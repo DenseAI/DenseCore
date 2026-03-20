@@ -1,0 +1,34 @@
+{{- $base := index .Values "dense-base" -}}
+{{- if and .Values.autoscaling.enabled $base.keda.enabled -}}
+{{- fail "autoscaling.enabled and dense-base.keda.enabled cannot both be true; choose a single scaling controller" -}}
+{{- end -}}
+{{- if and .Values.networkPolicy.enabled $base.networkPolicy.enabled -}}
+{{- fail "networkPolicy.enabled and dense-base.networkPolicy.enabled cannot both be true; choose the legacy DenseCore extension or the DenseCloud shared template" -}}
+{{- end -}}
+
+{{- $ctx := dict "root" . "values" $base -}}
+{{- include "dense-base.validate" $ctx -}}
+---
+{{ include "dense-base.serviceAccount" $ctx }}
+---
+{{ include "dense-base.pvc" $ctx }}
+---
+{{ include "dense-base.deployment" $ctx }}
+---
+{{ include "dense-base.service" $ctx }}
+---
+{{ include "dense-base.grpcService" $ctx }}
+---
+{{ include "dense-base.ingress" $ctx }}
+---
+{{ include "dense-base.grpcIngress" $ctx }}
+---
+{{ include "dense-base.grpcCertificate" $ctx }}
+---
+{{ include "dense-base.keda" $ctx }}
+---
+{{ include "dense-base.pdb" $ctx }}
+---
+{{ include "dense-base.serviceMonitor" $ctx }}
+---
+{{ include "dense-base.networkPolicy" $ctx }}

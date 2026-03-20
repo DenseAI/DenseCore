@@ -1,0 +1,149 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "cmake>=3.14", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "densecore"
+version = "1.0.0"
+description = "High-Performance Heterogeneous Inference Engine (AVX-512/AMX/SVE) for LLMs"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">= 3.10"
+authors = [
+    {name = "DenseCore Team"}
+]
+keywords = [
+    "llm",
+    "inference",
+    "cpu",
+    "transformer",
+    "huggingface",
+    "gguf",
+    "machine-learning",
+    "deep-learning",
+    "ai",
+    "amx",
+    "sve",
+    "arm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "huggingface-hub>=0.20.0,<1.0.0",
+    "numpy>=2.4.2; python_version>='3.11'",
+    "numpy>=2.0.2,<2.4.0; python_version<'3.11'",
+    "gguf>=0.18.0",
+]
+
+[project.optional-dependencies]
+# HuggingFace ecosystem compatibility (tokenizer + config + hub workflows)
+hf = [
+    "transformers>=4.46.3",
+    "tokenizers>=0.15.0",
+]
+cpu = [
+    "transformers>=4.46.3",
+    "tokenizers>=0.15.0",
+]
+# Optional PyTorch support (not required for DenseCore inference)
+torch = [
+    "torch>=2.5.1",
+]
+# Full dependencies for integration workflows (kept lightweight by default)
+full = [
+    "transformers>=4.46.3",
+    "tokenizers>=0.15.0",
+    "langchain-core>=1.0.0",
+    "langchain-community>=0.4.1",
+    "langchain>=1.0.0",
+    "langgraph>=1.0.0",
+    "langchain-classic>=1.0.0",
+    "langchain-text-splitters>=1.0.0",
+]
+langchain = [
+    "langchain-core>=1.0.0",
+    "langchain-community>=0.4.1",
+    "langchain>=1.0.0",
+    "langgraph>=1.0.0",
+    "langchain-classic>=1.0.0",
+    "langchain-text-splitters>=1.0.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-asyncio>=0.21.0",
+    "mypy>=1.0",
+    "ruff>=0.1.0",
+    "black>=23.0",
+]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-rtd-theme>=2.0",
+    "myst-parser>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/DenseCore/DenseCore"
+Documentation = "https://github.com/DenseCore/DenseCore#readme"
+Repository = "https://github.com/DenseCore/DenseCore"
+Issues = "https://github.com/DenseCore/DenseCore/issues"
+Changelog = "https://github.com/DenseCore/DenseCore/blob/main/CHANGELOG.md"
+
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["densecore*"]
+
+[tool.setuptools.package-data]
+densecore = [
+    "*.so",
+    "*.dylib",
+    "*.dll",
+    "py.typed",
+    "core_src/*",
+    "core_src/**/*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]  # Only essential: errors, pyflakes, warnings
+ignore = ["E501", "E402", "F401", "F841"]  # Line length, import order, unused
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[dependency-groups]
+dev = [
+    "build>=1.3.0",
+    "twine>=6.2.0",
+]

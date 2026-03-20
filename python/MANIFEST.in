@@ -1,0 +1,17 @@
+# Include bundled C++ source (populated by setup.py during sdist)
+recursive-include densecore/core_src *
+
+# Include shared libraries (if pre-built/wheel)
+recursive-include densecore *.so *.dylib *.dll
+
+# Include PEP 561 type hints
+include densecore/py.typed
+
+# Include documentation and license (copied by setup.py sdist if needed)
+include README.md
+include LICENSE
+
+# Exclude build artifacts
+global-exclude *.pyc
+global-exclude __pycache__
+global-exclude .DS_Store

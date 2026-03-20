@@ -1,0 +1,91 @@
+name: Publish Helm Chart
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CHART_PATH: charts/densecore
+
+jobs:
+  # Verify that the tag is on main branch (prevent deploying unmerged code)
+  verify-main:
+    name: Verify tag is on main branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if tag is on main branch
+        run: |
+          TAG_SHA=$(git rev-list -n 1 ${{ github.ref }})
+          if git merge-base --is-ancestor $TAG_SHA origin/main; then
+            echo "✅ Tag is on main branch"
+          else
+            echo "❌ Tag is NOT on main branch - deployment blocked"
+            exit 1
+          fi
+
+  helm:
+    name: Package and Publish Helm Chart
+    needs: verify-main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.14.0'
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          else
+            echo "version=0.0.0-dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update Chart version
+        run: |
+          sed -i "s/^version:.*/version: ${{ steps.version.outputs.version }}/" ${{ env.CHART_PATH }}/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${{ steps.version.outputs.version }}\"/" ${{ env.CHART_PATH }}/Chart.yaml
+          cat ${{ env.CHART_PATH }}/Chart.yaml
+
+      - name: Lint Helm chart
+        run: helm lint ${{ env.CHART_PATH }}
+
+      - name: Run Helm template test
+        run: helm template densecore ${{ env.CHART_PATH }} --debug
+
+      - name: Package Helm chart
+        run: |
+          mkdir -p .deploy
+          helm package ${{ env.CHART_PATH }} --destination .deploy
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push to GHCR (OCI Registry)
+        if: github.event_name != 'pull_request'
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          helm push .deploy/densecore-*.tgz oci://ghcr.io/${OWNER_LC}/charts
+
+      - name: Upload chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: .deploy/*.tgz
+          retention-days: 30

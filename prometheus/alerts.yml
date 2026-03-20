@@ -1,0 +1,92 @@
+groups:
+  - name: densecore-availability
+    rules:
+      - alert: DenseCoreDown
+        expr: up{job="densecore"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: densecore
+        annotations:
+          summary: "DenseCore target is down"
+          description: "Prometheus cannot scrape DenseCore for at least 1 minute."
+          runbook_url: "docs/OPERATIONS_RUNBOOK.md#1-densecoredown"
+
+  - name: densecore-slo
+    rules:
+      - alert: DenseCoreHighErrorRate
+        expr: densecore:slo_error_rate5m > 0.05 and densecore:slo_request_rate5m > 0.2
+        for: 5m
+        labels:
+          severity: critical
+          service: densecore
+        annotations:
+          summary: "DenseCore 5xx/error rate is high"
+          description: "Error rate over last 5m is {{ $value | humanizePercentage }} (threshold 5%)."
+          runbook_url: "docs/OPERATIONS_RUNBOOK.md#2-densecorehigherrorrate"
+
+      - alert: DenseCoreTTFTP99High
+        expr: densecore:slo_ttft_p99_seconds > 2
+        for: 10m
+        labels:
+          severity: warning
+          service: densecore
+        annotations:
+          summary: "DenseCore TTFT p99 exceeds SLO"
+          description: "Current TTFT p99 is {{ $value }}s (> 2s)."
+          runbook_url: "docs/OPERATIONS_RUNBOOK.md#3-densecorettftp99high"
+
+      - alert: DenseCoreQueueBacklogHigh
+        expr: sum(densecore_pending_requests) > 20
+        for: 5m
+        labels:
+          severity: warning
+          service: densecore
+        annotations:
+          summary: "DenseCore queue backlog is building"
+          description: "Pending requests are {{ $value }} for at least 5 minutes."
+          runbook_url: "docs/OPERATIONS_RUNBOOK.md#4-densecorequeuebackloghigh"
+
+      - alert: DenseCoreQueueBacklogCritical
+        expr: sum(densecore_pending_requests) > 100
+        for: 2m
+        labels:
+          severity: critical
+          service: densecore
+        annotations:
+          summary: "DenseCore queue backlog is critical"
+          description: "Pending requests are {{ $value }} (critical threshold 100)."
+          runbook_url: "docs/OPERATIONS_RUNBOOK.md#5-densecorequeuebacklogcritical"
+
+      - alert: DenseCoreKVCachePressure
+        expr: max(densecore_kv_cache_usage_percent) > 90
+        for: 5m
+        labels:
+          severity: warning
+          service: densecore
+        annotations:
+          summary: "DenseCore KV cache usage is high"
+          description: "KV cache usage is {{ $value }}% (> 90%)."
+          runbook_url: "docs/OPERATIONS_RUNBOOK.md#6-densecorekvcachepressure"
+
+      - alert: DenseCoreTimeoutErrorsBurst
+        expr: increase(densecore_timeout_errors[10m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+          service: densecore
+        annotations:
+          summary: "DenseCore timeout errors increased"
+          description: "Timeout errors increased by {{ $value }} in the last 10m."
+          runbook_url: "docs/OPERATIONS_RUNBOOK.md#7-densecoretimeouterrorsburst"
+
+      - alert: DenseCoreOOMDetected
+        expr: increase(densecore_oom_errors[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          service: densecore
+        annotations:
+          summary: "DenseCore OOM detected"
+          description: "OOM error counter increased in the last 15m."
+          runbook_url: "docs/OPERATIONS_RUNBOOK.md#8-densecoreoomdetected"

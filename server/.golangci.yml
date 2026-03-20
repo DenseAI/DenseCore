@@ -1,0 +1,44 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    paths:
+      - vendor
+      - third_party
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - goconst
+    - misspell
+
+  settings:
+    goconst:
+      min-len: 3
+      min-occurrences: 5  # Relaxed
+
+    misspell:
+      locale: US
+
+  exclusions:
+    # Paths to exclude from linting
+    paths:
+      - vendor
+      - third_party
+
+    rules:
+      # Test files are less strict
+      - path: _test\.go
+        linters:
+          - gocyclo
+          - dupl
+          - errcheck
+          - gosec
+          - gocritic
+
+run:
+  timeout: 5m

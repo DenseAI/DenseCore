@@ -1,0 +1,206 @@
+name: Build and Publish to PyPI
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Publishing target'
+        required: true
+        type: choice
+        default: testpypi
+        options:
+          - testpypi
+          - pypi
+          - both
+
+jobs:
+  # Verify that the tag is on main branch (prevent deploying unmerged code)
+  verify-main:
+    name: Verify tag is on main branch
+    runs-on: ubuntu-latest
+    outputs:
+      is_main: ${{ steps.check.outputs.is_main }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if tag is on main branch
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.target }}" = "testpypi" ]; then
+            echo "✅ Manual TestPyPI publish does not require main branch"
+            echo "is_main=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Get the commit SHA that the tag points to
+          TAG_SHA=$(git rev-list -n 1 ${{ github.ref }})
+          # Check if this commit is an ancestor of main
+          if git merge-base --is-ancestor $TAG_SHA origin/main; then
+            echo "✅ Tag is on main branch"
+            echo "is_main=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Tag is NOT on main branch - deployment blocked"
+            echo "is_main=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
+    needs: verify-main
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 + ARM64 (Graviton) via QEMU emulation
+          - os: ubuntu-latest
+            cibw_archs: "x86_64 aarch64"
+          # macOS Intel
+          - os: macos-13
+            cibw_archs: "x86_64"
+          # macOS Apple Silicon
+          - os: macos-14
+            cibw_archs: "arm64"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up QEMU (for Linux ARM64 emulation)
+        if: runner.os == 'Linux'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build wheels with cibuildwheel
+        uses: pypa/cibuildwheel@v2.21.3
+        env:
+          # Target architectures
+          CIBW_ARCHS: ${{ matrix.cibw_archs }}
+          # Python versions to build
+          CIBW_BUILD: "cp310-* cp311-* cp312-*"
+          # Skip musllinux (Alpine) - not commonly used for ML workloads
+          CIBW_SKIP: "*-musllinux_*"
+          # Install build dependencies before building
+          CIBW_BEFORE_ALL_LINUX: |
+            if command -v yum &> /dev/null; then yum install -y cmake gcc-c++ make; elif command -v apt-get &> /dev/null; then apt-get update && apt-get install -y cmake g++ make; fi
+          CIBW_BEFORE_ALL_MACOS: |
+            brew install cmake
+          CIBW_BEFORE_BUILD: "pip install cmake ninja setuptools wheel"
+          # Build C++ library before Python wheel
+          CIBW_ENVIRONMENT: |
+            CMAKE_BUILD_TYPE=Release
+          # Test that the wheel imports correctly
+          CIBW_TEST_COMMAND: "python -c \"import densecore; print('DenseCore import OK')\""
+          # Repair wheels for manylinux compliance
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel}"
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: "delocate-wheel -w {dest_dir} {wheel}"
+        with:
+          package-dir: python
+          output-dir: wheelhouse
+
+      - name: Upload wheels as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ strategy.job-index }}
+          path: ./wheelhouse/*.whl
+          retention-days: 7
+
+  build_sdist:
+    name: Build source distribution
+    needs: verify-main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build sdist
+        run: |
+          pip install build
+          cd python && python -m build --sdist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: python/dist/*.tar.gz
+
+  publish_testpypi:
+    name: Publish to TestPyPI
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && (inputs.target == 'testpypi' || inputs.target == 'both')
+    permissions:
+      id-token: write
+    environment:
+      name: testpypi
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: List distribution files
+        run: ls -la dist/
+
+      - name: Publish to TestPyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: https://test.pypi.org/legacy/
+
+  publish_pypi:
+    name: Publish to PyPI
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && (inputs.target == 'pypi' || inputs.target == 'both'))
+    permissions:
+      id-token: write
+    environment:
+      name: pypi
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: List distribution files
+        run: ls -la dist/
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

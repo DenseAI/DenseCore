@@ -1,0 +1,142 @@
+# Build directories
+build/
+bin/
+
+# Third-party dependencies (downloaded by scripts)
+# But allow ggml submodule to be tracked
+core/third_party/*
+!core/third_party/ggml
+_deps/
+
+#workspace/
+
+# C++ build artifacts
+*.o
+*.so
+*.so.*
+*.dylib
+*.dll
+*.a
+*.lib
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+vendor/
+.mypy_cache/
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Model files (usually large)
+*.gguf
+*.bin
+models/
+!core/src/models/
+!core/include/densecore/models/
+
+# Log files
+*.log
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+#*.cmake
+!CMakeLists.txt
+compile_commands.json
+core/Makefile
+core/build*/
+core/CTestTestfile.cmake
+core/densecore_tests*_include.cmake
+
+# Test coverage
+*.gcov
+*.gcda
+*.gcno
+coverage/
+htmlcov/
+
+# Documentation build
+docs/_build/
+docs/.doctrees/
+
+# Secrets & Environment
+.env
+*.env
+*.pem
+*.key
+*.cert
+
+# Go Profiling & Coverage
+*.pprof
+coverage.out
+
+# Server binary
+server/densecore-server
+server/densecore-cli
+
+# Python virtual environment
+.venv/
+python/.venv/
+
+# PyPI build artifacts
+python/dist/
+python/build/
+python/*.egg-info/
+
+# HuggingFace cache
+.cache/huggingface/
+
+# Benchmark outputs
+scripts/*.json
+scripts/*.csv
+python/core/
+
+GEMINI.md
+
+# test file
+python/benchmark_fixed.py

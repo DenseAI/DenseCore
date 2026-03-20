@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-artifacts:
+    name: Build Release Artifacts
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: linux-amd64
+          - os: macos-latest
+            artifact_name: darwin-amd64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake
+
+      - name: Build C++ library
+        run: |
+          make lib BUILD_TYPE=Release
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build Go server
+        working-directory: server
+        run: |
+          export CGO_LDFLAGS="-L$(pwd)/../build -ldensecore -lstdc++ -ldl"
+          export CGO_CFLAGS="-I$(pwd)/../core/include"
+          go build -ldflags="-s -w" -o densecore-server-${{ matrix.artifact_name }} .
+
+      - name: Package artifacts
+        run: |
+          mkdir -p release
+          cp build/libdensecore.so* release/ || cp build/libdensecore.dylib release/ || true
+          cp server/densecore-server-${{ matrix.artifact_name }} release/
+          tar -czf densecore-${{ matrix.artifact_name }}.tar.gz -C release .
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: densecore-${{ matrix.artifact_name }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Note: Python package publishing is handled by pypi-publish.yml workflow
+  # which uses cibuildwheel for multi-platform wheel builds
+

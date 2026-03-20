@@ -1,0 +1,546 @@
+/**
+ * @file hwy_paged_attention.cc
+ * @brief Highway-accelerated PagedAttention implementation
+ */
+
+// 1. Set up Highway target
+#undef HWY_TARGET_INCLUDE
+#define HWY_TARGET_INCLUDE "kernels/hwy/hwy_paged_attention.cc"
+#include "hwy/foreach_target.h"
+
+#include "kv_cache.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <hwy/cache_control.h>
+#include <hwy/highway.h>
+#include <vector>
+
+
+// Use structs from kv_cache.h
+// block_q8_0, QK8_0 are available via densecore namespace or global if defined there.
+// kv_cache.h defines them in global scope based on the file content I wrote.
+
+#ifndef DENSECORE_HWY_FP16_TO_FP32_DEFINED_
+#define DENSECORE_HWY_FP16_TO_FP32_DEFINED_
+namespace densecore {
+// Guarded against foreach_target re-inclusion within the same TU.
+inline float fp16_to_fp32(uint16_t h) {
+    uint32_t sign = (h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t result;
+    if (exp == 0) {
+        result = sign;
+    } else if (exp == 31) {
+        result = sign | 0x7F800000 | (mant << 13);
+    } else {
+        result = sign | ((exp + 112) << 23) | (mant << 13);  // Bias 15 -> 127
+    }
+    float f;
+    std::memcpy(&f, &result, sizeof(f));
+    return f;
+}
+}  // namespace densecore
+#endif  // DENSECORE_HWY_FP16_TO_FP32_DEFINED_
+
+HWY_BEFORE_NAMESPACE();
+namespace densecore {
+namespace hwy_kernels {
+namespace HWY_NAMESPACE {
+
+namespace hn = hwy::HWY_NAMESPACE;
+
+#include "kernels/hwy/hwy_fastexp.h"
+
+// ============================================================================
+// Dot Product Kernels
+// ============================================================================
+
+// F32 Dot Product
+template <class D> HWY_INLINE float DotProductF32(D d, const float* q, const float* k, int head_dim) {
+    auto sum = hn::Zero(d);
+    int i = 0;
+    for (; i <= head_dim - static_cast<int>(hn::Lanes(d)); i += hn::Lanes(d)) {
+        const auto vq = hn::LoadU(d, q + i);
+        const auto vk = hn::LoadU(d, k + i);
+        sum = hn::MulAdd(vq, vk, sum);
+    }
+    float scalar_sum = hn::ReduceSum(d, sum);
+    for (; i < head_dim; ++i) {
+        scalar_sum += q[i] * k[i];
+    }
+    return scalar_sum;
+}
+
+// F16 Dot Product (Keys are FP16 payload stored as uint16_t, Query is FP32).
+// Explicit AVX2+F16C fast path with a scalar fallback for other targets.
+template <class D> HWY_INLINE float DotProductF16(D d, const float* q, const uint16_t* k, int head_dim) {
+#if defined(__AVX2__) && defined(__F16C__)
+    auto sum = hn::Zero(d);
+    const hn::Rebind<uint16_t, D> du16;
+    const hn::Rebind<hwy::float16_t, D> df16;
+    int i = 0;
+    for (; i <= head_dim - static_cast<int>(hn::Lanes(d)); i += hn::Lanes(d)) {
+        const auto vq = hn::LoadU(d, q + i);
+        const auto vk_bits = hn::LoadU(du16, k + i);
+        // KV cache stores FP16 as uint16_t payload. BitCast keeps the same bits in
+        // registers and avoids strict-aliasing UB from pointer reinterpret_cast.
+        const auto vk16 = hn::BitCast(df16, vk_bits);
+        const auto vk = hn::PromoteTo(d, vk16);
+        sum = hn::MulAdd(vq, vk, sum);
+    }
+    float scalar_sum = hn::ReduceSum(d, sum);
+    for (; i < head_dim; ++i) {
+        scalar_sum += q[i] * densecore::fp16_to_fp32(k[i]);
+    }
+    return scalar_sum;
+#else
+    (void)d;
+    float scalar_sum = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+        scalar_sum += q[i] * densecore::fp16_to_fp32(k[i]);
+    }
+    return scalar_sum;
+#endif
+}
+
+// Q8_0 Dot Product (Keys are Q8_0 blocks)
+// Uses Highway int8→int16→int32→float promotion chain instead of scalar stack buffer.
+template <class D> HWY_INLINE float DotProductQ8_0(D d, const float* q, const void* k_data, int head_dim) {
+    const block_q8_0* blocks = reinterpret_cast<const block_q8_0*>(k_data);
+    const int nb = head_dim / QK8_0;
+
+    auto total_sum = hn::Zero(d);
+    const int lanes = static_cast<int>(hn::Lanes(d));
+    // Rebind preserves vector width. For float lanes N, int8 lanes are 4N.
+    // We LoadN() only N bytes so promote-chain lower lanes exactly match scalar
+    // dequant for q[q_offset + i ... + i+N).
+    const hn::Rebind<int8_t, D> di8;
+    const hn::Rebind<int16_t, D> di16;
+    const hn::Rebind<int32_t, D> di32;
+    float scalar_tail_sum = 0.0f;
+    int q_offset = 0;
+
+    for (int b = 0; b < nb; ++b) {
+        float block_scale = densecore::fp16_to_fp32(blocks[b].d);
+        const auto v_scale = hn::Set(d, block_scale);
+        const int8_t* qs = blocks[b].qs;
+
+        int i = 0;
+        // Vectorized path: load quarter-width int8, promote to float32
+        for (; i <= QK8_0 - lanes; i += lanes) {
+            const auto vq = hn::LoadU(d, q + q_offset + i);
+
+            // Load exactly `lanes` int8 values (no over-read), then promote.
+            const auto vi8 = hn::LoadN(di8, qs + i, static_cast<size_t>(lanes));
+            const auto vi16 = hn::PromoteTo(di16, vi8);
+            const auto vi32 = hn::PromoteTo(di32, vi16);
+            auto vk = hn::ConvertTo(d, vi32);
+            vk = hn::Mul(vk, v_scale);
+
+            total_sum = hn::MulAdd(vq, vk, total_sum);
+        }
+        // Scalar tail within block
+        for (; i < QK8_0; ++i) {
+            scalar_tail_sum += q[q_offset + i] * (static_cast<float>(qs[i]) * block_scale);
+        }
+        q_offset += QK8_0;
+    }
+
+    float scalar_sum = hn::ReduceSum(d, total_sum) + scalar_tail_sum;
+
+    int tail_start = nb * QK8_0;
+    if (tail_start < head_dim) {
+        float block_scale = densecore::fp16_to_fp32(blocks[nb].d);
+        const int8_t* qs = blocks[nb].qs;
+        for (int i = 0; i < head_dim - tail_start; ++i) {
+            scalar_sum += q[tail_start + i] * (static_cast<float>(qs[i]) * block_scale);
+        }
+    }
+    return scalar_sum;
+}
+
+// ============================================================================
+// Accumulate Kernels
+// ============================================================================
+
+template <class D> HWY_INLINE void AccumulateF32(D d, float* accum, const float* v, float weight, int head_dim) {
+    const auto w = hn::Set(d, weight);
+    int i = 0;
+    for (; i <= head_dim - static_cast<int>(hn::Lanes(d)); i += hn::Lanes(d)) {
+        auto va = hn::LoadU(d, accum + i);
+        const auto vv = hn::LoadU(d, v + i);
+        va = hn::MulAdd(vv, w, va);
+        hn::StoreU(va, d, accum + i);
+    }
+    for (; i < head_dim; ++i) {
+        accum[i] += v[i] * weight;
+    }
+}
+
+template <class D> HWY_INLINE void AccumulateF16(D d, float* accum, const uint16_t* v, float weight, int head_dim) {
+#if defined(__AVX2__) && defined(__F16C__)
+    const auto w = hn::Set(d, weight);
+    const hn::Rebind<uint16_t, D> du16;
+    const hn::Rebind<hwy::float16_t, D> df16;
+    int i = 0;
+    for (; i <= head_dim - static_cast<int>(hn::Lanes(d)); i += hn::Lanes(d)) {
+        auto va = hn::LoadU(d, accum + i);
+        const auto vv_bits = hn::LoadU(du16, v + i);
+        // FP16 payload is backed by uint16_t; BitCast avoids aliasing UB.
+        const auto vv16 = hn::BitCast(df16, vv_bits);
+        const auto vv = hn::PromoteTo(d, vv16);
+        va = hn::MulAdd(vv, w, va);
+        hn::StoreU(va, d, accum + i);
+    }
+    for (; i < head_dim; ++i) {
+        accum[i] += densecore::fp16_to_fp32(v[i]) * weight;
+    }
+#else
+    (void)d;
+    for (int i = 0; i < head_dim; ++i) {
+        accum[i] += densecore::fp16_to_fp32(v[i]) * weight;
+    }
+#endif
+}
+
+template <class D> HWY_INLINE void AccumulateQ8_0(D d, float* accum, const void* v_data, float weight, int head_dim) {
+    const block_q8_0* blocks = reinterpret_cast<const block_q8_0*>(v_data);
+    const int nb = head_dim / QK8_0;
+    const int lanes = static_cast<int>(hn::Lanes(d));
+    const hn::Rebind<int8_t, D> di8;
+    const hn::Rebind<int16_t, D> di16;
+    const hn::Rebind<int32_t, D> di32;
+    int accum_offset = 0;
+
+    for (int b = 0; b < nb; ++b) {
+        float block_scale = densecore::fp16_to_fp32(blocks[b].d);
+        auto v_scale = hn::Set(d, block_scale * weight);
+        const int8_t* qs = blocks[b].qs;
+
+        int i = 0;
+        for (; i <= QK8_0 - lanes; i += lanes) {
+            auto va = hn::LoadU(d, accum + accum_offset + i);
+
+            // Load exactly `lanes` int8 values (no over-read), then promote.
+            const auto vi8 = hn::LoadN(di8, qs + i, static_cast<size_t>(lanes));
+            const auto vi16 = hn::PromoteTo(di16, vi8);
+            const auto vi32 = hn::PromoteTo(di32, vi16);
+            const auto vv = hn::ConvertTo(d, vi32);
+
+            va = hn::MulAdd(vv, v_scale, va);
+            hn::StoreU(va, d, accum + accum_offset + i);
+        }
+        for (; i < QK8_0; ++i) {
+            accum[accum_offset + i] += static_cast<float>(qs[i]) * block_scale * weight;
+        }
+        accum_offset += QK8_0;
+    }
+
+    int tail_start = nb * QK8_0;
+    if (tail_start < head_dim) {
+        float block_scale = densecore::fp16_to_fp32(blocks[nb].d);
+        const int8_t* qs = blocks[nb].qs;
+        for (int i = 0; i < head_dim - tail_start; ++i) {
+            accum[tail_start + i] += static_cast<float>(qs[i]) * block_scale * weight;
+        }
+    }
+}
+
+// ============================================================================
+// Main Kernel Logic
+// ============================================================================
+// Main Paged Attention Implementation (Generic over Highway Target)
+void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, const void* const* v_block_ptrs,
+                        int32_t cache_type, int32_t num_heads, int32_t head_dim, int32_t n_head_kv,
+                        int32_t block_table_size, int32_t context_len, int64_t head_stride_bytes_in,
+                        int64_t slot_stride_bytes_in, float scale, float* output, int32_t head_start, int32_t head_end,
+                        int32_t num_heads_total) {
+
+    const hn::ScalableTag<float> d;
+
+    if (!k_block_ptrs || !v_block_ptrs) return;
+    if (n_head_kv <= 0) return;
+    const int total_heads = (num_heads_total > 0) ? num_heads_total : num_heads;
+    if (total_heads <= 0 || total_heads % n_head_kv != 0) return;
+    const int kv_group_size = total_heads / n_head_kv;
+    if (kv_group_size <= 0) return;
+    if (head_stride_bytes_in <= 0 || slot_stride_bytes_in <= 0) return;
+    const size_t head_stride_bytes = static_cast<size_t>(head_stride_bytes_in);
+    const size_t slot_stride_bytes = static_cast<size_t>(slot_stride_bytes_in);
+
+    float block_scores[BLOCK_SIZE];
+
+    const int h_begin = std::max(0, head_start);
+    const int h_limit = (head_end < 0) ? num_heads : std::min(num_heads, head_end);
+    int prefetch_tokens = 1;
+    if (head_dim >= 256) {
+        prefetch_tokens = 3;
+    } else if (head_dim >= 128) {
+        prefetch_tokens = 2;
+    }
+    if (cache_type == 8) {  // Q8_0 has higher decode-side unpack pressure.
+        prefetch_tokens = std::min(prefetch_tokens + 1, 4);
+    }
+    static const bool prefetch_blocks = []() {
+        const char* env = std::getenv("DENSECORE_PAGED_ATTN_PREFETCH_BLOCKS");
+        if (!env || env[0] == '\0') return true;
+        return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
+    }();
+
+    for (int h = h_begin; h < h_limit; ++h) {
+        const float* q_head = query + h * head_dim;
+        float* out_head = output + h * head_dim;
+
+        int kv_head = h / kv_group_size;
+        if (kv_head < 0) kv_head = 0;
+        if (kv_head >= n_head_kv) kv_head = n_head_kv - 1;
+        // Offset in bytes for the specific KV head
+        const size_t head_offset_bytes = static_cast<size_t>(kv_head) * head_stride_bytes;
+
+        float m_prev = -1e30f;
+        float d_prev = 0.0f;
+
+        // Initialize output buffer to 0
+        std::fill(out_head, out_head + head_dim, 0.0f);
+
+        int tokens_processed = 0;
+
+        for (int b_idx = 0; b_idx < block_table_size; ++b_idx) {
+            // Compute valid tokens
+            int num_tokens = BLOCK_SIZE;
+            if (tokens_processed + num_tokens > context_len) {
+                num_tokens = context_len - tokens_processed;
+            }
+            if (num_tokens <= 0) break;
+
+            const uint8_t* k_block_base = reinterpret_cast<const uint8_t*>(k_block_ptrs[b_idx]);
+            const uint8_t* v_block_base = reinterpret_cast<const uint8_t*>(v_block_ptrs[b_idx]);
+            if (!k_block_base || !v_block_base) {
+                tokens_processed += num_tokens;
+                continue;
+            }
+
+            if (prefetch_blocks && b_idx + 1 < block_table_size) {
+                const uint8_t* next_k_block = reinterpret_cast<const uint8_t*>(k_block_ptrs[b_idx + 1]);
+                const uint8_t* next_v_block = reinterpret_cast<const uint8_t*>(v_block_ptrs[b_idx + 1]);
+                if (next_k_block) {
+                    ::hwy::Prefetch(next_k_block + head_offset_bytes);
+                }
+                if (next_v_block) {
+                    ::hwy::Prefetch(next_v_block + head_offset_bytes);
+                }
+            }
+
+            // 1. Compute Scores
+            float m_block = -1e30f;
+
+            for (int t = 0; t < num_tokens; ++t) {
+                // Prefetch next token data (strided)
+                const int pf_t = t + prefetch_tokens;
+                if (pf_t < num_tokens) {
+                    const uint8_t* next_k = k_block_base + pf_t * slot_stride_bytes + kv_head * head_stride_bytes;
+                    ::hwy::Prefetch(next_k);
+                }
+
+                float score = 0.0f;
+                // Calculate byte pointer to the specific K token vector
+                const uint8_t* k_ptr_bytes = k_block_base + t * slot_stride_bytes + kv_head * head_stride_bytes;
+
+                if (cache_type == 8) {  // Q8_0
+                    score = DotProductQ8_0(d, q_head, k_ptr_bytes, head_dim);
+                } else if (cache_type == 1) {  // F16
+                    score = DotProductF16(d, q_head, reinterpret_cast<const uint16_t*>(k_ptr_bytes), head_dim);
+                } else {  // F32
+                    score = DotProductF32(d, q_head, reinterpret_cast<const float*>(k_ptr_bytes), head_dim);
+                }
+
+                score *= scale;
+                block_scores[t] = score;
+                if (score > m_block) m_block = score;
+            }
+
+            // 2. Softmax / Rescale
+            float m_new = std::max(m_prev, m_block);
+            float alpha = FastExpScalar(m_prev - m_new);
+            float d_block = 0.0f;
+
+            // Rescale existing output
+            if (alpha != 1.0f) {
+                auto v_alpha = hn::Set(d, alpha);
+                int i = 0;
+                for (; i <= head_dim - static_cast<int>(hn::Lanes(d)); i += hn::Lanes(d)) {
+                    auto val = hn::LoadU(d, out_head + i);
+                    val = hn::Mul(val, v_alpha);
+                    hn::StoreU(val, d, out_head + i);
+                }
+                for (; i < head_dim; ++i) {
+                    out_head[i] *= alpha;
+                }
+            }
+
+            // 3. Vectorized exp for block_scores, then accumulate
+            {
+                const auto v_m_new = hn::Set(d, m_new);
+                // Process BLOCK_SIZE scores in SIMD lanes
+                int t = 0;
+                const int simd_lanes = static_cast<int>(hn::Lanes(d));
+                for (; t <= num_tokens - simd_lanes; t += simd_lanes) {
+                    auto vs = hn::LoadU(d, block_scores + t);
+                    vs = hn::Sub(vs, v_m_new);
+                    auto vexp = FastExpHwy(d, vs);
+                    hn::StoreU(vexp, d, block_scores + t);
+                }
+                for (; t < num_tokens; ++t) {
+                    block_scores[t] = FastExpScalar(block_scores[t] - m_new);
+                }
+                // Sum exp'd scores
+                for (t = 0; t < num_tokens; ++t) {
+                    d_block += block_scores[t];
+                }
+            }
+
+            for (int t = 0; t < num_tokens; ++t) {
+                float p = block_scores[t];
+
+                const uint8_t* v_ptr = v_block_base + t * slot_stride_bytes + head_offset_bytes;
+
+                // Prefetch next value
+                const int pf_t = t + prefetch_tokens;
+                if (pf_t < num_tokens) {
+                    const uint8_t* next_v = v_block_base + pf_t * slot_stride_bytes + head_offset_bytes;
+                    ::hwy::Prefetch(next_v);
+                }
+
+                // Accumulate based on type
+                if (cache_type == 0) {  // F32
+                    AccumulateF32(d, out_head, reinterpret_cast<const float*>(v_ptr), p, head_dim);
+                } else if (cache_type == 1) {  // F16
+                    AccumulateF16(d, out_head, reinterpret_cast<const uint16_t*>(v_ptr), p, head_dim);
+                } else if (cache_type == 8) {  // Q8_0
+                    AccumulateQ8_0(d, out_head, v_ptr, p, head_dim);
+                }
+            }
+
+            // Update global stats
+            d_prev = d_prev * alpha + d_block;
+            m_prev = m_new;
+
+            tokens_processed += num_tokens;
+        }
+
+        // Final Normalization
+        if (!(d_prev > 0.0f) || !std::isfinite(d_prev)) {
+            std::fill(out_head, out_head + head_dim, 0.0f);
+            continue;
+        }
+        float inv_sum = 1.0f / (d_prev + 1e-6f);
+        auto v_inv_sum = hn::Set(d, inv_sum);
+        int i = 0;
+        for (; i <= head_dim - static_cast<int>(hn::Lanes(d)); i += hn::Lanes(d)) {
+            auto val = hn::LoadU(d, out_head + i);
+            val = hn::Mul(val, v_inv_sum);
+            hn::StoreU(val, d, out_head + i);
+        }
+        for (; i < head_dim; ++i) {
+            out_head[i] *= inv_sum;
+        }
+    }
+}
+
+
+}  // namespace HWY_NAMESPACE
+}  // namespace hwy_kernels
+}  // namespace densecore
+HWY_AFTER_NAMESPACE();
+
+
+#if HWY_ONCE
+#include "densecore/hal/tensor.h"
+#include "densecore/kernels/paged_attention.h"
+#include <iostream>
+
+namespace densecore {
+namespace hwy_kernels {
+
+HWY_EXPORT(PagedAttentionImpl);
+
+void PagedAttention_Hwy(const float* query, const void* const* k_block_ptrs, const void* const* v_block_ptrs,
+                        int32_t cache_type, int32_t num_heads, int32_t head_dim, int32_t n_head_kv,
+                        int32_t block_table_size, int32_t context_len, int64_t head_stride_bytes,
+                        int64_t slot_stride_bytes, float scale, float* output, int32_t head_start, int32_t head_end,
+                        int32_t num_heads_total) {
+
+    HWY_DYNAMIC_DISPATCH(PagedAttentionImpl)
+    (query, k_block_ptrs, v_block_ptrs, cache_type, num_heads, head_dim, n_head_kv, block_table_size, context_len,
+     head_stride_bytes, slot_stride_bytes, scale, output, head_start, head_end, num_heads_total);
+}
+
+}  // namespace hwy_kernels
+
+namespace kernels {
+
+void PagedAttention(const Tensor& query, const PagedKVCache& cache, int layer, const std::vector<int>& block_table,
+                    int context_len, float scale, Tensor* output, int head_start, int head_end, int num_heads_total) {
+    // Input validation
+    if (!query.data || !output->data || block_table.empty()) return;
+
+    int num_heads = (int)query.shape[0];
+    int head_dim = (int)query.shape[1];
+    if (num_heads_total <= 0) {
+        num_heads_total = num_heads;
+    }
+    if (head_end < 0 || head_end > num_heads) {
+        head_end = num_heads;
+    }
+    if (head_start < 0) {
+        head_start = 0;
+    }
+    if (head_start >= head_end) {
+        return;
+    }
+
+    // Check supported types
+    // Note: Assuming query and output are always F32 for high precision accumulation
+    if (query.dtype != DType::F32 || output->dtype != DType::F32) {
+        throw std::runtime_error("[PagedAttention] Error: Query and Output must be F32");
+    }
+
+    // Determine cache type ID for Highway kernel
+    int32_t cache_type_id = -1;
+    if (cache.cache_type == GGML_TYPE_F32) {
+        cache_type_id = 0;
+    } else if (cache.cache_type == GGML_TYPE_F16) {
+        cache_type_id = 1;
+    } else if (cache.cache_type == GGML_TYPE_Q8_0) {
+        cache_type_id = 8;
+    } else {
+        throw std::runtime_error("[PagedAttention] Error: Unsupported cache type " +
+                                 std::to_string((int)cache.cache_type) + ". Supported: F32, F16, Q8_0");
+    }
+
+    const auto layout = cache.GetBlockLayout();
+    std::vector<const void*> k_block_ptrs(static_cast<size_t>(block_table.size()), nullptr);
+    std::vector<const void*> v_block_ptrs(static_cast<size_t>(block_table.size()), nullptr);
+    for (size_t i = 0; i < block_table.size(); ++i) {
+        const int block_id = block_table[i];
+        if (block_id < 0 || block_id >= cache.max_blocks) {
+            continue;
+        }
+        k_block_ptrs[i] = cache.GetKBlockPtr(block_id, layer);
+        v_block_ptrs[i] = cache.GetVBlockPtr(block_id, layer);
+    }
+
+    densecore::hwy_kernels::PagedAttention_Hwy(
+        (const float*)query.data, k_block_ptrs.data(), v_block_ptrs.data(), cache_type_id, num_heads, head_dim,
+        cache.n_head_kv, (int32_t)block_table.size(), context_len, static_cast<int64_t>(layout.head_stride_bytes),
+        static_cast<int64_t>(layout.slot_stride_bytes), scale, (float*)output->data, head_start, head_end,
+        num_heads_total);
+}
+
+}  // namespace kernels
+}  // namespace densecore
+#endif

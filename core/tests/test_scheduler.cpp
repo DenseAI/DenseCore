@@ -1,0 +1,224 @@
+#include <gtest/gtest.h>
+
+#include <cstdlib>
+#include <string>
+
+#include "scheduler.h"
+
+namespace densecore {
+namespace {
+
+class ScopedDecodeHomogeneousOverride {
+  public:
+    explicit ScopedDecodeHomogeneousOverride(const char* value) {
+        const char* prev = std::getenv(kEnvName);
+        if (prev) {
+            had_prev_ = true;
+            prev_value_ = prev;
+        }
+
+        if (value) {
+#if defined(_WIN32)
+            _putenv_s(kEnvName, value);
+#else
+            setenv(kEnvName, value, 1);
+#endif
+        } else {
+#if defined(_WIN32)
+            _putenv_s(kEnvName, "");
+#else
+            unsetenv(kEnvName);
+#endif
+        }
+    }
+
+    ~ScopedDecodeHomogeneousOverride() {
+        if (had_prev_) {
+#if defined(_WIN32)
+            _putenv_s(kEnvName, prev_value_.c_str());
+#else
+            setenv(kEnvName, prev_value_.c_str(), 1);
+#endif
+            return;
+        }
+
+#if defined(_WIN32)
+        _putenv_s(kEnvName, "");
+#else
+        unsetenv(kEnvName);
+#endif
+    }
+
+  private:
+    static constexpr const char* kEnvName = "DENSECORE_SCHED_DECODE_HOMOGENEOUS_N_PAST";
+    bool had_prev_ = false;
+    std::string prev_value_;
+};
+
+SchedulerConfig MakeTestConfig() {
+    SchedulerConfig cfg;
+    cfg.max_num_seqs = 16;
+    cfg.max_num_batched_tokens = 256;
+    cfg.enable_priority = true;
+    cfg.enable_chunked_prefill = false;
+    cfg.enforce_homogeneous_batch_n_past = true;
+    cfg.isolate_prefill_decode = true;
+    cfg.max_consecutive_decode_batches = 2;
+    return cfg;
+}
+
+TEST(SchedulerArchitecture, DoesNotMixPrefillAndDecodeInSingleStep) {
+    BlockManager block_manager(/*num_blocks=*/256, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, MakeTestConfig());
+
+    const int seq1 = scheduler.AddRequest(/*request_id=*/1, /*prompt_len=*/16, /*max_output_len=*/32);
+    ASSERT_GT(seq1, 0);
+
+    SchedulerOutput first = scheduler.Schedule();
+    EXPECT_FALSE(first.prefill_seq_ids.empty());
+    EXPECT_TRUE(first.decode_seq_ids.empty());
+
+    scheduler.UpdateProgress(seq1, 1);
+
+    const int seq2 = scheduler.AddRequest(/*request_id=*/2, /*prompt_len=*/16, /*max_output_len=*/32);
+    ASSERT_GT(seq2, 0);
+
+    SchedulerOutput mixed_check = scheduler.Schedule();
+    EXPECT_FALSE(mixed_check.decode_seq_ids.empty());
+    EXPECT_TRUE(mixed_check.prefill_seq_ids.empty());
+}
+
+TEST(SchedulerArchitecture, DecodeBatchUsesSingleContextBucket) {
+    ScopedDecodeHomogeneousOverride homogeneous_override("1");
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, MakeTestConfig());
+
+    const int seq1 = scheduler.AddRequest(/*request_id=*/10, /*prompt_len=*/16, /*max_output_len=*/64);
+    const int seq2 = scheduler.AddRequest(/*request_id=*/11, /*prompt_len=*/32, /*max_output_len=*/64);
+    ASSERT_GT(seq1, 0);
+    ASSERT_GT(seq2, 0);
+
+    SchedulerOutput prefill = scheduler.Schedule();
+    ASSERT_TRUE(prefill.decode_seq_ids.empty());
+    ASSERT_EQ(prefill.prefill_seq_ids.size(), 2u);
+    for (const auto& chunk : prefill.prefill_chunk_info) {
+        scheduler.UpdateProgress(chunk.seq_id, chunk.chunk_tokens);
+    }
+
+    SchedulerOutput decode = scheduler.Schedule();
+    ASSERT_TRUE(decode.prefill_seq_ids.empty());
+    ASSERT_FALSE(decode.decode_seq_ids.empty());
+    EXPECT_EQ(decode.decode_seq_ids.size(), 1u);
+    EXPECT_GT(decode.batch_context_len, 0);
+}
+
+TEST(SchedulerArchitecture, DecodeBatchAllowsHeterogeneousContextByDefault) {
+    ScopedDecodeHomogeneousOverride homogeneous_override(nullptr);
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, MakeTestConfig());
+
+    const int seq1 = scheduler.AddRequest(/*request_id=*/110, /*prompt_len=*/16, /*max_output_len=*/64);
+    const int seq2 = scheduler.AddRequest(/*request_id=*/111, /*prompt_len=*/32, /*max_output_len=*/64);
+    ASSERT_GT(seq1, 0);
+    ASSERT_GT(seq2, 0);
+
+    SchedulerOutput prefill = scheduler.Schedule();
+    ASSERT_TRUE(prefill.decode_seq_ids.empty());
+    ASSERT_EQ(prefill.prefill_seq_ids.size(), 2u);
+    for (const auto& chunk : prefill.prefill_chunk_info) {
+        scheduler.UpdateProgress(chunk.seq_id, chunk.chunk_tokens);
+    }
+
+    SchedulerOutput decode = scheduler.Schedule();
+    ASSERT_TRUE(decode.prefill_seq_ids.empty());
+    EXPECT_EQ(decode.decode_seq_ids.size(), 2u);
+}
+
+TEST(SchedulerArchitecture, PrefillAdmissionAfterDecodeStreak) {
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, MakeTestConfig());
+
+    const int seq_running = scheduler.AddRequest(/*request_id=*/20, /*prompt_len=*/16, /*max_output_len=*/64);
+    ASSERT_GT(seq_running, 0);
+
+    SchedulerOutput first = scheduler.Schedule();
+    ASSERT_FALSE(first.prefill_seq_ids.empty());
+
+    const int seq_waiting = scheduler.AddRequest(/*request_id=*/21, /*prompt_len=*/16, /*max_output_len=*/64);
+    ASSERT_GT(seq_waiting, 0);
+
+    SchedulerOutput d1 = scheduler.Schedule();
+    ASSERT_TRUE(d1.prefill_seq_ids.empty());
+    ASSERT_FALSE(d1.decode_seq_ids.empty());
+    scheduler.UpdateProgress(seq_running, 1);
+
+    SchedulerOutput d2 = scheduler.Schedule();
+    ASSERT_TRUE(d2.prefill_seq_ids.empty());
+    ASSERT_FALSE(d2.decode_seq_ids.empty());
+    scheduler.UpdateProgress(seq_running, 1);
+
+    SchedulerOutput prefill_after_streak = scheduler.Schedule();
+    EXPECT_FALSE(prefill_after_streak.prefill_seq_ids.empty());
+    EXPECT_TRUE(prefill_after_streak.decode_seq_ids.empty());
+}
+
+TEST(SchedulerArchitecture, ChunkedPrefillEmitsChunkMetadataAndTransitionsToDecode) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = true;
+    cfg.max_prefill_tokens = 8;
+    cfg.max_consecutive_decode_batches = 1;
+
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    const int seq = scheduler.AddRequest(/*request_id=*/30, /*prompt_len=*/20, /*max_output_len=*/32);
+    ASSERT_GT(seq, 0);
+
+    SchedulerOutput s1 = scheduler.Schedule();
+    ASSERT_EQ(s1.prefill_seq_ids.size(), 1u);
+    ASSERT_EQ(s1.prefill_chunk_info.size(), 1u);
+    EXPECT_EQ(s1.prefill_chunk_info[0].seq_id, seq);
+    EXPECT_EQ(s1.prefill_chunk_info[0].chunk_tokens, 8);
+    scheduler.UpdateProgress(seq, 8);
+
+    SchedulerOutput s2 = scheduler.Schedule();
+    ASSERT_EQ(s2.prefill_seq_ids.size(), 1u);
+    ASSERT_EQ(s2.prefill_chunk_info.size(), 1u);
+    EXPECT_EQ(s2.prefill_chunk_info[0].seq_id, seq);
+    EXPECT_EQ(s2.prefill_chunk_info[0].chunk_tokens, 8);
+    scheduler.UpdateProgress(seq, 8);
+
+    SchedulerOutput s3 = scheduler.Schedule();
+    ASSERT_EQ(s3.prefill_seq_ids.size(), 1u);
+    ASSERT_EQ(s3.prefill_chunk_info.size(), 1u);
+    EXPECT_EQ(s3.prefill_chunk_info[0].seq_id, seq);
+    EXPECT_EQ(s3.prefill_chunk_info[0].chunk_tokens, 4);
+    scheduler.UpdateProgress(seq, 4);
+
+    SchedulerOutput s4 = scheduler.Schedule();
+    EXPECT_TRUE(s4.prefill_seq_ids.empty());
+    EXPECT_EQ(s4.decode_seq_ids.size(), 1u);
+    EXPECT_EQ(s4.decode_seq_ids[0], seq);
+}
+
+TEST(SchedulerArchitecture, RejectsNonChunkablePrefillLargerThanBatchBudget) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = true;
+    cfg.max_prefill_tokens = 8;
+    cfg.max_num_batched_tokens = 8;
+
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    const int seq = scheduler.AddRequest(/*request_id=*/40,
+                                         /*prompt_len=*/16,
+                                         /*max_output_len=*/32,
+                                         /*priority=*/100,
+                                         /*prefix_tokens=*/nullptr,
+                                         /*allow_chunked_prefill=*/false);
+    EXPECT_LT(seq, 0);
+    EXPECT_FALSE(scheduler.HasRequests());
+}
+
+}  // namespace
+}  // namespace densecore
