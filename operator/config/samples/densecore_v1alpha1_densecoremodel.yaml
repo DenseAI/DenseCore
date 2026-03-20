@@ -1,0 +1,57 @@
+# Example DenseCoreModel for Qwen 0.5B
+# 이 예제는 HuggingFace에서 Qwen 0.5B 모델을 다운로드하여 배포합니다.
+apiVersion: densecore.io/v1alpha1
+kind: DenseCoreModel
+metadata:
+  name: qwen-0.5b
+  namespace: default
+  labels:
+    app.kubernetes.io/name: densecore
+    app.kubernetes.io/instance: qwen-0.5b
+spec:
+  model:
+    repoId: "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+    filename: "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    threads: 4
+
+  replicas: 2
+
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "8"
+      memory: "8Gi"
+
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilization: 70
+
+  service:
+    type: ClusterIP
+    port: 8080
+    grpcEnabled: true
+    grpcPort: 50051
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "8080"
+
+  env:
+    - name: LOG_LEVEL
+      value: "info"
+    - name: OTEL_ENABLED
+      value: "true"
+    - name: OTEL_ENDPOINT
+      value: "otel-collector.monitoring:4317"
+
+  nodeSelector:
+    kubernetes.io/arch: amd64
+
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "llm"
+      effect: "NoSchedule"

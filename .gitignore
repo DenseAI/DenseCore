@@ -80,6 +80,10 @@ Thumbs.db
 *.bak
 *.cache
 
+# Local agent/editor state
+.gemini/
+workspace/
+
 # CMake generated files
 CMakeCache.txt
 CMakeFiles/
@@ -135,6 +139,14 @@ python/*.egg-info/
 scripts/*.json
 scripts/*.csv
 python/core/
+
+# Local benchmark artifacts
+benchmarks/results/
+benchmarks/bench_native
+benchmarks/quality_test
+benchmarks/quality_test_new
+tests/matmul_test_manual
+tests/patch_embed_test_manual
 
 GEMINI.md
 

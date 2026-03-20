@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+package densecore;
+
+option go_package = "densecore-server/internal/grpc";
+
+// DenseCoreService provides LLM inference capabilities
+service DenseCoreService {
+  // ChatCompletion performs synchronous chat completion
+  rpc ChatCompletion (ChatCompletionRequest) returns (ChatCompletionResponse) {}
+  
+  // StreamChatCompletion performs streaming chat completion
+  rpc StreamChatCompletion (ChatCompletionRequest) returns (stream ChatCompletionChunk) {}
+  
+  // ListModels returns the list of available models
+  rpc ListModels (ListModelsRequest) returns (ListModelsResponse) {}
+  
+  // LoadModel loads a model at runtime
+  rpc LoadModel (LoadModelRequest) returns (LoadModelResponse) {}
+  
+  // UnloadModel unloads a model
+  rpc UnloadModel (UnloadModelRequest) returns (UnloadModelResponse) {}
+  
+  // GetEmbeddings generates embeddings for input text
+  rpc GetEmbeddings (EmbeddingRequest) returns (EmbeddingResponse) {}
+}
+
+// ============================================================================
+// Chat Completion Messages
+// ============================================================================
+
+message ChatCompletionRequest {
+  string model = 1;
+  repeated Message messages = 2;
+  int32 max_tokens = 3;
+  float temperature = 4;
+  float top_p = 5;
+  bool stream = 6;
+  int32 seed = 7;
+  repeated string stop = 8;
+}
+
+message Message {
+  string role = 1;
+  string content = 2;
+  string name = 3;  // Optional: for function calls
+}
+
+message ChatCompletionResponse {
+  string id = 1;
+  string object = 2;
+  int64 created = 3;
+  string model = 4;
+  repeated Choice choices = 5;
+  Usage usage = 6;
+}
+
+message ChatCompletionChunk {
+  string id = 1;
+  string object = 2;
+  int64 created = 3;
+  string model = 4;
+  repeated ChunkChoice choices = 5;
+}
+
+message Choice {
+  int32 index = 1;
+  Message message = 2;
+  string finish_reason = 3;
+}
+
+message ChunkChoice {
+  int32 index = 1;
+  ChunkDelta delta = 2;
+  string finish_reason = 3;
+}
+
+message ChunkDelta {
+  string role = 1;
+  string content = 2;
+}
+
+message Usage {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 total_tokens = 3;
+}
+
+// ============================================================================
+// Model Management Messages
+// ============================================================================
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  string object = 1;
+  repeated ModelInfo data = 2;
+}
+
+message ModelInfo {
+  string id = 1;
+  string object = 2;
+  int64 created = 3;
+  string owned_by = 4;
+  bool loaded = 5;
+  string root = 6;  // Model file path
+}
+
+message LoadModelRequest {
+  string model_id = 1;
+  string model_path = 2;
+  string draft_model_path = 3;
+  int32 threads = 4;
+}
+
+message LoadModelResponse {
+  bool success = 1;
+  string message = 2;
+  string model_id = 3;
+}
+
+message UnloadModelRequest {
+  string model_id = 1;
+}
+
+message UnloadModelResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ============================================================================
+// Embedding Messages
+// ============================================================================
+
+message EmbeddingRequest {
+  string model = 1;
+  repeated string input = 2;
+  string encoding_format = 3;  // "float" or "base64"
+}
+
+message EmbeddingResponse {
+  string object = 1;
+  repeated EmbeddingData data = 2;
+  string model = 3;
+  Usage usage = 4;
+}
+
+message EmbeddingData {
+  string object = 1;
+  int32 index = 2;
+  repeated float embedding = 3;
+}
