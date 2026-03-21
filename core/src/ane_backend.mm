@@ -197,9 +197,17 @@ struct ANEBackend::Impl {
     std::string cacheDirectory;
 
     // Memory tracking
+    enum class AllocationOwner {
+        ANE,
+        MetalFallback,
+    };
+    struct AllocationRecord {
+        size_t size_bytes = 0;
+        AllocationOwner owner = AllocationOwner::ANE;
+    };
     std::atomic<size_t> allocatedBytes{0};
     std::mutex allocMutex;
-    std::unordered_map<void*, size_t> allocationSizes;
+    std::unordered_map<void*, AllocationRecord> allocations;
 
     // Metal backend reference for fallback operations (RoPE, FlashAttention)
     std::unique_ptr<MetalBackend> metalFallback;
@@ -702,7 +710,7 @@ void* ANEBackend::AllocateDevice(size_t size_bytes, size_t alignment) {
         impl_->allocatedBytes += size_bytes;
         {
             std::lock_guard<std::mutex> lock(impl_->allocMutex);
-            impl_->allocationSizes[ptr] = size_bytes;
+            impl_->allocations[ptr] = {size_bytes, ANEBackend::Impl::AllocationOwner::ANE};
         }
         return ptr;
     }
@@ -711,13 +719,25 @@ void* ANEBackend::AllocateDevice(size_t size_bytes, size_t alignment) {
 
 void ANEBackend::FreeDevice(void* ptr) {
     if (ptr) {
+        ANEBackend::Impl::AllocationOwner owner = ANEBackend::Impl::AllocationOwner::ANE;
         {
             std::lock_guard<std::mutex> lock(impl_->allocMutex);
-            auto it = impl_->allocationSizes.find(ptr);
-            if (it != impl_->allocationSizes.end()) {
-                impl_->allocatedBytes -= it->second;
-                impl_->allocationSizes.erase(it);
+            auto it = impl_->allocations.find(ptr);
+            if (it != impl_->allocations.end()) {
+                impl_->allocatedBytes -= it->second.size_bytes;
+                owner = it->second.owner;
+                impl_->allocations.erase(it);
             }
+        }
+        if (owner == ANEBackend::Impl::AllocationOwner::MetalFallback) {
+            if (MetalBackend* metal = impl_->GetMetalFallback()) {
+                metal->FreeDevice(ptr);
+                return;
+            }
+            std::cerr << "[ANEBackend] Warning: lost Metal fallback for unified allocation "
+                         "during free: "
+                      << ptr << std::endl;
+            return;
         }
         free(ptr);
     }
@@ -746,7 +766,14 @@ void* ANEBackend::AllocateUnified(size_t size_bytes, size_t alignment) {
     // to the Metal GPU backend.
     MetalBackend* metal = impl_->GetMetalFallback();
     if (metal) {
-        return metal->AllocateUnified(size_bytes, alignment);
+        void* ptr = metal->AllocateUnified(size_bytes, alignment);
+        if (ptr) {
+            impl_->allocatedBytes += size_bytes;
+            std::lock_guard<std::mutex> lock(impl_->allocMutex);
+            impl_->allocations[ptr] = {size_bytes,
+                                       ANEBackend::Impl::AllocationOwner::MetalFallback};
+        }
+        return ptr;
     }
     // Fallback to posix_memalign if Metal is unavailable.
     return AllocateDevice(size_bytes, alignment);
