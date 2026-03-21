@@ -81,15 +81,17 @@ void RMSNormImpl(const float* HWY_RESTRICT x, const float* HWY_RESTRICT weight, 
     const auto v_scale = hn::Set(d, scale);
 
     // 3. Normalize and scale
+    // [P4 fix] Reorder multiplications: compute (v_scale * v_w) first so the
+    // compiler can issue it independently of v_x, enabling better out-of-order
+    // scheduling on superscalar pipelines.
     i = 0;
     for (; i + hn::Lanes(d) <= n; i += hn::Lanes(d)) {
         const auto v_x = hn::LoadU(d, x + i);
-        const auto v_w = hn::LoadU(d, weight + i);
-        const auto v_out = hn::Mul(hn::Mul(v_x, v_scale), v_w);
-        hn::StoreU(v_out, d, out + i);
+        const auto v_sw = hn::Mul(v_scale, hn::LoadU(d, weight + i));  // no dep on v_x
+        hn::StoreU(hn::Mul(v_x, v_sw), d, out + i);
     }
     for (; i < n; ++i) {
-        out[i] = x[i] * scale * weight[i];
+        out[i] = x[i] * (scale * weight[i]);
     }
 }
 
@@ -139,15 +141,16 @@ void AddRMSNormImpl(float* HWY_RESTRICT x_out, const float* HWY_RESTRICT x, cons
     const auto v_scale = hn::Set(d, scale);
 
     // Pass 2: Normalize and scale
+    // [P4 fix] Compute (v_scale * v_w) before loading v_val to allow
+    // independent scheduling of the weight multiply.
     i = 0;
     for (; i + hn::Lanes(d) <= n; i += hn::Lanes(d)) {
+        const auto v_sw = hn::Mul(v_scale, hn::LoadU(d, weight + i));
         const auto v_val = hn::LoadU(d, x_out + i);
-        const auto v_w = hn::LoadU(d, weight + i);
-        const auto v_res = hn::Mul(hn::Mul(v_val, v_scale), v_w);
-        hn::StoreU(v_res, d, x_out + i);
+        hn::StoreU(hn::Mul(v_val, v_sw), d, x_out + i);
     }
     for (; i < n; ++i) {
-        x_out[i] = x_out[i] * scale * weight[i];
+        x_out[i] = x_out[i] * (scale * weight[i]);
     }
 }
 

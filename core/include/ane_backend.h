@@ -198,6 +198,19 @@ public:
     void CopyToDevice(void* dst, const void* src, size_t size_bytes) override;
     void CopyFromDevice(void* dst, const void* src, size_t size_bytes) override;
 
+    /**
+     * @brief Allocate unified memory for zero-copy CPU↔GPU↔ANE access
+     *
+     * Delegates to the Metal fallback backend's AllocateDevice() which
+     * creates an MTLStorageModeShared buffer. This ensures that memory
+     * allocated through ANEBackend is truly zero-copy accessible by
+     * Metal GPU kernels used in the fallback path, avoiding hidden
+     * copies between posix_memalign'd CPU memory and GPU buffers.
+     *
+     * Falls back to AllocateDevice (posix_memalign) if Metal is unavailable.
+     */
+    void* AllocateUnified(size_t size_bytes, size_t alignment = 0) override;
+
     // Core operations (use pre-compiled CoreML models)
     void MatMul(const Tensor& A, const Tensor& B, Tensor* C) override;
     void MatMulTransB(const Tensor& A, const Tensor& B, Tensor* C) override;
@@ -228,26 +241,42 @@ public:
     // ===========================================================================
 
     /**
-     * @brief Check if an operation is natively supported on ANE
+     * @brief Check if an operation runs natively on ANE hardware
      *
-     * Operations NOT natively supported will use CPU fallback (Accelerate).
-     * Currently supported: MatMul (with pre-compiled .mlmodelc)
-     * CPU fallback: RMSNorm, Softmax, RoPE, FlashAttention, GemmInt4
+     * IMPORTANT: Individual op calls (MatMul, RMSNorm, etc.) delegate to
+     * Metal GPU or CPU Accelerate — they do NOT run on the Neural Engine.
+     *
+     * True ANE execution requires pre-compiled CoreML models loaded via:
+     * - CompileTransformerLayer() → ExecuteTransformerLayer()
+     * - CompileMatMul() with a cached .mlmodelc → ExecuteMatMul()
+     *
+     * The fused transformer layer path (CompileTransformerLayer) compiles
+     * QKV+RoPE+Attention+FFN as a single CoreML graph, eliminating the
+     * per-op ANE↔CPU transition overhead that would otherwise make
+     * individual ANE dispatches slower than GPU.
      *
      * @param op Operation type to check
-     * @return true if operation runs natively on ANE
+     * @return true only if a pre-compiled .mlmodelc can run this on ANE
      */
     static bool SupportsOperation(ANEOpType op) {
         switch (op) {
         case ANEOpType::MatMul:
-        case ANEOpType::MatMulBias: return true;  // Requires pre-compiled .mlmodelc
+        case ANEOpType::MatMulBias:
+            // Requires pre-compiled .mlmodelc; without it, falls back to Metal GPU.
+            return true;
+        case ANEOpType::Attention:
+        case ANEOpType::FFN:
+            // Supported via fused CompileTransformerLayer path (requires offline
+            // CoreML compilation with coremltools + xcrun coremlcompiler).
+            return true;
         case ANEOpType::RMSNorm:
         case ANEOpType::LayerNorm:
         case ANEOpType::SiLU:
         case ANEOpType::GeLU:
-        case ANEOpType::Softmax: return false;  // CPU fallback (Accelerate vDSP)
-        case ANEOpType::Attention:
-        case ANEOpType::FFN: return false;  // Requires complex model compilation
+        case ANEOpType::Softmax:
+            // These use Metal GPU fallback (preferred) or CPU Accelerate vDSP.
+            // They are included in fused transformer layers when compiled offline.
+            return false;
         default: return false;
         }
     }

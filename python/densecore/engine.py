@@ -408,7 +408,7 @@ def _find_library() -> str:
     Find the DenseCore shared library.
 
     Searches in:
-    1. Package directory
+    1. Package directory (including pip-installed cpython-suffixed names)
     2. Parent directories (for development)
     3. System library paths
     4. LD_LIBRARY_PATH / DYLD_LIBRARY_PATH
@@ -419,12 +419,12 @@ def _find_library() -> str:
     Raises:
         RuntimeError: If library cannot be found
     """
-    if platform.system() == "Windows":
-        lib_names = ["densecore.dll"]
-    elif platform.system() == "Darwin":
+    if platform.system() == "Darwin":
         lib_names = ["libdensecore.dylib"]
+        glob_pattern = "libdensecore*.dylib"
     else:
         lib_names = ["libdensecore.so", "libdensecore.so.1"]
+        glob_pattern = "libdensecore*.so"
 
     repo_root = Path(__file__).parent.parent.parent
     search_paths = [
@@ -448,6 +448,11 @@ def _find_library() -> str:
             lib_path = search_path / lib_name
             if lib_path.exists():
                 return str(lib_path)
+
+    # Fallback: glob for pip-installed wheel names (e.g. libdensecore.cpython-311-x86_64-linux-gnu.so)
+    candidates = sorted(Path(__file__).parent.glob(glob_pattern))
+    if candidates:
+        return str(candidates[0])
 
     raise RuntimeError(
         f"Could not find DenseCore library. Searched in: {[str(p) for p in search_paths]}"

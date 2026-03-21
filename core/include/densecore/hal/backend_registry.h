@@ -18,6 +18,12 @@
 
 #include "compute_backend.h"
 
+#ifdef __APPLE__
+namespace densecore {
+class HybridScheduler;
+}
+#endif
+
 namespace densecore {
 
 /**
@@ -125,6 +131,19 @@ public:
      */
     bool IsInitialized() const { return initialized_.load(std::memory_order_acquire); }
 
+#ifdef __APPLE__
+    /**
+     * @brief Get the Apple Silicon hybrid scheduler (CPU+GPU+ANE)
+     *
+     * Returns nullptr on non-Apple platforms or if backends haven't been
+     * registered yet. The scheduler is lazily created on first call and
+     * wired to the registered CPU, Metal, and ANE backends.
+     *
+     * @return Pointer to HybridScheduler, nullptr if unavailable
+     */
+    HybridScheduler* GetHybridScheduler();
+#endif
+
 private:
     BackendRegistry() = default;
     BackendRegistry(const BackendRegistry&) = delete;
@@ -134,6 +153,10 @@ private:
     std::unordered_map<DeviceType, std::unique_ptr<ComputeBackend>> backends_;
     DeviceType default_device_ = DeviceType::CPU;
     std::atomic<bool> initialized_{false};
+
+#ifdef __APPLE__
+    std::unique_ptr<HybridScheduler> hybridScheduler_;
+#endif
 };
 
 /**

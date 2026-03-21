@@ -177,6 +177,24 @@ public:
      */
     DeviceType Device() const override { return DeviceType::METAL; }
 
+    /**
+     * @brief Capability manifest reflecting actual Metal kernel coverage
+     *
+     * Native ops include all operations with custom Metal shaders or MPS
+     * implementations: MatMul, GEMV, Softmax, RMSNorm, AddRMSNorm, RoPE,
+     * FlashAttention, FusedQKV, and quantized INT4/INT8 GEMV/GEMM.
+     */
+    BackendCapabilityManifest GetCapabilityManifest() const override;
+
+    /**
+     * @brief Allocate unified memory via MTLStorageModeShared
+     *
+     * Explicitly allocates a Metal buffer with MTLStorageModeShared,
+     * returning the contents pointer for true zero-copy CPU↔GPU access.
+     * This is the preferred allocation path on Apple Silicon UMA.
+     */
+    void* AllocateUnified(size_t size_bytes, size_t alignment = 0) override;
+
     // =========================================================================
     // ComputeBackend Interface - Memory Management
     // =========================================================================

@@ -1,5 +1,6 @@
 #include "kv_cache.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -124,8 +125,11 @@ int BlockManager::AllocateSingle() {
         return -1;
     }
 
-    // Try random shard first to spread load
-    int start_shard = rand() % NUM_SHARDS;
+    // [P3 fix] Round-robin shard selection via atomic counter.
+    // rand() is not thread-safe (global state, data race under TSAN).
+    // An atomic counter gives uniform distribution without the race.
+    static std::atomic<uint32_t> rr_counter{0};
+    int start_shard = static_cast<int>(rr_counter.fetch_add(1, std::memory_order_relaxed) % NUM_SHARDS);
 
     for (int i = 0; i < NUM_SHARDS; ++i) {
         int shard_idx = (start_shard + i) % NUM_SHARDS;

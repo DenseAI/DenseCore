@@ -74,9 +74,7 @@ class CMakeBuild(build_ext):
 
         import platform
 
-        if platform.system() == "Windows":
-            lib_patterns = ["densecore.dll", "libdensecore.dll"]
-        elif platform.system() == "Darwin":
+        if platform.system() == "Darwin":
             lib_patterns = ["libdensecore.dylib", "libdensecore.so"]
         else:
             lib_patterns = ["libdensecore.so"]
@@ -223,7 +221,6 @@ setup(
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
         "Operating System :: POSIX :: Linux",
-        "Operating System :: Microsoft :: Windows",
         "Programming Language :: C++",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.10",
@@ -231,7 +228,7 @@ setup(
         "Programming Language :: Python :: 3.12",
     ],
     package_data={
-        "densecore": ["py.typed", "*.so", "*.dll"],
+        "densecore": ["py.typed", "*.so"],
     },
     include_package_data=True,
     zip_safe=False,

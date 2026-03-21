@@ -400,13 +400,33 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_work_;
     std::condition_variable cv_done_;
-    std::atomic<int> completed_count_{0};
-    std::atomic<bool> work_ready_{false};  // Atomic for lock-free spin check
-    std::atomic<bool> shutdown_{false};    // Atomic for lock-free spin check
-    std::atomic<uint64_t> generation_{0};  // Atomic for lock-free spin check
-    std::atomic<int> active_threads_{1};
 
-    // Work specification (generic parallel_for)
+    // [P2 fix] Each hot atomic on its own 64-byte cache line.
+    //
+    // Without alignas(64):
+    //   completed_count_ (4B), work_ready_ (1B), shutdown_ (1B),
+    //   generation_ (8B), active_threads_ (4B) all land on the same
+    //   cache line.  Workers do fetch_add(completed_count_) while the
+    //   main thread writes work_ready_/generation_ — causing cache
+    //   ping-pong between cores (false sharing).
+    //
+    // With alignas(64):
+    //   Each atomic occupies its own line; writes to different atomics
+    //   no longer invalidate each other's cache lines.
+    alignas(64) std::atomic<int> completed_count_{0};
+    alignas(64) std::atomic<bool> work_ready_{false};  // lock-free spin check
+    alignas(64) std::atomic<bool> shutdown_{false};    // lock-free spin check
+    alignas(64) std::atomic<uint64_t> generation_{0};  // lock-free spin check
+    alignas(64) std::atomic<int> active_threads_{1};
+
+    // Work specification (generic parallel_for).
+    //
+    // [P6 note] current_work_fn_ is a raw pointer to a std::function owned by
+    // the caller — no heap allocation occurs here.  The remaining overhead is
+    // one virtual dispatch (~3 ns) per thread dispatch, which is negligible
+    // vs. typical work-item latency.  A template-based approach (e.g. storing
+    // void(*)(int,int,int,void*) + void* ctx) would eliminate this dispatch
+    // but requires API changes; deferred until benchmarks show it matters.
     const std::function<void(int, int, int)>* current_work_fn_ = nullptr;
     int total_work_ = 0;
 

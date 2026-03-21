@@ -57,7 +57,18 @@ HWY_INLINE float UnpackNibbleScalar(const uint8_t* packed, int k, float scale, f
 }
 
 // ============================================================================
-// Prepack: Linear copy (layout already optimal for sequential access)
+// Prepack: row-major identity copy
+//
+// [P5 fix] The function was named "Interleaved" but performed a plain row-wise
+// memcpy — no interleaving of nibbles or bytes occurred.  The row-major layout
+// (each row packed contiguously as K/2 bytes) is already optimal for the
+// N-blocked GEMV kernel above, which walks each weight row sequentially.
+//
+// Renamed conceptually to "identity prepack": validates and copies the
+// already-optimal layout.  A true interleaved layout (e.g. interleaving bytes
+// from adjacent rows for VNNI-style access) would require a different kernel
+// and is not currently used.  If an interleaved layout is needed in the future,
+// add a separate PrepackInt4WeightsInterleaved() that does actual reordering.
 // ============================================================================
 void PrepackInt4WeightsInterleavedImpl(const uint8_t* HWY_RESTRICT src, uint8_t* HWY_RESTRICT dst, int K, int N,
                                        int group_size, int block_size) {

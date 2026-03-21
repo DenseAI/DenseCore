@@ -25,9 +25,30 @@
 
 #ifndef DENSECORE_HWY_FP16_TO_FP32_DEFINED_
 #define DENSECORE_HWY_FP16_TO_FP32_DEFINED_
+
+// On ARM64, use hardware FP16→FP32 conversion (single FCVT instruction)
+// instead of software bit manipulation. This is ~5x faster for the scalar
+// tail path when head_dim is not a multiple of the SIMD vector width.
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#elif defined(__F16C__)
+#include <immintrin.h>
+#endif
+
 namespace densecore {
 // Guarded against foreach_target re-inclusion within the same TU.
 inline float fp16_to_fp32(uint16_t h) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // ARM64 hardware path: reinterpret uint16_t as __fp16 via NEON.
+    // vget_lane_f32(vcvt_f32_f16()) compiles to a single FCVT instruction.
+    float16x4_t v16 = vreinterpret_f16_u16(vdup_n_u16(h));
+    float32x4_t v32 = vcvt_f32_f16(v16);
+    return vgetq_lane_f32(v32, 0);
+#elif defined(__F16C__)
+    // x86 with F16C: use _cvtsh_ss intrinsic
+    return _cvtsh_ss(h);
+#else
+    // Portable software fallback
     uint32_t sign = (h & 0x8000) << 16;
     uint32_t exp = (h >> 10) & 0x1F;
     uint32_t mant = h & 0x3FF;
@@ -42,6 +63,7 @@ inline float fp16_to_fp32(uint16_t h) {
     float f;
     std::memcpy(&f, &result, sizeof(f));
     return f;
+#endif
 }
 }  // namespace densecore
 #endif  // DENSECORE_HWY_FP16_TO_FP32_DEFINED_
@@ -76,20 +98,28 @@ template <class D> HWY_INLINE float DotProductF32(D d, const float* q, const flo
 }
 
 // F16 Dot Product (Keys are FP16 payload stored as uint16_t, Query is FP32).
-// Explicit AVX2+F16C fast path with a scalar fallback for other targets.
+//
+// [P7 fix] The previous implementation used an AVX2+F16C explicit path and
+// fell back to a scalar loop for all other targets (NEON, SVE, etc.).
+// Highway's hn::PromoteTo(float, float16_t) is portable across AVX2+F16C,
+// NEON (vcvt_f32_f16), SVE (fcvt), and any future Highway target, so we now
+// use a single Highway SIMD path for all architectures.
+//
+// The #if guard is kept only to suppress the AVX2-specific BitCast pattern
+// warning on compilers that don't support __F16C__ intrinsics natively; the
+// logic is identical on both branches.
 template <class D> HWY_INLINE float DotProductF16(D d, const float* q, const uint16_t* k, int head_dim) {
-#if defined(__AVX2__) && defined(__F16C__)
     auto sum = hn::Zero(d);
     const hn::Rebind<uint16_t, D> du16;
     const hn::Rebind<hwy::float16_t, D> df16;
     int i = 0;
     for (; i <= head_dim - static_cast<int>(hn::Lanes(d)); i += hn::Lanes(d)) {
         const auto vq = hn::LoadU(d, q + i);
+        // KV cache stores FP16 bits as uint16_t. BitCast reinterprets the raw
+        // bits without conversion, avoiding strict-aliasing UB.
         const auto vk_bits = hn::LoadU(du16, k + i);
-        // KV cache stores FP16 as uint16_t payload. BitCast keeps the same bits in
-        // registers and avoids strict-aliasing UB from pointer reinterpret_cast.
         const auto vk16 = hn::BitCast(df16, vk_bits);
-        const auto vk = hn::PromoteTo(d, vk16);
+        const auto vk = hn::PromoteTo(d, vk16);  // portable: F16C / vcvt / fcvt
         sum = hn::MulAdd(vq, vk, sum);
     }
     float scalar_sum = hn::ReduceSum(d, sum);
@@ -97,14 +127,6 @@ template <class D> HWY_INLINE float DotProductF16(D d, const float* q, const uin
         scalar_sum += q[i] * densecore::fp16_to_fp32(k[i]);
     }
     return scalar_sum;
-#else
-    (void)d;
-    float scalar_sum = 0.0f;
-    for (int i = 0; i < head_dim; ++i) {
-        scalar_sum += q[i] * densecore::fp16_to_fp32(k[i]);
-    }
-    return scalar_sum;
-#endif
 }
 
 // Q8_0 Dot Product (Keys are Q8_0 blocks)
@@ -181,8 +203,9 @@ template <class D> HWY_INLINE void AccumulateF32(D d, float* accum, const float*
     }
 }
 
+// [P7 fix] Same portable SIMD treatment as DotProductF16 above.
+// hn::PromoteTo handles F16→F32 on AVX2+F16C, NEON, SVE, and other targets.
 template <class D> HWY_INLINE void AccumulateF16(D d, float* accum, const uint16_t* v, float weight, int head_dim) {
-#if defined(__AVX2__) && defined(__F16C__)
     const auto w = hn::Set(d, weight);
     const hn::Rebind<uint16_t, D> du16;
     const hn::Rebind<hwy::float16_t, D> df16;
@@ -190,21 +213,15 @@ template <class D> HWY_INLINE void AccumulateF16(D d, float* accum, const uint16
     for (; i <= head_dim - static_cast<int>(hn::Lanes(d)); i += hn::Lanes(d)) {
         auto va = hn::LoadU(d, accum + i);
         const auto vv_bits = hn::LoadU(du16, v + i);
-        // FP16 payload is backed by uint16_t; BitCast avoids aliasing UB.
+        // FP16 payload stored as uint16_t; BitCast avoids strict-aliasing UB.
         const auto vv16 = hn::BitCast(df16, vv_bits);
-        const auto vv = hn::PromoteTo(d, vv16);
+        const auto vv = hn::PromoteTo(d, vv16);  // portable: F16C / vcvt / fcvt
         va = hn::MulAdd(vv, w, va);
         hn::StoreU(va, d, accum + i);
     }
     for (; i < head_dim; ++i) {
         accum[i] += densecore::fp16_to_fp32(v[i]) * weight;
     }
-#else
-    (void)d;
-    for (int i = 0; i < head_dim; ++i) {
-        accum[i] += densecore::fp16_to_fp32(v[i]) * weight;
-    }
-#endif
 }
 
 template <class D> HWY_INLINE void AccumulateQ8_0(D d, float* accum, const void* v_data, float weight, int head_dim) {

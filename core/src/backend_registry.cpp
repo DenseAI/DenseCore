@@ -34,6 +34,7 @@
 // =============================================================================
 #ifdef __APPLE__
 #include "../include/ane_backend.h"
+#include "../include/hybrid_scheduler.h"
 #include "../include/metal_backend.h"
 #endif
 
@@ -282,5 +283,62 @@ bool BackendRegistry::SupportsProfile(DeviceType device, InferenceProfile profil
     }
     return it->second->SupportsProfile(profile, include_fallback);
 }
+
+// =============================================================================
+// Apple Silicon Hybrid Scheduler
+// =============================================================================
+#ifdef __APPLE__
+HybridScheduler* BackendRegistry::GetHybridScheduler() {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        RegisterCpuBackend();
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (hybridScheduler_) {
+        return hybridScheduler_.get();
+    }
+
+    // Only create if we have at least CPU + Metal
+    auto cpu_it = backends_.find(DeviceType::CPU);
+    auto metal_it = backends_.find(DeviceType::METAL);
+    if (cpu_it == backends_.end()) {
+        return nullptr;
+    }
+
+    try {
+        hybridScheduler_ = std::make_unique<HybridScheduler>();
+
+        // Wire backends
+        hybridScheduler_->SetCpuBackend(
+            static_cast<CpuBackend*>(cpu_it->second.get()));
+
+        if (metal_it != backends_.end()) {
+            hybridScheduler_->SetGpuBackend(
+                static_cast<MetalBackend*>(metal_it->second.get()));
+        }
+
+        auto npu_it = backends_.find(DeviceType::NPU);
+        if (npu_it != backends_.end()) {
+            // NPU slot may hold ANEBackend or QnnBackend; only wire ANE.
+            auto* ane = dynamic_cast<ANEBackend*>(npu_it->second.get());
+            if (ane) {
+                hybridScheduler_->SetAneBackend(ane);
+            }
+        }
+
+        std::cout << "[BackendRegistry] Created HybridScheduler with"
+                  << (metal_it != backends_.end() ? " Metal" : "")
+                  << " backends" << std::endl;
+
+        return hybridScheduler_.get();
+    } catch (const std::exception& e) {
+        std::cerr << "[BackendRegistry] HybridScheduler init failed: "
+                  << e.what() << std::endl;
+        hybridScheduler_.reset();
+        return nullptr;
+    }
+}
+#endif
 
 }  // namespace densecore

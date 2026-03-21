@@ -654,19 +654,31 @@ ANEBackend::~ANEBackend() {
 BackendCapabilityManifest ANEBackend::GetCapabilityManifest() const {
     BackendCapabilityManifest manifest;
 
-    // Current ANE-native path: precompiled MatMul variants.
+    // ANE-native ops: These run on the Neural Engine when pre-compiled
+    // .mlmodelc files are available (via CompileMatMul/CompileTransformerLayer).
+    // Without cached models, they transparently fall back to Metal GPU.
     manifest.native_ops = {
         OpType::MatMul,
         OpType::MatMulTransB,
     };
 
-    // Implemented fallback coverage in ANE backend (Metal/CPU).
+    // Fallback ops: Implemented via Metal GPU (preferred) or CPU Accelerate.
+    // All ops listed here have working implementations in this backend,
+    // but they execute on Metal/CPU rather than the Neural Engine itself.
+    // The fused CompileTransformerLayer path runs all these on ANE as a
+    // single CoreML graph, which is the recommended production path.
     manifest.fallback_ops = {
-        OpType::Embedding,  // embedding lookup remains host/CPU side
-        OpType::GemmInt4,       OpType::RMSNorm, OpType::AddRMSNorm,
-        OpType::LayerNorm,      OpType::Softmax, OpType::SiLU,
-        OpType::GELU,           OpType::RoPE,    OpType::FusedQKVProjection,
-        OpType::FlashAttention,
+        OpType::Embedding,          // Table lookup — CPU
+        OpType::GemmInt4,           // Cached dequant + Metal GPU GEMM
+        OpType::RMSNorm,            // Metal GPU or CPU Accelerate vDSP
+        OpType::AddRMSNorm,         // Metal GPU or CPU Accelerate
+        OpType::LayerNorm,          // CPU implementation
+        OpType::Softmax,            // Metal GPU or CPU
+        OpType::SiLU,               // CPU implementation
+        OpType::GELU,               // CPU implementation
+        OpType::RoPE,               // Metal GPU kernel
+        OpType::FusedQKVProjection, // Metal GPU kernel
+        OpType::FlashAttention,     // Metal GPU FlashAttention kernel
     };
 
     // ANE-only mode forbids fallback use by design.
@@ -722,6 +734,22 @@ void ANEBackend::CopyFromDevice(void* dst, const void* src, size_t size_bytes) {
     if (dst && src && size_bytes > 0) {
         std::memcpy(dst, src, size_bytes);
     }
+}
+
+void* ANEBackend::AllocateUnified(size_t size_bytes, size_t alignment) {
+    if (size_bytes == 0) {
+        return nullptr;
+    }
+    // Prefer Metal allocation for true UMA zero-copy between CPU, GPU, and ANE.
+    // Metal's AllocateDevice creates MTLStorageModeShared buffers, which avoids
+    // hidden copies when fallback ops (RMSNorm, FlashAttention, etc.) delegate
+    // to the Metal GPU backend.
+    MetalBackend* metal = impl_->GetMetalFallback();
+    if (metal) {
+        return metal->AllocateUnified(size_bytes, alignment);
+    }
+    // Fallback to posix_memalign if Metal is unavailable.
+    return AllocateDevice(size_bytes, alignment);
 }
 
 // =============================================================================

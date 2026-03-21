@@ -1973,9 +1973,49 @@ const char* MetalBackend::Name() const {
     return name_;
 }
 
+BackendCapabilityManifest MetalBackend::GetCapabilityManifest() const {
+    BackendCapabilityManifest manifest;
+
+    // Native ops: operations with custom Metal shaders or MPS implementations.
+    // All these have actual GPU kernel paths in this backend.
+    manifest.native_ops = {
+        OpType::MatMul,             // MPS GEMM + custom GEMV kernel
+        OpType::MatMulTransB,       // MPS GEMM (transposeRight)
+        OpType::GemmInt4,           // Custom quantized GEMV (Q4_0/Q4_1) + GPU dequant→MPS GEMM
+        OpType::Softmax,            // Custom Metal softmax kernel
+        OpType::RMSNorm,            // Custom Metal RMSNorm kernel
+        OpType::AddRMSNorm,         // Custom Metal fused add+RMSNorm kernel
+        OpType::RoPE,               // Custom Metal RoPE kernel
+        OpType::FlashAttention,     // Custom Metal FlashAttention decode + prefill kernels
+        OpType::FusedQKVProjection, // Custom Metal fused QKV GEMV kernel
+    };
+
+    // Fallback ops: operations that this backend can serve via CPU (Accelerate.framework)
+    // but does not have dedicated GPU kernels for.
+    manifest.fallback_ops = {
+        OpType::Embedding,   // Table lookup — memory bound, CPU is fine
+        OpType::LayerNorm,   // Can use CPU Accelerate; Metal kernel TODO
+        OpType::SiLU,        // Element-wise — CPU Accelerate is sufficient
+        OpType::GELU,        // Element-wise — CPU Accelerate is sufficient
+    };
+
+    manifest.allow_cpu_fallback = true;
+    manifest.declared_complete = false;
+    return manifest;
+}
+
 // ============================================================================
 // ComputeBackend Interface - Memory Management
 // ============================================================================
+
+void* MetalBackend::AllocateUnified(size_t size_bytes, size_t alignment) {
+    // Explicitly route to AllocateDevice which creates MTLStorageModeShared buffers.
+    // This documents that Metal's AllocateDevice already provides UMA zero-copy.
+    if (alignment == 0) {
+        alignment = 64;  // Metal optimal alignment
+    }
+    return AllocateDevice(size_bytes, alignment);
+}
 
 void* MetalBackend::AllocateDevice(size_t size_bytes, size_t alignment) {
     if (size_bytes == 0) {

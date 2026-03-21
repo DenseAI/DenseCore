@@ -2,7 +2,7 @@
 recursive-include densecore/core_src *
 
 # Include shared libraries (if pre-built/wheel)
-recursive-include densecore *.so *.dylib *.dll
+recursive-include densecore *.so *.dylib
 
 # Include PEP 561 type hints
 include densecore/py.typed

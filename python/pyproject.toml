@@ -33,7 +33,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS :: MacOS X",
-    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -46,7 +45,7 @@ dependencies = [
     "huggingface-hub>=0.20.0,<1.0.0",
     "numpy>=2.4.2; python_version>='3.11'",
     "numpy>=2.0.2,<2.4.0; python_version<'3.11'",
-    "gguf>=0.18.0",
+    "gguf>=0.6.0",
 ]
 
 [project.optional-dependencies]
@@ -71,7 +70,6 @@ full = [
     "langchain-community>=0.4.1",
     "langchain>=1.0.0",
     "langgraph>=1.0.0",
-    "langchain-classic>=1.0.0",
     "langchain-text-splitters>=1.0.0",
 ]
 langchain = [
@@ -79,7 +77,6 @@ langchain = [
     "langchain-community>=0.4.1",
     "langchain>=1.0.0",
     "langgraph>=1.0.0",
-    "langchain-classic>=1.0.0",
     "langchain-text-splitters>=1.0.0",
 ]
 dev = [
@@ -113,7 +110,6 @@ include = ["densecore*"]
 densecore = [
     "*.so",
     "*.dylib",
-    "*.dll",
     "py.typed",
     "core_src/*",
     "core_src/**/*",
