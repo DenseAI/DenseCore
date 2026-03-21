@@ -1,6 +1,8 @@
 # Hardware Support & Backends
 
-DenseCore utilizes a Hardware Abstraction Layer (HAL) to support a wide range of devices without compromising performance.
+DenseCore is built as a **heterogeneous inference runtime** — not a GPU-fallback or CPU-only engine. The Hardware Abstraction Layer (HAL) enables runtime kernel selection across x86, ARM64, and Apple Silicon, so the same binary adapts to the available hardware without recompilation.
+
+This is the foundation of DenseCore's role as the **runtime substrate** of the Dense Series stack: one execution engine for edge nodes, ARM servers, cloud CPU instances, Apple Silicon workstations, and Jetson devices.
 
 ## Supported Architectures
 

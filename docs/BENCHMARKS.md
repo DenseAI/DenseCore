@@ -1,5 +1,7 @@
 # DenseCore Decode Benchmark (Best Combo, Reproducible)
 
+> **Benchmark scope note:** DenseCore's primary differentiation is not peak tok/s alone. The full KPI set is: TTFT, p95/p99 latency, jitter, tokens/sec per dollar, joules/token, memory footprint, queue pressure, and hardware portability. The results below document decode throughput on a single x86 host; broader hardware and KPI coverage is tracked in ongoing benchmark work.
+
 ## 1) Goal
 
 - Updated: `2026-02-17`

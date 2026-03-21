@@ -5,7 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/densecore)](https://pypi.org/project/densecore/)
 [![Docker Hub](https://img.shields.io/docker/pulls/densecore/densecore)](https://hub.docker.com/r/densecore/densecore)
 
-DenseCore is an open-source inference runtime built around a native C++ engine, a Python SDK, and a production API server.
+DenseCore is an open-source **memory-centric execution runtime for heterogeneous AI inference** — a C++ engine, Python SDK, and production API server that maximizes locality, utilization, and determinism across x86, ARM64, and Apple Silicon hardware.
 
 The repository currently exposes three primary surfaces:
 
@@ -23,6 +23,9 @@ The repository currently exposes three primary surfaces:
 - LoRA adapter loading from Python
 - Docker deployment for the API server
 - Helm chart for Kubernetes deployment
+- Heterogeneous hardware backends: x86 AVX2/AVX-512/AMX, ARM64 SVE/NEON, Apple Silicon Metal/ANE/Accelerate
+- Hybrid scheduler for CPU+GPU+ANE orchestration on Apple Silicon
+- NUMA-aware paged KV cache and memory subsystem
 
 ## Repository Layout
 
@@ -99,6 +102,24 @@ make server
 | Python embedding / local inference | `pip install densecore` |
 | Containerized HTTP/gRPC server | `docker pull densecore/densecore:latest` |
 | Interactive TUI or source-built server binary | build from this repository |
+
+## Architecture
+
+DenseCore operates as the **runtime substrate** of the Dense Series stack:
+
+```
+Client / SDK / App
+  → DenseCloud chassis (middleware, health, metrics, graceful shutdown)
+  → DenseEnterprise policy / auth / quota / audit
+  → DenseCore scheduler / memory / kernels / HAL
+  → heterogeneous hardware (x86 / ARM64 / Apple Silicon / Jetson)
+```
+
+DenseCore owns:
+- **Scheduler & worker loop** — continuous batching, preemption, request lifecycle
+- **Memory subsystem** — paged KV cache, NUMA-aware allocator, HugePages, arena allocator
+- **Kernel layer** — SIMD kernels (AVX2/AVX-512/AMX, SVE/NEON), Flash Attention, MoE routing
+- **HAL (Hardware Abstraction Layer)** — runtime kernel selection, hybrid CPU+GPU+ANE scheduler
 
 ## HTTP API Summary
 

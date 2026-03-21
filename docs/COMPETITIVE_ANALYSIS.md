@@ -8,9 +8,9 @@
 
 ## 1. Executive Summary
 
-**Verdict:** DenseCore is **not** a direct competitor to high-throughput GPU engines (vLLM, TensorRT-LLM) for large models (>70B). Instead, it acts as a **category-defining solution for "High-Performance CPU Inference"** specifically targeting Small Language Models (SLMs, <8B) and cost-sensitive scale-out architectures.
+**Verdict:** DenseCore is the **memory-centric execution runtime for heterogeneous AI inference** — the runtime substrate of the Dense Series stack. It is not a GPU-fallback for when GPUs are unavailable, but an execution platform that maximizes locality, utilization, determinism, and intelligence per joule across heterogeneous fleet hardware (x86, ARM64, Apple Silicon, Jetson).
 
-Its primary strength lies in **Total Cost of Ownership (TCO)** and **Operational Simplicity**—bridging the gap between the raw hackability of `llama.cpp` and the production readiness of `vLLM`.
+Its primary strength lies in **fleet-wide hardware utilization**, **operational deployability**, and **memory efficiency** — bridging the gap between the raw hackability of `llama.cpp` and the production readiness of `vLLM`, while covering hardware diversity that GPU-only engines cannot address.
 
 ---
 
@@ -18,13 +18,13 @@ Its primary strength lies in **Total Cost of Ownership (TCO)** and **Operational
 
 | Feature | **DenseCore** | **llama.cpp** | **vLLM** | **Ollama** | **TensorRT-LLM** |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Primary Compute** | **CPU (AVX-512)** | CPU/Apple/GPU | GPU (CUDA/ROCm) | CPU/GPU (Hybrid) | Nvidia GPU |
-| **Target Model Size** | **SLMs (0.5B - 8B)** | Any | Large (>7B) | Any | Large (>7B) |
-| **Architecture** | C++ Core + Go Server | Pure C++ | Python/C++ | Go + C++ Wrapper | C++ / Triton |
-| **KV Cache** | **Paged (Block-based)** | Linear (mostly) | Paged (State of Art) | Linear | Paged (In-flight) |
-| **Quantization** | **GGML (Q4_K_M)** | GGML (All types) | AWQ / GPTQ | GGML | FP8 / INT8 |
+| **Compute** | **Heterogeneous (x86/ARM64/Apple/Jetson)** | CPU/Apple/GPU | GPU (CUDA/ROCm) | CPU/GPU (Hybrid) | Nvidia GPU |
+| **KV Cache** | **Paged + NUMA-aware** | Linear (mostly) | Paged | Linear | Paged (In-flight) |
+| **Hybrid Scheduler** | **CPU+GPU+ANE (Apple)** | None | None | None | None |
+| **Architecture** | C++ Core + Go Server + HAL | Pure C++ | Python/C++ | Go + C++ Wrapper | C++ / Triton |
+| **Quantization** | **INT4/INT8/FP8 (GGML)** | GGML (All types) | AWQ / GPTQ | GGML | FP8 / INT8 |
 | **DevEx** | **Native Python SDK** | Band-aid Bindings | Excellent Python | CLI / API Focus | Complex C++ |
-| **Use Case** | **Production Microservices** | Local / Edge / hacker | High-Traffic SaaS | Local Chatbot | Enterprise SaaS |
+| **Use Case** | **Heterogeneous fleet inference** | Local / Edge / hacker | High-Traffic SaaS | Local Chatbot | Enterprise SaaS |
 
 ---
 
@@ -38,14 +38,14 @@ Its primary strength lies in **Total Cost of Ownership (TCO)** and **Operational
 *   **Verdict**: Use `llama.cpp` for running locally on a MacBook. Use **DenseCore** for deploying a Docker container to Kubernetes on AWS Fargate/EC2.
 
 ### 🆚 DenseCore vs. vLLM / TensorRT-LLM
-> *"Can it beat GPU performance?"*
+> *"Does it compete with GPU engines?"*
 
-*   **Reality Check**: access memory bandwidth on H100 GPU (3TB/s) vs DDR4 RAM (50GB/s) is a 60x difference. DenseCore will never beat vLLM on raw throughput.
-*   **The "Good Enough" Threshold**: For SLMs (e.g., Qwen2.5-0.5B), DenseCore achieves **28 TPS** on cheap CPUs. This crosses the "real-time reading speed" threshold.
-*   **TCO**:
-    *   **vLLM Cluster**: Requires expensive GPU instances (e.g., `g5.xlarge` @ ~$1.00/hr). High idle cost.
-    *   **DenseCore Fleet**: Runs on spot CPU instances (e.g., `c7i.large` @ ~$0.08/hr).
-*   **Verdict**: DenseCore wins on **Cost-Efficiency** for models <4B parameters.
+*   **Different Axis**: vLLM/TensorRT-LLM optimize for peak GPU throughput. DenseCore optimizes for **fleet-wide utilization, memory locality, and deployability** — on the hardware that already exists in most organizations.
+*   **Heterogeneous Reality**: Most inference fleets are not homogeneous H100 clusters. Edge nodes, ARM servers, Apple Silicon workstations, and Jetson devices all run inference today. DenseCore is the runtime that covers this spectrum.
+*   **TCO and Flexibility**:
+    *   GPU engines require expensive GPU instances and have high idle cost. Zero-scale is hard.
+    *   DenseCore runs on spot CPU instances (`c7i.large` @ ~$0.08/hr), edge devices, and Apple Silicon — with runtime kernel selection requiring no recompilation.
+*   **Verdict**: Complementary, not competing. DenseCore covers the heterogeneous deployment surface that GPU-only engines leave unaddressed.
 
 ### 🆚 DenseCore vs. Ollama
 > *"Ollama is easier to install."*
@@ -56,23 +56,23 @@ Its primary strength lies in **Total Cost of Ownership (TCO)** and **Operational
 
 ---
 
-## 4. Architect's Viewpoint (The "Pitch")
+## 4. Architect’s Viewpoint (The "Pitch")
 
-### ☁️ For AWS / Google Cloud Architects
-**"The Serverless LLM Runtime"**
-*   **Pain Point**: Cold-starting a GPU container takes minutes.
-*   **DenseCore Solution**: Cold-starts in seconds on standard CPU nodes. Ideal for scaling to zero.
-*   **Strategy**: Use DenseCore as the default runtime for Lambda/Cloud Run functions handling "Smart" tasks (summarization, categorization) using 3B class models.
+### ☁️ For Cloud / Infrastructure Architects
+**"Deployable Intelligence Across Your Entire Fleet"**
+*   **Pain Point**: GPU-only inference leaves most of your fleet (CPU nodes, ARM servers, edge) idle for AI workloads. Heterogeneous fleets need a heterogeneous runtime.
+*   **DenseCore Solution**: Single runtime, runtime kernel selection — x86 AVX-512, ARM64 SVE, Apple Silicon Metal/ANE. No recompilation. No separate runtime per hardware type.
+*   **Strategy**: Use DenseCore as the inference substrate across your heterogeneous fleet. Run on spot CPU nodes at $0.08/hr, scale to zero, deploy to edge — all with the same binary.
 
-### 🧠 For Intel / Hardware Partners
-**"The AVX-512 Showcase"**
-*   **Pain Point**: Everyone thinks AI = Nvidia.
-*   **DenseCore Solution**: Demonstrates that Intel Xeons can run modern GenAI workloads effectively using aggressive quantization (INT4) and SIMD optimizations without buying H100s.
+### 🧠 For Hardware Partners (Intel, Arm, Apple)
+**"The Memory-Centric Execution Showcase"**
+*   **Pain Point**: AI benchmark discussions are dominated by peak FLOPS. The real bottleneck is memory bandwidth, locality, and utilization.
+*   **DenseCore Solution**: Demonstrates that memory-first architecture (NUMA-aware paged KV, arena allocator, SIMD-optimized quantization) with proper HAL-level kernel selection unlocks practical inference performance on modern CPU and NPU silicon.
 
-### 🤗 For HuggingFace / GenAI Builders
-**"The Production Bridge"**
-*   **Pain Point**: `transformers` in Python is too slow for production; `vLLM` is too heavy/expensive for small tasks.
-*   **DenseCore Solution**: Fits the "Missing Middle". It’s the deployment engine for the emerging wave of high-quality SLMs (Phi-3, Qwen2, Gemma).
+### 🤗 For GenAI Application Builders
+**"From Prototype to Production Without the GPU Tax"**
+*   **Pain Point**: `transformers` is too slow for production; `vLLM` requires GPU infrastructure. Edge/on-prem deployments have no GPU.
+*   **DenseCore Solution**: Production-grade runtime with OpenAI-compatible API, Prometheus metrics, Kubernetes probes, and paged KV cache — deployable anywhere in the stack, from laptop to datacenter.
 
 ---
 
@@ -80,8 +80,9 @@ Its primary strength lies in **Total Cost of Ownership (TCO)** and **Operational
 
 To secure this position, DenseCore must prioritize:
 1.  **Strict Semantic Versioning**: Enterprises hate breaking changes.
-2.  **Observability**: First-class Prometheus metrics (already started) and OpenTelemetry tracing.
-3.  **Hybrid Runtimes**: Eventually supporting basic NPU acceleration (Intel AMX, Apple Neural Engine) while keeping the CPU core.
+2.  **Observability**: TTFT, p95/p99 latency, jitter, joules/token, memory footprint, queue pressure — not just tok/s.
+3.  **HAL completeness**: Continued hardening of hybrid scheduler, ANE integration, and Jetson/ARM64 coverage.
+4.  **Benchmark fairness**: Reproducible, fair-mode decode comparisons across hardware — correctness and memory metrics alongside throughput.
 
 ---
 
@@ -89,10 +90,10 @@ To secure this position, DenseCore must prioritize:
 
 | Category | Score | Notes |
 | :--- | :--- | :--- |
-| **Performance (CPU)** | ⭐⭐⭐⭐⭐ | Best-in-class for INT4/GGUF. |
-| **Performance (Peak)** | ⭐⭐ | Cannot beat GPU. |
-| **Cost Efficiency** | ⭐⭐⭐⭐⭐ | Unbeatable for low-traffic/batch. |
+| **Hardware Coverage** | ⭐⭐⭐⭐⭐ | x86/ARM64/Apple Silicon/Jetson via HAL. |
+| **Memory Efficiency** | ⭐⭐⭐⭐⭐ | Paged KV, NUMA-aware, arena allocator. |
+| **Cost Efficiency** | ⭐⭐⭐⭐⭐ | Spot CPU nodes, scale to zero, no GPU required. |
 | **Developer Exp.** | ⭐⭐⭐⭐ | Pythonic SDK is a huge plus. |
-| **Enterprise Ready** | ⭐⭐⭐⭐ | Go server provides stability. |
+| **Enterprise Ready** | ⭐⭐⭐⭐ | Go server provides stability; DenseOps/DenseEnterprise extend. |
 
-**Bottom Line:** DenseCore is the **"SQLite of LLM Inference"**—fast, self-contained, and runs everywhere without a heavy dedicated infrastructure.
+**Bottom Line:** DenseCore is the **memory-centric execution runtime for heterogeneous AI inference** — the runtime substrate that turns any hardware fleet into deployable intelligence.

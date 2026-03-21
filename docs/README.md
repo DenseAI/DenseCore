@@ -1,5 +1,7 @@
 # DenseCore Documentation
 
+DenseCore is the **memory-centric execution runtime for heterogeneous AI inference** — the runtime substrate of the Dense Series stack. It maximizes locality, utilization, and determinism across x86, ARM64, and Apple Silicon hardware.
+
 This documentation set is organized around the three public distribution surfaces in this repository:
 
 - PyPI package: `densecore`

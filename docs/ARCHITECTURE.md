@@ -24,7 +24,7 @@ A deep dive into DenseCore's system design, components, and performance optimiza
 
 ## Overview
 
-DenseCore is a **three-layer architecture** optimized for CPU-based LLM inference:
+DenseCore is a **memory-centric execution runtime for heterogeneous AI inference** — a three-layer architecture that maximizes locality, utilization, and determinism across x86, ARM64, and Apple Silicon hardware:
 
 ```mermaid
 graph TB
@@ -41,10 +41,12 @@ graph TB
         ModelMgr[Model Manager]
     end
 
-    subgraph "Layer 3: Compute Backend"
+    subgraph "Layer 3: Compute Backend (HAL)"
         GGML[GGML Tensor Ops]
         Quant[Quantization]
-        SIMD[SIMD Kernels AVX2/AVX-512]
+        SIMD[SIMD Kernels AVX2/AVX-512/AMX/SVE]
+        Metal[Metal GPU - Apple Silicon]
+        ANE[ANE - Apple Neural Engine]
     end
 
     PySDK --> |ctypes FFI| Scheduler
@@ -70,7 +72,7 @@ graph TB
 1. **C++ Core for Speed:** Critical path (tensor ops, memory management) in C++17
 2. **Python for UX:** Pythonic API via ctypes for minimal overhead
 3. **Go for Services:** High-concurrency REST server with built-in observability
-4. **GGML for Portability:** Broad CPU support (ARM, x86) without custom kernels
+4. **HAL for Heterogeneous Hardware:** Runtime kernel selection across x86 AVX2/AVX-512/AMX, ARM64 SVE/NEON, and Apple Silicon Metal/ANE/Accelerate
 
 ---
 
@@ -103,14 +105,16 @@ Many inference libraries are research-oriented. DenseCore is **production-first*
 - ✅ Request cancellation and timeouts
 - ✅ Structured logging (JSON output)
 
-### 3. **CPU as a First-Class Citizen**
+### 3. **Heterogeneous Hardware by Design**
 
-Most frameworks optimize for GPUs, with CPU as an afterthought. DenseCore inverts this:
+DenseCore is not a GPU-fallback — it is built to maximize utilization and locality across any hardware in the fleet:
 
-- Aggressive quantization (INT4, INT8, FP8) using standard implementations
-- Paged KV cache to minimize allocations
-- SIMD-optimized kernels (AVX2, AVX-512)
-- Graph Caching for reduced overhead
+- **x86**: AVX2, AVX-512, AVX-512 VNNI, Intel AMX (BF16 tile ops)
+- **ARM64**: SVE scalable vectors, NEON DOTPROD, NEON FP16 (AWS Graviton, Qualcomm)
+- **Apple Silicon**: Metal GPU, ANE (CoreML-backed), Accelerate AMX, hybrid CPU+GPU+ANE scheduler
+- Aggressive quantization (INT4, INT8, FP8) to maximize tokens per joule
+- NUMA-aware paged KV cache and memory subsystem for multi-socket servers
+- Runtime kernel selection — no recompilation required when moving between hardware
 
 ---
 
@@ -627,10 +631,12 @@ Batch Size = 8:  20 TPS per request (160 total)
 
 |Feature | DenseCore | llama.cpp | vLLM | Transformers |
 |---------|-----------|-----------|------|--------------|
+| **Compute** | Heterogeneous (x86/ARM/Apple/Jetson) | CPU/GPU hybrid | GPU-primary | GPU/CPU |
 | **Quantization** | INT4/INT8/FP8 | INT4/INT8 | FP16/BF16 | FP32/FP16 |
-| **KV Cache** | Paged (vLLM-style) | Contiguous | Paged | Implicit |
+| **KV Cache** | Paged + NUMA-aware | Contiguous | Paged | Implicit |
 | **Batching** | Continuous | None | Continuous | Static |
 | **Graph Caching** | ✅ Yes | ❌ No | ✅ CUDA Graph | ❌ No |
+| **Hybrid Scheduler** | ✅ CPU+GPU+ANE | ❌ No | ❌ No | ❌ No |
 | **Python API** | ✅ Native | ⚠️ Bindings | ✅ Native | ✅ Native |
 | **Async Support** | ✅ Yes | ❌ No | ✅ Yes | ⚠️ Limited |
 | **Production** | ✅ K8s-ready | ❌ CLI-only | ✅ K8s-ready | ⚠️ Manual |
