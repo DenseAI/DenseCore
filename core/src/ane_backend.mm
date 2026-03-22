@@ -738,17 +738,17 @@ BackendCapabilityManifest ANEBackend::GetCapabilityManifest() const {
     // The fused CompileTransformerLayer path runs all these on ANE as a
     // single CoreML graph, which is the recommended production path.
     manifest.fallback_ops = {
-        OpType::Embedding,          // Table lookup — CPU
-        OpType::GemmInt4,           // Fused Metal INT4 GEMM; cached FP32 fallback
-        OpType::RMSNorm,            // Metal GPU or CPU Accelerate vDSP
-        OpType::AddRMSNorm,         // Metal GPU or CPU Accelerate
-        OpType::LayerNorm,          // CPU implementation
-        OpType::Softmax,            // Metal GPU or CPU
-        OpType::SiLU,               // CPU implementation
-        OpType::GELU,               // CPU implementation
-        OpType::RoPE,               // Metal GPU kernel
-        OpType::FusedQKVProjection, // Metal GPU kernel
-        OpType::FlashAttention,     // Metal GPU FlashAttention kernel
+        OpType::Embedding,           // Table lookup — CPU
+        OpType::GemmInt4,            // Fused Metal INT4 GEMM; cached FP32 fallback
+        OpType::RMSNorm,             // Metal GPU or CPU Accelerate vDSP
+        OpType::AddRMSNorm,          // Metal GPU or CPU Accelerate
+        OpType::LayerNorm,           // CPU implementation
+        OpType::Softmax,             // Metal GPU or CPU
+        OpType::SiLU,                // CPU implementation
+        OpType::GELU,                // CPU implementation
+        OpType::RoPE,                // Metal GPU kernel
+        OpType::FusedQKVProjection,  // Metal GPU kernel
+        OpType::FlashAttention,      // Metal GPU FlashAttention kernel
     };
 
     // ANE-only mode forbids fallback use by design.
@@ -965,8 +965,7 @@ void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
         static bool warned_fused = false;
         if (!warned_fused) {
             std::cerr << "[ANEBackend] Note: INT4 GEMM using fused Metal grouped fallback. "
-                      << "Offline fused CoreML layers remain the preferred ANE path."
-                      << std::endl;
+                      << "Offline fused CoreML layers remain the preferred ANE path." << std::endl;
             warned_fused = true;
         }
         return;
@@ -989,8 +988,9 @@ void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
     }();
 
     const float* cachedWeights = impl_->GetCachedWeights(cacheKey);
-    const ggml_fp16_t* cachedWeightsFp16 =
-        (!cachedWeights && prefer_fp16_repack_cache) ? impl_->GetCachedWeightsFP16(cacheKey) : nullptr;
+    const ggml_fp16_t* cachedWeightsFp16 = (!cachedWeights && prefer_fp16_repack_cache)
+                                               ? impl_->GetCachedWeightsFP16(cacheKey)
+                                               : nullptr;
 
     const float* W_dequant_ptr = nullptr;
     std::vector<float> W_dequant_local;  // Allocated on cache miss or FP16-cache hit
@@ -1049,13 +1049,15 @@ void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
         W_dequant_ptr = W_dequant_local.data();
 
         if (prefer_fp16_repack_cache) {
-            std::vector<ggml_fp16_t> W_repacked_fp16(static_cast<size_t>(N) * static_cast<size_t>(K));
+            std::vector<ggml_fp16_t> W_repacked_fp16(static_cast<size_t>(N) *
+                                                     static_cast<size_t>(K));
             densecore::simd::ConvertF32ToF16(W_repacked_fp16.data(), W_dequant_local.data(),
                                              static_cast<size_t>(N) * static_cast<size_t>(K));
             impl_->CacheWeightsFP16(cacheKey, std::move(W_repacked_fp16));
         }
         if (keep_fp32_cache) {
-            impl_->CacheWeights(cacheKey, std::vector<float>(W_dequant_local.begin(), W_dequant_local.end()));
+            impl_->CacheWeights(cacheKey,
+                                std::vector<float>(W_dequant_local.begin(), W_dequant_local.end()));
         }
 
         // Log cache miss with GPU/CPU indicator
@@ -1094,8 +1096,7 @@ void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
         } else {
             std::cerr << " with FP32 dequant residency";
         }
-        std::cerr << ". Offline fused CoreML layers remain the preferred ANE path."
-                  << std::endl;
+        std::cerr << ". Offline fused CoreML layers remain the preferred ANE path." << std::endl;
         warned = true;
     }
 }
@@ -1530,7 +1531,8 @@ bool ANEBackend::CompileTransformerLayer(const std::string& name,
             return !env || (std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0);
         }();
         std::string model_path = impl_->cacheDirectory + "/" + name + ".mlmodelc";
-        std::string repacked_model_path = impl_->cacheDirectory + "/" + name + ".int4_repacked.mlmodelc";
+        std::string repacked_model_path =
+            impl_->cacheDirectory + "/" + name + ".int4_repacked.mlmodelc";
         if (prefer_repacked_model) {
             NSString* repackedPath = [NSString stringWithUTF8String:repacked_model_path.c_str()];
             if ([[NSFileManager defaultManager] fileExistsAtPath:repackedPath]) {

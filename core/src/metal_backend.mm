@@ -2137,8 +2137,8 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
 
         impl_->supportsSimdgroupMatrix = [impl_->device supportsFamily:MTLGPUFamilyApple7];
         if (const char* env = std::getenv("DENSECORE_METAL_INT4_SIMDGROUP_GEMM")) {
-            impl_->enableSimdgroupInt4Gemm = std::strcmp(env, "0") != 0 &&
-                                             std::strcmp(env, "false") != 0;
+            impl_->enableSimdgroupInt4Gemm =
+                std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
         }
 
         // Try to load pre-compiled shader library
@@ -2390,9 +2390,9 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
                 id<MTLFunction> gemmInt4GroupedSimdgroupFunction =
                     [quantizedGemvLib newFunctionWithName:@"gemm_int4_grouped_simdgroup_fused"];
                 if (gemmInt4GroupedSimdgroupFunction) {
-                    impl_->gemmInt4GroupedSimdgroupPipeline =
-                        [impl_->device newComputePipelineStateWithFunction:gemmInt4GroupedSimdgroupFunction
-                                                                     error:&error];
+                    impl_->gemmInt4GroupedSimdgroupPipeline = [impl_->device
+                        newComputePipelineStateWithFunction:gemmInt4GroupedSimdgroupFunction
+                                                      error:&error];
                 }
             }
 
@@ -2526,24 +2526,24 @@ BackendCapabilityManifest MetalBackend::GetCapabilityManifest() const {
     // Native ops: operations with custom Metal shaders or MPS implementations.
     // All these have actual GPU kernel paths in this backend.
     manifest.native_ops = {
-        OpType::MatMul,             // MPS GEMM + custom GEMV kernel
-        OpType::MatMulTransB,       // MPS GEMM (transposeRight)
-        OpType::GemmInt4,           // Custom quantized GEMV (Q4_0/Q4_1) + GPU dequant→MPS GEMM
-        OpType::Softmax,            // Custom Metal softmax kernel
-        OpType::RMSNorm,            // Custom Metal RMSNorm kernel
-        OpType::AddRMSNorm,         // Custom Metal fused add+RMSNorm kernel
-        OpType::RoPE,               // Custom Metal RoPE kernel
-        OpType::FlashAttention,     // Custom Metal FlashAttention decode + prefill kernels
-        OpType::FusedQKVProjection, // Custom Metal fused QKV GEMV kernel
+        OpType::MatMul,              // MPS GEMM + custom GEMV kernel
+        OpType::MatMulTransB,        // MPS GEMM (transposeRight)
+        OpType::GemmInt4,            // Custom quantized GEMV (Q4_0/Q4_1) + GPU dequant→MPS GEMM
+        OpType::Softmax,             // Custom Metal softmax kernel
+        OpType::RMSNorm,             // Custom Metal RMSNorm kernel
+        OpType::AddRMSNorm,          // Custom Metal fused add+RMSNorm kernel
+        OpType::RoPE,                // Custom Metal RoPE kernel
+        OpType::FlashAttention,      // Custom Metal FlashAttention decode + prefill kernels
+        OpType::FusedQKVProjection,  // Custom Metal fused QKV GEMV kernel
     };
 
     // Fallback ops: operations that this backend can serve via CPU (Accelerate.framework)
     // but does not have dedicated GPU kernels for.
     manifest.fallback_ops = {
-        OpType::Embedding,   // Table lookup — memory bound, CPU is fine
-        OpType::LayerNorm,   // Can use CPU Accelerate; Metal kernel TODO
-        OpType::SiLU,        // Element-wise — CPU Accelerate is sufficient
-        OpType::GELU,        // Element-wise — CPU Accelerate is sufficient
+        OpType::Embedding,  // Table lookup — memory bound, CPU is fine
+        OpType::LayerNorm,  // Can use CPU Accelerate; Metal kernel TODO
+        OpType::SiLU,       // Element-wise — CPU Accelerate is sufficient
+        OpType::GELU,       // Element-wise — CPU Accelerate is sufficient
     };
 
     manifest.allow_cpu_fallback = true;
@@ -2982,8 +2982,10 @@ void MetalBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scal
             use_q4_1 ? impl_->gemmQ4_1SimdgroupPipeline : impl_->gemmQ4_0SimdgroupPipeline;
         if (useSimdgroupPrefill && simdgroupPipeline) {
             id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
-            id<MTLBuffer> bufferA = impl_->GetOrWrapBuffer(const_cast<void*>(A.data), A.SizeBytes());
-            id<MTLBuffer> bufferW = impl_->GetOrWrapBuffer(const_cast<void*>(W.data), W.SizeBytes());
+            id<MTLBuffer> bufferA =
+                impl_->GetOrWrapBuffer(const_cast<void*>(A.data), A.SizeBytes());
+            id<MTLBuffer> bufferW =
+                impl_->GetOrWrapBuffer(const_cast<void*>(W.data), W.SizeBytes());
             id<MTLBuffer> bufferC = impl_->GetOrWrapBuffer(C->data, C->SizeBytes());
 
             if (commandBuffer && bufferA && bufferW && bufferC) {
@@ -3002,9 +3004,8 @@ void MetalBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scal
                     [encoder setBytes:&K_u length:sizeof(uint) atIndex:5];
 
                     const MTLSize threadgroupSize = MTLSizeMake(32, 1, 1);
-                    const MTLSize gridSize =
-                        MTLSizeMake((static_cast<NSUInteger>(N) + 7) / 8,
-                                    (static_cast<NSUInteger>(M) + 7) / 8, 1);
+                    const MTLSize gridSize = MTLSizeMake((static_cast<NSUInteger>(N) + 7) / 8,
+                                                         (static_cast<NSUInteger>(M) + 7) / 8, 1);
                     [encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSize];
                     [encoder endEncoding];
                     [commandBuffer commit];
@@ -3017,8 +3018,10 @@ void MetalBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scal
             use_q4_1 ? impl_->gemmQ4_1FusedPipeline : impl_->gemmQ4_0FusedPipeline;
         if (fusedPipeline) {
             id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
-            id<MTLBuffer> bufferA = impl_->GetOrWrapBuffer(const_cast<void*>(A.data), A.SizeBytes());
-            id<MTLBuffer> bufferW = impl_->GetOrWrapBuffer(const_cast<void*>(W.data), W.SizeBytes());
+            id<MTLBuffer> bufferA =
+                impl_->GetOrWrapBuffer(const_cast<void*>(A.data), A.SizeBytes());
+            id<MTLBuffer> bufferW =
+                impl_->GetOrWrapBuffer(const_cast<void*>(W.data), W.SizeBytes());
             id<MTLBuffer> bufferC = impl_->GetOrWrapBuffer(C->data, C->SizeBytes());
 
             if (commandBuffer && bufferA && bufferW && bufferC) {
@@ -3037,9 +3040,8 @@ void MetalBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scal
                     [encoder setBytes:&K_u length:sizeof(uint) atIndex:5];
 
                     const MTLSize threadgroupSize = MTLSizeMake(8, 8, 1);
-                    const MTLSize gridSize =
-                        MTLSizeMake((static_cast<NSUInteger>(N) + 7) / 8,
-                                    (static_cast<NSUInteger>(M) + 7) / 8, 1);
+                    const MTLSize gridSize = MTLSizeMake((static_cast<NSUInteger>(N) + 7) / 8,
+                                                         (static_cast<NSUInteger>(M) + 7) / 8, 1);
                     [encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSize];
                     [encoder endEncoding];
                     [commandBuffer commit];
@@ -3908,10 +3910,10 @@ bool MetalBackend::GemmInt4Grouped(const Tensor& A, const Tensor& W, const Tenso
         id<MTLBuffer> bufferW = impl_->GetOrWrapBuffer(const_cast<void*>(W.data), W.SizeBytes());
         id<MTLBuffer> bufferScales =
             impl_->GetOrWrapBuffer(const_cast<void*>(scales.data), scales.SizeBytes());
-        id<MTLBuffer> bufferZeros = has_zero_points
-                                        ? impl_->GetOrWrapBuffer(const_cast<void*>(zero_points.data),
-                                                                 zero_points.SizeBytes())
-                                        : bufferScales;
+        id<MTLBuffer> bufferZeros =
+            has_zero_points ? impl_->GetOrWrapBuffer(const_cast<void*>(zero_points.data),
+                                                     zero_points.SizeBytes())
+                            : bufferScales;
         id<MTLBuffer> bufferC = impl_->GetOrWrapBuffer(C->data, C->SizeBytes());
 
         if (!bufferA || !bufferW || !bufferScales || !bufferZeros || !bufferC) {
@@ -3923,12 +3925,12 @@ bool MetalBackend::GemmInt4Grouped(const Tensor& A, const Tensor& W, const Tenso
             return false;
         }
 
-        const bool useSimdgroupPrefill =
-            impl_->supportsSimdgroupMatrix && impl_->enableSimdgroupInt4Gemm && M >= 4 && K >= 32 &&
-            impl_->gemmInt4GroupedSimdgroupPipeline != nil;
-        id<MTLComputePipelineState> pipeline =
-            useSimdgroupPrefill ? impl_->gemmInt4GroupedSimdgroupPipeline
-                                : impl_->gemmInt4GroupedFusedPipeline;
+        const bool useSimdgroupPrefill = impl_->supportsSimdgroupMatrix &&
+                                         impl_->enableSimdgroupInt4Gemm && M >= 4 && K >= 32 &&
+                                         impl_->gemmInt4GroupedSimdgroupPipeline != nil;
+        id<MTLComputePipelineState> pipeline = useSimdgroupPrefill
+                                                   ? impl_->gemmInt4GroupedSimdgroupPipeline
+                                                   : impl_->gemmInt4GroupedFusedPipeline;
         if (!pipeline) {
             [encoder endEncoding];
             return false;
@@ -3953,9 +3955,8 @@ bool MetalBackend::GemmInt4Grouped(const Tensor& A, const Tensor& W, const Tenso
 
         const MTLSize threadgroupSize =
             useSimdgroupPrefill ? MTLSizeMake(32, 1, 1) : MTLSizeMake(8, 8, 1);
-        const MTLSize gridSize =
-            MTLSizeMake((static_cast<NSUInteger>(N) + 7) / 8,
-                        (static_cast<NSUInteger>(M) + 7) / 8, 1);
+        const MTLSize gridSize = MTLSizeMake((static_cast<NSUInteger>(N) + 7) / 8,
+                                             (static_cast<NSUInteger>(M) + 7) / 8, 1);
         [encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSize];
         [encoder endEncoding];
         [commandBuffer commit];

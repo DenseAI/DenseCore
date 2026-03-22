@@ -204,12 +204,10 @@ size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int head_dim, int n_hea
             bytes_per_slot =
                 ggml_row_size(cache_type, static_cast<int64_t>(head_dim) * static_cast<int64_t>(n_head_kv));
         } else {
-            bytes_per_slot = ggml_row_size(cache_type, static_cast<int64_t>(head_dim)) *
-                             static_cast<size_t>(n_head_kv);
+            bytes_per_slot = ggml_row_size(cache_type, static_cast<int64_t>(head_dim)) * static_cast<size_t>(n_head_kv);
         }
     } else {
-        bytes_per_slot =
-            ggml_row_size(cache_type, static_cast<int64_t>(head_dim) * static_cast<int64_t>(n_head_kv));
+        bytes_per_slot = ggml_row_size(cache_type, static_cast<int64_t>(head_dim) * static_cast<int64_t>(n_head_kv));
     }
 
     return bytes_per_slot * static_cast<size_t>(n_layer) * 2;
@@ -1229,9 +1227,8 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
                   << " MB, max_num_seqs=" << kv_config.max_num_seqs << ")" << std::endl;
 
         // Initialize PagedKVCache with specified type
-        PagedKVCache* cache =
-            InitPagedKVCache(model, kv_config.max_num_seqs, kv_config.max_seq_len, kv_config.effective_cache_type,
-                             state->numa_node_id);
+        PagedKVCache* cache = InitPagedKVCache(model, kv_config.max_num_seqs, kv_config.max_seq_len,
+                                               kv_config.effective_cache_type, state->numa_node_id);
         if (!cache) {
             delete model;
             // state is automatically cleaned up by unique_ptr

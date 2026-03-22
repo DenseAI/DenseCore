@@ -69,8 +69,8 @@ inline void ExecuteBF16TransB(const MatmulParams& params) {
     for (int n0 = 0; n0 < N; n0 += TILE_N) {
         const int n_len = std::min(TILE_N, N - n0);
         for (int nn = 0; nn < n_len; ++nn) {
-            ggml_bf16_to_fp32_row(b_bf16 + static_cast<size_t>(n0 + nn) * ldb, b_tile.data() + static_cast<size_t>(nn) * K,
-                                  K);
+            ggml_bf16_to_fp32_row(b_bf16 + static_cast<size_t>(n0 + nn) * ldb,
+                                  b_tile.data() + static_cast<size_t>(nn) * K, K);
         }
 
         for (int m = 0; m < M; ++m) {

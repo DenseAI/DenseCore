@@ -572,8 +572,7 @@ static DecodePagedAttentionPolicy LoadDecodePagedAttentionPolicy() {
     policy.min_head_dim = ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_MIN_HEAD_DIM", 64);
     policy.min_heads = ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_MIN_HEADS", 8);
     const bool legacy_allow_q8 = ParseTruthyEnv("DENSECORE_PAGED_ATTN_DECODE_ALLOW_Q8", false);
-    policy.allow_quantized_auto =
-        ParseTruthyEnv("DENSECORE_PAGED_ATTN_DECODE_ALLOW_QUANTIZED", legacy_allow_q8);
+    policy.allow_quantized_auto = ParseTruthyEnv("DENSECORE_PAGED_ATTN_DECODE_ALLOW_QUANTIZED", legacy_allow_q8);
     policy.debug_log = ParseTruthyEnv("DENSECORE_DEBUG_PAGED_ATTN_DECODE", false);
     return policy;
 }
@@ -2887,8 +2886,7 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
     v_head_scratch.resize(static_cast<size_t>(head_dim));
     scores.resize(static_cast<size_t>(context_len));
 
-    const auto* quant_traits =
-        ggml_is_quantized(layout.cache_type) ? ggml_get_type_traits(layout.cache_type) : nullptr;
+    const auto* quant_traits = ggml_is_quantized(layout.cache_type) ? ggml_get_type_traits(layout.cache_type) : nullptr;
 
     for (int h = h_start; h < h_end; ++h) {
         const float* q_head = q_data + static_cast<size_t>(h) * head_dim;

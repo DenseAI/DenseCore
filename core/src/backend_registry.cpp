@@ -310,12 +310,10 @@ HybridScheduler* BackendRegistry::GetHybridScheduler() {
         hybridScheduler_ = std::make_unique<HybridScheduler>();
 
         // Wire backends
-        hybridScheduler_->SetCpuBackend(
-            static_cast<CpuBackend*>(cpu_it->second.get()));
+        hybridScheduler_->SetCpuBackend(static_cast<CpuBackend*>(cpu_it->second.get()));
 
         if (metal_it != backends_.end()) {
-            hybridScheduler_->SetGpuBackend(
-                static_cast<MetalBackend*>(metal_it->second.get()));
+            hybridScheduler_->SetGpuBackend(static_cast<MetalBackend*>(metal_it->second.get()));
         }
 
         auto npu_it = backends_.find(DeviceType::NPU);
@@ -327,14 +325,12 @@ HybridScheduler* BackendRegistry::GetHybridScheduler() {
             }
         }
 
-        std::cout << "[BackendRegistry] Created HybridScheduler with"
-                  << (metal_it != backends_.end() ? " Metal" : "")
+        std::cout << "[BackendRegistry] Created HybridScheduler with" << (metal_it != backends_.end() ? " Metal" : "")
                   << " backends" << std::endl;
 
         return hybridScheduler_.get();
     } catch (const std::exception& e) {
-        std::cerr << "[BackendRegistry] HybridScheduler init failed: "
-                  << e.what() << std::endl;
+        std::cerr << "[BackendRegistry] HybridScheduler init failed: " << e.what() << std::endl;
         hybridScheduler_.reset();
         return nullptr;
     }

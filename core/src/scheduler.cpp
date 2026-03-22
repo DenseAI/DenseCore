@@ -87,11 +87,10 @@ Scheduler::Scheduler(BlockManager* block_manager, const SchedulerConfig& config)
     : block_manager_(block_manager), config_(config) {
     decode_homogeneous_batch_n_past_ =
         ParseEnvBool(std::getenv("DENSECORE_SCHED_DECODE_HOMOGENEOUS_N_PAST"), /*default_value=*/false);
-    config_.enable_mixed_prefill_decode = ParseEnvBool(std::getenv("DENSECORE_SCHED_ENABLE_MIXED_PREFILL_DECODE"),
-                                                       config_.enable_mixed_prefill_decode);
-    config_.max_mixed_prefill_tokens =
-        std::max(1, ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_MIXED_PREFILL_TOKENS"),
-                                config_.max_mixed_prefill_tokens));
+    config_.enable_mixed_prefill_decode =
+        ParseEnvBool(std::getenv("DENSECORE_SCHED_ENABLE_MIXED_PREFILL_DECODE"), config_.enable_mixed_prefill_decode);
+    config_.max_mixed_prefill_tokens = std::max(
+        1, ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_MIXED_PREFILL_TOKENS"), config_.max_mixed_prefill_tokens));
 }
 
 int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, int priority,
@@ -259,8 +258,8 @@ SchedulerOutput Scheduler::Schedule() {
                 if (homogeneous_decode_context && decode_context_bucket >= 0) {
                     const size_t prefill_before = output.prefill_seq_ids.size();
                     const int remaining_tokens = std::max(0, config_.max_num_batched_tokens - output.total_tokens);
-                    const int mixed_prefill_cap =
-                        std::min(config_.max_mixed_prefill_tokens, std::min(config_.max_prefill_tokens, remaining_tokens));
+                    const int mixed_prefill_cap = std::min(config_.max_mixed_prefill_tokens,
+                                                           std::min(config_.max_prefill_tokens, remaining_tokens));
                     if (mixed_prefill_cap > 0) {
                         output.batch_context_len = decode_context_bucket;
                         ScheduleWaiting(output, mixed_prefill_cap);
@@ -645,7 +644,8 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         // rows. The worker always lays out prefill rows before decode rows, and
         // graph-wide KV retention is still derived from batch.n_past[0], so
         // admitting a mismatched prefill group would corrupt decode history.
-        if (config_.enforce_homogeneous_batch_n_past && target_context_len >= 0 && group_context != target_context_len) {
+        if (config_.enforce_homogeneous_batch_n_past && target_context_len >= 0 &&
+            group_context != target_context_len) {
             still_waiting.push_back(group);
             continue;
         }

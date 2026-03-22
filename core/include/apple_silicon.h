@@ -263,9 +263,8 @@ bool HasCustomInt4Kernels();
  * The slice form allows the caller to parallelize across output columns
  * without temporary buffers.
  */
-void GemmInt4CustomRange(float* C, const float* A, const uint8_t* W_int4, const float* scales,
-                         const float* zero_points, int M, int N, int K, int group_size, int n_start = 0,
-                         int n_end = -1);
+void GemmInt4CustomRange(float* C, const float* A, const uint8_t* W_int4, const float* scales, const float* zero_points,
+                         int M, int N, int K, int group_size, int n_start = 0, int n_end = -1);
 
 // ============================================================================
 // Memory Information

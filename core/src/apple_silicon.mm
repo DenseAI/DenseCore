@@ -13,6 +13,7 @@
  */
 
 #include "../include/apple_silicon.h"
+
 #include "../include/simd_ops.h"
 
 #ifdef __APPLE__
@@ -212,7 +213,8 @@ void DequantizeInt4TileRows(float* dst, const uint8_t* weights, const float* sca
     for (int row = 0; row < rows; ++row) {
         const uint8_t* w_row = weights + static_cast<size_t>(row) * packed_k;
         const float* s_row = scales + static_cast<size_t>(row) * groups_per_row;
-        const float* z_row = zero_points ? zero_points + static_cast<size_t>(row) * groups_per_row : nullptr;
+        const float* z_row =
+            zero_points ? zero_points + static_cast<size_t>(row) * groups_per_row : nullptr;
         float* out_row = dst + static_cast<size_t>(row) * K;
         for (int k = 0; k < K; ++k) {
             const uint8_t packed = w_row[k / 2];
@@ -228,7 +230,8 @@ void DequantizeInt4TileRows(float* dst, const uint8_t* weights, const float* sca
 }
 
 bool TryGemmInt4AMXRange(float* C, const float* A, const uint8_t* W_int4, const float* scales,
-                         const float* zero_points, int M, int N, int K, int group_size, int n_start, int n_end) {
+                         const float* zero_points, int M, int N, int K, int group_size, int n_start,
+                         int n_end) {
     if (!C || !A || !W_int4 || !scales || M <= 0 || N <= 0 || K <= 0 || group_size <= 0) {
         return false;
     }
@@ -264,12 +267,14 @@ bool TryGemmInt4AMXRange(float* C, const float* A, const uint8_t* W_int4, const 
         const int groups_per_row = K / group_size;
         const uint8_t* w_tile = W_int4 + static_cast<size_t>(col) * packed_k;
         const float* s_tile = scales + static_cast<size_t>(col) * groups_per_row;
-        const float* z_tile = zero_points ? zero_points + static_cast<size_t>(col) * groups_per_row : nullptr;
-        DequantizeInt4TileRows(weight_tile.data(), w_tile, s_tile, z_tile, cols_this_tile, K, group_size);
+        const float* z_tile =
+            zero_points ? zero_points + static_cast<size_t>(col) * groups_per_row : nullptr;
+        DequantizeInt4TileRows(weight_tile.data(), w_tile, s_tile, z_tile, cols_this_tile, K,
+                               group_size);
 
         if (M == 1) {
-            cblas_sgemv(CblasRowMajor, CblasNoTrans, cols_this_tile, K, 1.0f, weight_tile.data(), K, A, 1, 0.0f,
-                        C + col, 1);
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, cols_this_tile, K, 1.0f, weight_tile.data(), K,
+                        A, 1, 0.0f, C + col, 1);
         } else {
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, cols_this_tile, K, 1.0f, A, K,
                         weight_tile.data(), K, 0.0f, C + col, N);
@@ -492,17 +497,22 @@ bool HasCustomInt4Kernels() {
 }
 
 void GemmInt4CustomRange(float* C, const float* A, const uint8_t* W_int4, const float* scales,
-                         const float* zero_points, int M, int N, int K, int group_size, int n_start, int n_end) {
-    if (!HasCustomInt4Kernels() || !C || !A || !W_int4 || !scales) return;
-    if (group_size <= 0 || (K % group_size) != 0) return;
+                         const float* zero_points, int M, int N, int K, int group_size, int n_start,
+                         int n_end) {
+    if (!HasCustomInt4Kernels() || !C || !A || !W_int4 || !scales)
+        return;
+    if (group_size <= 0 || (K % group_size) != 0)
+        return;
 
-    if (TryGemmInt4AMXRange(C, A, W_int4, scales, zero_points, M, N, K, group_size, n_start, n_end)) {
+    if (TryGemmInt4AMXRange(C, A, W_int4, scales, zero_points, M, N, K, group_size, n_start,
+                            n_end)) {
         return;
     }
 
     const int col_start = std::max(0, n_start);
     const int col_end = (n_end < 0) ? N : std::min(N, n_end);
-    if (col_start >= col_end) return;
+    if (col_start >= col_end)
+        return;
 
     const int slice_n = col_end - col_start;
     const int packed_k = K / 2;
@@ -511,14 +521,17 @@ void GemmInt4CustomRange(float* C, const float* A, const uint8_t* W_int4, const 
     const float* scale_slice = scales + static_cast<size_t>(col_start) * groups_per_row;
     thread_local std::vector<float> zero_fallback;
     if (!zero_points) {
-        zero_fallback.assign(static_cast<size_t>(slice_n) * static_cast<size_t>(groups_per_row), 0.0f);
+        zero_fallback.assign(static_cast<size_t>(slice_n) * static_cast<size_t>(groups_per_row),
+                             0.0f);
     }
-    const float* zero_slice =
-        zero_points ? (zero_points + static_cast<size_t>(col_start) * groups_per_row) : zero_fallback.data();
+    const float* zero_slice = zero_points
+                                  ? (zero_points + static_cast<size_t>(col_start) * groups_per_row)
+                                  : zero_fallback.data();
 
     for (int m = 0; m < M; ++m) {
-        simd::GemmInt4Fp32_NEON(C + static_cast<size_t>(m) * N + col_start, A + static_cast<size_t>(m) * K, w_slice,
-                                scale_slice, zero_slice, 1, slice_n, K, group_size);
+        simd::GemmInt4Fp32_NEON(C + static_cast<size_t>(m) * N + col_start,
+                                A + static_cast<size_t>(m) * K, w_slice, scale_slice, zero_slice, 1,
+                                slice_n, K, group_size);
     }
 }
 

@@ -1426,8 +1426,8 @@ void GemmInt4Fp32_AVX512(float* C, const float* A, const uint8_t* W, const float
 void GemmInt4Fp32_AVX2(float* C, const float* A, const uint8_t* W, const float* scales, const float* zeros, int M,
                        int N, int K, int group_size);
 
-void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W, const float* scales, const float* zeros, int M,
-                      int N, int K, int group_size);
+void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W, const float* scales, const float* zeros, int M, int N,
+                      int K, int group_size);
 
 void GemmInt4Fp32_NEON(float* C, const float* A, const uint8_t* W, const float* scales, const float* zeros, int M,
                        int N, int K, int group_size);
@@ -2291,7 +2291,7 @@ inline void GemmInt4Fp32Batched_AVX2(float* C, const float* A, const uint8_t* W_
  * @param group_size Quantization group size (K must be divisible)
  */
 inline void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W_int4, const float* scales,
-                              const float* zero_points, int M, int N, int K, int group_size) {
+                             const float* zero_points, int M, int N, int K, int group_size) {
     if (K % group_size != 0) return;
 
     const int num_groups = K / group_size;
@@ -2334,13 +2334,13 @@ inline void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W_int4, co
                 // from vl packed bytes per iteration
                 for (int k = 0; k < group_size; k += static_cast<int>(2 * vl)) {
                     const int remaining = group_size - k;
-                    const int step = (remaining < static_cast<int>(2 * vl))
-                                         ? remaining
-                                         : static_cast<int>(2 * vl);
+                    const int step = (remaining < static_cast<int>(2 * vl)) ? remaining : static_cast<int>(2 * vl);
                     const uint64_t packed_step = static_cast<uint64_t>((step + 1) / 2);
 
                     // Load activations with predication for tail
-                    svbool_t pg0 = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
+                    svbool_t pg0 = svwhilelt_b32_u64(
+                        0UL, static_cast<uint64_t>(
+                                 step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
                     svbool_t pg1 = (step > static_cast<int>(vl))
                                        ? svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step - static_cast<int>(vl)))
                                        : svpfalse_b();
@@ -2349,45 +2349,41 @@ inline void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W_int4, co
                     svfloat32_t a1 = svld1_f32(pg1, a_ptr + k + vl);
 
 // Macro to process one weight row for SVE
-#define SVE_PROCESS_ROW(idx, acc_var)                                                    \
-    do {                                                                                 \
-        const uint8_t* w_ptr = W_int4 + (n + (idx)) * packed_K + packed_g_offset + k / 2;\
-        __builtin_prefetch(w_ptr + 64, 0, 3);                                           \
-                                                                                         \
-        /* Load only the packed bytes needed for this step */                            \
-        svuint8_t packed_bytes = svld1_u8(svwhilelt_b8_u64(0UL, packed_step), w_ptr);   \
-                                                                                         \
-        /* Extract low nibbles (even indices) */                                         \
-        svuint8_t lo_u8 = svand_u8_x(svptrue_b8(), packed_bytes, svdup_u8(0x0F));       \
-        /* Extract high nibbles (odd indices) */                                         \
-        svuint8_t hi_u8 = svlsr_n_u8_x(svptrue_b8(), packed_bytes, 4);                  \
-                                                                                         \
-        /* Zero-extend u8→u32 */                                                         \
-        svuint32_t lo_u32 = svunpklo_u32(svunpklo_u16(lo_u8));                           \
-        svuint32_t hi_u32 = svunpklo_u32(svunpklo_u16(hi_u8));                           \
-                                                                                         \
-        /* Sign extend 4-bit: shift left 28, arithmetic shift right 28 */                \
-        svint32_t lo_s32 = svasr_n_s32_x(svptrue_b32(),                                 \
-                               svlsl_n_s32_x(svptrue_b32(),                              \
-                                   svreinterpret_s32_u32(lo_u32), 28), 28);              \
-        svint32_t hi_s32 = svasr_n_s32_x(svptrue_b32(),                                 \
-                               svlsl_n_s32_x(svptrue_b32(),                              \
-                                   svreinterpret_s32_u32(hi_u32), 28), 28);              \
-                                                                                         \
-        /* Interleave low and high nibbles to restore original order */                  \
-        /* Element order: [lo0, hi0, lo1, hi1, ...] */                                   \
-        svint32_t w_even = svzip1_s32(lo_s32, hi_s32);                                   \
-        svint32_t w_odd  = svzip2_s32(lo_s32, hi_s32);                                   \
-                                                                                         \
-        /* Convert to FP32 and dequantize */                                              \
-        svfloat32_t wf0 = svmul_f32_x(pg0, vs##idx,                                     \
-                              svsub_f32_x(pg0, svcvt_f32_s32_x(pg0, w_even), vz##idx));  \
-        svfloat32_t wf1 = svmul_f32_x(pg1, vs##idx,                                     \
-                              svsub_f32_x(pg1, svcvt_f32_s32_x(pg1, w_odd), vz##idx));   \
-                                                                                         \
-        /* FMA: acc += a * w */                                                          \
-        acc_var = svmla_f32_m(pg0, acc_var, a0, wf0);                                    \
-        acc_var = svmla_f32_m(pg1, acc_var, a1, wf1);                                    \
+#define SVE_PROCESS_ROW(idx, acc_var)                                                                          \
+    do {                                                                                                       \
+        const uint8_t* w_ptr = W_int4 + (n + (idx)) * packed_K + packed_g_offset + k / 2;                      \
+        __builtin_prefetch(w_ptr + 64, 0, 3);                                                                  \
+                                                                                                               \
+        /* Load only the packed bytes needed for this step */                                                  \
+        svuint8_t packed_bytes = svld1_u8(svwhilelt_b8_u64(0UL, packed_step), w_ptr);                          \
+                                                                                                               \
+        /* Extract low nibbles (even indices) */                                                               \
+        svuint8_t lo_u8 = svand_u8_x(svptrue_b8(), packed_bytes, svdup_u8(0x0F));                              \
+        /* Extract high nibbles (odd indices) */                                                               \
+        svuint8_t hi_u8 = svlsr_n_u8_x(svptrue_b8(), packed_bytes, 4);                                         \
+                                                                                                               \
+        /* Zero-extend u8→u32 */                                                                             \
+        svuint32_t lo_u32 = svunpklo_u32(svunpklo_u16(lo_u8));                                                 \
+        svuint32_t hi_u32 = svunpklo_u32(svunpklo_u16(hi_u8));                                                 \
+                                                                                                               \
+        /* Sign extend 4-bit: shift left 28, arithmetic shift right 28 */                                      \
+        svint32_t lo_s32 =                                                                                     \
+            svasr_n_s32_x(svptrue_b32(), svlsl_n_s32_x(svptrue_b32(), svreinterpret_s32_u32(lo_u32), 28), 28); \
+        svint32_t hi_s32 =                                                                                     \
+            svasr_n_s32_x(svptrue_b32(), svlsl_n_s32_x(svptrue_b32(), svreinterpret_s32_u32(hi_u32), 28), 28); \
+                                                                                                               \
+        /* Interleave low and high nibbles to restore original order */                                        \
+        /* Element order: [lo0, hi0, lo1, hi1, ...] */                                                         \
+        svint32_t w_even = svzip1_s32(lo_s32, hi_s32);                                                         \
+        svint32_t w_odd = svzip2_s32(lo_s32, hi_s32);                                                          \
+                                                                                                               \
+        /* Convert to FP32 and dequantize */                                                                   \
+        svfloat32_t wf0 = svmul_f32_x(pg0, vs##idx, svsub_f32_x(pg0, svcvt_f32_s32_x(pg0, w_even), vz##idx));  \
+        svfloat32_t wf1 = svmul_f32_x(pg1, vs##idx, svsub_f32_x(pg1, svcvt_f32_s32_x(pg1, w_odd), vz##idx));   \
+                                                                                                               \
+        /* FMA: acc += a * w */                                                                                \
+        acc_var = svmla_f32_m(pg0, acc_var, a0, wf0);                                                          \
+        acc_var = svmla_f32_m(pg1, acc_var, a1, wf1);                                                          \
     } while (0)
 
                     SVE_PROCESS_ROW(0, acc0);
@@ -2419,12 +2415,12 @@ inline void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W_int4, co
 
                 for (int k = 0; k < group_size; k += static_cast<int>(2 * vl)) {
                     const int remaining = group_size - k;
-                    const int step = (remaining < static_cast<int>(2 * vl))
-                                         ? remaining
-                                         : static_cast<int>(2 * vl);
+                    const int step = (remaining < static_cast<int>(2 * vl)) ? remaining : static_cast<int>(2 * vl);
                     const uint64_t packed_step = static_cast<uint64_t>((step + 1) / 2);
 
-                    svbool_t pg0 = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
+                    svbool_t pg0 = svwhilelt_b32_u64(
+                        0UL, static_cast<uint64_t>(
+                                 step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
                     svbool_t pg1 = (step > static_cast<int>(vl))
                                        ? svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step - static_cast<int>(vl)))
                                        : svpfalse_b();
@@ -2441,20 +2437,16 @@ inline void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W_int4, co
                     svuint32_t lo_u32 = svunpklo_u32(svunpklo_u16(lo_u8));
                     svuint32_t hi_u32 = svunpklo_u32(svunpklo_u16(hi_u8));
 
-                    svint32_t lo_s32 = svasr_n_s32_x(svptrue_b32(),
-                                           svlsl_n_s32_x(svptrue_b32(),
-                                               svreinterpret_s32_u32(lo_u32), 28), 28);
-                    svint32_t hi_s32 = svasr_n_s32_x(svptrue_b32(),
-                                           svlsl_n_s32_x(svptrue_b32(),
-                                               svreinterpret_s32_u32(hi_u32), 28), 28);
+                    svint32_t lo_s32 = svasr_n_s32_x(
+                        svptrue_b32(), svlsl_n_s32_x(svptrue_b32(), svreinterpret_s32_u32(lo_u32), 28), 28);
+                    svint32_t hi_s32 = svasr_n_s32_x(
+                        svptrue_b32(), svlsl_n_s32_x(svptrue_b32(), svreinterpret_s32_u32(hi_u32), 28), 28);
 
                     svint32_t w_even = svzip1_s32(lo_s32, hi_s32);
-                    svint32_t w_odd  = svzip2_s32(lo_s32, hi_s32);
+                    svint32_t w_odd = svzip2_s32(lo_s32, hi_s32);
 
-                    svfloat32_t wf0 = svmul_f32_x(pg0, vs,
-                                          svsub_f32_x(pg0, svcvt_f32_s32_x(pg0, w_even), vz));
-                    svfloat32_t wf1 = svmul_f32_x(pg1, vs,
-                                          svsub_f32_x(pg1, svcvt_f32_s32_x(pg1, w_odd), vz));
+                    svfloat32_t wf0 = svmul_f32_x(pg0, vs, svsub_f32_x(pg0, svcvt_f32_s32_x(pg0, w_even), vz));
+                    svfloat32_t wf1 = svmul_f32_x(pg1, vs, svsub_f32_x(pg1, svcvt_f32_s32_x(pg1, w_odd), vz));
 
                     acc = svmla_f32_m(pg0, acc, a0, wf0);
                     acc = svmla_f32_m(pg1, acc, a1, wf1);
@@ -2477,8 +2469,8 @@ inline void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W_int4, co
  * @param n_end_param Last output column (exclusive), -1 means N
  */
 inline void GemmInt4Fp32Batched_SVE(float* C, const float* A, const uint8_t* W_int4, const float* scales,
-                                     const float* zero_points, int M, int N, int K, int group_size,
-                                     int n_start = 0, int n_end_param = -1) {
+                                    const float* zero_points, int M, int N, int K, int group_size, int n_start = 0,
+                                    int n_end_param = -1) {
     const int n_end = (n_end_param < 0) ? N : n_end_param;
     if (K % group_size != 0 || n_start >= n_end || M <= 0) return;
 
@@ -2504,12 +2496,12 @@ inline void GemmInt4Fp32Batched_SVE(float* C, const float* A, const uint8_t* W_i
 
                 for (int k = 0; k < group_size; k += static_cast<int>(2 * vl)) {
                     const int remaining = group_size - k;
-                    const int step = (remaining < static_cast<int>(2 * vl))
-                                         ? remaining
-                                         : static_cast<int>(2 * vl);
+                    const int step = (remaining < static_cast<int>(2 * vl)) ? remaining : static_cast<int>(2 * vl);
                     const uint64_t packed_step = static_cast<uint64_t>((step + 1) / 2);
 
-                    svbool_t pg0 = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
+                    svbool_t pg0 = svwhilelt_b32_u64(
+                        0UL, static_cast<uint64_t>(
+                                 step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
                     svbool_t pg1 = (step > static_cast<int>(vl))
                                        ? svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step - static_cast<int>(vl)))
                                        : svpfalse_b();
@@ -2525,20 +2517,16 @@ inline void GemmInt4Fp32Batched_SVE(float* C, const float* A, const uint8_t* W_i
                     svuint32_t lo_u32 = svunpklo_u32(svunpklo_u16(lo_u8));
                     svuint32_t hi_u32 = svunpklo_u32(svunpklo_u16(hi_u8));
 
-                    svint32_t lo_s32 = svasr_n_s32_x(svptrue_b32(),
-                                           svlsl_n_s32_x(svptrue_b32(),
-                                               svreinterpret_s32_u32(lo_u32), 28), 28);
-                    svint32_t hi_s32 = svasr_n_s32_x(svptrue_b32(),
-                                           svlsl_n_s32_x(svptrue_b32(),
-                                               svreinterpret_s32_u32(hi_u32), 28), 28);
+                    svint32_t lo_s32 = svasr_n_s32_x(
+                        svptrue_b32(), svlsl_n_s32_x(svptrue_b32(), svreinterpret_s32_u32(lo_u32), 28), 28);
+                    svint32_t hi_s32 = svasr_n_s32_x(
+                        svptrue_b32(), svlsl_n_s32_x(svptrue_b32(), svreinterpret_s32_u32(hi_u32), 28), 28);
 
                     svint32_t w_even = svzip1_s32(lo_s32, hi_s32);
-                    svint32_t w_odd  = svzip2_s32(lo_s32, hi_s32);
+                    svint32_t w_odd = svzip2_s32(lo_s32, hi_s32);
 
-                    svfloat32_t wf0 = svmul_f32_x(pg0, vs,
-                                          svsub_f32_x(pg0, svcvt_f32_s32_x(pg0, w_even), vz));
-                    svfloat32_t wf1 = svmul_f32_x(pg1, vs,
-                                          svsub_f32_x(pg1, svcvt_f32_s32_x(pg1, w_odd), vz));
+                    svfloat32_t wf0 = svmul_f32_x(pg0, vs, svsub_f32_x(pg0, svcvt_f32_s32_x(pg0, w_even), vz));
+                    svfloat32_t wf1 = svmul_f32_x(pg1, vs, svsub_f32_x(pg1, svcvt_f32_s32_x(pg1, w_odd), vz));
 
                     // Apply to TILE_M rows (weight reuse!)
                     if (actual_m >= 1) {
@@ -2612,8 +2600,7 @@ inline int8x16_t QuantizeF32x16ToI8_NEON_DotProd(const float* a, float* out_scal
     const float32x4_t a2 = vld1q_f32(a + 8);
     const float32x4_t a3 = vld1q_f32(a + 12);
 
-    const float sum_a =
-        vaddvq_f32(a0) + vaddvq_f32(a1) + vaddvq_f32(a2) + vaddvq_f32(a3);
+    const float sum_a = vaddvq_f32(a0) + vaddvq_f32(a1) + vaddvq_f32(a2) + vaddvq_f32(a3);
     if (out_sum) {
         *out_sum = sum_a;
     }
@@ -2770,7 +2757,7 @@ inline void GemmInt4Fp32_NEON_DotProdApprox(float* C, const float* A, const uint
  * Performance: ~4x faster than scalar fallback on NEON
  */
 inline void GemmInt4Fp32_NEON(float* C, const float* A, const uint8_t* W_int4, const float* scales,
-                               const float* zero_points, int M, int N, int K, int group_size) {
+                              const float* zero_points, int M, int N, int K, int group_size) {
     if (K % group_size != 0) return;
 
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -2816,49 +2803,49 @@ inline void GemmInt4Fp32_NEON(float* C, const float* A, const uint8_t* W_int4, c
                     float32x4_t a1 = vld1q_f32(a_ptr + k + 4);
 
 // Macro to process one weight row for NEON
-#define NEON_PROCESS_ROW(idx, acc_a, acc_b)                                              \
-    do {                                                                                 \
-        const int row = n + (idx);                                                       \
-        const float scale = scales[row * num_groups + g];                                \
-        const float zero = zero_points[row * num_groups + g];                            \
-        const float32x4_t vscale = vdupq_n_f32(scale);                                   \
-        const float32x4_t vzero = vdupq_n_f32(zero);                                     \
-                                                                                         \
-        const uint8_t* w_ptr = W_int4 + row * packed_K + packed_g_offset + k / 2;        \
-        __builtin_prefetch(w_ptr + 32, 0, 3);                                            \
-                                                                                         \
-        /* Load 4 bytes = 8 packed INT4 weights */                                       \
-        uint8x8_t packed_u8 = vld1_u8(w_ptr);  /* loads 8 bytes, use first 4 */          \
-        /* Widen u8 → u16 */                                                             \
-        uint16x8_t packed_u16 = vmovl_u8(packed_u8);                                     \
-        /* Extract low nibbles (even positions) */                                       \
-        uint16x8_t lo_u16 = vandq_u16(packed_u16, vdupq_n_u16(0x0F));                    \
-        /* Extract high nibbles (odd positions) */                                       \
-        uint16x8_t hi_u16 = vshrq_n_u16(packed_u16, 4);                                  \
-        hi_u16 = vandq_u16(hi_u16, vdupq_n_u16(0x0F));                                   \
-                                                                                         \
-        /* Sign extension via shift trick (16-bit): shl 12, asr 12 */                   \
-        int16x8_t lo_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(lo_u16), 12), 12);\
-        int16x8_t hi_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(hi_u16), 12), 12);\
-                                                                                         \
-        /* Interleave low and high: [lo0,hi0,lo1,hi1,...] */                             \
-        int16x8_t interleaved_lo = vzip1q_s16(lo_s16, hi_s16);                           \
-        int16x8_t interleaved_hi = vzip2q_s16(lo_s16, hi_s16);                           \
-                                                                                         \
-        /* Convert first 4 elements to FP32 */                                           \
-        int32x4_t w32_0 = vmovl_s16(vget_low_s16(interleaved_lo));                       \
-        float32x4_t wf0 = vcvtq_f32_s32(w32_0);                                          \
-        /* Convert next 4 elements to FP32 */                                            \
-        int32x4_t w32_1 = vmovl_s16(vget_high_s16(interleaved_lo));                      \
-        float32x4_t wf1 = vcvtq_f32_s32(w32_1);                                          \
-                                                                                         \
-        /* Dequantize: w_dequant = scale * (q - zero) */                                 \
-        wf0 = vmulq_f32(vscale, vsubq_f32(wf0, vzero));                                  \
-        wf1 = vmulq_f32(vscale, vsubq_f32(wf1, vzero));                                  \
-                                                                                         \
-        /* FMA: acc += a * w */                                                          \
-        acc_a = vfmaq_f32(acc_a, a0, wf0);                                               \
-        acc_b = vfmaq_f32(acc_b, a1, wf1);                                               \
+#define NEON_PROCESS_ROW(idx, acc_a, acc_b)                                                 \
+    do {                                                                                    \
+        const int row = n + (idx);                                                          \
+        const float scale = scales[row * num_groups + g];                                   \
+        const float zero = zero_points[row * num_groups + g];                               \
+        const float32x4_t vscale = vdupq_n_f32(scale);                                      \
+        const float32x4_t vzero = vdupq_n_f32(zero);                                        \
+                                                                                            \
+        const uint8_t* w_ptr = W_int4 + row * packed_K + packed_g_offset + k / 2;           \
+        __builtin_prefetch(w_ptr + 32, 0, 3);                                               \
+                                                                                            \
+        /* Load 4 bytes = 8 packed INT4 weights */                                          \
+        uint8x8_t packed_u8 = vld1_u8(w_ptr); /* loads 8 bytes, use first 4 */              \
+        /* Widen u8 → u16 */                                                              \
+        uint16x8_t packed_u16 = vmovl_u8(packed_u8);                                        \
+        /* Extract low nibbles (even positions) */                                          \
+        uint16x8_t lo_u16 = vandq_u16(packed_u16, vdupq_n_u16(0x0F));                       \
+        /* Extract high nibbles (odd positions) */                                          \
+        uint16x8_t hi_u16 = vshrq_n_u16(packed_u16, 4);                                     \
+        hi_u16 = vandq_u16(hi_u16, vdupq_n_u16(0x0F));                                      \
+                                                                                            \
+        /* Sign extension via shift trick (16-bit): shl 12, asr 12 */                       \
+        int16x8_t lo_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(lo_u16), 12), 12); \
+        int16x8_t hi_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(hi_u16), 12), 12); \
+                                                                                            \
+        /* Interleave low and high: [lo0,hi0,lo1,hi1,...] */                                \
+        int16x8_t interleaved_lo = vzip1q_s16(lo_s16, hi_s16);                              \
+        int16x8_t interleaved_hi = vzip2q_s16(lo_s16, hi_s16);                              \
+                                                                                            \
+        /* Convert first 4 elements to FP32 */                                              \
+        int32x4_t w32_0 = vmovl_s16(vget_low_s16(interleaved_lo));                          \
+        float32x4_t wf0 = vcvtq_f32_s32(w32_0);                                             \
+        /* Convert next 4 elements to FP32 */                                               \
+        int32x4_t w32_1 = vmovl_s16(vget_high_s16(interleaved_lo));                         \
+        float32x4_t wf1 = vcvtq_f32_s32(w32_1);                                             \
+                                                                                            \
+        /* Dequantize: w_dequant = scale * (q - zero) */                                    \
+        wf0 = vmulq_f32(vscale, vsubq_f32(wf0, vzero));                                     \
+        wf1 = vmulq_f32(vscale, vsubq_f32(wf1, vzero));                                     \
+                                                                                            \
+        /* FMA: acc += a * w */                                                             \
+        acc_a = vfmaq_f32(acc_a, a0, wf0);                                                  \
+        acc_b = vfmaq_f32(acc_b, a1, wf1);                                                  \
     } while (0)
 
                     NEON_PROCESS_ROW(0, acc0, acc0b);
@@ -3288,8 +3275,7 @@ inline void UpdateOutput_AVX512(float* O, const float* PV, const float* alpha, c
 
 #if defined(__ARM_FEATURE_SVE)
 
-inline void ComputeQK_SVE(const float* Q, const float* K, float* S, int q_len, int kv_len, int head_dim,
-                          float scale) {
+inline void ComputeQK_SVE(const float* Q, const float* K, float* S, int q_len, int kv_len, int head_dim, float scale) {
     for (int qi = 0; qi < q_len; qi++) {
         const float* q_row = Q + qi * head_dim;
         for (int ki = 0; ki < kv_len; ki++) {
@@ -3361,8 +3347,7 @@ inline void UpdateOutput_SVE(float* O, const float* PV, const float* alpha, cons
 
 #if defined(DENSECORE_ARM)
 
-inline void ComputeQK_NEON(const float* Q, const float* K, float* S, int q_len, int kv_len, int head_dim,
-                           float scale) {
+inline void ComputeQK_NEON(const float* Q, const float* K, float* S, int q_len, int kv_len, int head_dim, float scale) {
     for (int qi = 0; qi < q_len; qi++) {
         const float* q_row = Q + qi * head_dim;
         for (int ki = 0; ki < kv_len; ki++) {
@@ -3461,8 +3446,7 @@ inline void ComputePV(const float* P, const float* V, float* O, int q_len, int k
     ComputePV_AVX512(P, V, O, q_len, kv_len, head_dim);
 }
 
-inline void UpdateOutput(float* O, const float* PV, const float* alpha, const float* beta, int q_len,
-                         int head_dim) {
+inline void UpdateOutput(float* O, const float* PV, const float* alpha, const float* beta, int q_len, int head_dim) {
     static const SimdLevel level = DetectSimdLevel();
 #if defined(__ARM_FEATURE_SVE)
     if (HasArmSveOrBetter(level)) {

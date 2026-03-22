@@ -702,8 +702,7 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
     cache->numa_node_id = numa_node_id;
 
     // Validate supported types for KV cache.
-    if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_Q8_0 &&
-        type != GGML_TYPE_Q4_0) {
+    if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_Q8_0 && type != GGML_TYPE_Q4_0) {
         std::cerr << "[KVCache] Warning: Unsupported cache type, falling back to F16" << std::endl;
         type = GGML_TYPE_F16;
         cache->cache_type = type;
