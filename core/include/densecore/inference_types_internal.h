@@ -47,6 +47,7 @@ KVCacheUserData* GetKVCacheUserData(int layer, bool is_k);
 // Used by MoE forward callbacks during graph execution.
 // ============================================================================
 struct MoEUserData {
+    const TransformerModel* model;
     const TransformerLayer* layer;
     int k;  // Number of experts to use (top-k)
     densecore::CpuBackend* backend;

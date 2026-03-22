@@ -27,6 +27,8 @@ enum class ModelArch : uint8_t {
     LLAMA,
     QWEN2,
     QWEN3,
+    GLM4_MOE,
+    GLM5_DSA,
     MISTRAL,
     GEMMA,
     PHI,
@@ -53,6 +55,8 @@ struct ModelArchFlags {
     bool requires_q_norm = false;  // Qwen3: RMS norm on Q before attention
     bool requires_k_norm = false;  // Qwen3: RMS norm on K before attention
     bool is_hybrid_ssm = false;    // Qwen3.5: Mamba2 SSM + Attention hybrid
+    bool is_glm_moe = false;       // GLM-4.5/5: grouped MoE routing + shared experts
+    bool is_glm_dsa = false;       // GLM-5: MLA + DSA attention path
 };
 
 // Forward declaration for RoPE table (defined in simd_ops.h)
@@ -140,18 +144,29 @@ static constexpr const char* kAttnQWeight = "attn_q.weight";
 static constexpr const char* kAttnKWeight = "attn_k.weight";
 static constexpr const char* kAttnVWeight = "attn_v.weight";
 static constexpr const char* kAttnOWeight = "attn_output.weight";
+static constexpr const char* kAttnQAProj = "attn_q_a.weight";
+static constexpr const char* kAttnQANorm = "attn_q_a_norm.weight";
+static constexpr const char* kAttnQBProj = "attn_q_b.weight";
+static constexpr const char* kAttnKvAProj = "attn_kv_a.weight";
+static constexpr const char* kAttnKvANorm = "attn_kv_a_norm.weight";
+static constexpr const char* kAttnKvBProj = "attn_kv_b.weight";
 static constexpr const char* kAttnQBias = "attn_q.bias";
 static constexpr const char* kAttnKBias = "attn_k.bias";
 static constexpr const char* kAttnVBias = "attn_v.bias";
 static constexpr const char* kAttnOBias = "attn_output.bias";
 static constexpr const char* kAttnQNorm = "attn_q_norm.weight";
 static constexpr const char* kAttnKNorm = "attn_k_norm.weight";
+static constexpr const char* kIndexerWqB = "indexer_wq_b.weight";
+static constexpr const char* kIndexerWk = "indexer_wk.weight";
+static constexpr const char* kIndexerKNorm = "indexer_k_norm.weight";
+static constexpr const char* kIndexerWeightsProj = "indexer_weights_proj.weight";
 static constexpr const char* kAttnNorm = "attention_norm.weight";
 static constexpr const char* kFfnNorm = "ffn_norm.weight";
 static constexpr const char* kFfnGate = "ffn_gate.weight";
 static constexpr const char* kFfnUp = "ffn_up.weight";
 static constexpr const char* kFfnDown = "ffn_down.weight";
 static constexpr const char* kMoeGate = "moe_gate.weight";
+static constexpr const char* kMoeCorrectionBias = "moe_e_score_correction_bias";
 static constexpr const char* kAttnQkvWeight = "attn_qkv.weight";
 static constexpr const char* kAttnQkvBias = "attn_qkv.bias";
 
@@ -414,6 +429,24 @@ struct TransformerModel {
     int ssm_time_step_rank = 16;
     int ssm_inner_size = 2048;
     int ssm_full_attn_interval = 4;
+
+    // MoE routing parameters (GLM-4.5 / GLM-5 and similar)
+    int moe_n_shared_experts = 0;
+    int moe_n_group = 1;
+    int moe_topk_group = 1;
+    int moe_first_k_dense_replace = 0;
+    float moe_routed_scaling_factor = 1.0f;
+    bool moe_norm_topk_prob = true;
+
+    // GLM-5 MLA / DSA parameters
+    int glm_q_lora_rank = 0;
+    int glm_kv_lora_rank = 0;
+    int glm_qk_rope_head_dim = 0;
+    int glm_qk_nope_head_dim = 0;
+    int glm_v_head_dim = 0;
+    int glm_index_topk = 0;
+    int glm_index_head_dim = 0;
+    int glm_index_n_heads = 0;
 
     // SSM runtime state (per-sequence, initialized by engine for hybrid models)
     // Indexed by SSM layer ordinal (NOT physical layer index).

@@ -24,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <queue>
 #include <random>
 #include <thread>
@@ -1164,7 +1165,11 @@ struct PagedAttentionUserData {
     PagedKVCache* cache = nullptr;
     int layer = 0;
     int head_dim = 0;
+    int v_head_dim = 0;
     int n_head = 0;
+    int index_n_heads = 0;
+    int index_head_dim = 0;
+    int index_topk = 0;
     std::atomic<uint64_t> epoch_started{0};
     std::atomic<uint64_t> epoch_done{0};
     std::atomic<int> kv_writers_done{0};
@@ -1291,6 +1296,13 @@ struct SSMQwen35DeltaUserData {
     int head_dim_k;
     int n_groups;
     float norm_eps;
+};
+
+struct GLMDSAPackUserData {
+    int n_heads;
+    int qk_nope_head_dim;
+    int qk_rope_head_dim;
+    int v_head_dim;
 };
 
 // ============================================================================
@@ -3322,6 +3334,280 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     }
 }
 
+void cb_glm_dsa_attention_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    auto* ud = static_cast<PagedAttentionUserData*>(userdata);
+    if (!ud || !ud->cache || !dst || !dst->data || nth <= 0) return;
+    if (!dst->src[0] || !dst->src[1] || !dst->src[2] || !dst->src[3] || !dst->src[4] || !dst->src[5]) return;
+
+    const auto* q_tensor = dst->src[0];
+    const auto* k_tensor = dst->src[1];
+    const auto* v_tensor = dst->src[2];
+    const auto* index_q_tensor = dst->src[3];
+    const auto* index_weights_tensor = dst->src[4];
+    const auto* index_k_tensor = dst->src[5];
+    if (!q_tensor->data || !k_tensor->data || !v_tensor->data || !index_q_tensor->data || !index_weights_tensor->data ||
+        !index_k_tensor->data) {
+        return;
+    }
+
+    const BatchSpec* batch = GetCurrentBatch();
+    if (!batch) return;
+
+    const int q_tokens = static_cast<int>(q_tensor->ne[2]);
+    const int n_head = ud->n_head;
+    const int n_head_kv = ud->cache->n_head_kv;
+    const int head_dim = ud->head_dim;
+    const int v_head_dim = ud->v_head_dim > 0 ? ud->v_head_dim : ud->head_dim;
+    const int index_n_heads = ud->index_n_heads;
+    const int index_head_dim = ud->index_head_dim;
+    const int index_topk = ud->index_topk;
+    if (q_tokens <= 0 || n_head <= 0 || n_head_kv <= 0 || head_dim <= 0 || v_head_dim <= 0 || index_n_heads <= 0 ||
+        index_head_dim <= 0 || (n_head % n_head_kv) != 0) {
+        return;
+    }
+
+    const char* q_base = reinterpret_cast<const char*>(q_tensor->data);
+    const char* k_base = reinterpret_cast<const char*>(k_tensor->data);
+    const char* v_base = reinterpret_cast<const char*>(v_tensor->data);
+    const char* index_q_base = reinterpret_cast<const char*>(index_q_tensor->data);
+    const char* index_weights_base = reinterpret_cast<const char*>(index_weights_tensor->data);
+    const char* index_k_base = reinterpret_cast<const char*>(index_k_tensor->data);
+    char* out_base = reinterpret_cast<char*>(dst->data);
+
+    const size_t q_token_stride = static_cast<size_t>(q_tensor->nb[2]);
+    const size_t k_token_stride = static_cast<size_t>(k_tensor->nb[2]);
+    const size_t v_token_stride = static_cast<size_t>(v_tensor->nb[2]);
+    const size_t index_q_token_stride = static_cast<size_t>(index_q_tensor->nb[2]);
+    const size_t index_weights_token_stride = static_cast<size_t>(index_weights_tensor->nb[1]);
+    const size_t index_k_token_stride = static_cast<size_t>(index_k_tensor->nb[1]);
+    const size_t out_token_stride = static_cast<size_t>(dst->nb[2]);
+    const int kv_group_size = n_head / n_head_kv;
+    const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const float index_scale = 1.0f / std::sqrt(static_cast<float>(index_head_dim));
+
+    uint64_t epoch = 0;
+    if (ith == 0) {
+        ud->kv_writers_done.store(0, std::memory_order_release);
+        epoch = ud->epoch_started.fetch_add(1, std::memory_order_acq_rel) + 1;
+    } else {
+        int spin_count = 0;
+        while (true) {
+            const uint64_t started = ud->epoch_started.load(std::memory_order_acquire);
+            const uint64_t done = ud->epoch_done.load(std::memory_order_acquire);
+            if (started > done) {
+                epoch = started;
+                break;
+            }
+            SpinPause(spin_count++);
+        }
+    }
+
+    for (int i = ith; i < q_tokens; i += nth) {
+        if (i >= static_cast<int>(batch->seq_id.size()) || i >= static_cast<int>(batch->pos.size())) continue;
+        const int seq_idx = batch->seq_id[static_cast<size_t>(i)];
+        if (seq_idx < 0 || seq_idx >= static_cast<int>(batch->block_tables.size())) continue;
+        const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
+        const int pos_i = batch->pos[static_cast<size_t>(i)];
+        if (pos_i < 0) continue;
+
+        const int logical_block = pos_i / BLOCK_SIZE;
+        const int slot = pos_i % BLOCK_SIZE;
+        if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) continue;
+        const int block_id = block_table[static_cast<size_t>(logical_block)];
+        if (block_id < 0 || block_id >= ud->cache->max_blocks) continue;
+
+        const float* k_src = reinterpret_cast<const float*>(k_base + static_cast<size_t>(i) * k_token_stride);
+        const float* v_src = reinterpret_cast<const float*>(v_base + static_cast<size_t>(i) * v_token_stride);
+        const float* index_k_src = reinterpret_cast<const float*>(index_k_base + static_cast<size_t>(i) * index_k_token_stride);
+        ud->cache->WriteKSlot(block_id, ud->layer, slot, k_src);
+        ud->cache->WriteVSlot(block_id, ud->layer, slot, v_src);
+        ud->cache->WriteIndexSlot(block_id, ud->layer, slot, index_k_src);
+    }
+
+    const int writers_done = ud->kv_writers_done.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (writers_done == nth) {
+        ud->epoch_done.store(epoch, std::memory_order_release);
+    } else {
+        int spin_count = 0;
+        while (ud->epoch_done.load(std::memory_order_acquire) < epoch) {
+            SpinPause(spin_count++);
+        }
+    }
+
+    thread_local std::vector<float> index_key_scratch;
+    thread_local std::vector<float> k_slot_scratch;
+    thread_local std::vector<float> v_slot_scratch;
+    thread_local std::vector<std::pair<float, int>> index_scores;
+    thread_local std::vector<float> attn_scores;
+    thread_local std::vector<int> selected_positions;
+    index_key_scratch.resize(static_cast<size_t>(index_head_dim));
+    k_slot_scratch.resize(static_cast<size_t>(ud->cache->GetElementsPerSlot()));
+    v_slot_scratch.resize(static_cast<size_t>(ud->cache->GetVElementsPerSlot()));
+
+    for (int token_idx = ith; token_idx < q_tokens; token_idx += nth) {
+        float* out_token = reinterpret_cast<float*>(out_base + static_cast<size_t>(token_idx) * out_token_stride);
+        std::fill(out_token, out_token + static_cast<size_t>(n_head) * static_cast<size_t>(v_head_dim), 0.0f);
+
+        if (token_idx >= static_cast<int>(batch->seq_id.size()) || token_idx >= static_cast<int>(batch->pos.size())) {
+            continue;
+        }
+
+        const int seq_idx = batch->seq_id[static_cast<size_t>(token_idx)];
+        if (seq_idx < 0 || seq_idx >= batch->num_seqs || seq_idx >= static_cast<int>(batch->block_tables.size()) ||
+            seq_idx >= static_cast<int>(batch->n_past.size())) {
+            continue;
+        }
+
+        const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
+        const int pos_i = batch->pos[static_cast<size_t>(token_idx)];
+        const int n_past_i = batch->n_past[static_cast<size_t>(seq_idx)];
+        if (block_table.empty() || pos_i < 0 || n_past_i < 0) {
+            continue;
+        }
+
+        const KVRetentionSpan retained_span = ComputeKVRetentionSpan(n_past_i, GetKVRetentionPolicy());
+        const int max_context = static_cast<int>(block_table.size()) * BLOCK_SIZE;
+        const int context_len = std::max(1, std::min(retained_span.history_kept + 1, max_context));
+        const int effective_topk = index_topk > 0 ? std::min(index_topk, context_len) : context_len;
+
+        const float* q_token = reinterpret_cast<const float*>(q_base + static_cast<size_t>(token_idx) * q_token_stride);
+        const float* index_weights_token =
+            reinterpret_cast<const float*>(index_weights_base + static_cast<size_t>(token_idx) * index_weights_token_stride);
+        const char* index_q_token_base = index_q_base + static_cast<size_t>(token_idx) * index_q_token_stride;
+        index_scores.clear();
+        index_scores.reserve(static_cast<size_t>(context_len));
+        for (int t = 0; t < context_len; ++t) {
+            const int token_pos =
+                (t < retained_span.history_kept) ? MapRetainedHistoryIndex(retained_span, t) : pos_i;
+            const int logical_block = token_pos / BLOCK_SIZE;
+            const int slot = token_pos % BLOCK_SIZE;
+            if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) continue;
+            const int block_id = block_table[static_cast<size_t>(logical_block)];
+            if (block_id < 0 || block_id >= ud->cache->max_blocks) continue;
+
+            ud->cache->ReadIndexSlot(block_id, ud->layer, slot, index_key_scratch.data());
+            float score = 0.0f;
+            for (int ih = 0; ih < index_n_heads; ++ih) {
+                const float* q_index_head =
+                    reinterpret_cast<const float*>(index_q_token_base + static_cast<size_t>(ih) * index_q_tensor->nb[1]);
+                float dot = 0.0f;
+                for (int d = 0; d < index_head_dim; ++d) {
+                    dot += q_index_head[d] * index_key_scratch[static_cast<size_t>(d)];
+                }
+                score += index_weights_token[ih] * (dot * index_scale);
+            }
+            index_scores.emplace_back(score, token_pos);
+        }
+
+        if (index_scores.empty()) {
+            continue;
+        }
+
+        if (static_cast<int>(index_scores.size()) > effective_topk) {
+            std::partial_sort(index_scores.begin(), index_scores.begin() + effective_topk, index_scores.end(),
+                              [](const auto& a, const auto& b) { return a.first > b.first; });
+        }
+        const int selected_count = std::min(effective_topk, static_cast<int>(index_scores.size()));
+        selected_positions.resize(static_cast<size_t>(selected_count));
+        for (int i = 0; i < selected_count; ++i) {
+            selected_positions[static_cast<size_t>(i)] = index_scores[static_cast<size_t>(i)].second;
+        }
+
+        attn_scores.resize(static_cast<size_t>(selected_count));
+        for (int h = 0; h < n_head; ++h) {
+            const float* q_head = q_token + static_cast<size_t>(h) * head_dim;
+            float* out_head = out_token + static_cast<size_t>(h) * v_head_dim;
+            std::fill(out_head, out_head + v_head_dim, 0.0f);
+
+            const int kv_head = std::min(n_head_kv - 1, std::max(0, h / kv_group_size));
+            float max_score = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < selected_count; ++i) {
+                const int token_pos = selected_positions[static_cast<size_t>(i)];
+                const int logical_block = token_pos / BLOCK_SIZE;
+                const int slot = token_pos % BLOCK_SIZE;
+                const int block_id = block_table[static_cast<size_t>(logical_block)];
+                ud->cache->ReadKSlot(block_id, ud->layer, slot, k_slot_scratch.data());
+                const float* k_head = k_slot_scratch.data() + static_cast<size_t>(kv_head) * head_dim;
+
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    score += q_head[d] * k_head[d];
+                }
+                score *= attn_scale;
+                attn_scores[static_cast<size_t>(i)] = score;
+                if (score > max_score) max_score = score;
+            }
+
+            if (!std::isfinite(max_score)) {
+                continue;
+            }
+
+            float denom = 0.0f;
+            for (int i = 0; i < selected_count; ++i) {
+                const float weight = std::exp(attn_scores[static_cast<size_t>(i)] - max_score);
+                if (!(weight > 0.0f) || !std::isfinite(weight)) continue;
+                denom += weight;
+
+                const int token_pos = selected_positions[static_cast<size_t>(i)];
+                const int logical_block = token_pos / BLOCK_SIZE;
+                const int slot = token_pos % BLOCK_SIZE;
+                const int block_id = block_table[static_cast<size_t>(logical_block)];
+                ud->cache->ReadVSlot(block_id, ud->layer, slot, v_slot_scratch.data());
+                const float* v_head = v_slot_scratch.data() + static_cast<size_t>(kv_head) * v_head_dim;
+                for (int d = 0; d < v_head_dim; ++d) {
+                    out_head[d] += weight * v_head[d];
+                }
+            }
+
+            if (!(denom > 0.0f) || !std::isfinite(denom)) {
+                std::fill(out_head, out_head + v_head_dim, 0.0f);
+                continue;
+            }
+            const float inv = 1.0f / denom;
+            for (int d = 0; d < v_head_dim; ++d) {
+                out_head[d] *= inv;
+            }
+        }
+    }
+}
+
+inline struct ggml_tensor* ggml_glm_dsa_attention(struct ggml_context* ctx, struct ggml_tensor* q_cur,
+                                                  struct ggml_tensor* k_cur, struct ggml_tensor* v_cur,
+                                                  struct ggml_tensor* index_q, struct ggml_tensor* index_weights,
+                                                  struct ggml_tensor* index_k, PagedAttentionUserData* userdata) {
+    const int64_t ne_res[4] = {v_cur->ne[0], q_cur->ne[1], q_cur->ne[2], 1};
+    struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_res);
+
+    result->op = GGML_OP_CUSTOM;
+    result->src[0] = q_cur;
+    result->src[1] = k_cur;
+    result->src[2] = v_cur;
+    result->src[3] = index_q;
+    result->src[4] = index_weights;
+    result->src[5] = index_k;
+
+    const BatchSpec* batch = GetCurrentBatch();
+    int n_tasks = ResolveInferenceConfig(batch).num_threads;
+    if (n_tasks <= 0) {
+        n_tasks = std::thread::hardware_concurrency();
+        if (n_tasks <= 0) n_tasks = 4;
+    }
+    int physical_cores = ResolveHardwareTopology(batch).GetPhysicalCoreCount();
+    if (physical_cores > 0) {
+        n_tasks = std::min(n_tasks, physical_cores);
+    }
+    n_tasks = std::max(1, std::min(n_tasks, std::max(1, static_cast<int>(q_cur->ne[2]))));
+
+    struct {
+        ggml_custom_op_t fun;
+        int n_tasks;
+        void* userdata;
+    } params = {cb_glm_dsa_attention_custom, n_tasks, userdata};
+    static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "params too large");
+    memcpy(result->op_params, &params, sizeof(params));
+    return result;
+}
+
 /**
  * Create a custom GGML operation for parallel GEMV
  *
@@ -4424,6 +4710,104 @@ MoEUserData* AllocateMoEUserData(struct ggml_context* ctx_c) {
     return reinterpret_cast<MoEUserData*>(storage->data);
 }
 
+static GLMDSAPackUserData* AllocateGLMDSAPackUserData(struct ggml_context* ctx_c) {
+    if (!ctx_c) {
+        return nullptr;
+    }
+    struct ggml_tensor* storage = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I8, sizeof(GLMDSAPackUserData));
+    if (!storage || !storage->data) {
+        return nullptr;
+    }
+    return reinterpret_cast<GLMDSAPackUserData*>(storage->data);
+}
+
+void cb_pack_glm_dsa_q(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
+                       int nth, void* userdata) {
+    (void)src0;
+    (void)nth;
+    auto* ud = static_cast<GLMDSAPackUserData*>(userdata);
+    if (ith != 0 || !ud || !dst || !src1 || !dst->data || !src1->data) {
+        return;
+    }
+
+    const int n_tokens = static_cast<int>(src1->ne[1]);
+    const int q_head_dim = ud->qk_nope_head_dim + ud->qk_rope_head_dim;
+    const size_t src_row_stride = static_cast<size_t>(src1->nb[1] / sizeof(float));
+    const size_t dst_row_stride = static_cast<size_t>(dst->nb[1] / sizeof(float));
+    const float* src = reinterpret_cast<const float*>(src1->data);
+    float* out = reinterpret_cast<float*>(dst->data);
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float* src_row = src + static_cast<size_t>(t) * src_row_stride;
+        float* dst_row = out + static_cast<size_t>(t) * dst_row_stride;
+        for (int h = 0; h < ud->n_heads; ++h) {
+            const float* src_head = src_row + static_cast<size_t>(h) * q_head_dim;
+            float* dst_head = dst_row + static_cast<size_t>(h) * q_head_dim;
+            memcpy(dst_head, src_head + ud->qk_nope_head_dim, static_cast<size_t>(ud->qk_rope_head_dim) * sizeof(float));
+            memcpy(dst_head + ud->qk_rope_head_dim, src_head, static_cast<size_t>(ud->qk_nope_head_dim) * sizeof(float));
+        }
+    }
+}
+
+void cb_pack_glm_dsa_k(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1,
+                       const struct ggml_tensor* src2, int ith, int nth, void* userdata) {
+    (void)src0;
+    (void)nth;
+    auto* ud = static_cast<GLMDSAPackUserData*>(userdata);
+    if (ith != 0 || !ud || !dst || !src1 || !src2 || !dst->data || !src1->data || !src2->data) {
+        return;
+    }
+
+    const int n_tokens = static_cast<int>(src1->ne[1]);
+    const int k_head_dim = ud->qk_nope_head_dim + ud->qk_rope_head_dim;
+    const int kv_proj_head_dim = ud->qk_nope_head_dim + ud->v_head_dim;
+    const size_t kv_row_stride = static_cast<size_t>(src1->nb[1] / sizeof(float));
+    const size_t rope_row_stride = static_cast<size_t>(src2->nb[1] / sizeof(float));
+    const size_t dst_row_stride = static_cast<size_t>(dst->nb[1] / sizeof(float));
+    const float* kv_src = reinterpret_cast<const float*>(src1->data);
+    const float* rope_src = reinterpret_cast<const float*>(src2->data);
+    float* out = reinterpret_cast<float*>(dst->data);
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float* kv_row = kv_src + static_cast<size_t>(t) * kv_row_stride;
+        const float* rope_row = rope_src + static_cast<size_t>(t) * rope_row_stride;
+        float* dst_row = out + static_cast<size_t>(t) * dst_row_stride;
+        for (int h = 0; h < ud->n_heads; ++h) {
+            const float* kv_head = kv_row + static_cast<size_t>(h) * kv_proj_head_dim;
+            float* dst_head = dst_row + static_cast<size_t>(h) * k_head_dim;
+            memcpy(dst_head, rope_row, static_cast<size_t>(ud->qk_rope_head_dim) * sizeof(float));
+            memcpy(dst_head + ud->qk_rope_head_dim, kv_head, static_cast<size_t>(ud->qk_nope_head_dim) * sizeof(float));
+        }
+    }
+}
+
+void cb_pack_glm_dsa_v(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
+                       int nth, void* userdata) {
+    (void)src0;
+    (void)nth;
+    auto* ud = static_cast<GLMDSAPackUserData*>(userdata);
+    if (ith != 0 || !ud || !dst || !src1 || !dst->data || !src1->data) {
+        return;
+    }
+
+    const int n_tokens = static_cast<int>(src1->ne[1]);
+    const int kv_proj_head_dim = ud->qk_nope_head_dim + ud->v_head_dim;
+    const size_t src_row_stride = static_cast<size_t>(src1->nb[1] / sizeof(float));
+    const size_t dst_row_stride = static_cast<size_t>(dst->nb[1] / sizeof(float));
+    const float* src = reinterpret_cast<const float*>(src1->data);
+    float* out = reinterpret_cast<float*>(dst->data);
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float* src_row = src + static_cast<size_t>(t) * src_row_stride;
+        float* dst_row = out + static_cast<size_t>(t) * dst_row_stride;
+        for (int h = 0; h < ud->n_heads; ++h) {
+            const float* src_head = src_row + static_cast<size_t>(h) * kv_proj_head_dim;
+            float* dst_head = dst_row + static_cast<size_t>(h) * ud->v_head_dim;
+            memcpy(dst_head, src_head + ud->qk_nope_head_dim, static_cast<size_t>(ud->v_head_dim) * sizeof(float));
+        }
+    }
+}
+
 static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(const TransformerLayer* layer) {
     using ExpertWeights = densecore::CpuBackend::ExpertWeights;
 
@@ -4537,6 +4921,123 @@ static void UpdateSchedulerExperts(const MoEUserData* ud, const densecore::moe::
     }
 }
 
+static densecore::moe::MoERouteResult RouteMoEGroupedSigmoid(const struct ggml_tensor* gate_logits,
+                                                             const MoEUserData* ud) {
+    densecore::moe::MoERouteResult routing;
+    if (!gate_logits || !ud || !ud->model) {
+        return routing;
+    }
+
+    const int n_experts = static_cast<int>(gate_logits->ne[0]);
+    const int batch_size = static_cast<int>(gate_logits->ne[1]);
+    const int top_k = std::max(1, std::min(ud->k, n_experts));
+    routing.batch_size = batch_size;
+    routing.top_k = top_k;
+    routing.expert_ids.assign(static_cast<size_t>(batch_size * top_k), -1);
+    routing.weights.assign(static_cast<size_t>(batch_size * top_k), 0.0f);
+    routing.token_indices.assign(static_cast<size_t>(batch_size * top_k), 0);
+
+    const float* logits = reinterpret_cast<const float*>(gate_logits->data);
+    if (!logits) {
+        return routing;
+    }
+
+    const struct ggml_tensor* bias_t = ud->layer ? ud->layer->Get(model_keys::kMoeCorrectionBias) : nullptr;
+    const float* correction_bias =
+        (bias_t && bias_t->type == GGML_TYPE_F32) ? reinterpret_cast<const float*>(bias_t->data) : nullptr;
+
+    const int n_group = std::max(1, ud->model->moe_n_group);
+    const int group_size = std::max(1, n_experts / n_group);
+    const int topk_group = std::max(1, std::min(ud->model->moe_topk_group, n_group));
+
+    std::vector<float> probs(static_cast<size_t>(n_experts), 0.0f);
+    std::vector<float> choice_scores(static_cast<size_t>(n_experts), 0.0f);
+    std::vector<float> group_scores(static_cast<size_t>(n_group), -std::numeric_limits<float>::infinity());
+    std::vector<int> active_groups(static_cast<size_t>(topk_group), 0);
+    std::vector<int> selected(static_cast<size_t>(top_k), -1);
+    const auto stable_sigmoid = [](float x) -> float {
+        if (x >= 0.0f) {
+            const float z = std::exp(-x);
+            return 1.0f / (1.0f + z);
+        }
+        const float z = std::exp(x);
+        return z / (1.0f + z);
+    };
+
+    for (int token_idx = 0; token_idx < batch_size; ++token_idx) {
+        const float* row = logits + static_cast<size_t>(token_idx) * n_experts;
+        for (int e = 0; e < n_experts; ++e) {
+            const float p = stable_sigmoid(row[e]);
+            probs[static_cast<size_t>(e)] = p;
+            choice_scores[static_cast<size_t>(e)] = p + (correction_bias ? correction_bias[e] : 0.0f);
+        }
+
+        for (int g = 0; g < n_group; ++g) {
+            const int begin = g * group_size;
+            const int end = (g == n_group - 1) ? n_experts : std::min(n_experts, begin + group_size);
+            float best = -std::numeric_limits<float>::infinity();
+            float second = -std::numeric_limits<float>::infinity();
+            for (int e = begin; e < end; ++e) {
+                const float score = choice_scores[static_cast<size_t>(e)];
+                if (score > best) {
+                    second = best;
+                    best = score;
+                } else if (score > second) {
+                    second = score;
+                }
+            }
+            group_scores[static_cast<size_t>(g)] = best + ((end - begin) > 1 ? second : 0.0f);
+        }
+
+        std::iota(active_groups.begin(), active_groups.end(), 0);
+        std::partial_sort(active_groups.begin(), active_groups.end(), active_groups.end(),
+                          [&](int a, int b) { return group_scores[static_cast<size_t>(a)] > group_scores[static_cast<size_t>(b)]; });
+
+        std::vector<std::pair<float, int>> candidates;
+        candidates.reserve(static_cast<size_t>(topk_group * group_size));
+        for (int group_rank = 0; group_rank < topk_group; ++group_rank) {
+            const int g = active_groups[static_cast<size_t>(group_rank)];
+            const int begin = g * group_size;
+            const int end = (g == n_group - 1) ? n_experts : std::min(n_experts, begin + group_size);
+            for (int e = begin; e < end; ++e) {
+                candidates.emplace_back(choice_scores[static_cast<size_t>(e)], e);
+            }
+        }
+        if (static_cast<int>(candidates.size()) < top_k) {
+            candidates.clear();
+            candidates.reserve(static_cast<size_t>(n_experts));
+            for (int e = 0; e < n_experts; ++e) {
+                candidates.emplace_back(choice_scores[static_cast<size_t>(e)], e);
+            }
+        }
+
+        std::partial_sort(candidates.begin(), candidates.begin() + top_k, candidates.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        float weight_sum = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            const int expert_id = candidates[static_cast<size_t>(k)].second;
+            selected[static_cast<size_t>(k)] = expert_id;
+            weight_sum += probs[static_cast<size_t>(expert_id)];
+        }
+
+        const float scale = ud->model->moe_routed_scaling_factor;
+        for (int k = 0; k < top_k; ++k) {
+            const int expert_id = selected[static_cast<size_t>(k)];
+            float weight = probs[static_cast<size_t>(expert_id)];
+            if (ud->model->moe_norm_topk_prob && weight_sum > 1e-20f) {
+                weight /= weight_sum;
+            }
+            weight *= scale;
+            routing.expert_ids[static_cast<size_t>(token_idx * top_k + k)] = expert_id;
+            routing.weights[static_cast<size_t>(token_idx * top_k + k)] = weight;
+            routing.token_indices[static_cast<size_t>(token_idx * top_k + k)] = token_idx;
+        }
+    }
+
+    return routing;
+}
+
 void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
                     int nth, void* userdata) {
     (void)nth;
@@ -4554,8 +5055,13 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     }
 
     // Routing (src1 = gate_logits)
-    densecore::Tensor t_gate_logits = GgmlToTensor(src1);
-    auto routing = densecore::moe::MoETopKRoute(t_gate_logits, ud->k);
+    densecore::moe::MoERouteResult routing;
+    if (ud->model && ud->model->arch_flags.is_glm_moe) {
+        routing = RouteMoEGroupedSigmoid(src1, ud);
+    } else {
+        densecore::Tensor t_gate_logits = GgmlToTensor(src1);
+        routing = densecore::moe::MoETopKRoute(t_gate_logits, ud->k);
+    }
     UpdateSchedulerExperts(ud, routing);
 
     // Forward (src0 = input, dst = output)
@@ -4928,6 +5434,16 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
         auto* wk = layer.Get(model_keys::kAttnKWeight);
         auto* wv = layer.Get(model_keys::kAttnVWeight);
         auto* wo = layer.Get(model_keys::kAttnOWeight);
+        auto* q_a = layer.Get(model_keys::kAttnQAProj);
+        auto* q_a_norm = layer.Get(model_keys::kAttnQANorm);
+        auto* q_b = layer.Get(model_keys::kAttnQBProj);
+        auto* kv_a = layer.Get(model_keys::kAttnKvAProj);
+        auto* kv_a_norm = layer.Get(model_keys::kAttnKvANorm);
+        auto* kv_b = layer.Get(model_keys::kAttnKvBProj);
+        auto* indexer_wq_b = layer.Get(model_keys::kIndexerWqB);
+        auto* indexer_wk = layer.Get(model_keys::kIndexerWk);
+        auto* indexer_k_norm = layer.Get(model_keys::kIndexerKNorm);
+        auto* indexer_weights_proj = layer.Get(model_keys::kIndexerWeightsProj);
         auto* bq = layer.Get(model_keys::kAttnQBias);
         auto* bk = layer.Get(model_keys::kAttnKBias);
         auto* bv = layer.Get(model_keys::kAttnVBias);
@@ -5032,22 +5548,107 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // =================================================================
 
             // Q/K/V Projections (using smart dispatcher for Parallel GEMV)
-            if (!wq || !wk || !wv) {
+            const bool use_glm_dsa_mla =
+                model->arch_flags.is_glm_dsa && q_a && q_a_norm && q_b && kv_a && kv_a_norm && kv_b;
+            if (!use_glm_dsa_mla && (!wq || !wk || !wv)) {
                 throw densecore::InvalidArgumentException("Missing Q/K/V weights in TransformerLayer");
             }
             struct ggml_tensor* Qcur = nullptr;
             struct ggml_tensor* Kcur = nullptr;
             struct ggml_tensor* Vcur = nullptr;
+            struct ggml_tensor* glm_q_resid = nullptr;
+            struct ggml_tensor* glm_index_query = nullptr;
+            struct ggml_tensor* glm_index_weights = nullptr;
+            struct ggml_tensor* glm_index_key = nullptr;
+            const bool use_glm_dsa_sparse =
+                use_glm_dsa_mla && cache && cache->has_index_cache &&
+                cache->index_head_dim == model->glm_index_head_dim && decode_only_batch_layout && indexer_wq_b &&
+                indexer_wk && indexer_k_norm && indexer_weights_proj && model->glm_index_n_heads > 0 &&
+                model->glm_index_head_dim > 0;
 
             // Optional fused QKV projection (single pass over input per token).
             // Falls back to per-projection matmul for non-F32/quantized weights.
-            const bool fused_qkv_supported = IsFusedQKVEnabled() && cur->type == GGML_TYPE_F32 &&
+            const bool fused_qkv_supported = !use_glm_dsa_mla && IsFusedQKVEnabled() && cur->type == GGML_TYPE_F32 &&
                                              wq->type == GGML_TYPE_F32 && wk->type == GGML_TYPE_F32 &&
                                              wv->type == GGML_TYPE_F32 && wq->data && wk->data && wv->data &&
                                              wq->ne[0] == cur->ne[0] && wk->ne[0] == cur->ne[0] &&
                                              wv->ne[0] == cur->ne[0] && wq->ne[1] > 0 && wk->ne[1] > 0 && wv->ne[1] > 0;
 
-            if (fused_qkv_supported) {
+            if (use_glm_dsa_mla) {
+                static bool logged_glm_dsa_path = false;
+                if (!logged_glm_dsa_path) {
+                    std::cerr << "[DenseCore] GLM-5 DSA path enabled"
+                              << (use_glm_dsa_sparse ? " with sparse indexer cache." : " without sparse indexer cache; using dense attention.")
+                              << std::endl;
+                    logged_glm_dsa_path = true;
+                }
+                const int qk_nope_head_dim = model->glm_qk_nope_head_dim;
+                const int qk_rope_head_dim = model->glm_qk_rope_head_dim;
+                const int v_head_dim = model->glm_v_head_dim;
+                const int kv_lora_rank = model->glm_kv_lora_rank;
+                const int q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+                const int kv_proj_head_dim = qk_nope_head_dim + v_head_dim;
+
+                if (qk_nope_head_dim <= 0 || qk_rope_head_dim <= 0 || v_head_dim <= 0 || kv_lora_rank <= 0) {
+                    throw densecore::InvalidArgumentException("Incomplete GLM-5 DSA metadata for MLA projection path");
+                }
+
+                glm_q_resid = smart_mul_mat(ctx_c, q_a, cur, model);
+                glm_q_resid = apply_weighted_rms_norm(glm_q_resid, q_a_norm, "glm_q_a_norm");
+                struct ggml_tensor* q_raw = smart_mul_mat(ctx_c, q_b, glm_q_resid, model);
+
+                struct ggml_tensor* kv_a_cur = smart_mul_mat(ctx_c, kv_a, cur, model);
+                const int64_t kv_a_dim = kv_a_cur->ne[0];
+                if (kv_a_dim < static_cast<int64_t>(kv_lora_rank + qk_rope_head_dim)) {
+                    throw densecore::InvalidArgumentException("GLM-5 kv_a projection is smaller than kv_lora_rank + rope dim");
+                }
+
+                struct ggml_tensor* kv_comp =
+                    ggml_view_2d(ctx_c, kv_a_cur, kv_lora_rank, N, kv_a_cur->nb[1], 0);
+                struct ggml_tensor* k_rope =
+                    ggml_view_2d(ctx_c, kv_a_cur, qk_rope_head_dim, N, kv_a_cur->nb[1],
+                                 static_cast<size_t>(kv_lora_rank) * ggml_element_size(kv_a_cur));
+                kv_comp = ggml_cont(ctx_c, kv_comp);
+                k_rope = ggml_cont(ctx_c, k_rope);
+                kv_comp = apply_weighted_rms_norm(kv_comp, kv_a_norm, "glm_kv_a_norm");
+                struct ggml_tensor* kv_raw = smart_mul_mat(ctx_c, kv_b, kv_comp, model);
+
+                if (q_raw->ne[0] != static_cast<int64_t>(q_head_dim * n_head)) {
+                    throw densecore::InvalidArgumentException("GLM-5 q_b projection shape mismatch");
+                }
+                if (kv_raw->ne[0] != static_cast<int64_t>(kv_proj_head_dim * n_head_kv)) {
+                    throw densecore::InvalidArgumentException("GLM-5 kv_b projection shape mismatch");
+                }
+
+                GLMDSAPackUserData* q_pack_ud = AllocateGLMDSAPackUserData(ctx_c);
+                GLMDSAPackUserData* k_pack_ud = AllocateGLMDSAPackUserData(ctx_c);
+                GLMDSAPackUserData* v_pack_ud = AllocateGLMDSAPackUserData(ctx_c);
+                if (!q_pack_ud || !k_pack_ud || !v_pack_ud) {
+                    throw densecore::OutOfMemoryException("Failed to allocate GLM-5 DSA packing userdata");
+                }
+                *q_pack_ud = {n_head, qk_nope_head_dim, qk_rope_head_dim, v_head_dim};
+                *k_pack_ud = {n_head_kv, qk_nope_head_dim, qk_rope_head_dim, v_head_dim};
+                *v_pack_ud = {n_head_kv, qk_nope_head_dim, qk_rope_head_dim, v_head_dim};
+
+                struct ggml_tensor* q_packed = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, q_head_dim * n_head, N);
+                struct ggml_tensor* k_packed = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, q_head_dim * n_head_kv, N);
+                struct ggml_tensor* v_packed = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, v_head_dim * n_head_kv, N);
+
+                // Repack [nope|rope] into [rope|nope] so the existing partial-RoPE path
+                // can operate on the leading rope dimensions.
+                Qcur = ggml_map_custom2(ctx_c, q_packed, q_raw, cb_pack_glm_dsa_q, 1, q_pack_ud);
+                Kcur = ggml_map_custom3(ctx_c, k_packed, kv_raw, k_rope, cb_pack_glm_dsa_k, 1, k_pack_ud);
+                Vcur = ggml_map_custom2(ctx_c, v_packed, kv_raw, cb_pack_glm_dsa_v, 1, v_pack_ud);
+
+                if (use_glm_dsa_sparse) {
+                    glm_index_query = smart_mul_mat(ctx_c, indexer_wq_b, glm_q_resid, model);
+                    glm_index_weights = smart_mul_mat(ctx_c, indexer_weights_proj, cur, model);
+                    glm_index_weights =
+                        ggml_scale(ctx_c, glm_index_weights, 1.0f / std::sqrt((float)model->glm_index_n_heads));
+                    glm_index_key = smart_mul_mat(ctx_c, indexer_wk, cur, model);
+                    glm_index_key = apply_weighted_rms_norm(glm_index_key, indexer_k_norm, "glm_index_k_norm");
+                }
+            } else if (fused_qkv_supported) {
                 const int dim_q_fused = static_cast<int>(wq->ne[1]);
                 const int dim_k_fused = static_cast<int>(wk->ne[1]);
                 const int dim_v_fused = static_cast<int>(wv->ne[1]);
@@ -5139,10 +5740,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             int dim_q = Qcur->ne[0];
             int dim_k = Kcur->ne[0];
             int dim_v = Vcur->ne[0];
-            (void)dim_v;
 
             int n_head_kv = model->hparams.n_head_kv;
             int head_dim_kv = (model->hparams.n_embd_head_k > 0) ? model->hparams.n_embd_head_k : (dim_k / n_head_kv);
+            int head_dim_v = (model->hparams.n_embd_head_v > 0) ? model->hparams.n_embd_head_v : (dim_v / n_head_kv);
             struct ggml_tensor* attn_gate = nullptr;
 
             // Qwen3.5 hybrid attention packs [q | gate] per-head, not as two
@@ -5182,7 +5783,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 Kcur = ggml_reshape_3d(ctx_c, Kcur, head_dim_kv, n_head_kv, N);
             }
             if (!v_done) {
-                Vcur = ggml_reshape_3d(ctx_c, Vcur, head_dim_kv, n_head_kv, N);
+                Vcur = ggml_reshape_3d(ctx_c, Vcur, head_dim_v, n_head_kv, N);
             }
 
             // =========================================================================
@@ -5339,9 +5940,62 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 }
             }
 
+            if (use_glm_dsa_sparse && glm_index_query && glm_index_weights && glm_index_key) {
+                const int index_n_heads = model->glm_index_n_heads;
+                const int index_head_dim = model->glm_index_head_dim;
+                const int index_rope_dim = std::min(model->glm_qk_rope_head_dim, index_head_dim);
+
+                glm_index_query = ggml_cont(ctx_c, glm_index_query);
+                glm_index_weights = ggml_cont(ctx_c, glm_index_weights);
+                glm_index_key = ggml_cont(ctx_c, glm_index_key);
+
+                glm_index_query = ggml_reshape_3d(ctx_c, glm_index_query, index_head_dim, index_n_heads, N);
+                if (index_rope_dim > 0) {
+                    glm_index_query =
+                        ggml_rope_ext(ctx_c, glm_index_query, pos, nullptr, index_rope_dim, 0, n_ctx,
+                                      model->hparams.rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f,
+                                      0.0f);
+                    struct ggml_tensor* index_k_3d = ggml_reshape_3d(ctx_c, glm_index_key, index_head_dim, 1, N);
+                    index_k_3d = ggml_rope_ext(ctx_c, index_k_3d, pos, nullptr, index_rope_dim, 0, n_ctx,
+                                               model->hparams.rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f,
+                                               0.0f, 0.0f);
+                    glm_index_key = ggml_reshape_2d(ctx_c, index_k_3d, index_head_dim, N);
+                }
+            }
+
+            struct ggml_tensor* KQV = nullptr;
+            if (use_glm_dsa_sparse && glm_index_query && glm_index_weights && glm_index_key) {
+                PagedAttentionUserData* ud = GetPagedAttentionUserData();
+                ud->cache = cache;
+                ud->layer = il;
+                ud->head_dim = head_dim_q;
+                ud->v_head_dim = head_dim_v;
+                ud->n_head = n_head;
+                ud->index_n_heads = model->glm_index_n_heads;
+                ud->index_head_dim = model->glm_index_head_dim;
+                ud->index_topk = model->glm_index_topk;
+                ud->epoch_started.store(0, std::memory_order_relaxed);
+                ud->epoch_done.store(0, std::memory_order_relaxed);
+                ud->kv_writers_done.store(0, std::memory_order_relaxed);
+
+                struct ggml_tensor* q_sparse = ggml_is_contiguous(Qcur) ? Qcur : ggml_cont(ctx_c, Qcur);
+                struct ggml_tensor* k_sparse = ggml_is_contiguous(Kcur) ? Kcur : ggml_cont(ctx_c, Kcur);
+                struct ggml_tensor* v_sparse = ggml_is_contiguous(Vcur) ? Vcur : ggml_cont(ctx_c, Vcur);
+                struct ggml_tensor* index_q_sparse =
+                    ggml_is_contiguous(glm_index_query) ? glm_index_query : ggml_cont(ctx_c, glm_index_query);
+                struct ggml_tensor* index_w_sparse =
+                    ggml_is_contiguous(glm_index_weights) ? glm_index_weights : ggml_cont(ctx_c, glm_index_weights);
+                struct ggml_tensor* index_k_sparse =
+                    ggml_is_contiguous(glm_index_key) ? glm_index_key : ggml_cont(ctx_c, glm_index_key);
+
+                KQV = ggml_glm_dsa_attention(ctx_c, q_sparse, k_sparse, v_sparse, index_q_sparse, index_w_sparse,
+                                             index_k_sparse, ud);
+            }
+
             // =========================================================================
             // KV CACHE INTEGRATION (Universal Paged Attention)
             // =========================================================================
+            if (!KQV) {
             struct ggml_tensor* K_all = Kcur;  // Default to current K
             struct ggml_tensor* V_all = Vcur;  // Default to current V
 
@@ -5355,9 +6009,12 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             }
             const int n_total_tokens = n_past_val + N;
             const bool paged_decode_candidate =
+                !model->arch_flags.is_glm_dsa &&
                 IsPagedDecodeCandidate(cache, batch, N, n_head, n_head_kv, head_dim_q, head_dim_kv);
-            const bool requested_paged_decode_attention = ShouldUsePagedDecodeAttention(
-                decode_paged_policy, cache, batch, N, n_head, n_head_kv, head_dim_q, head_dim_kv);
+            const bool requested_paged_decode_attention =
+                !model->arch_flags.is_glm_dsa &&
+                ShouldUsePagedDecodeAttention(decode_paged_policy, cache, batch, N, n_head, n_head_kv, head_dim_q,
+                                              head_dim_kv);
             const bool decode_only_batch = decode_only_batch_layout;
 
             // Safety override: GGML's generic decode matmul path can become numerically
@@ -5423,7 +6080,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 KVCacheUserData* k_ud = GetKVCacheUserData(il, true);
                 *k_ud = {cache, il, head_dim_kv, true};  // batch accessed via GetCurrentBatch()
                 KVCacheUserData* v_ud = GetKVCacheUserData(il, false);
-                *v_ud = {cache, il, head_dim_kv, false};  // batch accessed via GetCurrentBatch()
+                *v_ud = {cache, il, head_dim_v, false};  // batch accessed via GetCurrentBatch()
 
                 int kv_tasks = ResolveInferenceConfig(&batch).num_threads;
                 if (kv_tasks <= 0) {
@@ -5607,7 +6264,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // Note: Flash Attention still requires AVX-512-class x86 support for
             // correctness/perf in this path.
             const bool flash_attn_head_layout_supported =
-                (n_head_kv > 0) && (n_head % n_head_kv == 0) && (n_head % 8 == 0);
+                !model->arch_flags.is_glm_dsa && (n_head_kv > 0) && (n_head % n_head_kv == 0) && (n_head % 8 == 0);
             const bool flash_attn_runtime_supported = flash_attn_head_layout_supported &&
                                                       densecore::OpsRegistry::IsInitialized() &&
                                                       IsFlashAttentionIsaSupported();
@@ -5619,7 +6276,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // unnecessary even when n_past > 0. Prefill still requires zero offset.
             const bool hal_attention_offset_safe = (n_past_val == 0) || (N == 1);
             const bool use_hal_attention_dispatch = preferred_attention_device != densecore::DeviceType::CPU &&
-                                                    !use_paged_decode_attention && hal_attention_offset_safe;
+                                                    !use_paged_decode_attention && hal_attention_offset_safe &&
+                                                    !model->arch_flags.is_glm_dsa;
             const bool portable_cpu_flash_attention_supported =
                 flash_attn_head_layout_supported && densecore::OpsRegistry::IsInitialized() &&
                 (IsPortableCpuFlashAttentionEnabled() || flash_attn_forced);
@@ -5659,8 +6317,6 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                                                                      : (use_flash_attention ? "flash" : "standard"));
                 std::cerr << "[DecodeAttentionPath] N=" << N << " path=" << path << std::endl;
             }
-
-            struct ggml_tensor* KQV = nullptr;
 
             if (use_paged_decode_attention) {
                 // -----------------------------------------------------------------------
@@ -5860,6 +6516,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     KQV = ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
                 }
             }
+            }
 
             // Must be contiguous before reshape
             struct ggml_tensor* KQV_merged = ggml_cont(ctx_c, KQV);
@@ -5920,7 +6577,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 KQV_merged = ggml_map_custom1(ctx_c, KQV_merged, cb_check_kqv, 1, &dbg_layers[il]);
             }
 
-            cur = ggml_reshape_2d(ctx_c, KQV_merged, head_dim_q * n_head, N);
+            const int attn_out_head_dim = static_cast<int>(KQV_merged->ne[0]);
+            cur = ggml_reshape_2d(ctx_c, KQV_merged, attn_out_head_dim * n_head, N);
             if (attn_gate) {
                 attn_gate = ggml_sigmoid(ctx_c, attn_gate);
                 cur = ggml_mul(ctx_c, cur, attn_gate);
@@ -6053,6 +6711,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // =====================================================================
             // MOE PATH
             // =====================================================================
+            struct ggml_tensor* moe_input = cur;
+
             // 1. Router: gate_logits = moe_gate * input
             if (!moe_gate) {
                 throw densecore::InvalidArgumentException("Missing moe_gate weight in TransformerLayer");
@@ -6062,6 +6722,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // 2. Dispatch
             MoEUserData* moe_ud = AllocateMoEUserData(ctx_c);
             if (moe_ud) {
+                moe_ud->model = model;
                 moe_ud->layer = &model->layers[il];
                 moe_ud->k = model->hparams.n_experts_used;
                 moe_ud->batch = &batch;
@@ -6086,6 +6747,16 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // Use 1 task (single thread dispatch, threaded inside backend)
             cur = ggml_map_custom2(ctx_c, cur, gate_logits, cb_moe_forward, 1, moe_ud);
             ggml_set_name(cur, "moe_forward");
+
+            // GLM-style MoE keeps a dense shared-expert MLP in parallel with routed experts.
+            if (model->moe_n_shared_experts > 0 && ffn_gate && ffn_up && ffn_down) {
+                struct ggml_tensor* shared_gate = smart_mul_mat(ctx_c, ffn_gate, moe_input, model);
+                struct ggml_tensor* shared_up = smart_mul_mat(ctx_c, ffn_up, moe_input, model);
+                struct ggml_tensor* shared_ffn =
+                    ggml_map_custom2(ctx_c, shared_gate, shared_up, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+                shared_ffn = smart_mul_mat(ctx_c, ffn_down, shared_ffn, model);
+                cur = ggml_add(ctx_c, cur, shared_ffn);
+            }
         } else {
             // =====================================================================
             // DENSE PATH
