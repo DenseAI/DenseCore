@@ -102,12 +102,41 @@ inline void ExecuteINT8TransB(const MatmulParams& params) {
     const int8_t* b = static_cast<const int8_t*>(params.b);
     float* c = static_cast<float*>(params.c);
 
+    const float a_scale = params.quant.a_scales ? params.quant.a_scales[0] : 1.0f;
+    const float b_scale = params.quant.b_scales ? params.quant.b_scales[0] : 1.0f;
+    const float scale = a_scale * b_scale;
+    const int32_t a_zp = params.quant.a_zero_points ? params.quant.a_zero_points[0] : 0;
+    const int32_t b_zp = params.quant.b_zero_points ? params.quant.b_zero_points[0] : 0;
+
+    // Precompute per-row sum of B (used for a_zp correction across all M rows)
+    thread_local std::vector<int32_t> sum_b_rows;
+    if (a_zp != 0) {
+        sum_b_rows.resize(static_cast<size_t>(N));
+        for (int n = 0; n < N; ++n) {
+            const int8_t* b_row = b + static_cast<size_t>(n) * ldb;
+            int32_t s = 0;
+            for (int k = 0; k < K; ++k) s += static_cast<int32_t>(b_row[k]);
+            sum_b_rows[n] = s;
+        }
+    }
+
     for (int m = 0; m < M; ++m) {
         const int8_t* a_row = a + static_cast<size_t>(m) * lda;
         float* c_row = c + static_cast<size_t>(m) * ldc;
+
+        int32_t sum_a = 0;
+        if (b_zp != 0) {
+            for (int k = 0; k < K; ++k) sum_a += static_cast<int32_t>(a_row[k]);
+        }
+
         for (int n = 0; n < N; ++n) {
             const int8_t* b_row = b + static_cast<size_t>(n) * ldb;
-            c_row[n] = static_cast<float>(DotInt8Int8(a_row, b_row, K));
+            // dot(a - a_zp, b - b_zp) = dot(a,b) - a_zp*sum(b) - b_zp*sum(a) + K*a_zp*b_zp
+            int32_t dot = DotInt8Int8(a_row, b_row, K);
+            if (a_zp != 0) dot -= a_zp * sum_b_rows[n];
+            if (b_zp != 0) dot -= b_zp * sum_a;
+            if (a_zp != 0 && b_zp != 0) dot += K * a_zp * b_zp;
+            c_row[n] = static_cast<float>(dot) * scale;
         }
     }
 }

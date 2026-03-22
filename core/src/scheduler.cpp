@@ -622,20 +622,18 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
             continue;
         }
 
-        if (!can_chunk && remaining > tokens_budget) {
+        int prefill_budget = tokens_budget;
+        if (prefill_token_cap > 0) {
+            prefill_budget = std::min(prefill_budget, prefill_token_cap);
+        }
+        if (can_chunk) {
+            prefill_budget = std::min(prefill_budget, config_.max_prefill_tokens);
+        }
+        if (!can_chunk && remaining > prefill_budget) {
             still_waiting.push_back(group);
             continue;
         }
-
-        int chunk_budget = tokens_budget;
-        if (can_chunk) {
-            int chunk_cap = config_.max_prefill_tokens;
-            if (prefill_token_cap > 0) {
-                chunk_cap = std::min(chunk_cap, prefill_token_cap);
-            }
-            chunk_budget = std::min(chunk_budget, chunk_cap);
-        }
-        const int tokens_needed = can_chunk ? std::min(remaining, chunk_budget) : remaining;
+        const int tokens_needed = can_chunk ? std::min(remaining, prefill_budget) : remaining;
         if (tokens_needed <= 0) {
             still_waiting.push_back(group);
             continue;

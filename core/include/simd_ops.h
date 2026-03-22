@@ -2262,6 +2262,7 @@ inline void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W_int4, co
                     const int step = (remaining < static_cast<int>(2 * vl))
                                          ? remaining
                                          : static_cast<int>(2 * vl);
+                    const uint64_t packed_step = static_cast<uint64_t>((step + 1) / 2);
 
                     // Load activations with predication for tail
                     svbool_t pg0 = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
@@ -2278,8 +2279,8 @@ inline void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W_int4, co
         const uint8_t* w_ptr = W_int4 + (n + (idx)) * packed_K + packed_g_offset + k / 2;\
         __builtin_prefetch(w_ptr + 64, 0, 3);                                           \
                                                                                          \
-        /* Load vl packed bytes = 2*vl INT4 weights */                                   \
-        svuint8_t packed_bytes = svld1_u8(svwhilelt_b8_u64(0UL, vl), w_ptr);            \
+        /* Load only the packed bytes needed for this step */                            \
+        svuint8_t packed_bytes = svld1_u8(svwhilelt_b8_u64(0UL, packed_step), w_ptr);   \
                                                                                          \
         /* Extract low nibbles (even indices) */                                         \
         svuint8_t lo_u8 = svand_u8_x(svptrue_b8(), packed_bytes, svdup_u8(0x0F));       \
@@ -2346,6 +2347,7 @@ inline void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W_int4, co
                     const int step = (remaining < static_cast<int>(2 * vl))
                                          ? remaining
                                          : static_cast<int>(2 * vl);
+                    const uint64_t packed_step = static_cast<uint64_t>((step + 1) / 2);
 
                     svbool_t pg0 = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
                     svbool_t pg1 = (step > static_cast<int>(vl))
@@ -2357,7 +2359,7 @@ inline void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W_int4, co
 
                     const uint8_t* w_ptr = W_int4 + n * packed_K + packed_g_offset + k / 2;
 
-                    svuint8_t packed_bytes = svld1_u8(svwhilelt_b8_u64(0UL, vl), w_ptr);
+                    svuint8_t packed_bytes = svld1_u8(svwhilelt_b8_u64(0UL, packed_step), w_ptr);
                     svuint8_t lo_u8 = svand_u8_x(svptrue_b8(), packed_bytes, svdup_u8(0x0F));
                     svuint8_t hi_u8 = svlsr_n_u8_x(svptrue_b8(), packed_bytes, 4);
 
@@ -2430,6 +2432,7 @@ inline void GemmInt4Fp32Batched_SVE(float* C, const float* A, const uint8_t* W_i
                     const int step = (remaining < static_cast<int>(2 * vl))
                                          ? remaining
                                          : static_cast<int>(2 * vl);
+                    const uint64_t packed_step = static_cast<uint64_t>((step + 1) / 2);
 
                     svbool_t pg0 = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
                     svbool_t pg1 = (step > static_cast<int>(vl))
@@ -2440,7 +2443,7 @@ inline void GemmInt4Fp32Batched_SVE(float* C, const float* A, const uint8_t* W_i
                     const uint8_t* w_ptr = W_int4 + n * packed_K + packed_g_offset + k / 2;
                     __builtin_prefetch(w_ptr + 64, 0, 3);
 
-                    svuint8_t packed_bytes = svld1_u8(svwhilelt_b8_u64(0UL, vl), w_ptr);
+                    svuint8_t packed_bytes = svld1_u8(svwhilelt_b8_u64(0UL, packed_step), w_ptr);
                     svuint8_t lo_u8 = svand_u8_x(svptrue_b8(), packed_bytes, svdup_u8(0x0F));
                     svuint8_t hi_u8 = svlsr_n_u8_x(svptrue_b8(), packed_bytes, 4);
 
