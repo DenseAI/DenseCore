@@ -116,12 +116,12 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
 
             // Step 1: Compute Q @ K^T for this tile
             // S_ij = Q[i:i+Br] @ K[j:j+Bc]^T * scale
-            simd::ComputeQK_AVX512(Q + i * head_dim, K + j * head_dim, scratch.qk_block.data(), q_len, kv_len, head_dim,
-                                   scale);
+            simd::ComputeQK(Q + i * head_dim, K + j * head_dim, scratch.qk_block.data(), q_len, kv_len, head_dim,
+                            scale);
 
             // Step 2: Apply causal mask (vectorized)
             if (config.causal) {
-                simd::ApplyMask_AVX512(scratch.qk_block.data(), i, j, q_len, kv_len);
+                simd::ApplyMask(scratch.qk_block.data(), i, j, q_len, kv_len);
             }
 
             // Step 3: Online softmax update (vectorized)
@@ -137,13 +137,13 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
                 block_sum[qi] = L[i + qi];
             }
 
-            simd::SoftmaxBlock_AVX512(scratch.qk_block.data(), block_max, block_sum, q_len, kv_len, first_kv_block);
+            simd::SoftmaxBlock(scratch.qk_block.data(), block_max, block_sum, q_len, kv_len, first_kv_block);
 
             // Step 4: Compute P @ V for this tile
             // pv[qi] = sum_ki(softmax[qi, ki] * V[j + ki])
             memset(scratch.pv_block.data(), 0, q_len * head_dim * sizeof(float));
-            simd::ComputePV_AVX512(scratch.qk_block.data(), V + j * head_dim, scratch.pv_block.data(), q_len, kv_len,
-                                   head_dim);
+            simd::ComputePV(scratch.qk_block.data(), V + j * head_dim, scratch.pv_block.data(), q_len, kv_len,
+                            head_dim);
 
             // Step 5: Update output with rescaling
             // O = (alpha * L * O + pv) / L_new
@@ -171,7 +171,7 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
             }
 
             // Apply rescaling with vectorized kernel
-            simd::UpdateOutput_AVX512(O + i * head_dim, scratch.pv_block.data(), alpha_ptr, beta_ptr, q_len, head_dim);
+            simd::UpdateOutput(O + i * head_dim, scratch.pv_block.data(), alpha_ptr, beta_ptr, q_len, head_dim);
         }
     }
 }

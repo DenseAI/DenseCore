@@ -195,10 +195,11 @@ bool PinToEfficiencyCores();
  * @brief Check if AMX (Apple Matrix Extensions) is available
  *
  * AMX is a coprocessor on Apple Silicon that accelerates matrix operations
- * directly on the CPU. It's used by Accelerate.framework's BLAS routines.
+ * directly on the CPU. DenseCore currently relies on Accelerate.framework's
+ * BLAS routines to reach AMX for FP32 GEMV/GEMM.
  *
- * All M-series chips have AMX, so this should always return true on Apple
- * Silicon.
+ * This signal does not imply that DenseCore has custom AMX kernels for
+ * quantized INT4 paths; those still use the custom Apple CPU kernel path.
  *
  * @return true if AMX is available
  */
@@ -245,6 +246,25 @@ void GemvAccelerate(float* output, const float* input, const float* weight, int 
  * @param K Columns of A, rows of B
  */
 void GemmAccelerate(float* C, const float* A, const float* B, int M, int N, int K);
+
+/**
+ * @brief Check whether DenseCore has Apple CPU INT4 kernels available
+ *
+ * These kernels are implemented in DenseCore and tuned for Apple Silicon's
+ * current NEON core path. They complement Accelerate, which does not cover
+ * DenseCore's custom quantized INT4 layouts.
+ */
+bool HasCustomInt4Kernels();
+
+/**
+ * @brief Apple-tuned INT4 GEMM over an output-column slice
+ *
+ * Computes C[:, n_start:n_end] = A @ W^T for a packed INT4 weight matrix.
+ * The slice form allows the caller to parallelize across output columns
+ * without temporary buffers.
+ */
+void GemmInt4CustomRange(float* C, const float* A, const uint8_t* W_int4, const float* scales, const float* zero_points,
+                         int M, int N, int K, int group_size, int n_start = 0, int n_end = -1);
 
 // ============================================================================
 // Memory Information

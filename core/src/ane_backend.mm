@@ -26,6 +26,7 @@
 
 #include "../include/apple_silicon.h"
 #include "../include/metal_backend.h"  // For RoPE/FlashAttention fallback
+#include "../include/simd_ops.h"
 
 #ifdef __APPLE__
 
@@ -304,9 +305,21 @@ struct ANEBackend::Impl {
     size_t dequantCacheBytes = 0;
     static constexpr size_t DEQUANT_CACHE_MAX_BYTES = 512ULL * 1024 * 1024;  // 512MB limit
 
+    std::list<CacheKey> repackedFp16LruOrder;
+    struct FP16CacheEntry {
+        std::vector<ggml_fp16_t> data;
+        std::list<CacheKey>::iterator lruIterator;
+    };
+    std::mutex repackedFp16CacheMutex;
+    std::unordered_map<CacheKey, FP16CacheEntry, CacheKeyHash> repackedFp16Cache;
+    size_t repackedFp16CacheBytes = 0;
+    static constexpr size_t REPACKED_FP16_CACHE_MAX_BYTES = 256ULL * 1024 * 1024;
+
     // Cache metrics
     std::atomic<uint64_t> cacheHits{0};
     std::atomic<uint64_t> cacheMisses{0};
+    std::atomic<uint64_t> repackedFp16Hits{0};
+    std::atomic<uint64_t> repackedFp16Misses{0};
 
     /**
      * @brief Lookup weights in cache or return nullptr
@@ -360,11 +373,55 @@ struct ANEBackend::Impl {
         dequantCache[key] = std::move(entry);
     }
 
+    const ggml_fp16_t* GetCachedWeightsFP16(const CacheKey& key) {
+        std::lock_guard<std::mutex> lock(repackedFp16CacheMutex);
+        auto it = repackedFp16Cache.find(key);
+        if (it != repackedFp16Cache.end()) {
+            repackedFp16LruOrder.splice(repackedFp16LruOrder.begin(), repackedFp16LruOrder,
+                                        it->second.lruIterator);
+            repackedFp16Hits.fetch_add(1, std::memory_order_relaxed);
+            return it->second.data.data();
+        }
+        repackedFp16Misses.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+
+    void CacheWeightsFP16(const CacheKey& key, std::vector<ggml_fp16_t>&& data) {
+        std::lock_guard<std::mutex> lock(repackedFp16CacheMutex);
+
+        size_t newEntryBytes = data.size() * sizeof(ggml_fp16_t);
+        while (repackedFp16CacheBytes + newEntryBytes > REPACKED_FP16_CACHE_MAX_BYTES &&
+               !repackedFp16LruOrder.empty()) {
+            const CacheKey& lruKey = repackedFp16LruOrder.back();
+            auto it = repackedFp16Cache.find(lruKey);
+            if (it != repackedFp16Cache.end()) {
+                repackedFp16CacheBytes -= it->second.data.size() * sizeof(ggml_fp16_t);
+                repackedFp16Cache.erase(it);
+            }
+            repackedFp16LruOrder.pop_back();
+        }
+
+        repackedFp16LruOrder.push_front(key);
+        FP16CacheEntry entry;
+        entry.data = std::move(data);
+        entry.lruIterator = repackedFp16LruOrder.begin();
+        repackedFp16CacheBytes += newEntryBytes;
+        repackedFp16Cache[key] = std::move(entry);
+    }
+
     void ClearDequantCache() {
-        std::lock_guard<std::mutex> lock(dequantCacheMutex);
-        dequantCache.clear();
-        dequantLruOrder.clear();
-        dequantCacheBytes = 0;
+        {
+            std::lock_guard<std::mutex> lock(dequantCacheMutex);
+            dequantCache.clear();
+            dequantLruOrder.clear();
+            dequantCacheBytes = 0;
+        }
+        {
+            std::lock_guard<std::mutex> lock(repackedFp16CacheMutex);
+            repackedFp16Cache.clear();
+            repackedFp16LruOrder.clear();
+            repackedFp16CacheBytes = 0;
+        }
     }
 
     Impl() {
@@ -412,10 +469,15 @@ struct ANEBackend::Impl {
         StopCompileThread();
         @autoreleasepool {
             // Log final cache stats if any hits occurred
-            if (cacheHits.load() > 0 || cacheMisses.load() > 0) {
+            if (cacheHits.load() > 0 || cacheMisses.load() > 0 || repackedFp16Hits.load() > 0 ||
+                repackedFp16Misses.load() > 0) {
                 std::cerr << "[ANEBackend] Shutdown - INT4 cache stats: " << cacheHits.load()
                           << " hits, " << cacheMisses.load() << " misses ("
-                          << dequantCacheBytes / (1024 * 1024) << " MB cached)" << std::endl;
+                          << dequantCacheBytes / (1024 * 1024) << " MB FP32, "
+                          << repackedFp16Hits.load() << " FP16 repack hits, "
+                          << repackedFp16Misses.load() << " FP16 repack misses, "
+                          << repackedFp16CacheBytes / (1024 * 1024) << " MB FP16 cached)"
+                          << std::endl;
             }
             ClearDequantCache();
             compiledOps.clear();
@@ -676,17 +738,17 @@ BackendCapabilityManifest ANEBackend::GetCapabilityManifest() const {
     // The fused CompileTransformerLayer path runs all these on ANE as a
     // single CoreML graph, which is the recommended production path.
     manifest.fallback_ops = {
-        OpType::Embedding,          // Table lookup — CPU
-        OpType::GemmInt4,           // Cached dequant + Metal GPU GEMM
-        OpType::RMSNorm,            // Metal GPU or CPU Accelerate vDSP
-        OpType::AddRMSNorm,         // Metal GPU or CPU Accelerate
-        OpType::LayerNorm,          // CPU implementation
-        OpType::Softmax,            // Metal GPU or CPU
-        OpType::SiLU,               // CPU implementation
-        OpType::GELU,               // CPU implementation
-        OpType::RoPE,               // Metal GPU kernel
-        OpType::FusedQKVProjection, // Metal GPU kernel
-        OpType::FlashAttention,     // Metal GPU FlashAttention kernel
+        OpType::Embedding,           // Table lookup — CPU
+        OpType::GemmInt4,            // Fused Metal INT4 GEMM; cached FP32 fallback
+        OpType::RMSNorm,             // Metal GPU or CPU Accelerate vDSP
+        OpType::AddRMSNorm,          // Metal GPU or CPU Accelerate
+        OpType::LayerNorm,           // CPU implementation
+        OpType::Softmax,             // Metal GPU or CPU
+        OpType::SiLU,                // CPU implementation
+        OpType::GELU,                // CPU implementation
+        OpType::RoPE,                // Metal GPU kernel
+        OpType::FusedQKVProjection,  // Metal GPU kernel
+        OpType::FlashAttention,      // Metal GPU FlashAttention kernel
     };
 
     // ANE-only mode forbids fallback use by design.
@@ -852,13 +914,12 @@ void ANEBackend::MatMulTransB(const Tensor& A, const Tensor& B, Tensor* C) {
 void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales,
                           const Tensor& zero_points, Tensor* C, int group_size) {
     // =========================================================================
-    // ANE INT4 GEMM FALLBACK: Cached Dequantize + Metal GPU
+    // ANE INT4 GEMM FALLBACK
     // =========================================================================
     // Apple Neural Engine does not natively support INT4 quantization.
     // Strategy:
-    // 1. Check LRU cache for pre-dequantized FP32 weights
-    // 2. On cache miss: dequantize and store in cache
-    // 3. Delegate to Metal GPU for FP32 GEMM
+    // 1. Prefer fused Metal grouped-INT4 GEMM (packed weights stay compressed)
+    // 2. Fall back to cached FP32 dequantization + Metal GEMM if unavailable
     // =========================================================================
 
     if (impl_->aneOnlyMode) {
@@ -896,6 +957,20 @@ void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
         throw std::runtime_error("[ANEBackend] INT4 weight dimension mismatch");
     }
 
+    // Fast path: run the packed/grouped INT4 GEMM directly on Metal without
+    // materializing a dequantized FP32 weight matrix.
+    if (metal->GemmInt4Grouped(A, W, scales, zero_points, C, group_size)) {
+        impl_->MaybeSyncMetalFallback();
+
+        static bool warned_fused = false;
+        if (!warned_fused) {
+            std::cerr << "[ANEBackend] Note: INT4 GEMM using fused Metal grouped fallback. "
+                      << "Offline fused CoreML layers remain the preferred ANE path." << std::endl;
+            warned_fused = true;
+        }
+        return;
+    }
+
     // =========================================================================
     // CACHE LOOKUP: Check for pre-dequantized weights
     // =========================================================================
@@ -903,17 +978,34 @@ void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
         zero_points.IsValid() && zero_points.NumElements() >= expected_qparams;
     const void* zeros_cache_ptr = has_zero_points ? zero_points.data : nullptr;
     Impl::CacheKey cacheKey{W.data, scales.data, zeros_cache_ptr, N, K, group_size};
+    static const bool prefer_fp16_repack_cache = []() {
+        const char* env = std::getenv("DENSECORE_ANE_INT4_REPACK_FP16");
+        return !env || (std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0);
+    }();
+    static const bool keep_fp32_cache = []() {
+        const char* env = std::getenv("DENSECORE_ANE_INT4_CACHE_FP32");
+        return env && std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
+    }();
+
     const float* cachedWeights = impl_->GetCachedWeights(cacheKey);
+    const ggml_fp16_t* cachedWeightsFp16 = (!cachedWeights && prefer_fp16_repack_cache)
+                                               ? impl_->GetCachedWeightsFP16(cacheKey)
+                                               : nullptr;
 
     const float* W_dequant_ptr = nullptr;
-    std::vector<float> W_dequant_local;  // Only allocated on cache miss
+    std::vector<float> W_dequant_local;  // Allocated on cache miss or FP16-cache hit
 
     if (cachedWeights) {
         // Cache hit: use pre-dequantized weights
         W_dequant_ptr = cachedWeights;
+    } else if (cachedWeightsFp16) {
+        W_dequant_local.resize(static_cast<size_t>(N) * static_cast<size_t>(K));
+        densecore::simd::ConvertF16ToF32(W_dequant_local.data(), cachedWeightsFp16,
+                                         static_cast<size_t>(N) * static_cast<size_t>(K));
+        W_dequant_ptr = W_dequant_local.data();
     } else {
         // Cache miss: try GPU dequantization first, fall back to CPU
-        W_dequant_local.resize(N * K);
+        W_dequant_local.resize(static_cast<size_t>(N) * static_cast<size_t>(K));
 
         const uint8_t* w_int4 = W.DataAs<uint8_t>();
         const float* scales_ptr = scales.DataAs<float>();
@@ -956,8 +1048,17 @@ void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
 
         W_dequant_ptr = W_dequant_local.data();
 
-        // Cache the dequantized weights for future calls
-        impl_->CacheWeights(cacheKey, std::move(W_dequant_local));
+        if (prefer_fp16_repack_cache) {
+            std::vector<ggml_fp16_t> W_repacked_fp16(static_cast<size_t>(N) *
+                                                     static_cast<size_t>(K));
+            densecore::simd::ConvertF32ToF16(W_repacked_fp16.data(), W_dequant_local.data(),
+                                             static_cast<size_t>(N) * static_cast<size_t>(K));
+            impl_->CacheWeightsFP16(cacheKey, std::move(W_repacked_fp16));
+        }
+        if (keep_fp32_cache) {
+            impl_->CacheWeights(cacheKey,
+                                std::vector<float>(W_dequant_local.begin(), W_dequant_local.end()));
+        }
 
         // Log cache miss with GPU/CPU indicator
         static uint64_t lastLoggedMisses = 0;
@@ -965,7 +1066,8 @@ void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
         if (currentMisses - lastLoggedMisses >= 10) {
             std::cerr << "[ANEBackend] INT4 cache: " << impl_->cacheHits.load() << " hits, "
                       << currentMisses << " misses (" << (gpu_success ? "GPU" : "CPU")
-                      << " dequant)" << std::endl;
+                      << " dequant, FP16 repack " << (prefer_fp16_repack_cache ? "on" : "off")
+                      << ", FP32 cache " << (keep_fp32_cache ? "on" : "off") << ")" << std::endl;
             lastLoggedMisses = currentMisses;
         }
     }
@@ -988,8 +1090,13 @@ void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
     // Log warning on first use
     static bool warned = false;
     if (!warned) {
-        std::cerr << "[ANEBackend] Note: INT4 GEMM using cached Metal FP32 fallback. "
-                  << "For best performance, use FP16 models on Apple Silicon." << std::endl;
+        std::cerr << "[ANEBackend] Note: INT4 GEMM using cached Metal fallback";
+        if (prefer_fp16_repack_cache) {
+            std::cerr << " with FP16 repack residency";
+        } else {
+            std::cerr << " with FP32 dequant residency";
+        }
+        std::cerr << ". Offline fused CoreML layers remain the preferred ANE path." << std::endl;
         warned = true;
     }
 }
@@ -1416,8 +1523,24 @@ bool ANEBackend::CompileTransformerLayer(const std::string& name,
                   << " n_kv_heads=" << config.n_kv_heads << " max_seq_len=" << config.max_seq_len
                   << std::endl;
 
-        // Check for cached compiled model
+        // Check for cached compiled model. Prefer a repacked INT4->FP16 CoreML
+        // artifact when available so the full transformer block can stay inside
+        // CoreML/ANE without per-layer Metal fallback.
+        const bool prefer_repacked_model = []() {
+            const char* env = std::getenv("DENSECORE_ANE_PREFER_REPACKED_MODELS");
+            return !env || (std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0);
+        }();
         std::string model_path = impl_->cacheDirectory + "/" + name + ".mlmodelc";
+        std::string repacked_model_path =
+            impl_->cacheDirectory + "/" + name + ".int4_repacked.mlmodelc";
+        if (prefer_repacked_model) {
+            NSString* repackedPath = [NSString stringWithUTF8String:repacked_model_path.c_str()];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:repackedPath]) {
+                model_path = repacked_model_path;
+                std::cout << "[ANEBackend] Using repacked INT4->FP16 CoreML layer '" << name << "'"
+                          << std::endl;
+            }
+        }
         NSString* modelPath = [NSString stringWithUTF8String:model_path.c_str()];
         NSURL* modelURL = [NSURL fileURLWithPath:modelPath];
 
@@ -1433,6 +1556,9 @@ bool ANEBackend::CompileTransformerLayer(const std::string& name,
             std::cout << "      --n_heads=" << config.n_heads
                       << " --n_kv_heads=" << config.n_kv_heads << " \\" << std::endl;
             std::cout << "      --max_seq_len=" << config.max_seq_len << " \\" << std::endl;
+            if (prefer_repacked_model) {
+                std::cout << "      --prefer_int4_repacked_fp16 \\" << std::endl;
+            }
             std::cout << "      --output_dir=" << impl_->cacheDirectory << std::endl;
             std::cout << "\n  Then compile with:" << std::endl;
             std::cout << "    xcrun coremlcompiler compile " << name << ".mlpackage "

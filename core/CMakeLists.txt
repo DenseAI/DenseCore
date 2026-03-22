@@ -1082,6 +1082,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_async_backend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cpu_int4.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_int4_gemv.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_engine_kv_cache_config.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_moe_profiler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_numa_sticky_routing.cpp
         # Phase 1: Universal HAL tests

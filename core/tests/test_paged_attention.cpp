@@ -246,6 +246,38 @@ TEST_F(PagedAttentionTest, BasicCorrectnessQ8_0) {
     EXPECT_NEAR(output_data[0], 0.5f, 0.05f);
 }
 
+TEST_F(PagedAttentionTest, BasicCorrectnessQ4_0) {
+    RecreateCache(GGML_TYPE_Q4_0, 160);
+
+    int block0 = cache->block_manager->AllocateSingle();
+    int block1 = cache->block_manager->AllocateSingle();
+    ASSERT_GE(block0, 0);
+    ASSERT_GE(block1, 0);
+
+    std::vector<float> ones(64, 1.0f);
+    std::vector<float> twos(64, 2.0f);
+    std::vector<float> halves(64, 0.5f);
+
+    for (int t = 0; t < 16; ++t) {
+        cache->WriteKSlot(block0, 0, t, ones.data());
+        cache->WriteVSlot(block0, 0, t, ones.data());
+        cache->WriteKSlot(block1, 0, t, twos.data());
+        cache->WriteVSlot(block1, 0, t, halves.data());
+    }
+
+    std::vector<float> query_data(64, 1.0f);
+    densecore::Tensor query = densecore::Tensor::Make2D(query_data.data(), 1, 64);
+
+    std::vector<float> output_data(64, 0.0f);
+    densecore::Tensor output = densecore::Tensor::Make2D(output_data.data(), 1, 64);
+
+    std::vector<int> block_table = {block0, block1};
+    densecore::kernels::PagedAttention(query, *cache, 0, block_table, 32, 1.0f, &output);
+
+    // Q4_0 has visibly higher quantization noise than Q8_0.
+    EXPECT_NEAR(output_data[0], 0.5f, 0.12f);
+}
+
 TEST_F(PagedAttentionTest, InterleavedHeadsCorrectness) {
     // Set up model with NumHeadsKV = 2
     delete cache;

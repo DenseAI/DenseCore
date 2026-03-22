@@ -111,7 +111,9 @@ void OpsRegistry::Init() {
         // -----------------------------------------------------------------
         // GemmInt4 Dispatch
         // -----------------------------------------------------------------
-        // Dispatch chain: AVX512 -> AVX2 -> Scalar
+        // Dispatch chain:
+        //   x86:  AVX512 -> AVX2 -> Scalar
+        //   ARM:  SVE/SVE2 -> NEON -> Scalar
 #if defined(__AVX512F__)
         if (level >= simd::SimdLevel::AVX512) {
             reg.GemmInt4 = simd::GemmInt4Fp32_AVX512;
@@ -131,9 +133,25 @@ void OpsRegistry::Init() {
             reg.GemmInt4 = GemmInt4Fp32_Scalar;
             std::cout << "  [GemmInt4] -> Scalar (runtime: no AVX2)" << std::endl;
         }
+#elif defined(__ARM_FEATURE_SVE)
+        // SVE available at compile time — use SVE kernel (works on SVE and SVE2)
+        if (simd::IsArmFamily(level) && level >= simd::SimdLevel::SVE) {
+            reg.GemmInt4 = simd::GemmInt4Fp32_SVE;
+            std::cout << "  [GemmInt4] -> ARM SVE" << std::endl;
+        } else if (simd::IsArmFamily(level)) {
+            reg.GemmInt4 = simd::GemmInt4Fp32_NEON;
+            std::cout << "  [GemmInt4] -> ARM NEON (runtime: no SVE)" << std::endl;
+        } else {
+            reg.GemmInt4 = GemmInt4Fp32_Scalar;
+            std::cout << "  [GemmInt4] -> Scalar" << std::endl;
+        }
+#elif defined(DENSECORE_ARM) || defined(__aarch64__) || defined(_M_ARM64)
+        // ARM build without SVE compile support — use NEON
+        reg.GemmInt4 = simd::GemmInt4Fp32_NEON;
+        std::cout << "  [GemmInt4] -> ARM NEON" << std::endl;
 #else
         reg.GemmInt4 = GemmInt4Fp32_Scalar;
-        std::cout << "  [GemmInt4] -> Scalar (build without AVX2/AVX-512)" << std::endl;
+        std::cout << "  [GemmInt4] -> Scalar (build without AVX2/AVX-512/ARM)" << std::endl;
 #endif
 
         // -----------------------------------------------------------------

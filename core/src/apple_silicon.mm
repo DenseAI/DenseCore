@@ -14,6 +14,8 @@
 
 #include "../include/apple_silicon.h"
 
+#include "../include/simd_ops.h"
+
 #ifdef __APPLE__
 
 #import <Accelerate/Accelerate.h>
@@ -23,13 +25,18 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <limits>
 #import <mach/mach.h>
 #include <string>
 #import <sys/sysctl.h>
 #import <sys/types.h>
+#include <vector>
 
 namespace densecore {
 namespace apple {
+
+bool HasAMX();
 
 // ============================================================================
 // Internal Helpers
@@ -154,6 +161,128 @@ ChipGeneration DetectFromTargetType(const std::string& target_type_raw) {
     }
 
     return ChipGeneration::Unknown;
+}
+
+bool ParseEnvBool(const char* name, bool default_value) {
+    const char* env = std::getenv(name);
+    if (!env || env[0] == '\0') {
+        return default_value;
+    }
+    return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
+           std::strcmp(env, "FALSE") != 0 && std::strcmp(env, "off") != 0 &&
+           std::strcmp(env, "OFF") != 0;
+}
+
+int ParseEnvInt(const char* name, int default_value) {
+    const char* env = std::getenv(name);
+    if (!env || env[0] == '\0') {
+        return default_value;
+    }
+    char* end = nullptr;
+    long value = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0' || value <= 0 || value > std::numeric_limits<int>::max()) {
+        return default_value;
+    }
+    return static_cast<int>(value);
+}
+
+bool EnableAMXInt4Path() {
+    static const bool enabled = ParseEnvBool("DENSECORE_APPLE_AMX_INT4", true);
+    return enabled;
+}
+
+int GetAMXInt4TileN() {
+    static const int tile_n = std::max(16, ParseEnvInt("DENSECORE_APPLE_AMX_INT4_TILE_N", 128));
+    return tile_n;
+}
+
+int GetAMXInt4MinSliceN() {
+    static const int min_slice_n =
+        std::max(16, ParseEnvInt("DENSECORE_APPLE_AMX_INT4_MIN_SLICE_N", 64));
+    return min_slice_n;
+}
+
+int GetAMXInt4MinK() {
+    static const int min_k = std::max(32, ParseEnvInt("DENSECORE_APPLE_AMX_INT4_MIN_K", 128));
+    return min_k;
+}
+
+void DequantizeInt4TileRows(float* dst, const uint8_t* weights, const float* scales,
+                            const float* zero_points, int rows, int K, int group_size) {
+    const int packed_k = K / 2;
+    const int groups_per_row = K / group_size;
+    for (int row = 0; row < rows; ++row) {
+        const uint8_t* w_row = weights + static_cast<size_t>(row) * packed_k;
+        const float* s_row = scales + static_cast<size_t>(row) * groups_per_row;
+        const float* z_row =
+            zero_points ? zero_points + static_cast<size_t>(row) * groups_per_row : nullptr;
+        float* out_row = dst + static_cast<size_t>(row) * K;
+        for (int k = 0; k < K; ++k) {
+            const uint8_t packed = w_row[k / 2];
+            int q = (k & 1) ? int((packed >> 4) & 0x0F) : int(packed & 0x0F);
+            if (q > 7) {
+                q -= 16;
+            }
+            const int group_idx = k / group_size;
+            const float zero = z_row ? z_row[group_idx] : 0.0f;
+            out_row[k] = s_row[group_idx] * (static_cast<float>(q) - zero);
+        }
+    }
+}
+
+bool TryGemmInt4AMXRange(float* C, const float* A, const uint8_t* W_int4, const float* scales,
+                         const float* zero_points, int M, int N, int K, int group_size, int n_start,
+                         int n_end) {
+    if (!C || !A || !W_int4 || !scales || M <= 0 || N <= 0 || K <= 0 || group_size <= 0) {
+        return false;
+    }
+    if (!HasAMX() || !EnableAMXInt4Path()) {
+        return false;
+    }
+    if ((K % group_size) != 0 || K < GetAMXInt4MinK()) {
+        return false;
+    }
+
+    const int col_start = std::max(0, n_start);
+    const int col_end = (n_end < 0) ? N : std::min(N, n_end);
+    const int slice_n = col_end - col_start;
+    if (slice_n < GetAMXInt4MinSliceN()) {
+        return false;
+    }
+
+    const int tile_n = GetAMXInt4TileN();
+    thread_local std::vector<float> weight_tile;
+
+    static bool warned_once = false;
+    if (!warned_once) {
+        std::cout << "[AppleSilicon] INT4 GEMM using AMX-oriented tiled dequant + Accelerate path"
+                  << std::endl;
+        warned_once = true;
+    }
+
+    for (int col = col_start; col < col_end; col += tile_n) {
+        const int cols_this_tile = std::min(tile_n, col_end - col);
+        weight_tile.resize(static_cast<size_t>(cols_this_tile) * static_cast<size_t>(K));
+
+        const int packed_k = K / 2;
+        const int groups_per_row = K / group_size;
+        const uint8_t* w_tile = W_int4 + static_cast<size_t>(col) * packed_k;
+        const float* s_tile = scales + static_cast<size_t>(col) * groups_per_row;
+        const float* z_tile =
+            zero_points ? zero_points + static_cast<size_t>(col) * groups_per_row : nullptr;
+        DequantizeInt4TileRows(weight_tile.data(), w_tile, s_tile, z_tile, cols_this_tile, K,
+                               group_size);
+
+        if (M == 1) {
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, cols_this_tile, K, 1.0f, weight_tile.data(), K,
+                        A, 1, 0.0f, C + col, 1);
+        } else {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, cols_this_tile, K, 1.0f, A, K,
+                        weight_tile.data(), K, 0.0f, C + col, N);
+        }
+    }
+
+    return true;
 }
 
 }  // anonymous namespace
@@ -326,7 +455,9 @@ bool PinToEfficiencyCores() {
 // ============================================================================
 
 bool HasAMX() {
-    // All Apple Silicon chips have AMX
+    // All Apple Silicon chips expose AMX to system BLAS libraries such as
+    // Accelerate. DenseCore routes larger INT4 tiles through an AMX-oriented
+    // dequantize-and-GEMM path, with NEON retained as the small-range fallback.
     return IsAppleSilicon();
 }
 
@@ -357,6 +488,52 @@ void GemmAccelerate(float* C, const float* A, const float* B, int M, int N, int 
                 B, N,   // B and leading dimension
                 0.0f,   // beta
                 C, N);  // C and leading dimension
+}
+
+bool HasCustomInt4Kernels() {
+    // DenseCore now exposes two Apple CPU INT4 paths:
+    // 1. AMX-oriented tiled dequantization + Accelerate GEMM/GEMV
+    // 2. NEON fallback for small or unsupported ranges
+    return IsAppleSilicon();
+}
+
+void GemmInt4CustomRange(float* C, const float* A, const uint8_t* W_int4, const float* scales,
+                         const float* zero_points, int M, int N, int K, int group_size, int n_start,
+                         int n_end) {
+    if (!HasCustomInt4Kernels() || !C || !A || !W_int4 || !scales)
+        return;
+    if (group_size <= 0 || (K % group_size) != 0)
+        return;
+
+    if (TryGemmInt4AMXRange(C, A, W_int4, scales, zero_points, M, N, K, group_size, n_start,
+                            n_end)) {
+        return;
+    }
+
+    const int col_start = std::max(0, n_start);
+    const int col_end = (n_end < 0) ? N : std::min(N, n_end);
+    if (col_start >= col_end)
+        return;
+
+    const int slice_n = col_end - col_start;
+    const int packed_k = K / 2;
+    const int groups_per_row = K / group_size;
+    const uint8_t* w_slice = W_int4 + static_cast<size_t>(col_start) * packed_k;
+    const float* scale_slice = scales + static_cast<size_t>(col_start) * groups_per_row;
+    thread_local std::vector<float> zero_fallback;
+    if (!zero_points) {
+        zero_fallback.assign(static_cast<size_t>(slice_n) * static_cast<size_t>(groups_per_row),
+                             0.0f);
+    }
+    const float* zero_slice = zero_points
+                                  ? (zero_points + static_cast<size_t>(col_start) * groups_per_row)
+                                  : zero_fallback.data();
+
+    for (int m = 0; m < M; ++m) {
+        simd::GemmInt4Fp32_NEON(C + static_cast<size_t>(m) * N + col_start,
+                                A + static_cast<size_t>(m) * K, w_slice, scale_slice, zero_slice, 1,
+                                slice_n, K, group_size);
+    }
 }
 
 // ============================================================================

@@ -39,6 +39,9 @@
 #include "../include/optimization_bridge.h"
 #include "../include/simd_ops.h"
 #include "../include/simd_platform.h"
+#ifdef __APPLE__
+#include "../include/apple_silicon.h"
+#endif
 
 #include "densecore/exceptions.h"
 #include "densecore/hal/op_registry.h"
@@ -993,6 +996,19 @@ void CpuBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
     if (M == 1) {
         auto& pool = GetThreadPool(numa_node_id);
         const int n_threads = pool.GetNumThreads();
+#ifdef __APPLE__
+        if (apple::HasCustomInt4Kernels()) {
+            if (n_threads <= 1) {
+                apple::GemmInt4CustomRange(c_data, a_data, w_data, scales_data, zeros_data, M, N, K, group_size, 0, N);
+            } else {
+                pool.ParallelFor(N, [&](int n_start, int n_end, int /*thread_id*/) {
+                    apple::GemmInt4CustomRange(c_data, a_data, w_data, scales_data, zeros_data, M, N, K, group_size,
+                                               n_start, n_end);
+                });
+            }
+            return;
+        }
+#endif
         if (n_threads <= 1) {
             // Single-threaded: process all N at once
             hwy_kernels::GemvInt4_Hwy(c_data, a_data, w_data, scales_data, zeros_data, K, N, group_size, 0, N);
@@ -1018,6 +1034,13 @@ void CpuBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
     // columns across the thread pool.
     const size_t input_stride_bytes = static_cast<size_t>(K) * sizeof(float);
     auto run_batched = [&](int n_start, int n_end) -> bool {
+#ifdef __APPLE__
+        if (apple::HasCustomInt4Kernels()) {
+            apple::GemmInt4CustomRange(c_data, a_data, w_data, scales_data, zeros_data, M, N, K, group_size, n_start,
+                                       n_end);
+            return true;
+        }
+#endif
         if (!OpsRegistry::IsInitialized()) {
             OpsRegistry::Init();
         }

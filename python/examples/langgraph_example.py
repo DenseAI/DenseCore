@@ -252,7 +252,9 @@ def example_4_tool_execution():
 
     # Test tool invocation
     print("\nTesting calculator tool:")
-    result1 = tool_executor.invoke({"tool": "calculator", "tool_input": {"expression": "15 * 7 + 3"}})
+    result1 = tool_executor.invoke(
+        {"tool": "calculator", "tool_input": {"expression": "15 * 7 + 3"}}
+    )
     print(f"  {result1}")
 
     print("\nTesting word_count tool:")

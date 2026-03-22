@@ -131,6 +131,12 @@ struct SchedulerConfig {
     // Chunked prefill
     bool enable_chunked_prefill = true;
     int max_prefill_tokens = 512;  // Max prefill tokens per iteration
+    // Optional mixed-phase mode: when enabled, decode-first iterations may admit
+    // a bounded prefill chunk into the same batch if the decode context bucket is
+    // homogeneous. This reduces long-prompt head-of-line blocking without
+    // removing the existing isolated fallback.
+    bool enable_mixed_prefill_decode = false;
+    int max_mixed_prefill_tokens = 128;
 
     // Batch-shape safety: enforce single n_past bucket per iteration.
     bool enforce_homogeneous_batch_n_past = true;
@@ -245,7 +251,7 @@ private:
     std::chrono::steady_clock::time_point GetSequenceArrival(int seq_id) const;
 
     void ScheduleRunning(SchedulerOutput& output);
-    void ScheduleWaiting(SchedulerOutput& output);
+    void ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap = -1);
     void ScheduleSwapped(SchedulerOutput& output);
 
     BlockManager* block_manager_;

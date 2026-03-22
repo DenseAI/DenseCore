@@ -3,6 +3,7 @@
  * @brief Unit tests for KV cache components
  */
 
+#include <cmath>
 #include <cstring>
 #include <gtest/gtest.h>
 #include <set>
@@ -405,4 +406,42 @@ TEST(PagedKVCache, InitRejectsInvalidDimensions) {
 
     std::unique_ptr<PagedKVCache> zero_len(InitPagedKVCache(&model, 1, 0, GGML_TYPE_F16, -1));
     EXPECT_EQ(zero_len, nullptr);
+}
+
+TEST(PagedKVCache, Q40RoundTripReadWrite) {
+    TransformerModel model = MakeTestModel();
+    model.hparams.n_embd_head_k = 64;
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(&model, 1, 32, GGML_TYPE_Q4_0, -1));
+    ASSERT_NE(cache, nullptr);
+    ASSERT_EQ(cache->cache_type, GGML_TYPE_Q4_0);
+
+    std::vector<int> blocks = cache->block_manager->Allocate(1);
+    ASSERT_EQ(blocks.size(), 1u);
+
+    const int elements = cache->GetElementsPerSlot();
+    std::vector<float> input(elements, 0.0f);
+    std::vector<float> output(elements, 0.0f);
+    for (int i = 0; i < elements; ++i) {
+        input[i] = std::sin(static_cast<float>(i) * 0.25f);
+    }
+
+    cache->WriteKSlot(blocks[0], 0, 0, input.data());
+    cache->ReadKSlot(blocks[0], 0, 0, output.data());
+
+    for (int i = 0; i < elements; ++i) {
+        EXPECT_NEAR(output[i], input[i], 0.35f) << "i=" << i;
+    }
+}
+
+TEST(PagedKVCache, QuantizedCacheFallsBackWhenHeadDimMisaligned) {
+    TransformerModel model = MakeTestModel();
+    model.hparams.n_embd_head_k = 48;  // Not divisible by Q4_0/Q8_0 block size.
+
+    std::unique_ptr<PagedKVCache> q4_cache(InitPagedKVCache(&model, 1, 32, GGML_TYPE_Q4_0, -1));
+    ASSERT_NE(q4_cache, nullptr);
+    EXPECT_EQ(q4_cache->cache_type, GGML_TYPE_F16);
+
+    std::unique_ptr<PagedKVCache> q8_cache(InitPagedKVCache(&model, 1, 32, GGML_TYPE_Q8_0, -1));
+    ASSERT_NE(q8_cache, nullptr);
+    EXPECT_EQ(q8_cache->cache_type, GGML_TYPE_F16);
 }

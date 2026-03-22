@@ -361,7 +361,7 @@ struct DecodePagedAttentionPolicy {
     int min_context_tokens = 256;
     int min_head_dim = 64;
     int min_heads = 8;
-    bool allow_q8_auto = false;
+    bool allow_quantized_auto = false;
     bool debug_log = false;
 };
 
@@ -571,7 +571,8 @@ static DecodePagedAttentionPolicy LoadDecodePagedAttentionPolicy() {
     policy.min_context_tokens = ParsePositiveEnvInt("DENSECORE_PAGED_DECODE_MIN_CONTEXT", legacy_min_context);
     policy.min_head_dim = ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_MIN_HEAD_DIM", 64);
     policy.min_heads = ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_MIN_HEADS", 8);
-    policy.allow_q8_auto = ParseTruthyEnv("DENSECORE_PAGED_ATTN_DECODE_ALLOW_Q8", false);
+    const bool legacy_allow_q8 = ParseTruthyEnv("DENSECORE_PAGED_ATTN_DECODE_ALLOW_Q8", false);
+    policy.allow_quantized_auto = ParseTruthyEnv("DENSECORE_PAGED_ATTN_DECODE_ALLOW_QUANTIZED", legacy_allow_q8);
     policy.debug_log = ParseTruthyEnv("DENSECORE_DEBUG_PAGED_ATTN_DECODE", false);
     return policy;
 }
@@ -735,7 +736,7 @@ static bool ShouldUsePagedDecodeAttention(const DecodePagedAttentionPolicy& poli
     }
 
     // Auto mode: enable only when context is long enough to amortize callback/setup overhead.
-    if (!policy.allow_q8_auto && cache->cache_type == GGML_TYPE_Q8_0) {
+    if (!policy.allow_quantized_auto && ggml_is_quantized(cache->cache_type)) {
         return false;
     }
     if (n_head < policy.min_heads) {
@@ -2885,7 +2886,7 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
     v_head_scratch.resize(static_cast<size_t>(head_dim));
     scores.resize(static_cast<size_t>(context_len));
 
-    const auto* q8_traits = (layout.cache_type == GGML_TYPE_Q8_0) ? ggml_get_type_traits(GGML_TYPE_Q8_0) : nullptr;
+    const auto* quant_traits = ggml_is_quantized(layout.cache_type) ? ggml_get_type_traits(layout.cache_type) : nullptr;
 
     for (int h = h_start; h < h_end; ++h) {
         const float* q_head = q_data + static_cast<size_t>(h) * head_dim;
@@ -2923,8 +2924,8 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
                 densecore::simd::ConvertF16ToF32(k_head_scratch.data(), reinterpret_cast<const ggml_fp16_t*>(k_ptr),
                                                  head_dim);
                 k_head = k_head_scratch.data();
-            } else if (layout.cache_type == GGML_TYPE_Q8_0 && q8_traits && q8_traits->to_float) {
-                q8_traits->to_float(k_ptr, k_head_scratch.data(), head_dim);
+            } else if (ggml_is_quantized(layout.cache_type) && quant_traits && quant_traits->to_float) {
+                quant_traits->to_float(k_ptr, k_head_scratch.data(), head_dim);
                 k_head = k_head_scratch.data();
             }
             if (!k_head) {
@@ -2972,8 +2973,8 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
                 densecore::simd::ConvertF16ToF32(v_head_scratch.data(), reinterpret_cast<const ggml_fp16_t*>(v_ptr),
                                                  head_dim);
                 v_head = v_head_scratch.data();
-            } else if (layout.cache_type == GGML_TYPE_Q8_0 && q8_traits && q8_traits->to_float) {
-                q8_traits->to_float(v_ptr, v_head_scratch.data(), head_dim);
+            } else if (ggml_is_quantized(layout.cache_type) && quant_traits && quant_traits->to_float) {
+                quant_traits->to_float(v_ptr, v_head_scratch.data(), head_dim);
                 v_head = v_head_scratch.data();
             }
             if (!v_head) continue;
@@ -3210,6 +3211,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
             cache_type_id = 0;
         else if (ud->cache->cache_type == GGML_TYPE_F16)
             cache_type_id = 1;
+        else if (ud->cache->cache_type == GGML_TYPE_Q4_0)
+            cache_type_id = 4;
         else if (ud->cache->cache_type == GGML_TYPE_Q8_0)
             cache_type_id = 8;
     }

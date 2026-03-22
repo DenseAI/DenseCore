@@ -185,6 +185,36 @@ template <class D> HWY_INLINE float DotProductQ8_0(D d, const float* q, const vo
     return scalar_sum;
 }
 
+template <class D> HWY_INLINE float DotProductQ4_0(D /*d*/, const float* q, const void* k_data, int head_dim) {
+    const block_q4_0* blocks = reinterpret_cast<const block_q4_0*>(k_data);
+    const int nb = head_dim / QK4_0;
+    float scalar_sum = 0.0f;
+    int q_offset = 0;
+
+    for (int b = 0; b < nb; ++b) {
+        const float block_scale = densecore::fp16_to_fp32(blocks[b].d);
+        for (int i = 0; i < QK4_0 / 2; ++i) {
+            const uint8_t packed = blocks[b].qs[i];
+            const float q0 = static_cast<float>((packed & 0x0F) - 8);
+            const float q1 = static_cast<float>(((packed >> 4) & 0x0F) - 8);
+            scalar_sum += q[q_offset + 2 * i + 0] * (q0 * block_scale);
+            scalar_sum += q[q_offset + 2 * i + 1] * (q1 * block_scale);
+        }
+        q_offset += QK4_0;
+    }
+
+    if (q_offset < head_dim) {
+        const float block_scale = densecore::fp16_to_fp32(blocks[nb].d);
+        for (int i = 0; q_offset + i < head_dim; ++i) {
+            const uint8_t packed = blocks[nb].qs[i / 2];
+            const int qv = (i & 1) ? (((packed >> 4) & 0x0F) - 8) : ((packed & 0x0F) - 8);
+            scalar_sum += q[q_offset + i] * (static_cast<float>(qv) * block_scale);
+        }
+    }
+
+    return scalar_sum;
+}
+
 // ============================================================================
 // Accumulate Kernels
 // ============================================================================
@@ -267,6 +297,31 @@ template <class D> HWY_INLINE void AccumulateQ8_0(D d, float* accum, const void*
     }
 }
 
+template <class D> HWY_INLINE void AccumulateQ4_0(D /*d*/, float* accum, const void* v_data, float weight, int head_dim) {
+    const block_q4_0* blocks = reinterpret_cast<const block_q4_0*>(v_data);
+    const int nb = head_dim / QK4_0;
+    int accum_offset = 0;
+
+    for (int b = 0; b < nb; ++b) {
+        const float block_scale = densecore::fp16_to_fp32(blocks[b].d) * weight;
+        for (int i = 0; i < QK4_0 / 2; ++i) {
+            const uint8_t packed = blocks[b].qs[i];
+            accum[accum_offset + 2 * i + 0] += static_cast<float>((packed & 0x0F) - 8) * block_scale;
+            accum[accum_offset + 2 * i + 1] += static_cast<float>(((packed >> 4) & 0x0F) - 8) * block_scale;
+        }
+        accum_offset += QK4_0;
+    }
+
+    if (accum_offset < head_dim) {
+        const float block_scale = densecore::fp16_to_fp32(blocks[nb].d) * weight;
+        for (int i = 0; accum_offset + i < head_dim; ++i) {
+            const uint8_t packed = blocks[nb].qs[i / 2];
+            const int qv = (i & 1) ? (((packed >> 4) & 0x0F) - 8) : ((packed & 0x0F) - 8);
+            accum[accum_offset + i] += static_cast<float>(qv) * block_scale;
+        }
+    }
+}
+
 // ============================================================================
 // Main Kernel Logic
 // ============================================================================
@@ -299,7 +354,7 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
     } else if (head_dim >= 128) {
         prefetch_tokens = 2;
     }
-    if (cache_type == 8) {  // Q8_0 has higher decode-side unpack pressure.
+    if (cache_type == 8 || cache_type == 4) {  // Quantized KV has higher decode-side unpack pressure.
         prefetch_tokens = std::min(prefetch_tokens + 1, 4);
     }
     static const bool prefetch_blocks = []() {
@@ -369,6 +424,8 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
 
                 if (cache_type == 8) {  // Q8_0
                     score = DotProductQ8_0(d, q_head, k_ptr_bytes, head_dim);
+                } else if (cache_type == 4) {  // Q4_0
+                    score = DotProductQ4_0(d, q_head, k_ptr_bytes, head_dim);
                 } else if (cache_type == 1) {  // F16
                     score = DotProductF16(d, q_head, reinterpret_cast<const uint16_t*>(k_ptr_bytes), head_dim);
                 } else {  // F32
@@ -439,6 +496,8 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
                     AccumulateF16(d, out_head, reinterpret_cast<const uint16_t*>(v_ptr), p, head_dim);
                 } else if (cache_type == 8) {  // Q8_0
                     AccumulateQ8_0(d, out_head, v_ptr, p, head_dim);
+                } else if (cache_type == 4) {  // Q4_0
+                    AccumulateQ4_0(d, out_head, v_ptr, p, head_dim);
                 }
             }
 
@@ -532,11 +591,13 @@ void PagedAttention(const Tensor& query, const PagedKVCache& cache, int layer, c
         cache_type_id = 0;
     } else if (cache.cache_type == GGML_TYPE_F16) {
         cache_type_id = 1;
+    } else if (cache.cache_type == GGML_TYPE_Q4_0) {
+        cache_type_id = 4;
     } else if (cache.cache_type == GGML_TYPE_Q8_0) {
         cache_type_id = 8;
     } else {
         throw std::runtime_error("[PagedAttention] Error: Unsupported cache type " +
-                                 std::to_string((int)cache.cache_type) + ". Supported: F32, F16, Q8_0");
+                                 std::to_string((int)cache.cache_type) + ". Supported: F32, F16, Q4_0, Q8_0");
     }
 
     const auto layout = cache.GetBlockLayout();

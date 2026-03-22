@@ -473,9 +473,9 @@ size_t PagedKVCache::GetBytesPerSlot() const {
         return 0;
     }
 
-    if (cache_type == GGML_TYPE_Q8_0) {
+    if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
         // Keep each KV head in an independently quantized row so per-head stride is
-        // stable even when head_dim is not a multiple of QK8_0.
+        // stable even when head_dim is quantized per-KV-head.
         return ggml_row_size(cache_type, static_cast<int64_t>(head_dim)) * static_cast<size_t>(n_head_kv);
     }
 
@@ -491,10 +491,11 @@ PagedKVCache::BlockLayout PagedKVCache::GetBlockLayout() const {
     layout.cache_type = cache_type;
     layout.slot_stride_bytes = GetBytesPerSlot();
     layout.block_stride_bytes = GetBytesPerBlock();
-    if (cache_type == GGML_TYPE_Q8_0) {
+    if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
         layout.head_stride_bytes = ggml_row_size(cache_type, static_cast<int64_t>(head_dim));
-        layout.packed_values_per_block = QK8_0;
-        layout.packed_blocks_per_head = (head_dim + QK8_0 - 1) / QK8_0;
+        const int qk = ggml_blck_size(cache_type);
+        layout.packed_values_per_block = qk;
+        layout.packed_blocks_per_head = (head_dim + qk - 1) / qk;
     } else {
         if (n_head_kv > 0) {
             layout.head_stride_bytes = layout.slot_stride_bytes / static_cast<size_t>(n_head_kv);
@@ -700,11 +701,17 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
     cache->cache_type = type;
     cache->numa_node_id = numa_node_id;
 
-    // Validate supported types for KV cache
-    // vLLM style: FP16 is preferred. INT8 (Q8_0) supported for aggressive
-    // quantization.
-    if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_Q8_0) {
+    // Validate supported types for KV cache.
+    if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_Q8_0 && type != GGML_TYPE_Q4_0) {
         std::cerr << "[KVCache] Warning: Unsupported cache type, falling back to F16" << std::endl;
+        type = GGML_TYPE_F16;
+        cache->cache_type = type;
+    }
+
+    if (ggml_is_quantized(type) && (cache->head_dim % ggml_blck_size(type)) != 0) {
+        std::cerr << "[KVCache] Warning: head_dim=" << cache->head_dim << " is not divisible by "
+                  << ggml_blck_size(type) << " for quantized cache type " << ggml_type_name(type)
+                  << ", falling back to F16" << std::endl;
         type = GGML_TYPE_F16;
         cache->cache_type = type;
     }
@@ -781,6 +788,8 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
         type_name = "F16";
     else if (type == GGML_TYPE_Q8_0)
         type_name = "Q8_0 (INT8)";
+    else if (type == GGML_TYPE_Q4_0)
+        type_name = "Q4_0 (INT4)";
 
     std::cout << "[KVCache] Initialized PagedKVCache (Block Allocator):" << std::endl;
     std::cout << "  - max_blocks: " << cache->max_blocks << std::endl;
@@ -811,7 +820,7 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
 // ============================================================================
 
 bool PagedKVCache::IsQuantized() const {
-    return cache_type == GGML_TYPE_Q8_0;
+    return ggml_is_quantized(cache_type);
 }
 
 int PagedKVCache::GetElementsPerSlot() const {
@@ -826,13 +835,13 @@ void PagedKVCache::WriteKSlot(int block_id, int layer, int slot, const float* da
 
     if (cache_type == GGML_TYPE_F16) {
         densecore::simd::ConvertF32ToF16((ggml_fp16_t*)ptr, data, n);
-    } else if (cache_type == GGML_TYPE_Q8_0) {
-        const size_t head_stride = ggml_row_size(GGML_TYPE_Q8_0, static_cast<int64_t>(head_dim));
+    } else if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+        const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(head_dim));
         auto* dst = static_cast<uint8_t*>(ptr);
         for (int h = 0; h < n_head_kv; ++h) {
             const float* src_head = data + static_cast<size_t>(h) * static_cast<size_t>(head_dim);
             void* dst_head = dst + static_cast<size_t>(h) * head_stride;
-            ggml_quantize_chunk(GGML_TYPE_Q8_0, src_head, dst_head, 0, 1, head_dim, nullptr);
+            ggml_quantize_chunk(cache_type, src_head, dst_head, 0, 1, head_dim, nullptr);
         }
     } else {
         densecore::simd::CopyF32((float*)ptr, data, n);
@@ -847,13 +856,13 @@ void PagedKVCache::WriteVSlot(int block_id, int layer, int slot, const float* da
 
     if (cache_type == GGML_TYPE_F16) {
         densecore::simd::ConvertF32ToF16((ggml_fp16_t*)ptr, data, n);
-    } else if (cache_type == GGML_TYPE_Q8_0) {
-        const size_t head_stride = ggml_row_size(GGML_TYPE_Q8_0, static_cast<int64_t>(head_dim));
+    } else if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+        const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(head_dim));
         auto* dst = static_cast<uint8_t*>(ptr);
         for (int h = 0; h < n_head_kv; ++h) {
             const float* src_head = data + static_cast<size_t>(h) * static_cast<size_t>(head_dim);
             void* dst_head = dst + static_cast<size_t>(h) * head_stride;
-            ggml_quantize_chunk(GGML_TYPE_Q8_0, src_head, dst_head, 0, 1, head_dim, nullptr);
+            ggml_quantize_chunk(cache_type, src_head, dst_head, 0, 1, head_dim, nullptr);
         }
     } else {
         densecore::simd::CopyF32((float*)ptr, data, n);
@@ -868,9 +877,9 @@ void PagedKVCache::ReadKSlot(int block_id, int layer, int slot, float* out) cons
 
     if (cache_type == GGML_TYPE_F16) {
         densecore::simd::ConvertF16ToF32(out, (const ggml_fp16_t*)ptr, n);
-    } else if (cache_type == GGML_TYPE_Q8_0) {
-        const auto* type_traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
-        const size_t head_stride = ggml_row_size(GGML_TYPE_Q8_0, static_cast<int64_t>(head_dim));
+    } else if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+        const auto* type_traits = ggml_get_type_traits(cache_type);
+        const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(head_dim));
         const auto* src = static_cast<const uint8_t*>(ptr);
         for (int h = 0; h < n_head_kv; ++h) {
             const void* src_head = src + static_cast<size_t>(h) * head_stride;
@@ -890,9 +899,9 @@ void PagedKVCache::ReadVSlot(int block_id, int layer, int slot, float* out) cons
 
     if (cache_type == GGML_TYPE_F16) {
         densecore::simd::ConvertF16ToF32(out, (const ggml_fp16_t*)ptr, n);
-    } else if (cache_type == GGML_TYPE_Q8_0) {
-        const auto* type_traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
-        const size_t head_stride = ggml_row_size(GGML_TYPE_Q8_0, static_cast<int64_t>(head_dim));
+    } else if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+        const auto* type_traits = ggml_get_type_traits(cache_type);
+        const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(head_dim));
         const auto* src = static_cast<const uint8_t*>(ptr);
         for (int h = 0; h < n_head_kv; ++h) {
             const void* src_head = src + static_cast<size_t>(h) * head_stride;

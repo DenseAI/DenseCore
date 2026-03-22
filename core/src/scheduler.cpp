@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <limits>
 #include <unordered_set>
 
 #include "densecore/utils/logging.h"
@@ -54,6 +55,28 @@ bool ParseEnvBool(const char* value, bool default_value) {
     return default_value;
 }
 
+int ParseEnvInt(const char* value, int default_value) {
+    if (!value || *value == '\0') {
+        return default_value;
+    }
+
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0') {
+        return default_value;
+    }
+
+    if (parsed < 0 || parsed > std::numeric_limits<int>::max()) {
+        return default_value;
+    }
+
+    return static_cast<int>(parsed);
+}
+
+size_t ScheduledSeqCount(const SchedulerOutput& output) {
+    return output.prefill_seq_ids.size() + output.decode_seq_ids.size();
+}
+
 }  // namespace
 
 // ============================================================================
@@ -64,6 +87,10 @@ Scheduler::Scheduler(BlockManager* block_manager, const SchedulerConfig& config)
     : block_manager_(block_manager), config_(config) {
     decode_homogeneous_batch_n_past_ =
         ParseEnvBool(std::getenv("DENSECORE_SCHED_DECODE_HOMOGENEOUS_N_PAST"), /*default_value=*/false);
+    config_.enable_mixed_prefill_decode =
+        ParseEnvBool(std::getenv("DENSECORE_SCHED_ENABLE_MIXED_PREFILL_DECODE"), config_.enable_mixed_prefill_decode);
+    config_.max_mixed_prefill_tokens = std::max(
+        1, ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_MIXED_PREFILL_TOKENS"), config_.max_mixed_prefill_tokens));
 }
 
 int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, int priority,
@@ -188,8 +215,9 @@ SchedulerOutput Scheduler::Schedule() {
     // 2. Try to swap in sequences if memory is available
     ScheduleSwapped(output);
 
-    // 3. Phase isolation policy: avoid mixing decode and prefill in one batch
-    // to preserve single n_past assumptions in current inference graph path.
+    // 3. Phase isolation policy: preserve the current decode-first isolated path
+    // by default, but optionally admit a bounded prefill chunk into a decode
+    // iteration when the decode context bucket is homogeneous.
     if (config_.isolate_prefill_decode) {
         const bool has_waiting = !waiting_queue_.empty();
         const bool has_running = !running_seqs_.empty();
@@ -213,7 +241,38 @@ SchedulerOutput Scheduler::Schedule() {
 
         ScheduleRunning(output);
         if (!output.decode_seq_ids.empty()) {
-            consecutive_decode_batches_++;
+            bool mixed_prefill_admitted = false;
+            if (config_.enable_mixed_prefill_decode && !waiting_queue_.empty()) {
+                int decode_context_bucket = -1;
+                bool homogeneous_decode_context = true;
+                for (int seq_id : output.decode_seq_ids) {
+                    const int seq_context = GetSequenceContextLen(seq_id);
+                    if (decode_context_bucket < 0) {
+                        decode_context_bucket = seq_context;
+                    } else if (decode_context_bucket != seq_context) {
+                        homogeneous_decode_context = false;
+                        break;
+                    }
+                }
+
+                if (homogeneous_decode_context && decode_context_bucket >= 0) {
+                    const size_t prefill_before = output.prefill_seq_ids.size();
+                    const int remaining_tokens = std::max(0, config_.max_num_batched_tokens - output.total_tokens);
+                    const int mixed_prefill_cap = std::min(config_.max_mixed_prefill_tokens,
+                                                           std::min(config_.max_prefill_tokens, remaining_tokens));
+                    if (mixed_prefill_cap > 0) {
+                        output.batch_context_len = decode_context_bucket;
+                        ScheduleWaiting(output, mixed_prefill_cap);
+                        mixed_prefill_admitted = output.prefill_seq_ids.size() > prefill_before;
+                    }
+                }
+            }
+
+            if (mixed_prefill_admitted) {
+                consecutive_decode_batches_ = 0;
+            } else {
+                consecutive_decode_batches_++;
+            }
             return output;
         }
 
@@ -457,7 +516,7 @@ std::chrono::steady_clock::time_point Scheduler::GetSequenceArrival(int seq_id) 
 }
 
 void Scheduler::ScheduleRunning(SchedulerOutput& output) {
-    int tokens_budget = config_.max_num_batched_tokens - output.num_prefill_tokens;
+    int tokens_budget = config_.max_num_batched_tokens - output.total_tokens;
     std::unordered_set<int> active_experts;
 
     std::vector<int> running_ids(running_seqs_.begin(), running_seqs_.end());
@@ -471,7 +530,7 @@ void Scheduler::ScheduleRunning(SchedulerOutput& output) {
     int target_context_len = -1;
 
     for (int seq_id : running_ids) {
-        if (output.decode_seq_ids.size() >= (size_t)config_.max_num_seqs) {
+        if (ScheduledSeqCount(output) >= static_cast<size_t>(config_.max_num_seqs)) {
             break;
         }
         if (tokens_budget <= 0) {
@@ -519,7 +578,7 @@ void Scheduler::ScheduleRunning(SchedulerOutput& output) {
     }
 }
 
-void Scheduler::ScheduleWaiting(SchedulerOutput& output) {
+void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) {
     int tokens_budget = config_.max_num_batched_tokens - output.total_tokens;
 
     std::vector<SequenceGroup> sorted_queue(waiting_queue_.begin(), waiting_queue_.end());
@@ -532,10 +591,11 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output) {
 
     // Track active experts for MoE-aware batching
     std::unordered_set<int> active_experts;
-    int target_context_len = -1;
+    const bool extending_decode_batch = !output.decode_seq_ids.empty();
+    int target_context_len = output.batch_context_len;
 
     for (auto& group : sorted_queue) {
-        if (output.prefill_seq_ids.size() >= (size_t)config_.max_num_seqs) {
+        if (ScheduledSeqCount(output) >= static_cast<size_t>(config_.max_num_seqs)) {
             still_waiting.push_back(group);
             continue;
         }
@@ -561,22 +621,29 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output) {
             continue;
         }
 
-        if (!can_chunk && remaining > tokens_budget) {
+        int prefill_budget = tokens_budget;
+        if (prefill_token_cap > 0) {
+            prefill_budget = std::min(prefill_budget, prefill_token_cap);
+        }
+        if (can_chunk) {
+            prefill_budget = std::min(prefill_budget, config_.max_prefill_tokens);
+        }
+        if (!can_chunk && remaining > prefill_budget) {
             still_waiting.push_back(group);
             continue;
         }
-
-        int chunk_budget = tokens_budget;
-        if (can_chunk) {
-            chunk_budget = std::min(chunk_budget, config_.max_prefill_tokens);
-        }
-        const int tokens_needed = can_chunk ? std::min(remaining, chunk_budget) : remaining;
+        const int tokens_needed = can_chunk ? std::min(remaining, prefill_budget) : remaining;
         if (tokens_needed <= 0) {
             still_waiting.push_back(group);
             continue;
         }
 
         const int group_context = GetSequenceContextLen(seq_id);
+        // Mixed prefill+decode batches are only safe when the waiting prefill
+        // group already lives in the same retained-history bucket as the decode
+        // rows. The worker always lays out prefill rows before decode rows, and
+        // graph-wide KV retention is still derived from batch.n_past[0], so
+        // admitting a mismatched prefill group would corrupt decode history.
         if (config_.enforce_homogeneous_batch_n_past && target_context_len >= 0 &&
             group_context != target_context_len) {
             still_waiting.push_back(group);
@@ -759,6 +826,8 @@ SchedulerConfig CreateThroughputConfig() {
     config.priority_preempt_threshold = 5;
     config.enable_chunked_prefill = true;
     config.max_prefill_tokens = 1024;
+    config.enable_mixed_prefill_decode = true;
+    config.max_mixed_prefill_tokens = 128;
     return config;
 }
 
