@@ -502,6 +502,24 @@ public:
     bool DequantizeInt4Grouped(const void* weights_packed, const float* scales, const float* zeros, float* output,
                                int64_t N, int64_t K, int group_size);
 
+    /**
+     * @brief Fused GPU INT4 GEMM with group-wise scales/zero points
+     *
+     * Multiplies FP32 activations by packed INT4 weights directly on the GPU
+     * without materializing a dequantized FP32 weight matrix in unified memory.
+     * This is primarily used by the ANE backend's INT4 fallback path.
+     *
+     * @param A Activations [M, K] FP32
+     * @param W Packed INT4 weights [N, K/2]
+     * @param scales Per-group scale factors [N, K/group_size]
+     * @param zero_points Optional per-group zero points [N, K/group_size]
+     * @param C Output [M, N] FP32
+     * @param group_size Quantization group size
+     * @return true if the fused GPU path was dispatched successfully
+     */
+    bool GemmInt4Grouped(const Tensor& A, const Tensor& W, const Tensor& scales, const Tensor& zero_points, Tensor* C,
+                         int group_size);
+
 private:
     /**
      * @brief Private implementation (Pimpl idiom)

@@ -13,6 +13,7 @@
  */
 
 #include "../include/apple_silicon.h"
+#include "../include/simd_ops.h"
 
 #ifdef __APPLE__
 
@@ -326,7 +327,9 @@ bool PinToEfficiencyCores() {
 // ============================================================================
 
 bool HasAMX() {
-    // All Apple Silicon chips have AMX
+    // All Apple Silicon chips expose AMX to system BLAS libraries such as
+    // Accelerate. DenseCore's custom INT4 path is separate and currently uses
+    // Apple-tuned NEON kernels instead of direct AMX microkernels.
     return IsAppleSilicon();
 }
 
@@ -357,6 +360,34 @@ void GemmAccelerate(float* C, const float* A, const float* B, int M, int N, int 
                 B, N,   // B and leading dimension
                 0.0f,   // beta
                 C, N);  // C and leading dimension
+}
+
+bool HasCustomInt4Kernels() {
+    // This reports DenseCore's in-tree Apple CPU INT4 path, which is currently
+    // NEON-based rather than a direct AMX implementation.
+    return IsAppleSilicon();
+}
+
+void GemmInt4CustomRange(float* C, const float* A, const uint8_t* W_int4, const float* scales,
+                         const float* zero_points, int M, int N, int K, int group_size, int n_start, int n_end) {
+    if (!HasCustomInt4Kernels() || !C || !A || !W_int4 || !scales || !zero_points) return;
+    if (group_size <= 0 || (K % group_size) != 0) return;
+
+    const int col_start = std::max(0, n_start);
+    const int col_end = (n_end < 0) ? N : std::min(N, n_end);
+    if (col_start >= col_end) return;
+
+    const int slice_n = col_end - col_start;
+    const int packed_k = K / 2;
+    const int groups_per_row = K / group_size;
+    const uint8_t* w_slice = W_int4 + static_cast<size_t>(col_start) * packed_k;
+    const float* scale_slice = scales + static_cast<size_t>(col_start) * groups_per_row;
+    const float* zero_slice = zero_points + static_cast<size_t>(col_start) * groups_per_row;
+
+    for (int m = 0; m < M; ++m) {
+        simd::GemmInt4Fp32_NEON(C + static_cast<size_t>(m) * N + col_start, A + static_cast<size_t>(m) * K, w_slice,
+                                scale_slice, zero_slice, 1, slice_n, K, group_size);
+    }
 }
 
 // ============================================================================

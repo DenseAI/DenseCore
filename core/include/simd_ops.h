@@ -470,6 +470,14 @@ inline bool HasIntelAmx(SimdLevel level) {
     return level == SimdLevel::AMX;
 }
 
+inline bool HasArmSveOrBetter(SimdLevel level) {
+    return level == SimdLevel::SVE || level == SimdLevel::SVE2;
+}
+
+inline bool HasArmSve2(SimdLevel level) {
+    return level == SimdLevel::SVE2;
+}
+
 // =============================================================================
 // Thread Affinity & NUMA Topology
 // =============================================================================
@@ -689,6 +697,21 @@ inline void SimdCopy(void* dst, const void* src, size_t bytes) {
     if (i < bytes) {
         memcpy(reinterpret_cast<char*>(dst) + i, reinterpret_cast<const char*>(src) + i, bytes - i);
     }
+#elif defined(__ARM_FEATURE_SVE)
+    // SVE: scalable vector copy
+    const uint8_t* s = reinterpret_cast<const uint8_t*>(src);
+    uint8_t* d = reinterpret_cast<uint8_t*>(dst);
+    size_t i = 0;
+    const uint64_t vl8 = svcntb();  // bytes per SVE vector
+    for (; i + vl8 <= bytes; i += vl8) {
+        svuint8_t v = svld1_u8(svptrue_b8(), s + i);
+        svst1_u8(svptrue_b8(), d + i, v);
+    }
+    if (i < bytes) {
+        svbool_t pg = svwhilelt_b8_u64(0UL, static_cast<uint64_t>(bytes - i));
+        svuint8_t v = svld1_u8(pg, s + i);
+        svst1_u8(pg, d + i, v);
+    }
 #elif defined(DENSECORE_ARM)
     // NEON: 16 bytes per iteration
     const size_t vec_size = 16;
@@ -733,6 +756,21 @@ inline void ScaleF32(float* dst, const float* src, float scale, size_t n) {
     for (; i < n; i++) {
         dst[i] = src[i] * scale;
     }
+#elif defined(__ARM_FEATURE_SVE)
+    svfloat32_t vscale = svdup_f32(scale);
+    size_t i = 0;
+    const uint64_t vl = svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t v = svld1_f32(svptrue_b32(), src + i);
+        v = svmul_f32_x(svptrue_b32(), v, vscale);
+        svst1_f32(svptrue_b32(), dst + i, v);
+    }
+    if (i < n) {
+        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
+        svfloat32_t v = svld1_f32(pg, src + i);
+        v = svmul_f32_x(pg, v, vscale);
+        svst1_f32(pg, dst + i, v);
+    }
 #elif defined(DENSECORE_ARM)
     float32x4_t vscale = vdupq_n_f32(scale);
     size_t i = 0;
@@ -765,6 +803,20 @@ inline void AddF32(float* dst, const float* a, const float* b, size_t n) {
     }
     for (; i < n; i++) {
         dst[i] = a[i] + b[i];
+    }
+#elif defined(__ARM_FEATURE_SVE)
+    size_t i = 0;
+    const uint64_t vl = svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t va = svld1_f32(svptrue_b32(), a + i);
+        svfloat32_t vb = svld1_f32(svptrue_b32(), b + i);
+        svst1_f32(svptrue_b32(), dst + i, svadd_f32_x(svptrue_b32(), va, vb));
+    }
+    if (i < n) {
+        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
+        svfloat32_t va = svld1_f32(pg, a + i);
+        svfloat32_t vb = svld1_f32(pg, b + i);
+        svst1_f32(pg, dst + i, svadd_f32_x(pg, va, vb));
     }
 #elif defined(DENSECORE_ARM)
     size_t i = 0;
@@ -830,6 +882,22 @@ inline float DotF32(const float* a, const float* b, size_t n) {
         result += a[i] * b[i];
     }
     return result;
+#elif defined(__ARM_FEATURE_SVE)
+    svfloat32_t sum = svdup_f32(0.0f);
+    size_t i = 0;
+    const uint64_t vl = svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t va = svld1_f32(svptrue_b32(), a + i);
+        svfloat32_t vb = svld1_f32(svptrue_b32(), b + i);
+        sum = svmla_f32_x(svptrue_b32(), sum, va, vb);
+    }
+    if (i < n) {
+        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
+        svfloat32_t va = svld1_f32(pg, a + i);
+        svfloat32_t vb = svld1_f32(pg, b + i);
+        sum = svmla_f32_m(pg, sum, va, vb);
+    }
+    return svaddv_f32(svptrue_b32(), sum);
 #elif defined(DENSECORE_ARM)
     float32x4_t sum = vdupq_n_f32(0.0f);
     size_t i = 0;
@@ -876,6 +944,20 @@ inline float MaxF32(const float* a, size_t n) {
         if (a[i] > result) result = a[i];
     }
     return result;
+#elif defined(__ARM_FEATURE_SVE)
+    svfloat32_t vmax = svdup_f32(-1e30f);
+    size_t i = 0;
+    const uint64_t vl = svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t v = svld1_f32(svptrue_b32(), a + i);
+        vmax = svmax_f32_x(svptrue_b32(), vmax, v);
+    }
+    if (i < n) {
+        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
+        svfloat32_t v = svld1_f32(pg, a + i);
+        vmax = svmax_f32_m(pg, vmax, v);
+    }
+    return svmaxv_f32(svptrue_b32(), vmax);
 #elif defined(DENSECORE_ARM)
     float32x4_t vmax = vdupq_n_f32(-1e30f);
     size_t i = 0;
@@ -919,6 +1001,20 @@ inline float SumF32(const float* a, size_t n) {
         result += a[i];
     }
     return result;
+#elif defined(__ARM_FEATURE_SVE)
+    svfloat32_t sum = svdup_f32(0.0f);
+    size_t i = 0;
+    const uint64_t vl = svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t v = svld1_f32(svptrue_b32(), a + i);
+        sum = svadd_f32_x(svptrue_b32(), sum, v);
+    }
+    if (i < n) {
+        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
+        svfloat32_t v = svld1_f32(pg, a + i);
+        sum = svadd_f32_m(pg, sum, v);
+    }
+    return svaddv_f32(svptrue_b32(), sum);
 #elif defined(DENSECORE_ARM)
     float32x4_t sum = vdupq_n_f32(0.0f);
     size_t i = 0;
@@ -1058,6 +1154,19 @@ inline void MeanPool(const float* input, float* output, int seq_len, int hidden_
             break;
         }
     }
+#elif defined(__ARM_FEATURE_SVE)
+    const uint64_t vl = svcntw();
+    const svfloat32_t vdiv = svdup_f32(1.0f / seq_len);
+    for (int d = 0; d < hidden_dim; d += static_cast<int>(vl)) {
+        svbool_t pg = svwhilelt_b32_s32(d, hidden_dim);
+        svfloat32_t sum = svdup_f32(0.0f);
+        for (int s = 0; s < seq_len; s++) {
+            svfloat32_t v = svld1_f32(pg, input + s * hidden_dim + d);
+            sum = svadd_f32_m(pg, sum, v);
+        }
+        sum = svmul_f32_x(pg, sum, vdiv);
+        svst1_f32(pg, output + d, sum);
+    }
 #elif defined(DENSECORE_ARM)
     for (int d = 0; d < hidden_dim; d += 4) {
         int remaining = (d + 4 <= hidden_dim) ? 4 : hidden_dim - d;
@@ -1150,6 +1259,17 @@ inline void MaxPool(const float* input, float* output, int seq_len, int hidden_d
             break;
         }
     }
+#elif defined(__ARM_FEATURE_SVE)
+    const uint64_t vl = svcntw();
+    for (int d = 0; d < hidden_dim; d += static_cast<int>(vl)) {
+        svbool_t pg = svwhilelt_b32_s32(d, hidden_dim);
+        svfloat32_t vmax = svld1_f32(pg, input + d);
+        for (int s = 1; s < seq_len; s++) {
+            svfloat32_t v = svld1_f32(pg, input + s * hidden_dim + d);
+            vmax = svmax_f32_m(pg, vmax, v);
+        }
+        svst1_f32(pg, output + d, vmax);
+    }
 #elif defined(DENSECORE_ARM)
     for (int d = 0; d < hidden_dim; d += 4) {
         int remaining = (d + 4 <= hidden_dim) ? 4 : hidden_dim - d;
@@ -1229,6 +1349,12 @@ void GemmInt4Fp32_AVX512(float* C, const float* A, const uint8_t* W, const float
                          int N, int K, int group_size);
 
 void GemmInt4Fp32_AVX2(float* C, const float* A, const uint8_t* W, const float* scales, const float* zeros, int M,
+                       int N, int K, int group_size);
+
+void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W, const float* scales, const float* zeros, int M,
+                      int N, int K, int group_size);
+
+void GemmInt4Fp32_NEON(float* C, const float* A, const uint8_t* W, const float* scales, const float* zeros, int M,
                        int N, int K, int group_size);
 
 // =============================================================================
@@ -2051,6 +2177,503 @@ inline void GemmInt4Fp32Batched_AVX2(float* C, const float* A, const uint8_t* W_
 #endif  // __AVX2__ && DENSECORE_HAS_FMA
 
 // =============================================================================
+// INT4 Quantized GEMM (ARM SVE) - Scalable Vector Extension
+// =============================================================================
+// Targets: Google Cloud C4A (Axion/Neoverse V2, SVE2 128-bit scalable),
+//          AWS Graviton 3 (Neoverse V1, SVE 256-bit),
+//          AWS Graviton 4 (Neoverse V2, SVE2)
+//
+// SVE vectors are scalable — svcntw() returns the number of 32-bit lanes
+// at runtime (4 for 128-bit, 8 for 256-bit, 16 for 512-bit).
+// All loops use svwhilelt predicates for clean tail handling without
+// separate remainder code.
+// =============================================================================
+
+#if defined(__ARM_FEATURE_SVE)
+
+/**
+ * @brief High-performance SVE GEMM kernel: C = A * W^T (INT4 weights)
+ *
+ * Optimizations:
+ * - Scalable vector width (adapts to 128/256/512-bit SVE automatically)
+ * - 4x register blocking along N dimension
+ * - Predicated operations for clean tail handling (no remainder loops)
+ * - Shift-based INT4 sign extension (branchless)
+ * - Software prefetch for weights and activations
+ * - FMA via svmla_f32_x for peak throughput
+ *
+ * On Neoverse V2 (C4A, 128-bit SVE2): processes 4 floats per vector
+ * On Neoverse V1 (Graviton 3, 256-bit SVE): processes 8 floats per vector
+ *
+ * @param C Output [M, N]
+ * @param A Input activations [M, K]
+ * @param W_int4 Packed INT4 weights [N, K/2]
+ * @param scales Per-group scales [N, num_groups]
+ * @param zero_points Per-group zero points [N, num_groups]
+ * @param M Batch dimension
+ * @param N Output features
+ * @param K Input features
+ * @param group_size Quantization group size (K must be divisible)
+ */
+inline void GemmInt4Fp32_SVE(float* C, const float* A, const uint8_t* W_int4, const float* scales,
+                              const float* zero_points, int M, int N, int K, int group_size) {
+    if (K % group_size != 0) return;
+
+    const int num_groups = K / group_size;
+    const int packed_K = K / 2;
+    const uint64_t vl = svcntw();  // Number of 32-bit lanes per SVE vector
+
+    for (int m = 0; m < M; m++) {
+        const float* a_row = A + m * K;
+
+        // N-blocking: process 4 output columns at a time
+        int n = 0;
+        for (; n + 4 <= N; n += 4) {
+            svfloat32_t acc0 = svdup_f32(0.0f);
+            svfloat32_t acc1 = svdup_f32(0.0f);
+            svfloat32_t acc2 = svdup_f32(0.0f);
+            svfloat32_t acc3 = svdup_f32(0.0f);
+
+            for (int g = 0; g < num_groups; g++) {
+                const int k_offset = g * group_size;
+                const int packed_g_offset = g * (group_size / 2);
+                const float* a_ptr = a_row + k_offset;
+
+                // Broadcast scale/zero for each of the 4 weight rows
+                const svfloat32_t vs0 = svdup_f32(scales[(n + 0) * num_groups + g]);
+                const svfloat32_t vz0 = svdup_f32(zero_points[(n + 0) * num_groups + g]);
+                const svfloat32_t vs1 = svdup_f32(scales[(n + 1) * num_groups + g]);
+                const svfloat32_t vz1 = svdup_f32(zero_points[(n + 1) * num_groups + g]);
+                const svfloat32_t vs2 = svdup_f32(scales[(n + 2) * num_groups + g]);
+                const svfloat32_t vz2 = svdup_f32(zero_points[(n + 2) * num_groups + g]);
+                const svfloat32_t vs3 = svdup_f32(scales[(n + 3) * num_groups + g]);
+                const svfloat32_t vz3 = svdup_f32(zero_points[(n + 3) * num_groups + g]);
+
+                // Prefetch next group's activations
+                if (g + 1 < num_groups) {
+                    __builtin_prefetch(a_row + (g + 1) * group_size, 0, 3);
+                }
+
+                // Process K dimension in steps of 2*vl elements
+                // Each packed byte holds 2 INT4 values → process 2*vl weights
+                // from vl packed bytes per iteration
+                for (int k = 0; k < group_size; k += static_cast<int>(2 * vl)) {
+                    const int remaining = group_size - k;
+                    const int step = (remaining < static_cast<int>(2 * vl))
+                                         ? remaining
+                                         : static_cast<int>(2 * vl);
+
+                    // Load activations with predication for tail
+                    svbool_t pg0 = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
+                    svbool_t pg1 = (step > static_cast<int>(vl))
+                                       ? svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step - static_cast<int>(vl)))
+                                       : svpfalse_b();
+
+                    svfloat32_t a0 = svld1_f32(pg0, a_ptr + k);
+                    svfloat32_t a1 = svld1_f32(pg1, a_ptr + k + vl);
+
+// Macro to process one weight row for SVE
+#define SVE_PROCESS_ROW(idx, acc_var)                                                    \
+    do {                                                                                 \
+        const uint8_t* w_ptr = W_int4 + (n + (idx)) * packed_K + packed_g_offset + k / 2;\
+        __builtin_prefetch(w_ptr + 64, 0, 3);                                           \
+                                                                                         \
+        /* Load vl packed bytes = 2*vl INT4 weights */                                   \
+        svuint8_t packed_bytes = svld1_u8(svwhilelt_b8_u64(0UL, vl), w_ptr);            \
+                                                                                         \
+        /* Extract low nibbles (even indices) */                                         \
+        svuint8_t lo_u8 = svand_u8_x(svptrue_b8(), packed_bytes, svdup_u8(0x0F));       \
+        /* Extract high nibbles (odd indices) */                                         \
+        svuint8_t hi_u8 = svlsr_n_u8_x(svptrue_b8(), packed_bytes, 4);                  \
+                                                                                         \
+        /* Zero-extend u8→u32 */                                                         \
+        svuint32_t lo_u32 = svunpklo_u32(svunpklo_u16(lo_u8));                           \
+        svuint32_t hi_u32 = svunpklo_u32(svunpklo_u16(hi_u8));                           \
+                                                                                         \
+        /* Sign extend 4-bit: shift left 28, arithmetic shift right 28 */                \
+        svint32_t lo_s32 = svasr_n_s32_x(svptrue_b32(),                                 \
+                               svlsl_n_s32_x(svptrue_b32(),                              \
+                                   svreinterpret_s32_u32(lo_u32), 28), 28);              \
+        svint32_t hi_s32 = svasr_n_s32_x(svptrue_b32(),                                 \
+                               svlsl_n_s32_x(svptrue_b32(),                              \
+                                   svreinterpret_s32_u32(hi_u32), 28), 28);              \
+                                                                                         \
+        /* Interleave low and high nibbles to restore original order */                  \
+        /* Element order: [lo0, hi0, lo1, hi1, ...] */                                   \
+        svint32_t w_even = svzip1_s32(lo_s32, hi_s32);                                   \
+        svint32_t w_odd  = svzip2_s32(lo_s32, hi_s32);                                   \
+                                                                                         \
+        /* Convert to FP32 and dequantize */                                              \
+        svfloat32_t wf0 = svmul_f32_x(pg0, vs##idx,                                     \
+                              svsub_f32_x(pg0, svcvt_f32_s32_x(pg0, w_even), vz##idx));  \
+        svfloat32_t wf1 = svmul_f32_x(pg1, vs##idx,                                     \
+                              svsub_f32_x(pg1, svcvt_f32_s32_x(pg1, w_odd), vz##idx));   \
+                                                                                         \
+        /* FMA: acc += a * w */                                                          \
+        acc_var = svmla_f32_m(pg0, acc_var, a0, wf0);                                    \
+        acc_var = svmla_f32_m(pg1, acc_var, a1, wf1);                                    \
+    } while (0)
+
+                    SVE_PROCESS_ROW(0, acc0);
+                    SVE_PROCESS_ROW(1, acc1);
+                    SVE_PROCESS_ROW(2, acc2);
+                    SVE_PROCESS_ROW(3, acc3);
+
+#undef SVE_PROCESS_ROW
+                }
+            }
+
+            // Horizontal reduction using SVE addv
+            C[m * N + n + 0] = svaddv_f32(svptrue_b32(), acc0);
+            C[m * N + n + 1] = svaddv_f32(svptrue_b32(), acc1);
+            C[m * N + n + 2] = svaddv_f32(svptrue_b32(), acc2);
+            C[m * N + n + 3] = svaddv_f32(svptrue_b32(), acc3);
+        }
+
+        // Handle remaining columns (N % 4)
+        for (; n < N; n++) {
+            svfloat32_t acc = svdup_f32(0.0f);
+
+            for (int g = 0; g < num_groups; g++) {
+                const int k_offset = g * group_size;
+                const int packed_g_offset = g * (group_size / 2);
+                const float* a_ptr = a_row + k_offset;
+                const svfloat32_t vs = svdup_f32(scales[n * num_groups + g]);
+                const svfloat32_t vz = svdup_f32(zero_points[n * num_groups + g]);
+
+                for (int k = 0; k < group_size; k += static_cast<int>(2 * vl)) {
+                    const int remaining = group_size - k;
+                    const int step = (remaining < static_cast<int>(2 * vl))
+                                         ? remaining
+                                         : static_cast<int>(2 * vl);
+
+                    svbool_t pg0 = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
+                    svbool_t pg1 = (step > static_cast<int>(vl))
+                                       ? svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step - static_cast<int>(vl)))
+                                       : svpfalse_b();
+
+                    svfloat32_t a0 = svld1_f32(pg0, a_ptr + k);
+                    svfloat32_t a1 = svld1_f32(pg1, a_ptr + k + vl);
+
+                    const uint8_t* w_ptr = W_int4 + n * packed_K + packed_g_offset + k / 2;
+
+                    svuint8_t packed_bytes = svld1_u8(svwhilelt_b8_u64(0UL, vl), w_ptr);
+                    svuint8_t lo_u8 = svand_u8_x(svptrue_b8(), packed_bytes, svdup_u8(0x0F));
+                    svuint8_t hi_u8 = svlsr_n_u8_x(svptrue_b8(), packed_bytes, 4);
+
+                    svuint32_t lo_u32 = svunpklo_u32(svunpklo_u16(lo_u8));
+                    svuint32_t hi_u32 = svunpklo_u32(svunpklo_u16(hi_u8));
+
+                    svint32_t lo_s32 = svasr_n_s32_x(svptrue_b32(),
+                                           svlsl_n_s32_x(svptrue_b32(),
+                                               svreinterpret_s32_u32(lo_u32), 28), 28);
+                    svint32_t hi_s32 = svasr_n_s32_x(svptrue_b32(),
+                                           svlsl_n_s32_x(svptrue_b32(),
+                                               svreinterpret_s32_u32(hi_u32), 28), 28);
+
+                    svint32_t w_even = svzip1_s32(lo_s32, hi_s32);
+                    svint32_t w_odd  = svzip2_s32(lo_s32, hi_s32);
+
+                    svfloat32_t wf0 = svmul_f32_x(pg0, vs,
+                                          svsub_f32_x(pg0, svcvt_f32_s32_x(pg0, w_even), vz));
+                    svfloat32_t wf1 = svmul_f32_x(pg1, vs,
+                                          svsub_f32_x(pg1, svcvt_f32_s32_x(pg1, w_odd), vz));
+
+                    acc = svmla_f32_m(pg0, acc, a0, wf0);
+                    acc = svmla_f32_m(pg1, acc, a1, wf1);
+                }
+            }
+
+            C[m * N + n] = svaddv_f32(svptrue_b32(), acc);
+        }
+    }
+}
+
+/**
+ * @brief Batched INT4 GEMM with weight reuse across M tokens (SVE)
+ *
+ * Loop order: N-outer → M-tile → K-inner
+ * Same weight-reuse strategy as AVX2 batched variant, adapted for SVE.
+ * Dequantizes each weight tile ONCE and applies to TILE_M=4 rows.
+ *
+ * @param n_start First output column (inclusive)
+ * @param n_end_param Last output column (exclusive), -1 means N
+ */
+inline void GemmInt4Fp32Batched_SVE(float* C, const float* A, const uint8_t* W_int4, const float* scales,
+                                     const float* zero_points, int M, int N, int K, int group_size,
+                                     int n_start = 0, int n_end_param = -1) {
+    const int n_end = (n_end_param < 0) ? N : n_end_param;
+    if (K % group_size != 0 || n_start >= n_end || M <= 0) return;
+
+    const int num_groups = K / group_size;
+    const int packed_K = K / 2;
+    const uint64_t vl = svcntw();
+    constexpr int TILE_M = 4;
+
+    for (int n = n_start; n < n_end; n++) {
+        for (int m = 0; m < M; m += TILE_M) {
+            const int actual_m = std::min(TILE_M, M - m);
+
+            svfloat32_t acc0 = svdup_f32(0.0f);
+            svfloat32_t acc1 = svdup_f32(0.0f);
+            svfloat32_t acc2 = svdup_f32(0.0f);
+            svfloat32_t acc3 = svdup_f32(0.0f);
+
+            for (int g = 0; g < num_groups; g++) {
+                const int k_offset = g * group_size;
+                const int packed_g_offset = g * (group_size / 2);
+                const svfloat32_t vs = svdup_f32(scales[n * num_groups + g]);
+                const svfloat32_t vz = svdup_f32(zero_points[n * num_groups + g]);
+
+                for (int k = 0; k < group_size; k += static_cast<int>(2 * vl)) {
+                    const int remaining = group_size - k;
+                    const int step = (remaining < static_cast<int>(2 * vl))
+                                         ? remaining
+                                         : static_cast<int>(2 * vl);
+
+                    svbool_t pg0 = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step > 0 ? (step < static_cast<int>(vl) ? step : static_cast<int>(vl)) : 0));
+                    svbool_t pg1 = (step > static_cast<int>(vl))
+                                       ? svwhilelt_b32_u64(0UL, static_cast<uint64_t>(step - static_cast<int>(vl)))
+                                       : svpfalse_b();
+
+                    // Dequantize weight ONCE
+                    const uint8_t* w_ptr = W_int4 + n * packed_K + packed_g_offset + k / 2;
+                    __builtin_prefetch(w_ptr + 64, 0, 3);
+
+                    svuint8_t packed_bytes = svld1_u8(svwhilelt_b8_u64(0UL, vl), w_ptr);
+                    svuint8_t lo_u8 = svand_u8_x(svptrue_b8(), packed_bytes, svdup_u8(0x0F));
+                    svuint8_t hi_u8 = svlsr_n_u8_x(svptrue_b8(), packed_bytes, 4);
+
+                    svuint32_t lo_u32 = svunpklo_u32(svunpklo_u16(lo_u8));
+                    svuint32_t hi_u32 = svunpklo_u32(svunpklo_u16(hi_u8));
+
+                    svint32_t lo_s32 = svasr_n_s32_x(svptrue_b32(),
+                                           svlsl_n_s32_x(svptrue_b32(),
+                                               svreinterpret_s32_u32(lo_u32), 28), 28);
+                    svint32_t hi_s32 = svasr_n_s32_x(svptrue_b32(),
+                                           svlsl_n_s32_x(svptrue_b32(),
+                                               svreinterpret_s32_u32(hi_u32), 28), 28);
+
+                    svint32_t w_even = svzip1_s32(lo_s32, hi_s32);
+                    svint32_t w_odd  = svzip2_s32(lo_s32, hi_s32);
+
+                    svfloat32_t wf0 = svmul_f32_x(pg0, vs,
+                                          svsub_f32_x(pg0, svcvt_f32_s32_x(pg0, w_even), vz));
+                    svfloat32_t wf1 = svmul_f32_x(pg1, vs,
+                                          svsub_f32_x(pg1, svcvt_f32_s32_x(pg1, w_odd), vz));
+
+                    // Apply to TILE_M rows (weight reuse!)
+                    if (actual_m >= 1) {
+                        svfloat32_t av0 = svld1_f32(pg0, A + (m + 0) * K + k_offset + k);
+                        svfloat32_t av1 = svld1_f32(pg1, A + (m + 0) * K + k_offset + k + vl);
+                        acc0 = svmla_f32_m(pg0, acc0, av0, wf0);
+                        acc0 = svmla_f32_m(pg1, acc0, av1, wf1);
+                    }
+                    if (actual_m >= 2) {
+                        svfloat32_t av0 = svld1_f32(pg0, A + (m + 1) * K + k_offset + k);
+                        svfloat32_t av1 = svld1_f32(pg1, A + (m + 1) * K + k_offset + k + vl);
+                        acc1 = svmla_f32_m(pg0, acc1, av0, wf0);
+                        acc1 = svmla_f32_m(pg1, acc1, av1, wf1);
+                    }
+                    if (actual_m >= 3) {
+                        svfloat32_t av0 = svld1_f32(pg0, A + (m + 2) * K + k_offset + k);
+                        svfloat32_t av1 = svld1_f32(pg1, A + (m + 2) * K + k_offset + k + vl);
+                        acc2 = svmla_f32_m(pg0, acc2, av0, wf0);
+                        acc2 = svmla_f32_m(pg1, acc2, av1, wf1);
+                    }
+                    if (actual_m >= 4) {
+                        svfloat32_t av0 = svld1_f32(pg0, A + (m + 3) * K + k_offset + k);
+                        svfloat32_t av1 = svld1_f32(pg1, A + (m + 3) * K + k_offset + k + vl);
+                        acc3 = svmla_f32_m(pg0, acc3, av0, wf0);
+                        acc3 = svmla_f32_m(pg1, acc3, av1, wf1);
+                    }
+                }
+            }
+
+            if (actual_m >= 1) C[(m + 0) * N + n] = svaddv_f32(svptrue_b32(), acc0);
+            if (actual_m >= 2) C[(m + 1) * N + n] = svaddv_f32(svptrue_b32(), acc1);
+            if (actual_m >= 3) C[(m + 2) * N + n] = svaddv_f32(svptrue_b32(), acc2);
+            if (actual_m >= 4) C[(m + 3) * N + n] = svaddv_f32(svptrue_b32(), acc3);
+        }
+    }
+}
+
+#endif  // __ARM_FEATURE_SVE
+
+// =============================================================================
+// INT4 Quantized GEMM (ARM NEON) - Fixed 128-bit Vectors
+// =============================================================================
+// Targets: Apple Silicon, Graviton2, Raspberry Pi 4, any AArch64 without SVE
+// NEON: 128-bit fixed width, processes 4 floats per vector
+// =============================================================================
+
+#if defined(DENSECORE_ARM)
+
+/**
+ * @brief High-performance NEON GEMM kernel: C = A * W^T (INT4 weights)
+ *
+ * Optimizations:
+ * - 4x register blocking along N dimension
+ * - Shift-based INT4 sign extension (branchless)
+ * - FMA via vfmaq_f32 (available on all AArch64)
+ * - Software prefetch for weights
+ * - Processes 8 weights per iteration (4 packed bytes → 8 INT4 → 8 FP32)
+ *
+ * Performance: ~4x faster than scalar fallback on NEON
+ */
+inline void GemmInt4Fp32_NEON(float* C, const float* A, const uint8_t* W_int4, const float* scales,
+                               const float* zero_points, int M, int N, int K, int group_size) {
+    if (K % group_size != 0) return;
+
+    const int num_groups = K / group_size;
+    const int packed_K = K / 2;
+
+    for (int m = 0; m < M; m++) {
+        const float* a_row = A + m * K;
+
+        // N-blocking: process 4 output columns at a time
+        int n = 0;
+        for (; n + 4 <= N; n += 4) {
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            float32x4_t acc2 = vdupq_n_f32(0.0f);
+            float32x4_t acc3 = vdupq_n_f32(0.0f);
+            // Second set of accumulators for 2-way unrolling
+            float32x4_t acc0b = vdupq_n_f32(0.0f);
+            float32x4_t acc1b = vdupq_n_f32(0.0f);
+            float32x4_t acc2b = vdupq_n_f32(0.0f);
+            float32x4_t acc3b = vdupq_n_f32(0.0f);
+
+            for (int g = 0; g < num_groups; g++) {
+                const int k_offset = g * group_size;
+                const int packed_g_offset = g * (group_size / 2);
+                const float* a_ptr = a_row + k_offset;
+
+                // Prefetch next group
+                if (g + 1 < num_groups) {
+                    __builtin_prefetch(a_row + (g + 1) * group_size, 0, 3);
+                }
+
+                // Process 8 weights per iteration (4 packed bytes)
+                for (int k = 0; k < group_size; k += 8) {
+                    // Load 2 × 4 floats from activations
+                    float32x4_t a0 = vld1q_f32(a_ptr + k);
+                    float32x4_t a1 = vld1q_f32(a_ptr + k + 4);
+
+// Macro to process one weight row for NEON
+#define NEON_PROCESS_ROW(idx, acc_a, acc_b)                                              \
+    do {                                                                                 \
+        const int row = n + (idx);                                                       \
+        const float scale = scales[row * num_groups + g];                                \
+        const float zero = zero_points[row * num_groups + g];                            \
+        const float32x4_t vscale = vdupq_n_f32(scale);                                   \
+        const float32x4_t vzero = vdupq_n_f32(zero);                                     \
+                                                                                         \
+        const uint8_t* w_ptr = W_int4 + row * packed_K + packed_g_offset + k / 2;        \
+        __builtin_prefetch(w_ptr + 32, 0, 3);                                            \
+                                                                                         \
+        /* Load 4 bytes = 8 packed INT4 weights */                                       \
+        uint8x8_t packed_u8 = vld1_u8(w_ptr);  /* loads 8 bytes, use first 4 */          \
+        /* Widen u8 → u16 */                                                             \
+        uint16x8_t packed_u16 = vmovl_u8(packed_u8);                                     \
+        /* Extract low nibbles (even positions) */                                       \
+        uint16x8_t lo_u16 = vandq_u16(packed_u16, vdupq_n_u16(0x0F));                    \
+        /* Extract high nibbles (odd positions) */                                       \
+        uint16x8_t hi_u16 = vshrq_n_u16(packed_u16, 4);                                  \
+        hi_u16 = vandq_u16(hi_u16, vdupq_n_u16(0x0F));                                   \
+                                                                                         \
+        /* Sign extension via shift trick (16-bit): shl 12, asr 12 */                   \
+        int16x8_t lo_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(lo_u16), 12), 12);\
+        int16x8_t hi_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(hi_u16), 12), 12);\
+                                                                                         \
+        /* Interleave low and high: [lo0,hi0,lo1,hi1,...] */                             \
+        int16x8_t interleaved_lo = vzip1q_s16(lo_s16, hi_s16);                           \
+        int16x8_t interleaved_hi = vzip2q_s16(lo_s16, hi_s16);                           \
+                                                                                         \
+        /* Convert first 4 elements to FP32 */                                           \
+        int32x4_t w32_0 = vmovl_s16(vget_low_s16(interleaved_lo));                       \
+        float32x4_t wf0 = vcvtq_f32_s32(w32_0);                                          \
+        /* Convert next 4 elements to FP32 */                                            \
+        int32x4_t w32_1 = vmovl_s16(vget_high_s16(interleaved_lo));                      \
+        float32x4_t wf1 = vcvtq_f32_s32(w32_1);                                          \
+                                                                                         \
+        /* Dequantize: w_dequant = scale * (q - zero) */                                 \
+        wf0 = vmulq_f32(vscale, vsubq_f32(wf0, vzero));                                  \
+        wf1 = vmulq_f32(vscale, vsubq_f32(wf1, vzero));                                  \
+                                                                                         \
+        /* FMA: acc += a * w */                                                          \
+        acc_a = vfmaq_f32(acc_a, a0, wf0);                                               \
+        acc_b = vfmaq_f32(acc_b, a1, wf1);                                               \
+    } while (0)
+
+                    NEON_PROCESS_ROW(0, acc0, acc0b);
+                    NEON_PROCESS_ROW(1, acc1, acc1b);
+                    NEON_PROCESS_ROW(2, acc2, acc2b);
+                    NEON_PROCESS_ROW(3, acc3, acc3b);
+
+#undef NEON_PROCESS_ROW
+                }
+            }
+
+            // Merge paired accumulators and horizontal sum
+            acc0 = vaddq_f32(acc0, acc0b);
+            acc1 = vaddq_f32(acc1, acc1b);
+            acc2 = vaddq_f32(acc2, acc2b);
+            acc3 = vaddq_f32(acc3, acc3b);
+
+            C[m * N + n + 0] = vaddvq_f32(acc0);
+            C[m * N + n + 1] = vaddvq_f32(acc1);
+            C[m * N + n + 2] = vaddvq_f32(acc2);
+            C[m * N + n + 3] = vaddvq_f32(acc3);
+        }
+
+        // Handle remaining columns (N % 4)
+        for (; n < N; n++) {
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            float32x4_t acc_b = vdupq_n_f32(0.0f);
+
+            for (int g = 0; g < num_groups; g++) {
+                const int k_offset = g * group_size;
+                const float* a_ptr = a_row + k_offset;
+                const float32x4_t vscale = vdupq_n_f32(scales[n * num_groups + g]);
+                const float32x4_t vzero = vdupq_n_f32(zero_points[n * num_groups + g]);
+                const uint8_t* w_ptr = W_int4 + n * packed_K + g * (group_size / 2);
+
+                for (int k = 0; k < group_size; k += 8) {
+                    float32x4_t a0 = vld1q_f32(a_ptr + k);
+                    float32x4_t a1 = vld1q_f32(a_ptr + k + 4);
+
+                    uint8x8_t packed_u8 = vld1_u8(w_ptr + k / 2);
+                    uint16x8_t packed_u16 = vmovl_u8(packed_u8);
+                    uint16x8_t lo_u16 = vandq_u16(packed_u16, vdupq_n_u16(0x0F));
+                    uint16x8_t hi_u16 = vshrq_n_u16(packed_u16, 4);
+                    hi_u16 = vandq_u16(hi_u16, vdupq_n_u16(0x0F));
+
+                    int16x8_t lo_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(lo_u16), 12), 12);
+                    int16x8_t hi_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(hi_u16), 12), 12);
+
+                    int16x8_t interleaved_lo = vzip1q_s16(lo_s16, hi_s16);
+
+                    int32x4_t w32_0 = vmovl_s16(vget_low_s16(interleaved_lo));
+                    int32x4_t w32_1 = vmovl_s16(vget_high_s16(interleaved_lo));
+
+                    float32x4_t wf0 = vmulq_f32(vscale, vsubq_f32(vcvtq_f32_s32(w32_0), vzero));
+                    float32x4_t wf1 = vmulq_f32(vscale, vsubq_f32(vcvtq_f32_s32(w32_1), vzero));
+
+                    acc = vfmaq_f32(acc, a0, wf0);
+                    acc_b = vfmaq_f32(acc_b, a1, wf1);
+                }
+            }
+
+            acc = vaddq_f32(acc, acc_b);
+            C[m * N + n] = vaddvq_f32(acc);
+        }
+    }
+}
+
+#endif  // DENSECORE_ARM
+
+// =============================================================================
 // FlashAttention AVX-512 Micro-Kernels (Cache-Optimized)
 // =============================================================================
 
@@ -2403,6 +3026,203 @@ inline void UpdateOutput_AVX512(float* O, const float* PV, const float* alpha, c
 }
 
 #endif  // __AVX512F__
+
+// =============================================================================
+// FlashAttention ARM Kernels
+// =============================================================================
+
+#if defined(__ARM_FEATURE_SVE)
+
+inline void ComputeQK_SVE(const float* Q, const float* K, float* S, int q_len, int kv_len, int head_dim,
+                          float scale) {
+    for (int qi = 0; qi < q_len; qi++) {
+        const float* q_row = Q + qi * head_dim;
+        for (int ki = 0; ki < kv_len; ki++) {
+            const float* k_row = K + ki * head_dim;
+            S[qi * kv_len + ki] = DotF32(q_row, k_row, static_cast<size_t>(head_dim)) * scale;
+        }
+    }
+}
+
+inline void ComputePV_SVE(const float* P, const float* V, float* O, int q_len, int kv_len, int head_dim) {
+    const uint64_t vl = svcntw();
+    for (int qi = 0; qi < q_len; qi++) {
+        const float* p_row = P + qi * kv_len;
+        float* o_row = O + qi * head_dim;
+
+        for (int ki = 0; ki < kv_len; ki++) {
+            const svfloat32_t p_vec = svdup_f32(p_row[ki]);
+            const float* v_row = V + ki * head_dim;
+
+            int d = 0;
+            for (; d + static_cast<int>(vl) <= head_dim; d += static_cast<int>(vl)) {
+                svbool_t pg = svptrue_b32();
+                svfloat32_t o_vec = svld1_f32(pg, o_row + d);
+                svfloat32_t v_vec = svld1_f32(pg, v_row + d);
+                o_vec = svmla_f32_x(pg, o_vec, p_vec, v_vec);
+                svst1_f32(pg, o_row + d, o_vec);
+            }
+            if (d < head_dim) {
+                svbool_t pg = svwhilelt_b32_u64(static_cast<uint64_t>(d), static_cast<uint64_t>(head_dim));
+                svfloat32_t o_vec = svld1_f32(pg, o_row + d);
+                svfloat32_t v_vec = svld1_f32(pg, v_row + d);
+                o_vec = svmla_f32_m(pg, o_vec, p_vec, v_vec);
+                svst1_f32(pg, o_row + d, o_vec);
+            }
+        }
+    }
+}
+
+inline void UpdateOutput_SVE(float* O, const float* PV, const float* alpha, const float* beta, int q_len,
+                             int head_dim) {
+    const uint64_t vl = svcntw();
+    for (int qi = 0; qi < q_len; qi++) {
+        const svfloat32_t alpha_vec = svdup_f32(alpha[qi]);
+        const svfloat32_t beta_vec = svdup_f32(beta[qi]);
+        float* o_row = O + qi * head_dim;
+        const float* pv_row = PV + qi * head_dim;
+
+        int d = 0;
+        for (; d + static_cast<int>(vl) <= head_dim; d += static_cast<int>(vl)) {
+            svbool_t pg = svptrue_b32();
+            svfloat32_t o_vec = svld1_f32(pg, o_row + d);
+            svfloat32_t pv_vec = svld1_f32(pg, pv_row + d);
+            o_vec = svmul_f32_x(pg, o_vec, alpha_vec);
+            o_vec = svmla_f32_x(pg, o_vec, beta_vec, pv_vec);
+            svst1_f32(pg, o_row + d, o_vec);
+        }
+        if (d < head_dim) {
+            svbool_t pg = svwhilelt_b32_u64(static_cast<uint64_t>(d), static_cast<uint64_t>(head_dim));
+            svfloat32_t o_vec = svld1_f32(pg, o_row + d);
+            svfloat32_t pv_vec = svld1_f32(pg, pv_row + d);
+            o_vec = svmul_f32_m(pg, o_vec, alpha_vec);
+            o_vec = svmla_f32_m(pg, o_vec, beta_vec, pv_vec);
+            svst1_f32(pg, o_row + d, o_vec);
+        }
+    }
+}
+
+#endif  // __ARM_FEATURE_SVE
+
+#if defined(DENSECORE_ARM)
+
+inline void ComputeQK_NEON(const float* Q, const float* K, float* S, int q_len, int kv_len, int head_dim,
+                           float scale) {
+    for (int qi = 0; qi < q_len; qi++) {
+        const float* q_row = Q + qi * head_dim;
+        for (int ki = 0; ki < kv_len; ki++) {
+            const float* k_row = K + ki * head_dim;
+            S[qi * kv_len + ki] = DotF32(q_row, k_row, static_cast<size_t>(head_dim)) * scale;
+        }
+    }
+}
+
+inline void ComputePV_NEON(const float* P, const float* V, float* O, int q_len, int kv_len, int head_dim) {
+    for (int qi = 0; qi < q_len; qi++) {
+        const float* p_row = P + qi * kv_len;
+        float* o_row = O + qi * head_dim;
+
+        for (int ki = 0; ki < kv_len; ki++) {
+            const float32x4_t p_vec = vdupq_n_f32(p_row[ki]);
+            const float* v_row = V + ki * head_dim;
+
+            int d = 0;
+            for (; d + 4 <= head_dim; d += 4) {
+                float32x4_t o_vec = vld1q_f32(o_row + d);
+                float32x4_t v_vec = vld1q_f32(v_row + d);
+                o_vec = vfmaq_f32(o_vec, p_vec, v_vec);
+                vst1q_f32(o_row + d, o_vec);
+            }
+            for (; d < head_dim; d++) {
+                o_row[d] += p_row[ki] * v_row[d];
+            }
+        }
+    }
+}
+
+inline void UpdateOutput_NEON(float* O, const float* PV, const float* alpha, const float* beta, int q_len,
+                              int head_dim) {
+    for (int qi = 0; qi < q_len; qi++) {
+        const float32x4_t alpha_vec = vdupq_n_f32(alpha[qi]);
+        const float32x4_t beta_vec = vdupq_n_f32(beta[qi]);
+        float* o_row = O + qi * head_dim;
+        const float* pv_row = PV + qi * head_dim;
+
+        int d = 0;
+        for (; d + 4 <= head_dim; d += 4) {
+            float32x4_t o_vec = vld1q_f32(o_row + d);
+            float32x4_t pv_vec = vld1q_f32(pv_row + d);
+            o_vec = vmulq_f32(o_vec, alpha_vec);
+            o_vec = vfmaq_f32(o_vec, beta_vec, pv_vec);
+            vst1q_f32(o_row + d, o_vec);
+        }
+        for (; d < head_dim; d++) {
+            o_row[d] = alpha[qi] * o_row[d] + beta[qi] * pv_row[d];
+        }
+    }
+}
+
+#endif  // DENSECORE_ARM
+
+inline void ComputeQK(const float* Q, const float* K, float* S, int q_len, int kv_len, int head_dim, float scale) {
+    static const SimdLevel level = DetectSimdLevel();
+#if defined(__ARM_FEATURE_SVE)
+    if (HasArmSveOrBetter(level)) {
+        ComputeQK_SVE(Q, K, S, q_len, kv_len, head_dim, scale);
+        return;
+    }
+#endif
+#if defined(DENSECORE_ARM)
+    if (IsArmFamily(level)) {
+        ComputeQK_NEON(Q, K, S, q_len, kv_len, head_dim, scale);
+        return;
+    }
+#endif
+    ComputeQK_AVX512(Q, K, S, q_len, kv_len, head_dim, scale);
+}
+
+inline void ApplyMask(float* S, int q_start, int kv_start, int q_len, int kv_len) {
+    ApplyMask_AVX512(S, q_start, kv_start, q_len, kv_len);
+}
+
+inline void SoftmaxBlock(float* S, float* row_max, float* row_sum, int q_len, int kv_len, bool first_block) {
+    SoftmaxBlock_AVX512(S, row_max, row_sum, q_len, kv_len, first_block);
+}
+
+inline void ComputePV(const float* P, const float* V, float* O, int q_len, int kv_len, int head_dim) {
+    static const SimdLevel level = DetectSimdLevel();
+#if defined(__ARM_FEATURE_SVE)
+    if (HasArmSveOrBetter(level)) {
+        ComputePV_SVE(P, V, O, q_len, kv_len, head_dim);
+        return;
+    }
+#endif
+#if defined(DENSECORE_ARM)
+    if (IsArmFamily(level)) {
+        ComputePV_NEON(P, V, O, q_len, kv_len, head_dim);
+        return;
+    }
+#endif
+    ComputePV_AVX512(P, V, O, q_len, kv_len, head_dim);
+}
+
+inline void UpdateOutput(float* O, const float* PV, const float* alpha, const float* beta, int q_len,
+                         int head_dim) {
+    static const SimdLevel level = DetectSimdLevel();
+#if defined(__ARM_FEATURE_SVE)
+    if (HasArmSveOrBetter(level)) {
+        UpdateOutput_SVE(O, PV, alpha, beta, q_len, head_dim);
+        return;
+    }
+#endif
+#if defined(DENSECORE_ARM)
+    if (IsArmFamily(level)) {
+        UpdateOutput_NEON(O, PV, alpha, beta, q_len, head_dim);
+        return;
+    }
+#endif
+    UpdateOutput_AVX512(O, PV, alpha, beta, q_len, head_dim);
+}
 
 // =============================================================================
 // Fused Kernels for Memory Bandwidth Optimization
@@ -3096,6 +3916,154 @@ inline void ComputeQKV_Scalar(float* q, float* k, float* v, const float* x, cons
     }
 }
 
+#if defined(__ARM_FEATURE_SVE)
+
+inline float DotRow_SVE(const float* x, const float* w, int n_embd) {
+    svfloat32_t acc = svdup_f32(0.0f);
+    const uint64_t vl = svcntw();
+    int d = 0;
+    for (; d + static_cast<int>(vl) <= n_embd; d += static_cast<int>(vl)) {
+        svbool_t pg = svptrue_b32();
+        svfloat32_t x_vec = svld1_f32(pg, x + d);
+        svfloat32_t w_vec = svld1_f32(pg, w + d);
+        acc = svmla_f32_x(pg, acc, x_vec, w_vec);
+    }
+    if (d < n_embd) {
+        svbool_t pg = svwhilelt_b32_u64(static_cast<uint64_t>(d), static_cast<uint64_t>(n_embd));
+        svfloat32_t x_vec = svld1_f32(pg, x + d);
+        svfloat32_t w_vec = svld1_f32(pg, w + d);
+        acc = svmla_f32_m(pg, acc, x_vec, w_vec);
+    }
+    return svaddv_f32(svptrue_b32(), acc);
+}
+
+inline void ComputeQKV_SVE(float* q, float* k, float* v, const float* x, const float* w_q, const float* w_k,
+                           const float* w_v, int n_embd, int dim_q, int dim_k, int dim_v, int ith = 0, int nth = 1) {
+    const int total_cols = dim_q + dim_k + dim_v;
+    const int cols_per_thread = (total_cols + nth - 1) / nth;
+    const int start_col = ith * cols_per_thread;
+    const int end_col = std::min(start_col + cols_per_thread, total_cols);
+
+    if (start_col >= end_col) return;
+
+    constexpr int UNROLL = 2;
+
+    const int q_start = std::max(0, start_col);
+    const int q_end = std::min(dim_q, end_col);
+    if (q_start < q_end) {
+        int oq = q_start;
+        for (; oq + UNROLL <= q_end; oq += UNROLL) {
+            q[oq + 0] = DotRow_SVE(x, w_q + (oq + 0) * n_embd, n_embd);
+            q[oq + 1] = DotRow_SVE(x, w_q + (oq + 1) * n_embd, n_embd);
+        }
+        for (; oq < q_end; oq++) {
+            q[oq] = DotRow_SVE(x, w_q + oq * n_embd, n_embd);
+        }
+    }
+
+    const int k_virt_start = dim_q;
+    const int k_start = std::max(0, start_col - k_virt_start);
+    const int k_end = std::min(dim_k, end_col - k_virt_start);
+    if (k_start < k_end) {
+        int ok = k_start;
+        for (; ok + UNROLL <= k_end; ok += UNROLL) {
+            k[ok + 0] = DotRow_SVE(x, w_k + (ok + 0) * n_embd, n_embd);
+            k[ok + 1] = DotRow_SVE(x, w_k + (ok + 1) * n_embd, n_embd);
+        }
+        for (; ok < k_end; ok++) {
+            k[ok] = DotRow_SVE(x, w_k + ok * n_embd, n_embd);
+        }
+    }
+
+    const int v_virt_start = dim_q + dim_k;
+    const int v_start = std::max(0, start_col - v_virt_start);
+    const int v_end = std::min(dim_v, end_col - v_virt_start);
+    if (v_start < v_end) {
+        int ov = v_start;
+        for (; ov + UNROLL <= v_end; ov += UNROLL) {
+            v[ov + 0] = DotRow_SVE(x, w_v + (ov + 0) * n_embd, n_embd);
+            v[ov + 1] = DotRow_SVE(x, w_v + (ov + 1) * n_embd, n_embd);
+        }
+        for (; ov < v_end; ov++) {
+            v[ov] = DotRow_SVE(x, w_v + ov * n_embd, n_embd);
+        }
+    }
+}
+
+#endif  // __ARM_FEATURE_SVE
+
+#if defined(DENSECORE_ARM)
+
+inline float DotRow_NEON(const float* x, const float* w, int n_embd) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    int d = 0;
+    for (; d + 4 <= n_embd; d += 4) {
+        float32x4_t x_vec = vld1q_f32(x + d);
+        float32x4_t w_vec = vld1q_f32(w + d);
+        acc = vfmaq_f32(acc, x_vec, w_vec);
+    }
+    float sum = vaddvq_f32(acc);
+    for (; d < n_embd; d++) {
+        sum += x[d] * w[d];
+    }
+    return sum;
+}
+
+inline void ComputeQKV_NEON(float* q, float* k, float* v, const float* x, const float* w_q, const float* w_k,
+                            const float* w_v, int n_embd, int dim_q, int dim_k, int dim_v, int ith = 0, int nth = 1) {
+    const int total_cols = dim_q + dim_k + dim_v;
+    const int cols_per_thread = (total_cols + nth - 1) / nth;
+    const int start_col = ith * cols_per_thread;
+    const int end_col = std::min(start_col + cols_per_thread, total_cols);
+
+    if (start_col >= end_col) return;
+
+    constexpr int UNROLL = 2;
+
+    const int q_start = std::max(0, start_col);
+    const int q_end = std::min(dim_q, end_col);
+    if (q_start < q_end) {
+        int oq = q_start;
+        for (; oq + UNROLL <= q_end; oq += UNROLL) {
+            q[oq + 0] = DotRow_NEON(x, w_q + (oq + 0) * n_embd, n_embd);
+            q[oq + 1] = DotRow_NEON(x, w_q + (oq + 1) * n_embd, n_embd);
+        }
+        for (; oq < q_end; oq++) {
+            q[oq] = DotRow_NEON(x, w_q + oq * n_embd, n_embd);
+        }
+    }
+
+    const int k_virt_start = dim_q;
+    const int k_start = std::max(0, start_col - k_virt_start);
+    const int k_end = std::min(dim_k, end_col - k_virt_start);
+    if (k_start < k_end) {
+        int ok = k_start;
+        for (; ok + UNROLL <= k_end; ok += UNROLL) {
+            k[ok + 0] = DotRow_NEON(x, w_k + (ok + 0) * n_embd, n_embd);
+            k[ok + 1] = DotRow_NEON(x, w_k + (ok + 1) * n_embd, n_embd);
+        }
+        for (; ok < k_end; ok++) {
+            k[ok] = DotRow_NEON(x, w_k + ok * n_embd, n_embd);
+        }
+    }
+
+    const int v_virt_start = dim_q + dim_k;
+    const int v_start = std::max(0, start_col - v_virt_start);
+    const int v_end = std::min(dim_v, end_col - v_virt_start);
+    if (v_start < v_end) {
+        int ov = v_start;
+        for (; ov + UNROLL <= v_end; ov += UNROLL) {
+            v[ov + 0] = DotRow_NEON(x, w_v + (ov + 0) * n_embd, n_embd);
+            v[ov + 1] = DotRow_NEON(x, w_v + (ov + 1) * n_embd, n_embd);
+        }
+        for (; ov < v_end; ov++) {
+            v[ov] = DotRow_NEON(x, w_v + ov * n_embd, n_embd);
+        }
+    }
+}
+
+#endif  // DENSECORE_ARM
+
 // =============================================================================
 // Unified Dispatch Wrappers
 // =============================================================================
@@ -3149,6 +4117,14 @@ inline void ComputeQKV(float* q, float* k, float* v, const float* x, const float
         ComputeQKV_AVX512(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v, ith, nth);
     } else if (HasX86Avx2OrBetter(level)) {
         ComputeQKV_AVX2(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v, ith, nth);
+#if defined(__ARM_FEATURE_SVE)
+    } else if (HasArmSveOrBetter(level)) {
+        ComputeQKV_SVE(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v, ith, nth);
+#endif
+#if defined(DENSECORE_ARM)
+    } else if (IsArmFamily(level)) {
+        ComputeQKV_NEON(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v, ith, nth);
+#endif
     } else {
         ComputeQKV_Scalar(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v, ith, nth);
     }

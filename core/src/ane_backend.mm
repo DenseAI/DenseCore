@@ -677,7 +677,7 @@ BackendCapabilityManifest ANEBackend::GetCapabilityManifest() const {
     // single CoreML graph, which is the recommended production path.
     manifest.fallback_ops = {
         OpType::Embedding,          // Table lookup — CPU
-        OpType::GemmInt4,           // Cached dequant + Metal GPU GEMM
+        OpType::GemmInt4,           // Fused Metal INT4 GEMM; cached FP32 fallback
         OpType::RMSNorm,            // Metal GPU or CPU Accelerate vDSP
         OpType::AddRMSNorm,         // Metal GPU or CPU Accelerate
         OpType::LayerNorm,          // CPU implementation
@@ -852,13 +852,12 @@ void ANEBackend::MatMulTransB(const Tensor& A, const Tensor& B, Tensor* C) {
 void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales,
                           const Tensor& zero_points, Tensor* C, int group_size) {
     // =========================================================================
-    // ANE INT4 GEMM FALLBACK: Cached Dequantize + Metal GPU
+    // ANE INT4 GEMM FALLBACK
     // =========================================================================
     // Apple Neural Engine does not natively support INT4 quantization.
     // Strategy:
-    // 1. Check LRU cache for pre-dequantized FP32 weights
-    // 2. On cache miss: dequantize and store in cache
-    // 3. Delegate to Metal GPU for FP32 GEMM
+    // 1. Prefer fused Metal grouped-INT4 GEMM (packed weights stay compressed)
+    // 2. Fall back to cached FP32 dequantization + Metal GEMM if unavailable
     // =========================================================================
 
     if (impl_->aneOnlyMode) {
@@ -894,6 +893,21 @@ void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
         std::cerr << "[ANEBackend] GemmInt4: K dimension mismatch (expected " << K_packed * 2
                   << ", got " << K << ")" << std::endl;
         throw std::runtime_error("[ANEBackend] INT4 weight dimension mismatch");
+    }
+
+    // Fast path: run the packed/grouped INT4 GEMM directly on Metal without
+    // materializing a dequantized FP32 weight matrix.
+    if (metal->GemmInt4Grouped(A, W, scales, zero_points, C, group_size)) {
+        impl_->MaybeSyncMetalFallback();
+
+        static bool warned_fused = false;
+        if (!warned_fused) {
+            std::cerr << "[ANEBackend] Note: INT4 GEMM using fused Metal grouped fallback. "
+                      << "Offline fused CoreML layers remain the preferred ANE path."
+                      << std::endl;
+            warned_fused = true;
+        }
+        return;
     }
 
     // =========================================================================
@@ -989,7 +1003,8 @@ void ANEBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
     static bool warned = false;
     if (!warned) {
         std::cerr << "[ANEBackend] Note: INT4 GEMM using cached Metal FP32 fallback. "
-                  << "For best performance, use FP16 models on Apple Silicon." << std::endl;
+                  << "Offline fused CoreML layers remain the preferred ANE path."
+                  << std::endl;
         warned = true;
     }
 }

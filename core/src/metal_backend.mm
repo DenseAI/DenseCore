@@ -66,6 +66,9 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> gemvQ4_0Pipeline = nil;
     id<MTLComputePipelineState> gemvQ4_1Pipeline = nil;
     id<MTLComputePipelineState> gemvQ8_0Pipeline = nil;
+    id<MTLComputePipelineState> gemmQ4_0FusedPipeline = nil;
+    id<MTLComputePipelineState> gemmQ4_1FusedPipeline = nil;
+    id<MTLComputePipelineState> gemmInt4GroupedFusedPipeline = nil;
 
     // Fused QKV pipeline state
     id<MTLComputePipelineState> fusedQKVPipeline = nil;
@@ -236,6 +239,9 @@ struct MetalBackend::Impl {
         gemvQ4_0Pipeline = nil;
         gemvQ4_1Pipeline = nil;
         gemvQ8_0Pipeline = nil;
+        gemmQ4_0FusedPipeline = nil;
+        gemmQ4_1FusedPipeline = nil;
+        gemmInt4GroupedFusedPipeline = nil;
         fusedQKVPipeline = nil;
         ropePipeline = nil;
         dequantizeQ4_0Pipeline = nil;
@@ -660,6 +666,8 @@ constant uint QK4_0 = 32;
 constant uint QK4_1 = 32;
 constant uint QK8_0 = 32;
 constant uint THREADGROUP_SIZE = 256;
+constant uint PREFILL_TILE_M = 8;
+constant uint PREFILL_TILE_N = 8;
 
 struct block_q4_0 {
     half scale;
@@ -821,6 +829,231 @@ kernel void gemv_q8_0(
 
     if (tid == 0) {
         output[row] = shared_sum[0];
+    }
+}
+
+// =============================================================================
+// Fused Q4 GEMM Kernels (for M>1 prefill)
+// =============================================================================
+// These kernels keep packed INT4 weights in their compressed form until the
+// dot-product stage. Each threadgroup cooperatively stages an activation tile
+// and a dequantized weight tile in threadgroup memory, avoiding the previous
+// global-memory FP32 expansion pass before GEMM.
+
+kernel void gemm_q4_0_fused(
+    device const float* input [[buffer(0)]],          // [M, K]
+    device const block_q4_0* weight [[buffer(1)]],    // [N, ceil(K / 32)]
+    device float* output [[buffer(2)]],               // [M, N]
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    const uint local_n = lid.x;
+    const uint local_m = lid.y;
+    const uint linear_tid = local_m * PREFILL_TILE_N + local_n;
+    const uint m = group_id.y * PREFILL_TILE_M + local_m;
+    const uint n = group_id.x * PREFILL_TILE_N + local_n;
+    const uint blocks_per_row = (K + QK4_0 - 1) / QK4_0;
+
+    threadgroup float a_tile[PREFILL_TILE_M][QK4_0];
+    threadgroup float w_tile[PREFILL_TILE_N][QK4_0];
+
+    float sum = 0.0f;
+
+    for (uint block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const uint k_start = block_idx * QK4_0;
+
+        for (uint idx = linear_tid; idx < PREFILL_TILE_M * QK4_0; idx += PREFILL_TILE_M * PREFILL_TILE_N) {
+            const uint tile_m = idx / QK4_0;
+            const uint tile_k = idx % QK4_0;
+            const uint global_m = group_id.y * PREFILL_TILE_M + tile_m;
+            const uint global_k = k_start + tile_k;
+            a_tile[tile_m][tile_k] =
+                (global_m < M && global_k < K) ? input[global_m * K + global_k] : 0.0f;
+        }
+
+        for (uint idx = linear_tid; idx < PREFILL_TILE_N * QK4_0; idx += PREFILL_TILE_M * PREFILL_TILE_N) {
+            const uint tile_n = idx / QK4_0;
+            const uint tile_k = idx % QK4_0;
+            const uint global_n = group_id.x * PREFILL_TILE_N + tile_n;
+            const uint global_k = k_start + tile_k;
+            float value = 0.0f;
+            if (global_n < N && global_k < K) {
+                device const block_q4_0* block = &weight[global_n * blocks_per_row + block_idx];
+                const uint8_t packed = block->quants[tile_k / 2];
+                value = float(extract_q4(packed, tile_k & 1)) * float(block->scale);
+            }
+            w_tile[tile_n][tile_k] = value;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (m < M && n < N) {
+            const uint k_limit = min(QK4_0, K - k_start);
+            for (uint kk = 0; kk < k_limit; ++kk) {
+                sum = fma(a_tile[local_m][kk], w_tile[local_n][kk], sum);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (m < M && n < N) {
+        output[m * N + n] = sum;
+    }
+}
+
+kernel void gemm_q4_1_fused(
+    device const float* input [[buffer(0)]],          // [M, K]
+    device const block_q4_1* weight [[buffer(1)]],    // [N, ceil(K / 32)]
+    device float* output [[buffer(2)]],               // [M, N]
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    const uint local_n = lid.x;
+    const uint local_m = lid.y;
+    const uint linear_tid = local_m * PREFILL_TILE_N + local_n;
+    const uint m = group_id.y * PREFILL_TILE_M + local_m;
+    const uint n = group_id.x * PREFILL_TILE_N + local_n;
+    const uint blocks_per_row = (K + QK4_1 - 1) / QK4_1;
+
+    threadgroup float a_tile[PREFILL_TILE_M][QK4_1];
+    threadgroup float w_tile[PREFILL_TILE_N][QK4_1];
+
+    float sum = 0.0f;
+
+    for (uint block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const uint k_start = block_idx * QK4_1;
+
+        for (uint idx = linear_tid; idx < PREFILL_TILE_M * QK4_1; idx += PREFILL_TILE_M * PREFILL_TILE_N) {
+            const uint tile_m = idx / QK4_1;
+            const uint tile_k = idx % QK4_1;
+            const uint global_m = group_id.y * PREFILL_TILE_M + tile_m;
+            const uint global_k = k_start + tile_k;
+            a_tile[tile_m][tile_k] =
+                (global_m < M && global_k < K) ? input[global_m * K + global_k] : 0.0f;
+        }
+
+        for (uint idx = linear_tid; idx < PREFILL_TILE_N * QK4_1; idx += PREFILL_TILE_M * PREFILL_TILE_N) {
+            const uint tile_n = idx / QK4_1;
+            const uint tile_k = idx % QK4_1;
+            const uint global_n = group_id.x * PREFILL_TILE_N + tile_n;
+            const uint global_k = k_start + tile_k;
+            float value = 0.0f;
+            if (global_n < N && global_k < K) {
+                device const block_q4_1* block = &weight[global_n * blocks_per_row + block_idx];
+                const uint8_t packed = block->quants[tile_k / 2];
+                value = float(extract_q4_unsigned(packed, tile_k & 1)) * float(block->scale) +
+                        float(block->min);
+            }
+            w_tile[tile_n][tile_k] = value;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (m < M && n < N) {
+            const uint k_limit = min(QK4_1, K - k_start);
+            for (uint kk = 0; kk < k_limit; ++kk) {
+                sum = fma(a_tile[local_m][kk], w_tile[local_n][kk], sum);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (m < M && n < N) {
+        output[m * N + n] = sum;
+    }
+}
+
+kernel void gemm_int4_grouped_fused(
+    device const float* input [[buffer(0)]],     // [M, K]
+    device const uchar* weights [[buffer(1)]],   // [N, K/2]
+    device const float* scales [[buffer(2)]],    // [N, K/group_size]
+    device const float* zeros [[buffer(3)]],     // [N, K/group_size] (optional)
+    device float* output [[buffer(4)]],          // [M, N]
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    constant uint& group_size [[buffer(8)]],
+    constant uint& has_zero_points [[buffer(9)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    if (group_size == 0) {
+        return;
+    }
+
+    const uint local_n = lid.x;
+    const uint local_m = lid.y;
+    const uint linear_tid = local_m * PREFILL_TILE_N + local_n;
+    const uint m = group_id.y * PREFILL_TILE_M + local_m;
+    const uint n = group_id.x * PREFILL_TILE_N + local_n;
+    const uint groups_per_row = K / group_size;
+    const uint k_packed = K / 2;
+
+    if (groups_per_row == 0 || k_packed == 0) {
+        return;
+    }
+
+    threadgroup float a_tile[PREFILL_TILE_M][QK4_0];
+    threadgroup float w_tile[PREFILL_TILE_N][QK4_0];
+
+    float sum = 0.0f;
+    const uint blocks_per_row = (K + QK4_0 - 1) / QK4_0;
+
+    for (uint block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const uint k_start = block_idx * QK4_0;
+
+        for (uint idx = linear_tid; idx < PREFILL_TILE_M * QK4_0; idx += PREFILL_TILE_M * PREFILL_TILE_N) {
+            const uint tile_m = idx / QK4_0;
+            const uint tile_k = idx % QK4_0;
+            const uint global_m = group_id.y * PREFILL_TILE_M + tile_m;
+            const uint global_k = k_start + tile_k;
+            a_tile[tile_m][tile_k] =
+                (global_m < M && global_k < K) ? input[global_m * K + global_k] : 0.0f;
+        }
+
+        for (uint idx = linear_tid; idx < PREFILL_TILE_N * QK4_0; idx += PREFILL_TILE_M * PREFILL_TILE_N) {
+            const uint tile_n = idx / QK4_0;
+            const uint tile_k = idx % QK4_0;
+            const uint global_n = group_id.x * PREFILL_TILE_N + tile_n;
+            const uint global_k = k_start + tile_k;
+            float value = 0.0f;
+            if (global_n < N && global_k < K) {
+                const uint byte_idx = global_n * k_packed + (global_k / 2);
+                const uchar packed = weights[byte_idx];
+                int q = (global_k & 1) ? int((packed >> 4) & 0x0F) : int(packed & 0x0F);
+                if (q > 7) {
+                    q -= 16;
+                }
+                const uint group_idx = min(global_k / group_size, groups_per_row - 1);
+                const uint qparam_idx = global_n * groups_per_row + group_idx;
+                const float zero = has_zero_points ? zeros[qparam_idx] : 0.0f;
+                value = scales[qparam_idx] * (float(q) - zero);
+            }
+            w_tile[tile_n][tile_k] = value;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (m < M && n < N) {
+            const uint k_limit = min(QK4_0, K - k_start);
+            for (uint kk = 0; kk < k_limit; ++kk) {
+                sum = fma(a_tile[local_m][kk], w_tile[local_n][kk], sum);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (m < M && n < N) {
+        output[m * N + n] = sum;
     }
 }
 
@@ -1867,11 +2100,44 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
                                                                  error:&error];
             }
 
+            id<MTLFunction> gemmQ4_0Function =
+                [quantizedGemvLib newFunctionWithName:@"gemm_q4_0_fused"];
+            if (gemmQ4_0Function) {
+                impl_->gemmQ4_0FusedPipeline =
+                    [impl_->device newComputePipelineStateWithFunction:gemmQ4_0Function
+                                                                 error:&error];
+            }
+
+            id<MTLFunction> gemmQ4_1Function =
+                [quantizedGemvLib newFunctionWithName:@"gemm_q4_1_fused"];
+            if (gemmQ4_1Function) {
+                impl_->gemmQ4_1FusedPipeline =
+                    [impl_->device newComputePipelineStateWithFunction:gemmQ4_1Function
+                                                                 error:&error];
+            }
+
+            id<MTLFunction> gemmInt4GroupedFunction =
+                [quantizedGemvLib newFunctionWithName:@"gemm_int4_grouped_fused"];
+            if (gemmInt4GroupedFunction) {
+                impl_->gemmInt4GroupedFusedPipeline =
+                    [impl_->device newComputePipelineStateWithFunction:gemmInt4GroupedFunction
+                                                                 error:&error];
+            }
+
             if (impl_->gemvQ4_0Pipeline || impl_->gemvQ4_1Pipeline || impl_->gemvQ8_0Pipeline) {
                 std::cout << "[MetalBackend] Quantized GEMV kernels compiled: "
                           << (impl_->gemvQ4_0Pipeline ? "Q4_0 " : "")
                           << (impl_->gemvQ4_1Pipeline ? "Q4_1 " : "")
                           << (impl_->gemvQ8_0Pipeline ? "Q8_0 " : "") << std::endl;
+            }
+
+            if (impl_->gemmQ4_0FusedPipeline || impl_->gemmQ4_1FusedPipeline ||
+                impl_->gemmInt4GroupedFusedPipeline) {
+                std::cout << "[MetalBackend] Fused INT4 GEMM kernels compiled: "
+                          << (impl_->gemmQ4_0FusedPipeline ? "Q4_0 " : "")
+                          << (impl_->gemmQ4_1FusedPipeline ? "Q4_1 " : "")
+                          << (impl_->gemmInt4GroupedFusedPipeline ? "INT4_GROUPED " : "")
+                          << std::endl;
             }
 
             // Compile dequantization kernel for M>1 GEMM path
@@ -2426,7 +2692,46 @@ void MetalBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scal
         }
     }
 
-    // Prefill (M > 1): Use GPU dequantization + MPS GEMM
+    // Prefill (M > 1): Prefer fused GPU INT4 GEMM to avoid a global FP32
+    // dequantization pass before GEMM.
+    @autoreleasepool {
+        id<MTLComputePipelineState> fusedPipeline =
+            use_q4_1 ? impl_->gemmQ4_1FusedPipeline : impl_->gemmQ4_0FusedPipeline;
+        if (fusedPipeline) {
+            id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
+            id<MTLBuffer> bufferA = impl_->GetOrWrapBuffer(const_cast<void*>(A.data), A.SizeBytes());
+            id<MTLBuffer> bufferW = impl_->GetOrWrapBuffer(const_cast<void*>(W.data), W.SizeBytes());
+            id<MTLBuffer> bufferC = impl_->GetOrWrapBuffer(C->data, C->SizeBytes());
+
+            if (commandBuffer && bufferA && bufferW && bufferC) {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                if (encoder) {
+                    [encoder setComputePipelineState:fusedPipeline];
+                    [encoder setBuffer:bufferA offset:0 atIndex:0];
+                    [encoder setBuffer:bufferW offset:0 atIndex:1];
+                    [encoder setBuffer:bufferC offset:0 atIndex:2];
+
+                    uint M_u = static_cast<uint>(M);
+                    uint N_u = static_cast<uint>(N);
+                    uint K_u = static_cast<uint>(K);
+                    [encoder setBytes:&M_u length:sizeof(uint) atIndex:3];
+                    [encoder setBytes:&N_u length:sizeof(uint) atIndex:4];
+                    [encoder setBytes:&K_u length:sizeof(uint) atIndex:5];
+
+                    const MTLSize threadgroupSize = MTLSizeMake(8, 8, 1);
+                    const MTLSize gridSize =
+                        MTLSizeMake((static_cast<NSUInteger>(N) + 7) / 8,
+                                    (static_cast<NSUInteger>(M) + 7) / 8, 1);
+                    [encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSize];
+                    [encoder endEncoding];
+                    [commandBuffer commit];
+                    return;
+                }
+            }
+        }
+    }
+
+    // Fallback prefill path: GPU dequantization + MPS GEMM
     @autoreleasepool {
         id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
 
@@ -3253,6 +3558,79 @@ void MetalBackend::DisableGPUCapture() {
             [[MTLCaptureManager sharedCaptureManager] stopCapture];
             impl_->captureEnabled = false;
         }
+    }
+}
+
+bool MetalBackend::GemmInt4Grouped(const Tensor& A, const Tensor& W, const Tensor& scales,
+                                   const Tensor& zero_points, Tensor* C, int group_size) {
+    if (!A.IsValid() || !W.IsValid() || !scales.IsValid() || !C || !C->IsValid() ||
+        group_size <= 0) {
+        return false;
+    }
+
+    const int64_t M = A.shape[0];
+    const int64_t K = A.shape[1];
+    const int64_t N = W.shape[0];
+    const bool has_zero_points = zero_points.IsValid() && zero_points.NumElements() > 0;
+
+    if (M <= 0 || N <= 0 || K <= 0 || (K % 2) != 0 || (K % group_size) != 0) {
+        return false;
+    }
+    if (!impl_->gemmInt4GroupedFusedPipeline) {
+        return false;
+    }
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
+        if (!commandBuffer) {
+            return false;
+        }
+
+        id<MTLBuffer> bufferA = impl_->GetOrWrapBuffer(const_cast<void*>(A.data), A.SizeBytes());
+        id<MTLBuffer> bufferW = impl_->GetOrWrapBuffer(const_cast<void*>(W.data), W.SizeBytes());
+        id<MTLBuffer> bufferScales =
+            impl_->GetOrWrapBuffer(const_cast<void*>(scales.data), scales.SizeBytes());
+        id<MTLBuffer> bufferZeros = has_zero_points
+                                        ? impl_->GetOrWrapBuffer(const_cast<void*>(zero_points.data),
+                                                                 zero_points.SizeBytes())
+                                        : bufferScales;
+        id<MTLBuffer> bufferC = impl_->GetOrWrapBuffer(C->data, C->SizeBytes());
+
+        if (!bufferA || !bufferW || !bufferScales || !bufferZeros || !bufferC) {
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        if (!encoder) {
+            return false;
+        }
+
+        [encoder setComputePipelineState:impl_->gemmInt4GroupedFusedPipeline];
+        [encoder setBuffer:bufferA offset:0 atIndex:0];
+        [encoder setBuffer:bufferW offset:0 atIndex:1];
+        [encoder setBuffer:bufferScales offset:0 atIndex:2];
+        [encoder setBuffer:bufferZeros offset:0 atIndex:3];
+        [encoder setBuffer:bufferC offset:0 atIndex:4];
+
+        uint M_u = static_cast<uint>(M);
+        uint N_u = static_cast<uint>(N);
+        uint K_u = static_cast<uint>(K);
+        uint group_size_u = static_cast<uint>(group_size);
+        uint has_zero_points_u = has_zero_points ? 1u : 0u;
+        [encoder setBytes:&M_u length:sizeof(uint) atIndex:5];
+        [encoder setBytes:&N_u length:sizeof(uint) atIndex:6];
+        [encoder setBytes:&K_u length:sizeof(uint) atIndex:7];
+        [encoder setBytes:&group_size_u length:sizeof(uint) atIndex:8];
+        [encoder setBytes:&has_zero_points_u length:sizeof(uint) atIndex:9];
+
+        const MTLSize threadgroupSize = MTLSizeMake(8, 8, 1);
+        const MTLSize gridSize =
+            MTLSizeMake((static_cast<NSUInteger>(N) + 7) / 8,
+                        (static_cast<NSUInteger>(M) + 7) / 8, 1);
+        [encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSize];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        return true;
     }
 }
 
