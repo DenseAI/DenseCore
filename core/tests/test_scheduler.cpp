@@ -92,21 +92,23 @@ TEST(SchedulerArchitecture, MixedPrefillDecodeCanBeEnabledWithBoundedPrefillChun
     SchedulerConfig cfg = MakeTestConfig();
     cfg.enable_chunked_prefill = true;
     cfg.enable_mixed_prefill_decode = true;
-    cfg.max_prefill_tokens = 16;
+    cfg.max_prefill_tokens = 4;
     cfg.max_mixed_prefill_tokens = 4;
 
     BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
     Scheduler scheduler(&block_manager, cfg);
 
-    const int seq_running = scheduler.AddRequest(/*request_id=*/100, /*prompt_len=*/16, /*max_output_len=*/64);
+    const int seq_running = scheduler.AddRequest(/*request_id=*/100, /*prompt_len=*/4, /*max_output_len=*/64);
+    const int seq_waiting = scheduler.AddRequest(/*request_id=*/101, /*prompt_len=*/12, /*max_output_len=*/64);
     ASSERT_GT(seq_running, 0);
+    ASSERT_GT(seq_waiting, 0);
 
     SchedulerOutput first = scheduler.Schedule();
-    ASSERT_EQ(first.prefill_seq_ids.size(), 1u);
-    scheduler.UpdateProgress(seq_running, 16);
-
-    const int seq_waiting = scheduler.AddRequest(/*request_id=*/101, /*prompt_len=*/20, /*max_output_len=*/64);
-    ASSERT_GT(seq_waiting, 0);
+    ASSERT_EQ(first.prefill_seq_ids.size(), 2u);
+    ASSERT_EQ(first.prefill_chunk_info.size(), 2u);
+    for (const auto& chunk : first.prefill_chunk_info) {
+        scheduler.UpdateProgress(chunk.seq_id, chunk.chunk_tokens);
+    }
 
     SchedulerOutput mixed = scheduler.Schedule();
     EXPECT_EQ(mixed.decode_seq_ids.size(), 1u);
@@ -114,6 +116,7 @@ TEST(SchedulerArchitecture, MixedPrefillDecodeCanBeEnabledWithBoundedPrefillChun
     ASSERT_EQ(mixed.prefill_chunk_info.size(), 1u);
     EXPECT_EQ(mixed.prefill_chunk_info[0].seq_id, seq_waiting);
     EXPECT_EQ(mixed.prefill_chunk_info[0].chunk_tokens, 4);
+    EXPECT_EQ(mixed.batch_context_len, 4);
 }
 
 TEST(SchedulerArchitecture, MixedPrefillDecodeDefersNonChunkablePromptBeyondMixedCap) {
@@ -184,6 +187,32 @@ TEST(SchedulerArchitecture, MixedPrefillDecodeRequiresHomogeneousDecodeContext) 
     SchedulerOutput mixed_check = scheduler.Schedule();
     EXPECT_EQ(mixed_check.decode_seq_ids.size(), 2u);
     EXPECT_TRUE(mixed_check.prefill_seq_ids.empty());
+}
+
+TEST(SchedulerArchitecture, MixedPrefillDecodeDefersWaitingPrefillWithMismatchedContext) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = true;
+    cfg.enable_mixed_prefill_decode = true;
+    cfg.max_prefill_tokens = 16;
+    cfg.max_mixed_prefill_tokens = 4;
+
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    const int seq_running = scheduler.AddRequest(/*request_id=*/112, /*prompt_len=*/16, /*max_output_len=*/64);
+    ASSERT_GT(seq_running, 0);
+
+    SchedulerOutput first = scheduler.Schedule();
+    ASSERT_EQ(first.prefill_seq_ids.size(), 1u);
+    scheduler.UpdateProgress(seq_running, 16);
+
+    const int seq_waiting = scheduler.AddRequest(/*request_id=*/113, /*prompt_len=*/20, /*max_output_len=*/64);
+    ASSERT_GT(seq_waiting, 0);
+
+    SchedulerOutput mixed = scheduler.Schedule();
+    EXPECT_EQ(mixed.decode_seq_ids.size(), 1u);
+    EXPECT_TRUE(mixed.prefill_seq_ids.empty());
+    EXPECT_EQ(mixed.batch_context_len, 16);
 }
 
 TEST(SchedulerArchitecture, DecodeBatchUsesSingleContextBucket) {

@@ -48,9 +48,21 @@ enum class EngineStatus {
     STOPPED    // Fully stopped, ready for cleanup
 };
 
+struct KVCacheConfig {
+    int max_num_seqs = 4;
+    int max_seq_len = 4096;
+    size_t target_kv_memory = 512ULL * 1024ULL * 1024ULL;
+    size_t bytes_per_token = 0;
+    ggml_type requested_cache_type = GGML_TYPE_F16;
+    ggml_type effective_cache_type = GGML_TYPE_F16;
+};
+
 void SetLastError(DenseCoreStatus status, const std::string& message);
 void ClearLastError();
 DenseCoreStatus MapErrorCodeToStatus(densecore::ErrorCode code);
+ggml_type ResolveEffectiveKVCacheType(const TransformerModel* model, ggml_type requested_cache_type);
+size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int head_dim, int n_head_kv, int n_layer);
+KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type);
 
 struct EngineState;
 void PushResultEvent(EngineState* state, int request_id, const std::string& token, int token_id, bool finished,

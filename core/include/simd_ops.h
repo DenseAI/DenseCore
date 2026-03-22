@@ -478,6 +478,19 @@ inline bool HasArmSve2(SimdLevel level) {
     return level == SimdLevel::SVE2;
 }
 
+inline SimdLevel GetCachedSimdLevel() {
+    static const SimdLevel level = DetectSimdLevel();
+    return level;
+}
+
+inline bool RuntimeHasArmSveOrBetter() {
+#if defined(__ARM_FEATURE_SVE)
+    return HasArmSveOrBetter(GetCachedSimdLevel());
+#else
+    return false;
+#endif
+}
+
 // =============================================================================
 // Thread Affinity & NUMA Topology
 // =============================================================================
@@ -659,6 +672,135 @@ inline void PrefetchWrite(void* ptr) {
 // SIMD Copy Operations
 // =============================================================================
 
+#if defined(__ARM_FEATURE_SVE)
+inline void SimdCopy_SVE(void* dst, const void* src, size_t bytes) {
+    const uint8_t* s = reinterpret_cast<const uint8_t*>(src);
+    uint8_t* d = reinterpret_cast<uint8_t*>(dst);
+    size_t i = 0;
+    const uint64_t vl8 = svcntb();
+    for (; i + vl8 <= bytes; i += vl8) {
+        svuint8_t v = svld1_u8(svptrue_b8(), s + i);
+        svst1_u8(svptrue_b8(), d + i, v);
+    }
+    if (i < bytes) {
+        svbool_t pg = svwhilelt_b8_u64(0UL, static_cast<uint64_t>(bytes - i));
+        svuint8_t v = svld1_u8(pg, s + i);
+        svst1_u8(pg, d + i, v);
+    }
+}
+
+inline void ScaleF32_SVE(float* dst, const float* src, float scale, size_t n) {
+    const svfloat32_t vscale = svdup_f32(scale);
+    size_t i = 0;
+    const uint64_t vl = svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t v = svld1_f32(svptrue_b32(), src + i);
+        v = svmul_f32_x(svptrue_b32(), v, vscale);
+        svst1_f32(svptrue_b32(), dst + i, v);
+    }
+    if (i < n) {
+        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
+        svfloat32_t v = svld1_f32(pg, src + i);
+        v = svmul_f32_x(pg, v, vscale);
+        svst1_f32(pg, dst + i, v);
+    }
+}
+
+inline void AddF32_SVE(float* dst, const float* a, const float* b, size_t n) {
+    size_t i = 0;
+    const uint64_t vl = svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t va = svld1_f32(svptrue_b32(), a + i);
+        svfloat32_t vb = svld1_f32(svptrue_b32(), b + i);
+        svst1_f32(svptrue_b32(), dst + i, svadd_f32_x(svptrue_b32(), va, vb));
+    }
+    if (i < n) {
+        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
+        svfloat32_t va = svld1_f32(pg, a + i);
+        svfloat32_t vb = svld1_f32(pg, b + i);
+        svst1_f32(pg, dst + i, svadd_f32_x(pg, va, vb));
+    }
+}
+
+inline float DotF32_SVE(const float* a, const float* b, size_t n) {
+    svfloat32_t sum = svdup_f32(0.0f);
+    size_t i = 0;
+    const uint64_t vl = svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t va = svld1_f32(svptrue_b32(), a + i);
+        svfloat32_t vb = svld1_f32(svptrue_b32(), b + i);
+        sum = svmla_f32_x(svptrue_b32(), sum, va, vb);
+    }
+    if (i < n) {
+        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
+        svfloat32_t va = svld1_f32(pg, a + i);
+        svfloat32_t vb = svld1_f32(pg, b + i);
+        sum = svmla_f32_m(pg, sum, va, vb);
+    }
+    return svaddv_f32(svptrue_b32(), sum);
+}
+
+inline float MaxF32_SVE(const float* a, size_t n) {
+    svfloat32_t vmax = svdup_f32(-1e30f);
+    size_t i = 0;
+    const uint64_t vl = svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t v = svld1_f32(svptrue_b32(), a + i);
+        vmax = svmax_f32_x(svptrue_b32(), vmax, v);
+    }
+    if (i < n) {
+        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
+        svfloat32_t v = svld1_f32(pg, a + i);
+        vmax = svmax_f32_m(pg, vmax, v);
+    }
+    return svmaxv_f32(svptrue_b32(), vmax);
+}
+
+inline float SumF32_SVE(const float* a, size_t n) {
+    svfloat32_t sum = svdup_f32(0.0f);
+    size_t i = 0;
+    const uint64_t vl = svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t v = svld1_f32(svptrue_b32(), a + i);
+        sum = svadd_f32_x(svptrue_b32(), sum, v);
+    }
+    if (i < n) {
+        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
+        svfloat32_t v = svld1_f32(pg, a + i);
+        sum = svadd_f32_m(pg, sum, v);
+    }
+    return svaddv_f32(svptrue_b32(), sum);
+}
+
+inline void MeanPool_SVE(const float* input, float* output, int seq_len, int hidden_dim) {
+    const uint64_t vl = svcntw();
+    const svfloat32_t vdiv = svdup_f32(1.0f / seq_len);
+    for (int d = 0; d < hidden_dim; d += static_cast<int>(vl)) {
+        svbool_t pg = svwhilelt_b32_s32(d, hidden_dim);
+        svfloat32_t sum = svdup_f32(0.0f);
+        for (int s = 0; s < seq_len; s++) {
+            svfloat32_t v = svld1_f32(pg, input + s * hidden_dim + d);
+            sum = svadd_f32_m(pg, sum, v);
+        }
+        sum = svmul_f32_x(pg, sum, vdiv);
+        svst1_f32(pg, output + d, sum);
+    }
+}
+
+inline void MaxPool_SVE(const float* input, float* output, int seq_len, int hidden_dim) {
+    const uint64_t vl = svcntw();
+    for (int d = 0; d < hidden_dim; d += static_cast<int>(vl)) {
+        svbool_t pg = svwhilelt_b32_s32(d, hidden_dim);
+        svfloat32_t vmax = svld1_f32(pg, input + d);
+        for (int s = 1; s < seq_len; s++) {
+            svfloat32_t v = svld1_f32(pg, input + s * hidden_dim + d);
+            vmax = svmax_f32_m(pg, vmax, v);
+        }
+        svst1_f32(pg, output + d, vmax);
+    }
+}
+#endif
+
 /**
  * Fast memory copy using SIMD (aligned or unaligned)
  */
@@ -697,22 +839,13 @@ inline void SimdCopy(void* dst, const void* src, size_t bytes) {
     if (i < bytes) {
         memcpy(reinterpret_cast<char*>(dst) + i, reinterpret_cast<const char*>(src) + i, bytes - i);
     }
-#elif defined(__ARM_FEATURE_SVE)
-    // SVE: scalable vector copy
-    const uint8_t* s = reinterpret_cast<const uint8_t*>(src);
-    uint8_t* d = reinterpret_cast<uint8_t*>(dst);
-    size_t i = 0;
-    const uint64_t vl8 = svcntb();  // bytes per SVE vector
-    for (; i + vl8 <= bytes; i += vl8) {
-        svuint8_t v = svld1_u8(svptrue_b8(), s + i);
-        svst1_u8(svptrue_b8(), d + i, v);
-    }
-    if (i < bytes) {
-        svbool_t pg = svwhilelt_b8_u64(0UL, static_cast<uint64_t>(bytes - i));
-        svuint8_t v = svld1_u8(pg, s + i);
-        svst1_u8(pg, d + i, v);
-    }
 #elif defined(DENSECORE_ARM)
+    if (RuntimeHasArmSveOrBetter()) {
+#if defined(__ARM_FEATURE_SVE)
+        SimdCopy_SVE(dst, src, bytes);
+        return;
+#endif
+    }
     // NEON: 16 bytes per iteration
     const size_t vec_size = 16;
     size_t i = 0;
@@ -756,22 +889,13 @@ inline void ScaleF32(float* dst, const float* src, float scale, size_t n) {
     for (; i < n; i++) {
         dst[i] = src[i] * scale;
     }
-#elif defined(__ARM_FEATURE_SVE)
-    svfloat32_t vscale = svdup_f32(scale);
-    size_t i = 0;
-    const uint64_t vl = svcntw();
-    for (; i + vl <= n; i += vl) {
-        svfloat32_t v = svld1_f32(svptrue_b32(), src + i);
-        v = svmul_f32_x(svptrue_b32(), v, vscale);
-        svst1_f32(svptrue_b32(), dst + i, v);
-    }
-    if (i < n) {
-        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
-        svfloat32_t v = svld1_f32(pg, src + i);
-        v = svmul_f32_x(pg, v, vscale);
-        svst1_f32(pg, dst + i, v);
-    }
 #elif defined(DENSECORE_ARM)
+    if (RuntimeHasArmSveOrBetter()) {
+#if defined(__ARM_FEATURE_SVE)
+        ScaleF32_SVE(dst, src, scale, n);
+        return;
+#endif
+    }
     float32x4_t vscale = vdupq_n_f32(scale);
     size_t i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -804,21 +928,13 @@ inline void AddF32(float* dst, const float* a, const float* b, size_t n) {
     for (; i < n; i++) {
         dst[i] = a[i] + b[i];
     }
-#elif defined(__ARM_FEATURE_SVE)
-    size_t i = 0;
-    const uint64_t vl = svcntw();
-    for (; i + vl <= n; i += vl) {
-        svfloat32_t va = svld1_f32(svptrue_b32(), a + i);
-        svfloat32_t vb = svld1_f32(svptrue_b32(), b + i);
-        svst1_f32(svptrue_b32(), dst + i, svadd_f32_x(svptrue_b32(), va, vb));
-    }
-    if (i < n) {
-        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
-        svfloat32_t va = svld1_f32(pg, a + i);
-        svfloat32_t vb = svld1_f32(pg, b + i);
-        svst1_f32(pg, dst + i, svadd_f32_x(pg, va, vb));
-    }
 #elif defined(DENSECORE_ARM)
+    if (RuntimeHasArmSveOrBetter()) {
+#if defined(__ARM_FEATURE_SVE)
+        AddF32_SVE(dst, a, b, n);
+        return;
+#endif
+    }
     size_t i = 0;
     for (; i + 4 <= n; i += 4) {
         float32x4_t va = vld1q_f32(a + i);
@@ -882,23 +998,12 @@ inline float DotF32(const float* a, const float* b, size_t n) {
         result += a[i] * b[i];
     }
     return result;
-#elif defined(__ARM_FEATURE_SVE)
-    svfloat32_t sum = svdup_f32(0.0f);
-    size_t i = 0;
-    const uint64_t vl = svcntw();
-    for (; i + vl <= n; i += vl) {
-        svfloat32_t va = svld1_f32(svptrue_b32(), a + i);
-        svfloat32_t vb = svld1_f32(svptrue_b32(), b + i);
-        sum = svmla_f32_x(svptrue_b32(), sum, va, vb);
-    }
-    if (i < n) {
-        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
-        svfloat32_t va = svld1_f32(pg, a + i);
-        svfloat32_t vb = svld1_f32(pg, b + i);
-        sum = svmla_f32_m(pg, sum, va, vb);
-    }
-    return svaddv_f32(svptrue_b32(), sum);
 #elif defined(DENSECORE_ARM)
+    if (RuntimeHasArmSveOrBetter()) {
+#if defined(__ARM_FEATURE_SVE)
+        return DotF32_SVE(a, b, n);
+#endif
+    }
     float32x4_t sum = vdupq_n_f32(0.0f);
     size_t i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -944,21 +1049,12 @@ inline float MaxF32(const float* a, size_t n) {
         if (a[i] > result) result = a[i];
     }
     return result;
-#elif defined(__ARM_FEATURE_SVE)
-    svfloat32_t vmax = svdup_f32(-1e30f);
-    size_t i = 0;
-    const uint64_t vl = svcntw();
-    for (; i + vl <= n; i += vl) {
-        svfloat32_t v = svld1_f32(svptrue_b32(), a + i);
-        vmax = svmax_f32_x(svptrue_b32(), vmax, v);
-    }
-    if (i < n) {
-        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
-        svfloat32_t v = svld1_f32(pg, a + i);
-        vmax = svmax_f32_m(pg, vmax, v);
-    }
-    return svmaxv_f32(svptrue_b32(), vmax);
 #elif defined(DENSECORE_ARM)
+    if (RuntimeHasArmSveOrBetter()) {
+#if defined(__ARM_FEATURE_SVE)
+        return MaxF32_SVE(a, n);
+#endif
+    }
     float32x4_t vmax = vdupq_n_f32(-1e30f);
     size_t i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -1001,21 +1097,12 @@ inline float SumF32(const float* a, size_t n) {
         result += a[i];
     }
     return result;
-#elif defined(__ARM_FEATURE_SVE)
-    svfloat32_t sum = svdup_f32(0.0f);
-    size_t i = 0;
-    const uint64_t vl = svcntw();
-    for (; i + vl <= n; i += vl) {
-        svfloat32_t v = svld1_f32(svptrue_b32(), a + i);
-        sum = svadd_f32_x(svptrue_b32(), sum, v);
-    }
-    if (i < n) {
-        svbool_t pg = svwhilelt_b32_u64(0UL, static_cast<uint64_t>(n - i));
-        svfloat32_t v = svld1_f32(pg, a + i);
-        sum = svadd_f32_m(pg, sum, v);
-    }
-    return svaddv_f32(svptrue_b32(), sum);
 #elif defined(DENSECORE_ARM)
+    if (RuntimeHasArmSveOrBetter()) {
+#if defined(__ARM_FEATURE_SVE)
+        return SumF32_SVE(a, n);
+#endif
+    }
     float32x4_t sum = vdupq_n_f32(0.0f);
     size_t i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -1154,20 +1241,13 @@ inline void MeanPool(const float* input, float* output, int seq_len, int hidden_
             break;
         }
     }
-#elif defined(__ARM_FEATURE_SVE)
-    const uint64_t vl = svcntw();
-    const svfloat32_t vdiv = svdup_f32(1.0f / seq_len);
-    for (int d = 0; d < hidden_dim; d += static_cast<int>(vl)) {
-        svbool_t pg = svwhilelt_b32_s32(d, hidden_dim);
-        svfloat32_t sum = svdup_f32(0.0f);
-        for (int s = 0; s < seq_len; s++) {
-            svfloat32_t v = svld1_f32(pg, input + s * hidden_dim + d);
-            sum = svadd_f32_m(pg, sum, v);
-        }
-        sum = svmul_f32_x(pg, sum, vdiv);
-        svst1_f32(pg, output + d, sum);
-    }
 #elif defined(DENSECORE_ARM)
+    if (RuntimeHasArmSveOrBetter()) {
+#if defined(__ARM_FEATURE_SVE)
+        MeanPool_SVE(input, output, seq_len, hidden_dim);
+        return;
+#endif
+    }
     for (int d = 0; d < hidden_dim; d += 4) {
         int remaining = (d + 4 <= hidden_dim) ? 4 : hidden_dim - d;
         if (remaining == 4) {
@@ -1259,18 +1339,13 @@ inline void MaxPool(const float* input, float* output, int seq_len, int hidden_d
             break;
         }
     }
-#elif defined(__ARM_FEATURE_SVE)
-    const uint64_t vl = svcntw();
-    for (int d = 0; d < hidden_dim; d += static_cast<int>(vl)) {
-        svbool_t pg = svwhilelt_b32_s32(d, hidden_dim);
-        svfloat32_t vmax = svld1_f32(pg, input + d);
-        for (int s = 1; s < seq_len; s++) {
-            svfloat32_t v = svld1_f32(pg, input + s * hidden_dim + d);
-            vmax = svmax_f32_m(pg, vmax, v);
-        }
-        svst1_f32(pg, output + d, vmax);
-    }
 #elif defined(DENSECORE_ARM)
+    if (RuntimeHasArmSveOrBetter()) {
+#if defined(__ARM_FEATURE_SVE)
+        MaxPool_SVE(input, output, seq_len, hidden_dim);
+        return;
+#endif
+    }
     for (int d = 0; d < hidden_dim; d += 4) {
         int remaining = (d + 4 <= hidden_dim) ? 4 : hidden_dim - d;
         if (remaining == 4) {
@@ -2512,6 +2587,176 @@ inline void GemmInt4Fp32Batched_SVE(float* C, const float* A, const uint8_t* W_i
 
 #if defined(DENSECORE_ARM)
 
+#if defined(__ARM_FEATURE_DOTPROD)
+inline bool UseNeonInt4DotProdApprox() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_ARM_INT4_DOTPROD");
+        return env && std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
+    }();
+    return enabled;
+}
+
+inline int8x16_t UnpackInt4x16ToInt8_NEON_DotProd(const uint8_t* w_ptr) {
+    const uint8x8_t packed = vld1_u8(w_ptr);
+    const uint8x8_t lo = vand_u8(packed, vdup_n_u8(0x0F));
+    const uint8x8_t hi = vshr_n_u8(packed, 4);
+    const uint8x8_t interleaved_lo = vzip1_u8(lo, hi);
+    const uint8x8_t interleaved_hi = vzip2_u8(lo, hi);
+    const uint8x16_t qu = vcombine_u8(interleaved_lo, interleaved_hi);
+    return vreinterpretq_s8_u8(vsubq_u8(qu, vdupq_n_u8(8)));
+}
+
+inline int8x16_t QuantizeF32x16ToI8_NEON_DotProd(const float* a, float* out_scale, float* out_sum) {
+    const float32x4_t a0 = vld1q_f32(a + 0);
+    const float32x4_t a1 = vld1q_f32(a + 4);
+    const float32x4_t a2 = vld1q_f32(a + 8);
+    const float32x4_t a3 = vld1q_f32(a + 12);
+
+    const float sum_a =
+        vaddvq_f32(a0) + vaddvq_f32(a1) + vaddvq_f32(a2) + vaddvq_f32(a3);
+    if (out_sum) {
+        *out_sum = sum_a;
+    }
+
+    const float32x4_t abs0 = vabsq_f32(a0);
+    const float32x4_t abs1 = vabsq_f32(a1);
+    const float32x4_t abs2 = vabsq_f32(a2);
+    const float32x4_t abs3 = vabsq_f32(a3);
+    const float32x4_t max01 = vmaxq_f32(abs0, abs1);
+    const float32x4_t max23 = vmaxq_f32(abs2, abs3);
+    const float32x4_t maxv = vmaxq_f32(max01, max23);
+    const float max_abs = std::max(std::max(vgetq_lane_f32(maxv, 0), vgetq_lane_f32(maxv, 1)),
+                                   std::max(vgetq_lane_f32(maxv, 2), vgetq_lane_f32(maxv, 3)));
+
+    if (max_abs < 1e-12f) {
+        if (out_scale) {
+            *out_scale = 0.0f;
+        }
+        return vdupq_n_s8(0);
+    }
+
+    const float a_scale = max_abs / 127.0f;
+    if (out_scale) {
+        *out_scale = a_scale;
+    }
+    const float32x4_t inv_scale = vdupq_n_f32(127.0f / max_abs);
+
+    const int32x4_t q0 = vcvtnq_s32_f32(vmulq_f32(a0, inv_scale));
+    const int32x4_t q1 = vcvtnq_s32_f32(vmulq_f32(a1, inv_scale));
+    const int32x4_t q2 = vcvtnq_s32_f32(vmulq_f32(a2, inv_scale));
+    const int32x4_t q3 = vcvtnq_s32_f32(vmulq_f32(a3, inv_scale));
+
+    const int16x8_t q01 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+    const int16x8_t q23 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
+    return vcombine_s8(vqmovn_s16(q01), vqmovn_s16(q23));
+}
+
+inline float DotProdApproxF32Q4_16_NEON(const float* a, const uint8_t* w_ptr, float scale, float zero) {
+    float a_scale = 0.0f;
+    float sum_a = 0.0f;
+    const int8x16_t qa = QuantizeF32x16ToI8_NEON_DotProd(a, &a_scale, &sum_a);
+    if (a_scale == 0.0f) {
+        return 0.0f;
+    }
+
+    const int8x16_t qw = UnpackInt4x16ToInt8_NEON_DotProd(w_ptr);
+    int32x4_t acc = vdupq_n_s32(0);
+    acc = vdotq_s32(acc, qa, qw);
+    const float dot_q = static_cast<float>(vaddvq_s32(acc));
+    return scale * (a_scale * dot_q - zero * sum_a);
+}
+
+inline void GemmInt4Fp32_NEON_DotProdApprox(float* C, const float* A, const uint8_t* W_int4, const float* scales,
+                                            const float* zero_points, int M, int N, int K, int group_size) {
+    if (K % group_size != 0) return;
+
+    const int num_groups = K / group_size;
+    const int packed_K = K / 2;
+
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = A + m * K;
+
+        int n = 0;
+        for (; n + 4 <= N; n += 4) {
+            float acc0 = 0.0f;
+            float acc1 = 0.0f;
+            float acc2 = 0.0f;
+            float acc3 = 0.0f;
+
+            for (int g = 0; g < num_groups; ++g) {
+                const int k_offset = g * group_size;
+                const float* a_ptr = a_row + k_offset;
+                const float z0 = zero_points ? zero_points[(n + 0) * num_groups + g] : 0.0f;
+                const float z1 = zero_points ? zero_points[(n + 1) * num_groups + g] : 0.0f;
+                const float z2 = zero_points ? zero_points[(n + 2) * num_groups + g] : 0.0f;
+                const float z3 = zero_points ? zero_points[(n + 3) * num_groups + g] : 0.0f;
+                const float s0 = scales[(n + 0) * num_groups + g];
+                const float s1 = scales[(n + 1) * num_groups + g];
+                const float s2 = scales[(n + 2) * num_groups + g];
+                const float s3 = scales[(n + 3) * num_groups + g];
+                const uint8_t* w0 = W_int4 + (n + 0) * packed_K + g * (group_size / 2);
+                const uint8_t* w1 = W_int4 + (n + 1) * packed_K + g * (group_size / 2);
+                const uint8_t* w2 = W_int4 + (n + 2) * packed_K + g * (group_size / 2);
+                const uint8_t* w3 = W_int4 + (n + 3) * packed_K + g * (group_size / 2);
+
+                int k = 0;
+                for (; k + 16 <= group_size; k += 16) {
+                    acc0 += DotProdApproxF32Q4_16_NEON(a_ptr + k, w0 + k / 2, s0, z0);
+                    acc1 += DotProdApproxF32Q4_16_NEON(a_ptr + k, w1 + k / 2, s1, z1);
+                    acc2 += DotProdApproxF32Q4_16_NEON(a_ptr + k, w2 + k / 2, s2, z2);
+                    acc3 += DotProdApproxF32Q4_16_NEON(a_ptr + k, w3 + k / 2, s3, z3);
+                }
+                for (; k < group_size; ++k) {
+                    const float a_val = a_ptr[k];
+                    const int packed_idx = k / 2;
+                    const int nibble_shift = (k & 1) ? 4 : 0;
+                    int q0 = (w0[packed_idx] >> nibble_shift) & 0x0F;
+                    int q1 = (w1[packed_idx] >> nibble_shift) & 0x0F;
+                    int q2 = (w2[packed_idx] >> nibble_shift) & 0x0F;
+                    int q3 = (w3[packed_idx] >> nibble_shift) & 0x0F;
+                    if (q0 > 7) q0 -= 16;
+                    if (q1 > 7) q1 -= 16;
+                    if (q2 > 7) q2 -= 16;
+                    if (q3 > 7) q3 -= 16;
+                    acc0 += s0 * (static_cast<float>(q0) - z0) * a_val;
+                    acc1 += s1 * (static_cast<float>(q1) - z1) * a_val;
+                    acc2 += s2 * (static_cast<float>(q2) - z2) * a_val;
+                    acc3 += s3 * (static_cast<float>(q3) - z3) * a_val;
+                }
+            }
+
+            C[m * N + n + 0] = acc0;
+            C[m * N + n + 1] = acc1;
+            C[m * N + n + 2] = acc2;
+            C[m * N + n + 3] = acc3;
+        }
+
+        for (; n < N; ++n) {
+            float acc = 0.0f;
+            for (int g = 0; g < num_groups; ++g) {
+                const int k_offset = g * group_size;
+                const float* a_ptr = a_row + k_offset;
+                const float scale = scales[n * num_groups + g];
+                const float zero = zero_points ? zero_points[n * num_groups + g] : 0.0f;
+                const uint8_t* w_ptr = W_int4 + n * packed_K + g * (group_size / 2);
+
+                int k = 0;
+                for (; k + 16 <= group_size; k += 16) {
+                    acc += DotProdApproxF32Q4_16_NEON(a_ptr + k, w_ptr + k / 2, scale, zero);
+                }
+                for (; k < group_size; ++k) {
+                    const float a_val = a_ptr[k];
+                    int q = (w_ptr[k / 2] >> ((k & 1) ? 4 : 0)) & 0x0F;
+                    if (q > 7) q -= 16;
+                    acc += scale * (static_cast<float>(q) - zero) * a_val;
+                }
+            }
+            C[m * N + n] = acc;
+        }
+    }
+}
+#endif
+
 /**
  * @brief High-performance NEON GEMM kernel: C = A * W^T (INT4 weights)
  *
@@ -2527,6 +2772,13 @@ inline void GemmInt4Fp32Batched_SVE(float* C, const float* A, const uint8_t* W_i
 inline void GemmInt4Fp32_NEON(float* C, const float* A, const uint8_t* W_int4, const float* scales,
                                const float* zero_points, int M, int N, int K, int group_size) {
     if (K % group_size != 0) return;
+
+#if defined(__ARM_FEATURE_DOTPROD)
+    if (UseNeonInt4DotProdApprox()) {
+        GemmInt4Fp32_NEON_DotProdApprox(C, A, W_int4, scales, zero_points, M, N, K, group_size);
+        return;
+    }
+#endif
 
     const int num_groups = K / group_size;
     const int packed_K = K / 2;

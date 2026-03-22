@@ -593,7 +593,7 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
     // Track active experts for MoE-aware batching
     std::unordered_set<int> active_experts;
     const bool extending_decode_batch = !output.decode_seq_ids.empty();
-    int target_context_len = extending_decode_batch ? -1 : output.batch_context_len;
+    int target_context_len = output.batch_context_len;
 
     for (auto& group : sorted_queue) {
         if (ScheduledSeqCount(output) >= static_cast<size_t>(config_.max_num_seqs)) {
@@ -640,8 +640,12 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         }
 
         const int group_context = GetSequenceContextLen(seq_id);
-        if (!extending_decode_batch && config_.enforce_homogeneous_batch_n_past && target_context_len >= 0 &&
-            group_context != target_context_len) {
+        // Mixed prefill+decode batches are only safe when the waiting prefill
+        // group already lives in the same retained-history bucket as the decode
+        // rows. The worker always lays out prefill rows before decode rows, and
+        // graph-wide KV retention is still derived from batch.n_past[0], so
+        // admitting a mismatched prefill group would corrupt decode history.
+        if (config_.enforce_homogeneous_batch_n_past && target_context_len >= 0 && group_context != target_context_len) {
             still_waiting.push_back(group);
             continue;
         }
@@ -711,14 +715,10 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         output.prefill_chunk_info.push_back({seq_id, tokens_needed});
         output.num_prefill_tokens += tokens_needed;
         output.total_tokens += tokens_needed;
-        if (!extending_decode_batch && target_context_len < 0) {
+        if (target_context_len < 0) {
             target_context_len = group_context;
         }
-        if (!extending_decode_batch) {
-            output.batch_context_len = target_context_len;
-        } else if (output.batch_context_len >= 0 && output.batch_context_len != group_context) {
-            output.batch_context_len = -1;
-        }
+        output.batch_context_len = target_context_len;
         if (!new_blocks.empty()) {
             output.new_block_allocations.push_back({seq_id, new_blocks});
         }
