@@ -157,6 +157,29 @@ int ResolveKVHeadDim(const TransformerModel* model) {
     return model->hparams.n_embd / model->hparams.n_head;
 }
 
+int ResolveKVValueHeadDim(const TransformerModel* model) {
+    if (!model) {
+        return 0;
+    }
+    if (model->hparams.n_embd_head_v > 0) {
+        return model->hparams.n_embd_head_v;
+    }
+    if (model->hparams.n_embd_head_k > 0) {
+        return model->hparams.n_embd_head_k;
+    }
+    if (model->hparams.n_head <= 0) {
+        return 0;
+    }
+    return model->hparams.n_embd / model->hparams.n_head;
+}
+
+int ResolveKVIndexHeadDim(const TransformerModel* model) {
+    if (!model || !model->arch_flags.is_glm_dsa || model->glm_index_head_dim <= 0) {
+        return 0;
+    }
+    return model->glm_index_head_dim;
+}
+
 bool IsSupportedKVCacheType(ggml_type cache_type) {
     return cache_type == GGML_TYPE_F32 || cache_type == GGML_TYPE_F16 || cache_type == GGML_TYPE_Q8_0 ||
            cache_type == GGML_TYPE_Q4_0;
@@ -183,34 +206,41 @@ ggml_type ResolveEffectiveKVCacheType(const TransformerModel* model, ggml_type r
         return requested_cache_type;
     }
 
-    const int head_dim = ResolveKVHeadDim(model);
+    const int k_head_dim = ResolveKVHeadDim(model);
+    const int v_head_dim = ResolveKVValueHeadDim(model);
     const int quant_block_size = ggml_blck_size(requested_cache_type);
-    if (head_dim <= 0 || quant_block_size <= 0 || (head_dim % quant_block_size) != 0) {
+    if (k_head_dim <= 0 || v_head_dim <= 0 || quant_block_size <= 0 || (k_head_dim % quant_block_size) != 0 ||
+        (v_head_dim % quant_block_size) != 0) {
         return GGML_TYPE_F16;
     }
 
     return requested_cache_type;
 }
 
-size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int head_dim, int n_head_kv, int n_layer) {
-    if (head_dim <= 0 || n_head_kv <= 0 || n_layer <= 0) {
+size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int k_head_dim, int v_head_dim, int n_head_kv, int n_layer,
+                                   int index_head_dim) {
+    if (k_head_dim <= 0 || v_head_dim <= 0 || n_head_kv <= 0 || n_layer <= 0) {
         return 1;
     }
 
-    size_t bytes_per_slot = 0;
-    if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
-        if ((head_dim % ggml_blck_size(cache_type)) != 0) {
-            cache_type = GGML_TYPE_F16;
-            bytes_per_slot =
-                ggml_row_size(cache_type, static_cast<int64_t>(head_dim) * static_cast<int64_t>(n_head_kv));
-        } else {
-            bytes_per_slot = ggml_row_size(cache_type, static_cast<int64_t>(head_dim)) * static_cast<size_t>(n_head_kv);
-        }
-    } else {
-        bytes_per_slot = ggml_row_size(cache_type, static_cast<int64_t>(head_dim) * static_cast<int64_t>(n_head_kv));
+    if (ggml_is_quantized(cache_type) &&
+        ((k_head_dim % ggml_blck_size(cache_type)) != 0 || (v_head_dim % ggml_blck_size(cache_type)) != 0)) {
+        cache_type = GGML_TYPE_F16;
     }
 
-    return bytes_per_slot * static_cast<size_t>(n_layer) * 2;
+    auto bytes_per_slot_for_dim = [&](int head_dim) -> size_t {
+        if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+            return ggml_row_size(cache_type, static_cast<int64_t>(head_dim)) * static_cast<size_t>(n_head_kv);
+        }
+        return ggml_row_size(cache_type, static_cast<int64_t>(head_dim) * static_cast<int64_t>(n_head_kv));
+    };
+
+    const size_t k_bytes_per_slot = bytes_per_slot_for_dim(k_head_dim);
+    const size_t v_bytes_per_slot = bytes_per_slot_for_dim(v_head_dim);
+    const size_t index_bytes_per_slot =
+        index_head_dim > 0 ? ggml_row_size(GGML_TYPE_F16, static_cast<int64_t>(index_head_dim)) : 0;
+
+    return (k_bytes_per_slot + v_bytes_per_slot + index_bytes_per_slot) * static_cast<size_t>(n_layer);
 }
 
 KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type) {
@@ -225,11 +255,15 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
     int target_mb = ReadEnvInt("DENSECORE_KV_TARGET_MB", 512);
     config.target_kv_memory = static_cast<size_t>(target_mb) * 1024ULL * 1024ULL;
 
-    const int head_dim = ResolveKVHeadDim(model);
+    const int k_head_dim = ResolveKVHeadDim(model);
+    const int v_head_dim = ResolveKVValueHeadDim(model);
+    const int index_head_dim = ResolveKVIndexHeadDim(model);
     const int n_head_kv = model ? model->hparams.n_head_kv : 0;
     const int n_layer = model ? model->hparams.n_layer : 0;
 
-    config.bytes_per_token = ComputeKVCacheBytesPerToken(config.effective_cache_type, head_dim, n_head_kv, n_layer);
+    config.bytes_per_token =
+        ComputeKVCacheBytesPerToken(config.effective_cache_type, k_head_dim, v_head_dim, n_head_kv, n_layer,
+                                    index_head_dim);
     if (config.bytes_per_token == 0) {
         config.bytes_per_token = 1;
     }

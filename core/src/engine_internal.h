@@ -61,7 +61,8 @@ void SetLastError(DenseCoreStatus status, const std::string& message);
 void ClearLastError();
 DenseCoreStatus MapErrorCodeToStatus(densecore::ErrorCode code);
 ggml_type ResolveEffectiveKVCacheType(const TransformerModel* model, ggml_type requested_cache_type);
-size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int head_dim, int n_head_kv, int n_layer);
+size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int k_head_dim, int v_head_dim, int n_head_kv, int n_layer,
+                                  int index_head_dim = 0);
 KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type);
 
 struct EngineState;

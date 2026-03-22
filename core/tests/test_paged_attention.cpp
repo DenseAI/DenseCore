@@ -345,6 +345,65 @@ TEST_F(PagedAttentionTest, InterleavedHeadsCorrectness) {
     EXPECT_NEAR(out1[0], 2.0f, 1e-4f);
 }
 
+TEST_F(PagedAttentionTest, AsymmetricValueHeadDimUsesVLayout) {
+    delete cache;
+    delete model;
+
+    model = new MockTransformerModel();
+    model->hparams.n_embd_head_k = 64;
+    model->hparams.n_embd_head_v = 32;
+    model->hparams.n_head_kv = 1;
+    cache = InitPagedKVCache(model, 1, 64, GGML_TYPE_F32, -1);
+    ASSERT_NE(cache, nullptr);
+
+    const std::vector<int> block_table = AllocateBlockTable(cache, 16);
+    ASSERT_EQ(block_table.size(), 1u);
+
+    std::vector<float> k_slot(64, 0.0f);
+    std::vector<float> v_slot(32, 0.0f);
+    for (int t = 0; t < 16; ++t) {
+        std::fill(k_slot.begin(), k_slot.end(), 1.0f + static_cast<float>(t % 3));
+        std::fill(v_slot.begin(), v_slot.end(), 0.25f * static_cast<float>(t + 1));
+        cache->WriteKSlot(block_table[0], 0, t, k_slot.data());
+        cache->WriteVSlot(block_table[0], 0, t, v_slot.data());
+    }
+
+    std::vector<float> query_data(64, 1.0f);
+    densecore::Tensor query = densecore::Tensor::Make2D(query_data.data(), 1, 64);
+
+    std::vector<float> output_data(32, 0.0f);
+    densecore::Tensor output = densecore::Tensor::Make2D(output_data.data(), 1, 32);
+
+    densecore::kernels::PagedAttention(query, *cache, 0, block_table, 16, 1.0f / std::sqrt(64.0f), &output);
+
+    std::vector<float> expected(32, 0.0f);
+    std::vector<float> scores(16, 0.0f);
+    float max_score = -std::numeric_limits<float>::infinity();
+    for (int t = 0; t < 16; ++t) {
+        const float key_value = 1.0f + static_cast<float>(t % 3);
+        const float score = 64.0f * key_value * (1.0f / std::sqrt(64.0f));
+        scores[static_cast<size_t>(t)] = score;
+        max_score = std::max(max_score, score);
+    }
+    float denom = 0.0f;
+    for (int t = 0; t < 16; ++t) {
+        const float weight = std::exp(scores[static_cast<size_t>(t)] - max_score);
+        denom += weight;
+        const float value = 0.25f * static_cast<float>(t + 1);
+        for (float& out : expected) {
+            out += weight * value;
+        }
+    }
+    ASSERT_GT(denom, 0.0f);
+    for (float& out : expected) {
+        out /= denom;
+    }
+
+    for (int i = 0; i < 32; ++i) {
+        EXPECT_NEAR(output_data[static_cast<size_t>(i)], expected[static_cast<size_t>(i)], 1e-5f);
+    }
+}
+
 TEST_F(PagedAttentionTest, LongContextF16MatchesScalarReferenceMultiSeed) {
     constexpr int kContextLen = 4096;
     constexpr int kIterationsPerSeed = 3;

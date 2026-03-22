@@ -2860,20 +2860,23 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
     const int n_head_kv = ud->cache->n_head_kv;
     const int n_head_total = ud->n_head;
     const int head_dim = ud->head_dim;
-    if (head_dim <= 0 || n_head_kv <= 0 || n_head_total <= 0 || (n_head_total % n_head_kv) != 0) {
+    const int v_head_dim = ud->v_head_dim > 0 ? ud->v_head_dim : ud->head_dim;
+    if (head_dim <= 0 || v_head_dim <= 0 || n_head_kv <= 0 || n_head_total <= 0 || (n_head_total % n_head_kv) != 0) {
         for (int h = h_start; h < h_end; ++h) {
-            float* out_head = out_data + static_cast<size_t>(h) * head_dim;
-            std::fill(out_head, out_head + head_dim, 0.0f);
+            float* out_head = out_data + static_cast<size_t>(h) * v_head_dim;
+            std::fill(out_head, out_head + v_head_dim, 0.0f);
         }
         return;
     }
 
     const int kv_group_size = n_head_total / n_head_kv;
-    const auto layout = ud->cache->GetBlockLayout();
-    if (layout.head_stride_bytes == 0 || layout.slot_stride_bytes == 0) {
+    const auto k_layout = ud->cache->GetBlockLayout();
+    const auto v_layout = ud->cache->GetVBlockLayout();
+    if (k_layout.head_stride_bytes == 0 || k_layout.slot_stride_bytes == 0 || v_layout.head_stride_bytes == 0 ||
+        v_layout.slot_stride_bytes == 0) {
         for (int h = h_start; h < h_end; ++h) {
-            float* out_head = out_data + static_cast<size_t>(h) * head_dim;
-            std::fill(out_head, out_head + head_dim, 0.0f);
+            float* out_head = out_data + static_cast<size_t>(h) * v_head_dim;
+            std::fill(out_head, out_head + v_head_dim, 0.0f);
         }
         return;
     }
@@ -2895,20 +2898,21 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
     thread_local std::vector<float> v_head_scratch;
     thread_local std::vector<float> scores;
     k_head_scratch.resize(static_cast<size_t>(head_dim));
-    v_head_scratch.resize(static_cast<size_t>(head_dim));
+    v_head_scratch.resize(static_cast<size_t>(v_head_dim));
     scores.resize(static_cast<size_t>(context_len));
 
-    const auto* quant_traits = ggml_is_quantized(layout.cache_type) ? ggml_get_type_traits(layout.cache_type) : nullptr;
+    const auto* quant_traits = ggml_is_quantized(k_layout.cache_type) ? ggml_get_type_traits(k_layout.cache_type) : nullptr;
 
     for (int h = h_start; h < h_end; ++h) {
         const float* q_head = q_data + static_cast<size_t>(h) * head_dim;
-        float* out_head = out_data + static_cast<size_t>(h) * head_dim;
-        std::fill(out_head, out_head + head_dim, 0.0f);
+        float* out_head = out_data + static_cast<size_t>(h) * v_head_dim;
+        std::fill(out_head, out_head + v_head_dim, 0.0f);
 
         int kv_head = h / kv_group_size;
         if (kv_head < 0) kv_head = 0;
         if (kv_head >= n_head_kv) kv_head = n_head_kv - 1;
-        const size_t head_offset_bytes = static_cast<size_t>(kv_head) * layout.head_stride_bytes;
+        const size_t k_head_offset_bytes = static_cast<size_t>(kv_head) * k_layout.head_stride_bytes;
+        const size_t v_head_offset_bytes = static_cast<size_t>(kv_head) * v_layout.head_stride_bytes;
 
         float max_score = -INFINITY;
         for (int t = 0; t < context_len; ++t) {
@@ -2928,15 +2932,15 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
             }
 
             const uint8_t* k_ptr =
-                k_block_base + static_cast<size_t>(slot_idx) * layout.slot_stride_bytes + head_offset_bytes;
+                k_block_base + static_cast<size_t>(slot_idx) * k_layout.slot_stride_bytes + k_head_offset_bytes;
             const float* k_head = nullptr;
-            if (layout.cache_type == GGML_TYPE_F32) {
+            if (k_layout.cache_type == GGML_TYPE_F32) {
                 k_head = reinterpret_cast<const float*>(k_ptr);
-            } else if (layout.cache_type == GGML_TYPE_F16) {
+            } else if (k_layout.cache_type == GGML_TYPE_F16) {
                 densecore::simd::ConvertF16ToF32(k_head_scratch.data(), reinterpret_cast<const ggml_fp16_t*>(k_ptr),
                                                  head_dim);
                 k_head = k_head_scratch.data();
-            } else if (ggml_is_quantized(layout.cache_type) && quant_traits && quant_traits->to_float) {
+            } else if (ggml_is_quantized(k_layout.cache_type) && quant_traits && quant_traits->to_float) {
                 quant_traits->to_float(k_ptr, k_head_scratch.data(), head_dim);
                 k_head = k_head_scratch.data();
             }
@@ -2977,33 +2981,33 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
             if (!v_block_base) continue;
 
             const uint8_t* v_ptr =
-                v_block_base + static_cast<size_t>(slot_idx) * layout.slot_stride_bytes + head_offset_bytes;
+                v_block_base + static_cast<size_t>(slot_idx) * v_layout.slot_stride_bytes + v_head_offset_bytes;
             const float* v_head = nullptr;
-            if (layout.cache_type == GGML_TYPE_F32) {
+            if (v_layout.cache_type == GGML_TYPE_F32) {
                 v_head = reinterpret_cast<const float*>(v_ptr);
-            } else if (layout.cache_type == GGML_TYPE_F16) {
+            } else if (v_layout.cache_type == GGML_TYPE_F16) {
                 densecore::simd::ConvertF16ToF32(v_head_scratch.data(), reinterpret_cast<const ggml_fp16_t*>(v_ptr),
-                                                 head_dim);
+                                                 v_head_dim);
                 v_head = v_head_scratch.data();
-            } else if (ggml_is_quantized(layout.cache_type) && quant_traits && quant_traits->to_float) {
-                quant_traits->to_float(v_ptr, v_head_scratch.data(), head_dim);
+            } else if (ggml_is_quantized(v_layout.cache_type) && quant_traits && quant_traits->to_float) {
+                quant_traits->to_float(v_ptr, v_head_scratch.data(), v_head_dim);
                 v_head = v_head_scratch.data();
             }
             if (!v_head) continue;
 
-            for (int d = 0; d < head_dim; ++d) {
+            for (int d = 0; d < v_head_dim; ++d) {
                 out_head[d] += weight * v_head[d];
             }
             denom += weight;
         }
 
         if (!(denom > 0.0f) || !std::isfinite(denom)) {
-            std::fill(out_head, out_head + head_dim, 0.0f);
+            std::fill(out_head, out_head + v_head_dim, 0.0f);
             continue;
         }
 
         const float inv = 1.0f / denom;
-        for (int d = 0; d < head_dim; ++d) {
+        for (int d = 0; d < v_head_dim; ++d) {
             out_head[d] *= inv;
         }
     }
@@ -3018,6 +3022,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     const auto* q_tensor = dst->src[0];
     const auto* k_tensor = dst->src[1];
     const auto* v_tensor = dst->src[2];
+    const int v_head_dim = ud->v_head_dim > 0 ? ud->v_head_dim : ud->head_dim;
     if (!q_tensor->data || !k_tensor->data || !v_tensor->data) {
         if (ith == 0) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
@@ -3026,7 +3031,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     }
 
     const int q_tokens = static_cast<int>(q_tensor->ne[2]);
-    if (q_tokens <= 0 || ud->head_dim <= 0 || ud->n_head <= 0) {
+    if (q_tokens <= 0 || ud->head_dim <= 0 || v_head_dim <= 0 || ud->n_head <= 0) {
         if (ith == 0) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
         }
@@ -3051,9 +3056,9 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
 
     if (static_cast<int>(q_tensor->ne[0]) != ud->head_dim || static_cast<int>(q_tensor->ne[1]) != ud->n_head ||
         static_cast<int>(k_tensor->ne[0]) != ud->head_dim || static_cast<int>(k_tensor->ne[1]) != n_head_kv ||
-        static_cast<int>(v_tensor->ne[0]) != ud->head_dim || static_cast<int>(v_tensor->ne[1]) != n_head_kv ||
+        static_cast<int>(v_tensor->ne[0]) != v_head_dim || static_cast<int>(v_tensor->ne[1]) != n_head_kv ||
         static_cast<int>(k_tensor->ne[2]) != q_tokens || static_cast<int>(v_tensor->ne[2]) != q_tokens ||
-        static_cast<int>(dst->ne[0]) != ud->head_dim || static_cast<int>(dst->ne[1]) != ud->n_head ||
+        static_cast<int>(dst->ne[0]) != v_head_dim || static_cast<int>(dst->ne[1]) != ud->n_head ||
         static_cast<int>(dst->ne[2]) != q_tokens) {
         if (ith == 0) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
@@ -3065,8 +3070,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                            v_tensor->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
                            q_tensor->nb[1] == static_cast<size_t>(ud->head_dim) * sizeof(float) &&
                            k_tensor->nb[1] == static_cast<size_t>(ud->head_dim) * sizeof(float) &&
-                           v_tensor->nb[1] == static_cast<size_t>(ud->head_dim) * sizeof(float) &&
-                           dst->nb[1] == static_cast<size_t>(ud->head_dim) * sizeof(float);
+                           v_tensor->nb[1] == static_cast<size_t>(v_head_dim) * sizeof(float) &&
+                           dst->nb[1] == static_cast<size_t>(v_head_dim) * sizeof(float);
     if (!layout_ok) {
         if (ith == 0) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
@@ -3228,9 +3233,11 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         else if (ud->cache->cache_type == GGML_TYPE_Q8_0)
             cache_type_id = 8;
     }
-    const auto cache_layout = ud->cache->GetBlockLayout();
-    const bool hwy_ready =
-        use_hwy && cache_type_id >= 0 && cache_layout.head_stride_bytes > 0 && cache_layout.slot_stride_bytes > 0;
+    const auto k_cache_layout = ud->cache->GetBlockLayout();
+    const auto v_cache_layout = ud->cache->GetVBlockLayout();
+    const bool hwy_ready = use_hwy && cache_type_id >= 0 && k_cache_layout.head_stride_bytes > 0 &&
+                           k_cache_layout.slot_stride_bytes > 0 && v_cache_layout.head_stride_bytes > 0 &&
+                           v_cache_layout.slot_stride_bytes > 0;
     thread_local std::vector<const void*> k_block_ptrs;
     thread_local std::vector<const void*> v_block_ptrs;
     int cached_token_idx = -1;
@@ -3239,8 +3246,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
 
     auto zero_token_heads = [&](float* out_token, int h_start, int h_end) {
         for (int h = h_start; h < h_end; ++h) {
-            float* out_head = out_token + static_cast<size_t>(h) * ud->head_dim;
-            std::fill(out_head, out_head + ud->head_dim, 0.0f);
+            float* out_head = out_token + static_cast<size_t>(h) * v_head_dim;
+            std::fill(out_head, out_head + v_head_dim, 0.0f);
         }
     };
 
@@ -3315,10 +3322,12 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         }
 
         densecore::hwy_kernels::PagedAttention_Hwy(
-            q_token, k_block_ptrs.data(), v_block_ptrs.data(), cache_type_id, ud->n_head, ud->head_dim,
+            q_token, k_block_ptrs.data(), v_block_ptrs.data(), cache_type_id, ud->n_head, ud->head_dim, v_head_dim,
             ud->cache->n_head_kv, static_cast<int32_t>(block_table.size()), context_len,
-            static_cast<int64_t>(cache_layout.head_stride_bytes), static_cast<int64_t>(cache_layout.slot_stride_bytes),
-            scale, out_token, h_start, h_end, ud->n_head);
+            static_cast<int64_t>(k_cache_layout.head_stride_bytes),
+            static_cast<int64_t>(k_cache_layout.slot_stride_bytes),
+            static_cast<int64_t>(v_cache_layout.head_stride_bytes),
+            static_cast<int64_t>(v_cache_layout.slot_stride_bytes), scale, out_token, h_start, h_end, ud->n_head);
     }
 
     // Decode profiling: log KV write + attention compute timing (thread 0, every 100th call)
@@ -3772,7 +3781,7 @@ inline struct ggml_tensor* ggml_mul_mat_gemv_batched(struct ggml_context* ctx, s
 inline struct ggml_tensor* ggml_paged_attention_decode(struct ggml_context* ctx, struct ggml_tensor* q_cur,
                                                        struct ggml_tensor* k_cur, struct ggml_tensor* v_cur,
                                                        PagedAttentionUserData* userdata) {
-    const int64_t ne_res[4] = {q_cur->ne[0], q_cur->ne[1], q_cur->ne[2], 1};
+    const int64_t ne_res[4] = {v_cur->ne[0], q_cur->ne[1], q_cur->ne[2], 1};
     struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_res);
 
     result->op = GGML_OP_CUSTOM;
@@ -6333,6 +6342,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 ud->cache = cache;
                 ud->layer = il;
                 ud->head_dim = head_dim_q;
+                ud->v_head_dim = head_dim_v;
                 ud->n_head = n_head;
                 ud->epoch_started.store(0, std::memory_order_relaxed);
                 ud->epoch_done.store(0, std::memory_order_relaxed);

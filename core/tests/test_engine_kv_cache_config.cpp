@@ -54,14 +54,37 @@ class ScopedEnvVar {
     std::string prev_value_;
 };
 
-TransformerModel MakeModel(int head_dim, int n_head_kv = 8, int n_layer = 4) {
+TransformerModel MakeModel(int head_dim_k, int n_head_kv = 8, int n_layer = 4, int head_dim_v = 0) {
     TransformerModel model{};
-    model.hparams.n_embd_head_k = head_dim;
+    model.hparams.n_embd_head_k = head_dim_k;
+    model.hparams.n_embd_head_v = head_dim_v;
     model.hparams.n_head_kv = n_head_kv;
     model.hparams.n_layer = n_layer;
     model.hparams.n_head = std::max(1, n_head_kv);
-    model.hparams.n_embd = head_dim * model.hparams.n_head;
+    const int effective_v = head_dim_v > 0 ? head_dim_v : head_dim_k;
+    model.hparams.n_embd = std::max(head_dim_k, effective_v) * model.hparams.n_head;
     return model;
+}
+
+size_t ExpectedKVBytesPerToken(const TransformerModel& model, ggml_type cache_type) {
+    const int k_head_dim = model.hparams.n_embd_head_k;
+    const int v_head_dim = model.hparams.n_embd_head_v > 0 ? model.hparams.n_embd_head_v : model.hparams.n_embd_head_k;
+    const int n_head_kv = model.hparams.n_head_kv;
+    const int n_layer = model.hparams.n_layer;
+
+    auto bytes_per_slot_for_dim = [&](ggml_type type, int head_dim) -> size_t {
+        if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0) {
+            return ggml_row_size(type, static_cast<int64_t>(head_dim)) * static_cast<size_t>(n_head_kv);
+        }
+        return ggml_row_size(type, static_cast<int64_t>(head_dim) * static_cast<int64_t>(n_head_kv));
+    };
+
+    const size_t k_bytes = bytes_per_slot_for_dim(cache_type, k_head_dim);
+    const size_t v_bytes = bytes_per_slot_for_dim(cache_type, v_head_dim);
+    const size_t index_bytes = (model.arch_flags.is_glm_dsa && model.glm_index_head_dim > 0)
+                                   ? ggml_row_size(GGML_TYPE_F16, static_cast<int64_t>(model.glm_index_head_dim))
+                                   : 0;
+    return (k_bytes + v_bytes + index_bytes) * static_cast<size_t>(n_layer);
 }
 
 }  // namespace
@@ -74,9 +97,7 @@ TEST(EngineKVCacheConfig, MisalignedInt8FallsBackToF16Budgeting) {
     TransformerModel model = MakeModel(/*head_dim=*/48);
     const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_Q8_0);
 
-    const size_t expected_bytes_per_token =
-        ggml_row_size(GGML_TYPE_F16, static_cast<int64_t>(model.hparams.n_embd_head_k) * model.hparams.n_head_kv) *
-        static_cast<size_t>(model.hparams.n_layer) * 2;
+    const size_t expected_bytes_per_token = ExpectedKVBytesPerToken(model, GGML_TYPE_F16);
     const int expected_seq_len =
         std::max(256, std::min(static_cast<int>((32ULL * 1024ULL * 1024ULL) / expected_bytes_per_token), 8192));
 
@@ -94,9 +115,7 @@ TEST(EngineKVCacheConfig, MisalignedInt4FallsBackToF16Budgeting) {
     TransformerModel model = MakeModel(/*head_dim=*/48);
     const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_Q4_0);
 
-    const size_t expected_bytes_per_token =
-        ggml_row_size(GGML_TYPE_F16, static_cast<int64_t>(model.hparams.n_embd_head_k) * model.hparams.n_head_kv) *
-        static_cast<size_t>(model.hparams.n_layer) * 2;
+    const size_t expected_bytes_per_token = ExpectedKVBytesPerToken(model, GGML_TYPE_F16);
     const int expected_seq_len =
         std::max(256, std::min(static_cast<int>((32ULL * 1024ULL * 1024ULL) / expected_bytes_per_token), 8192));
 
@@ -114,9 +133,7 @@ TEST(EngineKVCacheConfig, AlignedInt8KeepsQuantizedBudgeting) {
     TransformerModel model = MakeModel(/*head_dim=*/64);
     const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_Q8_0);
 
-    const size_t expected_bytes_per_token =
-        ggml_row_size(GGML_TYPE_Q8_0, model.hparams.n_embd_head_k) * static_cast<size_t>(model.hparams.n_head_kv) *
-        static_cast<size_t>(model.hparams.n_layer) * 2;
+    const size_t expected_bytes_per_token = ExpectedKVBytesPerToken(model, GGML_TYPE_Q8_0);
     const int expected_seq_len =
         std::max(256, std::min(static_cast<int>((8ULL * 1024ULL * 1024ULL) / expected_bytes_per_token), 8192));
 
@@ -133,13 +150,65 @@ TEST(EngineKVCacheConfig, AlignedInt4KeepsQuantizedBudgetingWithoutBudgetInflati
     TransformerModel model = MakeModel(/*head_dim=*/64);
     const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_Q4_0);
 
-    const size_t expected_bytes_per_token =
-        ggml_row_size(GGML_TYPE_Q4_0, model.hparams.n_embd_head_k) * static_cast<size_t>(model.hparams.n_head_kv) *
-        static_cast<size_t>(model.hparams.n_layer) * 2;
+    const size_t expected_bytes_per_token = ExpectedKVBytesPerToken(model, GGML_TYPE_Q4_0);
     const int expected_seq_len =
         std::max(256, std::min(static_cast<int>((8ULL * 1024ULL * 1024ULL) / expected_bytes_per_token), 8192));
 
     EXPECT_EQ(config.effective_cache_type, GGML_TYPE_Q4_0);
+    EXPECT_EQ(config.bytes_per_token, expected_bytes_per_token);
+    EXPECT_EQ(config.max_seq_len, expected_seq_len);
+}
+
+TEST(EngineKVCacheConfig, MisalignedValueHeadFallsBackToF16Budgeting) {
+    ScopedEnvVar target_mb("DENSECORE_KV_TARGET_MB", "32");
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "8192");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+
+    TransformerModel model = MakeModel(/*head_dim_k=*/64, /*n_head_kv=*/8, /*n_layer=*/4, /*head_dim_v=*/48);
+    const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_Q8_0);
+
+    const size_t expected_bytes_per_token = ExpectedKVBytesPerToken(model, GGML_TYPE_F16);
+    const int expected_seq_len =
+        std::max(256, std::min(static_cast<int>((32ULL * 1024ULL * 1024ULL) / expected_bytes_per_token), 8192));
+
+    EXPECT_EQ(config.requested_cache_type, GGML_TYPE_Q8_0);
+    EXPECT_EQ(config.effective_cache_type, GGML_TYPE_F16);
+    EXPECT_EQ(config.bytes_per_token, expected_bytes_per_token);
+    EXPECT_EQ(config.max_seq_len, expected_seq_len);
+}
+
+TEST(EngineKVCacheConfig, AsymmetricAlignedKVUsesBothHeadDimsForBudgeting) {
+    ScopedEnvVar target_mb("DENSECORE_KV_TARGET_MB", "8");
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "8192");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+
+    TransformerModel model = MakeModel(/*head_dim_k=*/64, /*n_head_kv=*/8, /*n_layer=*/4, /*head_dim_v=*/96);
+    const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_Q8_0);
+
+    const size_t expected_bytes_per_token = ExpectedKVBytesPerToken(model, GGML_TYPE_Q8_0);
+    const int expected_seq_len =
+        std::max(256, std::min(static_cast<int>((8ULL * 1024ULL * 1024ULL) / expected_bytes_per_token), 8192));
+
+    EXPECT_EQ(config.effective_cache_type, GGML_TYPE_Q8_0);
+    EXPECT_EQ(config.bytes_per_token, expected_bytes_per_token);
+    EXPECT_EQ(config.max_seq_len, expected_seq_len);
+}
+
+TEST(EngineKVCacheConfig, GLMIndexCacheContributesToBudgeting) {
+    ScopedEnvVar target_mb("DENSECORE_KV_TARGET_MB", "8");
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "8192");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+
+    TransformerModel model = MakeModel(/*head_dim_k=*/64);
+    model.arch_flags.is_glm_dsa = true;
+    model.glm_index_head_dim = 32;
+    const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_Q8_0);
+
+    const size_t expected_bytes_per_token = ExpectedKVBytesPerToken(model, GGML_TYPE_Q8_0);
+    const int expected_seq_len =
+        std::max(256, std::min(static_cast<int>((8ULL * 1024ULL * 1024ULL) / expected_bytes_per_token), 8192));
+
+    EXPECT_EQ(config.effective_cache_type, GGML_TYPE_Q8_0);
     EXPECT_EQ(config.bytes_per_token, expected_bytes_per_token);
     EXPECT_EQ(config.max_seq_len, expected_seq_len);
 }
