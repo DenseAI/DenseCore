@@ -151,6 +151,26 @@ struct KVCacheConfig {
     size_t bytes_per_token = 0;
 };
 
+size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int head_dim, int n_head_kv, int n_layer) {
+    if (head_dim <= 0 || n_head_kv <= 0 || n_layer <= 0) {
+        return 1;
+    }
+
+    size_t bytes_per_slot = 0;
+    if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+        if ((head_dim % ggml_blck_size(cache_type)) != 0) {
+            return 1;
+        }
+        bytes_per_slot = ggml_row_size(cache_type, static_cast<int64_t>(head_dim)) *
+                         static_cast<size_t>(n_head_kv);
+    } else {
+        bytes_per_slot =
+            ggml_row_size(cache_type, static_cast<int64_t>(head_dim) * static_cast<int64_t>(n_head_kv));
+    }
+
+    return bytes_per_slot * static_cast<size_t>(n_layer) * 2;
+}
+
 KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type cache_type) {
     KVCacheConfig config;
     bool max_seq_len_env_set = false;
@@ -163,6 +183,8 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type cach
 
     if (cache_type == GGML_TYPE_Q8_0) {
         config.target_kv_memory *= 2;
+    } else if (cache_type == GGML_TYPE_Q4_0) {
+        config.target_kv_memory *= 4;
     }
 
     const int head_dim = model->hparams.n_embd_head_k > 0 ? model->hparams.n_embd_head_k
@@ -170,8 +192,7 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type cach
     const int n_head_kv = model->hparams.n_head_kv;
     const int n_layer = model->hparams.n_layer;
 
-    size_t type_size = ggml_type_size(cache_type);
-    config.bytes_per_token = static_cast<size_t>(head_dim) * n_head_kv * n_layer * 2 * type_size;
+    config.bytes_per_token = ComputeKVCacheBytesPerToken(cache_type, head_dim, n_head_kv, n_layer);
     if (config.bytes_per_token == 0) {
         config.bytes_per_token = 1;
     }
@@ -1111,6 +1132,10 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
             cache_type = GGML_TYPE_Q8_0;
             std::cout << "[DenseCore] Using INT8 KV Cache (50% memory reduction)" << std::endl;
             break;
+        case DENSECORE_KV_INT4:
+            cache_type = GGML_TYPE_Q4_0;
+            std::cout << "[DenseCore] Using INT4 KV Cache (75% memory reduction)" << std::endl;
+            break;
         case DENSECORE_KV_FP16:
         default: cache_type = GGML_TYPE_F16; break;
         }
@@ -1150,6 +1175,8 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
 
         if (kv_cache_type == DENSECORE_KV_INT8) {
             std::cout << "[DenseCore] INT8 mode: doubled target context length" << std::endl;
+        } else if (kv_cache_type == DENSECORE_KV_INT4) {
+            std::cout << "[DenseCore] INT4 mode: quadrupled target context length" << std::endl;
         }
 
         std::cout << "[DenseCore] Auto-configured max_seq_len: " << kv_config.max_seq_len << " (KV cache: ~"
@@ -1172,6 +1199,8 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
             type_name = "FP32";
         else if (cache_type == GGML_TYPE_Q8_0)
             type_name = "INT8 (Q8_0)";
+        else if (cache_type == GGML_TYPE_Q4_0)
+            type_name = "INT4 (Q4_0)";
         std::cout << "[DenseCore] KV Cache initialized with type: " << type_name << std::endl;
 
         // Create model entry

@@ -313,13 +313,16 @@ typedef enum {
     DENSECORE_KV_FP16 = 0,  ///< FP16 (default) - Best quality
     DENSECORE_KV_FP32 = 1,  ///< FP32 - Highest precision
     DENSECORE_KV_INT8 = 2,  ///< INT8 - 50% memory reduction, minimal quality loss
+    DENSECORE_KV_INT4 = 3,  ///< INT4 (Q4_0) - 75% memory reduction, higher quality risk
 } DenseCoreKVType;
 
 /**
  * @brief Initialize engine with KV cache type specification
  *
  * Extended initialization with control over KV cache precision.
- * INT8 KV cache reduces memory usage by 50% with minimal quality impact.
+ * Quantized KV cache can reduce memory substantially:
+ * - INT8: ~50% reduction
+ * - INT4: ~75% reduction
  *
  * @param model_path Path to the GGUF model file (required)
  * @param reserved Reserved for future options (pass NULL)

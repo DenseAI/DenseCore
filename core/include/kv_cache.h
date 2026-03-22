@@ -22,6 +22,13 @@ struct alignas(2) block_q8_0 {
 };
 static_assert(sizeof(block_q8_0) == sizeof(uint16_t) + QK8_0, "Q8_0 block size mismatch");
 
+static constexpr int QK4_0 = 32;  // Elements per Q4_0 block
+struct alignas(2) block_q4_0 {
+    uint16_t d;             // Scale as FP16
+    uint8_t qs[QK4_0 / 2];  // Packed 4-bit values (2 per byte)
+};
+static_assert(sizeof(block_q4_0) == sizeof(uint16_t) + QK4_0 / 2, "Q4_0 block size mismatch");
+
 // Q4_K super-block quantization structure (compatible with GGML format)
 // 256 elements per super-block, organized as 8 sub-blocks of 32 elements
 // Weight is represented as: x = d * scale * q - dmin * min
@@ -193,7 +200,7 @@ struct PagedKVCache {
         size_t head_stride_bytes = 0;
         size_t slot_stride_bytes = 0;
         size_t block_stride_bytes = 0;
-        int packed_values_per_block = 1;  // 32 for Q8_0, 1 for F16/F32
+        int packed_values_per_block = 1;  // 32 for Q8_0/Q4_0, 1 for F16/F32
         int packed_blocks_per_head = 0;   // ceil(head_dim / packed_values_per_block)
     };
 

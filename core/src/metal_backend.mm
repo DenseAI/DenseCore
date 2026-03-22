@@ -69,6 +69,9 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> gemmQ4_0FusedPipeline = nil;
     id<MTLComputePipelineState> gemmQ4_1FusedPipeline = nil;
     id<MTLComputePipelineState> gemmInt4GroupedFusedPipeline = nil;
+    id<MTLComputePipelineState> gemmQ4_0SimdgroupPipeline = nil;
+    id<MTLComputePipelineState> gemmQ4_1SimdgroupPipeline = nil;
+    id<MTLComputePipelineState> gemmInt4GroupedSimdgroupPipeline = nil;
 
     // Fused QKV pipeline state
     id<MTLComputePipelineState> fusedQKVPipeline = nil;
@@ -113,6 +116,8 @@ struct MetalBackend::Impl {
 
     // GPU capture state
     bool captureEnabled = false;
+    bool supportsSimdgroupMatrix = false;
+    bool enableSimdgroupInt4Gemm = true;
 
     // Helper: Get MTLBuffer for a tracked pointer (for MPS zero-copy)
     id<MTLBuffer> GetBufferForPointer(void* ptr) {
@@ -242,6 +247,9 @@ struct MetalBackend::Impl {
         gemmQ4_0FusedPipeline = nil;
         gemmQ4_1FusedPipeline = nil;
         gemmInt4GroupedFusedPipeline = nil;
+        gemmQ4_0SimdgroupPipeline = nil;
+        gemmQ4_1SimdgroupPipeline = nil;
+        gemmInt4GroupedSimdgroupPipeline = nil;
         fusedQKVPipeline = nil;
         ropePipeline = nil;
         dequantizeQ4_0Pipeline = nil;
@@ -660,6 +668,8 @@ kernel void rope_f32(
  */
 const char* kQuantizedGemvShaderSource = R"METAL(
 #include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 constant uint QK4_0 = 32;
@@ -668,6 +678,8 @@ constant uint QK8_0 = 32;
 constant uint THREADGROUP_SIZE = 256;
 constant uint PREFILL_TILE_M = 8;
 constant uint PREFILL_TILE_N = 8;
+constant uint SIMD_TILE = 8;
+constant uint SIMDGROUP_THREADS = 32;
 
 struct block_q4_0 {
     half scale;
@@ -692,6 +704,23 @@ inline int8_t extract_q4(uint8_t packed, uint idx) {
 
 inline uint8_t extract_q4_unsigned(uint8_t packed, uint idx) {
     return (idx == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+}
+
+inline float grouped_int4_value(device const uchar* weights, device const float* scales,
+                                device const float* zeros, uint n, uint k, uint K,
+                                uint group_size, bool has_zero_points) {
+    const uint k_packed = K / 2;
+    const uint byte_idx = n * k_packed + (k / 2);
+    const uchar packed = weights[byte_idx];
+    int q = (k & 1) ? int((packed >> 4) & 0x0F) : int(packed & 0x0F);
+    if (q > 7) {
+        q -= 16;
+    }
+    const uint groups_per_row = K / group_size;
+    const uint group_idx = min(k / group_size, groups_per_row - 1);
+    const uint qparam_idx = n * groups_per_row + group_idx;
+    const float zero = has_zero_points ? zeros[qparam_idx] : 0.0f;
+    return scales[qparam_idx] * (float(q) - zero);
 }
 
 kernel void gemv_q4_0(
@@ -1054,6 +1083,217 @@ kernel void gemm_int4_grouped_fused(
 
     if (m < M && n < N) {
         output[m * N + n] = sum;
+    }
+}
+
+kernel void gemm_q4_0_simdgroup_fused(
+    device const float* input [[buffer(0)]],
+    device const block_q4_0* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    const uint tile_m0 = group_id.y * SIMD_TILE;
+    const uint tile_n0 = group_id.x * SIMD_TILE;
+    const uint blocks_per_row = (K + QK4_0 - 1) / QK4_0;
+
+    threadgroup float a_tile[SIMD_TILE * SIMD_TILE];
+    threadgroup float b_tile[SIMD_TILE * SIMD_TILE];
+    threadgroup float c_tile[SIMD_TILE * SIMD_TILE];
+
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += SIMD_TILE) {
+        for (uint idx = tid; idx < SIMD_TILE * SIMD_TILE; idx += SIMDGROUP_THREADS) {
+            const uint local_m = idx / SIMD_TILE;
+            const uint local_k = idx % SIMD_TILE;
+            const uint global_m = tile_m0 + local_m;
+            const uint global_k = k0 + local_k;
+            a_tile[idx] = (global_m < M && global_k < K) ? input[global_m * K + global_k] : 0.0f;
+        }
+
+        for (uint idx = tid; idx < SIMD_TILE * SIMD_TILE; idx += SIMDGROUP_THREADS) {
+            const uint local_n = idx / SIMD_TILE;
+            const uint local_k = idx % SIMD_TILE;
+            const uint global_n = tile_n0 + local_n;
+            const uint global_k = k0 + local_k;
+            float value = 0.0f;
+            if (global_n < N && global_k < K) {
+                device const block_q4_0* block = &weight[global_n * blocks_per_row + (global_k / QK4_0)];
+                const uint within_block = global_k % QK4_0;
+                const uint8_t packed = block->quants[within_block / 2];
+                value = float(extract_q4(packed, within_block & 1)) * float(block->scale);
+            }
+            b_tile[idx] = value;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 ma;
+        simdgroup_float8x8 mb;
+        simdgroup_load(ma, a_tile, SIMD_TILE, ulong2(0, 0), false);
+        simdgroup_load(mb, b_tile, SIMD_TILE, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(acc, ma, mb, acc);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(acc, c_tile, SIMD_TILE, ulong2(0, 0), false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < SIMD_TILE * SIMD_TILE; idx += SIMDGROUP_THREADS) {
+        const uint local_m = idx / SIMD_TILE;
+        const uint local_n = idx % SIMD_TILE;
+        const uint global_m = tile_m0 + local_m;
+        const uint global_n = tile_n0 + local_n;
+        if (global_m < M && global_n < N) {
+            output[global_m * N + global_n] = c_tile[idx];
+        }
+    }
+}
+
+kernel void gemm_q4_1_simdgroup_fused(
+    device const float* input [[buffer(0)]],
+    device const block_q4_1* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    const uint tile_m0 = group_id.y * SIMD_TILE;
+    const uint tile_n0 = group_id.x * SIMD_TILE;
+    const uint blocks_per_row = (K + QK4_1 - 1) / QK4_1;
+
+    threadgroup float a_tile[SIMD_TILE * SIMD_TILE];
+    threadgroup float b_tile[SIMD_TILE * SIMD_TILE];
+    threadgroup float c_tile[SIMD_TILE * SIMD_TILE];
+
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += SIMD_TILE) {
+        for (uint idx = tid; idx < SIMD_TILE * SIMD_TILE; idx += SIMDGROUP_THREADS) {
+            const uint local_m = idx / SIMD_TILE;
+            const uint local_k = idx % SIMD_TILE;
+            const uint global_m = tile_m0 + local_m;
+            const uint global_k = k0 + local_k;
+            a_tile[idx] = (global_m < M && global_k < K) ? input[global_m * K + global_k] : 0.0f;
+        }
+
+        for (uint idx = tid; idx < SIMD_TILE * SIMD_TILE; idx += SIMDGROUP_THREADS) {
+            const uint local_n = idx / SIMD_TILE;
+            const uint local_k = idx % SIMD_TILE;
+            const uint global_n = tile_n0 + local_n;
+            const uint global_k = k0 + local_k;
+            float value = 0.0f;
+            if (global_n < N && global_k < K) {
+                device const block_q4_1* block = &weight[global_n * blocks_per_row + (global_k / QK4_1)];
+                const uint within_block = global_k % QK4_1;
+                const uint8_t packed = block->quants[within_block / 2];
+                value = float(extract_q4_unsigned(packed, within_block & 1)) * float(block->scale) +
+                        float(block->min);
+            }
+            b_tile[idx] = value;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 ma;
+        simdgroup_float8x8 mb;
+        simdgroup_load(ma, a_tile, SIMD_TILE, ulong2(0, 0), false);
+        simdgroup_load(mb, b_tile, SIMD_TILE, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(acc, ma, mb, acc);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(acc, c_tile, SIMD_TILE, ulong2(0, 0), false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < SIMD_TILE * SIMD_TILE; idx += SIMDGROUP_THREADS) {
+        const uint local_m = idx / SIMD_TILE;
+        const uint local_n = idx % SIMD_TILE;
+        const uint global_m = tile_m0 + local_m;
+        const uint global_n = tile_n0 + local_n;
+        if (global_m < M && global_n < N) {
+            output[global_m * N + global_n] = c_tile[idx];
+        }
+    }
+}
+
+kernel void gemm_int4_grouped_simdgroup_fused(
+    device const float* input [[buffer(0)]],
+    device const uchar* weights [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device const float* zeros [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    constant uint& group_size [[buffer(8)]],
+    constant uint& has_zero_points [[buffer(9)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    if (group_size == 0) {
+        return;
+    }
+
+    const uint tile_m0 = group_id.y * SIMD_TILE;
+    const uint tile_n0 = group_id.x * SIMD_TILE;
+
+    threadgroup float a_tile[SIMD_TILE * SIMD_TILE];
+    threadgroup float b_tile[SIMD_TILE * SIMD_TILE];
+    threadgroup float c_tile[SIMD_TILE * SIMD_TILE];
+
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += SIMD_TILE) {
+        for (uint idx = tid; idx < SIMD_TILE * SIMD_TILE; idx += SIMDGROUP_THREADS) {
+            const uint local_m = idx / SIMD_TILE;
+            const uint local_k = idx % SIMD_TILE;
+            const uint global_m = tile_m0 + local_m;
+            const uint global_k = k0 + local_k;
+            a_tile[idx] = (global_m < M && global_k < K) ? input[global_m * K + global_k] : 0.0f;
+        }
+
+        for (uint idx = tid; idx < SIMD_TILE * SIMD_TILE; idx += SIMDGROUP_THREADS) {
+            const uint local_n = idx / SIMD_TILE;
+            const uint local_k = idx % SIMD_TILE;
+            const uint global_n = tile_n0 + local_n;
+            const uint global_k = k0 + local_k;
+            b_tile[idx] = (global_n < N && global_k < K)
+                              ? grouped_int4_value(weights, scales, zeros, global_n, global_k, K,
+                                                   group_size, has_zero_points != 0)
+                              : 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 ma;
+        simdgroup_float8x8 mb;
+        simdgroup_load(ma, a_tile, SIMD_TILE, ulong2(0, 0), false);
+        simdgroup_load(mb, b_tile, SIMD_TILE, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(acc, ma, mb, acc);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(acc, c_tile, SIMD_TILE, ulong2(0, 0), false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < SIMD_TILE * SIMD_TILE; idx += SIMDGROUP_THREADS) {
+        const uint local_m = idx / SIMD_TILE;
+        const uint local_n = idx % SIMD_TILE;
+        const uint global_m = tile_m0 + local_m;
+        const uint global_n = tile_n0 + local_n;
+        if (global_m < M && global_n < N) {
+            output[global_m * N + global_n] = c_tile[idx];
+        }
     }
 }
 
@@ -1895,6 +2135,12 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
             throw std::runtime_error("Failed to create Metal command queue");
         }
 
+        impl_->supportsSimdgroupMatrix = [impl_->device supportsFamily:MTLGPUFamilyApple7];
+        if (const char* env = std::getenv("DENSECORE_METAL_INT4_SIMDGROUP_GEMM")) {
+            impl_->enableSimdgroupInt4Gemm = std::strcmp(env, "0") != 0 &&
+                                             std::strcmp(env, "false") != 0;
+        }
+
         // Try to load pre-compiled shader library
         NSError* error = nil;
         NSString* libraryPath = [[NSBundle mainBundle] pathForResource:@"densecore"
@@ -2124,6 +2370,32 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
                                                                  error:&error];
             }
 
+            if (impl_->supportsSimdgroupMatrix && impl_->enableSimdgroupInt4Gemm) {
+                id<MTLFunction> gemmQ4_0SimdgroupFunction =
+                    [quantizedGemvLib newFunctionWithName:@"gemm_q4_0_simdgroup_fused"];
+                if (gemmQ4_0SimdgroupFunction) {
+                    impl_->gemmQ4_0SimdgroupPipeline =
+                        [impl_->device newComputePipelineStateWithFunction:gemmQ4_0SimdgroupFunction
+                                                                     error:&error];
+                }
+
+                id<MTLFunction> gemmQ4_1SimdgroupFunction =
+                    [quantizedGemvLib newFunctionWithName:@"gemm_q4_1_simdgroup_fused"];
+                if (gemmQ4_1SimdgroupFunction) {
+                    impl_->gemmQ4_1SimdgroupPipeline =
+                        [impl_->device newComputePipelineStateWithFunction:gemmQ4_1SimdgroupFunction
+                                                                     error:&error];
+                }
+
+                id<MTLFunction> gemmInt4GroupedSimdgroupFunction =
+                    [quantizedGemvLib newFunctionWithName:@"gemm_int4_grouped_simdgroup_fused"];
+                if (gemmInt4GroupedSimdgroupFunction) {
+                    impl_->gemmInt4GroupedSimdgroupPipeline =
+                        [impl_->device newComputePipelineStateWithFunction:gemmInt4GroupedSimdgroupFunction
+                                                                     error:&error];
+                }
+            }
+
             if (impl_->gemvQ4_0Pipeline || impl_->gemvQ4_1Pipeline || impl_->gemvQ8_0Pipeline) {
                 std::cout << "[MetalBackend] Quantized GEMV kernels compiled: "
                           << (impl_->gemvQ4_0Pipeline ? "Q4_0 " : "")
@@ -2137,6 +2409,15 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
                           << (impl_->gemmQ4_0FusedPipeline ? "Q4_0 " : "")
                           << (impl_->gemmQ4_1FusedPipeline ? "Q4_1 " : "")
                           << (impl_->gemmInt4GroupedFusedPipeline ? "INT4_GROUPED " : "")
+                          << std::endl;
+            }
+
+            if (impl_->gemmQ4_0SimdgroupPipeline || impl_->gemmQ4_1SimdgroupPipeline ||
+                impl_->gemmInt4GroupedSimdgroupPipeline) {
+                std::cout << "[MetalBackend] simdgroup_matrix INT4 GEMM kernels compiled: "
+                          << (impl_->gemmQ4_0SimdgroupPipeline ? "Q4_0 " : "")
+                          << (impl_->gemmQ4_1SimdgroupPipeline ? "Q4_1 " : "")
+                          << (impl_->gemmInt4GroupedSimdgroupPipeline ? "INT4_GROUPED " : "")
                           << std::endl;
             }
 
@@ -2695,6 +2976,43 @@ void MetalBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scal
     // Prefill (M > 1): Prefer fused GPU INT4 GEMM to avoid a global FP32
     // dequantization pass before GEMM.
     @autoreleasepool {
+        const bool useSimdgroupPrefill =
+            impl_->supportsSimdgroupMatrix && impl_->enableSimdgroupInt4Gemm && M >= 4 && K >= 32;
+        id<MTLComputePipelineState> simdgroupPipeline =
+            use_q4_1 ? impl_->gemmQ4_1SimdgroupPipeline : impl_->gemmQ4_0SimdgroupPipeline;
+        if (useSimdgroupPrefill && simdgroupPipeline) {
+            id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
+            id<MTLBuffer> bufferA = impl_->GetOrWrapBuffer(const_cast<void*>(A.data), A.SizeBytes());
+            id<MTLBuffer> bufferW = impl_->GetOrWrapBuffer(const_cast<void*>(W.data), W.SizeBytes());
+            id<MTLBuffer> bufferC = impl_->GetOrWrapBuffer(C->data, C->SizeBytes());
+
+            if (commandBuffer && bufferA && bufferW && bufferC) {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                if (encoder) {
+                    [encoder setComputePipelineState:simdgroupPipeline];
+                    [encoder setBuffer:bufferA offset:0 atIndex:0];
+                    [encoder setBuffer:bufferW offset:0 atIndex:1];
+                    [encoder setBuffer:bufferC offset:0 atIndex:2];
+
+                    uint M_u = static_cast<uint>(M);
+                    uint N_u = static_cast<uint>(N);
+                    uint K_u = static_cast<uint>(K);
+                    [encoder setBytes:&M_u length:sizeof(uint) atIndex:3];
+                    [encoder setBytes:&N_u length:sizeof(uint) atIndex:4];
+                    [encoder setBytes:&K_u length:sizeof(uint) atIndex:5];
+
+                    const MTLSize threadgroupSize = MTLSizeMake(32, 1, 1);
+                    const MTLSize gridSize =
+                        MTLSizeMake((static_cast<NSUInteger>(N) + 7) / 8,
+                                    (static_cast<NSUInteger>(M) + 7) / 8, 1);
+                    [encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSize];
+                    [encoder endEncoding];
+                    [commandBuffer commit];
+                    return;
+                }
+            }
+        }
+
         id<MTLComputePipelineState> fusedPipeline =
             use_q4_1 ? impl_->gemmQ4_1FusedPipeline : impl_->gemmQ4_0FusedPipeline;
         if (fusedPipeline) {
@@ -3576,7 +3894,7 @@ bool MetalBackend::GemmInt4Grouped(const Tensor& A, const Tensor& W, const Tenso
     if (M <= 0 || N <= 0 || K <= 0 || (K % 2) != 0 || (K % group_size) != 0) {
         return false;
     }
-    if (!impl_->gemmInt4GroupedFusedPipeline) {
+    if (!impl_->gemmInt4GroupedFusedPipeline && !impl_->gemmInt4GroupedSimdgroupPipeline) {
         return false;
     }
 
@@ -3605,7 +3923,17 @@ bool MetalBackend::GemmInt4Grouped(const Tensor& A, const Tensor& W, const Tenso
             return false;
         }
 
-        [encoder setComputePipelineState:impl_->gemmInt4GroupedFusedPipeline];
+        const bool useSimdgroupPrefill =
+            impl_->supportsSimdgroupMatrix && impl_->enableSimdgroupInt4Gemm && M >= 4 && K >= 32 &&
+            impl_->gemmInt4GroupedSimdgroupPipeline != nil;
+        id<MTLComputePipelineState> pipeline =
+            useSimdgroupPrefill ? impl_->gemmInt4GroupedSimdgroupPipeline
+                                : impl_->gemmInt4GroupedFusedPipeline;
+        if (!pipeline) {
+            [encoder endEncoding];
+            return false;
+        }
+        [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:bufferA offset:0 atIndex:0];
         [encoder setBuffer:bufferW offset:0 atIndex:1];
         [encoder setBuffer:bufferScales offset:0 atIndex:2];
@@ -3623,7 +3951,8 @@ bool MetalBackend::GemmInt4Grouped(const Tensor& A, const Tensor& W, const Tenso
         [encoder setBytes:&group_size_u length:sizeof(uint) atIndex:8];
         [encoder setBytes:&has_zero_points_u length:sizeof(uint) atIndex:9];
 
-        const MTLSize threadgroupSize = MTLSizeMake(8, 8, 1);
+        const MTLSize threadgroupSize =
+            useSimdgroupPrefill ? MTLSizeMake(32, 1, 1) : MTLSizeMake(8, 8, 1);
         const MTLSize gridSize =
             MTLSizeMake((static_cast<NSUInteger>(N) + 7) / 8,
                         (static_cast<NSUInteger>(M) + 7) / 8, 1);
