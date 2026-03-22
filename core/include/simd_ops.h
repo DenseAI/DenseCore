@@ -840,23 +840,29 @@ inline void SimdCopy(void* dst, const void* src, size_t bytes) {
         memcpy(reinterpret_cast<char*>(dst) + i, reinterpret_cast<const char*>(src) + i, bytes - i);
     }
 #elif defined(DENSECORE_ARM)
+    // Try SVE path if runtime supports it and code is compiled with SVE
+    bool sve_executed = false;
     if (RuntimeHasArmSveOrBetter()) {
 #if defined(__ARM_FEATURE_SVE)
         SimdCopy_SVE(dst, src, bytes);
-        return;
+        sve_executed = true;
 #endif
     }
-    // NEON: 16 bytes per iteration
-    const size_t vec_size = 16;
-    size_t i = 0;
-    const uint8_t* s = reinterpret_cast<const uint8_t*>(src);
-    uint8_t* d = reinterpret_cast<uint8_t*>(dst);
-    for (; i + vec_size <= bytes; i += vec_size) {
-        uint8x16_t v = vld1q_u8(s + i);
-        vst1q_u8(d + i, v);
-    }
-    if (i < bytes) {
-        memcpy(d + i, s + i, bytes - i);
+
+    // Fallback to NEON if SVE was not available or failed
+    if (!sve_executed) {
+        // NEON: 16 bytes per iteration
+        const size_t vec_size = 16;
+        size_t i = 0;
+        const uint8_t* s = reinterpret_cast<const uint8_t*>(src);
+        uint8_t* d = reinterpret_cast<uint8_t*>(dst);
+        for (; i + vec_size <= bytes; i += vec_size) {
+            uint8x16_t v = vld1q_u8(s + i);
+            vst1q_u8(d + i, v);
+        }
+        if (i < bytes) {
+            memcpy(d + i, s + i, bytes - i);
+        }
     }
 #else
     memcpy(dst, src, bytes);
@@ -890,21 +896,27 @@ inline void ScaleF32(float* dst, const float* src, float scale, size_t n) {
         dst[i] = src[i] * scale;
     }
 #elif defined(DENSECORE_ARM)
+    // Try SVE path if runtime supports it and code is compiled with SVE
+    bool sve_executed = false;
     if (RuntimeHasArmSveOrBetter()) {
 #if defined(__ARM_FEATURE_SVE)
         ScaleF32_SVE(dst, src, scale, n);
-        return;
+        sve_executed = true;
 #endif
     }
-    float32x4_t vscale = vdupq_n_f32(scale);
-    size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4_t v = vld1q_f32(src + i);
-        v = vmulq_f32(v, vscale);
-        vst1q_f32(dst + i, v);
-    }
-    for (; i < n; i++) {
-        dst[i] = src[i] * scale;
+
+    // Fallback to NEON if SVE was not available or failed
+    if (!sve_executed) {
+        float32x4_t vscale = vdupq_n_f32(scale);
+        size_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            float32x4_t v = vld1q_f32(src + i);
+            v = vmulq_f32(v, vscale);
+            vst1q_f32(dst + i, v);
+        }
+        for (; i < n; i++) {
+            dst[i] = src[i] * scale;
+        }
     }
 #else
     for (size_t i = 0; i < n; i++) {
@@ -929,21 +941,27 @@ inline void AddF32(float* dst, const float* a, const float* b, size_t n) {
         dst[i] = a[i] + b[i];
     }
 #elif defined(DENSECORE_ARM)
+    // Try SVE path if runtime supports it and code is compiled with SVE
+    bool sve_executed = false;
     if (RuntimeHasArmSveOrBetter()) {
 #if defined(__ARM_FEATURE_SVE)
         AddF32_SVE(dst, a, b, n);
-        return;
+        sve_executed = true;
 #endif
     }
-    size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4_t va = vld1q_f32(a + i);
-        float32x4_t vb = vld1q_f32(b + i);
-        float32x4_t vc = vaddq_f32(va, vb);
-        vst1q_f32(dst + i, vc);
-    }
-    for (; i < n; i++) {
-        dst[i] = a[i] + b[i];
+
+    // Fallback to NEON if SVE was not available or failed
+    if (!sve_executed) {
+        size_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            float32x4_t va = vld1q_f32(a + i);
+            float32x4_t vb = vld1q_f32(b + i);
+            float32x4_t vc = vaddq_f32(va, vb);
+            vst1q_f32(dst + i, vc);
+        }
+        for (; i < n; i++) {
+            dst[i] = a[i] + b[i];
+        }
     }
 #else
     for (size_t i = 0; i < n; i++) {
@@ -999,21 +1017,29 @@ inline float DotF32(const float* a, const float* b, size_t n) {
     }
     return result;
 #elif defined(DENSECORE_ARM)
+    float result = 0.0f;
+    // Try SVE path if runtime supports it and code is compiled with SVE
+    bool sve_executed = false;
     if (RuntimeHasArmSveOrBetter()) {
 #if defined(__ARM_FEATURE_SVE)
-        return DotF32_SVE(a, b, n);
+        result = DotF32_SVE(a, b, n);
+        sve_executed = true;
 #endif
     }
-    float32x4_t sum = vdupq_n_f32(0.0f);
-    size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4_t va = vld1q_f32(a + i);
-        float32x4_t vb = vld1q_f32(b + i);
-        sum = vmlaq_f32(sum, va, vb);
-    }
-    float result = vaddvq_f32(sum);
-    for (; i < n; i++) {
-        result += a[i] * b[i];
+
+    // Fallback to NEON if SVE was not available or failed
+    if (!sve_executed) {
+        float32x4_t sum = vdupq_n_f32(0.0f);
+        size_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            float32x4_t va = vld1q_f32(a + i);
+            float32x4_t vb = vld1q_f32(b + i);
+            sum = vmlaq_f32(sum, va, vb);
+        }
+        result = vaddvq_f32(sum);
+        for (; i < n; i++) {
+            result += a[i] * b[i];
+        }
     }
     return result;
 #else
@@ -1050,20 +1076,28 @@ inline float MaxF32(const float* a, size_t n) {
     }
     return result;
 #elif defined(DENSECORE_ARM)
+    float result = -1e30f;
+    // Try SVE path if runtime supports it and code is compiled with SVE
+    bool sve_executed = false;
     if (RuntimeHasArmSveOrBetter()) {
 #if defined(__ARM_FEATURE_SVE)
-        return MaxF32_SVE(a, n);
+        result = MaxF32_SVE(a, n);
+        sve_executed = true;
 #endif
     }
-    float32x4_t vmax = vdupq_n_f32(-1e30f);
-    size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4_t v = vld1q_f32(a + i);
-        vmax = vmaxq_f32(vmax, v);
-    }
-    float result = vmaxvq_f32(vmax);
-    for (; i < n; i++) {
-        if (a[i] > result) result = a[i];
+
+    // Fallback to NEON if SVE was not available or failed
+    if (!sve_executed) {
+        float32x4_t vmax = vdupq_n_f32(-1e30f);
+        size_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            float32x4_t v = vld1q_f32(a + i);
+            vmax = vmaxq_f32(vmax, v);
+        }
+        result = vmaxvq_f32(vmax);
+        for (; i < n; i++) {
+            if (a[i] > result) result = a[i];
+        }
     }
     return result;
 #else
@@ -1098,20 +1132,28 @@ inline float SumF32(const float* a, size_t n) {
     }
     return result;
 #elif defined(DENSECORE_ARM)
+    float result = 0.0f;
+    // Try SVE path if runtime supports it and code is compiled with SVE
+    bool sve_executed = false;
     if (RuntimeHasArmSveOrBetter()) {
 #if defined(__ARM_FEATURE_SVE)
-        return SumF32_SVE(a, n);
+        result = SumF32_SVE(a, n);
+        sve_executed = true;
 #endif
     }
-    float32x4_t sum = vdupq_n_f32(0.0f);
-    size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4_t v = vld1q_f32(a + i);
-        sum = vaddq_f32(sum, v);
-    }
-    float result = vaddvq_f32(sum);
-    for (; i < n; i++) {
-        result += a[i];
+
+    // Fallback to NEON if SVE was not available or failed
+    if (!sve_executed) {
+        float32x4_t sum = vdupq_n_f32(0.0f);
+        size_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            float32x4_t v = vld1q_f32(a + i);
+            sum = vaddq_f32(sum, v);
+        }
+        result = vaddvq_f32(sum);
+        for (; i < n; i++) {
+            result += a[i];
+        }
     }
     return result;
 #else
@@ -1242,32 +1284,38 @@ inline void MeanPool(const float* input, float* output, int seq_len, int hidden_
         }
     }
 #elif defined(DENSECORE_ARM)
+    // Try SVE path if runtime supports it and code is compiled with SVE
+    bool sve_executed = false;
     if (RuntimeHasArmSveOrBetter()) {
 #if defined(__ARM_FEATURE_SVE)
         MeanPool_SVE(input, output, seq_len, hidden_dim);
-        return;
+        sve_executed = true;
 #endif
     }
-    for (int d = 0; d < hidden_dim; d += 4) {
-        int remaining = (d + 4 <= hidden_dim) ? 4 : hidden_dim - d;
-        if (remaining == 4) {
-            float32x4_t sum = vdupq_n_f32(0.0f);
-            for (int s = 0; s < seq_len; s++) {
-                float32x4_t v = vld1q_f32(input + s * hidden_dim + d);
-                sum = vaddq_f32(sum, v);
-            }
-            float32x4_t div = vdupq_n_f32(1.0f / seq_len);
-            sum = vmulq_f32(sum, div);
-            vst1q_f32(output + d, sum);
-        } else {
-            for (int dd = d; dd < hidden_dim; dd++) {
-                float sum = 0.0f;
+
+    // Fallback to NEON if SVE was not available or failed
+    if (!sve_executed) {
+        for (int d = 0; d < hidden_dim; d += 4) {
+            int remaining = (d + 4 <= hidden_dim) ? 4 : hidden_dim - d;
+            if (remaining == 4) {
+                float32x4_t sum = vdupq_n_f32(0.0f);
                 for (int s = 0; s < seq_len; s++) {
-                    sum += input[s * hidden_dim + dd];
+                    float32x4_t v = vld1q_f32(input + s * hidden_dim + d);
+                    sum = vaddq_f32(sum, v);
                 }
-                output[dd] = sum / seq_len;
+                float32x4_t div = vdupq_n_f32(1.0f / seq_len);
+                sum = vmulq_f32(sum, div);
+                vst1q_f32(output + d, sum);
+            } else {
+                for (int dd = d; dd < hidden_dim; dd++) {
+                    float sum = 0.0f;
+                    for (int s = 0; s < seq_len; s++) {
+                        sum += input[s * hidden_dim + dd];
+                    }
+                    output[dd] = sum / seq_len;
+                }
+                break;
             }
-            break;
         }
     }
 #else
@@ -1340,31 +1388,38 @@ inline void MaxPool(const float* input, float* output, int seq_len, int hidden_d
         }
     }
 #elif defined(DENSECORE_ARM)
+    // Try SVE path if runtime supports it and code is compiled with SVE
+    bool sve_executed = false;
     if (RuntimeHasArmSveOrBetter()) {
 #if defined(__ARM_FEATURE_SVE)
         MaxPool_SVE(input, output, seq_len, hidden_dim);
-        return;
+        sve_executed = true;
 #endif
     }
-    for (int d = 0; d < hidden_dim; d += 4) {
-        int remaining = (d + 4 <= hidden_dim) ? 4 : hidden_dim - d;
-        if (remaining == 4) {
-            float32x4_t vmax = vld1q_f32(input + d);
-            for (int s = 1; s < seq_len; s++) {
-                float32x4_t v = vld1q_f32(input + s * hidden_dim + d);
-                vmax = vmaxq_f32(vmax, v);
-            }
-            vst1q_f32(output + d, vmax);
-        } else {
-            for (int dd = d; dd < hidden_dim; dd++) {
-                float maxv = input[dd];
+
+    // Fallback to NEON if SVE was not available or failed
+    if (!sve_executed) {
+        for (int d = 0; d < hidden_dim; d += 4) {
+            int remaining = (d + 4 <= hidden_dim) ? 4 : hidden_dim - d;
+            if (remaining == 4) {
+                float32x4_t vmax = vld1q_f32(input + d);
                 for (int s = 1; s < seq_len; s++) {
-                    float v = input[s * hidden_dim + dd];
-                    if (v > maxv) maxv = v;
+                    float32x4_t v = vld1q_f32(input + s * hidden_dim + d);
+                    vmax = vmaxq_f32(vmax, v);
                 }
-                output[dd] = maxv;
+                vst1q_f32(output + d, vmax);
+            } else {
+                // Handle remaining elements with scalar code
+                for (int dd = d; dd < hidden_dim; dd++) {
+                    float maxv = input[dd];
+                    for (int s = 1; s < seq_len; s++) {
+                        float v = input[s * hidden_dim + dd];
+                        if (v > maxv) maxv = v;
+                    }
+                    output[dd] = maxv;
+                }
+                break;
             }
-            break;
         }
     }
 #else
