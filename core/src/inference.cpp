@@ -3450,6 +3450,7 @@ void cb_glm_dsa_attention_custom(struct ggml_tensor* dst, int ith, int nth, void
     thread_local std::vector<float> attn_scores;
     thread_local std::vector<int> selected_positions;
     thread_local std::map<int, std::vector<int>> token_selected_positions_cache;
+    token_selected_positions_cache.clear();
     index_key_scratch.resize(static_cast<size_t>(index_head_dim));
     k_slot_scratch.resize(static_cast<size_t>(ud->cache->GetElementsPerSlot()));
     v_slot_scratch.resize(static_cast<size_t>(ud->cache->GetVElementsPerSlot()));
