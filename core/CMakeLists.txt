@@ -741,6 +741,11 @@ if(APPLE)
         ${METAL_SHADER_DIR}/gemv.metal
         ${METAL_SHADER_DIR}/flash_attention.metal
         ${METAL_SHADER_DIR}/quantized_gemv.metal
+        ${METAL_SHADER_DIR}/window_attention.metal
+        ${METAL_SHADER_DIR}/temporal_attention.metal
+        ${METAL_SHADER_DIR}/triangular_attention.metal
+        ${METAL_SHADER_DIR}/patch_embed_3d.metal
+        ${METAL_SHADER_DIR}/point_cloud_ops.metal
     )
 
 

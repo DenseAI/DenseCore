@@ -16,6 +16,7 @@
 #import <Metal/Metal.h>
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -43,6 +44,48 @@ MTLSize ChooseThreadgroupSize(id<MTLComputePipelineState> pipeline, MTLSize grid
     const NSUInteger tz = std::max<NSUInteger>(1, std::min(grid.depth, tz_cap));
     return MTLSizeMake(tx, ty, tz);
 }
+
+id<MTLBuffer> WrapSharedBuffer(id<MTLDevice> device, const void* data, size_t bytes) {
+    return [device newBufferWithBytesNoCopy:(void*)data
+                                     length:bytes
+                                    options:MTLResourceStorageModeShared
+                                deallocator:nil];
+}
+
+DenseCoreOp* GetCpuFallback(OpType op) {
+    return OpRegistry::Instance().GetBest(op, DeviceType::CPU);
+}
+
+DenseCoreOp* GetExactDeviceOp(OpType op, DeviceType device) {
+    return OpRegistry::Instance().Get(op, device);
+}
+
+template <OpType kOpType, int kPriority = 10>
+class AppleNpuForwardOp : public DenseCoreOp {
+public:
+    void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                 const void* params) override {
+        if (auto* metal = GetExactDeviceOp(kOpType, DeviceType::METAL)) {
+            metal->Execute(inputs, outputs, params);
+            return;
+        }
+        if (auto* cpu = GetExactDeviceOp(kOpType, DeviceType::CPU)) {
+            cpu->Execute(inputs, outputs, params);
+            return;
+        }
+        throw std::runtime_error(std::string("[AppleNpuForwardOp] No delegate registered for ") +
+                                 OpTypeName(kOpType));
+    }
+
+    bool Supports(DeviceType device) const override { return device == DeviceType::NPU; }
+
+    OpCapabilities GetCapabilities() const override {
+        // Explicit NPU registration for admission/dispatch ownership. This is not
+        // a claim of ANE-native execution; it forwards to Metal when available
+        // and otherwise preserves CPU fallback.
+        return {.supports_fp16 = true, .priority = kPriority};
+    }
+};
 
 // ============================================================================
 // Metal Context Singleton
@@ -102,9 +145,16 @@ private:
 
         // Try loading from bundle first
         NSBundle* bundle = [NSBundle mainBundle];
-        NSString* libraryPath = [bundle pathForResource:@"universal_ops" ofType:@"metallib"];
-        if (libraryPath) {
+        NSArray<NSString*>* libraryNames = @[ @"universal_ops", @"densecore" ];
+        for (NSString* libraryName in libraryNames) {
+            NSString* libraryPath = [bundle pathForResource:libraryName ofType:@"metallib"];
+            if (!libraryPath) {
+                continue;
+            }
             library_ = [device_ newLibraryWithFile:libraryPath error:&error];
+            if (library_) {
+                break;
+            }
         }
 
         // Fallback: compile shaders at runtime
@@ -115,7 +165,8 @@ private:
             // Try to load individual shader files
             NSArray<NSString*>* shaderFiles = @[
                 @"window_attention.metal", @"temporal_attention.metal",
-                @"triangular_attention.metal", @"patch_embed_3d.metal"
+                @"triangular_attention.metal", @"patch_embed_3d.metal",
+                @"point_cloud_ops.metal"
             ];
 
             // Compile each shader if metallib not available
@@ -784,6 +835,588 @@ public:
 };
 
 // ============================================================================
+// Metal Point-Cloud / NeRF Ops
+// ============================================================================
+
+class MetalPointCloudPatchifyOp : public DenseCoreOp {
+public:
+    void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                 const void* params) override {
+        auto cpu_fallback = [&]() {
+            if (auto* cpu = GetCpuFallback(OpType::PointCloudPatchify)) {
+                cpu->Execute(inputs, outputs, params);
+            }
+        };
+        if (inputs.size() < 2 || outputs.empty()) {
+            cpu_fallback();
+            return;
+        }
+
+        auto& ctx = MetalContext::Instance();
+        if (!ctx.IsAvailable()) {
+            cpu_fallback();
+            return;
+        }
+        id<MTLComputePipelineState> pipeline = ctx.GetPipeline("point_cloud_patchify_forward");
+        if (!pipeline) {
+            cpu_fallback();
+            return;
+        }
+
+        const auto* p = static_cast<const PointCloudPatchifyParams*>(params);
+        PointCloudPatchifyParams default_params;
+        if (!p) p = &default_params;
+
+        const Tensor* points = inputs[0];
+        const Tensor* features = inputs[1];
+        Tensor* patches = outputs[0];
+        const uint B = static_cast<uint>(points->shape[0]);
+        const uint N = static_cast<uint>(points->shape[1]);
+        const uint D = static_cast<uint>(features->shape[2]);
+        const uint P = static_cast<uint>(p->num_patches);
+        const uint patch_dim = static_cast<uint>(p->patch_dim);
+        if (B == 0 || N == 0 || D == 0 || P == 0 || patch_dim == 0) {
+            cpu_fallback();
+            return;
+        }
+
+        id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), points->data, points->SizeBytes()) offset:0 atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), features->data, features->SizeBytes()) offset:0 atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), patches->data, patches->SizeBytes()) offset:0 atIndex:2];
+        [encoder setBytes:&B length:sizeof(uint) atIndex:3];
+        [encoder setBytes:&N length:sizeof(uint) atIndex:4];
+        [encoder setBytes:&D length:sizeof(uint) atIndex:5];
+        [encoder setBytes:&P length:sizeof(uint) atIndex:6];
+        [encoder setBytes:&patch_dim length:sizeof(uint) atIndex:7];
+
+        MTLSize gridSize = MTLSizeMake(patch_dim, P, B);
+        MTLSize threadGroupSize = ChooseThreadgroupSize(pipeline, gridSize);
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+    }
+
+    bool Supports(DeviceType device) const override {
+        return device == DeviceType::METAL && MetalContext::Instance().IsAvailable();
+    }
+
+    OpCapabilities GetCapabilities() const override {
+        return {.supports_fp16 = true, .priority = 80};
+    }
+};
+
+class MetalPointCloudUnpatchifyOp : public DenseCoreOp {
+public:
+    void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                 const void* params) override {
+        auto cpu_fallback = [&]() {
+            if (auto* cpu = GetCpuFallback(OpType::PointCloudUnpatchify)) {
+                cpu->Execute(inputs, outputs, params);
+            }
+        };
+        if (inputs.size() < 2 || outputs.empty()) {
+            cpu_fallback();
+            return;
+        }
+
+        auto& ctx = MetalContext::Instance();
+        if (!ctx.IsAvailable()) {
+            cpu_fallback();
+            return;
+        }
+        id<MTLComputePipelineState> pipeline = ctx.GetPipeline("point_cloud_unpatchify_forward");
+        if (!pipeline) {
+            cpu_fallback();
+            return;
+        }
+
+        const auto* p = static_cast<const PointCloudPatchifyParams*>(params);
+        PointCloudPatchifyParams default_params;
+        if (!p) p = &default_params;
+
+        const Tensor* patches = inputs[0];
+        const Tensor* points = inputs[1];
+        Tensor* features = outputs[0];
+        const uint B = static_cast<uint>(points->shape[0]);
+        const uint N = static_cast<uint>(points->shape[1]);
+        const uint D = static_cast<uint>(features->shape[2]);
+        const uint P = static_cast<uint>(p->num_patches);
+        if (B == 0 || N == 0 || D == 0 || P == 0) {
+            cpu_fallback();
+            return;
+        }
+
+        id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), patches->data, patches->SizeBytes()) offset:0 atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), points->data, points->SizeBytes()) offset:0 atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), features->data, features->SizeBytes()) offset:0 atIndex:2];
+        [encoder setBytes:&B length:sizeof(uint) atIndex:3];
+        [encoder setBytes:&N length:sizeof(uint) atIndex:4];
+        [encoder setBytes:&D length:sizeof(uint) atIndex:5];
+        [encoder setBytes:&P length:sizeof(uint) atIndex:6];
+
+        MTLSize gridSize = MTLSizeMake(D, N, B);
+        MTLSize threadGroupSize = ChooseThreadgroupSize(pipeline, gridSize);
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+    }
+
+    bool Supports(DeviceType device) const override {
+        return device == DeviceType::METAL && MetalContext::Instance().IsAvailable();
+    }
+
+    OpCapabilities GetCapabilities() const override {
+        return {.supports_fp16 = true, .priority = 80};
+    }
+};
+
+class MetalNeRFPositionalEncodingOp : public DenseCoreOp {
+public:
+    void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                 const void* params) override {
+        auto cpu_fallback = [&]() {
+            if (auto* cpu = GetCpuFallback(OpType::NeRFPositionalEncoding)) {
+                cpu->Execute(inputs, outputs, params);
+            }
+        };
+        if (inputs.empty() || outputs.empty()) {
+            cpu_fallback();
+            return;
+        }
+
+        auto& ctx = MetalContext::Instance();
+        if (!ctx.IsAvailable()) {
+            cpu_fallback();
+            return;
+        }
+        id<MTLComputePipelineState> pipeline = ctx.GetPipeline("nerf_positional_encoding_forward");
+        if (!pipeline) {
+            cpu_fallback();
+            return;
+        }
+
+        const auto* p = static_cast<const NeRFPositionalEncodingParams*>(params);
+        NeRFPositionalEncodingParams default_params;
+        if (!p) p = &default_params;
+
+        const Tensor* xyz = inputs[0];
+        Tensor* output = outputs[0];
+        const uint B = static_cast<uint>(xyz->shape[0]);
+        const uint N = static_cast<uint>(xyz->shape[1]);
+        const uint freq_bands = static_cast<uint>(p->num_frequencies);
+        const uint include_input = p->include_input ? 1u : 0u;
+        const uint out_dim = (include_input ? 3u : 0u) + 6u * freq_bands;
+
+        id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), xyz->data, xyz->SizeBytes()) offset:0 atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), output->data, output->SizeBytes()) offset:0 atIndex:1];
+        [encoder setBytes:&B length:sizeof(uint) atIndex:2];
+        [encoder setBytes:&N length:sizeof(uint) atIndex:3];
+        [encoder setBytes:&freq_bands length:sizeof(uint) atIndex:4];
+        [encoder setBytes:&include_input length:sizeof(uint) atIndex:5];
+
+        MTLSize gridSize = MTLSizeMake(out_dim, N, B);
+        MTLSize threadGroupSize = ChooseThreadgroupSize(pipeline, gridSize);
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+    }
+
+    bool Supports(DeviceType device) const override {
+        return device == DeviceType::METAL && MetalContext::Instance().IsAvailable();
+    }
+
+    OpCapabilities GetCapabilities() const override {
+        return {.supports_fp16 = true, .priority = 90};
+    }
+};
+
+class MetalGaussianFourierFeaturesOp : public DenseCoreOp {
+public:
+    void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                 const void* params) override {
+        auto cpu_fallback = [&]() {
+            if (auto* cpu = GetCpuFallback(OpType::GaussianFourierFeatures)) {
+                cpu->Execute(inputs, outputs, params);
+            }
+        };
+        if (inputs.size() < 2 || outputs.empty()) {
+            cpu_fallback();
+            return;
+        }
+
+        auto& ctx = MetalContext::Instance();
+        if (!ctx.IsAvailable()) {
+            cpu_fallback();
+            return;
+        }
+        id<MTLComputePipelineState> pipeline = ctx.GetPipeline("gaussian_fourier_features_forward");
+        if (!pipeline) {
+            cpu_fallback();
+            return;
+        }
+
+        const Tensor* xyz = inputs[0];
+        const Tensor* B_matrix = inputs[1];
+        Tensor* output = outputs[0];
+        const uint B = static_cast<uint>(xyz->shape[0]);
+        const uint N = static_cast<uint>(xyz->shape[1]);
+        const uint num_features = static_cast<uint>(output->shape[2]);
+        if ((num_features % 2u) != 0u) {
+            cpu_fallback();
+            return;
+        }
+
+        id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), xyz->data, xyz->SizeBytes()) offset:0 atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), B_matrix->data, B_matrix->SizeBytes()) offset:0 atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), output->data, output->SizeBytes()) offset:0 atIndex:2];
+        [encoder setBytes:&B length:sizeof(uint) atIndex:3];
+        [encoder setBytes:&N length:sizeof(uint) atIndex:4];
+        [encoder setBytes:&num_features length:sizeof(uint) atIndex:5];
+
+        MTLSize gridSize = MTLSizeMake(num_features, N, B);
+        MTLSize threadGroupSize = ChooseThreadgroupSize(pipeline, gridSize);
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+    }
+
+    bool Supports(DeviceType device) const override {
+        return device == DeviceType::METAL && MetalContext::Instance().IsAvailable();
+    }
+
+    OpCapabilities GetCapabilities() const override {
+        return {.supports_fp16 = true, .priority = 90};
+    }
+};
+
+class MetalFarthestPointSamplingOp : public DenseCoreOp {
+public:
+    void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                 const void* params) override {
+        auto cpu_fallback = [&]() {
+            if (auto* cpu = GetCpuFallback(OpType::FarthestPointSampling)) {
+                cpu->Execute(inputs, outputs, params);
+            }
+        };
+        if (inputs.empty() || outputs.empty()) {
+            cpu_fallback();
+            return;
+        }
+
+        auto& ctx = MetalContext::Instance();
+        if (!ctx.IsAvailable()) {
+            cpu_fallback();
+            return;
+        }
+        id<MTLComputePipelineState> pipeline = ctx.GetPipeline("farthest_point_sampling_forward");
+        if (!pipeline) {
+            cpu_fallback();
+            return;
+        }
+
+        const auto* p = static_cast<const FarthestPointSamplingParams*>(params);
+        FarthestPointSamplingParams default_params;
+        if (!p) p = &default_params;
+
+        const Tensor* points = inputs[0];
+        Tensor* indices = outputs[0];
+        const uint B = static_cast<uint>(points->shape[0]);
+        const uint N = static_cast<uint>(points->shape[1]);
+        const uint samples = static_cast<uint>(p->num_samples);
+        if (B == 0 || N == 0 || samples == 0) {
+            cpu_fallback();
+            return;
+        }
+
+        id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), points->data, points->SizeBytes()) offset:0 atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), indices->data, indices->SizeBytes()) offset:0 atIndex:1];
+        [encoder setBytes:&B length:sizeof(uint) atIndex:2];
+        [encoder setBytes:&N length:sizeof(uint) atIndex:3];
+        [encoder setBytes:&samples length:sizeof(uint) atIndex:4];
+
+        MTLSize gridSize = MTLSizeMake(B, 1, 1);
+        MTLSize threadGroupSize = MTLSizeMake(1, 1, 1);
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+    }
+
+    bool Supports(DeviceType device) const override {
+        return device == DeviceType::METAL && MetalContext::Instance().IsAvailable();
+    }
+
+    OpCapabilities GetCapabilities() const override {
+        return {.supports_fp16 = false, .priority = 70};
+    }
+};
+
+class MetalKNNQueryOp : public DenseCoreOp {
+public:
+    void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                 const void* params) override {
+        auto cpu_fallback = [&]() {
+            if (auto* cpu = GetCpuFallback(OpType::KNNQuery)) {
+                cpu->Execute(inputs, outputs, params);
+            }
+        };
+        if (inputs.size() < 2 || outputs.size() < 2) {
+            cpu_fallback();
+            return;
+        }
+
+        auto& ctx = MetalContext::Instance();
+        if (!ctx.IsAvailable()) {
+            cpu_fallback();
+            return;
+        }
+        id<MTLComputePipelineState> pipeline = ctx.GetPipeline("knn_query_forward");
+        if (!pipeline) {
+            cpu_fallback();
+            return;
+        }
+
+        const auto* p = static_cast<const KNNQueryParams*>(params);
+        KNNQueryParams default_params;
+        if (!p) p = &default_params;
+        const uint k = static_cast<uint>(p->k);
+        if (k == 0 || k > 64u) {
+            cpu_fallback();
+            return;
+        }
+
+        const Tensor* query = inputs[0];
+        const Tensor* ref = inputs[1];
+        Tensor* indices = outputs[0];
+        Tensor* distances = outputs[1];
+        const uint B = static_cast<uint>(query->shape[0]);
+        const uint M = static_cast<uint>(query->shape[1]);
+        const uint N = static_cast<uint>(ref->shape[1]);
+
+        id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), query->data, query->SizeBytes()) offset:0 atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), ref->data, ref->SizeBytes()) offset:0 atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), indices->data, indices->SizeBytes()) offset:0 atIndex:2];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), distances->data, distances->SizeBytes()) offset:0 atIndex:3];
+        [encoder setBytes:&B length:sizeof(uint) atIndex:4];
+        [encoder setBytes:&M length:sizeof(uint) atIndex:5];
+        [encoder setBytes:&N length:sizeof(uint) atIndex:6];
+        [encoder setBytes:&k length:sizeof(uint) atIndex:7];
+
+        MTLSize gridSize = MTLSizeMake(M, 1, B);
+        MTLSize threadGroupSize = ChooseThreadgroupSize(pipeline, gridSize);
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+    }
+
+    bool Supports(DeviceType device) const override {
+        return device == DeviceType::METAL && MetalContext::Instance().IsAvailable();
+    }
+
+    OpCapabilities GetCapabilities() const override {
+        return {.supports_fp16 = false, .priority = 70};
+    }
+};
+
+class MetalBallQueryOp : public DenseCoreOp {
+public:
+    void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                 const void* params) override {
+        auto cpu_fallback = [&]() {
+            if (auto* cpu = GetCpuFallback(OpType::BallQuery)) {
+                cpu->Execute(inputs, outputs, params);
+            }
+        };
+        if (inputs.size() < 2 || outputs.empty()) {
+            cpu_fallback();
+            return;
+        }
+
+        auto& ctx = MetalContext::Instance();
+        if (!ctx.IsAvailable()) {
+            cpu_fallback();
+            return;
+        }
+        id<MTLComputePipelineState> pipeline = ctx.GetPipeline("ball_query_forward");
+        if (!pipeline) {
+            cpu_fallback();
+            return;
+        }
+
+        const auto* p = static_cast<const BallQueryParams*>(params);
+        BallQueryParams default_params;
+        if (!p) p = &default_params;
+
+        const Tensor* query = inputs[0];
+        const Tensor* ref = inputs[1];
+        Tensor* indices = outputs[0];
+        const uint B = static_cast<uint>(query->shape[0]);
+        const uint M = static_cast<uint>(query->shape[1]);
+        const uint N = static_cast<uint>(ref->shape[1]);
+        const float radius = p->radius;
+        const uint max_samples = static_cast<uint>(p->max_samples);
+        if (max_samples == 0) {
+            cpu_fallback();
+            return;
+        }
+
+        id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), query->data, query->SizeBytes()) offset:0 atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), ref->data, ref->SizeBytes()) offset:0 atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), indices->data, indices->SizeBytes()) offset:0 atIndex:2];
+        [encoder setBytes:&B length:sizeof(uint) atIndex:3];
+        [encoder setBytes:&M length:sizeof(uint) atIndex:4];
+        [encoder setBytes:&N length:sizeof(uint) atIndex:5];
+        [encoder setBytes:&radius length:sizeof(float) atIndex:6];
+        [encoder setBytes:&max_samples length:sizeof(uint) atIndex:7];
+
+        MTLSize gridSize = MTLSizeMake(M, 1, B);
+        MTLSize threadGroupSize = ChooseThreadgroupSize(pipeline, gridSize);
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+    }
+
+    bool Supports(DeviceType device) const override {
+        return device == DeviceType::METAL && MetalContext::Instance().IsAvailable();
+    }
+
+    OpCapabilities GetCapabilities() const override {
+        return {.supports_fp16 = false, .priority = 70};
+    }
+};
+
+class MetalDeformableAttentionOp : public DenseCoreOp {
+public:
+    void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                 const void* params) override {
+        auto cpu_fallback = [&]() {
+            if (auto* cpu = GetCpuFallback(OpType::DeformableAttention)) {
+                cpu->Execute(inputs, outputs, params);
+            }
+        };
+        if (inputs.size() < 6 || outputs.empty()) {
+            cpu_fallback();
+            return;
+        }
+
+        auto& ctx = MetalContext::Instance();
+        if (!ctx.IsAvailable()) {
+            cpu_fallback();
+            return;
+        }
+        id<MTLComputePipelineState> pipeline = ctx.GetPipeline("deformable_attention_3d_forward");
+        if (!pipeline) {
+            cpu_fallback();
+            return;
+        }
+
+        const auto* p = static_cast<const DeformableAttentionParams*>(params);
+        DeformableAttentionParams default_params;
+        if (!p) p = &default_params;
+
+        const Tensor* query = inputs[0];
+        const Tensor* key = inputs[1];
+        const Tensor* value = inputs[2];
+        const Tensor* reference = inputs[3];
+        const Tensor* offsets = inputs[4];
+        const Tensor* weights = inputs[5];
+        const Tensor* key_points = inputs.size() >= 7 ? inputs[6] : nullptr;
+        Tensor* output = outputs[0];
+
+        const uint B = static_cast<uint>(query->shape[0]);
+        const uint Q = static_cast<uint>(query->shape[1]);
+        const uint N = static_cast<uint>(value->shape[1]);
+        const uint D = static_cast<uint>(query->shape[2]);
+        const uint H = static_cast<uint>(std::max(1, p->num_heads));
+        const uint total_samples = static_cast<uint>(std::max(1, p->num_points));
+        const uint offset_heads = offsets->ndim >= 4 ? static_cast<uint>(offsets->shape[2]) : 1u;
+        const uint weight_heads = weights->ndim >= 4 ? static_cast<uint>(weights->shape[2]) : 1u;
+        const uint use_key_points = (key_points && key_points->IsValid() && key_points->ndim == 3) ? 1u : 0u;
+
+        id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), query->data, query->SizeBytes()) offset:0 atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), key->data, key->SizeBytes()) offset:0 atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), value->data, value->SizeBytes()) offset:0 atIndex:2];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), reference->data, reference->SizeBytes()) offset:0 atIndex:3];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), offsets->data, offsets->SizeBytes()) offset:0 atIndex:4];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), weights->data, weights->SizeBytes()) offset:0 atIndex:5];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(),
+                                            use_key_points ? key_points->data : key->data,
+                                            use_key_points ? key_points->SizeBytes() : key->SizeBytes())
+                    offset:0
+                   atIndex:6];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), output->data, output->SizeBytes()) offset:0 atIndex:7];
+        [encoder setBytes:&B length:sizeof(uint) atIndex:8];
+        [encoder setBytes:&Q length:sizeof(uint) atIndex:9];
+        [encoder setBytes:&N length:sizeof(uint) atIndex:10];
+        [encoder setBytes:&D length:sizeof(uint) atIndex:11];
+        [encoder setBytes:&H length:sizeof(uint) atIndex:12];
+        [encoder setBytes:&total_samples length:sizeof(uint) atIndex:13];
+        [encoder setBytes:&offset_heads length:sizeof(uint) atIndex:14];
+        [encoder setBytes:&weight_heads length:sizeof(uint) atIndex:15];
+        [encoder setBytes:&use_key_points length:sizeof(uint) atIndex:16];
+
+        MTLSize gridSize = MTLSizeMake(D, Q, B);
+        MTLSize threadGroupSize = ChooseThreadgroupSize(pipeline, gridSize);
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+    }
+
+    bool Supports(DeviceType device) const override {
+        return device == DeviceType::METAL && MetalContext::Instance().IsAvailable();
+    }
+
+    OpCapabilities GetCapabilities() const override {
+        return {.supports_fp16 = true, .priority = 85};
+    }
+};
+
+using NpuTemporalAttentionOp = AppleNpuForwardOp<OpType::TemporalAttention>;
+using NpuPatchEmbed3DOp = AppleNpuForwardOp<OpType::PatchEmbed3D>;
+using NpuPatchifyOp = AppleNpuForwardOp<OpType::Patchify>;
+using NpuUnpatchifyOp = AppleNpuForwardOp<OpType::Unpatchify>;
+using NpuPointCloudPatchifyOp = AppleNpuForwardOp<OpType::PointCloudPatchify>;
+using NpuPointCloudUnpatchifyOp = AppleNpuForwardOp<OpType::PointCloudUnpatchify>;
+using NpuDeformableAttentionOp = AppleNpuForwardOp<OpType::DeformableAttention>;
+using NpuFarthestPointSamplingOp = AppleNpuForwardOp<OpType::FarthestPointSampling>;
+using NpuKNNQueryOp = AppleNpuForwardOp<OpType::KNNQuery>;
+using NpuBallQueryOp = AppleNpuForwardOp<OpType::BallQuery>;
+using NpuNeRFPositionalEncodingOp = AppleNpuForwardOp<OpType::NeRFPositionalEncoding>;
+using NpuGaussianFourierFeaturesOp = AppleNpuForwardOp<OpType::GaussianFourierFeatures>;
+using NpuGridSampleOp = AppleNpuForwardOp<OpType::GridSample>;
+
+// ============================================================================
 // Op Registration
 // ============================================================================
 
@@ -793,6 +1426,28 @@ DENSECORE_REGISTER_OP(MetalTriangularAttentionOp, OpType::TriangularAttention, D
 DENSECORE_REGISTER_OP(MetalPatchEmbed3DOp, OpType::PatchEmbed3D, DeviceType::METAL);
 DENSECORE_REGISTER_OP(MetalPatchifyOp, OpType::Patchify, DeviceType::METAL);
 DENSECORE_REGISTER_OP(MetalUnpatchifyOp, OpType::Unpatchify, DeviceType::METAL);
+DENSECORE_REGISTER_OP(MetalPointCloudPatchifyOp, OpType::PointCloudPatchify, DeviceType::METAL);
+DENSECORE_REGISTER_OP(MetalPointCloudUnpatchifyOp, OpType::PointCloudUnpatchify, DeviceType::METAL);
+DENSECORE_REGISTER_OP(MetalDeformableAttentionOp, OpType::DeformableAttention, DeviceType::METAL);
+DENSECORE_REGISTER_OP(MetalFarthestPointSamplingOp, OpType::FarthestPointSampling, DeviceType::METAL);
+DENSECORE_REGISTER_OP(MetalKNNQueryOp, OpType::KNNQuery, DeviceType::METAL);
+DENSECORE_REGISTER_OP(MetalBallQueryOp, OpType::BallQuery, DeviceType::METAL);
+DENSECORE_REGISTER_OP(MetalNeRFPositionalEncodingOp, OpType::NeRFPositionalEncoding, DeviceType::METAL);
+DENSECORE_REGISTER_OP(MetalGaussianFourierFeaturesOp, OpType::GaussianFourierFeatures, DeviceType::METAL);
+
+DENSECORE_REGISTER_OP(NpuTemporalAttentionOp, OpType::TemporalAttention, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuPatchEmbed3DOp, OpType::PatchEmbed3D, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuPatchifyOp, OpType::Patchify, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuUnpatchifyOp, OpType::Unpatchify, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuPointCloudPatchifyOp, OpType::PointCloudPatchify, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuPointCloudUnpatchifyOp, OpType::PointCloudUnpatchify, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuDeformableAttentionOp, OpType::DeformableAttention, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuFarthestPointSamplingOp, OpType::FarthestPointSampling, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuKNNQueryOp, OpType::KNNQuery, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuBallQueryOp, OpType::BallQuery, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuNeRFPositionalEncodingOp, OpType::NeRFPositionalEncoding, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuGaussianFourierFeaturesOp, OpType::GaussianFourierFeatures, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuGridSampleOp, OpType::GridSample, DeviceType::NPU);
 
 }  // namespace
 }  // namespace kernels
