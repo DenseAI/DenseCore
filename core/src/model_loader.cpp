@@ -1006,15 +1006,15 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
         if (!layer.Get(model_keys::kFfnGate)) {
             layer.Set(model_keys::kFfnGate,
-                      find_layer_tensor_with_tokens(layer, {"shared_experts", "gate_proj"}, {"experts"}));
+                      find_layer_tensor_with_tokens(layer, {"shared_experts", "gate_proj"}));
         }
         if (!layer.Get(model_keys::kFfnUp)) {
             layer.Set(model_keys::kFfnUp,
-                      find_layer_tensor_with_tokens(layer, {"shared_experts", "up_proj"}, {"experts"}));
+                      find_layer_tensor_with_tokens(layer, {"shared_experts", "up_proj"}));
         }
         if (!layer.Get(model_keys::kFfnDown)) {
             layer.Set(model_keys::kFfnDown,
-                      find_layer_tensor_with_tokens(layer, {"shared_experts", "down_proj"}, {"experts"}));
+                      find_layer_tensor_with_tokens(layer, {"shared_experts", "down_proj"}));
         }
         if (!layer.Get(model_keys::kMoeGate)) {
             layer.Set(model_keys::kMoeGate, find_layer_tensor_with_tokens(layer, {"mlp", "gate.weight"}, {"shared"}));

@@ -3449,13 +3449,16 @@ void cb_glm_dsa_attention_custom(struct ggml_tensor* dst, int ith, int nth, void
     thread_local std::vector<std::pair<float, int>> index_scores;
     thread_local std::vector<float> attn_scores;
     thread_local std::vector<int> selected_positions;
+    thread_local std::map<int, std::vector<int>> token_selected_positions_cache;
     index_key_scratch.resize(static_cast<size_t>(index_head_dim));
     k_slot_scratch.resize(static_cast<size_t>(ud->cache->GetElementsPerSlot()));
     v_slot_scratch.resize(static_cast<size_t>(ud->cache->GetVElementsPerSlot()));
 
-    for (int token_idx = ith; token_idx < q_tokens; token_idx += nth) {
-        float* out_token = reinterpret_cast<float*>(out_base + static_cast<size_t>(token_idx) * out_token_stride);
-        std::fill(out_token, out_token + static_cast<size_t>(n_head) * static_cast<size_t>(v_head_dim), 0.0f);
+    // Flatten token and head loops for 2D parallelization
+    const int total_work = q_tokens * n_head;
+    for (int work_idx = ith; work_idx < total_work; work_idx += nth) {
+        const int token_idx = work_idx / n_head;
+        const int h = work_idx % n_head;
 
         if (token_idx >= static_cast<int>(batch->seq_id.size()) || token_idx >= static_cast<int>(batch->pos.size())) {
             continue;
@@ -3479,103 +3482,111 @@ void cb_glm_dsa_attention_custom(struct ggml_tensor* dst, int ith, int nth, void
         const int context_len = std::max(1, std::min(retained_span.history_kept + 1, max_context));
         const int effective_topk = index_topk > 0 ? std::min(index_topk, context_len) : context_len;
 
-        const float* q_token = reinterpret_cast<const float*>(q_base + static_cast<size_t>(token_idx) * q_token_stride);
-        const float* index_weights_token =
-            reinterpret_cast<const float*>(index_weights_base + static_cast<size_t>(token_idx) * index_weights_token_stride);
-        const char* index_q_token_base = index_q_base + static_cast<size_t>(token_idx) * index_q_token_stride;
-        index_scores.clear();
-        index_scores.reserve(static_cast<size_t>(context_len));
-        for (int t = 0; t < context_len; ++t) {
-            const int token_pos =
-                (t < retained_span.history_kept) ? MapRetainedHistoryIndex(retained_span, t) : pos_i;
-            const int logical_block = token_pos / BLOCK_SIZE;
-            const int slot = token_pos % BLOCK_SIZE;
-            if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) continue;
-            const int block_id = block_table[static_cast<size_t>(logical_block)];
-            if (block_id < 0 || block_id >= ud->cache->max_blocks) continue;
+        // Compute selected positions once per token (with lazy cache)
+        if (token_selected_positions_cache.find(token_idx) == token_selected_positions_cache.end()) {
+            const float* index_weights_token =
+                reinterpret_cast<const float*>(index_weights_base + static_cast<size_t>(token_idx) * index_weights_token_stride);
+            const char* index_q_token_base = index_q_base + static_cast<size_t>(token_idx) * index_q_token_stride;
+            index_scores.clear();
+            index_scores.reserve(static_cast<size_t>(context_len));
+            for (int t = 0; t < context_len; ++t) {
+                const int token_pos =
+                    (t < retained_span.history_kept) ? MapRetainedHistoryIndex(retained_span, t) : pos_i;
+                const int logical_block = token_pos / BLOCK_SIZE;
+                const int slot = token_pos % BLOCK_SIZE;
+                if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) continue;
+                const int block_id = block_table[static_cast<size_t>(logical_block)];
+                if (block_id < 0 || block_id >= ud->cache->max_blocks) continue;
 
-            ud->cache->ReadIndexSlot(block_id, ud->layer, slot, index_key_scratch.data());
-            float score = 0.0f;
-            for (int ih = 0; ih < index_n_heads; ++ih) {
-                const float* q_index_head =
-                    reinterpret_cast<const float*>(index_q_token_base + static_cast<size_t>(ih) * index_q_tensor->nb[1]);
-                float dot = 0.0f;
-                for (int d = 0; d < index_head_dim; ++d) {
-                    dot += q_index_head[d] * index_key_scratch[static_cast<size_t>(d)];
+                ud->cache->ReadIndexSlot(block_id, ud->layer, slot, index_key_scratch.data());
+                float score = 0.0f;
+                for (int ih = 0; ih < index_n_heads; ++ih) {
+                    const float* q_index_head =
+                        reinterpret_cast<const float*>(index_q_token_base + static_cast<size_t>(ih) * index_q_tensor->nb[1]);
+                    float dot = 0.0f;
+                    for (int d = 0; d < index_head_dim; ++d) {
+                        dot += q_index_head[d] * index_key_scratch[static_cast<size_t>(d)];
+                    }
+                    score += index_weights_token[ih] * (dot * index_scale);
                 }
-                score += index_weights_token[ih] * (dot * index_scale);
+                index_scores.emplace_back(score, token_pos);
             }
-            index_scores.emplace_back(score, token_pos);
+
+            if (!index_scores.empty()) {
+                if (static_cast<int>(index_scores.size()) > effective_topk) {
+                    std::partial_sort(index_scores.begin(), index_scores.begin() + effective_topk, index_scores.end(),
+                                      [](const auto& a, const auto& b) { return a.first > b.first; });
+                }
+                const int selected_count = std::min(effective_topk, static_cast<int>(index_scores.size()));
+                std::vector<int>& cached = token_selected_positions_cache[token_idx];
+                cached.resize(static_cast<size_t>(selected_count));
+                for (int i = 0; i < selected_count; ++i) {
+                    cached[static_cast<size_t>(i)] = index_scores[static_cast<size_t>(i)].second;
+                }
+            }
         }
 
-        if (index_scores.empty()) {
+        const auto& cached_it = token_selected_positions_cache.find(token_idx);
+        if (cached_it == token_selected_positions_cache.end() || cached_it->second.empty()) {
+            continue;
+        }
+        const std::vector<int>& selected_positions_ref = cached_it->second;
+        const int selected_count = static_cast<int>(selected_positions_ref.size());
+
+        float* out_token = reinterpret_cast<float*>(out_base + static_cast<size_t>(token_idx) * out_token_stride);
+        const float* q_token = reinterpret_cast<const float*>(q_base + static_cast<size_t>(token_idx) * q_token_stride);
+        const float* q_head = q_token + static_cast<size_t>(h) * head_dim;
+        float* out_head = out_token + static_cast<size_t>(h) * v_head_dim;
+        std::fill(out_head, out_head + v_head_dim, 0.0f);
+
+        const int kv_head = std::min(n_head_kv - 1, std::max(0, h / kv_group_size));
+        float max_score = -std::numeric_limits<float>::infinity();
+        attn_scores.resize(static_cast<size_t>(selected_count));
+        for (int i = 0; i < selected_count; ++i) {
+            const int token_pos = selected_positions_ref[static_cast<size_t>(i)];
+            const int logical_block = token_pos / BLOCK_SIZE;
+            const int slot = token_pos % BLOCK_SIZE;
+            const int block_id = block_table[static_cast<size_t>(logical_block)];
+            ud->cache->ReadKSlot(block_id, ud->layer, slot, k_slot_scratch.data());
+            const float* k_head = k_slot_scratch.data() + static_cast<size_t>(kv_head) * head_dim;
+
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                score += q_head[d] * k_head[d];
+            }
+            score *= attn_scale;
+            attn_scores[static_cast<size_t>(i)] = score;
+            if (score > max_score) max_score = score;
+        }
+
+        if (!std::isfinite(max_score)) {
             continue;
         }
 
-        if (static_cast<int>(index_scores.size()) > effective_topk) {
-            std::partial_sort(index_scores.begin(), index_scores.begin() + effective_topk, index_scores.end(),
-                              [](const auto& a, const auto& b) { return a.first > b.first; });
-        }
-        const int selected_count = std::min(effective_topk, static_cast<int>(index_scores.size()));
-        selected_positions.resize(static_cast<size_t>(selected_count));
+        float denom = 0.0f;
         for (int i = 0; i < selected_count; ++i) {
-            selected_positions[static_cast<size_t>(i)] = index_scores[static_cast<size_t>(i)].second;
+            const float weight = std::exp(attn_scores[static_cast<size_t>(i)] - max_score);
+            if (!(weight > 0.0f) || !std::isfinite(weight)) continue;
+            denom += weight;
+
+            const int token_pos = selected_positions_ref[static_cast<size_t>(i)];
+            const int logical_block = token_pos / BLOCK_SIZE;
+            const int slot = token_pos % BLOCK_SIZE;
+            const int block_id = block_table[static_cast<size_t>(logical_block)];
+            ud->cache->ReadVSlot(block_id, ud->layer, slot, v_slot_scratch.data());
+            const float* v_head = v_slot_scratch.data() + static_cast<size_t>(kv_head) * v_head_dim;
+            for (int d = 0; d < v_head_dim; ++d) {
+                out_head[d] += weight * v_head[d];
+            }
         }
 
-        attn_scores.resize(static_cast<size_t>(selected_count));
-        for (int h = 0; h < n_head; ++h) {
-            const float* q_head = q_token + static_cast<size_t>(h) * head_dim;
-            float* out_head = out_token + static_cast<size_t>(h) * v_head_dim;
+        if (!(denom > 0.0f) || !std::isfinite(denom)) {
             std::fill(out_head, out_head + v_head_dim, 0.0f);
-
-            const int kv_head = std::min(n_head_kv - 1, std::max(0, h / kv_group_size));
-            float max_score = -std::numeric_limits<float>::infinity();
-            for (int i = 0; i < selected_count; ++i) {
-                const int token_pos = selected_positions[static_cast<size_t>(i)];
-                const int logical_block = token_pos / BLOCK_SIZE;
-                const int slot = token_pos % BLOCK_SIZE;
-                const int block_id = block_table[static_cast<size_t>(logical_block)];
-                ud->cache->ReadKSlot(block_id, ud->layer, slot, k_slot_scratch.data());
-                const float* k_head = k_slot_scratch.data() + static_cast<size_t>(kv_head) * head_dim;
-
-                float score = 0.0f;
-                for (int d = 0; d < head_dim; ++d) {
-                    score += q_head[d] * k_head[d];
-                }
-                score *= attn_scale;
-                attn_scores[static_cast<size_t>(i)] = score;
-                if (score > max_score) max_score = score;
-            }
-
-            if (!std::isfinite(max_score)) {
-                continue;
-            }
-
-            float denom = 0.0f;
-            for (int i = 0; i < selected_count; ++i) {
-                const float weight = std::exp(attn_scores[static_cast<size_t>(i)] - max_score);
-                if (!(weight > 0.0f) || !std::isfinite(weight)) continue;
-                denom += weight;
-
-                const int token_pos = selected_positions[static_cast<size_t>(i)];
-                const int logical_block = token_pos / BLOCK_SIZE;
-                const int slot = token_pos % BLOCK_SIZE;
-                const int block_id = block_table[static_cast<size_t>(logical_block)];
-                ud->cache->ReadVSlot(block_id, ud->layer, slot, v_slot_scratch.data());
-                const float* v_head = v_slot_scratch.data() + static_cast<size_t>(kv_head) * v_head_dim;
-                for (int d = 0; d < v_head_dim; ++d) {
-                    out_head[d] += weight * v_head[d];
-                }
-            }
-
-            if (!(denom > 0.0f) || !std::isfinite(denom)) {
-                std::fill(out_head, out_head + v_head_dim, 0.0f);
-                continue;
-            }
-            const float inv = 1.0f / denom;
-            for (int d = 0; d < v_head_dim; ++d) {
-                out_head[d] *= inv;
-            }
+            continue;
+        }
+        const float inv = 1.0f / denom;
+        for (int d = 0; d < v_head_dim; ++d) {
+            out_head[d] *= inv;
         }
     }
 }
@@ -3605,7 +3616,9 @@ inline struct ggml_tensor* ggml_glm_dsa_attention(struct ggml_context* ctx, stru
     if (physical_cores > 0) {
         n_tasks = std::min(n_tasks, physical_cores);
     }
-    n_tasks = std::max(1, std::min(n_tasks, std::max(1, static_cast<int>(q_cur->ne[2]))));
+    const int n_head = std::max(1, static_cast<int>(q_cur->ne[1]));
+    const int q_tokens = std::max(1, static_cast<int>(q_cur->ne[2]));
+    n_tasks = std::max(1, std::min(n_tasks, q_tokens * n_head));
 
     struct {
         ggml_custom_op_t fun;
@@ -4962,7 +4975,7 @@ static densecore::moe::MoERouteResult RouteMoEGroupedSigmoid(const struct ggml_t
     std::vector<float> probs(static_cast<size_t>(n_experts), 0.0f);
     std::vector<float> choice_scores(static_cast<size_t>(n_experts), 0.0f);
     std::vector<float> group_scores(static_cast<size_t>(n_group), -std::numeric_limits<float>::infinity());
-    std::vector<int> active_groups(static_cast<size_t>(topk_group), 0);
+    std::vector<int> active_groups(static_cast<size_t>(n_group), 0);
     std::vector<int> selected(static_cast<size_t>(top_k), -1);
     const auto stable_sigmoid = [](float x) -> float {
         if (x >= 0.0f) {
@@ -4999,7 +5012,7 @@ static densecore::moe::MoERouteResult RouteMoEGroupedSigmoid(const struct ggml_t
         }
 
         std::iota(active_groups.begin(), active_groups.end(), 0);
-        std::partial_sort(active_groups.begin(), active_groups.end(), active_groups.end(),
+        std::partial_sort(active_groups.begin(), active_groups.begin() + topk_group, active_groups.end(),
                           [&](int a, int b) { return group_scores[static_cast<size_t>(a)] > group_scores[static_cast<size_t>(b)]; });
 
         std::vector<std::pair<float, int>> candidates;
