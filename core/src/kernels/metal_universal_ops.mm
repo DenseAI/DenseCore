@@ -875,7 +875,8 @@ public:
         const uint D = static_cast<uint>(features->shape[2]);
         const uint P = static_cast<uint>(p->num_patches);
         const uint patch_dim = static_cast<uint>(p->patch_dim);
-        if (B == 0 || N == 0 || D == 0 || P == 0 || patch_dim == 0) {
+        const float voxel_size = p->voxel_size;
+        if (B == 0 || N == 0 || D == 0 || P == 0 || patch_dim == 0 || P > N) {
             cpu_fallback();
             return;
         }
@@ -897,6 +898,7 @@ public:
         [encoder setBytes:&D length:sizeof(uint) atIndex:5];
         [encoder setBytes:&P length:sizeof(uint) atIndex:6];
         [encoder setBytes:&patch_dim length:sizeof(uint) atIndex:7];
+        [encoder setBytes:&voxel_size length:sizeof(float) atIndex:8];
 
         MTLSize gridSize = MTLSizeMake(patch_dim, P, B);
         MTLSize threadGroupSize = ChooseThreadgroupSize(pipeline, gridSize);
@@ -951,7 +953,8 @@ public:
         const uint B = static_cast<uint>(points->shape[0]);
         const uint N = static_cast<uint>(points->shape[1]);
         const uint D = static_cast<uint>(features->shape[2]);
-        const uint P = static_cast<uint>(p->num_patches);
+        const uint P = static_cast<uint>(patches->shape[1]);
+        const float voxel_size = p->voxel_size;
         if (B == 0 || N == 0 || D == 0 || P == 0) {
             cpu_fallback();
             return;
@@ -973,6 +976,7 @@ public:
         [encoder setBytes:&N length:sizeof(uint) atIndex:4];
         [encoder setBytes:&D length:sizeof(uint) atIndex:5];
         [encoder setBytes:&P length:sizeof(uint) atIndex:6];
+        [encoder setBytes:&voxel_size length:sizeof(float) atIndex:7];
 
         MTLSize gridSize = MTLSizeMake(D, N, B);
         MTLSize threadGroupSize = ChooseThreadgroupSize(pipeline, gridSize);

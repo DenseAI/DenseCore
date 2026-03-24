@@ -146,6 +146,188 @@ TEST_F(UniversalOpsTest, PatchifyUnpatchifyInverse) {
     }
 }
 
+TEST_F(UniversalOpsTest, CpuBallQueryPadsMissingNeighborsWithMinusOne) {
+    std::vector<float> query = {0.0f, 0.0f, 0.0f};
+    std::vector<float> reference = {
+        0.0f, 0.0f, 0.0f,
+        10.0f, 0.0f, 0.0f,
+    };
+    std::vector<int32_t> indices(3, 99);
+
+    Tensor query_tensor = Tensor::Wrap(query.data(), {1, 1, 3}, DType::F32);
+    Tensor ref_tensor = Tensor::Wrap(reference.data(), {1, 2, 3}, DType::F32);
+    Tensor out_tensor = Tensor::Wrap(indices.data(), {1, 1, 3}, DType::INT32);
+
+    auto* op = OpRegistry::Instance().Get(OpType::BallQuery, DeviceType::CPU);
+    if (!op) {
+        GTEST_SKIP() << "BallQuery op not registered";
+    }
+
+    BallQueryParams params;
+    params.radius = 0.5f;
+    params.max_samples = 3;
+    op->Execute({&query_tensor, &ref_tensor}, {&out_tensor}, &params);
+
+    EXPECT_EQ(indices[0], 0);
+    EXPECT_EQ(indices[1], -1);
+    EXPECT_EQ(indices[2], -1);
+}
+
+TEST_F(UniversalOpsTest, CpuPointCloudPatchifyUsesMortonOrdering) {
+    std::vector<float> points = {
+        2.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f,
+        3.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+    };
+    std::vector<float> features = {10.0f, 20.0f, 30.0f, 40.0f};
+    std::vector<float> patches(2, 0.0f);
+
+    Tensor points_tensor = Tensor::Wrap(points.data(), {1, 4, 3}, DType::F32);
+    Tensor features_tensor = Tensor::Wrap(features.data(), {1, 4, 1}, DType::F32);
+    Tensor patches_tensor = Tensor::Wrap(patches.data(), {1, 2, 1}, DType::F32);
+
+    auto* op = OpRegistry::Instance().Get(OpType::PointCloudPatchify, DeviceType::CPU);
+    if (!op) {
+        GTEST_SKIP() << "PointCloudPatchify op not registered";
+    }
+
+    PointCloudPatchifyParams params;
+    params.num_patches = 2;
+    params.patch_dim = 1;
+    params.voxel_size = 1.0f;
+    op->Execute({&points_tensor, &features_tensor}, {&patches_tensor}, &params);
+
+    EXPECT_FLOAT_EQ(patches[0], 30.0f);
+    EXPECT_FLOAT_EQ(patches[1], 20.0f);
+}
+
+TEST_F(UniversalOpsTest, CpuPointCloudUnpatchifyUsesMortonOrdering) {
+    std::vector<float> points = {
+        2.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f,
+        3.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+    };
+    std::vector<float> patches = {100.0f, 200.0f};
+    std::vector<float> features(4, -1.0f);
+
+    Tensor patches_tensor = Tensor::Wrap(patches.data(), {1, 2, 1}, DType::F32);
+    Tensor points_tensor = Tensor::Wrap(points.data(), {1, 4, 3}, DType::F32);
+    Tensor features_tensor = Tensor::Wrap(features.data(), {1, 4, 1}, DType::F32);
+
+    auto* op = OpRegistry::Instance().Get(OpType::PointCloudUnpatchify, DeviceType::CPU);
+    if (!op) {
+        GTEST_SKIP() << "PointCloudUnpatchify op not registered";
+    }
+
+    PointCloudPatchifyParams params;
+    params.num_patches = 2;
+    params.patch_dim = 1;
+    params.voxel_size = 1.0f;
+    op->Execute({&patches_tensor, &points_tensor}, {&features_tensor}, &params);
+
+    EXPECT_FLOAT_EQ(features[0], 200.0f);
+    EXPECT_FLOAT_EQ(features[1], 100.0f);
+    EXPECT_FLOAT_EQ(features[2], 200.0f);
+    EXPECT_FLOAT_EQ(features[3], 100.0f);
+}
+
+#if defined(__APPLE__)
+TEST_F(UniversalOpsTest, MetalBallQueryMatchesCpuPaddingSemantics) {
+    auto* cpu_op = OpRegistry::Instance().Get(OpType::BallQuery, DeviceType::CPU);
+    auto* metal_op = OpRegistry::Instance().Get(OpType::BallQuery, DeviceType::METAL);
+    if (!cpu_op || !metal_op || !metal_op->Supports(DeviceType::METAL)) {
+        GTEST_SKIP() << "BallQuery Metal op not available";
+    }
+
+    std::vector<float> query = {0.0f, 0.0f, 0.0f};
+    std::vector<float> reference = {
+        0.0f, 0.0f, 0.0f,
+        10.0f, 0.0f, 0.0f,
+    };
+    std::vector<int32_t> cpu_indices(3, 0);
+    std::vector<int32_t> metal_indices(3, 0);
+
+    Tensor query_tensor = Tensor::Wrap(query.data(), {1, 1, 3}, DType::F32);
+    Tensor ref_tensor = Tensor::Wrap(reference.data(), {1, 2, 3}, DType::F32);
+    Tensor cpu_out = Tensor::Wrap(cpu_indices.data(), {1, 1, 3}, DType::INT32);
+    Tensor metal_out = Tensor::Wrap(metal_indices.data(), {1, 1, 3}, DType::INT32);
+
+    BallQueryParams params;
+    params.radius = 0.5f;
+    params.max_samples = 3;
+    cpu_op->Execute({&query_tensor, &ref_tensor}, {&cpu_out}, &params);
+    metal_op->Execute({&query_tensor, &ref_tensor}, {&metal_out}, &params);
+
+    EXPECT_EQ(cpu_indices, metal_indices);
+}
+
+TEST_F(UniversalOpsTest, MetalPointCloudPatchifyMatchesCpuMortonOrdering) {
+    auto* cpu_op = OpRegistry::Instance().Get(OpType::PointCloudPatchify, DeviceType::CPU);
+    auto* metal_op = OpRegistry::Instance().Get(OpType::PointCloudPatchify, DeviceType::METAL);
+    if (!cpu_op || !metal_op || !metal_op->Supports(DeviceType::METAL)) {
+        GTEST_SKIP() << "PointCloudPatchify Metal op not available";
+    }
+
+    std::vector<float> points = {
+        2.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f,
+        3.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+    };
+    std::vector<float> features = {10.0f, 20.0f, 30.0f, 40.0f};
+    std::vector<float> cpu_patches(2, 0.0f);
+    std::vector<float> metal_patches(2, 0.0f);
+
+    Tensor points_tensor = Tensor::Wrap(points.data(), {1, 4, 3}, DType::F32);
+    Tensor features_tensor = Tensor::Wrap(features.data(), {1, 4, 1}, DType::F32);
+    Tensor cpu_out = Tensor::Wrap(cpu_patches.data(), {1, 2, 1}, DType::F32);
+    Tensor metal_out = Tensor::Wrap(metal_patches.data(), {1, 2, 1}, DType::F32);
+
+    PointCloudPatchifyParams params;
+    params.num_patches = 2;
+    params.patch_dim = 1;
+    params.voxel_size = 1.0f;
+    cpu_op->Execute({&points_tensor, &features_tensor}, {&cpu_out}, &params);
+    metal_op->Execute({&points_tensor, &features_tensor}, {&metal_out}, &params);
+
+    EXPECT_EQ(cpu_patches, metal_patches);
+}
+
+TEST_F(UniversalOpsTest, MetalPointCloudUnpatchifyMatchesCpuMortonOrdering) {
+    auto* cpu_op = OpRegistry::Instance().Get(OpType::PointCloudUnpatchify, DeviceType::CPU);
+    auto* metal_op = OpRegistry::Instance().Get(OpType::PointCloudUnpatchify, DeviceType::METAL);
+    if (!cpu_op || !metal_op || !metal_op->Supports(DeviceType::METAL)) {
+        GTEST_SKIP() << "PointCloudUnpatchify Metal op not available";
+    }
+
+    std::vector<float> points = {
+        2.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f,
+        3.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+    };
+    std::vector<float> patches = {100.0f, 200.0f};
+    std::vector<float> cpu_features(4, -1.0f);
+    std::vector<float> metal_features(4, -1.0f);
+
+    Tensor patches_tensor = Tensor::Wrap(patches.data(), {1, 2, 1}, DType::F32);
+    Tensor points_tensor = Tensor::Wrap(points.data(), {1, 4, 3}, DType::F32);
+    Tensor cpu_out = Tensor::Wrap(cpu_features.data(), {1, 4, 1}, DType::F32);
+    Tensor metal_out = Tensor::Wrap(metal_features.data(), {1, 4, 1}, DType::F32);
+
+    PointCloudPatchifyParams params;
+    params.num_patches = 2;
+    params.patch_dim = 1;
+    params.voxel_size = 1.0f;
+    cpu_op->Execute({&patches_tensor, &points_tensor}, {&cpu_out}, &params);
+    metal_op->Execute({&patches_tensor, &points_tensor}, {&metal_out}, &params);
+
+    EXPECT_EQ(cpu_features, metal_features);
+}
+#endif
+
 // ============================================================================
 // WindowAttention Tests
 // ============================================================================

@@ -19,6 +19,39 @@ inline float distance_squared3(float ax, float ay, float az, float bx, float by,
     return dx * dx + dy * dy + dz * dz;
 }
 
+inline uint expand_bits_10(uint v) {
+    v = (v | (v << 16)) & 0x030000FFu;
+    v = (v | (v << 8)) & 0x0300F00Fu;
+    v = (v | (v << 4)) & 0x030C30C3u;
+    v = (v | (v << 2)) & 0x09249249u;
+    return v;
+}
+
+inline uint morton_code3d(float x, float y, float z, float voxel_size) {
+    const uint ix = uint(min(max(x / voxel_size, 0.0f), 1023.0f));
+    const uint iy = uint(min(max(y / voxel_size, 0.0f), 1023.0f));
+    const uint iz = uint(min(max(z / voxel_size, 0.0f), 1023.0f));
+    return (expand_bits_10(iz) << 2) | (expand_bits_10(iy) << 1) | expand_bits_10(ix);
+}
+
+inline uint morton_rank_for_point(device const float* points, uint batch, uint num_points, uint point_idx,
+                                  float voxel_size) {
+    const uint point_base = ((batch * num_points) + point_idx) * 3u;
+    const uint point_code =
+        morton_code3d(points[point_base + 0], points[point_base + 1], points[point_base + 2], voxel_size);
+
+    uint rank = 0u;
+    for (uint other = 0u; other < num_points; ++other) {
+        const uint other_base = ((batch * num_points) + other) * 3u;
+        const uint other_code =
+            morton_code3d(points[other_base + 0], points[other_base + 1], points[other_base + 2], voxel_size);
+        if (other_code < point_code || (other_code == point_code && other < point_idx)) {
+            ++rank;
+        }
+    }
+    return rank;
+}
+
 kernel void point_cloud_patchify_forward(
     device const float* points [[buffer(0)]],
     device const float* features [[buffer(1)]],
@@ -28,28 +61,31 @@ kernel void point_cloud_patchify_forward(
     constant uint& feature_dim [[buffer(5)]],
     constant uint& num_patches [[buffer(6)]],
     constant uint& patch_dim [[buffer(7)]],
+    constant float& voxel_size [[buffer(8)]],
     uint3 gid [[thread_position_in_grid]])
 {
     const uint dim = gid.x;
     const uint patch = gid.y;
     const uint b = gid.z;
     if (b >= batch || patch >= num_patches || dim >= patch_dim) return;
-    (void)points;
 
     const uint points_per_patch = max(1u, num_points / max(1u, num_patches));
     const uint start = patch * points_per_patch;
     const uint end = min(start + points_per_patch, num_points);
-    const uint count = max(1u, end > start ? end - start : 1u);
+    const uint count = end > start ? end - start : 0u;
 
     float sum = 0.0f;
     if (dim < feature_dim) {
-        for (uint i = start; i < end; ++i) {
+        for (uint i = 0u; i < num_points; ++i) {
+            const uint rank = morton_rank_for_point(points, b, num_points, i, voxel_size);
+            if (rank < start || rank >= end) continue;
             const uint idx = ((b * num_points + i) * feature_dim) + dim;
             sum += features[idx];
         }
     }
 
-    patches[((b * num_patches + patch) * patch_dim) + dim] = sum / float(count);
+    patches[((b * num_patches + patch) * patch_dim) + dim] =
+        (dim < feature_dim && count > 0u) ? (sum / float(count)) : 0.0f;
 }
 
 kernel void point_cloud_unpatchify_forward(
@@ -60,16 +96,20 @@ kernel void point_cloud_unpatchify_forward(
     constant uint& num_points [[buffer(4)]],
     constant uint& feature_dim [[buffer(5)]],
     constant uint& num_patches [[buffer(6)]],
+    constant float& voxel_size [[buffer(7)]],
     uint3 gid [[thread_position_in_grid]])
 {
     const uint dim = gid.x;
     const uint point = gid.y;
     const uint b = gid.z;
     if (b >= batch || point >= num_points || dim >= feature_dim) return;
-    (void)points;
 
     const uint points_per_patch = max(1u, num_points / max(1u, num_patches));
-    const uint patch = min(point / points_per_patch, num_patches - 1u);
+    const uint assigned_points = min(num_points, points_per_patch * num_patches);
+    const uint rank = morton_rank_for_point(points, b, num_points, point, voxel_size);
+    if (rank >= assigned_points) return;
+
+    const uint patch = min(rank / points_per_patch, num_patches - 1u);
     features[((b * num_points + point) * feature_dim) + dim] =
         patches[((b * num_patches + patch) * feature_dim) + dim];
 }
@@ -258,7 +298,6 @@ kernel void ball_query_forward(
     const float qz = query_points[query_base + 2];
 
     uint count = 0u;
-    int last = -1;
     for (uint r = 0; r < num_references && count < max_samples; ++r) {
         const uint ref_base = (b * num_references + r) * 3u;
         if (distance_squared3(qx, qy, qz,
@@ -266,13 +305,12 @@ kernel void ball_query_forward(
                               reference_points[ref_base + 1],
                               reference_points[ref_base + 2]) <= radius2) {
             indices[out_base + count] = int(r);
-            last = int(r);
             ++count;
         }
     }
 
     for (uint i = count; i < max_samples; ++i) {
-        indices[out_base + i] = last;
+        indices[out_base + i] = -1;
     }
 }
 

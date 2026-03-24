@@ -452,6 +452,17 @@ TransformerModel* LoadGGUFModel(const char* path) {
         tmp = static_cast<uint32_t>(model->glm_index_n_heads);
         get_u32("index_n_heads", tmp);
         model->glm_index_n_heads = static_cast<int>(tmp);
+
+        // Validate required GLM-5 DSA parameters
+        if (model->glm_kv_lora_rank <= 0 || model->glm_v_head_dim <= 0 || model->glm_index_head_dim <= 0 ||
+            model->glm_index_n_heads <= 0) {
+            fprintf(stderr,
+                    "[ModelLoader] Warning: GLM-5 DSA model has missing required parameters "
+                    "(kv_lora_rank=%d, v_head_dim=%d, index_head_dim=%d, index_n_heads=%d). "
+                    "DSA attention will be disabled and inference may be incorrect.\n",
+                    model->glm_kv_lora_rank, model->glm_v_head_dim, model->glm_index_head_dim,
+                    model->glm_index_n_heads);
+        }
     }
 
     // Load SSM parameters for hybrid models (Qwen3.5, Jamba, etc.)

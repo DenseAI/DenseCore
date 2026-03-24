@@ -3347,6 +3347,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
 void cb_glm_dsa_attention_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     auto* ud = static_cast<PagedAttentionUserData*>(userdata);
     if (!ud || !ud->cache || !dst || !dst->data || nth <= 0) return;
+    if (!ud->cache->has_index_cache) return;
     if (!dst->src[0] || !dst->src[1] || !dst->src[2] || !dst->src[3] || !dst->src[4] || !dst->src[5]) return;
 
     const auto* q_tensor = dst->src[0];
@@ -3451,7 +3452,7 @@ void cb_glm_dsa_attention_custom(struct ggml_tensor* dst, int ith, int nth, void
     thread_local std::vector<std::pair<float, int>> index_scores;
     thread_local std::vector<float> attn_scores;
     thread_local std::vector<int> selected_positions;
-    thread_local std::map<int, std::vector<int>> token_selected_positions_cache;
+    thread_local std::unordered_map<int, std::vector<int>> token_selected_positions_cache;
     token_selected_positions_cache.clear();
     index_key_scratch.resize(static_cast<size_t>(index_head_dim));
     k_slot_scratch.resize(static_cast<size_t>(ud->cache->GetElementsPerSlot()));

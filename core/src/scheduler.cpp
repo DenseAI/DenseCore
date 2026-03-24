@@ -268,9 +268,11 @@ SchedulerOutput Scheduler::Schedule() {
                 }
             }
 
-            if (mixed_prefill_admitted) {
+            if (mixed_prefill_admitted && waiting_queue_.empty()) {
                 consecutive_decode_batches_ = 0;
             } else {
+                // Preserve the decode streak while any waiting prompt is still
+                // blocked so the isolated-prefill fairness fallback can fire.
                 consecutive_decode_batches_++;
             }
             return output;
