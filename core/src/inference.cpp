@@ -24,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <queue>
 #include <random>
 #include <thread>
@@ -1164,7 +1165,11 @@ struct PagedAttentionUserData {
     PagedKVCache* cache = nullptr;
     int layer = 0;
     int head_dim = 0;
+    int v_head_dim = 0;
     int n_head = 0;
+    int index_n_heads = 0;
+    int index_head_dim = 0;
+    int index_topk = 0;
     std::atomic<uint64_t> epoch_started{0};
     std::atomic<uint64_t> epoch_done{0};
     std::atomic<int> kv_writers_done{0};
@@ -1291,6 +1296,13 @@ struct SSMQwen35DeltaUserData {
     int head_dim_k;
     int n_groups;
     float norm_eps;
+};
+
+struct GLMDSAPackUserData {
+    int n_heads;
+    int qk_nope_head_dim;
+    int qk_rope_head_dim;
+    int v_head_dim;
 };
 
 // ============================================================================
@@ -2848,20 +2860,23 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
     const int n_head_kv = ud->cache->n_head_kv;
     const int n_head_total = ud->n_head;
     const int head_dim = ud->head_dim;
-    if (head_dim <= 0 || n_head_kv <= 0 || n_head_total <= 0 || (n_head_total % n_head_kv) != 0) {
+    const int v_head_dim = ud->v_head_dim > 0 ? ud->v_head_dim : ud->head_dim;
+    if (head_dim <= 0 || v_head_dim <= 0 || n_head_kv <= 0 || n_head_total <= 0 || (n_head_total % n_head_kv) != 0) {
         for (int h = h_start; h < h_end; ++h) {
-            float* out_head = out_data + static_cast<size_t>(h) * head_dim;
-            std::fill(out_head, out_head + head_dim, 0.0f);
+            float* out_head = out_data + static_cast<size_t>(h) * v_head_dim;
+            std::fill(out_head, out_head + v_head_dim, 0.0f);
         }
         return;
     }
 
     const int kv_group_size = n_head_total / n_head_kv;
-    const auto layout = ud->cache->GetBlockLayout();
-    if (layout.head_stride_bytes == 0 || layout.slot_stride_bytes == 0) {
+    const auto k_layout = ud->cache->GetBlockLayout();
+    const auto v_layout = ud->cache->GetVBlockLayout();
+    if (k_layout.head_stride_bytes == 0 || k_layout.slot_stride_bytes == 0 || v_layout.head_stride_bytes == 0 ||
+        v_layout.slot_stride_bytes == 0) {
         for (int h = h_start; h < h_end; ++h) {
-            float* out_head = out_data + static_cast<size_t>(h) * head_dim;
-            std::fill(out_head, out_head + head_dim, 0.0f);
+            float* out_head = out_data + static_cast<size_t>(h) * v_head_dim;
+            std::fill(out_head, out_head + v_head_dim, 0.0f);
         }
         return;
     }
@@ -2883,20 +2898,22 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
     thread_local std::vector<float> v_head_scratch;
     thread_local std::vector<float> scores;
     k_head_scratch.resize(static_cast<size_t>(head_dim));
-    v_head_scratch.resize(static_cast<size_t>(head_dim));
+    v_head_scratch.resize(static_cast<size_t>(v_head_dim));
     scores.resize(static_cast<size_t>(context_len));
 
-    const auto* quant_traits = ggml_is_quantized(layout.cache_type) ? ggml_get_type_traits(layout.cache_type) : nullptr;
+    const auto* quant_traits =
+        ggml_is_quantized(k_layout.cache_type) ? ggml_get_type_traits(k_layout.cache_type) : nullptr;
 
     for (int h = h_start; h < h_end; ++h) {
         const float* q_head = q_data + static_cast<size_t>(h) * head_dim;
-        float* out_head = out_data + static_cast<size_t>(h) * head_dim;
-        std::fill(out_head, out_head + head_dim, 0.0f);
+        float* out_head = out_data + static_cast<size_t>(h) * v_head_dim;
+        std::fill(out_head, out_head + v_head_dim, 0.0f);
 
         int kv_head = h / kv_group_size;
         if (kv_head < 0) kv_head = 0;
         if (kv_head >= n_head_kv) kv_head = n_head_kv - 1;
-        const size_t head_offset_bytes = static_cast<size_t>(kv_head) * layout.head_stride_bytes;
+        const size_t k_head_offset_bytes = static_cast<size_t>(kv_head) * k_layout.head_stride_bytes;
+        const size_t v_head_offset_bytes = static_cast<size_t>(kv_head) * v_layout.head_stride_bytes;
 
         float max_score = -INFINITY;
         for (int t = 0; t < context_len; ++t) {
@@ -2916,15 +2933,15 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
             }
 
             const uint8_t* k_ptr =
-                k_block_base + static_cast<size_t>(slot_idx) * layout.slot_stride_bytes + head_offset_bytes;
+                k_block_base + static_cast<size_t>(slot_idx) * k_layout.slot_stride_bytes + k_head_offset_bytes;
             const float* k_head = nullptr;
-            if (layout.cache_type == GGML_TYPE_F32) {
+            if (k_layout.cache_type == GGML_TYPE_F32) {
                 k_head = reinterpret_cast<const float*>(k_ptr);
-            } else if (layout.cache_type == GGML_TYPE_F16) {
+            } else if (k_layout.cache_type == GGML_TYPE_F16) {
                 densecore::simd::ConvertF16ToF32(k_head_scratch.data(), reinterpret_cast<const ggml_fp16_t*>(k_ptr),
                                                  head_dim);
                 k_head = k_head_scratch.data();
-            } else if (ggml_is_quantized(layout.cache_type) && quant_traits && quant_traits->to_float) {
+            } else if (ggml_is_quantized(k_layout.cache_type) && quant_traits && quant_traits->to_float) {
                 quant_traits->to_float(k_ptr, k_head_scratch.data(), head_dim);
                 k_head = k_head_scratch.data();
             }
@@ -2965,33 +2982,33 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
             if (!v_block_base) continue;
 
             const uint8_t* v_ptr =
-                v_block_base + static_cast<size_t>(slot_idx) * layout.slot_stride_bytes + head_offset_bytes;
+                v_block_base + static_cast<size_t>(slot_idx) * v_layout.slot_stride_bytes + v_head_offset_bytes;
             const float* v_head = nullptr;
-            if (layout.cache_type == GGML_TYPE_F32) {
+            if (v_layout.cache_type == GGML_TYPE_F32) {
                 v_head = reinterpret_cast<const float*>(v_ptr);
-            } else if (layout.cache_type == GGML_TYPE_F16) {
+            } else if (v_layout.cache_type == GGML_TYPE_F16) {
                 densecore::simd::ConvertF16ToF32(v_head_scratch.data(), reinterpret_cast<const ggml_fp16_t*>(v_ptr),
-                                                 head_dim);
+                                                 v_head_dim);
                 v_head = v_head_scratch.data();
-            } else if (ggml_is_quantized(layout.cache_type) && quant_traits && quant_traits->to_float) {
-                quant_traits->to_float(v_ptr, v_head_scratch.data(), head_dim);
+            } else if (ggml_is_quantized(v_layout.cache_type) && quant_traits && quant_traits->to_float) {
+                quant_traits->to_float(v_ptr, v_head_scratch.data(), v_head_dim);
                 v_head = v_head_scratch.data();
             }
             if (!v_head) continue;
 
-            for (int d = 0; d < head_dim; ++d) {
+            for (int d = 0; d < v_head_dim; ++d) {
                 out_head[d] += weight * v_head[d];
             }
             denom += weight;
         }
 
         if (!(denom > 0.0f) || !std::isfinite(denom)) {
-            std::fill(out_head, out_head + head_dim, 0.0f);
+            std::fill(out_head, out_head + v_head_dim, 0.0f);
             continue;
         }
 
         const float inv = 1.0f / denom;
-        for (int d = 0; d < head_dim; ++d) {
+        for (int d = 0; d < v_head_dim; ++d) {
             out_head[d] *= inv;
         }
     }
@@ -3006,6 +3023,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     const auto* q_tensor = dst->src[0];
     const auto* k_tensor = dst->src[1];
     const auto* v_tensor = dst->src[2];
+    const int v_head_dim = ud->v_head_dim > 0 ? ud->v_head_dim : ud->head_dim;
     if (!q_tensor->data || !k_tensor->data || !v_tensor->data) {
         if (ith == 0) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
@@ -3014,7 +3032,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     }
 
     const int q_tokens = static_cast<int>(q_tensor->ne[2]);
-    if (q_tokens <= 0 || ud->head_dim <= 0 || ud->n_head <= 0) {
+    if (q_tokens <= 0 || ud->head_dim <= 0 || v_head_dim <= 0 || ud->n_head <= 0) {
         if (ith == 0) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
         }
@@ -3039,9 +3057,9 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
 
     if (static_cast<int>(q_tensor->ne[0]) != ud->head_dim || static_cast<int>(q_tensor->ne[1]) != ud->n_head ||
         static_cast<int>(k_tensor->ne[0]) != ud->head_dim || static_cast<int>(k_tensor->ne[1]) != n_head_kv ||
-        static_cast<int>(v_tensor->ne[0]) != ud->head_dim || static_cast<int>(v_tensor->ne[1]) != n_head_kv ||
+        static_cast<int>(v_tensor->ne[0]) != v_head_dim || static_cast<int>(v_tensor->ne[1]) != n_head_kv ||
         static_cast<int>(k_tensor->ne[2]) != q_tokens || static_cast<int>(v_tensor->ne[2]) != q_tokens ||
-        static_cast<int>(dst->ne[0]) != ud->head_dim || static_cast<int>(dst->ne[1]) != ud->n_head ||
+        static_cast<int>(dst->ne[0]) != v_head_dim || static_cast<int>(dst->ne[1]) != ud->n_head ||
         static_cast<int>(dst->ne[2]) != q_tokens) {
         if (ith == 0) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
@@ -3053,8 +3071,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                            v_tensor->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
                            q_tensor->nb[1] == static_cast<size_t>(ud->head_dim) * sizeof(float) &&
                            k_tensor->nb[1] == static_cast<size_t>(ud->head_dim) * sizeof(float) &&
-                           v_tensor->nb[1] == static_cast<size_t>(ud->head_dim) * sizeof(float) &&
-                           dst->nb[1] == static_cast<size_t>(ud->head_dim) * sizeof(float);
+                           v_tensor->nb[1] == static_cast<size_t>(v_head_dim) * sizeof(float) &&
+                           dst->nb[1] == static_cast<size_t>(v_head_dim) * sizeof(float);
     if (!layout_ok) {
         if (ith == 0) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
@@ -3216,9 +3234,11 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         else if (ud->cache->cache_type == GGML_TYPE_Q8_0)
             cache_type_id = 8;
     }
-    const auto cache_layout = ud->cache->GetBlockLayout();
-    const bool hwy_ready =
-        use_hwy && cache_type_id >= 0 && cache_layout.head_stride_bytes > 0 && cache_layout.slot_stride_bytes > 0;
+    const auto k_cache_layout = ud->cache->GetBlockLayout();
+    const auto v_cache_layout = ud->cache->GetVBlockLayout();
+    const bool hwy_ready = use_hwy && cache_type_id >= 0 && k_cache_layout.head_stride_bytes > 0 &&
+                           k_cache_layout.slot_stride_bytes > 0 && v_cache_layout.head_stride_bytes > 0 &&
+                           v_cache_layout.slot_stride_bytes > 0;
     thread_local std::vector<const void*> k_block_ptrs;
     thread_local std::vector<const void*> v_block_ptrs;
     int cached_token_idx = -1;
@@ -3227,8 +3247,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
 
     auto zero_token_heads = [&](float* out_token, int h_start, int h_end) {
         for (int h = h_start; h < h_end; ++h) {
-            float* out_head = out_token + static_cast<size_t>(h) * ud->head_dim;
-            std::fill(out_head, out_head + ud->head_dim, 0.0f);
+            float* out_head = out_token + static_cast<size_t>(h) * v_head_dim;
+            std::fill(out_head, out_head + v_head_dim, 0.0f);
         }
     };
 
@@ -3303,10 +3323,12 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         }
 
         densecore::hwy_kernels::PagedAttention_Hwy(
-            q_token, k_block_ptrs.data(), v_block_ptrs.data(), cache_type_id, ud->n_head, ud->head_dim,
+            q_token, k_block_ptrs.data(), v_block_ptrs.data(), cache_type_id, ud->n_head, ud->head_dim, v_head_dim,
             ud->cache->n_head_kv, static_cast<int32_t>(block_table.size()), context_len,
-            static_cast<int64_t>(cache_layout.head_stride_bytes), static_cast<int64_t>(cache_layout.slot_stride_bytes),
-            scale, out_token, h_start, h_end, ud->n_head);
+            static_cast<int64_t>(k_cache_layout.head_stride_bytes),
+            static_cast<int64_t>(k_cache_layout.slot_stride_bytes),
+            static_cast<int64_t>(v_cache_layout.head_stride_bytes),
+            static_cast<int64_t>(v_cache_layout.slot_stride_bytes), scale, out_token, h_start, h_end, ud->n_head);
     }
 
     // Decode profiling: log KV write + attention compute timing (thread 0, every 100th call)
@@ -3320,6 +3342,296 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                     ud->layer, kv_us, attn_us);
         }
     }
+}
+
+void cb_glm_dsa_attention_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    auto* ud = static_cast<PagedAttentionUserData*>(userdata);
+    if (!ud || !ud->cache || !dst || !dst->data || nth <= 0) return;
+    if (!ud->cache->has_index_cache) return;
+    if (!dst->src[0] || !dst->src[1] || !dst->src[2] || !dst->src[3] || !dst->src[4] || !dst->src[5]) return;
+
+    const auto* q_tensor = dst->src[0];
+    const auto* k_tensor = dst->src[1];
+    const auto* v_tensor = dst->src[2];
+    const auto* index_q_tensor = dst->src[3];
+    const auto* index_weights_tensor = dst->src[4];
+    const auto* index_k_tensor = dst->src[5];
+    if (!q_tensor->data || !k_tensor->data || !v_tensor->data || !index_q_tensor->data || !index_weights_tensor->data ||
+        !index_k_tensor->data) {
+        return;
+    }
+
+    const BatchSpec* batch = GetCurrentBatch();
+    if (!batch) return;
+
+    const int q_tokens = static_cast<int>(q_tensor->ne[2]);
+    const int n_head = ud->n_head;
+    const int n_head_kv = ud->cache->n_head_kv;
+    const int head_dim = ud->head_dim;
+    const int v_head_dim = ud->v_head_dim > 0 ? ud->v_head_dim : ud->head_dim;
+    const int index_n_heads = ud->index_n_heads;
+    const int index_head_dim = ud->index_head_dim;
+    const int index_topk = ud->index_topk;
+    if (q_tokens <= 0 || n_head <= 0 || n_head_kv <= 0 || head_dim <= 0 || v_head_dim <= 0 || index_n_heads <= 0 ||
+        index_head_dim <= 0 || (n_head % n_head_kv) != 0) {
+        return;
+    }
+
+    const char* q_base = reinterpret_cast<const char*>(q_tensor->data);
+    const char* k_base = reinterpret_cast<const char*>(k_tensor->data);
+    const char* v_base = reinterpret_cast<const char*>(v_tensor->data);
+    const char* index_q_base = reinterpret_cast<const char*>(index_q_tensor->data);
+    const char* index_weights_base = reinterpret_cast<const char*>(index_weights_tensor->data);
+    const char* index_k_base = reinterpret_cast<const char*>(index_k_tensor->data);
+    char* out_base = reinterpret_cast<char*>(dst->data);
+
+    const size_t q_token_stride = static_cast<size_t>(q_tensor->nb[2]);
+    const size_t k_token_stride = static_cast<size_t>(k_tensor->nb[2]);
+    const size_t v_token_stride = static_cast<size_t>(v_tensor->nb[2]);
+    const size_t index_q_token_stride = static_cast<size_t>(index_q_tensor->nb[2]);
+    const size_t index_weights_token_stride = static_cast<size_t>(index_weights_tensor->nb[1]);
+    const size_t index_k_token_stride = static_cast<size_t>(index_k_tensor->nb[1]);
+    const size_t out_token_stride = static_cast<size_t>(dst->nb[2]);
+    const int kv_group_size = n_head / n_head_kv;
+    const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const float index_scale = 1.0f / std::sqrt(static_cast<float>(index_head_dim));
+
+    uint64_t epoch = 0;
+    if (ith == 0) {
+        ud->kv_writers_done.store(0, std::memory_order_release);
+        epoch = ud->epoch_started.fetch_add(1, std::memory_order_acq_rel) + 1;
+    } else {
+        int spin_count = 0;
+        while (true) {
+            const uint64_t started = ud->epoch_started.load(std::memory_order_acquire);
+            const uint64_t done = ud->epoch_done.load(std::memory_order_acquire);
+            if (started > done) {
+                epoch = started;
+                break;
+            }
+            SpinPause(spin_count++);
+        }
+    }
+
+    for (int i = ith; i < q_tokens; i += nth) {
+        if (i >= static_cast<int>(batch->seq_id.size()) || i >= static_cast<int>(batch->pos.size())) continue;
+        const int seq_idx = batch->seq_id[static_cast<size_t>(i)];
+        if (seq_idx < 0 || seq_idx >= static_cast<int>(batch->block_tables.size())) continue;
+        const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
+        const int pos_i = batch->pos[static_cast<size_t>(i)];
+        if (pos_i < 0) continue;
+
+        const int logical_block = pos_i / BLOCK_SIZE;
+        const int slot = pos_i % BLOCK_SIZE;
+        if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) continue;
+        const int block_id = block_table[static_cast<size_t>(logical_block)];
+        if (block_id < 0 || block_id >= ud->cache->max_blocks) continue;
+
+        const float* k_src = reinterpret_cast<const float*>(k_base + static_cast<size_t>(i) * k_token_stride);
+        const float* v_src = reinterpret_cast<const float*>(v_base + static_cast<size_t>(i) * v_token_stride);
+        const float* index_k_src =
+            reinterpret_cast<const float*>(index_k_base + static_cast<size_t>(i) * index_k_token_stride);
+        ud->cache->WriteKSlot(block_id, ud->layer, slot, k_src);
+        ud->cache->WriteVSlot(block_id, ud->layer, slot, v_src);
+        ud->cache->WriteIndexSlot(block_id, ud->layer, slot, index_k_src);
+    }
+
+    const int writers_done = ud->kv_writers_done.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (writers_done == nth) {
+        ud->epoch_done.store(epoch, std::memory_order_release);
+    } else {
+        int spin_count = 0;
+        while (ud->epoch_done.load(std::memory_order_acquire) < epoch) {
+            SpinPause(spin_count++);
+        }
+    }
+
+    thread_local std::vector<float> index_key_scratch;
+    thread_local std::vector<float> k_slot_scratch;
+    thread_local std::vector<float> v_slot_scratch;
+    thread_local std::vector<std::pair<float, int>> index_scores;
+    thread_local std::vector<float> attn_scores;
+    thread_local std::vector<int> selected_positions;
+    thread_local std::unordered_map<int, std::vector<int>> token_selected_positions_cache;
+    token_selected_positions_cache.clear();
+    index_key_scratch.resize(static_cast<size_t>(index_head_dim));
+    k_slot_scratch.resize(static_cast<size_t>(ud->cache->GetElementsPerSlot()));
+    v_slot_scratch.resize(static_cast<size_t>(ud->cache->GetVElementsPerSlot()));
+
+    // Flatten token and head loops for 2D parallelization
+    const int total_work = q_tokens * n_head;
+    for (int work_idx = ith; work_idx < total_work; work_idx += nth) {
+        const int token_idx = work_idx / n_head;
+        const int h = work_idx % n_head;
+
+        if (token_idx >= static_cast<int>(batch->seq_id.size()) || token_idx >= static_cast<int>(batch->pos.size())) {
+            continue;
+        }
+
+        const int seq_idx = batch->seq_id[static_cast<size_t>(token_idx)];
+        if (seq_idx < 0 || seq_idx >= batch->num_seqs || seq_idx >= static_cast<int>(batch->block_tables.size()) ||
+            seq_idx >= static_cast<int>(batch->n_past.size())) {
+            continue;
+        }
+
+        const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
+        const int pos_i = batch->pos[static_cast<size_t>(token_idx)];
+        const int n_past_i = batch->n_past[static_cast<size_t>(seq_idx)];
+        if (block_table.empty() || pos_i < 0 || n_past_i < 0) {
+            continue;
+        }
+
+        const KVRetentionSpan retained_span = ComputeKVRetentionSpan(n_past_i, GetKVRetentionPolicy());
+        const int max_context = static_cast<int>(block_table.size()) * BLOCK_SIZE;
+        const int context_len = std::max(1, std::min(retained_span.history_kept + 1, max_context));
+        const int effective_topk = index_topk > 0 ? std::min(index_topk, context_len) : context_len;
+
+        // Compute selected positions once per token (with lazy cache)
+        if (token_selected_positions_cache.find(token_idx) == token_selected_positions_cache.end()) {
+            const float* index_weights_token = reinterpret_cast<const float*>(
+                index_weights_base + static_cast<size_t>(token_idx) * index_weights_token_stride);
+            const char* index_q_token_base = index_q_base + static_cast<size_t>(token_idx) * index_q_token_stride;
+            index_scores.clear();
+            index_scores.reserve(static_cast<size_t>(context_len));
+            for (int t = 0; t < context_len; ++t) {
+                const int token_pos =
+                    (t < retained_span.history_kept) ? MapRetainedHistoryIndex(retained_span, t) : pos_i;
+                const int logical_block = token_pos / BLOCK_SIZE;
+                const int slot = token_pos % BLOCK_SIZE;
+                if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) continue;
+                const int block_id = block_table[static_cast<size_t>(logical_block)];
+                if (block_id < 0 || block_id >= ud->cache->max_blocks) continue;
+
+                ud->cache->ReadIndexSlot(block_id, ud->layer, slot, index_key_scratch.data());
+                float score = 0.0f;
+                for (int ih = 0; ih < index_n_heads; ++ih) {
+                    const float* q_index_head = reinterpret_cast<const float*>(
+                        index_q_token_base + static_cast<size_t>(ih) * index_q_tensor->nb[1]);
+                    float dot = 0.0f;
+                    for (int d = 0; d < index_head_dim; ++d) {
+                        dot += q_index_head[d] * index_key_scratch[static_cast<size_t>(d)];
+                    }
+                    score += index_weights_token[ih] * (dot * index_scale);
+                }
+                index_scores.emplace_back(score, token_pos);
+            }
+
+            if (!index_scores.empty()) {
+                if (static_cast<int>(index_scores.size()) > effective_topk) {
+                    std::partial_sort(index_scores.begin(), index_scores.begin() + effective_topk, index_scores.end(),
+                                      [](const auto& a, const auto& b) { return a.first > b.first; });
+                }
+                const int selected_count = std::min(effective_topk, static_cast<int>(index_scores.size()));
+                std::vector<int>& cached = token_selected_positions_cache[token_idx];
+                cached.resize(static_cast<size_t>(selected_count));
+                for (int i = 0; i < selected_count; ++i) {
+                    cached[static_cast<size_t>(i)] = index_scores[static_cast<size_t>(i)].second;
+                }
+            }
+        }
+
+        const auto& cached_it = token_selected_positions_cache.find(token_idx);
+        if (cached_it == token_selected_positions_cache.end() || cached_it->second.empty()) {
+            continue;
+        }
+        const std::vector<int>& selected_positions_ref = cached_it->second;
+        const int selected_count = static_cast<int>(selected_positions_ref.size());
+
+        float* out_token = reinterpret_cast<float*>(out_base + static_cast<size_t>(token_idx) * out_token_stride);
+        const float* q_token = reinterpret_cast<const float*>(q_base + static_cast<size_t>(token_idx) * q_token_stride);
+        const float* q_head = q_token + static_cast<size_t>(h) * head_dim;
+        float* out_head = out_token + static_cast<size_t>(h) * v_head_dim;
+        std::fill(out_head, out_head + v_head_dim, 0.0f);
+
+        const int kv_head = std::min(n_head_kv - 1, std::max(0, h / kv_group_size));
+        float max_score = -std::numeric_limits<float>::infinity();
+        attn_scores.resize(static_cast<size_t>(selected_count));
+        for (int i = 0; i < selected_count; ++i) {
+            const int token_pos = selected_positions_ref[static_cast<size_t>(i)];
+            const int logical_block = token_pos / BLOCK_SIZE;
+            const int slot = token_pos % BLOCK_SIZE;
+            const int block_id = block_table[static_cast<size_t>(logical_block)];
+            ud->cache->ReadKSlot(block_id, ud->layer, slot, k_slot_scratch.data());
+            const float* k_head = k_slot_scratch.data() + static_cast<size_t>(kv_head) * head_dim;
+
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                score += q_head[d] * k_head[d];
+            }
+            score *= attn_scale;
+            attn_scores[static_cast<size_t>(i)] = score;
+            if (score > max_score) max_score = score;
+        }
+
+        if (!std::isfinite(max_score)) {
+            continue;
+        }
+
+        float denom = 0.0f;
+        for (int i = 0; i < selected_count; ++i) {
+            const float weight = std::exp(attn_scores[static_cast<size_t>(i)] - max_score);
+            if (!(weight > 0.0f) || !std::isfinite(weight)) continue;
+            denom += weight;
+
+            const int token_pos = selected_positions_ref[static_cast<size_t>(i)];
+            const int logical_block = token_pos / BLOCK_SIZE;
+            const int slot = token_pos % BLOCK_SIZE;
+            const int block_id = block_table[static_cast<size_t>(logical_block)];
+            ud->cache->ReadVSlot(block_id, ud->layer, slot, v_slot_scratch.data());
+            const float* v_head = v_slot_scratch.data() + static_cast<size_t>(kv_head) * v_head_dim;
+            for (int d = 0; d < v_head_dim; ++d) {
+                out_head[d] += weight * v_head[d];
+            }
+        }
+
+        if (!(denom > 0.0f) || !std::isfinite(denom)) {
+            std::fill(out_head, out_head + v_head_dim, 0.0f);
+            continue;
+        }
+        const float inv = 1.0f / denom;
+        for (int d = 0; d < v_head_dim; ++d) {
+            out_head[d] *= inv;
+        }
+    }
+}
+
+inline struct ggml_tensor* ggml_glm_dsa_attention(struct ggml_context* ctx, struct ggml_tensor* q_cur,
+                                                  struct ggml_tensor* k_cur, struct ggml_tensor* v_cur,
+                                                  struct ggml_tensor* index_q, struct ggml_tensor* index_weights,
+                                                  struct ggml_tensor* index_k, PagedAttentionUserData* userdata) {
+    const int64_t ne_res[4] = {v_cur->ne[0], q_cur->ne[1], q_cur->ne[2], 1};
+    struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_res);
+
+    result->op = GGML_OP_CUSTOM;
+    result->src[0] = q_cur;
+    result->src[1] = k_cur;
+    result->src[2] = v_cur;
+    result->src[3] = index_q;
+    result->src[4] = index_weights;
+    result->src[5] = index_k;
+
+    const BatchSpec* batch = GetCurrentBatch();
+    int n_tasks = ResolveInferenceConfig(batch).num_threads;
+    if (n_tasks <= 0) {
+        n_tasks = std::thread::hardware_concurrency();
+        if (n_tasks <= 0) n_tasks = 4;
+    }
+    int physical_cores = ResolveHardwareTopology(batch).GetPhysicalCoreCount();
+    if (physical_cores > 0) {
+        n_tasks = std::min(n_tasks, physical_cores);
+    }
+    const int n_head = std::max(1, static_cast<int>(q_cur->ne[1]));
+    const int q_tokens = std::max(1, static_cast<int>(q_cur->ne[2]));
+    n_tasks = std::max(1, std::min(n_tasks, q_tokens * n_head));
+
+    struct {
+        ggml_custom_op_t fun;
+        int n_tasks;
+        void* userdata;
+    } params = {cb_glm_dsa_attention_custom, n_tasks, userdata};
+    static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "params too large");
+    memcpy(result->op_params, &params, sizeof(params));
+    return result;
 }
 
 /**
@@ -3486,7 +3798,7 @@ inline struct ggml_tensor* ggml_mul_mat_gemv_batched(struct ggml_context* ctx, s
 inline struct ggml_tensor* ggml_paged_attention_decode(struct ggml_context* ctx, struct ggml_tensor* q_cur,
                                                        struct ggml_tensor* k_cur, struct ggml_tensor* v_cur,
                                                        PagedAttentionUserData* userdata) {
-    const int64_t ne_res[4] = {q_cur->ne[0], q_cur->ne[1], q_cur->ne[2], 1};
+    const int64_t ne_res[4] = {v_cur->ne[0], q_cur->ne[1], q_cur->ne[2], 1};
     struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_res);
 
     result->op = GGML_OP_CUSTOM;
@@ -4424,6 +4736,106 @@ MoEUserData* AllocateMoEUserData(struct ggml_context* ctx_c) {
     return reinterpret_cast<MoEUserData*>(storage->data);
 }
 
+static GLMDSAPackUserData* AllocateGLMDSAPackUserData(struct ggml_context* ctx_c) {
+    if (!ctx_c) {
+        return nullptr;
+    }
+    struct ggml_tensor* storage = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I8, sizeof(GLMDSAPackUserData));
+    if (!storage || !storage->data) {
+        return nullptr;
+    }
+    return reinterpret_cast<GLMDSAPackUserData*>(storage->data);
+}
+
+void cb_pack_glm_dsa_q(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
+                       int nth, void* userdata) {
+    (void)src0;
+    (void)nth;
+    auto* ud = static_cast<GLMDSAPackUserData*>(userdata);
+    if (ith != 0 || !ud || !dst || !src1 || !dst->data || !src1->data) {
+        return;
+    }
+
+    const int n_tokens = static_cast<int>(src1->ne[1]);
+    const int q_head_dim = ud->qk_nope_head_dim + ud->qk_rope_head_dim;
+    const size_t src_row_stride = static_cast<size_t>(src1->nb[1] / sizeof(float));
+    const size_t dst_row_stride = static_cast<size_t>(dst->nb[1] / sizeof(float));
+    const float* src = reinterpret_cast<const float*>(src1->data);
+    float* out = reinterpret_cast<float*>(dst->data);
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float* src_row = src + static_cast<size_t>(t) * src_row_stride;
+        float* dst_row = out + static_cast<size_t>(t) * dst_row_stride;
+        for (int h = 0; h < ud->n_heads; ++h) {
+            const float* src_head = src_row + static_cast<size_t>(h) * q_head_dim;
+            float* dst_head = dst_row + static_cast<size_t>(h) * q_head_dim;
+            memcpy(dst_head, src_head + ud->qk_nope_head_dim,
+                   static_cast<size_t>(ud->qk_rope_head_dim) * sizeof(float));
+            memcpy(dst_head + ud->qk_rope_head_dim, src_head,
+                   static_cast<size_t>(ud->qk_nope_head_dim) * sizeof(float));
+        }
+    }
+}
+
+void cb_pack_glm_dsa_k(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1,
+                       const struct ggml_tensor* src2, int ith, int nth, void* userdata) {
+    (void)src0;
+    (void)nth;
+    auto* ud = static_cast<GLMDSAPackUserData*>(userdata);
+    if (ith != 0 || !ud || !dst || !src1 || !src2 || !dst->data || !src1->data || !src2->data) {
+        return;
+    }
+
+    const int n_tokens = static_cast<int>(src1->ne[1]);
+    const int k_head_dim = ud->qk_nope_head_dim + ud->qk_rope_head_dim;
+    const int kv_proj_head_dim = ud->qk_nope_head_dim + ud->v_head_dim;
+    const size_t kv_row_stride = static_cast<size_t>(src1->nb[1] / sizeof(float));
+    const size_t rope_row_stride = static_cast<size_t>(src2->nb[1] / sizeof(float));
+    const size_t dst_row_stride = static_cast<size_t>(dst->nb[1] / sizeof(float));
+    const float* kv_src = reinterpret_cast<const float*>(src1->data);
+    const float* rope_src = reinterpret_cast<const float*>(src2->data);
+    float* out = reinterpret_cast<float*>(dst->data);
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float* kv_row = kv_src + static_cast<size_t>(t) * kv_row_stride;
+        const float* rope_row = rope_src + static_cast<size_t>(t) * rope_row_stride;
+        float* dst_row = out + static_cast<size_t>(t) * dst_row_stride;
+        for (int h = 0; h < ud->n_heads; ++h) {
+            const float* kv_head = kv_row + static_cast<size_t>(h) * kv_proj_head_dim;
+            float* dst_head = dst_row + static_cast<size_t>(h) * k_head_dim;
+            memcpy(dst_head, rope_row, static_cast<size_t>(ud->qk_rope_head_dim) * sizeof(float));
+            memcpy(dst_head + ud->qk_rope_head_dim, kv_head, static_cast<size_t>(ud->qk_nope_head_dim) * sizeof(float));
+        }
+    }
+}
+
+void cb_pack_glm_dsa_v(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
+                       int nth, void* userdata) {
+    (void)src0;
+    (void)nth;
+    auto* ud = static_cast<GLMDSAPackUserData*>(userdata);
+    if (ith != 0 || !ud || !dst || !src1 || !dst->data || !src1->data) {
+        return;
+    }
+
+    const int n_tokens = static_cast<int>(src1->ne[1]);
+    const int kv_proj_head_dim = ud->qk_nope_head_dim + ud->v_head_dim;
+    const size_t src_row_stride = static_cast<size_t>(src1->nb[1] / sizeof(float));
+    const size_t dst_row_stride = static_cast<size_t>(dst->nb[1] / sizeof(float));
+    const float* src = reinterpret_cast<const float*>(src1->data);
+    float* out = reinterpret_cast<float*>(dst->data);
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float* src_row = src + static_cast<size_t>(t) * src_row_stride;
+        float* dst_row = out + static_cast<size_t>(t) * dst_row_stride;
+        for (int h = 0; h < ud->n_heads; ++h) {
+            const float* src_head = src_row + static_cast<size_t>(h) * kv_proj_head_dim;
+            float* dst_head = dst_row + static_cast<size_t>(h) * ud->v_head_dim;
+            memcpy(dst_head, src_head + ud->qk_nope_head_dim, static_cast<size_t>(ud->v_head_dim) * sizeof(float));
+        }
+    }
+}
+
 static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(const TransformerLayer* layer) {
     using ExpertWeights = densecore::CpuBackend::ExpertWeights;
 
@@ -4537,6 +4949,124 @@ static void UpdateSchedulerExperts(const MoEUserData* ud, const densecore::moe::
     }
 }
 
+static densecore::moe::MoERouteResult RouteMoEGroupedSigmoid(const struct ggml_tensor* gate_logits,
+                                                             const MoEUserData* ud) {
+    densecore::moe::MoERouteResult routing;
+    if (!gate_logits || !ud || !ud->model) {
+        return routing;
+    }
+
+    const int n_experts = static_cast<int>(gate_logits->ne[0]);
+    const int batch_size = static_cast<int>(gate_logits->ne[1]);
+    const int top_k = std::max(1, std::min(ud->k, n_experts));
+    routing.batch_size = batch_size;
+    routing.top_k = top_k;
+    routing.expert_ids.assign(static_cast<size_t>(batch_size * top_k), -1);
+    routing.weights.assign(static_cast<size_t>(batch_size * top_k), 0.0f);
+    routing.token_indices.assign(static_cast<size_t>(batch_size * top_k), 0);
+
+    const float* logits = reinterpret_cast<const float*>(gate_logits->data);
+    if (!logits) {
+        return routing;
+    }
+
+    const struct ggml_tensor* bias_t = ud->layer ? ud->layer->Get(model_keys::kMoeCorrectionBias) : nullptr;
+    const float* correction_bias =
+        (bias_t && bias_t->type == GGML_TYPE_F32) ? reinterpret_cast<const float*>(bias_t->data) : nullptr;
+
+    const int n_group = std::max(1, ud->model->moe_n_group);
+    const int group_size = std::max(1, n_experts / n_group);
+    const int topk_group = std::max(1, std::min(ud->model->moe_topk_group, n_group));
+
+    std::vector<float> probs(static_cast<size_t>(n_experts), 0.0f);
+    std::vector<float> choice_scores(static_cast<size_t>(n_experts), 0.0f);
+    std::vector<float> group_scores(static_cast<size_t>(n_group), -std::numeric_limits<float>::infinity());
+    std::vector<int> active_groups(static_cast<size_t>(n_group), 0);
+    std::vector<int> selected(static_cast<size_t>(top_k), -1);
+    const auto stable_sigmoid = [](float x) -> float {
+        if (x >= 0.0f) {
+            const float z = std::exp(-x);
+            return 1.0f / (1.0f + z);
+        }
+        const float z = std::exp(x);
+        return z / (1.0f + z);
+    };
+
+    for (int token_idx = 0; token_idx < batch_size; ++token_idx) {
+        const float* row = logits + static_cast<size_t>(token_idx) * n_experts;
+        for (int e = 0; e < n_experts; ++e) {
+            const float p = stable_sigmoid(row[e]);
+            probs[static_cast<size_t>(e)] = p;
+            choice_scores[static_cast<size_t>(e)] = p + (correction_bias ? correction_bias[e] : 0.0f);
+        }
+
+        for (int g = 0; g < n_group; ++g) {
+            const int begin = g * group_size;
+            const int end = (g == n_group - 1) ? n_experts : std::min(n_experts, begin + group_size);
+            float best = -std::numeric_limits<float>::infinity();
+            float second = -std::numeric_limits<float>::infinity();
+            for (int e = begin; e < end; ++e) {
+                const float score = choice_scores[static_cast<size_t>(e)];
+                if (score > best) {
+                    second = best;
+                    best = score;
+                } else if (score > second) {
+                    second = score;
+                }
+            }
+            group_scores[static_cast<size_t>(g)] = best + ((end - begin) > 1 ? second : 0.0f);
+        }
+
+        std::iota(active_groups.begin(), active_groups.end(), 0);
+        std::partial_sort(
+            active_groups.begin(), active_groups.begin() + topk_group, active_groups.end(),
+            [&](int a, int b) { return group_scores[static_cast<size_t>(a)] > group_scores[static_cast<size_t>(b)]; });
+
+        std::vector<std::pair<float, int>> candidates;
+        candidates.reserve(static_cast<size_t>(topk_group * group_size));
+        for (int group_rank = 0; group_rank < topk_group; ++group_rank) {
+            const int g = active_groups[static_cast<size_t>(group_rank)];
+            const int begin = g * group_size;
+            const int end = (g == n_group - 1) ? n_experts : std::min(n_experts, begin + group_size);
+            for (int e = begin; e < end; ++e) {
+                candidates.emplace_back(choice_scores[static_cast<size_t>(e)], e);
+            }
+        }
+        if (static_cast<int>(candidates.size()) < top_k) {
+            candidates.clear();
+            candidates.reserve(static_cast<size_t>(n_experts));
+            for (int e = 0; e < n_experts; ++e) {
+                candidates.emplace_back(choice_scores[static_cast<size_t>(e)], e);
+            }
+        }
+
+        std::partial_sort(candidates.begin(), candidates.begin() + top_k, candidates.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        float weight_sum = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            const int expert_id = candidates[static_cast<size_t>(k)].second;
+            selected[static_cast<size_t>(k)] = expert_id;
+            weight_sum += probs[static_cast<size_t>(expert_id)];
+        }
+
+        const float scale = ud->model->moe_routed_scaling_factor;
+        for (int k = 0; k < top_k; ++k) {
+            const int expert_id = selected[static_cast<size_t>(k)];
+            float weight = probs[static_cast<size_t>(expert_id)];
+            if (ud->model->moe_norm_topk_prob && weight_sum > 1e-20f) {
+                weight /= weight_sum;
+            }
+            weight *= scale;
+            routing.expert_ids[static_cast<size_t>(token_idx * top_k + k)] = expert_id;
+            routing.weights[static_cast<size_t>(token_idx * top_k + k)] = weight;
+            routing.token_indices[static_cast<size_t>(token_idx * top_k + k)] = token_idx;
+        }
+    }
+
+    return routing;
+}
+
 void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
                     int nth, void* userdata) {
     (void)nth;
@@ -4554,8 +5084,13 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     }
 
     // Routing (src1 = gate_logits)
-    densecore::Tensor t_gate_logits = GgmlToTensor(src1);
-    auto routing = densecore::moe::MoETopKRoute(t_gate_logits, ud->k);
+    densecore::moe::MoERouteResult routing;
+    if (ud->model && ud->model->arch_flags.is_glm_moe) {
+        routing = RouteMoEGroupedSigmoid(src1, ud);
+    } else {
+        densecore::Tensor t_gate_logits = GgmlToTensor(src1);
+        routing = densecore::moe::MoETopKRoute(t_gate_logits, ud->k);
+    }
     UpdateSchedulerExperts(ud, routing);
 
     // Forward (src0 = input, dst = output)
@@ -4928,6 +5463,16 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
         auto* wk = layer.Get(model_keys::kAttnKWeight);
         auto* wv = layer.Get(model_keys::kAttnVWeight);
         auto* wo = layer.Get(model_keys::kAttnOWeight);
+        auto* q_a = layer.Get(model_keys::kAttnQAProj);
+        auto* q_a_norm = layer.Get(model_keys::kAttnQANorm);
+        auto* q_b = layer.Get(model_keys::kAttnQBProj);
+        auto* kv_a = layer.Get(model_keys::kAttnKvAProj);
+        auto* kv_a_norm = layer.Get(model_keys::kAttnKvANorm);
+        auto* kv_b = layer.Get(model_keys::kAttnKvBProj);
+        auto* indexer_wq_b = layer.Get(model_keys::kIndexerWqB);
+        auto* indexer_wk = layer.Get(model_keys::kIndexerWk);
+        auto* indexer_k_norm = layer.Get(model_keys::kIndexerKNorm);
+        auto* indexer_weights_proj = layer.Get(model_keys::kIndexerWeightsProj);
         auto* bq = layer.Get(model_keys::kAttnQBias);
         auto* bk = layer.Get(model_keys::kAttnKBias);
         auto* bv = layer.Get(model_keys::kAttnVBias);
@@ -5032,22 +5577,108 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // =================================================================
 
             // Q/K/V Projections (using smart dispatcher for Parallel GEMV)
-            if (!wq || !wk || !wv) {
+            const bool use_glm_dsa_mla =
+                model->arch_flags.is_glm_dsa && q_a && q_a_norm && q_b && kv_a && kv_a_norm && kv_b;
+            if (!use_glm_dsa_mla && (!wq || !wk || !wv)) {
                 throw densecore::InvalidArgumentException("Missing Q/K/V weights in TransformerLayer");
             }
             struct ggml_tensor* Qcur = nullptr;
             struct ggml_tensor* Kcur = nullptr;
             struct ggml_tensor* Vcur = nullptr;
+            struct ggml_tensor* glm_q_resid = nullptr;
+            struct ggml_tensor* glm_index_query = nullptr;
+            struct ggml_tensor* glm_index_weights = nullptr;
+            struct ggml_tensor* glm_index_key = nullptr;
+            const bool use_glm_dsa_sparse = use_glm_dsa_mla && cache && cache->has_index_cache &&
+                                            cache->index_head_dim == model->glm_index_head_dim &&
+                                            decode_only_batch_layout && indexer_wq_b && indexer_wk && indexer_k_norm &&
+                                            indexer_weights_proj && model->glm_index_n_heads > 0 &&
+                                            model->glm_index_head_dim > 0;
 
             // Optional fused QKV projection (single pass over input per token).
             // Falls back to per-projection matmul for non-F32/quantized weights.
-            const bool fused_qkv_supported = IsFusedQKVEnabled() && cur->type == GGML_TYPE_F32 &&
+            const bool fused_qkv_supported = !use_glm_dsa_mla && IsFusedQKVEnabled() && cur->type == GGML_TYPE_F32 &&
                                              wq->type == GGML_TYPE_F32 && wk->type == GGML_TYPE_F32 &&
                                              wv->type == GGML_TYPE_F32 && wq->data && wk->data && wv->data &&
                                              wq->ne[0] == cur->ne[0] && wk->ne[0] == cur->ne[0] &&
                                              wv->ne[0] == cur->ne[0] && wq->ne[1] > 0 && wk->ne[1] > 0 && wv->ne[1] > 0;
 
-            if (fused_qkv_supported) {
+            if (use_glm_dsa_mla) {
+                static bool logged_glm_dsa_path = false;
+                if (!logged_glm_dsa_path) {
+                    std::cerr << "[DenseCore] GLM-5 DSA path enabled"
+                              << (use_glm_dsa_sparse ? " with sparse indexer cache."
+                                                     : " without sparse indexer cache; using dense attention.")
+                              << std::endl;
+                    logged_glm_dsa_path = true;
+                }
+                const int qk_nope_head_dim = model->glm_qk_nope_head_dim;
+                const int qk_rope_head_dim = model->glm_qk_rope_head_dim;
+                const int v_head_dim = model->glm_v_head_dim;
+                const int kv_lora_rank = model->glm_kv_lora_rank;
+                const int q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+                const int kv_proj_head_dim = qk_nope_head_dim + v_head_dim;
+
+                if (qk_nope_head_dim <= 0 || qk_rope_head_dim <= 0 || v_head_dim <= 0 || kv_lora_rank <= 0) {
+                    throw densecore::InvalidArgumentException("Incomplete GLM-5 DSA metadata for MLA projection path");
+                }
+
+                glm_q_resid = smart_mul_mat(ctx_c, q_a, cur, model);
+                glm_q_resid = apply_weighted_rms_norm(glm_q_resid, q_a_norm, "glm_q_a_norm");
+                struct ggml_tensor* q_raw = smart_mul_mat(ctx_c, q_b, glm_q_resid, model);
+
+                struct ggml_tensor* kv_a_cur = smart_mul_mat(ctx_c, kv_a, cur, model);
+                const int64_t kv_a_dim = kv_a_cur->ne[0];
+                if (kv_a_dim < static_cast<int64_t>(kv_lora_rank + qk_rope_head_dim)) {
+                    throw densecore::InvalidArgumentException(
+                        "GLM-5 kv_a projection is smaller than kv_lora_rank + rope dim");
+                }
+
+                struct ggml_tensor* kv_comp = ggml_view_2d(ctx_c, kv_a_cur, kv_lora_rank, N, kv_a_cur->nb[1], 0);
+                struct ggml_tensor* k_rope =
+                    ggml_view_2d(ctx_c, kv_a_cur, qk_rope_head_dim, N, kv_a_cur->nb[1],
+                                 static_cast<size_t>(kv_lora_rank) * ggml_element_size(kv_a_cur));
+                kv_comp = ggml_cont(ctx_c, kv_comp);
+                k_rope = ggml_cont(ctx_c, k_rope);
+                kv_comp = apply_weighted_rms_norm(kv_comp, kv_a_norm, "glm_kv_a_norm");
+                struct ggml_tensor* kv_raw = smart_mul_mat(ctx_c, kv_b, kv_comp, model);
+
+                if (q_raw->ne[0] != static_cast<int64_t>(q_head_dim * n_head)) {
+                    throw densecore::InvalidArgumentException("GLM-5 q_b projection shape mismatch");
+                }
+                if (kv_raw->ne[0] != static_cast<int64_t>(kv_proj_head_dim * n_head_kv)) {
+                    throw densecore::InvalidArgumentException("GLM-5 kv_b projection shape mismatch");
+                }
+
+                GLMDSAPackUserData* q_pack_ud = AllocateGLMDSAPackUserData(ctx_c);
+                GLMDSAPackUserData* k_pack_ud = AllocateGLMDSAPackUserData(ctx_c);
+                GLMDSAPackUserData* v_pack_ud = AllocateGLMDSAPackUserData(ctx_c);
+                if (!q_pack_ud || !k_pack_ud || !v_pack_ud) {
+                    throw densecore::OutOfMemoryException("Failed to allocate GLM-5 DSA packing userdata");
+                }
+                *q_pack_ud = {n_head, qk_nope_head_dim, qk_rope_head_dim, v_head_dim};
+                *k_pack_ud = {n_head_kv, qk_nope_head_dim, qk_rope_head_dim, v_head_dim};
+                *v_pack_ud = {n_head_kv, qk_nope_head_dim, qk_rope_head_dim, v_head_dim};
+
+                struct ggml_tensor* q_packed = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, q_head_dim * n_head, N);
+                struct ggml_tensor* k_packed = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, q_head_dim * n_head_kv, N);
+                struct ggml_tensor* v_packed = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, v_head_dim * n_head_kv, N);
+
+                // Repack [nope|rope] into [rope|nope] so the existing partial-RoPE path
+                // can operate on the leading rope dimensions.
+                Qcur = ggml_map_custom2(ctx_c, q_packed, q_raw, cb_pack_glm_dsa_q, 1, q_pack_ud);
+                Kcur = ggml_map_custom3(ctx_c, k_packed, kv_raw, k_rope, cb_pack_glm_dsa_k, 1, k_pack_ud);
+                Vcur = ggml_map_custom2(ctx_c, v_packed, kv_raw, cb_pack_glm_dsa_v, 1, v_pack_ud);
+
+                if (use_glm_dsa_sparse) {
+                    glm_index_query = smart_mul_mat(ctx_c, indexer_wq_b, glm_q_resid, model);
+                    glm_index_weights = smart_mul_mat(ctx_c, indexer_weights_proj, cur, model);
+                    glm_index_weights =
+                        ggml_scale(ctx_c, glm_index_weights, 1.0f / std::sqrt((float)model->glm_index_n_heads));
+                    glm_index_key = smart_mul_mat(ctx_c, indexer_wk, cur, model);
+                    glm_index_key = apply_weighted_rms_norm(glm_index_key, indexer_k_norm, "glm_index_k_norm");
+                }
+            } else if (fused_qkv_supported) {
                 const int dim_q_fused = static_cast<int>(wq->ne[1]);
                 const int dim_k_fused = static_cast<int>(wk->ne[1]);
                 const int dim_v_fused = static_cast<int>(wv->ne[1]);
@@ -5139,10 +5770,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             int dim_q = Qcur->ne[0];
             int dim_k = Kcur->ne[0];
             int dim_v = Vcur->ne[0];
-            (void)dim_v;
 
             int n_head_kv = model->hparams.n_head_kv;
             int head_dim_kv = (model->hparams.n_embd_head_k > 0) ? model->hparams.n_embd_head_k : (dim_k / n_head_kv);
+            int head_dim_v = (model->hparams.n_embd_head_v > 0) ? model->hparams.n_embd_head_v : (dim_v / n_head_kv);
             struct ggml_tensor* attn_gate = nullptr;
 
             // Qwen3.5 hybrid attention packs [q | gate] per-head, not as two
@@ -5182,7 +5813,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 Kcur = ggml_reshape_3d(ctx_c, Kcur, head_dim_kv, n_head_kv, N);
             }
             if (!v_done) {
-                Vcur = ggml_reshape_3d(ctx_c, Vcur, head_dim_kv, n_head_kv, N);
+                Vcur = ggml_reshape_3d(ctx_c, Vcur, head_dim_v, n_head_kv, N);
             }
 
             // =========================================================================
@@ -5339,525 +5970,587 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 }
             }
 
-            // =========================================================================
-            // KV CACHE INTEGRATION (Universal Paged Attention)
-            // =========================================================================
-            struct ggml_tensor* K_all = Kcur;  // Default to current K
-            struct ggml_tensor* V_all = Vcur;  // Default to current V
+            if (use_glm_dsa_sparse && glm_index_query && glm_index_weights && glm_index_key) {
+                const int index_n_heads = model->glm_index_n_heads;
+                const int index_head_dim = model->glm_index_head_dim;
+                const int index_rope_dim = std::min(model->glm_qk_rope_head_dim, index_head_dim);
 
-            const bool use_cache = (cache != nullptr);
-            int n_past_val = 0;
-            if (use_cache && batch.num_seqs > 0 && batch.n_past.size() > 0) {
-                const KVRetentionPolicy& retention_policy = GetKVRetentionPolicy();
-                for (int n_past_i : batch.n_past) {
-                    n_past_val = std::max(n_past_val, ComputeKVRetentionSpan(n_past_i, retention_policy).history_kept);
+                glm_index_query = ggml_cont(ctx_c, glm_index_query);
+                glm_index_weights = ggml_cont(ctx_c, glm_index_weights);
+                glm_index_key = ggml_cont(ctx_c, glm_index_key);
+
+                glm_index_query = ggml_reshape_3d(ctx_c, glm_index_query, index_head_dim, index_n_heads, N);
+                if (index_rope_dim > 0) {
+                    glm_index_query = ggml_rope_ext(ctx_c, glm_index_query, pos, nullptr, index_rope_dim, 0, n_ctx,
+                                                    model->hparams.rope_freq_base, model->hparams.rope_freq_scale, 0.0f,
+                                                    1.0f, 0.0f, 0.0f);
+                    struct ggml_tensor* index_k_3d = ggml_reshape_3d(ctx_c, glm_index_key, index_head_dim, 1, N);
+                    index_k_3d = ggml_rope_ext(ctx_c, index_k_3d, pos, nullptr, index_rope_dim, 0, n_ctx,
+                                               model->hparams.rope_freq_base, model->hparams.rope_freq_scale, 0.0f,
+                                               1.0f, 0.0f, 0.0f);
+                    glm_index_key = ggml_reshape_2d(ctx_c, index_k_3d, index_head_dim, N);
                 }
-            }
-            const int n_total_tokens = n_past_val + N;
-            const bool paged_decode_candidate =
-                IsPagedDecodeCandidate(cache, batch, N, n_head, n_head_kv, head_dim_q, head_dim_kv);
-            const bool requested_paged_decode_attention = ShouldUsePagedDecodeAttention(
-                decode_paged_policy, cache, batch, N, n_head, n_head_kv, head_dim_q, head_dim_kv);
-            const bool decode_only_batch = decode_only_batch_layout;
-
-            // Safety override: GGML's generic decode matmul path can become numerically
-            // unstable for GQA decode (N=1, n_head != n_head_kv) on some CPU kernels.
-            // Force the custom paged decode attention path for correctness in this case.
-            const bool force_safe_gqa_decode = IsForceSafeGqaDecodeEnabled() && use_cache && paged_decode_candidate &&
-                                               N == 1 && n_past_val > 0 && n_head_kv > 0 && n_head > n_head_kv &&
-                                               (n_head % n_head_kv == 0) && (head_dim_q == head_dim_kv) &&
-                                               batch.num_seqs == 1 && !batch.seq_id.empty();
-            // For decode-only batched scheduling (N>1), force paged decode when the
-            // batch layout is a valid paged candidate. The legacy non-paged batched
-            // path is not sequence-isolated and can introduce cross-sequence drift.
-            const bool force_batched_decode_path = use_cache && decode_only_batch && N > 1 && paged_decode_candidate;
-
-            bool use_paged_decode_attention = requested_paged_decode_attention;
-            if (force_batched_decode_path) {
-                const bool was_enabled = use_paged_decode_attention;
-                use_paged_decode_attention = true;
-                if (!was_enabled) {
-                    static bool logged_force_batched_decode = false;
-                    if (!logged_force_batched_decode) {
-                        std::cerr << "[DenseCore] Forcing paged decode attention for decode-only batched scheduling "
-                                  << "for sequence-isolated correctness " << "(N=" << N << ")" << std::endl;
-                        logged_force_batched_decode = true;
-                    }
-                }
-            }
-
-            if (decode_paged_policy.debug_log && il == 0) {
-                const char* mode = "auto";
-                if (decode_paged_policy.mode == DecodePagedAttentionMode::Off) mode = "off";
-                if (decode_paged_policy.mode == DecodePagedAttentionMode::On) mode = "on";
-                const int cache_type = cache ? static_cast<int>(cache->cache_type) : -1;
-                const DecodeContextSummary context_summary = SummarizeDecodeContext(batch, N);
-                std::cerr << "[PagedDecode] mode=" << mode << " candidate=" << (paged_decode_candidate ? "1" : "0")
-                          << " use=" << (use_paged_decode_attention ? "1" : "0") << " N=" << N
-                          << " n_past=" << n_past_val << " n_head=" << n_head << " n_head_kv=" << n_head_kv
-                          << " head_dim_q=" << head_dim_q << " cache_type=" << cache_type
-                          << " ctx_min=" << (context_summary.valid ? context_summary.min_context : -1)
-                          << " ctx_avg=" << (context_summary.valid ? context_summary.avg_context : -1)
-                          << " ctx_max=" << (context_summary.valid ? context_summary.max_context : -1) << std::endl;
-            }
-
-            if (use_cache && !use_paged_decode_attention) {  // Re-enabled old KV cache approach
-                // Only need fancy logic if we have history.
-                // If n_past = 0 (Prefill), K_all == Kcur is mostly fine,
-                // BUT we still need to WRITE to cache.
-                // The 'ggml_pad' trick updates cache as side effect.
-                // So we act always if use_cache is true.
-
-                // Use ggml_pad to create a tensor of correct size (N + n_past)
-                // ggml_pad(ctx, a, pad_0, pad_1, pad_2, pad_3)
-                // We pad dimension 2 (sequence) by n_past_val.
-                // Result shape: [head_dim, n_head, N + n_past]
-                struct ggml_tensor* K_padded = Kcur;
-                struct ggml_tensor* V_padded = Vcur;
-
-                if (n_past_val > 0) {
-                    K_padded = ggml_pad(ctx_c, Kcur, 0, 0, n_past_val, 0);
-                    V_padded = ggml_pad(ctx_c, Vcur, 0, 0, n_past_val, 0);
-                }
-
-                KVCacheUserData* k_ud = GetKVCacheUserData(il, true);
-                *k_ud = {cache, il, head_dim_kv, true};  // batch accessed via GetCurrentBatch()
-                KVCacheUserData* v_ud = GetKVCacheUserData(il, false);
-                *v_ud = {cache, il, head_dim_kv, false};  // batch accessed via GetCurrentBatch()
-
-                int kv_tasks = ResolveInferenceConfig(&batch).num_threads;
-                if (kv_tasks <= 0) {
-                    kv_tasks = std::thread::hardware_concurrency();
-                    if (kv_tasks <= 0) kv_tasks = 4;
-                }
-                int physical_cores = ResolveHardwareTopology(&batch).GetPhysicalCoreCount();
-                if (physical_cores > 0) {
-                    kv_tasks = std::min(kv_tasks, physical_cores);
-                }
-                kv_tasks = std::max(1, kv_tasks);
-                kv_tasks = std::min(kv_tasks, std::max(1, n_head_kv));
-                {
-                    // Escape hatch for platform-specific troubleshooting.
-                    const char* env = std::getenv("DENSECORE_KV_CALLBACK_SINGLE_THREAD");
-                    const bool force_single = env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-                    if (force_single) {
-                        kv_tasks = 1;
-                    }
-                }
-
-                K_all = ggml_map_custom1(ctx_c, K_padded, cb_kv_manage, kv_tasks, k_ud);
-                V_all = ggml_map_custom1(ctx_c, V_padded, cb_kv_manage, kv_tasks, v_ud);
-            }
-
-            // =========================================================================
-            // NEW: Robust KV Cache Integration (Replaces ggml_pad approach)
-            // =========================================================================
-            // This approach explicitly:
-            //   1. Allocates destination tensors with full size [head_dim, n_head_kv,
-            //   n_total]
-            //   2. Uses cb_kv_update_and_gather to write cache, read history, append
-            //   current
-            //   3. Does NOT rely on ggml_pad padding behavior which was causing
-            //   NaN/hangs
-            // =========================================================================
-            if (false) {  // DISABLED: New approach has graph dependency bugs
-                // Step 1: Explicitly allocate K_all and V_all with full context size
-                // Shape: [head_dim_kv, n_head_kv, n_total_tokens]
-                struct ggml_tensor* K_all_tensor =
-                    ggml_new_tensor_3d(ctx_c, GGML_TYPE_F32, head_dim_kv, n_head_kv, n_total_tokens);
-                struct ggml_tensor* V_all_tensor =
-                    ggml_new_tensor_3d(ctx_c, GGML_TYPE_F32, head_dim_kv, n_head_kv, n_total_tokens);
-                ggml_set_name(K_all_tensor, "K_all");
-                ggml_set_name(V_all_tensor, "V_all");
-
-                // Step 2: Force Kcur/Vcur to be contiguous before passing data pointers
-                // This ensures src_data pointer is valid for memcpy in callback
-                struct ggml_tensor* Kcur_contig = ggml_cont(ctx_c, Kcur);
-                struct ggml_tensor* Vcur_contig = ggml_cont(ctx_c, Vcur);
-
-                // Step 3: Setup userdata for K with src_tensor pointer
-                // NOTE: src_tensor is set below after ggml_cont
-                //       The tensor pointer is stable; data is populated at graph
-                //       execution
-                KVUpdateGatherUserData* k_gather_ud = GetKVUpdateGatherUserData(il, true);
-                k_gather_ud->cache = cache;
-                k_gather_ud->batch = &batch;
-                k_gather_ud->layer = il;
-                k_gather_ud->head_dim = head_dim_kv;
-                k_gather_ud->n_head_kv = n_head_kv;
-                k_gather_ud->N = N;
-                k_gather_ud->n_past = n_past_val;
-                k_gather_ud->is_k = true;
-                k_gather_ud->src_tensor = nullptr;  // Set below
-
-                // Step 4: Setup userdata for V
-                KVUpdateGatherUserData* v_gather_ud = GetKVUpdateGatherUserData(il, false);
-                v_gather_ud->cache = cache;
-                v_gather_ud->batch = &batch;
-                v_gather_ud->layer = il;
-                v_gather_ud->head_dim = head_dim_kv;
-                v_gather_ud->n_head_kv = n_head_kv;
-                v_gather_ud->N = N;
-                v_gather_ud->n_past = n_past_val;
-                v_gather_ud->is_k = false;
-                v_gather_ud->src_tensor = nullptr;  // Set below
-
-                // Step 5: Create graph nodes that will execute the callbacks
-                // The src_data will be populated from the contiguous tensor's data
-                // pointer when the graph is executed (data is allocated by this point)
-                //
-                // WORKAROUND: ggml_map_custom1 passes its input tensor as 'src'.
-                // We need to pass BOTH the destination and source data.
-                // Solution: Store Kcur_contig as 'src' input, K_all_tensor->data is
-                // 'dst'
-                //
-                // The callback signature is: cb(dst, src, ith, nth, userdata)
-                // We set src_data = src->data in the callback if it's nullptr
-
-                // For K: Map from Kcur_contig, output shape matches K_all_tensor
-                // We need a custom callback wrapper that sets src_data from src tensor
-                // For now, we'll pass the contiguous tensor and handle in callback
-
-                // Actually, ggml_map_custom1(ctx, a, cb, n_tasks, userdata) creates:
-                //   result tensor with same shape as 'a'
-                //   callback receives: cb(result, a, ith, nth, userdata)
-                //
-                // So 'a' becomes 'src', and result is 'dst'
-                // We need result to have shape [head_dim_kv, n_head_kv, n_total_tokens]
-                // This means we should pass K_all_tensor as 'a', not Kcur!
-                //
-                // But then we need to access Kcur data via userdata.
-                // Since Kcur_contig->data is available at graph execution time,
-                // we can store its pointer now and it will be valid.
-
-                // CRITICAL FIX: The tensor data pointers are only valid AFTER
-                // ggml_backend allocates memory. At graph construction time, data may
-                // be nullptr. We need to access the data through the tensor pointer in
-                // the callback.
-
-                // Store tensor pointers in userdata (not raw data pointers)
-                // This requires modifying the struct to take ggml_tensor* instead of
-                // float* For now, we'll use a simpler workaround: pass Kcur_contig as
-                // input, create output tensor of correct size via ggml_new_tensor, then
-                // use ggml_cpy
-
-                // SIMPLER APPROACH: Use ggml_map_custom1 on K_all_tensor, pass Kcur as
-                // extra userdata Since Kcur_contig is built into the graph, its data
-                // pointer is stable
-                k_gather_ud->src_tensor = Kcur_contig;
-                v_gather_ud->src_tensor = Vcur_contig;
-
-                // Create the combined tensors via callback
-                K_all = ggml_map_custom1(ctx_c, K_all_tensor, cb_kv_update_and_gather, 1, k_gather_ud);
-                V_all = ggml_map_custom1(ctx_c, V_all_tensor, cb_kv_update_and_gather, 1, v_gather_ud);
-
-                // Mark as dependent on Kcur_contig and Vcur_contig for proper execution
-                // order
-                ggml_build_forward_expand(gf, Kcur_contig);
-                ggml_build_forward_expand(gf, Vcur_contig);
-            }
-
-            // After projection and reshape:
-
-            // Q: [head_dim_q, n_head, N]
-            // K_all: [head_dim_kv, n_head_kv, n_past + N]
-            // V_all: [head_dim_kv, n_head_kv, n_past + N]
-
-            // =========================================================================
-            // GQA (Grouped Query Attention): LOGICAL BROADCASTING
-            // =========================================================================
-            // For models like Qwen3 where n_head != n_head_kv (e.g., 32 Q heads, 4 KV
-            // heads):
-            //
-            // OLD APPROACH (REMOVED - caused segfaults and was inefficient):
-            //   Used ggml_repeat to physically expand K/V from n_head_kv to n_head.
-            //   This allocated 8x more memory and caused OOM/crashes.
-            //
-            // NEW APPROACH (Logical Broadcasting):
-            //   Keep K/V at their original [head_dim, n_head_kv, seq] shape.
-            //   The attention kernel computes: kv_head = query_head / (n_head /
-            //   n_head_kv) This is zero-copy and memory-efficient.
-            //
-            // Both ggml_flash_attn_ext and our custom FlashAttentionGQA support this.
-            // =========================================================================
-            struct ggml_tensor* K = K_all;
-            struct ggml_tensor* V = V_all;
-
-            // Compute GQA repetition factor for attention dispatch
-            const int n_rep = (n_head_kv > 0) ? (n_head / n_head_kv) : 1;
-            (void)n_rep;  // Used in attention mask/kernel setup
-
-            // =========================================================================
-            // ATTENTION (llama.cpp style - corrected tensor layouts)
-            // =========================================================================
-            // Tensor shapes at this point:
-            //   Q: [head_dim_q, n_head, N]
-            //   K: [head_dim_kv, n_head_kv, n_total_tokens]  (NOT expanded!)
-            //   V: [head_dim_kv, n_head_kv, n_total_tokens]  (NOT expanded!)
-            //
-            // For GQA: The attention kernel handles broadcasting internally.
-            // Query heads [0, n_rep) all attend to KV head 0, etc.
-            // =========================================================================
-
-            // =========================================================================
-            // ATTENTION DISPATCH (Runtime selection based on CPU capabilities)
-            // - AVX-512+: Use Flash Attention (ggml_flash_attn_ext) for efficiency
-            // - Other: Use standard Q*K^T -> softmax -> V for compatibility
-            // =========================================================================
-            // Note: Flash Attention still requires AVX-512-class x86 support for
-            // correctness/perf in this path.
-            const bool flash_attn_head_layout_supported =
-                (n_head_kv > 0) && (n_head % n_head_kv == 0) && (n_head % 8 == 0);
-            const bool flash_attn_runtime_supported = flash_attn_head_layout_supported &&
-                                                      densecore::OpsRegistry::IsInitialized() &&
-                                                      IsFlashAttentionIsaSupported();
-            const bool flash_attn_forced = IsFlashAttentionForced();
-            const bool use_flash_attention = !IsFlashAttentionDisabled() && flash_attn_runtime_supported;
-            const densecore::DeviceType preferred_attention_device = ResolvePreferredAttentionDevice(&batch);
-            // HAL FlashAttention API currently exposes only `causal` + `n_head_kv`.
-            // For decode (N == 1), no intra-query future tokens exist, so offset is
-            // unnecessary even when n_past > 0. Prefill still requires zero offset.
-            const bool hal_attention_offset_safe = (n_past_val == 0) || (N == 1);
-            const bool use_hal_attention_dispatch = preferred_attention_device != densecore::DeviceType::CPU &&
-                                                    !use_paged_decode_attention && hal_attention_offset_safe;
-            const bool portable_cpu_flash_attention_supported =
-                flash_attn_head_layout_supported && densecore::OpsRegistry::IsInitialized() &&
-                (IsPortableCpuFlashAttentionEnabled() || flash_attn_forced);
-            const bool prefer_portable_cpu_flash_safe_decode =
-                force_safe_gqa_decode && preferred_attention_device == densecore::DeviceType::CPU &&
-                hal_attention_offset_safe && portable_cpu_flash_attention_supported;
-            if (!use_paged_decode_attention && force_safe_gqa_decode && !prefer_portable_cpu_flash_safe_decode) {
-                use_paged_decode_attention = true;
-                static bool logged_force_safe_decode = false;
-                if (!logged_force_safe_decode) {
-                    std::cerr << "[DenseCore] Forcing paged decode attention for GQA decode safety "
-                              << "(N=1, n_head=" << n_head << ", n_head_kv=" << n_head_kv << ")" << std::endl;
-                    logged_force_safe_decode = true;
-                }
-            } else if (!use_paged_decode_attention && prefer_portable_cpu_flash_safe_decode) {
-                static bool logged_safe_decode_flash = false;
-                if (!logged_safe_decode_flash) {
-                    std::cerr << "[DenseCore] Using portable CPU flash attention for GQA decode safety "
-                              << "(N=1, n_head=" << n_head << ", n_head_kv=" << n_head_kv << ")" << std::endl;
-                    logged_safe_decode_flash = true;
-                }
-            }
-            const bool use_portable_cpu_flash_attention =
-                !IsFlashAttentionDisabled() && preferred_attention_device == densecore::DeviceType::CPU &&
-                !use_paged_decode_attention && hal_attention_offset_safe && portable_cpu_flash_attention_supported;
-            if (flash_attn_forced && !flash_attn_runtime_supported && il == 0 && IsVerboseGraphBuildLoggingEnabled()) {
-                std::cerr << "[DenseCore] DENSECORE_FORCE_FLASH_ATTN requested but native ggml flash is unavailable; "
-                             "falling back to DenseCore portable flash attention or standard attention."
-                          << std::endl;
-            }
-
-            if (decode_paged_policy.debug_log && il == 0 && decode_only_batch && N > 1) {
-                const char* path = use_paged_decode_attention ? "paged_decode"
-                                                              : (use_hal_attention_dispatch ? "hal_flash"
-                                                                 : use_portable_cpu_flash_attention
-                                                                     ? "cpu_flash_hal"
-                                                                     : (use_flash_attention ? "flash" : "standard"));
-                std::cerr << "[DecodeAttentionPath] N=" << N << " path=" << path << std::endl;
             }
 
             struct ggml_tensor* KQV = nullptr;
-
-            if (use_paged_decode_attention) {
-                // -----------------------------------------------------------------------
-                // DECODE PAGED ATTENTION FAST PATH (decode-only batches, one token/seq)
-                // -----------------------------------------------------------------------
-                // Avoids materializing [n_total] K/V tensors each token.
-                // Writes current K/V to paged cache and reads history directly from cache.
-                // -----------------------------------------------------------------------
-                struct ggml_tensor* Q_decode = ggml_is_contiguous(Qcur) ? Qcur : ggml_cont(ctx_c, Qcur);
-                struct ggml_tensor* K_decode = ggml_is_contiguous(Kcur) ? Kcur : ggml_cont(ctx_c, Kcur);
-                struct ggml_tensor* V_decode = ggml_is_contiguous(Vcur) ? Vcur : ggml_cont(ctx_c, Vcur);
-
+            if (use_glm_dsa_sparse && glm_index_query && glm_index_weights && glm_index_key) {
                 PagedAttentionUserData* ud = GetPagedAttentionUserData();
                 ud->cache = cache;
                 ud->layer = il;
                 ud->head_dim = head_dim_q;
+                ud->v_head_dim = head_dim_v;
                 ud->n_head = n_head;
+                ud->index_n_heads = model->glm_index_n_heads;
+                ud->index_head_dim = model->glm_index_head_dim;
+                ud->index_topk = model->glm_index_topk;
                 ud->epoch_started.store(0, std::memory_order_relaxed);
                 ud->epoch_done.store(0, std::memory_order_relaxed);
                 ud->kv_writers_done.store(0, std::memory_order_relaxed);
-                KQV = ggml_paged_attention_decode(ctx_c, Q_decode, K_decode, V_decode, ud);
-            } else if (use_hal_attention_dispatch) {
-                // -----------------------------------------------------------------------
-                // HAL ATTENTION PATH (per-op-class mixed routing)
-                // -----------------------------------------------------------------------
-                // Dispatches attention to the preferred attention device while the rest
-                // of the graph can remain on a different primary backend.
-                // -----------------------------------------------------------------------
-                struct ggml_tensor* Q_hal = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
-                struct ggml_tensor* K_hal = ggml_permute(ctx_c, K, 0, 2, 1, 3);
-                struct ggml_tensor* V_hal = ggml_permute(ctx_c, V, 0, 2, 1, 3);
-                Q_hal = ggml_cont(ctx_c, Q_hal);
-                K_hal = ggml_cont(ctx_c, K_hal);
-                V_hal = ggml_cont(ctx_c, V_hal);
 
-                const float scale = 1.0f / sqrtf((float)head_dim_q);
-                // For decode (N==1), causal=false is correct because K already contains
-                // only historical + current keys (no future positions).
-                const bool hal_causal = (N > 1);
-                KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv,
-                                               preferred_attention_device);
+                struct ggml_tensor* q_sparse = ggml_is_contiguous(Qcur) ? Qcur : ggml_cont(ctx_c, Qcur);
+                struct ggml_tensor* k_sparse = ggml_is_contiguous(Kcur) ? Kcur : ggml_cont(ctx_c, Kcur);
+                struct ggml_tensor* v_sparse = ggml_is_contiguous(Vcur) ? Vcur : ggml_cont(ctx_c, Vcur);
+                struct ggml_tensor* index_q_sparse =
+                    ggml_is_contiguous(glm_index_query) ? glm_index_query : ggml_cont(ctx_c, glm_index_query);
+                struct ggml_tensor* index_w_sparse =
+                    ggml_is_contiguous(glm_index_weights) ? glm_index_weights : ggml_cont(ctx_c, glm_index_weights);
+                struct ggml_tensor* index_k_sparse =
+                    ggml_is_contiguous(glm_index_key) ? glm_index_key : ggml_cont(ctx_c, glm_index_key);
 
-                // Convert [head_dim, N, n_head] -> [head_dim, n_head, N]
-                KQV = ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
-            } else if (use_portable_cpu_flash_attention) {
-                // -----------------------------------------------------------------------
-                // PORTABLE CPU FLASH ATTENTION PATH
-                // -----------------------------------------------------------------------
-                // On ARM/Apple CPU runtimes, route through DenseCore's backend-agnostic
-                // FlashAttention op instead of forcing the materialized standard path.
-                // -----------------------------------------------------------------------
-                struct ggml_tensor* Q_hal = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
-                struct ggml_tensor* K_hal = ggml_permute(ctx_c, K, 0, 2, 1, 3);
-                struct ggml_tensor* V_hal = ggml_permute(ctx_c, V, 0, 2, 1, 3);
-                Q_hal = ggml_cont(ctx_c, Q_hal);
-                K_hal = ggml_cont(ctx_c, K_hal);
-                V_hal = ggml_cont(ctx_c, V_hal);
+                KQV = ggml_glm_dsa_attention(ctx_c, q_sparse, k_sparse, v_sparse, index_q_sparse, index_w_sparse,
+                                             index_k_sparse, ud);
+            }
 
-                const float scale = 1.0f / sqrtf((float)head_dim_q);
-                const bool hal_causal = (N > 1);
-                KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv,
-                                               densecore::DeviceType::CPU);
+            // =========================================================================
+            // KV CACHE INTEGRATION (Universal Paged Attention)
+            // =========================================================================
+            if (!KQV) {
+                struct ggml_tensor* K_all = Kcur;  // Default to current K
+                struct ggml_tensor* V_all = Vcur;  // Default to current V
 
-                // Convert [head_dim, N, n_head] -> [head_dim, n_head, N]
-                KQV = ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
-            } else if (use_flash_attention) {
-                // -----------------------------------------------------------------------
-                // FLASH ATTENTION PATH (AVX-512 only)
-                // -----------------------------------------------------------------------
-                // ggml_flash_attn_ext natively supports GQA - it handles K/V with fewer
-                // heads than Q. The kernel internally computes: kv_head = query_head /
-                // n_rep
-                //
-                // Shapes: Q: [head_dim, N, n_head], K/V: [head_dim, n_total, n_head_kv]
-                // -----------------------------------------------------------------------
-                struct ggml_tensor* Q = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
-
-                // K/V: [head_dim, n_head_kv, n_total] -> [head_dim, n_total, n_head_kv]
-                struct ggml_tensor* K_fa = ggml_permute(ctx_c, K, 0, 2, 1, 3);
-                struct ggml_tensor* V_fa = ggml_permute(ctx_c, V, 0, 2, 1, 3);
-
-                // Create mask [n_total, N_padded, 1, 1] as required by
-                // ggml_flash_attn_ext 0.0f = can attend, -INFINITY = cannot attend
-                // (masked)
-                int N_padded = (N + GGML_KQ_MASK_PAD - 1) & ~(GGML_KQ_MASK_PAD - 1);
-                struct ggml_tensor* KQ_mask = nullptr;
-                if (shared_prefill_flash_mask && shared_prefill_mask_n_total == n_total_tokens &&
-                    shared_prefill_mask_n_padded == N_padded && shared_prefill_mask_n == N &&
-                    shared_prefill_mask_n_past == n_past_val) {
-                    KQ_mask = shared_prefill_flash_mask;
-                } else {
-                    KQ_mask = ggml_new_tensor_4d(ctx_c, GGML_TYPE_F32, n_total_tokens, N_padded, 1, 1);
-
-                    // Fill causal mask (column-major: element (k, q) is at k + q * n_kv)
-                    float* mask_data = reinterpret_cast<float*>(KQ_mask->data);
-                    for (int q = 0; q < N_padded; q++) {
-                        for (int k = 0; k < n_total_tokens; k++) {
-                            const int query_pos = n_past_val + q;
-                            const int key_pos = k;
-                            const int idx = k + q * n_total_tokens;
-
-                            if (q >= N || key_pos <= query_pos) {
-                                mask_data[idx] = 0.0f;
-                            } else {
-                                mask_data[idx] = -INFINITY;
-                            }
-                        }
+                const bool use_cache = (cache != nullptr);
+                int n_past_val = 0;
+                if (use_cache && batch.num_seqs > 0 && batch.n_past.size() > 0) {
+                    const KVRetentionPolicy& retention_policy = GetKVRetentionPolicy();
+                    for (int n_past_i : batch.n_past) {
+                        n_past_val =
+                            std::max(n_past_val, ComputeKVRetentionSpan(n_past_i, retention_policy).history_kept);
                     }
+                }
+                const int n_total_tokens = n_past_val + N;
+                const bool paged_decode_candidate =
+                    !model->arch_flags.is_glm_dsa &&
+                    IsPagedDecodeCandidate(cache, batch, N, n_head, n_head_kv, head_dim_q, head_dim_kv);
+                const bool requested_paged_decode_attention =
+                    !model->arch_flags.is_glm_dsa &&
+                    ShouldUsePagedDecodeAttention(decode_paged_policy, cache, batch, N, n_head, n_head_kv, head_dim_q,
+                                                  head_dim_kv);
+                const bool decode_only_batch = decode_only_batch_layout;
 
-                    if (N > 1 && !decode_only_batch) {
-                        shared_prefill_flash_mask = KQ_mask;
-                        shared_prefill_mask_n_total = n_total_tokens;
-                        shared_prefill_mask_n_padded = N_padded;
-                        shared_prefill_mask_n = N;
-                        shared_prefill_mask_n_past = n_past_val;
+                // Safety override: GGML's generic decode matmul path can become numerically
+                // unstable for GQA decode (N=1, n_head != n_head_kv) on some CPU kernels.
+                // Force the custom paged decode attention path for correctness in this case.
+                const bool force_safe_gqa_decode =
+                    IsForceSafeGqaDecodeEnabled() && use_cache && paged_decode_candidate && N == 1 && n_past_val > 0 &&
+                    n_head_kv > 0 && n_head > n_head_kv && (n_head % n_head_kv == 0) && (head_dim_q == head_dim_kv) &&
+                    batch.num_seqs == 1 && !batch.seq_id.empty();
+                // For decode-only batched scheduling (N>1), force paged decode when the
+                // batch layout is a valid paged candidate. The legacy non-paged batched
+                // path is not sequence-isolated and can introduce cross-sequence drift.
+                const bool force_batched_decode_path =
+                    use_cache && decode_only_batch && N > 1 && paged_decode_candidate;
+
+                bool use_paged_decode_attention = requested_paged_decode_attention;
+                if (force_batched_decode_path) {
+                    const bool was_enabled = use_paged_decode_attention;
+                    use_paged_decode_attention = true;
+                    if (!was_enabled) {
+                        static bool logged_force_batched_decode = false;
+                        if (!logged_force_batched_decode) {
+                            std::cerr
+                                << "[DenseCore] Forcing paged decode attention for decode-only batched scheduling "
+                                << "for sequence-isolated correctness " << "(N=" << N << ")" << std::endl;
+                            logged_force_batched_decode = true;
+                        }
                     }
                 }
 
-                // Ensure contiguity for Flash Attention
-                Q = ggml_cont(ctx_c, Q);
-                K_fa = ggml_cont(ctx_c, K_fa);
-                V_fa = ggml_cont(ctx_c, V_fa);
+                if (decode_paged_policy.debug_log && il == 0) {
+                    const char* mode = "auto";
+                    if (decode_paged_policy.mode == DecodePagedAttentionMode::Off) mode = "off";
+                    if (decode_paged_policy.mode == DecodePagedAttentionMode::On) mode = "on";
+                    const int cache_type = cache ? static_cast<int>(cache->cache_type) : -1;
+                    const DecodeContextSummary context_summary = SummarizeDecodeContext(batch, N);
+                    std::cerr << "[PagedDecode] mode=" << mode << " candidate=" << (paged_decode_candidate ? "1" : "0")
+                              << " use=" << (use_paged_decode_attention ? "1" : "0") << " N=" << N
+                              << " n_past=" << n_past_val << " n_head=" << n_head << " n_head_kv=" << n_head_kv
+                              << " head_dim_q=" << head_dim_q << " cache_type=" << cache_type
+                              << " ctx_min=" << (context_summary.valid ? context_summary.min_context : -1)
+                              << " ctx_avg=" << (context_summary.valid ? context_summary.avg_context : -1)
+                              << " ctx_max=" << (context_summary.valid ? context_summary.max_context : -1) << std::endl;
+                }
 
-                // Scale factor: 1/sqrt(head_dim)
-                float scale = 1.0f / sqrtf((float)head_dim_q);
+                if (use_cache && !use_paged_decode_attention) {  // Re-enabled old KV cache approach
+                    // Only need fancy logic if we have history.
+                    // If n_past = 0 (Prefill), K_all == Kcur is mostly fine,
+                    // BUT we still need to WRITE to cache.
+                    // The 'ggml_pad' trick updates cache as side effect.
+                    // So we act always if use_cache is true.
 
-                // Flash Attention: fused Q*K^T, scale, mask, softmax, *V
-                // Result: [head_dim, N, n_head]
-                KQV = ggml_flash_attn_ext(ctx_c, Q, K_fa, V_fa, KQ_mask, scale, 0.0f, 0.0f);
+                    // Use ggml_pad to create a tensor of correct size (N + n_past)
+                    // ggml_pad(ctx, a, pad_0, pad_1, pad_2, pad_3)
+                    // We pad dimension 2 (sequence) by n_past_val.
+                    // Result shape: [head_dim, n_head, N + n_past]
+                    struct ggml_tensor* K_padded = Kcur;
+                    struct ggml_tensor* V_padded = Vcur;
 
-                // Permute to [head_dim, n_head, N] for projection
-                KQV = ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
-            } else {
-                // -----------------------------------------------------------------------
-                // STANDARD ATTENTION PATH (AVX2/Fallback) - Tiled GQA Implementation
-                // -----------------------------------------------------------------------
-                // For GQA models (n_head != n_head_kv), we use a TILED approach:
-                //   - Iterate over KV heads (h_kv = 0 to n_head_kv)
-                //   - For each KV head, process n_rep query heads together
-                //   - Use ggml_view to slice tensors without copying (O(1) memory)
+                    if (n_past_val > 0) {
+                        K_padded = ggml_pad(ctx_c, Kcur, 0, 0, n_past_val, 0);
+                        V_padded = ggml_pad(ctx_c, Vcur, 0, 0, n_past_val, 0);
+                    }
+
+                    KVCacheUserData* k_ud = GetKVCacheUserData(il, true);
+                    *k_ud = {cache, il, head_dim_kv, true};  // batch accessed via GetCurrentBatch()
+                    KVCacheUserData* v_ud = GetKVCacheUserData(il, false);
+                    *v_ud = {cache, il, head_dim_v, false};  // batch accessed via GetCurrentBatch()
+
+                    int kv_tasks = ResolveInferenceConfig(&batch).num_threads;
+                    if (kv_tasks <= 0) {
+                        kv_tasks = std::thread::hardware_concurrency();
+                        if (kv_tasks <= 0) kv_tasks = 4;
+                    }
+                    int physical_cores = ResolveHardwareTopology(&batch).GetPhysicalCoreCount();
+                    if (physical_cores > 0) {
+                        kv_tasks = std::min(kv_tasks, physical_cores);
+                    }
+                    kv_tasks = std::max(1, kv_tasks);
+                    kv_tasks = std::min(kv_tasks, std::max(1, n_head_kv));
+                    {
+                        // Escape hatch for platform-specific troubleshooting.
+                        const char* env = std::getenv("DENSECORE_KV_CALLBACK_SINGLE_THREAD");
+                        const bool force_single = env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+                        if (force_single) {
+                            kv_tasks = 1;
+                        }
+                    }
+
+                    K_all = ggml_map_custom1(ctx_c, K_padded, cb_kv_manage, kv_tasks, k_ud);
+                    V_all = ggml_map_custom1(ctx_c, V_padded, cb_kv_manage, kv_tasks, v_ud);
+                }
+
+                // =========================================================================
+                // NEW: Robust KV Cache Integration (Replaces ggml_pad approach)
+                // =========================================================================
+                // This approach explicitly:
+                //   1. Allocates destination tensors with full size [head_dim, n_head_kv,
+                //   n_total]
+                //   2. Uses cb_kv_update_and_gather to write cache, read history, append
+                //   current
+                //   3. Does NOT rely on ggml_pad padding behavior which was causing
+                //   NaN/hangs
+                // =========================================================================
+                if (false) {  // DISABLED: New approach has graph dependency bugs
+                    // Step 1: Explicitly allocate K_all and V_all with full context size
+                    // Shape: [head_dim_kv, n_head_kv, n_total_tokens]
+                    struct ggml_tensor* K_all_tensor =
+                        ggml_new_tensor_3d(ctx_c, GGML_TYPE_F32, head_dim_kv, n_head_kv, n_total_tokens);
+                    struct ggml_tensor* V_all_tensor =
+                        ggml_new_tensor_3d(ctx_c, GGML_TYPE_F32, head_dim_kv, n_head_kv, n_total_tokens);
+                    ggml_set_name(K_all_tensor, "K_all");
+                    ggml_set_name(V_all_tensor, "V_all");
+
+                    // Step 2: Force Kcur/Vcur to be contiguous before passing data pointers
+                    // This ensures src_data pointer is valid for memcpy in callback
+                    struct ggml_tensor* Kcur_contig = ggml_cont(ctx_c, Kcur);
+                    struct ggml_tensor* Vcur_contig = ggml_cont(ctx_c, Vcur);
+
+                    // Step 3: Setup userdata for K with src_tensor pointer
+                    // NOTE: src_tensor is set below after ggml_cont
+                    //       The tensor pointer is stable; data is populated at graph
+                    //       execution
+                    KVUpdateGatherUserData* k_gather_ud = GetKVUpdateGatherUserData(il, true);
+                    k_gather_ud->cache = cache;
+                    k_gather_ud->batch = &batch;
+                    k_gather_ud->layer = il;
+                    k_gather_ud->head_dim = head_dim_kv;
+                    k_gather_ud->n_head_kv = n_head_kv;
+                    k_gather_ud->N = N;
+                    k_gather_ud->n_past = n_past_val;
+                    k_gather_ud->is_k = true;
+                    k_gather_ud->src_tensor = nullptr;  // Set below
+
+                    // Step 4: Setup userdata for V
+                    KVUpdateGatherUserData* v_gather_ud = GetKVUpdateGatherUserData(il, false);
+                    v_gather_ud->cache = cache;
+                    v_gather_ud->batch = &batch;
+                    v_gather_ud->layer = il;
+                    v_gather_ud->head_dim = head_dim_kv;
+                    v_gather_ud->n_head_kv = n_head_kv;
+                    v_gather_ud->N = N;
+                    v_gather_ud->n_past = n_past_val;
+                    v_gather_ud->is_k = false;
+                    v_gather_ud->src_tensor = nullptr;  // Set below
+
+                    // Step 5: Create graph nodes that will execute the callbacks
+                    // The src_data will be populated from the contiguous tensor's data
+                    // pointer when the graph is executed (data is allocated by this point)
+                    //
+                    // WORKAROUND: ggml_map_custom1 passes its input tensor as 'src'.
+                    // We need to pass BOTH the destination and source data.
+                    // Solution: Store Kcur_contig as 'src' input, K_all_tensor->data is
+                    // 'dst'
+                    //
+                    // The callback signature is: cb(dst, src, ith, nth, userdata)
+                    // We set src_data = src->data in the callback if it's nullptr
+
+                    // For K: Map from Kcur_contig, output shape matches K_all_tensor
+                    // We need a custom callback wrapper that sets src_data from src tensor
+                    // For now, we'll pass the contiguous tensor and handle in callback
+
+                    // Actually, ggml_map_custom1(ctx, a, cb, n_tasks, userdata) creates:
+                    //   result tensor with same shape as 'a'
+                    //   callback receives: cb(result, a, ith, nth, userdata)
+                    //
+                    // So 'a' becomes 'src', and result is 'dst'
+                    // We need result to have shape [head_dim_kv, n_head_kv, n_total_tokens]
+                    // This means we should pass K_all_tensor as 'a', not Kcur!
+                    //
+                    // But then we need to access Kcur data via userdata.
+                    // Since Kcur_contig->data is available at graph execution time,
+                    // we can store its pointer now and it will be valid.
+
+                    // CRITICAL FIX: The tensor data pointers are only valid AFTER
+                    // ggml_backend allocates memory. At graph construction time, data may
+                    // be nullptr. We need to access the data through the tensor pointer in
+                    // the callback.
+
+                    // Store tensor pointers in userdata (not raw data pointers)
+                    // This requires modifying the struct to take ggml_tensor* instead of
+                    // float* For now, we'll use a simpler workaround: pass Kcur_contig as
+                    // input, create output tensor of correct size via ggml_new_tensor, then
+                    // use ggml_cpy
+
+                    // SIMPLER APPROACH: Use ggml_map_custom1 on K_all_tensor, pass Kcur as
+                    // extra userdata Since Kcur_contig is built into the graph, its data
+                    // pointer is stable
+                    k_gather_ud->src_tensor = Kcur_contig;
+                    v_gather_ud->src_tensor = Vcur_contig;
+
+                    // Create the combined tensors via callback
+                    K_all = ggml_map_custom1(ctx_c, K_all_tensor, cb_kv_update_and_gather, 1, k_gather_ud);
+                    V_all = ggml_map_custom1(ctx_c, V_all_tensor, cb_kv_update_and_gather, 1, v_gather_ud);
+
+                    // Mark as dependent on Kcur_contig and Vcur_contig for proper execution
+                    // order
+                    ggml_build_forward_expand(gf, Kcur_contig);
+                    ggml_build_forward_expand(gf, Vcur_contig);
+                }
+
+                // After projection and reshape:
+
+                // Q: [head_dim_q, n_head, N]
+                // K_all: [head_dim_kv, n_head_kv, n_past + N]
+                // V_all: [head_dim_kv, n_head_kv, n_past + N]
+
+                // =========================================================================
+                // GQA (Grouped Query Attention): LOGICAL BROADCASTING
+                // =========================================================================
+                // For models like Qwen3 where n_head != n_head_kv (e.g., 32 Q heads, 4 KV
+                // heads):
                 //
-                // This avoids the massive memory bloat of ggml_repeat while maintaining
-                // correctness on all hardware (AVX2, SSE, etc.)
-                // -----------------------------------------------------------------------
+                // OLD APPROACH (REMOVED - caused segfaults and was inefficient):
+                //   Used ggml_repeat to physically expand K/V from n_head_kv to n_head.
+                //   This allocated 8x more memory and caused OOM/crashes.
+                //
+                // NEW APPROACH (Logical Broadcasting):
+                //   Keep K/V at their original [head_dim, n_head_kv, seq] shape.
+                //   The attention kernel computes: kv_head = query_head / (n_head /
+                //   n_head_kv) This is zero-copy and memory-efficient.
+                //
+                // Both ggml_flash_attn_ext and our custom FlashAttentionGQA support this.
+                // =========================================================================
+                struct ggml_tensor* K = K_all;
+                struct ggml_tensor* V = V_all;
 
-                // Scale factor for attention
-                float scale = 1.0f / sqrtf((float)head_dim_q);
+                // Compute GQA repetition factor for attention dispatch
+                const int n_rep = (n_head_kv > 0) ? (n_head / n_head_kv) : 1;
+                (void)n_rep;  // Used in attention mask/kernel setup
 
-                // =================================================================
-                // UNIFIED ATTENTION PATH (GQA + MHA)
-                // =================================================================
-                // GGML's mul_mat natively supports GQA broadcasting:
-                // when K has n_head_kv heads and Q has n_head heads (where
-                // n_head % n_head_kv == 0), mul_mat broadcasts K across
-                // query head groups automatically. This matches llama.cpp.
-                // =================================================================
-                {
-                    const bool skip_attn_cont = (N > 1) && IsPrefillAttentionSkipContEnabled();
-                    // Q: [head_dim, N, n_head]
+                // =========================================================================
+                // ATTENTION (llama.cpp style - corrected tensor layouts)
+                // =========================================================================
+                // Tensor shapes at this point:
+                //   Q: [head_dim_q, n_head, N]
+                //   K: [head_dim_kv, n_head_kv, n_total_tokens]  (NOT expanded!)
+                //   V: [head_dim_kv, n_head_kv, n_total_tokens]  (NOT expanded!)
+                //
+                // For GQA: The attention kernel handles broadcasting internally.
+                // Query heads [0, n_rep) all attend to KV head 0, etc.
+                // =========================================================================
+
+                // =========================================================================
+                // ATTENTION DISPATCH (Runtime selection based on CPU capabilities)
+                // - AVX-512+: Use Flash Attention (ggml_flash_attn_ext) for efficiency
+                // - Other: Use standard Q*K^T -> softmax -> V for compatibility
+                // =========================================================================
+                // Note: Flash Attention still requires AVX-512-class x86 support for
+                // correctness/perf in this path.
+                const bool flash_attn_head_layout_supported =
+                    !model->arch_flags.is_glm_dsa && (n_head_kv > 0) && (n_head % n_head_kv == 0) && (n_head % 8 == 0);
+                const bool flash_attn_runtime_supported = flash_attn_head_layout_supported &&
+                                                          densecore::OpsRegistry::IsInitialized() &&
+                                                          IsFlashAttentionIsaSupported();
+                const bool flash_attn_forced = IsFlashAttentionForced();
+                const bool use_flash_attention = !IsFlashAttentionDisabled() && flash_attn_runtime_supported;
+                const densecore::DeviceType preferred_attention_device = ResolvePreferredAttentionDevice(&batch);
+                // HAL FlashAttention API currently exposes only `causal` + `n_head_kv`.
+                // For decode (N == 1), no intra-query future tokens exist, so offset is
+                // unnecessary even when n_past > 0. Prefill still requires zero offset.
+                const bool hal_attention_offset_safe = (n_past_val == 0) || (N == 1);
+                const bool use_hal_attention_dispatch = preferred_attention_device != densecore::DeviceType::CPU &&
+                                                        !use_paged_decode_attention && hal_attention_offset_safe &&
+                                                        !model->arch_flags.is_glm_dsa;
+                const bool portable_cpu_flash_attention_supported =
+                    flash_attn_head_layout_supported && densecore::OpsRegistry::IsInitialized() &&
+                    (IsPortableCpuFlashAttentionEnabled() || flash_attn_forced);
+                const bool prefer_portable_cpu_flash_safe_decode =
+                    force_safe_gqa_decode && preferred_attention_device == densecore::DeviceType::CPU &&
+                    hal_attention_offset_safe && portable_cpu_flash_attention_supported;
+                if (!use_paged_decode_attention && force_safe_gqa_decode && !prefer_portable_cpu_flash_safe_decode) {
+                    use_paged_decode_attention = true;
+                    static bool logged_force_safe_decode = false;
+                    if (!logged_force_safe_decode) {
+                        std::cerr << "[DenseCore] Forcing paged decode attention for GQA decode safety "
+                                  << "(N=1, n_head=" << n_head << ", n_head_kv=" << n_head_kv << ")" << std::endl;
+                        logged_force_safe_decode = true;
+                    }
+                } else if (!use_paged_decode_attention && prefer_portable_cpu_flash_safe_decode) {
+                    static bool logged_safe_decode_flash = false;
+                    if (!logged_safe_decode_flash) {
+                        std::cerr << "[DenseCore] Using portable CPU flash attention for GQA decode safety "
+                                  << "(N=1, n_head=" << n_head << ", n_head_kv=" << n_head_kv << ")" << std::endl;
+                        logged_safe_decode_flash = true;
+                    }
+                }
+                const bool use_portable_cpu_flash_attention =
+                    !IsFlashAttentionDisabled() && preferred_attention_device == densecore::DeviceType::CPU &&
+                    !use_paged_decode_attention && hal_attention_offset_safe && portable_cpu_flash_attention_supported;
+                if (flash_attn_forced && !flash_attn_runtime_supported && il == 0 &&
+                    IsVerboseGraphBuildLoggingEnabled()) {
+                    std::cerr
+                        << "[DenseCore] DENSECORE_FORCE_FLASH_ATTN requested but native ggml flash is unavailable; "
+                           "falling back to DenseCore portable flash attention or standard attention."
+                        << std::endl;
+                }
+
+                if (decode_paged_policy.debug_log && il == 0 && decode_only_batch && N > 1) {
+                    const char* path =
+                        use_paged_decode_attention
+                            ? "paged_decode"
+                            : (use_hal_attention_dispatch         ? "hal_flash"
+                               : use_portable_cpu_flash_attention ? "cpu_flash_hal"
+                                                                  : (use_flash_attention ? "flash" : "standard"));
+                    std::cerr << "[DecodeAttentionPath] N=" << N << " path=" << path << std::endl;
+                }
+
+                if (use_paged_decode_attention) {
+                    // -----------------------------------------------------------------------
+                    // DECODE PAGED ATTENTION FAST PATH (decode-only batches, one token/seq)
+                    // -----------------------------------------------------------------------
+                    // Avoids materializing [n_total] K/V tensors each token.
+                    // Writes current K/V to paged cache and reads history directly from cache.
+                    // -----------------------------------------------------------------------
+                    struct ggml_tensor* Q_decode = ggml_is_contiguous(Qcur) ? Qcur : ggml_cont(ctx_c, Qcur);
+                    struct ggml_tensor* K_decode = ggml_is_contiguous(Kcur) ? Kcur : ggml_cont(ctx_c, Kcur);
+                    struct ggml_tensor* V_decode = ggml_is_contiguous(Vcur) ? Vcur : ggml_cont(ctx_c, Vcur);
+
+                    PagedAttentionUserData* ud = GetPagedAttentionUserData();
+                    ud->cache = cache;
+                    ud->layer = il;
+                    ud->head_dim = head_dim_q;
+                    ud->v_head_dim = head_dim_v;
+                    ud->n_head = n_head;
+                    ud->epoch_started.store(0, std::memory_order_relaxed);
+                    ud->epoch_done.store(0, std::memory_order_relaxed);
+                    ud->kv_writers_done.store(0, std::memory_order_relaxed);
+                    KQV = ggml_paged_attention_decode(ctx_c, Q_decode, K_decode, V_decode, ud);
+                } else if (use_hal_attention_dispatch) {
+                    // -----------------------------------------------------------------------
+                    // HAL ATTENTION PATH (per-op-class mixed routing)
+                    // -----------------------------------------------------------------------
+                    // Dispatches attention to the preferred attention device while the rest
+                    // of the graph can remain on a different primary backend.
+                    // -----------------------------------------------------------------------
+                    struct ggml_tensor* Q_hal = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
+                    struct ggml_tensor* K_hal = ggml_permute(ctx_c, K, 0, 2, 1, 3);
+                    struct ggml_tensor* V_hal = ggml_permute(ctx_c, V, 0, 2, 1, 3);
+                    Q_hal = ggml_cont(ctx_c, Q_hal);
+                    K_hal = ggml_cont(ctx_c, K_hal);
+                    V_hal = ggml_cont(ctx_c, V_hal);
+
+                    const float scale = 1.0f / sqrtf((float)head_dim_q);
+                    // For decode (N==1), causal=false is correct because K already contains
+                    // only historical + current keys (no future positions).
+                    const bool hal_causal = (N > 1);
+                    KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv,
+                                                   preferred_attention_device);
+
+                    // Convert [head_dim, N, n_head] -> [head_dim, n_head, N]
+                    KQV = ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
+                } else if (use_portable_cpu_flash_attention) {
+                    // -----------------------------------------------------------------------
+                    // PORTABLE CPU FLASH ATTENTION PATH
+                    // -----------------------------------------------------------------------
+                    // On ARM/Apple CPU runtimes, route through DenseCore's backend-agnostic
+                    // FlashAttention op instead of forcing the materialized standard path.
+                    // -----------------------------------------------------------------------
+                    struct ggml_tensor* Q_hal = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
+                    struct ggml_tensor* K_hal = ggml_permute(ctx_c, K, 0, 2, 1, 3);
+                    struct ggml_tensor* V_hal = ggml_permute(ctx_c, V, 0, 2, 1, 3);
+                    Q_hal = ggml_cont(ctx_c, Q_hal);
+                    K_hal = ggml_cont(ctx_c, K_hal);
+                    V_hal = ggml_cont(ctx_c, V_hal);
+
+                    const float scale = 1.0f / sqrtf((float)head_dim_q);
+                    const bool hal_causal = (N > 1);
+                    KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv,
+                                                   densecore::DeviceType::CPU);
+
+                    // Convert [head_dim, N, n_head] -> [head_dim, n_head, N]
+                    KQV = ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
+                } else if (use_flash_attention) {
+                    // -----------------------------------------------------------------------
+                    // FLASH ATTENTION PATH (AVX-512 only)
+                    // -----------------------------------------------------------------------
+                    // ggml_flash_attn_ext natively supports GQA - it handles K/V with fewer
+                    // heads than Q. The kernel internally computes: kv_head = query_head /
+                    // n_rep
+                    //
+                    // Shapes: Q: [head_dim, N, n_head], K/V: [head_dim, n_total, n_head_kv]
+                    // -----------------------------------------------------------------------
                     struct ggml_tensor* Q = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
 
-                    // K/V: [head_dim, n_total, n_head_kv]
-                    struct ggml_tensor* K_att = ggml_permute(ctx_c, K, 0, 2, 1, 3);
-                    struct ggml_tensor* V_att = ggml_permute(ctx_c, V, 0, 2, 1, 3);
+                    // K/V: [head_dim, n_head_kv, n_total] -> [head_dim, n_total, n_head_kv]
+                    struct ggml_tensor* K_fa = ggml_permute(ctx_c, K, 0, 2, 1, 3);
+                    struct ggml_tensor* V_fa = ggml_permute(ctx_c, V, 0, 2, 1, 3);
 
-                    // ggml_mul_mat requires lhs (a) to be non-transposed. Always
-                    // materialize K_att.
-                    K_att = ggml_cont(ctx_c, K_att);
-                    if (!skip_attn_cont) {
-                        // Fully contiguous fallback path.
-                        Q = ggml_cont(ctx_c, Q);
-                        V_att = ggml_cont(ctx_c, V_att);
+                    // Create mask [n_total, N_padded, 1, 1] as required by
+                    // ggml_flash_attn_ext 0.0f = can attend, -INFINITY = cannot attend
+                    // (masked)
+                    int N_padded = (N + GGML_KQ_MASK_PAD - 1) & ~(GGML_KQ_MASK_PAD - 1);
+                    struct ggml_tensor* KQ_mask = nullptr;
+                    if (shared_prefill_flash_mask && shared_prefill_mask_n_total == n_total_tokens &&
+                        shared_prefill_mask_n_padded == N_padded && shared_prefill_mask_n == N &&
+                        shared_prefill_mask_n_past == n_past_val) {
+                        KQ_mask = shared_prefill_flash_mask;
+                    } else {
+                        KQ_mask = ggml_new_tensor_4d(ctx_c, GGML_TYPE_F32, n_total_tokens, N_padded, 1, 1);
+
+                        // Fill causal mask (column-major: element (k, q) is at k + q * n_kv)
+                        float* mask_data = reinterpret_cast<float*>(KQ_mask->data);
+                        for (int q = 0; q < N_padded; q++) {
+                            for (int k = 0; k < n_total_tokens; k++) {
+                                const int query_pos = n_past_val + q;
+                                const int key_pos = k;
+                                const int idx = k + q * n_total_tokens;
+
+                                if (q >= N || key_pos <= query_pos) {
+                                    mask_data[idx] = 0.0f;
+                                } else {
+                                    mask_data[idx] = -INFINITY;
+                                }
+                            }
+                        }
+
+                        if (N > 1 && !decode_only_batch) {
+                            shared_prefill_flash_mask = KQ_mask;
+                            shared_prefill_mask_n_total = n_total_tokens;
+                            shared_prefill_mask_n_padded = N_padded;
+                            shared_prefill_mask_n = N;
+                            shared_prefill_mask_n_past = n_past_val;
+                        }
                     }
 
-                    // Q @ K^T -> [n_total, N, n_head] (broadcasts n_head_kv → n_head)
-                    struct ggml_tensor* KQ = ggml_mul_mat(ctx_c, K_att, Q);
+                    // Ensure contiguity for Flash Attention
+                    Q = ggml_cont(ctx_c, Q);
+                    K_fa = ggml_cont(ctx_c, K_fa);
+                    V_fa = ggml_cont(ctx_c, V_fa);
 
-                    // Scale
-                    KQ = ggml_scale(ctx_c, KQ, scale);
+                    // Scale factor: 1/sqrt(head_dim)
+                    float scale = 1.0f / sqrtf((float)head_dim_q);
 
-                    // Causal mask (prefill only)
-                    if (N > 1) {
-                        KQ = ggml_diag_mask_inf(ctx_c, KQ, n_past_val);
-                    }
-
-                    // Softmax
-                    KQ = ggml_soft_max(ctx_c, KQ);
-
-                    // KQ @ V -> [head_dim, N, n_head]
-                    // V needs transpose: [n_total, head_dim, n_head_kv]
-                    struct ggml_tensor* V_t = ggml_permute(ctx_c, V_att, 1, 0, 2, 3);
-                    // ggml_mul_mat requires lhs (a) to be non-transposed.
-                    V_t = ggml_cont(ctx_c, V_t);
-                    KQV = ggml_mul_mat(ctx_c, V_t, KQ);
+                    // Flash Attention: fused Q*K^T, scale, mask, softmax, *V
+                    // Result: [head_dim, N, n_head]
+                    KQV = ggml_flash_attn_ext(ctx_c, Q, K_fa, V_fa, KQ_mask, scale, 0.0f, 0.0f);
 
                     // Permute to [head_dim, n_head, N] for projection
                     KQV = ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
+                } else {
+                    // -----------------------------------------------------------------------
+                    // STANDARD ATTENTION PATH (AVX2/Fallback) - Tiled GQA Implementation
+                    // -----------------------------------------------------------------------
+                    // For GQA models (n_head != n_head_kv), we use a TILED approach:
+                    //   - Iterate over KV heads (h_kv = 0 to n_head_kv)
+                    //   - For each KV head, process n_rep query heads together
+                    //   - Use ggml_view to slice tensors without copying (O(1) memory)
+                    //
+                    // This avoids the massive memory bloat of ggml_repeat while maintaining
+                    // correctness on all hardware (AVX2, SSE, etc.)
+                    // -----------------------------------------------------------------------
+
+                    // Scale factor for attention
+                    float scale = 1.0f / sqrtf((float)head_dim_q);
+
+                    // =================================================================
+                    // UNIFIED ATTENTION PATH (GQA + MHA)
+                    // =================================================================
+                    // GGML's mul_mat natively supports GQA broadcasting:
+                    // when K has n_head_kv heads and Q has n_head heads (where
+                    // n_head % n_head_kv == 0), mul_mat broadcasts K across
+                    // query head groups automatically. This matches llama.cpp.
+                    // =================================================================
+                    {
+                        const bool skip_attn_cont = (N > 1) && IsPrefillAttentionSkipContEnabled();
+                        // Q: [head_dim, N, n_head]
+                        struct ggml_tensor* Q = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
+
+                        // K/V: [head_dim, n_total, n_head_kv]
+                        struct ggml_tensor* K_att = ggml_permute(ctx_c, K, 0, 2, 1, 3);
+                        struct ggml_tensor* V_att = ggml_permute(ctx_c, V, 0, 2, 1, 3);
+
+                        // ggml_mul_mat requires lhs (a) to be non-transposed. Always
+                        // materialize K_att.
+                        K_att = ggml_cont(ctx_c, K_att);
+                        if (!skip_attn_cont) {
+                            // Fully contiguous fallback path.
+                            Q = ggml_cont(ctx_c, Q);
+                            V_att = ggml_cont(ctx_c, V_att);
+                        }
+
+                        // Q @ K^T -> [n_total, N, n_head] (broadcasts n_head_kv → n_head)
+                        struct ggml_tensor* KQ = ggml_mul_mat(ctx_c, K_att, Q);
+
+                        // Scale
+                        KQ = ggml_scale(ctx_c, KQ, scale);
+
+                        // Causal mask (prefill only)
+                        if (N > 1) {
+                            KQ = ggml_diag_mask_inf(ctx_c, KQ, n_past_val);
+                        }
+
+                        // Softmax
+                        KQ = ggml_soft_max(ctx_c, KQ);
+
+                        // KQ @ V -> [head_dim, N, n_head]
+                        // V needs transpose: [n_total, head_dim, n_head_kv]
+                        struct ggml_tensor* V_t = ggml_permute(ctx_c, V_att, 1, 0, 2, 3);
+                        // ggml_mul_mat requires lhs (a) to be non-transposed.
+                        V_t = ggml_cont(ctx_c, V_t);
+                        KQV = ggml_mul_mat(ctx_c, V_t, KQ);
+
+                        // Permute to [head_dim, n_head, N] for projection
+                        KQV = ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
+                    }
                 }
             }
 
@@ -5920,7 +6613,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 KQV_merged = ggml_map_custom1(ctx_c, KQV_merged, cb_check_kqv, 1, &dbg_layers[il]);
             }
 
-            cur = ggml_reshape_2d(ctx_c, KQV_merged, head_dim_q * n_head, N);
+            const int attn_out_head_dim = static_cast<int>(KQV_merged->ne[0]);
+            cur = ggml_reshape_2d(ctx_c, KQV_merged, attn_out_head_dim * n_head, N);
             if (attn_gate) {
                 attn_gate = ggml_sigmoid(ctx_c, attn_gate);
                 cur = ggml_mul(ctx_c, cur, attn_gate);
@@ -6053,6 +6747,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // =====================================================================
             // MOE PATH
             // =====================================================================
+            struct ggml_tensor* moe_input = cur;
+
             // 1. Router: gate_logits = moe_gate * input
             if (!moe_gate) {
                 throw densecore::InvalidArgumentException("Missing moe_gate weight in TransformerLayer");
@@ -6062,6 +6758,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // 2. Dispatch
             MoEUserData* moe_ud = AllocateMoEUserData(ctx_c);
             if (moe_ud) {
+                moe_ud->model = model;
                 moe_ud->layer = &model->layers[il];
                 moe_ud->k = model->hparams.n_experts_used;
                 moe_ud->batch = &batch;
@@ -6086,6 +6783,16 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // Use 1 task (single thread dispatch, threaded inside backend)
             cur = ggml_map_custom2(ctx_c, cur, gate_logits, cb_moe_forward, 1, moe_ud);
             ggml_set_name(cur, "moe_forward");
+
+            // GLM-style MoE keeps a dense shared-expert MLP in parallel with routed experts.
+            if (model->moe_n_shared_experts > 0 && ffn_gate && ffn_up && ffn_down) {
+                struct ggml_tensor* shared_gate = smart_mul_mat(ctx_c, ffn_gate, moe_input, model);
+                struct ggml_tensor* shared_up = smart_mul_mat(ctx_c, ffn_up, moe_input, model);
+                struct ggml_tensor* shared_ffn =
+                    ggml_map_custom2(ctx_c, shared_gate, shared_up, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+                shared_ffn = smart_mul_mat(ctx_c, ffn_down, shared_ffn, model);
+                cur = ggml_add(ctx_c, cur, shared_ffn);
+            }
         } else {
             // =====================================================================
             // DENSE PATH

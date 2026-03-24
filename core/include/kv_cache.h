@@ -209,7 +209,9 @@ struct PagedKVCache {
     BlockManager* block_manager = nullptr;
 
     // Model dimensions
-    int head_dim;
+    int head_dim;            // K head dim
+    int v_head_dim;          // V head dim (can differ for MLA/DSA models)
+    int index_head_dim = 0;  // GLM-5 DSA indexer key dim
     int n_head_kv;
     int n_layer;
     int max_blocks;
@@ -224,9 +226,11 @@ struct PagedKVCache {
     // These own the actual KV cache memory as a pre-allocated arena
     std::unique_ptr<densecore::KVBlockAllocator> k_allocator;
     std::unique_ptr<densecore::KVBlockAllocator> v_allocator;
+    std::unique_ptr<densecore::KVBlockAllocator> index_allocator;
 
     // Flag to indicate allocator-based storage is active
     bool use_block_allocator = false;
+    bool has_index_cache = false;
 
     ~PagedKVCache();
 
@@ -256,18 +260,28 @@ struct PagedKVCache {
     void* GetVBlockPtr(int block_id, int layer);
     const void* GetVBlockPtr(int block_id, int layer) const;
 
+    // Get pointer to GLM-5 DSA indexer key cache for a specific (block_id, layer)
+    void* GetIndexBlockPtr(int block_id, int layer);
+    const void* GetIndexBlockPtr(int block_id, int layer) const;
+
     // Get pointer to a specific slot within a block
     void* GetKSlotPtr(int block_id, int layer, int slot);
     void* GetVSlotPtr(int block_id, int layer, int slot);
+    void* GetIndexSlotPtr(int block_id, int layer, int slot);
 
     // Get bytes per slot (head_dim * n_head_kv * type_size)
     size_t GetBytesPerSlot() const;
+    size_t GetVBytesPerSlot() const;
+    size_t GetIndexBytesPerSlot() const;
 
     // Get bytes per block (BLOCK_SIZE * bytes_per_slot)
     size_t GetBytesPerBlock() const;
+    size_t GetVBytesPerBlock() const;
+    size_t GetIndexBytesPerBlock() const;
 
     // Expose packed KV layout (strides + packing) for direct kernel addressing.
     BlockLayout GetBlockLayout() const;
+    BlockLayout GetVBlockLayout() const;
 
     // -------------------------------------------------------------------------
     // Quantized KV Cache Operations
@@ -278,16 +292,19 @@ struct PagedKVCache {
 
     // Get elements per slot (head_dim * n_head_kv)
     int GetElementsPerSlot() const;
+    int GetVElementsPerSlot() const;
 
     // Write a single KV slot with automatic quantization
     // Input: fp32 data of size [head_dim * n_head_kv]
     void WriteKSlot(int block_id, int layer, int slot, const float* data);
     void WriteVSlot(int block_id, int layer, int slot, const float* data);
+    void WriteIndexSlot(int block_id, int layer, int slot, const float* data);
 
     // Read a single KV slot with automatic dequantization
     // Output: fp32 data of size [head_dim * n_head_kv]
     void ReadKSlot(int block_id, int layer, int slot, float* out) const;
     void ReadVSlot(int block_id, int layer, int slot, float* out) const;
+    void ReadIndexSlot(int block_id, int layer, int slot, float* out) const;
 
     // Batch write/read for multiple slots (more efficient for Q8)
     void WriteKSlots(int block_id, int layer, int start_slot, int num_slots, const float* data);

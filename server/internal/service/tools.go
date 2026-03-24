@@ -30,6 +30,8 @@ func (f *ToolPromptFormatter) FormatToolsPrompt(tools []domain.Tool) string {
 	switch f.ModelType {
 	case "qwen":
 		return f.formatQwenTools(tools)
+	case "glm", "glm45", "glm47":
+		return f.formatGLMTools(tools)
 	case "llama":
 		return f.formatLlamaTools(tools)
 	default:
@@ -92,6 +94,32 @@ func (f *ToolPromptFormatter) formatQwenTools(tools []domain.Tool) string {
 	return sb.String()
 }
 
+// formatGLMTools creates a GLM-friendly XML-wrapped tool description.
+func (f *ToolPromptFormatter) formatGLMTools(tools []domain.Tool) string {
+	var sb strings.Builder
+	sb.WriteString("\n\n# Tools\n\n")
+	sb.WriteString("You may call tools by replying with:\n")
+	sb.WriteString("<tool_call>\n{\"name\": \"function_name\", \"arguments\": {...}}\n</tool_call>\n\n")
+	sb.WriteString("Available tools:\n<tools>\n")
+
+	for _, tool := range tools {
+		if tool.Type != "function" {
+			continue
+		}
+		toolJSON, err := json.Marshal(tool)
+		if err != nil {
+			slog.Warn("failed to marshal tool", slog.String("tool", tool.Function.Name), slog.String("error", err.Error()))
+			continue
+		}
+		sb.WriteString(string(toolJSON))
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("</tools>\n")
+	sb.WriteString("If you include reasoning, wrap it in <think>...</think> and keep tool calls outside the reasoning block.\n")
+	return sb.String()
+}
+
 // formatLlamaTools creates Llama-specific tool format
 func (f *ToolPromptFormatter) formatLlamaTools(tools []domain.Tool) string {
 	var sb strings.Builder
@@ -132,11 +160,27 @@ func (p *ToolCallParser) ParseToolCalls(output string) ([]domain.ToolCall, strin
 	switch p.ModelType {
 	case "qwen":
 		return p.parseQwenToolCalls(output)
+	case "glm", "glm45", "glm47":
+		return p.parseGLMToolCalls(output)
 	case "llama":
 		return p.parseLlamaToolCalls(output)
 	default:
 		return p.parseGenericToolCalls(output)
 	}
+}
+
+func stripReasoningBlocks(output string) string {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?s)<think>.*?</think>`),
+		regexp.MustCompile(`(?s)<reasoning>.*?</reasoning>`),
+		regexp.MustCompile(`(?s)◁think▷.*?◁/think▷`),
+	}
+
+	cleaned := output
+	for _, re := range patterns {
+		cleaned = re.ReplaceAllString(cleaned, "")
+	}
+	return strings.TrimSpace(cleaned)
 }
 
 // parseGenericToolCalls parses JSON-based tool calls.
@@ -233,6 +277,76 @@ func (p *ToolCallParser) parseQwenToolCalls(output string) ([]domain.ToolCall, s
 	// Remove tool calls from output
 	cleanOutput := re.ReplaceAllString(output, "")
 	cleanOutput = strings.TrimSpace(cleanOutput)
+
+	return toolCalls, cleanOutput, nil
+}
+
+// parseGLMToolCalls parses GLM-style tool calls and strips reasoning tags first.
+// Supported forms:
+//  1. <tool_call>{"name":"fn","arguments":{...}}</tool_call>
+//  2. <tool_call><name>fn</name><arguments>{...}</arguments></tool_call>
+//  3. Generic JSON tool_calls fallback after reasoning removal
+func (p *ToolCallParser) parseGLMToolCalls(output string) ([]domain.ToolCall, string, error) {
+	cleaned := stripReasoningBlocks(output)
+
+	// First, try the Qwen-compatible JSON-in-tool_call format.
+	if toolCalls, cleanOutput, err := p.parseQwenToolCalls(cleaned); err != nil {
+		return nil, output, err
+	} else if len(toolCalls) > 0 {
+		return toolCalls, stripReasoningBlocks(cleanOutput), nil
+	}
+
+	re := regexp.MustCompile(`(?s)<tool_call>\s*(.*?)\s*</tool_call>`)
+	matches := re.FindAllStringSubmatch(cleaned, -1)
+	if len(matches) == 0 {
+		return p.parseGenericToolCalls(cleaned)
+	}
+
+	nameRe := regexp.MustCompile(`(?s)<name>\s*([^<]+?)\s*</name>`)
+	argsRe := regexp.MustCompile(`(?s)<arguments>\s*(\{.*\})\s*</arguments>`)
+
+	var toolCalls []domain.ToolCall
+	for i, match := range matches {
+		body := strings.TrimSpace(match[1])
+		if strings.HasPrefix(body, "{") {
+			var parsed struct {
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+			}
+			if err := json.Unmarshal([]byte(body), &parsed); err == nil && parsed.Name != "" {
+				toolCalls = append(toolCalls, domain.ToolCall{
+					ID:   fmt.Sprintf("call_%d", i),
+					Type: "function",
+					Function: domain.ToolCallFunction{
+						Name:      parsed.Name,
+						Arguments: string(parsed.Arguments),
+					},
+				})
+			}
+			continue
+		}
+
+		nameMatch := nameRe.FindStringSubmatch(body)
+		argsMatch := argsRe.FindStringSubmatch(body)
+		if len(nameMatch) < 2 || len(argsMatch) < 2 {
+			continue
+		}
+
+		toolCalls = append(toolCalls, domain.ToolCall{
+			ID:   fmt.Sprintf("call_%d", i),
+			Type: "function",
+			Function: domain.ToolCallFunction{
+				Name:      strings.TrimSpace(nameMatch[1]),
+				Arguments: strings.TrimSpace(argsMatch[1]),
+			},
+		})
+	}
+
+	cleanOutput := re.ReplaceAllString(cleaned, "")
+	cleanOutput = strings.TrimSpace(cleanOutput)
+	if len(toolCalls) == 0 {
+		return p.parseGenericToolCalls(cleanOutput)
+	}
 
 	return toolCalls, cleanOutput, nil
 }

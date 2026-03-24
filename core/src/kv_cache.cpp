@@ -482,8 +482,36 @@ size_t PagedKVCache::GetBytesPerSlot() const {
     return ggml_row_size(cache_type, elements);
 }
 
+size_t PagedKVCache::GetVBytesPerSlot() const {
+    const int64_t elements = static_cast<int64_t>(v_head_dim) * static_cast<int64_t>(n_head_kv);
+    if (elements <= 0) {
+        return 0;
+    }
+
+    if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+        return ggml_row_size(cache_type, static_cast<int64_t>(v_head_dim)) * static_cast<size_t>(n_head_kv);
+    }
+
+    return ggml_row_size(cache_type, elements);
+}
+
+size_t PagedKVCache::GetIndexBytesPerSlot() const {
+    if (!has_index_cache || index_head_dim <= 0) {
+        return 0;
+    }
+    return sizeof(ggml_fp16_t) * static_cast<size_t>(index_head_dim);
+}
+
 size_t PagedKVCache::GetBytesPerBlock() const {
     return GetBytesPerSlot() * BLOCK_SIZE;
+}
+
+size_t PagedKVCache::GetVBytesPerBlock() const {
+    return GetVBytesPerSlot() * BLOCK_SIZE;
+}
+
+size_t PagedKVCache::GetIndexBytesPerBlock() const {
+    return GetIndexBytesPerSlot() * BLOCK_SIZE;
 }
 
 PagedKVCache::BlockLayout PagedKVCache::GetBlockLayout() const {
@@ -502,6 +530,26 @@ PagedKVCache::BlockLayout PagedKVCache::GetBlockLayout() const {
         }
         layout.packed_values_per_block = 1;
         layout.packed_blocks_per_head = head_dim;
+    }
+    return layout;
+}
+
+PagedKVCache::BlockLayout PagedKVCache::GetVBlockLayout() const {
+    BlockLayout layout;
+    layout.cache_type = cache_type;
+    layout.slot_stride_bytes = GetVBytesPerSlot();
+    layout.block_stride_bytes = GetVBytesPerBlock();
+    if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+        layout.head_stride_bytes = ggml_row_size(cache_type, static_cast<int64_t>(v_head_dim));
+        const int qk = ggml_blck_size(cache_type);
+        layout.packed_values_per_block = qk;
+        layout.packed_blocks_per_head = (v_head_dim + qk - 1) / qk;
+    } else {
+        if (n_head_kv > 0) {
+            layout.head_stride_bytes = layout.slot_stride_bytes / static_cast<size_t>(n_head_kv);
+        }
+        layout.packed_values_per_block = 1;
+        layout.packed_blocks_per_head = v_head_dim;
     }
     return layout;
 }
@@ -532,7 +580,7 @@ void* PagedKVCache::GetVBlockPtr(int block_id, int layer) {
     if (layer < 0 || layer >= n_layer) return nullptr;
 
     int64_t block_index = (int64_t)block_id * n_layer + layer;
-    size_t byte_offset = block_index * GetBytesPerBlock();
+    size_t byte_offset = block_index * GetVBytesPerBlock();
 
     if (use_block_allocator && v_allocator) {
         void* ptr = static_cast<char*>(v_allocator->ArenaBase()) + byte_offset;
@@ -546,6 +594,22 @@ const void* PagedKVCache::GetVBlockPtr(int block_id, int layer) const {
     return const_cast<PagedKVCache*>(this)->GetVBlockPtr(block_id, layer);
 }
 
+void* PagedKVCache::GetIndexBlockPtr(int block_id, int layer) {
+    if (!has_index_cache || !index_allocator) return nullptr;
+    if (block_id < 0 || block_id >= max_blocks) return nullptr;
+    if (layer < 0 || layer >= n_layer) return nullptr;
+
+    int64_t block_index = (int64_t)block_id * n_layer + layer;
+    size_t byte_offset = block_index * GetIndexBytesPerBlock();
+    void* ptr = static_cast<char*>(index_allocator->ArenaBase()) + byte_offset;
+    DENSECORE_ASSERT_ALIGNED_64(ptr);
+    return ptr;
+}
+
+const void* PagedKVCache::GetIndexBlockPtr(int block_id, int layer) const {
+    return const_cast<PagedKVCache*>(this)->GetIndexBlockPtr(block_id, layer);
+}
+
 void* PagedKVCache::GetKSlotPtr(int block_id, int layer, int slot) {
     void* block_ptr = GetKBlockPtr(block_id, layer);
     if (!block_ptr || slot < 0 || slot >= BLOCK_SIZE) return nullptr;
@@ -555,23 +619,34 @@ void* PagedKVCache::GetKSlotPtr(int block_id, int layer, int slot) {
 void* PagedKVCache::GetVSlotPtr(int block_id, int layer, int slot) {
     void* block_ptr = GetVBlockPtr(block_id, layer);
     if (!block_ptr || slot < 0 || slot >= BLOCK_SIZE) return nullptr;
-    return (char*)block_ptr + (size_t)slot * GetBytesPerSlot();
+    return (char*)block_ptr + (size_t)slot * GetVBytesPerSlot();
+}
+
+void* PagedKVCache::GetIndexSlotPtr(int block_id, int layer, int slot) {
+    void* block_ptr = GetIndexBlockPtr(block_id, layer);
+    if (!block_ptr || slot < 0 || slot >= BLOCK_SIZE) return nullptr;
+    return (char*)block_ptr + (size_t)slot * GetIndexBytesPerSlot();
 }
 
 void PagedKVCache::CopyBlockData(int src_block_id, int dst_block_id) {
     if (src_block_id == dst_block_id) return;
     if (src_block_id < 0 || dst_block_id < 0) return;
 
-    size_t bytes_per_block = GetBytesPerBlock();
+    size_t bytes_per_k_block = GetBytesPerBlock();
+    size_t bytes_per_v_block = GetVBytesPerBlock();
+    size_t bytes_per_index_block = GetIndexBytesPerBlock();
 
     for (int layer = 0; layer < n_layer; layer++) {
         void* k_src = GetKBlockPtr(src_block_id, layer);
         void* k_dst = GetKBlockPtr(dst_block_id, layer);
         void* v_src = GetVBlockPtr(src_block_id, layer);
         void* v_dst = GetVBlockPtr(dst_block_id, layer);
+        void* i_src = GetIndexBlockPtr(src_block_id, layer);
+        void* i_dst = GetIndexBlockPtr(dst_block_id, layer);
 
-        if (k_src && k_dst) memcpy(k_dst, k_src, bytes_per_block);
-        if (v_src && v_dst) memcpy(v_dst, v_src, bytes_per_block);
+        if (k_src && k_dst) memcpy(k_dst, k_src, bytes_per_k_block);
+        if (v_src && v_dst) memcpy(v_dst, v_src, bytes_per_v_block);
+        if (i_src && i_dst && bytes_per_index_block > 0) memcpy(i_dst, i_src, bytes_per_index_block);
     }
 }
 
@@ -580,27 +655,36 @@ void PagedKVCache::CopyBlockDataLayer(int src_block_id, int dst_block_id, int la
     if (src_block_id < 0 || dst_block_id < 0) return;
     if (layer < 0 || layer >= n_layer) return;
 
-    size_t bytes_per_block = GetBytesPerBlock();
+    size_t bytes_per_k_block = GetBytesPerBlock();
+    size_t bytes_per_v_block = GetVBytesPerBlock();
+    size_t bytes_per_index_block = GetIndexBytesPerBlock();
 
     void* k_src = GetKBlockPtr(src_block_id, layer);
     void* k_dst = GetKBlockPtr(dst_block_id, layer);
     void* v_src = GetVBlockPtr(src_block_id, layer);
     void* v_dst = GetVBlockPtr(dst_block_id, layer);
+    void* i_src = GetIndexBlockPtr(src_block_id, layer);
+    void* i_dst = GetIndexBlockPtr(dst_block_id, layer);
 
-    if (k_src && k_dst) memcpy(k_dst, k_src, bytes_per_block);
-    if (v_src && v_dst) memcpy(v_dst, v_src, bytes_per_block);
+    if (k_src && k_dst) memcpy(k_dst, k_src, bytes_per_k_block);
+    if (v_src && v_dst) memcpy(v_dst, v_src, bytes_per_v_block);
+    if (i_src && i_dst && bytes_per_index_block > 0) memcpy(i_dst, i_src, bytes_per_index_block);
 }
 
 void PagedKVCache::CopyBlocksToHost(const std::vector<int>& block_ids, std::vector<uint8_t>* k_out,
                                     std::vector<uint8_t>* v_out) const {
     if (!k_out || !v_out) return;
 
-    size_t bytes_per_block = GetBytesPerBlock();
+    size_t bytes_per_k_block = GetBytesPerBlock();
+    size_t bytes_per_v_block = GetVBytesPerBlock();
+    size_t bytes_per_index_block = GetIndexBytesPerBlock();
     size_t blocks = block_ids.size();
-    size_t total_bytes = blocks * static_cast<size_t>(n_layer) * bytes_per_block;
+    size_t total_k_bytes = blocks * static_cast<size_t>(n_layer) * bytes_per_k_block;
+    size_t total_v_bytes = blocks * static_cast<size_t>(n_layer) * bytes_per_v_block;
+    size_t total_index_bytes = has_index_cache ? blocks * static_cast<size_t>(n_layer) * bytes_per_index_block : 0;
 
-    k_out->assign(total_bytes, 0);
-    v_out->assign(total_bytes, 0);
+    k_out->assign(total_k_bytes + total_index_bytes, 0);
+    v_out->assign(total_v_bytes, 0);
 
     for (size_t i = 0; i < blocks; ++i) {
         int block_id = block_ids[i];
@@ -609,12 +693,20 @@ void PagedKVCache::CopyBlocksToHost(const std::vector<int>& block_ids, std::vect
         for (int layer = 0; layer < n_layer; ++layer) {
             const void* k_src = GetKBlockPtr(block_id, layer);
             const void* v_src = GetVBlockPtr(block_id, layer);
-            size_t offset = (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) * bytes_per_block;
+            const void* index_src = GetIndexBlockPtr(block_id, layer);
+            size_t offset_k = (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) * bytes_per_k_block;
+            size_t offset_v = (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) * bytes_per_v_block;
             if (k_src) {
-                memcpy(k_out->data() + offset, k_src, bytes_per_block);
+                memcpy(k_out->data() + offset_k, k_src, bytes_per_k_block);
             }
             if (v_src) {
-                memcpy(v_out->data() + offset, v_src, bytes_per_block);
+                memcpy(v_out->data() + offset_v, v_src, bytes_per_v_block);
+            }
+            if (index_src && total_index_bytes > 0) {
+                size_t index_base = total_k_bytes;
+                size_t offset_i = index_base + (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) *
+                                                   bytes_per_index_block;
+                memcpy(k_out->data() + offset_i, index_src, bytes_per_index_block);
             }
         }
     }
@@ -622,11 +714,15 @@ void PagedKVCache::CopyBlocksToHost(const std::vector<int>& block_ids, std::vect
 
 void PagedKVCache::RestoreBlocksFromHost(const std::vector<int>& block_ids, const std::vector<uint8_t>& k_in,
                                          const std::vector<uint8_t>& v_in) {
-    size_t bytes_per_block = GetBytesPerBlock();
+    size_t bytes_per_k_block = GetBytesPerBlock();
+    size_t bytes_per_v_block = GetVBytesPerBlock();
+    size_t bytes_per_index_block = GetIndexBytesPerBlock();
     size_t blocks = block_ids.size();
-    size_t total_bytes = blocks * static_cast<size_t>(n_layer) * bytes_per_block;
+    size_t total_k_bytes = blocks * static_cast<size_t>(n_layer) * bytes_per_k_block;
+    size_t total_v_bytes = blocks * static_cast<size_t>(n_layer) * bytes_per_v_block;
+    size_t total_index_bytes = has_index_cache ? blocks * static_cast<size_t>(n_layer) * bytes_per_index_block : 0;
 
-    if (k_in.size() < total_bytes || v_in.size() < total_bytes) {
+    if (k_in.size() < total_k_bytes || v_in.size() < total_v_bytes) {
         return;
     }
 
@@ -637,12 +733,20 @@ void PagedKVCache::RestoreBlocksFromHost(const std::vector<int>& block_ids, cons
         for (int layer = 0; layer < n_layer; ++layer) {
             void* k_dst = GetKBlockPtr(block_id, layer);
             void* v_dst = GetVBlockPtr(block_id, layer);
-            size_t offset = (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) * bytes_per_block;
+            void* index_dst = GetIndexBlockPtr(block_id, layer);
+            size_t offset_k = (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) * bytes_per_k_block;
+            size_t offset_v = (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) * bytes_per_v_block;
             if (k_dst) {
-                memcpy(k_dst, k_in.data() + offset, bytes_per_block);
+                memcpy(k_dst, k_in.data() + offset_k, bytes_per_k_block);
             }
             if (v_dst) {
-                memcpy(v_dst, v_in.data() + offset, bytes_per_block);
+                memcpy(v_dst, v_in.data() + offset_v, bytes_per_v_block);
+            }
+            if (index_dst && total_index_bytes > 0 && k_in.size() >= total_k_bytes + total_index_bytes) {
+                size_t index_base = total_k_bytes;
+                size_t offset_i = index_base + (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) *
+                                                   bytes_per_index_block;
+                memcpy(index_dst, k_in.data() + offset_i, bytes_per_index_block);
             }
         }
     }
@@ -696,10 +800,13 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
 
     // llama.cpp style: Use pre-computed head dimension from hparams
     cache->head_dim = model->hparams.n_embd_head_k;
+    cache->v_head_dim = model->hparams.n_embd_head_v > 0 ? model->hparams.n_embd_head_v : model->hparams.n_embd_head_k;
+    cache->index_head_dim = model->arch_flags.is_glm_dsa ? model->glm_index_head_dim : 0;
     cache->n_head_kv = model->hparams.n_head_kv;
     cache->n_layer = model->hparams.n_layer;
     cache->cache_type = type;
     cache->numa_node_id = numa_node_id;
+    cache->has_index_cache = model->arch_flags.is_glm_dsa && cache->index_head_dim > 0;
 
     // Validate supported types for KV cache.
     if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_Q8_0 && type != GGML_TYPE_Q4_0) {
@@ -708,10 +815,11 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
         cache->cache_type = type;
     }
 
-    if (ggml_is_quantized(type) && (cache->head_dim % ggml_blck_size(type)) != 0) {
-        std::cerr << "[KVCache] Warning: head_dim=" << cache->head_dim << " is not divisible by "
-                  << ggml_blck_size(type) << " for quantized cache type " << ggml_type_name(type)
-                  << ", falling back to F16" << std::endl;
+    if (ggml_is_quantized(type) &&
+        ((cache->head_dim % ggml_blck_size(type)) != 0 || (cache->v_head_dim % ggml_blck_size(type)) != 0)) {
+        std::cerr << "[KVCache] Warning: K/V head dims (" << cache->head_dim << ", " << cache->v_head_dim
+                  << ") are not divisible by " << ggml_blck_size(type) << " for quantized cache type "
+                  << ggml_type_name(type) << ", falling back to F16" << std::endl;
         type = GGML_TYPE_F16;
         cache->cache_type = type;
     }
@@ -732,10 +840,14 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
     // Calculate memory size per tensor (K or V) from runtime block stride to keep
     // quantized layouts (e.g., Q8_0 with padded rows) exact.
     int64_t n_layer_blocks = (int64_t)cache->max_blocks * cache->n_layer;
-    size_t block_stride = cache->GetBytesPerBlock();
+    size_t k_block_stride = cache->GetBytesPerBlock();
+    size_t v_block_stride = cache->GetVBytesPerBlock();
+    size_t index_block_stride = cache->GetIndexBytesPerBlock();
     size_t total_logical_blocks = static_cast<size_t>(n_layer_blocks);
-    size_t tensor_size = block_stride * total_logical_blocks;
-    size_t total_size = tensor_size * 2;  // K and V
+    size_t k_tensor_size = k_block_stride * total_logical_blocks;
+    size_t v_tensor_size = v_block_stride * total_logical_blocks;
+    size_t index_tensor_size = cache->has_index_cache ? index_block_stride * total_logical_blocks : 0;
+    size_t total_size = k_tensor_size + v_tensor_size + index_tensor_size;
 
     // ==========================================================================
     // KVBlockAllocator-based memory pool (PRIMARY PATH)
@@ -750,14 +862,20 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
     // So total "logical blocks" = max_blocks * n_layer
 
     // Create K allocator with NUMA awareness
-    cache->k_allocator = std::make_unique<densecore::KVBlockAllocator>(total_logical_blocks, block_stride, 64,
+    cache->k_allocator = std::make_unique<densecore::KVBlockAllocator>(total_logical_blocks, k_block_stride, 64,
                                                                        numa_node_id, use_hugepages, strict_numa);
 
     // Create V allocator with NUMA awareness
-    cache->v_allocator = std::make_unique<densecore::KVBlockAllocator>(total_logical_blocks, block_stride, 64,
+    cache->v_allocator = std::make_unique<densecore::KVBlockAllocator>(total_logical_blocks, v_block_stride, 64,
                                                                        numa_node_id, use_hugepages, strict_numa);
 
-    if (!cache->k_allocator->IsValid() || !cache->v_allocator->IsValid()) {
+    if (cache->has_index_cache) {
+        cache->index_allocator = std::make_unique<densecore::KVBlockAllocator>(
+            total_logical_blocks, index_block_stride, 64, numa_node_id, use_hugepages, strict_numa);
+    }
+
+    if (!cache->k_allocator->IsValid() || !cache->v_allocator->IsValid() ||
+        (cache->has_index_cache && (!cache->index_allocator || !cache->index_allocator->IsValid()))) {
         std::cerr << "[KVCache] Error: Failed to allocate " << (total_size / 1024 / 1024)
                   << " MB for KV cache via block allocators. Try reducing max_seq_len." << std::endl;
         delete cache;
@@ -775,11 +893,16 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
 
     bool k_hugepages_enabled = false;
     bool v_hugepages_enabled = false;
+    bool index_hugepages_enabled = false;
     if (use_hugepages) {
         k_hugepages_enabled =
             TryEnableHugePages(cache->k_allocator->ArenaBase(), cache->k_allocator->ArenaSize(), "KV cache K arena");
         v_hugepages_enabled =
             TryEnableHugePages(cache->v_allocator->ArenaBase(), cache->v_allocator->ArenaSize(), "KV cache V arena");
+        if (cache->has_index_cache && cache->index_allocator) {
+            index_hugepages_enabled = TryEnableHugePages(cache->index_allocator->ArenaBase(),
+                                                         cache->index_allocator->ArenaSize(), "KV cache index arena");
+        }
     }
 
     // Type name for logging
@@ -795,17 +918,25 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
     std::cout << "  - max_blocks: " << cache->max_blocks << std::endl;
     std::cout << "  - block_size: " << BLOCK_SIZE << " tokens" << std::endl;
     std::cout << "  - n_layer: " << cache->n_layer << std::endl;
-    std::cout << "  - head_dim: " << cache->head_dim << std::endl;
+    std::cout << "  - k_head_dim: " << cache->head_dim << std::endl;
+    std::cout << "  - v_head_dim: " << cache->v_head_dim << std::endl;
     std::cout << "  - n_head_kv: " << cache->n_head_kv << std::endl;
     std::cout << "  - cache_type: " << type_name << std::endl;
     std::cout << "  - k_arena: " << (cache->k_allocator->ArenaSize() / 1024 / 1024) << " MB" << std::endl;
     std::cout << "  - v_arena: " << (cache->v_allocator->ArenaSize() / 1024 / 1024) << " MB" << std::endl;
+    if (cache->has_index_cache && cache->index_allocator) {
+        std::cout << "  - index_head_dim: " << cache->index_head_dim << std::endl;
+        std::cout << "  - index_arena: " << (cache->index_allocator->ArenaSize() / 1024 / 1024) << " MB" << std::endl;
+    }
     std::cout << "  - total_memory: " << (total_size / 1024 / 1024) << " MB" << std::endl;
     std::cout << "  - allocation_mode: BLOCK_ALLOCATOR (zero-fragmentation)" << std::endl;
     std::cout << "  - hugepages: " << (use_hugepages ? "requested" : "disabled") << std::endl;
     if (use_hugepages) {
         std::cout << "  - hugepages_k: " << (k_hugepages_enabled ? "enabled" : "not enabled") << std::endl;
         std::cout << "  - hugepages_v: " << (v_hugepages_enabled ? "enabled" : "not enabled") << std::endl;
+        if (cache->has_index_cache) {
+            std::cout << "  - hugepages_index: " << (index_hugepages_enabled ? "enabled" : "not enabled") << std::endl;
+        }
     }
     if (numa_node_id >= 0) {
         std::cout << "  - numa_node: " << numa_node_id << " (strict)" << std::endl;
@@ -825,6 +956,10 @@ bool PagedKVCache::IsQuantized() const {
 
 int PagedKVCache::GetElementsPerSlot() const {
     return head_dim * n_head_kv;
+}
+
+int PagedKVCache::GetVElementsPerSlot() const {
+    return v_head_dim * n_head_kv;
 }
 
 void PagedKVCache::WriteKSlot(int block_id, int layer, int slot, const float* data) {
@@ -852,21 +987,27 @@ void PagedKVCache::WriteVSlot(int block_id, int layer, int slot, const float* da
     void* ptr = GetVSlotPtr(block_id, layer, slot);
     if (!ptr) return;
 
-    const int n = GetElementsPerSlot();
+    const int n = GetVElementsPerSlot();
 
     if (cache_type == GGML_TYPE_F16) {
         densecore::simd::ConvertF32ToF16((ggml_fp16_t*)ptr, data, n);
     } else if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
-        const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(head_dim));
+        const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(v_head_dim));
         auto* dst = static_cast<uint8_t*>(ptr);
         for (int h = 0; h < n_head_kv; ++h) {
-            const float* src_head = data + static_cast<size_t>(h) * static_cast<size_t>(head_dim);
+            const float* src_head = data + static_cast<size_t>(h) * static_cast<size_t>(v_head_dim);
             void* dst_head = dst + static_cast<size_t>(h) * head_stride;
-            ggml_quantize_chunk(cache_type, src_head, dst_head, 0, 1, head_dim, nullptr);
+            ggml_quantize_chunk(cache_type, src_head, dst_head, 0, 1, v_head_dim, nullptr);
         }
     } else {
         densecore::simd::CopyF32((float*)ptr, data, n);
     }
+}
+
+void PagedKVCache::WriteIndexSlot(int block_id, int layer, int slot, const float* data) {
+    void* ptr = GetIndexSlotPtr(block_id, layer, slot);
+    if (!ptr || !has_index_cache || index_head_dim <= 0) return;
+    densecore::simd::ConvertF32ToF16((ggml_fp16_t*)ptr, data, index_head_dim);
 }
 
 void PagedKVCache::ReadKSlot(int block_id, int layer, int slot, float* out) const {
@@ -895,22 +1036,28 @@ void PagedKVCache::ReadVSlot(int block_id, int layer, int slot, float* out) cons
     const void* ptr = const_cast<PagedKVCache*>(this)->GetVSlotPtr(block_id, layer, slot);
     if (!ptr) return;
 
-    const int n = GetElementsPerSlot();
+    const int n = GetVElementsPerSlot();
 
     if (cache_type == GGML_TYPE_F16) {
         densecore::simd::ConvertF16ToF32(out, (const ggml_fp16_t*)ptr, n);
     } else if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
         const auto* type_traits = ggml_get_type_traits(cache_type);
-        const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(head_dim));
+        const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(v_head_dim));
         const auto* src = static_cast<const uint8_t*>(ptr);
         for (int h = 0; h < n_head_kv; ++h) {
             const void* src_head = src + static_cast<size_t>(h) * head_stride;
-            float* out_head = out + static_cast<size_t>(h) * static_cast<size_t>(head_dim);
-            type_traits->to_float(src_head, out_head, head_dim);
+            float* out_head = out + static_cast<size_t>(h) * static_cast<size_t>(v_head_dim);
+            type_traits->to_float(src_head, out_head, v_head_dim);
         }
     } else {
         densecore::simd::CopyF32(out, (const float*)ptr, n);
     }
+}
+
+void PagedKVCache::ReadIndexSlot(int block_id, int layer, int slot, float* out) const {
+    const void* ptr = const_cast<PagedKVCache*>(this)->GetIndexSlotPtr(block_id, layer, slot);
+    if (!ptr || !has_index_cache || index_head_dim <= 0) return;
+    densecore::simd::ConvertF16ToF32(out, (const ggml_fp16_t*)ptr, index_head_dim);
 }
 
 void PagedKVCache::WriteKSlots(int block_id, int layer, int start_slot, int num_slots, const float* data) {

@@ -363,14 +363,26 @@ private:
         const int64_t Dv = value.shape[2];
         const int64_t Dout = std::min(D, Dv);
 
-        int64_t H = params ? params->num_heads : 1;
+        const int64_t configured_heads = params ? std::max<int64_t>(1, params->num_heads) : 1;
+        int64_t H = configured_heads;
+        bool shared_offsets_across_heads = false;
+        bool shared_weights_across_heads = false;
         if (sampling_offsets.ndim >= 4) {
-            H = sampling_offsets.shape[2];
+            const int64_t offset_heads = sampling_offsets.shape[2];
+            shared_offsets_across_heads = (offset_heads == 1 && configured_heads > 1);
+            H = shared_offsets_across_heads ? configured_heads : offset_heads;
         } else if (sampling_offsets.ndim == 3) {
-            H = 1;
+            H = configured_heads;
+            shared_offsets_across_heads = true;
         }
         if (H <= 0) {
             H = 1;
+        }
+        if (attention_weights.ndim >= 4) {
+            const int64_t weight_heads = attention_weights.shape[2];
+            shared_weights_across_heads = (weight_heads == 1 && H > 1);
+        } else if (attention_weights.ndim == 3) {
+            shared_weights_across_heads = true;
         }
 
         int64_t offsets_tail = 0;
@@ -422,7 +434,9 @@ private:
                     for (int64_t s = 0; s < S; ++s) {
                         size_t w_idx = 0;
                         if (attention_weights.ndim >= 4) {
-                            w_idx = static_cast<size_t>(((b * Q + q) * H + h) * S + s);
+                            const int64_t weight_head = shared_weights_across_heads ? 0 : h;
+                            w_idx =
+                                static_cast<size_t>(((b * Q + q) * attention_weights.shape[2] + weight_head) * S + s);
                         } else {
                             w_idx = static_cast<size_t>((b * Q + q) * S + s);
                         }
@@ -435,7 +449,9 @@ private:
                     for (int64_t s = 0; s < S; ++s) {
                         size_t off_idx = 0;
                         if (sampling_offsets.ndim >= 4) {
-                            off_idx = static_cast<size_t>(((b * Q + q) * H + h) * (S * 3) + s * 3);
+                            const int64_t offset_head = shared_offsets_across_heads ? 0 : h;
+                            off_idx = static_cast<size_t>(
+                                ((b * Q + q) * sampling_offsets.shape[2] + offset_head) * (S * 3) + s * 3);
                         } else {
                             off_idx = static_cast<size_t>((b * Q + q) * (S * 3) + s * 3);
                         }
@@ -456,7 +472,9 @@ private:
 
                         size_t w_idx = 0;
                         if (attention_weights.ndim >= 4) {
-                            w_idx = static_cast<size_t>(((b * Q + q) * H + h) * S + s);
+                            const int64_t weight_head = shared_weights_across_heads ? 0 : h;
+                            w_idx =
+                                static_cast<size_t>(((b * Q + q) * attention_weights.shape[2] + weight_head) * S + s);
                         } else {
                             w_idx = static_cast<size_t>((b * Q + q) * S + s);
                         }

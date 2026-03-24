@@ -205,6 +205,25 @@ TEST_F(OpRegistryTest, GetBestPrefersMetalBeforeCpuForNpuRequest) {
     EXPECT_EQ(best->GetCapabilities().priority, 20);
 }
 
+#if defined(__APPLE__)
+TEST_F(OpRegistryTest, AppleVideo3DOpsHaveExplicitNpuRegistrations) {
+    OpRegistry& registry = OpRegistry::Instance();
+    EXPECT_NE(registry.Get(OpType::TemporalAttention, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::PatchEmbed3D, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::Patchify, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::Unpatchify, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::PointCloudPatchify, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::PointCloudUnpatchify, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::DeformableAttention, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::FarthestPointSampling, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::KNNQuery, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::BallQuery, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::NeRFPositionalEncoding, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::GaussianFourierFeatures, DeviceType::NPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::GridSample, DeviceType::NPU), nullptr);
+}
+#endif
+
 TEST_F(OpRegistryTest, GetBestRespectsLayoutCriteria) {
     auto high_priority = std::make_shared<MockSelectableOp>(100, true, TensorLayout::NHWC);
     auto low_priority = std::make_shared<MockSelectableOp>(10, true, TensorLayout::NCHW);

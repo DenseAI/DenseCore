@@ -237,5 +237,57 @@ TEST_F(DeformableAttentionOpTest, PointCloud3DNearestSampling) {
     EXPECT_NEAR(out_data[3], 0.0f, 1e-4f);
 }
 
+TEST_F(DeformableAttentionOpTest, PointCloud3DSharedOffsetsBroadcastAcrossHeads) {
+    const int64_t B = 1;
+    const int64_t Q = 1;
+    const int64_t N = 2;
+    const int64_t D = 4;
+    const int64_t H = 2;
+    const int64_t S = 2;
+
+    std::vector<float> query_data(B * Q * D, 0.0f);
+    std::vector<float> key_data = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f, 0.0f,
+    };
+    std::vector<float> value_data = {
+        1.0f, 10.0f, 100.0f, 1000.0f,
+        2.0f, 20.0f, 200.0f, 2000.0f,
+    };
+    std::vector<float> reference_data = {0.0f, 0.0f, 0.0f};
+    std::vector<float> offsets_data = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+    };
+    std::vector<float> weights_data = {0.5f, 0.5f};
+    std::vector<float> out_data(B * Q * D, 0.0f);
+
+    Tensor t_query = Tensor::Wrap(query_data.data(), {B, Q, D}, DType::F32);
+    Tensor t_key = Tensor::Wrap(key_data.data(), {B, N, D}, DType::F32);
+    Tensor t_value = Tensor::Wrap(value_data.data(), {B, N, D}, DType::F32);
+    Tensor t_ref = Tensor::Wrap(reference_data.data(), {B, Q, 3}, DType::F32);
+    Tensor t_offsets = Tensor::Wrap(offsets_data.data(), {B, Q, 1, S * 3}, DType::F32);
+    Tensor t_weights = Tensor::Wrap(weights_data.data(), {B, Q, 1, S}, DType::F32);
+    Tensor t_out = Tensor::Wrap(out_data.data(), {B, Q, D}, DType::F32);
+
+    DeformableAttentionParams params;
+    params.num_heads = static_cast<int>(H);
+    params.num_levels = 1;
+    params.num_points = static_cast<int>(S);
+    params.dropout = 0.0f;
+
+    auto* op = OpRegistry::Instance().GetBest(OpType::DeformableAttention, DeviceType::CPU);
+    ASSERT_NE(op, nullptr);
+
+    std::vector<Tensor*> inputs = {&t_query, &t_key, &t_value, &t_ref, &t_offsets, &t_weights};
+    std::vector<Tensor*> outputs = {&t_out};
+    op->Execute(inputs, outputs, &params);
+
+    EXPECT_NEAR(out_data[0], 1.5f, 1e-4f);
+    EXPECT_NEAR(out_data[1], 15.0f, 1e-4f);
+    EXPECT_NEAR(out_data[2], 150.0f, 1e-4f);
+    EXPECT_NEAR(out_data[3], 1500.0f, 1e-4f);
+}
+
 }  // namespace
 }  // namespace densecore

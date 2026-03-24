@@ -268,9 +268,11 @@ SchedulerOutput Scheduler::Schedule() {
                 }
             }
 
-            if (mixed_prefill_admitted) {
+            if (mixed_prefill_admitted && waiting_queue_.empty()) {
                 consecutive_decode_batches_ = 0;
             } else {
+                // Preserve the decode streak while any waiting prompt is still
+                // blocked so the isolated-prefill fairness fallback can fire.
                 consecutive_decode_batches_++;
             }
             return output;
@@ -622,7 +624,7 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         }
 
         int prefill_budget = tokens_budget;
-        if (prefill_token_cap > 0) {
+        if (prefill_token_cap >= 0) {
             prefill_budget = std::min(prefill_budget, prefill_token_cap);
         }
         if (can_chunk) {
@@ -741,6 +743,9 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         seq_arrival_[seq_id] = group.arrival_time;
 
         tokens_budget -= tokens_needed;
+        if (prefill_token_cap >= 0) {
+            prefill_token_cap = std::max(0, prefill_token_cap - tokens_needed);
+        }
 
         if (remaining > tokens_needed) {
             group.num_tokens_to_process = remaining - tokens_needed;

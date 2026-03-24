@@ -122,6 +122,15 @@ static TransformerModel MakeTestModel() {
     return model;
 }
 
+static TransformerModel MakeGLM5TestModel() {
+    TransformerModel model = MakeTestModel();
+    model.arch = ModelArch::GLM5_DSA;
+    model.arch_flags.is_glm_dsa = true;
+    model.hparams.n_embd_head_v = 4;
+    model.glm_index_head_dim = 6;
+    return model;
+}
+
 TEST_F(BlockManagerTest, AllocateSingleBlock) {
     int block_id = manager->AllocateSingle();
     EXPECT_GE(block_id, 0);
@@ -292,6 +301,68 @@ TEST(PagedKVCache, CopyRestoreBlocksRoundTrip) {
             ASSERT_NE(v_ptr, nullptr);
             EXPECT_EQ(std::memcmp(expected_k.data() + offset, k_ptr, bytes_per_block), 0);
             EXPECT_EQ(std::memcmp(expected_v.data() + offset, v_ptr, bytes_per_block), 0);
+        }
+    }
+}
+
+TEST(PagedKVCache, CopyRestoreBlocksRoundTrip_WithGLM5IndexerCache) {
+    TransformerModel model = MakeGLM5TestModel();
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(&model, 1, 32, GGML_TYPE_F16, -1));
+    ASSERT_NE(cache, nullptr);
+    ASSERT_TRUE(cache->has_index_cache);
+
+    std::vector<int> blocks = cache->block_manager->Allocate(1);
+    ASSERT_EQ(blocks.size(), 1u);
+
+    const int k_elements_per_slot = cache->GetElementsPerSlot();
+    const int v_elements_per_slot = cache->GetVElementsPerSlot();
+    std::vector<float> k_slot(k_elements_per_slot);
+    std::vector<float> v_slot(v_elements_per_slot);
+    std::vector<float> index_slot(static_cast<size_t>(cache->index_head_dim));
+
+    for (int layer = 0; layer < cache->n_layer; ++layer) {
+        for (int slot_idx = 0; slot_idx < BLOCK_SIZE; ++slot_idx) {
+            for (int i = 0; i < k_elements_per_slot; ++i) {
+                k_slot[i] = static_cast<float>(1000 + layer * 100 + slot_idx * 10 + i);
+            }
+            for (int i = 0; i < v_elements_per_slot; ++i) {
+                v_slot[i] = static_cast<float>(2000 + layer * 100 + slot_idx * 10 + i);
+            }
+            for (int i = 0; i < cache->index_head_dim; ++i) {
+                index_slot[static_cast<size_t>(i)] = static_cast<float>(100 + layer * 10 + slot_idx + i);
+            }
+            cache->WriteKSlot(blocks[0], layer, slot_idx, k_slot.data());
+            cache->WriteVSlot(blocks[0], layer, slot_idx, v_slot.data());
+            cache->WriteIndexSlot(blocks[0], layer, slot_idx, index_slot.data());
+        }
+    }
+
+    std::vector<uint8_t> k_dump;
+    std::vector<uint8_t> v_dump;
+    cache->CopyBlocksToHost(blocks, &k_dump, &v_dump);
+    ASSERT_GT(k_dump.size(), 0u);
+    ASSERT_GT(v_dump.size(), 0u);
+
+    const size_t k_bytes = cache->GetBytesPerBlock() * static_cast<size_t>(cache->n_layer) * blocks.size();
+    const size_t index_bytes = cache->GetIndexBytesPerBlock() * static_cast<size_t>(cache->n_layer) * blocks.size();
+    ASSERT_EQ(k_dump.size(), k_bytes + index_bytes);
+
+    for (int layer = 0; layer < cache->n_layer; ++layer) {
+        std::memset(cache->GetKBlockPtr(blocks[0], layer), 0, cache->GetBytesPerBlock());
+        std::memset(cache->GetVBlockPtr(blocks[0], layer), 0, cache->GetVBytesPerBlock());
+        std::memset(cache->GetIndexBlockPtr(blocks[0], layer), 0, cache->GetIndexBytesPerBlock());
+    }
+
+    cache->RestoreBlocksFromHost(blocks, k_dump, v_dump);
+
+    std::vector<float> index_read(static_cast<size_t>(cache->index_head_dim), 0.0f);
+    for (int layer = 0; layer < cache->n_layer; ++layer) {
+        for (int slot_idx = 0; slot_idx < BLOCK_SIZE; ++slot_idx) {
+            cache->ReadIndexSlot(blocks[0], layer, slot_idx, index_read.data());
+            for (int i = 0; i < cache->index_head_dim; ++i) {
+                const float expected = static_cast<float>(100 + layer * 10 + slot_idx + i);
+                EXPECT_NEAR(index_read[static_cast<size_t>(i)], expected, 1e-2f);
+            }
         }
     }
 }

@@ -138,10 +138,11 @@ DENSECORE_API void CrossAttention_Hwy(const float* q_data, const float* k_data, 
 // PagedAttention (KV cache efficient serving)
 DENSECORE_API void PagedAttention_Hwy(const float* query, const void* const* k_block_ptrs,
                                       const void* const* v_block_ptrs, int32_t cache_type, int32_t num_heads,
-                                      int32_t head_dim, int32_t n_head_kv, int32_t block_table_size,
-                                      int32_t context_len, int64_t head_stride_bytes, int64_t slot_stride_bytes,
-                                      float scale, float* output, int32_t head_start = 0, int32_t head_end = -1,
-                                      int32_t num_heads_total = -1);
+                                      int32_t qk_head_dim, int32_t v_head_dim, int32_t n_head_kv,
+                                      int32_t block_table_size, int32_t context_len, int64_t k_head_stride_bytes,
+                                      int64_t k_slot_stride_bytes, int64_t v_head_stride_bytes,
+                                      int64_t v_slot_stride_bytes, float scale, float* output, int32_t head_start = 0,
+                                      int32_t head_end = -1, int32_t num_heads_total = -1);
 
 // PointAttention (3D point cloud)
 // Safety: if any index in `knn_indices` for a query point is outside [0, N-1],
