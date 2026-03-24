@@ -271,7 +271,7 @@ kernel void knn_query_forward(
     for (uint i = 0; i < k; ++i) {
         const uint fill = (best_idx[i] >= 0) ? i : max(0u, i > 0u ? i - 1u : 0u);
         indices[out_base + i] = best_idx[i] >= 0 ? best_idx[i] : best_idx[fill];
-        distances[out_base + i] = isfinite(best_dist[i]) ? best_dist[i] : best_dist[fill];
+        distances[out_base + i] = isfinite(best_dist[i]) ? sqrt(best_dist[i]) : sqrt(best_dist[fill]);
     }
 }
 
