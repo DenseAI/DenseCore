@@ -261,9 +261,8 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
     const int n_head_kv = model ? model->hparams.n_head_kv : 0;
     const int n_layer = model ? model->hparams.n_layer : 0;
 
-    config.bytes_per_token =
-        ComputeKVCacheBytesPerToken(config.effective_cache_type, k_head_dim, v_head_dim, n_head_kv, n_layer,
-                                    index_head_dim);
+    config.bytes_per_token = ComputeKVCacheBytesPerToken(config.effective_cache_type, k_head_dim, v_head_dim, n_head_kv,
+                                                         n_layer, index_head_dim);
     if (config.bytes_per_token == 0) {
         config.bytes_per_token = 1;
     }

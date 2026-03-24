@@ -704,8 +704,8 @@ void PagedKVCache::CopyBlocksToHost(const std::vector<int>& block_ids, std::vect
             }
             if (index_src && total_index_bytes > 0) {
                 size_t index_base = total_k_bytes;
-                size_t offset_i =
-                    index_base + (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) * bytes_per_index_block;
+                size_t offset_i = index_base + (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) *
+                                                   bytes_per_index_block;
                 memcpy(k_out->data() + offset_i, index_src, bytes_per_index_block);
             }
         }
@@ -744,8 +744,8 @@ void PagedKVCache::RestoreBlocksFromHost(const std::vector<int>& block_ids, cons
             }
             if (index_dst && total_index_bytes > 0 && k_in.size() >= total_k_bytes + total_index_bytes) {
                 size_t index_base = total_k_bytes;
-                size_t offset_i =
-                    index_base + (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) * bytes_per_index_block;
+                size_t offset_i = index_base + (i * static_cast<size_t>(n_layer) + static_cast<size_t>(layer)) *
+                                                   bytes_per_index_block;
                 memcpy(index_dst, k_in.data() + offset_i, bytes_per_index_block);
             }
         }
@@ -818,9 +818,8 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
     if (ggml_is_quantized(type) &&
         ((cache->head_dim % ggml_blck_size(type)) != 0 || (cache->v_head_dim % ggml_blck_size(type)) != 0)) {
         std::cerr << "[KVCache] Warning: K/V head dims (" << cache->head_dim << ", " << cache->v_head_dim
-                  << ") are not divisible by "
-                  << ggml_blck_size(type) << " for quantized cache type " << ggml_type_name(type)
-                  << ", falling back to F16" << std::endl;
+                  << ") are not divisible by " << ggml_blck_size(type) << " for quantized cache type "
+                  << ggml_type_name(type) << ", falling back to F16" << std::endl;
         type = GGML_TYPE_F16;
         cache->cache_type = type;
     }
@@ -871,9 +870,8 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
                                                                        numa_node_id, use_hugepages, strict_numa);
 
     if (cache->has_index_cache) {
-        cache->index_allocator = std::make_unique<densecore::KVBlockAllocator>(total_logical_blocks, index_block_stride,
-                                                                               64, numa_node_id, use_hugepages,
-                                                                               strict_numa);
+        cache->index_allocator = std::make_unique<densecore::KVBlockAllocator>(
+            total_logical_blocks, index_block_stride, 64, numa_node_id, use_hugepages, strict_numa);
     }
 
     if (!cache->k_allocator->IsValid() || !cache->v_allocator->IsValid() ||
@@ -928,8 +926,7 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
     std::cout << "  - v_arena: " << (cache->v_allocator->ArenaSize() / 1024 / 1024) << " MB" << std::endl;
     if (cache->has_index_cache && cache->index_allocator) {
         std::cout << "  - index_head_dim: " << cache->index_head_dim << std::endl;
-        std::cout << "  - index_arena: " << (cache->index_allocator->ArenaSize() / 1024 / 1024) << " MB"
-                  << std::endl;
+        std::cout << "  - index_arena: " << (cache->index_allocator->ArenaSize() / 1024 / 1024) << " MB" << std::endl;
     }
     std::cout << "  - total_memory: " << (total_size / 1024 / 1024) << " MB" << std::endl;
     std::cout << "  - allocation_mode: BLOCK_ALLOCATOR (zero-fragmentation)" << std::endl;
@@ -938,8 +935,7 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
         std::cout << "  - hugepages_k: " << (k_hugepages_enabled ? "enabled" : "not enabled") << std::endl;
         std::cout << "  - hugepages_v: " << (v_hugepages_enabled ? "enabled" : "not enabled") << std::endl;
         if (cache->has_index_cache) {
-            std::cout << "  - hugepages_index: " << (index_hugepages_enabled ? "enabled" : "not enabled")
-                      << std::endl;
+            std::cout << "  - hugepages_index: " << (index_hugepages_enabled ? "enabled" : "not enabled") << std::endl;
         }
     }
     if (numa_node_id >= 0) {

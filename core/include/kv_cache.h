@@ -209,8 +209,8 @@ struct PagedKVCache {
     BlockManager* block_manager = nullptr;
 
     // Model dimensions
-    int head_dim;     // K head dim
-    int v_head_dim;   // V head dim (can differ for MLA/DSA models)
+    int head_dim;            // K head dim
+    int v_head_dim;          // V head dim (can differ for MLA/DSA models)
     int index_head_dim = 0;  // GLM-5 DSA indexer key dim
     int n_head_kv;
     int n_layer;

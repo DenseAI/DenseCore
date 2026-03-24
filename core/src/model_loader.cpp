@@ -251,8 +251,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
 
     if (!tokenizer_type.empty()) {
-        const std::vector<std::string> supported = {"llama", "gpt2", "qwen2", "qwen3", "qwen35",
-                                                    "mistral", "gemma", "bpe", "glm4", "glm"};
+        const std::vector<std::string> supported = {"llama",   "gpt2",  "qwen2", "qwen3", "qwen35",
+                                                    "mistral", "gemma", "bpe",   "glm4",  "glm"};
         if (std::find(supported.begin(), supported.end(), tokenizer_lower) == supported.end()) {
             std::cerr << "[DenseCore] Warning: tokenizer model '" << tokenizer_type
                       << "' may not be fully compatible. Consider using external tokenization and input_ids."
@@ -789,7 +789,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
         return nullptr;
     };
 
-    auto get_layer_tensor_any = [&](uint32_t layer_idx, const std::vector<std::string>& suffixes) -> struct ggml_tensor* {
+    auto get_layer_tensor_any = [&](uint32_t layer_idx,
+                                    const std::vector<std::string>& suffixes) -> struct ggml_tensor* {
         const std::string layer_prefix = "blk." + std::to_string(layer_idx) + ".";
         std::vector<std::string> full_names;
         full_names.reserve(suffixes.size());
@@ -880,14 +881,14 @@ TransformerModel* LoadGGUFModel(const char* path) {
         std::string layer_prefix = "blk." + std::to_string(i) + ".";
 
         // Common to all layer types: norms and FFN
-        model->layers[i].Set(model_keys::kAttnNorm, get_layer_tensor_any(
-                                                        i, {"attn_norm.weight", "input_layernorm.weight",
-                                                            "attention_norm.weight", "self_attn_layernorm.weight"}));
+        model->layers[i].Set(model_keys::kAttnNorm,
+                             get_layer_tensor_any(i, {"attn_norm.weight", "input_layernorm.weight",
+                                                      "attention_norm.weight", "self_attn_layernorm.weight"}));
         model->layers[i].Set(model_keys::kFfnNorm,
                              get_layer_tensor_any(i, {"ffn_norm.weight", "post_attention_layernorm.weight",
                                                       "post_attention_norm.weight", "mlp_layernorm.weight"}));
-        model->layers[i].Set(model_keys::kPostAttnNorm,
-                             get_layer_tensor_any(i, {"post_attention_norm.weight", "post_attention_layernorm.weight"}));
+        model->layers[i].Set(model_keys::kPostAttnNorm, get_layer_tensor_any(i, {"post_attention_norm.weight",
+                                                                                 "post_attention_layernorm.weight"}));
         // Fallback: Qwen3.5 uses post_attention_norm instead of ffn_norm
         if (!model->layers[i].Get(model_keys::kFfnNorm) && model->layers[i].Get(model_keys::kPostAttnNorm)) {
             model->layers[i].Set(model_keys::kFfnNorm, model->layers[i].Get(model_keys::kPostAttnNorm));
@@ -925,15 +926,18 @@ TransformerModel* LoadGGUFModel(const char* path) {
             }
         } else {
             // Full attention layer: separate Q/K/V + QK-norms
-            model->layers[i].Set(model_keys::kAttnQWeight,
-                                 get_layer_tensor_any(i, {"attn_q.weight", "self_attn.q_proj.weight", "q_proj.weight"}));
-            model->layers[i].Set(model_keys::kAttnKWeight,
-                                 get_layer_tensor_any(i, {"attn_k.weight", "self_attn.k_proj.weight", "k_proj.weight"}));
-            model->layers[i].Set(model_keys::kAttnVWeight,
-                                 get_layer_tensor_any(i, {"attn_v.weight", "self_attn.v_proj.weight", "v_proj.weight"}));
-            model->layers[i].Set(model_keys::kAttnOWeight, get_layer_tensor_any(
-                                                             i, {"attn_output.weight", "self_attn.o_proj.weight",
-                                                                 "o_proj.weight", "self_attn.out_proj.weight"}));
+            model->layers[i].Set(
+                model_keys::kAttnQWeight,
+                get_layer_tensor_any(i, {"attn_q.weight", "self_attn.q_proj.weight", "q_proj.weight"}));
+            model->layers[i].Set(
+                model_keys::kAttnKWeight,
+                get_layer_tensor_any(i, {"attn_k.weight", "self_attn.k_proj.weight", "k_proj.weight"}));
+            model->layers[i].Set(
+                model_keys::kAttnVWeight,
+                get_layer_tensor_any(i, {"attn_v.weight", "self_attn.v_proj.weight", "v_proj.weight"}));
+            model->layers[i].Set(model_keys::kAttnOWeight,
+                                 get_layer_tensor_any(i, {"attn_output.weight", "self_attn.o_proj.weight",
+                                                          "o_proj.weight", "self_attn.out_proj.weight"}));
 
             model->layers[i].Set(model_keys::kAttnQBias,
                                  get_layer_tensor_any(i, {"attn_q.bias", "self_attn.q_proj.bias", "q_proj.bias"}));
@@ -945,12 +949,12 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                  get_layer_tensor_any(i, {"attn_output.bias", "self_attn.o_proj.bias", "o_proj.bias"}));
 
             // QK-Norm (Qwen3/3.5) - uses fallback for different GGUF naming
-            model->layers[i].Set(model_keys::kAttnQNorm,
-                                 get_layer_tensor_any(i, {"attn_q_norm.weight", "self_attn.q_norm.weight",
-                                                          "q_norm.weight"}));
-            model->layers[i].Set(model_keys::kAttnKNorm,
-                                 get_layer_tensor_any(i, {"attn_k_norm.weight", "self_attn.k_norm.weight",
-                                                          "k_norm.weight"}));
+            model->layers[i].Set(
+                model_keys::kAttnQNorm,
+                get_layer_tensor_any(i, {"attn_q_norm.weight", "self_attn.q_norm.weight", "q_norm.weight"}));
+            model->layers[i].Set(
+                model_keys::kAttnKNorm,
+                get_layer_tensor_any(i, {"attn_k_norm.weight", "self_attn.k_norm.weight", "k_norm.weight"}));
         }
 
         if (i == 0 || (model->arch_flags.is_hybrid_ssm && !is_ssm)) {
@@ -1005,22 +1009,20 @@ TransformerModel* LoadGGUFModel(const char* path) {
         auto& layer = model->layers[i];
 
         if (!layer.Get(model_keys::kFfnGate)) {
-            layer.Set(model_keys::kFfnGate,
-                      find_layer_tensor_with_tokens(layer, {"shared_experts", "gate_proj"}));
+            layer.Set(model_keys::kFfnGate, find_layer_tensor_with_tokens(layer, {"shared_experts", "gate_proj"}));
         }
         if (!layer.Get(model_keys::kFfnUp)) {
-            layer.Set(model_keys::kFfnUp,
-                      find_layer_tensor_with_tokens(layer, {"shared_experts", "up_proj"}));
+            layer.Set(model_keys::kFfnUp, find_layer_tensor_with_tokens(layer, {"shared_experts", "up_proj"}));
         }
         if (!layer.Get(model_keys::kFfnDown)) {
-            layer.Set(model_keys::kFfnDown,
-                      find_layer_tensor_with_tokens(layer, {"shared_experts", "down_proj"}));
+            layer.Set(model_keys::kFfnDown, find_layer_tensor_with_tokens(layer, {"shared_experts", "down_proj"}));
         }
         if (!layer.Get(model_keys::kMoeGate)) {
             layer.Set(model_keys::kMoeGate, find_layer_tensor_with_tokens(layer, {"mlp", "gate.weight"}, {"shared"}));
         }
         if (!layer.Get(model_keys::kMoeCorrectionBias)) {
-            layer.Set(model_keys::kMoeCorrectionBias, find_layer_tensor_with_tokens(layer, {"e_score_correction_bias"}));
+            layer.Set(model_keys::kMoeCorrectionBias,
+                      find_layer_tensor_with_tokens(layer, {"e_score_correction_bias"}));
         }
 
         const struct ggml_tensor* packed_gate_up =
@@ -1028,7 +1030,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
         const struct ggml_tensor* packed_down =
             find_layer_tensor_with_tokens(layer, {"experts", "down_proj"}, {"shared"});
 
-        if (packed_gate_up && packed_down && i >= static_cast<uint32_t>(std::max(0, model->moe_first_k_dense_replace))) {
+        if (packed_gate_up && packed_down &&
+            i >= static_cast<uint32_t>(std::max(0, model->moe_first_k_dense_replace))) {
             int packed_experts = 0;
             if (packed_gate_up->ne[2] > 0) {
                 packed_experts = static_cast<int>(packed_gate_up->ne[2]);
@@ -1043,19 +1046,20 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 layer.is_moe = true;
                 for (int expert_idx = 0; expert_idx < expert_count; ++expert_idx) {
                     const size_t gate_up_offset = static_cast<size_t>(expert_idx) * packed_gate_up->nb[2];
-                    struct ggml_tensor* gate_up_slice =
-                        ggml_view_2d(model->ctx_w, const_cast<struct ggml_tensor*>(packed_gate_up), packed_gate_up->ne[0],
-                                     packed_gate_up->ne[1], packed_gate_up->nb[1], gate_up_offset);
+                    struct ggml_tensor* gate_up_slice = ggml_view_2d(
+                        model->ctx_w, const_cast<struct ggml_tensor*>(packed_gate_up), packed_gate_up->ne[0],
+                        packed_gate_up->ne[1], packed_gate_up->nb[1], gate_up_offset);
 
                     const int64_t gate_up_rows = gate_up_slice->ne[1];
                     if (gate_up_rows < 2 || (gate_up_rows % 2) != 0) {
                         continue;
                     }
                     const int64_t intermediate = gate_up_rows / 2;
-                    struct ggml_tensor* gate_w =
-                        ggml_view_2d(model->ctx_w, gate_up_slice, gate_up_slice->ne[0], intermediate, gate_up_slice->nb[1], 0);
-                    struct ggml_tensor* up_w = ggml_view_2d(model->ctx_w, gate_up_slice, gate_up_slice->ne[0], intermediate,
-                                                            gate_up_slice->nb[1], static_cast<size_t>(intermediate) * gate_up_slice->nb[1]);
+                    struct ggml_tensor* gate_w = ggml_view_2d(model->ctx_w, gate_up_slice, gate_up_slice->ne[0],
+                                                              intermediate, gate_up_slice->nb[1], 0);
+                    struct ggml_tensor* up_w =
+                        ggml_view_2d(model->ctx_w, gate_up_slice, gate_up_slice->ne[0], intermediate,
+                                     gate_up_slice->nb[1], static_cast<size_t>(intermediate) * gate_up_slice->nb[1]);
                     const size_t down_offset = static_cast<size_t>(expert_idx) * packed_down->nb[2];
                     struct ggml_tensor* down_w =
                         ggml_view_2d(model->ctx_w, const_cast<struct ggml_tensor*>(packed_down), packed_down->ne[0],
@@ -1096,24 +1100,15 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
 
         if (model->arch_flags.is_glm_dsa) {
-            layer.Set(model_keys::kAttnQAProj,
-                      find_layer_tensor_with_tokens(layer, {"q_a_proj"}, {"indexer"}));
-            layer.Set(model_keys::kAttnQANorm,
-                      find_layer_tensor_with_tokens(layer, {"q_a_layernorm"}, {"indexer"}));
-            layer.Set(model_keys::kAttnQBProj,
-                      find_layer_tensor_with_tokens(layer, {"q_b_proj"}, {"indexer"}));
-            layer.Set(model_keys::kAttnKvAProj,
-                      find_layer_tensor_with_tokens(layer, {"kv_a_proj_with_mqa"}));
-            layer.Set(model_keys::kAttnKvANorm,
-                      find_layer_tensor_with_tokens(layer, {"kv_a_layernorm"}));
-            layer.Set(model_keys::kAttnKvBProj,
-                      find_layer_tensor_with_tokens(layer, {"kv_b_proj"}));
-            layer.Set(model_keys::kIndexerWqB,
-                      find_layer_tensor_with_tokens(layer, {"indexer", "wq_b"}));
-            layer.Set(model_keys::kIndexerWk,
-                      find_layer_tensor_with_tokens(layer, {"indexer", "wk"}));
-            layer.Set(model_keys::kIndexerKNorm,
-                      find_layer_tensor_with_tokens(layer, {"indexer", "k_norm"}));
+            layer.Set(model_keys::kAttnQAProj, find_layer_tensor_with_tokens(layer, {"q_a_proj"}, {"indexer"}));
+            layer.Set(model_keys::kAttnQANorm, find_layer_tensor_with_tokens(layer, {"q_a_layernorm"}, {"indexer"}));
+            layer.Set(model_keys::kAttnQBProj, find_layer_tensor_with_tokens(layer, {"q_b_proj"}, {"indexer"}));
+            layer.Set(model_keys::kAttnKvAProj, find_layer_tensor_with_tokens(layer, {"kv_a_proj_with_mqa"}));
+            layer.Set(model_keys::kAttnKvANorm, find_layer_tensor_with_tokens(layer, {"kv_a_layernorm"}));
+            layer.Set(model_keys::kAttnKvBProj, find_layer_tensor_with_tokens(layer, {"kv_b_proj"}));
+            layer.Set(model_keys::kIndexerWqB, find_layer_tensor_with_tokens(layer, {"indexer", "wq_b"}));
+            layer.Set(model_keys::kIndexerWk, find_layer_tensor_with_tokens(layer, {"indexer", "wk"}));
+            layer.Set(model_keys::kIndexerKNorm, find_layer_tensor_with_tokens(layer, {"indexer", "k_norm"}));
             layer.Set(model_keys::kIndexerWeightsProj,
                       find_layer_tensor_with_tokens(layer, {"indexer", "weights_proj"}));
             if (!layer.Get(model_keys::kAttnOWeight)) {

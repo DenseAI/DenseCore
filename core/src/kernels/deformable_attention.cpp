@@ -435,8 +435,8 @@ private:
                         size_t w_idx = 0;
                         if (attention_weights.ndim >= 4) {
                             const int64_t weight_head = shared_weights_across_heads ? 0 : h;
-                            w_idx = static_cast<size_t>(((b * Q + q) * attention_weights.shape[2] + weight_head) *
-                                                        S + s);
+                            w_idx =
+                                static_cast<size_t>(((b * Q + q) * attention_weights.shape[2] + weight_head) * S + s);
                         } else {
                             w_idx = static_cast<size_t>((b * Q + q) * S + s);
                         }
@@ -450,8 +450,8 @@ private:
                         size_t off_idx = 0;
                         if (sampling_offsets.ndim >= 4) {
                             const int64_t offset_head = shared_offsets_across_heads ? 0 : h;
-                            off_idx = static_cast<size_t>(((b * Q + q) * sampling_offsets.shape[2] + offset_head) *
-                                                          (S * 3) + s * 3);
+                            off_idx = static_cast<size_t>(
+                                ((b * Q + q) * sampling_offsets.shape[2] + offset_head) * (S * 3) + s * 3);
                         } else {
                             off_idx = static_cast<size_t>((b * Q + q) * (S * 3) + s * 3);
                         }
@@ -473,8 +473,8 @@ private:
                         size_t w_idx = 0;
                         if (attention_weights.ndim >= 4) {
                             const int64_t weight_head = shared_weights_across_heads ? 0 : h;
-                            w_idx = static_cast<size_t>(((b * Q + q) * attention_weights.shape[2] + weight_head) *
-                                                        S + s);
+                            w_idx =
+                                static_cast<size_t>(((b * Q + q) * attention_weights.shape[2] + weight_head) * S + s);
                         } else {
                             w_idx = static_cast<size_t>((b * Q + q) * S + s);
                         }

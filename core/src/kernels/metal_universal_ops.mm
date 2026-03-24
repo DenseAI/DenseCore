@@ -165,8 +165,7 @@ private:
             // Try to load individual shader files
             NSArray<NSString*>* shaderFiles = @[
                 @"window_attention.metal", @"temporal_attention.metal",
-                @"triangular_attention.metal", @"patch_embed_3d.metal",
-                @"point_cloud_ops.metal"
+                @"triangular_attention.metal", @"patch_embed_3d.metal", @"point_cloud_ops.metal"
             ];
 
             // Compile each shader if metallib not available
@@ -865,7 +864,8 @@ public:
 
         const auto* p = static_cast<const PointCloudPatchifyParams*>(params);
         PointCloudPatchifyParams default_params;
-        if (!p) p = &default_params;
+        if (!p)
+            p = &default_params;
 
         const Tensor* points = inputs[0];
         const Tensor* features = inputs[1];
@@ -883,9 +883,15 @@ public:
         id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), points->data, points->SizeBytes()) offset:0 atIndex:0];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), features->data, features->SizeBytes()) offset:0 atIndex:1];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), patches->data, patches->SizeBytes()) offset:0 atIndex:2];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), points->data, points->SizeBytes())
+                    offset:0
+                   atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), features->data, features->SizeBytes())
+                    offset:0
+                   atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), patches->data, patches->SizeBytes())
+                    offset:0
+                   atIndex:2];
         [encoder setBytes:&B length:sizeof(uint) atIndex:3];
         [encoder setBytes:&N length:sizeof(uint) atIndex:4];
         [encoder setBytes:&D length:sizeof(uint) atIndex:5];
@@ -936,7 +942,8 @@ public:
 
         const auto* p = static_cast<const PointCloudPatchifyParams*>(params);
         PointCloudPatchifyParams default_params;
-        if (!p) p = &default_params;
+        if (!p)
+            p = &default_params;
 
         const Tensor* patches = inputs[0];
         const Tensor* points = inputs[1];
@@ -953,9 +960,15 @@ public:
         id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), patches->data, patches->SizeBytes()) offset:0 atIndex:0];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), points->data, points->SizeBytes()) offset:0 atIndex:1];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), features->data, features->SizeBytes()) offset:0 atIndex:2];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), patches->data, patches->SizeBytes())
+                    offset:0
+                   atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), points->data, points->SizeBytes())
+                    offset:0
+                   atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), features->data, features->SizeBytes())
+                    offset:0
+                   atIndex:2];
         [encoder setBytes:&B length:sizeof(uint) atIndex:3];
         [encoder setBytes:&N length:sizeof(uint) atIndex:4];
         [encoder setBytes:&D length:sizeof(uint) atIndex:5];
@@ -1005,7 +1018,8 @@ public:
 
         const auto* p = static_cast<const NeRFPositionalEncodingParams*>(params);
         NeRFPositionalEncodingParams default_params;
-        if (!p) p = &default_params;
+        if (!p)
+            p = &default_params;
 
         const Tensor* xyz = inputs[0];
         Tensor* output = outputs[0];
@@ -1018,8 +1032,12 @@ public:
         id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), xyz->data, xyz->SizeBytes()) offset:0 atIndex:0];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), output->data, output->SizeBytes()) offset:0 atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), xyz->data, xyz->SizeBytes())
+                    offset:0
+                   atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), output->data, output->SizeBytes())
+                    offset:0
+                   atIndex:1];
         [encoder setBytes:&B length:sizeof(uint) atIndex:2];
         [encoder setBytes:&N length:sizeof(uint) atIndex:3];
         [encoder setBytes:&freq_bands length:sizeof(uint) atIndex:4];
@@ -1081,9 +1099,15 @@ public:
         id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), xyz->data, xyz->SizeBytes()) offset:0 atIndex:0];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), B_matrix->data, B_matrix->SizeBytes()) offset:0 atIndex:1];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), output->data, output->SizeBytes()) offset:0 atIndex:2];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), xyz->data, xyz->SizeBytes())
+                    offset:0
+                   atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), B_matrix->data, B_matrix->SizeBytes())
+                    offset:0
+                   atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), output->data, output->SizeBytes())
+                    offset:0
+                   atIndex:2];
         [encoder setBytes:&B length:sizeof(uint) atIndex:3];
         [encoder setBytes:&N length:sizeof(uint) atIndex:4];
         [encoder setBytes:&num_features length:sizeof(uint) atIndex:5];
@@ -1132,7 +1156,8 @@ public:
 
         const auto* p = static_cast<const FarthestPointSamplingParams*>(params);
         FarthestPointSamplingParams default_params;
-        if (!p) p = &default_params;
+        if (!p)
+            p = &default_params;
 
         const Tensor* points = inputs[0];
         Tensor* indices = outputs[0];
@@ -1147,8 +1172,12 @@ public:
         id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), points->data, points->SizeBytes()) offset:0 atIndex:0];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), indices->data, indices->SizeBytes()) offset:0 atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), points->data, points->SizeBytes())
+                    offset:0
+                   atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), indices->data, indices->SizeBytes())
+                    offset:0
+                   atIndex:1];
         [encoder setBytes:&B length:sizeof(uint) atIndex:2];
         [encoder setBytes:&N length:sizeof(uint) atIndex:3];
         [encoder setBytes:&samples length:sizeof(uint) atIndex:4];
@@ -1197,7 +1226,8 @@ public:
 
         const auto* p = static_cast<const KNNQueryParams*>(params);
         KNNQueryParams default_params;
-        if (!p) p = &default_params;
+        if (!p)
+            p = &default_params;
         const uint k = static_cast<uint>(p->k);
         if (k == 0 || k > 64u) {
             cpu_fallback();
@@ -1215,10 +1245,18 @@ public:
         id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), query->data, query->SizeBytes()) offset:0 atIndex:0];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), ref->data, ref->SizeBytes()) offset:0 atIndex:1];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), indices->data, indices->SizeBytes()) offset:0 atIndex:2];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), distances->data, distances->SizeBytes()) offset:0 atIndex:3];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), query->data, query->SizeBytes())
+                    offset:0
+                   atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), ref->data, ref->SizeBytes())
+                    offset:0
+                   atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), indices->data, indices->SizeBytes())
+                    offset:0
+                   atIndex:2];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), distances->data, distances->SizeBytes())
+                    offset:0
+                   atIndex:3];
         [encoder setBytes:&B length:sizeof(uint) atIndex:4];
         [encoder setBytes:&M length:sizeof(uint) atIndex:5];
         [encoder setBytes:&N length:sizeof(uint) atIndex:6];
@@ -1268,7 +1306,8 @@ public:
 
         const auto* p = static_cast<const BallQueryParams*>(params);
         BallQueryParams default_params;
-        if (!p) p = &default_params;
+        if (!p)
+            p = &default_params;
 
         const Tensor* query = inputs[0];
         const Tensor* ref = inputs[1];
@@ -1286,9 +1325,15 @@ public:
         id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), query->data, query->SizeBytes()) offset:0 atIndex:0];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), ref->data, ref->SizeBytes()) offset:0 atIndex:1];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), indices->data, indices->SizeBytes()) offset:0 atIndex:2];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), query->data, query->SizeBytes())
+                    offset:0
+                   atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), ref->data, ref->SizeBytes())
+                    offset:0
+                   atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), indices->data, indices->SizeBytes())
+                    offset:0
+                   atIndex:2];
         [encoder setBytes:&B length:sizeof(uint) atIndex:3];
         [encoder setBytes:&M length:sizeof(uint) atIndex:4];
         [encoder setBytes:&N length:sizeof(uint) atIndex:5];
@@ -1339,7 +1384,8 @@ public:
 
         const auto* p = static_cast<const DeformableAttentionParams*>(params);
         DeformableAttentionParams default_params;
-        if (!p) p = &default_params;
+        if (!p)
+            p = &default_params;
 
         const Tensor* query = inputs[0];
         const Tensor* key = inputs[1];
@@ -1358,23 +1404,38 @@ public:
         const uint total_samples = static_cast<uint>(std::max(1, p->num_points));
         const uint offset_heads = offsets->ndim >= 4 ? static_cast<uint>(offsets->shape[2]) : 1u;
         const uint weight_heads = weights->ndim >= 4 ? static_cast<uint>(weights->shape[2]) : 1u;
-        const uint use_key_points = (key_points && key_points->IsValid() && key_points->ndim == 3) ? 1u : 0u;
+        const uint use_key_points =
+            (key_points && key_points->IsValid() && key_points->ndim == 3) ? 1u : 0u;
 
         id<MTLCommandBuffer> commandBuffer = [ctx.queue() commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), query->data, query->SizeBytes()) offset:0 atIndex:0];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), key->data, key->SizeBytes()) offset:0 atIndex:1];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), value->data, value->SizeBytes()) offset:0 atIndex:2];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), reference->data, reference->SizeBytes()) offset:0 atIndex:3];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), offsets->data, offsets->SizeBytes()) offset:0 atIndex:4];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), weights->data, weights->SizeBytes()) offset:0 atIndex:5];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(),
-                                            use_key_points ? key_points->data : key->data,
-                                            use_key_points ? key_points->SizeBytes() : key->SizeBytes())
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), query->data, query->SizeBytes())
                     offset:0
-                   atIndex:6];
-        [encoder setBuffer:WrapSharedBuffer(ctx.device(), output->data, output->SizeBytes()) offset:0 atIndex:7];
+                   atIndex:0];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), key->data, key->SizeBytes())
+                    offset:0
+                   atIndex:1];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), value->data, value->SizeBytes())
+                    offset:0
+                   atIndex:2];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), reference->data, reference->SizeBytes())
+                    offset:0
+                   atIndex:3];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), offsets->data, offsets->SizeBytes())
+                    offset:0
+                   atIndex:4];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), weights->data, weights->SizeBytes())
+                    offset:0
+                   atIndex:5];
+        [encoder
+            setBuffer:WrapSharedBuffer(ctx.device(), use_key_points ? key_points->data : key->data,
+                                       use_key_points ? key_points->SizeBytes() : key->SizeBytes())
+               offset:0
+              atIndex:6];
+        [encoder setBuffer:WrapSharedBuffer(ctx.device(), output->data, output->SizeBytes())
+                    offset:0
+                   atIndex:7];
         [encoder setBytes:&B length:sizeof(uint) atIndex:8];
         [encoder setBytes:&Q length:sizeof(uint) atIndex:9];
         [encoder setBytes:&N length:sizeof(uint) atIndex:10];
@@ -1429,11 +1490,14 @@ DENSECORE_REGISTER_OP(MetalUnpatchifyOp, OpType::Unpatchify, DeviceType::METAL);
 DENSECORE_REGISTER_OP(MetalPointCloudPatchifyOp, OpType::PointCloudPatchify, DeviceType::METAL);
 DENSECORE_REGISTER_OP(MetalPointCloudUnpatchifyOp, OpType::PointCloudUnpatchify, DeviceType::METAL);
 DENSECORE_REGISTER_OP(MetalDeformableAttentionOp, OpType::DeformableAttention, DeviceType::METAL);
-DENSECORE_REGISTER_OP(MetalFarthestPointSamplingOp, OpType::FarthestPointSampling, DeviceType::METAL);
+DENSECORE_REGISTER_OP(MetalFarthestPointSamplingOp, OpType::FarthestPointSampling,
+                      DeviceType::METAL);
 DENSECORE_REGISTER_OP(MetalKNNQueryOp, OpType::KNNQuery, DeviceType::METAL);
 DENSECORE_REGISTER_OP(MetalBallQueryOp, OpType::BallQuery, DeviceType::METAL);
-DENSECORE_REGISTER_OP(MetalNeRFPositionalEncodingOp, OpType::NeRFPositionalEncoding, DeviceType::METAL);
-DENSECORE_REGISTER_OP(MetalGaussianFourierFeaturesOp, OpType::GaussianFourierFeatures, DeviceType::METAL);
+DENSECORE_REGISTER_OP(MetalNeRFPositionalEncodingOp, OpType::NeRFPositionalEncoding,
+                      DeviceType::METAL);
+DENSECORE_REGISTER_OP(MetalGaussianFourierFeaturesOp, OpType::GaussianFourierFeatures,
+                      DeviceType::METAL);
 
 DENSECORE_REGISTER_OP(NpuTemporalAttentionOp, OpType::TemporalAttention, DeviceType::NPU);
 DENSECORE_REGISTER_OP(NpuPatchEmbed3DOp, OpType::PatchEmbed3D, DeviceType::NPU);
@@ -1446,7 +1510,8 @@ DENSECORE_REGISTER_OP(NpuFarthestPointSamplingOp, OpType::FarthestPointSampling,
 DENSECORE_REGISTER_OP(NpuKNNQueryOp, OpType::KNNQuery, DeviceType::NPU);
 DENSECORE_REGISTER_OP(NpuBallQueryOp, OpType::BallQuery, DeviceType::NPU);
 DENSECORE_REGISTER_OP(NpuNeRFPositionalEncodingOp, OpType::NeRFPositionalEncoding, DeviceType::NPU);
-DENSECORE_REGISTER_OP(NpuGaussianFourierFeaturesOp, OpType::GaussianFourierFeatures, DeviceType::NPU);
+DENSECORE_REGISTER_OP(NpuGaussianFourierFeaturesOp, OpType::GaussianFourierFeatures,
+                      DeviceType::NPU);
 DENSECORE_REGISTER_OP(NpuGridSampleOp, OpType::GridSample, DeviceType::NPU);
 
 }  // namespace
