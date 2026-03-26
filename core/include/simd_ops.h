@@ -2869,8 +2869,11 @@ inline void GemmInt4Fp32_NEON(float* C, const float* A, const uint8_t* W_int4, c
         const uint8_t* w_ptr = W_int4 + row * packed_K + packed_g_offset + k / 2;           \
         __builtin_prefetch(w_ptr + 32, 0, 3);                                               \
                                                                                             \
-        /* Load 4 bytes = 8 packed INT4 weights */                                          \
-        uint8x8_t packed_u8 = vld1_u8(w_ptr); /* loads 8 bytes, use first 4 */              \
+        /* Load exactly 4 bytes = 8 packed INT4 weights.                                   \
+         * vld1_u8() would read 8 bytes and can overrun the final group tail on ARM. */     \
+        uint8_t packed_tmp[8] = {};                                                         \
+        std::memcpy(packed_tmp, w_ptr, sizeof(uint32_t));                                   \
+        uint8x8_t packed_u8 = vld1_u8(packed_tmp);                                          \
         /* Widen u8 → u16 */                                                              \
         uint16x8_t packed_u16 = vmovl_u8(packed_u8);                                        \
         /* Extract low nibbles (even positions) */                                          \
@@ -2883,9 +2886,8 @@ inline void GemmInt4Fp32_NEON(float* C, const float* A, const uint8_t* W_int4, c
         int16x8_t lo_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(lo_u16), 12), 12); \
         int16x8_t hi_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(hi_u16), 12), 12); \
                                                                                             \
-        /* Interleave low and high: [lo0,hi0,lo1,hi1,...] */                                \
+        /* Interleave low and high: [lo0,hi0,lo1,hi1,...] for the 4 loaded bytes. */        \
         int16x8_t interleaved_lo = vzip1q_s16(lo_s16, hi_s16);                              \
-        int16x8_t interleaved_hi = vzip2q_s16(lo_s16, hi_s16);                              \
                                                                                             \
         /* Convert first 4 elements to FP32 */                                              \
         int32x4_t w32_0 = vmovl_s16(vget_low_s16(interleaved_lo));                          \
@@ -2940,7 +2942,9 @@ inline void GemmInt4Fp32_NEON(float* C, const float* A, const uint8_t* W_int4, c
                     float32x4_t a0 = vld1q_f32(a_ptr + k);
                     float32x4_t a1 = vld1q_f32(a_ptr + k + 4);
 
-                    uint8x8_t packed_u8 = vld1_u8(w_ptr + k / 2);
+                    uint8_t packed_tmp[8] = {};
+                    std::memcpy(packed_tmp, w_ptr + k / 2, sizeof(uint32_t));
+                    uint8x8_t packed_u8 = vld1_u8(packed_tmp);
                     uint16x8_t packed_u16 = vmovl_u8(packed_u8);
                     uint16x8_t lo_u16 = vandq_u16(packed_u16, vdupq_n_u16(0x0F));
                     uint16x8_t hi_u16 = vshrq_n_u16(packed_u16, 4);
@@ -3255,8 +3259,9 @@ inline void UpdateOutput_AVX512(float* O, const float* PV, const float* alpha, c
 
 #else  // Non-AVX512 fallback (scalar implementations)
 
-// Scalar fallback versions
-inline void ComputeQK_AVX512(const float* Q, const float* K, float* S, int q_len, int kv_len, int head_dim,
+// Scalar fallback versions — named _Scalar to avoid confusion with the
+// actual AVX-512 intrinsic implementations in the #if branch above.
+inline void ComputeQK_Scalar(const float* Q, const float* K, float* S, int q_len, int kv_len, int head_dim,
                              float scale) {
     for (int qi = 0; qi < q_len; qi++) {
         for (int ki = 0; ki < kv_len; ki++) {
@@ -3266,7 +3271,7 @@ inline void ComputeQK_AVX512(const float* Q, const float* K, float* S, int q_len
     }
 }
 
-inline void ApplyMask_AVX512(float* S, int q_start, int kv_start, int q_len, int kv_len) {
+inline void ApplyMask_Scalar(float* S, int q_start, int kv_start, int q_len, int kv_len) {
     for (int qi = 0; qi < q_len; qi++) {
         for (int ki = 0; ki < kv_len; ki++) {
             if ((q_start + qi) < (kv_start + ki)) {
@@ -3276,7 +3281,7 @@ inline void ApplyMask_AVX512(float* S, int q_start, int kv_start, int q_len, int
     }
 }
 
-inline void SoftmaxBlock_AVX512(float* S, float* row_max, float* row_sum, int q_len, int kv_len, bool first_block) {
+inline void SoftmaxBlock_Scalar(float* S, float* row_max, float* row_sum, int q_len, int kv_len, bool first_block) {
     for (int qi = 0; qi < q_len; qi++) {
         float* s_row = S + qi * kv_len;
         float local_max = MaxF32(s_row, kv_len);
@@ -3300,7 +3305,7 @@ inline void SoftmaxBlock_AVX512(float* S, float* row_max, float* row_sum, int q_
     }
 }
 
-inline void ComputePV_AVX512(const float* P, const float* V, float* O, int q_len, int kv_len, int head_dim) {
+inline void ComputePV_Scalar(const float* P, const float* V, float* O, int q_len, int kv_len, int head_dim) {
     for (int qi = 0; qi < q_len; qi++) {
         for (int ki = 0; ki < kv_len; ki++) {
             float p_val = P[qi * kv_len + ki];
@@ -3313,7 +3318,7 @@ inline void ComputePV_AVX512(const float* P, const float* V, float* O, int q_len
     }
 }
 
-inline void UpdateOutput_AVX512(float* O, const float* PV, const float* alpha, const float* beta, int q_len,
+inline void UpdateOutput_Scalar(float* O, const float* PV, const float* alpha, const float* beta, int q_len,
                                 int head_dim) {
     for (int qi = 0; qi < q_len; qi++) {
         for (int d = 0; d < head_dim; d++) {
@@ -3412,6 +3417,86 @@ inline void ComputeQK_NEON(const float* Q, const float* K, float* S, int q_len, 
     }
 }
 
+inline void ApplyMask_NEON(float* S, int q_start, int kv_start, int q_len, int kv_len) {
+    const float neg_inf = -1e10f;
+    const float32x4_t neg_inf_vec = vdupq_n_f32(neg_inf);
+    for (int qi = 0; qi < q_len; qi++) {
+        const int global_qi = q_start + qi;
+        float* s_row = S + qi * kv_len;
+
+        // Causal mask: set s_row[ki] = -inf where global_qi < kv_start + ki.
+        // Equivalently, all ki > (global_qi - kv_start) get masked.
+        // The mask boundary is a single index per row, so the real win is
+        // vectorized stores for the contiguous -inf tail region.
+        const int mask_start = std::max(0, global_qi - kv_start + 1);
+
+        // Everything before mask_start is kept as-is (no work needed).
+        // Fill the tail [mask_start, kv_len) with -inf using NEON stores.
+        int ki = mask_start;
+        for (; ki + 4 <= kv_len; ki += 4) {
+            vst1q_f32(s_row + ki, neg_inf_vec);
+        }
+        for (; ki < kv_len; ki++) {
+            s_row[ki] = neg_inf;
+        }
+    }
+}
+
+inline void SoftmaxBlock_NEON(float* S, float* row_max, float* row_sum, int q_len, int kv_len, bool first_block) {
+    for (int qi = 0; qi < q_len; qi++) {
+        float* s_row = S + qi * kv_len;
+
+        // Find max using NEON
+        float32x4_t max_vec = vdupq_n_f32(-1e10f);
+        int ki = 0;
+        for (; ki + 4 <= kv_len; ki += 4) {
+            float32x4_t s_vec = vld1q_f32(s_row + ki);
+            max_vec = vmaxq_f32(max_vec, s_vec);
+        }
+        // Horizontal max reduction
+        float local_max = vmaxvq_f32(max_vec);
+        for (; ki < kv_len; ki++) {
+            local_max = std::max(local_max, s_row[ki]);
+        }
+
+        float m_old = first_block ? -1e10f : row_max[qi];
+        float m_new = std::max(m_old, local_max);
+
+        // Compute exp(s - m_new) and sum
+        float32x4_t sum_vec = vdupq_n_f32(0.0f);
+        float32x4_t m_new_vec = vdupq_n_f32(m_new);
+        ki = 0;
+        for (; ki + 4 <= kv_len; ki += 4) {
+            float32x4_t s_vec = vld1q_f32(s_row + ki);
+            // exp via scalar fallback (no vexpq on NEON)
+            float tmp[4];
+            vst1q_f32(tmp, vsubq_f32(s_vec, m_new_vec));
+            tmp[0] = expf(tmp[0]);
+            tmp[1] = expf(tmp[1]);
+            tmp[2] = expf(tmp[2]);
+            tmp[3] = expf(tmp[3]);
+            float32x4_t exp_vec = vld1q_f32(tmp);
+            vst1q_f32(s_row + ki, exp_vec);
+            sum_vec = vaddq_f32(sum_vec, exp_vec);
+        }
+        float local_sum = vaddvq_f32(sum_vec);
+        for (; ki < kv_len; ki++) {
+            float exp_val = expf(s_row[ki] - m_new);
+            s_row[ki] = exp_val;
+            local_sum += exp_val;
+        }
+
+        if (first_block) {
+            row_max[qi] = m_new;
+            row_sum[qi] = local_sum;
+        } else {
+            float alpha = expf(m_old - m_new);
+            row_sum[qi] = alpha * row_sum[qi] + local_sum;
+            row_max[qi] = m_new;
+        }
+    }
+}
+
 inline void ComputePV_NEON(const float* P, const float* V, float* O, int q_len, int kv_len, int head_dim) {
     for (int qi = 0; qi < q_len; qi++) {
         const float* p_row = P + qi * kv_len;
@@ -3473,15 +3558,60 @@ inline void ComputeQK(const float* Q, const float* K, float* S, int q_len, int k
         return;
     }
 #endif
+    // x86: real AVX-512 intrinsics when compiled with __AVX512F__,
+    // otherwise ComputeQK_Scalar (renamed from the confusing _AVX512 suffix).
+#if defined(__AVX512F__)
     ComputeQK_AVX512(Q, K, S, q_len, kv_len, head_dim, scale);
+#else
+    ComputeQK_Scalar(Q, K, S, q_len, kv_len, head_dim, scale);
+#endif
 }
 
 inline void ApplyMask(float* S, int q_start, int kv_start, int q_len, int kv_len) {
+    static const SimdLevel level = DetectSimdLevel();
+#if defined(__ARM_FEATURE_SVE)
+    if (HasArmSveOrBetter(level)) {
+        // SVE: use scalar fallback (ApplyMask is branch-heavy, SVE predication
+        // provides minimal benefit over well-predicted scalar branches).
+        ApplyMask_Scalar(S, q_start, kv_start, q_len, kv_len);
+        return;
+    }
+#endif
+#if defined(DENSECORE_ARM)
+    if (IsArmFamily(level)) {
+        ApplyMask_NEON(S, q_start, kv_start, q_len, kv_len);
+        return;
+    }
+#endif
+#if defined(__AVX512F__)
     ApplyMask_AVX512(S, q_start, kv_start, q_len, kv_len);
+#else
+    ApplyMask_Scalar(S, q_start, kv_start, q_len, kv_len);
+#endif
 }
 
 inline void SoftmaxBlock(float* S, float* row_max, float* row_sum, int q_len, int kv_len, bool first_block) {
+    static const SimdLevel level = DetectSimdLevel();
+#if defined(__ARM_FEATURE_SVE)
+    if (HasArmSveOrBetter(level)) {
+        // SVE: reuse scalar path — exp() dominates cost and SVE has no
+        // hardware exp instruction; the NEON path already vectorizes
+        // max/sum reductions which covers most of the benefit.
+        SoftmaxBlock_Scalar(S, row_max, row_sum, q_len, kv_len, first_block);
+        return;
+    }
+#endif
+#if defined(DENSECORE_ARM)
+    if (IsArmFamily(level)) {
+        SoftmaxBlock_NEON(S, row_max, row_sum, q_len, kv_len, first_block);
+        return;
+    }
+#endif
+#if defined(__AVX512F__)
     SoftmaxBlock_AVX512(S, row_max, row_sum, q_len, kv_len, first_block);
+#else
+    SoftmaxBlock_Scalar(S, row_max, row_sum, q_len, kv_len, first_block);
+#endif
 }
 
 inline void ComputePV(const float* P, const float* V, float* O, int q_len, int kv_len, int head_dim) {
@@ -3498,7 +3628,11 @@ inline void ComputePV(const float* P, const float* V, float* O, int q_len, int k
         return;
     }
 #endif
+#if defined(__AVX512F__)
     ComputePV_AVX512(P, V, O, q_len, kv_len, head_dim);
+#else
+    ComputePV_Scalar(P, V, O, q_len, kv_len, head_dim);
+#endif
 }
 
 inline void UpdateOutput(float* O, const float* PV, const float* alpha, const float* beta, int q_len, int head_dim) {
@@ -3515,7 +3649,11 @@ inline void UpdateOutput(float* O, const float* PV, const float* alpha, const fl
         return;
     }
 #endif
+#if defined(__AVX512F__)
     UpdateOutput_AVX512(O, PV, alpha, beta, q_len, head_dim);
+#else
+    UpdateOutput_Scalar(O, PV, alpha, beta, q_len, head_dim);
+#endif
 }
 
 // =============================================================================

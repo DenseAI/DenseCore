@@ -986,6 +986,31 @@ void CpuBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
     const float* zeros_data = zero_points.DataAs<float>();
     float* c_data = C->DataAs<float>();
 
+#if defined(DENSECORE_ARM_CORRECTNESS_FIRST) && (defined(__aarch64__) || defined(_M_ARM64))
+    if (!OpsRegistry::IsInitialized()) {
+        OpsRegistry::Init();
+    }
+    auto& reg = OpsRegistry::Instance();
+    if (reg.GemmInt4) {
+        reg.GemmInt4(c_data, a_data, w_data, scales_data, zeros_data, M, N, K, group_size);
+        return;
+    }
+#endif
+
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(DENSECORE_ARM_CORRECTNESS_FIRST)
+    // ARM correctness issue narrowed to the Highway INT4 path. Route through
+    // the runtime-selected DenseCore kernel (NEON/SVE) until Highway INT4 on
+    // ARM is verified against the same reference path.
+    if (!OpsRegistry::IsInitialized()) {
+        OpsRegistry::Init();
+    }
+    auto& reg = OpsRegistry::Instance();
+    if (reg.GemmInt4) {
+        reg.GemmInt4(c_data, a_data, w_data, scales_data, zeros_data, M, N, K, group_size);
+        return;
+    }
+#endif
+
     // ===========================================================================
     // DECODE OPTIMIZATION: Use GEMV kernel for M=1 (token generation)
     // ===========================================================================

@@ -1,8 +1,16 @@
 # Include bundled C++ source (populated by setup.py during sdist)
 recursive-include densecore/core_src *
-
-# Include shared libraries (if pre-built/wheel)
-recursive-include densecore *.so *.dylib
+prune densecore/core_src/_deps
+prune densecore/core_src/build
+prune densecore/core_src/lib
+prune densecore/core_src/bin
+prune densecore/core_src/CMakeFiles
+prune densecore/core_src/Testing
+prune densecore/core_src/cmake-build-debug
+global-exclude *.so
+global-exclude *.so.*
+global-exclude *.dylib
+global-exclude *.dylib.*
 
 # Include PEP 561 type hints
 include densecore/py.typed

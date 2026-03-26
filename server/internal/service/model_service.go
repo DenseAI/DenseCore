@@ -18,7 +18,11 @@ type ModelService struct {
 
 	// Atomic status for non-blocking startup probe
 	loadingStatus atomic.Int32
-	loadingError  atomic.Value // stores error
+	loadingError  atomic.Pointer[loadErrorValue]
+}
+
+type loadErrorValue struct {
+	err error
 }
 
 func NewModelService() *ModelService {
@@ -41,7 +45,7 @@ func (s *ModelService) LoadModel(mainModelPath, draftModelPath string, threads i
 // LoadModelWithOptions provides explicit control over the loading strategy.
 func (s *ModelService) LoadModelWithOptions(mainModelPath, draftModelPath string, threads int, force bool) error {
 	s.loadingStatus.Store(int32(domain.StatusLoading))
-	s.loadingError.Store(error(nil))
+	s.loadingError.Store(nil)
 
 	var err error
 	if force {
@@ -52,10 +56,11 @@ func (s *ModelService) LoadModelWithOptions(mainModelPath, draftModelPath string
 
 	if err != nil {
 		s.loadingStatus.Store(int32(domain.StatusFailed))
-		s.loadingError.Store(err)
+		s.loadingError.Store(&loadErrorValue{err: err})
 		return err
 	}
 
+	s.loadingError.Store(nil)
 	s.loadingStatus.Store(int32(domain.StatusReady))
 	return nil
 }
@@ -129,6 +134,7 @@ func (s *ModelService) UnloadModel() error {
 		s.currentEngine = nil
 	}
 	s.currentModelPath = ""
+	s.loadingError.Store(nil)
 	s.loadingStatus.Store(int32(domain.StatusIdle))
 	return nil
 }
@@ -168,7 +174,7 @@ func (s *ModelService) GetLoadingStatus() domain.LoadingStatus {
 // GetLoadingError returns the last loading error, if any.
 func (s *ModelService) GetLoadingError() error {
 	if err := s.loadingError.Load(); err != nil {
-		return err.(error)
+		return err.err
 	}
 	return nil
 }

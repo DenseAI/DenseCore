@@ -105,14 +105,15 @@ Changelog = "https://github.com/DenseCore/DenseCore/blob/main/CHANGELOG.md"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["densecore*"]
+exclude = ["densecore.core_src", "densecore.core_src.*", "tests", "tests.*"]
 
 [tool.setuptools.package-data]
 densecore = [
     "*.so",
+    "*.so.*",
     "*.dylib",
+    "*.dylib.*",
     "py.typed",
-    "core_src/*",
-    "core_src/**/*",
 ]
 
 [tool.ruff]

@@ -506,17 +506,17 @@ void MaybePrimeQwenNoThinking(const TransformerModel* model, std::vector<int>* t
     if (!model || !tokens || !ShouldPrimeQwenNoThinking(model)) {
         return;
     }
-    const std::vector<int> suffix =
-        Tokenizer::Tokenize(model, "<think>\n\n</think>\n\n", /*add_bos=*/false, /*add_eos=*/false);
-    if (suffix.empty() || tokens->size() >= suffix.size()) {
-        bool already_primed = !suffix.empty();
-        if (already_primed) {
-            const size_t start = tokens->size() - suffix.size();
-            for (size_t i = 0; i < suffix.size(); ++i) {
-                if ((*tokens)[start + i] != suffix[i]) {
-                    already_primed = false;
-                    break;
-                }
+    const std::vector<int> suffix = Tokenizer::Tokenize(model, "Answer: ", /*add_bos=*/false, /*add_eos=*/false);
+    if (suffix.empty()) {
+        return;
+    }
+    if (tokens->size() >= suffix.size()) {
+        bool already_primed = true;
+        const size_t start = tokens->size() - suffix.size();
+        for (size_t i = 0; i < suffix.size(); ++i) {
+            if ((*tokens)[start + i] != suffix[i]) {
+                already_primed = false;
+                break;
             }
         }
         if (already_primed) {
@@ -597,15 +597,18 @@ std::string MaybeApplyAutoChatTemplate(const TransformerModel* model, const std:
                                                  : true;
         std::string wrapped;
         wrapped.reserve(prompt.size() + 192);
-        wrapped += "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n";
+        wrapped += "<|im_start|>system\nYou are a helpful assistant.";
+        if ((model->arch == ModelArch::QWEN3 || model->arch == ModelArch::QWEN35) && !qwen_enable_thinking) {
+            wrapped += "\nProvide only the answer. Do not output any thinking process, analysis, reasoning steps, "
+                       "or preamble. Never start with 'Thinking Process'.";
+        }
+        wrapped += "<|im_end|>\n";
         wrapped += "<|im_start|>user\n";
         wrapped += prompt;
         wrapped += "<|im_end|>\n";
         wrapped += "<|im_start|>assistant\n";
         if ((model->arch == ModelArch::QWEN3 || model->arch == ModelArch::QWEN35) && !qwen_enable_thinking) {
-            // Qwen chat templates support a no-thinking mode by priming an
-            // empty think block before the final response.
-            wrapped += "<think>\n\n</think>\n\n";
+            wrapped += "Answer: ";
         }
         return wrapped;
     }

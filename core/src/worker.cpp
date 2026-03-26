@@ -558,22 +558,60 @@ size_t DecodeGraphCacheCtxBytes() {
     return bytes;
 }
 
-void SuppressTaggedBlock(std::string* token_text, bool* in_block, const char* open_tag, const char* close_tag) {
-    if (!token_text || !in_block || token_text->empty() || !open_tag || !close_tag) {
+size_t LongestPrefixSuffixMatch(const std::string& text, const std::string& pattern) {
+    if (text.empty() || pattern.empty()) return 0;
+    const size_t max_len = std::min(text.size(), pattern.size() - 1);
+    for (size_t len = max_len; len > 0; --len) {
+        if (text.compare(text.size() - len, len, pattern, 0, len) == 0) {
+            return len;
+        }
+    }
+    return 0;
+}
+
+size_t LongestTagCarry(const std::string& text, const std::string& open, const std::string& close) {
+    return std::max(LongestPrefixSuffixMatch(text, open), LongestPrefixSuffixMatch(text, close));
+}
+
+void ResetHybridSSMRuntimeState(TransformerModel* model) {
+    if (!model || !model->arch_flags.is_hybrid_ssm) {
+        return;
+    }
+    for (auto& layer_state : model->ssm_layer_states) {
+        layer_state.Reset();
+    }
+}
+
+void SuppressTaggedBlock(std::string* token_text, bool* in_block, std::string* pending, const char* open_tag,
+                         const char* close_tag) {
+    if (!token_text || !in_block || !pending || !open_tag || !close_tag) {
         return;
     }
 
     const std::string open(open_tag);
     const std::string close(close_tag);
+    std::string current;
+    current.reserve(pending->size() + token_text->size());
+    current.append(*pending);
+    current.append(*token_text);
+    pending->clear();
+    if (current.empty()) {
+        token_text->clear();
+        return;
+    }
 
     std::string out;
-    out.reserve(token_text->size());
+    out.reserve(current.size());
 
     size_t pos = 0;
-    while (pos < token_text->size()) {
+    while (pos < current.size()) {
         if (*in_block) {
-            const size_t close_pos = token_text->find(close, pos);
+            const size_t close_pos = current.find(close, pos);
             if (close_pos == std::string::npos) {
+                const size_t carry = LongestPrefixSuffixMatch(current, close);
+                if (carry > 0) {
+                    pending->assign(current, current.size() - carry, carry);
+                }
                 token_text->clear();
                 return;
             }
@@ -582,23 +620,23 @@ void SuppressTaggedBlock(std::string* token_text, bool* in_block, const char* op
             continue;
         }
 
-        const size_t open_pos = token_text->find(open, pos);
-        const size_t close_pos = token_text->find(close, pos);
+        const size_t open_pos = current.find(open, pos);
+        const size_t close_pos = current.find(close, pos);
 
         if (close_pos != std::string::npos && (open_pos == std::string::npos || close_pos < open_pos)) {
             // Drop unmatched close tags that may leak from partial streams.
-            out.append(*token_text, pos, close_pos - pos);
+            out.append(current, pos, close_pos - pos);
             pos = close_pos + close.size();
             continue;
         }
 
         if (open_pos == std::string::npos) {
-            out.append(*token_text, pos, std::string::npos);
+            out.append(current, pos, std::string::npos);
             break;
         }
 
-        out.append(*token_text, pos, open_pos - pos);
-        const size_t block_close_pos = token_text->find(close, open_pos + open.size());
+        out.append(current, pos, open_pos - pos);
+        const size_t block_close_pos = current.find(close, open_pos + open.size());
         if (block_close_pos == std::string::npos) {
             *in_block = true;
             break;
@@ -607,6 +645,13 @@ void SuppressTaggedBlock(std::string* token_text, bool* in_block, const char* op
     }
 
     *token_text = std::move(out);
+    if (!*in_block) {
+        const size_t carry = LongestTagCarry(*token_text, open, close);
+        if (carry > 0) {
+            pending->assign(*token_text, token_text->size() - carry, carry);
+            token_text->erase(token_text->size() - carry);
+        }
+    }
 }
 
 bool IsStopTokenId(const TransformerModel* model, int token_id) {
@@ -996,6 +1041,13 @@ void EngineLoop(EngineState* state) {
                 // semantics.
 
                 while (state->status == EngineStatus::RUNNING) {
+                    if (current_model && current_model->arch_flags.is_hybrid_ssm) {
+                        std::lock_guard<std::mutex> active_lock(state->active_mu);
+                        if (!state->active_requests.empty()) {
+                            break;
+                        }
+                    }
+
                     Request* req = state->pending_requests.Pop();
                     if (!req) break;  // Queue empty
 
@@ -1148,6 +1200,10 @@ void EngineLoop(EngineState* state) {
                     }
                     state->metrics.total_prompt_tokens += req->tokens.size();
 
+                    // Qwen3.5-style hybrid SSM models currently keep recurrent state in the
+                    // loaded model object, so a new request must start from a clean state.
+                    ResetHybridSSMRuntimeState(current_model);
+
                     // Register with scheduler (blocks allocated by scheduler)
                     int seq_id = state->scheduler->AddRequest(req->id, req->tokens.size(), req->max_tokens,
                                                               req->priority, &req->tokens,
@@ -1297,8 +1353,10 @@ void EngineLoop(EngineState* state) {
                 }
             }
 
+            const bool prefix_cache_allowed = !(current_model && current_model->arch_flags.is_hybrid_ssm);
+
             // 4a. Handle scheduler output: prefix cache hits
-            if (!used_single_request_fast_path) {
+            if (!used_single_request_fast_path && prefix_cache_allowed) {
                 for (const auto& hit : sched_output.prefix_cache_hits) {
                     auto req_it = seq_to_request.find(hit.seq_id);
                     if (req_it != seq_to_request.end()) {
@@ -2713,7 +2771,7 @@ void EngineLoop(EngineState* state) {
                         // This enables O(1) lookup for requests with identical prompt prefixes.
                         // Multi-stage collision verification ensures correctness.
                         // =======================================================================
-                        if (!req->prompt_tokens_for_cache.empty() && !req->block_table.empty()) {
+                        if (prefix_cache_allowed && !req->prompt_tokens_for_cache.empty() && !req->block_table.empty()) {
                             const int* tokens_ptr = req->prompt_tokens_for_cache.data();
                             int total_tokens = static_cast<int>(req->prompt_tokens_for_cache.size());
 
@@ -2730,9 +2788,9 @@ void EngineLoop(EngineState* state) {
                                     block_id, hash, tokens_ptr + start_token, block_tokens);
                             }
 
-                            // Clear after registration (memory optimization)
-                            req->prompt_tokens_for_cache.clear();
                         }
+                        // Clear after registration, or after skipping cache registration for hybrid SSM.
+                        req->prompt_tokens_for_cache.clear();
 
                         req->first_token_time = std::chrono::steady_clock::now();
                         auto ttft_us = std::chrono::duration_cast<std::chrono::microseconds>(req->first_token_time -
@@ -2787,10 +2845,12 @@ void EngineLoop(EngineState* state) {
                     // DENSECORE_SUPPRESS_REASONING_TAGS=0.
                     if (!req_bench_fast_path && !req->json_mode && !token_str.empty() &&
                         IsReasoningTagSuppressionEnabled()) {
-                        SuppressTaggedBlock(&token_str, &req->in_think_block, "<think>", "</think>");
-                        SuppressTaggedBlock(&token_str, &req->in_tool_call_block, "<tool_call>", "</tool_call>");
-                        SuppressTaggedBlock(&token_str, &req->in_tool_response_block, "<tool_response>",
-                                            "</tool_response>");
+                        SuppressTaggedBlock(&token_str, &req->in_think_block, &req->think_tag_pending, "<think>",
+                                            "</think>");
+                        SuppressTaggedBlock(&token_str, &req->in_tool_call_block, &req->tool_call_tag_pending,
+                                            "<tool_call>", "</tool_call>");
+                        SuppressTaggedBlock(&token_str, &req->in_tool_response_block, &req->tool_response_tag_pending,
+                                            "<tool_response>", "</tool_response>");
                     }
 
                     if (req->json_mode && !token_str.empty()) {

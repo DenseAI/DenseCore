@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	cloudmw "github.com/DenseCore/DenseCloud/go/middleware"
+	cloudmw "github.com/DenseAI/DenseCloud/go/middleware"
 )
 
 // ============================================================================

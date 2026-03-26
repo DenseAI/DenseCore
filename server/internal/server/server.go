@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	cloudmw "github.com/DenseCore/DenseCloud/go/middleware"
-	cloudserver "github.com/DenseCore/DenseCloud/go/server"
-	"github.com/DenseCore/DenseCloud/go/telemetry"
+	cloudmw "github.com/DenseAI/DenseCloud/go/middleware"
+	cloudserver "github.com/DenseAI/DenseCloud/go/server"
+	"github.com/DenseAI/DenseCloud/go/telemetry"
 
 	"descore-server/internal/api"
 	"descore-server/internal/buildinfo"

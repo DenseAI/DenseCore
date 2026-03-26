@@ -8,7 +8,7 @@ require (
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.4
 	github.com/charmbracelet/lipgloss v1.1.0
-	github.com/DenseCore/DenseCloud v0.0.0-20260315224408-fab4a3666e1e
+	github.com/DenseAI/DenseCloud v0.0.0-20260315134408-fab4a3666e1e
 	github.com/denseseries/dense-enterprise v0.0.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
@@ -86,3 +86,4 @@ require (
 )
 
 replace github.com/denseseries/dense-enterprise => ../../DenseEnterprise
+replace github.com/DenseAI/DenseCloud => ../../DenseCloud

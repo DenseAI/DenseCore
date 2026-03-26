@@ -11,8 +11,8 @@ server_dir="$repo_root/server"
 densecloud_dir="${DENSECLOUD_DIR:-$repo_root/../DenseCloud}"
 
 # DenseSeries modules are private by default.
-export GOPRIVATE="${GOPRIVATE:-github.com/DenseCore/*,github.com/denseseries/*}"
-export GONOSUMDB="${GONOSUMDB:-github.com/DenseCore/*,github.com/denseseries/*}"
+export GOPRIVATE="${GOPRIVATE:-github.com/DenseAI/*,github.com/DenseCore/*,github.com/denseseries/*}"
+export GONOSUMDB="${GONOSUMDB:-github.com/DenseAI/*,github.com/DenseCore/*,github.com/denseseries/*}"
 
 export GOCACHE="${GOCACHE:-${TMPDIR:-/tmp}/densecore-go-build-cache}"
 export GOMODCACHE="${GOMODCACHE:-${TMPDIR:-/tmp}/densecore-go-mod-cache}"
@@ -29,9 +29,6 @@ trap cleanup EXIT
 
 if [[ -f "$densecloud_dir/go.mod" ]]; then
 	densecloud_dir="$(cd "$densecloud_dir" && pwd)"
-	densecloud_version="$(
-		awk '$1 == "github.com/DenseCore/DenseCloud" { print $2; exit }' "$server_dir/go.mod"
-	)"
 	workfile="$(mktemp "${TMPDIR:-/tmp}/densecore-go-work.XXXXXX")"
 	cat >"$workfile" <<EOF
 go 1.24.0
@@ -41,12 +38,6 @@ use (
 	$densecloud_dir
 )
 EOF
-	if [[ -n "$densecloud_version" ]]; then
-		cat >>"$workfile" <<EOF
-
-replace github.com/DenseCore/DenseCloud $densecloud_version => $densecloud_dir
-EOF
-	fi
 fi
 
 if [[ -n "$workfile" ]]; then

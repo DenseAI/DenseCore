@@ -5,11 +5,11 @@ package engine
 // -----------------------
 // IMPORTANT: For CI/production, set environment variables:
 //   export CGO_CFLAGS="-I${PWD}/core/include"
-//   export CGO_LDFLAGS="-L${PWD}/build -ldensecore -lstdc++"
+//   export CGO_LDFLAGS="-L${PWD}/core/build -Wl,-rpath,${PWD}/core/build -ldensecore -lstdc++"
 //
 // ${SRCDIR} expands to the directory containing this Go source file.
 #cgo CFLAGS: -I${SRCDIR}/../../../core/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../build -ldensecore -lstdc++
+#cgo LDFLAGS: -L${SRCDIR}/../../../core/build -Wl,-rpath,${SRCDIR}/../../../core/build -ldensecore -lstdc++
 #include <stdlib.h>
 #include <stdint.h>
 #include "densecore.h"

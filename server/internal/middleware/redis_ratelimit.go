@@ -1,6 +1,6 @@
 package middleware
 
-import cloudmw "github.com/DenseCore/DenseCloud/go/middleware"
+import cloudmw "github.com/DenseAI/DenseCloud/go/middleware"
 
 // RedisRateLimiter is the shared distributed token bucket rate limiter from
 // the DenseCloud chassis. It is re-exported here so that existing call sites

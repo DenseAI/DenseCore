@@ -159,13 +159,13 @@ func (s *ChatService) normalizeSampling(req domain.ChatCompletionRequest) (float
 	topK := req.TopK
 	repetitionPenalty := req.RepetitionPenalty
 
-	if temperature == 0 {
+	if !req.TemperatureSet {
 		temperature = 1.0
 	}
-	if topP == 0 {
+	if !req.TopPSet {
 		topP = 1.0
 	}
-	if repetitionPenalty == 0 {
+	if !req.RepetitionPenaltySet {
 		repetitionPenalty = 1.0
 	}
 

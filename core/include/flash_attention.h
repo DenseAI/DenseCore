@@ -16,7 +16,6 @@
 
 #include <cmath>
 #include <cstdlib>
-#include <vector>
 
 #include "simd_ops.h"
 
@@ -55,6 +54,11 @@ struct FlashAttentionScratch {
     simd::AlignedVector<float> alpha_buf;  // [block_m] (64-byte aligned)
     simd::AlignedVector<float> beta_buf;   // [block_m] (64-byte aligned)
 
+    // Per-head running statistics — cached here to avoid heap allocation
+    // on every FlashAttentionForward call (hot path during decode/prefill).
+    simd::AlignedVector<float> global_max;  // [seq_q] running max per query
+    simd::AlignedVector<float> global_sum;  // [seq_q] running exp-sum per query
+
     void Resize(int block_m, int block_n, int head_dim) {
         qk_block.resize(block_m * block_n);
         pv_block.resize(block_m * head_dim);
@@ -66,7 +70,45 @@ struct FlashAttentionScratch {
         alpha_buf.resize(block_m);
         beta_buf.resize(block_m);
     }
+
+    /**
+     * @brief running statistics 버퍼를 seq_q 크기로 확보 (재할당 최소화).
+     *
+     * AlignedVector::resize()는 이미 capacity가 충분하면 할당하지 않으므로,
+     * 연속 호출 시 amortized O(1). 매 호출마다 std::vector를 새로 생성하던
+     * 기존 패턴 대비 prefill hot path에서 malloc/free 오버헤드 제거.
+     */
+    void EnsureGlobalStats(int seq_q) {
+        if (static_cast<int>(global_max.size()) < seq_q) {
+            global_max.resize(static_cast<size_t>(seq_q));
+            global_sum.resize(static_cast<size_t>(seq_q));
+        }
+    }
 };
+
+/**
+ * @brief head_dim/seq_len 기반 블록 사이즈 자동 튜닝.
+ *
+ * head_dim이 작을수록 레지스터에 여유가 생겨 더 큰 블록으로
+ * K/V 타일을 재사용할 수 있음. 기본값 64×64는 head_dim=128 기준
+ * L2 캐시 최적화 결과이며, 다른 사이즈에서는 비효율적일 수 있음.
+ */
+inline FlashAttentionConfig AutoTuneFlashConfig(int head_dim, int /*seq_len*/ = 0) {
+    FlashAttentionConfig config;
+    if (head_dim <= 64) {
+        config.block_m = 128;
+        config.block_n = 64;
+    } else if (head_dim <= 128) {
+        config.block_m = 64;
+        config.block_n = 64;
+    } else {
+        // Very large head_dim (e.g. 256 in some vision models):
+        // smaller blocks to keep tile data in L2.
+        config.block_m = 32;
+        config.block_n = 32;
+    }
+    return config;
+}
 
 /**
  * Flash Attention forward pass for a single head
@@ -95,9 +137,14 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
     // Initialize output to zero
     memset(O, 0, seq_len_q * head_dim * sizeof(float));
 
-    // Initialize row_max to -inf, row_sum to 0
-    std::vector<float> L(seq_len_q, 0.0f);    // Cumulative sum of exp
-    std::vector<float> M(seq_len_q, -1e10f);  // Max value seen so far
+    // Use scratch-resident running statistics instead of heap-allocated vectors.
+    // EnsureGlobalStats only reallocates if the buffer is too small, so repeated
+    // calls with the same seq_len_q are amortized O(1) — no malloc in hot path.
+    scratch.EnsureGlobalStats(seq_len_q);
+    float* L = scratch.global_sum.data();
+    float* M = scratch.global_max.data();
+    std::fill(L, L + seq_len_q, 0.0f);
+    std::fill(M, M + seq_len_q, -1e10f);
 
     // Process in tiles (outer KV loop for better cache locality)
     for (int j = 0; j < seq_len_kv; j += Bc) {

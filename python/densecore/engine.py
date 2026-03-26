@@ -473,10 +473,13 @@ def _preload_linux_runtime_dependencies(lib_path: str) -> None:
     if platform.system() != "Linux":
         return
 
+    lib_dir = Path(lib_path).resolve().parent
     candidates = [
+        str(lib_dir / "libgomp.so.1"),
         "libgomp.so.1",
-        str(Path(lib_path).resolve().parent / "libggml-cpu.so.0"),
-        str(Path(lib_path).resolve().parent / "libggml-base.so.0"),
+        str(lib_dir / "libggml-base.so.0"),
+        str(lib_dir / "libggml-cpu.so.0"),
+        str(Path(lib_path).resolve()),
     ]
 
     for candidate in candidates:
@@ -500,6 +503,7 @@ def _reexec_with_linux_preload(lib_path: str) -> None:
 
     lib_dir = Path(lib_path).resolve().parent
     preload_libs = [
+        str(lib_dir / "libgomp.so.1"),
         str(lib_dir / "libggml-base.so.0"),
         str(lib_dir / "libggml-cpu.so.0"),
         str(Path(lib_path).resolve()),
@@ -1740,27 +1744,25 @@ class DenseCore:
         return False
 
     def _maybe_prime_qwen_no_thinking(self, prompt: Union[str, List[int]]) -> Union[str, List[int]]:
-        if not self._should_prime_qwen_no_thinking() or self.tokenizer is None:
+        if not self._should_prime_qwen_no_thinking():
             return prompt
 
         def apply_no_thinking_text(text: str) -> str:
-            suffix = "<think>\n\n</think>\n\n"
             if "You are a helpful assistant." in text and "final answer only" not in text:
                 text = text.replace(
                     "You are a helpful assistant.",
-                    "You are a helpful assistant.\nProvide only the final answer. Do not output your thinking process, analysis, or reasoning steps.",
+                    "You are a helpful assistant.\nProvide only the answer. Do not output any thinking process, analysis, reasoning steps, or preamble. Never start with 'Thinking Process'.",
                     1,
                 )
-            if suffix in text:
-                return text
-            if "<|im_start|>assistant\n" in text:
-                return text.replace(
-                    "<|im_start|>assistant\n", f"<|im_start|>assistant\n{suffix}", 1
-                )
+            if "<|im_start|>assistant\n" in text and "Answer:" not in text:
+                text = text.replace("<|im_start|>assistant\n", "<|im_start|>assistant\nAnswer: ", 1)
             return text
 
         if isinstance(prompt, str):
             return apply_no_thinking_text(prompt)
+
+        if self.tokenizer is None:
+            return prompt
 
         prompt_text = self.tokenizer.decode(prompt, skip_special_tokens=False)
         primed_text = apply_no_thinking_text(prompt_text)

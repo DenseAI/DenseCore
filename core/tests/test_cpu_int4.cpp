@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "kernels/hwy/hwy_kernels.h"
+#include "simd_ops.h"
 using namespace densecore::hwy_kernels;
 
 namespace densecore {
@@ -89,6 +90,62 @@ void GemvInt4_Reference(float* output, const float* input, const uint8_t* weight
         }
 
         output[n] = sum;
+    }
+}
+
+void GemmInt4_Reference(float* output, const float* input, const uint8_t* weights, const float* scales,
+                        const float* zeros, int M, int K, int N, int group_size) {
+    const int num_full_groups = K / group_size;
+    const int remainder = K % group_size;
+    const int packed_K = (K + 1) / 2;
+    const int k_aligned = num_full_groups * group_size;
+
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+
+            for (int g = 0; g < num_full_groups; ++g) {
+                const float scale = scales[n * num_full_groups + g];
+                const float zero = zeros[n * num_full_groups + g];
+                const uint8_t* w_packed = weights + n * packed_K + g * (group_size / 2);
+                const int k_start = g * group_size;
+
+                for (int k = 0; k < group_size; ++k) {
+                    const int byte_idx = k / 2;
+                    const int nibble_idx = k % 2;
+                    uint8_t packed_byte = w_packed[byte_idx];
+
+                    int8_t q = (nibble_idx == 0) ? static_cast<int8_t>(packed_byte & 0x0F)
+                                                 : static_cast<int8_t>((packed_byte >> 4) & 0x0F);
+                    if (q & 0x08) {
+                        q |= static_cast<int8_t>(0xF0);
+                    }
+
+                    sum += input[m * K + k_start + k] * (scale * (static_cast<float>(q) - zero));
+                }
+            }
+
+            if (remainder > 0) {
+                const float scale = (num_full_groups > 0) ? scales[n * num_full_groups + num_full_groups - 1] : 1.0f;
+                const float zero = (num_full_groups > 0) ? zeros[n * num_full_groups + num_full_groups - 1] : 0.0f;
+
+                for (int k = k_aligned; k < K; ++k) {
+                    const int byte_idx = k / 2;
+                    const int nibble_idx = k % 2;
+                    uint8_t packed_byte = weights[n * packed_K + byte_idx];
+
+                    int8_t q = (nibble_idx == 0) ? static_cast<int8_t>(packed_byte & 0x0F)
+                                                 : static_cast<int8_t>((packed_byte >> 4) & 0x0F);
+                    if (q & 0x08) {
+                        q |= static_cast<int8_t>(0xF0);
+                    }
+
+                    sum += input[m * K + k] * (scale * (static_cast<float>(q) - zero));
+                }
+            }
+
+            output[m * N + n] = sum;
+        }
     }
 }
 
@@ -277,6 +334,69 @@ TEST_F(GemvInt4Test, PartialRowProcessing) {
         EXPECT_EQ(output_[n], -999.0f) << "Row " << n << " should not be modified";
     }
 }
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST_F(GemvInt4Test, ArmNeonGemvMatchesReference) {
+    const int K = 128;
+    const int N = 16;
+    const int group_size = 32;
+
+    GenerateTestData(K, N, group_size);
+
+    GemvInt4_Reference(reference_.data(), input_.data(), weights_.data(), scales_.data(), zeros_.data(), K, N,
+                       group_size, 0, N);
+
+    simd::GemmInt4Fp32_NEON(output_.data(), input_.data(), weights_.data(), scales_.data(), zeros_.data(), 1, N, K,
+                            group_size);
+
+    for (int n = 0; n < N; ++n) {
+        EXPECT_NEAR(output_[n], reference_[n], 1e-4f) << "Mismatch at output[" << n << "]";
+    }
+}
+
+TEST_F(GemvInt4Test, ArmNeonBatchedMatchesReference) {
+    const int M = 3;
+    const int K = 128;
+    const int N = 12;
+    const int group_size = 32;
+    const int num_groups = K / group_size;
+    const int packed_K = (K + 1) / 2;
+
+    std::vector<float> batched_input(M * K);
+    std::vector<uint8_t> batched_weights(N * packed_K);
+    std::vector<float> batched_scales(N * num_groups);
+    std::vector<float> batched_zeros(N * num_groups);
+    std::vector<float> batched_output(M * N, 0.0f);
+    std::vector<float> batched_reference(M * N, 0.0f);
+
+    for (float& v : batched_input) {
+        v = RandFloat(-1.0f, 1.0f);
+    }
+    for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; k += 2) {
+            const int8_t w0 = RandInt4();
+            const int8_t w1 = (k + 1 < K) ? RandInt4() : 0;
+            batched_weights[n * packed_K + k / 2] = PackInt4(w0, w1);
+        }
+    }
+    for (float& v : batched_scales) {
+        v = RandFloat(0.01f, 0.1f);
+    }
+    for (float& v : batched_zeros) {
+        v = RandFloat(-1.0f, 1.0f);
+    }
+
+    GemmInt4_Reference(batched_reference.data(), batched_input.data(), batched_weights.data(), batched_scales.data(),
+                       batched_zeros.data(), M, K, N, group_size);
+
+    simd::GemmInt4Fp32_NEON(batched_output.data(), batched_input.data(), batched_weights.data(), batched_scales.data(),
+                            batched_zeros.data(), M, N, K, group_size);
+
+    for (int i = 0; i < M * N; ++i) {
+        EXPECT_NEAR(batched_output[i], batched_reference[i], 1e-4f) << "Mismatch at index " << i;
+    }
+}
+#endif
 
 }  // namespace
 }  // namespace kernels

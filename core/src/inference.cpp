@@ -475,6 +475,22 @@ static int GetBatchedMinK() {
     return val;
 }
 
+static bool DisableArmNativeQ4KVecDot(ggml_type weight_type) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (weight_type != GGML_TYPE_Q4_K) {
+        return false;
+    }
+    const char* env = std::getenv("DENSECORE_ARM_ALLOW_Q4K_NATIVE_VECDOT");
+    if (!env || env[0] == '\0') {
+        return true;
+    }
+    return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
+#else
+    (void)weight_type;
+    return false;
+#endif
+}
+
 static bool ParseTruthyEnv(const char* name, bool default_value) {
     const char* env = std::getenv(name);
     if (!env || env[0] == '\0') {
@@ -854,7 +870,11 @@ static bool IsPortableCpuFlashAttentionEnabled() {
         if (mode == RuntimeToggleMode::Off) {
             return false;
         }
-        return densecore::simd::IsArmFamily(GetRuntimeSimdLevel());
+        // Auto mode: enable portable flash attention on all platforms.
+        // The prior ARM correctness issue was caused by K/V tensors not being
+        // registered in the GGML graph's src[] dependency chain, which meant
+        // their ggml_cont ops were never executed during graph compute.
+        return true;
     }();
     return enabled;
 }
@@ -2222,8 +2242,9 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     // ==========================================================================
     const size_t row_stride = weight_tensor->nb[1];  // Bytes per row
     const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight_type);
+    const bool disable_native_q4k_vecdot = DisableArmNativeQ4KVecDot(weight_type);
 
-    if (quant_input && type_traits_cpu && type_traits_cpu->vec_dot) {
+    if (quant_input && type_traits_cpu && type_traits_cpu->vec_dot && !disable_native_q4k_vecdot) {
         for (int k = k_start; k < k_end; k++) {
             const void* row_ptr = reinterpret_cast<const char*>(weight_data) + k * row_stride;
             type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
@@ -2671,7 +2692,8 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
     }
 
     const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight_type);
-    if (type_traits_cpu && type_traits_cpu->vec_dot) {
+    const bool disable_native_q4k_vecdot = DisableArmNativeQ4KVecDot(weight_type);
+    if (type_traits_cpu && type_traits_cpu->vec_dot && !disable_native_q4k_vecdot) {
         const ggml_type vec_dot_type =
             (ud->input_quant_type != GGML_TYPE_F32) ? ud->input_quant_type : type_traits_cpu->vec_dot_type;
         const auto* input_type_traits = ggml_get_type_traits_cpu(vec_dot_type);
@@ -4043,12 +4065,11 @@ inline struct ggml_tensor* ggml_mul_mat_hal(struct ggml_context* ctx, struct ggm
 }
 
 struct HalAttentionOpData {
-    struct ggml_tensor* k_tensor = nullptr;
-    struct ggml_tensor* v_tensor = nullptr;
     float scale = 1.0f;
     int n_head_kv = -1;
     uint8_t causal = 1;
     densecore::DeviceType preferred_device = densecore::DeviceType::CPU;
+    int layer = -1;
 };
 
 struct HalAttentionCustomParams {
@@ -4058,9 +4079,102 @@ struct HalAttentionCustomParams {
     HalAttentionOpData data;
 };
 
+static bool IsPortableFlashParityCheckEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_CHECK_PORTABLE_FLASH_ATTN");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static float PortableFlashParityTolerance() {
+    static const float tol = []() {
+        const char* env = std::getenv("DENSECORE_CHECK_PORTABLE_FLASH_ATTN_TOL");
+        if (!env || env[0] == '\0') {
+            return 1e-3f;
+        }
+        char* end = nullptr;
+        const float parsed = std::strtof(env, &end);
+        if (end == env || !std::isfinite(parsed) || parsed <= 0.0f) {
+            return 1e-3f;
+        }
+        return parsed;
+    }();
+    return tol;
+}
+
+static void ComputeFlashAttentionReference(const float* q, const float* k, const float* v, float* out, int n_head,
+                                           int n_head_kv, int seq_q, int seq_kv, int head_dim, float scale,
+                                           bool causal) {
+    if (!q || !k || !v || !out || n_head <= 0 || n_head_kv <= 0 || seq_q <= 0 || seq_kv <= 0 || head_dim <= 0) {
+        return;
+    }
+
+    const int n_rep = n_head / n_head_kv;
+    for (int h = 0; h < n_head; ++h) {
+        const int kv_head = h / n_rep;
+        const float* q_head = q + static_cast<size_t>(h) * seq_q * head_dim;
+        const float* k_head = k + static_cast<size_t>(kv_head) * seq_kv * head_dim;
+        const float* v_head = v + static_cast<size_t>(kv_head) * seq_kv * head_dim;
+        float* out_head = out + static_cast<size_t>(h) * seq_q * head_dim;
+
+        for (int tq = 0; tq < seq_q; ++tq) {
+            const float* q_row = q_head + static_cast<size_t>(tq) * head_dim;
+            float* out_row = out_head + static_cast<size_t>(tq) * head_dim;
+            std::fill(out_row, out_row + head_dim, 0.0f);
+
+            std::vector<float> scores(static_cast<size_t>(seq_kv), -INFINITY);
+            float row_max = -INFINITY;
+            for (int tk = 0; tk < seq_kv; ++tk) {
+                if (causal && tk > tq) {
+                    continue;
+                }
+                const float* k_row = k_head + static_cast<size_t>(tk) * head_dim;
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    score += q_row[d] * k_row[d];
+                }
+                score *= scale;
+                scores[static_cast<size_t>(tk)] = score;
+                row_max = std::max(row_max, score);
+            }
+
+            if (!std::isfinite(row_max)) {
+                continue;
+            }
+
+            float denom = 0.0f;
+            for (int tk = 0; tk < seq_kv; ++tk) {
+                float& score = scores[static_cast<size_t>(tk)];
+                if (!std::isfinite(score)) {
+                    score = 0.0f;
+                    continue;
+                }
+                score = std::exp(score - row_max);
+                denom += score;
+            }
+            if (!(denom > 0.0f) || !std::isfinite(denom)) {
+                continue;
+            }
+
+            const float inv_denom = 1.0f / denom;
+            for (int tk = 0; tk < seq_kv; ++tk) {
+                const float p = scores[static_cast<size_t>(tk)] * inv_denom;
+                if (!(p > 0.0f)) {
+                    continue;
+                }
+                const float* v_row = v_head + static_cast<size_t>(tk) * head_dim;
+                for (int d = 0; d < head_dim; ++d) {
+                    out_row[d] += p * v_row[d];
+                }
+            }
+        }
+    }
+}
+
 void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     (void)userdata;
-    if (ith != 0 || nth <= 0 || !dst || !dst->src[0]) {
+    if (ith != 0 || nth <= 0 || !dst || !dst->src[0] || !dst->src[1] || !dst->src[2]) {
         return;
     }
 
@@ -4070,8 +4184,8 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
     }
 
     const struct ggml_tensor* q = dst->src[0];
-    const struct ggml_tensor* k = params->data.k_tensor;
-    const struct ggml_tensor* v = params->data.v_tensor;
+    const struct ggml_tensor* k = dst->src[1];
+    const struct ggml_tensor* v = dst->src[2];
     if (!q || !k || !v || !q->data || !k->data || !v->data || !dst->data) {
         return;
     }
@@ -4135,22 +4249,55 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
             cpu->FlashAttention(Q, K, V, &O, params->data.scale, params->data.causal != 0, n_head_kv);
         }
     }
+
+    if (IsPortableFlashParityCheckEnabled()) {
+        static std::atomic<int> parity_budget{0};
+        const int run_idx = parity_budget.fetch_add(1, std::memory_order_relaxed);
+        if (run_idx < 8) {
+            std::vector<float> ref(static_cast<size_t>(n_head) * seq_q * head_dim, 0.0f);
+            ComputeFlashAttentionReference(reinterpret_cast<const float*>(q->data), reinterpret_cast<const float*>(k->data),
+                                           reinterpret_cast<const float*>(v->data), ref.data(), n_head, n_head_kv, seq_q,
+                                           seq_kv, head_dim, params->data.scale, params->data.causal != 0);
+
+            const float* got = reinterpret_cast<const float*>(dst->data);
+            float max_abs = 0.0f;
+            int max_idx = -1;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                const float diff = std::fabs(got[i] - ref[i]);
+                if (diff > max_abs) {
+                    max_abs = diff;
+                    max_idx = static_cast<int>(i);
+                }
+            }
+            if (max_abs > PortableFlashParityTolerance()) {
+                const float got_val = (max_idx >= 0) ? got[max_idx] : 0.0f;
+                const float ref_val = (max_idx >= 0) ? ref[static_cast<size_t>(max_idx)] : 0.0f;
+                fprintf(stderr,
+                        "[PortableFlashParity] FAIL layer=%d seq_q=%d seq_kv=%d n_head=%d n_head_kv=%d head_dim=%d "
+                        "max_abs=%.6f idx=%d got=%.6f ref=%.6f\n",
+                        params->data.layer, seq_q, seq_kv, n_head, n_head_kv, head_dim, max_abs, max_idx, got_val,
+                        ref_val);
+            }
+        }
+    }
 }
 
 inline struct ggml_tensor* ggml_flash_attention_hal(struct ggml_context* ctx, struct ggml_tensor* Q,
                                                     struct ggml_tensor* K, struct ggml_tensor* V, float scale,
-                                                    bool causal, int n_head_kv,
+                                                    bool causal, int n_head_kv, int layer,
                                                     densecore::DeviceType preferred_device) {
     const int64_t ne_res[4] = {Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3]};
     struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_res);
     result->op = GGML_OP_CUSTOM;
     result->src[0] = Q;
+    result->src[1] = K;
+    result->src[2] = V;
 
     HalAttentionCustomParams params = {
         cb_flash_attention_hal_custom,
         1,
         nullptr,
-        {K, V, scale, n_head_kv, static_cast<uint8_t>(causal ? 1 : 0), preferred_device}};
+        {scale, n_head_kv, static_cast<uint8_t>(causal ? 1 : 0), preferred_device, layer}};
     static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "params too large");
     std::memcpy(result->op_params, &params, sizeof(params));
     return result;
@@ -4193,11 +4340,20 @@ void cb_matmul_int4_custom(struct ggml_tensor* dst, int ith, int nth, void* user
         input->nb[0] == sizeof(float) && input->nb[1] == static_cast<size_t>(ud.K) * sizeof(float);
     const bool output_contig = dst->nb[0] == sizeof(float) && dst->nb[1] == static_cast<size_t>(ud.N) * sizeof(float);
     const bool single_threading_layer = IsInt4SingleThreadingLayerEnabled();
+#if defined(DENSECORE_ARM_CORRECTNESS_FIRST) && (defined(__aarch64__) || defined(_M_ARM64))
+    const bool force_correctness_first_backend = true;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    // Keep ARM INT4 matmul on the DenseCore backend path so we exercise the
+    // NEON/SVE kernels instead of the Highway direct callback fast path.
+    const bool force_correctness_first_backend = true;
+#else
+    const bool force_correctness_first_backend = false;
+#endif
 
     // Legacy escape hatch: keep DenseCore backend threadpool path for
     // platform-specific tuning. This path is intentionally serialized at GGML
     // level to avoid nested parallelism.
-    if (!single_threading_layer) {
+    if (force_correctness_first_backend || !single_threading_layer) {
         if (ith != 0) return;
 
         static thread_local std::vector<float> legacy_contig_input;
@@ -6392,7 +6548,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     // For decode (N==1), causal=false is correct because K already contains
                     // only historical + current keys (no future positions).
                     const bool hal_causal = (N > 1);
-                    KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv,
+                    KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv, il,
                                                    preferred_attention_device);
 
                     // Convert [head_dim, N, n_head] -> [head_dim, n_head, N]
@@ -6413,7 +6569,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
 
                     const float scale = 1.0f / sqrtf((float)head_dim_q);
                     const bool hal_causal = (N > 1);
-                    KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv,
+                    KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv, il,
                                                    densecore::DeviceType::CPU);
 
                     // Convert [head_dim, N, n_head] -> [head_dim, n_head, N]
