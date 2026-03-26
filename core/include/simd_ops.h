@@ -2858,51 +2858,51 @@ inline void GemmInt4Fp32_NEON(float* C, const float* A, const uint8_t* W_int4, c
                     float32x4_t a1 = vld1q_f32(a_ptr + k + 4);
 
 // Macro to process one weight row for NEON
-#define NEON_PROCESS_ROW(idx, acc_a, acc_b)                                                 \
-    do {                                                                                    \
-        const int row = n + (idx);                                                          \
-        const float scale = scales[row * num_groups + g];                                   \
-        const float zero = zero_points[row * num_groups + g];                               \
-        const float32x4_t vscale = vdupq_n_f32(scale);                                      \
-        const float32x4_t vzero = vdupq_n_f32(zero);                                        \
-                                                                                            \
-        const uint8_t* w_ptr = W_int4 + row * packed_K + packed_g_offset + k / 2;           \
-        __builtin_prefetch(w_ptr + 32, 0, 3);                                               \
-                                                                                            \
+#define NEON_PROCESS_ROW(idx, acc_a, acc_b)                                                  \
+    do {                                                                                     \
+        const int row = n + (idx);                                                           \
+        const float scale = scales[row * num_groups + g];                                    \
+        const float zero = zero_points[row * num_groups + g];                                \
+        const float32x4_t vscale = vdupq_n_f32(scale);                                       \
+        const float32x4_t vzero = vdupq_n_f32(zero);                                         \
+                                                                                             \
+        const uint8_t* w_ptr = W_int4 + row * packed_K + packed_g_offset + k / 2;            \
+        __builtin_prefetch(w_ptr + 32, 0, 3);                                                \
+                                                                                             \
         /* Load exactly 4 bytes = 8 packed INT4 weights.                                   \
-         * vld1_u8() would read 8 bytes and can overrun the final group tail on ARM. */     \
-        uint8_t packed_tmp[8] = {};                                                         \
-        std::memcpy(packed_tmp, w_ptr, sizeof(uint32_t));                                   \
-        uint8x8_t packed_u8 = vld1_u8(packed_tmp);                                          \
-        /* Widen u8 → u16 */                                                              \
-        uint16x8_t packed_u16 = vmovl_u8(packed_u8);                                        \
-        /* Extract low nibbles (even positions) */                                          \
-        uint16x8_t lo_u16 = vandq_u16(packed_u16, vdupq_n_u16(0x0F));                       \
-        /* Extract high nibbles (odd positions) */                                          \
-        uint16x8_t hi_u16 = vshrq_n_u16(packed_u16, 4);                                     \
-        hi_u16 = vandq_u16(hi_u16, vdupq_n_u16(0x0F));                                      \
-                                                                                            \
-        /* Sign extension via shift trick (16-bit): shl 12, asr 12 */                       \
-        int16x8_t lo_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(lo_u16), 12), 12); \
-        int16x8_t hi_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(hi_u16), 12), 12); \
-                                                                                            \
-        /* Interleave low and high: [lo0,hi0,lo1,hi1,...] for the 4 loaded bytes. */        \
-        int16x8_t interleaved_lo = vzip1q_s16(lo_s16, hi_s16);                              \
-                                                                                            \
-        /* Convert first 4 elements to FP32 */                                              \
-        int32x4_t w32_0 = vmovl_s16(vget_low_s16(interleaved_lo));                          \
-        float32x4_t wf0 = vcvtq_f32_s32(w32_0);                                             \
-        /* Convert next 4 elements to FP32 */                                               \
-        int32x4_t w32_1 = vmovl_s16(vget_high_s16(interleaved_lo));                         \
-        float32x4_t wf1 = vcvtq_f32_s32(w32_1);                                             \
-                                                                                            \
-        /* Dequantize: w_dequant = scale * (q - zero) */                                    \
-        wf0 = vmulq_f32(vscale, vsubq_f32(wf0, vzero));                                     \
-        wf1 = vmulq_f32(vscale, vsubq_f32(wf1, vzero));                                     \
-                                                                                            \
-        /* FMA: acc += a * w */                                                             \
-        acc_a = vfmaq_f32(acc_a, a0, wf0);                                                  \
-        acc_b = vfmaq_f32(acc_b, a1, wf1);                                                  \
+         * vld1_u8() would read 8 bytes and can overrun the final group tail on ARM. */ \
+        uint8_t packed_tmp[8] = {};                                                          \
+        std::memcpy(packed_tmp, w_ptr, sizeof(uint32_t));                                    \
+        uint8x8_t packed_u8 = vld1_u8(packed_tmp);                                           \
+        /* Widen u8 → u16 */                                                               \
+        uint16x8_t packed_u16 = vmovl_u8(packed_u8);                                         \
+        /* Extract low nibbles (even positions) */                                           \
+        uint16x8_t lo_u16 = vandq_u16(packed_u16, vdupq_n_u16(0x0F));                        \
+        /* Extract high nibbles (odd positions) */                                           \
+        uint16x8_t hi_u16 = vshrq_n_u16(packed_u16, 4);                                      \
+        hi_u16 = vandq_u16(hi_u16, vdupq_n_u16(0x0F));                                       \
+                                                                                             \
+        /* Sign extension via shift trick (16-bit): shl 12, asr 12 */                        \
+        int16x8_t lo_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(lo_u16), 12), 12);  \
+        int16x8_t hi_s16 = vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(hi_u16), 12), 12);  \
+                                                                                             \
+        /* Interleave low and high: [lo0,hi0,lo1,hi1,...] for the 4 loaded bytes. */         \
+        int16x8_t interleaved_lo = vzip1q_s16(lo_s16, hi_s16);                               \
+                                                                                             \
+        /* Convert first 4 elements to FP32 */                                               \
+        int32x4_t w32_0 = vmovl_s16(vget_low_s16(interleaved_lo));                           \
+        float32x4_t wf0 = vcvtq_f32_s32(w32_0);                                              \
+        /* Convert next 4 elements to FP32 */                                                \
+        int32x4_t w32_1 = vmovl_s16(vget_high_s16(interleaved_lo));                          \
+        float32x4_t wf1 = vcvtq_f32_s32(w32_1);                                              \
+                                                                                             \
+        /* Dequantize: w_dequant = scale * (q - zero) */                                     \
+        wf0 = vmulq_f32(vscale, vsubq_f32(wf0, vzero));                                      \
+        wf1 = vmulq_f32(vscale, vsubq_f32(wf1, vzero));                                      \
+                                                                                             \
+        /* FMA: acc += a * w */                                                              \
+        acc_a = vfmaq_f32(acc_a, a0, wf0);                                                   \
+        acc_b = vfmaq_f32(acc_b, a1, wf1);                                                   \
     } while (0)
 
                     NEON_PROCESS_ROW(0, acc0, acc0b);

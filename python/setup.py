@@ -267,7 +267,15 @@ class CustomSdist(sdist):
 
     @staticmethod
     def _sanitize_bundled_core_tree(dest_dir: Path) -> None:
-        removable_dirs = {"_deps", "CMakeFiles", "Testing", "build", "lib", "bin", "cmake-build-debug"}
+        removable_dirs = {
+            "_deps",
+            "CMakeFiles",
+            "Testing",
+            "build",
+            "lib",
+            "bin",
+            "cmake-build-debug",
+        }
         removable_files = {
             "CMakeCache.txt",
             "CTestTestfile.cmake",

@@ -2771,7 +2771,8 @@ void EngineLoop(EngineState* state) {
                         // This enables O(1) lookup for requests with identical prompt prefixes.
                         // Multi-stage collision verification ensures correctness.
                         // =======================================================================
-                        if (prefix_cache_allowed && !req->prompt_tokens_for_cache.empty() && !req->block_table.empty()) {
+                        if (prefix_cache_allowed && !req->prompt_tokens_for_cache.empty() &&
+                            !req->block_table.empty()) {
                             const int* tokens_ptr = req->prompt_tokens_for_cache.data();
                             int total_tokens = static_cast<int>(req->prompt_tokens_for_cache.size());
 
@@ -2787,7 +2788,6 @@ void EngineLoop(EngineState* state) {
                                 current_kv_cache->block_manager->RegisterPrefixBlockWithTokens(
                                     block_id, hash, tokens_ptr + start_token, block_tokens);
                             }
-
                         }
                         // Clear after registration, or after skipping cache registration for hybrid SSM.
                         req->prompt_tokens_for_cache.clear();

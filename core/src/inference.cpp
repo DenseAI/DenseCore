@@ -4255,9 +4255,10 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
         const int run_idx = parity_budget.fetch_add(1, std::memory_order_relaxed);
         if (run_idx < 8) {
             std::vector<float> ref(static_cast<size_t>(n_head) * seq_q * head_dim, 0.0f);
-            ComputeFlashAttentionReference(reinterpret_cast<const float*>(q->data), reinterpret_cast<const float*>(k->data),
-                                           reinterpret_cast<const float*>(v->data), ref.data(), n_head, n_head_kv, seq_q,
-                                           seq_kv, head_dim, params->data.scale, params->data.causal != 0);
+            ComputeFlashAttentionReference(reinterpret_cast<const float*>(q->data),
+                                           reinterpret_cast<const float*>(k->data),
+                                           reinterpret_cast<const float*>(v->data), ref.data(), n_head, n_head_kv,
+                                           seq_q, seq_kv, head_dim, params->data.scale, params->data.causal != 0);
 
             const float* got = reinterpret_cast<const float*>(dst->data);
             float max_abs = 0.0f;
