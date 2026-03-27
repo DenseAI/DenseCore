@@ -11,6 +11,7 @@
 #include "kernels/hwy/hwy_kernels.h"
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 HWY_BEFORE_NAMESPACE();
@@ -71,7 +72,11 @@ void InvariantPointAttentionImpl(const float* s_data, const float* pair_data, co
     // global_k_pts: Q * 3
     // attn_scores: L
     size_t required_bytes = (2 * Q * 3 + L) * sizeof(float);
-    if (workspace_size < required_bytes) return;
+    if (workspace_size < required_bytes) {
+        fprintf(stderr, "[InvariantPointAttention] workspace too small: need %zu B, got %zu B\n",
+                required_bytes, workspace_size);
+        return;
+    }
 
     float* ws_ptr = reinterpret_cast<float*>(workspace);
     float* global_q_pts = ws_ptr;

@@ -986,6 +986,20 @@ void CpuBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
     const float* zeros_data = zero_points.DataAs<float>();
     float* c_data = C->DataAs<float>();
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // ARM correctness issue narrowed to the Highway INT4 path. Route through
+    // the runtime-selected DenseCore kernel (NEON/SVE) until Highway INT4 on
+    // ARM is verified against the same reference path.
+    if (!OpsRegistry::IsInitialized()) {
+        OpsRegistry::Init();
+    }
+    auto& reg = OpsRegistry::Instance();
+    if (reg.GemmInt4) {
+        reg.GemmInt4(c_data, a_data, w_data, scales_data, zeros_data, M, N, K, group_size);
+        return;
+    }
+#endif
+
     // ===========================================================================
     // DECODE OPTIMIZATION: Use GEMV kernel for M=1 (token generation)
     // ===========================================================================
@@ -1480,6 +1494,8 @@ void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& 
     }
 
     // Expected layout: [batch, n_head, seq, head_dim]
+    // Decode fast path also accepts native GGML-style strides where dim is
+    // contiguous but the seq axis is strided by the number of heads.
     const int batch = static_cast<int>(Q.shape[0]);
     const int n_head = static_cast<int>(Q.shape[1]);
     const int seq_q = static_cast<int>(Q.shape[2]);
@@ -1506,6 +1522,11 @@ void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& 
     const float* v_data = V.DataAs<float>();
     float* o_data = output->DataAs<float>();
 
+    if (static_cast<int>(K.shape[3]) != head_dim || static_cast<int>(V.shape[3]) != head_dim ||
+        static_cast<int>(output->shape[3]) != head_dim) {
+        return;
+    }
+
     FlashAttentionConfig config;
     config.scale = scale;
     config.causal = causal;
@@ -1513,10 +1534,43 @@ void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& 
     auto& pool = GetThreadPool(numa_node_id);
     config.num_threads = std::max(1, pool.GetNumThreads());
 
+    const bool decode_native_strided_layout = seq_q == 1 && Q.stride[3] == 1 && K.stride[3] == 1 && V.stride[3] == 1 &&
+                                              output->stride[3] == 1 &&
+                                              (Q.stride[2] != head_dim || K.stride[2] != head_dim ||
+                                               V.stride[2] != head_dim || output->stride[2] != head_dim);
+
+    auto run_decode_native_strided = [&](int start, int end) {
+        static thread_local FlashAttentionScratch tl_scratch;
+        const int n_rep = n_head / n_head_kv;
+        for (int work_idx = start; work_idx < end; ++work_idx) {
+            const int b = work_idx / n_head;
+            const int h = work_idx % n_head;
+            const int h_kv = h / n_rep;
+
+            const float* q_ptr = q_data + b * Q.stride[0] + h * Q.stride[1];
+            const float* k_ptr = k_data + b * K.stride[0] + h_kv * K.stride[1];
+            const float* v_ptr = v_data + b * V.stride[0] + h_kv * V.stride[1];
+            float* o_ptr = o_data + b * output->stride[0] + h * output->stride[1];
+
+            FlashAttentionSingleQueryStridedKV(q_ptr, k_ptr, K.stride[2], v_ptr, V.stride[2], o_ptr, seq_kv, head_dim,
+                                               config, tl_scratch);
+        }
+    };
+
     // Route both explicit NUMA dispatch and the default backend path through
     // the backend thread pool. The previous default path delegated directly to
     // FlashAttentionGQA(..., nth=1), which left attention effectively single-threaded.
     const int total_work = batch * n_head;
+    if (decode_native_strided_layout) {
+        if (config.num_threads <= 1 || total_work <= 1) {
+            run_decode_native_strided(0, total_work);
+        } else {
+            pool.ParallelFor(total_work,
+                             [&](int start, int end, int /*tid*/) { run_decode_native_strided(start, end); });
+        }
+        return;
+    }
+
     if (config.num_threads <= 1 || total_work <= 1) {
         FlashAttentionGQA(q_data, k_data, v_data, o_data, batch, n_head, n_head_kv, seq_q, seq_kv, head_dim, config);
         return;

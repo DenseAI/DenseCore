@@ -157,10 +157,10 @@ output = model.generate("Hello", max_tokens=100)
 
 ## Links
 
-- [GitHub Repository](https://github.com/Jake-Network/DenseCore)
-- [Documentation](https://github.com/Jake-Network/DenseCore/tree/main/docs)
+- [GitHub Repository](https://github.com/DenseCore/DenseCore)
+- [Documentation](https://github.com/DenseCore/DenseCore/tree/main/docs)
 - [PyPI Package](https://pypi.org/project/densecore/)
-- [Docker Images](https://ghcr.io/jake-network/densecore)
+- [Docker Images](https://ghcr.io/densecore/densecore)
 
 ---
 

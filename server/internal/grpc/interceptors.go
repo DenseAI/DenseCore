@@ -10,7 +10,7 @@ import (
 
 	"descore-server/internal/middleware"
 
-	cloudtelemetry "github.com/DenseCore/DenseCloud/go/telemetry"
+	cloudtelemetry "github.com/DenseAI/DenseCloud/go/telemetry"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"

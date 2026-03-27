@@ -221,6 +221,9 @@ struct Request {
     std::vector<int> token_history;
     std::vector<int> prompt_tokens_for_cache;  // Original prompt tokens for prefix cache registration
     std::string utf8_pending;
+    std::string think_tag_pending;
+    std::string tool_call_tag_pending;
+    std::string tool_response_tag_pending;
     bool in_think_block = false;
     bool in_tool_call_block = false;
     bool in_tool_response_block = false;
@@ -295,6 +298,9 @@ struct Request {
         token_history.clear();
         prompt_tokens_for_cache.clear();
         utf8_pending.clear();
+        think_tag_pending.clear();
+        tool_call_tag_pending.clear();
+        tool_response_tag_pending.clear();
         in_think_block = false;
         in_tool_call_block = false;
         in_tool_response_block = false;

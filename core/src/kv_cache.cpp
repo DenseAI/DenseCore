@@ -13,7 +13,6 @@
 #endif
 
 #include "block_allocator.h"
-#include "densecore/license_guard.h"
 #include "numa_allocator.h"
 #include "simd_ops.h"
 
@@ -59,11 +58,6 @@ std::vector<int> BlockManager::Allocate(int n) {
     if (n == 1) {
         int id = AllocateSingle();
         if (id >= 0) return {id};
-        return {};
-    }
-
-    // OSS-safe: if enterprise plugin is not loaded, guard returns allow.
-    if (!DenseCoreEntLicenseGuardAllow()) {
         return {};
     }
 
@@ -120,11 +114,6 @@ std::vector<int> BlockManager::Allocate(int n) {
 }
 
 int BlockManager::AllocateSingle() {
-    // OSS-safe: if enterprise plugin is not loaded, guard returns allow.
-    if (!DenseCoreEntLicenseGuardAllow()) {
-        return -1;
-    }
-
     // [P3 fix] Round-robin shard selection via atomic counter.
     // rand() is not thread-safe (global state, data race under TSAN).
     // An atomic counter gives uniform distribution without the race.

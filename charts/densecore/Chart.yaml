@@ -5,10 +5,10 @@ description: Cloud-native inference runtime (LLM-compatible by default, extensib
 type: application
 
 # Chart version - incremented on chart changes
-version: 0.3.1
+version: 1.0.0
 
 # Application version - should match the DenseCore release
-appVersion: "0.3.1"
+appVersion: "1.0.0"
 
 dependencies:
   - name: dense-base
@@ -25,22 +25,22 @@ keywords:
   - openai
   - machine-learning
 
-home: https://github.com/Jake-Network/DenseCore
+home: https://github.com/DenseCore/DenseCore
 
 sources:
-  - https://github.com/Jake-Network/DenseCore
+  - https://github.com/DenseCore/DenseCore
 
 maintainers:
   - name: DenseCore Team
     email: maintainers@densecore.dev
 
-icon: https://raw.githubusercontent.com/Jake-Network/DenseCore/main/docs/images/logo.png
+icon: https://raw.githubusercontent.com/DenseCore/DenseCore/main/docs/images/logo.png
 
 annotations:
   category: AI/ML
   artifacthub.io/license: Apache-2.0
   artifacthub.io/links: |
     - name: Documentation
-      url: https://github.com/Jake-Network/DenseCore/tree/main/docs
+      url: https://github.com/DenseCore/DenseCore/tree/main/docs
     - name: Docker Hub
       url: https://hub.docker.com/r/densecore/densecore

@@ -37,25 +37,23 @@ COPY core/cmake/ core/cmake/
 COPY core/include/ core/include/
 
 # Create stub sources to satisfy CMake (will be replaced later)
-RUN mkdir -p core/src core/src/quantization core/src/pruning core/src/kernels core/tests && \
-    for f in engine worker inference model_types model_loader tokenizer kv_cache \
-    optimization_bridge save_model quantizer pruner quantize version tensor_utils \
-    scheduler embedding simd_ops cpu_backend cpu_backend_opt backend_registry \
-    kernel_context async_cpu_backend; do \
-    echo "" > core/src/${f}.cpp; \
-    done && \
-    for f in cpu_int4 cpu_amx; do \
-    echo "" > core/src/kernels/${f}.cpp; \
-    done && \
-    for f in max_quantizer awq_quantizer smoothquant_quantizer int4_quantizer; do \
-    echo "" > core/src/quantization/${f}.cpp; \
-    done && \
-    for f in depth_pruner width_pruner attention_pruner combined_pruner; do \
-    echo "" > core/src/pruning/${f}.cpp; \
-    done && \
-    for f in test_simd_ops test_memory_pool test_kv_cache test_aligned_allocator \
-    test_async_backend test_cpu_int4 test_kernel_context test_tensor_view; do \
-    echo "" > core/tests/${f}.cpp; \
+# Keep this derived from CMakeLists.txt so new source files do not break the ggml cache layer.
+RUN mkdir -p core/src core/tests && \
+    { \
+        awk '/^set\(SOURCES$/ { in_sources=1; next } \
+             in_sources && /^\)/ { in_sources=0; next } \
+             /^[[:space:]]*set\(TEST_SOURCES$/ { in_tests=1; next } \
+             in_tests && /^[[:space:]]*\)/ { in_tests=0; next } \
+             in_sources || in_tests { print $1 }' core/CMakeLists.txt; \
+        printf '%s\n' src/quantize.cpp; \
+    } | \
+    sed -e 's/#.*$//' \
+        -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]]*$//' \
+        -e 's#^\\${CMAKE_CURRENT_SOURCE_DIR}/##' | \
+    grep -E '^(src/|tests/)' | \
+    while read -r path; do \
+        mkdir -p "core/$(dirname "$path")" && : > "core/$path"; \
     done
 
 # Pre-build ggml (this is the slow part - now cached)
@@ -66,7 +64,7 @@ ARG TARGETARCH
 ARG DENSEVLA_ARM_TARGET=generic
 RUN mkdir -p build && cd build && \
     if [ "$TARGETARCH" = "arm64" ]; then \
-    EXTRA_FLAGS="-DCMAKE_TOOLCHAIN_FILE=../core/cmake/aarch64-toolchain.cmake -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DDENSEVLA_ARM_TARGET=${DENSEVLA_ARM_TARGET}"; \
+    EXTRA_FLAGS="-DCMAKE_TOOLCHAIN_FILE=../core/cmake/aarch64-toolchain.cmake -DDENSEVLA_ARM_TARGET=${DENSEVLA_ARM_TARGET}"; \
     else \
     EXTRA_FLAGS=""; \
     fi && \

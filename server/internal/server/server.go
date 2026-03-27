@@ -13,16 +13,16 @@ import (
 	"strings"
 	"time"
 
-	cloudmw "github.com/DenseCore/DenseCloud/go/middleware"
-	cloudserver "github.com/DenseCore/DenseCloud/go/server"
-	"github.com/DenseCore/DenseCloud/go/telemetry"
+	cloudmw "github.com/DenseAI/DenseCloud/go/middleware"
+	cloudserver "github.com/DenseAI/DenseCloud/go/server"
+	"github.com/DenseAI/DenseCloud/go/telemetry"
 
 	"descore-server/internal/api"
 	"descore-server/internal/buildinfo"
 	"descore-server/internal/config"
 	"descore-server/internal/domain"
 	"descore-server/internal/engine"
-	"descore-server/internal/enterprise"
+	"descore-server/internal/extensions"
 	densecoregrpc "descore-server/internal/grpc"
 	"descore-server/internal/middleware"
 	"descore-server/internal/queue"
@@ -41,8 +41,8 @@ const (
 `
 	// envTrue is the expected value for boolean environment variables
 	envTrue = "true"
-	// defaultEnterpriseMetricsPath is used when DENSECORE_ENT_METRICS_PATH is unset.
-	defaultEnterpriseMetricsPath = "/metrics/enterprise"
+	// defaultMetricsPath is used when DENSECORE_ENT_METRICS_PATH is unset.
+	defaultMetricsPath = "/metrics/enterprise"
 	// startupRollbackTimeout bounds rollback cleanup on startup failures.
 	startupRollbackTimeout = 30 * time.Second
 )
@@ -202,17 +202,17 @@ func Run(opts *Options) error {
 		return err
 	}
 
-	entRuntime, err := enterprise.NewRuntime(slog.Default())
+	runtimeExt, err := extensions.NewRuntime(slog.Default())
 	if err != nil {
-		return fmt.Errorf("failed to initialize enterprise runtime: %w", err)
+		return fmt.Errorf("failed to initialize runtime extensions: %w", err)
 	}
-	if err := validateEnterpriseMetricsPathConflict(cfg.MetricsEnabled, cfg.MetricsPath, entRuntime.Enabled()); err != nil {
+	if err := validateMetricsPathConflict(cfg.MetricsEnabled, cfg.MetricsPath, runtimeExt.Enabled()); err != nil {
 		return err
 	}
-	if err := entRuntime.Startup(context.Background()); err != nil {
-		return fmt.Errorf("enterprise runtime startup failed: %w", err)
+	if err := runtimeExt.Startup(context.Background()); err != nil {
+		return fmt.Errorf("runtime extensions startup failed: %w", err)
 	}
-	registerStartupRollback("enterprise runtime", entRuntime.Shutdown)
+	registerStartupRollback("runtime extensions", runtimeExt.Shutdown)
 	extensions := cloudserver.RuntimeExtensions()
 	for _, ext := range extensions {
 		extension := ext
@@ -403,7 +403,7 @@ func Run(opts *Options) error {
 	if authEnabled {
 		apiMiddleware = append(apiMiddleware, middleware.APIKeyAuth(apiKeyStore))
 	}
-	apiMiddleware = append(apiMiddleware, entRuntime.APIMiddleware()...)
+	apiMiddleware = append(apiMiddleware, runtimeExt.APIMiddleware()...)
 	for _, ext := range extensions {
 		apiMiddleware = append(apiMiddleware, ext.APIMiddleware()...)
 	}
@@ -435,7 +435,7 @@ func Run(opts *Options) error {
 		apiMux.HandleFunc("/models/load", handler.LoadModelHandler)
 		apiMux.HandleFunc("/models/unload", handler.UnloadModelHandler)
 	}
-	entRuntime.RegisterRoutes(rootMux, apiMux)
+	runtimeExt.RegisterRoutes(rootMux, apiMux)
 	for _, ext := range extensions {
 		ext.RegisterRoutes(rootMux, apiMux)
 	}
@@ -520,7 +520,7 @@ func Run(opts *Options) error {
 		})
 	}
 	shutdownHooks = append(shutdownHooks, func(ctx context.Context) error {
-		return entRuntime.Shutdown(ctx)
+		return runtimeExt.Shutdown(ctx)
 	})
 	for _, ext := range extensions {
 		extension := ext
@@ -596,14 +596,14 @@ func runStartupRollbackHooks(hooks []cloudserver.ShutdownHook) {
 	}
 }
 
-func validateEnterpriseMetricsPathConflict(coreMetricsEnabled bool, coreMetricsPath string, enterpriseEnabled bool) error {
-	if !coreMetricsEnabled || !enterpriseEnabled {
+func validateMetricsPathConflict(coreMetricsEnabled bool, coreMetricsPath string, runtimeEnabled bool) error {
+	if !coreMetricsEnabled || !runtimeEnabled {
 		return nil
 	}
 
 	entMetricsPath := strings.TrimSpace(os.Getenv("DENSECORE_ENT_METRICS_PATH"))
 	if entMetricsPath == "" {
-		entMetricsPath = defaultEnterpriseMetricsPath
+		entMetricsPath = defaultMetricsPath
 	}
 	coreMetricsPath = strings.TrimSpace(coreMetricsPath)
 	if entMetricsPath == coreMetricsPath {

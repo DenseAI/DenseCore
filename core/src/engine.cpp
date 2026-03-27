@@ -38,6 +38,12 @@ static void ConfigureHybridScheduler(EngineState* state, TransformerModel* model
         return;
     }
 
+#ifdef DENSECORE_TEST_BUILD
+    if (model && model->is_mock) {
+        return;
+    }
+#endif
+
     state->hybrid_enabled = true;
     state->hybrid_scheduler = std::make_unique<densecore::HybridScheduler>();
     state->hybrid_scheduler->SetCpuBackend(&densecore::GetCpuBackend());
@@ -506,17 +512,17 @@ void MaybePrimeQwenNoThinking(const TransformerModel* model, std::vector<int>* t
     if (!model || !tokens || !ShouldPrimeQwenNoThinking(model)) {
         return;
     }
-    const std::vector<int> suffix =
-        Tokenizer::Tokenize(model, "<think>\n\n</think>\n\n", /*add_bos=*/false, /*add_eos=*/false);
-    if (suffix.empty() || tokens->size() >= suffix.size()) {
-        bool already_primed = !suffix.empty();
-        if (already_primed) {
-            const size_t start = tokens->size() - suffix.size();
-            for (size_t i = 0; i < suffix.size(); ++i) {
-                if ((*tokens)[start + i] != suffix[i]) {
-                    already_primed = false;
-                    break;
-                }
+    const std::vector<int> suffix = Tokenizer::Tokenize(model, "Answer: ", /*add_bos=*/false, /*add_eos=*/false);
+    if (suffix.empty()) {
+        return;
+    }
+    if (tokens->size() >= suffix.size()) {
+        bool already_primed = true;
+        const size_t start = tokens->size() - suffix.size();
+        for (size_t i = 0; i < suffix.size(); ++i) {
+            if ((*tokens)[start + i] != suffix[i]) {
+                already_primed = false;
+                break;
             }
         }
         if (already_primed) {
@@ -597,15 +603,18 @@ std::string MaybeApplyAutoChatTemplate(const TransformerModel* model, const std:
                                                  : true;
         std::string wrapped;
         wrapped.reserve(prompt.size() + 192);
-        wrapped += "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n";
+        wrapped += "<|im_start|>system\nYou are a helpful assistant.";
+        if ((model->arch == ModelArch::QWEN3 || model->arch == ModelArch::QWEN35) && !qwen_enable_thinking) {
+            wrapped += "\nProvide only the answer. Do not output any thinking process, analysis, reasoning steps, "
+                       "or preamble. Never start with 'Thinking Process'.";
+        }
+        wrapped += "<|im_end|>\n";
         wrapped += "<|im_start|>user\n";
         wrapped += prompt;
         wrapped += "<|im_end|>\n";
         wrapped += "<|im_start|>assistant\n";
         if ((model->arch == ModelArch::QWEN3 || model->arch == ModelArch::QWEN35) && !qwen_enable_thinking) {
-            // Qwen chat templates support a no-thinking mode by priming an
-            // empty think block before the final response.
-            wrapped += "<think>\n\n</think>\n\n";
+            wrapped += "Answer: ";
         }
         return wrapped;
     }
@@ -980,6 +989,24 @@ int GetMaxContextTokens(DenseCoreHandle handle) {
     return DENSECORE_STATUS_MODEL_LOAD_FAILED;
 }
 
+int CountTokens(DenseCoreHandle handle, const char* text, int add_bos, int add_eos) {
+    if (!handle || !text) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "CountTokens: invalid arguments");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+    EngineState* state = (EngineState*)handle;
+
+    ModelEntry* entry = state->GetDefaultModel();
+    if (entry && entry->model) {
+        const std::vector<int> tokens = Tokenizer::Tokenize(entry->model.get(), text, add_bos != 0, add_eos != 0);
+        ClearError();
+        return static_cast<int>(tokens.size());
+    }
+
+    SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "CountTokens: no model loaded");
+    return DENSECORE_STATUS_MODEL_LOAD_FAILED;
+}
+
 /**
  * @brief Initialize engine with default NUMA settings (simplified API)
  *
@@ -1093,9 +1120,12 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
         // Log Flash Attention status based on CPU capabilities
         densecore::simd::SimdLevel simd_level = densecore::simd::DetectSimdLevel();
         if (densecore::simd::HasX86Avx512OrBetter(simd_level)) {
-            LOG_INFO("Flash Attention Enabled ({} detected)", densecore::simd::SimdLevelName(simd_level));
+            LOG_INFO("Native x86 Flash Attention Enabled ({} detected)", densecore::simd::SimdLevelName(simd_level));
+        } else if (densecore::simd::IsArmFamily(simd_level)) {
+            LOG_INFO("Native x86 Flash Attention Unavailable on {}; portable CPU flash attention remains eligible",
+                     densecore::simd::SimdLevelName(simd_level));
         } else {
-            LOG_WARN("Flash Attention Disabled (requires AVX-512, detected: {})",
+            LOG_WARN("Native x86 Flash Attention Disabled (requires AVX-512, detected: {})",
                      densecore::simd::SimdLevelName(simd_level));
         }
 

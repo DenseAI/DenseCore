@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -125,7 +126,11 @@ void TriangularAttentionImpl(const float* pair_data, const float* qw, const floa
     if (!checked_mul(static_cast<size_t>(4), D_head_sz, &proj_floats)) return;
     if (!checked_add(proj_floats, L_sz, &required_floats)) return;
     if (!checked_mul(required_floats, sizeof(float), &required_bytes)) return;
-    if (workspace_size < required_bytes) return;
+    if (workspace_size < required_bytes) {
+        fprintf(stderr, "[TriangularAttention] workspace too small: need %zu B, got %zu B\n",
+                required_bytes, workspace_size);
+        return;
+    }
 
     float* ws_ptr = reinterpret_cast<float*>(workspace);
     float* q_proj_ptr = ws_ptr;

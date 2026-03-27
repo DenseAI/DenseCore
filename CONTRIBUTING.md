@@ -85,7 +85,7 @@ git clone https://github.com/YOUR_USERNAME/DenseCore.git
 cd DenseCore
 
 # Add upstream remote
-git remote add upstream https://github.com/Jake-Network/DenseCore.git
+git remote add upstream https://github.com/DenseCore/DenseCore.git
 ```
 
 ### 2. Initialize Submodules
@@ -177,7 +177,7 @@ docker run -it --rm \
 
 ### Reporting Bugs
 
-Found a bug? Please [open an issue](https://github.com/Jake-Network/DenseCore/issues/new) with:
+Found a bug? Please [open an issue](https://github.com/DenseCore/DenseCore/issues/new) with:
 
 1. **Clear title** describing the problem
 2. **Steps to reproduce:**
@@ -191,12 +191,12 @@ Found a bug? Please [open an issue](https://github.com/Jake-Network/DenseCore/is
 4. **Environment:**
    - OS: (e.g., Ubuntu 22.04)
    - Python version: (e.g., 3.10.5)
-   - DenseCore version: (e.g., 2.0.0)
+   - DenseCore version: (e.g., 1.0.0)
 5. **Error messages/stack traces** (full output)
 
 ### Suggesting Features
 
-Have an idea? [Open an issue](https://github.com/Jake-Network/DenseCore/issues/new) with:
+Have an idea? [Open an issue](https://github.com/DenseCore/DenseCore/issues/new) with:
 
 1. **Use case:** What problem does this solve?
 2. **Proposed solution:** How should it work?
@@ -621,7 +621,7 @@ See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
 
 **Before asking:**
 1. Check [documentation](docs/README.md)
-2. Search [existing issues](https://github.com/Jake-Network/DenseCore/issues)
+2. Search [existing issues](https://github.com/DenseCore/DenseCore/issues)
 3. Read [troubleshooting guides](python/README.md#troubleshooting)
 
 **When asking:**

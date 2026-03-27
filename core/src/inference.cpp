@@ -224,6 +224,93 @@ static void LogMatmulPathOnce(const char* path) {
     }
 }
 
+[[maybe_unused]] static void LogMatmulValidationOnce(const char* path, bool ok, float max_abs_diff) {
+    if (!path || !IsDebugMatmulPathLoggingEnabled()) {
+        return;
+    }
+
+    static std::mutex mu;
+    static std::unordered_map<std::string, bool> logged;
+    std::lock_guard<std::mutex> lock(mu);
+    if (logged[path]) {
+        return;
+    }
+    logged[path] = true;
+    fprintf(stderr, "[DenseCore][MatmulValidate] %s status=%s max_abs_diff=%.8f\n", path, ok ? "pass" : "fail",
+            static_cast<double>(max_abs_diff));
+}
+
+enum class RuntimeToggleMode { Off = 0, Auto = 1, On = 2 };
+
+[[maybe_unused]] static RuntimeToggleMode GetArmQ4KNativeVecDotMode();
+
+static bool ShouldUseArmNativeQ4KVecDotValidated(ggml_type weight_type, const ggml_type_traits_cpu* type_traits_cpu,
+                                                 const void* sample_row_ptr, const void* sample_quant_input,
+                                                 const float* sample_input_f32, int N) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (weight_type != GGML_TYPE_Q4_K) {
+        return type_traits_cpu && type_traits_cpu->vec_dot;
+    }
+    if (!type_traits_cpu || !type_traits_cpu->vec_dot || !sample_row_ptr || !sample_quant_input || !sample_input_f32 ||
+        N <= 0) {
+        return false;
+    }
+
+    const RuntimeToggleMode mode = GetArmQ4KNativeVecDotMode();
+    if (mode == RuntimeToggleMode::Off) {
+        return false;
+    }
+    if (mode == RuntimeToggleMode::On) {
+        return true;
+    }
+
+    static std::atomic<int> state{0};  // 0=unknown, 1=enabled, 2=disabled
+    int current = state.load(std::memory_order_acquire);
+    if (current != 0) {
+        return current == 1;
+    }
+
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    current = state.load(std::memory_order_relaxed);
+    if (current == 0) {
+        float native_sum = 0.0f;
+        type_traits_cpu->vec_dot(N, &native_sum, 0, sample_row_ptr, 0, sample_quant_input, 0, 1);
+
+        const auto* type_traits = ggml_get_type_traits(weight_type);
+        thread_local std::vector<float> dequant_buffer;
+        bool ok = false;
+        float max_abs_diff = std::numeric_limits<float>::infinity();
+        if (type_traits && type_traits->to_float) {
+            dequant_buffer.resize(static_cast<size_t>(N));
+            type_traits->to_float(sample_row_ptr, dequant_buffer.data(), N);
+
+            float ref_sum = 0.0f;
+            for (int i = 0; i < N; ++i) {
+                ref_sum += dequant_buffer[static_cast<size_t>(i)] * sample_input_f32[i];
+            }
+
+            max_abs_diff = std::fabs(native_sum - ref_sum);
+            const float tol = std::max(1e-3f, 5e-4f * std::fabs(ref_sum));
+            ok = std::isfinite(native_sum) && max_abs_diff <= tol;
+        }
+
+        state.store(ok ? 1 : 2, std::memory_order_release);
+        LogMatmulValidationOnce("arm_q4k_native_vecdot", ok, max_abs_diff);
+        current = ok ? 1 : 2;
+    }
+
+    return current == 1;
+#else
+    (void)weight_type;
+    (void)sample_row_ptr;
+    (void)sample_quant_input;
+    (void)sample_input_f32;
+    (void)N;
+    return type_traits_cpu && type_traits_cpu->vec_dot;
+#endif
+}
+
 static bool IsCustomGemvDisabled() {
     static const bool disabled = []() {
         const char* legacy_env = std::getenv("DENSECORE_DISABLE_CUSTOM_GEMV");
@@ -475,6 +562,54 @@ static int GetBatchedMinK() {
     return val;
 }
 
+[[maybe_unused]] static RuntimeToggleMode GetArmQ4KNativeVecDotMode() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const char* legacy = std::getenv("DENSECORE_ARM_ALLOW_Q4K_NATIVE_VECDOT");
+    if (legacy && legacy[0] != '\0') {
+        if (std::strcmp(legacy, "0") == 0 || std::strcmp(legacy, "false") == 0 || std::strcmp(legacy, "FALSE") == 0) {
+            return RuntimeToggleMode::On;
+        }
+        return RuntimeToggleMode::Off;
+    }
+
+    const char* env = std::getenv("DENSECORE_ARM_Q4K_NATIVE_VECDOT_MODE");
+    if (!env || env[0] == '\0') {
+        return RuntimeToggleMode::Auto;
+    }
+    if (std::strcmp(env, "off") == 0 || std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 ||
+        std::strcmp(env, "FALSE") == 0) {
+        return RuntimeToggleMode::Off;
+    }
+    if (std::strcmp(env, "on") == 0 || std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
+        std::strcmp(env, "TRUE") == 0 || std::strcmp(env, "force") == 0) {
+        return RuntimeToggleMode::On;
+    }
+    return RuntimeToggleMode::Auto;
+#else
+    return RuntimeToggleMode::On;
+#endif
+}
+
+[[maybe_unused]] static RuntimeToggleMode GetArmInt4DirectFastPathMode() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const char* env = std::getenv("DENSECORE_ARM_INT4_DIRECT_FASTPATH_MODE");
+    if (!env || env[0] == '\0') {
+        return RuntimeToggleMode::Auto;
+    }
+    if (std::strcmp(env, "off") == 0 || std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 ||
+        std::strcmp(env, "FALSE") == 0) {
+        return RuntimeToggleMode::Off;
+    }
+    if (std::strcmp(env, "on") == 0 || std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
+        std::strcmp(env, "TRUE") == 0 || std::strcmp(env, "force") == 0) {
+        return RuntimeToggleMode::On;
+    }
+    return RuntimeToggleMode::Auto;
+#else
+    return RuntimeToggleMode::On;
+#endif
+}
+
 static bool ParseTruthyEnv(const char* name, bool default_value) {
     const char* env = std::getenv(name);
     if (!env || env[0] == '\0') {
@@ -491,8 +626,6 @@ static std::string AsciiLower(std::string s) {
     }
     return s;
 }
-
-enum class RuntimeToggleMode { Off = 0, Auto = 1, On = 2 };
 
 static RuntimeToggleMode ParseRuntimeToggleMode(const char* name, RuntimeToggleMode default_mode) {
     const char* env = std::getenv(name);
@@ -802,6 +935,91 @@ static bool IsDecodeProfileEnabled() {
     return enabled;
 }
 
+static bool IsDecodeAttentionPathLoggingEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_LOG_DECODE_ATTENTION_PATH");
+        if (env && env[0] != '\0' && std::strcmp(env, "0") != 0) {
+            return true;
+        }
+        return IsDecodeProfileEnabled() || IsDebugInferenceStatsEnabled();
+    }();
+    return enabled;
+}
+
+enum class DecodeAttentionPathKind : uint8_t {
+    Paged = 0,
+    Hal = 1,
+    PortableCpuFlash = 2,
+    NativeFlash = 3,
+    Standard = 4,
+};
+
+struct DecodeAttentionPathCounters {
+    std::atomic<uint64_t> total{0};
+    std::atomic<uint64_t> paged{0};
+    std::atomic<uint64_t> hal{0};
+    std::atomic<uint64_t> portable_cpu_flash{0};
+    std::atomic<uint64_t> native_flash{0};
+    std::atomic<uint64_t> standard{0};
+};
+
+static DecodeAttentionPathCounters& GetDecodeAttentionPathCounters() {
+    static DecodeAttentionPathCounters counters;
+    return counters;
+}
+
+static const char* DecodeAttentionPathName(DecodeAttentionPathKind kind) {
+    switch (kind) {
+    case DecodeAttentionPathKind::Paged: return "paged_decode";
+    case DecodeAttentionPathKind::Hal: return "hal_flash";
+    case DecodeAttentionPathKind::PortableCpuFlash: return "cpu_flash_hal";
+    case DecodeAttentionPathKind::NativeFlash: return "flash";
+    case DecodeAttentionPathKind::Standard: return "standard";
+    default: return "unknown";
+    }
+}
+
+static void RecordDecodeAttentionPath(DecodeAttentionPathKind kind, int layer, int N, int n_past_val, int n_head,
+                                      int n_head_kv, densecore::DeviceType preferred_device, bool native_layout,
+                                      bool paged_candidate, bool paged_selected, bool portable_supported,
+                                      bool offset_safe) {
+    if (layer != 0 || N <= 0) {
+        return;
+    }
+
+    DecodeAttentionPathCounters& counters = GetDecodeAttentionPathCounters();
+    const uint64_t total = counters.total.fetch_add(1, std::memory_order_relaxed) + 1;
+    switch (kind) {
+    case DecodeAttentionPathKind::Paged: counters.paged.fetch_add(1, std::memory_order_relaxed); break;
+    case DecodeAttentionPathKind::Hal: counters.hal.fetch_add(1, std::memory_order_relaxed); break;
+    case DecodeAttentionPathKind::PortableCpuFlash:
+        counters.portable_cpu_flash.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case DecodeAttentionPathKind::NativeFlash: counters.native_flash.fetch_add(1, std::memory_order_relaxed); break;
+    case DecodeAttentionPathKind::Standard: counters.standard.fetch_add(1, std::memory_order_relaxed); break;
+    }
+
+    if (IsDebugInferenceStatsEnabled() && total <= 8) {
+        std::cerr << "[DecodeAttentionDecision] path=" << DecodeAttentionPathName(kind) << " N=" << N
+                  << " n_past=" << n_past_val << " n_head=" << n_head << " n_head_kv=" << n_head_kv
+                  << " preferred_device=" << densecore::DeviceTypeName(preferred_device)
+                  << " native_layout=" << (native_layout ? "1" : "0")
+                  << " paged_candidate=" << (paged_candidate ? "1" : "0")
+                  << " paged_selected=" << (paged_selected ? "1" : "0")
+                  << " portable_supported=" << (portable_supported ? "1" : "0")
+                  << " offset_safe=" << (offset_safe ? "1" : "0") << std::endl;
+    }
+
+    if (IsDecodeAttentionPathLoggingEnabled() && total % 100 == 0) {
+        std::cerr << "[DecodeAttentionPathStats] total=" << total
+                  << " paged=" << counters.paged.load(std::memory_order_relaxed)
+                  << " hal=" << counters.hal.load(std::memory_order_relaxed)
+                  << " cpu_flash=" << counters.portable_cpu_flash.load(std::memory_order_relaxed)
+                  << " flash=" << counters.native_flash.load(std::memory_order_relaxed)
+                  << " standard=" << counters.standard.load(std::memory_order_relaxed) << std::endl;
+    }
+}
+
 static bool IsForceSafeGqaDecodeEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_FORCE_SAFE_GQA_DECODE");
@@ -854,7 +1072,11 @@ static bool IsPortableCpuFlashAttentionEnabled() {
         if (mode == RuntimeToggleMode::Off) {
             return false;
         }
-        return densecore::simd::IsArmFamily(GetRuntimeSimdLevel());
+        // Auto mode: enable portable flash attention on all platforms.
+        // The prior ARM correctness issue was caused by K/V tensors not being
+        // registered in the GGML graph's src[] dependency chain, which meant
+        // their ggml_cont ops were never executed during graph compute.
+        return true;
     }();
     return enabled;
 }
@@ -2222,8 +2444,11 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     // ==========================================================================
     const size_t row_stride = weight_tensor->nb[1];  // Bytes per row
     const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight_type);
+    const void* sample_row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k_start) * row_stride;
+    const bool allow_native_q4k_vecdot =
+        ShouldUseArmNativeQ4KVecDotValidated(weight_type, type_traits_cpu, sample_row_ptr, quant_input, x_f32, N);
 
-    if (quant_input && type_traits_cpu && type_traits_cpu->vec_dot) {
+    if (quant_input && type_traits_cpu && type_traits_cpu->vec_dot && allow_native_q4k_vecdot) {
         for (int k = k_start; k < k_end; k++) {
             const void* row_ptr = reinterpret_cast<const char*>(weight_data) + k * row_stride;
             type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
@@ -2727,8 +2952,12 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
             }
         }
 
+        const void* sample_row_ptr = weight_base + static_cast<size_t>(k_start) * weight_row_stride;
+        const bool allow_native_q4k_vecdot = ShouldUseArmNativeQ4KVecDotValidated(
+            weight_type, type_traits_cpu, sample_row_ptr, quant_input_base, x_rows.empty() ? nullptr : x_rows[0], N);
+
         // Fast path: one-time quantization + multi-column vec_dot (nrc=M).
-        if (can_use_quant_nrc_fast && quant_input_base) {
+        if (can_use_quant_nrc_fast && quant_input_base && allow_native_q4k_vecdot) {
             for (int k = k_start; k < k_end; ++k) {
                 float* out_ptr = reinterpret_cast<float*>(output_base + static_cast<size_t>(k) * sizeof(float));
                 const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
@@ -4042,13 +4271,18 @@ inline struct ggml_tensor* ggml_mul_mat_hal(struct ggml_context* ctx, struct ggm
     return result;
 }
 
+enum class HalAttentionTensorLayout : uint8_t {
+    HeadSeq = 0,     // [head_dim, seq, head]
+    GgmlDimHeadSeq,  // [head_dim, head, seq]
+};
+
 struct HalAttentionOpData {
-    struct ggml_tensor* k_tensor = nullptr;
-    struct ggml_tensor* v_tensor = nullptr;
     float scale = 1.0f;
     int n_head_kv = -1;
     uint8_t causal = 1;
+    uint8_t layout = static_cast<uint8_t>(HalAttentionTensorLayout::HeadSeq);
     densecore::DeviceType preferred_device = densecore::DeviceType::CPU;
+    int layer = -1;
 };
 
 struct HalAttentionCustomParams {
@@ -4058,9 +4292,113 @@ struct HalAttentionCustomParams {
     HalAttentionOpData data;
 };
 
+static bool IsPortableFlashParityCheckEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_CHECK_PORTABLE_FLASH_ATTN");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static float PortableFlashParityTolerance() {
+    static const float tol = []() {
+        const char* env = std::getenv("DENSECORE_CHECK_PORTABLE_FLASH_ATTN_TOL");
+        if (!env || env[0] == '\0') {
+            return 1e-3f;
+        }
+        char* end = nullptr;
+        const float parsed = std::strtof(env, &end);
+        if (end == env || !std::isfinite(parsed) || parsed <= 0.0f) {
+            return 1e-3f;
+        }
+        return parsed;
+    }();
+    return tol;
+}
+
+static void ComputeFlashAttentionReference(const float* q, const float* k, const float* v, float* out, int n_head,
+                                           int n_head_kv, int seq_q, int seq_kv, int head_dim, float scale,
+                                           bool causal) {
+    if (!q || !k || !v || !out || n_head <= 0 || n_head_kv <= 0 || seq_q <= 0 || seq_kv <= 0 || head_dim <= 0) {
+        return;
+    }
+
+    const int n_rep = n_head / n_head_kv;
+    for (int h = 0; h < n_head; ++h) {
+        const int kv_head = h / n_rep;
+        const float* q_head = q + static_cast<size_t>(h) * seq_q * head_dim;
+        const float* k_head = k + static_cast<size_t>(kv_head) * seq_kv * head_dim;
+        const float* v_head = v + static_cast<size_t>(kv_head) * seq_kv * head_dim;
+        float* out_head = out + static_cast<size_t>(h) * seq_q * head_dim;
+
+        for (int tq = 0; tq < seq_q; ++tq) {
+            const float* q_row = q_head + static_cast<size_t>(tq) * head_dim;
+            float* out_row = out_head + static_cast<size_t>(tq) * head_dim;
+            std::fill(out_row, out_row + head_dim, 0.0f);
+
+            std::vector<float> scores(static_cast<size_t>(seq_kv), -INFINITY);
+            float row_max = -INFINITY;
+            for (int tk = 0; tk < seq_kv; ++tk) {
+                if (causal && tk > tq) {
+                    continue;
+                }
+                const float* k_row = k_head + static_cast<size_t>(tk) * head_dim;
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    score += q_row[d] * k_row[d];
+                }
+                score *= scale;
+                scores[static_cast<size_t>(tk)] = score;
+                row_max = std::max(row_max, score);
+            }
+
+            if (!std::isfinite(row_max)) {
+                continue;
+            }
+
+            float denom = 0.0f;
+            for (int tk = 0; tk < seq_kv; ++tk) {
+                float& score = scores[static_cast<size_t>(tk)];
+                if (!std::isfinite(score)) {
+                    score = 0.0f;
+                    continue;
+                }
+                score = std::exp(score - row_max);
+                denom += score;
+            }
+            if (!(denom > 0.0f) || !std::isfinite(denom)) {
+                continue;
+            }
+
+            const float inv_denom = 1.0f / denom;
+            for (int tk = 0; tk < seq_kv; ++tk) {
+                const float p = scores[static_cast<size_t>(tk)] * inv_denom;
+                if (!(p > 0.0f)) {
+                    continue;
+                }
+                const float* v_row = v_head + static_cast<size_t>(tk) * head_dim;
+                for (int d = 0; d < head_dim; ++d) {
+                    out_row[d] += p * v_row[d];
+                }
+            }
+        }
+    }
+}
+
+static densecore::Tensor MakeHalAttentionTensorFromGgml(const struct ggml_tensor* tensor, int n_head, int seq_len,
+                                                        int head_dim) {
+    densecore::Tensor wrapped = densecore::Tensor::Make4D(const_cast<void*>(tensor->data), 1, n_head, seq_len, head_dim,
+                                                          densecore::DType::F32, densecore::DeviceType::CPU);
+    wrapped.stride[0] = static_cast<int64_t>(n_head) * seq_len * head_dim;
+    wrapped.stride[1] = static_cast<int64_t>(tensor->nb[1] / sizeof(float));
+    wrapped.stride[2] = static_cast<int64_t>(tensor->nb[2] / sizeof(float));
+    wrapped.stride[3] = static_cast<int64_t>(tensor->nb[0] / sizeof(float));
+    return wrapped;
+}
+
 void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     (void)userdata;
-    if (ith != 0 || nth <= 0 || !dst || !dst->src[0]) {
+    if (ith != 0 || nth <= 0 || !dst || !dst->src[0] || !dst->src[1] || !dst->src[2]) {
         return;
     }
 
@@ -4070,17 +4408,14 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
     }
 
     const struct ggml_tensor* q = dst->src[0];
-    const struct ggml_tensor* k = params->data.k_tensor;
-    const struct ggml_tensor* v = params->data.v_tensor;
+    const struct ggml_tensor* k = dst->src[1];
+    const struct ggml_tensor* v = dst->src[2];
     if (!q || !k || !v || !q->data || !k->data || !v->data || !dst->data) {
         return;
     }
 
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
         dst->type != GGML_TYPE_F32) {
-        return;
-    }
-    if (!ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v) || !ggml_is_contiguous(dst)) {
         return;
     }
     if (q->ne[0] <= 0 || q->ne[1] <= 0 || q->ne[2] <= 0 || k->ne[0] <= 0 || k->ne[1] <= 0 || k->ne[2] <= 0 ||
@@ -4091,11 +4426,57 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
         return;
     }
 
-    const int head_dim = static_cast<int>(q->ne[0]);
-    const int seq_q = static_cast<int>(q->ne[1]);
-    const int n_head = static_cast<int>(q->ne[2]);
-    const int seq_kv = static_cast<int>(k->ne[1]);
-    const int inferred_n_head_kv = static_cast<int>(k->ne[2]);
+    const HalAttentionTensorLayout layout = static_cast<HalAttentionTensorLayout>(params->data.layout);
+
+    int head_dim = static_cast<int>(q->ne[0]);
+    int seq_q = 0;
+    int n_head = 0;
+    int seq_kv = 0;
+    int inferred_n_head_kv = 0;
+
+    densecore::Tensor Q;
+    densecore::Tensor K;
+    densecore::Tensor V;
+    densecore::Tensor O;
+
+    if (layout == HalAttentionTensorLayout::HeadSeq) {
+        if (!ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v) || !ggml_is_contiguous(dst)) {
+            return;
+        }
+
+        seq_q = static_cast<int>(q->ne[1]);
+        n_head = static_cast<int>(q->ne[2]);
+        seq_kv = static_cast<int>(k->ne[1]);
+        inferred_n_head_kv = static_cast<int>(k->ne[2]);
+
+        Q = densecore::Tensor::Make4D(const_cast<void*>(q->data), 1, n_head, seq_q, head_dim, densecore::DType::F32,
+                                      densecore::DeviceType::CPU);
+        K = densecore::Tensor::Make4D(const_cast<void*>(k->data), 1, inferred_n_head_kv, seq_kv, head_dim,
+                                      densecore::DType::F32, densecore::DeviceType::CPU);
+        V = densecore::Tensor::Make4D(const_cast<void*>(v->data), 1, inferred_n_head_kv, seq_kv, head_dim,
+                                      densecore::DType::F32, densecore::DeviceType::CPU);
+        O = densecore::Tensor::Make4D(dst->data, 1, n_head, seq_q, head_dim, densecore::DType::F32,
+                                      densecore::DeviceType::CPU);
+    } else {
+        if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(float) || v->nb[0] != sizeof(float) ||
+            dst->nb[0] != sizeof(float)) {
+            return;
+        }
+
+        n_head = static_cast<int>(q->ne[1]);
+        seq_q = static_cast<int>(q->ne[2]);
+        inferred_n_head_kv = static_cast<int>(k->ne[1]);
+        seq_kv = static_cast<int>(k->ne[2]);
+        if (seq_q != 1) {
+            return;
+        }
+
+        Q = MakeHalAttentionTensorFromGgml(q, n_head, seq_q, head_dim);
+        K = MakeHalAttentionTensorFromGgml(k, inferred_n_head_kv, seq_kv, head_dim);
+        V = MakeHalAttentionTensorFromGgml(v, inferred_n_head_kv, seq_kv, head_dim);
+        O = MakeHalAttentionTensorFromGgml(dst, n_head, seq_q, head_dim);
+    }
+
     const int n_head_kv = params->data.n_head_kv > 0 ? params->data.n_head_kv : inferred_n_head_kv;
 
     if (n_head_kv <= 0 || n_head <= 0 || seq_q <= 0 || seq_kv <= 0 || head_dim <= 0) {
@@ -4118,15 +4499,6 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
         return;
     }
 
-    densecore::Tensor Q = densecore::Tensor::Make4D(const_cast<void*>(q->data), 1, n_head, seq_q, head_dim,
-                                                    densecore::DType::F32, densecore::DeviceType::CPU);
-    densecore::Tensor K = densecore::Tensor::Make4D(const_cast<void*>(k->data), 1, n_head_kv, seq_kv, head_dim,
-                                                    densecore::DType::F32, densecore::DeviceType::CPU);
-    densecore::Tensor V = densecore::Tensor::Make4D(const_cast<void*>(v->data), 1, n_head_kv, seq_kv, head_dim,
-                                                    densecore::DType::F32, densecore::DeviceType::CPU);
-    densecore::Tensor O = densecore::Tensor::Make4D(dst->data, 1, n_head, seq_q, head_dim, densecore::DType::F32,
-                                                    densecore::DeviceType::CPU);
-
     try {
         backend->FlashAttention(Q, K, V, &O, params->data.scale, params->data.causal != 0, n_head_kv);
     } catch (...) {
@@ -4135,22 +4507,56 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
             cpu->FlashAttention(Q, K, V, &O, params->data.scale, params->data.causal != 0, n_head_kv);
         }
     }
+
+    if (IsPortableFlashParityCheckEnabled() && layout == HalAttentionTensorLayout::HeadSeq) {
+        static std::atomic<int> parity_budget{0};
+        const int run_idx = parity_budget.fetch_add(1, std::memory_order_relaxed);
+        if (run_idx < 8) {
+            std::vector<float> ref(static_cast<size_t>(n_head) * seq_q * head_dim, 0.0f);
+            ComputeFlashAttentionReference(reinterpret_cast<const float*>(q->data),
+                                           reinterpret_cast<const float*>(k->data),
+                                           reinterpret_cast<const float*>(v->data), ref.data(), n_head, n_head_kv,
+                                           seq_q, seq_kv, head_dim, params->data.scale, params->data.causal != 0);
+
+            const float* got = reinterpret_cast<const float*>(dst->data);
+            float max_abs = 0.0f;
+            int max_idx = -1;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                const float diff = std::fabs(got[i] - ref[i]);
+                if (diff > max_abs) {
+                    max_abs = diff;
+                    max_idx = static_cast<int>(i);
+                }
+            }
+            if (max_abs > PortableFlashParityTolerance()) {
+                const float got_val = (max_idx >= 0) ? got[max_idx] : 0.0f;
+                const float ref_val = (max_idx >= 0) ? ref[static_cast<size_t>(max_idx)] : 0.0f;
+                fprintf(stderr,
+                        "[PortableFlashParity] FAIL layer=%d seq_q=%d seq_kv=%d n_head=%d n_head_kv=%d head_dim=%d "
+                        "max_abs=%.6f idx=%d got=%.6f ref=%.6f\n",
+                        params->data.layer, seq_q, seq_kv, n_head, n_head_kv, head_dim, max_abs, max_idx, got_val,
+                        ref_val);
+            }
+        }
+    }
 }
 
-inline struct ggml_tensor* ggml_flash_attention_hal(struct ggml_context* ctx, struct ggml_tensor* Q,
-                                                    struct ggml_tensor* K, struct ggml_tensor* V, float scale,
-                                                    bool causal, int n_head_kv,
-                                                    densecore::DeviceType preferred_device) {
+inline struct ggml_tensor*
+ggml_flash_attention_hal(struct ggml_context* ctx, struct ggml_tensor* Q, struct ggml_tensor* K, struct ggml_tensor* V,
+                         float scale, bool causal, int n_head_kv, int layer, densecore::DeviceType preferred_device,
+                         HalAttentionTensorLayout layout = HalAttentionTensorLayout::HeadSeq) {
     const int64_t ne_res[4] = {Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3]};
     struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_res);
     result->op = GGML_OP_CUSTOM;
     result->src[0] = Q;
+    result->src[1] = K;
+    result->src[2] = V;
 
-    HalAttentionCustomParams params = {
-        cb_flash_attention_hal_custom,
-        1,
-        nullptr,
-        {K, V, scale, n_head_kv, static_cast<uint8_t>(causal ? 1 : 0), preferred_device}};
+    HalAttentionCustomParams params = {cb_flash_attention_hal_custom,
+                                       1,
+                                       nullptr,
+                                       {scale, n_head_kv, static_cast<uint8_t>(causal ? 1 : 0),
+                                        static_cast<uint8_t>(layout), preferred_device, layer}};
     static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "params too large");
     std::memcpy(result->op_params, &params, sizeof(params));
     return result;
@@ -4171,6 +4577,159 @@ struct Int4MatmulCustomParams {
     void* userdata;
     Int4MatmulOpData data;
 };
+
+[[maybe_unused]] static void ComputeInt4MatmulReference(float* output, const float* input,
+                                                        const uint8_t* packed_weights, const float* scales,
+                                                        const float* zeros, int M, int K, int N, int group_size) {
+    if (!output || !input || !packed_weights || !scales || M <= 0 || K <= 0 || N <= 0 || group_size <= 0 ||
+        (K % group_size) != 0) {
+        return;
+    }
+
+    const int num_groups = K / group_size;
+    const int packed_K = (K + 1) / 2;
+
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = input + static_cast<size_t>(m) * static_cast<size_t>(K);
+        for (int n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int g = 0; g < num_groups; ++g) {
+                const float scale = scales[static_cast<size_t>(n) * static_cast<size_t>(num_groups) + g];
+                const float zero = zeros ? zeros[static_cast<size_t>(n) * static_cast<size_t>(num_groups) + g] : 0.0f;
+                const uint8_t* w_ptr = packed_weights + static_cast<size_t>(n) * static_cast<size_t>(packed_K) +
+                                       static_cast<size_t>(g) * static_cast<size_t>(group_size / 2);
+                const float* a_ptr = a_row + static_cast<size_t>(g) * static_cast<size_t>(group_size);
+
+                for (int k = 0; k < group_size; ++k) {
+                    int q = (w_ptr[k / 2] >> ((k & 1) ? 4 : 0)) & 0x0F;
+                    if (q > 7) q -= 16;
+                    acc += scale * (static_cast<float>(q) - zero) * a_ptr[k];
+                }
+            }
+            output[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = acc;
+        }
+    }
+}
+
+static bool ShouldUseArmInt4DirectFastPath(const ggml_tensor* input, const Int4MatmulOpData& ud, int ith) {
+#if defined(DENSECORE_ARM_CORRECTNESS_FIRST) && (defined(__aarch64__) || defined(_M_ARM64))
+    (void)input;
+    (void)ud;
+    (void)ith;
+    return false;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    if (!input || !ud.packed_weights || !ud.scales || !ud.zeros || ud.K <= 0 || ud.N <= 0 || ud.group_size <= 0 ||
+        input->type != GGML_TYPE_F32 || input->ne[0] != ud.K || input->ne[1] <= 0) {
+        return false;
+    }
+
+    const RuntimeToggleMode mode = GetArmInt4DirectFastPathMode();
+    if (mode == RuntimeToggleMode::Off) {
+        return false;
+    }
+    if (mode == RuntimeToggleMode::On) {
+        return true;
+    }
+
+    static std::atomic<int> state{0};  // 0=unknown, 1=enabled, 2=disabled
+    int current = state.load(std::memory_order_acquire);
+    if (current != 0) {
+        return current == 1;
+    }
+
+    if (ith != 0) {
+        int spin_count = 0;
+        while ((current = state.load(std::memory_order_acquire)) == 0) {
+            SpinPause(spin_count++);
+        }
+        return current == 1;
+    }
+
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    current = state.load(std::memory_order_relaxed);
+    if (current == 0) {
+        if (!densecore::OpsRegistry::IsInitialized()) {
+            densecore::OpsRegistry::Init();
+        }
+        auto& reg = densecore::OpsRegistry::Instance();
+
+        bool ok = false;
+        float max_abs_diff = std::numeric_limits<float>::infinity();
+
+        if (reg.GemmInt4Batched) {
+            const int M_check = std::min<int>(static_cast<int>(input->ne[1]), 2);
+            const int N_check = std::min(ud.N, 32);
+            const int K_check = ud.K;
+            const int num_groups = K_check / ud.group_size;
+            const int packed_K = (K_check + 1) / 2;
+
+            std::vector<float> sample_input(static_cast<size_t>(M_check) * static_cast<size_t>(K_check));
+            for (int m = 0; m < M_check; ++m) {
+                const char* src_row =
+                    reinterpret_cast<const char*>(input->data) + static_cast<size_t>(m) * input->nb[1];
+                if (input->nb[0] == sizeof(float)) {
+                    std::memcpy(sample_input.data() + static_cast<size_t>(m) * static_cast<size_t>(K_check), src_row,
+                                static_cast<size_t>(K_check) * sizeof(float));
+                } else {
+                    for (int k = 0; k < K_check; ++k) {
+                        sample_input[static_cast<size_t>(m) * static_cast<size_t>(K_check) + static_cast<size_t>(k)] =
+                            *reinterpret_cast<const float*>(src_row + static_cast<size_t>(k) * input->nb[0]);
+                    }
+                }
+            }
+
+            std::vector<uint8_t> sample_weights(static_cast<size_t>(N_check) * static_cast<size_t>(packed_K));
+            std::vector<float> sample_scales(static_cast<size_t>(N_check) * static_cast<size_t>(num_groups));
+            std::vector<float> sample_zeros(static_cast<size_t>(N_check) * static_cast<size_t>(num_groups));
+            for (int n = 0; n < N_check; ++n) {
+                std::memcpy(sample_weights.data() + static_cast<size_t>(n) * static_cast<size_t>(packed_K),
+                            ud.packed_weights + static_cast<size_t>(n) * static_cast<size_t>(packed_K),
+                            static_cast<size_t>(packed_K));
+                std::memcpy(sample_scales.data() + static_cast<size_t>(n) * static_cast<size_t>(num_groups),
+                            ud.scales + static_cast<size_t>(n) * static_cast<size_t>(num_groups),
+                            static_cast<size_t>(num_groups) * sizeof(float));
+                std::memcpy(sample_zeros.data() + static_cast<size_t>(n) * static_cast<size_t>(num_groups),
+                            ud.zeros + static_cast<size_t>(n) * static_cast<size_t>(num_groups),
+                            static_cast<size_t>(num_groups) * sizeof(float));
+            }
+
+            std::vector<float> fast_output(static_cast<size_t>(M_check) * static_cast<size_t>(N_check), 0.0f);
+            std::vector<float> ref_output(static_cast<size_t>(M_check) * static_cast<size_t>(N_check), 0.0f);
+
+            reg.GemmInt4Batched(fast_output.data(), sample_input.data(), sample_weights.data(), sample_scales.data(),
+                                sample_zeros.data(), M_check, K_check, N_check, ud.group_size, 0, M_check, 0, N_check,
+                                static_cast<size_t>(K_check) * sizeof(float));
+            ComputeInt4MatmulReference(ref_output.data(), sample_input.data(), sample_weights.data(),
+                                       sample_scales.data(), sample_zeros.data(), M_check, K_check, N_check,
+                                       ud.group_size);
+
+            ok = true;
+            max_abs_diff = 0.0f;
+            for (size_t i = 0; i < fast_output.size(); ++i) {
+                const float diff = std::fabs(fast_output[i] - ref_output[i]);
+                max_abs_diff = std::max(max_abs_diff, diff);
+                const float tol = std::max(1e-4f, 1e-4f * std::fabs(ref_output[i]));
+                if (!std::isfinite(fast_output[i]) || diff > tol) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        state.store(ok ? 1 : 2, std::memory_order_release);
+        LogMatmulValidationOnce("arm_int4_direct_fastpath", ok, max_abs_diff);
+        current = ok ? 1 : 2;
+    }
+
+    return current == 1;
+#else
+    (void)input;
+    (void)ud;
+    (void)ith;
+    return true;
+#endif
+}
 
 void cb_matmul_int4_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     (void)userdata;
@@ -4193,11 +4752,12 @@ void cb_matmul_int4_custom(struct ggml_tensor* dst, int ith, int nth, void* user
         input->nb[0] == sizeof(float) && input->nb[1] == static_cast<size_t>(ud.K) * sizeof(float);
     const bool output_contig = dst->nb[0] == sizeof(float) && dst->nb[1] == static_cast<size_t>(ud.N) * sizeof(float);
     const bool single_threading_layer = IsInt4SingleThreadingLayerEnabled();
+    const bool allow_direct_fast_path = ShouldUseArmInt4DirectFastPath(input, ud, ith);
 
     // Legacy escape hatch: keep DenseCore backend threadpool path for
     // platform-specific tuning. This path is intentionally serialized at GGML
     // level to avoid nested parallelism.
-    if (!single_threading_layer) {
+    if (!allow_direct_fast_path || !single_threading_layer) {
         if (ith != 0) return;
 
         static thread_local std::vector<float> legacy_contig_input;
@@ -6335,6 +6895,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 const bool use_portable_cpu_flash_attention =
                     !IsFlashAttentionDisabled() && preferred_attention_device == densecore::DeviceType::CPU &&
                     !use_paged_decode_attention && hal_attention_offset_safe && portable_cpu_flash_attention_supported;
+                const bool use_portable_cpu_flash_native_decode_layout =
+                    use_portable_cpu_flash_attention && N == 1 && head_dim_q == head_dim_kv &&
+                    head_dim_q == head_dim_v && ggml_is_contiguous(Qcur) && ggml_is_contiguous(K) &&
+                    ggml_is_contiguous(V);
                 if (flash_attn_forced && !flash_attn_runtime_supported && il == 0 &&
                     IsVerboseGraphBuildLoggingEnabled()) {
                     std::cerr
@@ -6351,6 +6915,20 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                                : use_portable_cpu_flash_attention ? "cpu_flash_hal"
                                                                   : (use_flash_attention ? "flash" : "standard"));
                     std::cerr << "[DecodeAttentionPath] N=" << N << " path=" << path << std::endl;
+                }
+
+                const DecodeAttentionPathKind attention_path_kind =
+                    use_paged_decode_attention ? DecodeAttentionPathKind::Paged
+                                               : (use_hal_attention_dispatch ? DecodeAttentionPathKind::Hal
+                                                  : use_portable_cpu_flash_attention
+                                                      ? DecodeAttentionPathKind::PortableCpuFlash
+                                                      : (use_flash_attention ? DecodeAttentionPathKind::NativeFlash
+                                                                             : DecodeAttentionPathKind::Standard));
+                if (n_past_val > 0 || decode_only_batch || N == 1) {
+                    RecordDecodeAttentionPath(attention_path_kind, il, N, n_past_val, n_head, n_head_kv,
+                                              preferred_attention_device, use_portable_cpu_flash_native_decode_layout,
+                                              paged_decode_candidate, use_paged_decode_attention,
+                                              portable_cpu_flash_attention_supported, hal_attention_offset_safe);
                 }
 
                 if (use_paged_decode_attention) {
@@ -6392,7 +6970,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     // For decode (N==1), causal=false is correct because K already contains
                     // only historical + current keys (no future positions).
                     const bool hal_causal = (N > 1);
-                    KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv,
+                    KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv, il,
                                                    preferred_attention_device);
 
                     // Convert [head_dim, N, n_head] -> [head_dim, n_head, N]
@@ -6404,20 +6982,26 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     // On ARM/Apple CPU runtimes, route through DenseCore's backend-agnostic
                     // FlashAttention op instead of forcing the materialized standard path.
                     // -----------------------------------------------------------------------
-                    struct ggml_tensor* Q_hal = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
-                    struct ggml_tensor* K_hal = ggml_permute(ctx_c, K, 0, 2, 1, 3);
-                    struct ggml_tensor* V_hal = ggml_permute(ctx_c, V, 0, 2, 1, 3);
-                    Q_hal = ggml_cont(ctx_c, Q_hal);
-                    K_hal = ggml_cont(ctx_c, K_hal);
-                    V_hal = ggml_cont(ctx_c, V_hal);
-
                     const float scale = 1.0f / sqrtf((float)head_dim_q);
                     const bool hal_causal = (N > 1);
-                    KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv,
-                                                   densecore::DeviceType::CPU);
+                    if (use_portable_cpu_flash_native_decode_layout) {
+                        KQV = ggml_flash_attention_hal(ctx_c, Qcur, K, V, scale, false, n_head_kv, il,
+                                                       densecore::DeviceType::CPU,
+                                                       HalAttentionTensorLayout::GgmlDimHeadSeq);
+                    } else {
+                        struct ggml_tensor* Q_hal = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
+                        struct ggml_tensor* K_hal = ggml_permute(ctx_c, K, 0, 2, 1, 3);
+                        struct ggml_tensor* V_hal = ggml_permute(ctx_c, V, 0, 2, 1, 3);
+                        Q_hal = ggml_cont(ctx_c, Q_hal);
+                        K_hal = ggml_cont(ctx_c, K_hal);
+                        V_hal = ggml_cont(ctx_c, V_hal);
 
-                    // Convert [head_dim, N, n_head] -> [head_dim, n_head, N]
-                    KQV = ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
+                        KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv, il,
+                                                       densecore::DeviceType::CPU);
+
+                        // Convert [head_dim, N, n_head] -> [head_dim, n_head, N]
+                        KQV = ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
+                    }
                 } else if (use_flash_attention) {
                     // -----------------------------------------------------------------------
                     // FLASH ATTENTION PATH (AVX-512 only)

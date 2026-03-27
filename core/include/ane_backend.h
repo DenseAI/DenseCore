@@ -86,7 +86,8 @@ enum class ANEOpType {
     SiLU,        ///< SiLU activation (x * sigmoid(x))
     GeLU,        ///< Gaussian Error Linear Unit
     Softmax,     ///< Softmax activation
-    Attention,   ///< Full attention block (experimental)
+    RoPE,        ///< Rotary Positional Embedding (offline-compiled ANE path)
+    Attention,   ///< Full attention block / FlashAttention (offline-compiled ANE path)
     FFN,         ///< Feed-forward network block (experimental)
 };
 
@@ -316,6 +317,56 @@ public:
      */
     bool CompileMatMulFP16(const std::string& name, int M, int K, const float* weight_fp32,
                            const float* bias_fp32 = nullptr);
+
+    /**
+     * @brief Load a pre-compiled offline CoreML model for RoPE execution on ANE
+     *
+     * Looks for `<cacheDirectory>/<name>.mlmodelc` compiled with coremltools.
+     * When found, subsequent RoPE() calls whose input dimensions match this model
+     * will execute entirely on the ANE, avoiding ANE↔Metal context switches.
+     *
+     * Offline compilation (coremltools):
+     * @code
+     *   import coremltools as ct
+     *   # Build RoPE MIL program for fixed seq_len/n_heads/head_dim
+     *   # Expected inputs:  "input"     [seq_len * n_heads, head_dim] float16
+     *   #                   "positions" [seq_len]                     int32
+     *   # Expected output:  "output"    [seq_len * n_heads, head_dim] float16
+     *   model.save("rope_seq128_h32_d128.mlpackage")
+     *   # xcrun coremlcompiler compile rope_seq128_h32_d128.mlpackage <cacheDir>
+     * @endcode
+     *
+     * @param name      Model identifier and filename stem (e.g. "rope_seq128_h32_d128")
+     * @param seq_len   Sequence length the model was compiled for
+     * @param n_heads   Number of attention heads
+     * @param head_dim  Dimension per head
+     * @return true if the cached model was loaded successfully
+     */
+    bool CompileRoPE(const std::string& name, int seq_len, int n_heads, int head_dim);
+
+    /**
+     * @brief Load a pre-compiled offline CoreML model for FlashAttention on ANE
+     *
+     * Looks for `<cacheDirectory>/<name>.mlmodelc` compiled with coremltools.
+     * When found, FlashAttention() calls whose Q shape matches will run on ANE,
+     * keeping the entire attention computation in a single ANE graph dispatch.
+     *
+     * Offline compilation (coremltools):
+     * @code
+     *   # Expected inputs:  "q"     [seq_len, n_heads,    head_dim] float16
+     *   #                   "k"     [kv_len,  n_kv_heads, head_dim] float16
+     *   #                   "v"     [kv_len,  n_kv_heads, head_dim] float16
+     *   # Expected output:  "output" [seq_len, n_heads,   head_dim] float16
+     *   # xcrun coremlcompiler compile flash_attn_seq128_h32_d128.mlpackage <cacheDir>
+     * @endcode
+     *
+     * @param name      Model identifier and filename stem
+     * @param seq_len   Query sequence length the model was compiled for
+     * @param n_heads   Number of query attention heads
+     * @param head_dim  Dimension per head
+     * @return true if the cached model was loaded successfully
+     */
+    bool CompileFlashAttention(const std::string& name, int seq_len, int n_heads, int head_dim);
 
     /**
      * @brief Execute a pre-compiled MatMul

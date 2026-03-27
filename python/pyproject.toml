@@ -27,7 +27,7 @@ keywords = [
     "arm",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -102,17 +102,21 @@ Changelog = "https://github.com/DenseCore/DenseCore/blob/main/CHANGELOG.md"
 
 
 
+[tool.setuptools]
+license-files = ["LICENSE"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["densecore*"]
+exclude = ["densecore.core_src", "densecore.core_src.*", "tests", "tests.*"]
 
 [tool.setuptools.package-data]
 densecore = [
     "*.so",
+    "*.so.*",
     "*.dylib",
+    "*.dylib.*",
     "py.typed",
-    "core_src/*",
-    "core_src/**/*",
 ]
 
 [tool.ruff]

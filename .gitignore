@@ -82,7 +82,7 @@ Thumbs.db
 
 # Local agent/editor state
 .gemini/
-workspace/
+#workspace/
 
 # CMake generated files
 CMakeCache.txt

@@ -18,6 +18,7 @@ type Engine interface {
 	GetMetrics() map[string]interface{}
 	GetDetailedMetrics() *DetailedMetrics
 	GetMaxContextTokens() int
+	CountTokens(text string, addBOS bool, addEOS bool) (int, error)
 	Close()
 	CancelRequest(reqID uintptr)
 }

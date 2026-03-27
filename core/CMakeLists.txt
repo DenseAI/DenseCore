@@ -18,6 +18,21 @@ endif()
 # ==========================================================================
 option(DENSECORE_COMMERCIAL "Enable commercial features (Graviton/Enterprise)" OFF)
 
+set(DENSECORE_LINUX_ARM64 OFF)
+if(NOT APPLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(DENSECORE_LINUX_ARM64 ON)
+endif()
+
+set(DENSECORE_ARM_CORRECTNESS_FIRST_DEFAULT OFF)
+if(DENSECORE_LINUX_ARM64)
+    set(DENSECORE_ARM_CORRECTNESS_FIRST_DEFAULT ON)
+endif()
+option(
+    DENSECORE_ARM_CORRECTNESS_FIRST
+    "Prefer correctness-first ggml defaults on Linux ARM (disables KleidiAI, llamafile, repack, and native ISA auto-tuning unless explicitly overridden)"
+    ${DENSECORE_ARM_CORRECTNESS_FIRST_DEFAULT}
+)
+
 if(DENSECORE_COMMERCIAL)
     message(STATUS "[DenseCore] Commercial build ENABLED")
     add_compile_definitions(DENSECORE_COMMERCIAL)
@@ -202,23 +217,36 @@ if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     DenseCoreResolveArmProfileMarch(DENSECORE_ARM_PROFILE_MARCH)
 endif()
 
+set(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE OFF)
+if(DENSECORE_LINUX_ARM64 AND DENSECORE_ARM_CORRECTNESS_FIRST)
+    set(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE ON)
+    message(STATUS "[DenseCore] ARM correctness-first defaults enabled")
+endif()
+
 # Configure ggml options before adding subdirectory
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
 # Note: Do NOT use FORCE for these options - allow command-line override
 if(NOT DEFINED GGML_NATIVE)
-    if(DENSECORE_PORTABLE OR CMAKE_CROSSCOMPILING)
+    if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE OR DENSECORE_PORTABLE OR CMAKE_CROSSCOMPILING)
         set(GGML_NATIVE OFF CACHE BOOL "Optimize for native CPU")
     else()
         set(GGML_NATIVE ON CACHE BOOL "Optimize for native CPU")
     endif()
 endif()
+set(DENSECORE_GGML_CPU_FEATURES_DEFAULT ON)
+if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+    set(DENSECORE_GGML_CPU_FEATURES_DEFAULT OFF)
+endif()
 if(NOT DEFINED GGML_LLAMAFILE)
-    set(GGML_LLAMAFILE ON CACHE BOOL "Enable ggml llamafile kernels")
+    set(GGML_LLAMAFILE ${DENSECORE_GGML_CPU_FEATURES_DEFAULT} CACHE BOOL "Enable ggml llamafile kernels")
+endif()
+if(NOT DEFINED GGML_CPU_REPACK)
+    set(GGML_CPU_REPACK ${DENSECORE_GGML_CPU_FEATURES_DEFAULT} CACHE BOOL "Enable ggml runtime repack kernels")
 endif()
 set(DENSECORE_CAN_USE_KLEIDIAI OFF)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND NOT DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
     set(DENSECORE_CAN_USE_KLEIDIAI ON)
 endif()
 if(NOT DEFINED GGML_CPU_KLEIDIAI)
@@ -227,8 +255,12 @@ elseif(GGML_CPU_KLEIDIAI AND NOT DENSECORE_CAN_USE_KLEIDIAI)
     message(STATUS "[DenseCore] Disabling GGML_CPU_KLEIDIAI for non-ARM target: ${CMAKE_SYSTEM_PROCESSOR}")
     set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "Enable ggml KleidiAI kernels" FORCE)
 endif()
-if(NOT DEFINED GGML_CPU_ARM_ARCH AND DENSECORE_ARM_PROFILE_GGML_ARCH)
-    set(GGML_CPU_ARM_ARCH "${DENSECORE_ARM_PROFILE_GGML_ARCH}" CACHE STRING "ggml: CPU architecture for ARM")
+if(NOT DEFINED GGML_CPU_ARM_ARCH)
+    if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+        set(GGML_CPU_ARM_ARCH "armv8-a" CACHE STRING "ggml: CPU architecture for ARM")
+    elseif(DENSECORE_ARM_PROFILE_GGML_ARCH)
+        set(GGML_CPU_ARM_ARCH "${DENSECORE_ARM_PROFILE_GGML_ARCH}" CACHE STRING "ggml: CPU architecture for ARM")
+    endif()
 endif()
 if(DENSECORE_PORTABLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(GGML_SSE42 OFF CACHE BOOL "ggml: enable SSE 4.2" FORCE)
@@ -363,7 +395,10 @@ if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
         message(STATUS "[DenseCore][ARM64] GGML_CPU_ARM_ARCH: ${GGML_CPU_ARM_ARCH}")
     endif()
 
-    if(NOT DENSECORE_ARM_MCPU AND NOT DENSECORE_ARM_MARCH AND DENSECORE_ARM_PROFILE_MARCH)
+    if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE AND NOT DENSECORE_ARM_MCPU AND NOT DENSECORE_ARM_MARCH)
+        set(DENSECORE_ARM_MARCH "armv8-a" CACHE STRING
+            "Explicit ARM architecture for -march (e.g. armv8.2-a+sve+dotprod)" FORCE)
+    elseif(NOT DENSECORE_ARM_MCPU AND NOT DENSECORE_ARM_MARCH AND DENSECORE_ARM_PROFILE_MARCH)
         set(DENSECORE_ARM_MARCH "${DENSECORE_ARM_PROFILE_MARCH}" CACHE STRING
             "Explicit ARM architecture for -march (e.g. armv8.2-a+sve+dotprod)" FORCE)
     endif()
@@ -388,6 +423,9 @@ if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     elseif(CMAKE_CROSSCOMPILING)
         message(STATUS "[DenseCore][ARM64] Cross-compiling: no default -mcpu/-march. "
                        "Set DENSECORE_ARM_MCPU or DENSECORE_ARM_MARCH.")
+    elseif(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+        list(APPEND DENSECORE_ARM_TUNE_FLAGS "-march=armv8-a")
+        message(STATUS "[DenseCore][ARM64] ARM correctness-first mode: using -march=armv8-a.")
     else()
         list(APPEND DENSECORE_ARM_TUNE_FLAGS "-mcpu=native")
         message(STATUS "[DenseCore][ARM64] Non-cross build: enabling -mcpu=native by default.")
@@ -434,7 +472,7 @@ set(SOURCES
     src/sampler/sampler.cpp
     # Backend abstraction
     src/op_registry.cpp
-    src/enterprise_plugin_loader.cpp
+    src/plugin_loader.cpp
     src/graph_executor.cpp
     src/lora_storage.cpp
     src/cpu_backend.cpp
@@ -625,6 +663,9 @@ target_compile_definitions(densecore PRIVATE
     DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM=$<IF:$<BOOL:${DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM}>,1,0>
     DENSECORE_DEFAULT_FUSED_QKV=$<IF:$<BOOL:${DENSECORE_DEFAULT_FUSED_QKV}>,1,0>
 )
+if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+    target_compile_definitions(densecore PRIVATE DENSECORE_ARM_CORRECTNESS_FIRST=1)
+endif()
 
 # AddressSanitizer option for memory debugging
 option(ASAN_BUILD "Enable AddressSanitizer for memory error detection" OFF)
@@ -934,7 +975,7 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(densecore PRIVATE Threads::Threads)
 if(UNIX AND NOT APPLE)
-    # Enterprise plugin loader uses dlopen/dlsym on Linux.
+    # Optional plugin loader uses dlopen/dlsym on Linux.
     target_link_libraries(densecore PRIVATE dl)
 endif()
 
@@ -1124,8 +1165,8 @@ if(DENSECORE_BUILD_TESTS)
         # ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bio_kernels.cpp
         # Logging tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_logging.cpp
-        # Enterprise plugin loader security tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_enterprise_plugin_loader.cpp
+        # Optional plugin loader security tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_plugin_loader.cpp
         # E2E smoke tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_engine_e2e.cpp
     )

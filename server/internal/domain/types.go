@@ -1,5 +1,7 @@
 package domain
 
+import "encoding/json"
+
 // StreamEvent represents a token event in the stream
 type StreamEvent struct {
 	Token      string
@@ -21,6 +23,74 @@ type ChatCompletionRequest struct {
 	Stream            bool            `json:"stream,omitempty"`
 	ResponseFormat    *ResponseFormat `json:"response_format,omitempty"`
 	ExpertCluster     []int           `json:"expert_cluster,omitempty"`
+
+	TemperatureSet       bool `json:"-"`
+	TopPSet              bool `json:"-"`
+	TopKSet              bool `json:"-"`
+	RepetitionPenaltySet bool `json:"-"`
+}
+
+func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
+	type rawChatCompletionRequest struct {
+		Model             string          `json:"model"`
+		Messages          []Message       `json:"messages"`
+		InputIDs          []int           `json:"input_ids,omitempty"`
+		LoraAdapter       string          `json:"lora_adapter,omitempty"`
+		MaxTokens         int             `json:"max_tokens,omitempty"`
+		Temperature       *float64        `json:"temperature,omitempty"`
+		TopP              *float64        `json:"top_p,omitempty"`
+		TopK              *int            `json:"top_k,omitempty"`
+		RepetitionPenalty *float64        `json:"repetition_penalty,omitempty"`
+		Stop              []string        `json:"stop,omitempty"`
+		Stream            bool            `json:"stream,omitempty"`
+		ResponseFormat    *ResponseFormat `json:"response_format,omitempty"`
+		ExpertCluster     []int           `json:"expert_cluster,omitempty"`
+	}
+
+	var raw rawChatCompletionRequest
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	r.Model = raw.Model
+	r.Messages = raw.Messages
+	r.InputIDs = raw.InputIDs
+	r.LoraAdapter = raw.LoraAdapter
+	r.MaxTokens = raw.MaxTokens
+	r.Stop = raw.Stop
+	r.Stream = raw.Stream
+	r.ResponseFormat = raw.ResponseFormat
+	r.ExpertCluster = raw.ExpertCluster
+
+	r.TemperatureSet = raw.Temperature != nil
+	if raw.Temperature != nil {
+		r.Temperature = *raw.Temperature
+	} else {
+		r.Temperature = 0
+	}
+
+	r.TopPSet = raw.TopP != nil
+	if raw.TopP != nil {
+		r.TopP = *raw.TopP
+	} else {
+		r.TopP = 0
+	}
+
+	r.TopKSet = raw.TopK != nil
+	if raw.TopK != nil {
+		r.TopK = *raw.TopK
+	} else {
+		r.TopK = 0
+	}
+
+	r.RepetitionPenaltySet = raw.RepetitionPenalty != nil
+	if raw.RepetitionPenalty != nil {
+		r.RepetitionPenalty = *raw.RepetitionPenalty
+	} else {
+		r.RepetitionPenalty = 0
+	}
+
+	return nil
 }
 
 type ResponseFormat struct {

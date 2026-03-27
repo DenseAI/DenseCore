@@ -266,20 +266,13 @@ class AutoTokenizer:
             >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
             >>> tokens = tokenizer("Hello!", return_tensors="pt")
         """
-        try:
-            import transformers
-        except ImportError:
+        auto_tokenizer_cls = HFAutoTokenizer
+        if auto_tokenizer_cls is None:
             raise ImportError(
                 "Transformers is not installed. "
                 "Please install it via `pip install densecore[hf]` (or `densecore[full]`) "
                 "to use AutoTokenizer, "
                 "or use the native `densecore.LlamaTokenizer` if available."
-            ) from None
-
-        auto_tokenizer_cls = getattr(transformers, "AutoTokenizer", HFAutoTokenizer)
-        if auto_tokenizer_cls is None:
-            raise ImportError(
-                "Transformers is installed but AutoTokenizer is unavailable in this version."
             ) from None
 
         return auto_tokenizer_cls.from_pretrained(

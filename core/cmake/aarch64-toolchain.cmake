@@ -28,10 +28,22 @@ include("${CMAKE_CURRENT_LIST_DIR}/arm_profiles.cmake")
 DenseCoreInitArmTargetProfiles()
 DenseCoreResolveArmProfileMarch(DENSECORE_ARM_PROFILE_MARCH)
 
+if(NOT DEFINED DENSECORE_ARM_CORRECTNESS_FIRST)
+    set(
+        DENSECORE_ARM_CORRECTNESS_FIRST
+        ON
+        CACHE BOOL
+        "Prefer correctness-first ggml defaults on Linux ARM (disable fast kernels unless explicitly re-enabled)"
+    )
+endif()
+
 # Toolchain-level ISA activation:
 # Ensure profile-derived -march is injected into initial C/CXX flags so
 # standalone cross-compiles also get the intended ARM ISA extensions.
 set(_densecore_effective_march "${DENSECORE_ARM_PROFILE_MARCH}")
+if(DENSECORE_ARM_CORRECTNESS_FIRST)
+    set(_densecore_effective_march "armv8-a")
+endif()
 if(DENSECORE_ARM_TARGET STREQUAL "custom" AND DENSECORE_ARM_MARCH)
     set(_densecore_effective_march "${DENSECORE_ARM_MARCH}")
 endif()
@@ -51,6 +63,9 @@ if(DENSECORE_ARM_TARGET STREQUAL "custom")
         set(DENSECORE_ARM_MARCH "${DENSECORE_ARM_PROFILE_MARCH}" CACHE STRING
             "Explicit ARM architecture for -march" FORCE)
     endif()
+elseif(DENSECORE_ARM_CORRECTNESS_FIRST)
+    set(DENSECORE_ARM_MARCH "armv8-a" CACHE STRING
+        "Explicit ARM architecture for -march" FORCE)
 elseif(DENSECORE_ARM_PROFILE_MARCH)
     set(DENSECORE_ARM_MARCH "${DENSECORE_ARM_PROFILE_MARCH}" CACHE STRING
         "Explicit ARM architecture for -march" FORCE)
@@ -61,6 +76,9 @@ if(DENSECORE_ARM_TARGET STREQUAL "custom")
         set(GGML_CPU_ARM_ARCH "${DENSECORE_ARM_PROFILE_GGML_ARCH}" CACHE STRING
             "ggml: CPU architecture for ARM" FORCE)
     endif()
+elseif(DENSECORE_ARM_CORRECTNESS_FIRST)
+    set(GGML_CPU_ARM_ARCH "armv8-a" CACHE STRING
+        "ggml: CPU architecture for ARM" FORCE)
 elseif(DENSECORE_ARM_PROFILE_GGML_ARCH)
     set(GGML_CPU_ARM_ARCH "${DENSECORE_ARM_PROFILE_GGML_ARCH}" CACHE STRING
         "ggml: CPU architecture for ARM" FORCE)
@@ -71,14 +89,23 @@ if(NOT DEFINED GGML_NATIVE)
     set(GGML_NATIVE OFF CACHE BOOL "Optimize for native CPU" FORCE)
 endif()
 
+set(_densecore_default_ggml_arm_kernels ON)
+if(DENSECORE_ARM_CORRECTNESS_FIRST)
+    set(_densecore_default_ggml_arm_kernels OFF)
+endif()
+
 if(NOT DEFINED GGML_LLAMAFILE)
-    set(GGML_LLAMAFILE ON CACHE BOOL "Enable ggml llamafile kernels" FORCE)
+    set(GGML_LLAMAFILE ${_densecore_default_ggml_arm_kernels} CACHE BOOL "Enable ggml llamafile kernels" FORCE)
+endif()
+if(NOT DEFINED GGML_CPU_REPACK)
+    set(GGML_CPU_REPACK ${_densecore_default_ggml_arm_kernels} CACHE BOOL "Enable ggml runtime repack kernels" FORCE)
 endif()
 if(NOT DEFINED GGML_CPU_KLEIDIAI)
-    set(GGML_CPU_KLEIDIAI ON CACHE BOOL "Enable ggml KleidiAI kernels" FORCE)
+    set(GGML_CPU_KLEIDIAI ${_densecore_default_ggml_arm_kernels} CACHE BOOL "Enable ggml KleidiAI kernels" FORCE)
 endif()
 
 message(STATUS "[DenseCore][Toolchain] ARM target profile: ${DENSECORE_ARM_TARGET}")
+message(STATUS "[DenseCore][Toolchain] DENSECORE_ARM_CORRECTNESS_FIRST: ${DENSECORE_ARM_CORRECTNESS_FIRST}")
 if(DENSECORE_ARM_MARCH)
     message(STATUS "[DenseCore][Toolchain] DENSECORE_ARM_MARCH: ${DENSECORE_ARM_MARCH}")
 endif()

@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	cloudserver "github.com/DenseCore/DenseCloud/go/server"
+	cloudserver "github.com/DenseAI/DenseCloud/go/server"
 )
 
 func TestRunStartupRollbackHooksRunsInReverseOrder(t *testing.T) {

@@ -10,6 +10,8 @@ import (
 	"descore-server/internal/domain"
 )
 
+const toolCallTypeFunction = "function"
+
 // ToolPromptFormatter formats tools into a prompt that the model can understand
 type ToolPromptFormatter struct {
 	// Model-specific format (e.g., "qwen", "llama", "generic")
@@ -44,10 +46,10 @@ func (f *ToolPromptFormatter) formatGenericTools(tools []domain.Tool) string {
 	var sb strings.Builder
 	sb.WriteString("\n\n# Available Tools\n\n")
 	sb.WriteString("You have access to the following tools. To use a tool, respond with a JSON object in the following format:\n")
-	sb.WriteString("```json\n{\"tool_calls\": [{\"id\": \"call_<unique_id>\", \"type\": \"function\", \"function\": {\"name\": \"<function_name>\", \"arguments\": \"<json_string>\"}}]}\n```\n\n")
+	sb.WriteString("```json\n{\"tool_calls\": [{\"id\": \"call_<unique_id>\", \"type\": \"" + toolCallTypeFunction + "\", \"function\": {\"name\": \"<function_name>\", \"arguments\": \"<json_string>\"}}]}\n```\n\n")
 
 	for _, tool := range tools {
-		if tool.Type != "function" {
+		if tool.Type != toolCallTypeFunction {
 			continue
 		}
 		sb.WriteString(fmt.Sprintf("## %s\n", tool.Function.Name))
@@ -76,7 +78,7 @@ func (f *ToolPromptFormatter) formatQwenTools(tools []domain.Tool) string {
 	sb.WriteString("You are a helpful assistant with access to the following tools:\n\n")
 
 	for _, tool := range tools {
-		if tool.Type != "function" {
+		if tool.Type != toolCallTypeFunction {
 			continue
 		}
 		toolJSON, err := json.Marshal(tool)
@@ -103,7 +105,7 @@ func (f *ToolPromptFormatter) formatGLMTools(tools []domain.Tool) string {
 	sb.WriteString("Available tools:\n<tools>\n")
 
 	for _, tool := range tools {
-		if tool.Type != "function" {
+		if tool.Type != toolCallTypeFunction {
 			continue
 		}
 		toolJSON, err := json.Marshal(tool)
@@ -126,7 +128,7 @@ func (f *ToolPromptFormatter) formatLlamaTools(tools []domain.Tool) string {
 	sb.WriteString("\n\nYou have access to the following functions:\n\n")
 
 	for _, tool := range tools {
-		if tool.Type != "function" {
+		if tool.Type != toolCallTypeFunction {
 			continue
 		}
 		sb.WriteString(fmt.Sprintf("Use the function '%s' to '%s':\n", tool.Function.Name, tool.Function.Description))
@@ -235,7 +237,7 @@ func (p *ToolCallParser) parseGenericToolCalls(output string) ([]domain.ToolCall
 				parsed.ToolCalls[i].ID = fmt.Sprintf("call_%d", i)
 			}
 			if parsed.ToolCalls[i].Type == "" {
-				parsed.ToolCalls[i].Type = "function"
+				parsed.ToolCalls[i].Type = toolCallTypeFunction
 			}
 		}
 
@@ -266,7 +268,7 @@ func (p *ToolCallParser) parseQwenToolCalls(output string) ([]domain.ToolCall, s
 
 		toolCalls = append(toolCalls, domain.ToolCall{
 			ID:   fmt.Sprintf("call_%d", i),
-			Type: "function",
+			Type: toolCallTypeFunction,
 			Function: domain.ToolCallFunction{
 				Name:      parsed.Name,
 				Arguments: string(parsed.Arguments),
@@ -316,7 +318,7 @@ func (p *ToolCallParser) parseGLMToolCalls(output string) ([]domain.ToolCall, st
 			if err := json.Unmarshal([]byte(body), &parsed); err == nil && parsed.Name != "" {
 				toolCalls = append(toolCalls, domain.ToolCall{
 					ID:   fmt.Sprintf("call_%d", i),
-					Type: "function",
+					Type: toolCallTypeFunction,
 					Function: domain.ToolCallFunction{
 						Name:      parsed.Name,
 						Arguments: string(parsed.Arguments),
@@ -334,7 +336,7 @@ func (p *ToolCallParser) parseGLMToolCalls(output string) ([]domain.ToolCall, st
 
 		toolCalls = append(toolCalls, domain.ToolCall{
 			ID:   fmt.Sprintf("call_%d", i),
-			Type: "function",
+			Type: toolCallTypeFunction,
 			Function: domain.ToolCallFunction{
 				Name:      strings.TrimSpace(nameMatch[1]),
 				Arguments: strings.TrimSpace(argsMatch[1]),
@@ -364,7 +366,7 @@ func (p *ToolCallParser) parseLlamaToolCalls(output string) ([]domain.ToolCall, 
 	for i, match := range matches {
 		toolCalls = append(toolCalls, domain.ToolCall{
 			ID:   fmt.Sprintf("call_%d", i),
-			Type: "function",
+			Type: toolCallTypeFunction,
 			Function: domain.ToolCallFunction{
 				Name:      match[1],
 				Arguments: match[2],
