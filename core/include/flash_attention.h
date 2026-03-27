@@ -74,11 +74,11 @@ struct FlashAttentionScratch {
     }
 
     /**
-     * @brief running statistics 버퍼를 seq_q 크기로 확보 (재할당 최소화).
+     * @brief Ensure the running-stats buffers are sized for seq_q with minimal reallocations.
      *
-     * AlignedVector::resize()는 이미 capacity가 충분하면 할당하지 않으므로,
-     * 연속 호출 시 amortized O(1). 매 호출마다 std::vector를 새로 생성하던
-     * 기존 패턴 대비 prefill hot path에서 malloc/free 오버헤드 제거.
+     * AlignedVector::resize() does not allocate when capacity is already sufficient, so
+     * repeated calls are amortized O(1). Compared with the old pattern of creating a new
+     * std::vector on every call, this removes malloc/free overhead from the prefill hot path.
      */
     void EnsureGlobalStats(int seq_q) {
         if (static_cast<int>(global_max.size()) < seq_q) {
@@ -89,11 +89,11 @@ struct FlashAttentionScratch {
 };
 
 /**
- * @brief head_dim/seq_len 기반 블록 사이즈 자동 튜닝.
+ * @brief Automatically tune block sizes based on head_dim/seq_len.
  *
- * head_dim이 작을수록 레지스터에 여유가 생겨 더 큰 블록으로
- * K/V 타일을 재사용할 수 있음. 기본값 64×64는 head_dim=128 기준
- * L2 캐시 최적화 결과이며, 다른 사이즈에서는 비효율적일 수 있음.
+ * Smaller head_dim leaves more register room, which allows larger blocks and
+ * better reuse of K/V tiles. The default 64x64 setting is optimized for
+ * head_dim = 128 and L2 cache behavior, and may be inefficient for other sizes.
  */
 inline FlashAttentionConfig AutoTuneFlashConfig(int head_dim, int /*seq_len*/ = 0) {
     FlashAttentionConfig config;

@@ -102,6 +102,9 @@ Changelog = "https://github.com/DenseCore/DenseCore/blob/main/CHANGELOG.md"
 
 
 
+[tool.setuptools]
+license-files = ["LICENSE"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["densecore*"]
