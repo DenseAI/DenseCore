@@ -66,7 +66,7 @@ ARG TARGETARCH
 ARG DENSEVLA_ARM_TARGET=generic
 RUN mkdir -p build && cd build && \
     if [ "$TARGETARCH" = "arm64" ]; then \
-    EXTRA_FLAGS="-DCMAKE_TOOLCHAIN_FILE=../core/cmake/aarch64-toolchain.cmake -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DDENSEVLA_ARM_TARGET=${DENSEVLA_ARM_TARGET}"; \
+    EXTRA_FLAGS="-DCMAKE_TOOLCHAIN_FILE=../core/cmake/aarch64-toolchain.cmake -DDENSEVLA_ARM_TARGET=${DENSEVLA_ARM_TARGET}"; \
     else \
     EXTRA_FLAGS=""; \
     fi && \

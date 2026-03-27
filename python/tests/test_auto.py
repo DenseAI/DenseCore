@@ -104,7 +104,7 @@ class TestAutoTokenizer:
 
         mock_tokenizer = MagicMock()
 
-        with patch("transformers.AutoTokenizer") as mock_hf_tokenizer:
+        with patch("densecore.auto.HFAutoTokenizer") as mock_hf_tokenizer:
             mock_hf_tokenizer.from_pretrained.return_value = mock_tokenizer
 
             result = AutoTokenizer.from_pretrained(

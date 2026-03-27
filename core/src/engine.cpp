@@ -38,6 +38,12 @@ static void ConfigureHybridScheduler(EngineState* state, TransformerModel* model
         return;
     }
 
+#ifdef DENSECORE_TEST_BUILD
+    if (model && model->is_mock) {
+        return;
+    }
+#endif
+
     state->hybrid_enabled = true;
     state->hybrid_scheduler = std::make_unique<densecore::HybridScheduler>();
     state->hybrid_scheduler->SetCpuBackend(&densecore::GetCpuBackend());

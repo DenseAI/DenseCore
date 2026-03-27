@@ -139,8 +139,8 @@ class GenerationConfig:
     # ==========================================================================
     # Sampling Parameters
     # ==========================================================================
-    do_sample: bool = False  # HF default: greedy decoding
-    temperature: float = 0.0
+    do_sample: Optional[bool] = None  # None = preserve provided sampling params
+    temperature: float = 1.0
     top_p: float = 1.0  # Nucleus sampling
     top_k: int = 0  # 0 = disabled
     typical_p: float = 1.0  # HF: typical decoding
@@ -226,8 +226,8 @@ class GenerationConfig:
         if isinstance(self.eos_token_id, int):
             self.stop_token_ids = [self.eos_token_id] + self.stop_token_ids
 
-        # Greedy decoding: disable sampling when do_sample=False
-        if not self.do_sample:
+        # Explicit greedy decoding: disable sampling only when caller opts in.
+        if self.do_sample is False:
             self.temperature = 0.0
             self.top_p = 1.0
             self.top_k = 0
@@ -310,6 +310,7 @@ class SamplingParams:
         """Convert to GenerationConfig."""
         return GenerationConfig(
             max_tokens=self.max_tokens,
+            do_sample=self.temperature > 0.0,
             temperature=self.temperature,
             top_p=self.top_p,
             top_k=self.top_k if self.top_k > 0 else 0,

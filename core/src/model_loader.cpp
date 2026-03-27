@@ -66,7 +66,7 @@ static TransformerModel* CreateMockModel() {
     model->cpu_backend = model->backend;
     model->cpu_backend = model->backend;
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(DENSECORE_TEST_BUILD)
     if (densecore::apple::IsAppleHybridEnabled()) {
         ggml_backend_t metal_backend = ggml_backend_metal_init();
         if (metal_backend) {
