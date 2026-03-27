@@ -1,6 +1,6 @@
 //go:build !denseenterprise
 
-package enterprise
+package extensions
 
 import (
 	"context"

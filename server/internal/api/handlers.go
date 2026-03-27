@@ -26,11 +26,6 @@ const (
 	// DefaultThreads is the default number of threads for model loading
 	DefaultThreads = 4
 
-	// TokenApproxRatio approximates token count from character length.
-	// This is a rough heuristic (avg ~4 chars per token for English).
-	// TODO(debt): Replace with actual tokenizer for accurate billing.
-	TokenApproxRatio = 4
-
 	// KVCacheCriticalThreshold is the KV cache usage percent above which
 	// the service is considered degraded and readiness probe fails.
 	// Set to 90% to allow headroom before actual capacity issues.
@@ -259,9 +254,11 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 
 	// Use strings.Builder for efficient concatenation
 	var responseBuilder strings.Builder
+	completionTokens := 0
 	for event := range outputChan {
 		if event.Token != "" {
 			responseBuilder.WriteString(event.Token)
+			completionTokens++
 		}
 		if event.IsFinished {
 			break
@@ -269,6 +266,7 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 	}
 
 	responseText := responseBuilder.String()
+	promptTokens := h.countChatPromptTokens(req)
 	resp := domain.ChatCompletionResponse{
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 		Object:  "chat.completion",
@@ -285,8 +283,9 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 			},
 		},
 		Usage: domain.Usage{
-			// TODO(debt): Use actual tokenizer for accurate token counting
-			CompletionTokens: len(responseText) / TokenApproxRatio,
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      promptTokens + completionTokens,
 		},
 	}
 
@@ -329,17 +328,14 @@ func (h *Handler) EmbeddingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	embeddings := make([]domain.EmbeddingData, 0, len(texts))
-	totalTokens := 0
-
 	for i, embd := range batchEmbeddings {
 		embeddings = append(embeddings, domain.EmbeddingData{
 			Object:    "embedding",
 			Embedding: embd,
 			Index:     i,
 		})
-		// TODO(debt): Use actual tokenizer for accurate token counting
-		totalTokens += len(texts[i]) / TokenApproxRatio
 	}
+	totalTokens := h.countTextTokens(texts, true, false)
 
 	resp := domain.EmbeddingResponse{
 		Object: "list",
@@ -473,8 +469,7 @@ func (h *Handler) RerankHandler(w http.ResponseWriter, r *http.Request) {
 		Results: results,
 		Model:   req.Model,
 		Usage: domain.Usage{
-			// TODO(debt): Use actual tokenizer for accurate token counting
-			TotalTokens: (len(req.Query) + sumStringLengths(docTexts)) / TokenApproxRatio,
+			TotalTokens: h.countTextTokens(append([]string{req.Query}, docTexts...), true, false),
 		},
 	}
 
@@ -514,12 +509,35 @@ func sqrt32(x float32) float32 {
 }
 
 // sumStringLengths returns sum of string lengths
-func sumStringLengths(strs []string) int {
+func (h *Handler) countChatPromptTokens(req domain.ChatCompletionRequest) int {
+	if len(req.InputIDs) > 0 {
+		return len(req.InputIDs)
+	}
+	return h.countSingleTextTokens(service.ExtractPrompt(req.Messages), true, false)
+}
+
+func (h *Handler) countTextTokens(texts []string, addBOS bool, addEOS bool) int {
 	total := 0
-	for _, s := range strs {
-		total += len(s)
+	for _, text := range texts {
+		total += h.countSingleTextTokens(text, addBOS, addEOS)
 	}
 	return total
+}
+
+func (h *Handler) countSingleTextTokens(text string, addBOS bool, addEOS bool) int {
+	if text == "" {
+		return 0
+	}
+	engine := h.modelService.GetEngine()
+	if engine == nil {
+		return 0
+	}
+	count, err := engine.CountTokens(text, addBOS, addEOS)
+	if err != nil {
+		slog.Warn("token counting failed", slog.String("error", err.Error()))
+		return 0
+	}
+	return count
 }
 
 func (h *Handler) LoadModelHandler(w http.ResponseWriter, r *http.Request) {

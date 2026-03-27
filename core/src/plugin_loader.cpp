@@ -1,16 +1,16 @@
 /**
- * @file enterprise_plugin_loader.cpp
- * @brief dlopen-based enterprise plugin loader implementation
+ * @file plugin_loader.cpp
+ * @brief dlopen-based optional plugin loader implementation
  *
  * Discovers and loads libdensecore_ent.so at runtime, resolving the
- * plugin init symbol to activate enterprise features.
+ * plugin init symbol to activate optional features.
  * Gracefully fails when .so is absent (normal OSS operation continues).
  *
  * Complexity: O(1) — dlopen + dlsym + single function call
  */
 
+#include "densecore/plugin_loader.h"
 #include "densecore/confidential_compute.h"
-#include "densecore/enterprise_plugin.h"
 #include "densecore/license_validator.h"
 #include "densecore/numa_routing.h"
 #include "densecore/telemetry_sink.h"
@@ -75,7 +75,7 @@ struct PluginState {
     bool loaded = false;
 };
 
-// Single global plugin state — only one enterprise plugin is supported.
+// Single global plugin state — only one plugin is supported.
 PluginState g_plugin;
 
 // VTable registries (written once during init, read concurrently after).
@@ -223,18 +223,17 @@ int ResolvePluginPath(const char* plugin_path, std::string* resolved_path) {
 
         requested = requested.lexically_normal();
         if (!requested.is_absolute()) {
-            ENT_LOG_ERROR("Rejected enterprise plugin path '%s': must resolve to an absolute path", raw_input.c_str());
+            ENT_LOG_ERROR("Rejected plugin path '%s': must resolve to an absolute path", raw_input.c_str());
             return kPluginPathInvalid;
         }
         if (requested.filename() != kDefaultPluginName) {
-            ENT_LOG_ERROR("Rejected enterprise plugin path '%s': filename must be '%s'", raw_input.c_str(),
-                          kDefaultPluginName);
+            ENT_LOG_ERROR("Rejected plugin path '%s': filename must be '%s'", raw_input.c_str(), kDefaultPluginName);
             return kPluginPathInvalid;
         }
 
         candidate_path = requested;
         if (!IsPathWithinBase(candidate_path, canonical_loader_dir)) {
-            ENT_LOG_ERROR("Rejected enterprise plugin path '%s': outside trusted directory '%s'", raw_input.c_str(),
+            ENT_LOG_ERROR("Rejected plugin path '%s': outside trusted directory '%s'", raw_input.c_str(),
                           canonical_loader_dir.string().c_str());
             return kPluginPathInvalid;
         }
@@ -243,8 +242,7 @@ int ResolvePluginPath(const char* plugin_path, std::string* resolved_path) {
     ec.clear();
     const bool exists = fs::exists(candidate_path, ec);
     if (ec) {
-        ENT_LOG_ERROR("Failed to inspect enterprise plugin path '%s': %s", candidate_path.string().c_str(),
-                      ec.message().c_str());
+        ENT_LOG_ERROR("Failed to inspect plugin path '%s': %s", candidate_path.string().c_str(), ec.message().c_str());
         return kPluginPathInvalid;
     }
     if (!exists) {
@@ -255,8 +253,7 @@ int ResolvePluginPath(const char* plugin_path, std::string* resolved_path) {
     ec.clear();
     const bool is_regular_file = fs::is_regular_file(candidate_path, ec);
     if (ec) {
-        ENT_LOG_ERROR("Failed to inspect enterprise plugin path '%s': %s", candidate_path.string().c_str(),
-                      ec.message().c_str());
+        ENT_LOG_ERROR("Failed to inspect plugin path '%s': %s", candidate_path.string().c_str(), ec.message().c_str());
         return kPluginPathInvalid;
     }
     if (!is_regular_file) {
@@ -267,12 +264,12 @@ int ResolvePluginPath(const char* plugin_path, std::string* resolved_path) {
     if (has_custom_path) {
         const fs::path canonical_candidate = fs::canonical(candidate_path, ec);
         if (ec) {
-            ENT_LOG_ERROR("Failed to canonicalize enterprise plugin path '%s': %s", candidate_path.string().c_str(),
+            ENT_LOG_ERROR("Failed to canonicalize plugin path '%s': %s", candidate_path.string().c_str(),
                           ec.message().c_str());
             return kPluginPathInvalid;
         }
         if (!IsPathWithinBase(canonical_candidate, canonical_loader_dir)) {
-            ENT_LOG_ERROR("Rejected enterprise plugin path '%s': outside trusted directory '%s'",
+            ENT_LOG_ERROR("Rejected plugin path '%s': outside trusted directory '%s'",
                           canonical_candidate.string().c_str(), canonical_loader_dir.string().c_str());
             return kPluginPathInvalid;
         }
@@ -293,14 +290,14 @@ extern "C" {
 
 int DenseCoreEntLoadPlugin(const char* plugin_path, void* engine) {
     if (g_plugin.loaded) {
-        ENT_LOG_WARN("Enterprise plugin already loaded, ignoring duplicate load");
+        ENT_LOG_WARN("Plugin already loaded, ignoring duplicate load");
         return 0;
     }
 
     std::string resolved_path;
     const int path_result = ResolvePluginPath(plugin_path, &resolved_path);
     if (path_result == 1) {
-        ENT_LOG_INFO("Enterprise plugin not found at '%s' (running in OSS mode)", resolved_path.c_str());
+        ENT_LOG_INFO("Plugin not found at '%s' (running in OSS mode)", resolved_path.c_str());
         return 1;
     }
     if (path_result < 0) {
@@ -318,9 +315,9 @@ int DenseCoreEntLoadPlugin(const char* plugin_path, void* engine) {
 
     if (!g_plugin.dl_handle) {
 #ifdef _WIN32
-        ENT_LOG_ERROR("Enterprise plugin failed to load from '%s'", path);
+        ENT_LOG_ERROR("Plugin failed to load from '%s'", path);
 #else
-        ENT_LOG_ERROR("Enterprise plugin failed to load from '%s': %s", path, dlerror());
+        ENT_LOG_ERROR("Plugin failed to load from '%s': %s", path, dlerror());
 #endif
         return -1;
     }
@@ -334,7 +331,7 @@ int DenseCoreEntLoadPlugin(const char* plugin_path, void* engine) {
 #endif
 
     if (!init_fn) {
-        ENT_LOG_ERROR("Enterprise plugin loaded but missing symbol: %s", DENSECORE_ENT_PLUGIN_SYMBOL);
+        ENT_LOG_ERROR("Plugin loaded but missing symbol: %s", DENSECORE_ENT_PLUGIN_SYMBOL);
         ClearRegisteredVTables();
         RollbackFailedLoad();
         return -1;
@@ -356,7 +353,7 @@ int DenseCoreEntLoadPlugin(const char* plugin_path, void* engine) {
     int result = g_plugin.init_fn(engine, &plugin_info);
 
     if (result != 0 || !plugin_info) {
-        ENT_LOG_ERROR("Enterprise plugin init failed (code=%d)", result);
+        ENT_LOG_ERROR("Plugin init failed (code=%d)", result);
         // Plugin init can register vtables before returning failure.
         ClearRegisteredVTables();
         RollbackFailedLoad();
@@ -366,8 +363,8 @@ int DenseCoreEntLoadPlugin(const char* plugin_path, void* engine) {
     // API version compatibility check
     uint32_t major = (plugin_info->api_version >> 16) & 0xFFFF;
     if (major != DENSECORE_ENT_API_VERSION_MAJOR) {
-        ENT_LOG_ERROR("Enterprise plugin API version mismatch: host=%u.x, plugin=%u.%u",
-                      DENSECORE_ENT_API_VERSION_MAJOR, major, plugin_info->api_version & 0xFFFF);
+        ENT_LOG_ERROR("Plugin API version mismatch: host=%u.x, plugin=%u.%u", DENSECORE_ENT_API_VERSION_MAJOR, major,
+                      plugin_info->api_version & 0xFFFF);
         // Plugin init already ran, so clear any registered callbacks before unload.
         ClearRegisteredVTables();
         RollbackFailedLoad();
@@ -380,8 +377,7 @@ int DenseCoreEntLoadPlugin(const char* plugin_path, void* engine) {
     char capability_hex[32];
     std::snprintf(capability_hex, sizeof(capability_hex), "0x%llX",
                   static_cast<unsigned long long>(plugin_info->capabilities));
-    ENT_LOG_INFO("Enterprise plugin loaded: %s v%s (capabilities=%s)", plugin_info->name, plugin_info->version,
-                 capability_hex);
+    ENT_LOG_INFO("Plugin loaded: %s v%s (capabilities=%s)", plugin_info->name, plugin_info->version, capability_hex);
 
     return 0;
 }
@@ -409,16 +405,16 @@ void DenseCoreEntUnloadPlugin(void) {
 
     g_plugin = PluginState{};
 
-    ENT_LOG_INFO("Enterprise plugin unloaded");
+    ENT_LOG_INFO("Plugin unloaded");
 }
 
 // =============================================================================
-// VTable Registration (called by enterprise plugin during init)
+// VTable Registration (called by plugin during init)
 // =============================================================================
 
 void DenseCoreEntRegisterTelemetry(const DenseCoreEntTelemetryVTable* vtable) {
     g_telemetry_vtable.store(vtable, std::memory_order_release);
-    ENT_LOG_INFO("Enterprise telemetry VTable registered");
+    ENT_LOG_INFO("Telemetry VTable registered");
 }
 
 const DenseCoreEntTelemetryVTable* DenseCoreEntGetTelemetryVTable(void) {
@@ -427,7 +423,7 @@ const DenseCoreEntTelemetryVTable* DenseCoreEntGetTelemetryVTable(void) {
 
 void DenseCoreEntRegisterLicense(const DenseCoreEntLicenseVTable* vtable) {
     g_license_vtable.store(vtable, std::memory_order_release);
-    ENT_LOG_INFO("Enterprise license VTable registered");
+    ENT_LOG_INFO("License VTable registered");
 }
 
 const DenseCoreEntLicenseVTable* DenseCoreEntGetLicenseVTable(void) {
@@ -436,7 +432,7 @@ const DenseCoreEntLicenseVTable* DenseCoreEntGetLicenseVTable(void) {
 
 void DenseCoreEntRegisterNumaRouting(const DenseCoreEntNumaRoutingVTable* vtable) {
     g_numa_routing_vtable.store(vtable, std::memory_order_release);
-    ENT_LOG_INFO("Enterprise NUMA routing VTable registered");
+    ENT_LOG_INFO("NUMA routing VTable registered");
 }
 
 const DenseCoreEntNumaRoutingVTable* DenseCoreEntGetNumaRoutingVTable(void) {
@@ -445,7 +441,7 @@ const DenseCoreEntNumaRoutingVTable* DenseCoreEntGetNumaRoutingVTable(void) {
 
 void DenseCoreEntRegisterConfidential(const DenseCoreEntConfidentialVTable* vtable) {
     g_confidential_vtable.store(vtable, std::memory_order_release);
-    ENT_LOG_INFO("Enterprise confidential-computing VTable registered");
+    ENT_LOG_INFO("Confidential-computing VTable registered");
 }
 
 const DenseCoreEntConfidentialVTable* DenseCoreEntGetConfidentialVTable(void) {

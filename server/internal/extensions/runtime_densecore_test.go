@@ -1,6 +1,6 @@
 //go:build denseenterprise && densecore_cgo && cgo
 
-package enterprise
+package extensions
 
 import (
 	"io"

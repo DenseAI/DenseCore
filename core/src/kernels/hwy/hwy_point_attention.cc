@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -49,7 +50,11 @@ void PointAttentionImpl(const float* HWY_RESTRICT query, const float* HWY_RESTRI
 
     // Workspace requirement: k floats for scores
     size_t required_bytes = k * sizeof(float);
-    if (workspace_size < required_bytes) return;
+    if (workspace_size < required_bytes) {
+        fprintf(stderr, "[PointAttention] workspace too small: need %zu B, got %zu B\n",
+                required_bytes, workspace_size);
+        return;
+    }
 
     float* scores = reinterpret_cast<float*>(workspace);
 

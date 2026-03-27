@@ -473,7 +473,7 @@ set(SOURCES
     src/sampler/sampler.cpp
     # Backend abstraction
     src/op_registry.cpp
-    src/enterprise_plugin_loader.cpp
+    src/plugin_loader.cpp
     src/graph_executor.cpp
     src/lora_storage.cpp
     src/cpu_backend.cpp
@@ -976,7 +976,7 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(densecore PRIVATE Threads::Threads)
 if(UNIX AND NOT APPLE)
-    # Enterprise plugin loader uses dlopen/dlsym on Linux.
+    # Optional plugin loader uses dlopen/dlsym on Linux.
     target_link_libraries(densecore PRIVATE dl)
 endif()
 
@@ -1166,8 +1166,8 @@ if(DENSECORE_BUILD_TESTS)
         # ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bio_kernels.cpp
         # Logging tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_logging.cpp
-        # Enterprise plugin loader security tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_enterprise_plugin_loader.cpp
+        # Optional plugin loader security tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_plugin_loader.cpp
         # E2E smoke tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_engine_e2e.cpp
     )

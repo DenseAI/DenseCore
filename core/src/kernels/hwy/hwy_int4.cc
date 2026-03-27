@@ -19,6 +19,19 @@
  *    full (hide 4-cycle FMA latency on modern CPUs).
  *
  * Unified for AVX-512, AVX2, NEON, SVE, and Scalar via Highway dispatch.
+ *
+ * AMX / Tile-accelerator gap
+ * --------------------------
+ * Intel AMX (Sapphire Rapids+) and Apple AMX operate on 2-D tiles, not SIMD
+ * vectors.  Highway does not abstract these accelerators, so the kernels here
+ * cannot exploit them automatically.  To close the gap for large-batch MatMul:
+ *   1. Add a compile-time detection block (e.g. #if defined(__AMX_INT8__))
+ *      in a new file hwy_int4_amx.cc alongside this file.
+ *   2. Implement tile-load (TILELOADD), TDPBSSD dot-product, and TILESTORED
+ *      using <immintrin.h> AMX intrinsics.
+ *   3. Register the AMX path in the HWY_EXPORT dispatch table so it is
+ *      selected at runtime when the CPU supports it (CPUID leaf 7, AMX_INT8).
+ * Until then, the Highway FMA path is the best portable fallback.
  */
 
 #undef HWY_TARGET_INCLUDE
@@ -57,18 +70,37 @@ HWY_INLINE float UnpackNibbleScalar(const uint8_t* packed, int k, float scale, f
 }
 
 // ============================================================================
-// Prepack: row-major identity copy
+// Prepack: 4-row column-interleaved layout
 //
-// [P5 fix] The function was named "Interleaved" but performed a plain row-wise
-// memcpy — no interleaving of nibbles or bytes occurred.  The row-major layout
-// (each row packed contiguously as K/2 bytes) is already optimal for the
-// N-blocked GEMV kernel above, which walks each weight row sequentially.
+// Transforms [N, packed_K] row-major weights into a 4-row column-interleaved
+// layout designed for VNNI / ARM DotProd optimised kernels:
 //
-// Renamed conceptually to "identity prepack": validates and copies the
-// already-optimal layout.  A true interleaved layout (e.g. interleaving bytes
-// from adjacent rows for VNNI-style access) would require a different kernel
-// and is not currently used.  If an interleaved layout is needed in the future,
-// add a separate PrepackInt4WeightsInterleaved() that does actual reordering.
+//   Original (row-major):
+//     row0[b0], row0[b1], ..., row0[bK-1],
+//     row1[b0], row1[b1], ..., row1[bK-1],
+//     row2[b0], ...
+//     row3[b0], ...
+//
+//   Interleaved (groups of 4 rows, column-first within each group):
+//     row0[b0], row1[b0], row2[b0], row3[b0],   <- byte position 0
+//     row0[b1], row1[b1], row2[b1], row3[b1],   <- byte position 1
+//     ...
+//     row0[bK-1], row1[bK-1], row2[bK-1], row3[bK-1]
+//
+// Benefit: the bytes for the same K-position of 4 consecutive rows are now
+// adjacent in memory.  A future VNNI/DotProd kernel can load them with a
+// single 4-byte (or 32-byte with AVX2 gather) load and issue one dot-product
+// instruction per K-tile across all 4 output channels simultaneously.
+//
+// Total storage: unchanged — N × packed_K bytes.
+//
+// NOTE: This output format is NOT compatible with GemvInt4Impl or
+// GemmInt4BatchedImpl, which expect plain row-major weights.  Pass the
+// interleaved buffer only to a kernel that explicitly handles this layout.
+//
+// Tail rows (N % 4 != 0) are stored row-major in the remaining space at the
+// same byte offset they would occupy in a plain row-major array, so the
+// caller can always address them as dst[n * packed_K] for n >= (N & ~3).
 // ============================================================================
 void PrepackInt4WeightsInterleavedImpl(const uint8_t* HWY_RESTRICT src, uint8_t* HWY_RESTRICT dst, int K, int N,
                                        int group_size, int block_size) {
@@ -77,13 +109,33 @@ void PrepackInt4WeightsInterleavedImpl(const uint8_t* HWY_RESTRICT src, uint8_t*
     (void)block_size;
 
     const int packed_K = PackedBytesForInt4(K);
+    const int n_full = (N / 4) * 4;  // rows that fit in complete groups of 4
 
-    // Keep prepack single-threaded here; inference-time parallelism is managed
-    // by DenseCore/GGML thread pools and should not nest with OpenMP workers.
-    for (int row = 0; row < N; ++row) {
-        const uint8_t* src_row = src + static_cast<int64_t>(row) * packed_K;
-        uint8_t* dst_row = dst + static_cast<int64_t>(row) * packed_K;
-        std::memcpy(dst_row, src_row, packed_K);
+    // Interleave 4 rows at a time.
+    // dst layout for row group r (rows r*4 .. r*4+3):
+    //   base = dst + r * 4 * packed_K
+    //   byte b of row ri: base[b * 4 + ri]
+    for (int n = 0; n < n_full; n += 4) {
+        const int r = n / 4;
+        const uint8_t* s0 = src + static_cast<int64_t>(n + 0) * packed_K;
+        const uint8_t* s1 = src + static_cast<int64_t>(n + 1) * packed_K;
+        const uint8_t* s2 = src + static_cast<int64_t>(n + 2) * packed_K;
+        const uint8_t* s3 = src + static_cast<int64_t>(n + 3) * packed_K;
+        uint8_t* d = dst + static_cast<int64_t>(r) * 4 * packed_K;
+        for (int b = 0; b < packed_K; ++b) {
+            d[b * 4 + 0] = s0[b];
+            d[b * 4 + 1] = s1[b];
+            d[b * 4 + 2] = s2[b];
+            d[b * 4 + 3] = s3[b];
+        }
+    }
+
+    // Tail rows (N % 4 != 0): copy row-major at their natural offset.
+    // n_full * packed_K == n_full/4 * 4 * packed_K, so they follow immediately.
+    for (int n = n_full; n < N; ++n) {
+        const uint8_t* src_row = src + static_cast<int64_t>(n) * packed_K;
+        uint8_t* dst_row = dst + static_cast<int64_t>(n) * packed_K;
+        std::memcpy(dst_row, src_row, static_cast<size_t>(packed_K));
     }
 }
 

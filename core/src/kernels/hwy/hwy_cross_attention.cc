@@ -11,6 +11,7 @@
 
 #include "kernels/hwy/hwy_kernels.h"
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -77,7 +78,11 @@ void CrossAttentionImpl(const float* HWY_RESTRICT q_data, const float* HWY_RESTR
     // Workspace Requirements:
     // attn_scores: seq_k
     size_t required_bytes = seq_k * sizeof(float);
-    if (workspace_size < required_bytes) return;
+    if (workspace_size < required_bytes) {
+        fprintf(stderr, "[CrossAttention] workspace too small: need %zu B, got %zu B\n",
+                required_bytes, workspace_size);
+        return;
+    }
 
     float* ws_ptr = reinterpret_cast<float*>(workspace);
     float* attn_scores = ws_ptr;

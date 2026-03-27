@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -148,10 +149,8 @@ void WindowAttentionImpl(const float* HWY_RESTRICT query, const float* HWY_RESTR
     required_bytes += score_size * sizeof(float);
 
     if (workspace_size < required_bytes) {
-        // In a kernel, we can't easily throw or log without overhead.
-        // Assuming caller validated size or we just return/crash safely.
-        // ideally:
-        // fprintf(stderr, "Workspace too small\n");
+        fprintf(stderr, "[WindowAttention] workspace too small: need %zu B, got %zu B\n",
+                required_bytes, workspace_size);
         return;
     }
 

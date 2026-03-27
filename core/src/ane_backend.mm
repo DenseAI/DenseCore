@@ -746,9 +746,9 @@ BackendCapabilityManifest ANEBackend::GetCapabilityManifest() const {
         OpType::Softmax,             // Metal GPU or CPU
         OpType::SiLU,                // CPU implementation
         OpType::GELU,                // CPU implementation
-        OpType::RoPE,                // Metal GPU kernel
+        OpType::RoPE,                // Metal GPU kernel (ANE if CompileRoPE model cached)
         OpType::FusedQKVProjection,  // Metal GPU kernel
-        OpType::FlashAttention,      // Metal GPU FlashAttention kernel
+        OpType::FlashAttention,      // Metal GPU kernel (ANE if CompileFlashAttention model cached)
     };
 
     // ANE-only mode forbids fallback use by design.
@@ -1218,18 +1218,118 @@ void ANEBackend::SoftmaxInplace(Tensor* data) {
 void ANEBackend::RoPE(const Tensor& input, const Tensor& cos_sin, const int* positions,
                       Tensor* output, int rope_dim) {
     // ==========================================================================
-    // PRODUCTION STRATEGY: Delegate RoPE to Metal GPU
+    // ANE path: check for a pre-compiled offline CoreML RoPE model.
+    // When available this keeps RoPE on ANE, eliminating the ANE↔Metal context
+    // switch that occurs when the rest of the transformer layer runs on ANE but
+    // RoPE is delegated to the Metal GPU.
+    //
+    // If no offline model is registered (CompileRoPE not called), fall through
+    // to the Metal GPU path which remains the default for runtime compilation.
     // ==========================================================================
-    // RoPE is a lightweight per-token operation that doesn't benefit from ANE's
-    // matrix-focused architecture. Metal GPU provides excellent performance for
-    // RoPE with its flexible compute shaders.
-    // ==========================================================================
+    {
+        CompiledOp* rope_op = nullptr;
+        std::string rope_key;
+        const int64_t total_elements = input.NumElements();
+        {
+            std::lock_guard<std::mutex> lock(impl_->opsMutex);
+            for (auto& [k, v] : impl_->compiledOps) {
+                if (v->type == ANEOpType::RoPE && v->status == ANEOpStatus::Ready &&
+                    v->model != nil &&
+                    static_cast<int64_t>(v->M) * static_cast<int64_t>(v->N) == total_elements) {
+                    rope_op = v.get();
+                    rope_key = k;
+                    impl_->UpdateLRU(k);
+                    break;
+                }
+            }
+        }
+        if (rope_op) {
+            @autoreleasepool {
+                impl_->SyncMetalFallback();
+                NSError* error = nil;
 
+                // Zero-copy MLMultiArray wrapping the input tensor.
+                NSMutableArray<NSNumber*>* inputShape = [NSMutableArray array];
+                NSMutableArray<NSNumber*>* inputStrides = [NSMutableArray array];
+                for (int d = 0; d < input.ndim; ++d) {
+                    [inputShape addObject:@(input.shape[d])];
+                    [inputStrides addObject:@(input.stride[d])];
+                }
+                MLMultiArray* inputArr =
+                    [[MLMultiArray alloc] initWithDataPointer:(void*)input.data
+                                                        shape:inputShape
+                                                     dataType:MLMultiArrayDataTypeFloat32
+                                                      strides:inputStrides
+                                                  deallocator:nil
+                                                        error:&error];
+                if (!inputArr) {
+                    std::cerr << "[ANEBackend] RoPE: failed to wrap input: " <<
+                        [[error localizedDescription] UTF8String] << std::endl;
+                    goto metal_rope_fallback;
+                }
+
+                // Positions as int32 MLMultiArray (copy required — CoreML needs Int32).
+                {
+                    const int seq_len = rope_op->N;
+                    NSArray<NSNumber*>* posShape = @[ @(seq_len) ];
+                    MLMultiArray* posArr =
+                        [[MLMultiArray alloc] initWithShape:posShape
+                                                   dataType:MLMultiArrayDataTypeInt32
+                                                      error:&error];
+                    if (!posArr) {
+                        std::cerr << "[ANEBackend] RoPE: failed to create positions array"
+                                  << std::endl;
+                        goto metal_rope_fallback;
+                    }
+                    int32_t* posPtr = static_cast<int32_t*>([posArr dataPointer]);
+                    for (int i = 0; i < seq_len; ++i) {
+                        posPtr[i] = static_cast<int32_t>(positions[i]);
+                    }
+
+                    NSDictionary* features = @{
+                        rope_op->inputName : [MLFeatureValue featureValueWithMultiArray:inputArr],
+                        @"positions" : [MLFeatureValue featureValueWithMultiArray:posArr]
+                    };
+                    MLDictionaryFeatureProvider* provider =
+                        [[MLDictionaryFeatureProvider alloc] initWithDictionary:features
+                                                                          error:&error];
+                    if (!provider) {
+                        std::cerr << "[ANEBackend] RoPE: failed to create feature provider"
+                                  << std::endl;
+                        goto metal_rope_fallback;
+                    }
+
+                    id<MLFeatureProvider> result = [rope_op->model predictionFromFeatures:provider
+                                                                                    error:&error];
+                    if (!result) {
+                        std::cerr << "[ANEBackend] RoPE ANE prediction failed: " <<
+                            [[error localizedDescription] UTF8String] << std::endl;
+                        goto metal_rope_fallback;
+                    }
+
+                    MLFeatureValue* outFeat = [result featureValueForName:rope_op->outputName];
+                    if (!outFeat) {
+                        std::cerr << "[ANEBackend] RoPE: output feature not found" << std::endl;
+                        goto metal_rope_fallback;
+                    }
+
+                    const float* srcPtr =
+                        static_cast<const float*>([[outFeat multiArrayValue] dataPointer]);
+                    std::memcpy(output->data, srcPtr, input.SizeBytes());
+
+                    rope_op->stats.total_executions++;
+                    rope_op->stats.uses_ane = true;
+                    return;
+                }
+            }
+        }
+    }
+
+metal_rope_fallback:
     if (impl_->aneOnlyMode) {
         ThrowANEOnlyUnsupported("RoPE");
     }
-    MetalBackend* metal = impl_->GetMetalFallback();
-    if (metal) {
+    if (MetalBackend* metal = impl_->GetMetalFallback()) {
         metal->RoPE(input, cos_sin, positions, output, rope_dim);
         impl_->MaybeSyncMetalFallback();
         return;
@@ -1257,20 +1357,105 @@ void ANEBackend::FusedQKVProjection(const Tensor& input, const Tensor& wq, const
 void ANEBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output,
                                 float scale, bool causal, int n_head_kv) {
     // ==========================================================================
-    // PRODUCTION STRATEGY: Delegate FlashAttention to Metal GPU
+    // ANE path: check for a pre-compiled offline CoreML FlashAttention model.
+    // When compiled offline (CompileFlashAttention), the entire QKV attention
+    // computation stays on ANE as a single graph dispatch, avoiding the
+    // repeated ANE↔Metal context switches that degrade throughput.
+    //
+    // Offline compilation is strongly recommended for fixed-shape decode paths
+    // (batch=1, seq_len=1) where the ANE/Metal switch cost dominates.
+    // If no offline model matches, the Metal GPU path is used as before.
     // ==========================================================================
-    // FlashAttention requires dynamic memory access patterns (softmax over
-    // variable-length sequences) that don't map well to ANE's fixed-function
-    // units. Metal's FlashAttention kernel with threadgroup memory streaming
-    // is the optimal choice.
-    // ==========================================================================
+    {
+        CompiledOp* attn_op = nullptr;
+        std::string attn_key;
+        // Q shape: [seq_len, n_heads, head_dim] or [seq_len, hidden_dim]
+        const int64_t q_seq = Q.ndim >= 1 ? Q.shape[0] : 0;
+        const int64_t q_rest = Q.NumElements() / (q_seq > 0 ? q_seq : 1);
+        {
+            std::lock_guard<std::mutex> lock(impl_->opsMutex);
+            for (auto& [k, v] : impl_->compiledOps) {
+                if (v->type == ANEOpType::Attention && v->status == ANEOpStatus::Ready &&
+                    v->model != nil && static_cast<int64_t>(v->M) == q_seq &&
+                    static_cast<int64_t>(v->N) == q_rest) {
+                    attn_op = v.get();
+                    attn_key = k;
+                    impl_->UpdateLRU(k);
+                    break;
+                }
+            }
+        }
+        if (attn_op) {
+            @autoreleasepool {
+                impl_->SyncMetalFallback();
+                NSError* error = nil;
 
+                auto MakeArray = [&](const Tensor& t) -> MLMultiArray* {
+                    NSMutableArray<NSNumber*>* shape = [NSMutableArray array];
+                    NSMutableArray<NSNumber*>* strides = [NSMutableArray array];
+                    for (int d = 0; d < t.ndim; ++d) {
+                        [shape addObject:@(t.shape[d])];
+                        [strides addObject:@(t.stride[d])];
+                    }
+                    return [[MLMultiArray alloc] initWithDataPointer:(void*)t.data
+                                                               shape:shape
+                                                            dataType:MLMultiArrayDataTypeFloat32
+                                                             strides:strides
+                                                         deallocator:nil
+                                                               error:&error];
+                };
+
+                MLMultiArray* qArr = MakeArray(Q);
+                if (!qArr)
+                    goto metal_attn_fallback;
+                MLMultiArray* kArr = MakeArray(K);
+                if (!kArr)
+                    goto metal_attn_fallback;
+                MLMultiArray* vArr = MakeArray(V);
+                if (!vArr)
+                    goto metal_attn_fallback;
+
+                NSDictionary* features = @{
+                    @"q" : [MLFeatureValue featureValueWithMultiArray:qArr],
+                    @"k" : [MLFeatureValue featureValueWithMultiArray:kArr],
+                    @"v" : [MLFeatureValue featureValueWithMultiArray:vArr]
+                };
+                MLDictionaryFeatureProvider* provider =
+                    [[MLDictionaryFeatureProvider alloc] initWithDictionary:features error:&error];
+                if (!provider)
+                    goto metal_attn_fallback;
+
+                {
+                    id<MLFeatureProvider> result = [attn_op->model predictionFromFeatures:provider
+                                                                                    error:&error];
+                    if (!result) {
+                        std::cerr << "[ANEBackend] FlashAttention ANE prediction failed: " <<
+                            [[error localizedDescription] UTF8String] << std::endl;
+                        goto metal_attn_fallback;
+                    }
+
+                    MLFeatureValue* outFeat = [result featureValueForName:attn_op->outputName];
+                    if (!outFeat)
+                        goto metal_attn_fallback;
+
+                    const float* srcPtr =
+                        static_cast<const float*>([[outFeat multiArrayValue] dataPointer]);
+                    std::memcpy(output->data, srcPtr, Q.SizeBytes());
+
+                    attn_op->stats.total_executions++;
+                    attn_op->stats.uses_ane = true;
+                    return;
+                }
+            }
+        }
+    }
+
+metal_attn_fallback:
     if (impl_->aneOnlyMode) {
         throw std::runtime_error(
             "[ANEBackend] FlashAttention requires Metal fallback; ANE-only mode enabled");
     }
-    MetalBackend* metal = impl_->GetMetalFallback();
-    if (metal) {
+    if (MetalBackend* metal = impl_->GetMetalFallback()) {
         metal->FlashAttention(Q, K, V, output, scale, causal, n_head_kv);
         impl_->MaybeSyncMetalFallback();
         return;
@@ -1375,6 +1560,130 @@ bool ANEBackend::CompileMatMulFP16(const std::string& name, int M, int K, const 
                                    const float* bias_fp32) {
     // Same as CompileMatMul but would convert to FP16 internally
     return CompileMatMul(name, M, K, weight_fp32, bias_fp32);
+}
+
+bool ANEBackend::CompileRoPE(const std::string& name, int seq_len, int n_heads, int head_dim) {
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(impl_->opsMutex);
+        auto it = impl_->compiledOps.find(name);
+        if (it != impl_->compiledOps.end() && it->second->status == ANEOpStatus::Ready) {
+            return true;
+        }
+
+        const std::string model_path = impl_->cacheDirectory + "/" + name + ".mlmodelc";
+        NSString* modelPath = [NSString stringWithUTF8String:model_path.c_str()];
+
+        if (![[NSFileManager defaultManager] fileExistsAtPath:modelPath]) {
+            std::cout << "[ANEBackend] No cached CoreML RoPE model for '" << name
+                      << "' at: " << model_path << "\n"
+                      << "  Compile offline with coremltools + xcrun coremlcompiler.\n"
+                      << "  Expected inputs: 'input' [seq*heads, head_dim] float16, "
+                         "'positions' [seq] int32\n"
+                      << "  Falling back to Metal GPU for RoPE." << std::endl;
+            auto op = std::make_unique<CompiledOp>();
+            op->type = ANEOpType::RoPE;
+            op->M = n_heads * head_dim;
+            op->N = seq_len;
+            op->status = ANEOpStatus::Failed;
+            impl_->compiledOps[name] = std::move(op);
+            return false;
+        }
+
+        NSError* error = nil;
+        NSURL* modelURL = [NSURL fileURLWithPath:modelPath];
+        MLModel* model = [MLModel modelWithContentsOfURL:modelURL
+                                           configuration:impl_->config
+                                                   error:&error];
+        if (!model) {
+            std::cerr << "[ANEBackend] Failed to load cached RoPE model '" << name
+                      << "': " << [[error localizedDescription] UTF8String] << std::endl;
+            auto op = std::make_unique<CompiledOp>();
+            op->type = ANEOpType::RoPE;
+            op->status = ANEOpStatus::Failed;
+            impl_->compiledOps[name] = std::move(op);
+            return false;
+        }
+
+        auto op = std::make_unique<CompiledOp>();
+        op->type = ANEOpType::RoPE;
+        op->M = n_heads * head_dim;  // elements per seq position (for dimension matching)
+        op->N = seq_len;             // compiled-in sequence length
+        op->model = model;
+        op->status = ANEOpStatus::Ready;
+        op->inputName = @"input";
+        op->outputName = @"output";
+
+        std::cout << "[ANEBackend] Loaded cached CoreML RoPE model '" << name
+                  << "' [seq=" << seq_len << ", n_heads=" << n_heads << ", head_dim=" << head_dim
+                  << "]" << std::endl;
+
+        impl_->EvictLRUIfNeeded();
+        impl_->compiledOps[name] = std::move(op);
+        impl_->UpdateLRU(name);
+        return true;
+    }
+}
+
+bool ANEBackend::CompileFlashAttention(const std::string& name, int seq_len, int n_heads,
+                                       int head_dim) {
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(impl_->opsMutex);
+        auto it = impl_->compiledOps.find(name);
+        if (it != impl_->compiledOps.end() && it->second->status == ANEOpStatus::Ready) {
+            return true;
+        }
+
+        const std::string model_path = impl_->cacheDirectory + "/" + name + ".mlmodelc";
+        NSString* modelPath = [NSString stringWithUTF8String:model_path.c_str()];
+
+        if (![[NSFileManager defaultManager] fileExistsAtPath:modelPath]) {
+            std::cout << "[ANEBackend] No cached CoreML FlashAttention model for '" << name
+                      << "' at: " << model_path << "\n"
+                      << "  Compile offline with coremltools + xcrun coremlcompiler.\n"
+                      << "  Expected inputs: 'q'/'k'/'v' [seq, heads, head_dim] float16\n"
+                      << "  Falling back to Metal GPU for FlashAttention." << std::endl;
+            auto op = std::make_unique<CompiledOp>();
+            op->type = ANEOpType::Attention;
+            op->M = seq_len;
+            op->N = n_heads * head_dim;
+            op->status = ANEOpStatus::Failed;
+            impl_->compiledOps[name] = std::move(op);
+            return false;
+        }
+
+        NSError* error = nil;
+        NSURL* modelURL = [NSURL fileURLWithPath:modelPath];
+        MLModel* model = [MLModel modelWithContentsOfURL:modelURL
+                                           configuration:impl_->config
+                                                   error:&error];
+        if (!model) {
+            std::cerr << "[ANEBackend] Failed to load cached FlashAttention model '" << name
+                      << "': " << [[error localizedDescription] UTF8String] << std::endl;
+            auto op = std::make_unique<CompiledOp>();
+            op->type = ANEOpType::Attention;
+            op->status = ANEOpStatus::Failed;
+            impl_->compiledOps[name] = std::move(op);
+            return false;
+        }
+
+        auto op = std::make_unique<CompiledOp>();
+        op->type = ANEOpType::Attention;
+        op->M = seq_len;
+        op->N = n_heads * head_dim;
+        op->model = model;
+        op->status = ANEOpStatus::Ready;
+        op->inputName = @"q";
+        op->outputName = @"output";
+
+        std::cout << "[ANEBackend] Loaded cached CoreML FlashAttention model '" << name
+                  << "' [seq=" << seq_len << ", n_heads=" << n_heads << ", head_dim=" << head_dim
+                  << "]" << std::endl;
+
+        impl_->EvictLRUIfNeeded();
+        impl_->compiledOps[name] = std::move(op);
+        impl_->UpdateLRU(name);
+        return true;
+    }
 }
 
 bool ANEBackend::ExecuteMatMul(const std::string& name, const float* input, float* output) {

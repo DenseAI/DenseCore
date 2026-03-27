@@ -1,24 +1,24 @@
 /**
- * @file enterprise_plugin.h
- * @brief DenseCore Enterprise Plugin Discovery & Loading API
+ * @file plugin_loader.h
+ * @brief DenseCore optional plugin discovery and loading API
  *
- * C API interface for dynamically loading enterprise plugins via dlopen/dlsym.
- * libdensecore_ent.so is loaded at runtime, injecting commercial features
+ * C API interface for dynamically loading optional plugins via dlopen/dlsym.
+ * libdensecore_ent.so is loaded at runtime, injecting optional features
  * without polluting the open-source core.
  *
  * Architecture:
  *   DenseCore (OSS) ──dlopen──▶ libdensecore_ent.so (Proprietary)
  *                    ◀──C API──
  *
- * The enterprise plugin is OPTIONAL. If the .so is not found,
- * DenseCore operates normally without any enterprise features.
+ * The plugin is OPTIONAL. If the .so is not found,
+ * DenseCore operates normally without the optional feature set.
  *
  * @note Thread-safety: Init/Shutdown are NOT thread-safe (call once at startup).
  *       All other query functions are thread-safe after init.
  */
 
-#ifndef DENSECORE_ENTERPRISE_PLUGIN_H
-#define DENSECORE_ENTERPRISE_PLUGIN_H
+#ifndef DENSECORE_PLUGIN_LOADER_H
+#define DENSECORE_PLUGIN_LOADER_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -47,7 +47,7 @@ extern "C" {
 
 /**
  * Symbol name resolved via dlsym() after dlopen().
- * The enterprise .so MUST export this exact symbol.
+ * The plugin .so MUST export this exact symbol.
  */
 #define DENSECORE_ENT_PLUGIN_SYMBOL "DenseCoreEntPluginInit"
 
@@ -78,14 +78,14 @@ extern "C" {
 // =============================================================================
 
 /**
- * @brief Enterprise plugin metadata
+ * @brief Optional plugin metadata
  *
  * Self-description struct returned by the plugin after dlopen.
  * The api_version field is used for binary compatibility verification.
  */
 typedef struct {
     uint32_t api_version;   ///< Must match DENSECORE_ENT_API_VERSION
-    const char* name;       ///< Plugin name (e.g., "DenseEnterprise")
+    const char* name;       ///< Plugin name (e.g., "DenseCorePlugin")
     const char* version;    ///< Semantic version string (e.g., "1.0.0")
     uint64_t capabilities;  ///< Bitmask of DENSECORE_ENT_CAP_* flags
 } DenseCoreEntPluginInfo;
@@ -121,17 +121,17 @@ typedef void (*DenseCoreEntShutdownFn)(void);
 // =============================================================================
 
 /**
- * @brief Attempt to load the enterprise plugin
+ * @brief Attempt to load the plugin
  *
  * Opens the .so file via dlopen and resolves the plugin init symbol.
  * Gracefully fails if .so is absent or symbol is missing (runs without
- * enterprise features).
+ * optional features).
  *
  * Search policy:
  *   1. If plugin_path is provided, it is resolved against the DenseCore module directory.
  *      The resolved path must stay within that trusted directory and use the default
- *      enterprise plugin filename for the current platform.
- *   2. If plugin_path is NULL/empty, load the default enterprise plugin filename from
+ *      plugin filename for the current platform.
+ *   2. If plugin_path is NULL/empty, load the default plugin filename from
  *      the DenseCore module directory.
  *
  * @param plugin_path  Optional plugin path override (NULL/empty for default location)
@@ -176,4 +176,4 @@ DENSECORE_ENT_API void DenseCoreEntUnloadPlugin(void);
 
 #undef DENSECORE_ENT_API
 
-#endif  // DENSECORE_ENTERPRISE_PLUGIN_H
+#endif  // DENSECORE_PLUGIN_LOADER_H

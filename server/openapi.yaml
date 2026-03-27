@@ -2,10 +2,10 @@ openapi: 3.0.0
 info:
   title: DenseCore API
   description: Cloud-native inference runtime (OpenAI-compatible LLM API in default profile).
-  version: 2.0.0
+  version: 1.0.0
   contact:
     name: DenseCore Team
-    url: https://github.com/Jake-Network/DenseCore
+    url: https://github.com/DenseCore/DenseCore
 servers:
   - url: http://localhost:8080/v1
     description: Local development server

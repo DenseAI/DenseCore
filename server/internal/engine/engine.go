@@ -13,7 +13,7 @@ package engine
 #include <stdlib.h>
 #include <stdint.h>
 #include "densecore.h"
-#include "densecore/enterprise_plugin.h"
+#include "densecore/plugin_loader.h"
 
 // Forward declaration of the Go callback (exported from callbacks.go)
 extern void streamCallbackGateway(char* token, int is_finished, void* user_data);
@@ -66,13 +66,13 @@ static void CancelRequestWrapper(DenseCoreHandle handle, int request_id) {
     CancelRequest(handle, request_id);
 }
 
-// Wrapper for enterprise plugin load (DenseCoreHandle -> void* engine)
-static int LoadEnterprisePluginWrapper(const char* plugin_path, DenseCoreHandle handle) {
+// Wrapper for optional plugin load (DenseCoreHandle -> void* engine)
+static int LoadPluginWrapper(const char* plugin_path, DenseCoreHandle handle) {
     return DenseCoreEntLoadPlugin(plugin_path, (void*)handle);
 }
 
-// Wrapper for enterprise plugin unload
-static void UnloadEnterprisePluginWrapper(void) {
+// Wrapper for optional plugin unload
+static void UnloadPluginWrapper(void) {
     DenseCoreEntUnloadPlugin();
 }
 */
@@ -101,8 +101,8 @@ const (
 )
 
 var cleanupOnce sync.Once
-var enterprisePluginMu sync.Mutex
-var enterprisePluginRefCount int
+var pluginMu sync.Mutex
+var pluginRefCount int
 
 // DenseEngine wraps the C++ engine with thread safety
 type DenseEngine struct {
@@ -130,7 +130,7 @@ func NewDenseEngine(mainModelPath, draftModelPath string, threads int) (*DenseEn
 		return nil, fmt.Errorf("failed to initialize DenseCore engine")
 	}
 
-	if err := loadEnterprisePlugin(handle); err != nil {
+	if err := loadPlugin(handle); err != nil {
 		C.FreeEngine(handle)
 		return nil, err
 	}
@@ -146,13 +146,13 @@ func NewDenseEngine(mainModelPath, draftModelPath string, threads int) (*DenseEn
 	}, nil
 }
 
-func loadEnterprisePlugin(handle C.DenseCoreHandle) error {
-	enterprisePluginMu.Lock()
-	defer enterprisePluginMu.Unlock()
+func loadPlugin(handle C.DenseCoreHandle) error {
+	pluginMu.Lock()
+	defer pluginMu.Unlock()
 
 	// Plugin loader is process-global; only attempt real load on first engine.
-	if enterprisePluginRefCount > 0 {
-		enterprisePluginRefCount++
+	if pluginRefCount > 0 {
+		pluginRefCount++
 		return nil
 	}
 
@@ -165,39 +165,39 @@ func loadEnterprisePlugin(handle C.DenseCoreHandle) error {
 		defer C.free(unsafe.Pointer(cPath))
 	}
 
-	rc := int(C.LoadEnterprisePluginWrapper(cPath, handle))
+	rc := int(C.LoadPluginWrapper(cPath, handle))
 	switch rc {
 	case 0:
-		enterprisePluginRefCount = 1
-		log.Printf("[enterprise] plugin loaded (path=%q)", pluginPath)
+		pluginRefCount = 1
+		log.Printf("[plugin] loaded (path=%q)", pluginPath)
 		return nil
 	case 1:
 		if required {
-			return fmt.Errorf("enterprise plugin required but not found (path=%q)", pluginPath)
+			return fmt.Errorf("plugin required but not found (path=%q)", pluginPath)
 		}
-		log.Printf("[enterprise] plugin not found, continuing in OSS mode (path=%q)", pluginPath)
+		log.Printf("[plugin] not found, continuing in OSS mode (path=%q)", pluginPath)
 		return nil
 	default:
 		if required || pluginPath != "" {
-			return fmt.Errorf("failed to initialize enterprise plugin (rc=%d, path=%q)", rc, pluginPath)
+			return fmt.Errorf("failed to initialize plugin (rc=%d, path=%q)", rc, pluginPath)
 		}
-		log.Printf("[enterprise] plugin initialization failed (rc=%d), continuing in OSS mode", rc)
+		log.Printf("[plugin] initialization failed (rc=%d), continuing in OSS mode", rc)
 		return nil
 	}
 }
 
-func unloadEnterprisePlugin() {
-	enterprisePluginMu.Lock()
-	defer enterprisePluginMu.Unlock()
+func unloadPlugin() {
+	pluginMu.Lock()
+	defer pluginMu.Unlock()
 
-	if enterprisePluginRefCount == 0 {
+	if pluginRefCount == 0 {
 		return
 	}
 
-	enterprisePluginRefCount--
-	if enterprisePluginRefCount == 0 {
-		C.UnloadEnterprisePluginWrapper()
-		log.Printf("[enterprise] plugin unloaded")
+	pluginRefCount--
+	if pluginRefCount == 0 {
+		C.UnloadPluginWrapper()
+		log.Printf("[plugin] unloaded")
 	}
 }
 
@@ -464,7 +464,7 @@ func (e *DenseEngine) GetEmbeddingsWithOptions(prompt string, poolingType string
 // Free the engine
 func (e *DenseEngine) Close() {
 	if e.handle != nil {
-		unloadEnterprisePlugin()
+		unloadPlugin()
 		C.FreeEngine(e.handle)
 		e.handle = nil
 	}
@@ -525,4 +525,25 @@ func (e *DenseEngine) GetDetailedMetrics() *domain.DetailedMetrics {
 // GetMaxContextTokens returns the model context length if available.
 func (e *DenseEngine) GetMaxContextTokens() int {
 	return int(C.GetMaxContextTokens(e.handle))
+}
+
+// CountTokens returns tokenizer-accurate token counts for the loaded model.
+func (e *DenseEngine) CountTokens(text string, addBOS bool, addEOS bool) (int, error) {
+	cText := C.CString(text)
+	defer C.free(unsafe.Pointer(cText))
+
+	addBOSInt := 0
+	if addBOS {
+		addBOSInt = 1
+	}
+	addEOSInt := 0
+	if addEOS {
+		addEOSInt = 1
+	}
+
+	count := int(C.CountTokens(e.handle, cText, C.int(addBOSInt), C.int(addEOSInt)))
+	if count < 0 {
+		return 0, fmt.Errorf("token counting failed with error code %d", count)
+	}
+	return count, nil
 }

@@ -61,6 +61,17 @@ func (m *MockEngine) GetMaxContextTokens() int {
 	return 4096
 }
 
+func (m *MockEngine) CountTokens(text string, addBOS bool, addEOS bool) (int, error) {
+	count := len(text)
+	if addBOS {
+		count++
+	}
+	if addEOS {
+		count++
+	}
+	return count, nil
+}
+
 func (m *MockEngine) Close() {}
 
 func (m *MockEngine) CancelRequest(reqID uintptr) {}

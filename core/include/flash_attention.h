@@ -14,8 +14,10 @@
 #ifndef DENSECORE_FLASH_ATTENTION_H
 #define DENSECORE_FLASH_ATTENTION_H
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 #include "simd_ops.h"
 
@@ -108,6 +110,128 @@ inline FlashAttentionConfig AutoTuneFlashConfig(int head_dim, int /*seq_len*/ = 
         config.block_n = 32;
     }
     return config;
+}
+
+inline void AccumulateScaledRow(const float* src, float scale, float* dst, int head_dim) {
+#if defined(__ARM_FEATURE_SVE)
+    if (simd::RuntimeHasArmSveOrBetter()) {
+        const uint64_t vl = svcntw();
+        const svfloat32_t scale_vec = svdup_f32(scale);
+        int d = 0;
+        for (; d + static_cast<int>(vl) <= head_dim; d += static_cast<int>(vl)) {
+            const svbool_t pg = svptrue_b32();
+            svfloat32_t dst_vec = svld1_f32(pg, dst + d);
+            const svfloat32_t src_vec = svld1_f32(pg, src + d);
+            dst_vec = svmla_f32_x(pg, dst_vec, src_vec, scale_vec);
+            svst1_f32(pg, dst + d, dst_vec);
+        }
+        if (d < head_dim) {
+            const svbool_t pg = svwhilelt_b32_u64(static_cast<uint64_t>(d), static_cast<uint64_t>(head_dim));
+            svfloat32_t dst_vec = svld1_f32(pg, dst + d);
+            const svfloat32_t src_vec = svld1_f32(pg, src + d);
+            dst_vec = svmla_f32_m(pg, dst_vec, src_vec, scale_vec);
+            svst1_f32(pg, dst + d, dst_vec);
+        }
+        return;
+    }
+#endif
+#if defined(DENSECORE_ARM)
+    if (simd::IsArmFamily(simd::GetCachedSimdLevel())) {
+        const float32x4_t scale_vec = vdupq_n_f32(scale);
+        int d = 0;
+        for (; d + 4 <= head_dim; d += 4) {
+            float32x4_t dst_vec = vld1q_f32(dst + d);
+            const float32x4_t src_vec = vld1q_f32(src + d);
+            dst_vec = vfmaq_f32(dst_vec, src_vec, scale_vec);
+            vst1q_f32(dst + d, dst_vec);
+        }
+        for (; d < head_dim; ++d) {
+            dst[d] += src[d] * scale;
+        }
+        return;
+    }
+#endif
+    for (int d = 0; d < head_dim; ++d) {
+        dst[d] += src[d] * scale;
+    }
+}
+
+inline void FlashAttentionSingleQueryStridedKV(const float* q_row, const float* k_base, int64_t k_row_stride,
+                                               const float* v_base, int64_t v_row_stride, float* out_row,
+                                               int seq_len_kv, int head_dim, const FlashAttentionConfig& config,
+                                               FlashAttentionScratch& scratch) {
+    if (!q_row || !k_base || !v_base || !out_row || seq_len_kv <= 0 || head_dim <= 0) {
+        return;
+    }
+
+    const FlashAttentionConfig tuned = [&]() {
+        FlashAttentionConfig cfg = config;
+        if (cfg.block_m <= 0 || cfg.block_n <= 0) {
+            cfg = AutoTuneFlashConfig(head_dim, seq_len_kv);
+            cfg.scale = config.scale;
+            cfg.causal = config.causal;
+            cfg.num_threads = config.num_threads;
+        }
+        return cfg;
+    }();
+
+    const int Bc = std::max(1, tuned.block_n);
+    const float scale = (tuned.scale > 0) ? tuned.scale : (1.0f / sqrtf(static_cast<float>(head_dim)));
+    scratch.Resize(1, Bc, head_dim);
+    std::memset(out_row, 0, static_cast<size_t>(head_dim) * sizeof(float));
+
+    float running_max = -1e10f;
+    float running_sum = 0.0f;
+
+    for (int j = 0; j < seq_len_kv; j += Bc) {
+        const int kv_len = std::min(Bc, seq_len_kv - j);
+        float* scores = scratch.qk_block.data();
+        float local_max = -1e10f;
+
+        for (int ki = 0; ki < kv_len; ++ki) {
+            const float* k_row = k_base + static_cast<int64_t>(j + ki) * k_row_stride;
+            float score = simd::DotF32(q_row, k_row, static_cast<size_t>(head_dim)) * scale;
+            if (tuned.causal && (j + ki) > 0) {
+                score = -1e10f;
+            }
+            scores[ki] = score;
+            local_max = std::max(local_max, score);
+        }
+
+        if (!std::isfinite(local_max)) {
+            continue;
+        }
+
+        const float new_max = std::max(running_max, local_max);
+        float block_sum = 0.0f;
+        for (int ki = 0; ki < kv_len; ++ki) {
+            scores[ki] = expf(scores[ki] - new_max);
+            block_sum += scores[ki];
+        }
+        const float new_sum =
+            (running_sum > 0.0f) ? (expf(running_max - new_max) * running_sum + block_sum) : block_sum;
+        if (!(new_sum > 0.0f) || !std::isfinite(new_sum)) {
+            continue;
+        }
+
+        float* pv = scratch.pv_block.data();
+        std::memset(pv, 0, static_cast<size_t>(head_dim) * sizeof(float));
+        for (int ki = 0; ki < kv_len; ++ki) {
+            const float p = scores[ki];
+            if (!(p > 0.0f)) {
+                continue;
+            }
+            const float* v_row = v_base + static_cast<int64_t>(j + ki) * v_row_stride;
+            AccumulateScaledRow(v_row, p, pv, head_dim);
+        }
+
+        const float alpha = (running_sum > 0.0f) ? (expf(running_max - new_max) * running_sum / new_sum) : 0.0f;
+        const float beta = 1.0f / new_sum;
+        simd::UpdateOutput(out_row, pv, &alpha, &beta, 1, head_dim);
+
+        running_max = new_max;
+        running_sum = new_sum;
+    }
 }
 
 /**

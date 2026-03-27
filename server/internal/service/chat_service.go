@@ -41,7 +41,7 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 		return fmt.Errorf("max_tokens exceeds maximum limit (%d)", maxCtx)
 	}
 
-	prompt := s.extractPrompt(req.Messages)
+	prompt := ExtractPrompt(req.Messages)
 	hasInputIDs := len(req.InputIDs) > 0
 	if prompt == "" && !hasInputIDs {
 		return errors.New("no user message found")
@@ -140,7 +140,7 @@ func (s *ChatService) GetBatchEmbeddings(texts []string) ([][]float32, error) {
 	return results, nil
 }
 
-func (s *ChatService) extractPrompt(messages []domain.Message) string {
+func ExtractPrompt(messages []domain.Message) string {
 	if len(messages) == 0 {
 		return ""
 	}

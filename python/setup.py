@@ -315,7 +315,7 @@ setup(
     description="High-Performance CPU Inference Engine for LLMs with HuggingFace Integration",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/Jake-Network/DenseCore",
+    url="https://github.com/DenseCore/DenseCore",
     packages=find_packages(include=["densecore", "densecore.*"]),
     # Add CMakeExtension
     ext_modules=[CMakeExtension("densecore.libdensecore")],
@@ -324,7 +324,7 @@ setup(
         "sdist": CustomSdist,
     },
     classifiers=[
-        "Development Status :: 4 - Beta",
+        "Development Status :: 5 - Production/Stable",
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",

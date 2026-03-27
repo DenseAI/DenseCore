@@ -34,7 +34,7 @@
  * @endcode
  *
  * @author DenseCore Team
- * @version 1.1.0
+ * @version 1.0.0
  */
 
 #ifndef DENSECORE_H
@@ -629,6 +629,17 @@ DENSECORE_API int GetEmbeddingDimension(DenseCoreHandle handle);
  * @return Max context length (n_ctx) on success, or negative error code
  */
 DENSECORE_API int GetMaxContextTokens(DenseCoreHandle handle);
+
+/**
+ * @brief Count tokenizer tokens for a text input using the loaded model tokenizer
+ *
+ * @param handle Handle to the DenseCore engine
+ * @param text UTF-8 text to tokenize
+ * @param add_bos Whether to prepend BOS during tokenization
+ * @param add_eos Whether to append EOS during tokenization
+ * @return Token count on success, or negative error code
+ */
+DENSECORE_API int CountTokens(DenseCoreHandle handle, const char* text, int add_bos, int add_eos);
 
 /**
  * Cancel a running request

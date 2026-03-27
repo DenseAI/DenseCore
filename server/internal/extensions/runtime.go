@@ -1,4 +1,4 @@
-package enterprise
+package extensions
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"net/http"
 )
 
-// Runtime defines optional enterprise server integrations.
+// Runtime defines optional server integrations.
 type Runtime interface {
 	Enabled() bool
 	APIMiddleware() []func(http.Handler) http.Handler
@@ -15,7 +15,7 @@ type Runtime interface {
 	Shutdown(ctx context.Context) error
 }
 
-// NewRuntime creates an enterprise runtime.
+// NewRuntime creates the optional runtime.
 //
 // The concrete implementation is selected by build tags.
 func NewRuntime(logger *slog.Logger) (Runtime, error) {

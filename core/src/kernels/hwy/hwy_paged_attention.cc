@@ -418,12 +418,29 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
             // 1. Compute Scores
             float m_block = -1e30f;
 
+            // Byte footprint of one KV head vector, used for multi-cache-line prefetch.
+            // cache_type: 0=F32 (4B/elem), 1=F16 (2B/elem), 8=Q8_0 (~1B/elem), 4=Q4_0 (~0.5B/elem)
+            const size_t k_head_bytes =
+                (cache_type == 1) ? static_cast<size_t>(qk_head_dim) * 2 :
+                (cache_type == 8) ? static_cast<size_t>(qk_head_dim) :
+                (cache_type == 4) ? static_cast<size_t>(qk_head_dim + 1) / 2 :
+                static_cast<size_t>(qk_head_dim) * 4;  // F32
+            const size_t v_head_bytes =
+                (cache_type == 1) ? static_cast<size_t>(v_head_dim) * 2 :
+                (cache_type == 8) ? static_cast<size_t>(v_head_dim) :
+                (cache_type == 4) ? static_cast<size_t>(v_head_dim + 1) / 2 :
+                static_cast<size_t>(v_head_dim) * 4;  // F32
+
             for (int t = 0; t < num_tokens; ++t) {
-                // Prefetch next token data (strided)
+                // Prefetch next token's K head: all cache lines (64 B each).
+                // A single Prefetch only covers 64 B; for head_dim >= 64 (FP16) or
+                // >= 32 (FP32) the remaining cache lines would be cold misses.
                 const int pf_t = t + prefetch_tokens;
                 if (pf_t < num_tokens) {
                     const uint8_t* next_k = k_block_base + pf_t * k_slot_stride_bytes + k_head_offset_bytes;
-                    ::hwy::Prefetch(next_k);
+                    for (size_t pf_off = 0; pf_off < k_head_bytes; pf_off += 64) {
+                        ::hwy::Prefetch(next_k + pf_off);
+                    }
                 }
 
                 float score = 0.0f;
@@ -490,11 +507,13 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
 
                 const uint8_t* v_ptr = v_block_base + t * v_slot_stride_bytes + v_head_offset_bytes;
 
-                // Prefetch next value
-                const int pf_t = t + prefetch_tokens;
-                if (pf_t < num_tokens) {
-                    const uint8_t* next_v = v_block_base + pf_t * v_slot_stride_bytes + v_head_offset_bytes;
-                    ::hwy::Prefetch(next_v);
+                // Prefetch next token's V head: all cache lines.
+                const int pf_tv = t + prefetch_tokens;
+                if (pf_tv < num_tokens) {
+                    const uint8_t* next_v = v_block_base + pf_tv * v_slot_stride_bytes + v_head_offset_bytes;
+                    for (size_t pf_off = 0; pf_off < v_head_bytes; pf_off += 64) {
+                        ::hwy::Prefetch(next_v + pf_off);
+                    }
                 }
 
                 // Accumulate based on type

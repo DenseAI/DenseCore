@@ -983,6 +983,24 @@ int GetMaxContextTokens(DenseCoreHandle handle) {
     return DENSECORE_STATUS_MODEL_LOAD_FAILED;
 }
 
+int CountTokens(DenseCoreHandle handle, const char* text, int add_bos, int add_eos) {
+    if (!handle || !text) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "CountTokens: invalid arguments");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+    EngineState* state = (EngineState*)handle;
+
+    ModelEntry* entry = state->GetDefaultModel();
+    if (entry && entry->model) {
+        const std::vector<int> tokens = Tokenizer::Tokenize(entry->model.get(), text, add_bos != 0, add_eos != 0);
+        ClearError();
+        return static_cast<int>(tokens.size());
+    }
+
+    SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "CountTokens: no model loaded");
+    return DENSECORE_STATUS_MODEL_LOAD_FAILED;
+}
+
 /**
  * @brief Initialize engine with default NUMA settings (simplified API)
  *
@@ -1096,9 +1114,12 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
         // Log Flash Attention status based on CPU capabilities
         densecore::simd::SimdLevel simd_level = densecore::simd::DetectSimdLevel();
         if (densecore::simd::HasX86Avx512OrBetter(simd_level)) {
-            LOG_INFO("Flash Attention Enabled ({} detected)", densecore::simd::SimdLevelName(simd_level));
+            LOG_INFO("Native x86 Flash Attention Enabled ({} detected)", densecore::simd::SimdLevelName(simd_level));
+        } else if (densecore::simd::IsArmFamily(simd_level)) {
+            LOG_INFO("Native x86 Flash Attention Unavailable on {}; portable CPU flash attention remains eligible",
+                     densecore::simd::SimdLevelName(simd_level));
         } else {
-            LOG_WARN("Flash Attention Disabled (requires AVX-512, detected: {})",
+            LOG_WARN("Native x86 Flash Attention Disabled (requires AVX-512, detected: {})",
                      densecore::simd::SimdLevelName(simd_level));
         }
 

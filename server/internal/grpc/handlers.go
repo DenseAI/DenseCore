@@ -19,34 +19,6 @@ type DenseCoreHandler struct {
 	UnimplementedDenseCoreServiceServer
 	chatService  *service.ChatService
 	modelService *service.ModelService
-	tokenCounter TokenCounter
-}
-
-// TokenCounter provides prompt token counts for usage reporting.
-type TokenCounter interface {
-	CountPromptTokens(messages []*Message) int32
-	CountInputTokens(inputs []string) int32
-}
-
-// ApproxTokenCounter uses a rough character-based estimate.
-type ApproxTokenCounter struct{}
-
-func (ApproxTokenCounter) CountPromptTokens(messages []*Message) int32 {
-	var promptTokens int32
-	for _, msg := range messages {
-		// TODO: replace with tokenizer-based counting for accurate billing/usage.
-		promptTokens += int32(len(msg.Content) / 4)
-	}
-	return promptTokens
-}
-
-func (ApproxTokenCounter) CountInputTokens(inputs []string) int32 {
-	var inputTokens int32
-	for _, input := range inputs {
-		// TODO: replace with tokenizer-based counting for accurate billing/usage.
-		inputTokens += int32(len(input) / 4)
-	}
-	return inputTokens
 }
 
 // NewDenseCoreHandler creates a new DenseCoreHandler.
@@ -55,7 +27,6 @@ func NewDenseCoreHandler(chat *service.ChatService, model *service.ModelService)
 	return &DenseCoreHandler{
 		chatService:  chat,
 		modelService: model,
-		tokenCounter: ApproxTokenCounter{},
 	}
 }
 
@@ -100,7 +71,7 @@ func (h *DenseCoreHandler) ChatCompletion(ctx context.Context, req *ChatCompleti
 	default:
 	}
 
-	promptTokens = h.tokenCounter.CountPromptTokens(req.Messages)
+	promptTokens = h.countPromptTokens(domainReq)
 
 	return &ChatCompletionResponse{
 		Id:      generateID("chatcmpl"),
@@ -309,7 +280,7 @@ func (h *DenseCoreHandler) GetEmbeddings(ctx context.Context, req *EmbeddingRequ
 	}
 
 	data := make([]*EmbeddingData, len(embeddings))
-	totalTokens := h.tokenCounter.CountInputTokens(req.Input)
+	totalTokens := h.countInputTokens(req.Input)
 
 	for i, emb := range embeddings {
 		data[i] = &EmbeddingData{
@@ -401,6 +372,37 @@ func (h *DenseCoreHandler) maxContextTokens() int {
 		return 0
 	}
 	return engine.GetMaxContextTokens()
+}
+
+func (h *DenseCoreHandler) countPromptTokens(req domain.ChatCompletionRequest) int32 {
+	if len(req.InputIDs) > 0 {
+		return int32(len(req.InputIDs))
+	}
+	return h.countTextTokens([]string{service.ExtractPrompt(req.Messages)}, true, false)
+}
+
+func (h *DenseCoreHandler) countInputTokens(inputs []string) int32 {
+	return h.countTextTokens(inputs, true, false)
+}
+
+func (h *DenseCoreHandler) countTextTokens(inputs []string, addBOS bool, addEOS bool) int32 {
+	engine := h.modelService.GetEngine()
+	if engine == nil {
+		return 0
+	}
+
+	var total int32
+	for _, input := range inputs {
+		if input == "" {
+			continue
+		}
+		count, err := engine.CountTokens(input, addBOS, addEOS)
+		if err != nil {
+			continue
+		}
+		total += int32(count)
+	}
+	return total
 }
 
 // mapError maps internal errors to gRPC status codes.

@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
-#include "densecore/enterprise_plugin.h"
+#include "densecore/plugin_loader.h"
 
 namespace {
 
-TEST(EnterprisePluginLoaderSecurity, RejectsNonDefaultPluginFilename) {
+TEST(PluginLoaderSecurity, RejectsNonDefaultPluginFilename) {
     DenseCoreEntUnloadPlugin();
 
     const int rc = DenseCoreEntLoadPlugin("evil_plugin.so", nullptr);
@@ -12,7 +12,7 @@ TEST(EnterprisePluginLoaderSecurity, RejectsNonDefaultPluginFilename) {
     EXPECT_EQ(DenseCoreEntGetPluginInfo(), nullptr);
 }
 
-TEST(EnterprisePluginLoaderSecurity, RejectsPathTraversalOutsideTrustedDirectory) {
+TEST(PluginLoaderSecurity, RejectsPathTraversalOutsideTrustedDirectory) {
     DenseCoreEntUnloadPlugin();
 
 #ifdef _WIN32

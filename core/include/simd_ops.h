@@ -3345,6 +3345,81 @@ inline void ComputeQK_SVE(const float* Q, const float* K, float* S, int q_len, i
     }
 }
 
+inline void ApplyMask_SVE(float* S, int q_start, int kv_start, int q_len, int kv_len) {
+    const float neg_inf = -1e10f;
+    const uint64_t vl = svcntw();
+    const svfloat32_t neg_inf_vec = svdup_f32(neg_inf);
+    for (int qi = 0; qi < q_len; ++qi) {
+        const int global_qi = q_start + qi;
+        float* s_row = S + qi * kv_len;
+        const int mask_start = std::max(0, global_qi - kv_start + 1);
+
+        int ki = mask_start;
+        for (; ki + static_cast<int>(vl) <= kv_len; ki += static_cast<int>(vl)) {
+            svst1_f32(svptrue_b32(), s_row + ki, neg_inf_vec);
+        }
+        if (ki < kv_len) {
+            const svbool_t pg = svwhilelt_b32_u64(static_cast<uint64_t>(ki), static_cast<uint64_t>(kv_len));
+            svst1_f32(pg, s_row + ki, neg_inf_vec);
+        }
+    }
+}
+
+inline void SoftmaxBlock_SVE(float* S, float* row_max, float* row_sum, int q_len, int kv_len, bool first_block) {
+    const uint64_t vl = svcntw();
+    for (int qi = 0; qi < q_len; ++qi) {
+        float* s_row = S + qi * kv_len;
+
+        svfloat32_t max_vec = svdup_f32(-1e10f);
+        int ki = 0;
+        for (; ki + static_cast<int>(vl) <= kv_len; ki += static_cast<int>(vl)) {
+            const svbool_t pg = svptrue_b32();
+            const svfloat32_t s_vec = svld1_f32(pg, s_row + ki);
+            max_vec = svmax_f32_x(pg, max_vec, s_vec);
+        }
+        float local_max = svmaxv_f32(svptrue_b32(), max_vec);
+        for (; ki < kv_len; ++ki) {
+            local_max = std::max(local_max, s_row[ki]);
+        }
+
+        const float m_old = first_block ? -1e10f : row_max[qi];
+        const float m_new = std::max(m_old, local_max);
+        const svfloat32_t m_new_vec = svdup_f32(m_new);
+        svfloat32_t sum_vec = svdup_f32(0.0f);
+
+        ki = 0;
+        for (; ki + static_cast<int>(vl) <= kv_len; ki += static_cast<int>(vl)) {
+            const svbool_t pg = svptrue_b32();
+            const svfloat32_t s_vec = svld1_f32(pg, s_row + ki);
+            const svfloat32_t shifted = svsub_f32_x(pg, s_vec, m_new_vec);
+            alignas(64) float tmp[64];
+            svst1_f32(pg, tmp, shifted);
+            for (uint64_t lane = 0; lane < vl; ++lane) {
+                tmp[lane] = expf(tmp[lane]);
+            }
+            const svfloat32_t exp_vec = svld1_f32(pg, tmp);
+            svst1_f32(pg, s_row + ki, exp_vec);
+            sum_vec = svadd_f32_x(pg, sum_vec, exp_vec);
+        }
+
+        float local_sum = svaddv_f32(svptrue_b32(), sum_vec);
+        for (; ki < kv_len; ++ki) {
+            const float exp_val = expf(s_row[ki] - m_new);
+            s_row[ki] = exp_val;
+            local_sum += exp_val;
+        }
+
+        if (first_block) {
+            row_max[qi] = m_new;
+            row_sum[qi] = local_sum;
+        } else {
+            const float alpha = expf(m_old - m_new);
+            row_sum[qi] = alpha * row_sum[qi] + local_sum;
+            row_max[qi] = m_new;
+        }
+    }
+}
+
 inline void ComputePV_SVE(const float* P, const float* V, float* O, int q_len, int kv_len, int head_dim) {
     const uint64_t vl = svcntw();
     for (int qi = 0; qi < q_len; qi++) {
@@ -3571,9 +3646,7 @@ inline void ApplyMask(float* S, int q_start, int kv_start, int q_len, int kv_len
     static const SimdLevel level = DetectSimdLevel();
 #if defined(__ARM_FEATURE_SVE)
     if (HasArmSveOrBetter(level)) {
-        // SVE: use scalar fallback (ApplyMask is branch-heavy, SVE predication
-        // provides minimal benefit over well-predicted scalar branches).
-        ApplyMask_Scalar(S, q_start, kv_start, q_len, kv_len);
+        ApplyMask_SVE(S, q_start, kv_start, q_len, kv_len);
         return;
     }
 #endif
@@ -3594,10 +3667,7 @@ inline void SoftmaxBlock(float* S, float* row_max, float* row_sum, int q_len, in
     static const SimdLevel level = DetectSimdLevel();
 #if defined(__ARM_FEATURE_SVE)
     if (HasArmSveOrBetter(level)) {
-        // SVE: reuse scalar path — exp() dominates cost and SVE has no
-        // hardware exp instruction; the NEON path already vectorizes
-        // max/sum reductions which covers most of the benefit.
-        SoftmaxBlock_Scalar(S, row_max, row_sum, q_len, kv_len, first_block);
+        SoftmaxBlock_SVE(S, row_max, row_sum, q_len, kv_len, first_block);
         return;
     }
 #endif
