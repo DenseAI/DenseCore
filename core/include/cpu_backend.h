@@ -344,6 +344,21 @@ public:
         int w3_type = 0;       ///< ggml_type of w3
     };
 
+    struct MoERuntimeStatsSnapshot {
+        uint64_t batches = 0;
+        uint64_t total_active_experts = 0;
+        uint64_t total_assignments = 0;
+        uint64_t total_local_hot_experts = 0;
+        uint64_t total_reuse_intersection = 0;
+        uint64_t total_reuse_union = 0;
+        uint64_t total_max_expert_batch = 0;
+        uint64_t total_prefetch_calls = 0;
+        uint64_t total_prefetch_bytes = 0;
+        uint64_t total_cached_experts = 0;
+        uint64_t total_dequantized_experts = 0;
+        uint64_t total_dequantized_bytes = 0;
+    };
+
     /**
      * @brief Migrate hot expert weights to local NUMA node
      *
@@ -482,6 +497,7 @@ public:
                     Tensor* output);
     void ForwardMoE(const TransformerLayer* layer_key, const Tensor& input, const moe::MoERouteResult& routing,
                     const std::vector<ExpertWeights>& experts, Tensor* output);
+    MoERuntimeStatsSnapshot GetMoERuntimeStatsSnapshot() const;
 
     // ===========================================================================
     // Dependency Injection (optional)
@@ -514,9 +530,22 @@ private:
     ImmediateModeGraph* GetCaptureGraph();
 
     struct MoELayerRegistry {
+        struct DequantizedExpertCacheEntry {
+            int expert_id = -1;
+            size_t bytes = 0;
+            uint64_t last_used = 0;
+            std::vector<float> w1;
+            std::vector<float> w2;
+            std::vector<float> w3;
+        };
+
         std::vector<ExpertWeights> experts;
         std::shared_ptr<moe::ExpertProfiler> profiler;
         std::vector<int> local_expert_ids;
+        std::vector<int> last_batch_experts;
+        std::unordered_map<int, std::shared_ptr<DequantizedExpertCacheEntry>> dequant_cache;
+        size_t dequant_cache_bytes = 0;
+        uint64_t dequant_cache_use_counter = 0;
         float ema_alpha = 0.1f;
         std::mutex mutex;
     };
@@ -545,6 +574,18 @@ private:
     // MoE Expert Registries (one per layer)
     std::unordered_map<const TransformerLayer*, std::shared_ptr<MoELayerRegistry>> moe_registries_;
     mutable std::mutex registry_mutex_;  ///< Protects MoE registry map
+    std::atomic<uint64_t> moe_stats_batches_{0};
+    std::atomic<uint64_t> moe_stats_total_active_experts_{0};
+    std::atomic<uint64_t> moe_stats_total_assignments_{0};
+    std::atomic<uint64_t> moe_stats_total_local_hot_experts_{0};
+    std::atomic<uint64_t> moe_stats_total_reuse_intersection_{0};
+    std::atomic<uint64_t> moe_stats_total_reuse_union_{0};
+    std::atomic<uint64_t> moe_stats_total_max_expert_batch_{0};
+    std::atomic<uint64_t> moe_stats_total_prefetch_calls_{0};
+    std::atomic<uint64_t> moe_stats_total_prefetch_bytes_{0};
+    std::atomic<uint64_t> moe_stats_total_cached_experts_{0};
+    std::atomic<uint64_t> moe_stats_total_dequantized_experts_{0};
+    std::atomic<uint64_t> moe_stats_total_dequantized_bytes_{0};
 
     // Cached OpRegistry dispatch pointers (resolved on first use)
     mutable MatMulOps* cached_matmul_ops_ = nullptr;

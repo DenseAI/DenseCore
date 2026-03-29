@@ -2,6 +2,7 @@
 #define DENSECORE_KV_CACHE_H
 
 #include <memory>
+#include <cstdint>
 #include <unordered_map>
 
 #include "block_allocator.h"
@@ -211,6 +212,15 @@ struct BlockManager {
 // ============================================================================
 // Paged KV Cache Structure
 // ============================================================================
+struct KVRuntimeStatsSnapshot {
+    uint64_t bulk_read_calls = 0;
+    uint64_t bulk_read_slots = 0;
+    uint64_t bulk_write_calls = 0;
+    uint64_t bulk_write_slots = 0;
+};
+
+KVRuntimeStatsSnapshot GetKVRuntimeStatsSnapshot();
+
 struct PagedKVCache {
     struct BlockLayout {
         ggml_type cache_type = GGML_TYPE_F16;

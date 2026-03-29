@@ -716,6 +716,10 @@ static DecodePagedAttentionPolicy LoadDecodePagedAttentionPolicy() {
     return policy;
 }
 
+bool IsPagedDecodeModeAlwaysOnImpl() {
+    return ParseDecodePagedAttentionMode() == DecodePagedAttentionMode::On;
+}
+
 struct DecodeContextSummary {
     int min_context = 0;
     int max_context = 0;
@@ -728,7 +732,7 @@ static bool IsBatchedPagedDecodeEnabled() {
     return enabled;
 }
 
-static bool IsDecodeOnlyBatchLayout(const BatchSpec& batch, int n_tokens_in_batch) {
+bool IsDecodeOnlyBatchLayoutImpl(const BatchSpec& batch, int n_tokens_in_batch) {
     if (n_tokens_in_batch <= 0) {
         return false;
     }
@@ -762,7 +766,7 @@ static bool IsDecodeOnlyBatchLayout(const BatchSpec& batch, int n_tokens_in_batc
 
 static DecodeContextSummary SummarizeDecodeContext(const BatchSpec& batch, int n_tokens_in_batch) {
     DecodeContextSummary summary;
-    if (!IsDecodeOnlyBatchLayout(batch, n_tokens_in_batch)) {
+    if (!IsDecodeOnlyBatchLayoutImpl(batch, n_tokens_in_batch)) {
         return summary;
     }
 
@@ -813,90 +817,179 @@ static DecodeContextSummary SummarizeDecodeContext(const BatchSpec& batch, int n
     return summary;
 }
 
-static bool IsPagedDecodeCandidate(const PagedKVCache* cache, const BatchSpec& batch, int n_tokens_in_batch, int n_head,
-                                   int n_head_kv, int head_dim_q, int head_dim_kv) {
-    if (!cache) {
-        return false;
+enum class DecodePagedFallbackReason : std::size_t {
+    None = 0,
+    NoCache = 1,
+    GlmDsa = 2,
+    NonDecodeOnlyLayout = 3,
+    InvalidHeadConfig = 4,
+    HeadDimMismatch = 5,
+    InvalidSeqMapping = 6,
+    MissingBlockTable = 7,
+    InvalidBlockTableIndex = 8,
+    InvalidBlockId = 9,
+    InvalidContextSummary = 10,
+    PolicyOff = 11,
+    AutoQuantizedDisabled = 12,
+    AutoMinHeads = 13,
+    AutoMinHeadDim = 14,
+    AutoContextShort = 15,
+};
+
+static_assert(static_cast<std::size_t>(DecodePagedFallbackReason::AutoContextShort) + 1 ==
+                  kDecodePagedFallbackReasonCount,
+              "Decode paged fallback count mismatch");
+
+static const char* DecodePagedFallbackReasonName(DecodePagedFallbackReason reason) {
+    switch (reason) {
+    case DecodePagedFallbackReason::None: return "none";
+    case DecodePagedFallbackReason::NoCache: return "no_cache";
+    case DecodePagedFallbackReason::GlmDsa: return "glm_dsa";
+    case DecodePagedFallbackReason::NonDecodeOnlyLayout: return "non_decode_layout";
+    case DecodePagedFallbackReason::InvalidHeadConfig: return "invalid_head_config";
+    case DecodePagedFallbackReason::HeadDimMismatch: return "head_dim_mismatch";
+    case DecodePagedFallbackReason::InvalidSeqMapping: return "invalid_seq_mapping";
+    case DecodePagedFallbackReason::MissingBlockTable: return "missing_block_table";
+    case DecodePagedFallbackReason::InvalidBlockTableIndex: return "invalid_block_index";
+    case DecodePagedFallbackReason::InvalidBlockId: return "invalid_block_id";
+    case DecodePagedFallbackReason::InvalidContextSummary: return "invalid_context";
+    case DecodePagedFallbackReason::PolicyOff: return "policy_off";
+    case DecodePagedFallbackReason::AutoQuantizedDisabled: return "auto_quant_disabled";
+    case DecodePagedFallbackReason::AutoMinHeads: return "auto_min_heads";
+    case DecodePagedFallbackReason::AutoMinHeadDim: return "auto_min_head_dim";
+    case DecodePagedFallbackReason::AutoContextShort: return "auto_context_short";
+    default: return "unknown";
     }
-    if (!IsDecodeOnlyBatchLayout(batch, n_tokens_in_batch)) {
-        return false;
+}
+
+const char* GetDecodePagedFallbackReasonNameImpl(std::size_t index) {
+    if (index >= kDecodePagedFallbackReasonCount) {
+        return "unknown";
+    }
+    return DecodePagedFallbackReasonName(static_cast<DecodePagedFallbackReason>(index));
+}
+
+static DecodePagedFallbackReason DiagnosePagedDecodeCandidateFailure(const PagedKVCache* cache, const BatchSpec& batch,
+                                                                    int n_tokens_in_batch, int n_head, int n_head_kv,
+                                                                    int head_dim_q, int head_dim_kv) {
+    if (!cache) {
+        return DecodePagedFallbackReason::NoCache;
+    }
+    if (!IsDecodeOnlyBatchLayoutImpl(batch, n_tokens_in_batch)) {
+        return DecodePagedFallbackReason::NonDecodeOnlyLayout;
     }
     if (n_head_kv <= 0 || n_head <= 0) {
-        return false;
+        return DecodePagedFallbackReason::InvalidHeadConfig;
     }
     if (n_head % n_head_kv != 0) {
-        return false;
+        return DecodePagedFallbackReason::InvalidHeadConfig;
     }
     if (head_dim_q != head_dim_kv) {
-        return false;
+        return DecodePagedFallbackReason::HeadDimMismatch;
     }
 
     for (int i = 0; i < n_tokens_in_batch; ++i) {
         const int seq_idx = batch.seq_id[static_cast<size_t>(i)];
+        if (seq_idx < 0 || seq_idx >= n_tokens_in_batch) {
+            return DecodePagedFallbackReason::InvalidSeqMapping;
+        }
         const int pos_i = batch.pos[static_cast<size_t>(i)];
         const int n_past_i = batch.n_past[static_cast<size_t>(seq_idx)];
         if (pos_i < 0 || n_past_i < 0) {
-            return false;
+            return DecodePagedFallbackReason::InvalidSeqMapping;
         }
 
         const auto& block_table = batch.block_tables[static_cast<size_t>(seq_idx)];
         if (block_table.empty()) {
-            return false;
+            return DecodePagedFallbackReason::MissingBlockTable;
         }
 
         const int logical_block = pos_i / BLOCK_SIZE;
         if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) {
-            return false;
+            return DecodePagedFallbackReason::InvalidBlockTableIndex;
         }
         const int block_id = block_table[static_cast<size_t>(logical_block)];
         if (block_id < 0 || block_id >= cache->max_blocks) {
-            return false;
+            return DecodePagedFallbackReason::InvalidBlockId;
         }
     }
 
     const DecodeContextSummary context_summary = SummarizeDecodeContext(batch, n_tokens_in_batch);
     if (!context_summary.valid) {
-        return false;
+        return DecodePagedFallbackReason::InvalidContextSummary;
     }
 
-    return true;
+    return DecodePagedFallbackReason::None;
 }
 
-static bool ShouldUsePagedDecodeAttention(const DecodePagedAttentionPolicy& policy, const PagedKVCache* cache,
-                                          const BatchSpec& batch, int n_tokens_in_batch, int n_head, int n_head_kv,
-                                          int head_dim_q, int head_dim_kv) {
-    if (policy.mode == DecodePagedAttentionMode::Off) return false;
-    if (!IsPagedDecodeCandidate(cache, batch, n_tokens_in_batch, n_head, n_head_kv, head_dim_q, head_dim_kv)) {
-        return false;
+bool IsPagedDecodeCandidateImpl(const PagedKVCache* cache, const BatchSpec& batch, int n_tokens_in_batch, int n_head,
+                                int n_head_kv, int head_dim_q, int head_dim_kv) {
+    return DiagnosePagedDecodeCandidateFailure(cache, batch, n_tokens_in_batch, n_head, n_head_kv, head_dim_q,
+                                               head_dim_kv) == DecodePagedFallbackReason::None;
+}
+
+struct DecodePagedDecision {
+    bool candidate = false;
+    bool requested = false;
+    DecodePagedFallbackReason reason = DecodePagedFallbackReason::None;
+};
+
+static DecodePagedDecision EvaluatePagedDecodeDecision(const DecodePagedAttentionPolicy& policy,
+                                                       const TransformerModel* model, const PagedKVCache* cache,
+                                                       const BatchSpec& batch, int n_tokens_in_batch, int n_head,
+                                                       int n_head_kv, int head_dim_q, int head_dim_kv) {
+    DecodePagedDecision decision;
+    if (model && model->arch_flags.is_glm_dsa) {
+        decision.reason = DecodePagedFallbackReason::GlmDsa;
+        return decision;
+    }
+
+    decision.reason =
+        DiagnosePagedDecodeCandidateFailure(cache, batch, n_tokens_in_batch, n_head, n_head_kv, head_dim_q, head_dim_kv);
+    if (decision.reason != DecodePagedFallbackReason::None) {
+        return decision;
+    }
+    decision.candidate = true;
+
+    if (policy.mode == DecodePagedAttentionMode::Off) {
+        decision.reason = DecodePagedFallbackReason::PolicyOff;
+        return decision;
     }
 
     if (policy.mode == DecodePagedAttentionMode::On) {
-        return true;
+        decision.requested = true;
+        return decision;
     }
 
     // Auto mode: enable only when context is long enough to amortize callback/setup overhead.
     if (!policy.allow_quantized_auto && ggml_is_quantized(cache->cache_type)) {
-        return false;
+        decision.reason = DecodePagedFallbackReason::AutoQuantizedDisabled;
+        return decision;
     }
     if (n_head < policy.min_heads) {
-        return false;
+        decision.reason = DecodePagedFallbackReason::AutoMinHeads;
+        return decision;
     }
     if (head_dim_q < policy.min_head_dim) {
-        return false;
+        decision.reason = DecodePagedFallbackReason::AutoMinHeadDim;
+        return decision;
     }
     const DecodeContextSummary context_summary = SummarizeDecodeContext(batch, n_tokens_in_batch);
     if (!context_summary.valid) {
-        return false;
+        decision.reason = DecodePagedFallbackReason::InvalidContextSummary;
+        return decision;
     }
     // Use the shortest context in the decode micro-batch as representative.
     // This prevents Auto mode from enabling paged decode only because a subset
     // of sequences has long history.
     const int context_len = context_summary.min_context;
     if (context_len < policy.min_context_tokens) {
-        return false;
+        decision.reason = DecodePagedFallbackReason::AutoContextShort;
+        return decision;
     }
 
-    return true;
+    decision.requested = true;
+    return decision;
 }
 
 static bool IsFlashAttentionDisabled() {
@@ -973,6 +1066,63 @@ static DecodeAttentionPathCounters& GetDecodeAttentionPathCounters() {
     return counters;
 }
 
+struct DecodeSharedQuantCounters {
+    std::atomic<uint64_t> total{0};
+    std::atomic<uint64_t> reused{0};
+    std::atomic<uint64_t> tls{0};
+};
+
+static DecodeSharedQuantCounters& GetDecodeSharedQuantCounters() {
+    static DecodeSharedQuantCounters counters;
+    return counters;
+}
+
+static std::array<std::atomic<uint64_t>, kDecodePagedFallbackReasonCount>& GetDecodePagedFallbackCounters() {
+    static std::array<std::atomic<uint64_t>, kDecodePagedFallbackReasonCount> counters{};
+    return counters;
+}
+
+static void RecordDecodePagedFallbackReason(DecodePagedFallbackReason reason, int layer, int N) {
+    if (N <= 0 || N > 4 || reason == DecodePagedFallbackReason::None) {
+        return;
+    }
+    GetDecodePagedFallbackCounters()[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+static void RecordSharedQuantReuse(bool reused_shared_buffer) {
+    DecodeSharedQuantCounters& counters = GetDecodeSharedQuantCounters();
+    counters.total.fetch_add(1, std::memory_order_relaxed);
+    if (reused_shared_buffer) {
+        counters.reused.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        counters.tls.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+DecodeRuntimeStatsSnapshot GetDecodeRuntimeStatsSnapshotImpl() {
+    DecodeRuntimeStatsSnapshot snapshot;
+
+    const DecodeAttentionPathCounters& path = GetDecodeAttentionPathCounters();
+    snapshot.path_total = path.total.load(std::memory_order_relaxed);
+    snapshot.path_paged = path.paged.load(std::memory_order_relaxed);
+    snapshot.path_hal = path.hal.load(std::memory_order_relaxed);
+    snapshot.path_portable_cpu_flash = path.portable_cpu_flash.load(std::memory_order_relaxed);
+    snapshot.path_native_flash = path.native_flash.load(std::memory_order_relaxed);
+    snapshot.path_standard = path.standard.load(std::memory_order_relaxed);
+
+    const auto& fallback = GetDecodePagedFallbackCounters();
+    for (std::size_t i = 0; i < snapshot.paged_fallback_reasons.size(); ++i) {
+        snapshot.paged_fallback_reasons[i] = fallback[i].load(std::memory_order_relaxed);
+    }
+
+    const DecodeSharedQuantCounters& quant = GetDecodeSharedQuantCounters();
+    snapshot.shared_quant_total = quant.total.load(std::memory_order_relaxed);
+    snapshot.shared_quant_reused = quant.reused.load(std::memory_order_relaxed);
+    snapshot.shared_quant_tls = quant.tls.load(std::memory_order_relaxed);
+
+    return snapshot;
+}
+
 static const char* DecodeAttentionPathName(DecodeAttentionPathKind kind) {
     switch (kind) {
     case DecodeAttentionPathKind::Paged: return "paged_decode";
@@ -988,7 +1138,7 @@ static void RecordDecodeAttentionPath(DecodeAttentionPathKind kind, int layer, i
                                       int n_head_kv, densecore::DeviceType preferred_device, bool native_layout,
                                       bool paged_candidate, bool paged_selected, bool portable_supported,
                                       bool offset_safe) {
-    if (layer != 0 || N <= 0) {
+    if (N <= 0) {
         return;
     }
 
@@ -1137,6 +1287,27 @@ static bool IsFusedQKVEnabled() {
     return enabled;
 }
 }  // namespace
+
+bool IsDecodeOnlyBatchLayout(const BatchSpec& batch, int n_tokens_in_batch) {
+    return IsDecodeOnlyBatchLayoutImpl(batch, n_tokens_in_batch);
+}
+
+bool IsPagedDecodeCandidate(const PagedKVCache* cache, const BatchSpec& batch, int n_tokens_in_batch, int n_head,
+                            int n_head_kv, int head_dim_q, int head_dim_kv) {
+    return IsPagedDecodeCandidateImpl(cache, batch, n_tokens_in_batch, n_head, n_head_kv, head_dim_q, head_dim_kv);
+}
+
+bool IsPagedDecodeModeAlwaysOn() {
+    return IsPagedDecodeModeAlwaysOnImpl();
+}
+
+DecodeRuntimeStatsSnapshot GetDecodeRuntimeStatsSnapshot() {
+    return GetDecodeRuntimeStatsSnapshotImpl();
+}
+
+const char* GetDecodePagedFallbackReasonName(std::size_t index) {
+    return GetDecodePagedFallbackReasonNameImpl(index);
+}
 
 // ============================================================================
 // InferenceContext Implementation ("Rebuild Graph, Reuse Memory" Strategy)
@@ -1994,6 +2165,11 @@ static inline bool IsTokenHeadDense(const struct ggml_tensor* t, int head_dim) {
            t->nb[1] == static_cast<size_t>(head_dim) * sizeof(float);
 }
 
+static inline bool IsTokenSpanDense(const struct ggml_tensor* t, int head_dim, int n_head_kv) {
+    const size_t head_block_bytes = static_cast<size_t>(head_dim) * static_cast<size_t>(n_head_kv) * sizeof(float);
+    return IsTokenHeadDense(t, head_dim) && t->nb[2] == head_block_bytes;
+}
+
 static inline void GatherTokenHeadContiguous(const struct ggml_tensor* src, int token_idx, int head_dim, int n_head_kv,
                                              float* out) {
     const char* token_base = reinterpret_cast<const char*>(src->data) + static_cast<size_t>(token_idx) * src->nb[2];
@@ -2034,6 +2210,64 @@ static inline void ScatterTokenHeadContiguous(const float* in, struct ggml_tenso
     }
 }
 
+static inline void GatherTokenSpanHeadContiguous(const struct ggml_tensor* src, int token_idx, int token_count,
+                                                 int head_dim, int n_head_kv, float* out) {
+    if (token_count <= 0) {
+        return;
+    }
+    const size_t head_block_bytes = static_cast<size_t>(head_dim) * static_cast<size_t>(n_head_kv) * sizeof(float);
+    const char* token_base = reinterpret_cast<const char*>(src->data) + static_cast<size_t>(token_idx) * src->nb[2];
+    if (IsTokenSpanDense(src, head_dim, n_head_kv)) {
+        std::memcpy(out, token_base, static_cast<size_t>(token_count) * head_block_bytes);
+        return;
+    }
+    for (int i = 0; i < token_count; ++i) {
+        GatherTokenHeadContiguous(src, token_idx + i, head_dim, n_head_kv,
+                                  out + static_cast<size_t>(i) * static_cast<size_t>(head_dim) * n_head_kv);
+    }
+}
+
+static inline void ScatterTokenSpanHeadContiguous(const float* in, struct ggml_tensor* dst, int token_idx,
+                                                  int token_count, int head_dim, int n_head_kv) {
+    if (token_count <= 0) {
+        return;
+    }
+    const size_t head_block_bytes = static_cast<size_t>(head_dim) * static_cast<size_t>(n_head_kv) * sizeof(float);
+    char* token_base = reinterpret_cast<char*>(dst->data) + static_cast<size_t>(token_idx) * dst->nb[2];
+    if (IsTokenSpanDense(dst, head_dim, n_head_kv)) {
+        std::memcpy(token_base, in, static_cast<size_t>(token_count) * head_block_bytes);
+        return;
+    }
+    for (int i = 0; i < token_count; ++i) {
+        ScatterTokenHeadContiguous(in + static_cast<size_t>(i) * static_cast<size_t>(head_dim) * n_head_kv, dst,
+                                   token_idx + i, head_dim, n_head_kv);
+    }
+}
+
+static inline void ZeroTokenSpanHead(struct ggml_tensor* dst, int token_idx, int token_count, int head_dim, int n_head_kv) {
+    if (token_count <= 0) {
+        return;
+    }
+    const size_t head_block_bytes = static_cast<size_t>(head_dim) * static_cast<size_t>(n_head_kv) * sizeof(float);
+    char* token_base = reinterpret_cast<char*>(dst->data) + static_cast<size_t>(token_idx) * dst->nb[2];
+    if (IsTokenSpanDense(dst, head_dim, n_head_kv)) {
+        std::memset(token_base, 0, static_cast<size_t>(token_count) * head_block_bytes);
+        return;
+    }
+
+    const size_t nb0 = dst->nb[0];
+    const size_t nb1 = dst->nb[1];
+    for (int i = 0; i < token_count; ++i) {
+        char* token_ptr = token_base + static_cast<size_t>(i) * dst->nb[2];
+        for (int h = 0; h < n_head_kv; ++h) {
+            char* head_ptr = token_ptr + static_cast<size_t>(h) * nb1;
+            for (int d = 0; d < head_dim; ++d) {
+                *reinterpret_cast<float*>(head_ptr + static_cast<size_t>(d) * nb0) = 0.0f;
+            }
+        }
+    }
+}
+
 // Custom callback to load K/V history from cache and append current K/V.
 // This implementation is stride-safe for both contiguous and view tensors.
 void cb_kv_manage(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* userdata) {
@@ -2053,36 +2287,59 @@ void cb_kv_manage(struct ggml_tensor* dst, const struct ggml_tensor* src, int it
     if (N < 0 || n_total < 0 || n_past < 0) return;
 
     const size_t head_block_size = static_cast<size_t>(head_dim) * n_head_kv;
-    const size_t head_block_bytes = head_block_size * sizeof(float);
-
     int writes_ok = 0;
     int writes_skipped = 0;
 
     // 1) Write current tokens to cache (single-threaded cache update).
     if (ith == 0 && N > 0) {
-        std::vector<float> packed(head_block_size);
-        for (int i = 0; i < N; ++i) {
-            if (i >= static_cast<int>(batch->seq_id.size()) || i >= static_cast<int>(batch->pos.size())) continue;
+        std::vector<float> packed;
+        packed.reserve(static_cast<size_t>(N) * head_block_size);
+        for (int i = 0; i < N;) {
+            if (i >= static_cast<int>(batch->seq_id.size()) || i >= static_cast<int>(batch->pos.size())) {
+                ++writes_skipped;
+                ++i;
+                continue;
+            }
             const int seq_id = batch->seq_id[i];
             const int pos = batch->pos[i];
-            if (seq_id < 0 || seq_id >= static_cast<int>(batch->block_tables.size())) continue;
+            if (seq_id < 0 || seq_id >= static_cast<int>(batch->block_tables.size())) {
+                ++writes_skipped;
+                ++i;
+                continue;
+            }
 
             const auto& block_table = batch->block_tables[seq_id];
             const int logical_block = pos / BLOCK_SIZE;
             const int slot = pos % BLOCK_SIZE;
             if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) {
                 writes_skipped++;
+                ++i;
                 continue;
             }
 
             const int block_id = block_table[logical_block];
-            GatherTokenHeadContiguous(src, i, head_dim, n_head_kv, packed.data());
-            if (ud->is_k) {
-                ud->cache->WriteKSlot(block_id, ud->layer, slot, packed.data());
-            } else {
-                ud->cache->WriteVSlot(block_id, ud->layer, slot, packed.data());
+            int run = 1;
+            while (i + run < N && i + run < static_cast<int>(batch->seq_id.size()) && i + run < static_cast<int>(batch->pos.size())) {
+                const int next_seq_id = batch->seq_id[i + run];
+                const int next_pos = batch->pos[i + run];
+                if (next_seq_id != seq_id || next_pos != pos + run) {
+                    break;
+                }
+                if ((next_pos / BLOCK_SIZE) != logical_block) {
+                    break;
+                }
+                ++run;
             }
-            writes_ok++;
+
+            packed.resize(static_cast<size_t>(run) * head_block_size);
+            GatherTokenSpanHeadContiguous(src, i, run, head_dim, n_head_kv, packed.data());
+            if (ud->is_k) {
+                ud->cache->WriteKSlots(block_id, ud->layer, slot, run, packed.data());
+            } else {
+                ud->cache->WriteVSlots(block_id, ud->layer, slot, run, packed.data());
+            }
+            writes_ok += run;
+            i += run;
         }
     }
 
@@ -2102,36 +2359,48 @@ void cb_kv_manage(struct ggml_tensor* dst, const struct ggml_tensor* src, int it
         const int t_start = ith * tokens_per_thread;
         const int t_end = std::min(t_start + tokens_per_thread, n_past);
 
-        std::vector<float> packed(head_block_size, 0.0f);
-        for (int t = t_start; t < t_end; ++t) {
+        std::vector<float> packed;
+        packed.reserve(static_cast<size_t>(std::max(1, BLOCK_SIZE)) * head_block_size);
+        for (int t = t_start; t < t_end;) {
             if (!has_valid_seq) {
-                std::fill(packed.begin(), packed.end(), 0.0f);
-                ScatterTokenHeadContiguous(packed.data(), dst, t, head_dim, n_head_kv);
-                continue;
+                ZeroTokenSpanHead(dst, t, t_end - t, head_dim, n_head_kv);
+                break;
             }
 
             if (!block_table || t >= retained_history.history_kept) {
-                std::fill(packed.begin(), packed.end(), 0.0f);
-                ScatterTokenHeadContiguous(packed.data(), dst, t, head_dim, n_head_kv);
-                continue;
+                ZeroTokenSpanHead(dst, t, t_end - t, head_dim, n_head_kv);
+                break;
             }
 
             const int token_pos = MapRetainedHistoryIndex(retained_history, t);
             const int logical_block = token_pos / BLOCK_SIZE;
             const int slot = token_pos % BLOCK_SIZE;
             if (logical_block < 0 || logical_block >= static_cast<int>(block_table->size())) {
-                std::fill(packed.begin(), packed.end(), 0.0f);
-                ScatterTokenHeadContiguous(packed.data(), dst, t, head_dim, n_head_kv);
+                ZeroTokenSpanHead(dst, t, 1, head_dim, n_head_kv);
+                ++t;
                 continue;
             }
 
             const int block_id = (*block_table)[logical_block];
-            if (ud->is_k) {
-                ud->cache->ReadKSlot(block_id, ud->layer, slot, packed.data());
-            } else {
-                ud->cache->ReadVSlot(block_id, ud->layer, slot, packed.data());
+            int run = 1;
+            while (t + run < t_end && t + run < retained_history.history_kept) {
+                const int next_token_pos = MapRetainedHistoryIndex(retained_history, t + run);
+                if (next_token_pos != token_pos + run) {
+                    break;
+                }
+                if ((next_token_pos / BLOCK_SIZE) != logical_block) {
+                    break;
+                }
+                ++run;
             }
-            ScatterTokenHeadContiguous(packed.data(), dst, t, head_dim, n_head_kv);
+            packed.resize(static_cast<size_t>(run) * head_block_size);
+            if (ud->is_k) {
+                ud->cache->ReadKSlots(block_id, ud->layer, slot, run, packed.data());
+            } else {
+                ud->cache->ReadVSlots(block_id, ud->layer, slot, run, packed.data());
+            }
+            ScatterTokenSpanHeadContiguous(packed.data(), dst, t, run, head_dim, n_head_kv);
+            t += run;
         }
     }
 
@@ -2141,10 +2410,11 @@ void cb_kv_manage(struct ggml_tensor* dst, const struct ggml_tensor* src, int it
         const int t_start = ith * tokens_per_thread;
         const int t_end = std::min(t_start + tokens_per_thread, N);
 
-        std::vector<float> packed(head_block_size);
-        for (int t = t_start; t < t_end; ++t) {
-            GatherTokenHeadContiguous(src, t, head_dim, n_head_kv, packed.data());
-            ScatterTokenHeadContiguous(packed.data(), dst, n_past + t, head_dim, n_head_kv);
+        if (t_end > t_start) {
+            std::vector<float> packed;
+            packed.resize(static_cast<size_t>(t_end - t_start) * head_block_size);
+            GatherTokenSpanHeadContiguous(src, t_start, t_end - t_start, head_dim, n_head_kv, packed.data());
+            ScatterTokenSpanHeadContiguous(packed.data(), dst, n_past + t_start, t_end - t_start, head_dim, n_head_kv);
         }
     }
 
@@ -2225,31 +2495,49 @@ void cb_kv_update_and_gather(struct ggml_tensor* dst, const struct ggml_tensor* 
     // ===========================================================================
     // For each new token in the batch, write its K/V to the PagedKVCache
     // ===========================================================================
-    for (int i = 0; i < N; i++) {
-        // Validate seq_id bounds
-        if (i >= static_cast<int>(ud->batch->seq_id.size())) continue;
+    for (int i = 0; i < N;) {
+        if (i >= static_cast<int>(ud->batch->seq_id.size()) || i >= static_cast<int>(ud->batch->pos.size())) {
+            ++i;
+            continue;
+        }
 
-        int seq_id = ud->batch->seq_id[i];
-        int pos = ud->batch->pos[i];
-
-        // Validate block_table bounds
-        if (seq_id < 0 || seq_id >= static_cast<int>(ud->batch->block_tables.size())) continue;
+        const int seq_id = ud->batch->seq_id[i];
+        const int pos = ud->batch->pos[i];
+        if (seq_id < 0 || seq_id >= static_cast<int>(ud->batch->block_tables.size())) {
+            ++i;
+            continue;
+        }
 
         const auto& block_table = ud->batch->block_tables[seq_id];
-        int logical_block = pos / BLOCK_SIZE;
-        int slot = pos % BLOCK_SIZE;
-
-        // Validate logical block exists
-        if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) continue;
-
-        int block_id = block_table[logical_block];
-        const float* token_data = src_data + i * head_block_size;
-
-        if (is_k) {
-            ud->cache->WriteKSlot(block_id, layer, slot, token_data);
-        } else {
-            ud->cache->WriteVSlot(block_id, layer, slot, token_data);
+        const int logical_block = pos / BLOCK_SIZE;
+        const int slot = pos % BLOCK_SIZE;
+        if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) {
+            ++i;
+            continue;
         }
+
+        int run = 1;
+        while (i + run < N && i + run < static_cast<int>(ud->batch->seq_id.size()) &&
+               i + run < static_cast<int>(ud->batch->pos.size())) {
+            const int next_seq_id = ud->batch->seq_id[i + run];
+            const int next_pos = ud->batch->pos[i + run];
+            if (next_seq_id != seq_id || next_pos != pos + run) {
+                break;
+            }
+            if ((next_pos / BLOCK_SIZE) != logical_block) {
+                break;
+            }
+            ++run;
+        }
+
+        const int block_id = block_table[logical_block];
+        const float* token_data = src_data + static_cast<size_t>(i) * head_block_size;
+        if (is_k) {
+            ud->cache->WriteKSlots(block_id, layer, slot, run, token_data);
+        } else {
+            ud->cache->WriteVSlots(block_id, layer, slot, run, token_data);
+        }
+        i += run;
     }
 
     // ===========================================================================
@@ -2264,28 +2552,39 @@ void cb_kv_update_and_gather(struct ggml_tensor* dst, const struct ggml_tensor* 
 
         if (seq_id >= 0 && seq_id < static_cast<int>(ud->batch->block_tables.size())) {
             const auto& block_table = ud->batch->block_tables[seq_id];
+            const bool dst_dense = IsTokenSpanDense(dst, head_dim, n_head_kv);
+            std::vector<float> packed;
+            packed.reserve(static_cast<size_t>(BLOCK_SIZE) * head_block_size);
 
-            for (int i = 0; i < n_past; i++) {
-                int logical_block = i / BLOCK_SIZE;
-                int slot = i % BLOCK_SIZE;
-
-                float* dst_slot = reinterpret_cast<float*>(dst->data) + i * head_block_size;
+            for (int i = 0; i < n_past;) {
+                const int logical_block = i / BLOCK_SIZE;
+                const int slot = i % BLOCK_SIZE;
+                const int run = std::min(BLOCK_SIZE - slot, n_past - i);
 
                 if (logical_block >= 0 && logical_block < static_cast<int>(block_table.size())) {
-                    int block_id = block_table[logical_block];
+                    const int block_id = block_table[logical_block];
+                    float* dst_slot = dst_dense ? (reinterpret_cast<float*>(dst->data) + static_cast<size_t>(i) * head_block_size)
+                                                : nullptr;
+                    if (!dst_dense) {
+                        packed.resize(static_cast<size_t>(run) * head_block_size);
+                        dst_slot = packed.data();
+                    }
                     if (is_k) {
-                        ud->cache->ReadKSlot(block_id, layer, slot, dst_slot);
+                        ud->cache->ReadKSlots(block_id, layer, slot, run, dst_slot);
                     } else {
-                        ud->cache->ReadVSlot(block_id, layer, slot, dst_slot);
+                        ud->cache->ReadVSlots(block_id, layer, slot, run, dst_slot);
+                    }
+                    if (!dst_dense) {
+                        ScatterTokenSpanHeadContiguous(dst_slot, dst, i, run, head_dim, n_head_kv);
                     }
                 } else {
-                    // Block doesn't exist - zero-fill this slot
-                    memset(dst_slot, 0, head_block_bytes);
+                    ZeroTokenSpanHead(dst, i, run, head_dim, n_head_kv);
                 }
+                i += run;
             }
         } else {
             // Invalid sequence - zero-fill entire history section
-            memset(dst->data, 0, n_past * head_block_bytes);
+            ZeroTokenSpanHead(dst, 0, n_past, head_dim, n_head_kv);
         }
     }
 
@@ -2294,8 +2593,12 @@ void cb_kv_update_and_gather(struct ggml_tensor* dst, const struct ggml_tensor* 
     // ===========================================================================
     // Copy the current K/V data after the history section
     // ===========================================================================
-    float* dst_current = reinterpret_cast<float*>(dst->data) + n_past * head_block_size;
-    memcpy(dst_current, src_data, N * head_block_bytes);
+    if (IsTokenSpanDense(dst, head_dim, n_head_kv)) {
+        float* dst_current = reinterpret_cast<float*>(dst->data) + n_past * head_block_size;
+        memcpy(dst_current, src_data, N * head_block_bytes);
+    } else {
+        ScatterTokenSpanHeadContiguous(src_data, dst, n_past, N, head_dim, n_head_kv);
+    }
 }
 
 // ============================================================================
@@ -2397,6 +2700,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     // that position marker and reuse the same quantized buffer.
     // ==========================================================================
     const void* quant_input = nullptr;
+    bool used_shared_quant_buffer = false;
     if (ud->input_quant_type != GGML_TYPE_F32) {
         const auto* input_type_traits = ggml_get_type_traits_cpu(ud->input_quant_type);
         if (input_type_traits && input_type_traits->from_float) {
@@ -2422,16 +2726,21 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                         input_type_traits->from_float(x_f32, ud->quant_input_shared, static_cast<int64_t>(N));
                         ud->quantized_stamp->store(expected_stamp, std::memory_order_release);
                         quant_input = ud->quant_input_shared;
+                        used_shared_quant_buffer = true;
                     } else {
                         int spin_count = 0;
                         while (ud->quantized_stamp->load(std::memory_order_acquire) != expected_stamp) {
                             SpinPause(spin_count++);
                         }
                         quant_input = ud->quant_input_shared;
+                        used_shared_quant_buffer = true;
                     }
                 }
             }
         }
+    }
+    if (ith == 0 && quant_input) {
+        RecordSharedQuantReuse(used_shared_quant_buffer);
     }
 
     // Partition output dimension across threads
@@ -2932,6 +3241,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
 
         const uint8_t* quant_input_base = nullptr;
         size_t quant_input_row_stride = quant_row_stride;
+        bool used_shared_quant_buffer = false;
         if (can_quantize_inputs) {
             const BatchSpec* batch = GetCurrentBatch();
             const bool can_sync_on_stamp = nth > 1 && ud->slot_id >= 0 && ud->quant_input_shared && ud->quantized_stamp;
@@ -2954,13 +3264,18 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 }
                 ud->quantized_stamp->store(expected_stamp, std::memory_order_release);
                 quant_input_base = ud->quant_input_shared;
+                used_shared_quant_buffer = true;
             } else {
                 int spin_count = 0;
                 while (ud->quantized_stamp->load(std::memory_order_acquire) != expected_stamp) {
                     SpinPause(spin_count++);
                 }
                 quant_input_base = ud->quant_input_shared;
+                used_shared_quant_buffer = true;
             }
+        }
+        if (ith == 0 && quant_input_base) {
+            RecordSharedQuantReuse(used_shared_quant_buffer);
         }
 
         const void* sample_row_ptr = weight_base + static_cast<size_t>(k_start) * weight_row_stride;
@@ -6758,13 +7073,11 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     }
                 }
                 const int n_total_tokens = n_past_val + N;
-                const bool paged_decode_candidate =
-                    !model->arch_flags.is_glm_dsa &&
-                    IsPagedDecodeCandidate(cache, batch, N, n_head, n_head_kv, head_dim_q, head_dim_kv);
-                const bool requested_paged_decode_attention =
-                    !model->arch_flags.is_glm_dsa &&
-                    ShouldUsePagedDecodeAttention(decode_paged_policy, cache, batch, N, n_head, n_head_kv, head_dim_q,
-                                                  head_dim_kv);
+                const DecodePagedDecision paged_decode_decision =
+                    EvaluatePagedDecodeDecision(decode_paged_policy, model, cache, batch, N, n_head, n_head_kv,
+                                                head_dim_q, head_dim_kv);
+                const bool paged_decode_candidate = paged_decode_decision.candidate;
+                const bool requested_paged_decode_attention = paged_decode_decision.requested;
                 const bool decode_only_batch = decode_only_batch_layout;
 
                 // Safety override: GGML's generic decode matmul path can become numerically
@@ -6794,7 +7107,6 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                         }
                     }
                 }
-
                 if (decode_paged_policy.debug_log && il == 0) {
                     const char* mode = "auto";
                     if (decode_paged_policy.mode == DecodePagedAttentionMode::Off) mode = "off";
@@ -6807,7 +7119,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                               << " head_dim_q=" << head_dim_q << " cache_type=" << cache_type
                               << " ctx_min=" << (context_summary.valid ? context_summary.min_context : -1)
                               << " ctx_avg=" << (context_summary.valid ? context_summary.avg_context : -1)
-                              << " ctx_max=" << (context_summary.valid ? context_summary.max_context : -1) << std::endl;
+                              << " ctx_max=" << (context_summary.valid ? context_summary.max_context : -1)
+                              << " reason=" << DecodePagedFallbackReasonName(paged_decode_decision.reason)
+                              << std::endl;
                 }
 
                 if (use_cache && !use_paged_decode_attention) {  // Re-enabled old KV cache approach
@@ -7075,6 +7389,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                                : use_portable_cpu_flash_attention ? "cpu_flash_hal"
                                                                   : (use_flash_attention ? "flash" : "standard"));
                     std::cerr << "[DecodeAttentionPath] N=" << N << " path=" << path << std::endl;
+                }
+
+                if (!use_paged_decode_attention) {
+                    RecordDecodePagedFallbackReason(paged_decode_decision.reason, il, N);
                 }
 
                 const DecodeAttentionPathKind attention_path_kind =

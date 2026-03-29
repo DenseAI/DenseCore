@@ -45,8 +45,6 @@
 #include "densecore/hal/transformer_ops.h"
 #include "densecore/hal/typed_tensor.h"
 #include "ggml.h"
-#include "kernels/cpu_fp8.h"
-#include "kernels/cpu_int4.h"
 #include "moe/moe_routing.h"
 #include "thread_pool_impl.h"
 
@@ -138,6 +136,65 @@ inline const float* GetLoRAWeightF32(const ggml_tensor* tensor, std::vector<floa
     }
 
     return nullptr;
+}
+
+inline bool ParseCpuBackendEnvBool(const char* name, bool default_value) {
+    const char* value = std::getenv(name);
+    if (!value || *value == '\0') {
+        return default_value;
+    }
+    return std::strcmp(value, "0") != 0;
+}
+
+inline size_t GetMoEPrefetchBytes() {
+    static const size_t bytes = []() -> size_t {
+        const char* env = std::getenv("DENSECORE_MOE_PREFETCH_BYTES");
+        if (!env || *env == '\0') {
+            return 8192;
+        }
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(env, &end, 10);
+        if (end == env || *end != '\0') {
+            return 8192;
+        }
+        return static_cast<size_t>(std::max<unsigned long long>(64ULL, parsed));
+    }();
+    return bytes;
+}
+
+inline bool IsMoELocalityOrderingEnabled() {
+    static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_LOCALITY_ORDERING", false);
+    return enabled;
+}
+
+inline bool IsMoENextExpertPrefetchEnabled() {
+    static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_PREFETCH_NEXT_EXPERT", false);
+    return enabled;
+}
+
+inline size_t GetMoEDequantCacheBytes() {
+    static const size_t bytes = []() -> size_t {
+        const char* env = std::getenv("DENSECORE_MOE_DEQUANT_CACHE_MB");
+        if (!env || *env == '\0') {
+            return 0;
+        }
+        char* end = nullptr;
+        const unsigned long long parsed_mb = std::strtoull(env, &end, 10);
+        if (end == env || *end != '\0') {
+            return 0;
+        }
+        return static_cast<size_t>(parsed_mb) * 1024ULL * 1024ULL;
+    }();
+    return bytes;
+}
+
+inline bool IsMoEDequantCacheEnabled() {
+    return GetMoEDequantCacheBytes() > 0;
+}
+
+inline bool ShouldCacheAllActiveExperts() {
+    static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_DEQUANT_CACHE_ALL_ACTIVE", false);
+    return enabled;
 }
 
 }  // namespace internal

@@ -7,77 +7,11 @@
  * and handling preemption based on memory pressure.
  */
 
-#include "scheduler.h"
-
-#include <algorithm>
-#include <cctype>
-#include <cstdlib>
-#include <limits>
-#include <unordered_set>
+#include "scheduler_internal.h"
 
 #include "densecore/utils/logging.h"
 
 namespace densecore {
-
-namespace {
-
-bool EqualsIgnoreCase(const char* lhs, const char* rhs) {
-    if (!lhs || !rhs) {
-        return false;
-    }
-    while (*lhs != '\0' && *rhs != '\0') {
-        const unsigned char lhs_ch = static_cast<unsigned char>(*lhs);
-        const unsigned char rhs_ch = static_cast<unsigned char>(*rhs);
-        if (std::tolower(lhs_ch) != std::tolower(rhs_ch)) {
-            return false;
-        }
-        ++lhs;
-        ++rhs;
-    }
-    return *lhs == '\0' && *rhs == '\0';
-}
-
-bool ParseEnvBool(const char* value, bool default_value) {
-    if (!value || *value == '\0') {
-        return default_value;
-    }
-
-    if (EqualsIgnoreCase(value, "1") || EqualsIgnoreCase(value, "true") || EqualsIgnoreCase(value, "yes") ||
-        EqualsIgnoreCase(value, "on")) {
-        return true;
-    }
-
-    if (EqualsIgnoreCase(value, "0") || EqualsIgnoreCase(value, "false") || EqualsIgnoreCase(value, "no") ||
-        EqualsIgnoreCase(value, "off")) {
-        return false;
-    }
-
-    return default_value;
-}
-
-int ParseEnvInt(const char* value, int default_value) {
-    if (!value || *value == '\0') {
-        return default_value;
-    }
-
-    char* end = nullptr;
-    const long parsed = std::strtol(value, &end, 10);
-    if (end == value || *end != '\0') {
-        return default_value;
-    }
-
-    if (parsed < 0 || parsed > std::numeric_limits<int>::max()) {
-        return default_value;
-    }
-
-    return static_cast<int>(parsed);
-}
-
-size_t ScheduledSeqCount(const SchedulerOutput& output) {
-    return output.prefill_seq_ids.size() + output.decode_seq_ids.size();
-}
-
-}  // namespace
 
 // ============================================================================
 // Scheduler Implementation
@@ -86,11 +20,24 @@ size_t ScheduledSeqCount(const SchedulerOutput& output) {
 Scheduler::Scheduler(BlockManager* block_manager, const SchedulerConfig& config)
     : block_manager_(block_manager), config_(config) {
     decode_homogeneous_batch_n_past_ =
-        ParseEnvBool(std::getenv("DENSECORE_SCHED_DECODE_HOMOGENEOUS_N_PAST"), /*default_value=*/false);
+        scheduler_internal::ParseEnvBool(std::getenv("DENSECORE_SCHED_DECODE_HOMOGENEOUS_N_PAST"),
+                                         /*default_value=*/false);
     config_.enable_mixed_prefill_decode =
-        ParseEnvBool(std::getenv("DENSECORE_SCHED_ENABLE_MIXED_PREFILL_DECODE"), config_.enable_mixed_prefill_decode);
+        scheduler_internal::ParseEnvBool(std::getenv("DENSECORE_SCHED_ENABLE_MIXED_PREFILL_DECODE"),
+                                         config_.enable_mixed_prefill_decode);
     config_.max_mixed_prefill_tokens = std::max(
-        1, ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_MIXED_PREFILL_TOKENS"), config_.max_mixed_prefill_tokens));
+        1, scheduler_internal::ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_MIXED_PREFILL_TOKENS"),
+                                           config_.max_mixed_prefill_tokens));
+    config_.enable_moe_clustering =
+        scheduler_internal::ParseEnvBool(std::getenv("DENSECORE_SCHED_ENABLE_MOE_CLUSTERING"),
+                                         config_.enable_moe_clustering);
+    config_.max_active_experts =
+        std::max(1, scheduler_internal::ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_ACTIVE_EXPERTS"),
+                                                    config_.max_active_experts));
+    config_.moe_batch_strictness = std::clamp(
+        scheduler_internal::ParseEnvFloat(std::getenv("DENSECORE_SCHED_MOE_BATCH_STRICTNESS"),
+                                          config_.moe_batch_strictness),
+        0.0f, 1.0f);
 }
 
 int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, int priority,
@@ -361,68 +308,6 @@ void Scheduler::UpdateProgress(int seq_id, int tokens_generated) {
     seq_context_len_[seq_id] += tokens_generated;
 }
 
-// =============================================================================
-// EnsureBlockWritable - Copy-on-Write Trigger (Patent Compliance)
-// =============================================================================
-// This function must be called before modifying any KV cache block that may be
-// shared with another sequence (e.g., after ForkSequence for beam search).
-// If the block's ref_count > 1, CopyOnWrite() allocates a new private block.
-// =============================================================================
-int Scheduler::EnsureBlockWritable(int seq_id, int block_index,
-                                   const std::function<void(int src, int dst)>& copy_callback) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    auto it = seq_block_ids_.find(seq_id);
-    if (it == seq_block_ids_.end()) {
-        return -1;  // Sequence not found
-    }
-
-    auto& blocks = it->second;
-    if (block_index < 0 || block_index >= static_cast<int>(blocks.size())) {
-        return -1;  // Invalid block index
-    }
-
-    int old_block_id = blocks[block_index];
-
-    // Check if block is shared and needs CoW
-    if (block_manager_->IsShared(old_block_id)) {
-        // Pass the callback to block manager to perform the actual copy during the transaction
-        int new_block_id = block_manager_->CopyOnWrite(old_block_id, copy_callback);
-        if (new_block_id >= 0 && new_block_id != old_block_id) {
-            // Update block table to use the new private copy
-            blocks[block_index] = new_block_id;
-            return new_block_id;
-        }
-    }
-
-    // Block was not shared, or CopyOnWrite returned the same block
-    return old_block_id;
-}
-
-// =============================================================================
-// SetPredictedExperts - MoE Expert Prediction (Patent Claim 4)
-// =============================================================================
-// After MoE routing selects experts for a token, call this to record them.
-// The scheduler uses this for expert-coverage-aware batching: requests using
-// similar experts are grouped together to maximize L3 cache utilization.
-// =============================================================================
-void Scheduler::SetPredictedExperts(int seq_id, const std::vector<int>& experts) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // Store in the dedicated map for all sequences (running or waiting)
-    seq_predicted_experts_[seq_id] = experts;
-
-    // Also update the waiting queue's SequenceGroup if the sequence is waiting
-    for (auto& group : waiting_queue_) {
-        for (int sid : group.sequence_ids) {
-            if (sid == seq_id) {
-                group.predicted_experts = experts;
-                return;
-            }
-        }
-    }
-}
-
 Scheduler::Stats Scheduler::GetStats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     Stats stats;
@@ -519,297 +404,6 @@ int Scheduler::GetSequenceContextLen(int seq_id) const {
 std::chrono::steady_clock::time_point Scheduler::GetSequenceArrival(int seq_id) const {
     auto it = seq_arrival_.find(seq_id);
     return (it != seq_arrival_.end()) ? it->second : std::chrono::steady_clock::now();
-}
-
-void Scheduler::ScheduleRunning(SchedulerOutput& output) {
-    int tokens_budget = config_.max_num_batched_tokens - output.total_tokens;
-    std::unordered_set<int> active_experts;
-
-    std::vector<int> running_ids(running_seqs_.begin(), running_seqs_.end());
-    std::sort(running_ids.begin(), running_ids.end(), [this](int a, int b) {
-        int pri_a = GetSequencePriority(a);
-        int pri_b = GetSequencePriority(b);
-        if (pri_a != pri_b) return pri_a < pri_b;
-        return GetSequenceArrival(a) < GetSequenceArrival(b);
-    });
-
-    int target_context_len = -1;
-
-    for (int seq_id : running_ids) {
-        if (ScheduledSeqCount(output) >= static_cast<size_t>(config_.max_num_seqs)) {
-            break;
-        }
-        if (tokens_budget <= 0) {
-            break;
-        }
-
-        const int seq_context = GetSequenceContextLen(seq_id);
-        if (decode_homogeneous_batch_n_past_ && target_context_len >= 0 && seq_context != target_context_len) {
-            continue;
-        }
-
-        if (config_.enable_moe_clustering) {
-            auto it = seq_predicted_experts_.find(seq_id);
-            if (it != seq_predicted_experts_.end() && !it->second.empty()) {
-                int new_experts = 0;
-                for (int e : it->second) {
-                    if (active_experts.find(e) == active_experts.end()) {
-                        new_experts++;
-                    }
-                }
-
-                if (static_cast<int>(active_experts.size()) + new_experts > config_.max_active_experts) {
-                    float rand_val = static_cast<float>(seq_id % 100) / 100.0f;
-                    if (rand_val < config_.moe_batch_strictness) {
-                        continue;
-                    }
-                }
-
-                for (int e : it->second) {
-                    active_experts.insert(e);
-                }
-            }
-        }
-
-        output.decode_seq_ids.push_back(seq_id);
-        output.num_decode_tokens++;
-        output.total_tokens++;
-        if (target_context_len < 0) {
-            target_context_len = seq_context;
-        }
-        output.batch_context_len = target_context_len;
-        tokens_budget--;
-
-        if (tokens_budget <= 0) break;
-    }
-}
-
-void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) {
-    int tokens_budget = config_.max_num_batched_tokens - output.total_tokens;
-
-    std::vector<SequenceGroup> sorted_queue(waiting_queue_.begin(), waiting_queue_.end());
-    std::sort(sorted_queue.begin(), sorted_queue.end(), [](const SequenceGroup& a, const SequenceGroup& b) {
-        if (a.priority != b.priority) return a.priority < b.priority;
-        return a.arrival_time < b.arrival_time;
-    });
-
-    std::deque<SequenceGroup> still_waiting;
-
-    // Track active experts for MoE-aware batching
-    std::unordered_set<int> active_experts;
-    const bool extending_decode_batch = !output.decode_seq_ids.empty();
-    int target_context_len = output.batch_context_len;
-
-    for (auto& group : sorted_queue) {
-        if (ScheduledSeqCount(output) >= static_cast<size_t>(config_.max_num_seqs)) {
-            still_waiting.push_back(group);
-            continue;
-        }
-
-        const int seq_id = group.sequence_ids[0];
-        const int remaining = group.num_tokens_to_process;
-        if (remaining <= 0) {
-            running_seqs_.insert(seq_id);
-            seq_status_[seq_id] = SequenceStatus::RUNNING;
-            continue;
-        }
-
-        auto chunk_policy_it = seq_allow_chunked_prefill_.find(seq_id);
-        const bool allow_chunk = (chunk_policy_it == seq_allow_chunked_prefill_.end()) ? true : chunk_policy_it->second;
-        const bool can_chunk = config_.enable_chunked_prefill && allow_chunk;
-
-        if (!can_chunk && remaining > config_.max_num_batched_tokens) {
-            LOG_WARN("Scheduler cancelling seq ", seq_id, " (remaining prefill=", remaining,
-                     " exceeds max_num_batched_tokens=", config_.max_num_batched_tokens,
-                     " with chunked prefill disabled)");
-            seq_status_[seq_id] = SequenceStatus::CANCELLED;
-            CleanupSequenceState(seq_id, /*erase_from_waiting_queue=*/false, /*free_block_manager_blocks=*/true);
-            continue;
-        }
-
-        int prefill_budget = tokens_budget;
-        if (prefill_token_cap >= 0) {
-            prefill_budget = std::min(prefill_budget, prefill_token_cap);
-        }
-        if (can_chunk) {
-            prefill_budget = std::min(prefill_budget, config_.max_prefill_tokens);
-        }
-        if (!can_chunk && remaining > prefill_budget) {
-            still_waiting.push_back(group);
-            continue;
-        }
-        const int tokens_needed = can_chunk ? std::min(remaining, prefill_budget) : remaining;
-        if (tokens_needed <= 0) {
-            still_waiting.push_back(group);
-            continue;
-        }
-
-        const int group_context = GetSequenceContextLen(seq_id);
-        // Mixed prefill+decode batches are only safe when the waiting prefill
-        // group already lives in the same retained-history bucket as the decode
-        // rows. The worker always lays out prefill rows before decode rows, and
-        // graph-wide KV retention is still derived from batch.n_past[0], so
-        // admitting a mismatched prefill group would corrupt decode history.
-        if (config_.enforce_homogeneous_batch_n_past && target_context_len >= 0 &&
-            group_context != target_context_len) {
-            still_waiting.push_back(group);
-            continue;
-        }
-
-        // =====================================================================
-        // MoE Expert Coverage Control
-        // =====================================================================
-        // If MoE clustering is enabled and this request has predicted experts,
-        // check if adding it would exceed the max_active_experts threshold.
-        // With strictness=1.0, always defer; with strictness=0.0, always admit.
-        // =====================================================================
-        if (config_.enable_moe_clustering && !group.predicted_experts.empty()) {
-            int new_experts = 0;
-            for (int e : group.predicted_experts) {
-                if (active_experts.find(e) == active_experts.end()) {
-                    new_experts++;
-                }
-            }
-
-            if (static_cast<int>(active_experts.size()) + new_experts > config_.max_active_experts) {
-                // Would exceed expert budget - use strictness to decide
-                // strictness=1.0 means always defer, strictness=0.0 means always admit
-                // We use a simple threshold: defer if strictness > random
-                // For determinism, we use strictness as probability threshold
-                float rand_val = static_cast<float>(group.request_id % 100) / 100.0f;
-                if (rand_val < config_.moe_batch_strictness) {
-                    still_waiting.push_back(group);
-                    continue;
-                }
-            }
-
-            // Track this request's experts as active
-            for (int e : group.predicted_experts) {
-                active_experts.insert(e);
-            }
-        }
-
-        auto& seq_blocks = seq_block_ids_[seq_id];
-        if (seq_blocks.empty() && !group.shared_block_ids.empty()) {
-            seq_blocks = group.shared_block_ids;
-        }
-
-        const int required_context = group_context + tokens_needed;
-        const int required_blocks = SequenceBlockTable::BlocksNeeded(required_context);
-        const int blocks_to_allocate = std::max(0, required_blocks - static_cast<int>(seq_blocks.size()));
-
-        std::vector<int> new_blocks;
-        if (blocks_to_allocate > 0) {
-            if (block_manager_->GetFreeBlockCount() < blocks_to_allocate) {
-                LOG_DEBUG("Scheduler: Not enough blocks for seq ", seq_id, " (needed ", blocks_to_allocate, ", free ",
-                          block_manager_->GetFreeBlockCount(), ")");
-                still_waiting.push_back(group);
-                continue;
-            }
-
-            new_blocks = block_manager_->Allocate(blocks_to_allocate);
-            if ((int)new_blocks.size() != blocks_to_allocate) {
-                LOG_DEBUG("Scheduler: Allocate failed for seq ", seq_id);
-                still_waiting.push_back(group);
-                continue;
-            }
-            seq_blocks.insert(seq_blocks.end(), new_blocks.begin(), new_blocks.end());
-        }
-
-        LOG_DEBUG("Scheduler: Scheduled seq ", seq_id, " (prefill)");
-        output.prefill_seq_ids.push_back(seq_id);
-        output.prefill_chunk_info.push_back({seq_id, tokens_needed});
-        output.num_prefill_tokens += tokens_needed;
-        output.total_tokens += tokens_needed;
-        if (target_context_len < 0) {
-            target_context_len = group_context;
-        }
-        output.batch_context_len = target_context_len;
-        if (!new_blocks.empty()) {
-            output.new_block_allocations.push_back({seq_id, new_blocks});
-        }
-
-        // Expose prefix cache hit information to worker
-        if (group.shared_prefix_len > 0 && !group.shared_block_ids.empty()) {
-            PrefixCacheInfo cache_info;
-            cache_info.seq_id = seq_id;
-            cache_info.cached_tokens = group.shared_prefix_len;
-            cache_info.cached_block_ids = group.shared_block_ids;
-            output.prefix_cache_hits.push_back(cache_info);
-            LOG_DEBUG("Scheduler: Prefix cache hit for seq ", seq_id, " (", group.shared_prefix_len, " tokens cached)");
-            // Emit prefix cache hit once; avoid duplicate append in worker.
-            group.shared_prefix_len = 0;
-            group.shared_block_ids.clear();
-        }
-
-        seq_generated_tokens_[seq_id] = 0;
-        seq_priority_[seq_id] = group.priority;
-        seq_arrival_[seq_id] = group.arrival_time;
-
-        tokens_budget -= tokens_needed;
-        if (prefill_token_cap >= 0) {
-            prefill_token_cap = std::max(0, prefill_token_cap - tokens_needed);
-        }
-
-        if (remaining > tokens_needed) {
-            group.num_tokens_to_process = remaining - tokens_needed;
-            seq_status_[seq_id] = SequenceStatus::WAITING;
-            still_waiting.push_back(group);
-        } else {
-            group.num_tokens_to_process = 0;
-            running_seqs_.insert(seq_id);
-            seq_status_[seq_id] = SequenceStatus::RUNNING;
-        }
-    }
-
-    waiting_queue_ = std::move(still_waiting);
-}
-
-void Scheduler::ScheduleSwapped(SchedulerOutput& output) {
-    if (swapped_seqs_.empty()) return;
-
-    int available_slots = config_.max_num_seqs - static_cast<int>(running_seqs_.size());
-    if (available_slots <= 0) return;
-
-    std::vector<int> swapped_ids(swapped_seqs_.begin(), swapped_seqs_.end());
-    std::sort(swapped_ids.begin(), swapped_ids.end(), [this](int a, int b) {
-        int pri_a = GetSequencePriority(a);
-        int pri_b = GetSequencePriority(b);
-        if (pri_a != pri_b) return pri_a < pri_b;
-        return GetSequenceArrival(a) < GetSequenceArrival(b);
-    });
-
-    for (int seq_id : swapped_ids) {
-        if (available_slots <= 0) break;
-
-        int prompt_len = 0;
-        auto prompt_it = seq_prompt_len_.find(seq_id);
-        if (prompt_it != seq_prompt_len_.end()) {
-            prompt_len = prompt_it->second;
-        }
-        int generated = GetSequenceProgress(seq_id);
-        int total_tokens = prompt_len + generated;
-        if (total_tokens <= 0) total_tokens = 1;
-
-        int blocks_needed = SequenceBlockTable::BlocksNeeded(total_tokens);
-        if (block_manager_->GetFreeBlockCount() < blocks_needed) {
-            continue;
-        }
-
-        std::vector<int> new_blocks = block_manager_->Allocate(blocks_needed);
-        if (new_blocks.empty()) {
-            continue;
-        }
-
-        output.swap_in_seq_ids.push_back(seq_id);
-        output.new_block_allocations.push_back({seq_id, new_blocks});
-        seq_block_ids_[seq_id] = new_blocks;
-
-        swapped_seqs_.erase(seq_id);
-        running_seqs_.insert(seq_id);
-        seq_status_[seq_id] = SequenceStatus::RUNNING;
-        available_slots--;
-    }
 }
 
 // ============================================================================

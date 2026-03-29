@@ -1,6 +1,7 @@
 #include <ggml-cpu.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -33,731 +34,12 @@
 #include "optimization_bridge.h"  // Runtime SIMD dispatch
 #include "simd_ops.h"
 #include "utils/raii_guards.h"
+#include "worker_internal.h"
 
 #include "cpu_backend.h"
 #include "densecore/arm_runtime.h"
 #include "densecore/graph_executor.h"
 #include "densecore/models/graph_registry.h"
-
-#ifndef DENSECORE_DEFAULT_PRECOMPUTED_ROPE
-#define DENSECORE_DEFAULT_PRECOMPUTED_ROPE 1
-#endif
-
-#ifndef DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM
-#define DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM 0
-#endif
-
-#ifndef DENSECORE_DEFAULT_FUSED_QKV
-#define DENSECORE_DEFAULT_FUSED_QKV 1
-#endif
-
-// Defined in inference.cpp (GGML custom paged decode callback).
-void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* userdata);
-
-namespace {
-bool IsDebugGraphLoggingEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_DEBUG_GRAPH");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsVerboseTokenTraceEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_VERBOSE_TOKEN_TRACE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsReasoningTagSuppressionEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_SUPPRESS_REASONING_TAGS");
-        if (!env || env[0] == '\0') return true;
-        return std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsBenchmarkFastPathEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_BENCH_MODE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsBenchmarkDirectCallbackEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_BENCH_DIRECT_CALLBACK");
-        if (!env || env[0] == '\0') {
-            return false;
-        }
-        return std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsBenchmarkDecodeBatchFastPathEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_BENCH_DECODE_BATCH_FAST_PATH");
-        if (!env || env[0] == '\0') {
-            return false;
-        }
-        return std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-int BenchmarkFastPathMaxBatch() {
-    static const int max_batch = []() {
-        const char* env = std::getenv("DENSECORE_BENCH_FAST_PATH_MAX_BATCH");
-        if (!env || env[0] == '\0') return 8;
-        char* end = nullptr;
-        const long v = std::strtol(env, &end, 10);
-        if (end == env || *end != '\0' || v <= 0 || v > std::numeric_limits<int>::max()) {
-            return 8;
-        }
-        return static_cast<int>(v);
-    }();
-    return max_batch;
-}
-
-bool AllowDecodeThreadsOverBase() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_ALLOW_EXCEED_BASE_THREADS");
-        if (env && env[0] != '\0') {
-            return std::strcmp(env, "0") != 0;
-        }
-        // Backward-compatible alias.
-        const char* legacy_env = std::getenv("DENSECORE_ALLOW_DECODE_THREADS_OVER_BASE");
-        return legacy_env && legacy_env[0] != '\0' && std::strcmp(legacy_env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsDecodeBatchPerfLoggingEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_LOG_DECODE_BATCH_TPS");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsDecodeProfileEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_PROFILE_DECODE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsBatchedDecodeCorrectnessCheckEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_CHECK_BATCHED_DECODE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsBatchedDecodeCorrectnessAbortEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_CHECK_BATCHED_DECODE_ABORT");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-float BatchedDecodeCorrectnessTolerance() {
-    static const float tol = []() {
-        const char* env = std::getenv("DENSECORE_CHECK_BATCHED_DECODE_TOL");
-        if (!env || env[0] == '\0') {
-            return 1e-3f;
-        }
-        char* end = nullptr;
-        const float v = std::strtof(env, &end);
-        if (end == env || !std::isfinite(v) || v <= 0.0f) {
-            return 1e-3f;
-        }
-        return v;
-    }();
-    return tol;
-}
-
-float DecodeGraphCacheRegressionTolerance() {
-    static const float tol = []() {
-        const char* env = std::getenv("DENSECORE_CHECK_DECODE_GRAPH_CACHE_TOL");
-        if (!env || env[0] == '\0') {
-            return BatchedDecodeCorrectnessTolerance();
-        }
-        char* end = nullptr;
-        const float v = std::strtof(env, &end);
-        if (end == env || !std::isfinite(v) || v <= 0.0f) {
-            return BatchedDecodeCorrectnessTolerance();
-        }
-        return v;
-    }();
-    return tol;
-}
-
-size_t BatchedDecodeCorrectnessContextBytes() {
-    static const size_t bytes = []() {
-        const char* env = std::getenv("DENSECORE_CHECK_BATCHED_DECODE_CTX_MB");
-        unsigned long long mb = 512ULL;
-        if (env && env[0] != '\0') {
-            char* end = nullptr;
-            const unsigned long long parsed = std::strtoull(env, &end, 10);
-            if (end != env && *end == '\0' && parsed > 0ULL) {
-                mb = parsed;
-            }
-        }
-        return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
-    }();
-    return bytes;
-}
-
-struct ArmComputeAffinityPolicy {
-    std::vector<int> core_ids;
-    std::string label = "none";
-};
-
-std::string AsciiLowerCopy(const char* value) {
-    if (!value) return {};
-    std::string lowered(value);
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return lowered;
-}
-
-ArmComputeAffinityPolicy ResolveArmComputeAffinityPolicy() {
-    ArmComputeAffinityPolicy policy;
-#if defined(__linux__) && defined(__aarch64__) && !defined(__ANDROID__)
-    const densecore::arm_runtime::CoreClusters clusters = densecore::arm_runtime::DetectCoreClustersLinux();
-    if (clusters.big_cores.empty() && clusters.little_cores.empty()) {
-        return policy;
-    }
-
-    std::string mode = AsciiLowerCopy(std::getenv("DENSECORE_ARM_COMPUTE_CLUSTER"));
-    if (mode.empty()) {
-        mode = "auto";
-    }
-
-    auto use_all_cores = [&]() {
-        policy.core_ids = clusters.big_cores;
-        policy.core_ids.insert(policy.core_ids.end(), clusters.little_cores.begin(), clusters.little_cores.end());
-        std::sort(policy.core_ids.begin(), policy.core_ids.end());
-        policy.core_ids.erase(std::unique(policy.core_ids.begin(), policy.core_ids.end()), policy.core_ids.end());
-        policy.label = "all";
-    };
-
-    if (mode == "all") {
-        use_all_cores();
-    } else if (mode == "little") {
-        policy.core_ids = clusters.little_cores;
-        policy.label = "little";
-    } else if (mode == "big") {
-        policy.core_ids = clusters.big_cores;
-        policy.label = "big";
-    } else {
-        if (!clusters.big_cores.empty() && !clusters.little_cores.empty()) {
-            policy.core_ids = clusters.big_cores;
-            policy.label = "big";
-        } else {
-            use_all_cores();
-        }
-    }
-
-    if (policy.core_ids.empty()) {
-        use_all_cores();
-    }
-#endif
-    return policy;
-}
-
-bool IsDecodeGraphCacheEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_DECODE_GRAPH_CACHE");
-        if (!env || env[0] == '\0') return true;
-        return std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsBatchedPagedDecodeEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_ENABLE_BATCHED_PAGED_DECODE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsPagedDecodeGloballyDisabled() {
-    static const bool disabled = []() {
-        const char* force_env = std::getenv("DENSECORE_FORCE_PAGED_DECODE");
-        if (force_env && force_env[0] != '\0' && std::strcmp(force_env, "0") != 0) {
-            return false;
-        }
-        const char* env = std::getenv("DENSECORE_PAGED_ATTN_DECODE_MODE");
-        if (!env || env[0] == '\0') return false;
-        return std::strcmp(env, "off") == 0 || std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0;
-    }();
-    return disabled;
-}
-
-int ParsePositiveEnvIntOrDefault(const char* name, int default_value) {
-    const char* env = std::getenv(name);
-    if (!env || env[0] == '\0') return default_value;
-    char* end = nullptr;
-    const long v = std::strtol(env, &end, 10);
-    if (end == env || *end != '\0' || v <= 0 || v > std::numeric_limits<int>::max()) {
-        return default_value;
-    }
-    return static_cast<int>(v);
-}
-
-std::string AsciiLower(const char* s) {
-    if (!s) return {};
-    std::string out(s);
-    for (char& c : out) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return out;
-}
-
-bool IsForcePagedDecodeEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_FORCE_PAGED_DECODE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-bool IsPagedDecodeModeForcedOn() {
-    static const bool forced_on = []() {
-        if (IsForcePagedDecodeEnabled()) {
-            return true;
-        }
-        const std::string mode = AsciiLower(std::getenv("DENSECORE_PAGED_ATTN_DECODE_MODE"));
-        if (mode == "on" || mode == "1" || mode == "true" || mode == "force") {
-            return true;
-        }
-        const char* legacy = std::getenv("DENSECORE_ENABLE_PAGED_ATTN_DECODE");
-        return legacy && legacy[0] != '\0' && std::strcmp(legacy, "0") != 0;
-    }();
-    return forced_on;
-}
-
-bool IsFlashAttentionForcedForCacheKey() {
-    static const bool forced = []() {
-        const char* env = std::getenv("DENSECORE_FORCE_FLASH_ATTN");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return forced;
-}
-
-bool IsFlashAttentionDisabledForCacheKey() {
-    static const bool disabled = []() {
-        const std::string mode = AsciiLower(std::getenv("DENSECORE_FLASH_ATTN_MODE"));
-        if (mode == "off" || mode == "0" || mode == "false" || mode == "no") {
-            return true;
-        }
-        const char* legacy = std::getenv("DENSECORE_DISABLE_FLASH_ATTN");
-        return legacy && legacy[0] != '\0' && std::strcmp(legacy, "0") != 0;
-    }();
-    return disabled;
-}
-
-enum class RuntimeToggleModeForCacheKey { Off = 0, Auto = 1, On = 2 };
-
-RuntimeToggleModeForCacheKey ParseRuntimeToggleModeForCacheKey(const char* name,
-                                                               RuntimeToggleModeForCacheKey default_mode) {
-    const std::string mode = AsciiLower(std::getenv(name));
-    if (mode.empty()) return default_mode;
-    if (mode == "0" || mode == "off" || mode == "false" || mode == "no") {
-        return RuntimeToggleModeForCacheKey::Off;
-    }
-    if (mode == "1" || mode == "on" || mode == "true" || mode == "yes" || mode == "force") {
-        return RuntimeToggleModeForCacheKey::On;
-    }
-    if (mode == "auto" || mode == "default") {
-        return RuntimeToggleModeForCacheKey::Auto;
-    }
-    return default_mode;
-}
-
-bool IsPrecomputedRoPEEnabledForCacheKey() {
-    static const bool enabled = []() {
-        const RuntimeToggleModeForCacheKey mode = ParseRuntimeToggleModeForCacheKey(
-            "DENSECORE_ROPE_PRECOMPUTED_MODE",
-            DENSECORE_DEFAULT_PRECOMPUTED_ROPE ? RuntimeToggleModeForCacheKey::On : RuntimeToggleModeForCacheKey::Off);
-        return mode != RuntimeToggleModeForCacheKey::Off;
-    }();
-    return enabled;
-}
-
-bool IsFusedResidualRMSNormEnabledForCacheKey() {
-    static const bool enabled = []() {
-        const RuntimeToggleModeForCacheKey mode = ParseRuntimeToggleModeForCacheKey(
-            "DENSECORE_FUSED_RESIDUAL_RMSNORM_MODE", DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM
-                                                         ? RuntimeToggleModeForCacheKey::On
-                                                         : RuntimeToggleModeForCacheKey::Off);
-        return mode != RuntimeToggleModeForCacheKey::Off;
-    }();
-    return enabled;
-}
-
-bool IsFusedQKVEnabledForCacheKey() {
-    static const bool enabled = []() {
-        const RuntimeToggleModeForCacheKey mode = ParseRuntimeToggleModeForCacheKey(
-            "DENSECORE_FUSED_QKV_MODE",
-            DENSECORE_DEFAULT_FUSED_QKV ? RuntimeToggleModeForCacheKey::On : RuntimeToggleModeForCacheKey::Off);
-        return mode != RuntimeToggleModeForCacheKey::Off;
-    }();
-    return enabled;
-}
-
-[[maybe_unused]] bool IsDecodeGraphCacheDebugValidationEnabled() {
-#ifndef NDEBUG
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_DEBUG_DECODE_GRAPH_CACHE");
-        if (!env || env[0] == '\0') return true;
-        return std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-#else
-    return false;
-#endif
-}
-
-[[maybe_unused]] bool IsDecodeGraphCacheRuntimeScanEnabled() {
-#ifndef NDEBUG
-    static const bool enabled = []() {
-        // Stronger opt-in for per-step graph scans on cached graph reuse.
-        const char* env = std::getenv("DENSECORE_DEBUG_DECODE_GRAPH_CACHE_RUNTIME_SCAN");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-#else
-    return false;
-#endif
-}
-
-bool IsDecodeGraphCacheRegressionEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_CHECK_DECODE_GRAPH_CACHE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-int DecodeGraphCacheRegressionSteps() {
-    static const int steps = ParsePositiveEnvIntOrDefault("DENSECORE_CHECK_DECODE_GRAPH_CACHE_STEPS", 200);
-    return steps;
-}
-
-uint64_t BuildDecodeGraphFeatureFlags(const TransformerModel* model) {
-    uint64_t feature_flags = 0;
-    if (IsForcePagedDecodeEnabled()) feature_flags |= (1ull << 0);
-    if (IsPagedDecodeModeForcedOn()) feature_flags |= (1ull << 1);
-    if (IsBatchedPagedDecodeEnabled()) feature_flags |= (1ull << 2);
-    if (IsPagedDecodeGloballyDisabled()) feature_flags |= (1ull << 3);
-    if (IsFlashAttentionForcedForCacheKey()) feature_flags |= (1ull << 4);
-    if (IsFlashAttentionDisabledForCacheKey()) feature_flags |= (1ull << 5);
-    if (model && model->arch_flags.requires_q_norm) feature_flags |= (1ull << 6);
-    if (model && model->arch_flags.requires_k_norm) feature_flags |= (1ull << 7);
-    if (IsPrecomputedRoPEEnabledForCacheKey()) feature_flags |= (1ull << 8);
-    if (IsFusedResidualRMSNormEnabledForCacheKey()) feature_flags |= (1ull << 9);
-    if (IsFusedQKVEnabledForCacheKey()) feature_flags |= (1ull << 10);
-    return feature_flags;
-}
-
-[[maybe_unused]] bool GraphContainsPagedDecodeCustomOp(const struct ggml_cgraph* graph) {
-    if (!graph) return false;
-    struct CustomOpParamsView {
-        ggml_custom_op_t fun;
-        int n_tasks;
-        void* userdata;
-    };
-    static_assert(sizeof(CustomOpParamsView) <= GGML_MAX_OP_PARAMS, "Custom op params view too large");
-    const int n_nodes = ggml_graph_n_nodes(const_cast<struct ggml_cgraph*>(graph));
-    for (int i = 0; i < n_nodes; ++i) {
-        struct ggml_tensor* node = ggml_graph_node(const_cast<struct ggml_cgraph*>(graph), i);
-        if (!node || node->op != GGML_OP_CUSTOM) continue;
-        CustomOpParamsView params{};
-        std::memcpy(&params, node->op_params, sizeof(params));
-        if (params.fun == cb_paged_attention_decode) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool VerifyCachedDecodeGraphPagedOpOnBuild(const struct ggml_cgraph* graph, int batch_size) {
-    if (batch_size <= 1) return true;
-    if (GraphContainsPagedDecodeCustomOp(graph)) return true;
-#ifndef NDEBUG
-    if (IsDecodeGraphCacheDebugValidationEnabled()) {
-        std::cerr << "[DecodeGraphCache][DEBUG] cached graph missing paged decode custom op on cache creation (bs="
-                  << batch_size << ")" << std::endl;
-        throw densecore::InvalidArgumentException(
-            "Decode graph cache invariant failed: expected paged decode custom op for batched decode layout.");
-    }
-    if (IsDebugGraphLoggingEnabled()) {
-        std::cerr << "[DecodeGraphCache][DEBUG] skip cache insert: missing paged decode custom op (bs=" << batch_size
-                  << ")" << std::endl;
-    }
-#else
-    if (IsDebugGraphLoggingEnabled()) {
-        std::cerr << "[DecodeGraphCache][DEBUG] skip cache insert: missing paged decode custom op (bs=" << batch_size
-                  << ")" << std::endl;
-    }
-#endif
-    return false;
-}
-
-void DebugVerifyCachedDecodeGraphReuseState(const struct ggml_cgraph* graph, int batch_size, bool reused_graph,
-                                            bool verified_paged_decode_op) {
-#ifndef NDEBUG
-    if (batch_size <= 1) return;
-    if (!verified_paged_decode_op) {
-        std::cerr << "[DecodeGraphCache][DEBUG] cached entry missing paged decode verification bit (bs=" << batch_size
-                  << ", reused=" << (reused_graph ? 1 : 0) << ")" << std::endl;
-        throw densecore::InvalidArgumentException(
-            "Decode graph cache invariant failed: cached entry missing paged decode verification state.");
-    }
-    if (!IsDecodeGraphCacheRuntimeScanEnabled()) return;
-    if (GraphContainsPagedDecodeCustomOp(graph)) return;
-    std::cerr << "[DecodeGraphCache][DEBUG] runtime scan mismatch: cached graph missing paged decode custom op (bs="
-              << batch_size << ", reused=" << (reused_graph ? 1 : 0) << ")" << std::endl;
-    throw densecore::InvalidArgumentException(
-        "Decode graph cache invariant failed: runtime scan expected paged decode custom op.");
-#else
-    (void)graph;
-    (void)batch_size;
-    (void)reused_graph;
-    (void)verified_paged_decode_op;
-#endif
-}
-
-int DecodeGraphCacheMaxBatch() {
-    static const int max_batch = ParsePositiveEnvIntOrDefault("DENSECORE_DECODE_GRAPH_CACHE_MAX_BATCH", 4);
-    return max_batch;
-}
-
-int DecodeGraphCacheLruSize() {
-    static const int lru = ParsePositiveEnvIntOrDefault("DENSECORE_DECODE_GRAPH_CACHE_LRU_SIZE", 8);
-    return lru;
-}
-
-size_t DecodeGraphCacheCtxBytes() {
-    static const size_t bytes = []() {
-        const int mb = ParsePositiveEnvIntOrDefault("DENSECORE_DECODE_GRAPH_CACHE_CTX_MB", 96);
-        return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
-    }();
-    return bytes;
-}
-
-size_t LongestPrefixSuffixMatch(const std::string& text, const std::string& pattern) {
-    if (text.empty() || pattern.empty()) return 0;
-    const size_t max_len = std::min(text.size(), pattern.size() - 1);
-    for (size_t len = max_len; len > 0; --len) {
-        if (text.compare(text.size() - len, len, pattern, 0, len) == 0) {
-            return len;
-        }
-    }
-    return 0;
-}
-
-size_t LongestTagCarry(const std::string& text, const std::string& open, const std::string& close) {
-    return std::max(LongestPrefixSuffixMatch(text, open), LongestPrefixSuffixMatch(text, close));
-}
-
-void EnsureRequestHybridSSMRuntimeState(TransformerModel* model, Request* req) {
-    if (!model || !req || !model->arch_flags.is_hybrid_ssm) {
-        return;
-    }
-
-    const int conv_channels = model->ssm_inner_size + 2 * model->ssm_group_count * model->ssm_state_size;
-    const int head_dim = model->ssm_inner_size / model->ssm_time_step_rank;
-    const size_t n_ssm_layers = model->ssm_layer_states.size();
-
-    if (req->ssm_runtime_states.size() != n_ssm_layers) {
-        req->ssm_runtime_states.resize(n_ssm_layers);
-        for (auto& state : req->ssm_runtime_states) {
-            state.Init(conv_channels, model->ssm_conv_kernel, model->ssm_time_step_rank, head_dim,
-                       model->ssm_state_size);
-        }
-        return;
-    }
-
-    for (auto& state : req->ssm_runtime_states) {
-        state.Reset();
-    }
-}
-
-void SuppressTaggedBlock(std::string* token_text, bool* in_block, std::string* pending, const char* open_tag,
-                         const char* close_tag) {
-    if (!token_text || !in_block || !pending || !open_tag || !close_tag) {
-        return;
-    }
-
-    const std::string open(open_tag);
-    const std::string close(close_tag);
-    std::string current;
-    current.reserve(pending->size() + token_text->size());
-    current.append(*pending);
-    current.append(*token_text);
-    pending->clear();
-    if (current.empty()) {
-        token_text->clear();
-        return;
-    }
-
-    std::string out;
-    out.reserve(current.size());
-
-    size_t pos = 0;
-    while (pos < current.size()) {
-        if (*in_block) {
-            const size_t close_pos = current.find(close, pos);
-            if (close_pos == std::string::npos) {
-                const size_t carry = LongestPrefixSuffixMatch(current, close);
-                if (carry > 0) {
-                    pending->assign(current, current.size() - carry, carry);
-                }
-                token_text->clear();
-                return;
-            }
-            pos = close_pos + close.size();
-            *in_block = false;
-            continue;
-        }
-
-        const size_t open_pos = current.find(open, pos);
-        const size_t close_pos = current.find(close, pos);
-
-        if (close_pos != std::string::npos && (open_pos == std::string::npos || close_pos < open_pos)) {
-            // Drop unmatched close tags that may leak from partial streams.
-            out.append(current, pos, close_pos - pos);
-            pos = close_pos + close.size();
-            continue;
-        }
-
-        if (open_pos == std::string::npos) {
-            out.append(current, pos, std::string::npos);
-            break;
-        }
-
-        out.append(current, pos, open_pos - pos);
-        const size_t block_close_pos = current.find(close, open_pos + open.size());
-        if (block_close_pos == std::string::npos) {
-            *in_block = true;
-            break;
-        }
-        pos = block_close_pos + close.size();
-    }
-
-    *token_text = std::move(out);
-    if (!*in_block) {
-        const size_t carry = LongestTagCarry(*token_text, open, close);
-        if (carry > 0) {
-            pending->assign(*token_text, token_text->size() - carry, carry);
-            token_text->erase(token_text->size() - carry);
-        }
-    }
-}
-
-bool IsStopTokenId(const TransformerModel* model, int token_id) {
-    if (!model) return false;
-    if (token_id == model->eos_token_id) {
-        return true;
-    }
-    for (int32_t stop_id : model->stop_token_ids) {
-        if (token_id == stop_id) {
-            return true;
-        }
-    }
-    return false;
-}
-
-size_t Utf8ValidPrefixLength(const std::string& s) {
-    const size_t n = s.size();
-    size_t i = 0;
-    size_t valid = 0;
-
-    while (i < n) {
-        const uint8_t c0 = static_cast<uint8_t>(s[i]);
-        if (c0 <= 0x7F) {
-            ++i;
-            valid = i;
-            continue;
-        }
-
-        size_t need = 0;
-        if ((c0 & 0xE0) == 0xC0) {
-            if (c0 < 0xC2) {
-                ++i;
-                valid = i;
-                continue;
-            }
-            need = 2;
-        } else if ((c0 & 0xF0) == 0xE0) {
-            need = 3;
-        } else if ((c0 & 0xF8) == 0xF0) {
-            if (c0 > 0xF4) {
-                ++i;
-                valid = i;
-                continue;
-            }
-            need = 4;
-        } else {
-            ++i;
-            valid = i;
-            continue;
-        }
-
-        if (i + need > n) {
-            break;  // Incomplete trailing codepoint.
-        }
-
-        bool ok = true;
-        for (size_t j = 1; j < need; ++j) {
-            const uint8_t cx = static_cast<uint8_t>(s[i + j]);
-            if ((cx & 0xC0) != 0x80) {
-                ok = false;
-                break;
-            }
-        }
-        if (!ok) {
-            ++i;
-            valid = i;
-            continue;
-        }
-
-        if (need == 3) {
-            const uint8_t c1 = static_cast<uint8_t>(s[i + 1]);
-            if ((c0 == 0xE0 && c1 < 0xA0) || (c0 == 0xED && c1 >= 0xA0)) {
-                ++i;
-                valid = i;
-                continue;
-            }
-        } else if (need == 4) {
-            const uint8_t c1 = static_cast<uint8_t>(s[i + 1]);
-            if ((c0 == 0xF0 && c1 < 0x90) || (c0 == 0xF4 && c1 >= 0x90)) {
-                ++i;
-                valid = i;
-                continue;
-            }
-        }
-
-        i += need;
-        valid = i;
-    }
-
-    return valid;
-}
-}  // namespace
 
 // Worker Loop (Continuous Batching) - Uses Scheduler for batch formation
 void EngineLoop(EngineState* state) {
@@ -1731,6 +1013,9 @@ void EngineLoop(EngineState* state) {
 
             InferenceConfig& infer_cfg = InferenceConfig::Instance();
             int active_threads = base_threads;
+            const int decode_batch_size = static_cast<int>(batch_requests.size());
+            const bool is_decode_batch = !is_prefill_batch && !is_embedding_batch;
+            const char* decode_thread_policy = is_prefill_batch ? "prefill" : "base";
 
             // DENSECORE_BENCH_RESPECT_THREADS=1 forces full thread count for all phases
             static const bool bench_respect_threads = []() {
@@ -1740,34 +1025,29 @@ void EngineLoop(EngineState* state) {
 
             if (bench_respect_threads) {
                 active_threads = base_threads;
+                decode_thread_policy = "bench_respect";
             } else if (!is_embedding_batch && infer_cfg.enable_split_thread_policy) {
                 const int configured_threads = is_prefill_batch ? infer_cfg.prefill_threads : infer_cfg.decode_threads;
                 if (configured_threads > 0) {
                     active_threads = configured_threads;
+                    decode_thread_policy = is_prefill_batch ? "prefill_override" : "decode_override";
                 } else {
-                    // Decode often saturates memory bandwidth before all cores are
-                    // useful. Use fewer threads by default, while keeping prefill
-                    // at full parallelism.
                     if (is_prefill_batch) {
                         active_threads = base_threads;
-                    } else if (physical_core_count >= 16) {
-                        active_threads = std::max(4, physical_core_count / 2);
-                    } else if (physical_core_count >= 8) {
-                        active_threads = std::max(2, physical_core_count - 2);
+                        decode_thread_policy = "prefill_base";
                     } else {
-                        active_threads = std::max(1, physical_core_count);
-                    }
-
-                    // Batch-size-aware scaling: for batch>=4, there's enough
-                    // independent work (multiple attention passes) to use more cores.
-                    if (!is_prefill_batch) {
-                        const int num_seqs = static_cast<int>(batch_requests.size());
-                        if (num_seqs >= 4) {
-                            const int decode_base = active_threads;
-                            const float scale = std::min(1.0f, static_cast<float>(num_seqs) / 8.0f);
+                        const int batch_override = DecodeThreadsBatchOverride(decode_batch_size);
+                        if (batch_override > 0) {
+                            active_threads = batch_override;
+                            decode_thread_policy = "decode_batch_env";
+                        } else if (UseLegacyDecodeThreadPolicy()) {
                             active_threads =
-                                decode_base +
-                                static_cast<int>(scale * static_cast<float>(physical_core_count - decode_base));
+                                ResolveLegacyDecodeThreads(decode_batch_size, physical_core_count, base_threads);
+                            decode_thread_policy = "decode_legacy_auto";
+                        } else {
+                            active_threads =
+                                ResolveAutoDecodeThreadsForBatch(decode_batch_size, physical_core_count, base_threads);
+                            decode_thread_policy = "decode_batch_auto";
                         }
                     }
                 }
@@ -1780,12 +1060,14 @@ void EngineLoop(EngineState* state) {
                                                       IsBenchmarkDecodeBatchFastPathEnabled() && !is_prefill_batch &&
                                                       !is_embedding_batch;
             if (bench_decode_batch_fast_path && physical_core_count > 0) {
-                const int num_seqs = static_cast<int>(batch_requests.size());
                 const int max_fast_batch = std::max(1, BenchmarkFastPathMaxBatch());
-                if (num_seqs >= 4 && num_seqs <= max_fast_batch) {
+                if (decode_batch_size >= 4 && decode_batch_size <= max_fast_batch) {
                     const int decode_boost_target = std::max(base_threads, std::max(1, (base_threads * 3) / 2));
                     active_threads = std::max(active_threads, decode_boost_target);
                     bench_decode_batch_thread_boost = active_threads > base_threads;
+                    if (bench_decode_batch_thread_boost) {
+                        decode_thread_policy = "bench_fast_path_boost";
+                    }
                 }
             }
 
@@ -1797,6 +1079,19 @@ void EngineLoop(EngineState* state) {
             }
             active_threads = std::max(1, std::min(active_threads, std::max(1, physical_core_count)));
             infer_cfg.num_threads = active_threads;
+            if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
+                GetDecodeWorkerStats().last_threads_by_batch[decode_batch_size].store(active_threads,
+                                                                                      std::memory_order_relaxed);
+            }
+            if (is_decode_batch && IsDebugDecodeThreadsEnabled()) {
+                static std::atomic<uint64_t> logged_decode_thread_events{0};
+                const uint64_t event_idx = logged_decode_thread_events.fetch_add(1, std::memory_order_relaxed);
+                if (event_idx < 64) {
+                    std::cerr << "[DecodeThreads] batch=" << decode_batch_size << " selected=" << active_threads
+                              << " base=" << base_threads << " physical=" << physical_core_count
+                              << " policy=" << decode_thread_policy << std::endl;
+                }
+            }
 
             // =========================================================================
             // 8a. Build Multi-LoRA Adapter Token Map (per-request adapters)
@@ -1935,14 +1230,20 @@ void EngineLoop(EngineState* state) {
                     }
                 }
             }
+            bool stable_paged_decode_topology = false;
+            if (decode_single_token_layout) {
+                if (UseLegacyDecodeGraphCachePolicy()) {
+                    const bool batched_decode_forced_paged = batch.num_seqs > 1;
+                    const bool single_decode_forced_paged =
+                        batch.num_seqs == 1 && IsPagedDecodeModeForcedOn() && IsBatchedPagedDecodeEnabled();
+                    stable_paged_decode_topology = batched_decode_forced_paged || single_decode_forced_paged;
+                } else {
+                    stable_paged_decode_topology =
+                        IsStablePagedDecodeTopologyForCache(current_model, current_kv_cache, batch);
+                }
+            }
             // Graph reuse is safe when decode path is deterministically paged.
-            // For decode-only batched layout (N>1, one token/seq), inference.cpp
-            // forcibly selects paged decode for correctness, so topology is stable
-            // regardless of paged-decode env toggles.
-            const bool batched_decode_forced_paged = decode_single_token_layout && batch.num_seqs > 1;
-            const bool single_decode_forced_paged =
-                decode_single_token_layout && IsPagedDecodeModeForcedOn() && IsBatchedPagedDecodeEnabled();
-            const bool decode_topology_stable = batched_decode_forced_paged || single_decode_forced_paged;
+            const bool decode_topology_stable = stable_paged_decode_topology;
             // CPU-only cache admission: cached decode graphs may include paged
             // decode custom ops that are not portable across backend/device types.
             const bool decode_reuse_shape_eligible =
@@ -1950,6 +1251,18 @@ void EngineLoop(EngineState* state) {
             const bool decode_reuse_candidate = decode_reuse_shape_eligible && cpu_backend_active;
             const size_t decode_graph_uncacheable_limit =
                 static_cast<size_t>(std::max(1, decode_graph_cache_lru_size * 2));
+            if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
+                DecodeWorkerStats& decode_stats = GetDecodeWorkerStats();
+                if (!decode_graph_cache_active) {
+                    decode_stats.graph_cache_skip_disabled.fetch_add(1, std::memory_order_relaxed);
+                } else if (!decode_topology_stable) {
+                    decode_stats.graph_cache_skip_unstable.fetch_add(1, std::memory_order_relaxed);
+                } else if (!batch.lora_map.empty()) {
+                    decode_stats.graph_cache_skip_lora.fetch_add(1, std::memory_order_relaxed);
+                } else if (!cpu_backend_active) {
+                    decode_stats.graph_cache_skip_backend.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             if (decode_reuse_shape_eligible && !cpu_backend_active && IsDebugGraphLoggingEnabled()) {
                 std::cerr << "[DecodeGraphCache][DEBUG] skip cache reuse due to backend/device mismatch"
                           << " (device=" << DeviceTypeName(deps.preferred_device)
@@ -1972,7 +1285,11 @@ void EngineLoop(EngineState* state) {
             const bool decode_reuse_attempt_allowed = decode_reuse_candidate && !decode_key_marked_uncacheable;
 
             std::chrono::steady_clock::time_point graph_build_begin, graph_build_end;
+            bool built_decode_graph_cache_entry = false;
             if (decode_reuse_attempt_allowed) {
+                if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
+                    GetDecodeWorkerStats().graph_cache_attempts.fetch_add(1, std::memory_order_relaxed);
+                }
                 auto it = decode_graph_cache.find(decode_graph_key);
                 if (it != decode_graph_cache.end() && it->second.graph && it->second.output && it->second.embd_inp &&
                     it->second.pos) {
@@ -1984,12 +1301,13 @@ void EngineLoop(EngineState* state) {
                     cached_graph_verified_paged_decode_op = it->second.verified_paged_decode_op;
                     reused_decode_graph = true;
                     using_cached_decode_graph = true;
+                    if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
+                        GetDecodeWorkerStats().graph_cache_hits.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
 
             if (!reused_decode_graph) {
-                bool built_cached_entry = false;
-
                 if (decode_reuse_attempt_allowed) {
                     while (decode_graph_cache.size() >= static_cast<size_t>(decode_graph_cache_lru_size) &&
                            !decode_graph_lru.empty()) {
@@ -2055,18 +1373,22 @@ void EngineLoop(EngineState* state) {
                                     embd_inp = entry.embd_inp;
                                     pos = entry.pos;
                                     cached_graph_verified_paged_decode_op = entry.verified_paged_decode_op;
-                                    built_cached_entry = true;
+                                    built_decode_graph_cache_entry = true;
                                     using_cached_decode_graph = true;
+                                    if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
+                                        GetDecodeWorkerStats().graph_cache_builds.fetch_add(1,
+                                                                                           std::memory_order_relaxed);
+                                    }
                                 }
                             }
                         }
                     }
-                    if (!built_cached_entry) {
+                    if (!built_decode_graph_cache_entry) {
                         free_decode_graph_entry(&candidate);
                     }
                 }
 
-                if (!built_cached_entry) {
+                if (!built_decode_graph_cache_entry) {
                     if (!state->inference_ctx.IsInitialized()) {
                         size_t ctx_size = state->CalculateGraphContextSize(current_model);
                         state->inference_ctx.Init(ctx_size);
@@ -2446,6 +1768,10 @@ void EngineLoop(EngineState* state) {
             ggml_backend_graph_compute(active_backend, gf);
             const auto compute_end = std::chrono::steady_clock::now();
             LOG_TRACE("Graph compute done for batch size {}", batch.num_seqs);
+            if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
+                GetDecodeWorkerStats().decode_batches.fetch_add(1, std::memory_order_relaxed);
+                MaybeLogDecodeRuntimeStats();
+            }
 
             if (run_batched_decode_correctness_check && decode_check_ready && output && output->data) {
                 std::vector<uint8_t> decode_check_post_k;

@@ -460,16 +460,21 @@ endif()
 set(SOURCES
     src/engine.cpp
     src/worker.cpp
+    src/worker_helpers.cpp
     src/inference.cpp
     src/model_types.cpp
     src/model_loader.cpp
     src/tokenizer.cpp
     src/kv_cache.cpp
+    src/kv_cache_block_manager.cpp
+    src/kv_cache_storage.cpp
     src/optimization_bridge.cpp
     src/save_model.cpp
     src/version.cpp
     src/error_api.cpp
     src/scheduler.cpp
+    src/scheduler_policy.cpp
+    src/scheduler_queue.cpp
     src/action_chunker.cpp
     src/arm_runtime.cpp
     src/operation_graph.cpp
@@ -480,6 +485,8 @@ set(SOURCES
     src/graph_executor.cpp
     src/lora_storage.cpp
     src/cpu_backend.cpp
+    src/backend/cpu_backend_moe_ops.cpp
+    src/backend/cpu_backend_moe_registry.cpp
     src/backend_registry.cpp
     src/kernel_context.cpp
     src/async_cpu_backend.cpp

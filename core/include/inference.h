@@ -1,6 +1,9 @@
 #ifndef DENSECORE_INFERENCE_H
 #define DENSECORE_INFERENCE_H
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <set>
 #include <vector>
 
@@ -105,6 +108,29 @@ struct InferenceDependencies {
     densecore::DeviceType preferred_norm_device = densecore::DeviceType::CPU;
     bool mixed_operation_routing = false;
 };
+
+static constexpr std::size_t kDecodePagedFallbackReasonCount = 16;
+
+struct DecodeRuntimeStatsSnapshot {
+    uint64_t path_total = 0;
+    uint64_t path_paged = 0;
+    uint64_t path_hal = 0;
+    uint64_t path_portable_cpu_flash = 0;
+    uint64_t path_native_flash = 0;
+    uint64_t path_standard = 0;
+    std::array<uint64_t, kDecodePagedFallbackReasonCount> paged_fallback_reasons{};
+    uint64_t shared_quant_total = 0;
+    uint64_t shared_quant_reused = 0;
+    uint64_t shared_quant_tls = 0;
+};
+
+// Internal decode helpers shared between graph-build and worker graph-cache admission.
+bool IsDecodeOnlyBatchLayout(const BatchSpec& batch, int n_tokens_in_batch);
+bool IsPagedDecodeCandidate(const PagedKVCache* cache, const BatchSpec& batch, int n_tokens_in_batch, int n_head,
+                            int n_head_kv, int head_dim_q, int head_dim_kv);
+bool IsPagedDecodeModeAlwaysOn();
+DecodeRuntimeStatsSnapshot GetDecodeRuntimeStatsSnapshot();
+const char* GetDecodePagedFallbackReasonName(std::size_t index);
 
 // ============================================================================
 // Persistent Compute Context for "Rebuild Graph, Reuse Memory" Strategy
