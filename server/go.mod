@@ -5,7 +5,7 @@ go 1.24.0
 toolchain go1.24.1
 
 require (
-	github.com/DenseAI/DenseCloud v0.0.0-20260315134408-fab4a3666e1e
+	github.com/DenseAI/DenseCloud v1.0.0
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.4
 	github.com/charmbracelet/lipgloss v1.1.0

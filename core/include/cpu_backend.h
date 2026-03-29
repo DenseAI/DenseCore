@@ -339,6 +339,9 @@ public:
         ExpertWeight w3;       ///< Up projection [hidden, intermediate] (SwiGLU)
         int hidden_dim;        ///< Model hidden dimension
         int intermediate_dim;  ///< FFN intermediate dimension
+        int w1_type = 0;       ///< ggml_type of w1 (0 = GGML_TYPE_F32)
+        int w2_type = 0;       ///< ggml_type of w2
+        int w3_type = 0;       ///< ggml_type of w3
     };
 
     /**

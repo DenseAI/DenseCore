@@ -94,7 +94,8 @@ Scheduler::Scheduler(BlockManager* block_manager, const SchedulerConfig& config)
 }
 
 int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, int priority,
-                          const std::vector<int>* prefix_tokens, bool allow_chunked_prefill) {
+                          const std::vector<int>* prefix_tokens, bool allow_chunked_prefill,
+                          bool require_hybrid_ssm_prefix_snapshot) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // Fast reject impossible requests:
@@ -114,13 +115,16 @@ int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, in
     group.arrival_time = std::chrono::steady_clock::now();
     group.num_tokens_to_process = prompt_len;
 
-    // Check for prefix cache hit with multi-stage collision verification
+    // Check for reusable full-block prefix hits.
+    // Prefix reuse always leaves at least one token to execute so prompt-end
+    // logits are still computed by the normal prefill path.
     if (prefix_tokens && !prefix_tokens->empty()) {
-        uint64_t hash = BlockManager::ComputeTokenHash(prefix_tokens->data(), prompt_len);
-        int cached_block = block_manager_->FindCachedBlockWithVerification(hash, prefix_tokens->data(), prompt_len);
-        if (cached_block >= 0) {
-            group.shared_prefix_len = prompt_len;
-            group.shared_block_ids.push_back(cached_block);
+        auto match = block_manager_->FindLongestCachedPrefixWithVerification(
+            prefix_tokens->data(), prompt_len, require_hybrid_ssm_prefix_snapshot);
+        if (match.cached_tokens > 0 && !match.cached_block_ids.empty()) {
+            group.shared_prefix_len = match.cached_tokens;
+            group.shared_block_ids = std::move(match.cached_block_ids);
+            group.num_tokens_to_process = std::max(0, prompt_len - group.shared_prefix_len);
         }
     }
 

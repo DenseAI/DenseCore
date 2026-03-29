@@ -86,10 +86,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy Go module files for caching
+# Copy Go module files and vendor directory for offline builds
 COPY server/go.mod server/go.sum* ./server/
-WORKDIR /app/server
-RUN go mod download
+COPY server/vendor/ server/vendor/
 
 # Now copy the REAL source files (invalidates from here down on code changes)
 WORKDIR /app
@@ -111,7 +110,7 @@ RUN cd build && \
 WORKDIR /app/server
 ENV CGO_LDFLAGS="-L/app/build -ldensecore -lstdc++ -ldl"
 ENV CGO_CFLAGS="-I/app/core/include"
-RUN CGO_ENABLED=1 GOOS=linux go build -o /densecore-server ./cmd/densecore
+RUN CGO_ENABLED=1 GOOS=linux go build -mod=vendor -o /densecore-server ./cmd/densecore
 
 # ============================================
 # Stage 3: Runtime (Debian glibc for C++ performance)

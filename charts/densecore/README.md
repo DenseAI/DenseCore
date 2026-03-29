@@ -25,7 +25,7 @@ Most runtime settings live under `dense-base.*`.
 
 The checked-in values currently default to:
 
-- server image: `densecore/densecore`
+- server image: `denseai/densecore`
 - downloader image: `densecore/downloader:0.3.0`
 - HTTP port: `8080`
 - gRPC enabled: `true`
@@ -37,7 +37,7 @@ The checked-in values currently default to:
 ```yaml
 dense-base:
   image:
-    repository: densecore/densecore
+    repository: denseai/densecore
     tag: "latest"
 
   model:
@@ -81,6 +81,7 @@ dense-base:
 ```
 
 Do not enable both HPA and KEDA at the same time.
+Validate KEDA behavior against your Prometheus/KEDA environment before treating it as the default production path.
 
 ## Notes
 

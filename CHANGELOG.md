@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.0] - 2026-03-28
+
+### Highlights
+
+First stable release. DenseCore is a memory-centric inference runtime for large language models
+on heterogeneous CPU architectures. NUMA locality and memory bandwidth determine throughput —
+not raw core count. This release validates that claim end-to-end on Google Cloud ARM, Intel,
+and AMD instances with state-of-the-art 27B–397B parameter models.
+
+### Added
+
+#### Architecture Support
+- **Qwen3 / Qwen3.5 series**: Full support including sparse MoE variants (Qwen3.5-397B-A17B,
+  Qwen3.5-35B-A3B, Qwen3-Coder-30B-A3B)
+- **Gemma 3**: Gemma 3 27B IT and all Gemma/Gemma2 family models
+- **Phi-4**: Phi-4-mini-instruct and Phi/Phi3 family
+- **Extended Mistral**: Mistral v3/v4 and Mixtral MoE variants
+
+#### NUMA & Memory
+- **NUMA-aware scheduling**: Workers pinned to NUMA nodes; KV cache allocated node-local
+- **ExpertProfiler**: Per-expert NUMA node tracking and dynamic rebalancing for sparse MoE
+- **Sticky routing**: Request-level NUMA affinity maintained across decode steps
+- **Memory bandwidth saturation analysis**: Tooling to identify throughput ceiling per topology
+
+#### Inference Engine
+- **Sparse MoE fast path**: Batch-optimized expert routing for activated-parameter models
+- **Paged KV cache v2**: Block-granular eviction with configurable block sizes
+- **Decode graph cache**: Reusable compute graphs for repeated decode shapes
+- **Q4_K batched kernel**: Vectorized GEMV for Q4_K_M quantized weights
+- **Token-level ITL recording**: `DENSECORE_BENCH_RECORD_TOKEN_TIMES=1` for p50/p90/p99 ITL
+
+#### Multi-Platform
+- **Google Axion (C4A)**: ARM64 SVE2 kernels, validated on 72-core instances
+- **AMD Genoa (C4D)**: AVX-512 + VNNI, NUMA topology study
+- **Intel (C4)**: AMX tile acceleration, hardware portability baseline
+- **Ampere Altra (T2A)**: ARM64 generic baseline
+- **Apple Silicon**: Metal GPU + ANE hybrid scheduling (M1/M2/M3/M4)
+
+#### Python SDK
+- **`from_pretrained()`**: Direct HuggingFace Hub model loading with auto-quantization
+- **`smart_load()`**: Device-aware quantization recommendation based on available RAM
+- **LoRA support**: `LoRAConfig` / `LoRAManager` for adapter hot-swap
+- **Async generation**: Full `async/await` support with GIL-released C++ callbacks
+- **LangChain / LangGraph**: `DenseCoreLLM`, `DenseCoreEmbeddings` integrations
+- **HF-compatible outputs**: `GenerateOutput`, `GenerateBeamOutput` matching transformers API
+
+#### Server (Go)
+- **OpenAI-compatible API**: `/v1/chat/completions`, `/v1/models`, `/v1/embeddings`
+- **gRPC server**: Streaming `ChatCompletion` and `StreamChatCompletion` services
+- **Prometheus metrics**: Token throughput, latency percentiles, queue depth
+- **API key auth**: Tier-based rate limiting with Redis backend
+- **Kubernetes-ready**: Liveness / readiness / startup probes, graceful drain
+
+#### DevOps
+- **PyPI wheels**: Pre-built wheels for Linux x86_64/aarch64, macOS x86_64/arm64,
+  Python 3.10/3.11/3.12 — `pip install densecore`
+- **Docker Hub**: `denseai/densecore:1.0.0` multi-arch image (amd64 + arm64)
+- **Helm chart**: `charts/densecore/` for Kubernetes deployment
+- **GCP benchmark suite**: `gcp_autorun.sh` one-shot orchestrator for ARM/Intel/AMD CPU benchmarks
+
+### Performance (GCP C4A — Google Axion 72-core ARM64, Q4_K_M)
+
+| Model | Active Params | TTFT (ms) | ITL p99 (ms) | tok/s | Peak RSS |
+|-------|---------------|-----------|--------------|-------|----------|
+| Qwen3.5-35B-A3B | 3B | — | — | — | ~20 GB |
+| Qwen3.5-27B | 27B | — | — | — | ~16 GB |
+| Qwen3-Coder-30B-A3B | 3.3B | — | — | — | ~18 GB |
+| Gemma 3 27B IT | 27B | — | — | — | ~16 GB |
+
+*Full GCP benchmark results: [benchmarks/results/](benchmarks/results/)*
+
+### Fixed
+
+- **GEMV correctness**: Resolved dimension mismatch in multi-head projection for Qwen3 variants
+- **KV cache block leak**: Fixed unreleased blocks on early-termination sequences
+- **NUMA allocator**: Type-safe deallocation prevents cross-node memory corruption
+- **Rope scaling**: Correct long-context rope scaling for models with >32K native context
+- **Tokenizer parity**: Switched to HF tokenizer for byte-fallback and special token handling
+
+### Changed
+
+- Benchmark CSV schema: added `peak_rss_kb` and `tps_per_dollar` columns
+- `DENSECORE_BENCH_RECORD_TOKEN_TIMES` default changed to `1` (ITL always collected)
+- Docker Hub registry changed from `ghcr.io/densecore` → `denseai/densecore`
+
+---
+
 ## [0.3.0] - 2025-12-21
 
 ### Added
@@ -131,6 +218,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Version History
 
+- **1.0.0** - Stable release (2026-03-28)
+- **0.3.0** - Production release (2025-12-21)
 - **0.2.0** - Production release (2025-12-16)
 - **0.1.0** - Production release (2025-12-15)
 ---
@@ -160,7 +249,7 @@ output = model.generate("Hello", max_tokens=100)
 - [GitHub Repository](https://github.com/DenseCore/DenseCore)
 - [Documentation](https://github.com/DenseCore/DenseCore/tree/main/docs)
 - [PyPI Package](https://pypi.org/project/densecore/)
-- [Docker Images](https://ghcr.io/densecore/densecore)
+- [Docker Images](https://hub.docker.com/r/denseai/densecore)
 
 ---
 

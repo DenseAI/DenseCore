@@ -105,13 +105,8 @@ void OpsRegistry::Init() {
         // -----------------------------------------------------------------
         // Batched INT4 GEMM Dispatch
         // -----------------------------------------------------------------
-#if defined(DENSECORE_ARM_CORRECTNESS_FIRST) && (defined(__aarch64__) || defined(_M_ARM64))
-        reg.GemmInt4Batched = nullptr;
-        std::cout << "  [GemmInt4Batched] -> Disabled (ARM correctness-first)" << std::endl;
-#else
         reg.GemmInt4Batched = hwy_kernels::GemmInt4Batched_Hwy;
         std::cout << "  [GemmInt4Batched] -> Highway (auto-dispatch)" << std::endl;
-#endif
 
         // -----------------------------------------------------------------
         // GemmInt4 Dispatch
@@ -119,10 +114,6 @@ void OpsRegistry::Init() {
         // Dispatch chain:
         //   x86:  AVX512 -> AVX2 -> Scalar
         //   ARM:  SVE/SVE2 -> NEON -> Scalar
-#if defined(DENSECORE_ARM_CORRECTNESS_FIRST) && (defined(__aarch64__) || defined(_M_ARM64))
-        reg.GemmInt4 = GemmInt4Fp32_Scalar;
-        std::cout << "  [GemmInt4] -> Scalar (ARM correctness-first)" << std::endl;
-#else
 #if defined(__AVX512F__)
         if (level >= simd::SimdLevel::AVX512) {
             reg.GemmInt4 = simd::GemmInt4Fp32_AVX512;
@@ -161,7 +152,6 @@ void OpsRegistry::Init() {
 #else
         reg.GemmInt4 = GemmInt4Fp32_Scalar;
         std::cout << "  [GemmInt4] -> Scalar (build without AVX2/AVX-512/ARM)" << std::endl;
-#endif
 #endif
 
         // -----------------------------------------------------------------

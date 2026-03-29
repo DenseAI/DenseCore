@@ -1,15 +1,15 @@
 # Cloud-Native Deployment Guide
 
-DenseCore is designed for cloud-native deployments with full Kubernetes, Helm, and Docker Compose support.
+DenseCore exposes a cloud-native server surface for Docker, Compose, and Kubernetes deployments. Probe/metrics behavior and packaging are first-class, while some integrations remain optional deployment contracts that should be validated in your target environment.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| **Helm Chart** | Production-ready chart with ServiceAccount, PDB, HPA, KEDA |
-| **Redis Integration** | Distributed rate limiting and API key storage |
-| **Prometheus Metrics** | ServiceMonitor for Prometheus Operator |
-| **Network Policy** | Pod network isolation |
+| **Helm Chart** | Chart with ServiceAccount, probes, PDB, HPA, and optional KEDA integration |
+| **Redis Integration** | Optional distributed rate limiting and API key storage |
+| **Prometheus Metrics** | `/metrics` surface and ServiceMonitor integration |
+| **Network Policy** | Pod network isolation patterns |
 | **Graceful Shutdown** | preStop hooks and terminationGracePeriodSeconds |
 
 ## Quick Start
@@ -140,7 +140,7 @@ Available metrics:
 
 ## KEDA Autoscaling
 
-KEDA enables scaling based on pending requests instead of CPU (leading vs. lagging indicator).
+KEDA enables scaling based on pending requests instead of CPU. Treat it as an optional chart contract and validate it against your Prometheus/KEDA stack before presenting it as a production baseline.
 
 Install KEDA:
 ```bash

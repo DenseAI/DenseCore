@@ -164,7 +164,8 @@ public:
      * Add a new request to the scheduler
      */
     int AddRequest(int request_id, int prompt_len, int max_output_len, int priority = 100,
-                   const std::vector<int>* prefix_tokens = nullptr, bool allow_chunked_prefill = true);
+                   const std::vector<int>* prefix_tokens = nullptr, bool allow_chunked_prefill = true,
+                   bool require_hybrid_ssm_prefix_snapshot = false);
 
     /**
      * Remove a request (cancel or complete)

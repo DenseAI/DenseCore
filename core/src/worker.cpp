@@ -573,12 +573,26 @@ size_t LongestTagCarry(const std::string& text, const std::string& open, const s
     return std::max(LongestPrefixSuffixMatch(text, open), LongestPrefixSuffixMatch(text, close));
 }
 
-void ResetHybridSSMRuntimeState(TransformerModel* model) {
-    if (!model || !model->arch_flags.is_hybrid_ssm) {
+void EnsureRequestHybridSSMRuntimeState(TransformerModel* model, Request* req) {
+    if (!model || !req || !model->arch_flags.is_hybrid_ssm) {
         return;
     }
-    for (auto& layer_state : model->ssm_layer_states) {
-        layer_state.Reset();
+
+    const int conv_channels = model->ssm_inner_size + 2 * model->ssm_group_count * model->ssm_state_size;
+    const int head_dim = model->ssm_inner_size / model->ssm_time_step_rank;
+    const size_t n_ssm_layers = model->ssm_layer_states.size();
+
+    if (req->ssm_runtime_states.size() != n_ssm_layers) {
+        req->ssm_runtime_states.resize(n_ssm_layers);
+        for (auto& state : req->ssm_runtime_states) {
+            state.Init(conv_channels, model->ssm_conv_kernel, model->ssm_time_step_rank, head_dim,
+                       model->ssm_state_size);
+        }
+        return;
+    }
+
+    for (auto& state : req->ssm_runtime_states) {
+        state.Reset();
     }
 }
 
@@ -1041,13 +1055,6 @@ void EngineLoop(EngineState* state) {
                 // semantics.
 
                 while (state->status == EngineStatus::RUNNING) {
-                    if (current_model && current_model->arch_flags.is_hybrid_ssm) {
-                        std::lock_guard<std::mutex> active_lock(state->active_mu);
-                        if (!state->active_requests.empty()) {
-                            break;
-                        }
-                    }
-
                     Request* req = state->pending_requests.Pop();
                     if (!req) break;  // Queue empty
 
@@ -1200,14 +1207,17 @@ void EngineLoop(EngineState* state) {
                     }
                     state->metrics.total_prompt_tokens += req->tokens.size();
 
-                    // Qwen3.5-style hybrid SSM models currently keep recurrent state in the
-                    // loaded model object, so a new request must start from a clean state.
-                    ResetHybridSSMRuntimeState(current_model);
+                    // Hybrid SSM models must keep recurrent state per request, not
+                    // globally on the shared model, otherwise batched execution
+                    // cross-contaminates sequences and forces single-request mode.
+                    EnsureRequestHybridSSMRuntimeState(current_model, req);
 
                     // Register with scheduler (blocks allocated by scheduler)
-                    int seq_id = state->scheduler->AddRequest(req->id, req->tokens.size(), req->max_tokens,
-                                                              req->priority, &req->tokens,
-                                                              /*allow_chunked_prefill=*/!req->is_embedding);
+                    int seq_id = state->scheduler->AddRequest(
+                        req->id, req->tokens.size(), req->max_tokens, req->priority, &req->tokens,
+                        /*allow_chunked_prefill=*/!req->is_embedding,
+                        /*require_hybrid_ssm_prefix_snapshot=*/current_model &&
+                            current_model->arch_flags.is_hybrid_ssm);
 
                     if (seq_id < 0) {
                         // Scheduler rejected (e.g., queue full or impossible non-chunked prefill)
@@ -1353,7 +1363,7 @@ void EngineLoop(EngineState* state) {
                 }
             }
 
-            const bool prefix_cache_allowed = !(current_model && current_model->arch_flags.is_hybrid_ssm);
+            const bool prefix_cache_allowed = true;
 
             // 4a. Handle scheduler output: prefix cache hits
             if (!used_single_request_fast_path && prefix_cache_allowed) {
@@ -1369,6 +1379,19 @@ void EngineLoop(EngineState* state) {
                         req->n_past += hit.cached_tokens;
                         if (hit.cached_tokens > 0 && hit.cached_tokens <= (int)req->tokens.size()) {
                             req->tokens.erase(req->tokens.begin(), req->tokens.begin() + hit.cached_tokens);
+                        }
+                        req->registered_prefix_blocks =
+                            std::max(req->registered_prefix_blocks, hit.cached_tokens / BLOCK_SIZE);
+
+                        if (current_model && current_model->arch_flags.is_hybrid_ssm && !hit.cached_block_ids.empty() &&
+                            !req->ssm_runtime_states.empty()) {
+                            std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot;
+                            const int snapshot_block = hit.cached_block_ids.back();
+                            if (current_kv_cache->block_manager->LoadHybridSSMSnapshotForBlock(snapshot_block,
+                                                                                               &snapshot) &&
+                                snapshot.size() == req->ssm_runtime_states.size()) {
+                                req->ssm_runtime_states = std::move(snapshot);
+                            }
                         }
                         LOG_INFO("Prefix cache hit for req {}: skipped {} tokens.", req->id, hit.cached_tokens);
                     }
@@ -1635,6 +1658,8 @@ void EngineLoop(EngineState* state) {
                 batch.block_tables.push_back(req->block_table);
                 batch.n_past.push_back(req->n_past);
                 batch.scheduler_seq_ids.push_back(req->seq_id);
+                batch.hybrid_ssm_runtime_states.push_back(req->ssm_runtime_states.empty() ? nullptr
+                                                                                          : &req->ssm_runtime_states);
                 batch_requests.push_back(req);
                 batch_token_counts.push_back(tokens_to_take);
 
@@ -1676,6 +1701,8 @@ void EngineLoop(EngineState* state) {
                 batch.block_tables.push_back(req->block_table);
                 batch.n_past.push_back(req->n_past);
                 batch.scheduler_seq_ids.push_back(req->seq_id);
+                batch.hybrid_ssm_runtime_states.push_back(req->ssm_runtime_states.empty() ? nullptr
+                                                                                          : &req->ssm_runtime_states);
                 batch_requests.push_back(req);
                 batch_token_counts.push_back(1);
 
@@ -2754,6 +2781,35 @@ void EngineLoop(EngineState* state) {
                             state->scheduler->UpdateProgress(req->seq_id, processed_count);
                         }
 
+                        // Register any newly completed full blocks immediately after
+                        // this prefill chunk so prefix reuse can restore the exact
+                        // hybrid SSM boundary state for the latest completed block.
+                        if (prefix_cache_allowed && !req->prompt_tokens_for_cache.empty() && !req->block_table.empty() &&
+                            req->n_past > 0) {
+                            const int* tokens_ptr = req->prompt_tokens_for_cache.data();
+                            int total_tokens = static_cast<int>(req->prompt_tokens_for_cache.size());
+                            const int completed_blocks =
+                                std::min(req->n_past / BLOCK_SIZE, static_cast<int>(req->block_table.size()));
+
+                            for (int blk_idx = req->registered_prefix_blocks; blk_idx < completed_blocks; ++blk_idx) {
+                                int block_id = req->block_table[static_cast<size_t>(blk_idx)];
+                                int start_token = blk_idx * BLOCK_SIZE;
+                                int block_tokens = std::min(BLOCK_SIZE, total_tokens - start_token);
+                                if (block_tokens != BLOCK_SIZE) {
+                                    break;
+                                }
+
+                                uint64_t hash = BlockManager::ComputeTokenHash(tokens_ptr + start_token, block_tokens);
+                                const bool attach_hybrid_snapshot =
+                                    current_model && current_model->arch_flags.is_hybrid_ssm &&
+                                    ((blk_idx + 1) * BLOCK_SIZE == req->n_past);
+                                current_kv_cache->block_manager->RegisterPrefixBlockWithTokens(
+                                    block_id, hash, tokens_ptr + start_token, block_tokens,
+                                    attach_hybrid_snapshot ? &req->ssm_runtime_states : nullptr);
+                            }
+                            req->registered_prefix_blocks = std::max(req->registered_prefix_blocks, completed_blocks);
+                        }
+
                         // Chunked prefill in progress: continue prefill without sampling.
                         if (processed_count < remaining_prompt_tokens) {
                             req->tokens.erase(req->tokens.begin(), req->tokens.begin() + processed_count);
@@ -2763,32 +2819,6 @@ void EngineLoop(EngineState* state) {
 
                         req->tokens.clear();
                         req->is_prefill = false;
-
-                        // =======================================================================
-                        // PREFIX CACHE REGISTRATION (vLLM-style Hash-based Caching)
-                        // =======================================================================
-                        // Register completed prefill blocks in prefix cache for future reuse.
-                        // This enables O(1) lookup for requests with identical prompt prefixes.
-                        // Multi-stage collision verification ensures correctness.
-                        // =======================================================================
-                        if (prefix_cache_allowed && !req->prompt_tokens_for_cache.empty() &&
-                            !req->block_table.empty()) {
-                            const int* tokens_ptr = req->prompt_tokens_for_cache.data();
-                            int total_tokens = static_cast<int>(req->prompt_tokens_for_cache.size());
-
-                            for (size_t blk_idx = 0; blk_idx < req->block_table.size(); ++blk_idx) {
-                                int block_id = req->block_table[blk_idx];
-                                int start_token = static_cast<int>(blk_idx) * BLOCK_SIZE;
-                                int block_tokens = std::min(BLOCK_SIZE, total_tokens - start_token);
-
-                                if (block_tokens <= 0) break;
-
-                                uint64_t hash = BlockManager::ComputeTokenHash(tokens_ptr + start_token, block_tokens);
-
-                                current_kv_cache->block_manager->RegisterPrefixBlockWithTokens(
-                                    block_id, hash, tokens_ptr + start_token, block_tokens);
-                            }
-                        }
                         // Clear after registration, or after skipping cache registration for hybrid SSM.
                         req->prompt_tokens_for_cache.clear();
 

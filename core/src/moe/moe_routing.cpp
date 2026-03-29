@@ -227,8 +227,11 @@ MoERouteResult MoETopKRoute(const Tensor& gate_logits, int k) {
     if (gate_logits.dtype != DType::F32) {
         throw std::runtime_error("MoE gating currently supports FP32 only");
     }
-    int batch_size = static_cast<int>(gate_logits.shape[0]);
-    int n_experts = static_cast<int>(gate_logits.shape[1]);
+    // gate_logits comes from GgmlToTensor which preserves ggml column-major layout:
+    //   shape[0] = ne[0] = n_experts (inner/fastest dimension)
+    //   shape[1] = ne[1] = batch_size (outer dimension)
+    int n_experts = static_cast<int>(gate_logits.shape[0]);
+    int batch_size = static_cast<int>(gate_logits.shape[1]);
     const float* logits = gate_logits.DataAs<float>();
     return MoETopKRoute(logits, batch_size, n_experts, k, true);
 }

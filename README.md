@@ -3,15 +3,32 @@
 [![CI](https://github.com/DenseCore/DenseCore/actions/workflows/ci.yml/badge.svg)](https://github.com/DenseCore/DenseCore/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![PyPI](https://img.shields.io/pypi/v/densecore)](https://pypi.org/project/densecore/)
-[![Docker Hub](https://img.shields.io/docker/pulls/densecore/densecore)](https://hub.docker.com/r/densecore/densecore)
+[![Docker Hub](https://img.shields.io/docker/pulls/denseai/densecore)](https://hub.docker.com/r/denseai/densecore)
 
-DenseCore is an open-source inference runtime built around a native C++ engine, a Python SDK, and a production API server.
+DenseCore is an open-source, memory-centric inference runtime for heterogeneous AI execution. It packages a native C++ engine, a Python SDK, and a production API server into a single execution stack.
+
+It is designed around a simple product idea: inference performance is constrained as much by memory movement, locality, fallback behavior, and hardware utilization as by raw compute.
 
 The repository currently exposes three primary surfaces:
 
 - Python package on PyPI: `densecore`
-- Production container image on Docker Hub: `densecore/densecore`
+- Production container image on Docker Hub: `denseai/densecore`
 - Go CLI / API server from source in [`server/`](server)
+
+## Positioning
+
+DenseCore is the runtime spine of Dense Series. It is intended to be:
+
+- a heterogeneous inference runtime rather than a single-hardware optimization demo
+- a memory- and locality-aware execution layer rather than a tok/s-only benchmark project
+- a production-capable serving surface with explicit health, metrics, and fallback paths
+
+DenseCore is not intended to be:
+
+- "just a slightly faster `llama.cpp`"
+- a GPU-free fallback product
+- a model company
+- a loose bundle of unrelated inference utilities
 
 ## What Works Today
 
@@ -23,6 +40,13 @@ The repository currently exposes three primary surfaces:
 - LoRA adapter loading from Python
 - Docker deployment for the API server
 - Helm chart for Kubernetes deployment
+
+## Runtime Principles
+
+- Correctness and fail-safe behavior come before fragile benchmark wins
+- Benchmark claims should be reproducible and fair across fallback paths
+- Memory footprint, latency stability, and hardware portability matter alongside throughput
+- Python local inference and server deployment are both first-class entry points
 
 ## Repository Layout
 
@@ -59,7 +83,7 @@ Run the published API image from Docker Hub with a local GGUF model:
 docker run --rm -p 8080:8080 \
   -v "$(pwd)/models:/models:ro" \
   -e MAIN_MODEL_PATH=/models/model.gguf \
-  densecore/densecore:latest
+  denseai/densecore:latest
 ```
 
 Check the server:
@@ -97,7 +121,7 @@ make server
 | Need | Install path |
 | --- | --- |
 | Python embedding / local inference | `pip install densecore` |
-| Containerized HTTP/gRPC server | `docker pull densecore/densecore:latest` |
+| Containerized HTTP/gRPC server | `docker pull denseai/densecore:latest` |
 | Interactive TUI or source-built server binary | build from this repository |
 
 ## HTTP API Summary

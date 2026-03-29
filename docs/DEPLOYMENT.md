@@ -1,13 +1,13 @@
 # Deployment Guide
 
-This guide covers the production API server, not the Python SDK.
+This guide covers the production API server surface, not the Python SDK. DenseCore's deployment story is centered on a memory-centric runtime with explicit probes, metrics, and fallback-aware startup behavior.
 
 ## Docker Hub Image
 
 The published server image is:
 
 ```bash
-docker pull densecore/densecore:latest
+docker pull denseai/densecore:latest
 ```
 
 The container expects `MAIN_MODEL_PATH` if you want a model loaded on startup.
@@ -18,7 +18,7 @@ The container expects `MAIN_MODEL_PATH` if you want a model loaded on startup.
 docker run --rm -p 8080:8080 \
   -v "$(pwd)/models:/models:ro" \
   -e MAIN_MODEL_PATH=/models/model.gguf \
-  densecore/densecore:latest
+  denseai/densecore:latest
 ```
 
 ### Run with authentication
@@ -29,7 +29,7 @@ docker run --rm -p 8080:8080 \
   -e MAIN_MODEL_PATH=/models/model.gguf \
   -e AUTH_ENABLED=true \
   -e API_KEYS="sk-prod:user:default" \
-  densecore/densecore:latest
+  denseai/densecore:latest
 ```
 
 ### Health and smoke checks
@@ -54,7 +54,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ## Build Your Own Image
 
 ```bash
-docker build -t densecore/densecore:latest .
+docker build -t denseai/densecore:latest .
 ```
 
 The root [`Dockerfile`](../Dockerfile) builds:
@@ -106,7 +106,7 @@ Common override pattern:
 ```yaml
 dense-base:
   image:
-    repository: densecore/densecore
+    repository: denseai/densecore
     tag: "latest"
 
   model:
@@ -183,3 +183,4 @@ curl -X POST http://localhost:8080/v1/models/unload
 - The API server starts before background model loading completes.
 - `startup` and `ready` probes intentionally reflect model load state.
 - If authentication is enabled without `API_KEYS` and without a Redis keystore, startup fails.
+- Optional autoscaling or external store integrations should be validated as deployment-specific extensions, not assumed baseline behavior.

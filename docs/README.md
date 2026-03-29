@@ -1,9 +1,9 @@
 # DenseCore Documentation
 
-This documentation set is organized around the three public distribution surfaces in this repository:
+This documentation set is organized around the three public distribution surfaces in this repository. DenseCore is the runtime spine of Dense Series: a memory-centric, CPU-first inference runtime with explicit heterogeneous hardware paths, production server surfaces, and graceful fallback expectations.
 
 - PyPI package: `densecore`
-- Docker Hub image: `densecore/densecore`
+- Docker Hub image: `denseai/densecore`
 - Source-built Go CLI and API server
 
 ## Start Here
@@ -65,3 +65,4 @@ Primary docs:
 - `pip install densecore` installs the Python SDK. It does not install the Go CLI.
 - The Docker Hub image runs the API server. It does not launch the interactive TUI.
 - The server expects `MAIN_MODEL_PATH` for a preloaded model in Docker and Kubernetes deployments.
+- DenseCore is CPU-first, not CPU-only. Backend maturity is hardware-specific, and optional accelerators should preserve graceful fallback behavior.

@@ -185,34 +185,57 @@ template <class D> HWY_INLINE float DotProductQ8_0(D d, const float* q, const vo
     return scalar_sum;
 }
 
-template <class D> HWY_INLINE float DotProductQ4_0(D /*d*/, const float* q, const void* k_data, int head_dim) {
+// Q4_0 Dot Product — Highway-vectorized.
+//
+// Unpacks each 32-element Q4_0 block into a 128-byte float scratch buffer
+// (always L1-resident) and performs a SIMD FMA dot product against the query.
+// The unpack loop (16 scalar iterations per block) is data-independent bit ops
+// and is not the bottleneck; the SIMD dot product loop is the hot path.
+// On NEON (4 float lanes) this is 8 FMA iterations vs 32 scalar; on SVE-512
+// (16 float lanes) only 2 FMA iterations.
+template <class D> HWY_INLINE float DotProductQ4_0(D d, const float* q, const void* k_data, int head_dim) {
     const block_q4_0* blocks = reinterpret_cast<const block_q4_0*>(k_data);
     const int nb = head_dim / QK4_0;
-    float scalar_sum = 0.0f;
-    int q_offset = 0;
+    const int lanes = static_cast<int>(hn::Lanes(d));
+    float total = 0.0f;
 
     for (int b = 0; b < nb; ++b) {
-        const float block_scale = densecore::fp16_to_fp32(blocks[b].d);
-        for (int i = 0; i < QK4_0 / 2; ++i) {
-            const uint8_t packed = blocks[b].qs[i];
-            const float q0 = static_cast<float>((packed & 0x0F) - 8);
-            const float q1 = static_cast<float>(((packed >> 4) & 0x0F) - 8);
-            scalar_sum += q[q_offset + 2 * i + 0] * (q0 * block_scale);
-            scalar_sum += q[q_offset + 2 * i + 1] * (q1 * block_scale);
+        const float scale = densecore::fp16_to_fp32(blocks[b].d);
+        const uint8_t* qs = blocks[b].qs;
+        const int q_base = b * QK4_0;
+
+        // Unpack 16 bytes → 32 float values. Stack buffer is always L1-resident.
+        float scratch[QK4_0];
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            scratch[2 * j + 0] = static_cast<float>((qs[j] & 0x0F) - 8);
+            scratch[2 * j + 1] = static_cast<float>((qs[j] >> 4)   - 8);
         }
-        q_offset += QK4_0;
+
+        // Vectorized dot product of q[q_base..q_base+32] × scratch[0..32]
+        auto vsum = hn::Zero(d);
+        int i = 0;
+        for (; i <= QK4_0 - lanes; i += lanes) {
+            vsum = hn::MulAdd(hn::LoadU(d, q + q_base + i), hn::LoadU(d, scratch + i), vsum);
+        }
+        float block_sum = hn::ReduceSum(d, vsum);
+        for (; i < QK4_0; ++i) {
+            block_sum += q[q_base + i] * scratch[i];
+        }
+        total += block_sum * scale;
     }
 
-    if (q_offset < head_dim) {
-        const float block_scale = densecore::fp16_to_fp32(blocks[nb].d);
-        for (int i = 0; q_offset + i < head_dim; ++i) {
+    // Tail: head_dim not a multiple of QK4_0 (uncommon but safe)
+    const int tail_start = nb * QK4_0;
+    if (tail_start < head_dim) {
+        const float scale = densecore::fp16_to_fp32(blocks[nb].d);
+        for (int i = 0; tail_start + i < head_dim; ++i) {
             const uint8_t packed = blocks[nb].qs[i / 2];
             const int qv = (i & 1) ? (((packed >> 4) & 0x0F) - 8) : ((packed & 0x0F) - 8);
-            scalar_sum += q[q_offset + i] * (static_cast<float>(qv) * block_scale);
+            total += q[tail_start + i] * (static_cast<float>(qv) * scale);
         }
     }
 
-    return scalar_sum;
+    return total;
 }
 
 // ============================================================================
@@ -297,27 +320,46 @@ template <class D> HWY_INLINE void AccumulateQ8_0(D d, float* accum, const void*
     }
 }
 
-template <class D> HWY_INLINE void AccumulateQ4_0(D /*d*/, float* accum, const void* v_data, float weight, int head_dim) {
+// Q4_0 Accumulate — Highway-vectorized (same unpack strategy as DotProductQ4_0).
+template <class D> HWY_INLINE void AccumulateQ4_0(D d, float* accum, const void* v_data, float weight, int head_dim) {
     const block_q4_0* blocks = reinterpret_cast<const block_q4_0*>(v_data);
     const int nb = head_dim / QK4_0;
+    const int lanes = static_cast<int>(hn::Lanes(d));
     int accum_offset = 0;
 
     for (int b = 0; b < nb; ++b) {
-        const float block_scale = densecore::fp16_to_fp32(blocks[b].d) * weight;
-        for (int i = 0; i < QK4_0 / 2; ++i) {
-            const uint8_t packed = blocks[b].qs[i];
-            accum[accum_offset + 2 * i + 0] += static_cast<float>((packed & 0x0F) - 8) * block_scale;
-            accum[accum_offset + 2 * i + 1] += static_cast<float>(((packed >> 4) & 0x0F) - 8) * block_scale;
+        const float scale = densecore::fp16_to_fp32(blocks[b].d) * weight;
+        const auto v_scale = hn::Set(d, scale);
+        const uint8_t* qs = blocks[b].qs;
+
+        // Unpack 16 bytes → 32 float values (L1-resident scratch buffer).
+        float scratch[QK4_0];
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            scratch[2 * j + 0] = static_cast<float>((qs[j] & 0x0F) - 8);
+            scratch[2 * j + 1] = static_cast<float>((qs[j] >> 4)   - 8);
+        }
+
+        // Vectorized accumulate: accum[i] += scratch[i] * scale
+        int i = 0;
+        for (; i <= QK4_0 - lanes; i += lanes) {
+            auto va = hn::LoadU(d, accum + accum_offset + i);
+            const auto vs = hn::LoadU(d, scratch + i);
+            va = hn::MulAdd(vs, v_scale, va);
+            hn::StoreU(va, d, accum + accum_offset + i);
+        }
+        for (; i < QK4_0; ++i) {
+            accum[accum_offset + i] += scratch[i] * scale;
         }
         accum_offset += QK4_0;
     }
 
+    // Tail
     if (accum_offset < head_dim) {
-        const float block_scale = densecore::fp16_to_fp32(blocks[nb].d) * weight;
+        const float scale = densecore::fp16_to_fp32(blocks[nb].d) * weight;
         for (int i = 0; accum_offset + i < head_dim; ++i) {
             const uint8_t packed = blocks[nb].qs[i / 2];
             const int qv = (i & 1) ? (((packed >> 4) & 0x0F) - 8) : ((packed & 0x0F) - 8);
-            accum[accum_offset + i] += static_cast<float>(qv) * block_scale;
+            accum[accum_offset + i] += static_cast<float>(qv) * scale;
         }
     }
 }
@@ -370,6 +412,20 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
         return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
     }();
 
+    // Byte footprint of one KV head vector — cache_type:
+    //   0=F32 (4B/elem), 1=F16 (2B/elem), 8=Q8_0 (~1B/elem), 4=Q4_0 (~0.5B/elem)
+    // Hoisted out of the per-head/per-block loops; constant for the whole call.
+    const size_t k_head_bytes =
+        (cache_type == 1) ? static_cast<size_t>(qk_head_dim) * 2 :
+        (cache_type == 8) ? static_cast<size_t>(qk_head_dim) :
+        (cache_type == 4) ? static_cast<size_t>(qk_head_dim + 1) / 2 :
+        static_cast<size_t>(qk_head_dim) * 4;  // F32
+    const size_t v_head_bytes =
+        (cache_type == 1) ? static_cast<size_t>(v_head_dim) * 2 :
+        (cache_type == 8) ? static_cast<size_t>(v_head_dim) :
+        (cache_type == 4) ? static_cast<size_t>(v_head_dim + 1) / 2 :
+        static_cast<size_t>(v_head_dim) * 4;  // F32
+
     for (int h = h_begin; h < h_limit; ++h) {
         const float* q_head = query + h * qk_head_dim;
         float* out_head = output + h * v_head_dim;
@@ -404,32 +460,28 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
                 continue;
             }
 
+            // Inter-block prefetch: cover the full KV head of the next block, not
+            // just the first 64 B. A single Prefetch only warms one cache line;
+            // for FP16 head_dim=128 the head is 256 B (4 lines), for F32 it is
+            // 512 B (8 lines). Issuing all lines here gives the hardware enough
+            // lead time before we begin processing that block.
             if (prefetch_blocks && b_idx + 1 < block_table_size) {
                 const uint8_t* next_k_block = reinterpret_cast<const uint8_t*>(k_block_ptrs[b_idx + 1]);
                 const uint8_t* next_v_block = reinterpret_cast<const uint8_t*>(v_block_ptrs[b_idx + 1]);
                 if (next_k_block) {
-                    ::hwy::Prefetch(next_k_block + k_head_offset_bytes);
+                    for (size_t pf_off = 0; pf_off < k_head_bytes; pf_off += 64) {
+                        ::hwy::Prefetch(next_k_block + k_head_offset_bytes + pf_off);
+                    }
                 }
                 if (next_v_block) {
-                    ::hwy::Prefetch(next_v_block + v_head_offset_bytes);
+                    for (size_t pf_off = 0; pf_off < v_head_bytes; pf_off += 64) {
+                        ::hwy::Prefetch(next_v_block + v_head_offset_bytes + pf_off);
+                    }
                 }
             }
 
             // 1. Compute Scores
             float m_block = -1e30f;
-
-            // Byte footprint of one KV head vector, used for multi-cache-line prefetch.
-            // cache_type: 0=F32 (4B/elem), 1=F16 (2B/elem), 8=Q8_0 (~1B/elem), 4=Q4_0 (~0.5B/elem)
-            const size_t k_head_bytes =
-                (cache_type == 1) ? static_cast<size_t>(qk_head_dim) * 2 :
-                (cache_type == 8) ? static_cast<size_t>(qk_head_dim) :
-                (cache_type == 4) ? static_cast<size_t>(qk_head_dim + 1) / 2 :
-                static_cast<size_t>(qk_head_dim) * 4;  // F32
-            const size_t v_head_bytes =
-                (cache_type == 1) ? static_cast<size_t>(v_head_dim) * 2 :
-                (cache_type == 8) ? static_cast<size_t>(v_head_dim) :
-                (cache_type == 4) ? static_cast<size_t>(v_head_dim + 1) / 2 :
-                static_cast<size_t>(v_head_dim) * 4;  // F32
 
             for (int t = 0; t < num_tokens; ++t) {
                 // Prefetch next token's K head: all cache lines (64 B each).

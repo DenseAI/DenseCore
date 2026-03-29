@@ -220,6 +220,7 @@ struct Request {
     std::vector<int> tokens;
     std::vector<int> token_history;
     std::vector<int> prompt_tokens_for_cache;  // Original prompt tokens for prefix cache registration
+    int registered_prefix_blocks = 0;
     std::string utf8_pending;
     std::string think_tag_pending;
     std::string tool_call_tag_pending;
@@ -244,6 +245,11 @@ struct Request {
     BlockTable block_table;
     SwapState swap_state;
     bool is_swapped = false;
+
+    // Hybrid SSM per-request recurrent state.
+    // Qwen3.5-style models cannot batch correctly if these buffers are shared
+    // globally across all in-flight requests.
+    std::vector<TransformerModel::SSMSequenceRuntimeState> ssm_runtime_states;
 
     // Embedding mode
     bool is_embedding = false;
@@ -297,6 +303,7 @@ struct Request {
         tokens.clear();
         token_history.clear();
         prompt_tokens_for_cache.clear();
+        registered_prefix_blocks = 0;
         utf8_pending.clear();
         think_tag_pending.clear();
         tool_call_tag_pending.clear();
@@ -313,6 +320,7 @@ struct Request {
         block_table.clear();
         swap_state.Clear();
         is_swapped = false;
+        ssm_runtime_states.clear();
         is_embedding = false;
         embedding_callback = nullptr;
         token_result_callback = nullptr;

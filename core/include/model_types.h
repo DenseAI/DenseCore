@@ -409,6 +409,7 @@ struct TransformerModel {
 
     // Context & Backend
     struct ggml_context* ctx_w = nullptr;    // weight context
+    struct ggml_context* ctx_views = nullptr; // view tensor metadata (expert slices, etc.)
     ggml_backend_t backend = nullptr;        // active compute backend
     ggml_backend_t cpu_backend = nullptr;    // CPU backend (always available)
     ggml_backend_t metal_backend = nullptr;  // Metal backend (Apple Silicon only)
@@ -429,6 +430,9 @@ struct TransformerModel {
     int ssm_time_step_rank = 16;
     int ssm_inner_size = 2048;
     int ssm_full_attn_interval = 4;
+    // Optional per-layer hybrid mask from GGUF metadata (1 = SSM/linear attention, 0 = full attention).
+    // When absent, runtime falls back to the legacy modulo-based interval rule.
+    std::vector<uint8_t> hybrid_layer_is_ssm;
 
     // MoE routing parameters (GLM-4.5 / GLM-5 and similar)
     int moe_n_shared_experts = 0;
@@ -450,16 +454,26 @@ struct TransformerModel {
 
     // SSM runtime state (per-sequence, initialized by engine for hybrid models)
     // Indexed by SSM layer ordinal (NOT physical layer index).
-    // Each entry holds conv ring buffer + recurrent hidden state for one SSM layer.
+    // Each entry holds immutable, dequantized per-layer weights for one SSM layer.
     struct SSMLayerRuntimeState {
-        std::vector<float> conv_state;   // [conv_channels * (kernel_size - 1)]
-        std::vector<float> ssm_state;    // [n_heads * head_dim * d_state]
         std::vector<float> conv1d_f32;   // dequantized ssm_conv1d.weight [conv_channels * kernel]
         std::vector<float> alpha_f32;    // dequantized ssm_alpha.weight [n_heads * n_embd]
         std::vector<float> beta_f32;     // dequantized ssm_beta.weight  [n_heads * n_embd]
         std::vector<float> dt_bias_f32;  // dequantized ssm_dt.bias [n_heads]
         std::vector<float> ssm_a_f32;    // dequantized ssm_a [n_heads]
         std::vector<float> norm_f32;     // dequantized ssm_norm.weight [head_dim]
+        void Init(int conv_channels, int kernel_size, int n_heads, int head_dim, int d_state) {
+            (void)conv_channels;
+            (void)kernel_size;
+            (void)n_heads;
+            (void)head_dim;
+            (void)d_state;
+        }
+    };
+
+    struct SSMSequenceRuntimeState {
+        std::vector<float> conv_state;  // [conv_channels * (kernel_size - 1)]
+        std::vector<float> ssm_state;   // [n_heads * head_dim * d_state]
         void Init(int conv_channels, int kernel_size, int n_heads, int head_dim, int d_state) {
             conv_state.assign(static_cast<size_t>(conv_channels) * (kernel_size - 1), 0.0f);
             ssm_state.assign(static_cast<size_t>(n_heads) * head_dim * d_state, 0.0f);
@@ -470,6 +484,16 @@ struct TransformerModel {
         }
     };
     std::vector<SSMLayerRuntimeState> ssm_layer_states;
+
+    bool IsHybridSSMLayer(int layer_idx) const {
+        if (!arch_flags.is_hybrid_ssm || layer_idx < 0 || layer_idx >= static_cast<int>(hparams.n_layer)) {
+            return false;
+        }
+        if (layer_idx < static_cast<int>(hybrid_layer_is_ssm.size())) {
+            return hybrid_layer_is_ssm[static_cast<size_t>(layer_idx)] != 0;
+        }
+        return layer_idx % ssm_full_attn_interval != ssm_full_attn_interval - 1;
+    }
 
     // Vision model parameters (populated when arch is VIT, CLIP_VISION, etc.)
     VisionHParams vision_hparams;

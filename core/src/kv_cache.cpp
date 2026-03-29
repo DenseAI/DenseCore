@@ -194,6 +194,7 @@ void BlockManager::FreeSingle(int block_id) {
         blocks[block_id].content_hash = 0;
     }
     block_tokens.erase(block_id);
+    block_hybrid_ssm_snapshots.erase(block_id);
 
     // Add to free list
     shard.free_blocks.push_back(block_id);
@@ -391,6 +392,86 @@ int BlockManager::FindCachedBlockWithVerification(uint64_t hash, const int* toke
     return block_id;
 }
 
+BlockManager::PrefixCacheMatch BlockManager::FindLongestCachedPrefixWithVerification(const int* tokens, int n_tokens,
+                                                                                     bool require_hybrid_ssm_snapshot) {
+    PrefixCacheMatch match;
+    if (!tokens || n_tokens <= 1) {
+        return match;
+    }
+
+    const int max_reusable_tokens = ((n_tokens - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    if (max_reusable_tokens <= 0) {
+        return match;
+    }
+
+    std::lock_guard<std::mutex> p_lock(prefix_mu);
+    std::vector<int> acquired_blocks;
+    acquired_blocks.reserve(static_cast<size_t>(max_reusable_tokens / BLOCK_SIZE));
+
+    for (int start_token = 0; start_token < max_reusable_tokens; start_token += BLOCK_SIZE) {
+        const uint64_t hash = ComputeTokenHash(tokens + start_token, BLOCK_SIZE);
+        auto it = prefix_cache.find(hash);
+        if (it == prefix_cache.end()) {
+            break;
+        }
+
+        const int block_id = it->second;
+        int shard_idx = block_id % NUM_SHARDS;
+        std::lock_guard<std::mutex> s_lock(shards[shard_idx]->mu);
+
+        if (blocks[block_id].ref_count <= 0) {
+            prefix_cache.erase(it);
+            block_tokens.erase(block_id);
+            block_hybrid_ssm_snapshots.erase(block_id);
+            break;
+        }
+
+        auto tokens_it = block_tokens.find(block_id);
+        if (tokens_it == block_tokens.end() || static_cast<int>(tokens_it->second.size()) != BLOCK_SIZE) {
+            break;
+        }
+
+        const std::vector<int>& stored_tokens = tokens_it->second;
+        bool tokens_match = true;
+        for (int i = 0; i < BLOCK_SIZE; ++i) {
+            if (stored_tokens[static_cast<size_t>(i)] != tokens[start_token + i]) {
+                tokens_match = false;
+                break;
+            }
+        }
+        if (!tokens_match) {
+            break;
+        }
+
+        blocks[block_id].ref_count++;
+        acquired_blocks.push_back(block_id);
+
+    }
+
+    if (acquired_blocks.empty()) {
+        return match;
+    }
+
+    if (require_hybrid_ssm_snapshot) {
+        while (!acquired_blocks.empty()) {
+            const int block_id = acquired_blocks.back();
+            if (block_hybrid_ssm_snapshots.find(block_id) != block_hybrid_ssm_snapshots.end()) {
+                break;
+            }
+            int shard_idx = block_id % NUM_SHARDS;
+            std::lock_guard<std::mutex> s_lock(shards[shard_idx]->mu);
+            if (blocks[block_id].ref_count > 0) {
+                blocks[block_id].ref_count--;
+            }
+            acquired_blocks.pop_back();
+        }
+    }
+
+    match.cached_block_ids = std::move(acquired_blocks);
+    match.cached_tokens = static_cast<int>(match.cached_block_ids.size()) * BLOCK_SIZE;
+    return match;
+}
+
 void BlockManager::RegisterPrefixBlock(int block_id, uint64_t hash) {
     if (block_id < 0 || block_id >= num_blocks || hash == 0) return;
 
@@ -402,7 +483,9 @@ void BlockManager::RegisterPrefixBlock(int block_id, uint64_t hash) {
     prefix_cache[hash] = block_id;
 }
 
-void BlockManager::RegisterPrefixBlockWithTokens(int block_id, uint64_t hash, const int* tokens, int n_tokens) {
+void BlockManager::RegisterPrefixBlockWithTokens(
+    int block_id, uint64_t hash, const int* tokens, int n_tokens,
+    const std::vector<TransformerModel::SSMSequenceRuntimeState>* hybrid_ssm_snapshot) {
     if (block_id < 0 || block_id >= num_blocks || hash == 0) return;
 
     std::lock_guard<std::mutex> p_lock(prefix_mu);
@@ -415,6 +498,24 @@ void BlockManager::RegisterPrefixBlockWithTokens(int block_id, uint64_t hash, co
     if (tokens && n_tokens > 0) {
         block_tokens[block_id] = std::vector<int>(tokens, tokens + n_tokens);
     }
+    if (hybrid_ssm_snapshot && !hybrid_ssm_snapshot->empty()) {
+        block_hybrid_ssm_snapshots[block_id] = *hybrid_ssm_snapshot;
+    }
+}
+
+bool BlockManager::LoadHybridSSMSnapshotForBlock(
+    int block_id, std::vector<TransformerModel::SSMSequenceRuntimeState>* out_snapshot) {
+    if (!out_snapshot || block_id < 0 || block_id >= num_blocks) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> p_lock(prefix_mu);
+    auto it = block_hybrid_ssm_snapshots.find(block_id);
+    if (it == block_hybrid_ssm_snapshots.end()) {
+        return false;
+    }
+    *out_snapshot = it->second;
+    return true;
 }
 
 void BlockManager::UnregisterPrefixBlock(int block_id) {
@@ -429,6 +530,7 @@ void BlockManager::UnregisterPrefixBlock(int block_id) {
         blocks[block_id].content_hash = 0;
     }
     block_tokens.erase(block_id);
+    block_hybrid_ssm_snapshots.erase(block_id);
 }
 
 uint64_t BlockManager::ComputeTokenHash(const int* tokens, int n_tokens) {
@@ -547,9 +649,12 @@ void* PagedKVCache::GetKBlockPtr(int block_id, int layer) {
     if (block_id < 0 || block_id >= max_blocks) return nullptr;
     if (layer < 0 || layer >= n_layer) return nullptr;
 
-    // Layout: [head_dim, n_head_kv, BLOCK_SIZE, num_blocks * n_layer]
-    // Block index in 4th dimension = block_id * n_layer + layer
-    int64_t block_index = (int64_t)block_id * n_layer + layer;
+    // Layer-major layout: all blocks for the same layer are contiguous.
+    //   block_index = layer * max_blocks + block_id
+    // This keeps consecutive blocks of the same layer within a tight address band
+    // (~block_stride apart vs n_layer * block_stride in the old block-major layout),
+    // drastically reducing TLB pressure on ARM when scanning a long context.
+    int64_t block_index = (int64_t)layer * max_blocks + block_id;
     size_t byte_offset = block_index * GetBytesPerBlock();
 
     if (use_block_allocator && k_allocator) {
@@ -568,7 +673,7 @@ void* PagedKVCache::GetVBlockPtr(int block_id, int layer) {
     if (block_id < 0 || block_id >= max_blocks) return nullptr;
     if (layer < 0 || layer >= n_layer) return nullptr;
 
-    int64_t block_index = (int64_t)block_id * n_layer + layer;
+    int64_t block_index = (int64_t)layer * max_blocks + block_id;  // Layer-major
     size_t byte_offset = block_index * GetVBytesPerBlock();
 
     if (use_block_allocator && v_allocator) {
@@ -588,7 +693,7 @@ void* PagedKVCache::GetIndexBlockPtr(int block_id, int layer) {
     if (block_id < 0 || block_id >= max_blocks) return nullptr;
     if (layer < 0 || layer >= n_layer) return nullptr;
 
-    int64_t block_index = (int64_t)block_id * n_layer + layer;
+    int64_t block_index = (int64_t)layer * max_blocks + block_id;  // Layer-major
     size_t byte_offset = block_index * GetIndexBytesPerBlock();
     void* ptr = static_cast<char*>(index_allocator->ArenaBase()) + byte_offset;
     DENSECORE_ASSERT_ALIGNED_64(ptr);
@@ -843,12 +948,23 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
     // Pre-allocates a single contiguous arena per K/V to eliminate fragmentation
     // ==========================================================================
 
+    // Hugepages dramatically reduce TLB pressure on large KV arenas. With the
+    // layer-major layout, each layer's block band can span hundreds of MB; 2 MB
+    // hugepages cut TLB entries needed by ~500x vs 4 KB base pages. Enabled by
+    // default on Linux; set DENSECORE_DISABLE_HUGEPAGES=1 to turn off.
+#if defined(__linux__)
+    const bool use_hugepages = []() {
+        const char* v = std::getenv("DENSECORE_DISABLE_HUGEPAGES");
+        return !(v && (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0));
+    }();
+#else
     const bool use_hugepages = IsEnvEnabled("DENSECORE_USE_HUGEPAGES");
+#endif
     const bool strict_numa = (numa_node_id >= 0);
 
-    // Block stride: bytes per "block" in our linear arena
-    // Each block_id maps to: block_id * n_layer + layer_idx
-    // So total "logical blocks" = max_blocks * n_layer
+    // Block stride: bytes per "block" in our linear arena.
+    // Layer-major layout: block_id maps to layer * max_blocks + block_id.
+    // Total "logical blocks" = n_layer * max_blocks
 
     // Create K allocator with NUMA awareness
     cache->k_allocator = std::make_unique<densecore::KVBlockAllocator>(total_logical_blocks, k_block_stride, 64,

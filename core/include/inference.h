@@ -49,6 +49,7 @@ struct BatchSpec {
     std::vector<BlockTable> block_tables;  // [NumSeqs]
     std::vector<int> n_past;               // Past tokens count for each sequence [NumSeqs]
     std::vector<int> scheduler_seq_ids;    // Scheduler sequence IDs [NumSeqs]
+    std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*> hybrid_ssm_runtime_states;  // [NumSeqs]
     densecore::Scheduler* scheduler = nullptr;
     int num_seqs;
 

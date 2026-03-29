@@ -18,6 +18,7 @@ TransformerModel::~TransformerModel() {
     numa_buffers.clear();
 
     // Standard GGML cleanup
+    if (ctx_views) ggml_free(ctx_views);
     if (ctx_w) ggml_free(ctx_w);
     if (ctx_gguf) gguf_free(ctx_gguf);
     if (backend) {

@@ -69,7 +69,7 @@ This security policy applies to:
 - ✅ `core/` - C++ inference engine
 - ✅ `python/` - Python SDK
 - ✅ `server/` - Go REST server
-- ✅ Official Docker images (`densecore/densecore`)
+- ✅ Official Docker images (`denseai/densecore`)
 - ✅ Helm charts (`charts/densecore`)
 - ✅ GitHub Actions workflows
 

@@ -1,6 +1,6 @@
 # DenseCore Architecture
 
-A deep dive into DenseCore's system design, components, and performance optimizations.
+A deep dive into DenseCore's system design, execution ownership, and performance-sensitive subsystems.
 
 ---
 
@@ -24,7 +24,7 @@ A deep dive into DenseCore's system design, components, and performance optimiza
 
 ## Overview
 
-DenseCore is a **three-layer architecture** optimized for CPU-based LLM inference:
+DenseCore is a **three-layer execution architecture** for memory-centric AI inference. It is CPU-first, but it is designed to expose heterogeneous backend paths without collapsing correctness, operability, or fallback behavior into benchmark-only tradeoffs.
 
 ```mermaid
 graph TB
@@ -67,10 +67,10 @@ graph TB
 
 **Key Design Decisions:**
 
-1. **C++ Core for Speed:** Critical path (tensor ops, memory management) in C++17
-2. **Python for UX:** Pythonic API via ctypes for minimal overhead
-3. **Go for Services:** High-concurrency REST server with built-in observability
-4. **GGML for Portability:** Broad CPU support (ARM, x86) without custom kernels
+1. **C++ Core on the Critical Path:** Tensor execution, memory management, scheduling, and cache behavior stay in native code.
+2. **Python for Local and Embedded UX:** The Python SDK provides a low-friction surface for local inference, embedding, and app integration.
+3. **Go for Production Service Surfaces:** The server and CLI provide observable, operational entry points rather than example-only wrappers.
+4. **CPU-First Portability with Heterogeneous Extensions:** DenseCore prioritizes portable CPU execution while allowing backend-specific acceleration where it can be introduced without weakening fallback semantics.
 
 ---
 
@@ -93,24 +93,31 @@ response = model.generate("Hello!")
 - Async/await support for modern Python
 - Type hints and docstrings
 
-### 2. **Production-Ready by Default**
+### 2. **Production Operability by Default**
 
-Many inference libraries are research-oriented. DenseCore is **production-first**:
+Many inference libraries are research-oriented. DenseCore treats the serving surface as a product surface:
 
-- ✅ Health checks (`/health/live`, `/health/ready`, `/health/startup`)
-- ✅ Prometheus metrics (latency percentiles, throughput, cache hit rate)
-- ✅ Graceful shutdown with request draining
-- ✅ Request cancellation and timeouts
-- ✅ Structured logging (JSON output)
+- explicit health checks (`/health/live`, `/health/ready`, `/health/startup`)
+- Prometheus metrics and runtime profiling surfaces
+- graceful shutdown with request draining
+- request cancellation and timeouts
+- structured logging and deployable configuration
 
-### 3. **CPU as a First-Class Citizen**
+### 3. **CPU-First, Heterogeneous by Design**
 
-Most frameworks optimize for GPUs, with CPU as an afterthought. DenseCore inverts this:
+DenseCore starts from CPU realities such as memory locality, NUMA behavior, cache pressure, and batching overhead. Optional backend acceleration should extend that execution model rather than replace it.
 
-- Aggressive quantization (INT4, INT8, FP8) using standard implementations
-- Paged KV cache to minimize allocations
-- SIMD-optimized kernels (AVX2, AVX-512)
-- Graph Caching for reduced overhead
+- quantization paths are used to improve footprint and deployability, not just headline throughput
+- paged KV cache reduces allocation churn and keeps memory behavior explicit
+- SIMD and backend-specific kernels are valuable only when they preserve correctness and fallback semantics
+- graph reuse and scheduler behavior matter because memory movement and runtime overhead can dominate real serving latency
+
+### 4. **Benchmark Fairness and Explicit Feature Maturity**
+
+DenseCore documents performance-sensitive features with two guardrails:
+
+- benchmark claims should be reproducible and separated from measurement artifacts
+- backend maturity should be called out honestly as production-ready, beta, experimental, or conditional rather than implied by a single fast path
 
 ---
 
@@ -1009,4 +1016,3 @@ DiagResult PrintSystemTopologyReport(void* ptr, size_t size, int requested_node)
     }
 }
 ```
-

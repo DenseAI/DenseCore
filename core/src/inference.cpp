@@ -691,7 +691,9 @@ static DecodePagedAttentionMode ParseDecodePagedAttentionMode() {
         return DecodePagedAttentionMode::On;
     }
 
-    return DecodePagedAttentionMode::Auto;
+    // Default: always use paged decode attention when candidate conditions are met.
+    // The materialized KV path (ggml_pad) is strictly worse for memory bandwidth.
+    return DecodePagedAttentionMode::On;
 }
 
 static DecodePagedAttentionPolicy LoadDecodePagedAttentionPolicy() {
@@ -705,7 +707,10 @@ static DecodePagedAttentionPolicy LoadDecodePagedAttentionPolicy() {
     policy.min_context_tokens = ParsePositiveEnvInt("DENSECORE_PAGED_DECODE_MIN_CONTEXT", legacy_min_context);
     policy.min_head_dim = ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_MIN_HEAD_DIM", 64);
     policy.min_heads = ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_MIN_HEADS", 8);
-    const bool legacy_allow_q8 = ParseTruthyEnv("DENSECORE_PAGED_ATTN_DECODE_ALLOW_Q8", false);
+    // Quantized KV cache (Q8_0, Q4_0) must use paged decode — the materialized
+    // fallback path re-allocs the full KV history every step, costing far more
+    // memory bandwidth than the paged path saves on dequant overhead.
+    const bool legacy_allow_q8 = ParseTruthyEnv("DENSECORE_PAGED_ATTN_DECODE_ALLOW_Q8", true);
     policy.allow_quantized_auto = ParseTruthyEnv("DENSECORE_PAGED_ATTN_DECODE_ALLOW_QUANTIZED", legacy_allow_q8);
     policy.debug_log = ParseTruthyEnv("DENSECORE_DEBUG_PAGED_ATTN_DECODE", false);
     return policy;
@@ -1502,6 +1507,9 @@ struct SSMConv1DUserData {
     const float* weight;
     int channels;
     int kernel_size;
+    int ssm_ordinal = -1;
+    const int* token_seq_ids = nullptr;
+    const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
 };
 
 struct SSMQwen35DeltaUserData {
@@ -1518,6 +1526,9 @@ struct SSMQwen35DeltaUserData {
     int head_dim_k;
     int n_groups;
     float norm_eps;
+    int ssm_ordinal = -1;
+    const int* token_seq_ids = nullptr;
+    const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
 };
 
 struct GLMDSAPackUserData {
@@ -3424,8 +3435,36 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     }
     if (do_profile && ith == 0) kv_end = std::chrono::steady_clock::now();
 
+    // Prefetch next layer's KV blocks to warm L2 cache and TLB before the next
+    // layer's callback starts. Only thread 0 issues prefetches to avoid duplicate
+    // prefetch storms across threads. With the layer-major arena layout, all blocks
+    // for layer L+1 are in a contiguous address band, so even a single cache-line
+    // prefetch per block is enough to kick off the hardware stream prefetcher.
+    if (ith == 0 && ud->cache && (ud->layer + 1) < ud->cache->n_layer) {
+        const int next_layer = ud->layer + 1;
+        const BatchSpec* batch_for_pf = GetCurrentBatch();
+        if (batch_for_pf) {
+            for (int si = 0; si < batch_for_pf->num_seqs; ++si) {
+                if (si >= static_cast<int>(batch_for_pf->block_tables.size())) break;
+                const auto& bt = batch_for_pf->block_tables[static_cast<size_t>(si)];
+                // Prefetch up to first 16 blocks — enough to prime the HW prefetcher
+                // for the sequential scan that follows. Remaining blocks are covered
+                // by the hardware stream prefetcher once access begins.
+                const int max_pf_blocks = std::min(static_cast<int>(bt.size()), 16);
+                for (int bi = 0; bi < max_pf_blocks; ++bi) {
+                    const int bid = bt[static_cast<size_t>(bi)];
+                    if (bid < 0 || bid >= ud->cache->max_blocks) continue;
+                    const void* k_ptr = ud->cache->GetKBlockPtr(bid, next_layer);
+                    const void* v_ptr = ud->cache->GetVBlockPtr(bid, next_layer);
+                    if (k_ptr) densecore::simd::Prefetch(k_ptr);
+                    if (v_ptr) densecore::simd::Prefetch(v_ptr);
+                }
+            }
+        }
+    }
+
     // Phase 2: Attention computation
-    const int head_tile = std::max(1, ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", 8));
+    static const int head_tile = std::max(1, ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", 8));
     const int tiles_per_token = std::max(1, (ud->n_head + head_tile - 1) / head_tile);
     int tile_start, tile_end;
     if (token_parallel_mode) {
@@ -4612,12 +4651,7 @@ struct Int4MatmulCustomParams {
 }
 
 static bool ShouldUseArmInt4DirectFastPath(const ggml_tensor* input, const Int4MatmulOpData& ud, int ith) {
-#if defined(DENSECORE_ARM_CORRECTNESS_FIRST) && (defined(__aarch64__) || defined(_M_ARM64))
-    (void)input;
-    (void)ud;
-    (void)ith;
-    return false;
-#elif defined(__aarch64__) || defined(_M_ARM64)
+#if defined(__aarch64__) || defined(_M_ARM64)
     if (!input || !ud.packed_weights || !ud.scales || !ud.zeros || ud.K <= 0 || ud.N <= 0 || ud.group_size <= 0 ||
         input->type != GGML_TYPE_F32 || input->ne[0] != ud.K || input->ne[1] <= 0) {
         return false;
@@ -5421,18 +5455,21 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
             w.w1.size = ggml_nbytes(gw1);
             w.hidden_dim = static_cast<int>(gw1->ne[0]);
             w.intermediate_dim = static_cast<int>(gw1->ne[1]);
+            w.w1_type = static_cast<int>(gw1->type);
         }
 
         auto* gw2 = layer->GetExpert(i, model_keys::kFfnDown);
         if (gw2) {
             w.w2.ptr = gw2->data;
             w.w2.size = ggml_nbytes(gw2);
+            w.w2_type = static_cast<int>(gw2->type);
         }
 
         auto* gw3 = layer->GetExpert(i, model_keys::kFfnUp);
         if (gw3) {
             w.w3.ptr = gw3->data;
             w.w3.size = ggml_nbytes(gw3);
+            w.w3_type = static_cast<int>(gw3->type);
         }
 
         experts.push_back(w);
@@ -5456,8 +5493,16 @@ static bool IsMoEPageMigrationEnabled() {
     return enabled;
 }
 
+static bool IsBenchmarkMode() {
+    return ParseTruthyEnv("DENSECORE_BENCH_MODE", false);
+}
+
+static bool IsMoEDebugLoggingEnabled() {
+    return ParseTruthyEnv("DENSECORE_DEBUG_MOE_CALLBACKS", false);
+}
+
 static void EnsureMoERebalanceThread(densecore::CpuBackend* backend) {
-    if (!backend || backend->IsRebalanceThreadRunning()) {
+    if (IsBenchmarkMode() || !backend || backend->IsRebalanceThreadRunning()) {
         return;
     }
     backend->StartRebalanceThread(GetMoERebalanceIntervalMs(), GetMoERebalanceTopK(), IsMoEPageMigrationEnabled());
@@ -5627,11 +5672,87 @@ static densecore::moe::MoERouteResult RouteMoEGroupedSigmoid(const struct ggml_t
     return routing;
 }
 
+static densecore::moe::MoERouteResult RouteMoESoftmaxTopK(const struct ggml_tensor* gate_logits, const MoEUserData* ud) {
+    densecore::moe::MoERouteResult routing;
+    if (!gate_logits || !ud || !ud->model) {
+        return routing;
+    }
+
+    const int n_experts = static_cast<int>(gate_logits->ne[0]);
+    const int batch_size = static_cast<int>(gate_logits->ne[1]);
+    const int top_k = std::max(1, std::min(ud->k, n_experts));
+    routing.batch_size = batch_size;
+    routing.top_k = top_k;
+    routing.expert_ids.assign(static_cast<size_t>(batch_size * top_k), -1);
+    routing.weights.assign(static_cast<size_t>(batch_size * top_k), 0.0f);
+    routing.token_indices.assign(static_cast<size_t>(batch_size * top_k), 0);
+
+    const float* logits = reinterpret_cast<const float*>(gate_logits->data);
+    if (!logits) {
+        return routing;
+    }
+
+    std::vector<float> probs(static_cast<size_t>(n_experts), 0.0f);
+    std::vector<std::pair<float, int>> scored(static_cast<size_t>(n_experts));
+    std::vector<int> selected(static_cast<size_t>(top_k), -1);
+
+    for (int token_idx = 0; token_idx < batch_size; ++token_idx) {
+        const float* row = logits + static_cast<size_t>(token_idx) * n_experts;
+        float max_logit = row[0];
+        for (int e = 1; e < n_experts; ++e) {
+            max_logit = std::max(max_logit, row[e]);
+        }
+        float sum = 0.0f;
+        for (int e = 0; e < n_experts; ++e) {
+            const float value = std::exp(row[e] - max_logit);
+            probs[static_cast<size_t>(e)] = value;
+            sum += value;
+        }
+        const float inv_sum = sum > 0.0f ? (1.0f / sum) : 0.0f;
+        for (int e = 0; e < n_experts; ++e) {
+            probs[static_cast<size_t>(e)] *= inv_sum;
+        }
+        for (int e = 0; e < n_experts; ++e) {
+            scored[static_cast<size_t>(e)] = {probs[static_cast<size_t>(e)], e};
+        }
+        std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        float weight_sum = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            const int expert_id = scored[static_cast<size_t>(k)].second;
+            selected[static_cast<size_t>(k)] = expert_id;
+            weight_sum += probs[static_cast<size_t>(expert_id)];
+        }
+
+        const float scale = ud->model->moe_routed_scaling_factor;
+        for (int k = 0; k < top_k; ++k) {
+            const int expert_id = selected[static_cast<size_t>(k)];
+            float weight = probs[static_cast<size_t>(expert_id)];
+            if (ud->model->moe_norm_topk_prob && weight_sum > 1e-20f) {
+                weight /= weight_sum;
+            }
+            weight *= scale;
+            routing.expert_ids[static_cast<size_t>(token_idx * top_k + k)] = expert_id;
+            routing.weights[static_cast<size_t>(token_idx * top_k + k)] = weight;
+            routing.token_indices[static_cast<size_t>(token_idx * top_k + k)] = token_idx;
+        }
+    }
+
+    return routing;
+}
+
 void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
                     int nth, void* userdata) {
     (void)nth;
     if (ith != 0) return;
-
+    if (IsMoEDebugLoggingEnabled()) {
+        static std::atomic<int> moe_call_count{0};
+        int call_id = moe_call_count.fetch_add(1);
+        fprintf(stderr, "[DBG] cb_moe_forward #%d src0=[%lld,%lld] src1=[%lld,%lld]\n",
+                call_id, (long long)src0->ne[0], (long long)src0->ne[1],
+                (long long)src1->ne[0], (long long)src1->ne[1]);
+    }
     auto* ud = static_cast<MoEUserData*>(userdata);
     if (!ud || !ud->layer || !ud->backend) return;
 
@@ -5648,8 +5769,7 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     if (ud->model && ud->model->arch_flags.is_glm_moe) {
         routing = RouteMoEGroupedSigmoid(src1, ud);
     } else {
-        densecore::Tensor t_gate_logits = GgmlToTensor(src1);
-        routing = densecore::moe::MoETopKRoute(t_gate_logits, ud->k);
+        routing = RouteMoESoftmaxTopK(src1, ud);
     }
     UpdateSchedulerExperts(ud, routing);
 
@@ -5681,7 +5801,20 @@ static void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src
         return;
     }
     for (int t = 0; t < N; ++t) {
-        densecore::hwy_kernels::SSMConv1DDecode_Hwy(ud->conv_state, &input[t * ud->channels], ud->weight,
+        float* conv_state = ud->conv_state;
+        if (ud->runtime_states && ud->token_seq_ids && ud->ssm_ordinal >= 0) {
+            const int seq_idx = ud->token_seq_ids[t];
+            if (seq_idx >= 0 && seq_idx < static_cast<int>(ud->runtime_states->size())) {
+                auto* seq_states = (*ud->runtime_states)[static_cast<size_t>(seq_idx)];
+                if (seq_states && ud->ssm_ordinal < static_cast<int>(seq_states->size())) {
+                    conv_state = (*seq_states)[static_cast<size_t>(ud->ssm_ordinal)].conv_state.data();
+                }
+            }
+        }
+        if (!conv_state) {
+            continue;
+        }
+        densecore::hwy_kernels::SSMConv1DDecode_Hwy(conv_state, &input[t * ud->channels], ud->weight,
                                                     &output[t * ud->channels], ud->channels, ud->kernel_size);
     }
 }
@@ -5715,7 +5848,12 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
                                 const struct ggml_tensor* c, int ith, int nth, void* userdata) {
     (void)nth;
     if (ith != 0) return;
-
+    if (IsMoEDebugLoggingEnabled()) {
+        static std::atomic<int> ssm_call_count{0};
+        int ssm_id = ssm_call_count.fetch_add(1);
+        fprintf(stderr, "[DBG] cb_ssm_delta #%d a=[%lld,%lld]\n",
+                ssm_id, (long long)a->ne[0], (long long)a->ne[1]);
+    }
     auto* ud = static_cast<SSMQwen35DeltaUserData*>(userdata);
     const float* qkv_conv = reinterpret_cast<const float*>(a->data);
     const float* z_proj = reinterpret_cast<const float*>(b->data);
@@ -5765,7 +5903,20 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
             const float* v_head = v_base + h * head_v_dim;
             const float* alpha_row = ud->alpha_weight + static_cast<size_t>(h) * ud->n_embd;
             const float* beta_row = ud->beta_weight + static_cast<size_t>(h) * ud->n_embd;
-            float* state = ud->ssm_state + static_cast<size_t>(h) * state_stride;
+            float* ssm_state_base = ud->ssm_state;
+            if (ud->runtime_states && ud->token_seq_ids && ud->ssm_ordinal >= 0) {
+                const int seq_idx = ud->token_seq_ids[t];
+                if (seq_idx >= 0 && seq_idx < static_cast<int>(ud->runtime_states->size())) {
+                    auto* seq_states = (*ud->runtime_states)[static_cast<size_t>(seq_idx)];
+                    if (seq_states && ud->ssm_ordinal < static_cast<int>(seq_states->size())) {
+                        ssm_state_base = (*seq_states)[static_cast<size_t>(ud->ssm_ordinal)].ssm_state.data();
+                    }
+                }
+            }
+            if (!ssm_state_base) {
+                continue;
+            }
+            float* state = ssm_state_base + static_cast<size_t>(h) * state_stride;
             float* y_head = y.data() + static_cast<size_t>(h) * head_v_dim;
 
             float alpha = ud->dt_bias[h];
@@ -6054,8 +6205,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
         cur = apply_weighted_rms_norm(cur, attn_norm, "attn_norm");
 
         // SSM / Attention layer dispatch
-        const bool is_ssm_layer = model->arch_flags.is_hybrid_ssm &&
-                                  (il % model->ssm_full_attn_interval != model->ssm_full_attn_interval - 1);
+        const bool is_ssm_layer = model->IsHybridSSMLayer(il);
         struct ggml_tensor* attn_out = nullptr;
         struct ggml_tensor* attn_post_residual = nullptr;
 
@@ -6094,11 +6244,14 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
 
             // 2. Conv1D: updates conv_state ring buffer, outputs [conv_channels, N]
             SSMConv1DUserData* conv_ud = GetSSMConv1DUserData();
-            conv_ud->conv_state = ssm_rt.conv_state.data();
+            conv_ud->conv_state = nullptr;
             conv_ud->weight = !ssm_rt.conv1d_f32.empty() ? ssm_rt.conv1d_f32.data()
                                                          : reinterpret_cast<const float*>(ssm_conv1d_w->data);
             conv_ud->channels = conv_channels;
             conv_ud->kernel_size = conv_kernel;
+            conv_ud->ssm_ordinal = ssm_ordinal;
+            conv_ud->token_seq_ids = batch.seq_id.data();
+            conv_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
             struct ggml_tensor* qkv_conv = ggml_map_custom1(ctx_c, qkv_mixed, cb_ssm_conv1d, 1, conv_ud);
             qkv_conv = ggml_silu(ctx_c, qkv_conv);
 
@@ -6113,7 +6266,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 !ssm_rt.ssm_a_f32.empty() ? ssm_rt.ssm_a_f32.data() : reinterpret_cast<const float*>(ssm_a->data);
             scan_ud->norm_weight =
                 !ssm_rt.norm_f32.empty() ? ssm_rt.norm_f32.data() : reinterpret_cast<const float*>(ssm_norm_w->data);
-            scan_ud->ssm_state = ssm_rt.ssm_state.data();
+            scan_ud->ssm_state = nullptr;
             scan_ud->n_embd = n_embd;
             scan_ud->d_inner = d_inner;
             scan_ud->n_heads = num_v_heads;
@@ -6121,6 +6274,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             scan_ud->head_dim_k = head_dim_k;
             scan_ud->n_groups = n_groups;
             scan_ud->norm_eps = model->hparams.f_norm_rms_eps;
+            scan_ud->ssm_ordinal = ssm_ordinal;
+            scan_ud->token_seq_ids = batch.seq_id.data();
+            scan_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
             struct ggml_tensor* y_scratch = ggml_map_custom3(ctx_c, qkv_conv, z, cur, cb_ssm_qwen35_delta, 1, scan_ud);
             struct ggml_tensor* y = ggml_cont(ctx_c, ggml_view_2d(ctx_c, y_scratch, d_inner, N, y_scratch->nb[1], 0));
 
@@ -6140,7 +6296,11 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             const bool use_glm_dsa_mla =
                 model->arch_flags.is_glm_dsa && q_a && q_a_norm && q_b && kv_a && kv_a_norm && kv_b;
             if (!use_glm_dsa_mla && (!wq || !wk || !wv)) {
-                throw densecore::InvalidArgumentException("Missing Q/K/V weights in TransformerLayer");
+                const std::string hint = model->arch_flags.is_hybrid_ssm
+                    ? " (hybrid SSM model: layer may be misclassified — check layer_types in GGUF)"
+                    : "";
+                throw densecore::InvalidArgumentException(
+                    "Missing Q/K/V weights in TransformerLayer " + std::to_string(il) + hint);
             }
             struct ggml_tensor* Qcur = nullptr;
             struct ggml_tensor* Kcur = nullptr;

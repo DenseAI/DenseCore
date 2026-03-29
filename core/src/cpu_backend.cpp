@@ -2153,15 +2153,13 @@ void CpuBackend::StartRebalanceThread(int interval_ms, int top_k, bool enable_pa
 }
 
 void CpuBackend::StopRebalanceThread() {
-    if (!rebalance_running_.load()) {
-        return;  // Not running
-    }
-
     rebalance_stop_.store(true);
 
     if (rebalance_thread_.joinable()) {
         rebalance_thread_.join();
     }
+
+    rebalance_running_.store(false);
 }
 
 void CpuBackend::InitMoEProfiler(int n_experts, float ema_alpha) {
@@ -2582,7 +2580,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                             const std::vector<ExpertWeights>& experts, Tensor* output) {
     const int batch_size = routing.batch_size;
     const int top_k = routing.top_k;
-    const size_t hidden_dim = input.shape[1];
+    // input from GgmlToTensor preserves ggml column-major: shape[0]=ne[0]=n_embd, shape[1]=ne[1]=N
+    const size_t hidden_dim = input.shape[0];
     const int num_experts = static_cast<int>(experts.size());
     const size_t assignment_count = routing.expert_ids.size();
 
@@ -2626,6 +2625,10 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
     static thread_local AlignedScratch routing_scratch;
     static thread_local AlignedScratch expert_input_scratch;
     static thread_local AlignedScratch expert_output_scratch;
+    // Dequantization scratch buffers for Q4K/Q6K expert weights
+    static thread_local AlignedScratch w1_dequant;
+    static thread_local AlignedScratch w2_dequant;
+    static thread_local AlignedScratch w3_dequant;
 
     // =========================================================================
     // Step 4: Group assignments by expert for batched dispatch (no allocations)
@@ -2680,15 +2683,42 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
 
         const ExpertWeights& exp = experts[expert_id];
 
-        Tensor w1 = Tensor::Make2D(exp.w1.ptr, static_cast<int64_t>(exp.intermediate_dim),
-                                   static_cast<int64_t>(exp.hidden_dim));
-        Tensor w2 = Tensor::Make2D(exp.w2.ptr, static_cast<int64_t>(exp.hidden_dim),
-                                   static_cast<int64_t>(exp.intermediate_dim));
+        // Helper: create F32 Tensor from expert weight, dequantizing if needed.
+        // For Q4K/Q6K weights the raw data is compressed; MatMulTransB requires F32.
+        auto make_weight_f32 = [&](void* ptr, int ggml_type_id, int64_t rows, int64_t cols,
+                                   AlignedScratch& scratch) -> Tensor {
+            if (!ptr || rows <= 0 || cols <= 0) {
+                return Tensor::Make2D(ptr, rows, cols);
+            }
+            const ggml_type wtype = static_cast<ggml_type>(ggml_type_id);
+            if (wtype == GGML_TYPE_F32) {
+                return Tensor::Make2D(ptr, rows, cols);
+            }
+            const struct ggml_type_traits* traits = ggml_get_type_traits(wtype);
+            if (!traits || !traits->to_float) {
+                return Tensor::Make2D(ptr, rows, cols);  // fallback: treat as F32
+            }
+            const size_t row_bytes = ggml_row_size(wtype, cols);
+            scratch.Resize(this, static_cast<size_t>(rows * cols));
+            const char* src = static_cast<const char*>(ptr);
+            for (int64_t r = 0; r < rows; ++r) {
+                traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes),
+                                 scratch.ptr + r * cols, static_cast<int64_t>(cols));
+            }
+            return Tensor::Make2D(scratch.ptr, rows, cols);
+        };
 
+        Tensor w1 = make_weight_f32(exp.w1.ptr, exp.w1_type,
+                                    static_cast<int64_t>(exp.intermediate_dim),
+                                    static_cast<int64_t>(exp.hidden_dim), w1_dequant);
+        Tensor w2 = make_weight_f32(exp.w2.ptr, exp.w2_type,
+                                    static_cast<int64_t>(exp.hidden_dim),
+                                    static_cast<int64_t>(exp.intermediate_dim), w2_dequant);
         Tensor w3;
         if (exp.w3.ptr != nullptr) {
-            w3 = Tensor::Make2D(exp.w3.ptr, static_cast<int64_t>(exp.intermediate_dim),
-                                static_cast<int64_t>(exp.hidden_dim));
+            w3 = make_weight_f32(exp.w3.ptr, exp.w3_type,
+                                 static_cast<int64_t>(exp.intermediate_dim),
+                                 static_cast<int64_t>(exp.hidden_dim), w3_dequant);
         }
 
         float* expert_input_buf = packed_input + static_cast<size_t>(start) * hidden_dim;

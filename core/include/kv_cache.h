@@ -110,6 +110,12 @@ struct BlockManager {
     // Maps block_id -> token sequence stored in that block
     // Protected by prefix_mu (usually accessed together)
     std::unordered_map<int, std::vector<int>> block_tokens;
+    std::unordered_map<int, std::vector<TransformerModel::SSMSequenceRuntimeState>> block_hybrid_ssm_snapshots;
+
+    struct PrefixCacheMatch {
+        int cached_tokens = 0;
+        std::vector<int> cached_block_ids;
+    };
 
     // Constructor
     BlockManager(int num_blocks, int block_size);
@@ -178,11 +184,22 @@ struct BlockManager {
     // Returns block_id if verified match, -1 otherwise
     int FindCachedBlockWithVerification(uint64_t hash, const int* tokens, int n_tokens);
 
+    // Find the longest reusable full-block prefix for a prompt.
+    // Returns only full BLOCK_SIZE chunks and always leaves at least one token
+    // to execute, so prompt-end logits are still computed normally.
+    PrefixCacheMatch FindLongestCachedPrefixWithVerification(const int* tokens, int n_tokens,
+                                                             bool require_hybrid_ssm_snapshot);
+
     // Register a block in prefix cache
     void RegisterPrefixBlock(int block_id, uint64_t hash);
 
     // Register a block with token storage for collision verification
-    void RegisterPrefixBlockWithTokens(int block_id, uint64_t hash, const int* tokens, int n_tokens);
+    void RegisterPrefixBlockWithTokens(
+        int block_id, uint64_t hash, const int* tokens, int n_tokens,
+        const std::vector<TransformerModel::SSMSequenceRuntimeState>* hybrid_ssm_snapshot = nullptr);
+
+    bool LoadHybridSSMSnapshotForBlock(int block_id,
+                                       std::vector<TransformerModel::SSMSequenceRuntimeState>* out_snapshot);
 
     // Remove a block from prefix cache
     void UnregisterPrefixBlock(int block_id);

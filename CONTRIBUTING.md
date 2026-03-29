@@ -32,13 +32,13 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 ## DenseCore Design Philosophy
 
-DenseCore's mission is **GPU-free LLM inference** that is **cloud-native** and **production-ready**.
+DenseCore's mission is a **memory-centric inference runtime for heterogeneous AI execution** with **CPU-first design**, **graceful fallback**, and **production-capable serving surfaces**.
 
 When contributing, please keep these principles in mind:
 
-- **CPU/Apple Silicon First**: We prioritize CPU and Apple Silicon optimizations. GPU support is welcome but must include CPU fallback.
-- **Cloud-Native**: Stateless design, observable (metrics/logs), configurable via environment variables.
-- **Quality**: Tests, documentation, and clean code are expected.
+- **CPU-First, Heterogeneous by Design**: Optimize CPU and locality-sensitive paths first. Additional backends are welcome when they preserve fallback correctness.
+- **Cloud-Native Serving Surfaces**: Keep the server observable, configurable, and operationally disciplined.
+- **Quality and Honesty**: Tests, documentation, explicit feature maturity, and reproducible benchmark claims are expected.
 
 ---
 
