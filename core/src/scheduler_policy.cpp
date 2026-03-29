@@ -25,6 +25,15 @@ bool EqualsIgnoreCase(const char* lhs, const char* rhs) {
     return *lhs == '\0' && *rhs == '\0';
 }
 
+uint64_t MixRequestKey(uint64_t value) {
+    // SplitMix64-derived mixer to avoid pathological low-ID bias such as
+    // request_key=0 always mapping to the most strict branch.
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
 }  // namespace
 
 bool ParseEnvBool(const char* value, bool default_value) {
@@ -100,9 +109,21 @@ int CountNewExperts(const std::vector<int>& experts, const std::unordered_set<in
     return new_experts;
 }
 
+float ComputeMoEDeferScore(int request_key) {
+    const uint64_t mixed = MixRequestKey(static_cast<uint64_t>(static_cast<uint32_t>(request_key)));
+    constexpr double kScale = 1.0 / static_cast<double>(UINT64_C(0xFFFFFFFFFFFFFFFF));
+    return static_cast<float>(static_cast<double>(mixed) * kScale);
+}
+
 bool ShouldDeferForMoEBudget(int request_key, const std::vector<int>& experts,
                              const std::unordered_set<int>& active_experts, const SchedulerConfig& config) {
     if (!config.enable_moe_clustering || experts.empty()) {
+        return false;
+    }
+    if (active_experts.empty()) {
+        // Never starve the first runnable request in an iteration. Locality
+        // optimization starts only after a seed request establishes the active
+        // expert set for that batch.
         return false;
     }
 
@@ -118,8 +139,7 @@ bool ShouldDeferForMoEBudget(int request_key, const std::vector<int>& experts,
     if (strictness >= 1.0f) {
         return true;
     }
-    const float rand_val = static_cast<float>(request_key % 100) / 100.0f;
-    return rand_val < strictness;
+    return ComputeMoEDeferScore(request_key) < strictness;
 }
 
 }  // namespace densecore::scheduler_internal

@@ -431,6 +431,7 @@ SchedulerConfig CreateThroughputConfig() {
     config.max_prefill_tokens = 1024;
     config.enable_mixed_prefill_decode = true;
     config.max_mixed_prefill_tokens = 128;
+    config.enable_moe_clustering = true;
     return config;
 }
 

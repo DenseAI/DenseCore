@@ -650,8 +650,24 @@ CpuBackend::MoERuntimeStatsSnapshot CpuBackend::GetMoERuntimeStatsSnapshot() con
     snapshot.total_reuse_intersection = moe_stats_total_reuse_intersection_.load(std::memory_order_relaxed);
     snapshot.total_reuse_union = moe_stats_total_reuse_union_.load(std::memory_order_relaxed);
     snapshot.total_max_expert_batch = moe_stats_total_max_expert_batch_.load(std::memory_order_relaxed);
+    snapshot.total_ordering_considered = moe_stats_total_ordering_considered_.load(std::memory_order_relaxed);
+    snapshot.total_ordering_applied = moe_stats_total_ordering_applied_.load(std::memory_order_relaxed);
+    snapshot.total_ordering_skipped_small_batch =
+        moe_stats_total_ordering_skipped_small_batch_.load(std::memory_order_relaxed);
+    snapshot.total_ordering_skipped_low_reuse =
+        moe_stats_total_ordering_skipped_low_reuse_.load(std::memory_order_relaxed);
+    snapshot.total_ordering_numa_switches_before =
+        moe_stats_total_ordering_numa_switches_before_.load(std::memory_order_relaxed);
+    snapshot.total_ordering_numa_switches_after =
+        moe_stats_total_ordering_numa_switches_after_.load(std::memory_order_relaxed);
+    snapshot.total_prefetch_candidates = moe_stats_total_prefetch_candidates_.load(std::memory_order_relaxed);
     snapshot.total_prefetch_calls = moe_stats_total_prefetch_calls_.load(std::memory_order_relaxed);
     snapshot.total_prefetch_bytes = moe_stats_total_prefetch_bytes_.load(std::memory_order_relaxed);
+    snapshot.total_prefetch_skipped_distance =
+        moe_stats_total_prefetch_skipped_distance_.load(std::memory_order_relaxed);
+    snapshot.total_prefetch_skipped_pressure =
+        moe_stats_total_prefetch_skipped_pressure_.load(std::memory_order_relaxed);
+    snapshot.total_prefetch_skipped_signal = moe_stats_total_prefetch_skipped_signal_.load(std::memory_order_relaxed);
     snapshot.total_cached_experts = moe_stats_total_cached_experts_.load(std::memory_order_relaxed);
     snapshot.total_dequantized_experts = moe_stats_total_dequantized_experts_.load(std::memory_order_relaxed);
     snapshot.total_dequantized_bytes = moe_stats_total_dequantized_bytes_.load(std::memory_order_relaxed);

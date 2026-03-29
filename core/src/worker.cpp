@@ -256,6 +256,52 @@ void EngineLoop(EngineState* state) {
             decode_graph_lru.splice(decode_graph_lru.begin(), decode_graph_lru, entry->lru_it);
             entry->lru_it = decode_graph_lru.begin();
         };
+        auto reap_finished_requests = [&]() {
+            std::vector<Request*> finished_requests;
+            {
+                std::lock_guard<std::mutex> lock(state->active_mu);
+                size_t write_idx = 0;
+                for (Request* req : state->active_requests) {
+                    if (req && !req->finished) {
+                        state->active_requests[write_idx++] = req;
+                    } else if (req) {
+                        finished_requests.push_back(req);
+                    }
+                }
+                state->active_requests.resize(write_idx);
+            }
+
+            if (finished_requests.empty()) {
+                return;
+            }
+
+            state->metrics.active_requests.fetch_sub(static_cast<int>(finished_requests.size()), std::memory_order_relaxed);
+            for (Request* req : finished_requests) {
+                state->request_pool.Release(req);
+            }
+
+            std::lock_guard<std::mutex> cv_lock(state->cv_mu);
+            state->queue_cv.notify_one();
+        };
+        auto reset_empty_schedule_watchdog = [&]() {
+            {
+                std::lock_guard<std::mutex> active_lock(state->active_mu);
+                for (Request* req : state->active_requests) {
+                    if (!req || req->finished) {
+                        continue;
+                    }
+                    req->empty_schedule_stall_count = 0;
+                }
+            }
+            std::lock_guard<std::mutex> watchdog_lock(state->scheduler_watchdog_mu);
+            state->empty_schedule_watchdog.consecutive_loops = 0;
+            state->empty_schedule_watchdog.first_seen = std::chrono::steady_clock::time_point();
+            state->empty_schedule_watchdog.last_seen = std::chrono::steady_clock::time_point();
+            state->empty_schedule_watchdog.last_log = std::chrono::steady_clock::time_point();
+        };
+        static constexpr auto kEmptyScheduleWarnAfter = std::chrono::milliseconds(250);
+        static constexpr auto kEmptyScheduleLogEvery = std::chrono::seconds(1);
+        static constexpr auto kEmptyScheduleFailAfter = std::chrono::seconds(2);
 
         while (state->status != EngineStatus::STOPPED) {
             const bool global_bench_fast_path = IsBenchmarkFastPathEnabled();
@@ -524,6 +570,8 @@ void EngineLoop(EngineState* state) {
                         std::lock_guard<std::mutex> active_lock(state->active_mu);
                         state->active_requests.push_back(req);
                     }
+                    req->empty_schedule_stall_count = 0;
+                    req->last_progress_time = req->start_time;
                     state->metrics.active_requests++;
                     state->metrics.total_requests++;
                     LOG_TRACE("Request {} moved to active", req->id);
@@ -767,13 +815,117 @@ void EngineLoop(EngineState* state) {
             //   - Balances power efficiency with responsiveness
             // =========================================================================
             if (sched_output.IsEmpty()) {
-                bool has_active;
+                bool has_active = false;
+                uint64_t watchdog_loops = 0;
+                long stall_ms = 0;
+                long oldest_idle_ms = 0;
+                bool should_log = false;
+                bool should_fail = false;
+                std::vector<Request*> stalled_requests;
+                const auto now = std::chrono::steady_clock::now();
                 {
                     std::lock_guard<std::mutex> lock(state->active_mu);
-                    has_active = !state->active_requests.empty();
+                    for (Request* req : state->active_requests) {
+                        if (!req || req->finished) {
+                            continue;
+                        }
+                        has_active = true;
+                        const auto last_progress =
+                            (req->last_progress_time == std::chrono::steady_clock::time_point()) ? req->start_time
+                                                                                                  : req->last_progress_time;
+                        const long idle_ms =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_progress).count();
+                        oldest_idle_ms = std::max(oldest_idle_ms, idle_ms);
+                        if (idle_ms < std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleWarnAfter).count()) {
+                            continue;
+                        }
+                        req->empty_schedule_stall_count++;
+                        stalled_requests.push_back(req);
+                    }
                 }
 
                 if (has_active) {
+                    if (!stalled_requests.empty()) {
+                        std::lock_guard<std::mutex> watchdog_lock(state->scheduler_watchdog_mu);
+                        auto& watchdog = state->empty_schedule_watchdog;
+                        if (watchdog.consecutive_loops == 0) {
+                            watchdog.first_seen = now;
+                        }
+                        watchdog.last_seen = now;
+                        watchdog.consecutive_loops++;
+                        watchdog_loops = watchdog.consecutive_loops;
+                        stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(watchdog.last_seen -
+                                                                                         watchdog.first_seen)
+                                       .count();
+                        if (stall_ms >= std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleFailAfter)
+                                            .count()) {
+                            should_fail = true;
+                            watchdog.failure_count++;
+                            watchdog.last_log = now;
+                        } else if (stall_ms >=
+                                       std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleWarnAfter)
+                                           .count() &&
+                                   (watchdog.last_log == std::chrono::steady_clock::time_point() ||
+                                    now - watchdog.last_log >= kEmptyScheduleLogEvery)) {
+                            should_log = true;
+                            watchdog.last_log = now;
+                        }
+                    } else {
+                        reset_empty_schedule_watchdog();
+                    }
+
+                    if (should_log || should_fail) {
+                        const std::string scheduler_state = state->DescribeSchedulerState();
+                        const std::string active_state = state->DescribeActiveRequests();
+                        if (should_fail) {
+                            LOG_ERROR("Broken scheduling state detected after {} ms (loops={}, oldest_idle_ms={}). {} {}",
+                                      stall_ms, watchdog_loops, oldest_idle_ms, scheduler_state, active_state);
+                            for (Request* req : stalled_requests) {
+                                if (!req || req->finished) {
+                                    continue;
+                                }
+                                const auto last_progress =
+                                    (req->last_progress_time == std::chrono::steady_clock::time_point()) ? req->start_time
+                                                                                                          : req->last_progress_time;
+                                const long idle_ms =
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(now - last_progress).count();
+                                LOG_ERROR(
+                                    "Failing stalled request {} (seq_id={}, prefill={}, tokens={}, n_past={}, "
+                                    "generated={}, empty_loops={}, idle_ms={})",
+                                    req->id, req->seq_id, req->is_prefill, req->tokens.size(), req->n_past,
+                                    req->generated_count, req->empty_schedule_stall_count, idle_ms);
+                                req->finished = true;
+                                state->metrics.failed_requests++;
+                                emit_result_event(req, "Error: Scheduler stalled while request remained active", -1,
+                                                  true, true);
+                                if (!req->block_table.empty()) {
+                                    current_kv_cache->block_manager->Free(req->block_table);
+                                    req->block_table.clear();
+                                }
+                                if (req->seq_id >= 0) {
+                                    state->scheduler->RemoveRequest(req->seq_id, false);
+                                    seq_to_request.erase(req->seq_id);
+                                }
+                                {
+                                    std::lock_guard<std::mutex> lk(req->mu);
+                                    req->cv.notify_all();
+                                }
+                            }
+                            std::lock_guard<std::mutex> cv_lock(state->cv_mu);
+                            state->queue_cv.notify_one();
+                        } else {
+                            LOG_WARN(
+                                "Scheduler returned empty batch with stalled active requests for {} ms (loops={}, "
+                                "oldest_idle_ms={}). {} {}",
+                                stall_ms, watchdog_loops, oldest_idle_ms, scheduler_state, active_state);
+                        }
+                    }
+
+                    if (should_fail) {
+                        reap_finished_requests();
+                        continue;
+                    }
+
                     // Active requests exist but scheduler couldn't schedule them
                     // Wait with VERY short timeout for latency-sensitive operation
                     std::unique_lock<std::mutex> lock(state->cv_mu);
@@ -782,6 +934,8 @@ void EngineLoop(EngineState* state) {
                         return !state->pending_requests.Empty() || state->status != EngineStatus::RUNNING;
                     });
                 } else {
+                    reap_finished_requests();
+                    reset_empty_schedule_watchdog();
                     // No active requests and scheduler empty - truly nothing to do
                     // Use slightly longer wait to save power
                     std::unique_lock<std::mutex> lock(state->cv_mu);
@@ -791,6 +945,8 @@ void EngineLoop(EngineState* state) {
                 }
                 continue;
             }
+
+            reset_empty_schedule_watchdog();
 
             // 8. Form BatchSpec from SchedulerOutput
             BatchSpec batch;
@@ -2103,6 +2259,8 @@ void EngineLoop(EngineState* state) {
                     if (req->is_prefill) {
                         const int remaining_prompt_tokens = static_cast<int>(req->tokens.size());
                         req->n_past += processed_count;
+                        req->empty_schedule_stall_count = 0;
+                        req->last_progress_time = std::chrono::steady_clock::now();
                         if (!global_bench_fast_path && req->seq_id >= 0) {
                             state->scheduler->UpdateProgress(req->seq_id, processed_count);
                         }
@@ -2244,6 +2402,8 @@ void EngineLoop(EngineState* state) {
                         }
                         req->n_past += processed_count;
                         auto now = std::chrono::steady_clock::now();
+                        req->empty_schedule_stall_count = 0;
+                        req->last_progress_time = now;
                         auto itl_us =
                             std::chrono::duration_cast<std::chrono::microseconds>(now - req->last_token_time).count();
                         state->metrics.RecordITL(itl_us);
@@ -2316,29 +2476,7 @@ void EngineLoop(EngineState* state) {
 
             // 11. Sync active_requests: remove finished requests
             // Also signal queue_cv when requests finish (frees memory for scheduler)
-            {
-                bool any_finished = false;
-                std::lock_guard<std::mutex> lock(state->active_mu);
-                auto it = state->active_requests.begin();
-                while (it != state->active_requests.end()) {
-                    Request* req = *it;
-                    if (req->finished) {
-                        it = state->active_requests.erase(it);
-                        state->metrics.active_requests--;
-                        state->request_pool.Release(req);
-                        any_finished = true;
-                    } else {
-                        ++it;
-                    }
-                }
-
-                // Signal queue_cv when requests finish - wakes scheduler if it's
-                // waiting due to memory fragmentation (freed blocks now available)
-                if (any_finished) {
-                    std::lock_guard<std::mutex> cv_lock(state->cv_mu);
-                    state->queue_cv.notify_one();
-                }
-            }
+            reap_finished_requests();
         }
         clear_decode_graph_cache();
     } catch (const densecore::DenseCoreException& e) {

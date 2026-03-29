@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <sstream>
 #include <stack>
 #include <string>
 #include <thread>
@@ -279,6 +280,8 @@ struct Request {
     int priority = 100;
     bool is_high_priority = false;
     int estimated_length = 0;
+    uint64_t empty_schedule_stall_count = 0;
+    std::chrono::steady_clock::time_point last_progress_time{};
 
     // Scheduler sequence ID (assigned by scheduler->AddRequest)
     // -1 indicates not yet registered with scheduler
@@ -337,6 +340,8 @@ struct Request {
         priority = 100;
         is_high_priority = false;
         estimated_length = 0;
+        empty_schedule_stall_count = 0;
+        last_progress_time = std::chrono::steady_clock::time_point();
         seq_id = -1;
         // Universal Engine Reset
         is_graph_execution = false;
@@ -574,6 +579,16 @@ struct EngineState {
     std::thread worker_thread;
     std::atomic<EngineStatus> status{EngineStatus::RUNNING};
 
+    struct EmptyScheduleWatchdog {
+        uint64_t consecutive_loops = 0;
+        uint64_t failure_count = 0;
+        std::chrono::steady_clock::time_point first_seen;
+        std::chrono::steady_clock::time_point last_seen;
+        std::chrono::steady_clock::time_point last_log;
+    };
+    std::mutex scheduler_watchdog_mu;
+    EmptyScheduleWatchdog empty_schedule_watchdog;
+
     // Metrics
     InternalMetrics metrics;
 
@@ -643,6 +658,47 @@ struct EngineState {
             compute_buffer.reset(static_cast<char*>(ptr));
             compute_buffer_initialized = true;
         }
+    }
+
+    std::string DescribeSchedulerState() {
+        if (!scheduler) return "scheduler=unavailable";
+        const auto stats = scheduler->GetStats();
+        std::ostringstream oss;
+        oss << "scheduler(waiting=" << stats.waiting_count << ", running=" << stats.running_count
+            << ", swapped=" << stats.swapped_count << ", mem_usage=" << stats.memory_usage << ")";
+        return oss.str();
+    }
+
+    std::string DescribeActiveRequests() {
+        std::lock_guard<std::mutex> lock(active_mu);
+        std::ostringstream oss;
+        oss << "active_requests=" << active_requests.size();
+        for (Request* req : active_requests) {
+            if (!req) continue;
+            oss << " [id=" << req->id << " seq=" << req->seq_id << " prefill=" << (req->is_prefill ? 1 : 0)
+                << " finished=" << (req->finished ? 1 : 0)
+                << " cancelled=" << (req->cancelled.load(std::memory_order_relaxed) ? 1 : 0)
+                << " swapped=" << (req->is_swapped ? 1 : 0) << " tokens=" << req->tokens.size()
+                << " n_past=" << req->n_past << " generated=" << req->generated_count
+                << " empty_loops=" << req->empty_schedule_stall_count << "]";
+        }
+        return oss.str();
+    }
+
+    std::string DescribeEmptyScheduleWatchdog() {
+        std::lock_guard<std::mutex> lock(scheduler_watchdog_mu);
+        std::ostringstream oss;
+        oss << "empty_schedule_watchdog(loops=" << empty_schedule_watchdog.consecutive_loops
+            << ", failures=" << empty_schedule_watchdog.failure_count;
+        if (empty_schedule_watchdog.consecutive_loops > 0 &&
+            empty_schedule_watchdog.first_seen != std::chrono::steady_clock::time_point()) {
+            const auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      empty_schedule_watchdog.last_seen - empty_schedule_watchdog.first_seen)
+                                      .count();
+            oss << ", stall_ms=" << stall_ms;
+        }
+        oss << ")";
+        return oss.str();
     }
 
     /**
@@ -852,10 +908,14 @@ struct EngineState {
                     void* user_data = nullptr;
                 };
                 std::vector<ShutdownCallback> shutdown_callbacks;
+                const std::string scheduler_state = DescribeSchedulerState();
+                const std::string watchdog_state = DescribeEmptyScheduleWatchdog();
+                const std::string active_state = DescribeActiveRequests();
                 {
                     std::lock_guard<std::mutex> lock(active_mu);
                     LOG_WARN("Shutdown timeout after 5 seconds. Force-killing ", active_requests.size(),
                              " active requests.");
+                    LOG_WARN("Shutdown diagnostics: {} {} {}", scheduler_state, watchdog_state, active_state);
                     // Mark remaining requests as finished to allow cleanup
                     for (Request* req : active_requests) {
                         req->finished = true;

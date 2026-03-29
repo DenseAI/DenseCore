@@ -3621,6 +3621,7 @@ inline void UpdateOutput_NEON(float* O, const float* PV, const float* alpha, con
 
 inline void ComputeQK(const float* Q, const float* K, float* S, int q_len, int kv_len, int head_dim, float scale) {
     static const SimdLevel level = DetectSimdLevel();
+    (void)level;
 #if defined(__ARM_FEATURE_SVE)
     if (HasArmSveOrBetter(level)) {
         ComputeQK_SVE(Q, K, S, q_len, kv_len, head_dim, scale);
@@ -3644,6 +3645,7 @@ inline void ComputeQK(const float* Q, const float* K, float* S, int q_len, int k
 
 inline void ApplyMask(float* S, int q_start, int kv_start, int q_len, int kv_len) {
     static const SimdLevel level = DetectSimdLevel();
+    (void)level;
 #if defined(__ARM_FEATURE_SVE)
     if (HasArmSveOrBetter(level)) {
         ApplyMask_SVE(S, q_start, kv_start, q_len, kv_len);
@@ -3665,6 +3667,7 @@ inline void ApplyMask(float* S, int q_start, int kv_start, int q_len, int kv_len
 
 inline void SoftmaxBlock(float* S, float* row_max, float* row_sum, int q_len, int kv_len, bool first_block) {
     static const SimdLevel level = DetectSimdLevel();
+    (void)level;
 #if defined(__ARM_FEATURE_SVE)
     if (HasArmSveOrBetter(level)) {
         SoftmaxBlock_SVE(S, row_max, row_sum, q_len, kv_len, first_block);
@@ -3686,6 +3689,7 @@ inline void SoftmaxBlock(float* S, float* row_max, float* row_sum, int q_len, in
 
 inline void ComputePV(const float* P, const float* V, float* O, int q_len, int kv_len, int head_dim) {
     static const SimdLevel level = DetectSimdLevel();
+    (void)level;
 #if defined(__ARM_FEATURE_SVE)
     if (HasArmSveOrBetter(level)) {
         ComputePV_SVE(P, V, O, q_len, kv_len, head_dim);
@@ -3707,6 +3711,7 @@ inline void ComputePV(const float* P, const float* V, float* O, int q_len, int k
 
 inline void UpdateOutput(float* O, const float* PV, const float* alpha, const float* beta, int q_len, int head_dim) {
     static const SimdLevel level = DetectSimdLevel();
+    (void)level;
 #if defined(__ARM_FEATURE_SVE)
     if (HasArmSveOrBetter(level)) {
         UpdateOutput_SVE(O, PV, alpha, beta, q_len, head_dim);

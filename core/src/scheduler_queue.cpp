@@ -67,6 +67,7 @@ void Scheduler::ScheduleRunning(SchedulerOutput& output) {
     std::vector<uint8_t> scheduled(running_ids.size(), 0);
     while (true) {
         int best_index = -1;
+        int fallback_index = -1;
         int best_priority = std::numeric_limits<int>::max();
         int best_overlap = -1;
         int best_new_experts = std::numeric_limits<int>::max();
@@ -82,6 +83,10 @@ void Scheduler::ScheduleRunning(SchedulerOutput& output) {
             const int seq_context = GetSequenceContextLen(seq_id);
             if (decode_homogeneous_batch_n_past_ && target_context_len >= 0 && seq_context != target_context_len) {
                 continue;
+            }
+
+            if (fallback_index < 0) {
+                fallback_index = static_cast<int>(idx);
             }
 
             auto experts_it = seq_predicted_experts_.find(seq_id);
@@ -120,6 +125,12 @@ void Scheduler::ScheduleRunning(SchedulerOutput& output) {
                 best_expert_count = expert_count;
                 best_arrival = arrival;
             }
+        }
+
+        if (best_index < 0 && fallback_index >= 0 && output.decode_seq_ids.empty()) {
+            // Production-safe fallback: never let MoE locality filtering leave a
+            // runnable decode iteration completely empty.
+            best_index = fallback_index;
         }
 
         if (best_index < 0 || scheduler_internal::ScheduledSeqCount(output) >= static_cast<size_t>(config_.max_num_seqs) ||
@@ -220,6 +231,7 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
     int target_context_len = output.batch_context_len;
 
     for (auto& group : sorted_queue) {
+        bool deferred_for_moe_budget = false;
         if (scheduler_internal::ScheduledSeqCount(output) >= static_cast<size_t>(config_.max_num_seqs)) {
             still_waiting.push_back(group);
             continue;
@@ -272,13 +284,13 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         if (config_.enable_moe_clustering && !group.predicted_experts.empty()) {
             if (scheduler_internal::ShouldDeferForMoEBudget(group.request_id, group.predicted_experts, active_experts,
                                                             config_)) {
-                still_waiting.push_back(group);
-                continue;
+                deferred_for_moe_budget = true;
             }
+        }
 
-            for (int expert_id : group.predicted_experts) {
-                active_experts.insert(expert_id);
-            }
+        if (deferred_for_moe_budget && !output.prefill_seq_ids.empty()) {
+            still_waiting.push_back(group);
+            continue;
         }
 
         auto& seq_blocks = seq_block_ids_[seq_id];
@@ -330,6 +342,12 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
             LOG_DEBUG("Scheduler: Prefix cache hit for seq ", seq_id, " (", group.shared_prefix_len, " tokens cached)");
             group.shared_prefix_len = 0;
             group.shared_block_ids.clear();
+        }
+
+        if (!group.predicted_experts.empty()) {
+            for (int expert_id : group.predicted_experts) {
+                active_experts.insert(expert_id);
+            }
         }
 
         seq_generated_tokens_[seq_id] = 0;

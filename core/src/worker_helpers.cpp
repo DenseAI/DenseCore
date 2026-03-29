@@ -31,7 +31,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
 
 namespace {
 
-std::string AsciiLowerCopy(const char* value) {
+[[maybe_unused]] std::string AsciiLowerCopy(const char* value) {
     if (!value) return {};
     std::string lowered(value);
     std::transform(lowered.begin(), lowered.end(), lowered.begin(),
@@ -168,7 +168,13 @@ bool IsReasoningTagSuppressionEnabled() {
 bool IsBenchmarkFastPathEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_BENCH_MODE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+        const bool on = env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+        if (on) {
+            std::cerr << "[DenseCore] DENSECORE_BENCH_MODE enabled; benchmark fast-path bypasses normal scheduler "
+                         "behavior and can mask serving-path stalls."
+                      << std::endl;
+        }
+        return on;
     }();
     return enabled;
 }

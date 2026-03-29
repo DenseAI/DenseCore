@@ -82,7 +82,7 @@ bool UseKVBulkSlotPath() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_KV_USE_BULK_PATH");
         if (!env || *env == '\0') {
-            return false;
+            return true;
         }
         return std::strcmp(env, "0") != 0;
     }();

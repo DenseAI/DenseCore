@@ -9,6 +9,7 @@
 #ifndef DENSECORE_INFERENCE_TYPES_INTERNAL_H
 #define DENSECORE_INFERENCE_TYPES_INTERNAL_H
 
+#include "cpu_backend.h"
 #include "kv_cache.h"
 #include "model_types.h"
 #include "scheduler.h"
@@ -16,10 +17,6 @@
 // Forward declarations
 struct ggml_context;
 struct BatchSpec;
-
-namespace densecore {
-class CpuBackend;
-}
 
 #ifndef GGML_KQ_MASK_PAD
 #define GGML_KQ_MASK_PAD 32
@@ -53,6 +50,9 @@ struct MoEUserData {
     densecore::CpuBackend* backend;
     const BatchSpec* batch;
     densecore::Scheduler* scheduler;
+    const densecore::CpuBackend::ExpertWeights* experts = nullptr;
+    int n_experts = 0;
+    bool experts_registered = false;
 };
 
 // Allocate MoE user data from graph context

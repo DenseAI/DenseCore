@@ -162,6 +162,19 @@ inline size_t GetMoEPrefetchBytes() {
     return bytes;
 }
 
+inline int ParseCpuBackendEnvInt(const char* name, int default_value, int min_value) {
+    const char* value = std::getenv(name);
+    if (!value || *value == '\0') {
+        return default_value;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0') {
+        return default_value;
+    }
+    return static_cast<int>(std::max<long>(min_value, parsed));
+}
+
 inline bool IsMoELocalityOrderingEnabled() {
     static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_LOCALITY_ORDERING", false);
     return enabled;
@@ -170,6 +183,36 @@ inline bool IsMoELocalityOrderingEnabled() {
 inline bool IsMoENextExpertPrefetchEnabled() {
     static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_PREFETCH_NEXT_EXPERT", false);
     return enabled;
+}
+
+inline int GetMoELocalityOrderingMinActiveExperts() {
+    static const int value =
+        ParseCpuBackendEnvInt("DENSECORE_MOE_LOCALITY_ORDERING_MIN_ACTIVE_EXPERTS", 3, 2);
+    return value;
+}
+
+inline int GetMoELocalityOrderingMinReuseIntersection() {
+    static const int value =
+        ParseCpuBackendEnvInt("DENSECORE_MOE_LOCALITY_ORDERING_MIN_REUSE_INTERSECTION", 1, 0);
+    return value;
+}
+
+inline int GetMoEPrefetchMinCurrentExpertTokens() {
+    static const int value =
+        ParseCpuBackendEnvInt("DENSECORE_MOE_PREFETCH_MIN_CURRENT_EXPERT_TOKENS", 2, 1);
+    return value;
+}
+
+inline int GetMoEPrefetchMaxActiveExperts() {
+    static const int value =
+        ParseCpuBackendEnvInt("DENSECORE_MOE_PREFETCH_MAX_ACTIVE_EXPERTS", 8, 1);
+    return value;
+}
+
+inline int GetMoEPrefetchMaxThreadCount() {
+    static const int value =
+        ParseCpuBackendEnvInt("DENSECORE_MOE_PREFETCH_MAX_THREAD_COUNT", 32, 1);
+    return value;
 }
 
 inline size_t GetMoEDequantCacheBytes() {

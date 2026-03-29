@@ -88,6 +88,43 @@ TEST(SchedulerArchitecture, DoesNotMixPrefillAndDecodeInSingleStep) {
     EXPECT_TRUE(mixed_check.prefill_seq_ids.empty());
 }
 
+TEST(SchedulerArchitecture, MoEClusteringIsOptInByDefault) {
+    SchedulerConfig cfg;
+    EXPECT_FALSE(cfg.enable_moe_clustering);
+
+    SchedulerConfig throughput_cfg = CreateThroughputConfig();
+    EXPECT_TRUE(throughput_cfg.enable_moe_clustering);
+}
+
+TEST(SchedulerArchitecture, StrictMoEClusteringDoesNotProduceEmptyDecodeBatch) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_moe_clustering = true;
+    cfg.max_active_experts = 1;
+    cfg.moe_batch_strictness = 1.0f;
+
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    const int seq1 = scheduler.AddRequest(/*request_id=*/201, /*prompt_len=*/8, /*max_output_len=*/32);
+    const int seq2 = scheduler.AddRequest(/*request_id=*/202, /*prompt_len=*/8, /*max_output_len=*/32);
+    ASSERT_GT(seq1, 0);
+    ASSERT_GT(seq2, 0);
+
+    SchedulerOutput prefill = scheduler.Schedule();
+    ASSERT_EQ(prefill.prefill_seq_ids.size(), 2u);
+    for (const auto& chunk : prefill.prefill_chunk_info) {
+        scheduler.UpdateProgress(chunk.seq_id, chunk.chunk_tokens);
+    }
+
+    scheduler.SetPredictedExperts(seq1, {1});
+    scheduler.SetPredictedExperts(seq2, {2});
+
+    SchedulerOutput decode = scheduler.Schedule();
+    EXPECT_TRUE(decode.prefill_seq_ids.empty());
+    EXPECT_FALSE(decode.decode_seq_ids.empty());
+    EXPECT_EQ(decode.decode_seq_ids.size(), 1u);
+}
+
 TEST(SchedulerArchitecture, MixedPrefillDecodeCanBeEnabledWithBoundedPrefillChunk) {
     SchedulerConfig cfg = MakeTestConfig();
     cfg.enable_chunked_prefill = true;

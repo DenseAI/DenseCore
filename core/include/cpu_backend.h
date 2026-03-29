@@ -352,8 +352,18 @@ public:
         uint64_t total_reuse_intersection = 0;
         uint64_t total_reuse_union = 0;
         uint64_t total_max_expert_batch = 0;
+        uint64_t total_ordering_considered = 0;
+        uint64_t total_ordering_applied = 0;
+        uint64_t total_ordering_skipped_small_batch = 0;
+        uint64_t total_ordering_skipped_low_reuse = 0;
+        uint64_t total_ordering_numa_switches_before = 0;
+        uint64_t total_ordering_numa_switches_after = 0;
+        uint64_t total_prefetch_candidates = 0;
         uint64_t total_prefetch_calls = 0;
         uint64_t total_prefetch_bytes = 0;
+        uint64_t total_prefetch_skipped_distance = 0;
+        uint64_t total_prefetch_skipped_pressure = 0;
+        uint64_t total_prefetch_skipped_signal = 0;
         uint64_t total_cached_experts = 0;
         uint64_t total_dequantized_experts = 0;
         uint64_t total_dequantized_bytes = 0;
@@ -497,6 +507,8 @@ public:
                     Tensor* output);
     void ForwardMoE(const TransformerLayer* layer_key, const Tensor& input, const moe::MoERouteResult& routing,
                     const std::vector<ExpertWeights>& experts, Tensor* output);
+    void ForwardMoE(const TransformerLayer* layer_key, const Tensor& input, const moe::MoERouteResult& routing,
+                    const ExpertWeights* experts, int num_experts, Tensor* output);
     MoERuntimeStatsSnapshot GetMoERuntimeStatsSnapshot() const;
 
     // ===========================================================================
@@ -581,8 +593,18 @@ private:
     std::atomic<uint64_t> moe_stats_total_reuse_intersection_{0};
     std::atomic<uint64_t> moe_stats_total_reuse_union_{0};
     std::atomic<uint64_t> moe_stats_total_max_expert_batch_{0};
+    std::atomic<uint64_t> moe_stats_total_ordering_considered_{0};
+    std::atomic<uint64_t> moe_stats_total_ordering_applied_{0};
+    std::atomic<uint64_t> moe_stats_total_ordering_skipped_small_batch_{0};
+    std::atomic<uint64_t> moe_stats_total_ordering_skipped_low_reuse_{0};
+    std::atomic<uint64_t> moe_stats_total_ordering_numa_switches_before_{0};
+    std::atomic<uint64_t> moe_stats_total_ordering_numa_switches_after_{0};
+    std::atomic<uint64_t> moe_stats_total_prefetch_candidates_{0};
     std::atomic<uint64_t> moe_stats_total_prefetch_calls_{0};
     std::atomic<uint64_t> moe_stats_total_prefetch_bytes_{0};
+    std::atomic<uint64_t> moe_stats_total_prefetch_skipped_distance_{0};
+    std::atomic<uint64_t> moe_stats_total_prefetch_skipped_pressure_{0};
+    std::atomic<uint64_t> moe_stats_total_prefetch_skipped_signal_{0};
     std::atomic<uint64_t> moe_stats_total_cached_experts_{0};
     std::atomic<uint64_t> moe_stats_total_dequantized_experts_{0};
     std::atomic<uint64_t> moe_stats_total_dequantized_bytes_{0};

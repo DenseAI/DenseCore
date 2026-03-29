@@ -245,18 +245,22 @@ void CpuBackend::DispatchExpertFFN(const TransformerLayer* layer_key, int expert
 
 void CpuBackend::ForwardMoE(const Tensor& input, const moe::MoERouteResult& routing,
                             const std::vector<ExpertWeights>& experts, Tensor* output) {
-    ForwardMoE(nullptr, input, routing, experts, output);
+    ForwardMoE(nullptr, input, routing, experts.data(), static_cast<int>(experts.size()), output);
 }
 
 void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& input, const moe::MoERouteResult& routing,
                             const std::vector<ExpertWeights>& experts, Tensor* output) {
+    ForwardMoE(layer_key, input, routing, experts.data(), static_cast<int>(experts.size()), output);
+}
+
+void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& input, const moe::MoERouteResult& routing,
+                            const ExpertWeights* experts, int num_experts, Tensor* output) {
     const int batch_size = routing.batch_size;
     const int top_k = routing.top_k;
     const size_t hidden_dim = input.shape[0];
-    const int num_experts = static_cast<int>(experts.size());
     const size_t assignment_count = routing.expert_ids.size();
 
-    if (batch_size <= 0 || top_k <= 0 || num_experts <= 0 || assignment_count == 0) {
+    if (!experts || batch_size <= 0 || top_k <= 0 || num_experts <= 0 || assignment_count == 0) {
         return;
     }
     if (routing.weights.size() != assignment_count) {
@@ -290,9 +294,168 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
     static thread_local AlignedScratch w1_dequant;
     static thread_local AlignedScratch w2_dequant;
     static thread_local AlignedScratch w3_dequant;
+    static thread_local AlignedScratch small_decode_output_scratch;
 
     const int total_assignments = static_cast<int>(assignment_count);
     if (total_assignments == 0 || num_experts == 0 || top_k <= 0) {
+        return;
+    }
+
+    const bool has_token_indices = !routing.token_indices.empty();
+    const float* input_data = input.DataAs<float>();
+
+    std::unordered_set<int> small_step_local_hot_experts;
+    std::vector<int> small_step_previous_batch_experts;
+    if (registry) {
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        small_step_local_hot_experts.insert(registry->local_expert_ids.begin(), registry->local_expert_ids.end());
+        small_step_previous_batch_experts = registry->last_batch_experts;
+    }
+
+    const bool small_decode_candidate = batch_size <= 4 && total_assignments <= 8;
+    std::vector<int> small_step_current_batch_experts;
+    small_step_current_batch_experts.reserve(static_cast<size_t>(std::min(total_assignments, num_experts)));
+    int small_step_max_expert_batch = 0;
+    if (small_decode_candidate) {
+        for (int i = 0; i < total_assignments; ++i) {
+            const int expert_id = routing.expert_ids[static_cast<size_t>(i)];
+            if (expert_id < 0 || expert_id >= num_experts) {
+                continue;
+            }
+            bool seen = false;
+            int expert_batch_count = 0;
+            for (int j = 0; j < total_assignments; ++j) {
+                if (routing.expert_ids[static_cast<size_t>(j)] == expert_id) {
+                    ++expert_batch_count;
+                }
+            }
+            small_step_max_expert_batch = std::max(small_step_max_expert_batch, expert_batch_count);
+            for (int existing : small_step_current_batch_experts) {
+                if (existing == expert_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                small_step_current_batch_experts.push_back(expert_id);
+            }
+        }
+    }
+
+    if (small_decode_candidate && small_step_max_expert_batch <= 1 && !small_step_current_batch_experts.empty()) {
+        std::unordered_set<int> previous_batch_set;
+        int reuse_intersection = 0;
+        if (!small_step_previous_batch_experts.empty()) {
+            previous_batch_set.insert(small_step_previous_batch_experts.begin(), small_step_previous_batch_experts.end());
+            for (int expert_id : small_step_current_batch_experts) {
+                if (previous_batch_set.find(expert_id) != previous_batch_set.end()) {
+                    ++reuse_intersection;
+                }
+            }
+        }
+        const int reuse_union = static_cast<int>(small_step_current_batch_experts.size() +
+                                                 small_step_previous_batch_experts.size() - reuse_intersection);
+        int local_hot_count = 0;
+        for (int expert_id : small_step_current_batch_experts) {
+            if (small_step_local_hot_experts.find(expert_id) != small_step_local_hot_experts.end()) {
+                ++local_hot_count;
+            }
+        }
+
+        moe_stats_batches_.fetch_add(1, std::memory_order_relaxed);
+        moe_stats_total_active_experts_.fetch_add(static_cast<uint64_t>(small_step_current_batch_experts.size()),
+                                                  std::memory_order_relaxed);
+        moe_stats_total_assignments_.fetch_add(static_cast<uint64_t>(total_assignments), std::memory_order_relaxed);
+        moe_stats_total_local_hot_experts_.fetch_add(static_cast<uint64_t>(local_hot_count), std::memory_order_relaxed);
+        moe_stats_total_reuse_intersection_.fetch_add(static_cast<uint64_t>(reuse_intersection),
+                                                      std::memory_order_relaxed);
+        moe_stats_total_reuse_union_.fetch_add(static_cast<uint64_t>(std::max(0, reuse_union)),
+                                               std::memory_order_relaxed);
+        moe_stats_total_max_expert_batch_.fetch_add(static_cast<uint64_t>(small_step_max_expert_batch),
+                                                    std::memory_order_relaxed);
+
+        if (registry) {
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            registry->last_batch_experts = small_step_current_batch_experts;
+        }
+
+        auto make_weight_f32_small = [&](void* ptr, int ggml_type_id, int64_t rows, int64_t cols, AlignedScratch& scratch,
+                                         size_t* dequantized_bytes, bool* dequantized_any) -> Tensor {
+            if (!ptr || rows <= 0 || cols <= 0) {
+                return Tensor::Make2D(ptr, rows, cols);
+            }
+            const ggml_type wtype = static_cast<ggml_type>(ggml_type_id);
+            if (wtype == GGML_TYPE_F32) {
+                return Tensor::Make2D(ptr, rows, cols);
+            }
+            const struct ggml_type_traits* traits = ggml_get_type_traits(wtype);
+            if (!traits || !traits->to_float) {
+                return Tensor::Make2D(ptr, rows, cols);
+            }
+            const size_t row_bytes = ggml_row_size(wtype, cols);
+            scratch.Resize(this, static_cast<size_t>(rows * cols));
+            const char* src = static_cast<const char*>(ptr);
+            for (int64_t r = 0; r < rows; ++r) {
+                traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes), scratch.ptr + r * cols, cols);
+            }
+            if (dequantized_bytes) {
+                *dequantized_bytes += static_cast<size_t>(rows * cols * sizeof(float));
+            }
+            if (dequantized_any) {
+                *dequantized_any = true;
+            }
+            return Tensor::Make2D(scratch.ptr, rows, cols);
+        };
+
+        small_decode_output_scratch.Resize(this, hidden_dim);
+        for (int i = 0; i < total_assignments; ++i) {
+            const int expert_id = routing.expert_ids[static_cast<size_t>(i)];
+            if (expert_id < 0 || expert_id >= num_experts) {
+                continue;
+            }
+            const int token_idx = has_token_indices ? routing.token_indices[static_cast<size_t>(i)] : (i / top_k);
+            if (token_idx < 0 || token_idx >= batch_size) {
+                continue;
+            }
+
+            const float weight = routing.weights[static_cast<size_t>(i)];
+            if (weight == 0.0f) {
+                continue;
+            }
+
+            const ExpertWeights& exp = experts[static_cast<size_t>(expert_id)];
+            size_t dequantized_bytes = 0;
+            bool dequantized_any = false;
+            Tensor w1 = make_weight_f32_small(exp.w1.ptr, exp.w1_type, static_cast<int64_t>(exp.intermediate_dim),
+                                              static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes,
+                                              &dequantized_any);
+            Tensor w2 = make_weight_f32_small(exp.w2.ptr, exp.w2_type, static_cast<int64_t>(exp.hidden_dim),
+                                              static_cast<int64_t>(exp.intermediate_dim), w2_dequant,
+                                              &dequantized_bytes, &dequantized_any);
+            Tensor w3;
+            if (exp.w3.ptr != nullptr) {
+                w3 = make_weight_f32_small(exp.w3.ptr, exp.w3_type, static_cast<int64_t>(exp.intermediate_dim),
+                                           static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes,
+                                           &dequantized_any);
+            }
+            if (dequantized_any) {
+                moe_stats_total_dequantized_experts_.fetch_add(1, std::memory_order_relaxed);
+                moe_stats_total_dequantized_bytes_.fetch_add(static_cast<uint64_t>(dequantized_bytes),
+                                                             std::memory_order_relaxed);
+            }
+
+            Tensor expert_input =
+                Tensor::Make2D(const_cast<float*>(input_data + static_cast<size_t>(token_idx) * hidden_dim), 1,
+                               static_cast<int64_t>(hidden_dim));
+            Tensor expert_out = Tensor::Make2D(small_decode_output_scratch.ptr, 1, static_cast<int64_t>(hidden_dim));
+            DispatchExpertFFN(layer_key, expert_id, expert_input, w1, w2, w3, &expert_out);
+
+            float* dst = out_data + static_cast<size_t>(token_idx) * hidden_dim;
+            const float* src = small_decode_output_scratch.ptr;
+            for (size_t d = 0; d < hidden_dim; ++d) {
+                dst[d] += weight * src[d];
+            }
+        }
         return;
     }
 
@@ -319,7 +482,6 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
     expert_input_scratch.Resize(this, packed_size);
     expert_output_scratch.Resize(this, packed_size);
 
-    const float* input_data = input.DataAs<float>();
     float* packed_input = expert_input_scratch.ptr;
     float* packed_output = expert_output_scratch.ptr;
     auto& reorder_pool = GetThreadPool(-1);
@@ -391,6 +553,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
         static_cast<int>(std::count_if(active_work.begin(), active_work.end(), [](const ActiveExpertWork& work) {
             return work.local_hot;
         }));
+    const int worker_threads = std::max(1, reorder_pool.GetNumThreads());
+    const bool small_decode_step = batch_size <= 4 && total_assignments <= 8 && max_expert_batch <= 1;
 
     moe_stats_batches_.fetch_add(1, std::memory_order_relaxed);
     moe_stats_total_active_experts_.fetch_add(static_cast<uint64_t>(active_work.size()), std::memory_order_relaxed);
@@ -406,17 +570,62 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
         registry->last_batch_experts = current_batch_experts;
     }
 
-    if (internal::IsMoELocalityOrderingEnabled()) {
-        std::stable_sort(active_work.begin(), active_work.end(), [](const ActiveExpertWork& lhs, const ActiveExpertWork& rhs) {
-            if (lhs.local_hot != rhs.local_hot) return lhs.local_hot > rhs.local_hot;
-            if (lhs.numa_node != rhs.numa_node) return lhs.numa_node < rhs.numa_node;
-            if (lhs.count != rhs.count) return lhs.count > rhs.count;
-            if (lhs.ema_load != rhs.ema_load) return lhs.ema_load > rhs.ema_load;
-            return lhs.expert_id < rhs.expert_id;
-        });
+    if (!small_decode_step && internal::IsMoELocalityOrderingEnabled()) {
+        moe_stats_total_ordering_considered_.fetch_add(1, std::memory_order_relaxed);
+
+        const bool enough_active_experts =
+            static_cast<int>(active_work.size()) >= internal::GetMoELocalityOrderingMinActiveExperts();
+        const bool enough_reuse_signal =
+            reuse_intersection >= internal::GetMoELocalityOrderingMinReuseIntersection() || local_hot_count > 0;
+
+        auto count_numa_switches = [](const std::vector<ActiveExpertWork>& work_items) -> uint64_t {
+            uint64_t switches = 0;
+            for (size_t i = 1; i < work_items.size(); ++i) {
+                const int prev = work_items[i - 1].numa_node;
+                const int cur = work_items[i].numa_node;
+                if (prev >= 0 && cur >= 0 && prev != cur) {
+                    ++switches;
+                }
+            }
+            return switches;
+        };
+
+        if (!enough_active_experts) {
+            moe_stats_total_ordering_skipped_small_batch_.fetch_add(1, std::memory_order_relaxed);
+        } else if (!enough_reuse_signal) {
+            moe_stats_total_ordering_skipped_low_reuse_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const uint64_t switches_before = count_numa_switches(active_work);
+            moe_stats_total_ordering_numa_switches_before_.fetch_add(switches_before, std::memory_order_relaxed);
+
+            auto ordering_score = [&previous_batch_set](const ActiveExpertWork& work) -> int {
+                const bool reused = previous_batch_set.find(work.expert_id) != previous_batch_set.end();
+                int score = 0;
+                if (work.local_hot) score += 32;
+                if (reused) score += 24;
+                if (work.numa_node >= 0) score += 4;
+                score += std::min(work.count, 4) * 3;
+                return score;
+            };
+
+            std::stable_sort(active_work.begin(), active_work.end(),
+                             [&ordering_score](const ActiveExpertWork& lhs, const ActiveExpertWork& rhs) {
+                                 const int lhs_score = ordering_score(lhs);
+                                 const int rhs_score = ordering_score(rhs);
+                                 if (lhs_score != rhs_score) return lhs_score > rhs_score;
+                                 if (lhs.ema_load != rhs.ema_load) return lhs.ema_load < rhs.ema_load;
+                                 if (lhs.count != rhs.count) return lhs.count < rhs.count;
+                                 if (lhs.numa_node != rhs.numa_node) return lhs.numa_node < rhs.numa_node;
+                                 return lhs.expert_id < rhs.expert_id;
+                             });
+
+            const uint64_t switches_after = count_numa_switches(active_work);
+            moe_stats_total_ordering_applied_.fetch_add(1, std::memory_order_relaxed);
+            moe_stats_total_ordering_numa_switches_after_.fetch_add(switches_after, std::memory_order_relaxed);
+        }
     }
 
-    const bool dequant_cache_enabled = internal::IsMoEDequantCacheEnabled() && registry != nullptr;
+    const bool dequant_cache_enabled = !small_decode_step && internal::IsMoEDequantCacheEnabled() && registry != nullptr;
     const bool cache_all_active_experts = internal::ShouldCacheAllActiveExperts();
     const size_t dequant_cache_budget = internal::GetMoEDequantCacheBytes();
 
@@ -472,19 +681,49 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
         const ActiveExpertWork& work = active_work[idx];
         const ExpertWeights& exp = experts[static_cast<size_t>(work.expert_id)];
 
-        if (internal::IsMoENextExpertPrefetchEnabled() && idx + 1 < active_work.size()) {
-            const ExpertWeights& next_exp = experts[static_cast<size_t>(active_work[idx + 1].expert_id)];
-            const size_t prefetch_bytes = internal::GetMoEPrefetchBytes();
-            auto prefetch_weight = [prefetch_bytes](const ExpertWeight& weight) {
-                if (!weight.ptr || weight.size == 0) return static_cast<size_t>(0);
-                const size_t bytes = std::min(prefetch_bytes, weight.size);
-                densecore::simd::PrefetchRange(weight.ptr, bytes);
-                return bytes;
-            };
-            const size_t prefetched = prefetch_weight(next_exp.w1) + prefetch_weight(next_exp.w2) + prefetch_weight(next_exp.w3);
-            if (prefetched > 0) {
-                moe_stats_total_prefetch_calls_.fetch_add(1, std::memory_order_relaxed);
-                moe_stats_total_prefetch_bytes_.fetch_add(static_cast<uint64_t>(prefetched), std::memory_order_relaxed);
+        if (!small_decode_step && internal::IsMoENextExpertPrefetchEnabled() && idx + 1 < active_work.size()) {
+            moe_stats_total_prefetch_candidates_.fetch_add(1, std::memory_order_relaxed);
+            const ActiveExpertWork& next_work = active_work[idx + 1];
+            const bool next_reused = previous_batch_set.find(next_work.expert_id) != previous_batch_set.end();
+            const int reuse_signals =
+                (next_work.local_hot ? 1 : 0) + (next_reused ? 1 : 0) + (next_work.count > 1 ? 1 : 0);
+            const bool enough_compute_distance =
+                work.count >= internal::GetMoEPrefetchMinCurrentExpertTokens();
+            const bool under_pressure_budget =
+                static_cast<int>(active_work.size()) <= internal::GetMoEPrefetchMaxActiveExperts() &&
+                worker_threads <= internal::GetMoEPrefetchMaxThreadCount();
+
+            if (!enough_compute_distance) {
+                moe_stats_total_prefetch_skipped_distance_.fetch_add(1, std::memory_order_relaxed);
+            } else if (!under_pressure_budget) {
+                moe_stats_total_prefetch_skipped_pressure_.fetch_add(1, std::memory_order_relaxed);
+            } else if (reuse_signals <= 0) {
+                moe_stats_total_prefetch_skipped_signal_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                const ExpertWeights& next_exp = experts[static_cast<size_t>(next_work.expert_id)];
+                size_t prefetch_budget = internal::GetMoEPrefetchBytes();
+                if (reuse_signals == 1) {
+                    prefetch_budget = std::max<size_t>(64, prefetch_budget / 2);
+                }
+                if (static_cast<int>(active_work.size()) >= std::max(2, internal::GetMoEPrefetchMaxActiveExperts() / 2)) {
+                    prefetch_budget = std::max<size_t>(64, prefetch_budget / 2);
+                }
+
+                const int weight_count = next_exp.w3.ptr != nullptr ? 3 : 2;
+                const size_t per_weight_budget = std::max<size_t>(64, prefetch_budget / static_cast<size_t>(weight_count));
+                auto prefetch_weight = [per_weight_budget](const ExpertWeight& weight) {
+                    if (!weight.ptr || weight.size == 0) return static_cast<size_t>(0);
+                    const size_t bytes = std::min(per_weight_budget, weight.size);
+                    densecore::simd::PrefetchRange(weight.ptr, bytes);
+                    return bytes;
+                };
+                const size_t prefetched =
+                    prefetch_weight(next_exp.w1) + prefetch_weight(next_exp.w2) + prefetch_weight(next_exp.w3);
+                if (prefetched > 0) {
+                    moe_stats_total_prefetch_calls_.fetch_add(1, std::memory_order_relaxed);
+                    moe_stats_total_prefetch_bytes_.fetch_add(static_cast<uint64_t>(prefetched),
+                                                              std::memory_order_relaxed);
+                }
             }
         }
 

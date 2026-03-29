@@ -38,6 +38,7 @@
 #include "densecore/exceptions.h"
 #include "densecore/hal/backend_registry.h"
 #include "densecore/kernels/paged_attention.h"
+#include "moe/moe_routing.h"
 #include "dtype_utils.h"  // For GgmlTypeToDType
 #include "kernels/hwy/hwy_kernels.h"
 #include "kv_cache.h"  // Added for KV cache
@@ -547,17 +548,17 @@ static int MapRetainedHistoryIndex(const KVRetentionSpan& span, int retained_ind
 }
 
 // Env-tunable thresholds for batched GEMM/GEMV routing
-static int GetBatchedMinM() {
+[[maybe_unused]] static int GetBatchedMinM() {
     static const int val = ParsePositiveEnvInt("DENSECORE_MATMUL_BATCHED_MIN_M", 2);
     return val;
 }
 
-static int GetBatchedMinN() {
+[[maybe_unused]] static int GetBatchedMinN() {
     static const int val = ParsePositiveEnvInt("DENSECORE_MATMUL_BATCHED_MIN_N", 32);
     return val;
 }
 
-static int GetBatchedMinK() {
+[[maybe_unused]] static int GetBatchedMinK() {
     static const int val = ParsePositiveEnvInt("DENSECORE_MATMUL_BATCHED_MIN_K", 32);
     return val;
 }
@@ -727,7 +728,7 @@ struct DecodeContextSummary {
     bool valid = false;
 };
 
-static bool IsBatchedPagedDecodeEnabled() {
+[[maybe_unused]] static bool IsBatchedPagedDecodeEnabled() {
     static const bool enabled = ParseTruthyEnv("DENSECORE_ENABLE_BATCHED_PAGED_DECODE", false);
     return enabled;
 }
@@ -3646,8 +3647,9 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         return;
     }
 
-    // Token-parallel fast path: when nth == q_tokens > 1, each thread owns
-    // exactly one token. Write KV for its token, then run all heads — no barrier.
+    // Token-parallel fast path is only valid when the scheduler intentionally
+    // collapsed work to one task per token. Otherwise keep the mixed
+    // token/head-tiled path so batched decode can use more than q_tokens tasks.
     const bool token_parallel_mode = (nth == q_tokens && q_tokens > 1);
 
     // Phase 1: Write current decode K/V to paged cache (parallel over tokens).
@@ -3827,6 +3829,15 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     int cached_token_idx = -1;
     int cached_seq_idx = -1;
     const std::vector<int>* cached_block_table = nullptr;
+    int cached_ptr_seq_idx = -1;
+    const std::vector<int>* cached_ptr_block_table = nullptr;
+    int cached_context_len = 0;
+    int cached_pos_i = -1;
+    KVRetentionSpan cached_retained_span{};
+    bool cached_retention_truncated = false;
+    bool cached_token_valid = false;
+    const float* cached_q_token = nullptr;
+    float* cached_out_token = nullptr;
 
     auto zero_token_heads = [&](float* out_token, int h_start, int h_end) {
         for (int h = h_start; h < h_end; ++h) {
@@ -3847,49 +3858,61 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
             continue;
         }
 
-        const float* q_token = reinterpret_cast<const float*>(q_base + static_cast<size_t>(token_idx) * q_token_stride);
-        float* out_token = reinterpret_cast<float*>(out_base + static_cast<size_t>(token_idx) * out_token_stride);
+        if (token_idx != cached_token_idx) {
+            cached_token_idx = token_idx;
+            cached_seq_idx = -1;
+            cached_block_table = nullptr;
+            cached_context_len = 0;
+            cached_pos_i = -1;
+            cached_retained_span = {};
+            cached_retention_truncated = false;
+            cached_token_valid = false;
+            cached_q_token = nullptr;
+            cached_out_token = nullptr;
 
-        if (token_idx < 0 || token_idx >= q_tokens) {
+            if (token_idx >= 0 && token_idx < q_tokens) {
+                cached_q_token =
+                    reinterpret_cast<const float*>(q_base + static_cast<size_t>(token_idx) * q_token_stride);
+                cached_out_token = reinterpret_cast<float*>(out_base + static_cast<size_t>(token_idx) * out_token_stride);
+                const int seq_idx = batch->seq_id[static_cast<size_t>(token_idx)];
+                if (seq_idx >= 0 && seq_idx < batch->num_seqs) {
+                    const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
+                    const int pos_i = batch->pos[static_cast<size_t>(token_idx)];
+                    const int n_past_i = batch->n_past[static_cast<size_t>(seq_idx)];
+                    if (!block_table.empty() && pos_i >= 0 && n_past_i >= 0) {
+                        cached_seq_idx = seq_idx;
+                        cached_block_table = &block_table;
+                        cached_pos_i = pos_i;
+                        cached_retained_span = ComputeKVRetentionSpan(n_past_i, GetKVRetentionPolicy());
+                        cached_retention_truncated = cached_retained_span.history_kept < n_past_i;
+                        const int max_context = static_cast<int>(block_table.size()) * BLOCK_SIZE;
+                        cached_context_len =
+                            std::max(1, std::min(cached_retained_span.history_kept + 1, max_context));
+                        cached_token_valid = cached_context_len > 0;
+                    }
+                }
+            }
+        }
+
+        float* out_token = cached_out_token;
+        if (!out_token) {
+            continue;
+        }
+        if (!cached_token_valid || !cached_block_table || !cached_q_token) {
             zero_token_heads(out_token, h_start, h_end);
             continue;
         }
 
-        const int seq_idx = batch->seq_id[static_cast<size_t>(token_idx)];
-        if (seq_idx < 0 || seq_idx >= batch->num_seqs) {
-            zero_token_heads(out_token, h_start, h_end);
+        const float* q_token = cached_q_token;
+        const auto& block_table = *cached_block_table;
+
+        if (!hwy_ready || cached_retention_truncated) {
+            ComputePagedAttentionScalarHeads(ud, block_table, cached_context_len, cached_retained_span, cached_pos_i,
+                                             scale, q_token, out_token, h_start, h_end);
             continue;
         }
 
-        const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
-        if (block_table.empty()) {
-            zero_token_heads(out_token, h_start, h_end);
-            continue;
-        }
-
-        const int pos_i = batch->pos[static_cast<size_t>(token_idx)];
-        const int n_past_i = batch->n_past[static_cast<size_t>(seq_idx)];
-        if (pos_i < 0 || n_past_i < 0) {
-            zero_token_heads(out_token, h_start, h_end);
-            continue;
-        }
-
-        const KVRetentionSpan retained_span = ComputeKVRetentionSpan(n_past_i, GetKVRetentionPolicy());
-        const bool retention_truncated = retained_span.history_kept < n_past_i;
-        const int max_context = static_cast<int>(block_table.size()) * BLOCK_SIZE;
-        const int context_len = std::max(1, std::min(retained_span.history_kept + 1, max_context));
-        if (context_len <= 0) {
-            zero_token_heads(out_token, h_start, h_end);
-            continue;
-        }
-
-        if (!hwy_ready || retention_truncated) {
-            ComputePagedAttentionScalarHeads(ud, block_table, context_len, retained_span, pos_i, scale, q_token,
-                                             out_token, h_start, h_end);
-            continue;
-        }
-
-        if (token_idx != cached_token_idx || seq_idx != cached_seq_idx || cached_block_table != &block_table) {
+        if (cached_ptr_block_table != &block_table || cached_ptr_seq_idx != cached_seq_idx) {
             k_block_ptrs.resize(block_table.size(), nullptr);
             v_block_ptrs.resize(block_table.size(), nullptr);
             for (size_t bi = 0; bi < block_table.size(); ++bi) {
@@ -3900,14 +3923,13 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                 k_block_ptrs[bi] = ud->cache->GetKBlockPtr(block_id, ud->layer);
                 v_block_ptrs[bi] = ud->cache->GetVBlockPtr(block_id, ud->layer);
             }
-            cached_token_idx = token_idx;
-            cached_seq_idx = seq_idx;
-            cached_block_table = &block_table;
+            cached_ptr_seq_idx = cached_seq_idx;
+            cached_ptr_block_table = &block_table;
         }
 
         densecore::hwy_kernels::PagedAttention_Hwy(
             q_token, k_block_ptrs.data(), v_block_ptrs.data(), cache_type_id, ud->n_head, ud->head_dim, v_head_dim,
-            ud->cache->n_head_kv, static_cast<int32_t>(block_table.size()), context_len,
+            ud->cache->n_head_kv, static_cast<int32_t>(block_table.size()), cached_context_len,
             static_cast<int64_t>(k_cache_layout.head_stride_bytes),
             static_cast<int64_t>(k_cache_layout.slot_stride_bytes),
             static_cast<int64_t>(v_cache_layout.head_stride_bytes),
@@ -3921,8 +3943,9 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         if (++profile_cb_count % 100 == 0) {
             const long kv_us = std::chrono::duration_cast<std::chrono::microseconds>(kv_end - kv_begin).count();
             const long attn_us = std::chrono::duration_cast<std::chrono::microseconds>(attn_end - attn_begin).count();
-            fprintf(stderr, "[DecodeProfile] bs=%d threads=%d layer=%d kv_us=%ld attn_us=%ld\n", q_tokens, nth,
-                    ud->layer, kv_us, attn_us);
+            fprintf(stderr,
+                    "[DecodeProfile] bs=%d threads=%d layer=%d token_parallel=%d kv_us=%ld attn_us=%ld\n",
+                    q_tokens, nth, ud->layer, token_parallel_mode ? 1 : 0, kv_us, attn_us);
         }
     }
 }
@@ -4404,20 +4427,25 @@ inline struct ggml_tensor* ggml_paged_attention_decode(struct ggml_context* ctx,
     const int head_tile = std::max(1, ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", 8));
     const int tiles_per_token = std::max(1, (std::max(1, n_heads) + head_tile - 1) / head_tile);
     const int total_tiles = std::max(1, n_tokens * tiles_per_token);
-    // Token-parallel mode: when batch has multiple tokens and threads >= tokens,
-    // assign 1 thread per token (each handles all heads). Eliminates KV write
-    // barrier overhead and improves cache locality for small batches.
-    const bool token_parallel = (n_tokens > 1 && n_tokens <= n_tasks);
-    if (token_parallel) {
-        n_tasks = n_tokens;
-    } else {
-        n_tasks = std::max(1, std::min(n_tasks, total_tiles));
-    }
+    // Preserve head-tiled parallelism for batched decode. Collapsing batch=2~4
+    // to n_tasks=n_tokens strands CPU threads when each token still has
+    // multiple head tiles to process.
+    const bool token_parallel = (n_tokens > 1 && tiles_per_token == 1 && n_tokens <= n_tasks);
+    n_tasks = std::max(1, std::min(n_tasks, total_tiles));
     // Scalar fallback remains correctness-first, but we keep the same token/head
     // tiling to preserve parallelism on non-Highway hosts.
     if (!token_parallel && !IsPagedAttentionHwyEnabled()) {
         const int scalar_tasks = ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_SCALAR_TASKS", n_tasks);
         n_tasks = std::max(1, std::min(scalar_tasks, total_tiles));
+    }
+    if (IsDecodeAttentionPathLoggingEnabled() && n_tokens > 1) {
+        static std::atomic<uint64_t> paged_decode_task_logs{0};
+        const uint64_t log_idx = paged_decode_task_logs.fetch_add(1, std::memory_order_relaxed);
+        if (log_idx < 32) {
+            std::cerr << "[PagedDecodeTasks] batch=" << n_tokens << " heads=" << n_heads
+                      << " tiles_per_token=" << tiles_per_token << " total_tiles=" << total_tiles
+                      << " n_tasks=" << n_tasks << " token_parallel=" << (token_parallel ? 1 : 0) << std::endl;
+        }
     }
     struct {
         ggml_custom_op_t fun;
@@ -5642,6 +5670,7 @@ MoEUserData* AllocateMoEUserData(struct ggml_context* ctx_c) {
     if (!storage || !storage->data) {
         return nullptr;
     }
+    std::memset(storage->data, 0, sizeof(MoEUserData));
     return reinterpret_cast<MoEUserData*>(storage->data);
 }
 
@@ -5833,7 +5862,11 @@ static void UpdateSchedulerExperts(const MoEUserData* ud, const densecore::moe::
     }
 
     const int num_seqs = static_cast<int>(batch->scheduler_seq_ids.size());
-    std::vector<std::vector<int>> per_seq_experts(static_cast<size_t>(num_seqs));
+    thread_local std::vector<std::vector<int>> per_seq_experts;
+    per_seq_experts.resize(static_cast<size_t>(num_seqs));
+    for (auto& experts : per_seq_experts) {
+        experts.clear();
+    }
 
     const bool has_token_indices = !routing.token_indices.empty();
     const int total_assignments = static_cast<int>(routing.expert_ids.size());
@@ -5853,6 +5886,10 @@ static void UpdateSchedulerExperts(const MoEUserData* ud, const densecore::moe::
         per_seq_experts[static_cast<size_t>(seq_idx)].push_back(expert_id);
     }
 
+    const bool decode_single_token_per_seq =
+        batch->seq_id.size() == batch->scheduler_seq_ids.size() &&
+        static_cast<int>(batch->seq_id.size()) == routing.batch_size;
+
     for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
         auto& experts = per_seq_experts[static_cast<size_t>(seq_idx)];
         if (experts.empty()) {
@@ -5863,31 +5900,45 @@ static void UpdateSchedulerExperts(const MoEUserData* ud, const densecore::moe::
             continue;
         }
 
-        std::sort(experts.begin(), experts.end());
-        experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
+        if (!decode_single_token_per_seq && experts.size() > 1) {
+            std::sort(experts.begin(), experts.end());
+            experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
+        }
         ud->scheduler->SetPredictedExperts(sched_seq_id, experts);
     }
 }
 
-static densecore::moe::MoERouteResult RouteMoEGroupedSigmoid(const struct ggml_tensor* gate_logits,
-                                                             const MoEUserData* ud) {
-    densecore::moe::MoERouteResult routing;
-    if (!gate_logits || !ud || !ud->model) {
-        return routing;
+static bool EnsureMoERouteStorage(densecore::moe::MoERouteResult* routing, int batch_size, int top_k) {
+    if (!routing || batch_size <= 0 || top_k <= 0) {
+        return false;
     }
+    const size_t total = static_cast<size_t>(batch_size * top_k);
+    routing->batch_size = batch_size;
+    routing->top_k = top_k;
+    routing->expert_ids.resize(total);
+    routing->weights.resize(total);
+    routing->token_indices.resize(total);
+    std::fill(routing->expert_ids.begin(), routing->expert_ids.end(), -1);
+    std::fill(routing->weights.begin(), routing->weights.end(), 0.0f);
+    std::fill(routing->token_indices.begin(), routing->token_indices.end(), 0);
+    return true;
+}
 
+static bool RouteMoEGroupedSigmoid(const struct ggml_tensor* gate_logits, const MoEUserData* ud,
+                                   densecore::moe::MoERouteResult* routing) {
+    if (!gate_logits || !ud || !ud->model || !routing) {
+        return false;
+    }
     const int n_experts = static_cast<int>(gate_logits->ne[0]);
     const int batch_size = static_cast<int>(gate_logits->ne[1]);
     const int top_k = std::max(1, std::min(ud->k, n_experts));
-    routing.batch_size = batch_size;
-    routing.top_k = top_k;
-    routing.expert_ids.assign(static_cast<size_t>(batch_size * top_k), -1);
-    routing.weights.assign(static_cast<size_t>(batch_size * top_k), 0.0f);
-    routing.token_indices.assign(static_cast<size_t>(batch_size * top_k), 0);
+    if (!EnsureMoERouteStorage(routing, batch_size, top_k)) {
+        return false;
+    }
 
     const float* logits = reinterpret_cast<const float*>(gate_logits->data);
     if (!logits) {
-        return routing;
+        return false;
     }
 
     const struct ggml_tensor* bias_t = ud->layer ? ud->layer->Get(model_keys::kMoeCorrectionBias) : nullptr;
@@ -5898,11 +5949,17 @@ static densecore::moe::MoERouteResult RouteMoEGroupedSigmoid(const struct ggml_t
     const int group_size = std::max(1, n_experts / n_group);
     const int topk_group = std::max(1, std::min(ud->model->moe_topk_group, n_group));
 
-    std::vector<float> probs(static_cast<size_t>(n_experts), 0.0f);
-    std::vector<float> choice_scores(static_cast<size_t>(n_experts), 0.0f);
-    std::vector<float> group_scores(static_cast<size_t>(n_group), -std::numeric_limits<float>::infinity());
-    std::vector<int> active_groups(static_cast<size_t>(n_group), 0);
-    std::vector<int> selected(static_cast<size_t>(top_k), -1);
+    thread_local std::vector<float> probs;
+    thread_local std::vector<float> choice_scores;
+    thread_local std::vector<float> group_scores;
+    thread_local std::vector<int> active_groups;
+    thread_local std::vector<int> selected;
+    thread_local std::vector<std::pair<float, int>> candidates;
+    probs.assign(static_cast<size_t>(n_experts), 0.0f);
+    choice_scores.assign(static_cast<size_t>(n_experts), 0.0f);
+    group_scores.assign(static_cast<size_t>(n_group), -std::numeric_limits<float>::infinity());
+    active_groups.resize(static_cast<size_t>(n_group));
+    selected.assign(static_cast<size_t>(top_k), -1);
     const auto stable_sigmoid = [](float x) -> float {
         if (x >= 0.0f) {
             const float z = std::exp(-x);
@@ -5942,8 +5999,8 @@ static densecore::moe::MoERouteResult RouteMoEGroupedSigmoid(const struct ggml_t
             active_groups.begin(), active_groups.begin() + topk_group, active_groups.end(),
             [&](int a, int b) { return group_scores[static_cast<size_t>(a)] > group_scores[static_cast<size_t>(b)]; });
 
-        std::vector<std::pair<float, int>> candidates;
-        candidates.reserve(static_cast<size_t>(topk_group * group_size));
+        candidates.clear();
+        candidates.reserve(static_cast<size_t>(std::max(top_k, topk_group * group_size)));
         for (int group_rank = 0; group_rank < topk_group; ++group_rank) {
             const int g = active_groups[static_cast<size_t>(group_rank)];
             const int begin = g * group_size;
@@ -5978,83 +6035,53 @@ static densecore::moe::MoERouteResult RouteMoEGroupedSigmoid(const struct ggml_t
                 weight /= weight_sum;
             }
             weight *= scale;
-            routing.expert_ids[static_cast<size_t>(token_idx * top_k + k)] = expert_id;
-            routing.weights[static_cast<size_t>(token_idx * top_k + k)] = weight;
-            routing.token_indices[static_cast<size_t>(token_idx * top_k + k)] = token_idx;
+            routing->expert_ids[static_cast<size_t>(token_idx * top_k + k)] = expert_id;
+            routing->weights[static_cast<size_t>(token_idx * top_k + k)] = weight;
+            routing->token_indices[static_cast<size_t>(token_idx * top_k + k)] = token_idx;
         }
     }
 
-    return routing;
+    return true;
 }
 
-static densecore::moe::MoERouteResult RouteMoESoftmaxTopK(const struct ggml_tensor* gate_logits, const MoEUserData* ud) {
-    densecore::moe::MoERouteResult routing;
-    if (!gate_logits || !ud || !ud->model) {
-        return routing;
+static bool RouteMoESoftmaxTopK(const struct ggml_tensor* gate_logits, const MoEUserData* ud,
+                                densecore::moe::MoERouteResult* routing) {
+    if (!gate_logits || !ud || !ud->model || !routing) {
+        return false;
     }
 
     const int n_experts = static_cast<int>(gate_logits->ne[0]);
     const int batch_size = static_cast<int>(gate_logits->ne[1]);
     const int top_k = std::max(1, std::min(ud->k, n_experts));
-    routing.batch_size = batch_size;
-    routing.top_k = top_k;
-    routing.expert_ids.assign(static_cast<size_t>(batch_size * top_k), -1);
-    routing.weights.assign(static_cast<size_t>(batch_size * top_k), 0.0f);
-    routing.token_indices.assign(static_cast<size_t>(batch_size * top_k), 0);
+    if (!EnsureMoERouteStorage(routing, batch_size, top_k)) {
+        return false;
+    }
 
     const float* logits = reinterpret_cast<const float*>(gate_logits->data);
     if (!logits) {
-        return routing;
+        return false;
     }
 
-    std::vector<float> probs(static_cast<size_t>(n_experts), 0.0f);
-    std::vector<std::pair<float, int>> scored(static_cast<size_t>(n_experts));
-    std::vector<int> selected(static_cast<size_t>(top_k), -1);
-
-    for (int token_idx = 0; token_idx < batch_size; ++token_idx) {
-        const float* row = logits + static_cast<size_t>(token_idx) * n_experts;
-        float max_logit = row[0];
-        for (int e = 1; e < n_experts; ++e) {
-            max_logit = std::max(max_logit, row[e]);
-        }
-        float sum = 0.0f;
-        for (int e = 0; e < n_experts; ++e) {
-            const float value = std::exp(row[e] - max_logit);
-            probs[static_cast<size_t>(e)] = value;
-            sum += value;
-        }
-        const float inv_sum = sum > 0.0f ? (1.0f / sum) : 0.0f;
-        for (int e = 0; e < n_experts; ++e) {
-            probs[static_cast<size_t>(e)] *= inv_sum;
-        }
-        for (int e = 0; e < n_experts; ++e) {
-            scored[static_cast<size_t>(e)] = {probs[static_cast<size_t>(e)], e};
-        }
-        std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
-                          [](const auto& a, const auto& b) { return a.first > b.first; });
-
-        float weight_sum = 0.0f;
-        for (int k = 0; k < top_k; ++k) {
-            const int expert_id = scored[static_cast<size_t>(k)].second;
-            selected[static_cast<size_t>(k)] = expert_id;
-            weight_sum += probs[static_cast<size_t>(expert_id)];
-        }
-
-        const float scale = ud->model->moe_routed_scaling_factor;
-        for (int k = 0; k < top_k; ++k) {
-            const int expert_id = selected[static_cast<size_t>(k)];
-            float weight = probs[static_cast<size_t>(expert_id)];
-            if (ud->model->moe_norm_topk_prob && weight_sum > 1e-20f) {
-                weight /= weight_sum;
-            }
-            weight *= scale;
-            routing.expert_ids[static_cast<size_t>(token_idx * top_k + k)] = expert_id;
-            routing.weights[static_cast<size_t>(token_idx * top_k + k)] = weight;
-            routing.token_indices[static_cast<size_t>(token_idx * top_k + k)] = token_idx;
-        }
+    thread_local std::vector<float> route_workspace;
+    thread_local densecore::moe::MoERoutingWorkspace ws;
+    const size_t workspace_bytes = densecore::moe::GetMoERoutingWorkspaceSize(batch_size, n_experts, top_k);
+    const size_t workspace_floats = (workspace_bytes + sizeof(float) - 1) / sizeof(float);
+    route_workspace.resize(workspace_floats);
+    if (!densecore::moe::InitMoERoutingWorkspace(&ws, route_workspace.data(),
+                                                 route_workspace.size() * sizeof(float), batch_size, n_experts,
+                                                 top_k)) {
+        return false;
+    }
+    if (!densecore::moe::MoETopKRoute(logits, batch_size, n_experts, top_k, ud->model->moe_norm_topk_prob, routing,
+                                      &ws)) {
+        return false;
     }
 
-    return routing;
+    const float scale = ud->model->moe_routed_scaling_factor;
+    for (float& weight : routing->weights) {
+        weight *= scale;
+    }
+    return true;
 }
 
 void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
@@ -6071,28 +6098,46 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     auto* ud = static_cast<MoEUserData*>(userdata);
     if (!ud || !ud->layer || !ud->backend) return;
 
-    std::vector<densecore::CpuBackend::ExpertWeights> experts = ud->backend->GetRegisteredExperts(ud->layer);
-    if (experts.empty()) {
-        experts = BuildExpertWeights(ud->layer);
-        ud->backend->InitMoEProfiler(ud->layer, static_cast<int>(experts.size()));
-        ud->backend->RegisterMoEExperts(ud->layer, experts);
+    if (!ud->experts_registered && ud->experts && ud->n_experts > 0) {
+        std::vector<densecore::CpuBackend::ExpertWeights> experts_vec(
+            ud->experts, ud->experts + static_cast<size_t>(ud->n_experts));
+        ud->backend->InitMoEProfiler(ud->layer, ud->n_experts);
+        ud->backend->RegisterMoEExperts(ud->layer, experts_vec);
         EnsureMoERebalanceThread(ud->backend);
+        ud->experts_registered = true;
     }
 
-    // Routing (src1 = gate_logits)
-    densecore::moe::MoERouteResult routing;
-    if (ud->model && ud->model->arch_flags.is_glm_moe) {
-        routing = RouteMoEGroupedSigmoid(src1, ud);
-    } else {
-        routing = RouteMoESoftmaxTopK(src1, ud);
+    std::vector<densecore::CpuBackend::ExpertWeights> experts;
+    if (!ud->experts || ud->n_experts <= 0) {
+        experts = ud->backend->GetRegisteredExperts(ud->layer);
     }
+    if ((!ud->experts || ud->n_experts <= 0) && experts.empty()) {
+        experts = BuildExpertWeights(ud->layer);
+        if (!experts.empty()) {
+            ud->backend->InitMoEProfiler(ud->layer, static_cast<int>(experts.size()));
+            ud->backend->RegisterMoEExperts(ud->layer, experts);
+            EnsureMoERebalanceThread(ud->backend);
+        }
+    }
+    if ((!ud->experts || ud->n_experts <= 0) && experts.empty()) return;
+
+    // Routing (src1 = gate_logits)
+    thread_local densecore::moe::MoERouteResult routing;
+    const bool routed = (ud->model && ud->model->arch_flags.is_glm_moe)
+                            ? RouteMoEGroupedSigmoid(src1, ud, &routing)
+                            : RouteMoESoftmaxTopK(src1, ud, &routing);
+    if (!routed || routing.expert_ids.empty()) return;
     UpdateSchedulerExperts(ud, routing);
 
     // Forward (src0 = input, dst = output)
     densecore::Tensor t_input = GgmlToTensor(src0);
     densecore::Tensor t_output = GgmlToTensor(dst);
 
-    ud->backend->ForwardMoE(ud->layer, t_input, routing, experts, &t_output);
+    if (ud->experts && ud->n_experts > 0) {
+        ud->backend->ForwardMoE(ud->layer, t_input, routing, ud->experts, ud->n_experts, &t_output);
+    } else {
+        ud->backend->ForwardMoE(ud->layer, t_input, routing, experts, &t_output);
+    }
 }
 
 // ============================================================================
@@ -7838,6 +7883,20 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     moe_ud->backend->InitMoEProfiler(moe_ud->layer, n_experts);
                     moe_ud->backend->RegisterMoEExperts(moe_ud->layer, experts);
                     EnsureMoERebalanceThread(moe_ud->backend);
+                    if (n_experts > 0) {
+                        struct ggml_tensor* expert_storage = ggml_new_tensor_1d(
+                            ctx_c, GGML_TYPE_I8,
+                            static_cast<int64_t>(sizeof(densecore::CpuBackend::ExpertWeights)) * n_experts);
+                        if (expert_storage && expert_storage->data) {
+                            std::memcpy(expert_storage->data, experts.data(),
+                                        static_cast<size_t>(n_experts) *
+                                            sizeof(densecore::CpuBackend::ExpertWeights));
+                            moe_ud->experts =
+                                reinterpret_cast<const densecore::CpuBackend::ExpertWeights*>(expert_storage->data);
+                            moe_ud->n_experts = n_experts;
+                            moe_ud->experts_registered = true;
+                        }
+                    }
                 }
             }
 
