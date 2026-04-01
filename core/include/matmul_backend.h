@@ -81,6 +81,10 @@ DENSECORE_API MatmulBackendKind SelectMatmulBackend(const MatmulParams& params, 
 
 DENSECORE_API void PrepareMatmulWeights(const void* weight, int64_t K, int64_t N, DType dtype, const char* name);
 
+// Shared DenseCore FP32 TransB execution path used by both the backend adapter
+// and the generic CPU op registry path.
+DENSECORE_API void ExecuteDenseCoreMatmulTransBF32(const MatmulParams& params);
+
 }  // namespace densecore
 
 #endif  // DENSECORE_MATMUL_BACKEND_H

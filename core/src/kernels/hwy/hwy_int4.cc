@@ -42,6 +42,7 @@
 
 #include "kernels/hwy/hwy_kernels.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -51,6 +52,8 @@ namespace hwy_kernels {
 namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
+
+#include "kernels/hwy/hwy_fastexp.h"
 
 HWY_INLINE int PackedBytesForInt4(int k) { return (k + 1) / 2; }
 HWY_INLINE int PrefetchVecItersAhead(int lanes) {
@@ -563,6 +566,133 @@ void GemvInt4Impl(float* HWY_RESTRICT output, const float* HWY_RESTRICT input, c
     }
 }
 
+void GemvInt4DualFusedSiluImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT input,
+                               const uint8_t* HWY_RESTRICT gate_weights, const float* HWY_RESTRICT gate_scales,
+                               const float* HWY_RESTRICT gate_zeros, const uint8_t* HWY_RESTRICT up_weights,
+                               const float* HWY_RESTRICT up_scales, const float* HWY_RESTRICT up_zeros, int K, int N,
+                               int group_size, int n_start, int n_end) {
+    if (!output || !input || !gate_weights || !up_weights || K <= 0 || N <= 0 || group_size <= 0) return;
+    if ((group_size & 1) != 0) return;
+
+    n_start = std::max(0, n_start);
+    n_end = std::min(N, n_end);
+    if (n_start >= n_end) return;
+
+    const hn::ScalableTag<float> df;
+    using Di8 = hn::Rebind<int8_t, hn::ScalableTag<float>>;
+    using Du8 = hn::Rebind<uint8_t, hn::ScalableTag<float>>;
+    using Di16 = hn::Rebind<int16_t, hn::ScalableTag<float>>;
+    using Di32 = hn::Rebind<int32_t, hn::ScalableTag<float>>;
+
+    const Di8 di8;
+    const Du8 du8;
+    const Di16 di16;
+    const Di32 di32;
+
+    const size_t lanes_f = hn::Lanes(df);
+    const int lanes = static_cast<int>(lanes_f);
+    const int vec_step = (lanes >= 2 && (lanes % 2 == 0)) ? lanes : 0;
+    const int prefetch_vec_iters_ahead = PrefetchVecItersAhead(lanes);
+
+    const int num_full_groups = K / group_size;
+    const int remainder = K % group_size;
+    const int packed_K = PackedBytesForInt4(K);
+    if (num_full_groups > 0 && (!gate_scales || !gate_zeros || !up_scales || !up_zeros)) return;
+
+    const auto iota_u8 = hn::Iota(du8, 0);
+    const auto tbl_indices = hn::ShiftRight<1>(iota_u8);
+    const auto mask_bit = hn::And(iota_u8, hn::Set(du8, 1));
+    const auto mask_odd_u8 = hn::Eq(mask_bit, hn::Set(du8, 1));
+    const auto mask_odd = hn::RebindMask(di8, mask_odd_u8);
+
+    for (int n = n_start; n < n_end; ++n) {
+        auto gate_acc = hn::Zero(df);
+        auto up_acc = hn::Zero(df);
+        float gate_scalar = 0.0f;
+        float up_scalar = 0.0f;
+
+        const uint8_t* gate_row = gate_weights + static_cast<int64_t>(n) * packed_K;
+        const uint8_t* up_row = up_weights + static_cast<int64_t>(n) * packed_K;
+        const float gate_s_tail = (num_full_groups > 0)
+                                      ? gate_scales[static_cast<int64_t>(n) * num_full_groups + num_full_groups - 1]
+                                      : 1.0f;
+        const float gate_z_tail = (num_full_groups > 0)
+                                      ? gate_zeros[static_cast<int64_t>(n) * num_full_groups + num_full_groups - 1]
+                                      : 0.0f;
+        const float up_s_tail = (num_full_groups > 0)
+                                    ? up_scales[static_cast<int64_t>(n) * num_full_groups + num_full_groups - 1]
+                                    : 1.0f;
+        const float up_z_tail = (num_full_groups > 0)
+                                    ? up_zeros[static_cast<int64_t>(n) * num_full_groups + num_full_groups - 1]
+                                    : 0.0f;
+
+        for (int g = 0; g < num_full_groups; ++g) {
+            const int k_base = g * group_size;
+            const float gate_s = gate_scales[static_cast<int64_t>(n) * num_full_groups + g];
+            const float gate_z = gate_zeros[static_cast<int64_t>(n) * num_full_groups + g];
+            const float up_s = up_scales[static_cast<int64_t>(n) * num_full_groups + g];
+            const float up_z = up_zeros[static_cast<int64_t>(n) * num_full_groups + g];
+            const auto v_gate_s = hn::Set(df, gate_s);
+            const auto v_gate_nsz = hn::Set(df, -gate_s * gate_z);
+            const auto v_up_s = hn::Set(df, up_s);
+            const auto v_up_nsz = hn::Set(df, -up_s * up_z);
+
+            const uint8_t* gate_ptr = gate_row + g * (group_size / 2);
+            const uint8_t* up_ptr = up_row + g * (group_size / 2);
+
+            int k = 0;
+            for (; vec_step > 0 && k + vec_step <= group_size; k += vec_step) {
+                if (k + vec_step * prefetch_vec_iters_ahead < group_size) {
+                    const int pf_k = k + vec_step * prefetch_vec_iters_ahead;
+                    ::hwy::Prefetch(gate_ptr + pf_k / 2);
+                    ::hwy::Prefetch(up_ptr + pf_k / 2);
+                    ::hwy::Prefetch(input + k_base + pf_k);
+                }
+
+                const int byte_off = k / 2;
+                auto v_input = hn::LoadU(df, input + k_base + k);
+
+                auto gate_bytes = hn::LoadN(du8, gate_ptr + byte_off, lanes_f / 2);
+                auto gate_exp = hn::BitCast(di8, hn::TableLookupBytes(gate_bytes, tbl_indices));
+                auto gate_lo = hn::ShiftRight<4>(hn::ShiftLeft<4>(gate_exp));
+                auto gate_hi = hn::ShiftRight<4>(gate_exp);
+                auto gate_i8 = hn::IfThenElse(mask_odd, gate_hi, gate_lo);
+                auto gate_f = hn::ConvertTo(df, hn::PromoteTo(di32, hn::PromoteTo(di16, gate_i8)));
+                auto gate_dq = hn::MulAdd(v_gate_s, gate_f, v_gate_nsz);
+
+                auto up_bytes = hn::LoadN(du8, up_ptr + byte_off, lanes_f / 2);
+                auto up_exp = hn::BitCast(di8, hn::TableLookupBytes(up_bytes, tbl_indices));
+                auto up_lo = hn::ShiftRight<4>(hn::ShiftLeft<4>(up_exp));
+                auto up_hi = hn::ShiftRight<4>(up_exp);
+                auto up_i8 = hn::IfThenElse(mask_odd, up_hi, up_lo);
+                auto up_f = hn::ConvertTo(df, hn::PromoteTo(di32, hn::PromoteTo(di16, up_i8)));
+                auto up_dq = hn::MulAdd(v_up_s, up_f, v_up_nsz);
+
+                gate_acc = hn::MulAdd(v_input, gate_dq, gate_acc);
+                up_acc = hn::MulAdd(v_input, up_dq, up_acc);
+            }
+
+            for (; k < group_size; ++k) {
+                const int kk = k_base + k;
+                gate_scalar += input[kk] * UnpackNibbleScalar(gate_ptr, k, gate_s, gate_z);
+                up_scalar += input[kk] * UnpackNibbleScalar(up_ptr, k, up_s, up_z);
+            }
+        }
+
+        float gate_sum = hn::ReduceSum(df, gate_acc) + gate_scalar;
+        float up_sum = hn::ReduceSum(df, up_acc) + up_scalar;
+        if (remainder > 0) {
+            for (int kk = num_full_groups * group_size; kk < K; ++kk) {
+                gate_sum += input[kk] * UnpackNibbleScalar(gate_row, kk, gate_s_tail, gate_z_tail);
+                up_sum += input[kk] * UnpackNibbleScalar(up_row, kk, up_s_tail, up_z_tail);
+            }
+        }
+
+        const float silu = gate_sum / (1.0f + FastExpScalar(-gate_sum));
+        output[n] = silu * up_sum;
+    }
+}
+
 // ============================================================================
 // M-Blocked GEMM: M>1, weight reuse across batch dimension
 // ============================================================================
@@ -820,12 +950,21 @@ namespace densecore {
 namespace hwy_kernels {
 
 HWY_EXPORT(GemvInt4Impl);
+HWY_EXPORT(GemvInt4DualFusedSiluImpl);
 HWY_EXPORT(GemmInt4BatchedImpl);
 HWY_EXPORT(PrepackInt4WeightsInterleavedImpl);
 
 void GemvInt4_Hwy(float* output, const float* input, const uint8_t* weights, const float* scales, const float* zeros,
                   int K, int N, int group_size, int n_start, int n_end) {
     HWY_DYNAMIC_DISPATCH(GemvInt4Impl)(output, input, weights, scales, zeros, K, N, group_size, n_start, n_end);
+}
+
+void GemvInt4DualFusedSilu_Hwy(float* output, const float* input, const uint8_t* gate_weights,
+                               const float* gate_scales, const float* gate_zeros, const uint8_t* up_weights,
+                               const float* up_scales, const float* up_zeros, int K, int N, int group_size,
+                               int n_start, int n_end) {
+    HWY_DYNAMIC_DISPATCH(GemvInt4DualFusedSiluImpl)(output, input, gate_weights, gate_scales, gate_zeros, up_weights,
+                                                    up_scales, up_zeros, K, N, group_size, n_start, n_end);
 }
 
 void GemmInt4Batched_Hwy(float* output, const float* input, const uint8_t* weights, const float* scales,

@@ -125,12 +125,12 @@ size_t GetMoEPrefetchBytes() {
 }
 
 bool IsMoELocalityOrderingEnabled() {
-    static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_LOCALITY_ORDERING", false);
+    static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_LOCALITY_ORDERING", true);
     return enabled;
 }
 
 bool IsMoENextExpertPrefetchEnabled() {
-    static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_PREFETCH_NEXT_EXPERT", false);
+    static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_PREFETCH_NEXT_EXPERT", true);
     return enabled;
 }
 
@@ -138,12 +138,12 @@ size_t GetMoEDequantCacheBytes() {
     static const size_t bytes = []() -> size_t {
         const char* env = std::getenv("DENSECORE_MOE_DEQUANT_CACHE_MB");
         if (!env || *env == '\0') {
-            return 0;
+            return 128ULL * 1024ULL * 1024ULL;
         }
         char* end = nullptr;
         const unsigned long long parsed_mb = std::strtoull(env, &end, 10);
         if (end == env || *end != '\0') {
-            return 0;
+            return 128ULL * 1024ULL * 1024ULL;
         }
         return static_cast<size_t>(parsed_mb) * 1024ULL * 1024ULL;
     }();
@@ -989,16 +989,32 @@ void CpuBackend::MatMulTransB(const Tensor& A, const Tensor& B, Tensor* C, int n
         float* c_data = C->DataAs<float>();
 
         auto& pool = GetThreadPool(numa_node_id);
-        pool.ParallelFor(M, [=](int m_start, int m_end, int) {
-            for (int m = m_start; m < m_end; ++m) {
-                const float* a_row = a_data + static_cast<size_t>(m) * K;
-                float* c_row = c_data + static_cast<size_t>(m) * N;
-                for (int n = 0; n < N; ++n) {
+        const int n_threads = std::max(1, pool.GetNumThreads());
+        const bool prefer_n_parallel =
+            n_threads > 1 && ((M <= 2 && N >= 64) || (M <= 4 && N >= 128) || (M < N / 4));
+
+        if (prefer_n_parallel) {
+            pool.ParallelFor(N, [=](int n_start, int n_end, int) {
+                for (int n = n_start; n < n_end; ++n) {
                     const float* b_row = b_data + static_cast<size_t>(n) * K;
-                    c_row[n] = simd::DotF32(a_row, b_row, K);
+                    for (int m = 0; m < M; ++m) {
+                        const float* a_row = a_data + static_cast<size_t>(m) * K;
+                        c_data[static_cast<size_t>(m) * N + n] = simd::DotF32(a_row, b_row, K);
+                    }
                 }
-            }
-        });
+            });
+        } else {
+            pool.ParallelFor(M, [=](int m_start, int m_end, int) {
+                for (int m = m_start; m < m_end; ++m) {
+                    const float* a_row = a_data + static_cast<size_t>(m) * K;
+                    float* c_row = c_data + static_cast<size_t>(m) * N;
+                    for (int n = 0; n < N; ++n) {
+                        const float* b_row = b_data + static_cast<size_t>(n) * K;
+                        c_row[n] = simd::DotF32(a_row, b_row, K);
+                    }
+                }
+            });
+        }
         return;
     }
 

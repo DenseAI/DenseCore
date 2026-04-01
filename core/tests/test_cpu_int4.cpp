@@ -149,6 +149,20 @@ void GemmInt4_Reference(float* output, const float* input, const uint8_t* weight
     }
 }
 
+void GemvInt4DualFusedSilu_Reference(float* output, const float* input, const uint8_t* gate_weights,
+                                     const float* gate_scales, const float* gate_zeros, const uint8_t* up_weights,
+                                     const float* up_scales, const float* up_zeros, int K, int N, int group_size,
+                                     int n_start, int n_end) {
+    std::vector<float> gate(N, 0.0f);
+    std::vector<float> up(N, 0.0f);
+    GemvInt4_Reference(gate.data(), input, gate_weights, gate_scales, gate_zeros, K, N, group_size, n_start, n_end);
+    GemvInt4_Reference(up.data(), input, up_weights, up_scales, up_zeros, K, N, group_size, n_start, n_end);
+    for (int n = n_start; n < n_end; ++n) {
+        const float g = gate[n];
+        output[n] = (g / (1.0f + std::exp(-g))) * up[n];
+    }
+}
+
 // =============================================================================
 // Test Fixtures
 // =============================================================================
@@ -332,6 +346,90 @@ TEST_F(GemvInt4Test, PartialRowProcessing) {
     }
     for (int n = n_end; n < N; n++) {
         EXPECT_EQ(output_[n], -999.0f) << "Row " << n << " should not be modified";
+    }
+}
+
+TEST_F(GemvInt4Test, DualFusedSilu_AlignedK_128_GroupSize32) {
+    const int K = 128;
+    const int N = 12;
+    const int group_size = 32;
+    const int num_groups = K / group_size;
+    const int packed_K = (K + 1) / 2;
+
+    std::vector<float> input(K);
+    std::vector<uint8_t> gate_weights(N * packed_K);
+    std::vector<uint8_t> up_weights(N * packed_K);
+    std::vector<float> gate_scales(N * num_groups);
+    std::vector<float> gate_zeros(N * num_groups);
+    std::vector<float> up_scales(N * num_groups);
+    std::vector<float> up_zeros(N * num_groups);
+    std::vector<float> output(N, 0.0f);
+    std::vector<float> reference(N, 0.0f);
+
+    for (float& v : input) {
+        v = RandFloat(-1.0f, 1.0f);
+    }
+    for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; k += 2) {
+            gate_weights[n * packed_K + k / 2] = PackInt4(RandInt4(), (k + 1 < K) ? RandInt4() : 0);
+            up_weights[n * packed_K + k / 2] = PackInt4(RandInt4(), (k + 1 < K) ? RandInt4() : 0);
+        }
+    }
+    for (float& v : gate_scales) v = RandFloat(0.01f, 0.1f);
+    for (float& v : gate_zeros) v = RandFloat(-1.0f, 1.0f);
+    for (float& v : up_scales) v = RandFloat(0.01f, 0.1f);
+    for (float& v : up_zeros) v = RandFloat(-1.0f, 1.0f);
+
+    GemvInt4DualFusedSilu_Reference(reference.data(), input.data(), gate_weights.data(), gate_scales.data(),
+                                    gate_zeros.data(), up_weights.data(), up_scales.data(), up_zeros.data(), K, N,
+                                    group_size, 0, N);
+    GemvInt4DualFusedSilu_Hwy(output.data(), input.data(), gate_weights.data(), gate_scales.data(), gate_zeros.data(),
+                              up_weights.data(), up_scales.data(), up_zeros.data(), K, N, group_size, 0, N);
+
+    for (int n = 0; n < N; ++n) {
+        EXPECT_NEAR(output[n], reference[n], 1e-3f) << "Mismatch at output[" << n << "]";
+    }
+}
+
+TEST_F(GemvInt4Test, DualFusedSilu_UnalignedK_257_GroupSize32) {
+    const int K = 257;
+    const int N = 7;
+    const int group_size = 32;
+    const int num_groups = K / group_size;
+    const int packed_K = (K + 1) / 2;
+
+    std::vector<float> input(K);
+    std::vector<uint8_t> gate_weights(N * packed_K);
+    std::vector<uint8_t> up_weights(N * packed_K);
+    std::vector<float> gate_scales(N * num_groups);
+    std::vector<float> gate_zeros(N * num_groups);
+    std::vector<float> up_scales(N * num_groups);
+    std::vector<float> up_zeros(N * num_groups);
+    std::vector<float> output(N, 0.0f);
+    std::vector<float> reference(N, 0.0f);
+
+    for (float& v : input) {
+        v = RandFloat(-1.0f, 1.0f);
+    }
+    for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; k += 2) {
+            gate_weights[n * packed_K + k / 2] = PackInt4(RandInt4(), (k + 1 < K) ? RandInt4() : 0);
+            up_weights[n * packed_K + k / 2] = PackInt4(RandInt4(), (k + 1 < K) ? RandInt4() : 0);
+        }
+    }
+    for (float& v : gate_scales) v = RandFloat(0.01f, 0.1f);
+    for (float& v : gate_zeros) v = RandFloat(-1.0f, 1.0f);
+    for (float& v : up_scales) v = RandFloat(0.01f, 0.1f);
+    for (float& v : up_zeros) v = RandFloat(-1.0f, 1.0f);
+
+    GemvInt4DualFusedSilu_Reference(reference.data(), input.data(), gate_weights.data(), gate_scales.data(),
+                                    gate_zeros.data(), up_weights.data(), up_scales.data(), up_zeros.data(), K, N,
+                                    group_size, 0, N);
+    GemvInt4DualFusedSilu_Hwy(output.data(), input.data(), gate_weights.data(), gate_scales.data(), gate_zeros.data(),
+                              up_weights.data(), up_scales.data(), up_zeros.data(), K, N, group_size, 0, N);
+
+    for (int n = 0; n < N; ++n) {
+        EXPECT_NEAR(output[n], reference[n], 2e-3f) << "Mismatch at output[" << n << "]";
     }
 }
 

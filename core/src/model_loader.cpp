@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -20,6 +21,7 @@
 #include "inference.h"  // For InitRoPETable
 #include "matmul_backend.h"
 #include "numa_allocator.h"
+#include "tokenizer.h"
 
 #if defined(__linux__)
 #include <sys/mman.h>  // For mmap, MAP_HUGETLB
@@ -27,6 +29,7 @@
 
 #include "apple_silicon.h"
 #include "dtype_utils.h"
+#include "qwen35_ssm_math.h"
 
 // ============================================================================
 // Mock Model (Test Build Only)
@@ -76,6 +79,7 @@ static TransformerModel* CreateMockModel() {
             std::cerr << "[DenseCore] Warning: Failed to initialize GGML Metal backend" << std::endl;
         }
     }
+
 #endif
 
     // Allocate dummy weights
@@ -417,6 +421,14 @@ TransformerModel* LoadGGUFModel(const char* path) {
     get_f32("rope.freq_base", model->hparams.rope_freq_base);
     get_f32("rope.freq_scale", model->hparams.rope_freq_scale);
     get_i32_arr4("rope.dimension_sections", model->hparams.rope_sections);
+    get_bool("rope.mrope_interleaved", model->hparams.rope_mrope_interleaved);
+    get_bool("rope.scaling.mrope_interleaved", model->hparams.rope_mrope_interleaved);
+    get_bool("mrope_interleaved", model->hparams.rope_mrope_interleaved);
+    if (!model->hparams.rope_mrope_interleaved && model->arch_flags.is_hybrid_ssm &&
+        (model->hparams.rope_sections[0] > 0 || model->hparams.rope_sections[1] > 0)) {
+        model->hparams.rope_mrope_interleaved = true;
+        std::cout << "[DenseCore] Defaulting hybrid-SSM MRoPE to interleaved mode" << std::endl;
+    }
 
     // Load MoE parameters when present.
     if (model->arch_flags.is_glm_moe || has_key("n_routed_experts") || has_key("num_experts_per_tok") ||
@@ -524,6 +536,25 @@ TransformerModel* LoadGGUFModel(const char* path) {
         get_u32("full_attention_interval", tmp);
         model->ssm_full_attn_interval = static_cast<int>(tmp);
 
+        const auto fail_hybrid_ssm = [&](const std::string& reason) {
+            std::cerr << "[DenseCore] FATAL: invalid hybrid SSM configuration: " << reason << std::endl;
+            if (model->backend) ggml_backend_free(model->backend);
+            gguf_free(ctx_gguf);
+            if (ctx_w) ggml_free(ctx_w);
+            delete model;
+            return static_cast<TransformerModel*>(nullptr);
+        };
+        if (model->ssm_inner_size <= 0 || model->ssm_state_size <= 0 || model->ssm_group_count <= 0 ||
+            model->ssm_time_step_rank <= 0 || model->ssm_conv_kernel <= 0) {
+            return fail_hybrid_ssm("non-positive SSM hyperparameter");
+        }
+        if (model->ssm_inner_size % model->ssm_time_step_rank != 0) {
+            return fail_hybrid_ssm("ssm_inner_size must be divisible by ssm_time_step_rank");
+        }
+        if (model->ssm_time_step_rank % model->ssm_group_count != 0) {
+            return fail_hybrid_ssm("ssm_time_step_rank must be divisible by ssm_group_count");
+        }
+
         std::vector<std::string> layer_types;
         get_str_array("layer_types", layer_types);
         if (!layer_types.empty()) {
@@ -544,6 +575,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
         // Initialize SSM runtime states
         const int conv_channels = model->ssm_inner_size + 2 * model->ssm_group_count * model->ssm_state_size;
         const int head_dim = model->ssm_inner_size / model->ssm_time_step_rank;
+        if (conv_channels <= 0 || head_dim <= 0) {
+            return fail_hybrid_ssm("derived conv_channels/head_dim must be positive");
+        }
         int n_ssm_layers = 0;
         for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
             if (model->IsHybridSSMLayer(static_cast<int>(i))) {
@@ -564,6 +598,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             std::cout << "[DenseCore] RoPE sections: [" << model->hparams.rope_sections[0] << ", "
                       << model->hparams.rope_sections[1] << ", " << model->hparams.rope_sections[2] << ", "
                       << model->hparams.rope_sections[3] << "]" << std::endl;
+            std::cout << "[DenseCore] MRoPE interleaved: "
+                      << (model->hparams.rope_mrope_interleaved ? "true" : "false") << std::endl;
         }
     }
 
@@ -795,6 +831,10 @@ TransformerModel* LoadGGUFModel(const char* path) {
         if (!model->bpe_merge_ranks.empty()) {
             std::cout << "[DenseCore] Loaded " << model->bpe_merge_ranks.size() << " BPE merges" << std::endl;
         }
+    }
+
+    if (!model->vocab_tokens.empty()) {
+        Tokenizer::BuildStreamTokenPieceCache(model);
     }
 
     // 3. Initialize backend with error checking
@@ -1331,44 +1371,179 @@ TransformerModel* LoadGGUFModel(const char* path) {
     // =========================================================================
     if (model->arch_flags.is_hybrid_ssm) {
         int ssm_ordinal = 0;
-        auto dequant = [](struct ggml_tensor* t, std::vector<float>& out) {
+        auto dequant_raw = [](struct ggml_tensor* t, std::vector<float>& out) {
             out.clear();
-            if (!t) return;
+            if (!t) return false;
             const int64_t n = ggml_nelements(t);
-            if (n <= 0) return;
+            if (n <= 0) return false;
             out.resize(static_cast<size_t>(n));
             const auto* traits = ggml_get_type_traits(t->type);
             if (t->type == GGML_TYPE_F32) {
                 std::memcpy(out.data(), t->data, static_cast<size_t>(n) * sizeof(float));
-            } else if (traits && traits->to_float) {
-                traits->to_float(t->data, out.data(), n);
-            } else {
-                out.clear();
+                return true;
             }
+            if (traits && traits->to_float) {
+                traits->to_float(t->data, out.data(), n);
+                return true;
+            }
+            out.clear();
+            return false;
+        };
+        const int conv_channels = model->ssm_inner_size + 2 * model->ssm_group_count * model->ssm_state_size;
+        const int n_heads = model->ssm_time_step_rank;
+        const int head_dim = model->ssm_inner_size / std::max(1, n_heads);
+        const int conv_expected = conv_channels * model->ssm_conv_kernel;
+        const int alpha_beta_expected = n_heads * static_cast<int>(model->hparams.n_embd);
+        const int per_head_expected = n_heads;
+        const int norm_head_expected = head_dim;
+        const int norm_full_expected = model->ssm_inner_size;
+        auto shape_string = [](const struct ggml_tensor* t) {
+            if (!t) return std::string("<null>");
+            std::string out = "[";
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                if (d != 0) out += "x";
+                out += std::to_string(static_cast<long long>(t->ne[d]));
+            }
+            out += "]";
+            return out;
+        };
+        auto validate_finite = [&](const char* label, const std::vector<float>& values, uint32_t layer_idx) -> bool {
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (!std::isfinite(values[i])) {
+                    std::cerr << "[DenseCore] FATAL: non-finite " << label << " value at layer " << layer_idx
+                              << " elem " << i << ": " << values[i] << std::endl;
+                    return false;
+                }
+            }
+            return true;
+        };
+        auto canonicalize_conv1d = [&](const char* label, struct ggml_tensor* t, std::vector<float>& out,
+                                       uint32_t layer_idx) -> bool {
+            std::vector<float> raw;
+            if (!dequant_raw(t, raw)) {
+                std::cerr << "[DenseCore] FATAL: unable to dequantize " << label << " at layer " << layer_idx
+                          << std::endl;
+                return false;
+            }
+            if (!t || (t->ne[0] != model->ssm_conv_kernel && t->ne[1] != model->ssm_conv_kernel) ||
+                (t->ne[0] != conv_channels && t->ne[1] != conv_channels)) {
+                std::cerr << "[DenseCore] FATAL: invalid " << label << " shape at layer " << layer_idx << ": "
+                          << shape_string(t) << ", expected [" << model->ssm_conv_kernel << "x" << conv_channels
+                          << "] or [" << conv_channels << "x" << model->ssm_conv_kernel << "]" << std::endl;
+                return false;
+            }
+            out.assign(static_cast<size_t>(conv_expected), 0.0f);
+            if (t->ne[0] == model->ssm_conv_kernel && t->ne[1] == conv_channels) {
+                out = std::move(raw);
+                return validate_finite(label, out, layer_idx);
+            }
+            for (int ch = 0; ch < conv_channels; ++ch) {
+                for (int k = 0; k < model->ssm_conv_kernel; ++k) {
+                    out[static_cast<size_t>(ch) * model->ssm_conv_kernel + k] =
+                        raw[static_cast<size_t>(k) * conv_channels + ch];
+                }
+            }
+            return validate_finite(label, out, layer_idx);
+        };
+        auto canonicalize_head_by_embd = [&](const char* label, struct ggml_tensor* t, std::vector<float>& out,
+                                             uint32_t layer_idx) -> bool {
+            std::vector<float> raw;
+            if (!dequant_raw(t, raw)) {
+                std::cerr << "[DenseCore] FATAL: unable to dequantize " << label << " at layer " << layer_idx
+                          << std::endl;
+                return false;
+            }
+            if (!t || ggml_n_dims(t) < 2) {
+                std::cerr << "[DenseCore] FATAL: invalid " << label << " rank at layer " << layer_idx << std::endl;
+                return false;
+            }
+            if (Qwen35CanonicalizeHeadByEmbd(raw.data(), t->ne, static_cast<int>(model->hparams.n_embd), n_heads,
+                                             &out)) {
+                return validate_finite(label, out, layer_idx);
+            }
+            std::cerr << "[DenseCore] FATAL: invalid " << label << " shape at layer " << layer_idx << ": "
+                      << shape_string(t) << ", expected [" << model->hparams.n_embd << "x" << n_heads << "] or ["
+                      << n_heads << "x" << model->hparams.n_embd << "]" << std::endl;
+            return false;
+        };
+        auto canonicalize_per_head = [&](const char* label, struct ggml_tensor* t, std::vector<float>& out,
+                                         uint32_t layer_idx) -> bool {
+            std::vector<float> raw;
+            if (!dequant_raw(t, raw)) {
+                std::cerr << "[DenseCore] FATAL: unable to dequantize " << label << " at layer " << layer_idx
+                          << std::endl;
+                return false;
+            }
+            if (!Qwen35CanonicalizePerHeadVector(raw.data(), t ? t->ne : nullptr, per_head_expected, &out)) {
+                std::cerr << "[DenseCore] FATAL: invalid " << label << " shape at layer " << layer_idx << ": "
+                          << shape_string(t) << ", expected [" << per_head_expected << "x1x1x1]" << std::endl;
+                return false;
+            }
+            return validate_finite(label, out, layer_idx);
+        };
+        auto canonicalize_norm = [&](const char* label, struct ggml_tensor* t, std::vector<float>& out,
+                                     Qwen35SSMNormLayout* out_layout, uint32_t layer_idx) -> bool {
+            std::vector<float> raw;
+            if (!dequant_raw(t, raw)) {
+                std::cerr << "[DenseCore] FATAL: unable to dequantize " << label << " at layer " << layer_idx
+                          << std::endl;
+                return false;
+            }
+            const Qwen35SSMNormLayout norm_layout =
+                Qwen35CanonicalizeNorm(raw.data(), t ? t->ne : nullptr, norm_head_expected, norm_full_expected, &out);
+            if (norm_layout == Qwen35SSMNormLayout::INVALID) {
+                std::cerr << "[DenseCore] FATAL: invalid " << label << " shape at layer " << layer_idx << ": "
+                          << shape_string(t) << ", expected [" << norm_head_expected << "x1x1x1] or ["
+                          << norm_full_expected << "x1x1x1]" << std::endl;
+                return false;
+            }
+            if (out_layout) {
+                *out_layout = norm_layout;
+            }
+            return validate_finite(label, out, layer_idx);
         };
         for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
             const bool is_ssm = model->IsHybridSSMLayer(static_cast<int>(i));
             if (!is_ssm) continue;
             if (ssm_ordinal < static_cast<int>(model->ssm_layer_states.size())) {
                 auto& state = model->ssm_layer_states[ssm_ordinal];
-                dequant(model->layers[i].Get(model_keys::kSSMConv1d), state.conv1d_f32);
-                dequant(model->layers[i].Get(model_keys::kSSMAlpha), state.alpha_f32);
-                dequant(model->layers[i].Get(model_keys::kSSMBeta), state.beta_f32);
-                dequant(model->layers[i].Get(model_keys::kSSMDtBias), state.dt_bias_f32);
-                dequant(model->layers[i].Get(model_keys::kSSMA), state.ssm_a_f32);
-                dequant(model->layers[i].Get(model_keys::kSSMNorm), state.norm_f32);
+                auto* conv = model->layers[i].Get(model_keys::kSSMConv1d);
+                auto* alpha = model->layers[i].Get(model_keys::kSSMAlpha);
+                auto* beta = model->layers[i].Get(model_keys::kSSMBeta);
+                auto* dt = model->layers[i].Get(model_keys::kSSMDtBias);
+                auto* ssm_a = model->layers[i].Get(model_keys::kSSMA);
+                auto* norm = model->layers[i].Get(model_keys::kSSMNorm);
+
+                if (!canonicalize_conv1d("ssm_conv1d", conv, state.conv1d_f32, i) ||
+                    !canonicalize_head_by_embd("ssm_alpha", alpha, state.alpha_f32, i) ||
+                    !canonicalize_head_by_embd("ssm_beta", beta, state.beta_f32, i) ||
+                    !canonicalize_per_head("ssm_dt_bias", dt, state.dt_bias_f32, i) ||
+                    !canonicalize_per_head("ssm_a/A_log", ssm_a, state.a_log_f32, i) ||
+                    !canonicalize_norm("ssm_norm", norm, state.norm_f32, &state.norm_layout, i)) {
+                    if (model->backend) ggml_backend_free(model->backend);
+                    gguf_free(ctx_gguf);
+                    if (ctx_w) ggml_free(ctx_w);
+                    delete model;
+                    return nullptr;
+                }
 
                 if (i == 0) {
-                    auto* conv = model->layers[i].Get(model_keys::kSSMConv1d);
-                    auto* alpha = model->layers[i].Get(model_keys::kSSMAlpha);
-                    auto* beta = model->layers[i].Get(model_keys::kSSMBeta);
-                    auto* dt = model->layers[i].Get(model_keys::kSSMDtBias);
-                    auto* ssm_a = model->layers[i].Get(model_keys::kSSMA);
-                    auto* norm = model->layers[i].Get(model_keys::kSSMNorm);
                     std::cout << "[DenseCore] Qwen3.5 SSM tensor types: conv1d=" << ggml_type_name(conv->type)
                               << " alpha=" << ggml_type_name(alpha->type) << " beta=" << ggml_type_name(beta->type)
                               << " dt_bias=" << ggml_type_name(dt->type) << " ssm_a=" << ggml_type_name(ssm_a->type)
                               << " norm=" << ggml_type_name(norm->type) << std::endl;
+                    std::cout << "[DenseCore] Qwen3.5 SSM tensor shapes: conv1d=" << shape_string(conv)
+                              << " alpha=" << shape_string(alpha) << " beta=" << shape_string(beta)
+                              << " dt_bias=" << shape_string(dt) << " A_log=" << shape_string(ssm_a)
+                              << " norm=" << shape_string(norm) << std::endl;
+                    std::cout << "[DenseCore] Qwen3.5 SSM canonical layouts: conv1d=" << state.conv1d_f32.size()
+                              << " alpha=" << state.alpha_f32.size() << " beta=" << state.beta_f32.size()
+                              << " dt_bias=" << state.dt_bias_f32.size() << " A_log=" << state.a_log_f32.size()
+                              << " norm=" << state.norm_f32.size() << " norm_semantics="
+                              << (state.norm_layout == Qwen35SSMNormLayout::SHARED_HEAD_DIM ? "shared_head_dim"
+                                  : state.norm_layout == Qwen35SSMNormLayout::FLATTENED_D_INNER ? "flattened_d_inner"
+                                                                                                  : "invalid")
+                              << std::endl;
                 }
             }
             ++ssm_ordinal;
@@ -1882,10 +2057,32 @@ TransformerModel* LoadGGUFModel(const char* path) {
         t = ggml_get_next_tensor(model->ctx_w, t);
     }
 
-    const bool prepopulate_weights = []() {
+    const bool prepopulate_weights = [total_weight_bytes]() {
         const char* env = std::getenv("DENSECORE_PREPOPULATE_WEIGHTS");
-        if (!env) return true;
-        return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 && std::strcmp(env, "FALSE") != 0;
+        if (env && env[0] != '\0') {
+            std::string mode(env);
+            std::transform(mode.begin(), mode.end(), mode.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (mode == "0" || mode == "false" || mode == "off" || mode == "no") {
+                return false;
+            }
+            if (mode == "1" || mode == "true" || mode == "on" || mode == "yes" || mode == "force") {
+                return true;
+            }
+        }
+
+        const char* threshold_env = std::getenv("DENSECORE_PREPOPULATE_WEIGHTS_THRESHOLD_MB");
+        size_t threshold_mb = 8192;
+        if (threshold_env && threshold_env[0] != '\0') {
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(threshold_env, &end, 10);
+            if (end != threshold_env && *end == '\0' && parsed > 0) {
+                threshold_mb = static_cast<size_t>(parsed);
+            }
+        }
+
+        const size_t threshold_bytes = threshold_mb * 1024ULL * 1024ULL;
+        return total_weight_bytes <= threshold_bytes;
     }();
 
     if (densecore::NumaAllocator::IsNumaAvailable()) {
@@ -1909,7 +2106,13 @@ TransformerModel* LoadGGUFModel(const char* path) {
                       << " MB of weight pages (MADV_WILLNEED)" << std::endl;
         }
     } else {
-        std::cout << "[DenseCore] Skipping weight pre-population (DENSECORE_PREPOPULATE_WEIGHTS=0)" << std::endl;
+        std::cout << "[DenseCore] Skipping weight pre-population";
+        if (const char* env = std::getenv("DENSECORE_PREPOPULATE_WEIGHTS"); env && env[0] != '\0') {
+            std::cout << " (DENSECORE_PREPOPULATE_WEIGHTS=" << env << ")";
+        } else {
+            std::cout << " (auto-disabled for large model; override with DENSECORE_PREPOPULATE_WEIGHTS=1)";
+        }
+        std::cout << std::endl;
     }
 #endif
 

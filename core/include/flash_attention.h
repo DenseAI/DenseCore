@@ -36,6 +36,8 @@ struct FlashAttentionConfig {
     float scale = 0.0f;   // If 0, will be set to 1/sqrt(head_dim)
     bool causal = true;   // Causal masking
     int num_threads = 1;  // For parallel heads
+    int q_start_offset = 0;   // Global query offset for chunked prefill causal masking
+    int kv_start_offset = 0;  // Global key/value offset for chunked prefill causal masking
 };
 
 /**
@@ -271,6 +273,8 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
     std::fill(M, M + seq_len_q, -1e10f);
 
     // Process in tiles (outer KV loop for better cache locality)
+    const int q_base = std::max(0, config.q_start_offset);
+    const int kv_base = std::max(0, config.kv_start_offset);
     for (int j = 0; j < seq_len_kv; j += Bc) {
         const int kv_end = std::min(j + Bc, seq_len_kv);
         const int kv_len = kv_end - j;
@@ -281,7 +285,7 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
             const int q_len = q_end - i;
 
             // Apply causal mask: skip if all keys are after all queries
-            if (config.causal && j > i + q_len - 1) {
+            if (config.causal && (kv_base + j) > (q_base + i + q_len - 1)) {
                 continue;
             }
 
@@ -292,7 +296,7 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
 
             // Step 2: Apply causal mask (vectorized)
             if (config.causal) {
-                simd::ApplyMask(scratch.qk_block.data(), i, j, q_len, kv_len);
+                simd::ApplyMask(scratch.qk_block.data(), q_base + i, kv_base + j, q_len, kv_len);
             }
 
             // Step 3: Online softmax update (vectorized)

@@ -15,6 +15,7 @@
 
 #include "densecore/hal/tensor.h"
 #include "numa_allocator.h"
+#include "qwen35_ssm_math.h"
 // ============================================================================
 // Model Architecture Enum
 // ============================================================================
@@ -136,6 +137,7 @@ struct TransformerHParams {
     float rope_freq_base = 10000.0f;
     float rope_freq_scale = 1.0f;
     std::array<int32_t, 4> rope_sections = {0, 0, 0, 0};
+    bool rope_mrope_interleaved = false;
 };
 
 // Canonical per-layer tensor keys (GGUF-agnostic, used by graph builders)
@@ -456,12 +458,13 @@ struct TransformerModel {
     // Indexed by SSM layer ordinal (NOT physical layer index).
     // Each entry holds immutable, dequantized per-layer weights for one SSM layer.
     struct SSMLayerRuntimeState {
-        std::vector<float> conv1d_f32;   // dequantized ssm_conv1d.weight [conv_channels * kernel]
-        std::vector<float> alpha_f32;    // dequantized ssm_alpha.weight [n_heads * n_embd]
-        std::vector<float> beta_f32;     // dequantized ssm_beta.weight  [n_heads * n_embd]
-        std::vector<float> dt_bias_f32;  // dequantized ssm_dt.bias [n_heads]
-        std::vector<float> ssm_a_f32;    // dequantized ssm_a [n_heads]
-        std::vector<float> norm_f32;     // dequantized ssm_norm.weight [head_dim]
+        std::vector<float> conv1d_f32;   // canonical [conv_channels][kernel]
+        std::vector<float> alpha_f32;    // canonical [n_heads][n_embd]
+        std::vector<float> beta_f32;     // canonical [n_heads][n_embd]
+        std::vector<float> dt_bias_f32;  // canonical [n_heads]
+        std::vector<float> a_log_f32;    // canonical GGUF A_log values [n_heads], not materialized A
+        std::vector<float> norm_f32;     // canonical shared [head_dim_v] or flattened [d_inner]
+        Qwen35SSMNormLayout norm_layout = Qwen35SSMNormLayout::INVALID;
         void Init(int conv_channels, int kernel_size, int n_heads, int head_dim, int d_state) {
             (void)conv_channels;
             (void)kernel_size;
@@ -473,10 +476,21 @@ struct TransformerModel {
 
     struct SSMSequenceRuntimeState {
         std::vector<float> conv_state;  // [conv_channels * (kernel_size - 1)]
-        std::vector<float> ssm_state;   // [n_heads * head_dim * d_state]
+        std::vector<float> ssm_state;   // canonical [n_heads][head_dim_k][head_dim_v], flattened as [K,V]
+        static size_t ExpectedConvStateElements(int conv_channels, int kernel_size) {
+            return static_cast<size_t>(conv_channels) * static_cast<size_t>(std::max(0, kernel_size - 1));
+        }
+        static size_t ExpectedStateElements(int n_heads, int head_dim_k, int head_dim_v) {
+            return static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim_k) * static_cast<size_t>(head_dim_v);
+        }
         void Init(int conv_channels, int kernel_size, int n_heads, int head_dim, int d_state) {
-            conv_state.assign(static_cast<size_t>(conv_channels) * (kernel_size - 1), 0.0f);
-            ssm_state.assign(static_cast<size_t>(n_heads) * head_dim * d_state, 0.0f);
+            conv_state.assign(ExpectedConvStateElements(conv_channels, kernel_size), 0.0f);
+            ssm_state.assign(ExpectedStateElements(n_heads, head_dim, d_state), 0.0f);
+        }
+        bool MatchesShape(int conv_channels, int kernel_size, int n_heads, int head_dim, int d_state) const {
+            const size_t expected_conv = ExpectedConvStateElements(conv_channels, kernel_size);
+            const size_t expected_ssm = ExpectedStateElements(n_heads, head_dim, d_state);
+            return conv_state.size() == expected_conv && ssm_state.size() == expected_ssm;
         }
         void Reset() {
             std::fill(conv_state.begin(), conv_state.end(), 0.0f);
@@ -523,6 +537,8 @@ struct TransformerModel {
     std::vector<int32_t> stop_token_ids;
     // Optional chat template string from GGUF metadata.
     std::string chat_template;
+    // Pre-decoded stream-safe token pieces used by hot decode/token streaming.
+    std::vector<std::string> stream_token_pieces;
     int32_t bos_token_id = 1;
     int32_t eos_token_id = 2;
     std::string tokenizer_type;

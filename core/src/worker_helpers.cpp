@@ -165,6 +165,28 @@ bool IsReasoningTagSuppressionEnabled() {
     return enabled;
 }
 
+bool IsDirectCallbackEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DIRECT_CALLBACK");
+        if (!env || env[0] == '\0') {
+            return false;
+        }
+        return std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool IsSingleRequestFastPathEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_SINGLE_REQUEST_FAST_PATH");
+        if (!env || env[0] == '\0') {
+            return true;
+        }
+        return std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
 bool IsBenchmarkFastPathEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_BENCH_MODE");
@@ -666,10 +688,10 @@ int ResolveAutoDecodeThreadsForBatch(int num_seqs, int physical_core_count, int 
     }
 
     switch (std::min(num_seqs, 4)) {
-    case 1: return std::max(min_threads, std::min(cap, (cap * 5 + 7) / 8));
-    case 2: return std::max(min_threads, std::min(cap, (cap * 3 + 3) / 4));
-    case 3: return std::max(min_threads, std::min(cap, (cap * 3 + 3) / 4));
-    case 4: return std::max(min_threads, std::min(cap, (cap * 7 + 7) / 8));
+    case 1: return cap;
+    case 2: return std::max(min_threads, std::min(cap, (cap * 7 + 7) / 8));
+    case 3: return cap;
+    case 4: return cap;
     default: return cap;
     }
 }
@@ -807,17 +829,29 @@ void EnsureRequestHybridSSMRuntimeState(TransformerModel* model, Request* req) {
     const int conv_channels = model->ssm_inner_size + 2 * model->ssm_group_count * model->ssm_state_size;
     const int head_dim = model->ssm_inner_size / model->ssm_time_step_rank;
     const size_t n_ssm_layers = model->ssm_layer_states.size();
-
-    if (req->ssm_runtime_states.size() != n_ssm_layers) {
+    const auto reinit_all = [&]() {
         req->ssm_runtime_states.resize(n_ssm_layers);
         for (auto& state : req->ssm_runtime_states) {
-            state.Init(conv_channels, model->ssm_conv_kernel, model->ssm_time_step_rank, head_dim,
-                       model->ssm_state_size);
+            state.Init(conv_channels, model->ssm_conv_kernel, model->ssm_time_step_rank, head_dim, model->ssm_state_size);
         }
+    };
+    const size_t expected_conv =
+        TransformerModel::SSMSequenceRuntimeState::ExpectedConvStateElements(conv_channels, model->ssm_conv_kernel);
+    const size_t expected_ssm = TransformerModel::SSMSequenceRuntimeState::ExpectedStateElements(
+        model->ssm_time_step_rank, head_dim, model->ssm_state_size);
+
+    if (req->ssm_runtime_states.size() != n_ssm_layers) {
+        reinit_all();
         return;
     }
 
     for (auto& state : req->ssm_runtime_states) {
+        if (state.conv_state.size() != expected_conv || state.ssm_state.size() != expected_ssm ||
+            !state.MatchesShape(conv_channels, model->ssm_conv_kernel, model->ssm_time_step_rank, head_dim,
+                                model->ssm_state_size)) {
+            reinit_all();
+            return;
+        }
         state.Reset();
     }
 }

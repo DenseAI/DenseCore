@@ -45,6 +45,7 @@
 #include "memory_pool.h"
 #include "moe/moe_routing.h"
 #include "quantization/int4_types.h"  // For TensorInt4
+#include "qwen35_ssm_math.h"
 #include "scheduler.h"
 #include "simd_ops.h"
 
@@ -197,6 +198,59 @@ static void LogMatmulDispatch(const char* weight_name, const char* weight_type_l
     }
 }
 
+static bool IsHybridSSMQkvWeightName(const char* weight_name) {
+    if (!weight_name || weight_name[0] == '\0') {
+        return false;
+    }
+    return std::strstr(weight_name, "attn_qkv.weight") != nullptr ||
+           std::strstr(weight_name, "linear_attn.in_proj_qkv.weight") != nullptr;
+}
+
+static bool IsDebugSSMQkvReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SSM_QKV_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugSSMProjectionReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SSM_PROJECTION_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugSSMCoreReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SSM_CORE_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool ShouldForcePlainGgmlForHybridSSMQkv() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_HYBRID_SSM_QKV_FORCE_GGML");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static void LogHybridSSMQkvDispatch(const char* weight_name, ggml_type weight_type, int M, int N, int K,
+                                    const char* chosen_path, bool used_batched_quant_nrc, bool used_native_q4k_vecdot,
+                                    bool used_direct_int4_fastpath) {
+    if (!IsDebugMatmulDispatchEnabled() || !IsHybridSSMQkvWeightName(weight_name)) {
+        return;
+    }
+    fprintf(stderr,
+            "[SSM_QKV_DISPATCH] w=%s ggml_type=%s M=%d N=%d K=%d path=%s batched_quant_nrc=%d native_q4k_vecdot=%d direct_int4_fastpath=%d\n",
+            weight_name ? weight_name : "(unnamed)", ggml_type_name(weight_type), M, N, K,
+            chosen_path ? chosen_path : "unknown", used_batched_quant_nrc ? 1 : 0, used_native_q4k_vecdot ? 1 : 0,
+            used_direct_int4_fastpath ? 1 : 0);
+}
+
 // Env-tunable thresholds declared here, defined after ParsePositiveEnvInt.
 static int GetBatchedMinM();
 static int GetBatchedMinN();
@@ -340,6 +394,14 @@ static bool IsCustomGemvDisabled() {
     return disabled;
 }
 
+static bool IsPackedInt4CustomDisabled() {
+    static const bool disabled = []() {
+        const char* env = std::getenv("DENSECORE_DISABLE_PACKED_INT4_CUSTOM");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return disabled;
+}
+
 // Legacy opt-in (kept for backward compat, but batched quant is now always-on by default)
 static bool IsSmallBatchQuantGemmEnabled() {
     static const bool enabled = []() {
@@ -369,6 +431,29 @@ static bool IsBatchedQuantDisabled() {
         return !IsSmallBatchQuantGemmEnabled();
     }();
     return disabled;
+}
+
+// ARM small-batch quantized matmul policy.
+// Default to the DenseCore batched path on ARM and keep an opt-out for
+// diagnostics. Falling back to generic GGML on this model family was both
+// slower and numerically unstable on real prefill traffic.
+static bool IsArmBatchedQuantSafeByDefault() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    static const bool enabled = []() {
+        const char* disable_env = std::getenv("DENSECORE_ARM_DISABLE_BATCHED_QUANT");
+        if (disable_env && disable_env[0] != '\0' && std::strcmp(disable_env, "0") != 0) {
+            return false;
+        }
+        const char* enable_env = std::getenv("DENSECORE_ARM_ENABLE_BATCHED_QUANT");
+        if (enable_env && enable_env[0] != '\0') {
+            return std::strcmp(enable_env, "0") != 0;
+        }
+        return true;
+    }();
+    return enabled;
+#else
+    return true;
+#endif
 }
 
 // Enable nrc-batched quant path by default and rely on per-type runtime checks
@@ -1026,6 +1111,128 @@ static bool IsPagedAttentionHwyEnabled() {
     return enabled;
 }
 
+static bool IsDebugPagedAttentionReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_PAGED_ATTN_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool ShouldRunPagedAttentionReferenceProbe(int layer, int token_idx) {
+    if (!IsDebugPagedAttentionReferenceEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_PAGED_ATTN_REFERENCE_LAYER", -1);
+    static const int target_token = ParseIntEnv("DENSECORE_DEBUG_PAGED_ATTN_REFERENCE_TOKEN", 0);
+    static std::atomic<int> remaining_budget{
+        ParsePositiveEnvInt("DENSECORE_DEBUG_PAGED_ATTN_REFERENCE_MAX_CALLS", 1)};
+
+    if (target_layer >= 0 && layer != target_layer) {
+        return false;
+    }
+    if (target_token >= 0 && token_idx != target_token) {
+        return false;
+    }
+
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void DebugLogTensorFiniteStats(const char* tag, const struct ggml_tensor* tensor) {
+    if (!tag || !tensor || !tensor->data || tensor->type != GGML_TYPE_F32) {
+        return;
+    }
+    const float* data = reinterpret_cast<const float*>(tensor->data);
+    const int n = ggml_nelements(tensor);
+    if (n <= 0) {
+        return;
+    }
+
+    int nan_ct = 0;
+    int inf_ct = 0;
+    int zero_ct = 0;
+    int finite_ct = 0;
+    float mn = std::numeric_limits<float>::infinity();
+    float mx = -std::numeric_limits<float>::infinity();
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const float v = data[i];
+        if (std::isnan(v)) {
+            ++nan_ct;
+            continue;
+        }
+        if (!std::isfinite(v)) {
+            ++inf_ct;
+            continue;
+        }
+        if (v == 0.0f) {
+            ++zero_ct;
+        }
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+        sum += v;
+        sum_sq += static_cast<double>(v) * static_cast<double>(v);
+        ++finite_ct;
+    }
+
+    if (!std::isfinite(mn)) mn = 0.0f;
+    if (!std::isfinite(mx)) mx = 0.0f;
+    const double mean = finite_ct > 0 ? (sum / finite_ct) : 0.0;
+    const double rms = finite_ct > 0 ? std::sqrt(sum_sq / finite_ct) : 0.0;
+    std::fprintf(stderr,
+                 "[%s] type=%d shape=[%ld,%ld,%ld] total=%d zero=%d nan=%d inf=%d min=%.6f max=%.6f mean=%.6f rms=%.6f\n",
+                 tag, static_cast<int>(tensor->type), static_cast<long>(tensor->ne[0]), static_cast<long>(tensor->ne[1]),
+                 static_cast<long>(tensor->ne[2]), n, zero_ct, nan_ct, inf_ct, mn, mx, mean, rms);
+}
+
+static void ComputeMatmulReferenceF32(const struct ggml_tensor* weight, const struct ggml_tensor* input,
+                                      std::vector<float>* out) {
+    constexpr int kMatmulReferenceMaxDequant = 16384;
+    if (!weight || !input || !out || !weight->data || !input->data || input->type != GGML_TYPE_F32) {
+        out->clear();
+        return;
+    }
+    const int N = static_cast<int>(weight->ne[0]);
+    const int K = static_cast<int>(weight->ne[1]);
+    const int M = static_cast<int>(input->ne[1]);
+    if (N <= 0 || K <= 0 || M <= 0 || static_cast<int>(input->ne[0]) != N) {
+        out->clear();
+        return;
+    }
+
+    const auto* type_traits = ggml_get_type_traits(weight->type);
+    if (!type_traits || !type_traits->to_float || N > kMatmulReferenceMaxDequant) {
+        out->clear();
+        return;
+    }
+
+    out->assign(static_cast<size_t>(K) * static_cast<size_t>(M), 0.0f);
+    std::vector<float> dequant_row(static_cast<size_t>(N), 0.0f);
+    const char* weight_base = reinterpret_cast<const char*>(weight->data);
+    const char* input_base = reinterpret_cast<const char*>(input->data);
+    for (int k = 0; k < K; ++k) {
+        const void* row_ptr = weight_base + static_cast<size_t>(k) * static_cast<size_t>(weight->nb[1]);
+        type_traits->to_float(row_ptr, dequant_row.data(), N);
+        for (int m = 0; m < M; ++m) {
+            const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(input->nb[1]);
+            float sum = 0.0f;
+            for (int i = 0; i < N; ++i) {
+                const float x = *reinterpret_cast<const float*>(src_col + static_cast<size_t>(i) * input->nb[0]);
+                sum += dequant_row[static_cast<size_t>(i)] * x;
+            }
+            (*out)[static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k)] = sum;
+        }
+    }
+}
+
 static bool IsDecodeProfileEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_PROFILE_DECODE");
@@ -1517,6 +1724,7 @@ struct AddRMSNormUserData {
     int n_embd;               ///< Embedding dimension
     int n_tokens;             ///< Number of tokens
     float eps;                ///< RMSNorm epsilon
+    ptrdiff_t residual_row_stride = 0;  ///< Residual row stride in float elements
 };
 
 // Thread-local pool for AddRMSNorm user data
@@ -1529,7 +1737,7 @@ AddRMSNormUserData* GetAddRMSNormUserData();
 // =============================================================================
 static constexpr int kMaxGemvUserDataSlots = 2048;
 static constexpr size_t kMaxQuantInputBufferSize = 65536;  // 64KB for large N
-static constexpr int kMaxSmallBatchColsHard = 8;
+static constexpr int kMaxSmallBatchColsHard = 16;
 static constexpr size_t kMaxDequantBufferSize = 16384;
 static constexpr int kMaxPagedAttentionUserDataSlots = 256;
 
@@ -1542,6 +1750,7 @@ struct GemvUserData {
     int K;                              // Output dimension
     ggml_type weight_type;              // Tensor type (F32, Q4_K, Q8_0, etc.)
     ggml_type input_quant_type;         // Quantization type for input (Q8_K, Q8_0, or F32)
+    bool force_reference_scalar = false;
     int slot_id = -1;
     uint8_t* quant_input_shared = nullptr;
     std::atomic<uint64_t>* quantized_stamp = nullptr;
@@ -1553,6 +1762,7 @@ struct GemvBatchedUserData {
     int K = 0;                                    // Output dimension
     int M = 0;                                    // Number of input columns (tokens)
     ggml_type weight_type = GGML_TYPE_F32;
+    bool force_reference_scalar = false;
     int slot_id = -1;
     ggml_type input_quant_type = GGML_TYPE_F32;
     size_t quant_row_stride = 0;  // Pre-computed aligned row stride for quantized input
@@ -1572,7 +1782,27 @@ struct PagedAttentionUserData {
     std::atomic<uint64_t> epoch_started{0};
     std::atomic<uint64_t> epoch_done{0};
     std::atomic<int> kv_writers_done{0};
+    std::atomic<int> shared_block_ptrs_ready{0};
+    std::vector<const void*>* shared_k_block_ptrs = nullptr;
+    std::vector<const void*>* shared_v_block_ptrs = nullptr;
 };
+
+inline int ResolvePagedAttentionDecodeHeadTile(int n_head, int n_tokens, int n_tasks) {
+    const int configured_head_tile = std::max(1, ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", 8));
+    if (n_head <= 0 || n_tokens <= 0 || n_tasks <= 0) {
+        return configured_head_tile;
+    }
+
+    // For latency-sensitive decode (batch 1-4), expose enough head tiles to keep
+    // CPU workers occupied. The historical fixed tile=8 leaves batch=1 with only
+    // four tasks on 32-head Qwen models, which strands cores during decode.
+    if (n_tokens <= 4) {
+        const int target_tiles_per_token = std::max(1, (n_tasks + n_tokens - 1) / n_tokens);
+        const int adaptive_head_tile = std::max(1, (n_head + target_tiles_per_token - 1) / target_tiles_per_token);
+        return std::min(configured_head_tile, adaptive_head_tile);
+    }
+    return configured_head_tile;
+}
 
 /**
  * Custom callback for fused Add + RMSNorm
@@ -1586,11 +1816,17 @@ void cb_residual_rmsnorm_fused(struct ggml_tensor* dst, const struct ggml_tensor
                                void* userdata) {
     auto* ud = (AddRMSNormUserData*)userdata;
     if (!ud || !ud->rms_weight) return;
+    if (!src || !dst || !src->data || !dst->data) return;
+    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return;
+    if (src->nb[0] != static_cast<int64_t>(sizeof(float)) || dst->nb[0] != static_cast<int64_t>(sizeof(float))) return;
 
     const int n_embd = ud->n_embd;
     const int n_tokens = ud->n_tokens;
     const float eps = ud->eps;
     const bool has_residual = ud->residual != nullptr;
+    const ptrdiff_t src_row_stride = static_cast<ptrdiff_t>(src->nb[1] / sizeof(float));
+    const ptrdiff_t dst_row_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
+    const ptrdiff_t residual_row_stride = ud->residual_row_stride > 0 ? ud->residual_row_stride : n_embd;
 
     // Partition work across tokens
     const int tokens_per_thread = (n_tokens + nth - 1) / nth;
@@ -1601,11 +1837,11 @@ void cb_residual_rmsnorm_fused(struct ggml_tensor* dst, const struct ggml_tensor
 
     // Process assigned tokens
     for (int t = t_start; t < t_end; t++) {
-        const float* x_ptr = (const float*)src->data + t * n_embd;
-        float* out_ptr = (float*)dst->data + t * n_embd;
+        const float* x_ptr = reinterpret_cast<const float*>(src->data) + static_cast<ptrdiff_t>(t) * src_row_stride;
+        float* out_ptr = reinterpret_cast<float*>(dst->data) + static_cast<ptrdiff_t>(t) * dst_row_stride;
 
         if (has_residual) {
-            const float* res_ptr = ud->residual + t * n_embd;
+            const float* res_ptr = ud->residual + static_cast<ptrdiff_t>(t) * residual_row_stride;
             // Use unified AddRMSNorm dispatcher (Runtime AVX512/AVX2/Scalar)
             densecore::simd::AddRMSNorm(out_ptr, x_ptr, res_ptr, ud->rms_weight, static_cast<size_t>(n_embd), eps);
         } else {
@@ -1679,25 +1915,37 @@ struct SSMConv1DUserData {
     const float* weight;
     int channels;
     int kernel_size;
+    int layer_idx = -1;
     int ssm_ordinal = -1;
     const int* token_seq_ids = nullptr;
     const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
+};
+
+struct SSMProjectionReferenceUserData {
+    const struct ggml_tensor* weight_tensor = nullptr;
+    const struct ggml_tensor* input_tensor = nullptr;
+    int layer_idx = -1;
+    const int* token_seq_ids = nullptr;
+    const char* stage = nullptr;
+    const char* var_name = nullptr;
 };
 
 struct SSMQwen35DeltaUserData {
     const float* alpha_weight;  // [n_heads, n_embd]
     const float* beta_weight;   // [n_heads, n_embd]
     const float* dt_bias;       // [n_heads]
-    const float* ssm_a;         // [n_heads]
-    const float* norm_weight;   // [head_dim_v]
-    float* ssm_state;           // [n_heads * head_dim_k * head_dim_v]
+    const float* a_log;         // [n_heads]
+    const float* norm_weight;   // [head_dim_v] or [d_inner]
+    float* ssm_state;           // canonical [n_heads][head_dim_k][head_dim_v]
     int n_embd;
     int d_inner;
     int n_heads;
     int head_dim_v;
     int head_dim_k;
     int n_groups;
+    Qwen35SSMNormLayout norm_layout = Qwen35SSMNormLayout::INVALID;
     float norm_eps;
+    int layer_idx = -1;
     int ssm_ordinal = -1;
     const int* token_seq_ids = nullptr;
     const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
@@ -1732,8 +1980,12 @@ struct InferenceWorkContext {
     int gemv_batched_userdata_index = 0;
     PagedAttentionUserData paged_attention_userdata_pool[kMaxPagedAttentionUserDataSlots];
     int paged_attention_userdata_index = 0;
+    std::vector<const void*> paged_attention_shared_k_block_ptrs;
+    std::vector<const void*> paged_attention_shared_v_block_ptrs;
     SSMConv1DUserData ssm_conv1d_pool[128];
     int ssm_conv1d_index = 0;
+    SSMProjectionReferenceUserData ssm_projection_reference_pool[384];
+    int ssm_projection_reference_index = 0;
     SSMQwen35DeltaUserData ssm_qwen35_delta_pool[128];
     int ssm_qwen35_delta_index = 0;
     std::vector<ggml_bf16_t> bf16_buffer;
@@ -1757,7 +2009,10 @@ void ResetInferenceWorkContext(InferenceWorkContext* ctx) {
     ctx->gemv_userdata_index = 0;
     ctx->gemv_batched_userdata_index = 0;
     ctx->paged_attention_userdata_index = 0;
+    ctx->paged_attention_shared_k_block_ptrs.clear();
+    ctx->paged_attention_shared_v_block_ptrs.clear();
     ctx->ssm_conv1d_index = 0;
+    ctx->ssm_projection_reference_index = 0;
     ctx->ssm_qwen35_delta_index = 0;
     g_shared_batch.store(nullptr, std::memory_order_release);
 }
@@ -1869,7 +2124,11 @@ inline PagedAttentionUserData* GetPagedAttentionUserData() {
         ctx->paged_attention_userdata_index = 0;
         idx = 0;
     }
-    return &ctx->paged_attention_userdata_pool[idx];
+    PagedAttentionUserData* ud = &ctx->paged_attention_userdata_pool[idx];
+    ud->shared_k_block_ptrs = &ctx->paged_attention_shared_k_block_ptrs;
+    ud->shared_v_block_ptrs = &ctx->paged_attention_shared_v_block_ptrs;
+    ud->shared_block_ptrs_ready.store(0, std::memory_order_relaxed);
+    return ud;
 }
 
 inline SSMConv1DUserData* GetSSMConv1DUserData() {
@@ -1883,6 +2142,20 @@ inline SSMConv1DUserData* GetSSMConv1DUserData() {
         throw densecore::OutOfMemoryException("SSMConv1DUserData pool exhausted");
     }
     return &ctx->ssm_conv1d_pool[idx];
+}
+
+inline SSMProjectionReferenceUserData* GetSSMProjectionReferenceUserData() {
+    InferenceWorkContext* ctx = GetCurrentWorkContext();
+    if (!ctx) {
+        throw densecore::InvalidArgumentException(
+            "GetSSMProjectionReferenceUserData called without active InferenceWorkContext");
+    }
+    int idx = ctx->ssm_projection_reference_index++;
+    if (idx >= 384) {
+        ctx->ssm_projection_reference_index = 0;
+        idx = 0;
+    }
+    return &ctx->ssm_projection_reference_pool[idx];
 }
 
 inline SSMQwen35DeltaUserData* GetSSMQwen35DeltaUserData() {
@@ -2126,11 +2399,15 @@ void cb_rope_precomputed_custom(struct ggml_tensor* dst, int ith, int nth, void*
     }
 }
 
+static inline bool ModelUsesMRoPE(const TransformerModel* model);
+static inline int PositionIdsPerToken(const TransformerModel* model);
+
 inline struct ggml_tensor* ggml_rope_precomputed_table(struct ggml_context* ctx, struct ggml_tensor* input,
                                                        struct ggml_tensor* pos, const TransformerModel* model,
                                                        int rope_dim, const BatchSpec* batch) {
     if (!ctx || !input || !pos || !model) return nullptr;
     if (input->type != GGML_TYPE_F32 || pos->type != GGML_TYPE_I32) return nullptr;
+    if (ModelUsesMRoPE(model)) return nullptr;
     if (model->rope_cos_sin.empty() || model->rope_head_dim <= 0) return nullptr;
 
     const int head_dim = static_cast<int>(input->ne[0]);
@@ -2211,6 +2488,55 @@ static inline void ScatterTokenHeadContiguous(const float* in, struct ggml_tenso
     }
 }
 
+static inline bool ModelUsesMRoPE(const TransformerModel* model) {
+    return model && model->hparams.rope_sections[0] > 0 && model->hparams.rope_sections[1] > 0;
+}
+
+static inline int ModelMRoPEMode(const TransformerModel* model) {
+    if (!ModelUsesMRoPE(model)) {
+        return GGML_ROPE_TYPE_NORMAL;
+    }
+    return model->hparams.rope_mrope_interleaved ? GGML_ROPE_TYPE_IMROPE : GGML_ROPE_TYPE_MROPE;
+}
+
+static inline int PositionIdsPerToken(const TransformerModel* model) {
+    return ModelUsesMRoPE(model) ? GGML_MROPE_SECTIONS : 1;
+}
+
+bool PopulatePositionTensor(TransformerModel* model, const BatchSpec& batch, struct ggml_tensor* pos) {
+    if (!model || !pos || !pos->data || pos->type != GGML_TYPE_I32) {
+        return false;
+    }
+
+    const int n_tokens = static_cast<int>(batch.pos.size());
+    if (n_tokens <= 0) {
+        return false;
+    }
+
+    const int ids_per_token = PositionIdsPerToken(model);
+    const int expected = n_tokens * ids_per_token;
+    if (pos->ne[0] != expected) {
+        return false;
+    }
+
+    int32_t* dst = reinterpret_cast<int32_t*>(pos->data);
+    if (ids_per_token == 1) {
+        std::memcpy(dst, batch.pos.data(), static_cast<size_t>(n_tokens) * sizeof(int32_t));
+        return true;
+    }
+
+    for (int i = 0; i < n_tokens; ++i) {
+        const int32_t p = batch.pos[static_cast<size_t>(i)];
+        for (int j = 0; j < ids_per_token; ++j) {
+            const size_t offset =
+                static_cast<size_t>(j) * static_cast<size_t>(n_tokens) + static_cast<size_t>(i);
+            dst[offset] = p;
+        }
+    }
+
+    return true;
+}
+
 static inline void GatherTokenSpanHeadContiguous(const struct ggml_tensor* src, int token_idx, int token_count,
                                                  int head_dim, int n_head_kv, float* out) {
     if (token_count <= 0) {
@@ -2269,6 +2595,97 @@ static inline void ZeroTokenSpanHead(struct ggml_tensor* dst, int token_idx, int
     }
 }
 
+static inline void WriteCurrentBatchKvToCache(const BatchSpec* batch, const struct ggml_tensor* src, PagedKVCache* cache,
+                                              int layer, int head_dim, int n_head_kv, bool is_k, int token_begin,
+                                              int token_end, int* writes_ok, int* writes_skipped) {
+    if (!batch || !src || !cache || !src->data || head_dim <= 0 || n_head_kv <= 0) {
+        return;
+    }
+
+    const int N = static_cast<int>(batch->tokens.size());
+    if (N <= 0) {
+        return;
+    }
+
+    const int begin = std::max(0, token_begin);
+    const int end = (token_end < 0) ? N : std::min(N, token_end);
+    if (begin >= end) {
+        return;
+    }
+
+    const size_t head_block_size = static_cast<size_t>(head_dim) * static_cast<size_t>(n_head_kv);
+    const bool src_dense = IsTokenSpanDense(src, head_dim, n_head_kv);
+    std::vector<float> packed;
+    if (!src_dense) {
+        packed.reserve(static_cast<size_t>(std::min(end - begin, BLOCK_SIZE)) * head_block_size);
+    }
+
+    for (int i = begin; i < end;) {
+        if (i >= static_cast<int>(batch->seq_id.size()) || i >= static_cast<int>(batch->pos.size())) {
+            if (writes_skipped) {
+                ++(*writes_skipped);
+            }
+            ++i;
+            continue;
+        }
+
+        const int seq_id = batch->seq_id[i];
+        const int pos = batch->pos[i];
+        if (seq_id < 0 || seq_id >= static_cast<int>(batch->block_tables.size())) {
+            if (writes_skipped) {
+                ++(*writes_skipped);
+            }
+            ++i;
+            continue;
+        }
+
+        const auto& block_table = batch->block_tables[seq_id];
+        const int logical_block = pos / BLOCK_SIZE;
+        const int slot = pos % BLOCK_SIZE;
+        if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) {
+            if (writes_skipped) {
+                ++(*writes_skipped);
+            }
+            ++i;
+            continue;
+        }
+
+        const int block_id = block_table[logical_block];
+        int run = 1;
+        while (i + run < end && i + run < static_cast<int>(batch->seq_id.size()) &&
+               i + run < static_cast<int>(batch->pos.size())) {
+            const int next_seq_id = batch->seq_id[i + run];
+            const int next_pos = batch->pos[i + run];
+            if (next_seq_id != seq_id || next_pos != pos + run) {
+                break;
+            }
+            if ((next_pos / BLOCK_SIZE) != logical_block) {
+                break;
+            }
+            ++run;
+        }
+
+        packed.resize(static_cast<size_t>(run) * head_block_size);
+        const float* run_data = nullptr;
+        if (src_dense) {
+            run_data = reinterpret_cast<const float*>(reinterpret_cast<const char*>(src->data) +
+                                                      static_cast<size_t>(i) * src->nb[2]);
+        } else {
+            GatherTokenSpanHeadContiguous(src, i, run, head_dim, n_head_kv, packed.data());
+            run_data = packed.data();
+        }
+        if (is_k) {
+            cache->WriteKSlots(block_id, layer, slot, run, run_data);
+        } else {
+            cache->WriteVSlots(block_id, layer, slot, run, run_data);
+        }
+        if (writes_ok) {
+            *writes_ok += run;
+        }
+        i += run;
+    }
+}
+
 // Custom callback to load K/V history from cache and append current K/V.
 // This implementation is stride-safe for both contiguous and view tensors.
 void cb_kv_manage(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* userdata) {
@@ -2291,56 +2708,14 @@ void cb_kv_manage(struct ggml_tensor* dst, const struct ggml_tensor* src, int it
     int writes_ok = 0;
     int writes_skipped = 0;
 
-    // 1) Write current tokens to cache (single-threaded cache update).
-    if (ith == 0 && N > 0) {
-        std::vector<float> packed;
-        packed.reserve(static_cast<size_t>(N) * head_block_size);
-        for (int i = 0; i < N;) {
-            if (i >= static_cast<int>(batch->seq_id.size()) || i >= static_cast<int>(batch->pos.size())) {
-                ++writes_skipped;
-                ++i;
-                continue;
-            }
-            const int seq_id = batch->seq_id[i];
-            const int pos = batch->pos[i];
-            if (seq_id < 0 || seq_id >= static_cast<int>(batch->block_tables.size())) {
-                ++writes_skipped;
-                ++i;
-                continue;
-            }
-
-            const auto& block_table = batch->block_tables[seq_id];
-            const int logical_block = pos / BLOCK_SIZE;
-            const int slot = pos % BLOCK_SIZE;
-            if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) {
-                writes_skipped++;
-                ++i;
-                continue;
-            }
-
-            const int block_id = block_table[logical_block];
-            int run = 1;
-            while (i + run < N && i + run < static_cast<int>(batch->seq_id.size()) && i + run < static_cast<int>(batch->pos.size())) {
-                const int next_seq_id = batch->seq_id[i + run];
-                const int next_pos = batch->pos[i + run];
-                if (next_seq_id != seq_id || next_pos != pos + run) {
-                    break;
-                }
-                if ((next_pos / BLOCK_SIZE) != logical_block) {
-                    break;
-                }
-                ++run;
-            }
-
-            packed.resize(static_cast<size_t>(run) * head_block_size);
-            GatherTokenSpanHeadContiguous(src, i, run, head_dim, n_head_kv, packed.data());
-            if (ud->is_k) {
-                ud->cache->WriteKSlots(block_id, ud->layer, slot, run, packed.data());
-            } else {
-                ud->cache->WriteVSlots(block_id, ud->layer, slot, run, packed.data());
-            }
-            writes_ok += run;
-            i += run;
+    // 1) Write current tokens to cache (parallel over token ranges).
+    if (N > 0) {
+        const int tokens_per_thread = (N + nth - 1) / nth;
+        const int t_start = ith * tokens_per_thread;
+        const int t_end = std::min(t_start + tokens_per_thread, N);
+        if (t_end > t_start) {
+            WriteCurrentBatchKvToCache(batch, src, ud->cache, ud->layer, head_dim, n_head_kv, ud->is_k, t_start,
+                                       t_end, &writes_ok, &writes_skipped);
         }
     }
 
@@ -2431,6 +2806,166 @@ void cb_kv_manage(struct ggml_tensor* dst, const struct ggml_tensor* src, int it
             kv_layout_dbg++;
         }
     }
+}
+
+void cb_kv_write_only(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* userdata) {
+    auto* ud = static_cast<KVCacheUserData*>(userdata);
+    if (!ud || !ud->cache || !src || !dst || !src->data || !dst->data) return;
+
+    const BatchSpec* batch = GetCurrentBatch();
+    if (!batch) return;
+
+    const int head_dim = ud->head_dim_kv;
+    const int n_head_kv = ud->cache->n_head_kv;
+    if (head_dim <= 0 || n_head_kv <= 0) return;
+
+    const int N = static_cast<int>(batch->tokens.size());
+    if (N <= 0) {
+        return;
+    }
+
+    const int tokens_per_thread = (N + nth - 1) / nth;
+    const int t_start = ith * tokens_per_thread;
+    const int t_end = std::min(t_start + tokens_per_thread, N);
+
+    if (t_end > t_start) {
+        WriteCurrentBatchKvToCache(batch, src, ud->cache, ud->layer, head_dim, n_head_kv, ud->is_k, t_start, t_end,
+                                   nullptr, nullptr);
+    }
+
+    const size_t head_block_size = static_cast<size_t>(head_dim) * static_cast<size_t>(n_head_kv);
+    if (t_end > t_start) {
+        if (IsTokenSpanDense(src, head_dim, n_head_kv) && IsTokenSpanDense(dst, head_dim, n_head_kv)) {
+            const char* src_ptr = reinterpret_cast<const char*>(src->data) + static_cast<size_t>(t_start) * src->nb[2];
+            char* dst_ptr = reinterpret_cast<char*>(dst->data) + static_cast<size_t>(t_start) * dst->nb[2];
+            std::memcpy(dst_ptr, src_ptr, static_cast<size_t>(t_end - t_start) * head_block_size * sizeof(float));
+        } else {
+            std::vector<float> packed;
+            packed.resize(static_cast<size_t>(t_end - t_start) * head_block_size);
+            GatherTokenSpanHeadContiguous(src, t_start, t_end - t_start, head_dim, n_head_kv, packed.data());
+            ScatterTokenSpanHeadContiguous(packed.data(), dst, t_start, t_end - t_start, head_dim, n_head_kv);
+        }
+    }
+}
+
+void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    auto* ud = static_cast<KVCacheUserData*>(userdata);
+    if (!ud || !ud->cache || !dst || !dst->data || !dst->src[0] || !dst->src[0]->data || nth <= 0) return;
+
+    const BatchSpec* batch = GetCurrentBatch();
+    if (!batch) return;
+
+    const struct ggml_tensor* src = dst->src[0];
+    const int head_dim = ud->head_dim_kv;
+    const int n_head_kv = ud->cache->n_head_kv;
+    if (head_dim <= 0 || n_head_kv <= 0) return;
+
+    const int N = static_cast<int>(batch->tokens.size());
+    const int n_total = static_cast<int>(dst->ne[2]);
+    const int n_past = n_total - N;
+    if (N < 0 || n_total < 0 || n_past < 0) return;
+
+    if (N > 0) {
+        const int tokens_per_thread = (N + nth - 1) / nth;
+        const int t_start = ith * tokens_per_thread;
+        const int t_end = std::min(t_start + tokens_per_thread, N);
+        if (t_end > t_start) {
+            WriteCurrentBatchKvToCache(batch, src, ud->cache, ud->layer, head_dim, n_head_kv, ud->is_k, t_start,
+                                       t_end, nullptr, nullptr);
+        }
+    }
+
+    if (n_past > 0) {
+        const int seq_id = batch->seq_id.empty() ? -1 : batch->seq_id[0];
+        const bool has_valid_seq = (seq_id >= 0 && seq_id < static_cast<int>(batch->block_tables.size()));
+        const auto* block_table = has_valid_seq ? &batch->block_tables[seq_id] : nullptr;
+        const KVRetentionPolicy& retention_policy = GetKVRetentionPolicy();
+        KVRetentionSpan retained_history;
+        if (has_valid_seq && seq_id < static_cast<int>(batch->n_past.size())) {
+            const int seq_n_past = std::max(0, batch->n_past[static_cast<size_t>(seq_id)]);
+            retained_history = ComputeKVRetentionSpan(seq_n_past, retention_policy);
+        }
+
+        const int tokens_per_thread = (n_past + nth - 1) / nth;
+        const int t_start = ith * tokens_per_thread;
+        const int t_end = std::min(t_start + tokens_per_thread, n_past);
+        std::vector<float> packed;
+        const size_t head_block_size = static_cast<size_t>(head_dim) * static_cast<size_t>(n_head_kv);
+        packed.reserve(static_cast<size_t>(std::max(1, BLOCK_SIZE)) * head_block_size);
+        for (int t = t_start; t < t_end;) {
+            if (!has_valid_seq) {
+                ZeroTokenSpanHead(dst, t, t_end - t, head_dim, n_head_kv);
+                break;
+            }
+
+            if (!block_table || t >= retained_history.history_kept) {
+                ZeroTokenSpanHead(dst, t, t_end - t, head_dim, n_head_kv);
+                break;
+            }
+
+            const int token_pos = MapRetainedHistoryIndex(retained_history, t);
+            const int logical_block = token_pos / BLOCK_SIZE;
+            const int slot = token_pos % BLOCK_SIZE;
+            if (logical_block < 0 || logical_block >= static_cast<int>(block_table->size())) {
+                ZeroTokenSpanHead(dst, t, 1, head_dim, n_head_kv);
+                ++t;
+                continue;
+            }
+
+            const int block_id = (*block_table)[logical_block];
+            int run = 1;
+            while (t + run < t_end && t + run < retained_history.history_kept) {
+                const int next_token_pos = MapRetainedHistoryIndex(retained_history, t + run);
+                if (next_token_pos != token_pos + run) {
+                    break;
+                }
+                if ((next_token_pos / BLOCK_SIZE) != logical_block) {
+                    break;
+                }
+                ++run;
+            }
+            packed.resize(static_cast<size_t>(run) * head_block_size);
+            if (ud->is_k) {
+                ud->cache->ReadKSlots(block_id, ud->layer, slot, run, packed.data());
+            } else {
+                ud->cache->ReadVSlots(block_id, ud->layer, slot, run, packed.data());
+            }
+            ScatterTokenSpanHeadContiguous(packed.data(), dst, t, run, head_dim, n_head_kv);
+            t += run;
+        }
+    }
+
+    if (N > 0) {
+        const int tokens_per_thread = (N + nth - 1) / nth;
+        const int t_start = ith * tokens_per_thread;
+        const int t_end = std::min(t_start + tokens_per_thread, N);
+        if (t_end > t_start) {
+            const size_t head_block_size = static_cast<size_t>(head_dim) * static_cast<size_t>(n_head_kv);
+            if (IsTokenSpanDense(src, head_dim, n_head_kv) && IsTokenSpanDense(dst, head_dim, n_head_kv)) {
+                const char* src_ptr =
+                    reinterpret_cast<const char*>(src->data) + static_cast<size_t>(t_start) * src->nb[2];
+                char* dst_ptr = reinterpret_cast<char*>(dst->data) +
+                                static_cast<size_t>(n_past + t_start) * dst->nb[2];
+                std::memcpy(dst_ptr, src_ptr, static_cast<size_t>(t_end - t_start) * head_block_size * sizeof(float));
+            } else {
+                std::vector<float> packed;
+                packed.resize(static_cast<size_t>(t_end - t_start) * head_block_size);
+                GatherTokenSpanHeadContiguous(src, t_start, t_end - t_start, head_dim, n_head_kv, packed.data());
+                ScatterTokenSpanHeadContiguous(packed.data(), dst, n_past + t_start, t_end - t_start, head_dim,
+                                               n_head_kv);
+            }
+        }
+    }
+}
+
+inline struct ggml_tensor* ggml_kv_update_and_gather(struct ggml_context* ctx, struct ggml_tensor* src, int n_total,
+                                                     int n_tasks, KVCacheUserData* userdata) {
+    if (!ctx || !src || n_total <= 0) {
+        return src;
+    }
+    struct ggml_tensor* args[1] = {src};
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, src->ne[0], src->ne[1], n_total, 1, args, 1,
+                          cb_kv_update_and_gather_custom, n_tasks, userdata);
 }
 
 // ============================================================================
@@ -2694,6 +3229,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     }
 
     const ggml_type weight_type = weight_tensor->type;
+    const char* weight_name = weight_tensor->name[0] ? weight_tensor->name : "(unnamed)";
 
     // ==========================================================================
     // SHARED PRE-QUANTIZATION (token-position synchronized):
@@ -2755,6 +3291,9 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     // CASE A: FP32 weights - use optimized simd::GemvParallel
     // ==========================================================================
     if (weight_type == GGML_TYPE_F32) {
+        if (IsHybridSSMQkvWeightName(weight_name) && IsDebugMatmulDispatchEnabled() && ith == 0) {
+            LogHybridSSMQkvDispatch(weight_name, weight_type, 1, K, N, "GEMV_F32_CALLBACK", false, false, false);
+        }
         const float* weight = reinterpret_cast<const float*>(weight_data);
         densecore::simd::GemvParallel(output, x_f32, weight, N, K, ith, nth);
         return;
@@ -2769,7 +3308,11 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     const bool allow_native_q4k_vecdot =
         ShouldUseArmNativeQ4KVecDotValidated(weight_type, type_traits_cpu, sample_row_ptr, quant_input, x_f32, N);
 
-    if (quant_input && type_traits_cpu && type_traits_cpu->vec_dot && allow_native_q4k_vecdot) {
+    if (!ud->force_reference_scalar && quant_input && type_traits_cpu && type_traits_cpu->vec_dot && allow_native_q4k_vecdot) {
+        if (IsHybridSSMQkvWeightName(weight_name) && IsDebugMatmulDispatchEnabled() && ith == 0) {
+            LogHybridSSMQkvDispatch(weight_name, weight_type, 1, K, N, "GEMV_NATIVE_VECDOT_CALLBACK", false, true,
+                                    false);
+        }
         for (int k = k_start; k < k_end; k++) {
             const void* row_ptr = reinterpret_cast<const char*>(weight_data) + k * row_stride;
             type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
@@ -2785,6 +3328,10 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     if (!type_traits || !type_traits->to_float || N > static_cast<int>(kMaxDequantBufferSize)) {
         for (int k = k_start; k < k_end; k++) output[k] = 0.0f;
         return;
+    }
+    if (IsHybridSSMQkvWeightName(weight_name) && IsDebugMatmulDispatchEnabled() && ith == 0) {
+        LogHybridSSMQkvDispatch(weight_name, weight_type, 1, K, N, "GEMV_DEQUANT_REFERENCE_CALLBACK", false, false,
+                                false);
     }
     dequant_buffer_tls.resize(static_cast<size_t>(N));
     float* dequant_buffer = dequant_buffer_tls.data();
@@ -3146,6 +3693,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
     const size_t output_col_stride = static_cast<size_t>(dst->nb[1]);
     const size_t weight_row_stride = static_cast<size_t>(weight_tensor->nb[1]);
     const ggml_type weight_type = weight_tensor->type;
+    const char* weight_name = weight_tensor->name[0] ? weight_tensor->name : "(unnamed)";
 
     thread_local std::vector<const float*> x_rows;
     thread_local std::vector<float> gathered_inputs;
@@ -3183,6 +3731,9 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
     const char* weight_base = reinterpret_cast<const char*>(weight_tensor->data);
 
     if (weight_type == GGML_TYPE_F32) {
+        if (IsHybridSSMQkvWeightName(weight_name) && IsDebugMatmulDispatchEnabled() && ith == 0) {
+            LogHybridSSMQkvDispatch(weight_name, weight_type, M, K, N, "BATCHED_F32_CALLBACK", false, false, false);
+        }
         // Fast path: contiguous layout -> Highway SIMD GEMM with Split-N parallelism.
         // GemmFP32_Hwy computes C[:, n_start:n_end) = A[M,K_gemm] x B[N_gemm,K_gemm]^T
         // Our mapping: A=input[M, N_input], B=weight[K_output, N_input], C=output[M, K_output]
@@ -3222,158 +3773,170 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
             (ud->input_quant_type != GGML_TYPE_F32) ? ud->input_quant_type : type_traits_cpu->vec_dot_type;
         const auto* input_type_traits = ggml_get_type_traits_cpu(vec_dot_type);
         const size_t quant_row_size = ggml_row_size(vec_dot_type, static_cast<int64_t>(N));
-        // Use pre-computed stride from graph-build if available, else compute now
         const size_t quant_row_stride = (ud->quant_row_stride > 0)
                                             ? ud->quant_row_stride
                                             : densecore::AlignUp(quant_row_size, static_cast<size_t>(64));
-        const size_t quant_buffer_capacity =
-            static_cast<size_t>(kMaxQuantInputBufferSize) * static_cast<size_t>(kMaxSmallBatchColsHard);
         const int vec_dot_nrows = std::max<int>(1, static_cast<int>(type_traits_cpu->nrows));
-        const bool vec_dot_supports_nrc_batch = vec_dot_nrows >= M;
-
-        const bool can_quantize_inputs = input_type_traits && input_type_traits->from_float && quant_row_size > 0 &&
-                                         M <= kMaxSmallBatchColsHard && quant_row_stride <= kMaxQuantInputBufferSize &&
-                                         quant_row_stride * static_cast<size_t>(M) <= quant_buffer_capacity;
-
-        const bool can_use_quant_nrc_fast = can_quantize_inputs && output_contig && vec_dot_supports_nrc_batch;
+        const int quant_tile_cols =
+            std::max(1, std::min(kMaxSmallBatchColsHard,
+                                 ParsePositiveEnvInt("DENSECORE_BATCHED_QUANT_TILE_COLS", kMaxSmallBatchColsHard)));
+        const bool can_quantize_inputs =
+            input_type_traits && input_type_traits->from_float && quant_row_size > 0 &&
+            quant_row_stride <= kMaxQuantInputBufferSize;
         const bool can_use_q4k_true_batched = can_quantize_inputs && weight_type == GGML_TYPE_Q4_K &&
                                               vec_dot_type == GGML_TYPE_Q8_K && IsQ4KTrueBatchedKernelEnabled() &&
                                               (N % QK_K == 0);
 
-        const uint8_t* quant_input_base = nullptr;
-        size_t quant_input_row_stride = quant_row_stride;
-        bool used_shared_quant_buffer = false;
         if (can_quantize_inputs) {
-            const BatchSpec* batch = GetCurrentBatch();
-            const bool can_sync_on_stamp = nth > 1 && ud->slot_id >= 0 && ud->quant_input_shared && ud->quantized_stamp;
-            const uint64_t expected_stamp =
-                ComputeGemvBatchedQuantStamp(batch, M, ud->slot_id, src->data, weight_tensor->data);
-
-            const size_t quant_total_size = quant_row_stride * static_cast<size_t>(M);
             thread_local std::vector<uint8_t> quant_inputs_tls;
-            if (!can_sync_on_stamp) {
-                quant_inputs_tls.resize(quant_total_size);
-                for (int m = 0; m < M; ++m) {
-                    uint8_t* q_ptr = quant_inputs_tls.data() + static_cast<size_t>(m) * quant_row_stride;
-                    input_type_traits->from_float(x_rows[static_cast<size_t>(m)], q_ptr, static_cast<int64_t>(N));
-                }
-                quant_input_base = quant_inputs_tls.data();
-            } else if (ith == 0) {
-                for (int m = 0; m < M; ++m) {
-                    uint8_t* q_ptr = ud->quant_input_shared + static_cast<size_t>(m) * quant_row_stride;
-                    input_type_traits->from_float(x_rows[static_cast<size_t>(m)], q_ptr, static_cast<int64_t>(N));
-                }
-                ud->quantized_stamp->store(expected_stamp, std::memory_order_release);
-                quant_input_base = ud->quant_input_shared;
-                used_shared_quant_buffer = true;
-            } else {
-                int spin_count = 0;
-                while (ud->quantized_stamp->load(std::memory_order_acquire) != expected_stamp) {
-                    SpinPause(spin_count++);
-                }
-                quant_input_base = ud->quant_input_shared;
-                used_shared_quant_buffer = true;
-            }
-        }
-        if (ith == 0 && quant_input_base) {
-            RecordSharedQuantReuse(used_shared_quant_buffer);
-        }
+            const BatchSpec* batch = GetCurrentBatch();
+            const bool can_sync_on_stamp =
+                M <= quant_tile_cols && nth > 1 && ud->slot_id >= 0 && ud->quant_input_shared && ud->quantized_stamp;
+            const uint64_t expected_stamp =
+                can_sync_on_stamp ? ComputeGemvBatchedQuantStamp(batch, M, ud->slot_id, src->data, weight_tensor->data) : 0;
+            bool logged_quant_reuse = false;
 
-        const void* sample_row_ptr = weight_base + static_cast<size_t>(k_start) * weight_row_stride;
-        const bool allow_native_q4k_vecdot = ShouldUseArmNativeQ4KVecDotValidated(
-            weight_type, type_traits_cpu, sample_row_ptr, quant_input_base, x_rows.empty() ? nullptr : x_rows[0], N);
+            for (int tile_start = 0; tile_start < M; tile_start += quant_tile_cols) {
+                const int tile_m = std::min(quant_tile_cols, M - tile_start);
+                const size_t quant_total_size = quant_row_stride * static_cast<size_t>(tile_m);
+                const bool use_shared_quant_buffer = can_sync_on_stamp && tile_start == 0;
+                const uint8_t* quant_input_base = nullptr;
 
-        // Fast path: one-time quantization + multi-column vec_dot (nrc=M).
-        if (can_use_quant_nrc_fast && quant_input_base && allow_native_q4k_vecdot) {
-            for (int k = k_start; k < k_end; ++k) {
-                float* out_ptr = reinterpret_cast<float*>(output_base + static_cast<size_t>(k) * sizeof(float));
-                const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
-                type_traits_cpu->vec_dot(N, out_ptr, dst->nb[1], row_ptr, 0, quant_input_base, quant_input_row_stride,
-                                         M);
-            }
-            LogMatmulPathOnce("gemv_batched_quant_nrc");
-            return;
-        }
-
-        // True-batched custom kernel for Q4_K x Q8_K on x86:
-        // unpack/scale once per weight row, compute all M columns together.
-        if (can_use_q4k_true_batched && quant_input_base) {
-            alignas(64) std::array<float, kMaxSmallBatchColsHard> row_sums{};
-            static const bool debug_q4k_kernel_check = []() {
-                const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_CHECK");
-                return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-            }();
-            static const float kDebugKernelWarnDiff = []() {
-                const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_TOL");
-                if (!env || env[0] == '\0') return 1e-3f;
-                char* end = nullptr;
-                const float v = std::strtof(env, &end);
-                if (end == env || !std::isfinite(v) || v < 0.0f) return 1e-3f;
-                return v;
-            }();
-            static std::atomic<int> q4k_kernel_warn_count{0};
-            float max_abs_diff = 0.0f;
-            int max_diff_k = -1;
-            int max_diff_m = -1;
-            float max_diff_batched = 0.0f;
-            float max_diff_ref = 0.0f;
-            bool all_rows_ok = true;
-            for (int k = k_start; k < k_end; ++k) {
-                const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
-                if (!ComputeQ4KQ8KBatchedRow(row_ptr, quant_input_base, quant_input_row_stride, M, N,
-                                             row_sums.data())) {
-                    all_rows_ok = false;
-                    break;
-                }
-
-                if (debug_q4k_kernel_check) {
-                    for (int m = 0; m < M; ++m) {
-                        float ref = 0.0f;
-                        const void* q_ptr = quant_input_base + static_cast<size_t>(m) * quant_input_row_stride;
-                        type_traits_cpu->vec_dot(N, &ref, 0, row_ptr, 0, q_ptr, 0, 1);
-                        const float diff = std::fabs(row_sums[static_cast<size_t>(m)] - ref);
-                        if (diff > max_abs_diff) {
-                            max_abs_diff = diff;
-                            max_diff_k = k;
-                            max_diff_m = m;
-                            max_diff_batched = row_sums[static_cast<size_t>(m)];
-                            max_diff_ref = ref;
+                if (use_shared_quant_buffer) {
+                    if (ith == 0) {
+                        for (int m = 0; m < tile_m; ++m) {
+                            uint8_t* q_ptr = ud->quant_input_shared + static_cast<size_t>(m) * quant_row_stride;
+                            input_type_traits->from_float(x_rows[static_cast<size_t>(tile_start + m)], q_ptr,
+                                                          static_cast<int64_t>(N));
                         }
+                        ud->quantized_stamp->store(expected_stamp, std::memory_order_release);
+                    } else {
+                        int spin_count = 0;
+                        while (ud->quantized_stamp->load(std::memory_order_acquire) != expected_stamp) {
+                            SpinPause(spin_count++);
+                        }
+                    }
+                    quant_input_base = ud->quant_input_shared;
+                    if (ith == 0 && !logged_quant_reuse) {
+                        RecordSharedQuantReuse(true);
+                        logged_quant_reuse = true;
+                    }
+                } else {
+                    quant_inputs_tls.resize(quant_total_size);
+                    for (int m = 0; m < tile_m; ++m) {
+                        uint8_t* q_ptr = quant_inputs_tls.data() + static_cast<size_t>(m) * quant_row_stride;
+                        input_type_traits->from_float(x_rows[static_cast<size_t>(tile_start + m)], q_ptr,
+                                                      static_cast<int64_t>(N));
+                    }
+                    quant_input_base = quant_inputs_tls.data();
+                    if (ith == 0 && !logged_quant_reuse) {
+                        RecordSharedQuantReuse(false);
+                        logged_quant_reuse = true;
                     }
                 }
 
-                for (int m = 0; m < M; ++m) {
-                    store_out(m, k, row_sums[static_cast<size_t>(m)]);
-                }
-            }
-            if (debug_q4k_kernel_check && max_abs_diff > kDebugKernelWarnDiff) {
-                const int warn_idx = q4k_kernel_warn_count.fetch_add(1, std::memory_order_relaxed);
-                if (warn_idx < 32) {
-                    std::cerr << "[Q4K_BATCHED_CHECK] WARN ith=" << ith << " max_abs_diff=" << max_abs_diff
-                              << " at(k,m)=" << max_diff_k << "," << max_diff_m << " batched=" << max_diff_batched
-                              << " ref=" << max_diff_ref << std::endl;
-                }
-            }
-            if (all_rows_ok) {
-                return;
-            }
-        }
+                const bool can_use_quant_nrc_fast = output_contig && vec_dot_nrows >= tile_m;
+                const void* sample_row_ptr = weight_base + static_cast<size_t>(k_start) * weight_row_stride;
+                const bool allow_native_q4k_vecdot = ShouldUseArmNativeQ4KVecDotValidated(
+                    weight_type, type_traits_cpu, sample_row_ptr, quant_input_base,
+                    x_rows[static_cast<size_t>(tile_start)], N);
 
-        // Robust fallback: reuse the quantized input buffer and run vec_dot with
-        // nrc=1. This keeps parity with single-token quant GEMV math when the
-        // backend has no true nrc=M support for this weight/input type pair.
-        if (quant_input_base) {
-            for (int k = k_start; k < k_end; ++k) {
-                const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
-                for (int m = 0; m < M; ++m) {
-                    float sum = 0.0f;
-                    const void* q_ptr = quant_input_base + static_cast<size_t>(m) * quant_input_row_stride;
-                    type_traits_cpu->vec_dot(N, &sum, 0, row_ptr, 0, q_ptr, 0, 1);
-                    store_out(m, k, sum);
+                if (!ud->force_reference_scalar && can_use_quant_nrc_fast && quant_input_base && allow_native_q4k_vecdot) {
+                    if (IsHybridSSMQkvWeightName(weight_name) && IsDebugMatmulDispatchEnabled() && ith == 0 &&
+                        tile_start == 0) {
+                        LogHybridSSMQkvDispatch(weight_name, weight_type, M, K, N, "GGML_QUANT_NRC_M_CALLBACK", true,
+                                                true, false);
+                    }
+                    for (int k = k_start; k < k_end; ++k) {
+                        char* out_col = output_base + static_cast<size_t>(tile_start) * output_col_stride;
+                        float* out_ptr = reinterpret_cast<float*>(out_col + static_cast<size_t>(k) * sizeof(float));
+                        const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
+                        type_traits_cpu->vec_dot(N, out_ptr, dst->nb[1], row_ptr, 0, quant_input_base, quant_row_stride,
+                                                 tile_m);
+                    }
+                    LogMatmulPathOnce("gemv_batched_quant_nrc");
+                    continue;
+                }
+
+                if (!ud->force_reference_scalar && can_use_q4k_true_batched && quant_input_base) {
+                    alignas(64) std::array<float, kMaxSmallBatchColsHard> row_sums{};
+                    static const bool debug_q4k_kernel_check = []() {
+                        const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_CHECK");
+                        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+                    }();
+                    static const float kDebugKernelWarnDiff = []() {
+                        const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_TOL");
+                        if (!env || env[0] == '\0') return 1e-3f;
+                        char* end = nullptr;
+                        const float v = std::strtof(env, &end);
+                        if (end == env || !std::isfinite(v) || v < 0.0f) return 1e-3f;
+                        return v;
+                    }();
+                    static std::atomic<int> q4k_kernel_warn_count{0};
+                    float max_abs_diff = 0.0f;
+                    int max_diff_k = -1;
+                    int max_diff_m = -1;
+                    float max_diff_batched = 0.0f;
+                    float max_diff_ref = 0.0f;
+                    bool all_rows_ok = true;
+                    for (int k = k_start; k < k_end; ++k) {
+                        const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
+                        if (!ComputeQ4KQ8KBatchedRow(row_ptr, quant_input_base, quant_row_stride, tile_m, N,
+                                                     row_sums.data())) {
+                            all_rows_ok = false;
+                            break;
+                        }
+
+                        if (debug_q4k_kernel_check) {
+                            for (int m = 0; m < tile_m; ++m) {
+                                float ref = 0.0f;
+                                const void* q_ptr = quant_input_base + static_cast<size_t>(m) * quant_row_stride;
+                                type_traits_cpu->vec_dot(N, &ref, 0, row_ptr, 0, q_ptr, 0, 1);
+                                const float diff = std::fabs(row_sums[static_cast<size_t>(m)] - ref);
+                                if (diff > max_abs_diff) {
+                                    max_abs_diff = diff;
+                                    max_diff_k = k;
+                                    max_diff_m = tile_start + m;
+                                    max_diff_batched = row_sums[static_cast<size_t>(m)];
+                                    max_diff_ref = ref;
+                                }
+                            }
+                        }
+
+                        for (int m = 0; m < tile_m; ++m) {
+                            store_out(tile_start + m, k, row_sums[static_cast<size_t>(m)]);
+                        }
+                    }
+                    if (debug_q4k_kernel_check && max_abs_diff > kDebugKernelWarnDiff) {
+                        const int warn_idx = q4k_kernel_warn_count.fetch_add(1, std::memory_order_relaxed);
+                        if (warn_idx < 32) {
+                            std::cerr << "[Q4K_BATCHED_CHECK] WARN ith=" << ith << " max_abs_diff=" << max_abs_diff
+                                      << " at(k,m)=" << max_diff_k << "," << max_diff_m
+                                      << " batched=" << max_diff_batched << " ref=" << max_diff_ref << std::endl;
+                        }
+                    }
+                    if (all_rows_ok) {
+                        continue;
+                    }
+                }
+
+                for (int k = k_start; k < k_end; ++k) {
+                    const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
+                    for (int m = 0; m < tile_m; ++m) {
+                        float sum = 0.0f;
+                        const void* q_ptr = quant_input_base + static_cast<size_t>(m) * quant_row_stride;
+                        type_traits_cpu->vec_dot(N, &sum, 0, row_ptr, 0, q_ptr, 0, 1);
+                        store_out(tile_start + m, k, sum);
+                    }
                 }
             }
             return;
         }
+    }
+
+    if (IsHybridSSMQkvWeightName(weight_name) && IsDebugMatmulDispatchEnabled() && ith == 0) {
+        LogHybridSSMQkvDispatch(weight_name, weight_type, M, K, N, "BATCHED_DEQUANT_REFERENCE_CALLBACK", false, false,
+                                false);
     }
 
     const auto* type_traits = ggml_get_type_traits(weight_type);
@@ -3690,6 +4253,50 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                 }
             }
         }
+    } else if (q_tokens == 1) {
+        // Single-token decode only has one KV write, but the legacy barrier made
+        // every GGML worker participate in kv_writers_done and spin until the last
+        // idle worker arrived. Let thread 0 perform the write and release the
+        // readers as soon as the slot becomes visible.
+        uint64_t epoch = 0;
+        if (ith == 0) {
+            epoch = ud->epoch_started.fetch_add(1, std::memory_order_acq_rel) + 1;
+            const int seq_idx = batch->seq_id[0];
+            if (seq_idx >= 0 && seq_idx < batch->num_seqs && !batch->block_tables.empty()) {
+                const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
+                if (!block_table.empty()) {
+                    const int pos_i = batch->pos[0];
+                    if (pos_i >= 0) {
+                        const int logical_block = pos_i / BLOCK_SIZE;
+                        const int slot = pos_i % BLOCK_SIZE;
+                        if (logical_block >= 0 && logical_block < static_cast<int>(block_table.size())) {
+                            const int block_id = block_table[static_cast<size_t>(logical_block)];
+                            if (block_id >= 0 && block_id < ud->cache->max_blocks) {
+                                const float* k_src = reinterpret_cast<const float*>(k_base);
+                                const float* v_src = reinterpret_cast<const float*>(v_base);
+                                ud->cache->WriteKSlot(block_id, ud->layer, slot, k_src);
+                                ud->cache->WriteVSlot(block_id, ud->layer, slot, v_src);
+                            }
+                        }
+                    }
+                }
+            }
+            ud->epoch_done.store(epoch, std::memory_order_release);
+        } else {
+            int spin_count = 0;
+            while (true) {
+                const uint64_t started = ud->epoch_started.load(std::memory_order_acquire);
+                if (started != 0) {
+                    epoch = started;
+                    break;
+                }
+                SpinPause(spin_count++);
+            }
+            spin_count = 0;
+            while (ud->epoch_done.load(std::memory_order_acquire) < epoch) {
+                SpinPause(spin_count++);
+            }
+        }
     } else {
         // Standard barrier-based path for n_tokens==1 or head-tiled parallelism
         uint64_t epoch = 0;
@@ -3781,7 +4388,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     }
 
     // Phase 2: Attention computation
-    static const int head_tile = std::max(1, ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", 8));
+    const int head_tile = ResolvePagedAttentionDecodeHeadTile(ud->n_head, q_tokens, nth);
     const int tiles_per_token = std::max(1, (ud->n_head + head_tile - 1) / head_tile);
     int tile_start, tile_end;
     if (token_parallel_mode) {
@@ -3826,6 +4433,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                            v_cache_layout.slot_stride_bytes > 0;
     thread_local std::vector<const void*> k_block_ptrs;
     thread_local std::vector<const void*> v_block_ptrs;
+    const void* const* shared_k_block_ptrs_data = nullptr;
+    const void* const* shared_v_block_ptrs_data = nullptr;
     int cached_token_idx = -1;
     int cached_seq_idx = -1;
     const std::vector<int>* cached_block_table = nullptr;
@@ -3848,6 +4457,38 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
 
     std::chrono::steady_clock::time_point attn_begin;
     if (do_profile) attn_begin = std::chrono::steady_clock::now();
+
+    if (q_tokens == 1 && hwy_ready && ud->shared_k_block_ptrs && ud->shared_v_block_ptrs) {
+        if (ith == 0) {
+            ud->shared_k_block_ptrs->clear();
+            ud->shared_v_block_ptrs->clear();
+            const int seq_idx = batch->seq_id[0];
+            if (seq_idx >= 0 && seq_idx < batch->num_seqs &&
+                seq_idx < static_cast<int>(batch->block_tables.size())) {
+                const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
+                ud->shared_k_block_ptrs->resize(block_table.size(), nullptr);
+                ud->shared_v_block_ptrs->resize(block_table.size(), nullptr);
+                for (size_t bi = 0; bi < block_table.size(); ++bi) {
+                    const int block_id = block_table[bi];
+                    if (block_id < 0 || block_id >= ud->cache->max_blocks) {
+                        continue;
+                    }
+                    (*ud->shared_k_block_ptrs)[bi] = ud->cache->GetKBlockPtr(block_id, ud->layer);
+                    (*ud->shared_v_block_ptrs)[bi] = ud->cache->GetVBlockPtr(block_id, ud->layer);
+                }
+            }
+            ud->shared_block_ptrs_ready.store(1, std::memory_order_release);
+        } else {
+            int spin_count = 0;
+            while (ud->shared_block_ptrs_ready.load(std::memory_order_acquire) == 0) {
+                SpinPause(spin_count++);
+            }
+        }
+        shared_k_block_ptrs_data =
+            ud->shared_k_block_ptrs->empty() ? nullptr : ud->shared_k_block_ptrs->data();
+        shared_v_block_ptrs_data =
+            ud->shared_v_block_ptrs->empty() ? nullptr : ud->shared_v_block_ptrs->data();
+    }
 
     for (int tile = tile_start; tile < tile_end; ++tile) {
         const int token_idx = tile / tiles_per_token;
@@ -3913,27 +4554,69 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         }
 
         if (cached_ptr_block_table != &block_table || cached_ptr_seq_idx != cached_seq_idx) {
-            k_block_ptrs.resize(block_table.size(), nullptr);
-            v_block_ptrs.resize(block_table.size(), nullptr);
-            for (size_t bi = 0; bi < block_table.size(); ++bi) {
-                const int block_id = block_table[bi];
-                if (block_id < 0 || block_id >= ud->cache->max_blocks) {
-                    continue;
+            if (!(q_tokens == 1 && shared_k_block_ptrs_data && shared_v_block_ptrs_data)) {
+                k_block_ptrs.resize(block_table.size(), nullptr);
+                v_block_ptrs.resize(block_table.size(), nullptr);
+                for (size_t bi = 0; bi < block_table.size(); ++bi) {
+                    const int block_id = block_table[bi];
+                    if (block_id < 0 || block_id >= ud->cache->max_blocks) {
+                        continue;
+                    }
+                    k_block_ptrs[bi] = ud->cache->GetKBlockPtr(block_id, ud->layer);
+                    v_block_ptrs[bi] = ud->cache->GetVBlockPtr(block_id, ud->layer);
                 }
-                k_block_ptrs[bi] = ud->cache->GetKBlockPtr(block_id, ud->layer);
-                v_block_ptrs[bi] = ud->cache->GetVBlockPtr(block_id, ud->layer);
             }
             cached_ptr_seq_idx = cached_seq_idx;
             cached_ptr_block_table = &block_table;
         }
 
         densecore::hwy_kernels::PagedAttention_Hwy(
-            q_token, k_block_ptrs.data(), v_block_ptrs.data(), cache_type_id, ud->n_head, ud->head_dim, v_head_dim,
+            q_token, shared_k_block_ptrs_data ? shared_k_block_ptrs_data : k_block_ptrs.data(),
+            shared_v_block_ptrs_data ? shared_v_block_ptrs_data : v_block_ptrs.data(), cache_type_id, ud->n_head,
+            ud->head_dim, v_head_dim,
             ud->cache->n_head_kv, static_cast<int32_t>(block_table.size()), cached_context_len,
             static_cast<int64_t>(k_cache_layout.head_stride_bytes),
             static_cast<int64_t>(k_cache_layout.slot_stride_bytes),
             static_cast<int64_t>(v_cache_layout.head_stride_bytes),
             static_cast<int64_t>(v_cache_layout.slot_stride_bytes), scale, out_token, h_start, h_end, ud->n_head);
+
+        if (ShouldRunPagedAttentionReferenceProbe(ud->layer, token_idx)) {
+            thread_local std::vector<float> scalar_ref;
+            const size_t token_elems = static_cast<size_t>(ud->n_head) * static_cast<size_t>(v_head_dim);
+            scalar_ref.assign(token_elems, 0.0f);
+            ComputePagedAttentionScalarHeads(ud, block_table, cached_context_len, cached_retained_span, cached_pos_i,
+                                             scale, q_token, scalar_ref.data(), h_start, h_end);
+
+            float max_abs_diff = 0.0f;
+            int max_h = -1;
+            int max_d = -1;
+            float fast_val = 0.0f;
+            float ref_val = 0.0f;
+            for (int h = h_start; h < h_end; ++h) {
+                const float* fast_head = out_token + static_cast<size_t>(h) * v_head_dim;
+                const float* ref_head = scalar_ref.data() + static_cast<size_t>(h) * v_head_dim;
+                for (int d = 0; d < v_head_dim; ++d) {
+                    const float got = fast_head[d];
+                    const float expect = ref_head[d];
+                    const float diff = std::fabs(got - expect);
+                    if (diff > max_abs_diff) {
+                        max_abs_diff = diff;
+                        max_h = h;
+                        max_d = d;
+                        fast_val = got;
+                        ref_val = expect;
+                    }
+                }
+            }
+            if (max_abs_diff > 1e-4f || !std::isfinite(max_abs_diff)) {
+                std::fprintf(stderr,
+                             "[PagedAttnRef] layer=%d seq=%d token_idx=%d pos=%d heads=[%d,%d) context=%d max_abs_diff=%g "
+                             "head=%d dim=%d fast=%g ref=%g\n",
+                             ud->layer, cached_seq_idx, token_idx, cached_pos_i, h_start, h_end, cached_context_len,
+                             static_cast<double>(max_abs_diff), max_h, max_d, static_cast<double>(fast_val),
+                             static_cast<double>(ref_val));
+            }
+        }
     }
 
     // Decode profiling: log KV write + attention compute timing (thread 0, every 100th call)
@@ -4344,7 +5027,7 @@ inline struct ggml_tensor* ggml_mul_mat_gemv_batched(struct ggml_context* ctx, s
 
     if (ggml_is_quantized(weight->type)) {
         const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight->type);
-        if (!type_traits_cpu || !type_traits_cpu->vec_dot || M > kMaxSmallBatchColsHard) {
+        if (!type_traits_cpu || !type_traits_cpu->vec_dot) {
             return ggml_mul_mat(ctx, weight, input);
         }
 
@@ -4356,11 +5039,7 @@ inline struct ggml_tensor* ggml_mul_mat_gemv_batched(struct ggml_context* ctx, s
 
         const size_t quant_row_size = ggml_row_size(vec_dot_type, static_cast<int64_t>(N));
         const size_t quant_row_stride = densecore::AlignUp(quant_row_size, static_cast<size_t>(64));
-        const size_t quant_buffer_capacity =
-            static_cast<size_t>(kMaxQuantInputBufferSize) * static_cast<size_t>(kMaxSmallBatchColsHard);
-
-        if (quant_row_size == 0 || quant_row_stride > kMaxQuantInputBufferSize ||
-            quant_row_stride * static_cast<size_t>(M) > quant_buffer_capacity) {
+        if (quant_row_size == 0 || quant_row_stride > kMaxQuantInputBufferSize) {
             return ggml_mul_mat(ctx, weight, input);
         }
 
@@ -4424,7 +5103,7 @@ inline struct ggml_tensor* ggml_paged_attention_decode(struct ggml_context* ctx,
     }
     const int n_heads = static_cast<int>(q_cur->ne[1]);
     const int n_tokens = std::max(1, static_cast<int>(q_cur->ne[2]));
-    const int head_tile = std::max(1, ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", 8));
+    const int head_tile = ResolvePagedAttentionDecodeHeadTile(n_heads, n_tokens, n_tasks);
     const int tiles_per_token = std::max(1, (std::max(1, n_heads) + head_tile - 1) / head_tile);
     const int total_tiles = std::max(1, n_tokens * tiles_per_token);
     // Preserve head-tiled parallelism for batched decode. Collapsing batch=2~4
@@ -4661,6 +5340,8 @@ enum class HalAttentionTensorLayout : uint8_t {
 struct HalAttentionOpData {
     float scale = 1.0f;
     int n_head_kv = -1;
+    int q_start_offset = 0;
+    int kv_start_offset = 0;
     uint8_t causal = 1;
     uint8_t layout = static_cast<uint8_t>(HalAttentionTensorLayout::HeadSeq);
     densecore::DeviceType preferred_device = densecore::DeviceType::CPU;
@@ -4700,7 +5381,7 @@ static float PortableFlashParityTolerance() {
 
 static void ComputeFlashAttentionReference(const float* q, const float* k, const float* v, float* out, int n_head,
                                            int n_head_kv, int seq_q, int seq_kv, int head_dim, float scale,
-                                           bool causal) {
+                                           bool causal, int q_start_offset = 0, int kv_start_offset = 0) {
     if (!q || !k || !v || !out || n_head <= 0 || n_head_kv <= 0 || seq_q <= 0 || seq_kv <= 0 || head_dim <= 0) {
         return;
     }
@@ -4721,7 +5402,7 @@ static void ComputeFlashAttentionReference(const float* q, const float* k, const
             std::vector<float> scores(static_cast<size_t>(seq_kv), -INFINITY);
             float row_max = -INFINITY;
             for (int tk = 0; tk < seq_kv; ++tk) {
-                if (causal && tk > tq) {
+                if (causal && (kv_start_offset + tk) > (q_start_offset + tq)) {
                     continue;
                 }
                 const float* k_row = k_head + static_cast<size_t>(tk) * head_dim;
@@ -4780,7 +5461,7 @@ static densecore::Tensor MakeHalAttentionTensorFromGgml(const struct ggml_tensor
 
 void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     (void)userdata;
-    if (ith != 0 || nth <= 0 || !dst || !dst->src[0] || !dst->src[1] || !dst->src[2]) {
+    if (nth <= 0 || !dst || !dst->src[0] || !dst->src[1] || !dst->src[2]) {
         return;
     }
 
@@ -4793,6 +5474,10 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
     const struct ggml_tensor* k = dst->src[1];
     const struct ggml_tensor* v = dst->src[2];
     if (!q || !k || !v || !q->data || !k->data || !v->data || !dst->data) {
+        return;
+    }
+    const bool direct_cpu_flash_path = params->data.preferred_device == densecore::DeviceType::CPU;
+    if (!direct_cpu_flash_path && ith != 0) {
         return;
     }
 
@@ -4871,6 +5556,33 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
         return;
     }
 
+    if (direct_cpu_flash_path && layout == HalAttentionTensorLayout::HeadSeq) {
+        if (!ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v) || !ggml_is_contiguous(dst)) {
+            return;
+        }
+
+        densecore::FlashAttentionConfig config = densecore::AutoTuneFlashConfig(head_dim, seq_kv);
+        config.scale = params->data.scale;
+        config.causal = params->data.causal != 0;
+        config.num_threads = std::max(1, nth);
+        config.q_start_offset = std::max(0, params->data.q_start_offset);
+        config.kv_start_offset = std::max(0, params->data.kv_start_offset);
+
+        const float* q_data = reinterpret_cast<const float*>(q->data);
+        const float* k_data = reinterpret_cast<const float*>(k->data);
+        const float* v_data = reinterpret_cast<const float*>(v->data);
+        float* o_data = reinterpret_cast<float*>(dst->data);
+
+        if (n_head == n_head_kv) {
+            densecore::FlashAttentionBatched(q_data, k_data, v_data, o_data, 1, n_head, seq_q, seq_kv, head_dim,
+                                             config, ith, nth);
+        } else {
+            densecore::FlashAttentionGQA(q_data, k_data, v_data, o_data, 1, n_head, n_head_kv, seq_q, seq_kv,
+                                         head_dim, config, ith, nth);
+        }
+        return;
+    }
+
     const BatchSpec* batch = GetCurrentBatch();
     densecore::BackendRegistry& registry = ResolveBackendRegistry(batch);
     densecore::ComputeBackend* backend = registry.Get(params->data.preferred_device);
@@ -4898,7 +5610,8 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
             ComputeFlashAttentionReference(reinterpret_cast<const float*>(q->data),
                                            reinterpret_cast<const float*>(k->data),
                                            reinterpret_cast<const float*>(v->data), ref.data(), n_head, n_head_kv,
-                                           seq_q, seq_kv, head_dim, params->data.scale, params->data.causal != 0);
+                                           seq_q, seq_kv, head_dim, params->data.scale, params->data.causal != 0,
+                                           params->data.q_start_offset, params->data.kv_start_offset);
 
             const float* got = reinterpret_cast<const float*>(dst->data);
             float max_abs = 0.0f;
@@ -4923,10 +5636,12 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
     }
 }
 
-inline struct ggml_tensor*
-ggml_flash_attention_hal(struct ggml_context* ctx, struct ggml_tensor* Q, struct ggml_tensor* K, struct ggml_tensor* V,
-                         float scale, bool causal, int n_head_kv, int layer, densecore::DeviceType preferred_device,
-                         HalAttentionTensorLayout layout = HalAttentionTensorLayout::HeadSeq) {
+inline struct ggml_tensor* ggml_flash_attention_hal(struct ggml_context* ctx, struct ggml_tensor* Q,
+                                                    struct ggml_tensor* K, struct ggml_tensor* V, float scale,
+                                                    bool causal, int n_head_kv, int layer,
+                                                    densecore::DeviceType preferred_device,
+                                                    HalAttentionTensorLayout layout = HalAttentionTensorLayout::HeadSeq,
+                                                    int q_start_offset = 0, int kv_start_offset = 0) {
     const int64_t ne_res[4] = {Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3]};
     struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_res);
     result->op = GGML_OP_CUSTOM;
@@ -4937,8 +5652,14 @@ ggml_flash_attention_hal(struct ggml_context* ctx, struct ggml_tensor* Q, struct
     HalAttentionCustomParams params = {cb_flash_attention_hal_custom,
                                        1,
                                        nullptr,
-                                       {scale, n_head_kv, static_cast<uint8_t>(causal ? 1 : 0),
-                                        static_cast<uint8_t>(layout), preferred_device, layer}};
+                                       {scale,
+                                        n_head_kv,
+                                        q_start_offset,
+                                        kv_start_offset,
+                                        static_cast<uint8_t>(causal ? 1 : 0),
+                                        static_cast<uint8_t>(layout),
+                                        preferred_device,
+                                        layer}};
     static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "params too large");
     std::memcpy(result->op_params, &params, sizeof(params));
     return result;
@@ -5458,6 +6179,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const int K_dim = static_cast<int>(weight->ne[0]);
     const int N_dim = static_cast<int>(weight->ne[1]);
     const char* w_name = (weight->name[0] ? weight->name : "(unnamed)");
+    const bool is_hybrid_ssm_qkv = model && model->arch_flags.is_hybrid_ssm && IsHybridSSMQkvWeightName(w_name);
 
     // ========================================================================
     // PATH 1: DenseCore-packed INT4 (highest priority)
@@ -5467,9 +6189,11 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         if (it_int4 != model->int4_weight_bindings.end()) {
             const auto& binding = it_int4->second;
             if (binding.k > 0 && binding.n > 0 && binding.group_size > 0 && binding.packed && binding.scales &&
-                binding.zeros) {
+                binding.zeros && !IsPackedInt4CustomDisabled()) {
                 LogMatmulDispatch(w_name, "PACKED_INT4", M, N_dim, K_dim,
                                   M == 1 ? "HWY_INT4_GEMV" : "HWY_INT4_BATCHED");
+                LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
+                                        M == 1 ? "HWY_INT4_GEMV" : "HWY_INT4_BATCHED", false, false, true);
                 return ggml_mul_mat_int4(ctx, weight, input, binding);
             }
         }
@@ -5480,6 +6204,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             const auto& binding = it_fp8->second;
             if (binding.k > 0 && binding.n > 0 && binding.packed) {
                 LogMatmulDispatch(w_name, "PACKED_FP8", M, N_dim, K_dim, M == 1 ? "FP8_GEMV" : "FP8_TILED_GEMM");
+                LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
+                                        M == 1 ? "FP8_GEMV" : "FP8_TILED_GEMM", false, false, false);
                 return ggml_mul_mat_fp8(ctx, weight, input, binding);
             }
         }
@@ -5497,12 +6223,13 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                                       input->nb[0] == static_cast<int64_t>(sizeof(float));
     if (hal_matmul_candidate) {
         LogMatmulDispatch(w_name, "FLOAT_F32", M, N_dim, K_dim, "HAL_MATMUL_ROUTE");
+        LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "HAL_MATMUL_ROUTE", false, false, false);
         return ggml_mul_mat_hal(ctx, weight, input, preferred_matmul_device);
     }
 
-    const int max_small_batch_cols = ParsePositiveEnvInt("DENSECORE_SMALL_BATCH_GEMV_MAX_COLS", 8);
+    const int max_small_batch_cols = ParsePositiveEnvInt("DENSECORE_SMALL_BATCH_GEMV_MAX_COLS", kMaxSmallBatchColsHard);
     const int max_small_batch_quant_cols =
-        ParsePositiveEnvInt("DENSECORE_SMALL_BATCH_GEMV_QUANT_MAX_COLS", kMaxSmallBatchColsHard);
+        ParsePositiveEnvInt("DENSECORE_SMALL_BATCH_GEMV_QUANT_MAX_COLS", 4096);
     const bool is_gemv_candidate =
         (input_cols == 1) && (weight->type == GGML_TYPE_F32 || ggml_is_quantized(weight->type));
     const bool is_small_batch_f32_candidate = (input_cols > 1 && input_cols <= max_small_batch_cols &&
@@ -5524,15 +6251,16 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             }
             const int vec_dot_nrows = std::max<int>(1, static_cast<int>(type_traits_cpu->nrows));
             quant_nrc_batch_ready =
-                IsQuantNrcBatchEnabled() && vec_dot_nrows >= input_cols && input_cols <= kMaxSmallBatchColsHard;
+                IsQuantNrcBatchEnabled() && vec_dot_nrows >= std::min(input_cols, kMaxSmallBatchColsHard);
             quant_true_batched_kernel_ready = IsQ4KTrueBatchedKernelEnabled() && (weight->type == GGML_TYPE_Q4_K) &&
                                               (type_traits_cpu->vec_dot_type == GGML_TYPE_Q8_K) &&
-                                              (input->ne[0] % QK_K == 0) && input_cols <= kMaxSmallBatchColsHard;
+                                              (input->ne[0] % QK_K == 0);
         }
     }
     const bool is_small_batch_quant_candidate =
         (input_cols > 1 && input_cols <= max_small_batch_quant_cols && input->type == GGML_TYPE_F32 &&
-         ggml_is_quantized(weight->type) && !IsBatchedQuantDisabled() && has_quant_vec_dot && has_quant_from_float &&
+         ggml_is_quantized(weight->type) && !IsBatchedQuantDisabled() && IsArmBatchedQuantSafeByDefault() &&
+         has_quant_vec_dot && has_quant_from_float &&
          quant_input_size_ok);
     const bool is_small_batch_candidate = is_small_batch_f32_candidate || is_small_batch_quant_candidate;
 
@@ -5552,12 +6280,21 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     // PATH 2: M==1 GEMV (decode single-token)
     // ========================================================================
     if (!IsCustomGemvDisabled() && is_gemv_candidate && is_compatible) {
+        if (ShouldForcePlainGgmlForHybridSSMQkv() && is_hybrid_ssm_qkv) {
+            LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "GGML_NATIVE", "forced_ssm_qkv_plain_ggml");
+            LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "GGML_NATIVE", false, false, false);
+            LogMatmulPathOnce("ggml_mul_mat");
+            return ggml_mul_mat(ctx, weight, input);
+        }
         if (input->type != GGML_TYPE_F32) {
             fprintf(stderr, "CRITICAL: smart_mul_mat input type is %d! Tensor name: %s\n", input->type, input->name);
         }
         LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim,
                           ggml_is_quantized(weight->type) ? "GEMV_QUANT" : "GEMV_F32");
         GemvUserData* ud = GetGemvUserData();
+        ud->force_reference_scalar = false;
+        LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
+                                ggml_is_quantized(weight->type) ? "GEMV_QUANT" : "GEMV_F32", false, false, false);
         return ggml_mul_mat_gemv(ctx, weight, input, ud);
     }
 
@@ -5567,12 +6304,22 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     //   - FP32: batched dot with weight row reuse
     // ========================================================================
     if (!IsCustomGemvDisabled() && is_small_batch_candidate && is_compatible) {
+        if (ShouldForcePlainGgmlForHybridSSMQkv() && is_hybrid_ssm_qkv) {
+            LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "GGML_NATIVE", "forced_ssm_qkv_plain_ggml");
+            LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "GGML_NATIVE", false, false, false);
+            LogMatmulPathOnce("ggml_mul_mat");
+            return ggml_mul_mat(ctx, weight, input);
+        }
         if (is_small_batch_quant_candidate) {
             LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "GGML_QUANT_NRC_M");
         } else {
             LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "BATCHED_F32");
         }
         GemvBatchedUserData* ud = GetGemvBatchedUserData();
+        ud->force_reference_scalar = false;
+        LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
+                                is_small_batch_quant_candidate ? "GGML_QUANT_NRC_M" : "BATCHED_F32",
+                                is_small_batch_quant_candidate, false, false);
         return ggml_mul_mat_gemv_batched(ctx, weight, input, ud);
     }
 
@@ -5586,6 +6333,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             reason = "M>max_quant_cols";
         else if (IsBatchedQuantDisabled())
             reason = "batched_quant_disabled";
+        else if (!IsArmBatchedQuantSafeByDefault())
+            reason = "batched_quant_arm_guard";
         else if (!has_quant_vec_dot)
             reason = "no_vec_dot";
         else if (!has_quant_from_float)
@@ -5621,6 +6370,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
 
         if (densecore::SelectMatmulBackend(params, true) == densecore::MatmulBackendKind::OneDNN) {
             LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "ONEDNN_GEMM");
+            LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "ONEDNN_GEMM", false, false, false);
             MatmulOpData data;
             data.backend = densecore::MatmulBackendKind::OneDNN;
             data.a_type = params.a_type;
@@ -5633,6 +6383,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
 
     // Standard GGML fallback (handles transpose/stride correctly)
     LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "GGML_NATIVE");
+    LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "GGML_NATIVE", false, false, false);
     LogMatmulPathOnce("ggml_mul_mat");
     return ggml_mul_mat(ctx, weight, input);
 }
@@ -5648,15 +6399,27 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
 // MoE Forward Callbacks
 // ============================================================================
 
-// Helper: Convert GGML tensor to DenseCore HAL Tensor
-inline densecore::Tensor GgmlToTensor(const struct ggml_tensor* t) {
+// Helper: Convert GGML tensors to DenseCore HAL tensors using DenseCore's
+// row-major convention. GGML stores 2D tensors as [cols, rows], while
+// DenseCore expects [rows, cols].
+inline densecore::Tensor GgmlToRowMajorTensor(const struct ggml_tensor* t) {
+    if (!t) {
+        return {};
+    }
+
     densecore::Tensor out;
     out.data = t->data;
     out.dtype = densecore::GgmlTypeToDType(t->type);
-    for (int i = 0; i < 4; ++i) {
-        out.shape[i] = t->ne[i];
-        out.stride[i] = t->nb[i];
-    }
+    out.shape[0] = t->ne[1];
+    out.shape[1] = t->ne[0];
+    out.shape[2] = t->ne[2];
+    out.shape[3] = t->ne[3];
+    out.stride[0] = t->ne[0];
+    out.stride[1] = 1;
+    out.stride[2] = t->nb[2];
+    out.stride[3] = t->nb[3];
+    out.ndim = 2;
+    out.device_type = densecore::DeviceType::CPU;
     return out;
 }
 
@@ -5774,13 +6537,39 @@ void cb_pack_glm_dsa_v(struct ggml_tensor* dst, const struct ggml_tensor* src0, 
     }
 }
 
-static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(const TransformerLayer* layer) {
+static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(const TransformerLayer* layer,
+                                                                            const TransformerModel* model) {
     using ExpertWeights = densecore::CpuBackend::ExpertWeights;
+    using ExpertPackedInt4Weight = densecore::CpuBackend::ExpertPackedInt4Weight;
 
     std::vector<ExpertWeights> experts;
     if (!layer) {
         return experts;
     }
+
+    const auto make_int4_binding = [model](const ggml_tensor* tensor, int expected_k,
+                                           int expected_n) -> ExpertPackedInt4Weight {
+        ExpertPackedInt4Weight packed{};
+        if (!model || !tensor || expected_k <= 0 || expected_n <= 0) {
+            return packed;
+        }
+        const auto it = model->int4_weight_bindings.find(tensor);
+        if (it == model->int4_weight_bindings.end()) {
+            return packed;
+        }
+        const auto& binding = it->second;
+        if (!binding.packed || !binding.scales || !binding.zeros || !binding.packed->data || !binding.scales->data ||
+            !binding.zeros->data || binding.group_size <= 0 || binding.k != expected_k || binding.n != expected_n) {
+            return packed;
+        }
+        packed.packed_weights = reinterpret_cast<const uint8_t*>(binding.packed->data);
+        packed.scales = reinterpret_cast<const float*>(binding.scales->data);
+        packed.zeros = reinterpret_cast<const float*>(binding.zeros->data);
+        packed.group_size = binding.group_size;
+        packed.K = static_cast<int>(binding.k);
+        packed.N = static_cast<int>(binding.n);
+        return packed;
+    };
 
     size_t n_experts = layer->NumExperts();
     experts.reserve(n_experts);
@@ -5800,6 +6589,8 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
             w.hidden_dim = static_cast<int>(gw1->ne[0]);
             w.intermediate_dim = static_cast<int>(gw1->ne[1]);
             w.w1_type = static_cast<int>(gw1->type);
+            w.w1_tensor = gw1;
+            w.w1_int4 = make_int4_binding(gw1, w.hidden_dim, w.intermediate_dim);
         }
 
         auto* gw2 = layer->GetExpert(i, model_keys::kFfnDown);
@@ -5807,6 +6598,8 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
             w.w2.ptr = gw2->data;
             w.w2.size = ggml_nbytes(gw2);
             w.w2_type = static_cast<int>(gw2->type);
+            w.w2_tensor = gw2;
+            w.w2_int4 = make_int4_binding(gw2, w.intermediate_dim, w.hidden_dim);
         }
 
         auto* gw3 = layer->GetExpert(i, model_keys::kFfnUp);
@@ -5814,6 +6607,8 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
             w.w3.ptr = gw3->data;
             w.w3.size = ggml_nbytes(gw3);
             w.w3_type = static_cast<int>(gw3->type);
+            w.w3_tensor = gw3;
+            w.w3_int4 = make_int4_binding(gw3, w.hidden_dim, w.intermediate_dim);
         }
 
         experts.push_back(w);
@@ -6094,32 +6889,14 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
         fprintf(stderr, "[DBG] cb_moe_forward #%d src0=[%lld,%lld] src1=[%lld,%lld]\n",
                 call_id, (long long)src0->ne[0], (long long)src0->ne[1],
                 (long long)src1->ne[0], (long long)src1->ne[1]);
+        if (call_id < 8) {
+            DebugLogTensorFiniteStats("MOE_IN", src0);
+            DebugLogTensorFiniteStats("MOE_GATE", src1);
+        }
     }
     auto* ud = static_cast<MoEUserData*>(userdata);
     if (!ud || !ud->layer || !ud->backend) return;
-
-    if (!ud->experts_registered && ud->experts && ud->n_experts > 0) {
-        std::vector<densecore::CpuBackend::ExpertWeights> experts_vec(
-            ud->experts, ud->experts + static_cast<size_t>(ud->n_experts));
-        ud->backend->InitMoEProfiler(ud->layer, ud->n_experts);
-        ud->backend->RegisterMoEExperts(ud->layer, experts_vec);
-        EnsureMoERebalanceThread(ud->backend);
-        ud->experts_registered = true;
-    }
-
-    std::vector<densecore::CpuBackend::ExpertWeights> experts;
-    if (!ud->experts || ud->n_experts <= 0) {
-        experts = ud->backend->GetRegisteredExperts(ud->layer);
-    }
-    if ((!ud->experts || ud->n_experts <= 0) && experts.empty()) {
-        experts = BuildExpertWeights(ud->layer);
-        if (!experts.empty()) {
-            ud->backend->InitMoEProfiler(ud->layer, static_cast<int>(experts.size()));
-            ud->backend->RegisterMoEExperts(ud->layer, experts);
-            EnsureMoERebalanceThread(ud->backend);
-        }
-    }
-    if ((!ud->experts || ud->n_experts <= 0) && experts.empty()) return;
+    if (!ud->experts_registered || !ud->experts || ud->n_experts <= 0) return;
 
     // Routing (src1 = gate_logits)
     thread_local densecore::moe::MoERouteResult routing;
@@ -6130,54 +6907,22 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     UpdateSchedulerExperts(ud, routing);
 
     // Forward (src0 = input, dst = output)
-    densecore::Tensor t_input = GgmlToTensor(src0);
-    densecore::Tensor t_output = GgmlToTensor(dst);
+    densecore::Tensor t_input = GgmlToRowMajorTensor(src0);
+    densecore::Tensor t_output = GgmlToRowMajorTensor(dst);
 
-    if (ud->experts && ud->n_experts > 0) {
-        ud->backend->ForwardMoE(ud->layer, t_input, routing, ud->experts, ud->n_experts, &t_output);
-    } else {
-        ud->backend->ForwardMoE(ud->layer, t_input, routing, experts, &t_output);
+    ud->backend->ForwardMoE(ud->layer, t_input, routing, ud->experts, ud->n_experts, &t_output);
+    if (IsMoEDebugLoggingEnabled()) {
+        static std::atomic<int> moe_out_count{0};
+        const int call_id = moe_out_count.fetch_add(1);
+        if (call_id < 8) {
+            DebugLogTensorFiniteStats("MOE_OUT", dst);
+        }
     }
 }
 
 // ============================================================================
 // SSM (Mamba2) Callback Functions
 // ============================================================================
-
-// Conv1D decode callback: processes N tokens sequentially through the ring buffer
-static void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* userdata) {
-    (void)nth;
-    if (ith != 0) return;
-    auto* ud = static_cast<SSMConv1DUserData*>(userdata);
-    const float* input = reinterpret_cast<const float*>(src->data);
-    float* output = reinterpret_cast<float*>(dst->data);
-    if (!ud || !input || !output) return;
-
-    static const bool ssm_passthrough = (std::getenv("SSM_PASSTHROUGH") != nullptr);
-    const int N = static_cast<int>(src->ne[1]);
-    if (ssm_passthrough) {
-        // Pass-through: copy input → output, skip conv and state update
-        std::memcpy(output, input, static_cast<size_t>(N) * ud->channels * sizeof(float));
-        return;
-    }
-    for (int t = 0; t < N; ++t) {
-        float* conv_state = ud->conv_state;
-        if (ud->runtime_states && ud->token_seq_ids && ud->ssm_ordinal >= 0) {
-            const int seq_idx = ud->token_seq_ids[t];
-            if (seq_idx >= 0 && seq_idx < static_cast<int>(ud->runtime_states->size())) {
-                auto* seq_states = (*ud->runtime_states)[static_cast<size_t>(seq_idx)];
-                if (seq_states && ud->ssm_ordinal < static_cast<int>(seq_states->size())) {
-                    conv_state = (*seq_states)[static_cast<size_t>(ud->ssm_ordinal)].conv_state.data();
-                }
-            }
-        }
-        if (!conv_state) {
-            continue;
-        }
-        densecore::hwy_kernels::SSMConv1DDecode_Hwy(conv_state, &input[t * ud->channels], ud->weight,
-                                                    &output[t * ud->channels], ud->channels, ud->kernel_size);
-    }
-}
 
 static inline float SoftplusStable(float x) {
     if (x > 20.0f) return x;
@@ -6192,6 +6937,391 @@ static inline float SigmoidStable(float x) {
     }
     const float z = std::exp(x);
     return z / (1.0f + z);
+}
+
+static bool IsSSMNonFiniteDebugEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SSM_NONFINITE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+struct Qwen35SSMDebugScalars {
+    float alpha = std::numeric_limits<float>::quiet_NaN();
+    float beta = std::numeric_limits<float>::quiet_NaN();
+    float softplus_alpha = std::numeric_limits<float>::quiet_NaN();
+    float exp_a_log = std::numeric_limits<float>::quiet_NaN();
+    float g = std::numeric_limits<float>::quiet_NaN();
+    float decay = std::numeric_limits<float>::quiet_NaN();
+    float beta_gate = std::numeric_limits<float>::quiet_NaN();
+    float q_sum_sq = std::numeric_limits<float>::quiet_NaN();
+    float k_sum_sq = std::numeric_limits<float>::quiet_NaN();
+    float rms = std::numeric_limits<float>::quiet_NaN();
+};
+
+static void AbortOnFirstSSMNonFinite(int layer_idx, int token_idx, int seq_idx, int head_idx, const char* stage,
+                                     const char* var_name, int elem_idx, float value,
+                                     const Qwen35SSMDebugScalars& scalars) {
+    static std::atomic<bool> fired{false};
+    if (!IsSSMNonFiniteDebugEnabled()) return;
+    if (fired.exchange(true, std::memory_order_relaxed)) return;
+
+    std::fprintf(stderr,
+                 "[DenseCore][SSM_NONFINITE] layer=%d token=%d seq=%d head=%d stage=%s var=%s elem=%d value=%g "
+                 "alpha=%g beta=%g softplus=%g exp_a_log=%g g=%g decay=%g beta_gate=%g q_sum_sq=%g k_sum_sq=%g rms=%g\n",
+                 layer_idx, token_idx, seq_idx, head_idx, stage ? stage : "<unknown>", var_name ? var_name : "<unnamed>",
+                 elem_idx, static_cast<double>(value), static_cast<double>(scalars.alpha),
+                 static_cast<double>(scalars.beta), static_cast<double>(scalars.softplus_alpha),
+                 static_cast<double>(scalars.exp_a_log), static_cast<double>(scalars.g),
+                 static_cast<double>(scalars.decay), static_cast<double>(scalars.beta_gate),
+                 static_cast<double>(scalars.q_sum_sq), static_cast<double>(scalars.k_sum_sq),
+                 static_cast<double>(scalars.rms));
+    std::fflush(stderr);
+    std::abort();
+}
+
+static void CheckSSMFiniteScalar(int layer_idx, int token_idx, int seq_idx, int head_idx, const char* stage,
+                                 const char* var_name, float value, const Qwen35SSMDebugScalars& scalars) {
+    if (!IsSSMNonFiniteDebugEnabled() || std::isfinite(value)) return;
+    AbortOnFirstSSMNonFinite(layer_idx, token_idx, seq_idx, head_idx, stage, var_name, -1, value, scalars);
+}
+
+static void CheckSSMFiniteVector(int layer_idx, int token_idx, int seq_idx, int head_idx, const char* stage,
+                                 const char* var_name, const float* values, int n,
+                                 const Qwen35SSMDebugScalars& scalars) {
+    if (!IsSSMNonFiniteDebugEnabled() || !values || n <= 0) return;
+    for (int i = 0; i < n; ++i) {
+        if (!std::isfinite(values[i])) {
+            AbortOnFirstSSMNonFinite(layer_idx, token_idx, seq_idx, head_idx, stage, var_name, i, values[i], scalars);
+        }
+    }
+}
+
+static void CheckSSMFiniteTensor(int layer_idx, const int* token_seq_ids, const struct ggml_tensor* tensor,
+                                 const char* stage, const char* var_name) {
+    if (!IsSSMNonFiniteDebugEnabled() || !tensor || !tensor->data) return;
+    const auto* values = reinterpret_cast<const float*>(tensor->data);
+    const int64_t ne0 = tensor->ne[0];
+    const int64_t ne1 = std::max<int64_t>(1, tensor->ne[1]);
+    const int64_t total = ggml_nelements(tensor);
+    if (!values || ne0 <= 0 || ne1 <= 0 || total <= 0) return;
+    const Qwen35SSMDebugScalars scalars{};
+    for (int64_t idx = 0; idx < total; ++idx) {
+        if (std::isfinite(values[idx])) continue;
+        const int token_idx = static_cast<int>(idx / ne0);
+        const int seq_idx = (token_seq_ids && token_idx >= 0 && token_idx < ne1) ? token_seq_ids[token_idx] : -1;
+        const int elem_idx = static_cast<int>(idx % ne0);
+        AbortOnFirstSSMNonFinite(layer_idx, token_idx, seq_idx, -1, stage, var_name, elem_idx, values[idx], scalars);
+    }
+}
+
+[[noreturn]] static void FatalQwen35SSMRuntimeError(int layer_idx, int token_idx, int seq_idx, int head_idx,
+                                                    const char* message) {
+    std::fprintf(stderr,
+                 "[DenseCore][Qwen35SSM] FATAL layer=%d token=%d seq=%d head=%d: %s\n",
+                 layer_idx, token_idx, seq_idx, head_idx, message ? message : "unknown error");
+#if !defined(NDEBUG)
+    std::abort();
+#else
+    std::terminate();
+#endif
+}
+
+static void cb_ssm_projection_reference_probe(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                              void* userdata) {
+    (void)nth;
+    if (ith != 0) return;
+    auto* ud = static_cast<SSMProjectionReferenceUserData*>(userdata);
+    if (!dst || !src || !ud || !ud->weight_tensor || !ud->input_tensor) return;
+    if (dst->data && src->data) {
+        std::memcpy(dst->data, src->data, ggml_nbytes(src));
+    }
+    if (!src->data) {
+        return;
+    }
+
+    std::vector<float> ref;
+    ComputeMatmulReferenceF32(ud->weight_tensor, ud->input_tensor, &ref);
+    if (ref.empty()) {
+        std::fprintf(stderr, "[SSM_PROJ_REF] layer=%d stage=%s var=%s status=skipped reason=reference_unavailable\n",
+                     ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown");
+        return;
+    }
+
+    const float* runtime = reinterpret_cast<const float*>(src->data);
+    const int total = ggml_nelements(src);
+    if (total <= 0 || static_cast<size_t>(total) != ref.size()) {
+        std::fprintf(stderr,
+                     "[SSM_PROJ_REF] layer=%d stage=%s var=%s status=skipped reason=shape_mismatch runtime=%d ref=%zu\n",
+                     ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown",
+                     total, ref.size());
+        return;
+    }
+
+    float max_abs_diff = 0.0f;
+    int max_idx = -1;
+    int first_bad_idx = -1;
+    bool runtime_nonfinite = false;
+    bool ref_nonfinite = false;
+    for (int i = 0; i < total; ++i) {
+        const bool runtime_finite = std::isfinite(runtime[i]);
+        const bool ref_finite = std::isfinite(ref[static_cast<size_t>(i)]);
+        if (!runtime_finite || !ref_finite) {
+            if (first_bad_idx < 0) {
+                first_bad_idx = i;
+                runtime_nonfinite = !runtime_finite;
+                ref_nonfinite = !ref_finite;
+            }
+            continue;
+        }
+        const float diff = std::fabs(runtime[i] - ref[static_cast<size_t>(i)]);
+        if (diff > max_abs_diff) {
+            max_abs_diff = diff;
+            max_idx = i;
+        }
+    }
+
+    const int row_dim = static_cast<int>(src->ne[0]);
+    const int bad_token = (first_bad_idx >= 0 && row_dim > 0) ? first_bad_idx / row_dim : -1;
+    const int bad_elem = (first_bad_idx >= 0 && row_dim > 0) ? first_bad_idx % row_dim : -1;
+    const int bad_seq =
+        (bad_token >= 0 && ud->token_seq_ids && bad_token < static_cast<int>(src->ne[1])) ? ud->token_seq_ids[bad_token]
+                                                                                            : -1;
+
+    std::fprintf(stderr,
+                 "[SSM_PROJ_REF] layer=%d stage=%s var=%s total=%d first_bad_idx=%d token=%d seq=%d elem=%d runtime_nonfinite=%d ref_nonfinite=%d max_abs_diff=%.8g max_idx=%d\n",
+                 ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown", total,
+                 first_bad_idx, bad_token, bad_seq, bad_elem, runtime_nonfinite ? 1 : 0, ref_nonfinite ? 1 : 0,
+                 max_abs_diff, max_idx);
+    if (first_bad_idx >= 0) {
+        std::fprintf(stderr, "[SSM_PROJ_REF] first_bad runtime=%g ref=%g\n",
+                     static_cast<double>(runtime[first_bad_idx]),
+                     static_cast<double>(ref[static_cast<size_t>(first_bad_idx)]));
+    } else if (max_idx >= 0) {
+        std::fprintf(stderr, "[SSM_PROJ_REF] worst_diff runtime=%g ref=%g\n", static_cast<double>(runtime[max_idx]),
+                     static_cast<double>(ref[static_cast<size_t>(max_idx)]));
+    }
+}
+
+static void RunSSMConv1DReference(const float* conv_state, const float* input, const float* weight, float* output,
+                                  int channels, int kernel_size) {
+    if (!conv_state || !input || !weight || !output || channels <= 0 || kernel_size <= 0) return;
+    const int hist = kernel_size - 1;
+    for (int ch = 0; ch < channels; ++ch) {
+        float sum = 0.0f;
+        const float* state_row = conv_state + static_cast<size_t>(ch) * hist;
+        const float* weight_row = weight + static_cast<size_t>(ch) * kernel_size;
+        for (int k = 0; k < hist; ++k) {
+            sum += state_row[k] * weight_row[k];
+        }
+        sum += input[ch] * weight_row[hist];
+        output[ch] = sum;
+    }
+}
+
+static void LogSSMCoreReferenceDiff(int layer_idx, int token_idx, int seq_idx, int head_idx, const char* stage,
+                                    const char* var_name, const float* actual, const float* reference, int n) {
+    if (!IsDebugSSMCoreReferenceEnabled() || !actual || !reference || n <= 0) return;
+    float max_abs_diff = 0.0f;
+    int max_idx = -1;
+    int first_bad_idx = -1;
+    bool actual_nonfinite = false;
+    bool ref_nonfinite = false;
+    for (int i = 0; i < n; ++i) {
+        const bool a_fin = std::isfinite(actual[i]);
+        const bool r_fin = std::isfinite(reference[i]);
+        if (!a_fin || !r_fin) {
+            if (first_bad_idx < 0) {
+                first_bad_idx = i;
+                actual_nonfinite = !a_fin;
+                ref_nonfinite = !r_fin;
+            }
+            continue;
+        }
+        const float diff = std::fabs(actual[i] - reference[i]);
+        if (diff > max_abs_diff) {
+            max_abs_diff = diff;
+            max_idx = i;
+        }
+    }
+    if (first_bad_idx < 0 && max_idx < 0) return;
+    std::fprintf(stderr,
+                 "[DenseCore][SSM_CORE_REF] layer=%d token=%d seq=%d head=%d stage=%s var=%s n=%d first_bad=%d actual_nonfinite=%d ref_nonfinite=%d max_abs_diff=%.8g max_idx=%d",
+                 layer_idx, token_idx, seq_idx, head_idx, stage ? stage : "unknown", var_name ? var_name : "unknown",
+                 n, first_bad_idx, actual_nonfinite ? 1 : 0, ref_nonfinite ? 1 : 0, max_abs_diff, max_idx);
+    if (first_bad_idx >= 0) {
+        std::fprintf(stderr, " actual=%g ref=%g\n", static_cast<double>(actual[first_bad_idx]),
+                     static_cast<double>(reference[first_bad_idx]));
+    } else {
+        std::fprintf(stderr, " actual=%g ref=%g\n", static_cast<double>(actual[max_idx]),
+                     static_cast<double>(reference[max_idx]));
+    }
+}
+
+static bool RunQwen35ReferenceHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head,
+                                       Qwen35SSMHeadStepStats* stats) {
+    if (!cfg.input_t || !cfg.q_head || !cfg.k_head || !cfg.v_head || !cfg.z_head || !cfg.alpha_row || !cfg.beta_row ||
+        !state_kv || !y_head || cfg.n_embd <= 0 || cfg.head_dim_k <= 0 || cfg.head_dim_v <= 0) {
+        return false;
+    }
+
+    std::vector<float> q_norm(static_cast<size_t>(cfg.head_dim_k), 0.0f);
+    std::vector<float> k_norm(static_cast<size_t>(cfg.head_dim_k), 0.0f);
+    std::vector<float> delta(static_cast<size_t>(cfg.head_dim_v), 0.0f);
+
+    float alpha = cfg.dt_bias;
+    float beta = 0.0f;
+    for (int i = 0; i < cfg.n_embd; ++i) {
+        alpha += cfg.alpha_row[i] * cfg.input_t[i];
+        beta += cfg.beta_row[i] * cfg.input_t[i];
+    }
+
+    const float softplus_alpha = SoftplusStable(alpha);
+    const float exp_a_log = std::exp(cfg.a_log);
+    const float g = -exp_a_log * softplus_alpha;
+    const float decay = std::exp(g);
+    const float beta_gate = SigmoidStable(beta);
+
+    float q_sum_sq = 0.0f;
+    float k_sum_sq = 0.0f;
+    for (int i = 0; i < cfg.head_dim_k; ++i) {
+        q_sum_sq += cfg.q_head[i] * cfg.q_head[i];
+        k_sum_sq += cfg.k_head[i] * cfg.k_head[i];
+    }
+    const float q_inv_norm =
+        (1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k))) / std::sqrt(q_sum_sq + cfg.norm_eps);
+    const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+    for (int i = 0; i < cfg.head_dim_k; ++i) {
+        q_norm[static_cast<size_t>(i)] = cfg.q_head[i] * q_inv_norm;
+        k_norm[static_cast<size_t>(i)] = cfg.k_head[i] * k_inv_norm;
+    }
+
+    const size_t state_elems = static_cast<size_t>(cfg.head_dim_k) * static_cast<size_t>(cfg.head_dim_v);
+    for (size_t i = 0; i < state_elems; ++i) {
+        state_kv[i] *= decay;
+    }
+    for (int v = 0; v < cfg.head_dim_v; ++v) {
+        float kv_mem = 0.0f;
+        for (int k = 0; k < cfg.head_dim_k; ++k) {
+            kv_mem += state_kv[static_cast<size_t>(k) * cfg.head_dim_v + v] * k_norm[static_cast<size_t>(k)];
+        }
+        delta[static_cast<size_t>(v)] = (cfg.v_head[v] - kv_mem) * beta_gate;
+    }
+    for (int k = 0; k < cfg.head_dim_k; ++k) {
+        float* row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        const float kval = k_norm[static_cast<size_t>(k)];
+        for (int v = 0; v < cfg.head_dim_v; ++v) {
+            row[v] += kval * delta[static_cast<size_t>(v)];
+        }
+    }
+
+    float sum_sq = 0.0f;
+    for (int v = 0; v < cfg.head_dim_v; ++v) {
+        float sum = 0.0f;
+        for (int k = 0; k < cfg.head_dim_k; ++k) {
+            sum += state_kv[static_cast<size_t>(k) * cfg.head_dim_v + v] * q_norm[static_cast<size_t>(k)];
+        }
+        y_head[v] = sum;
+        sum_sq += sum * sum;
+    }
+    const float rms = std::sqrt(sum_sq / cfg.head_dim_v + cfg.norm_eps);
+    for (int v = 0; v < cfg.head_dim_v; ++v) {
+        const float norm_w = cfg.norm_weight ? cfg.norm_weight[v] : 1.0f;
+        y_head[v] = (y_head[v] / rms) * norm_w * (cfg.z_head[v] * SigmoidStable(cfg.z_head[v]));
+    }
+
+    if (stats) {
+        stats->alpha = alpha;
+        stats->beta = beta;
+        stats->softplus_alpha = softplus_alpha;
+        stats->exp_a_log = exp_a_log;
+        stats->g = g;
+        stats->decay = decay;
+        stats->beta_gate = beta_gate;
+        stats->q_sum_sq = q_sum_sq;
+        stats->k_sum_sq = k_sum_sq;
+        stats->rms = rms;
+    }
+    return true;
+}
+
+// Conv1D decode callback: processes N tokens sequentially through the ring buffer
+static void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* userdata) {
+    (void)nth;
+    if (ith != 0) return;
+    auto* ud = static_cast<SSMConv1DUserData*>(userdata);
+    const float* input = reinterpret_cast<const float*>(src->data);
+    float* output = reinterpret_cast<float*>(dst->data);
+    if (!ud || !input || !output) return;
+
+    static const bool ssm_passthrough = (std::getenv("SSM_PASSTHROUGH") != nullptr);
+    static const bool ssm_conv_passthrough = (std::getenv("DENSECORE_SSM_CONV_PASSTHROUGH") != nullptr);
+    const int N = static_cast<int>(src->ne[1]);
+    const ptrdiff_t input_stride = static_cast<ptrdiff_t>(src->nb[1] / sizeof(float));
+    const ptrdiff_t output_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
+    const size_t conv_state_elems =
+        static_cast<size_t>(ud->channels) * static_cast<size_t>(std::max(0, ud->kernel_size - 1));
+    const bool debug_conv_ref = IsDebugSSMCoreReferenceEnabled();
+    std::vector<float> conv_state_before;
+    std::vector<float> conv_ref;
+    if (debug_conv_ref) {
+        conv_state_before.resize(conv_state_elems, 0.0f);
+        conv_ref.resize(static_cast<size_t>(ud->channels), 0.0f);
+    }
+    if (ssm_passthrough || ssm_conv_passthrough) {
+        for (int t = 0; t < N; ++t) {
+            std::memcpy(output + static_cast<ptrdiff_t>(t) * output_stride,
+                        input + static_cast<ptrdiff_t>(t) * input_stride,
+                        static_cast<size_t>(ud->channels) * sizeof(float));
+        }
+        return;
+    }
+    for (int t = 0; t < N; ++t) {
+        float* conv_state = ud->conv_state;
+        if (ud->runtime_states && ud->token_seq_ids && ud->ssm_ordinal >= 0) {
+            const int seq_idx = ud->token_seq_ids[t];
+            if (seq_idx >= 0 && seq_idx < static_cast<int>(ud->runtime_states->size())) {
+                auto* seq_states = (*ud->runtime_states)[static_cast<size_t>(seq_idx)];
+                if (seq_states && ud->ssm_ordinal < static_cast<int>(seq_states->size())) {
+                    auto& seq_state = (*seq_states)[static_cast<size_t>(ud->ssm_ordinal)].conv_state;
+                    if (seq_state.size() >= conv_state_elems) {
+                        conv_state = seq_state.data();
+                    } else {
+                        conv_state = nullptr;
+                    }
+                }
+            }
+        }
+        if (!conv_state) {
+            continue;
+        }
+        if (debug_conv_ref && !conv_state_before.empty()) {
+            std::memcpy(conv_state_before.data(), conv_state, conv_state_elems * sizeof(float));
+        }
+        if (IsSSMNonFiniteDebugEnabled()) {
+            const Qwen35SSMDebugScalars scalars{};
+            const int seq_idx = (ud->token_seq_ids && t < N) ? ud->token_seq_ids[t] : -1;
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, -1, "conv", "conv_input",
+                                 input + static_cast<ptrdiff_t>(t) * input_stride, ud->channels, scalars);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, -1, "conv", "conv_state", conv_state,
+                                 static_cast<int>(conv_state_elems), scalars);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, -1, "conv", "conv_weight", ud->weight,
+                                 ud->channels * ud->kernel_size, scalars);
+        }
+        densecore::hwy_kernels::SSMConv1DDecode_Hwy(
+            conv_state, input + static_cast<ptrdiff_t>(t) * input_stride, ud->weight,
+            output + static_cast<ptrdiff_t>(t) * output_stride, ud->channels, ud->kernel_size);
+        const int seq_idx = (ud->token_seq_ids && t < N) ? ud->token_seq_ids[t] : -1;
+        if (debug_conv_ref && !conv_ref.empty()) {
+            RunSSMConv1DReference(conv_state_before.data(), input + static_cast<ptrdiff_t>(t) * input_stride, ud->weight,
+                                  conv_ref.data(), ud->channels, ud->kernel_size);
+            LogSSMCoreReferenceDiff(ud->layer_idx, t, seq_idx, -1, "conv", "conv_output",
+                                    output + static_cast<ptrdiff_t>(t) * output_stride, conv_ref.data(), ud->channels);
+        }
+        CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, -1, "conv", "conv_output",
+                             output + static_cast<ptrdiff_t>(t) * output_stride, ud->channels, {});
+    }
 }
 
 // Qwen3.5 recurrent delta-net callback.
@@ -6222,13 +7352,14 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
     if (!ud || !qkv_conv || !z_proj || !input || !y_out) return;
 
     static const bool ssm_passthrough = (std::getenv("SSM_PASSTHROUGH") != nullptr);
+    static const bool ssm_delta_passthrough = (std::getenv("DENSECORE_SSM_DELTA_PASSTHROUGH") != nullptr);
     const int N = static_cast<int>(a->ne[1]);
     const int out_elems = static_cast<int>(dst->ne[0]) * N;
     const ptrdiff_t qkv_stride = static_cast<ptrdiff_t>(a->nb[1] / sizeof(float));
     const ptrdiff_t z_stride = static_cast<ptrdiff_t>(b->nb[1] / sizeof(float));
     const ptrdiff_t input_stride = static_cast<ptrdiff_t>(c->nb[1] / sizeof(float));
     const ptrdiff_t out_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
-    if (ssm_passthrough) {
+    if (ssm_passthrough || ssm_delta_passthrough) {
         std::memset(y_out, 0, static_cast<size_t>(out_elems) * sizeof(float));
         return;
     }
@@ -6239,25 +7370,52 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
     const int head_k_dim = ud->head_dim_k;
     const int head_v_dim = ud->head_dim_v;
     const int qk_total = head_k_dim * num_k_heads;
-    const float q_scale = 1.0f / std::sqrt(static_cast<float>(head_v_dim));
     const int state_stride = head_k_dim * head_v_dim;
+    const int heads_per_group = (num_k_heads > 0) ? std::max(1, num_v_heads / num_k_heads) : 1;
 
     std::vector<float> q_norm(static_cast<size_t>(head_k_dim));
     std::vector<float> k_norm(static_cast<size_t>(head_k_dim));
     std::vector<float> kv_mem(static_cast<size_t>(head_v_dim));
     std::vector<float> delta(static_cast<size_t>(head_v_dim));
+    std::vector<float> y_pre_norm(static_cast<size_t>(head_v_dim));
     std::vector<float> y(static_cast<size_t>(ud->d_inner));
+    const bool debug_core_ref = IsDebugSSMCoreReferenceEnabled();
+    std::vector<float> q_expanded;
+    std::vector<float> k_expanded;
+    std::vector<float> ref_state;
+    std::vector<float> ref_y_head;
+    if (debug_core_ref) {
+        q_expanded.resize(static_cast<size_t>(num_v_heads) * head_k_dim, 0.0f);
+        k_expanded.resize(static_cast<size_t>(num_v_heads) * head_k_dim, 0.0f);
+        ref_state.resize(static_cast<size_t>(state_stride), 0.0f);
+        ref_y_head.resize(static_cast<size_t>(head_v_dim), 0.0f);
+    }
 
     for (int t = 0; t < N; ++t) {
+        std::fill(y.begin(), y.end(), 0.0f);
         const float* input_t = input + static_cast<ptrdiff_t>(t) * input_stride;
         const float* qkv_t = qkv_conv + static_cast<ptrdiff_t>(t) * qkv_stride;
         const float* z_t = z_proj + static_cast<ptrdiff_t>(t) * z_stride;
         const float* q_base = qkv_t;
         const float* k_base = qkv_t + qk_total;
         const float* v_base = qkv_t + 2 * qk_total;
+        if (debug_core_ref) {
+            for (int h = 0; h < num_v_heads; ++h) {
+                const int src_k_head =
+                    (num_k_heads == num_v_heads) ? h : std::min(num_k_heads - 1, h / heads_per_group);
+                std::memcpy(q_expanded.data() + static_cast<size_t>(h) * head_k_dim,
+                            q_base + static_cast<size_t>(src_k_head) * head_k_dim,
+                            static_cast<size_t>(head_k_dim) * sizeof(float));
+                std::memcpy(k_expanded.data() + static_cast<size_t>(h) * head_k_dim,
+                            k_base + static_cast<size_t>(src_k_head) * head_k_dim,
+                            static_cast<size_t>(head_k_dim) * sizeof(float));
+            }
+        }
 
         for (int h = 0; h < num_v_heads; ++h) {
-            const int src_k_head = (num_k_heads == num_v_heads) ? h : (h % num_k_heads);
+            const int seq_idx = (ud->token_seq_ids && t < N) ? ud->token_seq_ids[t] : -1;
+            const int src_k_head =
+                (num_k_heads == num_v_heads) ? h : std::min(num_k_heads - 1, h / heads_per_group);
             const float* q_head = q_base + src_k_head * head_k_dim;
             const float* k_head = k_base + src_k_head * head_k_dim;
             const float* v_head = v_base + h * head_v_dim;
@@ -6269,7 +7427,13 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
                 if (seq_idx >= 0 && seq_idx < static_cast<int>(ud->runtime_states->size())) {
                     auto* seq_states = (*ud->runtime_states)[static_cast<size_t>(seq_idx)];
                     if (seq_states && ud->ssm_ordinal < static_cast<int>(seq_states->size())) {
-                        ssm_state_base = (*seq_states)[static_cast<size_t>(ud->ssm_ordinal)].ssm_state.data();
+                        auto& seq_state = (*seq_states)[static_cast<size_t>(ud->ssm_ordinal)].ssm_state;
+                        const size_t required = static_cast<size_t>(ud->n_heads) * static_cast<size_t>(state_stride);
+                        if (seq_state.size() >= required) {
+                            ssm_state_base = seq_state.data();
+                        } else {
+                            ssm_state_base = nullptr;
+                        }
                     }
                 }
             }
@@ -6278,79 +7442,101 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
             }
             float* state = ssm_state_base + static_cast<size_t>(h) * state_stride;
             float* y_head = y.data() + static_cast<size_t>(h) * head_v_dim;
-
-            float alpha = ud->dt_bias[h];
-            float beta = 0.0f;
-            for (int i = 0; i < ud->n_embd; ++i) {
-                alpha += alpha_row[i] * input_t[i];
-                beta += beta_row[i] * input_t[i];
-            }
-            const float decay_gate = SoftplusStable(alpha) * ud->ssm_a[h];
-            const float beta_gate = SigmoidStable(beta);
-            const float decay = std::exp(decay_gate);
-
-            float q_sum_sq = 0.0f;
-            float k_sum_sq = 0.0f;
-            for (int i = 0; i < head_k_dim; ++i) {
-                q_sum_sq += q_head[i] * q_head[i];
-                k_sum_sq += k_head[i] * k_head[i];
-            }
-            const float q_inv_norm = q_scale / std::sqrt(q_sum_sq + ud->norm_eps);
-            const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + ud->norm_eps);
-            for (int i = 0; i < head_k_dim; ++i) {
-                q_norm[i] = q_head[i] * q_inv_norm;
-                k_norm[i] = k_head[i] * k_inv_norm;
+            const float* norm_weight_head = ud->norm_weight;
+            if (ud->norm_layout == Qwen35SSMNormLayout::FLATTENED_D_INNER) {
+                norm_weight_head += static_cast<size_t>(h) * head_v_dim;
+            } else if (ud->norm_layout != Qwen35SSMNormLayout::SHARED_HEAD_DIM) {
+                FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h, "invalid hybrid SSM norm layout");
             }
 
-            for (int idx = 0; idx < state_stride; ++idx) {
-                state[idx] *= decay;
-            }
+            Qwen35SSMHeadStepConfig cfg{};
+            cfg.input_t = input_t;
+            cfg.q_head = q_head;
+            cfg.k_head = k_head;
+            cfg.v_head = v_head;
+            cfg.z_head = z_t + static_cast<size_t>(h) * head_v_dim;
+            cfg.alpha_row = alpha_row;
+            cfg.beta_row = beta_row;
+            cfg.norm_weight = norm_weight_head;
+            cfg.n_embd = ud->n_embd;
+            cfg.head_dim_k = head_k_dim;
+            cfg.head_dim_v = head_v_dim;
+            cfg.dt_bias = ud->dt_bias[h];
+            cfg.a_log = ud->a_log[h];
+            cfg.norm_eps = ud->norm_eps;
 
-            for (int j = 0; j < head_v_dim; ++j) {
-                float sum = 0.0f;
-                const float* state_row = state + j * head_k_dim;
-                for (int i = 0; i < head_k_dim; ++i) {
-                    sum += state_row[i] * k_norm[i];
-                }
-                kv_mem[j] = sum;
-            }
-
-            for (int j = 0; j < head_v_dim; ++j) {
-                delta[j] = (v_head[j] - kv_mem[j]) * beta_gate;
-            }
-
-            for (int j = 0; j < head_v_dim; ++j) {
-                float* state_row = state + j * head_k_dim;
-                const float dj = delta[j];
-                for (int i = 0; i < head_k_dim; ++i) {
-                    state_row[i] += dj * k_norm[i];
+            Qwen35SSMHeadStepStats ref_stats{};
+            const float* q_ref_head = q_head;
+            const float* k_ref_head = k_head;
+            if (debug_core_ref) {
+                q_ref_head = q_expanded.data() + static_cast<size_t>(h) * head_k_dim;
+                k_ref_head = k_expanded.data() + static_cast<size_t>(h) * head_k_dim;
+                LogSSMCoreReferenceDiff(ud->layer_idx, t, seq_idx, h, "delta_mapping", "q_head", q_head, q_ref_head,
+                                        head_k_dim);
+                LogSSMCoreReferenceDiff(ud->layer_idx, t, seq_idx, h, "delta_mapping", "k_head", k_head, k_ref_head,
+                                        head_k_dim);
+                std::memcpy(ref_state.data(), state, static_cast<size_t>(state_stride) * sizeof(float));
+                Qwen35SSMHeadStepConfig ref_cfg = cfg;
+                ref_cfg.q_head = q_ref_head;
+                ref_cfg.k_head = k_ref_head;
+                if (!RunQwen35ReferenceHeadStep(ref_cfg, ref_state.data(), ref_y_head.data(), &ref_stats)) {
+                    FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h,
+                                               "RunQwen35ReferenceHeadStep rejected runtime inputs");
                 }
             }
 
-            for (int j = 0; j < head_v_dim; ++j) {
-                float sum = 0.0f;
-                const float* state_row = state + j * head_k_dim;
-                for (int i = 0; i < head_k_dim; ++i) {
-                    sum += state_row[i] * q_norm[i];
-                }
-                y_head[j] = sum;
+            Qwen35SSMHeadStepStats step_stats{};
+            Qwen35SSMHeadStepDebugBuffers step_debug{};
+            step_debug.q_norm = q_norm.data();
+            step_debug.k_norm = k_norm.data();
+            step_debug.kv_mem = kv_mem.data();
+            step_debug.delta = delta.data();
+            step_debug.y_pre_norm = y_pre_norm.data();
+            if (!Qwen35RunGatedDeltaHeadStep(cfg, state, y_head, &step_stats, &step_debug)) {
+                FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h, "Qwen35RunGatedDeltaHeadStep rejected runtime inputs");
+            }
+            if (debug_core_ref) {
+                LogSSMCoreReferenceDiff(ud->layer_idx, t, seq_idx, h, "delta_reference", "state", state,
+                                        ref_state.data(), state_stride);
+                LogSSMCoreReferenceDiff(ud->layer_idx, t, seq_idx, h, "delta_reference", "y_head", y_head,
+                                        ref_y_head.data(), head_v_dim);
             }
 
-            float sum_sq = 0.0f;
-            for (int j = 0; j < head_v_dim; ++j) {
-                sum_sq += y_head[j] * y_head[j];
-            }
-            const float rms = std::sqrt(sum_sq / head_v_dim + ud->norm_eps);
-            for (int j = 0; j < head_v_dim; ++j) {
-                const float z_val = z_t[h * head_v_dim + j];
-                const float gated = z_val / (1.0f + std::exp(-z_val));
-                y_head[j] = (y_head[j] / rms) * ud->norm_weight[j] * gated;
-            }
+            Qwen35SSMDebugScalars dbg{};
+            dbg.alpha = step_stats.alpha;
+            dbg.beta = step_stats.beta;
+            dbg.softplus_alpha = step_stats.softplus_alpha;
+            dbg.exp_a_log = step_stats.exp_a_log;
+            dbg.g = step_stats.g;
+            dbg.decay = step_stats.decay;
+            dbg.beta_gate = step_stats.beta_gate;
+            dbg.q_sum_sq = step_stats.q_sum_sq;
+            dbg.k_sum_sq = step_stats.k_sum_sq;
+            dbg.rms = step_stats.rms;
+            CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "alpha_projection", "alpha", step_stats.alpha, dbg);
+            CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "beta_projection", "beta", step_stats.beta, dbg);
+            CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "decay", "softplus_alpha", step_stats.softplus_alpha,
+                                 dbg);
+            CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "decay", "exp_a_log", step_stats.exp_a_log, dbg);
+            CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "decay", "g", step_stats.g, dbg);
+            CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "decay", "decay", step_stats.decay, dbg);
+            CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "qk_norm", "q_sum_sq", step_stats.q_sum_sq, dbg);
+            CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "qk_norm", "k_sum_sq", step_stats.k_sum_sq, dbg);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "qk_norm", "q_norm", q_norm.data(), head_k_dim, dbg);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "qk_norm", "k_norm", k_norm.data(), head_k_dim, dbg);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "kv_mem", "kv_mem", kv_mem.data(), head_v_dim, dbg);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "delta", "delta", delta.data(), head_v_dim, dbg);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "state_update", "state", state, state_stride, dbg);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "y_pre_norm", "y_head", y_pre_norm.data(), head_v_dim,
+                                 dbg);
+            CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "y_post_norm", "rms", step_stats.rms, dbg);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "y_post_norm", "y_head", y_head, head_v_dim, dbg);
 
             if (ssm_debug && t == 0 && h == 0) {
                 fprintf(stderr,
-                        "[QWEN35_SSM] alpha=%.4f decay=%.4f beta=%.4f q0=%.4f k0=%.4f v0=%.4f z0=%.4f y0=%.4f\n", alpha,
-                        decay, beta_gate, q_norm[0], k_norm[0], v_head[0], z_t[0], y_head[0]);
+                        "[QWEN35_SSM] alpha=%.4f g=%.4f decay=%.4f beta=%.4f q0=%.4f k0=%.4f v0=%.4f z0=%.4f y0=%.4f\n",
+                        step_stats.alpha, step_stats.g, step_stats.decay, step_stats.beta_gate, q_norm[0], k_norm[0],
+                        v_head[0], cfg.z_head[0], y_head[0]);
             }
         }
 
@@ -6447,10 +7633,11 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     }
 
     // Position tensor for RoPE
-    struct ggml_tensor* pos = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I32, N);
+    const int pos_ids_per_token = PositionIdsPerToken(model);
+    struct ggml_tensor* pos = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I32, static_cast<int64_t>(N) * pos_ids_per_token);
     ggml_set_name(pos, "pos");
     if (pos->data) {
-        memcpy(pos->data, batch.pos.data(), N * sizeof(int));
+        PopulatePositionTensor(model, batch, pos);
     }
     if (out_pos) *out_pos = pos;
 
@@ -6482,6 +7669,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
         ud->n_embd = static_cast<int>(src->ne[0]);
         ud->n_tokens = static_cast<int>(src->ne[1]);
         ud->eps = model->hparams.f_norm_rms_eps;
+        ud->residual_row_stride = 0;
         const int n_tasks = ResolveTaskCount(&batch, std::max(1, ud->n_tokens));
         struct ggml_tensor* out = ggml_map_custom1(ctx_c, src, cb_residual_rmsnorm_fused, n_tasks, ud);
         if (debug_name) {
@@ -6598,17 +7786,83 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             const int n_groups = model->ssm_group_count;
             const int conv_channels = d_inner + 2 * n_groups * head_dim_k;
             const int conv_kernel = model->ssm_conv_kernel;
+            const size_t expected_conv_weights = static_cast<size_t>(conv_channels) * static_cast<size_t>(conv_kernel);
+            const size_t expected_head_by_embd = static_cast<size_t>(num_v_heads) * static_cast<size_t>(n_embd);
+            const size_t expected_per_head = static_cast<size_t>(num_v_heads);
+            const size_t expected_norm_shared = static_cast<size_t>(head_dim_v);
+            const size_t expected_norm_full = static_cast<size_t>(d_inner);
+
+            if (ssm_rt.conv1d_f32.size() != expected_conv_weights || ssm_rt.alpha_f32.size() != expected_head_by_embd ||
+                ssm_rt.beta_f32.size() != expected_head_by_embd || ssm_rt.dt_bias_f32.size() != expected_per_head ||
+                ssm_rt.a_log_f32.size() != expected_per_head ||
+                (ssm_rt.norm_layout == Qwen35SSMNormLayout::SHARED_HEAD_DIM &&
+                 ssm_rt.norm_f32.size() != expected_norm_shared) ||
+                (ssm_rt.norm_layout == Qwen35SSMNormLayout::FLATTENED_D_INNER &&
+                 ssm_rt.norm_f32.size() != expected_norm_full) ||
+                ssm_rt.norm_layout == Qwen35SSMNormLayout::INVALID) {
+                throw densecore::InvalidArgumentException(
+                    "Missing canonical hybrid SSM runtime weights in layer " + std::to_string(il));
+            }
+
+            if (IsSSMNonFiniteDebugEnabled()) {
+                auto cb_check_ssm_input = [](struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                             void* ud) {
+                    (void)nth;
+                    if (ith != 0) return;
+                    const int layer_idx = ud ? *reinterpret_cast<const int*>(ud) : -1;
+                    const int* seq_ids =
+                        (GetCurrentWorkContext() && GetCurrentWorkContext()->batch)
+                            ? GetCurrentWorkContext()->batch->seq_id.data()
+                            : nullptr;
+                    CheckSSMFiniteTensor(layer_idx, seq_ids, src, "ssm_input", "attn_norm_out");
+                    if (dst->data && src->data) {
+                        std::memcpy(dst->data, src->data, ggml_nbytes(src));
+                    }
+                };
+                static int ssm_input_layers[128] = {};
+                for (int li = 0; li < 128; ++li) ssm_input_layers[li] = li;
+                cur = ggml_map_custom1(ctx_c, cur, cb_check_ssm_input, 1, &ssm_input_layers[il]);
+            }
 
             // 1. qkv_mixed projection: normed input [n_embd, N] → [conv_channels, N]
             struct ggml_tensor* qkv_mixed = smart_mul_mat(ctx_c, attn_qkv, cur, model);
+            if (IsDebugSSMQkvReferenceEnabled() || IsDebugSSMProjectionReferenceEnabled()) {
+                SSMProjectionReferenceUserData* qkv_ref_ud = GetSSMProjectionReferenceUserData();
+                qkv_ref_ud->weight_tensor = attn_qkv;
+                qkv_ref_ud->input_tensor = cur;
+                qkv_ref_ud->layer_idx = il;
+                qkv_ref_ud->token_seq_ids = batch.seq_id.data();
+                qkv_ref_ud->stage = "qkv_proj";
+                qkv_ref_ud->var_name = "qkv_mixed";
+                qkv_mixed = ggml_map_custom1(ctx_c, qkv_mixed, cb_ssm_projection_reference_probe, 1, qkv_ref_ud);
+            }
+            if (IsSSMNonFiniteDebugEnabled()) {
+                auto cb_check_ssm_qkv = [](struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                           void* ud) {
+                    (void)nth;
+                    if (ith != 0) return;
+                    const int layer_idx = ud ? *reinterpret_cast<const int*>(ud) : -1;
+                    const int* seq_ids =
+                        (GetCurrentWorkContext() && GetCurrentWorkContext()->batch)
+                            ? GetCurrentWorkContext()->batch->seq_id.data()
+                            : nullptr;
+                    CheckSSMFiniteTensor(layer_idx, seq_ids, src, "qkv_proj", "qkv_mixed");
+                    if (dst->data && src->data) {
+                        std::memcpy(dst->data, src->data, ggml_nbytes(src));
+                    }
+                };
+                static int ssm_qkv_layers[128] = {};
+                for (int li = 0; li < 128; ++li) ssm_qkv_layers[li] = li;
+                qkv_mixed = ggml_map_custom1(ctx_c, qkv_mixed, cb_check_ssm_qkv, 1, &ssm_qkv_layers[il]);
+            }
 
             // 2. Conv1D: updates conv_state ring buffer, outputs [conv_channels, N]
             SSMConv1DUserData* conv_ud = GetSSMConv1DUserData();
             conv_ud->conv_state = nullptr;
-            conv_ud->weight = !ssm_rt.conv1d_f32.empty() ? ssm_rt.conv1d_f32.data()
-                                                         : reinterpret_cast<const float*>(ssm_conv1d_w->data);
+            conv_ud->weight = ssm_rt.conv1d_f32.data();
             conv_ud->channels = conv_channels;
             conv_ud->kernel_size = conv_kernel;
+            conv_ud->layer_idx = il;
             conv_ud->ssm_ordinal = ssm_ordinal;
             conv_ud->token_seq_ids = batch.seq_id.data();
             conv_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
@@ -6617,15 +7871,22 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
 
             // 3. z projection and recurrent Qwen3.5 delta-net block.
             struct ggml_tensor* z = smart_mul_mat(ctx_c, attn_gate_w, cur, model);
+            if (IsDebugSSMProjectionReferenceEnabled()) {
+                SSMProjectionReferenceUserData* z_ref_ud = GetSSMProjectionReferenceUserData();
+                z_ref_ud->weight_tensor = attn_gate_w;
+                z_ref_ud->input_tensor = cur;
+                z_ref_ud->layer_idx = il;
+                z_ref_ud->token_seq_ids = batch.seq_id.data();
+                z_ref_ud->stage = "gate_proj";
+                z_ref_ud->var_name = "z";
+                z = ggml_map_custom1(ctx_c, z, cb_ssm_projection_reference_probe, 1, z_ref_ud);
+            }
             SSMQwen35DeltaUserData* scan_ud = GetSSMQwen35DeltaUserData();
             scan_ud->alpha_weight = ssm_rt.alpha_f32.data();
             scan_ud->beta_weight = ssm_rt.beta_f32.data();
-            scan_ud->dt_bias = !ssm_rt.dt_bias_f32.empty() ? ssm_rt.dt_bias_f32.data()
-                                                           : reinterpret_cast<const float*>(ssm_dt_bias_t->data);
-            scan_ud->ssm_a =
-                !ssm_rt.ssm_a_f32.empty() ? ssm_rt.ssm_a_f32.data() : reinterpret_cast<const float*>(ssm_a->data);
-            scan_ud->norm_weight =
-                !ssm_rt.norm_f32.empty() ? ssm_rt.norm_f32.data() : reinterpret_cast<const float*>(ssm_norm_w->data);
+            scan_ud->dt_bias = ssm_rt.dt_bias_f32.data();
+            scan_ud->a_log = ssm_rt.a_log_f32.data();
+            scan_ud->norm_weight = ssm_rt.norm_f32.data();
             scan_ud->ssm_state = nullptr;
             scan_ud->n_embd = n_embd;
             scan_ud->d_inner = d_inner;
@@ -6633,7 +7894,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             scan_ud->head_dim_v = head_dim_v;
             scan_ud->head_dim_k = head_dim_k;
             scan_ud->n_groups = n_groups;
+            scan_ud->norm_layout = ssm_rt.norm_layout;
             scan_ud->norm_eps = model->hparams.f_norm_rms_eps;
+            scan_ud->layer_idx = il;
             scan_ud->ssm_ordinal = ssm_ordinal;
             scan_ud->token_seq_ids = batch.seq_id.data();
             scan_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
@@ -6642,6 +7905,16 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
 
             // 4. Output projection: [d_inner, N] → [n_embd, N]
             cur = smart_mul_mat(ctx_c, ssm_out_w, y, model);
+            if (IsDebugSSMProjectionReferenceEnabled()) {
+                SSMProjectionReferenceUserData* out_ref_ud = GetSSMProjectionReferenceUserData();
+                out_ref_ud->weight_tensor = ssm_out_w;
+                out_ref_ud->input_tensor = y;
+                out_ref_ud->layer_idx = il;
+                out_ref_ud->token_seq_ids = batch.seq_id.data();
+                out_ref_ud->stage = "ssm_out_proj";
+                out_ref_ud->var_name = "ssm_out";
+                cur = ggml_map_custom1(ctx_c, cur, cb_ssm_projection_reference_probe, 1, out_ref_ud);
+            }
 
             // Residual connection
             attn_out = cur;
@@ -7025,16 +8298,17 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     Kcur = K_rope_fast;
                 } else {
                     if (use_mrope) {
+                        const int rope_mode = ModelMRoPEMode(model);
                         int rope_sections[GGML_MROPE_SECTIONS] = {
                             model->hparams.rope_sections[0],
                             model->hparams.rope_sections[1],
                             model->hparams.rope_sections[2],
                             model->hparams.rope_sections[3],
                         };
-                        Qcur = ggml_rope_multi(ctx_c, Qcur, pos, nullptr, rope_dim, rope_sections, GGML_ROPE_TYPE_MROPE,
+                        Qcur = ggml_rope_multi(ctx_c, Qcur, pos, nullptr, rope_dim, rope_sections, rope_mode,
                                                n_ctx, model->hparams.rope_freq_base, model->hparams.rope_freq_scale,
                                                0.0f, 1.0f, 0.0f, 0.0f);
-                        Kcur = ggml_rope_multi(ctx_c, Kcur, pos, nullptr, rope_dim, rope_sections, GGML_ROPE_TYPE_MROPE,
+                        Kcur = ggml_rope_multi(ctx_c, Kcur, pos, nullptr, rope_dim, rope_sections, rope_mode,
                                                n_ctx, model->hparams.rope_freq_base, model->hparams.rope_freq_scale,
                                                0.0f, 1.0f, 0.0f, 0.0f);
                     } else {
@@ -7176,18 +8450,6 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     // The 'ggml_pad' trick updates cache as side effect.
                     // So we act always if use_cache is true.
 
-                    // Use ggml_pad to create a tensor of correct size (N + n_past)
-                    // ggml_pad(ctx, a, pad_0, pad_1, pad_2, pad_3)
-                    // We pad dimension 2 (sequence) by n_past_val.
-                    // Result shape: [head_dim, n_head, N + n_past]
-                    struct ggml_tensor* K_padded = Kcur;
-                    struct ggml_tensor* V_padded = Vcur;
-
-                    if (n_past_val > 0) {
-                        K_padded = ggml_pad(ctx_c, Kcur, 0, 0, n_past_val, 0);
-                        V_padded = ggml_pad(ctx_c, Vcur, 0, 0, n_past_val, 0);
-                    }
-
                     KVCacheUserData* k_ud = GetKVCacheUserData(il, true);
                     *k_ud = {cache, il, head_dim_kv, true};  // batch accessed via GetCurrentBatch()
                     KVCacheUserData* v_ud = GetKVCacheUserData(il, false);
@@ -7213,8 +8475,18 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                         }
                     }
 
-                    K_all = ggml_map_custom1(ctx_c, K_padded, cb_kv_manage, kv_tasks, k_ud);
-                    V_all = ggml_map_custom1(ctx_c, V_padded, cb_kv_manage, kv_tasks, v_ud);
+                    if (n_past_val == 0) {
+                        // Prefill first chunk fast path: avoid materializing an
+                        // equivalent [history | current] tensor when history is empty.
+                        K_all = ggml_map_custom1(ctx_c, Kcur, cb_kv_write_only, kv_tasks, k_ud);
+                        V_all = ggml_map_custom1(ctx_c, Vcur, cb_kv_write_only, kv_tasks, v_ud);
+                    } else {
+                        // Prefill later-chunk fast path: write current tokens to KV cache,
+                        // gather retained history directly into the final [head_dim, n_head_kv, n_total]
+                        // tensor, and append current tokens without routing through ggml_pad.
+                        K_all = ggml_kv_update_and_gather(ctx_c, Kcur, n_total_tokens, kv_tasks, k_ud);
+                        V_all = ggml_kv_update_and_gather(ctx_c, Vcur, n_total_tokens, kv_tasks, v_ud);
+                    }
                 }
 
                 // =========================================================================
@@ -7382,9 +8654,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 const bool flash_attn_forced = IsFlashAttentionForced();
                 const bool use_flash_attention = !IsFlashAttentionDisabled() && flash_attn_runtime_supported;
                 const densecore::DeviceType preferred_attention_device = ResolvePreferredAttentionDevice(&batch);
-                // HAL FlashAttention API currently exposes only `causal` + `n_head_kv`.
-                // For decode (N == 1), no intra-query future tokens exist, so offset is
-                // unnecessary even when n_past > 0. Prefill still requires zero offset.
+                // Non-CPU HAL backends do not currently carry the chunked-prefill query
+                // offset into causal masking, so they remain limited to zero-offset
+                // prefill or decode (N == 1).
                 const bool hal_attention_offset_safe = (n_past_val == 0) || (N == 1);
                 const bool use_hal_attention_dispatch = preferred_attention_device != densecore::DeviceType::CPU &&
                                                         !use_paged_decode_attention && hal_attention_offset_safe &&
@@ -7413,7 +8685,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 }
                 const bool use_portable_cpu_flash_attention =
                     !IsFlashAttentionDisabled() && preferred_attention_device == densecore::DeviceType::CPU &&
-                    !use_paged_decode_attention && hal_attention_offset_safe && portable_cpu_flash_attention_supported;
+                    !use_paged_decode_attention && portable_cpu_flash_attention_supported;
                 const bool use_portable_cpu_flash_native_decode_layout =
                     use_portable_cpu_flash_attention && N == 1 && head_dim_q == head_dim_kv &&
                     head_dim_q == head_dim_v && ggml_is_contiguous(Qcur) && ggml_is_contiguous(K) &&
@@ -7507,6 +8779,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     // -----------------------------------------------------------------------
                     const float scale = 1.0f / sqrtf((float)head_dim_q);
                     const bool hal_causal = (N > 1);
+                    const int flash_q_start_offset = hal_causal ? n_past_val : 0;
                     if (use_portable_cpu_flash_native_decode_layout) {
                         KQV = ggml_flash_attention_hal(ctx_c, Qcur, K, V, scale, false, n_head_kv, il,
                                                        densecore::DeviceType::CPU,
@@ -7520,7 +8793,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                         V_hal = ggml_cont(ctx_c, V_hal);
 
                         KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv, il,
-                                                       densecore::DeviceType::CPU);
+                                                       densecore::DeviceType::CPU,
+                                                       HalAttentionTensorLayout::HeadSeq, flash_q_start_offset, 0);
 
                         // Convert [head_dim, N, n_head] -> [head_dim, n_head, N]
                         KQV = ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
@@ -7840,6 +9114,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             fused_ud->n_embd = static_cast<int>(attn_out->ne[0]);
             fused_ud->n_tokens = static_cast<int>(attn_out->ne[1]);
             fused_ud->eps = model->hparams.f_norm_rms_eps;
+            fused_ud->residual_row_stride = static_cast<ptrdiff_t>(inpL->nb[1] / sizeof(float));
 
             const int n_tasks = ResolveTaskCount(&batch, std::max<int>(1, fused_ud->n_tokens));
             cur = ggml_map_custom1(ctx_c, attn_out, cb_residual_rmsnorm_fused, n_tasks, fused_ud);
@@ -7878,24 +9153,23 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     moe_ud->backend = dynamic_cast<densecore::CpuBackend*>(registry.Get(densecore::DeviceType::CPU));
                 }
                 if (moe_ud->backend) {
-                    auto experts = BuildExpertWeights(moe_ud->layer);
-                    const int n_experts = static_cast<int>(experts.size());
-                    moe_ud->backend->InitMoEProfiler(moe_ud->layer, n_experts);
-                    moe_ud->backend->RegisterMoEExperts(moe_ud->layer, experts);
+                    const densecore::CpuBackend::ExpertWeights* registered_experts = nullptr;
+                    int registered_count = 0;
+                    if (!moe_ud->backend->GetRegisteredExpertsView(moe_ud->layer, &registered_experts,
+                                                                  &registered_count) ||
+                        !registered_experts || registered_count <= 0) {
+                        auto experts = BuildExpertWeights(moe_ud->layer, model);
+                        const int n_experts = static_cast<int>(experts.size());
+                        moe_ud->backend->InitMoEProfiler(moe_ud->layer, n_experts);
+                        moe_ud->backend->RegisterMoEExperts(moe_ud->layer, experts);
+                        moe_ud->backend->GetRegisteredExpertsView(moe_ud->layer, &registered_experts,
+                                                                  &registered_count);
+                    }
                     EnsureMoERebalanceThread(moe_ud->backend);
-                    if (n_experts > 0) {
-                        struct ggml_tensor* expert_storage = ggml_new_tensor_1d(
-                            ctx_c, GGML_TYPE_I8,
-                            static_cast<int64_t>(sizeof(densecore::CpuBackend::ExpertWeights)) * n_experts);
-                        if (expert_storage && expert_storage->data) {
-                            std::memcpy(expert_storage->data, experts.data(),
-                                        static_cast<size_t>(n_experts) *
-                                            sizeof(densecore::CpuBackend::ExpertWeights));
-                            moe_ud->experts =
-                                reinterpret_cast<const densecore::CpuBackend::ExpertWeights*>(expert_storage->data);
-                            moe_ud->n_experts = n_experts;
-                            moe_ud->experts_registered = true;
-                        }
+                    if (registered_experts && registered_count > 0) {
+                        moe_ud->experts = registered_experts;
+                        moe_ud->n_experts = registered_count;
+                        moe_ud->experts_registered = true;
                     }
                 }
             }
@@ -8491,206 +9765,271 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         debug_log_sample(token);
         return token;
     }
-    if (params.temperature == 1.0f && params.top_k <= 1 && params.top_p >= 1.0f && params.min_p <= 0.0f &&
-        params.grammar == nullptr && !has_penalty) {
-        const int token = finite_argmax_raw();
-        debug_log_sample(token);
-        return token;
-    }
 
     thread_local std::vector<float> working_logits;
-    working_logits.assign(last_logits + range_start, last_logits + range_end);
-    if (params.disallowed_token_ids && !params.disallowed_token_ids->empty()) {
-        for (int token_id : *params.disallowed_token_ids) {
-            if (token_id >= range_start && token_id < range_end) {
-                working_logits[token_id - range_start] = -INFINITY;
-            }
-        }
-    }
-    auto finite_argmax = [range_start]() -> int {
-        int best_idx = 0;
-        float best_val = -INFINITY;
-        bool found = false;
-        for (int i = 0; i < static_cast<int>(working_logits.size()); ++i) {
-            const float v = working_logits[i];
-            if (!std::isfinite(v)) continue;
-            if (!found || v > best_val) {
-                best_val = v;
-                best_idx = i;
-                found = true;
-            }
-        }
-        return found ? (range_start + best_idx) : range_start;
-    };
-    auto sanitize_logits = []() -> int {
-        int finite_count = 0;
-        for (float& v : working_logits) {
-            if (std::isfinite(v)) {
-                finite_count++;
-            } else {
-                v = -INFINITY;
-            }
-        }
-        return finite_count;
-    };
-
-    if (params.grammar && params.vocab) {
-        ApplyGrammarMask(working_logits.data(), active_vocab, params.grammar, *params.vocab);
-    }
-
-    if (params.repetition_penalty != 1.0f && params.token_history && !params.token_history->empty()) {
-        for (int token : *params.token_history) {
-            if (token >= range_start && token < range_end) {
-                const int local_token = token - range_start;
-                if (working_logits[local_token] < 0) {
-                    working_logits[local_token] *= params.repetition_penalty;
-                } else {
-                    working_logits[local_token] /= params.repetition_penalty;
+    const bool requires_working_logits = params.grammar && params.vocab;
+    if (requires_working_logits) {
+        working_logits.assign(last_logits + range_start, last_logits + range_end);
+        if (params.disallowed_token_ids && !params.disallowed_token_ids->empty()) {
+            for (int token_id : *params.disallowed_token_ids) {
+                if (token_id >= range_start && token_id < range_end) {
+                    working_logits[token_id - range_start] = -INFINITY;
                 }
             }
         }
+        ApplyGrammarMask(working_logits.data(), active_vocab, params.grammar, *params.vocab);
     }
 
-    if ((params.frequency_penalty != 0.0f || params.presence_penalty != 0.0f) && params.token_history &&
-        !params.token_history->empty()) {
-        std::unordered_map<int, int> token_counts;
+    thread_local std::unordered_map<int, int> token_counts;
+    token_counts.clear();
+    if (has_history) {
         token_counts.reserve(params.token_history->size());
         for (int token : *params.token_history) {
             if (token >= range_start && token < range_end) {
-                token_counts[token - range_start]++;
+                token_counts[token]++;
+            }
+        }
+    }
+
+    auto base_logit_at = [&](int local_token) -> float {
+        if (requires_working_logits) {
+            return working_logits[static_cast<size_t>(local_token)];
+        }
+        return last_logits[range_start + local_token];
+    };
+
+    auto adjusted_logit_at = [&](int local_token) -> float {
+        const int token_id = range_start + local_token;
+        if (!requires_working_logits && is_disallowed(token_id)) {
+            return -INFINITY;
+        }
+
+        float v = base_logit_at(local_token);
+        if (!std::isfinite(v)) {
+            return -INFINITY;
+        }
+
+        if (has_penalty) {
+            auto it = token_counts.find(token_id);
+            if (it != token_counts.end()) {
+                const int count = it->second;
+                if (params.repetition_penalty != 1.0f) {
+                    for (int rep = 0; rep < count; ++rep) {
+                        if (v < 0.0f) {
+                            v *= params.repetition_penalty;
+                        } else {
+                            v /= params.repetition_penalty;
+                        }
+                    }
+                }
+                if (params.frequency_penalty != 0.0f || params.presence_penalty != 0.0f) {
+                    v -= params.frequency_penalty * count + params.presence_penalty * 1.0f;
+                }
             }
         }
 
-        for (auto& kv : token_counts) {
-            const int token = kv.first;
-            int count = kv.second;
-            float penalty = params.frequency_penalty * count + params.presence_penalty * (count > 0 ? 1.0f : 0.0f);
-            working_logits[token] -= penalty;
+        if (params.temperature > 0.0f && params.temperature != 1.0f) {
+            v /= params.temperature;
         }
+
+        return std::isfinite(v) ? v : -INFINITY;
+    };
+
+    auto finite_argmax_adjusted = [&]() -> int {
+        int best_idx = range_start;
+        float best_val = -INFINITY;
+        bool found = false;
+        for (int i = 0; i < active_vocab; ++i) {
+            const float v = adjusted_logit_at(i);
+            if (!std::isfinite(v)) continue;
+            const int token_id = range_start + i;
+            if (!found || v > best_val || (v == best_val && token_id < best_idx)) {
+                best_val = v;
+                best_idx = token_id;
+                found = true;
+            }
+        }
+        return found ? best_idx : finite_argmax_raw();
+    };
+
+    if (params.temperature <= 0.0f ||
+        (params.top_k <= 1 && params.top_p >= 1.0f && params.min_p <= 0.0f)) {
+        const int token = finite_argmax_adjusted();
+        debug_log_sample(token);
+        return token;
     }
 
-    if (params.temperature <= 0.0f) {
-        const int token = finite_argmax();
-        debug_log_sample(token);
-        return token;
-    }
-    if (params.temperature != 1.0f && params.temperature > 0.0f) {
-        for (int i = 0; i < active_vocab; i++) {
-            working_logits[i] /= params.temperature;
-        }
-    }
-    if (sanitize_logits() == 0) {
-        const int token = finite_argmax_raw();
-        debug_log_sample(token);
-        return token;
-    }
+    struct SamplingCandidate {
+        float logit = -INFINITY;
+        float mass = 0.0f;
+        int token_id = -1;
+    };
 
-    float max_logit = -INFINITY;
-    for (float v : working_logits) {
-        if (std::isfinite(v) && v > max_logit) max_logit = v;
-    }
-    if (!std::isfinite(max_logit)) {
-        const int token = finite_argmax();
-        debug_log_sample(token);
-        return token;
-    }
+    auto candidate_desc = [](const SamplingCandidate& a, const SamplingCandidate& b) {
+        if (a.logit == b.logit) return a.token_id < b.token_id;
+        return a.logit > b.logit;
+    };
+    auto candidate_worse_first = [](const SamplingCandidate& a, const SamplingCandidate& b) {
+        if (a.logit == b.logit) return a.token_id < b.token_id;
+        return a.logit > b.logit;
+    };
 
     int k = params.top_k;
     if (k <= 0 || k > active_vocab) {
         k = active_vocab;
     }
 
-    thread_local std::vector<std::pair<float, int>> prob_idx;
-    prob_idx.clear();
-    prob_idx.reserve(static_cast<size_t>(active_vocab));
-    float sum_exp = 0.0f;
-    for (int i = 0; i < active_vocab; i++) {
-        float prob = std::isfinite(working_logits[i]) ? std::exp(working_logits[i] - max_logit) : 0.0f;
-        if (!std::isfinite(prob)) {
-            prob = 0.0f;
+    thread_local std::vector<SamplingCandidate> candidates;
+    thread_local std::unordered_map<int, int> candidate_lookup;
+    candidates.clear();
+    candidate_lookup.clear();
+    candidates.reserve(static_cast<size_t>(k));
+    candidate_lookup.reserve(static_cast<size_t>(k) * 2U + 1U);
+
+    float max_logit = -INFINITY;
+    int best_token = range_start;
+    bool found_finite = false;
+
+    for (int i = 0; i < active_vocab; ++i) {
+        const float v = adjusted_logit_at(i);
+        if (!std::isfinite(v)) continue;
+        const int token_id = range_start + i;
+        if (!found_finite || v > max_logit || (v == max_logit && token_id < best_token)) {
+            max_logit = v;
+            best_token = token_id;
+            found_finite = true;
         }
-        sum_exp += prob;
-        prob_idx.push_back({prob, range_start + i});
+
+        if (k < active_vocab) {
+            SamplingCandidate cand;
+            cand.logit = v;
+            cand.token_id = token_id;
+            if (static_cast<int>(candidates.size()) < k) {
+                candidates.push_back(cand);
+                std::push_heap(candidates.begin(), candidates.end(), candidate_worse_first);
+            } else if (v > candidates.front().logit ||
+                       (v == candidates.front().logit && token_id < candidates.front().token_id)) {
+                std::pop_heap(candidates.begin(), candidates.end(), candidate_worse_first);
+                candidates.back() = cand;
+                std::push_heap(candidates.begin(), candidates.end(), candidate_worse_first);
+            }
+        }
     }
 
-    if (sum_exp <= 0.0f || !std::isfinite(sum_exp)) {
-        const int token = finite_argmax();
+    if (!found_finite || !std::isfinite(max_logit)) {
+        const int token = finite_argmax_raw();
         debug_log_sample(token);
         return token;
     }
 
-    const float inv_sum_exp = 1.0f / sum_exp;
-    for (auto& p : prob_idx) {
-        p.first *= inv_sum_exp;
-    }
-
-    auto prob_desc = [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
-        if (a.first == b.first) return a.second < b.second;
-        return a.first > b.first;
-    };
-
     if (k < active_vocab) {
-        std::nth_element(prob_idx.begin(), prob_idx.begin() + k, prob_idx.end(), prob_desc);
-        prob_idx.resize(k);
-    }
-    std::sort(prob_idx.begin(), prob_idx.end(), prob_desc);
-
-    if (params.min_p > 0.0f && !prob_idx.empty()) {
-        float max_prob = prob_idx[0].first;
-        float threshold = params.min_p * max_prob;
-        auto it = std::remove_if(prob_idx.begin(), prob_idx.end(),
-                                 [threshold](const auto& p) { return p.first < threshold; });
-        prob_idx.erase(it, prob_idx.end());
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            candidate_lookup.emplace(candidates[i].token_id, static_cast<int>(i));
+        }
+    } else {
+        candidates.reserve(static_cast<size_t>(active_vocab));
     }
 
-    if (params.top_p < 1.0f && !prob_idx.empty()) {
-        float cumulative = 0.0f;
+    float sum_exp = 0.0f;
+    for (int i = 0; i < active_vocab; ++i) {
+        const float v = adjusted_logit_at(i);
+        if (!std::isfinite(v)) continue;
+        float mass = std::exp(v - max_logit);
+        if (!std::isfinite(mass)) {
+            mass = 0.0f;
+        }
+        sum_exp += mass;
+        const int token_id = range_start + i;
+        if (k < active_vocab) {
+            auto it = candidate_lookup.find(token_id);
+            if (it != candidate_lookup.end()) {
+                candidates[static_cast<size_t>(it->second)].mass = mass;
+            }
+        } else {
+            SamplingCandidate cand;
+            cand.logit = v;
+            cand.mass = mass;
+            cand.token_id = token_id;
+            candidates.push_back(cand);
+        }
+    }
+
+    if (!(sum_exp > 0.0f) || !std::isfinite(sum_exp)) {
+        debug_log_sample(best_token);
+        return best_token;
+    }
+
+    std::sort(candidates.begin(), candidates.end(), candidate_desc);
+
+    if (params.min_p > 0.0f && !candidates.empty()) {
+        const float threshold = params.min_p * candidates.front().mass;
+        auto it =
+            std::remove_if(candidates.begin(), candidates.end(), [threshold](const SamplingCandidate& candidate) {
+                return candidate.mass < threshold;
+            });
+        candidates.erase(it, candidates.end());
+    }
+
+    if (params.top_p < 1.0f && !candidates.empty()) {
+        const float cutoff_mass = params.top_p * sum_exp;
+        float cumulative_mass = 0.0f;
         size_t cutoff = 0;
-        for (size_t i = 0; i < prob_idx.size(); i++) {
-            cumulative += prob_idx[i].first;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            cumulative_mass += candidates[i].mass;
             cutoff = i + 1;
-            if (cumulative >= params.top_p) {
+            if (cumulative_mass >= cutoff_mass) {
                 break;
             }
         }
-        prob_idx.resize(cutoff);
+        candidates.resize(cutoff);
     }
 
-    if (prob_idx.empty()) {
-        const int token = finite_argmax();
-        debug_log_sample(token);
-        return token;
+    if (candidates.empty()) {
+        debug_log_sample(best_token);
+        return best_token;
     }
 
-    float total = 0.0f;
-    for (const auto& p : prob_idx) {
-        total += p.first;
+    float total_mass = 0.0f;
+    for (const auto& candidate : candidates) {
+        total_mass += candidate.mass;
     }
-    if (total <= 0.0f || !std::isfinite(total)) {
-        const int token = prob_idx[0].second;
-        debug_log_sample(token);
-        return token;
-    }
-    const float inv_total = 1.0f / total;
-    for (auto& p : prob_idx) {
-        p.first *= inv_total;
+    if (!(total_mass > 0.0f) || !std::isfinite(total_mass)) {
+        debug_log_sample(candidates.front().token_id);
+        return candidates.front().token_id;
     }
 
     thread_local std::unique_ptr<std::mt19937> rng;
+    thread_local uint64_t last_seed = 0;
+    thread_local bool seeded_from_device = false;
     if (!rng) {
         rng = std::make_unique<std::mt19937>(std::random_device{}());
+        seeded_from_device = true;
+        last_seed = 0;
     }
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float random_val = dist(*rng);
-    float cumulative = 0.0f;
-    for (const auto& p : prob_idx) {
-        cumulative += p.first;
-        if (random_val <= cumulative) {
-            debug_log_sample(p.second);
-            return p.second;
+    if (params.seed != 0) {
+        if (last_seed != params.seed || seeded_from_device) {
+            std::seed_seq seq{static_cast<uint32_t>(params.seed), static_cast<uint32_t>(params.seed >> 32)};
+            rng->seed(seq);
+            last_seed = params.seed;
+            seeded_from_device = false;
+        }
+    } else if (!seeded_from_device) {
+        rng->seed(std::random_device{}());
+        last_seed = 0;
+        seeded_from_device = true;
+    }
+
+    std::uniform_real_distribution<float> dist(0.0f, total_mass);
+    const float random_val = dist(*rng);
+    float cumulative_mass = 0.0f;
+    for (const auto& candidate : candidates) {
+        cumulative_mass += candidate.mass;
+        if (random_val <= cumulative_mass) {
+            debug_log_sample(candidate.token_id);
+            return candidate.token_id;
         }
     }
 
-    debug_log_sample(prob_idx[0].second);
-    return prob_idx[0].second;
+    debug_log_sample(candidates.front().token_id);
+    return candidates.front().token_id;
 }

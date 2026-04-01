@@ -178,6 +178,19 @@ DENSECORE_API void GemvInt4_Hwy(float* output, const float* input, const uint8_t
                                 const float* zeros, int K, int N, int group_size, int n_start, int n_end);
 
 /**
+ * @brief Dual-output INT4 GEMV with fused SwiGLU activation
+ *
+ * Computes `output = silu(gate) * up` for a single input row where both
+ * `gate` and `up` come from packed INT4 expert projections sharing the same
+ * input vector.
+ */
+DENSECORE_API void GemvInt4DualFusedSilu_Hwy(float* output, const float* input, const uint8_t* gate_weights,
+                                             const float* gate_scales, const float* gate_zeros,
+                                             const uint8_t* up_weights, const float* up_scales,
+                                             const float* up_zeros, int K, int N, int group_size, int n_start,
+                                             int n_end);
+
+/**
  * @brief Batched INT4 GEMM with M-blocking for weight reuse
  *
  * For M>1, loads each weight tile once and applies to M_BLOCK=4 input rows.

@@ -490,6 +490,7 @@ set(SOURCES
     src/backend_registry.cpp
     src/kernel_context.cpp
     src/async_cpu_backend.cpp
+    src/qwen35_ssm_math.cpp
     src/matmul_backend.cpp
     src/matmul_backend_densecore.cpp
     src/matmul_backend_onednn.cpp
@@ -727,6 +728,16 @@ if(DENSECORE_BUILD_BENCHMARKS)
     if(DENSECORE_USE_MIMALLOC)
         target_compile_definitions(alloc_bench PRIVATE DENSECORE_USE_MIMALLOC)
     endif()
+
+    foreach(_densecore_bench_target IN ITEMS bench_native quality_test qwen35_fast_qa)
+        add_executable(${_densecore_bench_target} ../benchmarks/${_densecore_bench_target}.cpp)
+        target_link_libraries(${_densecore_bench_target} PRIVATE densecore Threads::Threads)
+        target_include_directories(${_densecore_bench_target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_BINARY_DIR}/include
+            ${GGML_DIR}/include
+        )
+    endforeach()
 endif()
 
 # Platform-specific optimizations
@@ -1124,6 +1135,7 @@ if(DENSECORE_BUILD_TESTS)
     # Test sources (use absolute paths to ensure correct resolution)
     set(TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_simd_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen35_ssm_math.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_memory_pool.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kv_cache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scheduler.cpp
@@ -1132,6 +1144,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hardware_topology.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_operation_graph.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_graph_capture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_matmul_backend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_aligned_allocator.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tensor_view.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kernel_context.cpp

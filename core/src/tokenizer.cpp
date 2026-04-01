@@ -247,6 +247,59 @@ bool IsByteLevelBpeTokenizer(const TransformerModel* model) {
     return probe_hits >= 3;
 }
 
+std::string DetokenizeImpl(const TransformerModel* model, int token_id) {
+    if (!model || token_id < 0 || token_id >= static_cast<int>(model->vocab_tokens.size())) {
+        return "";
+    }
+
+    const std::string& token = model->vocab_tokens[static_cast<size_t>(token_id)];
+
+    if (token_id < static_cast<int>(model->token_types.size()) && model->token_types[static_cast<size_t>(token_id)] == 3) {
+        return "";
+    }
+    if (IsLikelyControlTokenLiteral(token)) {
+        return "";
+    }
+
+    if (token.size() == 6 && token[0] == '<' && token[1] == '0' && token[2] == 'x' && token[5] == '>') {
+        char hex[3] = {token[3], token[4], 0};
+        int byte_val = 0;
+        if (std::sscanf(hex, "%x", &byte_val) == 1) {
+            return std::string(1, static_cast<char>(byte_val));
+        }
+    }
+
+    const auto units = SplitUtf8Units(token);
+    std::string out;
+    out.reserve(token.size());
+
+    if (!IsByteLevelBpeTokenizer(model)) {
+        for (const std::string& unit : units) {
+            if (unit == "▁") {
+                out.push_back(' ');
+            } else {
+                out.append(unit);
+            }
+        }
+        return out;
+    }
+
+    const auto& u2b = UnicodeToByte();
+    for (const std::string& unit : units) {
+        auto it = u2b.find(unit);
+        if (it != u2b.end()) {
+            out.push_back(static_cast<char>(it->second));
+            continue;
+        }
+        if (unit == "▁") {
+            out.push_back(' ');
+            continue;
+        }
+        out.append(unit);
+    }
+    return out;
+}
+
 struct Utf8Codepoint {
     uint32_t cp = 0;
     size_t start = 0;
@@ -800,66 +853,22 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
 // Detokenize
 // ============================================================================
 
+void Tokenizer::BuildStreamTokenPieceCache(TransformerModel* model) {
+    if (!model) return;
+    model->stream_token_pieces.resize(model->vocab_tokens.size());
+    for (size_t i = 0; i < model->vocab_tokens.size(); ++i) {
+        model->stream_token_pieces[i] = DetokenizeImpl(model, static_cast<int>(i));
+    }
+}
+
 std::string Tokenizer::Detokenize(const TransformerModel* model, int token_id) {
-    if (!model || token_id < 0 || token_id >= static_cast<int>(model->vocab_tokens.size())) {
+    if (!model) {
         return "";
     }
-
-    const std::string token = model->vocab_tokens[token_id];
-
-    // Do not stream control/special markers to the end user.
-    if (token_id < static_cast<int>(model->token_types.size()) && model->token_types[token_id] == 3) {
-        return "";
+    if (token_id >= 0 && token_id < static_cast<int>(model->stream_token_pieces.size())) {
+        return model->stream_token_pieces[static_cast<size_t>(token_id)];
     }
-    if (IsLikelyControlTokenLiteral(token)) {
-        return "";
-    }
-
-    // Handle explicit byte token format: <0xXX>
-    if (token.size() == 6 && token[0] == '<' && token[1] == '0' && token[2] == 'x' && token[5] == '>') {
-        char hex[3] = {token[3], token[4], 0};
-        int byte_val = 0;
-        if (std::sscanf(hex, "%x", &byte_val) == 1) {
-            return std::string(1, static_cast<char>(byte_val));
-        }
-    }
-
-    const auto units = SplitUtf8Units(token);
-    std::string out;
-    out.reserve(token.size());
-
-    // Non-byte-BPE tokenizers should preserve UTF-8 bytes verbatim (except ▁ -> space).
-    if (!IsByteLevelBpeTokenizer(model)) {
-        for (const std::string& unit : units) {
-            if (unit == "▁") {
-                out.push_back(' ');
-            } else {
-                out.append(unit);
-            }
-        }
-        return out;
-    }
-
-    const auto& u2b = UnicodeToByte();
-
-    for (const std::string& unit : units) {
-        auto it = u2b.find(unit);
-        if (it != u2b.end()) {
-            out.push_back(static_cast<char>(it->second));
-            continue;
-        }
-
-        // SentencePiece leading-space marker fallback.
-        if (unit == "▁") {
-            out.push_back(' ');
-            continue;
-        }
-
-        // Unknown unit: keep original UTF-8 bytes as-is.
-        out.append(unit);
-    }
-
-    return out;
+    return DetokenizeImpl(model, token_id);
 }
 
 std::string Tokenizer::DetokenizeMultiple(const TransformerModel* model, const std::vector<int>& token_ids) {

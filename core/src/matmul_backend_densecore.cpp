@@ -6,6 +6,7 @@
 #include "../include/matmul_backend.h"
 
 #include "../include/simd_ops.h"
+#include "kernels/hwy/hwy_kernels.h"
 
 namespace densecore {
 
@@ -22,6 +23,10 @@ inline bool SupportsBF16TransB(const MatmulParams& params) {
 
 inline bool SupportsINT8TransB(const MatmulParams& params) {
     return params.a_type == DType::INT8 && params.b_type == DType::INT8 && params.c_type == DType::F32;
+}
+
+inline bool IsContiguousF32TransB(const MatmulParams& params) {
+    return params.lda == params.K && params.ldb == params.K && params.ldc == params.N;
 }
 
 inline int32_t DotInt8Int8(const int8_t* a, const int8_t* b, int n) {
@@ -157,11 +162,7 @@ public:
     void Execute(const MatmulParams& params) override {
         if (!Supports(params) || !params.a || !params.b || !params.c) return;
         if (SupportsF32TransB(params)) {
-            const float* a = static_cast<const float*>(params.a);
-            const float* b = static_cast<const float*>(params.b);
-            float* c = static_cast<float*>(params.c);
-            simd::MatMulTransB(c, a, b, static_cast<int>(params.M), static_cast<int>(params.N),
-                               static_cast<int>(params.K));
+            ExecuteDenseCoreMatmulTransBF32(params);
             return;
         }
 
@@ -177,6 +178,36 @@ public:
 };
 
 }  // namespace
+
+void ExecuteDenseCoreMatmulTransBF32(const MatmulParams& params) {
+    if (!SupportsF32TransB(params) || !params.a || !params.b || !params.c) return;
+
+    const int M = static_cast<int>(params.M);
+    const int N = static_cast<int>(params.N);
+    const int K = static_cast<int>(params.K);
+    const int lda = static_cast<int>(params.lda > 0 ? params.lda : params.K);
+    const int ldb = static_cast<int>(params.ldb > 0 ? params.ldb : params.K);
+    const int ldc = static_cast<int>(params.ldc > 0 ? params.ldc : params.N);
+    if (M <= 0 || N <= 0 || K <= 0) return;
+
+    const float* a = static_cast<const float*>(params.a);
+    const float* b = static_cast<const float*>(params.b);
+    float* c = static_cast<float*>(params.c);
+
+    if (IsContiguousF32TransB(params)) {
+        hwy_kernels::GemmFP32_Hwy(c, a, b, M, N, K, 0, N);
+        return;
+    }
+
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + static_cast<size_t>(m) * lda;
+        float* c_row = c + static_cast<size_t>(m) * ldc;
+        for (int n = 0; n < N; ++n) {
+            const float* b_row = b + static_cast<size_t>(n) * ldb;
+            c_row[n] = simd::DotF32(a_row, b_row, K);
+        }
+    }
+}
 
 MatmulBackend& GetDenseCoreMatmulBackend() {
     static DenseCoreMatmulBackend backend;

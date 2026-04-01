@@ -55,6 +55,59 @@ class ScopedDecodeHomogeneousOverride {
     std::string prev_value_;
 };
 
+class ScopedEnvOverride {
+  public:
+    ScopedEnvOverride(const char* name, const char* value) : name_(name ? name : "") {
+        if (name_.empty()) {
+            return;
+        }
+        const char* prev = std::getenv(name_.c_str());
+        if (prev) {
+            had_prev_ = true;
+            prev_value_ = prev;
+        }
+
+        if (value) {
+#if defined(_WIN32)
+            _putenv_s(name_.c_str(), value);
+#else
+            setenv(name_.c_str(), value, 1);
+#endif
+        } else {
+#if defined(_WIN32)
+            _putenv_s(name_.c_str(), "");
+#else
+            unsetenv(name_.c_str());
+#endif
+        }
+    }
+
+    ~ScopedEnvOverride() {
+        if (name_.empty()) {
+            return;
+        }
+        if (had_prev_) {
+#if defined(_WIN32)
+            _putenv_s(name_.c_str(), prev_value_.c_str());
+#else
+            setenv(name_.c_str(), prev_value_.c_str(), 1);
+#endif
+            return;
+        }
+
+#if defined(_WIN32)
+        _putenv_s(name_.c_str(), "");
+#else
+        unsetenv(name_.c_str());
+#endif
+    }
+
+  private:
+    std::string name_;
+    bool had_prev_ = false;
+    std::string prev_value_;
+};
+
 SchedulerConfig MakeTestConfig() {
     SchedulerConfig cfg;
     cfg.max_num_seqs = 16;
@@ -94,6 +147,27 @@ TEST(SchedulerArchitecture, MoEClusteringIsOptInByDefault) {
 
     SchedulerConfig throughput_cfg = CreateThroughputConfig();
     EXPECT_TRUE(throughput_cfg.enable_moe_clustering);
+}
+
+TEST(SchedulerArchitecture, PrefillEnvOverrideCapsChunkSize) {
+    ScopedEnvOverride chunking_env("DENSECORE_SCHED_ENABLE_CHUNKED_PREFILL", "1");
+    ScopedEnvOverride prefill_cap_env("DENSECORE_SCHED_MAX_PREFILL_TOKENS", "8");
+
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = false;
+    cfg.max_prefill_tokens = 64;
+
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    const int seq = scheduler.AddRequest(/*request_id=*/42, /*prompt_len=*/24, /*max_output_len=*/32);
+    ASSERT_GT(seq, 0);
+
+    SchedulerOutput first = scheduler.Schedule();
+    ASSERT_EQ(first.prefill_seq_ids.size(), 1u);
+    ASSERT_EQ(first.prefill_chunk_info.size(), 1u);
+    EXPECT_EQ(first.prefill_chunk_info[0].seq_id, seq);
+    EXPECT_EQ(first.prefill_chunk_info[0].chunk_tokens, 8);
 }
 
 TEST(SchedulerArchitecture, StrictMoEClusteringDoesNotProduceEmptyDecodeBatch) {

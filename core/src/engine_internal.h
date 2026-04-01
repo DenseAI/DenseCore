@@ -282,6 +282,7 @@ struct Request {
     int estimated_length = 0;
     uint64_t empty_schedule_stall_count = 0;
     std::chrono::steady_clock::time_point last_progress_time{};
+    int pending_scheduler_progress = 0;
 
     // Scheduler sequence ID (assigned by scheduler->AddRequest)
     // -1 indicates not yet registered with scheduler
@@ -342,6 +343,7 @@ struct Request {
         estimated_length = 0;
         empty_schedule_stall_count = 0;
         last_progress_time = std::chrono::steady_clock::time_point();
+        pending_scheduler_progress = 0;
         seq_id = -1;
         // Universal Engine Reset
         is_graph_execution = false;
@@ -750,7 +752,7 @@ struct EngineState {
         // allowing larger graphs (e.g., Qwen3-4B batch=4 decode) to avoid 2GB
         // hard-cap OOM.
         size_t min_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MIN_MB", 256, HARD_MIN_MB, HARD_MAX_MB);
-        size_t max_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MAX_MB", 4096, HARD_MIN_MB, HARD_MAX_MB);
+        size_t max_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MAX_MB", 8192, HARD_MIN_MB, HARD_MAX_MB);
         if (max_mb < min_mb) max_mb = min_mb;
         const size_t MIN_SIZE = min_mb * MB;
         const size_t MAX_SIZE = max_mb * MB;

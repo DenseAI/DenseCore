@@ -41,6 +41,128 @@
 #include "densecore/graph_executor.h"
 #include "densecore/models/graph_registry.h"
 
+namespace {
+
+bool IsMulGraphValidationEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_VALIDATE_MUL");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool IsValidGgmlType(enum ggml_type type) {
+    const int value = static_cast<int>(type);
+    return value >= 0 && value < static_cast<int>(GGML_TYPE_COUNT);
+}
+
+bool IsValidGgmlOp(enum ggml_op op) {
+    const int value = static_cast<int>(op);
+    return value >= 0 && value < static_cast<int>(GGML_OP_COUNT);
+}
+
+const char* SafeGgmlTypeName(enum ggml_type type) {
+    return IsValidGgmlType(type) ? ggml_type_name(type) : "<invalid-type>";
+}
+
+const char* SafeGgmlOpName(enum ggml_op op) {
+    return IsValidGgmlOp(op) ? ggml_op_name(op) : "<invalid-op>";
+}
+
+std::string TensorDebugSummary(const struct ggml_tensor* tensor) {
+    if (!tensor) {
+        return "<null>";
+    }
+
+    std::string summary;
+    summary.reserve(256);
+    summary += "ptr=" + std::to_string(reinterpret_cast<uintptr_t>(tensor));
+    summary += " name=";
+    summary += tensor->name[0] ? tensor->name : "<unnamed>";
+    summary += " op=";
+    summary += SafeGgmlOpName(tensor->op);
+    summary += " type=";
+    summary += SafeGgmlTypeName(tensor->type);
+    summary += " ne=[";
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (d != 0) summary += ",";
+        summary += std::to_string(static_cast<long long>(tensor->ne[d]));
+    }
+    summary += "] nb=[";
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (d != 0) summary += ",";
+        summary += std::to_string(static_cast<long long>(tensor->nb[d]));
+    }
+    summary += "]";
+    return summary;
+}
+
+bool IsHybridSSMSnapshotDebugEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_HYBRID_SSM_SNAPSHOT");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+void DebugLogHybridSSMSnapshot(const char* stage, int req_id, int cached_tokens, int block_id,
+                               const std::vector<TransformerModel::SSMSequenceRuntimeState>& states) {
+    if (!IsHybridSSMSnapshotDebugEnabled()) {
+        return;
+    }
+    const size_t n_layers = states.size();
+    float conv0 = 0.0f;
+    float ssm0 = 0.0f;
+    if (!states.empty()) {
+        if (!states[0].conv_state.empty()) conv0 = states[0].conv_state[0];
+        if (!states[0].ssm_state.empty()) ssm0 = states[0].ssm_state[0];
+    }
+    std::cerr << "[HybridSSMSnapshot] stage=" << (stage ? stage : "<unknown>") << " req=" << req_id
+              << " cached_tokens=" << cached_tokens << " block_id=" << block_id << " layers=" << n_layers
+              << " conv0=" << conv0 << " ssm0=" << ssm0 << std::endl;
+}
+
+void ValidateMulNodesOrThrow(struct ggml_cgraph* graph, const char* stage) {
+    if (!IsMulGraphValidationEnabled() || !graph) {
+        return;
+    }
+
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor* node = ggml_graph_node(graph, i);
+        if (!node || node->op != GGML_OP_MUL) {
+            continue;
+        }
+
+        struct ggml_tensor* src0 = node->src[0];
+        struct ggml_tensor* src1 = node->src[1];
+        std::string issue;
+        if (!IsValidGgmlType(node->type)) {
+            issue = "dst has invalid type";
+        } else if (!src0 || !src1) {
+            issue = "missing MUL source";
+        } else if (!IsValidGgmlType(src0->type)) {
+            issue = "src0 has invalid type";
+        } else if (!IsValidGgmlType(src1->type)) {
+            issue = "src1 has invalid type";
+        } else if (!ggml_can_repeat(src1, src0)) {
+            issue = "src1 cannot broadcast to src0";
+        }
+
+        if (!issue.empty()) {
+            std::cerr << "[MulGraphValidation] stage=" << (stage ? stage : "<unknown>") << " node=" << i
+                      << " issue=" << issue << std::endl;
+            std::cerr << "  dst:  " << TensorDebugSummary(node) << std::endl;
+            std::cerr << "  src0: " << TensorDebugSummary(src0) << std::endl;
+            std::cerr << "  src1: " << TensorDebugSummary(src1) << std::endl;
+            throw densecore::InvalidArgumentException("GGML MUL graph validation failed at node " +
+                                                      std::to_string(i) + " (" + issue + ")");
+        }
+    }
+}
+
+}  // namespace
+
 // Worker Loop (Continuous Batching) - Uses Scheduler for batch formation
 void EngineLoop(EngineState* state) {
     struct WorkContextBinder {
@@ -224,11 +346,58 @@ void EngineLoop(EngineState* state) {
             bool verified_paged_decode_op = false;
             std::list<DecodeGraphCacheKey>::iterator lru_it;
         };
+        struct PrefillGraphCacheKey {
+            int batch_size = 0;
+            int tokens = 0;
+            int n_past = 0;
+            int threads = 0;
+            uintptr_t model_id = 0;
+            int arch_id = 0;
+            int cache_type_id = -1;
+            uint64_t feature_flags = 0;
+
+            bool operator==(const PrefillGraphCacheKey& other) const {
+                return batch_size == other.batch_size && tokens == other.tokens && n_past == other.n_past &&
+                       threads == other.threads && model_id == other.model_id && arch_id == other.arch_id &&
+                       cache_type_id == other.cache_type_id && feature_flags == other.feature_flags;
+            }
+        };
+        struct PrefillGraphCacheKeyHash {
+            size_t operator()(const PrefillGraphCacheKey& key) const {
+                size_t h = 1469598103934665603ull;
+                auto mix = [&h](uint64_t v) {
+                    h ^= static_cast<size_t>(v);
+                    h *= static_cast<size_t>(1099511628211ull);
+                };
+                mix(static_cast<uint64_t>(static_cast<uint32_t>(key.batch_size)));
+                mix(static_cast<uint64_t>(static_cast<uint32_t>(key.tokens)));
+                mix(static_cast<uint64_t>(static_cast<uint32_t>(key.n_past)));
+                mix(static_cast<uint64_t>(static_cast<uint32_t>(key.threads)));
+                mix(static_cast<uint64_t>(key.model_id));
+                mix(static_cast<uint64_t>(static_cast<uint32_t>(key.arch_id)));
+                mix(static_cast<uint64_t>(static_cast<uint32_t>(key.cache_type_id)));
+                mix(key.feature_flags);
+                return h;
+            }
+        };
+        struct PrefillGraphCacheEntry {
+            std::vector<uint8_t> ctx_buffer;
+            struct ggml_context* ctx = nullptr;
+            struct ggml_cgraph* graph = nullptr;
+            struct ggml_tensor* output = nullptr;
+            struct ggml_tensor* embd_inp = nullptr;
+            struct ggml_tensor* pos = nullptr;
+            size_t ctx_bytes = 0;
+            std::list<PrefillGraphCacheKey>::iterator lru_it;
+        };
 
         std::unordered_map<DecodeGraphCacheKey, DecodeGraphCacheEntry, DecodeGraphCacheKeyHash> decode_graph_cache;
         std::list<DecodeGraphCacheKey> decode_graph_lru;
         std::unordered_set<DecodeGraphCacheKey, DecodeGraphCacheKeyHash> decode_graph_uncacheable;
         std::list<DecodeGraphCacheKey> decode_graph_uncacheable_lru;
+        std::unordered_map<PrefillGraphCacheKey, PrefillGraphCacheEntry, PrefillGraphCacheKeyHash> prefill_graph_cache;
+        std::list<PrefillGraphCacheKey> prefill_graph_lru;
+        size_t prefill_graph_cache_bytes = 0;
 
         auto free_decode_graph_entry = [](DecodeGraphCacheEntry* entry) {
             if (!entry) return;
@@ -251,10 +420,32 @@ void EngineLoop(EngineState* state) {
             decode_graph_uncacheable.clear();
             decode_graph_uncacheable_lru.clear();
         };
+        auto clear_prefill_graph_cache = [&]() {
+            for (auto& kv : prefill_graph_cache) {
+                if (kv.second.ctx) {
+                    ggml_free(kv.second.ctx);
+                    kv.second.ctx = nullptr;
+                }
+                kv.second.graph = nullptr;
+                kv.second.output = nullptr;
+                kv.second.embd_inp = nullptr;
+                kv.second.pos = nullptr;
+                kv.second.ctx_buffer.clear();
+                kv.second.ctx_bytes = 0;
+            }
+            prefill_graph_cache.clear();
+            prefill_graph_lru.clear();
+            prefill_graph_cache_bytes = 0;
+        };
         auto touch_decode_graph_entry = [&](DecodeGraphCacheEntry* entry) {
             if (!entry) return;
             decode_graph_lru.splice(decode_graph_lru.begin(), decode_graph_lru, entry->lru_it);
             entry->lru_it = decode_graph_lru.begin();
+        };
+        auto touch_prefill_graph_entry = [&](PrefillGraphCacheEntry* entry) {
+            if (!entry) return;
+            prefill_graph_lru.splice(prefill_graph_lru.begin(), prefill_graph_lru, entry->lru_it);
+            entry->lru_it = prefill_graph_lru.begin();
         };
         auto reap_finished_requests = [&]() {
             std::vector<Request*> finished_requests;
@@ -305,11 +496,12 @@ void EngineLoop(EngineState* state) {
 
         while (state->status != EngineStatus::STOPPED) {
             const bool global_bench_fast_path = IsBenchmarkFastPathEnabled();
-            const bool global_bench_direct_callback = global_bench_fast_path && IsBenchmarkDirectCallbackEnabled();
+            const bool global_direct_callback =
+                IsDirectCallbackEnabled() || (global_bench_fast_path && IsBenchmarkDirectCallbackEnabled());
             auto emit_result_event = [&](Request* req, const std::string& token, int token_id, bool finished,
                                          bool error) {
                 if (!req || (!req->callback && !req->token_result_callback)) return;
-                if (global_bench_direct_callback) {
+                if (global_direct_callback) {
                     if (req->callback) {
                         req->callback(token.c_str(), finished ? 1 : 0, req->user_data);
                     } else if (req->token_result_callback) {
@@ -623,11 +815,28 @@ void EngineLoop(EngineState* state) {
             }
 
             // 3. Query Scheduler for next batch
-            //    Bench fast-path: for single active request with no pending work,
-            //    bypass scheduler bookkeeping and build a direct single-request schedule.
+            //    Single-request fast-path: for one active request with no queued or
+            //    waiting peers, bypass scheduler iteration bookkeeping and build a
+            //    direct schedule.
             densecore::SchedulerOutput sched_output;
             bool used_single_request_fast_path = false;
-            if (global_bench_fast_path && state->pending_requests.Empty()) {
+            auto flush_scheduler_progress = [&](const std::vector<Request*>& requests) {
+                if (global_bench_fast_path || !state->scheduler) return;
+                std::vector<std::pair<int, int>> updates;
+                updates.reserve(requests.size());
+                for (Request* request : requests) {
+                    if (!request || request->seq_id < 0 || request->pending_scheduler_progress <= 0 || request->finished) {
+                        continue;
+                    }
+                    updates.emplace_back(request->seq_id, request->pending_scheduler_progress);
+                    request->pending_scheduler_progress = 0;
+                }
+                if (!updates.empty()) {
+                    state->scheduler->UpdateProgressBatch(updates);
+                }
+            };
+            const bool single_request_fast_path_enabled = IsSingleRequestFastPathEnabled();
+            if ((global_bench_fast_path || single_request_fast_path_enabled) && state->pending_requests.Empty()) {
                 Request* single_req = nullptr;
                 {
                     std::lock_guard<std::mutex> lock(state->active_mu);
@@ -636,9 +845,14 @@ void EngineLoop(EngineState* state) {
                     }
                 }
 
-                if (single_req && !single_req->finished && !single_req->is_embedding && !single_req->is_swapped &&
-                    !single_req->cancelled.load(std::memory_order_relaxed) && single_req->seq_id >= 0 &&
-                    !single_req->tokens.empty()) {
+                const auto sched_stats = state->scheduler ? state->scheduler->GetStats() : densecore::Scheduler::Stats{};
+                const bool scheduler_single_tenant =
+                    !state->scheduler || (sched_stats.waiting_count == 0 && sched_stats.swapped_count == 0 &&
+                                          sched_stats.running_count <= 1);
+
+                if (scheduler_single_tenant && single_req && !single_req->finished && !single_req->is_embedding &&
+                    !single_req->is_swapped && !single_req->cancelled.load(std::memory_order_relaxed) &&
+                    single_req->seq_id >= 0 && !single_req->tokens.empty()) {
                     const int tokens_to_process =
                         single_req->is_prefill ? static_cast<int>(single_req->tokens.size()) : 1;
                     if (tokens_to_process > 0) {
@@ -670,6 +884,12 @@ void EngineLoop(EngineState* state) {
             }
 
             if (!used_single_request_fast_path) {
+                std::vector<Request*> requests_to_flush;
+                {
+                    std::lock_guard<std::mutex> lock(state->active_mu);
+                    requests_to_flush = state->active_requests;
+                }
+                flush_scheduler_progress(requests_to_flush);
                 // std::cerr << "[DEBUG] EngineLoop: Calling Scheduler->Schedule()"
                 //           << std::endl;
                 sched_output = state->scheduler->Schedule();
@@ -717,10 +937,51 @@ void EngineLoop(EngineState* state) {
                             !req->ssm_runtime_states.empty()) {
                             std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot;
                             const int snapshot_block = hit.cached_block_ids.back();
+                            const int expected_conv =
+                                current_model->ssm_inner_size +
+                                2 * current_model->ssm_group_count * current_model->ssm_state_size;
+                            const int expected_head_dim =
+                                current_model->ssm_inner_size / std::max(1, current_model->ssm_time_step_rank);
+                            const size_t expected_conv_elems =
+                                TransformerModel::SSMSequenceRuntimeState::ExpectedConvStateElements(
+                                    expected_conv, current_model->ssm_conv_kernel);
+                            const size_t expected_ssm_elems =
+                                TransformerModel::SSMSequenceRuntimeState::ExpectedStateElements(
+                                    current_model->ssm_time_step_rank, expected_head_dim, current_model->ssm_state_size);
+                            auto snapshot_shape_ok =
+                                [&](const std::vector<TransformerModel::SSMSequenceRuntimeState>& states) {
+                                    if (hit.cached_tokens <= 0 || hit.cached_tokens % BLOCK_SIZE != 0) {
+                                        return false;
+                                    }
+                                    if (hit.cached_block_ids.empty() || snapshot_block != hit.cached_block_ids.back()) {
+                                        return false;
+                                    }
+                                    if (states.size() != req->ssm_runtime_states.size()) {
+                                        return false;
+                                    }
+                                    for (const auto& state : states) {
+                                        if (state.conv_state.size() != expected_conv_elems ||
+                                            state.ssm_state.size() != expected_ssm_elems) {
+                                            return false;
+                                        }
+                                    }
+                                    return true;
+                                };
                             if (current_kv_cache->block_manager->LoadHybridSSMSnapshotForBlock(snapshot_block,
                                                                                                &snapshot) &&
-                                snapshot.size() == req->ssm_runtime_states.size()) {
+                                snapshot_shape_ok(snapshot)) {
+                                DebugLogHybridSSMSnapshot("restore_before", req->id, hit.cached_tokens, snapshot_block,
+                                                          snapshot);
                                 req->ssm_runtime_states = std::move(snapshot);
+                                DebugLogHybridSSMSnapshot("restore_after", req->id, hit.cached_tokens, snapshot_block,
+                                                          req->ssm_runtime_states);
+                            } else if (!snapshot.empty()) {
+                                LOG_WARN("Discarding hybrid SSM snapshot for req {}: shape mismatch on block {}", req->id,
+                                         snapshot_block);
+                            } else if (IsHybridSSMSnapshotDebugEnabled()) {
+                                std::cerr << "[HybridSSMSnapshot] restore_miss req=" << req->id
+                                          << " cached_tokens=" << hit.cached_tokens << " block_id=" << snapshot_block
+                                          << std::endl;
                             }
                         }
                         LOG_INFO("Prefix cache hit for req {}: skipped {} tokens.", req->id, hit.cached_tokens);
@@ -1374,6 +1635,29 @@ void EngineLoop(EngineState* state) {
             const int decode_graph_cache_lru_size = std::max(1, DecodeGraphCacheLruSize());
             const bool decode_graph_cache_active =
                 IsDecodeGraphCacheEnabled() && current_kv_cache != nullptr && decode_graph_cache_lru_size > 0;
+            const auto parse_prefill_graph_cache_bool = [](const char* name, bool default_value) {
+                const char* env = std::getenv(name);
+                if (!env || env[0] == '\0') return default_value;
+                return std::strcmp(env, "0") != 0;
+            };
+            const auto parse_prefill_graph_cache_int = [](const char* name, int default_value) {
+                const char* env = std::getenv(name);
+                if (!env || env[0] == '\0') return default_value;
+                char* end = nullptr;
+                const long value = std::strtol(env, &end, 10);
+                if (end == env || value <= 0) return default_value;
+                return static_cast<int>(value);
+            };
+            const int prefill_graph_cache_lru_size =
+                std::max(1, parse_prefill_graph_cache_int("DENSECORE_PREFILL_GRAPH_CACHE_LRU", 16));
+            const size_t prefill_graph_cache_max_bytes = static_cast<size_t>(
+                std::max(128, parse_prefill_graph_cache_int("DENSECORE_PREFILL_GRAPH_CACHE_MAX_MB", 1024))) *
+                                                        1024ULL * 1024ULL;
+            const bool prefill_graph_cache_active =
+                parse_prefill_graph_cache_bool("DENSECORE_PREFILL_GRAPH_CACHE", true) && current_kv_cache != nullptr &&
+                prefill_graph_cache_lru_size > 0;
+            const size_t prefill_graph_ctx_bytes =
+                prefill_graph_cache_active ? state->CalculateGraphContextSize(current_model) : 0;
             bool decode_single_token_layout = !is_embedding_batch && !is_prefill_batch && batch.num_seqs > 0 &&
                                               batch.num_seqs <= decode_graph_cache_max_batch &&
                                               batch_token_counts.size() == batch_requests.size() &&
@@ -1439,9 +1723,38 @@ void EngineLoop(EngineState* state) {
                 decode_reuse_candidate &&
                 decode_graph_uncacheable.find(decode_graph_key) != decode_graph_uncacheable.end();
             const bool decode_reuse_attempt_allowed = decode_reuse_candidate && !decode_key_marked_uncacheable;
+            const bool prefill_graph_entry_cacheable =
+                prefill_graph_cache_active && prefill_graph_ctx_bytes > 0 &&
+                prefill_graph_ctx_bytes <= prefill_graph_cache_max_bytes;
+            const bool prefill_reuse_shape_eligible =
+                prefill_graph_cache_active && is_prefill_batch && !is_embedding_batch && cpu_backend_active &&
+                current_model && current_model->hparams.n_experts == 0 && !current_model->arch_flags.is_hybrid_ssm &&
+                batch.lora_map.empty() && batch.num_seqs == 1 && batch_token_counts.size() == 1 &&
+                batch_requests.size() == 1 && !batch_requests[0]->is_embedding && prefill_graph_entry_cacheable;
+            const bool prefill_reuse_candidate = prefill_reuse_shape_eligible;
+
+            PrefillGraphCacheKey prefill_graph_key{};
+            if (prefill_reuse_candidate) {
+                int n_past = 0;
+                if (!batch.n_past.empty()) {
+                    n_past = std::max(0, batch.n_past[0]);
+                }
+                prefill_graph_key.batch_size = batch.num_seqs;
+                prefill_graph_key.tokens = static_cast<int>(batch.tokens.size());
+                prefill_graph_key.n_past = n_past;
+                prefill_graph_key.threads = active_threads;
+                prefill_graph_key.model_id = reinterpret_cast<uintptr_t>(current_model);
+                prefill_graph_key.arch_id = current_model ? static_cast<int>(current_model->arch) : -1;
+                prefill_graph_key.cache_type_id =
+                    current_kv_cache ? static_cast<int>(current_kv_cache->cache_type) : -1;
+                prefill_graph_key.feature_flags = BuildDecodeGraphFeatureFlags(current_model);
+            }
 
             std::chrono::steady_clock::time_point graph_build_begin, graph_build_end;
             bool built_decode_graph_cache_entry = false;
+            bool reused_prefill_graph = false;
+            bool using_cached_prefill_graph = false;
+            bool built_prefill_graph_cache_entry = false;
             if (decode_reuse_attempt_allowed) {
                 if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
                     GetDecodeWorkerStats().graph_cache_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -1463,7 +1776,21 @@ void EngineLoop(EngineState* state) {
                 }
             }
 
-            if (!reused_decode_graph) {
+            if (!reused_decode_graph && prefill_reuse_candidate) {
+                auto it = prefill_graph_cache.find(prefill_graph_key);
+                if (it != prefill_graph_cache.end() && it->second.graph && it->second.output && it->second.embd_inp &&
+                    it->second.pos) {
+                    touch_prefill_graph_entry(&it->second);
+                    gf = it->second.graph;
+                    output = it->second.output;
+                    embd_inp = it->second.embd_inp;
+                    pos = it->second.pos;
+                    reused_prefill_graph = true;
+                    using_cached_prefill_graph = true;
+                }
+            }
+
+            if (!reused_decode_graph && !reused_prefill_graph) {
                 if (decode_reuse_attempt_allowed) {
                     while (decode_graph_cache.size() >= static_cast<size_t>(decode_graph_cache_lru_size) &&
                            !decode_graph_lru.empty()) {
@@ -1544,7 +1871,98 @@ void EngineLoop(EngineState* state) {
                     }
                 }
 
-                if (!built_decode_graph_cache_entry) {
+                if (!built_decode_graph_cache_entry && prefill_reuse_candidate) {
+                    while (prefill_graph_cache.size() >= static_cast<size_t>(prefill_graph_cache_lru_size) &&
+                           !prefill_graph_lru.empty()) {
+                        const PrefillGraphCacheKey evict_key = prefill_graph_lru.back();
+                        prefill_graph_lru.pop_back();
+                        auto evict_it = prefill_graph_cache.find(evict_key);
+                        if (evict_it != prefill_graph_cache.end()) {
+                            prefill_graph_cache_bytes =
+                                (prefill_graph_cache_bytes > evict_it->second.ctx_bytes)
+                                    ? (prefill_graph_cache_bytes - evict_it->second.ctx_bytes)
+                                    : 0;
+                            if (evict_it->second.ctx) {
+                                ggml_free(evict_it->second.ctx);
+                                evict_it->second.ctx = nullptr;
+                            }
+                            evict_it->second.graph = nullptr;
+                            evict_it->second.output = nullptr;
+                            evict_it->second.embd_inp = nullptr;
+                            evict_it->second.pos = nullptr;
+                            evict_it->second.ctx_buffer.clear();
+                            prefill_graph_cache.erase(evict_it);
+                        }
+                    }
+
+                    PrefillGraphCacheEntry candidate;
+                    candidate.ctx_bytes = prefill_graph_ctx_bytes;
+                    struct ggml_init_params prefill_params = {
+                        .mem_size = candidate.ctx_bytes,
+                        .mem_buffer = nullptr,
+                        .no_alloc = false,
+                    };
+                    candidate.ctx = ggml_init(prefill_params);
+                    if (candidate.ctx) {
+                        candidate.graph = ggml_new_graph_custom(candidate.ctx, 32768, false);
+                        if (candidate.graph) {
+                            graph_build_begin = std::chrono::steady_clock::now();
+                            candidate.output = BuildTransformerGraph(current_model, current_kv_cache, candidate.ctx,
+                                                                     batch, is_embedding_batch, candidate.graph,
+                                                                     &candidate.embd_inp, &candidate.pos);
+                            graph_build_end = std::chrono::steady_clock::now();
+                            if (candidate.output && candidate.embd_inp && candidate.pos) {
+                                while (!prefill_graph_lru.empty() &&
+                                       (prefill_graph_cache.size() >= static_cast<size_t>(prefill_graph_cache_lru_size) ||
+                                        prefill_graph_cache_bytes + candidate.ctx_bytes > prefill_graph_cache_max_bytes)) {
+                                    const PrefillGraphCacheKey budget_evict_key = prefill_graph_lru.back();
+                                    prefill_graph_lru.pop_back();
+                                    auto budget_evict_it = prefill_graph_cache.find(budget_evict_key);
+                                    if (budget_evict_it == prefill_graph_cache.end()) {
+                                        continue;
+                                    }
+                                    prefill_graph_cache_bytes =
+                                        (prefill_graph_cache_bytes > budget_evict_it->second.ctx_bytes)
+                                            ? (prefill_graph_cache_bytes - budget_evict_it->second.ctx_bytes)
+                                            : 0;
+                                    if (budget_evict_it->second.ctx) {
+                                        ggml_free(budget_evict_it->second.ctx);
+                                        budget_evict_it->second.ctx = nullptr;
+                                    }
+                                    budget_evict_it->second.graph = nullptr;
+                                    budget_evict_it->second.output = nullptr;
+                                    budget_evict_it->second.embd_inp = nullptr;
+                                    budget_evict_it->second.pos = nullptr;
+                                    budget_evict_it->second.ctx_buffer.clear();
+                                    budget_evict_it->second.ctx_bytes = 0;
+                                    prefill_graph_cache.erase(budget_evict_it);
+                                }
+                                prefill_graph_lru.push_front(prefill_graph_key);
+                                candidate.lru_it = prefill_graph_lru.begin();
+                                auto inserted = prefill_graph_cache.emplace(prefill_graph_key, std::move(candidate));
+                                PrefillGraphCacheEntry& entry = inserted.first->second;
+                                prefill_graph_cache_bytes += entry.ctx_bytes;
+                                gf = entry.graph;
+                                output = entry.output;
+                                embd_inp = entry.embd_inp;
+                                pos = entry.pos;
+                                built_prefill_graph_cache_entry = true;
+                                using_cached_prefill_graph = true;
+                            }
+                        }
+                    }
+                    if (!built_prefill_graph_cache_entry && candidate.ctx) {
+                        ggml_free(candidate.ctx);
+                        candidate.ctx = nullptr;
+                        candidate.graph = nullptr;
+                        candidate.output = nullptr;
+                        candidate.embd_inp = nullptr;
+                        candidate.pos = nullptr;
+                        candidate.ctx_buffer.clear();
+                    }
+                }
+
+                if (!built_decode_graph_cache_entry && !built_prefill_graph_cache_entry) {
                     if (!state->inference_ctx.IsInitialized()) {
                         size_t ctx_size = state->CalculateGraphContextSize(current_model);
                         state->inference_ctx.Init(ctx_size);
@@ -1611,7 +2029,7 @@ void EngineLoop(EngineState* state) {
             pos->data = input_base + embd_size + 256;  // alignment padding
 
             memcpy(embd_inp->data, batch.tokens.data(), batch.tokens.size() * sizeof(int));
-            memcpy(pos->data, batch.pos.data(), batch.pos.size() * sizeof(int));
+            PopulatePositionTensor(current_model, batch, pos);
 
             // =======================================================================
             // MEMORY FENCE: Ensures visibility of input data to GGML worker threads.
@@ -1793,8 +2211,7 @@ void EngineLoop(EngineState* state) {
                                             uncached_pos->data = uncached_inputs.data() + uncached_embd_bytes + 256;
                                             std::memcpy(uncached_embd->data, batch.tokens.data(),
                                                         batch.tokens.size() * sizeof(int));
-                                            std::memcpy(uncached_pos->data, batch.pos.data(),
-                                                        batch.pos.size() * sizeof(int));
+                                            PopulatePositionTensor(current_model, batch, uncached_pos);
 
                                             maybe_set_cpu_threads();
 
@@ -1921,6 +2338,7 @@ void EngineLoop(EngineState* state) {
             }
 
             const auto compute_begin = std::chrono::steady_clock::now();
+            ValidateMulNodesOrThrow(gf, is_decode_batch ? "decode" : "prefill");
             ggml_backend_graph_compute(active_backend, gf);
             const auto compute_end = std::chrono::steady_clock::now();
             LOG_TRACE("Graph compute done for batch size {}", batch.num_seqs);
@@ -2046,7 +2464,7 @@ void EngineLoop(EngineState* state) {
                         verify_embd->data = verify_input.data();
                         verify_pos->data = verify_input.data() + verify_embd_bytes + 256;
                         std::memcpy(verify_embd->data, single_batch.tokens.data(), sizeof(int));
-                        std::memcpy(verify_pos->data, single_batch.pos.data(), sizeof(int));
+                        PopulatePositionTensor(current_model, single_batch, verify_pos);
 
                         maybe_set_cpu_threads();
                         ggml_backend_graph_compute(active_backend, verify_gf);
@@ -2262,7 +2680,7 @@ void EngineLoop(EngineState* state) {
                         req->empty_schedule_stall_count = 0;
                         req->last_progress_time = std::chrono::steady_clock::now();
                         if (!global_bench_fast_path && req->seq_id >= 0) {
-                            state->scheduler->UpdateProgress(req->seq_id, processed_count);
+                            req->pending_scheduler_progress += processed_count;
                         }
 
                         // Register any newly completed full blocks immediately after
@@ -2287,6 +2705,10 @@ void EngineLoop(EngineState* state) {
                                 const bool attach_hybrid_snapshot =
                                     current_model && current_model->arch_flags.is_hybrid_ssm &&
                                     ((blk_idx + 1) * BLOCK_SIZE == req->n_past);
+                                if (attach_hybrid_snapshot) {
+                                    DebugLogHybridSSMSnapshot("save", req->id, req->n_past, block_id,
+                                                              req->ssm_runtime_states);
+                                }
                                 current_kv_cache->block_manager->RegisterPrefixBlockWithTokens(
                                     block_id, hash, tokens_ptr + start_token, block_tokens,
                                     attach_hybrid_snapshot ? &req->ssm_runtime_states : nullptr);
@@ -2345,11 +2767,23 @@ void EngineLoop(EngineState* state) {
                     if (!req_bench_fast_path) {
                         std::string token_piece = Tokenizer::Detokenize(current_model, best_token);
                         if (!token_piece.empty()) {
-                            req->utf8_pending.append(token_piece);
-                            const size_t emit_len = Utf8ValidPrefixLength(req->utf8_pending);
-                            if (emit_len > 0) {
-                                token_str.assign(req->utf8_pending.data(), emit_len);
-                                req->utf8_pending.erase(0, emit_len);
+                            if (req->utf8_pending.empty()) {
+                                const size_t emit_len = Utf8ValidPrefixLength(token_piece);
+                                if (emit_len == token_piece.size()) {
+                                    token_str = std::move(token_piece);
+                                } else if (emit_len > 0) {
+                                    token_str.assign(token_piece.data(), emit_len);
+                                    req->utf8_pending.assign(token_piece.data() + emit_len, token_piece.size() - emit_len);
+                                } else {
+                                    req->utf8_pending = std::move(token_piece);
+                                }
+                            } else {
+                                req->utf8_pending.append(token_piece);
+                                const size_t emit_len = Utf8ValidPrefixLength(req->utf8_pending);
+                                if (emit_len > 0) {
+                                    token_str.assign(req->utf8_pending.data(), emit_len);
+                                    req->utf8_pending.erase(0, emit_len);
+                                }
                             }
                         }
                     }
@@ -2359,12 +2793,19 @@ void EngineLoop(EngineState* state) {
                     // DENSECORE_SUPPRESS_REASONING_TAGS=0.
                     if (!req_bench_fast_path && !req->json_mode && !token_str.empty() &&
                         IsReasoningTagSuppressionEnabled()) {
-                        SuppressTaggedBlock(&token_str, &req->in_think_block, &req->think_tag_pending, "<think>",
-                                            "</think>");
-                        SuppressTaggedBlock(&token_str, &req->in_tool_call_block, &req->tool_call_tag_pending,
-                                            "<tool_call>", "</tool_call>");
-                        SuppressTaggedBlock(&token_str, &req->in_tool_response_block, &req->tool_response_tag_pending,
-                                            "<tool_response>", "</tool_response>");
+                        const bool may_contain_tag = req->in_think_block || req->in_tool_call_block ||
+                                                     req->in_tool_response_block || !req->think_tag_pending.empty() ||
+                                                     !req->tool_call_tag_pending.empty() ||
+                                                     !req->tool_response_tag_pending.empty() ||
+                                                     token_str.find('<') != std::string::npos;
+                        if (may_contain_tag) {
+                            SuppressTaggedBlock(&token_str, &req->in_think_block, &req->think_tag_pending, "<think>",
+                                                "</think>");
+                            SuppressTaggedBlock(&token_str, &req->in_tool_call_block, &req->tool_call_tag_pending,
+                                                "<tool_call>", "</tool_call>");
+                            SuppressTaggedBlock(&token_str, &req->in_tool_response_block, &req->tool_response_tag_pending,
+                                                "<tool_response>", "</tool_response>");
+                        }
                     }
 
                     if (req->json_mode && !token_str.empty()) {
@@ -2398,7 +2839,7 @@ void EngineLoop(EngineState* state) {
                     // the next decode iteration.
                     if (!was_prefill_step) {
                         if (!global_bench_fast_path && req->seq_id >= 0) {
-                            state->scheduler->UpdateProgress(req->seq_id, processed_count);
+                            req->pending_scheduler_progress += processed_count;
                         }
                         req->n_past += processed_count;
                         auto now = std::chrono::steady_clock::now();
@@ -2472,6 +2913,8 @@ void EngineLoop(EngineState* state) {
                 token_offset += processed_count;
             }
 
+            flush_scheduler_progress(batch_requests);
+
             // RAII guard (ctx_temp_guard) automatically frees non-cached contexts
 
             // 11. Sync active_requests: remove finished requests
@@ -2479,6 +2922,7 @@ void EngineLoop(EngineState* state) {
             reap_finished_requests();
         }
         clear_decode_graph_cache();
+        clear_prefill_graph_cache();
     } catch (const densecore::DenseCoreException& e) {
         std::cerr << "[DenseCore] Worker thread exception (" << e.CodeInt() << "): " << e.what() << std::endl;
     } catch (const std::exception& e) {

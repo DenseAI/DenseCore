@@ -183,6 +183,10 @@ GgmlTensorHandle* BuildTransformerGraph(TransformerModel* model, PagedKVCache* c
                                         GgmlGraphHandle* gf = nullptr, GgmlTensorHandle** out_embd = nullptr,
                                         GgmlTensorHandle** out_pos = nullptr);
 
+// Populate a GGML position tensor from BatchSpec positions.
+// For MRoPE models, GGML expects 4 position ids per token.
+bool PopulatePositionTensor(TransformerModel* model, const BatchSpec& batch, GgmlTensorHandle* pos);
+
 // Initialize pre-computed RoPE cos/sin table for optimized inference
 void InitRoPETable(TransformerModel* model);
 
@@ -264,6 +268,10 @@ struct SamplingParams {
 
     // Vocabulary for grammar masking
     const std::vector<std::string>* vocab = nullptr;
+
+    // Optional deterministic seed for testing or reproducible decoding.
+    // When 0, sampling uses a process-local random seed.
+    uint64_t seed = 0;
 };
 
 int SampleToken(GgmlTensorHandle* logits, int idx, const SamplingParams& params = SamplingParams());

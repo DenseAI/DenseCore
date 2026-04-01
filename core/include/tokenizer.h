@@ -38,6 +38,11 @@ public:
     static std::string DetokenizeMultiple(const TransformerModel* model, const std::vector<int>& token_ids);
 
     /**
+     * Precompute stream-safe detokenized pieces for hot decode/token streaming.
+     */
+    static void BuildStreamTokenPieceCache(TransformerModel* model);
+
+    /**
      * Check if a token exists in the vocabulary.
      */
     static bool HasToken(const TransformerModel* model, const std::string& token);

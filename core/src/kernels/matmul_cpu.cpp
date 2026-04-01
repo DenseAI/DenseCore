@@ -11,9 +11,7 @@
 #include "densecore/hal/typed_tensor.h"
 
 #include "../include/cpu_backend.h"
-#include "../include/gemm_config.h"
 #include "../include/matmul_backend.h"
-#include "../include/simd_ops.h"  // For simd::DotF32, simd::MatMulTransB
 #include "../include/simd_platform.h"
 #include "../thread_pool_impl.h"  // Corrected path (src/thread_pool_impl.h)
 
@@ -72,34 +70,6 @@ public:
         }
 
         // PREFILL Phase (M>1): Matrix-Matrix Multiplication (GEMM)
-
-#if defined(DENSECORE_USE_ONEDNN)
-        // oneDNN Path
-        const auto& gemm_cfg = GetGemmConfig();
-        if (gemm_cfg.ShouldUseOneDNN(M, K, N)) {
-            MatmulParams params;
-            params.a = a_data;
-            params.b = b_data;
-            params.c = c_data;
-            params.M = M;
-            params.N = N;
-            params.K = K;
-            params.lda = K;
-            params.ldb = N;
-            params.ldc = N;
-            params.trans_a = false;
-            params.trans_b = false;
-            params.a_type = DType::F32;
-            params.b_type = DType::F32;
-            params.c_type = DType::F32;
-
-            auto& backend = GetOneDnnMatmulBackend();
-            if (backend.IsAvailable()) {
-                backend.Execute(params);
-                return;
-            }
-        }
-#endif
 
 #ifdef __APPLE__
         // Apple Accelerate Path
@@ -169,20 +139,22 @@ public:
         return;
 #endif
 
-        auto& pool = GetCpuBackend().GetThreadPool(0);
-        // GEMM (Prefill): Parallelize across M (rows).
-        // NOTE: forcing split-N Highway for low-M was slower on batch=4/threads=8
-        // in end-to-end decode benchmarks, so keep this path as default.
-        pool.ParallelFor(M, [=](int m_start, int m_end, int) {
-            for (int m = m_start; m < m_end; ++m) {
-                const float* a_row = a_data + m * K;
-                float* c_row = c_data + m * N;
-                for (int n = 0; n < N; ++n) {
-                    const float* b_row = b_data + n * K;
-                    c_row[n] = simd::DotF32(a_row, b_row, K);
-                }
-            }
-        });
+        MatmulParams params;
+        params.a = a_data;
+        params.b = b_data;
+        params.c = c_data;
+        params.M = M;
+        params.N = N;
+        params.K = K;
+        params.lda = K;
+        params.ldb = K;
+        params.ldc = N;
+        params.trans_a = false;
+        params.trans_b = true;
+        params.a_type = DType::F32;
+        params.b_type = DType::F32;
+        params.c_type = DType::F32;
+        ExecuteDenseCoreMatmulTransBF32(params);
     }
 };
 

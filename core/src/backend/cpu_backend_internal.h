@@ -176,12 +176,12 @@ inline int ParseCpuBackendEnvInt(const char* name, int default_value, int min_va
 }
 
 inline bool IsMoELocalityOrderingEnabled() {
-    static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_LOCALITY_ORDERING", false);
+    static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_LOCALITY_ORDERING", true);
     return enabled;
 }
 
 inline bool IsMoENextExpertPrefetchEnabled() {
-    static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_PREFETCH_NEXT_EXPERT", false);
+    static const bool enabled = ParseCpuBackendEnvBool("DENSECORE_MOE_PREFETCH_NEXT_EXPERT", true);
     return enabled;
 }
 
@@ -219,12 +219,12 @@ inline size_t GetMoEDequantCacheBytes() {
     static const size_t bytes = []() -> size_t {
         const char* env = std::getenv("DENSECORE_MOE_DEQUANT_CACHE_MB");
         if (!env || *env == '\0') {
-            return 0;
+            return 128ULL * 1024ULL * 1024ULL;
         }
         char* end = nullptr;
         const unsigned long long parsed_mb = std::strtoull(env, &end, 10);
         if (end == env || *end != '\0') {
-            return 0;
+            return 128ULL * 1024ULL * 1024ULL;
         }
         return static_cast<size_t>(parsed_mb) * 1024ULL * 1024ULL;
     }();

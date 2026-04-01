@@ -1,0 +1,290 @@
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <vector>
+
+#include "qwen35_ssm_math.h"
+
+namespace {
+
+float SoftplusRef(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return std::exp(x);
+    return std::log1p(std::exp(x));
+}
+
+float SigmoidRef(float x) {
+    if (x >= 0.0f) {
+        const float z = std::exp(-x);
+        return 1.0f / (1.0f + z);
+    }
+    const float z = std::exp(x);
+    return z / (1.0f + z);
+}
+
+float SiluRef(float x) {
+    return x * SigmoidRef(x);
+}
+
+void RunReferenceStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head) {
+    std::vector<float> q_norm(static_cast<size_t>(cfg.head_dim_k), 0.0f);
+    std::vector<float> k_norm(static_cast<size_t>(cfg.head_dim_k), 0.0f);
+    std::vector<float> delta(static_cast<size_t>(cfg.head_dim_v), 0.0f);
+
+    float alpha = cfg.dt_bias;
+    float beta = 0.0f;
+    for (int i = 0; i < cfg.n_embd; ++i) {
+        alpha += cfg.alpha_row[i] * cfg.input_t[i];
+        beta += cfg.beta_row[i] * cfg.input_t[i];
+    }
+
+    const float g = -std::exp(cfg.a_log) * SoftplusRef(alpha);
+    const float decay = std::exp(g);
+    const float beta_gate = SigmoidRef(beta);
+
+    float q_sum_sq = 0.0f;
+    float k_sum_sq = 0.0f;
+    for (int i = 0; i < cfg.head_dim_k; ++i) {
+        q_sum_sq += cfg.q_head[i] * cfg.q_head[i];
+        k_sum_sq += cfg.k_head[i] * cfg.k_head[i];
+    }
+
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k));
+    const float q_inv_norm = q_scale / std::sqrt(q_sum_sq + cfg.norm_eps);
+    const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+    for (int i = 0; i < cfg.head_dim_k; ++i) {
+        q_norm[static_cast<size_t>(i)] = cfg.q_head[i] * q_inv_norm;
+        k_norm[static_cast<size_t>(i)] = cfg.k_head[i] * k_inv_norm;
+    }
+
+    for (int i = 0; i < cfg.head_dim_k * cfg.head_dim_v; ++i) {
+        state_kv[i] *= decay;
+    }
+
+    for (int v = 0; v < cfg.head_dim_v; ++v) {
+        float kv_mem = 0.0f;
+        for (int k = 0; k < cfg.head_dim_k; ++k) {
+            kv_mem += state_kv[static_cast<size_t>(k) * cfg.head_dim_v + v] * k_norm[static_cast<size_t>(k)];
+        }
+        delta[static_cast<size_t>(v)] = (cfg.v_head[v] - kv_mem) * beta_gate;
+    }
+
+    for (int k = 0; k < cfg.head_dim_k; ++k) {
+        float* row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        for (int v = 0; v < cfg.head_dim_v; ++v) {
+            row[v] += k_norm[static_cast<size_t>(k)] * delta[static_cast<size_t>(v)];
+        }
+    }
+
+    float sum_sq = 0.0f;
+    for (int v = 0; v < cfg.head_dim_v; ++v) {
+        float sum = 0.0f;
+        for (int k = 0; k < cfg.head_dim_k; ++k) {
+            sum += state_kv[static_cast<size_t>(k) * cfg.head_dim_v + v] * q_norm[static_cast<size_t>(k)];
+        }
+        y_head[v] = sum;
+        sum_sq += sum * sum;
+    }
+
+    const float rms = std::sqrt(sum_sq / cfg.head_dim_v + cfg.norm_eps);
+    for (int v = 0; v < cfg.head_dim_v; ++v) {
+        const float norm_w = cfg.norm_weight ? cfg.norm_weight[v] : 1.0f;
+        y_head[v] = (y_head[v] / rms) * norm_w * SiluRef(cfg.z_head[v]);
+    }
+}
+
+float MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b) {
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        max_abs = std::max(max_abs, std::fabs(a[i] - b[i]));
+    }
+    return max_abs;
+}
+
+}  // namespace
+
+TEST(Qwen35SSMMathTest, MatchesReferenceStep) {
+    const std::vector<float> input = {0.25f, -0.5f, 0.75f, -0.125f};
+    const std::vector<float> q = {0.3f, -0.8f};
+    const std::vector<float> k = {0.4f, 0.6f};
+    const std::vector<float> v = {1.0f, -0.5f, 0.75f};
+    const std::vector<float> z = {0.1f, -0.3f, 0.8f};
+    const std::vector<float> alpha_row = {0.2f, -0.1f, 0.05f, 0.3f};
+    const std::vector<float> beta_row = {-0.15f, 0.05f, 0.12f, -0.2f};
+    const std::vector<float> norm = {1.1f, 0.9f, 1.05f};
+    std::vector<float> state = {
+        0.2f, -0.1f, 0.4f,
+        -0.3f, 0.5f, 0.1f,
+    };
+    std::vector<float> ref_state = state;
+    std::vector<float> y(3, 0.0f);
+    std::vector<float> ref_y(3, 0.0f);
+
+    Qwen35SSMHeadStepConfig cfg{};
+    cfg.input_t = input.data();
+    cfg.q_head = q.data();
+    cfg.k_head = k.data();
+    cfg.v_head = v.data();
+    cfg.z_head = z.data();
+    cfg.alpha_row = alpha_row.data();
+    cfg.beta_row = beta_row.data();
+    cfg.norm_weight = norm.data();
+    cfg.n_embd = 4;
+    cfg.head_dim_k = 2;
+    cfg.head_dim_v = 3;
+    cfg.dt_bias = -0.2f;
+    cfg.a_log = -1.4f;
+    cfg.norm_eps = 1e-6f;
+
+    Qwen35SSMHeadStepStats stats{};
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(cfg, state.data(), y.data(), &stats));
+    RunReferenceStep(cfg, ref_state.data(), ref_y.data());
+
+    EXPECT_TRUE(std::isfinite(stats.g));
+    EXPECT_LT(stats.decay, 1.0f);
+    EXPECT_GT(stats.decay, 0.0f);
+    EXPECT_LT(MaxAbsDiff(state, ref_state), 1e-6f);
+    EXPECT_LT(MaxAbsDiff(y, ref_y), 1e-6f);
+}
+
+TEST(Qwen35SSMMathTest, PositiveALogStillProducesContractiveDecay) {
+    const std::vector<float> input = {1.0f, -0.25f};
+    const std::vector<float> q = {0.7f, -0.2f};
+    const std::vector<float> k = {-0.4f, 0.9f};
+    const std::vector<float> v = {0.25f, -0.75f};
+    const std::vector<float> z = {0.5f, -0.1f};
+    const std::vector<float> alpha_row = {0.6f, 0.4f};
+    const std::vector<float> beta_row = {0.1f, -0.2f};
+    std::vector<float> state(4, 0.0f);
+    std::vector<float> y(2, 0.0f);
+
+    Qwen35SSMHeadStepConfig cfg{};
+    cfg.input_t = input.data();
+    cfg.q_head = q.data();
+    cfg.k_head = k.data();
+    cfg.v_head = v.data();
+    cfg.z_head = z.data();
+    cfg.alpha_row = alpha_row.data();
+    cfg.beta_row = beta_row.data();
+    cfg.norm_weight = nullptr;
+    cfg.n_embd = 2;
+    cfg.head_dim_k = 2;
+    cfg.head_dim_v = 2;
+    cfg.dt_bias = 0.3f;
+    cfg.a_log = 0.8f;
+    cfg.norm_eps = 1e-6f;
+
+    Qwen35SSMHeadStepStats stats{};
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(cfg, state.data(), y.data(), &stats));
+
+    EXPECT_TRUE(std::isfinite(stats.exp_a_log));
+    EXPECT_TRUE(std::isfinite(stats.g));
+    EXPECT_TRUE(std::isfinite(stats.decay));
+    EXPECT_LT(stats.g, 0.0f);
+    EXPECT_LT(stats.decay, 1.0f);
+    EXPECT_GT(stats.decay, 0.0f);
+    for (float value : state) EXPECT_TRUE(std::isfinite(value));
+    for (float value : y) EXPECT_TRUE(std::isfinite(value));
+}
+
+TEST(Qwen35SSMMathTest, DebugBuffersExposeCanonicalKVLayoutIntermediates) {
+    const std::vector<float> input = {0.25f, -0.5f, 0.75f, -0.125f};
+    const std::vector<float> q = {0.3f, -0.8f};
+    const std::vector<float> k = {0.4f, 0.6f};
+    const std::vector<float> v = {1.0f, -0.5f, 0.75f};
+    const std::vector<float> z = {0.1f, -0.3f, 0.8f};
+    const std::vector<float> alpha_row = {0.2f, -0.1f, 0.05f, 0.3f};
+    const std::vector<float> beta_row = {-0.15f, 0.05f, 0.12f, -0.2f};
+    std::vector<float> state = {
+        0.2f, -0.1f, 0.4f,
+        -0.3f, 0.5f, 0.1f,
+    };
+    std::vector<float> y(3, 0.0f);
+    std::vector<float> q_norm(2, 0.0f);
+    std::vector<float> k_norm(2, 0.0f);
+    std::vector<float> kv_mem(3, 0.0f);
+    std::vector<float> delta(3, 0.0f);
+    std::vector<float> y_pre_norm(3, 0.0f);
+
+    Qwen35SSMHeadStepConfig cfg{};
+    cfg.input_t = input.data();
+    cfg.q_head = q.data();
+    cfg.k_head = k.data();
+    cfg.v_head = v.data();
+    cfg.z_head = z.data();
+    cfg.alpha_row = alpha_row.data();
+    cfg.beta_row = beta_row.data();
+    cfg.n_embd = 4;
+    cfg.head_dim_k = 2;
+    cfg.head_dim_v = 3;
+    cfg.dt_bias = -0.2f;
+    cfg.a_log = -1.4f;
+    cfg.norm_eps = 1e-6f;
+
+    Qwen35SSMHeadStepDebugBuffers debug{};
+    debug.q_norm = q_norm.data();
+    debug.k_norm = k_norm.data();
+    debug.kv_mem = kv_mem.data();
+    debug.delta = delta.data();
+    debug.y_pre_norm = y_pre_norm.data();
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(cfg, state.data(), y.data(), nullptr, &debug));
+
+    for (float value : q_norm) EXPECT_TRUE(std::isfinite(value));
+    for (float value : k_norm) EXPECT_TRUE(std::isfinite(value));
+    for (float value : kv_mem) EXPECT_TRUE(std::isfinite(value));
+    for (float value : delta) EXPECT_TRUE(std::isfinite(value));
+    for (float value : y_pre_norm) EXPECT_TRUE(std::isfinite(value));
+
+    EXPECT_GT(std::fabs(kv_mem[0]) + std::fabs(kv_mem[1]) + std::fabs(kv_mem[2]), 0.0f);
+    EXPECT_GT(std::fabs(delta[0]) + std::fabs(delta[1]) + std::fabs(delta[2]), 0.0f);
+    EXPECT_GT(std::fabs(y_pre_norm[0]) + std::fabs(y_pre_norm[1]) + std::fabs(y_pre_norm[2]), 0.0f);
+}
+
+TEST(Qwen35SSMMathTest, CanonicalizesLoaderShapesAndOrientation) {
+    const int64_t canonical_alpha_ne[4] = {4, 2, 1, 1};
+    const std::vector<float> canonical_alpha = {
+        1.0f, 3.0f, 5.0f, 7.0f,
+        2.0f, 4.0f, 6.0f, 8.0f,
+    };
+    std::vector<float> alpha_out;
+    ASSERT_TRUE(Qwen35CanonicalizeHeadByEmbd(canonical_alpha.data(), canonical_alpha_ne, 4, 2, &alpha_out));
+    EXPECT_EQ(alpha_out, canonical_alpha);
+
+    const int64_t transposed_alpha_ne[4] = {2, 4, 1, 1};
+    const std::vector<float> transposed_alpha = {
+        1.0f, 2.0f,
+        3.0f, 4.0f,
+        5.0f, 6.0f,
+        7.0f, 8.0f,
+    };
+    ASSERT_TRUE(Qwen35CanonicalizeHeadByEmbd(transposed_alpha.data(), transposed_alpha_ne, 4, 2, &alpha_out));
+    EXPECT_EQ(alpha_out, (std::vector<float>{1.0f, 3.0f, 5.0f, 7.0f, 2.0f, 4.0f, 6.0f, 8.0f}));
+
+    const int64_t invalid_alpha_ne[4] = {4, 2, 2, 1};
+    EXPECT_FALSE(Qwen35CanonicalizeHeadByEmbd(canonical_alpha.data(), invalid_alpha_ne, 4, 2, &alpha_out));
+
+    const int64_t a_log_ne[4] = {2, 1, 1, 1};
+    const std::vector<float> a_log = {-1.25f, 0.75f};
+    std::vector<float> a_log_out;
+    ASSERT_TRUE(Qwen35CanonicalizePerHeadVector(a_log.data(), a_log_ne, 2, &a_log_out));
+    EXPECT_EQ(a_log_out, a_log);
+
+    const int64_t norm_head_ne[4] = {3, 1, 1, 1};
+    const std::vector<float> norm_head = {0.1f, -0.2f, 0.3f};
+    std::vector<float> norm_out;
+    EXPECT_EQ(Qwen35CanonicalizeNorm(norm_head.data(), norm_head_ne, 3, 6, &norm_out),
+              Qwen35SSMNormLayout::SHARED_HEAD_DIM);
+    EXPECT_EQ(norm_out, norm_head);
+
+    const int64_t norm_full_ne[4] = {6, 1, 1, 1};
+    const std::vector<float> norm_full = {0.1f, -0.2f, 0.3f, 0.4f, -0.5f, 0.6f};
+    EXPECT_EQ(Qwen35CanonicalizeNorm(norm_full.data(), norm_full_ne, 3, 6, &norm_out),
+              Qwen35SSMNormLayout::FLATTENED_D_INNER);
+    EXPECT_EQ(norm_out, norm_full);
+
+    const int64_t bad_norm_ne[4] = {3, 2, 1, 1};
+    EXPECT_EQ(Qwen35CanonicalizeNorm(norm_full.data(), bad_norm_ne, 3, 6, &norm_out),
+              Qwen35SSMNormLayout::INVALID);
+}

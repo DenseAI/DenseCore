@@ -130,7 +130,7 @@ struct SchedulerConfig {
 
     // Chunked prefill
     bool enable_chunked_prefill = true;
-    int max_prefill_tokens = 512;  // Max prefill tokens per iteration
+    int max_prefill_tokens = 2048;  // Max prefill tokens per iteration
     // Optional mixed-phase mode: when enabled, decode-first iterations may admit
     // a bounded prefill chunk into the same batch if the decode context bucket is
     // homogeneous. This reduces long-prompt head-of-line blocking without
@@ -212,6 +212,7 @@ public:
      * Update sequence progress (call after each token generation)
      */
     void UpdateProgress(int seq_id, int tokens_generated = 1);
+    void UpdateProgressBatch(const std::vector<std::pair<int, int>>& progress_updates);
 
     /**
      * Get scheduler stats

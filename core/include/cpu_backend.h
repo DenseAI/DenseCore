@@ -330,6 +330,19 @@ public:
         size_t size;  ///< Size in bytes
     };
 
+    struct ExpertPackedInt4Weight {
+        const uint8_t* packed_weights = nullptr;
+        const float* scales = nullptr;
+        const float* zeros = nullptr;
+        int group_size = 0;
+        int K = 0;
+        int N = 0;
+
+        bool IsValid() const {
+            return packed_weights && scales && zeros && group_size > 0 && K > 0 && N > 0 && (K % group_size) == 0;
+        }
+    };
+
     /**
      * @brief Expert weights for a single MoE expert (w1, w2, w3)
      */
@@ -342,6 +355,12 @@ public:
         int w1_type = 0;       ///< ggml_type of w1 (0 = GGML_TYPE_F32)
         int w2_type = 0;       ///< ggml_type of w2
         int w3_type = 0;       ///< ggml_type of w3
+        const struct ggml_tensor* w1_tensor = nullptr;
+        const struct ggml_tensor* w2_tensor = nullptr;
+        const struct ggml_tensor* w3_tensor = nullptr;
+        ExpertPackedInt4Weight w1_int4;
+        ExpertPackedInt4Weight w2_int4;
+        ExpertPackedInt4Weight w3_int4;
     };
 
     struct MoERuntimeStatsSnapshot {
@@ -462,6 +481,7 @@ public:
      */
     std::vector<ExpertWeights> GetRegisteredExperts() const;
     std::vector<ExpertWeights> GetRegisteredExperts(const TransformerLayer* layer_key) const;
+    bool GetRegisteredExpertsView(const TransformerLayer* layer_key, const ExpertWeights** experts, int* count) const;
 
     // =========================================================================
     // Sticky Routing: NUMA-Aware Expert FFN Dispatch
@@ -484,6 +504,11 @@ public:
      * @param w3 Expert FFN w3 weights (up projection, for SwiGLU)
      * @param output Output tensor (pre-allocated)
      */
+    void DispatchExpertFFN(int expert_id, const Tensor& input, const ExpertWeights& expert, const Tensor& w1,
+                           const Tensor& w2, const Tensor& w3, Tensor* output);
+    void DispatchExpertFFN(const TransformerLayer* layer_key, int expert_id, const Tensor& input,
+                           const ExpertWeights& expert, const Tensor& w1, const Tensor& w2, const Tensor& w3,
+                           Tensor* output);
     void DispatchExpertFFN(int expert_id, const Tensor& input, const Tensor& w1, const Tensor& w2, const Tensor& w3,
                            Tensor* output);
     void DispatchExpertFFN(const TransformerLayer* layer_key, int expert_id, const Tensor& input, const Tensor& w1,
@@ -546,9 +571,12 @@ private:
             int expert_id = -1;
             size_t bytes = 0;
             uint64_t last_used = 0;
-            std::vector<float> w1;
-            std::vector<float> w2;
-            std::vector<float> w3;
+            simd::AlignedVector<float> w1;
+            simd::AlignedVector<float> w2;
+            simd::AlignedVector<float> w3;
+            Tensor w1_tensor;
+            Tensor w2_tensor;
+            Tensor w3_tensor;
         };
 
         std::vector<ExpertWeights> experts;

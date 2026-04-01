@@ -225,6 +225,31 @@ TEST_F(BlockManagerTest, CopyOnWrite_SharedBlock) {
     EXPECT_EQ(manager->GetRefCount(block_id), 1);
 }
 
+TEST_F(BlockManagerTest, HybridSSMSnapshotRoundTripPreservesState) {
+    const int block_id = manager->AllocateSingle();
+    ASSERT_GE(block_id, 0);
+
+    TransformerModel::SSMSequenceRuntimeState layer0;
+    layer0.conv_state = {0.25f, -0.5f, 0.75f};
+    layer0.ssm_state = {1.0f, 2.0f, 3.0f, 4.0f};
+    TransformerModel::SSMSequenceRuntimeState layer1;
+    layer1.conv_state = {-1.25f, 1.5f};
+    layer1.ssm_state = {-2.0f, 0.5f, 0.25f};
+    std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot = {layer0, layer1};
+
+    const int tokens[BLOCK_SIZE] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    const uint64_t hash = BlockManager::ComputeTokenHash(tokens, BLOCK_SIZE);
+    manager->RegisterPrefixBlockWithTokens(block_id, hash, tokens, BLOCK_SIZE, &snapshot);
+
+    std::vector<TransformerModel::SSMSequenceRuntimeState> restored;
+    ASSERT_TRUE(manager->LoadHybridSSMSnapshotForBlock(block_id, &restored));
+    ASSERT_EQ(restored.size(), snapshot.size());
+    for (size_t i = 0; i < snapshot.size(); ++i) {
+        EXPECT_EQ(restored[i].conv_state, snapshot[i].conv_state);
+        EXPECT_EQ(restored[i].ssm_state, snapshot[i].ssm_state);
+    }
+}
+
 // =============================================================================
 // PagedKVCache Swap Persistence Tests
 // =============================================================================

@@ -18,6 +18,8 @@ struct ArmComputeAffinityPolicy {
 bool IsDebugGraphLoggingEnabled();
 bool IsVerboseTokenTraceEnabled();
 bool IsReasoningTagSuppressionEnabled();
+bool IsDirectCallbackEnabled();
+bool IsSingleRequestFastPathEnabled();
 bool IsBenchmarkFastPathEnabled();
 bool IsBenchmarkDirectCallbackEnabled();
 bool IsBenchmarkDecodeBatchFastPathEnabled();

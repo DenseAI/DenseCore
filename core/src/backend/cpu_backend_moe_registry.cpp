@@ -641,6 +641,34 @@ std::vector<CpuBackend::ExpertWeights> CpuBackend::GetRegisteredExperts(const Tr
     return registry->experts;
 }
 
+bool CpuBackend::GetRegisteredExpertsView(const TransformerLayer* layer_key, const ExpertWeights** experts,
+                                          int* count) const {
+    if (experts) {
+        *experts = nullptr;
+    }
+    if (count) {
+        *count = 0;
+    }
+
+    auto registry = GetMoELayerRegistry(layer_key);
+    if (!registry) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    if (registry->experts.empty()) {
+        return false;
+    }
+
+    if (experts) {
+        *experts = registry->experts.data();
+    }
+    if (count) {
+        *count = static_cast<int>(registry->experts.size());
+    }
+    return true;
+}
+
 CpuBackend::MoERuntimeStatsSnapshot CpuBackend::GetMoERuntimeStatsSnapshot() const {
     MoERuntimeStatsSnapshot snapshot;
     snapshot.batches = moe_stats_batches_.load(std::memory_order_relaxed);

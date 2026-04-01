@@ -19,6 +19,12 @@ namespace densecore {
 
 Scheduler::Scheduler(BlockManager* block_manager, const SchedulerConfig& config)
     : block_manager_(block_manager), config_(config) {
+    config_.enable_chunked_prefill =
+        scheduler_internal::ParseEnvBool(std::getenv("DENSECORE_SCHED_ENABLE_CHUNKED_PREFILL"),
+                                         config_.enable_chunked_prefill);
+    config_.max_prefill_tokens =
+        std::max(1, scheduler_internal::ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_PREFILL_TOKENS"),
+                                                    config_.max_prefill_tokens));
     decode_homogeneous_batch_n_past_ =
         scheduler_internal::ParseEnvBool(std::getenv("DENSECORE_SCHED_DECODE_HOMOGENEOUS_N_PAST"),
                                          /*default_value=*/false);
@@ -38,6 +44,7 @@ Scheduler::Scheduler(BlockManager* block_manager, const SchedulerConfig& config)
         scheduler_internal::ParseEnvFloat(std::getenv("DENSECORE_SCHED_MOE_BATCH_STRICTNESS"),
                                           config_.moe_batch_strictness),
         0.0f, 1.0f);
+    config_.max_prefill_tokens = std::min(config_.max_prefill_tokens, std::max(1, config_.max_num_batched_tokens));
 }
 
 int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, int priority,
@@ -306,6 +313,20 @@ void Scheduler::UpdateProgress(int seq_id, int tokens_generated) {
     std::lock_guard<std::mutex> lock(mutex_);
     seq_generated_tokens_[seq_id] += tokens_generated;
     seq_context_len_[seq_id] += tokens_generated;
+}
+
+void Scheduler::UpdateProgressBatch(const std::vector<std::pair<int, int>>& progress_updates) {
+    if (progress_updates.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& update : progress_updates) {
+        if (update.first < 0 || update.second <= 0) {
+            continue;
+        }
+        seq_generated_tokens_[update.first] += update.second;
+        seq_context_len_[update.first] += update.second;
+    }
 }
 
 Scheduler::Stats Scheduler::GetStats() const {
