@@ -98,8 +98,8 @@ bool GraphContainsPagedDecodeCustomOp(const struct ggml_cgraph* graph) {
     return false;
 }
 
-bool ResolvePagedDecodeHeadDims(const TransformerModel* model, int* n_head_out, int* n_head_kv_out,
-                                int* head_dim_q_out, int* head_dim_kv_out) {
+bool ResolvePagedDecodeHeadDims(const TransformerModel* model, int* n_head_out, int* n_head_kv_out, int* head_dim_q_out,
+                                int* head_dim_kv_out) {
     if (!model || !n_head_out || !n_head_kv_out || !head_dim_q_out || !head_dim_kv_out) {
         return false;
     }
@@ -665,8 +665,7 @@ int ResolveLegacyDecodeThreads(int num_seqs, int physical_core_count, int base_t
     if (num_seqs >= 4) {
         const int decode_base = active_threads;
         const float scale = std::min(1.0f, static_cast<float>(num_seqs) / 8.0f);
-        active_threads =
-            decode_base + static_cast<int>(scale * static_cast<float>(available_threads - decode_base));
+        active_threads = decode_base + static_cast<int>(scale * static_cast<float>(available_threads - decode_base));
     }
 
     return std::max(1, active_threads);
@@ -696,7 +695,8 @@ int ResolveAutoDecodeThreadsForBatch(int num_seqs, int physical_core_count, int 
     }
 }
 
-bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const PagedKVCache* cache, const BatchSpec& batch) {
+bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const PagedKVCache* cache,
+                                         const BatchSpec& batch) {
     if (!model || !cache || model->arch_flags.is_glm_dsa) {
         return false;
     }
@@ -751,7 +751,8 @@ void MaybeLogDecodeRuntimeStats() {
             const double shared_quant_hit_rate =
                 shared_quant_total > 0 ? (100.0 * static_cast<double>(runtime.shared_quant_reused) / shared_quant_total)
                                        : 0.0;
-            const densecore::CpuBackend::MoERuntimeStatsSnapshot moe_stats = densecore::GetCpuBackend().GetMoERuntimeStatsSnapshot();
+            const densecore::CpuBackend::MoERuntimeStatsSnapshot moe_stats =
+                densecore::GetCpuBackend().GetMoERuntimeStatsSnapshot();
             const KVRuntimeStatsSnapshot kv_stats = GetKVRuntimeStatsSnapshot();
             const double moe_avg_unique_experts =
                 moe_stats.batches > 0 ? static_cast<double>(moe_stats.total_active_experts) / moe_stats.batches : 0.0;
@@ -770,15 +771,15 @@ void MaybeLogDecodeRuntimeStats() {
             const double moe_avg_cached_experts =
                 moe_stats.batches > 0 ? static_cast<double>(moe_stats.total_cached_experts) / moe_stats.batches : 0.0;
             const double moe_avg_dequant_experts =
-                moe_stats.batches > 0 ? static_cast<double>(moe_stats.total_dequantized_experts) / moe_stats.batches : 0.0;
+                moe_stats.batches > 0 ? static_cast<double>(moe_stats.total_dequantized_experts) / moe_stats.batches
+                                      : 0.0;
 
-            std::cerr << "[DecodeRuntimeStats] batches=" << decode_batches
-                      << " paged_hit_rate=" << paged_hit_rate << "% (" << runtime.path_paged << "/"
-                      << runtime.path_total << ")"
+            std::cerr << "[DecodeRuntimeStats] batches=" << decode_batches << " paged_hit_rate=" << paged_hit_rate
+                      << "% (" << runtime.path_paged << "/" << runtime.path_total << ")"
                       << " graph_cache_hit_rate=" << graph_hit_rate << "% (" << graph_hits << "/" << graph_attempts
-                      << ", builds=" << graph_builds << ")"
-                      << " shared_quant_hit_rate=" << shared_quant_hit_rate << "% (" << runtime.shared_quant_reused
-                      << "/" << shared_quant_total << ", tls=" << runtime.shared_quant_tls << ")"
+                      << ", builds=" << graph_builds << ")" << " shared_quant_hit_rate=" << shared_quant_hit_rate
+                      << "% (" << runtime.shared_quant_reused << "/" << shared_quant_total
+                      << ", tls=" << runtime.shared_quant_tls << ")"
                       << " decode_threads[b1=" << worker_stats.last_threads_by_batch[1].load(std::memory_order_relaxed)
                       << ",b2=" << worker_stats.last_threads_by_batch[2].load(std::memory_order_relaxed)
                       << ",b3=" << worker_stats.last_threads_by_batch[3].load(std::memory_order_relaxed)
@@ -787,13 +788,12 @@ void MaybeLogDecodeRuntimeStats() {
                       << "%,reuse=" << moe_step_reuse << "%,concentration=" << moe_concentration
                       << "%,avg_cached=" << moe_avg_cached_experts << ",avg_dequant=" << moe_avg_dequant_experts;
             if (moe_stats.total_prefetch_calls > 0 || moe_stats.total_dequantized_experts > 0) {
-                std::cerr << ",prefetch_calls=" << moe_stats.total_prefetch_calls
-                          << ",prefetch_mb=" << (static_cast<double>(moe_stats.total_prefetch_bytes) / (1024.0 * 1024.0))
-                          << ",dequant_experts=" << moe_stats.total_dequantized_experts
-                          << ",dequant_mb=" << (static_cast<double>(moe_stats.total_dequantized_bytes) / (1024.0 * 1024.0));
+                std::cerr << ",prefetch_calls=" << moe_stats.total_prefetch_calls << ",prefetch_mb="
+                          << (static_cast<double>(moe_stats.total_prefetch_bytes) / (1024.0 * 1024.0))
+                          << ",dequant_experts=" << moe_stats.total_dequantized_experts << ",dequant_mb="
+                          << (static_cast<double>(moe_stats.total_dequantized_bytes) / (1024.0 * 1024.0));
             }
-            std::cerr << "]"
-                      << " kv_bulk[reads=" << kv_stats.bulk_read_calls << "/" << kv_stats.bulk_read_slots
+            std::cerr << "]" << " kv_bulk[reads=" << kv_stats.bulk_read_calls << "/" << kv_stats.bulk_read_slots
                       << ",writes=" << kv_stats.bulk_write_calls << "/" << kv_stats.bulk_write_slots << "]";
 
             bool wrote_reason = false;
@@ -832,7 +832,8 @@ void EnsureRequestHybridSSMRuntimeState(TransformerModel* model, Request* req) {
     const auto reinit_all = [&]() {
         req->ssm_runtime_states.resize(n_ssm_layers);
         for (auto& state : req->ssm_runtime_states) {
-            state.Init(conv_channels, model->ssm_conv_kernel, model->ssm_time_step_rank, head_dim, model->ssm_state_size);
+            state.Init(conv_channels, model->ssm_conv_kernel, model->ssm_time_step_rank, head_dim,
+                       model->ssm_state_size);
         }
     };
     const size_t expected_conv =

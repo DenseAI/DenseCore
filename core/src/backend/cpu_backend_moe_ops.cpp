@@ -4,7 +4,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <limits>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace densecore {
@@ -50,8 +53,247 @@ bool IsMoEDebugTimingEnabled() {
     return enabled;
 }
 
-template <size_t N>
-bool CopyIntVectorToFixedArray(const std::vector<int>& src, std::array<int, N>* dst, int* count) {
+bool IsMoEReferenceCheckEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_MOE_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+float MoEReferenceTolerance() {
+    static const float tol = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_MOE_REFERENCE_TOL");
+        if (!env || env[0] == '\0') {
+            return 1e-2f;
+        }
+        char* end = nullptr;
+        const float parsed = std::strtof(env, &end);
+        if (end == env || !std::isfinite(parsed) || parsed <= 0.0f) {
+            return 1e-2f;
+        }
+        return parsed;
+    }();
+    return tol;
+}
+
+bool ShouldRunMoEReferenceCheck() {
+    if (!IsMoEReferenceCheckEnabled()) {
+        return false;
+    }
+    static std::atomic<int> remaining_budget{[]() {
+        const char* env = std::getenv("DENSECORE_DEBUG_MOE_REFERENCE_MAX_CALLS");
+        if (!env || env[0] == '\0') {
+            return 1;
+        }
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end == env || parsed <= 0) {
+            return 1;
+        }
+        return static_cast<int>(parsed);
+    }()};
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct MoEReferenceExpertMatrices {
+    std::vector<float> w1;  // [intermediate, hidden]
+    std::vector<float> w2;  // [hidden, intermediate]
+    std::vector<float> w3;  // [intermediate, hidden]
+    int hidden_dim = 0;
+    int intermediate_dim = 0;
+};
+
+bool DequantExpertMatrixToF32(const CpuBackend::ExpertWeights& expert, const CpuBackend::ExpertWeight& weight,
+                              int ggml_type_id, const CpuBackend::ExpertPackedInt4Weight& int4_binding, int64_t rows,
+                              int64_t cols, std::vector<float>* out, std::string* reason) {
+    (void)expert;
+    if (!out) {
+        return false;
+    }
+    out->clear();
+    if (!weight.ptr || rows <= 0 || cols <= 0) {
+        if (reason) {
+            *reason = "missing expert weight";
+        }
+        return false;
+    }
+    if (int4_binding.IsValid()) {
+        if (reason) {
+            *reason = "packed-int4 MoE reference dequant is not implemented";
+        }
+        return false;
+    }
+    const ggml_type wtype = static_cast<ggml_type>(ggml_type_id);
+    const size_t total = static_cast<size_t>(rows * cols);
+    out->resize(total);
+    if (wtype == GGML_TYPE_F32) {
+        std::memcpy(out->data(), weight.ptr, total * sizeof(float));
+        return true;
+    }
+    const struct ggml_type_traits* traits = ggml_get_type_traits(wtype);
+    if (!traits || !traits->to_float) {
+        if (reason) {
+            *reason = "missing ggml to_float dequantizer";
+        }
+        return false;
+    }
+    const size_t row_bytes = ggml_row_size(wtype, cols);
+    const char* src = static_cast<const char*>(weight.ptr);
+    for (int64_t r = 0; r < rows; ++r) {
+        traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes), out->data() + r * cols, cols);
+    }
+    return true;
+}
+
+bool BuildMoEReferenceExpertMatrices(const CpuBackend::ExpertWeights& expert, MoEReferenceExpertMatrices* out,
+                                     std::string* reason) {
+    if (!out) {
+        return false;
+    }
+    out->w1.clear();
+    out->w2.clear();
+    out->w3.clear();
+    out->hidden_dim = expert.hidden_dim;
+    out->intermediate_dim = expert.intermediate_dim;
+    if (expert.hidden_dim <= 0 || expert.intermediate_dim <= 0) {
+        if (reason) {
+            *reason = "invalid expert dimensions";
+        }
+        return false;
+    }
+    if (!DequantExpertMatrixToF32(expert, expert.w1, expert.w1_type, expert.w1_int4, expert.intermediate_dim,
+                                  expert.hidden_dim, &out->w1, reason)) {
+        return false;
+    }
+    if (!DequantExpertMatrixToF32(expert, expert.w2, expert.w2_type, expert.w2_int4, expert.hidden_dim,
+                                  expert.intermediate_dim, &out->w2, reason)) {
+        return false;
+    }
+    if (expert.w3.ptr != nullptr &&
+        !DequantExpertMatrixToF32(expert, expert.w3, expert.w3_type, expert.w3_int4, expert.intermediate_dim,
+                                  expert.hidden_dim, &out->w3, reason)) {
+        return false;
+    }
+    return true;
+}
+
+void RunMoEReferenceCheck(const float* input_data, int batch_size, int hidden_dim, const moe::MoERouteResult& routing,
+                          const CpuBackend::ExpertWeights* experts, int num_experts, const float* actual_output) {
+    if (!input_data || !experts || !actual_output || batch_size <= 0 || hidden_dim <= 0 || num_experts <= 0) {
+        return;
+    }
+    if (static_cast<int>(routing.expert_ids.size()) != batch_size * routing.top_k ||
+        static_cast<int>(routing.weights.size()) != batch_size * routing.top_k) {
+        return;
+    }
+
+    std::unordered_map<int, MoEReferenceExpertMatrices> cached;
+    cached.reserve(static_cast<size_t>(std::min(num_experts, routing.top_k * batch_size)));
+    std::vector<float> reference(static_cast<size_t>(batch_size * hidden_dim), 0.0f);
+    std::vector<float> gate;
+    std::vector<float> up;
+    std::vector<float> hidden;
+    std::string failure_reason;
+
+    for (int i = 0; i < static_cast<int>(routing.expert_ids.size()); ++i) {
+        const int expert_id = routing.expert_ids[static_cast<size_t>(i)];
+        const int token_idx =
+            routing.token_indices.empty() ? (i / routing.top_k) : routing.token_indices[static_cast<size_t>(i)];
+        const float route_weight = routing.weights[static_cast<size_t>(i)];
+        if (expert_id < 0 || expert_id >= num_experts || token_idx < 0 || token_idx >= batch_size) {
+            continue;
+        }
+
+        auto it = cached.find(expert_id);
+        if (it == cached.end()) {
+            MoEReferenceExpertMatrices matrices;
+            if (!BuildMoEReferenceExpertMatrices(experts[static_cast<size_t>(expert_id)], &matrices, &failure_reason)) {
+                std::fprintf(stderr, "[MoE_REF] skipped: expert=%d reason=%s\n", expert_id, failure_reason.c_str());
+                return;
+            }
+            it = cached.emplace(expert_id, std::move(matrices)).first;
+        }
+
+        const MoEReferenceExpertMatrices& matrices = it->second;
+        const float* token_in = input_data + static_cast<size_t>(token_idx) * hidden_dim;
+        gate.assign(static_cast<size_t>(matrices.intermediate_dim), 0.0f);
+        if (matrices.w3.empty()) {
+            up.assign(static_cast<size_t>(matrices.intermediate_dim), 1.0f);
+        } else {
+            up.assign(static_cast<size_t>(matrices.intermediate_dim), 0.0f);
+        }
+        hidden.assign(static_cast<size_t>(matrices.intermediate_dim), 0.0f);
+
+        for (int r = 0; r < matrices.intermediate_dim; ++r) {
+            const float* w1_row = matrices.w1.data() + static_cast<size_t>(r) * matrices.hidden_dim;
+            const float gate_val = simd::DotF32(token_in, w1_row, matrices.hidden_dim);
+            gate[static_cast<size_t>(r)] = gate_val;
+            if (!matrices.w3.empty()) {
+                const float* w3_row = matrices.w3.data() + static_cast<size_t>(r) * matrices.hidden_dim;
+                up[static_cast<size_t>(r)] = simd::DotF32(token_in, w3_row, matrices.hidden_dim);
+            }
+            const float silu = gate_val / (1.0f + std::exp(-gate_val));
+            hidden[static_cast<size_t>(r)] = silu * up[static_cast<size_t>(r)];
+        }
+
+        float* ref_out = reference.data() + static_cast<size_t>(token_idx) * hidden_dim;
+        for (int r = 0; r < hidden_dim; ++r) {
+            const float* w2_row = matrices.w2.data() + static_cast<size_t>(r) * matrices.intermediate_dim;
+            ref_out[r] += route_weight * simd::DotF32(hidden.data(), w2_row, matrices.intermediate_dim);
+        }
+    }
+
+    float max_abs_diff = 0.0f;
+    size_t max_idx = 0;
+    bool actual_nonfinite = false;
+    bool ref_nonfinite = false;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        if (!std::isfinite(reference[i])) {
+            ref_nonfinite = true;
+            max_idx = i;
+            break;
+        }
+        if (!std::isfinite(actual_output[i])) {
+            actual_nonfinite = true;
+            max_idx = i;
+            break;
+        }
+        const float diff = std::fabs(reference[i] - actual_output[i]);
+        if (diff > max_abs_diff) {
+            max_abs_diff = diff;
+            max_idx = i;
+        }
+    }
+
+    const int token_idx = hidden_dim > 0 ? static_cast<int>(max_idx / static_cast<size_t>(hidden_dim)) : -1;
+    const int dim_idx = hidden_dim > 0 ? static_cast<int>(max_idx % static_cast<size_t>(hidden_dim)) : -1;
+    std::fprintf(stderr,
+                 "[MoE_REF] batch=%d top_k=%d max_abs_diff=%g token=%d dim=%d actual=%g ref=%g actual_nonfinite=%d "
+                 "ref_nonfinite=%d tol=%g\n",
+                 batch_size, routing.top_k, max_abs_diff, token_idx, dim_idx,
+                 max_idx < reference.size() ? actual_output[max_idx] : 0.0f,
+                 max_idx < reference.size() ? reference[max_idx] : 0.0f, actual_nonfinite ? 1 : 0,
+                 ref_nonfinite ? 1 : 0, MoEReferenceTolerance());
+    if (max_abs_diff > MoEReferenceTolerance()) {
+        for (int b = 0; b < std::min(batch_size, 2); ++b) {
+            std::fprintf(stderr, "[MoE_REF] token=%d routed:", b);
+            for (int k = 0; k < routing.top_k; ++k) {
+                const size_t idx = static_cast<size_t>(b * routing.top_k + k);
+                std::fprintf(stderr, " (%d,%g)", routing.expert_ids[idx], routing.weights[idx]);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+}
+
+template <size_t N> bool CopyIntVectorToFixedArray(const std::vector<int>& src, std::array<int, N>* dst, int* count) {
     if (!dst || !count) {
         return false;
     }
@@ -66,8 +308,7 @@ bool CopyIntVectorToFixedArray(const std::vector<int>& src, std::array<int, N>* 
     return true;
 }
 
-template <size_t N>
-bool FixedArrayContains(const std::array<int, N>& values, int count, int target) {
+template <size_t N> bool FixedArrayContains(const std::array<int, N>& values, int count, int target) {
     for (int i = 0; i < count; ++i) {
         if (values[static_cast<size_t>(i)] == target) {
             return true;
@@ -91,8 +332,8 @@ bool ExpertUsesPackedInt4Only(const CpuBackend::ExpertWeights& expert) {
 
 bool TryRunPackedInt4ProjectionDirect(CpuBackend* backend, const CpuBackend::ExpertPackedInt4Weight& binding,
                                       const Tensor& input, Tensor* output, int numa_node) {
-    if (!backend || !output || !binding.IsValid() || !input.IsValid() || !output->IsValid() || input.dtype != DType::F32 ||
-        output->dtype != DType::F32 || input.ndim != 2 || output->ndim != 2) {
+    if (!backend || !output || !binding.IsValid() || !input.IsValid() || !output->IsValid() ||
+        input.dtype != DType::F32 || output->dtype != DType::F32 || input.ndim != 2 || output->ndim != 2) {
         return false;
     }
 
@@ -136,9 +377,9 @@ bool TryRunPackedInt4ProjectionDirect(CpuBackend* backend, const CpuBackend::Exp
                                                             0, M, n_start, n_end, input_stride_bytes);
             });
         } else {
-            densecore::hwy_kernels::GemmInt4Batched_Hwy(output_data, input_data, binding.packed_weights,
-                                                        binding.scales, binding.zeros, M, K, N, binding.group_size, 0,
-                                                        M, 0, N, input_stride_bytes);
+            densecore::hwy_kernels::GemmInt4Batched_Hwy(output_data, input_data, binding.packed_weights, binding.scales,
+                                                        binding.zeros, M, K, N, binding.group_size, 0, M, 0, N,
+                                                        input_stride_bytes);
         }
         return true;
     }
@@ -147,11 +388,13 @@ bool TryRunPackedInt4ProjectionDirect(CpuBackend* backend, const CpuBackend::Exp
 #endif
 }
 
-bool TryRunPackedInt4FusedSwiGLUProjectionDirect(CpuBackend* backend, const CpuBackend::ExpertPackedInt4Weight& gate_binding,
+bool TryRunPackedInt4FusedSwiGLUProjectionDirect(CpuBackend* backend,
+                                                 const CpuBackend::ExpertPackedInt4Weight& gate_binding,
                                                  const CpuBackend::ExpertPackedInt4Weight& up_binding,
                                                  const Tensor& input, Tensor* output, int numa_node) {
-    if (!backend || !output || !gate_binding.IsValid() || !up_binding.IsValid() || !input.IsValid() || !output->IsValid() ||
-        input.dtype != DType::F32 || output->dtype != DType::F32 || input.ndim != 2 || output->ndim != 2) {
+    if (!backend || !output || !gate_binding.IsValid() || !up_binding.IsValid() || !input.IsValid() ||
+        !output->IsValid() || input.dtype != DType::F32 || output->dtype != DType::F32 || input.ndim != 2 ||
+        output->ndim != 2) {
         return false;
     }
 
@@ -191,8 +434,9 @@ bool TryRunPackedInt4FusedSwiGLUProjectionDirect(CpuBackend* backend, const CpuB
 #endif
 }
 
-void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& input, const CpuBackend::ExpertWeights& expert,
-                           const Tensor& w1, const Tensor& w2, const Tensor& w3, Tensor* output) {
+void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& input,
+                           const CpuBackend::ExpertWeights& expert, const Tensor& w1, const Tensor& w2,
+                           const Tensor& w3, Tensor* output) {
     if (!backend || !output) {
         return;
     }
@@ -247,8 +491,8 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
 
 bool TryRunPackedInt4Projection(CpuBackend* backend, const CpuBackend::ExpertPackedInt4Weight& binding,
                                 const Tensor& input, Tensor* output, int numa_node) {
-    if (!backend || !output || !binding.IsValid() || !input.IsValid() || !output->IsValid() || input.dtype != DType::F32 ||
-        output->dtype != DType::F32 || input.ndim != 2 || output->ndim != 2) {
+    if (!backend || !output || !binding.IsValid() || !input.IsValid() || !output->IsValid() ||
+        input.dtype != DType::F32 || output->dtype != DType::F32 || input.ndim != 2 || output->ndim != 2) {
         return false;
     }
 
@@ -535,10 +779,9 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                                ? Tensor()
                                : Tensor::Make2D(entry->w1.data(), static_cast<int64_t>(exp.intermediate_dim),
                                                 static_cast<int64_t>(exp.hidden_dim));
-        entry->w2_tensor = entry->w2.empty()
-                               ? Tensor()
-                               : Tensor::Make2D(entry->w2.data(), static_cast<int64_t>(exp.hidden_dim),
-                                                static_cast<int64_t>(exp.intermediate_dim));
+        entry->w2_tensor = entry->w2.empty() ? Tensor()
+                                             : Tensor::Make2D(entry->w2.data(), static_cast<int64_t>(exp.hidden_dim),
+                                                              static_cast<int64_t>(exp.intermediate_dim));
         entry->w3_tensor = entry->w3.empty()
                                ? Tensor()
                                : Tensor::Make2D(entry->w3.data(), static_cast<int64_t>(exp.intermediate_dim),
@@ -618,14 +861,14 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                 }
             }
             if (!seen && small_step_current_batch_expert_count < kSmallDecodeMaxAssignments) {
-                small_step_current_batch_experts[static_cast<size_t>(small_step_current_batch_expert_count++)] = expert_id;
+                small_step_current_batch_experts[static_cast<size_t>(small_step_current_batch_expert_count++)] =
+                    expert_id;
             }
         }
     }
 
     if (small_decode_candidate && !small_decode_requires_general_path && small_step_snapshot_ok &&
-        small_step_max_expert_batch <= 1 &&
-        small_step_current_batch_expert_count > 0) {
+        small_step_max_expert_batch <= 1 && small_step_current_batch_expert_count > 0) {
         int reuse_intersection = 0;
         if (small_step_previous_batch_count > 0) {
             for (int i = 0; i < small_step_current_batch_expert_count; ++i) {
@@ -635,7 +878,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                 }
             }
         }
-        const int reuse_union = small_step_current_batch_expert_count + small_step_previous_batch_count - reuse_intersection;
+        const int reuse_union =
+            small_step_current_batch_expert_count + small_step_previous_batch_count - reuse_intersection;
         int local_hot_count = 0;
         for (int i = 0; i < small_step_current_batch_expert_count; ++i) {
             if (FixedArrayContains(small_step_local_hot_experts, small_step_local_hot_count,
@@ -667,9 +911,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
         const bool cache_all_active_experts = internal::ShouldCacheAllActiveExperts();
         const size_t dequant_cache_budget = internal::GetMoEDequantCacheBytes();
 
-        auto make_weight_f32_small = [&](void* ptr, int ggml_type_id,
-                                         const ExpertPackedInt4Weight& int4_binding, int64_t rows, int64_t cols,
-                                         AlignedScratch& scratch, size_t* dequantized_bytes,
+        auto make_weight_f32_small = [&](void* ptr, int ggml_type_id, const ExpertPackedInt4Weight& int4_binding,
+                                         int64_t rows, int64_t cols, AlignedScratch& scratch, size_t* dequantized_bytes,
                                          bool* dequantized_any) -> Tensor {
             if (!ptr || rows <= 0 || cols <= 0) {
                 return Tensor::Make2D(ptr, rows, cols);
@@ -730,8 +973,7 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                 GetExpertMatrixDequantBytes(exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
                                             static_cast<int64_t>(exp.intermediate_dim)) +
                 ((exp.w3.ptr != nullptr)
-                     ? GetExpertMatrixDequantBytes(exp.w3_type, exp.w3_int4,
-                                                   static_cast<int64_t>(exp.intermediate_dim),
+                     ? GetExpertMatrixDequantBytes(exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
                                                    static_cast<int64_t>(exp.hidden_dim))
                      : 0);
             if (should_try_cache && cacheable_bytes > 0 && cacheable_bytes <= dequant_cache_budget) {
@@ -754,7 +996,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                     candidate->expert_id = expert_id;
                     candidate->bytes = cacheable_bytes;
                     if ((!exp.w1_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) && exp.w1_type != GGML_TYPE_F32) {
-                        const struct ggml_type_traits* traits = ggml_get_type_traits(static_cast<ggml_type>(exp.w1_type));
+                        const struct ggml_type_traits* traits =
+                            ggml_get_type_traits(static_cast<ggml_type>(exp.w1_type));
                         if (traits && traits->to_float) {
                             candidate->w1.resize(static_cast<size_t>(exp.intermediate_dim) * exp.hidden_dim);
                             const size_t row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w1_type), exp.hidden_dim);
@@ -766,7 +1009,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                         }
                     }
                     if ((!exp.w2_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) && exp.w2_type != GGML_TYPE_F32) {
-                        const struct ggml_type_traits* traits = ggml_get_type_traits(static_cast<ggml_type>(exp.w2_type));
+                        const struct ggml_type_traits* traits =
+                            ggml_get_type_traits(static_cast<ggml_type>(exp.w2_type));
                         if (traits && traits->to_float) {
                             candidate->w2.resize(static_cast<size_t>(exp.hidden_dim) * exp.intermediate_dim);
                             const size_t row_bytes =
@@ -774,14 +1018,14 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                             const char* src = static_cast<const char*>(exp.w2.ptr);
                             for (int64_t r = 0; r < exp.hidden_dim; ++r) {
                                 traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes),
-                                                 candidate->w2.data() + r * exp.intermediate_dim,
-                                                 exp.intermediate_dim);
+                                                 candidate->w2.data() + r * exp.intermediate_dim, exp.intermediate_dim);
                             }
                         }
                     }
                     if (exp.w3.ptr != nullptr && (!exp.w3_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
                         exp.w3_type != GGML_TYPE_F32) {
-                        const struct ggml_type_traits* traits = ggml_get_type_traits(static_cast<ggml_type>(exp.w3_type));
+                        const struct ggml_type_traits* traits =
+                            ggml_get_type_traits(static_cast<ggml_type>(exp.w3_type));
                         if (traits && traits->to_float) {
                             candidate->w3.resize(static_cast<size_t>(exp.intermediate_dim) * exp.hidden_dim);
                             const size_t row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w3_type), exp.hidden_dim);
@@ -806,8 +1050,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                                !registry->dequant_cache.empty()) {
                             auto evict_it = registry->dequant_cache.end();
                             uint64_t oldest_use = std::numeric_limits<uint64_t>::max();
-                            for (auto it_cache = registry->dequant_cache.begin(); it_cache != registry->dequant_cache.end();
-                                 ++it_cache) {
+                            for (auto it_cache = registry->dequant_cache.begin();
+                                 it_cache != registry->dequant_cache.end(); ++it_cache) {
                                 if (!it_cache->second) {
                                     evict_it = it_cache;
                                     break;
@@ -845,22 +1089,21 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                                                     static_cast<int64_t>(exp.intermediate_dim),
                                                     static_cast<int64_t>(exp.hidden_dim), w1_dequant,
                                                     &dequantized_bytes, &dequantized_any);
-            Tensor w2 = (cached_entry && (!exp.w2_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
-                         exp.w2_type != GGML_TYPE_F32)
-                            ? cached_entry->w2_tensor
-                            : make_weight_f32_small(exp.w2.ptr, exp.w2_type, exp.w2_int4,
-                                                    static_cast<int64_t>(exp.hidden_dim),
-                                                    static_cast<int64_t>(exp.intermediate_dim), w2_dequant,
-                                                    &dequantized_bytes, &dequantized_any);
+            Tensor w2 =
+                (cached_entry && (!exp.w2_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
+                 exp.w2_type != GGML_TYPE_F32)
+                    ? cached_entry->w2_tensor
+                    : make_weight_f32_small(exp.w2.ptr, exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
+                                            static_cast<int64_t>(exp.intermediate_dim), w2_dequant, &dequantized_bytes,
+                                            &dequantized_any);
             Tensor w3;
             if (exp.w3.ptr != nullptr) {
                 w3 = (cached_entry && (!exp.w3_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
                       exp.w3_type != GGML_TYPE_F32)
                          ? cached_entry->w3_tensor
-                         : make_weight_f32_small(exp.w3.ptr, exp.w3_type, exp.w3_int4,
-                                                 static_cast<int64_t>(exp.intermediate_dim),
-                                                 static_cast<int64_t>(exp.hidden_dim), w3_dequant,
-                                                 &dequantized_bytes, &dequantized_any);
+                         : make_weight_f32_small(
+                               exp.w3.ptr, exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
+                               static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes, &dequantized_any);
             }
             if (dequantized_any) {
                 moe_stats_total_dequantized_experts_.fetch_add(1, std::memory_order_relaxed);
@@ -880,6 +1123,10 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
             for (size_t d = 0; d < hidden_dim; ++d) {
                 dst[d] += weight * src[d];
             }
+        }
+        if (ShouldRunMoEReferenceCheck()) {
+            RunMoEReferenceCheck(input_data, batch_size, static_cast<int>(hidden_dim), routing, experts, num_experts,
+                                 out_data);
         }
         return;
     }
@@ -972,16 +1219,15 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
     const int reuse_union =
         static_cast<int>(current_batch_experts.size() + previous_batch_experts.size() - reuse_intersection);
     const int max_expert_batch = reorder_map.max_expert_batch;
-    const int local_hot_count =
-        static_cast<int>(std::count_if(active_work.begin(), active_work.end(), [](const ActiveExpertWork& work) {
-            return work.local_hot;
-        }));
+    const int local_hot_count = static_cast<int>(std::count_if(
+        active_work.begin(), active_work.end(), [](const ActiveExpertWork& work) { return work.local_hot; }));
     const int worker_threads = std::max(1, reorder_pool.GetNumThreads());
     const bool small_decode_step = batch_size <= 4 && total_assignments <= 8 && max_expert_batch <= 1;
 
     moe_stats_batches_.fetch_add(1, std::memory_order_relaxed);
     moe_stats_total_active_experts_.fetch_add(static_cast<uint64_t>(active_work.size()), std::memory_order_relaxed);
-    moe_stats_total_assignments_.fetch_add(static_cast<uint64_t>(reorder_map.total_assignments), std::memory_order_relaxed);
+    moe_stats_total_assignments_.fetch_add(static_cast<uint64_t>(reorder_map.total_assignments),
+                                           std::memory_order_relaxed);
     moe_stats_total_local_hot_experts_.fetch_add(static_cast<uint64_t>(local_hot_count), std::memory_order_relaxed);
     moe_stats_total_reuse_intersection_.fetch_add(static_cast<uint64_t>(reuse_intersection), std::memory_order_relaxed);
     moe_stats_total_reuse_union_.fetch_add(static_cast<uint64_t>(std::max(0, reuse_union)), std::memory_order_relaxed);
@@ -1113,8 +1359,7 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
             const bool next_reused = previous_batch_set.find(next_work.expert_id) != previous_batch_set.end();
             const int reuse_signals =
                 (next_work.local_hot ? 1 : 0) + (next_reused ? 1 : 0) + (next_work.count > 1 ? 1 : 0);
-            const bool enough_compute_distance =
-                work.count >= internal::GetMoEPrefetchMinCurrentExpertTokens();
+            const bool enough_compute_distance = work.count >= internal::GetMoEPrefetchMinCurrentExpertTokens();
             const bool under_pressure_budget =
                 static_cast<int>(active_work.size()) <= internal::GetMoEPrefetchMaxActiveExperts() &&
                 worker_threads <= internal::GetMoEPrefetchMaxThreadCount();
@@ -1131,12 +1376,14 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                 if (reuse_signals == 1) {
                     prefetch_budget = std::max<size_t>(64, prefetch_budget / 2);
                 }
-                if (static_cast<int>(active_work.size()) >= std::max(2, internal::GetMoEPrefetchMaxActiveExperts() / 2)) {
+                if (static_cast<int>(active_work.size()) >=
+                    std::max(2, internal::GetMoEPrefetchMaxActiveExperts() / 2)) {
                     prefetch_budget = std::max<size_t>(64, prefetch_budget / 2);
                 }
 
                 const int weight_count = next_exp.w3.ptr != nullptr ? 3 : 2;
-                const size_t per_weight_budget = std::max<size_t>(64, prefetch_budget / static_cast<size_t>(weight_count));
+                const size_t per_weight_budget =
+                    std::max<size_t>(64, prefetch_budget / static_cast<size_t>(weight_count));
                 auto prefetch_weight = [per_weight_budget](const ExpertWeight& weight) {
                     if (!weight.ptr || weight.size == 0) return static_cast<size_t>(0);
                     const size_t bytes = std::min(per_weight_budget, weight.size);
@@ -1153,20 +1400,20 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
             }
         }
 
-        const auto dequant_begin = debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto dequant_begin =
+            debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> cached_entry;
         const bool should_try_cache =
             dequant_cache_enabled &&
-            (cache_all_active_experts || work.local_hot || previous_batch_set.find(work.expert_id) != previous_batch_set.end() ||
-             work.count > 1);
+            (cache_all_active_experts || work.local_hot ||
+             previous_batch_set.find(work.expert_id) != previous_batch_set.end() || work.count > 1);
         const size_t cacheable_bytes =
             GetExpertMatrixDequantBytes(exp.w1_type, exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
                                         static_cast<int64_t>(exp.hidden_dim)) +
             GetExpertMatrixDequantBytes(exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
                                         static_cast<int64_t>(exp.intermediate_dim)) +
             ((exp.w3.ptr != nullptr)
-                 ? GetExpertMatrixDequantBytes(exp.w3_type, exp.w3_int4,
-                                               static_cast<int64_t>(exp.intermediate_dim),
+                 ? GetExpertMatrixDequantBytes(exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
                                                static_cast<int64_t>(exp.hidden_dim))
                  : 0);
         if (should_try_cache && cacheable_bytes > 0 && cacheable_bytes <= dequant_cache_budget) {
@@ -1191,7 +1438,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                 dequantize_into_buffer(exp.w2.ptr, exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
                                        static_cast<int64_t>(exp.intermediate_dim), &candidate->w2);
                 if (exp.w3.ptr != nullptr) {
-                    dequantize_into_buffer(exp.w3.ptr, exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
+                    dequantize_into_buffer(exp.w3.ptr, exp.w3_type, exp.w3_int4,
+                                           static_cast<int64_t>(exp.intermediate_dim),
                                            static_cast<int64_t>(exp.hidden_dim), &candidate->w3);
                 }
                 refresh_cached_tensors(candidate.get(), exp);
@@ -1208,7 +1456,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                            !registry->dequant_cache.empty()) {
                         auto evict_it = registry->dequant_cache.end();
                         uint64_t oldest_use = std::numeric_limits<uint64_t>::max();
-                        for (auto it_cache = registry->dequant_cache.begin(); it_cache != registry->dequant_cache.end(); ++it_cache) {
+                        for (auto it_cache = registry->dequant_cache.begin(); it_cache != registry->dequant_cache.end();
+                             ++it_cache) {
                             if (!it_cache->second) {
                                 evict_it = it_cache;
                                 break;
@@ -1245,21 +1494,20 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
         Tensor w2;
         Tensor w3;
         if (cached_entry) {
-            w1 = (exp.w1_int4.IsValid() && CanUsePackedInt4MoEFastPath())
-                     ? Tensor()
-                     : (exp.w1_type == GGML_TYPE_F32)
-                     ? Tensor::Make2D(exp.w1.ptr, static_cast<int64_t>(exp.intermediate_dim), static_cast<int64_t>(exp.hidden_dim))
+            w1 = (exp.w1_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
+                 : (exp.w1_type == GGML_TYPE_F32)
+                     ? Tensor::Make2D(exp.w1.ptr, static_cast<int64_t>(exp.intermediate_dim),
+                                      static_cast<int64_t>(exp.hidden_dim))
                      : cached_entry->w1_tensor;
-            w2 = (exp.w2_int4.IsValid() && CanUsePackedInt4MoEFastPath())
-                     ? Tensor()
-                     : (exp.w2_type == GGML_TYPE_F32)
-                     ? Tensor::Make2D(exp.w2.ptr, static_cast<int64_t>(exp.hidden_dim), static_cast<int64_t>(exp.intermediate_dim))
-                     : cached_entry->w2_tensor;
+            w2 = (exp.w2_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
+                 : (exp.w2_type == GGML_TYPE_F32) ? Tensor::Make2D(exp.w2.ptr, static_cast<int64_t>(exp.hidden_dim),
+                                                                   static_cast<int64_t>(exp.intermediate_dim))
+                                                  : cached_entry->w2_tensor;
             if (exp.w3.ptr != nullptr) {
-                w3 = (exp.w3_int4.IsValid() && CanUsePackedInt4MoEFastPath())
-                         ? Tensor()
-                         : (exp.w3_type == GGML_TYPE_F32)
-                         ? Tensor::Make2D(exp.w3.ptr, static_cast<int64_t>(exp.intermediate_dim), static_cast<int64_t>(exp.hidden_dim))
+                w3 = (exp.w3_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
+                     : (exp.w3_type == GGML_TYPE_F32)
+                         ? Tensor::Make2D(exp.w3.ptr, static_cast<int64_t>(exp.intermediate_dim),
+                                          static_cast<int64_t>(exp.hidden_dim))
                          : cached_entry->w3_tensor;
             }
             ++cached_experts_this_step;
@@ -1267,18 +1515,19 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
             w1 = (exp.w1_int4.IsValid() && CanUsePackedInt4MoEFastPath())
                      ? Tensor()
                      : make_weight_f32(exp.w1.ptr, exp.w1_type, static_cast<int64_t>(exp.intermediate_dim),
-                                 static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes, &dequantized_any);
+                                       static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes,
+                                       &dequantized_any);
             w2 = (exp.w2_int4.IsValid() && CanUsePackedInt4MoEFastPath())
                      ? Tensor()
                      : make_weight_f32(exp.w2.ptr, exp.w2_type, static_cast<int64_t>(exp.hidden_dim),
-                                 static_cast<int64_t>(exp.intermediate_dim), w2_dequant, &dequantized_bytes,
-                                 &dequantized_any);
+                                       static_cast<int64_t>(exp.intermediate_dim), w2_dequant, &dequantized_bytes,
+                                       &dequantized_any);
             if (exp.w3.ptr != nullptr) {
                 w3 = (exp.w3_int4.IsValid() && CanUsePackedInt4MoEFastPath())
                          ? Tensor()
                          : make_weight_f32(exp.w3.ptr, exp.w3_type, static_cast<int64_t>(exp.intermediate_dim),
-                                     static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes,
-                                     &dequantized_any);
+                                           static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes,
+                                           &dequantized_any);
             }
         }
         if (dequantized_any) {
@@ -1295,7 +1544,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
         Tensor expert_out = Tensor::Make2D(packed_output + static_cast<size_t>(work.start) * hidden_dim,
                                            static_cast<int64_t>(work.count), static_cast<int64_t>(hidden_dim));
 
-        const auto expert_begin = debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto expert_begin =
+            debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         DispatchExpertFFNImpl(this, work.numa_node, expert_input, exp, w1, w2, w3, &expert_out);
         if (debug_timing) {
             expert_duration += (std::chrono::steady_clock::now() - expert_begin);
@@ -1309,12 +1559,16 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
     moe::ReorderOutputs(packed_output, hidden_dim_i, reorder_map, out_data, &reorder_pool);
     const auto reorder_output_end = std::chrono::steady_clock::now();
 
+    if (ShouldRunMoEReferenceCheck()) {
+        RunMoEReferenceCheck(input_data, batch_size, static_cast<int>(hidden_dim), routing, experts, num_experts,
+                             out_data);
+    }
+
     if (debug_timing && batch_size >= 2 && batch_size <= 4) {
         static std::atomic<int> timing_log_count{0};
         const int log_idx = timing_log_count.fetch_add(1, std::memory_order_relaxed);
         if (log_idx < 24) {
-            const auto total_ms =
-                std::chrono::duration<double, std::milli>(reorder_output_end - forward_begin).count();
+            const auto total_ms = std::chrono::duration<double, std::milli>(reorder_output_end - forward_begin).count();
             const auto reorder_in_ms =
                 std::chrono::duration<double, std::milli>(reorder_input_end - reorder_input_begin).count();
             const auto dequant_ms = std::chrono::duration<double, std::milli>(dequant_duration).count();
@@ -1324,8 +1578,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
             std::fprintf(stderr,
                          "[MoE_TIMING #%d] batch=%d assignments=%d active_experts=%zu reorder_in=%.2fms "
                          "dequant=%.2fms expert_ffn=%.2fms reorder_out=%.2fms total=%.2fms\n",
-                         log_idx, batch_size, total_assignments, active_work.size(), reorder_in_ms, dequant_ms, expert_ms,
-                         reorder_out_ms, total_ms);
+                         log_idx, batch_size, total_assignments, active_work.size(), reorder_in_ms, dequant_ms,
+                         expert_ms, reorder_out_ms, total_ms);
         }
     }
 }

@@ -186,9 +186,8 @@ DENSECORE_API void GemvInt4_Hwy(float* output, const float* input, const uint8_t
  */
 DENSECORE_API void GemvInt4DualFusedSilu_Hwy(float* output, const float* input, const uint8_t* gate_weights,
                                              const float* gate_scales, const float* gate_zeros,
-                                             const uint8_t* up_weights, const float* up_scales,
-                                             const float* up_zeros, int K, int N, int group_size, int n_start,
-                                             int n_end);
+                                             const uint8_t* up_weights, const float* up_scales, const float* up_zeros,
+                                             int K, int N, int group_size, int n_start, int n_end);
 
 /**
  * @brief Batched INT4 GEMM with M-blocking for weight reuse

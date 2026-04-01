@@ -157,7 +157,9 @@ int BlockManager::GetFreeBlockCount() {
     return total;
 }
 
-int BlockManager::GetUsedBlockCount() { return num_blocks - GetFreeBlockCount(); }
+int BlockManager::GetUsedBlockCount() {
+    return num_blocks - GetFreeBlockCount();
+}
 
 int BlockManager::Fork(int block_id) {
     if (block_id < 0 || block_id >= num_blocks) return -1;
@@ -296,8 +298,8 @@ int BlockManager::FindCachedBlockWithVerification(uint64_t hash, const int* toke
     return block_id;
 }
 
-BlockManager::PrefixCacheMatch BlockManager::FindLongestCachedPrefixWithVerification(
-    const int* tokens, int n_tokens, bool require_hybrid_ssm_snapshot) {
+BlockManager::PrefixCacheMatch BlockManager::FindLongestCachedPrefixWithVerification(const int* tokens, int n_tokens,
+                                                                                     bool require_hybrid_ssm_snapshot) {
     PrefixCacheMatch match;
     if (!tokens || n_tokens <= BLOCK_SIZE) {
         return match;
@@ -363,8 +365,8 @@ void BlockManager::RegisterPrefixBlockWithTokens(
     }
 }
 
-bool BlockManager::LoadHybridSSMSnapshotForBlock(
-    int block_id, std::vector<TransformerModel::SSMSequenceRuntimeState>* out_snapshot) {
+bool BlockManager::LoadHybridSSMSnapshotForBlock(int block_id,
+                                                 std::vector<TransformerModel::SSMSequenceRuntimeState>* out_snapshot) {
     if (!out_snapshot || block_id < 0 || block_id >= num_blocks) {
         return false;
     }

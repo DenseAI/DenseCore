@@ -990,8 +990,7 @@ void CpuBackend::MatMulTransB(const Tensor& A, const Tensor& B, Tensor* C, int n
 
         auto& pool = GetThreadPool(numa_node_id);
         const int n_threads = std::max(1, pool.GetNumThreads());
-        const bool prefer_n_parallel =
-            n_threads > 1 && ((M <= 2 && N >= 64) || (M <= 4 && N >= 128) || (M < N / 4));
+        const bool prefer_n_parallel = n_threads > 1 && ((M <= 2 && N >= 64) || (M <= 4 && N >= 128) || (M < N / 4));
 
         if (prefer_n_parallel) {
             pool.ParallelFor(N, [=](int n_start, int n_end, int) {

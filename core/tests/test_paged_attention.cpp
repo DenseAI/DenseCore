@@ -329,6 +329,74 @@ TEST_F(PagedAttentionTest, FlashAttentionGqaHonorsChunkedPrefillOffsets) {
     }
 }
 
+TEST_F(PagedAttentionTest, FlashAttentionGqaQwenShapeMatchesReference) {
+    constexpr int n_head = 16;
+    constexpr int n_head_kv = 2;
+    constexpr int seq_q = 5;
+    constexpr int seq_kv = 5;
+    constexpr int head_dim = 128;
+
+    std::vector<float> q(static_cast<size_t>(n_head * seq_q * head_dim));
+    std::vector<float> k(static_cast<size_t>(n_head_kv * seq_kv * head_dim));
+    std::vector<float> v(static_cast<size_t>(n_head_kv * seq_kv * head_dim));
+    std::vector<float> out(static_cast<size_t>(n_head * seq_q * head_dim), 0.0f);
+    std::vector<float> ref(out.size(), 0.0f);
+
+    std::mt19937 rng(777u);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (float& x : q) x = dist(rng);
+    for (float& x : k) x = dist(rng);
+    for (float& x : v) x = dist(rng);
+
+    densecore::FlashAttentionConfig config = densecore::AutoTuneFlashConfig(head_dim, seq_kv);
+    config.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    config.causal = true;
+
+    densecore::FlashAttentionGQA(q.data(), k.data(), v.data(), out.data(), 1, n_head, n_head_kv, seq_q, seq_kv,
+                                 head_dim, config);
+    ComputeFlashReferenceWithOffsets(q.data(), k.data(), v.data(), ref.data(), n_head, n_head_kv, seq_q, seq_kv,
+                                     head_dim, config.scale, true, 0, 0);
+
+    for (size_t i = 0; i < out.size(); ++i) {
+        EXPECT_NEAR(out[i], ref[i], 1e-4f) << "Mismatch at index " << i;
+    }
+}
+
+TEST_F(PagedAttentionTest, FlashAttentionGqaQwenChunkedPrefillMatchesReference) {
+    constexpr int n_head = 16;
+    constexpr int n_head_kv = 2;
+    constexpr int seq_q = 4;
+    constexpr int seq_kv = 9;
+    constexpr int head_dim = 128;
+
+    std::vector<float> q(static_cast<size_t>(n_head * seq_q * head_dim));
+    std::vector<float> k(static_cast<size_t>(n_head_kv * seq_kv * head_dim));
+    std::vector<float> v(static_cast<size_t>(n_head_kv * seq_kv * head_dim));
+    std::vector<float> out(static_cast<size_t>(n_head * seq_q * head_dim), 0.0f);
+    std::vector<float> ref(out.size(), 0.0f);
+
+    std::mt19937 rng(888u);
+    std::uniform_real_distribution<float> dist(-0.75f, 0.75f);
+    for (float& x : q) x = dist(rng);
+    for (float& x : k) x = dist(rng);
+    for (float& x : v) x = dist(rng);
+
+    densecore::FlashAttentionConfig config = densecore::AutoTuneFlashConfig(head_dim, seq_kv);
+    config.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    config.causal = true;
+    config.q_start_offset = 5;
+    config.kv_start_offset = 0;
+
+    densecore::FlashAttentionGQA(q.data(), k.data(), v.data(), out.data(), 1, n_head, n_head_kv, seq_q, seq_kv,
+                                 head_dim, config);
+    ComputeFlashReferenceWithOffsets(q.data(), k.data(), v.data(), ref.data(), n_head, n_head_kv, seq_q, seq_kv,
+                                     head_dim, config.scale, true, config.q_start_offset, config.kv_start_offset);
+
+    for (size_t i = 0; i < out.size(); ++i) {
+        EXPECT_NEAR(out[i], ref[i], 1e-4f) << "Mismatch at index " << i;
+    }
+}
+
 TEST_F(PagedAttentionTest, BasicCorrectnessF16) {
     // Re-create cache with F16 type
     RecreateCache(GGML_TYPE_F16, 160);

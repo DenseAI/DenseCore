@@ -35,9 +35,15 @@ size_t PagedKVCache::GetIndexBytesPerSlot() const {
     return sizeof(ggml_fp16_t) * static_cast<size_t>(index_head_dim);
 }
 
-size_t PagedKVCache::GetBytesPerBlock() const { return GetBytesPerSlot() * BLOCK_SIZE; }
-size_t PagedKVCache::GetVBytesPerBlock() const { return GetVBytesPerSlot() * BLOCK_SIZE; }
-size_t PagedKVCache::GetIndexBytesPerBlock() const { return GetIndexBytesPerSlot() * BLOCK_SIZE; }
+size_t PagedKVCache::GetBytesPerBlock() const {
+    return GetBytesPerSlot() * BLOCK_SIZE;
+}
+size_t PagedKVCache::GetVBytesPerBlock() const {
+    return GetVBytesPerSlot() * BLOCK_SIZE;
+}
+size_t PagedKVCache::GetIndexBytesPerBlock() const {
+    return GetIndexBytesPerSlot() * BLOCK_SIZE;
+}
 
 PagedKVCache::BlockLayout PagedKVCache::GetBlockLayout() const {
     BlockLayout layout;
@@ -261,9 +267,15 @@ void PagedKVCache::RestoreBlocksFromHost(const std::vector<int>& block_ids, cons
     }
 }
 
-bool PagedKVCache::IsQuantized() const { return ggml_is_quantized(cache_type); }
-int PagedKVCache::GetElementsPerSlot() const { return head_dim * n_head_kv; }
-int PagedKVCache::GetVElementsPerSlot() const { return v_head_dim * n_head_kv; }
+bool PagedKVCache::IsQuantized() const {
+    return ggml_is_quantized(cache_type);
+}
+int PagedKVCache::GetElementsPerSlot() const {
+    return head_dim * n_head_kv;
+}
+int PagedKVCache::GetVElementsPerSlot() const {
+    return v_head_dim * n_head_kv;
+}
 
 void PagedKVCache::WriteKSlot(int block_id, int layer, int slot, const float* data) {
     void* ptr = GetKSlotPtr(block_id, layer, slot);

@@ -1,8 +1,8 @@
 #ifndef DENSECORE_KV_CACHE_H
 #define DENSECORE_KV_CACHE_H
 
-#include <memory>
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 
 #include "block_allocator.h"

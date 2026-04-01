@@ -19,31 +19,28 @@ namespace densecore {
 
 Scheduler::Scheduler(BlockManager* block_manager, const SchedulerConfig& config)
     : block_manager_(block_manager), config_(config) {
-    config_.enable_chunked_prefill =
-        scheduler_internal::ParseEnvBool(std::getenv("DENSECORE_SCHED_ENABLE_CHUNKED_PREFILL"),
-                                         config_.enable_chunked_prefill);
+    config_.enable_chunked_prefill = scheduler_internal::ParseEnvBool(
+        std::getenv("DENSECORE_SCHED_ENABLE_CHUNKED_PREFILL"), config_.enable_chunked_prefill);
     config_.max_prefill_tokens =
         std::max(1, scheduler_internal::ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_PREFILL_TOKENS"),
                                                     config_.max_prefill_tokens));
     decode_homogeneous_batch_n_past_ =
         scheduler_internal::ParseEnvBool(std::getenv("DENSECORE_SCHED_DECODE_HOMOGENEOUS_N_PAST"),
                                          /*default_value=*/false);
-    config_.enable_mixed_prefill_decode =
-        scheduler_internal::ParseEnvBool(std::getenv("DENSECORE_SCHED_ENABLE_MIXED_PREFILL_DECODE"),
-                                         config_.enable_mixed_prefill_decode);
-    config_.max_mixed_prefill_tokens = std::max(
-        1, scheduler_internal::ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_MIXED_PREFILL_TOKENS"),
-                                           config_.max_mixed_prefill_tokens));
-    config_.enable_moe_clustering =
-        scheduler_internal::ParseEnvBool(std::getenv("DENSECORE_SCHED_ENABLE_MOE_CLUSTERING"),
-                                         config_.enable_moe_clustering);
+    config_.enable_mixed_prefill_decode = scheduler_internal::ParseEnvBool(
+        std::getenv("DENSECORE_SCHED_ENABLE_MIXED_PREFILL_DECODE"), config_.enable_mixed_prefill_decode);
+    config_.max_mixed_prefill_tokens =
+        std::max(1, scheduler_internal::ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_MIXED_PREFILL_TOKENS"),
+                                                    config_.max_mixed_prefill_tokens));
+    config_.enable_moe_clustering = scheduler_internal::ParseEnvBool(
+        std::getenv("DENSECORE_SCHED_ENABLE_MOE_CLUSTERING"), config_.enable_moe_clustering);
     config_.max_active_experts =
         std::max(1, scheduler_internal::ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_ACTIVE_EXPERTS"),
                                                     config_.max_active_experts));
-    config_.moe_batch_strictness = std::clamp(
-        scheduler_internal::ParseEnvFloat(std::getenv("DENSECORE_SCHED_MOE_BATCH_STRICTNESS"),
-                                          config_.moe_batch_strictness),
-        0.0f, 1.0f);
+    config_.moe_batch_strictness =
+        std::clamp(scheduler_internal::ParseEnvFloat(std::getenv("DENSECORE_SCHED_MOE_BATCH_STRICTNESS"),
+                                                     config_.moe_batch_strictness),
+                   0.0f, 1.0f);
     config_.max_prefill_tokens = std::min(config_.max_prefill_tokens, std::max(1, config_.max_num_batched_tokens));
 }
 
@@ -73,8 +70,8 @@ int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, in
     // Prefix reuse always leaves at least one token to execute so prompt-end
     // logits are still computed by the normal prefill path.
     if (prefix_tokens && !prefix_tokens->empty()) {
-        auto match = block_manager_->FindLongestCachedPrefixWithVerification(
-            prefix_tokens->data(), prompt_len, require_hybrid_ssm_prefix_snapshot);
+        auto match = block_manager_->FindLongestCachedPrefixWithVerification(prefix_tokens->data(), prompt_len,
+                                                                             require_hybrid_ssm_prefix_snapshot);
         if (match.cached_tokens > 0 && !match.cached_block_ids.empty()) {
             group.shared_prefix_len = match.cached_tokens;
             group.shared_block_ids = std::move(match.cached_block_ids);

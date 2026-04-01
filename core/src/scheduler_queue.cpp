@@ -133,7 +133,8 @@ void Scheduler::ScheduleRunning(SchedulerOutput& output) {
             best_index = fallback_index;
         }
 
-        if (best_index < 0 || scheduler_internal::ScheduledSeqCount(output) >= static_cast<size_t>(config_.max_num_seqs) ||
+        if (best_index < 0 ||
+            scheduler_internal::ScheduledSeqCount(output) >= static_cast<size_t>(config_.max_num_seqs) ||
             tokens_budget <= 0) {
             break;
         }
@@ -187,8 +188,10 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
 
             for (size_t idx = 0; idx < pending.size(); ++idx) {
                 const SequenceGroup& group = pending[idx];
-                const int overlap = scheduler_internal::CountExpertOverlap(group.predicted_experts, preview_active_experts);
-                const int new_experts = scheduler_internal::CountNewExperts(group.predicted_experts, preview_active_experts);
+                const int overlap =
+                    scheduler_internal::CountExpertOverlap(group.predicted_experts, preview_active_experts);
+                const int new_experts =
+                    scheduler_internal::CountNewExperts(group.predicted_experts, preview_active_experts);
                 const int expert_count = static_cast<int>(group.predicted_experts.size());
 
                 bool better = false;
@@ -276,7 +279,8 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         }
 
         const int group_context = GetSequenceContextLen(seq_id);
-        if (config_.enforce_homogeneous_batch_n_past && target_context_len >= 0 && group_context != target_context_len) {
+        if (config_.enforce_homogeneous_batch_n_past && target_context_len >= 0 &&
+            group_context != target_context_len) {
             still_waiting.push_back(group);
             continue;
         }

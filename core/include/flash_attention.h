@@ -33,9 +33,9 @@ constexpr int FLASH_ATTN_BLOCK_N = 64;  // Key/Value block size
 struct FlashAttentionConfig {
     int block_m = FLASH_ATTN_BLOCK_M;
     int block_n = FLASH_ATTN_BLOCK_N;
-    float scale = 0.0f;   // If 0, will be set to 1/sqrt(head_dim)
-    bool causal = true;   // Causal masking
-    int num_threads = 1;  // For parallel heads
+    float scale = 0.0f;       // If 0, will be set to 1/sqrt(head_dim)
+    bool causal = true;       // Causal masking
+    int num_threads = 1;      // For parallel heads
     int q_start_offset = 0;   // Global query offset for chunked prefill causal masking
     int kv_start_offset = 0;  // Global key/value offset for chunked prefill causal masking
 };

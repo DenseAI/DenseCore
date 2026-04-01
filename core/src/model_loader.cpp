@@ -171,9 +171,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
     // 256 experts × 64 layers × 3 views × 512 bytes ≈ 24MB; allocate 32MB to be safe.
     {
         struct ggml_init_params vp = {
-            /*.mem_size   =*/ 32LL * 1024LL * 1024LL,
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ false,
+            /*.mem_size   =*/32LL * 1024LL * 1024LL,
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/false,
         };
         model->ctx_views = ggml_init(vp);
     }
@@ -566,8 +566,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 // Qwen3.5 GGUFs tag full-attention layers as "attention" (not "full_attention").
                 // Treat both as non-SSM; only mark as SSM for explicitly recurrent types.
-                const bool is_full_attn = (type == "full_attention" || type == "attention" ||
-                                           type == "transformer" || type == "self_attention");
+                const bool is_full_attn = (type == "full_attention" || type == "attention" || type == "transformer" ||
+                                           type == "self_attention");
                 model->hybrid_layer_is_ssm[i] = is_full_attn ? 0 : 1;
             }
         }
@@ -598,8 +598,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             std::cout << "[DenseCore] RoPE sections: [" << model->hparams.rope_sections[0] << ", "
                       << model->hparams.rope_sections[1] << ", " << model->hparams.rope_sections[2] << ", "
                       << model->hparams.rope_sections[3] << "]" << std::endl;
-            std::cout << "[DenseCore] MRoPE interleaved: "
-                      << (model->hparams.rope_mrope_interleaved ? "true" : "false") << std::endl;
+            std::cout << "[DenseCore] MRoPE interleaved: " << (model->hparams.rope_mrope_interleaved ? "true" : "false")
+                      << std::endl;
         }
     }
 
@@ -1004,9 +1004,10 @@ TransformerModel* LoadGGUFModel(const char* path) {
         model->layers[i].Set(model_keys::kFfnDown,
                              get_layer_tensor_any(i, {"ffn_down.weight", "ffn_down_shexp.weight",
                                                       "mlp.down_proj.weight", "down_proj.weight"}));
-        model->layers[i].Set(model_keys::kFfnUp,
-                             get_layer_tensor_any(i, {"ffn_up.weight", "ffn_up_shexp.weight",
-                                                      "mlp.up_proj.weight", "up_proj.weight"}));
+        model->layers[i].Set(model_keys::kFfnUp, get_layer_tensor_any(i, {"ffn_up.weight", "ffn_up_shexp.weight",
+                                                                          "mlp.up_proj.weight", "up_proj.weight"}));
+        model->layers[i].Set(model_keys::kFfnSharedGate,
+                             get_layer_tensor_any(i, {"ffn_gate_inp_shexp.weight", "shared_expert_gate.weight"}));
 
         // Determine if this is an SSM layer or full attention layer
         const bool is_ssm = model->IsHybridSSMLayer(static_cast<int>(i));
@@ -1019,8 +1020,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                  get_layer_tensor_any(i, {"attn_gate.weight", "linear_attn.in_proj_z.weight"}));
             model->layers[i].Set(model_keys::kSSMConv1d,
                                  get_layer_tensor_any(i, {"ssm_conv1d.weight", "linear_attn.conv1d.weight"}));
-            model->layers[i].Set(model_keys::kSSMA,
-                                 get_layer_tensor_any(i, {"ssm_a", "linear_attn.A_log"}));
+            model->layers[i].Set(model_keys::kSSMA, get_layer_tensor_any(i, {"ssm_a", "linear_attn.A_log"}));
             model->layers[i].Set(model_keys::kSSMAlpha,
                                  get_layer_tensor_any(i, {"ssm_alpha.weight", "linear_attn.in_proj_a.weight"}));
             model->layers[i].Set(model_keys::kSSMBeta,
@@ -1133,6 +1133,11 @@ TransformerModel* LoadGGUFModel(const char* path) {
         if (!layer.Get(model_keys::kFfnDown)) {
             layer.Set(model_keys::kFfnDown, find_layer_tensor_with_tokens(layer, {"shared_experts", "down_proj"}));
         }
+        if (!layer.Get(model_keys::kFfnSharedGate)) {
+            auto* t = find_layer_tensor_with_tokens(layer, {"shared_expert_gate"});
+            if (!t) t = find_layer_tensor_with_tokens(layer, {"ffn_gate_inp_shexp"});
+            layer.Set(model_keys::kFfnSharedGate, t);
+        }
         if (!layer.Get(model_keys::kMoeGate)) {
             auto* t = find_layer_tensor_with_tokens(layer, {"mlp", "gate.weight"}, {"shared"});
             if (!t) t = find_layer_tensor_with_tokens(layer, {"ffn_gate_inp"}, {"shexp"});
@@ -1165,20 +1170,20 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 struct ggml_context* vctx = model->ctx_views ? model->ctx_views : model->ctx_w;
                 for (int expert_idx = 0; expert_idx < expert_count; ++expert_idx) {
                     const size_t gate_up_offset = static_cast<size_t>(expert_idx) * packed_gate_up->nb[2];
-                    struct ggml_tensor* gate_up_slice = ggml_view_2d(
-                        vctx, const_cast<struct ggml_tensor*>(packed_gate_up), packed_gate_up->ne[0],
-                        packed_gate_up->ne[1], packed_gate_up->nb[1], gate_up_offset);
+                    struct ggml_tensor* gate_up_slice =
+                        ggml_view_2d(vctx, const_cast<struct ggml_tensor*>(packed_gate_up), packed_gate_up->ne[0],
+                                     packed_gate_up->ne[1], packed_gate_up->nb[1], gate_up_offset);
 
                     const int64_t gate_up_rows = gate_up_slice->ne[1];
                     if (gate_up_rows < 2 || (gate_up_rows % 2) != 0) {
                         continue;
                     }
                     const int64_t intermediate = gate_up_rows / 2;
-                    struct ggml_tensor* gate_w = ggml_view_2d(vctx, gate_up_slice, gate_up_slice->ne[0],
-                                                              intermediate, gate_up_slice->nb[1], 0);
+                    struct ggml_tensor* gate_w =
+                        ggml_view_2d(vctx, gate_up_slice, gate_up_slice->ne[0], intermediate, gate_up_slice->nb[1], 0);
                     struct ggml_tensor* up_w =
-                        ggml_view_2d(vctx, gate_up_slice, gate_up_slice->ne[0], intermediate,
-                                     gate_up_slice->nb[1], static_cast<size_t>(intermediate) * gate_up_slice->nb[1]);
+                        ggml_view_2d(vctx, gate_up_slice, gate_up_slice->ne[0], intermediate, gate_up_slice->nb[1],
+                                     static_cast<size_t>(intermediate) * gate_up_slice->nb[1]);
                     const size_t down_offset = static_cast<size_t>(expert_idx) * packed_down->nb[2];
                     struct ggml_tensor* down_w =
                         ggml_view_2d(vctx, const_cast<struct ggml_tensor*>(packed_down), packed_down->ne[0],
@@ -1215,32 +1220,29 @@ TransformerModel* LoadGGUFModel(const char* path) {
         // (used by qwen35moe bartowski GGUFs — experts stacked along ne[2] axis)
         if (layer.NumExperts() == 0 && layer.Get(model_keys::kMoeGate)) {
             const struct ggml_tensor* sep_gate = find_layer_tensor_with_tokens(layer, {"ffn_gate_exps"});
-            const struct ggml_tensor* sep_up   = find_layer_tensor_with_tokens(layer, {"ffn_up_exps"});
-            const struct ggml_tensor* sep_down  = find_layer_tensor_with_tokens(layer, {"ffn_down_exps"});
+            const struct ggml_tensor* sep_up = find_layer_tensor_with_tokens(layer, {"ffn_up_exps"});
+            const struct ggml_tensor* sep_down = find_layer_tensor_with_tokens(layer, {"ffn_down_exps"});
             if (sep_gate && sep_up && sep_down) {
-                int n_exp = (sep_gate->ne[2] > 1) ? static_cast<int>(sep_gate->ne[2])
-                          : (sep_gate->ne[3] > 0) ? static_cast<int>(sep_gate->ne[3]) : 0;
+                int n_exp = (sep_gate->ne[2] > 1)   ? static_cast<int>(sep_gate->ne[2])
+                            : (sep_gate->ne[3] > 0) ? static_cast<int>(sep_gate->ne[3])
+                                                    : 0;
                 if (model->hparams.n_experts == 0 && n_exp > 0) {
                     model->hparams.n_experts = static_cast<uint32_t>(n_exp);
                 }
                 int expert_count = std::min<int>(n_exp, static_cast<int>(model->hparams.n_experts));
-                if (expert_count > 0 &&
-                    i >= static_cast<uint32_t>(std::max(0, model->moe_first_k_dense_replace))) {
+                if (expert_count > 0 && i >= static_cast<uint32_t>(std::max(0, model->moe_first_k_dense_replace))) {
                     layer.is_moe = true;
                     struct ggml_context* vctx2 = model->ctx_views ? model->ctx_views : model->ctx_w;
                     for (int ei = 0; ei < expert_count; ++ei) {
                         const size_t g_off = static_cast<size_t>(ei) * sep_gate->nb[2];
                         const size_t u_off = static_cast<size_t>(ei) * sep_up->nb[2];
                         const size_t d_off = static_cast<size_t>(ei) * sep_down->nb[2];
-                        struct ggml_tensor* gw = ggml_view_2d(vctx2,
-                            const_cast<struct ggml_tensor*>(sep_gate),
-                            sep_gate->ne[0], sep_gate->ne[1], sep_gate->nb[1], g_off);
-                        struct ggml_tensor* uw = ggml_view_2d(vctx2,
-                            const_cast<struct ggml_tensor*>(sep_up),
-                            sep_up->ne[0], sep_up->ne[1], sep_up->nb[1], u_off);
-                        struct ggml_tensor* dw = ggml_view_2d(vctx2,
-                            const_cast<struct ggml_tensor*>(sep_down),
-                            sep_down->ne[0], sep_down->ne[1], sep_down->nb[1], d_off);
+                        struct ggml_tensor* gw = ggml_view_2d(vctx2, const_cast<struct ggml_tensor*>(sep_gate),
+                                                              sep_gate->ne[0], sep_gate->ne[1], sep_gate->nb[1], g_off);
+                        struct ggml_tensor* uw = ggml_view_2d(vctx2, const_cast<struct ggml_tensor*>(sep_up),
+                                                              sep_up->ne[0], sep_up->ne[1], sep_up->nb[1], u_off);
+                        struct ggml_tensor* dw = ggml_view_2d(vctx2, const_cast<struct ggml_tensor*>(sep_down),
+                                                              sep_down->ne[0], sep_down->ne[1], sep_down->nb[1], d_off);
                         layer.SetExpert(static_cast<size_t>(ei), model_keys::kFfnGate, gw);
                         layer.SetExpert(static_cast<size_t>(ei), model_keys::kFfnUp, uw);
                         layer.SetExpert(static_cast<size_t>(ei), model_keys::kFfnDown, dw);
@@ -1304,7 +1306,6 @@ TransformerModel* LoadGGUFModel(const char* path) {
         if (!layer.Get(model_keys::kAttnKNorm)) {
             layer.Set(model_keys::kAttnKNorm, find_layer_tensor_with_tokens(layer, {"k_norm"}, {"indexer"}));
         }
-
     }
 
     // Detect shared experts from tensor presence when moe_n_shared_experts was not in metadata.
@@ -1540,9 +1541,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
                               << " alpha=" << state.alpha_f32.size() << " beta=" << state.beta_f32.size()
                               << " dt_bias=" << state.dt_bias_f32.size() << " A_log=" << state.a_log_f32.size()
                               << " norm=" << state.norm_f32.size() << " norm_semantics="
-                              << (state.norm_layout == Qwen35SSMNormLayout::SHARED_HEAD_DIM ? "shared_head_dim"
+                              << (state.norm_layout == Qwen35SSMNormLayout::SHARED_HEAD_DIM     ? "shared_head_dim"
                                   : state.norm_layout == Qwen35SSMNormLayout::FLATTENED_D_INNER ? "flattened_d_inner"
-                                                                                                  : "invalid")
+                                                                                                : "invalid")
                               << std::endl;
                 }
             }

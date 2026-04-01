@@ -254,7 +254,8 @@ std::string DetokenizeImpl(const TransformerModel* model, int token_id) {
 
     const std::string& token = model->vocab_tokens[static_cast<size_t>(token_id)];
 
-    if (token_id < static_cast<int>(model->token_types.size()) && model->token_types[static_cast<size_t>(token_id)] == 3) {
+    if (token_id < static_cast<int>(model->token_types.size()) &&
+        model->token_types[static_cast<size_t>(token_id)] == 3) {
         return "";
     }
     if (IsLikelyControlTokenLiteral(token)) {

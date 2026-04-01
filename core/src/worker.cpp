@@ -155,8 +155,8 @@ void ValidateMulNodesOrThrow(struct ggml_cgraph* graph, const char* stage) {
             std::cerr << "  dst:  " << TensorDebugSummary(node) << std::endl;
             std::cerr << "  src0: " << TensorDebugSummary(src0) << std::endl;
             std::cerr << "  src1: " << TensorDebugSummary(src1) << std::endl;
-            throw densecore::InvalidArgumentException("GGML MUL graph validation failed at node " +
-                                                      std::to_string(i) + " (" + issue + ")");
+            throw densecore::InvalidArgumentException("GGML MUL graph validation failed at node " + std::to_string(i) +
+                                                      " (" + issue + ")");
         }
     }
 }
@@ -466,7 +466,8 @@ void EngineLoop(EngineState* state) {
                 return;
             }
 
-            state->metrics.active_requests.fetch_sub(static_cast<int>(finished_requests.size()), std::memory_order_relaxed);
+            state->metrics.active_requests.fetch_sub(static_cast<int>(finished_requests.size()),
+                                                     std::memory_order_relaxed);
             for (Request* req : finished_requests) {
                 state->request_pool.Release(req);
             }
@@ -733,11 +734,11 @@ void EngineLoop(EngineState* state) {
                     EnsureRequestHybridSSMRuntimeState(current_model, req);
 
                     // Register with scheduler (blocks allocated by scheduler)
-                    int seq_id = state->scheduler->AddRequest(
-                        req->id, req->tokens.size(), req->max_tokens, req->priority, &req->tokens,
-                        /*allow_chunked_prefill=*/!req->is_embedding,
-                        /*require_hybrid_ssm_prefix_snapshot=*/current_model &&
-                            current_model->arch_flags.is_hybrid_ssm);
+                    int seq_id = state->scheduler->AddRequest(req->id, req->tokens.size(), req->max_tokens,
+                                                              req->priority, &req->tokens,
+                                                              /*allow_chunked_prefill=*/!req->is_embedding,
+                                                              /*require_hybrid_ssm_prefix_snapshot=*/current_model &&
+                                                                  current_model->arch_flags.is_hybrid_ssm);
 
                     if (seq_id < 0) {
                         // Scheduler rejected (e.g., queue full or impossible non-chunked prefill)
@@ -825,7 +826,8 @@ void EngineLoop(EngineState* state) {
                 std::vector<std::pair<int, int>> updates;
                 updates.reserve(requests.size());
                 for (Request* request : requests) {
-                    if (!request || request->seq_id < 0 || request->pending_scheduler_progress <= 0 || request->finished) {
+                    if (!request || request->seq_id < 0 || request->pending_scheduler_progress <= 0 ||
+                        request->finished) {
                         continue;
                     }
                     updates.emplace_back(request->seq_id, request->pending_scheduler_progress);
@@ -845,7 +847,8 @@ void EngineLoop(EngineState* state) {
                     }
                 }
 
-                const auto sched_stats = state->scheduler ? state->scheduler->GetStats() : densecore::Scheduler::Stats{};
+                const auto sched_stats =
+                    state->scheduler ? state->scheduler->GetStats() : densecore::Scheduler::Stats{};
                 const bool scheduler_single_tenant =
                     !state->scheduler || (sched_stats.waiting_count == 0 && sched_stats.swapped_count == 0 &&
                                           sched_stats.running_count <= 1);
@@ -947,7 +950,8 @@ void EngineLoop(EngineState* state) {
                                     expected_conv, current_model->ssm_conv_kernel);
                             const size_t expected_ssm_elems =
                                 TransformerModel::SSMSequenceRuntimeState::ExpectedStateElements(
-                                    current_model->ssm_time_step_rank, expected_head_dim, current_model->ssm_state_size);
+                                    current_model->ssm_time_step_rank, expected_head_dim,
+                                    current_model->ssm_state_size);
                             auto snapshot_shape_ok =
                                 [&](const std::vector<TransformerModel::SSMSequenceRuntimeState>& states) {
                                     if (hit.cached_tokens <= 0 || hit.cached_tokens % BLOCK_SIZE != 0) {
@@ -976,8 +980,8 @@ void EngineLoop(EngineState* state) {
                                 DebugLogHybridSSMSnapshot("restore_after", req->id, hit.cached_tokens, snapshot_block,
                                                           req->ssm_runtime_states);
                             } else if (!snapshot.empty()) {
-                                LOG_WARN("Discarding hybrid SSM snapshot for req {}: shape mismatch on block {}", req->id,
-                                         snapshot_block);
+                                LOG_WARN("Discarding hybrid SSM snapshot for req {}: shape mismatch on block {}",
+                                         req->id, snapshot_block);
                             } else if (IsHybridSSMSnapshotDebugEnabled()) {
                                 std::cerr << "[HybridSSMSnapshot] restore_miss req=" << req->id
                                           << " cached_tokens=" << hit.cached_tokens << " block_id=" << snapshot_block
@@ -1091,13 +1095,14 @@ void EngineLoop(EngineState* state) {
                             continue;
                         }
                         has_active = true;
-                        const auto last_progress =
-                            (req->last_progress_time == std::chrono::steady_clock::time_point()) ? req->start_time
-                                                                                                  : req->last_progress_time;
+                        const auto last_progress = (req->last_progress_time == std::chrono::steady_clock::time_point())
+                                                       ? req->start_time
+                                                       : req->last_progress_time;
                         const long idle_ms =
                             std::chrono::duration_cast<std::chrono::milliseconds>(now - last_progress).count();
                         oldest_idle_ms = std::max(oldest_idle_ms, idle_ms);
-                        if (idle_ms < std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleWarnAfter).count()) {
+                        if (idle_ms <
+                            std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleWarnAfter).count()) {
                             continue;
                         }
                         req->empty_schedule_stall_count++;
@@ -1118,8 +1123,8 @@ void EngineLoop(EngineState* state) {
                         stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(watchdog.last_seen -
                                                                                          watchdog.first_seen)
                                        .count();
-                        if (stall_ms >= std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleFailAfter)
-                                            .count()) {
+                        if (stall_ms >=
+                            std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleFailAfter).count()) {
                             should_fail = true;
                             watchdog.failure_count++;
                             watchdog.last_log = now;
@@ -1139,22 +1144,23 @@ void EngineLoop(EngineState* state) {
                         const std::string scheduler_state = state->DescribeSchedulerState();
                         const std::string active_state = state->DescribeActiveRequests();
                         if (should_fail) {
-                            LOG_ERROR("Broken scheduling state detected after {} ms (loops={}, oldest_idle_ms={}). {} {}",
-                                      stall_ms, watchdog_loops, oldest_idle_ms, scheduler_state, active_state);
+                            LOG_ERROR(
+                                "Broken scheduling state detected after {} ms (loops={}, oldest_idle_ms={}). {} {}",
+                                stall_ms, watchdog_loops, oldest_idle_ms, scheduler_state, active_state);
                             for (Request* req : stalled_requests) {
                                 if (!req || req->finished) {
                                     continue;
                                 }
                                 const auto last_progress =
-                                    (req->last_progress_time == std::chrono::steady_clock::time_point()) ? req->start_time
-                                                                                                          : req->last_progress_time;
+                                    (req->last_progress_time == std::chrono::steady_clock::time_point())
+                                        ? req->start_time
+                                        : req->last_progress_time;
                                 const long idle_ms =
                                     std::chrono::duration_cast<std::chrono::milliseconds>(now - last_progress).count();
-                                LOG_ERROR(
-                                    "Failing stalled request {} (seq_id={}, prefill={}, tokens={}, n_past={}, "
-                                    "generated={}, empty_loops={}, idle_ms={})",
-                                    req->id, req->seq_id, req->is_prefill, req->tokens.size(), req->n_past,
-                                    req->generated_count, req->empty_schedule_stall_count, idle_ms);
+                                LOG_ERROR("Failing stalled request {} (seq_id={}, prefill={}, tokens={}, n_past={}, "
+                                          "generated={}, empty_loops={}, idle_ms={})",
+                                          req->id, req->seq_id, req->is_prefill, req->tokens.size(), req->n_past,
+                                          req->generated_count, req->empty_schedule_stall_count, idle_ms);
                                 req->finished = true;
                                 state->metrics.failed_requests++;
                                 emit_result_event(req, "Error: Scheduler stalled while request remained active", -1,
@@ -1175,10 +1181,9 @@ void EngineLoop(EngineState* state) {
                             std::lock_guard<std::mutex> cv_lock(state->cv_mu);
                             state->queue_cv.notify_one();
                         } else {
-                            LOG_WARN(
-                                "Scheduler returned empty batch with stalled active requests for {} ms (loops={}, "
-                                "oldest_idle_ms={}). {} {}",
-                                stall_ms, watchdog_loops, oldest_idle_ms, scheduler_state, active_state);
+                            LOG_WARN("Scheduler returned empty batch with stalled active requests for {} ms (loops={}, "
+                                     "oldest_idle_ms={}). {} {}",
+                                     stall_ms, watchdog_loops, oldest_idle_ms, scheduler_state, active_state);
                         }
                     }
 
@@ -1650,9 +1655,10 @@ void EngineLoop(EngineState* state) {
             };
             const int prefill_graph_cache_lru_size =
                 std::max(1, parse_prefill_graph_cache_int("DENSECORE_PREFILL_GRAPH_CACHE_LRU", 16));
-            const size_t prefill_graph_cache_max_bytes = static_cast<size_t>(
-                std::max(128, parse_prefill_graph_cache_int("DENSECORE_PREFILL_GRAPH_CACHE_MAX_MB", 1024))) *
-                                                        1024ULL * 1024ULL;
+            const size_t prefill_graph_cache_max_bytes =
+                static_cast<size_t>(
+                    std::max(128, parse_prefill_graph_cache_int("DENSECORE_PREFILL_GRAPH_CACHE_MAX_MB", 1024))) *
+                1024ULL * 1024ULL;
             const bool prefill_graph_cache_active =
                 parse_prefill_graph_cache_bool("DENSECORE_PREFILL_GRAPH_CACHE", true) && current_kv_cache != nullptr &&
                 prefill_graph_cache_lru_size > 0;
@@ -1723,9 +1729,8 @@ void EngineLoop(EngineState* state) {
                 decode_reuse_candidate &&
                 decode_graph_uncacheable.find(decode_graph_key) != decode_graph_uncacheable.end();
             const bool decode_reuse_attempt_allowed = decode_reuse_candidate && !decode_key_marked_uncacheable;
-            const bool prefill_graph_entry_cacheable =
-                prefill_graph_cache_active && prefill_graph_ctx_bytes > 0 &&
-                prefill_graph_ctx_bytes <= prefill_graph_cache_max_bytes;
+            const bool prefill_graph_entry_cacheable = prefill_graph_cache_active && prefill_graph_ctx_bytes > 0 &&
+                                                       prefill_graph_ctx_bytes <= prefill_graph_cache_max_bytes;
             const bool prefill_reuse_shape_eligible =
                 prefill_graph_cache_active && is_prefill_batch && !is_embedding_batch && cpu_backend_active &&
                 current_model && current_model->hparams.n_experts == 0 && !current_model->arch_flags.is_hybrid_ssm &&
@@ -1860,7 +1865,7 @@ void EngineLoop(EngineState* state) {
                                     using_cached_decode_graph = true;
                                     if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
                                         GetDecodeWorkerStats().graph_cache_builds.fetch_add(1,
-                                                                                           std::memory_order_relaxed);
+                                                                                            std::memory_order_relaxed);
                                     }
                                 }
                             }
@@ -1878,10 +1883,9 @@ void EngineLoop(EngineState* state) {
                         prefill_graph_lru.pop_back();
                         auto evict_it = prefill_graph_cache.find(evict_key);
                         if (evict_it != prefill_graph_cache.end()) {
-                            prefill_graph_cache_bytes =
-                                (prefill_graph_cache_bytes > evict_it->second.ctx_bytes)
-                                    ? (prefill_graph_cache_bytes - evict_it->second.ctx_bytes)
-                                    : 0;
+                            prefill_graph_cache_bytes = (prefill_graph_cache_bytes > evict_it->second.ctx_bytes)
+                                                            ? (prefill_graph_cache_bytes - evict_it->second.ctx_bytes)
+                                                            : 0;
                             if (evict_it->second.ctx) {
                                 ggml_free(evict_it->second.ctx);
                                 evict_it->second.ctx = nullptr;
@@ -1912,9 +1916,10 @@ void EngineLoop(EngineState* state) {
                                                                      &candidate.embd_inp, &candidate.pos);
                             graph_build_end = std::chrono::steady_clock::now();
                             if (candidate.output && candidate.embd_inp && candidate.pos) {
-                                while (!prefill_graph_lru.empty() &&
-                                       (prefill_graph_cache.size() >= static_cast<size_t>(prefill_graph_cache_lru_size) ||
-                                        prefill_graph_cache_bytes + candidate.ctx_bytes > prefill_graph_cache_max_bytes)) {
+                                while (
+                                    !prefill_graph_lru.empty() &&
+                                    (prefill_graph_cache.size() >= static_cast<size_t>(prefill_graph_cache_lru_size) ||
+                                     prefill_graph_cache_bytes + candidate.ctx_bytes > prefill_graph_cache_max_bytes)) {
                                     const PrefillGraphCacheKey budget_evict_key = prefill_graph_lru.back();
                                     prefill_graph_lru.pop_back();
                                     auto budget_evict_it = prefill_graph_cache.find(budget_evict_key);
@@ -2686,8 +2691,8 @@ void EngineLoop(EngineState* state) {
                         // Register any newly completed full blocks immediately after
                         // this prefill chunk so prefix reuse can restore the exact
                         // hybrid SSM boundary state for the latest completed block.
-                        if (prefix_cache_allowed && !req->prompt_tokens_for_cache.empty() && !req->block_table.empty() &&
-                            req->n_past > 0) {
+                        if (prefix_cache_allowed && !req->prompt_tokens_for_cache.empty() &&
+                            !req->block_table.empty() && req->n_past > 0) {
                             const int* tokens_ptr = req->prompt_tokens_for_cache.data();
                             int total_tokens = static_cast<int>(req->prompt_tokens_for_cache.size());
                             const int completed_blocks =
@@ -2702,9 +2707,9 @@ void EngineLoop(EngineState* state) {
                                 }
 
                                 uint64_t hash = BlockManager::ComputeTokenHash(tokens_ptr + start_token, block_tokens);
-                                const bool attach_hybrid_snapshot =
-                                    current_model && current_model->arch_flags.is_hybrid_ssm &&
-                                    ((blk_idx + 1) * BLOCK_SIZE == req->n_past);
+                                const bool attach_hybrid_snapshot = current_model &&
+                                                                    current_model->arch_flags.is_hybrid_ssm &&
+                                                                    ((blk_idx + 1) * BLOCK_SIZE == req->n_past);
                                 if (attach_hybrid_snapshot) {
                                     DebugLogHybridSSMSnapshot("save", req->id, req->n_past, block_id,
                                                               req->ssm_runtime_states);
@@ -2773,7 +2778,8 @@ void EngineLoop(EngineState* state) {
                                     token_str = std::move(token_piece);
                                 } else if (emit_len > 0) {
                                     token_str.assign(token_piece.data(), emit_len);
-                                    req->utf8_pending.assign(token_piece.data() + emit_len, token_piece.size() - emit_len);
+                                    req->utf8_pending.assign(token_piece.data() + emit_len,
+                                                             token_piece.size() - emit_len);
                                 } else {
                                     req->utf8_pending = std::move(token_piece);
                                 }
@@ -2793,18 +2799,17 @@ void EngineLoop(EngineState* state) {
                     // DENSECORE_SUPPRESS_REASONING_TAGS=0.
                     if (!req_bench_fast_path && !req->json_mode && !token_str.empty() &&
                         IsReasoningTagSuppressionEnabled()) {
-                        const bool may_contain_tag = req->in_think_block || req->in_tool_call_block ||
-                                                     req->in_tool_response_block || !req->think_tag_pending.empty() ||
-                                                     !req->tool_call_tag_pending.empty() ||
-                                                     !req->tool_response_tag_pending.empty() ||
-                                                     token_str.find('<') != std::string::npos;
+                        const bool may_contain_tag =
+                            req->in_think_block || req->in_tool_call_block || req->in_tool_response_block ||
+                            !req->think_tag_pending.empty() || !req->tool_call_tag_pending.empty() ||
+                            !req->tool_response_tag_pending.empty() || token_str.find('<') != std::string::npos;
                         if (may_contain_tag) {
                             SuppressTaggedBlock(&token_str, &req->in_think_block, &req->think_tag_pending, "<think>",
                                                 "</think>");
                             SuppressTaggedBlock(&token_str, &req->in_tool_call_block, &req->tool_call_tag_pending,
                                                 "<tool_call>", "</tool_call>");
-                            SuppressTaggedBlock(&token_str, &req->in_tool_response_block, &req->tool_response_tag_pending,
-                                                "<tool_response>", "</tool_response>");
+                            SuppressTaggedBlock(&token_str, &req->in_tool_response_block,
+                                                &req->tool_response_tag_pending, "<tool_response>", "</tool_response>");
                         }
                     }
 

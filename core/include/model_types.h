@@ -167,6 +167,7 @@ static constexpr const char* kFfnNorm = "ffn_norm.weight";
 static constexpr const char* kFfnGate = "ffn_gate.weight";
 static constexpr const char* kFfnUp = "ffn_up.weight";
 static constexpr const char* kFfnDown = "ffn_down.weight";
+static constexpr const char* kFfnSharedGate = "ffn_shared_gate.weight";
 static constexpr const char* kMoeGate = "moe_gate.weight";
 static constexpr const char* kMoeCorrectionBias = "moe_e_score_correction_bias";
 static constexpr const char* kAttnQkvWeight = "attn_qkv.weight";
@@ -410,11 +411,11 @@ struct TransformerModel {
     std::vector<TransformerLayer> layers;
 
     // Context & Backend
-    struct ggml_context* ctx_w = nullptr;    // weight context
-    struct ggml_context* ctx_views = nullptr; // view tensor metadata (expert slices, etc.)
-    ggml_backend_t backend = nullptr;        // active compute backend
-    ggml_backend_t cpu_backend = nullptr;    // CPU backend (always available)
-    ggml_backend_t metal_backend = nullptr;  // Metal backend (Apple Silicon only)
+    struct ggml_context* ctx_w = nullptr;      // weight context
+    struct ggml_context* ctx_views = nullptr;  // view tensor metadata (expert slices, etc.)
+    ggml_backend_t backend = nullptr;          // active compute backend
+    ggml_backend_t cpu_backend = nullptr;      // CPU backend (always available)
+    ggml_backend_t metal_backend = nullptr;    // Metal backend (Apple Silicon only)
     // Mock flag
     bool is_mock = false;
     // Tied embeddings flag (output = tok_embeddings)

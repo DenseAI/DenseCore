@@ -223,9 +223,12 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
     }
 
     const char* type_name = "F32";
-    if (type == GGML_TYPE_F16) type_name = "F16";
-    else if (type == GGML_TYPE_Q8_0) type_name = "Q8_0 (INT8)";
-    else if (type == GGML_TYPE_Q4_0) type_name = "Q4_0 (INT4)";
+    if (type == GGML_TYPE_F16)
+        type_name = "F16";
+    else if (type == GGML_TYPE_Q8_0)
+        type_name = "Q8_0 (INT8)";
+    else if (type == GGML_TYPE_Q4_0)
+        type_name = "Q4_0 (INT4)";
 
     std::cout << "[KVCache] Initialized PagedKVCache (Block Allocator):" << std::endl;
     std::cout << "  - max_blocks: " << cache->max_blocks << std::endl;

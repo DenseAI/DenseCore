@@ -186,32 +186,27 @@ inline bool IsMoENextExpertPrefetchEnabled() {
 }
 
 inline int GetMoELocalityOrderingMinActiveExperts() {
-    static const int value =
-        ParseCpuBackendEnvInt("DENSECORE_MOE_LOCALITY_ORDERING_MIN_ACTIVE_EXPERTS", 3, 2);
+    static const int value = ParseCpuBackendEnvInt("DENSECORE_MOE_LOCALITY_ORDERING_MIN_ACTIVE_EXPERTS", 3, 2);
     return value;
 }
 
 inline int GetMoELocalityOrderingMinReuseIntersection() {
-    static const int value =
-        ParseCpuBackendEnvInt("DENSECORE_MOE_LOCALITY_ORDERING_MIN_REUSE_INTERSECTION", 1, 0);
+    static const int value = ParseCpuBackendEnvInt("DENSECORE_MOE_LOCALITY_ORDERING_MIN_REUSE_INTERSECTION", 1, 0);
     return value;
 }
 
 inline int GetMoEPrefetchMinCurrentExpertTokens() {
-    static const int value =
-        ParseCpuBackendEnvInt("DENSECORE_MOE_PREFETCH_MIN_CURRENT_EXPERT_TOKENS", 2, 1);
+    static const int value = ParseCpuBackendEnvInt("DENSECORE_MOE_PREFETCH_MIN_CURRENT_EXPERT_TOKENS", 2, 1);
     return value;
 }
 
 inline int GetMoEPrefetchMaxActiveExperts() {
-    static const int value =
-        ParseCpuBackendEnvInt("DENSECORE_MOE_PREFETCH_MAX_ACTIVE_EXPERTS", 8, 1);
+    static const int value = ParseCpuBackendEnvInt("DENSECORE_MOE_PREFETCH_MAX_ACTIVE_EXPERTS", 8, 1);
     return value;
 }
 
 inline int GetMoEPrefetchMaxThreadCount() {
-    static const int value =
-        ParseCpuBackendEnvInt("DENSECORE_MOE_PREFETCH_MAX_THREAD_COUNT", 32, 1);
+    static const int value = ParseCpuBackendEnvInt("DENSECORE_MOE_PREFETCH_MAX_THREAD_COUNT", 32, 1);
     return value;
 }
 
