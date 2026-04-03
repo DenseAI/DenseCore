@@ -58,6 +58,8 @@ struct ModelArchFlags {
     bool is_hybrid_ssm = false;    // Qwen3.5: Mamba2 SSM + Attention hybrid
     bool is_glm_moe = false;       // GLM-4.5/5: grouped MoE routing + shared experts
     bool is_glm_dsa = false;       // GLM-5: MLA + DSA attention path
+    bool is_gemma4 = false;        // Gemma4: alternate KV-head metadata and MoE routing
+    bool uses_unit_offset_rms_norm = false;  // Gemma1/2-style RMSNorm uses (1 + weight)
 };
 
 // Forward declaration for RoPE table (defined in simd_ops.h)
@@ -183,6 +185,10 @@ static constexpr const char* kSSMNorm = "ssm_norm.weight";
 static constexpr const char* kSSMOut = "ssm_out.weight";
 static constexpr const char* kAttnGate = "attn_gate.weight";
 static constexpr const char* kPostAttnNorm = "post_attention_norm.weight";
+static constexpr const char* kGemma4PerLayerInputGate = "gemma4.per_layer_input_gate.weight";
+static constexpr const char* kGemma4PerLayerProjection = "gemma4.per_layer_projection.weight";
+static constexpr const char* kGemma4PostPerLayerInputNorm = "gemma4.post_per_layer_input_norm.weight";
+static constexpr const char* kGemma4LayerOutputScale = "gemma4.layer_output_scale.weight";
 }  // namespace model_keys
 
 // ============================================================================
@@ -436,6 +442,30 @@ struct TransformerModel {
     // Optional per-layer hybrid mask from GGUF metadata (1 = SSM/linear attention, 0 = full attention).
     // When absent, runtime falls back to the legacy modulo-based interval rule.
     std::vector<uint8_t> hybrid_layer_is_ssm;
+
+    // Gemma4 encodes per-layer KV-head counts in GGUF metadata.
+    // The runtime uses this when present to derive layer-local attention head
+    // shapes instead of collapsing everything to a single global scalar.
+    std::vector<uint32_t> gemma4_layer_n_head_kv;
+    std::vector<uint8_t> gemma4_layer_is_sliding;
+    std::vector<int32_t> gemma4_layer_kv_source;
+    int gemma4_sliding_window = -1;
+    int gemma4_n_shared_kv_layers = 0;
+    int gemma4_hidden_size_per_layer_input = 0;
+    float gemma4_attention_logit_softcapping = 50.0f;
+    float gemma4_final_logit_softcapping = 0.0f;
+    float gemma4_full_attention_partial_rotary_factor = 0.25f;
+    uint32_t gemma4_key_length_full = 0;
+    uint32_t gemma4_value_length_full = 0;
+    uint32_t gemma4_key_length_swa = 0;
+    uint32_t gemma4_value_length_swa = 0;
+    float gemma4_rope_freq_base_full = 0.0f;
+    float gemma4_rope_freq_base_swa = 0.0f;
+    int gemma4_rope_dim_full = 0;
+    int gemma4_rope_dim_swa = 0;
+    struct ggml_tensor* gemma4_per_layer_model_projection = nullptr;
+    struct ggml_tensor* gemma4_per_layer_projection_norm = nullptr;
+    struct ggml_tensor* gemma4_per_layer_token_embeddings = nullptr;
 
     // MoE routing parameters (GLM-4.5 / GLM-5 and similar)
     int moe_n_shared_experts = 0;

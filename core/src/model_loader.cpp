@@ -31,6 +31,15 @@
 #include "dtype_utils.h"
 #include "qwen35_ssm_math.h"
 
+namespace {
+constexpr const char* kGemma4RouterScaleKey = "gemma4.router.scale";
+constexpr const char* kGemma4RouterPerExpertScaleKey = "gemma4.router.per_expert_scale";
+constexpr const char* kGemma4PreMoeNormKey = "gemma4.pre_feedforward_layernorm_2.weight";
+constexpr const char* kGemma4PostSharedNormKey = "gemma4.post_feedforward_layernorm_1.weight";
+constexpr const char* kGemma4PostMoeNormKey = "gemma4.post_feedforward_layernorm_2.weight";
+constexpr const char* kGemma4PostFfnNormKey = "gemma4.post_feedforward_layernorm.weight";
+}  // namespace
+
 // ============================================================================
 // Mock Model (Test Build Only)
 // ============================================================================
@@ -218,8 +227,15 @@ TransformerModel* LoadGGUFModel(const char* path) {
         model->arch_flags.is_glm_dsa = true;
     } else if (arch_lower == "mistral") {
         model->arch = ModelArch::MISTRAL;
-    } else if (arch_lower == "gemma" || arch_lower == "gemma2") {
+    } else if (arch_lower == "gemma" || arch_lower == "gemma2" || arch_lower == "gemma4" ||
+               arch_lower == "gemma4_text") {
         model->arch = ModelArch::GEMMA;
+        model->arch_flags.is_gemma4 = (arch_lower == "gemma4" || arch_lower == "gemma4_text");
+        model->arch_flags.uses_unit_offset_rms_norm = !model->arch_flags.is_gemma4;
+        if (model->arch_flags.is_gemma4) {
+            model->arch_flags.requires_q_norm = true;
+            model->arch_flags.requires_k_norm = true;
+        }
     } else if (arch_lower == "phi" || arch_lower == "phi3") {
         model->arch = ModelArch::PHI;
         // Vision Architectures
@@ -268,10 +284,15 @@ TransformerModel* LoadGGUFModel(const char* path) {
     if (idx_chat_template != -1) {
         model->chat_template = gguf_get_val_str(ctx_gguf, idx_chat_template);
     }
+    const int gemma4_head_count_kv_idx = gguf_find_key(ctx_gguf, "gemma4.attention.head_count_kv");
+    const gguf_type gemma4_head_count_kv_type =
+        gemma4_head_count_kv_idx != -1 ? gguf_get_kv_type(ctx_gguf, gemma4_head_count_kv_idx) : GGUF_TYPE_UINT8;
+    const bool has_gemma4_kv_array = gemma4_head_count_kv_type == GGUF_TYPE_ARRAY;
 
     if (!tokenizer_type.empty()) {
-        const std::vector<std::string> supported = {"llama",   "gpt2",  "qwen2", "qwen3", "qwen35",
-                                                    "mistral", "gemma", "bpe",   "glm4",  "glm"};
+        const std::vector<std::string> supported = {"llama",   "gpt2",   "qwen2", "qwen3",  "qwen35",
+                                                    "mistral", "gemma",  "gemma4", "bpe",   "glm4",
+                                                    "glm"};
         if (std::find(supported.begin(), supported.end(), tokenizer_lower) == supported.end()) {
             std::cerr << "[DenseCore] Warning: tokenizer model '" << tokenizer_type
                       << "' may not be fully compatible. Consider using external tokenization and input_ids."
@@ -279,40 +300,66 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
     }
 
-    // 2. Generic parameter loader using architecture prefix
-    auto get_u32 = [&](const std::string& suffix, uint32_t& val) {
-        // Try architecture-specific key first, then fallback to general
+    auto find_prefixed_key = [&](const std::string& suffix) -> int {
         std::string key = arch + "." + suffix;
         int idx = gguf_find_key(ctx_gguf, key.c_str());
-        if (idx == -1) {
-            // Fallback to "general." prefix
-            key = "general." + suffix;
-            idx = gguf_find_key(ctx_gguf, key.c_str());
-        }
         if (idx != -1) {
+            return idx;
+        }
+        if (model->arch_flags.is_gemma4 && arch != "gemma4") {
+            key = "gemma4." + suffix;
+            idx = gguf_find_key(ctx_gguf, key.c_str());
+            if (idx != -1) {
+                return idx;
+            }
+        }
+        key = "general." + suffix;
+        return gguf_find_key(ctx_gguf, key.c_str());
+    };
+
+    // 2. Generic parameter loader using architecture prefix
+    auto get_u32 = [&](const std::string& suffix, uint32_t& val) {
+        const int idx = find_prefixed_key(suffix);
+        if (idx == -1) {
+            return;
+        }
+
+        const gguf_type type = gguf_get_kv_type(ctx_gguf, idx);
+        if (type == GGUF_TYPE_UINT32) {
             val = gguf_get_val_u32(ctx_gguf, idx);
+            return;
+        }
+        if (type == GGUF_TYPE_INT32) {
+            val = static_cast<uint32_t>(gguf_get_val_i32(ctx_gguf, idx));
+            return;
+        }
+        if (type == GGUF_TYPE_ARRAY) {
+            const int n = gguf_get_arr_n(ctx_gguf, idx);
+            const gguf_type arr_type = gguf_get_arr_type(ctx_gguf, idx);
+            const void* arr_data = gguf_get_arr_data(ctx_gguf, idx);
+            if (!arr_data || n <= 0) {
+                return;
+            }
+            if (arr_type == GGUF_TYPE_UINT32) {
+                val = static_cast<const uint32_t*>(arr_data)[0];
+                return;
+            }
+            if (arr_type == GGUF_TYPE_INT32) {
+                val = static_cast<uint32_t>(static_cast<const int32_t*>(arr_data)[0]);
+                return;
+            }
         }
     };
 
     auto get_f32 = [&](const std::string& suffix, float& val) {
-        std::string key = arch + "." + suffix;
-        int idx = gguf_find_key(ctx_gguf, key.c_str());
-        if (idx == -1) {
-            key = "general." + suffix;
-            idx = gguf_find_key(ctx_gguf, key.c_str());
-        }
+        const int idx = find_prefixed_key(suffix);
         if (idx != -1) {
             val = gguf_get_val_f32(ctx_gguf, idx);
         }
     };
 
     auto get_i32_arr4 = [&](const std::string& suffix, std::array<int32_t, 4>& vals) {
-        std::string key = arch + "." + suffix;
-        int idx = gguf_find_key(ctx_gguf, key.c_str());
-        if (idx == -1) {
-            key = "general." + suffix;
-            idx = gguf_find_key(ctx_gguf, key.c_str());
-        }
+        const int idx = find_prefixed_key(suffix);
         if (idx == -1) {
             return;
         }
@@ -332,24 +379,14 @@ TransformerModel* LoadGGUFModel(const char* path) {
     };
 
     auto get_bool = [&](const std::string& suffix, bool& val) {
-        std::string key = arch + "." + suffix;
-        int idx = gguf_find_key(ctx_gguf, key.c_str());
-        if (idx == -1) {
-            key = "general." + suffix;
-            idx = gguf_find_key(ctx_gguf, key.c_str());
-        }
+        const int idx = find_prefixed_key(suffix);
         if (idx != -1) {
             val = gguf_get_val_bool(ctx_gguf, idx);
         }
     };
 
     auto get_str_array = [&](const std::string& suffix, std::vector<std::string>& vals) {
-        std::string key = arch + "." + suffix;
-        int idx = gguf_find_key(ctx_gguf, key.c_str());
-        if (idx == -1) {
-            key = "general." + suffix;
-            idx = gguf_find_key(ctx_gguf, key.c_str());
-        }
+        const int idx = find_prefixed_key(suffix);
         if (idx == -1 || gguf_get_arr_type(ctx_gguf, idx) != GGUF_TYPE_STRING) {
             return;
         }
@@ -362,13 +399,31 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
     };
 
-    auto has_key = [&](const std::string& suffix) -> bool {
-        std::string key = arch + "." + suffix;
-        if (gguf_find_key(ctx_gguf, key.c_str()) != -1) {
-            return true;
+    auto get_u8_array = [&](const std::string& suffix, std::vector<uint8_t>& vals) {
+        const int idx = find_prefixed_key(suffix);
+        if (idx == -1 || gguf_get_kv_type(ctx_gguf, idx) != GGUF_TYPE_ARRAY) {
+            return;
         }
-        key = "general." + suffix;
-        return gguf_find_key(ctx_gguf, key.c_str()) != -1;
+        const gguf_type arr_type = gguf_get_arr_type(ctx_gguf, idx);
+        const int n = gguf_get_arr_n(ctx_gguf, idx);
+        const void* raw = gguf_get_arr_data(ctx_gguf, idx);
+        if (!raw || n <= 0 || (arr_type != GGUF_TYPE_UINT8 && arr_type != GGUF_TYPE_BOOL)) {
+            return;
+        }
+        vals.resize(static_cast<size_t>(n));
+        if (arr_type == GGUF_TYPE_UINT8) {
+            const auto* src = static_cast<const uint8_t*>(raw);
+            std::copy(src, src + n, vals.begin());
+        } else {
+            const auto* src = static_cast<const int8_t*>(raw);
+            for (int i = 0; i < n; ++i) {
+                vals[static_cast<size_t>(i)] = src[i] ? 1u : 0u;
+            }
+        }
+    };
+
+    auto has_key = [&](const std::string& suffix) -> bool {
+        return find_prefixed_key(suffix) != -1;
     };
 
     // Load hyperparameters using dynamic architecture prefix
@@ -380,10 +435,38 @@ TransformerModel* LoadGGUFModel(const char* path) {
     get_u32("context_length", model->hparams.n_ctx);
 
     if (model->hparams.n_head_kv == 0) model->hparams.n_head_kv = model->hparams.n_head;
+    model->gemma4_layer_n_head_kv.clear();
+    if (has_gemma4_kv_array) {
+        const int idx = gemma4_head_count_kv_idx;
+        const gguf_type arr_type = gguf_get_arr_type(ctx_gguf, idx);
+        if (idx != -1 && (arr_type == GGUF_TYPE_INT32 || arr_type == GGUF_TYPE_UINT32)) {
+            model->gemma4_layer_n_head_kv.assign(model->hparams.n_layer, model->hparams.n_head_kv);
+            const int n = gguf_get_arr_n(ctx_gguf, idx);
+            const void* raw = gguf_get_arr_data(ctx_gguf, idx);
+            if (raw && n > 0) {
+                const size_t limit = std::min<size_t>(model->gemma4_layer_n_head_kv.size(), static_cast<size_t>(n));
+                for (size_t i = 0; i < limit; ++i) {
+                    const uint32_t kv =
+                        arr_type == GGUF_TYPE_UINT32 ? static_cast<const uint32_t*>(raw)[i]
+                                                     : static_cast<uint32_t>(static_cast<const int32_t*>(raw)[i]);
+                    if (kv > 0) {
+                        model->gemma4_layer_n_head_kv[i] = kv;
+                    }
+                }
+            }
+        }
+    }
 
-    // llama.cpp style: Load head dimensions from GGUF
-    get_u32("attention.key_length", model->hparams.n_embd_head_k);
-    get_u32("attention.value_length", model->hparams.n_embd_head_v);
+    // llama.cpp style: Load head dimensions from GGUF.
+    //
+    // Gemma4 uses per-layer KV-head metadata and exposes key/value lengths
+    // that do not match the current runtime reshape path. Leave those at 0
+    // here so the later weight-shape inference can derive a consistent head
+    // dimension from the actual attention tensors.
+    if (!model->arch_flags.is_gemma4) {
+        get_u32("attention.key_length", model->hparams.n_embd_head_k);
+        get_u32("attention.value_length", model->hparams.n_embd_head_v);
+    }
 
     // Resolve n_rot (rotary embedding dimension).
     //
@@ -430,21 +513,112 @@ TransformerModel* LoadGGUFModel(const char* path) {
         std::cout << "[DenseCore] Defaulting hybrid-SSM MRoPE to interleaved mode" << std::endl;
     }
 
+    if (model->arch_flags.is_gemma4) {
+        model->gemma4_full_attention_partial_rotary_factor = 0.25f;
+        model->gemma4_rope_freq_base_full = model->hparams.rope_freq_base;
+        model->gemma4_rope_freq_base_swa = model->hparams.rope_freq_base;
+        model->gemma4_rope_dim_full = static_cast<int>(model->hparams.n_rot);
+        model->gemma4_rope_dim_swa = static_cast<int>(model->hparams.n_rot);
+        model->gemma4_key_length_full = 0;
+        model->gemma4_value_length_full = 0;
+        model->gemma4_key_length_swa = 0;
+        model->gemma4_value_length_swa = 0;
+
+        get_f32("rope.freq_base", model->gemma4_rope_freq_base_full);
+        get_f32("rope.freq_base_swa", model->gemma4_rope_freq_base_swa);
+
+        uint32_t tmp_u32 = static_cast<uint32_t>(model->gemma4_rope_dim_full);
+        get_u32("rope.dimension_count", tmp_u32);
+        model->gemma4_rope_dim_full = static_cast<int>(tmp_u32);
+        tmp_u32 = static_cast<uint32_t>(model->gemma4_rope_dim_swa > 0 ? model->gemma4_rope_dim_swa
+                                                                        : model->gemma4_rope_dim_full);
+        get_u32("rope.dimension_count_swa", tmp_u32);
+        model->gemma4_rope_dim_swa = static_cast<int>(tmp_u32);
+
+        get_u32("attention.key_length", model->gemma4_key_length_full);
+        get_u32("attention.value_length", model->gemma4_value_length_full);
+        model->gemma4_key_length_swa = model->gemma4_key_length_full;
+        model->gemma4_value_length_swa = model->gemma4_value_length_full;
+        get_u32("attention.key_length_swa", model->gemma4_key_length_swa);
+        get_u32("attention.value_length_swa", model->gemma4_value_length_swa);
+
+        tmp_u32 = 0;
+        get_u32("attention.sliding_window", tmp_u32);
+        model->gemma4_sliding_window = static_cast<int>(tmp_u32);
+
+        tmp_u32 = 0;
+        get_u32("attention.shared_kv_layers", tmp_u32);
+        model->gemma4_n_shared_kv_layers = static_cast<int>(tmp_u32);
+
+        tmp_u32 = 0;
+        get_u32("embedding_length_per_layer_input", tmp_u32);
+        model->gemma4_hidden_size_per_layer_input = static_cast<int>(tmp_u32);
+
+        get_f32("attention_logit_cap", model->gemma4_attention_logit_softcapping);
+        get_f32("final_logit_softcapping", model->gemma4_final_logit_softcapping);
+
+        std::vector<uint8_t> sliding_pattern;
+        get_u8_array("attention.sliding_window_pattern", sliding_pattern);
+        model->gemma4_layer_is_sliding.assign(model->hparams.n_layer, 0);
+        if (!sliding_pattern.empty()) {
+            const size_t limit = std::min(sliding_pattern.size(), static_cast<size_t>(model->hparams.n_layer));
+            for (size_t i = 0; i < limit; ++i) {
+                model->gemma4_layer_is_sliding[i] = sliding_pattern[i] != 0 ? 1 : 0;
+            }
+        } else {
+            std::vector<std::string> layer_types;
+            get_str_array("layer_types", layer_types);
+            if (!layer_types.empty()) {
+                const size_t limit = std::min(layer_types.size(), static_cast<size_t>(model->hparams.n_layer));
+                for (size_t i = 0; i < limit; ++i) {
+                    std::string type = layer_types[i];
+                    std::transform(type.begin(), type.end(), type.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    model->gemma4_layer_is_sliding[i] = (type == "sliding_attention") ? 1 : 0;
+                }
+            }
+        }
+
+        model->gemma4_layer_kv_source.assign(model->hparams.n_layer, -1);
+        const int first_shared_layer =
+            std::max(0, static_cast<int>(model->hparams.n_layer) - std::max(0, model->gemma4_n_shared_kv_layers));
+        int last_non_shared_sliding = -1;
+        int last_non_shared_full = -1;
+        for (int i = 0; i < static_cast<int>(model->hparams.n_layer); ++i) {
+            const bool is_sliding = i < static_cast<int>(model->gemma4_layer_is_sliding.size()) &&
+                                    model->gemma4_layer_is_sliding[static_cast<size_t>(i)] != 0;
+            if (i < first_shared_layer) {
+                if (is_sliding) {
+                    last_non_shared_sliding = i;
+                } else {
+                    last_non_shared_full = i;
+                }
+                model->gemma4_layer_kv_source[static_cast<size_t>(i)] = i;
+            } else {
+                model->gemma4_layer_kv_source[static_cast<size_t>(i)] =
+                    is_sliding ? last_non_shared_sliding : last_non_shared_full;
+            }
+        }
+    }
+
     // Load MoE parameters when present.
     if (model->arch_flags.is_glm_moe || has_key("n_routed_experts") || has_key("num_experts_per_tok") ||
-        has_key("expert_count") || has_key("expert_used_count")) {
+        has_key("expert_count") || has_key("expert_used_count") || has_key("enable_moe_block") ||
+        has_key("num_experts") || has_key("top_k_experts")) {
         uint32_t tmp = 0;
 
         tmp = model->hparams.n_experts;
         get_u32("n_routed_experts", tmp);
         if (tmp == 0) get_u32("num_local_experts", tmp);
         if (tmp == 0) get_u32("expert_count", tmp);  // qwen35moe naming
+        if (tmp == 0) get_u32("num_experts", tmp);  // gemma4 / transformers naming
         model->hparams.n_experts = tmp;
 
         tmp = model->hparams.n_experts_used;
         get_u32("num_experts_per_tok", tmp);
         if (tmp == 0) get_u32("n_experts_used", tmp);
         if (tmp == 0) get_u32("expert_used_count", tmp);  // qwen35moe naming
+        if (tmp == 0) get_u32("top_k_experts", tmp);      // gemma4 naming
         model->hparams.n_experts_used = tmp;
 
         tmp = static_cast<uint32_t>(model->moe_n_shared_experts);
@@ -635,6 +809,21 @@ TransformerModel* LoadGGUFModel(const char* path) {
                       << std::endl;
             add_bos = false;
         }
+    }
+
+    const std::string tokenizer_type_lower = [&]() {
+        std::string lower = model->tokenizer_type;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return lower;
+    }();
+    const bool is_gemma_tokenizer = tokenizer_type_lower == "gemma" || tokenizer_type_lower == "gemma2" ||
+                                    tokenizer_type_lower == "gemma3" || tokenizer_type_lower == "gemma4" ||
+                                    tokenizer_type_lower.rfind("gemma", 0) == 0;
+    if (!add_bos && is_gemma_tokenizer && idx_bos != -1 && model->bos_token_id >= 0) {
+        std::cout << "[DenseCore] Gemma tokenizer detected; forcing BOS insertion to match HF tokenizer contract"
+                  << std::endl;
+        add_bos = true;
     }
 
     if (!add_bos) {
@@ -990,8 +1179,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
                              get_layer_tensor_any(i, {"attn_norm.weight", "input_layernorm.weight",
                                                       "attention_norm.weight", "self_attn_layernorm.weight"}));
         model->layers[i].Set(model_keys::kFfnNorm,
-                             get_layer_tensor_any(i, {"ffn_norm.weight", "post_attention_layernorm.weight",
-                                                      "post_attention_norm.weight", "mlp_layernorm.weight"}));
+                             get_layer_tensor_any(i, {"ffn_norm.weight", "pre_feedforward_layernorm.weight",
+                                                      "post_attention_layernorm.weight", "post_attention_norm.weight",
+                                                      "mlp_layernorm.weight"}));
         model->layers[i].Set(model_keys::kPostAttnNorm, get_layer_tensor_any(i, {"post_attention_norm.weight",
                                                                                  "post_attention_layernorm.weight"}));
         // Fallback: Qwen3.5 uses post_attention_norm instead of ffn_norm
@@ -1000,14 +1190,32 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
         model->layers[i].Set(model_keys::kFfnGate,
                              get_layer_tensor_any(i, {"ffn_gate.weight", "ffn_gate_shexp.weight",
-                                                      "mlp.gate_proj.weight", "gate_proj.weight"}));
+                                                      "shared_expert.gate_proj.weight", "mlp.gate_proj.weight",
+                                                      "gate_proj.weight"}));
         model->layers[i].Set(model_keys::kFfnDown,
                              get_layer_tensor_any(i, {"ffn_down.weight", "ffn_down_shexp.weight",
-                                                      "mlp.down_proj.weight", "down_proj.weight"}));
+                                                      "shared_expert.down_proj.weight", "mlp.down_proj.weight",
+                                                      "down_proj.weight"}));
         model->layers[i].Set(model_keys::kFfnUp, get_layer_tensor_any(i, {"ffn_up.weight", "ffn_up_shexp.weight",
+                                                                          "shared_expert.up_proj.weight",
                                                                           "mlp.up_proj.weight", "up_proj.weight"}));
         model->layers[i].Set(model_keys::kFfnSharedGate,
                              get_layer_tensor_any(i, {"ffn_gate_inp_shexp.weight", "shared_expert_gate.weight"}));
+        model->layers[i].Set(kGemma4RouterScaleKey, get_layer_tensor_any(i, {"router.scale"}));
+        model->layers[i].Set(kGemma4RouterPerExpertScaleKey, get_layer_tensor_any(i, {"router.per_expert_scale"}));
+        model->layers[i].Set(kGemma4PreMoeNormKey, get_layer_tensor_any(i, {"pre_feedforward_layernorm_2.weight"}));
+        model->layers[i].Set(kGemma4PostSharedNormKey,
+                             get_layer_tensor_any(i, {"post_feedforward_layernorm_1.weight"}));
+        model->layers[i].Set(kGemma4PostMoeNormKey, get_layer_tensor_any(i, {"post_feedforward_layernorm_2.weight"}));
+        model->layers[i].Set(kGemma4PostFfnNormKey,
+                             get_layer_tensor_any(i, {"post_feedforward_layernorm.weight", "post_ffw_norm.weight"}));
+        model->layers[i].Set(model_keys::kGemma4PerLayerInputGate, get_layer_tensor_any(i, {"inp_gate.weight"}));
+        model->layers[i].Set(model_keys::kGemma4PerLayerProjection, get_layer_tensor_any(i, {"proj.weight"}));
+        model->layers[i].Set(model_keys::kGemma4PostPerLayerInputNorm, get_layer_tensor_any(i, {"post_norm.weight"}));
+        model->layers[i].Set(model_keys::kGemma4LayerOutputScale,
+                             get_layer_tensor_any(i, {"layer_output_scale.weight"}));
+        model->layers[i].Set(model_keys::kMoeGate,
+                             get_layer_tensor_any(i, {"moe_gate.weight", "router.proj.weight", "mlp.gate.weight"}));
 
         // Determine if this is an SSM layer or full attention layer
         const bool is_ssm = model->IsHybridSSMLayer(static_cast<int>(i));
@@ -1126,12 +1334,21 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
         if (!layer.Get(model_keys::kFfnGate)) {
             layer.Set(model_keys::kFfnGate, find_layer_tensor_with_tokens(layer, {"shared_experts", "gate_proj"}));
+            if (!layer.Get(model_keys::kFfnGate)) {
+                layer.Set(model_keys::kFfnGate, find_layer_tensor_with_tokens(layer, {"shared_expert", "gate_proj"}));
+            }
         }
         if (!layer.Get(model_keys::kFfnUp)) {
             layer.Set(model_keys::kFfnUp, find_layer_tensor_with_tokens(layer, {"shared_experts", "up_proj"}));
+            if (!layer.Get(model_keys::kFfnUp)) {
+                layer.Set(model_keys::kFfnUp, find_layer_tensor_with_tokens(layer, {"shared_expert", "up_proj"}));
+            }
         }
         if (!layer.Get(model_keys::kFfnDown)) {
             layer.Set(model_keys::kFfnDown, find_layer_tensor_with_tokens(layer, {"shared_experts", "down_proj"}));
+            if (!layer.Get(model_keys::kFfnDown)) {
+                layer.Set(model_keys::kFfnDown, find_layer_tensor_with_tokens(layer, {"shared_expert", "down_proj"}));
+            }
         }
         if (!layer.Get(model_keys::kFfnSharedGate)) {
             auto* t = find_layer_tensor_with_tokens(layer, {"shared_expert_gate"});
@@ -1325,14 +1542,17 @@ TransformerModel* LoadGGUFModel(const char* path) {
     struct ggml_tensor* wq_ref = nullptr;
     struct ggml_tensor* wk_ref = nullptr;
     struct ggml_tensor* wv_ref = nullptr;
+    struct ggml_tensor* k_norm_ref = nullptr;
     for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
         auto* wq_i = model->layers[i].Get(model_keys::kAttnQWeight);
         auto* wk_i = model->layers[i].Get(model_keys::kAttnKWeight);
         auto* wv_i = model->layers[i].Get(model_keys::kAttnVWeight);
+        auto* k_norm_i = model->layers[i].Get(model_keys::kAttnKNorm);
         if (wq_i && !wq_ref) wq_ref = wq_i;
         if (wk_i && !wk_ref) wk_ref = wk_i;
         if (wv_i && !wv_ref) wv_ref = wv_i;
-        if (wq_ref && wk_ref && wv_ref) break;
+        if (k_norm_i && !k_norm_ref) k_norm_ref = k_norm_i;
+        if (wq_ref && wk_ref && wv_ref && k_norm_ref) break;
     }
     if (model->arch_flags.is_glm_dsa) {
         if (model->glm_qk_nope_head_dim > 0 || model->glm_qk_rope_head_dim > 0) {
@@ -1346,11 +1566,50 @@ TransformerModel* LoadGGUFModel(const char* path) {
             model->hparams.n_rot = static_cast<uint32_t>(model->glm_qk_rope_head_dim);
         }
     }
-    if (model->hparams.n_embd_head_k == 0 && wk_ref) {
-        model->hparams.n_embd_head_k = wk_ref->ne[1] / model->hparams.n_head_kv;
-    }
-    if (model->hparams.n_embd_head_v == 0 && wv_ref) {
-        model->hparams.n_embd_head_v = wv_ref->ne[1] / model->hparams.n_head_kv;
+    if (!model->gemma4_layer_n_head_kv.empty()) {
+        uint32_t max_head_k = 0;
+        uint32_t max_head_v = 0;
+        for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+            const uint32_t layer_n_head_kv =
+                (i < model->gemma4_layer_n_head_kv.size() && model->gemma4_layer_n_head_kv[i] > 0)
+                    ? model->gemma4_layer_n_head_kv[i]
+                    : model->hparams.n_head_kv;
+            if (layer_n_head_kv == 0) continue;
+            auto* wk_i = model->layers[i].Get(model_keys::kAttnKWeight);
+            auto* wv_i = model->layers[i].Get(model_keys::kAttnVWeight);
+            if (wk_i && wk_i->ne[1] > 0 && (wk_i->ne[1] % layer_n_head_kv) == 0) {
+                max_head_k = std::max(max_head_k, static_cast<uint32_t>(wk_i->ne[1] / layer_n_head_kv));
+            }
+            if (wv_i && wv_i->ne[1] > 0 && (wv_i->ne[1] % layer_n_head_kv) == 0) {
+                max_head_v = std::max(max_head_v, static_cast<uint32_t>(wv_i->ne[1] / layer_n_head_kv));
+            } else if (wk_i && wk_i->ne[1] > 0 && (wk_i->ne[1] % layer_n_head_kv) == 0) {
+                // Gemma4 omits V on some layers; use K width as the fallback.
+                max_head_v = std::max(max_head_v, static_cast<uint32_t>(wk_i->ne[1] / layer_n_head_kv));
+            }
+        }
+        max_head_k = std::max(max_head_k, std::max(model->gemma4_key_length_full, model->gemma4_key_length_swa));
+        max_head_v = std::max(max_head_v, std::max(model->gemma4_value_length_full, model->gemma4_value_length_swa));
+        if (max_head_k > 0) model->hparams.n_embd_head_k = max_head_k;
+        if (max_head_v > 0) model->hparams.n_embd_head_v = max_head_v;
+    } else if (model->arch_flags.is_gemma4) {
+        const uint32_t gemma4_head_dim_k =
+            std::max(std::max(model->gemma4_key_length_full, model->gemma4_key_length_swa),
+                     k_norm_ref && k_norm_ref->ne[0] > 0 ? static_cast<uint32_t>(k_norm_ref->ne[0]) : 0u);
+        const uint32_t gemma4_head_dim_v =
+            std::max(std::max(model->gemma4_value_length_full, model->gemma4_value_length_swa), gemma4_head_dim_k);
+        if (gemma4_head_dim_k > 0) {
+            model->hparams.n_embd_head_k = gemma4_head_dim_k;
+        }
+        if (gemma4_head_dim_v > 0) {
+            model->hparams.n_embd_head_v = gemma4_head_dim_v;
+        }
+    } else {
+        if (model->hparams.n_embd_head_k == 0 && wk_ref) {
+            model->hparams.n_embd_head_k = wk_ref->ne[1] / model->hparams.n_head_kv;
+        }
+        if (model->hparams.n_embd_head_v == 0 && wv_ref) {
+            model->hparams.n_embd_head_v = wv_ref->ne[1] / model->hparams.n_head_kv;
+        }
     }
     // Fallback to n_embd/n_head
     if (model->hparams.n_embd_head_k == 0) {
@@ -2453,6 +2712,9 @@ TransformerModel* LoadGGUFModelNuma(const char* path, int numa_node, bool use_hu
     collect(model->tok_embeddings, "tok_embeddings");
     collect(model->output, "output");
     collect(model->output_norm, "output_norm");
+    collect(model->gemma4_per_layer_model_projection, "gemma4.per_layer_model_projection");
+    collect(model->gemma4_per_layer_projection_norm, "gemma4.per_layer_projection_norm");
+    collect(model->gemma4_per_layer_token_embeddings, "gemma4.per_layer_token_embeddings");
 
     // Collect layer weights
     for (size_t i = 0; i < model->layers.size(); ++i) {
@@ -2468,6 +2730,9 @@ TransformerModel* LoadGGUFModelNuma(const char* path, int numa_node, bool use_hu
         collect(layer.Get(model_keys::kFfnUp), (prefix + "w3").c_str());
         collect(layer.Get(model_keys::kAttnNorm), (prefix + "attn_norm").c_str());
         collect(layer.Get(model_keys::kFfnNorm), (prefix + "ffn_norm").c_str());
+        collect(layer.Get(model_keys::kGemma4PerLayerInputGate), (prefix + "inp_gate").c_str());
+        collect(layer.Get(model_keys::kGemma4PerLayerProjection), (prefix + "proj").c_str());
+        collect(layer.Get(model_keys::kGemma4PostPerLayerInputNorm), (prefix + "post_norm").c_str());
     }
 
     // Step 4: Rebind tensors based on mode
@@ -2603,6 +2868,16 @@ TransformerModel* LoadModelFromExternal(const TransformerHParams& hparams, const
     model->tok_embeddings = get_tensor("token_embd.weight");
     model->output_norm = get_tensor("output_norm.weight");
     model->output = get_tensor("output.weight");
+    if (model->arch_flags.is_gemma4) {
+        model->gemma4_per_layer_model_projection = get_tensor("per_layer_model_proj.weight");
+        model->gemma4_per_layer_projection_norm = get_tensor("per_layer_proj_norm.weight");
+        model->gemma4_per_layer_token_embeddings = get_tensor("per_layer_token_embd.weight");
+        if (model->gemma4_hidden_size_per_layer_input <= 0 && model->gemma4_per_layer_projection_norm &&
+            model->gemma4_per_layer_projection_norm->ne[0] > 0) {
+            model->gemma4_hidden_size_per_layer_input =
+                static_cast<int>(model->gemma4_per_layer_projection_norm->ne[0]);
+        }
+    }
     if (!model->output) model->output = get_tensor("lm_head.weight");
 
     for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {

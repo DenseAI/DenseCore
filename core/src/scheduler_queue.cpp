@@ -37,6 +37,12 @@ int Scheduler::EnsureBlockWritable(int seq_id, int block_index,
 
 void Scheduler::SetPredictedExperts(int seq_id, const std::vector<int>& experts) {
     std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_predicted_experts_.find(seq_id);
+    if (it != seq_predicted_experts_.end() && it->second.size() == experts.size() &&
+        std::equal(it->second.begin(), it->second.end(), experts.begin())) {
+        return;
+    }
+
     seq_predicted_experts_[seq_id] = experts;
 
     for (auto& group : waiting_queue_) {

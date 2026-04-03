@@ -46,6 +46,7 @@ KVCacheUserData* GetKVCacheUserData(int layer, bool is_k);
 struct MoEUserData {
     const TransformerModel* model;
     const TransformerLayer* layer;
+    int layer_idx = -1;
     int k;  // Number of experts to use (top-k)
     densecore::CpuBackend* backend;
     const BatchSpec* batch;

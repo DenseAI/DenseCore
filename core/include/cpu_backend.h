@@ -268,7 +268,8 @@ public:
     void FusedQKVProjection(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv, Tensor* q_out,
                             Tensor* k_out, Tensor* v_out) override;
     void FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale,
-                        bool causal = true, int n_head_kv = -1) override;
+                        bool causal = true, int n_head_kv = -1, int sliding_window = -1, float logit_softcap = 0.0f,
+                        uint32_t semantic_flags = 0) override;
     void Synchronize() override { /* No-op for CPU */ }
 
     // ===========================================================================
@@ -290,7 +291,8 @@ public:
     void GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales, const Tensor& zero_points, Tensor* C,
                   int group_size, int numa_node_id);
     void FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale, bool causal,
-                        int n_head_kv, int numa_node_id);
+                        int n_head_kv, int sliding_window, float logit_softcap, uint32_t semantic_flags,
+                        int numa_node_id);
 
     // ===========================================================================
     // Multi-NUMA Thread Pool Management
@@ -352,6 +354,7 @@ public:
         ExpertWeight w3;       ///< Up projection [hidden, intermediate] (SwiGLU)
         int hidden_dim;        ///< Model hidden dimension
         int intermediate_dim;  ///< FFN intermediate dimension
+        bool use_gelu_activation = false;  ///< Gemma4-style gated GELU instead of SiLU
         int w1_type = 0;       ///< ggml_type of w1 (0 = GGML_TYPE_F32)
         int w2_type = 0;       ///< ggml_type of w2
         int w3_type = 0;       ///< ggml_type of w3

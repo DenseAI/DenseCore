@@ -36,10 +36,23 @@ struct AlignedScratch {
 constexpr int kSmallDecodeMaxAssignments = 8;
 constexpr int kSmallDecodeMaxSnapshotExperts = 64;
 
+inline float GeluTanhApprox(float x) {
+    const float x3 = x * x * x;
+    return 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x3)));
+}
+
 bool CanUsePackedInt4MoEFastPath() {
 #if defined(__aarch64__) || defined(_M_ARM64)
+    // ARM keeps the direct Highway kernels disabled below and falls through to
+    // CpuBackend::GemmInt4(), which already routes through the verified
+    // runtime-selected INT4 kernel path. Default-enable that packed route here
+    // so MoE expert views do not dequantize by default; keep the existing env
+    // name as an opt-out switch for bisects/regressions.
     const char* env = std::getenv("DENSECORE_MOE_ENABLE_ARM_PACKED_INT4");
-    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    if (!env || env[0] == '\0') {
+        return true;
+    }
+    return std::strcmp(env, "0") != 0;
 #else
     return true;
 #endif
@@ -222,6 +235,7 @@ void RunMoEReferenceCheck(const float* input_data, int batch_size, int hidden_di
         }
 
         const MoEReferenceExpertMatrices& matrices = it->second;
+        const bool use_gelu_activation = experts[static_cast<size_t>(expert_id)].use_gelu_activation;
         const float* token_in = input_data + static_cast<size_t>(token_idx) * hidden_dim;
         gate.assign(static_cast<size_t>(matrices.intermediate_dim), 0.0f);
         if (matrices.w3.empty()) {
@@ -239,8 +253,9 @@ void RunMoEReferenceCheck(const float* input_data, int batch_size, int hidden_di
                 const float* w3_row = matrices.w3.data() + static_cast<size_t>(r) * matrices.hidden_dim;
                 up[static_cast<size_t>(r)] = simd::DotF32(token_in, w3_row, matrices.hidden_dim);
             }
-            const float silu = gate_val / (1.0f + std::exp(-gate_val));
-            hidden[static_cast<size_t>(r)] = silu * up[static_cast<size_t>(r)];
+            const float activated =
+                use_gelu_activation ? GeluTanhApprox(gate_val) : (gate_val / (1.0f + std::exp(-gate_val)));
+            hidden[static_cast<size_t>(r)] = activated * up[static_cast<size_t>(r)];
         }
 
         float* ref_out = reference.data() + static_cast<size_t>(token_idx) * hidden_dim;
@@ -452,6 +467,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     hidden_scratch.Resize(backend, hidden_size);
     Tensor hidden = Tensor::Make2D(hidden_scratch.ptr, batch, intermediate_dim);
     const bool used_fused_int4_swiglu =
+        !expert.use_gelu_activation &&
         TryRunPackedInt4FusedSwiGLUProjectionDirect(backend, expert.w1_int4, expert.w3_int4, input, &hidden, numa_node);
     if (!used_fused_int4_swiglu && (w3.IsValid() || expert.w3_int4.IsValid())) {
         gate_scratch.Resize(backend, hidden_size);
@@ -480,8 +496,9 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         pool.ParallelFor(total, [=](int start, int end, int) {
             for (int i = start; i < end; i++) {
                 float x = h_ptr[i];
-                float silu = x / (1.0f + internal::FastExp(-x));
-                h_ptr[i] = silu * g_ptr[i];
+                const float activated =
+                    expert.use_gelu_activation ? GeluTanhApprox(x) : (x / (1.0f + internal::FastExp(-x)));
+                h_ptr[i] = activated * g_ptr[i];
             }
         });
     }

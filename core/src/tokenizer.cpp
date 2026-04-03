@@ -4,6 +4,8 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <limits>
 #include <queue>
@@ -96,6 +98,14 @@ int Tokenizer::FindBestMerge(const TransformerModel* model, const std::vector<st
 
 namespace {
 
+bool IsDebugTokenizerEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_TOKENIZER");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
 constexpr char kMergeKeySep = '\x1f';
 
 std::string EncodeUtf8(uint32_t cp) {
@@ -141,10 +151,32 @@ bool IsLikelyControlTokenLiteral(const std::string& token) {
         return true;
     }
     // Qwen3 thinking delimiters use <...> not <|...|>
-    if (token == "<think>" || token == "</think>") {
+    if (token == "<think>" || token == "</think>" || token == "<bos>" || token == "<eos>" || token == "<pad>" ||
+        token == "<unk>" || token == "<mask>") {
         return true;
     }
     return false;
+}
+
+bool IsAtomicSpecialTokenLiteral(const TransformerModel* model, const std::string& token) {
+    if (!model || token.empty()) {
+        return false;
+    }
+
+    auto it = model->token_to_id.find(token);
+    if (it == model->token_to_id.end()) {
+        return false;
+    }
+
+    const int token_id = it->second;
+    if (token_id >= 0 && token_id < static_cast<int>(model->token_types.size())) {
+        const int32_t token_type = model->token_types[static_cast<size_t>(token_id)];
+        if (token_type == 3 || token_type == 4) {
+            return true;
+        }
+    }
+
+    return IsLikelyControlTokenLiteral(token);
 }
 
 const std::array<std::string, 256>& ByteToUnicode() {
@@ -223,10 +255,21 @@ bool UseQwen35Pretokenizer(const TransformerModel* model) {
     return tokenizer == "qwen35";
 }
 
+bool UseGemmaPretokenizer(const TransformerModel* model) {
+    if (!model) return false;
+    if (model->arch == ModelArch::GEMMA) return true;
+    const std::string tokenizer = AsciiLowerCopy(model->tokenizer_type);
+    return tokenizer == "gemma" || tokenizer == "gemma2" || tokenizer == "gemma3" || tokenizer == "gemma4" ||
+           tokenizer.rfind("gemma", 0) == 0;
+}
+
 bool IsByteLevelBpeTokenizer(const TransformerModel* model) {
     if (!model) return false;
 
     const std::string tokenizer = AsciiLowerCopy(model->tokenizer_type);
+    if (UseGemmaPretokenizer(model)) {
+        return false;
+    }
     if (tokenizer.find("gpt2") != std::string::npos || tokenizer.find("qwen") != std::string::npos) {
         return true;
     }
@@ -554,6 +597,22 @@ std::vector<std::string> PretokenizeQwenUnicode(const std::string& text, bool qw
 }
 
 std::vector<std::string> PretokenizeForByteBpe(const TransformerModel* model, const std::string& text) {
+    if (UseGemmaPretokenizer(model)) {
+        // Hugging Face GemmaTokenizer normalizes spaces to U+2581 before BPE
+        // and relies on byte fallback inside the BPE model. Over-splitting the
+        // text here prevents merges and explodes prompt length.
+        std::string normalized;
+        normalized.reserve(text.size() * 3);
+        for (char ch : text) {
+            if (ch == ' ') {
+                normalized.append("\xE2\x96\x81");
+            } else {
+                normalized.push_back(ch);
+            }
+        }
+        return {std::move(normalized)};
+    }
+
     // GPT-2 default (ASCII-centric fallback).
     static const std::regex kPatternGpt2(
         "'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?[0-9]+| ?[^\\sA-Za-z0-9]+|\\s+(?!\\S)|\\s+",
@@ -592,7 +651,11 @@ std::vector<std::string> PretokenizeForByteBpe(const TransformerModel* model, co
     return pieces;
 }
 
-std::vector<std::string> EncodePieceBytes(const std::string& piece) {
+std::vector<std::string> EncodePieceSymbols(const TransformerModel* model, const std::string& piece) {
+    if (UseGemmaPretokenizer(model)) {
+        return SplitUtf8Units(piece);
+    }
+
     const auto& b2u = ByteToUnicode();
     std::vector<std::string> symbols;
     symbols.reserve(piece.size());
@@ -663,6 +726,19 @@ void AppendByteFallbackTokens(const TransformerModel* model, const std::string& 
 
 void AppendSymbolsToIds(const TransformerModel* model, const std::vector<std::string>& symbols, std::vector<int>* out) {
     if (!out) return;
+
+    if (!IsByteLevelBpeTokenizer(model)) {
+        for (const std::string& sym : symbols) {
+            auto it = model->token_to_id.find(sym);
+            if (it != model->token_to_id.end()) {
+                out->push_back(it->second);
+                continue;
+            }
+
+            AppendByteFallbackTokens(model, sym, out);
+        }
+        return;
+    }
 
     const auto& u2b = UnicodeToByte();
 
@@ -786,24 +862,24 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
             if (span.empty()) return;
             const std::vector<std::string> pieces = PretokenizeForByteBpe(model, span);
             for (const std::string& piece : pieces) {
-                std::vector<std::string> symbols = EncodePieceBytes(piece);
+                std::vector<std::string> symbols = EncodePieceSymbols(model, piece);
                 symbols = MergeWithBpeRanks(model, std::move(symbols));
                 AppendSymbolsToIds(model, symbols, &result);
             }
         };
 
-        // Handle chat/control special tokens (e.g. <|im_start|>, <|im_end|>) as
+        // Handle special/control tokens (e.g. <bos>, <|im_start|>, <turn|>) as
         // atomic tokens before running byte-BPE pretokenization.
         size_t cursor = 0;
         size_t span_start = 0;
         while (cursor < text.size()) {
-            if (text[cursor] == '<' && (cursor + 1) < text.size() && text[cursor + 1] == '|') {
-                const size_t close = text.find("|>", cursor + 2);
+            if (text[cursor] == '<') {
+                const size_t close = text.find('>', cursor + 1);
                 if (close != std::string::npos) {
-                    const size_t tok_end = close + 2;
+                    const size_t tok_end = close + 1;
                     const std::string special = text.substr(cursor, tok_end - cursor);
-                    auto it = model->token_to_id.find(special);
-                    if (it != model->token_to_id.end()) {
+                    if (IsAtomicSpecialTokenLiteral(model, special)) {
+                        auto it = model->token_to_id.find(special);
                         tokenize_plain_span(text.substr(span_start, cursor - span_start));
                         result.push_back(it->second);
                         cursor = tok_end;
@@ -845,6 +921,27 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
 
     if (add_eos && model->eos_token_id >= 0) {
         result.push_back(model->eos_token_id);
+    }
+
+    if (IsDebugTokenizerEnabled()) {
+        std::fprintf(stderr, "[TokenizerDebug] arch=%d tokenizer_type=%s add_bos=%d add_eos=%d text=\"%s\"\n",
+                     static_cast<int>(model->arch), model->tokenizer_type.c_str(), add_bos ? 1 : 0, add_eos ? 1 : 0,
+                     text.c_str());
+        std::fprintf(stderr, "[TokenizerDebug] token_count=%zu ids=", result.size());
+        for (size_t i = 0; i < result.size(); ++i) {
+            if (i != 0) std::fprintf(stderr, ",");
+            std::fprintf(stderr, "%d", result[i]);
+        }
+        std::fprintf(stderr, "\n");
+        const size_t preview = std::min<size_t>(result.size(), 16);
+        for (size_t i = 0; i < preview; ++i) {
+            const int id = result[i];
+            const std::string raw =
+                (id >= 0 && id < static_cast<int>(model->vocab_tokens.size())) ? model->vocab_tokens[id] : "";
+            const std::string text_piece = DetokenizeImpl(model, id);
+            std::fprintf(stderr, "[TokenizerDebug] tok[%zu] id=%d raw=\"%s\" text=\"%s\"\n", i, id, raw.c_str(),
+                         text_piece.c_str());
+        }
     }
 
     return result;

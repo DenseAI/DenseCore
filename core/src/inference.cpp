@@ -65,6 +65,35 @@
 #endif
 
 namespace {
+constexpr const char* kGemma4RouterScaleKey = "gemma4.router.scale";
+constexpr const char* kGemma4RouterPerExpertScaleKey = "gemma4.router.per_expert_scale";
+constexpr const char* kGemma4PreMoeNormKey = "gemma4.pre_feedforward_layernorm_2.weight";
+constexpr const char* kGemma4PostSharedNormKey = "gemma4.post_feedforward_layernorm_1.weight";
+constexpr const char* kGemma4PostMoeNormKey = "gemma4.post_feedforward_layernorm_2.weight";
+constexpr const char* kGemma4PostFfnNormKey = "gemma4.post_feedforward_layernorm.weight";
+
+static inline bool IsGemma4SlidingLayer(const TransformerModel* model, int layer_idx) {
+    return model && model->arch_flags.is_gemma4 && layer_idx >= 0 &&
+           layer_idx < static_cast<int>(model->gemma4_layer_is_sliding.size()) &&
+           model->gemma4_layer_is_sliding[static_cast<size_t>(layer_idx)] != 0;
+}
+
+static inline int Gemma4KVSourceLayer(const TransformerModel* model, int layer_idx) {
+    if (!model || !model->arch_flags.is_gemma4 || layer_idx < 0 ||
+        layer_idx >= static_cast<int>(model->gemma4_layer_kv_source.size())) {
+        return layer_idx;
+    }
+    const int source = model->gemma4_layer_kv_source[static_cast<size_t>(layer_idx)];
+    return source >= 0 ? source : layer_idx;
+}
+
+static inline bool IsGemma4MoEModel(const TransformerModel* model, const TransformerLayer* layer = nullptr) {
+    if (!model || model->arch != ModelArch::GEMMA || model->hparams.n_experts == 0) {
+        return false;
+    }
+    return !layer || layer->Get(kGemma4RouterScaleKey) || layer->Get(kGemma4RouterPerExpertScaleKey) || layer->is_moe;
+}
+
 static const InferenceConfig& ResolveInferenceConfig(const BatchSpec* batch) {
     if (batch && batch->deps && batch->deps->config) {
         return *batch->deps->config;
@@ -224,6 +253,57 @@ static bool IsDebugSSMProjectionReferenceEnabled() {
 static bool IsDebugAttentionProjectionReferenceEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_ATTN_PROJECTION_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static void ValidateAttentionProjectionShape3D(const struct ggml_tensor* tensor, const char* tensor_name, int layer_idx,
+                                               int ne0, int ne1, int ne2, int projected_dim, int n_heads) {
+    if (!tensor) {
+        throw densecore::InvalidArgumentException("Missing attention projection tensor for " +
+                                                  std::string(tensor_name ? tensor_name : "unknown") + " in layer " +
+                                                  std::to_string(layer_idx));
+    }
+    if (projected_dim <= 0 || n_heads <= 0 || ne2 <= 0) {
+        throw densecore::InvalidArgumentException("Invalid attention reshape parameters for " +
+                                                  std::string(tensor_name ? tensor_name : "unknown") + " in layer " +
+                                                  std::to_string(layer_idx) + ": projected_dim=" +
+                                                  std::to_string(projected_dim) + " n_heads=" + std::to_string(n_heads) +
+                                                  " n_tokens=" + std::to_string(ne2));
+    }
+    if ((projected_dim % n_heads) != 0) {
+        throw densecore::InvalidArgumentException("Attention projection dimension is not divisible by head count for " +
+                                                  std::string(tensor_name ? tensor_name : "unknown") + " in layer " +
+                                                  std::to_string(layer_idx) + ": dim=" +
+                                                  std::to_string(projected_dim) + " n_heads=" + std::to_string(n_heads));
+    }
+    const int64_t expected =
+        static_cast<int64_t>(ne0) * static_cast<int64_t>(ne1) * static_cast<int64_t>(ne2);
+    const int64_t actual = ggml_nelements(tensor);
+    if (actual != expected) {
+        throw densecore::InvalidArgumentException(
+            "Attention reshape contract mismatch for " + std::string(tensor_name ? tensor_name : "unknown") +
+            " in layer " + std::to_string(layer_idx) + ": tensor=[" + std::to_string(tensor->ne[0]) + "," +
+            std::to_string(tensor->ne[1]) + "," + std::to_string(tensor->ne[2]) + "," +
+            std::to_string(tensor->ne[3]) + "] projected_dim=" + std::to_string(projected_dim) +
+            " n_heads=" + std::to_string(n_heads) + " target=[" + std::to_string(ne0) + "," +
+            std::to_string(ne1) + "," + std::to_string(ne2) + "] actual_nelements=" + std::to_string(actual) +
+            " expected_nelements=" + std::to_string(expected));
+    }
+}
+
+static bool IsDebugFinalProjectionReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_FINAL_PROJECTION_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugFfnProjectionReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_FFN_PROJECTION_REFERENCE");
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
@@ -1037,6 +1117,12 @@ static DecodePagedDecision EvaluatePagedDecodeDecision(const DecodePagedAttentio
         decision.reason = DecodePagedFallbackReason::GlmDsa;
         return decision;
     }
+    if (model && model->arch_flags.is_gemma4) {
+        // Gemma4 uses layer-local KV-head layouts that are not yet stable in
+        // the paged decode fast path. Keep decode on the dense path for now.
+        decision.reason = DecodePagedFallbackReason::PolicyOff;
+        return decision;
+    }
 
     decision.reason = DiagnosePagedDecodeCandidateFailure(cache, batch, n_tokens_in_batch, n_head, n_head_kv,
                                                           head_dim_q, head_dim_kv);
@@ -1127,12 +1213,41 @@ static bool IsDebugPagedAttentionReferenceEnabled() {
     return enabled;
 }
 
+static bool IsDebugPagedAttentionEagerReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_PAGED_ATTN_EAGER_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
 static bool IsDebugAttentionCoreReferenceEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_ATTN_CORE_REFERENCE");
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
+}
+
+static bool IsDebugAddRmsNormReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_ADD_RMSNORM_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool ShouldRunAddRmsNormReferenceProbe(int layer_idx) {
+    if (!IsDebugAddRmsNormReferenceEnabled()) {
+        return false;
+    }
+    int configured_layer = -1;
+    if (const char* env = std::getenv("DENSECORE_DEBUG_ADD_RMSNORM_REFERENCE_LAYER")) {
+        if (env[0] != '\0') {
+            configured_layer = std::atoi(env);
+        }
+    }
+    return configured_layer < 0 || configured_layer == layer_idx;
 }
 
 static bool IsDebugAttentionPostReferenceEnabled() {
@@ -1184,6 +1299,32 @@ static bool ShouldRunPagedAttentionReferenceProbe(int layer, int token_idx) {
     static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_PAGED_ATTN_REFERENCE_LAYER", -1);
     static const int target_token = ParseIntEnv("DENSECORE_DEBUG_PAGED_ATTN_REFERENCE_TOKEN", 0);
     static std::atomic<int> remaining_budget{ParsePositiveEnvInt("DENSECORE_DEBUG_PAGED_ATTN_REFERENCE_MAX_CALLS", 1)};
+
+    if (target_layer >= 0 && layer != target_layer) {
+        return false;
+    }
+    if (target_token >= 0 && token_idx != target_token) {
+        return false;
+    }
+
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldRunPagedAttentionEagerReferenceProbe(int layer, int token_idx) {
+    if (!IsDebugPagedAttentionEagerReferenceEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_PAGED_ATTN_EAGER_REFERENCE_LAYER", -1);
+    static const int target_token = ParseIntEnv("DENSECORE_DEBUG_PAGED_ATTN_EAGER_REFERENCE_TOKEN", 0);
+    static std::atomic<int> remaining_budget{
+        ParsePositiveEnvInt("DENSECORE_DEBUG_PAGED_ATTN_EAGER_REFERENCE_MAX_CALLS", 1)};
 
     if (target_layer >= 0 && layer != target_layer) {
         return false;
@@ -1273,6 +1414,42 @@ static bool ShouldRunAttentionProjectionReferenceProbe(int layer) {
     return false;
 }
 
+static bool ShouldRunFinalProjectionReferenceProbe() {
+    if (!IsDebugFinalProjectionReferenceEnabled()) {
+        return false;
+    }
+
+    static std::atomic<int> remaining_budget{
+        ParsePositiveEnvInt("DENSECORE_DEBUG_FINAL_PROJECTION_REFERENCE_MAX_CALLS", 1)};
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldRunFfnProjectionReferenceProbe(int layer) {
+    if (!IsDebugFfnProjectionReferenceEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_FFN_PROJECTION_REFERENCE_LAYER", -1);
+    static std::atomic<int> remaining_budget{
+        ParsePositiveEnvInt("DENSECORE_DEBUG_FFN_PROJECTION_REFERENCE_MAX_CALLS", 8)};
+    if (target_layer >= 0 && layer != target_layer) {
+        return false;
+    }
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void DebugLogTensorFiniteStats(const char* tag, const struct ggml_tensor* tensor) {
     if (!tag || !tensor || !tensor->data || tensor->type != GGML_TYPE_F32) {
         return;
@@ -1329,11 +1506,60 @@ static void ComputeMatmulReferenceF32(const struct ggml_tensor* weight, const st
         out->clear();
         return;
     }
-    const int N = static_cast<int>(weight->ne[0]);
-    const int K = static_cast<int>(weight->ne[1]);
     const int M = static_cast<int>(input->ne[1]);
-    if (N <= 0 || K <= 0 || M <= 0 || static_cast<int>(input->ne[0]) != N) {
+    if (M <= 0) {
         out->clear();
+        return;
+    }
+
+    const int input_dim = static_cast<int>(input->ne[0]);
+    const int ne0 = static_cast<int>(weight->ne[0]);
+    const int ne1 = static_cast<int>(weight->ne[1]);
+    const char* weight_base = reinterpret_cast<const char*>(weight->data);
+    const char* input_base = reinterpret_cast<const char*>(input->data);
+
+    if (weight->type == GGML_TYPE_F32 && input_dim == ne1 && ne0 > 0 && ne1 > 0) {
+        out->assign(static_cast<size_t>(ne0) * static_cast<size_t>(M), 0.0f);
+        for (int m = 0; m < M; ++m) {
+            const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(input->nb[1]);
+            for (int out_idx = 0; out_idx < ne0; ++out_idx) {
+                float sum = 0.0f;
+                for (int in_idx = 0; in_idx < ne1; ++in_idx) {
+                    const char* weight_row = weight_base + static_cast<size_t>(in_idx) * static_cast<size_t>(weight->nb[1]);
+                    const float w =
+                        *reinterpret_cast<const float*>(weight_row + static_cast<size_t>(out_idx) * weight->nb[0]);
+                    const float x =
+                        *reinterpret_cast<const float*>(src_col + static_cast<size_t>(in_idx) * input->nb[0]);
+                    sum += w * x;
+                }
+                (*out)[static_cast<size_t>(m) * static_cast<size_t>(ne0) + static_cast<size_t>(out_idx)] = sum;
+            }
+        }
+        return;
+    }
+
+    const int N = ne0;
+    const int K = ne1;
+    if (N <= 0 || K <= 0 || input_dim != N) {
+        out->clear();
+        return;
+    }
+
+    out->assign(static_cast<size_t>(K) * static_cast<size_t>(M), 0.0f);
+    if (weight->type == GGML_TYPE_F32) {
+        for (int k = 0; k < K; ++k) {
+            const char* row_ptr = weight_base + static_cast<size_t>(k) * static_cast<size_t>(weight->nb[1]);
+            for (int m = 0; m < M; ++m) {
+                const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(input->nb[1]);
+                float sum = 0.0f;
+                for (int i = 0; i < N; ++i) {
+                    const float w = *reinterpret_cast<const float*>(row_ptr + static_cast<size_t>(i) * weight->nb[0]);
+                    const float x = *reinterpret_cast<const float*>(src_col + static_cast<size_t>(i) * input->nb[0]);
+                    sum += w * x;
+                }
+                (*out)[static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k)] = sum;
+            }
+        }
         return;
     }
 
@@ -1343,10 +1569,7 @@ static void ComputeMatmulReferenceF32(const struct ggml_tensor* weight, const st
         return;
     }
 
-    out->assign(static_cast<size_t>(K) * static_cast<size_t>(M), 0.0f);
     std::vector<float> dequant_row(static_cast<size_t>(N), 0.0f);
-    const char* weight_base = reinterpret_cast<const char*>(weight->data);
-    const char* input_base = reinterpret_cast<const char*>(input->data);
     for (int k = 0; k < K; ++k) {
         const void* row_ptr = weight_base + static_cast<size_t>(k) * static_cast<size_t>(weight->nb[1]);
         type_traits->to_float(row_ptr, dequant_row.data(), N);
@@ -1855,6 +2078,10 @@ struct AddRMSNormUserData {
     float eps;                            ///< RMSNorm epsilon
     ptrdiff_t residual_row_stride = 0;    ///< Residual row stride in float elements
     std::vector<float> owned_rms_weight;  ///< Optional canonicalized RMS weight storage
+    int layer_idx = -1;
+    const int* token_seq_ids = nullptr;
+    const char* stage = nullptr;
+    const char* var_name = nullptr;
 };
 
 // Thread-local pool for AddRMSNorm user data
@@ -1957,6 +2184,7 @@ void cb_residual_rmsnorm_fused(struct ggml_tensor* dst, const struct ggml_tensor
     const ptrdiff_t src_row_stride = static_cast<ptrdiff_t>(src->nb[1] / sizeof(float));
     const ptrdiff_t dst_row_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
     const ptrdiff_t residual_row_stride = ud->residual_row_stride > 0 ? ud->residual_row_stride : n_embd;
+    const bool run_reference_probe = ShouldRunAddRmsNormReferenceProbe(ud->layer_idx);
 
     // Partition work across tokens
     const int tokens_per_thread = (n_tokens + nth - 1) / nth;
@@ -1969,13 +2197,61 @@ void cb_residual_rmsnorm_fused(struct ggml_tensor* dst, const struct ggml_tensor
     for (int t = t_start; t < t_end; t++) {
         const float* x_ptr = reinterpret_cast<const float*>(src->data) + static_cast<ptrdiff_t>(t) * src_row_stride;
         float* out_ptr = reinterpret_cast<float*>(dst->data) + static_cast<ptrdiff_t>(t) * dst_row_stride;
+        const float* res_ptr =
+            has_residual ? (ud->residual + static_cast<ptrdiff_t>(t) * residual_row_stride) : nullptr;
 
         if (has_residual) {
-            const float* res_ptr = ud->residual + static_cast<ptrdiff_t>(t) * residual_row_stride;
             // Use unified AddRMSNorm dispatcher (Runtime AVX512/AVX2/Scalar)
             densecore::simd::AddRMSNorm(out_ptr, x_ptr, res_ptr, ud->rms_weight, static_cast<size_t>(n_embd), eps);
         } else {
             densecore::simd::RMSNorm(x_ptr, ud->rms_weight, out_ptr, static_cast<size_t>(n_embd), eps);
+        }
+
+        if (run_reference_probe) {
+            static std::atomic<int> emitted{0};
+            const int max_calls = ParsePositiveEnvInt("DENSECORE_DEBUG_ADD_RMSNORM_REFERENCE_MAX_CALLS", 8);
+            const int prior = emitted.load(std::memory_order_relaxed);
+            if (prior < max_calls && emitted.fetch_add(1, std::memory_order_relaxed) < max_calls) {
+                std::vector<float> summed(static_cast<size_t>(n_embd));
+                double sum_sq = 0.0;
+                for (int i = 0; i < n_embd; ++i) {
+                    float val = x_ptr[i];
+                    if (res_ptr) {
+                        val += res_ptr[i];
+                    }
+                    summed[static_cast<size_t>(i)] = val;
+                    sum_sq += static_cast<double>(val) * static_cast<double>(val);
+                }
+
+                const float inv_rms = 1.0f / std::sqrt(static_cast<float>(sum_sq / std::max(1, n_embd)) + eps);
+                float max_abs_diff = 0.0f;
+                int first_bad_idx = -1;
+                float first_actual = 0.0f;
+                float first_ref = 0.0f;
+                bool actual_nonfinite = false;
+                bool ref_nonfinite = false;
+                for (int i = 0; i < n_embd; ++i) {
+                    const float ref = summed[static_cast<size_t>(i)] * inv_rms * ud->rms_weight[i];
+                    const float actual = out_ptr[i];
+                    actual_nonfinite = actual_nonfinite || !std::isfinite(actual);
+                    ref_nonfinite = ref_nonfinite || !std::isfinite(ref);
+                    const float diff = std::fabs(actual - ref);
+                    if (diff > max_abs_diff) {
+                        max_abs_diff = diff;
+                        first_bad_idx = i;
+                        first_actual = actual;
+                        first_ref = ref;
+                    }
+                }
+                const int seq_id = ud->token_seq_ids ? ud->token_seq_ids[t] : -1;
+                fprintf(stderr,
+                        "[ADD_RMS_REF] layer=%d stage=%s var=%s token=%d seq=%d has_residual=%d "
+                        "max_abs_diff=%.9g first_idx=%d actual=%.9g ref=%.9g actual_nonfinite=%d "
+                        "ref_nonfinite=%d\n",
+                        ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown", t,
+                        seq_id, has_residual ? 1 : 0, max_abs_diff, first_bad_idx, first_actual, first_ref,
+                        actual_nonfinite ? 1 : 0, ref_nonfinite ? 1 : 0);
+            }
         }
     }
 }
@@ -2013,6 +2289,80 @@ void cb_silu_mul_fused(struct ggml_tensor* dst, const struct ggml_tensor* a, con
 
     // Use parallel SiLU×Mul from simd_ops.h
     densecore::simd::SiLUMulParallel(out, gate, up, size, ith, nth);
+}
+
+void cb_gelu_mul_fused(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b, int ith,
+                       int nth, void* userdata) {
+    (void)userdata;
+    if (!a || !b || !dst || !a->data || !b->data || !dst->data) return;
+
+    const float* gate = reinterpret_cast<const float*>(a->data);
+    const float* up = reinterpret_cast<const float*>(b->data);
+    float* out = reinterpret_cast<float*>(dst->data);
+    const size_t size = ggml_nelements(a);
+
+    const size_t begin = (size * static_cast<size_t>(ith)) / static_cast<size_t>(nth);
+    const size_t end = (size * static_cast<size_t>(ith + 1)) / static_cast<size_t>(nth);
+    for (size_t i = begin; i < end; ++i) {
+        const float x = gate[i];
+        const float x3 = x * x * x;
+        const float gelu =
+            0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x3)));
+        out[i] = gelu * up[i];
+    }
+}
+
+struct SharedScalarGateApplyUserData {
+    const struct ggml_tensor* gate_logits_scalar = nullptr;
+};
+
+static inline SharedScalarGateApplyUserData* GetSharedScalarGateApplyUserData() {
+    static thread_local SharedScalarGateApplyUserData pool[64];
+    static thread_local int index = 0;
+    if (index >= 64) {
+        index = 0;
+    }
+    return &pool[index++];
+}
+
+static void cb_apply_shared_scalar_gate(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                        void* userdata) {
+    auto* ud = static_cast<SharedScalarGateApplyUserData*>(userdata);
+    if (!dst || !src || !ud || !ud->gate_logits_scalar || !dst->data || !src->data || !ud->gate_logits_scalar->data) {
+        return;
+    }
+
+    const int hidden = static_cast<int>(src->ne[0]);
+    const int tokens = static_cast<int>(std::max<int64_t>(1, src->ne[1]));
+    const int scalar_elems = static_cast<int>(ggml_nelements(ud->gate_logits_scalar));
+    if (hidden <= 0 || tokens <= 0 || scalar_elems < tokens) {
+        return;
+    }
+
+    const auto stable_sigmoid = [](float x) -> float {
+        if (x >= 0.0f) {
+            const float z = std::exp(-x);
+            return 1.0f / (1.0f + z);
+        }
+        const float z = std::exp(x);
+        return z / (1.0f + z);
+    };
+
+    const float* src_base = reinterpret_cast<const float*>(src->data);
+    float* dst_base = reinterpret_cast<float*>(dst->data);
+    const float* gate_base = reinterpret_cast<const float*>(ud->gate_logits_scalar->data);
+    const ptrdiff_t src_row_stride = static_cast<ptrdiff_t>(src->nb[1] / sizeof(float));
+    const ptrdiff_t dst_row_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
+    const ptrdiff_t gate_row_stride = static_cast<ptrdiff_t>(ud->gate_logits_scalar->nb[1] / sizeof(float));
+
+    const int token_begin = (tokens * ith) / nth;
+    const int token_end = (tokens * (ith + 1)) / nth;
+    for (int t = token_begin; t < token_end; ++t) {
+        const float gate = stable_sigmoid(gate_base[static_cast<ptrdiff_t>(t) * gate_row_stride]);
+        const float* src_row = src_base + static_cast<ptrdiff_t>(t) * src_row_stride;
+        float* dst_row = dst_base + static_cast<ptrdiff_t>(t) * dst_row_stride;
+        densecore::simd::ScaleF32(dst_row, src_row, gate, static_cast<size_t>(hidden));
+    }
 }
 
 // ============================================================================
@@ -2054,11 +2404,147 @@ struct SSMConv1DUserData {
 struct ProjectionReferenceUserData {
     const struct ggml_tensor* weight_tensor = nullptr;
     const struct ggml_tensor* input_tensor = nullptr;
+    const uint8_t* int4_packed = nullptr;
+    const float* int4_scales = nullptr;
+    const float* int4_zeros = nullptr;
+    int int4_group_size = 0;
+    int int4_k = 0;
+    int int4_n = 0;
+    const uint8_t* fp8_packed = nullptr;
+    TransformerModel::FP8Format fp8_format = TransformerModel::FP8Format::E4M3FN;
+    int fp8_k = 0;
+    int fp8_n = 0;
     int layer_idx = -1;
     const int* token_seq_ids = nullptr;
     const char* stage = nullptr;
     const char* var_name = nullptr;
 };
+
+struct SharedScalarGateReferenceUserData {
+    const struct ggml_tensor* shared_ffn_pre_gate = nullptr;
+    const struct ggml_tensor* shared_gate_logits_scalar = nullptr;
+    int layer_idx = -1;
+    const int* token_seq_ids = nullptr;
+    const char* stage = nullptr;
+    const char* var_name = nullptr;
+};
+
+static void ComputeMatmulReferenceInt4BindingF32(const ProjectionReferenceUserData* ud, std::vector<float>* out) {
+    if (!ud || !out || !ud->input_tensor || !ud->input_tensor->data || ud->input_tensor->type != GGML_TYPE_F32 ||
+        !ud->int4_packed || !ud->int4_scales || !ud->int4_zeros || ud->int4_group_size <= 0 || ud->int4_k <= 0 ||
+        ud->int4_n <= 0) {
+        out->clear();
+        return;
+    }
+    const int K = ud->int4_k;
+    const int N = ud->int4_n;
+    const int M = static_cast<int>(ud->input_tensor->ne[1]);
+    if (M <= 0 || static_cast<int>(ud->input_tensor->ne[0]) != K || (K % ud->int4_group_size) != 0 ||
+        (ud->int4_group_size & 1) != 0) {
+        out->clear();
+        return;
+    }
+
+    const int num_groups = K / ud->int4_group_size;
+    const int packed_k = (K + 1) / 2;
+    out->assign(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+
+    const char* input_base = reinterpret_cast<const char*>(ud->input_tensor->data);
+    for (int m = 0; m < M; ++m) {
+        const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(ud->input_tensor->nb[1]);
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            for (int g = 0; g < num_groups; ++g) {
+                const float scale = ud->int4_scales[n * num_groups + g];
+                const float zero = ud->int4_zeros[n * num_groups + g];
+                const int k_start = g * ud->int4_group_size;
+                const uint8_t* w_packed = ud->int4_packed + static_cast<size_t>(n) * packed_k +
+                                          static_cast<size_t>(g) * (ud->int4_group_size / 2);
+                for (int k = 0; k < ud->int4_group_size; ++k) {
+                    const int byte_idx = k / 2;
+                    const int nibble_idx = k % 2;
+                    const uint8_t packed_byte = w_packed[byte_idx];
+                    int8_t q = (nibble_idx == 0) ? static_cast<int8_t>(packed_byte & 0x0F)
+                                                 : static_cast<int8_t>((packed_byte >> 4) & 0x0F);
+                    if (q & 0x08) {
+                        q = static_cast<int8_t>(q | static_cast<int8_t>(0xF0));
+                    }
+                    const float x = *reinterpret_cast<const float*>(
+                        src_col + static_cast<size_t>(k_start + k) * ud->input_tensor->nb[0]);
+                    sum += x * (scale * (static_cast<float>(q) - zero));
+                }
+            }
+            (*out)[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = sum;
+        }
+    }
+}
+
+static void ComputeMatmulReferenceFp8BindingF32(const ProjectionReferenceUserData* ud, std::vector<float>* out) {
+    if (!ud || !out || !ud->input_tensor || !ud->input_tensor->data || ud->input_tensor->type != GGML_TYPE_F32 ||
+        !ud->fp8_packed || ud->fp8_k <= 0 || ud->fp8_n <= 0) {
+        out->clear();
+        return;
+    }
+    const int K = ud->fp8_k;
+    const int N = ud->fp8_n;
+    const int M = static_cast<int>(ud->input_tensor->ne[1]);
+    if (M <= 0 || static_cast<int>(ud->input_tensor->ne[0]) != K) {
+        out->clear();
+        return;
+    }
+
+    out->assign(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+    std::vector<float> dequant_row(static_cast<size_t>(K), 0.0f);
+    const char* input_base = reinterpret_cast<const char*>(ud->input_tensor->data);
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* packed_row = ud->fp8_packed + static_cast<size_t>(n) * static_cast<size_t>(K);
+        if (ud->fp8_format == TransformerModel::FP8Format::E5M2) {
+            densecore::hwy_kernels::ConvertFP8E5M2ToFP32_Hwy(packed_row, dequant_row.data(), static_cast<int64_t>(K));
+        } else {
+            densecore::hwy_kernels::ConvertFP8E4M3FNToFP32_Hwy(packed_row, dequant_row.data(),
+                                                               static_cast<int64_t>(K));
+        }
+        for (int m = 0; m < M; ++m) {
+            const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(ud->input_tensor->nb[1]);
+            float sum = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                const float x = *reinterpret_cast<const float*>(src_col + static_cast<size_t>(k) * ud->input_tensor->nb[0]);
+                sum += dequant_row[static_cast<size_t>(k)] * x;
+            }
+            (*out)[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = sum;
+        }
+    }
+}
+
+static bool ShouldRunSharedScalarGateReferenceProbe(int layer_idx) {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SHARED_SCALAR_GATE_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    if (!enabled) return false;
+    static const int target_layer = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SHARED_SCALAR_GATE_REFERENCE_LAYER");
+        if (!env || env[0] == '\0') return -1;
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        return (end == env) ? -1 : static_cast<int>(parsed);
+    }();
+    static std::atomic<int> remaining_budget{[]() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SHARED_SCALAR_GATE_REFERENCE_MAX_CALLS");
+        if (!env || env[0] == '\0') return 4;
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        return (end == env || parsed <= 0) ? 4 : static_cast<int>(parsed);
+    }()};
+    if (target_layer >= 0 && layer_idx != target_layer) return false;
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 struct AttentionCoreReferenceUserData {
     const struct ggml_tensor* value_tensor = nullptr;
@@ -2304,6 +2790,15 @@ inline ProjectionReferenceUserData* GetProjectionReferenceUserData() {
         idx = 0;
     }
     return &ctx->projection_reference_pool[idx];
+}
+
+inline SharedScalarGateReferenceUserData* GetSharedScalarGateReferenceUserData() {
+    static thread_local SharedScalarGateReferenceUserData pool[64];
+    static thread_local int index = 0;
+    if (index >= 64) {
+        index = 0;
+    }
+    return &pool[index++];
 }
 
 inline AttentionCoreReferenceUserData* GetAttentionCoreReferenceUserData() {
@@ -4161,6 +4656,11 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
     }
 }
 
+static void ComputeFlashAttentionReference(const float* q, const float* k, const float* v, float* out, int n_head,
+                                           int n_head_kv, int seq_q, int seq_kv, int head_dim, float scale, bool causal,
+                                           int q_start_offset, int kv_start_offset, int sliding_window,
+                                           float logit_softcap = 0.0f);
+
 static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, const std::vector<int>& block_table,
                                              int context_len, const KVRetentionSpan& retained_span, int current_pos,
                                              float scale, const float* q_data, float* out_data, int h_start,
@@ -4324,6 +4824,121 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
             out_head[d] *= inv;
         }
     }
+}
+
+static void LogPagedAttentionEagerReferenceProbe(const PagedAttentionUserData* ud, const std::vector<int>& block_table,
+                                                 int context_len, const KVRetentionSpan& retained_span, int current_pos,
+                                                 const float* q_token, const float* runtime_out, int token_idx,
+                                                 int seq_idx, int h_start, int h_end) {
+    if (!ud || !ud->cache || !q_token || !runtime_out || context_len <= 0 || ud->n_head <= 0 || ud->head_dim <= 0) {
+        return;
+    }
+
+    const int n_head_kv = ud->cache->n_head_kv;
+    const int v_head_dim = ud->v_head_dim > 0 ? ud->v_head_dim : ud->head_dim;
+    if (n_head_kv <= 0 || ud->n_head % n_head_kv != 0 || v_head_dim <= 0) {
+        return;
+    }
+
+    thread_local std::vector<float> k_slot;
+    thread_local std::vector<float> v_slot;
+    thread_local std::vector<float> k_all;
+    thread_local std::vector<float> v_all;
+    thread_local std::vector<float> ref_out;
+
+    const size_t k_slot_elems = static_cast<size_t>(ud->head_dim) * static_cast<size_t>(n_head_kv);
+    const size_t v_slot_elems = static_cast<size_t>(v_head_dim) * static_cast<size_t>(n_head_kv);
+    const size_t k_all_elems = static_cast<size_t>(n_head_kv) * static_cast<size_t>(context_len) *
+                               static_cast<size_t>(ud->head_dim);
+    const size_t v_all_elems = static_cast<size_t>(n_head_kv) * static_cast<size_t>(context_len) *
+                               static_cast<size_t>(v_head_dim);
+    const size_t out_elems = static_cast<size_t>(ud->n_head) * static_cast<size_t>(v_head_dim);
+
+    k_slot.resize(k_slot_elems);
+    v_slot.resize(v_slot_elems);
+    k_all.assign(k_all_elems, 0.0f);
+    v_all.assign(v_all_elems, 0.0f);
+    ref_out.assign(out_elems, 0.0f);
+
+    for (int t = 0; t < context_len; ++t) {
+        const int token_pos = (t < retained_span.history_kept) ? MapRetainedHistoryIndex(retained_span, t) : current_pos;
+        const int logical_block = token_pos / BLOCK_SIZE;
+        const int slot = token_pos % BLOCK_SIZE;
+        if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) {
+            continue;
+        }
+        const int block_id = block_table[static_cast<size_t>(logical_block)];
+        if (block_id < 0 || block_id >= ud->cache->max_blocks) {
+            continue;
+        }
+
+        ud->cache->ReadKSlot(block_id, ud->layer, slot, k_slot.data());
+        ud->cache->ReadVSlot(block_id, ud->layer, slot, v_slot.data());
+
+        for (int kv_head = 0; kv_head < n_head_kv; ++kv_head) {
+            const float* src_k = k_slot.data() + static_cast<size_t>(kv_head) * ud->head_dim;
+            float* dst_k = k_all.data() + (static_cast<size_t>(kv_head) * context_len + static_cast<size_t>(t)) *
+                                              static_cast<size_t>(ud->head_dim);
+            std::memcpy(dst_k, src_k, static_cast<size_t>(ud->head_dim) * sizeof(float));
+
+            const float* src_v = v_slot.data() + static_cast<size_t>(kv_head) * v_head_dim;
+            float* dst_v = v_all.data() + (static_cast<size_t>(kv_head) * context_len + static_cast<size_t>(t)) *
+                                              static_cast<size_t>(v_head_dim);
+            std::memcpy(dst_v, src_v, static_cast<size_t>(v_head_dim) * sizeof(float));
+        }
+    }
+
+    ComputeFlashAttentionReference(q_token, k_all.data(), v_all.data(), ref_out.data(), ud->n_head, n_head_kv, 1,
+                                   context_len, ud->head_dim, 1.0f / std::sqrt(static_cast<float>(ud->head_dim)),
+                                   false, 0, 0, -1);
+
+    const int h_begin = std::max(0, h_start);
+    const int h_limit = std::min(ud->n_head, h_end);
+    if (h_begin >= h_limit) {
+        return;
+    }
+
+    float max_abs_diff = 0.0f;
+    int max_h = -1;
+    int max_d = -1;
+    float fast_val = 0.0f;
+    float ref_val = 0.0f;
+    bool runtime_nonfinite = false;
+    bool ref_nonfinite = false;
+    int first_bad_idx = -1;
+    for (int h = h_begin; h < h_limit; ++h) {
+        const float* got_head = runtime_out + static_cast<size_t>(h) * v_head_dim;
+        const float* ref_head = ref_out.data() + static_cast<size_t>(h) * v_head_dim;
+        for (int d = 0; d < v_head_dim; ++d) {
+            const float got = got_head[d];
+            const float expect = ref_head[d];
+            if (!std::isfinite(got) || !std::isfinite(expect)) {
+                if (first_bad_idx < 0) {
+                    first_bad_idx = h * v_head_dim + d;
+                    runtime_nonfinite = !std::isfinite(got);
+                    ref_nonfinite = !std::isfinite(expect);
+                    fast_val = got;
+                    ref_val = expect;
+                }
+                continue;
+            }
+            const float diff = std::fabs(got - expect);
+            if (diff > max_abs_diff) {
+                max_abs_diff = diff;
+                max_h = h;
+                max_d = d;
+                fast_val = got;
+                ref_val = expect;
+            }
+        }
+    }
+
+    std::fprintf(stderr,
+                 "[PagedAttnEagerRef] layer=%d seq=%d token_idx=%d pos=%d heads=[%d,%d) context=%d first_bad_idx=%d "
+                 "runtime_nonfinite=%d ref_nonfinite=%d max_abs_diff=%g head=%d dim=%d fast=%g ref=%g\n",
+                 ud->layer, seq_idx, token_idx, current_pos, h_begin, h_limit, context_len, first_bad_idx,
+                 runtime_nonfinite ? 1 : 0, ref_nonfinite ? 1 : 0, static_cast<double>(max_abs_diff), max_h, max_d,
+                 static_cast<double>(fast_val), static_cast<double>(ref_val));
 }
 
 void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
@@ -4740,6 +5355,11 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         if (!hwy_ready || cached_retention_truncated) {
             ComputePagedAttentionScalarHeads(ud, block_table, cached_context_len, cached_retained_span, cached_pos_i,
                                              scale, q_token, out_token, h_start, h_end);
+            if (ShouldRunPagedAttentionEagerReferenceProbe(ud->layer, token_idx)) {
+                LogPagedAttentionEagerReferenceProbe(ud, block_table, cached_context_len, cached_retained_span,
+                                                    cached_pos_i, q_token, out_token, token_idx, cached_seq_idx,
+                                                    h_start, h_end);
+            }
             continue;
         }
 
@@ -4806,6 +5426,10 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                     static_cast<double>(max_abs_diff), max_h, max_d, static_cast<double>(fast_val),
                     static_cast<double>(ref_val));
             }
+        }
+        if (ShouldRunPagedAttentionEagerReferenceProbe(ud->layer, token_idx)) {
+            LogPagedAttentionEagerReferenceProbe(ud, block_table, cached_context_len, cached_retained_span, cached_pos_i,
+                                                q_token, out_token, token_idx, cached_seq_idx, h_start, h_end);
         }
     }
 
@@ -5526,11 +6150,16 @@ enum class HalAttentionTensorLayout : uint8_t {
     GgmlDimHeadSeq,  // [head_dim, head, seq]
 };
 
+constexpr uint32_t kFastAttentionSemanticLogitSoftcap = 1u << 0;
+
 struct HalAttentionOpData {
     float scale = 1.0f;
     int n_head_kv = -1;
     int q_start_offset = 0;
     int kv_start_offset = 0;
+    int sliding_window = -1;
+    float logit_softcap = 0.0f;
+    uint32_t semantic_flags = 0;
     uint8_t causal = 1;
     uint8_t layout = static_cast<uint8_t>(HalAttentionTensorLayout::HeadSeq);
     densecore::DeviceType preferred_device = densecore::DeviceType::CPU;
@@ -5591,7 +6220,8 @@ static bool ShouldRunPortableFlashParityCheck(int layer) {
 
 static void ComputeFlashAttentionReference(const float* q, const float* k, const float* v, float* out, int n_head,
                                            int n_head_kv, int seq_q, int seq_kv, int head_dim, float scale, bool causal,
-                                           int q_start_offset = 0, int kv_start_offset = 0) {
+                                           int q_start_offset, int kv_start_offset, int sliding_window,
+                                           float logit_softcap) {
     if (!q || !k || !v || !out || n_head <= 0 || n_head_kv <= 0 || seq_q <= 0 || seq_kv <= 0 || head_dim <= 0) {
         return;
     }
@@ -5612,7 +6242,12 @@ static void ComputeFlashAttentionReference(const float* q, const float* k, const
             std::vector<float> scores(static_cast<size_t>(seq_kv), -INFINITY);
             float row_max = -INFINITY;
             for (int tk = 0; tk < seq_kv; ++tk) {
-                if (causal && (kv_start_offset + tk) > (q_start_offset + tq)) {
+                const int query_pos = q_start_offset + tq;
+                const int key_pos = kv_start_offset + tk;
+                if (causal && key_pos > query_pos) {
+                    continue;
+                }
+                if (sliding_window >= 0 && key_pos < (query_pos - sliding_window)) {
                     continue;
                 }
                 const float* k_row = k_head + static_cast<size_t>(tk) * head_dim;
@@ -5621,6 +6256,9 @@ static void ComputeFlashAttentionReference(const float* q, const float* k, const
                     score += q_row[d] * k_row[d];
                 }
                 score *= scale;
+                if (logit_softcap > 0.0f) {
+                    score = std::tanh(score / logit_softcap) * logit_softcap;
+                }
                 scores[static_cast<size_t>(tk)] = score;
                 row_max = std::max(row_max, score);
             }
@@ -5773,10 +6411,13 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
 
         densecore::FlashAttentionConfig config = densecore::AutoTuneFlashConfig(head_dim, seq_kv);
         config.scale = params->data.scale;
+        config.logit_softcap = params->data.logit_softcap;
         config.causal = params->data.causal != 0;
+        config.sliding_window = params->data.sliding_window;
         config.num_threads = std::max(1, nth);
         config.q_start_offset = std::max(0, params->data.q_start_offset);
         config.kv_start_offset = std::max(0, params->data.kv_start_offset);
+        config.semantic_flags = params->data.semantic_flags;
 
         const float* q_data = reinterpret_cast<const float*>(q->data);
         const float* k_data = reinterpret_cast<const float*>(k->data);
@@ -5804,11 +6445,15 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
     }
 
     try {
-        backend->FlashAttention(Q, K, V, &O, params->data.scale, params->data.causal != 0, n_head_kv);
+        backend->FlashAttention(Q, K, V, &O, params->data.scale, params->data.causal != 0, n_head_kv,
+                                params->data.sliding_window, params->data.logit_softcap,
+                                params->data.semantic_flags);
     } catch (...) {
         densecore::ComputeBackend* cpu = registry.Get(densecore::DeviceType::CPU);
         if (cpu && cpu != backend) {
-            cpu->FlashAttention(Q, K, V, &O, params->data.scale, params->data.causal != 0, n_head_kv);
+            cpu->FlashAttention(Q, K, V, &O, params->data.scale, params->data.causal != 0, n_head_kv,
+                                params->data.sliding_window, params->data.logit_softcap,
+                                params->data.semantic_flags);
         }
     }
 
@@ -5817,7 +6462,9 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
         ComputeFlashAttentionReference(reinterpret_cast<const float*>(q->data), reinterpret_cast<const float*>(k->data),
                                        reinterpret_cast<const float*>(v->data), ref.data(), n_head, n_head_kv, seq_q,
                                        seq_kv, head_dim, params->data.scale, params->data.causal != 0,
-                                       params->data.q_start_offset, params->data.kv_start_offset);
+                                       params->data.q_start_offset, params->data.kv_start_offset,
+                                       params->data.sliding_window,
+                                       params->data.logit_softcap);
 
         const float* got = reinterpret_cast<const float*>(dst->data);
         float max_abs = 0.0f;
@@ -5842,7 +6489,8 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
 
 inline struct ggml_tensor* ggml_flash_attention_hal(struct ggml_context* ctx, struct ggml_tensor* Q,
                                                     struct ggml_tensor* K, struct ggml_tensor* V, float scale,
-                                                    bool causal, int n_head_kv, int layer,
+                                                    bool causal, int n_head_kv, int sliding_window, float logit_softcap,
+                                                    uint32_t semantic_flags, int layer,
                                                     densecore::DeviceType preferred_device,
                                                     HalAttentionTensorLayout layout = HalAttentionTensorLayout::HeadSeq,
                                                     int q_start_offset = 0, int kv_start_offset = 0) {
@@ -5856,7 +6504,8 @@ inline struct ggml_tensor* ggml_flash_attention_hal(struct ggml_context* ctx, st
     HalAttentionCustomParams params = {cb_flash_attention_hal_custom,
                                        1,
                                        nullptr,
-                                       {scale, n_head_kv, q_start_offset, kv_start_offset,
+                                       {scale, n_head_kv, q_start_offset, kv_start_offset, sliding_window, logit_softcap,
+                                        semantic_flags,
                                         static_cast<uint8_t>(causal ? 1 : 0), static_cast<uint8_t>(layout),
                                         preferred_device, layer}};
     static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "params too large");
@@ -6750,21 +7399,95 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
         if (!model || !tensor || expected_k <= 0 || expected_n <= 0) {
             return packed;
         }
+        const auto pack_direct = [&](const TransformerModel::Int4WeightBinding& binding,
+                                     const ggml_tensor* bound_tensor, int logical_n) -> ExpertPackedInt4Weight {
+            if (!bound_tensor || !bound_tensor->data || !binding.packed || !binding.scales || !binding.zeros ||
+                !binding.packed->data || !binding.scales->data || !binding.zeros->data || binding.group_size <= 0 ||
+                binding.k != expected_k || binding.n != logical_n) {
+                return {};
+            }
+            ExpertPackedInt4Weight resolved{};
+            resolved.packed_weights = reinterpret_cast<const uint8_t*>(bound_tensor->data);
+            resolved.scales = reinterpret_cast<const float*>(binding.scales->data);
+            resolved.zeros = reinterpret_cast<const float*>(binding.zeros->data);
+            resolved.group_size = binding.group_size;
+            resolved.K = static_cast<int>(binding.k);
+            resolved.N = static_cast<int>(binding.n);
+            return resolved;
+        };
+
         const auto it = model->int4_weight_bindings.find(tensor);
-        if (it == model->int4_weight_bindings.end()) {
-            return packed;
+        if (it != model->int4_weight_bindings.end()) {
+            packed = pack_direct(it->second, tensor, expected_n);
+            if (packed.IsValid()) {
+                return packed;
+            }
         }
-        const auto& binding = it->second;
+
+        const ggml_tensor* root = tensor->view_src;
+        if (!root) {
+            return {};
+        }
+        const auto it_root = model->int4_weight_bindings.find(root);
+        if (it_root == model->int4_weight_bindings.end()) {
+            return {};
+        }
+        const auto& binding = it_root->second;
         if (!binding.packed || !binding.scales || !binding.zeros || !binding.packed->data || !binding.scales->data ||
-            !binding.zeros->data || binding.group_size <= 0 || binding.k != expected_k || binding.n != expected_n) {
-            return packed;
+            !binding.zeros->data || binding.group_size <= 0 || binding.k != expected_k || binding.n < expected_n ||
+            !tensor->data) {
+            return {};
         }
-        packed.packed_weights = reinterpret_cast<const uint8_t*>(binding.packed->data);
-        packed.scales = reinterpret_cast<const float*>(binding.scales->data);
-        packed.zeros = reinterpret_cast<const float*>(binding.zeros->data);
+
+        const size_t row_stride_bytes = static_cast<size_t>(root->nb[1]);
+        if (row_stride_bytes == 0) {
+            return {};
+        }
+        const size_t plane_stride_bytes = static_cast<size_t>(root->nb[2]);
+        const size_t total_offs = tensor->view_offs;
+        size_t expert_idx = 0;
+        size_t row_offs_bytes = total_offs;
+        if (plane_stride_bytes > 0 && root->ne[2] > 1) {
+            expert_idx = total_offs / plane_stride_bytes;
+            row_offs_bytes = total_offs % plane_stride_bytes;
+        }
+        if ((row_offs_bytes % row_stride_bytes) != 0) {
+            return {};
+        }
+
+        const size_t row_start = row_offs_bytes / row_stride_bytes;
+        if (row_start + static_cast<size_t>(expected_n) > static_cast<size_t>(binding.n)) {
+            return {};
+        }
+
+        const int64_t groups_per_row = binding.k / binding.group_size;
+        if (groups_per_row <= 0) {
+            return {};
+        }
+
+        const size_t scales_row_stride = static_cast<size_t>(binding.scales->nb[1] / sizeof(float));
+        const size_t zeros_row_stride = static_cast<size_t>(binding.zeros->nb[1] / sizeof(float));
+        if (scales_row_stride == 0 || zeros_row_stride == 0) {
+            return {};
+        }
+
+        size_t scales_off = row_start * scales_row_stride;
+        size_t zeros_off = row_start * zeros_row_stride;
+        if (expert_idx > 0) {
+            if (binding.scales->ne[2] <= 1 || binding.zeros->ne[2] <= 1 || binding.scales->nb[2] == 0 ||
+                binding.zeros->nb[2] == 0) {
+                return {};
+            }
+            scales_off += expert_idx * static_cast<size_t>(binding.scales->nb[2] / sizeof(float));
+            zeros_off += expert_idx * static_cast<size_t>(binding.zeros->nb[2] / sizeof(float));
+        }
+
+        packed.packed_weights = reinterpret_cast<const uint8_t*>(tensor->data);
+        packed.scales = reinterpret_cast<const float*>(binding.scales->data) + scales_off;
+        packed.zeros = reinterpret_cast<const float*>(binding.zeros->data) + zeros_off;
         packed.group_size = binding.group_size;
-        packed.K = static_cast<int>(binding.k);
-        packed.N = static_cast<int>(binding.n);
+        packed.K = expected_k;
+        packed.N = expected_n;
         return packed;
     };
 
@@ -6778,6 +7501,7 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
         w.w3 = {nullptr, 0};
         w.hidden_dim = 0;
         w.intermediate_dim = 0;
+        w.use_gelu_activation = IsGemma4MoEModel(model, layer);
 
         auto* gw1 = layer->GetExpert(i, model_keys::kFfnGate);
         if (gw1) {
@@ -6837,6 +7561,10 @@ static bool IsMoEDebugLoggingEnabled() {
     return ParseTruthyEnv("DENSECORE_DEBUG_MOE_CALLBACKS", false);
 }
 
+static bool IsMoEStageTimingEnabled() {
+    return ParseTruthyEnv("DENSECORE_DEBUG_MOE_STAGE_TIMING", false);
+}
+
 static void EnsureMoERebalanceThread(densecore::CpuBackend* backend) {
     if (IsBenchmarkMode() || !backend || backend->IsRebalanceThreadRunning()) {
         return;
@@ -6862,6 +7590,48 @@ static void UpdateSchedulerExperts(const MoEUserData* ud, const densecore::moe::
 
     const bool has_token_indices = !routing.token_indices.empty();
     const int total_assignments = static_cast<int>(routing.expert_ids.size());
+    const bool decode_single_token_per_seq = batch->seq_id.size() == batch->scheduler_seq_ids.size() &&
+                                             static_cast<int>(batch->seq_id.size()) == routing.batch_size;
+
+    if (decode_single_token_per_seq) {
+        std::vector<int> experts;
+        experts.reserve(static_cast<size_t>(std::max(1, routing.top_k)));
+
+        const int token_count = static_cast<int>(batch->seq_id.size());
+        for (int token_idx = 0; token_idx < token_count; ++token_idx) {
+            const int seq_idx = batch->seq_id[static_cast<size_t>(token_idx)];
+            if (seq_idx < 0 || seq_idx >= num_seqs) {
+                continue;
+            }
+
+            experts.clear();
+            for (int i = 0; i < total_assignments; ++i) {
+                const int routed_token_idx = has_token_indices ? routing.token_indices[static_cast<size_t>(i)]
+                                                               : (i / routing.top_k);
+                if (routed_token_idx != token_idx) {
+                    continue;
+                }
+                const int expert_id = routing.expert_ids[static_cast<size_t>(i)];
+                if (expert_id < 0) {
+                    continue;
+                }
+                if (std::find(experts.begin(), experts.end(), expert_id) == experts.end()) {
+                    experts.push_back(expert_id);
+                }
+            }
+
+            if (experts.empty()) {
+                continue;
+            }
+            const int sched_seq_id = batch->scheduler_seq_ids[static_cast<size_t>(seq_idx)];
+            if (sched_seq_id < 0) {
+                continue;
+            }
+            ud->scheduler->SetPredictedExperts(sched_seq_id, experts);
+        }
+        return;
+    }
+
     for (int i = 0; i < total_assignments; ++i) {
         const int token_idx = has_token_indices ? routing.token_indices[i] : (i / routing.top_k);
         if (token_idx < 0 || token_idx >= static_cast<int>(batch->seq_id.size())) {
@@ -6877,9 +7647,6 @@ static void UpdateSchedulerExperts(const MoEUserData* ud, const densecore::moe::
         }
         per_seq_experts[static_cast<size_t>(seq_idx)].push_back(expert_id);
     }
-
-    const bool decode_single_token_per_seq = batch->seq_id.size() == batch->scheduler_seq_ids.size() &&
-                                             static_cast<int>(batch->seq_id.size()) == routing.batch_size;
 
     for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
         auto& experts = per_seq_experts[static_cast<size_t>(seq_idx)];
@@ -7074,6 +7841,53 @@ static bool RouteMoESoftmaxTopK(const struct ggml_tensor* gate_logits, const MoE
     return true;
 }
 
+static bool RouteMoEGemma4TopK(const struct ggml_tensor* gate_logits, const MoEUserData* ud,
+                               densecore::moe::MoERouteResult* routing) {
+    if (!gate_logits || !ud || !ud->model || !ud->layer || !routing) {
+        return false;
+    }
+
+    const int n_experts = static_cast<int>(gate_logits->ne[0]);
+    const int batch_size = static_cast<int>(gate_logits->ne[1]);
+    const int top_k = std::max(1, std::min(ud->k, n_experts));
+    if (!EnsureMoERouteStorage(routing, batch_size, top_k)) {
+        return false;
+    }
+
+    const float* logits = reinterpret_cast<const float*>(gate_logits->data);
+    if (!logits) {
+        return false;
+    }
+
+    thread_local std::vector<float> route_workspace;
+    thread_local densecore::moe::MoERoutingWorkspace ws;
+    const size_t workspace_bytes = densecore::moe::GetMoERoutingWorkspaceSize(batch_size, n_experts, top_k);
+    const size_t workspace_floats = (workspace_bytes + sizeof(float) - 1) / sizeof(float);
+    route_workspace.resize(workspace_floats);
+    if (!densecore::moe::InitMoERoutingWorkspace(&ws, route_workspace.data(), route_workspace.size() * sizeof(float),
+                                                 batch_size, n_experts, top_k)) {
+        return false;
+    }
+    if (!densecore::moe::MoETopKRoute(logits, batch_size, n_experts, top_k, true, routing, &ws)) {
+        return false;
+    }
+
+    const struct ggml_tensor* per_expert_scale_t = ud->layer->Get(kGemma4RouterPerExpertScaleKey);
+    const float* per_expert_scale =
+        (per_expert_scale_t && per_expert_scale_t->type == GGML_TYPE_F32) ? reinterpret_cast<const float*>(per_expert_scale_t->data)
+                                                                          : nullptr;
+    const float scale = ud->model->moe_routed_scaling_factor;
+    for (size_t i = 0; i < routing->weights.size(); ++i) {
+        const int expert_id = routing->expert_ids[i];
+        if (per_expert_scale && expert_id >= 0 && expert_id < n_experts) {
+            routing->weights[i] *= per_expert_scale[expert_id];
+        }
+        routing->weights[i] *= scale;
+        routing->token_indices[i] = static_cast<int>(i / static_cast<size_t>(top_k));
+    }
+    return true;
+}
+
 void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
                     int nth, void* userdata) {
     (void)nth;
@@ -7093,17 +7907,39 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     if (!ud->experts_registered || !ud->experts || ud->n_experts <= 0) return;
 
     // Routing (src1 = gate_logits)
+    const bool debug_stage_timing = IsMoEStageTimingEnabled();
+    const auto route_begin = debug_stage_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     thread_local densecore::moe::MoERouteResult routing;
-    const bool routed = (ud->model && ud->model->arch_flags.is_glm_moe) ? RouteMoEGroupedSigmoid(src1, ud, &routing)
-                                                                        : RouteMoESoftmaxTopK(src1, ud, &routing);
+    const bool routed = (ud->model && ud->model->arch_flags.is_glm_moe)
+                            ? RouteMoEGroupedSigmoid(src1, ud, &routing)
+                        : IsGemma4MoEModel(ud->model, ud->layer) ? RouteMoEGemma4TopK(src1, ud, &routing)
+                                                                 : RouteMoESoftmaxTopK(src1, ud, &routing);
     if (!routed || routing.expert_ids.empty()) return;
+    const auto route_end = debug_stage_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     UpdateSchedulerExperts(ud, routing);
+    const auto scheduler_end =
+        debug_stage_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     // Forward (src0 = input, dst = output)
     densecore::Tensor t_input = GgmlToRowMajorTensor(src0);
     densecore::Tensor t_output = GgmlToRowMajorTensor(dst);
 
     ud->backend->ForwardMoE(ud->layer, t_input, routing, ud->experts, ud->n_experts, &t_output);
+    if (debug_stage_timing) {
+        const auto backend_end = std::chrono::steady_clock::now();
+        const auto route_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(route_end - route_begin).count();
+        const auto scheduler_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(scheduler_end - route_end).count();
+        const auto backend_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(backend_end - scheduler_end).count();
+        std::fprintf(stderr,
+                     "[MOE_STAGE] layer=%d batch=%d top_k=%d assignments=%zu route_us=%lld scheduler_us=%lld "
+                     "backend_us=%lld\n",
+                     ud->layer_idx, routing.batch_size, routing.top_k, routing.expert_ids.size(),
+                     static_cast<long long>(route_us), static_cast<long long>(scheduler_us),
+                     static_cast<long long>(backend_us));
+    }
     if (IsMoEDebugLoggingEnabled()) {
         static std::atomic<int> moe_out_count{0};
         const int call_id = moe_out_count.fetch_add(1);
@@ -7234,9 +8070,26 @@ static void cb_projection_reference_probe(struct ggml_tensor* dst, const struct 
 
     std::vector<float> ref;
     ComputeMatmulReferenceF32(ud->weight_tensor, ud->input_tensor, &ref);
+    if (ref.empty() && ud->int4_packed && ud->int4_scales && ud->int4_zeros) {
+        ComputeMatmulReferenceInt4BindingF32(ud, &ref);
+    }
+    if (ref.empty() && ud->fp8_packed) {
+        ComputeMatmulReferenceFp8BindingF32(ud, &ref);
+    }
     if (ref.empty()) {
-        std::fprintf(stderr, "[PROJ_REF] layer=%d stage=%s var=%s status=skipped reason=reference_unavailable\n",
-                     ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown");
+        std::fprintf(stderr,
+                     "[PROJ_REF] layer=%d stage=%s var=%s status=skipped reason=reference_unavailable "
+                     "weight=%s wtype=%d wne0=%lld wne1=%lld input_type=%d ine0=%lld ine1=%lld int4=%d fp8=%d\n",
+                     ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown",
+                     ud->weight_tensor && ud->weight_tensor->name[0] ? ud->weight_tensor->name : "(unnamed)",
+                     ud->weight_tensor ? static_cast<int>(ud->weight_tensor->type) : -1,
+                     ud->weight_tensor ? static_cast<long long>(ud->weight_tensor->ne[0]) : -1LL,
+                     ud->weight_tensor ? static_cast<long long>(ud->weight_tensor->ne[1]) : -1LL,
+                     ud->input_tensor ? static_cast<int>(ud->input_tensor->type) : -1,
+                     ud->input_tensor ? static_cast<long long>(ud->input_tensor->ne[0]) : -1LL,
+                     ud->input_tensor ? static_cast<long long>(ud->input_tensor->ne[1]) : -1LL,
+                     ud->int4_packed ? 1 : 0,
+                     ud->fp8_packed ? 1 : 0);
         return;
     }
 
@@ -7293,6 +8146,60 @@ static void cb_projection_reference_probe(struct ggml_tensor* dst, const struct 
         std::fprintf(stderr, "[PROJ_REF] worst_diff runtime=%g ref=%g\n", static_cast<double>(runtime[max_idx]),
                      static_cast<double>(ref[static_cast<size_t>(max_idx)]));
     }
+}
+
+static void cb_shared_scalar_gate_reference_probe(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith,
+                                                  int nth, void* userdata) {
+    (void)nth;
+    if (ith != 0) return;
+    auto* ud = static_cast<SharedScalarGateReferenceUserData*>(userdata);
+    if (!dst || !src || !ud || !ud->shared_ffn_pre_gate || !ud->shared_gate_logits_scalar) return;
+    if (dst->data && src->data) {
+        std::memcpy(dst->data, src->data, ggml_nbytes(src));
+    }
+    if (!src->data || !ud->shared_ffn_pre_gate->data || !ud->shared_gate_logits_scalar->data) return;
+
+    const int hidden = static_cast<int>(src->ne[0]);
+    const int tokens = static_cast<int>(std::max<int64_t>(1, src->ne[1]));
+    const int scalar_elems = static_cast<int>(ggml_nelements(ud->shared_gate_logits_scalar));
+    if (hidden <= 0 || tokens <= 0 || scalar_elems < tokens) {
+        std::fprintf(stderr,
+                     "[SHARED_GATE_REF] layer=%d stage=%s var=%s status=skipped reason=shape_mismatch hidden=%d "
+                     "tokens=%d scalar=%d\n",
+                     ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown",
+                     hidden, tokens, scalar_elems);
+        return;
+    }
+
+    const float* runtime = reinterpret_cast<const float*>(src->data);
+    const float* shared_pre = reinterpret_cast<const float*>(ud->shared_ffn_pre_gate->data);
+    const float* gate_logits = reinterpret_cast<const float*>(ud->shared_gate_logits_scalar->data);
+
+    float max_abs_diff = 0.0f;
+    int max_idx = -1;
+    for (int t = 0; t < tokens; ++t) {
+        const float gate = SigmoidStable(gate_logits[t]);
+        for (int d = 0; d < hidden; ++d) {
+            const int idx = t * hidden + d;
+            const float ref = shared_pre[idx] * gate;
+            const float diff = std::fabs(runtime[idx] - ref);
+            if (diff > max_abs_diff) {
+                max_abs_diff = diff;
+                max_idx = idx;
+            }
+        }
+    }
+
+    const int token_idx = (max_idx >= 0 && hidden > 0) ? (max_idx / hidden) : -1;
+    const int elem_idx = (max_idx >= 0 && hidden > 0) ? (max_idx % hidden) : -1;
+    const int seq_idx = (ud->token_seq_ids && token_idx >= 0 && token_idx < tokens) ? ud->token_seq_ids[token_idx] : -1;
+    const float gate = (token_idx >= 0 && token_idx < scalar_elems) ? SigmoidStable(gate_logits[token_idx]) : 0.0f;
+    const float ref = (max_idx >= 0) ? shared_pre[max_idx] * gate : 0.0f;
+    const float actual = (max_idx >= 0) ? runtime[max_idx] : 0.0f;
+    std::fprintf(stderr,
+                 "[SHARED_GATE_REF] layer=%d stage=%s var=%s token=%d seq=%d elem=%d max_abs_diff=%g runtime=%g ref=%g gate=%g\n",
+                 ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown",
+                 token_idx, seq_idx, elem_idx, max_abs_diff, actual, ref, gate);
 }
 
 static void cb_attention_core_reference_probe(struct ggml_tensor* dst, const struct ggml_tensor* src,
@@ -7479,7 +8386,7 @@ static void cb_attention_post_reference_probe(struct ggml_tensor* dst, const str
                 reinterpret_cast<const float*>(ud->gate_tensor->data) +
                 static_cast<ptrdiff_t>(token_idx) * static_cast<ptrdiff_t>(ud->gate_tensor->nb[1] / sizeof(float));
             for (int i = 0; i < d_inner; ++i) {
-                ref_token[static_cast<size_t>(i)] *= SigmoidStable(gate_col[i]);
+                ref_token[static_cast<size_t>(i)] *= gate_col[i];
             }
         }
 
@@ -8023,6 +8930,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     if (out_embd) *out_embd = embd_inp;
 
     struct ggml_tensor* cur = ggml_get_rows(ctx_c, model->tok_embeddings, embd_inp);
+    if (model->arch_flags.is_gemma4) {
+        cur = ggml_scale(ctx_c, cur, std::sqrt(static_cast<float>(model->hparams.n_embd)));
+    }
 
     if (IsDebugInferenceStatsEnabled()) {
         // TEMP DEBUG: Check embedding output
@@ -8065,19 +8975,27 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
 
     const bool decode_only_batch_layout = IsDecodeOnlyBatchLayout(batch, N);
 
-    auto qwen35_effective_rms_weight = [&](struct ggml_tensor * norm_weight,
-                                           const char* debug_name) -> struct ggml_tensor* {
-        if (!norm_weight || model->arch != ModelArch::QWEN35) {
+    auto requires_gemma_rms_weight_offset = [&]() -> bool {
+        return model && model->arch_flags.uses_unit_offset_rms_norm;
+    };
+
+    auto effective_rms_weight = [&](struct ggml_tensor * norm_weight,
+                                    const char* debug_name) -> struct ggml_tensor* {
+        if (!norm_weight) {
             return norm_weight;
         }
-        struct ggml_tensor* one = ggml_new_tensor_1d(ctx_c, GGML_TYPE_F32, 1);
-        ggml_set_f32(one, 1.0f);
-        struct ggml_tensor* one_broadcast = ggml_repeat(ctx_c, one, norm_weight);
-        struct ggml_tensor* effective = ggml_add(ctx_c, norm_weight, one_broadcast);
-        if (debug_name) {
-            ggml_set_name(effective, debug_name);
+        if (requires_gemma_rms_weight_offset()) {
+            struct ggml_tensor* one = ggml_new_f32(ctx_c, 1.0f);
+            struct ggml_tensor* shifted = ggml_add1(ctx_c, norm_weight, one);
+            if (debug_name) {
+                ggml_set_name(shifted, debug_name);
+            }
+            return shifted;
         }
-        return effective;
+        if (debug_name) {
+            ggml_set_name(norm_weight, debug_name);
+        }
+        return norm_weight;
     };
 
     auto bind_add_rmsnorm_weight = [&](AddRMSNormUserData* ud, struct ggml_tensor* norm_weight,
@@ -8095,16 +9013,16 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                                                       " has invalid element count");
         }
         const float* raw_weight = reinterpret_cast<const float*>(norm_weight->data);
-        if (model->arch != ModelArch::QWEN35) {
+        if (requires_gemma_rms_weight_offset()) {
+            ud->owned_rms_weight.resize(static_cast<size_t>(n_weight));
+            for (int64_t i = 0; i < n_weight; ++i) {
+                ud->owned_rms_weight[static_cast<size_t>(i)] = raw_weight[i] + 1.0f;
+            }
+            ud->rms_weight = ud->owned_rms_weight.data();
+        } else {
             ud->owned_rms_weight.clear();
             ud->rms_weight = raw_weight;
-            return;
         }
-        ud->owned_rms_weight.resize(static_cast<size_t>(n_weight));
-        for (int64_t i = 0; i < n_weight; ++i) {
-            ud->owned_rms_weight[static_cast<size_t>(i)] = raw_weight[i] + 1.0f;
-        }
-        ud->rms_weight = ud->owned_rms_weight.data();
     };
 
     auto apply_weighted_rms_norm = [&](struct ggml_tensor * src, struct ggml_tensor * norm_weight,
@@ -8112,7 +9030,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
         if (!src || !norm_weight) {
             return src;
         }
-        struct ggml_tensor* effective_norm_weight = qwen35_effective_rms_weight(norm_weight, nullptr);
+        struct ggml_tensor* effective_norm_weight = effective_rms_weight(norm_weight, nullptr);
 
         const bool force_cpu_norm =
             IsMixedRoutingEnabled(&batch) && ResolvePreferredNormDevice(&batch) == densecore::DeviceType::CPU &&
@@ -8135,6 +9053,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
         ud->n_tokens = static_cast<int>(src->ne[1]);
         ud->eps = model->hparams.f_norm_rms_eps;
         ud->residual_row_stride = 0;
+        ud->layer_idx = -1;
+        ud->token_seq_ids = batch.seq_id.data();
+        ud->stage = "rms_norm";
+        ud->var_name = debug_name ? debug_name : "rms_norm";
         const int n_tasks = ResolveTaskCount(&batch, std::max(1, ud->n_tokens));
         struct ggml_tensor* out = ggml_map_custom1(ctx_c, src, cb_residual_rmsnorm_fused, n_tasks, ud);
         if (debug_name) {
@@ -8142,6 +9064,33 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
         }
         return out;
     };
+
+    struct ggml_tensor* gemma4_per_layer_inputs = nullptr;
+    if (model->arch_flags.is_gemma4 && model->gemma4_hidden_size_per_layer_input > 0 &&
+        model->gemma4_per_layer_model_projection && model->gemma4_per_layer_projection_norm &&
+        model->gemma4_per_layer_token_embeddings) {
+        const int hidden_per_layer = model->gemma4_hidden_size_per_layer_input;
+        const int n_layer_i = static_cast<int>(model->hparams.n_layer);
+
+        struct ggml_tensor* token_inputs = ggml_get_rows(ctx_c, model->gemma4_per_layer_token_embeddings, embd_inp);
+        token_inputs = ggml_scale(ctx_c, token_inputs, std::sqrt(static_cast<float>(hidden_per_layer)));
+        token_inputs = ggml_reshape_3d(ctx_c, token_inputs, hidden_per_layer, n_layer_i, N);
+
+        struct ggml_tensor* projected_inputs =
+            smart_mul_mat(ctx_c, model->gemma4_per_layer_model_projection, cur, model);
+        projected_inputs =
+            ggml_scale(ctx_c, projected_inputs, 1.0f / std::sqrt(static_cast<float>(model->hparams.n_embd)));
+        projected_inputs = ggml_reshape_3d(ctx_c, projected_inputs, hidden_per_layer, n_layer_i, N);
+
+        struct ggml_tensor* projected_inputs_2d =
+            ggml_reshape_2d(ctx_c, projected_inputs, hidden_per_layer, n_layer_i * N);
+        projected_inputs_2d =
+            apply_weighted_rms_norm(projected_inputs_2d, model->gemma4_per_layer_projection_norm,
+                                    "gemma4_per_layer_projection_norm");
+        gemma4_per_layer_inputs = ggml_reshape_3d(ctx_c, projected_inputs_2d, hidden_per_layer, n_layer_i, N);
+        gemma4_per_layer_inputs = ggml_add(ctx_c, gemma4_per_layer_inputs, token_inputs);
+        gemma4_per_layer_inputs = ggml_scale(ctx_c, gemma4_per_layer_inputs, std::pow(2.0f, -0.5f));
+    }
 
     // Reuse causal mask tensor across layers for the same forward pass.
     // Prefill builds N>1 attention repeatedly; hoisting avoids O(L * N * K)
@@ -8175,6 +9124,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
         shared_prefill_mask_n = N;
         shared_prefill_mask_n_past = prefill_n_past;
     }
+
+    std::vector<struct ggml_tensor*> gemma4_layer_k_cache(static_cast<size_t>(n_layer), nullptr);
+    std::vector<struct ggml_tensor*> gemma4_layer_v_cache(static_cast<size_t>(n_layer), nullptr);
 
     // =========================================================================
     // 2. Transformer Layers
@@ -8392,6 +9344,14 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // Q/K/V Projections (using smart dispatcher for Parallel GEMV)
             const bool use_glm_dsa_mla =
                 model->arch_flags.is_glm_dsa && q_a && q_a_norm && q_b && kv_a && kv_a_norm && kv_b;
+            const bool gemma4_value_from_key = !use_glm_dsa_mla && !wv && wk && model->arch_flags.is_gemma4;
+            if (!use_glm_dsa_mla && (!wq || !wk || !wv)) {
+                if (gemma4_value_from_key) {
+                    // Gemma4 alternative attention omits V projection on some layers.
+                    // Those blocks use the raw K projection as the input to v_norm.
+                    wv = wk;
+                }
+            }
             if (!use_glm_dsa_mla && (!wq || !wk || !wv)) {
                 const std::string hint =
                     model->arch_flags.is_hybrid_ssm
@@ -8618,33 +9578,39 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             int dim_v = Vcur->ne[0];
 
             int n_head_kv = model->hparams.n_head_kv;
-            int head_dim_kv = (model->hparams.n_embd_head_k > 0) ? model->hparams.n_embd_head_k : (dim_k / n_head_kv);
-            int head_dim_v = (model->hparams.n_embd_head_v > 0) ? model->hparams.n_embd_head_v : (dim_v / n_head_kv);
+            if (!model->gemma4_layer_n_head_kv.empty() && il < static_cast<int>(model->gemma4_layer_n_head_kv.size())) {
+                n_head_kv = static_cast<int>(model->gemma4_layer_n_head_kv[static_cast<size_t>(il)]);
+            }
+            const bool use_runtime_kv_dims = model->arch_flags.is_gemma4 || !model->gemma4_layer_n_head_kv.empty();
+            int head_dim_kv =
+                (!use_runtime_kv_dims && model->hparams.n_embd_head_k > 0) ? model->hparams.n_embd_head_k
+                                                                            : (n_head_kv > 0 ? (dim_k / n_head_kv) : 0);
+            int head_dim_v =
+                (!use_runtime_kv_dims && model->hparams.n_embd_head_v > 0) ? model->hparams.n_embd_head_v
+                                                                            : (n_head_kv > 0 ? (dim_v / n_head_kv) : 0);
             struct ggml_tensor* attn_gate = nullptr;
 
-            // Qwen3.5 hybrid attention follows the Qwen3NextAttention contract:
-            // q_proj is viewed as [n_head, head_dim * 2] and then split on the
-            // last dimension into per-head [q | gate]. This is not a global
-            // [all_q][all_gate] split.
+            // Qwen3.5 hybrid attention packs [q | gate] per-head, not as two
+            // contiguous global halves. Mirror llama.cpp's strided per-head views.
             if (model->arch_flags.is_hybrid_ssm && dim_q > head_dim_kv * n_head) {
                 const int64_t q_attn_dim = static_cast<int64_t>(head_dim_kv) * n_head;
                 const int64_t q_full_per_head = dim_q / n_head;
                 const int64_t q_attn_per_head = head_dim_kv;
-                if (q_full_per_head != q_attn_per_head * 2) {
-                    throw densecore::InvalidArgumentException(
-                        "Hybrid attention Q projection has unexpected gate packing in layer " + std::to_string(il) +
-                        ": dim_q=" + std::to_string(dim_q) + " q_full_per_head=" + std::to_string(q_full_per_head) +
-                        " expected_per_head=" + std::to_string(q_attn_per_head * 2));
+                if (q_full_per_head >= q_attn_per_head * 2) {
+                    struct ggml_tensor* Qcur_full = Qcur;
+                    const size_t elem = ggml_element_size(Qcur_full);
+                    struct ggml_tensor* Qcur_head = ggml_view_3d(ctx_c, Qcur_full, q_attn_per_head, n_head, N,
+                                                                 elem * q_full_per_head, Qcur_full->nb[1], 0);
+                    struct ggml_tensor* gate_head =
+                        ggml_view_3d(ctx_c, Qcur_full, q_attn_per_head, n_head, N, elem * q_full_per_head,
+                                     Qcur_full->nb[1], elem * q_attn_per_head);
+                    Qcur = ggml_cont_2d(ctx_c, Qcur_head, q_attn_dim, N);
+                    attn_gate = ggml_cont_2d(ctx_c, gate_head, q_attn_dim, N);
+                } else {
+                    attn_gate = ggml_cont(ctx_c, ggml_view_2d(ctx_c, Qcur, q_attn_dim, N, Qcur->nb[1],
+                                                              q_attn_dim * ggml_element_size(Qcur)));
+                    Qcur = ggml_cont(ctx_c, ggml_view_2d(ctx_c, Qcur, q_attn_dim, N, Qcur->nb[1], 0));
                 }
-                struct ggml_tensor* Qcur_full = Qcur;
-                const size_t elem = ggml_element_size(Qcur_full);
-                struct ggml_tensor* Qcur_head = ggml_view_3d(ctx_c, Qcur_full, q_attn_per_head, n_head, N,
-                                                             elem * q_full_per_head, Qcur_full->nb[1], 0);
-                struct ggml_tensor* gate_head =
-                    ggml_view_3d(ctx_c, Qcur_full, q_attn_per_head, n_head, N, elem * q_full_per_head, Qcur_full->nb[1],
-                                 elem * q_attn_per_head);
-                Qcur = ggml_cont_2d(ctx_c, Qcur_head, q_attn_dim, N);
-                attn_gate = ggml_cont_2d(ctx_c, gate_head, q_attn_dim, N);
                 dim_q = static_cast<int>(q_attn_dim);
             }
 
@@ -8654,13 +9620,16 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             bool v_done = false;
 
             // Reshape Q (Standard)
+            ValidateAttentionProjectionShape3D(Qcur, "Qcur", il, head_dim_q, n_head, N, dim_q, n_head);
             Qcur = ggml_reshape_3d(ctx_c, Qcur, head_dim_q, n_head, N);
 
             // Reshape K/V
             if (!k_done) {
+                ValidateAttentionProjectionShape3D(Kcur, "Kcur", il, head_dim_kv, n_head_kv, N, dim_k, n_head_kv);
                 Kcur = ggml_reshape_3d(ctx_c, Kcur, head_dim_kv, n_head_kv, N);
             }
             if (!v_done) {
+                ValidateAttentionProjectionShape3D(Vcur, "Vcur", il, head_dim_v, n_head_kv, N, dim_v, n_head_kv);
                 Vcur = ggml_reshape_3d(ctx_c, Vcur, head_dim_v, n_head_kv, N);
             }
 
@@ -8683,12 +9652,17 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // Q Normalization (required for Qwen3, optional for others)
             if (model->arch_flags.requires_q_norm && q_norm) {
                 const int64_t q_n_tokens = Qcur->ne[2];  // N (batch size)
-                struct ggml_tensor* q_norm_effective = qwen35_effective_rms_weight(q_norm, nullptr);
+                struct ggml_tensor* q_norm_effective = effective_rms_weight(q_norm, nullptr);
                 if (IsDebugInferenceStatsEnabled() && il == 3) {
                     static int qnorm_dbg = 0;
+                    if (qnorm_dbg < 2 && q_norm->data && q_norm->type == GGML_TYPE_F32) {
+                        const float* qn_raw = reinterpret_cast<const float*>(q_norm->data);
+                        fprintf(stderr, "[QNORM_L3_RAW #%d] q_norm_raw[0]=%.6f q_norm_raw[1]=%.6f q_norm_raw[2]=%.6f q_norm_raw[3]=%.6f\n",
+                                qnorm_dbg, qn_raw[0], qn_raw[1], qn_raw[2], qn_raw[3]);
+                    }
                     if (qnorm_dbg < 2 && q_norm_effective->data && q_norm_effective->type == GGML_TYPE_F32) {
                         const float* qn = reinterpret_cast<const float*>(q_norm_effective->data);
-                        fprintf(stderr, "[QNORM_L3 #%d] q_norm[0]=%.6f q_norm[1]=%.6f q_norm[2]=%.6f q_norm[3]=%.6f\n",
+                        fprintf(stderr, "[QNORM_L3_EFFECTIVE #%d] q_norm[0]=%.6f q_norm[1]=%.6f q_norm[2]=%.6f q_norm[3]=%.6f\n",
                                 qnorm_dbg, qn[0], qn[1], qn[2], qn[3]);
                         qnorm_dbg++;
                     }
@@ -8724,12 +9698,17 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // K Normalization (required for Qwen3, optional for others)
             if (model->arch_flags.requires_k_norm && k_norm) {
                 const int64_t k_n_tokens = Kcur->ne[2];  // N (batch size)
-                struct ggml_tensor* k_norm_effective = qwen35_effective_rms_weight(k_norm, nullptr);
+                struct ggml_tensor* k_norm_effective = effective_rms_weight(k_norm, nullptr);
                 if (IsDebugInferenceStatsEnabled() && il == 3) {
                     static int knorm_dbg = 0;
+                    if (knorm_dbg < 2 && k_norm->data && k_norm->type == GGML_TYPE_F32) {
+                        const float* kn_raw = reinterpret_cast<const float*>(k_norm->data);
+                        fprintf(stderr, "[KNORM_L3_RAW #%d] k_norm_raw[0]=%.6f k_norm_raw[1]=%.6f k_norm_raw[2]=%.6f k_norm_raw[3]=%.6f\n",
+                                knorm_dbg, kn_raw[0], kn_raw[1], kn_raw[2], kn_raw[3]);
+                    }
                     if (knorm_dbg < 2 && k_norm_effective->data && k_norm_effective->type == GGML_TYPE_F32) {
                         const float* kn = reinterpret_cast<const float*>(k_norm_effective->data);
-                        fprintf(stderr, "[KNORM_L3 #%d] k_norm[0]=%.6f k_norm[1]=%.6f k_norm[2]=%.6f k_norm[3]=%.6f\n",
+                        fprintf(stderr, "[KNORM_L3_EFFECTIVE #%d] k_norm[0]=%.6f k_norm[1]=%.6f k_norm[2]=%.6f k_norm[3]=%.6f\n",
                                 knorm_dbg, kn[0], kn[1], kn[2], kn[3]);
                         knorm_dbg++;
                     }
@@ -8762,10 +9741,39 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 }
             }
 
+            if (model->arch_flags.is_gemma4 && Vcur) {
+                const int64_t v_n_tokens = Vcur->ne[2];
+                if (head_dim_v > 0 && n_head_kv > 0) {
+                    struct ggml_tensor* V_2d = ggml_reshape_2d(ctx_c, Vcur, head_dim_v, n_head_kv * v_n_tokens);
+                    V_2d = ggml_rms_norm(ctx_c, V_2d, model->hparams.f_norm_rms_eps);
+                    Vcur = ggml_reshape_3d(ctx_c, V_2d, head_dim_v, n_head_kv, v_n_tokens);
+                }
+            }
+
             // Apply RoPE
             // Use n_rot from model params if specified (e.g. for partial RoPE or
             // specific dim) Fallback to full head_dim_q if n_rot is 0
             int rope_dim = model->hparams.n_rot;
+            float rope_freq_base = model->hparams.rope_freq_base;
+            bool use_gemma4_proportional_rope = false;
+            if (model->arch_flags.is_gemma4) {
+                const bool is_sliding_layer = IsGemma4SlidingLayer(model, il);
+                if (is_sliding_layer) {
+                    rope_dim = model->gemma4_rope_dim_swa > 0 ? model->gemma4_rope_dim_swa : rope_dim;
+                } else {
+                    use_gemma4_proportional_rope = true;
+                    rope_dim = static_cast<int>(std::lround(
+                        static_cast<float>(head_dim_q) * model->gemma4_full_attention_partial_rotary_factor));
+                    if (rope_dim <= 0) {
+                        rope_dim = head_dim_q;
+                    }
+                    // RoPE pairs operate on an even count of dimensions.
+                    rope_dim &= ~1;
+                }
+                rope_freq_base =
+                    is_sliding_layer && model->gemma4_rope_freq_base_swa > 0.0f ? model->gemma4_rope_freq_base_swa
+                                                                                 : model->gemma4_rope_freq_base_full;
+            }
             if (rope_dim <= 0) {
                 rope_dim = head_dim_q;
             }
@@ -8785,7 +9793,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             if (!skip_rope) {
                 struct ggml_tensor* Q_rope_fast = nullptr;
                 struct ggml_tensor* K_rope_fast = nullptr;
-                if (IsPrecomputedRoPEEnabled()) {
+                if (IsPrecomputedRoPEEnabled() &&
+                    (!model->arch_flags.is_gemma4 || use_gemma4_proportional_rope)) {
                     Q_rope_fast = ggml_rope_precomputed_table(ctx_c, Qcur, pos, model, rope_dim, &batch);
                     K_rope_fast = ggml_rope_precomputed_table(ctx_c, Kcur, pos, model, rope_dim, &batch);
                 }
@@ -8803,21 +9812,37 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                             model->hparams.rope_sections[3],
                         };
                         Qcur = ggml_rope_multi(ctx_c, Qcur, pos, nullptr, rope_dim, rope_sections, rope_mode, n_ctx,
-                                               model->hparams.rope_freq_base, model->hparams.rope_freq_scale, 0.0f,
-                                               1.0f, 0.0f, 0.0f);
+                                               rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f,
+                                               0.0f);
                         Kcur = ggml_rope_multi(ctx_c, Kcur, pos, nullptr, rope_dim, rope_sections, rope_mode, n_ctx,
-                                               model->hparams.rope_freq_base, model->hparams.rope_freq_scale, 0.0f,
-                                               1.0f, 0.0f, 0.0f);
+                                               rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f,
+                                               0.0f);
                     } else {
                         // Fallback to standard GGML RoPE when precomputed path is
                         // unavailable for this tensor/layout.
                         Qcur =
-                            ggml_rope_ext(ctx_c, Qcur, pos, nullptr, rope_dim, 0, n_ctx, model->hparams.rope_freq_base,
+                            ggml_rope_ext(ctx_c, Qcur, pos, nullptr, rope_dim, 0, n_ctx, rope_freq_base,
                                           model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
                         Kcur =
-                            ggml_rope_ext(ctx_c, Kcur, pos, nullptr, rope_dim, 0, n_ctx, model->hparams.rope_freq_base,
+                            ggml_rope_ext(ctx_c, Kcur, pos, nullptr, rope_dim, 0, n_ctx, rope_freq_base,
                                           model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
                     }
+                }
+            }
+
+            if (model->arch_flags.is_gemma4) {
+                const int kv_source_layer = Gemma4KVSourceLayer(model, il);
+                if (kv_source_layer == il) {
+                    gemma4_layer_k_cache[static_cast<size_t>(il)] = Kcur;
+                    gemma4_layer_v_cache[static_cast<size_t>(il)] = Vcur;
+                } else if (kv_source_layer >= 0 && kv_source_layer < n_layer &&
+                           gemma4_layer_k_cache[static_cast<size_t>(kv_source_layer)] &&
+                           gemma4_layer_v_cache[static_cast<size_t>(kv_source_layer)]) {
+                    Kcur = gemma4_layer_k_cache[static_cast<size_t>(kv_source_layer)];
+                    Vcur = gemma4_layer_v_cache[static_cast<size_t>(kv_source_layer)];
+                    n_head_kv = static_cast<int>(Kcur->ne[1]);
+                    head_dim_kv = static_cast<int>(Kcur->ne[0]);
+                    head_dim_v = static_cast<int>(Vcur->ne[0]);
                 }
             }
 
@@ -8899,6 +9924,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 const bool paged_decode_candidate = paged_decode_decision.candidate;
                 const bool requested_paged_decode_attention = paged_decode_decision.requested;
                 const bool decode_only_batch = decode_only_batch_layout;
+                const int kv_cache_layer = model->arch_flags.is_gemma4 ? Gemma4KVSourceLayer(model, il) : il;
 
                 // Safety override: GGML's generic decode matmul path can become numerically
                 // unstable for GQA decode (N=1, n_head != n_head_kv) on some CPU kernels.
@@ -8950,10 +9976,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     // The 'ggml_pad' trick updates cache as side effect.
                     // So we act always if use_cache is true.
 
-                    KVCacheUserData* k_ud = GetKVCacheUserData(il, true);
-                    *k_ud = {cache, il, head_dim_kv, true};  // batch accessed via GetCurrentBatch()
-                    KVCacheUserData* v_ud = GetKVCacheUserData(il, false);
-                    *v_ud = {cache, il, head_dim_v, false};  // batch accessed via GetCurrentBatch()
+                    KVCacheUserData* k_ud = GetKVCacheUserData(kv_cache_layer, true);
+                    *k_ud = {cache, kv_cache_layer, head_dim_kv, true};  // batch accessed via GetCurrentBatch()
+                    KVCacheUserData* v_ud = GetKVCacheUserData(kv_cache_layer, false);
+                    *v_ud = {cache, kv_cache_layer, head_dim_v, false};  // batch accessed via GetCurrentBatch()
 
                     int kv_tasks = ResolveInferenceConfig(&batch).num_threads;
                     if (kv_tasks <= 0) {
@@ -9149,21 +10175,31 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 // =========================================================================
                 // Note: Flash Attention still requires AVX-512-class x86 support for
                 // correctness/perf in this path.
+                const float fast_attn_logit_softcap =
+                    model->arch_flags.is_gemma4 ? model->gemma4_attention_logit_softcapping : 0.0f;
+                const int fast_attn_sliding_window =
+                    (model->arch_flags.is_gemma4 && IsGemma4SlidingLayer(model, il) && model->gemma4_sliding_window > 0)
+                        ? model->gemma4_sliding_window
+                        : -1;
+                const bool fast_attn_requires_extended_semantics = fast_attn_logit_softcap > 0.0f;
+                const uint32_t fast_attn_semantic_flags =
+                    fast_attn_requires_extended_semantics ? kFastAttentionSemanticLogitSoftcap : 0u;
                 const bool flash_attn_head_layout_supported =
                     !model->arch_flags.is_glm_dsa && (n_head_kv > 0) && (n_head % n_head_kv == 0) && (n_head % 8 == 0);
                 const bool flash_attn_runtime_supported = flash_attn_head_layout_supported &&
                                                           densecore::OpsRegistry::IsInitialized() &&
                                                           IsFlashAttentionIsaSupported();
                 const bool flash_attn_forced = IsFlashAttentionForced();
-                const bool use_flash_attention = !IsFlashAttentionDisabled() && flash_attn_runtime_supported;
+                const bool use_flash_attention =
+                    !fast_attn_requires_extended_semantics && !IsFlashAttentionDisabled() && flash_attn_runtime_supported;
                 const densecore::DeviceType preferred_attention_device = ResolvePreferredAttentionDevice(&batch);
                 // Non-CPU HAL backends do not currently carry the chunked-prefill query
                 // offset into causal masking, so they remain limited to zero-offset
                 // prefill or decode (N == 1).
                 const bool hal_attention_offset_safe = (n_past_val == 0) || (N == 1);
-                const bool use_hal_attention_dispatch = preferred_attention_device != densecore::DeviceType::CPU &&
-                                                        !use_paged_decode_attention && hal_attention_offset_safe &&
-                                                        !model->arch_flags.is_glm_dsa;
+                const bool use_hal_attention_dispatch =
+                    !fast_attn_requires_extended_semantics && preferred_attention_device != densecore::DeviceType::CPU &&
+                    !use_paged_decode_attention && hal_attention_offset_safe && !model->arch_flags.is_glm_dsa;
                 const bool portable_cpu_flash_attention_supported =
                     flash_attn_head_layout_supported && densecore::OpsRegistry::IsInitialized() &&
                     (IsPortableCpuFlashAttentionEnabled() || flash_attn_forced);
@@ -9187,7 +10223,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     }
                 }
                 const bool use_portable_cpu_flash_attention =
-                    !IsFlashAttentionDisabled() && preferred_attention_device == densecore::DeviceType::CPU &&
+                    !IsFlashAttentionDisabled() &&
+                    (preferred_attention_device == densecore::DeviceType::CPU || fast_attn_requires_extended_semantics) &&
                     !use_paged_decode_attention && portable_cpu_flash_attention_supported;
                 const bool use_portable_cpu_flash_native_decode_layout =
                     use_portable_cpu_flash_attention && N == 1 && head_dim_q == head_dim_kv &&
@@ -9242,7 +10279,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
 
                     PagedAttentionUserData* ud = GetPagedAttentionUserData();
                     ud->cache = cache;
-                    ud->layer = il;
+                    ud->layer = kv_cache_layer;
                     ud->head_dim = head_dim_q;
                     ud->v_head_dim = head_dim_v;
                     ud->n_head = n_head;
@@ -9264,11 +10301,13 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     K_hal = ggml_cont(ctx_c, K_hal);
                     V_hal = ggml_cont(ctx_c, V_hal);
 
-                    const float scale = 1.0f / sqrtf((float)head_dim_q);
+                    const float scale = model->arch_flags.is_gemma4 ? 1.0f : 1.0f / sqrtf((float)head_dim_q);
                     // For decode (N==1), causal=false is correct because K already contains
                     // only historical + current keys (no future positions).
                     const bool hal_causal = (N > 1);
-                    KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv, il,
+                    KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv,
+                                                   fast_attn_sliding_window, fast_attn_logit_softcap,
+                                                   fast_attn_semantic_flags, il,
                                                    preferred_attention_device);
 
                     // Convert [head_dim, N, n_head] -> [head_dim, n_head, N]
@@ -9280,13 +10319,16 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     // On ARM/Apple CPU runtimes, route through DenseCore's backend-agnostic
                     // FlashAttention op instead of forcing the materialized standard path.
                     // -----------------------------------------------------------------------
-                    const float scale = 1.0f / sqrtf((float)head_dim_q);
+                    const float scale = model->arch_flags.is_gemma4 ? 1.0f : 1.0f / sqrtf((float)head_dim_q);
                     const bool hal_causal = (N > 1);
-                    const int flash_q_start_offset = hal_causal ? n_past_val : 0;
+                    const int flash_q_start_offset = n_past_val;
                     if (use_portable_cpu_flash_native_decode_layout) {
-                        KQV = ggml_flash_attention_hal(ctx_c, Qcur, K, V, scale, false, n_head_kv, il,
+                        KQV = ggml_flash_attention_hal(ctx_c, Qcur, K, V, scale, false, n_head_kv,
+                                                       fast_attn_sliding_window, fast_attn_logit_softcap,
+                                                       fast_attn_semantic_flags, il,
                                                        densecore::DeviceType::CPU,
-                                                       HalAttentionTensorLayout::GgmlDimHeadSeq);
+                                                       HalAttentionTensorLayout::GgmlDimHeadSeq,
+                                                       flash_q_start_offset, 0);
                     } else {
                         struct ggml_tensor* Q_hal = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
                         struct ggml_tensor* K_hal = ggml_permute(ctx_c, K, 0, 2, 1, 3);
@@ -9295,7 +10337,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                         K_hal = ggml_cont(ctx_c, K_hal);
                         V_hal = ggml_cont(ctx_c, V_hal);
 
-                        KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv, il,
+                        KQV = ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv,
+                                                       fast_attn_sliding_window, fast_attn_logit_softcap,
+                                                       fast_attn_semantic_flags, il,
                                                        densecore::DeviceType::CPU, HalAttentionTensorLayout::HeadSeq,
                                                        flash_q_start_offset, 0);
 
@@ -9361,7 +10405,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     V_fa = ggml_cont(ctx_c, V_fa);
 
                     // Scale factor: 1/sqrt(head_dim)
-                    float scale = 1.0f / sqrtf((float)head_dim_q);
+                    const float scale = model->arch_flags.is_gemma4 ? 1.0f : 1.0f / sqrtf((float)head_dim_q);
 
                     // Flash Attention: fused Q*K^T, scale, mask, softmax, *V
                     // Result: [head_dim, N, n_head]
@@ -9383,7 +10427,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     // -----------------------------------------------------------------------
 
                     // Scale factor for attention
-                    float scale = 1.0f / sqrtf((float)head_dim_q);
+                    const float scale = model->arch_flags.is_gemma4 ? 1.0f : 1.0f / sqrtf((float)head_dim_q);
 
                     // =================================================================
                     // UNIFIED ATTENTION PATH (GQA + MHA)
@@ -9417,6 +10461,13 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                         // Scale
                         KQ = ggml_scale(ctx_c, KQ, scale);
 
+                        if (model->arch_flags.is_gemma4 && model->gemma4_attention_logit_softcapping > 0.0f) {
+                            const float inv_softcap = 1.0f / model->gemma4_attention_logit_softcapping;
+                            KQ = ggml_scale(ctx_c, KQ, inv_softcap);
+                            KQ = ggml_tanh(ctx_c, KQ);
+                            KQ = ggml_scale(ctx_c, KQ, model->gemma4_attention_logit_softcapping);
+                        }
+
                         // Causal mask (prefill only)
                         if (N > 1) {
                             KQ = ggml_diag_mask_inf(ctx_c, KQ, n_past_val);
@@ -9428,6 +10479,11 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                         // KQ @ V -> [head_dim, N, n_head]
                         // V needs transpose: [n_total, head_dim, n_head_kv]
                         struct ggml_tensor* V_t = ggml_permute(ctx_c, V_att, 1, 0, 2, 3);
+                        if (n_head_kv > 0 && n_head > n_head_kv && (n_head % n_head_kv) == 0) {
+                            struct ggml_tensor* V_repeat_shape =
+                                ggml_new_tensor_3d(ctx_c, V_t->type, V_t->ne[0], V_t->ne[1], n_head);
+                            V_t = ggml_repeat(ctx_c, V_t, V_repeat_shape);
+                        }
                         // ggml_mul_mat requires lhs (a) to be non-transposed.
                         V_t = ggml_cont(ctx_c, V_t);
                         KQV = ggml_mul_mat(ctx_c, V_t, KQ);
@@ -9556,6 +10612,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 cur = ggml_map_custom2(ctx_c, cur, cur_input_to_wo, cb_apply_multi_lora, 1, GetCurrentWorkContext());
             }
             if (bo) cur = ggml_add(ctx_c, cur, bo);
+            if (auto* post_attn_norm = model->layers[il].Get(model_keys::kPostAttnNorm);
+                post_attn_norm && post_attn_norm != ffn_norm) {
+                cur = apply_weighted_rms_norm(cur, post_attn_norm, "post_attention_norm");
+            }
 
             // Residual Connection
             attn_out = cur;
@@ -9655,6 +10715,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             fused_ud->n_tokens = static_cast<int>(attn_out->ne[1]);
             fused_ud->eps = model->hparams.f_norm_rms_eps;
             fused_ud->residual_row_stride = static_cast<ptrdiff_t>(inpL->nb[1] / sizeof(float));
+            fused_ud->layer_idx = il;
+            fused_ud->token_seq_ids = batch.seq_id.data();
+            fused_ud->stage = "pre_ffn_add_rmsnorm";
+            fused_ud->var_name = "ffn_norm";
 
             const int n_tasks = ResolveTaskCount(&batch, std::max<int>(1, fused_ud->n_tokens));
             cur = ggml_map_custom1(ctx_c, attn_out, cb_residual_rmsnorm_fused, n_tasks, fused_ud);
@@ -9669,19 +10733,63 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // =====================================================================
             // MOE PATH
             // =====================================================================
+            const bool is_gemma4_moe = IsGemma4MoEModel(model, &model->layers[il]);
+            struct ggml_tensor* gemma_router_scale = model->layers[il].Get(kGemma4RouterScaleKey);
+            struct ggml_tensor* gemma_pre_moe_norm = model->layers[il].Get(kGemma4PreMoeNormKey);
+            struct ggml_tensor* gemma_post_shared_norm = model->layers[il].Get(kGemma4PostSharedNormKey);
+            struct ggml_tensor* gemma_post_moe_norm = model->layers[il].Get(kGemma4PostMoeNormKey);
             struct ggml_tensor* moe_input = cur;
+            if (is_gemma4_moe && gemma_pre_moe_norm) {
+                moe_input =
+                    apply_weighted_rms_norm(inpFF, gemma_pre_moe_norm, "gemma4_pre_feedforward_layernorm_2");
+            }
+            struct ggml_tensor* router_input = cur;
+            if (is_gemma4_moe) {
+                router_input = ggml_rms_norm(ctx_c, inpFF, model->hparams.f_norm_rms_eps);
+                ggml_set_name(router_input, "gemma4_router_rms_norm");
+                if (gemma_router_scale) {
+                    struct ggml_tensor* router_scale = ggml_repeat(ctx_c, gemma_router_scale, router_input);
+                    router_input = ggml_mul(ctx_c, router_input, router_scale);
+                }
+                router_input = ggml_scale(ctx_c, router_input, 1.0f / std::sqrt(static_cast<float>(model->hparams.n_embd)));
+            }
 
             // 1. Router: gate_logits = moe_gate * input
             if (!moe_gate) {
                 throw densecore::InvalidArgumentException("Missing moe_gate weight in TransformerLayer");
             }
-            struct ggml_tensor* gate_logits = smart_mul_mat(ctx_c, moe_gate, cur, model);
+            struct ggml_tensor* gate_logits = smart_mul_mat(ctx_c, moe_gate, router_input, model);
+            if (ShouldRunFfnProjectionReferenceProbe(il)) {
+                ProjectionReferenceUserData* gate_ref_ud = GetProjectionReferenceUserData();
+                gate_ref_ud->weight_tensor = moe_gate;
+                gate_ref_ud->input_tensor = router_input;
+                gate_ref_ud->layer_idx = il;
+                gate_ref_ud->token_seq_ids = batch.seq_id.data();
+                gate_ref_ud->stage = "moe_router_proj";
+                gate_ref_ud->var_name = "gate_logits";
+                if (const auto it = model->int4_weight_bindings.find(moe_gate); it != model->int4_weight_bindings.end()) {
+                    gate_ref_ud->int4_packed = reinterpret_cast<const uint8_t*>(it->second.packed->data);
+                    gate_ref_ud->int4_scales = reinterpret_cast<const float*>(it->second.scales->data);
+                    gate_ref_ud->int4_zeros = reinterpret_cast<const float*>(it->second.zeros->data);
+                    gate_ref_ud->int4_group_size = it->second.group_size;
+                    gate_ref_ud->int4_k = static_cast<int>(it->second.k);
+                    gate_ref_ud->int4_n = static_cast<int>(it->second.n);
+                } else if (const auto it = model->fp8_weight_bindings.find(moe_gate);
+                           it != model->fp8_weight_bindings.end()) {
+                    gate_ref_ud->fp8_packed = reinterpret_cast<const uint8_t*>(it->second.packed->data);
+                    gate_ref_ud->fp8_format = it->second.format;
+                    gate_ref_ud->fp8_k = static_cast<int>(it->second.k);
+                    gate_ref_ud->fp8_n = static_cast<int>(it->second.n);
+                }
+                gate_logits = ggml_map_custom1(ctx_c, gate_logits, cb_projection_reference_probe, 1, gate_ref_ud);
+            }
 
             // 2. Dispatch
             MoEUserData* moe_ud = AllocateMoEUserData(ctx_c);
             if (moe_ud) {
                 moe_ud->model = model;
                 moe_ud->layer = &model->layers[il];
+                moe_ud->layer_idx = il;
                 moe_ud->k = model->hparams.n_experts_used;
                 moe_ud->batch = &batch;
                 moe_ud->scheduler = batch.scheduler;
@@ -9716,24 +10824,116 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
 
             // Use map_custom2: src0=cur, src1=gate_logits
             // Use 1 task (single thread dispatch, threaded inside backend)
-            cur = ggml_map_custom2(ctx_c, cur, gate_logits, cb_moe_forward, 1, moe_ud);
+            cur = ggml_map_custom2(ctx_c, moe_input, gate_logits, cb_moe_forward, 1, moe_ud);
             ggml_set_name(cur, "moe_forward");
 
-            // Qwen3.5-MoE keeps a dense shared-expert MLP in parallel with routed experts,
-            // gated by a separate scalar sigmoid projection.
+            // Shared-expert branch runs in parallel with routed experts.
             if (model->moe_n_shared_experts > 0 && ffn_gate && ffn_up && ffn_down) {
-                if (!ffn_shared_gate) {
+                if (!is_gemma4_moe && !ffn_shared_gate) {
                     throw densecore::InvalidArgumentException("Missing shared expert gate weight in TransformerLayer");
                 }
                 struct ggml_tensor* shared_gate = smart_mul_mat(ctx_c, ffn_gate, moe_input, model);
                 struct ggml_tensor* shared_up = smart_mul_mat(ctx_c, ffn_up, moe_input, model);
+                if (ShouldRunFfnProjectionReferenceProbe(il)) {
+                    ProjectionReferenceUserData* shared_gate_ref_ud = GetProjectionReferenceUserData();
+                    shared_gate_ref_ud->weight_tensor = ffn_gate;
+                    shared_gate_ref_ud->input_tensor = moe_input;
+                    shared_gate_ref_ud->layer_idx = il;
+                    shared_gate_ref_ud->token_seq_ids = batch.seq_id.data();
+                    shared_gate_ref_ud->stage = "shared_expert_gate_proj";
+                    shared_gate_ref_ud->var_name = "shared_gate";
+                    shared_gate = ggml_map_custom1(ctx_c, shared_gate, cb_projection_reference_probe, 1,
+                                                   shared_gate_ref_ud);
+
+                    ProjectionReferenceUserData* shared_up_ref_ud = GetProjectionReferenceUserData();
+                    shared_up_ref_ud->weight_tensor = ffn_up;
+                    shared_up_ref_ud->input_tensor = moe_input;
+                    shared_up_ref_ud->layer_idx = il;
+                    shared_up_ref_ud->token_seq_ids = batch.seq_id.data();
+                    shared_up_ref_ud->stage = "shared_expert_up_proj";
+                    shared_up_ref_ud->var_name = "shared_up";
+                    shared_up =
+                        ggml_map_custom1(ctx_c, shared_up, cb_projection_reference_probe, 1, shared_up_ref_ud);
+                }
                 struct ggml_tensor* shared_ffn =
-                    ggml_map_custom2(ctx_c, shared_gate, shared_up, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+                    ggml_map_custom2(ctx_c, shared_gate, shared_up,
+                                     is_gemma4_moe ? cb_gelu_mul_fused : cb_silu_mul_fused, GGML_N_TASKS_MAX,
+                                     nullptr);
+                struct ggml_tensor* shared_ffn_input = shared_ffn;
                 shared_ffn = smart_mul_mat(ctx_c, ffn_down, shared_ffn, model);
-                struct ggml_tensor* shared_gate_logits = smart_mul_mat(ctx_c, ffn_shared_gate, moe_input, model);
-                shared_gate_logits = ggml_sigmoid(ctx_c, shared_gate_logits);
-                shared_gate_logits = ggml_repeat(ctx_c, shared_gate_logits, shared_ffn);
-                shared_ffn = ggml_mul(ctx_c, shared_ffn, shared_gate_logits);
+                if (ShouldRunFfnProjectionReferenceProbe(il)) {
+                    ProjectionReferenceUserData* shared_down_ref_ud = GetProjectionReferenceUserData();
+                    shared_down_ref_ud->weight_tensor = ffn_down;
+                    shared_down_ref_ud->input_tensor = shared_ffn_input;
+                    shared_down_ref_ud->layer_idx = il;
+                    shared_down_ref_ud->token_seq_ids = batch.seq_id.data();
+                    shared_down_ref_ud->stage = "shared_expert_down_proj";
+                    shared_down_ref_ud->var_name = "shared_ffn";
+                    shared_ffn =
+                        ggml_map_custom1(ctx_c, shared_ffn, cb_projection_reference_probe, 1, shared_down_ref_ud);
+                }
+                if (is_gemma4_moe) {
+                    if (gemma_post_shared_norm) {
+                        shared_ffn = apply_weighted_rms_norm(shared_ffn, gemma_post_shared_norm,
+                                                             "gemma4_post_feedforward_layernorm_1");
+                    }
+                    if (gemma_post_moe_norm) {
+                        cur = apply_weighted_rms_norm(cur, gemma_post_moe_norm,
+                                                      "gemma4_post_feedforward_layernorm_2");
+                    }
+                } else {
+                    struct ggml_tensor* shared_gate_logits = smart_mul_mat(ctx_c, ffn_shared_gate, moe_input, model);
+                    struct ggml_tensor* shared_gate_logits_scalar = shared_gate_logits;
+                    if (ShouldRunFfnProjectionReferenceProbe(il)) {
+                        ProjectionReferenceUserData* shared_scalar_gate_ref_ud = GetProjectionReferenceUserData();
+                        shared_scalar_gate_ref_ud->weight_tensor = ffn_shared_gate;
+                        shared_scalar_gate_ref_ud->input_tensor = moe_input;
+                        shared_scalar_gate_ref_ud->layer_idx = il;
+                        shared_scalar_gate_ref_ud->token_seq_ids = batch.seq_id.data();
+                        shared_scalar_gate_ref_ud->stage = "shared_expert_scalar_gate_proj";
+                        shared_scalar_gate_ref_ud->var_name = "shared_gate_logits";
+                        if (const auto it = model->int4_weight_bindings.find(ffn_shared_gate);
+                            it != model->int4_weight_bindings.end()) {
+                            shared_scalar_gate_ref_ud->int4_packed =
+                                reinterpret_cast<const uint8_t*>(it->second.packed->data);
+                            shared_scalar_gate_ref_ud->int4_scales =
+                                reinterpret_cast<const float*>(it->second.scales->data);
+                            shared_scalar_gate_ref_ud->int4_zeros =
+                                reinterpret_cast<const float*>(it->second.zeros->data);
+                            shared_scalar_gate_ref_ud->int4_group_size = it->second.group_size;
+                            shared_scalar_gate_ref_ud->int4_k = static_cast<int>(it->second.k);
+                            shared_scalar_gate_ref_ud->int4_n = static_cast<int>(it->second.n);
+                        } else if (const auto it = model->fp8_weight_bindings.find(ffn_shared_gate);
+                                   it != model->fp8_weight_bindings.end()) {
+                            shared_scalar_gate_ref_ud->fp8_packed =
+                                reinterpret_cast<const uint8_t*>(it->second.packed->data);
+                            shared_scalar_gate_ref_ud->fp8_format = it->second.format;
+                            shared_scalar_gate_ref_ud->fp8_k = static_cast<int>(it->second.k);
+                            shared_scalar_gate_ref_ud->fp8_n = static_cast<int>(it->second.n);
+                        }
+                        shared_gate_logits = ggml_map_custom1(ctx_c, shared_gate_logits, cb_projection_reference_probe, 1,
+                                                              shared_scalar_gate_ref_ud);
+                    }
+                    struct ggml_tensor* shared_ffn_pre_scalar_gate = shared_ffn;
+                    SharedScalarGateApplyUserData* shared_gate_apply_ud = GetSharedScalarGateApplyUserData();
+                    shared_gate_apply_ud->gate_logits_scalar = shared_gate_logits_scalar;
+                    const int shared_gate_tasks = ResolveTaskCount(
+                        &batch, std::max<int>(1, static_cast<int>(std::max<int64_t>(1, shared_ffn->ne[1]))));
+                    shared_ffn = ggml_map_custom1(ctx_c, shared_ffn, cb_apply_shared_scalar_gate, shared_gate_tasks,
+                                                  shared_gate_apply_ud);
+                    if (ShouldRunSharedScalarGateReferenceProbe(il)) {
+                        SharedScalarGateReferenceUserData* shared_gate_runtime_ud =
+                            GetSharedScalarGateReferenceUserData();
+                        shared_gate_runtime_ud->shared_ffn_pre_gate = shared_ffn_pre_scalar_gate;
+                        shared_gate_runtime_ud->shared_gate_logits_scalar = shared_gate_logits_scalar;
+                        shared_gate_runtime_ud->layer_idx = il;
+                        shared_gate_runtime_ud->token_seq_ids = batch.seq_id.data();
+                        shared_gate_runtime_ud->stage = "shared_expert_branch";
+                        shared_gate_runtime_ud->var_name = "shared_ffn_after_scalar_gate";
+                        shared_ffn = ggml_map_custom1(ctx_c, shared_ffn, cb_shared_scalar_gate_reference_probe, 1,
+                                                      shared_gate_runtime_ud);
+                    }
+                }
                 cur = ggml_add(ctx_c, cur, shared_ffn);
             }
         } else {
@@ -9746,6 +10946,25 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             }
             struct ggml_tensor* w1 = smart_mul_mat(ctx_c, ffn_gate, cur, model);
             struct ggml_tensor* w3 = smart_mul_mat(ctx_c, ffn_up, cur, model);
+            if (ShouldRunFfnProjectionReferenceProbe(il)) {
+                ProjectionReferenceUserData* w1_ref_ud = GetProjectionReferenceUserData();
+                w1_ref_ud->weight_tensor = ffn_gate;
+                w1_ref_ud->input_tensor = cur;
+                w1_ref_ud->layer_idx = il;
+                w1_ref_ud->token_seq_ids = batch.seq_id.data();
+                w1_ref_ud->stage = "ffn_gate_proj";
+                w1_ref_ud->var_name = "w1";
+                w1 = ggml_map_custom1(ctx_c, w1, cb_projection_reference_probe, 1, w1_ref_ud);
+
+                ProjectionReferenceUserData* w3_ref_ud = GetProjectionReferenceUserData();
+                w3_ref_ud->weight_tensor = ffn_up;
+                w3_ref_ud->input_tensor = cur;
+                w3_ref_ud->layer_idx = il;
+                w3_ref_ud->token_seq_ids = batch.seq_id.data();
+                w3_ref_ud->stage = "ffn_up_proj";
+                w3_ref_ud->var_name = "w3";
+                w3 = ggml_map_custom1(ctx_c, w3, cb_projection_reference_probe, 1, w3_ref_ud);
+            }
 
             // Apply Multi-LoRA [FFN Gate/Up]
             {
@@ -9761,12 +10980,26 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
 
             // Fused SiLU×Mul: silu(w1) * w3 in single pass (avoids intermediate tensor)
             // This saves ~50% memory bandwidth in FFN forward pass.
-            cur = ggml_map_custom2(ctx_c, w1, w3, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+            if (model->arch_flags.is_gemma4) {
+                cur = ggml_map_custom2(ctx_c, w1, w3, cb_gelu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+            } else {
+                cur = ggml_map_custom2(ctx_c, w1, w3, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+            }
             ggml_set_name(cur, "ffn_silu_mul_fused");
 
             // Apply Multi-LoRA [FFN Down]
             struct ggml_tensor* ffn_input = cur;
             cur = smart_mul_mat(ctx_c, ffn_down, cur, model);
+            if (ShouldRunFfnProjectionReferenceProbe(il)) {
+                ProjectionReferenceUserData* down_ref_ud = GetProjectionReferenceUserData();
+                down_ref_ud->weight_tensor = ffn_down;
+                down_ref_ud->input_tensor = ffn_input;
+                down_ref_ud->layer_idx = il;
+                down_ref_ud->token_seq_ids = batch.seq_id.data();
+                down_ref_ud->stage = "ffn_down_proj";
+                down_ref_ud->var_name = "ffn_out";
+                cur = ggml_map_custom1(ctx_c, cur, cb_projection_reference_probe, 1, down_ref_ud);
+            }
             {
                 char name_buf[64];
                 snprintf(name_buf, sizeof(name_buf), "blk.%d.ffn_down", il);
@@ -9775,8 +11008,53 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             }
         }
 
+        if (auto* gemma_post_ffn_norm = model->layers[il].Get(kGemma4PostFfnNormKey)) {
+            cur = apply_weighted_rms_norm(cur, gemma_post_ffn_norm, "gemma4_post_feedforward_layernorm");
+        }
+
         // Residual connection
         cur = ggml_add(ctx_c, cur, inpFF);
+
+        if (model->arch_flags.is_gemma4 && gemma4_per_layer_inputs &&
+            model->gemma4_hidden_size_per_layer_input > 0) {
+            auto* per_layer_gate = model->layers[il].Get(model_keys::kGemma4PerLayerInputGate);
+            auto* per_layer_proj = model->layers[il].Get(model_keys::kGemma4PerLayerProjection);
+            auto* post_per_layer_norm = model->layers[il].Get(model_keys::kGemma4PostPerLayerInputNorm);
+            if (per_layer_gate && per_layer_proj && post_per_layer_norm) {
+                const int hidden_per_layer = model->gemma4_hidden_size_per_layer_input;
+                struct ggml_tensor* per_layer_input =
+                    ggml_view_2d(ctx_c, gemma4_per_layer_inputs, hidden_per_layer, N, gemma4_per_layer_inputs->nb[2],
+                                 static_cast<size_t>(il) * gemma4_per_layer_inputs->nb[1]);
+                struct ggml_tensor* per_layer_delta = smart_mul_mat(ctx_c, per_layer_gate, cur, model);
+                // Gemma4 uses gelu_pytorch_tanh for both FFN and per-layer input gating.
+                per_layer_delta = ggml_map_custom1(
+                    ctx_c, per_layer_delta,
+                    [](struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* ud) {
+                        (void)ud;
+                        if (!dst || !src || !dst->data || !src->data) return;
+                        const float* in = reinterpret_cast<const float*>(src->data);
+                        float* out = reinterpret_cast<float*>(dst->data);
+                        const size_t size = ggml_nelements(src);
+                        const size_t begin = (size * static_cast<size_t>(ith)) / static_cast<size_t>(nth);
+                        const size_t end = (size * static_cast<size_t>(ith + 1)) / static_cast<size_t>(nth);
+                        for (size_t i = begin; i < end; ++i) {
+                            const float x = in[i];
+                            const float x3 = x * x * x;
+                            out[i] = 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x3)));
+                        }
+                    },
+                    GGML_N_TASKS_MAX, nullptr);
+                per_layer_delta = ggml_mul(ctx_c, per_layer_delta, per_layer_input);
+                per_layer_delta = smart_mul_mat(ctx_c, per_layer_proj, per_layer_delta, model);
+                per_layer_delta =
+                    apply_weighted_rms_norm(per_layer_delta, post_per_layer_norm, "gemma4_post_per_layer_input_norm");
+                cur = ggml_add(ctx_c, cur, per_layer_delta);
+            }
+            if (auto* layer_output_scale = model->layers[il].Get(model_keys::kGemma4LayerOutputScale)) {
+                struct ggml_tensor* scale = ggml_repeat(ctx_c, layer_output_scale, cur);
+                cur = ggml_mul(ctx_c, cur, scale);
+            }
+        }
 
         if (IsDebugInferenceStatsEnabled()) {
             auto cb_check_layer = [](struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
@@ -9889,7 +11167,24 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     }
 
     // LM Head projection: [n_embd, N] -> [n_vocab, N]
+    struct ggml_tensor* cur_input_to_lm_head = cur;
     cur = smart_mul_mat(ctx_c, model->output, cur, model);
+    if (ShouldRunFinalProjectionReferenceProbe()) {
+        ProjectionReferenceUserData* final_ref_ud = GetProjectionReferenceUserData();
+        final_ref_ud->weight_tensor = model->output;
+        final_ref_ud->input_tensor = cur_input_to_lm_head;
+        final_ref_ud->layer_idx = static_cast<int>(model->layers.size());
+        final_ref_ud->token_seq_ids = batch.seq_id.data();
+        final_ref_ud->stage = "lm_head";
+        final_ref_ud->var_name = "logits";
+        cur = ggml_map_custom1(ctx_c, cur, cb_projection_reference_probe, 1, final_ref_ud);
+    }
+    if (model->arch_flags.is_gemma4 && model->gemma4_final_logit_softcapping > 0.0f) {
+        const float inv_softcap = 1.0f / model->gemma4_final_logit_softcapping;
+        cur = ggml_scale(ctx_c, cur, inv_softcap);
+        cur = ggml_tanh(ctx_c, cur);
+        cur = ggml_scale(ctx_c, cur, model->gemma4_final_logit_softcapping);
+    }
     ggml_set_name(cur, "output");
 
     // Add to graph

@@ -674,7 +674,9 @@ public:
      * @param n_head_kv Number of KV heads (-1 = same as n_head, MHA mode)
      */
     virtual void FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale,
-                                bool causal = true, int n_head_kv = -1) = 0;
+                                bool causal = true, int n_head_kv = -1, int sliding_window = -1,
+                                float logit_softcap = 0.0f,
+                                uint32_t semantic_flags = 0) = 0;
 
     // ===========================================================================
     // Synchronization

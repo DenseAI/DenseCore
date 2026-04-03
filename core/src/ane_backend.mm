@@ -1355,7 +1355,8 @@ void ANEBackend::FusedQKVProjection(const Tensor& input, const Tensor& wq, const
 }
 
 void ANEBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output,
-                                float scale, bool causal, int n_head_kv) {
+                                float scale, bool causal, int n_head_kv, int sliding_window, float logit_softcap,
+                                uint32_t semantic_flags) {
     // ==========================================================================
     // ANE path: check for a pre-compiled offline CoreML FlashAttention model.
     // When compiled offline (CompileFlashAttention), the entire QKV attention
@@ -1456,7 +1457,8 @@ metal_attn_fallback:
             "[ANEBackend] FlashAttention requires Metal fallback; ANE-only mode enabled");
     }
     if (MetalBackend* metal = impl_->GetMetalFallback()) {
-        metal->FlashAttention(Q, K, V, output, scale, causal, n_head_kv);
+        metal->FlashAttention(Q, K, V, output, scale, causal, n_head_kv, sliding_window, logit_softcap,
+                              semantic_flags);
         impl_->MaybeSyncMetalFallback();
         return;
     }

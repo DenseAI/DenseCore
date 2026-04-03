@@ -34,11 +34,31 @@ struct FlashAttentionConfig {
     int block_m = FLASH_ATTN_BLOCK_M;
     int block_n = FLASH_ATTN_BLOCK_N;
     float scale = 0.0f;       // If 0, will be set to 1/sqrt(head_dim)
+    float logit_softcap = 0.0f;  // If > 0, apply tanh(logits / softcap) * softcap before softmax
     bool causal = true;       // Causal masking
     int num_threads = 1;      // For parallel heads
     int q_start_offset = 0;   // Global query offset for chunked prefill causal masking
     int kv_start_offset = 0;  // Global key/value offset for chunked prefill causal masking
+    int sliding_window = -1;  // If >= 0, disallow attention to keys older than query_pos - sliding_window
+    uint32_t semantic_flags = 0;  // Reserved for model-specific fast-attention semantics
 };
+
+inline float ApplyAttentionLogitSoftcap(float score, float logit_softcap) {
+    if (!(logit_softcap > 0.0f) || !std::isfinite(score)) {
+        return score;
+    }
+    return std::tanh(score / logit_softcap) * logit_softcap;
+}
+
+inline bool IsAttentionKeyMasked(const FlashAttentionConfig& config, int query_pos, int key_pos) {
+    if (config.causal && key_pos > query_pos) {
+        return true;
+    }
+    if (config.sliding_window >= 0 && key_pos < (query_pos - config.sliding_window)) {
+        return true;
+    }
+    return false;
+}
 
 /**
  * Scratch buffer for Flash Attention computation.
@@ -193,8 +213,12 @@ inline void FlashAttentionSingleQueryStridedKV(const float* q_row, const float* 
         for (int ki = 0; ki < kv_len; ++ki) {
             const float* k_row = k_base + static_cast<int64_t>(j + ki) * k_row_stride;
             float score = simd::DotF32(q_row, k_row, static_cast<size_t>(head_dim)) * scale;
-            if (tuned.causal && (j + ki) > 0) {
+            const int query_pos = std::max(0, tuned.q_start_offset);
+            const int key_pos = std::max(0, tuned.kv_start_offset) + j + ki;
+            if (IsAttentionKeyMasked(tuned, query_pos, key_pos)) {
                 score = -1e10f;
+            } else {
+                score = ApplyAttentionLogitSoftcap(score, tuned.logit_softcap);
             }
             scores[ki] = score;
             local_max = std::max(local_max, score);
@@ -294,9 +318,31 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
             simd::ComputeQK(Q + i * head_dim, K + j * head_dim, scratch.qk_block.data(), q_len, kv_len, head_dim,
                             scale);
 
-            // Step 2: Apply causal mask (vectorized)
-            if (config.causal) {
-                simd::ApplyMask(scratch.qk_block.data(), q_base + i, kv_base + j, q_len, kv_len);
+            if (config.logit_softcap > 0.0f) {
+                for (int qi = 0; qi < q_len; ++qi) {
+                    float* row = scratch.qk_block.data() + static_cast<size_t>(qi) * Bc;
+                    for (int kj = 0; kj < kv_len; ++kj) {
+                        row[kj] = ApplyAttentionLogitSoftcap(row[kj], config.logit_softcap);
+                    }
+                }
+            }
+
+            // Step 2: Apply causal/sliding mask
+            if (config.causal || config.sliding_window >= 0) {
+                if (config.causal && config.sliding_window < 0) {
+                    simd::ApplyMask(scratch.qk_block.data(), q_base + i, kv_base + j, q_len, kv_len);
+                } else {
+                    for (int qi = 0; qi < q_len; ++qi) {
+                        const int query_pos = q_base + i + qi;
+                        float* row = scratch.qk_block.data() + static_cast<size_t>(qi) * Bc;
+                        for (int kj = 0; kj < kv_len; ++kj) {
+                            const int key_pos = kv_base + j + kj;
+                            if (IsAttentionKeyMasked(config, query_pos, key_pos)) {
+                                row[kj] = -1e10f;
+                            }
+                        }
+                    }
+                }
             }
 
             // Step 3: Online softmax update (vectorized)

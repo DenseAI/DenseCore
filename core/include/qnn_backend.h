@@ -81,7 +81,8 @@ public:
     void FusedQKVProjection(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv, Tensor* q_out,
                             Tensor* k_out, Tensor* v_out) override;
     void FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale, bool causal,
-                        int n_head_kv) override;
+                        int n_head_kv, int sliding_window = -1, float logit_softcap = 0.0f,
+                        uint32_t semantic_flags = 0) override;
 
     // Synchronization
     void Synchronize() override;

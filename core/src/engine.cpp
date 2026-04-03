@@ -561,7 +561,8 @@ void ConfigureQwenReasoningTokenBlocklist(const TransformerModel* model, Request
 
 bool PromptAlreadyTemplated(const std::string& prompt) {
     return prompt.find("<|im_start|>") != std::string::npos || prompt.find("<|im_end|>") != std::string::npos ||
-           prompt.find("<|assistant|>") != std::string::npos || prompt.find("<|user|>") != std::string::npos;
+           prompt.find("<|assistant|>") != std::string::npos || prompt.find("<|user|>") != std::string::npos ||
+           prompt.find("<|turn>") != std::string::npos || prompt.find("<turn|>") != std::string::npos;
 }
 
 void DebugPrintPromptTokens(const TransformerModel* model, const std::vector<int>& tokens, const char* tag) {
@@ -592,7 +593,10 @@ std::string MaybeApplyAutoChatTemplate(const TransformerModel* model, const std:
 
     const bool has_chatml = HasTokenLiteral(model, "<|im_start|>") && HasTokenLiteral(model, "<|im_end|>");
     const bool has_role_tokens = HasTokenLiteral(model, "<|user|>") && HasTokenLiteral(model, "<|assistant|>");
+    const bool has_gemma_turn_tokens = HasTokenLiteral(model, "<|turn>") && HasTokenLiteral(model, "<turn|>");
     const bool template_looks_chatml = model->chat_template.find("<|im_start|>") != std::string::npos;
+    const bool template_looks_gemma_turn = model->chat_template.find("<|turn>") != std::string::npos &&
+                                           model->chat_template.find("<turn|>") != std::string::npos;
     const bool prefer_chat_template =
         model->arch == ModelArch::QWEN2 || model->arch == ModelArch::QWEN3 || model->arch == ModelArch::QWEN35;
 
@@ -626,6 +630,15 @@ std::string MaybeApplyAutoChatTemplate(const TransformerModel* model, const std:
         wrapped += "<|user|>\n";
         wrapped += prompt;
         wrapped += "\n<|assistant|>\n";
+        return wrapped;
+    }
+
+    if (has_gemma_turn_tokens || template_looks_gemma_turn) {
+        std::string wrapped;
+        wrapped.reserve(prompt.size() + 48);
+        wrapped += "<|turn>user\n";
+        wrapped += prompt;
+        wrapped += "<turn|>\n<|turn>model\n";
         return wrapped;
     }
 

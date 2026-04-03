@@ -1547,22 +1547,28 @@ void CpuBackend::FusedQKVProjection(const Tensor& input, const Tensor& wq, const
 }
 
 void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale,
-                                bool causal, int n_head_kv) {
+                                bool causal, int n_head_kv, int sliding_window, float logit_softcap,
+                                uint32_t semantic_flags) {
     // Delegate to NUMA-aware version with round-robin dispatch
-    FlashAttention(Q, K, V, output, scale, causal, n_head_kv, -1);
+    FlashAttention(Q, K, V, output, scale, causal, n_head_kv, sliding_window, logit_softcap, semantic_flags, -1);
 }
 
 void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale,
-                                bool causal, int n_head_kv, int numa_node_id) {
+                                bool causal, int n_head_kv, int sliding_window, float logit_softcap,
+                                uint32_t semantic_flags,
+                                int numa_node_id) {
     if (!Q.IsValid() || !K.IsValid() || !V.IsValid() || !output || !output->IsValid()) {
         return;
     }
 
     if (ImmediateModeGraph* graph = GetCaptureGraph()) {
         Tensor out = *output;
-        graph->RecordOperation([this, Q, K, V, out, scale, causal, n_head_kv, numa_node_id]() mutable {
+        graph->RecordOperation(
+            [this, Q, K, V, out, scale, causal, n_head_kv, sliding_window, logit_softcap, semantic_flags,
+             numa_node_id]() mutable {
             CaptureGuard guard(this);
-            FlashAttention(Q, K, V, &out, scale, causal, n_head_kv, numa_node_id);
+            FlashAttention(Q, K, V, &out, scale, causal, n_head_kv, sliding_window, logit_softcap, semantic_flags,
+                           numa_node_id);
         });
         return;
     }
@@ -1603,7 +1609,10 @@ void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& 
 
     FlashAttentionConfig config;
     config.scale = scale;
+    config.logit_softcap = logit_softcap;
     config.causal = causal;
+    config.sliding_window = sliding_window;
+    config.semantic_flags = semantic_flags;
 
     auto& pool = GetThreadPool(numa_node_id);
     config.num_threads = std::max(1, pool.GetNumThreads());

@@ -561,11 +561,13 @@ void QnnBackend::FusedQKVProjection(const Tensor& input, const Tensor& wq, const
 }
 
 void QnnBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale,
-                                bool causal, int n_head_kv) {
+                                bool causal, int n_head_kv, int sliding_window, float logit_softcap,
+                                uint32_t semantic_flags) {
     if (capturing_) {
         return;
     }
-    GetCpuBackend().FlashAttention(Q, K, V, output, scale, causal, n_head_kv);
+    GetCpuBackend().FlashAttention(Q, K, V, output, scale, causal, n_head_kv, sliding_window, logit_softcap,
+                                   semantic_flags);
 }
 
 void QnnBackend::Synchronize() {

@@ -81,13 +81,20 @@ public:
         float scale = 1.0f;
         bool causal = false;
         int n_head_kv = -1;
+        int sliding_window = -1;
+        float logit_softcap = 0.0f;
+        uint32_t semantic_flags = 0;
         if (auto* p = static_cast<const FlashAttentionParams*>(params)) {
             scale = p->scale;
             causal = p->causal;
             n_head_kv = p->n_head_kv;
+            sliding_window = p->sliding_window;
+            logit_softcap = p->logit_softcap;
+            semantic_flags = p->semantic_flags;
         }
 
-        backend->FlashAttention(*q, *k, *v, out, scale, causal, n_head_kv);
+        backend->FlashAttention(*q, *k, *v, out, scale, causal, n_head_kv, sliding_window, logit_softcap,
+                                semantic_flags);
     }
 
     bool Supports(DeviceType device) const override { return device == DeviceType::METAL; }
