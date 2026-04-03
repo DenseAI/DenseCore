@@ -296,9 +296,9 @@ struct RoPEParams {
 struct FlashAttentionParams {
     float scale = 1.0f;
     bool causal = true;
-    int n_head_kv = -1;  ///< For GQA, -1 = MHA mode
-    int numa_node = -1;  ///< NUMA node hint (-1 = don't care)
-    int sliding_window = -1;  ///< -1 disables sliding-window masking
+    int n_head_kv = -1;           ///< For GQA, -1 = MHA mode
+    int numa_node = -1;           ///< NUMA node hint (-1 = don't care)
+    int sliding_window = -1;      ///< -1 disables sliding-window masking
     float logit_softcap = 0.0f;   ///< 0 = disabled, otherwise tanh(logits / softcap) * softcap
     uint32_t semantic_flags = 0;  ///< Reserved for model-specific fast-attention semantics
 };

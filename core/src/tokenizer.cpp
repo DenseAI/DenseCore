@@ -4,9 +4,9 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cstdio>
 #include <limits>
 #include <queue>
 #include <regex>

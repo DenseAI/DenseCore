@@ -53,12 +53,12 @@ enum class ModelArch : uint8_t {
 // Architecture-specific feature flags
 // These flags enable explicit checks instead of implicit null-pointer guards
 struct ModelArchFlags {
-    bool requires_q_norm = false;  // Qwen3: RMS norm on Q before attention
-    bool requires_k_norm = false;  // Qwen3: RMS norm on K before attention
-    bool is_hybrid_ssm = false;    // Qwen3.5: Mamba2 SSM + Attention hybrid
-    bool is_glm_moe = false;       // GLM-4.5/5: grouped MoE routing + shared experts
-    bool is_glm_dsa = false;       // GLM-5: MLA + DSA attention path
-    bool is_gemma4 = false;        // Gemma4: alternate KV-head metadata and MoE routing
+    bool requires_q_norm = false;            // Qwen3: RMS norm on Q before attention
+    bool requires_k_norm = false;            // Qwen3: RMS norm on K before attention
+    bool is_hybrid_ssm = false;              // Qwen3.5: Mamba2 SSM + Attention hybrid
+    bool is_glm_moe = false;                 // GLM-4.5/5: grouped MoE routing + shared experts
+    bool is_glm_dsa = false;                 // GLM-5: MLA + DSA attention path
+    bool is_gemma4 = false;                  // Gemma4: alternate KV-head metadata and MoE routing
     bool uses_unit_offset_rms_norm = false;  // Gemma1/2-style RMSNorm uses (1 + weight)
 };
 
@@ -185,6 +185,7 @@ static constexpr const char* kSSMNorm = "ssm_norm.weight";
 static constexpr const char* kSSMOut = "ssm_out.weight";
 static constexpr const char* kAttnGate = "attn_gate.weight";
 static constexpr const char* kPostAttnNorm = "post_attention_norm.weight";
+static constexpr const char* kAttnRopeFreqs = "rope_freqs.weight";
 static constexpr const char* kGemma4PerLayerInputGate = "gemma4.per_layer_input_gate.weight";
 static constexpr const char* kGemma4PerLayerProjection = "gemma4.per_layer_projection.weight";
 static constexpr const char* kGemma4PostPerLayerInputNorm = "gemma4.post_per_layer_input_norm.weight";

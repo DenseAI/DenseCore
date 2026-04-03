@@ -33,13 +33,13 @@ constexpr int FLASH_ATTN_BLOCK_N = 64;  // Key/Value block size
 struct FlashAttentionConfig {
     int block_m = FLASH_ATTN_BLOCK_M;
     int block_n = FLASH_ATTN_BLOCK_N;
-    float scale = 0.0f;       // If 0, will be set to 1/sqrt(head_dim)
-    float logit_softcap = 0.0f;  // If > 0, apply tanh(logits / softcap) * softcap before softmax
-    bool causal = true;       // Causal masking
-    int num_threads = 1;      // For parallel heads
-    int q_start_offset = 0;   // Global query offset for chunked prefill causal masking
-    int kv_start_offset = 0;  // Global key/value offset for chunked prefill causal masking
-    int sliding_window = -1;  // If >= 0, disallow attention to keys older than query_pos - sliding_window
+    float scale = 0.0f;           // If 0, will be set to 1/sqrt(head_dim)
+    float logit_softcap = 0.0f;   // If > 0, apply tanh(logits / softcap) * softcap before softmax
+    bool causal = true;           // Causal masking
+    int num_threads = 1;          // For parallel heads
+    int q_start_offset = 0;       // Global query offset for chunked prefill causal masking
+    int kv_start_offset = 0;      // Global key/value offset for chunked prefill causal masking
+    int sliding_window = -1;      // If >= 0, disallow attention to keys older than query_pos - sliding_window
     uint32_t semantic_flags = 0;  // Reserved for model-specific fast-attention semantics
 };
 

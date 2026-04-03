@@ -1555,17 +1555,15 @@ void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& 
 
 void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale,
                                 bool causal, int n_head_kv, int sliding_window, float logit_softcap,
-                                uint32_t semantic_flags,
-                                int numa_node_id) {
+                                uint32_t semantic_flags, int numa_node_id) {
     if (!Q.IsValid() || !K.IsValid() || !V.IsValid() || !output || !output->IsValid()) {
         return;
     }
 
     if (ImmediateModeGraph* graph = GetCaptureGraph()) {
         Tensor out = *output;
-        graph->RecordOperation(
-            [this, Q, K, V, out, scale, causal, n_head_kv, sliding_window, logit_softcap, semantic_flags,
-             numa_node_id]() mutable {
+        graph->RecordOperation([this, Q, K, V, out, scale, causal, n_head_kv, sliding_window, logit_softcap,
+                                semantic_flags, numa_node_id]() mutable {
             CaptureGuard guard(this);
             FlashAttention(Q, K, V, &out, scale, causal, n_head_kv, sliding_window, logit_softcap, semantic_flags,
                            numa_node_id);

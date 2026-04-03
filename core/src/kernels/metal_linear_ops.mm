@@ -93,8 +93,8 @@ public:
             semantic_flags = p->semantic_flags;
         }
 
-        backend->FlashAttention(*q, *k, *v, out, scale, causal, n_head_kv, sliding_window, logit_softcap,
-                                semantic_flags);
+        backend->FlashAttention(*q, *k, *v, out, scale, causal, n_head_kv, sliding_window,
+                                logit_softcap, semantic_flags);
     }
 
     bool Supports(DeviceType device) const override { return device == DeviceType::METAL; }

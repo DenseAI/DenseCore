@@ -290,9 +290,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
     const bool has_gemma4_kv_array = gemma4_head_count_kv_type == GGUF_TYPE_ARRAY;
 
     if (!tokenizer_type.empty()) {
-        const std::vector<std::string> supported = {"llama",   "gpt2",   "qwen2", "qwen3",  "qwen35",
-                                                    "mistral", "gemma",  "gemma4", "bpe",   "glm4",
-                                                    "glm"};
+        const std::vector<std::string> supported = {"llama", "gpt2",   "qwen2", "qwen3", "qwen35", "mistral",
+                                                    "gemma", "gemma4", "bpe",   "glm4",  "glm"};
         if (std::find(supported.begin(), supported.end(), tokenizer_lower) == supported.end()) {
             std::cerr << "[DenseCore] Warning: tokenizer model '" << tokenizer_type
                       << "' may not be fully compatible. Consider using external tokenization and input_ids."
@@ -422,9 +421,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
     };
 
-    auto has_key = [&](const std::string& suffix) -> bool {
-        return find_prefixed_key(suffix) != -1;
-    };
+    auto has_key = [&](const std::string& suffix) -> bool { return find_prefixed_key(suffix) != -1; };
 
     // Load hyperparameters using dynamic architecture prefix
     get_u32("vocab_size", model->hparams.n_vocab);
@@ -446,9 +443,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
             if (raw && n > 0) {
                 const size_t limit = std::min<size_t>(model->gemma4_layer_n_head_kv.size(), static_cast<size_t>(n));
                 for (size_t i = 0; i < limit; ++i) {
-                    const uint32_t kv =
-                        arr_type == GGUF_TYPE_UINT32 ? static_cast<const uint32_t*>(raw)[i]
-                                                     : static_cast<uint32_t>(static_cast<const int32_t*>(raw)[i]);
+                    const uint32_t kv = arr_type == GGUF_TYPE_UINT32
+                                            ? static_cast<const uint32_t*>(raw)[i]
+                                            : static_cast<uint32_t>(static_cast<const int32_t*>(raw)[i]);
                     if (kv > 0) {
                         model->gemma4_layer_n_head_kv[i] = kv;
                     }
@@ -531,7 +528,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
         get_u32("rope.dimension_count", tmp_u32);
         model->gemma4_rope_dim_full = static_cast<int>(tmp_u32);
         tmp_u32 = static_cast<uint32_t>(model->gemma4_rope_dim_swa > 0 ? model->gemma4_rope_dim_swa
-                                                                        : model->gemma4_rope_dim_full);
+                                                                       : model->gemma4_rope_dim_full);
         get_u32("rope.dimension_count_swa", tmp_u32);
         model->gemma4_rope_dim_swa = static_cast<int>(tmp_u32);
 
@@ -611,7 +608,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
         get_u32("n_routed_experts", tmp);
         if (tmp == 0) get_u32("num_local_experts", tmp);
         if (tmp == 0) get_u32("expert_count", tmp);  // qwen35moe naming
-        if (tmp == 0) get_u32("num_experts", tmp);  // gemma4 / transformers naming
+        if (tmp == 0) get_u32("num_experts", tmp);   // gemma4 / transformers naming
         model->hparams.n_experts = tmp;
 
         tmp = model->hparams.n_experts_used;
@@ -1188,14 +1185,14 @@ TransformerModel* LoadGGUFModel(const char* path) {
         if (!model->layers[i].Get(model_keys::kFfnNorm) && model->layers[i].Get(model_keys::kPostAttnNorm)) {
             model->layers[i].Set(model_keys::kFfnNorm, model->layers[i].Get(model_keys::kPostAttnNorm));
         }
-        model->layers[i].Set(model_keys::kFfnGate,
-                             get_layer_tensor_any(i, {"ffn_gate.weight", "ffn_gate_shexp.weight",
-                                                      "shared_expert.gate_proj.weight", "mlp.gate_proj.weight",
-                                                      "gate_proj.weight"}));
-        model->layers[i].Set(model_keys::kFfnDown,
-                             get_layer_tensor_any(i, {"ffn_down.weight", "ffn_down_shexp.weight",
-                                                      "shared_expert.down_proj.weight", "mlp.down_proj.weight",
-                                                      "down_proj.weight"}));
+        model->layers[i].Set(
+            model_keys::kFfnGate,
+            get_layer_tensor_any(i, {"ffn_gate.weight", "ffn_gate_shexp.weight", "shared_expert.gate_proj.weight",
+                                     "mlp.gate_proj.weight", "gate_proj.weight"}));
+        model->layers[i].Set(
+            model_keys::kFfnDown,
+            get_layer_tensor_any(i, {"ffn_down.weight", "ffn_down_shexp.weight", "shared_expert.down_proj.weight",
+                                     "mlp.down_proj.weight", "down_proj.weight"}));
         model->layers[i].Set(model_keys::kFfnUp, get_layer_tensor_any(i, {"ffn_up.weight", "ffn_up_shexp.weight",
                                                                           "shared_expert.up_proj.weight",
                                                                           "mlp.up_proj.weight", "up_proj.weight"}));
@@ -1214,6 +1211,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
         model->layers[i].Set(model_keys::kGemma4PostPerLayerInputNorm, get_layer_tensor_any(i, {"post_norm.weight"}));
         model->layers[i].Set(model_keys::kGemma4LayerOutputScale,
                              get_layer_tensor_any(i, {"layer_output_scale.weight"}));
+        model->layers[i].Set(model_keys::kAttnRopeFreqs, get_layer_tensor_any(i, {"rope_freqs.weight"}));
         model->layers[i].Set(model_keys::kMoeGate,
                              get_layer_tensor_any(i, {"moe_gate.weight", "router.proj.weight", "mlp.gate.weight"}));
 
