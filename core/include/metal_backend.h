@@ -421,7 +421,7 @@ public:
      */
     void FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale,
                         bool causal = true, int n_head_kv = -1, int sliding_window = -1, float logit_softcap = 0.0f,
-                        uint32_t semantic_flags = 0) override;
+                        uint32_t semantic_flags = 0, int q_start_offset = 0, int kv_start_offset = 0) override;
 
     // =========================================================================
     // ComputeBackend Interface - Synchronization

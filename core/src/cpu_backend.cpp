@@ -1548,14 +1548,15 @@ void CpuBackend::FusedQKVProjection(const Tensor& input, const Tensor& wq, const
 
 void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale,
                                 bool causal, int n_head_kv, int sliding_window, float logit_softcap,
-                                uint32_t semantic_flags) {
+                                uint32_t semantic_flags, int q_start_offset, int kv_start_offset) {
     // Delegate to NUMA-aware version with round-robin dispatch
-    FlashAttention(Q, K, V, output, scale, causal, n_head_kv, sliding_window, logit_softcap, semantic_flags, -1);
+    FlashAttention(Q, K, V, output, scale, causal, n_head_kv, sliding_window, logit_softcap, semantic_flags, -1,
+                   q_start_offset, kv_start_offset);
 }
 
 void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale,
                                 bool causal, int n_head_kv, int sliding_window, float logit_softcap,
-                                uint32_t semantic_flags, int numa_node_id) {
+                                uint32_t semantic_flags, int numa_node_id, int q_start_offset, int kv_start_offset) {
     if (!Q.IsValid() || !K.IsValid() || !V.IsValid() || !output || !output->IsValid()) {
         return;
     }
@@ -1563,10 +1564,10 @@ void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& 
     if (ImmediateModeGraph* graph = GetCaptureGraph()) {
         Tensor out = *output;
         graph->RecordOperation([this, Q, K, V, out, scale, causal, n_head_kv, sliding_window, logit_softcap,
-                                semantic_flags, numa_node_id]() mutable {
+                                semantic_flags, numa_node_id, q_start_offset, kv_start_offset]() mutable {
             CaptureGuard guard(this);
             FlashAttention(Q, K, V, &out, scale, causal, n_head_kv, sliding_window, logit_softcap, semantic_flags,
-                           numa_node_id);
+                           numa_node_id, q_start_offset, kv_start_offset);
         });
         return;
     }
@@ -1611,6 +1612,8 @@ void CpuBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& 
     config.causal = causal;
     config.sliding_window = sliding_window;
     config.semantic_flags = semantic_flags;
+    config.q_start_offset = std::max(0, q_start_offset);
+    config.kv_start_offset = std::max(0, kv_start_offset);
 
     auto& pool = GetThreadPool(numa_node_id);
     config.num_threads = std::max(1, pool.GetNumThreads());

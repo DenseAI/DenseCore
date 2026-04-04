@@ -2745,6 +2745,9 @@ void EngineLoop(EngineState* state) {
                     SamplingParams sampling_params = req->sampling_params;
                     sampling_params.token_history = &req->token_history;
                     sampling_params.disallowed_token_ids = &req->disallowed_token_ids;
+                    if (std::getenv("DENSECORE_DEBUG_SAMPLE") != nullptr) {
+                        sampling_params.vocab = &current_model->vocab_tokens;
+                    }
                     if (req->json_mode) {
                         sampling_params.grammar = &req->grammar;
                         sampling_params.vocab = &current_model->vocab_tokens;

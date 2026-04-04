@@ -498,6 +498,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
     std::cout << "[DenseCore] Loaded RMS norm epsilon: " << model->hparams.f_norm_rms_eps << std::endl;
 
     // Load RoPE parameters
+    get_f32("attention.scale", model->hparams.f_attention_scale);
     get_f32("rope.freq_base", model->hparams.rope_freq_base);
     get_f32("rope.freq_scale", model->hparams.rope_freq_scale);
     get_i32_arr4("rope.dimension_sections", model->hparams.rope_sections);
@@ -596,6 +597,23 @@ TransformerModel* LoadGGUFModel(const char* path) {
                     is_sliding ? last_non_shared_sliding : last_non_shared_full;
             }
         }
+
+        std::cout << "[DenseCore] Gemma4 metadata:" << " rope_dim_full=" << model->gemma4_rope_dim_full
+                  << " rope_dim_swa=" << model->gemma4_rope_dim_swa << " key_len_full=" << model->gemma4_key_length_full
+                  << " key_len_swa=" << model->gemma4_key_length_swa
+                  << " value_len_full=" << model->gemma4_value_length_full
+                  << " value_len_swa=" << model->gemma4_value_length_swa
+                  << " sliding_window=" << model->gemma4_sliding_window
+                  << " shared_kv_layers=" << model->gemma4_n_shared_kv_layers
+                  << " attn_logit_cap=" << model->gemma4_attention_logit_softcapping
+                  << " final_logit_softcap=" << model->gemma4_final_logit_softcapping << std::endl;
+        std::cout << "[DenseCore] Gemma4 layer pattern:";
+        for (uint32_t i = 0; i < std::min<uint32_t>(model->hparams.n_layer, 12); ++i) {
+            const bool is_sliding = i < model->gemma4_layer_is_sliding.size() && model->gemma4_layer_is_sliding[i] != 0;
+            const int kv_src = i < model->gemma4_layer_kv_source.size() ? model->gemma4_layer_kv_source[i] : -1;
+            std::cout << " L" << i << "=" << (is_sliding ? "S" : "F") << "/src" << kv_src;
+        }
+        std::cout << std::endl;
     }
 
     // Load MoE parameters when present.
@@ -808,24 +826,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
     }
 
-    const std::string tokenizer_type_lower = [&]() {
-        std::string lower = model->tokenizer_type;
-        std::transform(lower.begin(), lower.end(), lower.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return lower;
-    }();
-    const bool is_gemma_tokenizer = tokenizer_type_lower == "gemma" || tokenizer_type_lower == "gemma2" ||
-                                    tokenizer_type_lower == "gemma3" || tokenizer_type_lower == "gemma4" ||
-                                    tokenizer_type_lower.rfind("gemma", 0) == 0;
-    if (!add_bos && is_gemma_tokenizer && idx_bos != -1 && model->bos_token_id >= 0) {
-        std::cout << "[DenseCore] Gemma tokenizer detected; forcing BOS insertion to match HF tokenizer contract"
-                  << std::endl;
-        add_bos = true;
-    }
-
-    if (!add_bos) {
-        model->bos_token_id = -1;
-    }
+    model->tokenizer_add_bos = add_bos;
 
     std::cout << "[DenseCore] Model params: n_vocab=" << model->hparams.n_vocab << ", n_embd=" << model->hparams.n_embd
               << ", n_layer=" << model->hparams.n_layer << ", n_head=" << model->hparams.n_head
@@ -1211,7 +1212,13 @@ TransformerModel* LoadGGUFModel(const char* path) {
         model->layers[i].Set(model_keys::kGemma4PostPerLayerInputNorm, get_layer_tensor_any(i, {"post_norm.weight"}));
         model->layers[i].Set(model_keys::kGemma4LayerOutputScale,
                              get_layer_tensor_any(i, {"layer_output_scale.weight"}));
-        model->layers[i].Set(model_keys::kAttnRopeFreqs, get_layer_tensor_any(i, {"rope_freqs.weight"}));
+        {
+            struct ggml_tensor* rope_freqs = get_layer_tensor_any(i, {"rope_freqs.weight"});
+            if (!rope_freqs && model->arch_flags.is_gemma4) {
+                rope_freqs = get_tensor("rope_freqs.weight");
+            }
+            model->layers[i].Set(model_keys::kAttnRopeFreqs, rope_freqs);
+        }
         model->layers[i].Set(model_keys::kMoeGate,
                              get_layer_tensor_any(i, {"moe_gate.weight", "router.proj.weight", "mlp.gate.weight"}));
 
@@ -1277,6 +1284,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
             model->layers[i].Set(
                 model_keys::kAttnKNorm,
                 get_layer_tensor_any(i, {"attn_k_norm.weight", "self_attn.k_norm.weight", "k_norm.weight"}));
+            model->layers[i].Set(
+                model_keys::kAttnVNorm,
+                get_layer_tensor_any(i, {"attn_v_norm.weight", "self_attn.v_norm.weight", "v_norm.weight"}));
         }
 
         if (i == 0 || (model->arch_flags.is_hybrid_ssm && !is_ssm)) {
@@ -1520,6 +1530,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
         if (!layer.Get(model_keys::kAttnKNorm)) {
             layer.Set(model_keys::kAttnKNorm, find_layer_tensor_with_tokens(layer, {"k_norm"}, {"indexer"}));
+        }
+        if (!layer.Get(model_keys::kAttnVNorm)) {
+            layer.Set(model_keys::kAttnVNorm, find_layer_tensor_with_tokens(layer, {"v_norm"}));
         }
     }
 

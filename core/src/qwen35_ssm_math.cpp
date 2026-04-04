@@ -4,6 +4,11 @@
 #include <cmath>
 #include <vector>
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#define DENSECORE_NEON_SSM 1
+#endif
+
 namespace {
 
 inline float SoftplusStable(float x) {
@@ -104,17 +109,53 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
 
     float q_sum_sq = 0.0f;
     float k_sum_sq = 0.0f;
+#if defined(DENSECORE_NEON_SSM)
+    {
+        float32x4_t qss = vdupq_n_f32(0.0f);
+        float32x4_t kss = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 4 <= cfg.head_dim_k; i += 4) {
+            float32x4_t qv = vld1q_f32(cfg.q_head + i);
+            float32x4_t kv = vld1q_f32(cfg.k_head + i);
+            qss = vmlaq_f32(qss, qv, qv);
+            kss = vmlaq_f32(kss, kv, kv);
+        }
+        q_sum_sq = vaddvq_f32(qss);
+        k_sum_sq = vaddvq_f32(kss);
+        for (; i < cfg.head_dim_k; ++i) {
+            q_sum_sq += cfg.q_head[i] * cfg.q_head[i];
+            k_sum_sq += cfg.k_head[i] * cfg.k_head[i];
+        }
+    }
+#else
     for (int i = 0; i < cfg.head_dim_k; ++i) {
         q_sum_sq += cfg.q_head[i] * cfg.q_head[i];
         k_sum_sq += cfg.k_head[i] * cfg.k_head[i];
     }
+#endif
     const float q_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k));
     const float q_inv_norm = q_scale / std::sqrt(q_sum_sq + cfg.norm_eps);
     const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+#if defined(DENSECORE_NEON_SSM)
+    {
+        const float32x4_t vqn = vdupq_n_f32(q_inv_norm);
+        const float32x4_t vkn = vdupq_n_f32(k_inv_norm);
+        int i = 0;
+        for (; i + 4 <= cfg.head_dim_k; i += 4) {
+            vst1q_f32(q_norm.data() + i, vmulq_f32(vld1q_f32(cfg.q_head + i), vqn));
+            vst1q_f32(k_norm.data() + i, vmulq_f32(vld1q_f32(cfg.k_head + i), vkn));
+        }
+        for (; i < cfg.head_dim_k; ++i) {
+            q_norm[static_cast<size_t>(i)] = cfg.q_head[i] * q_inv_norm;
+            k_norm[static_cast<size_t>(i)] = cfg.k_head[i] * k_inv_norm;
+        }
+    }
+#else
     for (int i = 0; i < cfg.head_dim_k; ++i) {
         q_norm[static_cast<size_t>(i)] = cfg.q_head[i] * q_inv_norm;
         k_norm[static_cast<size_t>(i)] = cfg.k_head[i] * k_inv_norm;
     }
+#endif
     if (debug && debug->q_norm) {
         for (int i = 0; i < cfg.head_dim_k; ++i) {
             debug->q_norm[i] = q_norm[static_cast<size_t>(i)];
@@ -127,15 +168,54 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
     }
 
     const size_t state_elems = static_cast<size_t>(cfg.head_dim_k) * static_cast<size_t>(cfg.head_dim_v);
+
+    // State decay: state_kv *= decay
+#if defined(DENSECORE_NEON_SSM)
+    {
+        const float32x4_t v_decay = vdupq_n_f32(decay);
+        size_t idx = 0;
+        for (; idx + 4 <= state_elems; idx += 4) {
+            vst1q_f32(state_kv + idx, vmulq_f32(vld1q_f32(state_kv + idx), v_decay));
+        }
+        for (; idx < state_elems; ++idx) {
+            state_kv[idx] *= decay;
+        }
+    }
+#else
     for (size_t idx = 0; idx < state_elems; ++idx) {
         state_kv[idx] *= decay;
     }
+#endif
 
+    // kv_mem[v] = sum_k(state_kv[k,v] * k_norm[k])
+    // delta[v] = (v_head[v] - kv_mem[v]) * beta_gate
     for (int v = 0; v < cfg.head_dim_v; ++v) {
         float kv_mem = 0.0f;
+#if defined(DENSECORE_NEON_SSM)
+        {
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            int k = 0;
+            for (; k + 4 <= cfg.head_dim_k; k += 4) {
+                // Load 4 k_norm values
+                float32x4_t kn = vld1q_f32(k_norm.data() + k);
+                // Load 4 state values (column-major: state_kv[k * head_dim_v + v])
+                float s0 = state_kv[static_cast<size_t>(k + 0) * cfg.head_dim_v + v];
+                float s1 = state_kv[static_cast<size_t>(k + 1) * cfg.head_dim_v + v];
+                float s2 = state_kv[static_cast<size_t>(k + 2) * cfg.head_dim_v + v];
+                float s3 = state_kv[static_cast<size_t>(k + 3) * cfg.head_dim_v + v];
+                float32x4_t sv = {s0, s1, s2, s3};
+                acc = vmlaq_f32(acc, sv, kn);
+            }
+            kv_mem = vaddvq_f32(acc);
+            for (; k < cfg.head_dim_k; ++k) {
+                kv_mem += state_kv[static_cast<size_t>(k) * cfg.head_dim_v + v] * k_norm[static_cast<size_t>(k)];
+            }
+        }
+#else
         for (int k = 0; k < cfg.head_dim_k; ++k) {
             kv_mem += state_kv[static_cast<size_t>(k) * cfg.head_dim_v + v] * k_norm[static_cast<size_t>(k)];
         }
+#endif
         if (debug && debug->kv_mem) {
             debug->kv_mem[v] = kv_mem;
         }
@@ -147,19 +227,56 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
         }
     }
 
+    // State update: state_kv[k, v] += k_norm[k] * delta[v]
     for (int k = 0; k < cfg.head_dim_k; ++k) {
         const float k_val = k_norm[static_cast<size_t>(k)];
         float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+#if defined(DENSECORE_NEON_SSM)
+        {
+            const float32x4_t v_kval = vdupq_n_f32(k_val);
+            int v = 0;
+            for (; v + 4 <= cfg.head_dim_v; v += 4) {
+                float32x4_t sr = vld1q_f32(state_row + v);
+                float32x4_t dl = vld1q_f32(delta.data() + v);
+                vst1q_f32(state_row + v, vmlaq_f32(sr, v_kval, dl));
+            }
+            for (; v < cfg.head_dim_v; ++v) {
+                state_row[v] += k_val * delta[static_cast<size_t>(v)];
+            }
+        }
+#else
         for (int v = 0; v < cfg.head_dim_v; ++v) {
             state_row[v] += k_val * delta[static_cast<size_t>(v)];
         }
+#endif
     }
 
+    // Output: y_head[v] = sum_k(state_kv[k,v] * q_norm[k])
     for (int v = 0; v < cfg.head_dim_v; ++v) {
         float sum = 0.0f;
+#if defined(DENSECORE_NEON_SSM)
+        {
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            int k = 0;
+            for (; k + 4 <= cfg.head_dim_k; k += 4) {
+                float32x4_t qn = vld1q_f32(q_norm.data() + k);
+                float s0 = state_kv[static_cast<size_t>(k + 0) * cfg.head_dim_v + v];
+                float s1 = state_kv[static_cast<size_t>(k + 1) * cfg.head_dim_v + v];
+                float s2 = state_kv[static_cast<size_t>(k + 2) * cfg.head_dim_v + v];
+                float s3 = state_kv[static_cast<size_t>(k + 3) * cfg.head_dim_v + v];
+                float32x4_t sv = {s0, s1, s2, s3};
+                acc = vmlaq_f32(acc, sv, qn);
+            }
+            sum = vaddvq_f32(acc);
+            for (; k < cfg.head_dim_k; ++k) {
+                sum += state_kv[static_cast<size_t>(k) * cfg.head_dim_v + v] * q_norm[static_cast<size_t>(k)];
+            }
+        }
+#else
         for (int k = 0; k < cfg.head_dim_k; ++k) {
             sum += state_kv[static_cast<size_t>(k) * cfg.head_dim_v + v] * q_norm[static_cast<size_t>(k)];
         }
+#endif
         y_head[v] = sum;
     }
     if (debug && debug->y_pre_norm) {
@@ -169,13 +286,29 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
     }
 
     float sum_sq = 0.0f;
+#if defined(DENSECORE_NEON_SSM)
+    {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        int v = 0;
+        for (; v + 4 <= cfg.head_dim_v; v += 4) {
+            float32x4_t yv = vld1q_f32(y_head + v);
+            acc = vmlaq_f32(acc, yv, yv);
+        }
+        sum_sq = vaddvq_f32(acc);
+        for (; v < cfg.head_dim_v; ++v) {
+            sum_sq += y_head[v] * y_head[v];
+        }
+    }
+#else
     for (int v = 0; v < cfg.head_dim_v; ++v) {
         sum_sq += y_head[v] * y_head[v];
     }
+#endif
     const float rms = std::sqrt(sum_sq / cfg.head_dim_v + cfg.norm_eps);
+    const float inv_rms = 1.0f / rms;
     for (int v = 0; v < cfg.head_dim_v; ++v) {
         const float norm_w = cfg.norm_weight ? cfg.norm_weight[v] : 1.0f;
-        y_head[v] = (y_head[v] / rms) * norm_w * SiluStable(cfg.z_head[v]);
+        y_head[v] = (y_head[v] * inv_rms) * norm_w * SiluStable(cfg.z_head[v]);
     }
 
     if (stats) {

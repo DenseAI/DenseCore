@@ -242,6 +242,8 @@ struct PagedKVCache {
     int n_head_kv;
     int n_layer;
     int max_blocks;
+    std::vector<int> layer_head_dims;
+    std::vector<int> layer_v_head_dims;
 
     // Cache type
     ggml_type cache_type;
@@ -317,9 +319,14 @@ struct PagedKVCache {
     // Check if cache uses quantized type
     bool IsQuantized() const;
 
+    int GetHeadDimForLayer(int layer) const;
+    int GetVHeadDimForLayer(int layer) const;
+
     // Get elements per slot (head_dim * n_head_kv)
     int GetElementsPerSlot() const;
     int GetVElementsPerSlot() const;
+    int GetElementsPerSlot(int layer) const;
+    int GetVElementsPerSlot(int layer) const;
 
     // Write a single KV slot with automatic quantization
     // Input: fp32 data of size [head_dim * n_head_kv]

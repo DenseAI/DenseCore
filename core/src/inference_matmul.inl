@@ -2556,12 +2556,47 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
         const float* v_data = reinterpret_cast<const float*>(v->data);
         float* o_data = reinterpret_cast<float*>(dst->data);
 
+        #if defined(DENSECORE_X86) && !defined(__AVX512F__)
+        if (ith == 0) {
+            ComputeFlashAttentionReference(q_data, k_data, v_data, o_data, n_head, n_head_kv, seq_q, seq_kv, head_dim,
+                                           params->data.scale, params->data.causal != 0, params->data.q_start_offset,
+                                           params->data.kv_start_offset, params->data.sliding_window,
+                                           params->data.logit_softcap);
+        }
+        #else
         if (n_head == n_head_kv) {
-            densecore::FlashAttentionBatched(q_data, k_data, v_data, o_data, 1, n_head, seq_q, seq_kv, head_dim, config,
-                                             ith, nth);
+            densecore::FlashAttentionBatched(q_data, k_data, v_data, o_data, 1, n_head, seq_q, seq_kv, head_dim,
+                                             config, ith, nth);
         } else {
-            densecore::FlashAttentionGQA(q_data, k_data, v_data, o_data, 1, n_head, n_head_kv, seq_q, seq_kv, head_dim,
-                                         config, ith, nth);
+            densecore::FlashAttentionGQA(q_data, k_data, v_data, o_data, 1, n_head, n_head_kv, seq_q, seq_kv,
+                                         head_dim, config, ith, nth);
+        }
+        #endif
+        if (ShouldRunPortableFlashParityCheck(params->data.layer) && ith == 0) {
+            std::vector<float> ref(static_cast<size_t>(n_head) * seq_q * head_dim, 0.0f);
+            ComputeFlashAttentionReference(q_data, k_data, v_data, ref.data(), n_head, n_head_kv, seq_q, seq_kv,
+                                           head_dim, params->data.scale, params->data.causal != 0,
+                                           params->data.q_start_offset, params->data.kv_start_offset,
+                                           params->data.sliding_window, params->data.logit_softcap);
+
+            float max_abs = 0.0f;
+            int max_idx = -1;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                const float diff = std::fabs(o_data[i] - ref[i]);
+                if (diff > max_abs) {
+                    max_abs = diff;
+                    max_idx = static_cast<int>(i);
+                }
+            }
+            if (max_abs > PortableFlashParityTolerance()) {
+                const float got_val = (max_idx >= 0) ? o_data[max_idx] : 0.0f;
+                const float ref_val = (max_idx >= 0) ? ref[static_cast<size_t>(max_idx)] : 0.0f;
+                fprintf(stderr,
+                        "[PortableFlashParity] FAIL layer=%d seq_q=%d seq_kv=%d n_head=%d n_head_kv=%d head_dim=%d "
+                        "max_abs=%.6f idx=%d got=%.6f ref=%.6f\n",
+                        params->data.layer, seq_q, seq_kv, n_head, n_head_kv, head_dim, max_abs, max_idx, got_val,
+                        ref_val);
+            }
         }
         return;
     }
@@ -3400,4 +3435,3 @@ inline densecore::Tensor GgmlToRowMajorTensor(const struct ggml_tensor* t) {
     out.device_type = densecore::DeviceType::CPU;
     return out;
 }
-

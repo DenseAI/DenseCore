@@ -3580,7 +3580,8 @@ void MetalBackend::FusedQKVProjection(const Tensor& input, const Tensor& wq, con
 
 void MetalBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output,
                                   float scale, bool causal, int n_head_kv, int sliding_window,
-                                  float logit_softcap, uint32_t semantic_flags) {
+                                  float logit_softcap, uint32_t semantic_flags, int q_start_offset,
+                                  int kv_start_offset) {
     if (!Q.IsValid() || !K.IsValid() || !V.IsValid() || !output || !output->IsValid()) {
         return;
     }
@@ -3588,6 +3589,8 @@ void MetalBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor
     (void)sliding_window;
     (void)logit_softcap;
     (void)semantic_flags;
+    (void)q_start_offset;
+    (void)kv_start_offset;
 
     const int batch = static_cast<int>(Q.shape[0]);
     const int n_head = static_cast<int>(Q.shape[1]);

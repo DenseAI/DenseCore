@@ -822,7 +822,7 @@ int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char* prompt, int poo
     req->normalize_embedding = (normalize != 0);
 
     // Tokenize immediately (outside hot path)
-    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), prompt, true);
+    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), prompt, model_entry->model->tokenizer_add_bos);
 
     // Embeddings get premium tier explicitly
     req->priority = 50;
@@ -864,7 +864,7 @@ int SubmitRequestWithSamplingEx(DenseCoreHandle handle, const char* prompt, int 
 
     // Tokenize prompt
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
-    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, true);
+    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
     DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "sampling");
@@ -899,7 +899,7 @@ int SubmitRequestWithTokenResults(DenseCoreHandle handle, const char* prompt, in
                       /*callback=*/nullptr, user_data);
 
     req->prompt = prompt;
-    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, true);
+    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
     DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "token_results");
@@ -1696,7 +1696,7 @@ int SubmitRequest(DenseCoreHandle handle, const char* prompt, int max_tokens, co
 
     // Tokenize immediately (outside hot path)
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
-    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, true);
+    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     req->token_history = req->tokens;
 
     ApplyDefaultLora(state, req);
@@ -1774,7 +1774,7 @@ int SubmitRequestWithFormatEx(DenseCoreHandle handle, const char* prompt, int ma
 
     // Tokenize immediately (outside hot path)
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
-    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, true);
+    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     req->token_history = req->tokens;
 
     AssignGenerationTier(req);

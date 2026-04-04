@@ -26,6 +26,8 @@ public:
         float scale = 1.0f;
         bool causal = true;
         int n_head_kv = -1;
+        int q_start_offset = 0;
+        int kv_start_offset = 0;
         int sliding_window = -1;
         float logit_softcap = 0.0f;
         uint32_t semantic_flags = 0;
@@ -33,13 +35,15 @@ public:
             scale = p->scale;
             causal = p->causal;
             n_head_kv = p->n_head_kv;
+            q_start_offset = p->q_start_offset;
+            kv_start_offset = p->kv_start_offset;
             sliding_window = p->sliding_window;
             logit_softcap = p->logit_softcap;
             semantic_flags = p->semantic_flags;
         }
 
         GetCpuBackend().FlashAttention(*q, *k, *v, out, scale, causal, n_head_kv, sliding_window, logit_softcap,
-                                       semantic_flags);
+                                       semantic_flags, q_start_offset, kv_start_offset);
     }
 
     bool Supports(DeviceType device) const override { return device == DeviceType::CPU; }

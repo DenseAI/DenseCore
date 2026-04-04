@@ -26,6 +26,8 @@ struct InferenceWorkContext {
     int ssm_conv1d_index = 0;
     ProjectionReferenceUserData projection_reference_pool[384];
     int projection_reference_index = 0;
+    RmsNormReferenceUserData rmsnorm_reference_pool[256];
+    int rmsnorm_reference_index = 0;
     AttentionCoreReferenceUserData attention_core_reference_pool[128];
     int attention_core_reference_index = 0;
     SSMQwen35DeltaUserData ssm_qwen35_delta_pool[128];
@@ -55,6 +57,7 @@ void ResetInferenceWorkContext(InferenceWorkContext* ctx) {
     ctx->paged_attention_shared_v_block_ptrs.clear();
     ctx->ssm_conv1d_index = 0;
     ctx->projection_reference_index = 0;
+    ctx->rmsnorm_reference_index = 0;
     ctx->attention_core_reference_index = 0;
     ctx->ssm_qwen35_delta_index = 0;
     g_shared_batch.store(nullptr, std::memory_order_release);
@@ -199,6 +202,20 @@ inline ProjectionReferenceUserData* GetProjectionReferenceUserData() {
         idx = 0;
     }
     return &ctx->projection_reference_pool[idx];
+}
+
+inline RmsNormReferenceUserData* GetRmsNormReferenceUserData() {
+    InferenceWorkContext* ctx = GetCurrentWorkContext();
+    if (!ctx) {
+        throw densecore::InvalidArgumentException(
+            "GetRmsNormReferenceUserData called without active InferenceWorkContext");
+    }
+    int idx = ctx->rmsnorm_reference_index++;
+    if (idx >= 256) {
+        ctx->rmsnorm_reference_index = 0;
+        idx = 0;
+    }
+    return &ctx->rmsnorm_reference_pool[idx];
 }
 
 inline SharedScalarGateReferenceUserData* GetSharedScalarGateReferenceUserData() {
@@ -1274,4 +1291,3 @@ inline GemvBatchedUserData* GetGemvBatchedUserData() {
     ud->quantized_stamp = &ctx->gemv_batched_quantized_stamp;
     return ud;
 }
-

@@ -313,10 +313,15 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
                 continue;
             }
 
-            // Step 1: Compute Q @ K^T for this tile
-            // S_ij = Q[i:i+Br] @ K[j:j+Bc]^T * scale
+// Step 1: Compute Q @ K^T for this tile
+// S_ij = Q[i:i+Br] @ K[j:j+Bc]^T * scale
+#if defined(DENSECORE_X86) && !defined(__AVX512F__)
+            simd::ComputeQK_Scalar(Q + i * head_dim, K + j * head_dim, scratch.qk_block.data(), q_len, kv_len, head_dim,
+                                   scale);
+#else
             simd::ComputeQK(Q + i * head_dim, K + j * head_dim, scratch.qk_block.data(), q_len, kv_len, head_dim,
                             scale);
+#endif
 
             if (config.logit_softcap > 0.0f) {
                 for (int qi = 0; qi < q_len; ++qi) {
@@ -358,13 +363,22 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
                 block_sum[qi] = L[i + qi];
             }
 
+#if defined(DENSECORE_X86) && !defined(__AVX512F__)
+            simd::SoftmaxBlock_Scalar(scratch.qk_block.data(), block_max, block_sum, q_len, kv_len, first_kv_block);
+#else
             simd::SoftmaxBlock(scratch.qk_block.data(), block_max, block_sum, q_len, kv_len, first_kv_block);
+#endif
 
             // Step 4: Compute P @ V for this tile
             // pv[qi] = sum_ki(softmax[qi, ki] * V[j + ki])
             memset(scratch.pv_block.data(), 0, q_len * head_dim * sizeof(float));
+#if defined(DENSECORE_X86) && !defined(__AVX512F__)
+            simd::ComputePV_Scalar(scratch.qk_block.data(), V + j * head_dim, scratch.pv_block.data(), q_len, kv_len,
+                                   head_dim);
+#else
             simd::ComputePV(scratch.qk_block.data(), V + j * head_dim, scratch.pv_block.data(), q_len, kv_len,
                             head_dim);
+#endif
 
             // Step 5: Update output with rescaling
             // O = (alpha * L * O + pv) / L_new
@@ -391,8 +405,12 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
                 L[global_qi] = L_new;
             }
 
-            // Apply rescaling with vectorized kernel
+// Apply rescaling with vectorized kernel
+#if defined(DENSECORE_X86) && !defined(__AVX512F__)
+            simd::UpdateOutput_Scalar(O + i * head_dim, scratch.pv_block.data(), alpha_ptr, beta_ptr, q_len, head_dim);
+#else
             simd::UpdateOutput(O + i * head_dim, scratch.pv_block.data(), alpha_ptr, beta_ptr, q_len, head_dim);
+#endif
         }
     }
 }

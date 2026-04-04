@@ -136,6 +136,7 @@ struct TransformerHParams {
     uint32_t n_ff = 0;            // FFN intermediate dimension
 
     float f_norm_rms_eps = 1e-5f;
+    float f_attention_scale = 0.0f;
     float rope_freq_base = 10000.0f;
     float rope_freq_scale = 1.0f;
     std::array<int32_t, 4> rope_sections = {0, 0, 0, 0};
@@ -160,6 +161,7 @@ static constexpr const char* kAttnVBias = "attn_v.bias";
 static constexpr const char* kAttnOBias = "attn_output.bias";
 static constexpr const char* kAttnQNorm = "attn_q_norm.weight";
 static constexpr const char* kAttnKNorm = "attn_k_norm.weight";
+static constexpr const char* kAttnVNorm = "attn_v_norm.weight";
 static constexpr const char* kIndexerWqB = "indexer_wq_b.weight";
 static constexpr const char* kIndexerWk = "indexer_wk.weight";
 static constexpr const char* kIndexerKNorm = "indexer_k_norm.weight";
@@ -574,6 +576,7 @@ struct TransformerModel {
     int32_t bos_token_id = 1;
     int32_t eos_token_id = 2;
     std::string tokenizer_type;
+    bool tokenizer_add_bos = false;
 
     // Pre-computed RoPE cos/sin table (interleaved: [cos, sin, cos, sin, ...])
     // Layout: [max_seq_len, head_dim] where each pair is (cos, sin)

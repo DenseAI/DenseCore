@@ -23,6 +23,18 @@ static GLMDSAPackUserData* AllocateGLMDSAPackUserData(struct ggml_context* ctx_c
     return reinterpret_cast<GLMDSAPackUserData*>(storage->data);
 }
 
+static HiddenSnapshotUserData* AllocateHiddenSnapshotUserData(struct ggml_context* ctx_c) {
+    if (!ctx_c) {
+        return nullptr;
+    }
+    struct ggml_tensor* storage = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I8, sizeof(HiddenSnapshotUserData));
+    if (!storage || !storage->data) {
+        return nullptr;
+    }
+    std::memset(storage->data, 0, sizeof(HiddenSnapshotUserData));
+    return reinterpret_cast<HiddenSnapshotUserData*>(storage->data);
+}
+
 void cb_pack_glm_dsa_q(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
                        int nth, void* userdata) {
     (void)src0;
@@ -877,6 +889,150 @@ static void cb_projection_reference_probe(struct ggml_tensor* dst, const struct 
     }
 }
 
+static void cb_rmsnorm_reference_probe(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                       void* userdata) {
+    (void)nth;
+    if (ith != 0) return;
+
+    auto* ud = static_cast<RmsNormReferenceUserData*>(userdata);
+    if (!ud || !dst || !src || !src->data || !ud->input_tensor || !ud->input_tensor->data || !ud->norm_weight ||
+        !ud->norm_weight->data || src->type != GGML_TYPE_F32 || ud->input_tensor->type != GGML_TYPE_F32 ||
+        ud->norm_weight->type != GGML_TYPE_F32) {
+        return;
+    }
+    if (dst->data && src->data) {
+        std::memcpy(dst->data, src->data, ggml_nbytes(src));
+    }
+
+    const int n_embd = static_cast<int>(ud->input_tensor->ne[0]);
+    const int n_tokens = static_cast<int>(ud->input_tensor->ne[1]);
+    if (n_embd <= 0 || n_tokens <= 0 || static_cast<int>(src->ne[0]) != n_embd ||
+        static_cast<int>(src->ne[1]) != n_tokens) {
+        return;
+    }
+
+    const float eps = 1e-6f;
+    const auto* input_base = reinterpret_cast<const char*>(ud->input_tensor->data);
+    const auto* runtime_base = reinterpret_cast<const char*>(src->data);
+    const auto* weight = reinterpret_cast<const float*>(ud->norm_weight->data);
+
+    float max_abs_diff = 0.0f;
+    int max_idx = -1;
+    int max_token = -1;
+    float max_actual = 0.0f;
+    float max_ref = 0.0f;
+    bool runtime_nonfinite = false;
+    bool ref_nonfinite = false;
+
+    for (int token_idx = 0; token_idx < n_tokens; ++token_idx) {
+        const auto* input_row =
+            reinterpret_cast<const float*>(input_base + static_cast<size_t>(token_idx) * ud->input_tensor->nb[1]);
+        const auto* runtime_row =
+            reinterpret_cast<const float*>(runtime_base + static_cast<size_t>(token_idx) * src->nb[1]);
+
+        double sum_sq = 0.0;
+        for (int i = 0; i < n_embd; ++i) {
+            const float v = input_row[i];
+            sum_sq += static_cast<double>(v) * static_cast<double>(v);
+        }
+        const float inv_rms = 1.0f / std::sqrt(static_cast<float>(sum_sq / std::max(1, n_embd)) + eps);
+
+        for (int i = 0; i < n_embd; ++i) {
+            const float ref = input_row[i] * inv_rms * weight[i];
+            const float actual = runtime_row[i];
+            runtime_nonfinite = runtime_nonfinite || !std::isfinite(actual);
+            ref_nonfinite = ref_nonfinite || !std::isfinite(ref);
+            const float diff = std::fabs(actual - ref);
+            if (diff > max_abs_diff) {
+                max_abs_diff = diff;
+                max_idx = i;
+                max_token = token_idx;
+                max_actual = actual;
+                max_ref = ref;
+            }
+        }
+    }
+
+    const int seq_id = (ud->token_seq_ids && max_token >= 0) ? ud->token_seq_ids[max_token] : -1;
+    std::fprintf(stderr,
+                 "[RMS_REF] layer=%d stage=%s var=%s token=%d seq=%d runtime_nonfinite=%d ref_nonfinite=%d "
+                 "max_abs_diff=%.8g max_idx=%d actual=%.8g ref=%.8g\n",
+                 ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown",
+                 max_token, seq_id, runtime_nonfinite ? 1 : 0, ref_nonfinite ? 1 : 0, max_abs_diff, max_idx,
+                 max_actual, max_ref);
+}
+
+static void cb_hidden_snapshot_probe(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                     void* userdata) {
+    (void)nth;
+    if (ith != 0) return;
+
+    auto* ud = static_cast<HiddenSnapshotUserData*>(userdata);
+    if (!ud || !dst || !src || !src->data || src->type != GGML_TYPE_F32) {
+        return;
+    }
+    if (dst->data && src->data) {
+        std::memcpy(dst->data, src->data, ggml_nbytes(src));
+    }
+
+    const int width = static_cast<int>(src->ne[0]);
+    const int tokens = static_cast<int>(std::max<int64_t>(1, src->ne[1]));
+    if (width <= 0 || tokens <= 0) {
+        return;
+    }
+
+    int token_idx = ud->token_idx;
+    if (token_idx < 0) {
+        token_idx = tokens - 1;
+    }
+    token_idx = std::max(0, std::min(token_idx, tokens - 1));
+
+    const auto* row = reinterpret_cast<const float*>(reinterpret_cast<const char*>(src->data) +
+                                                     static_cast<size_t>(token_idx) * src->nb[1]);
+    float min_v = std::numeric_limits<float>::infinity();
+    float max_v = -std::numeric_limits<float>::infinity();
+    float max_abs = 0.0f;
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    int finite_ct = 0;
+    int nan_ct = 0;
+    int inf_ct = 0;
+    for (int i = 0; i < width; ++i) {
+        const float v = row[i];
+        if (std::isnan(v)) {
+            nan_ct++;
+            continue;
+        }
+        if (!std::isfinite(v)) {
+            inf_ct++;
+            continue;
+        }
+        min_v = std::min(min_v, v);
+        max_v = std::max(max_v, v);
+        max_abs = std::max(max_abs, std::fabs(v));
+        sum += v;
+        sum_sq += static_cast<double>(v) * static_cast<double>(v);
+        finite_ct++;
+    }
+    if (!std::isfinite(min_v)) min_v = 0.0f;
+    if (!std::isfinite(max_v)) max_v = 0.0f;
+
+    const int seq_id = (ud->token_seq_ids && token_idx >= 0) ? ud->token_seq_ids[token_idx] : -1;
+    std::fprintf(stderr,
+                 "[HIDDEN_SNAPSHOT] layer=%d stage=%s var=%s token=%d seq=%d width=%d nan=%d inf=%d min=%.8g "
+                 "max=%.8g max_abs=%.8g mean=%.8g rms=%.8g\n",
+                 ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown",
+                 token_idx, seq_id, width, nan_ct, inf_ct, min_v, max_v, max_abs,
+                 finite_ct > 0 ? (sum / finite_ct) : 0.0, finite_ct > 0 ? std::sqrt(sum_sq / finite_ct) : 0.0);
+
+    const int preview = std::min(width, 8);
+    std::fprintf(stderr, "[HIDDEN_SNAPSHOT] values");
+    for (int i = 0; i < preview; ++i) {
+        std::fprintf(stderr, " %.8g", row[i]);
+    }
+    std::fprintf(stderr, "\n");
+}
+
 static void cb_shared_scalar_gate_reference_probe(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith,
                                                   int nth, void* userdata) {
     (void)nth;
@@ -964,9 +1120,17 @@ static void cb_attention_core_reference_probe(struct ggml_tensor* dst, const str
     if (n_tokens <= 0 || n_total <= 0) {
         return;
     }
+    static const bool require_past = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_ATTN_CORE_REFERENCE_REQUIRE_PAST");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    if (require_past && ud->n_past <= 0) {
+        return;
+    }
 
     const int n_rep = ud->n_head / ud->n_head_kv;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(ud->head_dim_q));
+    const float scale =
+        ud->attention_scale > 0.0f ? ud->attention_scale : (1.0f / std::sqrt(static_cast<float>(ud->head_dim_q)));
     const bool causal = n_tokens > 1;
 
     std::vector<float> q_token(static_cast<size_t>(ud->n_head) * ud->head_dim_q, 0.0f);
@@ -992,7 +1156,12 @@ static void cb_attention_core_reference_probe(struct ggml_tensor* dst, const str
             float max_score = -std::numeric_limits<float>::infinity();
 
             for (int k_idx = 0; k_idx < n_total; ++k_idx) {
-                if (causal && k_idx > (ud->n_past + token_idx)) {
+                const int query_pos = ud->n_past + token_idx;
+                if (causal && k_idx > query_pos) {
+                    scores[static_cast<size_t>(k_idx)] = -std::numeric_limits<float>::infinity();
+                    continue;
+                }
+                if (ud->sliding_window >= 0 && k_idx < (query_pos - ud->sliding_window)) {
                     scores[static_cast<size_t>(k_idx)] = -std::numeric_limits<float>::infinity();
                     continue;
                 }
@@ -1002,7 +1171,10 @@ static void cb_attention_core_reference_probe(struct ggml_tensor* dst, const str
                 for (int d = 0; d < ud->head_dim_q; ++d) {
                     dot += q_head[d] * k_head[d];
                 }
-                const float score = dot * scale;
+                float score = dot * scale;
+                if (ud->logit_softcap > 0.0f) {
+                    score = std::tanh(score / ud->logit_softcap) * ud->logit_softcap;
+                }
                 scores[static_cast<size_t>(k_idx)] = score;
                 max_score = std::max(max_score, score);
             }

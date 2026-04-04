@@ -269,7 +269,7 @@ public:
                             Tensor* k_out, Tensor* v_out) override;
     void FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale,
                         bool causal = true, int n_head_kv = -1, int sliding_window = -1, float logit_softcap = 0.0f,
-                        uint32_t semantic_flags = 0) override;
+                        uint32_t semantic_flags = 0, int q_start_offset = 0, int kv_start_offset = 0) override;
     void Synchronize() override { /* No-op for CPU */ }
 
     // ===========================================================================
@@ -292,7 +292,7 @@ public:
                   int group_size, int numa_node_id);
     void FlashAttention(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor* output, float scale, bool causal,
                         int n_head_kv, int sliding_window, float logit_softcap, uint32_t semantic_flags,
-                        int numa_node_id);
+                        int numa_node_id, int q_start_offset, int kv_start_offset);
 
     // ===========================================================================
     // Multi-NUMA Thread Pool Management
