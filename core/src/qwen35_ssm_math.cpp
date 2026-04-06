@@ -90,9 +90,14 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
         return false;
     }
 
-    std::vector<float> q_norm(static_cast<size_t>(cfg.head_dim_k));
-    std::vector<float> k_norm(static_cast<size_t>(cfg.head_dim_k));
-    std::vector<float> delta(static_cast<size_t>(cfg.head_dim_v));
+    // thread_local reuse buffers — eliminates ~1,536 heap allocs/token
+    // (24 SSM layers × ~64 heads × 3 vectors per call)
+    static thread_local std::vector<float> q_norm;
+    static thread_local std::vector<float> k_norm;
+    static thread_local std::vector<float> delta;
+    q_norm.resize(static_cast<size_t>(cfg.head_dim_k));
+    k_norm.resize(static_cast<size_t>(cfg.head_dim_k));
+    delta.resize(static_cast<size_t>(cfg.head_dim_v));
 
     float alpha = cfg.dt_bias;
     float beta = 0.0f;

@@ -53,13 +53,29 @@ void SSMConv1DDecodeCleanImpl(
         int kernel_size) {
 
     const int hist = kernel_size - 1;
-    // Step 1: Compute conv output.
-    // Window for channel c = [conv_state[c*hist+0], ..., conv_state[c*hist+hist-1], input[c]]
-    //                       =  positions 0 .. kernel_size-1  (oldest to newest)
-    // weight[c * kernel_size + k] for k ∈ [0, kernel_size)
-    // output[c] = sum_k weight[c*ks+k] * window[k]
 
-    // Scalar path: gather with strided access, no alignment issues.
+    // Qwen3.5: kernel_size=4 (conv_kernel_dim), channels ≈ 4096
+    // Optimized path for kernel_size == 4 (hist == 3): fully unrolled, fused output + state update.
+    // NOTE: The computation is strided-gather per channel, so SIMD writes via hn::Load/Store
+    // are NOT used here — hn::Load requires alignment (e.g. 64-byte for AVX-512) but stack
+    // arrays are only 16-byte aligned on x86_64, causing SIGBUS/SIGSEGV. Write directly to
+    // output[c] instead and let the compiler auto-vectorize.
+    if (kernel_size == 4) {
+        for (int ci = 0; ci < channels; ++ci) {
+            const int cs_base = ci * 3;
+            const int w_base = ci * 4;
+            output[ci] = conv_state[cs_base] * weight[w_base] +
+                         conv_state[cs_base + 1] * weight[w_base + 1] +
+                         conv_state[cs_base + 2] * weight[w_base + 2] +
+                         input[ci] * weight[w_base + 3];
+            conv_state[cs_base] = conv_state[cs_base + 1];
+            conv_state[cs_base + 1] = conv_state[cs_base + 2];
+            conv_state[cs_base + 2] = input[ci];
+        }
+        return;
+    }
+
+    // Generic path for other kernel sizes
     for (int ci = 0; ci < channels; ++ci) {
         float s = 0.0f;
         for (int k = 0; k < hist; ++k) {
@@ -68,8 +84,6 @@ void SSMConv1DDecodeCleanImpl(
         s += input[ci] * weight[ci * kernel_size + hist];
         output[ci] = s;
     }
-
-    // Step 2: Update buffer — shift left, insert current input at end.
     for (int ci = 0; ci < channels; ++ci) {
         for (int j = 0; j < hist - 1; ++j) {
             conv_state[ci * hist + j] = conv_state[ci * hist + j + 1];
@@ -200,12 +214,16 @@ void SSMScanPrefillImpl(
         const float* C_t = &C[t * bc_stride];
         float* out_t = &output[t * d_inner];
 
-        // Size the per-head buffers from n_heads to avoid fixed-capacity overflow.
-        std::vector<float> dt_sp(n_heads);
-        std::vector<float> dt_B_ones(n_heads);
+        // thread_local reuse buffers — eliminates seq_len × 2 heap allocs per SSM layer
+        static thread_local std::vector<float> dt_sp;
+        static thread_local std::vector<float> dt_B_ones;
+        if (static_cast<int>(dt_sp.size()) < n_heads) {
+            dt_sp.resize(static_cast<size_t>(n_heads));
+            dt_B_ones.assign(static_cast<size_t>(n_heads), 1.0f);
+        }
         for (int h = 0; h < n_heads; ++h) {
             dt_sp[h] = SoftplusScalar(dt_t[h]);
-            dt_B_ones[h] = 1.0f;  // prefill path: B scaling handled separately if needed
+            dt_B_ones[h] = 1.0f;
         }
 
         SSMScanDecodeImpl(x_t, dt_sp.data(), dt_B_ones.data(), A_log, B_t, C_t, state, out_t,

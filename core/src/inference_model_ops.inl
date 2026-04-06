@@ -1603,12 +1603,15 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
     const int state_stride = head_k_dim * head_v_dim;
     const int heads_per_group = (num_k_heads > 0) ? std::max(1, num_v_heads / num_k_heads) : 1;
 
-    std::vector<float> q_norm(static_cast<size_t>(head_k_dim));
-    std::vector<float> k_norm(static_cast<size_t>(head_k_dim));
-    std::vector<float> kv_mem(static_cast<size_t>(head_v_dim));
-    std::vector<float> delta(static_cast<size_t>(head_v_dim));
-    std::vector<float> y_pre_norm(static_cast<size_t>(head_v_dim));
-    std::vector<float> y(static_cast<size_t>(ud->d_inner));
+    // Allocate once instead of per-token to reduce memory allocation overhead
+    // Stack allocation: Qwen3.5 max ~10KB (head_dim_k=128, head_dim_v=128, d_inner=2048)
+    float q_norm_buf[256], k_norm_buf[256], kv_mem_buf[256], delta_buf[256], y_pre_norm_buf[256], y_buf[2048];
+    float* const q_norm = q_norm_buf;
+    float* const k_norm = k_norm_buf;
+    float* const kv_mem = kv_mem_buf;
+    float* const delta = delta_buf;
+    float* const y_pre_norm = y_pre_norm_buf;
+    float* const y = y_buf;
     const bool debug_core_ref = IsDebugSSMCoreReferenceEnabled();
     std::vector<float> q_expanded;
     std::vector<float> k_expanded;
@@ -1622,7 +1625,7 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
     }
 
     for (int t = 0; t < N; ++t) {
-        std::fill(y.begin(), y.end(), 0.0f);
+        std::fill(y, y + ud->d_inner, 0.0f);
         const float* input_t = input + static_cast<ptrdiff_t>(t) * input_stride;
         const float* qkv_t = qkv_conv + static_cast<ptrdiff_t>(t) * qkv_stride;
         const float* z_t = z_proj + static_cast<ptrdiff_t>(t) * z_stride;
@@ -1670,7 +1673,7 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
                 continue;
             }
             float* state = ssm_state_base + static_cast<size_t>(h) * state_stride;
-            float* y_head = y.data() + static_cast<size_t>(h) * head_v_dim;
+            float* y_head = y + static_cast<size_t>(h) * head_v_dim;
             const float* norm_weight_head = ud->norm_weight;
             if (ud->norm_layout == Qwen35SSMNormLayout::FLATTENED_D_INNER) {
                 norm_weight_head += static_cast<size_t>(h) * head_v_dim;
@@ -1716,11 +1719,11 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
 
             Qwen35SSMHeadStepStats step_stats{};
             Qwen35SSMHeadStepDebugBuffers step_debug{};
-            step_debug.q_norm = q_norm.data();
-            step_debug.k_norm = k_norm.data();
-            step_debug.kv_mem = kv_mem.data();
-            step_debug.delta = delta.data();
-            step_debug.y_pre_norm = y_pre_norm.data();
+            step_debug.q_norm = q_norm;
+            step_debug.k_norm = k_norm;
+            step_debug.kv_mem = kv_mem;
+            step_debug.delta = delta;
+            step_debug.y_pre_norm = y_pre_norm;
             if (!Qwen35RunGatedDeltaHeadStep(cfg, state, y_head, &step_stats, &step_debug)) {
                 FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h,
                                            "Qwen35RunGatedDeltaHeadStep rejected runtime inputs");
@@ -1752,12 +1755,12 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
             CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "decay", "decay", step_stats.decay, dbg);
             CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "qk_norm", "q_sum_sq", step_stats.q_sum_sq, dbg);
             CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "qk_norm", "k_sum_sq", step_stats.k_sum_sq, dbg);
-            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "qk_norm", "q_norm", q_norm.data(), head_k_dim, dbg);
-            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "qk_norm", "k_norm", k_norm.data(), head_k_dim, dbg);
-            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "kv_mem", "kv_mem", kv_mem.data(), head_v_dim, dbg);
-            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "delta", "delta", delta.data(), head_v_dim, dbg);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "qk_norm", "q_norm", q_norm, head_k_dim, dbg);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "qk_norm", "k_norm", k_norm, head_k_dim, dbg);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "kv_mem", "kv_mem", kv_mem, head_v_dim, dbg);
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "delta", "delta", delta, head_v_dim, dbg);
             CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "state_update", "state", state, state_stride, dbg);
-            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "y_pre_norm", "y_head", y_pre_norm.data(), head_v_dim,
+            CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "y_pre_norm", "y_head", y_pre_norm, head_v_dim,
                                  dbg);
             CheckSSMFiniteScalar(ud->layer_idx, t, seq_idx, h, "y_post_norm", "rms", step_stats.rms, dbg);
             CheckSSMFiniteVector(ud->layer_idx, t, seq_idx, h, "y_post_norm", "y_head", y_head, head_v_dim, dbg);
@@ -1770,7 +1773,7 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
             }
         }
 
-        std::memcpy(y_out + static_cast<ptrdiff_t>(t) * out_stride, y.data(),
+        std::memcpy(y_out + static_cast<ptrdiff_t>(t) * out_stride, y,
                     static_cast<size_t>(ud->d_inner) * sizeof(float));
     }
 }

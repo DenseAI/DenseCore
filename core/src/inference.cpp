@@ -1705,7 +1705,7 @@ static void ComputeMatmulReferenceF32(const struct ggml_tensor* weight, const st
         const size_t quant_row_size = ggml_row_size(vec_dot_type, static_cast<int64_t>(N));
         if (input_type_traits && input_type_traits->from_float && quant_row_size > 0 &&
             quant_row_size <= kMatmulReferenceMaxQuantRowBytes) {
-            std::vector<uint8_t> quant_rows(quant_row_size * static_cast<size_t>(M));
+        std::vector<uint8_t> quant_rows(quant_row_size * static_cast<size_t>(M));
             for (int m = 0; m < M; ++m) {
                 const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(input->nb[1]);
                 std::vector<float> gathered_input(static_cast<size_t>(N), 0.0f);
