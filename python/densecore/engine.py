@@ -48,6 +48,7 @@ except ImportError:
 
 import numpy as np
 
+from .chat_template import format_chat_prompt
 from .config import GenerationConfig, ModelConfig
 from .lora import LoRAManager
 
@@ -595,6 +596,7 @@ class DenseCore:
         self._lock = threading.Lock()
         self._verbose = verbose
         self._model_path = ""
+        self._hf_repo_id = hf_repo_id or ""
         self._kv_cache_dtype = kv_cache_dtype
         self.tokenizer = None
 
@@ -2090,33 +2092,22 @@ class DenseCore:
             >>> if result.get("tool_calls"):
             ...     print("Tool called:", result["tool_calls"])
         """
-        # Build prompt from messages
-        prompt_parts = []
+        extra_system_messages = []
 
         # Add tool definitions if provided
         if tools and tool_choice != "none":
             tool_desc = self._format_tools_prompt(tools)
-            prompt_parts.append(tool_desc)
+            extra_system_messages.append(tool_desc)
 
         if system_prompt:
-            prompt_parts.append(f"System: {system_prompt}")
+            extra_system_messages.append(system_prompt)
 
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-
-            if role == "system":
-                prompt_parts.append(f"System: {content}")
-            elif role == "user":
-                prompt_parts.append(f"User: {content}")
-            elif role == "assistant":
-                prompt_parts.append(f"Assistant: {content}")
-            elif role == "tool":
-                tool_name = msg.get("name", "tool")
-                prompt_parts.append(f"Tool ({tool_name}): {content}")
-
-        prompt_parts.append("Assistant:")
-        prompt = "\n\n".join(prompt_parts)
+        model_hint = self._hf_repo_id or self._model_path
+        prompt = format_chat_prompt(
+            model_hint,
+            messages,
+            extra_system_messages=extra_system_messages,
+        )
 
         response_text = self.generate(prompt, max_tokens, **kwargs)
 

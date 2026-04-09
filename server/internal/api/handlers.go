@@ -190,67 +190,89 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 	}
 
 	outputChan := make(chan domain.StreamEvent, StreamChannelBufferSize)
-	err := h.chatService.GenerateStream(ctx, req, outputChan)
-	if err != nil {
-		slog.Error("generation failed",
-			slog.String("model", req.Model),
-			slog.String("error", err.Error()),
-		)
-		close(outputChan)
-		sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
-		return
-	}
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- h.chatService.GenerateStream(ctx, req, outputChan)
+	}()
 
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().Unix())
 	created := time.Now().Unix()
 
-	for event := range outputChan {
-		if event.IsFinished {
-			if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
+	for {
+		select {
+		case event, ok := <-outputChan:
+			if !ok {
+				if err := <-errChan; err != nil {
+					slog.Error("generation failed",
+						slog.String("model", req.Model),
+						slog.String("error", err.Error()),
+					)
+					sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+				}
+				return
+			}
+			if event.IsFinished {
+				if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
+					slog.Debug("SSE write error", slog.String("error", err.Error()))
+				}
+				flusher.Flush()
+				// Drain the worker goroutine so cancellation and cleanup complete.
+				if err := <-errChan; err != nil {
+					slog.Error("generation failed",
+						slog.String("model", req.Model),
+						slog.String("error", err.Error()),
+					)
+				}
+				return
+			}
+
+			chunk := domain.ChatCompletionChunk{
+				ID:      id,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   req.Model,
+				Choices: []domain.ChunkChoice{
+					{
+						Index: 0,
+						Delta: domain.ChunkDelta{
+							Content: event.Token,
+						},
+						FinishReason: nil,
+					},
+				},
+			}
+
+			data, err := json.Marshal(chunk)
+			if err != nil {
+				slog.Error("failed to marshal SSE chunk", slog.String("error", err.Error()))
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
 				slog.Debug("SSE write error", slog.String("error", err.Error()))
+				return
 			}
 			flusher.Flush()
-			break
+		case err := <-errChan:
+			if err != nil {
+				slog.Error("generation failed",
+					slog.String("model", req.Model),
+					slog.String("error", err.Error()),
+				)
+				sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+			}
+			return
+		case <-ctx.Done():
+			return
 		}
-
-		chunk := domain.ChatCompletionChunk{
-			ID:      id,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   req.Model,
-			Choices: []domain.ChunkChoice{
-				{
-					Index: 0,
-					Delta: domain.ChunkDelta{
-						Content: event.Token,
-					},
-					FinishReason: nil,
-				},
-			},
-		}
-
-		data, err := json.Marshal(chunk)
-		if err != nil {
-			slog.Error("failed to marshal SSE chunk", slog.String("error", err.Error()))
-			continue
-		}
-		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
-			slog.Debug("SSE write error", slog.String("error", err.Error()))
-			break
-		}
-		flusher.Flush()
 	}
 }
 
 func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req domain.ChatCompletionRequest) {
 	outputChan := make(chan domain.StreamEvent, StreamChannelBufferSize)
-
-	err := h.chatService.GenerateStream(ctx, req, outputChan)
-	if err != nil {
-		close(outputChan)
-		sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
-		return
-	}
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- h.chatService.GenerateStream(ctx, req, outputChan)
+	}()
 
 	// Use strings.Builder for efficient concatenation
 	var responseBuilder strings.Builder
@@ -263,6 +285,10 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 		if event.IsFinished {
 			break
 		}
+	}
+	if err := <-errChan; err != nil {
+		sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+		return
 	}
 
 	responseText := responseBuilder.String()
@@ -513,7 +539,7 @@ func (h *Handler) countChatPromptTokens(req domain.ChatCompletionRequest) int {
 	if len(req.InputIDs) > 0 {
 		return len(req.InputIDs)
 	}
-	return h.countSingleTextTokens(service.ExtractPrompt(req.Messages), true, false)
+	return h.countSingleTextTokens(service.FormatChatPrompt(h.modelService.GetCurrentModel(), req.Messages, req.ChatTemplateKwargs), true, false)
 }
 
 func (h *Handler) countTextTokens(texts []string, addBOS bool, addEOS bool) int {

@@ -634,7 +634,6 @@ docs = [
 ]
 full = [
     { name = "langchain" },
-    { name = "langchain-classic" },
     { name = "langchain-community" },
     { name = "langchain-core" },
     { name = "langchain-text-splitters" },
@@ -648,7 +647,6 @@ hf = [
 ]
 langchain = [
     { name = "langchain" },
-    { name = "langchain-classic" },
     { name = "langchain-community" },
     { name = "langchain-core" },
     { name = "langchain-text-splitters" },
@@ -667,12 +665,10 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.0" },
-    { name = "gguf", specifier = ">=0.18.0" },
+    { name = "gguf", specifier = ">=0.6.0" },
     { name = "huggingface-hub", specifier = ">=0.20.0,<1.0.0" },
     { name = "langchain", marker = "extra == 'full'", specifier = ">=1.0.0" },
     { name = "langchain", marker = "extra == 'langchain'", specifier = ">=1.0.0" },
-    { name = "langchain-classic", marker = "extra == 'full'", specifier = ">=1.0.0" },
-    { name = "langchain-classic", marker = "extra == 'langchain'", specifier = ">=1.0.0" },
     { name = "langchain-community", marker = "extra == 'full'", specifier = ">=0.4.1" },
     { name = "langchain-community", marker = "extra == 'langchain'", specifier = ">=0.4.1" },
     { name = "langchain-core", marker = "extra == 'full'", specifier = ">=1.0.0" },

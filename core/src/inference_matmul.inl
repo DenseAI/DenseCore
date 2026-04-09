@@ -875,7 +875,6 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
                 scores[static_cast<size_t>(t)] = -INFINITY;
                 continue;
             }
-
             const uint8_t* k_ptr =
                 k_block_base + static_cast<size_t>(slot_idx) * k_layout.slot_stride_bytes + k_head_offset_bytes;
             const float* k_head = nullptr;
@@ -2536,11 +2535,7 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
         return;
     }
 
-    if (direct_cpu_flash_path && layout == HalAttentionTensorLayout::HeadSeq) {
-        if (!ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v) || !ggml_is_contiguous(dst)) {
-            return;
-        }
-
+    if (direct_cpu_flash_path) {
         densecore::FlashAttentionConfig config = densecore::AutoTuneFlashConfig(head_dim, seq_kv);
         config.scale = params->data.scale;
         config.logit_softcap = params->data.logit_softcap;
@@ -2551,28 +2546,76 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
         config.kv_start_offset = std::max(0, params->data.kv_start_offset);
         config.semantic_flags = params->data.semantic_flags;
 
-        const float* q_data = reinterpret_cast<const float*>(q->data);
-        const float* k_data = reinterpret_cast<const float*>(k->data);
-        const float* v_data = reinterpret_cast<const float*>(v->data);
-        float* o_data = reinterpret_cast<float*>(dst->data);
+        if (layout == HalAttentionTensorLayout::HeadSeq) {
+            if (!ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v) || !ggml_is_contiguous(dst)) {
+                return;
+            }
 
-        #if defined(DENSECORE_X86) && !defined(__AVX512F__)
-        if (ith == 0) {
-            ComputeFlashAttentionReference(q_data, k_data, v_data, o_data, n_head, n_head_kv, seq_q, seq_kv, head_dim,
-                                           params->data.scale, params->data.causal != 0, params->data.q_start_offset,
-                                           params->data.kv_start_offset, params->data.sliding_window,
-                                           params->data.logit_softcap);
-        }
-        #else
-        if (n_head == n_head_kv) {
-            densecore::FlashAttentionBatched(q_data, k_data, v_data, o_data, 1, n_head, seq_q, seq_kv, head_dim,
-                                             config, ith, nth);
+            const float* q_data = reinterpret_cast<const float*>(q->data);
+            const float* k_data = reinterpret_cast<const float*>(k->data);
+            const float* v_data = reinterpret_cast<const float*>(v->data);
+            float* o_data = reinterpret_cast<float*>(dst->data);
+
+            #if defined(DENSECORE_X86) && !defined(__AVX512F__)
+            if (ith == 0) {
+                ComputeFlashAttentionReference(q_data, k_data, v_data, o_data, n_head, n_head_kv, seq_q, seq_kv,
+                                               head_dim, params->data.scale, params->data.causal != 0,
+                                               params->data.q_start_offset, params->data.kv_start_offset,
+                                               params->data.sliding_window, params->data.logit_softcap);
+            }
+            #else
+            if (n_head == n_head_kv) {
+                densecore::FlashAttentionBatched(q_data, k_data, v_data, o_data, 1, n_head, seq_q, seq_kv, head_dim,
+                                                 config, ith, nth);
+            } else {
+                densecore::FlashAttentionGQA(q_data, k_data, v_data, o_data, 1, n_head, n_head_kv, seq_q, seq_kv,
+                                             head_dim, config, ith, nth);
+            }
+            #endif
         } else {
-            densecore::FlashAttentionGQA(q_data, k_data, v_data, o_data, 1, n_head, n_head_kv, seq_q, seq_kv,
-                                         head_dim, config, ith, nth);
+            if (seq_q != 1 || q->nb[0] != sizeof(float) || k->nb[0] != sizeof(float) || v->nb[0] != sizeof(float) ||
+                dst->nb[0] != sizeof(float)) {
+                return;
+            }
+
+            static thread_local densecore::FlashAttentionScratch tl_scratch;
+            tl_scratch.Resize(config.block_m, config.block_n, head_dim);
+
+            const int total_work = n_head;
+            const int work_per_thread = std::max(1, (total_work + nth - 1) / nth);
+            const int work_start = ith * work_per_thread;
+            const int work_end = std::min(total_work, work_start + work_per_thread);
+            const int n_rep = n_head / n_head_kv;
+
+            const float* q_data = reinterpret_cast<const float*>(q->data);
+            const float* k_data = reinterpret_cast<const float*>(k->data);
+            const float* v_data = reinterpret_cast<const float*>(v->data);
+            float* o_data = reinterpret_cast<float*>(dst->data);
+
+            const int64_t q_head_stride = static_cast<int64_t>(q->nb[1] / sizeof(float));
+            const int64_t kv_head_stride = static_cast<int64_t>(k->nb[1] / sizeof(float));
+            const int64_t kv_seq_stride = static_cast<int64_t>(k->nb[2] / sizeof(float));
+            const int64_t v_head_stride = static_cast<int64_t>(v->nb[1] / sizeof(float));
+            const int64_t v_seq_stride = static_cast<int64_t>(v->nb[2] / sizeof(float));
+            const int64_t o_head_stride = static_cast<int64_t>(dst->nb[1] / sizeof(float));
+
+            for (int h = work_start; h < work_end; ++h) {
+                const int h_kv = h / n_rep;
+                const float* q_ptr = q_data + static_cast<ptrdiff_t>(h) * q_head_stride;
+                const float* k_ptr = k_data + static_cast<ptrdiff_t>(h_kv) * kv_head_stride;
+                const float* v_ptr = v_data + static_cast<ptrdiff_t>(h_kv) * v_head_stride;
+                float* o_ptr = o_data + static_cast<ptrdiff_t>(h) * o_head_stride;
+
+                densecore::FlashAttentionSingleQueryStridedKV(
+                    q_ptr, k_ptr, kv_seq_stride, v_ptr, v_seq_stride, o_ptr, seq_kv, head_dim, config, tl_scratch);
+            }
         }
-        #endif
-        if (ShouldRunPortableFlashParityCheck(params->data.layer) && ith == 0) {
+        if (layout == HalAttentionTensorLayout::HeadSeq && ShouldRunPortableFlashParityCheck(params->data.layer) &&
+            ith == 0) {
+            const float* q_data = reinterpret_cast<const float*>(q->data);
+            const float* k_data = reinterpret_cast<const float*>(k->data);
+            const float* v_data = reinterpret_cast<const float*>(v->data);
+            float* o_data = reinterpret_cast<float*>(dst->data);
             std::vector<float> ref(static_cast<size_t>(n_head) * seq_q * head_dim, 0.0f);
             ComputeFlashAttentionReference(q_data, k_data, v_data, ref.data(), n_head, n_head_kv, seq_q, seq_kv,
                                            head_dim, params->data.scale, params->data.causal != 0,
@@ -3197,7 +3240,19 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const bool is_hybrid_ssm_qkv = model && model->arch_flags.is_hybrid_ssm && IsHybridSSMQkvWeightName(w_name);
 
     // ========================================================================
-    // PATH 1: DenseCore-packed INT4 (highest priority)
+    // HYBRID SSM QKV CONSERVATIVE FALLBACK (Highest priority for correctness)
+    // ========================================================================
+    // CRITICAL: This guard must remain at the absolute top of the function to 
+    // prevent any optimized quantized/packed paths from returning silently 
+    // wrong results for hybrid SSM projections.
+    if (is_hybrid_ssm_qkv && ShouldForcePlainGgmlForHybridSSMQkv()) {
+        LogMatmulDispatch(w_name, "PLAIN_GGML", M, N_dim, K_dim, "CONSERVATIVE_FALLBACK");
+        LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "PLAIN_GGML_CONSERVATIVE_FALLBACK", false, false, false);
+        return ggml_mul_mat(ctx, weight, input);
+    }
+
+    // ========================================================================
+    // PATH 1: DenseCore-packed INT4
     // ========================================================================
     if (model) {
         auto it_int4 = model->int4_weight_bindings.find(weight);

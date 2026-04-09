@@ -53,12 +53,35 @@ public:
     static bool IsGraphModel(ModelArch arch);
 
     /**
+     * @brief Check if a loaded model instance supports graph execution
+     *
+     * This is more precise than the enum-only overload for architecture
+     * families like GEMMA where Gemma4 requires a specialized inline graph.
+     *
+     * @param model Loaded model instance
+     * @return true if graph execution is supported for this specific model
+     */
+    static bool IsGraphModel(const TransformerModel* model);
+
+    /**
      * @brief Get the graph name for a model architecture
      *
      * @param arch Model architecture enum
      * @return Graph name for registry (e.g., "vit_base")
      */
     static const char* GetGraphName(ModelArch arch);
+
+    /**
+     * @brief Get the graph name for a specific loaded model instance
+     *
+     * Some architecture families share an enum but require different graph
+     * paths depending on model flags. This overload keeps those variants from
+     * being advertised as generic graph-compatible.
+     *
+     * @param model Loaded model instance
+     * @return Graph name for registry, or nullptr if no generic graph applies
+     */
+    static const char* GetGraphName(const TransformerModel* model);
 
     /**
      * @brief Check if a loaded model has whisper weights registered for graph execution

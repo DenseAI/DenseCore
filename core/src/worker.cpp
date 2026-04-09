@@ -1692,8 +1692,9 @@ void EngineLoop(EngineState* state) {
             const bool decode_topology_stable = stable_paged_decode_topology;
             // CPU-only cache admission: cached decode graphs may include paged
             // decode custom ops that are not portable across backend/device types.
-            const bool decode_reuse_shape_eligible =
-                decode_graph_cache_active && decode_topology_stable && batch.lora_map.empty();
+            const bool decode_reuse_shape_eligible = decode_graph_cache_active && decode_topology_stable &&
+                                                     batch.lora_map.empty() &&
+                                                     IsDecodeGraphCacheSafeForModel(current_model);
             const bool decode_reuse_candidate = decode_reuse_shape_eligible && cpu_backend_active;
             const size_t decode_graph_uncacheable_limit =
                 static_cast<size_t>(std::max(1, decode_graph_cache_lru_size * 2));
@@ -2768,6 +2769,9 @@ void EngineLoop(EngineState* state) {
                         req->token_history.erase(req->token_history.begin(),
                                                  req->token_history.begin() +
                                                      static_cast<std::vector<int>::difference_type>(drop));
+                    }
+                    if (ShouldTerminateRepetitiveLoop(current_model, req)) {
+                        req->finished = true;
                     }
 
                     std::string token_str;

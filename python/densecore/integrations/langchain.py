@@ -60,6 +60,7 @@ try:
 except ImportError:
     PydanticBaseModel = None  # type: ignore
 
+from ..chat_template import format_chat_prompt
 from ..config import GenerationConfig, ModelConfig
 from ..engine import DenseCore, GenerationOutput
 
@@ -904,7 +905,8 @@ class DenseCoreChatModel(BaseChatModel):
 
         Handles all message types including ToolMessage for multi-turn tool use.
         """
-        formatted_parts = []
+        structured_messages: list[dict[str, Any]] = []
+        extra_system_messages: list[str] = []
 
         # Check if we have tools bound
         bound_tools = getattr(self, "_bound_tools", [])
@@ -924,41 +926,54 @@ class DenseCoreChatModel(BaseChatModel):
                 tools_desc += "You must emit at least one tool call in the required JSON format.\n"
             elif isinstance(tool_choice, str) and tool_choice not in ("auto", "none", "required"):
                 tools_desc += f'You must prefer tool "{tool_choice}" when producing a tool call.\n'
-            formatted_parts.append(f"System: {tools_desc}")
+            extra_system_messages.append(tools_desc)
 
         output_schema = getattr(self, "_output_schema", None)
         if output_schema:
-            formatted_parts.append(
-                "System: Return a valid JSON object matching this schema exactly:\n"
+            extra_system_messages.append(
+                "Return a valid JSON object matching this schema exactly:\n"
                 f"{json.dumps(output_schema, ensure_ascii=False)}"
             )
 
         for message in messages:
             if isinstance(message, SystemMessage):
-                formatted_parts.append(f"System: {message.content}")
+                structured_messages.append({"role": "system", "content": message.content})
             elif isinstance(message, HumanMessage):
-                formatted_parts.append(f"User: {message.content}")
+                structured_messages.append({"role": "user", "content": message.content})
             elif isinstance(message, AIMessage):
-                content = message.content
-                # Include tool calls in the message if present
+                assistant_message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": message.content,
+                }
                 if hasattr(message, "tool_calls") and message.tool_calls:
-                    for tc in message.tool_calls:
-                        content += f'\n<tool_call>{{"name": "{tc["name"]}", "arguments": {json.dumps(tc.get("args", {}))}}}</tool_call>'
-                formatted_parts.append(f"Assistant: {content}")
+                    assistant_message["tool_calls"] = [
+                        {
+                            "id": tc.get("id", f"call_{index}"),
+                            "type": "function",
+                            "function": {
+                                "name": tc.get("name", "unknown"),
+                                "arguments": json.dumps(tc.get("args", {}), ensure_ascii=False),
+                            },
+                        }
+                        for index, tc in enumerate(message.tool_calls)
+                    ]
+                structured_messages.append(assistant_message)
             elif isinstance(message, ToolMessage):
-                # Format tool result
                 tool_name = getattr(message, "name", "tool")
-                formatted_parts.append(f"Tool ({tool_name}): {message.content}")
+                structured_messages.append(
+                    {"role": "tool", "name": tool_name, "content": message.content}
+                )
             elif isinstance(message, ChatMessage):
                 role = message.role or "User"
-                formatted_parts.append(f"{role}: {message.content}")
+                structured_messages.append({"role": role.lower(), "content": message.content})
             else:
-                # Fallback for unknown message types
-                formatted_parts.append(f"User: {message.content}")
+                structured_messages.append({"role": "user", "content": message.content})
 
-        # Add assistant prefix to prompt completion
-        formatted_parts.append("Assistant: ")
-        return "\n".join(formatted_parts)
+        return format_chat_prompt(
+            self.hf_repo_id or self.model_path,
+            structured_messages,
+            extra_system_messages=extra_system_messages,
+        )
 
     def _get_generation_config(self, **kwargs: Any) -> GenerationConfig:
         """Create GenerationConfig from parameters."""

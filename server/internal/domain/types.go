@@ -1,6 +1,10 @@
 package domain
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
 
 // StreamEvent represents a token event in the stream
 type StreamEvent struct {
@@ -10,19 +14,20 @@ type StreamEvent struct {
 
 // OpenAI-compatible request/response structures
 type ChatCompletionRequest struct {
-	Model             string          `json:"model"`
-	Messages          []Message       `json:"messages"`
-	InputIDs          []int           `json:"input_ids,omitempty"`
-	LoraAdapter       string          `json:"lora_adapter,omitempty"`
-	MaxTokens         int             `json:"max_tokens,omitempty"`
-	Temperature       float64         `json:"temperature,omitempty"`
-	TopP              float64         `json:"top_p,omitempty"`
-	TopK              int             `json:"top_k,omitempty"`
-	RepetitionPenalty float64         `json:"repetition_penalty,omitempty"`
-	Stop              []string        `json:"stop,omitempty"`
-	Stream            bool            `json:"stream,omitempty"`
-	ResponseFormat    *ResponseFormat `json:"response_format,omitempty"`
-	ExpertCluster     []int           `json:"expert_cluster,omitempty"`
+	Model              string              `json:"model"`
+	Messages           []Message           `json:"messages"`
+	InputIDs           []int               `json:"input_ids,omitempty"`
+	LoraAdapter        string              `json:"lora_adapter,omitempty"`
+	ChatTemplateKwargs *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
+	MaxTokens          int                 `json:"max_tokens,omitempty"`
+	Temperature        float64             `json:"temperature,omitempty"`
+	TopP               float64             `json:"top_p,omitempty"`
+	TopK               int                 `json:"top_k,omitempty"`
+	RepetitionPenalty  float64             `json:"repetition_penalty,omitempty"`
+	Stop               []string            `json:"stop,omitempty"`
+	Stream             bool                `json:"stream,omitempty"`
+	ResponseFormat     *ResponseFormat     `json:"response_format,omitempty"`
+	ExpertCluster      []int               `json:"expert_cluster,omitempty"`
 
 	TemperatureSet       bool `json:"-"`
 	TopPSet              bool `json:"-"`
@@ -32,19 +37,20 @@ type ChatCompletionRequest struct {
 
 func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
 	type rawChatCompletionRequest struct {
-		Model             string          `json:"model"`
-		Messages          []Message       `json:"messages"`
-		InputIDs          []int           `json:"input_ids,omitempty"`
-		LoraAdapter       string          `json:"lora_adapter,omitempty"`
-		MaxTokens         int             `json:"max_tokens,omitempty"`
-		Temperature       *float64        `json:"temperature,omitempty"`
-		TopP              *float64        `json:"top_p,omitempty"`
-		TopK              *int            `json:"top_k,omitempty"`
-		RepetitionPenalty *float64        `json:"repetition_penalty,omitempty"`
-		Stop              []string        `json:"stop,omitempty"`
-		Stream            bool            `json:"stream,omitempty"`
-		ResponseFormat    *ResponseFormat `json:"response_format,omitempty"`
-		ExpertCluster     []int           `json:"expert_cluster,omitempty"`
+		Model              string              `json:"model"`
+		Messages           []Message           `json:"messages"`
+		InputIDs           []int               `json:"input_ids,omitempty"`
+		LoraAdapter        string              `json:"lora_adapter,omitempty"`
+		ChatTemplateKwargs *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
+		MaxTokens          int                 `json:"max_tokens,omitempty"`
+		Temperature        *float64            `json:"temperature,omitempty"`
+		TopP               *float64            `json:"top_p,omitempty"`
+		TopK               *int                `json:"top_k,omitempty"`
+		RepetitionPenalty  *float64            `json:"repetition_penalty,omitempty"`
+		Stop               []string            `json:"stop,omitempty"`
+		Stream             bool                `json:"stream,omitempty"`
+		ResponseFormat     *ResponseFormat     `json:"response_format,omitempty"`
+		ExpertCluster      []int               `json:"expert_cluster,omitempty"`
 	}
 
 	var raw rawChatCompletionRequest
@@ -56,6 +62,7 @@ func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
 	r.Messages = raw.Messages
 	r.InputIDs = raw.InputIDs
 	r.LoraAdapter = raw.LoraAdapter
+	r.ChatTemplateKwargs = raw.ChatTemplateKwargs
 	r.MaxTokens = raw.MaxTokens
 	r.Stop = raw.Stop
 	r.Stream = raw.Stream
@@ -97,9 +104,131 @@ type ResponseFormat struct {
 	Type string `json:"type"` // "text" or "json_object"
 }
 
+type ChatTemplateKwargs struct {
+	EnableThinking *bool `json:"enable_thinking,omitempty"`
+}
+
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string         `json:"role"`
+	Content          string         `json:"-"`
+	ContentParts     []ContentPart  `json:"-"`
+	ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`
+	ToolResponses    []ToolResponse `json:"tool_responses,omitempty"`
+	ToolCallID       string         `json:"tool_call_id,omitempty"`
+	Name             string         `json:"name,omitempty"`
+	ReasoningContent string         `json:"reasoning_content,omitempty"`
+}
+
+type ContentPart struct {
+	Type     string `json:"type,omitempty"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+	Image    string `json:"image,omitempty"`
+	Video    string `json:"video,omitempty"`
+	Audio    string `json:"audio,omitempty"`
+	URL      string `json:"url,omitempty"`
+}
+
+type ToolResponse struct {
+	Name     string      `json:"name,omitempty"`
+	Response interface{} `json:"response,omitempty"`
+}
+
+func (m *Message) UnmarshalJSON(data []byte) error {
+	type rawMessage struct {
+		Role             string          `json:"role"`
+		Content          json.RawMessage `json:"content"`
+		ToolCalls        []ToolCall      `json:"tool_calls,omitempty"`
+		ToolResponses    []ToolResponse  `json:"tool_responses,omitempty"`
+		ToolCallID       string          `json:"tool_call_id,omitempty"`
+		Name             string          `json:"name,omitempty"`
+		ReasoningContent string          `json:"reasoning_content,omitempty"`
+	}
+
+	var raw rawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	m.Role = raw.Role
+	m.ToolCalls = raw.ToolCalls
+	m.ToolResponses = raw.ToolResponses
+	m.ToolCallID = raw.ToolCallID
+	m.Name = raw.Name
+	m.ReasoningContent = raw.ReasoningContent
+	m.Content = ""
+	m.ContentParts = nil
+
+	if len(raw.Content) == 0 || string(raw.Content) == "null" {
+		return nil
+	}
+
+	if raw.Content[0] == '"' {
+		if err := json.Unmarshal(raw.Content, &m.Content); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if raw.Content[0] == '[' {
+		if err := json.Unmarshal(raw.Content, &m.ContentParts); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	return fmt.Errorf("unsupported message content shape")
+}
+
+func (m Message) MarshalJSON() ([]byte, error) {
+	type rawMessage struct {
+		Role             string         `json:"role"`
+		Content          interface{}    `json:"content,omitempty"`
+		ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`
+		ToolResponses    []ToolResponse `json:"tool_responses,omitempty"`
+		ToolCallID       string         `json:"tool_call_id,omitempty"`
+		Name             string         `json:"name,omitempty"`
+		ReasoningContent string         `json:"reasoning_content,omitempty"`
+	}
+	var content interface{}
+	if len(m.ContentParts) > 0 {
+		content = m.ContentParts
+	} else {
+		content = m.Content
+	}
+	return json.Marshal(rawMessage{
+		Role:             m.Role,
+		Content:          content,
+		ToolCalls:        m.ToolCalls,
+		ToolResponses:    m.ToolResponses,
+		ToolCallID:       m.ToolCallID,
+		Name:             m.Name,
+		ReasoningContent: m.ReasoningContent,
+	})
+}
+
+func (m Message) HasStructuredContent() bool {
+	return len(m.ContentParts) > 0
+}
+
+func (m Message) FlattenedText() string {
+	if !m.HasStructuredContent() {
+		return m.Content
+	}
+	var sb strings.Builder
+	for _, part := range m.ContentParts {
+		switch {
+		case part.Text != "":
+			sb.WriteString(part.Text)
+		case part.Type == "image" || part.Image != "" || part.ImageURL != "" || part.URL != "":
+			sb.WriteString("[image]")
+		case part.Type == "video" || part.Video != "":
+			sb.WriteString("[video]")
+		case part.Type == "audio" || part.Audio != "":
+			sb.WriteString("[audio]")
+		}
+	}
+	return sb.String()
 }
 
 type ChatCompletionResponse struct {

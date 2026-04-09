@@ -5,12 +5,12 @@ package engine
 // -----------------------
 // IMPORTANT: Set these environment variables before building:
 //   export CGO_CFLAGS="-I${PWD}/core/include"
-//   export CGO_LDFLAGS="-L${PWD}/core/build -Wl,-rpath,${PWD}/core/build -ldensecore -lstdc++"
+//   export CGO_LDFLAGS="-L${PWD}/build -Wl,-rpath,${PWD}/build -ldensecore -lstdc++"
 // OR use pkg-config if available.
 //
 // The ${SRCDIR} variable expands to the directory containing the Go source file.
 #cgo CFLAGS: -I${SRCDIR}/../../../core/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../core/build -Wl,-rpath,${SRCDIR}/../../../core/build -ldensecore -lstdc++
+#cgo LDFLAGS: -L${SRCDIR}/../../../build -Wl,-rpath,${SRCDIR}/../../../build -ldensecore -lstdc++
 #include <stdlib.h>
 #include "densecore.h"
 

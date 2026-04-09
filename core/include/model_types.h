@@ -455,7 +455,7 @@ struct TransformerModel {
     int gemma4_sliding_window = -1;
     int gemma4_n_shared_kv_layers = 0;
     int gemma4_hidden_size_per_layer_input = 0;
-    float gemma4_attention_logit_softcapping = 50.0f;
+    float gemma4_attention_logit_softcapping = 0.0f;
     float gemma4_final_logit_softcapping = 0.0f;
     float gemma4_full_attention_partial_rotary_factor = 0.25f;
     uint32_t gemma4_key_length_full = 0;

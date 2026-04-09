@@ -383,6 +383,21 @@ bool IsDecodeGraphCacheEnabled() {
     return enabled;
 }
 
+bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model) {
+    if (!model) {
+        return false;
+    }
+
+    // Hybrid SSM decode graphs capture per-batch recurrent-state pointers in
+    // GGML custom-op userdata. Reusing those graphs across requests keeps stale
+    // `token_seq_ids` / `runtime_states` bindings and corrupts the next decode.
+    if (model->arch_flags.is_hybrid_ssm) {
+        return false;
+    }
+
+    return true;
+}
+
 bool IsBatchedPagedDecodeEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_ENABLE_BATCHED_PAGED_DECODE");
@@ -938,6 +953,48 @@ bool IsStopTokenId(const TransformerModel* model, int token_id) {
             return true;
         }
     }
+    return false;
+}
+
+bool ShouldTerminateRepetitiveLoop(const TransformerModel* model, const Request* req) {
+    if (!model || !req) return false;
+    if (model->arch != ModelArch::QWEN3 && model->arch != ModelArch::QWEN35) {
+        return false;
+    }
+
+    const auto& history = req->token_history;
+    const size_t n = history.size();
+    if (n < 8) {
+        return false;
+    }
+
+    const int latest = history.back();
+    size_t same_suffix = 1;
+    while (same_suffix < n && history[n - 1 - same_suffix] == latest) {
+        ++same_suffix;
+    }
+    if (same_suffix >= 8) {
+        return true;
+    }
+
+    if (n >= 12) {
+        const int a = history[n - 1];
+        const int b = history[n - 2];
+        if (a != b) {
+            bool alternating = true;
+            for (size_t i = 0; i < 12; ++i) {
+                const int expected = (i % 2 == 0) ? a : b;
+                if (history[n - 1 - i] != expected) {
+                    alternating = false;
+                    break;
+                }
+            }
+            if (alternating) {
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 

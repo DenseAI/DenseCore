@@ -338,6 +338,7 @@ setup(
     package_data={
         "densecore": [
             "py.typed",
+            "prompt_profiles.json",
             "*.so",
             "*.so.*",
             "*.dylib",

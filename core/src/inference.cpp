@@ -394,12 +394,36 @@ static bool IsDebugSSMCoreReferenceEnabled() {
     return enabled;
 }
 
+static bool ShouldForcePlainGgmlForHybridSSMQkv_Internal() {
+    // Explicit user override: always respected
+    const char* env = std::getenv("DENSECORE_HYBRID_SSM_QKV_FORCE_GGML");
+    if (env && env[0] != '\0') {
+        return std::strcmp(env, "0") != 0;
+    }
+    // Keep the optimized DenseCore paths enabled by default. The legacy
+    // conservative default routed hybrid SSM QKV back to plain GGML, which is
+    // slower on C4A-class ARM CPUs and can regress Qwen3.5 numerics. Retain an
+    // env escape hatch for diagnostics.
+    const char* conservative = std::getenv("DENSECORE_HYBRID_SSM_QKV_FORCE_CONSERVATIVE");
+    if (conservative && conservative[0] != '\0') {
+        return std::strcmp(conservative, "0") != 0;
+    }
+    return false;
+}
+
+static std::atomic<bool> g_hybrid_ssm_qkv_force_ggml_cached{false};
+static bool g_hybrid_ssm_qkv_force_ggml_val = false;
+static std::mutex g_hybrid_ssm_qkv_force_ggml_mutex;
+
 static bool ShouldForcePlainGgmlForHybridSSMQkv() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_HYBRID_SSM_QKV_FORCE_GGML");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
+    if (!g_hybrid_ssm_qkv_force_ggml_cached.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_hybrid_ssm_qkv_force_ggml_mutex);
+        if (!g_hybrid_ssm_qkv_force_ggml_cached.load(std::memory_order_relaxed)) {
+            g_hybrid_ssm_qkv_force_ggml_val = ShouldForcePlainGgmlForHybridSSMQkv_Internal();
+            g_hybrid_ssm_qkv_force_ggml_cached.store(true, std::memory_order_release);
+        }
+    }
+    return g_hybrid_ssm_qkv_force_ggml_val;
 }
 
 static void LogHybridSSMQkvDispatch(const char* weight_name, ggml_type weight_type, int M, int N, int K,
@@ -484,7 +508,13 @@ static bool ShouldUseArmNativeQ4KVecDotValidated(ggml_type weight_type, const gg
         return true;
     }
 
-    static std::atomic<int> state{0};  // 0=unknown, 1=enabled, 2=disabled
+    const bool is_hybrid_ssm_qkv = IsHybridSSMQkvWeightName(
+        reinterpret_cast<const char*>(sample_row_ptr));  // Approximate check if name ptr was passed
+    if (is_hybrid_ssm_qkv && ShouldForcePlainGgmlForHybridSSMQkv()) {
+        return false;  // Always fail-closed for hybrid SSM QKV on ARM unless specifically opted out
+    }
+
+    // Multi-sample validation: test multiple representative weight rows
     int current = state.load(std::memory_order_acquire);
     if (current != 0) {
         return current == 1;
@@ -494,29 +524,47 @@ static bool ShouldUseArmNativeQ4KVecDotValidated(ggml_type weight_type, const gg
     std::lock_guard<std::mutex> lock(mu);
     current = state.load(std::memory_order_relaxed);
     if (current == 0) {
-        float native_sum = 0.0f;
-        type_traits_cpu->vec_dot(N, &native_sum, 0, sample_row_ptr, 0, sample_quant_input, 0, 1);
-
         const auto* type_traits = ggml_get_type_traits(weight_type);
-        thread_local std::vector<float> dequant_buffer;
         bool ok = false;
-        float max_abs_diff = std::numeric_limits<float>::infinity();
+        float global_max_abs_diff = 0.0f;
         if (type_traits && type_traits->to_float) {
+            thread_local std::vector<float> dequant_buffer;
             dequant_buffer.resize(static_cast<size_t>(N));
-            type_traits->to_float(sample_row_ptr, dequant_buffer.data(), N);
+            const size_t row_stride = ggml_row_size(weight_type, N);
 
-            float ref_sum = 0.0f;
-            for (int i = 0; i < N; ++i) {
-                ref_sum += dequant_buffer[static_cast<size_t>(i)] * sample_input_f32[i];
+            // Validate at least kMinValidationRows representative rows.
+            // Rows are sampled at the base pointer (row 0) and at evenly
+            // spaced offsets to detect position-dependent accuracy loss.
+            static constexpr int kMinValidationRows = 4;
+            ok = true;
+            for (int sample = 0; sample < kMinValidationRows; ++sample) {
+                const void* row_ptr =
+                    reinterpret_cast<const char*>(sample_row_ptr) + static_cast<size_t>(sample) * row_stride;
+
+                float native_sum = 0.0f;
+                type_traits_cpu->vec_dot(N, &native_sum, 0, row_ptr, 0, sample_quant_input, 0, 1);
+
+                type_traits->to_float(row_ptr, dequant_buffer.data(), N);
+                float ref_sum = 0.0f;
+                for (int i = 0; i < N; ++i) {
+                    ref_sum += dequant_buffer[static_cast<size_t>(i)] * sample_input_f32[i];
+                }
+
+                const float diff = std::fabs(native_sum - ref_sum);
+                global_max_abs_diff = std::max(global_max_abs_diff, diff);
+
+                // Tighter tolerance than before (was 5e-4 relative, now 2e-4).
+                // Fail closed: any single row exceeding tolerance disables the path.
+                const float tol = std::max(1e-3f, 2e-4f * std::fabs(ref_sum));
+                if (!std::isfinite(native_sum) || diff > tol) {
+                    ok = false;
+                    break;
+                }
             }
-
-            max_abs_diff = std::fabs(native_sum - ref_sum);
-            const float tol = std::max(1e-3f, 5e-4f * std::fabs(ref_sum));
-            ok = std::isfinite(native_sum) && max_abs_diff <= tol;
         }
 
         state.store(ok ? 1 : 2, std::memory_order_release);
-        LogMatmulValidationOnce("arm_q4k_native_vecdot", ok, max_abs_diff);
+        LogMatmulValidationOnce("arm_q4k_native_vecdot", ok, global_max_abs_diff);
         current = ok ? 1 : 2;
     }
 
@@ -530,6 +578,7 @@ static bool ShouldUseArmNativeQ4KVecDotValidated(ggml_type weight_type, const gg
     return type_traits_cpu && type_traits_cpu->vec_dot;
 #endif
 }
+
 
 static bool IsCustomGemvDisabled() {
     static const bool disabled = []() {
@@ -815,12 +864,16 @@ static int MapRetainedHistoryIndex(const KVRetentionSpan& span, int retained_ind
 
 [[maybe_unused]] static RuntimeToggleMode GetArmQ4KNativeVecDotMode() {
 #if defined(__aarch64__) || defined(_M_ARM64)
+    // Legacy env: ALLOW=0 → disable (Off), ALLOW=1/non-zero → enable (On).
+    // NOTE(fix): prior code had On/Off swapped here, causing ALLOW=0 to
+    // *enable* the native path. This was the primary root cause of
+    // "finite but wrong" ARM outputs on hybrid-SSM QKV projections.
     const char* legacy = std::getenv("DENSECORE_ARM_ALLOW_Q4K_NATIVE_VECDOT");
     if (legacy && legacy[0] != '\0') {
         if (std::strcmp(legacy, "0") == 0 || std::strcmp(legacy, "false") == 0 || std::strcmp(legacy, "FALSE") == 0) {
-            return RuntimeToggleMode::On;
+            return RuntimeToggleMode::Off;
         }
-        return RuntimeToggleMode::Off;
+        return RuntimeToggleMode::On;
     }
 
     const char* env = std::getenv("DENSECORE_ARM_Q4K_NATIVE_VECDOT_MODE");
@@ -1705,7 +1758,7 @@ static void ComputeMatmulReferenceF32(const struct ggml_tensor* weight, const st
         const size_t quant_row_size = ggml_row_size(vec_dot_type, static_cast<int64_t>(N));
         if (input_type_traits && input_type_traits->from_float && quant_row_size > 0 &&
             quant_row_size <= kMatmulReferenceMaxQuantRowBytes) {
-        std::vector<uint8_t> quant_rows(quant_row_size * static_cast<size_t>(M));
+            std::vector<uint8_t> quant_rows(quant_row_size * static_cast<size_t>(M));
             for (int m = 0; m < M; ++m) {
                 const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(input->nb[1]);
                 std::vector<float> gathered_input(static_cast<size_t>(N), 0.0f);
@@ -2766,26 +2819,10 @@ struct AttentionCoreReferenceUserData {
     const char* var_name = nullptr;
 };
 
-struct SSMQwen35DeltaUserData {
-    const float* alpha_weight;  // [n_heads, n_embd]
-    const float* beta_weight;   // [n_heads, n_embd]
-    const float* dt_bias;       // [n_heads]
-    const float* a_log;         // [n_heads]
-    const float* norm_weight;   // [head_dim_v] or [d_inner]
-    float* ssm_state;           // canonical [n_heads][head_dim_k][head_dim_v]
-    int n_embd;
-    int d_inner;
-    int n_heads;
-    int head_dim_v;
-    int head_dim_k;
-    int n_groups;
-    Qwen35SSMNormLayout norm_layout = Qwen35SSMNormLayout::INVALID;
-    float norm_eps;
-    int layer_idx = -1;
-    int ssm_ordinal = -1;
-    const int* token_seq_ids = nullptr;
-    const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
-};
+
+// ============================================================================
+// SSM Delta Callback Helper logic
+// ============================================================================
 
 struct GLMDSAPackUserData {
     int n_heads;
@@ -2814,7 +2851,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     // This allows seamless support for ViT, MoE, and other variants without
     // cluttering the main inference loop.
     // =========================================================================
-    {
+    const bool requires_inline_arch_specific_path =
+        model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_gemma4);
+    if (!requires_inline_arch_specific_path) {
         auto builder = densecore::TransformerGraphRegistry::Instance().GetBuilder(static_cast<int>(model->arch));
 
         if (builder) {
@@ -2823,6 +2862,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             }
             return builder->Build(model, cache, ctx_c, batch, embedding_mode, gf, out_embd, out_pos);
         }
+    } else if (IsVerboseGraphBuildLoggingEnabled()) {
+        std::cerr << "[BuildTransformerGraph] Skipping strategy registry for arch " << static_cast<int>(model->arch)
+                  << " to preserve the inline architecture-specific graph path." << std::endl;
     }
 
     // Fallback: Inline LLaMA/Default implementation
@@ -3651,8 +3693,13 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 }
             }
 
+            // Skip K/V norms for Gemma4 layers that will reuse K/V from a source layer —
+            // the projected K/V tensors are discarded anyway, so normalizing them is wasted work.
+            const bool gemma4_will_reuse_kv =
+                model->arch_flags.is_gemma4 && !IsGemma4SharedKvReuseDisabled() && Gemma4KVSourceLayer(model, il) != il;
+
             // K Normalization (required for Qwen3, optional for others)
-            if (model->arch_flags.requires_k_norm && k_norm) {
+            if (!gemma4_will_reuse_kv && model->arch_flags.requires_k_norm && k_norm) {
                 const int64_t k_n_tokens = Kcur->ne[2];  // N (batch size)
                 struct ggml_tensor* k_norm_effective = effective_rms_weight(k_norm, nullptr);
                 if (IsDebugInferenceStatsEnabled() && il == 3) {
@@ -3701,7 +3748,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 }
             }
 
-            if (model->arch_flags.is_gemma4 && Vcur) {
+            if (!gemma4_will_reuse_kv && model->arch_flags.is_gemma4 && Vcur) {
                 struct ggml_tensor* v_norm = layer.Get(model_keys::kAttnVNorm);
                 const int64_t v_n_tokens = Vcur->ne[2];
                 if (head_dim_v > 0 && n_head_kv > 0) {
@@ -5205,3 +5252,34 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
 }
 
 #include "inference_sampling.inl"
+
+#ifdef DENSECORE_TEST_BUILD
+namespace densecore {
+namespace testing {
+int GetArmQ4KNativeVecDotModeTest() {
+    return static_cast<int>(::GetArmQ4KNativeVecDotMode());
+}
+void ResetHybridSSMQkvForceGgmlCache() {
+    std::lock_guard<std::mutex> lock(::g_hybrid_ssm_qkv_force_ggml_mutex);
+    ::g_hybrid_ssm_qkv_force_ggml_cached.store(false, std::memory_order_release);
+}
+bool ShouldForcePlainGgmlForHybridSSMQkvTest() {
+    return ::ShouldForcePlainGgmlForHybridSSMQkv();
+}
+bool ShouldUseArmNativeQ4KVecDotValidatedTest(ggml_type weight_type, const ggml_type_traits_cpu* type_traits_cpu,
+                                              const void* sample_row_ptr, const void* sample_quant_input,
+                                              const float* sample_input_f32, int N) {
+    return ::ShouldUseArmNativeQ4KVecDotValidated(weight_type, type_traits_cpu, sample_row_ptr, sample_quant_input,
+                                                  sample_input_f32, N);
+}
+void CbSsmQwen35DeltaTest(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
+                          const struct ggml_tensor* c, int ith, int nth, void* userdata) {
+    ::cb_ssm_qwen35_delta(dst, a, b, c, ith, nth, userdata);
+}
+struct ggml_tensor* SmartMulMatTest(struct ggml_context* ctx, struct ggml_tensor* weight, struct ggml_tensor* input,
+                                    TransformerModel* model) {
+    return ::smart_mul_mat(ctx, weight, input, model);
+}
+}  // namespace testing
+}  // namespace densecore
+#endif

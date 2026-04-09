@@ -313,6 +313,15 @@ std::string TrimWhitespace(std::string value) {
     return value.substr(first, last - first + 1);
 }
 
+bool ContainsNonASCIIText(const std::string& text) {
+    for (unsigned char ch : text) {
+        if (ch & 0x80) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool IsPathWithinBase(const fs::path& candidate, const fs::path& base_dir) {
     const fs::path relative = candidate.lexically_relative(base_dir);
     if (relative.empty()) {
@@ -497,39 +506,109 @@ bool HasTokenLiteral(const TransformerModel* model, const char* token) {
     return model->token_to_id.find(token) != model->token_to_id.end();
 }
 
-bool ShouldPrimeQwenNoThinking(const TransformerModel* model) {
-    if (!model) return false;
+enum class PromptTemplateKind {
+    PLAIN = 0,
+    CHATML,
+    ROLE_TAGS,
+    TURN_TAGS,
+};
+
+struct PromptTemplateProfile {
+    PromptTemplateKind kind = PromptTemplateKind::PLAIN;
+    std::string open_tag;
+    std::string close_tag;
+    std::string system_role;
+    std::string user_role;
+    std::string assistant_role;
+    bool supports_thinking = false;
+    bool thinking_enabled = false;
+};
+
+bool TemplateContains(const TransformerModel* model, const char* needle) {
+    return model && needle && model->chat_template.find(needle) != std::string::npos;
+}
+
+bool ModelUsesQwenThinkingEnv(const TransformerModel* model) {
+    return model && (model->arch == ModelArch::QWEN3 || model->arch == ModelArch::QWEN35);
+}
+
+bool ResolveQwenThinkingEnabled(const TransformerModel* model) {
+    if (!model) {
+        return false;
+    }
     if (model->arch == ModelArch::QWEN3) {
-        return !ParseBoolEnv("DENSECORE_QWEN3_ENABLE_THINKING", true);
+        return ParseBoolEnv("DENSECORE_QWEN3_ENABLE_THINKING", true);
     }
     if (model->arch == ModelArch::QWEN35) {
-        return !ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", true);
+        return ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", true);
     }
-    return false;
+    return true;
+}
+
+PromptTemplateProfile ResolvePromptTemplateProfile(const TransformerModel* model) {
+    PromptTemplateProfile profile;
+    if (!model) {
+        return profile;
+    }
+
+    const bool has_chatml_tokens = HasTokenLiteral(model, "<|im_start|>") && HasTokenLiteral(model, "<|im_end|>");
+    const bool has_role_tokens = HasTokenLiteral(model, "<|user|>") && HasTokenLiteral(model, "<|assistant|>");
+    const bool has_turn_tokens = HasTokenLiteral(model, "<|turn>") && HasTokenLiteral(model, "<turn|>");
+    const bool template_looks_chatml = TemplateContains(model, "<|im_start|>");
+    const bool template_looks_turn_tags = TemplateContains(model, "<|turn>") && TemplateContains(model, "<turn|>");
+    const bool prefer_chatml =
+        model->arch == ModelArch::QWEN2 || model->arch == ModelArch::QWEN3 || model->arch == ModelArch::QWEN35;
+    const bool prefer_turn_tags = model->arch_flags.is_gemma4;
+
+    if (has_chatml_tokens || template_looks_chatml || prefer_chatml) {
+        profile.kind = PromptTemplateKind::CHATML;
+        profile.open_tag = "<|im_start|>";
+        profile.close_tag = "<|im_end|>\n";
+        profile.system_role = "system";
+        profile.user_role = "user";
+        profile.assistant_role = "assistant";
+        profile.supports_thinking = ModelUsesQwenThinkingEnv(model);
+        profile.thinking_enabled = ResolveQwenThinkingEnabled(model);
+        return profile;
+    }
+
+    if (has_turn_tokens || template_looks_turn_tags || prefer_turn_tags) {
+        profile.kind = PromptTemplateKind::TURN_TAGS;
+        profile.open_tag = "<|turn>";
+        profile.close_tag = "<turn|>\n";
+        profile.system_role = "system";
+        profile.user_role = "user";
+        profile.assistant_role = "model";
+        profile.supports_thinking = model->arch_flags.is_gemma4;
+        profile.thinking_enabled =
+            model->arch_flags.is_gemma4 ? ParseBoolEnv("DENSECORE_GEMMA4_ENABLE_THINKING", false) : false;
+        return profile;
+    }
+
+    if (has_role_tokens) {
+        profile.kind = PromptTemplateKind::ROLE_TAGS;
+        profile.open_tag = "";
+        profile.close_tag = "";
+        profile.system_role = "system";
+        profile.user_role = "user";
+        profile.assistant_role = "assistant";
+        return profile;
+    }
+
+    return profile;
+}
+
+bool ShouldPrimeQwenNoThinking(const TransformerModel* model) {
+    if (!ModelUsesQwenThinkingEnv(model)) return false;
+    return !ResolveQwenThinkingEnabled(model);
 }
 
 void MaybePrimeQwenNoThinking(const TransformerModel* model, std::vector<int>* tokens) {
     if (!model || !tokens || !ShouldPrimeQwenNoThinking(model)) {
         return;
     }
-    const std::vector<int> suffix = Tokenizer::Tokenize(model, "Answer: ", /*add_bos=*/false, /*add_eos=*/false);
-    if (suffix.empty()) {
-        return;
-    }
-    if (tokens->size() >= suffix.size()) {
-        bool already_primed = true;
-        const size_t start = tokens->size() - suffix.size();
-        for (size_t i = 0; i < suffix.size(); ++i) {
-            if ((*tokens)[start + i] != suffix[i]) {
-                already_primed = false;
-                break;
-            }
-        }
-        if (already_primed) {
-            return;
-        }
-    }
-    tokens->insert(tokens->end(), suffix.begin(), suffix.end());
+    // Keep the assistant cue alone. Qwen no-thinking works better when we do
+    // not force an English prefix like "Answer:" onto the continuation.
 }
 
 void ConfigureQwenReasoningTokenBlocklist(const TransformerModel* model, Request* req) {
@@ -539,19 +618,17 @@ void ConfigureQwenReasoningTokenBlocklist(const TransformerModel* model, Request
         return;
     }
 
-    if (model->token_types.size() == model->vocab_tokens.size()) {
-        for (size_t i = 0; i < model->token_types.size(); ++i) {
-            if (model->token_types[i] == 3 && static_cast<int>(i) != model->eos_token_id) {
-                req->disallowed_token_ids.push_back(static_cast<int>(i));
-            }
-        }
-    } else {
-        static const char* kBlockedLiterals[] = {"<think>", "</think>", "<|im_start|>", "<|im_end|>", nullptr};
-        for (int i = 0; kBlockedLiterals[i] != nullptr; ++i) {
-            auto it = model->token_to_id.find(kBlockedLiterals[i]);
-            if (it != model->token_to_id.end()) {
-                req->disallowed_token_ids.push_back(it->second);
-            }
+    // Qwen no-thinking should suppress reasoning/tool delimiters, but it must
+    // still be able to emit normal chat terminators such as <|im_end|> so the
+    // generation can stop cleanly instead of degenerating into filler tokens.
+    static const char* kBlockedLiterals[] = {
+        "<think>",         "</think>",         "<tool_call>",  "</tool_call>",
+        "<tool_response>", "</tool_response>", "<|im_start|>", nullptr,
+    };
+    for (int i = 0; kBlockedLiterals[i] != nullptr; ++i) {
+        auto it = model->token_to_id.find(kBlockedLiterals[i]);
+        if (it != model->token_to_id.end()) {
+            req->disallowed_token_ids.push_back(it->second);
         }
     }
     std::sort(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end());
@@ -563,6 +640,30 @@ bool PromptAlreadyTemplated(const std::string& prompt) {
     return prompt.find("<|im_start|>") != std::string::npos || prompt.find("<|im_end|>") != std::string::npos ||
            prompt.find("<|assistant|>") != std::string::npos || prompt.find("<|user|>") != std::string::npos ||
            prompt.find("<|turn>") != std::string::npos || prompt.find("<turn|>") != std::string::npos;
+}
+
+bool PromptEndsInsideTaggedBlock(const std::string& prompt, const char* open_tag, const char* close_tag) {
+    if (!open_tag || !close_tag) {
+        return false;
+    }
+    const size_t last_open = prompt.rfind(open_tag);
+    if (last_open == std::string::npos) {
+        return false;
+    }
+    const size_t last_close = prompt.rfind(close_tag);
+    return last_close == std::string::npos || last_close < last_open;
+}
+
+void InitializePromptSuppressionState(Request* req) {
+    if (!req) {
+        return;
+    }
+    req->think_tag_pending.clear();
+    req->tool_call_tag_pending.clear();
+    req->tool_response_tag_pending.clear();
+    req->in_think_block = PromptEndsInsideTaggedBlock(req->prompt, "<think>", "</think>");
+    req->in_tool_call_block = PromptEndsInsideTaggedBlock(req->prompt, "<tool_call>", "</tool_call>");
+    req->in_tool_response_block = PromptEndsInsideTaggedBlock(req->prompt, "<tool_response>", "</tool_response>");
 }
 
 void DebugPrintPromptTokens(const TransformerModel* model, const std::vector<int>& tokens, const char* tag) {
@@ -590,40 +691,35 @@ std::string MaybeApplyAutoChatTemplate(const TransformerModel* model, const std:
     if (PromptAlreadyTemplated(prompt)) {
         return prompt;
     }
+    const PromptTemplateProfile profile = ResolvePromptTemplateProfile(model);
 
-    const bool has_chatml = HasTokenLiteral(model, "<|im_start|>") && HasTokenLiteral(model, "<|im_end|>");
-    const bool has_role_tokens = HasTokenLiteral(model, "<|user|>") && HasTokenLiteral(model, "<|assistant|>");
-    const bool has_gemma_turn_tokens = HasTokenLiteral(model, "<|turn>") && HasTokenLiteral(model, "<turn|>");
-    const bool template_looks_chatml = model->chat_template.find("<|im_start|>") != std::string::npos;
-    const bool template_looks_gemma_turn = model->chat_template.find("<|turn>") != std::string::npos &&
-                                           model->chat_template.find("<turn|>") != std::string::npos;
-    const bool prefer_chat_template =
-        model->arch == ModelArch::QWEN2 || model->arch == ModelArch::QWEN3 || model->arch == ModelArch::QWEN35;
+    // Real Qwen3.5 GGUFs regress badly on the no-thinking ChatML helper for
+    // non-ASCII prompts, especially Korean. Plain-text fallback is materially
+    // more stable there, while ASCII-only prompts still behave better with the
+    // standard ChatML scaffold.
+    if (profile.kind == PromptTemplateKind::CHATML && ModelUsesQwenThinkingEnv(model) && !profile.thinking_enabled &&
+        ContainsNonASCIIText(prompt)) {
+        return prompt;
+    }
 
-    if (has_chatml || template_looks_chatml || prefer_chat_template) {
-        const bool qwen_enable_thinking =
-            (model->arch == ModelArch::QWEN3)    ? ParseBoolEnv("DENSECORE_QWEN3_ENABLE_THINKING", true)
-            : (model->arch == ModelArch::QWEN35) ? ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", true)
-                                                 : true;
+    if (profile.kind == PromptTemplateKind::CHATML) {
         std::string wrapped;
-        wrapped.reserve(prompt.size() + 192);
-        wrapped += "<|im_start|>system\nYou are a helpful assistant.";
-        if ((model->arch == ModelArch::QWEN3 || model->arch == ModelArch::QWEN35) && !qwen_enable_thinking) {
-            wrapped += "\nProvide only the answer. Do not output any thinking process, analysis, reasoning steps, "
-                       "or preamble. Never start with 'Thinking Process'.";
-        }
-        wrapped += "<|im_end|>\n";
-        wrapped += "<|im_start|>user\n";
+        wrapped.reserve(prompt.size() + 160);
+        wrapped += profile.open_tag;
+        wrapped += profile.user_role;
+        wrapped += "\n";
         wrapped += prompt;
-        wrapped += "<|im_end|>\n";
-        wrapped += "<|im_start|>assistant\n";
-        if ((model->arch == ModelArch::QWEN3 || model->arch == ModelArch::QWEN35) && !qwen_enable_thinking) {
-            wrapped += "Answer: ";
+        wrapped += profile.close_tag;
+        wrapped += profile.open_tag;
+        wrapped += profile.assistant_role;
+        wrapped += "\n";
+        if (profile.supports_thinking) {
+            wrapped += profile.thinking_enabled ? "<think>\n" : "<think>\n\n</think>\n\n";
         }
         return wrapped;
     }
 
-    if (has_role_tokens) {
+    if (profile.kind == PromptTemplateKind::ROLE_TAGS) {
         std::string wrapped;
         wrapped.reserve(prompt.size() + 96);
         wrapped += "<|system|>\nYou are a helpful assistant.\n";
@@ -633,12 +729,25 @@ std::string MaybeApplyAutoChatTemplate(const TransformerModel* model, const std:
         return wrapped;
     }
 
-    if (has_gemma_turn_tokens || template_looks_gemma_turn) {
+    if (profile.kind == PromptTemplateKind::TURN_TAGS) {
         std::string wrapped;
-        wrapped.reserve(prompt.size() + 48);
-        wrapped += "<|turn>user\n";
+        wrapped.reserve(prompt.size() + 96);
+        // Gemma4 requires <bos> at the start of the sequence.
+        wrapped += "<bos>";
+        if (profile.supports_thinking && profile.thinking_enabled) {
+            wrapped += profile.open_tag;
+            wrapped += profile.system_role;
+            wrapped += "\n<|think|>";
+            wrapped += profile.close_tag;
+        }
+        wrapped += profile.open_tag;
+        wrapped += profile.user_role;
+        wrapped += "\n";
         wrapped += prompt;
-        wrapped += "<turn|>\n<|turn>model\n";
+        wrapped += profile.close_tag;
+        wrapped += profile.open_tag;
+        wrapped += profile.assistant_role;
+        wrapped += "\n";
         return wrapped;
     }
 
@@ -689,6 +798,25 @@ TransformerModel* LoadModelWithNuma(const char* model_path, int numa_node_id) {
     return LoadGGUFModel(model_path);
 }
 }  // namespace
+
+#ifdef DENSECORE_TEST_BUILD
+std::string DenseCoreTestOnlyApplyAutoChatTemplate(const TransformerModel* model, const std::string& prompt) {
+    return MaybeApplyAutoChatTemplate(model, prompt);
+}
+
+bool DenseCoreTestOnlyPromptStartsInThinkBlock(const std::string& prompt) {
+    Request req{};
+    req.prompt = prompt;
+    InitializePromptSuppressionState(&req);
+    return req.in_think_block;
+}
+
+std::vector<int> DenseCoreTestOnlyQwenReasoningBlocklist(const TransformerModel* model) {
+    Request req{};
+    ConfigureQwenReasoningTokenBlocklist(model, &req);
+    return req.disallowed_token_ids;
+}
+#endif
 
 // Global request ID counter (shared across all Submit* functions)
 static std::atomic<int> global_req_id{1};
@@ -864,6 +992,7 @@ int SubmitRequestWithSamplingEx(DenseCoreHandle handle, const char* prompt, int 
 
     // Tokenize prompt
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
+    InitializePromptSuppressionState(req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
@@ -898,7 +1027,8 @@ int SubmitRequestWithTokenResults(DenseCoreHandle handle, const char* prompt, in
                       /*stop_sequences=*/nullptr, /*json_mode=*/0,
                       /*callback=*/nullptr, user_data);
 
-    req->prompt = prompt;
+    req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
+    InitializePromptSuppressionState(req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
@@ -1696,6 +1826,7 @@ int SubmitRequest(DenseCoreHandle handle, const char* prompt, int max_tokens, co
 
     // Tokenize immediately (outside hot path)
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
+    InitializePromptSuppressionState(req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     req->token_history = req->tokens;
 
@@ -1774,6 +1905,7 @@ int SubmitRequestWithFormatEx(DenseCoreHandle handle, const char* prompt, int ma
 
     // Tokenize immediately (outside hot path)
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
+    InitializePromptSuppressionState(req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     req->token_history = req->tokens;
 

@@ -558,22 +558,49 @@ TransformerModel* LoadGGUFModel(const char* path) {
         std::vector<uint8_t> sliding_pattern;
         get_u8_array("attention.sliding_window_pattern", sliding_pattern);
         model->gemma4_layer_is_sliding.assign(model->hparams.n_layer, 0);
-        if (!sliding_pattern.empty()) {
-            const size_t limit = std::min(sliding_pattern.size(), static_cast<size_t>(model->hparams.n_layer));
-            for (size_t i = 0; i < limit; ++i) {
+        bool sliding_pattern_complete = false;
+        if (sliding_pattern.size() >= static_cast<size_t>(model->hparams.n_layer)) {
+            for (size_t i = 0; i < static_cast<size_t>(model->hparams.n_layer); ++i) {
                 model->gemma4_layer_is_sliding[i] = sliding_pattern[i] != 0 ? 1 : 0;
             }
-        } else {
+            sliding_pattern_complete = true;
+        }
+        if (!sliding_pattern_complete) {
+            // Try layer_types metadata
             std::vector<std::string> layer_types;
             get_str_array("layer_types", layer_types);
-            if (!layer_types.empty()) {
-                const size_t limit = std::min(layer_types.size(), static_cast<size_t>(model->hparams.n_layer));
-                for (size_t i = 0; i < limit; ++i) {
+            if (layer_types.size() >= static_cast<size_t>(model->hparams.n_layer)) {
+                for (size_t i = 0; i < static_cast<size_t>(model->hparams.n_layer); ++i) {
                     std::string type = layer_types[i];
                     std::transform(type.begin(), type.end(), type.begin(),
                                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                     model->gemma4_layer_is_sliding[i] = (type == "sliding_attention") ? 1 : 0;
                 }
+                sliding_pattern_complete = true;
+            }
+        }
+        if (!sliding_pattern_complete && model->gemma4_key_length_swa > 0 && model->gemma4_key_length_full > 0 &&
+            model->gemma4_key_length_swa != model->gemma4_key_length_full) {
+            // Fallback: infer SWA vs full-attention from per-layer K weight output dimension.
+            // SWA layers have smaller K projection (key_length_swa), full layers have larger (key_length_full).
+            int inferred_count = 0;
+            for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+                std::string k_name = "blk." + std::to_string(i) + ".attn_k.weight";
+                struct ggml_tensor* k_tensor = ggml_get_tensor(ctx_w, k_name.c_str());
+                if (k_tensor && k_tensor->ne[1] > 0) {
+                    const int64_t k_out_dim = k_tensor->ne[1];
+                    // ne[1] is the output dimension of the K projection (n_head_kv * head_dim_k)
+                    // For GQA with n_head_kv=1: k_out_dim == head_dim_k directly.
+                    // SWA layers match key_length_swa, full layers match key_length_full.
+                    model->gemma4_layer_is_sliding[i] =
+                        (k_out_dim == static_cast<int64_t>(model->gemma4_key_length_swa)) ? 1 : 0;
+                    inferred_count++;
+                }
+            }
+            if (inferred_count > 0) {
+                std::cout << "[DenseCore] Gemma4: inferred sliding window pattern from K weight shapes ("
+                          << inferred_count << "/" << model->hparams.n_layer << " layers)" << std::endl;
+                sliding_pattern_complete = true;
             }
         }
 
@@ -608,7 +635,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
                   << " attn_logit_cap=" << model->gemma4_attention_logit_softcapping
                   << " final_logit_softcap=" << model->gemma4_final_logit_softcapping << std::endl;
         std::cout << "[DenseCore] Gemma4 layer pattern:";
-        for (uint32_t i = 0; i < std::min<uint32_t>(model->hparams.n_layer, 12); ++i) {
+        for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
             const bool is_sliding = i < model->gemma4_layer_is_sliding.size() && model->gemma4_layer_is_sliding[i] != 0;
             const int kv_src = i < model->gemma4_layer_kv_source.size() ? model->gemma4_layer_kv_source[i] : -1;
             std::cout << " L" << i << "=" << (is_sliding ? "S" : "F") << "/src" << kv_src;
@@ -2091,7 +2118,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
     // through the universal graph execution path in worker.cpp
     // ==========================================================================
     if (densecore::ModelGraphBridge::RegisterFromModel(model)) {
-        const char* graph_name = densecore::ModelGraphBridge::GetGraphName(model->arch);
+        const char* graph_name = densecore::ModelGraphBridge::GetGraphName(model);
         if (graph_name) {
             std::cout << "[DenseCore] Graph builder registered for: " << graph_name << std::endl;
         } else {

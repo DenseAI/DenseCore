@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"context"
@@ -255,6 +256,45 @@ func TestChatCompletionHandler(t *testing.T) {
 				tt.checkResponse(t, resp)
 			}
 		})
+	}
+}
+
+func TestChatCompletionHandler_Stream(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			outputChan <- domain.StreamEvent{Token: "Paris", IsFinished: false}
+			outputChan <- domain.StreamEvent{Token: "", IsFinished: true}
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
+		Model: "test-model",
+		Messages: []domain.Message{
+			{Role: "user", Content: "What is the capital of France?"},
+		},
+		Stream: true,
+	})
+	w := httptest.NewRecorder()
+
+	handler.ChatCompletionHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "data:") || !strings.Contains(body, "Paris") {
+		t.Fatalf("streaming response missing expected SSE frames: %q", body)
 	}
 }
 

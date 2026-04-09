@@ -307,6 +307,18 @@ int Sampler::Sample(const Tensor& logits, const SamplingParams& params) const {
         stride = 1;
     }
 
+    // Temperature zero must be true greedy decoding.
+    // Treating it as temperature 1.0 makes "deterministic" requests sample
+    // from top-k/top-p instead of taking the best token.
+    if (!(params.temperature > 0.0f)) {
+#if defined(__AVX2__)
+        if (stride == 1) {
+            return ArgmaxAVX2(data, static_cast<int>(vocab));
+        }
+#endif
+        return ArgmaxScalar(data, static_cast<int>(vocab), stride);
+    }
+
     if (params.top_p < 1.0f) {
         return SampleTopP(data, static_cast<int>(vocab), stride, params, workspace_probs_, workspace_indices_);
     }

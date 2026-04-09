@@ -72,8 +72,8 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 		// 2. Prepare channels
 		// workerChan: receives tokens from Engine (C++)
 		// userChan: receives tokens forwarded by Worker (sent to ChatService)
-		workerChan := make(chan domain.StreamEvent, 1)
-		userChan := make(chan domain.StreamEvent, 1)
+		workerChan := make(chan domain.StreamEvent, 100)
+		userChan := make(chan domain.StreamEvent, 100)
 
 		// 3. Get Engine (Dynamic)
 		engine := p.modelService.GetEngine()

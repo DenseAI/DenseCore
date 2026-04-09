@@ -1,6 +1,6 @@
 #include "backend/cpu_backend_internal.h"
-#include "kernels/hwy/hwy_kernels.h"
 #include "ggml-cpu.h"  // For ggml_get_type_traits_cpu (vec_dot)
+#include "kernels/hwy/hwy_kernels.h"
 
 #include <algorithm>
 #include <array>
@@ -365,8 +365,8 @@ bool ExpertHasGgmlQuantizedWeights(const CpuBackend::ExpertWeights& expert) {
 /// 양자화된 expert weight에 대해 ggml vec_dot 기반 GEMV를 수행.
 /// F32 dequantization을 완전히 우회하여 MoE 추론 속도를 극적으로 개선.
 /// @complexity O(M * N * K) where expert matrices are [N, K]
-bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, int ggml_type_id,
-                                   const Tensor& input, Tensor* output, int64_t N, int64_t K, int numa_node) {
+bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, int ggml_type_id, const Tensor& input,
+                                   Tensor* output, int64_t N, int64_t K, int numa_node) {
     if (!backend || !weight_ptr || !output || !input.IsValid() || !output->IsValid()) return false;
     if (input.dtype != DType::F32 || output->dtype != DType::F32) return false;
     if (input.ndim != 2 || output->ndim != 2) return false;
@@ -542,16 +542,16 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     // Unified projection dispatch: packed INT4 → ggml quantized GEMV → F32 dense
     const auto run_projection = [&](const Tensor& src, const Tensor& dense_weight,
                                     const CpuBackend::ExpertPackedInt4Weight& int4_binding,
-                                    const CpuBackend::ExpertWeight& raw_weight, int ggml_type_id,
-                                    int64_t proj_rows, int64_t proj_cols, Tensor* dst) {
+                                    const CpuBackend::ExpertWeight& raw_weight, int ggml_type_id, int64_t proj_rows,
+                                    int64_t proj_cols, Tensor* dst) {
         // Path 1: Packed INT4 (custom DenseCore format)
         if (TryRunPackedInt4Projection(backend, int4_binding, src, dst, numa_node)) {
             return;
         }
         // Path 2: Native ggml quantized GEMV (Q4_K, Q4_0, etc.) — zero dequantization
         if (raw_weight.ptr && ggml_type_id != GGML_TYPE_F32 &&
-            TryRunGgmlQuantizedProjection(backend, raw_weight.ptr, ggml_type_id,
-                                          src, dst, proj_rows, proj_cols, numa_node)) {
+            TryRunGgmlQuantizedProjection(backend, raw_weight.ptr, ggml_type_id, src, dst, proj_rows, proj_cols,
+                                          numa_node)) {
             return;
         }
         // Path 3: F32 dense matmul fallback (requires pre-dequantized weight)
@@ -561,14 +561,12 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     };
 
     if (!used_fused_int4_swiglu) {
-        run_projection(input, w1, expert.w1_int4, expert.w1, expert.w1_type,
-                       intermediate_dim, hidden_dim, &hidden);
+        run_projection(input, w1, expert.w1_int4, expert.w1, expert.w1_type, intermediate_dim, hidden_dim, &hidden);
     }
 
     if (!used_fused_int4_swiglu && (w3.IsValid() || expert.w3_int4.IsValid() || expert.w3.ptr)) {
         Tensor gate = Tensor::Make2D(gate_scratch.ptr, batch, intermediate_dim);
-        run_projection(input, w3, expert.w3_int4, expert.w3, expert.w3_type,
-                       intermediate_dim, hidden_dim, &gate);
+        run_projection(input, w3, expert.w3_int4, expert.w3, expert.w3_type, intermediate_dim, hidden_dim, &gate);
 
         auto& pool = backend->GetThreadPool(numa_node);
         const int total = static_cast<int>(hidden_size);
@@ -585,8 +583,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         });
     }
 
-    run_projection(hidden, w2, expert.w2_int4, expert.w2, expert.w2_type,
-                   hidden_dim, intermediate_dim, output);
+    run_projection(hidden, w2, expert.w2_int4, expert.w2, expert.w2_type, hidden_dim, intermediate_dim, output);
 }
 
 bool TryRunPackedInt4Projection(CpuBackend* backend, const CpuBackend::ExpertPackedInt4Weight& binding,
@@ -1192,26 +1189,26 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
             Tensor w1, w2, w3;
             if (!has_ggml_quant) {
                 w1 = (cached_entry && (!exp.w1_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
-                             exp.w1_type != GGML_TYPE_F32)
-                                ? cached_entry->w1_tensor
-                                : make_weight_f32_small(exp.w1.ptr, exp.w1_type, exp.w1_int4,
-                                                        static_cast<int64_t>(exp.intermediate_dim),
-                                                        static_cast<int64_t>(exp.hidden_dim), w1_dequant,
-                                                        &dequantized_bytes, &dequantized_any);
-                w2 =
-                    (cached_entry && (!exp.w2_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
-                     exp.w2_type != GGML_TYPE_F32)
-                        ? cached_entry->w2_tensor
-                        : make_weight_f32_small(exp.w2.ptr, exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
-                                                static_cast<int64_t>(exp.intermediate_dim), w2_dequant, &dequantized_bytes,
-                                                &dequantized_any);
+                      exp.w1_type != GGML_TYPE_F32)
+                         ? cached_entry->w1_tensor
+                         : make_weight_f32_small(
+                               exp.w1.ptr, exp.w1_type, exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
+                               static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes, &dequantized_any);
+                w2 = (cached_entry && (!exp.w2_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
+                      exp.w2_type != GGML_TYPE_F32)
+                         ? cached_entry->w2_tensor
+                         : make_weight_f32_small(exp.w2.ptr, exp.w2_type, exp.w2_int4,
+                                                 static_cast<int64_t>(exp.hidden_dim),
+                                                 static_cast<int64_t>(exp.intermediate_dim), w2_dequant,
+                                                 &dequantized_bytes, &dequantized_any);
                 if (exp.w3.ptr != nullptr) {
                     w3 = (cached_entry && (!exp.w3_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
                           exp.w3_type != GGML_TYPE_F32)
                              ? cached_entry->w3_tensor
-                             : make_weight_f32_small(
-                                   exp.w3.ptr, exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                   static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes, &dequantized_any);
+                             : make_weight_f32_small(exp.w3.ptr, exp.w3_type, exp.w3_int4,
+                                                     static_cast<int64_t>(exp.intermediate_dim),
+                                                     static_cast<int64_t>(exp.hidden_dim), w3_dequant,
+                                                     &dequantized_bytes, &dequantized_any);
                 }
             }
             // else: w1/w2/w3 remain empty Tensors — DispatchExpertFFNImpl uses quantized GEMV path

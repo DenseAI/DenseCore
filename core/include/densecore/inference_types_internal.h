@@ -12,11 +12,13 @@
 #include "cpu_backend.h"
 #include "kv_cache.h"
 #include "model_types.h"
+#include "qwen35_ssm_math.h"
 #include "scheduler.h"
 
 // Forward declarations
 struct ggml_context;
 struct BatchSpec;
+struct TransformerModel;
 
 #ifndef GGML_KQ_MASK_PAD
 #define GGML_KQ_MASK_PAD 32
@@ -79,6 +81,34 @@ void cb_kv_manage(struct ggml_tensor* dst, const struct ggml_tensor* src, int it
 // MoE forward callback
 void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
                     int nth, void* userdata);
+
+// ============================================================================
+// Qwen3.5 SSM User Data
+// ============================================================================
+struct SSMQwen35DeltaUserData {
+    const float* alpha_weight;  // [n_heads, n_embd]
+    const float* beta_weight;   // [n_heads, n_embd]
+    const float* dt_bias;       // [n_heads]
+    const float* a_log;         // [n_heads]
+    const float* norm_weight;   // [head_dim_v] or [d_inner]
+    float* ssm_state;           // canonical [n_heads][head_dim_k][head_dim_v]
+    int n_embd;
+    int d_inner;
+    int n_heads;
+    int head_dim_v;
+    int head_dim_k;
+    int n_groups;
+    Qwen35SSMNormLayout norm_layout = Qwen35SSMNormLayout::INVALID;
+    float norm_eps;
+    int layer_idx = -1;
+    int ssm_ordinal = -1;
+    const int* token_seq_ids = nullptr;
+    const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
+};
+
+// SSM delta recurrent callback
+void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
+                         const struct ggml_tensor* c, int ith, int nth, void* userdata);
 
 // Smart matrix multiplication dispatcher
 struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* weight, struct ggml_tensor* input,

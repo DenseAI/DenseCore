@@ -5,6 +5,9 @@
 #include <limits>
 #include <vector>
 
+#include "densecore/exceptions.h"
+#include "densecore/graph_builders/llm_config_generator.h"
+#include "densecore/models/model_graph_bridge.h"
 #include "qwen35_ssm_math.h"
 
 namespace {
@@ -287,4 +290,54 @@ TEST(Qwen35SSMMathTest, CanonicalizesLoaderShapesAndOrientation) {
     const int64_t bad_norm_ne[4] = {3, 2, 1, 1};
     EXPECT_EQ(Qwen35CanonicalizeNorm(norm_full.data(), bad_norm_ne, 3, 6, &norm_out),
               Qwen35SSMNormLayout::INVALID);
+}
+
+TEST(Qwen35GraphDispatchTest, LlmConfigGeneratorRejectsHybridSSMModels) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+
+    EXPECT_THROW(
+        {
+            auto config = densecore::LlmConfigGenerator::Generate(&model);
+            (void)config;
+        },
+        densecore::GraphBuildException);
+}
+
+TEST(Qwen35GraphDispatchTest, ModelGraphBridgeDoesNotAdvertiseGenericGraphSupportForQwen35) {
+    EXPECT_FALSE(densecore::ModelGraphBridge::IsGraphModel(ModelArch::QWEN35));
+    EXPECT_EQ(densecore::ModelGraphBridge::GetGraphName(ModelArch::QWEN35), nullptr);
+
+    EXPECT_TRUE(densecore::ModelGraphBridge::IsGraphModel(ModelArch::QWEN3));
+    EXPECT_STREQ(densecore::ModelGraphBridge::GetGraphName(ModelArch::QWEN3), "llm_universal");
+}
+
+TEST(Gemma4GraphDispatchTest, LlmConfigGeneratorRejectsGemma4Models) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+
+    EXPECT_THROW(
+        {
+            auto config = densecore::LlmConfigGenerator::Generate(&model);
+            (void)config;
+        },
+        densecore::GraphBuildException);
+}
+
+TEST(Gemma4GraphDispatchTest, ModelGraphBridgeDoesNotAdvertiseGenericGraphSupportForGemma4) {
+    TransformerModel gemma4{};
+    gemma4.arch = ModelArch::GEMMA;
+    gemma4.arch_flags.is_gemma4 = true;
+
+    EXPECT_FALSE(densecore::ModelGraphBridge::IsGraphModel(&gemma4));
+    EXPECT_EQ(densecore::ModelGraphBridge::GetGraphName(&gemma4), nullptr);
+
+    TransformerModel gemma2{};
+    gemma2.arch = ModelArch::GEMMA;
+    gemma2.arch_flags.is_gemma4 = false;
+
+    EXPECT_TRUE(densecore::ModelGraphBridge::IsGraphModel(&gemma2));
+    EXPECT_STREQ(densecore::ModelGraphBridge::GetGraphName(&gemma2), "llm_universal");
 }

@@ -22,11 +22,7 @@ Examples:
 	RunE: func(cmd *cobra.Command, args []string) error {
 		auth, _ := cmd.Flags().GetBool("auth")
 
-		var grpcEnabled *bool
-		if cmd.Flags().Changed("grpc") {
-			enabled, _ := cmd.Flags().GetBool("grpc")
-			grpcEnabled = &enabled
-		}
+		grpcEnabled, _ := cmd.Flags().GetBool("grpc")
 
 		grpcPort := 0
 		if cmd.Flags().Changed("grpc-port") {
@@ -42,7 +38,7 @@ Examples:
 			ShowBanner:  true,
 			Background:  false,
 			AuthEnabled: auth, // Pass directly, env var fallback handled in server.Start()
-			GRPCEnabled: grpcEnabled,
+			GRPCEnabled: &grpcEnabled,
 			GRPCPort:    grpcPort,
 		}
 		return server.Run(opts)

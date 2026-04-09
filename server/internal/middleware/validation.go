@@ -138,12 +138,13 @@ func (v *RequestValidator) ValidateChatRequest(req *domain.ChatCompletionRequest
 				return domain.ErrInvalidRequest("message role cannot be empty").
 					WithParam("messages[].role")
 			}
-			if msg.Role != "system" && msg.Role != "user" && msg.Role != "assistant" {
+			if msg.Role != "system" && msg.Role != "developer" && msg.Role != "user" &&
+				msg.Role != "assistant" && msg.Role != "tool" {
 				return domain.ErrInvalidRequest(
-					fmt.Sprintf("invalid message role: %s (must be system, user, or assistant)", msg.Role),
+					fmt.Sprintf("invalid message role: %s (must be system, developer, user, assistant, or tool)", msg.Role),
 				).WithParam("messages[].role")
 			}
-			totalLen += len(msg.Content)
+			totalLen += len(msg.FlattenedText())
 		}
 
 		if totalLen > maxPromptLen {

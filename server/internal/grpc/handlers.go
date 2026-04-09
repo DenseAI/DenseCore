@@ -378,7 +378,7 @@ func (h *DenseCoreHandler) countPromptTokens(req domain.ChatCompletionRequest) i
 	if len(req.InputIDs) > 0 {
 		return int32(len(req.InputIDs))
 	}
-	return h.countTextTokens([]string{service.ExtractPrompt(req.Messages)}, true, false)
+	return h.countTextTokens([]string{service.FormatChatPrompt(h.modelService.GetCurrentModel(), req.Messages, nil)}, true, false)
 }
 
 func (h *DenseCoreHandler) countInputTokens(inputs []string) int32 {

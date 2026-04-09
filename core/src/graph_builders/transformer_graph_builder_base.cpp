@@ -202,6 +202,10 @@ std::unique_ptr<TransformerGraphBuilder> TransformerGraphRegistry::GetBuilder(in
     case ModelArch::MISTRAL:
     case ModelArch::GEMMA:
     case ModelArch::PHI: arch_name = "llama"; break;
+    case ModelArch::QWEN35:
+        // Qwen3.5 is hybrid SSM + attention and must stay on the inline graph
+        // path until it has a dedicated strategy builder.
+        return nullptr;
     default: arch_name = "llama"; break;
     }
 

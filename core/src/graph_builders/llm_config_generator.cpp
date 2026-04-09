@@ -4,12 +4,24 @@
  */
 
 #include "densecore/graph_builders/llm_config_generator.h"
+
+#include "densecore/exceptions.h"
 #include <cmath>
 #include <iostream>
 
 namespace densecore {
 
 graph::GraphConfig LlmConfigGenerator::Generate(const TransformerModel* model) {
+    if (!model) {
+        throw GraphBuildException("LlmConfigGenerator: model is null");
+    }
+    if (model->arch == ModelArch::QWEN35 || model->arch_flags.is_hybrid_ssm) {
+        throw GraphBuildException("LlmConfigGenerator does not support hybrid SSM architectures like Qwen3.5");
+    }
+    if (model->arch_flags.is_gemma4) {
+        throw GraphBuildException("LlmConfigGenerator does not support Gemma4 architecture-specific graph features");
+    }
+
     graph::GraphConfig config;
     config.name = "llm_generic";
     config.inputs = {"tokens", "pos"};  // Input tokens and positions

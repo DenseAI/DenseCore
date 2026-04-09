@@ -719,6 +719,15 @@ struct EngineState {
             if (v > hard_max_mb) return hard_max_mb;
             return static_cast<size_t>(v);
         };
+        auto parse_env_int = [](const char* name, int default_value, int min_value) -> int {
+            const char* env = std::getenv(name);
+            if (!env || env[0] == '\0') return default_value;
+            errno = 0;
+            char* end = nullptr;
+            long v = std::strtol(env, &end, 10);
+            if (errno != 0 || end == env || *end != '\0') return default_value;
+            return static_cast<int>(std::max<long>(min_value, v));
+        };
 
         constexpr size_t MB = 1024ULL * 1024ULL;
         constexpr size_t HARD_MIN_MB = 128;
@@ -729,29 +738,40 @@ struct EngineState {
         }
 
         const auto& hp = model->hparams;
+        const size_t runtime_max_seq_len = static_cast<size_t>(parse_env_int("DENSECORE_MAX_SEQ_LEN", 4096, 1));
+        const size_t runtime_max_num_seqs = static_cast<size_t>(parse_env_int("DENSECORE_MAX_NUM_SEQS", 4, 1));
+        const size_t effective_seq_len = std::max<size_t>(
+            1, std::min<size_t>(static_cast<size_t>(std::max<int32_t>(1, hp.n_ctx)), runtime_max_seq_len));
 
-        // Estimate memory per layer:
-        // - QKV projections: 3 × n_embd × batch × sizeof(float)
-        // - Attention scores: n_head × seq_len × seq_len × sizeof(float)
-        // - FFN intermediates: 4 × n_embd × batch × sizeof(float)
-        // Conservative estimate: ~32 tensors per layer averaging n_embd size
-        size_t per_layer_estimate = 32ULL * hp.n_embd * sizeof(float) * 128;  // assume batch×seq≈128
+        // The graph context holds graph nodes, views, scratch tensors and a modest
+        // amount of activation staging. It should scale with the active request
+        // shape, not with the model's full advertised context window or vocab.
+        const size_t token_working_set = runtime_max_num_seqs * effective_seq_len;
+        const size_t attn_working_set = static_cast<size_t>(std::max<int32_t>(1, hp.n_head)) * token_working_set;
+        const size_t hidden_working_set = static_cast<size_t>(std::max<int32_t>(1, hp.n_embd)) * token_working_set;
 
-        // Total for all layers
-        size_t base_size = hp.n_layer * per_layer_estimate;
+        size_t base_size = static_cast<size_t>(std::max<int32_t>(1, hp.n_layer)) *
+                           (hidden_working_set * sizeof(float) / 4 + attn_working_set * sizeof(float) / 8);
+        size_t overhead = hidden_working_set * sizeof(float) * 2;
 
-        // Add overhead for graph metadata, KV cache tensors, embeddings
-        size_t overhead = (size_t)hp.n_embd * hp.n_vocab * sizeof(float);                   // embedding table
-        overhead += (size_t)hp.n_layer * hp.n_ctx * hp.n_head_kv * 64 * sizeof(float) * 2;  // K+V worst case
+        // Hybrid SSM / Gemma4 graphs need extra room for recurrent state views and
+        // architecture-specific branch tensors, but still nowhere near full-model memory.
+        if (model->arch_flags.is_hybrid_ssm) {
+            overhead += static_cast<size_t>(std::max(1, model->ssm_inner_size)) * token_working_set * sizeof(float) / 2;
+        }
+        if (model->arch_flags.is_gemma4) {
+            overhead += hidden_working_set * sizeof(float);
+        }
 
-        // Total with 50% safety margin
-        size_t total = (size_t)((base_size + overhead) * 1.5);
+        size_t total = base_size + overhead;
 
         // Clamp to runtime-configurable bounds.
         // Defaults are chosen to keep previous behavior for small models while
         // allowing larger graphs (e.g., Qwen3-4B batch=4 decode) to avoid 2GB
         // hard-cap OOM.
-        size_t min_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MIN_MB", 256, HARD_MIN_MB, HARD_MAX_MB);
+        const size_t recommended_min_mb =
+            model->arch_flags.is_gemma4 ? 384 : (model->arch_flags.is_hybrid_ssm ? 320 : 256);
+        size_t min_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MIN_MB", recommended_min_mb, HARD_MIN_MB, HARD_MAX_MB);
         size_t max_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MAX_MB", 8192, HARD_MIN_MB, HARD_MAX_MB);
         if (max_mb < min_mb) max_mb = min_mb;
         const size_t MIN_SIZE = min_mb * MB;

@@ -41,21 +41,39 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 		return fmt.Errorf("max_tokens exceeds maximum limit (%d)", maxCtx)
 	}
 
-	prompt := ExtractPrompt(req.Messages)
+	modelHint := s.modelService.GetCurrentModel()
+	prompt := FormatChatPrompt(modelHint, req.Messages, req.ChatTemplateKwargs)
 	hasInputIDs := len(req.InputIDs) > 0
 	if prompt == "" && !hasInputIDs {
 		return errors.New("no user message found")
 	}
 
-	// Check if JSON mode is requested
+	stream, err := s.startGeneration(ctx, req, modelHint, prompt)
+	if err != nil {
+		return err
+	}
+
+	defer close(outputChan)
+	for {
+		select {
+		case event, ok := <-stream:
+			if !ok {
+				return nil
+			}
+			outputChan <- event
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatCompletionRequest, modelHint, prompt string) (<-chan domain.StreamEvent, error) {
 	jsonMode := req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object"
+	temperature, topP, topK, repetitionPenalty := s.normalizeSampling(modelHint, req)
 
-	temperature, topP, topK, repetitionPenalty := s.normalizeSampling(req)
-
-	// Create QueuedRequest
 	queuedReq := &queue.QueuedRequest{
 		ID:                uuid.New().String(),
-		Priority:          queue.RequestPriority(0), // Default priority
+		Priority:          queue.RequestPriority(0),
 		MaxTokens:         req.MaxTokens,
 		Prompt:            prompt,
 		InputIDs:          req.InputIDs,
@@ -71,29 +89,22 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 		ExpertCluster:     req.ExpertCluster,
 	}
 
-	// Enqueue with backpressure
 	if !s.requestQueue.Enqueue(queuedReq) {
-		return domain.ErrServiceBusy // Need to define this or standard error
+		return nil, domain.ErrServiceBusy
 	}
 
-	// Wait for worker to pick up the request
 	select {
 	case result := <-queuedReq.ResultChan:
 		switch v := result.(type) {
 		case error:
-			return v
+			return nil, v
 		case chan domain.StreamEvent:
-			// Stream tokens from worker to client
-			for event := range v {
-				outputChan <- event
-			}
-			close(outputChan)
-			return nil
+			return v, nil
 		default:
-			return fmt.Errorf("unexpected result type from worker")
+			return nil, fmt.Errorf("unexpected result type from worker")
 		}
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 }
 
@@ -146,27 +157,55 @@ func ExtractPrompt(messages []domain.Message) string {
 	}
 	// Find the last user message
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			return messages[i].Content
+		if messages[i].Role == roleUser {
+			return messages[i].FlattenedText()
 		}
 	}
-	return messages[len(messages)-1].Content
+	return messages[len(messages)-1].FlattenedText()
 }
 
-func (s *ChatService) normalizeSampling(req domain.ChatCompletionRequest) (float64, float64, int, float64) {
+func (s *ChatService) normalizeSampling(modelHint string, req domain.ChatCompletionRequest) (float64, float64, int, float64) {
 	temperature := req.Temperature
 	topP := req.TopP
 	topK := req.TopK
 	repetitionPenalty := req.RepetitionPenalty
+	profile := resolvePromptProfile(modelHint)
+	isQwen := profile.family == promptFamilyQwen
+	thinkingEnabled := profile.thinkingEnabled(modelHint, req.ChatTemplateKwargs)
 
 	if !req.TemperatureSet {
-		temperature = 1.0
+		if isQwen && !thinkingEnabled {
+			temperature = 0.7
+		} else {
+			temperature = 1.0
+		}
 	}
 	if !req.TopPSet {
-		topP = 1.0
+		if isQwen && thinkingEnabled {
+			topP = 0.95
+		} else if isQwen {
+			topP = 0.8
+		} else if profile.family == promptFamilyGemma {
+			topP = 0.95
+		} else {
+			topP = 1.0
+		}
+	}
+	if !req.TopKSet {
+		if isQwen {
+			topK = 20
+		} else if profile.family == promptFamilyGemma {
+			topK = 64
+		} else {
+			topK = 0
+		}
 	}
 	if !req.RepetitionPenaltySet {
-		repetitionPenalty = 1.0
+		if isQwen {
+			repetitionPenalty = 1.05
+		} else {
+			repetitionPenalty = 1.0
+		}
 	}
 
 	return temperature, topP, topK, repetitionPenalty

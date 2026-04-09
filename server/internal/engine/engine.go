@@ -5,11 +5,11 @@ package engine
 // -----------------------
 // IMPORTANT: For CI/production, set environment variables:
 //   export CGO_CFLAGS="-I${PWD}/core/include"
-//   export CGO_LDFLAGS="-L${PWD}/core/build -Wl,-rpath,${PWD}/core/build -ldensecore -lstdc++"
+//   export CGO_LDFLAGS="-L${PWD}/build -Wl,-rpath,${PWD}/build -ldensecore -lstdc++"
 //
 // ${SRCDIR} expands to the directory containing this Go source file.
 #cgo CFLAGS: -I${SRCDIR}/../../../core/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../core/build -Wl,-rpath,${SRCDIR}/../../../core/build -ldensecore -lstdc++
+#cgo LDFLAGS: -L${SRCDIR}/../../../build -Wl,-rpath,${SRCDIR}/../../../build -ldensecore -lstdc++
 #include <stdlib.h>
 #include <stdint.h>
 #include "densecore.h"
@@ -127,6 +127,10 @@ func NewDenseEngine(mainModelPath, draftModelPath string, threads int) (*DenseEn
 	// InitEngine(model_path, reserved, threads)
 	handle := C.InitEngine(cMainPath, cDraftPath, C.int(threads))
 	if handle == nil {
+		lastErr := C.DenseCoreGetLastError()
+		if lastErr != nil {
+			return nil, fmt.Errorf("failed to initialize DenseCore engine: %s", C.GoString(lastErr))
+		}
 		return nil, fmt.Errorf("failed to initialize DenseCore engine")
 	}
 

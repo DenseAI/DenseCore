@@ -423,4 +423,27 @@ TEST(SamplingRangeTest, ActionRangeWithPenaltiesMatchesLegacyReference) {
     EXPECT_EQ(SampleToken(logits, 0, params), SampleTokenLegacyReference(logits, 0, params));
 }
 
+TEST(SamplingRangeTest, TemperatureZeroUsesGreedyEvenWithTopKAndTopP) {
+    ggml_init_params p = {
+        .mem_size = 1024 * 1024,
+        .mem_buffer = nullptr,
+        .no_alloc = false,
+    };
+    GgmlContextGuard guard;
+    guard.ctx = ggml_init(p);
+    ASSERT_NE(guard.ctx, nullptr);
+
+    const std::vector<float> logits_data = {0.1f, 0.2f, 0.3f, 0.9f, 0.8f};
+    ggml_tensor* logits = MakeLogitsTensor(guard.ctx, logits_data);
+    ASSERT_NE(logits, nullptr);
+
+    SamplingParams params;
+    params.temperature = 0.0f;
+    params.top_k = 3;
+    params.top_p = 0.5f;
+    params.seed = 123;
+
+    EXPECT_EQ(SampleToken(logits, 0, params), 3);
+}
+
 }  // namespace densecore

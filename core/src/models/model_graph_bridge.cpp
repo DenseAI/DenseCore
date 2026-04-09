@@ -9,6 +9,7 @@
  */
 
 #include "densecore/models/model_graph_bridge.h"
+#include "densecore/exceptions.h"
 #include "densecore/graph/generic_graph_builder.h"
 #include "densecore/graph_builders/llm_config_generator.h"
 #include "densecore/hal/operation_graph.h"
@@ -92,6 +93,14 @@ static void AddCanonicalLlmTensorAliases(const TransformerModel* model,
     }
 }
 
+static bool SupportsGenericLlmGraph(const TransformerModel* model) {
+    if (!model) return false;
+    if (model->arch == ModelArch::QWEN35 || model->arch_flags.is_hybrid_ssm || model->arch_flags.is_gemma4) {
+        return false;
+    }
+    return true;
+}
+
 // =============================================================================
 // Generic LLM Builder (Config-Driven)
 // =============================================================================
@@ -101,6 +110,10 @@ public:
 
     std::unique_ptr<OperationGraph> Build(const std::vector<Tensor>& inputs,
                                           const std::string& /*variant_name*/) override {
+        if (!SupportsGenericLlmGraph(model_)) {
+            throw GraphBuildException("GenericLlmBuilder does not support hybrid SSM architectures like Qwen3.5");
+        }
+
         // 1. Generate Config
         auto config = LlmConfigGenerator::Generate(model_);
 
@@ -1073,11 +1086,17 @@ bool ModelGraphBridge::IsGraphModel(ModelArch arch) {
     case ModelArch::GEMMA:
     case ModelArch::PHI:
     case ModelArch::LLAVA:
-    case ModelArch::QWEN_VL:
-    case ModelArch::QWEN35: return true;
+    case ModelArch::QWEN_VL: return true;
     case ModelArch::UNKNOWN:
+    case ModelArch::QWEN35:
     default: return false;
     }
+}
+
+bool ModelGraphBridge::IsGraphModel(const TransformerModel* model) {
+    if (!model) return false;
+    if (!IsGraphModel(model->arch)) return false;
+    return SupportsGenericLlmGraph(model) || model->has_vision || model->has_whisper;
 }
 
 namespace {
@@ -1086,7 +1105,6 @@ bool IsLlmArch(ModelArch arch) {
     case ModelArch::LLAMA:
     case ModelArch::QWEN2:
     case ModelArch::QWEN3:
-    case ModelArch::QWEN35:
     case ModelArch::MISTRAL:
     case ModelArch::GEMMA:
     case ModelArch::PHI:
@@ -1108,9 +1126,18 @@ const char* ModelGraphBridge::GetGraphName(ModelArch arch) {
     case ModelArch::CLIP_VISION: return "clip_vision";
     case ModelArch::SIGLIP: return "siglip";
     case ModelArch::WHISPER: return "whisper_encoder";
+    case ModelArch::QWEN35: return nullptr;
     case ModelArch::UNKNOWN: return nullptr;
     default: return "llm_universal";  // Default fallback for all LLMs
     }
+}
+
+const char* ModelGraphBridge::GetGraphName(const TransformerModel* model) {
+    if (!model) return nullptr;
+    if ((model->arch == ModelArch::QWEN35 || model->arch == ModelArch::GEMMA) && !SupportsGenericLlmGraph(model)) {
+        return nullptr;
+    }
+    return GetGraphName(model->arch);
 }
 
 bool ModelGraphBridge::RegisterFromModel(const TransformerModel* model) {
@@ -1141,7 +1168,7 @@ bool ModelGraphBridge::RegisterFromModel(const TransformerModel* model) {
 }
 
 bool ModelGraphBridge::RegisterVisionBuilder(const TransformerModel* model) {
-    const char* graph_name = GetGraphName(model->arch);
+    const char* graph_name = GetGraphName(model);
     if (!graph_name) {
         std::cerr << "[ModelGraphBridge] Unknown vision arch" << std::endl;
         return false;
@@ -1187,6 +1214,11 @@ bool ModelGraphBridge::RegisterWhisperBuilder(const TransformerModel* model) {
 }
 
 bool ModelGraphBridge::RegisterLlmBuilder(const TransformerModel* model) {
+    if (!SupportsGenericLlmGraph(model)) {
+        std::cout << "[ModelGraphBridge] Skipping GenericLlmBuilder for hybrid SSM arch" << std::endl;
+        return false;
+    }
+
     GraphRegistry::Instance().Register("llm_generic", [model]() -> std::unique_ptr<GraphBuilder> {
         return std::make_unique<GenericLlmBuilder>(model);
     });

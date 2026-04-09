@@ -1565,7 +1565,7 @@ static void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src
 // Output:
 //   dst = scratch buffer whose first d_inner rows contain the recurrent
 //         linear-attention output after gated RMSNorm
-static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
+void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
                                 const struct ggml_tensor* c, int ith, int nth, void* userdata) {
     (void)nth;
     if (ith != 0) return;
@@ -1603,6 +1603,54 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
     const int state_stride = head_k_dim * head_v_dim;
     const int heads_per_group = (num_k_heads > 0) ? std::max(1, num_v_heads / num_k_heads) : 1;
 
+    // =========================================================================
+    // LAYOUT ASSERTIONS & RUNTIME CONTRACT CHECK
+    // =========================================================================
+    if (!ud || !a || !b || !c || !dst || !a->data || !b->data || !c->data || !dst->data) {
+        FatalQwen35SSMRuntimeError(ud ? ud->layer_idx : -1, 0, -1, -1, "SSM delta: null tensor or data");
+    }
+
+    const int expected_conv_channels = ud->d_inner + 2 * qk_total;
+    
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || c->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM delta inputs/outputs must be F32");
+    }
+
+    if (b->nb[0] != sizeof(float) || c->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM delta: non-contiguous element stride detected in b, c, or dst");
+    }
+
+    if (a->ne[0] != expected_conv_channels) {
+        fprintf(stderr, "[DenseCore][Qwen35SSM] FATAL LAYOUT MISMATCH layer=%d: qkv_conv ne[0]=%lld expected=%d\n",
+                ud->layer_idx, (long long)a->ne[0], expected_conv_channels);
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM QKV layout mismatch: ne[0] != d_inner + 2*n_groups*head_dim_k");
+    }
+    if (b->ne[0] != ud->d_inner) {
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM z tensor shape mismatch");
+    }
+    if (c->ne[0] != ud->n_embd) {
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM input tensor shape mismatch");
+    }
+    // ggml_map_custom3() allocates the output tensor with the same shape as `a`
+    // (here, qkv_conv). The SSM block only writes the first d_inner values per row,
+    // and the caller later views that prefix as [d_inner, N].
+    if (dst->ne[0] < ud->d_inner) {
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM output tensor shape mismatch");
+    }
+
+    const bool requires_qkv_canonicalization = (a->nb[0] != sizeof(float));
+    if (!requires_qkv_canonicalization && qkv_stride < expected_conv_channels) {
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM QKV row stride is smaller than element count");
+    }
+    if (z_stride < ud->d_inner) {
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM z row stride is smaller than element count");
+    }
+    if (input_stride < ud->n_embd) {
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM input row stride is smaller than element count");
+    }
+
+
+
     // Allocate once instead of per-token to reduce memory allocation overhead
     // Stack allocation: Qwen3.5 max ~10KB (head_dim_k=128, head_dim_v=128, d_inner=2048)
     float q_norm_buf[256], k_norm_buf[256], kv_mem_buf[256], delta_buf[256], y_pre_norm_buf[256], y_buf[2048];
@@ -1624,14 +1672,34 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
         ref_y_head.resize(static_cast<size_t>(head_v_dim), 0.0f);
     }
 
+    std::vector<float> canonical_qkv_row;
+    if (requires_qkv_canonicalization) {
+        canonical_qkv_row.resize(expected_conv_channels, 0.0f);
+    }
+
     for (int t = 0; t < N; ++t) {
         std::fill(y, y + ud->d_inner, 0.0f);
         const float* input_t = input + static_cast<ptrdiff_t>(t) * input_stride;
-        const float* qkv_t = qkv_conv + static_cast<ptrdiff_t>(t) * qkv_stride;
         const float* z_t = z_proj + static_cast<ptrdiff_t>(t) * z_stride;
-        const float* q_base = qkv_t;
-        const float* k_base = qkv_t + qk_total;
-        const float* v_base = qkv_t + 2 * qk_total;
+        
+        const float* q_base;
+        const float* k_base;
+        const float* v_base;
+
+        if (requires_qkv_canonicalization) {
+            const char* row_bytes = reinterpret_cast<const char*>(a->data) + static_cast<size_t>(t) * a->nb[1];
+            for (int i = 0; i < expected_conv_channels; ++i) {
+                canonical_qkv_row[i] = *reinterpret_cast<const float*>(row_bytes + static_cast<size_t>(i) * a->nb[0]);
+            }
+            q_base = canonical_qkv_row.data();
+            k_base = canonical_qkv_row.data() + qk_total;
+            v_base = canonical_qkv_row.data() + 2 * qk_total;
+        } else {
+            const float* qkv_t = qkv_conv + static_cast<ptrdiff_t>(t) * qkv_stride;
+            q_base = qkv_t;
+            k_base = qkv_t + qk_total;
+            v_base = qkv_t + 2 * qk_total;
+        }
         if (debug_core_ref) {
             for (int h = 0; h < num_v_heads; ++h) {
                 const int src_k_head =
@@ -1648,9 +1716,31 @@ static void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tenso
         for (int h = 0; h < num_v_heads; ++h) {
             const int seq_idx = (ud->token_seq_ids && t < N) ? ud->token_seq_ids[t] : -1;
             const int src_k_head = (num_k_heads == num_v_heads) ? h : std::min(num_k_heads - 1, h / heads_per_group);
-            const float* q_head = q_base + src_k_head * head_k_dim;
-            const float* k_head = k_base + src_k_head * head_k_dim;
-            const float* v_head = v_base + h * head_v_dim;
+            
+            // Boundary check for QKV head slicing within the logical row
+            if (src_k_head < 0 || src_k_head >= num_k_heads) {
+                FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h, "SSM delta: K head index out of range");
+            }
+            if (h < 0 || h >= num_v_heads) {
+                FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h, "SSM delta: V head index out of range");
+            }
+            
+            const float* q_head = q_base + static_cast<size_t>(src_k_head) * head_k_dim;
+            const float* k_head = k_base + static_cast<size_t>(src_k_head) * head_k_dim;
+            const float* v_head = v_base + static_cast<size_t>(h) * head_v_dim;
+            
+            // Validate that slice pointers are within the expected bounds of the row
+            const float* row_end = q_base + expected_conv_channels;
+            if (q_head + head_k_dim > k_base) {
+                FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h, "SSM delta: Q head slice out of bounds");
+            }
+            if (k_head + head_k_dim > v_base) {
+                FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h, "SSM delta: K head slice out of bounds");
+            }
+            if (v_head + head_v_dim > row_end) {
+                FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h, "SSM delta: V head slice out of bounds");
+            }
+
             const float* alpha_row = ud->alpha_weight + static_cast<size_t>(h) * ud->n_embd;
             const float* beta_row = ud->beta_weight + static_cast<size_t>(h) * ud->n_embd;
             float* ssm_state_base = ud->ssm_state;
