@@ -33,8 +33,9 @@ struct TransformerModel;
 struct KVCacheUserData {
     PagedKVCache* cache;
     int layer;
-    int head_dim_kv;  // Store dynamically detected head dim (NOTE: matches inference.cpp naming)
-    bool is_k;        // True if processing K, false if processing V
+    int head_dim_kv;                   // Store dynamically detected head dim (NOTE: matches inference.cpp naming)
+    bool is_k;                         // True if processing K, false if processing V
+    bool read_only_shared_kv = false;  // Gemma4 shared layers reuse source KV cache without writing
 };
 
 // Thread-local pool access (defined in inference.cpp)

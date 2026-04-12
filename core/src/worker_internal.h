@@ -37,6 +37,7 @@ ArmComputeAffinityPolicy ResolveArmComputeAffinityPolicy();
 
 bool IsDecodeGraphCacheEnabled();
 bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model);
+bool DoesDecodeGraphCacheRequireRuntimeRebind(const TransformerModel* model);
 bool IsBatchedPagedDecodeEnabled();
 bool IsPagedDecodeGloballyDisabled();
 bool IsForcePagedDecodeEnabled();

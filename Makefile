@@ -1,4 +1,4 @@
-.PHONY: all clean lib server run test help format lint format-check docs proto grpc-deps ensure-golangci-lint
+.PHONY: all clean lib server run test bench-qwen35 help format lint format-check docs proto grpc-deps ensure-golangci-lint
 
 # Default target
 all: lib server
@@ -43,6 +43,7 @@ help:
 	@echo "  make server   - Build Go server"
 	@echo "  make run      - Build and run the server"
 	@echo "  make test     - Run a test request"
+	@echo "  make bench-qwen35 - Run the Qwen3.5 HTTP benchmark"
 	@echo "  make clean    - Remove build artifacts"
 	@echo ""
 	@echo "Code quality:"
@@ -199,6 +200,15 @@ test:
 			"messages": [{"role": "user", "content": "Hello, how are you?"}], \
 			"max_tokens": 100 \
 		}' | python3 -m json.tool || echo "Note: Install python3 for pretty JSON output"
+	@echo ""
+	@echo "=========================================="
+
+# Run the Qwen3.5 HTTP benchmark against the local Go server
+bench-qwen35:
+	@echo "=========================================="
+	@echo "Running Qwen3.5 HTTP Benchmark"
+	@echo "=========================================="
+	@./benchmarks/qwen35_bench.sh
 	@echo ""
 	@echo "=========================================="
 

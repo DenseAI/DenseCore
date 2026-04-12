@@ -242,6 +242,7 @@ struct PagedKVCache {
     int n_head_kv;
     int n_layer;
     int max_blocks;
+    std::vector<int> layer_n_head_kv;
     std::vector<int> layer_head_dims;
     std::vector<int> layer_v_head_dims;
 
@@ -319,6 +320,7 @@ struct PagedKVCache {
     // Check if cache uses quantized type
     bool IsQuantized() const;
 
+    int GetHeadCountForLayer(int layer) const;
     int GetHeadDimForLayer(int layer) const;
     int GetVHeadDimForLayer(int layer) const;
 

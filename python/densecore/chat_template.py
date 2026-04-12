@@ -350,7 +350,7 @@ def format_chat_prompt(
             else:
                 filtered.append(message)
 
-        parts: list[str] = []
+        parts: list[str] = ["<bos>"]
         if thinking_enabled or system_parts:
             system_content = ""
             if thinking_enabled:

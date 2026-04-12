@@ -7,6 +7,7 @@
 #include "ggml.h"               // Required for ggml_tensor definition
 #include "hardware_topology.h"  // For compute thread affinity
 #include "matmul_backend.h"
+#include "models/model_inference_policy.h"
 #include "optimization_bridge.h"  // Runtime SIMD dispatch
 
 #ifndef GGML_KQ_MASK_PAD
@@ -72,45 +73,6 @@ constexpr const char* kGemma4PostSharedNormKey = "gemma4.post_feedforward_layern
 constexpr const char* kGemma4PostMoeNormKey = "gemma4.post_feedforward_layernorm_2.weight";
 constexpr const char* kGemma4PostFfnNormKey = "gemma4.post_feedforward_layernorm.weight";
 
-static inline bool IsGemma4SlidingLayer(const TransformerModel* model, int layer_idx) {
-    return model && model->arch_flags.is_gemma4 && layer_idx >= 0 &&
-           layer_idx < static_cast<int>(model->gemma4_layer_is_sliding.size()) &&
-           model->gemma4_layer_is_sliding[static_cast<size_t>(layer_idx)] != 0;
-}
-
-static inline int Gemma4KVSourceLayer(const TransformerModel* model, int layer_idx) {
-    if (!model || !model->arch_flags.is_gemma4 || layer_idx < 0 ||
-        layer_idx >= static_cast<int>(model->gemma4_layer_kv_source.size())) {
-        return layer_idx;
-    }
-    const int source = model->gemma4_layer_kv_source[static_cast<size_t>(layer_idx)];
-    return source >= 0 ? source : layer_idx;
-}
-
-static inline bool IsGemma4SharedKvReuseDisabled() {
-    static const bool disabled = []() {
-        const char* env = std::getenv("DENSECORE_GEMMA4_DISABLE_SHARED_KV_REUSE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return disabled;
-}
-
-static inline bool IsGemma4PerLayerInputDisabled() {
-    static const bool disabled = []() {
-        const char* env = std::getenv("DENSECORE_GEMMA4_DISABLE_PER_LAYER_INPUT");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return disabled;
-}
-
-static inline bool IsGemma4LayerOutputScaleDisabled() {
-    static const bool disabled = []() {
-        const char* env = std::getenv("DENSECORE_GEMMA4_DISABLE_LAYER_OUTPUT_SCALE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return disabled;
-}
-
 static struct ggml_tensor* BuildAttentionMaskTensor(struct ggml_context* ctx, int n_total_tokens, int n_queries,
                                                     int n_past, int sliding_window, int n_padded = -1) {
     if (!ctx || n_total_tokens <= 0 || n_queries <= 0) {
@@ -146,13 +108,6 @@ static struct ggml_tensor* BuildAttentionMaskTensor(struct ggml_context* ctx, in
     }
 
     return mask;
-}
-
-static inline bool IsGemma4MoEModel(const TransformerModel* model, const TransformerLayer* layer = nullptr) {
-    if (!model || model->arch != ModelArch::GEMMA || model->hparams.n_experts == 0) {
-        return false;
-    }
-    return !layer || layer->Get(kGemma4RouterScaleKey) || layer->Get(kGemma4RouterPerExpertScaleKey) || layer->is_moe;
 }
 
 static const InferenceConfig& ResolveInferenceConfig(const BatchSpec* batch) {
@@ -1247,12 +1202,6 @@ static DecodePagedDecision EvaluatePagedDecodeDecision(const DecodePagedAttentio
         decision.reason = DecodePagedFallbackReason::GlmDsa;
         return decision;
     }
-    if (model && model->arch_flags.is_gemma4) {
-        // Gemma4 uses layer-local KV-head layouts that are not yet stable in
-        // the paged decode fast path. Keep decode on the dense path for now.
-        decision.reason = DecodePagedFallbackReason::PolicyOff;
-        return decision;
-    }
 
     decision.reason = DiagnosePagedDecodeCandidateFailure(cache, batch, n_tokens_in_batch, n_head, n_head_kv,
                                                           head_dim_q, head_dim_kv);
@@ -2172,15 +2121,16 @@ static std::atomic<const BatchSpec*> g_shared_batch{nullptr};
 // ============================================================================
 
 struct KVUpdateGatherUserData {
-    PagedKVCache* cache;             // KV cache instance
-    const BatchSpec* batch;          // Batch specification with block tables
-    int layer;                       // Current transformer layer
-    int head_dim;                    // Dimension per head
-    int n_head_kv;                   // Number of KV heads
-    int N;                           // Current batch size (new tokens)
-    int n_past;                      // Number of past/history tokens
-    bool is_k;                       // True for K tensor, false for V tensor
-    struct ggml_tensor* src_tensor;  // Pointer to Kcur/Vcur tensor (data accessed at runtime)
+    PagedKVCache* cache;               // KV cache instance
+    const BatchSpec* batch;            // Batch specification with block tables
+    int layer;                         // Current transformer layer
+    int head_dim;                      // Dimension per head
+    int n_head_kv;                     // Number of KV heads
+    int N;                             // Current batch size (new tokens)
+    int n_past;                        // Number of past/history tokens
+    bool is_k;                         // True for K tensor, false for V tensor
+    bool read_only_shared_kv = false;  // Shared Gemma4 layers reuse cache without writing
+    struct ggml_tensor* src_tensor;    // Pointer to Kcur/Vcur tensor (data accessed at runtime)
 };
 
 // Pool size for KVUpdateGatherUserData
@@ -2902,8 +2852,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     if (out_embd) *out_embd = embd_inp;
 
     struct ggml_tensor* cur = ggml_get_rows(ctx_c, model->tok_embeddings, embd_inp);
-    if (model->arch_flags.is_gemma4) {
-        cur = ggml_scale(ctx_c, cur, std::sqrt(static_cast<float>(model->hparams.n_embd)));
+    if (const float embedding_scale = densecore::models::ResolveInputEmbeddingScale(model); embedding_scale != 1.0f) {
+        cur = ggml_scale(ctx_c, cur, embedding_scale);
     }
 
     if (IsDebugInferenceStatsEnabled()) {
@@ -2948,7 +2898,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     const bool decode_only_batch_layout = IsDecodeOnlyBatchLayout(batch, N);
 
     auto requires_gemma_rms_weight_offset = [&]() -> bool {
-        return model && model->arch_flags.uses_unit_offset_rms_norm;
+        return densecore::models::RequiresUnitOffsetRmsNorm(model);
     };
 
     auto effective_rms_weight = [&](struct ggml_tensor * norm_weight, const char* debug_name) -> struct ggml_tensor* {
@@ -3106,9 +3056,6 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
         shared_prefill_mask_n_past = prefill_n_past;
         shared_prefill_mask_sliding_window = -1;
     }
-
-    std::vector<struct ggml_tensor*> gemma4_layer_k_cache(static_cast<size_t>(n_layer), nullptr);
-    std::vector<struct ggml_tensor*> gemma4_layer_v_cache(static_cast<size_t>(n_layer), nullptr);
 
     // =========================================================================
     // 2. Transformer Layers
@@ -3571,11 +3518,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             int dim_k = Kcur->ne[0];
             int dim_v = Vcur->ne[0];
 
-            int n_head_kv = model->hparams.n_head_kv;
-            if (!model->gemma4_layer_n_head_kv.empty() && il < static_cast<int>(model->gemma4_layer_n_head_kv.size())) {
-                n_head_kv = static_cast<int>(model->gemma4_layer_n_head_kv[static_cast<size_t>(il)]);
-            }
-            const bool use_runtime_kv_dims = model->arch_flags.is_gemma4 || !model->gemma4_layer_n_head_kv.empty();
+            int n_head_kv = densecore::models::ResolveLayerKVHeadCount(model, il);
+            const bool use_runtime_kv_dims = densecore::models::UseRuntimeKVHeadDims(model);
             int head_dim_kv = (!use_runtime_kv_dims && model->hparams.n_embd_head_k > 0)
                                   ? model->hparams.n_embd_head_k
                                   : (n_head_kv > 0 ? (dim_k / n_head_kv) : 0);
@@ -3610,6 +3554,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
 
             int head_dim_q = dim_q / n_head;
 
+            const bool gemma4_shared_kv_layer =
+                model->arch_flags.is_gemma4 && densecore::models::Gemma4KVSourceLayer(model, il) != il;
             bool k_done = false;
             bool v_done = false;
 
@@ -3644,7 +3590,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             //   4. Reshape back to [head_dim, n_head, N]
             // =========================================================================
             // Q Normalization (required for Qwen3, optional for others)
-            if (model->arch_flags.requires_q_norm && q_norm) {
+            if (densecore::models::ShouldApplyQNorm(model, q_norm)) {
                 const int64_t q_n_tokens = Qcur->ne[2];  // N (batch size)
                 struct ggml_tensor* q_norm_effective = effective_rms_weight(q_norm, nullptr);
                 if (IsDebugInferenceStatsEnabled() && il == 3) {
@@ -3693,13 +3639,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 }
             }
 
-            // Skip K/V norms for Gemma4 layers that will reuse K/V from a source layer —
-            // the projected K/V tensors are discarded anyway, so normalizing them is wasted work.
-            const bool gemma4_will_reuse_kv =
-                model->arch_flags.is_gemma4 && !IsGemma4SharedKvReuseDisabled() && Gemma4KVSourceLayer(model, il) != il;
-
             // K Normalization (required for Qwen3, optional for others)
-            if (!gemma4_will_reuse_kv && model->arch_flags.requires_k_norm && k_norm) {
+            if (densecore::models::ShouldApplyKNorm(model, k_norm, gemma4_shared_kv_layer)) {
                 const int64_t k_n_tokens = Kcur->ne[2];  // N (batch size)
                 struct ggml_tensor* k_norm_effective = effective_rms_weight(k_norm, nullptr);
                 if (IsDebugInferenceStatsEnabled() && il == 3) {
@@ -3748,7 +3689,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 }
             }
 
-            if (!gemma4_will_reuse_kv && model->arch_flags.is_gemma4 && Vcur) {
+            if (densecore::models::ShouldApplyVNorm(model, Vcur, gemma4_shared_kv_layer)) {
                 struct ggml_tensor* v_norm = layer.Get(model_keys::kAttnVNorm);
                 const int64_t v_n_tokens = Vcur->ne[2];
                 if (head_dim_v > 0 && n_head_kv > 0) {
@@ -3769,19 +3710,22 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             bool use_gemma4_proportional_rope = false;
             struct ggml_tensor* rope_freq_factors = nullptr;
             if (model->arch_flags.is_gemma4) {
-                const bool is_sliding_layer = IsGemma4SlidingLayer(model, il);
+                const bool is_sliding_layer = densecore::models::IsGemma4SlidingLayer(model, il);
                 if (is_sliding_layer) {
                     rope_dim = model->gemma4_rope_dim_swa > 0 ? model->gemma4_rope_dim_swa : rope_dim;
                 } else {
-                    use_gemma4_proportional_rope = true;
-                    rope_freq_factors = rope_freqs;
-                    rope_dim = model->gemma4_rope_dim_full > 0 ? model->gemma4_rope_dim_full : 0;
+                    // Gemma4 full attention: proportional RoPE via rope_freqs.weight.
+                    // The freq_factors tensor has [1.0×64, 1e30×192] for 256 pairs:
+                    // pairs 0-63 (freq=1.0) get normal rotation, pairs 64-255 (freq=1e30)
+                    // get effectively zero rotation. The GGUF weights are permuted to
+                    // match this NEOX-mode pairing convention (same as llama.cpp).
+                    use_gemma4_proportional_rope = !densecore::models::IsGemma4FullRopeFreqsDisabled();
+                    rope_freq_factors = use_gemma4_proportional_rope ? rope_freqs : nullptr;
+                    rope_dim = use_gemma4_proportional_rope ? model->gemma4_rope_dim_full : 0;
                     if (rope_dim <= 0) {
                         rope_dim = static_cast<int>(std::lround(static_cast<float>(head_dim_q) *
                                                                 model->gemma4_full_attention_partial_rotary_factor));
-                        if (rope_dim <= 0) {
-                            rope_dim = head_dim_q;
-                        }
+                        if (rope_dim <= 0) rope_dim = head_dim_q;
                     }
                     // RoPE pairs operate on an even count of dimensions.
                     rope_dim &= ~1;
@@ -3807,37 +3751,61 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             }
 
             if (!skip_rope) {
+                const int rope_mode = model->arch_flags.is_gemma4 ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL;
                 struct ggml_tensor* Q_rope_fast = nullptr;
                 struct ggml_tensor* K_rope_fast = nullptr;
-                if (IsPrecomputedRoPEEnabled() &&
-                    (!model->arch_flags.is_gemma4 || (use_gemma4_proportional_rope && rope_freq_factors == nullptr))) {
+                const bool can_use_precomputed_rope =
+                    IsPrecomputedRoPEEnabled() &&
+                    (!model->arch_flags.is_gemma4 ||
+                     (use_gemma4_proportional_rope && rope_freq_factors == nullptr && !gemma4_shared_kv_layer));
+                if (can_use_precomputed_rope) {
                     Q_rope_fast = ggml_rope_precomputed_table(ctx_c, Qcur, pos, model, rope_dim, &batch);
                     K_rope_fast = ggml_rope_precomputed_table(ctx_c, Kcur, pos, model, rope_dim, &batch);
                 }
                 const bool use_mrope = model->hparams.rope_sections[0] > 0 && model->hparams.rope_sections[1] > 0;
-                if (Q_rope_fast && K_rope_fast) {
-                    Qcur = Q_rope_fast;
-                    Kcur = K_rope_fast;
-                } else {
-                    if (use_mrope) {
-                        const int rope_mode = ModelMRoPEMode(model);
+                if (gemma4_shared_kv_layer) {
+                    if (Q_rope_fast) {
+                        Qcur = Q_rope_fast;
+                    } else if (use_mrope) {
+                        const int rope_mrope_mode = ModelMRoPEMode(model);
                         int rope_sections[GGML_MROPE_SECTIONS] = {
                             model->hparams.rope_sections[0],
                             model->hparams.rope_sections[1],
                             model->hparams.rope_sections[2],
                             model->hparams.rope_sections[3],
                         };
-                        Qcur = ggml_rope_multi(ctx_c, Qcur, pos, nullptr, rope_dim, rope_sections, rope_mode, n_ctx,
-                                               rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
-                        Kcur = ggml_rope_multi(ctx_c, Kcur, pos, nullptr, rope_dim, rope_sections, rope_mode, n_ctx,
-                                               rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+                        Qcur =
+                            ggml_rope_multi(ctx_c, Qcur, pos, nullptr, rope_dim, rope_sections, rope_mrope_mode, n_ctx,
+                                            rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+                    } else {
+                        Qcur = ggml_rope_ext(ctx_c, Qcur, pos, rope_freq_factors, rope_dim, rope_mode, n_ctx,
+                                             rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+                    }
+                } else if (Q_rope_fast && K_rope_fast) {
+                    Qcur = Q_rope_fast;
+                    Kcur = K_rope_fast;
+                } else {
+                    if (use_mrope) {
+                        const int rope_mrope_mode = ModelMRoPEMode(model);
+                        int rope_sections[GGML_MROPE_SECTIONS] = {
+                            model->hparams.rope_sections[0],
+                            model->hparams.rope_sections[1],
+                            model->hparams.rope_sections[2],
+                            model->hparams.rope_sections[3],
+                        };
+                        Qcur =
+                            ggml_rope_multi(ctx_c, Qcur, pos, nullptr, rope_dim, rope_sections, rope_mrope_mode, n_ctx,
+                                            rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+                        Kcur =
+                            ggml_rope_multi(ctx_c, Kcur, pos, nullptr, rope_dim, rope_sections, rope_mrope_mode, n_ctx,
+                                            rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
                     } else {
                         // Fallback to standard GGML RoPE when precomputed path is
                         // unavailable for this tensor/layout.
-                        Qcur = ggml_rope_ext(ctx_c, Qcur, pos, rope_freq_factors, rope_dim, 0, n_ctx, rope_freq_base,
-                                             model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
-                        Kcur = ggml_rope_ext(ctx_c, Kcur, pos, rope_freq_factors, rope_dim, 0, n_ctx, rope_freq_base,
-                                             model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+                        Qcur = ggml_rope_ext(ctx_c, Qcur, pos, rope_freq_factors, rope_dim, rope_mode, n_ctx,
+                                             rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+                        Kcur = ggml_rope_ext(ctx_c, Kcur, pos, rope_freq_factors, rope_dim, rope_mode, n_ctx,
+                                             rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
                     }
                 }
             }
@@ -3845,22 +3813,6 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             const bool use_explicit_attention_scale = model->hparams.f_attention_scale > 0.0f;
             if (use_explicit_attention_scale) {
                 Qcur = ggml_scale(ctx_c, Qcur, model->hparams.f_attention_scale);
-            }
-
-            if (model->arch_flags.is_gemma4) {
-                const int kv_source_layer = Gemma4KVSourceLayer(model, il);
-                if (kv_source_layer == il || IsGemma4SharedKvReuseDisabled()) {
-                    gemma4_layer_k_cache[static_cast<size_t>(il)] = Kcur;
-                    gemma4_layer_v_cache[static_cast<size_t>(il)] = Vcur;
-                } else if (kv_source_layer >= 0 && kv_source_layer < n_layer &&
-                           gemma4_layer_k_cache[static_cast<size_t>(kv_source_layer)] &&
-                           gemma4_layer_v_cache[static_cast<size_t>(kv_source_layer)]) {
-                    Kcur = gemma4_layer_k_cache[static_cast<size_t>(kv_source_layer)];
-                    Vcur = gemma4_layer_v_cache[static_cast<size_t>(kv_source_layer)];
-                    n_head_kv = static_cast<int>(Kcur->ne[1]);
-                    head_dim_kv = static_cast<int>(Kcur->ne[0]);
-                    head_dim_v = static_cast<int>(Vcur->ne[0]);
-                }
             }
 
             if (use_glm_dsa_sparse && glm_index_query && glm_index_weights && glm_index_key) {
@@ -3941,22 +3893,34 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 const bool paged_decode_candidate = paged_decode_decision.candidate;
                 const bool requested_paged_decode_attention = paged_decode_decision.requested;
                 const bool decode_only_batch = decode_only_batch_layout;
-                const int kv_cache_layer = model->arch_flags.is_gemma4 ? Gemma4KVSourceLayer(model, il) : il;
+                const int kv_cache_layer = densecore::models::Gemma4KVSourceLayer(model, il);
 
                 // Safety override: GGML's generic decode matmul path can become numerically
                 // unstable for GQA decode (N=1, n_head != n_head_kv) on some CPU kernels.
                 // Force the custom paged decode attention path for correctness in this case.
-                const bool force_safe_gqa_decode =
-                    IsForceSafeGqaDecodeEnabled() && use_cache && paged_decode_candidate && N == 1 && n_past_val > 0 &&
-                    n_head_kv > 0 && n_head > n_head_kv && (n_head % n_head_kv == 0) && (head_dim_q == head_dim_kv) &&
-                    batch.num_seqs == 1 && !batch.seq_id.empty();
+                const bool disable_paged_decode_for_gemma4 = model->arch_flags.is_gemma4;
+                const bool force_safe_gqa_decode = !disable_paged_decode_for_gemma4 && IsForceSafeGqaDecodeEnabled() &&
+                                                   use_cache && paged_decode_candidate && N == 1 && n_past_val > 0 &&
+                                                   n_head_kv > 0 && n_head > n_head_kv && (n_head % n_head_kv == 0) &&
+                                                   (head_dim_q == head_dim_kv) && batch.num_seqs == 1 &&
+                                                   !batch.seq_id.empty();
                 // For decode-only batched scheduling (N>1), force paged decode when the
                 // batch layout is a valid paged candidate. The legacy non-paged batched
                 // path is not sequence-isolated and can introduce cross-sequence drift.
                 const bool force_batched_decode_path =
                     use_cache && decode_only_batch && N > 1 && paged_decode_candidate;
 
-                bool use_paged_decode_attention = requested_paged_decode_attention;
+                bool use_paged_decode_attention = requested_paged_decode_attention && !disable_paged_decode_for_gemma4;
+                if (disable_paged_decode_for_gemma4 && requested_paged_decode_attention) {
+                    static bool logged_gemma4_paged_decode_disable = false;
+                    if (!logged_gemma4_paged_decode_disable) {
+                        std::cerr << "[DenseCore] Disabling paged decode attention for Gemma4; "
+                                     "falling back to portable attention until the paged path "
+                                     "supports Gemma4 softcap/sliding semantics."
+                                  << std::endl;
+                        logged_gemma4_paged_decode_disable = true;
+                    }
+                }
                 if (force_batched_decode_path) {
                     const bool was_enabled = use_paged_decode_attention;
                     use_paged_decode_attention = true;
@@ -3986,7 +3950,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                               << " reason=" << DecodePagedFallbackReasonName(paged_decode_decision.reason) << std::endl;
                 }
 
-                if (use_cache && !use_paged_decode_attention) {  // Re-enabled old KV cache approach
+                if (use_cache && !use_paged_decode_attention) {
                     // Only need fancy logic if we have history.
                     // If n_past = 0 (Prefill), K_all == Kcur is mostly fine,
                     // BUT we still need to WRITE to cache.
@@ -3995,8 +3959,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
 
                     KVCacheUserData* k_ud = GetKVCacheUserData(kv_cache_layer, true);
                     *k_ud = {cache, kv_cache_layer, head_dim_kv, true};  // batch accessed via GetCurrentBatch()
+                    k_ud->read_only_shared_kv = gemma4_shared_kv_layer;
                     KVCacheUserData* v_ud = GetKVCacheUserData(kv_cache_layer, false);
                     *v_ud = {cache, kv_cache_layer, head_dim_v, false};  // batch accessed via GetCurrentBatch()
+                    v_ud->read_only_shared_kv = gemma4_shared_kv_layer;
 
                     int kv_tasks = ResolveInferenceConfig(&batch).num_threads;
                     if (kv_tasks <= 0) {
@@ -4018,7 +3984,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                         }
                     }
 
-                    if (n_past_val == 0) {
+                    if (gemma4_shared_kv_layer) {
+                        K_all = ggml_kv_update_and_gather(ctx_c, Kcur, n_total_tokens, kv_tasks, k_ud);
+                        V_all = ggml_kv_update_and_gather(ctx_c, Vcur, n_total_tokens, kv_tasks, v_ud);
+                    } else if (n_past_val == 0) {
                         // Prefill first chunk fast path: avoid materializing an
                         // equivalent [history | current] tensor when history is empty.
                         K_all = ggml_map_custom1(ctx_c, Kcur, cb_kv_write_only, kv_tasks, k_ud);
@@ -4065,7 +4034,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     KVUpdateGatherUserData* k_gather_ud = GetKVUpdateGatherUserData(il, true);
                     k_gather_ud->cache = cache;
                     k_gather_ud->batch = &batch;
-                    k_gather_ud->layer = il;
+                    k_gather_ud->layer = kv_cache_layer;
                     k_gather_ud->head_dim = head_dim_kv;
                     k_gather_ud->n_head_kv = n_head_kv;
                     k_gather_ud->N = N;
@@ -4077,7 +4046,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     KVUpdateGatherUserData* v_gather_ud = GetKVUpdateGatherUserData(il, false);
                     v_gather_ud->cache = cache;
                     v_gather_ud->batch = &batch;
-                    v_gather_ud->layer = il;
+                    v_gather_ud->layer = kv_cache_layer;
                     v_gather_ud->head_dim = head_dim_kv;
                     v_gather_ud->n_head_kv = n_head_kv;
                     v_gather_ud->N = N;
@@ -4195,7 +4164,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 const float fast_attn_logit_softcap =
                     model->arch_flags.is_gemma4 ? model->gemma4_attention_logit_softcapping : 0.0f;
                 const int fast_attn_sliding_window =
-                    (model->arch_flags.is_gemma4 && IsGemma4SlidingLayer(model, il) && model->gemma4_sliding_window > 0)
+                    (model->arch_flags.is_gemma4 && densecore::models::IsGemma4SlidingLayer(model, il) &&
+                     model->gemma4_sliding_window > 0)
                         ? model->gemma4_sliding_window
                         : -1;
                 const bool fast_attn_requires_extended_semantics = fast_attn_logit_softcap > 0.0f;
@@ -4252,7 +4222,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 const bool use_portable_cpu_flash_native_decode_layout =
                     use_portable_cpu_flash_attention && N == 1 && head_dim_q == head_dim_kv &&
                     head_dim_q == head_dim_v && ggml_is_contiguous(Qcur) && ggml_is_contiguous(K) &&
-                    ggml_is_contiguous(V);
+                    ggml_is_contiguous(V) && !model->arch_flags.is_gemma4;
                 if (flash_attn_forced && !flash_attn_runtime_supported && il == 0 &&
                     IsVerboseGraphBuildLoggingEnabled()) {
                     std::cerr
@@ -4324,7 +4294,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     K_hal = ggml_cont(ctx_c, K_hal);
                     V_hal = ggml_cont(ctx_c, V_hal);
 
-                    const float scale = use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q);
+                    const float scale = model->arch_flags.is_gemma4
+                                            ? 1.0f
+                                            : (use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q));
                     // For decode (N==1), causal=false is correct because K already contains
                     // only historical + current keys (no future positions).
                     const bool hal_causal = (N > 1);
@@ -4341,7 +4313,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     // On ARM/Apple CPU runtimes, route through DenseCore's backend-agnostic
                     // FlashAttention op instead of forcing the materialized standard path.
                     // -----------------------------------------------------------------------
-                    const float scale = use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q);
+                    const float scale = model->arch_flags.is_gemma4
+                                            ? 1.0f
+                                            : (use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q));
                     const bool hal_causal = (N > 1);
                     const int flash_q_start_offset = n_past_val;
                     if (use_portable_cpu_flash_native_decode_layout) {
@@ -4410,8 +4384,11 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     K_fa = ggml_cont(ctx_c, K_fa);
                     V_fa = ggml_cont(ctx_c, V_fa);
 
-                    // Scale factor: 1/sqrt(head_dim)
-                    const float scale = use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q);
+                    // Scale factor: Gemma4 uses scaling=1.0 per HF reference
+                    // (q_norm/k_norm handle normalization, no 1/sqrt(d) needed)
+                    const float scale = model->arch_flags.is_gemma4
+                                            ? 1.0f
+                                            : (use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q));
 
                     // Flash Attention: fused Q*K^T, scale, mask, softmax, *V
                     // Result: [head_dim, N, n_head]
@@ -4432,8 +4409,11 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     // correctness on all hardware (AVX2, SSE, etc.)
                     // -----------------------------------------------------------------------
 
-                    // Scale factor for attention
-                    const float scale = use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q);
+                    // Scale factor: Gemma4 uses scaling=1.0 per HF reference
+                    // (q_norm/k_norm handle normalization, no 1/sqrt(d) needed)
+                    const float scale = model->arch_flags.is_gemma4
+                                            ? 1.0f
+                                            : (use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q));
 
                     // =================================================================
                     // UNIFIED ATTENTION PATH (GQA + MHA)
@@ -4514,10 +4494,14 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             if (attn_core_reference_eligible && attn_ref_k && attn_ref_v && IsDebugAttentionCoreReferenceEnabled()) {
                 AttentionCoreReferenceUserData* attn_ref_ud = GetAttentionCoreReferenceUserData();
                 const int attn_ref_sliding_window =
-                    (model->arch_flags.is_gemma4 && IsGemma4SlidingLayer(model, il) && model->gemma4_sliding_window > 0)
+                    (model->arch_flags.is_gemma4 && densecore::models::IsGemma4SlidingLayer(model, il) &&
+                     model->gemma4_sliding_window > 0)
                         ? model->gemma4_sliding_window
                         : -1;
-                const float attn_ref_scale = use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q);
+                const float attn_ref_scale =
+                    model->arch_flags.is_gemma4
+                        ? 1.0f
+                        : (use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q));
                 const float attn_ref_logit_softcap =
                     model->arch_flags.is_gemma4 ? model->gemma4_attention_logit_softcapping : 0.0f;
                 attn_ref_ud->value_tensor = attn_ref_v;
@@ -4638,7 +4622,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             }
             if (bo) cur = ggml_add(ctx_c, cur, bo);
             if (auto* post_attn_norm = model->layers[il].Get(model_keys::kPostAttnNorm);
-                post_attn_norm && post_attn_norm != ffn_norm) {
+                post_attn_norm && (model->arch_flags.is_gemma4 || post_attn_norm != ffn_norm)) {
                 cur = apply_weighted_rms_norm(cur, post_attn_norm, "post_attention_norm", il);
             }
 
@@ -4781,7 +4765,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // =====================================================================
             // MOE PATH
             // =====================================================================
-            const bool is_gemma4_moe = IsGemma4MoEModel(model, &model->layers[il]);
+            const bool is_gemma4_moe = densecore::models::IsGemma4MoEModel(model, &model->layers[il]);
             struct ggml_tensor* gemma_router_scale = model->layers[il].Get(kGemma4RouterScaleKey);
             struct ggml_tensor* gemma_pre_moe_norm = model->layers[il].Get(kGemma4PreMoeNormKey);
             struct ggml_tensor* gemma_post_shared_norm = model->layers[il].Get(kGemma4PostSharedNormKey);
@@ -4904,9 +4888,15 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     shared_up_ref_ud->var_name = "shared_up";
                     shared_up = ggml_map_custom1(ctx_c, shared_up, cb_projection_reference_probe, 1, shared_up_ref_ud);
                 }
-                struct ggml_tensor* shared_ffn =
-                    ggml_map_custom2(ctx_c, shared_gate, shared_up,
-                                     is_gemma4_moe ? cb_gelu_mul_fused : cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+                struct ggml_tensor* shared_ffn = nullptr;
+                if (is_gemma4_moe) {
+                    // Match llama.cpp Gemma4 path: use native GEGLU so strided matmul
+                    // outputs do not rely on custom flat-memory assumptions.
+                    shared_ffn = ggml_geglu_split(ctx_c, shared_gate, shared_up);
+                } else {
+                    shared_ffn =
+                        ggml_map_custom2(ctx_c, shared_gate, shared_up, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+                }
                 struct ggml_tensor* shared_ffn_input = shared_ffn;
                 shared_ffn = smart_mul_mat(ctx_c, ffn_down, shared_ffn, model);
                 if (ShouldRunFfnProjectionReferenceProbe(il)) {
@@ -5029,7 +5019,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             // Fused SiLU×Mul: silu(w1) * w3 in single pass (avoids intermediate tensor)
             // This saves ~50% memory bandwidth in FFN forward pass.
             if (model->arch_flags.is_gemma4) {
-                cur = ggml_map_custom2(ctx_c, w1, w3, cb_gelu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+                // Match llama.cpp Gemma4 path: use native GEGLU so strided matmul
+                // outputs do not rely on custom flat-memory assumptions.
+                cur = ggml_geglu_split(ctx_c, w1, w3);
             } else {
                 cur = ggml_map_custom2(ctx_c, w1, w3, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
             }
@@ -5074,8 +5066,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             }
         }
 
-        if (model->arch_flags.is_gemma4 && !IsGemma4PerLayerInputDisabled() && gemma4_per_layer_inputs &&
-            model->gemma4_hidden_size_per_layer_input > 0) {
+        if (model->arch_flags.is_gemma4 && !densecore::models::IsGemma4PerLayerInputDisabled() &&
+            gemma4_per_layer_inputs && model->gemma4_hidden_size_per_layer_input > 0) {
             auto* per_layer_gate = model->layers[il].Get(model_keys::kGemma4PerLayerInputGate);
             auto* per_layer_proj = model->layers[il].Get(model_keys::kGemma4PerLayerProjection);
             auto* post_per_layer_norm = model->layers[il].Get(model_keys::kGemma4PostPerLayerInputNorm);
@@ -5085,22 +5077,23 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     ggml_view_2d(ctx_c, gemma4_per_layer_inputs, hidden_per_layer, N, gemma4_per_layer_inputs->nb[2],
                                  static_cast<size_t>(il) * gemma4_per_layer_inputs->nb[1]);
                 struct ggml_tensor* per_layer_delta = smart_mul_mat(ctx_c, per_layer_gate, cur, model);
-                per_layer_delta =
-                    ggml_map_custom1(ctx_c, per_layer_delta, cb_gelu_tanh_unary, GGML_N_TASKS_MAX, nullptr);
+                per_layer_delta = ggml_gelu(ctx_c, per_layer_delta);
                 per_layer_delta = ggml_mul(ctx_c, per_layer_delta, per_layer_input);
                 per_layer_delta = smart_mul_mat(ctx_c, per_layer_proj, per_layer_delta, model);
                 per_layer_delta = apply_weighted_rms_norm(per_layer_delta, post_per_layer_norm,
                                                           "gemma4_post_per_layer_input_norm", il);
                 cur = ggml_add(ctx_c, cur, per_layer_delta);
             }
-            if (!IsGemma4LayerOutputScaleDisabled()) {
-                if (auto* layer_output_scale = model->layers[il].Get(model_keys::kGemma4LayerOutputScale)) {
-                    struct ggml_tensor* scale = ggml_repeat(ctx_c, layer_output_scale, cur);
-                    cur = ggml_mul(ctx_c, cur, scale);
-                }
+        }
+        if (model->arch_flags.is_gemma4 && !densecore::models::IsGemma4LayerOutputScaleDisabled()) {
+            if (auto* layer_output_scale = model->layers[il].Get(model_keys::kGemma4LayerOutputScale)) {
+                // Gemma4 checkpoint scalar: scale the full layer output (same as llama.cpp).
+                // This matches the training-time behavior where subsequent layers see
+                // the scaled hidden state as their input.
+                struct ggml_tensor* scale = ggml_repeat(ctx_c, layer_output_scale, cur);
+                cur = ggml_mul(ctx_c, cur, scale);
             }
         }
-
         if (IsDebugInferenceStatsEnabled()) {
             auto cb_check_layer = [](struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
                                      void* ud) {
@@ -5146,7 +5139,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 }
 
                 // Keep early-layer shape/stats visibility while always surfacing NaN/Inf.
-                const bool emit_regular = (layer_idx <= 5) && (cb_ct[layer_idx] < 5);
+                const bool emit_regular = (cb_ct[layer_idx] < 2);
                 const bool emit_anomaly = (nan_ct > 0 || inf_ct > 0);
                 if (emit_regular || emit_anomaly) {
                     if (!std::isfinite(mn)) mn = 0.0f;
@@ -5175,6 +5168,34 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     // =========================================================================
     // 3. Final Layer Norm and LM Head
     // =========================================================================
+    if (IsDebugInferenceStatsEnabled()) {
+        // TEMP: check raw hidden BEFORE output_norm
+        auto cb_pre_norm = [](struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* ud) {
+            if (ith != 0) return;
+            static int ct = 0;
+            if (ct < 2 && src && src->data && src->nb[0] == sizeof(float)) {
+                const int ne0 = (int)src->ne[0], ne1 = (int)src->ne[1];
+                const float* d = (const float*)src->data;
+                fprintf(stderr, "[PRE_NORM #%d] shape=[%d,%d]\n", ct, ne0, ne1);
+                for (int ti : {0, ne1 - 1}) {
+                    if (ti < 0 || ti >= ne1) continue;
+                    const float* row = d + ti * ne0;
+                    float mn = row[0], mx = row[0];
+                    double sq = 0.0;
+                    for (int i = 0; i < ne0; i++) {
+                        if (row[i] < mn) mn = row[i];
+                        if (row[i] > mx) mx = row[i];
+                        sq += (double)row[i] * row[i];
+                    }
+                    fprintf(stderr, "  [PRE_NORM_TOK %d] min=%.4f max=%.4f rms=%.4f first4=[%.3f,%.3f,%.3f,%.3f]\n", ti,
+                            mn, mx, std::sqrt(sq / ne0), row[0], row[1], row[2], row[3]);
+                }
+                ct++;
+            }
+            if (dst && src && dst->data && src->data) memcpy(dst->data, src->data, ggml_nbytes(src));
+        };
+        cur = ggml_map_custom1(ctx_c, cur, cb_pre_norm, 1, nullptr);
+    }
     cur = apply_weighted_rms_norm(cur, model->output_norm, "output_norm", static_cast<int>(model->layers.size()));
 
     if (embedding_mode) {
@@ -5192,6 +5213,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 int n = ggml_nelements(src);
                 int zero_ct = 0;
                 float mn = d[0], mx = d[0];
+                double sum_sq = 0.0;
                 for (int i = 0; i < n; i++) {
                     if (d[i] == 0.0f)
                         zero_ct++;
@@ -5199,9 +5221,36 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                         if (d[i] < mn) mn = d[i];
                         if (d[i] > mx) mx = d[i];
                     }
+                    sum_sq += (double)d[i] * d[i];
                 }
-                fprintf(stderr, "[HIDDEN #%d] shape=[%ld,%ld] total=%d zero=%d min=%.6f max=%.6f\n", cb_ct,
-                        (long)src->ne[0], (long)src->ne[1], n, zero_ct, mn, mx);
+                double rms_all = std::sqrt(sum_sq / n);
+                fprintf(stderr, "[HIDDEN #%d] shape=[%ld,%ld] total=%d zero=%d min=%.6f max=%.6f rms=%.6f\n", cb_ct,
+                        (long)src->ne[0], (long)src->ne[1], n, zero_ct, mn, mx, rms_all);
+                // Per-token stats: show first, last-1, and last token
+                if (src->nb[0] == sizeof(float) && src->ne[1] > 1) {
+                    const int n_embd = (int)src->ne[0];
+                    const int n_tok = (int)src->ne[1];
+                    for (int ti : {0, n_tok - 2, n_tok - 1}) {
+                        if (ti < 0 || ti >= n_tok) continue;
+                        const float* row = d + ti * n_embd;
+                        float rmn = row[0], rmx = row[0];
+                        double rsq = 0.0;
+                        double sum = 0.0;
+                        int pos_cnt = 0;
+                        for (int j = 0; j < n_embd; j++) {
+                            if (row[j] < rmn) rmn = row[j];
+                            if (row[j] > rmx) rmx = row[j];
+                            rsq += (double)row[j] * row[j];
+                            sum += row[j];
+                            if (row[j] > 0) pos_cnt++;
+                        }
+                        fprintf(stderr,
+                                "  [HIDDEN_TOK %d] min=%.6f max=%.6f rms=%.6f mean=%.6f pos=%d/%d "
+                                "first8=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]\n",
+                                ti, rmn, rmx, std::sqrt(rsq / n_embd), sum / n_embd, pos_cnt, n_embd, row[0], row[1],
+                                row[2], row[3], row[4], row[5], row[6], row[7]);
+                    }
+                }
                 cb_ct++;
             }
             if (dst && src && dst->data && src->data) {
@@ -5225,6 +5274,39 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     // LM Head projection: [n_embd, N] -> [n_vocab, N]
     struct ggml_tensor* cur_input_to_lm_head = cur;
     cur = smart_mul_mat(ctx_c, model->output, cur, model);
+    if (IsDebugInferenceStatsEnabled()) {
+        // TEMP DEBUG: Check raw logits immediately after LM head (before softcap)
+        auto cb_check_lm_head_out = [](struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                       void* ud) {
+            if (ith != 0) return;
+            static int cb_lm_ct = 0;
+            if (cb_lm_ct < 3 && src && src->data) {
+                const int n_vocab = (int)src->ne[0];
+                const int n_tok = (int)src->ne[1];
+                const ptrdiff_t row_stride = (ptrdiff_t)(src->nb[1] / sizeof(float));
+                const float* d = (const float*)src->data;
+                // Check first and last token
+                for (int ti : {0, n_tok - 1}) {
+                    if (ti < 0 || ti >= n_tok) continue;
+                    const float* row = d + (ptrdiff_t)ti * row_stride;
+                    float mn = row[0], mx = row[0];
+                    int pos_ct = 0;
+                    for (int i = 0; i < n_vocab; i++) {
+                        if (row[i] < mn) mn = row[i];
+                        if (row[i] > mx) mx = row[i];
+                        if (row[i] > 0) pos_ct++;
+                    }
+                    fprintf(stderr, "[LM_HEAD_OUT #%d] tok=%d/%d vocab=%d min=%.4f max=%.4f pos_ct=%d stride=%ld\n",
+                            cb_lm_ct, ti, n_tok, n_vocab, mn, mx, pos_ct, (long)row_stride);
+                }
+                cb_lm_ct++;
+            }
+            if (dst && src && dst->data && src->data) {
+                memcpy(dst->data, src->data, ggml_nbytes(src));
+            }
+        };
+        cur = ggml_map_custom1(ctx_c, cur, cb_check_lm_head_out, 1, nullptr);
+    }
     if (ShouldRunFinalProjectionReferenceProbe()) {
         ProjectionReferenceUserData* final_ref_ud = GetProjectionReferenceUserData();
         final_ref_ud->weight_tensor = model->output;
@@ -5249,6 +5331,72 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     }
 
     return cur;
+}
+
+bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& batch) {
+    if (!graph) {
+        return false;
+    }
+    if (batch.seq_id.empty() || batch.hybrid_ssm_runtime_states.empty()) {
+        return false;
+    }
+
+    struct Custom1ParamsView {
+        ggml_custom1_op_t fun;
+        int n_tasks;
+        void* userdata;
+    };
+    struct Custom3ParamsView {
+        ggml_custom3_op_t fun;
+        int n_tasks;
+        void* userdata;
+    };
+    static_assert(sizeof(Custom1ParamsView) <= GGML_MAX_OP_PARAMS, "Custom1ParamsView too large");
+    static_assert(sizeof(Custom3ParamsView) <= GGML_MAX_OP_PARAMS, "Custom3ParamsView too large");
+
+    int conv_rebinds = 0;
+    int delta_rebinds = 0;
+    const int* seq_ids = batch.seq_id.data();
+    const auto* runtime_states = &batch.hybrid_ssm_runtime_states;
+
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor* node = ggml_graph_node(graph, i);
+        if (!node) {
+            continue;
+        }
+
+        if (node->op == GGML_OP_MAP_CUSTOM1) {
+            Custom1ParamsView params{};
+            std::memcpy(&params, node->op_params, sizeof(params));
+            if (params.fun == cb_ssm_conv1d) {
+                auto* ud = static_cast<SSMConv1DUserData*>(params.userdata);
+                if (!ud) {
+                    return false;
+                }
+                ud->token_seq_ids = seq_ids;
+                ud->runtime_states = runtime_states;
+                conv_rebinds++;
+            }
+            continue;
+        }
+
+        if (node->op == GGML_OP_MAP_CUSTOM3) {
+            Custom3ParamsView params{};
+            std::memcpy(&params, node->op_params, sizeof(params));
+            if (params.fun == cb_ssm_qwen35_delta) {
+                auto* ud = static_cast<SSMQwen35DeltaUserData*>(params.userdata);
+                if (!ud) {
+                    return false;
+                }
+                ud->token_seq_ids = seq_ids;
+                ud->runtime_states = runtime_states;
+                delta_rebinds++;
+            }
+        }
+    }
+
+    return conv_rebinds > 0 && delta_rebinds > 0 && conv_rebinds == delta_rebinds;
 }
 
 #include "inference_sampling.inl"

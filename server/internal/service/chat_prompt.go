@@ -54,30 +54,11 @@ func splitChatMessages(messages []domain.Message) ([]domain.Message, []domain.Me
 	return systemMessages, conversationMessages
 }
 
-func containsNonASCII(text string) bool {
-	for _, r := range text {
-		if r > 127 {
-			return true
-		}
-	}
-	return false
-}
-
 func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwargs *domain.ChatTemplateKwargs) string {
 	profile := resolvePromptProfile(modelHint)
 	thinkingEnabled := profile.thinkingEnabled(modelHint, templateKwargs)
 
-	if !thinkingEnabled && len(messages) == 1 {
-		msg := messages[0]
-		role := strings.ToLower(strings.TrimSpace(msg.Role))
-		content := renderQwenContent(msg, false)
-		if role == roleUser && containsNonASCII(content) {
-			return content
-		}
-	}
-
 	var sb strings.Builder
-	hasSystem := false
 
 	writeChatMLBlock := func(role, content string) {
 		content = normalizePromptContent(content)
@@ -89,19 +70,6 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 		sb.WriteString("\n")
 		sb.WriteString(content)
 		sb.WriteString(profile.closeTag)
-	}
-
-	// Check for user-provided system message first before writing default.
-	for _, msg := range messages {
-		if strings.ToLower(strings.TrimSpace(msg.Role)) == roleSystem ||
-			strings.ToLower(strings.TrimSpace(msg.Role)) == roleDeveloper {
-			hasSystem = true
-			break
-		}
-	}
-
-	if !hasSystem {
-		writeChatMLBlock(roleSystem, defaultChatSystemPrompt)
 	}
 
 	for idx, msg := range messages {
@@ -268,9 +236,12 @@ func formatGemmaTurnPrompt(modelHint string, messages []domain.Message, template
 	}
 
 	if !hasSystem {
-		systemParts = append(systemParts, defaultChatSystemPrompt)
+		systemParts = nil
 	}
 
+	// Gemma GGUF chat templates emit bos_token in-band while tokenizer-side
+	// add_bos remains false, so keep Go/C++/Python prompt contracts aligned.
+	sb.WriteString("<bos>")
 	if thinkingEnabled || len(systemParts) > 0 {
 		sb.WriteString(profile.openTag)
 		sb.WriteString(profile.systemRole)

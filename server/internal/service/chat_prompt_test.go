@@ -33,22 +33,25 @@ func TestFormatChatPromptQwenUsesChatML(t *testing.T) {
 	if !strings.Contains(prompt, "<|im_start|>user") {
 		t.Fatalf("expected user chatml block, got %q", prompt)
 	}
-	if !strings.Contains(prompt, "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n") {
-		t.Fatalf("expected default qwen system prompt, got %q", prompt)
+	if strings.Contains(prompt, "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n") {
+		t.Fatalf("expected no implicit qwen system prompt, got %q", prompt)
 	}
 	if !strings.HasSuffix(prompt, "<think>\n") {
 		t.Fatalf("expected qwen thinking preamble, got %q", prompt)
 	}
 }
 
-func TestFormatChatPromptQwenNoThinkingSingleUserFallsBackToRawPrompt(t *testing.T) {
+func TestFormatChatPromptQwenNoThinkingSingleUserKeepsChatML(t *testing.T) {
 	t.Setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false")
 	prompt := FormatChatPrompt("/tmp/Qwen3.5-2B-Q4_K_M.gguf", []domain.Message{
 		{Role: "user", Content: "안녕?"},
 	}, nil)
 
-	if prompt != "안녕?" {
-		t.Fatalf("expected raw qwen prompt fallback when thinking is disabled, got %q", prompt)
+	if !strings.Contains(prompt, "<|im_start|>user\n안녕?<|im_end|>\n") {
+		t.Fatalf("expected qwen unicode prompt to stay in chatml, got %q", prompt)
+	}
+	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") {
+		t.Fatalf("expected qwen closed think scaffold, got %q", prompt)
 	}
 }
 
@@ -85,14 +88,11 @@ func TestFormatChatPromptGemmaUsesTurnTemplate(t *testing.T) {
 		{Role: "user", Content: "안녕?"},
 	}, nil)
 
-	if !strings.Contains(prompt, "<|turn>system\nYou are a helpful assistant.<turn|>\n") {
-		t.Fatalf("expected default gemma system prompt, got %q", prompt)
+	if strings.Contains(prompt, "<|turn>system\nYou are a helpful assistant.<turn|>\n") {
+		t.Fatalf("expected no implicit gemma system prompt, got %q", prompt)
 	}
-	if !strings.Contains(prompt, "<|turn>user\n안녕?<turn|>\n") {
-		t.Fatalf("expected gemma user turn, got %q", prompt)
-	}
-	if !strings.HasSuffix(prompt, "<|turn>model\n") {
-		t.Fatalf("expected gemma model completion cue, got %q", prompt)
+	if prompt != "<bos><|turn>user\n안녕?<turn|>\n<|turn>model\n" {
+		t.Fatalf("expected bare gemma turn template, got %q", prompt)
 	}
 }
 
@@ -116,7 +116,7 @@ func TestFormatChatPromptGemmaThinkingInjectsSystemThinkMarker(t *testing.T) {
 		{Role: "user", Content: "Hello"},
 	}, &domain.ChatTemplateKwargs{EnableThinking: &enableThinking})
 
-	if !strings.HasPrefix(prompt, "<|turn>system\n<|think|>You are a helpful assistant.<turn|>\n<|turn>user\nHello<turn|>\n") {
+	if !strings.HasPrefix(prompt, "<bos><|turn>system\n<|think|><turn|>\n<|turn>user\nHello<turn|>\n") {
 		t.Fatalf("expected gemma thinking marker in system turn, got %q", prompt)
 	}
 }
@@ -127,7 +127,7 @@ func TestFormatChatPromptGemmaFoldsExplicitSystemIntoFirstUserTurn(t *testing.T)
 		{Role: "user", Content: "Hello"},
 	}, nil)
 
-	if !strings.HasPrefix(prompt, "<|turn>system\nYou are terse.<turn|>\n<|turn>user\nHello<turn|>\n") {
+	if !strings.HasPrefix(prompt, "<bos><|turn>system\nYou are terse.<turn|>\n<|turn>user\nHello<turn|>\n") {
 		t.Fatalf("expected explicit gemma system instructions in dedicated system turn, got %q", prompt)
 	}
 }
@@ -138,8 +138,8 @@ func TestFormatChatPromptQwenTemplateKwargsOverrideThinking(t *testing.T) {
 		{Role: "user", Content: "안녕?"},
 	}, &domain.ChatTemplateKwargs{EnableThinking: &enableThinking})
 
-	if prompt != "안녕?" {
-		t.Fatalf("expected raw qwen prompt fallback when template kwargs disable thinking, got %q", prompt)
+	if !strings.Contains(prompt, "<|im_start|>user\n안녕?<|im_end|>\n") {
+		t.Fatalf("expected qwen chatml when template kwargs disable thinking, got %q", prompt)
 	}
 }
 
@@ -150,8 +150,8 @@ func TestFormatChatPromptQwenNoThinkingKeepsChatMLForHistory(t *testing.T) {
 		{Role: "assistant", Content: "안녕하세요."},
 	}, nil)
 
-	if !strings.Contains(prompt, "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n") {
-		t.Fatalf("expected qwen system block for history-bearing prompt, got %q", prompt)
+	if strings.Contains(prompt, "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n") {
+		t.Fatalf("expected no implicit qwen system block, got %q", prompt)
 	}
 	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") {
 		t.Fatalf("expected qwen closed think prefix when history prevents raw fallback, got %q", prompt)

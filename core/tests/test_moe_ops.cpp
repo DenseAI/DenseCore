@@ -8,8 +8,10 @@
 #include "densecore/hal/op_registry.h"
 #include "densecore/hal/operation_graph.h"
 #include "densecore/hal/tensor.h"
+#include "moe/moe_routing.h"
 
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <numeric>
 #include <vector>
@@ -197,6 +199,59 @@ TEST_F(MoEOpsTest, MoEScatterGatherRoundtrip) {
             EXPECT_NEAR(actual, expected, 0.001f)
                 << "Mismatch at token " << b << " dim " << d;
         }
+    }
+}
+
+TEST_F(MoEOpsTest, MoETopKRouteGateLogitsTensorMatchesRawPointer) {
+    const int batch_size = 3;
+    const int num_experts = 4;
+    const int top_k = 2;
+
+    std::vector<float> logits = {
+        0.1f, 2.0f, 1.0f, -1.0f,
+        3.0f, 0.5f, 0.4f, 0.2f,
+        -1.0f, 0.0f, 4.0f, 1.0f,
+    };
+
+    Tensor gate_logits = Tensor::Make2D(logits.data(), batch_size, num_experts);
+
+    moe::MoERouteResult expected;
+    expected.expert_ids.resize(batch_size * top_k);
+    expected.weights.resize(batch_size * top_k);
+    expected.token_indices.resize(batch_size * top_k);
+
+    const size_t workspace_bytes = moe::GetMoERoutingWorkspaceSize(batch_size, num_experts, top_k);
+    std::vector<uint8_t> workspace_storage(workspace_bytes + 64);
+    void* workspace_ptr = workspace_storage.data();
+    const uintptr_t workspace_addr = reinterpret_cast<uintptr_t>(workspace_ptr);
+    const uintptr_t aligned_addr = (workspace_addr + 63u) & ~static_cast<uintptr_t>(63u);
+    moe::MoERoutingWorkspace ws;
+    ASSERT_TRUE(moe::InitMoERoutingWorkspace(&ws, reinterpret_cast<void*>(aligned_addr), workspace_bytes, batch_size,
+                                             num_experts, top_k));
+    ASSERT_TRUE(moe::MoETopKRoute(logits.data(), batch_size, num_experts, top_k, true, &expected, &ws));
+
+    const moe::MoERouteResult alloc_result = moe::MoETopKRoute(gate_logits, top_k);
+    EXPECT_EQ(alloc_result.batch_size, batch_size);
+    EXPECT_EQ(alloc_result.top_k, top_k);
+    EXPECT_EQ(alloc_result.expert_ids, expected.expert_ids);
+    EXPECT_EQ(alloc_result.token_indices, expected.token_indices);
+    ASSERT_EQ(alloc_result.weights.size(), expected.weights.size());
+    for (size_t i = 0; i < alloc_result.weights.size(); ++i) {
+        EXPECT_NEAR(alloc_result.weights[i], expected.weights[i], 1e-6f) << "weight mismatch at " << i;
+    }
+
+    moe::MoERouteResult noalloc_result;
+    noalloc_result.expert_ids.resize(batch_size * top_k);
+    noalloc_result.weights.resize(batch_size * top_k);
+    noalloc_result.token_indices.resize(batch_size * top_k);
+    ASSERT_TRUE(moe::MoETopKRoute(gate_logits, top_k, &noalloc_result, &ws));
+    EXPECT_EQ(noalloc_result.batch_size, batch_size);
+    EXPECT_EQ(noalloc_result.top_k, top_k);
+    EXPECT_EQ(noalloc_result.expert_ids, expected.expert_ids);
+    EXPECT_EQ(noalloc_result.token_indices, expected.token_indices);
+    ASSERT_EQ(noalloc_result.weights.size(), expected.weights.size());
+    for (size_t i = 0; i < noalloc_result.weights.size(); ++i) {
+        EXPECT_NEAR(noalloc_result.weights[i], expected.weights[i], 1e-6f) << "noalloc weight mismatch at " << i;
     }
 }
 

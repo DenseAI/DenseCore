@@ -227,11 +227,12 @@ MoERouteResult MoETopKRoute(const Tensor& gate_logits, int k) {
     if (gate_logits.dtype != DType::F32) {
         throw std::runtime_error("MoE gating currently supports FP32 only");
     }
-    // gate_logits comes from GgmlToTensor which preserves ggml column-major layout:
-    //   shape[0] = ne[0] = n_experts (inner/fastest dimension)
-    //   shape[1] = ne[1] = batch_size (outer dimension)
-    int n_experts = static_cast<int>(gate_logits.shape[0]);
-    int batch_size = static_cast<int>(gate_logits.shape[1]);
+    if (gate_logits.ndim != 2) {
+        throw std::runtime_error("MoE routing expects gate_logits to be 2D");
+    }
+    // DenseCore Tensor uses row-major [batch_size, n_experts] for 2D activations.
+    int batch_size = static_cast<int>(gate_logits.shape[0]);
+    int n_experts = static_cast<int>(gate_logits.shape[1]);
     const float* logits = gate_logits.DataAs<float>();
     return MoETopKRoute(logits, batch_size, n_experts, k, true);
 }
@@ -333,6 +334,56 @@ bool MoETopKRoute(const float* router_logits, int batch_size, int n_experts, int
 
         if (normalize_weights) {
             NormalizeWeights(out_weights, top_k);
+        }
+
+        for (int k_idx = 0; k_idx < top_k; ++k_idx) {
+            result->token_indices[static_cast<size_t>(b) * top_k + k_idx] = b;
+        }
+    }
+
+    return true;
+}
+
+bool MoETopKRouteSigmoid(const float* router_logits, int batch_size, int n_experts, int top_k, MoERouteResult* result,
+                         MoERoutingWorkspace* ws) {
+    if (!router_logits || !result || !ws) {
+        return false;
+    }
+    if (batch_size <= 0 || n_experts <= 0 || top_k <= 0) {
+        return false;
+    }
+    if (ws->max_tokens < batch_size || ws->max_experts < n_experts || ws->max_top_k < top_k) {
+        return false;
+    }
+
+    const int total = batch_size * top_k;
+    if (static_cast<int>(result->expert_ids.size()) != total || static_cast<int>(result->weights.size()) != total ||
+        static_cast<int>(result->token_indices.size()) != total) {
+        return false;
+    }
+
+    result->batch_size = batch_size;
+    result->top_k = top_k;
+
+    for (int b = 0; b < batch_size; ++b) {
+        const float* logits_row = router_logits + static_cast<size_t>(b) * n_experts;
+        int* out_ids = result->expert_ids.data() + static_cast<size_t>(b) * top_k;
+        float* out_weights = result->weights.data() + static_cast<size_t>(b) * top_k;
+
+        // Apply sigmoid independently to each expert logit.
+        // Use numerically stable sigmoid: for x>=0 use 1/(1+e^-x), for x<0 use e^x/(1+e^x).
+        for (int e = 0; e < n_experts; ++e) {
+            const float x = logits_row[e];
+            ws->probs[e] = x >= 0.0f ? 1.0f / (1.0f + std::exp(-x)) : std::exp(x) / (1.0f + std::exp(x));
+        }
+
+        // Select top-k by sigmoid score (weights are NOT renormalized — sigmoid values are independent).
+        TopKSelect(ws->probs, n_experts, top_k, ws->topk_scores, ws->topk_indices);
+
+        const int k = std::min(top_k, n_experts);
+        for (int i = 0; i < k; ++i) {
+            out_ids[i] = ws->topk_indices[i];
+            out_weights[i] = ws->topk_scores[i];
         }
 
         for (int k_idx = 0; k_idx < top_k; ++k_idx) {

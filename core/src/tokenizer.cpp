@@ -12,6 +12,8 @@
 #include <regex>
 #include <unordered_map>
 
+#include "densecore/models/model_descriptor.h"
+
 /**
  * BPE tokenizer implementation.
  *
@@ -171,7 +173,7 @@ bool IsAtomicSpecialTokenLiteral(const TransformerModel* model, const std::strin
     const int token_id = it->second;
     if (token_id >= 0 && token_id < static_cast<int>(model->token_types.size())) {
         const int32_t token_type = model->token_types[static_cast<size_t>(token_id)];
-        if (token_type == 3 || token_type == 4) {
+        if (token_type != 1 && token_type != 6) {
             return true;
         }
     }
@@ -244,34 +246,30 @@ std::string AsciiLowerCopy(std::string s) {
 }
 
 bool UseQwenPretokenizer(const TransformerModel* model) {
-    if (!model) return false;
-    const std::string tokenizer = AsciiLowerCopy(model->tokenizer_type);
-    return tokenizer == "qwen2" || tokenizer == "qwen3" || tokenizer.find("qwen") != std::string::npos;
+    const auto family = densecore::models::ResolveTokenizerFamily(model);
+    return family == densecore::models::TokenizerFamily::QWEN_BYTE_BPE ||
+           family == densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE;
 }
 
 bool UseQwen35Pretokenizer(const TransformerModel* model) {
-    if (!model) return false;
-    const std::string tokenizer = AsciiLowerCopy(model->tokenizer_type);
-    return tokenizer == "qwen35";
+    return densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE;
 }
 
 bool UseGemmaPretokenizer(const TransformerModel* model) {
-    if (!model) return false;
-    if (model->arch == ModelArch::GEMMA) return true;
-    const std::string tokenizer = AsciiLowerCopy(model->tokenizer_type);
-    return tokenizer == "gemma" || tokenizer == "gemma2" || tokenizer == "gemma3" || tokenizer == "gemma4" ||
-           tokenizer.rfind("gemma", 0) == 0;
+    return densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::GEMMA_SENTENCEPIECE;
 }
 
 bool IsByteLevelBpeTokenizer(const TransformerModel* model) {
     if (!model) return false;
 
-    const std::string tokenizer = AsciiLowerCopy(model->tokenizer_type);
-    if (UseGemmaPretokenizer(model)) {
-        return false;
-    }
-    if (tokenizer.find("gpt2") != std::string::npos || tokenizer.find("qwen") != std::string::npos) {
-        return true;
+    switch (densecore::models::ResolveTokenizerFamily(model)) {
+    case densecore::models::TokenizerFamily::GEMMA_SENTENCEPIECE: return false;
+    case densecore::models::TokenizerFamily::GPT2_BYTE_BPE:
+    case densecore::models::TokenizerFamily::QWEN_BYTE_BPE:
+    case densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE:
+    case densecore::models::TokenizerFamily::GLM_BYTE_BPE: return true;
+    case densecore::models::TokenizerFamily::LLAMA_SENTENCEPIECE:
+    case densecore::models::TokenizerFamily::UNKNOWN: break;
     }
 
     // Heuristic fallback for GGUFs that omit tokenizer_type but include byte-BPE merges.
@@ -297,9 +295,11 @@ std::string DetokenizeImpl(const TransformerModel* model, int token_id) {
 
     const std::string& token = model->vocab_tokens[static_cast<size_t>(token_id)];
 
-    if (token_id < static_cast<int>(model->token_types.size()) &&
-        model->token_types[static_cast<size_t>(token_id)] == 3) {
-        return "";
+    if (token_id < static_cast<int>(model->token_types.size())) {
+        const int32_t token_type = model->token_types[static_cast<size_t>(token_id)];
+        if (token_type != 1 && token_type != 6) {
+            return "";
+        }
     }
     if (IsLikelyControlTokenLiteral(token)) {
         return "";

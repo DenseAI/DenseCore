@@ -103,6 +103,14 @@ bool ResolvePagedDecodeHeadDims(const TransformerModel* model, int* n_head_out, 
     if (!model || !n_head_out || !n_head_kv_out || !head_dim_q_out || !head_dim_kv_out) {
         return false;
     }
+    if (!model->gemma4_layer_n_head_kv.empty()) {
+        for (size_t i = 0; i < model->gemma4_layer_n_head_kv.size(); ++i) {
+            const uint32_t layer_n_head_kv = model->gemma4_layer_n_head_kv[i];
+            if (layer_n_head_kv > 0 && layer_n_head_kv != model->hparams.n_head_kv) {
+                return false;
+            }
+        }
+    }
     const int n_head = model->hparams.n_head;
     const int n_head_kv = model->hparams.n_head_kv;
     if (n_head <= 0 || n_head_kv <= 0) {
@@ -384,18 +392,11 @@ bool IsDecodeGraphCacheEnabled() {
 }
 
 bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model) {
-    if (!model) {
-        return false;
-    }
+    return model != nullptr;
+}
 
-    // Hybrid SSM decode graphs capture per-batch recurrent-state pointers in
-    // GGML custom-op userdata. Reusing those graphs across requests keeps stale
-    // `token_seq_ids` / `runtime_states` bindings and corrupts the next decode.
-    if (model->arch_flags.is_hybrid_ssm) {
-        return false;
-    }
-
-    return true;
+bool DoesDecodeGraphCacheRequireRuntimeRebind(const TransformerModel* model) {
+    return model && model->arch_flags.is_hybrid_ssm;
 }
 
 bool IsBatchedPagedDecodeEnabled() {

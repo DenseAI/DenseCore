@@ -792,9 +792,10 @@ void EngineLoop(EngineState* state) {
                         LOG_INFO("Cancelling active request: {}", req->id);
                         req->finished = true;
                         state->metrics.failed_requests++;
-                        // Push cancellation event to callback queue (instead of direct
-                        // callback)
-                        emit_result_event(req, "Error: Request cancelled", -1, true, true);
+                        // Treat cooperative cancellation as a silent terminal event so
+                        // stop-marker driven early exits do not leak an error string
+                        // into user-visible output.
+                        emit_result_event(req, "", -1, true, true);
                         // Defer scheduler removal to avoid lock-order inversion
                         if (req->seq_id >= 0) {
                             cancelled_seq_ids.push_back(req->seq_id);
@@ -1768,16 +1769,35 @@ void EngineLoop(EngineState* state) {
                 auto it = decode_graph_cache.find(decode_graph_key);
                 if (it != decode_graph_cache.end() && it->second.graph && it->second.output && it->second.embd_inp &&
                     it->second.pos) {
-                    touch_decode_graph_entry(&it->second);
-                    gf = it->second.graph;
-                    output = it->second.output;
-                    embd_inp = it->second.embd_inp;
-                    pos = it->second.pos;
-                    cached_graph_verified_paged_decode_op = it->second.verified_paged_decode_op;
-                    reused_decode_graph = true;
-                    using_cached_decode_graph = true;
-                    if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
-                        GetDecodeWorkerStats().graph_cache_hits.fetch_add(1, std::memory_order_relaxed);
+                    bool rebind_ok = true;
+                    if (DoesDecodeGraphCacheRequireRuntimeRebind(current_model)) {
+                        rebind_ok = RebindHybridSSMDecodeGraphRuntimeState(it->second.graph, batch);
+                        if (!rebind_ok) {
+                            if (IsDebugGraphLoggingEnabled()) {
+                                std::cerr << "[DecodeGraphCache] evicting hybrid SSM cached graph after runtime "
+                                             "rebind failure"
+                                          << " (bs=" << decode_graph_key.batch_size
+                                          << ", threads=" << decode_graph_key.threads << ")" << std::endl;
+                            }
+                            decode_graph_lru.erase(it->second.lru_it);
+                            free_decode_graph_entry(&it->second);
+                            decode_graph_cache.erase(it);
+                        }
+                    }
+                    if (!rebind_ok) {
+                        // Fall back to rebuilding below.
+                    } else {
+                        touch_decode_graph_entry(&it->second);
+                        gf = it->second.graph;
+                        output = it->second.output;
+                        embd_inp = it->second.embd_inp;
+                        pos = it->second.pos;
+                        cached_graph_verified_paged_decode_op = it->second.verified_paged_decode_op;
+                        reused_decode_graph = true;
+                        using_cached_decode_graph = true;
+                        if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
+                            GetDecodeWorkerStats().graph_cache_hits.fetch_add(1, std::memory_order_relaxed);
+                        }
                     }
                 }
             }
@@ -1850,6 +1870,16 @@ void EngineLoop(EngineState* state) {
                                                 << " (bs=" << decode_graph_key.batch_size
                                                 << ", threads=" << decode_graph_key.threads << ")" << std::endl;
                                         }
+                                    }
+                                }
+                                if (cache_entry_admissible && DoesDecodeGraphCacheRequireRuntimeRebind(current_model) &&
+                                    !RebindHybridSSMDecodeGraphRuntimeState(candidate.graph, batch)) {
+                                    cache_entry_admissible = false;
+                                    if (IsDebugGraphLoggingEnabled()) {
+                                        std::cerr << "[DecodeGraphCache] skip cache insert: hybrid SSM runtime "
+                                                     "rebind probe failed"
+                                                  << " (bs=" << decode_graph_key.batch_size
+                                                  << ", threads=" << decode_graph_key.threads << ")" << std::endl;
                                     }
                                 }
                                 if (cache_entry_admissible) {
@@ -2901,6 +2931,32 @@ void EngineLoop(EngineState* state) {
                     if (req->finished || IsStopTokenId(current_model, best_token) ||
                         req->generated_count >= req->max_tokens) {
                         req->finished = true;
+                        if (!req_bench_fast_path && !req->utf8_pending.empty() &&
+                            (req->callback || req->token_result_callback)) {
+                            const size_t emit_len = Utf8ValidPrefixLength(req->utf8_pending);
+                            if (emit_len > 0) {
+                                std::string tail(req->utf8_pending.data(), emit_len);
+                                if (!req->json_mode && IsReasoningTagSuppressionEnabled()) {
+                                    const bool may_contain_tag =
+                                        req->in_think_block || req->in_tool_call_block || req->in_tool_response_block ||
+                                        !req->think_tag_pending.empty() || !req->tool_call_tag_pending.empty() ||
+                                        !req->tool_response_tag_pending.empty() || tail.find('<') != std::string::npos;
+                                    if (may_contain_tag) {
+                                        SuppressTaggedBlock(&tail, &req->in_think_block, &req->think_tag_pending,
+                                                            "<think>", "</think>");
+                                        SuppressTaggedBlock(&tail, &req->in_tool_call_block,
+                                                            &req->tool_call_tag_pending, "<tool_call>", "</tool_call>");
+                                        SuppressTaggedBlock(&tail, &req->in_tool_response_block,
+                                                            &req->tool_response_tag_pending, "<tool_response>",
+                                                            "</tool_response>");
+                                    }
+                                }
+                                if (!tail.empty() || req->token_result_callback) {
+                                    emit_result_event(req, tail, best_token, false, false);
+                                }
+                            }
+                            req->utf8_pending.clear();
+                        }
                         // Decode graph cache is keyed by batch shape/threading, not request ID.
                         state->metrics.completed_requests++;
                         // Push finished signal to callback queue (instead of direct

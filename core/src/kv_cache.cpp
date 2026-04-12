@@ -137,22 +137,45 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
     cache->index_head_dim = model->arch_flags.is_glm_dsa ? model->glm_index_head_dim : 0;
     cache->n_head_kv = model->hparams.n_head_kv;
     cache->n_layer = model->hparams.n_layer;
+    cache->layer_n_head_kv.assign(static_cast<size_t>(cache->n_layer), std::max(1, cache->n_head_kv));
     cache->layer_head_dims.assign(static_cast<size_t>(cache->n_layer), cache->head_dim);
     cache->layer_v_head_dims.assign(static_cast<size_t>(cache->n_layer), cache->v_head_dim);
     if (model->arch_flags.is_gemma4) {
-        const int full_k =
+        int max_layer_n_head_kv = std::max(1, cache->n_head_kv);
+        if (!model->gemma4_layer_n_head_kv.empty()) {
+            for (int layer = 0; layer < cache->n_layer; ++layer) {
+                const int layer_n_head_kv =
+                    (layer < static_cast<int>(model->gemma4_layer_n_head_kv.size()) &&
+                     model->gemma4_layer_n_head_kv[static_cast<size_t>(layer)] > 0)
+                        ? static_cast<int>(model->gemma4_layer_n_head_kv[static_cast<size_t>(layer)])
+                        : std::max(1, cache->n_head_kv);
+                cache->layer_n_head_kv[static_cast<size_t>(layer)] = layer_n_head_kv;
+                max_layer_n_head_kv = std::max(max_layer_n_head_kv, layer_n_head_kv);
+            }
+            cache->n_head_kv = max_layer_n_head_kv;
+        }
+
+        const int full_k_total =
             model->gemma4_key_length_full > 0 ? static_cast<int>(model->gemma4_key_length_full) : cache->head_dim;
-        const int full_v =
+        const int full_v_total =
             model->gemma4_value_length_full > 0 ? static_cast<int>(model->gemma4_value_length_full) : cache->v_head_dim;
-        const int swa_k = model->gemma4_key_length_swa > 0 ? static_cast<int>(model->gemma4_key_length_swa) : full_k;
-        const int swa_v =
-            model->gemma4_value_length_swa > 0 ? static_cast<int>(model->gemma4_value_length_swa) : full_v;
+        const int swa_k_total =
+            model->gemma4_key_length_swa > 0 ? static_cast<int>(model->gemma4_key_length_swa) : full_k_total;
+        const int swa_v_total =
+            model->gemma4_value_length_swa > 0 ? static_cast<int>(model->gemma4_value_length_swa) : full_v_total;
         for (int layer = 0; layer < cache->n_layer; ++layer) {
             const bool is_sliding = layer < static_cast<int>(model->gemma4_layer_is_sliding.size()) &&
                                     model->gemma4_layer_is_sliding[static_cast<size_t>(layer)] != 0;
-            cache->layer_head_dims[static_cast<size_t>(layer)] = is_sliding ? swa_k : full_k;
-            cache->layer_v_head_dims[static_cast<size_t>(layer)] = is_sliding ? swa_v : full_v;
+            const int layer_n_head_kv = std::max(1, cache->layer_n_head_kv[static_cast<size_t>(layer)]);
+            const int layer_k_total = is_sliding ? swa_k_total : full_k_total;
+            const int layer_v_total = is_sliding ? swa_v_total : full_v_total;
+            cache->layer_head_dims[static_cast<size_t>(layer)] =
+                layer_k_total > 0 ? std::max(1, layer_k_total / layer_n_head_kv) : cache->head_dim;
+            cache->layer_v_head_dims[static_cast<size_t>(layer)] =
+                layer_v_total > 0 ? std::max(1, layer_v_total / layer_n_head_kv) : cache->v_head_dim;
         }
+        cache->head_dim = *std::max_element(cache->layer_head_dims.begin(), cache->layer_head_dims.end());
+        cache->v_head_dim = *std::max_element(cache->layer_v_head_dims.begin(), cache->layer_v_head_dims.end());
     }
     cache->cache_type = type;
     cache->numa_node_id = numa_node_id;

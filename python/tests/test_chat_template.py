@@ -31,7 +31,7 @@ def test_format_chat_prompt_gemma_uses_turn_tags():
         [{"role": "user", "content": "안녕?"}],
     )
 
-    assert prompt == "<|turn>user\n안녕?<turn|>\n<|turn>model\n"
+    assert prompt == "<bos><|turn>user\n안녕?<turn|>\n<|turn>model\n"
 
 
 def test_format_chat_prompt_generic_transcript_fallback():

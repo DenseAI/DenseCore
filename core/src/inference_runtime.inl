@@ -808,7 +808,7 @@ void cb_kv_manage(struct ggml_tensor* dst, const struct ggml_tensor* src, int it
     if (!batch) return;
 
     const int head_dim = ud->head_dim_kv;
-    const int n_head_kv = ud->cache->n_head_kv;
+    const int n_head_kv = ud->cache->GetHeadCountForLayer(ud->layer);
     if (head_dim <= 0 || n_head_kv <= 0) return;
 
     const int N = static_cast<int>(batch->tokens.size());
@@ -928,7 +928,7 @@ void cb_kv_write_only(struct ggml_tensor* dst, const struct ggml_tensor* src, in
     if (!batch) return;
 
     const int head_dim = ud->head_dim_kv;
-    const int n_head_kv = ud->cache->n_head_kv;
+    const int n_head_kv = ud->cache->GetHeadCountForLayer(ud->layer);
     if (head_dim <= 0 || n_head_kv <= 0) return;
 
     const int N = static_cast<int>(batch->tokens.size());
@@ -969,7 +969,7 @@ void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, v
 
     const struct ggml_tensor* src = dst->src[0];
     const int head_dim = ud->head_dim_kv;
-    const int n_head_kv = ud->cache->n_head_kv;
+    const int n_head_kv = ud->cache->GetHeadCountForLayer(ud->layer);
     if (head_dim <= 0 || n_head_kv <= 0) return;
 
     const int N = static_cast<int>(batch->tokens.size());
@@ -977,7 +977,10 @@ void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, v
     const int n_past = n_total - N;
     if (N < 0 || n_total < 0 || n_past < 0) return;
 
-    if (N > 0) {
+    const bool read_only_shared_kv = ud->read_only_shared_kv;
+    const int history_tokens = read_only_shared_kv ? n_total : n_past;
+
+    if (N > 0 && !read_only_shared_kv) {
         const int tokens_per_thread = (N + nth - 1) / nth;
         const int t_start = ith * tokens_per_thread;
         const int t_end = std::min(t_start + tokens_per_thread, N);
@@ -987,20 +990,21 @@ void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, v
         }
     }
 
-    if (n_past > 0) {
+    if (history_tokens > 0) {
         const int seq_id = batch->seq_id.empty() ? -1 : batch->seq_id[0];
         const bool has_valid_seq = (seq_id >= 0 && seq_id < static_cast<int>(batch->block_tables.size()));
         const auto* block_table = has_valid_seq ? &batch->block_tables[seq_id] : nullptr;
         const KVRetentionPolicy& retention_policy = GetKVRetentionPolicy();
         KVRetentionSpan retained_history;
         if (has_valid_seq && seq_id < static_cast<int>(batch->n_past.size())) {
-            const int seq_n_past = std::max(0, batch->n_past[static_cast<size_t>(seq_id)]);
+            const int seq_n_past = read_only_shared_kv ? history_tokens
+                                                       : std::max(0, batch->n_past[static_cast<size_t>(seq_id)]);
             retained_history = ComputeKVRetentionSpan(seq_n_past, retention_policy);
         }
 
-        const int tokens_per_thread = (n_past + nth - 1) / nth;
+        const int tokens_per_thread = (history_tokens + nth - 1) / nth;
         const int t_start = ith * tokens_per_thread;
-        const int t_end = std::min(t_start + tokens_per_thread, n_past);
+        const int t_end = std::min(t_start + tokens_per_thread, history_tokens);
         std::vector<float> packed;
         const size_t head_block_size = static_cast<size_t>(head_dim) * static_cast<size_t>(n_head_kv);
         packed.reserve(static_cast<size_t>(std::max(1, BLOCK_SIZE)) * head_block_size);
@@ -1047,7 +1051,7 @@ void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, v
         }
     }
 
-    if (N > 0) {
+    if (N > 0 && !read_only_shared_kv) {
         const int tokens_per_thread = (N + nth - 1) / nth;
         const int t_start = ith * tokens_per_thread;
         const int t_end = std::min(t_start + tokens_per_thread, N);

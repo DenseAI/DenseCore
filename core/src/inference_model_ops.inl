@@ -242,7 +242,7 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
         w.w3 = {nullptr, 0};
         w.hidden_dim = 0;
         w.intermediate_dim = 0;
-        w.use_gelu_activation = IsGemma4MoEModel(model, layer);
+        w.use_gelu_activation = densecore::models::IsGemma4MoEModel(model, layer);
 
         auto* gw1 = layer->GetExpert(i, model_keys::kFfnGate);
         if (gw1) {
@@ -609,7 +609,9 @@ static bool RouteMoEGemma4TopK(const struct ggml_tensor* gate_logits, const MoEU
                                                  batch_size, n_experts, top_k)) {
         return false;
     }
-    if (!densecore::moe::MoETopKRoute(logits, batch_size, n_experts, top_k, true, routing, &ws)) {
+    // Gemma4 MoE uses sigmoid routing: sigmoid applied independently to each expert
+    // logit, with top-k selected by sigmoid score (weights not renormalized).
+    if (!densecore::moe::MoETopKRouteSigmoid(logits, batch_size, n_experts, top_k, routing, &ws)) {
         return false;
     }
 
@@ -653,7 +655,7 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     thread_local densecore::moe::MoERouteResult routing;
     const bool routed = (ud->model && ud->model->arch_flags.is_glm_moe)
                             ? RouteMoEGroupedSigmoid(src1, ud, &routing)
-                        : IsGemma4MoEModel(ud->model, ud->layer) ? RouteMoEGemma4TopK(src1, ud, &routing)
+                        : densecore::models::IsGemma4MoEModel(ud->model, ud->layer) ? RouteMoEGemma4TopK(src1, ud, &routing)
                                                                  : RouteMoESoftmaxTopK(src1, ud, &routing);
     if (!routed || routing.expert_ids.empty()) return;
     const auto route_end = debug_stage_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

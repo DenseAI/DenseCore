@@ -16,6 +16,7 @@
 #include <thread>
 #include <unordered_set>
 
+#include "densecore/models/model_descriptor.h"
 #include "densecore/models/model_graph_bridge.h"  // Universal graph execution bridge
 #include "hardware_topology.h"
 #include "inference.h"  // For InitRoPETable
@@ -196,65 +197,13 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
     std::cout << "[DenseCore] Detected architecture: " << arch << std::endl;
 
-    std::string arch_lower = arch;
-    std::transform(arch_lower.begin(), arch_lower.end(), arch_lower.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    // Set architecture enum and flags from detected string
-    if (arch_lower == "llama") {
-        model->arch = ModelArch::LLAMA;
-    } else if (arch_lower == "qwen2" || arch_lower == "qwen2.5") {
-        model->arch = ModelArch::QWEN2;
-    } else if (arch_lower == "qwen35" || arch_lower == "qwen3.5" || arch_lower == "qwen35moe" ||
-               arch_lower == "qwen35_moe" || arch_lower == "qwen3.5_moe" || arch_lower == "qwen3_5_moe" ||
-               arch_lower == "qwen3_5_moe_text") {
-        model->arch = ModelArch::QWEN35;
-        model->arch_flags.is_hybrid_ssm = true;
-        model->arch_flags.requires_q_norm = true;
-        model->arch_flags.requires_k_norm = true;
-    } else if (arch_lower == "qwen3" || arch_lower == "qwen3_moe" || arch_lower == "qwen3moe") {
-        model->arch = ModelArch::QWEN3;
-        model->arch_flags.requires_q_norm = true;
-        model->arch_flags.requires_k_norm = true;
-    } else if (arch_lower == "glm4_moe" || arch_lower == "glm4moe" || arch_lower == "glm4.5" ||
-               arch_lower == "glm-4.5" || arch_lower == "glm4") {
-        model->arch = ModelArch::GLM4_MOE;
-        model->arch_flags.is_glm_moe = true;
-    } else if (arch_lower == "glm_moe_dsa" || arch_lower == "glm5_dsa" || arch_lower == "glm5" ||
-               arch_lower == "glm-5") {
-        model->arch = ModelArch::GLM5_DSA;
-        model->arch_flags.is_glm_moe = true;
-        model->arch_flags.is_glm_dsa = true;
-    } else if (arch_lower == "mistral") {
-        model->arch = ModelArch::MISTRAL;
-    } else if (arch_lower == "gemma" || arch_lower == "gemma2" || arch_lower == "gemma4" ||
-               arch_lower == "gemma4_text") {
-        model->arch = ModelArch::GEMMA;
-        model->arch_flags.is_gemma4 = (arch_lower == "gemma4" || arch_lower == "gemma4_text");
-        model->arch_flags.uses_unit_offset_rms_norm = !model->arch_flags.is_gemma4;
-        if (model->arch_flags.is_gemma4) {
-            model->arch_flags.requires_q_norm = true;
-            model->arch_flags.requires_k_norm = true;
-        }
-    } else if (arch_lower == "phi" || arch_lower == "phi3") {
-        model->arch = ModelArch::PHI;
-        // Vision Architectures
-    } else if (arch_lower == "vit" || arch_lower == "vision_transformer") {
-        model->arch = ModelArch::VIT;
-    } else if (arch_lower == "clip" || arch_lower == "clip_vision") {
-        model->arch = ModelArch::CLIP_VISION;
-    } else if (arch_lower == "siglip") {
-        model->arch = ModelArch::SIGLIP;
-        // Audio Architectures
-    } else if (arch_lower == "whisper") {
-        model->arch = ModelArch::WHISPER;
-        // Multimodal Architectures
-    } else if (arch_lower == "llava") {
-        model->arch = ModelArch::LLAVA;
-    } else if (arch_lower == "qwen_vl" || arch_lower == "qwen2_vl") {
-        model->arch = ModelArch::QWEN_VL;
-    } else {
+    const auto resolved_arch = densecore::models::ResolveModelDescriptor(arch);
+    model->arch = resolved_arch.arch;
+    model->variant = resolved_arch.variant;
+    model->arch_flags = resolved_arch.arch_flags;
+    if (!resolved_arch.known) {
         model->arch = ModelArch::UNKNOWN;
+        model->variant = ModelVariant::UNKNOWN;
         std::cerr << "[DenseCore] Warning: Unknown architecture '" << arch << "'. Model may not load correctly."
                   << std::endl;
     }
@@ -290,9 +239,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
     const bool has_gemma4_kv_array = gemma4_head_count_kv_type == GGUF_TYPE_ARRAY;
 
     if (!tokenizer_type.empty()) {
-        const std::vector<std::string> supported = {"llama", "gpt2",   "qwen2", "qwen3", "qwen35", "mistral",
-                                                    "gemma", "gemma4", "bpe",   "glm4",  "glm"};
-        if (std::find(supported.begin(), supported.end(), tokenizer_lower) == supported.end()) {
+        if (!densecore::models::IsKnownTokenizerModel(tokenizer_lower)) {
             std::cerr << "[DenseCore] Warning: tokenizer model '" << tokenizer_type
                       << "' may not be fully compatible. Consider using external tokenization and input_ids."
                       << std::endl;
@@ -553,6 +500,10 @@ TransformerModel* LoadGGUFModel(const char* path) {
         model->gemma4_hidden_size_per_layer_input = static_cast<int>(tmp_u32);
 
         get_f32("attention_logit_cap", model->gemma4_attention_logit_softcapping);
+        // Gemma4 text model does NOT use attention logit softcapping per the HF
+        // reference (self.scaling = 1.0, no tanh capping). Only the audio encoder
+        // uses softcap=50. If the GGUF omits the key, keep 0.0 (disabled).
+        // GGUFs that explicitly set the key will still use the stored value.
         get_f32("final_logit_softcapping", model->gemma4_final_logit_softcapping);
 
         std::vector<uint8_t> sliding_pattern;
@@ -1000,14 +951,16 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
 
         // If token_type is available, harvest known end/control markers.
-        if (model->token_types.size() == model->vocab_tokens.size()) {
-            for (size_t i = 0; i < model->token_types.size(); ++i) {
-                if (model->token_types[i] != 3) continue;  // control
-                const std::string& tok = model->vocab_tokens[i];
-                if (tok.find("im_end") != std::string::npos || tok.find("eot") != std::string::npos ||
-                    tok.find("eom") != std::string::npos || tok.find("endoftext") != std::string::npos) {
-                    add_stop_id(static_cast<int32_t>(i));
-                }
+        // GGUF is supposed to keep token_type aligned with tokens, but some
+        // Gemma4 exports in the wild have partial metadata. Use the overlap we
+        // have instead of dropping stop-id detection entirely.
+        const size_t token_type_count = std::min(model->token_types.size(), model->vocab_tokens.size());
+        for (size_t i = 0; i < token_type_count; ++i) {
+            if (model->token_types[i] != 3) continue;  // control
+            const std::string& tok = model->vocab_tokens[i];
+            if (tok.find("im_end") != std::string::npos || tok.find("eot") != std::string::npos ||
+                tok.find("eom") != std::string::npos || tok.find("endoftext") != std::string::npos) {
+                add_stop_id(static_cast<int32_t>(i));
             }
         }
 
@@ -1604,6 +1557,43 @@ TransformerModel* LoadGGUFModel(const char* path) {
             model->hparams.n_rot = static_cast<uint32_t>(model->glm_qk_rope_head_dim);
         }
     }
+    if (model->arch_flags.is_gemma4 && model->gemma4_layer_n_head_kv.empty()) {
+        std::vector<uint32_t> inferred_layer_n_head_kv(static_cast<size_t>(model->hparams.n_layer),
+                                                       std::max<uint32_t>(1u, model->hparams.n_head_kv));
+        bool inferred_any = false;
+        uint32_t max_inferred_n_head_kv = std::max<uint32_t>(1u, model->hparams.n_head_kv);
+        for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+            auto* wk_i = model->layers[i].Get(model_keys::kAttnKWeight);
+            auto* wv_i = model->layers[i].Get(model_keys::kAttnVWeight);
+            auto* k_norm_i = model->layers[i].Get(model_keys::kAttnKNorm);
+            const bool is_sliding = i < model->gemma4_layer_is_sliding.size() &&
+                                    model->gemma4_layer_is_sliding[static_cast<size_t>(i)] != 0;
+            uint32_t target_head_dim = (k_norm_i && k_norm_i->ne[0] > 0) ? static_cast<uint32_t>(k_norm_i->ne[0])
+                                                                         : (is_sliding ? model->gemma4_key_length_swa
+                                                                                       : model->gemma4_key_length_full);
+            uint32_t inferred_layer_heads = inferred_layer_n_head_kv[static_cast<size_t>(i)];
+            if (target_head_dim > 0) {
+                if (wk_i && wk_i->ne[1] > 0 && (wk_i->ne[1] % target_head_dim) == 0) {
+                    inferred_layer_heads =
+                        std::max<uint32_t>(inferred_layer_heads, static_cast<uint32_t>(wk_i->ne[1] / target_head_dim));
+                }
+                if (wv_i && wv_i->ne[1] > 0 && (wv_i->ne[1] % target_head_dim) == 0) {
+                    inferred_layer_heads =
+                        std::max<uint32_t>(inferred_layer_heads, static_cast<uint32_t>(wv_i->ne[1] / target_head_dim));
+                }
+            }
+            inferred_layer_heads = std::max<uint32_t>(1u, inferred_layer_heads);
+            inferred_layer_n_head_kv[static_cast<size_t>(i)] = inferred_layer_heads;
+            max_inferred_n_head_kv = std::max(max_inferred_n_head_kv, inferred_layer_heads);
+            inferred_any = inferred_any || inferred_layer_heads != model->hparams.n_head_kv;
+        }
+        if (inferred_any) {
+            model->gemma4_layer_n_head_kv = std::move(inferred_layer_n_head_kv);
+            model->hparams.n_head_kv = max_inferred_n_head_kv;
+            std::cout << "[DenseCore] Gemma4: inferred per-layer KV head counts from weight/norm shapes"
+                      << " (max n_head_kv=" << model->hparams.n_head_kv << ")" << std::endl;
+        }
+    }
     if (!model->gemma4_layer_n_head_kv.empty()) {
         uint32_t max_head_k = 0;
         uint32_t max_head_v = 0;
@@ -1624,9 +1614,18 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 // Gemma4 omits V on some layers; use K width as the fallback.
                 max_head_v = std::max(max_head_v, static_cast<uint32_t>(wk_i->ne[1] / layer_n_head_kv));
             }
+            const bool is_sliding = i < model->gemma4_layer_is_sliding.size() &&
+                                    model->gemma4_layer_is_sliding[static_cast<size_t>(i)] != 0;
+            const uint32_t meta_key_len = is_sliding ? model->gemma4_key_length_swa : model->gemma4_key_length_full;
+            const uint32_t meta_value_len =
+                is_sliding ? model->gemma4_value_length_swa : model->gemma4_value_length_full;
+            if (meta_key_len > 0) {
+                max_head_k = std::max(max_head_k, meta_key_len / layer_n_head_kv);
+            }
+            if (meta_value_len > 0) {
+                max_head_v = std::max(max_head_v, meta_value_len / layer_n_head_kv);
+            }
         }
-        max_head_k = std::max(max_head_k, std::max(model->gemma4_key_length_full, model->gemma4_key_length_swa));
-        max_head_v = std::max(max_head_v, std::max(model->gemma4_value_length_full, model->gemma4_value_length_swa));
         if (max_head_k > 0) model->hparams.n_embd_head_k = max_head_k;
         if (max_head_v > 0) model->hparams.n_embd_head_v = max_head_v;
     } else if (model->arch_flags.is_gemma4) {

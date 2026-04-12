@@ -50,6 +50,26 @@ enum class ModelArch : uint8_t {
     QWEN_VL,  // Qwen-VL (LLM + Vision)
 };
 
+enum class ModelVariant : uint8_t {
+    UNKNOWN = 0,
+    LLAMA,
+    QWEN2,
+    QWEN3,
+    QWEN35,
+    GLM4_MOE,
+    GLM5_DSA,
+    MISTRAL,
+    GEMMA,
+    GEMMA4,
+    PHI,
+    VIT,
+    CLIP_VISION,
+    SIGLIP,
+    WHISPER,
+    LLAVA,
+    QWEN_VL,
+};
+
 // Architecture-specific feature flags
 // These flags enable explicit checks instead of implicit null-pointer guards
 struct ModelArchFlags {
@@ -433,6 +453,7 @@ struct TransformerModel {
 
     // Architecture detection (for arch-specific code paths and validation)
     ModelArch arch = ModelArch::UNKNOWN;
+    ModelVariant variant = ModelVariant::UNKNOWN;
     ModelArchFlags arch_flags;
 
     // SSM parameters (populated when arch_flags.is_hybrid_ssm = true)

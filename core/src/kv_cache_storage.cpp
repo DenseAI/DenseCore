@@ -270,6 +270,13 @@ void PagedKVCache::RestoreBlocksFromHost(const std::vector<int>& block_ids, cons
 bool PagedKVCache::IsQuantized() const {
     return ggml_is_quantized(cache_type);
 }
+int PagedKVCache::GetHeadCountForLayer(int layer) const {
+    if (layer >= 0 && layer < static_cast<int>(layer_n_head_kv.size()) &&
+        layer_n_head_kv[static_cast<size_t>(layer)] > 0) {
+        return layer_n_head_kv[static_cast<size_t>(layer)];
+    }
+    return n_head_kv;
+}
 int PagedKVCache::GetHeadDimForLayer(int layer) const {
     if (layer >= 0 && layer < static_cast<int>(layer_head_dims.size()) &&
         layer_head_dims[static_cast<size_t>(layer)] > 0) {
@@ -291,16 +298,17 @@ int PagedKVCache::GetVElementsPerSlot() const {
     return v_head_dim * n_head_kv;
 }
 int PagedKVCache::GetElementsPerSlot(int layer) const {
-    return GetHeadDimForLayer(layer) * n_head_kv;
+    return GetHeadDimForLayer(layer) * GetHeadCountForLayer(layer);
 }
 int PagedKVCache::GetVElementsPerSlot(int layer) const {
-    return GetVHeadDimForLayer(layer) * n_head_kv;
+    return GetVHeadDimForLayer(layer) * GetHeadCountForLayer(layer);
 }
 
 void PagedKVCache::WriteKSlot(int block_id, int layer, int slot, const float* data) {
     void* ptr = GetKSlotPtr(block_id, layer, slot);
     if (!ptr) return;
 
+    const int layer_n_head_kv = GetHeadCountForLayer(layer);
     const int layer_head_dim = GetHeadDimForLayer(layer);
     const int n = GetElementsPerSlot(layer);
     const int storage_n = GetElementsPerSlot();
@@ -318,7 +326,9 @@ void PagedKVCache::WriteKSlot(int block_id, int layer, int slot, const float* da
             const float* src_head = data + static_cast<size_t>(h) * static_cast<size_t>(layer_head_dim);
             void* dst_head = dst + static_cast<size_t>(h) * head_stride;
             std::fill(padded_head.begin(), padded_head.end(), 0.0f);
-            std::memcpy(padded_head.data(), src_head, static_cast<size_t>(layer_head_dim) * sizeof(float));
+            if (h < layer_n_head_kv) {
+                std::memcpy(padded_head.data(), src_head, static_cast<size_t>(layer_head_dim) * sizeof(float));
+            }
             ggml_quantize_chunk(cache_type, padded_head.data(), dst_head, 0, 1, head_dim, nullptr);
         }
     } else {
@@ -334,6 +344,7 @@ void PagedKVCache::WriteVSlot(int block_id, int layer, int slot, const float* da
     void* ptr = GetVSlotPtr(block_id, layer, slot);
     if (!ptr) return;
 
+    const int layer_n_head_kv = GetHeadCountForLayer(layer);
     const int layer_head_dim = GetVHeadDimForLayer(layer);
     const int n = GetVElementsPerSlot(layer);
     const int storage_n = GetVElementsPerSlot();
@@ -351,7 +362,9 @@ void PagedKVCache::WriteVSlot(int block_id, int layer, int slot, const float* da
             const float* src_head = data + static_cast<size_t>(h) * static_cast<size_t>(layer_head_dim);
             void* dst_head = dst + static_cast<size_t>(h) * head_stride;
             std::fill(padded_head.begin(), padded_head.end(), 0.0f);
-            std::memcpy(padded_head.data(), src_head, static_cast<size_t>(layer_head_dim) * sizeof(float));
+            if (h < layer_n_head_kv) {
+                std::memcpy(padded_head.data(), src_head, static_cast<size_t>(layer_head_dim) * sizeof(float));
+            }
             ggml_quantize_chunk(cache_type, padded_head.data(), dst_head, 0, 1, v_head_dim, nullptr);
         }
     } else {
@@ -373,6 +386,7 @@ void PagedKVCache::ReadKSlot(int block_id, int layer, int slot, float* out) cons
     const void* ptr = const_cast<PagedKVCache*>(this)->GetKSlotPtr(block_id, layer, slot);
     if (!ptr) return;
 
+    const int layer_n_head_kv = GetHeadCountForLayer(layer);
     const int layer_head_dim = GetHeadDimForLayer(layer);
     const int n = GetElementsPerSlot(layer);
     if (cache_type == GGML_TYPE_F16) {
@@ -382,7 +396,7 @@ void PagedKVCache::ReadKSlot(int block_id, int layer, int slot, float* out) cons
         const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(head_dim));
         const auto* src = static_cast<const uint8_t*>(ptr);
         std::vector<float> tmp_head(static_cast<size_t>(head_dim), 0.0f);
-        for (int h = 0; h < n_head_kv; ++h) {
+        for (int h = 0; h < layer_n_head_kv; ++h) {
             const void* src_head = src + static_cast<size_t>(h) * head_stride;
             float* out_head = out + static_cast<size_t>(h) * static_cast<size_t>(layer_head_dim);
             type_traits->to_float(src_head, tmp_head.data(), head_dim);
@@ -397,6 +411,7 @@ void PagedKVCache::ReadVSlot(int block_id, int layer, int slot, float* out) cons
     const void* ptr = const_cast<PagedKVCache*>(this)->GetVSlotPtr(block_id, layer, slot);
     if (!ptr) return;
 
+    const int layer_n_head_kv = GetHeadCountForLayer(layer);
     const int layer_head_dim = GetVHeadDimForLayer(layer);
     const int n = GetVElementsPerSlot(layer);
     if (cache_type == GGML_TYPE_F16) {
@@ -406,7 +421,7 @@ void PagedKVCache::ReadVSlot(int block_id, int layer, int slot, float* out) cons
         const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(v_head_dim));
         const auto* src = static_cast<const uint8_t*>(ptr);
         std::vector<float> tmp_head(static_cast<size_t>(v_head_dim), 0.0f);
-        for (int h = 0; h < n_head_kv; ++h) {
+        for (int h = 0; h < layer_n_head_kv; ++h) {
             const void* src_head = src + static_cast<size_t>(h) * head_stride;
             float* out_head = out + static_cast<size_t>(h) * static_cast<size_t>(layer_head_dim);
             type_traits->to_float(src_head, tmp_head.data(), v_head_dim);
@@ -425,6 +440,15 @@ void PagedKVCache::ReadIndexSlot(int block_id, int layer, int slot, float* out) 
 
 void PagedKVCache::WriteKSlots(int block_id, int layer, int start_slot, int num_slots, const float* data) {
     if (num_slots <= 0 || !data || start_slot < 0 || start_slot + num_slots > BLOCK_SIZE) return;
+    const int layer_n_head_kv = GetHeadCountForLayer(layer);
+    const int layer_head_dim = GetHeadDimForLayer(layer);
+    if (layer_n_head_kv != n_head_kv || layer_head_dim != head_dim) {
+        const int elems_per_slot = GetElementsPerSlot(layer);
+        for (int i = 0; i < num_slots; ++i) {
+            WriteKSlot(block_id, layer, start_slot + i, data + static_cast<size_t>(i) * elems_per_slot);
+        }
+        return;
+    }
     if (!UseKVBulkSlotPath()) {
         const int elems_per_slot = GetElementsPerSlot(layer);
         for (int i = 0; i < num_slots; ++i) {
@@ -449,7 +473,6 @@ void PagedKVCache::WriteKSlots(int block_id, int layer, int start_slot, int num_
         return;
     }
     if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
-        const int layer_head_dim = GetHeadDimForLayer(layer);
         const int64_t total_rows = static_cast<int64_t>(num_slots) * static_cast<int64_t>(n_head_kv);
         if (layer_head_dim == head_dim) {
             ggml_quantize_chunk(cache_type, data, ptr, 0, total_rows, head_dim, nullptr);
@@ -474,6 +497,15 @@ void PagedKVCache::WriteKSlots(int block_id, int layer, int start_slot, int num_
 
 void PagedKVCache::WriteVSlots(int block_id, int layer, int start_slot, int num_slots, const float* data) {
     if (num_slots <= 0 || !data || start_slot < 0 || start_slot + num_slots > BLOCK_SIZE) return;
+    const int layer_n_head_kv = GetHeadCountForLayer(layer);
+    const int layer_head_dim = GetVHeadDimForLayer(layer);
+    if (layer_n_head_kv != n_head_kv || layer_head_dim != v_head_dim) {
+        const int elems_per_slot = GetVElementsPerSlot(layer);
+        for (int i = 0; i < num_slots; ++i) {
+            WriteVSlot(block_id, layer, start_slot + i, data + static_cast<size_t>(i) * elems_per_slot);
+        }
+        return;
+    }
     if (!UseKVBulkSlotPath()) {
         const int elems_per_slot = GetVElementsPerSlot(layer);
         for (int i = 0; i < num_slots; ++i) {
@@ -498,7 +530,6 @@ void PagedKVCache::WriteVSlots(int block_id, int layer, int start_slot, int num_
         return;
     }
     if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
-        const int layer_head_dim = GetVHeadDimForLayer(layer);
         const int64_t total_rows = static_cast<int64_t>(num_slots) * static_cast<int64_t>(n_head_kv);
         if (layer_head_dim == v_head_dim) {
             ggml_quantize_chunk(cache_type, data, ptr, 0, total_rows, v_head_dim, nullptr);
@@ -524,6 +555,15 @@ void PagedKVCache::WriteVSlots(int block_id, int layer, int start_slot, int num_
 
 void PagedKVCache::ReadKSlots(int block_id, int layer, int start_slot, int num_slots, float* out) const {
     if (num_slots <= 0 || !out || start_slot < 0 || start_slot + num_slots > BLOCK_SIZE) return;
+    const int layer_n_head_kv = GetHeadCountForLayer(layer);
+    const int layer_head_dim = GetHeadDimForLayer(layer);
+    if (layer_n_head_kv != n_head_kv || layer_head_dim != head_dim) {
+        const int elems_per_slot = GetElementsPerSlot(layer);
+        for (int i = 0; i < num_slots; ++i) {
+            ReadKSlot(block_id, layer, start_slot + i, out + static_cast<size_t>(i) * elems_per_slot);
+        }
+        return;
+    }
     if (!UseKVBulkSlotPath()) {
         const int elems_per_slot = GetElementsPerSlot(layer);
         for (int i = 0; i < num_slots; ++i) {
@@ -548,7 +588,6 @@ void PagedKVCache::ReadKSlots(int block_id, int layer, int start_slot, int num_s
         const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(head_dim));
         const auto* src = static_cast<const uint8_t*>(ptr);
         const int total_rows = num_slots * n_head_kv;
-        const int layer_head_dim = GetHeadDimForLayer(layer);
         std::vector<float> tmp_head(static_cast<size_t>(head_dim), 0.0f);
         for (int row = 0; row < total_rows; ++row) {
             type_traits->to_float(src + static_cast<size_t>(row) * head_stride, tmp_head.data(), head_dim);
@@ -562,6 +601,15 @@ void PagedKVCache::ReadKSlots(int block_id, int layer, int start_slot, int num_s
 
 void PagedKVCache::ReadVSlots(int block_id, int layer, int start_slot, int num_slots, float* out) const {
     if (num_slots <= 0 || !out || start_slot < 0 || start_slot + num_slots > BLOCK_SIZE) return;
+    const int layer_n_head_kv = GetHeadCountForLayer(layer);
+    const int layer_head_dim = GetVHeadDimForLayer(layer);
+    if (layer_n_head_kv != n_head_kv || layer_head_dim != v_head_dim) {
+        const int elems_per_slot = GetVElementsPerSlot(layer);
+        for (int i = 0; i < num_slots; ++i) {
+            ReadVSlot(block_id, layer, start_slot + i, out + static_cast<size_t>(i) * elems_per_slot);
+        }
+        return;
+    }
     if (!UseKVBulkSlotPath()) {
         const int elems_per_slot = GetVElementsPerSlot(layer);
         for (int i = 0; i < num_slots; ++i) {
@@ -586,7 +634,6 @@ void PagedKVCache::ReadVSlots(int block_id, int layer, int start_slot, int num_s
         const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(v_head_dim));
         const auto* src = static_cast<const uint8_t*>(ptr);
         const int total_rows = num_slots * n_head_kv;
-        const int layer_head_dim = GetVHeadDimForLayer(layer);
         std::vector<float> tmp_head(static_cast<size_t>(v_head_dim), 0.0f);
         for (int row = 0; row < total_rows; ++row) {
             type_traits->to_float(src + static_cast<size_t>(row) * head_stride, tmp_head.data(), v_head_dim);
