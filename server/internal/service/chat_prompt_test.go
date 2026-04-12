@@ -47,11 +47,11 @@ func TestFormatChatPromptQwenNoThinkingSingleUserKeepsChatML(t *testing.T) {
 		{Role: "user", Content: "안녕?"},
 	}, nil)
 
-	if !strings.Contains(prompt, "<|im_start|>user\n안녕?<|im_end|>\n") {
+	if !strings.Contains(prompt, "<|im_start|>user\n안녕? /no_think<|im_end|>\n") {
 		t.Fatalf("expected qwen unicode prompt to stay in chatml, got %q", prompt)
 	}
-	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") {
-		t.Fatalf("expected qwen closed think scaffold, got %q", prompt)
+	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n") {
+		t.Fatalf("expected qwen assistant generation cue without think scaffold, got %q", prompt)
 	}
 }
 
@@ -61,8 +61,11 @@ func TestFormatChatPromptQwenNoThinkingAsciiPromptKeepsChatML(t *testing.T) {
 		{Role: "user", Content: "hello"},
 	}, nil)
 
-	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") {
-		t.Fatalf("expected ascii qwen prompt to keep closed-think chatml scaffold, got %q", prompt)
+	if !strings.Contains(prompt, "<|im_start|>user\nhello /no_think<|im_end|>\n") {
+		t.Fatalf("expected ascii qwen prompt to inject /no_think, got %q", prompt)
+	}
+	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n") {
+		t.Fatalf("expected ascii qwen prompt to end with assistant generation cue, got %q", prompt)
 	}
 }
 
@@ -138,7 +141,7 @@ func TestFormatChatPromptQwenTemplateKwargsOverrideThinking(t *testing.T) {
 		{Role: "user", Content: "안녕?"},
 	}, &domain.ChatTemplateKwargs{EnableThinking: &enableThinking})
 
-	if !strings.Contains(prompt, "<|im_start|>user\n안녕?<|im_end|>\n") {
+	if !strings.Contains(prompt, "<|im_start|>user\n안녕? /no_think<|im_end|>\n") {
 		t.Fatalf("expected qwen chatml when template kwargs disable thinking, got %q", prompt)
 	}
 }
@@ -153,8 +156,8 @@ func TestFormatChatPromptQwenNoThinkingKeepsChatMLForHistory(t *testing.T) {
 	if strings.Contains(prompt, "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n") {
 		t.Fatalf("expected no implicit qwen system block, got %q", prompt)
 	}
-	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") {
-		t.Fatalf("expected qwen closed think prefix when history prevents raw fallback, got %q", prompt)
+	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n") {
+		t.Fatalf("expected qwen history prompt to end with assistant generation cue, got %q", prompt)
 	}
 }
 

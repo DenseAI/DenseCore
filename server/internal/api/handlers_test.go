@@ -73,6 +73,10 @@ func (m *MockEngine) CountTokens(text string, addBOS bool, addEOS bool) (int, er
 	return count, nil
 }
 
+func (m *MockEngine) GetTokenizerType() string { return "" }
+
+func (m *MockEngine) GetChatTemplate() string { return "" }
+
 func (m *MockEngine) Close() {}
 
 func (m *MockEngine) CancelRequest(reqID uintptr) {}

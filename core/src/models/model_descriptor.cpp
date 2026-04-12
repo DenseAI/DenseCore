@@ -273,11 +273,86 @@ const ModelDescriptor& DescribeModel(const TransformerModel* model) {
     return DescribeModelVariant(InferVariantFromModel(model));
 }
 
+TokenizerFamily ResolveTokenizerFamilyFromMetadata(std::string_view tokenizer_type) {
+    const std::string lowered = AsciiLower(tokenizer_type);
+    if (lowered.empty()) {
+        return TokenizerFamily::UNKNOWN;
+    }
+    if (lowered.find("qwen35") != std::string::npos || lowered.find("qwen3.5") != std::string::npos) {
+        return TokenizerFamily::QWEN35_UNICODE_BPE;
+    }
+    if (lowered.find("qwen") != std::string::npos) {
+        return TokenizerFamily::QWEN_BYTE_BPE;
+    }
+    if (lowered.find("gemma") != std::string::npos) {
+        return TokenizerFamily::GEMMA_SENTENCEPIECE;
+    }
+    if (lowered.find("llama") != std::string::npos || lowered.find("sentencepiece") != std::string::npos ||
+        lowered.find("spm") != std::string::npos) {
+        return TokenizerFamily::LLAMA_SENTENCEPIECE;
+    }
+    if (lowered.find("gpt2") != std::string::npos || lowered == "bpe") {
+        return TokenizerFamily::GPT2_BYTE_BPE;
+    }
+    if (lowered.find("glm") != std::string::npos) {
+        return TokenizerFamily::GLM_BYTE_BPE;
+    }
+    return TokenizerFamily::UNKNOWN;
+}
+
+PromptTemplateFamily ResolvePromptTemplateFamilyFromMetadata(std::string_view tokenizer_type,
+                                                             std::string_view chat_template) {
+    const std::string tokenizer_lower = AsciiLower(tokenizer_type);
+    const std::string template_lower = AsciiLower(chat_template);
+
+    if (template_lower.find("<|im_start|>") != std::string::npos ||
+        template_lower.find("<|im_end|>") != std::string::npos) {
+        return PromptTemplateFamily::CHATML;
+    }
+    if (template_lower.find("<|turn>") != std::string::npos || template_lower.find("<turn|>") != std::string::npos) {
+        return PromptTemplateFamily::TURN_TAGS;
+    }
+    if (template_lower.find("<|assistant|>") != std::string::npos ||
+        template_lower.find("<|user|>") != std::string::npos) {
+        return PromptTemplateFamily::ROLE_TAGS;
+    }
+
+    const TokenizerFamily tokenizer_family = ResolveTokenizerFamilyFromMetadata(tokenizer_lower);
+    switch (tokenizer_family) {
+    case TokenizerFamily::QWEN_BYTE_BPE:
+    case TokenizerFamily::QWEN35_UNICODE_BPE: return PromptTemplateFamily::CHATML;
+    case TokenizerFamily::GEMMA_SENTENCEPIECE:
+        if (tokenizer_lower.find("gemma4") != std::string::npos) {
+            return PromptTemplateFamily::TURN_TAGS;
+        }
+        return PromptTemplateFamily::PLAIN;
+    case TokenizerFamily::LLAMA_SENTENCEPIECE: return PromptTemplateFamily::ROLE_TAGS;
+    case TokenizerFamily::GPT2_BYTE_BPE:
+    case TokenizerFamily::GLM_BYTE_BPE:
+    case TokenizerFamily::UNKNOWN:
+    default: return PromptTemplateFamily::PLAIN;
+    }
+}
+
 TokenizerFamily ResolveTokenizerFamily(const TransformerModel* model) {
+    if (model) {
+        const TokenizerFamily metadata_family = ResolveTokenizerFamilyFromMetadata(model->tokenizer_type);
+        if (metadata_family != TokenizerFamily::UNKNOWN) {
+            return metadata_family;
+        }
+    }
     return DescribeModel(model).tokenizer_family;
 }
 
 PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model) {
+    if (model) {
+        const PromptTemplateFamily metadata_family =
+            ResolvePromptTemplateFamilyFromMetadata(model->tokenizer_type, model->chat_template);
+        if (metadata_family != PromptTemplateFamily::PLAIN || !model->chat_template.empty() ||
+            !model->tokenizer_type.empty()) {
+            return metadata_family;
+        }
+    }
     return DescribeModel(model).prompt_template_family;
 }
 

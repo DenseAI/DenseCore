@@ -139,6 +139,14 @@ def gemma_thinking_enabled(enable_thinking: Optional[bool]) -> bool:
     return bool(enable_thinking)
 
 
+def append_qwen_no_think_directive(content: str) -> str:
+    if "/no_think" in content or "/nothink" in content:
+        return content
+    if content and not content[-1].isspace():
+        content += " "
+    return content + "/no_think"
+
+
 def _normalize_content(content: str) -> str:
     return content.strip()
 
@@ -310,6 +318,11 @@ def format_chat_prompt(
     if profile.family == "qwen":
         thinking_enabled = qwen_thinking_enabled(model_hint, enable_thinking)
         parts: list[str] = []
+        last_user_index = -1
+        for index, message in enumerate(normalized_messages):
+            role = str(message.get("role", "user")).strip().lower()
+            if role == "user":
+                last_user_index = index
         for index, message in enumerate(normalized_messages):
             role = str(message.get("role", "user")).strip().lower()
             if role == "system":
@@ -321,6 +334,8 @@ def format_chat_prompt(
                         )
             elif role == "user":
                 content = _render_qwen_content(message, profile)
+                if content and not thinking_enabled and index == last_user_index:
+                    content = append_qwen_no_think_directive(content)
                 if content:
                     parts.append(f"{profile.open_tag}user\n{content}{profile.close_tag}")
             elif role == "assistant":
@@ -333,7 +348,7 @@ def format_chat_prompt(
                 content = _render_qwen_tool_response(message, profile)
                 if content:
                     parts.append(f"{profile.open_tag}user\n{content}{profile.close_tag}")
-        assistant_prefix = "<think>\n" if thinking_enabled else "<think>\n\n</think>\n\n"
+        assistant_prefix = "<think>\n" if thinking_enabled else ""
         parts.append(f"{profile.open_tag}{profile.assistant_role}\n{assistant_prefix}")
         return "".join(parts)
 

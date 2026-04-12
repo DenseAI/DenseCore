@@ -539,7 +539,7 @@ func (h *Handler) countChatPromptTokens(req domain.ChatCompletionRequest) int {
 	if len(req.InputIDs) > 0 {
 		return len(req.InputIDs)
 	}
-	return h.countSingleTextTokens(service.FormatChatPrompt(h.modelService.GetCurrentModel(), req.Messages, req.ChatTemplateKwargs), true, false)
+	return h.countSingleTextTokens(service.BuildChatPrompt(h.modelService.GetCurrentModel(), req.Messages, req.ChatTemplateKwargs), true, false)
 }
 
 func (h *Handler) countTextTokens(texts []string, addBOS bool, addEOS bool) int {

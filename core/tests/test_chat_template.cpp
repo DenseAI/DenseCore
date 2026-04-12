@@ -51,9 +51,35 @@ TEST(ChatTemplateTest, QwenNoThinkingAutoTemplateKeepsChatMLScaffoldForUnicodePr
 
     EXPECT_EQ(wrapped,
               "<|im_start|>user\n"
-              "안녕?<|im_end|>\n"
-              "<|im_start|>assistant\n"
-              "<think>\n\n</think>\n\n");
+              "안녕? /no_think<|im_end|>\n"
+              "<|im_start|>assistant\n");
+}
+
+TEST(ChatTemplateTest, Qwen35DefaultsToNoThinkingWhenEnvIsUnset) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+
+    EXPECT_EQ(wrapped,
+              "<|im_start|>user\n"
+              "hello /no_think<|im_end|>\n"
+              "<|im_start|>assistant\n");
+}
+
+TEST(ChatTemplateTest, Qwen3DefaultsToThinkingWhenEnvIsUnset) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN3;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    unsetenv("DENSECORE_QWEN3_ENABLE_THINKING");
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+
+    EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
 }
 
 TEST(ChatTemplateTest, GemmaThinkingAutoTemplateInjectsThinkSystemTurn) {

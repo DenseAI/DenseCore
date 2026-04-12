@@ -110,6 +110,13 @@ static struct ggml_tensor* BuildAttentionMaskTensor(struct ggml_context* ctx, in
     return mask;
 }
 
+static bool ShouldBuildExplicitStandardAttentionMask(int n_queries, int sliding_window) {
+    // Decode with a sliding-window still needs an explicit mask even when N == 1.
+    // Otherwise the standard fallback path attends to stale history that Gemma4
+    // sliding layers are supposed to exclude.
+    return n_queries > 1 || sliding_window >= 0;
+}
+
 static const InferenceConfig& ResolveInferenceConfig(const BatchSpec* batch) {
     if (batch && batch->deps && batch->deps->config) {
         return *batch->deps->config;
@@ -1193,6 +1200,19 @@ struct DecodePagedDecision {
     DecodePagedFallbackReason reason = DecodePagedFallbackReason::None;
 };
 
+struct BasePagedDecodeExecutionDecision {
+    DecodePagedDecision paged_decode_decision{};
+    bool paged_decode_supported = false;
+    bool decode_only_batch = false;
+    bool force_batched_decode_path = false;
+    bool use_paged_decode_attention = false;
+    int n_past_val = 0;
+};
+
+#ifdef DENSECORE_TEST_BUILD
+static std::atomic<int> g_test_force_flash_attention_disabled{0};
+#endif
+
 static DecodePagedDecision EvaluatePagedDecodeDecision(const DecodePagedAttentionPolicy& policy,
                                                        const TransformerModel* model, const PagedKVCache* cache,
                                                        const BatchSpec& batch, int n_tokens_in_batch, int n_head,
@@ -1251,7 +1271,43 @@ static DecodePagedDecision EvaluatePagedDecodeDecision(const DecodePagedAttentio
     return decision;
 }
 
+static BasePagedDecodeExecutionDecision
+ResolveBasePagedDecodeExecutionDecision(const DecodePagedAttentionPolicy& policy, const TransformerModel* model,
+                                        const PagedKVCache* cache, const BatchSpec& batch, int n_tokens_in_batch,
+                                        int n_head, int n_head_kv, int head_dim_q, int head_dim_kv) {
+    BasePagedDecodeExecutionDecision decision;
+    const bool use_cache = (cache != nullptr);
+    if (use_cache && batch.num_seqs > 0 && !batch.n_past.empty()) {
+        const KVRetentionPolicy& retention_policy = GetKVRetentionPolicy();
+        for (int n_past_i : batch.n_past) {
+            decision.n_past_val =
+                std::max(decision.n_past_val, ComputeKVRetentionSpan(n_past_i, retention_policy).history_kept);
+        }
+    }
+
+    decision.paged_decode_decision = EvaluatePagedDecodeDecision(policy, model, cache, batch, n_tokens_in_batch, n_head,
+                                                                 n_head_kv, head_dim_q, head_dim_kv);
+    decision.paged_decode_supported = densecore::models::SupportsPagedDecodeAttention(model);
+    decision.decode_only_batch = IsDecodeOnlyBatchLayoutImpl(batch, n_tokens_in_batch);
+    // For decode-only N>1 this preserves a policy-approved paged decode
+    // choice across later local dispatch branches. It must not upgrade a
+    // batch from mere shape/cache candidacy into paged decode when policy
+    // explicitly disabled the path or auto-mode declined it.
+    decision.force_batched_decode_path = decision.paged_decode_supported && use_cache && decision.decode_only_batch &&
+                                         n_tokens_in_batch > 1 && decision.paged_decode_decision.requested;
+    decision.use_paged_decode_attention = decision.paged_decode_decision.requested && decision.paged_decode_supported;
+    if (decision.force_batched_decode_path) {
+        decision.use_paged_decode_attention = true;
+    }
+    return decision;
+}
+
 static bool IsFlashAttentionDisabled() {
+#ifdef DENSECORE_TEST_BUILD
+    if (g_test_force_flash_attention_disabled.load(std::memory_order_relaxed) != 0) {
+        return true;
+    }
+#endif
     static const bool disabled = []() {
         if (ParseRuntimeToggleMode("DENSECORE_FLASH_ATTN_MODE", RuntimeToggleMode::Auto) == RuntimeToggleMode::Off) {
             return true;
@@ -2769,6 +2825,25 @@ struct AttentionCoreReferenceUserData {
     const char* var_name = nullptr;
 };
 
+#ifdef DENSECORE_TEST_BUILD
+static std::atomic<int> g_test_capture_attention_layer{-1};
+static std::vector<float>* g_test_capture_attention_out = nullptr;
+
+static void cb_test_capture_attention_tensor(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                             void* userdata) {
+    (void)nth;
+    (void)userdata;
+    if (!dst || !src || !dst->data || !src->data) return;
+    std::memcpy(dst->data, src->data, ggml_nbytes(src));
+    if (ith != 0 || !g_test_capture_attention_out || src->type != GGML_TYPE_F32) {
+        return;
+    }
+    const int elems = static_cast<int>(ggml_nelements(src));
+    g_test_capture_attention_out->resize(static_cast<size_t>(elems));
+    std::memcpy(g_test_capture_attention_out->data(), src->data, static_cast<size_t>(elems) * sizeof(float));
+}
+#endif
+
 
 // ============================================================================
 // SSM Delta Callback Helper logic
@@ -3878,40 +3953,29 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 struct ggml_tensor* V_all = Vcur;  // Default to current V
 
                 const bool use_cache = (cache != nullptr);
-                int n_past_val = 0;
-                if (use_cache && batch.num_seqs > 0 && batch.n_past.size() > 0) {
-                    const KVRetentionPolicy& retention_policy = GetKVRetentionPolicy();
-                    for (int n_past_i : batch.n_past) {
-                        n_past_val =
-                            std::max(n_past_val, ComputeKVRetentionSpan(n_past_i, retention_policy).history_kept);
-                    }
-                }
+                const BasePagedDecodeExecutionDecision base_paged_decode = ResolveBasePagedDecodeExecutionDecision(
+                    decode_paged_policy, model, cache, batch, N, n_head, n_head_kv, head_dim_q, head_dim_kv);
+                const int n_past_val = base_paged_decode.n_past_val;
                 attn_ref_n_past = n_past_val;
                 const int n_total_tokens = n_past_val + N;
-                const DecodePagedDecision paged_decode_decision = EvaluatePagedDecodeDecision(
-                    decode_paged_policy, model, cache, batch, N, n_head, n_head_kv, head_dim_q, head_dim_kv);
+                const DecodePagedDecision paged_decode_decision = base_paged_decode.paged_decode_decision;
                 const bool paged_decode_candidate = paged_decode_decision.candidate;
                 const bool requested_paged_decode_attention = paged_decode_decision.requested;
-                const bool decode_only_batch = decode_only_batch_layout;
+                const bool decode_only_batch = base_paged_decode.decode_only_batch;
                 const int kv_cache_layer = densecore::models::Gemma4KVSourceLayer(model, il);
 
                 // Safety override: GGML's generic decode matmul path can become numerically
                 // unstable for GQA decode (N=1, n_head != n_head_kv) on some CPU kernels.
                 // Force the custom paged decode attention path for correctness in this case.
-                const bool disable_paged_decode_for_gemma4 = model->arch_flags.is_gemma4;
-                const bool force_safe_gqa_decode = !disable_paged_decode_for_gemma4 && IsForceSafeGqaDecodeEnabled() &&
-                                                   use_cache && paged_decode_candidate && N == 1 && n_past_val > 0 &&
-                                                   n_head_kv > 0 && n_head > n_head_kv && (n_head % n_head_kv == 0) &&
-                                                   (head_dim_q == head_dim_kv) && batch.num_seqs == 1 &&
-                                                   !batch.seq_id.empty();
-                // For decode-only batched scheduling (N>1), force paged decode when the
-                // batch layout is a valid paged candidate. The legacy non-paged batched
-                // path is not sequence-isolated and can introduce cross-sequence drift.
-                const bool force_batched_decode_path =
-                    use_cache && decode_only_batch && N > 1 && paged_decode_candidate;
-
-                bool use_paged_decode_attention = requested_paged_decode_attention && !disable_paged_decode_for_gemma4;
-                if (disable_paged_decode_for_gemma4 && requested_paged_decode_attention) {
+                const bool paged_decode_supported = base_paged_decode.paged_decode_supported;
+                const bool disable_paged_decode_for_model = !paged_decode_supported;
+                const bool force_safe_gqa_decode =
+                    paged_decode_supported && IsForceSafeGqaDecodeEnabled() && use_cache && paged_decode_candidate &&
+                    N == 1 && n_past_val > 0 && n_head_kv > 0 && n_head > n_head_kv && (n_head % n_head_kv == 0) &&
+                    (head_dim_q == head_dim_kv) && batch.num_seqs == 1 && !batch.seq_id.empty();
+                const bool force_batched_decode_path = base_paged_decode.force_batched_decode_path;
+                bool use_paged_decode_attention = base_paged_decode.use_paged_decode_attention;
+                if (disable_paged_decode_for_model && requested_paged_decode_attention) {
                     static bool logged_gemma4_paged_decode_disable = false;
                     if (!logged_gemma4_paged_decode_disable) {
                         std::cerr << "[DenseCore] Disabling paged decode attention for Gemma4; "
@@ -3941,6 +4005,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     const int cache_type = cache ? static_cast<int>(cache->cache_type) : -1;
                     const DecodeContextSummary context_summary = SummarizeDecodeContext(batch, N);
                     std::cerr << "[PagedDecode] mode=" << mode << " candidate=" << (paged_decode_candidate ? "1" : "0")
+                              << " supported=" << (paged_decode_supported ? "1" : "0")
                               << " use=" << (use_paged_decode_attention ? "1" : "0") << " N=" << N
                               << " n_past=" << n_past_val << " n_head=" << n_head << " n_head_kv=" << n_head_kv
                               << " head_dim_q=" << head_dim_q << " cache_type=" << cache_type
@@ -3948,6 +4013,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                               << " ctx_avg=" << (context_summary.valid ? context_summary.avg_context : -1)
                               << " ctx_max=" << (context_summary.valid ? context_summary.max_context : -1)
                               << " reason=" << DecodePagedFallbackReasonName(paged_decode_decision.reason) << std::endl;
+                    if (!paged_decode_supported && decode_only_batch && N > 1 && paged_decode_candidate) {
+                        std::cerr << "[DecodeAttentionPath] N=" << N << " path=standard reason=model_veto_paged_decode"
+                                  << std::endl;
+                    }
                 }
 
                 if (use_cache && !use_paged_decode_attention) {
@@ -4245,6 +4314,13 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                     RecordDecodePagedFallbackReason(paged_decode_decision.reason, il, N);
                 }
 
+#ifndef NDEBUG
+                if (model->arch_flags.is_gemma4 && use_paged_decode_attention) {
+                    throw densecore::InvalidArgumentException(
+                        "Decode attention invariant failed: Gemma4 must not execute paged decode attention.");
+                }
+#endif
+
                 const DecodeAttentionPathKind attention_path_kind =
                     use_paged_decode_attention ? DecodeAttentionPathKind::Paged
                                                : (use_hal_attention_dispatch ? DecodeAttentionPathKind::Hal
@@ -4454,9 +4530,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                             KQ = ggml_scale(ctx_c, KQ, model->gemma4_attention_logit_softcapping);
                         }
 
-                        // Causal/sliding mask (prefill only)
-                        if (N > 1) {
-                            if (model->arch_flags.is_gemma4 && fast_attn_sliding_window >= 0) {
+                        if (ShouldBuildExplicitStandardAttentionMask(N, fast_attn_sliding_window)) {
+                            if (fast_attn_sliding_window >= 0) {
                                 struct ggml_tensor* KQ_mask = BuildAttentionMaskTensor(
                                     ctx_c, n_total_tokens, N, n_past_val, fast_attn_sliding_window);
                                 KQ = ggml_add(ctx_c, KQ, KQ_mask);
@@ -4521,6 +4596,11 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 KQV_merged = ggml_map_custom3(ctx_c, KQV_merged, Qcur, attn_ref_k, cb_attention_core_reference_probe, 1,
                                               attn_ref_ud);
             }
+#ifdef DENSECORE_TEST_BUILD
+            if (g_test_capture_attention_layer.load(std::memory_order_relaxed) == il) {
+                KQV_merged = ggml_map_custom1(ctx_c, KQV_merged, cb_test_capture_attention_tensor, 1, nullptr);
+            }
+#endif
             if ((il == 1 || il == 3 || il == 4) && IsDebugInferenceStatsEnabled()) {
                 auto cb_check_kqv = [](struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
                                        void* ud) {
@@ -5317,7 +5397,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
         final_ref_ud->var_name = "logits";
         cur = ggml_map_custom1(ctx_c, cur, cb_projection_reference_probe, 1, final_ref_ud);
     }
-    if (model->arch_flags.is_gemma4 && model->gemma4_final_logit_softcapping > 0.0f) {
+    if (model->arch_flags.is_gemma4 && model->gemma4_final_logit_softcapping > 0.0f &&
+        !densecore::models::IsGemma4FinalLogitSoftcapDisabled()) {
         const float inv_softcap = 1.0f / model->gemma4_final_logit_softcapping;
         cur = ggml_scale(ctx_c, cur, inv_softcap);
         cur = ggml_tanh(ctx_c, cur);
@@ -5404,6 +5485,229 @@ bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchS
 #ifdef DENSECORE_TEST_BUILD
 namespace densecore {
 namespace testing {
+namespace {
+class ScopedAttentionCaptureGuard {
+public:
+    ScopedAttentionCaptureGuard(std::vector<float>* out, int layer)
+        : previous_out_(g_test_capture_attention_out),
+          previous_layer_(g_test_capture_attention_layer.load(std::memory_order_relaxed)) {
+        g_test_capture_attention_out = out;
+        g_test_capture_attention_layer.store(layer, std::memory_order_relaxed);
+    }
+
+    ~ScopedAttentionCaptureGuard() {
+        g_test_capture_attention_layer.store(previous_layer_, std::memory_order_relaxed);
+        g_test_capture_attention_out = previous_out_;
+    }
+
+private:
+    std::vector<float>* previous_out_;
+    int previous_layer_;
+};
+}  // namespace
+
+bool ShouldUsePagedDecodeAttentionForBatchTest(const TransformerModel* model, const PagedKVCache* cache,
+                                               const BatchSpec& batch) {
+    if (!model) {
+        return false;
+    }
+    const int n_tokens_in_batch = static_cast<int>(batch.tokens.size());
+    const int n_head = static_cast<int>(model->hparams.n_head);
+    const int n_head_kv = static_cast<int>(model->hparams.n_head_kv);
+    if (n_head <= 0 || n_head_kv <= 0) {
+        return false;
+    }
+    const int head_dim_q = static_cast<int>(model->hparams.n_embd) / n_head;
+    const int head_dim_kv =
+        model->hparams.n_embd_head_k > 0 ? static_cast<int>(model->hparams.n_embd_head_k) : head_dim_q;
+    const BasePagedDecodeExecutionDecision decision =
+        ::ResolveBasePagedDecodeExecutionDecision(::LoadDecodePagedAttentionPolicy(), model, cache, batch,
+                                                  n_tokens_in_batch, n_head, n_head_kv, head_dim_q, head_dim_kv);
+    return decision.use_paged_decode_attention;
+}
+std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float>& q, const std::vector<float>& k,
+                                                         const std::vector<float>& v, int n_head, int n_head_kv,
+                                                         int head_dim_q, int head_dim_k, int head_dim_v, int n_queries,
+                                                         int n_total_tokens, int n_past, int sliding_window,
+                                                         float scale, float logit_softcap) {
+    if (n_head <= 0 || n_head_kv <= 0 || head_dim_q <= 0 || head_dim_k <= 0 || head_dim_v <= 0 || n_queries <= 0 ||
+        n_total_tokens <= 0 || (n_head % n_head_kv) != 0) {
+        return {};
+    }
+    if (static_cast<int>(q.size()) != n_queries * n_head * head_dim_q ||
+        static_cast<int>(k.size()) != n_total_tokens * n_head_kv * head_dim_k ||
+        static_cast<int>(v.size()) != n_total_tokens * n_head_kv * head_dim_v) {
+        return {};
+    }
+
+    const bool use_explicit_mask = ::ShouldBuildExplicitStandardAttentionMask(n_queries, sliding_window);
+    const int n_rep = n_head / n_head_kv;
+    std::vector<float> out(static_cast<size_t>(n_queries) * static_cast<size_t>(n_head) * head_dim_v, 0.0f);
+    std::vector<float> scores(static_cast<size_t>(n_total_tokens), -std::numeric_limits<float>::infinity());
+
+    for (int token_idx = 0; token_idx < n_queries; ++token_idx) {
+        const int query_pos = n_past + token_idx;
+        for (int h = 0; h < n_head; ++h) {
+            const int kv_head = h / n_rep;
+            const float* q_head = q.data() + (static_cast<size_t>(token_idx) * n_head + h) * head_dim_q;
+            float* out_head = out.data() + (static_cast<size_t>(token_idx) * n_head + h) * head_dim_v;
+            float max_score = -std::numeric_limits<float>::infinity();
+
+            for (int k_idx = 0; k_idx < n_total_tokens; ++k_idx) {
+                bool masked = false;
+                if (use_explicit_mask) {
+                    if (sliding_window >= 0 && k_idx < (query_pos - sliding_window)) {
+                        masked = true;
+                    }
+                    if (n_queries > 1 && k_idx > query_pos) {
+                        masked = true;
+                    }
+                }
+                if (masked) {
+                    scores[static_cast<size_t>(k_idx)] = -std::numeric_limits<float>::infinity();
+                    continue;
+                }
+
+                const float* k_head = k.data() + (static_cast<size_t>(k_idx) * n_head_kv + kv_head) * head_dim_k;
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim_q; ++d) {
+                    dot += q_head[d] * k_head[d];
+                }
+                float score = dot * scale;
+                if (logit_softcap > 0.0f && std::isfinite(score)) {
+                    score = std::tanh(score / logit_softcap) * logit_softcap;
+                }
+                scores[static_cast<size_t>(k_idx)] = score;
+                max_score = std::max(max_score, score);
+            }
+
+            if (!std::isfinite(max_score)) {
+                continue;
+            }
+
+            float denom = 0.0f;
+            for (int k_idx = 0; k_idx < n_total_tokens; ++k_idx) {
+                const float score = scores[static_cast<size_t>(k_idx)];
+                if (!std::isfinite(score)) {
+                    continue;
+                }
+                const float weight = std::exp(score - max_score);
+                denom += weight;
+                const float* v_head = v.data() + (static_cast<size_t>(k_idx) * n_head_kv + kv_head) * head_dim_v;
+                for (int d = 0; d < head_dim_v; ++d) {
+                    out_head[d] += weight * v_head[d];
+                }
+            }
+
+            if (denom > 0.0f) {
+                const float inv = 1.0f / denom;
+                for (int d = 0; d < head_dim_v; ++d) {
+                    out_head[d] *= inv;
+                }
+            }
+        }
+    }
+
+    return out;
+}
+static std::vector<float> ExecuteTransformerGraphForTestImpl(TransformerModel* model, PagedKVCache* cache,
+                                                             const BatchSpec& batch, int num_threads,
+                                                             bool embedding_mode) {
+    if (!model) {
+        return {};
+    }
+
+    std::unique_ptr<InferenceWorkContext, void (*)(InferenceWorkContext*)> work_ctx(CreateInferenceWorkContext(),
+                                                                                    DestroyInferenceWorkContext);
+    if (!work_ctx) {
+        return {};
+    }
+
+    SetCurrentWorkContext(work_ctx.get());
+    ResetInferenceWorkContext(work_ctx.get());
+    SetCurrentBatch(&batch);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/32ull * 1024ull * 1024ull,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/false,
+    };
+    struct ggml_context* ctx = ggml_init(params);
+    if (!ctx) {
+        SetCurrentWorkContext(nullptr);
+        return {};
+    }
+
+    std::vector<float> logits;
+    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 32768, false);
+    struct ggml_tensor* output = BuildTransformerGraph(model, cache, ctx, batch, embedding_mode, gf, nullptr, nullptr);
+    if (output) {
+        if (ggml_graph_n_nodes(gf) == 0) {
+            ggml_build_forward_expand(gf, output);
+        }
+        ggml_graph_compute_with_ctx(ctx, gf, std::max(1, num_threads));
+        if (output->data && output->type == GGML_TYPE_F32) {
+            const int rows = static_cast<int>(output->ne[0]);
+            const int cols = std::max(1, static_cast<int>(output->ne[1]));
+            const ptrdiff_t row_stride = static_cast<ptrdiff_t>(output->nb[1] / sizeof(float));
+            const float* src = reinterpret_cast<const float*>(output->data);
+            logits.resize(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+            for (int col = 0; col < cols; ++col) {
+                std::memcpy(logits.data() + static_cast<size_t>(col) * static_cast<size_t>(rows),
+                            src + static_cast<ptrdiff_t>(col) * row_stride, static_cast<size_t>(rows) * sizeof(float));
+            }
+        }
+    }
+
+    ggml_free(ctx);
+    ResetInferenceWorkContext(work_ctx.get());
+    SetCurrentWorkContext(nullptr);
+    return logits;
+}
+std::vector<float> ExecuteTransformerGraphForTest(TransformerModel* model, PagedKVCache* cache, const BatchSpec& batch,
+                                                  int num_threads) {
+    return ExecuteTransformerGraphForTestImpl(model, cache, batch, num_threads, /*embedding_mode=*/false);
+}
+std::vector<float> ExecuteTransformerGraphEmbeddingsForTest(TransformerModel* model, PagedKVCache* cache,
+                                                            const BatchSpec& batch, int num_threads) {
+    return ExecuteTransformerGraphForTestImpl(model, cache, batch, num_threads, /*embedding_mode=*/true);
+}
+std::vector<float> ExecuteTransformerAttentionForTest(TransformerModel* model, PagedKVCache* cache,
+                                                      const BatchSpec& batch, int target_layer, int num_threads) {
+    std::vector<float> captured;
+    ScopedAttentionCaptureGuard capture_guard(&captured, target_layer);
+    (void)ExecuteTransformerGraphForTestImpl(model, cache, batch, num_threads, /*embedding_mode=*/false);
+    return captured;
+}
+void SetFlashAttentionDisabledForTest(bool disabled) {
+    g_test_force_flash_attention_disabled.store(disabled ? 1 : 0, std::memory_order_relaxed);
+}
+void ComputeKVRetentionSpanForTest(int n_past, int sliding_window, int sink_tokens, int* history_kept, int* sink_kept,
+                                   int* tail_start) {
+    KVRetentionPolicy policy;
+    policy.enabled = (sliding_window >= 0);
+    policy.sliding_window = sliding_window >= 0 ? sliding_window : -1;
+    policy.sink_tokens = std::max(0, sink_tokens);
+
+    const KVRetentionSpan span = ::ComputeKVRetentionSpan(n_past, policy);
+    if (history_kept) {
+        *history_kept = span.history_kept;
+    }
+    if (sink_kept) {
+        *sink_kept = span.sink_kept;
+    }
+    if (tail_start) {
+        *tail_start = span.tail_start;
+    }
+}
+int MapRetainedHistoryIndexForTest(int n_past, int sliding_window, int sink_tokens, int retained_index) {
+    KVRetentionPolicy policy;
+    policy.enabled = (sliding_window >= 0);
+    policy.sliding_window = sliding_window >= 0 ? sliding_window : -1;
+    policy.sink_tokens = std::max(0, sink_tokens);
+    const KVRetentionSpan span = ::ComputeKVRetentionSpan(n_past, policy);
+    return ::MapRetainedHistoryIndex(span, retained_index);
+}
 int GetArmQ4KNativeVecDotModeTest() {
     return static_cast<int>(::GetArmQ4KNativeVecDotMode());
 }

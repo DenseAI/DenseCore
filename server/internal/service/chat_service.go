@@ -42,13 +42,15 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 	}
 
 	modelHint := s.modelService.GetCurrentModel()
-	prompt := FormatChatPrompt(modelHint, req.Messages, req.ChatTemplateKwargs)
+	tokenizerType := engine.GetTokenizerType()
+	chatTemplate := engine.GetChatTemplate()
+	prompt := BuildChatPromptWithMetadata(modelHint, tokenizerType, chatTemplate, req.Messages, req.ChatTemplateKwargs)
 	hasInputIDs := len(req.InputIDs) > 0
 	if prompt == "" && !hasInputIDs {
 		return errors.New("no user message found")
 	}
 
-	stream, err := s.startGeneration(ctx, req, modelHint, prompt)
+	stream, err := s.startGeneration(ctx, req, modelHint, tokenizerType, chatTemplate, prompt)
 	if err != nil {
 		return err
 	}
@@ -67,9 +69,9 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 	}
 }
 
-func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatCompletionRequest, modelHint, prompt string) (<-chan domain.StreamEvent, error) {
+func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatCompletionRequest, modelHint, tokenizerType, chatTemplate, prompt string) (<-chan domain.StreamEvent, error) {
 	jsonMode := req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object"
-	temperature, topP, topK, repetitionPenalty := s.normalizeSampling(modelHint, req)
+	temperature, topP, topK, repetitionPenalty := s.normalizeSampling(modelHint, tokenizerType, chatTemplate, req)
 
 	queuedReq := &queue.QueuedRequest{
 		ID:                uuid.New().String(),
@@ -164,12 +166,12 @@ func ExtractPrompt(messages []domain.Message) string {
 	return messages[len(messages)-1].FlattenedText()
 }
 
-func (s *ChatService) normalizeSampling(modelHint string, req domain.ChatCompletionRequest) (float64, float64, int, float64) {
+func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate string, req domain.ChatCompletionRequest) (float64, float64, int, float64) {
 	temperature := req.Temperature
 	topP := req.TopP
 	topK := req.TopK
 	repetitionPenalty := req.RepetitionPenalty
-	profile := resolvePromptProfile(modelHint)
+	profile := resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate)
 	isQwen := profile.family == promptFamilyQwen
 	thinkingEnabled := profile.thinkingEnabled(modelHint, req.ChatTemplateKwargs)
 
@@ -209,4 +211,16 @@ func (s *ChatService) normalizeSampling(modelHint string, req domain.ChatComplet
 	}
 
 	return temperature, topP, topK, repetitionPenalty
+}
+
+// BuildChatPrompt renders the template and applies model-specific priming.
+// This mirrors the Python engine's Qwen no-thinking priming so the server
+// behaves consistently with the other frontends.
+func BuildChatPrompt(modelHint string, messages []domain.Message, templateKwargs *domain.ChatTemplateKwargs) string {
+	return BuildChatPromptWithMetadata(modelHint, "", "", messages, templateKwargs)
+}
+
+func BuildChatPromptWithMetadata(modelHint, tokenizerType, chatTemplate string, messages []domain.Message,
+	templateKwargs *domain.ChatTemplateKwargs) string {
+	return FormatChatPromptWithMetadata(modelHint, tokenizerType, chatTemplate, messages, templateKwargs)
 }

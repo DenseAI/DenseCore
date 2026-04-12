@@ -961,6 +961,36 @@ int CountTokens(DenseCoreHandle handle, const char* text, int add_bos, int add_e
     return DENSECORE_STATUS_MODEL_LOAD_FAILED;
 }
 
+const char* GetTokenizerType(DenseCoreHandle handle) {
+    if (!handle) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "GetTokenizerType: handle is null");
+        return nullptr;
+    }
+    EngineState* state = (EngineState*)handle;
+    ModelEntry* entry = state->GetDefaultModel();
+    if (entry && entry->model) {
+        ClearError();
+        return entry->model->tokenizer_type.empty() ? nullptr : entry->model->tokenizer_type.c_str();
+    }
+    SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "GetTokenizerType: no model loaded");
+    return nullptr;
+}
+
+const char* GetChatTemplate(DenseCoreHandle handle) {
+    if (!handle) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "GetChatTemplate: handle is null");
+        return nullptr;
+    }
+    EngineState* state = (EngineState*)handle;
+    ModelEntry* entry = state->GetDefaultModel();
+    if (entry && entry->model) {
+        ClearError();
+        return entry->model->chat_template.empty() ? nullptr : entry->model->chat_template.c_str();
+    }
+    SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "GetChatTemplate: no model loaded");
+    return nullptr;
+}
+
 /**
  * @brief Initialize engine with default NUMA settings (simplified API)
  *

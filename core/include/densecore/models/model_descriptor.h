@@ -50,6 +50,9 @@ const ModelDescriptor& DescribeModelVariant(ModelVariant variant);
 const ModelDescriptor& DescribeModel(const TransformerModel* model);
 TokenizerFamily ResolveTokenizerFamily(const TransformerModel* model);
 PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model);
+TokenizerFamily ResolveTokenizerFamilyFromMetadata(std::string_view tokenizer_type);
+PromptTemplateFamily ResolvePromptTemplateFamilyFromMetadata(std::string_view tokenizer_type,
+                                                             std::string_view chat_template);
 bool IsKnownTokenizerModel(std::string_view tokenizer_name);
 const char* TokenizerFamilyName(TokenizerFamily family);
 

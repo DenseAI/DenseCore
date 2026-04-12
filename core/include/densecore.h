@@ -640,6 +640,8 @@ DENSECORE_API int GetMaxContextTokens(DenseCoreHandle handle);
  * @return Token count on success, or negative error code
  */
 DENSECORE_API int CountTokens(DenseCoreHandle handle, const char* text, int add_bos, int add_eos);
+DENSECORE_API const char* GetTokenizerType(DenseCoreHandle handle);
+DENSECORE_API const char* GetChatTemplate(DenseCoreHandle handle);
 
 /**
  * Cancel a running request

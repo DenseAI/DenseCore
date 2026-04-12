@@ -1143,6 +1143,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model_descriptor.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen_loop_guard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_decode_graph_cache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gemma4_decode_fallback.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_memory_pool.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kv_cache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scheduler.cpp

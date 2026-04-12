@@ -30,6 +30,7 @@
 
 #include "apple_silicon.h"
 #include "dtype_utils.h"
+#include "models/model_inference_policy.h"
 #include "qwen35_ssm_math.h"
 
 namespace {
@@ -499,11 +500,13 @@ TransformerModel* LoadGGUFModel(const char* path) {
         get_u32("embedding_length_per_layer_input", tmp_u32);
         model->gemma4_hidden_size_per_layer_input = static_cast<int>(tmp_u32);
 
-        get_f32("attention_logit_cap", model->gemma4_attention_logit_softcapping);
-        // Gemma4 text model does NOT use attention logit softcapping per the HF
-        // reference (self.scaling = 1.0, no tanh capping). Only the audio encoder
-        // uses softcap=50. If the GGUF omits the key, keep 0.0 (disabled).
-        // GGUFs that explicitly set the key will still use the stored value.
+        float gemma4_attention_logit_cap = 0.0f;
+        get_f32("attention_logit_cap", gemma4_attention_logit_cap);
+        // Gemma4 text attention stays uncapped even when exporters carry over an
+        // audio-only attention_logit_cap field. Sanitize this at load time so
+        // decode numerics remain fail-closed.
+        model->gemma4_attention_logit_softcapping =
+            densecore::models::SanitizeAttentionLogitSoftcapForLoad(model, gemma4_attention_logit_cap);
         get_f32("final_logit_softcapping", model->gemma4_final_logit_softcapping);
 
         std::vector<uint8_t> sliding_pattern;

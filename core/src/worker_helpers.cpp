@@ -13,6 +13,7 @@
 #include "densecore/arm_runtime.h"
 #include "densecore/exceptions.h"
 #include "ggml.h"
+#include "models/model_inference_policy.h"
 
 #ifndef DENSECORE_DEFAULT_PRECOMPUTED_ROPE
 #define DENSECORE_DEFAULT_PRECOMPUTED_ROPE 1
@@ -713,7 +714,7 @@ int ResolveAutoDecodeThreadsForBatch(int num_seqs, int physical_core_count, int 
 
 bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const PagedKVCache* cache,
                                          const BatchSpec& batch) {
-    if (!model || !cache || model->arch_flags.is_glm_dsa) {
+    if (!model || !cache || model->arch_flags.is_glm_dsa || !densecore::models::SupportsPagedDecodeAttention(model)) {
         return false;
     }
     const int n_tokens_in_batch = static_cast<int>(batch.tokens.size());

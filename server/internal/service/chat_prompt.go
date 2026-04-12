@@ -17,11 +17,16 @@ const (
 )
 
 func FormatChatPrompt(modelHint string, messages []domain.Message, templateKwargs *domain.ChatTemplateKwargs) string {
+	return FormatChatPromptWithMetadata(modelHint, "", "", messages, templateKwargs)
+}
+
+func FormatChatPromptWithMetadata(modelHint, tokenizerType, chatTemplate string, messages []domain.Message,
+	templateKwargs *domain.ChatTemplateKwargs) string {
 	if len(messages) == 0 {
 		return ""
 	}
 
-	profile := resolvePromptProfile(modelHint)
+	profile := resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate)
 
 	switch profile.family {
 	case promptFamilyQwen:
@@ -81,7 +86,11 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 				writeChatMLBlock(roleSystem, renderQwenContent(msg, false))
 			}
 		case roleUser:
-			writeChatMLBlock(role, renderQwenContent(msg, false))
+			content := renderQwenContent(msg, false)
+			if !thinkingEnabled && idx == len(messages)-1 {
+				content = appendQwenNoThinkDirective(content)
+			}
+			writeChatMLBlock(role, content)
 		case roleAssistant:
 			writeChatMLBlock(role, renderQwenAssistantMessage(msg))
 		case roleTool:
@@ -94,14 +103,22 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 	sb.WriteString("\n")
 	if thinkingEnabled {
 		sb.WriteString("<think>\n")
-	} else {
-		sb.WriteString("<think>\n\n</think>\n\n")
 	}
 	return sb.String()
 }
 
 func normalizePromptContent(content string) string {
 	return strings.TrimSpace(content)
+}
+
+func appendQwenNoThinkDirective(content string) string {
+	if strings.Contains(content, "/no_think") || strings.Contains(content, "/nothink") {
+		return content
+	}
+	if content != "" && !strings.HasSuffix(content, " ") && !strings.HasSuffix(content, "\n") && !strings.HasSuffix(content, "\t") {
+		content += " "
+	}
+	return content + "/no_think"
 }
 
 func renderStructuredText(parts []domain.ContentPart, imageToken, videoToken, audioToken string) string {

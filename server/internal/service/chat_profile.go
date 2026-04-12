@@ -73,7 +73,27 @@ var (
 )
 
 func resolvePromptProfile(modelHint string) promptProfile {
+	return resolvePromptProfileWithMetadata(modelHint, "", "")
+}
+
+func resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate string) promptProfile {
 	lower := strings.ToLower(strings.TrimSpace(modelHint))
+	tokenizerLower := strings.ToLower(strings.TrimSpace(tokenizerType))
+	templateLower := strings.ToLower(strings.TrimSpace(chatTemplate))
+	switch {
+	case strings.Contains(templateLower, "<|im_start|>") || strings.Contains(templateLower, "<|im_end|>"):
+		return fallbackPromptProfile("qwen")
+	case strings.Contains(templateLower, "<|turn>") || strings.Contains(templateLower, "<turn|>"):
+		return fallbackPromptProfile("gemma")
+	}
+	switch {
+	case strings.Contains(tokenizerLower, "qwen35") || strings.Contains(tokenizerLower, "qwen3.5"):
+		return fallbackPromptProfile("qwen3.5")
+	case strings.Contains(tokenizerLower, "qwen"):
+		return fallbackPromptProfile("qwen")
+	case strings.Contains(tokenizerLower, "gemma"):
+		return fallbackPromptProfile("gemma")
+	}
 	for _, spec := range loadPromptProfileSpecs() {
 		if spec.matches(lower) {
 			return spec.toPromptProfile()

@@ -551,3 +551,19 @@ func (e *DenseEngine) CountTokens(text string, addBOS bool, addEOS bool) (int, e
 	}
 	return count, nil
 }
+
+func (e *DenseEngine) GetTokenizerType() string {
+	cValue := C.GetTokenizerType(e.handle)
+	if cValue == nil {
+		return ""
+	}
+	return C.GoString(cValue)
+}
+
+func (e *DenseEngine) GetChatTemplate() string {
+	cValue := C.GetChatTemplate(e.handle)
+	if cValue == nil {
+		return ""
+	}
+	return C.GoString(cValue)
+}

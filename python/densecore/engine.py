@@ -1740,7 +1740,7 @@ class DenseCore:
     def _should_prime_qwen_no_thinking(self) -> bool:
         model_name = str(getattr(self, "model_path", "")).lower()
         if "qwen3.5" in model_name or "qwen35" in model_name:
-            return os.getenv("DENSECORE_QWEN35_ENABLE_THINKING", "1") not in ("1", "true", "True")
+            return os.getenv("DENSECORE_QWEN35_ENABLE_THINKING", "0") not in ("1", "true", "True")
         if "qwen3" in model_name:
             return os.getenv("DENSECORE_QWEN3_ENABLE_THINKING", "1") not in ("1", "true", "True")
         return False

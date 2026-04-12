@@ -40,6 +40,7 @@
 #include "densecore/arm_runtime.h"
 #include "densecore/graph_executor.h"
 #include "densecore/models/graph_registry.h"
+#include "models/model_inference_policy.h"
 
 namespace {
 
@@ -1679,10 +1680,12 @@ void EngineLoop(EngineState* state) {
             }
             bool stable_paged_decode_topology = false;
             if (decode_single_token_layout) {
+                const bool paged_decode_supported = densecore::models::SupportsPagedDecodeAttention(current_model);
                 if (UseLegacyDecodeGraphCachePolicy()) {
-                    const bool batched_decode_forced_paged = batch.num_seqs > 1;
-                    const bool single_decode_forced_paged =
-                        batch.num_seqs == 1 && IsPagedDecodeModeForcedOn() && IsBatchedPagedDecodeEnabled();
+                    const bool batched_decode_forced_paged = paged_decode_supported && batch.num_seqs > 1;
+                    const bool single_decode_forced_paged = paged_decode_supported && batch.num_seqs == 1 &&
+                                                            IsPagedDecodeModeForcedOn() &&
+                                                            IsBatchedPagedDecodeEnabled();
                     stable_paged_decode_topology = batched_decode_forced_paged || single_decode_forced_paged;
                 } else {
                     stable_paged_decode_topology =
@@ -2030,6 +2033,12 @@ void EngineLoop(EngineState* state) {
             if (using_cached_decode_graph && decode_single_token_layout && batch.num_seqs > 1) {
                 DebugVerifyCachedDecodeGraphReuseState(gf, batch.num_seqs, reused_decode_graph,
                                                        cached_graph_verified_paged_decode_op);
+#ifndef NDEBUG
+                if (current_model && current_model->arch_flags.is_gemma4 && cached_graph_verified_paged_decode_op) {
+                    throw densecore::InvalidArgumentException(
+                        "Decode graph cache invariant failed: Gemma4 must not reuse paged decode cached graphs.");
+                }
+#endif
                 if (cached_graph_verified_paged_decode_op && !cpu_backend_active) {
                     if (IsDebugGraphLoggingEnabled()) {
                         std::cerr << "[DecodeGraphCache][DEBUG] cached paged decode graph rejected: selected backend "

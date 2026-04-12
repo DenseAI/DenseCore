@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 
 namespace densecore::models {
 namespace {
@@ -26,6 +27,38 @@ float ResolveInputEmbeddingScale(const TransformerModel* model) {
 
 bool RequiresUnitOffsetRmsNorm(const TransformerModel* model) {
     return model && model->arch_flags.uses_unit_offset_rms_norm;
+}
+
+bool SupportsPagedDecodeAttention(const TransformerModel* model) {
+    // Fail closed for Gemma4. The generic paged decode callback does not yet
+    // preserve Gemma4's sliding-window/shared-KV attention behavior, so later
+    // batching or cache policy must treat this veto as monotonic.
+    return !(model && model->arch_flags.is_gemma4);
+}
+
+float SanitizeAttentionLogitSoftcapForLoad(const TransformerModel* model, float gguf_softcap) {
+    if (!model || !model->arch_flags.is_gemma4) {
+        return gguf_softcap;
+    }
+    // DenseCore's current TransformerModel Gemma4 path is the text decoder
+    // path. Some exporters still serialize the audio-only attention softcap
+    // metadata there, so fail closed and ignore it rather than silently
+    // distorting text attention numerics. Future Gemma4 audio/multimodal
+    // support must route through an explicitly differentiated load path before
+    // reusing this sanitizer.
+#ifndef NDEBUG
+    if (gguf_softcap > 0.0f) {
+        static bool logged_gemma4_softcap_assumption = false;
+        if (!logged_gemma4_softcap_assumption) {
+            std::cerr << "[DenseCore][DEBUG] Sanitizing Gemma4 attention_logit_cap=" << gguf_softcap
+                      << " to 0.0 for the current text-model load path. Future Gemma4 audio/multimodal support "
+                         "must not inherit this path silently."
+                      << std::endl;
+            logged_gemma4_softcap_assumption = true;
+        }
+    }
+#endif
+    return 0.0f;
 }
 
 bool IsGemma4SlidingLayer(const TransformerModel* model, int layer_idx) {
@@ -63,6 +96,10 @@ bool IsGemma4FullRopeFreqsDisabled() {
 
 bool IsGemma4QKNormDisabled() {
     return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_QK_NORM", false);
+}
+
+bool IsGemma4FinalLogitSoftcapDisabled() {
+    return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_FINAL_LOGIT_SOFTCAP", false);
 }
 
 bool IsGemma4MoEModel(const TransformerModel* model, const TransformerLayer* layer) {

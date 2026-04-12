@@ -1,4 +1,8 @@
-from densecore.chat_template import format_chat_prompt, resolve_prompt_profile
+from densecore.chat_template import (
+    format_chat_prompt,
+    qwen_thinking_enabled,
+    resolve_prompt_profile,
+)
 
 
 def test_resolve_prompt_profile_uses_shared_families():
@@ -21,8 +25,13 @@ def test_format_chat_prompt_qwen_matches_chatml_suffix(monkeypatch):
         [{"role": "user", "content": "안녕?"}],
     )
 
-    assert "<|im_start|>user\n안녕?<|im_end|>\n" in prompt
-    assert prompt.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    assert "<|im_start|>user\n안녕? /no_think<|im_end|>\n" in prompt
+    assert prompt.endswith("<|im_start|>assistant\n")
+
+
+def test_qwen_thinking_enabled_defaults_are_model_specific():
+    assert qwen_thinking_enabled("/tmp/Qwen3.5-2B-Q4_K_M.gguf", None) is False
+    assert qwen_thinking_enabled("/tmp/Qwen3-0.6B-Q4_K_M.gguf", None) is True
 
 
 def test_format_chat_prompt_gemma_uses_turn_tags():

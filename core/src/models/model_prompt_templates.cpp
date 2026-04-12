@@ -86,7 +86,7 @@ bool ResolveQwenThinkingEnabled(const TransformerModel* model) {
         return ParseBoolEnv("DENSECORE_QWEN3_ENABLE_THINKING", true);
     }
     if (descriptor.variant == ModelVariant::QWEN35) {
-        return ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", true);
+        return ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", false);
     }
     return true;
 }
@@ -94,6 +94,17 @@ bool ResolveQwenThinkingEnabled(const TransformerModel* model) {
 bool ShouldPrimeQwenNoThinking(const TransformerModel* model) {
     if (!ModelUsesQwenThinkingEnv(model)) return false;
     return !ResolveQwenThinkingEnabled(model);
+}
+
+std::string AppendQwenNoThinkDirective(std::string content) {
+    if (content.find("/no_think") != std::string::npos || content.find("/nothink") != std::string::npos) {
+        return content;
+    }
+    if (!content.empty() && !std::isspace(static_cast<unsigned char>(content.back()))) {
+        content.push_back(' ');
+    }
+    content += "/no_think";
+    return content;
 }
 
 }  // namespace
@@ -173,6 +184,9 @@ void ConfigureGemma4TextTokenBlocklistForModel(const TransformerModel* model, Re
     if (!model || !req || DescribeModel(model).variant != ModelVariant::GEMMA4) {
         return;
     }
+    if (ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_TEXT_BLOCKLIST", false)) {
+        return;
+    }
 
     auto is_stop_id = [&](int token_id) {
         return std::binary_search(model->stop_token_ids.begin(), model->stop_token_ids.end(), token_id);
@@ -216,16 +230,20 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
     if (profile.kind == PromptTemplateKind::CHATML) {
         std::string wrapped;
         wrapped.reserve(prompt.size() + 160);
+        std::string user_prompt = prompt;
+        if (profile.supports_thinking && !profile.thinking_enabled) {
+            user_prompt = AppendQwenNoThinkDirective(std::move(user_prompt));
+        }
         wrapped += profile.open_tag;
         wrapped += profile.user_role;
         wrapped += "\n";
-        wrapped += prompt;
+        wrapped += user_prompt;
         wrapped += profile.close_tag;
         wrapped += profile.open_tag;
         wrapped += profile.assistant_role;
         wrapped += "\n";
-        if (profile.supports_thinking) {
-            wrapped += profile.thinking_enabled ? "<think>\n" : "<think>\n\n</think>\n\n";
+        if (profile.supports_thinking && profile.thinking_enabled) {
+            wrapped += "<think>\n";
         }
         return wrapped;
     }
