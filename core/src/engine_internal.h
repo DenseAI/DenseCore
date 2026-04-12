@@ -266,6 +266,7 @@ struct Request {
     // Sampling parameters (per-request)
     SamplingParams sampling_params;
     std::vector<int> disallowed_token_ids;
+    std::vector<int> allowed_token_ids;
     std::vector<std::string> stop_sequences;
     std::string stop_buffer;
     size_t stop_buffer_max = 0;
@@ -333,6 +334,7 @@ struct Request {
         json_mode = false;
         sampling_params = SamplingParams();
         disallowed_token_ids.clear();
+        allowed_token_ids.clear();
         stop_sequences.clear();
         stop_buffer.clear();
         stop_buffer_max = 0;

@@ -7,6 +7,7 @@
 
 #include "densecore/exceptions.h"
 #include "densecore/graph_builders/llm_config_generator.h"
+#include "densecore/models/model_graph_capabilities.h"
 #include "densecore/models/model_graph_bridge.h"
 #include "qwen35_ssm_math.h"
 
@@ -297,6 +298,9 @@ TEST(Qwen35GraphDispatchTest, LlmConfigGeneratorRejectsHybridSSMModels) {
     model.arch = ModelArch::QWEN35;
     model.arch_flags.is_hybrid_ssm = true;
 
+    const auto resolution = densecore::models::ResolveGraphFamily(&model);
+    EXPECT_EQ(resolution.preferred_family, densecore::models::GraphFamily::DecoderHybridSSM);
+
     EXPECT_THROW(
         {
             auto config = densecore::LlmConfigGenerator::Generate(&model);
@@ -309,14 +313,21 @@ TEST(Qwen35GraphDispatchTest, ModelGraphBridgeDoesNotAdvertiseGenericGraphSuppor
     EXPECT_FALSE(densecore::ModelGraphBridge::IsGraphModel(ModelArch::QWEN35));
     EXPECT_EQ(densecore::ModelGraphBridge::GetGraphName(ModelArch::QWEN35), nullptr);
 
-    EXPECT_TRUE(densecore::ModelGraphBridge::IsGraphModel(ModelArch::QWEN3));
-    EXPECT_STREQ(densecore::ModelGraphBridge::GetGraphName(ModelArch::QWEN3), "llm_universal");
+    TransformerModel qwen3{};
+    qwen3.arch = ModelArch::QWEN3;
+    EXPECT_FALSE(densecore::ModelGraphBridge::IsGraphModel(&qwen3));
+    EXPECT_EQ(densecore::ModelGraphBridge::GetGraphName(&qwen3), nullptr);
 }
 
 TEST(Gemma4GraphDispatchTest, LlmConfigGeneratorRejectsGemma4Models) {
     TransformerModel model{};
     model.arch = ModelArch::GEMMA;
     model.arch_flags.is_gemma4 = true;
+    model.gemma4_layer_is_sliding = {1};
+    model.gemma4_layer_kv_source = {0};
+
+    const auto resolution = densecore::models::ResolveGraphFamily(&model);
+    EXPECT_EQ(resolution.preferred_family, densecore::models::GraphFamily::DecoderSlidingWindowSharedKV);
 
     EXPECT_THROW(
         {

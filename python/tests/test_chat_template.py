@@ -1,5 +1,6 @@
 from densecore.chat_template import (
     format_chat_prompt,
+    _profile_specs,
     qwen_thinking_enabled,
     resolve_prompt_profile,
 )
@@ -16,6 +17,22 @@ def test_resolve_prompt_profile_uses_shared_families():
 
     generic = resolve_prompt_profile("/tmp/llama-3.2-base.gguf")
     assert generic.family == "generic"
+
+
+def test_resolve_prompt_profile_keeps_known_families_over_generic_override(tmp_path, monkeypatch):
+    profile_path = tmp_path / "prompt_profiles.json"
+    profile_path.write_text(
+        """
+        {"profiles":[{"family":"generic","kind":"generic_transcript","match_substrings":["qwen3-0.6b"],"roles":{"system":"System","user":"User","assistant":"Assistant"},"tags":{"open":"","close":""},"multimodal":{"image":"","video":"","audio":""},"default_system_prompt":"You are a helpful assistant."}]}
+        """.strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DENSECORE_PROMPT_PROFILE_PATH", str(profile_path))
+    _profile_specs.cache_clear()
+
+    profile = resolve_prompt_profile("/tmp/Qwen3-0.6B-Q4_K_M.unsloth.gguf")
+    assert profile.family == "qwen"
+    assert profile.kind == "chatml"
 
 
 def test_format_chat_prompt_qwen_matches_chatml_suffix(monkeypatch):

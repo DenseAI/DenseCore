@@ -521,6 +521,7 @@ set(SOURCES
     # Graph Optimization module
     src/graph_optimizer.cpp
     src/models/model_descriptor.cpp
+    src/models/model_graph_capabilities.cpp
     src/models/model_prompt_templates.cpp
     src/models/model_inference_policy.cpp
     src/models/model_graph_bridge.cpp
@@ -1141,6 +1142,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen35_ssm_math.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_chat_template.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model_descriptor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_transformer_graph_dispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen_loop_guard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_decode_graph_cache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gemma4_decode_fallback.cpp

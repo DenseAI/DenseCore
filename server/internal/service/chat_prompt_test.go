@@ -1,6 +1,8 @@
 package service
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -21,6 +23,21 @@ func TestResolvePromptProfileKnownFamilies(t *testing.T) {
 	generic := resolvePromptProfile("/tmp/llama-3.2-base.gguf")
 	if generic.family != promptFamilyGeneric || generic.kind != promptProfileKindGenericTranscript {
 		t.Fatalf("expected generic transcript profile fallback, got family=%v kind=%v", generic.family, generic.kind)
+	}
+}
+
+func TestResolvePromptProfileKeepsKnownFamiliesWhenExternalProfileMatchesGeneric(t *testing.T) {
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "prompt_profiles.json")
+	if err := os.WriteFile(profilePath, []byte(`{"profiles":[{"family":"generic","kind":"generic_transcript","match_substrings":["qwen3-0.6b"],"roles":{"system":"System","user":"User","assistant":"Assistant"},"tags":{"open":"","close":""},"multimodal":{"image":"","video":"","audio":""},"default_system_prompt":"You are a helpful assistant."}]}`), 0o600); err != nil {
+		t.Fatalf("write prompt profile: %v", err)
+	}
+
+	t.Setenv("DENSECORE_PROMPT_PROFILE_PATH", profilePath)
+	profile := resolvePromptProfile("/tmp/Qwen3-0.6B-Q4_K_M.unsloth.gguf")
+
+	if profile.family != promptFamilyQwen || profile.kind != promptProfileKindChatML {
+		t.Fatalf("expected qwen chatml profile to override generic external profile, got family=%v kind=%v", profile.family, profile.kind)
 	}
 }
 

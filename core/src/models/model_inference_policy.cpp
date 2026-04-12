@@ -16,6 +16,18 @@ bool ParseBoolEnv(const char* name, bool default_value) {
     return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0;
 }
 
+bool IsGemma4ForceDenseBaselineEnabled() {
+    return ParseBoolEnv("DENSECORE_GEMMA4_FORCE_DENSE_BASELINE", false);
+}
+
+bool IsGemma4SharedKVDisabled() {
+    return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_SHARED_KV", false);
+}
+
+bool IsGemma4SlidingWindowDisabled() {
+    return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_SLIDING_WINDOW", false);
+}
+
 }  // namespace
 
 float ResolveInputEmbeddingScale(const TransformerModel* model) {
@@ -37,37 +49,24 @@ bool SupportsPagedDecodeAttention(const TransformerModel* model) {
 }
 
 float SanitizeAttentionLogitSoftcapForLoad(const TransformerModel* model, float gguf_softcap) {
-    if (!model || !model->arch_flags.is_gemma4) {
-        return gguf_softcap;
-    }
-    // DenseCore's current TransformerModel Gemma4 path is the text decoder
-    // path. Some exporters still serialize the audio-only attention softcap
-    // metadata there, so fail closed and ignore it rather than silently
-    // distorting text attention numerics. Future Gemma4 audio/multimodal
-    // support must route through an explicitly differentiated load path before
-    // reusing this sanitizer.
-#ifndef NDEBUG
-    if (gguf_softcap > 0.0f) {
-        static bool logged_gemma4_softcap_assumption = false;
-        if (!logged_gemma4_softcap_assumption) {
-            std::cerr << "[DenseCore][DEBUG] Sanitizing Gemma4 attention_logit_cap=" << gguf_softcap
-                      << " to 0.0 for the current text-model load path. Future Gemma4 audio/multimodal support "
-                         "must not inherit this path silently."
-                      << std::endl;
-            logged_gemma4_softcap_assumption = true;
-        }
-    }
-#endif
-    return 0.0f;
+    (void)model;
+    return gguf_softcap;
 }
 
 bool IsGemma4SlidingLayer(const TransformerModel* model, int layer_idx) {
+    if (model && model->arch_flags.is_gemma4 &&
+        (IsGemma4ForceDenseBaselineEnabled() || IsGemma4SlidingWindowDisabled())) {
+        return false;
+    }
     return model && model->arch_flags.is_gemma4 && layer_idx >= 0 &&
            layer_idx < static_cast<int>(model->gemma4_layer_is_sliding.size()) &&
            model->gemma4_layer_is_sliding[static_cast<size_t>(layer_idx)] != 0;
 }
 
 int Gemma4KVSourceLayer(const TransformerModel* model, int layer_idx) {
+    if (model && model->arch_flags.is_gemma4 && (IsGemma4ForceDenseBaselineEnabled() || IsGemma4SharedKVDisabled())) {
+        return layer_idx;
+    }
     if (!model || !model->arch_flags.is_gemma4 || layer_idx < 0) {
         return layer_idx;
     }
@@ -84,6 +83,10 @@ bool IsGemma4PerLayerInputDisabled() {
 
 bool IsGemma4LayerOutputScaleDisabled() {
     return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_LAYER_OUTPUT_SCALE", false);
+}
+
+bool IsGemma4DecodeSpecialTransformDisabled() {
+    return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_SPECIAL_DECODE_TRANSFORMS", false);
 }
 
 bool IsGemma4VNormDisabled() {

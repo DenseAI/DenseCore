@@ -87,6 +87,22 @@ static struct ggml_tensor* BuildAttentionMaskTensor(struct ggml_context* ctx, in
         return mask;
     }
 
+    int sink_tokens = 0;
+    if (const char* env = std::getenv("DENSECORE_KV_SINK_TOKENS"); env && env[0] != '\0') {
+        sink_tokens = std::max(0, std::atoi(env));
+    } else if (const char* env = std::getenv("DENSECORE_SINK_TOKENS"); env && env[0] != '\0') {
+        sink_tokens = std::max(0, std::atoi(env));
+    }
+    const int sink_kept = std::clamp(sink_tokens, 0, n_past);
+    const int tail_start = (sliding_window >= 0) ? std::max(sink_kept, n_past - std::max(0, sliding_window)) : n_past;
+    const int history_kept = (sliding_window >= 0) ? (sink_kept + std::max(0, n_past - tail_start)) : n_past;
+    auto map_retained_history_index = [&](int retained_index) {
+        if (retained_index < sink_kept) {
+            return retained_index;
+        }
+        return tail_start + (retained_index - sink_kept);
+    };
+
     float* mask_data = reinterpret_cast<float*>(mask->data);
     for (int q = 0; q < n_padded; ++q) {
         const bool padded_query = q >= n_queries;
@@ -98,7 +114,7 @@ static struct ggml_tensor* BuildAttentionMaskTensor(struct ggml_context* ctx, in
                 continue;
             }
 
-            const int key_pos = k;
+            const int key_pos = (k < history_kept) ? map_retained_history_index(k) : (n_past + (k - history_kept));
             bool allow = key_pos <= query_pos;
             if (allow && sliding_window >= 0 && key_pos < (query_pos - sliding_window)) {
                 allow = false;
@@ -1300,6 +1316,17 @@ ResolveBasePagedDecodeExecutionDecision(const DecodePagedAttentionPolicy& policy
         decision.use_paged_decode_attention = true;
     }
     return decision;
+}
+
+static int ResolveAttentionQueryBasePosition(const BatchSpec& batch) {
+    if (batch.n_past.empty()) {
+        return 0;
+    }
+    int max_n_past = 0;
+    for (int n_past_i : batch.n_past) {
+        max_n_past = std::max(max_n_past, n_past_i);
+    }
+    return max_n_past;
 }
 
 static bool IsFlashAttentionDisabled() {
@@ -2865,40 +2892,182 @@ struct GLMDSAPackUserData {
 
 #include "inference_model_ops.inl"
 
+static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, PagedKVCache* cache,
+                                                           struct ggml_context* ctx_c, const BatchSpec& batch,
+                                                           bool embedding_mode, struct ggml_cgraph* gf,
+                                                           struct ggml_tensor** out_embd, struct ggml_tensor** out_pos);
+
+namespace {
+
+const char* GraphExecutionRouteName(densecore::TransformerGraphExecutionRoute route) {
+    switch (route) {
+    case densecore::TransformerGraphExecutionRoute::RegistryBuilder: return "RegistryBuilder";
+    case densecore::TransformerGraphExecutionRoute::InlineDenseAttention: return "InlineDenseAttention";
+    case densecore::TransformerGraphExecutionRoute::InlineHybridSSM: return "InlineHybridSSM";
+    case densecore::TransformerGraphExecutionRoute::InlineSlidingWindowSharedKV: return "InlineSlidingWindowSharedKV";
+    case densecore::TransformerGraphExecutionRoute::Reject:
+    default: return "Reject";
+    }
+}
+
+densecore::models::GraphBuilderSupport MakeDenseCoreInlineGraphSupport() {
+    densecore::models::GraphBuilderSupport support{};
+    support.builder_name = "DenseCoreInlineTransformerGraph";
+    support.supported_families = {densecore::models::GraphFamily::DecoderDenseAttention,
+                                  densecore::models::GraphFamily::DecoderHybridSSM,
+                                  densecore::models::GraphFamily::DecoderSlidingWindowSharedKV};
+    support.supports_sliding_window_attention = true;
+    support.supports_shared_kv_source = true;
+    support.supports_hybrid_ssm_mixer = true;
+    support.supports_moe = true;
+    support.supports_q_norm = true;
+    support.supports_k_norm = true;
+    support.supports_v_norm = true;
+    support.supports_per_layer_kv_head_variability = true;
+    support.supports_special_attention_mask = true;
+    support.supports_special_residual_scaling = true;
+    return support;
+}
+
+class InlineDenseDecoderRegistryBuilder : public densecore::TransformerGraphBuilder {
+public:
+    struct ggml_tensor* Build(TransformerModel* model, PagedKVCache* cache, struct ggml_context* ctx,
+                              const BatchSpec& batch, bool embedding_mode, struct ggml_cgraph* gf,
+                              struct ggml_tensor** out_embd, struct ggml_tensor** out_pos) override {
+        return BuildTransformerGraphInlineImpl(model, cache, ctx, batch, embedding_mode, gf, out_embd, out_pos);
+    }
+
+    const char* Name() const override { return "densecore_inline_dense_decoder"; }
+};
+
+struct InlineDenseDecoderRegistryBuilderRegistrar {
+    InlineDenseDecoderRegistryBuilderRegistrar() {
+        densecore::TransformerGraphRegistry::Instance().RegisterExact(
+            densecore::kDenseDecoderGenericBuilderKey, "densecore_inline_dense_decoder",
+            densecore::models::MakeDenseDecoderGenericSupport("densecore_inline_dense_decoder"),
+            []() { return std::make_unique<InlineDenseDecoderRegistryBuilder>(); });
+    }
+};
+
+static InlineDenseDecoderRegistryBuilderRegistrar g_inline_dense_decoder_registry_builder_registrar;
+
+}  // namespace
+
+densecore::TransformerGraphExecutionPlan
+densecore::ResolveTransformerGraphExecutionPlan(const TransformerModel* model) {
+    TransformerGraphExecutionPlan plan{};
+    plan.resolution = models::ResolveGraphFamily(model);
+
+    if (!model) {
+        plan.route = TransformerGraphExecutionRoute::Reject;
+        plan.debug_reason = "model is null";
+        return plan;
+    }
+
+    std::string registry_debug;
+    const auto descriptor =
+        TransformerGraphRegistry::Instance().ResolveBuilderDescriptor(plan.resolution, &registry_debug);
+    plan.debug_reason = "registry admission: " + registry_debug;
+    if (descriptor) {
+        plan.route = TransformerGraphExecutionRoute::RegistryBuilder;
+        plan.registry_builder_key = descriptor->key;
+        plan.selected_builder_name = descriptor->display_name;
+        return plan;
+    }
+
+    const auto inline_admission = models::AdmitGraphBuilder(plan.resolution, MakeDenseCoreInlineGraphSupport());
+    plan.debug_reason += " | inline admission: " + inline_admission.Summary();
+    if (!inline_admission.admitted) {
+        plan.route = TransformerGraphExecutionRoute::Reject;
+        return plan;
+    }
+
+    switch (inline_admission.admitted_family) {
+    case models::GraphFamily::DecoderDenseAttention:
+        plan.route = TransformerGraphExecutionRoute::InlineDenseAttention;
+        break;
+    case models::GraphFamily::DecoderHybridSSM: plan.route = TransformerGraphExecutionRoute::InlineHybridSSM; break;
+    case models::GraphFamily::DecoderSlidingWindowSharedKV:
+        plan.route = TransformerGraphExecutionRoute::InlineSlidingWindowSharedKV;
+        break;
+    case models::GraphFamily::EncoderDecoder:
+    case models::GraphFamily::MultimodalProjectedDecoder:
+    case models::GraphFamily::UNKNOWN:
+    default:
+        plan.route = TransformerGraphExecutionRoute::Reject;
+        plan.debug_reason += " | unsupported inline family";
+        break;
+    }
+
+    return plan;
+}
+
+std::unique_ptr<densecore::TransformerGraphBuilder>
+densecore::InstantiateRegistryBuilderForExecutionPlan(const TransformerGraphExecutionPlan& plan,
+                                                      std::string* error_reason) {
+    if (plan.route != TransformerGraphExecutionRoute::RegistryBuilder) {
+        if (error_reason) {
+            *error_reason = "execution plan route is not RegistryBuilder";
+        }
+        return nullptr;
+    }
+    if (plan.registry_builder_key.empty()) {
+        if (error_reason) {
+            *error_reason = "registry builder route is missing an exact builder key";
+        }
+        return nullptr;
+    }
+
+    auto builder = TransformerGraphRegistry::Instance().GetBuilderExact(plan.registry_builder_key);
+    if (!builder && error_reason) {
+        *error_reason = "exact registry builder key '" + plan.registry_builder_key + "' is not available for execution";
+    }
+    return builder;
+}
 
 struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache* cache, struct ggml_context* ctx_c,
                                           const BatchSpec& batch, bool embedding_mode, struct ggml_cgraph* gf,
                                           struct ggml_tensor** out_embd, struct ggml_tensor** out_pos) {
-    // =========================================================================
-    // STRATEGY PATTERN DISPATCH
-    // =========================================================================
-    // Try to use a registered GraphBuilder for this architecture.
-    // This allows seamless support for ViT, MoE, and other variants without
-    // cluttering the main inference loop.
-    // =========================================================================
-    const bool requires_inline_arch_specific_path =
-        model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_gemma4);
-    if (!requires_inline_arch_specific_path) {
-        auto builder = densecore::TransformerGraphRegistry::Instance().GetBuilder(static_cast<int>(model->arch));
+    const auto plan = densecore::ResolveTransformerGraphExecutionPlan(model);
 
-        if (builder) {
-            if (IsVerboseGraphBuildLoggingEnabled()) {
-                std::cerr << "[BuildTransformerGraph] Using strategy: " << builder->Name() << std::endl;
-            }
-            return builder->Build(model, cache, ctx_c, batch, embedding_mode, gf, out_embd, out_pos);
-        }
-    } else if (IsVerboseGraphBuildLoggingEnabled()) {
-        std::cerr << "[BuildTransformerGraph] Skipping strategy registry for arch " << static_cast<int>(model->arch)
-                  << " to preserve the inline architecture-specific graph path." << std::endl;
-    }
-
-    // Fallback: Inline LLaMA/Default implementation
     if (IsVerboseGraphBuildLoggingEnabled()) {
-        std::cerr << "[BuildTransformerGraph] No builder found for arch " << (int)model->arch
-                  << ", using default inline LLaMA logic." << std::endl;
+        std::cerr << "[BuildTransformerGraph] Resolved capabilities: "
+                  << densecore::models::FormatModelGraphCapabilities(plan.resolution.capabilities) << std::endl;
+        std::cerr << "[BuildTransformerGraph] Selected graph family: "
+                  << densecore::models::FormatGraphFamilyResolution(plan.resolution) << std::endl;
+        if (!plan.debug_reason.empty()) {
+            std::cerr << "[BuildTransformerGraph] Dispatch detail: " << plan.debug_reason << std::endl;
+        }
+        std::cerr << "[BuildTransformerGraph] Execution route: " << GraphExecutionRouteName(plan.route)
+                  << (plan.selected_builder_name.empty() ? "" : " via ")
+                  << (plan.selected_builder_name.empty() ? "" : plan.selected_builder_name.c_str()) << std::endl;
     }
 
+    switch (plan.route) {
+    case densecore::TransformerGraphExecutionRoute::RegistryBuilder: {
+        std::string execution_error;
+        auto builder = densecore::InstantiateRegistryBuilderForExecutionPlan(plan, &execution_error);
+        if (!builder) {
+            throw densecore::GraphBuildException("BuildTransformerGraph dispatch selected registry builder key '" +
+                                                 plan.registry_builder_key +
+                                                 "' but execution failed closed: " + execution_error);
+        }
+        return builder->Build(model, cache, ctx_c, batch, embedding_mode, gf, out_embd, out_pos);
+    }
+    case densecore::TransformerGraphExecutionRoute::InlineDenseAttention:
+    case densecore::TransformerGraphExecutionRoute::InlineHybridSSM:
+    case densecore::TransformerGraphExecutionRoute::InlineSlidingWindowSharedKV:
+        return BuildTransformerGraphInlineImpl(model, cache, ctx_c, batch, embedding_mode, gf, out_embd, out_pos);
+    case densecore::TransformerGraphExecutionRoute::Reject:
+    default: throw densecore::GraphBuildException("BuildTransformerGraph fail-closed: " + plan.debug_reason);
+    }
+}
 
+static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, PagedKVCache* cache,
+                                                           struct ggml_context* ctx_c, const BatchSpec& batch,
+                                                           bool embedding_mode, struct ggml_cgraph* gf,
+                                                           struct ggml_tensor** out_embd,
+                                                           struct ggml_tensor** out_pos) {
     // ENSURE: ctx_c must be initialized with sufficient memory (e.g. 128MB+)
     // to hold the compute graph nodes, especially for deep models like Qwen.
     // This initialization happens in worker.cpp (InitGraphCache or temp
@@ -2971,6 +3140,10 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     if (out_pos) *out_pos = pos;
 
     const bool decode_only_batch_layout = IsDecodeOnlyBatchLayout(batch, N);
+    const int debug_query_base_pos = ResolveAttentionQueryBasePosition(batch);
+    const bool gemma4_decode_special_transforms_disabled =
+        model->arch_flags.is_gemma4 && densecore::models::IsGemma4DecodeSpecialTransformDisabled() &&
+        debug_query_base_pos > 0;
 
     auto requires_gemma_rms_weight_offset = [&]() -> bool {
         return densecore::models::RequiresUnitOffsetRmsNorm(model);
@@ -3956,7 +4129,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 const BasePagedDecodeExecutionDecision base_paged_decode = ResolveBasePagedDecodeExecutionDecision(
                     decode_paged_policy, model, cache, batch, N, n_head, n_head_kv, head_dim_q, head_dim_kv);
                 const int n_past_val = base_paged_decode.n_past_val;
-                attn_ref_n_past = n_past_val;
+                const int attn_query_base_pos = debug_query_base_pos;
+                attn_ref_n_past = attn_query_base_pos;
                 const int n_total_tokens = n_past_val + N;
                 const DecodePagedDecision paged_decode_decision = base_paged_decode.paged_decode_decision;
                 const bool paged_decode_candidate = paged_decode_decision.candidate;
@@ -4393,7 +4567,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                                             ? 1.0f
                                             : (use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q));
                     const bool hal_causal = (N > 1);
-                    const int flash_q_start_offset = n_past_val;
+                    const int flash_q_start_offset = attn_query_base_pos;
                     if (use_portable_cpu_flash_native_decode_layout) {
                         KQV = ggml_flash_attention_hal(
                             ctx_c, Qcur, K, V, scale, false, n_head_kv, fast_attn_sliding_window,
@@ -4442,7 +4616,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                         shared_prefill_mask_sliding_window == fast_attn_sliding_window) {
                         KQ_mask = shared_prefill_flash_mask;
                     } else {
-                        KQ_mask = BuildAttentionMaskTensor(ctx_c, n_total_tokens, N, n_past_val,
+                        KQ_mask = BuildAttentionMaskTensor(ctx_c, n_total_tokens, N, attn_query_base_pos,
                                                            fast_attn_sliding_window, N_padded);
 
                         if (N > 1 && !decode_only_batch) {
@@ -4533,7 +4707,7 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                         if (ShouldBuildExplicitStandardAttentionMask(N, fast_attn_sliding_window)) {
                             if (fast_attn_sliding_window >= 0) {
                                 struct ggml_tensor* KQ_mask = BuildAttentionMaskTensor(
-                                    ctx_c, n_total_tokens, N, n_past_val, fast_attn_sliding_window);
+                                    ctx_c, n_total_tokens, N, attn_query_base_pos, fast_attn_sliding_window);
                                 KQ = ggml_add(ctx_c, KQ, KQ_mask);
                             } else {
                                 KQ = ggml_diag_mask_inf(ctx_c, KQ, n_past_val);
@@ -5146,8 +5320,9 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
             }
         }
 
-        if (model->arch_flags.is_gemma4 && !densecore::models::IsGemma4PerLayerInputDisabled() &&
-            gemma4_per_layer_inputs && model->gemma4_hidden_size_per_layer_input > 0) {
+        if (model->arch_flags.is_gemma4 && !gemma4_decode_special_transforms_disabled &&
+            !densecore::models::IsGemma4PerLayerInputDisabled() && gemma4_per_layer_inputs &&
+            model->gemma4_hidden_size_per_layer_input > 0) {
             auto* per_layer_gate = model->layers[il].Get(model_keys::kGemma4PerLayerInputGate);
             auto* per_layer_proj = model->layers[il].Get(model_keys::kGemma4PerLayerProjection);
             auto* post_per_layer_norm = model->layers[il].Get(model_keys::kGemma4PostPerLayerInputNorm);
@@ -5165,7 +5340,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
                 cur = ggml_add(ctx_c, cur, per_layer_delta);
             }
         }
-        if (model->arch_flags.is_gemma4 && !densecore::models::IsGemma4LayerOutputScaleDisabled()) {
+        if (model->arch_flags.is_gemma4 && !gemma4_decode_special_transforms_disabled &&
+            !densecore::models::IsGemma4LayerOutputScaleDisabled()) {
             if (auto* layer_output_scale = model->layers[il].Get(model_keys::kGemma4LayerOutputScale)) {
                 // Gemma4 checkpoint scalar: scale the full layer output (same as llama.cpp).
                 // This matches the training-time behavior where subsequent layers see
@@ -5354,32 +5530,90 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     // LM Head projection: [n_embd, N] -> [n_vocab, N]
     struct ggml_tensor* cur_input_to_lm_head = cur;
     cur = smart_mul_mat(ctx_c, model->output, cur, model);
-    if (IsDebugInferenceStatsEnabled()) {
-        // TEMP DEBUG: Check raw logits immediately after LM head (before softcap)
+    const bool debug_lm_head = IsDebugInferenceStatsEnabled() || std::getenv("DENSECORE_DEBUG_LM_HEAD_TOP") != nullptr;
+    if (debug_lm_head) {
         auto cb_check_lm_head_out = [](struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
                                        void* ud) {
+            (void)nth;
+            (void)ud;
             if (ith != 0) return;
             static int cb_lm_ct = 0;
-            if (cb_lm_ct < 3 && src && src->data) {
+            if (src && src->data) {
                 const int n_vocab = (int)src->ne[0];
                 const int n_tok = (int)src->ne[1];
                 const ptrdiff_t row_stride = (ptrdiff_t)(src->nb[1] / sizeof(float));
                 const float* d = (const float*)src->data;
-                // Check first and last token
-                for (int ti : {0, n_tok - 1}) {
-                    if (ti < 0 || ti >= n_tok) continue;
-                    const float* row = d + (ptrdiff_t)ti * row_stride;
-                    float mn = row[0], mx = row[0];
-                    int pos_ct = 0;
-                    for (int i = 0; i < n_vocab; i++) {
-                        if (row[i] < mn) mn = row[i];
-                        if (row[i] > mx) mx = row[i];
-                        if (row[i] > 0) pos_ct++;
-                    }
-                    fprintf(stderr, "[LM_HEAD_OUT #%d] tok=%d/%d vocab=%d min=%.4f max=%.4f pos_ct=%d stride=%ld\n",
-                            cb_lm_ct, ti, n_tok, n_vocab, mn, mx, pos_ct, (long)row_stride);
+                const bool debug_stats = IsDebugInferenceStatsEnabled();
+                const char* top_env = std::getenv("DENSECORE_DEBUG_LM_HEAD_TOP");
+                int top_n = 0;
+                if (top_env && *top_env) {
+                    char* end = nullptr;
+                    long parsed = std::strtol(top_env, &end, 10);
+                    top_n =
+                        (end == top_env || (end && *end != '\0') || parsed <= 0) ? 8 : (int)std::min<long>(parsed, 32);
                 }
-                cb_lm_ct++;
+                if (debug_stats && cb_lm_ct < 3) {
+                    for (int ti : {0, n_tok - 1}) {
+                        if (ti < 0 || ti >= n_tok) continue;
+                        const float* row = d + (ptrdiff_t)ti * row_stride;
+                        float mn = row[0], mx = row[0];
+                        int pos_ct = 0;
+                        for (int i = 0; i < n_vocab; i++) {
+                            if (row[i] < mn) mn = row[i];
+                            if (row[i] > mx) mx = row[i];
+                            if (row[i] > 0) pos_ct++;
+                        }
+                        fprintf(stderr, "[LM_HEAD_OUT #%d] tok=%d/%d vocab=%d min=%.4f max=%.4f pos_ct=%d stride=%ld\n",
+                                cb_lm_ct, ti, n_tok, n_vocab, mn, mx, pos_ct, (long)row_stride);
+                    }
+                    cb_lm_ct++;
+                }
+                if (top_n > 0 && n_tok > 0) {
+                    const float* row = d + (ptrdiff_t)(n_tok - 1) * row_stride;
+                    std::vector<std::pair<float, int>> top;
+                    top.reserve((size_t)top_n);
+                    auto worse_first = [](const auto& a, const auto& b) {
+                        if (a.first == b.first) return a.second < b.second;
+                        return a.first > b.first;
+                    };
+                    for (int i = 0; i < n_vocab; ++i) {
+                        const float v = row[i];
+                        if (!std::isfinite(v)) continue;
+                        if ((int)top.size() < top_n) {
+                            top.emplace_back(v, i);
+                            std::push_heap(top.begin(), top.end(), worse_first);
+                        } else if (v > top.front().first || (v == top.front().first && i < top.front().second)) {
+                            std::pop_heap(top.begin(), top.end(), worse_first);
+                            top.back() = {v, i};
+                            std::push_heap(top.begin(), top.end(), worse_first);
+                        }
+                    }
+                    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+                        if (a.first == b.first) return a.second < b.second;
+                        return a.first > b.first;
+                    });
+                    fprintf(stderr, "[LM_HEAD_TOP] tok=%d/%d top_n=%d\n", n_tok - 1, n_tok, top_n);
+                    for (const auto& [score, token_id] : top) {
+                        fprintf(stderr, "  [TOP] token=%d logit=%.6f\n", token_id, score);
+                    }
+                    const char* watch_env = std::getenv("DENSECORE_DEBUG_LM_HEAD_WATCH_IDS");
+                    if (watch_env && *watch_env) {
+                        std::string spec(watch_env);
+                        size_t start = 0;
+                        while (start < spec.size()) {
+                            size_t end = spec.find(',', start);
+                            if (end == std::string::npos) end = spec.size();
+                            std::string piece = spec.substr(start, end - start);
+                            char* parse_end = nullptr;
+                            long parsed = std::strtol(piece.c_str(), &parse_end, 10);
+                            if (parse_end != piece.c_str() && (!parse_end || *parse_end == '\0') && parsed >= 0 &&
+                                parsed < n_vocab) {
+                                fprintf(stderr, "  [WATCH] token=%ld logit=%.6f\n", parsed, row[parsed]);
+                            }
+                            start = end + 1;
+                        }
+                    }
+                }
             }
             if (dst && src && dst->data && src->data) {
                 memcpy(dst->data, src->data, ggml_nbytes(src));
@@ -5545,6 +5779,12 @@ std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float
     std::vector<float> out(static_cast<size_t>(n_queries) * static_cast<size_t>(n_head) * head_dim_v, 0.0f);
     std::vector<float> scores(static_cast<size_t>(n_total_tokens), -std::numeric_limits<float>::infinity());
 
+    KVRetentionPolicy retention_policy;
+    retention_policy.enabled = (sliding_window >= 0);
+    retention_policy.sliding_window = sliding_window >= 0 ? sliding_window : -1;
+    retention_policy.sink_tokens = GetKVRetentionPolicy().sink_tokens;
+    const KVRetentionSpan retained = ::ComputeKVRetentionSpan(n_past, retention_policy);
+
     for (int token_idx = 0; token_idx < n_queries; ++token_idx) {
         const int query_pos = n_past + token_idx;
         for (int h = 0; h < n_head; ++h) {
@@ -5556,10 +5796,12 @@ std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float
             for (int k_idx = 0; k_idx < n_total_tokens; ++k_idx) {
                 bool masked = false;
                 if (use_explicit_mask) {
-                    if (sliding_window >= 0 && k_idx < (query_pos - sliding_window)) {
+                    const int key_pos = (k_idx < retained.history_kept) ? ::MapRetainedHistoryIndex(retained, k_idx)
+                                                                        : (n_past + (k_idx - retained.history_kept));
+                    if (sliding_window >= 0 && key_pos < (query_pos - sliding_window)) {
                         masked = true;
                     }
-                    if (n_queries > 1 && k_idx > query_pos) {
+                    if (n_queries > 1 && key_pos > query_pos) {
                         masked = true;
                     }
                 }

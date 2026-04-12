@@ -9,6 +9,7 @@ std::string DenseCoreTestOnlyApplyAutoChatTemplate(const TransformerModel* model
 bool DenseCoreTestOnlyPromptStartsInThinkBlock(const std::string& prompt);
 std::vector<int> DenseCoreTestOnlyQwenReasoningBlocklist(const TransformerModel* model);
 std::vector<int> DenseCoreTestOnlyGemma4TextBlocklist(const TransformerModel* model);
+std::string DenseCoreTestOnlyPrimeQwenNoThinking(const TransformerModel* model, const std::string& prompt);
 
 TEST(ChatTemplateTest, GemmaAutoTemplateUsesOfficialTurnFormatWithImplicitInstructions) {
     TransformerModel model{};
@@ -80,6 +81,21 @@ TEST(ChatTemplateTest, Qwen3DefaultsToThinkingWhenEnvIsUnset) {
     const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
 
     EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+}
+
+TEST(ChatTemplateTest, Qwen3NoThinkingPrimesAssistantAnswerCue) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN3;
+    model.variant = ModelVariant::QWEN3;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN3_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "What is the capital of France?");
+    const std::string primed = DenseCoreTestOnlyPrimeQwenNoThinking(&model, wrapped);
+    unsetenv("DENSECORE_QWEN3_ENABLE_THINKING");
+
+    EXPECT_NE(primed.find("<|im_start|>assistant\nAnswer: "), std::string::npos);
 }
 
 TEST(ChatTemplateTest, GemmaThinkingAutoTemplateInjectsThinkSystemTurn) {

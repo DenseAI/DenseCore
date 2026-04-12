@@ -323,21 +323,51 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         }
         return std::binary_search(params.disallowed_token_ids->begin(), params.disallowed_token_ids->end(), token_id);
     };
+    auto is_allowed = [&](int token_id) -> bool {
+        if (!params.allowed_token_ids || params.allowed_token_ids->empty()) {
+            return true;
+        }
+        return std::binary_search(params.allowed_token_ids->begin(), params.allowed_token_ids->end(), token_id);
+    };
+    auto resolve_debug_top_n = [&]() -> int {
+        const char* env = std::getenv("DENSECORE_DEBUG_SAMPLE_TOP");
+        if (!env || env[0] == '\0') {
+            return 0;
+        }
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end == env || (end && *end != '\0') || parsed <= 0) {
+            return 5;
+        }
+        return static_cast<int>(std::min<long>(parsed, 20));
+    };
+    const int debug_top_n = resolve_debug_top_n();
 
-    auto finite_argmax_raw = [last_logits, range_start, range_end, &is_disallowed]() -> int {
+    auto first_allowed_token = [&]() -> int {
+        if (!params.allowed_token_ids || params.allowed_token_ids->empty()) {
+            return range_start;
+        }
+        for (int token_id : *params.allowed_token_ids) {
+            if (token_id >= range_start && token_id < range_end) {
+                return token_id;
+            }
+        }
+        return range_start;
+    };
+    auto finite_argmax_raw = [last_logits, range_start, range_end, &is_disallowed, &is_allowed, &first_allowed_token]() -> int {
         int best_idx = range_start;
         float best_val = -INFINITY;
         bool found = false;
         for (int i = range_start; i < range_end; ++i) {
             const float v = last_logits[i];
-            if (!std::isfinite(v) || is_disallowed(i)) continue;
+            if (!std::isfinite(v) || is_disallowed(i) || !is_allowed(i)) continue;
             if (!found || v > best_val) {
                 best_val = v;
                 best_idx = i;
                 found = true;
             }
         }
-        return found ? best_idx : range_start;
+        return found ? best_idx : first_allowed_token();
     };
     const bool debug_sample = (std::getenv("DENSECORE_DEBUG_SAMPLE") != nullptr);
     auto debug_log_sample = [&](int token_id) {
@@ -446,7 +476,7 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
 
     auto adjusted_logit_at = [&](int local_token) -> float {
         const int token_id = range_start + local_token;
-        if (!requires_working_logits && is_disallowed(token_id)) {
+        if (!requires_working_logits && (is_disallowed(token_id) || !is_allowed(token_id))) {
             return -INFINITY;
         }
 
@@ -480,6 +510,81 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
 
         return std::isfinite(v) ? v : -INFINITY;
     };
+    auto debug_dump_top_candidates = [&](const char* stage, int sampled_token) {
+        if (debug_top_n <= 0 || !params.vocab) {
+            return;
+        }
+        struct DebugCandidate {
+            float logit = -INFINITY;
+            int token_id = -1;
+        };
+        std::vector<DebugCandidate> top;
+        top.reserve(static_cast<size_t>(debug_top_n));
+        auto worse_first = [](const DebugCandidate& a, const DebugCandidate& b) {
+            if (a.logit == b.logit) return a.token_id < b.token_id;
+            return a.logit > b.logit;
+        };
+        for (int i = 0; i < active_vocab; ++i) {
+            const float v = adjusted_logit_at(i);
+            if (!std::isfinite(v)) continue;
+            const int token_id = range_start + i;
+            DebugCandidate cand{v, token_id};
+            if (static_cast<int>(top.size()) < debug_top_n) {
+                top.push_back(cand);
+                std::push_heap(top.begin(), top.end(), worse_first);
+            } else if (v > top.front().logit || (v == top.front().logit && token_id < top.front().token_id)) {
+                std::pop_heap(top.begin(), top.end(), worse_first);
+                top.back() = cand;
+                std::push_heap(top.begin(), top.end(), worse_first);
+            }
+        }
+        std::sort(top.begin(), top.end(), [](const DebugCandidate& a, const DebugCandidate& b) {
+            if (a.logit == b.logit) return a.token_id < b.token_id;
+            return a.logit > b.logit;
+        });
+        fprintf(stderr,
+                "[SAMPLE_TOP] stage=%s idx=%d sampled=%d temp=%.4f top_p=%.4f top_k=%d rep=%.4f active_vocab=%d\n",
+                stage ? stage : "unknown", idx, sampled_token, params.temperature, params.top_p, params.top_k,
+                params.repetition_penalty, active_vocab);
+        for (const DebugCandidate& cand : top) {
+            std::string tok = (cand.token_id >= 0 && cand.token_id < static_cast<int>(params.vocab->size()))
+                                  ? (*params.vocab)[cand.token_id]
+                                  : "";
+            for (char& ch : tok) {
+                if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+            }
+            fprintf(stderr, "  [TOP] token=%d logit=%.6f raw='%s'%s\n", cand.token_id, cand.logit, tok.c_str(),
+                    cand.token_id == sampled_token ? " <sampled>" : "");
+        }
+        const char* watch_env = std::getenv("DENSECORE_DEBUG_SAMPLE_WATCH_IDS");
+        if (watch_env && watch_env[0] != '\0') {
+            std::string ids_spec(watch_env);
+            size_t start = 0;
+            while (start < ids_spec.size()) {
+                size_t end = ids_spec.find(',', start);
+                if (end == std::string::npos) {
+                    end = ids_spec.size();
+                }
+                const std::string token_id_text = ids_spec.substr(start, end - start);
+                char* parse_end = nullptr;
+                const long parsed = std::strtol(token_id_text.c_str(), &parse_end, 10);
+                if (parse_end != token_id_text.c_str() && (!parse_end || *parse_end == '\0') && parsed >= range_start &&
+                    parsed < range_end) {
+                    const int token_id = static_cast<int>(parsed);
+                    const float logit = adjusted_logit_at(token_id - range_start);
+                    std::string tok = (token_id >= 0 && token_id < static_cast<int>(params.vocab->size()))
+                                          ? (*params.vocab)[token_id]
+                                          : "";
+                    for (char& ch : tok) {
+                        if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+                    }
+                    fprintf(stderr, "  [WATCH] token=%d logit=%.6f raw='%s'%s\n", token_id, logit, tok.c_str(),
+                            token_id == sampled_token ? " <sampled>" : "");
+                }
+                start = end + 1;
+            }
+        }
+    };
 
     auto finite_argmax_adjusted = [&]() -> int {
         int best_idx = range_start;
@@ -495,11 +600,12 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
                 found = true;
             }
         }
-        return found ? best_idx : finite_argmax_raw();
+        return found ? best_idx : first_allowed_token();
     };
 
     if (params.temperature <= 0.0f || (params.top_k <= 1 && params.top_p >= 1.0f && params.min_p <= 0.0f)) {
         const int token = finite_argmax_adjusted();
+        debug_dump_top_candidates("argmax_adjusted", token);
         debug_log_sample(token);
         return token;
     }
@@ -563,6 +669,7 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
 
     if (!found_finite || !std::isfinite(max_logit)) {
         const int token = finite_argmax_raw();
+        debug_dump_top_candidates("argmax_raw_fallback", token);
         debug_log_sample(token);
         return token;
     }
@@ -600,6 +707,7 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
     }
 
     if (!(sum_exp > 0.0f) || !std::isfinite(sum_exp)) {
+        debug_dump_top_candidates("best_token_fallback", best_token);
         debug_log_sample(best_token);
         return best_token;
     }
@@ -629,6 +737,7 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
     }
 
     if (candidates.empty()) {
+        debug_dump_top_candidates("empty_candidates_fallback", best_token);
         debug_log_sample(best_token);
         return best_token;
     }
@@ -638,6 +747,7 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         total_mass += candidate.mass;
     }
     if (!(total_mass > 0.0f) || !std::isfinite(total_mass)) {
+        debug_dump_top_candidates("front_candidate_fallback", candidates.front().token_id);
         debug_log_sample(candidates.front().token_id);
         return candidates.front().token_id;
     }
@@ -669,11 +779,13 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
     for (const auto& candidate : candidates) {
         cumulative_mass += candidate.mass;
         if (random_val <= cumulative_mass) {
+            debug_dump_top_candidates("sampled", candidate.token_id);
             debug_log_sample(candidate.token_id);
             return candidate.token_id;
         }
     }
 
+    debug_dump_top_candidates("sorted_front_fallback", candidates.front().token_id);
     debug_log_sample(candidates.front().token_id);
     return candidates.front().token_id;
 }

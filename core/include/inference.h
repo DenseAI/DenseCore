@@ -5,9 +5,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "densecore/hal/tensor.h"
+#include "densecore/models/model_graph_capabilities.h"
 #include "kv_cache.h"
 #include "model_types.h"
 
@@ -29,6 +31,27 @@ struct LoRAAdapter;  // Forward declaration
 class BackendRegistry;
 class HardwareTopology;
 class OpRegistry;
+class TransformerGraphBuilder;
+
+enum class TransformerGraphExecutionRoute : uint8_t {
+    Reject = 0,
+    RegistryBuilder,
+    InlineDenseAttention,
+    InlineHybridSSM,
+    InlineSlidingWindowSharedKV,
+};
+
+struct TransformerGraphExecutionPlan {
+    models::GraphFamilyResolution resolution{};
+    TransformerGraphExecutionRoute route = TransformerGraphExecutionRoute::Reject;
+    std::string registry_builder_key;
+    std::string selected_builder_name;
+    std::string debug_reason;
+};
+
+TransformerGraphExecutionPlan ResolveTransformerGraphExecutionPlan(const TransformerModel* model);
+std::unique_ptr<TransformerGraphBuilder>
+InstantiateRegistryBuilderForExecutionPlan(const TransformerGraphExecutionPlan& plan, std::string* error_reason);
 }  // namespace densecore
 
 struct InferenceDependencies;
@@ -266,6 +289,9 @@ struct SamplingParams {
 
     // Optional explicit token blacklist applied before sampling.
     const std::vector<int>* disallowed_token_ids = nullptr;
+
+    // Optional explicit token whitelist applied before sampling.
+    const std::vector<int>* allowed_token_ids = nullptr;
 
     // Grammar constraint for structured output
     GrammarConstraint* grammar = nullptr;

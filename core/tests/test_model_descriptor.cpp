@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <string>
+
+#include "densecore/models/model_graph_capabilities.h"
 #include "densecore/models/model_descriptor.h"
 #include "model_types.h"
 #include "models/model_inference_policy.h"
@@ -73,4 +76,60 @@ TEST(ModelDescriptorTest, NonGemmaSoftcapMetadataIsUnchanged) {
     model.arch = ModelArch::LLAMA;
 
     EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(&model, 50.0f), 50.0f);
+}
+
+TEST(ModelDescriptorTest, DenseDecoderGraphFamilySelectsGenericDecoder) {
+    TransformerModel model{};
+    model.arch = ModelArch::LLAMA;
+
+    const auto capabilities = densecore::models::ResolveModelGraphCapabilities(&model);
+    const auto resolution = densecore::models::ResolveGraphFamily(&model);
+
+    EXPECT_EQ(capabilities.topology, densecore::models::GraphTopology::DECODER_ONLY);
+    EXPECT_TRUE(capabilities.has_dense_attention);
+    EXPECT_EQ(resolution.preferred_family, densecore::models::GraphFamily::DecoderDenseAttention);
+    EXPECT_TRUE(resolution.fallback_chain.empty());
+}
+
+TEST(ModelDescriptorTest, Qwen35GraphFamilySelectsHybridSsm) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.arch_flags.requires_q_norm = true;
+    model.arch_flags.requires_k_norm = true;
+
+    const auto resolution = densecore::models::ResolveGraphFamily(&model);
+
+    EXPECT_EQ(resolution.preferred_family, densecore::models::GraphFamily::DecoderHybridSSM);
+    ASSERT_EQ(resolution.fallback_chain.size(), 1u);
+    EXPECT_EQ(resolution.fallback_chain[0], densecore::models::GraphFamily::DecoderDenseAttention);
+}
+
+TEST(ModelDescriptorTest, Gemma4GraphFamilySelectsSlidingSharedKv) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.gemma4_layer_is_sliding = {1, 0};
+    model.gemma4_layer_kv_source = {0, 0};
+    model.gemma4_layer_n_head_kv = {4, 2};
+    model.hparams.n_head_kv = 4;
+
+    const auto resolution = densecore::models::ResolveGraphFamily(&model);
+
+    EXPECT_EQ(resolution.preferred_family, densecore::models::GraphFamily::DecoderSlidingWindowSharedKV);
+    ASSERT_EQ(resolution.fallback_chain.size(), 1u);
+    EXPECT_EQ(resolution.fallback_chain[0], densecore::models::GraphFamily::DecoderDenseAttention);
+}
+
+TEST(ModelDescriptorTest, DenseDecoderAdmissionFailsClosedForUnsupportedMoe) {
+    TransformerModel model{};
+    model.arch = ModelArch::LLAMA;
+    model.hparams.n_experts = 8;
+
+    const auto admission = densecore::models::AdmitGraphBuilder(
+        densecore::models::ResolveGraphFamily(&model),
+        densecore::models::MakeDenseDecoderGenericSupport("unit-test-generic"));
+
+    EXPECT_FALSE(admission.admitted);
+    EXPECT_NE(admission.Summary().find("MoE routing semantics"), std::string::npos);
 }

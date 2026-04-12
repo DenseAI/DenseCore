@@ -17,10 +17,14 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <ggml.h>
+
+#include "densecore/models/model_graph_capabilities.h"
 
 // Forward declarations to avoid circular includes
 struct TransformerModel;
@@ -28,6 +32,8 @@ struct BatchSpec;
 struct PagedKVCache;
 
 namespace densecore {
+
+inline constexpr const char* kDenseDecoderGenericBuilderKey = "densecore_inline_dense_decoder";
 
 // ============================================================================
 // TransformerGraphBuilder: Strategy interface for graph construction
@@ -78,6 +84,12 @@ protected:
                                     bool embedding_mode, struct ggml_cgraph* gf);
 };
 
+struct RegisteredTransformerGraphBuilder {
+    std::string key;
+    std::string display_name;
+    models::GraphBuilderSupport support;
+};
+
 // ============================================================================
 // TransformerGraphRegistry: Factory for selecting architecture-specific builder
 // ============================================================================
@@ -90,34 +102,94 @@ public:
 
     using BuilderFactory = std::function<std::unique_ptr<TransformerGraphBuilder>()>;
 
-    // Register a builder factory for an architecture
+    // Compatibility-only registration surface.
+    // Registers a string alias without capability metadata, so the new runtime
+    // graph-family dispatch must not rely on entries created through this API.
     void Register(const std::string& arch_name, BuilderFactory factory) {
         std::lock_guard<std::mutex> lock(mu_);
-        builders_[arch_name] = factory;
+        RegisterLocked(arch_name, arch_name, models::GraphBuilderSupport{}, std::move(factory));
     }
 
-    // Get a builder instance for the given architecture
-    // Falls back to "llama" if architecture not found (most compatible)
-    std::unique_ptr<TransformerGraphBuilder> GetBuilder(const std::string& arch_name) {
+    // Exact registration surface for capability-aware dispatch. The registry
+    // owns the builder identity and support metadata so planning can choose an
+    // admitted builder without constructing it.
+    void RegisterExact(const std::string& key, const std::string& display_name, models::GraphBuilderSupport support,
+                       BuilderFactory factory) {
         std::lock_guard<std::mutex> lock(mu_);
-        auto it = builders_.find(arch_name);
+        RegisterLocked(key, display_name, std::move(support), std::move(factory));
+    }
+
+    // Exact registry lookup for capability-aware dispatch.
+    // New runtime graph selection must use this surface, not string fallback.
+    std::unique_ptr<TransformerGraphBuilder> GetBuilderExact(const std::string& key) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = builders_.find(key);
         if (it != builders_.end()) {
-            return it->second();
-        }
-        // Fallback to LLaMA-style builder (most common)
-        it = builders_.find("llama");
-        if (it != builders_.end()) {
-            return it->second();
+            return it->second.factory();
         }
         return nullptr;
     }
 
-    // Get builder based on ModelArch enum (convenience wrapper)
+    std::optional<RegisteredTransformerGraphBuilder> GetBuilderDescriptorExact(const std::string& key) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = builders_.find(key);
+        if (it == builders_.end()) {
+            return std::nullopt;
+        }
+        return RegisteredTransformerGraphBuilder{it->second.key, it->second.display_name, it->second.support};
+    }
+
+    std::optional<RegisteredTransformerGraphBuilder>
+    ResolveBuilderDescriptor(const models::GraphFamilyResolution& resolution, std::string* debug_reason);
+
+    // Compatibility-only string lookup.
+    // Falls back to "llama" for legacy callers and must not be used by the new
+    // capability-aware graph-family execution control plane.
+    std::unique_ptr<TransformerGraphBuilder> GetBuilder(const std::string& arch_name) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = builders_.find(arch_name);
+        if (it != builders_.end()) {
+            return it->second.factory();
+        }
+        // Fallback to LLaMA-style builder (most common)
+        it = builders_.find("llama");
+        if (it != builders_.end()) {
+            return it->second.factory();
+        }
+        return nullptr;
+    }
+
+    // Legacy-only compatibility overload.
+    // Do not use this from BuildTransformerGraph or any capability-aware runtime
+    // dispatch path; it preserves coarse arch-name fallback semantics and does
+    // not represent the new graph-family admission contract.
     std::unique_ptr<TransformerGraphBuilder> GetBuilder(int arch_enum);
 
+    // Resolve graph family from model capabilities and attempt admitted builders
+    // for compatibility with call sites that still want a direct builder object.
+    // New runtime execution planning should prefer exact builder-key resolution.
+    std::unique_ptr<TransformerGraphBuilder> GetBuilder(const TransformerModel* model, std::string* debug_reason);
+
 private:
+    struct BuilderEntry {
+        std::string key;
+        std::string display_name;
+        models::GraphBuilderSupport support;
+        BuilderFactory factory;
+    };
+
+    void RegisterLocked(const std::string& key, const std::string& display_name, models::GraphBuilderSupport support,
+                        BuilderFactory factory) {
+        auto it = builders_.find(key);
+        if (it == builders_.end()) {
+            registration_order_.push_back(key);
+        }
+        builders_[key] = BuilderEntry{key, display_name, std::move(support), std::move(factory)};
+    }
+
     std::mutex mu_;
-    std::unordered_map<std::string, BuilderFactory> builders_;
+    std::unordered_map<std::string, BuilderEntry> builders_;
+    std::vector<std::string> registration_order_;
 };
 
 // ============================================================================

@@ -190,10 +190,87 @@ struct ggml_tensor* TransformerGraphBuilder::BuildLMHead(TransformerModel* model
 }
 
 // ============================================================================
-// TransformerGraphRegistry: ModelArch to string mapping
+// TransformerGraphRegistry: capability-aware selection plus legacy compatibility
 // ============================================================================
 
+std::optional<RegisteredTransformerGraphBuilder>
+TransformerGraphRegistry::ResolveBuilderDescriptor(const models::GraphFamilyResolution& resolution,
+                                                   std::string* debug_reason) {
+    std::lock_guard<std::mutex> lock(mu_);
+
+    std::vector<std::string> rejection_reasons;
+    for (const std::string& key : registration_order_) {
+        const auto it = builders_.find(key);
+        if (it == builders_.end()) {
+            continue;
+        }
+        const auto& entry = it->second;
+        if (entry.support.supported_families.empty()) {
+            continue;
+        }
+
+        const auto admission = models::AdmitGraphBuilder(resolution, entry.support);
+        if (admission.admitted) {
+            if (debug_reason) {
+                *debug_reason = "selected exact builder '" + entry.key + "' (" + entry.display_name + ")";
+            }
+            return RegisteredTransformerGraphBuilder{entry.key, entry.display_name, entry.support};
+        }
+
+        rejection_reasons.push_back(entry.display_name + ": " + admission.Summary());
+    }
+
+    if (debug_reason) {
+        if (rejection_reasons.empty()) {
+            *debug_reason = "no exact registry builder with capability metadata is registered for this graph family";
+        } else {
+            debug_reason->clear();
+            for (size_t i = 0; i < rejection_reasons.size(); ++i) {
+                if (i != 0) {
+                    *debug_reason += " | ";
+                }
+                *debug_reason += rejection_reasons[i];
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::unique_ptr<TransformerGraphBuilder> TransformerGraphRegistry::GetBuilder(const TransformerModel* model,
+                                                                              std::string* debug_reason) {
+    if (!model) {
+        if (debug_reason) {
+            *debug_reason = "model is null";
+        }
+        return nullptr;
+    }
+
+    const auto resolution = models::ResolveGraphFamily(model);
+    if (debug_reason) {
+        *debug_reason = models::FormatModelGraphCapabilities(resolution.capabilities) + " | " +
+                        models::FormatGraphFamilyResolution(resolution);
+    }
+    std::string descriptor_debug;
+    const auto descriptor = ResolveBuilderDescriptor(resolution, &descriptor_debug);
+    if (!descriptor) {
+        if (debug_reason) {
+            *debug_reason += " | " + descriptor_debug;
+        }
+        return nullptr;
+    }
+
+    auto builder = GetBuilderExact(descriptor->key);
+    if (!builder && debug_reason) {
+        *debug_reason += " | resolved exact builder '" + descriptor->key + "' but factory lookup failed";
+    }
+    return builder;
+}
+
 std::unique_ptr<TransformerGraphBuilder> TransformerGraphRegistry::GetBuilder(int arch_enum) {
+    // Legacy-only fallback surface kept for compatibility with older call sites.
+    // BuildTransformerGraph must not use this overload; it bypasses the graph
+    // capability/admission control plane and only preserves the pre-refactor
+    // coarse arch-name behavior.
     // Map ModelArch enum to string name
     const char* arch_name = "llama";  // Default fallback
 

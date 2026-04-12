@@ -86,12 +86,26 @@ def _profile_specs() -> list[dict[str, Any]]:
     return []
 
 
+def _infer_family(source: str) -> str:
+    if "gemma" in source:
+        return "gemma"
+    if "qwen" in source:
+        return "qwen"
+    return "generic"
+
+
 def resolve_prompt_profile(model_hint: Optional[str]) -> PromptProfile:
     source = (model_hint or "").strip().lower()
+    inferred_family = _infer_family(source)
     specs = _profile_specs()
     for spec in specs:
         matches = spec.get("match_substrings", [])
         if any(token in source for token in matches):
+            family = str(spec.get("family", "generic")).strip().lower()
+            if family == "generic" and inferred_family in {"qwen", "gemma"}:
+                for profile in _default_profiles():
+                    if profile.family == inferred_family:
+                        return profile
             roles = spec.get("roles", {})
             tags = spec.get("tags", {})
             multimodal = spec.get("multimodal", {})

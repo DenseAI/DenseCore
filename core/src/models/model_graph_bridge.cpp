@@ -16,6 +16,7 @@
 #include "densecore/hal/tensor.h"
 #include "densecore/hal/transformer_ops_ext.h"
 #include "densecore/models/graph_registry.h"
+#include "densecore/models/model_graph_capabilities.h"
 #include "model_types.h"
 
 #include "ggml.h"
@@ -93,12 +94,26 @@ static void AddCanonicalLlmTensorAliases(const TransformerModel* model,
     }
 }
 
-static bool SupportsGenericLlmGraph(const TransformerModel* model) {
-    if (!model) return false;
-    if (model->arch == ModelArch::QWEN35 || model->arch_flags.is_hybrid_ssm || model->arch_flags.is_gemma4) {
-        return false;
+models::GraphAdmissionResult AdmitGenericLlmBuilder(const TransformerModel* model) {
+    if (!model) {
+        return {};
     }
-    return true;
+    return models::AdmitGraphBuilder(models::ResolveGraphFamily(model),
+                                     models::MakeDenseDecoderGenericSupport("GenericLlmBuilder"));
+}
+
+bool SupportsGenericLlmGraph(const TransformerModel* model) {
+    return AdmitGenericLlmBuilder(model).admitted;
+}
+
+void LogGraphResolution(const char* prefix, const TransformerModel* model) {
+    if (!model) {
+        return;
+    }
+    const auto resolution = models::ResolveGraphFamily(model);
+    std::cout << prefix << " capabilities: " << models::FormatModelGraphCapabilities(resolution.capabilities)
+              << std::endl;
+    std::cout << prefix << " graph family: " << models::FormatGraphFamilyResolution(resolution) << std::endl;
 }
 
 // =============================================================================
@@ -110,8 +125,9 @@ public:
 
     std::unique_ptr<OperationGraph> Build(const std::vector<Tensor>& inputs,
                                           const std::string& /*variant_name*/) override {
-        if (!SupportsGenericLlmGraph(model_)) {
-            throw GraphBuildException("GenericLlmBuilder does not support hybrid SSM architectures like Qwen3.5");
+        const auto admission = AdmitGenericLlmBuilder(model_);
+        if (!admission.admitted) {
+            throw GraphBuildException("GenericLlmBuilder admission failed: " + admission.Summary());
         }
 
         // 1. Generate Config
@@ -1081,7 +1097,6 @@ bool ModelGraphBridge::IsGraphModel(ModelArch arch) {
     case ModelArch::WHISPER:
     case ModelArch::LLAMA:
     case ModelArch::QWEN2:
-    case ModelArch::QWEN3:
     case ModelArch::MISTRAL:
     case ModelArch::GEMMA:
     case ModelArch::PHI:
@@ -1134,7 +1149,7 @@ const char* ModelGraphBridge::GetGraphName(ModelArch arch) {
 
 const char* ModelGraphBridge::GetGraphName(const TransformerModel* model) {
     if (!model) return nullptr;
-    if ((model->arch == ModelArch::QWEN35 || model->arch == ModelArch::GEMMA) && !SupportsGenericLlmGraph(model)) {
+    if (IsLlmArch(model->arch) && !SupportsGenericLlmGraph(model)) {
         return nullptr;
     }
     return GetGraphName(model->arch);
@@ -1214,8 +1229,11 @@ bool ModelGraphBridge::RegisterWhisperBuilder(const TransformerModel* model) {
 }
 
 bool ModelGraphBridge::RegisterLlmBuilder(const TransformerModel* model) {
-    if (!SupportsGenericLlmGraph(model)) {
-        std::cout << "[ModelGraphBridge] Skipping GenericLlmBuilder for hybrid SSM arch" << std::endl;
+    LogGraphResolution("[ModelGraphBridge]", model);
+
+    const auto admission = AdmitGenericLlmBuilder(model);
+    if (!admission.admitted) {
+        std::cout << "[ModelGraphBridge] Skipping GenericLlmBuilder: " << admission.Summary() << std::endl;
         return false;
     }
 

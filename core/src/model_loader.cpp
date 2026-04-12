@@ -502,9 +502,6 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
         float gemma4_attention_logit_cap = 0.0f;
         get_f32("attention_logit_cap", gemma4_attention_logit_cap);
-        // Gemma4 text attention stays uncapped even when exporters carry over an
-        // audio-only attention_logit_cap field. Sanitize this at load time so
-        // decode numerics remain fail-closed.
         model->gemma4_attention_logit_softcapping =
             densecore::models::SanitizeAttentionLogitSoftcapForLoad(model, gemma4_attention_logit_cap);
         get_f32("final_logit_softcapping", model->gemma4_final_logit_softcapping);

@@ -73,6 +73,68 @@ bool IsGemma4LikelyControlToken(const std::string& token) {
     return token.rfind("<unused", 0) == 0;
 }
 
+bool IsAsciiTextLikeToken(const std::string& token) {
+    bool saw_ascii_alnum = false;
+    for (unsigned char ch : token) {
+        if (ch >= 0x80) {
+            return false;
+        }
+        if (std::isalnum(ch)) {
+            saw_ascii_alnum = true;
+            continue;
+        }
+        switch (ch) {
+        case ' ':
+        case '\n':
+        case '\r':
+        case '\t':
+        case '_':
+        case '-':
+        case '\'':
+        case '"':
+        case '.':
+        case ',':
+        case ':':
+        case ';':
+        case '!':
+        case '?':
+        case '(':
+        case ')': continue;
+        default: return false;
+        }
+    }
+    return saw_ascii_alnum;
+}
+
+bool IsAsciiOneWordAnswerToken(const std::string& token) {
+    if (token.empty()) {
+        return false;
+    }
+    bool has_word_boundary = false;
+    size_t i = 0;
+    if (token[0] == '\xE2' && token.size() >= 3 && static_cast<unsigned char>(token[1]) == 0x96 &&
+        static_cast<unsigned char>(token[2]) == 0x81) {
+        i = 3;  // leading sentencepiece space marker
+        has_word_boundary = true;
+    }
+    if (i >= token.size()) {
+        return false;
+    }
+    const unsigned char first = static_cast<unsigned char>(token[i]);
+    if (!has_word_boundary && !std::isupper(first)) {
+        return false;
+    }
+    bool saw_alpha = false;
+    for (; i < token.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(token[i]);
+        if (ch >= 0x80 || !std::isalpha(ch)) {
+            return false;
+        }
+        saw_alpha = true;
+    }
+    return saw_alpha;
+}
+
 bool ModelUsesQwenThinkingEnv(const TransformerModel* model) {
     return DescribeModel(model).uses_qwen_thinking_env;
 }
@@ -207,6 +269,28 @@ void ConfigureGemma4TextTokenBlocklistForModel(const TransformerModel* model, Re
     for (const auto& [token, token_id] : model->token_to_id) {
         if (IsGemma4LikelyControlToken(token) && !is_stop_id(token_id)) {
             AppendDisallowedTokenId(req, token_id);
+        }
+    }
+
+    if (ParseBoolEnv("DENSECORE_GEMMA4_STRICT_ASCII_TEXT", false)) {
+        for (const auto& [token, token_id] : model->token_to_id) {
+            if (is_stop_id(token_id)) {
+                continue;
+            }
+            if (!IsAsciiTextLikeToken(token)) {
+                AppendDisallowedTokenId(req, token_id);
+            }
+        }
+    }
+
+    if (ParseBoolEnv("DENSECORE_GEMMA4_ONE_WORD_ASCII_QA", false)) {
+        for (const auto& [token, token_id] : model->token_to_id) {
+            if (is_stop_id(token_id)) {
+                continue;
+            }
+            if (!IsAsciiOneWordAnswerToken(token)) {
+                AppendDisallowedTokenId(req, token_id);
+            }
         }
     }
 

@@ -94,12 +94,33 @@ func resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate str
 	case strings.Contains(tokenizerLower, "gemma"):
 		return fallbackPromptProfile("gemma")
 	}
+	detectedFamily := inferPromptFamilyFromModelHint(lower)
 	for _, spec := range loadPromptProfileSpecs() {
 		if spec.matches(lower) {
-			return spec.toPromptProfile()
+			profile := spec.toPromptProfile()
+			if profile.family == promptFamilyGeneric {
+				switch detectedFamily {
+				case promptFamilyQwen:
+					return fallbackPromptProfile("qwen")
+				case promptFamilyGemma:
+					return fallbackPromptProfile("gemma")
+				}
+			}
+			return profile
 		}
 	}
 	return fallbackPromptProfile(modelHint)
+}
+
+func inferPromptFamilyFromModelHint(modelHint string) promptFamily {
+	switch {
+	case strings.Contains(modelHint, "gemma"):
+		return promptFamilyGemma
+	case strings.Contains(modelHint, "qwen"):
+		return promptFamilyQwen
+	default:
+		return promptFamilyGeneric
+	}
 }
 
 func loadPromptProfileSpecs() []promptProfileSpec {

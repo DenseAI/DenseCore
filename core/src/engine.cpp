@@ -494,9 +494,101 @@ void ApplyActionTokenRangeFromEnv(SamplingParams* params) {
     params->action_token_start = action_token_start;
 }
 
+void ApplyAllowedTokenIdsFromEnv(Request* req, const TransformerModel* model) {
+    if (!req) return;
+    const char* env = std::getenv("DENSECORE_ALLOWED_TOKEN_IDS");
+    if (!env || env[0] == '\0') {
+        req->allowed_token_ids.clear();
+        req->sampling_params.allowed_token_ids = nullptr;
+        return;
+    }
+    req->allowed_token_ids.clear();
+    std::string spec(env);
+    size_t start = 0;
+    while (start < spec.size()) {
+        size_t end = spec.find(',', start);
+        if (end == std::string::npos) end = spec.size();
+        std::string piece = spec.substr(start, end - start);
+        char* parse_end = nullptr;
+        long parsed = std::strtol(piece.c_str(), &parse_end, 10);
+        if (parse_end != piece.c_str() && (!parse_end || *parse_end == '\0') && parsed >= 0 &&
+            parsed <= std::numeric_limits<int>::max()) {
+            req->allowed_token_ids.push_back(static_cast<int>(parsed));
+        }
+        start = end + 1;
+    }
+    const bool strict = []() {
+        const char* env = std::getenv("DENSECORE_ALLOWED_TOKEN_IDS_STRICT");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    if (model && !strict) {
+        for (int stop_id : model->stop_token_ids) {
+            if (stop_id >= 0) req->allowed_token_ids.push_back(stop_id);
+        }
+        if (model->eos_token_id >= 0) {
+            req->allowed_token_ids.push_back(model->eos_token_id);
+        }
+    }
+    std::sort(req->allowed_token_ids.begin(), req->allowed_token_ids.end());
+    req->allowed_token_ids.erase(std::unique(req->allowed_token_ids.begin(), req->allowed_token_ids.end()),
+                                 req->allowed_token_ids.end());
+    req->sampling_params.allowed_token_ids = req->allowed_token_ids.empty() ? nullptr : &req->allowed_token_ids;
+}
+
+bool ShouldPrimeQwenNoThinkingPrompt(const TransformerModel* model) {
+    const auto& descriptor = densecore::models::DescribeModel(model);
+    if (!descriptor.uses_qwen_thinking_env) {
+        return false;
+    }
+    if (descriptor.variant == ModelVariant::QWEN3) {
+        return !ParseBoolEnv("DENSECORE_QWEN3_ENABLE_THINKING", true);
+    }
+    if (descriptor.variant == ModelVariant::QWEN35) {
+        return !ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", false);
+    }
+    return false;
+}
+
+std::string PrimeQwenNoThinkingText(std::string prompt_text) {
+    if (prompt_text.find("You are a helpful assistant.") != std::string::npos &&
+        prompt_text.find("final answer only") == std::string::npos) {
+        const std::string replacement =
+            "You are a helpful assistant.\n"
+            "Provide only the answer. Do not output any thinking process, analysis, reasoning steps, or preamble. "
+            "Never start with 'Thinking Process'.";
+        prompt_text.replace(prompt_text.find("You are a helpful assistant."),
+                            std::strlen("You are a helpful assistant."), replacement);
+    }
+    if (prompt_text.find("<|im_start|>assistant\n") != std::string::npos &&
+        prompt_text.find("Answer:") == std::string::npos) {
+        prompt_text.replace(prompt_text.find("<|im_start|>assistant\n"), std::strlen("<|im_start|>assistant\n"),
+                            "<|im_start|>assistant\nAnswer: ");
+    }
+    return prompt_text;
+}
+
+void MaybePrimeQwenNoThinkingPromptText(const TransformerModel* model, std::string* prompt_text) {
+    if (!prompt_text || !ShouldPrimeQwenNoThinkingPrompt(model)) {
+        return;
+    }
+    *prompt_text = PrimeQwenNoThinkingText(std::move(*prompt_text));
+}
+
 void MaybePrimeQwenNoThinking(const TransformerModel* model, std::vector<int>* tokens) {
-    (void)model;
-    (void)tokens;
+    if (!model || !tokens || tokens->empty()) {
+        return;
+    }
+    if (!ShouldPrimeQwenNoThinkingPrompt(model)) {
+        return;
+    }
+
+    const std::string prompt_text = Tokenizer::DetokenizeMultiple(model, *tokens);
+    const std::string primed_text = PrimeQwenNoThinkingText(prompt_text);
+    if (primed_text == prompt_text) {
+        return;
+    }
+
+    *tokens = Tokenizer::Tokenize(model, primed_text, /*add_bos=*/false, /*add_eos=*/false);
 }
 
 void ConfigureQwenReasoningTokenBlocklist(const TransformerModel* model, Request* req) {
@@ -624,6 +716,13 @@ std::vector<int> DenseCoreTestOnlyGemma4TextBlocklist(const TransformerModel* mo
     ConfigureGemma4TextTokenBlocklist(model, &req);
     return req.disallowed_token_ids;
 }
+
+std::string DenseCoreTestOnlyPrimeQwenNoThinking(const TransformerModel* model, const std::string& prompt) {
+    if (!ShouldPrimeQwenNoThinkingPrompt(model)) {
+        return prompt;
+    }
+    return PrimeQwenNoThinkingText(prompt);
+}
 #endif
 
 // Global request ID counter (shared across all Submit* functions)
@@ -700,6 +799,7 @@ void InitCommonRequest(EngineState* state, Request* req, int max_tokens, float t
     req->sampling_params.top_k = top_k;
     req->sampling_params.repetition_penalty = repetition_penalty;
     ApplyActionTokenRangeFromEnv(&req->sampling_params);
+    req->sampling_params.allowed_token_ids = nullptr;
 
     if (stop_sequences) {
         for (int i = 0; stop_sequences[i] != nullptr; ++i) {
@@ -800,11 +900,13 @@ int SubmitRequestWithSamplingEx(DenseCoreHandle handle, const char* prompt, int 
 
     // Tokenize prompt
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
+    MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
     InitializePromptSuppressionState(req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
     ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
+    ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "sampling");
     req->token_history = req->tokens;
 
@@ -837,11 +939,13 @@ int SubmitRequestWithTokenResults(DenseCoreHandle handle, const char* prompt, in
                       /*callback=*/nullptr, user_data);
 
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
+    MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
     InitializePromptSuppressionState(req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
     ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
+    ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "token_results");
     req->token_history = req->tokens;
 
@@ -989,6 +1093,31 @@ const char* GetChatTemplate(DenseCoreHandle handle) {
     }
     SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "GetChatTemplate: no model loaded");
     return nullptr;
+}
+
+int DenseCoreTokenizeText(DenseCoreHandle handle, const char* text, int add_bos, int add_eos, int* out_ids,
+                          int max_ids) {
+    if (!handle) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCoreTokenizeText: handle is null");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+    if (!text || !out_ids || max_ids <= 0) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCoreTokenizeText: invalid arguments");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+    EngineState* state = (EngineState*)handle;
+    ModelEntry* entry = state->GetDefaultModel();
+    if (!entry || !entry->model) {
+        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "DenseCoreTokenizeText: no model loaded");
+        return DENSECORE_STATUS_MODEL_LOAD_FAILED;
+    }
+    const std::vector<int> tokens = Tokenizer::Tokenize(entry->model.get(), text, add_bos != 0, add_eos != 0);
+    const int count = std::min<int>(max_ids, static_cast<int>(tokens.size()));
+    for (int i = 0; i < count; ++i) {
+        out_ids[i] = tokens[static_cast<size_t>(i)];
+    }
+    ClearError();
+    return count;
 }
 
 /**
@@ -1667,8 +1796,10 @@ int SubmitRequest(DenseCoreHandle handle, const char* prompt, int max_tokens, co
 
     // Tokenize immediately (outside hot path)
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
+    MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
     InitializePromptSuppressionState(req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
+    ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
 
     ApplyDefaultLora(state, req);
@@ -1746,8 +1877,10 @@ int SubmitRequestWithFormatEx(DenseCoreHandle handle, const char* prompt, int ma
 
     // Tokenize immediately (outside hot path)
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
+    MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
     InitializePromptSuppressionState(req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
+    ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
 
     AssignGenerationTier(req);

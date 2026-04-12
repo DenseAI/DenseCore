@@ -15,6 +15,7 @@ bool IsGemma4SlidingLayer(const TransformerModel* model, int layer_idx);
 int Gemma4KVSourceLayer(const TransformerModel* model, int layer_idx);
 bool IsGemma4PerLayerInputDisabled();
 bool IsGemma4LayerOutputScaleDisabled();
+bool IsGemma4DecodeSpecialTransformDisabled();
 bool IsGemma4VNormDisabled();
 bool IsGemma4FullRopeFreqsDisabled();
 bool IsGemma4QKNormDisabled();

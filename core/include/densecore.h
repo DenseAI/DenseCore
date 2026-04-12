@@ -642,6 +642,8 @@ DENSECORE_API int GetMaxContextTokens(DenseCoreHandle handle);
 DENSECORE_API int CountTokens(DenseCoreHandle handle, const char* text, int add_bos, int add_eos);
 DENSECORE_API const char* GetTokenizerType(DenseCoreHandle handle);
 DENSECORE_API const char* GetChatTemplate(DenseCoreHandle handle);
+DENSECORE_API int DenseCoreTokenizeText(DenseCoreHandle handle, const char* text, int add_bos, int add_eos,
+                                        int* out_ids, int max_ids);
 
 /**
  * Cancel a running request
