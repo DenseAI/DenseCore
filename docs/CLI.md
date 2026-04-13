@@ -11,7 +11,7 @@ make lib
 make server
 ```
 
-This produces the CLI binary used below.
+This produces `bin/densecore-server`, which exposes both `serve` and `run`.
 
 ## Commands
 
@@ -29,10 +29,10 @@ Behavior implemented in the current CLI:
 Examples:
 
 ```bash
-densecore run
-densecore run Qwen/Qwen2.5-0.5B-Instruct-GGUF
-densecore run TheBloke/Llama-2-7B-Chat-GGUF --filename llama-2-7b-chat.Q4_K_M.gguf
-densecore run --port 9090
+./bin/densecore-server run
+./bin/densecore-server run Qwen/Qwen2.5-0.5B-Instruct-GGUF
+./bin/densecore-server run TheBloke/Llama-2-7B-Chat-GGUF --filename llama-2-7b-chat.Q4_K_M.gguf
+./bin/densecore-server run --port 9090
 ```
 
 Notes:
@@ -50,10 +50,10 @@ Notes:
 Examples:
 
 ```bash
-densecore serve --model ./models/model.gguf
-densecore serve --model ./models/model.gguf --port 9090
-densecore serve --model ./models/model.gguf --grpc=false
-AUTH_ENABLED=true API_KEYS=sk-example:user:default densecore serve --model ./models/model.gguf
+./bin/densecore-server serve --model ./models/model.gguf
+./bin/densecore-server serve --model ./models/model.gguf --port 9090
+./bin/densecore-server serve --model ./models/model.gguf --grpc=false
+AUTH_ENABLED=true API_KEYS=sk-example:user:default ./bin/densecore-server serve --model ./models/model.gguf
 ```
 
 Flags currently defined by the CLI:
@@ -74,6 +74,8 @@ Flags currently defined by the CLI:
 When `serve` is running, the HTTP server exposes:
 
 - `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `POST /completion` (compatibility alias)
 - `POST /v1/embeddings`
 - `POST /v1/rerank`
 - `GET /v1/models`

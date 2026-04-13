@@ -100,6 +100,9 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 				req.TopK,
 				req.RepetitionPenalty,
 				req.StopSequences,
+				req.AllowedTokenIDs,
+				req.AllowedTokensStrict,
+				req.DisallowedTokenIDs,
 				workerChan,
 			)
 		} else {
@@ -114,6 +117,9 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 				req.TopK,
 				req.RepetitionPenalty,
 				req.StopSequences,
+				req.AllowedTokenIDs,
+				req.AllowedTokensStrict,
+				req.DisallowedTokenIDs,
 				workerChan,
 			)
 		}

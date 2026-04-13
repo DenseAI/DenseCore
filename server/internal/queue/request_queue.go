@@ -12,21 +12,24 @@ type RequestPriority int
 
 // QueuedRequest represents a request in the queue
 type QueuedRequest struct {
-	ID                string
-	Priority          RequestPriority
-	EnqueueTime       time.Time
-	MaxTokens         int
-	JSONMode          bool
-	Prompt            string
-	InputIDs          []int
-	LoraAdapter       string
-	StopSequences     []string
-	Temperature       float64
-	TopP              float64
-	TopK              int
-	RepetitionPenalty float64
-	Context           context.Context
-	ResultChan        chan interface{}
+	ID                  string
+	Priority            RequestPriority
+	EnqueueTime         time.Time
+	MaxTokens           int
+	JSONMode            bool
+	Prompt              string
+	InputIDs            []int
+	LoraAdapter         string
+	StopSequences       []string
+	Temperature         float64
+	TopP                float64
+	TopK                int
+	RepetitionPenalty   float64
+	AllowedTokenIDs     []int
+	AllowedTokensStrict bool
+	DisallowedTokenIDs  []int
+	Context             context.Context
+	ResultChan          chan interface{}
 
 	// MoE optimization: predicted or last-used expert IDs for this request
 	// Used by MoEAwareDequeue to group requests with similar expert affinity

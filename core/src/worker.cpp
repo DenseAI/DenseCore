@@ -2815,8 +2815,14 @@ void EngineLoop(EngineState* state) {
                     }
 
                     std::string token_str;
+                    const bool bench_fast_path_text_enabled = []() {
+                        const char* env = std::getenv("DENSECORE_BENCH_QA_TEXT");
+                        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+                    }();
                     const bool req_bench_fast_path = global_bench_fast_path && !req->json_mode;
-                    if (!req_bench_fast_path) {
+                    const bool should_detokenize =
+                        !req_bench_fast_path || bench_fast_path_text_enabled || req->token_result_callback != nullptr;
+                    if (should_detokenize) {
                         std::string token_piece = Tokenizer::Detokenize(current_model, best_token);
                         if (!token_piece.empty()) {
                             if (req->utf8_pending.empty()) {
@@ -2871,7 +2877,7 @@ void EngineLoop(EngineState* state) {
                     // This prevents the worker thread from blocking on Python GIL.
                     // =========================================================================
                     if (req->callback || req->token_result_callback) {
-                        if (req_bench_fast_path) {
+                        if (req_bench_fast_path && !should_detokenize) {
                             // Benchmark fast-path: emit one callback per generated token
                             // without detokenization/string processing overhead.
                             emit_result_event(req, "", best_token, false, false);

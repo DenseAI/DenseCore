@@ -535,6 +535,55 @@ void ApplyAllowedTokenIdsFromEnv(Request* req, const TransformerModel* model) {
     req->sampling_params.allowed_token_ids = req->allowed_token_ids.empty() ? nullptr : &req->allowed_token_ids;
 }
 
+void ApplyTokenIdConstraints(Request* req, const TransformerModel* model, const int* allowed_token_ids,
+                             int num_allowed_token_ids, bool allowed_token_ids_strict, const int* disallowed_token_ids,
+                             int num_disallowed_token_ids) {
+    if (!req) return;
+
+    req->allowed_token_ids.clear();
+    req->disallowed_token_ids.clear();
+
+    if (allowed_token_ids && num_allowed_token_ids > 0) {
+        req->allowed_token_ids.reserve(static_cast<size_t>(num_allowed_token_ids));
+        for (int i = 0; i < num_allowed_token_ids; ++i) {
+            const int token_id = allowed_token_ids[i];
+            if (token_id >= 0) {
+                req->allowed_token_ids.push_back(token_id);
+            }
+        }
+
+        if (model && !allowed_token_ids_strict) {
+            for (int stop_id : model->stop_token_ids) {
+                if (stop_id >= 0) req->allowed_token_ids.push_back(stop_id);
+            }
+            if (model->eos_token_id >= 0) {
+                req->allowed_token_ids.push_back(model->eos_token_id);
+            }
+        }
+
+        std::sort(req->allowed_token_ids.begin(), req->allowed_token_ids.end());
+        req->allowed_token_ids.erase(std::unique(req->allowed_token_ids.begin(), req->allowed_token_ids.end()),
+                                     req->allowed_token_ids.end());
+    }
+
+    if (disallowed_token_ids && num_disallowed_token_ids > 0) {
+        req->disallowed_token_ids.reserve(static_cast<size_t>(num_disallowed_token_ids));
+        for (int i = 0; i < num_disallowed_token_ids; ++i) {
+            const int token_id = disallowed_token_ids[i];
+            if (token_id >= 0) {
+                req->disallowed_token_ids.push_back(token_id);
+            }
+        }
+        std::sort(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end());
+        req->disallowed_token_ids.erase(std::unique(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end()),
+                                        req->disallowed_token_ids.end());
+    }
+
+    req->sampling_params.allowed_token_ids = req->allowed_token_ids.empty() ? nullptr : &req->allowed_token_ids;
+    req->sampling_params.disallowed_token_ids =
+        req->disallowed_token_ids.empty() ? nullptr : &req->disallowed_token_ids;
+}
+
 bool ShouldPrimeQwenNoThinkingPrompt(const TransformerModel* model) {
     const auto& descriptor = densecore::models::DescribeModel(model);
     if (!descriptor.uses_qwen_thinking_env) {
@@ -800,6 +849,7 @@ void InitCommonRequest(EngineState* state, Request* req, int max_tokens, float t
     req->sampling_params.repetition_penalty = repetition_penalty;
     ApplyActionTokenRangeFromEnv(&req->sampling_params);
     req->sampling_params.allowed_token_ids = nullptr;
+    req->sampling_params.disallowed_token_ids = nullptr;
 
     if (stop_sequences) {
         for (int i = 0; stop_sequences[i] != nullptr; ++i) {
@@ -880,15 +930,30 @@ int SubmitRequestWithSampling(DenseCoreHandle handle, const char* prompt, int ma
 int SubmitRequestWithSamplingEx(DenseCoreHandle handle, const char* prompt, int max_tokens, const char* lora_name,
                                 float temperature, float top_p, int top_k, float repetition_penalty,
                                 const char** stop_sequences, int json_mode, TokenCallback callback, void* user_data) {
+    return SubmitRequestWithSamplingConstraintsEx(handle, prompt, max_tokens, lora_name, temperature, top_p, top_k,
+                                                  repetition_penalty, stop_sequences, json_mode,
+                                                  /*allowed_token_ids=*/nullptr, /*num_allowed_token_ids=*/0,
+                                                  /*allowed_token_ids_strict=*/0,
+                                                  /*disallowed_token_ids=*/nullptr,
+                                                  /*num_disallowed_token_ids=*/0, callback, user_data);
+}
+
+int SubmitRequestWithSamplingConstraintsEx(DenseCoreHandle handle, const char* prompt, int max_tokens,
+                                           const char* lora_name, float temperature, float top_p, int top_k,
+                                           float repetition_penalty, const char** stop_sequences, int json_mode,
+                                           const int* allowed_token_ids, int num_allowed_token_ids,
+                                           int allowed_token_ids_strict, const int* disallowed_token_ids,
+                                           int num_disallowed_token_ids, TokenCallback callback, void* user_data) {
     if (!handle || !prompt) {
-        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "SubmitRequestWithSamplingEx: invalid arguments");
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "SubmitRequestWithSamplingConstraintsEx: invalid arguments");
         return DENSECORE_STATUS_INVALID_ARGUMENT;
     }
     EngineState* state = (EngineState*)handle;
 
     ModelEntry* model_entry = state->GetDefaultModel();
     if (!model_entry || !model_entry->is_loaded) {
-        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "SubmitRequestWithSamplingEx: default model not loaded");
+        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED,
+                 "SubmitRequestWithSamplingConstraintsEx: default model not loaded");
         return DENSECORE_STATUS_MODEL_LOAD_FAILED;
     }
 
@@ -906,7 +971,12 @@ int SubmitRequestWithSamplingEx(DenseCoreHandle handle, const char* prompt, int 
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
     ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
-    ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
+    if ((allowed_token_ids && num_allowed_token_ids > 0) || (disallowed_token_ids && num_disallowed_token_ids > 0)) {
+        ApplyTokenIdConstraints(req, model_entry->model.get(), allowed_token_ids, num_allowed_token_ids,
+                                allowed_token_ids_strict != 0, disallowed_token_ids, num_disallowed_token_ids);
+    } else {
+        ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
+    }
     DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "sampling");
     req->token_history = req->tokens;
 
@@ -966,8 +1036,22 @@ int SubmitRequestIdsWithSamplingEx(DenseCoreHandle handle, const int* tokens, in
                                    const char* lora_name, float temperature, float top_p, int top_k,
                                    float repetition_penalty, const char** stop_sequences, int json_mode,
                                    TokenCallback callback, void* user_data) {
+    return SubmitRequestIdsWithSamplingConstraintsEx(handle, tokens, n_tokens, max_tokens, lora_name, temperature,
+                                                     top_p, top_k, repetition_penalty, stop_sequences, json_mode,
+                                                     /*allowed_token_ids=*/nullptr, /*num_allowed_token_ids=*/0,
+                                                     /*allowed_token_ids_strict=*/0,
+                                                     /*disallowed_token_ids=*/nullptr,
+                                                     /*num_disallowed_token_ids=*/0, callback, user_data);
+}
+
+int SubmitRequestIdsWithSamplingConstraintsEx(DenseCoreHandle handle, const int* tokens, int n_tokens, int max_tokens,
+                                              const char* lora_name, float temperature, float top_p, int top_k,
+                                              float repetition_penalty, const char** stop_sequences, int json_mode,
+                                              const int* allowed_token_ids, int num_allowed_token_ids,
+                                              int allowed_token_ids_strict, const int* disallowed_token_ids,
+                                              int num_disallowed_token_ids, TokenCallback callback, void* user_data) {
     if (!handle || !tokens || n_tokens <= 0) {
-        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "SubmitRequestIdsWithSamplingEx: invalid arguments");
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "SubmitRequestIdsWithSamplingConstraintsEx: invalid arguments");
         return DENSECORE_STATUS_INVALID_ARGUMENT;
     }
     EngineState* state = (EngineState*)handle;
@@ -985,6 +1069,13 @@ int SubmitRequestIdsWithSamplingEx(DenseCoreHandle handle, const int* tokens, in
         MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
         ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
         ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
+        if ((allowed_token_ids && num_allowed_token_ids > 0) ||
+            (disallowed_token_ids && num_disallowed_token_ids > 0)) {
+            ApplyTokenIdConstraints(req, model_entry->model.get(), allowed_token_ids, num_allowed_token_ids,
+                                    allowed_token_ids_strict != 0, disallowed_token_ids, num_disallowed_token_ids);
+        } else {
+            ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
+        }
         DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "ids_sampling");
     }
     req->token_history = req->tokens;

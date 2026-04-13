@@ -149,7 +149,7 @@ go mod tidy
 make server
 
 # Run server
-./bin/densecore-server
+./bin/densecore-server serve
 ```
 
 ### 6. Development with Docker

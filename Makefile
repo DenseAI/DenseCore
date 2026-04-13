@@ -40,8 +40,8 @@ help:
 	@echo "Build targets:"
 	@echo "  make all      - Build library and server (default)"
 	@echo "  make lib      - Build C++ core library"
-	@echo "  make server   - Build Go server"
-	@echo "  make run      - Build and run the server"
+	@echo "  make server   - Build Go CLI/server"
+	@echo "  make run      - Build and run the API server"
 	@echo "  make test     - Run a test request"
 	@echo "  make bench-qwen35 - Run the Qwen3.5 HTTP benchmark"
 	@echo "  make clean    - Remove build artifacts"
@@ -170,7 +170,7 @@ server: lib
 	@cd $(SERVER_DIR) && \
 		CGO_ENABLED=1 \
 		CGO_LDFLAGS="-L../$(BUILD_DIR) -ldensecore -lstdc++" \
-		go build -o ../$(BIN_DIR)/densecore-server .
+		go build -o ../$(BIN_DIR)/densecore-server ./cmd/densecore
 	@echo ""
 	@echo "Server built successfully: $(BIN_DIR)/densecore-server"
 	@echo "=========================================="
@@ -181,9 +181,9 @@ run: server
 	@echo "Starting DenseCore Server"
 	@echo "=========================================="
 ifeq ($(UNAME_S),Darwin)
-	@DYLD_LIBRARY_PATH=$(BUILD_DIR):$$DYLD_LIBRARY_PATH $(BIN_DIR)/densecore-server
+	@DYLD_LIBRARY_PATH=$(BUILD_DIR):$$DYLD_LIBRARY_PATH $(BIN_DIR)/densecore-server serve
 else
-	@LD_LIBRARY_PATH=$(BUILD_DIR):$$LD_LIBRARY_PATH $(BIN_DIR)/densecore-server
+	@LD_LIBRARY_PATH=$(BUILD_DIR):$$LD_LIBRARY_PATH $(BIN_DIR)/densecore-server serve
 endif
 
 # Test the server with a sample request
@@ -244,7 +244,7 @@ debug:
 	@cd $(SERVER_DIR) && \
 		CGO_ENABLED=1 \
 		CGO_LDFLAGS="-L../$(BUILD_DIR) -ldensecore -lstdc++" \
-		go build -gcflags="all=-N -l" -o ../$(BIN_DIR)/densecore-server .
+		go build -gcflags="all=-N -l" -o ../$(BIN_DIR)/densecore-server ./cmd/densecore
 	@echo "Debug build complete"
 
 # Generate API documentation

@@ -38,6 +38,21 @@ static int SubmitRequestWithSamplingWrapper(DenseCoreHandle handle, const char* 
                                        (TokenCallback)streamCallbackGateway, (void*)user_data);
 }
 
+static int SubmitRequestWithSamplingConstraintsWrapper(DenseCoreHandle handle, const char* prompt, int max_tokens,
+                                                       const char* lora_name, float temperature, float top_p,
+                                                       int top_k, float repetition_penalty,
+                                                       const char** stop_sequences, int json_mode,
+                                                       const int* allowed_token_ids, int num_allowed_token_ids,
+                                                       int allowed_token_ids_strict,
+                                                       const int* disallowed_token_ids,
+                                                       int num_disallowed_token_ids, uintptr_t user_data) {
+    return SubmitRequestWithSamplingConstraintsEx(handle, prompt, max_tokens, lora_name, temperature, top_p, top_k,
+                                                  repetition_penalty, stop_sequences, json_mode, allowed_token_ids,
+                                                  num_allowed_token_ids, allowed_token_ids_strict,
+                                                  disallowed_token_ids, num_disallowed_token_ids,
+                                                  (TokenCallback)streamCallbackGateway, (void*)user_data);
+}
+
 // Wrapper function for SubmitRequestIdsWithSamplingEx (per-request LoRA)
 static int SubmitRequestIdsWithSamplingWrapper(DenseCoreHandle handle, const int* tokens, int n_tokens, int max_tokens,
                                                const char* lora_name, float temperature, float top_p, int top_k,
@@ -46,6 +61,22 @@ static int SubmitRequestIdsWithSamplingWrapper(DenseCoreHandle handle, const int
     return SubmitRequestIdsWithSamplingEx(handle, tokens, n_tokens, max_tokens, lora_name, temperature, top_p, top_k,
                                           repetition_penalty, stop_sequences, json_mode,
                                           (TokenCallback)streamCallbackGateway, (void*)user_data);
+}
+
+static int SubmitRequestIdsWithSamplingConstraintsWrapper(DenseCoreHandle handle, const int* tokens, int n_tokens,
+                                                          int max_tokens, const char* lora_name,
+                                                          float temperature, float top_p, int top_k,
+                                                          float repetition_penalty, const char** stop_sequences,
+                                                          int json_mode, const int* allowed_token_ids,
+                                                          int num_allowed_token_ids, int allowed_token_ids_strict,
+                                                          const int* disallowed_token_ids,
+                                                          int num_disallowed_token_ids, uintptr_t user_data) {
+    return SubmitRequestIdsWithSamplingConstraintsEx(handle, tokens, n_tokens, max_tokens, lora_name, temperature,
+                                                     top_p, top_k, repetition_penalty, stop_sequences, json_mode,
+                                                     allowed_token_ids, num_allowed_token_ids,
+                                                     allowed_token_ids_strict, disallowed_token_ids,
+                                                     num_disallowed_token_ids, (TokenCallback)streamCallbackGateway,
+                                                     (void*)user_data);
 }
 
 // Forward declaration of the Go callback for embeddings (exported from callbacks.go)
@@ -268,7 +299,7 @@ func (e *DenseEngine) GenerateStreamWithFormat(ctx context.Context, prompt strin
 // GenerateStreamWithSampling generates response with full sampling options (JSON mode optional).
 func (e *DenseEngine) GenerateStreamWithSampling(ctx context.Context, prompt string, maxTokens int,
 	loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64,
-	stop []string,
+	stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int,
 	outputChan chan domain.StreamEvent) error {
 	cPrompt := C.CString(prompt)
 	defer C.free(unsafe.Pointer(cPrompt))
@@ -293,7 +324,29 @@ func (e *DenseEngine) GenerateStreamWithSampling(ctx context.Context, prompt str
 		jsonModeInt = 1
 	}
 
-	ret := C.SubmitRequestWithSamplingWrapper(
+	var allowedPtr *C.int
+	var disallowedPtr *C.int
+	cAllowed := make([]C.int, len(allowedTokenIDs))
+	for i, id := range allowedTokenIDs {
+		cAllowed[i] = C.int(id)
+	}
+	if len(cAllowed) > 0 {
+		allowedPtr = (*C.int)(unsafe.Pointer(&cAllowed[0]))
+	}
+	cDisallowed := make([]C.int, len(disallowedTokenIDs))
+	for i, id := range disallowedTokenIDs {
+		cDisallowed[i] = C.int(id)
+	}
+	if len(cDisallowed) > 0 {
+		disallowedPtr = (*C.int)(unsafe.Pointer(&cDisallowed[0]))
+	}
+
+	allowedStrictInt := 0
+	if allowedTokensStrict {
+		allowedStrictInt = 1
+	}
+
+	ret := C.SubmitRequestWithSamplingConstraintsWrapper(
 		e.handle,
 		cPrompt,
 		C.int(maxTokens),
@@ -304,6 +357,11 @@ func (e *DenseEngine) GenerateStreamWithSampling(ctx context.Context, prompt str
 		C.float(repetitionPenalty),
 		stopPtr,
 		C.int(jsonModeInt),
+		allowedPtr,
+		C.int(len(cAllowed)),
+		C.int(allowedStrictInt),
+		disallowedPtr,
+		C.int(len(cDisallowed)),
 		C.uintptr_t(reqID),
 	)
 	if ret < 0 {
@@ -319,7 +377,7 @@ func (e *DenseEngine) GenerateStreamWithSampling(ctx context.Context, prompt str
 // GenerateStreamTokensWithSampling generates response using pre-tokenized input IDs and sampling options.
 func (e *DenseEngine) GenerateStreamTokensWithSampling(ctx context.Context, inputIDs []int, maxTokens int,
 	loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64,
-	stop []string,
+	stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int,
 	outputChan chan domain.StreamEvent) error {
 	if len(inputIDs) == 0 {
 		return fmt.Errorf("input_ids must not be empty")
@@ -350,7 +408,29 @@ func (e *DenseEngine) GenerateStreamTokensWithSampling(ctx context.Context, inpu
 		jsonModeInt = 1
 	}
 
-	ret := C.SubmitRequestIdsWithSamplingWrapper(
+	var allowedPtr *C.int
+	var disallowedPtr *C.int
+	cAllowed := make([]C.int, len(allowedTokenIDs))
+	for i, id := range allowedTokenIDs {
+		cAllowed[i] = C.int(id)
+	}
+	if len(cAllowed) > 0 {
+		allowedPtr = (*C.int)(unsafe.Pointer(&cAllowed[0]))
+	}
+	cDisallowed := make([]C.int, len(disallowedTokenIDs))
+	for i, id := range disallowedTokenIDs {
+		cDisallowed[i] = C.int(id)
+	}
+	if len(cDisallowed) > 0 {
+		disallowedPtr = (*C.int)(unsafe.Pointer(&cDisallowed[0]))
+	}
+
+	allowedStrictInt := 0
+	if allowedTokensStrict {
+		allowedStrictInt = 1
+	}
+
+	ret := C.SubmitRequestIdsWithSamplingConstraintsWrapper(
 		e.handle,
 		(*C.int)(unsafe.Pointer(&cTokens[0])),
 		C.int(len(cTokens)),
@@ -362,6 +442,11 @@ func (e *DenseEngine) GenerateStreamTokensWithSampling(ctx context.Context, inpu
 		C.float(repetitionPenalty),
 		stopPtr,
 		C.int(jsonModeInt),
+		allowedPtr,
+		C.int(len(cAllowed)),
+		C.int(allowedStrictInt),
+		disallowedPtr,
+		C.int(len(cDisallowed)),
 		C.uintptr_t(reqID),
 	)
 	if ret < 0 {
@@ -550,6 +635,51 @@ func (e *DenseEngine) CountTokens(text string, addBOS bool, addEOS bool) (int, e
 		return 0, fmt.Errorf("token counting failed with error code %d", count)
 	}
 	return count, nil
+}
+
+// TokenizeText returns tokenizer IDs for the provided text.
+func (e *DenseEngine) TokenizeText(text string, addBOS bool, addEOS bool) ([]int, error) {
+	cText := C.CString(text)
+	defer C.free(unsafe.Pointer(cText))
+
+	addBOSInt := 0
+	if addBOS {
+		addBOSInt = 1
+	}
+	addEOSInt := 0
+	if addEOS {
+		addEOSInt = 1
+	}
+
+	count := int(C.CountTokens(e.handle, cText, C.int(addBOSInt), C.int(addEOSInt)))
+	if count < 0 {
+		return nil, fmt.Errorf("token counting failed with error code %d", count)
+	}
+	if count == 0 {
+		return nil, nil
+	}
+
+	buffer := make([]C.int, count)
+	written := int(C.DenseCoreTokenizeText(
+		e.handle,
+		cText,
+		C.int(addBOSInt),
+		C.int(addEOSInt),
+		(*C.int)(unsafe.Pointer(&buffer[0])),
+		C.int(len(buffer)),
+	))
+	if written < 0 {
+		return nil, fmt.Errorf("tokenization failed with error code %d", written)
+	}
+	if written == 0 {
+		return nil, nil
+	}
+
+	out := make([]int, written)
+	for i := 0; i < written; i++ {
+		out[i] = int(buffer[i])
+	}
+	return out, nil
 }
 
 func (e *DenseEngine) GetTokenizerType() string {

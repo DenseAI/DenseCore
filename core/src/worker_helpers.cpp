@@ -688,7 +688,8 @@ int ResolveLegacyDecodeThreads(int num_seqs, int physical_core_count, int base_t
     return std::max(1, active_threads);
 }
 
-int ResolveAutoDecodeThreadsForBatch(int num_seqs, int physical_core_count, int base_threads) {
+int ResolveAutoDecodeThreadsForBatchWithSimd(int num_seqs, int physical_core_count, int base_threads,
+                                             densecore::simd::SimdLevel simd_level) {
     int cap = physical_core_count > 0 ? physical_core_count : base_threads;
     if (cap <= 0) {
         cap = 1;
@@ -703,13 +704,34 @@ int ResolveAutoDecodeThreadsForBatch(int num_seqs, int physical_core_count, int 
         return cap;
     }
 
-    switch (std::min(num_seqs, 4)) {
-    case 1: return cap;
-    case 2: return std::max(min_threads, std::min(cap, (cap * 7 + 7) / 8));
-    case 3: return cap;
-    case 4: return cap;
-    default: return cap;
+    int threads_per_seq = 4;
+    switch (simd_level) {
+    case densecore::simd::SimdLevel::AMX:
+    case densecore::simd::SimdLevel::AVX512:
+    case densecore::simd::SimdLevel::SVE:
+    case densecore::simd::SimdLevel::SVE2:
+        threads_per_seq = 8;
+        break;
+    case densecore::simd::SimdLevel::NEON:
+        threads_per_seq = 6;
+        break;
+    default:
+        break;
     }
+
+    const int primary_batch = std::min(std::max(1, num_seqs), 8);
+    int target = threads_per_seq * primary_batch;
+    if (num_seqs > 8) {
+        const int spill_threads_per_seq = std::max(1, threads_per_seq / 2);
+        target += (num_seqs - 8) * spill_threads_per_seq;
+    }
+
+    return std::max(min_threads, std::min(cap, target));
+}
+
+int ResolveAutoDecodeThreadsForBatch(int num_seqs, int physical_core_count, int base_threads) {
+    return ResolveAutoDecodeThreadsForBatchWithSimd(num_seqs, physical_core_count, base_threads,
+                                                    densecore::simd::DetectSimdLevel());
 }
 
 bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const PagedKVCache* cache,

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "simd_ops.h"
 #include "engine_internal.h"
 
 struct ArmComputeAffinityPolicy {
@@ -63,6 +64,8 @@ int DecodeThreadsBatchOverride(int batch_size);
 bool UseLegacyDecodeThreadPolicy();
 bool UseLegacyDecodeGraphCachePolicy();
 int ResolveLegacyDecodeThreads(int num_seqs, int physical_core_count, int base_threads);
+int ResolveAutoDecodeThreadsForBatchWithSimd(int num_seqs, int physical_core_count, int base_threads,
+                                             densecore::simd::SimdLevel simd_level);
 int ResolveAutoDecodeThreadsForBatch(int num_seqs, int physical_core_count, int base_threads);
 bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const PagedKVCache* cache,
                                          const BatchSpec& batch);

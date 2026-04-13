@@ -116,6 +116,22 @@ Request:
 
 Streaming is supported with Server-Sent Events when `stream=true`.
 
+### `POST /v1/completions`
+
+OpenAI-compatible prompt completion route.
+
+Request:
+
+```json
+{
+  "prompt": "The capital of France is",
+  "max_tokens": 8,
+  "stream": false
+}
+```
+
+The server also accepts the compatibility alias `POST /completion`.
+
 ### `POST /v1/embeddings`
 
 Request:

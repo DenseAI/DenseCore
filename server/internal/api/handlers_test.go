@@ -34,11 +34,11 @@ func (m *MockEngine) GenerateStreamWithFormat(ctx context.Context, prompt string
 	return m.GenerateStream(ctx, prompt, maxTokens, outputChan)
 }
 
-func (m *MockEngine) GenerateStreamWithSampling(ctx context.Context, prompt string, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, outputChan chan domain.StreamEvent) error {
+func (m *MockEngine) GenerateStreamWithSampling(ctx context.Context, prompt string, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) error {
 	return m.GenerateStream(ctx, prompt, maxTokens, outputChan)
 }
 
-func (m *MockEngine) GenerateStreamTokensWithSampling(ctx context.Context, inputIDs []int, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, outputChan chan domain.StreamEvent) error {
+func (m *MockEngine) GenerateStreamTokensWithSampling(ctx context.Context, inputIDs []int, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) error {
 	return m.GenerateStream(ctx, "", maxTokens, outputChan)
 }
 
@@ -71,6 +71,13 @@ func (m *MockEngine) CountTokens(text string, addBOS bool, addEOS bool) (int, er
 		count++
 	}
 	return count, nil
+}
+
+func (m *MockEngine) TokenizeText(text string, addBOS bool, addEOS bool) ([]int, error) {
+	if text == "" {
+		return nil, nil
+	}
+	return []int{len(text)}, nil
 }
 
 func (m *MockEngine) GetTokenizerType() string { return "" }
@@ -298,6 +305,122 @@ func TestChatCompletionHandler_Stream(t *testing.T) {
 	}
 	body := w.Body.String()
 	if !strings.Contains(body, "data:") || !strings.Contains(body, "Paris") {
+		t.Fatalf("streaming response missing expected SSE frames: %q", body)
+	}
+}
+
+func TestCompletionHandler(t *testing.T) {
+	tests := []struct {
+		name           string
+		request        domain.CompletionRequest
+		mockResponse   string
+		expectedStatus int
+		checkResponse  func(*testing.T, map[string]interface{})
+	}{
+		{
+			name: "Valid request returns completion",
+			request: domain.CompletionRequest{
+				Model:     "test-model",
+				Prompt:    "What is the capital of France?",
+				MaxTokens: 8,
+			},
+			mockResponse:   "Paris",
+			expectedStatus: http.StatusOK,
+			checkResponse: func(t *testing.T, resp map[string]interface{}) {
+				if resp["object"] != "text_completion" {
+					t.Fatalf("expected object=text_completion, got %v", resp["object"])
+				}
+				choices := resp["choices"].([]interface{})
+				if len(choices) != 1 {
+					t.Fatalf("expected 1 choice, got %d", len(choices))
+				}
+				choice := choices[0].(map[string]interface{})
+				if choice["text"] != "Paris" {
+					t.Fatalf("expected text=Paris, got %v", choice["text"])
+				}
+			},
+		},
+		{
+			name: "Empty prompt returns error",
+			request: domain.CompletionRequest{
+				Model:  "test-model",
+				Prompt: "",
+			},
+			expectedStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockModelService := NewMockModelService()
+			mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+				go func() {
+					outputChan <- domain.StreamEvent{Token: tt.mockResponse, IsFinished: true}
+					close(outputChan)
+				}()
+				return nil
+			}
+
+			q := queue.NewRequestQueue(10)
+			workerPool := service.NewQueueProcessor(q, mockModelService)
+			workerPool.Start(1)
+			defer workerPool.Stop()
+
+			chatService := service.NewChatService(mockModelService, q)
+			handler := NewHandler(chatService, mockModelService)
+
+			req := makeRequest("POST", "/v1/completions", tt.request)
+			w := httptest.NewRecorder()
+
+			handler.CompletionHandler(w, req)
+
+			if w.Code != tt.expectedStatus {
+				t.Fatalf("expected status %d, got %d", tt.expectedStatus, w.Code)
+			}
+			if tt.checkResponse != nil && w.Code == http.StatusOK {
+				var resp map[string]interface{}
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("failed to decode response: %v", err)
+				}
+				tt.checkResponse(t, resp)
+			}
+		})
+	}
+}
+
+func TestCompletionHandler_Stream(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			outputChan <- domain.StreamEvent{Token: "Paris", IsFinished: false}
+			outputChan <- domain.StreamEvent{Token: "", IsFinished: true}
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/completions", domain.CompletionRequest{
+		Model:  "test-model",
+		Prompt: "What is the capital of France?",
+		Stream: true,
+	})
+	w := httptest.NewRecorder()
+
+	handler.CompletionHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "data:") || !strings.Contains(body, "Paris") || !strings.Contains(body, "text_completion") {
 		t.Fatalf("streaming response missing expected SSE frames: %q", body)
 	}
 }

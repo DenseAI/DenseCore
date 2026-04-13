@@ -14,20 +14,23 @@ type StreamEvent struct {
 
 // OpenAI-compatible request/response structures
 type ChatCompletionRequest struct {
-	Model              string              `json:"model"`
-	Messages           []Message           `json:"messages"`
-	InputIDs           []int               `json:"input_ids,omitempty"`
-	LoraAdapter        string              `json:"lora_adapter,omitempty"`
-	ChatTemplateKwargs *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
-	MaxTokens          int                 `json:"max_tokens,omitempty"`
-	Temperature        float64             `json:"temperature,omitempty"`
-	TopP               float64             `json:"top_p,omitempty"`
-	TopK               int                 `json:"top_k,omitempty"`
-	RepetitionPenalty  float64             `json:"repetition_penalty,omitempty"`
-	Stop               []string            `json:"stop,omitempty"`
-	Stream             bool                `json:"stream,omitempty"`
-	ResponseFormat     *ResponseFormat     `json:"response_format,omitempty"`
-	ExpertCluster      []int               `json:"expert_cluster,omitempty"`
+	Model               string              `json:"model"`
+	Messages            []Message           `json:"messages"`
+	InputIDs            []int               `json:"input_ids,omitempty"`
+	LoraAdapter         string              `json:"lora_adapter,omitempty"`
+	ChatTemplateKwargs  *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
+	MaxTokens           int                 `json:"max_tokens,omitempty"`
+	Temperature         float64             `json:"temperature,omitempty"`
+	TopP                float64             `json:"top_p,omitempty"`
+	TopK                int                 `json:"top_k,omitempty"`
+	RepetitionPenalty   float64             `json:"repetition_penalty,omitempty"`
+	AllowedTokenIDs     []int               `json:"allowed_token_ids,omitempty"`
+	AllowedTokensStrict bool                `json:"allowed_tokens_strict,omitempty"`
+	DisallowedTokenIDs  []int               `json:"disallowed_token_ids,omitempty"`
+	Stop                []string            `json:"stop,omitempty"`
+	Stream              bool                `json:"stream,omitempty"`
+	ResponseFormat      *ResponseFormat     `json:"response_format,omitempty"`
+	ExpertCluster       []int               `json:"expert_cluster,omitempty"`
 
 	TemperatureSet       bool `json:"-"`
 	TopPSet              bool `json:"-"`
@@ -37,20 +40,23 @@ type ChatCompletionRequest struct {
 
 func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
 	type rawChatCompletionRequest struct {
-		Model              string              `json:"model"`
-		Messages           []Message           `json:"messages"`
-		InputIDs           []int               `json:"input_ids,omitempty"`
-		LoraAdapter        string              `json:"lora_adapter,omitempty"`
-		ChatTemplateKwargs *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
-		MaxTokens          int                 `json:"max_tokens,omitempty"`
-		Temperature        *float64            `json:"temperature,omitempty"`
-		TopP               *float64            `json:"top_p,omitempty"`
-		TopK               *int                `json:"top_k,omitempty"`
-		RepetitionPenalty  *float64            `json:"repetition_penalty,omitempty"`
-		Stop               []string            `json:"stop,omitempty"`
-		Stream             bool                `json:"stream,omitempty"`
-		ResponseFormat     *ResponseFormat     `json:"response_format,omitempty"`
-		ExpertCluster      []int               `json:"expert_cluster,omitempty"`
+		Model               string              `json:"model"`
+		Messages            []Message           `json:"messages"`
+		InputIDs            []int               `json:"input_ids,omitempty"`
+		LoraAdapter         string              `json:"lora_adapter,omitempty"`
+		ChatTemplateKwargs  *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
+		MaxTokens           int                 `json:"max_tokens,omitempty"`
+		Temperature         *float64            `json:"temperature,omitempty"`
+		TopP                *float64            `json:"top_p,omitempty"`
+		TopK                *int                `json:"top_k,omitempty"`
+		RepetitionPenalty   *float64            `json:"repetition_penalty,omitempty"`
+		AllowedTokenIDs     []int               `json:"allowed_token_ids,omitempty"`
+		AllowedTokensStrict bool                `json:"allowed_tokens_strict,omitempty"`
+		DisallowedTokenIDs  []int               `json:"disallowed_token_ids,omitempty"`
+		Stop                []string            `json:"stop,omitempty"`
+		Stream              bool                `json:"stream,omitempty"`
+		ResponseFormat      *ResponseFormat     `json:"response_format,omitempty"`
+		ExpertCluster       []int               `json:"expert_cluster,omitempty"`
 	}
 
 	var raw rawChatCompletionRequest
@@ -64,6 +70,9 @@ func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
 	r.LoraAdapter = raw.LoraAdapter
 	r.ChatTemplateKwargs = raw.ChatTemplateKwargs
 	r.MaxTokens = raw.MaxTokens
+	r.AllowedTokenIDs = raw.AllowedTokenIDs
+	r.AllowedTokensStrict = raw.AllowedTokensStrict
+	r.DisallowedTokenIDs = raw.DisallowedTokenIDs
 	r.Stop = raw.Stop
 	r.Stream = raw.Stream
 	r.ResponseFormat = raw.ResponseFormat
@@ -240,10 +249,104 @@ type ChatCompletionResponse struct {
 	Usage   Usage    `json:"usage"`
 }
 
+type CompletionRequest struct {
+	Model               string          `json:"model"`
+	Prompt              string          `json:"prompt"`
+	MaxTokens           int             `json:"max_tokens,omitempty"`
+	Temperature         float64         `json:"temperature,omitempty"`
+	TopP                float64         `json:"top_p,omitempty"`
+	TopK                int             `json:"top_k,omitempty"`
+	RepetitionPenalty   float64         `json:"repetition_penalty,omitempty"`
+	AllowedTokenIDs     []int           `json:"allowed_token_ids,omitempty"`
+	AllowedTokensStrict bool            `json:"allowed_tokens_strict,omitempty"`
+	DisallowedTokenIDs  []int           `json:"disallowed_token_ids,omitempty"`
+	Stop                []string        `json:"stop,omitempty"`
+	Stream              bool            `json:"stream,omitempty"`
+	ResponseFormat      *ResponseFormat `json:"response_format,omitempty"`
+	ExpertCluster       []int           `json:"expert_cluster,omitempty"`
+
+	TemperatureSet       bool `json:"-"`
+	TopPSet              bool `json:"-"`
+	TopKSet              bool `json:"-"`
+	RepetitionPenaltySet bool `json:"-"`
+}
+
+func (r *CompletionRequest) UnmarshalJSON(data []byte) error {
+	type rawCompletionRequest struct {
+		Model               string          `json:"model"`
+		Prompt              string          `json:"prompt"`
+		MaxTokens           int             `json:"max_tokens,omitempty"`
+		Temperature         *float64        `json:"temperature,omitempty"`
+		TopP                *float64        `json:"top_p,omitempty"`
+		TopK                *int            `json:"top_k,omitempty"`
+		RepetitionPenalty   *float64        `json:"repetition_penalty,omitempty"`
+		AllowedTokenIDs     []int           `json:"allowed_token_ids,omitempty"`
+		AllowedTokensStrict bool            `json:"allowed_tokens_strict,omitempty"`
+		DisallowedTokenIDs  []int           `json:"disallowed_token_ids,omitempty"`
+		Stop                []string        `json:"stop,omitempty"`
+		Stream              bool            `json:"stream,omitempty"`
+		ResponseFormat      *ResponseFormat `json:"response_format,omitempty"`
+		ExpertCluster       []int           `json:"expert_cluster,omitempty"`
+	}
+
+	var raw rawCompletionRequest
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	r.Model = raw.Model
+	r.Prompt = raw.Prompt
+	r.MaxTokens = raw.MaxTokens
+	r.AllowedTokenIDs = raw.AllowedTokenIDs
+	r.AllowedTokensStrict = raw.AllowedTokensStrict
+	r.DisallowedTokenIDs = raw.DisallowedTokenIDs
+	r.Stop = raw.Stop
+	r.Stream = raw.Stream
+	r.ResponseFormat = raw.ResponseFormat
+	r.ExpertCluster = raw.ExpertCluster
+
+	r.TemperatureSet = raw.Temperature != nil
+	if raw.Temperature != nil {
+		r.Temperature = *raw.Temperature
+	}
+
+	r.TopPSet = raw.TopP != nil
+	if raw.TopP != nil {
+		r.TopP = *raw.TopP
+	}
+
+	r.TopKSet = raw.TopK != nil
+	if raw.TopK != nil {
+		r.TopK = *raw.TopK
+	}
+
+	r.RepetitionPenaltySet = raw.RepetitionPenalty != nil
+	if raw.RepetitionPenalty != nil {
+		r.RepetitionPenalty = *raw.RepetitionPenalty
+	}
+
+	return nil
+}
+
 type Choice struct {
 	Index        int     `json:"index"`
 	Message      Message `json:"message"`
 	FinishReason string  `json:"finish_reason"`
+}
+
+type CompletionResponse struct {
+	ID      string             `json:"id"`
+	Object  string             `json:"object"`
+	Created int64              `json:"created"`
+	Model   string             `json:"model"`
+	Choices []CompletionChoice `json:"choices"`
+	Usage   Usage              `json:"usage"`
+}
+
+type CompletionChoice struct {
+	Index        int    `json:"index"`
+	Text         string `json:"text"`
+	FinishReason string `json:"finish_reason"`
 }
 
 type ChatCompletionChunk struct {
@@ -252,6 +355,20 @@ type ChatCompletionChunk struct {
 	Created int64         `json:"created"`
 	Model   string        `json:"model"`
 	Choices []ChunkChoice `json:"choices"`
+}
+
+type CompletionChunk struct {
+	ID      string                  `json:"id"`
+	Object  string                  `json:"object"`
+	Created int64                   `json:"created"`
+	Model   string                  `json:"model"`
+	Choices []CompletionChunkChoice `json:"choices"`
+}
+
+type CompletionChunkChoice struct {
+	Index        int         `json:"index"`
+	Text         string      `json:"text"`
+	FinishReason interface{} `json:"finish_reason"`
 }
 
 type ChunkChoice struct {

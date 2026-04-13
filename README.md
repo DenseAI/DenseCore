@@ -34,7 +34,7 @@ DenseCore is not intended to be:
 
 - Python SDK for local GGUF inference
 - Hugging Face Hub downloads for GGUF models
-- OpenAI-compatible chat completions over HTTP
+- OpenAI-compatible chat and prompt completions over HTTP
 - Embeddings and rerank HTTP endpoints
 - Optional gRPC server on port `50051`
 - LoRA adapter loading from Python
@@ -104,6 +104,28 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+Example prompt completion request:
+
+```bash
+curl -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "The capital of France is",
+    "max_tokens": 8
+  }'
+```
+
+Compatibility alias:
+
+```bash
+curl -X POST http://localhost:8080/completion \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "The capital of France is",
+    "max_tokens": 8
+  }'
+```
+
 ### Go CLI
 
 The interactive `densecore run` command is provided by the Go CLI in [`server/`](server), not by the PyPI package.
@@ -113,7 +135,7 @@ Build it from source:
 ```bash
 make lib
 make server
-./bin/densecore run
+./bin/densecore-server run
 ```
 
 ## Installation Matrix
@@ -129,6 +151,8 @@ make server
 The Go server exposes:
 
 - `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `POST /completion` (compatibility alias)
 - `POST /v1/embeddings`
 - `POST /v1/rerank`
 - `GET /v1/models`

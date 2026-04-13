@@ -176,6 +176,89 @@ func (h *Handler) ChatCompletionHandler(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+// CompletionHandler accepts prompt-style completion requests and translates
+// them into the server's chat-generation pipeline for compatibility.
+func (h *Handler) CompletionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		sendError(w, "Method not allowed", "invalid_request_error", ErrCodeMethodNotAllowed, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req domain.CompletionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendError(w, "Invalid JSON in request body", "invalid_request_error", ErrCodeInvalidJSON, http.StatusBadRequest)
+		return
+	}
+
+	if strings.TrimSpace(req.Prompt) == "" {
+		sendError(w, "prompt must be provided", "invalid_request_error", ErrCodeInvalidRequest, http.StatusBadRequest)
+		return
+	}
+
+	chatReq := completionRequestToChatRequest(req)
+	if chatReq.MaxTokens == 0 {
+		chatReq.MaxTokens = DefaultMaxTokens
+	}
+	if chatReq.MaxTokens < 0 {
+		sendError(w, "max_tokens must be non-negative", "invalid_request_error", ErrCodeInvalidRequest, http.StatusBadRequest)
+		return
+	}
+	if chatReq.MaxTokens > MaxAllowedTokens {
+		sendError(w, fmt.Sprintf("max_tokens exceeds maximum allowed (%d)", MaxAllowedTokens), "invalid_request_error", ErrCodeInvalidRequest, http.StatusBadRequest)
+		return
+	}
+	if chatReq.Temperature < 0 || chatReq.Temperature > 2 {
+		sendError(w, "temperature must be between 0 and 2", "invalid_request_error", ErrCodeInvalidRequest, http.StatusBadRequest)
+		return
+	}
+	if engine := h.modelService.GetEngine(); engine != nil {
+		if maxCtx := engine.GetMaxContextTokens(); maxCtx > 0 && chatReq.MaxTokens > maxCtx {
+			sendError(w, fmt.Sprintf("max_tokens exceeds model context limit (%d)", maxCtx), "invalid_request_error", ErrCodeInvalidRequest, http.StatusBadRequest)
+			return
+		}
+	}
+	if chatReq.Model == "" {
+		modelID, _, _ := h.modelService.GetModelIdentity()
+		chatReq.Model = modelID
+	}
+
+	slog.Info("processing completion request",
+		slog.String("model", chatReq.Model),
+		slog.Int("max_tokens", chatReq.MaxTokens),
+		slog.Bool("stream", chatReq.Stream),
+	)
+
+	ctx := r.Context()
+	if chatReq.Stream {
+		h.handleCompletionStream(ctx, w, chatReq)
+	} else {
+		h.handleCompletionSync(ctx, w, chatReq, req.Prompt)
+	}
+}
+
+func completionRequestToChatRequest(req domain.CompletionRequest) domain.ChatCompletionRequest {
+	return domain.ChatCompletionRequest{
+		Model:                req.Model,
+		Messages:             []domain.Message{{Role: "user", Content: req.Prompt}},
+		MaxTokens:            req.MaxTokens,
+		Temperature:          req.Temperature,
+		TopP:                 req.TopP,
+		TopK:                 req.TopK,
+		RepetitionPenalty:    req.RepetitionPenalty,
+		AllowedTokenIDs:      req.AllowedTokenIDs,
+		AllowedTokensStrict:  req.AllowedTokensStrict,
+		DisallowedTokenIDs:   req.DisallowedTokenIDs,
+		Stop:                 req.Stop,
+		Stream:               req.Stream,
+		ResponseFormat:       req.ResponseFormat,
+		ExpertCluster:        req.ExpertCluster,
+		TemperatureSet:       req.TemperatureSet,
+		TopPSet:              req.TopPSet,
+		TopKSet:              req.TopKSet,
+		RepetitionPenaltySet: req.RepetitionPenaltySet,
+	}
+}
+
 func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req domain.ChatCompletionRequest) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -267,6 +350,92 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 	}
 }
 
+func (h *Handler) handleCompletionStream(ctx context.Context, w http.ResponseWriter, req domain.ChatCompletionRequest) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	outputChan := make(chan domain.StreamEvent, StreamChannelBufferSize)
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- h.chatService.GenerateStream(ctx, req, outputChan)
+	}()
+
+	id := fmt.Sprintf("cmpl-%d", time.Now().Unix())
+	created := time.Now().Unix()
+
+	for {
+		select {
+		case event, ok := <-outputChan:
+			if !ok {
+				if err := <-errChan; err != nil {
+					slog.Error("generation failed",
+						slog.String("model", req.Model),
+						slog.String("error", err.Error()),
+					)
+					sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+				}
+				return
+			}
+			if event.IsFinished {
+				if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
+					slog.Debug("SSE write error", slog.String("error", err.Error()))
+				}
+				flusher.Flush()
+				if err := <-errChan; err != nil {
+					slog.Error("generation failed",
+						slog.String("model", req.Model),
+						slog.String("error", err.Error()),
+					)
+				}
+				return
+			}
+
+			chunk := domain.CompletionChunk{
+				ID:      id,
+				Object:  "text_completion",
+				Created: created,
+				Model:   req.Model,
+				Choices: []domain.CompletionChunkChoice{
+					{
+						Index:        0,
+						Text:         event.Token,
+						FinishReason: nil,
+					},
+				},
+			}
+
+			data, err := json.Marshal(chunk)
+			if err != nil {
+				slog.Error("failed to marshal SSE chunk", slog.String("error", err.Error()))
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				slog.Debug("SSE write error", slog.String("error", err.Error()))
+				return
+			}
+			flusher.Flush()
+		case err := <-errChan:
+			if err != nil {
+				slog.Error("generation failed",
+					slog.String("model", req.Model),
+					slog.String("error", err.Error()),
+				)
+				sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+			}
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req domain.ChatCompletionRequest) {
 	outputChan := make(chan domain.StreamEvent, StreamChannelBufferSize)
 	errChan := make(chan error, 1)
@@ -305,6 +474,56 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 					Role:    "assistant",
 					Content: responseText,
 				},
+				FinishReason: "stop",
+			},
+		},
+		Usage: domain.Usage{
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      promptTokens + completionTokens,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		slog.Error("failed to encode response", slog.String("error", err.Error()))
+	}
+}
+
+func (h *Handler) handleCompletionSync(ctx context.Context, w http.ResponseWriter, req domain.ChatCompletionRequest, prompt string) {
+	outputChan := make(chan domain.StreamEvent, StreamChannelBufferSize)
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- h.chatService.GenerateStream(ctx, req, outputChan)
+	}()
+
+	var responseBuilder strings.Builder
+	completionTokens := 0
+	for event := range outputChan {
+		if event.Token != "" {
+			responseBuilder.WriteString(event.Token)
+			completionTokens++
+		}
+		if event.IsFinished {
+			break
+		}
+	}
+	if err := <-errChan; err != nil {
+		sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+		return
+	}
+
+	responseText := responseBuilder.String()
+	promptTokens := h.countTextTokens([]string{prompt}, true, false)
+	resp := domain.CompletionResponse{
+		ID:      fmt.Sprintf("cmpl-%d", time.Now().Unix()),
+		Object:  "text_completion",
+		Created: time.Now().Unix(),
+		Model:   req.Model,
+		Choices: []domain.CompletionChoice{
+			{
+				Index:        0,
+				Text:         responseText,
 				FinishReason: "stop",
 			},
 		},

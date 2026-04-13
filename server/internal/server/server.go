@@ -429,11 +429,14 @@ func Run(opts *Options) error {
 	apiMux.HandleFunc("/runtime/profile", handler.RuntimeProfileHandler)
 	if cfg.LLMAPIEnabled {
 		apiMux.HandleFunc("/chat/completions", handler.ChatCompletionHandler)
+		apiMux.HandleFunc("/completion", handler.CompletionHandler)
+		apiMux.HandleFunc("/completions", handler.CompletionHandler)
 		apiMux.HandleFunc("/embeddings", handler.EmbeddingsHandler)
 		apiMux.HandleFunc("/rerank", handler.RerankHandler)
 		apiMux.HandleFunc("/models", handler.ModelsHandler)
 		apiMux.HandleFunc("/models/load", handler.LoadModelHandler)
 		apiMux.HandleFunc("/models/unload", handler.UnloadModelHandler)
+		rootMux.Handle("/completion", wrapWithMiddleware(http.HandlerFunc(handler.CompletionHandler), apiMiddleware...))
 	}
 	runtimeExt.RegisterRoutes(rootMux, apiMux)
 	for _, ext := range extensions {
@@ -634,11 +637,20 @@ func buildEndpoints(llmAPIEnabled bool) map[string]string {
 	}
 	if llmAPIEnabled {
 		endpoints["chat"] = "/v1/chat/completions"
+		endpoints["completions"] = "/v1/completions"
 		endpoints["embeddings"] = "/v1/embeddings"
 		endpoints["rerank"] = "/v1/rerank"
 		endpoints["models"] = "/v1/models"
 	}
 	return endpoints
+}
+
+func wrapWithMiddleware(handler http.Handler, middleware ...func(http.Handler) http.Handler) http.Handler {
+	wrapped := handler
+	for i := len(middleware) - 1; i >= 0; i-- {
+		wrapped = middleware[i](wrapped)
+	}
+	return wrapped
 }
 
 func makeRootHandler(cfg rootHandlerConfig) http.HandlerFunc {

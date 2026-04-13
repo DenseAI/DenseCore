@@ -38,6 +38,8 @@ void ComputeKVRetentionSpanForTest(int n_past, int sliding_window, int sink_toke
                                    int* sink_kept, int* tail_start);
 int MapRetainedHistoryIndexForTest(int n_past, int sliding_window, int sink_tokens, int retained_index);
 void SetFlashAttentionDisabledForTest(bool disabled);
+std::vector<float> ExecuteTransformerGraphEmbeddingsForTest(TransformerModel* model, PagedKVCache* cache,
+                                                            const BatchSpec& batch, int num_threads);
 }  // namespace densecore::testing
 
 namespace {
@@ -314,7 +316,83 @@ float L1Diff(const std::vector<float>& a, const std::vector<float>& b) {
     return total;
 }
 
+std::vector<float> ApplyWeightedRmsNormRef(const std::vector<float>& input, const std::vector<float>& weight,
+                                           float eps = 1e-5f) {
+    double mean_sq = 0.0;
+    for (float v : input) {
+        mean_sq += static_cast<double>(v) * static_cast<double>(v);
+    }
+    mean_sq /= static_cast<double>(input.size());
+    const float inv_rms = 1.0f / std::sqrt(static_cast<float>(mean_sq) + eps);
+
+    std::vector<float> out(input.size(), 0.0f);
+    for (size_t i = 0; i < input.size(); ++i) {
+        out[i] = input[i] * inv_rms * weight[i];
+    }
+    return out;
+}
+
 }  // namespace
+
+TEST(Gemma4FallbackDecodeTest, LayerOutputScaleAppliesAfterResidualAddition) {
+    auto model = MakeBaseGemma4GraphModel(/*n_layer=*/1);
+    model->gemma4_layer_is_sliding[0] = 0u;
+    model->gemma4_sliding_window = -1;
+
+    SetTensorData(model->tok_embeddings, {
+                                          0.0f, 0.0f,
+                                          1.0f, 1.0f,
+                                      });
+    SetTensorData(model->output, {
+                                     1.0f, 0.0f,
+                                     0.0f, 1.0f,
+                                 });
+    model->layers[0].Set(model_keys::kPostAttnNorm, ggml_new_tensor_1d(model->ctx_w, GGML_TYPE_F32, kTinyGraphDim));
+    SetTensorData(model->layers[0].Get(model_keys::kPostAttnNorm), {1.0f, 1.0f});
+    model->layers[0].Set("gemma4.post_feedforward_layernorm.weight",
+                         ggml_new_tensor_1d(model->ctx_w, GGML_TYPE_F32, kTinyGraphDim));
+    SetTensorData(model->layers[0].Get("gemma4.post_feedforward_layernorm.weight"), {1.0f, 1.0f});
+    model->layers[0].Set(model_keys::kGemma4LayerOutputScale, ggml_new_tensor_1d(model->ctx_w, GGML_TYPE_F32, 1));
+    SetTensorData(model->layers[0].Get(model_keys::kGemma4LayerOutputScale), {2.0f});
+
+    ConfigureLayerQkv(model->layers[0].Get(model_keys::kAttnQWeight), model->layers[0].Get(model_keys::kAttnKWeight),
+                      model->layers[0].Get(model_keys::kAttnVWeight), model->layers[0].Get(model_keys::kAttnOWeight),
+                      /*Q=*/{1.0f, 0.0f, 0.0f, 1.0f},
+                      /*K=*/{0.0f, 0.0f, 0.0f, 0.0f},
+                      /*V=*/{1.0f, 0.0f, 0.0f, 0.0f},
+                      /*O=*/{1.0f, 0.0f, 0.0f, 1.0f});
+    SetTensorData(model->layers[0].Get(model_keys::kFfnGate), std::vector<float>(static_cast<size_t>(kTinyGraphDim) *
+                                                                                  static_cast<size_t>(kTinyGraphDim * 4),
+                                                                                  0.0f));
+    SetTensorData(model->layers[0].Get(model_keys::kFfnUp), std::vector<float>(static_cast<size_t>(kTinyGraphDim) *
+                                                                                static_cast<size_t>(kTinyGraphDim * 4),
+                                                                                0.0f));
+    SetTensorData(model->layers[0].Get(model_keys::kFfnDown), std::vector<float>(static_cast<size_t>(kTinyGraphDim * 4) *
+                                                                                  static_cast<size_t>(kTinyGraphDim),
+                                                                                  0.0f));
+
+    auto cache = MakeTinyGraphCache(model.get());
+    ASSERT_NE(cache, nullptr);
+    const int block_id = cache->block_manager->AllocateSingle();
+    ASSERT_GE(block_id, 0);
+
+    const BatchSpec batch = MakeSingleTokenDecodeBatch(/*token_id=*/1, /*n_past=*/0, block_id);
+    const std::vector<float> runtime =
+        densecore::testing::ExecuteTransformerGraphEmbeddingsForTest(model.get(), cache.get(), batch, /*num_threads=*/1);
+    ASSERT_EQ(runtime.size(), 2u);
+
+    const float input_scale = std::sqrt(static_cast<float>(model->hparams.n_embd));
+    const std::vector<float> residual = {input_scale, input_scale};
+    const std::vector<float> attn_post_norm = ApplyWeightedRmsNormRef({1.0f, 0.0f}, {1.0f, 1.0f});
+    const std::vector<float> expected_scaled_after_residual = ApplyWeightedRmsNormRef(
+        {2.0f * (residual[0] + attn_post_norm[0]), 2.0f * (residual[1] + attn_post_norm[1])}, {1.0f, 1.0f});
+    const std::vector<float> expected_scaled_branch_only =
+        ApplyWeightedRmsNormRef({residual[0] + 2.0f * attn_post_norm[0], residual[1] + 2.0f * attn_post_norm[1]},
+                                {1.0f, 1.0f});
+
+    EXPECT_LT(L1Diff(runtime, expected_scaled_after_residual), 1e-4f);
+    EXPECT_GT(L1Diff(runtime, expected_scaled_branch_only), 0.1f);
+}
 
 TEST(Gemma4FallbackDecodeTest, SlidingWindowDecodeMasksRetainedHistoryInStandardPath) {
     ScopedFlashAttentionDisableForTest flash_guard;

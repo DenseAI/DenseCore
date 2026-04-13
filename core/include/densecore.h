@@ -456,6 +456,16 @@ DENSECORE_API int SubmitRequestWithSamplingEx(DenseCoreHandle handle, const char
                                               TokenCallback callback, void* user_data);
 
 /**
+ * Submit a request with full sampling parameters, per-request LoRA, and
+ * explicit token allow/deny constraints (Non-blocking)
+ */
+DENSECORE_API int SubmitRequestWithSamplingConstraintsEx(
+    DenseCoreHandle handle, const char* prompt, int max_tokens, const char* lora_name, float temperature, float top_p,
+    int top_k, float repetition_penalty, const char** stop_sequences, int json_mode, const int* allowed_token_ids,
+    int num_allowed_token_ids, int allowed_token_ids_strict, const int* disallowed_token_ids,
+    int num_disallowed_token_ids, TokenCallback callback, void* user_data);
+
+/**
  * Submit a request with structured token results and full sampling parameters
  * (Non-blocking)
  *
@@ -521,6 +531,16 @@ DENSECORE_API int SubmitRequestIdsWithSamplingEx(DenseCoreHandle handle, const i
                                                  int max_tokens, const char* lora_name, float temperature, float top_p,
                                                  int top_k, float repetition_penalty, const char** stop_sequences,
                                                  int json_mode, TokenCallback callback, void* user_data);
+
+/**
+ * Submit a token-ID request with full sampling parameters, per-request LoRA,
+ * and explicit token allow/deny constraints (Non-blocking)
+ */
+DENSECORE_API int SubmitRequestIdsWithSamplingConstraintsEx(
+    DenseCoreHandle handle, const int* tokens, int n_tokens, int max_tokens, const char* lora_name, float temperature,
+    float top_p, int top_k, float repetition_penalty, const char** stop_sequences, int json_mode,
+    const int* allowed_token_ids, int num_allowed_token_ids, int allowed_token_ids_strict,
+    const int* disallowed_token_ids, int num_disallowed_token_ids, TokenCallback callback, void* user_data);
 
 /**
  * Submit a request with token IDs and format specification (Non-blocking)

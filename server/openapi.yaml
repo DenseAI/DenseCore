@@ -61,6 +61,33 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /completions:
+    post:
+      summary: Create text completion
+      operationId: createCompletion
+      tags:
+        - Chat
+      description: OpenAI-compatible prompt completion route. The server also accepts the root-level compatibility alias `POST /completion`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCompletionRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateCompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /embeddings:
     post:
       summary: Create embeddings
@@ -261,6 +288,80 @@ components:
                 type: integer
               message:
                 $ref: '#/components/schemas/ChatCompletionMessage'
+              finish_reason:
+                type: string
+        usage:
+          type: object
+          properties:
+            prompt_tokens:
+              type: integer
+            completion_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+
+    CreateCompletionRequest:
+      type: object
+      required:
+        - prompt
+      properties:
+        model:
+          type: string
+          description: ID of the model to use
+        prompt:
+          type: string
+        temperature:
+          type: number
+          default: 1.0
+        top_p:
+          type: number
+          default: 1.0
+        top_k:
+          type: integer
+          default: 0
+        repetition_penalty:
+          type: number
+          default: 1.0
+        stream:
+          type: boolean
+          default: false
+        stop:
+          type: array
+          items:
+            type: string
+        max_tokens:
+          type: integer
+        allowed_token_ids:
+          type: array
+          items:
+            type: integer
+        allowed_tokens_strict:
+          type: boolean
+        disallowed_token_ids:
+          type: array
+          items:
+            type: integer
+
+    CreateCompletionResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              text:
+                type: string
               finish_reason:
                 type: string
         usage:

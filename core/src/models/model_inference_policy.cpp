@@ -20,6 +20,14 @@ bool IsGemma4ForceDenseBaselineEnabled() {
     return ParseBoolEnv("DENSECORE_GEMMA4_FORCE_DENSE_BASELINE", false);
 }
 
+bool UseGemma4BenchQualityFallback() {
+    const char* bench = std::getenv("DENSECORE_BENCH_MODE");
+    if (!bench || bench[0] == '\0' || std::strcmp(bench, "0") == 0) {
+        return false;
+    }
+    return ParseBoolEnv("DENSECORE_GEMMA4_BENCH_QUALITY_FALLBACK", true);
+}
+
 bool IsGemma4SharedKVDisabled() {
     return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_SHARED_KV", false);
 }
@@ -55,7 +63,7 @@ float SanitizeAttentionLogitSoftcapForLoad(const TransformerModel* model, float 
 
 bool IsGemma4SlidingLayer(const TransformerModel* model, int layer_idx) {
     if (model && model->arch_flags.is_gemma4 &&
-        (IsGemma4ForceDenseBaselineEnabled() || IsGemma4SlidingWindowDisabled())) {
+        (IsGemma4ForceDenseBaselineEnabled() || IsGemma4SlidingWindowDisabled() || UseGemma4BenchQualityFallback())) {
         return false;
     }
     return model && model->arch_flags.is_gemma4 && layer_idx >= 0 &&
@@ -86,7 +94,7 @@ bool IsGemma4LayerOutputScaleDisabled() {
 }
 
 bool IsGemma4DecodeSpecialTransformDisabled() {
-    return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_SPECIAL_DECODE_TRANSFORMS", false);
+    return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_SPECIAL_DECODE_TRANSFORMS", false) || UseGemma4BenchQualityFallback();
 }
 
 bool IsGemma4VNormDisabled() {

@@ -52,3 +52,10 @@ func TestMakeRootHandlerDoesNotMutateConfiguredEndpoints(t *testing.T) {
 		t.Fatalf("base endpoints map mutated, expected len=2 got len=%d", len(baseEndpoints))
 	}
 }
+
+func TestBuildEndpointsIncludesCompletionsWhenLLMAPIEnabled(t *testing.T) {
+	endpoints := buildEndpoints(true)
+	if got := endpoints["completions"]; got != "/v1/completions" {
+		t.Fatalf("expected completions endpoint, got %q", got)
+	}
+}

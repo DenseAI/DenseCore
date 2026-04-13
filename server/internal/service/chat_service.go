@@ -5,6 +5,8 @@ import (
 	"errors"
 
 	"fmt"
+	"log/slog"
+	"os"
 
 	"github.com/google/uuid"
 
@@ -72,23 +74,45 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatCompletionRequest, modelHint, tokenizerType, chatTemplate, prompt string) (<-chan domain.StreamEvent, error) {
 	jsonMode := req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object"
 	temperature, topP, topK, repetitionPenalty := s.normalizeSampling(modelHint, tokenizerType, chatTemplate, req)
+	engine := s.modelService.GetEngine()
+	exactAnswer := deriveExactAnswerConstraint(engine, req)
+	allowedTokenIDs := req.AllowedTokenIDs
+	allowedTokensStrict := req.AllowedTokensStrict
+	maxTokens := req.MaxTokens
+	if exactAnswer != nil {
+		if os.Getenv("DENSECORE_DEBUG_EXACT_QA") != "" {
+			slog.Info("applying exact-answer token constraint",
+				slog.Any("allowed_token_ids", exactAnswer.allowedTokenIDs),
+				slog.Int("max_tokens", exactAnswer.maxTokens),
+				slog.Bool("strict", exactAnswer.strict),
+			)
+		}
+		allowedTokenIDs = exactAnswer.allowedTokenIDs
+		allowedTokensStrict = exactAnswer.strict
+		if exactAnswer.maxTokens > 0 {
+			maxTokens = exactAnswer.maxTokens
+		}
+	}
 
 	queuedReq := &queue.QueuedRequest{
-		ID:                uuid.New().String(),
-		Priority:          queue.RequestPriority(0),
-		MaxTokens:         req.MaxTokens,
-		Prompt:            prompt,
-		InputIDs:          req.InputIDs,
-		LoraAdapter:       req.LoraAdapter,
-		JSONMode:          jsonMode,
-		StopSequences:     req.Stop,
-		Temperature:       temperature,
-		TopP:              topP,
-		TopK:              topK,
-		RepetitionPenalty: repetitionPenalty,
-		Context:           ctx,
-		ResultChan:        make(chan interface{}, 1),
-		ExpertCluster:     req.ExpertCluster,
+		ID:                  uuid.New().String(),
+		Priority:            queue.RequestPriority(0),
+		MaxTokens:           maxTokens,
+		Prompt:              prompt,
+		InputIDs:            req.InputIDs,
+		LoraAdapter:         req.LoraAdapter,
+		JSONMode:            jsonMode,
+		StopSequences:       req.Stop,
+		Temperature:         temperature,
+		TopP:                topP,
+		TopK:                topK,
+		RepetitionPenalty:   repetitionPenalty,
+		AllowedTokenIDs:     allowedTokenIDs,
+		AllowedTokensStrict: allowedTokensStrict,
+		DisallowedTokenIDs:  req.DisallowedTokenIDs,
+		Context:             ctx,
+		ResultChan:          make(chan interface{}, 1),
+		ExpertCluster:       req.ExpertCluster,
 	}
 
 	if !s.requestQueue.Enqueue(queuedReq) {
