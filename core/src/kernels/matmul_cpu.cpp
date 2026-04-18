@@ -15,14 +15,154 @@
 #include "../include/simd_platform.h"
 #include "../thread_pool_impl.h"  // Corrected path (src/thread_pool_impl.h)
 
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
 #endif
 
+#include "ggml.h"
+
 namespace densecore {
 namespace {
+bool IsF32OrBF16(DType dtype) {
+    return dtype == DType::F32 || dtype == DType::BF16;
+}
+
+void ExecuteMixedMatMulF32Accum(const Tensor& A, const Tensor& B, Tensor* C) {
+    const int M = static_cast<int>(A.shape[0]);
+    const int K = static_cast<int>(A.shape[1]);
+    const int N = static_cast<int>(B.shape[1]);
+
+    const float* a_f32 = (A.dtype == DType::F32) ? A.DataAs<float>() : nullptr;
+    const ggml_bf16_t* a_bf16 = (A.dtype == DType::BF16) ? A.DataAs<ggml_bf16_t>() : nullptr;
+    const float* b_f32 = (B.dtype == DType::F32) ? B.DataAs<float>() : nullptr;
+    const ggml_bf16_t* b_bf16 = (B.dtype == DType::BF16) ? B.DataAs<ggml_bf16_t>() : nullptr;
+    float* c_data = C->DataAs<float>();
+
+    auto& pool = GetCpuBackend().GetThreadPool(0);
+    pool.ParallelFor(M, [&](int m_start, int m_end, int /*tid*/) {
+        std::vector<float> a_row_storage(static_cast<size_t>(K));
+        for (int m = m_start; m < m_end; ++m) {
+            const float* a_row = nullptr;
+            if (a_f32) {
+                a_row = a_f32 + static_cast<size_t>(m) * K;
+            } else {
+                ggml_bf16_to_fp32_row(a_bf16 + static_cast<size_t>(m) * K, a_row_storage.data(), K);
+                a_row = a_row_storage.data();
+            }
+
+            float* c_row = c_data + static_cast<size_t>(m) * N;
+            for (int n = 0; n < N; ++n) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; ++k) {
+                    const float b = b_f32 ? b_f32[static_cast<size_t>(k) * N + n]
+                                          : ggml_bf16_to_fp32(b_bf16[static_cast<size_t>(k) * N + n]);
+                    sum += a_row[k] * b;
+                }
+                c_row[n] = sum;
+            }
+        }
+    });
+}
+
+void ExecuteMixedMatMulTransBF32Accum(const Tensor& A, const Tensor& B, Tensor* C) {
+    const int M = static_cast<int>(A.shape[0]);
+    const int K = static_cast<int>(A.shape[1]);
+    const int N = static_cast<int>(B.shape[0]);
+
+    const float* a_f32 = (A.dtype == DType::F32) ? A.DataAs<float>() : nullptr;
+    const ggml_bf16_t* a_bf16 = (A.dtype == DType::BF16) ? A.DataAs<ggml_bf16_t>() : nullptr;
+    const float* b_f32 = (B.dtype == DType::F32) ? B.DataAs<float>() : nullptr;
+    const ggml_bf16_t* b_bf16 = (B.dtype == DType::BF16) ? B.DataAs<ggml_bf16_t>() : nullptr;
+    float* c_data = C->DataAs<float>();
+
+    auto& pool = GetCpuBackend().GetThreadPool(0);
+    pool.ParallelFor(M, [&](int m_start, int m_end, int /*tid*/) {
+        std::vector<float> a_row_storage(static_cast<size_t>(K));
+        std::vector<float> b_row_storage(static_cast<size_t>(K));
+        for (int m = m_start; m < m_end; ++m) {
+            const float* a_row = nullptr;
+            if (a_f32) {
+                a_row = a_f32 + static_cast<size_t>(m) * K;
+            } else {
+                ggml_bf16_to_fp32_row(a_bf16 + static_cast<size_t>(m) * K, a_row_storage.data(), K);
+                a_row = a_row_storage.data();
+            }
+
+            float* c_row = c_data + static_cast<size_t>(m) * N;
+            for (int n = 0; n < N; ++n) {
+                const float* b_row = nullptr;
+                if (b_f32) {
+                    b_row = b_f32 + static_cast<size_t>(n) * K;
+                } else {
+                    ggml_bf16_to_fp32_row(b_bf16 + static_cast<size_t>(n) * K, b_row_storage.data(), K);
+                    b_row = b_row_storage.data();
+                }
+                c_row[n] = simd::DotF32(a_row, b_row, K);
+            }
+        }
+    });
+}
+
+bool ExecuteTransBViaMatmulBackend(const Tensor& A, const Tensor& B, Tensor* C) {
+    if (!IsF32OrBF16(A.dtype) || !IsF32OrBF16(B.dtype) || !C || C->dtype != DType::F32) {
+        return false;
+    }
+
+    MatmulParams params;
+    params.a = A.data;
+    params.b = B.data;
+    params.c = C->data;
+    params.M = A.shape[0];
+    params.N = B.shape[0];
+    params.K = A.shape[1];
+    params.lda = A.shape[1];
+    params.ldb = B.shape[1];
+    params.ldc = C->shape[1];
+    params.trans_a = false;
+    params.trans_b = true;
+    params.a_type = A.dtype;
+    params.b_type = B.dtype;
+    params.c_type = C->dtype;
+
+    thread_local std::vector<ggml_bf16_t> a_bf16_buffer;
+    if (A.dtype == DType::F32 && B.dtype == DType::BF16 && params.M > 1) {
+        MatmulParams bf16_candidate = params;
+        bf16_candidate.a_type = DType::BF16;
+        if (SelectMatmulBackend(bf16_candidate, true) == MatmulBackendKind::OneDNN) {
+            const size_t total = static_cast<size_t>(params.M * params.K);
+            a_bf16_buffer.resize(total);
+            const float* a_f32 = A.DataAs<float>();
+            for (int64_t m = 0; m < params.M; ++m) {
+                ggml_fp32_to_bf16_row(a_f32 + static_cast<size_t>(m) * params.lda,
+                                      a_bf16_buffer.data() + static_cast<size_t>(m) * params.K,
+                                      static_cast<int>(params.K));
+            }
+            params.a = a_bf16_buffer.data();
+            params.lda = params.K;
+            params.a_type = DType::BF16;
+        }
+    }
+
+    const bool is_prefill = params.M > 1;
+    MatmulBackendKind kind = SelectMatmulBackend(params, is_prefill);
+    MatmulBackend* backend =
+        (kind == MatmulBackendKind::OneDNN) ? &GetOneDnnMatmulBackend() : &GetDenseCoreMatmulBackend();
+    if (!backend->Supports(params)) {
+        backend = &GetDenseCoreMatmulBackend();
+        if (!backend->Supports(params)) {
+            ExecuteMixedMatMulTransBF32Accum(A, B, C);
+            return true;
+        }
+    }
+
+    backend->Execute(params);
+    return true;
+}
+
 class CpuMatMulOp : public MatMulOps {
 public:
     void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, const void* params) override {
@@ -35,6 +175,8 @@ public:
     }
 
     bool Supports(DeviceType device) const override { return device == DeviceType::CPU; }
+
+    bool SupportsDType(DType dtype) const override { return dtype == DType::F32 || dtype == DType::BF16; }
 
     OpCapabilities GetCapabilities() const override {
         return {.supports_fp16 = false,
@@ -51,11 +193,17 @@ public:
     // =========================================================================
     void MatMul(const Tensor& A, const Tensor& B, Tensor* C) override {
         if (!A.IsValid() || !B.IsValid() || !C || !C->IsValid()) return;
+        if (!IsF32OrBF16(A.dtype) || !IsF32OrBF16(B.dtype) || C->dtype != DType::F32) return;
 
         // A: [M, K], B: [K, N], C: [M, N]
         const int M = static_cast<int>(A.shape[0]);
         const int K = static_cast<int>(A.shape[1]);
         const int N = static_cast<int>(B.shape[1]);
+
+        if (A.dtype == DType::BF16 || B.dtype == DType::BF16) {
+            ExecuteMixedMatMulF32Accum(A, B, C);
+            return;
+        }
 
         const float* a_data = A.DataAs<float>();
         const float* b_data = B.DataAs<float>();
@@ -121,17 +269,22 @@ public:
     // =========================================================================
     void MatMulTransB(const Tensor& A, const Tensor& B, Tensor* C) override {
         if (!A.IsValid() || !B.IsValid() || !C || !C->IsValid()) return;
+        if (!IsF32OrBF16(A.dtype) || !IsF32OrBF16(B.dtype) || C->dtype != DType::F32) return;
 
         // A: [M, K], B: [N, K] (stored row-major), C: [M, N]
         const int M = static_cast<int>(A.shape[0]);
         const int K = static_cast<int>(A.shape[1]);
         const int N = static_cast<int>(B.shape[0]);  // N is dim 0 of B
 
+#ifdef __APPLE__
+        if (A.dtype != DType::F32 || B.dtype != DType::F32) {
+            ExecuteTransBViaMatmulBackend(A, B, C);
+            return;
+        }
+
         const float* a_data = A.DataAs<float>();
         const float* b_data = B.DataAs<float>();
         float* c_data = C->DataAs<float>();
-
-#ifdef __APPLE__
         // B is [N, K] row-major. B^T is [K, N] row-major.
         // cblas expects B to be [K, N].
         // Since B is [N, K], we use CblasTrans.
@@ -139,22 +292,7 @@ public:
         return;
 #endif
 
-        MatmulParams params;
-        params.a = a_data;
-        params.b = b_data;
-        params.c = c_data;
-        params.M = M;
-        params.N = N;
-        params.K = K;
-        params.lda = K;
-        params.ldb = K;
-        params.ldc = N;
-        params.trans_a = false;
-        params.trans_b = true;
-        params.a_type = DType::F32;
-        params.b_type = DType::F32;
-        params.c_type = DType::F32;
-        ExecuteDenseCoreMatmulTransBF32(params);
+        ExecuteTransBViaMatmulBackend(A, B, C);
     }
 };
 

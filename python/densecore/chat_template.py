@@ -94,13 +94,37 @@ def _infer_family(source: str) -> str:
     return "generic"
 
 
-def resolve_prompt_profile(model_hint: Optional[str]) -> PromptProfile:
+def _infer_family_from_metadata(tokenizer_type: str, chat_template: str) -> str:
+    tokenizer_lower = (tokenizer_type or "").strip().lower()
+    template_lower = (chat_template or "").strip().lower()
+    if "<|im_start|>" in template_lower or "<|im_end|>" in template_lower:
+        return "qwen"
+    if "<|turn>" in template_lower or "<turn|>" in template_lower:
+        return "gemma"
+    for source in (tokenizer_lower, template_lower):
+        family = _infer_family(source)
+        if family != "generic":
+            return family
+    return "generic"
+
+
+def resolve_prompt_profile(
+    model_hint: Optional[str],
+    tokenizer_type: Optional[str] = None,
+    chat_template: Optional[str] = None,
+) -> PromptProfile:
     source = (model_hint or "").strip().lower()
-    inferred_family = _infer_family(source)
+    tokenizer_source = (tokenizer_type or "").strip().lower()
+    template_source = (chat_template or "").strip().lower()
+    metadata_family = _infer_family_from_metadata(tokenizer_source, template_source)
+    inferred_family = metadata_family if metadata_family != "generic" else _infer_family(source)
     specs = _profile_specs()
     for spec in specs:
-        matches = spec.get("match_substrings", [])
-        if any(token in source for token in matches):
+        matches = [str(token).strip().lower() for token in spec.get("match_substrings", [])]
+        if any(
+            token and (token in source or token in tokenizer_source or token in template_source)
+            for token in matches
+        ):
             family = str(spec.get("family", "generic")).strip().lower()
             if family == "generic" and inferred_family in {"qwen", "gemma"}:
                 for profile in _default_profiles():
@@ -123,7 +147,7 @@ def resolve_prompt_profile(model_hint: Optional[str]) -> PromptProfile:
                 audio_token=multimodal.get("audio", ""),
             )
     for profile in _default_profiles():
-        if profile.family != "generic" and profile.family in source:
+        if profile.family == inferred_family:
             return profile
     return _default_profiles()[-1]
 
@@ -318,11 +342,13 @@ def format_chat_prompt(
     *,
     enable_thinking: Optional[bool] = None,
     extra_system_messages: Optional[list[str]] = None,
+    tokenizer_type: Optional[str] = None,
+    chat_template: Optional[str] = None,
 ) -> str:
     if not messages and not extra_system_messages:
         return ""
 
-    profile = resolve_prompt_profile(model_hint)
+    profile = resolve_prompt_profile(model_hint, tokenizer_type, chat_template)
     normalized_messages = list(messages)
     if extra_system_messages:
         for content in reversed(extra_system_messages):

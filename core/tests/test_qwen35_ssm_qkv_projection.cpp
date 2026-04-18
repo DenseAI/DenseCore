@@ -433,6 +433,118 @@ TEST(Qwen35SSMQkvProjection, DeterministicOutputForFixedInput) {
     EXPECT_GT(energy, 1e-10f) << "Output is trivially zero for non-zero inputs";
 }
 
+namespace densecore {
+namespace testing {
+    extern void CbSsmQwen35DeltaTest(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
+                                     const struct ggml_tensor* c, int ith, int nth, void* userdata);
+    extern int GetArmQ4KNativeVecDotModeTest();
+}
+}
+
+TEST(Qwen35SSMQkvProjection, CallbackMatchesPreSiluQkvInputs) {
+    TestRng rng(4242);
+
+    auto qkv_pre_silu = rng.Uniform(kTestConvChannels, 0.3f);
+    auto z = rng.Uniform(kTestDInner, 0.2f);
+    auto input_t = rng.Uniform(kTestNEmbd, 0.1f);
+    auto alpha = rng.Uniform(static_cast<size_t>(kTestNHeads) * kTestNEmbd, 0.01f);
+    auto beta = rng.Uniform(static_cast<size_t>(kTestNHeads) * kTestNEmbd, 0.01f);
+    auto dt_bias = rng.Uniform(kTestNHeads, 0.05f);
+    auto a_log = rng.Uniform(kTestNHeads, 0.05f);
+    auto norm = rng.Uniform(kTestHeadDimV, 0.02f);
+    for (float& v : norm) v = 0.9f + std::fabs(v);
+    for (float& v : dt_bias) v -= 0.2f;
+    for (float& v : a_log) v = -1.0f - std::fabs(v);
+
+    std::vector<float> qkv_post_silu(qkv_pre_silu.size(), 0.0f);
+    for (size_t i = 0; i < qkv_pre_silu.size(); ++i) {
+        const float x = qkv_pre_silu[i];
+        qkv_post_silu[i] = x / (1.0f + std::exp(-x));
+    }
+
+    std::vector<float> state(static_cast<size_t>(kTestNHeads) * kTestHeadDimK * kTestHeadDimV, 0.0f);
+    std::vector<float> expected(static_cast<size_t>(kTestDInner), 0.0f);
+
+    const int heads_per_group = kTestNHeads / kTestNGroups;
+    const float* q_base = qkv_post_silu.data();
+    const float* k_base = q_base + kTestQKTotal;
+    const float* v_base = k_base + kTestQKTotal;
+
+    for (int h = 0; h < kTestNHeads; ++h) {
+        const int src_k_head = std::min(kTestNGroups - 1, h / heads_per_group);
+        Qwen35SSMHeadStepConfig cfg{};
+        cfg.input_t = input_t.data();
+        cfg.q_head = q_base + src_k_head * kTestHeadDimK;
+        cfg.k_head = k_base + src_k_head * kTestHeadDimK;
+        cfg.v_head = v_base + h * kTestHeadDimV;
+        cfg.z_head = z.data() + h * kTestHeadDimV;
+        cfg.alpha_row = alpha.data() + static_cast<size_t>(h) * kTestNEmbd;
+        cfg.beta_row = beta.data() + static_cast<size_t>(h) * kTestNEmbd;
+        cfg.norm_weight = norm.data();
+        cfg.n_embd = kTestNEmbd;
+        cfg.head_dim_k = kTestHeadDimK;
+        cfg.head_dim_v = kTestHeadDimV;
+        cfg.dt_bias = dt_bias[static_cast<size_t>(h)];
+        cfg.a_log = a_log[static_cast<size_t>(h)];
+        cfg.norm_eps = 1e-6f;
+
+        float* state_h = state.data() + static_cast<size_t>(h) * kTestHeadDimK * kTestHeadDimV;
+        float* y_h = expected.data() + static_cast<size_t>(h) * kTestHeadDimV;
+        ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(cfg, state_h, y_h, nullptr));
+    }
+
+    struct ggml_tensor a = {};
+    struct ggml_tensor b = {};
+    struct ggml_tensor c = {};
+    struct ggml_tensor dst = {};
+    a.data = z.data();
+    b.data = qkv_pre_silu.data();
+    c.data = input_t.data();
+    std::vector<float> callback_out(static_cast<size_t>(kTestDInner), 0.0f);
+    dst.data = callback_out.data();
+
+    a.type = GGML_TYPE_F32;
+    b.type = GGML_TYPE_F32;
+    c.type = GGML_TYPE_F32;
+    dst.type = GGML_TYPE_F32;
+    a.ne[0] = kTestDInner; a.ne[1] = 1;
+    b.ne[0] = kTestConvChannels; b.ne[1] = 1;
+    c.ne[0] = kTestNEmbd; c.ne[1] = 1;
+    dst.ne[0] = kTestDInner; dst.ne[1] = 1;
+    a.nb[0] = sizeof(float); a.nb[1] = kTestDInner * sizeof(float);
+    b.nb[0] = sizeof(float); b.nb[1] = kTestConvChannels * sizeof(float);
+    c.nb[0] = sizeof(float); c.nb[1] = kTestNEmbd * sizeof(float);
+    dst.nb[0] = sizeof(float); dst.nb[1] = kTestDInner * sizeof(float);
+
+    SSMQwen35DeltaUserData ud{};
+    ud.alpha_weight = alpha.data();
+    ud.beta_weight = beta.data();
+    ud.dt_bias = dt_bias.data();
+    ud.a_log = a_log.data();
+    ud.norm_weight = norm.data();
+    ud.ssm_state = state.data();
+    ud.n_embd = kTestNEmbd;
+    ud.d_inner = kTestDInner;
+    ud.n_heads = kTestNHeads;
+    ud.head_dim_v = kTestHeadDimV;
+    ud.head_dim_k = kTestHeadDimK;
+    ud.n_groups = kTestNGroups;
+    ud.norm_layout = Qwen35SSMNormLayout::SHARED_HEAD_DIM;
+    ud.norm_eps = 1e-6f;
+    ud.layer_idx = 0;
+    ud.ssm_ordinal = -1;
+    ud.token_seq_ids = nullptr;
+    ud.runtime_states = nullptr;
+
+    std::fill(state.begin(), state.end(), 0.0f);
+    densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &ud);
+
+    for (int i = 0; i < kTestDInner; ++i) {
+        EXPECT_NEAR(callback_out[static_cast<size_t>(i)], expected[static_cast<size_t>(i)], 1e-5f)
+            << "callback mismatch at index " << i;
+    }
+}
+
 // ============================================================================
 // TEST: Env parsing test for GetArmQ4KNativeVecDotMode
 //
@@ -440,14 +552,6 @@ TEST(Qwen35SSMQkvProjection, DeterministicOutputForFixedInput) {
 // Verify =1 => On (2)
 // Verify missing => Auto (1)
 // ============================================================================
-namespace densecore {
-namespace testing {
-    extern int GetArmQ4KNativeVecDotModeTest();
-    extern void CbSsmQwen35DeltaTest(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
-                                     const struct ggml_tensor* c, int ith, int nth, void* userdata);
-}
-}
-
 TEST(Qwen35SSMQkvProjection, EnvParsingLegacyArmQ4k) {
     const char* prev = std::getenv("DENSECORE_ARM_ALLOW_Q4K_NATIVE_VECDOT");
     std::string safe_prev = prev ? prev : "";
@@ -503,8 +607,8 @@ TEST(Qwen35SSMQkvProjection, CallbackContractAssertions) {
     a.data = dummy_data; b.data = dummy_data; c.data = dummy_data; dst.data = dummy_data;
     
     a.type = GGML_TYPE_F32; b.type = GGML_TYPE_F32; c.type = GGML_TYPE_F32; dst.type = GGML_TYPE_F32;
-    a.ne[0] = kTestConvChannels; a.ne[1] = 1;
-    b.ne[0] = kTestDInner; b.ne[1] = 1;
+    a.ne[0] = kTestDInner; a.ne[1] = 1;
+    b.ne[0] = kTestConvChannels; b.ne[1] = 1;
     c.ne[0] = kTestNEmbd; c.ne[1] = 1;
     dst.ne[0] = kTestDInner; dst.ne[1] = 1;
     a.nb[0] = sizeof(float); b.nb[0] = sizeof(float); c.nb[0] = sizeof(float); dst.nb[0] = sizeof(float);
@@ -525,17 +629,17 @@ TEST(Qwen35SSMQkvProjection, CallbackContractAssertions) {
     ud.runtime_states = nullptr;
     
     // Death tests are supported by gtest: "EXPECT_DEATH(statement, regex)"
-    a.ne[0] = kTestConvChannels - 1; 
+    b.ne[0] = kTestConvChannels - 1; 
     EXPECT_DEATH(densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &ud), "SSM QKV layout mismatch");
-    a.ne[0] = kTestConvChannels; 
+    b.ne[0] = kTestConvChannels; 
     
     a.type = GGML_TYPE_F16;
     EXPECT_DEATH(densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &ud), "SSM delta inputs/outputs must be F32");
     a.type = GGML_TYPE_F32; 
     
-    b.ne[0] = kTestDInner - 1;
+    a.ne[0] = kTestDInner - 1;
     EXPECT_DEATH(densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &ud), "SSM z tensor shape mismatch");
-    b.ne[0] = kTestDInner; 
+    a.ne[0] = kTestDInner; 
 
     dst.ne[0] = kTestDInner - 1;
     EXPECT_DEATH(densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &ud), "SSM output tensor shape mismatch");

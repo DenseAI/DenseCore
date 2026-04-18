@@ -709,14 +709,9 @@ int ResolveAutoDecodeThreadsForBatchWithSimd(int num_seqs, int physical_core_cou
     case densecore::simd::SimdLevel::AMX:
     case densecore::simd::SimdLevel::AVX512:
     case densecore::simd::SimdLevel::SVE:
-    case densecore::simd::SimdLevel::SVE2:
-        threads_per_seq = 8;
-        break;
-    case densecore::simd::SimdLevel::NEON:
-        threads_per_seq = 6;
-        break;
-    default:
-        break;
+    case densecore::simd::SimdLevel::SVE2: threads_per_seq = 8; break;
+    case densecore::simd::SimdLevel::NEON: threads_per_seq = 6; break;
+    default: break;
     }
 
     const int primary_batch = std::min(std::max(1, num_seqs), 8);

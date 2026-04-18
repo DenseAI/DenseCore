@@ -45,7 +45,15 @@ struct ResolvedModelDescriptor {
     bool known = false;
 };
 
+struct ModelDetectionHints {
+    bool has_gemma4_metadata = false;
+    bool has_gemma4_tensor_signatures = false;
+    bool has_gemma4_tokenizer_hint = false;
+};
+
 ResolvedModelDescriptor ResolveModelDescriptor(std::string_view arch_name);
+ResolvedModelDescriptor ResolveModelDescriptorWithHints(std::string_view arch_name, const ModelDetectionHints& hints,
+                                                        bool* used_hint_upgrade = nullptr);
 const ModelDescriptor& DescribeModelVariant(ModelVariant variant);
 const ModelDescriptor& DescribeModel(const TransformerModel* model);
 TokenizerFamily ResolveTokenizerFamily(const TransformerModel* model);
@@ -54,7 +62,9 @@ TokenizerFamily ResolveTokenizerFamilyFromMetadata(std::string_view tokenizer_ty
 PromptTemplateFamily ResolvePromptTemplateFamilyFromMetadata(std::string_view tokenizer_type,
                                                              std::string_view chat_template);
 bool IsKnownTokenizerModel(std::string_view tokenizer_name);
+const char* ModelVariantName(ModelVariant variant);
 const char* TokenizerFamilyName(TokenizerFamily family);
+const char* PromptTemplateFamilyName(PromptTemplateFamily family);
 
 }  // namespace densecore::models
 

@@ -665,6 +665,61 @@ DENSECORE_API const char* GetChatTemplate(DenseCoreHandle handle);
 DENSECORE_API int DenseCoreTokenizeText(DenseCoreHandle handle, const char* text, int add_bos, int add_eos,
                                         int* out_ids, int max_ids);
 
+typedef struct {
+    const char* role;
+    const char* content;
+    const char* reasoning_content;
+    const char* name;
+} DenseCoreChatMessage;
+
+typedef struct {
+    int enable_thinking;  // -1 = auto, 0 = disable, 1 = enable
+} DenseCoreChatTemplateOptions;
+
+typedef struct {
+    const char* rendered_prompt;
+    const char* tokenizer_type;
+    const char* chat_template;
+    const char* model_variant;
+    const char* prompt_family;
+    int thinking_enabled;
+} DenseCoreRenderedChatPrompt;
+
+typedef enum {
+    DENSECORE_SUBMIT_PATH_UNKNOWN = 0,
+    DENSECORE_SUBMIT_PATH_TEXT = 1,
+    DENSECORE_SUBMIT_PATH_TEXT_WITH_SAMPLING = 2,
+    DENSECORE_SUBMIT_PATH_TEXT_WITH_FORMAT = 3,
+    DENSECORE_SUBMIT_PATH_IDS = 4,
+    DENSECORE_SUBMIT_PATH_IDS_WITH_SAMPLING = 5,
+    DENSECORE_SUBMIT_PATH_IDS_WITH_FORMAT = 6,
+} DenseCoreSubmitPath;
+
+typedef struct {
+    const char* rendered_prompt;
+    const int* token_ids;
+    int num_token_ids;
+    DenseCoreSubmitPath submit_path;
+    float temperature;
+    float top_p;
+    int top_k;
+    float repetition_penalty;
+    int json_mode;
+    int template_applied;
+    int text_primed;
+    int token_primed;
+} DenseCoreRequestSnapshot;
+
+DENSECORE_API int DenseCoreRenderChatPrompt(DenseCoreHandle handle, const DenseCoreChatMessage* messages,
+                                            int num_messages, const DenseCoreChatTemplateOptions* options,
+                                            DenseCoreRenderedChatPrompt* out);
+DENSECORE_API int DenseCorePreviewTextRequest(DenseCoreHandle handle, const char* prompt, int max_tokens,
+                                              float temperature, float top_p, int top_k, float repetition_penalty,
+                                              int json_mode, DenseCoreRequestSnapshot* out);
+DENSECORE_API int DenseCorePreviewTokenRequest(DenseCoreHandle handle, const int* token_ids, int num_token_ids,
+                                               int max_tokens, float temperature, float top_p, int top_k,
+                                               float repetition_penalty, int json_mode, DenseCoreRequestSnapshot* out);
+
 /**
  * Cancel a running request
  *

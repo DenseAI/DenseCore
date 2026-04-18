@@ -212,3 +212,23 @@ TEST(EngineKVCacheConfig, GLMIndexCacheContributesToBudgeting) {
     EXPECT_EQ(config.bytes_per_token, expected_bytes_per_token);
     EXPECT_EQ(config.max_seq_len, expected_seq_len);
 }
+
+TEST(EngineKVCacheConfig, HybridSsmGraphContextKeepsBatchFourHeadroom) {
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "512");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+    ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
+    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", nullptr);
+
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_embd = 2048;
+    model.hparams.n_layer = 24;
+    model.hparams.n_head = 8;
+    model.hparams.n_ctx = 262144;
+    model.ssm_inner_size = 2048;
+
+    const size_t graph_ctx_bytes = EngineState::CalculateGraphContextSize(&model);
+    EXPECT_GE(graph_ctx_bytes, static_cast<size_t>(4096) * 1024 * 1024)
+        << "Hybrid Qwen3.5 batch decode graph context regressed below the known-safe 4 GB floor";
+}

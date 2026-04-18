@@ -105,11 +105,17 @@ struct SSMQwen35DeltaUserData {
     int ssm_ordinal = -1;
     const int* token_seq_ids = nullptr;
     const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
+    const ggml_tensor* z_tensor = nullptr;
+    const ggml_tensor* input_tensor = nullptr;
 };
 
 // SSM delta recurrent callback
+void cb_ssm_conv1d_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_ssm_qwen35_delta_qkv_only(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                  void* userdata);
 void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
                          const struct ggml_tensor* c, int ith, int nth, void* userdata);
+void cb_ssm_qwen35_delta_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
 
 // Smart matrix multiplication dispatcher
 struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* weight, struct ggml_tensor* input,

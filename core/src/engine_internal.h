@@ -232,7 +232,12 @@ struct Request {
     int n_past = 0;
     bool is_prefill = true;
     int generated_count = 0;
+    int parity_debug_output_tokens = 0;
     bool finished = false;
+    bool parity_debug_text_primed = false;
+    bool parity_debug_token_primed = false;
+    bool parity_debug_template_applied = false;
+    std::string parity_debug_submit_api;
 
     // Request lifecycle control
     std::atomic<bool> cancelled{false};  // Cancellation flag
@@ -319,7 +324,12 @@ struct Request {
         n_past = 0;
         is_prefill = true;
         generated_count = 0;
+        parity_debug_output_tokens = 0;
         finished = false;
+        parity_debug_text_primed = false;
+        parity_debug_token_primed = false;
+        parity_debug_template_applied = false;
+        parity_debug_submit_api.clear();
         cancelled = false;
         tier = "standard";
         block_table.clear();
@@ -745,16 +755,31 @@ struct EngineState {
         const size_t effective_seq_len = std::max<size_t>(
             1, std::min<size_t>(static_cast<size_t>(std::max<int32_t>(1, hp.n_ctx)), runtime_max_seq_len));
 
-        // The graph context holds graph nodes, views, scratch tensors and a modest
-        // amount of activation staging. It should scale with the active request
-        // shape, not with the model's full advertised context window or vocab.
+        // The graph context backs the persistent GGML compute pool used while
+        // rebuilding and executing the active graph. It must cover:
+        //   - per-layer hidden-state / QKV / FFN activations (O(n_embd * seq))
+        //   - attention score / probability scratch (O(n_head * seq^2))
+        //   - a few live residual/output buffers outside the layer loop
+        //
+        // The prior estimate only used O(n_head * seq), which under-sized the
+        // pool for decoder attention graphs and caused ggml_new_object() aborts
+        // once real OpenVLA/llm_universal paths exercised longer prompts.
         const size_t token_working_set = runtime_max_num_seqs * effective_seq_len;
-        const size_t attn_working_set = static_cast<size_t>(std::max<int32_t>(1, hp.n_head)) * token_working_set;
         const size_t hidden_working_set = static_cast<size_t>(std::max<int32_t>(1, hp.n_embd)) * token_working_set;
+        const size_t hidden_bytes = hidden_working_set * sizeof(float);
 
-        size_t base_size = static_cast<size_t>(std::max<int32_t>(1, hp.n_layer)) *
-                           (hidden_working_set * sizeof(float) / 4 + attn_working_set * sizeof(float) / 8);
-        size_t overhead = hidden_working_set * sizeof(float) * 2;
+        const size_t attention_score_elems =
+            static_cast<size_t>(std::max<int32_t>(1, hp.n_head)) * token_working_set * effective_seq_len;
+        const size_t attention_score_bytes = attention_score_elems * sizeof(float);
+
+        // Conservative layer-local upper bound:
+        //   - ~7 hidden-sized buffers (norm/Q/K/V/attn_out/ffn/residual staging)
+        //   - ~2 score-sized buffers (scores + probs/mask-expanded scratch)
+        const size_t per_layer_activation_bytes = hidden_bytes * 7 + attention_score_bytes * 2;
+        size_t base_size = static_cast<size_t>(std::max<int32_t>(1, hp.n_layer)) * per_layer_activation_bytes;
+
+        // Residual/output/lm-head staging that can remain live across layers.
+        size_t overhead = hidden_bytes * 4 + attention_score_bytes / 2;
 
         // Hybrid SSM / Gemma4 graphs need extra room for recurrent state views and
         // architecture-specific branch tensors, but still nowhere near full-model memory.
@@ -762,19 +787,44 @@ struct EngineState {
             overhead += static_cast<size_t>(std::max(1, model->ssm_inner_size)) * token_working_set * sizeof(float) / 2;
         }
         if (model->arch_flags.is_gemma4) {
-            overhead += hidden_working_set * sizeof(float);
+            overhead += hidden_bytes;
         }
 
         size_t total = base_size + overhead;
+
+        // Leave explicit headroom for ggml object metadata, graph bookkeeping,
+        // and architecture-specific scratch that are not modeled perfectly by
+        // the coarse activation estimate above. Without this margin, real
+        // decoder graphs tend to miss by a few MB and abort in ggml_new_object.
+        total += std::max(total / 4, static_cast<size_t>(128) * MB);
+        total += static_cast<size_t>(8) * MB;
+        total += static_cast<size_t>(4) * MB;
 
         // Clamp to runtime-configurable bounds.
         // Defaults are chosen to keep previous behavior for small models while
         // allowing larger graphs (e.g., Qwen3-4B batch=4 decode) to avoid 2GB
         // hard-cap OOM.
-        const size_t recommended_min_mb =
-            model->arch_flags.is_gemma4 ? 384 : (model->arch_flags.is_hybrid_ssm ? 320 : 256);
+        size_t recommended_min_mb = model->arch_flags.is_gemma4 ? 384 : (model->arch_flags.is_hybrid_ssm ? 320 : 256);
+        if (!model->arch_flags.is_gemma4 && !model->arch_flags.is_hybrid_ssm &&
+            std::max<int32_t>(1, hp.n_layer) >= 24 && std::max<int32_t>(1, hp.n_embd) >= 3072) {
+            recommended_min_mb = std::max(recommended_min_mb, static_cast<size_t>(2560));
+        }
+        size_t recommended_max_mb = 8192;
+        // Small hybrid-SSM models (for example Qwen3.5-2B on laptop-class CPUs)
+        // still need materially more graph-context headroom once the runtime is
+        // provisioned for multi-sequence decode. Batch=2/4 decode can exceed
+        // 2-3 GB of GGML graph objects on the local hybrid fixture, so keep the
+        // cap below the historical 8 GB ceiling but high enough that the graph
+        // builder is not clipped a few MB under real demand.
+        if (model->arch_flags.is_hybrid_ssm && std::max<int32_t>(1, hp.n_embd) <= 2048 &&
+            std::max<int32_t>(1, hp.n_layer) <= 24 && effective_seq_len <= 4096 && runtime_max_num_seqs <= 4) {
+            recommended_max_mb = 4096;
+        } else if (model->arch_flags.is_hybrid_ssm && effective_seq_len <= 2048 && runtime_max_num_seqs <= 4) {
+            recommended_max_mb = 6144;
+        }
+
         size_t min_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MIN_MB", recommended_min_mb, HARD_MIN_MB, HARD_MAX_MB);
-        size_t max_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MAX_MB", 8192, HARD_MIN_MB, HARD_MAX_MB);
+        size_t max_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MAX_MB", recommended_max_mb, HARD_MIN_MB, HARD_MAX_MB);
         if (max_mb < min_mb) max_mb = min_mb;
         const size_t MIN_SIZE = min_mb * MB;
         const size_t MAX_SIZE = max_mb * MB;

@@ -198,17 +198,6 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
     std::cout << "[DenseCore] Detected architecture: " << arch << std::endl;
 
-    const auto resolved_arch = densecore::models::ResolveModelDescriptor(arch);
-    model->arch = resolved_arch.arch;
-    model->variant = resolved_arch.variant;
-    model->arch_flags = resolved_arch.arch_flags;
-    if (!resolved_arch.known) {
-        model->arch = ModelArch::UNKNOWN;
-        model->variant = ModelVariant::UNKNOWN;
-        std::cerr << "[DenseCore] Warning: Unknown architecture '" << arch << "'. Model may not load correctly."
-                  << std::endl;
-    }
-
     // Detect tokenizer metadata from GGUF.
     //
     // `tokenizer.ggml.model` describes the base tokenizer family (e.g. gpt2),
@@ -229,11 +218,43 @@ TransformerModel* LoadGGUFModel(const char* path) {
     std::string tokenizer_lower = tokenizer_type;
     std::transform(tokenizer_lower.begin(), tokenizer_lower.end(), tokenizer_lower.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    model->tokenizer_type = tokenizer_type;
     int idx_chat_template = gguf_find_key(ctx_gguf, "tokenizer.chat_template");
+    std::string chat_template;
     if (idx_chat_template != -1) {
-        model->chat_template = gguf_get_val_str(ctx_gguf, idx_chat_template);
+        chat_template = gguf_get_val_str(ctx_gguf, idx_chat_template);
     }
+
+    densecore::models::ModelDetectionHints detection_hints;
+    detection_hints.has_gemma4_metadata = gguf_find_key(ctx_gguf, "gemma4.attention.head_count_kv") != -1 ||
+                                          gguf_find_key(ctx_gguf, "gemma4.attention.key_length_swa") != -1 ||
+                                          gguf_find_key(ctx_gguf, "gemma4.attention.value_length_swa") != -1 ||
+                                          gguf_find_key(ctx_gguf, "gemma4.attention.shared_kv_layers") != -1 ||
+                                          gguf_find_key(ctx_gguf, "gemma4.embedding_length_per_layer_input") != -1 ||
+                                          gguf_find_key(ctx_gguf, "gemma4.layer_types") != -1;
+    detection_hints.has_gemma4_tensor_signatures = gguf_find_tensor(ctx_gguf, "per_layer_model_proj.weight") != -1 ||
+                                                   gguf_find_tensor(ctx_gguf, "per_layer_proj_norm.weight") != -1 ||
+                                                   gguf_find_tensor(ctx_gguf, "per_layer_token_embd.weight") != -1 ||
+                                                   gguf_find_tensor(ctx_gguf, "blk.0.inp_gate.weight") != -1;
+    detection_hints.has_gemma4_tokenizer_hint = tokenizer_lower.find("gemma4") != std::string::npos;
+
+    bool used_hint_upgrade = false;
+    const auto resolved_arch =
+        densecore::models::ResolveModelDescriptorWithHints(arch, detection_hints, &used_hint_upgrade);
+    model->arch = resolved_arch.arch;
+    model->variant = resolved_arch.variant;
+    model->arch_flags = resolved_arch.arch_flags;
+    if (!resolved_arch.known) {
+        model->arch = ModelArch::UNKNOWN;
+        model->variant = ModelVariant::UNKNOWN;
+        std::cerr << "[DenseCore] Warning: Unknown architecture '" << arch << "'. Model may not load correctly."
+                  << std::endl;
+    } else if (used_hint_upgrade) {
+        std::cerr << "[DenseCore] Warning: architecture '" << arch
+                  << "' classified as Gemma4 from auxiliary metadata/tensor signatures" << std::endl;
+    }
+
+    model->tokenizer_type = tokenizer_type;
+    model->chat_template = std::move(chat_template);
     const int gemma4_head_count_kv_idx = gguf_find_key(ctx_gguf, "gemma4.attention.head_count_kv");
     const gguf_type gemma4_head_count_kv_type =
         gemma4_head_count_kv_idx != -1 ? gguf_get_kv_type(ctx_gguf, gemma4_head_count_kv_idx) : GGUF_TYPE_UINT8;
@@ -1207,6 +1228,13 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
         if (is_ssm) {
             // SSM/Mamba layer: fused QKV + SSM weights + gate
+            struct ggml_tensor* fused_ba = get_layer_tensor_any(i, {"ssm_ba.weight", "linear_attn.in_proj_ba.weight"});
+            struct ggml_tensor* ssm_alpha =
+                get_layer_tensor_any(i, {"ssm_alpha.weight", "linear_attn.in_proj_a.weight"});
+            struct ggml_tensor* ssm_beta = get_layer_tensor_any(i, {"ssm_beta.weight", "linear_attn.in_proj_b.weight"});
+            if (!ssm_alpha && fused_ba) ssm_alpha = fused_ba;
+            if (!ssm_beta && fused_ba) ssm_beta = fused_ba;
+
             model->layers[i].Set(model_keys::kAttnQkvWeight,
                                  get_layer_tensor_any(i, {"attn_qkv.weight", "linear_attn.in_proj_qkv.weight"}));
             model->layers[i].Set(model_keys::kAttnGate,
@@ -1214,10 +1242,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             model->layers[i].Set(model_keys::kSSMConv1d,
                                  get_layer_tensor_any(i, {"ssm_conv1d.weight", "linear_attn.conv1d.weight"}));
             model->layers[i].Set(model_keys::kSSMA, get_layer_tensor_any(i, {"ssm_a", "linear_attn.A_log"}));
-            model->layers[i].Set(model_keys::kSSMAlpha,
-                                 get_layer_tensor_any(i, {"ssm_alpha.weight", "linear_attn.in_proj_a.weight"}));
-            model->layers[i].Set(model_keys::kSSMBeta,
-                                 get_layer_tensor_any(i, {"ssm_beta.weight", "linear_attn.in_proj_b.weight"}));
+            model->layers[i].Set(model_keys::kSSMAlpha, ssm_alpha);
+            model->layers[i].Set(model_keys::kSSMBeta, ssm_beta);
             model->layers[i].Set(model_keys::kSSMDtBias,
                                  get_layer_tensor_any(i, {"ssm_dt.bias", "linear_attn.dt_bias"}));
             model->layers[i].Set(model_keys::kSSMNorm,
@@ -1763,6 +1789,25 @@ TransformerModel* LoadGGUFModel(const char* path) {
                       << n_heads << "x" << model->hparams.n_embd << "]" << std::endl;
             return false;
         };
+        auto canonicalize_fused_ba = [&](const char* label, struct ggml_tensor* t, std::vector<float>& beta_out,
+                                         std::vector<float>& alpha_out, uint32_t layer_idx) -> bool {
+            std::vector<float> raw;
+            if (!dequant_raw(t, raw)) {
+                std::cerr << "[DenseCore] FATAL: unable to dequantize " << label << " at layer " << layer_idx
+                          << std::endl;
+                return false;
+            }
+            if (Qwen35CanonicalizeFusedBA(raw.data(), t ? t->ne : nullptr, static_cast<int>(model->hparams.n_embd),
+                                          n_heads, model->ssm_group_count, &beta_out, &alpha_out)) {
+                return validate_finite("ssm_ba/beta", beta_out, layer_idx) &&
+                       validate_finite("ssm_ba/alpha", alpha_out, layer_idx);
+            }
+            std::cerr << "[DenseCore] FATAL: invalid " << label << " shape at layer " << layer_idx << ": "
+                      << shape_string(t) << ", expected [" << model->hparams.n_embd << "x" << (2 * n_heads) << "] or ["
+                      << (2 * n_heads) << "x" << model->hparams.n_embd << "] with grouped [beta,alpha]" << " layout"
+                      << std::endl;
+            return false;
+        };
         auto canonicalize_per_head = [&](const char* label, struct ggml_tensor* t, std::vector<float>& out,
                                          uint32_t layer_idx) -> bool {
             std::vector<float> raw;
@@ -1810,10 +1855,12 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 auto* dt = model->layers[i].Get(model_keys::kSSMDtBias);
                 auto* ssm_a = model->layers[i].Get(model_keys::kSSMA);
                 auto* norm = model->layers[i].Get(model_keys::kSSMNorm);
+                const bool has_fused_ba = alpha && beta && alpha == beta;
 
                 if (!canonicalize_conv1d("ssm_conv1d", conv, state.conv1d_f32, i) ||
-                    !canonicalize_head_by_embd("ssm_alpha", alpha, state.alpha_f32, i) ||
-                    !canonicalize_head_by_embd("ssm_beta", beta, state.beta_f32, i) ||
+                    !(has_fused_ba ? canonicalize_fused_ba("ssm_ba", alpha, state.beta_f32, state.alpha_f32, i)
+                                   : (canonicalize_head_by_embd("ssm_alpha", alpha, state.alpha_f32, i) &&
+                                      canonicalize_head_by_embd("ssm_beta", beta, state.beta_f32, i))) ||
                     !canonicalize_per_head("ssm_dt_bias", dt, state.dt_bias_f32, i) ||
                     !canonicalize_per_head("ssm_a/A_log", ssm_a, state.a_log_f32, i) ||
                     !canonicalize_norm("ssm_norm", norm, state.norm_f32, &state.norm_layout, i)) {

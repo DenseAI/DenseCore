@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <string>
 
+#include "models/model_prompt_templates.h"
 #include "model_types.h"
 
 std::string DenseCoreTestOnlyApplyAutoChatTemplate(const TransformerModel* model, const std::string& prompt);
@@ -160,6 +161,66 @@ TEST(ChatTemplateTest, QwenNoThinkingPromptDoesNotStartInsideThinkBlock) {
     unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
 
     EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+}
+
+TEST(ChatTemplateTest, AutoTemplateCanBeDisabledForRawQaMode) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_AUTO_CHAT_TEMPLATE", "0", 1);
+    setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false", 1);
+    const std::string prompt = "The capital of France is";
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, prompt);
+    unsetenv("DENSECORE_AUTO_CHAT_TEMPLATE");
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+
+    EXPECT_EQ(wrapped, prompt);
+}
+
+TEST(CanonicalChatRenderTest, QwenCanonicalRendererMatchesChatMLPrompt) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false", 1);
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "hello";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    bool thinking_enabled = true;
+    const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {}, &thinking_enabled);
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+
+    EXPECT_FALSE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<|im_start|>user\n"
+              "hello /no_think<|im_end|>\n"
+              "<|im_start|>assistant\n");
+}
+
+TEST(CanonicalChatRenderTest, GemmaCanonicalRendererMatchesTurnTags) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "What is the capital of France?";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    bool thinking_enabled = false;
+    const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {}, &thinking_enabled);
+
+    EXPECT_FALSE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<bos>"
+              "<|turn>user\n"
+              "What is the capital of France?<turn|>\n"
+              "<|turn>model\n");
 }
 
 TEST(QwenReasoningBlocklistTest, NoThinkingBlocksReasoningTagsButKeepsChatTerminator) {

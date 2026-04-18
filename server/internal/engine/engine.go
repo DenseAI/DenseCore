@@ -251,7 +251,9 @@ func (e *DenseEngine) GenerateStream(ctx context.Context, prompt string, maxToke
 	completionCh := completionChannels.Register(reqID)
 
 	// Call C wrapper
+	e.mu.Lock()
 	ret := C.SubmitRequestWrapper(e.handle, cPrompt, C.int(maxTokens), C.uintptr_t(reqID))
+	e.mu.Unlock()
 	if ret < 0 {
 		Cleanup(reqID)
 		return fmt.Errorf("submission failed with error code %d", ret)
@@ -284,7 +286,9 @@ func (e *DenseEngine) GenerateStreamWithFormat(ctx context.Context, prompt strin
 	}
 
 	// Call C wrapper with format
+	e.mu.Lock()
 	ret := C.SubmitRequestWithFormatWrapper(e.handle, cPrompt, C.int(maxTokens), C.int(jsonModeInt), C.uintptr_t(reqID))
+	e.mu.Unlock()
 	if ret < 0 {
 		Cleanup(reqID)
 		return fmt.Errorf("submission failed with error code %d", ret)
@@ -346,6 +350,7 @@ func (e *DenseEngine) GenerateStreamWithSampling(ctx context.Context, prompt str
 		allowedStrictInt = 1
 	}
 
+	e.mu.Lock()
 	ret := C.SubmitRequestWithSamplingConstraintsWrapper(
 		e.handle,
 		cPrompt,
@@ -364,6 +369,7 @@ func (e *DenseEngine) GenerateStreamWithSampling(ctx context.Context, prompt str
 		C.int(len(cDisallowed)),
 		C.uintptr_t(reqID),
 	)
+	e.mu.Unlock()
 	if ret < 0 {
 		Cleanup(reqID)
 		return fmt.Errorf("submission failed with error code %d", ret)
@@ -430,6 +436,7 @@ func (e *DenseEngine) GenerateStreamTokensWithSampling(ctx context.Context, inpu
 		allowedStrictInt = 1
 	}
 
+	e.mu.Lock()
 	ret := C.SubmitRequestIdsWithSamplingConstraintsWrapper(
 		e.handle,
 		(*C.int)(unsafe.Pointer(&cTokens[0])),
@@ -449,6 +456,7 @@ func (e *DenseEngine) GenerateStreamTokensWithSampling(ctx context.Context, inpu
 		C.int(len(cDisallowed)),
 		C.uintptr_t(reqID),
 	)
+	e.mu.Unlock()
 	if ret < 0 {
 		Cleanup(reqID)
 		return fmt.Errorf("submission failed with error code %d", ret)
@@ -534,7 +542,9 @@ func (e *DenseEngine) GetEmbeddingsWithOptions(prompt string, poolingType string
 		normalizeInt = 0
 	}
 
+	e.mu.Lock()
 	ret := C.SubmitEmbeddingRequestExWrapper(e.handle, cPrompt, C.int(poolingInt), C.int(normalizeInt), C.uintptr_t(id))
+	e.mu.Unlock()
 	if ret < 0 {
 		embeddingChannels.Delete(uintptr(id))
 		return nil, fmt.Errorf("submission failed with error code %d", ret)
@@ -696,4 +706,72 @@ func (e *DenseEngine) GetChatTemplate() string {
 		return ""
 	}
 	return C.GoString(cValue)
+}
+
+func (e *DenseEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool) (*domain.RenderedChatPrompt, error) {
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("messages must not be empty")
+	}
+
+	cMessages := make([]C.DenseCoreChatMessage, len(messages))
+	cleanups := make([]func(), 0, len(messages)*4)
+	cstr := func(value string) *C.char {
+		ptr := C.CString(value)
+		cleanups = append(cleanups, func() { C.free(unsafe.Pointer(ptr)) })
+		return ptr
+	}
+	for index, message := range messages {
+		cMessages[index] = C.DenseCoreChatMessage{
+			role:              cstr(message.Role),
+			content:           cstr(message.FlattenedText()),
+			reasoning_content: cstr(message.ReasoningContent),
+			name:              cstr(message.Name),
+		}
+	}
+	defer func() {
+		for _, cleanup := range cleanups {
+			cleanup()
+		}
+	}()
+
+	options := C.DenseCoreChatTemplateOptions{enable_thinking: -1}
+	if enableThinking != nil {
+		if *enableThinking {
+			options.enable_thinking = 1
+		} else {
+			options.enable_thinking = 0
+		}
+	}
+
+	var rendered C.DenseCoreRenderedChatPrompt
+	e.mu.Lock()
+	ret := C.DenseCoreRenderChatPrompt(
+		e.handle,
+		(*C.DenseCoreChatMessage)(unsafe.Pointer(&cMessages[0])),
+		C.int(len(cMessages)),
+		&options,
+		&rendered,
+	)
+	e.mu.Unlock()
+	if ret < 0 {
+		return nil, fmt.Errorf("chat prompt render failed with error code %d", ret)
+	}
+
+	result := &domain.RenderedChatPrompt{
+		RenderedPrompt: C.GoString(rendered.rendered_prompt),
+		Thinking:       rendered.thinking_enabled != 0,
+	}
+	if rendered.tokenizer_type != nil {
+		result.TokenizerType = C.GoString(rendered.tokenizer_type)
+	}
+	if rendered.chat_template != nil {
+		result.ChatTemplate = C.GoString(rendered.chat_template)
+	}
+	if rendered.model_variant != nil {
+		result.ModelVariant = C.GoString(rendered.model_variant)
+	}
+	if rendered.prompt_family != nil {
+		result.PromptFamily = C.GoString(rendered.prompt_family)
+	}
+	return result, nil
 }

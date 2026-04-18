@@ -57,7 +57,9 @@ bool SupportsPagedDecodeAttention(const TransformerModel* model) {
 }
 
 float SanitizeAttentionLogitSoftcapForLoad(const TransformerModel* model, float gguf_softcap) {
-    (void)model;
+    if (model && model->arch_flags.is_gemma4) {
+        return 0.0f;
+    }
     return gguf_softcap;
 }
 

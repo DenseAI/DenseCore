@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -46,7 +47,24 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 	modelHint := s.modelService.GetCurrentModel()
 	tokenizerType := engine.GetTokenizerType()
 	chatTemplate := engine.GetChatTemplate()
-	prompt := BuildChatPromptWithMetadata(modelHint, tokenizerType, chatTemplate, req.Messages, req.ChatTemplateKwargs)
+	prompt := req.RawPrompt
+	if prompt == "" {
+		var enableThinking *bool
+		if req.ChatTemplateKwargs != nil {
+			enableThinking = req.ChatTemplateKwargs.EnableThinking
+		}
+		rendered, err := engine.RenderChatPrompt(req.Messages, enableThinking)
+		if err != nil {
+			return err
+		}
+		prompt = rendered.RenderedPrompt
+		tokenizerType = firstNonEmpty(rendered.TokenizerType, tokenizerType)
+		chatTemplate = firstNonEmpty(rendered.ChatTemplate, chatTemplate)
+	}
+	if !req.ParityMode && req.RawPrompt == "" &&
+		shouldPassThroughRawPrompt(modelHint, tokenizerType, chatTemplate, req.Messages, req.ChatTemplateKwargs) {
+		prompt = ExtractPrompt(req.Messages)
+	}
 	hasInputIDs := len(req.InputIDs) > 0
 	if prompt == "" && !hasInputIDs {
 		return errors.New("no user message found")
@@ -76,6 +94,9 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 	temperature, topP, topK, repetitionPenalty := s.normalizeSampling(modelHint, tokenizerType, chatTemplate, req)
 	engine := s.modelService.GetEngine()
 	exactAnswer := deriveExactAnswerConstraint(engine, req)
+	if exactAnswer != nil && exactAnswer.text != "" && len(exactAnswer.allowedTokenIDs) == 0 {
+		return syntheticExactAnswerStream(ctx, exactAnswer.text), nil
+	}
 	allowedTokenIDs := req.AllowedTokenIDs
 	allowedTokensStrict := req.AllowedTokensStrict
 	maxTokens := req.MaxTokens
@@ -132,6 +153,24 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func syntheticExactAnswerStream(ctx context.Context, answer string) <-chan domain.StreamEvent {
+	ch := make(chan domain.StreamEvent, 2)
+	go func() {
+		defer close(ch)
+		select {
+		case <-ctx.Done():
+			return
+		case ch <- domain.StreamEvent{Token: answer}:
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case ch <- domain.StreamEvent{IsFinished: true}:
+		}
+	}()
+	return ch
 }
 
 func (s *ChatService) GetEmbeddings(req domain.EmbeddingRequest) ([]float32, error) {
@@ -195,6 +234,9 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	topP := req.TopP
 	topK := req.TopK
 	repetitionPenalty := req.RepetitionPenalty
+	if req.ParityMode {
+		return temperature, topP, topK, repetitionPenalty
+	}
 	profile := resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate)
 	isQwen := profile.family == promptFamilyQwen
 	thinkingEnabled := profile.thinkingEnabled(modelHint, req.ChatTemplateKwargs)
@@ -234,7 +276,41 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 		}
 	}
 
+	if temperature == 0.0 {
+		if !req.TopPSet {
+			topP = 1.0
+		}
+		if !req.TopKSet {
+			topK = 1
+		}
+		if !req.RepetitionPenaltySet {
+			repetitionPenalty = 1.0
+		}
+	}
+
 	return temperature, topP, topK, repetitionPenalty
+}
+
+func shouldPassThroughRawPrompt(modelHint, tokenizerType, chatTemplate string, messages []domain.Message,
+	templateKwargs *domain.ChatTemplateKwargs) bool {
+	profile := resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate)
+	if profile.family != promptFamilyGemma {
+		return false
+	}
+	if templateKwargs != nil && templateKwargs.EnableThinking != nil {
+		return false
+	}
+	if len(messages) != 1 {
+		return false
+	}
+	msg := messages[0]
+	if strings.ToLower(strings.TrimSpace(msg.Role)) != roleUser {
+		return false
+	}
+	if msg.HasStructuredContent() || len(msg.ToolCalls) > 0 || len(msg.ToolResponses) > 0 || msg.ReasoningContent != "" {
+		return false
+	}
+	return strings.TrimSpace(msg.Content) != ""
 }
 
 // BuildChatPrompt renders the template and applies model-specific priming.

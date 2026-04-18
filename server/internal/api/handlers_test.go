@@ -42,6 +42,10 @@ func (m *MockEngine) GenerateStreamTokensWithSampling(ctx context.Context, input
 	return m.GenerateStream(ctx, "", maxTokens, outputChan)
 }
 
+func (m *MockEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool) (*domain.RenderedChatPrompt, error) {
+	return &domain.RenderedChatPrompt{RenderedPrompt: "mock prompt"}, nil
+}
+
 func (m *MockEngine) GetEmbeddings(prompt string) ([]float32, error) {
 	return []float32{0.1, 0.2, 0.3}, nil
 }
@@ -422,6 +426,27 @@ func TestCompletionHandler_Stream(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, "data:") || !strings.Contains(body, "Paris") || !strings.Contains(body, "text_completion") {
 		t.Fatalf("streaming response missing expected SSE frames: %q", body)
+	}
+}
+
+func TestCompletionRequestToChatRequestPreservesParityRawPrompt(t *testing.T) {
+	req := domain.CompletionRequest{
+		Model:      "test-model",
+		Prompt:     "The capital of France is",
+		MaxTokens:  8,
+		ParityMode: true,
+	}
+
+	chatReq := completionRequestToChatRequest(req)
+
+	if !chatReq.ParityMode {
+		t.Fatalf("expected parity mode to be preserved")
+	}
+	if chatReq.RawPrompt != req.Prompt {
+		t.Fatalf("expected raw prompt passthrough, got %q", chatReq.RawPrompt)
+	}
+	if len(chatReq.Messages) != 1 || chatReq.Messages[0].Content != req.Prompt {
+		t.Fatalf("expected compatibility message to keep original prompt, got %+v", chatReq.Messages)
 	}
 }
 

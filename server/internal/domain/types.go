@@ -12,11 +12,21 @@ type StreamEvent struct {
 	IsFinished bool
 }
 
+type RenderedChatPrompt struct {
+	RenderedPrompt string
+	TokenizerType  string
+	ChatTemplate   string
+	ModelVariant   string
+	PromptFamily   string
+	Thinking       bool
+}
+
 // OpenAI-compatible request/response structures
 type ChatCompletionRequest struct {
 	Model               string              `json:"model"`
 	Messages            []Message           `json:"messages"`
 	InputIDs            []int               `json:"input_ids,omitempty"`
+	RawPrompt           string              `json:"raw_prompt,omitempty"`
 	LoraAdapter         string              `json:"lora_adapter,omitempty"`
 	ChatTemplateKwargs  *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
 	MaxTokens           int                 `json:"max_tokens,omitempty"`
@@ -31,6 +41,7 @@ type ChatCompletionRequest struct {
 	Stream              bool                `json:"stream,omitempty"`
 	ResponseFormat      *ResponseFormat     `json:"response_format,omitempty"`
 	ExpertCluster       []int               `json:"expert_cluster,omitempty"`
+	ParityMode          bool                `json:"parity_mode,omitempty"`
 
 	TemperatureSet       bool `json:"-"`
 	TopPSet              bool `json:"-"`
@@ -43,6 +54,7 @@ func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
 		Model               string              `json:"model"`
 		Messages            []Message           `json:"messages"`
 		InputIDs            []int               `json:"input_ids,omitempty"`
+		RawPrompt           string              `json:"raw_prompt,omitempty"`
 		LoraAdapter         string              `json:"lora_adapter,omitempty"`
 		ChatTemplateKwargs  *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
 		MaxTokens           int                 `json:"max_tokens,omitempty"`
@@ -57,6 +69,7 @@ func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
 		Stream              bool                `json:"stream,omitempty"`
 		ResponseFormat      *ResponseFormat     `json:"response_format,omitempty"`
 		ExpertCluster       []int               `json:"expert_cluster,omitempty"`
+		ParityMode          bool                `json:"parity_mode,omitempty"`
 	}
 
 	var raw rawChatCompletionRequest
@@ -67,6 +80,7 @@ func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
 	r.Model = raw.Model
 	r.Messages = raw.Messages
 	r.InputIDs = raw.InputIDs
+	r.RawPrompt = raw.RawPrompt
 	r.LoraAdapter = raw.LoraAdapter
 	r.ChatTemplateKwargs = raw.ChatTemplateKwargs
 	r.MaxTokens = raw.MaxTokens
@@ -77,6 +91,7 @@ func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
 	r.Stream = raw.Stream
 	r.ResponseFormat = raw.ResponseFormat
 	r.ExpertCluster = raw.ExpertCluster
+	r.ParityMode = raw.ParityMode
 
 	r.TemperatureSet = raw.Temperature != nil
 	if raw.Temperature != nil {
@@ -264,6 +279,7 @@ type CompletionRequest struct {
 	Stream              bool            `json:"stream,omitempty"`
 	ResponseFormat      *ResponseFormat `json:"response_format,omitempty"`
 	ExpertCluster       []int           `json:"expert_cluster,omitempty"`
+	ParityMode          bool            `json:"parity_mode,omitempty"`
 
 	TemperatureSet       bool `json:"-"`
 	TopPSet              bool `json:"-"`
@@ -287,6 +303,7 @@ func (r *CompletionRequest) UnmarshalJSON(data []byte) error {
 		Stream              bool            `json:"stream,omitempty"`
 		ResponseFormat      *ResponseFormat `json:"response_format,omitempty"`
 		ExpertCluster       []int           `json:"expert_cluster,omitempty"`
+		ParityMode          bool            `json:"parity_mode,omitempty"`
 	}
 
 	var raw rawCompletionRequest
@@ -304,6 +321,7 @@ func (r *CompletionRequest) UnmarshalJSON(data []byte) error {
 	r.Stream = raw.Stream
 	r.ResponseFormat = raw.ResponseFormat
 	r.ExpertCluster = raw.ExpertCluster
+	r.ParityMode = raw.ParityMode
 
 	r.TemperatureSet = raw.Temperature != nil
 	if raw.Temperature != nil {

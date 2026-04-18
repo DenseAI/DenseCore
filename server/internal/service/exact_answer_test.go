@@ -37,6 +37,9 @@ func (e *exactAnswerTestEngine) CountTokens(text string, addBOS bool, addEOS boo
 func (e *exactAnswerTestEngine) TokenizeText(text string, addBOS bool, addEOS bool) ([]int, error) {
 	return e.tokens[text], nil
 }
+func (e *exactAnswerTestEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool) (*domain.RenderedChatPrompt, error) {
+	return &domain.RenderedChatPrompt{RenderedPrompt: messages[0].Content}, nil
+}
 func (e *exactAnswerTestEngine) GetTokenizerType() string    { return "gemma" }
 func (e *exactAnswerTestEngine) GetChatTemplate() string     { return "<|turn>user\n" }
 func (e *exactAnswerTestEngine) Close()                      {}
@@ -80,5 +83,31 @@ func TestDeriveExactAnswerConstraint(t *testing.T) {
 	wantIDs := []int{9079, 12908}
 	if !reflect.DeepEqual(got.allowedTokenIDs, wantIDs) {
 		t.Fatalf("allowedTokenIDs=%v want %v", got.allowedTokenIDs, wantIDs)
+	}
+	if got.text != "Paris" {
+		t.Fatalf("text=%q want Paris", got.text)
+	}
+}
+
+func TestDeriveExactAnswerConstraintMultiTokenFallback(t *testing.T) {
+	engine := &exactAnswerTestEngine{
+		tokens: map[string][]int{
+			"BLUE-PEARL-471": {101, 202},
+		},
+	}
+	req := domain.ChatCompletionRequest{
+		Messages:  []domain.Message{{Role: "user", Content: "Repeat the exact secret code only. Answer with only BLUE-PEARL-471."}},
+		MaxTokens: 8,
+	}
+
+	got := deriveExactAnswerConstraint(engine, req)
+	if got == nil {
+		t.Fatalf("expected constraint, got nil")
+	}
+	if got.text != "BLUE-PEARL-471" {
+		t.Fatalf("text=%q want BLUE-PEARL-471", got.text)
+	}
+	if len(got.allowedTokenIDs) != 0 {
+		t.Fatalf("allowedTokenIDs=%v want empty for multi-token fallback", got.allowedTokenIDs)
 	}
 }

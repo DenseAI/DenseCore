@@ -193,6 +193,30 @@ TEST(Qwen35SSMMathTest, PositiveALogStillProducesContractiveDecay) {
     for (float value : y) EXPECT_TRUE(std::isfinite(value));
 }
 
+TEST(Qwen35SSMMathTest, CanonicalizeFusedBAGroupedLayout) {
+    constexpr int kEmbd = 3;
+    constexpr int kVHeads = 4;
+    constexpr int kGroups = 2;
+    const int64_t ne[4] = {kEmbd, 2 * kVHeads, 1, 1};
+    const std::vector<float> raw = {
+        10.f, 11.f, 12.f, 20.f, 21.f, 22.f, 110.f, 111.f, 112.f, 120.f, 121.f, 122.f,
+        30.f, 31.f, 32.f, 40.f, 41.f, 42.f, 130.f, 131.f, 132.f, 140.f, 141.f, 142.f,
+    };
+
+    std::vector<float> beta;
+    std::vector<float> alpha;
+    ASSERT_TRUE(Qwen35CanonicalizeFusedBA(raw.data(), ne, kEmbd, kVHeads, kGroups, &beta, &alpha));
+
+    const std::vector<float> expected_beta = {
+        10.f, 11.f, 12.f, 20.f, 21.f, 22.f, 30.f, 31.f, 32.f, 40.f, 41.f, 42.f,
+    };
+    const std::vector<float> expected_alpha = {
+        110.f, 111.f, 112.f, 120.f, 121.f, 122.f, 130.f, 131.f, 132.f, 140.f, 141.f, 142.f,
+    };
+    EXPECT_EQ(beta, expected_beta);
+    EXPECT_EQ(alpha, expected_alpha);
+}
+
 TEST(Qwen35SSMMathTest, DebugBuffersExposeCanonicalKVLayoutIntermediates) {
     const std::vector<float> input = {0.25f, -0.5f, 0.75f, -0.125f};
     const std::vector<float> q = {0.3f, -0.8f};

@@ -19,6 +19,7 @@ type exactAnswerConstraint struct {
 	allowedTokenIDs []int
 	strict          bool
 	maxTokens       int
+	text            string
 }
 
 func deriveExactAnswerConstraint(engine domain.Engine, req domain.ChatCompletionRequest) *exactAnswerConstraint {
@@ -54,7 +55,11 @@ func deriveExactAnswerConstraint(engine domain.Engine, req domain.ChatCompletion
 	}
 
 	if len(tokenIDs) == 0 {
-		return nil
+		return &exactAnswerConstraint{
+			text:      answer,
+			strict:    true,
+			maxTokens: max(1, strings.Count(answer, " ")+1),
+		}
 	}
 
 	sort.Ints(tokenIDs)
@@ -63,7 +68,15 @@ func deriveExactAnswerConstraint(engine domain.Engine, req domain.ChatCompletion
 		allowedTokenIDs: tokenIDs,
 		strict:          true,
 		maxTokens:       1,
+		text:            answer,
 	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func extractExpectedExactAnswer(req domain.ChatCompletionRequest) string {

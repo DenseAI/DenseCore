@@ -493,6 +493,7 @@ static bool ShouldUseArmNativeQ4KVecDotValidated(ggml_type weight_type, const gg
     }
 
     // Multi-sample validation: test multiple representative weight rows
+    static std::atomic<int> state{0};
     int current = state.load(std::memory_order_acquire);
     if (current != 0) {
         return current == 1;
@@ -725,6 +726,7 @@ enum class DecodePagedAttentionMode { Off = 0, Auto = 1, On = 2 };
 struct DecodePagedAttentionPolicy {
     DecodePagedAttentionMode mode = DecodePagedAttentionMode::Auto;
     int min_context_tokens = 256;
+    int min_batched_context_tokens = 256;
     int min_head_dim = 64;
     int min_heads = 8;
     bool allow_quantized_auto = false;
@@ -983,10 +985,16 @@ static DecodePagedAttentionPolicy LoadDecodePagedAttentionPolicy() {
     policy.mode = ParseDecodePagedAttentionMode();
     const densecore::simd::SimdLevel simd = GetRuntimeSimdLevel();
     const bool has_avx2_or_better = densecore::simd::HasX86Avx2OrBetter(simd);
+    const bool has_avx512_or_better = densecore::simd::HasX86Avx512OrBetter(simd);
     const bool is_arm = densecore::simd::IsArmFamily(simd);
     const int default_min_context = has_avx2_or_better ? 128 : (is_arm ? 64 : 256);
+    const int default_min_batched_context = (has_avx2_or_better && !has_avx512_or_better) ? 64 : default_min_context;
     const int legacy_min_context = ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_MIN_CONTEXT", default_min_context);
     policy.min_context_tokens = ParsePositiveEnvInt("DENSECORE_PAGED_DECODE_MIN_CONTEXT", legacy_min_context);
+    const int legacy_min_batched_context =
+        ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_MIN_BATCH_CONTEXT", default_min_batched_context);
+    policy.min_batched_context_tokens =
+        ParsePositiveEnvInt("DENSECORE_PAGED_DECODE_MIN_BATCH_CONTEXT", legacy_min_batched_context);
     policy.min_head_dim = ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_MIN_HEAD_DIM", 64);
     policy.min_heads = ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_MIN_HEADS", 8);
     // Quantized KV cache (Q8_0, Q4_0) must use paged decode — the materialized
@@ -1278,7 +1286,9 @@ static DecodePagedDecision EvaluatePagedDecodeDecision(const DecodePagedAttentio
     // This prevents Auto mode from enabling paged decode only because a subset
     // of sequences has long history.
     const int context_len = context_summary.min_context;
-    if (context_len < policy.min_context_tokens) {
+    const int effective_min_context =
+        (n_tokens_in_batch > 1) ? policy.min_batched_context_tokens : policy.min_context_tokens;
+    if (context_len < effective_min_context) {
         decision.reason = DecodePagedFallbackReason::AutoContextShort;
         return decision;
     }
@@ -2132,13 +2142,28 @@ void InferenceContext::Init(size_t buffer_size) {
         return;  // Already initialized
     }
 
-    // Allocate aligned buffer for GGML context
-    // Use 64-byte alignment for AVX-512 compatibility
-    compute_buffer.resize(buffer_size);
+    // Allocate aligned buffer for GGML context.
+    // Avoid std::vector::resize() here because it zero-fills the entire
+    // region. For multi-GB hybrid-SSM graph contexts that turns startup into
+    // a giant memset before any real work begins.
+    constexpr size_t kAlignment = 64;
+    void* ptr = nullptr;
+#if defined(_WIN32)
+    ptr = _aligned_malloc(buffer_size, kAlignment);
+#else
+    if (posix_memalign(&ptr, kAlignment, buffer_size) != 0) {
+        ptr = nullptr;
+    }
+#endif
+    if (!ptr) {
+        throw densecore::OutOfMemoryException("InferenceContext: aligned allocation failed");
+    }
+    compute_buffer = ptr;
+    compute_buffer_size = buffer_size;
 
     struct ggml_init_params params = {
         .mem_size = buffer_size,
-        .mem_buffer = compute_buffer.data(),
+        .mem_buffer = compute_buffer,
         .no_alloc = false,
     };
     ctx_compute = ggml_init(params);
@@ -2153,7 +2178,7 @@ void InferenceContext::Init(size_t buffer_size) {
 }
 
 void InferenceContext::Reset() {
-    if (!initialized || compute_buffer.empty()) {
+    if (!initialized || !compute_buffer || compute_buffer_size == 0) {
         return;
     }
 
@@ -2167,8 +2192,8 @@ void InferenceContext::Reset() {
     }
 
     struct ggml_init_params params = {
-        .mem_size = compute_buffer.size(),
-        .mem_buffer = compute_buffer.data(),
+        .mem_size = compute_buffer_size,
+        .mem_buffer = compute_buffer,
         .no_alloc = false,
     };
     ctx_compute = ggml_init(params);
@@ -2182,8 +2207,15 @@ void InferenceContext::Free() {
         ggml_free(ctx_compute);
         ctx_compute = nullptr;
     }
-    compute_buffer.clear();
-    compute_buffer.shrink_to_fit();
+    if (compute_buffer) {
+#if defined(_WIN32)
+        _aligned_free(compute_buffer);
+#else
+        std::free(compute_buffer);
+#endif
+        compute_buffer = nullptr;
+    }
+    compute_buffer_size = 0;
     initialized = false;
 }
 
@@ -3472,7 +3504,6 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             conv_ud->token_seq_ids = batch.seq_id.data();
             conv_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
             struct ggml_tensor* qkv_conv = ggml_map_custom1(ctx_c, qkv_mixed, cb_ssm_conv1d, 1, conv_ud);
-            qkv_conv = ggml_silu(ctx_c, qkv_conv);
 
             // 3. z projection and recurrent Qwen3.5 delta-net block.
             struct ggml_tensor* z = smart_mul_mat(ctx_c, attn_gate_w, cur, model);
@@ -3505,7 +3536,13 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             scan_ud->ssm_ordinal = ssm_ordinal;
             scan_ud->token_seq_ids = batch.seq_id.data();
             scan_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
-            struct ggml_tensor* y_scratch = ggml_map_custom3(ctx_c, qkv_conv, z, cur, cb_ssm_qwen35_delta, 1, scan_ud);
+            scan_ud->z_tensor = z;
+            scan_ud->input_tensor = cur;
+            if (gf) {
+                ggml_build_forward_expand(gf, z);
+                ggml_build_forward_expand(gf, cur);
+            }
+            struct ggml_tensor* y_scratch = ggml_map_custom1(ctx_c, qkv_conv, cb_ssm_qwen35_delta_qkv_only, 1, scan_ud);
             struct ggml_tensor* y = ggml_cont(ctx_c, ggml_view_2d(ctx_c, y_scratch, d_inner, N, y_scratch->nb[1], 0));
 
             // 4. Output projection: [d_inner, N] → [n_embd, N]

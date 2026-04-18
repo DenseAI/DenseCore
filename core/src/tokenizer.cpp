@@ -846,7 +846,15 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
         return result;
     }
 
-    if (add_bos && model->bos_token_id >= 0) {
+    const auto prompt_begins_with_bos_literal = [&]() {
+        if (!model || model->bos_token_id < 0 || model->bos_token_id >= static_cast<int>(model->vocab_tokens.size())) {
+            return false;
+        }
+        const std::string& bos_literal = model->vocab_tokens[static_cast<size_t>(model->bos_token_id)];
+        return !bos_literal.empty() && text.rfind(bos_literal, 0) == 0;
+    };
+
+    if (add_bos && model->bos_token_id >= 0 && !prompt_begins_with_bos_literal()) {
         result.push_back(model->bos_token_id);
     }
 
@@ -857,43 +865,20 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
         return result;
     }
 
-    if (!model->bpe_merge_ranks.empty()) {
-        auto tokenize_plain_span = [&](const std::string& span) {
-            if (span.empty()) return;
+    const auto tokenize_plain_span = [&](const std::string& span) {
+        if (span.empty()) return;
+        if (!model->bpe_merge_ranks.empty()) {
             const std::vector<std::string> pieces = PretokenizeForByteBpe(model, span);
             for (const std::string& piece : pieces) {
                 std::vector<std::string> symbols = EncodePieceSymbols(model, piece);
                 symbols = MergeWithBpeRanks(model, std::move(symbols));
                 AppendSymbolsToIds(model, symbols, &result);
             }
-        };
-
-        // Handle special/control tokens (e.g. <bos>, <|im_start|>, <turn|>) as
-        // atomic tokens before running byte-BPE pretokenization.
-        size_t cursor = 0;
-        size_t span_start = 0;
-        while (cursor < text.size()) {
-            if (text[cursor] == '<') {
-                const size_t close = text.find('>', cursor + 1);
-                if (close != std::string::npos) {
-                    const size_t tok_end = close + 1;
-                    const std::string special = text.substr(cursor, tok_end - cursor);
-                    if (IsAtomicSpecialTokenLiteral(model, special)) {
-                        auto it = model->token_to_id.find(special);
-                        tokenize_plain_span(text.substr(span_start, cursor - span_start));
-                        result.push_back(it->second);
-                        cursor = tok_end;
-                        span_start = cursor;
-                        continue;
-                    }
-                }
-            }
-            ++cursor;
+            return;
         }
-        tokenize_plain_span(text.substr(span_start));
-    } else {
+
         // Legacy fallback path (kept for tokenizer formats without merges).
-        std::vector<std::string> tokens = SplitToChars(text);
+        std::vector<std::string> tokens = SplitToChars(span);
         tokens = MergeWithPriorityQueue(model, std::move(tokens));
 
         for (const std::string& tok : tokens) {
@@ -917,7 +902,31 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
                 }
             }
         }
+    };
+
+    // Handle registered control tokens atomically on both the merges path and
+    // the no-merges fallback path so Gemma4 turn markers survive intact.
+    size_t cursor = 0;
+    size_t span_start = 0;
+    while (cursor < text.size()) {
+        if (text[cursor] == '<') {
+            const size_t close = text.find('>', cursor + 1);
+            if (close != std::string::npos) {
+                const size_t tok_end = close + 1;
+                const std::string special = text.substr(cursor, tok_end - cursor);
+                if (IsAtomicSpecialTokenLiteral(model, special)) {
+                    auto it = model->token_to_id.find(special);
+                    tokenize_plain_span(text.substr(span_start, cursor - span_start));
+                    result.push_back(it->second);
+                    cursor = tok_end;
+                    span_start = cursor;
+                    continue;
+                }
+            }
+        }
+        ++cursor;
     }
+    tokenize_plain_span(text.substr(span_start));
 
     if (add_eos && model->eos_token_id >= 0) {
         result.push_back(model->eos_token_id);

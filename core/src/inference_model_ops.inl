@@ -1557,11 +1557,27 @@ static void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src
     }
 }
 
+void cb_ssm_conv1d_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    if (!dst) {
+        return;
+    }
+    cb_ssm_conv1d(dst, dst->src[0], ith, nth, userdata);
+}
+
+void cb_ssm_qwen35_delta_qkv_only(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                  void* userdata) {
+    auto* ud = static_cast<SSMQwen35DeltaUserData*>(userdata);
+    if (!dst || !src || !ud || !ud->z_tensor || !ud->input_tensor) {
+        return;
+    }
+    cb_ssm_qwen35_delta(dst, ud->z_tensor, src, ud->input_tensor, ith, nth, userdata);
+}
+
 // Qwen3.5 recurrent delta-net callback.
 //
 // Inputs:
-//   a = convolved qkv_mixed after SiLU [conv_channels, N]
-//   b = z projection before SiLU       [d_inner, N]
+//   a = z projection                   [d_inner, N]
+//   b = convolved qkv_mixed            [conv_channels, N]
 //   c = normalized layer input         [n_embd, N]
 //
 // Output:
@@ -1577,8 +1593,8 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
         fprintf(stderr, "[DBG] cb_ssm_delta #%d a=[%lld,%lld]\n", ssm_id, (long long)a->ne[0], (long long)a->ne[1]);
     }
     auto* ud = static_cast<SSMQwen35DeltaUserData*>(userdata);
-    const float* qkv_conv = reinterpret_cast<const float*>(a->data);
-    const float* z_proj = reinterpret_cast<const float*>(b->data);
+    const float* z_proj = reinterpret_cast<const float*>(a->data);
+    const float* qkv_conv = reinterpret_cast<const float*>(b->data);
     const float* input = reinterpret_cast<const float*>(c->data);
     float* y_out = reinterpret_cast<float*>(dst->data);
     if (!ud || !qkv_conv || !z_proj || !input || !y_out) return;
@@ -1587,8 +1603,8 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
     static const bool ssm_delta_passthrough = (std::getenv("DENSECORE_SSM_DELTA_PASSTHROUGH") != nullptr);
     const int N = static_cast<int>(a->ne[1]);
     const int out_elems = static_cast<int>(dst->ne[0]) * N;
-    const ptrdiff_t qkv_stride = static_cast<ptrdiff_t>(a->nb[1] / sizeof(float));
-    const ptrdiff_t z_stride = static_cast<ptrdiff_t>(b->nb[1] / sizeof(float));
+    const ptrdiff_t z_stride = static_cast<ptrdiff_t>(a->nb[1] / sizeof(float));
+    const ptrdiff_t qkv_stride = static_cast<ptrdiff_t>(b->nb[1] / sizeof(float));
     const ptrdiff_t input_stride = static_cast<ptrdiff_t>(c->nb[1] / sizeof(float));
     const ptrdiff_t out_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
     if (ssm_passthrough || ssm_delta_passthrough) {
@@ -1615,6 +1631,13 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
     const int expected_conv_channels = ud->d_inner + 2 * qk_total;
     
     if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || c->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        std::fprintf(stderr,
+                     "[DenseCore][Qwen35SSM] FATAL DTYPE layer=%d a=%d b=%d c=%d dst=%d\n",
+                     ud->layer_idx,
+                     static_cast<int>(a->type),
+                     static_cast<int>(b->type),
+                     static_cast<int>(c->type),
+                     static_cast<int>(dst->type));
         FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM delta inputs/outputs must be F32");
     }
 
@@ -1622,12 +1645,12 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
         FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM delta: non-contiguous element stride detected in b, c, or dst");
     }
 
-    if (a->ne[0] != expected_conv_channels) {
+    if (b->ne[0] != expected_conv_channels) {
         fprintf(stderr, "[DenseCore][Qwen35SSM] FATAL LAYOUT MISMATCH layer=%d: qkv_conv ne[0]=%lld expected=%d\n",
-                ud->layer_idx, (long long)a->ne[0], expected_conv_channels);
+                ud->layer_idx, (long long)b->ne[0], expected_conv_channels);
         FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM QKV layout mismatch: ne[0] != d_inner + 2*n_groups*head_dim_k");
     }
-    if (b->ne[0] != ud->d_inner) {
+    if (a->ne[0] != ud->d_inner) {
         FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM z tensor shape mismatch");
     }
     if (c->ne[0] != ud->n_embd) {
@@ -1640,7 +1663,7 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
         FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM output tensor shape mismatch");
     }
 
-    const bool requires_qkv_canonicalization = (a->nb[0] != sizeof(float));
+    const bool requires_qkv_canonicalization = (b->nb[0] != sizeof(float));
     if (!requires_qkv_canonicalization && qkv_stride < expected_conv_channels) {
         FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM QKV row stride is smaller than element count");
     }
@@ -1653,15 +1676,27 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
 
 
 
-    // Allocate once instead of per-token to reduce memory allocation overhead
-    // Stack allocation: Qwen3.5 max ~10KB (head_dim_k=128, head_dim_v=128, d_inner=2048)
-    float q_norm_buf[256], k_norm_buf[256], kv_mem_buf[256], delta_buf[256], y_pre_norm_buf[256], y_buf[2048];
-    float* const q_norm = q_norm_buf;
-    float* const k_norm = k_norm_buf;
-    float* const kv_mem = kv_mem_buf;
-    float* const delta = delta_buf;
-    float* const y_pre_norm = y_pre_norm_buf;
-    float* const y = y_buf;
+    // Reuse scratch storage per thread. Qwen3.5-35B-A3B uses d_inner=4096 and
+    // head_dim_k/head_dim_v=256, so fixed stack buffers sized for smaller
+    // variants can overflow and corrupt the callback stack frame.
+    static thread_local std::vector<float> q_norm_buf;
+    static thread_local std::vector<float> k_norm_buf;
+    static thread_local std::vector<float> kv_mem_buf;
+    static thread_local std::vector<float> delta_buf;
+    static thread_local std::vector<float> y_pre_norm_buf;
+    static thread_local std::vector<float> y_buf;
+    q_norm_buf.resize(static_cast<size_t>(head_k_dim));
+    k_norm_buf.resize(static_cast<size_t>(head_k_dim));
+    kv_mem_buf.resize(static_cast<size_t>(head_v_dim));
+    delta_buf.resize(static_cast<size_t>(head_v_dim));
+    y_pre_norm_buf.resize(static_cast<size_t>(head_v_dim));
+    y_buf.resize(static_cast<size_t>(ud->d_inner));
+    float* const q_norm = q_norm_buf.data();
+    float* const k_norm = k_norm_buf.data();
+    float* const kv_mem = kv_mem_buf.data();
+    float* const delta = delta_buf.data();
+    float* const y_pre_norm = y_pre_norm_buf.data();
+    float* const y = y_buf.data();
     const bool debug_core_ref = IsDebugSSMCoreReferenceEnabled();
     std::vector<float> q_expanded;
     std::vector<float> k_expanded;
@@ -1675,9 +1710,7 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
     }
 
     std::vector<float> canonical_qkv_row;
-    if (requires_qkv_canonicalization) {
-        canonical_qkv_row.resize(expected_conv_channels, 0.0f);
-    }
+    canonical_qkv_row.resize(static_cast<size_t>(expected_conv_channels), 0.0f);
 
     for (int t = 0; t < N; ++t) {
         std::fill(y, y + ud->d_inner, 0.0f);
@@ -1689,19 +1722,21 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
         const float* v_base;
 
         if (requires_qkv_canonicalization) {
-            const char* row_bytes = reinterpret_cast<const char*>(a->data) + static_cast<size_t>(t) * a->nb[1];
+            const char* row_bytes = reinterpret_cast<const char*>(b->data) + static_cast<size_t>(t) * b->nb[1];
             for (int i = 0; i < expected_conv_channels; ++i) {
-                canonical_qkv_row[i] = *reinterpret_cast<const float*>(row_bytes + static_cast<size_t>(i) * a->nb[0]);
+                const float raw = *reinterpret_cast<const float*>(row_bytes + static_cast<size_t>(i) * b->nb[0]);
+                canonical_qkv_row[static_cast<size_t>(i)] = raw * SigmoidStable(raw);
             }
-            q_base = canonical_qkv_row.data();
-            k_base = canonical_qkv_row.data() + qk_total;
-            v_base = canonical_qkv_row.data() + 2 * qk_total;
         } else {
             const float* qkv_t = qkv_conv + static_cast<ptrdiff_t>(t) * qkv_stride;
-            q_base = qkv_t;
-            k_base = qkv_t + qk_total;
-            v_base = qkv_t + 2 * qk_total;
+            for (int i = 0; i < expected_conv_channels; ++i) {
+                const float raw = qkv_t[i];
+                canonical_qkv_row[static_cast<size_t>(i)] = raw * SigmoidStable(raw);
+            }
         }
+        q_base = canonical_qkv_row.data();
+        k_base = canonical_qkv_row.data() + qk_total;
+        v_base = canonical_qkv_row.data() + 2 * qk_total;
         if (debug_core_ref) {
             for (int h = 0; h < num_v_heads; ++h) {
                 const int src_k_head =
@@ -1868,4 +1903,11 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
         std::memcpy(y_out + static_cast<ptrdiff_t>(t) * out_stride, y,
                     static_cast<size_t>(ud->d_inner) * sizeof(float));
     }
+}
+
+void cb_ssm_qwen35_delta_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    if (!dst) {
+        return;
+    }
+    cb_ssm_qwen35_delta(dst, dst->src[0], dst->src[1], dst->src[2], ith, nth, userdata);
 }

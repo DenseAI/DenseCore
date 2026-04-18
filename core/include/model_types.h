@@ -55,6 +55,7 @@ enum class ModelVariant : uint8_t {
     LLAMA,
     QWEN2,
     QWEN3,
+    QWEN3NEXT,
     QWEN35,
     GLM4_MOE,
     GLM5_DSA,

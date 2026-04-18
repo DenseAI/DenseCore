@@ -40,6 +40,7 @@
 #include "densecore/arm_runtime.h"
 #include "densecore/graph_executor.h"
 #include "densecore/models/graph_registry.h"
+#include "densecore/models/model_descriptor.h"
 #include "models/model_inference_policy.h"
 
 namespace {
@@ -47,6 +48,14 @@ namespace {
 bool IsMulGraphValidationEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_VALIDATE_MUL");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool IsRuntimePathLoggingEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_RUNTIME_PATH");
         return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
@@ -2030,6 +2039,19 @@ void EngineLoop(EngineState* state) {
                 continue;  // Recover
             }
 
+            if (IsRuntimePathLoggingEnabled()) {
+                const auto descriptor = densecore::models::DescribeModel(current_model);
+                std::cerr << "[RuntimePath] variant=" << densecore::models::ModelVariantName(descriptor.variant)
+                          << " batch_seqs=" << batch.num_seqs
+                          << " decode_layout=" << (decode_single_token_layout ? "single_token" : "general")
+                          << " decode_cache_reused=" << (reused_decode_graph ? "1" : "0")
+                          << " decode_cache_active=" << (using_cached_decode_graph ? "1" : "0")
+                          << " prefill_cache_active=" << (using_cached_prefill_graph ? "1" : "0")
+                          << " decode_topology_stable=" << (decode_topology_stable ? "1" : "0")
+                          << " paged_decode_supported="
+                          << (densecore::models::SupportsPagedDecodeAttention(current_model) ? "1" : "0") << std::endl;
+            }
+
             if (using_cached_decode_graph && decode_single_token_layout && batch.num_seqs > 1) {
                 DebugVerifyCachedDecodeGraphReuseState(gf, batch.num_seqs, reused_decode_graph,
                                                        cached_graph_verified_paged_decode_op);
@@ -2884,6 +2906,13 @@ void EngineLoop(EngineState* state) {
                         } else if (!token_str.empty() || req->token_result_callback) {
                             if (IsVerboseTokenTraceEnabled()) {
                                 std::cerr << "[TRACE] Pushing result for request " << req->id << std::endl;
+                            }
+                            if (std::getenv("DENSECORE_PARITY_DEBUG") != nullptr &&
+                                req->parity_debug_output_tokens < 64) {
+                                std::cerr << "[ParityOutput] req=" << req->id
+                                          << " index=" << req->parity_debug_output_tokens << " token_id=" << best_token
+                                          << " text=" << token_str << std::endl;
+                                req->parity_debug_output_tokens++;
                             }
                             emit_result_event(req, token_str, best_token, false, false);
                         }

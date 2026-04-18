@@ -7,6 +7,7 @@ with a Pythonic API supporting both synchronous and asynchronous generation.
 
 import asyncio
 import ctypes
+import ctypes.util
 import json
 import os
 import platform
@@ -48,7 +49,11 @@ except ImportError:
 
 import numpy as np
 
-from .chat_template import format_chat_prompt
+from .chat_template import (
+    format_chat_prompt,
+    qwen_thinking_enabled,
+    resolve_prompt_profile,
+)
 from .config import GenerationConfig, ModelConfig
 from .lora import LoRAManager
 
@@ -227,6 +232,30 @@ class DenseCoreMetrics(ctypes.Structure):
         ("tokens_per_second", ctypes.c_float),
         ("active_requests", ctypes.c_int),
         ("total_tokens_generated", ctypes.c_long),
+    ]
+
+
+class DenseCoreChatMessage(ctypes.Structure):
+    _fields_ = [
+        ("role", ctypes.c_char_p),
+        ("content", ctypes.c_char_p),
+        ("reasoning_content", ctypes.c_char_p),
+        ("name", ctypes.c_char_p),
+    ]
+
+
+class DenseCoreChatTemplateOptions(ctypes.Structure):
+    _fields_ = [("enable_thinking", ctypes.c_int)]
+
+
+class DenseCoreRenderedChatPrompt(ctypes.Structure):
+    _fields_ = [
+        ("rendered_prompt", ctypes.c_char_p),
+        ("tokenizer_type", ctypes.c_char_p),
+        ("chat_template", ctypes.c_char_p),
+        ("model_variant", ctypes.c_char_p),
+        ("prompt_family", ctypes.c_char_p),
+        ("thinking_enabled", ctypes.c_int),
     ]
 
 
@@ -475,9 +504,10 @@ def _preload_linux_runtime_dependencies(lib_path: str) -> None:
         return
 
     lib_dir = Path(lib_path).resolve().parent
+    system_libgomp = ctypes.util.find_library("gomp")
     candidates = [
         str(lib_dir / "libgomp.so.1"),
-        "libgomp.so.1",
+        system_libgomp or "libgomp.so.1",
         str(lib_dir / "libggml-base.so.0"),
         str(lib_dir / "libggml-cpu.so.0"),
         str(Path(lib_path).resolve()),
@@ -503,20 +533,30 @@ def _reexec_with_linux_preload(lib_path: str) -> None:
         return
 
     lib_dir = Path(lib_path).resolve().parent
-    preload_libs = [
+    system_libgomp = ctypes.util.find_library("gomp")
+    preload_libs = []
+    for candidate in (
         str(lib_dir / "libgomp.so.1"),
+        system_libgomp,
         str(lib_dir / "libggml-base.so.0"),
         str(lib_dir / "libggml-cpu.so.0"),
         str(Path(lib_path).resolve()),
-    ]
-    existing = [entry for entry in os.environ.get("LD_PRELOAD", "").split(os.pathsep) if entry]
+    ):
+        if not candidate:
+            continue
+        if os.path.isabs(candidate) and not os.path.exists(candidate):
+            continue
+        preload_libs.append(candidate)
+
+    # LD_PRELOAD is whitespace-separated on Linux.
+    existing = [entry for entry in os.environ.get("LD_PRELOAD", "").split() if entry]
     merged: list[str] = []
     for entry in preload_libs + existing:
         if entry and entry not in merged:
             merged.append(entry)
 
     env = os.environ.copy()
-    env["LD_PRELOAD"] = os.pathsep.join(merged)
+    env["LD_PRELOAD"] = " ".join(merged)
     env["DENSECORE_TLS_REEXEC_DONE"] = "1"
     os.execve(sys.executable, [sys.executable, *sys.argv], env)
 
@@ -592,6 +632,7 @@ class DenseCore:
         self._closed = True
         self._requests: Dict[int, Any] = {}
         self._active_ctypes_refs: Dict[int, List[Any]] = {}  # Prevent GC of ctypes objects
+        self._request_parity_mode: Dict[int, bool] = {}
         self._req_id_counter = 0
         self._lock = threading.Lock()
         self._verbose = verbose
@@ -954,6 +995,62 @@ class DenseCore:
         except AttributeError:
             self._has_cancel_api = False
 
+        try:
+            self._lib.CountTokens.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            self._lib.CountTokens.restype = ctypes.c_int
+            self._lib.CountTokens.errcheck = _errcheck
+            self._has_count_tokens_api = True
+        except AttributeError:
+            self._has_count_tokens_api = False
+
+        try:
+            self._lib.GetTokenizerType.argtypes = [ctypes.c_void_p]
+            self._lib.GetTokenizerType.restype = ctypes.c_char_p
+            self._has_tokenizer_metadata_api = True
+        except AttributeError:
+            self._has_tokenizer_metadata_api = False
+
+        try:
+            self._lib.GetChatTemplate.argtypes = [ctypes.c_void_p]
+            self._lib.GetChatTemplate.restype = ctypes.c_char_p
+            self._has_chat_template_api = True
+        except AttributeError:
+            self._has_chat_template_api = False
+
+        try:
+            self._lib.DenseCoreTokenizeText.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.c_int,
+            ]
+            self._lib.DenseCoreTokenizeText.restype = ctypes.c_int
+            self._lib.DenseCoreTokenizeText.errcheck = _errcheck
+            self._has_native_tokenizer_api = True
+        except AttributeError:
+            self._has_native_tokenizer_api = False
+
+        try:
+            self._lib.DenseCoreRenderChatPrompt.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(DenseCoreChatMessage),
+                ctypes.c_int,
+                ctypes.POINTER(DenseCoreChatTemplateOptions),
+                ctypes.POINTER(DenseCoreRenderedChatPrompt),
+            ]
+            self._lib.DenseCoreRenderChatPrompt.restype = ctypes.c_int
+            self._lib.DenseCoreRenderChatPrompt.errcheck = _errcheck
+            self._has_native_chat_render_api = True
+        except AttributeError:
+            self._has_native_chat_render_api = False
+
         # HAL & Weight Loading API
         try:
             self._lib.DenseCoreLoadPlugin.argtypes = [ctypes.c_char_p]
@@ -1080,8 +1177,10 @@ class DenseCore:
         except Exception as e:
             warnings.warn(f"Failed to load tokenizer from {hf_repo_id}: {e}", stacklevel=2)
 
-    def _clean_bpe_token(self, token: str) -> str:
+    def _clean_bpe_token(self, token: str, *, parity_mode: bool = False) -> str:
         """Clean BPE artifacts from token string."""
+        if parity_mode:
+            return token
         # Replace Ġ with space
         # Replace Ċ with newline
         # This is a simple heuristic for BPE/SentencePiece tokens
@@ -1115,6 +1214,7 @@ class DenseCore:
                 with self._lock:
                     self._requests.pop(req_id, None)
                     self._active_ctypes_refs.pop(req_id, None)
+                    self._request_parity_mode.pop(req_id, None)
             return
 
         try:
@@ -1122,7 +1222,9 @@ class DenseCore:
             token_str = token.decode("utf-8", errors="replace") if token else ""
 
             # Since C++ now sends decoded tokens, just clean BPE artifacts
-            token_str = self._clean_bpe_token(token_str)
+            with self._lock:
+                parity_mode = self._request_parity_mode.get(req_id, False)
+            token_str = self._clean_bpe_token(token_str, parity_mode=parity_mode)
 
             handler(token_str, finished)
         except Exception as e:
@@ -1136,6 +1238,7 @@ class DenseCore:
                 with self._lock:
                     self._requests.pop(req_id, None)
                     self._active_ctypes_refs.pop(req_id, None)
+                    self._request_parity_mode.pop(req_id, None)
 
     def _register_request(self, handler: Callable[[str, bool], None]) -> int:
         """Register a request handler and return request ID."""
@@ -1214,6 +1317,11 @@ class DenseCore:
             params["top_p"] = 1.0
             params["top_k"] = 0
 
+        if params["temperature"] == 0.0:
+            params["top_p"] = 1.0
+            if params["top_k"] <= 0:
+                params["top_k"] = 1
+
         # Stop sequences merging
         stop_from_kwargs = kwargs.get("stop")
         if isinstance(stop_from_kwargs, str):
@@ -1252,19 +1360,11 @@ class DenseCore:
         prompt_bytes = None
         tokens_array = None
         n_tokens = 0
-        prompt = self._maybe_prime_qwen_no_thinking(prompt)
 
         # 1. Prepare input
         if isinstance(prompt, str):
-            # Prefer tokenizer path for parity with token-id submit APIs.
-            # Fall back to raw prompt submit APIs when tokenizer is unavailable.
-            if self.tokenizer is not None:
-                tokens = self.tokenizer.encode(prompt, add_special_tokens=True)
-                tokens_array = (ctypes.c_int * len(tokens))(*tokens)
-                n_tokens = len(tokens)
-            else:
-                input_mode = "text"
-                prompt_bytes = prompt.encode("utf-8")
+            input_mode = "text"
+            prompt_bytes = prompt.encode("utf-8")
         else:
             tokens_array = (ctypes.c_int * len(prompt))(*prompt)
             n_tokens = len(prompt)
@@ -1446,6 +1546,7 @@ class DenseCore:
         output_hidden_states: bool = False,
         # DenseCore specific
         json_mode: bool = False,
+        parity_mode: bool = False,
         **kwargs,
     ) -> Union[str, "GenerateOutput"]:  # noqa: F821 - forward reference
         """
@@ -1551,6 +1652,7 @@ class DenseCore:
             resolve_kwargs["stopping_criteria"] = stopping_criteria
         resolve_kwargs["return_dict_in_generate"] = return_dict_in_generate
         resolve_kwargs["json_mode"] = json_mode
+        resolve_kwargs["parity_mode"] = parity_mode
 
         params = self._resolve_generation_params(
             config, resolve_kwargs, default_max_tokens=max_tokens
@@ -1596,6 +1698,8 @@ class DenseCore:
             result_queue.put((token, finished))
 
         req_id = self._register_request(handler)
+        with self._lock:
+            self._request_parity_mode[req_id] = parity_mode
 
         try:
             # Submit request (handled by helper)
@@ -1607,6 +1711,7 @@ class DenseCore:
             with self._lock:
                 self._requests.pop(req_id, None)
                 self._active_ctypes_refs.pop(req_id, None)
+                self._request_parity_mode.pop(req_id, None)
             raise
 
         # Collect generated tokens
@@ -1778,6 +1883,7 @@ class DenseCore:
         max_tokens: int = 256,
         config: Optional[GenerationConfig] = None,
         json_mode: bool = False,
+        parity_mode: bool = False,
         **kwargs,
     ) -> Iterator[str]:
         """
@@ -1805,6 +1911,7 @@ class DenseCore:
         # Consolidate params
         resolve_kwargs = dict(kwargs)
         resolve_kwargs["json_mode"] = json_mode
+        resolve_kwargs["parity_mode"] = parity_mode
         params = self._resolve_generation_params(
             config, resolve_kwargs, default_max_tokens=max_tokens
         )
@@ -1815,6 +1922,8 @@ class DenseCore:
             result_queue.put((token, finished))
 
         req_id = self._register_request(handler)
+        with self._lock:
+            self._request_parity_mode[req_id] = parity_mode
 
         try:
             # Submit request
@@ -1826,6 +1935,7 @@ class DenseCore:
             with self._lock:
                 self._requests.pop(req_id, None)
                 self._active_ctypes_refs.pop(req_id, None)
+                self._request_parity_mode.pop(req_id, None)
             raise
 
         while True:
@@ -2051,6 +2161,89 @@ class DenseCore:
     # Chat Interface (OpenAI-compatible)
     # =========================================================================
 
+    @staticmethod
+    def _supports_native_chat_render(
+        messages: List[Dict[str, Any]],
+        extra_system_messages: List[str],
+    ) -> bool:
+        supported_roles = {"system", "developer", "user", "assistant", "tool"}
+        for content in extra_system_messages:
+            if not isinstance(content, str):
+                return False
+        for message in messages:
+            if str(message.get("role", "")).strip().lower() not in supported_roles:
+                return False
+            if not isinstance(message.get("content", ""), str):
+                return False
+            if message.get("tool_calls") or message.get("tool_responses"):
+                return False
+        return True
+
+    def render_chat_prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        enable_thinking: Optional[bool] = None,
+        extra_system_messages: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        if not getattr(self, "_has_native_chat_render_api", False):
+            raise NotImplementedError(
+                "DenseCoreRenderChatPrompt API is not available in the loaded DenseCore library"
+            )
+
+        normalized_messages = list(messages)
+        if extra_system_messages:
+            for content in reversed(extra_system_messages):
+                if str(content).strip():
+                    normalized_messages.insert(0, {"role": "system", "content": content})
+        if not normalized_messages:
+            raise ValueError("messages must not be empty")
+        if not self._supports_native_chat_render(normalized_messages, []):
+            raise ValueError("messages contain shapes unsupported by native chat renderer")
+
+        c_messages = (DenseCoreChatMessage * len(normalized_messages))()
+        refs: List[bytes] = []
+        for index, message in enumerate(normalized_messages):
+            role_bytes = str(message.get("role", "")).encode("utf-8")
+            content_bytes = str(message.get("content", "")).encode("utf-8")
+            reasoning_bytes = str(message.get("reasoning_content", "")).encode("utf-8")
+            name_bytes = str(message.get("name", "")).encode("utf-8")
+            refs.extend([role_bytes, content_bytes, reasoning_bytes, name_bytes])
+            c_messages[index] = DenseCoreChatMessage(
+                role=role_bytes,
+                content=content_bytes,
+                reasoning_content=reasoning_bytes,
+                name=name_bytes,
+            )
+
+        options = DenseCoreChatTemplateOptions(
+            enable_thinking=-1 if enable_thinking is None else int(bool(enable_thinking))
+        )
+        rendered = DenseCoreRenderedChatPrompt()
+        self._lib.DenseCoreRenderChatPrompt(
+            self._handle,
+            c_messages,
+            len(normalized_messages),
+            ctypes.byref(options),
+            ctypes.byref(rendered),
+        )
+        return {
+            "prompt": rendered.rendered_prompt.decode("utf-8") if rendered.rendered_prompt else "",
+            "tokenizer_type": rendered.tokenizer_type.decode("utf-8")
+            if rendered.tokenizer_type
+            else "",
+            "chat_template": rendered.chat_template.decode("utf-8")
+            if rendered.chat_template
+            else "",
+            "model_variant": rendered.model_variant.decode("utf-8")
+            if rendered.model_variant
+            else "",
+            "prompt_family": rendered.prompt_family.decode("utf-8")
+            if rendered.prompt_family
+            else "",
+            "thinking_enabled": bool(rendered.thinking_enabled),
+        }
+
     def chat(
         self,
         messages: List[Dict[str, str]],
@@ -2059,6 +2252,7 @@ class DenseCore:
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         return_dict: bool = False,
+        parity_mode: bool = False,
         **kwargs,
     ) -> Union[str, Dict[str, Any]]:
         """
@@ -2103,13 +2297,55 @@ class DenseCore:
             extra_system_messages.append(system_prompt)
 
         model_hint = self._hf_repo_id or self._model_path
-        prompt = format_chat_prompt(
+        prompt_meta: Dict[str, Any]
+        if getattr(
+            self, "_has_native_chat_render_api", False
+        ) and self._supports_native_chat_render(messages, extra_system_messages):
+            prompt_meta = self.render_chat_prompt(
+                messages,
+                enable_thinking=kwargs.get("enable_thinking"),
+                extra_system_messages=extra_system_messages,
+            )
+        else:
+            tokenizer_type = self.get_tokenizer_type()
+            chat_template = self.get_chat_template()
+            profile = resolve_prompt_profile(
+                model_hint,
+                tokenizer_type=tokenizer_type,
+                chat_template=chat_template,
+            )
+            prompt_meta = {
+                "prompt": format_chat_prompt(
+                    model_hint,
+                    messages,
+                    extra_system_messages=extra_system_messages,
+                    tokenizer_type=tokenizer_type,
+                    chat_template=chat_template,
+                ),
+                "prompt_family": profile.family,
+            }
+        profile = resolve_prompt_profile(
             model_hint,
-            messages,
-            extra_system_messages=extra_system_messages,
+            tokenizer_type=prompt_meta.get("tokenizer_type"),
+            chat_template=prompt_meta.get("chat_template"),
         )
+        if (
+            self._should_passthrough_raw_chat_prompt(
+                profile.family, messages, extra_system_messages
+            )
+            and not parity_mode
+        ):
+            prompt = str(messages[0].get("content", "")).strip()
+        else:
+            prompt = prompt_meta["prompt"]
 
-        response_text = self.generate(prompt, max_tokens, **kwargs)
+        if not parity_mode:
+            kwargs = self._apply_chat_sampling_defaults(
+                model_hint=model_hint,
+                profile_family=profile.family,
+                kwargs=kwargs,
+            )
+        response_text = self.generate(prompt, max_tokens, parity_mode=parity_mode, **kwargs)
 
         # If tools provided, try to parse tool calls
         tool_calls = None
@@ -2129,6 +2365,124 @@ class DenseCore:
             return result
 
         return response_text
+
+    @staticmethod
+    def _apply_chat_sampling_defaults(
+        model_hint: Optional[str],
+        profile_family: str,
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Align Python chat() defaults with the Go server chat defaults.
+
+        This keeps user-facing chat behavior consistent across:
+        - Python SDK `DenseCore.chat()`
+        - Go server `/v1/chat/completions`
+        """
+        resolved = dict(kwargs)
+        thinking_enabled = (
+            qwen_thinking_enabled(model_hint, None) if profile_family == "qwen" else False
+        )
+
+        if "temperature" not in resolved or resolved["temperature"] is None:
+            if profile_family == "qwen" and not thinking_enabled:
+                resolved["temperature"] = 0.7
+            else:
+                resolved["temperature"] = 1.0
+
+        if "top_p" not in resolved or resolved["top_p"] is None:
+            if profile_family == "qwen" and thinking_enabled:
+                resolved["top_p"] = 0.95
+            elif profile_family == "qwen":
+                resolved["top_p"] = 0.8
+            elif profile_family == "gemma":
+                resolved["top_p"] = 0.95
+            else:
+                resolved["top_p"] = 1.0
+
+        if "top_k" not in resolved or resolved["top_k"] is None:
+            if profile_family == "qwen":
+                resolved["top_k"] = 20
+            elif profile_family == "gemma":
+                resolved["top_k"] = 64
+            else:
+                resolved["top_k"] = 0
+
+        if "repetition_penalty" not in resolved or resolved["repetition_penalty"] is None:
+            resolved["repetition_penalty"] = 1.05 if profile_family == "qwen" else 1.0
+
+        if resolved.get("temperature") == 0.0:
+            if "top_p" not in kwargs or kwargs.get("top_p") is None:
+                resolved["top_p"] = 1.0
+            if "top_k" not in kwargs or kwargs.get("top_k") is None:
+                resolved["top_k"] = 1
+            if "repetition_penalty" not in kwargs or kwargs.get("repetition_penalty") is None:
+                resolved["repetition_penalty"] = 1.0
+
+        return resolved
+
+    @staticmethod
+    def _should_passthrough_raw_chat_prompt(
+        family: str,
+        messages: List[Dict[str, str]],
+        extra_system_messages: List[str],
+    ) -> bool:
+        if family != "gemma":
+            return False
+        if extra_system_messages or len(messages) != 1:
+            return False
+        message = messages[0]
+        if str(message.get("role", "")).strip().lower() != "user":
+            return False
+        content = message.get("content", "")
+        return isinstance(content, str) and content.strip() != ""
+
+    def get_tokenizer_type(self) -> str:
+        if not getattr(self, "_has_tokenizer_metadata_api", False) or not self._handle:
+            return ""
+        value = self._lib.GetTokenizerType(self._handle)
+        return value.decode("utf-8") if value else ""
+
+    def get_chat_template(self) -> str:
+        if not getattr(self, "_has_chat_template_api", False) or not self._handle:
+            return ""
+        value = self._lib.GetChatTemplate(self._handle)
+        return value.decode("utf-8") if value else ""
+
+    def count_tokens(self, text: str, *, add_bos: bool = False, add_eos: bool = False) -> int:
+        if not getattr(self, "_has_count_tokens_api", False):
+            raise NotImplementedError(
+                "CountTokens API is not available in the loaded DenseCore library"
+            )
+        return int(
+            self._lib.CountTokens(
+                self._handle,
+                text.encode("utf-8"),
+                int(add_bos),
+                int(add_eos),
+            )
+        )
+
+    def tokenize_text(
+        self, text: str, *, add_bos: bool = False, add_eos: bool = False
+    ) -> List[int]:
+        if not getattr(self, "_has_native_tokenizer_api", False):
+            raise NotImplementedError(
+                "DenseCoreTokenizeText API is not available in the loaded DenseCore library"
+            )
+        count = self.count_tokens(text, add_bos=add_bos, add_eos=add_eos)
+        if count <= 0:
+            return []
+        buffer = (ctypes.c_int * count)()
+        written = self._lib.DenseCoreTokenizeText(
+            self._handle,
+            text.encode("utf-8"),
+            int(add_bos),
+            int(add_eos),
+            buffer,
+            count,
+        )
+        return [int(buffer[index]) for index in range(int(written))]
 
     # =========================================================================
     # LoRA Adapter Management

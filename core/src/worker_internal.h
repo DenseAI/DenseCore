@@ -8,8 +8,8 @@
 #include <string>
 #include <vector>
 
-#include "simd_ops.h"
 #include "engine_internal.h"
+#include "simd_ops.h"
 
 struct ArmComputeAffinityPolicy {
     std::vector<int> core_ids;

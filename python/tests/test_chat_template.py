@@ -4,6 +4,7 @@ from densecore.chat_template import (
     qwen_thinking_enabled,
     resolve_prompt_profile,
 )
+from densecore.engine import DenseCore
 
 
 def test_resolve_prompt_profile_uses_shared_families():
@@ -58,6 +59,25 @@ def test_format_chat_prompt_gemma_uses_turn_tags():
     )
 
     assert prompt == "<bos><|turn>user\n안녕?<turn|>\n<|turn>model\n"
+
+
+def test_gemma_chat_passthrough_helper_prefers_raw_single_turn():
+    assert DenseCore._should_passthrough_raw_chat_prompt(
+        "gemma",
+        [{"role": "user", "content": "What is the capital of France?"}],
+        [],
+    )
+
+
+def test_gemma_chat_passthrough_helper_rejects_history():
+    assert not DenseCore._should_passthrough_raw_chat_prompt(
+        "gemma",
+        [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ],
+        [],
+    )
 
 
 def test_format_chat_prompt_generic_transcript_fallback():

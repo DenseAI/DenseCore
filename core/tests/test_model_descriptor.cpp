@@ -18,12 +18,49 @@ TEST(ModelDescriptorTest, ResolveGemma4AliasPreservesRuntimeFlags) {
     EXPECT_TRUE(resolved.arch_flags.requires_k_norm);
 }
 
+TEST(ModelDescriptorTest, ResolveGemma4FromMetadataHintsUpgradesAmbiguousGemmaArch) {
+    densecore::models::ModelDetectionHints hints;
+    hints.has_gemma4_metadata = true;
+
+    bool used_hint_upgrade = false;
+    const auto resolved = densecore::models::ResolveModelDescriptorWithHints("gemma", hints, &used_hint_upgrade);
+
+    ASSERT_TRUE(resolved.known);
+    EXPECT_TRUE(used_hint_upgrade);
+    EXPECT_EQ(resolved.arch, ModelArch::GEMMA);
+    EXPECT_EQ(resolved.variant, ModelVariant::GEMMA4);
+    EXPECT_TRUE(resolved.arch_flags.is_gemma4);
+}
+
+TEST(ModelDescriptorTest, PlainGemmaHintsDoNotMisclassifyModel) {
+    densecore::models::ModelDetectionHints hints;
+
+    bool used_hint_upgrade = true;
+    const auto resolved = densecore::models::ResolveModelDescriptorWithHints("gemma", hints, &used_hint_upgrade);
+
+    ASSERT_TRUE(resolved.known);
+    EXPECT_FALSE(used_hint_upgrade);
+    EXPECT_EQ(resolved.variant, ModelVariant::GEMMA);
+    EXPECT_FALSE(resolved.arch_flags.is_gemma4);
+}
+
 TEST(ModelDescriptorTest, ResolveQwen35AliasMarksHybridSSM) {
     const auto resolved = densecore::models::ResolveModelDescriptor("qwen3_5_moe_text");
 
     ASSERT_TRUE(resolved.known);
     EXPECT_EQ(resolved.arch, ModelArch::QWEN35);
     EXPECT_EQ(resolved.variant, ModelVariant::QWEN35);
+    EXPECT_TRUE(resolved.arch_flags.is_hybrid_ssm);
+    EXPECT_TRUE(resolved.arch_flags.requires_q_norm);
+    EXPECT_TRUE(resolved.arch_flags.requires_k_norm);
+}
+
+TEST(ModelDescriptorTest, ResolveQwen3NextAliasReusesHybridSsmRuntime) {
+    const auto resolved = densecore::models::ResolveModelDescriptor("qwen3next");
+
+    ASSERT_TRUE(resolved.known);
+    EXPECT_EQ(resolved.arch, ModelArch::QWEN35);
+    EXPECT_EQ(resolved.variant, ModelVariant::QWEN3NEXT);
     EXPECT_TRUE(resolved.arch_flags.is_hybrid_ssm);
     EXPECT_TRUE(resolved.arch_flags.requires_q_norm);
     EXPECT_TRUE(resolved.arch_flags.requires_k_norm);
@@ -60,6 +97,44 @@ TEST(ModelDescriptorTest, ChatTemplateMetadataOverridesPromptFamily) {
 
     EXPECT_EQ(densecore::models::ResolvePromptTemplateFamily(&model),
               densecore::models::PromptTemplateFamily::TURN_TAGS);
+}
+
+TEST(ModelDescriptorTest, Gemma4PromptTemplatePrefersTurnTagsForGenericGemmaTokenizerMetadata) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.tokenizer_type = "gemma";
+
+    EXPECT_EQ(densecore::models::ResolvePromptTemplateFamily(&model),
+              densecore::models::PromptTemplateFamily::TURN_TAGS);
+}
+
+TEST(ModelDescriptorTest, Gemma4PromptTemplateDefaultsToTurnTagsWithoutChatMetadata) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+
+    EXPECT_EQ(densecore::models::ResolvePromptTemplateFamily(&model),
+              densecore::models::PromptTemplateFamily::TURN_TAGS);
+}
+
+TEST(ModelDescriptorTest, PlainGemmaPromptTemplateRemainsPlainForGenericMetadata) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.tokenizer_type = "gemma";
+
+    EXPECT_EQ(densecore::models::ResolvePromptTemplateFamily(&model),
+              densecore::models::PromptTemplateFamily::PLAIN);
+}
+
+TEST(ModelDescriptorTest, ExplicitChatTemplateStillOverridesGemma4DefaultPromptFamily) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.chat_template = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n";
+
+    EXPECT_EQ(densecore::models::ResolvePromptTemplateFamily(&model),
+              densecore::models::PromptTemplateFamily::CHATML);
 }
 
 TEST(ModelDescriptorTest, Gemma4TextIgnoresAttentionLogitSoftcapMetadata) {

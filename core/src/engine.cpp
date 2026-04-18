@@ -22,6 +22,7 @@
 #include "densecore/hal/device_interface.h"  // For Device/Allocator
 #include "densecore/hal/tensor.h"            // For Tensor struct
 #include "densecore/models/model_descriptor.h"
+#include "densecore/models/model_graph_capabilities.h"
 #include "embedding.h"
 #include "engine_internal.h"
 #include "hardware_topology.h"
@@ -150,6 +151,70 @@ bool IsVerboseTokenTraceEnabled() {
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
+}
+
+bool IsRuntimePathLoggingEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_RUNTIME_PATH");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool IsRuntimePathTokenLoggingEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_RUNTIME_PATH_TOKENS");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool IsParityDebugEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_PARITY_DEBUG");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+void LogRequestRuntimePath(const TransformerModel* model, const std::string& original_prompt, const Request* req) {
+    if ((!IsRuntimePathLoggingEnabled() && !IsParityDebugEnabled()) || !model || !req) {
+        return;
+    }
+
+    const auto descriptor = densecore::models::DescribeModel(model);
+    const auto tokenizer_family = densecore::models::ResolveTokenizerFamily(model);
+    const auto prompt_family = densecore::models::ResolvePromptTemplateFamily(model);
+    const auto graph_resolution = densecore::models::ResolveGraphFamily(model);
+    std::cerr << "[RuntimePath] variant=" << densecore::models::ModelVariantName(descriptor.variant)
+              << " prompt_family=" << densecore::models::PromptTemplateFamilyName(prompt_family)
+              << " tokenizer_family=" << densecore::models::TokenizerFamilyName(tokenizer_family)
+              << " tokenizer_type=" << (model->tokenizer_type.empty() ? "<unset>" : model->tokenizer_type.c_str())
+              << " graph_family=" << densecore::models::GraphFamilyName(graph_resolution.preferred_family)
+              << " template_applied=" << (req->parity_debug_template_applied ? "1" : "0")
+              << " text_primed=" << (req->parity_debug_text_primed ? "1" : "0")
+              << " token_primed=" << (req->parity_debug_token_primed ? "1" : "0") << " submit_api="
+              << (req->parity_debug_submit_api.empty() ? "<unset>" : req->parity_debug_submit_api.c_str())
+              << " temperature=" << req->sampling_params.temperature << " top_p=" << req->sampling_params.top_p
+              << " top_k=" << req->sampling_params.top_k
+              << " repetition_penalty=" << req->sampling_params.repetition_penalty
+              << " json_mode=" << (req->json_mode ? "1" : "0") << " stop_sequences=" << req->stop_sequences.size()
+              << " disallowed_tokens=" << req->disallowed_token_ids.size() << " prompt_tokens=" << req->tokens.size()
+              << std::endl;
+    if (IsParityDebugEnabled()) {
+        std::cerr << "[ParityRequest] original_prompt=" << original_prompt << std::endl;
+        std::cerr << "[ParityRequest] rendered_prompt=" << req->prompt << std::endl;
+    }
+    if (IsRuntimePathTokenLoggingEnabled()) {
+        std::cerr << "[RuntimePathTokens] ids=";
+        for (size_t i = 0; i < req->tokens.size(); ++i) {
+            if (i != 0) {
+                std::cerr << ",";
+            }
+            std::cerr << req->tokens[i];
+        }
+        std::cerr << std::endl;
+    }
 }
 
 int ResolveKVHeadDim(const TransformerModel* model) {
@@ -959,16 +1024,22 @@ int SubmitRequestWithSamplingConstraintsEx(DenseCoreHandle handle, const char* p
 
     Request* req = AcquireAndInitRequest(state);
     req->lora_name = lora_name ? lora_name : "";
+    req->parity_debug_submit_api = "SubmitRequestWithSamplingConstraintsEx";
 
     InitCommonRequest(state, req, max_tokens, temperature, top_p, top_k, repetition_penalty, stop_sequences, json_mode,
                       callback, user_data);
 
     // Tokenize prompt
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
+    req->parity_debug_template_applied = (req->prompt != prompt);
+    const std::string prompt_before_text_priming = req->prompt;
     MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
+    req->parity_debug_text_primed = (req->prompt != prompt_before_text_priming);
     InitializePromptSuppressionState(req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
+    const std::vector<int> tokens_before_priming = req->tokens;
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
+    req->parity_debug_token_primed = (req->tokens != tokens_before_priming);
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
     ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
     if ((allowed_token_ids && num_allowed_token_ids > 0) || (disallowed_token_ids && num_disallowed_token_ids > 0)) {
@@ -979,6 +1050,7 @@ int SubmitRequestWithSamplingConstraintsEx(DenseCoreHandle handle, const char* p
     }
     DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "sampling");
     req->token_history = req->tokens;
+    LogRequestRuntimePath(model_entry->model.get(), prompt, req);
 
     AssignGenerationTier(req);
     EnqueueRequest(state, req);
@@ -1003,16 +1075,22 @@ int SubmitRequestWithTokenResults(DenseCoreHandle handle, const char* prompt, in
 
     Request* req = AcquireAndInitRequest(state);
     req->token_result_callback = callback;
+    req->parity_debug_submit_api = "SubmitRequestWithTokenResults";
 
     InitCommonRequest(state, req, max_tokens, temperature, top_p, top_k, repetition_penalty,
                       /*stop_sequences=*/nullptr, /*json_mode=*/0,
                       /*callback=*/nullptr, user_data);
 
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
+    req->parity_debug_template_applied = (req->prompt != prompt);
+    const std::string token_result_prompt_before_text_priming = req->prompt;
     MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
+    req->parity_debug_text_primed = (req->prompt != token_result_prompt_before_text_priming);
     InitializePromptSuppressionState(req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
+    const std::vector<int> token_result_tokens_before_priming = req->tokens;
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
+    req->parity_debug_token_primed = (req->tokens != token_result_tokens_before_priming);
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
     ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
@@ -1058,6 +1136,7 @@ int SubmitRequestIdsWithSamplingConstraintsEx(DenseCoreHandle handle, const int*
 
     Request* req = AcquireAndInitRequest(state);
     req->lora_name = lora_name ? lora_name : "";
+    req->parity_debug_submit_api = "SubmitRequestIdsWithSamplingConstraintsEx";
 
     InitCommonRequest(state, req, max_tokens, temperature, top_p, top_k, repetition_penalty, stop_sequences, json_mode,
                       callback, user_data);
@@ -1066,7 +1145,9 @@ int SubmitRequestIdsWithSamplingConstraintsEx(DenseCoreHandle handle, const int*
     req->tokens.assign(tokens, tokens + n_tokens);
     ModelEntry* model_entry = state->GetDefaultModel();
     if (model_entry && model_entry->model) {
+        const std::vector<int> ids_tokens_before_priming = req->tokens;
         MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
+        req->parity_debug_token_primed = (req->tokens != ids_tokens_before_priming);
         ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
         ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
         if ((allowed_token_ids && num_allowed_token_ids > 0) ||
@@ -1184,6 +1265,152 @@ const char* GetChatTemplate(DenseCoreHandle handle) {
     }
     SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "GetChatTemplate: no model loaded");
     return nullptr;
+}
+
+namespace {
+thread_local std::string g_rendered_chat_prompt;
+thread_local std::string g_rendered_model_variant;
+thread_local std::string g_rendered_prompt_family;
+thread_local std::vector<int> g_preview_token_ids;
+
+DenseCoreSubmitPath ResolveSubmitPathForPreview(bool token_ids, bool json_mode, bool sampling) {
+    if (token_ids) {
+        if (json_mode) {
+            return sampling ? DENSECORE_SUBMIT_PATH_IDS_WITH_SAMPLING : DENSECORE_SUBMIT_PATH_IDS_WITH_FORMAT;
+        }
+        return sampling ? DENSECORE_SUBMIT_PATH_IDS_WITH_SAMPLING : DENSECORE_SUBMIT_PATH_IDS;
+    }
+    if (json_mode) {
+        return sampling ? DENSECORE_SUBMIT_PATH_TEXT_WITH_SAMPLING : DENSECORE_SUBMIT_PATH_TEXT_WITH_FORMAT;
+    }
+    return sampling ? DENSECORE_SUBMIT_PATH_TEXT_WITH_SAMPLING : DENSECORE_SUBMIT_PATH_TEXT;
+}
+}  // namespace
+
+int DenseCoreRenderChatPrompt(DenseCoreHandle handle, const DenseCoreChatMessage* messages, int num_messages,
+                              const DenseCoreChatTemplateOptions* options, DenseCoreRenderedChatPrompt* out) {
+    if (!handle || !messages || num_messages <= 0 || !out) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCoreRenderChatPrompt: invalid arguments");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+
+    EngineState* state = (EngineState*)handle;
+    ModelEntry* entry = state->GetDefaultModel();
+    if (!entry || !entry->model) {
+        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "DenseCoreRenderChatPrompt: no model loaded");
+        return DENSECORE_STATUS_MODEL_LOAD_FAILED;
+    }
+
+    std::vector<densecore::models::CanonicalChatMessage> canonical_messages;
+    canonical_messages.reserve(static_cast<size_t>(num_messages));
+    for (int i = 0; i < num_messages; ++i) {
+        densecore::models::CanonicalChatMessage message;
+        message.role = messages[i].role ? messages[i].role : "";
+        message.content = messages[i].content ? messages[i].content : "";
+        message.reasoning_content = messages[i].reasoning_content ? messages[i].reasoning_content : "";
+        message.name = messages[i].name ? messages[i].name : "";
+        canonical_messages.push_back(std::move(message));
+    }
+
+    densecore::models::CanonicalChatRenderOptions render_options;
+    render_options.enable_thinking = options ? options->enable_thinking : -1;
+    bool thinking_enabled = false;
+    g_rendered_chat_prompt = densecore::models::RenderModelChatMessages(entry->model.get(), canonical_messages,
+                                                                        render_options, &thinking_enabled);
+    const auto descriptor = densecore::models::DescribeModel(entry->model.get());
+    g_rendered_model_variant = densecore::models::ModelVariantName(descriptor.variant);
+    g_rendered_prompt_family =
+        densecore::models::PromptTemplateFamilyName(densecore::models::ResolvePromptTemplateFamily(entry->model.get()));
+
+    out->rendered_prompt = g_rendered_chat_prompt.c_str();
+    out->tokenizer_type = entry->model->tokenizer_type.empty() ? nullptr : entry->model->tokenizer_type.c_str();
+    out->chat_template = entry->model->chat_template.empty() ? nullptr : entry->model->chat_template.c_str();
+    out->model_variant = g_rendered_model_variant.c_str();
+    out->prompt_family = g_rendered_prompt_family.c_str();
+    out->thinking_enabled = thinking_enabled ? 1 : 0;
+    ClearError();
+    return DENSECORE_STATUS_OK;
+}
+
+int DenseCorePreviewTextRequest(DenseCoreHandle handle, const char* prompt, int max_tokens, float temperature,
+                                float top_p, int top_k, float repetition_penalty, int json_mode,
+                                DenseCoreRequestSnapshot* out) {
+    (void)max_tokens;
+    if (!handle || !prompt || !out) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCorePreviewTextRequest: invalid arguments");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+
+    EngineState* state = (EngineState*)handle;
+    ModelEntry* entry = state->GetDefaultModel();
+    if (!entry || !entry->model) {
+        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "DenseCorePreviewTextRequest: no model loaded");
+        return DENSECORE_STATUS_MODEL_LOAD_FAILED;
+    }
+
+    std::string rendered_prompt = MaybeApplyAutoChatTemplate(entry->model.get(), prompt);
+    const bool template_applied = rendered_prompt != prompt;
+    const std::string before_text_priming = rendered_prompt;
+    MaybePrimeQwenNoThinkingPromptText(entry->model.get(), &rendered_prompt);
+    const bool text_primed = rendered_prompt != before_text_priming;
+    g_preview_token_ids = Tokenizer::Tokenize(entry->model.get(), rendered_prompt, entry->model->tokenizer_add_bos);
+    const std::vector<int> before_token_priming = g_preview_token_ids;
+    MaybePrimeQwenNoThinking(entry->model.get(), &g_preview_token_ids);
+    const bool token_primed = g_preview_token_ids != before_token_priming;
+    g_rendered_chat_prompt = rendered_prompt;
+
+    out->rendered_prompt = g_rendered_chat_prompt.c_str();
+    out->token_ids = g_preview_token_ids.empty() ? nullptr : g_preview_token_ids.data();
+    out->num_token_ids = static_cast<int>(g_preview_token_ids.size());
+    out->submit_path = ResolveSubmitPathForPreview(false, json_mode != 0, true);
+    out->temperature = temperature;
+    out->top_p = top_p;
+    out->top_k = top_k;
+    out->repetition_penalty = repetition_penalty;
+    out->json_mode = json_mode != 0 ? 1 : 0;
+    out->template_applied = template_applied ? 1 : 0;
+    out->text_primed = text_primed ? 1 : 0;
+    out->token_primed = token_primed ? 1 : 0;
+    ClearError();
+    return DENSECORE_STATUS_OK;
+}
+
+int DenseCorePreviewTokenRequest(DenseCoreHandle handle, const int* token_ids, int num_token_ids, int max_tokens,
+                                 float temperature, float top_p, int top_k, float repetition_penalty, int json_mode,
+                                 DenseCoreRequestSnapshot* out) {
+    (void)max_tokens;
+    if (!handle || !token_ids || num_token_ids <= 0 || !out) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCorePreviewTokenRequest: invalid arguments");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+
+    EngineState* state = (EngineState*)handle;
+    ModelEntry* entry = state->GetDefaultModel();
+    if (!entry || !entry->model) {
+        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "DenseCorePreviewTokenRequest: no model loaded");
+        return DENSECORE_STATUS_MODEL_LOAD_FAILED;
+    }
+
+    g_preview_token_ids.assign(token_ids, token_ids + num_token_ids);
+    const std::vector<int> before_token_priming = g_preview_token_ids;
+    MaybePrimeQwenNoThinking(entry->model.get(), &g_preview_token_ids);
+    const bool token_primed = g_preview_token_ids != before_token_priming;
+    g_rendered_chat_prompt.clear();
+
+    out->rendered_prompt = nullptr;
+    out->token_ids = g_preview_token_ids.data();
+    out->num_token_ids = static_cast<int>(g_preview_token_ids.size());
+    out->submit_path = ResolveSubmitPathForPreview(true, json_mode != 0, true);
+    out->temperature = temperature;
+    out->top_p = top_p;
+    out->top_k = top_k;
+    out->repetition_penalty = repetition_penalty;
+    out->json_mode = json_mode != 0 ? 1 : 0;
+    out->template_applied = 0;
+    out->text_primed = 0;
+    out->token_primed = token_primed ? 1 : 0;
+    ClearError();
+    return DENSECORE_STATUS_OK;
 }
 
 int DenseCoreTokenizeText(DenseCoreHandle handle, const char* text, int add_bos, int add_eos, int* out_ids,
@@ -1892,6 +2119,7 @@ int SubmitRequest(DenseCoreHandle handle, const char* prompt, int max_tokens, co
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
+    LogRequestRuntimePath(model_entry->model.get(), prompt, req);
 
     ApplyDefaultLora(state, req);
     AssignGenerationTier(req);
@@ -1973,6 +2201,7 @@ int SubmitRequestWithFormatEx(DenseCoreHandle handle, const char* prompt, int ma
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
+    LogRequestRuntimePath(model_entry->model.get(), prompt, req);
 
     AssignGenerationTier(req);
     EnqueueRequest(state, req);

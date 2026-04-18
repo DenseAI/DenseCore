@@ -96,7 +96,7 @@ public:
                 return ptr;
             }
             // Fallback if mmap didn't produce aligned result
-            if (ptr) Free(ptr, aligned_size);
+            if (ptr) Free(ptr, aligned_size, AllocationType::Mmap);
         }
 #endif
         return AllocateAligned(aligned_size, alignment);

@@ -24,6 +24,12 @@ if(NOT APPLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR M
 endif()
 
 set(DENSECORE_ARM_CORRECTNESS_FIRST_DEFAULT OFF)
+if(DENSECORE_LINUX_ARM64)
+    # Linux ARM Q4 request paths can enter third-party fast kernels that are
+    # currently not stable enough for production inference. Default to the
+    # correctness-first lane and require explicit opt-in for those kernels.
+    set(DENSECORE_ARM_CORRECTNESS_FIRST_DEFAULT ON)
+endif()
 option(
     DENSECORE_ARM_CORRECTNESS_FIRST
     "Prefer correctness-first ggml defaults on Linux ARM (disables KleidiAI, llamafile, repack, and native ISA auto-tuning unless explicitly overridden)"
@@ -1140,8 +1146,10 @@ if(DENSECORE_BUILD_TESTS)
     set(TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_simd_ops.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen35_ssm_math.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen35_ssm_qkv_projection.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_chat_template.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model_descriptor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tokenizer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_transformer_graph_dispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen_loop_guard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_decode_graph_cache.cpp

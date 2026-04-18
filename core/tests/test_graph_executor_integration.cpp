@@ -6,9 +6,16 @@
 #include "densecore/hal/op_registry.h"
 #include "densecore/kv_cache_decoder.h"
 #include "densecore/kv_cache_encoder.h"
+#include "ggml.h"
 
 namespace densecore {
 namespace {
+
+std::vector<ggml_bf16_t> ToBF16(const std::vector<float>& src) {
+    std::vector<ggml_bf16_t> dst(src.size());
+    ggml_fp32_to_bf16_row(src.data(), dst.data(), static_cast<int>(src.size()));
+    return dst;
+}
 
 class GraphExecutorIntegrationTest : public ::testing::Test {
 protected:
@@ -112,6 +119,41 @@ TEST_F(GraphExecutorIntegrationTest, EncoderDecoderIntegration) {
     // Cleanup handled by manual free since Tensor Make4D doesn't own memory
     free(q_data);
     free(out_data);
+}
+
+TEST_F(GraphExecutorIntegrationTest, MatMulTransBSupportsBF16WeightsInGraph) {
+    constexpr int M = 2;
+    constexpr int K = 4;
+    constexpr int N = 3;
+
+    std::vector<float> a = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+    };
+    std::vector<float> b = {
+        1.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 1.0f,
+        1.0f, 1.0f, 1.0f, 1.0f,
+    };
+    std::vector<ggml_bf16_t> b_bf16 = ToBF16(b);
+    std::vector<float> c(static_cast<size_t>(M * N), 0.0f);
+
+    OperationGraph graph;
+    const size_t a_idx = graph.RegisterTensor(Tensor::Make2D(a.data(), M, K, DType::F32));
+    const size_t b_idx = graph.RegisterTensor(Tensor::Make2D(b_bf16.data(), N, K, DType::BF16));
+    const size_t c_idx = graph.RegisterTensor(Tensor::Make2D(c.data(), M, N, DType::F32));
+    graph.AddNode(OpType::MatMulTransB, {a_idx, b_idx}, {c_idx}, "bf16_linear", {});
+
+    GraphExecutor executor;
+    executor.Execute(graph, DeviceType::CPU);
+
+    const std::vector<float> expected = {
+        4.0f, 6.0f, 10.0f,
+        12.0f, 14.0f, 26.0f,
+    };
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_NEAR(c[i], expected[i], 3e-2f);
+    }
 }
 
 }  // namespace

@@ -2,6 +2,7 @@
 #define DENSECORE_MODELS_MODEL_PROMPT_TEMPLATES_H
 
 #include <string>
+#include <vector>
 
 #include "engine_internal.h"
 #include "model_types.h"
@@ -26,8 +27,21 @@ struct PromptTemplateProfile {
     bool thinking_enabled = false;
 };
 
+struct CanonicalChatMessage {
+    std::string role;
+    std::string content;
+    std::string reasoning_content;
+    std::string name;
+};
+
+struct CanonicalChatRenderOptions {
+    int enable_thinking = -1;  // -1 = auto
+};
+
 PromptTemplateProfile ResolveModelPromptTemplateProfile(const TransformerModel* model);
 std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std::string& prompt);
+std::string RenderModelChatMessages(const TransformerModel* model, const std::vector<CanonicalChatMessage>& messages,
+                                    const CanonicalChatRenderOptions& options, bool* thinking_enabled = nullptr);
 void ConfigureQwenReasoningTokenBlocklistForModel(const TransformerModel* model, Request* req);
 void ConfigureGemma4TextTokenBlocklistForModel(const TransformerModel* model, Request* req);
 

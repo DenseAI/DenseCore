@@ -169,7 +169,8 @@ const char* GetDecodePagedFallbackReasonName(std::size_t index);
 
 struct InferenceContext {
     GgmlContextHandle* ctx_compute = nullptr;  // Persistent GGML context
-    std::vector<uint8_t> compute_buffer;       // Static memory pool (64-byte aligned)
+    void* compute_buffer = nullptr;            // Static memory pool (64-byte aligned, uninitialized)
+    size_t compute_buffer_size = 0;
     bool initialized = false;
 
     // Initialize with fixed buffer size (called once at engine startup)

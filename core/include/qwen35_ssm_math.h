@@ -51,6 +51,8 @@ enum class Qwen35SSMNormLayout {
 
 bool Qwen35CanonicalizeHeadByEmbd(const float* raw, const int64_t ne[4], int n_embd, int n_heads,
                                   std::vector<float>* out);
+bool Qwen35CanonicalizeFusedBA(const float* raw, const int64_t ne[4], int n_embd, int n_v_heads, int n_groups,
+                               std::vector<float>* beta_out, std::vector<float>* alpha_out);
 bool Qwen35CanonicalizePerHeadVector(const float* raw, const int64_t ne[4], int n_heads, std::vector<float>* out);
 Qwen35SSMNormLayout Qwen35CanonicalizeNorm(const float* raw, const int64_t ne[4], int head_dim_v, int d_inner,
                                            std::vector<float>* out);

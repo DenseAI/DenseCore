@@ -34,7 +34,7 @@ struct AlignedScratch {
     }
 };
 
-// Qwen3.5-35B-A3B: 256 experts × top-8 → batch=4 yields 32 assignments
+// Qwen3.5-35B-A3B: 256 experts x top-8 -> batch=4 yields 32 assignments
 constexpr int kSmallDecodeMaxAssignments = 32;
 constexpr int kSmallDecodeMaxSnapshotExperts = 512;
 
@@ -66,6 +66,32 @@ bool IsMoEDebugTimingEnabled() {
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
+}
+
+bool IsMoEFFNDebugTimingEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_MOE_FFN_TIMING");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool ShouldParallelizeExpertFFNInner(int64_t batch, int64_t hidden_dim, int64_t intermediate_dim) {
+    const char* force_env = std::getenv("DENSECORE_MOE_FORCE_INNER_PARALLEL");
+    if (force_env && force_env[0] != '\0') {
+        return std::strcmp(force_env, "0") != 0;
+    }
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // Qwen3.5-35B-A3B batch=1 decode on C4A repeatedly executes tiny expert
+    // GEMV/GEMM fragments (top-k experts, one token). Fanning each fragment out
+    // across the whole thread pool costs more than the math itself and was the
+    // dominant source of backend_us inflation after the crash fix.
+    const int64_t work_items = batch * intermediate_dim;
+    if (batch <= 1 && hidden_dim <= 4096 && intermediate_dim <= 8192 && work_items <= 8192) {
+        return false;
+    }
+#endif
+    return true;
 }
 
 bool IsMoEReferenceCheckEnabled() {
@@ -335,7 +361,7 @@ template <size_t N> bool FixedArrayContains(const std::array<int, N>& values, in
 }
 
 bool TryRunPackedInt4Projection(CpuBackend* backend, const CpuBackend::ExpertPackedInt4Weight& binding,
-                                const Tensor& input, Tensor* output, int numa_node);
+                                const Tensor& input, Tensor* output, int numa_node, bool allow_parallel);
 
 bool ExpertUsesPackedInt4Only(const CpuBackend::ExpertWeights& expert) {
     if (!expert.w1_int4.IsValid() || !expert.w2_int4.IsValid()) {
@@ -347,8 +373,8 @@ bool ExpertUsesPackedInt4Only(const CpuBackend::ExpertWeights& expert) {
     return true;
 }
 
-// Check if expert weights are in a ggml quantized format that supports vec_dot
-// (e.g., Q4_K, Q4_0, Q6_K, etc.) — enables zero-dequantization GEMV.
+// Check if expert weights are in a ggml quantized format that supports vec_dot.
+// Examples: Q4_K, Q4_0, Q6_K. This enables zero-dequantization GEMV.
 bool ExpertHasGgmlQuantizedWeights(const CpuBackend::ExpertWeights& expert) {
     if (!expert.w1.ptr || !expert.w2.ptr) return false;
     const auto check_type = [](int type_id) -> bool {
@@ -362,11 +388,11 @@ bool ExpertHasGgmlQuantizedWeights(const CpuBackend::ExpertWeights& expert) {
            (expert.w3.ptr == nullptr || check_type(expert.w3_type));
 }
 
-/// 양자화된 expert weight에 대해 ggml vec_dot 기반 GEMV를 수행.
-/// F32 dequantization을 완전히 우회하여 MoE 추론 속도를 극적으로 개선.
-/// @complexity O(M * N * K) where expert matrices are [N, K]
+// Run ggml vec_dot based GEMV for quantized expert weights.
+// This bypasses F32 dequantization on the hot MoE path.
+// Complexity: O(M * N * K) where expert matrices are [N, K].
 bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, int ggml_type_id, const Tensor& input,
-                                   Tensor* output, int64_t N, int64_t K, int numa_node) {
+                                   Tensor* output, int64_t N, int64_t K, int numa_node, bool allow_parallel = true) {
     if (!backend || !weight_ptr || !output || !input.IsValid() || !output->IsValid()) return false;
     if (input.dtype != DType::F32 || output->dtype != DType::F32) return false;
     if (input.ndim != 2 || output->ndim != 2) return false;
@@ -401,23 +427,31 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
     }
 
     auto& pool = backend->GetThreadPool(numa_node);
+    const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
 
     for (int64_t m = 0; m < M; ++m) {
         float* out_row = out_data + m * N;
         const void* qi = qinput_buf.data() + static_cast<size_t>(m) * iq_row_bytes;
 
-        pool.ParallelFor(static_cast<int>(N), [&](int n_start, int n_end, int) {
-            for (int n = n_start; n < n_end; ++n) {
+        if (n_threads <= 1) {
+            for (int64_t n = 0; n < N; ++n) {
                 const void* w_row = w_data + static_cast<size_t>(n) * w_row_bytes;
                 type_traits_cpu->vec_dot(static_cast<int>(K), out_row + n, 0, w_row, 0, qi, 0, 1);
             }
-        });
+        } else {
+            pool.ParallelFor(static_cast<int>(N), [&](int n_start, int n_end, int) {
+                for (int n = n_start; n < n_end; ++n) {
+                    const void* w_row = w_data + static_cast<size_t>(n) * w_row_bytes;
+                    type_traits_cpu->vec_dot(static_cast<int>(K), out_row + n, 0, w_row, 0, qi, 0, 1);
+                }
+            });
+        }
     }
     return true;
 }
 
 bool TryRunPackedInt4ProjectionDirect(CpuBackend* backend, const CpuBackend::ExpertPackedInt4Weight& binding,
-                                      const Tensor& input, Tensor* output, int numa_node) {
+                                      const Tensor& input, Tensor* output, int numa_node, bool allow_parallel = true) {
     if (!backend || !output || !binding.IsValid() || !input.IsValid() || !output->IsValid() ||
         input.dtype != DType::F32 || output->dtype != DType::F32 || input.ndim != 2 || output->ndim != 2) {
         return false;
@@ -435,7 +469,7 @@ bool TryRunPackedInt4ProjectionDirect(CpuBackend* backend, const CpuBackend::Exp
     const float* input_data = input.DataAs<float>();
     float* output_data = output->DataAs<float>();
     auto& pool = backend->GetThreadPool(numa_node);
-    const int n_threads = pool.GetNumThreads();
+    const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
 
     if (M == 1) {
         if (n_threads <= 1) {
@@ -473,7 +507,8 @@ bool TryRunPackedInt4ProjectionDirect(CpuBackend* backend, const CpuBackend::Exp
 bool TryRunPackedInt4FusedSwiGLUProjectionDirect(CpuBackend* backend,
                                                  const CpuBackend::ExpertPackedInt4Weight& gate_binding,
                                                  const CpuBackend::ExpertPackedInt4Weight& up_binding,
-                                                 const Tensor& input, Tensor* output, int numa_node) {
+                                                 const Tensor& input, Tensor* output, int numa_node,
+                                                 bool allow_parallel = true) {
     if (!backend || !output || !gate_binding.IsValid() || !up_binding.IsValid() || !input.IsValid() ||
         !output->IsValid() || input.dtype != DType::F32 || output->dtype != DType::F32 || input.ndim != 2 ||
         output->ndim != 2) {
@@ -492,7 +527,7 @@ bool TryRunPackedInt4FusedSwiGLUProjectionDirect(CpuBackend* backend,
     const float* input_data = input.DataAs<float>();
     float* output_data = output->DataAs<float>();
     auto& pool = backend->GetThreadPool(numa_node);
-    const int n_threads = pool.GetNumThreads();
+    const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
 
     for (int m = 0; m < M; ++m) {
         const float* row_input = input_data + static_cast<size_t>(m) * K;
@@ -515,10 +550,14 @@ bool TryRunPackedInt4FusedSwiGLUProjectionDirect(CpuBackend* backend,
 
 void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& input,
                            const CpuBackend::ExpertWeights& expert, const Tensor& w1, const Tensor& w2,
-                           const Tensor& w3, Tensor* output) {
+                           const Tensor& w3, Tensor* output, bool allow_inner_parallel = true) {
     if (!backend || !output) {
         return;
     }
+
+    const bool debug_ffn_timing = IsMoEFFNDebugTimingEnabled();
+    const auto total_begin =
+        debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     static thread_local AlignedScratch hidden_scratch;
     static thread_local AlignedScratch gate_scratch;
@@ -529,29 +568,32 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     if (intermediate_dim <= 0) return;
     const int64_t hidden_dim = input.shape[1];
     const size_t hidden_size = static_cast<size_t>(batch * intermediate_dim);
+    const bool enable_inner_parallel =
+        allow_inner_parallel && ShouldParallelizeExpertFFNInner(batch, hidden_dim, intermediate_dim);
 
     hidden_scratch.Resize(backend, hidden_size);
     Tensor hidden = Tensor::Make2D(hidden_scratch.ptr, batch, intermediate_dim);
     const bool used_fused_int4_swiglu =
         !expert.use_gelu_activation &&
-        TryRunPackedInt4FusedSwiGLUProjectionDirect(backend, expert.w1_int4, expert.w3_int4, input, &hidden, numa_node);
+        TryRunPackedInt4FusedSwiGLUProjectionDirect(backend, expert.w1_int4, expert.w3_int4, input, &hidden, numa_node,
+                                                    enable_inner_parallel);
     if (!used_fused_int4_swiglu && (w3.IsValid() || expert.w3_int4.IsValid() || expert.w3.ptr)) {
         gate_scratch.Resize(backend, hidden_size);
     }
 
-    // Unified projection dispatch: packed INT4 → ggml quantized GEMV → F32 dense
+    // Unified projection dispatch: packed INT4 -> ggml quantized GEMV -> F32 dense
     const auto run_projection = [&](const Tensor& src, const Tensor& dense_weight,
                                     const CpuBackend::ExpertPackedInt4Weight& int4_binding,
                                     const CpuBackend::ExpertWeight& raw_weight, int ggml_type_id, int64_t proj_rows,
                                     int64_t proj_cols, Tensor* dst) {
         // Path 1: Packed INT4 (custom DenseCore format)
-        if (TryRunPackedInt4Projection(backend, int4_binding, src, dst, numa_node)) {
+        if (TryRunPackedInt4Projection(backend, int4_binding, src, dst, numa_node, enable_inner_parallel)) {
             return;
         }
-        // Path 2: Native ggml quantized GEMV (Q4_K, Q4_0, etc.) — zero dequantization
+        // Path 2: Native ggml quantized GEMV (Q4_K, Q4_0, etc.) -> zero dequantization
         if (raw_weight.ptr && ggml_type_id != GGML_TYPE_F32 &&
             TryRunGgmlQuantizedProjection(backend, raw_weight.ptr, ggml_type_id, src, dst, proj_rows, proj_cols,
-                                          numa_node)) {
+                                          numa_node, enable_inner_parallel)) {
             return;
         }
         // Path 3: F32 dense matmul fallback (requires pre-dequantized weight)
@@ -560,34 +602,86 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         }
     };
 
+    std::chrono::steady_clock::duration w1_duration{};
+    std::chrono::steady_clock::duration gate_duration{};
+    std::chrono::steady_clock::duration activation_duration{};
+    std::chrono::steady_clock::duration w2_duration{};
+
     if (!used_fused_int4_swiglu) {
+        const auto w1_begin =
+            debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         run_projection(input, w1, expert.w1_int4, expert.w1, expert.w1_type, intermediate_dim, hidden_dim, &hidden);
+        if (debug_ffn_timing) {
+            w1_duration += (std::chrono::steady_clock::now() - w1_begin);
+        }
     }
 
     if (!used_fused_int4_swiglu && (w3.IsValid() || expert.w3_int4.IsValid() || expert.w3.ptr)) {
         Tensor gate = Tensor::Make2D(gate_scratch.ptr, batch, intermediate_dim);
+        const auto gate_begin =
+            debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         run_projection(input, w3, expert.w3_int4, expert.w3, expert.w3_type, intermediate_dim, hidden_dim, &gate);
+        if (debug_ffn_timing) {
+            gate_duration += (std::chrono::steady_clock::now() - gate_begin);
+        }
 
         auto& pool = backend->GetThreadPool(numa_node);
         const int total = static_cast<int>(hidden_size);
         float* h_ptr = hidden_scratch.ptr;
         const float* g_ptr = gate_scratch.ptr;
 
-        pool.ParallelFor(total, [=](int start, int end, int) {
-            for (int i = start; i < end; i++) {
+        const auto activation_begin =
+            debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (enable_inner_parallel && pool.GetNumThreads() > 1) {
+            pool.ParallelFor(total, [=](int start, int end, int) {
+                for (int i = start; i < end; i++) {
+                    float x = h_ptr[i];
+                    const float activated =
+                        expert.use_gelu_activation ? GeluTanhApprox(x) : (x / (1.0f + internal::FastExp(-x)));
+                    h_ptr[i] = activated * g_ptr[i];
+                }
+            });
+        } else {
+            for (int i = 0; i < total; ++i) {
                 float x = h_ptr[i];
                 const float activated =
                     expert.use_gelu_activation ? GeluTanhApprox(x) : (x / (1.0f + internal::FastExp(-x)));
                 h_ptr[i] = activated * g_ptr[i];
             }
-        });
+        }
+        if (debug_ffn_timing) {
+            activation_duration += (std::chrono::steady_clock::now() - activation_begin);
+        }
     }
 
+    const auto w2_begin = debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     run_projection(hidden, w2, expert.w2_int4, expert.w2, expert.w2_type, hidden_dim, intermediate_dim, output);
+    if (debug_ffn_timing) {
+        w2_duration += (std::chrono::steady_clock::now() - w2_begin);
+        static std::atomic<int> log_budget{0};
+        int current = log_budget.load(std::memory_order_relaxed);
+        while (current < 256 && !log_budget.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) {}
+        if (current < 256) {
+            const auto total_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - total_begin).count();
+            const auto w1_ms = std::chrono::duration<double, std::milli>(w1_duration).count();
+            const auto gate_ms = std::chrono::duration<double, std::milli>(gate_duration).count();
+            const auto activation_ms = std::chrono::duration<double, std::milli>(activation_duration).count();
+            const auto w2_ms = std::chrono::duration<double, std::milli>(w2_duration).count();
+            std::fprintf(stderr,
+                         "[MOE_FFN] batch=%lld hidden=%lld inter=%lld gelu=%d fused=%d allow_inner_parallel=%d "
+                         "effective_inner_parallel=%d "
+                         "w1_ms=%.3f gate_ms=%.3f act_ms=%.3f w2_ms=%.3f total_ms=%.3f\n",
+                         static_cast<long long>(batch), static_cast<long long>(hidden_dim),
+                         static_cast<long long>(intermediate_dim), expert.use_gelu_activation ? 1 : 0,
+                         used_fused_int4_swiglu ? 1 : 0, allow_inner_parallel ? 1 : 0, enable_inner_parallel ? 1 : 0,
+                         w1_ms, gate_ms, activation_ms, w2_ms, total_ms);
+        }
+    }
 }
 
 bool TryRunPackedInt4Projection(CpuBackend* backend, const CpuBackend::ExpertPackedInt4Weight& binding,
-                                const Tensor& input, Tensor* output, int numa_node) {
+                                const Tensor& input, Tensor* output, int numa_node, bool allow_parallel = true) {
     if (!backend || !output || !binding.IsValid() || !input.IsValid() || !output->IsValid() ||
         input.dtype != DType::F32 || output->dtype != DType::F32 || input.ndim != 2 || output->ndim != 2) {
         return false;
@@ -597,7 +691,7 @@ bool TryRunPackedInt4Projection(CpuBackend* backend, const CpuBackend::ExpertPac
         return false;
     }
 
-    if (TryRunPackedInt4ProjectionDirect(backend, binding, input, output, numa_node)) {
+    if (TryRunPackedInt4ProjectionDirect(backend, binding, input, output, numa_node, allow_parallel)) {
         return true;
     }
 
@@ -856,6 +950,14 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
 
     auto registry = GetMoELayerRegistry(layer_key);
     RecordExpertAccess(layer_key, routing.expert_ids.data(), static_cast<int>(routing.expert_ids.size()));
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // ARM Qwen35-MoE runs have hit invalid-mutex crashes while touching
+    // per-layer registry side channels (locality snapshots / dequant cache)
+    // from the routed expert path. Keep the core MoE execution path active,
+    // but disable the optional registry-backed bookkeeping on ARM until the
+    // shared-state lifetime and synchronization are fully hardened.
+    registry.reset();
+#endif
 
     float* out_data = output->DataAs<float>();
     std::memset(out_data, 0, batch_size * hidden_dim * sizeof(float));
@@ -890,8 +992,18 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
         return;
     }
 
-    // Qwen3.5: batch=1~4 × top_k=8 → up to 32 assignments
-    const bool small_decode_candidate = batch_size <= 4 && total_assignments <= kSmallDecodeMaxAssignments;
+    // Qwen3.5-35B-A3B can fan out into many one-token expert assignments on ARM.
+    // The tiny decode-specialized path processes those assignments serially,
+    // which underutilizes CPU and can strand the request in prefill. Force the
+    // batched MoE path for very large expert pools on ARM so experts are grouped
+    // and routed through the main reordered execution lane.
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const bool arm_large_expert_pool = num_experts >= 128 && batch_size > 1;
+#else
+    const bool arm_large_expert_pool = false;
+#endif
+    const bool small_decode_candidate =
+        batch_size <= 4 && total_assignments <= kSmallDecodeMaxAssignments && !arm_large_expert_pool;
     const bool has_token_indices = !routing.token_indices.empty();
     const float* input_data = input.DataAs<float>();
     bool small_decode_requires_general_path = false;
@@ -1211,7 +1323,7 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                                                      &dequantized_bytes, &dequantized_any);
                 }
             }
-            // else: w1/w2/w3 remain empty Tensors — DispatchExpertFFNImpl uses quantized GEMV path
+            // else: w1/w2/w3 remain empty Tensors -> DispatchExpertFFNImpl uses quantized GEMV path
             if (dequantized_any) {
                 moe_stats_total_dequantized_experts_.fetch_add(1, std::memory_order_relaxed);
                 moe_stats_total_dequantized_bytes_.fetch_add(static_cast<uint64_t>(dequantized_bytes),
@@ -1456,212 +1568,253 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
     uint64_t cached_experts_this_step = 0;
     std::chrono::steady_clock::duration dequant_duration{};
     std::chrono::steady_clock::duration expert_duration{};
-    for (size_t idx = 0; idx < active_work.size(); ++idx) {
-        const ActiveExpertWork& work = active_work[idx];
-        const ExpertWeights& exp = experts[static_cast<size_t>(work.expert_id)];
+    std::mutex work_stats_mutex;
+    // Qwen3.5-35B-A3B on C4A-class ARM can reach this expert-parallel path during
+    // multi-token prefill. The current shared-registry/cache access inside the
+    // worker lambda is not hardened enough for that path and has produced
+    // invalid-mutex crashes in production-style runs. Keep the reordered MoE
+    // path, but serialize expert execution on ARM until the parallel cache
+    // coordination is made safe.
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const bool parallelize_experts = false;
+#else
+    const bool parallelize_experts = arm_large_expert_pool && batch_size > 4 &&
+                                     active_work.size() >= static_cast<size_t>(std::max(4, worker_threads / 2));
+#endif
 
-        if (!small_decode_step && internal::IsMoENextExpertPrefetchEnabled() && idx + 1 < active_work.size()) {
-            moe_stats_total_prefetch_candidates_.fetch_add(1, std::memory_order_relaxed);
-            const ActiveExpertWork& next_work = active_work[idx + 1];
-            const bool next_reused = previous_batch_set.find(next_work.expert_id) != previous_batch_set.end();
-            const int reuse_signals =
-                (next_work.local_hot ? 1 : 0) + (next_reused ? 1 : 0) + (next_work.count > 1 ? 1 : 0);
-            const bool enough_compute_distance = work.count >= internal::GetMoEPrefetchMinCurrentExpertTokens();
-            const bool under_pressure_budget =
-                static_cast<int>(active_work.size()) <= internal::GetMoEPrefetchMaxActiveExperts() &&
-                worker_threads <= internal::GetMoEPrefetchMaxThreadCount();
+    auto run_active_work_range = [&](int start_idx, int end_idx, bool allow_inner_parallel) {
+        uint64_t local_cached_experts = 0;
+        std::chrono::steady_clock::duration local_dequant_duration{};
+        std::chrono::steady_clock::duration local_expert_duration{};
 
-            if (!enough_compute_distance) {
-                moe_stats_total_prefetch_skipped_distance_.fetch_add(1, std::memory_order_relaxed);
-            } else if (!under_pressure_budget) {
-                moe_stats_total_prefetch_skipped_pressure_.fetch_add(1, std::memory_order_relaxed);
-            } else if (reuse_signals <= 0) {
-                moe_stats_total_prefetch_skipped_signal_.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                const ExpertWeights& next_exp = experts[static_cast<size_t>(next_work.expert_id)];
-                size_t prefetch_budget = internal::GetMoEPrefetchBytes();
-                if (reuse_signals == 1) {
-                    prefetch_budget = std::max<size_t>(64, prefetch_budget / 2);
-                }
-                if (static_cast<int>(active_work.size()) >=
-                    std::max(2, internal::GetMoEPrefetchMaxActiveExperts() / 2)) {
-                    prefetch_budget = std::max<size_t>(64, prefetch_budget / 2);
-                }
+        for (int raw_idx = start_idx; raw_idx < end_idx; ++raw_idx) {
+            const size_t idx = static_cast<size_t>(raw_idx);
+            const ActiveExpertWork& work = active_work[idx];
+            const ExpertWeights& exp = experts[static_cast<size_t>(work.expert_id)];
 
-                const int weight_count = next_exp.w3.ptr != nullptr ? 3 : 2;
-                const size_t per_weight_budget =
-                    std::max<size_t>(64, prefetch_budget / static_cast<size_t>(weight_count));
-                auto prefetch_weight = [per_weight_budget](const ExpertWeight& weight) {
-                    if (!weight.ptr || weight.size == 0) return static_cast<size_t>(0);
-                    const size_t bytes = std::min(per_weight_budget, weight.size);
-                    densecore::simd::PrefetchRange(weight.ptr, bytes);
-                    return bytes;
-                };
-                const size_t prefetched =
-                    prefetch_weight(next_exp.w1) + prefetch_weight(next_exp.w2) + prefetch_weight(next_exp.w3);
-                if (prefetched > 0) {
-                    moe_stats_total_prefetch_calls_.fetch_add(1, std::memory_order_relaxed);
-                    moe_stats_total_prefetch_bytes_.fetch_add(static_cast<uint64_t>(prefetched),
-                                                              std::memory_order_relaxed);
-                }
-            }
-        }
+            if (!small_decode_step && internal::IsMoENextExpertPrefetchEnabled() && idx + 1 < active_work.size()) {
+                moe_stats_total_prefetch_candidates_.fetch_add(1, std::memory_order_relaxed);
+                const ActiveExpertWork& next_work = active_work[idx + 1];
+                const bool next_reused = previous_batch_set.find(next_work.expert_id) != previous_batch_set.end();
+                const int reuse_signals =
+                    (next_work.local_hot ? 1 : 0) + (next_reused ? 1 : 0) + (next_work.count > 1 ? 1 : 0);
+                const bool enough_compute_distance = work.count >= internal::GetMoEPrefetchMinCurrentExpertTokens();
+                const bool under_pressure_budget =
+                    static_cast<int>(active_work.size()) <= internal::GetMoEPrefetchMaxActiveExperts() &&
+                    worker_threads <= internal::GetMoEPrefetchMaxThreadCount();
 
-        const auto dequant_begin =
-            debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> cached_entry;
-        const bool should_try_cache =
-            dequant_cache_enabled &&
-            (cache_all_active_experts || work.local_hot ||
-             previous_batch_set.find(work.expert_id) != previous_batch_set.end() || work.count > 1);
-        const size_t cacheable_bytes =
-            GetExpertMatrixDequantBytes(exp.w1_type, exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                        static_cast<int64_t>(exp.hidden_dim)) +
-            GetExpertMatrixDequantBytes(exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
-                                        static_cast<int64_t>(exp.intermediate_dim)) +
-            ((exp.w3.ptr != nullptr)
-                 ? GetExpertMatrixDequantBytes(exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                               static_cast<int64_t>(exp.hidden_dim))
-                 : 0);
-        if (should_try_cache && cacheable_bytes > 0 && cacheable_bytes <= dequant_cache_budget) {
-            std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> existing_entry;
-            {
-                std::lock_guard<std::mutex> lock(registry->mutex);
-                auto it = registry->dequant_cache.find(work.expert_id);
-                if (it != registry->dequant_cache.end()) {
-                    existing_entry = it->second;
-                    if (existing_entry) {
-                        existing_entry->last_used = ++registry->dequant_cache_use_counter;
+                if (!enough_compute_distance) {
+                    moe_stats_total_prefetch_skipped_distance_.fetch_add(1, std::memory_order_relaxed);
+                } else if (!under_pressure_budget) {
+                    moe_stats_total_prefetch_skipped_pressure_.fetch_add(1, std::memory_order_relaxed);
+                } else if (reuse_signals <= 0) {
+                    moe_stats_total_prefetch_skipped_signal_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    const ExpertWeights& next_exp = experts[static_cast<size_t>(next_work.expert_id)];
+                    size_t prefetch_budget = internal::GetMoEPrefetchBytes();
+                    if (reuse_signals == 1) {
+                        prefetch_budget = std::max<size_t>(64, prefetch_budget / 2);
+                    }
+                    if (static_cast<int>(active_work.size()) >=
+                        std::max(2, internal::GetMoEPrefetchMaxActiveExperts() / 2)) {
+                        prefetch_budget = std::max<size_t>(64, prefetch_budget / 2);
+                    }
+
+                    const int weight_count = next_exp.w3.ptr != nullptr ? 3 : 2;
+                    const size_t per_weight_budget =
+                        std::max<size_t>(64, prefetch_budget / static_cast<size_t>(weight_count));
+                    auto prefetch_weight = [per_weight_budget](const ExpertWeight& weight) {
+                        if (!weight.ptr || weight.size == 0) return static_cast<size_t>(0);
+                        const size_t bytes = std::min(per_weight_budget, weight.size);
+                        densecore::simd::PrefetchRange(weight.ptr, bytes);
+                        return bytes;
+                    };
+                    const size_t prefetched =
+                        prefetch_weight(next_exp.w1) + prefetch_weight(next_exp.w2) + prefetch_weight(next_exp.w3);
+                    if (prefetched > 0) {
+                        moe_stats_total_prefetch_calls_.fetch_add(1, std::memory_order_relaxed);
+                        moe_stats_total_prefetch_bytes_.fetch_add(static_cast<uint64_t>(prefetched),
+                                                                  std::memory_order_relaxed);
                     }
                 }
             }
 
-            if (!existing_entry) {
-                auto candidate = std::make_shared<MoELayerRegistry::DequantizedExpertCacheEntry>();
-                candidate->expert_id = work.expert_id;
-                candidate->bytes = cacheable_bytes;
-                dequantize_into_buffer(exp.w1.ptr, exp.w1_type, exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                       static_cast<int64_t>(exp.hidden_dim), &candidate->w1);
-                dequantize_into_buffer(exp.w2.ptr, exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
-                                       static_cast<int64_t>(exp.intermediate_dim), &candidate->w2);
-                if (exp.w3.ptr != nullptr) {
-                    dequantize_into_buffer(exp.w3.ptr, exp.w3_type, exp.w3_int4,
+            const auto dequant_begin =
+                debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> cached_entry;
+            const bool should_try_cache =
+                dequant_cache_enabled &&
+                (cache_all_active_experts || work.local_hot ||
+                 previous_batch_set.find(work.expert_id) != previous_batch_set.end() || work.count > 1);
+            const size_t cacheable_bytes =
+                GetExpertMatrixDequantBytes(exp.w1_type, exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
+                                            static_cast<int64_t>(exp.hidden_dim)) +
+                GetExpertMatrixDequantBytes(exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
+                                            static_cast<int64_t>(exp.intermediate_dim)) +
+                ((exp.w3.ptr != nullptr)
+                     ? GetExpertMatrixDequantBytes(exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
+                                                   static_cast<int64_t>(exp.hidden_dim))
+                     : 0);
+            if (should_try_cache && cacheable_bytes > 0 && cacheable_bytes <= dequant_cache_budget) {
+                std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> existing_entry;
+                {
+                    std::lock_guard<std::mutex> lock(registry->mutex);
+                    auto it = registry->dequant_cache.find(work.expert_id);
+                    if (it != registry->dequant_cache.end()) {
+                        existing_entry = it->second;
+                        if (existing_entry) {
+                            existing_entry->last_used = ++registry->dequant_cache_use_counter;
+                        }
+                    }
+                }
+
+                if (!existing_entry) {
+                    auto candidate = std::make_shared<MoELayerRegistry::DequantizedExpertCacheEntry>();
+                    candidate->expert_id = work.expert_id;
+                    candidate->bytes = cacheable_bytes;
+                    dequantize_into_buffer(exp.w1.ptr, exp.w1_type, exp.w1_int4,
                                            static_cast<int64_t>(exp.intermediate_dim),
-                                           static_cast<int64_t>(exp.hidden_dim), &candidate->w3);
-                }
-                refresh_cached_tensors(candidate.get(), exp);
-
-                std::lock_guard<std::mutex> lock(registry->mutex);
-                auto it = registry->dequant_cache.find(work.expert_id);
-                if (it != registry->dequant_cache.end()) {
-                    cached_entry = it->second;
-                    if (cached_entry) {
-                        cached_entry->last_used = ++registry->dequant_cache_use_counter;
+                                           static_cast<int64_t>(exp.hidden_dim), &candidate->w1);
+                    dequantize_into_buffer(exp.w2.ptr, exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
+                                           static_cast<int64_t>(exp.intermediate_dim), &candidate->w2);
+                    if (exp.w3.ptr != nullptr) {
+                        dequantize_into_buffer(exp.w3.ptr, exp.w3_type, exp.w3_int4,
+                                               static_cast<int64_t>(exp.intermediate_dim),
+                                               static_cast<int64_t>(exp.hidden_dim), &candidate->w3);
                     }
-                } else if (candidate->bytes <= dequant_cache_budget) {
-                    while (registry->dequant_cache_bytes + candidate->bytes > dequant_cache_budget &&
-                           !registry->dequant_cache.empty()) {
-                        auto evict_it = registry->dequant_cache.end();
-                        uint64_t oldest_use = std::numeric_limits<uint64_t>::max();
-                        for (auto it_cache = registry->dequant_cache.begin(); it_cache != registry->dequant_cache.end();
-                             ++it_cache) {
-                            if (!it_cache->second) {
-                                evict_it = it_cache;
+                    refresh_cached_tensors(candidate.get(), exp);
+
+                    std::lock_guard<std::mutex> lock(registry->mutex);
+                    auto it = registry->dequant_cache.find(work.expert_id);
+                    if (it != registry->dequant_cache.end()) {
+                        cached_entry = it->second;
+                        if (cached_entry) {
+                            cached_entry->last_used = ++registry->dequant_cache_use_counter;
+                        }
+                    } else if (candidate->bytes <= dequant_cache_budget) {
+                        while (registry->dequant_cache_bytes + candidate->bytes > dequant_cache_budget &&
+                               !registry->dequant_cache.empty()) {
+                            auto evict_it = registry->dequant_cache.end();
+                            uint64_t oldest_use = std::numeric_limits<uint64_t>::max();
+                            for (auto it_cache = registry->dequant_cache.begin();
+                                 it_cache != registry->dequant_cache.end(); ++it_cache) {
+                                if (!it_cache->second) {
+                                    evict_it = it_cache;
+                                    break;
+                                }
+                                if (it_cache->second->last_used < oldest_use) {
+                                    oldest_use = it_cache->second->last_used;
+                                    evict_it = it_cache;
+                                }
+                            }
+                            if (evict_it == registry->dequant_cache.end()) {
                                 break;
                             }
-                            if (it_cache->second->last_used < oldest_use) {
-                                oldest_use = it_cache->second->last_used;
-                                evict_it = it_cache;
+                            if (evict_it->second) {
+                                registry->dequant_cache_bytes -=
+                                    std::min(registry->dequant_cache_bytes, evict_it->second->bytes);
                             }
+                            registry->dequant_cache.erase(evict_it);
                         }
-                        if (evict_it == registry->dequant_cache.end()) {
-                            break;
+                        if (registry->dequant_cache_bytes + candidate->bytes <= dequant_cache_budget) {
+                            candidate->last_used = ++registry->dequant_cache_use_counter;
+                            registry->dequant_cache_bytes += candidate->bytes;
+                            registry->dequant_cache.emplace(work.expert_id, candidate);
+                            cached_entry = std::move(candidate);
                         }
-                        if (evict_it->second) {
-                            registry->dequant_cache_bytes -=
-                                std::min(registry->dequant_cache_bytes, evict_it->second->bytes);
-                        }
-                        registry->dequant_cache.erase(evict_it);
                     }
-                    if (registry->dequant_cache_bytes + candidate->bytes <= dequant_cache_budget) {
-                        candidate->last_used = ++registry->dequant_cache_use_counter;
-                        registry->dequant_cache_bytes += candidate->bytes;
-                        registry->dequant_cache.emplace(work.expert_id, candidate);
-                        cached_entry = std::move(candidate);
-                    }
+                } else {
+                    cached_entry = std::move(existing_entry);
                 }
-            } else {
-                cached_entry = std::move(existing_entry);
             }
-        }
 
-        size_t dequantized_bytes = 0;
-        bool dequantized_any = false;
-        Tensor w1;
-        Tensor w2;
-        Tensor w3;
-        if (cached_entry) {
-            w1 = (exp.w1_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
-                 : (exp.w1_type == GGML_TYPE_F32)
-                     ? Tensor::Make2D(exp.w1.ptr, static_cast<int64_t>(exp.intermediate_dim),
-                                      static_cast<int64_t>(exp.hidden_dim))
-                     : cached_entry->w1_tensor;
-            w2 = (exp.w2_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
-                 : (exp.w2_type == GGML_TYPE_F32) ? Tensor::Make2D(exp.w2.ptr, static_cast<int64_t>(exp.hidden_dim),
-                                                                   static_cast<int64_t>(exp.intermediate_dim))
-                                                  : cached_entry->w2_tensor;
-            if (exp.w3.ptr != nullptr) {
-                w3 = (exp.w3_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
-                     : (exp.w3_type == GGML_TYPE_F32)
-                         ? Tensor::Make2D(exp.w3.ptr, static_cast<int64_t>(exp.intermediate_dim),
+            size_t dequantized_bytes = 0;
+            bool dequantized_any = false;
+            Tensor w1;
+            Tensor w2;
+            Tensor w3;
+            if (cached_entry) {
+                w1 = (exp.w1_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
+                     : (exp.w1_type == GGML_TYPE_F32)
+                         ? Tensor::Make2D(exp.w1.ptr, static_cast<int64_t>(exp.intermediate_dim),
                                           static_cast<int64_t>(exp.hidden_dim))
-                         : cached_entry->w3_tensor;
-            }
-            ++cached_experts_this_step;
-        } else {
-            // Skip F32 dequant for ggml-quantized experts — quantized GEMV handles them directly
-            const bool has_ggml_quant_gen = ExpertHasGgmlQuantizedWeights(exp);
-            if (!has_ggml_quant_gen) {
-                w1 = (exp.w1_int4.IsValid() && CanUsePackedInt4MoEFastPath())
-                         ? Tensor()
-                         : make_weight_f32(exp.w1.ptr, exp.w1_type, static_cast<int64_t>(exp.intermediate_dim),
-                                           static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes,
-                                           &dequantized_any);
-                w2 = (exp.w2_int4.IsValid() && CanUsePackedInt4MoEFastPath())
-                         ? Tensor()
-                         : make_weight_f32(exp.w2.ptr, exp.w2_type, static_cast<int64_t>(exp.hidden_dim),
-                                           static_cast<int64_t>(exp.intermediate_dim), w2_dequant, &dequantized_bytes,
-                                           &dequantized_any);
+                         : cached_entry->w1_tensor;
+                w2 = (exp.w2_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
+                     : (exp.w2_type == GGML_TYPE_F32) ? Tensor::Make2D(exp.w2.ptr, static_cast<int64_t>(exp.hidden_dim),
+                                                                       static_cast<int64_t>(exp.intermediate_dim))
+                                                      : cached_entry->w2_tensor;
                 if (exp.w3.ptr != nullptr) {
-                    w3 = (exp.w3_int4.IsValid() && CanUsePackedInt4MoEFastPath())
-                             ? Tensor()
-                             : make_weight_f32(exp.w3.ptr, exp.w3_type, static_cast<int64_t>(exp.intermediate_dim),
-                                               static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes,
-                                               &dequantized_any);
+                    w3 = (exp.w3_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
+                         : (exp.w3_type == GGML_TYPE_F32)
+                             ? Tensor::Make2D(exp.w3.ptr, static_cast<int64_t>(exp.intermediate_dim),
+                                              static_cast<int64_t>(exp.hidden_dim))
+                             : cached_entry->w3_tensor;
                 }
+                ++local_cached_experts;
+            } else {
+                // Skip F32 dequant for ggml-quantized experts -> quantized GEMV handles them directly
+                const bool has_ggml_quant_gen = ExpertHasGgmlQuantizedWeights(exp);
+                if (!has_ggml_quant_gen) {
+                    w1 = (exp.w1_int4.IsValid() && CanUsePackedInt4MoEFastPath())
+                             ? Tensor()
+                             : make_weight_f32(exp.w1.ptr, exp.w1_type, static_cast<int64_t>(exp.intermediate_dim),
+                                               static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes,
+                                               &dequantized_any);
+                    w2 = (exp.w2_int4.IsValid() && CanUsePackedInt4MoEFastPath())
+                             ? Tensor()
+                             : make_weight_f32(exp.w2.ptr, exp.w2_type, static_cast<int64_t>(exp.hidden_dim),
+                                               static_cast<int64_t>(exp.intermediate_dim), w2_dequant,
+                                               &dequantized_bytes, &dequantized_any);
+                    if (exp.w3.ptr != nullptr) {
+                        w3 = (exp.w3_int4.IsValid() && CanUsePackedInt4MoEFastPath())
+                                 ? Tensor()
+                                 : make_weight_f32(exp.w3.ptr, exp.w3_type, static_cast<int64_t>(exp.intermediate_dim),
+                                                   static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes,
+                                                   &dequantized_any);
+                    }
+                }
+                // else: w1/w2/w3 remain empty — DispatchExpertFFNImpl uses quantized GEMV
             }
-            // else: w1/w2/w3 remain empty — DispatchExpertFFNImpl uses quantized GEMV
-        }
-        if (dequantized_any) {
-            moe_stats_total_dequantized_experts_.fetch_add(1, std::memory_order_relaxed);
-            moe_stats_total_dequantized_bytes_.fetch_add(static_cast<uint64_t>(dequantized_bytes),
-                                                         std::memory_order_relaxed);
-        }
-        if (debug_timing) {
-            dequant_duration += (std::chrono::steady_clock::now() - dequant_begin);
+            if (dequantized_any) {
+                moe_stats_total_dequantized_experts_.fetch_add(1, std::memory_order_relaxed);
+                moe_stats_total_dequantized_bytes_.fetch_add(static_cast<uint64_t>(dequantized_bytes),
+                                                             std::memory_order_relaxed);
+            }
+            if (debug_timing) {
+                local_dequant_duration += (std::chrono::steady_clock::now() - dequant_begin);
+            }
+
+            Tensor expert_input = Tensor::Make2D(packed_input + static_cast<size_t>(work.start) * hidden_dim,
+                                                 static_cast<int64_t>(work.count), static_cast<int64_t>(hidden_dim));
+            Tensor expert_out = Tensor::Make2D(packed_output + static_cast<size_t>(work.start) * hidden_dim,
+                                               static_cast<int64_t>(work.count), static_cast<int64_t>(hidden_dim));
+
+            const auto expert_begin =
+                debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            DispatchExpertFFNImpl(this, work.numa_node, expert_input, exp, w1, w2, w3, &expert_out,
+                                  allow_inner_parallel);
+            if (debug_timing) {
+                local_expert_duration += (std::chrono::steady_clock::now() - expert_begin);
+            }
         }
 
-        Tensor expert_input = Tensor::Make2D(packed_input + static_cast<size_t>(work.start) * hidden_dim,
-                                             static_cast<int64_t>(work.count), static_cast<int64_t>(hidden_dim));
-        Tensor expert_out = Tensor::Make2D(packed_output + static_cast<size_t>(work.start) * hidden_dim,
-                                           static_cast<int64_t>(work.count), static_cast<int64_t>(hidden_dim));
-
-        const auto expert_begin =
-            debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        DispatchExpertFFNImpl(this, work.numa_node, expert_input, exp, w1, w2, w3, &expert_out);
-        if (debug_timing) {
-            expert_duration += (std::chrono::steady_clock::now() - expert_begin);
+        if (parallelize_experts) {
+            std::lock_guard<std::mutex> lock(work_stats_mutex);
+            cached_experts_this_step += local_cached_experts;
+            dequant_duration += local_dequant_duration;
+            expert_duration += local_expert_duration;
+        } else {
+            cached_experts_this_step += local_cached_experts;
+            dequant_duration += local_dequant_duration;
+            expert_duration += local_expert_duration;
         }
+    };
+
+    if (parallelize_experts) {
+        reorder_pool.ParallelFor(static_cast<int>(active_work.size()),
+                                 [&](int start, int end, int) { run_active_work_range(start, end, false); });
+    } else {
+        run_active_work_range(0, static_cast<int>(active_work.size()), true);
     }
     if (cached_experts_this_step > 0) {
         moe_stats_total_cached_experts_.fetch_add(cached_experts_this_step, std::memory_order_relaxed);

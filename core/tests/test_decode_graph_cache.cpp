@@ -110,8 +110,9 @@ private:
     std::string prev_value_;
 };
 
-bool ShouldUsePagedDecodeAttentionForTestBatch(const TransformerModel* model) {
-    const BatchSpec batch = MakeDecodeOnlyBatch(/*num_seqs=*/2, /*n_past=*/BLOCK_SIZE);
+bool ShouldUsePagedDecodeAttentionForTestBatch(const TransformerModel* model, int num_seqs = 2,
+                                               int n_past = BLOCK_SIZE) {
+    const BatchSpec batch = MakeDecodeOnlyBatch(num_seqs, n_past);
     PagedKVCache cache{};
     cache.cache_type = GGML_TYPE_F16;
     cache.max_blocks = 8;
@@ -193,4 +194,26 @@ TEST(DecodeGraphCachePolicyTest, NonGemmaInferenceDecisionUsesPagedDecodeWhenPol
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", nullptr);
 
     EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&llama));
+}
+
+TEST(DecodeGraphCachePolicyTest, AutoModeAllowsShortBatchedDecodeWithSeparateThreshold) {
+    const TransformerModel llama = MakeDecodeModel(false);
+    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
+    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
+    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "auto");
+    ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", "128");
+    ScopedEnvOverride min_batch_ctx_env("DENSECORE_PAGED_DECODE_MIN_BATCH_CONTEXT", "64");
+
+    EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&llama, /*num_seqs=*/2, /*n_past=*/63));
+}
+
+TEST(DecodeGraphCachePolicyTest, AutoModeKeepsShortSingleDecodeOnStandardPath) {
+    const TransformerModel llama = MakeDecodeModel(false);
+    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
+    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
+    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "auto");
+    ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", "128");
+    ScopedEnvOverride min_batch_ctx_env("DENSECORE_PAGED_DECODE_MIN_BATCH_CONTEXT", "64");
+
+    EXPECT_FALSE(ShouldUsePagedDecodeAttentionForTestBatch(&llama, /*num_seqs=*/1, /*n_past=*/63));
 }

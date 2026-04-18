@@ -240,6 +240,7 @@ func completionRequestToChatRequest(req domain.CompletionRequest) domain.ChatCom
 	return domain.ChatCompletionRequest{
 		Model:                req.Model,
 		Messages:             []domain.Message{{Role: "user", Content: req.Prompt}},
+		RawPrompt:            req.Prompt,
 		MaxTokens:            req.MaxTokens,
 		Temperature:          req.Temperature,
 		TopP:                 req.TopP,
@@ -252,6 +253,7 @@ func completionRequestToChatRequest(req domain.CompletionRequest) domain.ChatCom
 		Stream:               req.Stream,
 		ResponseFormat:       req.ResponseFormat,
 		ExpertCluster:        req.ExpertCluster,
+		ParityMode:           req.ParityMode,
 		TemperatureSet:       req.TemperatureSet,
 		TopPSet:              req.TopPSet,
 		TopKSet:              req.TopKSet,

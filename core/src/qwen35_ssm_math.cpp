@@ -58,6 +58,60 @@ bool Qwen35CanonicalizeHeadByEmbd(const float* raw, const int64_t ne[4], int n_e
     return false;
 }
 
+bool Qwen35CanonicalizeFusedBA(const float* raw, const int64_t ne[4], int n_embd, int n_v_heads, int n_groups,
+                               std::vector<float>* beta_out, std::vector<float>* alpha_out) {
+    if (!raw || !ne || !beta_out || !alpha_out || n_embd <= 0 || n_v_heads <= 0 || n_groups <= 0 || ne[2] != 1 ||
+        ne[3] != 1 || (n_v_heads % n_groups) != 0) {
+        return false;
+    }
+
+    const int heads_per_group = n_v_heads / n_groups;
+    const int fused_width = 2 * n_v_heads;
+    beta_out->assign(static_cast<size_t>(n_embd) * static_cast<size_t>(n_v_heads), 0.0f);
+    alpha_out->assign(static_cast<size_t>(n_embd) * static_cast<size_t>(n_v_heads), 0.0f);
+
+    auto beta_slot = [&](int head_idx) { return beta_out->data() + static_cast<size_t>(head_idx) * n_embd; };
+    auto alpha_slot = [&](int head_idx) { return alpha_out->data() + static_cast<size_t>(head_idx) * n_embd; };
+
+    if (ne[0] == n_embd && ne[1] == fused_width) {
+        for (int group = 0; group < n_groups; ++group) {
+            const int group_base = group * heads_per_group;
+            const int fused_base = group * (2 * heads_per_group);
+            for (int local_head = 0; local_head < heads_per_group; ++local_head) {
+                const int head_idx = group_base + local_head;
+                const int beta_col = fused_base + local_head;
+                const int alpha_col = fused_base + heads_per_group + local_head;
+                std::copy(raw + static_cast<size_t>(beta_col) * n_embd,
+                          raw + static_cast<size_t>(beta_col + 1) * n_embd, beta_slot(head_idx));
+                std::copy(raw + static_cast<size_t>(alpha_col) * n_embd,
+                          raw + static_cast<size_t>(alpha_col + 1) * n_embd, alpha_slot(head_idx));
+            }
+        }
+        return true;
+    }
+
+    if (ne[0] == fused_width && ne[1] == n_embd) {
+        for (int group = 0; group < n_groups; ++group) {
+            const int group_base = group * heads_per_group;
+            const int fused_base = group * (2 * heads_per_group);
+            for (int local_head = 0; local_head < heads_per_group; ++local_head) {
+                const int head_idx = group_base + local_head;
+                const int beta_row = fused_base + local_head;
+                const int alpha_row = fused_base + heads_per_group + local_head;
+                for (int embd_idx = 0; embd_idx < n_embd; ++embd_idx) {
+                    beta_slot(head_idx)[embd_idx] = raw[static_cast<size_t>(embd_idx) * fused_width + beta_row];
+                    alpha_slot(head_idx)[embd_idx] = raw[static_cast<size_t>(embd_idx) * fused_width + alpha_row];
+                }
+            }
+        }
+        return true;
+    }
+
+    beta_out->clear();
+    alpha_out->clear();
+    return false;
+}
+
 bool Qwen35CanonicalizePerHeadVector(const float* raw, const int64_t ne[4], int n_heads, std::vector<float>* out) {
     if (!raw || !out || !IsVectorShape(ne, n_heads)) {
         return false;

@@ -46,6 +46,15 @@ constexpr ModelDescriptor kDescriptors[] = {
      true,
      true,
      {.requires_q_norm = true, .requires_k_norm = true}},
+    {ModelVariant::QWEN3NEXT,
+     ModelArch::QWEN35,
+     "qwen3next",
+     TokenizerFamily::QWEN_BYTE_BPE,
+     PromptTemplateFamily::CHATML,
+     false,
+     false,
+     false,
+     {.requires_q_norm = true, .requires_k_norm = true, .is_hybrid_ssm = true}},
     {ModelVariant::QWEN35,
      ModelArch::QWEN35,
      "qwen35",
@@ -197,9 +206,18 @@ ModelVariant InferVariantFromModel(const TransformerModel* model) {
     }
 }
 
-}  // namespace
+bool ShouldUpgradeGemmaToGemma4(std::string_view arch_name, const ModelDetectionHints& hints) {
+    const std::string lowered = AsciiLower(arch_name);
+    if (lowered == "gemma4" || lowered == "gemma4_text") {
+        return true;
+    }
+    if (lowered != "gemma" && lowered != "gemma2" && lowered != "unknown") {
+        return false;
+    }
+    return hints.has_gemma4_metadata || hints.has_gemma4_tensor_signatures || hints.has_gemma4_tokenizer_hint;
+}
 
-ResolvedModelDescriptor ResolveModelDescriptor(std::string_view arch_name) {
+ResolvedModelDescriptor ResolveModelDescriptorFromArchName(std::string_view arch_name) {
     const std::string lowered = AsciiLower(arch_name);
 
     const auto make_result = [](const ModelDescriptor& descriptor) {
@@ -215,6 +233,10 @@ ResolvedModelDescriptor ResolveModelDescriptor(std::string_view arch_name) {
     }
     if (MatchesAny(lowered, std::array<std::string_view, 3>{"qwen3", "qwen3_moe", "qwen3moe"})) {
         return make_result(DescribeModelVariant(ModelVariant::QWEN3));
+    }
+    if (MatchesAny(lowered, std::array<std::string_view, 6>{"qwen3next", "qwen3_next", "qwen3-next", "qwen3codernext",
+                                                            "qwen3_coder_next", "qwen3-coder-next"})) {
+        return make_result(DescribeModelVariant(ModelVariant::QWEN3NEXT));
     }
     if (MatchesAny(lowered, std::array<std::string_view, 7>{"qwen35", "qwen3.5", "qwen35moe", "qwen35_moe",
                                                             "qwen3.5_moe", "qwen3_5_moe", "qwen3_5_moe_text"})) {
@@ -258,6 +280,25 @@ ResolvedModelDescriptor ResolveModelDescriptor(std::string_view arch_name) {
     }
 
     return {};
+}
+
+}  // namespace
+
+ResolvedModelDescriptor ResolveModelDescriptor(std::string_view arch_name) {
+    return ResolveModelDescriptorWithHints(arch_name, {});
+}
+
+ResolvedModelDescriptor ResolveModelDescriptorWithHints(std::string_view arch_name, const ModelDetectionHints& hints,
+                                                        bool* used_hint_upgrade) {
+    ResolvedModelDescriptor resolved = ResolveModelDescriptorFromArchName(arch_name);
+    const bool upgraded = ShouldUpgradeGemmaToGemma4(arch_name, hints) && resolved.variant != ModelVariant::GEMMA4;
+    if (upgraded) {
+        resolved = ResolveModelDescriptorFromArchName("gemma4");
+    }
+    if (used_hint_upgrade) {
+        *used_hint_upgrade = upgraded;
+    }
+    return resolved;
 }
 
 const ModelDescriptor& DescribeModelVariant(ModelVariant variant) {
@@ -345,22 +386,54 @@ TokenizerFamily ResolveTokenizerFamily(const TransformerModel* model) {
 }
 
 PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model) {
+    const auto& descriptor = DescribeModel(model);
     if (model) {
         const PromptTemplateFamily metadata_family =
             ResolvePromptTemplateFamilyFromMetadata(model->tokenizer_type, model->chat_template);
-        if (metadata_family != PromptTemplateFamily::PLAIN || !model->chat_template.empty() ||
+        const bool has_explicit_chat_template = !model->chat_template.empty();
+        if (descriptor.variant == ModelVariant::GEMMA4) {
+            if (has_explicit_chat_template && metadata_family != PromptTemplateFamily::PLAIN) {
+                return metadata_family;
+            }
+            return PromptTemplateFamily::TURN_TAGS;
+        }
+        if (metadata_family != PromptTemplateFamily::PLAIN || has_explicit_chat_template ||
             !model->tokenizer_type.empty()) {
             return metadata_family;
         }
     }
-    return DescribeModel(model).prompt_template_family;
+    return descriptor.prompt_template_family;
 }
 
 bool IsKnownTokenizerModel(std::string_view tokenizer_name) {
     const std::string lowered = AsciiLower(tokenizer_name);
-    static constexpr std::array<std::string_view, 11> kKnown = {
-        "llama", "gpt2", "qwen2", "qwen3", "qwen35", "mistral", "gemma", "gemma4", "bpe", "glm4", "glm"};
+    static constexpr std::array<std::string_view, 12> kKnown = {
+        "llama", "gpt2", "qwen2", "qwen3", "qwen3next", "qwen35", "mistral", "gemma", "gemma4", "bpe", "glm4", "glm"};
     return MatchesAny(lowered, kKnown);
+}
+
+const char* ModelVariantName(ModelVariant variant) {
+    switch (variant) {
+    case ModelVariant::LLAMA: return "llama";
+    case ModelVariant::QWEN2: return "qwen2";
+    case ModelVariant::QWEN3: return "qwen3";
+    case ModelVariant::QWEN3NEXT: return "qwen3next";
+    case ModelVariant::QWEN35: return "qwen35";
+    case ModelVariant::GLM4_MOE: return "glm4_moe";
+    case ModelVariant::GLM5_DSA: return "glm5_dsa";
+    case ModelVariant::MISTRAL: return "mistral";
+    case ModelVariant::GEMMA: return "gemma";
+    case ModelVariant::GEMMA4: return "gemma4";
+    case ModelVariant::PHI: return "phi";
+    case ModelVariant::VIT: return "vit";
+    case ModelVariant::CLIP_VISION: return "clip_vision";
+    case ModelVariant::SIGLIP: return "siglip";
+    case ModelVariant::WHISPER: return "whisper";
+    case ModelVariant::LLAVA: return "llava";
+    case ModelVariant::QWEN_VL: return "qwen_vl";
+    case ModelVariant::UNKNOWN:
+    default: return "unknown";
+    }
 }
 
 const char* TokenizerFamilyName(TokenizerFamily family) {
@@ -373,6 +446,16 @@ const char* TokenizerFamilyName(TokenizerFamily family) {
     case TokenizerFamily::GLM_BYTE_BPE: return "glm_byte_bpe";
     case TokenizerFamily::UNKNOWN:
     default: return "unknown";
+    }
+}
+
+const char* PromptTemplateFamilyName(PromptTemplateFamily family) {
+    switch (family) {
+    case PromptTemplateFamily::PLAIN: return "plain";
+    case PromptTemplateFamily::CHATML: return "chatml";
+    case PromptTemplateFamily::ROLE_TAGS: return "role_tags";
+    case PromptTemplateFamily::TURN_TAGS: return "turn_tags";
+    default: return "plain";
     }
 }
 
