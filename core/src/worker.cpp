@@ -63,6 +63,14 @@ bool IsRuntimePathLoggingEnabled() {
     return enabled;
 }
 
+bool IsSchedulerStallDebugEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_SCHEDULER_STALL_DEBUG");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
 bool IsMoEPathTraceDumpEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_MOE_TRACE_DUMP");
@@ -1593,6 +1601,35 @@ void EngineLoop(EngineState* state) {
             deps.mixed_operation_routing = false;
             batch.deps = &deps;
 
+            struct BatchBuildStats {
+                int scheduled_prefill_count = 0;
+                int scheduled_decode_count = 0;
+                int built_batch_count = 0;
+                int skipped_block_writable_count = 0;
+                int skipped_finished_count = 0;
+                int skipped_cancelled_count = 0;
+                int skipped_mixed_embedding_count = 0;
+                int skipped_missing_request_count = 0;
+                std::vector<Request*> stalled_requests;
+                std::vector<int> missing_seq_ids;
+
+                int scheduled_total() const { return scheduled_prefill_count + scheduled_decode_count; }
+            } batch_build_stats;
+
+            auto note_batch_build_stall = [&](Request* req) {
+                if (!req) {
+                    return;
+                }
+                req->batch_build_stall_count++;
+                batch_build_stats.stalled_requests.push_back(req);
+            };
+            auto reset_batch_build_stall = [&](Request* req) {
+                if (!req) {
+                    return;
+                }
+                req->batch_build_stall_count = 0;
+            };
+
             for (const auto& chunk : sched_output.prefill_chunk_info) {
                 if (chunk.seq_id >= 0 && chunk.chunk_tokens > 0) {
                     prefill_chunk_tokens[chunk.seq_id] = chunk.chunk_tokens;
@@ -1667,19 +1704,34 @@ void EngineLoop(EngineState* state) {
 
             // Process prefill sequences
             for (int seq_id : sched_output.prefill_seq_ids) {
+                batch_build_stats.scheduled_prefill_count++;
                 auto req_it = seq_to_request.find(seq_id);
-                if (req_it == seq_to_request.end()) continue;
+                if (req_it == seq_to_request.end()) {
+                    batch_build_stats.skipped_missing_request_count++;
+                    batch_build_stats.missing_seq_ids.push_back(seq_id);
+                    continue;
+                }
 
                 Request* req = req_it->second;
                 LOG_TRACE("Prefill loop: Found request {} for seq {} (finished={})", req->id, seq_id, req->finished);
-                if (req->finished) continue;
-                if (req->cancelled.load(std::memory_order_relaxed)) continue;
+                if (req->finished) {
+                    batch_build_stats.skipped_finished_count++;
+                    note_batch_build_stall(req);
+                    continue;
+                }
+                if (req->cancelled.load(std::memory_order_relaxed)) {
+                    batch_build_stats.skipped_cancelled_count++;
+                    note_batch_build_stall(req);
+                    continue;
+                }
 
                 // Enforce homogeneous batch type
                 if (first_request) {
                     is_embedding_batch = req->is_embedding;
                     first_request = false;
                 } else if (req->is_embedding != is_embedding_batch) {
+                    batch_build_stats.skipped_mixed_embedding_count++;
+                    note_batch_build_stall(req);
                     continue;  // Skip mixed types
                 }
 
@@ -1691,6 +1743,8 @@ void EngineLoop(EngineState* state) {
                 if (tokens_to_take <= 0) continue;
 
                 if (!ensure_request_blocks_writable(req, req->n_past, tokens_to_take)) {
+                    batch_build_stats.skipped_block_writable_count++;
+                    note_batch_build_stall(req);
                     LOG_WARN("Skipping req {} in prefill: failed to ensure writable KV blocks (seq_id={}, n_past={}, "
                              "tokens={})",
                              req->id, seq_id, req->n_past, tokens_to_take);
@@ -1733,6 +1787,8 @@ void EngineLoop(EngineState* state) {
                                                                                           : &req->ssm_runtime_states);
                 batch_requests.push_back(req);
                 batch_token_counts.push_back(tokens_to_take);
+                batch_build_stats.built_batch_count++;
+                reset_batch_build_stall(req);
 
                 GenericInput input;
                 input.kind = BatchInputKind::Tokens;
@@ -1742,24 +1798,41 @@ void EngineLoop(EngineState* state) {
 
             // Process decode sequences
             for (int seq_id : sched_output.decode_seq_ids) {
+                batch_build_stats.scheduled_decode_count++;
                 auto req_it = seq_to_request.find(seq_id);
-                if (req_it == seq_to_request.end()) continue;
+                if (req_it == seq_to_request.end()) {
+                    batch_build_stats.skipped_missing_request_count++;
+                    batch_build_stats.missing_seq_ids.push_back(seq_id);
+                    continue;
+                }
 
                 Request* req = req_it->second;
                 LOG_TRACE("Decode loop: Found request {} for seq {} (finished={})", req->id, seq_id, req->finished);
-                if (req->finished) continue;
-                if (req->cancelled.load(std::memory_order_relaxed)) continue;
+                if (req->finished) {
+                    batch_build_stats.skipped_finished_count++;
+                    note_batch_build_stall(req);
+                    continue;
+                }
+                if (req->cancelled.load(std::memory_order_relaxed)) {
+                    batch_build_stats.skipped_cancelled_count++;
+                    note_batch_build_stall(req);
+                    continue;
+                }
 
                 // Enforce homogeneous batch type
                 if (first_request) {
                     is_embedding_batch = req->is_embedding;
                     first_request = false;
                 } else if (req->is_embedding != is_embedding_batch) {
+                    batch_build_stats.skipped_mixed_embedding_count++;
+                    note_batch_build_stall(req);
                     continue;
                 }
 
                 // Decode: single token
                 if (!ensure_request_blocks_writable(req, req->n_past, 1)) {
+                    batch_build_stats.skipped_block_writable_count++;
+                    note_batch_build_stall(req);
                     LOG_WARN("Skipping req {} in decode: failed to ensure writable KV block (seq_id={}, n_past={})",
                              req->id, seq_id, req->n_past);
                     continue;
@@ -1776,6 +1849,8 @@ void EngineLoop(EngineState* state) {
                                                                                           : &req->ssm_runtime_states);
                 batch_requests.push_back(req);
                 batch_token_counts.push_back(1);
+                batch_build_stats.built_batch_count++;
+                reset_batch_build_stall(req);
 
                 GenericInput input;
                 input.kind = BatchInputKind::Tokens;
@@ -1786,6 +1861,101 @@ void EngineLoop(EngineState* state) {
             }
 
             if (batch_requests.empty()) {
+                std::sort(batch_build_stats.stalled_requests.begin(), batch_build_stats.stalled_requests.end());
+                batch_build_stats.stalled_requests.erase(
+                    std::unique(batch_build_stats.stalled_requests.begin(), batch_build_stats.stalled_requests.end()),
+                    batch_build_stats.stalled_requests.end());
+                std::sort(batch_build_stats.missing_seq_ids.begin(), batch_build_stats.missing_seq_ids.end());
+                batch_build_stats.missing_seq_ids.erase(
+                    std::unique(batch_build_stats.missing_seq_ids.begin(), batch_build_stats.missing_seq_ids.end()),
+                    batch_build_stats.missing_seq_ids.end());
+
+                if (batch_build_stats.scheduled_total() > 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    long oldest_idle_ms = 0;
+                    long max_build_stall_loops = 0;
+                    for (Request* req : batch_build_stats.stalled_requests) {
+                        if (!req || req->finished) {
+                            continue;
+                        }
+                        const auto last_progress = (req->last_progress_time == std::chrono::steady_clock::time_point())
+                                                       ? req->start_time
+                                                       : req->last_progress_time;
+                        const long idle_ms =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_progress).count();
+                        oldest_idle_ms = std::max(oldest_idle_ms, idle_ms);
+                        max_build_stall_loops =
+                            std::max<long>(max_build_stall_loops, static_cast<long>(req->batch_build_stall_count));
+                    }
+
+                    const bool should_fail =
+                        oldest_idle_ms >=
+                        std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleFailAfter).count();
+                    const bool should_log =
+                        IsSchedulerStallDebugEnabled() ||
+                        oldest_idle_ms >=
+                            std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleWarnAfter).count();
+
+                    if (should_log || should_fail) {
+                        const std::string scheduler_state = state->DescribeSchedulerState();
+                        const std::string active_state = state->DescribeActiveRequests();
+                        std::ostringstream skip_summary_stream;
+                        skip_summary_stream << "scheduled[prefill=" << batch_build_stats.scheduled_prefill_count
+                                            << ",decode=" << batch_build_stats.scheduled_decode_count << "] built="
+                                            << batch_build_stats.built_batch_count
+                                            << " skipped[block_writable="
+                                            << batch_build_stats.skipped_block_writable_count
+                                            << ",finished=" << batch_build_stats.skipped_finished_count
+                                            << ",cancelled=" << batch_build_stats.skipped_cancelled_count
+                                            << ",mixed_embedding="
+                                            << batch_build_stats.skipped_mixed_embedding_count
+                                            << ",missing_request="
+                                            << batch_build_stats.skipped_missing_request_count
+                                            << "] max_build_stall_loops=" << max_build_stall_loops;
+                        const std::string skip_summary = skip_summary_stream.str();
+                        if (should_fail) {
+                            LOG_ERROR("Batch construction stalled after {} ms with {}. {} {}", oldest_idle_ms,
+                                      skip_summary, scheduler_state, active_state);
+                        } else {
+                            LOG_WARN("Batch construction skipped all scheduled work after {} ms with {}. {} {}",
+                                     oldest_idle_ms, skip_summary, scheduler_state, active_state);
+                        }
+                    }
+
+                    if (should_fail) {
+                        for (Request* req : batch_build_stats.stalled_requests) {
+                            if (!req || req->finished) {
+                                continue;
+                            }
+                            LOG_ERROR("Failing batch-build-stalled request {} (seq_id={}, prefill={}, tokens={}, "
+                                      "n_past={}, generated={}, build_stall_loops={})",
+                                      req->id, req->seq_id, req->is_prefill, req->tokens.size(), req->n_past,
+                                      req->generated_count, req->batch_build_stall_count);
+                            req->finished = true;
+                            state->metrics.failed_requests++;
+                            emit_result_event(req, "Error: Scheduler scheduled work but batch construction stalled", -1,
+                                              true, true);
+                            if (!req->block_table.empty()) {
+                                current_kv_cache->block_manager->Free(req->block_table);
+                                req->block_table.clear();
+                            }
+                            if (req->seq_id >= 0) {
+                                state->scheduler->RemoveRequest(req->seq_id, false);
+                                seq_to_request.erase(req->seq_id);
+                            }
+                            {
+                                std::lock_guard<std::mutex> lk(req->mu);
+                                req->cv.notify_all();
+                            }
+                        }
+                        for (int missing_seq_id : batch_build_stats.missing_seq_ids) {
+                            state->scheduler->RemoveRequest(missing_seq_id, false);
+                            seq_to_request.erase(missing_seq_id);
+                        }
+                        reap_finished_requests();
+                        continue;
+                    }
+                }
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
                 continue;
             }
@@ -2799,8 +2969,38 @@ void EngineLoop(EngineState* state) {
             const auto compute_begin = std::chrono::steady_clock::now();
             ValidateMulNodesOrThrow(gf, is_decode_batch ? "decode" : "prefill");
             MaybeLogMoEGraphSummary(gf, current_model, is_prefill_batch);
+            ResetMoEStrictFailure();
             ggml_backend_graph_compute(active_backend, gf);
             const auto compute_end = std::chrono::steady_clock::now();
+            std::string moe_strict_failure;
+            if (ConsumeMoEStrictFailure(&moe_strict_failure)) {
+                if (moe_strict_failure.empty()) {
+                    moe_strict_failure = "MoE strict mode failure";
+                }
+                LOG_ERROR("Failing batch after MoE strict failure: {}", moe_strict_failure);
+                for (Request* req : batch_requests) {
+                    if (!req || req->finished) {
+                        continue;
+                    }
+                    req->finished = true;
+                    state->metrics.failed_requests++;
+                    emit_result_event(req, "Error: " + moe_strict_failure, -1, true, true);
+                    if (!req->block_table.empty()) {
+                        current_kv_cache->block_manager->Free(req->block_table);
+                        req->block_table.clear();
+                    }
+                    if (req->seq_id >= 0) {
+                        state->scheduler->RemoveRequest(req->seq_id, false);
+                        seq_to_request.erase(req->seq_id);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(req->mu);
+                        req->cv.notify_all();
+                    }
+                }
+                reap_finished_requests();
+                continue;
+            }
             if (Request* trace_req = !batch_requests.empty() ? batch_requests[0] : nullptr) {
                 LogPrefillStage("after_prefill_backend_execute", trace_req, current_model, &state->inference_ctx,
                                 input_base, input_span_bytes, output, is_prefill_batch, active_threads);

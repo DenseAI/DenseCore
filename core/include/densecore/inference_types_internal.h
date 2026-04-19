@@ -64,6 +64,7 @@ struct MoEUserData {
     const densecore::CpuBackend::ExpertWeights* experts = nullptr;
     int n_experts = 0;
     bool experts_registered = false;
+    bool test_force_empty_routing = false;
 };
 
 // Allocate MoE user data from graph context

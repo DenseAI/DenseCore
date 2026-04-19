@@ -338,6 +338,24 @@ uint64_t GetMoECallbackEntryCounter();
 uint64_t GetMoECallbackMissingUserdataCounter();
 uint64_t GetMoECallbackMissingBackendCounter();
 uint64_t GetMoECallbackMissingExpertsCounter();
+uint64_t GetMoECallbackRoutingFailureCounter();
+uint64_t GetMoECallbackEmptyRoutingCounter();
+uint64_t GetMoECallbackFailClosedCounter();
+bool ConsumeMoEStrictFailure(std::string* message);
+void ResetMoEStrictFailure();
+
+namespace densecore::testing {
+struct Gemma4MoEBranchInputsSnapshot {
+    std::vector<float> shared_input;
+    std::vector<float> routed_input;
+};
+
+Gemma4MoEBranchInputsSnapshot ComputeGemma4MoEBranchInputsForTest(const std::vector<float>& attn_post_residual,
+                                                                  const std::vector<float>& inp_ff,
+                                                                  const std::vector<float>& ffn_norm_weight,
+                                                                  const std::vector<float>& pre_moe_norm_weight,
+                                                                  float eps);
+}  // namespace densecore::testing
 
 // ============================================================================
 // Internal Ops Exposed for Graph Builders

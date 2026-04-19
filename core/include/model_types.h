@@ -214,6 +214,8 @@ static constexpr const char* kGemma4PerLayerInputGate = "gemma4.per_layer_input_
 static constexpr const char* kGemma4PerLayerProjection = "gemma4.per_layer_projection.weight";
 static constexpr const char* kGemma4PostPerLayerInputNorm = "gemma4.post_per_layer_input_norm.weight";
 static constexpr const char* kGemma4LayerOutputScale = "gemma4.layer_output_scale.weight";
+static constexpr const char* kGemma4PackedGateUpExpert = "gemma4.ffn_gate_up_expert.weight";
+static constexpr const char* kGemma4PackedDownScale = "gemma4.ffn_down_expert.scale";
 }  // namespace model_keys
 
 // ============================================================================

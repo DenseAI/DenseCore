@@ -87,7 +87,10 @@ enum class MoEWiringReasonCode : int {
 
 bool IsMoEWiringDebugEnabled() {
     static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_DEBUG_MOE_WIRING");
+        const char* env = std::getenv("DENSECORE_MOE_WIRING_DEBUG");
+        if (!env || env[0] == '\0') {
+            env = std::getenv("DENSECORE_DEBUG_MOE_WIRING");
+        }
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
@@ -5246,9 +5249,10 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             struct ggml_tensor* gemma_pre_moe_norm = model->layers[il].Get(kGemma4PreMoeNormKey);
             struct ggml_tensor* gemma_post_shared_norm = model->layers[il].Get(kGemma4PostSharedNormKey);
             struct ggml_tensor* gemma_post_moe_norm = model->layers[il].Get(kGemma4PostMoeNormKey);
-            struct ggml_tensor* moe_input = cur;
+            struct ggml_tensor* shared_input = cur;
+            struct ggml_tensor* routed_input = cur;
             if (is_gemma4_moe && gemma_pre_moe_norm) {
-                moe_input =
+                routed_input =
                     apply_weighted_rms_norm(inpFF, gemma_pre_moe_norm, "gemma4_pre_feedforward_layernorm_2", il);
             }
             struct ggml_tensor* router_input = cur;
@@ -5315,6 +5319,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 if (!moe_ud->backend) {
                     moe_ud->backend = dynamic_cast<densecore::CpuBackend*>(registry.Get(densecore::DeviceType::CPU));
                 }
+                if (!moe_ud->backend) {
+                    moe_ud->backend = &densecore::GetTelemetryCpuBackend();
+                }
                 if (moe_ud->backend) {
                     const densecore::CpuBackend::ExpertWeights* registered_experts = nullptr;
                     int registered_count = 0;
@@ -5340,7 +5347,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             // Use map_custom2: src0=cur, src1=gate_logits
             // Use 1 task (single thread dispatch, threaded inside backend)
             g_moe_graph_wiring_debug_counter.fetch_add(1, std::memory_order_relaxed);
-            cur = ggml_map_custom2(ctx_c, moe_input, gate_logits, cb_moe_forward, 1, moe_ud);
+            cur = ggml_map_custom2(ctx_c, routed_input, gate_logits, cb_moe_forward, 1, moe_ud);
             {
                 char moe_name[64];
                 std::snprintf(moe_name, sizeof(moe_name), "blk.%d.moe_forward", il);
@@ -5352,12 +5359,12 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 if (!is_gemma4_moe && !ffn_shared_gate) {
                     throw densecore::InvalidArgumentException("Missing shared expert gate weight in TransformerLayer");
                 }
-                struct ggml_tensor* shared_gate = smart_mul_mat(ctx_c, ffn_gate, moe_input, model);
-                struct ggml_tensor* shared_up = smart_mul_mat(ctx_c, ffn_up, moe_input, model);
+                struct ggml_tensor* shared_gate = smart_mul_mat(ctx_c, ffn_gate, shared_input, model);
+                struct ggml_tensor* shared_up = smart_mul_mat(ctx_c, ffn_up, shared_input, model);
                 if (ShouldRunFfnProjectionReferenceProbe(il)) {
                     ProjectionReferenceUserData* shared_gate_ref_ud = GetProjectionReferenceUserData();
                     shared_gate_ref_ud->weight_tensor = ffn_gate;
-                    shared_gate_ref_ud->input_tensor = moe_input;
+                    shared_gate_ref_ud->input_tensor = shared_input;
                     shared_gate_ref_ud->layer_idx = il;
                     shared_gate_ref_ud->token_seq_ids = batch.seq_id.data();
                     shared_gate_ref_ud->stage = "shared_expert_gate_proj";
@@ -5367,7 +5374,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
                     ProjectionReferenceUserData* shared_up_ref_ud = GetProjectionReferenceUserData();
                     shared_up_ref_ud->weight_tensor = ffn_up;
-                    shared_up_ref_ud->input_tensor = moe_input;
+                    shared_up_ref_ud->input_tensor = shared_input;
                     shared_up_ref_ud->layer_idx = il;
                     shared_up_ref_ud->token_seq_ids = batch.seq_id.data();
                     shared_up_ref_ud->stage = "shared_expert_up_proj";
@@ -5406,12 +5413,12 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                                                       il);
                     }
                 } else {
-                    struct ggml_tensor* shared_gate_logits = smart_mul_mat(ctx_c, ffn_shared_gate, moe_input, model);
+                    struct ggml_tensor* shared_gate_logits = smart_mul_mat(ctx_c, ffn_shared_gate, shared_input, model);
                     struct ggml_tensor* shared_gate_logits_scalar = shared_gate_logits;
                     if (ShouldRunFfnProjectionReferenceProbe(il)) {
                         ProjectionReferenceUserData* shared_scalar_gate_ref_ud = GetProjectionReferenceUserData();
                         shared_scalar_gate_ref_ud->weight_tensor = ffn_shared_gate;
-                        shared_scalar_gate_ref_ud->input_tensor = moe_input;
+                        shared_scalar_gate_ref_ud->input_tensor = shared_input;
                         shared_scalar_gate_ref_ud->layer_idx = il;
                         shared_scalar_gate_ref_ud->token_seq_ids = batch.seq_id.data();
                         shared_scalar_gate_ref_ud->stage = "shared_expert_scalar_gate_proj";
@@ -6405,3 +6412,58 @@ uint64_t GetMoECallbackMissingBackendCounter() {
 uint64_t GetMoECallbackMissingExpertsCounter() {
     return ::GetMoECallbackMissingExpertsCount();
 }
+
+uint64_t GetMoECallbackRoutingFailureCounter() {
+    return ::GetMoECallbackRoutingFailureCount();
+}
+
+uint64_t GetMoECallbackEmptyRoutingCounter() {
+    return ::GetMoECallbackEmptyRoutingCount();
+}
+
+uint64_t GetMoECallbackFailClosedCounter() {
+    return ::GetMoECallbackFailClosedCount();
+}
+
+bool ConsumeMoEStrictFailure(std::string* message) {
+    return ::ConsumeMoEStrictFailureState(message);
+}
+
+void ResetMoEStrictFailure() {
+    ::ResetMoEStrictFailureState();
+}
+
+namespace densecore::testing {
+namespace {
+std::vector<float> ApplyWeightedRmsNormVectorForTest(const std::vector<float>& src, const std::vector<float>& weight,
+                                                     float eps) {
+    if (src.empty()) {
+        return {};
+    }
+    std::vector<float> out(src.size(), 0.0f);
+    float sum_sq = 0.0f;
+    for (float v : src) {
+        sum_sq += v * v;
+    }
+    const float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(src.size()) + eps);
+    for (size_t i = 0; i < src.size(); ++i) {
+        const float w = i < weight.size() ? weight[i] : 1.0f;
+        out[i] = src[i] * inv_rms * w;
+    }
+    return out;
+}
+}  // namespace
+
+Gemma4MoEBranchInputsSnapshot ComputeGemma4MoEBranchInputsForTest(const std::vector<float>& attn_post_residual,
+                                                                  const std::vector<float>& inp_ff,
+                                                                  const std::vector<float>& ffn_norm_weight,
+                                                                  const std::vector<float>& pre_moe_norm_weight,
+                                                                  float eps) {
+    Gemma4MoEBranchInputsSnapshot snapshot;
+    snapshot.shared_input = ApplyWeightedRmsNormVectorForTest(attn_post_residual, ffn_norm_weight, eps);
+    snapshot.routed_input =
+        pre_moe_norm_weight.empty() ? snapshot.shared_input
+                                    : ApplyWeightedRmsNormVectorForTest(inp_ff, pre_moe_norm_weight, eps);
+    return snapshot;
+}
+}  // namespace densecore::testing

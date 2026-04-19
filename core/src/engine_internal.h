@@ -287,6 +287,7 @@ struct Request {
     bool is_high_priority = false;
     int estimated_length = 0;
     uint64_t empty_schedule_stall_count = 0;
+    uint64_t batch_build_stall_count = 0;
     std::chrono::steady_clock::time_point last_progress_time{};
     int pending_scheduler_progress = 0;
 
@@ -354,6 +355,7 @@ struct Request {
         is_high_priority = false;
         estimated_length = 0;
         empty_schedule_stall_count = 0;
+        batch_build_stall_count = 0;
         last_progress_time = std::chrono::steady_clock::time_point();
         pending_scheduler_progress = 0;
         seq_id = -1;
@@ -694,7 +696,8 @@ struct EngineState {
                 << " cancelled=" << (req->cancelled.load(std::memory_order_relaxed) ? 1 : 0)
                 << " swapped=" << (req->is_swapped ? 1 : 0) << " tokens=" << req->tokens.size()
                 << " n_past=" << req->n_past << " generated=" << req->generated_count
-                << " empty_loops=" << req->empty_schedule_stall_count << "]";
+                << " empty_loops=" << req->empty_schedule_stall_count
+                << " build_stall_loops=" << req->batch_build_stall_count << "]";
         }
         return oss.str();
     }

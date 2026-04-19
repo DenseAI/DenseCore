@@ -256,6 +256,9 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
         w.intermediate_dim = 0;
         w.use_gelu_activation = densecore::models::IsGemma4MoEModel(model, layer);
         w.force_safe_reference = model && model->arch_flags.is_gemma4 && w.use_gelu_activation;
+        w.gate_up_tensor = layer->GetExpert(i, model_keys::kGemma4PackedGateUpExpert);
+        w.w2_scale_tensor = layer->GetExpert(i, model_keys::kGemma4PackedDownScale);
+        w.uses_canonical_gemma4_packed_layout = (w.gate_up_tensor != nullptr);
 
         auto* gw1 = layer->GetExpert(i, model_keys::kFfnGate);
         if (gw1) {
@@ -284,6 +287,10 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
             w.w3_type = static_cast<int>(gw3->type);
             w.w3_tensor = gw3;
             w.w3_int4 = make_int4_binding(gw3, w.hidden_dim, w.intermediate_dim);
+        }
+
+        if (w.w2_scale_tensor) {
+            w.force_safe_reference = true;
         }
 
         experts.push_back(w);
@@ -315,12 +322,24 @@ static std::atomic<uint64_t> g_moe_callback_entry_count{0};
 static std::atomic<uint64_t> g_moe_callback_missing_userdata_count{0};
 static std::atomic<uint64_t> g_moe_callback_missing_backend_count{0};
 static std::atomic<uint64_t> g_moe_callback_missing_experts_count{0};
+static std::atomic<uint64_t> g_moe_callback_routing_failure_count{0};
+static std::atomic<uint64_t> g_moe_callback_empty_routing_count{0};
+static std::atomic<uint64_t> g_moe_callback_fail_closed_count{0};
+static std::atomic<bool> g_moe_strict_failure_pending{false};
+static std::mutex g_moe_strict_failure_mu;
+static std::string g_moe_strict_failure_message;
 
 static void ResetMoECallbackEntryCount() {
     g_moe_callback_entry_count.store(0, std::memory_order_relaxed);
     g_moe_callback_missing_userdata_count.store(0, std::memory_order_relaxed);
     g_moe_callback_missing_backend_count.store(0, std::memory_order_relaxed);
     g_moe_callback_missing_experts_count.store(0, std::memory_order_relaxed);
+    g_moe_callback_routing_failure_count.store(0, std::memory_order_relaxed);
+    g_moe_callback_empty_routing_count.store(0, std::memory_order_relaxed);
+    g_moe_callback_fail_closed_count.store(0, std::memory_order_relaxed);
+    g_moe_strict_failure_pending.store(false, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_moe_strict_failure_mu);
+    g_moe_strict_failure_message.clear();
 }
 
 static uint64_t GetMoECallbackEntryCount() {
@@ -339,16 +358,77 @@ static uint64_t GetMoECallbackMissingExpertsCount() {
     return g_moe_callback_missing_experts_count.load(std::memory_order_relaxed);
 }
 
+static uint64_t GetMoECallbackRoutingFailureCount() {
+    return g_moe_callback_routing_failure_count.load(std::memory_order_relaxed);
+}
+
+static uint64_t GetMoECallbackEmptyRoutingCount() {
+    return g_moe_callback_empty_routing_count.load(std::memory_order_relaxed);
+}
+
+static uint64_t GetMoECallbackFailClosedCount() {
+    return g_moe_callback_fail_closed_count.load(std::memory_order_relaxed);
+}
+
 static bool IsMoEDebugLoggingEnabled() {
-    return ParseTruthyEnv("DENSECORE_DEBUG_MOE_CALLBACKS", false);
+    return ParseTruthyEnv("DENSECORE_DEBUG_MOE", ParseTruthyEnv("DENSECORE_DEBUG_MOE_CALLBACKS", false));
+}
+
+static bool IsMoEStrictModeEnabled() {
+    return ParseTruthyEnv("DENSECORE_MOE_STRICT", false);
 }
 
 static bool IsMoEStageTimingEnabled() {
-    return ParseTruthyEnv("DENSECORE_DEBUG_MOE_STAGE_TIMING", false);
+    return ParseTruthyEnv("DENSECORE_MOE_STAGE_TIMING", ParseTruthyEnv("DENSECORE_DEBUG_MOE_STAGE_TIMING", false));
 }
 
 static bool IsMoEDetailedTraceEnabled() {
     return ParseTruthyEnv("DENSECORE_DEBUG_MOE_TRACE", false);
+}
+
+static void ResetMoEStrictFailureState() {
+    g_moe_strict_failure_pending.store(false, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_moe_strict_failure_mu);
+    g_moe_strict_failure_message.clear();
+}
+
+static bool ConsumeMoEStrictFailureState(std::string* message) {
+    if (!g_moe_strict_failure_pending.exchange(false, std::memory_order_acq_rel)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_moe_strict_failure_mu);
+    if (message) {
+        *message = g_moe_strict_failure_message;
+    }
+    g_moe_strict_failure_message.clear();
+    return true;
+}
+
+static void RecordMoEStrictFailure(const std::string& message) {
+    {
+        std::lock_guard<std::mutex> lock(g_moe_strict_failure_mu);
+        g_moe_strict_failure_message = message;
+    }
+    g_moe_strict_failure_pending.store(true, std::memory_order_release);
+}
+
+static void ZeroFillTensor(struct ggml_tensor* tensor) {
+    if (!tensor || !tensor->data) {
+        return;
+    }
+    std::memset(tensor->data, 0, ggml_nbytes(tensor));
+}
+
+static void FailClosedMoECallback(struct ggml_tensor* dst, std::atomic<uint64_t>* counter, const std::string& message) {
+    if (counter) {
+        counter->fetch_add(1, std::memory_order_relaxed);
+    }
+    g_moe_callback_fail_closed_count.fetch_add(1, std::memory_order_relaxed);
+    ZeroFillTensor(dst);
+    std::fprintf(stderr, "[DenseCore][MoE] fail-closed: %s\n", message.c_str());
+    if (IsMoEStrictModeEnabled()) {
+        RecordMoEStrictFailure(message);
+    }
 }
 
 static int GetMoEDebugSelectedLayer() {
@@ -772,15 +852,31 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     }
     auto* ud = static_cast<MoEUserData*>(userdata);
     if (!ud || !ud->layer) {
-        g_moe_callback_missing_userdata_count.fetch_add(1, std::memory_order_relaxed);
+        FailClosedMoECallback(dst, &g_moe_callback_missing_userdata_count, "MoE callback missing userdata/layer");
         return;
     }
     if (!ud->backend) {
-        g_moe_callback_missing_backend_count.fetch_add(1, std::memory_order_relaxed);
+        // Fail-safe path for environments where registry CPU backend resolution is delayed
+        // or unavailable at graph wiring time. Keep MoE execution on CPU rather than silently
+        // dropping routed expert forward.
+        ud->backend = &densecore::GetTelemetryCpuBackend();
+    }
+    if (!ud->backend) {
+        FailClosedMoECallback(dst, &g_moe_callback_missing_backend_count, "MoE callback missing CPU backend");
         return;
     }
+    if ((!ud->experts_registered || !ud->experts || ud->n_experts <= 0) && ud->layer) {
+        const densecore::CpuBackend::ExpertWeights* registered_experts = nullptr;
+        int registered_count = 0;
+        if (ud->backend->GetRegisteredExpertsView(ud->layer, &registered_experts, &registered_count) &&
+            registered_experts && registered_count > 0) {
+            ud->experts = registered_experts;
+            ud->n_experts = registered_count;
+            ud->experts_registered = true;
+        }
+    }
     if (!ud->experts_registered || !ud->experts || ud->n_experts <= 0) {
-        g_moe_callback_missing_experts_count.fetch_add(1, std::memory_order_relaxed);
+        FailClosedMoECallback(dst, &g_moe_callback_missing_experts_count, "MoE callback missing registered experts");
         return;
     }
 
@@ -791,8 +887,20 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     const bool routed = (ud->model && ud->model->arch_flags.is_glm_moe)
                             ? RouteMoEGroupedSigmoid(src1, ud, &routing)
                         : densecore::models::IsGemma4MoEModel(ud->model, ud->layer) ? RouteMoEGemma4TopK(src1, ud, &routing)
-                                                                 : RouteMoESoftmaxTopK(src1, ud, &routing);
-    if (!routed || routing.expert_ids.empty()) return;
+                                                                : RouteMoESoftmaxTopK(src1, ud, &routing);
+    if (!routed) {
+        FailClosedMoECallback(dst, &g_moe_callback_routing_failure_count, "MoE routing failed");
+        return;
+    }
+    if (ud->test_force_empty_routing) {
+        routing.expert_ids.clear();
+        routing.weights.clear();
+        routing.token_indices.clear();
+    }
+    if (routing.expert_ids.empty()) {
+        FailClosedMoECallback(dst, &g_moe_callback_empty_routing_count, "MoE routing produced no experts");
+        return;
+    }
     DumpMoERouteTrace(src1, ud, routing);
     const auto route_end = debug_stage_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     UpdateSchedulerExperts(ud, routing);

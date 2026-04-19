@@ -30,6 +30,7 @@
 
 #include "apple_silicon.h"
 #include "dtype_utils.h"
+#include "gemma4_packed_expert_layout.h"
 #include "models/model_inference_policy.h"
 #include "qwen35_ssm_math.h"
 
@@ -1529,7 +1530,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             model->layers[i].Set(model_keys::kAttnRopeFreqs, rope_freqs);
         }
         model->layers[i].Set(model_keys::kMoeGate,
-                             get_layer_tensor_any(i, {"moe_gate.weight", "router.proj.weight", "mlp.gate.weight"}));
+                             get_layer_tensor_any(i, {"moe_gate.weight", "router.proj.weight", "mlp.gate.weight",
+                                                      "ffn_gate_inp.weight", "ffn_gate_inp"}));
 
         // Determine if this is an SSM layer or full attention layer
         const bool is_ssm = model->IsHybridSSMLayer(static_cast<int>(i));
@@ -1675,8 +1677,11 @@ TransformerModel* LoadGGUFModel(const char* path) {
             layer.Set(model_keys::kFfnSharedGate, t);
         }
         if (!layer.Get(model_keys::kMoeGate)) {
-            auto* t = find_layer_tensor_with_tokens(layer, {"mlp", "gate.weight"}, {"shared"});
-            if (!t) t = find_layer_tensor_with_tokens(layer, {"ffn_gate_inp"}, {"shexp"});
+            auto* t = get_layer_tensor_any(static_cast<int>(i),
+                                           {"moe_gate.weight", "router.proj.weight", "mlp.gate.weight",
+                                            "ffn_gate_inp.weight", "ffn_gate_inp"});
+            if (!t) t = find_layer_tensor_with_tokens(layer, {"mlp", "gate.weight"}, {"shared"});
+            if (!t) t = find_layer_tensor_with_tokens(layer, {"ffn_gate_inp"});
             layer.Set(model_keys::kMoeGate, t);
         }
         if (!layer.Get(model_keys::kMoeCorrectionBias)) {
@@ -1685,9 +1690,16 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
 
         const struct ggml_tensor* packed_gate_up =
-            find_layer_tensor_with_tokens(layer, {"experts", "gate_up_proj"}, {"shared"});
+            get_layer_tensor_any(static_cast<int>(i), {"experts.gate_up_proj.weight", "ffn_gate_up_exps.weight"});
+        if (!packed_gate_up) {
+            packed_gate_up = find_layer_tensor_with_tokens(layer, {"experts", "gate_up_proj"}, {"shared"});
+        }
         const struct ggml_tensor* packed_down =
-            find_layer_tensor_with_tokens(layer, {"experts", "down_proj"}, {"shared"});
+            get_layer_tensor_any(static_cast<int>(i), {"experts.down_proj.weight", "ffn_down_exps.weight"});
+        if (!packed_down) {
+            packed_down = find_layer_tensor_with_tokens(layer, {"experts", "down_proj"}, {"shared"});
+        }
+        const struct ggml_tensor* packed_down_scale = nullptr;
 
         // Gemma4 E26B/A4B GGUFs use packed MoE tensors named
         // `ffn_gate_up_exps.weight` + `ffn_down_exps.weight` (with optional
@@ -1707,12 +1719,24 @@ TransformerModel* LoadGGUFModel(const char* path) {
                     packed_down = find_layer_tensor_with_tokens(layer, {"ffn_down_exps"}, {"scale"});
                 }
             }
+            packed_down_scale = get_layer_tensor_any(static_cast<int>(i), {"ffn_down_exps.scale"});
+            if (!packed_down_scale) {
+                packed_down_scale = find_layer_tensor_with_tokens(layer, {"ffn_down_exps", "scale"});
+            }
         }
 
         if (packed_gate_up && packed_down &&
             i >= static_cast<uint32_t>(std::max(0, model->moe_first_k_dense_replace))) {
+            densecore::gemma4::PackedExpertLayout packed_layout{};
+            std::string packed_layout_reason;
+            const bool has_canonical_gemma4_layout =
+                model->arch_flags.is_gemma4 &&
+                densecore::gemma4::InferPackedExpertLayout(packed_gate_up, packed_down, &packed_layout,
+                                                           &packed_layout_reason);
             int packed_experts = 0;
-            if (packed_gate_up->ne[2] > 0) {
+            if (has_canonical_gemma4_layout) {
+                packed_experts = packed_layout.num_experts;
+            } else if (packed_gate_up->ne[2] > 0) {
                 packed_experts = static_cast<int>(packed_gate_up->ne[2]);
             } else if (packed_gate_up->ne[3] > 0) {
                 packed_experts = static_cast<int>(packed_gate_up->ne[3]);
@@ -1726,11 +1750,54 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 used_packed_expert_slices = true;
                 struct ggml_context* vctx = model->ctx_views ? model->ctx_views : model->ctx_w;
                 for (int expert_idx = 0; expert_idx < expert_count; ++expert_idx) {
+                    if (has_canonical_gemma4_layout) {
+                        densecore::gemma4::PackedExpertViews expert_views{};
+                        std::string packed_view_reason;
+                        if (!densecore::gemma4::MakePackedExpertViews(
+                                vctx, const_cast<struct ggml_tensor*>(packed_gate_up),
+                                const_cast<struct ggml_tensor*>(packed_down),
+                                const_cast<struct ggml_tensor*>(packed_down_scale), expert_idx, &expert_views,
+                                &packed_view_reason)) {
+                            continue;
+                        }
+                        layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kGemma4PackedGateUpExpert,
+                                        expert_views.gate_up);
+                        layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kFfnGate, expert_views.gate);
+                        layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kFfnUp, expert_views.up);
+                        layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kFfnDown, expert_views.down);
+                        if (expert_views.down_scale) {
+                            layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kGemma4PackedDownScale,
+                                            expert_views.down_scale);
+                        }
+
+                        const auto gate_it = model->int4_weight_bindings.find(packed_gate_up);
+                        if (gate_it != model->int4_weight_bindings.end()) {
+                            TransformerModel::Int4WeightBinding gate_binding{};
+                            if (densecore::gemma4::ResolvePackedProjectionBinding(vctx, gate_it->second,
+                                                                                 expert_views.gate_view, &gate_binding)) {
+                                model->int4_weight_bindings[expert_views.gate] = gate_binding;
+                            }
+                            TransformerModel::Int4WeightBinding up_binding{};
+                            if (densecore::gemma4::ResolvePackedProjectionBinding(vctx, gate_it->second,
+                                                                                 expert_views.up_view, &up_binding)) {
+                                model->int4_weight_bindings[expert_views.up] = up_binding;
+                            }
+                        }
+                        const auto down_it = model->int4_weight_bindings.find(packed_down);
+                        if (down_it != model->int4_weight_bindings.end()) {
+                            TransformerModel::Int4WeightBinding down_binding{};
+                            if (densecore::gemma4::ResolvePackedProjectionBinding(vctx, down_it->second,
+                                                                                 expert_views.down_view, &down_binding)) {
+                                model->int4_weight_bindings[expert_views.down] = down_binding;
+                            }
+                        }
+                        continue;
+                    }
+
                     const size_t gate_up_offset = static_cast<size_t>(expert_idx) * packed_gate_up->nb[2];
                     struct ggml_tensor* gate_up_slice =
                         ggml_view_2d(vctx, const_cast<struct ggml_tensor*>(packed_gate_up), packed_gate_up->ne[0],
                                      packed_gate_up->ne[1], packed_gate_up->nb[1], gate_up_offset);
-
                     const int64_t gate_up_rows = gate_up_slice->ne[1];
                     if (gate_up_rows < 2 || (gate_up_rows % 2) != 0) {
                         continue;
@@ -1745,7 +1812,6 @@ TransformerModel* LoadGGUFModel(const char* path) {
                     struct ggml_tensor* down_w =
                         ggml_view_2d(vctx, const_cast<struct ggml_tensor*>(packed_down), packed_down->ne[0],
                                      packed_down->ne[1], packed_down->nb[1], down_offset);
-
                     layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kFfnGate, gate_w);
                     layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kFfnUp, up_w);
                     layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kFfnDown, down_w);
@@ -1779,9 +1845,15 @@ TransformerModel* LoadGGUFModel(const char* path) {
         // Handle separate stacked expert format: ffn_gate_exps / ffn_up_exps / ffn_down_exps
         // (used by qwen35moe bartowski GGUFs — experts stacked along ne[2] axis)
         if (layer.NumExperts() == 0 && layer.Get(model_keys::kMoeGate)) {
-            const struct ggml_tensor* sep_gate = find_layer_tensor_with_tokens(layer, {"ffn_gate_exps"});
-            const struct ggml_tensor* sep_up = find_layer_tensor_with_tokens(layer, {"ffn_up_exps"});
-            const struct ggml_tensor* sep_down = find_layer_tensor_with_tokens(layer, {"ffn_down_exps"});
+            const struct ggml_tensor* sep_gate =
+                get_layer_tensor_any(static_cast<int>(i), {"ffn_gate_exps.weight", "ffn_gate_exps"});
+            if (!sep_gate) sep_gate = find_layer_tensor_with_tokens(layer, {"ffn_gate_exps"});
+            const struct ggml_tensor* sep_up =
+                get_layer_tensor_any(static_cast<int>(i), {"ffn_up_exps.weight", "ffn_up_exps"});
+            if (!sep_up) sep_up = find_layer_tensor_with_tokens(layer, {"ffn_up_exps"});
+            const struct ggml_tensor* sep_down =
+                get_layer_tensor_any(static_cast<int>(i), {"ffn_down_exps.weight", "ffn_down_exps"});
+            if (!sep_down) sep_down = find_layer_tensor_with_tokens(layer, {"ffn_down_exps"});
             if (sep_gate && sep_up && sep_down) {
                 int n_exp = (sep_gate->ne[2] > 1)   ? static_cast<int>(sep_gate->ne[2])
                             : (sep_gate->ne[3] > 0) ? static_cast<int>(sep_gate->ne[3])

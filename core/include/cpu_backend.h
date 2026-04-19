@@ -360,9 +360,12 @@ public:
         int w1_type = 0;                   ///< ggml_type of w1 (0 = GGML_TYPE_F32)
         int w2_type = 0;                   ///< ggml_type of w2
         int w3_type = 0;                   ///< ggml_type of w3
+        const struct ggml_tensor* gate_up_tensor = nullptr;
         const struct ggml_tensor* w1_tensor = nullptr;
         const struct ggml_tensor* w2_tensor = nullptr;
         const struct ggml_tensor* w3_tensor = nullptr;
+        const struct ggml_tensor* w2_scale_tensor = nullptr;
+        bool uses_canonical_gemma4_packed_layout = false;
         ExpertPackedInt4Weight w1_int4;
         ExpertPackedInt4Weight w2_int4;
         ExpertPackedInt4Weight w3_int4;
