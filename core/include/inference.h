@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -303,9 +304,40 @@ struct SamplingParams {
     // Optional deterministic seed for testing or reproducible decoding.
     // When 0, sampling uses a process-local random seed.
     uint64_t seed = 0;
+
+    // Optional request metadata for debug tracing.
+    int request_id = -1;
+    int output_token_index = -1;
+};
+
+struct SamplingDebugCandidate {
+    int token_id = -1;
+    float pre_penalty_logit = -std::numeric_limits<float>::infinity();
+    float post_penalty_logit = -std::numeric_limits<float>::infinity();
+};
+
+struct SamplingDebugTraceEntry {
+    int request_id = -1;
+    int output_token_index = -1;
+    int sampled_token_id = -1;
+    float temperature = 0.0f;
+    float top_p = 0.0f;
+    int top_k = 0;
+    float repetition_penalty = 1.0f;
+    std::vector<SamplingDebugCandidate> top_pre_penalty;
+    std::vector<SamplingDebugCandidate> top_post_penalty;
 };
 
 int SampleToken(GgmlTensorHandle* logits, int idx, const SamplingParams& params = SamplingParams());
+void ResetSamplingDebugTrace();
+std::vector<SamplingDebugTraceEntry> GetSamplingDebugTraceSnapshot();
+void ResetMoEGraphWiringDebugCounter();
+uint64_t GetMoEGraphWiringDebugCounter();
+void ResetMoECallbackEntryCounter();
+uint64_t GetMoECallbackEntryCounter();
+uint64_t GetMoECallbackMissingUserdataCounter();
+uint64_t GetMoECallbackMissingBackendCounter();
+uint64_t GetMoECallbackMissingExpertsCounter();
 
 // ============================================================================
 // Internal Ops Exposed for Graph Builders

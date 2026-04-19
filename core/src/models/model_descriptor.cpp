@@ -64,6 +64,15 @@ constexpr ModelDescriptor kDescriptors[] = {
      true,
      false,
      {.requires_q_norm = true, .requires_k_norm = true, .is_hybrid_ssm = true}},
+    {ModelVariant::QWEN36,
+     ModelArch::QWEN35,
+     "qwen36",
+     TokenizerFamily::QWEN35_UNICODE_BPE,
+     PromptTemplateFamily::CHATML,
+     true,
+     true,
+     false,
+     {.requires_q_norm = true, .requires_k_norm = true, .is_hybrid_ssm = true}},
     {ModelVariant::GLM4_MOE,
      ModelArch::GLM4_MOE,
      "glm4_moe",
@@ -238,6 +247,13 @@ ResolvedModelDescriptor ResolveModelDescriptorFromArchName(std::string_view arch
                                                             "qwen3_coder_next", "qwen3-coder-next"})) {
         return make_result(DescribeModelVariant(ModelVariant::QWEN3NEXT));
     }
+    if (MatchesAny(lowered, std::array<std::string_view, 11>{"qwen36", "qwen3.6", "qwen3_6", "qwen3-6",
+                                                             "qwen3.6-35b-a3b", "qwen3_6_35b_a3b",
+                                                             "qwen3-6-35b-a3b", "qwen3.6_35b_a3b",
+                                                             "qwen36_35b_a3b", "qwen36-35b-a3b",
+                                                             "qwen3.6-35b-a3b-instruct"})) {
+        return make_result(DescribeModelVariant(ModelVariant::QWEN36));
+    }
     if (MatchesAny(lowered, std::array<std::string_view, 7>{"qwen35", "qwen3.5", "qwen35moe", "qwen35_moe",
                                                             "qwen3.5_moe", "qwen3_5_moe", "qwen3_5_moe_text"})) {
         return make_result(DescribeModelVariant(ModelVariant::QWEN35));
@@ -319,7 +335,8 @@ TokenizerFamily ResolveTokenizerFamilyFromMetadata(std::string_view tokenizer_ty
     if (lowered.empty()) {
         return TokenizerFamily::UNKNOWN;
     }
-    if (lowered.find("qwen35") != std::string::npos || lowered.find("qwen3.5") != std::string::npos) {
+    if (lowered.find("qwen36") != std::string::npos || lowered.find("qwen3.6") != std::string::npos ||
+        lowered.find("qwen35") != std::string::npos || lowered.find("qwen3.5") != std::string::npos) {
         return TokenizerFamily::QWEN35_UNICODE_BPE;
     }
     if (lowered.find("qwen") != std::string::npos) {
@@ -407,8 +424,9 @@ PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model) 
 
 bool IsKnownTokenizerModel(std::string_view tokenizer_name) {
     const std::string lowered = AsciiLower(tokenizer_name);
-    static constexpr std::array<std::string_view, 12> kKnown = {
-        "llama", "gpt2", "qwen2", "qwen3", "qwen3next", "qwen35", "mistral", "gemma", "gemma4", "bpe", "glm4", "glm"};
+    static constexpr std::array<std::string_view, 13> kKnown = {
+        "llama", "gpt2", "qwen2", "qwen3", "qwen3next", "qwen35", "qwen36", "mistral", "gemma", "gemma4", "bpe",
+        "glm4", "glm"};
     return MatchesAny(lowered, kKnown);
 }
 
@@ -419,6 +437,7 @@ const char* ModelVariantName(ModelVariant variant) {
     case ModelVariant::QWEN3: return "qwen3";
     case ModelVariant::QWEN3NEXT: return "qwen3next";
     case ModelVariant::QWEN35: return "qwen35";
+    case ModelVariant::QWEN36: return "qwen36";
     case ModelVariant::GLM4_MOE: return "glm4_moe";
     case ModelVariant::GLM5_DSA: return "glm5_dsa";
     case ModelVariant::MISTRAL: return "mistral";

@@ -7,6 +7,7 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
+#include <cstdio>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -41,6 +42,7 @@
 #include "densecore/graph_executor.h"
 #include "densecore/models/graph_registry.h"
 #include "densecore/models/model_descriptor.h"
+#include "inference.h"
 #include "models/model_inference_policy.h"
 
 namespace {
@@ -59,6 +61,319 @@ bool IsRuntimePathLoggingEnabled() {
         return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
+}
+
+bool IsMoEPathTraceDumpEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_MOE_TRACE_DUMP");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool IsSamplerTraceDumpEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SAMPLER_TRACE_DUMP");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool IsDeterminismBoundaryDebugEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_DETERMINISM_BOUNDARY");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool IsPrefixCacheReuseDisabled() {
+    static const bool disabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_DISABLE_PREFIX_CACHE_REUSE");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return disabled;
+}
+
+bool IsHybridSSMSnapshotRestoreDisabled() {
+    static const bool disabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_DISABLE_HYBRID_SSM_RESTORE");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return disabled;
+}
+
+bool IsGraphCacheReuseDisabled() {
+    static const bool disabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_DISABLE_GRAPH_CACHE_REUSE");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return disabled;
+}
+
+bool IsMoETracePlumbingDisabled() {
+    static const bool disabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_DISABLE_MOE_TRACE_PLUMBING");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return disabled;
+}
+
+bool IsMoEGraphSummaryEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_MOE_GRAPH_SUMMARY");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+void MaybeLogMoEGraphSummary(struct ggml_cgraph* gf, const TransformerModel* model, bool is_prefill_batch) {
+    if (!IsMoEGraphSummaryEnabled() || !gf || !model || model->hparams.n_layer == 0 || model->hparams.n_experts == 0) {
+        return;
+    }
+    static std::atomic<bool> logged_prefill{false};
+    static std::atomic<bool> logged_decode{false};
+    if (is_prefill_batch) {
+        if (logged_prefill.exchange(true, std::memory_order_relaxed)) return;
+    } else {
+        if (logged_decode.exchange(true, std::memory_order_relaxed)) return;
+    }
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    uint64_t moe_gating_ops = 0;
+    uint64_t moe_scatter_ops = 0;
+    uint64_t moe_forward_ops = 0;
+    uint64_t moe_gather_ops = 0;
+    uint64_t dense_ffn_matmul_ops = 0;
+    std::vector<uint64_t> layer_dense_ffn_ops(model->hparams.n_layer, 0);
+    std::vector<uint64_t> layer_moe_forward_ops(model->hparams.n_layer, 0);
+    std::vector<uint64_t> layer_moe_gate_ops(model->hparams.n_layer, 0);
+
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor* node = ggml_graph_node(gf, i);
+        if (!node) continue;
+        const char* name = node->name;
+        if (!name || !name[0]) continue;
+
+        int layer_idx = -1;
+        if (std::sscanf(name, "blk.%d.", &layer_idx) != 1) {
+            layer_idx = -1;
+        }
+        const bool layer_ok = layer_idx >= 0 && layer_idx < static_cast<int>(model->hparams.n_layer);
+
+        if (std::strstr(name, ".moe_gate_logits")) {
+            ++moe_gating_ops;
+            if (layer_ok) {
+                ++layer_moe_gate_ops[static_cast<size_t>(layer_idx)];
+            }
+        } else if (std::strstr(name, ".moe_forward")) {
+            ++moe_forward_ops;
+            if (layer_ok) {
+                ++layer_moe_forward_ops[static_cast<size_t>(layer_idx)];
+            }
+        } else if (std::strstr(name, ".ffn_gate") || std::strstr(name, ".ffn_up") || std::strstr(name, ".ffn_down")) {
+            ++dense_ffn_matmul_ops;
+            if (layer_ok) {
+                ++layer_dense_ffn_ops[static_cast<size_t>(layer_idx)];
+            }
+        }
+    }
+
+    std::fprintf(stderr,
+                 "[MOE_GRAPH_SUMMARY] phase=%s nodes=%d ops{MoEGating:%llu,MoEScatter:%llu,MoEForward:%llu,"
+                 "MoEGather:%llu,dense_ffn_matmul:%llu} layers=%u\n",
+                 is_prefill_batch ? "prefill" : "decode", n_nodes, static_cast<unsigned long long>(moe_gating_ops),
+                 static_cast<unsigned long long>(moe_scatter_ops), static_cast<unsigned long long>(moe_forward_ops),
+                 static_cast<unsigned long long>(moe_gather_ops), static_cast<unsigned long long>(dense_ffn_matmul_ops),
+                 model->hparams.n_layer);
+
+    for (uint32_t layer = 0; layer < model->hparams.n_layer; ++layer) {
+        const TransformerLayer& l = model->layers[layer];
+        std::fprintf(stderr,
+                     "[MOE_GRAPH_LAYER] phase=%s layer=%u is_moe=%d has_moe_gate=%d num_experts=%zu "
+                     "ffn_ops{moe_gate:%llu,moe_forward:%llu,dense_ffn_matmul:%llu}\n",
+                     is_prefill_batch ? "prefill" : "decode", layer, l.is_moe ? 1 : 0,
+                     l.Get(model_keys::kMoeGate) ? 1 : 0, l.NumExperts(),
+                     static_cast<unsigned long long>(layer_moe_gate_ops[layer]),
+                     static_cast<unsigned long long>(layer_moe_forward_ops[layer]),
+                     static_cast<unsigned long long>(layer_dense_ffn_ops[layer]));
+    }
+}
+
+bool ShouldZeroFillPrefillInputBuffer() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_ZERO_FILL_PREFILL_INPUT_BUFFER");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool ShouldZeroFillPrefillGraphBuffer() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_ZERO_FILL_PREFILL_GRAPH_BUFFER");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool ShouldZeroFillPrefillKVBlocks() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_ZERO_FILL_PREFILL_KV_BLOCKS");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+int PrefillThreadOverride() {
+    static const int value = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_PREFILL_THREADS");
+        if (!env || env[0] == '\0') {
+            return 0;
+        }
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end == env || (end && *end != '\0') || parsed <= 0) {
+            return 0;
+        }
+        return static_cast<int>(parsed);
+    }();
+    return value;
+}
+
+uint64_t Fnv1aInit() {
+    return 1469598103934665603ull;
+}
+
+void Fnv1aMixU64(uint64_t* hash, uint64_t value) {
+    if (!hash) {
+        return;
+    }
+    *hash ^= value;
+    *hash *= 1099511628211ull;
+}
+
+uint64_t HashIntVectorSummary(const std::vector<int>& values, size_t max_items = 32) {
+    uint64_t hash = Fnv1aInit();
+    Fnv1aMixU64(&hash, static_cast<uint64_t>(values.size()));
+    const size_t limit = std::min(max_items, values.size());
+    for (size_t i = 0; i < limit; ++i) {
+        Fnv1aMixU64(&hash, static_cast<uint64_t>(static_cast<uint32_t>(values[i])));
+    }
+    if (values.size() > limit) {
+        for (size_t i = values.size() - std::min<size_t>(4, values.size()); i < values.size(); ++i) {
+            Fnv1aMixU64(&hash, static_cast<uint64_t>(static_cast<uint32_t>(values[i])));
+        }
+    }
+    return hash;
+}
+
+uint64_t HashByteSpanSummary(const void* data, size_t bytes) {
+    if (!data || bytes == 0) {
+        return 0;
+    }
+    const auto* ptr = reinterpret_cast<const uint8_t*>(data);
+    uint64_t hash = Fnv1aInit();
+    Fnv1aMixU64(&hash, static_cast<uint64_t>(bytes));
+    const size_t window = std::min<size_t>(bytes, 4096);
+    for (size_t i = 0; i < window; ++i) {
+        Fnv1aMixU64(&hash, ptr[i]);
+    }
+    if (bytes > window) {
+        const size_t mid = bytes / 2;
+        for (size_t i = 0; i < std::min<size_t>(256, bytes - mid); ++i) {
+            Fnv1aMixU64(&hash, ptr[mid + i]);
+        }
+        const size_t tail_start = bytes - std::min<size_t>(256, bytes);
+        for (size_t i = tail_start; i < bytes; ++i) {
+            Fnv1aMixU64(&hash, ptr[i]);
+        }
+    }
+    return hash;
+}
+
+uint64_t HashHybridSSMStateSummary(const std::vector<TransformerModel::SSMSequenceRuntimeState>& states) {
+    uint64_t hash = Fnv1aInit();
+    Fnv1aMixU64(&hash, static_cast<uint64_t>(states.size()));
+    for (const auto& state : states) {
+        Fnv1aMixU64(&hash, static_cast<uint64_t>(state.conv_state.size()));
+        Fnv1aMixU64(&hash, static_cast<uint64_t>(state.ssm_state.size()));
+        if (!state.conv_state.empty()) {
+            const size_t mid = state.conv_state.size() / 2;
+            uint32_t bits = 0;
+            std::memcpy(&bits, &state.conv_state[0], sizeof(uint32_t));
+            Fnv1aMixU64(&hash, bits);
+            std::memcpy(&bits, &state.conv_state[mid], sizeof(uint32_t));
+            Fnv1aMixU64(&hash, bits);
+            std::memcpy(&bits, &state.conv_state.back(), sizeof(uint32_t));
+            Fnv1aMixU64(&hash, bits);
+        }
+        if (!state.ssm_state.empty()) {
+            const size_t mid = state.ssm_state.size() / 2;
+            uint32_t bits = 0;
+            std::memcpy(&bits, &state.ssm_state[0], sizeof(uint32_t));
+            Fnv1aMixU64(&hash, bits);
+            std::memcpy(&bits, &state.ssm_state[mid], sizeof(uint32_t));
+            Fnv1aMixU64(&hash, bits);
+            std::memcpy(&bits, &state.ssm_state.back(), sizeof(uint32_t));
+            Fnv1aMixU64(&hash, bits);
+        }
+    }
+    return hash;
+}
+
+void LogPrefillStage(const char* stage, const Request* req, const TransformerModel* model,
+                     const InferenceContext* inference_ctx, const void* input_buffer, size_t input_buffer_bytes,
+                     const struct ggml_tensor* output, bool is_prefill_batch, int active_threads) {
+    if (!IsDeterminismBoundaryDebugEnabled() || !req || !is_prefill_batch) {
+        return;
+    }
+    const auto descriptor = densecore::models::DescribeModel(model);
+    const uint64_t token_hash = HashIntVectorSummary(req->tokens);
+    const uint64_t block_hash = HashIntVectorSummary(req->block_table);
+    const uint64_t ssm_hash = HashHybridSSMStateSummary(req->ssm_runtime_states);
+    const uint64_t input_hash = HashByteSpanSummary(input_buffer, input_buffer_bytes);
+    const uint64_t graph_hash =
+        inference_ctx ? HashByteSpanSummary(inference_ctx->compute_buffer, inference_ctx->compute_buffer_size) : 0;
+    uint64_t output_hash = 0;
+    size_t output_bytes = 0;
+    if (output && output->data) {
+        output_bytes = ggml_nbytes(output);
+        output_hash = HashByteSpanSummary(output->data, output_bytes);
+    }
+    std::cerr << "[PrefillStage] stage=" << (stage ? stage : "<unknown>") << " req=" << req->id
+              << " variant=" << densecore::models::ModelVariantName(descriptor.variant)
+              << " threads=" << active_threads << " prompt_tokens=" << req->tokens.size() << " n_past=" << req->n_past
+              << " token_hash=0x" << std::hex << token_hash << " block_hash=0x" << block_hash << " ssm_hash=0x"
+              << ssm_hash << " input_hash=0x" << input_hash << " graph_hash=0x" << graph_hash << " output_hash=0x"
+              << output_hash << std::dec << " input_bytes=" << input_buffer_bytes << " output_bytes=" << output_bytes
+              << std::endl;
+}
+
+void LogDeterminismBoundary(const char* stage, const Request* req, const TransformerModel* model,
+                            bool prefix_cache_allowed, bool prefix_cache_hit, bool hybrid_restore_attempted,
+                            bool hybrid_restore_applied, bool chunked_prefill, bool decode_cache_active,
+                            bool decode_cache_reused, bool prefill_cache_active) {
+    if (!IsDeterminismBoundaryDebugEnabled() || !req) {
+        return;
+    }
+    const auto descriptor = densecore::models::DescribeModel(model);
+    const uint64_t token_hash = HashIntVectorSummary(req->tokens);
+    const uint64_t block_hash = HashIntVectorSummary(req->block_table);
+    const uint64_t ssm_hash = HashHybridSSMStateSummary(req->ssm_runtime_states);
+    std::cerr << "[DeterminismBoundary] stage=" << (stage ? stage : "<unknown>") << " req=" << req->id
+              << " variant=" << densecore::models::ModelVariantName(descriptor.variant)
+              << " prompt_tokens=" << req->tokens.size() << " n_past=" << req->n_past
+              << " generated=" << req->generated_count << " is_prefill=" << (req->is_prefill ? 1 : 0)
+              << " prefix_cache_allowed=" << (prefix_cache_allowed ? 1 : 0)
+              << " prefix_cache_hit=" << (prefix_cache_hit ? 1 : 0)
+              << " hybrid_restore_attempted=" << (hybrid_restore_attempted ? 1 : 0)
+              << " hybrid_restore_applied=" << (hybrid_restore_applied ? 1 : 0)
+              << " chunked_prefill=" << (chunked_prefill ? 1 : 0)
+              << " decode_cache_active=" << (decode_cache_active ? 1 : 0)
+              << " decode_cache_reused=" << (decode_cache_reused ? 1 : 0)
+              << " prefill_cache_active=" << (prefill_cache_active ? 1 : 0)
+              << " token_hash=0x" << std::hex << token_hash << " block_hash=0x" << block_hash << " ssm_hash=0x"
+              << ssm_hash << std::dec << std::endl;
 }
 
 bool IsValidGgmlType(enum ggml_type type) {
@@ -742,6 +1057,15 @@ void EngineLoop(EngineState* state) {
                     // globally on the shared model, otherwise batched execution
                     // cross-contaminates sequences and forces single-request mode.
                     EnsureRequestHybridSSMRuntimeState(current_model, req);
+                    LogDeterminismBoundary("after_tokenization", req, current_model,
+                                           /*prefix_cache_allowed=*/!IsPrefixCacheReuseDisabled(),
+                                           /*prefix_cache_hit=*/false,
+                                           /*hybrid_restore_attempted=*/false,
+                                           /*hybrid_restore_applied=*/false,
+                                           /*chunked_prefill=*/false,
+                                           /*decode_cache_active=*/false,
+                                           /*decode_cache_reused=*/false,
+                                           /*prefill_cache_active=*/false);
 
                     // Register with scheduler (blocks allocated by scheduler)
                     int seq_id = state->scheduler->AddRequest(req->id, req->tokens.size(), req->max_tokens,
@@ -927,7 +1251,11 @@ void EngineLoop(EngineState* state) {
                 }
             }
 
-            const bool prefix_cache_allowed = true;
+            const bool prefix_cache_allowed = !IsPrefixCacheReuseDisabled();
+            std::unordered_set<int> determinism_prefix_hit_reqs;
+            std::unordered_set<int> determinism_hybrid_restore_attempt_reqs;
+            std::unordered_set<int> determinism_hybrid_restore_applied_reqs;
+            std::unordered_set<int> determinism_chunked_prefill_reqs;
 
             // 4a. Handle scheduler output: prefix cache hits
             if (!used_single_request_fast_path && prefix_cache_allowed) {
@@ -935,6 +1263,7 @@ void EngineLoop(EngineState* state) {
                     auto req_it = seq_to_request.find(hit.seq_id);
                     if (req_it != seq_to_request.end()) {
                         Request* req = req_it->second;
+                        determinism_prefix_hit_reqs.insert(req->id);
                         // Append shared blocks from prefix cache
                         req->block_table.insert(req->block_table.end(), hit.cached_block_ids.begin(),
                                                 hit.cached_block_ids.end());
@@ -982,12 +1311,20 @@ void EngineLoop(EngineState* state) {
                                     }
                                     return true;
                                 };
-                            if (current_kv_cache->block_manager->LoadHybridSSMSnapshotForBlock(snapshot_block,
-                                                                                               &snapshot) &&
-                                snapshot_shape_ok(snapshot)) {
+                            determinism_hybrid_restore_attempt_reqs.insert(req->id);
+                            if (IsHybridSSMSnapshotRestoreDisabled()) {
+                                if (IsHybridSSMSnapshotDebugEnabled()) {
+                                    std::cerr << "[HybridSSMSnapshot] restore_disabled req=" << req->id
+                                              << " cached_tokens=" << hit.cached_tokens
+                                              << " block_id=" << snapshot_block << std::endl;
+                                }
+                            } else if (current_kv_cache->block_manager->LoadHybridSSMSnapshotForBlock(snapshot_block,
+                                                                                                        &snapshot) &&
+                                       snapshot_shape_ok(snapshot)) {
                                 DebugLogHybridSSMSnapshot("restore_before", req->id, hit.cached_tokens, snapshot_block,
                                                           snapshot);
                                 req->ssm_runtime_states = std::move(snapshot);
+                                determinism_hybrid_restore_applied_reqs.insert(req->id);
                                 DebugLogHybridSSMSnapshot("restore_after", req->id, hit.cached_tokens, snapshot_block,
                                                           req->ssm_runtime_states);
                             } else if (!snapshot.empty()) {
@@ -999,6 +1336,16 @@ void EngineLoop(EngineState* state) {
                                           << std::endl;
                             }
                         }
+                        LogDeterminismBoundary("after_prefix_restore", req, current_model, prefix_cache_allowed,
+                                               /*prefix_cache_hit=*/true,
+                                               /*hybrid_restore_attempted=*/determinism_hybrid_restore_attempt_reqs.count(
+                                                                               req->id) != 0,
+                                               /*hybrid_restore_applied=*/determinism_hybrid_restore_applied_reqs.count(
+                                                                             req->id) != 0,
+                                               /*chunked_prefill=*/false,
+                                               /*decode_cache_active=*/false,
+                                               /*decode_cache_reused=*/false,
+                                               /*prefill_cache_active=*/false);
                         LOG_INFO("Prefix cache hit for req {}: skipped {} tokens.", req->id, hit.cached_tokens);
                     }
                 }
@@ -1350,6 +1697,15 @@ void EngineLoop(EngineState* state) {
                     continue;
                 }
 
+                if (ShouldZeroFillPrefillKVBlocks() && current_kv_cache && !req->block_table.empty()) {
+                    std::vector<uint8_t> zero_k;
+                    std::vector<uint8_t> zero_v;
+                    current_kv_cache->CopyBlocksToHost(req->block_table, &zero_k, &zero_v);
+                    std::fill(zero_k.begin(), zero_k.end(), 0);
+                    std::fill(zero_v.begin(), zero_v.end(), 0);
+                    current_kv_cache->RestoreBlocksFromHost(req->block_table, zero_k, zero_v);
+                }
+
                 // Save original prompt tokens once for prefix cache registration.
                 if (req->prompt_tokens_for_cache.empty()) {
                     req->prompt_tokens_for_cache = req->tokens;
@@ -1483,6 +1839,13 @@ void EngineLoop(EngineState* state) {
                             decode_thread_policy = "decode_batch_auto";
                         }
                     }
+                }
+            }
+            if (is_prefill_batch) {
+                const int debug_prefill_threads = PrefillThreadOverride();
+                if (debug_prefill_threads > 0) {
+                    active_threads = debug_prefill_threads;
+                    decode_thread_policy = "prefill_debug_override";
                 }
             }
 
@@ -1651,6 +2014,7 @@ void EngineLoop(EngineState* state) {
             const int decode_graph_cache_lru_size = std::max(1, DecodeGraphCacheLruSize());
             const bool decode_graph_cache_active =
                 IsDecodeGraphCacheEnabled() && current_kv_cache != nullptr && decode_graph_cache_lru_size > 0;
+            const bool force_disable_graph_cache = IsGraphCacheReuseDisabled();
             const auto parse_prefill_graph_cache_bool = [](const char* name, bool default_value) {
                 const char* env = std::getenv(name);
                 if (!env || env[0] == '\0') return default_value;
@@ -1673,8 +2037,11 @@ void EngineLoop(EngineState* state) {
             const bool prefill_graph_cache_active =
                 parse_prefill_graph_cache_bool("DENSECORE_PREFILL_GRAPH_CACHE", true) && current_kv_cache != nullptr &&
                 prefill_graph_cache_lru_size > 0;
+            const bool decode_graph_cache_active_effective = decode_graph_cache_active && !force_disable_graph_cache;
+            const bool prefill_graph_cache_active_effective =
+                prefill_graph_cache_active && !force_disable_graph_cache;
             const size_t prefill_graph_ctx_bytes =
-                prefill_graph_cache_active ? state->CalculateGraphContextSize(current_model) : 0;
+                prefill_graph_cache_active_effective ? state->CalculateGraphContextSize(current_model) : 0;
             bool decode_single_token_layout = !is_embedding_batch && !is_prefill_batch && batch.num_seqs > 0 &&
                                               batch.num_seqs <= decode_graph_cache_max_batch &&
                                               batch_token_counts.size() == batch_requests.size() &&
@@ -1705,7 +2072,7 @@ void EngineLoop(EngineState* state) {
             const bool decode_topology_stable = stable_paged_decode_topology;
             // CPU-only cache admission: cached decode graphs may include paged
             // decode custom ops that are not portable across backend/device types.
-            const bool decode_reuse_shape_eligible = decode_graph_cache_active && decode_topology_stable &&
+            const bool decode_reuse_shape_eligible = decode_graph_cache_active_effective && decode_topology_stable &&
                                                      batch.lora_map.empty() &&
                                                      IsDecodeGraphCacheSafeForModel(current_model);
             const bool decode_reuse_candidate = decode_reuse_shape_eligible && cpu_backend_active;
@@ -1713,7 +2080,7 @@ void EngineLoop(EngineState* state) {
                 static_cast<size_t>(std::max(1, decode_graph_cache_lru_size * 2));
             if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
                 DecodeWorkerStats& decode_stats = GetDecodeWorkerStats();
-                if (!decode_graph_cache_active) {
+                if (!decode_graph_cache_active_effective) {
                     decode_stats.graph_cache_skip_disabled.fetch_add(1, std::memory_order_relaxed);
                 } else if (!decode_topology_stable) {
                     decode_stats.graph_cache_skip_unstable.fetch_add(1, std::memory_order_relaxed);
@@ -1743,10 +2110,11 @@ void EngineLoop(EngineState* state) {
                 decode_reuse_candidate &&
                 decode_graph_uncacheable.find(decode_graph_key) != decode_graph_uncacheable.end();
             const bool decode_reuse_attempt_allowed = decode_reuse_candidate && !decode_key_marked_uncacheable;
-            const bool prefill_graph_entry_cacheable = prefill_graph_cache_active && prefill_graph_ctx_bytes > 0 &&
+            const bool prefill_graph_entry_cacheable =
+                prefill_graph_cache_active_effective && prefill_graph_ctx_bytes > 0 &&
                                                        prefill_graph_ctx_bytes <= prefill_graph_cache_max_bytes;
             const bool prefill_reuse_shape_eligible =
-                prefill_graph_cache_active && is_prefill_batch && !is_embedding_batch && cpu_backend_active &&
+                prefill_graph_cache_active_effective && is_prefill_batch && !is_embedding_batch && cpu_backend_active &&
                 current_model && current_model->hparams.n_experts == 0 && !current_model->arch_flags.is_hybrid_ssm &&
                 batch.lora_map.empty() && batch.num_seqs == 1 && batch_token_counts.size() == 1 &&
                 batch_requests.size() == 1 && !batch_requests[0]->is_embedding && prefill_graph_entry_cacheable;
@@ -2011,9 +2379,18 @@ void EngineLoop(EngineState* state) {
                 }
 
                 if (!built_decode_graph_cache_entry && !built_prefill_graph_cache_entry) {
+                    if (is_prefill_batch && ShouldZeroFillPrefillGraphBuffer() && state->inference_ctx.compute_buffer &&
+                        state->inference_ctx.compute_buffer_size > 0) {
+                        std::memset(state->inference_ctx.compute_buffer, 0, state->inference_ctx.compute_buffer_size);
+                    }
                     if (!state->inference_ctx.IsInitialized()) {
                         size_t ctx_size = state->CalculateGraphContextSize(current_model);
                         state->inference_ctx.Init(ctx_size);
+                    }
+
+                    if (Request* trace_req = !batch_requests.empty() ? batch_requests[0] : nullptr) {
+                        LogPrefillStage("before_prefill_graph_build", trace_req, current_model, &state->inference_ctx,
+                                        nullptr, 0, nullptr, is_prefill_batch, active_threads);
                     }
 
                     // Reset persistent context (O(1) - reuses existing memory buffer)
@@ -2031,6 +2408,10 @@ void EngineLoop(EngineState* state) {
                     output = BuildTransformerGraph(current_model, current_kv_cache, ctx_nodes, batch,
                                                    is_embedding_batch, gf, &embd_inp, &pos);
                     graph_build_end = std::chrono::steady_clock::now();
+                    if (Request* trace_req = !batch_requests.empty() ? batch_requests[0] : nullptr) {
+                        LogPrefillStage("after_prefill_graph_build", trace_req, current_model, &state->inference_ctx,
+                                        nullptr, 0, output, is_prefill_batch, active_threads);
+                    }
                 }
             }
 
@@ -2091,12 +2472,21 @@ void EngineLoop(EngineState* state) {
             // Use offset 0 of compute buffer for inputs
             char* input_base = state->compute_buffer.get();
             size_t embd_size = ggml_nbytes(embd_inp);
+            const size_t pos_size = ggml_nbytes(pos);
+            const size_t input_span_bytes = embd_size + 256 + pos_size;
 
             embd_inp->data = input_base;
             pos->data = input_base + embd_size + 256;  // alignment padding
 
+            if (is_prefill_batch && ShouldZeroFillPrefillInputBuffer()) {
+                std::memset(input_base, 0, input_span_bytes);
+            }
             memcpy(embd_inp->data, batch.tokens.data(), batch.tokens.size() * sizeof(int));
             PopulatePositionTensor(current_model, batch, pos);
+            if (Request* trace_req = !batch_requests.empty() ? batch_requests[0] : nullptr) {
+                LogPrefillStage("before_prefill_backend_execute", trace_req, current_model, &state->inference_ctx,
+                                input_base, input_span_bytes, output, is_prefill_batch, active_threads);
+            }
 
             // =======================================================================
             // MEMORY FENCE: Ensures visibility of input data to GGML worker threads.
@@ -2204,6 +2594,7 @@ void EngineLoop(EngineState* state) {
                         // KV blocks, so each must start from the same pre-step KV
                         // state; restore again before the real decode compute so this
                         // regression mode does not perturb generation.
+                        MaybeLogMoEGraphSummary(gf, current_model, is_prefill_batch);
                         ggml_backend_graph_compute(active_backend, gf);
 
                         if (!output || !output->data) {
@@ -2282,6 +2673,7 @@ void EngineLoop(EngineState* state) {
 
                                             maybe_set_cpu_threads();
 
+                                            MaybeLogMoEGraphSummary(uncached_gf, current_model, is_prefill_batch);
                                             ggml_backend_graph_compute(active_backend, uncached_gf);
                                             if (!uncached_output->data) {
                                                 std::cerr << "[DecodeGraphCacheCheck] skipped due to shape mismatch: "
@@ -2406,8 +2798,15 @@ void EngineLoop(EngineState* state) {
 
             const auto compute_begin = std::chrono::steady_clock::now();
             ValidateMulNodesOrThrow(gf, is_decode_batch ? "decode" : "prefill");
+            MaybeLogMoEGraphSummary(gf, current_model, is_prefill_batch);
             ggml_backend_graph_compute(active_backend, gf);
             const auto compute_end = std::chrono::steady_clock::now();
+            if (Request* trace_req = !batch_requests.empty() ? batch_requests[0] : nullptr) {
+                LogPrefillStage("after_prefill_backend_execute", trace_req, current_model, &state->inference_ctx,
+                                input_base, input_span_bytes, output, is_prefill_batch, active_threads);
+                LogPrefillStage("after_prefill_logits_extraction", trace_req, current_model, &state->inference_ctx,
+                                input_base, input_span_bytes, output, is_prefill_batch, active_threads);
+            }
             LOG_TRACE("Graph compute done for batch size {}", batch.num_seqs);
             if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
                 GetDecodeWorkerStats().decode_batches.fetch_add(1, std::memory_order_relaxed);
@@ -2534,6 +2933,7 @@ void EngineLoop(EngineState* state) {
                         PopulatePositionTensor(current_model, single_batch, verify_pos);
 
                         maybe_set_cpu_threads();
+                        MaybeLogMoEGraphSummary(verify_gf, current_model, is_prefill_batch);
                         ggml_backend_graph_compute(active_backend, verify_gf);
 
                         if (!verify_output->data || static_cast<int>(verify_output->ne[0]) != n_vocab) {
@@ -2785,6 +3185,7 @@ void EngineLoop(EngineState* state) {
 
                         // Chunked prefill in progress: continue prefill without sampling.
                         if (processed_count < remaining_prompt_tokens) {
+                            determinism_chunked_prefill_reqs.insert(req->id);
                             req->tokens.erase(req->tokens.begin(), req->tokens.begin() + processed_count);
                             token_offset += processed_count;
                             continue;
@@ -2801,12 +3202,24 @@ void EngineLoop(EngineState* state) {
                                            .count();
                         state->metrics.RecordTTFT(ttft_us);
                         req->last_token_time = req->first_token_time;
+                        LogDeterminismBoundary("after_prefill_complete", req, current_model, prefix_cache_allowed,
+                                               /*prefix_cache_hit=*/determinism_prefix_hit_reqs.count(req->id) != 0,
+                                               /*hybrid_restore_attempted=*/determinism_hybrid_restore_attempt_reqs.count(
+                                                                               req->id) != 0,
+                                               /*hybrid_restore_applied=*/determinism_hybrid_restore_applied_reqs.count(
+                                                                             req->id) != 0,
+                                               /*chunked_prefill=*/determinism_chunked_prefill_reqs.count(req->id) != 0,
+                                               /*decode_cache_active=*/using_cached_decode_graph,
+                                               /*decode_cache_reused=*/reused_decode_graph,
+                                               /*prefill_cache_active=*/using_cached_prefill_graph);
                     }
 
                     // Sample token
                     SamplingParams sampling_params = req->sampling_params;
                     sampling_params.token_history = &req->token_history;
                     sampling_params.disallowed_token_ids = &req->disallowed_token_ids;
+                    sampling_params.request_id = req->id;
+                    sampling_params.output_token_index = req->generated_count;
                     if (std::getenv("DENSECORE_DEBUG_SAMPLE") != nullptr ||
                         std::getenv("DENSECORE_DEBUG_SAMPLE_TOP") != nullptr) {
                         sampling_params.vocab = &current_model->vocab_tokens;
@@ -2814,6 +3227,18 @@ void EngineLoop(EngineState* state) {
                     if (req->json_mode) {
                         sampling_params.grammar = &req->grammar;
                         sampling_params.vocab = &current_model->vocab_tokens;
+                    }
+                    if (req->generated_count == 0) {
+                        LogDeterminismBoundary("pre_decode_token0_lm_head", req, current_model, prefix_cache_allowed,
+                                               /*prefix_cache_hit=*/determinism_prefix_hit_reqs.count(req->id) != 0,
+                                               /*hybrid_restore_attempted=*/determinism_hybrid_restore_attempt_reqs.count(
+                                                                               req->id) != 0,
+                                               /*hybrid_restore_applied=*/determinism_hybrid_restore_applied_reqs.count(
+                                                                             req->id) != 0,
+                                               /*chunked_prefill=*/determinism_chunked_prefill_reqs.count(req->id) != 0,
+                                               /*decode_cache_active=*/using_cached_decode_graph,
+                                               /*decode_cache_reused=*/reused_decode_graph,
+                                               /*prefill_cache_active=*/using_cached_prefill_graph);
                     }
 
                     int best_token = SampleToken(output, last_token_idx, sampling_params);
@@ -2976,6 +3401,58 @@ void EngineLoop(EngineState* state) {
                     if (req->finished || IsStopTokenId(current_model, best_token) ||
                         req->generated_count >= req->max_tokens) {
                         req->finished = true;
+                        if (IsMoEPathTraceDumpEnabled() && !IsMoETracePlumbingDisabled()) {
+                            const auto forward_calls = densecore::GetTelemetryCpuBackend().GetMoEForwardInvocationCount();
+                            const auto graph_wiring = GetMoEGraphWiringDebugCounter();
+                            const auto traces = densecore::GetTelemetryCpuBackend().GetMoEPathTraceSnapshot();
+                            std::cerr << "[MOE_TRACE_DUMP] request_id=" << req->id
+                                      << " generated_tokens=" << req->generated_count
+                                      << " moe_graph_wiring_count=" << graph_wiring
+                                      << " moe_forward_invocations=" << forward_calls
+                                      << " moe_path_entries=" << traces.size() << std::endl;
+                            for (const auto& entry : traces) {
+                                if (entry.decode_step >= 2) {
+                                    continue;
+                                }
+                                std::cerr << "[MOE_TRACE_DUMP] request_id=" << req->id
+                                          << " layer_idx=" << entry.layer_idx
+                                          << " expert_id=" << entry.expert_id
+                                          << " seq_id=" << entry.seq_id
+                                          << " token_idx=" << entry.token_idx
+                                          << " decode_step=" << entry.decode_step
+                                          << " n_past=" << entry.n_past
+                                          << " force_safe_reference=" << (entry.force_safe_reference ? 1 : 0)
+                                          << " safe_reference_mode=" << (entry.safe_reference_mode ? 1 : 0)
+                                          << " selected_path=" << static_cast<int>(entry.selected_path) << std::endl;
+                            }
+                        }
+                        if (IsSamplerTraceDumpEnabled()) {
+                            const auto sampling_trace = GetSamplingDebugTraceSnapshot();
+                            for (const auto& entry : sampling_trace) {
+                                if (entry.request_id != req->id || entry.output_token_index > 1) {
+                                    continue;
+                                }
+                                std::cerr << "[SAMPLER_TRACE_DUMP] request_id=" << req->id
+                                          << " output_token_index=" << entry.output_token_index
+                                          << " sampled_token_id=" << entry.sampled_token_id << std::endl;
+                                std::cerr << "[SAMPLER_TRACE_DUMP] request_id=" << req->id
+                                          << " output_token_index=" << entry.output_token_index
+                                          << " top_pre_penalty=";
+                                for (const auto& c : entry.top_pre_penalty) {
+                                    std::cerr << c.token_id << ":" << c.pre_penalty_logit << ":" << c.post_penalty_logit
+                                              << " ";
+                                }
+                                std::cerr << std::endl;
+                                std::cerr << "[SAMPLER_TRACE_DUMP] request_id=" << req->id
+                                          << " output_token_index=" << entry.output_token_index
+                                          << " top_post_penalty=";
+                                for (const auto& c : entry.top_post_penalty) {
+                                    std::cerr << c.token_id << ":" << c.pre_penalty_logit << ":" << c.post_penalty_logit
+                                              << " ";
+                                }
+                                std::cerr << std::endl;
+                            }
+                        }
                         if (!req_bench_fast_path && !req->utf8_pending.empty() &&
                             (req->callback || req->token_result_callback)) {
                             const size_t emit_len = Utf8ValidPrefixLength(req->utf8_pending);

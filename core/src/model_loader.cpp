@@ -42,6 +42,8 @@ constexpr const char* kGemma4PostMoeNormKey = "gemma4.post_feedforward_layernorm
 constexpr const char* kGemma4PostFfnNormKey = "gemma4.post_feedforward_layernorm.weight";
 }  // namespace
 
+bool IsMoELoaderDebugEnabled();
+
 // ============================================================================
 // Mock Model (Test Build Only)
 // ============================================================================
@@ -203,6 +205,37 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
     std::cout << "[DenseCore] Detected architecture: " << arch << std::endl;
 
+    auto get_exact_string = [&](const char* key) -> std::string {
+        if (!key) {
+            return {};
+        }
+        const int idx = gguf_find_key(ctx_gguf, key);
+        if (idx == -1 || gguf_get_kv_type(ctx_gguf, idx) != GGUF_TYPE_STRING) {
+            return {};
+        }
+        const char* value = gguf_get_val_str(ctx_gguf, idx);
+        return value ? value : "";
+    };
+
+    auto get_exact_string_array = [&](const char* key) -> std::vector<std::string> {
+        std::vector<std::string> values;
+        if (!key) {
+            return values;
+        }
+        const int idx = gguf_find_key(ctx_gguf, key);
+        if (idx == -1 || gguf_get_kv_type(ctx_gguf, idx) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(ctx_gguf, idx) != GGUF_TYPE_STRING) {
+            return values;
+        }
+        const int n = gguf_get_arr_n(ctx_gguf, idx);
+        values.reserve(static_cast<size_t>(std::max(0, n)));
+        for (int i = 0; i < n; ++i) {
+            const char* value = gguf_get_arr_str(ctx_gguf, idx, i);
+            values.emplace_back(value ? value : "");
+        }
+        return values;
+    };
+
     // Detect tokenizer metadata from GGUF.
     //
     // `tokenizer.ggml.model` describes the base tokenizer family (e.g. gpt2),
@@ -243,8 +276,78 @@ TransformerModel* LoadGGUFModel(const char* path) {
     detection_hints.has_gemma4_tokenizer_hint = tokenizer_lower.find("gemma4") != std::string::npos;
 
     bool used_hint_upgrade = false;
-    const auto resolved_arch =
+    auto resolved_arch =
         densecore::models::ResolveModelDescriptorWithHints(arch, detection_hints, &used_hint_upgrade);
+
+    const auto ascii_lower_copy = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    };
+    const auto contains_lower = [&](const std::string& haystack, const char* needle) {
+        if (!needle || !*needle) {
+            return false;
+        }
+        return ascii_lower_copy(haystack).find(needle) != std::string::npos;
+    };
+
+    const std::string general_name = get_exact_string("general.name");
+    const std::string general_basename = get_exact_string("general.basename");
+    const std::string general_repo = get_exact_string("general.repo");
+    const std::string general_hf_repo = get_exact_string("general.hf_repo_id");
+    const std::string hf_repo = get_exact_string("hf.repo_id");
+    const std::string hf_model_type =
+        !get_exact_string("hf.model_type").empty() ? get_exact_string("hf.model_type")
+        : !get_exact_string("general.hf_model_type").empty() ? get_exact_string("general.hf_model_type")
+                                                             : get_exact_string("transformers.model_type");
+    std::vector<std::string> hf_architectures = get_exact_string_array("hf.architectures");
+    if (hf_architectures.empty()) hf_architectures = get_exact_string_array("general.hf_architectures");
+    if (hf_architectures.empty()) hf_architectures = get_exact_string_array("transformers.architectures");
+    if (hf_architectures.empty()) {
+        const std::string single_arch = get_exact_string("hf.architecture");
+        if (!single_arch.empty()) {
+            hf_architectures.push_back(single_arch);
+        }
+    }
+
+    const std::string arch_lower = ascii_lower_copy(arch);
+    const bool qwen35_architecture = arch_lower == "qwen35moe";
+    const bool qwen35_hf_model_type = ascii_lower_copy(hf_model_type) == "qwen3_5_moe";
+    bool qwen35_hf_architecture = false;
+    for (const auto& value : hf_architectures) {
+        if (ascii_lower_copy(value) == "qwen3_5moeforconditionalgeneration") {
+            qwen35_hf_architecture = true;
+            break;
+        }
+    }
+    const bool qwen36_named_variant = contains_lower(general_name, "qwen3.6") || contains_lower(general_basename, "qwen3.6") ||
+                                      contains_lower(general_repo, "qwen3.6") || contains_lower(general_hf_repo, "qwen3.6") ||
+                                      contains_lower(hf_repo, "qwen3.6");
+    const bool qwen35_family_aux = qwen35_architecture || qwen35_hf_model_type || qwen35_hf_architecture || qwen36_named_variant;
+    std::string qwen35_resolution_signal;
+    if (qwen35_architecture) {
+        qwen35_resolution_signal = "general.architecture=qwen35moe";
+    } else if (qwen35_hf_model_type) {
+        qwen35_resolution_signal = "hf.model_type=qwen3_5_moe";
+    } else if (qwen35_hf_architecture) {
+        qwen35_resolution_signal = "hf.architectures contains Qwen3_5MoeForConditionalGeneration";
+    } else if (contains_lower(general_name, "qwen3.6")) {
+        qwen35_resolution_signal = "general.name contains Qwen3.6";
+    } else if (contains_lower(general_basename, "qwen3.6")) {
+        qwen35_resolution_signal = "general.basename contains Qwen3.6";
+    } else if (contains_lower(general_repo, "qwen3.6")) {
+        qwen35_resolution_signal = "general.repo contains Qwen3.6";
+    } else if (contains_lower(general_hf_repo, "qwen3.6")) {
+        qwen35_resolution_signal = "general.hf_repo_id contains Qwen3.6";
+    } else if (contains_lower(hf_repo, "qwen3.6")) {
+        qwen35_resolution_signal = "hf.repo_id contains Qwen3.6";
+    }
+    if (!resolved_arch.known && qwen35_family_aux) {
+        resolved_arch = densecore::models::ResolveModelDescriptor(qwen36_named_variant ? "qwen36" : "qwen35moe");
+    } else if (resolved_arch.known && resolved_arch.arch == ModelArch::QWEN35 && qwen36_named_variant) {
+        resolved_arch = densecore::models::ResolveModelDescriptor("qwen36");
+    }
+
     model->arch = resolved_arch.arch;
     model->variant = resolved_arch.variant;
     model->arch_flags = resolved_arch.arch_flags;
@@ -256,6 +359,10 @@ TransformerModel* LoadGGUFModel(const char* path) {
     } else if (used_hint_upgrade) {
         std::cerr << "[DenseCore] Warning: architecture '" << arch
                   << "' classified as Gemma4 from auxiliary metadata/tensor signatures" << std::endl;
+    }
+    if (qwen35_family_aux && model->arch == ModelArch::QWEN35 && !qwen35_resolution_signal.empty()) {
+        std::cout << "[DenseCore] Resolved " << densecore::models::ModelVariantName(model->variant)
+                  << " hybrid-SSM family via " << qwen35_resolution_signal << std::endl;
     }
 
     model->tokenizer_type = tokenizer_type;
@@ -274,19 +381,36 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
 
     auto find_prefixed_key = [&](const std::string& suffix) -> int {
-        std::string key = arch + "." + suffix;
-        int idx = gguf_find_key(ctx_gguf, key.c_str());
-        if (idx != -1) {
-            return idx;
+        std::vector<std::string> prefixes;
+        prefixes.reserve(8);
+        if (!arch.empty()) {
+            prefixes.push_back(arch);
         }
-        if (model->arch_flags.is_gemma4 && arch != "gemma4") {
-            key = "gemma4." + suffix;
-            idx = gguf_find_key(ctx_gguf, key.c_str());
+        if (model->arch_flags.is_hybrid_ssm) {
+            static const char* kHybridPrefixes[] = {"qwen35moe", "qwen3_5_moe", "qwen3_5_moe_text", "qwen35",
+                                                    "qwen36"};
+            for (const char* prefix : kHybridPrefixes) {
+                if (!prefix) continue;
+                if (std::find(prefixes.begin(), prefixes.end(), prefix) == prefixes.end()) {
+                    prefixes.emplace_back(prefix);
+                }
+            }
+        }
+        for (const auto& prefix : prefixes) {
+            std::string key = prefix + "." + suffix;
+            int idx = gguf_find_key(ctx_gguf, key.c_str());
             if (idx != -1) {
                 return idx;
             }
         }
-        key = "general." + suffix;
+        if (model->arch_flags.is_gemma4 && arch != "gemma4") {
+            const std::string key = "gemma4." + suffix;
+            const int idx = gguf_find_key(ctx_gguf, key.c_str());
+            if (idx != -1) {
+                return idx;
+            }
+        }
+        const std::string key = "general." + suffix;
         return gguf_find_key(ctx_gguf, key.c_str());
     };
 
@@ -703,6 +827,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
     // Load SSM parameters for hybrid models (Qwen3.5, Jamba, etc.)
     if (model->arch_flags.is_hybrid_ssm) {
         uint32_t tmp = 0;
+        const bool has_full_attention_interval_key = has_key("full_attention_interval");
         tmp = model->ssm_conv_kernel;
         get_u32("ssm.conv_kernel", tmp);
         model->ssm_conv_kernel = static_cast<int>(tmp);
@@ -718,17 +843,14 @@ TransformerModel* LoadGGUFModel(const char* path) {
         tmp = model->ssm_inner_size;
         get_u32("ssm.inner_size", tmp);
         model->ssm_inner_size = static_cast<int>(tmp);
-        tmp = model->ssm_full_attn_interval;
-        get_u32("full_attention_interval", tmp);
+        tmp = 0;
+        if (has_full_attention_interval_key) {
+            get_u32("full_attention_interval", tmp);
+        }
         model->ssm_full_attn_interval = static_cast<int>(tmp);
 
         const auto fail_hybrid_ssm = [&](const std::string& reason) {
-            std::cerr << "[DenseCore] FATAL: invalid hybrid SSM configuration: " << reason << std::endl;
-            if (model->backend) ggml_backend_free(model->backend);
-            gguf_free(ctx_gguf);
-            if (ctx_w) ggml_free(ctx_w);
-            delete model;
-            return static_cast<TransformerModel*>(nullptr);
+            return fail_load("invalid hybrid SSM configuration: " + reason);
         };
         if (model->ssm_inner_size <= 0 || model->ssm_state_size <= 0 || model->ssm_group_count <= 0 ||
             model->ssm_time_step_rank <= 0 || model->ssm_conv_kernel <= 0) {
@@ -743,19 +865,45 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
         std::vector<std::string> layer_types;
         get_str_array("layer_types", layer_types);
+        if (!layer_types.empty() && layer_types.size() != static_cast<size_t>(model->hparams.n_layer)) {
+            return fail_hybrid_ssm("partial hybrid layer_types export");
+        }
         if (!layer_types.empty()) {
             model->hybrid_layer_is_ssm.assign(model->hparams.n_layer, 0);
-            const size_t n = std::min(layer_types.size(), static_cast<size_t>(model->hparams.n_layer));
-            for (size_t i = 0; i < n; ++i) {
+            for (size_t i = 0; i < static_cast<size_t>(model->hparams.n_layer); ++i) {
                 std::string type = layer_types[i];
                 std::transform(type.begin(), type.end(), type.begin(),
                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                // Qwen3.5 GGUFs tag full-attention layers as "attention" (not "full_attention").
-                // Treat both as non-SSM; only mark as SSM for explicitly recurrent types.
                 const bool is_full_attn = (type == "full_attention" || type == "attention" || type == "transformer" ||
                                            type == "self_attention");
+                const bool is_linear_attn =
+                    (type == "linear_attention" || type == "linear_attn" || type == "ssm" || type == "gated_deltanet");
+                if (!is_full_attn && !is_linear_attn) {
+                    return fail_hybrid_ssm("unknown layer_types entry '" + layer_types[i] + "'");
+                }
                 model->hybrid_layer_is_ssm[i] = is_full_attn ? 0 : 1;
             }
+            if (model->ssm_full_attn_interval > 0) {
+                for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+                    const bool expected_ssm = (i % model->ssm_full_attn_interval) !=
+                                              static_cast<uint32_t>(model->ssm_full_attn_interval - 1);
+                    if ((model->hybrid_layer_is_ssm[i] != 0) != expected_ssm) {
+                        return fail_hybrid_ssm("layer_types schedule disagrees with full_attention_interval");
+                    }
+                }
+            }
+        } else if (model->arch == ModelArch::QWEN35 && has_full_attention_interval_key &&
+                   model->ssm_full_attn_interval == 4) {
+            model->hybrid_layer_is_ssm.assign(model->hparams.n_layer, 1);
+            for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+                if (((i + 1) % 4) == 0) {
+                    model->hybrid_layer_is_ssm[i] = 0;
+                }
+            }
+            std::cout << "[DenseCore] Reconstructed hybrid layer schedule from full_attention_interval="
+                      << model->ssm_full_attn_interval << " because layer_types metadata is missing" << std::endl;
+        } else {
+            return fail_hybrid_ssm("missing reliable layer_types/full_attention_interval metadata");
         }
 
         // Initialize SSM runtime states
@@ -765,10 +913,16 @@ TransformerModel* LoadGGUFModel(const char* path) {
             return fail_hybrid_ssm("derived conv_channels/head_dim must be positive");
         }
         int n_ssm_layers = 0;
+        int n_full_attn_layers = 0;
         for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
             if (model->IsHybridSSMLayer(static_cast<int>(i))) {
                 n_ssm_layers++;
+            } else {
+                n_full_attn_layers++;
             }
+        }
+        if (n_ssm_layers == 0 || n_full_attn_layers == 0) {
+            return fail_hybrid_ssm("hybrid schedule must contain both SSM and full-attention layers");
         }
         model->ssm_layer_states.resize(n_ssm_layers);
         for (auto& s : model->ssm_layer_states) {
@@ -780,6 +934,92 @@ TransformerModel* LoadGGUFModel(const char* path) {
                   << " n_heads=" << model->ssm_time_step_rank << " inner=" << model->ssm_inner_size
                   << " attn_interval=" << model->ssm_full_attn_interval << " n_ssm_layers=" << n_ssm_layers
                   << std::endl;
+        std::cout << "[DenseCore] Hybrid schedule summary: ssm_layers=" << n_ssm_layers
+                  << " attention_layers=" << n_full_attn_layers << std::endl;
+        if (model->variant == ModelVariant::QWEN36) {
+            struct Qwen36ExpectedProfile {
+                int hidden_size = 2048;
+                int n_layer = 40;
+                int full_attention_interval = 4;
+                int attn_heads = 16;
+                int kv_heads = 2;
+                int head_dim = 256;
+                int linear_key_heads = 16;
+                int linear_value_heads = 32;
+                int linear_key_dim = 128;
+                int linear_value_dim = 128;
+                int conv_kernel = 4;
+                int experts = 256;
+                int experts_per_token = 8;
+            } expected;
+
+            const bool strict_qwen36_profile = []() {
+                const char* env = std::getenv("DENSECORE_QWEN36_STRICT_PROFILE");
+                return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+            }();
+            const bool allow_qwen36_test_profile = []() {
+                const char* env = std::getenv("DENSECORE_QWEN36_ALLOW_TEST_PROFILE");
+                return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+            }();
+
+            std::vector<std::string> mismatches;
+            if (static_cast<int>(model->hparams.n_embd) != expected.hidden_size) {
+                mismatches.push_back("hidden_size");
+            }
+            if (static_cast<int>(model->hparams.n_layer) != expected.n_layer) {
+                mismatches.push_back("n_layer");
+            }
+            if (model->ssm_full_attn_interval != expected.full_attention_interval) {
+                mismatches.push_back("full_attention_interval");
+            }
+            if (static_cast<int>(model->hparams.n_head) != expected.attn_heads) {
+                mismatches.push_back("attention.head_count");
+            }
+            if (static_cast<int>(model->hparams.n_head_kv) != expected.kv_heads) {
+                mismatches.push_back("attention.head_count_kv");
+            }
+            if (static_cast<int>(model->hparams.n_embd_head_k) != expected.head_dim) {
+                mismatches.push_back("attention.key_length/head_dim");
+            }
+            if (model->ssm_group_count != expected.linear_key_heads) {
+                mismatches.push_back("linear_num_key_heads");
+            }
+            if (model->ssm_time_step_rank != expected.linear_value_heads) {
+                mismatches.push_back("linear_num_value_heads");
+            }
+            if ((model->ssm_group_count > 0 ? model->ssm_state_size : 0) != expected.linear_key_dim) {
+                mismatches.push_back("linear_key_head_dim");
+            }
+            if ((model->ssm_time_step_rank > 0 ? model->ssm_inner_size / model->ssm_time_step_rank : 0) !=
+                expected.linear_value_dim) {
+                mismatches.push_back("linear_value_head_dim");
+            }
+            if (model->ssm_conv_kernel != expected.conv_kernel) {
+                mismatches.push_back("linear_conv_kernel_dim");
+            }
+            if (static_cast<int>(model->hparams.n_experts) != expected.experts) {
+                mismatches.push_back("num_experts");
+            }
+            if (static_cast<int>(model->hparams.n_experts_used) != expected.experts_per_token) {
+                mismatches.push_back("num_experts_per_tok");
+            }
+            if (model->moe_n_shared_experts <= 0) {
+                mismatches.push_back("shared_expert");
+            }
+
+            if (!mismatches.empty()) {
+                std::cerr << "[DenseCore] Warning: Qwen3.6 profile metadata differs from the official 35B-A3B text "
+                             "profile in: ";
+                for (size_t i = 0; i < mismatches.size(); ++i) {
+                    if (i != 0) std::cerr << ", ";
+                    std::cerr << mismatches[i];
+                }
+                std::cerr << std::endl;
+                if (strict_qwen36_profile && !allow_qwen36_test_profile) {
+                    return fail_hybrid_ssm("Qwen3.6 strict profile validation failed");
+                }
+            }
+        }
         if (model->hparams.rope_sections[0] > 0 || model->hparams.rope_sections[1] > 0) {
             std::cout << "[DenseCore] RoPE sections: [" << model->hparams.rope_sections[0] << ", "
                       << model->hparams.rope_sections[1] << ", " << model->hparams.rope_sections[2] << ", "
@@ -1376,12 +1616,6 @@ TransformerModel* LoadGGUFModel(const char* path) {
     // Populate any missing layer tensors from GGUF metadata.
     populate_layer_tensors_from_gguf();
 
-    auto ascii_lower_copy = [](std::string s) {
-        std::transform(s.begin(), s.end(), s.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return s;
-    };
-
     auto find_layer_tensor_with_tokens = [&](const TransformerLayer& layer, const std::vector<std::string>& required,
                                              const std::vector<std::string>& forbidden = {}) -> struct ggml_tensor* {
         for (const auto& entry : layer.tensors) {
@@ -1413,6 +1647,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
     for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
         auto& layer = model->layers[i];
+        int expert_regex_hits = 0;
+        bool used_packed_expert_slices = false;
+        bool used_sep_expert_slices = false;
 
         if (!layer.Get(model_keys::kFfnGate)) {
             layer.Set(model_keys::kFfnGate, find_layer_tensor_with_tokens(layer, {"shared_experts", "gate_proj"}));
@@ -1452,6 +1689,26 @@ TransformerModel* LoadGGUFModel(const char* path) {
         const struct ggml_tensor* packed_down =
             find_layer_tensor_with_tokens(layer, {"experts", "down_proj"}, {"shared"});
 
+        // Gemma4 E26B/A4B GGUFs use packed MoE tensors named
+        // `ffn_gate_up_exps.weight` + `ffn_down_exps.weight` (with optional
+        // sidecar `ffn_down_exps.scale`) instead of `experts.*gate_up_proj`.
+        // Keep this narrowly scoped to Gemma4 to avoid changing unrelated MoE
+        // loaders.
+        if (model->arch_flags.is_gemma4) {
+            if (!packed_gate_up) {
+                packed_gate_up = find_layer_tensor_with_tokens(layer, {"ffn_gate_up_exps", "weight"});
+                if (!packed_gate_up) {
+                    packed_gate_up = find_layer_tensor_with_tokens(layer, {"ffn_gate_up_exps"}, {"scale"});
+                }
+            }
+            if (!packed_down) {
+                packed_down = find_layer_tensor_with_tokens(layer, {"ffn_down_exps", "weight"});
+                if (!packed_down) {
+                    packed_down = find_layer_tensor_with_tokens(layer, {"ffn_down_exps"}, {"scale"});
+                }
+            }
+        }
+
         if (packed_gate_up && packed_down &&
             i >= static_cast<uint32_t>(std::max(0, model->moe_first_k_dense_replace))) {
             int packed_experts = 0;
@@ -1466,6 +1723,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
             const int expert_count = std::min<int>(packed_experts, static_cast<int>(model->hparams.n_experts));
             if (expert_count > 0 && layer.Get(model_keys::kMoeGate)) {
                 layer.is_moe = true;
+                used_packed_expert_slices = true;
                 struct ggml_context* vctx = model->ctx_views ? model->ctx_views : model->ctx_w;
                 for (int expert_idx = 0; expert_idx < expert_count; ++expert_idx) {
                     const size_t gate_up_offset = static_cast<size_t>(expert_idx) * packed_gate_up->nb[2];
@@ -1502,16 +1760,19 @@ TransformerModel* LoadGGUFModel(const char* path) {
             if (std::regex_search(name, match, expert_gate_re) && match.size() >= 2) {
                 const size_t expert_idx = static_cast<size_t>(std::stoul(match[1].str()));
                 layer.SetExpert(expert_idx, model_keys::kFfnGate, tensor);
+                expert_regex_hits++;
                 continue;
             }
             if (std::regex_search(name, match, expert_up_re) && match.size() >= 2) {
                 const size_t expert_idx = static_cast<size_t>(std::stoul(match[1].str()));
                 layer.SetExpert(expert_idx, model_keys::kFfnUp, tensor);
+                expert_regex_hits++;
                 continue;
             }
             if (std::regex_search(name, match, expert_down_re) && match.size() >= 2) {
                 const size_t expert_idx = static_cast<size_t>(std::stoul(match[1].str()));
                 layer.SetExpert(expert_idx, model_keys::kFfnDown, tensor);
+                expert_regex_hits++;
             }
         }
 
@@ -1531,6 +1792,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 int expert_count = std::min<int>(n_exp, static_cast<int>(model->hparams.n_experts));
                 if (expert_count > 0 && i >= static_cast<uint32_t>(std::max(0, model->moe_first_k_dense_replace))) {
                     layer.is_moe = true;
+                    used_sep_expert_slices = true;
                     struct ggml_context* vctx2 = model->ctx_views ? model->ctx_views : model->ctx_w;
                     for (int ei = 0; ei < expert_count; ++ei) {
                         const size_t g_off = static_cast<size_t>(ei) * sep_gate->nb[2];
@@ -1556,6 +1818,31 @@ TransformerModel* LoadGGUFModel(const char* path) {
             if (model->hparams.n_experts == 0) {
                 model->hparams.n_experts = static_cast<uint32_t>(layer.NumExperts());
             }
+        }
+
+        if (IsMoELoaderDebugEnabled()) {
+            int expert_name_candidates = 0;
+            for (const auto& entry : layer.tensors) {
+                const std::string key_lower = ascii_lower_copy(entry.first);
+                if (key_lower.find("expert") != std::string::npos || key_lower.find("ffn_gate_exps") != std::string::npos ||
+                    key_lower.find("ffn_up_exps") != std::string::npos ||
+                    key_lower.find("ffn_down_exps") != std::string::npos) {
+                    expert_name_candidates++;
+                }
+            }
+            int reason_code = 0;
+            if (!layer.Get(model_keys::kMoeGate)) {
+                reason_code = 1;  // no_moe_gate
+            } else if (layer.NumExperts() == 0) {
+                reason_code = expert_name_candidates > 0 ? 3 : 2;  // 3: candidates but unmatched, 2: no candidates
+            }
+            std::fprintf(stderr,
+                         "[MOE_LOADER_LAYER] layer=%u is_moe=%d has_moe_gate=%d num_experts=%zu packed_gate_up=%d "
+                         "packed_down=%d used_packed=%d used_sep=%d regex_hits=%d expert_name_candidates=%d "
+                         "reason_code=%d\n",
+                         i, layer.is_moe ? 1 : 0, layer.Get(model_keys::kMoeGate) ? 1 : 0, layer.NumExperts(),
+                         packed_gate_up ? 1 : 0, packed_down ? 1 : 0, used_packed_expert_slices ? 1 : 0,
+                         used_sep_expert_slices ? 1 : 0, expert_regex_hits, expert_name_candidates, reason_code);
         }
 
         if (model->arch_flags.is_glm_dsa) {
@@ -1619,6 +1906,11 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 break;
             }
         }
+    }
+    if (model->hparams.n_experts > 0) {
+        std::cout << "[DenseCore] MoE summary: experts=" << model->hparams.n_experts
+                  << " top_k=" << model->hparams.n_experts_used
+                  << " shared_experts=" << model->moe_n_shared_experts << std::endl;
     }
 
     // Auto-compute head dimensions from weight tensor shapes.
@@ -1965,6 +2257,22 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
         std::cout << "[DenseCore] " << arch << " architecture validated: Q/K norms present on attention layers"
                   << std::endl;
+    }
+
+    if (model->arch_flags.is_hybrid_ssm) {
+        bool saw_qwen_vision_tensor = false;
+        for (const char* probe : {"visual.patch_embed.proj.weight", "vision_tower.patch_embed.proj.weight",
+                                  "vision_model.embeddings.patch_embedding.weight"}) {
+            if (ggml_get_tensor(model->ctx_w, probe) != nullptr) {
+                saw_qwen_vision_tensor = true;
+                break;
+            }
+        }
+        if (saw_qwen_vision_tensor) {
+            std::cout << "[DenseCore] Qwen3.6 vision tensors detected; running language-only text path; "
+                         "multimodal execution is unsupported in this patch."
+                      << std::endl;
+        }
     }
 
     // =========================================================================
@@ -3036,4 +3344,11 @@ TransformerModel* LoadModelFromExternal(const TransformerHParams& hparams, const
     std::cout << "[DenseCore] SmartLoader: Model loaded successfully (" << ctx_size / 1024 << " KB header)."
               << std::endl;
     return model;
+}
+bool IsMoELoaderDebugEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_MOE_LOADER");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
 }

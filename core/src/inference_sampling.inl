@@ -2,6 +2,38 @@
 // Grammar-Based Sampling Implementation
 // ============================================================================
 
+namespace {
+
+std::mutex& SamplingDebugTraceMutex() {
+    static std::mutex mu;
+    return mu;
+}
+
+std::vector<SamplingDebugTraceEntry>& SamplingDebugTraceStorage() {
+    static std::vector<SamplingDebugTraceEntry> entries;
+    return entries;
+}
+
+bool ShouldCaptureSamplingDebugTrace(const SamplingParams& params) {
+    if (params.request_id < 0 || params.output_token_index < 0) {
+        return false;
+    }
+    const char* env = std::getenv("DENSECORE_DEBUG_SAMPLER_TRACE");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+}  // namespace
+
+void ResetSamplingDebugTrace() {
+    std::lock_guard<std::mutex> lock(SamplingDebugTraceMutex());
+    SamplingDebugTraceStorage().clear();
+}
+
+std::vector<SamplingDebugTraceEntry> GetSamplingDebugTraceSnapshot() {
+    std::lock_guard<std::mutex> lock(SamplingDebugTraceMutex());
+    return SamplingDebugTraceStorage();
+}
+
 void InitGrammarConstraint(GrammarConstraint* grammar, const std::vector<std::string>& vocab) {
     if (!grammar) return;
 
@@ -510,6 +542,67 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
 
         return std::isfinite(v) ? v : -INFINITY;
     };
+    auto capture_top_candidates = [&](bool post_penalty) {
+        std::vector<SamplingDebugCandidate> top;
+        top.reserve(8);
+        auto worse_first = [](const SamplingDebugCandidate& a, const SamplingDebugCandidate& b) {
+            if (a.post_penalty_logit == b.post_penalty_logit) return a.token_id < b.token_id;
+            return a.post_penalty_logit > b.post_penalty_logit;
+        };
+        for (int i = 0; i < active_vocab; ++i) {
+            const int token_id = range_start + i;
+            float pre = base_logit_at(i);
+            if (!std::isfinite(pre) || (!requires_working_logits && (is_disallowed(token_id) || !is_allowed(token_id)))) {
+                pre = -INFINITY;
+            }
+            const float post = adjusted_logit_at(i);
+            if (!std::isfinite(post)) {
+                continue;
+            }
+            SamplingDebugCandidate cand;
+            cand.token_id = token_id;
+            cand.pre_penalty_logit = pre;
+            cand.post_penalty_logit = post;
+            if (!post_penalty) {
+                cand.post_penalty_logit = pre;
+            }
+            if (top.size() < 8) {
+                top.push_back(cand);
+                std::push_heap(top.begin(), top.end(), worse_first);
+            } else if (cand.post_penalty_logit > top.front().post_penalty_logit ||
+                       (cand.post_penalty_logit == top.front().post_penalty_logit && cand.token_id < top.front().token_id)) {
+                std::pop_heap(top.begin(), top.end(), worse_first);
+                top.back() = cand;
+                std::push_heap(top.begin(), top.end(), worse_first);
+            }
+        }
+        std::sort(top.begin(), top.end(), [](const SamplingDebugCandidate& a, const SamplingDebugCandidate& b) {
+            if (a.post_penalty_logit == b.post_penalty_logit) return a.token_id < b.token_id;
+            return a.post_penalty_logit > b.post_penalty_logit;
+        });
+        return top;
+    };
+    auto maybe_record_sampling_trace = [&](int sampled_token) {
+        if (!ShouldCaptureSamplingDebugTrace(params)) {
+            return;
+        }
+        SamplingDebugTraceEntry entry;
+        entry.request_id = params.request_id;
+        entry.output_token_index = params.output_token_index;
+        entry.sampled_token_id = sampled_token;
+        entry.temperature = params.temperature;
+        entry.top_p = params.top_p;
+        entry.top_k = params.top_k;
+        entry.repetition_penalty = params.repetition_penalty;
+        entry.top_pre_penalty = capture_top_candidates(false);
+        entry.top_post_penalty = capture_top_candidates(true);
+        std::lock_guard<std::mutex> lock(SamplingDebugTraceMutex());
+        auto& storage = SamplingDebugTraceStorage();
+        storage.push_back(std::move(entry));
+        if (storage.size() > 64) {
+            storage.erase(storage.begin(), storage.begin() + static_cast<std::ptrdiff_t>(storage.size() - 64));
+        }
+    };
     auto debug_dump_top_candidates = [&](const char* stage, int sampled_token) {
         if (debug_top_n <= 0 || !params.vocab) {
             return;
@@ -605,6 +698,7 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
 
     if (params.temperature <= 0.0f || (params.top_k <= 1 && params.top_p >= 1.0f && params.min_p <= 0.0f)) {
         const int token = finite_argmax_adjusted();
+        maybe_record_sampling_trace(token);
         debug_dump_top_candidates("argmax_adjusted", token);
         debug_log_sample(token);
         return token;
@@ -669,6 +763,7 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
 
     if (!found_finite || !std::isfinite(max_logit)) {
         const int token = finite_argmax_raw();
+        maybe_record_sampling_trace(token);
         debug_dump_top_candidates("argmax_raw_fallback", token);
         debug_log_sample(token);
         return token;
@@ -707,6 +802,7 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
     }
 
     if (!(sum_exp > 0.0f) || !std::isfinite(sum_exp)) {
+        maybe_record_sampling_trace(best_token);
         debug_dump_top_candidates("best_token_fallback", best_token);
         debug_log_sample(best_token);
         return best_token;
@@ -737,6 +833,7 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
     }
 
     if (candidates.empty()) {
+        maybe_record_sampling_trace(best_token);
         debug_dump_top_candidates("empty_candidates_fallback", best_token);
         debug_log_sample(best_token);
         return best_token;
@@ -747,6 +844,7 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         total_mass += candidate.mass;
     }
     if (!(total_mass > 0.0f) || !std::isfinite(total_mass)) {
+        maybe_record_sampling_trace(candidates.front().token_id);
         debug_dump_top_candidates("front_candidate_fallback", candidates.front().token_id);
         debug_log_sample(candidates.front().token_id);
         return candidates.front().token_id;
@@ -779,12 +877,14 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
     for (const auto& candidate : candidates) {
         cumulative_mass += candidate.mass;
         if (random_val <= cumulative_mass) {
+            maybe_record_sampling_trace(candidate.token_id);
             debug_dump_top_candidates("sampled", candidate.token_id);
             debug_log_sample(candidate.token_id);
             return candidate.token_id;
         }
     }
 
+    maybe_record_sampling_trace(candidates.front().token_id);
     debug_dump_top_candidates("sorted_front_fallback", candidates.front().token_id);
     debug_log_sample(candidates.front().token_id);
     return candidates.front().token_id;

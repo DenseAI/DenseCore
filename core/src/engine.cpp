@@ -654,11 +654,25 @@ bool ShouldPrimeQwenNoThinkingPrompt(const TransformerModel* model) {
     if (!descriptor.uses_qwen_thinking_env) {
         return false;
     }
+    auto try_parse_bool_env = [](const char* name, bool* out) {
+        if (!out) {
+            return false;
+        }
+        const char* env = std::getenv(name);
+        if (!env || env[0] == '\0') {
+            return false;
+        }
+        *out = std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0;
+        return true;
+    };
     if (descriptor.variant == ModelVariant::QWEN3) {
         return !ParseBoolEnv("DENSECORE_QWEN3_ENABLE_THINKING", true);
     }
     if (descriptor.variant == ModelVariant::QWEN35) {
         return !ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", false);
+    }
+    if (descriptor.variant == ModelVariant::QWEN36) {
+        return false;
     }
     return false;
 }
@@ -899,6 +913,7 @@ void ApplyDefaultLora(EngineState* state, Request* req) {
 void InitCommonRequest(EngineState* state, Request* req, int max_tokens, float temperature, float top_p, int top_k,
                        float repetition_penalty, const char** stop_sequences, int json_mode, TokenCallback callback,
                        void* user_data) {
+    ResetMoEGraphWiringDebugCounter();
     req->max_tokens = max_tokens;
     req->callback = callback;
     req->user_data = user_data;
@@ -1096,6 +1111,7 @@ int SubmitRequestWithTokenResults(DenseCoreHandle handle, const char* prompt, in
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "token_results");
     req->token_history = req->tokens;
+    LogRequestRuntimePath(model_entry->model.get(), prompt, req);
 
     AssignGenerationTier(req);
     EnqueueRequest(state, req);

@@ -8,6 +8,7 @@
 #include "hardware_topology.h"  // For compute thread affinity
 #include "matmul_backend.h"
 #include "models/model_inference_policy.h"
+#include "densecore/models/model_graph_capabilities.h"
 #include "optimization_bridge.h"  // Runtime SIMD dispatch
 
 #ifndef GGML_KQ_MASK_PAD
@@ -72,6 +73,25 @@ constexpr const char* kGemma4PreMoeNormKey = "gemma4.pre_feedforward_layernorm_2
 constexpr const char* kGemma4PostSharedNormKey = "gemma4.post_feedforward_layernorm_1.weight";
 constexpr const char* kGemma4PostMoeNormKey = "gemma4.post_feedforward_layernorm_2.weight";
 constexpr const char* kGemma4PostFfnNormKey = "gemma4.post_feedforward_layernorm.weight";
+std::atomic<uint64_t> g_moe_graph_wiring_debug_counter{0};
+
+enum class MoEWiringReasonCode : int {
+    Wired = 0,
+    ModelHasNoMoE = 1,
+    LayerFlagFalse = 2,
+    MissingMoeGate = 3,
+    NoExperts = 4,
+    DenseReplaceGate = 5,
+    LayerFlagMismatch = 6,
+};
+
+bool IsMoEWiringDebugEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_MOE_WIRING");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
 
 static struct ggml_tensor* BuildAttentionMaskTensor(struct ggml_context* ctx, int n_total_tokens, int n_queries,
                                                     int n_past, int sliding_window, int n_padded = -1) {
@@ -3403,6 +3423,20 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
     // 2. Transformer Layers
     // =========================================================================
     int ssm_ordinal_counter = 0;  // Counts SSM layers for state indexing
+    std::array<uint64_t, 7> moe_wiring_reason_counts{};
+    const bool moe_wiring_debug = IsMoEWiringDebugEnabled();
+    if (moe_wiring_debug) {
+        const auto resolution = densecore::models::ResolveGraphFamily(model);
+        std::fprintf(stderr,
+                     "[MOE_WIRING_MODEL] arch=%d variant=%d preferred_family=%s fail_closed=%d capabilities=%s "
+                     "n_layer=%d n_experts=%u top_k=%u moe_first_k_dense_replace=%d N=%d decode_only=%d\n",
+                     static_cast<int>(resolution.capabilities.arch),
+                     static_cast<int>(resolution.capabilities.variant),
+                     densecore::models::GraphFamilyName(resolution.preferred_family), resolution.fail_closed ? 1 : 0,
+                     densecore::models::FormatModelGraphCapabilities(resolution.capabilities).c_str(), n_layer,
+                     model->hparams.n_experts, model->hparams.n_experts_used, model->moe_first_k_dense_replace, N,
+                     decode_only_batch_layout ? 1 : 0);
+    }
     for (int il = 0; il < n_layer; ++il) {
         auto& layer = model->layers[il];
         auto* attn_norm = layer.Get(model_keys::kAttnNorm);
@@ -3433,6 +3467,40 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         auto* ffn_down = layer.Get(model_keys::kFfnDown);
         auto* ffn_shared_gate = layer.Get(model_keys::kFfnSharedGate);
         auto* moe_gate = layer.Get(model_keys::kMoeGate);
+        const int layer_num_experts = static_cast<int>(layer.NumExperts());
+        const int dense_replace_cutoff = std::max(0, model->moe_first_k_dense_replace);
+        const bool dense_replace_gate = il < dense_replace_cutoff;
+        const bool model_has_moe = model->hparams.n_experts > 0;
+        const bool has_moe_gate = moe_gate != nullptr;
+        const bool has_experts = layer_num_experts > 0;
+        const bool layer_moe_candidate = has_moe_gate && has_experts && !dense_replace_gate;
+        if (moe_wiring_debug) {
+            MoEWiringReasonCode reason = MoEWiringReasonCode::Wired;
+            if (!layer.is_moe) {
+                if (!model_has_moe) {
+                    reason = MoEWiringReasonCode::ModelHasNoMoE;
+                } else if (!has_moe_gate) {
+                    reason = MoEWiringReasonCode::MissingMoeGate;
+                } else if (!has_experts) {
+                    reason = MoEWiringReasonCode::NoExperts;
+                } else if (dense_replace_gate) {
+                    reason = MoEWiringReasonCode::DenseReplaceGate;
+                } else if (layer_moe_candidate) {
+                    reason = MoEWiringReasonCode::LayerFlagMismatch;
+                } else {
+                    reason = MoEWiringReasonCode::LayerFlagFalse;
+                }
+            }
+            const int reason_code = static_cast<int>(reason);
+            if (reason_code >= 0 && reason_code < static_cast<int>(moe_wiring_reason_counts.size())) {
+                moe_wiring_reason_counts[static_cast<size_t>(reason_code)]++;
+            }
+            std::fprintf(stderr,
+                         "[MOE_WIRING_LAYER] layer=%d is_moe_layer=%d has_moe_gate=%d num_experts=%d "
+                         "dense_replace_gate=%d model_has_moe=%d attempted=%d reason_code=%d\n",
+                         il, layer.is_moe ? 1 : 0, has_moe_gate ? 1 : 0, layer_num_experts, dense_replace_gate ? 1 : 0,
+                         model_has_moe ? 1 : 0, layer.is_moe ? 1 : 0, reason_code);
+        }
 
         struct ggml_tensor* inpL = cur;
         if (ShouldRunHiddenSnapshotProbe(il, "layer_input")) {
@@ -5200,6 +5268,11 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 throw densecore::InvalidArgumentException("Missing moe_gate weight in TransformerLayer");
             }
             struct ggml_tensor* gate_logits = smart_mul_mat(ctx_c, moe_gate, router_input, model);
+            {
+                char gate_name[64];
+                std::snprintf(gate_name, sizeof(gate_name), "blk.%d.moe_gate_logits", il);
+                ggml_set_name(gate_logits, gate_name);
+            }
             if (ShouldRunFfnProjectionReferenceProbe(il)) {
                 ProjectionReferenceUserData* gate_ref_ud = GetProjectionReferenceUserData();
                 gate_ref_ud->weight_tensor = moe_gate;
@@ -5266,8 +5339,13 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // Use map_custom2: src0=cur, src1=gate_logits
             // Use 1 task (single thread dispatch, threaded inside backend)
+            g_moe_graph_wiring_debug_counter.fetch_add(1, std::memory_order_relaxed);
             cur = ggml_map_custom2(ctx_c, moe_input, gate_logits, cb_moe_forward, 1, moe_ud);
-            ggml_set_name(cur, "moe_forward");
+            {
+                char moe_name[64];
+                std::snprintf(moe_name, sizeof(moe_name), "blk.%d.moe_forward", il);
+                ggml_set_name(cur, moe_name);
+            }
 
             // Shared-expert branch runs in parallel with routed experts.
             if (model->moe_n_shared_experts > 0 && ffn_gate && ffn_up && ffn_down) {
@@ -5595,6 +5673,18 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             void* layer_ud = static_cast<void*>(&layers[il]);
             cur = ggml_map_custom1(ctx_c, cur, cb_check_layer, 1, layer_ud);
         }
+    }
+    if (moe_wiring_debug) {
+        std::fprintf(stderr,
+                     "[MOE_WIRING_SUMMARY] reason_counts={wired:%llu,model_no_moe:%llu,layer_flag_false:%llu,"
+                     "missing_moe_gate:%llu,no_experts:%llu,dense_replace_gate:%llu,layer_flag_mismatch:%llu}\n",
+                     static_cast<unsigned long long>(moe_wiring_reason_counts[0]),
+                     static_cast<unsigned long long>(moe_wiring_reason_counts[1]),
+                     static_cast<unsigned long long>(moe_wiring_reason_counts[2]),
+                     static_cast<unsigned long long>(moe_wiring_reason_counts[3]),
+                     static_cast<unsigned long long>(moe_wiring_reason_counts[4]),
+                     static_cast<unsigned long long>(moe_wiring_reason_counts[5]),
+                     static_cast<unsigned long long>(moe_wiring_reason_counts[6]));
     }
 
     // =========================================================================
@@ -6144,6 +6234,12 @@ int MapRetainedHistoryIndexForTest(int n_past, int sliding_window, int sink_toke
 int GetArmQ4KNativeVecDotModeTest() {
     return static_cast<int>(::GetArmQ4KNativeVecDotMode());
 }
+void ResetMoEGraphWiringDebugCounter() {
+    ::g_moe_graph_wiring_debug_counter.store(0, std::memory_order_relaxed);
+}
+uint64_t GetMoEGraphWiringDebugCounter() {
+    return ::g_moe_graph_wiring_debug_counter.load(std::memory_order_relaxed);
+}
 void ResetHybridSSMQkvForceGgmlCache() {
     std::lock_guard<std::mutex> lock(::g_hybrid_ssm_qkv_force_ggml_mutex);
     ::g_hybrid_ssm_qkv_force_ggml_cached.store(false, std::memory_order_release);
@@ -6281,3 +6377,31 @@ struct ggml_tensor* SmartMulMatTest(struct ggml_context* ctx, struct ggml_tensor
 }  // namespace testing
 }  // namespace densecore
 #endif
+
+void ResetMoEGraphWiringDebugCounter() {
+    ::g_moe_graph_wiring_debug_counter.store(0, std::memory_order_relaxed);
+}
+
+uint64_t GetMoEGraphWiringDebugCounter() {
+    return ::g_moe_graph_wiring_debug_counter.load(std::memory_order_relaxed);
+}
+
+void ResetMoECallbackEntryCounter() {
+    ::ResetMoECallbackEntryCount();
+}
+
+uint64_t GetMoECallbackEntryCounter() {
+    return ::GetMoECallbackEntryCount();
+}
+
+uint64_t GetMoECallbackMissingUserdataCounter() {
+    return ::GetMoECallbackMissingUserdataCount();
+}
+
+uint64_t GetMoECallbackMissingBackendCounter() {
+    return ::GetMoECallbackMissingBackendCount();
+}
+
+uint64_t GetMoECallbackMissingExpertsCounter() {
+    return ::GetMoECallbackMissingExpertsCount();
+}

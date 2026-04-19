@@ -255,6 +255,7 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
         w.hidden_dim = 0;
         w.intermediate_dim = 0;
         w.use_gelu_activation = densecore::models::IsGemma4MoEModel(model, layer);
+        w.force_safe_reference = model && model->arch_flags.is_gemma4 && w.use_gelu_activation;
 
         auto* gw1 = layer->GetExpert(i, model_keys::kFfnGate);
         if (gw1) {
@@ -308,6 +309,34 @@ static bool IsMoEPageMigrationEnabled() {
 
 static bool IsBenchmarkMode() {
     return ParseTruthyEnv("DENSECORE_BENCH_MODE", false);
+}
+
+static std::atomic<uint64_t> g_moe_callback_entry_count{0};
+static std::atomic<uint64_t> g_moe_callback_missing_userdata_count{0};
+static std::atomic<uint64_t> g_moe_callback_missing_backend_count{0};
+static std::atomic<uint64_t> g_moe_callback_missing_experts_count{0};
+
+static void ResetMoECallbackEntryCount() {
+    g_moe_callback_entry_count.store(0, std::memory_order_relaxed);
+    g_moe_callback_missing_userdata_count.store(0, std::memory_order_relaxed);
+    g_moe_callback_missing_backend_count.store(0, std::memory_order_relaxed);
+    g_moe_callback_missing_experts_count.store(0, std::memory_order_relaxed);
+}
+
+static uint64_t GetMoECallbackEntryCount() {
+    return g_moe_callback_entry_count.load(std::memory_order_relaxed);
+}
+
+static uint64_t GetMoECallbackMissingUserdataCount() {
+    return g_moe_callback_missing_userdata_count.load(std::memory_order_relaxed);
+}
+
+static uint64_t GetMoECallbackMissingBackendCount() {
+    return g_moe_callback_missing_backend_count.load(std::memory_order_relaxed);
+}
+
+static uint64_t GetMoECallbackMissingExpertsCount() {
+    return g_moe_callback_missing_experts_count.load(std::memory_order_relaxed);
 }
 
 static bool IsMoEDebugLoggingEnabled() {
@@ -730,6 +759,7 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
                     int nth, void* userdata) {
     (void)nth;
     if (ith != 0) return;
+    g_moe_callback_entry_count.fetch_add(1, std::memory_order_relaxed);
     if (IsMoEDebugLoggingEnabled()) {
         static std::atomic<int> moe_call_count{0};
         int call_id = moe_call_count.fetch_add(1);
@@ -741,8 +771,18 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
         }
     }
     auto* ud = static_cast<MoEUserData*>(userdata);
-    if (!ud || !ud->layer || !ud->backend) return;
-    if (!ud->experts_registered || !ud->experts || ud->n_experts <= 0) return;
+    if (!ud || !ud->layer) {
+        g_moe_callback_missing_userdata_count.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!ud->backend) {
+        g_moe_callback_missing_backend_count.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!ud->experts_registered || !ud->experts || ud->n_experts <= 0) {
+        g_moe_callback_missing_experts_count.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
 
     // Routing (src1 = gate_logits)
     const bool debug_stage_timing = IsMoEStageTimingEnabled();
@@ -763,7 +803,8 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     densecore::Tensor t_input = GgmlToRowMajorTensor(src0);
     densecore::Tensor t_output = GgmlToRowMajorTensor(dst);
 
-    ud->backend->ForwardMoE(ud->layer, t_input, routing, ud->experts, ud->n_experts, &t_output);
+    ud->backend->ForwardMoE(ud->layer, ud->layer_idx, ud->batch, t_input, routing, ud->experts, ud->n_experts,
+                            &t_output);
     if (debug_stage_timing) {
         const auto backend_end = std::chrono::steady_clock::now();
         const auto route_us =
@@ -1557,6 +1598,111 @@ static void LogSSMCoreReferenceDiff(int layer_idx, int token_idx, int seq_idx, i
     }
 }
 
+static bool IsTraceQwen35SSMRuntimeContractEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_SSM_TRACE_RUNTIME_CONTRACT");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsReferenceSafeQwen35SSMDeltaEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_SSM_REFERENCE_SAFE_DELTA");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsCompareReferenceSafeQwen35SSMDeltaEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_SSM_COMPARE_REFERENCE_SAFE_DELTA");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static int TraceQwen35SSMMaxHeads() {
+    static const int value = []() {
+        const char* env = std::getenv("DENSECORE_SSM_TRACE_MAX_HEADS");
+        if (!env || env[0] == '\0') {
+            return 32;
+        }
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end == env || (end && *end != '\0') || parsed <= 0) {
+            return 32;
+        }
+        return static_cast<int>(parsed);
+    }();
+    return value;
+}
+
+static int TraceQwen35SSMMaxTokens() {
+    static const int value = []() {
+        const char* env = std::getenv("DENSECORE_SSM_TRACE_MAX_TOKENS");
+        if (!env || env[0] == '\0') {
+            return 1024;
+        }
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end == env || (end && *end != '\0') || parsed <= 0) {
+            return 1024;
+        }
+        return static_cast<int>(parsed);
+    }();
+    return value;
+}
+
+static uint64_t HashQwen35SSMFloatSpan(const float* data, size_t count) {
+    if (!data) {
+        return 0;
+    }
+    uint64_t hash = 1469598103934665603ull;
+    hash ^= static_cast<uint64_t>(count);
+    hash *= 1099511628211ull;
+    for (size_t i = 0; i < count; ++i) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, data + i, sizeof(bits));
+        hash ^= static_cast<uint64_t>(bits);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static void LogQwen35SSMRuntimeContract(const char* mode, int layer_idx, int token_idx, int seq_idx, int head_idx,
+                                        int src_k_head, int heads_per_group, uintptr_t token_state_base_ptr,
+                                        size_t token_state_elems, size_t state_offset_bytes, size_t state_span_bytes,
+                                        ptrdiff_t input_stride, ptrdiff_t output_stride, bool overlap_prev,
+                                        bool grouped_src_reused, uint64_t q_hash, uint64_t k_hash, uint64_t v_hash,
+                                        uint64_t state_in_hash, uint64_t state_out_hash, uint64_t y_hash) {
+    if (!IsTraceQwen35SSMRuntimeContractEnabled()) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "[SSM_RUNTIME_CONTRACT] mode=%s layer=%d token=%d seq=%d head=%d src_k_head=%d heads_per_group=%d "
+                 "base_ptr=0x%llx total_elems=%zu state_off_bytes=%zu state_span_bytes=%zu input_stride=%lld "
+                 "output_stride=%lld overlap_prev=%d grouped_src_reused=%d q_hash=0x%llx k_hash=0x%llx v_hash=0x%llx "
+                 "state_in=0x%llx state_out=0x%llx y_hash=0x%llx\n",
+                 mode ? mode : "unknown", layer_idx, token_idx, seq_idx, head_idx, src_k_head, heads_per_group,
+                 static_cast<unsigned long long>(token_state_base_ptr), token_state_elems, state_offset_bytes,
+                 state_span_bytes, static_cast<long long>(input_stride), static_cast<long long>(output_stride),
+                 overlap_prev ? 1 : 0, grouped_src_reused ? 1 : 0, static_cast<unsigned long long>(q_hash),
+                 static_cast<unsigned long long>(k_hash), static_cast<unsigned long long>(v_hash),
+                 static_cast<unsigned long long>(state_in_hash), static_cast<unsigned long long>(state_out_hash),
+                 static_cast<unsigned long long>(y_hash));
+}
+
+static void LogQwen35SSMLayerAggregate(const char* mode, int layer_idx, int token_idx, int seq_idx,
+                                       uint64_t aggregate_hash) {
+    if (!IsTraceQwen35SSMRuntimeContractEnabled()) {
+        return;
+    }
+    std::fprintf(stderr, "[SSM_LAYER_AGG] mode=%s layer=%d token=%d seq=%d aggregate_state_hash=0x%llx\n",
+                 mode ? mode : "unknown", layer_idx, token_idx, seq_idx,
+                 static_cast<unsigned long long>(aggregate_hash));
+}
+
 static bool RunQwen35ReferenceHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head,
                                        Qwen35SSMHeadStepStats* stats) {
     if (!cfg.input_t || !cfg.q_head || !cfg.k_head || !cfg.v_head || !cfg.z_head || !cfg.alpha_row || !cfg.beta_row ||
@@ -1772,11 +1918,6 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
     const ptrdiff_t qkv_stride = static_cast<ptrdiff_t>(b->nb[1] / sizeof(float));
     const ptrdiff_t input_stride = static_cast<ptrdiff_t>(c->nb[1] / sizeof(float));
     const ptrdiff_t out_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
-    if (ssm_passthrough || ssm_delta_passthrough) {
-        std::memset(y_out, 0, static_cast<size_t>(out_elems) * sizeof(float));
-        return;
-    }
-
     static const bool ssm_debug = (std::getenv("SSM_DEBUG") != nullptr);
     const int num_k_heads = ud->n_groups;
     const int num_v_heads = ud->n_heads;
@@ -1881,6 +2022,7 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
         std::fill(y, y + ud->d_inner, 0.0f);
         const float* input_t = input + static_cast<ptrdiff_t>(t) * input_stride;
         const float* z_t = z_proj + static_cast<ptrdiff_t>(t) * z_stride;
+        const int seq_idx = (ud->token_seq_ids && t < N) ? ud->token_seq_ids[t] : -1;
         
         const float* q_base;
         const float* k_base;
@@ -1915,8 +2057,63 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
             }
         }
 
+        float* token_ssm_state_base = ud->ssm_state;
+        size_t token_ssm_state_elems = 0;
+        if (ud->runtime_states && ud->token_seq_ids && ud->ssm_ordinal >= 0) {
+            if (seq_idx >= 0 && seq_idx < static_cast<int>(ud->runtime_states->size())) {
+                auto* seq_states = (*ud->runtime_states)[static_cast<size_t>(seq_idx)];
+                if (seq_states && ud->ssm_ordinal < static_cast<int>(seq_states->size())) {
+                    auto& seq_state = (*seq_states)[static_cast<size_t>(ud->ssm_ordinal)].ssm_state;
+                    const size_t required = static_cast<size_t>(ud->n_heads) * static_cast<size_t>(state_stride);
+                    if (seq_state.size() >= required) {
+                        token_ssm_state_base = seq_state.data();
+                        token_ssm_state_elems = seq_state.size();
+                    } else {
+                        token_ssm_state_base = nullptr;
+                    }
+                }
+            }
+        } else if (token_ssm_state_base) {
+            token_ssm_state_elems = static_cast<size_t>(ud->n_heads) * static_cast<size_t>(state_stride);
+        }
+
+        if (ssm_passthrough || ssm_delta_passthrough) {
+            if (IsTraceQwen35SSMRuntimeContractEnabled() && t < TraceQwen35SSMMaxTokens() && token_ssm_state_base) {
+                uint64_t token_hash = 1469598103934665603ull;
+                for (int h = 0; h < std::min(num_v_heads, TraceQwen35SSMMaxHeads()); ++h) {
+                    const int src_k_head =
+                        (num_k_heads == num_v_heads) ? h : std::min(num_k_heads - 1, h / heads_per_group);
+                    const bool grouped_src_reused = (num_k_heads != num_v_heads);
+                    const size_t state_offset_bytes =
+                        static_cast<size_t>(h) * static_cast<size_t>(state_stride) * sizeof(float);
+                    const size_t state_span_bytes = static_cast<size_t>(state_stride) * sizeof(float);
+                    const bool overlap_prev = h > 0 && state_offset_bytes <
+                        static_cast<size_t>(h - 1) * static_cast<size_t>(state_stride) * sizeof(float) + state_span_bytes;
+                    const float* q_head = q_base + static_cast<size_t>(src_k_head) * head_k_dim;
+                    const float* k_head = k_base + static_cast<size_t>(src_k_head) * head_k_dim;
+                    const float* v_head = v_base + static_cast<size_t>(h) * head_v_dim;
+                    const float* state = token_ssm_state_base + static_cast<size_t>(h) * state_stride;
+                    const uint64_t q_hash = HashQwen35SSMFloatSpan(q_head, static_cast<size_t>(head_k_dim));
+                    const uint64_t k_hash = HashQwen35SSMFloatSpan(k_head, static_cast<size_t>(head_k_dim));
+                    const uint64_t v_hash = HashQwen35SSMFloatSpan(v_head, static_cast<size_t>(head_v_dim));
+                    const uint64_t state_hash = HashQwen35SSMFloatSpan(state, static_cast<size_t>(state_stride));
+                    LogQwen35SSMRuntimeContract("passthrough", ud->layer_idx, t, seq_idx, h, src_k_head,
+                                                heads_per_group,
+                                                reinterpret_cast<uintptr_t>(token_ssm_state_base),
+                                                token_ssm_state_elems, state_offset_bytes, state_span_bytes,
+                                                input_stride, out_stride, overlap_prev, grouped_src_reused, q_hash,
+                                                k_hash, v_hash, state_hash, state_hash, 0);
+                    token_hash ^= state_hash;
+                    token_hash *= 1099511628211ull;
+                }
+                LogQwen35SSMLayerAggregate("passthrough", ud->layer_idx, t, seq_idx, token_hash);
+            }
+            std::memset(y_out + static_cast<ptrdiff_t>(t) * out_stride, 0, static_cast<size_t>(ud->d_inner) * sizeof(float));
+            continue;
+        }
+
+        uint64_t layer_aggregate_hash = 1469598103934665603ull;
         for (int h = 0; h < num_v_heads; ++h) {
-            const int seq_idx = (ud->token_seq_ids && t < N) ? ud->token_seq_ids[t] : -1;
             const int src_k_head = (num_k_heads == num_v_heads) ? h : std::min(num_k_heads - 1, h / heads_per_group);
             
             // Boundary check for QKV head slicing within the logical row
@@ -1945,27 +2142,23 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
 
             const float* alpha_row = ud->alpha_weight + static_cast<size_t>(h) * ud->n_embd;
             const float* beta_row = ud->beta_weight + static_cast<size_t>(h) * ud->n_embd;
-            float* ssm_state_base = ud->ssm_state;
-            if (ud->runtime_states && ud->token_seq_ids && ud->ssm_ordinal >= 0) {
-                const int seq_idx = ud->token_seq_ids[t];
-                if (seq_idx >= 0 && seq_idx < static_cast<int>(ud->runtime_states->size())) {
-                    auto* seq_states = (*ud->runtime_states)[static_cast<size_t>(seq_idx)];
-                    if (seq_states && ud->ssm_ordinal < static_cast<int>(seq_states->size())) {
-                        auto& seq_state = (*seq_states)[static_cast<size_t>(ud->ssm_ordinal)].ssm_state;
-                        const size_t required = static_cast<size_t>(ud->n_heads) * static_cast<size_t>(state_stride);
-                        if (seq_state.size() >= required) {
-                            ssm_state_base = seq_state.data();
-                        } else {
-                            ssm_state_base = nullptr;
-                        }
-                    }
-                }
-            }
-            if (!ssm_state_base) {
+            if (!token_ssm_state_base) {
                 continue;
             }
-            float* state = ssm_state_base + static_cast<size_t>(h) * state_stride;
+            const size_t state_offset = static_cast<size_t>(h) * static_cast<size_t>(state_stride);
+            const size_t state_elems = static_cast<size_t>(state_stride);
+            if (state_offset + state_elems > token_ssm_state_elems) {
+                FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h,
+                                           "SSM delta: head state span exceeds resolved runtime state");
+            }
+            float* state = token_ssm_state_base + state_offset;
             float* y_head = y + static_cast<size_t>(h) * head_v_dim;
+            const uint64_t q_hash = HashQwen35SSMFloatSpan(q_head, static_cast<size_t>(head_k_dim));
+            const uint64_t k_hash = HashQwen35SSMFloatSpan(k_head, static_cast<size_t>(head_k_dim));
+            const uint64_t v_hash = HashQwen35SSMFloatSpan(v_head, static_cast<size_t>(head_v_dim));
+            const uint64_t state_before_hash = HashQwen35SSMFloatSpan(state, state_elems);
+            const bool overlap_prev = h > 0 && state_offset < (static_cast<size_t>(h - 1) * static_cast<size_t>(state_stride) + state_elems);
+            const bool grouped_src_reused = (num_k_heads != num_v_heads);
             const float* norm_weight_head = ud->norm_weight;
             if (ud->norm_layout == Qwen35SSMNormLayout::FLATTENED_D_INNER) {
                 norm_weight_head += static_cast<size_t>(h) * head_v_dim;
@@ -2011,15 +2204,64 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
 
             Qwen35SSMHeadStepStats step_stats{};
             Qwen35SSMHeadStepDebugBuffers step_debug{};
+            Qwen35SSMHeadStepTrace step_trace{};
             step_debug.q_norm = q_norm;
             step_debug.k_norm = k_norm;
             step_debug.kv_mem = kv_mem;
             step_debug.delta = delta;
             step_debug.y_pre_norm = y_pre_norm;
-            if (!Qwen35RunGatedDeltaHeadStep(cfg, state, y_head, &step_stats, &step_debug)) {
+            bool step_ok = false;
+            if (IsReferenceSafeQwen35SSMDeltaEnabled()) {
+                step_ok = Qwen35RunGatedDeltaHeadStepReferenceSafe(cfg, state, state, y_head, &step_stats, &step_debug,
+                                                                  &step_trace);
+            } else {
+                step_ok = Qwen35RunGatedDeltaHeadStepWithWriteback(cfg, state, state, y_head, &step_stats, &step_debug);
+                step_trace.state_in_hash = state_before_hash;
+                step_trace.state_out_hash = HashQwen35SSMFloatSpan(state, state_elems);
+                step_trace.y_hash = HashQwen35SSMFloatSpan(y_head, static_cast<size_t>(head_v_dim));
+            }
+            if (!step_ok) {
                 FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h,
                                            "Qwen35RunGatedDeltaHeadStep rejected runtime inputs");
             }
+            if (IsCompareReferenceSafeQwen35SSMDeltaEnabled()) {
+                std::vector<float> reference_state(state_elems, 0.0f);
+                std::vector<float> reference_y(static_cast<size_t>(head_v_dim), 0.0f);
+                std::memcpy(reference_state.data(), token_ssm_state_base + state_offset, state_elems * sizeof(float));
+                std::memcpy(reference_state.data(), state, state_elems * sizeof(float));
+                std::memcpy(reference_state.data(), token_ssm_state_base + state_offset, state_elems * sizeof(float));
+                Qwen35SSMHeadStepTrace reference_trace{};
+                if (!Qwen35RunGatedDeltaHeadStepReferenceSafe(cfg, token_ssm_state_base + state_offset,
+                                                              reference_state.data(), reference_y.data(), nullptr,
+                                                              nullptr, &reference_trace)) {
+                    FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h,
+                                               "Qwen35RunGatedDeltaHeadStepReferenceSafe rejected runtime inputs");
+                }
+                const uint64_t normal_state_hash = HashQwen35SSMFloatSpan(state, state_elems);
+                const uint64_t ref_state_hash = HashQwen35SSMFloatSpan(reference_state.data(), state_elems);
+                const uint64_t normal_y_hash = HashQwen35SSMFloatSpan(y_head, static_cast<size_t>(head_v_dim));
+                const uint64_t ref_y_hash = HashQwen35SSMFloatSpan(reference_y.data(), static_cast<size_t>(head_v_dim));
+                if (normal_state_hash != ref_state_hash || normal_y_hash != ref_y_hash) {
+                    std::fprintf(stderr,
+                                 "[SSM_REFERENCE_SAFE_MISMATCH] layer=%d token=%d seq=%d head=%d "
+                                 "normal_state=0x%llx ref_state=0x%llx normal_y=0x%llx ref_y=0x%llx\n",
+                                 ud->layer_idx, t, seq_idx, h, static_cast<unsigned long long>(normal_state_hash),
+                                 static_cast<unsigned long long>(ref_state_hash),
+                                 static_cast<unsigned long long>(normal_y_hash),
+                                 static_cast<unsigned long long>(ref_y_hash));
+                }
+            }
+            if (IsTraceQwen35SSMRuntimeContractEnabled() && t < TraceQwen35SSMMaxTokens() &&
+                h < TraceQwen35SSMMaxHeads()) {
+                LogQwen35SSMRuntimeContract(IsReferenceSafeQwen35SSMDeltaEnabled() ? "reference_safe" : "normal",
+                                            ud->layer_idx, t, seq_idx, h, src_k_head, heads_per_group,
+                                            reinterpret_cast<uintptr_t>(token_ssm_state_base), token_ssm_state_elems,
+                                            state_offset * sizeof(float), state_elems * sizeof(float), input_stride,
+                                            out_stride, overlap_prev, grouped_src_reused, q_hash, k_hash, v_hash,
+                                            state_before_hash, step_trace.state_out_hash, step_trace.y_hash);
+            }
+            layer_aggregate_hash ^= step_trace.state_out_hash;
+            layer_aggregate_hash *= 1099511628211ull;
             if (debug_core_ref) {
                 LogSSMCoreReferenceDiff(ud->layer_idx, t, seq_idx, h, "delta_reference", "state", state,
                                         ref_state.data(), state_stride);
@@ -2063,6 +2305,11 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
                         step_stats.alpha, step_stats.g, step_stats.decay, step_stats.beta_gate, q_norm[0], k_norm[0],
                         v_head[0], cfg.z_head[0], y_head[0]);
             }
+        }
+
+        if (IsTraceQwen35SSMRuntimeContractEnabled() && t < TraceQwen35SSMMaxTokens()) {
+            LogQwen35SSMLayerAggregate(IsReferenceSafeQwen35SSMDeltaEnabled() ? "reference_safe" : "normal",
+                                       ud->layer_idx, t, seq_idx, layer_aggregate_hash);
         }
 
         std::memcpy(y_out + static_cast<ptrdiff_t>(t) * out_stride, y,

@@ -80,6 +80,19 @@ bool IsMoESafeReferenceModeEnabled() {
     return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
+bool ShouldForceMoESafeReference(const CpuBackend::ExpertWeights* expert) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return expert && expert->force_safe_reference;
+#else
+    (void)expert;
+    return false;
+#endif
+}
+
+bool IsMoESafeReferenceModeEnabled(const CpuBackend::ExpertWeights* expert) {
+    return IsMoESafeReferenceModeEnabled() || ShouldForceMoESafeReference(expert);
+}
+
 bool IsMoEMatmulPathDebugEnabled() {
     const char* env = std::getenv("DENSECORE_DEBUG_MOE_MATMUL_PATHS");
     return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
@@ -97,6 +110,37 @@ void LogMoEMatmulPath(const char* path, int M, int K, int N, int group_size, boo
     std::fprintf(stderr, "[MOE_MATMUL_PATH] path=%s M=%d K=%d N=%d group_size=%d allow_parallel=%d\n",
                  path ? path : "unknown", M, K, N, group_size, allow_parallel ? 1 : 0);
 }
+
+CpuBackend::MoEProjectionPath ParseMoEProjectionPath(const char* path) {
+    if (!path) {
+        return CpuBackend::MoEProjectionPath::Unknown;
+    }
+    if (std::strcmp(path, "direct_hwy") == 0) {
+        return CpuBackend::MoEProjectionPath::PackedInt4Fast;
+    }
+    if (std::strcmp(path, "backend_gemmint4") == 0) {
+        return CpuBackend::MoEProjectionPath::RuntimeGemmInt4;
+    }
+    if (std::strcmp(path, "ggml_quantized_vecdot") == 0) {
+        return CpuBackend::MoEProjectionPath::GgmlQuantizedVecDot;
+    }
+    if (std::strcmp(path, "reference_f32") == 0) {
+        return CpuBackend::MoEProjectionPath::ReferenceF32;
+    }
+    if (std::strcmp(path, "dense_f32") == 0) {
+        return CpuBackend::MoEProjectionPath::DenseF32;
+    }
+    return CpuBackend::MoEProjectionPath::Unknown;
+}
+
+struct MoEExecutionTraceContext {
+    int layer_idx = -1;
+    int seq_id = -1;
+    int token_idx = -1;
+    int decode_step = -1;
+    int n_past = -1;
+    int expert_id = -1;
+};
 
 bool ShouldParallelizeExpertFFNInner(int64_t batch, int64_t hidden_dim, int64_t intermediate_dim) {
     const char* force_env = std::getenv("DENSECORE_MOE_FORCE_INNER_PARALLEL");
@@ -444,7 +488,8 @@ template <size_t N> bool FixedArrayContains(const std::array<int, N>& values, in
 }
 
 bool TryRunPackedInt4Projection(CpuBackend* backend, const CpuBackend::ExpertPackedInt4Weight& binding,
-                                const Tensor& input, Tensor* output, int numa_node, bool allow_parallel);
+                                const Tensor& input, Tensor* output, int numa_node, bool allow_parallel,
+                                CpuBackend::MoEProjectionPath* selected_path = nullptr);
 
 bool ExpertUsesPackedInt4Only(const CpuBackend::ExpertWeights& expert) {
     if (!expert.w1_int4.IsValid() || !expert.w2_int4.IsValid()) {
@@ -653,7 +698,8 @@ bool TryRunPackedInt4FusedSwiGLUProjectionDirect(CpuBackend* backend,
 
 void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& input,
                            const CpuBackend::ExpertWeights& expert, const Tensor& w1, const Tensor& w2,
-                           const Tensor& w3, Tensor* output, bool allow_inner_parallel = true) {
+                           const Tensor& w3, Tensor* output, bool allow_inner_parallel = true,
+                           const MoEExecutionTraceContext* trace_ctx = nullptr) {
     if (!backend || !output) {
         return;
     }
@@ -673,7 +719,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     const size_t hidden_size = static_cast<size_t>(batch * intermediate_dim);
     const bool enable_inner_parallel =
         allow_inner_parallel && ShouldParallelizeExpertFFNInner(batch, hidden_dim, intermediate_dim);
-    const bool safe_reference_mode = IsMoESafeReferenceModeEnabled();
+    const bool safe_reference_mode = IsMoESafeReferenceModeEnabled(&expert);
 
     hidden_scratch.Resize(backend, hidden_size);
     Tensor hidden = Tensor::Make2D(hidden_scratch.ptr, batch, intermediate_dim);
@@ -686,13 +732,35 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     }
 
     // Unified projection dispatch: packed INT4 -> ggml quantized GEMV -> F32 dense
-    const auto run_projection = [&](const Tensor& src, const Tensor& dense_weight,
+    const auto run_projection = [&](const char projection_slot, const Tensor& src, const Tensor& dense_weight,
                                     const CpuBackend::ExpertPackedInt4Weight& int4_binding,
                                     const CpuBackend::ExpertWeight& raw_weight, int ggml_type_id, int64_t proj_rows,
                                     int64_t proj_cols, Tensor* dst) {
+        auto record_path = [&](const char* path_name) {
+            if (!trace_ctx) {
+                return;
+            }
+            CpuBackend::MoEPathTraceEntry entry;
+            entry.layer_idx = trace_ctx->layer_idx;
+            entry.seq_id = trace_ctx->seq_id;
+            entry.token_idx = trace_ctx->token_idx;
+            entry.decode_step = trace_ctx->decode_step;
+            entry.n_past = trace_ctx->n_past;
+            entry.expert_id = trace_ctx->expert_id;
+            entry.force_safe_reference = expert.force_safe_reference;
+            entry.safe_reference_mode = safe_reference_mode;
+            entry.projection[0] = projection_slot;
+            entry.projection[1] = '\0';
+            entry.selected_path = ParseMoEProjectionPath(path_name);
+            backend->RecordMoEPathTrace(entry);
+        };
         // Path 1: Packed INT4 (custom DenseCore format)
+        CpuBackend::MoEProjectionPath packed_path = CpuBackend::MoEProjectionPath::Unknown;
         if (!safe_reference_mode &&
-            TryRunPackedInt4Projection(backend, int4_binding, src, dst, numa_node, enable_inner_parallel)) {
+            TryRunPackedInt4Projection(backend, int4_binding, src, dst, numa_node, enable_inner_parallel,
+                                       &packed_path)) {
+            record_path(packed_path == CpuBackend::MoEProjectionPath::PackedInt4Fast ? "direct_hwy"
+                                                                                     : "backend_gemmint4");
             return;
         }
         // Path 2: Native ggml quantized GEMV (Q4_K, Q4_0, etc.) -> zero dequantization
@@ -701,6 +769,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
                                           numa_node, enable_inner_parallel)) {
             LogMoEMatmulPath("ggml_quantized_vecdot", static_cast<int>(src.shape[0]), static_cast<int>(src.shape[1]),
                              static_cast<int>(dst->shape[1]), int4_binding.group_size, enable_inner_parallel);
+            record_path("ggml_quantized_vecdot");
             return;
         }
         // Path 3: F32 dense matmul fallback (requires pre-dequantized weight)
@@ -708,6 +777,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
             LogMoEMatmulPath(safe_reference_mode ? "reference_f32" : "dense_f32",
                              static_cast<int>(src.shape[0]), static_cast<int>(src.shape[1]),
                              static_cast<int>(dst->shape[1]), int4_binding.group_size, enable_inner_parallel);
+            record_path(safe_reference_mode ? "reference_f32" : "dense_f32");
             backend->MatMulTransB(src, dense_weight, dst, numa_node);
         }
     };
@@ -720,7 +790,8 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     if (!used_fused_int4_swiglu) {
         const auto w1_begin =
             debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        run_projection(input, w1, expert.w1_int4, expert.w1, expert.w1_type, intermediate_dim, hidden_dim, &hidden);
+        run_projection('1', input, w1, expert.w1_int4, expert.w1, expert.w1_type, intermediate_dim, hidden_dim,
+                       &hidden);
         if (debug_ffn_timing) {
             w1_duration += (std::chrono::steady_clock::now() - w1_begin);
         }
@@ -730,7 +801,8 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         Tensor gate = Tensor::Make2D(gate_scratch.ptr, batch, intermediate_dim);
         const auto gate_begin =
             debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        run_projection(input, w3, expert.w3_int4, expert.w3, expert.w3_type, intermediate_dim, hidden_dim, &gate);
+        run_projection('3', input, w3, expert.w3_int4, expert.w3, expert.w3_type, intermediate_dim, hidden_dim,
+                       &gate);
         if (debug_ffn_timing) {
             gate_duration += (std::chrono::steady_clock::now() - gate_begin);
         }
@@ -765,7 +837,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     }
 
     const auto w2_begin = debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    run_projection(hidden, w2, expert.w2_int4, expert.w2, expert.w2_type, hidden_dim, intermediate_dim, output);
+    run_projection('2', hidden, w2, expert.w2_int4, expert.w2, expert.w2_type, hidden_dim, intermediate_dim, output);
     if (debug_ffn_timing) {
         w2_duration += (std::chrono::steady_clock::now() - w2_begin);
         static std::atomic<int> log_budget{0};
@@ -791,7 +863,8 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
 }
 
 bool TryRunPackedInt4Projection(CpuBackend* backend, const CpuBackend::ExpertPackedInt4Weight& binding,
-                                const Tensor& input, Tensor* output, int numa_node, bool allow_parallel = true) {
+                                const Tensor& input, Tensor* output, int numa_node, bool allow_parallel,
+                                CpuBackend::MoEProjectionPath* selected_path) {
     if (!backend || !output || !binding.IsValid() || !input.IsValid() || !output->IsValid() ||
         input.dtype != DType::F32 || output->dtype != DType::F32 || input.ndim != 2 || output->ndim != 2) {
         return false;
@@ -804,6 +877,9 @@ bool TryRunPackedInt4Projection(CpuBackend* backend, const CpuBackend::ExpertPac
     if (TryRunPackedInt4ProjectionDirect(backend, binding, input, output, numa_node, allow_parallel)) {
         LogMoEMatmulPath("direct_hwy", static_cast<int>(input.shape[0]), static_cast<int>(input.shape[1]),
                          static_cast<int>(output->shape[1]), binding.group_size, allow_parallel);
+        if (selected_path) {
+            *selected_path = CpuBackend::MoEProjectionPath::PackedInt4Fast;
+        }
         return true;
     }
 
@@ -825,16 +901,19 @@ bool TryRunPackedInt4Projection(CpuBackend* backend, const CpuBackend::ExpertPac
     backend->GemmInt4(input, W, S, Z, output, binding.group_size, numa_node);
     LogMoEMatmulPath("backend_gemmint4", static_cast<int>(input.shape[0]), static_cast<int>(input.shape[1]),
                      static_cast<int>(output->shape[1]), binding.group_size, allow_parallel);
+    if (selected_path) {
+        *selected_path = CpuBackend::MoEProjectionPath::RuntimeGemmInt4;
+    }
     return true;
 }
 
 size_t GetExpertMatrixDequantBytes(int ggml_type_id, const CpuBackend::ExpertPackedInt4Weight& int4_binding,
-                                   int64_t rows, int64_t cols) {
+                                   int64_t rows, int64_t cols, bool safe_reference_mode) {
     if (rows <= 0 || cols <= 0 || ggml_type_id == GGML_TYPE_F32) {
         return 0;
     }
     if (int4_binding.IsValid()) {
-        return IsMoESafeReferenceModeEnabled() ? static_cast<size_t>(rows * cols * sizeof(float)) : 0;
+        return safe_reference_mode ? static_cast<size_t>(rows * cols * sizeof(float)) : 0;
     }
     return static_cast<size_t>(rows * cols * sizeof(float));
 }
@@ -1036,16 +1115,29 @@ void CpuBackend::DispatchExpertFFN(const TransformerLayer* layer_key, int expert
 
 void CpuBackend::ForwardMoE(const Tensor& input, const moe::MoERouteResult& routing,
                             const std::vector<ExpertWeights>& experts, Tensor* output) {
-    ForwardMoE(nullptr, input, routing, experts.data(), static_cast<int>(experts.size()), output);
+    ForwardMoE(nullptr, -1, nullptr, input, routing, experts.data(), static_cast<int>(experts.size()), output);
 }
 
 void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& input, const moe::MoERouteResult& routing,
                             const std::vector<ExpertWeights>& experts, Tensor* output) {
-    ForwardMoE(layer_key, input, routing, experts.data(), static_cast<int>(experts.size()), output);
+    ForwardMoE(layer_key, -1, nullptr, input, routing, experts.data(), static_cast<int>(experts.size()), output);
+}
+
+void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, int layer_idx, const BatchSpec* batch,
+                            const Tensor& input, const moe::MoERouteResult& routing,
+                            const std::vector<ExpertWeights>& experts, Tensor* output) {
+    ForwardMoE(layer_key, layer_idx, batch, input, routing, experts.data(), static_cast<int>(experts.size()), output);
 }
 
 void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& input, const moe::MoERouteResult& routing,
                             const ExpertWeights* experts, int num_experts, Tensor* output) {
+    ForwardMoE(layer_key, -1, nullptr, input, routing, experts, num_experts, output);
+}
+
+void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, int layer_idx, const BatchSpec* batch,
+                            const Tensor& input, const moe::MoERouteResult& routing, const ExpertWeights* experts,
+                            int num_experts, Tensor* output) {
+    moe_forward_invocation_count_.fetch_add(1, std::memory_order_relaxed);
     const int batch_size = routing.batch_size;
     const int top_k = routing.top_k;
     const size_t hidden_dim = input.shape[1];
@@ -1121,7 +1213,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
         batch_size <= 4 && total_assignments <= kSmallDecodeMaxAssignments && !arm_large_expert_pool;
     const bool has_token_indices = !routing.token_indices.empty();
     const float* input_data = input.DataAs<float>();
-    const bool safe_reference_mode = IsMoESafeReferenceModeEnabled();
+    const bool safe_reference_mode =
+        num_experts > 0 ? IsMoESafeReferenceModeEnabled(&experts[0]) : IsMoESafeReferenceModeEnabled();
     bool small_decode_requires_general_path = false;
     if (small_decode_candidate) {
         for (size_t i = 0; i < assignment_count; ++i) {
@@ -1311,12 +1404,12 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                 dequant_cache_enabled && (cache_all_active_experts || local_hot || reused_last_batch);
             const size_t cacheable_bytes =
                 GetExpertMatrixDequantBytes(exp.w1_type, exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                            static_cast<int64_t>(exp.hidden_dim)) +
+                                            static_cast<int64_t>(exp.hidden_dim), safe_reference_mode) +
                 GetExpertMatrixDequantBytes(exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
-                                            static_cast<int64_t>(exp.intermediate_dim)) +
+                                            static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode) +
                 ((exp.w3.ptr != nullptr)
                      ? GetExpertMatrixDequantBytes(exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                                   static_cast<int64_t>(exp.hidden_dim))
+                                                   static_cast<int64_t>(exp.hidden_dim), safe_reference_mode)
                      : 0);
             if (should_try_cache && cacheable_bytes > 0 && cacheable_bytes <= dequant_cache_budget) {
                 std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> existing_entry;
@@ -1481,7 +1574,26 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                                static_cast<int64_t>(hidden_dim));
             Tensor expert_out = Tensor::Make2D(small_decode_output_scratch.ptr, 1, static_cast<int64_t>(hidden_dim));
             const int expert_numa_node = profiler ? profiler->GetExpertNumaNode(expert_id) : -1;
-            DispatchExpertFFNImpl(this, expert_numa_node, expert_input, exp, w1, w2, w3, &expert_out);
+            MoEExecutionTraceContext trace_ctx;
+            trace_ctx.layer_idx = layer_idx;
+            trace_ctx.expert_id = expert_id;
+            trace_ctx.token_idx = token_idx;
+            if (batch && trace_ctx.token_idx >= 0 && trace_ctx.token_idx < static_cast<int>(batch->seq_id.size())) {
+                trace_ctx.seq_id = batch->seq_id[static_cast<size_t>(trace_ctx.token_idx)];
+                if (trace_ctx.seq_id >= 0 && trace_ctx.seq_id < static_cast<int>(batch->n_past.size())) {
+                    trace_ctx.n_past = batch->n_past[static_cast<size_t>(trace_ctx.seq_id)];
+                    std::lock_guard<std::mutex> lock(moe_path_trace_mutex_);
+                    const auto last_it = moe_decode_last_n_past_.find(trace_ctx.seq_id);
+                    if (last_it == moe_decode_last_n_past_.end() || last_it->second != trace_ctx.n_past) {
+                        moe_decode_last_n_past_[trace_ctx.seq_id] = trace_ctx.n_past;
+                        trace_ctx.decode_step = moe_decode_step_ordinals_[trace_ctx.seq_id]++;
+                    } else {
+                        trace_ctx.decode_step = std::max(0, moe_decode_step_ordinals_[trace_ctx.seq_id] - 1);
+                    }
+                }
+            }
+            DispatchExpertFFNImpl(this, expert_numa_node, expert_input, exp, w1, w2, w3, &expert_out,
+                                  true, &trace_ctx);
 
             float* dst = out_data + static_cast<size_t>(token_idx) * hidden_dim;
             const float* src = small_decode_output_scratch.ptr;
@@ -1838,12 +1950,12 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                  previous_batch_set.find(work.expert_id) != previous_batch_set.end() || work.count > 1);
             const size_t cacheable_bytes =
                 GetExpertMatrixDequantBytes(exp.w1_type, exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                            static_cast<int64_t>(exp.hidden_dim)) +
+                                            static_cast<int64_t>(exp.hidden_dim), safe_reference_mode) +
                 GetExpertMatrixDequantBytes(exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
-                                            static_cast<int64_t>(exp.intermediate_dim)) +
+                                            static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode) +
                 ((exp.w3.ptr != nullptr)
                      ? GetExpertMatrixDequantBytes(exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                                   static_cast<int64_t>(exp.hidden_dim))
+                                                   static_cast<int64_t>(exp.hidden_dim), safe_reference_mode)
                      : 0);
             if (should_try_cache && cacheable_bytes > 0 && cacheable_bytes <= dequant_cache_budget) {
                 std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> existing_entry;
@@ -1977,8 +2089,27 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
 
             const auto expert_begin =
                 debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            MoEExecutionTraceContext trace_ctx;
+            trace_ctx.layer_idx = layer_idx;
+            trace_ctx.expert_id = work.expert_id;
+            trace_ctx.token_idx = (work.count == 1) ? reorder_map.token_indices[static_cast<size_t>(work.start)] : -1;
+            if (batch && trace_ctx.token_idx >= 0 &&
+                trace_ctx.token_idx < static_cast<int>(batch->seq_id.size())) {
+                trace_ctx.seq_id = batch->seq_id[static_cast<size_t>(trace_ctx.token_idx)];
+                if (trace_ctx.seq_id >= 0 && trace_ctx.seq_id < static_cast<int>(batch->n_past.size())) {
+                    trace_ctx.n_past = batch->n_past[static_cast<size_t>(trace_ctx.seq_id)];
+                    std::lock_guard<std::mutex> lock(moe_path_trace_mutex_);
+                    const auto last_it = moe_decode_last_n_past_.find(trace_ctx.seq_id);
+                    if (last_it == moe_decode_last_n_past_.end() || last_it->second != trace_ctx.n_past) {
+                        moe_decode_last_n_past_[trace_ctx.seq_id] = trace_ctx.n_past;
+                        trace_ctx.decode_step = moe_decode_step_ordinals_[trace_ctx.seq_id]++;
+                    } else {
+                        trace_ctx.decode_step = std::max(0, moe_decode_step_ordinals_[trace_ctx.seq_id] - 1);
+                    }
+                }
+            }
             DispatchExpertFFNImpl(this, work.numa_node, expert_input, exp, w1, w2, w3, &expert_out,
-                                  allow_inner_parallel);
+                                  allow_inner_parallel, &trace_ctx);
             if (debug_timing) {
                 local_expert_duration += (std::chrono::steady_clock::now() - expert_begin);
             }
@@ -2033,6 +2164,33 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                          expert_ms, reorder_out_ms, total_ms);
         }
     }
+}
+
+void CpuBackend::ResetMoEPathTrace() {
+    std::lock_guard<std::mutex> lock(moe_path_trace_mutex_);
+    moe_path_trace_.clear();
+    moe_forward_invocation_count_.store(0, std::memory_order_relaxed);
+    moe_decode_step_ordinals_.clear();
+    moe_decode_last_n_past_.clear();
+}
+
+std::vector<CpuBackend::MoEPathTraceEntry> CpuBackend::GetMoEPathTraceSnapshot() const {
+    std::lock_guard<std::mutex> lock(moe_path_trace_mutex_);
+    return moe_path_trace_;
+}
+
+void CpuBackend::RecordMoEPathTrace(const MoEPathTraceEntry& entry) {
+    std::lock_guard<std::mutex> lock(moe_path_trace_mutex_);
+    moe_path_trace_.push_back(entry);
+    if (moe_path_trace_.size() > 512) {
+        moe_path_trace_.erase(moe_path_trace_.begin(),
+                              moe_path_trace_.begin() +
+                                  static_cast<std::ptrdiff_t>(moe_path_trace_.size() - 512));
+    }
+}
+
+uint64_t CpuBackend::GetMoEForwardInvocationCount() const {
+    return moe_forward_invocation_count_.load(std::memory_order_relaxed);
 }
 
 }  // namespace densecore

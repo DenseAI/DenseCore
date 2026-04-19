@@ -49,6 +49,7 @@
 
 // Forward declaration shared across namespaces.
 struct TransformerLayer;
+struct BatchSpec;
 
 namespace densecore {
 
@@ -355,6 +356,7 @@ public:
         int hidden_dim;                    ///< Model hidden dimension
         int intermediate_dim;              ///< FFN intermediate dimension
         bool use_gelu_activation = false;  ///< Gemma4-style gated GELU instead of SiLU
+        bool force_safe_reference = false; ///< Force F32 reference matmul path for parity-sensitive experts
         int w1_type = 0;                   ///< ggml_type of w1 (0 = GGML_TYPE_F32)
         int w2_type = 0;                   ///< ggml_type of w2
         int w3_type = 0;                   ///< ggml_type of w3
@@ -389,6 +391,28 @@ public:
         uint64_t total_cached_experts = 0;
         uint64_t total_dequantized_experts = 0;
         uint64_t total_dequantized_bytes = 0;
+    };
+
+    enum class MoEProjectionPath : uint8_t {
+        Unknown = 0,
+        PackedInt4Fast,
+        RuntimeGemmInt4,
+        GgmlQuantizedVecDot,
+        ReferenceF32,
+        DenseF32,
+    };
+
+    struct MoEPathTraceEntry {
+        int layer_idx = -1;
+        int seq_id = -1;
+        int token_idx = -1;
+        int decode_step = -1;
+        int n_past = -1;
+        int expert_id = -1;
+        bool force_safe_reference = false;
+        bool safe_reference_mode = false;
+        char projection[3] = {'?', '\0', '\0'};
+        MoEProjectionPath selected_path = MoEProjectionPath::Unknown;
     };
 
     /**
@@ -535,9 +559,17 @@ public:
                     Tensor* output);
     void ForwardMoE(const TransformerLayer* layer_key, const Tensor& input, const moe::MoERouteResult& routing,
                     const std::vector<ExpertWeights>& experts, Tensor* output);
+    void ForwardMoE(const TransformerLayer* layer_key, int layer_idx, const BatchSpec* batch, const Tensor& input,
+                    const moe::MoERouteResult& routing, const std::vector<ExpertWeights>& experts, Tensor* output);
     void ForwardMoE(const TransformerLayer* layer_key, const Tensor& input, const moe::MoERouteResult& routing,
                     const ExpertWeights* experts, int num_experts, Tensor* output);
+    void ForwardMoE(const TransformerLayer* layer_key, int layer_idx, const BatchSpec* batch, const Tensor& input,
+                    const moe::MoERouteResult& routing, const ExpertWeights* experts, int num_experts, Tensor* output);
     MoERuntimeStatsSnapshot GetMoERuntimeStatsSnapshot() const;
+    void ResetMoEPathTrace();
+    std::vector<MoEPathTraceEntry> GetMoEPathTraceSnapshot() const;
+    void RecordMoEPathTrace(const MoEPathTraceEntry& entry);
+    uint64_t GetMoEForwardInvocationCount() const;
 
     // ===========================================================================
     // Dependency Injection (optional)
@@ -639,6 +671,11 @@ private:
     std::atomic<uint64_t> moe_stats_total_cached_experts_{0};
     std::atomic<uint64_t> moe_stats_total_dequantized_experts_{0};
     std::atomic<uint64_t> moe_stats_total_dequantized_bytes_{0};
+    mutable std::mutex moe_path_trace_mutex_;
+    std::vector<MoEPathTraceEntry> moe_path_trace_;
+    std::atomic<uint64_t> moe_forward_invocation_count_{0};
+    std::unordered_map<int, int> moe_decode_step_ordinals_;
+    std::unordered_map<int, int> moe_decode_last_n_past_;
 
     // Cached OpRegistry dispatch pointers (resolved on first use)
     mutable MatMulOps* cached_matmul_ops_ = nullptr;
@@ -655,6 +692,7 @@ private:
  * The singleton is created on first use and destroyed at program exit.
  */
 DENSECORE_API CpuBackend& GetCpuBackend();
+DENSECORE_API CpuBackend& GetTelemetryCpuBackend();
 DENSECORE_API void UpdateBackendThreads(int n_threads);
 DENSECORE_API int GetBackendThreadCount();
 

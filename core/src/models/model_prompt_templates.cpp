@@ -27,6 +27,18 @@ bool ParseBoolEnv(const char* name, bool default_value) {
     return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0;
 }
 
+bool TryParseBoolEnv(const char* name, bool* out) {
+    if (!out) {
+        return false;
+    }
+    const char* env = std::getenv(name);
+    if (!env || env[0] == '\0') {
+        return false;
+    }
+    *out = std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0;
+    return true;
+}
+
 bool PromptAlreadyTemplated(const std::string& prompt) {
     return prompt.find("<|im_start|>") != std::string::npos || prompt.find("<|im_end|>") != std::string::npos ||
            prompt.find("<|assistant|>") != std::string::npos || prompt.find("<|user|>") != std::string::npos ||
@@ -217,11 +229,29 @@ bool ResolveQwenThinkingEnabled(const TransformerModel* model) {
     if (descriptor.variant == ModelVariant::QWEN35) {
         return ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", false);
     }
+    if (descriptor.variant == ModelVariant::QWEN36) {
+        bool enabled = true;
+        if (TryParseBoolEnv("DENSECORE_QWEN36_ENABLE_THINKING", &enabled)) {
+            return enabled;
+        }
+        return ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", true);
+    }
     return true;
 }
 
+bool SupportsQwenNoThinkDirective(const TransformerModel* model) {
+    if (!model) {
+        return false;
+    }
+    const auto& descriptor = DescribeModel(model);
+    if (!descriptor.uses_qwen_thinking_env) {
+        return false;
+    }
+    return descriptor.variant != ModelVariant::QWEN36;
+}
+
 bool ShouldPrimeQwenNoThinking(const TransformerModel* model) {
-    if (!ModelUsesQwenThinkingEnv(model)) return false;
+    if (!ModelUsesQwenThinkingEnv(model) || !SupportsQwenNoThinkDirective(model)) return false;
     return !ResolveQwenThinkingEnabled(model);
 }
 
@@ -385,7 +415,7 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         std::string wrapped;
         wrapped.reserve(prompt.size() + 160);
         std::string user_prompt = prompt;
-        if (profile.supports_thinking && !profile.thinking_enabled) {
+        if (profile.supports_thinking && !profile.thinking_enabled && SupportsQwenNoThinkDirective(model)) {
             user_prompt = AppendQwenNoThinkDirective(std::move(user_prompt));
         }
         wrapped += profile.open_tag;
@@ -480,7 +510,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
                 }
             } else if (role == "user") {
                 std::string content = TrimCopy(messages[i].content);
-                if (!thinking_enabled && static_cast<int>(i) == last_user_index) {
+                if (!thinking_enabled && static_cast<int>(i) == last_user_index && SupportsQwenNoThinkDirective(model)) {
                     content = AppendQwenNoThinkDirective(std::move(content));
                 }
                 append_block(profile.user_role, content);

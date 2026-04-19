@@ -43,6 +43,12 @@ struct Qwen35SSMHeadStepDebugBuffers {
     float* y_pre_norm = nullptr;  // [head_dim_v]
 };
 
+struct Qwen35SSMHeadStepTrace {
+    uint64_t state_in_hash = 0;
+    uint64_t state_out_hash = 0;
+    uint64_t y_hash = 0;
+};
+
 enum class Qwen35SSMNormLayout {
     INVALID = 0,
     SHARED_HEAD_DIM,
@@ -57,6 +63,8 @@ bool Qwen35CanonicalizePerHeadVector(const float* raw, const int64_t ne[4], int 
 Qwen35SSMNormLayout Qwen35CanonicalizeNorm(const float* raw, const int64_t ne[4], int head_dim_v, int d_inner,
                                            std::vector<float>* out);
 
+size_t Qwen35SSMHeadStateElements(int head_dim_k, int head_dim_v);
+
 // Runs one Qwen3.5 gated-delta recurrent step for a single head.
 //
 // `state_kv` uses the canonical reference layout [K, V], flattened as
@@ -65,5 +73,21 @@ Qwen35SSMNormLayout Qwen35CanonicalizeNorm(const float* raw, const int64_t ne[4]
 bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head,
                                  Qwen35SSMHeadStepStats* stats = nullptr,
                                  Qwen35SSMHeadStepDebugBuffers* debug = nullptr);
+
+// Runs the same head step through an isolated scratch copy, then writes the
+// entire canonical [K, V] state span back to `state_out_kv`.
+bool Qwen35RunGatedDeltaHeadStepWithWriteback(const Qwen35SSMHeadStepConfig& cfg, const float* state_in_kv,
+                                              float* state_out_kv, float* y_head,
+                                              Qwen35SSMHeadStepStats* stats = nullptr,
+                                              Qwen35SSMHeadStepDebugBuffers* debug = nullptr);
+
+// Debug-only correctness-first path:
+// materialize state into scratch, run the delta step, write the full result into
+// a freshly zeroed destination slice, then copy that slice back out.
+bool Qwen35RunGatedDeltaHeadStepReferenceSafe(const Qwen35SSMHeadStepConfig& cfg, const float* state_in_kv,
+                                              float* state_out_kv, float* y_head,
+                                              Qwen35SSMHeadStepStats* stats = nullptr,
+                                              Qwen35SSMHeadStepDebugBuffers* debug = nullptr,
+                                              Qwen35SSMHeadStepTrace* trace = nullptr);
 
 #endif  // DENSECORE_QWEN35_SSM_MATH_H
