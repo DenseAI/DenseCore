@@ -35,6 +35,18 @@ static HiddenSnapshotUserData* AllocateHiddenSnapshotUserData(struct ggml_contex
     return reinterpret_cast<HiddenSnapshotUserData*>(storage->data);
 }
 
+static Gemma4KVSummaryUserData* AllocateGemma4KVSummaryUserData(struct ggml_context* ctx_c) {
+    if (!ctx_c) {
+        return nullptr;
+    }
+    struct ggml_tensor* storage = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I8, sizeof(Gemma4KVSummaryUserData));
+    if (!storage || !storage->data) {
+        return nullptr;
+    }
+    std::memset(storage->data, 0, sizeof(Gemma4KVSummaryUserData));
+    return reinterpret_cast<Gemma4KVSummaryUserData*>(storage->data);
+}
+
 void cb_pack_glm_dsa_q(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
                        int nth, void* userdata) {
     (void)src0;
@@ -306,6 +318,91 @@ static bool IsMoEStageTimingEnabled() {
     return ParseTruthyEnv("DENSECORE_DEBUG_MOE_STAGE_TIMING", false);
 }
 
+static bool IsMoEDetailedTraceEnabled() {
+    return ParseTruthyEnv("DENSECORE_DEBUG_MOE_TRACE", false);
+}
+
+static int GetMoEDebugSelectedLayer() {
+    static const int layer = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_MOE_LAYER");
+        if (!env || env[0] == '\0') return -1;
+        char* end = nullptr;
+        const long parsed = std::strtol(env, &end, 10);
+        return (end == env) ? -1 : static_cast<int>(parsed);
+    }();
+    return layer;
+}
+
+static int GetMoEDebugSelectedToken() {
+    static const int token = std::max(0, ParsePositiveEnvInt("DENSECORE_DEBUG_MOE_TOKEN", 0));
+    return token;
+}
+
+static bool ShouldTraceMoELayer(const MoEUserData* ud) {
+    if (!IsMoEDetailedTraceEnabled() || !ud) {
+        return false;
+    }
+    const int selected_layer = GetMoEDebugSelectedLayer();
+    return selected_layer < 0 || ud->layer_idx == selected_layer;
+}
+
+static void DumpMoERouteTrace(const struct ggml_tensor* gate_logits, const MoEUserData* ud,
+                              const densecore::moe::MoERouteResult& routing) {
+    if (!ShouldTraceMoELayer(ud) || !gate_logits || !gate_logits->data || routing.batch_size <= 0) {
+        return;
+    }
+
+    const int token_idx = std::min(GetMoEDebugSelectedToken(), routing.batch_size - 1);
+    const int n_experts = static_cast<int>(gate_logits->ne[0]);
+    const float* logits = reinterpret_cast<const float*>(gate_logits->data);
+    const float* row = logits + static_cast<size_t>(token_idx) * n_experts;
+
+    std::fprintf(stderr,
+                 "[MOE_TRACE_ROUTE] layer=%d token=%d batch=%d experts=%d top_k=%d shared=%d scale=%g norm_topk=%d\n",
+                 ud->layer_idx, token_idx, routing.batch_size, n_experts, routing.top_k,
+                 ud->model ? ud->model->moe_n_shared_experts : 0,
+                 ud->model ? static_cast<double>(ud->model->moe_routed_scaling_factor) : 0.0,
+                 (ud->model && ud->model->moe_norm_topk_prob) ? 1 : 0);
+    std::fprintf(stderr, "[MOE_TRACE_ROUTE] logits=");
+    for (int e = 0; e < n_experts; ++e) {
+        if (e != 0) std::fputc(',', stderr);
+        std::fprintf(stderr, "%g", static_cast<double>(row[e]));
+    }
+    std::fputc('\n', stderr);
+    std::fprintf(stderr, "[MOE_TRACE_ROUTE] selected=");
+    for (int k = 0; k < routing.top_k; ++k) {
+        const size_t idx = static_cast<size_t>(token_idx * routing.top_k + k);
+        std::fprintf(stderr, "%s(%d,%g)", k == 0 ? "" : ",", routing.expert_ids[idx],
+                     static_cast<double>(routing.weights[idx]));
+    }
+    std::fputc('\n', stderr);
+    std::fprintf(stderr, "[MOE_TRACE_ROUTE] token_indices=");
+    for (int k = 0; k < routing.top_k; ++k) {
+        const size_t idx = static_cast<size_t>(token_idx * routing.top_k + k);
+        std::fprintf(stderr, "%s%d", k == 0 ? "" : ",", routing.token_indices[idx]);
+    }
+    std::fputc('\n', stderr);
+}
+
+static void DumpMoEOutputTrace(const struct ggml_tensor* dst, const MoEUserData* ud) {
+    if (!ShouldTraceMoELayer(ud) || !dst || !dst->data) {
+        return;
+    }
+    const int64_t elems = ggml_nelements(dst);
+    const float* values = reinterpret_cast<const float*>(dst->data);
+    double sum = 0.0;
+    double abs_sum = 0.0;
+    double sq_sum = 0.0;
+    for (int64_t i = 0; i < elems; ++i) {
+        const double v = static_cast<double>(values[i]);
+        sum += v;
+        abs_sum += std::fabs(v);
+        sq_sum += v * v;
+    }
+    std::fprintf(stderr, "[MOE_TRACE_OUT] layer=%d elems=%lld sum=%g abs_sum=%g sq_sum=%g\n", ud->layer_idx,
+                 static_cast<long long>(elems), sum, abs_sum, sq_sum);
+}
+
 static void EnsureMoERebalanceThread(densecore::CpuBackend* backend) {
     if (IsBenchmarkMode() || !backend || backend->IsRebalanceThreadRunning()) {
         return;
@@ -561,13 +658,12 @@ static bool RouteMoESoftmaxTopK(const struct ggml_tensor* gate_logits, const MoE
         return false;
     }
 
-    thread_local std::vector<float> route_workspace;
+    thread_local std::vector<uint8_t> route_workspace;
     thread_local densecore::moe::MoERoutingWorkspace ws;
     const size_t workspace_bytes = densecore::moe::GetMoERoutingWorkspaceSize(batch_size, n_experts, top_k);
-    const size_t workspace_floats = (workspace_bytes + sizeof(float) - 1) / sizeof(float);
-    route_workspace.resize(workspace_floats);
-    if (!densecore::moe::InitMoERoutingWorkspace(&ws, route_workspace.data(), route_workspace.size() * sizeof(float),
-                                                 batch_size, n_experts, top_k)) {
+    route_workspace.resize(workspace_bytes + 64);
+    if (!densecore::moe::InitMoERoutingWorkspace(&ws, route_workspace.data(), route_workspace.size(), batch_size,
+                                                 n_experts, top_k)) {
         return false;
     }
     if (!densecore::moe::MoETopKRoute(logits, batch_size, n_experts, top_k, ud->model->moe_norm_topk_prob, routing,
@@ -600,13 +696,12 @@ static bool RouteMoEGemma4TopK(const struct ggml_tensor* gate_logits, const MoEU
         return false;
     }
 
-    thread_local std::vector<float> route_workspace;
+    thread_local std::vector<uint8_t> route_workspace;
     thread_local densecore::moe::MoERoutingWorkspace ws;
     const size_t workspace_bytes = densecore::moe::GetMoERoutingWorkspaceSize(batch_size, n_experts, top_k);
-    const size_t workspace_floats = (workspace_bytes + sizeof(float) - 1) / sizeof(float);
-    route_workspace.resize(workspace_floats);
-    if (!densecore::moe::InitMoERoutingWorkspace(&ws, route_workspace.data(), route_workspace.size() * sizeof(float),
-                                                 batch_size, n_experts, top_k)) {
+    route_workspace.resize(workspace_bytes + 64);
+    if (!densecore::moe::InitMoERoutingWorkspace(&ws, route_workspace.data(), route_workspace.size(), batch_size,
+                                                 n_experts, top_k)) {
         return false;
     }
     // Gemma4 MoE uses sigmoid routing: sigmoid applied independently to each expert
@@ -658,6 +753,7 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
                         : densecore::models::IsGemma4MoEModel(ud->model, ud->layer) ? RouteMoEGemma4TopK(src1, ud, &routing)
                                                                  : RouteMoESoftmaxTopK(src1, ud, &routing);
     if (!routed || routing.expert_ids.empty()) return;
+    DumpMoERouteTrace(src1, ud, routing);
     const auto route_end = debug_stage_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     UpdateSchedulerExperts(ud, routing);
     const auto scheduler_end =
@@ -683,6 +779,7 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
                      static_cast<long long>(route_us), static_cast<long long>(scheduler_us),
                      static_cast<long long>(backend_us));
     }
+    DumpMoEOutputTrace(dst, ud);
     if (IsMoEDebugLoggingEnabled()) {
         static std::atomic<int> moe_out_count{0};
         const int call_id = moe_out_count.fetch_add(1);
@@ -1033,6 +1130,74 @@ static void cb_hidden_snapshot_probe(struct ggml_tensor* dst, const struct ggml_
         std::fprintf(stderr, " %.8g", row[i]);
     }
     std::fprintf(stderr, "\n");
+}
+
+static void cb_gemma4_kv_summary_probe(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                       void* userdata) {
+    (void)nth;
+    if (ith != 0) return;
+
+    auto* ud = static_cast<Gemma4KVSummaryUserData*>(userdata);
+    if (!ud || !dst || !src || !src->data || src->type != GGML_TYPE_F32) {
+        return;
+    }
+    if (dst->data && src->data) {
+        std::memcpy(dst->data, src->data, ggml_nbytes(src));
+    }
+
+    const int head_dim = static_cast<int>(src->ne[0]);
+    const int n_heads = static_cast<int>(std::max<int64_t>(1, src->ne[1]));
+    const int n_tokens = static_cast<int>(std::max<int64_t>(1, src->ne[2]));
+    if (head_dim <= 0 || n_heads <= 0 || n_tokens <= 0) {
+        return;
+    }
+
+    const int token_idx = n_tokens - 1;
+    float min_v = std::numeric_limits<float>::infinity();
+    float max_v = -std::numeric_limits<float>::infinity();
+    float max_abs = 0.0f;
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    double checksum = 0.0;
+    int finite_ct = 0;
+    int nan_ct = 0;
+    int inf_ct = 0;
+    int linear_idx = 0;
+
+    for (int head = 0; head < n_heads; ++head) {
+        const char* head_base =
+            reinterpret_cast<const char*>(src->data) + static_cast<size_t>(head) * src->nb[1] +
+            static_cast<size_t>(token_idx) * src->nb[2];
+        const float* values = reinterpret_cast<const float*>(head_base);
+        for (int dim = 0; dim < head_dim; ++dim, ++linear_idx) {
+            const float v = values[dim];
+            if (std::isnan(v)) {
+                nan_ct++;
+                continue;
+            }
+            if (!std::isfinite(v)) {
+                inf_ct++;
+                continue;
+            }
+            min_v = std::min(min_v, v);
+            max_v = std::max(max_v, v);
+            max_abs = std::max(max_abs, std::fabs(v));
+            sum += v;
+            sum_sq += static_cast<double>(v) * static_cast<double>(v);
+            checksum += static_cast<double>(linear_idx + 1) * static_cast<double>(v);
+            finite_ct++;
+        }
+    }
+
+    if (!std::isfinite(min_v)) min_v = 0.0f;
+    if (!std::isfinite(max_v)) max_v = 0.0f;
+    std::fprintf(stderr,
+                 "[GEMMA4_SHARED_KV] action=%s kind=%s layer=%d source_layer=%d token=%d tokens=%d head_dim=%d "
+                 "heads=%d nan=%d inf=%d min=%.8g max=%.8g max_abs=%.8g mean=%.8g rms=%.8g checksum=%.12g\n",
+                 ud->action ? ud->action : "unknown", ud->kind ? ud->kind : "?", ud->layer_idx, ud->source_layer,
+                 token_idx, n_tokens, head_dim, n_heads, nan_ct, inf_ct, min_v, max_v, max_abs,
+                 finite_ct > 0 ? (sum / finite_ct) : 0.0, finite_ct > 0 ? std::sqrt(sum_sq / finite_ct) : 0.0,
+                 checksum);
 }
 
 static void cb_shared_scalar_gate_reference_probe(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith,

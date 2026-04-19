@@ -4,12 +4,14 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <queue>
 #include <regex>
+#include <stdexcept>
 #include <unordered_map>
 
 #include "densecore/models/model_descriptor.h"
@@ -147,6 +149,51 @@ std::vector<std::string> SplitUtf8Units(const std::string& text) {
     return units;
 }
 
+std::string NormalizeSentencePieceText(const std::string& text) {
+    if (text.empty()) {
+        return {};
+    }
+
+    std::string normalized;
+    normalized.reserve(text.size() * 3 + 3);
+    if (text.front() != ' ') {
+        normalized.append("\xE2\x96\x81");
+    }
+    for (char ch : text) {
+        if (ch == ' ') {
+            normalized.append("\xE2\x96\x81");
+        } else {
+            normalized.push_back(ch);
+        }
+    }
+    return normalized;
+}
+
+int FindSentencePieceUnkId(const TransformerModel* model) {
+    if (!model) {
+        return -1;
+    }
+
+    auto lit = model->token_to_id.find("<unk>");
+    if (lit != model->token_to_id.end()) {
+        return lit->second;
+    }
+
+    for (size_t i = 0; i < model->token_types.size(); ++i) {
+        if (model->token_types[i] == 2) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+float GetSentencePieceScore(const TransformerModel* model, int token_id) {
+    if (!model || token_id < 0 || token_id >= static_cast<int>(model->token_scores.size())) {
+        return 0.0f;
+    }
+    return model->token_scores[static_cast<size_t>(token_id)];
+}
+
 bool IsLikelyControlTokenLiteral(const std::string& token) {
     if (token.size() >= 4 && token[0] == '<' && token[1] == '|' && token[token.size() - 2] == '|' &&
         token[token.size() - 1] == '>') {
@@ -257,6 +304,17 @@ bool UseQwen35Pretokenizer(const TransformerModel* model) {
 
 bool UseGemmaPretokenizer(const TransformerModel* model) {
     return densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::GEMMA_SENTENCEPIECE;
+}
+
+bool UseSentencePieceUnigramTokenizer(const TransformerModel* model) {
+    if (!model || model->token_scores.empty()) {
+        return false;
+    }
+    switch (densecore::models::ResolveTokenizerFamily(model)) {
+    case densecore::models::TokenizerFamily::GEMMA_SENTENCEPIECE:
+    case densecore::models::TokenizerFamily::LLAMA_SENTENCEPIECE: return true;
+    default: return false;
+    }
 }
 
 bool IsByteLevelBpeTokenizer(const TransformerModel* model) {
@@ -833,6 +891,81 @@ std::vector<std::string> MergeWithPriorityQueue(const TransformerModel* model, s
     return tokens;
 }
 
+void AppendSentencePieceUnigram(const TransformerModel* model, const std::string& span, std::vector<int>* out) {
+    if (!model || !out || span.empty()) {
+        return;
+    }
+
+    const std::string normalized = NormalizeSentencePieceText(span);
+    const auto cps = DecodeUtf8Codepoints(normalized);
+    if (cps.empty()) {
+        return;
+    }
+
+    size_t max_token_bytes = 0;
+    for (const auto& token : model->vocab_tokens) {
+        max_token_bytes = std::max(max_token_bytes, token.size());
+    }
+    if (max_token_bytes == 0) {
+        return;
+    }
+
+    const int unk_id = FindSentencePieceUnkId(model);
+    const float kNegInf = -std::numeric_limits<float>::infinity();
+    std::vector<float> best(cps.size() + 1, kNegInf);
+    std::vector<int> best_id(cps.size(), -1);
+    std::vector<size_t> best_next(cps.size(), cps.size());
+    best[cps.size()] = 0.0f;
+
+    for (int i = static_cast<int>(cps.size()) - 1; i >= 0; --i) {
+        const size_t byte_begin = cps[static_cast<size_t>(i)].start;
+        for (size_t j = static_cast<size_t>(i) + 1; j <= cps.size(); ++j) {
+            const size_t byte_end = (j < cps.size()) ? cps[j].start : normalized.size();
+            if (byte_end - byte_begin > max_token_bytes) {
+                break;
+            }
+
+            auto it = model->token_to_id.find(normalized.substr(byte_begin, byte_end - byte_begin));
+            if (it == model->token_to_id.end() || !std::isfinite(best[j])) {
+                continue;
+            }
+
+            const float candidate = GetSentencePieceScore(model, it->second) + best[j];
+            if (candidate > best[static_cast<size_t>(i)]) {
+                best[static_cast<size_t>(i)] = candidate;
+                best_id[static_cast<size_t>(i)] = it->second;
+                best_next[static_cast<size_t>(i)] = j;
+            }
+        }
+
+        if (best_id[static_cast<size_t>(i)] < 0 && unk_id >= 0 && std::isfinite(best[static_cast<size_t>(i) + 1])) {
+            best[static_cast<size_t>(i)] = GetSentencePieceScore(model, unk_id) + best[static_cast<size_t>(i) + 1];
+            best_id[static_cast<size_t>(i)] = unk_id;
+            best_next[static_cast<size_t>(i)] = static_cast<size_t>(i) + 1;
+        }
+    }
+
+    if (best_id[0] < 0) {
+        if (model->arch_flags.is_gemma4) {
+            throw std::runtime_error("Gemma4 tokenizer could not segment prompt with GGUF sentencepiece metadata");
+        }
+        return;
+    }
+
+    for (size_t i = 0; i < cps.size();) {
+        const int id = best_id[i];
+        if (id < 0) {
+            break;
+        }
+        out->push_back(id);
+        const size_t next = best_next[i];
+        if (next <= i) {
+            break;
+        }
+        i = next;
+    }
+}
+
 }  // namespace
 
 // ============================================================================
@@ -867,6 +1000,10 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
 
     const auto tokenize_plain_span = [&](const std::string& span) {
         if (span.empty()) return;
+        if (UseSentencePieceUnigramTokenizer(model) && model->bpe_merge_ranks.empty()) {
+            AppendSentencePieceUnigram(model, span, &result);
+            return;
+        }
         if (!model->bpe_merge_ranks.empty()) {
             const std::vector<std::string> pieces = PretokenizeForByteBpe(model, span);
             for (const std::string& piece : pieces) {

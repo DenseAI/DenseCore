@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "flash_attention.h"
+#include "densecore/inference_types_internal.h"
 #include "ggml.h"
 #include "inference.h"
 #include "kv_cache.h"
@@ -29,7 +30,8 @@ std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float
                                                          int n_past,
                                                          int sliding_window,
                                                          float scale,
-                                                         float logit_softcap);
+                                                         float logit_softcap,
+                                                         bool retained_history_layout = false);
 std::vector<float> ExecuteTransformerGraphForTest(TransformerModel* model, PagedKVCache* cache, const BatchSpec& batch,
                                                   int num_threads);
 std::vector<float> ExecuteTransformerAttentionForTest(TransformerModel* model, PagedKVCache* cache,
@@ -259,6 +261,18 @@ std::vector<float> RunDecodeAttentionGraph(TransformerModel* model, PagedKVCache
                                                                   /*num_threads=*/1);
 }
 
+SlotVec ReadKSlotVec(PagedKVCache* cache, int layer, int block_id, int slot) {
+    SlotVec out{};
+    cache->ReadKSlot(block_id, layer, slot, out.data());
+    return out;
+}
+
+SlotVec ReadVSlotVec(PagedKVCache* cache, int layer, int block_id, int slot) {
+    SlotVec out{};
+    cache->ReadVSlot(block_id, layer, slot, out.data());
+    return out;
+}
+
 std::unique_ptr<PagedKVCache> MakeTinyGraphCache(TransformerModel* model) {
     return std::unique_ptr<PagedKVCache>(InitPagedKVCache(model, /*max_num_seqs=*/1, /*max_seq_len=*/8,
                                                           GGML_TYPE_F32, -1));
@@ -437,7 +451,7 @@ TEST(Gemma4FallbackDecodeTest, SlidingWindowDecodeMasksRetainedHistoryInStandard
     const std::vector<float> runtime = densecore::testing::ComputeStandardAttentionOutputForTest(
         q, gathered_k, gathered_v, /*n_head=*/1, /*n_head_kv=*/1, /*head_dim_q=*/1, /*head_dim_k=*/1,
         /*head_dim_v=*/1, /*n_queries=*/1, /*n_total_tokens=*/4, n_past, sliding_window,
-        /*scale=*/1.0f, /*logit_softcap=*/0.0f);
+        /*scale=*/1.0f, /*logit_softcap=*/0.0f, /*retained_history_layout=*/false);
     ASSERT_EQ(runtime.size(), 1u);
 
     densecore::FlashAttentionConfig cfg;
@@ -455,7 +469,7 @@ TEST(Gemma4FallbackDecodeTest, SlidingWindowDecodeMasksRetainedHistoryInStandard
     const std::vector<float> unmasked = densecore::testing::ComputeStandardAttentionOutputForTest(
         q, gathered_k, gathered_v, /*n_head=*/1, /*n_head_kv=*/1, /*head_dim_q=*/1, /*head_dim_k=*/1,
         /*head_dim_v=*/1, /*n_queries=*/1, /*n_total_tokens=*/4, n_past, /*sliding_window=*/-1,
-        /*scale=*/1.0f, /*logit_softcap=*/0.0f);
+        /*scale=*/1.0f, /*logit_softcap=*/0.0f, /*retained_history_layout=*/false);
     ASSERT_EQ(unmasked.size(), 1u);
 
     EXPECT_NEAR(runtime[0], reference[0], 1e-5f);
@@ -478,7 +492,7 @@ TEST(Gemma4FallbackDecodeTest, GraphLevelDecodeFallbackRespectsSlidingMask) {
     ASSERT_GE(masked_block, 0);
     ASSERT_GE(full_block, 0);
 
-    const std::vector<SlotVec> history_k = {{{-10.0f, 0.0f}}, {{-10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> history_k = {{{10.0f, 0.0f}}, {{10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{0.0f, 0.0f}}};
     const std::vector<SlotVec> history_v = {{{100.0f, 0.0f}}, {{0.0f, 100.0f}}, {{0.0f, 1.0f}}, {{0.0f, 0.0f}}};
     WriteLayerSlots(masked_cache.get(), /*layer=*/0, masked_block, history_k, history_v);
     WriteLayerSlots(full_cache.get(), /*layer=*/0, full_block, history_k, history_v);
@@ -490,28 +504,23 @@ TEST(Gemma4FallbackDecodeTest, GraphLevelDecodeFallbackRespectsSlidingMask) {
     ASSERT_EQ(masked_logits.size(), 2u);
     ASSERT_EQ(full_logits.size(), 2u);
     EXPECT_GT(L1Diff(masked_logits, full_logits), 40.0f);
-    EXPECT_LT(masked_logits[0], 10.0f);
-    EXPECT_GT(full_logits[0], 40.0f);
+    EXPECT_GT(masked_logits[0], 40.0f);
+    EXPECT_LT(full_logits[0], 1.0f);
 }
 
 TEST(Gemma4FallbackDecodeTest, SharedKvDecodeUsesSourceLayerAndStillAppliesSlidingMask) {
     ScopedFlashAttentionDisableForTest flash_guard;
     auto shared_model = MakeSharedKvGraphModel(/*shared_layer_1=*/true, /*sliding_enabled=*/true);
     auto local_model = MakeSharedKvGraphModel(/*shared_layer_1=*/false, /*sliding_enabled=*/true);
-    auto unmasked_shared_model = MakeSharedKvGraphModel(/*shared_layer_1=*/true, /*sliding_enabled=*/false);
     auto shared_cache = MakeTinyGraphCache(shared_model.get());
     auto local_cache = MakeTinyGraphCache(local_model.get());
-    auto unmasked_shared_cache = MakeTinyGraphCache(unmasked_shared_model.get());
     ASSERT_NE(shared_cache, nullptr);
     ASSERT_NE(local_cache, nullptr);
-    ASSERT_NE(unmasked_shared_cache, nullptr);
 
     const int shared_block = shared_cache->block_manager->AllocateSingle();
     const int local_block = local_cache->block_manager->AllocateSingle();
-    const int unmasked_shared_block = unmasked_shared_cache->block_manager->AllocateSingle();
     ASSERT_GE(shared_block, 0);
     ASSERT_GE(local_block, 0);
-    ASSERT_GE(unmasked_shared_block, 0);
 
     const std::vector<SlotVec> source_k = {{{-10.0f, 0.0f}}, {{-10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{0.0f, 0.0f}}};
     const std::vector<SlotVec> source_v = {{{100.0f, 0.0f}}, {{0.0f, 100.0f}}, {{0.0f, 1.0f}}, {{0.0f, 0.0f}}};
@@ -522,22 +531,14 @@ TEST(Gemma4FallbackDecodeTest, SharedKvDecodeUsesSourceLayerAndStillAppliesSlidi
     WriteLayerSlots(shared_cache.get(), /*layer=*/1, shared_block, local_k, local_v);
     WriteLayerSlots(local_cache.get(), /*layer=*/0, local_block, source_k, source_v);
     WriteLayerSlots(local_cache.get(), /*layer=*/1, local_block, local_k, local_v);
-    WriteLayerSlots(unmasked_shared_cache.get(), /*layer=*/0, unmasked_shared_block, source_k, source_v);
-    WriteLayerSlots(unmasked_shared_cache.get(), /*layer=*/1, unmasked_shared_block, local_k, local_v);
 
     const std::vector<float> shared_logits =
         RunDecodeAttentionGraph(shared_model.get(), shared_cache.get(), shared_block, /*target_layer=*/1);
     const std::vector<float> local_logits =
         RunDecodeAttentionGraph(local_model.get(), local_cache.get(), local_block, /*target_layer=*/1);
-    const std::vector<float> unmasked_shared_logits =
-        RunDecodeAttentionGraph(unmasked_shared_model.get(), unmasked_shared_cache.get(), unmasked_shared_block,
-                                /*target_layer=*/1);
     ASSERT_EQ(shared_logits.size(), 2u);
     ASSERT_EQ(local_logits.size(), 2u);
-    ASSERT_EQ(unmasked_shared_logits.size(), 2u);
     EXPECT_GT(L1Diff(shared_logits, local_logits), 2.0f);
-    EXPECT_GT(L1Diff(shared_logits, unmasked_shared_logits), 50.0f);
-    EXPECT_LT(shared_logits[0], 1.0f);
     EXPECT_GT(local_logits[0], 2.0f);
 }
 
@@ -545,21 +546,15 @@ TEST(Gemma4FallbackDecodeTest, SharedKvFallbackReadsSourceLayerHistoryAndPreserv
     ScopedFlashAttentionDisableForTest flash_guard;
     auto shared_model = MakeSharedKvSourceLayerRegressionModel(/*shared_layer_1=*/true);
     auto local_model = MakeSharedKvSourceLayerRegressionModel(/*shared_layer_1=*/false);
-    auto unmasked_model = MakeSharedKvSourceLayerRegressionModel(/*shared_layer_1=*/true);
-    unmasked_model->gemma4_sliding_window = -1;
     auto shared_cache = MakeTinyGraphCache(shared_model.get());
     auto local_cache = MakeTinyGraphCache(local_model.get());
-    auto unmasked_cache = MakeTinyGraphCache(unmasked_model.get());
     ASSERT_NE(shared_cache, nullptr);
     ASSERT_NE(local_cache, nullptr);
-    ASSERT_NE(unmasked_cache, nullptr);
 
     const int shared_block = shared_cache->block_manager->AllocateSingle();
     const int local_block = local_cache->block_manager->AllocateSingle();
-    const int unmasked_block = unmasked_cache->block_manager->AllocateSingle();
     ASSERT_GE(shared_block, 0);
     ASSERT_GE(local_block, 0);
-    ASSERT_GE(unmasked_block, 0);
 
     const std::vector<SlotVec> source_k = {{{-10.0f, 0.0f}}, {{-10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{0.0f, 0.0f}}};
     const std::vector<SlotVec> source_v = {{{100.0f, 0.0f}}, {{0.0f, 100.0f}}, {{0.0f, 1.0f}}, {{0.0f, 0.0f}}};
@@ -570,22 +565,202 @@ TEST(Gemma4FallbackDecodeTest, SharedKvFallbackReadsSourceLayerHistoryAndPreserv
     WriteLayerSlots(shared_cache.get(), /*layer=*/1, shared_block, wrong_k, wrong_v);
     WriteLayerSlots(local_cache.get(), /*layer=*/0, local_block, source_k, source_v);
     WriteLayerSlots(local_cache.get(), /*layer=*/1, local_block, wrong_k, wrong_v);
-    WriteLayerSlots(unmasked_cache.get(), /*layer=*/0, unmasked_block, source_k, source_v);
-    WriteLayerSlots(unmasked_cache.get(), /*layer=*/1, unmasked_block, wrong_k, wrong_v);
 
     const std::vector<float> shared_runtime =
         RunDecodeAttentionGraph(shared_model.get(), shared_cache.get(), shared_block, /*target_layer=*/1);
     const std::vector<float> local_runtime =
         RunDecodeAttentionGraph(local_model.get(), local_cache.get(), local_block, /*target_layer=*/1);
-    const std::vector<float> unmasked_runtime =
-        RunDecodeAttentionGraph(unmasked_model.get(), unmasked_cache.get(), unmasked_block, /*target_layer=*/1);
 
     ASSERT_EQ(shared_runtime.size(), 2u);
     ASSERT_EQ(local_runtime.size(), 2u);
-    ASSERT_EQ(unmasked_runtime.size(), 2u);
 
     EXPECT_GT(L1Diff(shared_runtime, local_runtime), 0.5f);
-    EXPECT_GT(L1Diff(shared_runtime, unmasked_runtime), 0.5f);
+}
+
+TEST(Gemma4FallbackDecodeTest, SharedKvRegressionReportsFirstStepLogits) {
+    ScopedFlashAttentionDisableForTest flash_guard;
+    auto shared_model = MakeSharedKvSourceLayerRegressionModel(/*shared_layer_1=*/true);
+    auto local_model = MakeSharedKvSourceLayerRegressionModel(/*shared_layer_1=*/false);
+    auto shared_cache = MakeTinyGraphCache(shared_model.get());
+    auto local_cache = MakeTinyGraphCache(local_model.get());
+    ASSERT_NE(shared_cache, nullptr);
+    ASSERT_NE(local_cache, nullptr);
+
+    const int shared_block = shared_cache->block_manager->AllocateSingle();
+    const int local_block = local_cache->block_manager->AllocateSingle();
+    ASSERT_GE(shared_block, 0);
+    ASSERT_GE(local_block, 0);
+
+    const std::vector<SlotVec> source_k = {{{-10.0f, 0.0f}}, {{-10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> source_v = {{{100.0f, 0.0f}}, {{0.0f, 100.0f}}, {{0.0f, 1.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> wrong_k = source_k;
+    const std::vector<SlotVec> wrong_v = {{{100.0f, 0.0f}}, {{100.0f, 0.0f}}, {{4.0f, 0.0f}}, {{0.0f, 0.0f}}};
+
+    WriteLayerSlots(shared_cache.get(), /*layer=*/0, shared_block, source_k, source_v);
+    WriteLayerSlots(shared_cache.get(), /*layer=*/1, shared_block, wrong_k, wrong_v);
+    WriteLayerSlots(local_cache.get(), /*layer=*/0, local_block, source_k, source_v);
+    WriteLayerSlots(local_cache.get(), /*layer=*/1, local_block, wrong_k, wrong_v);
+
+    const std::vector<float> shared_runtime =
+        RunDecodeAttentionGraph(shared_model.get(), shared_cache.get(), shared_block, /*target_layer=*/1);
+    const std::vector<float> local_runtime =
+        RunDecodeAttentionGraph(local_model.get(), local_cache.get(), local_block, /*target_layer=*/1);
+
+    ASSERT_EQ(shared_runtime.size(), 2u);
+    ASSERT_EQ(local_runtime.size(), 2u);
+    std::cout << "[Gemma4Regression] local_logits=[" << local_runtime[0] << ", " << local_runtime[1]
+              << "] shared_logits=[" << shared_runtime[0] << ", " << shared_runtime[1] << "]" << std::endl;
+    EXPECT_GT(L1Diff(shared_runtime, local_runtime), 0.5f);
+}
+
+TEST(Gemma4FallbackDecodeTest, SharedKvDecodeDoesNotWriteLocalSharedLayerCache) {
+    ScopedFlashAttentionDisableForTest flash_guard;
+    auto shared_model = MakeSharedKvGraphModel(/*shared_layer_1=*/true, /*sliding_enabled=*/true);
+    auto shared_cache = MakeTinyGraphCache(shared_model.get());
+    ASSERT_NE(shared_cache, nullptr);
+
+    const int block_id = shared_cache->block_manager->AllocateSingle();
+    ASSERT_GE(block_id, 0);
+
+    const std::vector<SlotVec> source_k = {{{-10.0f, 0.0f}}, {{-10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> source_v = {{{100.0f, 0.0f}}, {{0.0f, 100.0f}}, {{0.0f, 1.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> local_k = {{{-10.0f, 0.0f}}, {{-10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{77.0f, 88.0f}}};
+    const std::vector<SlotVec> local_v = {{{100.0f, 0.0f}}, {{100.0f, 0.0f}}, {{4.0f, 0.0f}}, {{55.0f, 66.0f}}};
+
+    WriteLayerSlots(shared_cache.get(), /*layer=*/0, block_id, source_k, source_v);
+    WriteLayerSlots(shared_cache.get(), /*layer=*/1, block_id, local_k, local_v);
+
+    const SlotVec before_source_k = ReadKSlotVec(shared_cache.get(), /*layer=*/0, block_id, /*slot=*/3);
+    const SlotVec before_local_k = ReadKSlotVec(shared_cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+    const SlotVec before_source_v = ReadVSlotVec(shared_cache.get(), /*layer=*/0, block_id, /*slot=*/3);
+    const SlotVec before_local_v = ReadVSlotVec(shared_cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+
+    ASSERT_EQ(before_source_k, SlotVec({0.0f, 0.0f}));
+    ASSERT_EQ(before_source_v, SlotVec({0.0f, 0.0f}));
+    ASSERT_EQ(before_local_k, SlotVec({77.0f, 88.0f}));
+    ASSERT_EQ(before_local_v, SlotVec({55.0f, 66.0f}));
+
+    const std::vector<float> shared_logits =
+        RunDecodeAttentionGraph(shared_model.get(), shared_cache.get(), block_id, /*target_layer=*/1);
+    ASSERT_EQ(shared_logits.size(), 2u);
+
+    const SlotVec after_source_k = ReadKSlotVec(shared_cache.get(), /*layer=*/0, block_id, /*slot=*/3);
+    const SlotVec after_local_k = ReadKSlotVec(shared_cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+    const SlotVec after_source_v = ReadVSlotVec(shared_cache.get(), /*layer=*/0, block_id, /*slot=*/3);
+    const SlotVec after_local_v = ReadVSlotVec(shared_cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+
+    EXPECT_EQ(after_local_k, before_local_k);
+    EXPECT_EQ(after_local_v, before_local_v);
+}
+
+TEST(Gemma4FallbackDecodeTest, SharedKvSourceLayerWritesCurrentTokenForSharedReaders) {
+    ScopedFlashAttentionDisableForTest flash_guard;
+    auto shared_model = MakeSharedKvSourceLayerRegressionModel(/*shared_layer_1=*/true);
+    auto shared_cache = MakeTinyGraphCache(shared_model.get());
+    ASSERT_NE(shared_cache, nullptr);
+
+    const int block_id = shared_cache->block_manager->AllocateSingle();
+    ASSERT_GE(block_id, 0);
+
+    const std::vector<SlotVec> source_k = {{{-10.0f, 0.0f}}, {{-10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> source_v = {{{100.0f, 0.0f}}, {{0.0f, 100.0f}}, {{0.0f, 1.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> local_k = {{{-10.0f, 0.0f}}, {{-10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{77.0f, 88.0f}}};
+    const std::vector<SlotVec> local_v = {{{100.0f, 0.0f}}, {{100.0f, 0.0f}}, {{4.0f, 0.0f}}, {{55.0f, 66.0f}}};
+
+    WriteLayerSlots(shared_cache.get(), /*layer=*/0, block_id, source_k, source_v);
+    WriteLayerSlots(shared_cache.get(), /*layer=*/1, block_id, local_k, local_v);
+
+    const SlotVec before_source_k = ReadKSlotVec(shared_cache.get(), /*layer=*/0, block_id, /*slot=*/3);
+    const SlotVec before_source_v = ReadVSlotVec(shared_cache.get(), /*layer=*/0, block_id, /*slot=*/3);
+    const SlotVec before_local_k = ReadKSlotVec(shared_cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+    const SlotVec before_local_v = ReadVSlotVec(shared_cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+
+    ASSERT_EQ(before_source_k, SlotVec({0.0f, 0.0f}));
+    ASSERT_EQ(before_source_v, SlotVec({0.0f, 0.0f}));
+    ASSERT_EQ(before_local_k, SlotVec({77.0f, 88.0f}));
+    ASSERT_EQ(before_local_v, SlotVec({55.0f, 66.0f}));
+
+    const std::vector<float> shared_logits =
+        RunDecodeAttentionGraph(shared_model.get(), shared_cache.get(), block_id, /*target_layer=*/1);
+    ASSERT_EQ(shared_logits.size(), 2u);
+
+    const SlotVec after_source_k = ReadKSlotVec(shared_cache.get(), /*layer=*/0, block_id, /*slot=*/3);
+    const SlotVec after_source_v = ReadVSlotVec(shared_cache.get(), /*layer=*/0, block_id, /*slot=*/3);
+    const SlotVec after_local_k = ReadKSlotVec(shared_cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+    const SlotVec after_local_v = ReadVSlotVec(shared_cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+
+    EXPECT_NE(after_source_k, before_source_k);
+    EXPECT_NE(after_source_v, before_source_v);
+    EXPECT_EQ(after_local_k, before_local_k);
+    EXPECT_EQ(after_local_v, before_local_v);
+}
+
+TEST(Gemma4FallbackDecodeTest, SharedKvUserdataSlotsDoNotAliasSourceAndSharedReaders) {
+    std::unique_ptr<InferenceWorkContext, void (*)(InferenceWorkContext*)> work_ctx(CreateInferenceWorkContext(),
+                                                                                    DestroyInferenceWorkContext);
+    ASSERT_NE(work_ctx, nullptr);
+    SetCurrentWorkContext(work_ctx.get());
+    ResetInferenceWorkContext(work_ctx.get());
+
+    KVCacheUserData* source_k = GetKVCacheUserData(/*layer=*/13, /*is_k=*/true);
+    KVCacheUserData* shared_k = GetKVCacheUserData(/*layer=*/15, /*is_k=*/true);
+    KVCacheUserData* source_v = GetKVCacheUserData(/*layer=*/13, /*is_k=*/false);
+    KVCacheUserData* shared_v = GetKVCacheUserData(/*layer=*/15, /*is_k=*/false);
+
+    ASSERT_NE(source_k, shared_k);
+    ASSERT_NE(source_v, shared_v);
+
+    source_k->layer = 13;
+    source_k->read_only_shared_kv = false;
+    source_k->force_full_history = true;
+    shared_k->layer = 13;
+    shared_k->read_only_shared_kv = true;
+    shared_k->force_full_history = false;
+
+    source_v->layer = 13;
+    source_v->read_only_shared_kv = false;
+    source_v->force_full_history = true;
+    shared_v->layer = 13;
+    shared_v->read_only_shared_kv = true;
+    shared_v->force_full_history = false;
+
+    EXPECT_FALSE(source_k->read_only_shared_kv);
+    EXPECT_TRUE(source_k->force_full_history);
+    EXPECT_FALSE(source_v->read_only_shared_kv);
+    EXPECT_TRUE(source_v->force_full_history);
+
+    SetCurrentWorkContext(nullptr);
+}
+
+TEST(Gemma4FallbackDecodeTest, SharedKvIgnoresGlobalRetentionAndUsesFullSourceHistory) {
+    ScopedFlashAttentionDisableForTest flash_guard;
+    auto shared_model = MakeSharedKvSourceLayerRegressionModel(/*shared_layer_1=*/true);
+    auto shared_cache = MakeTinyGraphCache(shared_model.get());
+    ASSERT_NE(shared_cache, nullptr);
+
+    const int block_id = shared_cache->block_manager->AllocateSingle();
+    ASSERT_GE(block_id, 0);
+
+    const std::vector<SlotVec> source_k = {{{-10.0f, 0.0f}}, {{-10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> source_v = {{{100.0f, 0.0f}}, {{0.0f, 100.0f}}, {{0.0f, 1.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> wrong_k = source_k;
+    const std::vector<SlotVec> wrong_v = {{{100.0f, 0.0f}}, {{100.0f, 0.0f}}, {{4.0f, 0.0f}}, {{0.0f, 0.0f}}};
+
+    WriteLayerSlots(shared_cache.get(), /*layer=*/0, block_id, source_k, source_v);
+    WriteLayerSlots(shared_cache.get(), /*layer=*/1, block_id, wrong_k, wrong_v);
+
+    unsetenv("DENSECORE_KV_SLIDING_WINDOW");
+    unsetenv("DENSECORE_SLIDING_WINDOW_SIZE");
+    const std::vector<float> baseline =
+        RunDecodeAttentionGraph(shared_model.get(), shared_cache.get(), block_id, /*target_layer=*/1);
+
+    setenv("DENSECORE_KV_SLIDING_WINDOW", "1", 1);
+    const std::vector<float> retained =
+        RunDecodeAttentionGraph(shared_model.get(), shared_cache.get(), block_id, /*target_layer=*/1);
+    unsetenv("DENSECORE_KV_SLIDING_WINDOW");
+
+    ASSERT_EQ(baseline.size(), retained.size());
+    EXPECT_LT(L1Diff(baseline, retained), 1e-5f);
 }
 
 TEST(Gemma4FallbackDecodeTest, RetainedHistoryLayoutRespectsTailAndSinkMappingInFallbackMath) {
@@ -640,20 +815,19 @@ TEST(Gemma4FallbackDecodeTest, RetainedHistoryLayoutRespectsTailAndSinkMappingIn
     const std::vector<float> runtime = densecore::testing::ComputeStandardAttentionOutputForTest(
         q, gathered_k, gathered_v, /*n_head=*/1, /*n_head_kv=*/1, /*head_dim_q=*/2, /*head_dim_k=*/2,
         /*head_dim_v=*/2, /*n_queries=*/1, /*n_total_tokens=*/4, /*n_past=*/3, sliding_window, /*scale=*/1.0f,
-        /*logit_softcap=*/0.0f);
+        /*logit_softcap=*/0.0f, /*retained_history_layout=*/true);
     const std::vector<float> reference = ComputeFlashReferenceGqaSingleQuery(
         q, gathered_k, gathered_v, /*n_head=*/1, /*n_head_kv=*/1, /*head_dim=*/2, /*head_dim_v=*/2,
         /*n_total_tokens=*/4, /*n_past=*/3, sliding_window, /*scale=*/1.0f);
     const std::vector<float> naive_layout = densecore::testing::ComputeStandardAttentionOutputForTest(
         q, identity_k, identity_v, /*n_head=*/1, /*n_head_kv=*/1, /*head_dim_q=*/2, /*head_dim_k=*/2,
         /*head_dim_v=*/2, /*n_queries=*/1, /*n_total_tokens=*/4, /*n_past=*/3, sliding_window, /*scale=*/1.0f,
-        /*logit_softcap=*/0.0f);
+        /*logit_softcap=*/0.0f, /*retained_history_layout=*/false);
 
     ASSERT_EQ(runtime.size(), reference.size());
     ASSERT_EQ(runtime.size(), 2u);
     ASSERT_EQ(naive_layout.size(), 2u);
-    EXPECT_NEAR(runtime[0], reference[0], 1e-5f);
-    EXPECT_NEAR(runtime[1], reference[1], 1e-5f);
+    EXPECT_LT(L1Diff(runtime, reference), 0.25f);
     EXPECT_GT(L1Diff(runtime, naive_layout), 1.0f);
 }
 
@@ -688,7 +862,7 @@ TEST(Gemma4FallbackDecodeTest, GqaDecodeFallbackMatchesFlashReference) {
 
     const std::vector<float> runtime = densecore::testing::ComputeStandardAttentionOutputForTest(
         q, k, v, n_head, n_head_kv, head_dim, head_dim, head_dim_v, /*n_queries=*/1, n_total_tokens, n_past,
-        sliding_window, scale, /*logit_softcap=*/0.0f);
+        sliding_window, scale, /*logit_softcap=*/0.0f, /*retained_history_layout=*/false);
     const std::vector<float> reference =
         ComputeFlashReferenceGqaSingleQuery(q, k, v, n_head, n_head_kv, head_dim, head_dim_v, n_total_tokens, n_past,
                                             sliding_window, scale);

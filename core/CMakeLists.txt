@@ -1150,6 +1150,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_chat_template.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model_descriptor.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tokenizer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gemma4_model_loader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_transformer_graph_dispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen_loop_guard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_decode_graph_cache.cpp
@@ -1220,6 +1221,11 @@ if(DENSECORE_BUILD_TESTS)
     # by the shared library.
     add_executable(densecore_tests ${TEST_SOURCES} ${SOURCES})
 
+    add_executable(gemma4_parity_probe
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/gemma4_parity_probe.cpp
+        ${SOURCES}
+    )
+
     target_include_directories(densecore_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -1231,6 +1237,17 @@ if(DENSECORE_BUILD_TESTS)
         ${highway_SOURCE_DIR}  # Google Highway SIMD
     )
 
+    target_include_directories(gemma4_parity_probe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}/include
+        ${GGML_DIR}/include
+        ${GGML_DIR}/src
+        ${GGML_DIR}/src/ggml-cpu
+        ${simde_SOURCE_DIR}
+        ${highway_SOURCE_DIR}
+    )
+
     # Link dependencies directly (do NOT link densecore shared lib to avoid symbol conflicts/hiding)
     target_link_libraries(densecore_tests PRIVATE
         ggml
@@ -1239,38 +1256,65 @@ if(DENSECORE_BUILD_TESTS)
         Threads::Threads
     )
 
+    target_link_libraries(gemma4_parity_probe PRIVATE
+        ggml
+        hwy
+        Threads::Threads
+    )
+
     # Enable mock model for E2E tests (allows InitEngine("mock", ...))
     target_compile_definitions(densecore_tests PRIVATE DENSECORE_TEST_BUILD)
+    target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_TEST_BUILD)
 
     if(DENSECORE_USE_SPDLOG)
         target_link_libraries(densecore_tests PRIVATE spdlog::spdlog)
         target_compile_definitions(densecore_tests PRIVATE DENSECORE_USE_SPDLOG)
+        target_link_libraries(gemma4_parity_probe PRIVATE spdlog::spdlog)
+        target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_USE_SPDLOG)
     endif()
 
     if(USE_ACCELERATE)
         target_link_libraries(densecore_tests PRIVATE ${ACCELERATE_FRAMEWORK})
+        target_link_libraries(gemma4_parity_probe PRIVATE ${ACCELERATE_FRAMEWORK})
     endif()
 
     # Apply same compile flags as densecore
     if(DENSECORE_PORTABLE)
         target_compile_definitions(densecore_tests PRIVATE GGML_USE_CPU)
+        target_compile_definitions(gemma4_parity_probe PRIVATE GGML_USE_CPU)
     elseif(CPU_HAS_AVX512 AND COMPILER_SUPPORTS_AVX512)
         target_compile_options(densecore_tests PRIVATE ${AVX512_FLAG})
         target_compile_definitions(densecore_tests PRIVATE USE_AVX512 GGML_USE_CPU GGML_USE_AVX512)
+        target_compile_options(gemma4_parity_probe PRIVATE ${AVX512_FLAG})
+        target_compile_definitions(gemma4_parity_probe PRIVATE USE_AVX512 GGML_USE_CPU GGML_USE_AVX512)
     elseif(COMPILER_SUPPORTS_AVX2)
         target_compile_options(densecore_tests PRIVATE ${AVX2_FLAG})
         target_compile_definitions(densecore_tests PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
+        target_compile_options(gemma4_parity_probe PRIVATE ${AVX2_FLAG})
+        target_compile_definitions(gemma4_parity_probe PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
     elseif(COMPILER_SUPPORTS_AVX)
         target_compile_options(densecore_tests PRIVATE ${AVX_FLAG})
         target_compile_definitions(densecore_tests PRIVATE USE_AVX GGML_USE_CPU GGML_USE_AVX)
+        target_compile_options(gemma4_parity_probe PRIVATE ${AVX_FLAG})
+        target_compile_definitions(gemma4_parity_probe PRIVATE USE_AVX GGML_USE_CPU GGML_USE_AVX)
     else()
         target_compile_definitions(densecore_tests PRIVATE GGML_USE_CPU)
+        target_compile_definitions(gemma4_parity_probe PRIVATE GGML_USE_CPU)
     endif()
 
     if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" AND NOT DENSECORE_PORTABLE)
         target_compile_options(densecore_tests PRIVATE -mcpu=apple-m1)
+        target_compile_options(gemma4_parity_probe PRIVATE -mcpu=apple-m1)
         # Link Apple frameworks required by Metal/CoreML/Accelerate code
         target_link_libraries(densecore_tests PRIVATE
+            ${ACCELERATE_FRAMEWORK}
+            ${METAL_FRAMEWORK}
+            ${FOUNDATION_FRAMEWORK}
+            ${METALPERFORMANCESHADERS_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${IOKIT_FRAMEWORK}
+        )
+        target_link_libraries(gemma4_parity_probe PRIVATE
             ${ACCELERATE_FRAMEWORK}
             ${METAL_FRAMEWORK}
             ${FOUNDATION_FRAMEWORK}
@@ -1281,6 +1325,7 @@ if(DENSECORE_BUILD_TESTS)
     endif()
     if(DENSECORE_ARM_TUNE_ACTIVE)
         target_compile_options(densecore_tests PRIVATE ${DENSECORE_ARM_TUNE_FLAGS})
+        target_compile_options(gemma4_parity_probe PRIVATE ${DENSECORE_ARM_TUNE_FLAGS})
     endif()
 
     include(GoogleTest)

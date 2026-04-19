@@ -57,8 +57,15 @@ bool SupportsPagedDecodeAttention(const TransformerModel* model) {
 }
 
 float SanitizeAttentionLogitSoftcapForLoad(const TransformerModel* model, float gguf_softcap) {
-    if (model && model->arch_flags.is_gemma4) {
-        return 0.0f;
+    if (model && model->arch_flags.is_gemma4 && gguf_softcap <= 0.0f) {
+        static bool warned_invalid_gemma4_softcap = false;
+        if (!warned_invalid_gemma4_softcap) {
+            std::cerr << "[DenseCore] Warning: Gemma4 attention_logit_cap must be positive; "
+                         "normalizing non-positive metadata to HF-compatible default 50.0"
+                      << std::endl;
+            warned_invalid_gemma4_softcap = true;
+        }
+        return 50.0f;
     }
     return gguf_softcap;
 }
@@ -93,6 +100,10 @@ bool IsGemma4PerLayerInputDisabled() {
 
 bool IsGemma4LayerOutputScaleDisabled() {
     return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_LAYER_OUTPUT_SCALE", false);
+}
+
+bool IsGemma4SharedKVExplicitStateDisabled() {
+    return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_SHARED_KV_EXPLICIT_STATE", false);
 }
 
 bool IsGemma4DecodeSpecialTransformDisabled() {

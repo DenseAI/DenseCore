@@ -4,6 +4,7 @@
 struct InferenceWorkContext {
     const BatchSpec* batch = nullptr;
     KVCacheUserData kv_pool[256];
+    std::vector<Gemma4SharedKVState> gemma4_shared_kv_states;
     QKVUserData qkv_pool[256];
     KVUpdateGatherUserData kv_update_gather_pool[kMaxKVUpdateGatherSlots];
     int qkv_index = 0;
@@ -46,6 +47,7 @@ void DestroyInferenceWorkContext(InferenceWorkContext* ctx) {
 void ResetInferenceWorkContext(InferenceWorkContext* ctx) {
     if (!ctx) return;
     ctx->batch = nullptr;
+    ctx->gemma4_shared_kv_states.clear();
     ctx->qkv_index = 0;
     ctx->add_rmsnorm_index = 0;
     ctx->gemv_quantized_stamp.store(0, std::memory_order_relaxed);
@@ -89,6 +91,39 @@ static const BatchSpec* GetCurrentBatch() {
         return ctx->batch;
     }
     return g_shared_batch.load(std::memory_order_acquire);
+}
+
+static Gemma4SharedKVState* GetGemma4SharedKVStateSlot(int layer) {
+    InferenceWorkContext* ctx = GetCurrentWorkContext();
+    if (!ctx) {
+        throw densecore::InvalidArgumentException("GetGemma4SharedKVStateSlot called without active InferenceWorkContext");
+    }
+    if (layer < 0) {
+        throw densecore::InvalidArgumentException("GetGemma4SharedKVStateSlot called with negative layer");
+    }
+    if (ctx->gemma4_shared_kv_states.size() <= static_cast<size_t>(layer)) {
+        ctx->gemma4_shared_kv_states.resize(static_cast<size_t>(layer) + 1);
+    }
+    return &ctx->gemma4_shared_kv_states[static_cast<size_t>(layer)];
+}
+
+static void SetGemma4SharedKVState(int source_layer, ggml_tensor* k, ggml_tensor* v) {
+    Gemma4SharedKVState* slot = GetGemma4SharedKVStateSlot(source_layer);
+    slot->k = k;
+    slot->v = v;
+    slot->source_layer = source_layer;
+}
+
+static const Gemma4SharedKVState* GetGemma4SharedKVState(int source_layer) {
+    InferenceWorkContext* ctx = GetCurrentWorkContext();
+    if (!ctx || source_layer < 0 || static_cast<size_t>(source_layer) >= ctx->gemma4_shared_kv_states.size()) {
+        return nullptr;
+    }
+    const Gemma4SharedKVState& slot = ctx->gemma4_shared_kv_states[static_cast<size_t>(source_layer)];
+    if (!slot.k || !slot.v || slot.source_layer != source_layer) {
+        return nullptr;
+    }
+    return &slot;
 }
 
 // NOTE: KVCacheUserData is defined in densecore/inference_types_internal.h
@@ -707,6 +742,12 @@ static inline void WriteCurrentBatchKvToCache(const BatchSpec* batch, const stru
         packed.reserve(static_cast<size_t>(std::min(end - begin, BLOCK_SIZE)) * head_block_size);
     }
 
+    const bool debug_gemma4_decode_write = [&]() {
+        const char* env = std::getenv("DENSECORE_DEBUG_GEMMA4_SHARED_KV");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0 && batch->tokens.size() == 1 &&
+               (layer == 13 || layer == 14);
+    }();
+
     for (int i = begin; i < end;) {
         if (i >= static_cast<int>(batch->seq_id.size()) || i >= static_cast<int>(batch->pos.size())) {
             if (writes_skipped) {
@@ -766,6 +807,61 @@ static inline void WriteCurrentBatchKvToCache(const BatchSpec* batch, const stru
         } else {
             cache->WriteVSlots(block_id, layer, slot, run, run_data);
         }
+        if (debug_gemma4_decode_write && run == 1) {
+            std::vector<float> roundtrip(static_cast<size_t>(run) * head_block_size, 0.0f);
+            if (is_k) {
+                cache->ReadKSlots(block_id, layer, slot, run, roundtrip.data());
+            } else {
+                cache->ReadVSlots(block_id, layer, slot, run, roundtrip.data());
+            }
+
+            auto log_slice = [&](const char* stage, const float* values) {
+                float min_v = std::numeric_limits<float>::infinity();
+                float max_v = -std::numeric_limits<float>::infinity();
+                float max_abs = 0.0f;
+                double sum = 0.0;
+                double sum_sq = 0.0;
+                double checksum = 0.0;
+                int finite_ct = 0;
+                int nan_ct = 0;
+                int inf_ct = 0;
+                for (size_t vi = 0; vi < head_block_size; ++vi) {
+                    const float v = values[vi];
+                    if (std::isnan(v)) {
+                        nan_ct++;
+                        continue;
+                    }
+                    if (!std::isfinite(v)) {
+                        inf_ct++;
+                        continue;
+                    }
+                    min_v = std::min(min_v, v);
+                    max_v = std::max(max_v, v);
+                    max_abs = std::max(max_abs, std::fabs(v));
+                    sum += v;
+                    sum_sq += static_cast<double>(v) * static_cast<double>(v);
+                    checksum += static_cast<double>(vi + 1) * static_cast<double>(v);
+                    finite_ct++;
+                }
+                if (!std::isfinite(min_v)) min_v = 0.0f;
+                if (!std::isfinite(max_v)) max_v = 0.0f;
+                std::fprintf(stderr,
+                             "[GEMMA4_SHARED_KV] action=%s kind=%s layer=%d source_layer=%d seq=%d pos=%d block=%d "
+                             "slot=%d head_dim=%d heads=%d nan=%d inf=%d min=%.8g max=%.8g max_abs=%.8g "
+                             "mean=%.8g rms=%.8g checksum=%.12g first8=",
+                             stage, is_k ? "K" : "V", layer, layer, seq_id, pos, block_id, slot, head_dim, n_head_kv,
+                             nan_ct, inf_ct, min_v, max_v, max_abs, finite_ct > 0 ? (sum / finite_ct) : 0.0,
+                             finite_ct > 0 ? std::sqrt(sum_sq / finite_ct) : 0.0, checksum);
+                const size_t preview = std::min<size_t>(8, head_block_size);
+                for (size_t vi = 0; vi < preview; ++vi) {
+                    std::fprintf(stderr, "%s%.8g", vi == 0 ? "" : ",", values[vi]);
+                }
+                std::fprintf(stderr, "\n");
+            };
+
+            log_slice("pre-cache-write", run_data);
+            log_slice("post-cache-readback", roundtrip.data());
+        }
         if (ShouldRunKvRoundTripProbe(layer, is_k)) {
             std::vector<float> roundtrip(static_cast<size_t>(run) * head_block_size, 0.0f);
             if (is_k) {
@@ -796,6 +892,41 @@ static inline void WriteCurrentBatchKvToCache(const BatchSpec* batch, const stru
         }
         i += run;
     }
+}
+
+static inline bool ReadSingleCurrentBatchKvFromCache(const BatchSpec* batch, PagedKVCache* cache, int layer,
+                                                     int head_dim, int n_head_kv, bool is_k, int batch_token_idx,
+                                                     float* out) {
+    if (!batch || !cache || !out || batch_token_idx < 0 || batch_token_idx >= static_cast<int>(batch->tokens.size()) ||
+        batch_token_idx >= static_cast<int>(batch->seq_id.size()) ||
+        batch_token_idx >= static_cast<int>(batch->pos.size())) {
+        return false;
+    }
+
+    const int seq_id = batch->seq_id[batch_token_idx];
+    const int pos = batch->pos[batch_token_idx];
+    if (seq_id < 0 || seq_id >= static_cast<int>(batch->block_tables.size()) || pos < 0) {
+        return false;
+    }
+
+    const auto& block_table = batch->block_tables[static_cast<size_t>(seq_id)];
+    const int logical_block = pos / BLOCK_SIZE;
+    const int slot = pos % BLOCK_SIZE;
+    if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) {
+        return false;
+    }
+
+    const int block_id = block_table[static_cast<size_t>(logical_block)];
+    if (block_id < 0) {
+        return false;
+    }
+
+    if (is_k) {
+        cache->ReadKSlots(block_id, layer, slot, 1, out);
+    } else {
+        cache->ReadVSlots(block_id, layer, slot, 1, out);
+    }
+    return true;
 }
 
 // Custom callback to load K/V history from cache and append current K/V.
@@ -836,7 +967,12 @@ void cb_kv_manage(struct ggml_tensor* dst, const struct ggml_tensor* src, int it
         const int seq_id = batch->seq_id.empty() ? -1 : batch->seq_id[0];
         const bool has_valid_seq = (seq_id >= 0 && seq_id < static_cast<int>(batch->block_tables.size()));
         const auto* block_table = has_valid_seq ? &batch->block_tables[seq_id] : nullptr;
-        const KVRetentionPolicy& retention_policy = GetKVRetentionPolicy();
+        KVRetentionPolicy retention_policy = GetKVRetentionPolicy();
+        if (ud->force_full_history) {
+            retention_policy.enabled = false;
+            retention_policy.sliding_window = -1;
+            retention_policy.sink_tokens = 0;
+        }
         KVRetentionSpan retained_history;
         if (has_valid_seq && seq_id < static_cast<int>(batch->n_past.size())) {
             const int seq_n_past = std::max(0, batch->n_past[static_cast<size_t>(seq_id)]);
@@ -979,6 +1115,17 @@ void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, v
 
     const bool read_only_shared_kv = ud->read_only_shared_kv;
     const int history_tokens = read_only_shared_kv ? n_total : n_past;
+    const char* debug_shared_env = std::getenv("DENSECORE_DEBUG_GEMMA4_SHARED_KV");
+    const bool debug_gemma4_decode = debug_shared_env && debug_shared_env[0] != '\0' &&
+                                     std::strcmp(debug_shared_env, "0") != 0 && (ud->layer == 13 || ud->layer == 14);
+    if (debug_gemma4_decode && ith == 0) {
+        std::fprintf(stderr,
+                     "[GEMMA4_SHARED_KV] action=callback-state kind=%s layer=%d source_layer=%d N=%d n_total=%d "
+                     "n_past=%d read_only=%d force_full_history=%d seqs=%d pos0=%d\n",
+                     ud->is_k ? "K" : "V", ud->layer, ud->layer, N, n_total, n_past, read_only_shared_kv ? 1 : 0,
+                     ud->force_full_history ? 1 : 0, batch->num_seqs,
+                     batch->pos.empty() ? -1 : batch->pos[0]);
+    }
 
     if (N > 0 && !read_only_shared_kv) {
         const int tokens_per_thread = (N + nth - 1) / nth;
@@ -994,7 +1141,12 @@ void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, v
         const int seq_id = batch->seq_id.empty() ? -1 : batch->seq_id[0];
         const bool has_valid_seq = (seq_id >= 0 && seq_id < static_cast<int>(batch->block_tables.size()));
         const auto* block_table = has_valid_seq ? &batch->block_tables[seq_id] : nullptr;
-        const KVRetentionPolicy& retention_policy = GetKVRetentionPolicy();
+        KVRetentionPolicy retention_policy = GetKVRetentionPolicy();
+        if (ud->force_full_history) {
+            retention_policy.enabled = false;
+            retention_policy.sliding_window = -1;
+            retention_policy.sink_tokens = 0;
+        }
         KVRetentionSpan retained_history;
         if (has_valid_seq && seq_id < static_cast<int>(batch->n_past.size())) {
             const int seq_n_past = read_only_shared_kv ? history_tokens
@@ -1057,7 +1209,14 @@ void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, v
         const int t_end = std::min(t_start + tokens_per_thread, N);
         if (t_end > t_start) {
             const size_t head_block_size = static_cast<size_t>(head_dim) * static_cast<size_t>(n_head_kv);
-            if (IsTokenSpanDense(src, head_dim, n_head_kv) && IsTokenSpanDense(dst, head_dim, n_head_kv)) {
+            if (N == 1) {
+                std::vector<float> packed(head_block_size, 0.0f);
+                if (!ReadSingleCurrentBatchKvFromCache(batch, ud->cache, ud->layer, head_dim, n_head_kv, ud->is_k,
+                                                       t_start, packed.data())) {
+                    GatherTokenSpanHeadContiguous(src, t_start, 1, head_dim, n_head_kv, packed.data());
+                }
+                ScatterTokenSpanHeadContiguous(packed.data(), dst, n_past + t_start, 1, head_dim, n_head_kv);
+            } else if (IsTokenSpanDense(src, head_dim, n_head_kv) && IsTokenSpanDense(dst, head_dim, n_head_kv)) {
                 const char* src_ptr =
                     reinterpret_cast<const char*>(src->data) + static_cast<size_t>(t_start) * src->nb[2];
                 char* dst_ptr = reinterpret_cast<char*>(dst->data) + static_cast<size_t>(n_past + t_start) * dst->nb[2];

@@ -45,11 +45,10 @@ inline float GeluTanhApprox(float x) {
 
 bool CanUsePackedInt4MoEFastPath() {
 #if defined(__aarch64__) || defined(_M_ARM64)
-    // ARM keeps the direct Highway kernels disabled below and falls through to
-    // CpuBackend::GemmInt4(), which already routes through the verified
-    // runtime-selected INT4 kernel path. Default-enable that packed route here
-    // so MoE expert views do not dequantize by default; keep the existing env
-    // name as an opt-out switch for bisects/regressions.
+    // Keep the packed INT4 MoE route enabled on ARM, but route it through
+    // CpuBackend::GemmInt4() instead of the direct Highway small-batch kernels.
+    // That preserves the intended fast path while reusing the verified
+    // runtime-selected ARM INT4 kernel selection.
     const char* env = std::getenv("DENSECORE_MOE_ENABLE_ARM_PACKED_INT4");
     if (!env || env[0] == '\0') {
         return true;
@@ -74,6 +73,29 @@ bool IsMoEFFNDebugTimingEnabled() {
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
+}
+
+bool IsMoESafeReferenceModeEnabled() {
+    const char* env = std::getenv("DENSECORE_MOE_SAFE_REFERENCE");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+bool IsMoEMatmulPathDebugEnabled() {
+    const char* env = std::getenv("DENSECORE_DEBUG_MOE_MATMUL_PATHS");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+bool IsMoECachePolicyDebugEnabled() {
+    const char* env = std::getenv("DENSECORE_DEBUG_MOE_CACHE_POLICY");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+void LogMoEMatmulPath(const char* path, int M, int K, int N, int group_size, bool allow_parallel) {
+    if (!IsMoEMatmulPathDebugEnabled()) {
+        return;
+    }
+    std::fprintf(stderr, "[MOE_MATMUL_PATH] path=%s M=%d K=%d N=%d group_size=%d allow_parallel=%d\n",
+                 path ? path : "unknown", M, K, N, group_size, allow_parallel ? 1 : 0);
 }
 
 bool ShouldParallelizeExpertFFNInner(int64_t batch, int64_t hidden_dim, int64_t intermediate_dim) {
@@ -143,6 +165,56 @@ bool ShouldRunMoEReferenceCheck() {
     return false;
 }
 
+bool DequantizePackedInt4ToF32(const CpuBackend::ExpertPackedInt4Weight& binding, int64_t rows, int64_t cols,
+                               float* out) {
+    if (!binding.IsValid() || !out || rows <= 0 || cols <= 0 || binding.K != cols || binding.N < rows) {
+        return false;
+    }
+
+    const int packed_cols = static_cast<int>((cols + 1) / 2);
+    const int num_full_groups = static_cast<int>(cols / binding.group_size);
+    const int k_aligned = num_full_groups * binding.group_size;
+
+    for (int64_t r = 0; r < rows; ++r) {
+        const uint8_t* packed_row = binding.packed_weights + static_cast<size_t>(r) * packed_cols;
+        float* out_row = out + r * cols;
+        const float* row_scales = binding.scales + static_cast<size_t>(r) * num_full_groups;
+        const float* row_zeros = binding.zeros + static_cast<size_t>(r) * num_full_groups;
+
+        for (int g = 0; g < num_full_groups; ++g) {
+            const float scale = row_scales[g];
+            const float zero = row_zeros[g];
+            const int k_start = g * binding.group_size;
+            const uint8_t* packed_group = packed_row + (k_start / 2);
+            for (int k = 0; k < binding.group_size; ++k) {
+                const uint8_t packed = packed_group[k / 2];
+                int8_t q = (k & 1) ? static_cast<int8_t>((packed >> 4) & 0x0F)
+                                   : static_cast<int8_t>(packed & 0x0F);
+                if (q & 0x08) {
+                    q |= static_cast<int8_t>(0xF0);
+                }
+                out_row[k_start + k] = scale * (static_cast<float>(q) - zero);
+            }
+        }
+
+        if (k_aligned < cols) {
+            const float scale = (num_full_groups > 0) ? row_scales[num_full_groups - 1] : 1.0f;
+            const float zero = (num_full_groups > 0) ? row_zeros[num_full_groups - 1] : 0.0f;
+            for (int64_t k = k_aligned; k < cols; ++k) {
+                const uint8_t packed = packed_row[k / 2];
+                int8_t q = (k & 1) ? static_cast<int8_t>((packed >> 4) & 0x0F)
+                                   : static_cast<int8_t>(packed & 0x0F);
+                if (q & 0x08) {
+                    q |= static_cast<int8_t>(0xF0);
+                }
+                out_row[k] = scale * (static_cast<float>(q) - zero);
+            }
+        }
+    }
+
+    return true;
+}
+
 struct MoEReferenceExpertMatrices {
     std::vector<float> w1;  // [intermediate, hidden]
     std::vector<float> w2;  // [hidden, intermediate]
@@ -159,15 +231,26 @@ bool DequantExpertMatrixToF32(const CpuBackend::ExpertWeights& expert, const Cpu
         return false;
     }
     out->clear();
-    if (!weight.ptr || rows <= 0 || cols <= 0) {
+    if (rows <= 0 || cols <= 0) {
         if (reason) {
             *reason = "missing expert weight";
         }
         return false;
     }
     if (int4_binding.IsValid()) {
+        out->resize(static_cast<size_t>(rows * cols));
+        if (!DequantizePackedInt4ToF32(int4_binding, rows, cols, out->data())) {
+            if (reason) {
+                *reason = "packed-int4 MoE reference dequant failed";
+            }
+            out->clear();
+            return false;
+        }
+        return true;
+    }
+    if (!weight.ptr) {
         if (reason) {
-            *reason = "packed-int4 MoE reference dequant is not implemented";
+            *reason = "missing expert weight";
         }
         return false;
     }
@@ -466,6 +549,16 @@ bool TryRunPackedInt4ProjectionDirect(CpuBackend* backend, const CpuBackend::Exp
         return false;
     }
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // Do not route MoE packed INT4 through the direct Highway small-batch path
+    // on ARM. CpuBackend::GemmInt4() already carries the ARM-safe runtime
+    // selection logic and was the path used to fix dense Qwen correctness.
+    (void)backend;
+    (void)numa_node;
+    (void)allow_parallel;
+    return false;
+#endif
+
     const float* input_data = input.DataAs<float>();
     float* output_data = output->DataAs<float>();
     auto& pool = backend->GetThreadPool(numa_node);
@@ -524,6 +617,16 @@ bool TryRunPackedInt4FusedSwiGLUProjectionDirect(CpuBackend* backend,
         return false;
     }
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // Same ARM rule as the single-projection path above: use the backend INT4
+    // kernels instead of the direct Highway fused kernel until ARM parity is
+    // proven for MoE expert workloads.
+    (void)backend;
+    (void)numa_node;
+    (void)allow_parallel;
+    return false;
+#endif
+
     const float* input_data = input.DataAs<float>();
     float* output_data = output->DataAs<float>();
     auto& pool = backend->GetThreadPool(numa_node);
@@ -570,11 +673,12 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     const size_t hidden_size = static_cast<size_t>(batch * intermediate_dim);
     const bool enable_inner_parallel =
         allow_inner_parallel && ShouldParallelizeExpertFFNInner(batch, hidden_dim, intermediate_dim);
+    const bool safe_reference_mode = IsMoESafeReferenceModeEnabled();
 
     hidden_scratch.Resize(backend, hidden_size);
     Tensor hidden = Tensor::Make2D(hidden_scratch.ptr, batch, intermediate_dim);
     const bool used_fused_int4_swiglu =
-        !expert.use_gelu_activation &&
+        !safe_reference_mode && !expert.use_gelu_activation &&
         TryRunPackedInt4FusedSwiGLUProjectionDirect(backend, expert.w1_int4, expert.w3_int4, input, &hidden, numa_node,
                                                     enable_inner_parallel);
     if (!used_fused_int4_swiglu && (w3.IsValid() || expert.w3_int4.IsValid() || expert.w3.ptr)) {
@@ -587,17 +691,23 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
                                     const CpuBackend::ExpertWeight& raw_weight, int ggml_type_id, int64_t proj_rows,
                                     int64_t proj_cols, Tensor* dst) {
         // Path 1: Packed INT4 (custom DenseCore format)
-        if (TryRunPackedInt4Projection(backend, int4_binding, src, dst, numa_node, enable_inner_parallel)) {
+        if (!safe_reference_mode &&
+            TryRunPackedInt4Projection(backend, int4_binding, src, dst, numa_node, enable_inner_parallel)) {
             return;
         }
         // Path 2: Native ggml quantized GEMV (Q4_K, Q4_0, etc.) -> zero dequantization
-        if (raw_weight.ptr && ggml_type_id != GGML_TYPE_F32 &&
+        if (!safe_reference_mode && raw_weight.ptr && ggml_type_id != GGML_TYPE_F32 &&
             TryRunGgmlQuantizedProjection(backend, raw_weight.ptr, ggml_type_id, src, dst, proj_rows, proj_cols,
                                           numa_node, enable_inner_parallel)) {
+            LogMoEMatmulPath("ggml_quantized_vecdot", static_cast<int>(src.shape[0]), static_cast<int>(src.shape[1]),
+                             static_cast<int>(dst->shape[1]), int4_binding.group_size, enable_inner_parallel);
             return;
         }
         // Path 3: F32 dense matmul fallback (requires pre-dequantized weight)
         if (dense_weight.IsValid()) {
+            LogMoEMatmulPath(safe_reference_mode ? "reference_f32" : "dense_f32",
+                             static_cast<int>(src.shape[0]), static_cast<int>(src.shape[1]),
+                             static_cast<int>(dst->shape[1]), int4_binding.group_size, enable_inner_parallel);
             backend->MatMulTransB(src, dense_weight, dst, numa_node);
         }
     };
@@ -692,6 +802,8 @@ bool TryRunPackedInt4Projection(CpuBackend* backend, const CpuBackend::ExpertPac
     }
 
     if (TryRunPackedInt4ProjectionDirect(backend, binding, input, output, numa_node, allow_parallel)) {
+        LogMoEMatmulPath("direct_hwy", static_cast<int>(input.shape[0]), static_cast<int>(input.shape[1]),
+                         static_cast<int>(output->shape[1]), binding.group_size, allow_parallel);
         return true;
     }
 
@@ -711,14 +823,18 @@ bool TryRunPackedInt4Projection(CpuBackend* backend, const CpuBackend::ExpertPac
     Tensor S = Tensor::Make2D(const_cast<float*>(binding.scales), binding.N, groups_per_row);
     Tensor Z = Tensor::Make2D(const_cast<float*>(binding.zeros), binding.N, groups_per_row);
     backend->GemmInt4(input, W, S, Z, output, binding.group_size, numa_node);
+    LogMoEMatmulPath("backend_gemmint4", static_cast<int>(input.shape[0]), static_cast<int>(input.shape[1]),
+                     static_cast<int>(output->shape[1]), binding.group_size, allow_parallel);
     return true;
 }
 
 size_t GetExpertMatrixDequantBytes(int ggml_type_id, const CpuBackend::ExpertPackedInt4Weight& int4_binding,
                                    int64_t rows, int64_t cols) {
-    if (rows <= 0 || cols <= 0 || ggml_type_id == GGML_TYPE_F32 ||
-        (int4_binding.IsValid() && CanUsePackedInt4MoEFastPath())) {
+    if (rows <= 0 || cols <= 0 || ggml_type_id == GGML_TYPE_F32) {
         return 0;
+    }
+    if (int4_binding.IsValid()) {
+        return IsMoESafeReferenceModeEnabled() ? static_cast<size_t>(rows * cols * sizeof(float)) : 0;
     }
     return static_cast<size_t>(rows * cols * sizeof(float));
 }
@@ -951,12 +1067,11 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
     auto registry = GetMoELayerRegistry(layer_key);
     RecordExpertAccess(layer_key, routing.expert_ids.data(), static_cast<int>(routing.expert_ids.size()));
 #if defined(__aarch64__) || defined(_M_ARM64)
-    // ARM Qwen35-MoE runs have hit invalid-mutex crashes while touching
-    // per-layer registry side channels (locality snapshots / dequant cache)
-    // from the routed expert path. Keep the core MoE execution path active,
-    // but disable the optional registry-backed bookkeeping on ARM until the
-    // shared-state lifetime and synchronization are fully hardened.
-    registry.reset();
+    // Keep ARM profiler/locality snapshots active, but avoid the mutable
+    // registry-backed dequant cache until that shared-state lane is proven safe.
+    const bool arm_disable_registry_dequant_cache = true;
+#else
+    const bool arm_disable_registry_dequant_cache = false;
 #endif
 
     float* out_data = output->DataAs<float>();
@@ -1006,6 +1121,7 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
         batch_size <= 4 && total_assignments <= kSmallDecodeMaxAssignments && !arm_large_expert_pool;
     const bool has_token_indices = !routing.token_indices.empty();
     const float* input_data = input.DataAs<float>();
+    const bool safe_reference_mode = IsMoESafeReferenceModeEnabled();
     bool small_decode_requires_general_path = false;
     if (small_decode_candidate) {
         for (size_t i = 0; i < assignment_count; ++i) {
@@ -1015,7 +1131,7 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
             }
             const auto& exp = experts[static_cast<size_t>(expert_id)];
             // Accept packed INT4 OR ggml quantized weights (Q4_K etc.)
-            if (!ExpertUsesPackedInt4Only(exp) && !ExpertHasGgmlQuantizedWeights(exp)) {
+            if (!ExpertUsesPackedInt4Only(exp) && !(ExpertHasGgmlQuantizedWeights(exp) && !safe_reference_mode)) {
                 small_decode_requires_general_path = true;
                 break;
             }
@@ -1119,18 +1235,32 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                                                     static_cast<ptrdiff_t>(small_step_current_batch_expert_count));
         }
 
-        const bool dequant_cache_enabled = internal::IsMoEDequantCacheEnabled() && registry != nullptr;
+        const bool dequant_cache_enabled =
+            internal::IsMoEDequantCacheEnabled() && registry != nullptr && !arm_disable_registry_dequant_cache;
         const bool cache_all_active_experts = internal::ShouldCacheAllActiveExperts();
         const size_t dequant_cache_budget = internal::GetMoEDequantCacheBytes();
 
         auto make_weight_f32_small = [&](void* ptr, int ggml_type_id, const ExpertPackedInt4Weight& int4_binding,
                                          int64_t rows, int64_t cols, AlignedScratch& scratch, size_t* dequantized_bytes,
                                          bool* dequantized_any) -> Tensor {
+            if (int4_binding.IsValid()) {
+                if (!safe_reference_mode) {
+                    return Tensor();
+                }
+                scratch.Resize(this, static_cast<size_t>(rows * cols));
+                if (!DequantizePackedInt4ToF32(int4_binding, rows, cols, scratch.ptr)) {
+                    return Tensor();
+                }
+                if (dequantized_bytes) {
+                    *dequantized_bytes += static_cast<size_t>(rows * cols * sizeof(float));
+                }
+                if (dequantized_any) {
+                    *dequantized_any = true;
+                }
+                return Tensor::Make2D(scratch.ptr, rows, cols);
+            }
             if (!ptr || rows <= 0 || cols <= 0) {
                 return Tensor::Make2D(ptr, rows, cols);
-            }
-            if (int4_binding.IsValid() && CanUsePackedInt4MoEFastPath()) {
-                return Tensor();
             }
             const ggml_type wtype = static_cast<ggml_type>(ggml_type_id);
             if (wtype == GGML_TYPE_F32) {
@@ -1207,10 +1337,15 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                     auto candidate = std::make_shared<MoELayerRegistry::DequantizedExpertCacheEntry>();
                     candidate->expert_id = expert_id;
                     candidate->bytes = cacheable_bytes;
-                    if ((!exp.w1_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) && exp.w1_type != GGML_TYPE_F32) {
+                    if ((!exp.w1_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
+                        exp.w1_type != GGML_TYPE_F32) {
                         const struct ggml_type_traits* traits =
                             ggml_get_type_traits(static_cast<ggml_type>(exp.w1_type));
-                        if (traits && traits->to_float) {
+                        if (exp.w1_int4.IsValid() && safe_reference_mode) {
+                            candidate->w1.resize(static_cast<size_t>(exp.intermediate_dim) * exp.hidden_dim);
+                            DequantizePackedInt4ToF32(exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
+                                                      static_cast<int64_t>(exp.hidden_dim), candidate->w1.data());
+                        } else if (traits && traits->to_float) {
                             candidate->w1.resize(static_cast<size_t>(exp.intermediate_dim) * exp.hidden_dim);
                             const size_t row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w1_type), exp.hidden_dim);
                             const char* src = static_cast<const char*>(exp.w1.ptr);
@@ -1220,10 +1355,15 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                             }
                         }
                     }
-                    if ((!exp.w2_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) && exp.w2_type != GGML_TYPE_F32) {
+                    if ((!exp.w2_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
+                        exp.w2_type != GGML_TYPE_F32) {
                         const struct ggml_type_traits* traits =
                             ggml_get_type_traits(static_cast<ggml_type>(exp.w2_type));
-                        if (traits && traits->to_float) {
+                        if (exp.w2_int4.IsValid() && safe_reference_mode) {
+                            candidate->w2.resize(static_cast<size_t>(exp.hidden_dim) * exp.intermediate_dim);
+                            DequantizePackedInt4ToF32(exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
+                                                      static_cast<int64_t>(exp.intermediate_dim), candidate->w2.data());
+                        } else if (traits && traits->to_float) {
                             candidate->w2.resize(static_cast<size_t>(exp.hidden_dim) * exp.intermediate_dim);
                             const size_t row_bytes =
                                 ggml_row_size(static_cast<ggml_type>(exp.w2_type), exp.intermediate_dim);
@@ -1234,11 +1374,16 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                             }
                         }
                     }
-                    if (exp.w3.ptr != nullptr && (!exp.w3_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
+                    if (exp.w3.ptr != nullptr &&
+                        (!exp.w3_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
                         exp.w3_type != GGML_TYPE_F32) {
                         const struct ggml_type_traits* traits =
                             ggml_get_type_traits(static_cast<ggml_type>(exp.w3_type));
-                        if (traits && traits->to_float) {
+                        if (exp.w3_int4.IsValid() && safe_reference_mode) {
+                            candidate->w3.resize(static_cast<size_t>(exp.intermediate_dim) * exp.hidden_dim);
+                            DequantizePackedInt4ToF32(exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
+                                                      static_cast<int64_t>(exp.hidden_dim), candidate->w3.data());
+                        } else if (traits && traits->to_float) {
                             candidate->w3.resize(static_cast<size_t>(exp.intermediate_dim) * exp.hidden_dim);
                             const size_t row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w3_type), exp.hidden_dim);
                             const char* src = static_cast<const char*>(exp.w3.ptr);
@@ -1294,19 +1439,19 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
 
             // When expert weights are ggml-quantized (Q4_K etc.), skip F32 dequant entirely.
             // The quantized GEMV path in DispatchExpertFFNImpl handles these directly via vec_dot.
-            const bool has_ggml_quant = ExpertHasGgmlQuantizedWeights(exp);
+            const bool has_ggml_quant = !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp);
 
             size_t dequantized_bytes = 0;
             bool dequantized_any = false;
             Tensor w1, w2, w3;
             if (!has_ggml_quant) {
-                w1 = (cached_entry && (!exp.w1_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
+                w1 = (cached_entry && (!exp.w1_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
                       exp.w1_type != GGML_TYPE_F32)
                          ? cached_entry->w1_tensor
                          : make_weight_f32_small(
                                exp.w1.ptr, exp.w1_type, exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
                                static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes, &dequantized_any);
-                w2 = (cached_entry && (!exp.w2_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
+                w2 = (cached_entry && (!exp.w2_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
                       exp.w2_type != GGML_TYPE_F32)
                          ? cached_entry->w2_tensor
                          : make_weight_f32_small(exp.w2.ptr, exp.w2_type, exp.w2_int4,
@@ -1314,7 +1459,8 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                                                  static_cast<int64_t>(exp.intermediate_dim), w2_dequant,
                                                  &dequantized_bytes, &dequantized_any);
                 if (exp.w3.ptr != nullptr) {
-                    w3 = (cached_entry && (!exp.w3_int4.IsValid() || !CanUsePackedInt4MoEFastPath()) &&
+                    w3 = (cached_entry &&
+                          (!exp.w3_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
                           exp.w3_type != GGML_TYPE_F32)
                              ? cached_entry->w3_tensor
                              : make_weight_f32_small(exp.w3.ptr, exp.w3_type, exp.w3_int4,
@@ -1425,6 +1571,20 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
         return;
     }
 
+    if (IsMoEMatmulPathDebugEnabled()) {
+        std::fprintf(stderr, "[MOE_REORDER] assignments=%d active_experts=%zu token_indices=",
+                     reorder_map.total_assignments, active_work.size());
+        const int trace_count = std::min(reorder_map.total_assignments, 32);
+        for (int i = 0; i < trace_count; ++i) {
+            std::fprintf(stderr, "%s%d", i == 0 ? "" : ",", reorder_map.token_indices[i]);
+        }
+        std::fprintf(stderr, "\n[MOE_REORDER] expert_batches=");
+        for (size_t i = 0; i < active_work.size(); ++i) {
+            std::fprintf(stderr, "%s(%d:%d)", i == 0 ? "" : ",", active_work[i].expert_id, active_work[i].count);
+        }
+        std::fputc('\n', stderr);
+    }
+
     int reuse_intersection = 0;
     std::unordered_set<int> previous_batch_set;
     if (!previous_batch_experts.empty()) {
@@ -1513,12 +1673,30 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
         }
     }
 
-    const bool dequant_cache_enabled = internal::IsMoEDequantCacheEnabled() && registry != nullptr;
+    const bool dequant_cache_enabled =
+        internal::IsMoEDequantCacheEnabled() && registry != nullptr && !arm_disable_registry_dequant_cache;
     const bool cache_all_active_experts = internal::ShouldCacheAllActiveExperts();
     const size_t dequant_cache_budget = internal::GetMoEDequantCacheBytes();
 
-    auto make_weight_f32 = [&](void* ptr, int ggml_type_id, int64_t rows, int64_t cols, AlignedScratch& scratch,
-                               size_t* dequantized_bytes, bool* dequantized_any) -> Tensor {
+    auto make_weight_f32 = [&](void* ptr, int ggml_type_id, const ExpertPackedInt4Weight& int4_binding, int64_t rows,
+                               int64_t cols, AlignedScratch& scratch, size_t* dequantized_bytes,
+                               bool* dequantized_any) -> Tensor {
+        if (int4_binding.IsValid()) {
+            if (!safe_reference_mode) {
+                return Tensor();
+            }
+            scratch.Resize(this, static_cast<size_t>(rows * cols));
+            if (!DequantizePackedInt4ToF32(int4_binding, rows, cols, scratch.ptr)) {
+                return Tensor();
+            }
+            if (dequantized_bytes) {
+                *dequantized_bytes += static_cast<size_t>(rows * cols * sizeof(float));
+            }
+            if (dequantized_any) {
+                *dequantized_any = true;
+            }
+            return Tensor::Make2D(scratch.ptr, rows, cols);
+        }
         if (!ptr || rows <= 0 || cols <= 0) {
             return Tensor::Make2D(ptr, rows, cols);
         }
@@ -1549,9 +1727,14 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                                      int64_t rows, int64_t cols, simd::AlignedVector<float>* dst) -> bool {
         if (!dst) return false;
         dst->clear();
+        if (int4_binding.IsValid()) {
+            if (!IsMoESafeReferenceModeEnabled()) return false;
+            dst->resize(static_cast<size_t>(rows * cols));
+            return DequantizePackedInt4ToF32(int4_binding, rows, cols, dst->data());
+        }
         if (!ptr || rows <= 0 || cols <= 0) return false;
         const ggml_type wtype = static_cast<ggml_type>(ggml_type_id);
-        if (wtype == GGML_TYPE_F32 || (int4_binding.IsValid() && CanUsePackedInt4MoEFastPath())) return false;
+        if (wtype == GGML_TYPE_F32) return false;
         const struct ggml_type_traits* traits = ggml_get_type_traits(wtype);
         if (!traits || !traits->to_float) return false;
         const size_t total = static_cast<size_t>(rows * cols);
@@ -1575,12 +1758,19 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
     // invalid-mutex crashes in production-style runs. Keep the reordered MoE
     // path, but serialize expert execution on ARM until the parallel cache
     // coordination is made safe.
-#if defined(__aarch64__) || defined(_M_ARM64)
-    const bool parallelize_experts = false;
-#else
-    const bool parallelize_experts = arm_large_expert_pool && batch_size > 4 &&
-                                     active_work.size() >= static_cast<size_t>(std::max(4, worker_threads / 2));
-#endif
+    const bool parallelize_experts =
+        !small_decode_step && batch_size > 1 &&
+        active_work.size() >= static_cast<size_t>(std::max(4, worker_threads / 2)) &&
+        (!arm_disable_registry_dequant_cache || !dequant_cache_enabled);
+    if (IsMoECachePolicyDebugEnabled()) {
+        std::fprintf(stderr,
+                     "[MOE_CACHE_POLICY] arm_disable_registry_dequant_cache=%d registry_present=%d "
+                     "dequant_cache_enabled=%d parallelize_experts=%d reason=%s\n",
+                     arm_disable_registry_dequant_cache ? 1 : 0, registry ? 1 : 0, dequant_cache_enabled ? 1 : 0,
+                     parallelize_experts ? 1 : 0,
+                     arm_disable_registry_dequant_cache ? "arm_mutable_dequant_cache_bypassed"
+                                                         : "cache_lane_available");
+    }
 
     auto run_active_work_range = [&](int start_idx, int end_idx, bool allow_inner_parallel) {
         uint64_t local_cached_experts = 0;
@@ -1734,17 +1924,17 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
             Tensor w2;
             Tensor w3;
             if (cached_entry) {
-                w1 = (exp.w1_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
+                w1 = (exp.w1_int4.IsValid() && !safe_reference_mode && CanUsePackedInt4MoEFastPath()) ? Tensor()
                      : (exp.w1_type == GGML_TYPE_F32)
                          ? Tensor::Make2D(exp.w1.ptr, static_cast<int64_t>(exp.intermediate_dim),
                                           static_cast<int64_t>(exp.hidden_dim))
                          : cached_entry->w1_tensor;
-                w2 = (exp.w2_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
+                w2 = (exp.w2_int4.IsValid() && !safe_reference_mode && CanUsePackedInt4MoEFastPath()) ? Tensor()
                      : (exp.w2_type == GGML_TYPE_F32) ? Tensor::Make2D(exp.w2.ptr, static_cast<int64_t>(exp.hidden_dim),
                                                                        static_cast<int64_t>(exp.intermediate_dim))
                                                       : cached_entry->w2_tensor;
                 if (exp.w3.ptr != nullptr) {
-                    w3 = (exp.w3_int4.IsValid() && CanUsePackedInt4MoEFastPath()) ? Tensor()
+                    w3 = (exp.w3_int4.IsValid() && !safe_reference_mode && CanUsePackedInt4MoEFastPath()) ? Tensor()
                          : (exp.w3_type == GGML_TYPE_F32)
                              ? Tensor::Make2D(exp.w3.ptr, static_cast<int64_t>(exp.intermediate_dim),
                                               static_cast<int64_t>(exp.hidden_dim))
@@ -1753,24 +1943,20 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, const Tensor& inp
                 ++local_cached_experts;
             } else {
                 // Skip F32 dequant for ggml-quantized experts -> quantized GEMV handles them directly
-                const bool has_ggml_quant_gen = ExpertHasGgmlQuantizedWeights(exp);
+                const bool has_ggml_quant_gen = !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp);
                 if (!has_ggml_quant_gen) {
-                    w1 = (exp.w1_int4.IsValid() && CanUsePackedInt4MoEFastPath())
-                             ? Tensor()
-                             : make_weight_f32(exp.w1.ptr, exp.w1_type, static_cast<int64_t>(exp.intermediate_dim),
-                                               static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes,
-                                               &dequantized_any);
-                    w2 = (exp.w2_int4.IsValid() && CanUsePackedInt4MoEFastPath())
-                             ? Tensor()
-                             : make_weight_f32(exp.w2.ptr, exp.w2_type, static_cast<int64_t>(exp.hidden_dim),
-                                               static_cast<int64_t>(exp.intermediate_dim), w2_dequant,
-                                               &dequantized_bytes, &dequantized_any);
+                    w1 = make_weight_f32(exp.w1.ptr, exp.w1_type, exp.w1_int4,
+                                         static_cast<int64_t>(exp.intermediate_dim),
+                                         static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes,
+                                         &dequantized_any);
+                    w2 = make_weight_f32(exp.w2.ptr, exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
+                                         static_cast<int64_t>(exp.intermediate_dim), w2_dequant, &dequantized_bytes,
+                                         &dequantized_any);
                     if (exp.w3.ptr != nullptr) {
-                        w3 = (exp.w3_int4.IsValid() && CanUsePackedInt4MoEFastPath())
-                                 ? Tensor()
-                                 : make_weight_f32(exp.w3.ptr, exp.w3_type, static_cast<int64_t>(exp.intermediate_dim),
-                                                   static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes,
-                                                   &dequantized_any);
+                        w3 = make_weight_f32(exp.w3.ptr, exp.w3_type, exp.w3_int4,
+                                             static_cast<int64_t>(exp.intermediate_dim),
+                                             static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes,
+                                             &dequantized_any);
                     }
                 }
                 // else: w1/w2/w3 remain empty — DispatchExpertFFNImpl uses quantized GEMV

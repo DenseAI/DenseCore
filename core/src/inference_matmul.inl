@@ -124,7 +124,8 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight_type);
     const void* sample_row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k_start) * row_stride;
     const bool allow_native_q4k_vecdot =
-        ShouldUseArmNativeQ4KVecDotValidated(weight_type, type_traits_cpu, sample_row_ptr, quant_input, x_f32, N);
+        ShouldUseArmNativeQ4KVecDotValidated(weight_type, type_traits_cpu, weight_name, sample_row_ptr, quant_input,
+                                             x_f32, N);
 
     if (!ud->force_reference_scalar && quant_input && type_traits_cpu && type_traits_cpu->vec_dot &&
         allow_native_q4k_vecdot) {
@@ -657,8 +658,8 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 const bool can_use_quant_nrc_fast = output_contig && vec_dot_nrows >= tile_m;
                 const void* sample_row_ptr = weight_base + static_cast<size_t>(k_start) * weight_row_stride;
                 const bool allow_native_q4k_vecdot =
-                    ShouldUseArmNativeQ4KVecDotValidated(weight_type, type_traits_cpu, sample_row_ptr, quant_input_base,
-                                                         x_rows[static_cast<size_t>(tile_start)], N);
+                    ShouldUseArmNativeQ4KVecDotValidated(weight_type, type_traits_cpu, weight_name, sample_row_ptr,
+                                                         quant_input_base, x_rows[static_cast<size_t>(tile_start)], N);
 
                 if (!ud->force_reference_scalar && can_use_quant_nrc_fast && quant_input_base &&
                     allow_native_q4k_vecdot) {

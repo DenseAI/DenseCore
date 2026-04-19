@@ -137,13 +137,21 @@ TEST(ModelDescriptorTest, ExplicitChatTemplateStillOverridesGemma4DefaultPromptF
               densecore::models::PromptTemplateFamily::CHATML);
 }
 
-TEST(ModelDescriptorTest, Gemma4TextIgnoresAttentionLogitSoftcapMetadata) {
+TEST(ModelDescriptorTest, Gemma4TextPreservesAttentionLogitSoftcapMetadata) {
     TransformerModel model{};
     model.arch = ModelArch::GEMMA;
     model.arch_flags.is_gemma4 = true;
 
-    EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(&model, 50.0f), 0.0f);
-    EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(&model, 0.0f), 0.0f);
+    EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(&model, 50.0f), 50.0f);
+}
+
+TEST(ModelDescriptorTest, Gemma4TextNormalizesInvalidAttentionLogitSoftcapMetadataToDefault) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+
+    EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(&model, 0.0f), 50.0f);
+    EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(&model, -3.0f), 50.0f);
 }
 
 TEST(ModelDescriptorTest, NonGemmaSoftcapMetadataIsUnchanged) {

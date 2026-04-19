@@ -175,6 +175,11 @@ TransformerModel* LoadGGUFModel(const char* path) {
     TransformerModel* model = new TransformerModel();
     model->ctx_gguf = ctx_gguf;
     model->ctx_w = ctx_w;
+    const auto fail_load = [&](const std::string& reason) -> TransformerModel* {
+        std::cerr << "[DenseCore] FATAL: " << reason << std::endl;
+        delete model;
+        return nullptr;
+    };
 
     // Allocate a small separate context for view tensor metadata (expert slices, etc.).
     // gguf_init_from_file leaves no room for additional ggml_tensor structs in ctx_w,
@@ -391,6 +396,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
     };
 
     auto has_key = [&](const std::string& suffix) -> bool { return find_prefixed_key(suffix) != -1; };
+    auto has_exact_key = [&](const char* key) -> bool { return gguf_find_key(ctx_gguf, key) != -1; };
 
     // Load hyperparameters using dynamic architecture prefix
     get_u32("vocab_size", model->hparams.n_vocab);
@@ -521,8 +527,18 @@ TransformerModel* LoadGGUFModel(const char* path) {
         get_u32("embedding_length_per_layer_input", tmp_u32);
         model->gemma4_hidden_size_per_layer_input = static_cast<int>(tmp_u32);
 
-        float gemma4_attention_logit_cap = 0.0f;
-        get_f32("attention_logit_cap", gemma4_attention_logit_cap);
+        float gemma4_attention_logit_cap = 50.0f;
+        if (has_key("attention_logit_cap")) {
+            get_f32("attention_logit_cap", gemma4_attention_logit_cap);
+        } else {
+            static bool warned_gemma4_softcap_default = false;
+            if (!warned_gemma4_softcap_default) {
+                std::cerr << "[DenseCore] Warning: Gemma4 GGUF is missing attention_logit_cap metadata; "
+                             "using HF-compatible default 50.0"
+                          << std::endl;
+                warned_gemma4_softcap_default = true;
+            }
+        }
         model->gemma4_attention_logit_softcapping =
             densecore::models::SanitizeAttentionLogitSoftcapForLoad(model, gemma4_attention_logit_cap);
         get_f32("final_logit_softcapping", model->gemma4_final_logit_softcapping);
@@ -551,29 +567,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 sliding_pattern_complete = true;
             }
         }
-        if (!sliding_pattern_complete && model->gemma4_key_length_swa > 0 && model->gemma4_key_length_full > 0 &&
-            model->gemma4_key_length_swa != model->gemma4_key_length_full) {
-            // Fallback: infer SWA vs full-attention from per-layer K weight output dimension.
-            // SWA layers have smaller K projection (key_length_swa), full layers have larger (key_length_full).
-            int inferred_count = 0;
-            for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
-                std::string k_name = "blk." + std::to_string(i) + ".attn_k.weight";
-                struct ggml_tensor* k_tensor = ggml_get_tensor(ctx_w, k_name.c_str());
-                if (k_tensor && k_tensor->ne[1] > 0) {
-                    const int64_t k_out_dim = k_tensor->ne[1];
-                    // ne[1] is the output dimension of the K projection (n_head_kv * head_dim_k)
-                    // For GQA with n_head_kv=1: k_out_dim == head_dim_k directly.
-                    // SWA layers match key_length_swa, full layers match key_length_full.
-                    model->gemma4_layer_is_sliding[i] =
-                        (k_out_dim == static_cast<int64_t>(model->gemma4_key_length_swa)) ? 1 : 0;
-                    inferred_count++;
-                }
-            }
-            if (inferred_count > 0) {
-                std::cout << "[DenseCore] Gemma4: inferred sliding window pattern from K weight shapes ("
-                          << inferred_count << "/" << model->hparams.n_layer << " layers)" << std::endl;
-                sliding_pattern_complete = true;
-            }
+        if (!sliding_pattern_complete) {
+            return fail_load("Gemma4 GGUF is missing a complete layer_types/sliding_window_pattern export");
         }
 
         model->gemma4_layer_kv_source.assign(model->hparams.n_layer, -1);
@@ -594,6 +589,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
             } else {
                 model->gemma4_layer_kv_source[static_cast<size_t>(i)] =
                     is_sliding ? last_non_shared_sliding : last_non_shared_full;
+                if (model->gemma4_layer_kv_source[static_cast<size_t>(i)] < 0) {
+                    return fail_load("Gemma4 shared-KV metadata is inconsistent for at least one layer");
+                }
             }
         }
 
@@ -807,6 +805,19 @@ TransformerModel* LoadGGUFModel(const char* path) {
     bool add_bos = (idx_bos != -1);
     if (idx_add_bos != -1) {
         add_bos = gguf_get_val_bool(ctx_gguf, idx_add_bos);
+    }
+    if (model->arch_flags.is_gemma4) {
+        // HF Gemma4 raw text tokenization does not auto-prepend BOS.
+        // Some GGUF exports still carry add_bos_token=true, but the official
+        // tokenizer/chat template emits <bos> explicitly when needed.
+        static bool warned_gemma4_bos_override = false;
+        if (idx_add_bos != -1 && gguf_get_val_bool(ctx_gguf, idx_add_bos) && !warned_gemma4_bos_override) {
+            std::cerr << "[DenseCore] Warning: overriding Gemma4 tokenizer.ggml.add_bos_token=true to false "
+                         "for Hugging Face tokenizer parity on raw text prompts"
+                      << std::endl;
+            warned_gemma4_bos_override = true;
+        }
+        add_bos = false;
     }
 
     if (model->bos_token_id < 0) {
@@ -1025,6 +1036,43 @@ TransformerModel* LoadGGUFModel(const char* path) {
         Tokenizer::BuildStreamTokenPieceCache(model);
     }
 
+    if (model->arch_flags.is_gemma4) {
+        if (model->tokenizer_type.empty()) {
+            return fail_load("Gemma4 GGUF is missing tokenizer.ggml.model/tokenizer.ggml.pre metadata");
+        }
+        if (densecore::models::ResolveTokenizerFamily(model) != densecore::models::TokenizerFamily::GEMMA_SENTENCEPIECE) {
+            return fail_load("Gemma4 requires GEMMA_SENTENCEPIECE tokenizer metadata");
+        }
+        if (model->bos_token_id < 0 || model->eos_token_id < 0) {
+            return fail_load("Gemma4 GGUF is missing BOS/EOS tokenizer metadata");
+        }
+        if (model->vocab_tokens.empty()) {
+            return fail_load("Gemma4 GGUF is missing tokenizer.ggml.tokens");
+        }
+        if (model->token_scores.size() != model->vocab_tokens.size()) {
+            return fail_load("Gemma4 GGUF is missing complete tokenizer.ggml.scores for sentencepiece parity");
+        }
+        if (model->token_types.size() != model->vocab_tokens.size()) {
+            return fail_load("Gemma4 GGUF is missing complete tokenizer.ggml.token_type metadata");
+        }
+        if (!has_key("layer_types") && !has_key("attention.sliding_window_pattern")) {
+            return fail_load("Gemma4 GGUF must export explicit layer_types or sliding_window_pattern metadata");
+        }
+        if (!has_key("attention.shared_kv_layers")) {
+            return fail_load("Gemma4 GGUF is missing attention.shared_kv_layers metadata");
+        }
+        if (detection_hints.has_gemma4_tensor_signatures && !has_key("embedding_length_per_layer_input")) {
+            return fail_load("Gemma4 GGUF is missing embedding_length_per_layer_input metadata");
+        }
+        if (model->gemma4_key_length_full == 0 || model->gemma4_key_length_swa == 0 || model->gemma4_value_length_full == 0 ||
+            model->gemma4_value_length_swa == 0) {
+            return fail_load("Gemma4 GGUF is missing explicit key/value length metadata");
+        }
+        if (model->gemma4_rope_dim_full <= 0 || model->gemma4_rope_dim_swa <= 0) {
+            return fail_load("Gemma4 GGUF is missing explicit RoPE dimension metadata");
+        }
+    }
+
     // 3. Initialize backend with error checking
     model->backend = ggml_backend_cpu_init();
     if (!model->backend) {
@@ -1124,6 +1172,11 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
     model->tok_embeddings = get_tensor("token_embd.weight");
     model->output_norm = get_tensor("output_norm.weight");
+    if (model->arch_flags.is_gemma4) {
+        model->gemma4_per_layer_model_projection = get_tensor("per_layer_model_proj.weight");
+        model->gemma4_per_layer_projection_norm = get_tensor("per_layer_proj_norm.weight");
+        model->gemma4_per_layer_token_embeddings = get_tensor("per_layer_token_embd.weight");
+    }
 
     // Try multiple possible names for lm_head/output projection
     model->output = get_tensor("output.weight");
@@ -1144,6 +1197,21 @@ TransformerModel* LoadGGUFModel(const char* path) {
         while (t) {
             std::cout << "  - " << t->name << " [" << t->ne[0] << ", " << t->ne[1] << "]" << std::endl;
             t = ggml_get_next_tensor(model->ctx_w, t);
+        }
+    }
+
+    if (model->arch_flags.is_gemma4) {
+        const bool has_any_per_layer_input_tensor =
+            model->gemma4_per_layer_model_projection || model->gemma4_per_layer_projection_norm ||
+            model->gemma4_per_layer_token_embeddings;
+        if (has_any_per_layer_input_tensor) {
+            if (!model->gemma4_per_layer_model_projection || !model->gemma4_per_layer_projection_norm ||
+                !model->gemma4_per_layer_token_embeddings) {
+                return fail_load("Gemma4 GGUF has incomplete per-layer-input tensor export");
+            }
+            if (model->gemma4_hidden_size_per_layer_input <= 0) {
+                return fail_load("Gemma4 GGUF is missing embedding_length_per_layer_input metadata");
+            }
         }
     }
 
@@ -1584,40 +1652,10 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
     }
     if (model->arch_flags.is_gemma4 && model->gemma4_layer_n_head_kv.empty()) {
-        std::vector<uint32_t> inferred_layer_n_head_kv(static_cast<size_t>(model->hparams.n_layer),
-                                                       std::max<uint32_t>(1u, model->hparams.n_head_kv));
-        bool inferred_any = false;
-        uint32_t max_inferred_n_head_kv = std::max<uint32_t>(1u, model->hparams.n_head_kv);
-        for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
-            auto* wk_i = model->layers[i].Get(model_keys::kAttnKWeight);
-            auto* wv_i = model->layers[i].Get(model_keys::kAttnVWeight);
-            auto* k_norm_i = model->layers[i].Get(model_keys::kAttnKNorm);
-            const bool is_sliding = i < model->gemma4_layer_is_sliding.size() &&
-                                    model->gemma4_layer_is_sliding[static_cast<size_t>(i)] != 0;
-            uint32_t target_head_dim = (k_norm_i && k_norm_i->ne[0] > 0) ? static_cast<uint32_t>(k_norm_i->ne[0])
-                                                                         : (is_sliding ? model->gemma4_key_length_swa
-                                                                                       : model->gemma4_key_length_full);
-            uint32_t inferred_layer_heads = inferred_layer_n_head_kv[static_cast<size_t>(i)];
-            if (target_head_dim > 0) {
-                if (wk_i && wk_i->ne[1] > 0 && (wk_i->ne[1] % target_head_dim) == 0) {
-                    inferred_layer_heads =
-                        std::max<uint32_t>(inferred_layer_heads, static_cast<uint32_t>(wk_i->ne[1] / target_head_dim));
-                }
-                if (wv_i && wv_i->ne[1] > 0 && (wv_i->ne[1] % target_head_dim) == 0) {
-                    inferred_layer_heads =
-                        std::max<uint32_t>(inferred_layer_heads, static_cast<uint32_t>(wv_i->ne[1] / target_head_dim));
-                }
-            }
-            inferred_layer_heads = std::max<uint32_t>(1u, inferred_layer_heads);
-            inferred_layer_n_head_kv[static_cast<size_t>(i)] = inferred_layer_heads;
-            max_inferred_n_head_kv = std::max(max_inferred_n_head_kv, inferred_layer_heads);
-            inferred_any = inferred_any || inferred_layer_heads != model->hparams.n_head_kv;
-        }
-        if (inferred_any) {
-            model->gemma4_layer_n_head_kv = std::move(inferred_layer_n_head_kv);
-            model->hparams.n_head_kv = max_inferred_n_head_kv;
-            std::cout << "[DenseCore] Gemma4: inferred per-layer KV head counts from weight/norm shapes"
-                      << " (max n_head_kv=" << model->hparams.n_head_kv << ")" << std::endl;
+        if (model->hparams.n_head_kv > 0) {
+            model->gemma4_layer_n_head_kv.assign(model->hparams.n_layer, model->hparams.n_head_kv);
+        } else {
+            return fail_load("Gemma4 GGUF is missing explicit attention.head_count_kv metadata");
         }
     }
     if (!model->gemma4_layer_n_head_kv.empty()) {
@@ -2956,10 +2994,23 @@ TransformerModel* LoadModelFromExternal(const TransformerHParams& hparams, const
         model->gemma4_per_layer_model_projection = get_tensor("per_layer_model_proj.weight");
         model->gemma4_per_layer_projection_norm = get_tensor("per_layer_proj_norm.weight");
         model->gemma4_per_layer_token_embeddings = get_tensor("per_layer_token_embd.weight");
-        if (model->gemma4_hidden_size_per_layer_input <= 0 && model->gemma4_per_layer_projection_norm &&
-            model->gemma4_per_layer_projection_norm->ne[0] > 0) {
-            model->gemma4_hidden_size_per_layer_input =
-                static_cast<int>(model->gemma4_per_layer_projection_norm->ne[0]);
+        const bool has_any_per_layer_input_tensor =
+            model->gemma4_per_layer_model_projection || model->gemma4_per_layer_projection_norm ||
+            model->gemma4_per_layer_token_embeddings;
+        if (has_any_per_layer_input_tensor) {
+            if (!model->gemma4_per_layer_model_projection || !model->gemma4_per_layer_projection_norm ||
+                !model->gemma4_per_layer_token_embeddings) {
+                std::cerr << "[DenseCore] FATAL: Gemma4 external tensor load has incomplete per-layer-input export"
+                          << std::endl;
+                delete model;
+                return nullptr;
+            }
+            if (model->gemma4_hidden_size_per_layer_input <= 0) {
+                std::cerr << "[DenseCore] FATAL: Gemma4 external tensor load requires explicit per-layer-input metadata"
+                          << std::endl;
+                delete model;
+                return nullptr;
+            }
         }
     }
     if (!model->output) model->output = get_tensor("lm_head.weight");

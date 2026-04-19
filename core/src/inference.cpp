@@ -356,6 +356,14 @@ static bool IsDebugHiddenSnapshotEnabled() {
     return enabled;
 }
 
+static bool IsDebugGemma4SharedKVEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_GEMMA4_SHARED_KV");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
 static bool IsDebugFfnProjectionReferenceEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_FFN_PROJECTION_REFERENCE");
@@ -467,8 +475,9 @@ enum class RuntimeToggleMode { Off = 0, Auto = 1, On = 2 };
 [[maybe_unused]] static RuntimeToggleMode GetArmQ4KNativeVecDotMode();
 
 static bool ShouldUseArmNativeQ4KVecDotValidated(ggml_type weight_type, const ggml_type_traits_cpu* type_traits_cpu,
-                                                 const void* sample_row_ptr, const void* sample_quant_input,
-                                                 const float* sample_input_f32, int N) {
+                                                 const char* weight_name, const void* sample_row_ptr,
+                                                 const void* sample_quant_input, const float* sample_input_f32,
+                                                 int N) {
 #if defined(__aarch64__) || defined(_M_ARM64)
     if (weight_type != GGML_TYPE_Q4_K) {
         return type_traits_cpu && type_traits_cpu->vec_dot;
@@ -486,8 +495,7 @@ static bool ShouldUseArmNativeQ4KVecDotValidated(ggml_type weight_type, const gg
         return true;
     }
 
-    const bool is_hybrid_ssm_qkv = IsHybridSSMQkvWeightName(
-        reinterpret_cast<const char*>(sample_row_ptr));  // Approximate check if name ptr was passed
+    const bool is_hybrid_ssm_qkv = IsHybridSSMQkvWeightName(weight_name);
     if (is_hybrid_ssm_qkv && ShouldForcePlainGgmlForHybridSSMQkv()) {
         return false;  // Always fail-closed for hybrid SSM QKV on ARM unless specifically opted out
     }
@@ -550,6 +558,7 @@ static bool ShouldUseArmNativeQ4KVecDotValidated(ggml_type weight_type, const gg
     return current == 1;
 #else
     (void)weight_type;
+    (void)weight_name;
     (void)sample_row_ptr;
     (void)sample_quant_input;
     (void)sample_input_f32;
@@ -1304,10 +1313,14 @@ ResolveBasePagedDecodeExecutionDecision(const DecodePagedAttentionPolicy& policy
     BasePagedDecodeExecutionDecision decision;
     const bool use_cache = (cache != nullptr);
     if (use_cache && batch.num_seqs > 0 && !batch.n_past.empty()) {
-        const KVRetentionPolicy& retention_policy = GetKVRetentionPolicy();
         for (int n_past_i : batch.n_past) {
-            decision.n_past_val =
-                std::max(decision.n_past_val, ComputeKVRetentionSpan(n_past_i, retention_policy).history_kept);
+            if (model && model->arch_flags.is_gemma4) {
+                decision.n_past_val = std::max(decision.n_past_val, std::max(0, n_past_i));
+            } else {
+                const KVRetentionPolicy& retention_policy = GetKVRetentionPolicy();
+                decision.n_past_val =
+                    std::max(decision.n_past_val, ComputeKVRetentionSpan(n_past_i, retention_policy).history_kept);
+            }
         }
     }
 
@@ -1436,6 +1449,25 @@ static bool IsDebugKvRoundTripEnabled() {
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
+}
+
+static float ResolveGemma4AttentionLogitSoftcapRuntime(const TransformerModel* model) {
+    if (!model || !model->arch_flags.is_gemma4) {
+        return 0.0f;
+    }
+    return model->gemma4_attention_logit_softcapping > 0.0f ? model->gemma4_attention_logit_softcapping : 50.0f;
+}
+
+static bool IsGemma4SharedKVSourceLayer(const TransformerModel* model, int layer_idx) {
+    if (!model || !model->arch_flags.is_gemma4 || layer_idx < 0) {
+        return false;
+    }
+    for (size_t i = 0; i < model->gemma4_layer_kv_source.size(); ++i) {
+        if (static_cast<int>(i) > layer_idx && model->gemma4_layer_kv_source[i] == layer_idx) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool ShouldRunKvRoundTripProbe(int layer, bool is_k) {
@@ -2748,6 +2780,36 @@ struct HiddenSnapshotUserData {
     const char* stage = nullptr;
     const char* var_name = nullptr;
 };
+
+struct Gemma4KVSummaryUserData {
+    int layer_idx = -1;
+    int source_layer = -1;
+    const char* action = nullptr;
+    const char* kind = nullptr;
+};
+
+static Gemma4KVSummaryUserData* AllocateGemma4KVSummaryUserData(struct ggml_context* ctx_c);
+static void cb_gemma4_kv_summary_probe(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                       void* userdata);
+
+static struct ggml_tensor* MaybeAttachGemma4SharedKVProbe(struct ggml_context* ctx_c, struct ggml_tensor* tensor,
+                                                          const char* action, const char* kind, int layer_idx,
+                                                          int source_layer) {
+    const char* env = std::getenv("DENSECORE_DEBUG_GEMMA4_SHARED_KV");
+    const bool enabled = env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    if (!enabled || !ctx_c || !tensor) {
+        return tensor;
+    }
+    auto* ud = AllocateGemma4KVSummaryUserData(ctx_c);
+    if (!ud) {
+        return tensor;
+    }
+    ud->layer_idx = layer_idx;
+    ud->source_layer = source_layer;
+    ud->action = action;
+    ud->kind = kind;
+    return ggml_map_custom1(ctx_c, tensor, cb_gemma4_kv_summary_probe, 1, ud);
+}
 
 static void ComputeMatmulReferenceInt4BindingF32(const ProjectionReferenceUserData* ud, std::vector<float>* out) {
     if (!ud || !out || !ud->input_tensor || !ud->input_tensor->data || ud->input_tensor->type != GGML_TYPE_F32 ||
@@ -4095,6 +4157,11 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 }
             }
 
+            if (model->arch_flags.is_gemma4 && N == 1 && IsGemma4SharedKVSourceLayer(model, il)) {
+                Kcur = MaybeAttachGemma4SharedKVProbe(ctx_c, Kcur, "pre-cache-write", "K", il, il);
+                Vcur = MaybeAttachGemma4SharedKVProbe(ctx_c, Vcur, "pre-cache-write", "V", il, il);
+            }
+
             const bool use_explicit_attention_scale = model->hparams.f_attention_scale > 0.0f;
             if (use_explicit_attention_scale) {
                 Qcur = ggml_scale(ctx_c, Qcur, model->hparams.f_attention_scale);
@@ -4174,6 +4241,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 const bool requested_paged_decode_attention = paged_decode_decision.requested;
                 const bool decode_only_batch = base_paged_decode.decode_only_batch;
                 const int kv_cache_layer = densecore::models::Gemma4KVSourceLayer(model, il);
+                const bool gemma4_shared_kv_source_layer = IsGemma4SharedKVSourceLayer(model, il);
+                const bool gemma4_shared_kv_explicit_state_disabled =
+                    model->arch_flags.is_gemma4 && densecore::models::IsGemma4SharedKVExplicitStateDisabled();
 
                 // Safety override: GGML's generic decode matmul path can become numerically
                 // unstable for GQA decode (N=1, n_head != n_head_kv) on some CPU kernels.
@@ -4236,13 +4306,25 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     // BUT we still need to WRITE to cache.
                     // The 'ggml_pad' trick updates cache as side effect.
                     // So we act always if use_cache is true.
+                    struct ggml_tensor* cache_k_src = Kcur;
+                    struct ggml_tensor* cache_v_src = Vcur;
+                    if (model->arch_flags.is_gemma4 && N == 1) {
+                        // Single-token Gemma4 decode can reach this path with
+                        // non-dense 3D views. Materialize the current K/V slice
+                        // before cache write/gather so the source-layer publish
+                        // path does not silently write zeros for the appended token.
+                        cache_k_src = ggml_cont(ctx_c, Kcur);
+                        cache_v_src = ggml_cont(ctx_c, Vcur);
+                    }
 
-                    KVCacheUserData* k_ud = GetKVCacheUserData(kv_cache_layer, true);
+                    KVCacheUserData* k_ud = GetKVCacheUserData(il, true);
                     *k_ud = {cache, kv_cache_layer, head_dim_kv, true};  // batch accessed via GetCurrentBatch()
                     k_ud->read_only_shared_kv = gemma4_shared_kv_layer;
-                    KVCacheUserData* v_ud = GetKVCacheUserData(kv_cache_layer, false);
+                    k_ud->force_full_history = gemma4_shared_kv_source_layer;
+                    KVCacheUserData* v_ud = GetKVCacheUserData(il, false);
                     *v_ud = {cache, kv_cache_layer, head_dim_v, false};  // batch accessed via GetCurrentBatch()
                     v_ud->read_only_shared_kv = gemma4_shared_kv_layer;
+                    v_ud->force_full_history = gemma4_shared_kv_source_layer;
 
                     int kv_tasks = ResolveInferenceConfig(&batch).num_threads;
                     if (kv_tasks <= 0) {
@@ -4265,19 +4347,55 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     }
 
                     if (gemma4_shared_kv_layer) {
-                        K_all = ggml_kv_update_and_gather(ctx_c, Kcur, n_total_tokens, kv_tasks, k_ud);
-                        V_all = ggml_kv_update_and_gather(ctx_c, Vcur, n_total_tokens, kv_tasks, v_ud);
+                        if (gemma4_shared_kv_explicit_state_disabled) {
+                            K_all = ggml_kv_update_and_gather(ctx_c, Kcur, n_total_tokens, kv_tasks, k_ud);
+                            V_all = ggml_kv_update_and_gather(ctx_c, Vcur, n_total_tokens, kv_tasks, v_ud);
+                            K_all = MaybeAttachGemma4SharedKVProbe(ctx_c, K_all, "cache-read", "K", il, kv_cache_layer);
+                            V_all = MaybeAttachGemma4SharedKVProbe(ctx_c, V_all, "cache-read", "V", il, kv_cache_layer);
+                        } else {
+                            const Gemma4SharedKVState* shared_kv_state = GetGemma4SharedKVState(kv_cache_layer);
+                            if (!shared_kv_state) {
+                                throw densecore::InvalidArgumentException(
+                                    "Gemma4 shared-KV layer is missing per-forward shared_kv_states for its source layer");
+                            }
+                            K_all = MaybeAttachGemma4SharedKVProbe(ctx_c, shared_kv_state->k, "explicit-read", "K",
+                                                                   il, kv_cache_layer);
+                            V_all = MaybeAttachGemma4SharedKVProbe(ctx_c, shared_kv_state->v, "explicit-read", "V",
+                                                                   il, kv_cache_layer);
+                        }
                     } else if (n_past_val == 0) {
                         // Prefill first chunk fast path: avoid materializing an
                         // equivalent [history | current] tensor when history is empty.
-                        K_all = ggml_map_custom1(ctx_c, Kcur, cb_kv_write_only, kv_tasks, k_ud);
-                        V_all = ggml_map_custom1(ctx_c, Vcur, cb_kv_write_only, kv_tasks, v_ud);
+                        K_all = ggml_map_custom1(ctx_c, cache_k_src, cb_kv_write_only, kv_tasks, k_ud);
+                        V_all = ggml_map_custom1(ctx_c, cache_v_src, cb_kv_write_only, kv_tasks, v_ud);
                     } else {
                         // Prefill later-chunk fast path: write current tokens to KV cache,
                         // gather retained history directly into the final [head_dim, n_head_kv, n_total]
                         // tensor, and append current tokens without routing through ggml_pad.
-                        K_all = ggml_kv_update_and_gather(ctx_c, Kcur, n_total_tokens, kv_tasks, k_ud);
-                        V_all = ggml_kv_update_and_gather(ctx_c, Vcur, n_total_tokens, kv_tasks, v_ud);
+                        K_all = ggml_kv_update_and_gather(ctx_c, cache_k_src, n_total_tokens, kv_tasks, k_ud);
+                        V_all = ggml_kv_update_and_gather(ctx_c, cache_v_src, n_total_tokens, kv_tasks, v_ud);
+                    }
+                }
+
+                if (model->arch_flags.is_gemma4) {
+                    if (gemma4_shared_kv_layer) {
+                        if (!use_cache && !gemma4_shared_kv_explicit_state_disabled) {
+                            const Gemma4SharedKVState* shared_kv_state = GetGemma4SharedKVState(kv_cache_layer);
+                            if (!shared_kv_state) {
+                                throw densecore::InvalidArgumentException(
+                                    "Gemma4 shared-KV layer is missing per-forward shared_kv_states for its source layer");
+                            }
+                            K_all = MaybeAttachGemma4SharedKVProbe(ctx_c, shared_kv_state->k, "explicit-read", "K", il,
+                                                                   kv_cache_layer);
+                            V_all = MaybeAttachGemma4SharedKVProbe(ctx_c, shared_kv_state->v, "explicit-read", "V", il,
+                                                                   kv_cache_layer);
+                        }
+                    } else if (gemma4_shared_kv_source_layer) {
+                        if (!gemma4_shared_kv_explicit_state_disabled) {
+                            K_all = MaybeAttachGemma4SharedKVProbe(ctx_c, K_all, "publish", "K", il, il);
+                            V_all = MaybeAttachGemma4SharedKVProbe(ctx_c, V_all, "publish", "V", il, il);
+                            SetGemma4SharedKVState(il, K_all, V_all);
+                        }
                     }
                 }
 
@@ -4441,8 +4559,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 // =========================================================================
                 // Note: Flash Attention still requires AVX-512-class x86 support for
                 // correctness/perf in this path.
-                const float fast_attn_logit_softcap =
-                    model->arch_flags.is_gemma4 ? model->gemma4_attention_logit_softcapping : 0.0f;
+                const float fast_attn_logit_softcap = ResolveGemma4AttentionLogitSoftcapRuntime(model);
                 const int fast_attn_sliding_window =
                     (model->arch_flags.is_gemma4 && densecore::models::IsGemma4SlidingLayer(model, il) &&
                      model->gemma4_sliding_window > 0)
@@ -4734,11 +4851,12 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                         // Scale
                         KQ = ggml_scale(ctx_c, KQ, scale);
 
-                        if (model->arch_flags.is_gemma4 && model->gemma4_attention_logit_softcapping > 0.0f) {
-                            const float inv_softcap = 1.0f / model->gemma4_attention_logit_softcapping;
+                        const float gemma4_attention_softcap = ResolveGemma4AttentionLogitSoftcapRuntime(model);
+                        if (model->arch_flags.is_gemma4 && gemma4_attention_softcap > 0.0f) {
+                            const float inv_softcap = 1.0f / gemma4_attention_softcap;
                             KQ = ggml_scale(ctx_c, KQ, inv_softcap);
                             KQ = ggml_tanh(ctx_c, KQ);
-                            KQ = ggml_scale(ctx_c, KQ, model->gemma4_attention_logit_softcapping);
+                            KQ = ggml_scale(ctx_c, KQ, gemma4_attention_softcap);
                         }
 
                         if (ShouldBuildExplicitStandardAttentionMask(N, fast_attn_sliding_window)) {
@@ -4788,8 +4906,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     model->arch_flags.is_gemma4
                         ? 1.0f
                         : (use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q));
-                const float attn_ref_logit_softcap =
-                    model->arch_flags.is_gemma4 ? model->gemma4_attention_logit_softcapping : 0.0f;
+                const float attn_ref_logit_softcap = ResolveGemma4AttentionLogitSoftcapRuntime(model);
                 attn_ref_ud->value_tensor = attn_ref_v;
                 attn_ref_ud->layer_idx = il;
                 attn_ref_ud->n_head = n_head;
@@ -5375,6 +5492,17 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 per_layer_delta = apply_weighted_rms_norm(per_layer_delta, post_per_layer_norm,
                                                           "gemma4_post_per_layer_input_norm", il);
                 cur = ggml_add(ctx_c, cur, per_layer_delta);
+                if (ShouldRunHiddenSnapshotProbe(il, "after_per_layer_input")) {
+                    auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
+                    if (hidden_ud) {
+                        hidden_ud->layer_idx = il;
+                        hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                        hidden_ud->token_seq_ids = batch.seq_id.data();
+                        hidden_ud->stage = "after_per_layer_input";
+                        hidden_ud->var_name = "layer_output";
+                        cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
+                    }
+                }
             }
         }
         if (model->arch_flags.is_gemma4 && !gemma4_decode_special_transforms_disabled &&
@@ -5385,6 +5513,17 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 // the scaled hidden state as their input.
                 struct ggml_tensor* scale = ggml_repeat(ctx_c, layer_output_scale, cur);
                 cur = ggml_mul(ctx_c, cur, scale);
+                if (ShouldRunHiddenSnapshotProbe(il, "after_layer_output_scale")) {
+                    auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
+                    if (hidden_ud) {
+                        hidden_ud->layer_idx = il;
+                        hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                        hidden_ud->token_seq_ids = batch.seq_id.data();
+                        hidden_ud->stage = "after_layer_output_scale";
+                        hidden_ud->var_name = "layer_output";
+                        cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
+                    }
+                }
             }
         }
         if (IsDebugInferenceStatsEnabled()) {
@@ -5488,6 +5627,17 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             if (dst && src && dst->data && src->data) memcpy(dst->data, src->data, ggml_nbytes(src));
         };
         cur = ggml_map_custom1(ctx_c, cur, cb_pre_norm, 1, nullptr);
+    }
+    if (ShouldRunHiddenSnapshotProbe(static_cast<int>(model->layers.size()), "pre_output_norm_hidden")) {
+        auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
+        if (hidden_ud) {
+            hidden_ud->layer_idx = static_cast<int>(model->layers.size());
+            hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+            hidden_ud->token_seq_ids = batch.seq_id.data();
+            hidden_ud->stage = "pre_output_norm_hidden";
+            hidden_ud->var_name = "cur";
+            cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
+        }
     }
     cur = apply_weighted_rms_norm(cur, model->output_norm, "output_norm", static_cast<int>(model->layers.size()));
 
@@ -5800,7 +5950,8 @@ std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float
                                                          const std::vector<float>& v, int n_head, int n_head_kv,
                                                          int head_dim_q, int head_dim_k, int head_dim_v, int n_queries,
                                                          int n_total_tokens, int n_past, int sliding_window,
-                                                         float scale, float logit_softcap) {
+                                                         float scale, float logit_softcap,
+                                                         bool retained_history_layout) {
     if (n_head <= 0 || n_head_kv <= 0 || head_dim_q <= 0 || head_dim_k <= 0 || head_dim_v <= 0 || n_queries <= 0 ||
         n_total_tokens <= 0 || (n_head % n_head_kv) != 0) {
         return {};
@@ -5833,8 +5984,11 @@ std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float
             for (int k_idx = 0; k_idx < n_total_tokens; ++k_idx) {
                 bool masked = false;
                 if (use_explicit_mask) {
-                    const int key_pos = (k_idx < retained.history_kept) ? ::MapRetainedHistoryIndex(retained, k_idx)
-                                                                        : (n_past + (k_idx - retained.history_kept));
+                    const int key_pos =
+                        retained_history_layout
+                            ? ((k_idx < retained.history_kept) ? ::MapRetainedHistoryIndex(retained, k_idx)
+                                                               : (n_past + (k_idx - retained.history_kept)))
+                            : k_idx;
                     if (sliding_window >= 0 && key_pos < (query_pos - sliding_window)) {
                         masked = true;
                     }
@@ -6000,8 +6154,121 @@ bool ShouldForcePlainGgmlForHybridSSMQkvTest() {
 bool ShouldUseArmNativeQ4KVecDotValidatedTest(ggml_type weight_type, const ggml_type_traits_cpu* type_traits_cpu,
                                               const void* sample_row_ptr, const void* sample_quant_input,
                                               const float* sample_input_f32, int N) {
-    return ::ShouldUseArmNativeQ4KVecDotValidated(weight_type, type_traits_cpu, sample_row_ptr, sample_quant_input,
-                                                  sample_input_f32, N);
+    return ::ShouldUseArmNativeQ4KVecDotValidated(weight_type, type_traits_cpu, nullptr, sample_row_ptr,
+                                                  sample_quant_input, sample_input_f32, N);
+}
+std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeightsForTest(const TransformerLayer* layer,
+                                                                            const TransformerModel* model) {
+    return ::BuildExpertWeights(layer, model);
+}
+bool RouteMoESoftmaxTopKForTest(const struct ggml_tensor* gate_logits, const TransformerModel* model,
+                                const TransformerLayer* layer, int top_k, densecore::moe::MoERouteResult* routing) {
+    MoEUserData ud{};
+    ud.model = model;
+    ud.layer = layer;
+    ud.k = top_k;
+    return ::RouteMoESoftmaxTopK(gate_logits, &ud, routing);
+}
+bool RouteMoEGroupedSigmoidForTest(const struct ggml_tensor* gate_logits, const TransformerModel* model,
+                                   const TransformerLayer* layer, int top_k,
+                                   densecore::moe::MoERouteResult* routing) {
+    MoEUserData ud{};
+    ud.model = model;
+    ud.layer = layer;
+    ud.k = top_k;
+    return ::RouteMoEGroupedSigmoid(gate_logits, &ud, routing);
+}
+bool RouteMoEGemma4TopKForTest(const struct ggml_tensor* gate_logits, const TransformerModel* model,
+                               const TransformerLayer* layer, int top_k, densecore::moe::MoERouteResult* routing) {
+    MoEUserData ud{};
+    ud.model = model;
+    ud.layer = layer;
+    ud.k = top_k;
+    return ::RouteMoEGemma4TopK(gate_logits, &ud, routing);
+}
+std::vector<float> ApplySharedScalarGateForTest(const std::vector<float>& shared_ffn_pre_gate,
+                                                const std::vector<float>& shared_gate_logits_scalar, int tokens,
+                                                int hidden_dim) {
+    if (tokens <= 0 || hidden_dim <= 0 ||
+        static_cast<int>(shared_ffn_pre_gate.size()) != tokens * hidden_dim ||
+        static_cast<int>(shared_gate_logits_scalar.size()) != tokens) {
+        return {};
+    }
+
+    ggml_init_params params{};
+    params.mem_size = 64 * 1024;
+    params.no_alloc = false;
+    struct ggml_context* ctx = ggml_init(params);
+    if (!ctx) {
+        return {};
+    }
+
+    struct ggml_tensor* src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_dim, tokens);
+    struct ggml_tensor* dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_dim, tokens);
+    struct ggml_tensor* gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, tokens);
+    if (!src || !dst || !gate || !src->data || !dst->data || !gate->data) {
+        ggml_free(ctx);
+        return {};
+    }
+
+    std::memcpy(src->data, shared_ffn_pre_gate.data(), shared_ffn_pre_gate.size() * sizeof(float));
+    std::memcpy(gate->data, shared_gate_logits_scalar.data(), shared_gate_logits_scalar.size() * sizeof(float));
+    SharedScalarGateApplyUserData ud{};
+    ud.gate_logits_scalar = gate;
+    ::cb_apply_shared_scalar_gate(dst, src, 0, 1, &ud);
+
+    std::vector<float> out(static_cast<size_t>(tokens * hidden_dim), 0.0f);
+    std::memcpy(out.data(), dst->data, out.size() * sizeof(float));
+    ggml_free(ctx);
+    return out;
+}
+std::vector<float> ComputeSharedExpertMergedOutputForTest(const std::vector<float>& moe_input,
+                                                          const std::vector<float>& routed_output,
+                                                          const std::vector<float>& gate_weight,
+                                                          const std::vector<float>& up_weight,
+                                                          const std::vector<float>& down_weight,
+                                                          const std::vector<float>& shared_gate_logits_scalar,
+                                                          int tokens, int hidden_dim, int intermediate_dim) {
+    if (tokens <= 0 || hidden_dim <= 0 || intermediate_dim <= 0 ||
+        static_cast<int>(moe_input.size()) != tokens * hidden_dim ||
+        static_cast<int>(routed_output.size()) != tokens * hidden_dim ||
+        static_cast<int>(gate_weight.size()) != intermediate_dim * hidden_dim ||
+        static_cast<int>(up_weight.size()) != intermediate_dim * hidden_dim ||
+        static_cast<int>(down_weight.size()) != hidden_dim * intermediate_dim ||
+        static_cast<int>(shared_gate_logits_scalar.size()) != tokens) {
+        return {};
+    }
+
+    auto matmul_trans_b = [](const std::vector<float>& input, const std::vector<float>& weight, int M, int K,
+                             int N) {
+        std::vector<float> out(static_cast<size_t>(M * N), 0.0f);
+        for (int m = 0; m < M; ++m) {
+            for (int n = 0; n < N; ++n) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; ++k) {
+                    sum += input[static_cast<size_t>(m * K + k)] * weight[static_cast<size_t>(n * K + k)];
+                }
+                out[static_cast<size_t>(m * N + n)] = sum;
+            }
+        }
+        return out;
+    };
+
+    const std::vector<float> shared_gate = matmul_trans_b(moe_input, gate_weight, tokens, hidden_dim, intermediate_dim);
+    const std::vector<float> shared_up = matmul_trans_b(moe_input, up_weight, tokens, hidden_dim, intermediate_dim);
+    std::vector<float> shared_ffn_pre_gate(static_cast<size_t>(tokens * intermediate_dim), 0.0f);
+    for (size_t i = 0; i < shared_ffn_pre_gate.size(); ++i) {
+        const float g = shared_gate[i];
+        shared_ffn_pre_gate[i] = (g / (1.0f + std::exp(-g))) * shared_up[i];
+    }
+    const std::vector<float> gated = ApplySharedScalarGateForTest(shared_ffn_pre_gate, shared_gate_logits_scalar,
+                                                                  tokens, intermediate_dim);
+    const std::vector<float> shared_down = matmul_trans_b(gated, down_weight, tokens, intermediate_dim, hidden_dim);
+    std::vector<float> merged = routed_output;
+    for (size_t i = 0; i < merged.size(); ++i) {
+        merged[i] += shared_down[i];
+    }
+    return merged;
 }
 void CbSsmQwen35DeltaTest(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
                           const struct ggml_tensor* c, int ith, int nth, void* userdata) {

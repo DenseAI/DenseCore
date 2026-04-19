@@ -36,6 +36,13 @@ struct KVCacheUserData {
     int head_dim_kv;                   // Store dynamically detected head dim (NOTE: matches inference.cpp naming)
     bool is_k;                         // True if processing K, false if processing V
     bool read_only_shared_kv = false;  // Gemma4 shared layers reuse source KV cache without writing
+    bool force_full_history = false;   // Gemma4 correctness path keeps full source history for shared-KV semantics
+};
+
+struct Gemma4SharedKVState {
+    ggml_tensor* k = nullptr;
+    ggml_tensor* v = nullptr;
+    int source_layer = -1;
 };
 
 // Thread-local pool access (defined in inference.cpp)
