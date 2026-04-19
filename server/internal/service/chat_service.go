@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 
 	"fmt"
@@ -18,6 +20,16 @@ import (
 type ChatService struct {
 	modelService domain.ModelService
 	requestQueue *queue.RequestQueue
+}
+
+type preparedPrompt struct {
+	prompt               string
+	promptSource         string
+	renderedPrompt       string
+	renderedTemplateUsed bool
+	rawPassthroughUsed   bool
+	tokenizerType        string
+	chatTemplate         string
 }
 
 func NewChatService(modelService domain.ModelService, q *queue.RequestQueue) *ChatService {
@@ -45,32 +57,16 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 	}
 
 	modelHint := s.modelService.GetCurrentModel()
-	tokenizerType := engine.GetTokenizerType()
-	chatTemplate := engine.GetChatTemplate()
-	prompt := req.RawPrompt
-	if prompt == "" {
-		var enableThinking *bool
-		if req.ChatTemplateKwargs != nil {
-			enableThinking = req.ChatTemplateKwargs.EnableThinking
-		}
-		rendered, err := engine.RenderChatPrompt(req.Messages, enableThinking)
-		if err != nil {
-			return err
-		}
-		prompt = rendered.RenderedPrompt
-		tokenizerType = firstNonEmpty(rendered.TokenizerType, tokenizerType)
-		chatTemplate = firstNonEmpty(rendered.ChatTemplate, chatTemplate)
-	}
-	if !req.ParityMode && req.RawPrompt == "" &&
-		shouldPassThroughRawPrompt(modelHint, tokenizerType, chatTemplate, req.Messages, req.ChatTemplateKwargs) {
-		prompt = ExtractPrompt(req.Messages)
+	prepared, err := s.preparePrompt(engine, req, modelHint)
+	if err != nil {
+		return err
 	}
 	hasInputIDs := len(req.InputIDs) > 0
-	if prompt == "" && !hasInputIDs {
+	if prepared.prompt == "" && !hasInputIDs {
 		return errors.New("no user message found")
 	}
 
-	stream, err := s.startGeneration(ctx, req, modelHint, tokenizerType, chatTemplate, prompt)
+	stream, err := s.startGeneration(ctx, req, modelHint, prepared)
 	if err != nil {
 		return err
 	}
@@ -89,17 +85,55 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 	}
 }
 
-func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatCompletionRequest, modelHint, tokenizerType, chatTemplate, prompt string) (<-chan domain.StreamEvent, error) {
+func (s *ChatService) preparePrompt(engine domain.Engine, req domain.ChatCompletionRequest, modelHint string) (preparedPrompt, error) {
+	prepared := preparedPrompt{
+		prompt:        req.RawPrompt,
+		promptSource:  "request_raw_prompt",
+		tokenizerType: engine.GetTokenizerType(),
+		chatTemplate:  engine.GetChatTemplate(),
+	}
+	if req.RawPrompt != "" {
+		return prepared, nil
+	}
+
+	var enableThinking *bool
+	if req.ChatTemplateKwargs != nil {
+		enableThinking = req.ChatTemplateKwargs.EnableThinking
+	}
+	rendered, err := engine.RenderChatPrompt(req.Messages, enableThinking)
+	if err != nil {
+		return prepared, err
+	}
+
+	prepared.prompt = rendered.RenderedPrompt
+	prepared.promptSource = "rendered_chat_template"
+	prepared.renderedPrompt = rendered.RenderedPrompt
+	prepared.renderedTemplateUsed = true
+	prepared.tokenizerType = firstNonEmpty(rendered.TokenizerType, prepared.tokenizerType)
+	prepared.chatTemplate = firstNonEmpty(rendered.ChatTemplate, prepared.chatTemplate)
+
+	if !req.ParityMode && shouldPassThroughRawPrompt(modelHint, prepared.tokenizerType, prepared.chatTemplate, req.Messages, req.ChatTemplateKwargs) {
+		prepared.prompt = ExtractPrompt(req.Messages)
+		prepared.promptSource = "raw_chat_passthrough"
+		prepared.rawPassthroughUsed = true
+	}
+
+	return prepared, nil
+}
+
+func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatCompletionRequest, modelHint string, prepared preparedPrompt) (<-chan domain.StreamEvent, error) {
 	jsonMode := req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object"
-	temperature, topP, topK, repetitionPenalty := s.normalizeSampling(modelHint, tokenizerType, chatTemplate, req)
+	temperature, topP, topK, repetitionPenalty := s.normalizeSampling(modelHint, prepared.tokenizerType, prepared.chatTemplate, req)
 	engine := s.modelService.GetEngine()
 	exactAnswer := deriveExactAnswerConstraint(engine, req)
-	if exactAnswer != nil && exactAnswer.text != "" && len(exactAnswer.allowedTokenIDs) == 0 {
-		return syntheticExactAnswerStream(ctx, exactAnswer.text), nil
-	}
 	allowedTokenIDs := req.AllowedTokenIDs
 	allowedTokensStrict := req.AllowedTokensStrict
 	maxTokens := req.MaxTokens
+	if exactAnswer != nil && exactAnswer.text != "" && len(exactAnswer.allowedTokenIDs) == 0 {
+		s.logPromptPathDebug(engine, req, modelHint, prepared, temperature, topP, topK, repetitionPenalty,
+			allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, true)
+		return syntheticExactAnswerStream(ctx, exactAnswer.text), nil
+	}
 	if exactAnswer != nil {
 		if os.Getenv("DENSECORE_DEBUG_EXACT_QA") != "" {
 			slog.Info("applying exact-answer token constraint",
@@ -114,12 +148,14 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 			maxTokens = exactAnswer.maxTokens
 		}
 	}
+	s.logPromptPathDebug(engine, req, modelHint, prepared, temperature, topP, topK, repetitionPenalty,
+		allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, false)
 
 	queuedReq := &queue.QueuedRequest{
 		ID:                  uuid.New().String(),
 		Priority:            queue.RequestPriority(0),
 		MaxTokens:           maxTokens,
-		Prompt:              prompt,
+		Prompt:              prepared.prompt,
 		InputIDs:            req.InputIDs,
 		LoraAdapter:         req.LoraAdapter,
 		JSONMode:            jsonMode,
@@ -134,6 +170,23 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 		Context:             ctx,
 		ResultChan:          make(chan interface{}, 1),
 		ExpertCluster:       req.ExpertCluster,
+	}
+	if envFlagEnabled("DENSECORE_DEBUG_REQUEST_STATE") {
+		slog.Info("normalized_request_state",
+			slog.String("submit_api", "SubmitRequestWithSamplingConstraintsEx"),
+			slog.Int("max_tokens", queuedReq.MaxTokens),
+			slog.Float64("temperature", queuedReq.Temperature),
+			slog.Float64("top_p", queuedReq.TopP),
+			slog.Int("top_k", queuedReq.TopK),
+			slog.Float64("repetition_penalty", queuedReq.RepetitionPenalty),
+			slog.Any("stop_sequences", queuedReq.StopSequences),
+			slog.Bool("json_mode", queuedReq.JSONMode),
+			slog.Int("allowed_token_ids", len(queuedReq.AllowedTokenIDs)),
+			slog.Bool("allowed_tokens_strict", queuedReq.AllowedTokensStrict),
+			slog.Int("disallowed_token_ids", len(queuedReq.DisallowedTokenIDs)),
+			slog.Bool("streaming", true),
+			slog.Int("input_ids", len(queuedReq.InputIDs)),
+		)
 	}
 
 	if !s.requestQueue.Enqueue(queuedReq) {
@@ -153,6 +206,66 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func (s *ChatService) logPromptPathDebug(engine domain.Engine, req domain.ChatCompletionRequest, modelHint string,
+	prepared preparedPrompt, temperature, topP float64, topK int, repetitionPenalty float64,
+	allowedTokenIDs []int, allowedTokensStrict bool, maxTokens int, exactAnswer *exactAnswerConstraint,
+	syntheticExactAnswer bool) {
+	if !chatPathDebugEnabled() {
+		return
+	}
+
+	tokenIDs := req.InputIDs
+	tokenSource := "request_input_ids"
+	tokenizeErr := ""
+	if len(tokenIDs) == 0 && prepared.prompt != "" && engine != nil {
+		ids, err := engine.TokenizeText(prepared.prompt, false, false)
+		if err != nil {
+			tokenizeErr = err.Error()
+		} else {
+			tokenIDs = ids
+			tokenSource = "engine_tokenize(add_bos=false,add_eos=false)"
+		}
+	}
+
+	templateID, templateHash := chatTemplateIdentity(prepared.chatTemplate)
+	fields := []any{
+		slog.String("model_hint", modelHint),
+		slog.String("prompt_source", prepared.promptSource),
+		slog.Bool("rendered_chat_template", prepared.renderedTemplateUsed),
+		slog.Bool("raw_passthrough", prepared.rawPassthroughUsed),
+		slog.String("tokenizer_type", prepared.tokenizerType),
+		slog.String("chat_template_id", templateID),
+		slog.String("chat_template_hash", templateHash),
+		slog.String("rendered_prompt_preview", previewText(prepared.renderedPrompt, 160)),
+		slog.String("final_prompt_preview", previewText(prepared.prompt, 160)),
+		slog.String("input_token_source", tokenSource),
+		slog.Any("input_token_ids_preview", previewInts(tokenIDs, 16)),
+		slog.Int("input_token_count", len(tokenIDs)),
+		slog.Float64("temperature", temperature),
+		slog.Float64("top_p", topP),
+		slog.Int("top_k", topK),
+		slog.Float64("repetition_penalty", repetitionPenalty),
+		slog.Int("max_tokens", maxTokens),
+		slog.Int("allowed_token_ids", len(allowedTokenIDs)),
+		slog.Bool("allowed_tokens_strict", allowedTokensStrict),
+		slog.Int("disallowed_token_ids", len(req.DisallowedTokenIDs)),
+		slog.Bool("exact_answer_constraint", exactAnswer != nil),
+		slog.Bool("synthetic_exact_answer", syntheticExactAnswer),
+	}
+	if exactAnswer != nil {
+		fields = append(fields,
+			slog.Int("exact_answer_allowed_token_ids", len(exactAnswer.allowedTokenIDs)),
+			slog.Bool("exact_answer_strict", exactAnswer.strict),
+			slog.Int("exact_answer_max_tokens", exactAnswer.maxTokens),
+			slog.String("exact_answer_text_preview", previewText(exactAnswer.text, 80)),
+		)
+	}
+	if tokenizeErr != "" {
+		fields = append(fields, slog.String("input_tokenize_error", tokenizeErr))
+	}
+	slog.Info("chat request debug", fields...)
 }
 
 func syntheticExactAnswerStream(ctx context.Context, answer string) <-chan domain.StreamEvent {
@@ -239,37 +352,42 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	}
 	profile := resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate)
 	isQwen := profile.family == promptFamilyQwen
+	isGemma := profile.family == promptFamilyGemma
 	thinkingEnabled := profile.thinkingEnabled(modelHint, req.ChatTemplateKwargs)
 
 	if !req.TemperatureSet {
-		if isQwen && !thinkingEnabled {
+		if isGemma {
+			temperature = 0.0
+		} else if isQwen && !thinkingEnabled {
 			temperature = 0.7
 		} else {
 			temperature = 1.0
 		}
 	}
 	if !req.TopPSet {
-		if isQwen && thinkingEnabled {
+		if isGemma {
+			topP = 1.0
+		} else if isQwen && thinkingEnabled {
 			topP = 0.95
 		} else if isQwen {
 			topP = 0.8
-		} else if profile.family == promptFamilyGemma {
-			topP = 0.95
 		} else {
 			topP = 1.0
 		}
 	}
 	if !req.TopKSet {
-		if isQwen {
+		if isGemma {
+			topK = 1
+		} else if isQwen {
 			topK = 20
-		} else if profile.family == promptFamilyGemma {
-			topK = 64
 		} else {
 			topK = 0
 		}
 	}
 	if !req.RepetitionPenaltySet {
-		if isQwen {
+		if isGemma {
+			repetitionPenalty = 1.05
+		} else if isQwen {
 			repetitionPenalty = 1.05
 		} else {
 			repetitionPenalty = 1.0
@@ -284,7 +402,11 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 			topK = 1
 		}
 		if !req.RepetitionPenaltySet {
-			repetitionPenalty = 1.0
+			if isGemma {
+				repetitionPenalty = 1.05
+			} else {
+				repetitionPenalty = 1.0
+			}
 		}
 	}
 
@@ -293,8 +415,11 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 
 func shouldPassThroughRawPrompt(modelHint, tokenizerType, chatTemplate string, messages []domain.Message,
 	templateKwargs *domain.ChatTemplateKwargs) bool {
+	if !allowDebugChatRawPassthrough() {
+		return false
+	}
 	profile := resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate)
-	if profile.family != promptFamilyGemma {
+	if profile.family == promptFamilyGemma {
 		return false
 	}
 	if templateKwargs != nil && templateKwargs.EnableThinking != nil {
@@ -311,6 +436,52 @@ func shouldPassThroughRawPrompt(modelHint, tokenizerType, chatTemplate string, m
 		return false
 	}
 	return strings.TrimSpace(msg.Content) != ""
+}
+
+func chatPathDebugEnabled() bool {
+	return envFlagEnabled("DENSECORE_DEBUG_CHAT_PATH") ||
+		envFlagEnabled("DENSECORE_PARITY_DEBUG") ||
+		envFlagEnabled("DENSECORE_DEBUG_RUNTIME_PATH") ||
+		envFlagEnabled("DENSECORE_DEBUG_RUNTIME_PATH_TOKENS")
+}
+
+func allowDebugChatRawPassthrough() bool {
+	return envFlagEnabled("DENSECORE_DEBUG_CHAT_RAW_PASSTHROUGH")
+}
+
+func envFlagEnabled(key string) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	return value != "" && value != "0"
+}
+
+func previewInts(values []int, limit int) []int {
+	if len(values) <= limit {
+		return append([]int(nil), values...)
+	}
+	return append([]int(nil), values[:limit]...)
+}
+
+func previewText(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	replacer := strings.NewReplacer("\n", "\\n", "\r", "\\r", "\t", "\\t")
+	value = replacer.Replace(value)
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "..."
+}
+
+func chatTemplateIdentity(chatTemplate string) (string, string) {
+	trimmed := strings.TrimSpace(chatTemplate)
+	if trimmed == "" {
+		return "<unset>", ""
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	hash := hex.EncodeToString(sum[:8])
+	return previewText(trimmed, 72), hash
 }
 
 // BuildChatPrompt renders the template and applies model-specific priming.

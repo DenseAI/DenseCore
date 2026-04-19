@@ -152,17 +152,17 @@ func TestNormalizeSamplingGemmaDefaults(t *testing.T) {
 	svc := &ChatService{}
 
 	temperature, topP, topK, repetitionPenalty := svc.normalizeSampling("/tmp/gemma-4-E2B-it-Q4_K_M.gguf", "", "", domain.ChatCompletionRequest{})
-	if temperature != 1.0 {
-		t.Fatalf("expected gemma temperature 1.0, got %v", temperature)
+	if temperature != 0.0 {
+		t.Fatalf("expected gemma temperature 0.0, got %v", temperature)
 	}
-	if topP != 0.95 {
-		t.Fatalf("expected gemma top_p 0.95, got %v", topP)
+	if topP != 1.0 {
+		t.Fatalf("expected gemma top_p 1.0, got %v", topP)
 	}
-	if topK != 64 {
-		t.Fatalf("expected gemma top_k 64, got %v", topK)
+	if topK != 1 {
+		t.Fatalf("expected gemma top_k 1, got %v", topK)
 	}
-	if repetitionPenalty != 1.0 {
-		t.Fatalf("expected gemma repetition penalty 1.0, got %v", repetitionPenalty)
+	if repetitionPenalty != 1.05 {
+		t.Fatalf("expected gemma repetition penalty 1.05, got %v", repetitionPenalty)
 	}
 }
 
@@ -173,7 +173,7 @@ func TestNormalizeSamplingDeterministicTemperatureForcesGreedyLikeDefaults(t *te
 		Temperature:    0.0,
 		TemperatureSet: true,
 	})
-	if temperature != 0.0 || topP != 1.0 || topK != 1 || repetitionPenalty != 1.0 {
+	if temperature != 0.0 || topP != 1.0 || topK != 1 || repetitionPenalty != 1.05 {
 		t.Fatalf("expected deterministic defaults for temp=0, got temp=%v top_p=%v top_k=%v rep=%v",
 			temperature, topP, topK, repetitionPenalty)
 	}
@@ -203,20 +203,18 @@ func TestBuildChatPromptQwenNoThinkingDoesNotInjectThinkScaffold(t *testing.T) {
 	}
 }
 
-func TestShouldPassThroughRawPromptGemmaSingleTurn(t *testing.T) {
+func TestShouldNotPassThroughRawPromptGemmaSingleTurn(t *testing.T) {
 	msgs := []domain.Message{{Role: "user", Content: "What is the capital of France?"}}
-	if !shouldPassThroughRawPrompt("/tmp/gemma-4-E2B-it-Q4_K_M.gguf", "gemma4", "", msgs, nil) {
-		t.Fatalf("expected Gemma single-turn request to use raw prompt passthrough")
+	if shouldPassThroughRawPrompt("/tmp/gemma-4-E2B-it-Q4_K_M.gguf", "gemma4", "", msgs, nil) {
+		t.Fatalf("expected Gemma single-turn request to keep the rendered chat template")
 	}
 }
 
-func TestShouldNotPassThroughRawPromptGemmaHistory(t *testing.T) {
-	msgs := []domain.Message{
-		{Role: "user", Content: "Hello"},
-		{Role: "assistant", Content: "Hi"},
-	}
-	if shouldPassThroughRawPrompt("/tmp/gemma-4-E2B-it-Q4_K_M.gguf", "gemma4", "", msgs, nil) {
-		t.Fatalf("expected Gemma history to keep formatted chat prompt")
+func TestShouldPassThroughRawPromptGenericOnlyWithDebugFlag(t *testing.T) {
+	t.Setenv("DENSECORE_DEBUG_CHAT_RAW_PASSTHROUGH", "1")
+	msgs := []domain.Message{{Role: "user", Content: "hello"}}
+	if !shouldPassThroughRawPrompt("/tmp/llama-3.2-base.gguf", "llama", "", msgs, nil) {
+		t.Fatalf("expected generic single-turn request to allow raw prompt passthrough only in debug mode")
 	}
 }
 
@@ -244,7 +242,7 @@ func TestGenerateStreamParityModeUsesCanonicalRenderer(t *testing.T) {
 	}
 }
 
-func TestGenerateStreamNonParityModeGemmaPassthroughRemainsProductMode(t *testing.T) {
+func TestGenerateStreamNonParityModeGemmaUsesRenderedPrompt(t *testing.T) {
 	engine := &chatServiceRenderTestEngine{
 		renderedPrompt: "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
 	}
@@ -262,7 +260,10 @@ func TestGenerateStreamNonParityModeGemmaPassthroughRemainsProductMode(t *testin
 	if err != nil {
 		t.Fatalf("GenerateStream returned error: %v", err)
 	}
-	if engine.lastPrompt != "What is the capital of France?" {
-		t.Fatalf("expected product-mode raw passthrough, got %q", engine.lastPrompt)
+	if engine.lastPrompt != engine.renderedPrompt {
+		t.Fatalf("expected rendered prompt for Gemma chat path, got %q", engine.lastPrompt)
+	}
+	if engine.lastPrompt != "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n" {
+		t.Fatalf("expected Gemma BOS/turn-tag/assistant-prefix prompt, got %q", engine.lastPrompt)
 	}
 }

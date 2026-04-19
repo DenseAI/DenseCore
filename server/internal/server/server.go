@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -271,7 +272,27 @@ func Run(opts *Options) error {
 						slog.String("hint", "use /v1/models/load to retry"),
 					)
 				} else {
-					slog.Info("model loaded successfully, ready to serve requests")
+					executablePath, execErr := os.Executable()
+					if execErr != nil {
+						executablePath = ""
+					}
+					modelPath := cfg.MainModelPath
+					if modelPath != "" {
+						if absPath, err := filepath.Abs(modelPath); err == nil {
+							modelPath = absPath
+						}
+					}
+					tokenizerType := ""
+					if loadedEngine := modelService.GetEngine(); loadedEngine != nil {
+						tokenizerType = loadedEngine.GetTokenizerType()
+					}
+					slog.Info("model loaded successfully, ready to serve requests",
+						slog.String("server_binary_path", executablePath),
+						slog.String("densecore_shared_library_path", engine.ResolvedDenseCoreLibraryPath()),
+						slog.String("model_path", modelPath),
+						slog.String("tokenizer_type", tokenizerType),
+						slog.Bool("gemma4_path", strings.EqualFold(tokenizerType, "gemma4")),
+					)
 				}
 			}()
 			slog.Info("model loading started in background, server will start immediately")
