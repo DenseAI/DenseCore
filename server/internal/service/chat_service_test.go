@@ -152,14 +152,14 @@ func TestNormalizeSamplingGemmaDefaults(t *testing.T) {
 	svc := &ChatService{}
 
 	temperature, topP, topK, repetitionPenalty := svc.normalizeSampling("/tmp/gemma-4-E2B-it-Q4_K_M.gguf", "", "", domain.ChatCompletionRequest{})
-	if temperature != 0.0 {
-		t.Fatalf("expected gemma temperature 0.0, got %v", temperature)
+	if temperature != 0.2 {
+		t.Fatalf("expected gemma temperature 0.2, got %v", temperature)
 	}
-	if topP != 1.0 {
-		t.Fatalf("expected gemma top_p 1.0, got %v", topP)
+	if topP != 0.95 {
+		t.Fatalf("expected gemma top_p 0.95, got %v", topP)
 	}
-	if topK != 1 {
-		t.Fatalf("expected gemma top_k 1, got %v", topK)
+	if topK != 32 {
+		t.Fatalf("expected gemma top_k 32, got %v", topK)
 	}
 	if repetitionPenalty != 1.05 {
 		t.Fatalf("expected gemma repetition penalty 1.05, got %v", repetitionPenalty)

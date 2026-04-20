@@ -357,7 +357,7 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 
 	if !req.TemperatureSet {
 		if isGemma {
-			temperature = 0.0
+			temperature = 0.2
 		} else if isQwen && !thinkingEnabled {
 			temperature = 0.7
 		} else {
@@ -366,7 +366,7 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	}
 	if !req.TopPSet {
 		if isGemma {
-			topP = 1.0
+			topP = 0.95
 		} else if isQwen && thinkingEnabled {
 			topP = 0.95
 		} else if isQwen {
@@ -377,7 +377,7 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	}
 	if !req.TopKSet {
 		if isGemma {
-			topK = 1
+			topK = 32
 		} else if isQwen {
 			topK = 20
 		} else {
