@@ -1141,8 +1141,8 @@ void CpuBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
         }
 #if defined(__AVX2__)
         for (int m = 0; m < M; ++m) {
-            hwy_kernels::GemvInt4_Hwy(c_data + static_cast<size_t>(m) * N, a_data + static_cast<size_t>(m) * K,
-                                      w_data, scales_data, zeros_data, K, N, group_size, n_start, n_end);
+            hwy_kernels::GemvInt4_Hwy(c_data + static_cast<size_t>(m) * N, a_data + static_cast<size_t>(m) * K, w_data,
+                                      scales_data, zeros_data, K, N, group_size, n_start, n_end);
         }
         return true;
 #else

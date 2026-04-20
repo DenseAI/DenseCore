@@ -370,10 +370,11 @@ template <class D> HWY_INLINE void AccumulateQ4_0(D d, float* accum, const void*
 // Main Paged Attention Implementation (Generic over Highway Target)
 void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, const void* const* v_block_ptrs,
                         int32_t cache_type, int32_t num_heads, int32_t qk_head_dim, int32_t v_head_dim,
-                        int32_t n_head_kv, int32_t block_table_size, int32_t context_len,
+                        int32_t n_head_kv, int32_t block_table_size, int32_t context_len, int32_t context_start_pos,
                         int64_t k_head_stride_bytes_in, int64_t k_slot_stride_bytes_in,
-                        int64_t v_head_stride_bytes_in, int64_t v_slot_stride_bytes_in, float scale, float* output,
-                        int32_t head_start, int32_t head_end, int32_t num_heads_total) {
+                        int64_t v_head_stride_bytes_in, int64_t v_slot_stride_bytes_in, float scale,
+                        float logit_softcap, float* output, int32_t head_start, int32_t head_end,
+                        int32_t num_heads_total) {
 
     const hn::ScalableTag<float> d;
 
@@ -443,20 +444,23 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
         // Initialize output buffer to 0
         std::fill(out_head, out_head + v_head_dim, 0.0f);
 
-        int tokens_processed = 0;
+        const int context_end_pos = context_start_pos + context_len;
+        const int start_block = std::max(0, context_start_pos / BLOCK_SIZE);
+        const int start_slot = std::max(0, context_start_pos % BLOCK_SIZE);
 
-        for (int b_idx = 0; b_idx < block_table_size; ++b_idx) {
-            // Compute valid tokens
-            int num_tokens = BLOCK_SIZE;
-            if (tokens_processed + num_tokens > context_len) {
-                num_tokens = context_len - tokens_processed;
+        for (int logical_block = start_block; logical_block < block_table_size; ++logical_block) {
+            const int block_abs_start = logical_block * BLOCK_SIZE;
+            const int slot_begin = (logical_block == start_block) ? start_slot : 0;
+            const int slot_end = std::min(BLOCK_SIZE, context_end_pos - block_abs_start);
+            const int num_tokens = slot_end - slot_begin;
+            if (num_tokens <= 0) {
+                if (block_abs_start >= context_end_pos) break;
+                continue;
             }
-            if (num_tokens <= 0) break;
 
-            const uint8_t* k_block_base = reinterpret_cast<const uint8_t*>(k_block_ptrs[b_idx]);
-            const uint8_t* v_block_base = reinterpret_cast<const uint8_t*>(v_block_ptrs[b_idx]);
+            const uint8_t* k_block_base = reinterpret_cast<const uint8_t*>(k_block_ptrs[logical_block]);
+            const uint8_t* v_block_base = reinterpret_cast<const uint8_t*>(v_block_ptrs[logical_block]);
             if (!k_block_base || !v_block_base) {
-                tokens_processed += num_tokens;
                 continue;
             }
 
@@ -465,9 +469,9 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
             // for FP16 head_dim=128 the head is 256 B (4 lines), for F32 it is
             // 512 B (8 lines). Issuing all lines here gives the hardware enough
             // lead time before we begin processing that block.
-            if (prefetch_blocks && b_idx + 1 < block_table_size) {
-                const uint8_t* next_k_block = reinterpret_cast<const uint8_t*>(k_block_ptrs[b_idx + 1]);
-                const uint8_t* next_v_block = reinterpret_cast<const uint8_t*>(v_block_ptrs[b_idx + 1]);
+            if (prefetch_blocks && logical_block + 1 < block_table_size) {
+                const uint8_t* next_k_block = reinterpret_cast<const uint8_t*>(k_block_ptrs[logical_block + 1]);
+                const uint8_t* next_v_block = reinterpret_cast<const uint8_t*>(v_block_ptrs[logical_block + 1]);
                 if (next_k_block) {
                     for (size_t pf_off = 0; pf_off < k_head_bytes; pf_off += 64) {
                         ::hwy::Prefetch(next_k_block + k_head_offset_bytes + pf_off);
@@ -489,7 +493,8 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
                 // >= 32 (FP32) the remaining cache lines would be cold misses.
                 const int pf_t = t + prefetch_tokens;
                 if (pf_t < num_tokens) {
-                    const uint8_t* next_k = k_block_base + pf_t * k_slot_stride_bytes + k_head_offset_bytes;
+                    const int next_slot = slot_begin + pf_t;
+                    const uint8_t* next_k = k_block_base + next_slot * k_slot_stride_bytes + k_head_offset_bytes;
                     for (size_t pf_off = 0; pf_off < k_head_bytes; pf_off += 64) {
                         ::hwy::Prefetch(next_k + pf_off);
                     }
@@ -497,7 +502,8 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
 
                 float score = 0.0f;
                 // Calculate byte pointer to the specific K token vector
-                const uint8_t* k_ptr_bytes = k_block_base + t * k_slot_stride_bytes + k_head_offset_bytes;
+                const int slot_idx = slot_begin + t;
+                const uint8_t* k_ptr_bytes = k_block_base + slot_idx * k_slot_stride_bytes + k_head_offset_bytes;
 
                 if (cache_type == 8) {  // Q8_0
                     score = DotProductQ8_0(d, q_head, k_ptr_bytes, qk_head_dim);
@@ -510,6 +516,9 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
                 }
 
                 score *= scale;
+                if (logit_softcap > 0.0f && std::isfinite(score)) {
+                    score = std::tanh(score / logit_softcap) * logit_softcap;
+                }
                 block_scores[t] = score;
                 if (score > m_block) m_block = score;
             }
@@ -557,12 +566,14 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
             for (int t = 0; t < num_tokens; ++t) {
                 float p = block_scores[t];
 
-                const uint8_t* v_ptr = v_block_base + t * v_slot_stride_bytes + v_head_offset_bytes;
+                const int slot_idx = slot_begin + t;
+                const uint8_t* v_ptr = v_block_base + slot_idx * v_slot_stride_bytes + v_head_offset_bytes;
 
                 // Prefetch next token's V head: all cache lines.
                 const int pf_tv = t + prefetch_tokens;
                 if (pf_tv < num_tokens) {
-                    const uint8_t* next_v = v_block_base + pf_tv * v_slot_stride_bytes + v_head_offset_bytes;
+                    const int next_slot = slot_begin + pf_tv;
+                    const uint8_t* next_v = v_block_base + next_slot * v_slot_stride_bytes + v_head_offset_bytes;
                     for (size_t pf_off = 0; pf_off < v_head_bytes; pf_off += 64) {
                         ::hwy::Prefetch(next_v + pf_off);
                     }
@@ -579,12 +590,9 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
                     AccumulateQ4_0(d, out_head, v_ptr, p, v_head_dim);
                 }
             }
-
             // Update global stats
             d_prev = d_prev * alpha + d_block;
             m_prev = m_new;
-
-            tokens_processed += num_tokens;
         }
 
         // Final Normalization
@@ -625,15 +633,15 @@ HWY_EXPORT(PagedAttentionImpl);
 
 void PagedAttention_Hwy(const float* query, const void* const* k_block_ptrs, const void* const* v_block_ptrs,
                         int32_t cache_type, int32_t num_heads, int32_t qk_head_dim, int32_t v_head_dim,
-                        int32_t n_head_kv, int32_t block_table_size, int32_t context_len,
+                        int32_t n_head_kv, int32_t block_table_size, int32_t context_len, int32_t context_start_pos,
                         int64_t k_head_stride_bytes, int64_t k_slot_stride_bytes, int64_t v_head_stride_bytes,
-                        int64_t v_slot_stride_bytes, float scale, float* output, int32_t head_start,
+                        int64_t v_slot_stride_bytes, float scale, float logit_softcap, float* output, int32_t head_start,
                         int32_t head_end, int32_t num_heads_total) {
 
     HWY_DYNAMIC_DISPATCH(PagedAttentionImpl)
     (query, k_block_ptrs, v_block_ptrs, cache_type, num_heads, qk_head_dim, v_head_dim, n_head_kv, block_table_size,
-     context_len, k_head_stride_bytes, k_slot_stride_bytes, v_head_stride_bytes, v_slot_stride_bytes, scale, output,
-     head_start, head_end, num_heads_total);
+     context_len, context_start_pos, k_head_stride_bytes, k_slot_stride_bytes, v_head_stride_bytes,
+     v_slot_stride_bytes, scale, logit_softcap, output, head_start, head_end, num_heads_total);
 }
 
 }  // namespace hwy_kernels
@@ -641,7 +649,8 @@ void PagedAttention_Hwy(const float* query, const void* const* k_block_ptrs, con
 namespace kernels {
 
 void PagedAttention(const Tensor& query, const PagedKVCache& cache, int layer, const std::vector<int>& block_table,
-                    int context_len, float scale, Tensor* output, int head_start, int head_end, int num_heads_total) {
+                    const PagedAttentionConfig& config, Tensor* output, int head_start, int head_end,
+                    int num_heads_total) {
     // Input validation
     if (!query.data || !output->data || block_table.empty()) return;
 
@@ -700,10 +709,10 @@ void PagedAttention(const Tensor& query, const PagedKVCache& cache, int layer, c
 
     densecore::hwy_kernels::PagedAttention_Hwy(
         (const float*)query.data, k_block_ptrs.data(), v_block_ptrs.data(), cache_type_id, num_heads, head_dim,
-        v_head_dim, cache.n_head_kv, (int32_t)block_table.size(), context_len,
+        v_head_dim, cache.n_head_kv, (int32_t)block_table.size(), config.context_len, config.context_start_pos,
         static_cast<int64_t>(k_layout.head_stride_bytes), static_cast<int64_t>(k_layout.slot_stride_bytes),
-        static_cast<int64_t>(v_layout.head_stride_bytes), static_cast<int64_t>(v_layout.slot_stride_bytes), scale,
-        (float*)output->data, head_start, head_end, num_heads_total);
+        static_cast<int64_t>(v_layout.head_stride_bytes), static_cast<int64_t>(v_layout.slot_stride_bytes),
+        config.scale, config.logit_softcap, (float*)output->data, head_start, head_end, num_heads_total);
 }
 
 }  // namespace kernels

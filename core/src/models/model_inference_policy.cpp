@@ -25,7 +25,7 @@ bool UseGemma4BenchQualityFallback() {
     if (!bench || bench[0] == '\0' || std::strcmp(bench, "0") == 0) {
         return false;
     }
-    return ParseBoolEnv("DENSECORE_GEMMA4_BENCH_QUALITY_FALLBACK", true);
+    return ParseBoolEnv("DENSECORE_GEMMA4_BENCH_QUALITY_FALLBACK", false);
 }
 
 bool IsGemma4SharedKVDisabled() {
@@ -50,10 +50,13 @@ bool RequiresUnitOffsetRmsNorm(const TransformerModel* model) {
 }
 
 bool SupportsPagedDecodeAttention(const TransformerModel* model) {
-    // Fail closed for Gemma4. The generic paged decode callback does not yet
-    // preserve Gemma4's sliding-window/shared-KV attention behavior, so later
-    // batching or cache policy must treat this veto as monotonic.
-    return !(model && model->arch_flags.is_gemma4);
+    if (!model || !model->arch_flags.is_gemma4) {
+        return true;
+    }
+    if (IsGemma4ForceDenseBaselineEnabled() || UseGemma4BenchQualityFallback()) {
+        return false;
+    }
+    return true;
 }
 
 float SanitizeAttentionLogitSoftcapForLoad(const TransformerModel* model, float gguf_softcap) {

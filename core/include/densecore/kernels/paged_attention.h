@@ -16,6 +16,13 @@
 namespace densecore {
 namespace kernels {
 
+struct PagedAttentionConfig {
+    int context_len = 0;
+    int context_start_pos = 0;
+    float scale = 0.0f;
+    float logit_softcap = 0.0f;
+};
+
 /**
  * @brief Compute Attention with Paged KV Cache (Highway/SIMD)
  *
@@ -41,8 +48,17 @@ namespace kernels {
  *       by broadcasting KV heads.
  */
 void PagedAttention(const Tensor& query, const PagedKVCache& cache, int layer, const std::vector<int>& block_table,
-                    int context_len, float scale, Tensor* output, int head_start = 0, int head_end = -1,
+                    const PagedAttentionConfig& config, Tensor* output, int head_start = 0, int head_end = -1,
                     int num_heads_total = -1);
+
+inline void PagedAttention(const Tensor& query, const PagedKVCache& cache, int layer,
+                           const std::vector<int>& block_table, int context_len, float scale, Tensor* output,
+                           int head_start = 0, int head_end = -1, int num_heads_total = -1) {
+    PagedAttentionConfig config;
+    config.context_len = context_len;
+    config.scale = scale;
+    PagedAttention(query, cache, layer, block_table, config, output, head_start, head_end, num_heads_total);
+}
 
 }  // namespace kernels
 }  // namespace densecore

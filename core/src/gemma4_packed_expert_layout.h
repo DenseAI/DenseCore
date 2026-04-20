@@ -194,28 +194,56 @@ inline bool MakePackedExpertViews(ggml_context* vctx, ggml_tensor* gate_up_root,
 
     size_t gate_up_expert_offset = 0;
     if (layout.gate_up_expert_axis >= 0) {
-        gate_up_expert_offset = static_cast<size_t>(expert_index) * static_cast<size_t>(gate_up_root->nb[layout.gate_up_expert_axis]);
+        gate_up_expert_offset =
+            static_cast<size_t>(expert_index) * static_cast<size_t>(gate_up_root->nb[layout.gate_up_expert_axis]);
     }
     if (layout.gate_up_kind == PackedGateUpLayoutKind::RowStacked3D) {
-        out->gate_up = ggml_view_2d(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim * 2, gate_up_root->nb[1],
-                                    gate_up_expert_offset);
-        out->gate_view = {Make2DView(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim, gate_up_expert_offset),
-                          expert_index, layout.gate_up_expert_axis, -1, -1, layout.intermediate_dim, layout.hidden_dim, 0,
-                          gate_up_expert_offset};
+        out->gate_up = ggml_view_2d(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim * 2,
+                                    gate_up_root->nb[1], gate_up_expert_offset);
+        out->gate_view = {
+            Make2DView(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim, gate_up_expert_offset),
+            expert_index,
+            layout.gate_up_expert_axis,
+            -1,
+            -1,
+            layout.intermediate_dim,
+            layout.hidden_dim,
+            0,
+            gate_up_expert_offset};
         out->up_view = {Make2DView(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim,
-                                   gate_up_expert_offset + static_cast<size_t>(layout.intermediate_dim) * static_cast<size_t>(gate_up_root->nb[1])),
-                        expert_index, layout.gate_up_expert_axis, -1, -1, layout.intermediate_dim, layout.hidden_dim,
+                                   gate_up_expert_offset + static_cast<size_t>(layout.intermediate_dim) *
+                                                               static_cast<size_t>(gate_up_root->nb[1])),
+                        expert_index,
+                        layout.gate_up_expert_axis,
+                        -1,
+                        -1,
                         layout.intermediate_dim,
-                        gate_up_expert_offset + static_cast<size_t>(layout.intermediate_dim) * static_cast<size_t>(gate_up_root->nb[1])};
+                        layout.hidden_dim,
+                        layout.intermediate_dim,
+                        gate_up_expert_offset +
+                            static_cast<size_t>(layout.intermediate_dim) * static_cast<size_t>(gate_up_root->nb[1])};
     } else {
-        out->gate_up = ggml_view_3d(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim, 2, gate_up_root->nb[1],
-                                    gate_up_root->nb[2], gate_up_expert_offset);
-        out->gate_view = {Make2DView(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim, gate_up_expert_offset),
-                          expert_index, layout.gate_up_expert_axis, 2, 0, layout.intermediate_dim, layout.hidden_dim, 0,
-                          gate_up_expert_offset};
+        out->gate_up = ggml_view_3d(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim, 2,
+                                    gate_up_root->nb[1], gate_up_root->nb[2], gate_up_expert_offset);
+        out->gate_view = {
+            Make2DView(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim, gate_up_expert_offset),
+            expert_index,
+            layout.gate_up_expert_axis,
+            2,
+            0,
+            layout.intermediate_dim,
+            layout.hidden_dim,
+            0,
+            gate_up_expert_offset};
         out->up_view = {Make2DView(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim,
                                    gate_up_expert_offset + static_cast<size_t>(gate_up_root->nb[2])),
-                        expert_index, layout.gate_up_expert_axis, 2, 1, layout.intermediate_dim, layout.hidden_dim, 0,
+                        expert_index,
+                        layout.gate_up_expert_axis,
+                        2,
+                        1,
+                        layout.intermediate_dim,
+                        layout.hidden_dim,
+                        0,
                         gate_up_expert_offset + static_cast<size_t>(gate_up_root->nb[2])};
     }
     out->gate = out->gate_view.tensor;
@@ -223,8 +251,15 @@ inline bool MakePackedExpertViews(ggml_context* vctx, ggml_tensor* gate_up_root,
 
     const size_t down_offset =
         static_cast<size_t>(expert_index) * static_cast<size_t>(down_root->nb[layout.down_expert_axis]);
-    out->down_view = {Make2DView(vctx, down_root, layout.intermediate_dim, layout.hidden_dim, down_offset), expert_index,
-                      layout.down_expert_axis, -1, -1, layout.hidden_dim, layout.intermediate_dim, 0, down_offset};
+    out->down_view = {Make2DView(vctx, down_root, layout.intermediate_dim, layout.hidden_dim, down_offset),
+                      expert_index,
+                      layout.down_expert_axis,
+                      -1,
+                      -1,
+                      layout.hidden_dim,
+                      layout.intermediate_dim,
+                      0,
+                      down_offset};
     out->down = out->down_view.tensor;
 
     if (down_scale_root) {
@@ -232,9 +267,9 @@ inline bool MakePackedExpertViews(ggml_context* vctx, ggml_tensor* gate_up_root,
             if (reason) *reason = "Gemma4 down scale sidecar must be F32";
             return false;
         }
-        out->down_scale =
-            Make2DView(vctx, down_scale_root, layout.intermediate_dim, layout.hidden_dim,
-                       static_cast<size_t>(expert_index) * static_cast<size_t>(down_scale_root->nb[layout.down_expert_axis]));
+        out->down_scale = Make2DView(vctx, down_scale_root, layout.intermediate_dim, layout.hidden_dim,
+                                     static_cast<size_t>(expert_index) *
+                                         static_cast<size_t>(down_scale_root->nb[layout.down_expert_axis]));
     }
 
     if (!out->gate || !out->up || !out->down || !out->gate_up) {

@@ -277,8 +277,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
     detection_hints.has_gemma4_tokenizer_hint = tokenizer_lower.find("gemma4") != std::string::npos;
 
     bool used_hint_upgrade = false;
-    auto resolved_arch =
-        densecore::models::ResolveModelDescriptorWithHints(arch, detection_hints, &used_hint_upgrade);
+    auto resolved_arch = densecore::models::ResolveModelDescriptorWithHints(arch, detection_hints, &used_hint_upgrade);
 
     const auto ascii_lower_copy = [](std::string s) {
         std::transform(s.begin(), s.end(), s.begin(),
@@ -297,10 +296,10 @@ TransformerModel* LoadGGUFModel(const char* path) {
     const std::string general_repo = get_exact_string("general.repo");
     const std::string general_hf_repo = get_exact_string("general.hf_repo_id");
     const std::string hf_repo = get_exact_string("hf.repo_id");
-    const std::string hf_model_type =
-        !get_exact_string("hf.model_type").empty() ? get_exact_string("hf.model_type")
-        : !get_exact_string("general.hf_model_type").empty() ? get_exact_string("general.hf_model_type")
-                                                             : get_exact_string("transformers.model_type");
+    const std::string hf_model_type = !get_exact_string("hf.model_type").empty() ? get_exact_string("hf.model_type")
+                                      : !get_exact_string("general.hf_model_type").empty()
+                                          ? get_exact_string("general.hf_model_type")
+                                          : get_exact_string("transformers.model_type");
     std::vector<std::string> hf_architectures = get_exact_string_array("hf.architectures");
     if (hf_architectures.empty()) hf_architectures = get_exact_string_array("general.hf_architectures");
     if (hf_architectures.empty()) hf_architectures = get_exact_string_array("transformers.architectures");
@@ -321,10 +320,12 @@ TransformerModel* LoadGGUFModel(const char* path) {
             break;
         }
     }
-    const bool qwen36_named_variant = contains_lower(general_name, "qwen3.6") || contains_lower(general_basename, "qwen3.6") ||
-                                      contains_lower(general_repo, "qwen3.6") || contains_lower(general_hf_repo, "qwen3.6") ||
-                                      contains_lower(hf_repo, "qwen3.6");
-    const bool qwen35_family_aux = qwen35_architecture || qwen35_hf_model_type || qwen35_hf_architecture || qwen36_named_variant;
+    const bool qwen36_named_variant = contains_lower(general_name, "qwen3.6") ||
+                                      contains_lower(general_basename, "qwen3.6") ||
+                                      contains_lower(general_repo, "qwen3.6") ||
+                                      contains_lower(general_hf_repo, "qwen3.6") || contains_lower(hf_repo, "qwen3.6");
+    const bool qwen35_family_aux =
+        qwen35_architecture || qwen35_hf_model_type || qwen35_hf_architecture || qwen36_named_variant;
     std::string qwen35_resolution_signal;
     if (qwen35_architecture) {
         qwen35_resolution_signal = "general.architecture=qwen35moe";
@@ -388,8 +389,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
             prefixes.push_back(arch);
         }
         if (model->arch_flags.is_hybrid_ssm) {
-            static const char* kHybridPrefixes[] = {"qwen35moe", "qwen3_5_moe", "qwen3_5_moe_text", "qwen35",
-                                                    "qwen36"};
+            static const char* kHybridPrefixes[] = {"qwen35moe", "qwen3_5_moe", "qwen3_5_moe_text", "qwen35", "qwen36"};
             for (const char* prefix : kHybridPrefixes) {
                 if (!prefix) continue;
                 if (std::find(prefixes.begin(), prefixes.end(), prefix) == prefixes.end()) {
@@ -886,8 +886,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             }
             if (model->ssm_full_attn_interval > 0) {
                 for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
-                    const bool expected_ssm = (i % model->ssm_full_attn_interval) !=
-                                              static_cast<uint32_t>(model->ssm_full_attn_interval - 1);
+                    const bool expected_ssm =
+                        (i % model->ssm_full_attn_interval) != static_cast<uint32_t>(model->ssm_full_attn_interval - 1);
                     if ((model->hybrid_layer_is_ssm[i] != 0) != expected_ssm) {
                         return fail_hybrid_ssm("layer_types schedule disagrees with full_attention_interval");
                     }
@@ -1079,14 +1079,6 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
     model->tokenizer_add_bos = add_bos;
 
-    std::cout << "[DenseCore] Model params: n_vocab=" << model->hparams.n_vocab << ", n_embd=" << model->hparams.n_embd
-              << ", n_layer=" << model->hparams.n_layer << ", n_head=" << model->hparams.n_head
-              << ", n_head_kv=" << model->hparams.n_head_kv << ", n_rot=" << model->hparams.n_rot
-              << ", n_ctx=" << model->hparams.n_ctx << std::endl;
-    std::cout << "[DenseCore] BOS=" << model->bos_token_id << ", EOS=" << model->eos_token_id
-              << ", rope_freq=" << model->hparams.rope_freq_base << ", rope_scale=" << model->hparams.rope_freq_scale
-              << std::endl;
-
     // 2. Load Vocab
     int token_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.tokens");
     if (token_idx != -1) {
@@ -1101,11 +1093,19 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
         // Update n_vocab to match actual loaded vocab size
         if (n_tokens != (int)model->hparams.n_vocab) {
-            std::cout << "[DenseCore] Vocab size mismatch! Metadata=" << model->hparams.n_vocab << " but loaded "
-                      << n_tokens << " tokens. Updating to " << n_tokens << std::endl;
+            std::cout << "[DenseCore] Normalizing n_vocab from metadata " << model->hparams.n_vocab
+                      << " to tokenizer token count " << n_tokens << std::endl;
             model->hparams.n_vocab = n_tokens;
         }
     }
+
+    std::cout << "[DenseCore] Model params: n_vocab=" << model->hparams.n_vocab << ", n_embd=" << model->hparams.n_embd
+              << ", n_layer=" << model->hparams.n_layer << ", n_head=" << model->hparams.n_head
+              << ", n_head_kv=" << model->hparams.n_head_kv << ", n_rot=" << model->hparams.n_rot
+              << ", n_ctx=" << model->hparams.n_ctx << std::endl;
+    std::cout << "[DenseCore] BOS=" << model->bos_token_id << ", EOS=" << model->eos_token_id
+              << ", rope_freq=" << model->hparams.rope_freq_base << ", rope_scale=" << model->hparams.rope_freq_scale
+              << std::endl;
 
     // Optional token scores (SentencePiece / BPE rank hints).
     int scores_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.scores");
@@ -1281,7 +1281,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
         if (model->tokenizer_type.empty()) {
             return fail_load("Gemma4 GGUF is missing tokenizer.ggml.model/tokenizer.ggml.pre metadata");
         }
-        if (densecore::models::ResolveTokenizerFamily(model) != densecore::models::TokenizerFamily::GEMMA_SENTENCEPIECE) {
+        if (densecore::models::ResolveTokenizerFamily(model) !=
+            densecore::models::TokenizerFamily::GEMMA_SENTENCEPIECE) {
             return fail_load("Gemma4 requires GEMMA_SENTENCEPIECE tokenizer metadata");
         }
         if (model->bos_token_id < 0 || model->eos_token_id < 0) {
@@ -1305,8 +1306,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
         if (detection_hints.has_gemma4_tensor_signatures && !has_key("embedding_length_per_layer_input")) {
             return fail_load("Gemma4 GGUF is missing embedding_length_per_layer_input metadata");
         }
-        if (model->gemma4_key_length_full == 0 || model->gemma4_key_length_swa == 0 || model->gemma4_value_length_full == 0 ||
-            model->gemma4_value_length_swa == 0) {
+        if (model->gemma4_key_length_full == 0 || model->gemma4_key_length_swa == 0 ||
+            model->gemma4_value_length_full == 0 || model->gemma4_value_length_swa == 0) {
             return fail_load("Gemma4 GGUF is missing explicit key/value length metadata");
         }
         if (model->gemma4_rope_dim_full <= 0 || model->gemma4_rope_dim_swa <= 0) {
@@ -1442,9 +1443,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
 
     if (model->arch_flags.is_gemma4) {
-        const bool has_any_per_layer_input_tensor =
-            model->gemma4_per_layer_model_projection || model->gemma4_per_layer_projection_norm ||
-            model->gemma4_per_layer_token_embeddings;
+        const bool has_any_per_layer_input_tensor = model->gemma4_per_layer_model_projection ||
+                                                    model->gemma4_per_layer_projection_norm ||
+                                                    model->gemma4_per_layer_token_embeddings;
         if (has_any_per_layer_input_tensor) {
             if (!model->gemma4_per_layer_model_projection || !model->gemma4_per_layer_projection_norm ||
                 !model->gemma4_per_layer_token_embeddings) {
@@ -1464,18 +1465,17 @@ TransformerModel* LoadGGUFModel(const char* path) {
     if (model->output) {
         std::cout << "[DenseCore] output shape: [" << model->output->ne[0] << ", " << model->output->ne[1] << "]"
                   << std::endl;
-
-        // Validate n_vocab matches output tensor shape
-        uint32_t tensor_vocab_size = model->output->ne[1];
-        if (tensor_vocab_size != model->hparams.n_vocab && tensor_vocab_size > 0) {
-            std::cout << "[DenseCore] ERROR: Vocab size inconsistency! " << "Loaded vocab=" << model->hparams.n_vocab
-                      << " but output tensor expects " << tensor_vocab_size << " tokens." << std::endl;
-            std::cout << "[DenseCore] This will cause garbage output. " << "Check GGUF file integrity." << std::endl;
-
-            if (tensor_vocab_size > model->hparams.n_vocab) {
-                std::cout << "[DenseCore] WARNING: Tensor vocab larger than loaded vocab. "
-                          << "Some tokens may not decode properly." << std::endl;
-            }
+    }
+    if (model->tok_embeddings) {
+        const uint32_t embedding_vocab_size = static_cast<uint32_t>(model->tok_embeddings->ne[1]);
+        if (embedding_vocab_size > 0 && embedding_vocab_size != model->hparams.n_vocab) {
+            return fail_load("GGUF tokenizer/embedding vocab size mismatch");
+        }
+    }
+    if (model->output) {
+        const uint32_t output_vocab_size = static_cast<uint32_t>(model->output->ne[1]);
+        if (output_vocab_size > 0 && output_vocab_size != model->hparams.n_vocab) {
+            return fail_load("GGUF tokenizer/output vocab size mismatch");
         }
     }
 
@@ -1677,9 +1677,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
             layer.Set(model_keys::kFfnSharedGate, t);
         }
         if (!layer.Get(model_keys::kMoeGate)) {
-            auto* t = get_layer_tensor_any(static_cast<int>(i),
-                                           {"moe_gate.weight", "router.proj.weight", "mlp.gate.weight",
-                                            "ffn_gate_inp.weight", "ffn_gate_inp"});
+            auto* t =
+                get_layer_tensor_any(static_cast<int>(i), {"moe_gate.weight", "router.proj.weight", "mlp.gate.weight",
+                                                           "ffn_gate_inp.weight", "ffn_gate_inp"});
             if (!t) t = find_layer_tensor_with_tokens(layer, {"mlp", "gate.weight"}, {"shared"});
             if (!t) t = find_layer_tensor_with_tokens(layer, {"ffn_gate_inp"});
             layer.Set(model_keys::kMoeGate, t);
@@ -1730,9 +1730,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             densecore::gemma4::PackedExpertLayout packed_layout{};
             std::string packed_layout_reason;
             const bool has_canonical_gemma4_layout =
-                model->arch_flags.is_gemma4 &&
-                densecore::gemma4::InferPackedExpertLayout(packed_gate_up, packed_down, &packed_layout,
-                                                           &packed_layout_reason);
+                model->arch_flags.is_gemma4 && densecore::gemma4::InferPackedExpertLayout(
+                                                   packed_gate_up, packed_down, &packed_layout, &packed_layout_reason);
             int packed_experts = 0;
             if (has_canonical_gemma4_layout) {
                 packed_experts = packed_layout.num_experts;
@@ -1773,21 +1772,21 @@ TransformerModel* LoadGGUFModel(const char* path) {
                         const auto gate_it = model->int4_weight_bindings.find(packed_gate_up);
                         if (gate_it != model->int4_weight_bindings.end()) {
                             TransformerModel::Int4WeightBinding gate_binding{};
-                            if (densecore::gemma4::ResolvePackedProjectionBinding(vctx, gate_it->second,
-                                                                                 expert_views.gate_view, &gate_binding)) {
+                            if (densecore::gemma4::ResolvePackedProjectionBinding(
+                                    vctx, gate_it->second, expert_views.gate_view, &gate_binding)) {
                                 model->int4_weight_bindings[expert_views.gate] = gate_binding;
                             }
                             TransformerModel::Int4WeightBinding up_binding{};
                             if (densecore::gemma4::ResolvePackedProjectionBinding(vctx, gate_it->second,
-                                                                                 expert_views.up_view, &up_binding)) {
+                                                                                  expert_views.up_view, &up_binding)) {
                                 model->int4_weight_bindings[expert_views.up] = up_binding;
                             }
                         }
                         const auto down_it = model->int4_weight_bindings.find(packed_down);
                         if (down_it != model->int4_weight_bindings.end()) {
                             TransformerModel::Int4WeightBinding down_binding{};
-                            if (densecore::gemma4::ResolvePackedProjectionBinding(vctx, down_it->second,
-                                                                                 expert_views.down_view, &down_binding)) {
+                            if (densecore::gemma4::ResolvePackedProjectionBinding(
+                                    vctx, down_it->second, expert_views.down_view, &down_binding)) {
                                 model->int4_weight_bindings[expert_views.down] = down_binding;
                             }
                         }
@@ -1896,7 +1895,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             int expert_name_candidates = 0;
             for (const auto& entry : layer.tensors) {
                 const std::string key_lower = ascii_lower_copy(entry.first);
-                if (key_lower.find("expert") != std::string::npos || key_lower.find("ffn_gate_exps") != std::string::npos ||
+                if (key_lower.find("expert") != std::string::npos ||
+                    key_lower.find("ffn_gate_exps") != std::string::npos ||
                     key_lower.find("ffn_up_exps") != std::string::npos ||
                     key_lower.find("ffn_down_exps") != std::string::npos) {
                     expert_name_candidates++;
@@ -1981,8 +1981,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
     if (model->hparams.n_experts > 0) {
         std::cout << "[DenseCore] MoE summary: experts=" << model->hparams.n_experts
-                  << " top_k=" << model->hparams.n_experts_used
-                  << " shared_experts=" << model->moe_n_shared_experts << std::endl;
+                  << " top_k=" << model->hparams.n_experts_used << " shared_experts=" << model->moe_n_shared_experts
+                  << std::endl;
     }
 
     // Auto-compute head dimensions from weight tensor shapes.
@@ -3374,9 +3374,9 @@ TransformerModel* LoadModelFromExternal(const TransformerHParams& hparams, const
         model->gemma4_per_layer_model_projection = get_tensor("per_layer_model_proj.weight");
         model->gemma4_per_layer_projection_norm = get_tensor("per_layer_proj_norm.weight");
         model->gemma4_per_layer_token_embeddings = get_tensor("per_layer_token_embd.weight");
-        const bool has_any_per_layer_input_tensor =
-            model->gemma4_per_layer_model_projection || model->gemma4_per_layer_projection_norm ||
-            model->gemma4_per_layer_token_embeddings;
+        const bool has_any_per_layer_input_tensor = model->gemma4_per_layer_model_projection ||
+                                                    model->gemma4_per_layer_projection_norm ||
+                                                    model->gemma4_per_layer_token_embeddings;
         if (has_any_per_layer_input_tensor) {
             if (!model->gemma4_per_layer_model_projection || !model->gemma4_per_layer_projection_norm ||
                 !model->gemma4_per_layer_token_embeddings) {

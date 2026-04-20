@@ -1,6 +1,7 @@
 #include "inference.h"
 
-#include "densecore/inference_types_internal.h"          // Shared internal types
+#include "densecore/inference_types_internal.h"  // Shared internal types
+#include "densecore/models/model_graph_capabilities.h"
 #include "densecore/models/transformer_graph_builder.h"  // Strategy Pattern for graph building
 #include "flash_attention.h"
 #include "ggml-cpu.h"           // For ggml_get_type_traits_cpu (vec_dot)
@@ -8,7 +9,6 @@
 #include "hardware_topology.h"  // For compute thread affinity
 #include "matmul_backend.h"
 #include "models/model_inference_policy.h"
-#include "densecore/models/model_graph_capabilities.h"
 #include "optimization_bridge.h"  // Runtime SIMD dispatch
 
 #ifndef GGML_KQ_MASK_PAD
@@ -499,8 +499,7 @@ enum class RuntimeToggleMode { Off = 0, Auto = 1, On = 2 };
 
 static bool ShouldUseArmNativeQ4KVecDotValidated(ggml_type weight_type, const ggml_type_traits_cpu* type_traits_cpu,
                                                  const char* weight_name, const void* sample_row_ptr,
-                                                 const void* sample_quant_input, const float* sample_input_f32,
-                                                 int N) {
+                                                 const void* sample_quant_input, const float* sample_input_f32, int N) {
 #if defined(__aarch64__) || defined(_M_ARM64)
     if (weight_type != GGML_TYPE_Q4_K) {
         return type_traits_cpu && type_traits_cpu->vec_dot;
@@ -2471,10 +2470,17 @@ struct GemvBatchedUserData {
 
 struct PagedAttentionUserData {
     PagedKVCache* cache = nullptr;
-    int layer = 0;
+    int layer = 0;  // Current model layer for logging/probes
+    int read_layer = 0;
+    int write_layer = 0;
     int head_dim = 0;
     int v_head_dim = 0;
     int n_head = 0;
+    bool write_current_kv = true;
+    bool force_full_history = false;
+    int sliding_window = -1;
+    float attention_scale = 0.0f;
+    float logit_softcap = 0.0f;
     int index_n_heads = 0;
     int index_head_dim = 0;
     int index_topk = 0;
@@ -3433,8 +3439,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         std::fprintf(stderr,
                      "[MOE_WIRING_MODEL] arch=%d variant=%d preferred_family=%s fail_closed=%d capabilities=%s "
                      "n_layer=%d n_experts=%u top_k=%u moe_first_k_dense_replace=%d N=%d decode_only=%d\n",
-                     static_cast<int>(resolution.capabilities.arch),
-                     static_cast<int>(resolution.capabilities.variant),
+                     static_cast<int>(resolution.capabilities.arch), static_cast<int>(resolution.capabilities.variant),
                      densecore::models::GraphFamilyName(resolution.preferred_family), resolution.fail_closed ? 1 : 0,
                      densecore::models::FormatModelGraphCapabilities(resolution.capabilities).c_str(), n_layer,
                      model->hparams.n_experts, model->hparams.n_experts_used, model->moe_first_k_dense_replace, N,
@@ -4330,9 +4335,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 if (disable_paged_decode_for_model && requested_paged_decode_attention) {
                     static bool logged_gemma4_paged_decode_disable = false;
                     if (!logged_gemma4_paged_decode_disable) {
-                        std::cerr << "[DenseCore] Disabling paged decode attention for Gemma4; "
-                                     "falling back to portable attention until the paged path "
-                                     "supports Gemma4 softcap/sliding semantics."
+                        std::cerr << "[DenseCore] Gemma4 paged decode attention is disabled by support gate; "
+                                     "falling back to the standard decode path."
                                   << std::endl;
                         logged_gemma4_paged_decode_disable = true;
                     }
@@ -4427,12 +4431,13 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                             const Gemma4SharedKVState* shared_kv_state = GetGemma4SharedKVState(kv_cache_layer);
                             if (!shared_kv_state) {
                                 throw densecore::InvalidArgumentException(
-                                    "Gemma4 shared-KV layer is missing per-forward shared_kv_states for its source layer");
+                                    "Gemma4 shared-KV layer is missing per-forward shared_kv_states for its source "
+                                    "layer");
                             }
-                            K_all = MaybeAttachGemma4SharedKVProbe(ctx_c, shared_kv_state->k, "explicit-read", "K",
-                                                                   il, kv_cache_layer);
-                            V_all = MaybeAttachGemma4SharedKVProbe(ctx_c, shared_kv_state->v, "explicit-read", "V",
-                                                                   il, kv_cache_layer);
+                            K_all = MaybeAttachGemma4SharedKVProbe(ctx_c, shared_kv_state->k, "explicit-read", "K", il,
+                                                                   kv_cache_layer);
+                            V_all = MaybeAttachGemma4SharedKVProbe(ctx_c, shared_kv_state->v, "explicit-read", "V", il,
+                                                                   kv_cache_layer);
                         }
                     } else if (n_past_val == 0) {
                         // Prefill first chunk fast path: avoid materializing an
@@ -4454,7 +4459,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                             const Gemma4SharedKVState* shared_kv_state = GetGemma4SharedKVState(kv_cache_layer);
                             if (!shared_kv_state) {
                                 throw densecore::InvalidArgumentException(
-                                    "Gemma4 shared-KV layer is missing per-forward shared_kv_states for its source layer");
+                                    "Gemma4 shared-KV layer is missing per-forward shared_kv_states for its source "
+                                    "layer");
                             }
                             K_all = MaybeAttachGemma4SharedKVProbe(ctx_c, shared_kv_state->k, "explicit-read", "K", il,
                                                                    kv_cache_layer);
@@ -4713,13 +4719,6 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     RecordDecodePagedFallbackReason(paged_decode_decision.reason, il, N);
                 }
 
-#ifndef NDEBUG
-                if (model->arch_flags.is_gemma4 && use_paged_decode_attention) {
-                    throw densecore::InvalidArgumentException(
-                        "Decode attention invariant failed: Gemma4 must not execute paged decode attention.");
-                }
-#endif
-
                 const DecodeAttentionPathKind attention_path_kind =
                     use_paged_decode_attention ? DecodeAttentionPathKind::Paged
                                                : (use_hal_attention_dispatch ? DecodeAttentionPathKind::Hal
@@ -4744,16 +4743,33 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     struct ggml_tensor* Q_decode = ggml_is_contiguous(Qcur) ? Qcur : ggml_cont(ctx_c, Qcur);
                     struct ggml_tensor* K_decode = ggml_is_contiguous(Kcur) ? Kcur : ggml_cont(ctx_c, Kcur);
                     struct ggml_tensor* V_decode = ggml_is_contiguous(Vcur) ? Vcur : ggml_cont(ctx_c, Vcur);
+                    const int paged_attn_sliding_window =
+                        (model->arch_flags.is_gemma4 && densecore::models::IsGemma4SlidingLayer(model, il) &&
+                         model->gemma4_sliding_window > 0)
+                            ? model->gemma4_sliding_window
+                            : -1;
+                    const float paged_attn_scale =
+                        model->arch_flags.is_gemma4
+                            ? 1.0f
+                            : (use_explicit_attention_scale ? 1.0f : 1.0f / sqrtf((float)head_dim_q));
 
                     PagedAttentionUserData* ud = GetPagedAttentionUserData();
                     ud->cache = cache;
-                    ud->layer = kv_cache_layer;
+                    ud->layer = il;
+                    ud->read_layer = kv_cache_layer;
+                    ud->write_layer = kv_cache_layer;
                     ud->head_dim = head_dim_q;
                     ud->v_head_dim = head_dim_v;
                     ud->n_head = n_head;
+                    ud->write_current_kv = !gemma4_shared_kv_layer;
+                    ud->force_full_history = gemma4_shared_kv_layer || gemma4_shared_kv_source_layer;
+                    ud->sliding_window = paged_attn_sliding_window;
+                    ud->attention_scale = paged_attn_scale;
+                    ud->logit_softcap = fast_attn_logit_softcap;
                     ud->epoch_started.store(0, std::memory_order_relaxed);
                     ud->epoch_done.store(0, std::memory_order_relaxed);
                     ud->kv_writers_done.store(0, std::memory_order_relaxed);
+                    ud->shared_block_ptrs_ready.store(0, std::memory_order_relaxed);
                     KQV = ggml_paged_attention_decode(ctx_c, Q_decode, K_decode, V_decode, ud);
                 } else if (use_hal_attention_dispatch) {
                     // -----------------------------------------------------------------------
@@ -6081,11 +6097,10 @@ std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float
             for (int k_idx = 0; k_idx < n_total_tokens; ++k_idx) {
                 bool masked = false;
                 if (use_explicit_mask) {
-                    const int key_pos =
-                        retained_history_layout
-                            ? ((k_idx < retained.history_kept) ? ::MapRetainedHistoryIndex(retained, k_idx)
-                                                               : (n_past + (k_idx - retained.history_kept)))
-                            : k_idx;
+                    const int key_pos = retained_history_layout ? ((k_idx < retained.history_kept)
+                                                                       ? ::MapRetainedHistoryIndex(retained, k_idx)
+                                                                       : (n_past + (k_idx - retained.history_kept)))
+                                                                : k_idx;
                     if (sliding_window >= 0 && key_pos < (query_pos - sliding_window)) {
                         masked = true;
                     }
@@ -6273,8 +6288,7 @@ bool RouteMoESoftmaxTopKForTest(const struct ggml_tensor* gate_logits, const Tra
     return ::RouteMoESoftmaxTopK(gate_logits, &ud, routing);
 }
 bool RouteMoEGroupedSigmoidForTest(const struct ggml_tensor* gate_logits, const TransformerModel* model,
-                                   const TransformerLayer* layer, int top_k,
-                                   densecore::moe::MoERouteResult* routing) {
+                                   const TransformerLayer* layer, int top_k, densecore::moe::MoERouteResult* routing) {
     MoEUserData ud{};
     ud.model = model;
     ud.layer = layer;
@@ -6292,8 +6306,7 @@ bool RouteMoEGemma4TopKForTest(const struct ggml_tensor* gate_logits, const Tran
 std::vector<float> ApplySharedScalarGateForTest(const std::vector<float>& shared_ffn_pre_gate,
                                                 const std::vector<float>& shared_gate_logits_scalar, int tokens,
                                                 int hidden_dim) {
-    if (tokens <= 0 || hidden_dim <= 0 ||
-        static_cast<int>(shared_ffn_pre_gate.size()) != tokens * hidden_dim ||
+    if (tokens <= 0 || hidden_dim <= 0 || static_cast<int>(shared_ffn_pre_gate.size()) != tokens * hidden_dim ||
         static_cast<int>(shared_gate_logits_scalar.size()) != tokens) {
         return {};
     }
@@ -6325,13 +6338,10 @@ std::vector<float> ApplySharedScalarGateForTest(const std::vector<float>& shared
     ggml_free(ctx);
     return out;
 }
-std::vector<float> ComputeSharedExpertMergedOutputForTest(const std::vector<float>& moe_input,
-                                                          const std::vector<float>& routed_output,
-                                                          const std::vector<float>& gate_weight,
-                                                          const std::vector<float>& up_weight,
-                                                          const std::vector<float>& down_weight,
-                                                          const std::vector<float>& shared_gate_logits_scalar,
-                                                          int tokens, int hidden_dim, int intermediate_dim) {
+std::vector<float> ComputeSharedExpertMergedOutputForTest(
+    const std::vector<float>& moe_input, const std::vector<float>& routed_output, const std::vector<float>& gate_weight,
+    const std::vector<float>& up_weight, const std::vector<float>& down_weight,
+    const std::vector<float>& shared_gate_logits_scalar, int tokens, int hidden_dim, int intermediate_dim) {
     if (tokens <= 0 || hidden_dim <= 0 || intermediate_dim <= 0 ||
         static_cast<int>(moe_input.size()) != tokens * hidden_dim ||
         static_cast<int>(routed_output.size()) != tokens * hidden_dim ||
@@ -6342,8 +6352,7 @@ std::vector<float> ComputeSharedExpertMergedOutputForTest(const std::vector<floa
         return {};
     }
 
-    auto matmul_trans_b = [](const std::vector<float>& input, const std::vector<float>& weight, int M, int K,
-                             int N) {
+    auto matmul_trans_b = [](const std::vector<float>& input, const std::vector<float>& weight, int M, int K, int N) {
         std::vector<float> out(static_cast<size_t>(M * N), 0.0f);
         for (int m = 0; m < M; ++m) {
             for (int n = 0; n < N; ++n) {
@@ -6364,8 +6373,8 @@ std::vector<float> ComputeSharedExpertMergedOutputForTest(const std::vector<floa
         const float g = shared_gate[i];
         shared_ffn_pre_gate[i] = (g / (1.0f + std::exp(-g))) * shared_up[i];
     }
-    const std::vector<float> gated = ApplySharedScalarGateForTest(shared_ffn_pre_gate, shared_gate_logits_scalar,
-                                                                  tokens, intermediate_dim);
+    const std::vector<float> gated =
+        ApplySharedScalarGateForTest(shared_ffn_pre_gate, shared_gate_logits_scalar, tokens, intermediate_dim);
     const std::vector<float> shared_down = matmul_trans_b(gated, down_weight, tokens, intermediate_dim, hidden_dim);
     std::vector<float> merged = routed_output;
     for (size_t i = 0; i < merged.size(); ++i) {
@@ -6461,9 +6470,9 @@ Gemma4MoEBranchInputsSnapshot ComputeGemma4MoEBranchInputsForTest(const std::vec
                                                                   float eps) {
     Gemma4MoEBranchInputsSnapshot snapshot;
     snapshot.shared_input = ApplyWeightedRmsNormVectorForTest(attn_post_residual, ffn_norm_weight, eps);
-    snapshot.routed_input =
-        pre_moe_norm_weight.empty() ? snapshot.shared_input
-                                    : ApplyWeightedRmsNormVectorForTest(inp_ff, pre_moe_norm_weight, eps);
+    snapshot.routed_input = pre_moe_norm_weight.empty()
+                                ? snapshot.shared_input
+                                : ApplyWeightedRmsNormVectorForTest(inp_ff, pre_moe_norm_weight, eps);
     return snapshot;
 }
 }  // namespace densecore::testing

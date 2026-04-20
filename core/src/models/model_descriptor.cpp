@@ -247,11 +247,10 @@ ResolvedModelDescriptor ResolveModelDescriptorFromArchName(std::string_view arch
                                                             "qwen3_coder_next", "qwen3-coder-next"})) {
         return make_result(DescribeModelVariant(ModelVariant::QWEN3NEXT));
     }
-    if (MatchesAny(lowered, std::array<std::string_view, 11>{"qwen36", "qwen3.6", "qwen3_6", "qwen3-6",
-                                                             "qwen3.6-35b-a3b", "qwen3_6_35b_a3b",
-                                                             "qwen3-6-35b-a3b", "qwen3.6_35b_a3b",
-                                                             "qwen36_35b_a3b", "qwen36-35b-a3b",
-                                                             "qwen3.6-35b-a3b-instruct"})) {
+    if (MatchesAny(lowered,
+                   std::array<std::string_view, 11>{"qwen36", "qwen3.6", "qwen3_6", "qwen3-6", "qwen3.6-35b-a3b",
+                                                    "qwen3_6_35b_a3b", "qwen3-6-35b-a3b", "qwen3.6_35b_a3b",
+                                                    "qwen36_35b_a3b", "qwen36-35b-a3b", "qwen3.6-35b-a3b-instruct"})) {
         return make_result(DescribeModelVariant(ModelVariant::QWEN36));
     }
     if (MatchesAny(lowered, std::array<std::string_view, 7>{"qwen35", "qwen3.5", "qwen35moe", "qwen35_moe",
@@ -424,9 +423,9 @@ PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model) 
 
 bool IsKnownTokenizerModel(std::string_view tokenizer_name) {
     const std::string lowered = AsciiLower(tokenizer_name);
-    static constexpr std::array<std::string_view, 13> kKnown = {
-        "llama", "gpt2", "qwen2", "qwen3", "qwen3next", "qwen35", "qwen36", "mistral", "gemma", "gemma4", "bpe",
-        "glm4", "glm"};
+    static constexpr std::array<std::string_view, 13> kKnown = {"llama",  "gpt2",   "qwen2",   "qwen3", "qwen3next",
+                                                                "qwen35", "qwen36", "mistral", "gemma", "gemma4",
+                                                                "bpe",    "glm4",   "glm"};
     return MatchesAny(lowered, kKnown);
 }
 

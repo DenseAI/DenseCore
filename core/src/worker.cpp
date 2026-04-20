@@ -7,10 +7,10 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
-#include <cstdio>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -349,12 +349,11 @@ void LogPrefillStage(const char* stage, const Request* req, const TransformerMod
         output_hash = HashByteSpanSummary(output->data, output_bytes);
     }
     std::cerr << "[PrefillStage] stage=" << (stage ? stage : "<unknown>") << " req=" << req->id
-              << " variant=" << densecore::models::ModelVariantName(descriptor.variant)
-              << " threads=" << active_threads << " prompt_tokens=" << req->tokens.size() << " n_past=" << req->n_past
-              << " token_hash=0x" << std::hex << token_hash << " block_hash=0x" << block_hash << " ssm_hash=0x"
-              << ssm_hash << " input_hash=0x" << input_hash << " graph_hash=0x" << graph_hash << " output_hash=0x"
-              << output_hash << std::dec << " input_bytes=" << input_buffer_bytes << " output_bytes=" << output_bytes
-              << std::endl;
+              << " variant=" << densecore::models::ModelVariantName(descriptor.variant) << " threads=" << active_threads
+              << " prompt_tokens=" << req->tokens.size() << " n_past=" << req->n_past << " token_hash=0x" << std::hex
+              << token_hash << " block_hash=0x" << block_hash << " ssm_hash=0x" << ssm_hash << " input_hash=0x"
+              << input_hash << " graph_hash=0x" << graph_hash << " output_hash=0x" << output_hash << std::dec
+              << " input_bytes=" << input_buffer_bytes << " output_bytes=" << output_bytes << std::endl;
 }
 
 void LogDeterminismBoundary(const char* stage, const Request* req, const TransformerModel* model,
@@ -379,9 +378,8 @@ void LogDeterminismBoundary(const char* stage, const Request* req, const Transfo
               << " chunked_prefill=" << (chunked_prefill ? 1 : 0)
               << " decode_cache_active=" << (decode_cache_active ? 1 : 0)
               << " decode_cache_reused=" << (decode_cache_reused ? 1 : 0)
-              << " prefill_cache_active=" << (prefill_cache_active ? 1 : 0)
-              << " token_hash=0x" << std::hex << token_hash << " block_hash=0x" << block_hash << " ssm_hash=0x"
-              << ssm_hash << std::dec << std::endl;
+              << " prefill_cache_active=" << (prefill_cache_active ? 1 : 0) << " token_hash=0x" << std::hex
+              << token_hash << " block_hash=0x" << block_hash << " ssm_hash=0x" << ssm_hash << std::dec << std::endl;
 }
 
 bool IsValidGgmlType(enum ggml_type type) {
@@ -1327,7 +1325,7 @@ void EngineLoop(EngineState* state) {
                                               << " block_id=" << snapshot_block << std::endl;
                                 }
                             } else if (current_kv_cache->block_manager->LoadHybridSSMSnapshotForBlock(snapshot_block,
-                                                                                                        &snapshot) &&
+                                                                                                      &snapshot) &&
                                        snapshot_shape_ok(snapshot)) {
                                 DebugLogHybridSSMSnapshot("restore_before", req->id, hit.cached_tokens, snapshot_block,
                                                           snapshot);
@@ -1344,16 +1342,15 @@ void EngineLoop(EngineState* state) {
                                           << std::endl;
                             }
                         }
-                        LogDeterminismBoundary("after_prefix_restore", req, current_model, prefix_cache_allowed,
-                                               /*prefix_cache_hit=*/true,
-                                               /*hybrid_restore_attempted=*/determinism_hybrid_restore_attempt_reqs.count(
-                                                                               req->id) != 0,
-                                               /*hybrid_restore_applied=*/determinism_hybrid_restore_applied_reqs.count(
-                                                                             req->id) != 0,
-                                               /*chunked_prefill=*/false,
-                                               /*decode_cache_active=*/false,
-                                               /*decode_cache_reused=*/false,
-                                               /*prefill_cache_active=*/false);
+                        LogDeterminismBoundary(
+                            "after_prefix_restore", req, current_model, prefix_cache_allowed,
+                            /*prefix_cache_hit=*/true,
+                            /*hybrid_restore_attempted=*/determinism_hybrid_restore_attempt_reqs.count(req->id) != 0,
+                            /*hybrid_restore_applied=*/determinism_hybrid_restore_applied_reqs.count(req->id) != 0,
+                            /*chunked_prefill=*/false,
+                            /*decode_cache_active=*/false,
+                            /*decode_cache_reused=*/false,
+                            /*prefill_cache_active=*/false);
                         LOG_INFO("Prefix cache hit for req {}: skipped {} tokens.", req->id, hit.cached_tokens);
                     }
                 }
@@ -1900,18 +1897,16 @@ void EngineLoop(EngineState* state) {
                         const std::string scheduler_state = state->DescribeSchedulerState();
                         const std::string active_state = state->DescribeActiveRequests();
                         std::ostringstream skip_summary_stream;
-                        skip_summary_stream << "scheduled[prefill=" << batch_build_stats.scheduled_prefill_count
-                                            << ",decode=" << batch_build_stats.scheduled_decode_count << "] built="
-                                            << batch_build_stats.built_batch_count
-                                            << " skipped[block_writable="
-                                            << batch_build_stats.skipped_block_writable_count
-                                            << ",finished=" << batch_build_stats.skipped_finished_count
-                                            << ",cancelled=" << batch_build_stats.skipped_cancelled_count
-                                            << ",mixed_embedding="
-                                            << batch_build_stats.skipped_mixed_embedding_count
-                                            << ",missing_request="
-                                            << batch_build_stats.skipped_missing_request_count
-                                            << "] max_build_stall_loops=" << max_build_stall_loops;
+                        skip_summary_stream
+                            << "scheduled[prefill=" << batch_build_stats.scheduled_prefill_count
+                            << ",decode=" << batch_build_stats.scheduled_decode_count
+                            << "] built=" << batch_build_stats.built_batch_count
+                            << " skipped[block_writable=" << batch_build_stats.skipped_block_writable_count
+                            << ",finished=" << batch_build_stats.skipped_finished_count
+                            << ",cancelled=" << batch_build_stats.skipped_cancelled_count
+                            << ",mixed_embedding=" << batch_build_stats.skipped_mixed_embedding_count
+                            << ",missing_request=" << batch_build_stats.skipped_missing_request_count
+                            << "] max_build_stall_loops=" << max_build_stall_loops;
                         const std::string skip_summary = skip_summary_stream.str();
                         if (should_fail) {
                             LOG_ERROR("Batch construction stalled after {} ms with {}. {} {}", oldest_idle_ms,
@@ -2208,8 +2203,7 @@ void EngineLoop(EngineState* state) {
                 parse_prefill_graph_cache_bool("DENSECORE_PREFILL_GRAPH_CACHE", true) && current_kv_cache != nullptr &&
                 prefill_graph_cache_lru_size > 0;
             const bool decode_graph_cache_active_effective = decode_graph_cache_active && !force_disable_graph_cache;
-            const bool prefill_graph_cache_active_effective =
-                prefill_graph_cache_active && !force_disable_graph_cache;
+            const bool prefill_graph_cache_active_effective = prefill_graph_cache_active && !force_disable_graph_cache;
             const size_t prefill_graph_ctx_bytes =
                 prefill_graph_cache_active_effective ? state->CalculateGraphContextSize(current_model) : 0;
             bool decode_single_token_layout = !is_embedding_batch && !is_prefill_batch && batch.num_seqs > 0 &&
@@ -2280,8 +2274,8 @@ void EngineLoop(EngineState* state) {
                 decode_reuse_candidate &&
                 decode_graph_uncacheable.find(decode_graph_key) != decode_graph_uncacheable.end();
             const bool decode_reuse_attempt_allowed = decode_reuse_candidate && !decode_key_marked_uncacheable;
-            const bool prefill_graph_entry_cacheable =
-                prefill_graph_cache_active_effective && prefill_graph_ctx_bytes > 0 &&
+            const bool prefill_graph_entry_cacheable = prefill_graph_cache_active_effective &&
+                                                       prefill_graph_ctx_bytes > 0 &&
                                                        prefill_graph_ctx_bytes <= prefill_graph_cache_max_bytes;
             const bool prefill_reuse_shape_eligible =
                 prefill_graph_cache_active_effective && is_prefill_batch && !is_embedding_batch && cpu_backend_active &&
@@ -3402,16 +3396,15 @@ void EngineLoop(EngineState* state) {
                                            .count();
                         state->metrics.RecordTTFT(ttft_us);
                         req->last_token_time = req->first_token_time;
-                        LogDeterminismBoundary("after_prefill_complete", req, current_model, prefix_cache_allowed,
-                                               /*prefix_cache_hit=*/determinism_prefix_hit_reqs.count(req->id) != 0,
-                                               /*hybrid_restore_attempted=*/determinism_hybrid_restore_attempt_reqs.count(
-                                                                               req->id) != 0,
-                                               /*hybrid_restore_applied=*/determinism_hybrid_restore_applied_reqs.count(
-                                                                             req->id) != 0,
-                                               /*chunked_prefill=*/determinism_chunked_prefill_reqs.count(req->id) != 0,
-                                               /*decode_cache_active=*/using_cached_decode_graph,
-                                               /*decode_cache_reused=*/reused_decode_graph,
-                                               /*prefill_cache_active=*/using_cached_prefill_graph);
+                        LogDeterminismBoundary(
+                            "after_prefill_complete", req, current_model, prefix_cache_allowed,
+                            /*prefix_cache_hit=*/determinism_prefix_hit_reqs.count(req->id) != 0,
+                            /*hybrid_restore_attempted=*/determinism_hybrid_restore_attempt_reqs.count(req->id) != 0,
+                            /*hybrid_restore_applied=*/determinism_hybrid_restore_applied_reqs.count(req->id) != 0,
+                            /*chunked_prefill=*/determinism_chunked_prefill_reqs.count(req->id) != 0,
+                            /*decode_cache_active=*/using_cached_decode_graph,
+                            /*decode_cache_reused=*/reused_decode_graph,
+                            /*prefill_cache_active=*/using_cached_prefill_graph);
                     }
 
                     // Sample token
@@ -3429,16 +3422,15 @@ void EngineLoop(EngineState* state) {
                         sampling_params.vocab = &current_model->vocab_tokens;
                     }
                     if (req->generated_count == 0) {
-                        LogDeterminismBoundary("pre_decode_token0_lm_head", req, current_model, prefix_cache_allowed,
-                                               /*prefix_cache_hit=*/determinism_prefix_hit_reqs.count(req->id) != 0,
-                                               /*hybrid_restore_attempted=*/determinism_hybrid_restore_attempt_reqs.count(
-                                                                               req->id) != 0,
-                                               /*hybrid_restore_applied=*/determinism_hybrid_restore_applied_reqs.count(
-                                                                             req->id) != 0,
-                                               /*chunked_prefill=*/determinism_chunked_prefill_reqs.count(req->id) != 0,
-                                               /*decode_cache_active=*/using_cached_decode_graph,
-                                               /*decode_cache_reused=*/reused_decode_graph,
-                                               /*prefill_cache_active=*/using_cached_prefill_graph);
+                        LogDeterminismBoundary(
+                            "pre_decode_token0_lm_head", req, current_model, prefix_cache_allowed,
+                            /*prefix_cache_hit=*/determinism_prefix_hit_reqs.count(req->id) != 0,
+                            /*hybrid_restore_attempted=*/determinism_hybrid_restore_attempt_reqs.count(req->id) != 0,
+                            /*hybrid_restore_applied=*/determinism_hybrid_restore_applied_reqs.count(req->id) != 0,
+                            /*chunked_prefill=*/determinism_chunked_prefill_reqs.count(req->id) != 0,
+                            /*decode_cache_active=*/using_cached_decode_graph,
+                            /*decode_cache_reused=*/reused_decode_graph,
+                            /*prefill_cache_active=*/using_cached_prefill_graph);
                     }
 
                     int best_token = SampleToken(output, last_token_idx, sampling_params);
@@ -3602,7 +3594,8 @@ void EngineLoop(EngineState* state) {
                         req->generated_count >= req->max_tokens) {
                         req->finished = true;
                         if (IsMoEPathTraceDumpEnabled() && !IsMoETracePlumbingDisabled()) {
-                            const auto forward_calls = densecore::GetTelemetryCpuBackend().GetMoEForwardInvocationCount();
+                            const auto forward_calls =
+                                densecore::GetTelemetryCpuBackend().GetMoEForwardInvocationCount();
                             const auto graph_wiring = GetMoEGraphWiringDebugCounter();
                             const auto traces = densecore::GetTelemetryCpuBackend().GetMoEPathTraceSnapshot();
                             std::cerr << "[MOE_TRACE_DUMP] request_id=" << req->id
@@ -3615,12 +3608,9 @@ void EngineLoop(EngineState* state) {
                                     continue;
                                 }
                                 std::cerr << "[MOE_TRACE_DUMP] request_id=" << req->id
-                                          << " layer_idx=" << entry.layer_idx
-                                          << " expert_id=" << entry.expert_id
-                                          << " seq_id=" << entry.seq_id
-                                          << " token_idx=" << entry.token_idx
-                                          << " decode_step=" << entry.decode_step
-                                          << " n_past=" << entry.n_past
+                                          << " layer_idx=" << entry.layer_idx << " expert_id=" << entry.expert_id
+                                          << " seq_id=" << entry.seq_id << " token_idx=" << entry.token_idx
+                                          << " decode_step=" << entry.decode_step << " n_past=" << entry.n_past
                                           << " force_safe_reference=" << (entry.force_safe_reference ? 1 : 0)
                                           << " safe_reference_mode=" << (entry.safe_reference_mode ? 1 : 0)
                                           << " selected_path=" << static_cast<int>(entry.selected_path) << std::endl;
@@ -3636,16 +3626,14 @@ void EngineLoop(EngineState* state) {
                                           << " output_token_index=" << entry.output_token_index
                                           << " sampled_token_id=" << entry.sampled_token_id << std::endl;
                                 std::cerr << "[SAMPLER_TRACE_DUMP] request_id=" << req->id
-                                          << " output_token_index=" << entry.output_token_index
-                                          << " top_pre_penalty=";
+                                          << " output_token_index=" << entry.output_token_index << " top_pre_penalty=";
                                 for (const auto& c : entry.top_pre_penalty) {
                                     std::cerr << c.token_id << ":" << c.pre_penalty_logit << ":" << c.post_penalty_logit
                                               << " ";
                                 }
                                 std::cerr << std::endl;
                                 std::cerr << "[SAMPLER_TRACE_DUMP] request_id=" << req->id
-                                          << " output_token_index=" << entry.output_token_index
-                                          << " top_post_penalty=";
+                                          << " output_token_index=" << entry.output_token_index << " top_post_penalty=";
                                 for (const auto& c : entry.top_post_penalty) {
                                     std::cerr << c.token_id << ":" << c.pre_penalty_logit << ":" << c.post_penalty_logit
                                               << " ";

@@ -186,7 +186,8 @@ struct MoEExecutionTraceContext {
 void MaybeLogGemma4PackedChecksum(const CpuBackend::ExpertWeights& expert, const Tensor& w1, const Tensor& w2,
                                   const Tensor& w3, const Tensor& post_gate_up, const Tensor& post_down,
                                   const MoEExecutionTraceContext* trace_ctx) {
-    if (!IsGemma4PackedChecksumDebugEnabled() || !trace_ctx || !expert.use_gelu_activation || trace_ctx->layer_idx < 0) {
+    if (!IsGemma4PackedChecksumDebugEnabled() || !trace_ctx || !expert.use_gelu_activation ||
+        trace_ctx->layer_idx < 0) {
         return;
     }
     static std::atomic<bool> logged{false};
@@ -296,8 +297,7 @@ bool DequantizePackedInt4ToF32(const CpuBackend::ExpertPackedInt4Weight& binding
             const uint8_t* packed_group = packed_row + (k_start / 2);
             for (int k = 0; k < binding.group_size; ++k) {
                 const uint8_t packed = packed_group[k / 2];
-                int8_t q = (k & 1) ? static_cast<int8_t>((packed >> 4) & 0x0F)
-                                   : static_cast<int8_t>(packed & 0x0F);
+                int8_t q = (k & 1) ? static_cast<int8_t>((packed >> 4) & 0x0F) : static_cast<int8_t>(packed & 0x0F);
                 if (q & 0x08) {
                     q |= static_cast<int8_t>(0xF0);
                 }
@@ -310,8 +310,7 @@ bool DequantizePackedInt4ToF32(const CpuBackend::ExpertPackedInt4Weight& binding
             const float zero = (num_full_groups > 0) ? row_zeros[num_full_groups - 1] : 0.0f;
             for (int64_t k = k_aligned; k < cols; ++k) {
                 const uint8_t packed = packed_row[k / 2];
-                int8_t q = (k & 1) ? static_cast<int8_t>((packed >> 4) & 0x0F)
-                                   : static_cast<int8_t>(packed & 0x0F);
+                int8_t q = (k & 1) ? static_cast<int8_t>((packed >> 4) & 0x0F) : static_cast<int8_t>(packed & 0x0F);
                 if (q & 0x08) {
                     q |= static_cast<int8_t>(0xF0);
                 }
@@ -368,7 +367,8 @@ bool ApplyScaleSidecarInPlace(const ggml_tensor* scale_tensor, int64_t rows, int
                 }
                 return false;
             }
-            const float scale = *reinterpret_cast<const float*>(scale_row + static_cast<size_t>(sc) * scale_tensor->nb[0]);
+            const float scale =
+                *reinterpret_cast<const float*>(scale_row + static_cast<size_t>(sc) * scale_tensor->nb[0]);
             values[static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(c)] *= scale;
         }
     }
@@ -877,9 +877,8 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         };
         // Path 1: Packed INT4 (custom DenseCore format)
         CpuBackend::MoEProjectionPath packed_path = CpuBackend::MoEProjectionPath::Unknown;
-        if (!safe_reference_mode &&
-            TryRunPackedInt4Projection(backend, int4_binding, src, dst, numa_node, enable_inner_parallel,
-                                       &packed_path)) {
+        if (!safe_reference_mode && TryRunPackedInt4Projection(backend, int4_binding, src, dst, numa_node,
+                                                               enable_inner_parallel, &packed_path)) {
             record_path(packed_path == CpuBackend::MoEProjectionPath::PackedInt4Fast ? "direct_hwy"
                                                                                      : "backend_gemmint4");
             return;
@@ -895,9 +894,9 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         }
         // Path 3: F32 dense matmul fallback (requires pre-dequantized weight)
         if (dense_weight.IsValid()) {
-            LogMoEMatmulPath(safe_reference_mode ? "reference_f32" : "dense_f32",
-                             static_cast<int>(src.shape[0]), static_cast<int>(src.shape[1]),
-                             static_cast<int>(dst->shape[1]), int4_binding.group_size, enable_inner_parallel);
+            LogMoEMatmulPath(safe_reference_mode ? "reference_f32" : "dense_f32", static_cast<int>(src.shape[0]),
+                             static_cast<int>(src.shape[1]), static_cast<int>(dst->shape[1]), int4_binding.group_size,
+                             enable_inner_parallel);
             record_path(safe_reference_mode ? "reference_f32" : "dense_f32");
             backend->MatMulTransB(src, dense_weight, dst, numa_node);
         }
@@ -922,8 +921,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         Tensor gate = Tensor::Make2D(gate_scratch.ptr, batch, intermediate_dim);
         const auto gate_begin =
             debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        run_projection('3', input, w3, expert.w3_int4, expert.w3, expert.w3_type, intermediate_dim, hidden_dim,
-                       &gate);
+        run_projection('3', input, w3, expert.w3_int4, expert.w3, expert.w3_type, intermediate_dim, hidden_dim, &gate);
         if (debug_ffn_timing) {
             gate_duration += (std::chrono::steady_clock::now() - gate_begin);
         }
@@ -1602,8 +1600,7 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, int layer_idx, co
                             DequantizePackedInt4ToF32(exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
                                                       static_cast<int64_t>(exp.intermediate_dim), candidate->w2.data());
                         } else if (exp.w2_type == GGML_TYPE_F32) {
-                            std::memcpy(candidate->w2.data(), exp.w2.ptr,
-                                        candidate->w2.size() * sizeof(float));
+                            std::memcpy(candidate->w2.data(), exp.w2.ptr, candidate->w2.size() * sizeof(float));
                         } else if (traits && traits->to_float) {
                             const size_t row_bytes =
                                 ggml_row_size(static_cast<ggml_type>(exp.w2_type), exp.intermediate_dim);
@@ -1688,16 +1685,17 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, int layer_idx, co
             bool dequantized_any = false;
             Tensor w1, w2, w3;
             if (!has_ggml_quant) {
-                w1 = (cached_entry && (!exp.w1_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
+                w1 = (cached_entry &&
+                      (!exp.w1_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
                       exp.w1_type != GGML_TYPE_F32)
                          ? cached_entry->w1_tensor
-                         : make_weight_f32_small(
-                               exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr, static_cast<int64_t>(exp.intermediate_dim),
-                               static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes, &dequantized_any);
-                w2 = (cached_entry && (exp.w2_scale_tensor ||
-                                       ((!exp.w2_int4.IsValid() || safe_reference_mode ||
-                                         !CanUsePackedInt4MoEFastPath()) &&
-                                        exp.w2_type != GGML_TYPE_F32)))
+                         : make_weight_f32_small(exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr,
+                                                 static_cast<int64_t>(exp.intermediate_dim),
+                                                 static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes,
+                                                 &dequantized_any);
+                w2 = (cached_entry && (exp.w2_scale_tensor || ((!exp.w2_int4.IsValid() || safe_reference_mode ||
+                                                                !CanUsePackedInt4MoEFastPath()) &&
+                                                               exp.w2_type != GGML_TYPE_F32)))
                          ? cached_entry->w2_tensor
                          : make_weight_f32_small(exp.w2.ptr, exp.w2_type, exp.w2_int4, exp.w2_scale_tensor,
                                                  static_cast<int64_t>(exp.hidden_dim),
@@ -1744,8 +1742,7 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, int layer_idx, co
                     }
                 }
             }
-            DispatchExpertFFNImpl(this, expert_numa_node, expert_input, exp, w1, w2, w3, &expert_out,
-                                  true, &trace_ctx);
+            DispatchExpertFFNImpl(this, expert_numa_node, expert_input, exp, w1, w2, w3, &expert_out, true, &trace_ctx);
 
             float* dst = out_data + static_cast<size_t>(token_idx) * hidden_dim;
             const float* src = small_decode_output_scratch.ptr;
@@ -1836,8 +1833,9 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, int layer_idx, co
     }
 
     if (IsMoEMatmulPathDebugEnabled()) {
-        std::fprintf(stderr, "[MOE_REORDER] assignments=%d active_experts=%zu token_indices=",
-                     reorder_map.total_assignments, active_work.size());
+        std::fprintf(stderr,
+                     "[MOE_REORDER] assignments=%d active_experts=%zu token_indices=", reorder_map.total_assignments,
+                     active_work.size());
         const int trace_count = std::min(reorder_map.total_assignments, 32);
         for (int i = 0; i < trace_count; ++i) {
             std::fprintf(stderr, "%s%d", i == 0 ? "" : ",", reorder_map.token_indices[i]);
@@ -2049,10 +2047,9 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, int layer_idx, co
     // invalid-mutex crashes in production-style runs. Keep the reordered MoE
     // path, but serialize expert execution on ARM until the parallel cache
     // coordination is made safe.
-    const bool parallelize_experts =
-        !small_decode_step && batch_size > 1 &&
-        active_work.size() >= static_cast<size_t>(std::max(4, worker_threads / 2)) &&
-        (!arm_disable_registry_dequant_cache || !dequant_cache_enabled);
+    const bool parallelize_experts = !small_decode_step && batch_size > 1 &&
+                                     active_work.size() >= static_cast<size_t>(std::max(4, worker_threads / 2)) &&
+                                     (!arm_disable_registry_dequant_cache || !dequant_cache_enabled);
     if (IsMoECachePolicyDebugEnabled()) {
         std::fprintf(stderr,
                      "[MOE_CACHE_POLICY] arm_disable_registry_dequant_cache=%d registry_present=%d "
@@ -2060,7 +2057,7 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, int layer_idx, co
                      arm_disable_registry_dequant_cache ? 1 : 0, registry ? 1 : 0, dequant_cache_enabled ? 1 : 0,
                      parallelize_experts ? 1 : 0,
                      arm_disable_registry_dequant_cache ? "arm_mutable_dequant_cache_bypassed"
-                                                         : "cache_lane_available");
+                                                        : "cache_lane_available");
     }
 
     auto run_active_work_range = [&](int start_idx, int end_idx, bool allow_inner_parallel) {
@@ -2225,10 +2222,10 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, int layer_idx, co
                 w2 = ((exp.w2_int4.IsValid() && !safe_reference_mode && CanUsePackedInt4MoEFastPath()) &&
                       !exp.w2_scale_tensor)
                          ? Tensor()
-                         : ((exp.w2_type == GGML_TYPE_F32) && !exp.w2_scale_tensor)
-                               ? Tensor::Make2D(exp.w2.ptr, static_cast<int64_t>(exp.hidden_dim),
-                                                static_cast<int64_t>(exp.intermediate_dim))
-                               : cached_entry->w2_tensor;
+                     : ((exp.w2_type == GGML_TYPE_F32) && !exp.w2_scale_tensor)
+                         ? Tensor::Make2D(exp.w2.ptr, static_cast<int64_t>(exp.hidden_dim),
+                                          static_cast<int64_t>(exp.intermediate_dim))
+                         : cached_entry->w2_tensor;
                 if (exp.w3.ptr != nullptr) {
                     w3 = (exp.w3_int4.IsValid() && !safe_reference_mode && CanUsePackedInt4MoEFastPath()) ? Tensor()
                          : (exp.w3_type == GGML_TYPE_F32)
@@ -2241,19 +2238,16 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, int layer_idx, co
                 // Skip F32 dequant for ggml-quantized experts -> quantized GEMV handles them directly
                 const bool has_ggml_quant_gen = !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp);
                 if (!has_ggml_quant_gen) {
-                    w1 = make_weight_f32(exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr,
-                                         static_cast<int64_t>(exp.intermediate_dim),
-                                         static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes,
-                                         &dequantized_any);
-                    w2 = make_weight_f32(exp.w2.ptr, exp.w2_type, exp.w2_int4, exp.w2_scale_tensor,
-                                         static_cast<int64_t>(exp.hidden_dim),
-                                         static_cast<int64_t>(exp.intermediate_dim), w2_dequant, &dequantized_bytes,
-                                         &dequantized_any);
+                    w1 = make_weight_f32(
+                        exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr, static_cast<int64_t>(exp.intermediate_dim),
+                        static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes, &dequantized_any);
+                    w2 = make_weight_f32(
+                        exp.w2.ptr, exp.w2_type, exp.w2_int4, exp.w2_scale_tensor, static_cast<int64_t>(exp.hidden_dim),
+                        static_cast<int64_t>(exp.intermediate_dim), w2_dequant, &dequantized_bytes, &dequantized_any);
                     if (exp.w3.ptr != nullptr) {
-                        w3 = make_weight_f32(exp.w3.ptr, exp.w3_type, exp.w3_int4, nullptr,
-                                             static_cast<int64_t>(exp.intermediate_dim),
-                                             static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes,
-                                             &dequantized_any);
+                        w3 = make_weight_f32(
+                            exp.w3.ptr, exp.w3_type, exp.w3_int4, nullptr, static_cast<int64_t>(exp.intermediate_dim),
+                            static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes, &dequantized_any);
                     }
                 }
                 // else: w1/w2/w3 remain empty — DispatchExpertFFNImpl uses quantized GEMV
@@ -2278,8 +2272,7 @@ void CpuBackend::ForwardMoE(const TransformerLayer* layer_key, int layer_idx, co
             trace_ctx.layer_idx = layer_idx;
             trace_ctx.expert_id = work.expert_id;
             trace_ctx.token_idx = (work.count == 1) ? reorder_map.token_indices[static_cast<size_t>(work.start)] : -1;
-            if (batch && trace_ctx.token_idx >= 0 &&
-                trace_ctx.token_idx < static_cast<int>(batch->seq_id.size())) {
+            if (batch && trace_ctx.token_idx >= 0 && trace_ctx.token_idx < static_cast<int>(batch->seq_id.size())) {
                 trace_ctx.seq_id = batch->seq_id[static_cast<size_t>(trace_ctx.token_idx)];
                 if (trace_ctx.seq_id >= 0 && trace_ctx.seq_id < static_cast<int>(batch->n_past.size())) {
                     trace_ctx.n_past = batch->n_past[static_cast<size_t>(trace_ctx.seq_id)];
@@ -2369,8 +2362,7 @@ void CpuBackend::RecordMoEPathTrace(const MoEPathTraceEntry& entry) {
     moe_path_trace_.push_back(entry);
     if (moe_path_trace_.size() > 512) {
         moe_path_trace_.erase(moe_path_trace_.begin(),
-                              moe_path_trace_.begin() +
-                                  static_cast<std::ptrdiff_t>(moe_path_trace_.size() - 512));
+                              moe_path_trace_.begin() + static_cast<std::ptrdiff_t>(moe_path_trace_.size() - 512));
     }
 }
 

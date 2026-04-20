@@ -835,8 +835,8 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
         if (block_id < 0 || block_id >= ud->cache->max_blocks) {
             continue;
         }
-        k_blocks[bi] = reinterpret_cast<const uint8_t*>(ud->cache->GetKBlockPtr(block_id, ud->layer));
-        v_blocks[bi] = reinterpret_cast<const uint8_t*>(ud->cache->GetVBlockPtr(block_id, ud->layer));
+        k_blocks[bi] = reinterpret_cast<const uint8_t*>(ud->cache->GetKBlockPtr(block_id, ud->read_layer));
+        v_blocks[bi] = reinterpret_cast<const uint8_t*>(ud->cache->GetVBlockPtr(block_id, ud->read_layer));
     }
 
     thread_local std::vector<float> k_head_scratch;
@@ -898,7 +898,10 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
             for (int d = 0; d < head_dim; ++d) {
                 dot += q_head[d] * k_head[d];
             }
-            const float score = dot * scale;
+            float score = dot * scale;
+            if (ud->logit_softcap > 0.0f && std::isfinite(score)) {
+                score = std::tanh(score / ud->logit_softcap) * ud->logit_softcap;
+            }
             scores[static_cast<size_t>(t)] = score;
             if (std::isfinite(score) && score > max_score) {
                 max_score = score;
@@ -1004,8 +1007,8 @@ static void LogPagedAttentionEagerReferenceProbe(const PagedAttentionUserData* u
             continue;
         }
 
-        ud->cache->ReadKSlot(block_id, ud->layer, slot, k_slot.data());
-        ud->cache->ReadVSlot(block_id, ud->layer, slot, v_slot.data());
+        ud->cache->ReadKSlot(block_id, ud->read_layer, slot, k_slot.data());
+        ud->cache->ReadVSlot(block_id, ud->read_layer, slot, v_slot.data());
 
         for (int kv_head = 0; kv_head < n_head_kv; ++kv_head) {
             const float* src_k = k_slot.data() + static_cast<size_t>(kv_head) * ud->head_dim;
@@ -1020,9 +1023,10 @@ static void LogPagedAttentionEagerReferenceProbe(const PagedAttentionUserData* u
         }
     }
 
+    const float scale =
+        ud->attention_scale > 0.0f ? ud->attention_scale : (1.0f / std::sqrt(static_cast<float>(ud->head_dim)));
     ComputeFlashAttentionReference(q_token, k_all.data(), v_all.data(), ref_out.data(), ud->n_head, n_head_kv, 1,
-                                   context_len, ud->head_dim, 1.0f / std::sqrt(static_cast<float>(ud->head_dim)),
-                                   false, 0, 0, -1);
+                                   context_len, ud->head_dim, scale, false, 0, 0, -1, ud->logit_softcap);
 
     const int h_begin = std::max(0, h_start);
     const int h_limit = std::min(ud->n_head, h_end);
@@ -1166,8 +1170,12 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     const char* v_base = reinterpret_cast<const char*>(v_tensor->data);
     const size_t k_token_stride = static_cast<size_t>(k_tensor->nb[2]);
     const size_t v_token_stride = static_cast<size_t>(v_tensor->nb[2]);
+    const bool write_current_kv = ud->write_current_kv;
 
-    if (token_parallel_mode) {
+    if (!write_current_kv) {
+        // Shared Gemma4 reader layers reuse the source-layer cache and must not
+        // publish their local K/V into that source cache.
+    } else if (token_parallel_mode) {
         // Each thread writes KV for exactly token_idx == ith. No barrier needed
         // because each thread only reads from its own token's KV cache slot.
         const int token_idx = ith;
@@ -1186,8 +1194,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                                 k_base + static_cast<size_t>(token_idx) * k_token_stride);
                             const float* v_src = reinterpret_cast<const float*>(
                                 v_base + static_cast<size_t>(token_idx) * v_token_stride);
-                            ud->cache->WriteKSlot(block_id, ud->layer, slot, k_src);
-                            ud->cache->WriteVSlot(block_id, ud->layer, slot, v_src);
+                            ud->cache->WriteKSlot(block_id, ud->write_layer, slot, k_src);
+                            ud->cache->WriteVSlot(block_id, ud->write_layer, slot, v_src);
                         }
                     }
                 }
@@ -1214,8 +1222,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                             if (block_id >= 0 && block_id < ud->cache->max_blocks) {
                                 const float* k_src = reinterpret_cast<const float*>(k_base);
                                 const float* v_src = reinterpret_cast<const float*>(v_base);
-                                ud->cache->WriteKSlot(block_id, ud->layer, slot, k_src);
-                                ud->cache->WriteVSlot(block_id, ud->layer, slot, v_src);
+                                ud->cache->WriteKSlot(block_id, ud->write_layer, slot, k_src);
+                                ud->cache->WriteVSlot(block_id, ud->write_layer, slot, v_src);
                             }
                         }
                     }
@@ -1283,8 +1291,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
 
             const float* k_src = reinterpret_cast<const float*>(k_base + static_cast<size_t>(i) * k_token_stride);
             const float* v_src = reinterpret_cast<const float*>(v_base + static_cast<size_t>(i) * v_token_stride);
-            ud->cache->WriteKSlot(block_id, ud->layer, slot, k_src);
-            ud->cache->WriteVSlot(block_id, ud->layer, slot, v_src);
+            ud->cache->WriteKSlot(block_id, ud->write_layer, slot, k_src);
+            ud->cache->WriteVSlot(block_id, ud->write_layer, slot, v_src);
         }
 
         const int writers_done = ud->kv_writers_done.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -1348,7 +1356,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     }
 
     const bool use_hwy = IsPagedAttentionHwyEnabled();
-    const float scale = 1.0f / std::sqrt(static_cast<float>(ud->head_dim));
+    const float scale =
+        ud->attention_scale > 0.0f ? ud->attention_scale : (1.0f / std::sqrt(static_cast<float>(ud->head_dim)));
     const char* q_base = reinterpret_cast<const char*>(q_tensor->data);
     char* out_base = reinterpret_cast<char*>(dst->data);
     const size_t q_token_stride = static_cast<size_t>(q_tensor->nb[2]);
@@ -1381,9 +1390,11 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     int cached_ptr_seq_idx = -1;
     const std::vector<int>* cached_ptr_block_table = nullptr;
     int cached_context_len = 0;
+    int cached_context_start_pos = 0;
     int cached_pos_i = -1;
     KVRetentionSpan cached_retained_span{};
     bool cached_retention_truncated = false;
+    bool cached_noncontiguous_retention = false;
     bool cached_token_valid = false;
     const float* cached_q_token = nullptr;
     float* cached_out_token = nullptr;
@@ -1412,8 +1423,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                     if (block_id < 0 || block_id >= ud->cache->max_blocks) {
                         continue;
                     }
-                    (*ud->shared_k_block_ptrs)[bi] = ud->cache->GetKBlockPtr(block_id, ud->layer);
-                    (*ud->shared_v_block_ptrs)[bi] = ud->cache->GetVBlockPtr(block_id, ud->layer);
+                    (*ud->shared_k_block_ptrs)[bi] = ud->cache->GetKBlockPtr(block_id, ud->read_layer);
+                    (*ud->shared_v_block_ptrs)[bi] = ud->cache->GetVBlockPtr(block_id, ud->read_layer);
                 }
             }
             ud->shared_block_ptrs_ready.store(1, std::memory_order_release);
@@ -1441,9 +1452,11 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
             cached_seq_idx = -1;
             cached_block_table = nullptr;
             cached_context_len = 0;
+            cached_context_start_pos = 0;
             cached_pos_i = -1;
             cached_retained_span = {};
             cached_retention_truncated = false;
+            cached_noncontiguous_retention = false;
             cached_token_valid = false;
             cached_q_token = nullptr;
             cached_out_token = nullptr;
@@ -1462,8 +1475,25 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                         cached_seq_idx = seq_idx;
                         cached_block_table = &block_table;
                         cached_pos_i = pos_i;
-                        cached_retained_span = ComputeKVRetentionSpan(n_past_i, GetKVRetentionPolicy());
+                        KVRetentionPolicy retention_policy = GetKVRetentionPolicy();
+                        if (ud->force_full_history) {
+                            retention_policy.enabled = false;
+                            retention_policy.sliding_window = -1;
+                            retention_policy.sink_tokens = 0;
+                        }
+                        if (ud->sliding_window >= 0) {
+                            retention_policy.enabled = true;
+                            retention_policy.sliding_window = ud->sliding_window;
+                            retention_policy.sink_tokens = 0;
+                        }
+                        cached_retained_span = ComputeKVRetentionSpan(n_past_i, retention_policy);
                         cached_retention_truncated = cached_retained_span.history_kept < n_past_i;
+                        cached_noncontiguous_retention =
+                            cached_retention_truncated && cached_retained_span.sink_kept > 0;
+                        cached_context_start_pos =
+                            (cached_retention_truncated && cached_retained_span.sink_kept == 0)
+                                ? cached_retained_span.tail_start
+                                : 0;
                         const int max_context = static_cast<int>(block_table.size()) * BLOCK_SIZE;
                         cached_context_len = std::max(1, std::min(cached_retained_span.history_kept + 1, max_context));
                         cached_token_valid = cached_context_len > 0;
@@ -1484,7 +1514,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         const float* q_token = cached_q_token;
         const auto& block_table = *cached_block_table;
 
-        if (!hwy_ready || cached_retention_truncated) {
+        if (!hwy_ready || cached_noncontiguous_retention) {
             ComputePagedAttentionScalarHeads(ud, block_table, cached_context_len, cached_retained_span, cached_pos_i,
                                              scale, q_token, out_token, h_start, h_end);
             if (ShouldRunPagedAttentionEagerReferenceProbe(ud->layer, token_idx)) {
@@ -1504,8 +1534,8 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                     if (block_id < 0 || block_id >= ud->cache->max_blocks) {
                         continue;
                     }
-                    k_block_ptrs[bi] = ud->cache->GetKBlockPtr(block_id, ud->layer);
-                    v_block_ptrs[bi] = ud->cache->GetVBlockPtr(block_id, ud->layer);
+                    k_block_ptrs[bi] = ud->cache->GetKBlockPtr(block_id, ud->read_layer);
+                    v_block_ptrs[bi] = ud->cache->GetVBlockPtr(block_id, ud->read_layer);
                 }
             }
             cached_ptr_seq_idx = cached_seq_idx;
@@ -1516,10 +1546,11 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
             q_token, shared_k_block_ptrs_data ? shared_k_block_ptrs_data : k_block_ptrs.data(),
             shared_v_block_ptrs_data ? shared_v_block_ptrs_data : v_block_ptrs.data(), cache_type_id, ud->n_head,
             ud->head_dim, v_head_dim, ud->cache->n_head_kv, static_cast<int32_t>(block_table.size()),
-            cached_context_len, static_cast<int64_t>(k_cache_layout.head_stride_bytes),
+            cached_context_len, cached_context_start_pos, static_cast<int64_t>(k_cache_layout.head_stride_bytes),
             static_cast<int64_t>(k_cache_layout.slot_stride_bytes),
             static_cast<int64_t>(v_cache_layout.head_stride_bytes),
-            static_cast<int64_t>(v_cache_layout.slot_stride_bytes), scale, out_token, h_start, h_end, ud->n_head);
+            static_cast<int64_t>(v_cache_layout.slot_stride_bytes), scale, ud->logit_softcap, out_token, h_start,
+            h_end, ud->n_head);
 
         if (ShouldRunPagedAttentionReferenceProbe(ud->layer, token_idx)) {
             thread_local std::vector<float> scalar_ref;

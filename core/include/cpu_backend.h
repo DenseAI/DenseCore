@@ -350,16 +350,16 @@ public:
      * @brief Expert weights for a single MoE expert (w1, w2, w3)
      */
     struct ExpertWeights {
-        ExpertWeight w1;                   ///< Gate projection [hidden, intermediate]
-        ExpertWeight w2;                   ///< Down projection [intermediate, hidden]
-        ExpertWeight w3;                   ///< Up projection [hidden, intermediate] (SwiGLU)
-        int hidden_dim;                    ///< Model hidden dimension
-        int intermediate_dim;              ///< FFN intermediate dimension
-        bool use_gelu_activation = false;  ///< Gemma4-style gated GELU instead of SiLU
-        bool force_safe_reference = false; ///< Force F32 reference matmul path for parity-sensitive experts
-        int w1_type = 0;                   ///< ggml_type of w1 (0 = GGML_TYPE_F32)
-        int w2_type = 0;                   ///< ggml_type of w2
-        int w3_type = 0;                   ///< ggml_type of w3
+        ExpertWeight w1;                    ///< Gate projection [hidden, intermediate]
+        ExpertWeight w2;                    ///< Down projection [intermediate, hidden]
+        ExpertWeight w3;                    ///< Up projection [hidden, intermediate] (SwiGLU)
+        int hidden_dim;                     ///< Model hidden dimension
+        int intermediate_dim;               ///< FFN intermediate dimension
+        bool use_gelu_activation = false;   ///< Gemma4-style gated GELU instead of SiLU
+        bool force_safe_reference = false;  ///< Force F32 reference matmul path for parity-sensitive experts
+        int w1_type = 0;                    ///< ggml_type of w1 (0 = GGML_TYPE_F32)
+        int w2_type = 0;                    ///< ggml_type of w2
+        int w3_type = 0;                    ///< ggml_type of w3
         const struct ggml_tensor* gate_up_tensor = nullptr;
         const struct ggml_tensor* w1_tensor = nullptr;
         const struct ggml_tensor* w2_tensor = nullptr;

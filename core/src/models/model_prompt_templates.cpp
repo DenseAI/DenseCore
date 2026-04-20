@@ -510,7 +510,8 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
                 }
             } else if (role == "user") {
                 std::string content = TrimCopy(messages[i].content);
-                if (!thinking_enabled && static_cast<int>(i) == last_user_index && SupportsQwenNoThinkDirective(model)) {
+                if (!thinking_enabled && static_cast<int>(i) == last_user_index &&
+                    SupportsQwenNoThinkDirective(model)) {
                     content = AppendQwenNoThinkDirective(std::move(content));
                 }
                 append_block(profile.user_role, content);

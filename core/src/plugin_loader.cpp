@@ -31,6 +31,7 @@
 #ifdef DENSECORE_USE_SPDLOG
 #include <spdlog/fmt/bundled/printf.h>
 #include <spdlog/spdlog.h>
+#define ENT_LOG_DEBUG(format_str, ...) spdlog::debug("{}", fmt::sprintf(format_str, ##__VA_ARGS__))
 #define ENT_LOG_INFO(format_str, ...) spdlog::info("{}", fmt::sprintf(format_str, ##__VA_ARGS__))
 #define ENT_LOG_WARN(format_str, ...) spdlog::warn("{}", fmt::sprintf(format_str, ##__VA_ARGS__))
 #define ENT_LOG_ERROR(format_str, ...) spdlog::error("{}", fmt::sprintf(format_str, ##__VA_ARGS__))
@@ -55,6 +56,7 @@ inline void EntLog(FILE* stream, const char* level, const char* fmt, ...) {
 
 }  // namespace
 
+#define ENT_LOG_DEBUG(fmt, ...) EntLog(stdout, "DEBUG", fmt, ##__VA_ARGS__)
 #define ENT_LOG_INFO(fmt, ...) EntLog(stdout, "INFO", fmt, ##__VA_ARGS__)
 #define ENT_LOG_WARN(fmt, ...) EntLog(stderr, "WARN", fmt, ##__VA_ARGS__)
 #define ENT_LOG_ERROR(fmt, ...) EntLog(stderr, "ERROR", fmt, ##__VA_ARGS__)
@@ -297,7 +299,7 @@ int DenseCoreEntLoadPlugin(const char* plugin_path, void* engine) {
     std::string resolved_path;
     const int path_result = ResolvePluginPath(plugin_path, &resolved_path);
     if (path_result == 1) {
-        ENT_LOG_INFO("Plugin not found at '%s' (running in OSS mode)", resolved_path.c_str());
+        ENT_LOG_DEBUG("Plugin not found at '%s' (running in OSS mode)", resolved_path.c_str());
         return 1;
     }
     if (path_result < 0) {
