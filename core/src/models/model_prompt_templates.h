@@ -4,8 +4,8 @@
 #include <string>
 #include <vector>
 
-#include "engine_internal.h"
-#include "model_types.h"
+#include "densecore/models/model_types.h"
+#include "runtime/engine_internal.h"
 
 namespace densecore::models {
 

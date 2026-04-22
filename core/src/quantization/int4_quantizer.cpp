@@ -14,7 +14,7 @@
 #include <iostream>
 #include <limits>
 
-#include "simd_ops.h"
+#include "densecore/simd/simd_ops.h"
 
 #ifdef _WIN32
 #include <malloc.h>  // _aligned_malloc

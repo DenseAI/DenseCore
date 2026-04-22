@@ -7,7 +7,7 @@
 #define DENSECORE_LLM_CONFIG_GENERATOR_H
 
 #include "densecore/graph/graph_schema.h"
-#include "model_types.h"  // For TransformerModel
+#include "densecore/models/model_types.h"  // For TransformerModel
 
 namespace densecore {
 

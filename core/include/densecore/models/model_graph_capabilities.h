@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-#include "model_types.h"
+#include "densecore/models/model_types.h"
 
 namespace densecore::models {
 

@@ -7,7 +7,7 @@
  *
  * Design Goals:
  * - Specific exception types for different error categories
- * - Integration with existing ErrorCode from utils/error.h
+ * - Integration with existing ErrorCode from densecore/utils/error.h
  * - Rich error messages with context
  *
  * Usage:
@@ -28,7 +28,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "utils/error.h"  // Use existing ErrorCode
+#include "densecore/utils/error.h"  // Use existing ErrorCode
 
 namespace densecore {
 

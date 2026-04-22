@@ -456,7 +456,7 @@ struct Tensor {
 // Forward declarations for UnifiedTensorRef
 // =============================================================================
 
-// Forward declare QuantizedTensorView (defined in quantized_tensor.h)
+// Forward declare QuantizedTensorView (defined in densecore/quantization/quantized_tensor.h)
 struct QuantizedTensorView;
 
 /**
@@ -584,7 +584,7 @@ struct UnifiedTensorRef {
     /**
      * @brief Get raw data pointer (works for both kinds)
      *
-     * @note For quantized tensors, include quantized_tensor.h and use
+     * @note For quantized tensors, include densecore/quantization/quantized_tensor.h and use
      *       AsQuantized().data for direct access.
      */
     const void* Data() const;
@@ -592,7 +592,7 @@ struct UnifiedTensorRef {
     /**
      * @brief Get data type (FP32, INT4, etc.)
      *
-     * @note For quantized tensors, include quantized_tensor.h and use
+     * @note For quantized tensors, include densecore/quantization/quantized_tensor.h and use
      *       AsQuantized().type for direct access.
      */
     DType GetDType() const;

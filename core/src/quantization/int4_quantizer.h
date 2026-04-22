@@ -15,8 +15,8 @@
 #include <memory>
 #include <vector>
 
-#include "quantization/int4_types.h"
-#include "quantizer.h"
+#include "densecore/quantization/int4_types.h"
+#include "densecore/quantization/quantizer.h"
 
 namespace densecore {
 

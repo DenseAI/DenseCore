@@ -5,7 +5,7 @@
  * Implements lock-free expert hit tracking with EMA-based hotness scoring.
  */
 
-#include "moe/profiler.h"
+#include "densecore/moe/profiler.h"
 
 #include <algorithm>
 #include <memory>

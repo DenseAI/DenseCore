@@ -14,10 +14,10 @@
  * This leverages optimized MatMul kernels for the heavy lifting.
  */
 
-#include "cpu_backend.h"
+#include "densecore/backend/cpu_backend.h"
 #include "densecore/hal/op_registry.h"
 #include "densecore/hal/transformer_ops.h"
-#include "optimization_bridge.h"
+#include "densecore/runtime/optimization_bridge.h"
 
 #include <algorithm>
 #include <cmath>

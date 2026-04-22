@@ -1,7 +1,7 @@
 #ifndef DENSECORE_WIDTH_PRUNER_H
 #define DENSECORE_WIDTH_PRUNER_H
 
-#include "pruner.h"
+#include "densecore/pruning/pruner.h"
 
 namespace densecore {
 

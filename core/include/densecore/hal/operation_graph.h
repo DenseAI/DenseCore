@@ -43,7 +43,7 @@
 
 #include "densecore/hal/tensor.h"
 
-#include "accelerator_traits.h"
+#include "densecore/backend/accelerator_traits.h"
 
 namespace densecore {
 

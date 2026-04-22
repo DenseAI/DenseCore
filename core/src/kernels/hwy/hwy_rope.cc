@@ -129,7 +129,7 @@ void ApplyRoPE_Hwy(float* out, const float* in, const float* cos_sin, const int*
 
 }  // namespace hwy_kernels
 
-// C++ linkage trampoline called from simd_ops.h inline ApplyRoPE()
+// C++ linkage trampoline called from densecore/simd/simd_ops.h inline ApplyRoPE()
 namespace simd {
 void ApplyRoPE_HwyDispatch(float* out, const float* in, const float* cos_sin, const int* positions, int n_tokens,
                            int head_dim, int rope_dim, int max_seq_len, int ith, int nth) {

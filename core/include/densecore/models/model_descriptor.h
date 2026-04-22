@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string_view>
 
-#include "model_types.h"
+#include "densecore/models/model_types.h"
 
 namespace densecore::models {
 

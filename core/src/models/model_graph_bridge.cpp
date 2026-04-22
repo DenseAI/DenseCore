@@ -17,7 +17,7 @@
 #include "densecore/hal/transformer_ops_ext.h"
 #include "densecore/models/graph_registry.h"
 #include "densecore/models/model_graph_capabilities.h"
-#include "model_types.h"
+#include "densecore/models/model_types.h"
 
 #include "ggml.h"
 

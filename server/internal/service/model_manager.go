@@ -113,7 +113,7 @@ type ModelManagerConfig struct {
 func DefaultModelManagerConfig() ModelManagerConfig {
 	return ModelManagerConfig{
 		MaxModels:      2,
-		DefaultThreads: 4,
+		DefaultThreads: 0,
 		EvictionPolicy: "lru",
 	}
 }
@@ -140,9 +140,6 @@ type ModelManager struct {
 func NewModelManager(cfg ModelManagerConfig) *ModelManager {
 	if cfg.MaxModels <= 0 {
 		cfg.MaxModels = 2
-	}
-	if cfg.DefaultThreads <= 0 {
-		cfg.DefaultThreads = 4
 	}
 
 	return &ModelManager{

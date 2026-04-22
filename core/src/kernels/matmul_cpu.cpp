@@ -10,10 +10,10 @@
 #include "densecore/hal/transformer_ops.h"
 #include "densecore/hal/typed_tensor.h"
 
-#include "../include/cpu_backend.h"
-#include "../include/matmul_backend.h"
-#include "../include/simd_platform.h"
-#include "../thread_pool_impl.h"  // Corrected path (src/thread_pool_impl.h)
+#include "../backend/thread_pool_impl.h"  // Corrected path (src/backend/thread_pool_impl.h)
+#include "densecore/backend/cpu_backend.h"
+#include "densecore/backend/matmul_backend.h"
+#include "densecore/simd/simd_platform.h"
 
 #include <algorithm>
 #include <cstring>

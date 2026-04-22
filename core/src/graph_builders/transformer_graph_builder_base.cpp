@@ -3,10 +3,10 @@
  * @brief Base implementation for TransformerGraphBuilder common utilities
  */
 
+#include "densecore/memory/kv_cache.h"
+#include "densecore/models/model_types.h"
 #include "densecore/models/transformer_graph_builder.h"
-#include "inference.h"
-#include "kv_cache.h"
-#include "model_types.h"
+#include "densecore/runtime/inference.h"
 
 #include <algorithm>
 #include <cstdlib>

@@ -8,10 +8,9 @@
 #include <memory>
 #include <mutex>
 
+#include "densecore/backend/apple/metal_backend.h"
 #include "densecore/hal/op_registry.h"
 #include "densecore/hal/transformer_ops.h"
-
-#include "metal_backend.h"
 
 namespace densecore {
 namespace kernels {

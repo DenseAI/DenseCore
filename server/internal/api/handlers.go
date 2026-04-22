@@ -237,10 +237,19 @@ func (h *Handler) CompletionHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func completionRequestToChatRequest(req domain.CompletionRequest) domain.ChatCompletionRequest {
+	rawPrompt := ""
+	var chatTemplateKwargs *domain.ChatTemplateKwargs
+	if req.ParityMode {
+		rawPrompt = req.Prompt
+	} else {
+		enableThinking := false
+		chatTemplateKwargs = &domain.ChatTemplateKwargs{EnableThinking: &enableThinking}
+	}
 	return domain.ChatCompletionRequest{
 		Model:                req.Model,
 		Messages:             []domain.Message{{Role: "user", Content: req.Prompt}},
-		RawPrompt:            req.Prompt,
+		RawPrompt:            rawPrompt,
+		ChatTemplateKwargs:   chatTemplateKwargs,
 		MaxTokens:            req.MaxTokens,
 		Temperature:          req.Temperature,
 		TopP:                 req.TopP,

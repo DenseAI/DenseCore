@@ -10,8 +10,8 @@
 
 #include "densecore/hal/op_registry.h"
 #include "densecore/hal/transformer_ops.h"
+#include "densecore/simd/simd_ops.h"
 #include "kernels/hwy/hwy_kernels.h"
-#include "simd_ops.h"
 
 #include <cmath>
 #include <cstring>

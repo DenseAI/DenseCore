@@ -334,7 +334,7 @@ void AdaLN_Hwy(const float* input, const float* scale, const float* shift, float
 
 }  // namespace hwy_kernels
 
-// C++ linkage trampoline called from simd_ops.h or adaln.cpp inline
+// C++ linkage trampoline called from densecore/simd/simd_ops.h or adaln.cpp inline
 namespace simd {
 void AddRMSNorm_HwyDispatch(float* x_out, const float* x, const float* residual, const float* weight, size_t n,
                             float eps) {

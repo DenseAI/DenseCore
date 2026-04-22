@@ -8,7 +8,7 @@
 #define HWY_TARGET_INCLUDE "kernels/hwy/hwy_paged_attention.cc"
 #include "hwy/foreach_target.h"
 
-#include "kv_cache.h"
+#include "densecore/memory/kv_cache.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -19,9 +19,9 @@
 #include <vector>
 
 
-// Use structs from kv_cache.h
+// Use structs from densecore/memory/kv_cache.h
 // block_q8_0, QK8_0 are available via densecore namespace or global if defined there.
-// kv_cache.h defines them in global scope based on the file content I wrote.
+// densecore/memory/kv_cache.h defines them in global scope based on the file content I wrote.
 
 #ifndef DENSECORE_HWY_FP16_TO_FP32_DEFINED_
 #define DENSECORE_HWY_FP16_TO_FP32_DEFINED_

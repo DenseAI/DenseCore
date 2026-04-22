@@ -28,10 +28,9 @@
 #include <cstring>
 #include <string>
 
+#include "densecore/backend/apple/apple_silicon.h"
+#include "densecore/backend/apple/hybrid_scheduler.h"
 #include "densecore/hal/backend_selector.h"
-
-#include "../include/apple_silicon.h"
-#include "../include/hybrid_scheduler.h"
 
 namespace densecore {
 

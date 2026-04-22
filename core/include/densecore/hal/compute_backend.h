@@ -49,9 +49,9 @@
  * // No copy back needed - CPU reads same memory
  * @endcode
  *
- * @see accelerator_traits.h for hardware capability queries
+ * @see densecore/backend/accelerator_traits.h for hardware capability queries
  * @see operation_graph.h for graph capture/execution
- * @see quantized_tensor.h for quantization metadata
+ * @see densecore/quantization/quantized_tensor.h for quantization metadata
  */
 
 #ifndef DENSECORE_COMPUTE_BACKEND_H
@@ -64,10 +64,10 @@
 #include <stdexcept>
 #include <string>
 
-#include "accelerator_traits.h"
+#include "densecore/backend/accelerator_traits.h"
 #include "densecore/hal/inference_profile.h"
 #include "densecore/hal/operation_graph.h"
-#include "quantized_tensor.h"
+#include "densecore/quantization/quantized_tensor.h"
 #include "tensor.h"
 
 #include <unordered_map>

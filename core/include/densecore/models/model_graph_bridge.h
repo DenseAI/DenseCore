@@ -23,7 +23,7 @@
 #include <string>
 
 // Forward declarations
-#include "model_types.h"
+#include "densecore/models/model_types.h"
 
 namespace densecore {
 

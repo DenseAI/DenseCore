@@ -31,22 +31,22 @@
 // =============================================================================
 // DenseCore Includes
 // =============================================================================
-#include "cpu_backend.h"
-#include "flash_attention.h"
-#include "gemm_config.h"
-#include "hardware_topology.h"
-#include "inference.h"
-#include "lora_storage.h"
-#include "matmul_backend.h"
-#include "optimization_bridge.h"
-#include "simd_platform.h"
+#include "densecore/backend/cpu_backend.h"
+#include "densecore/backend/flash_attention.h"
+#include "densecore/backend/gemm_config.h"
+#include "densecore/backend/hardware_topology.h"
+#include "densecore/backend/matmul_backend.h"
+#include "densecore/models/lora_storage.h"
+#include "densecore/runtime/inference.h"
+#include "densecore/runtime/optimization_bridge.h"
+#include "densecore/simd/simd_platform.h"
 
+#include "backend/thread_pool_impl.h"
 #include "densecore/hal/op_registry.h"
 #include "densecore/hal/transformer_ops.h"
 #include "densecore/hal/typed_tensor.h"
+#include "densecore/moe/moe_routing.h"
 #include "ggml.h"
-#include "moe/moe_routing.h"
-#include "thread_pool_impl.h"
 
 // =============================================================================
 // Platform-Specific Includes

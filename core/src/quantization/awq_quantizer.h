@@ -3,7 +3,7 @@
 
 #include <vector>
 
-#include "quantizer.h"
+#include "densecore/quantization/quantizer.h"
 
 namespace densecore {
 

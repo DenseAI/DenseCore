@@ -1,6 +1,0 @@
-#ifndef DENSECORE_SCHEDULER_SRC_WRAPPER_H
-#define DENSECORE_SCHEDULER_SRC_WRAPPER_H
-
-#include "../include/scheduler.h"
-
-#endif  // DENSECORE_SCHEDULER_SRC_WRAPPER_H

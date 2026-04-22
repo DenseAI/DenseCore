@@ -7,7 +7,7 @@
 #include "densecore/hal/operation_graph.h"
 #include "densecore/hal/tensor.h"
 
-#include "simd_ops.h"
+#include "densecore/simd/simd_ops.h"
 
 namespace densecore {
 namespace {

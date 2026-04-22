@@ -6,7 +6,7 @@
 #include "densecore/hal/op_registry.h"
 #include "densecore/hal/transformer_ops.h"
 
-#include "cpu_backend.h"
+#include "densecore/backend/cpu_backend.h"
 
 namespace densecore {
 namespace kernels {

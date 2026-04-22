@@ -1,7 +1,7 @@
 #ifndef DENSECORE_MAX_QUANTIZER_H
 #define DENSECORE_MAX_QUANTIZER_H
 
-#include "quantizer.h"
+#include "densecore/quantization/quantizer.h"
 
 namespace densecore {
 

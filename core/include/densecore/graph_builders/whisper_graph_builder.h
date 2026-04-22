@@ -7,7 +7,7 @@
 #define DENSECORE_WHISPER_GRAPH_BUILDER_H
 
 #include "densecore/models/graph_registry.h"
-#include "model_types.h"
+#include "densecore/models/model_types.h"
 #include <memory>
 
 namespace densecore {

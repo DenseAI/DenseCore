@@ -450,6 +450,29 @@ func TestCompletionRequestToChatRequestPreservesParityRawPrompt(t *testing.T) {
 	}
 }
 
+func TestCompletionRequestToChatRequestUsesCanonicalChatPathByDefault(t *testing.T) {
+	req := domain.CompletionRequest{
+		Model:     "test-model",
+		Prompt:    "The capital of France is",
+		MaxTokens: 8,
+	}
+
+	chatReq := completionRequestToChatRequest(req)
+
+	if chatReq.ParityMode {
+		t.Fatalf("expected parity mode to remain disabled")
+	}
+	if chatReq.RawPrompt != "" {
+		t.Fatalf("expected non-parity completion requests to avoid raw prompt passthrough, got %q", chatReq.RawPrompt)
+	}
+	if chatReq.ChatTemplateKwargs == nil || chatReq.ChatTemplateKwargs.EnableThinking == nil || *chatReq.ChatTemplateKwargs.EnableThinking {
+		t.Fatalf("expected non-parity completion requests to disable thinking by default, got %+v", chatReq.ChatTemplateKwargs)
+	}
+	if len(chatReq.Messages) != 1 || chatReq.Messages[0].Content != req.Prompt {
+		t.Fatalf("expected compatibility message to keep original prompt, got %+v", chatReq.Messages)
+	}
+}
+
 func TestEmbeddingsHandler(t *testing.T) {
 	tests := []struct {
 		name           string

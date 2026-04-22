@@ -6,11 +6,11 @@
  * This is the routing phase that determines which experts process each token.
  */
 
-#include "moe/moe_routing.h"
-#include "../thread_pool_impl.h"
+#include "densecore/moe/moe_routing.h"
+#include "../backend/thread_pool_impl.h"
 #include "densecore/hal/tensor.h"
-#include "moe/moe_types.h"
-#include "simd_ops.h"
+#include "densecore/moe/moe_types.h"
+#include "densecore/simd/simd_ops.h"
 
 #include <algorithm>
 #include <cmath>

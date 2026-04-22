@@ -1,7 +1,7 @@
 #ifndef DENSECORE_MODELS_MODEL_INFERENCE_POLICY_H
 #define DENSECORE_MODELS_MODEL_INFERENCE_POLICY_H
 
-#include "model_types.h"
+#include "densecore/models/model_types.h"
 
 struct ggml_tensor;
 

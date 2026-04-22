@@ -10,7 +10,7 @@
 #define DENSECORE_KERNELS_PAGED_ATTENTION_H
 
 #include "densecore/hal/tensor.h"
-#include "kv_cache.h"
+#include "densecore/memory/kv_cache.h"
 #include <vector>
 
 namespace densecore {

@@ -10,9 +10,9 @@
 #include "densecore/hal/operation_graph.h"
 #include "densecore/hal/tensor.h"
 #include "densecore/hal/transformer_ops.h"
-#include "moe/moe_routing.h"
-#include "moe/moe_types.h"
-#include "simd_ops.h"
+#include "densecore/moe/moe_routing.h"
+#include "densecore/moe/moe_types.h"
+#include "densecore/simd/simd_ops.h"
 
 #include <cstring>
 

@@ -1,7 +1,7 @@
 #include "attention_pruner.h"
 
+#include <densecore/runtime/tensor_utils.h>
 #include <ggml.h>
-#include <tensor_utils.h>
 
 #include <algorithm>
 #include <cmath>
