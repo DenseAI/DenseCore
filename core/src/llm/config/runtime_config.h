@@ -1,6 +1,7 @@
 #ifndef DENSECORE_LLM_RUNTIME_CONFIG_H
 #define DENSECORE_LLM_RUNTIME_CONFIG_H
 
+#include <cstddef>
 #include <string>
 
 #include "runtime/runtime_env.h"
@@ -87,6 +88,23 @@ int MapRetainedHistoryIndex(const KVRetentionSpan& span, int retained_index);
 
 densecore::env::RuntimeToggleMode LoadArmQ4KNativeVecDotMode();
 densecore::env::RuntimeToggleMode LoadArmInt4DirectFastPathMode();
+
+struct PrefillGraphCachePolicy {
+    bool enabled = true;
+    int lru_size = 16;
+    std::size_t max_bytes = 1024ULL * 1024ULL * 1024ULL;
+};
+
+struct FastPathRuntimeConfig {
+    WorkerRuntimeConfig worker{};
+    EngineRuntimeDebugConfig engine_debug{};
+    DecodePagedAttentionPolicy decode_paged_attention{};
+    KVRetentionPolicy kv_retention{};
+    PrefillGraphCachePolicy prefill_graph_cache{};
+    bool bench_respect_threads = false;
+};
+
+FastPathRuntimeConfig LoadFastPathRuntimeConfig();
 
 }  // namespace densecore::llm::config
 

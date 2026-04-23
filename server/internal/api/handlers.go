@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -45,6 +46,8 @@ const (
 	ErrCodeMethodNotAllowed = "method_not_allowed"
 	ErrCodeServerError      = "server_error"
 	ErrCodeModelNotLoaded   = "model_not_loaded"
+	ErrCodeRequestTimeout   = "request_timeout"
+	ErrCodeRequestCanceled  = "request_canceled"
 )
 
 type Handler struct {
@@ -291,17 +294,14 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().Unix())
 	created := time.Now().Unix()
+	streamStarted := false
 
 	for {
 		select {
 		case event, ok := <-outputChan:
 			if !ok {
 				if err := <-errChan; err != nil {
-					slog.Error("generation failed",
-						slog.String("model", req.Model),
-						slog.String("error", err.Error()),
-					)
-					sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 				}
 				return
 			}
@@ -310,12 +310,10 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 					slog.Debug("SSE write error", slog.String("error", err.Error()))
 				}
 				flusher.Flush()
+				streamStarted = true
 				// Drain the worker goroutine so cancellation and cleanup complete.
 				if err := <-errChan; err != nil {
-					slog.Error("generation failed",
-						slog.String("model", req.Model),
-						slog.String("error", err.Error()),
-					)
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 				}
 				return
 			}
@@ -346,16 +344,14 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 				return
 			}
 			flusher.Flush()
+			streamStarted = true
 		case err := <-errChan:
 			if err != nil {
-				slog.Error("generation failed",
-					slog.String("model", req.Model),
-					slog.String("error", err.Error()),
-				)
-				sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+				writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 			}
 			return
 		case <-ctx.Done():
+			writeGenerationError(ctx, w, flusher, req.Model, ctx.Err(), streamStarted)
 			return
 		}
 	}
@@ -380,17 +376,14 @@ func (h *Handler) handleCompletionStream(ctx context.Context, w http.ResponseWri
 
 	id := fmt.Sprintf("cmpl-%d", time.Now().Unix())
 	created := time.Now().Unix()
+	streamStarted := false
 
 	for {
 		select {
 		case event, ok := <-outputChan:
 			if !ok {
 				if err := <-errChan; err != nil {
-					slog.Error("generation failed",
-						slog.String("model", req.Model),
-						slog.String("error", err.Error()),
-					)
-					sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 				}
 				return
 			}
@@ -399,11 +392,9 @@ func (h *Handler) handleCompletionStream(ctx context.Context, w http.ResponseWri
 					slog.Debug("SSE write error", slog.String("error", err.Error()))
 				}
 				flusher.Flush()
+				streamStarted = true
 				if err := <-errChan; err != nil {
-					slog.Error("generation failed",
-						slog.String("model", req.Model),
-						slog.String("error", err.Error()),
-					)
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 				}
 				return
 			}
@@ -432,16 +423,14 @@ func (h *Handler) handleCompletionStream(ctx context.Context, w http.ResponseWri
 				return
 			}
 			flusher.Flush()
+			streamStarted = true
 		case err := <-errChan:
 			if err != nil {
-				slog.Error("generation failed",
-					slog.String("model", req.Model),
-					slog.String("error", err.Error()),
-				)
-				sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+				writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 			}
 			return
 		case <-ctx.Done():
+			writeGenerationError(ctx, w, flusher, req.Model, ctx.Err(), streamStarted)
 			return
 		}
 	}
@@ -467,7 +456,8 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 		}
 	}
 	if err := <-errChan; err != nil {
-		sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+		message, errType, code, statusCode := classifyGenerationError(err)
+		sendError(w, message, errType, code, statusCode)
 		return
 	}
 
@@ -520,7 +510,8 @@ func (h *Handler) handleCompletionSync(ctx context.Context, w http.ResponseWrite
 		}
 	}
 	if err := <-errChan; err != nil {
-		sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+		message, errType, code, statusCode := classifyGenerationError(err)
+		sendError(w, message, errType, code, statusCode)
 		return
 	}
 
@@ -1252,6 +1243,55 @@ func sendError(w http.ResponseWriter, message, errType, code string, statusCode 
 	if err := json.NewEncoder(w).Encode(errorResp); err != nil {
 		slog.Debug("failed to encode error response", slog.String("error", err.Error()))
 	}
+}
+
+func classifyGenerationError(err error) (message, errType, code string, statusCode int) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "request timed out before completion", "timeout_error", ErrCodeRequestTimeout, http.StatusGatewayTimeout
+	case errors.Is(err, context.Canceled):
+		return "request canceled", "canceled_error", ErrCodeRequestCanceled, 499
+	default:
+		return err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError
+	}
+}
+
+func writeSSEError(w http.ResponseWriter, flusher http.Flusher, message, errType, code string) {
+	errorResp := domain.ErrorResponse{
+		Error: domain.ErrorDetail{
+			Message: message,
+			Type:    errType,
+			Code:    code,
+		},
+	}
+	data, err := json.Marshal(errorResp)
+	if err != nil {
+		slog.Debug("failed to marshal sse error", slog.String("error", err.Error()))
+		return
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		slog.Debug("failed to write sse error", slog.String("error", err.Error()))
+		return
+	}
+	flusher.Flush()
+}
+
+func writeGenerationError(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, model string, err error, streamStarted bool) {
+	message, errType, code, statusCode := classifyGenerationError(err)
+	logLevel := slog.LevelError
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		logLevel = slog.LevelWarn
+	}
+	slog.LogAttrs(ctx, logLevel, "generation failed",
+		slog.String("model", model),
+		slog.String("error", err.Error()),
+		slog.Bool("stream_started", streamStarted),
+	)
+	if streamStarted {
+		writeSSEError(w, flusher, message, errType, code)
+		return
+	}
+	sendError(w, message, errType, code, statusCode)
 }
 
 func sanitizeMetricsNamespace(ns string) string {

@@ -15,6 +15,14 @@ bool IsLinuxHugepagesDisabled() {
     return value && (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0);
 }
 
+bool ParseLegacyEnabledBool(const char* name, bool default_value) {
+    const char* env_value = std::getenv(name);
+    if (!env_value || env_value[0] == '\0') {
+        return default_value;
+    }
+    return std::strcmp(env_value, "0") != 0;
+}
+
 }  // namespace
 
 WorkerRuntimeConfig LoadWorkerRuntimeConfig() {
@@ -225,6 +233,21 @@ env::RuntimeToggleMode LoadArmInt4DirectFastPathMode() {
 #else
     return env::RuntimeToggleMode::On;
 #endif
+}
+
+FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
+    FastPathRuntimeConfig config;
+    config.worker = LoadWorkerRuntimeConfig();
+    config.engine_debug = LoadEngineRuntimeDebugConfig();
+    config.decode_paged_attention = LoadDecodePagedAttentionPolicy();
+    config.kv_retention = LoadKVRetentionPolicy();
+    config.bench_respect_threads = env::ParseTruthyEnv("DENSECORE_BENCH_RESPECT_THREADS", false);
+    config.prefill_graph_cache.enabled = ParseLegacyEnabledBool("DENSECORE_PREFILL_GRAPH_CACHE", true);
+    config.prefill_graph_cache.lru_size = std::max(1, env::ParsePositiveEnvInt("DENSECORE_PREFILL_GRAPH_CACHE_LRU", 16));
+    const int prefill_graph_cache_mb =
+        std::max(128, env::ParsePositiveEnvInt("DENSECORE_PREFILL_GRAPH_CACHE_MAX_MB", 1024));
+    config.prefill_graph_cache.max_bytes = static_cast<std::size_t>(prefill_graph_cache_mb) * 1024ULL * 1024ULL;
+    return config;
 }
 
 }  // namespace densecore::llm::config

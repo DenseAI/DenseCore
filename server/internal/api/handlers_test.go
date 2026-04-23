@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"descore-server/internal/domain"
 	"descore-server/internal/queue"
 	"descore-server/internal/service"
+	"time"
 )
 
 // MockEngine implements a simple mock inference engine for testing
@@ -426,6 +428,167 @@ func TestCompletionHandler_Stream(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, "data:") || !strings.Contains(body, "Paris") || !strings.Contains(body, "text_completion") {
 		t.Fatalf("streaming response missing expected SSE frames: %q", body)
+	}
+}
+
+func TestChatCompletionHandlerSyncTimeoutReturnsStructuredTimeout(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			<-ctx.Done()
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
+		Model: "test-model",
+		Messages: []domain.Message{
+			{Role: "user", Content: "Explain why the sky is blue."},
+		},
+		Stream: false,
+	})
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	handler.ChatCompletionHandler(w, req)
+
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("expected status 504, got %d with body %q", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), ErrCodeRequestTimeout) {
+		t.Fatalf("expected timeout error code in body, got %q", w.Body.String())
+	}
+}
+
+func TestChatCompletionHandlerStreamTimeoutBeforeFirstTokenDoesNotReturnEmpty200(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			<-ctx.Done()
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
+		Model: "test-model",
+		Messages: []domain.Message{
+			{Role: "user", Content: "Explain why the sky is blue."},
+		},
+		Stream: true,
+	})
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	handler.ChatCompletionHandler(w, req)
+
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("expected status 504, got %d with body %q", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "[DONE]") {
+		t.Fatalf("unexpected successful stream terminator in timeout body: %q", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), ErrCodeRequestTimeout) {
+		t.Fatalf("expected timeout error code in body, got %q", w.Body.String())
+	}
+}
+
+func TestChatCompletionHandlerStreamWritesSSEErrorAfterPartialOutput(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			outputChan <- domain.StreamEvent{Token: "Paris", IsFinished: false}
+			outputChan <- domain.StreamEvent{Err: errors.New("engine failed after first token")}
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
+		Model: "test-model",
+		Messages: []domain.Message{
+			{Role: "user", Content: "What is the capital of France?"},
+		},
+		Stream: true,
+	})
+	w := httptest.NewRecorder()
+
+	handler.ChatCompletionHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200 after partial stream, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Paris") {
+		t.Fatalf("expected first streamed token, got %q", body)
+	}
+	if !strings.Contains(body, ErrCodeServerError) {
+		t.Fatalf("expected streamed error payload, got %q", body)
+	}
+}
+
+func TestCompletionHandlerSyncEngineErrorDoesNotBecomeCompletionText(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			outputChan <- domain.StreamEvent{Err: errors.New("engine failed")}
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/completions", domain.CompletionRequest{
+		Model:  "test-model",
+		Prompt: "Explain why the sky is blue.",
+	})
+	w := httptest.NewRecorder()
+
+	handler.CompletionHandler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status 500, got %d with body %q", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "\"text\":\"engine failed\"") {
+		t.Fatalf("engine error leaked into completion payload: %q", w.Body.String())
 	}
 }
 

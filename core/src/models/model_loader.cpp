@@ -1793,7 +1793,28 @@ TransformerModel* LoadGGUFModel(const char* path) {
                         continue;
                     }
 
-                    const size_t gate_up_offset = static_cast<size_t>(expert_idx) * packed_gate_up->nb[2];
+                    const int gate_up_expert_axis =
+                        packed_gate_up->ne[2] > 1 ? 2 : (packed_gate_up->ne[3] > 1 ? 3 : -1);
+                    const int down_expert_axis =
+                        packed_down->ne[2] > 1 ? 2 : (packed_down->ne[3] > 1 ? 3 : -1);
+                    if (gate_up_expert_axis < 0 || down_expert_axis < 0) {
+                        continue;
+                    }
+
+                    const size_t gate_up_stride = static_cast<size_t>(packed_gate_up->nb[gate_up_expert_axis]);
+                    const size_t down_stride = static_cast<size_t>(packed_down->nb[down_expert_axis]);
+                    const size_t gate_up_offset = static_cast<size_t>(expert_idx) * gate_up_stride;
+                    const size_t down_offset = static_cast<size_t>(expert_idx) * down_stride;
+                    if (ggml_nbytes(packed_gate_up) > 0 &&
+                        gate_up_offset + static_cast<size_t>(packed_gate_up->ne[0]) * static_cast<size_t>(packed_gate_up->nb[1]) >
+                            static_cast<size_t>(ggml_nbytes(packed_gate_up))) {
+                        continue;
+                    }
+                    if (ggml_nbytes(packed_down) > 0 &&
+                        down_offset + static_cast<size_t>(packed_down->ne[0]) * static_cast<size_t>(packed_down->nb[1]) >
+                            static_cast<size_t>(ggml_nbytes(packed_down))) {
+                        continue;
+                    }
                     struct ggml_tensor* gate_up_slice =
                         ggml_view_2d(vctx, const_cast<struct ggml_tensor*>(packed_gate_up), packed_gate_up->ne[0],
                                      packed_gate_up->ne[1], packed_gate_up->nb[1], gate_up_offset);
@@ -1807,7 +1828,6 @@ TransformerModel* LoadGGUFModel(const char* path) {
                     struct ggml_tensor* up_w =
                         ggml_view_2d(vctx, gate_up_slice, gate_up_slice->ne[0], intermediate, gate_up_slice->nb[1],
                                      static_cast<size_t>(intermediate) * gate_up_slice->nb[1]);
-                    const size_t down_offset = static_cast<size_t>(expert_idx) * packed_down->nb[2];
                     struct ggml_tensor* down_w =
                         ggml_view_2d(vctx, const_cast<struct ggml_tensor*>(packed_down), packed_down->ne[0],
                                      packed_down->ne[1], packed_down->nb[1], down_offset);

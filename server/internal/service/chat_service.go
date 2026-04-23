@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 
+	cloudmw "github.com/DenseAI/DenseCloud/go/middleware"
 	"github.com/google/uuid"
 
 	"descore-server/internal/domain"
@@ -77,6 +78,9 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 		case event, ok := <-stream:
 			if !ok {
 				return nil
+			}
+			if event.Err != nil {
+				return event.Err
 			}
 			outputChan <- event
 		case <-ctx.Done():
@@ -153,6 +157,7 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 
 	queuedReq := &queue.QueuedRequest{
 		ID:                  uuid.New().String(),
+		TraceID:             cloudmw.GetRequestID(ctx),
 		Priority:            queue.RequestPriority(0),
 		MaxTokens:           maxTokens,
 		Prompt:              prepared.prompt,
@@ -170,6 +175,16 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 		Context:             ctx,
 		ResultChan:          make(chan interface{}, 1),
 		ExpertCluster:       req.ExpertCluster,
+	}
+	if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
+		slog.Info("request lifecycle: enqueue",
+			slog.String("trace_id", queuedReq.TraceID),
+			slog.String("queue_request_id", queuedReq.ID),
+			slog.Bool("streaming", true),
+			slog.Int("max_tokens", queuedReq.MaxTokens),
+			slog.Int("prompt_len", len(queuedReq.Prompt)),
+			slog.Int("input_ids", len(queuedReq.InputIDs)),
+		)
 	}
 	if envFlagEnabled("DENSECORE_DEBUG_REQUEST_STATE") {
 		slog.Info("normalized_request_state",
@@ -353,11 +368,14 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	profile := resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate)
 	isQwen := profile.family == promptFamilyQwen
 	isGemma := profile.family == promptFamilyGemma
+	isQwen36 := isQwen && isQwen36ModelHint(modelHint)
 	thinkingEnabled := profile.thinkingEnabled(modelHint, req.ChatTemplateKwargs)
 
 	if !req.TemperatureSet {
 		if isGemma {
 			temperature = 0.2
+		} else if isQwen36 && !thinkingEnabled {
+			temperature = 0.0
 		} else if isQwen && !thinkingEnabled {
 			temperature = 0.7
 		} else {
@@ -411,6 +429,11 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	}
 
 	return temperature, topP, topK, repetitionPenalty
+}
+
+func isQwen36ModelHint(modelHint string) bool {
+	lower := strings.ToLower(strings.TrimSpace(modelHint))
+	return strings.Contains(lower, "qwen3.6") || strings.Contains(lower, "qwen36")
 }
 
 func shouldPassThroughRawPrompt(modelHint, tokenizerType, chatTemplate string, messages []domain.Message,

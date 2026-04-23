@@ -38,7 +38,9 @@ static int SubmitEmbeddingRequestWrapper(DenseCoreHandle handle, const char* pro
 import "C"
 
 import (
+	"errors"
 	"log"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -121,9 +123,6 @@ func (m *RequestChannelMap) cleanupStaleChannels(ttl time.Duration) {
 			// Re-check existence to be safe (though delete is idempotent)
 			if item, exists := m.channels[id]; exists && item.createdAt.Before(threshold) {
 				log.Printf("Cleaning up zombie request channel %d (age > %v)", id, ttl)
-
-				// Close channel to unblock workers
-				close(item.ch)
 				delete(m.channels, id)
 			}
 		}
@@ -231,10 +230,14 @@ func streamCallbackGateway(token *C.char, isFinished C.int, userData unsafe.Poin
 	id := uintptr(userData)
 	if ch, ok := requestChannels.Load(id); ok {
 		tokenStr := C.GoString(token)
-		ch <- domain.StreamEvent{
+		event := domain.StreamEvent{
 			Token:      tokenStr,
 			IsFinished: isFinished != 0,
 		}
+		if isFinished != 0 && strings.HasPrefix(tokenStr, "Error:") {
+			event.Err = errors.New(strings.TrimSpace(tokenStr))
+		}
+		ch <- event
 
 		if isFinished != 0 {
 			// Signal completion BEFORE cleanup to ensure watcher goroutine exits

@@ -2,6 +2,7 @@
 
 #include "densecore/backend/hardware_topology.h"
 #include "densecore/hal/backend_registry.h"
+#include "llm/config/runtime_config.h"
 
 const InferenceConfig& densecore::llm::runtime::ResolveInferenceConfig(const BatchSpec* batch) {
     if (batch && batch->deps && batch->deps->config) {
@@ -22,6 +23,16 @@ densecore::BackendRegistry& densecore::llm::runtime::ResolveBackendRegistry(cons
         return *batch->deps->backend_registry;
     }
     return densecore::BackendRegistry::Instance();
+}
+
+const densecore::llm::config::FastPathRuntimeConfig&
+densecore::llm::runtime::ResolveFastPathRuntimeConfig(const BatchSpec* batch) {
+    if (batch && batch->deps && batch->deps->fast_path_config) {
+        return *batch->deps->fast_path_config;
+    }
+    thread_local densecore::llm::config::FastPathRuntimeConfig config;
+    config = densecore::llm::config::LoadFastPathRuntimeConfig();
+    return config;
 }
 
 densecore::DeviceType densecore::llm::runtime::ResolvePreferredDevice(const BatchSpec* batch) {

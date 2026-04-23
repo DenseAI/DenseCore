@@ -8,6 +8,7 @@ namespace densecore::llm::runtime {
 const InferenceConfig& ResolveInferenceConfig(const BatchSpec* batch);
 densecore::HardwareTopology& ResolveHardwareTopology(const BatchSpec* batch);
 densecore::BackendRegistry& ResolveBackendRegistry(const BatchSpec* batch);
+const densecore::llm::config::FastPathRuntimeConfig& ResolveFastPathRuntimeConfig(const BatchSpec* batch);
 densecore::DeviceType ResolvePreferredDevice(const BatchSpec* batch);
 densecore::DeviceType ResolvePreferredMatmulDevice(const BatchSpec* batch);
 densecore::DeviceType ResolvePreferredAttentionDevice(const BatchSpec* batch);

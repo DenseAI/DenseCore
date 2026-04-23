@@ -464,68 +464,75 @@ endif()
 
 # Source files (DenseCore specific only)
 set(SOURCES
-    src/engine.cpp
-    src/worker.cpp
-    src/worker_helpers.cpp
-    src/inference.cpp
-    src/model_types.cpp
-    src/model_loader.cpp
-    src/tokenizer.cpp
-    src/kv_cache.cpp
-    src/kv_cache_block_manager.cpp
-    src/kv_cache_storage.cpp
-    src/optimization_bridge.cpp
-    src/save_model.cpp
-    src/version.cpp
-    src/error_api.cpp
-    src/scheduler.cpp
-    src/scheduler_policy.cpp
-    src/scheduler_queue.cpp
-    src/action_chunker.cpp
-    src/arm_runtime.cpp
-    src/operation_graph.cpp
+    src/runtime/engine.cpp
+    src/runtime/worker.cpp
+    src/runtime/worker_helpers.cpp
+    src/llm/config/runtime_config.cpp
+    src/llm/runtime/deps.cpp
+    src/llm/attention/internal.cpp
+    src/llm/attention/exec.cpp
+    src/llm/graph/planning.cpp
+    src/llm/models/common/family_internal.cpp
+    src/llm/sampling/exec.cpp
+    src/runtime/inference.cpp
+    src/models/model_types.cpp
+    src/models/model_loader.cpp
+    src/models/tokenizer.cpp
+    src/runtime/memory/kv_cache.cpp
+    src/runtime/memory/kv_cache_block_manager.cpp
+    src/runtime/memory/kv_cache_storage.cpp
+    src/runtime/optimization_bridge.cpp
+    src/models/save_model.cpp
+    src/api/version.cpp
+    src/api/error_api.cpp
+    src/runtime/scheduler.cpp
+    src/runtime/scheduler_policy.cpp
+    src/runtime/scheduler_queue.cpp
+    src/runtime/action_chunker.cpp
+    src/runtime/arm_runtime.cpp
+    src/hal/operation_graph.cpp
     src/sampler/sampler.cpp
     # Backend abstraction
-    src/op_registry.cpp
-    src/plugin_loader.cpp
-    src/graph_executor.cpp
-    src/lora_storage.cpp
-    src/cpu_backend.cpp
+    src/hal/op_registry.cpp
+    src/runtime/plugin_loader.cpp
+    src/runtime/graph_executor.cpp
+    src/models/lora_storage.cpp
+    src/backend/cpu_backend.cpp
     src/backend/cpu_backend_moe_ops.cpp
     src/backend/cpu_backend_moe_registry.cpp
-    src/backend_registry.cpp
-    src/kernel_context.cpp
-    src/async_cpu_backend.cpp
-    src/qwen35_ssm_math.cpp
-    src/matmul_backend.cpp
-    src/matmul_backend_densecore.cpp
-    src/matmul_backend_onednn.cpp
+    src/backend/backend_registry.cpp
+    src/hal/kernel_context.cpp
+    src/backend/async_cpu_backend.cpp
+    src/models/qwen35_ssm_math.cpp
+    src/backend/matmul_backend.cpp
+    src/backend/matmul_backend_densecore.cpp
+    src/backend/matmul_backend_onednn.cpp
     # Kernels (optimized SIMD implementations)
 
-    src/kv_cache_encoder.cpp
-    src/kv_cache_decoder.cpp
+    src/runtime/memory/kv_cache_encoder.cpp
+    src/runtime/memory/kv_cache_decoder.cpp
     # MoE (Mixture of Experts) profiling and routing
     src/moe/profiler.cpp
     src/moe/moe_routing.cpp
     src/kernels/moe_ops.cpp
     src/kernels/matmul_cpu.cpp
     # Quantization module
-    src/quantize_api.cpp
-    src/quantizer.cpp
+    src/api/quantize_api.cpp
+    src/quantization/quantizer.cpp
     src/quantization/max_quantizer.cpp
     src/quantization/awq_quantizer.cpp
     src/quantization/smoothquant_quantizer.cpp
     src/quantization/int4_quantizer.cpp
     # Pruning module
-    src/pruner.cpp
-    src/tensor_utils.cpp
-    src/simd_ops.cpp  # Quantized dot product dispatcher
+    src/pruning/pruner.cpp
+    src/runtime/tensor_utils.cpp
+    src/simd/simd_ops.cpp  # Quantized dot product dispatcher
     src/pruning/depth_pruner.cpp
     src/pruning/width_pruner.cpp
     src/pruning/attention_pruner.cpp
     src/pruning/combined_pruner.cpp
     # Graph Optimization module
-    src/graph_optimizer.cpp
+    src/graph/graph_optimizer.cpp
     src/models/model_descriptor.cpp
     src/models/model_graph_capabilities.cpp
     src/models/model_prompt_templates.cpp
@@ -555,7 +562,7 @@ set(SOURCES
     src/graph_builders/whisper_graph_builder.cpp
     src/graph_builders/llm_config_generator.cpp
     src/graph/generic_graph_builder.cpp
-    src/qnn_backend.cpp
+    src/backend/qnn_backend.cpp
     src/kernels/audio_ops.cpp
     # Universal Transformer Operations - Multimodal/Vision
     src/kernels/window_attention.cpp
@@ -609,10 +616,10 @@ set(SOURCES
     if(APPLE)
         # Metal source files (Objective-C++)
         set(METAL_SOURCES
-            src/metal_backend.mm
-            src/apple_silicon.mm
-            src/ane_backend.mm
-            src/hybrid_scheduler.mm
+            src/backend/apple/metal_backend.mm
+            src/backend/apple/apple_silicon.mm
+            src/backend/apple/ane_backend.mm
+            src/backend/apple/hybrid_scheduler.mm
             src/hal/apple_backend_selector.mm
             src/kernels/metal_universal_ops.mm
             src/kernels/metal_linear_ops.mm
@@ -909,7 +916,7 @@ else()
             set(AVX2_FLAG "-mavx2" "-mfma")
             # AVX-512 flags including VNNI for INT8 acceleration (Ice Lake+, Sapphire Rapids, Zen4+)
             # -mavx512vnni enables vpdpbusd instruction for 4x INT8 dot products per lane
-            set(AVX512_FLAG "-mavx512f" "-mavx512dq" "-mavx512vl" "-mavx512bw" "-mavx512vnni")
+            set(AVX512_FLAG "-mavx512f" "-mavx512dq" "-mavx512vl" "-mavx512bw" "-mavx512vnni" "-mfma")
         endif()
 
         # Check CPU capabilities for AVX-512 (cross-platform approach)
@@ -1019,7 +1026,7 @@ endif()
 # - Compute-level parallelism: GGML's internal thread pool
 #
 # OpenMP is NOT used to avoid thread oversubscription (nested parallelism).
-# All SIMD kernels in simd_ops.h are single-threaded and rely on the caller
+# All SIMD kernels in densecore/simd/simd_ops.h are single-threaded and rely on the caller
 # (GGML callbacks or worker.cpp) to manage parallel execution.
 # ==========================================================================
 message(STATUS "Threading: GGML thread pool + std::thread (OpenMP disabled)")
@@ -1070,7 +1077,7 @@ install(TARGETS densecore
 )
 
 # Quantize tool
-add_executable(quantize src/quantize.cpp)
+add_executable(quantize src/tools/quantize.cpp)
 
 target_include_directories(quantize PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1078,6 +1085,9 @@ target_include_directories(quantize PUBLIC
     ${GGML_DIR}/src
     ${GGML_DIR}/src/ggml-cpu
     ${simde_SOURCE_DIR} # Add SIMDe include path
+)
+target_include_directories(quantize PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 target_compile_definitions(quantize PRIVATE
@@ -1144,75 +1154,81 @@ if(DENSECORE_BUILD_TESTS)
 
     # Test sources (use absolute paths to ensure correct resolution)
     set(TEST_SOURCES
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_simd_ops.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen35_ssm_math.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen35_ssm_qkv_projection.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_chat_template.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model_descriptor.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tokenizer.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gemma4_model_loader.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_transformer_graph_dispatch.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen_loop_guard.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_decode_graph_cache.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_decode_thread_policy.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gemma4_decode_fallback.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_memory_pool.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kv_cache.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scheduler.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_action_chunker.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_arm_runtime.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hardware_topology.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_operation_graph.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_graph_capture.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_matmul_backend.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_aligned_allocator.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tensor_view.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kernel_context.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fp8.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_async_backend.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cpu_int4.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_int4_gemv.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_engine_kv_cache_config.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_moe_profiler.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_numa_sticky_routing.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_simd_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_qwen35_ssm_math.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_qwen35_ssm_qkv_projection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_qwen36_model_loader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_chat_template.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_model_descriptor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_tokenizer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_gemma4_model_loader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_transformer_graph_dispatch.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_qwen_loop_guard.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_decode_graph_cache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_attention_policy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_decode_thread_policy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_model_family_internal.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_worker_result_dispatch.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_gemma4_decode_fallback.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_memory_pool.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_kv_cache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_scheduler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_action_chunker.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_arm_runtime.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/test_hardware_topology.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_operation_graph.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_graph_capture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/test_matmul_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_aligned_allocator.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_tensor_view.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hal/test_kernel_context.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_fp8.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/test_async_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/quantization/test_cpu_int4.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/quantization/test_int4_gemv.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_engine_kv_cache_config.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_llm_runtime_config.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_moe_profiler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_numa_sticky_routing.cpp
         # Phase 1: Universal HAL tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_transformer_ops.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rope_2d.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_deformable_attention.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_groupnorm.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_op_registry.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_op_registry_di.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qnn_backend.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_activation_ops.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_image_ops.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sampling_range.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_normalization.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_moe_ops.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kv_cache_encoder.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kv_cache_decoder.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_graph_executor_integration.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_graph_domain_ops.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_graph_domain_ops.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_audio_ops.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_whisper_e2e.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_transformer_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_rope_2d.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_deformable_attention.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_groupnorm.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hal/test_op_registry.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hal/test_op_registry_di.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/test_qnn_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_activation_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_image_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_sampling_range.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_sampling_and_moe_trace.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_normalization.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_moe_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_kv_cache_encoder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_kv_cache_decoder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_graph_executor_integration.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_graph_domain_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_graph_domain_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_audio_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_whisper_e2e.cpp
         # Phase 2: Encoder-Decoder tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_attention_pair_bias_hwy.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cross_attention.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_point_attention_hwy.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_triangular_attention_hwy.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_paged_attention.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_attention_pair_bias_hwy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_cross_attention.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_point_attention_hwy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_triangular_attention_hwy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_paged_attention.cpp
         # HAL Abstraction tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hal_abstraction.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hal/test_hal_abstraction.cpp
         # Universal Transformer Operations tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_universal_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_universal_ops.cpp
         # Bio/Science kernel tests
-        # ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bio_kernels.cpp
+        # ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_bio_kernels.cpp
         # Logging tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_logging.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_logging.cpp
         # Optional plugin loader security tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_plugin_loader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_plugin_loader.cpp
         # E2E smoke tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_engine_e2e.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_engine_e2e.cpp
     )
 
     # Create test executable
@@ -1222,7 +1238,7 @@ if(DENSECORE_BUILD_TESTS)
     add_executable(densecore_tests ${TEST_SOURCES} ${SOURCES})
 
     add_executable(gemma4_parity_probe
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/gemma4_parity_probe.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/gemma4_parity_probe.cpp
         ${SOURCES}
     )
 
@@ -1233,7 +1249,7 @@ if(DENSECORE_BUILD_TESTS)
         ${GGML_DIR}/include
         ${GGML_DIR}/src
         ${GGML_DIR}/src/ggml-cpu
-        ${simde_SOURCE_DIR}  # SIMDe for simd_platform.h
+        ${simde_SOURCE_DIR}  # SIMDe for densecore/simd/simd_platform.h
         ${highway_SOURCE_DIR}  # Google Highway SIMD
     )
 

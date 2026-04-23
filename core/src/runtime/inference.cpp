@@ -115,6 +115,7 @@ bool IsMoEWiringDebugEnabled() {
 
 using densecore::llm::runtime::IsMixedRoutingEnabled;
 using densecore::llm::runtime::ResolveBackendRegistry;
+using densecore::llm::runtime::ResolveFastPathRuntimeConfig;
 using densecore::llm::runtime::ResolveHardwareTopology;
 using densecore::llm::runtime::ResolveInferenceConfig;
 using densecore::llm::runtime::ResolvePreferredAttentionDevice;
@@ -623,9 +624,8 @@ static uint64_t ComputeGemvBatchedQuantStamp(const BatchSpec* batch, int M, int 
     return hash == 0 ? 1 : hash;
 }
 
-static const KVRetentionPolicy& GetKVRetentionPolicy() {
-    static const KVRetentionPolicy policy = densecore::llm::config::LoadKVRetentionPolicy();
-    return policy;
+static const KVRetentionPolicy& GetKVRetentionPolicy(const BatchSpec* batch = nullptr) {
+    return ResolveFastPathRuntimeConfig(batch).kv_retention;
 }
 
 // Env-tunable thresholds for batched GEMM/GEMV routing
@@ -677,8 +677,8 @@ static DecodePagedAttentionMode ParseDecodePagedAttentionMode() {
     return densecore::llm::config::LoadDecodePagedAttentionMode();
 }
 
-static DecodePagedAttentionPolicy LoadDecodePagedAttentionPolicy() {
-    return densecore::llm::config::LoadDecodePagedAttentionPolicy();
+static const DecodePagedAttentionPolicy& ResolveDecodePagedAttentionPolicy(const BatchSpec* batch = nullptr) {
+    return ResolveFastPathRuntimeConfig(batch).decode_paged_attention;
 }
 
 bool IsPagedDecodeModeAlwaysOnImpl() {
@@ -770,7 +770,7 @@ static DecodeContextSummary SummarizeDecodeContext(const BatchSpec& batch, int n
         }
 
         const KVRetentionSpan retained =
-            densecore::llm::config::ComputeKVRetentionSpan(n_past_i, GetKVRetentionPolicy());
+            densecore::llm::config::ComputeKVRetentionSpan(n_past_i, GetKVRetentionPolicy(&batch));
         const int max_context_i = static_cast<int>(block_table.size()) * BLOCK_SIZE;
         const int context_len_i = std::max(1, std::min(retained.history_kept + 1, max_context_i));
         summary.min_context = std::min(summary.min_context, context_len_i);
@@ -2320,7 +2320,11 @@ static InlineDenseDecoderRegistryBuilderRegistrar g_inline_dense_decoder_registr
 struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache* cache, struct ggml_context* ctx_c,
                                           const BatchSpec& batch, bool embedding_mode, struct ggml_cgraph* gf,
                                           struct ggml_tensor** out_embd, struct ggml_tensor** out_pos) {
-    const auto plan = densecore::ResolveTransformerGraphExecutionPlan(model);
+    const densecore::TransformerGraphExecutionPlan* bound_plan =
+        (batch.deps && batch.deps->transformer_execution_plan) ? batch.deps->transformer_execution_plan : nullptr;
+    const densecore::TransformerGraphExecutionPlan fallback_plan =
+        bound_plan ? densecore::TransformerGraphExecutionPlan{} : densecore::ResolveTransformerGraphExecutionPlan(model);
+    const densecore::TransformerGraphExecutionPlan& plan = bound_plan ? *bound_plan : fallback_plan;
 
     if (IsVerboseGraphBuildLoggingEnabled()) {
         std::cerr << "[BuildTransformerGraph] Resolved capabilities: "
@@ -2372,7 +2376,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
     const int n_head_kv = model->hparams.n_head_kv;
     const int n_layer = model->hparams.n_layer;
     const int n_ctx = model->hparams.n_ctx;
-    const DecodePagedAttentionPolicy decode_paged_policy = LoadDecodePagedAttentionPolicy();
+    const DecodePagedAttentionPolicy& decode_paged_policy = ResolveDecodePagedAttentionPolicy(&batch);
     (void)n_embd;
     (void)n_head_kv;
     (void)n_ctx;
@@ -4736,9 +4740,9 @@ bool ShouldUsePagedDecodeAttentionForBatchTest(const TransformerModel* model, co
     const int head_dim_kv =
         model->hparams.n_embd_head_k > 0 ? static_cast<int>(model->hparams.n_embd_head_k) : head_dim_q;
     const BasePagedDecodeExecutionDecision decision =
-        ::densecore::llm::attention::ResolveBasePagedDecodeExecutionDecision(::LoadDecodePagedAttentionPolicy(), model,
-                                                                             cache, batch, n_tokens_in_batch, n_head,
-                                                                             n_head_kv, head_dim_q, head_dim_kv);
+        ::densecore::llm::attention::ResolveBasePagedDecodeExecutionDecision(
+            ::ResolveDecodePagedAttentionPolicy(&batch), model, cache, batch, n_tokens_in_batch, n_head, n_head_kv,
+            head_dim_q, head_dim_kv);
     return decision.use_paged_decode_attention;
 }
 std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float>& q, const std::vector<float>& k,

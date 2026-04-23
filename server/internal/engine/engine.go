@@ -135,6 +135,10 @@ var cleanupOnce sync.Once
 var pluginMu sync.Mutex
 var pluginRefCount int
 
+func requestLifecycleDebugEnabled() bool {
+	return util.ParseBoolEnv("DENSECORE_DEBUG_REQUEST_LIFECYCLE", false)
+}
+
 // DenseEngine wraps the C++ engine with thread safety
 type DenseEngine struct {
 	handle C.DenseCoreHandle
@@ -258,9 +262,13 @@ func (e *DenseEngine) GenerateStream(ctx context.Context, prompt string, maxToke
 		Cleanup(reqID)
 		return fmt.Errorf("submission failed with error code %d", ret)
 	}
+	engineReqID := int(ret)
+	if requestLifecycleDebugEnabled() {
+		log.Printf("request lifecycle: submit_text callback_id=%d engine_request_id=%d max_tokens=%d", reqID, engineReqID, maxTokens)
+	}
 
 	// Launch context watcher goroutine
-	go e.watchContext(ctx, reqID, completionCh)
+	go e.watchContext(ctx, reqID, engineReqID, completionCh)
 
 	return nil
 }
@@ -293,9 +301,14 @@ func (e *DenseEngine) GenerateStreamWithFormat(ctx context.Context, prompt strin
 		Cleanup(reqID)
 		return fmt.Errorf("submission failed with error code %d", ret)
 	}
+	engineReqID := int(ret)
+	if requestLifecycleDebugEnabled() {
+		log.Printf("request lifecycle: submit_format callback_id=%d engine_request_id=%d max_tokens=%d json_mode=%t",
+			reqID, engineReqID, maxTokens, jsonMode)
+	}
 
 	// Launch context watcher goroutine
-	go e.watchContext(ctx, reqID, completionCh)
+	go e.watchContext(ctx, reqID, engineReqID, completionCh)
 
 	return nil
 }
@@ -374,8 +387,13 @@ func (e *DenseEngine) GenerateStreamWithSampling(ctx context.Context, prompt str
 		Cleanup(reqID)
 		return fmt.Errorf("submission failed with error code %d", ret)
 	}
+	engineReqID := int(ret)
+	if requestLifecycleDebugEnabled() {
+		log.Printf("request lifecycle: submit_sampling callback_id=%d engine_request_id=%d max_tokens=%d json_mode=%t allowed=%d disallowed=%d",
+			reqID, engineReqID, maxTokens, jsonMode, len(allowedTokenIDs), len(disallowedTokenIDs))
+	}
 
-	go e.watchContext(ctx, reqID, completionCh)
+	go e.watchContext(ctx, reqID, engineReqID, completionCh)
 
 	return nil
 }
@@ -461,8 +479,13 @@ func (e *DenseEngine) GenerateStreamTokensWithSampling(ctx context.Context, inpu
 		Cleanup(reqID)
 		return fmt.Errorf("submission failed with error code %d", ret)
 	}
+	engineReqID := int(ret)
+	if requestLifecycleDebugEnabled() {
+		log.Printf("request lifecycle: submit_token_ids callback_id=%d engine_request_id=%d max_tokens=%d input_ids=%d json_mode=%t allowed=%d disallowed=%d",
+			reqID, engineReqID, maxTokens, len(inputIDs), jsonMode, len(allowedTokenIDs), len(disallowedTokenIDs))
+	}
 
-	go e.watchContext(ctx, reqID, completionCh)
+	go e.watchContext(ctx, reqID, engineReqID, completionCh)
 
 	return nil
 }
@@ -471,15 +494,30 @@ func (e *DenseEngine) GenerateStreamTokensWithSampling(ctx context.Context, inpu
 // This goroutine exits when either:
 // 1. The context is canceled (and we call CancelRequest), or
 // 2. The request completes normally (completionCh is closed)
-func (e *DenseEngine) watchContext(ctx context.Context, reqID uintptr, completionCh <-chan struct{}) {
+func (e *DenseEngine) watchContext(ctx context.Context, callbackReqID uintptr, engineReqID int, completionCh <-chan struct{}) {
 	select {
 	case <-ctx.Done():
-		// Context canceled - signal C++ to stop generating
-		log.Printf("Context canceled for request %d, cleaning up...", reqID)
-		e.CancelRequest(reqID) // C++ side cancellation
-		Cleanup(reqID)         // Go side cleanup
+		if requestLifecycleDebugEnabled() {
+			log.Printf("request lifecycle: context_done callback_id=%d engine_request_id=%d err=%v",
+				callbackReqID, engineReqID, ctx.Err())
+		}
+		// Cancel the actual DenseCore request ID, not the callback user_data ID.
+		e.CancelRequest(uintptr(engineReqID))
+		select {
+		case <-completionCh:
+			if requestLifecycleDebugEnabled() {
+				log.Printf("request lifecycle: cancellation_observed callback_id=%d engine_request_id=%d",
+					callbackReqID, engineReqID)
+			}
+		case <-time.After(5 * time.Second):
+			log.Printf("request lifecycle: cancellation_cleanup_timeout callback_id=%d engine_request_id=%d", callbackReqID, engineReqID)
+			Cleanup(callbackReqID)
+		}
 	case <-completionCh:
-		// Generation finished normally - exit silently
+		if requestLifecycleDebugEnabled() {
+			log.Printf("request lifecycle: callback_complete callback_id=%d engine_request_id=%d",
+				callbackReqID, engineReqID)
+		}
 	}
 }
 

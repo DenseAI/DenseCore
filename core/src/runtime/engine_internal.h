@@ -36,6 +36,7 @@
 #include "densecore/runtime/scheduler.h"
 #include "densecore/utils/error.h"
 #include "densecore/utils/logging.h"
+#include "llm/config/runtime_config.h"
 
 #ifdef __APPLE__
 #include "densecore/backend/apple/ane_backend.h"
@@ -227,6 +228,7 @@ struct Request {
     std::string think_tag_pending;
     std::string tool_call_tag_pending;
     std::string tool_response_tag_pending;
+    bool suppress_reasoning_tags = true;
     bool in_think_block = false;
     bool in_tool_call_block = false;
     bool in_tool_response_block = false;
@@ -320,6 +322,7 @@ struct Request {
         think_tag_pending.clear();
         tool_call_tag_pending.clear();
         tool_response_tag_pending.clear();
+        suppress_reasoning_tags = true;
         in_think_block = false;
         in_tool_call_block = false;
         in_tool_response_block = false;
@@ -440,6 +443,7 @@ struct ModelEntry {
     // Owned resources with automatic cleanup via RAII
     std::unique_ptr<TransformerModel> model;
     std::unique_ptr<PagedKVCache> kv_cache;
+    densecore::TransformerGraphExecutionPlan transformer_execution_plan{};
 
     std::chrono::steady_clock::time_point last_used;
     int usage_count = 0;
@@ -545,6 +549,7 @@ struct EngineState {
 
     // Dependency Injected Op Registry
     std::unique_ptr<densecore::OpRegistry> op_registry;
+    densecore::llm::config::FastPathRuntimeConfig fast_path_config{};
 
     // Advanced scheduler (vLLM-style)
     std::unique_ptr<densecore::Scheduler> scheduler;  // Smart pointer ownership

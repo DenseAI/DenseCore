@@ -49,10 +49,33 @@
 
 namespace {
 
-const densecore::llm::config::WorkerRuntimeConfig& GetWorkerRuntimeConfig() {
-    static const densecore::llm::config::WorkerRuntimeConfig config = densecore::llm::config::LoadWorkerRuntimeConfig();
+thread_local const densecore::llm::config::FastPathRuntimeConfig* tls_fast_path_runtime_config = nullptr;
+
+const densecore::llm::config::FastPathRuntimeConfig& GetFastPathRuntimeConfig() {
+    if (tls_fast_path_runtime_config) {
+        return *tls_fast_path_runtime_config;
+    }
+    static const densecore::llm::config::FastPathRuntimeConfig config =
+        densecore::llm::config::LoadFastPathRuntimeConfig();
     return config;
 }
+
+const densecore::llm::config::WorkerRuntimeConfig& GetWorkerRuntimeConfig() {
+    return GetFastPathRuntimeConfig().worker;
+}
+
+class ScopedFastPathRuntimeConfigBinder {
+  public:
+    explicit ScopedFastPathRuntimeConfigBinder(const densecore::llm::config::FastPathRuntimeConfig* config)
+        : previous_(tls_fast_path_runtime_config) {
+        tls_fast_path_runtime_config = config;
+    }
+
+    ~ScopedFastPathRuntimeConfigBinder() { tls_fast_path_runtime_config = previous_; }
+
+  private:
+    const densecore::llm::config::FastPathRuntimeConfig* previous_ = nullptr;
+};
 
 bool IsMulGraphValidationEnabled() {
     return GetWorkerRuntimeConfig().validate_mul;
@@ -481,6 +504,7 @@ void EngineLoop(EngineState* state) {
             LOG_CRITICAL("FATAL: No model loaded. EngineLoop exiting.");
             return;
         }
+        ScopedFastPathRuntimeConfigBinder fast_path_runtime_config_binder(&state->fast_path_config);
         TransformerModel* current_model = model_entry->model.get();
         PagedKVCache* current_kv_cache = model_entry->kv_cache.get();
 
@@ -1510,6 +1534,8 @@ void EngineLoop(EngineState* state) {
             deps.hardware_topology = &densecore::HardwareTopology::GetInstance();
             deps.backend_registry = &densecore::BackendRegistry::Instance();
             deps.op_registry = state->op_registry ? state->op_registry.get() : nullptr;
+            deps.fast_path_config = &state->fast_path_config;
+            deps.transformer_execution_plan = &model_entry->transformer_execution_plan;
             deps.preferred_device = densecore::DeviceType::CPU;
             deps.preferred_matmul_device = densecore::DeviceType::CPU;
             deps.preferred_attention_device = densecore::DeviceType::CPU;
@@ -1892,10 +1918,7 @@ void EngineLoop(EngineState* state) {
             const char* decode_thread_policy = is_prefill_batch ? "prefill" : "base";
 
             // DENSECORE_BENCH_RESPECT_THREADS=1 forces full thread count for all phases
-            static const bool bench_respect_threads = []() {
-                const char* env = std::getenv("DENSECORE_BENCH_RESPECT_THREADS");
-                return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-            }();
+            const bool bench_respect_threads = state->fast_path_config.bench_respect_threads;
 
             if (bench_respect_threads) {
                 active_threads = base_threads;
@@ -2100,28 +2123,11 @@ void EngineLoop(EngineState* state) {
             const bool decode_graph_cache_active =
                 IsDecodeGraphCacheEnabled() && current_kv_cache != nullptr && decode_graph_cache_lru_size > 0;
             const bool force_disable_graph_cache = IsGraphCacheReuseDisabled();
-            const auto parse_prefill_graph_cache_bool = [](const char* name, bool default_value) {
-                const char* env = std::getenv(name);
-                if (!env || env[0] == '\0') return default_value;
-                return std::strcmp(env, "0") != 0;
-            };
-            const auto parse_prefill_graph_cache_int = [](const char* name, int default_value) {
-                const char* env = std::getenv(name);
-                if (!env || env[0] == '\0') return default_value;
-                char* end = nullptr;
-                const long value = std::strtol(env, &end, 10);
-                if (end == env || value <= 0) return default_value;
-                return static_cast<int>(value);
-            };
-            const int prefill_graph_cache_lru_size =
-                std::max(1, parse_prefill_graph_cache_int("DENSECORE_PREFILL_GRAPH_CACHE_LRU", 16));
-            const size_t prefill_graph_cache_max_bytes =
-                static_cast<size_t>(
-                    std::max(128, parse_prefill_graph_cache_int("DENSECORE_PREFILL_GRAPH_CACHE_MAX_MB", 1024))) *
-                1024ULL * 1024ULL;
+            const auto& prefill_graph_cache_policy = state->fast_path_config.prefill_graph_cache;
+            const int prefill_graph_cache_lru_size = std::max(1, prefill_graph_cache_policy.lru_size);
+            const size_t prefill_graph_cache_max_bytes = prefill_graph_cache_policy.max_bytes;
             const bool prefill_graph_cache_active =
-                parse_prefill_graph_cache_bool("DENSECORE_PREFILL_GRAPH_CACHE", true) && current_kv_cache != nullptr &&
-                prefill_graph_cache_lru_size > 0;
+                prefill_graph_cache_policy.enabled && current_kv_cache != nullptr && prefill_graph_cache_lru_size > 0;
             const bool decode_graph_cache_active_effective = decode_graph_cache_active && !force_disable_graph_cache;
             const bool prefill_graph_cache_active_effective = prefill_graph_cache_active && !force_disable_graph_cache;
             const size_t prefill_graph_ctx_bytes =
@@ -3370,7 +3376,7 @@ void EngineLoop(EngineState* state) {
                     // user output by default. Disable with
                     // DENSECORE_SUPPRESS_REASONING_TAGS=0.
                     if (!req_bench_fast_path && !req->json_mode && !token_str.empty() &&
-                        IsReasoningTagSuppressionEnabled()) {
+                        req->suppress_reasoning_tags && IsReasoningTagSuppressionEnabled()) {
                         const bool may_contain_tag =
                             req->in_think_block || req->in_tool_call_block || req->in_tool_response_block ||
                             !req->think_tag_pending.empty() || !req->tool_call_tag_pending.empty() ||
@@ -3527,7 +3533,8 @@ void EngineLoop(EngineState* state) {
                             const size_t emit_len = Utf8ValidPrefixLength(req->utf8_pending);
                             if (emit_len > 0) {
                                 std::string tail(req->utf8_pending.data(), emit_len);
-                                if (!req->json_mode && IsReasoningTagSuppressionEnabled()) {
+                                if (!req->json_mode && req->suppress_reasoning_tags &&
+                                    IsReasoningTagSuppressionEnabled()) {
                                     const bool may_contain_tag =
                                         req->in_think_block || req->in_tool_call_block || req->in_tool_response_block ||
                                         !req->think_tag_pending.empty() || !req->tool_call_tag_pending.empty() ||

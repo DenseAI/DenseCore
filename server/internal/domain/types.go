@@ -9,7 +9,9 @@ import (
 // StreamEvent represents a token event in the stream
 type StreamEvent struct {
 	Token      string
+	TokenID    int
 	IsFinished bool
+	Err        error
 }
 
 type RenderedChatPrompt struct {

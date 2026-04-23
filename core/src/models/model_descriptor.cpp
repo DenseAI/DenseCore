@@ -423,9 +423,12 @@ PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model) 
 
 bool IsKnownTokenizerModel(std::string_view tokenizer_name) {
     const std::string lowered = AsciiLower(tokenizer_name);
-    static constexpr std::array<std::string_view, 13> kKnown = {"llama",  "gpt2",   "qwen2",   "qwen3", "qwen3next",
-                                                                "qwen35", "qwen36", "mistral", "gemma", "gemma4",
-                                                                "bpe",    "glm4",   "glm"};
+    static constexpr std::array<std::string_view, 21> kKnown = {
+        "llama",   "gpt2",      "qwen2",     "qwen2.5",  "qwen3",      "qwen3next", "qwen35",
+        "qwen3.5", "qwen35moe", "qwen36",    "qwen3.6",  "qwen3_5_moe", "qwen3_5_moe_text",
+        "mistral", "gemma",     "gemma4",    "bpe",      "glm4",       "glm",       "sentencepiece",
+        "spm",
+    };
     return MatchesAny(lowered, kKnown);
 }
 

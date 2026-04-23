@@ -65,6 +65,7 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 
 		slog.Debug("worker picked request",
 			slog.Int("worker_id", workerID),
+			slog.String("trace_id", req.TraceID),
 			slog.String("req_id", req.ID),
 			slog.String("priority", fmtPriority(req.Priority)),
 		)
@@ -125,7 +126,10 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 		}
 
 		if err != nil {
-			slog.Error("engine submission failed", slog.String("req_id", req.ID), slog.String("error", err.Error()))
+			slog.Error("engine submission failed",
+				slog.String("trace_id", req.TraceID),
+				slog.String("req_id", req.ID),
+				slog.String("error", err.Error()))
 
 			// Send error to ChatService
 			select {
@@ -140,9 +144,16 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 		// Submission succeeded, so we give them the channel to read tokens.
 		select {
 		case req.ResultChan <- userChan:
+			if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
+				slog.Info("request lifecycle: engine submission succeeded",
+					slog.String("trace_id", req.TraceID),
+					slog.String("queue_request_id", req.ID),
+					slog.Int("worker_id", workerID),
+				)
+			}
 			// 5. Proxy Loop (The Monitor)
 			// This keeps the worker "busy" until generation finishes.
-			proxyStream(workerChan, userChan)
+			proxyStream(req.Context, req.TraceID, req.ID, workerChan, userChan)
 		default:
 			slog.Warn("request result channel abandoned after submission", slog.String("req_id", req.ID))
 			// We just drain and exit.
@@ -159,10 +170,34 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 }
 
 // proxyStream forwards events from source to dest until source closes.
-func proxyStream(src <-chan domain.StreamEvent, dst chan<- domain.StreamEvent) {
+func proxyStream(ctx context.Context, traceID string, queueReqID string, src <-chan domain.StreamEvent, dst chan<- domain.StreamEvent) {
 	defer close(dst)
+	dstAbandoned := false
 	for event := range src {
-		dst <- event
+		if dstAbandoned {
+			continue
+		}
+		select {
+		case dst <- event:
+			if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") && event.Token != "" {
+				slog.Info("request lifecycle: forwarded stream event",
+					slog.String("trace_id", traceID),
+					slog.String("queue_request_id", queueReqID),
+					slog.Bool("finished", event.IsFinished),
+					slog.Bool("has_error", event.Err != nil),
+					slog.String("token_preview", previewText(event.Token, 64)),
+				)
+			}
+		case <-ctx.Done():
+			dstAbandoned = true
+			if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
+				slog.Warn("request lifecycle: stream destination abandoned",
+					slog.String("trace_id", traceID),
+					slog.String("queue_request_id", queueReqID),
+					slog.String("error", ctx.Err().Error()),
+				)
+			}
+		}
 	}
 }
 

@@ -13,6 +13,7 @@ type RequestPriority int
 // QueuedRequest represents a request in the queue
 type QueuedRequest struct {
 	ID                  string
+	TraceID             string
 	Priority            RequestPriority
 	EnqueueTime         time.Time
 	MaxTokens           int

@@ -120,34 +120,46 @@ static void ConfigureHybridScheduler(EngineState* state, TransformerModel* model
 namespace {
 namespace fs = std::filesystem;
 
+std::unique_ptr<ModelEntry> MakeModelEntry(std::string model_id, std::string model_path,
+                                           std::unique_ptr<TransformerModel> model,
+                                           std::unique_ptr<PagedKVCache> kv_cache);
+
 int ReadEnvInt(const char* name, int default_value, bool* was_set = nullptr) {
     return densecore::llm::config::ReadPositiveIntEnv(name, default_value, was_set);
 }
 
-const densecore::llm::config::EngineRuntimeDebugConfig& GetEngineRuntimeDebugConfig() {
-    static const densecore::llm::config::EngineRuntimeDebugConfig config =
-        densecore::llm::config::LoadEngineRuntimeDebugConfig();
+const densecore::llm::config::FastPathRuntimeConfig& ResolveFastPathRuntimeConfig(const EngineState* state) {
+    if (state) {
+        return state->fast_path_config;
+    }
+    static const densecore::llm::config::FastPathRuntimeConfig config =
+        densecore::llm::config::LoadFastPathRuntimeConfig();
     return config;
 }
 
-bool IsVerboseTokenTraceEnabled() {
-    return GetEngineRuntimeDebugConfig().verbose_token_trace;
+const densecore::llm::config::EngineRuntimeDebugConfig& ResolveEngineRuntimeDebugConfig(const EngineState* state) {
+    return ResolveFastPathRuntimeConfig(state).engine_debug;
 }
 
-bool IsRuntimePathLoggingEnabled() {
-    return GetEngineRuntimeDebugConfig().runtime_path_logging;
+bool IsVerboseTokenTraceEnabled(const EngineState* state) {
+    return ResolveEngineRuntimeDebugConfig(state).verbose_token_trace;
 }
 
-bool IsRuntimePathTokenLoggingEnabled() {
-    return GetEngineRuntimeDebugConfig().runtime_path_token_logging;
+bool IsRuntimePathLoggingEnabled(const EngineState* state) {
+    return ResolveEngineRuntimeDebugConfig(state).runtime_path_logging;
 }
 
-bool IsParityDebugEnabled() {
-    return GetEngineRuntimeDebugConfig().parity_debug;
+bool IsRuntimePathTokenLoggingEnabled(const EngineState* state) {
+    return ResolveEngineRuntimeDebugConfig(state).runtime_path_token_logging;
 }
 
-void LogRequestRuntimePath(const TransformerModel* model, const std::string& original_prompt, const Request* req) {
-    if ((!IsRuntimePathLoggingEnabled() && !IsParityDebugEnabled()) || !model || !req) {
+bool IsParityDebugEnabled(const EngineState* state) {
+    return ResolveEngineRuntimeDebugConfig(state).parity_debug;
+}
+
+void LogRequestRuntimePath(const EngineState* state, const TransformerModel* model, const std::string& original_prompt,
+                           const Request* req) {
+    if ((!IsRuntimePathLoggingEnabled(state) && !IsParityDebugEnabled(state)) || !model || !req) {
         return;
     }
 
@@ -170,11 +182,11 @@ void LogRequestRuntimePath(const TransformerModel* model, const std::string& ori
               << " json_mode=" << (req->json_mode ? "1" : "0") << " stop_sequences=" << req->stop_sequences.size()
               << " disallowed_tokens=" << req->disallowed_token_ids.size() << " prompt_tokens=" << req->tokens.size()
               << std::endl;
-    if (IsParityDebugEnabled()) {
+    if (IsParityDebugEnabled(state)) {
         std::cerr << "[ParityRequest] original_prompt=" << original_prompt << std::endl;
         std::cerr << "[ParityRequest] rendered_prompt=" << req->prompt << std::endl;
     }
-    if (IsRuntimePathTokenLoggingEnabled()) {
+    if (IsRuntimePathTokenLoggingEnabled(state)) {
         std::cerr << "[RuntimePathTokens] ids=";
         for (size_t i = 0; i < req->tokens.size(); ++i) {
             if (i != 0) {
@@ -478,13 +490,8 @@ bool LoadOptionalDraftModel(EngineState* state, const std::string& main_model_pa
         return false;
     }
 
-    auto draft_entry = std::make_unique<ModelEntry>();
-    draft_entry->model_id = "draft";
-    draft_entry->model_path = draft_model_path;
-    draft_entry->model = std::unique_ptr<TransformerModel>(draft_model);
-    draft_entry->kv_cache = std::unique_ptr<PagedKVCache>(draft_cache);
-    draft_entry->last_used = std::chrono::steady_clock::now();
-    draft_entry->is_loaded = true;
+    auto draft_entry = MakeModelEntry("draft", draft_model_path, std::unique_ptr<TransformerModel>(draft_model),
+                                      std::unique_ptr<PagedKVCache>(draft_cache));
 
     state->models["draft"] = std::move(draft_entry);
     state->draft_model_id = "draft";
@@ -615,17 +622,6 @@ bool ShouldPrimeQwenNoThinkingPrompt(const TransformerModel* model) {
     if (!descriptor.uses_qwen_thinking_env) {
         return false;
     }
-    auto try_parse_bool_env = [](const char* name, bool* out) {
-        if (!out) {
-            return false;
-        }
-        const char* env = std::getenv(name);
-        if (!env || env[0] == '\0') {
-            return false;
-        }
-        *out = std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0;
-        return true;
-    };
     if (descriptor.variant == ModelVariant::QWEN3) {
         return !ParseBoolEnv("DENSECORE_QWEN3_ENABLE_THINKING", true);
     }
@@ -633,7 +629,10 @@ bool ShouldPrimeQwenNoThinkingPrompt(const TransformerModel* model) {
         return !ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", false);
     }
     if (descriptor.variant == ModelVariant::QWEN36) {
-        return false;
+        if (const char* env = std::getenv("DENSECORE_QWEN36_ENABLE_THINKING"); env && env[0] != '\0') {
+            return std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 || std::strcmp(env, "False") == 0;
+        }
+        return !ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", true);
     }
     return false;
 }
@@ -716,6 +715,59 @@ void InitializePromptSuppressionState(Request* req) {
     req->in_think_block = PromptEndsInsideTaggedBlock(req->prompt, "<think>", "</think>");
     req->in_tool_call_block = PromptEndsInsideTaggedBlock(req->prompt, "<tool_call>", "</tool_call>");
     req->in_tool_response_block = PromptEndsInsideTaggedBlock(req->prompt, "<tool_response>", "</tool_response>");
+    req->suppress_reasoning_tags = !req->in_think_block;
+}
+
+bool IsQwenThinkingEnabledForSuppression(const TransformerModel* model) {
+    if (!model) {
+        return false;
+    }
+    const auto& descriptor = densecore::models::DescribeModel(model);
+    if (!descriptor.uses_qwen_thinking_env) {
+        return false;
+    }
+    if (descriptor.variant == ModelVariant::QWEN3) {
+        return ParseBoolEnv("DENSECORE_QWEN3_ENABLE_THINKING", true);
+    }
+    if (descriptor.variant == ModelVariant::QWEN35) {
+        return ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", false);
+    }
+    if (descriptor.variant == ModelVariant::QWEN36) {
+        const char* env = std::getenv("DENSECORE_QWEN36_ENABLE_THINKING");
+        if (env && env[0] != '\0') {
+            return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0;
+        }
+        return ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", true);
+    }
+    return false;
+}
+
+void ConfigurePromptSuppressionForModel(const TransformerModel* model, Request* req) {
+    if (!model || !req) {
+        return;
+    }
+    const auto& descriptor = densecore::models::DescribeModel(model);
+    if (descriptor.variant == ModelVariant::QWEN36) {
+        if (IsQwenThinkingEnabledForSuppression(model)) {
+            req->suppress_reasoning_tags = false;
+        }
+    }
+}
+
+std::unique_ptr<ModelEntry> MakeModelEntry(std::string model_id, std::string model_path,
+                                           std::unique_ptr<TransformerModel> model,
+                                           std::unique_ptr<PagedKVCache> kv_cache) {
+    auto entry = std::make_unique<ModelEntry>();
+    entry->model_id = std::move(model_id);
+    entry->model_path = std::move(model_path);
+    entry->model = std::move(model);
+    entry->kv_cache = std::move(kv_cache);
+    entry->last_used = std::chrono::steady_clock::now();
+    entry->is_loaded = true;
+    if (entry->model) {
+        entry->transformer_execution_plan = densecore::ResolveTransformerGraphExecutionPlan(entry->model.get());
+    }
+    return entry;
 }
 
 void DebugPrintPromptTokens(const TransformerModel* model, const std::vector<int>& tokens, const char* tag) {
@@ -792,6 +844,21 @@ bool DenseCoreTestOnlyPromptStartsInThinkBlock(const std::string& prompt) {
     req.prompt = prompt;
     InitializePromptSuppressionState(&req);
     return req.in_think_block;
+}
+
+bool DenseCoreTestOnlySuppressesReasoningTagsForPrompt(const std::string& prompt) {
+    Request req{};
+    req.prompt = prompt;
+    InitializePromptSuppressionState(&req);
+    return req.suppress_reasoning_tags;
+}
+
+bool DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(const TransformerModel* model, const std::string& prompt) {
+    Request req{};
+    req.prompt = prompt;
+    InitializePromptSuppressionState(&req);
+    ConfigurePromptSuppressionForModel(model, &req);
+    return req.suppress_reasoning_tags;
 }
 
 std::vector<int> DenseCoreTestOnlyQwenReasoningBlocklist(const TransformerModel* model) {
@@ -1012,6 +1079,7 @@ int SubmitRequestWithSamplingConstraintsEx(DenseCoreHandle handle, const char* p
     MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
     req->parity_debug_text_primed = (req->prompt != prompt_before_text_priming);
     InitializePromptSuppressionState(req);
+    ConfigurePromptSuppressionForModel(model_entry->model.get(), req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     const std::vector<int> tokens_before_priming = req->tokens;
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
@@ -1026,7 +1094,7 @@ int SubmitRequestWithSamplingConstraintsEx(DenseCoreHandle handle, const char* p
     }
     DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "sampling");
     req->token_history = req->tokens;
-    LogRequestRuntimePath(model_entry->model.get(), prompt, req);
+    LogRequestRuntimePath(state, model_entry->model.get(), prompt, req);
 
     AssignGenerationTier(req);
     EnqueueRequest(state, req);
@@ -1063,6 +1131,7 @@ int SubmitRequestWithTokenResults(DenseCoreHandle handle, const char* prompt, in
     MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
     req->parity_debug_text_primed = (req->prompt != token_result_prompt_before_text_priming);
     InitializePromptSuppressionState(req);
+    ConfigurePromptSuppressionForModel(model_entry->model.get(), req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     const std::vector<int> token_result_tokens_before_priming = req->tokens;
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
@@ -1072,7 +1141,7 @@ int SubmitRequestWithTokenResults(DenseCoreHandle handle, const char* prompt, in
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "token_results");
     req->token_history = req->tokens;
-    LogRequestRuntimePath(model_entry->model.get(), prompt, req);
+    LogRequestRuntimePath(state, model_entry->model.get(), prompt, req);
 
     AssignGenerationTier(req);
     EnqueueRequest(state, req);
@@ -1514,6 +1583,7 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
         state->numa_node_id = numa_node_id;
         state->pinning_policy = pinning_policy;
         state->n_threads = threads;  // Store for worker thread
+        state->fast_path_config = densecore::llm::config::LoadFastPathRuntimeConfig();
 
         // Initialize OpRegistry (Dependency Injection)
         state->op_registry = std::make_unique<densecore::OpRegistry>();
@@ -1553,14 +1623,8 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
         }
 
         // Wrap model and cache into ModelEntry and add to pool
-        auto entry = std::make_unique<ModelEntry>();
-        entry->model_id = "default";
-        entry->model_path = canonical_model_path;
-        entry->model = std::unique_ptr<TransformerModel>(model);
-        entry->kv_cache = std::unique_ptr<PagedKVCache>(cache);
-        entry->last_used = std::chrono::steady_clock::now();
-        entry->is_loaded = true;
-
+        auto entry = MakeModelEntry("default", canonical_model_path, std::unique_ptr<TransformerModel>(model),
+                                    std::unique_ptr<PagedKVCache>(cache));
         state->models["default"] = std::move(entry);
         state->default_model_id = "default";
         if (!LoadOptionalDraftModel(state.get(), canonical_model_path, canonical_draft_model_path, GGML_TYPE_F16,
@@ -1682,6 +1746,7 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
         state->numa_node_id = numa_node_id;
         state->pinning_policy = pinning_policy;
         state->n_threads = threads;
+        state->fast_path_config = densecore::llm::config::LoadFastPathRuntimeConfig();
 
         // Initialize OpRegistry (Dependency Injection)
         state->op_registry = std::make_unique<densecore::OpRegistry>();
@@ -1712,14 +1777,8 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
         std::cout << "[DenseCore] KV Cache initialized with type: " << type_name << std::endl;
 
         // Create model entry
-        auto entry = std::make_unique<ModelEntry>();
-        entry->model_id = "default";
-        entry->model_path = canonical_model_path;
-        entry->model = std::unique_ptr<TransformerModel>(model);
-        entry->kv_cache = std::unique_ptr<PagedKVCache>(cache);
-        entry->last_used = std::chrono::steady_clock::now();
-        entry->is_loaded = true;
-
+        auto entry = MakeModelEntry("default", canonical_model_path, std::unique_ptr<TransformerModel>(model),
+                                    std::unique_ptr<PagedKVCache>(cache));
         state->models["default"] = std::move(entry);
         state->default_model_id = "default";
         if (!LoadOptionalDraftModel(state.get(), canonical_model_path, canonical_draft_model_path, cache_type,
@@ -2022,7 +2081,7 @@ void CallbackLoop(EngineState* state) {
                 }
             }
 
-            if (IsVerboseTokenTraceEnabled()) {
+            if (IsVerboseTokenTraceEnabled(state)) {
                 std::cerr << "[TRACE] CallbackLoop popped event for request " << event.request_id
                           << " (finished=" << event.finished << ")" << std::endl;
             }
@@ -2093,10 +2152,11 @@ int SubmitRequest(DenseCoreHandle handle, const char* prompt, int max_tokens, co
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
     MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
     InitializePromptSuppressionState(req);
+    ConfigurePromptSuppressionForModel(model_entry->model.get(), req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
-    LogRequestRuntimePath(model_entry->model.get(), prompt, req);
+    LogRequestRuntimePath(state, model_entry->model.get(), prompt, req);
 
     ApplyDefaultLora(state, req);
     AssignGenerationTier(req);
@@ -2175,10 +2235,11 @@ int SubmitRequestWithFormatEx(DenseCoreHandle handle, const char* prompt, int ma
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
     MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
     InitializePromptSuppressionState(req);
+    ConfigurePromptSuppressionForModel(model_entry->model.get(), req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
-    LogRequestRuntimePath(model_entry->model.get(), prompt, req);
+    LogRequestRuntimePath(state, model_entry->model.get(), prompt, req);
 
     AssignGenerationTier(req);
     EnqueueRequest(state, req);
@@ -2418,13 +2479,8 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
     }
 
     // Create model entry with unique_ptr ownership
-    auto entry = std::make_unique<ModelEntry>();
-    entry->model_id = model_id;
-    entry->model_path = canonical_model_path;
-    entry->model = std::unique_ptr<TransformerModel>(model);
-    entry->kv_cache = std::unique_ptr<PagedKVCache>(cache);
-    entry->last_used = std::chrono::steady_clock::now();
-    entry->is_loaded = true;
+    auto entry = MakeModelEntry(model_id, canonical_model_path, std::unique_ptr<TransformerModel>(model),
+                                std::unique_ptr<PagedKVCache>(cache));
 
     // Add to pool
     {

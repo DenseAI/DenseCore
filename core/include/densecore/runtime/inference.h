@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "densecore/hal/tensor.h"
+#include "llm/config/runtime_config.h"
 #include "densecore/memory/kv_cache.h"
 #include "densecore/models/model_graph_capabilities.h"
 #include "densecore/models/model_types.h"
@@ -126,6 +127,8 @@ struct InferenceDependencies {
     densecore::HardwareTopology* hardware_topology = nullptr;
     densecore::BackendRegistry* backend_registry = nullptr;
     densecore::OpRegistry* op_registry = nullptr;
+    const densecore::llm::config::FastPathRuntimeConfig* fast_path_config = nullptr;
+    const densecore::TransformerGraphExecutionPlan* transformer_execution_plan = nullptr;
     densecore::DeviceType preferred_device = densecore::DeviceType::CPU;
     densecore::DeviceType preferred_matmul_device = densecore::DeviceType::CPU;
     densecore::DeviceType preferred_attention_device = densecore::DeviceType::CPU;

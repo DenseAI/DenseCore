@@ -96,6 +96,27 @@ func TestNormalizeSamplingQwenNoThinkingDefaults(t *testing.T) {
 	}
 }
 
+func TestNormalizeSamplingQwen36NoThinkingDefaultsAreConservative(t *testing.T) {
+	svc := &ChatService{}
+	enableThinking := false
+
+	temperature, topP, topK, repetitionPenalty := svc.normalizeSampling("/tmp/Qwen3.6-35B-A3B-Q4_K_M.gguf", "", "", domain.ChatCompletionRequest{
+		ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking},
+	})
+	if temperature != 0.0 {
+		t.Fatalf("expected qwen3.6 no-thinking temperature 0.0, got %v", temperature)
+	}
+	if topP != 1.0 {
+		t.Fatalf("expected qwen3.6 no-thinking top_p 1.0, got %v", topP)
+	}
+	if topK != 1 {
+		t.Fatalf("expected qwen3.6 no-thinking top_k 1, got %v", topK)
+	}
+	if repetitionPenalty != 1.0 {
+		t.Fatalf("expected qwen3.6 no-thinking repetition penalty 1.0, got %v", repetitionPenalty)
+	}
+}
+
 func TestNormalizeSamplingQwenThinkingDefaults(t *testing.T) {
 	svc := &ChatService{}
 	t.Setenv("DENSECORE_QWEN35_ENABLE_THINKING", "true")

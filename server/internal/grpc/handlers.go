@@ -47,7 +47,6 @@ func (h *DenseCoreHandler) ChatCompletion(ctx context.Context, req *ChatCompleti
 
 	// Start generation in a separate goroutine
 	go func() {
-		defer close(outputChan)
 		if err := h.chatService.GenerateStream(ctx, domainReq, outputChan); err != nil {
 			errChan <- err
 		}
@@ -115,7 +114,6 @@ func (h *DenseCoreHandler) StreamChatCompletion(req *ChatCompletionRequest, stre
 
 	// Start generation in a separate goroutine
 	go func() {
-		defer close(outputChan)
 		if err := h.chatService.GenerateStream(ctx, domainReq, outputChan); err != nil {
 			errChan <- err
 		}
