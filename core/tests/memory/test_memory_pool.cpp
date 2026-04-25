@@ -8,7 +8,7 @@
 #include <thread>
 #include <vector>
 
-#include "memory_pool.h"
+#include "densecore/memory/memory_pool.h"
 
 using namespace densecore;
 

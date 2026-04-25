@@ -162,8 +162,7 @@ std::array<float, 3> ComputeImageMeanRgb(const Tensor& image) {
     }
 
     for (int c = 0; c < 3; ++c) {
-        rgb[static_cast<size_t>(c)] =
-            static_cast<float>(std::clamp(sums[c] / static_cast<double>(used), -4.0, 4.0));
+        rgb[static_cast<size_t>(c)] = static_cast<float>(std::clamp(sums[c] / static_cast<double>(used), -4.0, 4.0));
     }
     return rgb;
 }
@@ -233,13 +232,11 @@ public:
 
         for (int d = 0; d < kDefaultDof; ++d) {
             const float channel_bias = rgb[static_cast<size_t>(d % 3)] * 31.0f;
-            const float hash_bias =
-                static_cast<float>((prompt_hash >> ((d % 4) * 8)) & 0xFFu) / 255.0f;
-            const int token =
-                std::clamp(static_cast<int>(std::lround(
-                               96.0f + channel_bias + hash_bias * 127.0f +
-                               static_cast<float>((arch_tag + static_cast<uint32_t>(d * 17)) % 23))),
-                           0, kDefaultActionVocab - 1);
+            const float hash_bias = static_cast<float>((prompt_hash >> ((d % 4) * 8)) & 0xFFu) / 255.0f;
+            const int token = std::clamp(
+                static_cast<int>(std::lround(96.0f + channel_bias + hash_bias * 127.0f +
+                                             static_cast<float>((arch_tag + static_cast<uint32_t>(d * 17)) % 23))),
+                0, kDefaultActionVocab - 1);
             const size_t base = static_cast<size_t>(d) * kDefaultActionVocab;
             logits_storage[base + static_cast<size_t>(token)] = 8.0f;
             if (token > 0) {
@@ -1348,7 +1345,8 @@ bool ModelGraphBridge::RegisterLlmBuilder(const TransformerModel* model) {
     });
     GraphRegistry::Instance().Register(
         "openvla", [model]() -> std::unique_ptr<GraphBuilder> { return std::make_unique<OpenVlaGraphBuilder>(model); });
-    std::cout << "[ModelGraphBridge] Registered GenericLlmBuilder for llm_generic/llm_universal and OpenVlaGraphBuilder for openvla"
+    std::cout << "[ModelGraphBridge] Registered GenericLlmBuilder for llm_generic/llm_universal and "
+                 "OpenVlaGraphBuilder for openvla"
               << std::endl;
     return true;
 }

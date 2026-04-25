@@ -38,7 +38,9 @@ static int SubmitEmbeddingRequestWrapper(DenseCoreHandle handle, const char* pro
 import "C"
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -111,6 +113,11 @@ func (m *RequestChannelMap) cleanupStaleChannels(ttl time.Duration) {
 	m.mu.RLock()
 	for id, item := range m.channels {
 		if item.createdAt.Before(threshold) {
+			if _, active := completionChannels.Load(id); active {
+				// Active requests can legitimately outlive the stale-channel TTL.
+				// Do not tear down their callback channels underneath an in-flight stream.
+				continue
+			}
 			staleIDs = append(staleIDs, id)
 		}
 	}
@@ -225,17 +232,30 @@ func StartMapCleanupTicker(interval, ttl time.Duration) {
 	requestChannels.StartCleanupTicker(interval, ttl)
 }
 
+func terminalErrorFromCallbackToken(token string) error {
+	message := strings.TrimSpace(token)
+	if message == "" || !strings.HasPrefix(message, "Error:") {
+		return nil
+	}
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "cancel"):
+		return fmt.Errorf("%w: %s", context.Canceled, message)
+	case strings.Contains(lower, "timeout"):
+		return fmt.Errorf("%w: %s", context.DeadlineExceeded, message)
+	default:
+		return errors.New(message)
+	}
+}
+
 //export streamCallbackGateway
 func streamCallbackGateway(token *C.char, isFinished C.int, userData unsafe.Pointer) {
 	id := uintptr(userData)
 	if ch, ok := requestChannels.Load(id); ok {
 		tokenStr := C.GoString(token)
-		event := domain.StreamEvent{
-			Token:      tokenStr,
-			IsFinished: isFinished != 0,
-		}
-		if isFinished != 0 && strings.HasPrefix(tokenStr, "Error:") {
-			event.Err = errors.New(strings.TrimSpace(tokenStr))
+		event := domain.StreamEvent{Token: tokenStr}
+		if isFinished != 0 {
+			event = domain.NewTerminalEvent(terminalErrorFromCallbackToken(tokenStr))
 		}
 		ch <- event
 

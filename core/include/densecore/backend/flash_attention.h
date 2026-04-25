@@ -82,6 +82,10 @@ struct FlashAttentionScratch {
     // on every FlashAttentionForward call (hot path during decode/prefill).
     simd::AlignedVector<float> global_max;  // [seq_q] running max per query
     simd::AlignedVector<float> global_sum;  // [seq_q] running exp-sum per query
+    simd::AlignedVector<float> strided_q;   // [seq_q, head_dim] staged contiguous Q rows
+    simd::AlignedVector<float> strided_k;   // [seq_kv, head_dim] staged contiguous K rows
+    simd::AlignedVector<float> strided_v;   // [seq_kv, head_dim] staged contiguous V rows
+    simd::AlignedVector<float> strided_o;   // [seq_q, head_dim] staged contiguous output rows
 
     void Resize(int block_m, int block_n, int head_dim) {
         qk_block.resize(block_m * block_n);
@@ -93,6 +97,19 @@ struct FlashAttentionScratch {
         o_block.resize(block_m * head_dim);
         alpha_buf.resize(block_m);
         beta_buf.resize(block_m);
+    }
+
+    void EnsureStridedBuffers(int seq_q, int seq_kv, int head_dim) {
+        const size_t q_elems = static_cast<size_t>(seq_q) * head_dim;
+        const size_t kv_elems = static_cast<size_t>(seq_kv) * head_dim;
+        if (strided_q.size() < q_elems) {
+            strided_q.resize(q_elems);
+            strided_o.resize(q_elems);
+        }
+        if (strided_k.size() < kv_elems) {
+            strided_k.resize(kv_elems);
+            strided_v.resize(kv_elems);
+        }
     }
 
     /**
@@ -257,6 +274,47 @@ inline void FlashAttentionSingleQueryStridedKV(const float* q_row, const float* 
 
         running_max = new_max;
         running_sum = new_sum;
+    }
+}
+
+inline void FlashAttentionForward(const float* Q, const float* K, const float* V, float* O, int seq_len_q,
+                                  int seq_len_kv, int head_dim, const FlashAttentionConfig& config,
+                                  FlashAttentionScratch& scratch);
+
+inline void FlashAttentionForwardStrided(const float* Q, int64_t q_row_stride, const float* K, int64_t k_row_stride,
+                                         const float* V, int64_t v_row_stride, float* O, int64_t o_row_stride,
+                                         int seq_len_q, int seq_len_kv, int head_dim,
+                                         const FlashAttentionConfig& config, FlashAttentionScratch& scratch) {
+    if (!Q || !K || !V || !O || seq_len_q <= 0 || seq_len_kv <= 0 || head_dim <= 0) {
+        return;
+    }
+    if (q_row_stride == head_dim && k_row_stride == head_dim && v_row_stride == head_dim && o_row_stride == head_dim) {
+        FlashAttentionForward(Q, K, V, O, seq_len_q, seq_len_kv, head_dim, config, scratch);
+        return;
+    }
+
+    scratch.EnsureStridedBuffers(seq_len_q, seq_len_kv, head_dim);
+    float* q_contig = scratch.strided_q.data();
+    float* k_contig = scratch.strided_k.data();
+    float* v_contig = scratch.strided_v.data();
+    float* o_contig = scratch.strided_o.data();
+
+    for (int qi = 0; qi < seq_len_q; ++qi) {
+        std::memcpy(q_contig + static_cast<size_t>(qi) * head_dim, Q + static_cast<int64_t>(qi) * q_row_stride,
+                    static_cast<size_t>(head_dim) * sizeof(float));
+    }
+    for (int ki = 0; ki < seq_len_kv; ++ki) {
+        std::memcpy(k_contig + static_cast<size_t>(ki) * head_dim, K + static_cast<int64_t>(ki) * k_row_stride,
+                    static_cast<size_t>(head_dim) * sizeof(float));
+        std::memcpy(v_contig + static_cast<size_t>(ki) * head_dim, V + static_cast<int64_t>(ki) * v_row_stride,
+                    static_cast<size_t>(head_dim) * sizeof(float));
+    }
+
+    FlashAttentionForward(q_contig, k_contig, v_contig, o_contig, seq_len_q, seq_len_kv, head_dim, config, scratch);
+
+    for (int qi = 0; qi < seq_len_q; ++qi) {
+        std::memcpy(O + static_cast<int64_t>(qi) * o_row_stride, o_contig + static_cast<size_t>(qi) * head_dim,
+                    static_cast<size_t>(head_dim) * sizeof(float));
     }
 }
 

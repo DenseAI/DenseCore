@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "cpu_backend.h"
+#include "densecore/backend/cpu_backend.h"
 #include "densecore/hal/operation_graph.h"
 
 TEST(GraphDomainOps, PatchEmbed2D_ExecuteGraph) {

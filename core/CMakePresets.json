@@ -1,0 +1,58 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base-release",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/../build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "DENSECORE_BUILD_TESTS": "ON",
+        "DENSECORE_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "c4-perf",
+      "displayName": "C4 Performance",
+      "description": "Intel C4 performance profile with oneDNN, LTO, and native ISA enabled for prefill/decode tuning.",
+      "inherits": "base-release",
+      "binaryDir": "${sourceDir}/../build-c4-perf",
+      "cacheVariables": {
+        "DENSECORE_USE_ONEDNN": "ON",
+        "DENSECORE_LTO": "ON",
+        "DENSECORE_ARM_CORRECTNESS_FIRST": "OFF",
+        "GGML_NATIVE": "ON"
+      }
+    },
+    {
+      "name": "c4a-perf",
+      "displayName": "C4A Performance",
+      "description": "Google Axion / Neoverse-V2 performance profile with correctness-first disabled and explicit ARM tuning.",
+      "inherits": "base-release",
+      "binaryDir": "${sourceDir}/../build-c4a-perf",
+      "cacheVariables": {
+        "DENSECORE_ARM_CORRECTNESS_FIRST": "OFF",
+        "DENSECORE_ARM_MCPU": "neoverse-v2",
+        "DENSECORE_LTO": "ON",
+        "DENSECORE_USE_ONEDNN": "OFF",
+        "GGML_NATIVE": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-c4-perf",
+      "configurePreset": "c4-perf"
+    },
+    {
+      "name": "build-c4a-perf",
+      "configurePreset": "c4a-perf"
+    }
+  ]
+}

@@ -27,7 +27,9 @@ func (m *MockEngine) GenerateStream(ctx context.Context, prompt string, maxToken
 	}
 	// Default behavior: send one token and finish
 	go func() {
-		outputChan <- domain.StreamEvent{Token: "mock response", IsFinished: true}
+		outputChan <- domain.StreamEvent{Token: "mock response"}
+		outputChan <- domain.NewTerminalEvent(nil)
+		close(outputChan)
 	}()
 	return nil
 }
@@ -44,7 +46,8 @@ func (m *MockEngine) GenerateStreamTokensWithSampling(ctx context.Context, input
 	return m.GenerateStream(ctx, "", maxTokens, outputChan)
 }
 
-func (m *MockEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool) (*domain.RenderedChatPrompt, error) {
+func (m *MockEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool,
+	preserveThinking *bool) (*domain.RenderedChatPrompt, error) {
 	return &domain.RenderedChatPrompt{RenderedPrompt: "mock prompt"}, nil
 }
 
@@ -237,7 +240,8 @@ func TestChatCompletionHandler(t *testing.T) {
 					return tt.mockError
 				}
 				go func() {
-					outputChan <- domain.StreamEvent{Token: tt.mockResponse, IsFinished: true}
+					outputChan <- domain.StreamEvent{Token: tt.mockResponse}
+					outputChan <- domain.NewTerminalEvent(nil)
 					close(outputChan)
 				}()
 				return nil
@@ -280,8 +284,8 @@ func TestChatCompletionHandler_Stream(t *testing.T) {
 	mockModelService := NewMockModelService()
 	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
 		go func() {
-			outputChan <- domain.StreamEvent{Token: "Paris", IsFinished: false}
-			outputChan <- domain.StreamEvent{Token: "", IsFinished: true}
+			outputChan <- domain.StreamEvent{Token: "Paris"}
+			outputChan <- domain.NewTerminalEvent(nil)
 			close(outputChan)
 		}()
 		return nil
@@ -361,7 +365,8 @@ func TestCompletionHandler(t *testing.T) {
 			mockModelService := NewMockModelService()
 			mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
 				go func() {
-					outputChan <- domain.StreamEvent{Token: tt.mockResponse, IsFinished: true}
+					outputChan <- domain.StreamEvent{Token: tt.mockResponse}
+					outputChan <- domain.NewTerminalEvent(nil)
 					close(outputChan)
 				}()
 				return nil
@@ -398,8 +403,8 @@ func TestCompletionHandler_Stream(t *testing.T) {
 	mockModelService := NewMockModelService()
 	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
 		go func() {
-			outputChan <- domain.StreamEvent{Token: "Paris", IsFinished: false}
-			outputChan <- domain.StreamEvent{Token: "", IsFinished: true}
+			outputChan <- domain.StreamEvent{Token: "Paris"}
+			outputChan <- domain.NewTerminalEvent(nil)
 			close(outputChan)
 		}()
 		return nil
@@ -520,8 +525,8 @@ func TestChatCompletionHandlerStreamWritesSSEErrorAfterPartialOutput(t *testing.
 	mockModelService := NewMockModelService()
 	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
 		go func() {
-			outputChan <- domain.StreamEvent{Token: "Paris", IsFinished: false}
-			outputChan <- domain.StreamEvent{Err: errors.New("engine failed after first token")}
+			outputChan <- domain.StreamEvent{Token: "Paris"}
+			outputChan <- domain.NewTerminalEvent(errors.New("engine failed after first token"))
 			close(outputChan)
 		}()
 		return nil
@@ -558,11 +563,55 @@ func TestChatCompletionHandlerStreamWritesSSEErrorAfterPartialOutput(t *testing.
 	}
 }
 
+func TestChatCompletionHandlerStreamAbnormalCloseAfterPartialOutputWritesSSEError(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			outputChan <- domain.StreamEvent{Token: "Paris"}
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
+		Model: "test-model",
+		Messages: []domain.Message{
+			{Role: "user", Content: "What is the capital of France?"},
+		},
+		Stream: true,
+	})
+	w := httptest.NewRecorder()
+
+	handler.ChatCompletionHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200 after partial stream, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Paris") {
+		t.Fatalf("expected first streamed token, got %q", body)
+	}
+	if !strings.Contains(body, ErrCodeServerError) {
+		t.Fatalf("expected streamed internal error payload, got %q", body)
+	}
+	if strings.Contains(body, "[DONE]") {
+		t.Fatalf("unexpected successful terminator after abnormal close: %q", body)
+	}
+}
+
 func TestCompletionHandlerSyncEngineErrorDoesNotBecomeCompletionText(t *testing.T) {
 	mockModelService := NewMockModelService()
 	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
 		go func() {
-			outputChan <- domain.StreamEvent{Err: errors.New("engine failed")}
+			outputChan <- domain.NewTerminalEvent(errors.New("engine failed"))
 			close(outputChan)
 		}()
 		return nil
@@ -589,6 +638,40 @@ func TestCompletionHandlerSyncEngineErrorDoesNotBecomeCompletionText(t *testing.
 	}
 	if strings.Contains(w.Body.String(), "\"text\":\"engine failed\"") {
 		t.Fatalf("engine error leaked into completion payload: %q", w.Body.String())
+	}
+}
+
+func TestCompletionHandlerSyncClosedWithoutTerminalReturnsInternalError(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			outputChan <- domain.StreamEvent{Token: "partial"}
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/completions", domain.CompletionRequest{
+		Model:  "test-model",
+		Prompt: "Explain why the sky is blue.",
+	})
+	w := httptest.NewRecorder()
+
+	handler.CompletionHandler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status 500, got %d with body %q", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), ErrCodeServerError) {
+		t.Fatalf("expected internal error code in body, got %q", w.Body.String())
 	}
 }
 

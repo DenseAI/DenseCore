@@ -8,8 +8,8 @@
 #include <gtest/gtest.h>
 #include <set>
 
-#include "kv_cache.h"
-#include "model_types.h"
+#include "densecore/memory/kv_cache.h"
+#include "densecore/models/model_types.h"
 
 // =============================================================================
 // SequenceBlockTable Tests

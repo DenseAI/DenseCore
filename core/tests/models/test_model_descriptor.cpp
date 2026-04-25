@@ -4,7 +4,7 @@
 
 #include "densecore/models/model_graph_capabilities.h"
 #include "densecore/models/model_descriptor.h"
-#include "model_types.h"
+#include "densecore/models/model_types.h"
 #include "models/model_inference_policy.h"
 
 TEST(ModelDescriptorTest, ResolveGemma4AliasPreservesRuntimeFlags) {
@@ -55,6 +55,17 @@ TEST(ModelDescriptorTest, ResolveQwen35AliasMarksHybridSSM) {
     EXPECT_TRUE(resolved.arch_flags.requires_k_norm);
 }
 
+TEST(ModelDescriptorTest, ResolveQwen36AliasReusesHybridSsmRuntimeWithVariantOverride) {
+    const auto resolved = densecore::models::ResolveModelDescriptor("Qwen3.6-35B-A3B");
+
+    ASSERT_TRUE(resolved.known);
+    EXPECT_EQ(resolved.arch, ModelArch::QWEN35);
+    EXPECT_EQ(resolved.variant, ModelVariant::QWEN36);
+    EXPECT_TRUE(resolved.arch_flags.is_hybrid_ssm);
+    EXPECT_TRUE(resolved.arch_flags.requires_q_norm);
+    EXPECT_TRUE(resolved.arch_flags.requires_k_norm);
+}
+
 TEST(ModelDescriptorTest, ResolveQwen3NextAliasReusesHybridSsmRuntime) {
     const auto resolved = densecore::models::ResolveModelDescriptor("qwen3next");
 
@@ -87,6 +98,21 @@ TEST(ModelDescriptorTest, TokenizerMetadataOverridesDescriptorFamily) {
 
     EXPECT_EQ(densecore::models::ResolveTokenizerFamily(&model),
               densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE);
+}
+
+TEST(ModelDescriptorTest, Qwen36TokenizerMetadataUsesQwen35UnicodeFamily) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.tokenizer_type = "qwen3.6";
+
+    EXPECT_EQ(densecore::models::ResolveTokenizerFamily(&model),
+              densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE);
+}
+
+TEST(ModelDescriptorTest, Qwen36TokenizerAliasIsRecognizedWithoutCompatibilityWarning) {
+    EXPECT_TRUE(densecore::models::IsKnownTokenizerModel("qwen3.6"));
+    EXPECT_TRUE(densecore::models::IsKnownTokenizerModel("qwen3_5_moe"));
 }
 
 TEST(ModelDescriptorTest, ChatTemplateMetadataOverridesPromptFamily) {

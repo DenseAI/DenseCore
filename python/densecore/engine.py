@@ -245,7 +245,10 @@ class DenseCoreChatMessage(ctypes.Structure):
 
 
 class DenseCoreChatTemplateOptions(ctypes.Structure):
-    _fields_ = [("enable_thinking", ctypes.c_int)]
+    _fields_ = [
+        ("enable_thinking", ctypes.c_int),
+        ("preserve_thinking", ctypes.c_int),
+    ]
 
 
 class DenseCoreRenderedChatPrompt(ctypes.Structure):
@@ -2184,6 +2187,7 @@ class DenseCore:
         messages: List[Dict[str, Any]],
         *,
         enable_thinking: Optional[bool] = None,
+        preserve_thinking: Optional[bool] = None,
         extra_system_messages: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         if not getattr(self, "_has_native_chat_render_api", False):
@@ -2217,7 +2221,8 @@ class DenseCore:
             )
 
         options = DenseCoreChatTemplateOptions(
-            enable_thinking=-1 if enable_thinking is None else int(bool(enable_thinking))
+            enable_thinking=-1 if enable_thinking is None else int(bool(enable_thinking)),
+            preserve_thinking=-1 if preserve_thinking is None else int(bool(preserve_thinking)),
         )
         rendered = DenseCoreRenderedChatPrompt()
         self._lib.DenseCoreRenderChatPrompt(
@@ -2304,6 +2309,7 @@ class DenseCore:
             prompt_meta = self.render_chat_prompt(
                 messages,
                 enable_thinking=kwargs.get("enable_thinking"),
+                preserve_thinking=kwargs.get("preserve_thinking"),
                 extra_system_messages=extra_system_messages,
             )
         else:

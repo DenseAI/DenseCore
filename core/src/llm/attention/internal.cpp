@@ -33,10 +33,12 @@ int EffectiveAutoPagedContextFloor(const TransformerModel* model, int requested_
     // was tuned conservatively and leaves short interactive prompts on the slower
     // fallback path. Keep the generic floor for other models and relax it only for
     // Qwen dense / hybrid-attention layers.
-    switch (model->arch) {
-    case ModelArch::QWEN3: return std::min(requested_floor, n_tokens_in_batch > 1 ? 32 : 16);
-    default: return requested_floor;
+    if (model->arch == ModelArch::QWEN3 ||
+        (model->arch == ModelArch::QWEN35 && model->variant == ModelVariant::QWEN36 &&
+         densecore::models::SupportsPagedDecodeAttention(model))) {
+        return std::min(requested_floor, n_tokens_in_batch > 1 ? 32 : 16);
     }
+    return requested_floor;
 }
 
 static_assert(static_cast<std::size_t>(DecodePagedFallbackReason::AutoContextShort) + 1 ==

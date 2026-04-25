@@ -11,9 +11,9 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
-#include "inference.h"
-#include "densecore/inference_types_internal.h"
-#include "qwen35_ssm_math.h"
+#include "densecore/runtime/inference.h"
+#include "runtime/inference_types_internal.h"
+#include "densecore/models/qwen35_ssm_math.h"
 
 // ==========================================================================
 // Qwen3.5 SSM QKV Projection Boundary Regression Tests
@@ -91,6 +91,17 @@ bool AllFinite(const float* data, int n) {
         if (!std::isfinite(data[i])) return false;
     }
     return true;
+}
+
+uint64_t HashFloatVector(const std::vector<float>& values) {
+    uint64_t hash = 1469598103934665603ull;
+    for (float value : values) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        hash ^= static_cast<uint64_t>(bits);
+        hash *= 1099511628211ull;
+    }
+    return hash;
 }
 
 }  // namespace
@@ -543,6 +554,241 @@ TEST(Qwen35SSMQkvProjection, CallbackMatchesPreSiluQkvInputs) {
         EXPECT_NEAR(callback_out[static_cast<size_t>(i)], expected[static_cast<size_t>(i)], 1e-5f)
             << "callback mismatch at index " << i;
     }
+}
+
+TEST(Qwen35SSMQkvProjection, CallbackStateWritebackPreservesNeighborHeadBoundaries) {
+    constexpr int nEmbd = 4;
+    constexpr int nHeads = 2;
+    constexpr int nGroups = 1;
+    constexpr int headDimK = 2;
+    constexpr int headDimV = 3;
+    constexpr int dInner = nHeads * headDimV;
+    constexpr int convChannels = dInner + 2 * nGroups * headDimK;
+    constexpr int stateStride = headDimK * headDimV;
+
+    const std::vector<float> z = {0.1f, -0.2f, 0.3f, 0.4f, -0.5f, 0.6f};
+    const std::vector<float> qkv_pre_silu = {
+        0.25f, -0.1f,
+        0.15f, 0.05f,
+        0.9f, -0.7f, 0.3f,
+        -0.2f, 0.8f, -0.4f,
+    };
+    const std::vector<float> input_t = {0.2f, -0.1f, 0.05f, 0.3f};
+    const std::vector<float> alpha = {
+        0.1f, -0.05f, 0.02f, 0.03f,
+        -0.04f, 0.02f, 0.01f, -0.03f,
+    };
+    const std::vector<float> beta = {
+        -0.08f, 0.03f, 0.06f, -0.1f,
+        0.05f, -0.02f, 0.04f, 0.01f,
+    };
+    const std::vector<float> dt_bias = {-0.15f, -0.12f};
+    const std::vector<float> a_log = {-1.2f, -1.0f};
+    const std::vector<float> norm = {1.0f, 1.0f, 1.0f};
+
+    std::vector<float> state(static_cast<size_t>(nHeads) * stateStride, 0.0f);
+    std::vector<float> baseline = state;
+    std::vector<float> expected_head0(headDimV, 0.0f);
+    std::vector<float> expected_head1(headDimV, 0.0f);
+
+    for (size_t i = 0; i < state.size(); ++i) {
+        state[i] = baseline[i] = 0.01f * static_cast<float>(i + 1);
+    }
+
+    std::vector<float> qkv_post_silu(qkv_pre_silu.size(), 0.0f);
+    for (size_t i = 0; i < qkv_pre_silu.size(); ++i) {
+        const float x = qkv_pre_silu[i];
+        qkv_post_silu[i] = x / (1.0f + std::exp(-x));
+    }
+
+    const float* q_base = qkv_post_silu.data();
+    const float* k_base = q_base + headDimK;
+    const float* v_base = k_base + headDimK;
+    for (int h = 0; h < nHeads; ++h) {
+        Qwen35SSMHeadStepConfig cfg{};
+        cfg.input_t = input_t.data();
+        cfg.q_head = q_base;
+        cfg.k_head = k_base;
+        cfg.v_head = v_base + static_cast<size_t>(h) * headDimV;
+        cfg.z_head = z.data() + static_cast<size_t>(h) * headDimV;
+        cfg.alpha_row = alpha.data() + static_cast<size_t>(h) * nEmbd;
+        cfg.beta_row = beta.data() + static_cast<size_t>(h) * nEmbd;
+        cfg.norm_weight = norm.data();
+        cfg.n_embd = nEmbd;
+        cfg.head_dim_k = headDimK;
+        cfg.head_dim_v = headDimV;
+        cfg.dt_bias = dt_bias[static_cast<size_t>(h)];
+        cfg.a_log = a_log[static_cast<size_t>(h)];
+        cfg.norm_eps = 1e-6f;
+
+        float* baseline_head = baseline.data() + static_cast<size_t>(h) * stateStride;
+        float* expected_y = (h == 0) ? expected_head0.data() : expected_head1.data();
+        ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(cfg, baseline_head, expected_y, nullptr));
+    }
+
+    struct ggml_tensor a = {};
+    struct ggml_tensor b = {};
+    struct ggml_tensor c = {};
+    struct ggml_tensor dst = {};
+    std::vector<float> callback_out(static_cast<size_t>(dInner), 0.0f);
+    a.data = const_cast<float*>(z.data());
+    b.data = const_cast<float*>(qkv_pre_silu.data());
+    c.data = const_cast<float*>(input_t.data());
+    dst.data = callback_out.data();
+    a.type = GGML_TYPE_F32;
+    b.type = GGML_TYPE_F32;
+    c.type = GGML_TYPE_F32;
+    dst.type = GGML_TYPE_F32;
+    a.ne[0] = dInner; a.ne[1] = 1;
+    b.ne[0] = convChannels; b.ne[1] = 1;
+    c.ne[0] = nEmbd; c.ne[1] = 1;
+    dst.ne[0] = dInner; dst.ne[1] = 1;
+    a.nb[0] = sizeof(float); a.nb[1] = dInner * sizeof(float);
+    b.nb[0] = sizeof(float); b.nb[1] = convChannels * sizeof(float);
+    c.nb[0] = sizeof(float); c.nb[1] = nEmbd * sizeof(float);
+    dst.nb[0] = sizeof(float); dst.nb[1] = dInner * sizeof(float);
+
+    SSMQwen35DeltaUserData ud{};
+    ud.alpha_weight = alpha.data();
+    ud.beta_weight = beta.data();
+    ud.dt_bias = dt_bias.data();
+    ud.a_log = a_log.data();
+    ud.norm_weight = norm.data();
+    ud.ssm_state = state.data();
+    ud.n_embd = nEmbd;
+    ud.d_inner = dInner;
+    ud.n_heads = nHeads;
+    ud.head_dim_v = headDimV;
+    ud.head_dim_k = headDimK;
+    ud.n_groups = nGroups;
+    ud.norm_layout = Qwen35SSMNormLayout::SHARED_HEAD_DIM;
+    ud.norm_eps = 1e-6f;
+    ud.layer_idx = 0;
+    ud.ssm_ordinal = -1;
+    ud.token_seq_ids = nullptr;
+    ud.runtime_states = nullptr;
+
+    densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &ud);
+
+    for (size_t i = 0; i < state.size(); ++i) {
+        EXPECT_NEAR(state[i], baseline[i], 1e-6f) << "state mismatch at index " << i;
+    }
+    for (int i = 0; i < headDimV; ++i) {
+        EXPECT_NEAR(callback_out[static_cast<size_t>(i)], expected_head0[static_cast<size_t>(i)], 1e-6f);
+        EXPECT_NEAR(callback_out[static_cast<size_t>(headDimV + i)], expected_head1[static_cast<size_t>(i)], 1e-6f);
+    }
+}
+
+TEST(Qwen35SSMQkvProjection, CallbackChunkedPrefillMatchesUnchunkedStateAndOutput) {
+    constexpr int nEmbd = 4;
+    constexpr int nHeads = 2;
+    constexpr int nGroups = 1;
+    constexpr int headDimK = 2;
+    constexpr int headDimV = 3;
+    constexpr int dInner = nHeads * headDimV;
+    constexpr int convChannels = dInner + 2 * nGroups * headDimK;
+    constexpr int tokens = 2;
+    constexpr int stateElems = nHeads * headDimK * headDimV;
+
+    const std::vector<float> z = {
+        0.1f, -0.2f, 0.3f, 0.4f, -0.5f, 0.6f,
+        -0.3f, 0.2f, -0.1f, 0.5f, 0.25f, -0.4f,
+    };
+    const std::vector<float> qkv_pre_silu = {
+        0.25f, -0.1f, 0.15f, 0.05f, 0.9f, -0.7f, 0.3f, -0.2f, 0.8f, -0.4f,
+        -0.3f, 0.2f, 0.1f, -0.25f, -0.5f, 0.6f, -0.1f, 0.7f, -0.2f, 0.4f,
+    };
+    const std::vector<float> input_t = {
+        0.2f, -0.1f, 0.05f, 0.3f,
+        -0.15f, 0.25f, -0.05f, 0.1f,
+    };
+    const std::vector<float> alpha = {
+        0.1f, -0.05f, 0.02f, 0.03f,
+        -0.04f, 0.02f, 0.01f, -0.03f,
+    };
+    const std::vector<float> beta = {
+        -0.08f, 0.03f, 0.06f, -0.1f,
+        0.05f, -0.02f, 0.04f, 0.01f,
+    };
+    const std::vector<float> dt_bias = {-0.15f, -0.12f};
+    const std::vector<float> a_log = {-1.2f, -1.0f};
+    const std::vector<float> norm = {1.0f, 1.0f, 1.0f};
+
+    auto init_tensor = [](ggml_tensor* tensor, void* data, ggml_type type, int64_t ne0, int64_t ne1) {
+        tensor->data = data;
+        tensor->type = type;
+        tensor->ne[0] = ne0;
+        tensor->ne[1] = ne1;
+        tensor->nb[0] = sizeof(float);
+        tensor->nb[1] = ne0 * sizeof(float);
+    };
+
+    auto init_userdata = [&](SSMQwen35DeltaUserData* ud, float* state_ptr) {
+        *ud = {};
+        ud->alpha_weight = alpha.data();
+        ud->beta_weight = beta.data();
+        ud->dt_bias = dt_bias.data();
+        ud->a_log = a_log.data();
+        ud->norm_weight = norm.data();
+        ud->ssm_state = state_ptr;
+        ud->n_embd = nEmbd;
+        ud->d_inner = dInner;
+        ud->n_heads = nHeads;
+        ud->head_dim_v = headDimV;
+        ud->head_dim_k = headDimK;
+        ud->n_groups = nGroups;
+        ud->norm_layout = Qwen35SSMNormLayout::SHARED_HEAD_DIM;
+        ud->norm_eps = 1e-6f;
+        ud->layer_idx = 0;
+        ud->ssm_ordinal = -1;
+        ud->token_seq_ids = nullptr;
+        ud->runtime_states = nullptr;
+    };
+
+    struct ggml_tensor a = {};
+    struct ggml_tensor b = {};
+    struct ggml_tensor c = {};
+    struct ggml_tensor dst = {};
+    std::vector<float> unchunked_state(stateElems, 0.0f);
+    std::vector<float> chunked_state(stateElems, 0.0f);
+    std::vector<float> unchunked_out(static_cast<size_t>(tokens) * dInner, 0.0f);
+    std::vector<float> chunk0_out(dInner, 0.0f);
+    std::vector<float> chunk1_out(dInner, 0.0f);
+
+    init_tensor(&a, const_cast<float*>(z.data()), GGML_TYPE_F32, dInner, tokens);
+    init_tensor(&b, const_cast<float*>(qkv_pre_silu.data()), GGML_TYPE_F32, convChannels, tokens);
+    init_tensor(&c, const_cast<float*>(input_t.data()), GGML_TYPE_F32, nEmbd, tokens);
+    init_tensor(&dst, unchunked_out.data(), GGML_TYPE_F32, dInner, tokens);
+
+    SSMQwen35DeltaUserData unchunked_ud{};
+    init_userdata(&unchunked_ud, unchunked_state.data());
+    densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &unchunked_ud);
+
+    SSMQwen35DeltaUserData chunked_ud{};
+    init_userdata(&chunked_ud, chunked_state.data());
+    init_tensor(&a, const_cast<float*>(z.data()), GGML_TYPE_F32, dInner, 1);
+    init_tensor(&b, const_cast<float*>(qkv_pre_silu.data()), GGML_TYPE_F32, convChannels, 1);
+    init_tensor(&c, const_cast<float*>(input_t.data()), GGML_TYPE_F32, nEmbd, 1);
+    init_tensor(&dst, chunk0_out.data(), GGML_TYPE_F32, dInner, 1);
+    densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &chunked_ud);
+
+    init_tensor(&a, const_cast<float*>(z.data()) + dInner, GGML_TYPE_F32, dInner, 1);
+    init_tensor(&b, const_cast<float*>(qkv_pre_silu.data()) + convChannels, GGML_TYPE_F32, convChannels, 1);
+    init_tensor(&c, const_cast<float*>(input_t.data()) + nEmbd, GGML_TYPE_F32, nEmbd, 1);
+    init_tensor(&dst, chunk1_out.data(), GGML_TYPE_F32, dInner, 1);
+    densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &chunked_ud);
+
+    for (size_t i = 0; i < unchunked_state.size(); ++i) {
+        EXPECT_NEAR(unchunked_state[i], chunked_state[i], 1e-6f) << "state mismatch at index " << i;
+    }
+    for (int i = 0; i < dInner; ++i) {
+        EXPECT_NEAR(unchunked_out[static_cast<size_t>(i)], chunk0_out[static_cast<size_t>(i)], 1e-6f)
+            << "token0 output mismatch at index " << i;
+        EXPECT_NEAR(unchunked_out[static_cast<size_t>(dInner + i)], chunk1_out[static_cast<size_t>(i)], 1e-6f)
+            << "token1 output mismatch at index " << i;
+    }
+
+    EXPECT_EQ(HashFloatVector(unchunked_state), HashFloatVector(chunked_state));
 }
 
 // ============================================================================

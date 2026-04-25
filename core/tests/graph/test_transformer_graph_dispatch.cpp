@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
 #include "densecore/models/transformer_graph_builder.h"
-#include "inference.h"
-#include "model_types.h"
+#include "densecore/runtime/inference.h"
+#include "densecore/models/model_types.h"
 
 namespace {
 

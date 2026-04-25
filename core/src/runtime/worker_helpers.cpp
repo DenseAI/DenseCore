@@ -12,6 +12,7 @@
 #include "densecore/arm_runtime.h"
 #include "densecore/backend/cpu_backend.h"
 #include "densecore/exceptions.h"
+#include "densecore/models/model_descriptor.h"
 #include "ggml.h"
 #include "models/model_inference_policy.h"
 #include "runtime/runtime_env.h"
@@ -35,6 +36,48 @@ namespace {
 
 int ParsePositiveEnvIntOrDefault(const char* name, int default_value) {
     return densecore::env::ParsePositiveEnvInt(name, default_value);
+}
+
+bool IsWideSimdLevel(densecore::simd::SimdLevel simd_level) {
+    switch (simd_level) {
+    case densecore::simd::SimdLevel::AMX:
+    case densecore::simd::SimdLevel::AVX512:
+    case densecore::simd::SimdLevel::SVE:
+    case densecore::simd::SimdLevel::SVE2: return true;
+    default: return false;
+    }
+}
+
+int CapThreadsToAvailableCores(int physical_core_count, int base_threads) {
+    int cap = physical_core_count > 0 ? physical_core_count : base_threads;
+    if (cap <= 0) {
+        cap = 1;
+    }
+    if (base_threads > 0) {
+        cap = std::min(cap, base_threads);
+    }
+    return std::max(1, cap);
+}
+
+bool IsQwen36HybridSsmSingleRequest(const TransformerModel* model, int num_seqs) {
+    if (num_seqs != 1 || !model || !model->arch_flags.is_hybrid_ssm) {
+        return false;
+    }
+    const auto descriptor = densecore::models::DescribeModel(model);
+    return descriptor.variant == ModelVariant::QWEN36;
+}
+
+int ResolveQwen36WideSimdSingleDecodeFallbackThreads(int cap) {
+    if (cap <= 8) {
+        return cap;
+    }
+    if (cap <= 12) {
+        return 8;
+    }
+    if (cap <= 16) {
+        return 10;
+    }
+    return 12;
 }
 
 bool GraphContainsPagedDecodeCustomOp(const struct ggml_cgraph* graph) {
@@ -162,6 +205,16 @@ void EmitRequestResult(EngineState* state, Request* req, const std::string& toke
 bool IsSingleRequestFastPathEnabled() {
     static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_SINGLE_REQUEST_FAST_PATH", true);
     return enabled;
+}
+
+bool ShouldBypassSingleRequestFastPathForLongHybridSSM(const TransformerModel* model, const Request* req) {
+    if (!model || !req || !model->arch_flags.is_hybrid_ssm) {
+        return false;
+    }
+    if (densecore::env::ParseNonZeroEnv("DENSECORE_DISABLE_SINGLE_REQ_FAST_PATH_FOR_LONG_HYBRID_SSM", false)) {
+        return true;
+    }
+    return req->n_past > 0 || static_cast<int>(req->tokens.size()) > BLOCK_SIZE;
 }
 
 bool IsBenchmarkFastPathEnabled() {
@@ -593,6 +646,14 @@ bool UseLegacyDecodeGraphCachePolicy() {
     return legacy;
 }
 
+bool IsQwen36SingleDecodeCacheCandidate(const TransformerModel* model) {
+    if (!model || !model->arch_flags.is_hybrid_ssm) {
+        return false;
+    }
+    const auto descriptor = densecore::models::DescribeModel(model);
+    return descriptor.variant == ModelVariant::QWEN36;
+}
+
 int ResolveLegacyDecodeThreads(int num_seqs, int physical_core_count, int base_threads) {
     int available_threads = physical_core_count > 0 ? physical_core_count : base_threads;
     if (available_threads <= 0) {
@@ -617,16 +678,31 @@ int ResolveLegacyDecodeThreads(int num_seqs, int physical_core_count, int base_t
     return std::max(1, active_threads);
 }
 
+PrefillThreadPolicySelection ResolvePrefillThreadPolicySelection(const TransformerModel* model, int num_seqs,
+                                                                 int prompt_token_count, int physical_core_count,
+                                                                 int base_threads,
+                                                                 densecore::simd::SimdLevel simd_level) {
+    PrefillThreadPolicySelection selection;
+    selection.threads = CapThreadsToAvailableCores(physical_core_count, base_threads);
+    selection.label = "prefill_base";
+
+    if (IsQwen36HybridSsmSingleRequest(model, num_seqs) && IsWideSimdLevel(simd_level)) {
+        if (prompt_token_count > 0 && prompt_token_count < 64) {
+            selection.threads = std::min(selection.threads, 8);
+            selection.label = "prefill_qwen36_single_short_prompt";
+        } else if (prompt_token_count > 0 && prompt_token_count < 128) {
+            selection.threads = std::min(selection.threads, 12);
+            selection.label = "prefill_qwen36_single_medium_prompt";
+        } else {
+            selection.label = "prefill_qwen36_single_long_prompt";
+        }
+    }
+    return selection;
+}
+
 int ResolveAutoDecodeThreadsForBatchWithSimd(int num_seqs, int physical_core_count, int base_threads,
                                              densecore::simd::SimdLevel simd_level) {
-    int cap = physical_core_count > 0 ? physical_core_count : base_threads;
-    if (cap <= 0) {
-        cap = 1;
-    }
-    if (base_threads > 0) {
-        cap = std::min(cap, base_threads);
-    }
-    cap = std::max(1, cap);
+    int cap = CapThreadsToAvailableCores(physical_core_count, base_threads);
 
     const int min_threads = std::min(cap, std::max(1, num_seqs));
     if (cap <= 4) {
@@ -651,6 +727,40 @@ int ResolveAutoDecodeThreadsForBatchWithSimd(int num_seqs, int physical_core_cou
     }
 
     return std::max(min_threads, std::min(cap, target));
+}
+
+DecodeThreadPolicySelection ResolveDecodeThreadPolicySelection(const TransformerModel* model, int num_seqs,
+                                                               int physical_core_count, int base_threads,
+                                                               densecore::simd::SimdLevel simd_level) {
+    DecodeThreadPolicySelection selection;
+    selection.threads =
+        ResolveAutoDecodeThreadsForBatchWithSimd(num_seqs, physical_core_count, base_threads, simd_level);
+    selection.label = "decode_batch_auto";
+
+    if (!IsQwen36HybridSsmSingleRequest(model, num_seqs)) {
+        return selection;
+    }
+    if (!IsWideSimdLevel(simd_level)) {
+        return selection;
+    }
+
+    const int cap = CapThreadsToAvailableCores(physical_core_count, base_threads);
+    const int env_override = densecore::env::ParsePositiveEnvInt("DENSECORE_QWEN36_SINGLE_DECODE_THREADS", 0);
+    if (env_override > 0) {
+        selection.threads = std::max(1, std::min(cap, env_override));
+        selection.label = "decode_qwen36_single_env_override";
+        return selection;
+    }
+
+    if (model->hparams.n_experts > 0) {
+        selection.threads = std::max(1, std::min(cap, 8));
+        selection.label = "decode_qwen36_a3b_c4_sweet_spot";
+        return selection;
+    }
+
+    selection.threads = ResolveQwen36WideSimdSingleDecodeFallbackThreads(cap);
+    selection.label = "decode_qwen36_dense27_c4_sweet_spot";
+    return selection;
 }
 
 int ResolveAutoDecodeThreadsForBatch(int num_seqs, int physical_core_count, int base_threads) {
@@ -682,7 +792,7 @@ bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const Pa
     if (batch.num_seqs > 1) {
         return true;
     }
-    return IsPagedDecodeModeAlwaysOn();
+    return IsPagedDecodeModeAlwaysOn() || IsQwen36SingleDecodeCacheCandidate(model);
 }
 
 DecodeWorkerStats& GetDecodeWorkerStats() {
@@ -773,12 +883,54 @@ void MaybeLogDecodeRuntimeStats() {
                 std::cerr << " paged_fallbacks=none";
             }
 
+            bool wrote_dispatch = false;
+            for (std::size_t weight_idx = 0; weight_idx < kHybridSSMDispatchWeightCount; ++weight_idx) {
+                for (std::size_t path_idx = 0; path_idx < kHybridSSMDispatchPathCount; ++path_idx) {
+                    const std::size_t flat_idx = weight_idx * kHybridSSMDispatchPathCount + path_idx;
+                    const uint64_t count = runtime.hybrid_ssm_dispatch_counts[flat_idx];
+                    if (count == 0) {
+                        continue;
+                    }
+                    std::cerr << (wrote_dispatch ? "," : " hybrid_ssm_dispatch=");
+                    std::cerr << GetHybridSSMDispatchWeightName(weight_idx) << ":"
+                              << GetHybridSSMDispatchPathName(path_idx) << ":" << count;
+                    wrote_dispatch = true;
+                }
+            }
+            if (!wrote_dispatch) {
+                std::cerr << " hybrid_ssm_dispatch=none";
+            }
+
             std::cerr << " graph_cache_skips[disabled="
                       << worker_stats.graph_cache_skip_disabled.load(std::memory_order_relaxed)
                       << ",unstable=" << worker_stats.graph_cache_skip_unstable.load(std::memory_order_relaxed)
                       << ",lora=" << worker_stats.graph_cache_skip_lora.load(std::memory_order_relaxed)
-                      << ",backend=" << worker_stats.graph_cache_skip_backend.load(std::memory_order_relaxed) << "]"
-                      << std::endl;
+                      << ",backend=" << worker_stats.graph_cache_skip_backend.load(std::memory_order_relaxed)
+                      << ",uncacheable="
+                      << worker_stats.graph_cache_rejected_uncacheable.load(std::memory_order_relaxed) << "]";
+
+            bool wrote_variant_bucket = false;
+            for (std::size_t variant_idx = 0; variant_idx < kDecodeGraphCacheTrackedVariants; ++variant_idx) {
+                for (std::size_t batch_idx = 1; batch_idx < kDecodeGraphCacheTrackedBatches; ++batch_idx) {
+                    const auto& bucket = worker_stats.graph_cache_by_variant_batch[variant_idx][batch_idx];
+                    const uint64_t attempts = bucket.attempts.load(std::memory_order_relaxed);
+                    const uint64_t hits = bucket.hits.load(std::memory_order_relaxed);
+                    const uint64_t builds = bucket.builds.load(std::memory_order_relaxed);
+                    const uint64_t rejected = bucket.rejected_uncacheable.load(std::memory_order_relaxed);
+                    if (attempts == 0 && hits == 0 && builds == 0 && rejected == 0) {
+                        continue;
+                    }
+                    std::cerr << (wrote_variant_bucket ? "," : " graph_cache_by_model_batch=");
+                    std::cerr << densecore::models::ModelVariantName(static_cast<ModelVariant>(variant_idx)) << ":b"
+                              << batch_idx << "{attempts=" << attempts << ",hits=" << hits << ",builds=" << builds
+                              << ",rejected_uncacheable=" << rejected << "}";
+                    wrote_variant_bucket = true;
+                }
+            }
+            if (!wrote_variant_bucket) {
+                std::cerr << " graph_cache_by_model_batch=none";
+            }
+            std::cerr << std::endl;
             return;
         }
     }
@@ -910,9 +1062,17 @@ bool ShouldTerminateRepetitiveLoop(const TransformerModel* model, const Request*
         return false;
     }
 
+    const auto descriptor = densecore::models::DescribeModel(model);
+    const bool is_qwen36 = descriptor.variant == ModelVariant::QWEN36;
+    if (is_qwen36 && req->generated_count < 32) {
+        return false;
+    }
+
     const auto& history = req->token_history;
     const size_t n = history.size();
-    if (n < 8) {
+    const size_t same_suffix_limit = is_qwen36 ? 16 : 8;
+    const size_t alternating_window = is_qwen36 ? 24 : 12;
+    if (n < std::min(same_suffix_limit, alternating_window)) {
         return false;
     }
 
@@ -921,16 +1081,16 @@ bool ShouldTerminateRepetitiveLoop(const TransformerModel* model, const Request*
     while (same_suffix < n && history[n - 1 - same_suffix] == latest) {
         ++same_suffix;
     }
-    if (same_suffix >= 8) {
+    if (same_suffix >= same_suffix_limit) {
         return true;
     }
 
-    if (n >= 12) {
+    if (n >= alternating_window) {
         const int a = history[n - 1];
         const int b = history[n - 2];
         if (a != b) {
             bool alternating = true;
-            for (size_t i = 0; i < 12; ++i) {
+            for (size_t i = 0; i < alternating_window; ++i) {
                 const int expected = (i % 2 == 0) ? a : b;
                 if (history[n - 1 - i] != expected) {
                     alternating = false;
@@ -1021,4 +1181,156 @@ size_t Utf8ValidPrefixLength(const std::string& s) {
     }
 
     return valid;
+}
+
+int DecodeVisibleProgressTimeoutMs() {
+    static const int timeout_ms =
+        densecore::env::ParsePositiveEnvInt("DENSECORE_DECODE_VISIBLE_PROGRESS_TIMEOUT_MS", 5000);
+    return timeout_ms;
+}
+
+int DecodeVisibleProgressMaxSilentSteps() {
+    static const int max_steps =
+        densecore::env::ParsePositiveEnvInt("DENSECORE_DECODE_VISIBLE_PROGRESS_MAX_STEPS", 256);
+    return max_steps;
+}
+
+const char* DecodeFinishCauseName(DecodeFinishCause cause) {
+    switch (cause) {
+    case DecodeFinishCause::StopToken: return "stop_token";
+    case DecodeFinishCause::StopSequence: return "stop_sequence";
+    case DecodeFinishCause::MaxTokens: return "max_tokens";
+    case DecodeFinishCause::LoopGuard: return "loop_guard";
+    case DecodeFinishCause::DecodeVisibleProgressTimeout: return "decode_visible_progress_timeout";
+    case DecodeFinishCause::SchedulerEmptyBatchStall: return "scheduler_empty_batch_stall";
+    case DecodeFinishCause::SchedulerUnschedulable: return "scheduler_unschedulable";
+    case DecodeFinishCause::BatchBuildStall: return "batch_build_stall";
+    case DecodeFinishCause::RequestCanceled: return "request_canceled";
+    case DecodeFinishCause::OutOfMemory: return "out_of_memory";
+    case DecodeFinishCause::MissingTokens: return "missing_tokens";
+    case DecodeFinishCause::SchedulerRejected: return "scheduler_rejected";
+    case DecodeFinishCause::Unknown:
+    default: return "unknown";
+    }
+}
+
+const char* DecodeSilentFinishReasonName(DecodeSilentFinishReason reason) {
+    switch (reason) {
+    case DecodeSilentFinishReason::ReasoningSuppressedOnly: return "reasoning_suppressed_only";
+    case DecodeSilentFinishReason::Utf8PendingOnly: return "utf8_pending_only";
+    case DecodeSilentFinishReason::None:
+    default: return "none";
+    }
+}
+
+void NoteDecodeSampleProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id) {
+    if (!req) {
+        return;
+    }
+    req->last_sampled_token_time = now;
+    req->decode_no_output_steps++;
+    req->sampled_token_count++;
+    if (req->first_sampled_token_id < 0) {
+        req->first_sampled_token_id = token_id;
+    }
+    if (req->last_external_emit_time == std::chrono::steady_clock::time_point()) {
+        req->last_external_emit_time = now;
+    }
+}
+
+void NoteSuppressedToken(Request* req) {
+    if (!req) {
+        return;
+    }
+    req->suppressed_token_count++;
+}
+
+void NoteVisibleEmitProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id) {
+    if (!req) {
+        return;
+    }
+    req->last_external_emit_time = now;
+    req->decode_no_output_steps = 0;
+    req->visible_emitted_token_count++;
+    if (req->first_visible_token_id < 0) {
+        req->first_visible_token_id = token_id;
+    }
+}
+
+void FinalizeDecodeSilentFinishReason(Request* req) {
+    if (!req) {
+        return;
+    }
+    req->decode_silent_finish_reason = DecodeSilentFinishReason::None;
+    if (req->visible_emitted_token_count != 0) {
+        return;
+    }
+    if (req->suppressed_token_count != 0) {
+        req->decode_silent_finish_reason = DecodeSilentFinishReason::ReasoningSuppressedOnly;
+        return;
+    }
+    if (!req->utf8_pending.empty()) {
+        req->decode_silent_finish_reason = DecodeSilentFinishReason::Utf8PendingOnly;
+    }
+}
+
+void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) {
+    if (!req || !model) {
+        return;
+    }
+    const auto descriptor = densecore::models::DescribeModel(model);
+    if (descriptor.variant != ModelVariant::QWEN36) {
+        return;
+    }
+    const auto ns_to_ms = [](uint64_t ns) { return static_cast<double>(ns) / 1000000.0; };
+    const auto point_to_ms = [](std::chrono::steady_clock::time_point start,
+                                std::chrono::steady_clock::time_point end) -> double {
+        if (start == std::chrono::steady_clock::time_point() || end == std::chrono::steady_clock::time_point() ||
+            end < start) {
+            return 0.0;
+        }
+        return static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000.0;
+    };
+    const int prompt_tokens =
+        req->prompt_token_count > 0 ? req->prompt_token_count : std::max(0, req->n_past - req->generated_count);
+    const uint64_t steady_visible_tokens =
+        req->visible_emitted_token_count > 0 ? (req->visible_emitted_token_count - 1) : 0;
+    const double prefill_ttft_ms = point_to_ms(req->start_time, req->first_token_time);
+    const double decode_visible_ms =
+        steady_visible_tokens > 0 ? point_to_ms(req->first_token_time, req->last_external_emit_time) : 0.0;
+    const double steady_visible_tok_s =
+        (decode_visible_ms > 0.0) ? (static_cast<double>(steady_visible_tokens) / (decode_visible_ms / 1000.0)) : 0.0;
+    std::cerr << "[Qwen36DecodeSummary] req=" << req->id
+              << " finish_cause=" << DecodeFinishCauseName(req->decode_finish_cause)
+              << " silent_reason=" << DecodeSilentFinishReasonName(req->decode_silent_finish_reason)
+              << " prompt_tokens=" << prompt_tokens << " sampled_tokens=" << req->sampled_token_count
+              << " visible_tokens=" << req->visible_emitted_token_count
+              << " steady_visible_tokens=" << steady_visible_tokens
+              << " long_form_visible=" << (req->visible_emitted_token_count >= 64 ? 1 : 0)
+              << " nonempty_visible_output=" << (req->visible_emitted_token_count > 0 ? 1 : 0)
+              << " suppressed_tokens=" << req->suppressed_token_count << " prefill_ttft_ms=" << prefill_ttft_ms
+              << " decode_visible_ms=" << decode_visible_ms << " steady_visible_tok_s=" << steady_visible_tok_s
+              << " prefill_threads=" << req->prefill_thread_count << " prefill_policy="
+              << (req->prefill_thread_policy.empty() ? "none" : req->prefill_thread_policy.c_str())
+              << " decode_threads=" << req->decode_thread_count
+              << " decode_policy=" << (req->decode_thread_policy.empty() ? "none" : req->decode_thread_policy.c_str())
+              << " scheduler_wait_ms=" << ns_to_ms(req->scheduler_wait_ns)
+              << " batch_build_ms=" << ns_to_ms(req->batch_build_ns)
+              << " graph_build_rebind_ms=" << ns_to_ms(req->graph_build_rebind_ns)
+              << " graph_execute_ms=" << ns_to_ms(req->graph_execute_ns)
+              << " first_sampled_token_id=" << req->first_sampled_token_id
+              << " first_visible_token_id=" << req->first_visible_token_id
+              << " generated_count=" << req->generated_count << " n_past=" << req->n_past << std::endl;
+}
+
+bool HasDecodeVisibleProgressStalled(const Request* req, std::chrono::steady_clock::time_point now) {
+    if (!req || req->finished || req->last_sampled_token_time == std::chrono::steady_clock::time_point()) {
+        return false;
+    }
+    const auto last_emit = (req->last_external_emit_time == std::chrono::steady_clock::time_point())
+                               ? req->last_sampled_token_time
+                               : req->last_external_emit_time;
+    const auto silent_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_emit).count();
+    return req->decode_no_output_steps >= static_cast<uint64_t>(DecodeVisibleProgressMaxSilentSteps()) ||
+           silent_ms >= DecodeVisibleProgressTimeoutMs();
 }

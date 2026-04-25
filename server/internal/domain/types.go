@@ -1,17 +1,51 @@
 package domain
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
 
 // StreamEvent represents a token event in the stream
 type StreamEvent struct {
-	Token      string
-	TokenID    int
-	IsFinished bool
-	Err        error
+	Token        string
+	TokenID      int
+	IsFinished   bool
+	Terminal     bool
+	Canceled     bool
+	ErrorMessage string
+	Err          error
+}
+
+func NewTerminalEvent(err error) StreamEvent {
+	event := StreamEvent{Terminal: true}
+	if err == nil {
+		event.IsFinished = true
+		return event
+	}
+	event.Err = err
+	event.ErrorMessage = err.Error()
+	event.Canceled = errors.Is(err, context.Canceled)
+	return event
+}
+
+func (e StreamEvent) TerminalError() error {
+	if e.Err != nil {
+		return e.Err
+	}
+	if e.ErrorMessage != "" {
+		return errors.New(e.ErrorMessage)
+	}
+	if e.Canceled {
+		return context.Canceled
+	}
+	return nil
+}
+
+func (e StreamEvent) TerminalSuccess() bool {
+	return e.Terminal && e.TerminalError() == nil
 }
 
 type RenderedChatPrompt struct {
@@ -131,7 +165,8 @@ type ResponseFormat struct {
 }
 
 type ChatTemplateKwargs struct {
-	EnableThinking *bool `json:"enable_thinking,omitempty"`
+	EnableThinking   *bool `json:"enable_thinking,omitempty"`
+	PreserveThinking *bool `json:"preserve_thinking,omitempty"`
 }
 
 type Message struct {
@@ -235,6 +270,27 @@ func (m Message) MarshalJSON() ([]byte, error) {
 
 func (m Message) HasStructuredContent() bool {
 	return len(m.ContentParts) > 0
+}
+
+func (m Message) HasNonTextStructuredContent() bool {
+	if !m.HasStructuredContent() {
+		return false
+	}
+	for _, part := range m.ContentParts {
+		if part.Text != "" {
+			continue
+		}
+		if part.Type == "image" || part.Image != "" || part.ImageURL != "" || part.URL != "" {
+			return true
+		}
+		if part.Type == "video" || part.Video != "" {
+			return true
+		}
+		if part.Type == "audio" || part.Audio != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (m Message) FlattenedText() string {

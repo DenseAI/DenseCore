@@ -3,7 +3,7 @@
 #include <cstdlib>
 #include <string>
 
-#include "qnn_backend.h"
+#include "densecore/backend/qnn_backend.h"
 
 namespace densecore {
 namespace {

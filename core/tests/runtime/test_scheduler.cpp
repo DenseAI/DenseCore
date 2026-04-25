@@ -3,7 +3,7 @@
 #include <cstdlib>
 #include <string>
 
-#include "scheduler.h"
+#include "densecore/runtime/scheduler.h"
 
 namespace densecore {
 namespace {
@@ -130,8 +130,8 @@ TEST(SchedulerArchitecture, DoesNotMixPrefillAndDecodeInSingleStep) {
     SchedulerOutput first = scheduler.Schedule();
     EXPECT_FALSE(first.prefill_seq_ids.empty());
     EXPECT_TRUE(first.decode_seq_ids.empty());
-
-    scheduler.UpdateProgress(seq1, 1);
+    ASSERT_EQ(first.prefill_chunk_info.size(), 1u);
+    scheduler.UpdateProgress(seq1, first.prefill_chunk_info[0].chunk_tokens);
 
     const int seq2 = scheduler.AddRequest(/*request_id=*/2, /*prompt_len=*/16, /*max_output_len=*/32);
     ASSERT_GT(seq2, 0);
@@ -168,6 +168,28 @@ TEST(SchedulerArchitecture, PrefillEnvOverrideCapsChunkSize) {
     ASSERT_EQ(first.prefill_chunk_info.size(), 1u);
     EXPECT_EQ(first.prefill_chunk_info[0].seq_id, seq);
     EXPECT_EQ(first.prefill_chunk_info[0].chunk_tokens, 8);
+}
+
+TEST(SchedulerArchitecture, PerRequestPrefillChunkCapOverridesGlobalChunkBudget) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = true;
+    cfg.max_prefill_tokens = 32;
+
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    const int seq = scheduler.AddRequest(/*request_id=*/43, /*prompt_len=*/24, /*max_output_len=*/32,
+                                         /*priority=*/100, /*prefix_tokens=*/nullptr,
+                                         /*allow_chunked_prefill=*/true,
+                                         /*require_hybrid_ssm_prefix_snapshot=*/false,
+                                         /*max_prefill_chunk_tokens=*/6);
+    ASSERT_GT(seq, 0);
+
+    SchedulerOutput first = scheduler.Schedule();
+    ASSERT_EQ(first.prefill_seq_ids.size(), 1u);
+    ASSERT_EQ(first.prefill_chunk_info.size(), 1u);
+    EXPECT_EQ(first.prefill_chunk_info[0].seq_id, seq);
+    EXPECT_EQ(first.prefill_chunk_info[0].chunk_tokens, 6);
 }
 
 TEST(SchedulerArchitecture, StrictMoEClusteringDoesNotProduceEmptyDecodeBatch) {
@@ -462,6 +484,8 @@ TEST(SchedulerArchitecture, PrefillAdmissionAfterDecodeStreak) {
 
     SchedulerOutput first = scheduler.Schedule();
     ASSERT_FALSE(first.prefill_seq_ids.empty());
+    ASSERT_EQ(first.prefill_chunk_info.size(), 1u);
+    scheduler.UpdateProgress(seq_running, first.prefill_chunk_info[0].chunk_tokens);
 
     const int seq_waiting = scheduler.AddRequest(/*request_id=*/21, /*prompt_len=*/16, /*max_output_len=*/64);
     ASSERT_GT(seq_waiting, 0);
@@ -518,6 +542,54 @@ TEST(SchedulerArchitecture, ChunkedPrefillEmitsChunkMetadataAndTransitionsToDeco
     EXPECT_TRUE(s4.prefill_seq_ids.empty());
     EXPECT_EQ(s4.decode_seq_ids.size(), 1u);
     EXPECT_EQ(s4.decode_seq_ids[0], seq);
+}
+
+TEST(SchedulerArchitecture, FinalPrefillChunkDoesNotBecomeDecodeUntilCompletionIsCommitted) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = true;
+    cfg.max_prefill_tokens = 8;
+
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    const int seq = scheduler.AddRequest(/*request_id=*/35, /*prompt_len=*/8, /*max_output_len=*/32);
+    ASSERT_GT(seq, 0);
+
+    SchedulerOutput first = scheduler.Schedule();
+    ASSERT_EQ(first.prefill_seq_ids.size(), 1u);
+    EXPECT_EQ(first.prefill_chunk_info[0].chunk_tokens, 8);
+    EXPECT_EQ(scheduler.GetStatus(seq), SequenceStatus::WAITING);
+
+    SchedulerOutput before_commit = scheduler.Schedule();
+    EXPECT_EQ(before_commit.prefill_seq_ids.size(), 1u);
+    EXPECT_TRUE(before_commit.decode_seq_ids.empty());
+
+    scheduler.OnPrefillChunkComplete(seq, 8, /*prefill_finished=*/true);
+    EXPECT_EQ(scheduler.GetStatus(seq), SequenceStatus::RUNNING);
+
+    SchedulerOutput decode = scheduler.Schedule();
+    EXPECT_TRUE(decode.prefill_seq_ids.empty());
+    ASSERT_EQ(decode.decode_seq_ids.size(), 1u);
+    EXPECT_EQ(decode.decode_seq_ids[0], seq);
+}
+
+TEST(SchedulerArchitecture, EmptyScheduleReportsUnschedulableReasonForInsufficientBlockCapacity) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = true;
+    cfg.max_prefill_tokens = BLOCK_SIZE * 2;
+    cfg.max_num_batched_tokens = BLOCK_SIZE * 2;
+
+    BlockManager block_manager(/*num_blocks=*/1, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    const int seq = scheduler.AddRequest(/*request_id=*/36, /*prompt_len=*/BLOCK_SIZE * 2, /*max_output_len=*/32);
+    ASSERT_GT(seq, 0);
+
+    SchedulerOutput output = scheduler.Schedule();
+    EXPECT_TRUE(output.IsEmpty());
+    EXPECT_EQ(output.empty_reason, SchedulerEmptyReason::WaitingSeqPresentButUnschedulable);
+    EXPECT_EQ(output.unschedulable_reason, SchedulerUnschedulableReason::RequiredBlocksExceedCapacity);
+    EXPECT_EQ(output.diagnostic_seq_id, seq);
 }
 
 TEST(SchedulerArchitecture, RejectsNonChunkablePrefillLargerThanBatchBudget) {

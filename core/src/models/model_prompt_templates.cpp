@@ -69,6 +69,13 @@ bool ThinkingEnabledForRender(const PromptTemplateProfile& profile, const Canoni
     return profile.thinking_enabled;
 }
 
+bool PreserveThinkingForRender(const CanonicalChatRenderOptions& options) {
+    if (options.preserve_thinking >= 0) {
+        return options.preserve_thinking != 0;
+    }
+    return true;
+}
+
 bool ShouldPreOpenThinkingBlock(const TransformerModel* model) {
     if (!model) {
         return false;
@@ -76,8 +83,11 @@ bool ShouldPreOpenThinkingBlock(const TransformerModel* model) {
     return DescribeModel(model).variant != ModelVariant::QWEN36;
 }
 
-std::string RenderQwenAssistantMessage(const CanonicalChatMessage& message) {
+std::string RenderQwenAssistantMessage(const CanonicalChatMessage& message, bool preserve_thinking) {
     const std::string content = TrimCopy(message.content);
+    if (!preserve_thinking) {
+        return content;
+    }
     const std::string reasoning = TrimCopy(message.reasoning_content);
     if (reasoning.empty()) {
         return content;
@@ -254,11 +264,11 @@ bool SupportsQwenNoThinkDirective(const TransformerModel* model) {
     if (!descriptor.uses_qwen_thinking_env) {
         return false;
     }
-    return true;
+    return descriptor.variant != ModelVariant::QWEN36;
 }
 
-bool ShouldPrimeQwenNoThinking(const TransformerModel* model) {
-    if (!ModelUsesQwenThinkingEnv(model) || !SupportsQwenNoThinkDirective(model)) return false;
+bool ShouldSuppressQwenReasoningTags(const TransformerModel* model) {
+    if (!ModelUsesQwenThinkingEnv(model)) return false;
     return !ResolveQwenThinkingEnabled(model);
 }
 
@@ -270,19 +280,6 @@ std::string AppendQwenNoThinkDirective(std::string content) {
         content.push_back(' ');
     }
     content += "/no_think";
-    return content;
-}
-
-std::string AppendQwen36ThinkingDirective(std::string content) {
-    static constexpr std::string_view kDirective =
-        "Think step by step inside <think> and </think>, then provide the final answer.";
-    if (content.find(std::string(kDirective)) != std::string::npos) {
-        return content;
-    }
-    if (!content.empty() && !std::isspace(static_cast<unsigned char>(content.back()))) {
-        content.push_back(' ');
-    }
-    content.append(kDirective);
     return content;
 }
 
@@ -340,7 +337,7 @@ PromptTemplateProfile ResolveModelPromptTemplateProfile(const TransformerModel* 
 void ConfigureQwenReasoningTokenBlocklistForModel(const TransformerModel* model, Request* req) {
     if (!model || !req) return;
     req->disallowed_token_ids.clear();
-    if (!ShouldPrimeQwenNoThinking(model)) {
+    if (!ShouldSuppressQwenReasoningTags(model)) {
         return;
     }
 
@@ -437,9 +434,6 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         std::string user_prompt = prompt;
         if (profile.supports_thinking && !profile.thinking_enabled && SupportsQwenNoThinkDirective(model)) {
             user_prompt = AppendQwenNoThinkDirective(std::move(user_prompt));
-        } else if (profile.supports_thinking && profile.thinking_enabled &&
-                   DescribeModel(model).variant == ModelVariant::QWEN36) {
-            user_prompt = AppendQwen36ThinkingDirective(std::move(user_prompt));
         }
         wrapped += profile.open_tag;
         wrapped += profile.user_role;
@@ -500,6 +494,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
 
     const PromptTemplateProfile profile = ResolveModelPromptTemplateProfile(model);
     const bool thinking_enabled = ThinkingEnabledForRender(profile, options);
+    const bool preserve_thinking = PreserveThinkingForRender(options);
     if (thinking_enabled_out) {
         *thinking_enabled_out = thinking_enabled;
     }
@@ -536,13 +531,11 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
                 if (static_cast<int>(i) == last_user_index) {
                     if (!thinking_enabled && SupportsQwenNoThinkDirective(model)) {
                         content = AppendQwenNoThinkDirective(std::move(content));
-                    } else if (thinking_enabled && DescribeModel(model).variant == ModelVariant::QWEN36) {
-                        content = AppendQwen36ThinkingDirective(std::move(content));
                     }
                 }
                 append_block(profile.user_role, content);
             } else if (role == "assistant") {
-                append_block(profile.assistant_role, RenderQwenAssistantMessage(messages[i]));
+                append_block(profile.assistant_role, RenderQwenAssistantMessage(messages[i], preserve_thinking));
             } else if (role == "tool") {
                 append_block(profile.user_role,
                              "<tool_response>\n" + TrimCopy(messages[i].content) + "\n</tool_response>");

@@ -55,12 +55,21 @@ func (h *DenseCoreHandler) ChatCompletion(ctx context.Context, req *ChatCompleti
 	// Collect all tokens
 	var responseText string
 	var promptTokens, completionTokens int32
+	terminalSeen := false
 
 	for event := range outputChan {
-		if !event.IsFinished {
+		if event.Token != "" {
 			responseText += event.Token
 			completionTokens++
 		}
+		if !event.Terminal {
+			continue
+		}
+		terminalSeen = true
+		if err := event.TerminalError(); err != nil {
+			return nil, h.mapError(err)
+		}
+		break
 	}
 
 	// Check if generation failed
@@ -68,6 +77,9 @@ func (h *DenseCoreHandler) ChatCompletion(ctx context.Context, req *ChatCompleti
 	case err := <-errChan:
 		return nil, h.mapError(err)
 	default:
+	}
+	if !terminalSeen {
+		return nil, h.mapError(domain.ErrStreamClosedWithoutTerminal)
 	}
 
 	promptTokens = h.countPromptTokens(domainReq)
@@ -141,6 +153,7 @@ func (h *DenseCoreHandler) StreamChatCompletion(req *ChatCompletionRequest, stre
 	}
 
 	// Stream tokens
+	terminalSeen := false
 	for event := range outputChan {
 		select {
 		case <-ctx.Done():
@@ -148,7 +161,11 @@ func (h *DenseCoreHandler) StreamChatCompletion(req *ChatCompletionRequest, stre
 		default:
 		}
 
-		if event.IsFinished {
+		if event.Terminal {
+			terminalSeen = true
+			if err := event.TerminalError(); err != nil {
+				return h.mapError(err)
+			}
 			// Send final chunk with finish_reason
 			if err := stream.Send(&ChatCompletionChunk{
 				Id:      id,
@@ -190,6 +207,9 @@ func (h *DenseCoreHandler) StreamChatCompletion(req *ChatCompletionRequest, stre
 	case err := <-errChan:
 		return h.mapError(err)
 	default:
+	}
+	if !terminalSeen {
+		return h.mapError(domain.ErrStreamClosedWithoutTerminal)
 	}
 
 	return nil

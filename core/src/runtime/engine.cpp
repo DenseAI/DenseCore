@@ -629,10 +629,7 @@ bool ShouldPrimeQwenNoThinkingPrompt(const TransformerModel* model) {
         return !ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", false);
     }
     if (descriptor.variant == ModelVariant::QWEN36) {
-        if (const char* env = std::getenv("DENSECORE_QWEN36_ENABLE_THINKING"); env && env[0] != '\0') {
-            return std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 || std::strcmp(env, "False") == 0;
-        }
-        return !ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", true);
+        return false;
     }
     return false;
 }
@@ -1360,6 +1357,7 @@ int DenseCoreRenderChatPrompt(DenseCoreHandle handle, const DenseCoreChatMessage
 
     densecore::models::CanonicalChatRenderOptions render_options;
     render_options.enable_thinking = options ? options->enable_thinking : -1;
+    render_options.preserve_thinking = options ? options->preserve_thinking : -1;
     bool thinking_enabled = false;
     g_rendered_chat_prompt = densecore::models::RenderModelChatMessages(entry->model.get(), canonical_messages,
                                                                         render_options, &thinking_enabled);

@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <vector>
 
-#include "model_types.h"
-#include "tokenizer.h"
+#include "densecore/models/model_types.h"
+#include "densecore/models/tokenizer.h"
 
 namespace {
 

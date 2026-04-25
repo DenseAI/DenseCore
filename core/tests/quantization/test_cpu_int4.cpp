@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "kernels/hwy/hwy_kernels.h"
-#include "simd_ops.h"
+#include "densecore/simd/simd_ops.h"
 using namespace densecore::hwy_kernels;
 
 namespace densecore {

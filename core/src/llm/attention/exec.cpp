@@ -4,11 +4,45 @@
 #include "llm/attention/internal.h"
 #include "models/model_inference_policy.h"
 
+#include <algorithm>
 #include <cmath>
 
 #ifndef GGML_KQ_MASK_PAD
 #define GGML_KQ_MASK_PAD 32
 #endif
+
+namespace {
+
+std::atomic<uint64_t> g_shared_prefill_flash_mask_builds{0};
+
+struct ggml_tensor*
+BuildOrReuseSharedPrefillFlashMask(struct ggml_context* ctx_c, int n_total_tokens, int n_tokens, int n_past_val,
+                                   int attn_query_base_pos, int fast_attn_sliding_window, bool decode_only_batch,
+                                   struct ggml_tensor** shared_prefill_flash_mask, int* shared_prefill_mask_n_total,
+                                   int* shared_prefill_mask_n_padded, int* shared_prefill_mask_n,
+                                   int* shared_prefill_mask_n_past, int* shared_prefill_mask_sliding_window) {
+    const int n_padded = (n_tokens + GGML_KQ_MASK_PAD - 1) & ~(GGML_KQ_MASK_PAD - 1);
+    if (*shared_prefill_flash_mask && *shared_prefill_mask_n_total == n_total_tokens &&
+        *shared_prefill_mask_n_padded == n_padded && *shared_prefill_mask_n == n_tokens &&
+        *shared_prefill_mask_n_past == n_past_val && *shared_prefill_mask_sliding_window == fast_attn_sliding_window) {
+        return *shared_prefill_flash_mask;
+    }
+
+    struct ggml_tensor* mask = densecore::llm::attention::BuildAttentionMaskTensor(
+        ctx_c, n_total_tokens, n_tokens, attn_query_base_pos, fast_attn_sliding_window, n_padded);
+    if (n_tokens > 1 && !decode_only_batch) {
+        *shared_prefill_flash_mask = mask;
+        *shared_prefill_mask_n_total = n_total_tokens;
+        *shared_prefill_mask_n_padded = n_padded;
+        *shared_prefill_mask_n = n_tokens;
+        *shared_prefill_mask_n_past = n_past_val;
+        *shared_prefill_mask_sliding_window = fast_attn_sliding_window;
+        g_shared_prefill_flash_mask_builds.fetch_add(1, std::memory_order_relaxed);
+    }
+    return mask;
+}
+
+}  // namespace
 
 struct ggml_tensor* ggml_paged_attention_decode(struct ggml_context* ctx, struct ggml_tensor* q_cur,
                                                 struct ggml_tensor* k_cur, struct ggml_tensor* v_cur,
@@ -122,24 +156,10 @@ struct ggml_tensor* ExecuteNativeFlashAttentionPath(
     struct ggml_tensor* K_fa = ggml_permute(ctx_c, K, 0, 2, 1, 3);
     struct ggml_tensor* V_fa = ggml_permute(ctx_c, V, 0, 2, 1, 3);
 
-    int N_padded = (n_tokens + GGML_KQ_MASK_PAD - 1) & ~(GGML_KQ_MASK_PAD - 1);
-    struct ggml_tensor* KQ_mask = nullptr;
-    if (*shared_prefill_flash_mask && *shared_prefill_mask_n_total == n_total_tokens &&
-        *shared_prefill_mask_n_padded == N_padded && *shared_prefill_mask_n == n_tokens &&
-        *shared_prefill_mask_n_past == n_past_val && *shared_prefill_mask_sliding_window == fast_attn_sliding_window) {
-        KQ_mask = *shared_prefill_flash_mask;
-    } else {
-        KQ_mask = densecore::llm::attention::BuildAttentionMaskTensor(
-            ctx_c, n_total_tokens, n_tokens, attn_query_base_pos, fast_attn_sliding_window, N_padded);
-        if (n_tokens > 1 && !decode_only_batch) {
-            *shared_prefill_flash_mask = KQ_mask;
-            *shared_prefill_mask_n_total = n_total_tokens;
-            *shared_prefill_mask_n_padded = N_padded;
-            *shared_prefill_mask_n = n_tokens;
-            *shared_prefill_mask_n_past = n_past_val;
-            *shared_prefill_mask_sliding_window = fast_attn_sliding_window;
-        }
-    }
+    struct ggml_tensor* KQ_mask = BuildOrReuseSharedPrefillFlashMask(
+        ctx_c, n_total_tokens, n_tokens, n_past_val, attn_query_base_pos, fast_attn_sliding_window, decode_only_batch,
+        shared_prefill_flash_mask, shared_prefill_mask_n_total, shared_prefill_mask_n_padded, shared_prefill_mask_n,
+        shared_prefill_mask_n_past, shared_prefill_mask_sliding_window);
 
     Q = ggml_cont(ctx_c, Q);
     K_fa = ggml_cont(ctx_c, K_fa);
@@ -202,3 +222,46 @@ struct ggml_tensor* ExecuteStandardAttentionPath(struct ggml_context* ctx_c, Tra
     struct ggml_tensor* KQV = ggml_mul_mat(ctx_c, V_t, KQ);
     return ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
 }
+
+#ifdef DENSECORE_TEST_BUILD
+namespace densecore::llm::attention::testing {
+
+void ResetSharedPrefillFlashMaskBuildsForTest() {
+    g_shared_prefill_flash_mask_builds.store(0, std::memory_order_relaxed);
+}
+
+uint64_t GetSharedPrefillFlashMaskBuildsForTest() {
+    return g_shared_prefill_flash_mask_builds.load(std::memory_order_relaxed);
+}
+
+void ExerciseSharedPrefillFlashMaskBuildForTest(bool native_flash_selected, int n_total_tokens, int n_tokens,
+                                                int attn_query_base_pos, bool decode_only_batch,
+                                                int fast_attn_sliding_window) {
+    if (!native_flash_selected) {
+        return;
+    }
+
+    struct ggml_init_params params {};
+    params.mem_size = 256 * 1024;
+    params.no_alloc = false;
+    struct ggml_context* ctx = ggml_init(params);
+    if (!ctx) {
+        return;
+    }
+
+    struct ggml_tensor* shared_prefill_flash_mask = nullptr;
+    int shared_prefill_mask_n_total = -1;
+    int shared_prefill_mask_n_padded = -1;
+    int shared_prefill_mask_n = -1;
+    int shared_prefill_mask_n_past = -1;
+    int shared_prefill_mask_sliding_window = -1;
+    (void)BuildOrReuseSharedPrefillFlashMask(
+        ctx, n_total_tokens, n_tokens, /*n_past_val=*/std::max(0, n_total_tokens - n_tokens), attn_query_base_pos,
+        fast_attn_sliding_window, decode_only_batch, &shared_prefill_flash_mask, &shared_prefill_mask_n_total,
+        &shared_prefill_mask_n_padded, &shared_prefill_mask_n, &shared_prefill_mask_n_past,
+        &shared_prefill_mask_sliding_window);
+    ggml_free(ctx);
+}
+
+}  // namespace densecore::llm::attention::testing
+#endif

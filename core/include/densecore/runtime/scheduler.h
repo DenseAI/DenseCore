@@ -16,6 +16,7 @@
 #include <climits>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -33,6 +34,23 @@ enum class SequenceStatus {
     SWAPPED,    // Preempted and swapped to CPU
     FINISHED,   // Completed generation
     CANCELLED,  // User cancelled
+};
+
+enum class SchedulerEmptyReason {
+    None = 0,
+    NoFreeBlocks,
+    PrefillBudgetZero,
+    ContextBucketMismatch,
+    MaxNumSeqsReached,
+    MoeBudgetDeferred,
+    WaitingSeqPresentButUnschedulable,
+    RunningSeqPresentButDecodeUnschedulable,
+};
+
+enum class SchedulerUnschedulableReason {
+    None = 0,
+    PromptExceedsBatchBudget,
+    RequiredBlocksExceedCapacity,
 };
 
 /**
@@ -54,6 +72,7 @@ struct SequenceGroup {
     // Computed at each iteration
     int num_running_seqs = 0;
     int num_tokens_to_process = 0;
+    int max_prefill_chunk_tokens = -1;
 
     // Progress tracking (for smart preemption)
     int generated_tokens = 0;  // Tokens generated so far
@@ -108,6 +127,9 @@ struct SchedulerOutput {
     // Dominant context length (n_past) for the selected batch.
     // -1 means unset/empty.
     int batch_context_len = -1;
+    SchedulerEmptyReason empty_reason = SchedulerEmptyReason::None;
+    SchedulerUnschedulableReason unschedulable_reason = SchedulerUnschedulableReason::None;
+    int diagnostic_seq_id = -1;
 
     bool IsEmpty() const { return prefill_seq_ids.empty() && decode_seq_ids.empty(); }
 };
@@ -165,7 +187,7 @@ public:
      */
     int AddRequest(int request_id, int prompt_len, int max_output_len, int priority = 100,
                    const std::vector<int>* prefix_tokens = nullptr, bool allow_chunked_prefill = true,
-                   bool require_hybrid_ssm_prefix_snapshot = false);
+                   bool require_hybrid_ssm_prefix_snapshot = false, int max_prefill_chunk_tokens = -1);
 
     /**
      * Remove a request (cancel or complete)
@@ -211,8 +233,13 @@ public:
     /**
      * Update sequence progress (call after each token generation)
      */
+    void OnPrefillChunkComplete(int seq_id, int tokens_processed, bool prefill_finished);
+    void OnDecodeStepComplete(int seq_id, int tokens_processed = 1);
     void UpdateProgress(int seq_id, int tokens_generated = 1);
     void UpdateProgressBatch(const std::vector<std::pair<int, int>>& progress_updates);
+    static const char* EmptyReasonName(SchedulerEmptyReason reason);
+    static const char* UnschedulableReasonName(SchedulerUnschedulableReason reason);
+    static std::string DescribeUnschedulableReason(const SchedulerOutput& output);
 
     /**
      * Get scheduler stats
@@ -222,6 +249,8 @@ public:
         int running_count;
         int swapped_count;
         float memory_usage;
+        SchedulerEmptyReason last_empty_reason = SchedulerEmptyReason::None;
+        SchedulerUnschedulableReason last_unschedulable_reason = SchedulerUnschedulableReason::None;
     };
 
     Stats GetStats() const;
@@ -251,6 +280,10 @@ private:
     int GetSequenceProgress(int seq_id) const;
     int GetSequenceContextLen(int seq_id) const;
     std::chrono::steady_clock::time_point GetSequenceArrival(int seq_id) const;
+    SequenceGroup* FindWaitingGroupLocked(int seq_id);
+    const SequenceGroup* FindWaitingGroupLocked(int seq_id) const;
+    void OnPrefillChunkCompleteLocked(int seq_id, int tokens_processed, bool prefill_finished);
+    void OnDecodeStepCompleteLocked(int seq_id, int tokens_processed);
 
     void ScheduleRunning(SchedulerOutput& output);
     void ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap = -1);
@@ -298,6 +331,8 @@ private:
     // batching. Updated after MoE routing via SetPredictedExperts().
     // ==========================================================================
     std::unordered_map<int, std::vector<int>> seq_predicted_experts_;  // seq_id -> expert_ids
+    SchedulerEmptyReason last_empty_reason_ = SchedulerEmptyReason::None;
+    SchedulerUnschedulableReason last_unschedulable_reason_ = SchedulerUnschedulableReason::None;
 };
 
 // Configuration factories

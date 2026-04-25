@@ -673,7 +673,8 @@ typedef struct {
 } DenseCoreChatMessage;
 
 typedef struct {
-    int enable_thinking;  // -1 = auto, 0 = disable, 1 = enable
+    int enable_thinking;    // -1 = auto, 0 = disable, 1 = enable
+    int preserve_thinking;  // -1 = auto, 0 = strip assistant reasoning history, 1 = preserve
 } DenseCoreChatTemplateOptions;
 
 typedef struct {

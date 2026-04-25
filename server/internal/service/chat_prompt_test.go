@@ -163,6 +163,63 @@ func TestFormatChatPromptQwenTemplateKwargsOverrideThinking(t *testing.T) {
 	}
 }
 
+func TestFormatChatPromptQwen36NoThinkingUsesOfficialPromptWithoutDirective(t *testing.T) {
+	enableThinking := false
+	prompt := FormatChatPrompt("/tmp/Qwen3.6-27B-Q4_K_M.gguf", []domain.Message{
+		{Role: "user", Content: "안녕?"},
+	}, &domain.ChatTemplateKwargs{EnableThinking: &enableThinking})
+
+	if strings.Contains(prompt, "/no_think") {
+		t.Fatalf("expected qwen3.6 no-thinking prompt to avoid /no_think, got %q", prompt)
+	}
+	if prompt != "<|im_start|>user\n안녕?<|im_end|>\n<|im_start|>assistant\n" {
+		t.Fatalf("unexpected qwen3.6 no-thinking prompt: %q", prompt)
+	}
+}
+
+func TestFormatChatPromptQwen36MergesLeadingSystemAndDeveloperIntoSingleSystemBlock(t *testing.T) {
+	enableThinking := false
+	prompt := FormatChatPrompt("/tmp/Qwen3.6-27B-Q4_K_M.gguf", []domain.Message{
+		{Role: "system", Content: "You are terse."},
+		{Role: "developer", Content: "Prefer bullet points."},
+		{Role: "user", Content: "Summarize this."},
+	}, &domain.ChatTemplateKwargs{EnableThinking: &enableThinking})
+
+	expectedPrefix := "<|im_start|>system\nYou are terse.\n\nPrefer bullet points.<|im_end|>\n<|im_start|>user\nSummarize this.<|im_end|>\n"
+	if !strings.HasPrefix(prompt, expectedPrefix) {
+		t.Fatalf("expected merged leading system/developer block, got %q", prompt)
+	}
+}
+
+func TestFormatChatPromptQwen36ThinkingDoesNotPreopenThinkBlock(t *testing.T) {
+	enableThinking := true
+	prompt := FormatChatPrompt("/tmp/Qwen3.6-27B-Q4_K_M.gguf", []domain.Message{
+		{Role: "user", Content: "hello"},
+	}, &domain.ChatTemplateKwargs{EnableThinking: &enableThinking})
+
+	if strings.Contains(prompt, "<think>\n") {
+		t.Fatalf("expected qwen3.6 prompt to avoid synthetic think preamble, got %q", prompt)
+	}
+	if prompt != "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n" {
+		t.Fatalf("unexpected qwen3.6 thinking prompt: %q", prompt)
+	}
+}
+
+func TestFormatChatPromptQwen36CanStripAssistantReasoningHistory(t *testing.T) {
+	preserveThinking := false
+	prompt := FormatChatPrompt("/tmp/Qwen3.6-27B-Q4_K_M.gguf", []domain.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "final", ReasoningContent: "chain"},
+	}, &domain.ChatTemplateKwargs{PreserveThinking: &preserveThinking})
+
+	if strings.Contains(prompt, "<think>") {
+		t.Fatalf("expected preserve_thinking=false to strip assistant reasoning history, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "<|im_start|>assistant\nfinal<|im_end|>\n") {
+		t.Fatalf("expected assistant content to remain after stripping reasoning, got %q", prompt)
+	}
+}
+
 func TestFormatChatPromptQwenNoThinkingKeepsChatMLForHistory(t *testing.T) {
 	t.Setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false")
 	prompt := FormatChatPrompt("/tmp/Qwen3.5-2B-Q4_K_M.gguf", []domain.Message{

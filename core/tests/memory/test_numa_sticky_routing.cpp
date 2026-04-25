@@ -23,13 +23,13 @@
 #include <string>
 #include <vector>
 
-#include "../src/thread_pool_impl.h"
-#include "cpu_backend.h"
+#include "../src/backend/thread_pool_impl.h"
+#include "densecore/backend/cpu_backend.h"
 #include "densecore.h"
 #include "ggml.h"
-#include "inference.h"
-#include "model_types.h"
-#include "moe/profiler.h"
+#include "densecore/runtime/inference.h"
+#include "densecore/models/model_types.h"
+#include "densecore/moe/profiler.h"
 
 using namespace densecore;
 using namespace densecore::moe;
@@ -445,6 +445,12 @@ void WriteA3BResultFile(const char* path, const char* status, std::string_view m
     }
     std::fprintf(fp, "]\n}\n");
     std::fclose(fp);
+}
+
+std::string MakeA3BResultMessage(std::string_view label) {
+    std::string out(label);
+    out += " deterministic A3B harness completed";
+    return out;
 }
 
 struct TokenCaptureState {
@@ -1207,6 +1213,50 @@ TEST(NumaStickyRouting, DispatchExpertFFN_PackedInt4EmitsPathVisibility) {
 #endif
 }
 
+TEST(NumaStickyRouting, ForwardMoE_ExpertFlagForcesReferencePathOnArm) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    GTEST_SKIP() << "ARM-only parity guard";
+#else
+    CpuBackend& backend = GetCpuBackend();
+    const int batch = 2;
+    const int hidden_dim = 16;
+    const int intermediate_dim = 24;
+    const int group_size = 8;
+
+    PackedExpertFixture fixture = BuildPackedExpertFixture(batch, hidden_dim, intermediate_dim, group_size, 911);
+    fixture.expert.force_safe_reference = true;
+
+    std::vector<float> output(static_cast<size_t>(batch * hidden_dim), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(fixture.input.data(), batch, hidden_dim);
+    Tensor output_tensor = Tensor::Make2D(output.data(), batch, hidden_dim);
+    std::vector<CpuBackend::ExpertWeights> experts = {fixture.expert};
+
+    moe::MoERouteResult routing;
+    routing.batch_size = batch;
+    routing.top_k = 1;
+    routing.expert_ids.resize(static_cast<size_t>(batch), 0);
+    routing.weights.resize(static_cast<size_t>(batch), 1.0f);
+    routing.token_indices.resize(static_cast<size_t>(batch));
+    for (int i = 0; i < batch; ++i) {
+        routing.token_indices[static_cast<size_t>(i)] = i;
+    }
+
+    EnvGuard matmul_trace("DENSECORE_DEBUG_MOE_MATMUL_PATHS", "1");
+    ::testing::internal::CaptureStderr();
+    backend.ForwardMoE(input_tensor, routing, experts, &output_tensor);
+    const std::string stderr_output = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(stderr_output.find("path=reference_f32"), std::string::npos);
+    EXPECT_EQ(stderr_output.find("path=backend_gemmint4"), std::string::npos);
+
+    const std::vector<float> reference =
+        BuildPackedExpertReference(fixture, batch, hidden_dim, intermediate_dim, group_size);
+    for (size_t i = 0; i < reference.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 2e-3f) << "index=" << i;
+    }
+#endif
+}
+
 TEST(NumaStickyRouting, RoutingOracleSoftmaxTopKMatchesReference) {
     struct ggml_init_params params{};
     params.mem_size = 64 * 1024;
@@ -1712,6 +1762,56 @@ TEST(NumaStickyRouting, BuildExpertWeightsReconstructsBasePackedInt4Slices) {
     ggml_free(ctx);
 }
 
+TEST(NumaStickyRouting, BuildExpertWeightsMarksGemma4MoEExpertsForceSafeReference) {
+    struct ggml_init_params params{};
+    params.mem_size = 64 * 1024;
+    params.no_alloc = false;
+    struct ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    const int hidden_dim = 8;
+    const int intermediate_dim = 4;
+
+    auto* w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_dim, intermediate_dim);
+    auto* w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, intermediate_dim, hidden_dim);
+    auto* w3 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_dim, intermediate_dim);
+    ASSERT_NE(w1, nullptr);
+    ASSERT_NE(w2, nullptr);
+    ASSERT_NE(w3, nullptr);
+
+    std::vector<float> w1_data(static_cast<size_t>(hidden_dim * intermediate_dim), 0.1f);
+    std::vector<float> w2_data(static_cast<size_t>(hidden_dim * intermediate_dim), 0.2f);
+    std::vector<float> w3_data(static_cast<size_t>(hidden_dim * intermediate_dim), 0.3f);
+    std::memcpy(w1->data, w1_data.data(), w1_data.size() * sizeof(float));
+    std::memcpy(w2->data, w2_data.data(), w2_data.size() * sizeof(float));
+    std::memcpy(w3->data, w3_data.data(), w3_data.size() * sizeof(float));
+
+    TransformerLayer layer{};
+    layer.is_moe = true;
+    layer.SetExpert(0, model_keys::kFfnGate, w1);
+    layer.SetExpert(0, model_keys::kFfnDown, w2);
+    layer.SetExpert(0, model_keys::kFfnUp, w3);
+
+    TransformerModel gemma4_model{};
+    gemma4_model.arch = ModelArch::GEMMA;
+    gemma4_model.arch_flags.is_gemma4 = true;
+    gemma4_model.hparams.n_experts = 2;
+    const auto gemma4_experts = densecore::testing::BuildExpertWeightsForTest(&layer, &gemma4_model);
+    ASSERT_EQ(gemma4_experts.size(), 1u);
+    EXPECT_TRUE(gemma4_experts[0].use_gelu_activation);
+    EXPECT_TRUE(gemma4_experts[0].force_safe_reference);
+
+    TransformerModel baseline_model{};
+    baseline_model.arch = ModelArch::LLAMA;
+    baseline_model.arch_flags.is_gemma4 = false;
+    baseline_model.hparams.n_experts = 2;
+    const auto baseline_experts = densecore::testing::BuildExpertWeightsForTest(&layer, &baseline_model);
+    ASSERT_EQ(baseline_experts.size(), 1u);
+    EXPECT_FALSE(baseline_experts[0].force_safe_reference);
+
+    ggml_free(ctx);
+}
+
 TEST(NumaStickyRouting, RealQwen35A3BDeterministicHarness) {
     const char* model_path = std::getenv("DENSECORE_QWEN35_A3B_MODEL");
     const char* prompt = std::getenv("DENSECORE_QWEN35_A3B_PROMPT");
@@ -1785,7 +1885,95 @@ TEST(NumaStickyRouting, RealQwen35A3BDeterministicHarness) {
 
     const char* final_status =
         (first_divergence_batch1 < 0 && first_divergence_batch4 < 0) ? "pass" : "divergence";
-    WriteA3BResultFile(result_json, final_status, "Deterministic A3B harness completed", prompt, single.token_ids,
+    WriteA3BResultFile(result_json, final_status, MakeA3BResultMessage("Qwen3.5"), prompt, single.token_ids,
+                       representative_batch4, first_divergence_batch1, first_divergence_batch4);
+
+    for (size_t i = 0; i < expected_one.size(); ++i) {
+        EXPECT_EQ(single.token_ids[i], expected_one[i]) << "batch1 divergence at token " << i;
+    }
+    for (auto& state : batch_states) {
+        for (size_t i = 0; i < expected_four.size(); ++i) {
+            EXPECT_EQ(state.token_ids[i], expected_four[i]) << "batch4 divergence at token " << i;
+        }
+    }
+
+    FreeEngine(engine);
+}
+
+TEST(NumaStickyRouting, RealQwen36A3BDeterministicHarness) {
+    const char* model_path = std::getenv("DENSECORE_QWEN36_A3B_MODEL");
+    const char* prompt = std::getenv("DENSECORE_QWEN36_A3B_PROMPT");
+    const char* expect_batch1 = std::getenv("DENSECORE_QWEN36_A3B_EXPECT_BATCH1");
+    const char* expect_batch4 = std::getenv("DENSECORE_QWEN36_A3B_EXPECT_BATCH4");
+    const char* result_json = std::getenv("DENSECORE_QWEN36_A3B_RESULT_JSON");
+    if (!model_path || !*model_path || !prompt || !*prompt || !expect_batch1 || !*expect_batch1 || !expect_batch4 ||
+        !*expect_batch4) {
+        WriteA3BResultFile(result_json, "skipped_due_to_missing_artifact",
+                           "Missing model path, prompt, or expected trace environment variables", prompt ? prompt : "",
+                           {}, {}, -1, -1);
+        GTEST_SKIP() << "Set DENSECORE_QWEN36_A3B_MODEL, _PROMPT, _EXPECT_BATCH1, and _EXPECT_BATCH4 to run.";
+    }
+
+    const std::vector<int> expected_one = ParseCsvInts(expect_batch1);
+    const std::vector<int> expected_four = ParseCsvInts(expect_batch4);
+    ASSERT_FALSE(expected_one.empty());
+    ASSERT_FALSE(expected_four.empty());
+
+    DenseCoreHandle engine = InitEngine(model_path, nullptr, 4);
+    if (engine == nullptr) {
+        WriteA3BResultFile(result_json, "runtime_failure", DenseCoreGetLastError() ? DenseCoreGetLastError() : "",
+                           prompt, {}, {}, -1, -1);
+    }
+    ASSERT_NE(engine, nullptr) << DenseCoreGetLastError();
+
+    auto run_request = [&](TokenCaptureState* state) {
+        return SubmitRequestWithTokenResults(engine, prompt, std::max<int>(expected_four.size(), expected_one.size()),
+                                             0.0f, 1.0f, 1, 1.0f, TokenCaptureCallback, state);
+    };
+
+    TokenCaptureState single;
+    ASSERT_GE(run_request(&single), 0) << DenseCoreGetLastError();
+    if (!WaitForTokenCompletion(&single, 120000)) {
+        WriteA3BResultFile(result_json, "runtime_failure", "Timed out waiting for batch=1 request", prompt, {}, {}, -1,
+                           -1);
+    }
+    ASSERT_TRUE(single.finished);
+    ASSERT_GE(single.token_ids.size(), expected_one.size());
+    int first_divergence_batch1 = -1;
+    for (size_t i = 0; i < expected_one.size(); ++i) {
+        if (single.token_ids[i] != expected_one[i]) {
+            first_divergence_batch1 = static_cast<int>(i);
+            break;
+        }
+    }
+
+    std::array<TokenCaptureState, 4> batch_states;
+    for (auto& state : batch_states) {
+        ASSERT_GE(run_request(&state), 0) << DenseCoreGetLastError();
+    }
+    int first_divergence_batch4 = -1;
+    std::vector<int> representative_batch4;
+    for (auto& state : batch_states) {
+        if (!WaitForTokenCompletion(&state, 120000)) {
+            WriteA3BResultFile(result_json, "runtime_failure", "Timed out waiting for batch=4 request", prompt,
+                               single.token_ids, representative_batch4, first_divergence_batch1, first_divergence_batch4);
+        }
+        ASSERT_TRUE(state.finished);
+        ASSERT_GE(state.token_ids.size(), expected_four.size());
+        if (representative_batch4.empty()) {
+            representative_batch4.assign(state.token_ids.begin(),
+                                         state.token_ids.begin() + static_cast<ptrdiff_t>(expected_four.size()));
+        }
+        for (size_t i = 0; i < expected_four.size(); ++i) {
+            if (first_divergence_batch4 < 0 && state.token_ids[i] != expected_four[i]) {
+                first_divergence_batch4 = static_cast<int>(i);
+            }
+        }
+    }
+
+    const char* final_status =
+        (first_divergence_batch1 < 0 && first_divergence_batch4 < 0) ? "pass" : "divergence";
+    WriteA3BResultFile(result_json, final_status, MakeA3BResultMessage("Qwen3.6"), prompt, single.token_ids,
                        representative_batch4, first_divergence_batch1, first_divergence_batch4);
 
     for (size_t i = 0; i < expected_one.size(); ++i) {

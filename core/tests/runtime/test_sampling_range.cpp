@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "ggml.h"
-#include "inference.h"
+#include "densecore/runtime/inference.h"
 
 namespace {
 

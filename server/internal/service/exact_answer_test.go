@@ -37,7 +37,8 @@ func (e *exactAnswerTestEngine) CountTokens(text string, addBOS bool, addEOS boo
 func (e *exactAnswerTestEngine) TokenizeText(text string, addBOS bool, addEOS bool) ([]int, error) {
 	return e.tokens[text], nil
 }
-func (e *exactAnswerTestEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool) (*domain.RenderedChatPrompt, error) {
+func (e *exactAnswerTestEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool,
+	preserveThinking *bool) (*domain.RenderedChatPrompt, error) {
 	return &domain.RenderedChatPrompt{RenderedPrompt: messages[0].Content}, nil
 }
 func (e *exactAnswerTestEngine) GetTokenizerType() string    { return "gemma" }
@@ -51,6 +52,9 @@ func TestExtractExactAnswerFromText(t *testing.T) {
 		want string
 	}{
 		{"What is the capital of France? Answer with only Paris.", "Paris"},
+		{"What is the secret token? Answer with only the token.", ""},
+		{"Repeat the exact secret code only. Answer with only BLUE-PEARL-471.", "BLUE-PEARL-471"},
+		{"What is the capital of France? Answer with only \"Paris\".", "Paris"},
 		{"한국의 수도는 어디인가요? 서울만 답해 주세요.", "서울"},
 		{"Say hello.", ""},
 	}

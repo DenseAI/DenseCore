@@ -309,10 +309,41 @@ static bool IsDebugSSMCoreReferenceEnabled() {
 using densecore::llm::models::IsHybridSSMQkvWeightName;
 using densecore::llm::models::ShouldForcePlainGgmlForHybridSSMQkv;
 
+static std::array<std::atomic<uint64_t>, kHybridSSMDispatchWeightCount * kHybridSSMDispatchPathCount>
+    g_hybrid_ssm_dispatch_counters{};
+
+static std::size_t ResolveHybridSSMDispatchWeightIndex(const char* name) {
+    if (!name) {
+        return 3;
+    }
+    if (std::strstr(name, "qkv_mixed")) return 0;
+    if (std::strcmp(name, "z") == 0 || std::strstr(name, ".z")) return 1;
+    if (std::strstr(name, "ssm_out")) return 2;
+    return 3;
+}
+
+static std::size_t ResolveHybridSSMDispatchPathIndex(const char* path) {
+    if (!path) {
+        return 4;
+    }
+    if (std::strstr(path, "PLAIN_GGML_CONSERVATIVE_FALLBACK")) return 0;
+    if (std::strstr(path, "GEMV_QUANT")) return 1;
+    if (std::strstr(path, "GGML_QUANT_NRC_M")) return 2;
+    if (std::strstr(path, "GGML_NATIVE")) return 3;
+    return 4;
+}
+
 static void LogHybridSSMQkvDispatch(const char* weight_name, ggml_type weight_type, int M, int N, int K,
                                     const char* chosen_path, bool used_batched_quant_nrc, bool used_native_q4k_vecdot,
                                     bool used_direct_int4_fastpath) {
-    if (!IsDebugMatmulDispatchEnabled() || !densecore::llm::models::IsHybridSSMQkvWeightName(weight_name)) {
+    if (!densecore::llm::models::IsHybridSSMQkvWeightName(weight_name)) {
+        return;
+    }
+    const std::size_t weight_index = ResolveHybridSSMDispatchWeightIndex(weight_name);
+    const std::size_t path_index = ResolveHybridSSMDispatchPathIndex(chosen_path);
+    g_hybrid_ssm_dispatch_counters[weight_index * kHybridSSMDispatchPathCount + path_index].fetch_add(
+        1, std::memory_order_relaxed);
+    if (!IsDebugMatmulDispatchEnabled()) {
         return;
     }
     fprintf(stderr,
@@ -1461,7 +1492,11 @@ bool IsPagedDecodeModeAlwaysOn() {
 }
 
 DecodeRuntimeStatsSnapshot GetDecodeRuntimeStatsSnapshot() {
-    return densecore::llm::attention::GetDecodeRuntimeStatsSnapshotImpl();
+    DecodeRuntimeStatsSnapshot snapshot = densecore::llm::attention::GetDecodeRuntimeStatsSnapshotImpl();
+    for (std::size_t i = 0; i < snapshot.hybrid_ssm_dispatch_counts.size(); ++i) {
+        snapshot.hybrid_ssm_dispatch_counts[i] = g_hybrid_ssm_dispatch_counters[i].load(std::memory_order_relaxed);
+    }
+    return snapshot;
 }
 
 const char* GetDecodePagedFallbackReasonName(std::size_t index) {
@@ -1470,6 +1505,27 @@ const char* GetDecodePagedFallbackReasonName(std::size_t index) {
     }
     return densecore::llm::attention::DecodePagedFallbackReasonName(
         static_cast<densecore::llm::attention::DecodePagedFallbackReason>(index));
+}
+
+const char* GetHybridSSMDispatchWeightName(std::size_t index) {
+    switch (index) {
+    case 0: return "qkv_mixed";
+    case 1: return "z";
+    case 2: return "ssm_out";
+    case 3:
+    default: return "other";
+    }
+}
+
+const char* GetHybridSSMDispatchPathName(std::size_t index) {
+    switch (index) {
+    case 0: return "PLAIN_GGML_CONSERVATIVE_FALLBACK";
+    case 1: return "GEMV_QUANT";
+    case 2: return "GGML_QUANT_NRC_M";
+    case 3: return "GGML_NATIVE";
+    case 4:
+    default: return "OTHER";
+    }
 }
 
 // ============================================================================
@@ -1722,6 +1778,14 @@ static constexpr int kMaxGemvUserDataSlots = 2048;
 static constexpr size_t kMaxQuantInputBufferSize = 65536;  // 64KB for large N
 static constexpr int kMaxSmallBatchColsHard = 16;
 static constexpr size_t kMaxDequantBufferSize = 16384;
+
+static int ResolveQuantBatchedTileCols(int requested_cols, int vec_dot_nrows, bool allow_true_batched_q4k) {
+    int tile_cols = std::max(1, std::min(kMaxSmallBatchColsHard, requested_cols));
+    if (!allow_true_batched_q4k && vec_dot_nrows > 0) {
+        tile_cols = std::min(tile_cols, vec_dot_nrows);
+    }
+    return std::max(1, tile_cols);
+}
 /**
  * User data for parallel GEMV operation
  */
@@ -2323,7 +2387,8 @@ struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache*
     const densecore::TransformerGraphExecutionPlan* bound_plan =
         (batch.deps && batch.deps->transformer_execution_plan) ? batch.deps->transformer_execution_plan : nullptr;
     const densecore::TransformerGraphExecutionPlan fallback_plan =
-        bound_plan ? densecore::TransformerGraphExecutionPlan{} : densecore::ResolveTransformerGraphExecutionPlan(model);
+        bound_plan ? densecore::TransformerGraphExecutionPlan{}
+                   : densecore::ResolveTransformerGraphExecutionPlan(model);
     const densecore::TransformerGraphExecutionPlan& plan = bound_plan ? *bound_plan : fallback_plan;
 
     if (IsVerboseGraphBuildLoggingEnabled()) {
@@ -2537,39 +2602,14 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
     }
 
     // Reuse causal mask tensor across layers for the same forward pass.
-    // Prefill builds N>1 attention repeatedly; hoisting avoids O(L * N * K)
-    // mask materialization and graph-build overhead.
+    // The mask is built lazily only if native flash attention is actually
+    // selected. Portable CPU flash and standard attention do not need it.
     struct ggml_tensor* shared_prefill_flash_mask = nullptr;
     int shared_prefill_mask_n_total = -1;
     int shared_prefill_mask_n_padded = -1;
     int shared_prefill_mask_n = -1;
     int shared_prefill_mask_n_past = -1;
     int shared_prefill_mask_sliding_window = -1;
-    if (N > 1 && !decode_only_batch_layout) {
-        int prefill_n_past = 0;
-        if (cache && batch.num_seqs > 0 && !batch.n_past.empty()) {
-            prefill_n_past = *std::max_element(batch.n_past.begin(), batch.n_past.end());
-        }
-        const int prefill_n_total = prefill_n_past + N;
-        const int prefill_n_padded = (N + GGML_KQ_MASK_PAD - 1) & ~(GGML_KQ_MASK_PAD - 1);
-
-        shared_prefill_flash_mask = ggml_new_tensor_4d(ctx_c, GGML_TYPE_F32, prefill_n_total, prefill_n_padded, 1, 1);
-        float* mask_data = reinterpret_cast<float*>(shared_prefill_flash_mask->data);
-        for (int q = 0; q < prefill_n_padded; ++q) {
-            for (int k = 0; k < prefill_n_total; ++k) {
-                const int query_pos = prefill_n_past + q;
-                const int key_pos = k;
-                const int idx = k + q * prefill_n_total;
-                mask_data[idx] = (q < N && key_pos <= query_pos) ? 0.0f : -INFINITY;
-            }
-        }
-
-        shared_prefill_mask_n_total = prefill_n_total;
-        shared_prefill_mask_n_padded = prefill_n_padded;
-        shared_prefill_mask_n = N;
-        shared_prefill_mask_n_past = prefill_n_past;
-        shared_prefill_mask_sliding_window = -1;
-    }
 
     // =========================================================================
     // 2. Transformer Layers
@@ -5076,6 +5116,9 @@ void CbSsmQwen35DeltaTest(struct ggml_tensor* dst, const struct ggml_tensor* a, 
 struct ggml_tensor* SmartMulMatTest(struct ggml_context* ctx, struct ggml_tensor* weight, struct ggml_tensor* input,
                                     TransformerModel* model) {
     return ::smart_mul_mat(ctx, weight, input, model);
+}
+int ResolveQuantBatchedTileColsForTest(int requested_cols, int vec_dot_nrows, bool allow_true_batched_q4k) {
+    return ::ResolveQuantBatchedTileCols(requested_cols, vec_dot_nrows, allow_true_batched_q4k);
 }
 }  // namespace testing
 }  // namespace densecore

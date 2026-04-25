@@ -1,7 +1,8 @@
 #include "densecore/hal/tensor.h"
+#include "densecore/backend/cpu_backend.h"
 #include "densecore/kernels/paged_attention.h"
-#include "flash_attention.h"
-#include "kv_cache.h"
+#include "densecore/backend/flash_attention.h"
+#include "densecore/memory/kv_cache.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -108,6 +109,56 @@ void ComputeReferenceSingleHead(const PagedKVCache& cache, const std::vector<int
 
         const int logical_block = t / BLOCK_SIZE;
         const int slot = t % BLOCK_SIZE;
+        cache.ReadVSlot(block_table[static_cast<size_t>(logical_block)], 0, slot, v_head.data());
+        for (int d = 0; d < static_cast<int>(query.size()); ++d) {
+            (*out)[static_cast<size_t>(d)] += weight * v_head[static_cast<size_t>(d)];
+        }
+    }
+
+    ASSERT_GT(denom, 0.0f);
+    const float inv = 1.0f / denom;
+    for (float& v : *out) {
+        v *= inv;
+    }
+}
+
+void ComputeReferenceSingleHeadWindowed(const PagedKVCache& cache, const std::vector<int>& block_table,
+                                        int context_start_pos, int context_len, const std::vector<float>& query,
+                                        float scale, float logit_softcap, std::vector<float>* out) {
+    out->assign(query.size(), 0.0f);
+    std::vector<float> k_head(query.size(), 0.0f);
+    std::vector<float> v_head(query.size(), 0.0f);
+    std::vector<float> scores(static_cast<size_t>(context_len), 0.0f);
+
+    float max_score = -std::numeric_limits<float>::infinity();
+    for (int t = 0; t < context_len; ++t) {
+        const int token_pos = context_start_pos + t;
+        const int logical_block = token_pos / BLOCK_SIZE;
+        const int slot = token_pos % BLOCK_SIZE;
+        cache.ReadKSlot(block_table[static_cast<size_t>(logical_block)], 0, slot, k_head.data());
+
+        float dot = 0.0f;
+        for (int d = 0; d < static_cast<int>(query.size()); ++d) {
+            dot += query[static_cast<size_t>(d)] * k_head[static_cast<size_t>(d)];
+        }
+        float score = dot * scale;
+        if (logit_softcap > 0.0f && std::isfinite(score)) {
+            score = std::tanh(score / logit_softcap) * logit_softcap;
+        }
+        scores[static_cast<size_t>(t)] = score;
+        if (score > max_score) {
+            max_score = score;
+        }
+    }
+
+    float denom = 0.0f;
+    for (int t = 0; t < context_len; ++t) {
+        const float weight = std::exp(scores[static_cast<size_t>(t)] - max_score);
+        denom += weight;
+
+        const int token_pos = context_start_pos + t;
+        const int logical_block = token_pos / BLOCK_SIZE;
+        const int slot = token_pos % BLOCK_SIZE;
         cache.ReadVSlot(block_table[static_cast<size_t>(logical_block)], 0, slot, v_head.data());
         for (int d = 0; d < static_cast<int>(query.size()); ++d) {
             (*out)[static_cast<size_t>(d)] += weight * v_head[static_cast<size_t>(d)];
@@ -296,6 +347,78 @@ TEST_F(PagedAttentionTest, BasicCorrectnessF32) {
     EXPECT_NEAR(output_data[0], 0.5f, 1e-5f);
 }
 
+TEST_F(PagedAttentionTest, ContextStartOffsetMatchesReference) {
+    int block0 = cache->block_manager->AllocateSingle();
+    int block1 = cache->block_manager->AllocateSingle();
+    ASSERT_GE(block0, 0);
+    ASSERT_GE(block1, 0);
+
+    std::vector<float> ones(64, 1.0f);
+    std::vector<float> twos(64, 2.0f);
+    std::vector<float> halves(64, 0.5f);
+    for (int t = 0; t < 16; ++t) {
+        cache->WriteKSlot(block0, 0, t, ones.data());
+        cache->WriteVSlot(block0, 0, t, ones.data());
+        cache->WriteKSlot(block1, 0, t, twos.data());
+        cache->WriteVSlot(block1, 0, t, halves.data());
+    }
+
+    std::vector<float> query_data(64, 1.0f);
+    densecore::Tensor query = densecore::Tensor::Make2D(query_data.data(), 1, 64);
+    std::vector<float> output_data(64, 0.0f);
+    densecore::Tensor output = densecore::Tensor::Make2D(output_data.data(), 1, 64);
+    const std::vector<int> block_table = {block0, block1};
+
+    densecore::kernels::PagedAttentionConfig config;
+    config.context_len = 16;
+    config.context_start_pos = 16;
+    config.scale = 1.0f;
+    densecore::kernels::PagedAttention(query, *cache, 0, block_table, config, &output);
+
+    std::vector<float> ref;
+    ComputeReferenceSingleHeadWindowed(*cache, block_table, /*context_start_pos=*/16, /*context_len=*/16, query_data,
+                                       /*scale=*/1.0f, /*logit_softcap=*/0.0f, &ref);
+
+    EXPECT_NEAR(output_data[0], ref[0], 1e-5f);
+    EXPECT_NEAR(output_data[0], 0.5f, 1e-5f);
+}
+
+TEST_F(PagedAttentionTest, LogitSoftcapMatchesReference) {
+    int block0 = cache->block_manager->AllocateSingle();
+    ASSERT_GE(block0, 0);
+
+    std::vector<float> k_small(64, 0.25f);
+    std::vector<float> k_large(64, 4.0f);
+    std::vector<float> v_small(64, 1.0f);
+    std::vector<float> v_large(64, -1.0f);
+    for (int t = 0; t < 8; ++t) {
+        cache->WriteKSlot(block0, 0, t, k_small.data());
+        cache->WriteVSlot(block0, 0, t, v_small.data());
+    }
+    for (int t = 8; t < 16; ++t) {
+        cache->WriteKSlot(block0, 0, t, k_large.data());
+        cache->WriteVSlot(block0, 0, t, v_large.data());
+    }
+
+    std::vector<float> query_data(64, 1.0f);
+    densecore::Tensor query = densecore::Tensor::Make2D(query_data.data(), 1, 64);
+    std::vector<float> output_data(64, 0.0f);
+    densecore::Tensor output = densecore::Tensor::Make2D(output_data.data(), 1, 64);
+    const std::vector<int> block_table = {block0};
+
+    densecore::kernels::PagedAttentionConfig config;
+    config.context_len = 16;
+    config.scale = 1.0f;
+    config.logit_softcap = 8.0f;
+    densecore::kernels::PagedAttention(query, *cache, 0, block_table, config, &output);
+
+    std::vector<float> ref;
+    ComputeReferenceSingleHeadWindowed(*cache, block_table, /*context_start_pos=*/0, /*context_len=*/16, query_data,
+                                       /*scale=*/1.0f, /*logit_softcap=*/8.0f, &ref);
+
+    EXPECT_NEAR(output_data[0], ref[0], 5e-5f);
+}
+
 TEST_F(PagedAttentionTest, FlashAttentionGqaHonorsChunkedPrefillOffsets) {
     constexpr int n_head = 2;
     constexpr int n_head_kv = 1;
@@ -394,6 +517,112 @@ TEST_F(PagedAttentionTest, FlashAttentionGqaQwenChunkedPrefillMatchesReference) 
 
     for (size_t i = 0; i < out.size(); ++i) {
         EXPECT_NEAR(out[i], ref[i], 1e-4f) << "Mismatch at index " << i;
+    }
+}
+
+TEST_F(PagedAttentionTest, CpuBackendFlashAttentionPrefillNativeStridedMatchesPacked) {
+    constexpr int batch = 2;
+    constexpr int n_head = 3;
+    constexpr int n_head_kv = 3;
+    constexpr int seq_q = 4;
+    constexpr int seq_kv = 4;
+    constexpr int head_dim = 8;
+
+    const size_t native_q_elems = static_cast<size_t>(batch) * seq_q * n_head * head_dim;
+    const size_t native_kv_elems = static_cast<size_t>(batch) * seq_kv * n_head_kv * head_dim;
+    const size_t packed_q_elems = static_cast<size_t>(batch) * n_head * seq_q * head_dim;
+    const size_t packed_kv_elems = static_cast<size_t>(batch) * n_head_kv * seq_kv * head_dim;
+
+    std::vector<float> q_native(native_q_elems);
+    std::vector<float> k_native(native_kv_elems);
+    std::vector<float> v_native(native_kv_elems);
+    std::vector<float> q_packed(packed_q_elems);
+    std::vector<float> k_packed(packed_kv_elems);
+    std::vector<float> v_packed(packed_kv_elems);
+    std::vector<float> out_native(native_q_elems, 0.0f);
+    std::vector<float> out_packed(packed_q_elems, 0.0f);
+
+    std::mt19937 rng(999u);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    for (float& x : q_native) x = dist(rng);
+    for (float& x : k_native) x = dist(rng);
+    for (float& x : v_native) x = dist(rng);
+
+    for (int b = 0; b < batch; ++b) {
+        for (int s = 0; s < seq_q; ++s) {
+            for (int h = 0; h < n_head; ++h) {
+                const size_t native_base = ((static_cast<size_t>(b) * seq_q + s) * n_head + h) * head_dim;
+                const size_t packed_base = ((static_cast<size_t>(b) * n_head + h) * seq_q + s) * head_dim;
+                std::copy_n(q_native.data() + native_base, head_dim, q_packed.data() + packed_base);
+            }
+        }
+        for (int s = 0; s < seq_kv; ++s) {
+            for (int h = 0; h < n_head_kv; ++h) {
+                const size_t native_base = ((static_cast<size_t>(b) * seq_kv + s) * n_head_kv + h) * head_dim;
+                const size_t packed_base = ((static_cast<size_t>(b) * n_head_kv + h) * seq_kv + s) * head_dim;
+                std::copy_n(k_native.data() + native_base, head_dim, k_packed.data() + packed_base);
+                std::copy_n(v_native.data() + native_base, head_dim, v_packed.data() + packed_base);
+            }
+        }
+    }
+
+    densecore::Tensor q_native_t;
+    q_native_t.data = q_native.data();
+    q_native_t.ndim = 4;
+    q_native_t.dtype = densecore::DType::F32;
+    q_native_t.device_type = densecore::DeviceType::CPU;
+    q_native_t.shape = {batch, n_head, seq_q, head_dim};
+    q_native_t.stride = {static_cast<int64_t>(seq_q) * n_head * head_dim, head_dim,
+                         static_cast<int64_t>(n_head) * head_dim, 1};
+
+    densecore::Tensor k_native_t;
+    k_native_t.data = k_native.data();
+    k_native_t.ndim = 4;
+    k_native_t.dtype = densecore::DType::F32;
+    k_native_t.device_type = densecore::DeviceType::CPU;
+    k_native_t.shape = {batch, n_head_kv, seq_kv, head_dim};
+    k_native_t.stride = {static_cast<int64_t>(seq_kv) * n_head_kv * head_dim, head_dim,
+                         static_cast<int64_t>(n_head_kv) * head_dim, 1};
+
+    densecore::Tensor v_native_t = k_native_t;
+    v_native_t.data = v_native.data();
+
+    densecore::Tensor out_native_t;
+    out_native_t.data = out_native.data();
+    out_native_t.ndim = 4;
+    out_native_t.dtype = densecore::DType::F32;
+    out_native_t.device_type = densecore::DeviceType::CPU;
+    out_native_t.shape = {batch, n_head, seq_q, head_dim};
+    out_native_t.stride = {static_cast<int64_t>(seq_q) * n_head * head_dim, head_dim,
+                           static_cast<int64_t>(n_head) * head_dim, 1};
+
+    densecore::Tensor q_packed_t = densecore::Tensor::Make4D(q_packed.data(), batch, n_head, seq_q, head_dim);
+    densecore::Tensor k_packed_t =
+        densecore::Tensor::Make4D(k_packed.data(), batch, n_head_kv, seq_kv, head_dim);
+    densecore::Tensor v_packed_t =
+        densecore::Tensor::Make4D(v_packed.data(), batch, n_head_kv, seq_kv, head_dim);
+    densecore::Tensor out_packed_t =
+        densecore::Tensor::Make4D(out_packed.data(), batch, n_head, seq_q, head_dim);
+
+    auto& backend = densecore::GetCpuBackend();
+    backend.FlashAttention(q_native_t, k_native_t, v_native_t, &out_native_t,
+                           1.0f / std::sqrt(static_cast<float>(head_dim)),
+                           /*causal=*/false, n_head_kv);
+    backend.FlashAttention(q_packed_t, k_packed_t, v_packed_t, &out_packed_t,
+                           1.0f / std::sqrt(static_cast<float>(head_dim)),
+                           /*causal=*/false, n_head_kv);
+
+    for (int b = 0; b < batch; ++b) {
+        for (int s = 0; s < seq_q; ++s) {
+            for (int h = 0; h < n_head; ++h) {
+                const size_t native_base = ((static_cast<size_t>(b) * seq_q + s) * n_head + h) * head_dim;
+                const size_t packed_base = ((static_cast<size_t>(b) * n_head + h) * seq_q + s) * head_dim;
+                for (int d = 0; d < head_dim; ++d) {
+                    EXPECT_NEAR(out_native[native_base + d], out_packed[packed_base + d], 1e-5f)
+                        << "b=" << b << " s=" << s << " h=" << h << " d=" << d;
+                }
+            }
+        }
     }
 }
 

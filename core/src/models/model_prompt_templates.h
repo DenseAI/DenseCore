@@ -35,7 +35,8 @@ struct CanonicalChatMessage {
 };
 
 struct CanonicalChatRenderOptions {
-    int enable_thinking = -1;  // -1 = auto
+    int enable_thinking = -1;    // -1 = auto
+    int preserve_thinking = -1;  // -1 = auto
 };
 
 PromptTemplateProfile ResolveModelPromptTemplateProfile(const TransformerModel* model);

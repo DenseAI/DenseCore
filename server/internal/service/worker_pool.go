@@ -173,30 +173,103 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 func proxyStream(ctx context.Context, traceID string, queueReqID string, src <-chan domain.StreamEvent, dst chan<- domain.StreamEvent) {
 	defer close(dst)
 	dstAbandoned := false
-	for event := range src {
-		if dstAbandoned {
-			continue
+	sawPartial := false
+	terminalSeen := false
+
+	sendEvent := func(event domain.StreamEvent) {
+		if dstAbandoned && !event.Terminal {
+			return
 		}
+		if dstAbandoned {
+			select {
+			case dst <- event:
+			default:
+			}
+		} else {
+			dst <- event
+		}
+		if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") && (event.Token != "" || event.Terminal) {
+			slog.Info("request lifecycle: forwarded stream event",
+				slog.String("trace_id", traceID),
+				slog.String("queue_request_id", queueReqID),
+				slog.Bool("terminal", event.Terminal),
+				slog.Bool("finished", event.IsFinished),
+				slog.Bool("canceled", event.Canceled),
+				slog.Bool("has_error", event.TerminalError() != nil),
+				slog.String("token_preview", previewText(event.Token, 64)),
+			)
+		}
+	}
+
+	logAbandonment := func(err error) {
+		if dstAbandoned || !envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") || err == nil {
+			return
+		}
+		state := "before_generation"
+		if sawPartial {
+			state = "after_partial_output"
+		}
+		slog.Warn("request lifecycle: stream destination abandoned",
+			slog.String("trace_id", traceID),
+			slog.String("queue_request_id", queueReqID),
+			slog.String("state", state),
+			slog.String("error", err.Error()),
+		)
+	}
+
+	for {
 		select {
-		case dst <- event:
-			if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") && event.Token != "" {
-				slog.Info("request lifecycle: forwarded stream event",
-					slog.String("trace_id", traceID),
-					slog.String("queue_request_id", queueReqID),
-					slog.Bool("finished", event.IsFinished),
-					slog.Bool("has_error", event.Err != nil),
-					slog.String("token_preview", previewText(event.Token, 64)),
-				)
+		case event, ok := <-src:
+			if !ok {
+				if !terminalSeen {
+					err := domain.ErrStreamClosedWithoutTerminal
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						err = ctxErr
+					}
+					sendEvent(domain.NewTerminalEvent(err))
+				}
+				return
+			}
+			if event.Token != "" {
+				sawPartial = true
+			}
+			if event.Terminal {
+				terminalSeen = true
+				sendEvent(event)
+				continue
+			}
+			if dstAbandoned {
+				continue
+			}
+			select {
+			case dst <- event:
+				if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") && event.Token != "" {
+					slog.Info("request lifecycle: forwarded stream event",
+						slog.String("trace_id", traceID),
+						slog.String("queue_request_id", queueReqID),
+						slog.Bool("terminal", false),
+						slog.Bool("finished", event.IsFinished),
+						slog.Bool("has_error", false),
+						slog.String("token_preview", previewText(event.Token, 64)),
+					)
+				}
+			case <-ctx.Done():
+				logAbandonment(ctx.Err())
+				dstAbandoned = true
+				if !terminalSeen {
+					sendEvent(domain.NewTerminalEvent(ctx.Err()))
+					terminalSeen = true
+				}
+				return
 			}
 		case <-ctx.Done():
+			logAbandonment(ctx.Err())
 			dstAbandoned = true
-			if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
-				slog.Warn("request lifecycle: stream destination abandoned",
-					slog.String("trace_id", traceID),
-					slog.String("queue_request_id", queueReqID),
-					slog.String("error", ctx.Err().Error()),
-				)
+			if !terminalSeen {
+				sendEvent(domain.NewTerminalEvent(ctx.Err()))
+				terminalSeen = true
 			}
+			return
 		}
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"sync"
 
+	cloudmw "github.com/DenseAI/DenseCloud/go/middleware"
 	cloudtelemetry "github.com/DenseAI/DenseCloud/go/telemetry"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -127,21 +128,27 @@ func (s *Server) Start() error {
 	opts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(s.config.MaxRecvMsgSize),
 		grpc.MaxSendMsgSize(s.config.MaxSendMsgSize),
-		grpc.ChainUnaryInterceptor(
-			RecoveryUnaryInterceptor(),
-			TracingUnaryInterceptor(),
-			LoggingUnaryInterceptor(),
-			AuthUnaryInterceptor(s.config.AuthEnabled, s.config.APIKeyStore),
-			MetricsUnaryInterceptor(s.config.SharedMetrics),
-		),
-		grpc.ChainStreamInterceptor(
-			RecoveryStreamInterceptor(),
-			TracingStreamInterceptor(),
-			LoggingStreamInterceptor(),
-			AuthStreamInterceptor(s.config.AuthEnabled, s.config.APIKeyStore),
-			MetricsStreamInterceptor(s.config.SharedMetrics),
-		),
 	}
+	unaryInterceptors := []grpc.UnaryServerInterceptor{
+		cloudmw.GRPCRequestIDUnary(),
+		cloudmw.GRPCRecoveryUnary(),
+		cloudmw.GRPCTracingUnary("densecore-grpc"),
+		cloudmw.GRPCLoggingUnary(),
+		AuthUnaryInterceptor(s.config.AuthEnabled, s.config.APIKeyStore),
+		cloudmw.GRPCMetricsUnary(s.config.SharedMetrics),
+	}
+	streamInterceptors := []grpc.StreamServerInterceptor{
+		cloudmw.GRPCRequestIDStream(),
+		cloudmw.GRPCRecoveryStream(),
+		cloudmw.GRPCTracingStream("densecore-grpc"),
+		cloudmw.GRPCLoggingStream(),
+		AuthStreamInterceptor(s.config.AuthEnabled, s.config.APIKeyStore),
+		cloudmw.GRPCMetricsStream(s.config.SharedMetrics),
+	}
+	opts = append(opts,
+		grpc.ChainUnaryInterceptor(unaryInterceptors...),
+		grpc.ChainStreamInterceptor(streamInterceptors...),
+	)
 
 	if s.config.TLSEnabled {
 		creds, err := buildServerTLSCredentials(s.config)

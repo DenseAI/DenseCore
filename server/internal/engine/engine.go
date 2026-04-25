@@ -139,6 +139,19 @@ func requestLifecycleDebugEnabled() bool {
 	return util.ParseBoolEnv("DENSECORE_DEBUG_REQUEST_LIFECYCLE", false)
 }
 
+func parseKVCacheType(raw string) (C.DenseCoreKVType, bool, error) {
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case "", "fp16", "f16":
+		return C.DENSECORE_KV_FP16, false, nil
+	case "q8_0", "int8", "q8":
+		return C.DENSECORE_KV_INT8, true, nil
+	case "q4_0", "int4", "q4":
+		return C.DENSECORE_KV_INT4, true, nil
+	default:
+		return C.DENSECORE_KV_FP16, false, fmt.Errorf("unsupported DENSECORE_KV_TYPE %q (expected fp16, q8_0, or q4_0)", raw)
+	}
+}
+
 // DenseEngine wraps the C++ engine with thread safety
 type DenseEngine struct {
 	handle C.DenseCoreHandle
@@ -159,8 +172,23 @@ func NewDenseEngine(mainModelPath, draftModelPath string, threads int) (*DenseEn
 		defer C.free(unsafe.Pointer(cDraftPath))
 	}
 
-	// InitEngine(model_path, reserved, threads)
-	handle := C.InitEngine(cMainPath, cDraftPath, C.int(threads))
+	kvType, useExplicitKVType, err := parseKVCacheType(os.Getenv("DENSECORE_KV_TYPE"))
+	if err != nil {
+		return nil, err
+	}
+
+	var handle C.DenseCoreHandle
+	if useExplicitKVType {
+		log.Printf("[engine] initializing DenseCore with explicit KV cache type=%s", strings.ToLower(strings.TrimSpace(os.Getenv("DENSECORE_KV_TYPE"))))
+		// Keep explicit KV type selection from also pinning the entire load path
+		// to NUMA node 0. Let the runtime pick its default placement so large
+		// models can fall back to interleaved or auto placement instead of
+		// failing a strict single-node KV allocation.
+		handle = C.InitEngineWithKVType(cMainPath, cDraftPath, C.int(threads), C.int(-1), C.int(0), kvType)
+	} else {
+		// InitEngine(model_path, reserved, threads)
+		handle = C.InitEngine(cMainPath, cDraftPath, C.int(threads))
+	}
 	if handle == nil {
 		lastErr := C.DenseCoreGetLastError()
 		if lastErr != nil {
@@ -746,7 +774,18 @@ func (e *DenseEngine) GetChatTemplate() string {
 	return C.GoString(cValue)
 }
 
-func (e *DenseEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool) (*domain.RenderedChatPrompt, error) {
+func chatTemplateOptionValue(value *bool) int {
+	if value == nil {
+		return -1
+	}
+	if *value {
+		return 1
+	}
+	return 0
+}
+
+func (e *DenseEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool,
+	preserveThinking *bool) (*domain.RenderedChatPrompt, error) {
 	if len(messages) == 0 {
 		return nil, fmt.Errorf("messages must not be empty")
 	}
@@ -772,13 +811,9 @@ func (e *DenseEngine) RenderChatPrompt(messages []domain.Message, enableThinking
 		}
 	}()
 
-	options := C.DenseCoreChatTemplateOptions{enable_thinking: -1}
-	if enableThinking != nil {
-		if *enableThinking {
-			options.enable_thinking = 1
-		} else {
-			options.enable_thinking = 0
-		}
+	options := C.DenseCoreChatTemplateOptions{
+		enable_thinking:   C.int(chatTemplateOptionValue(enableThinking)),
+		preserve_thinking: C.int(chatTemplateOptionValue(preserveThinking)),
 	}
 
 	var rendered C.DenseCoreRenderedChatPrompt

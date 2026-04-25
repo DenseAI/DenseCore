@@ -8,7 +8,7 @@
 #include <gtest/gtest.h>
 #include <vector>
 
-#include "simd_ops.h"
+#include "densecore/simd/simd_ops.h"
 
 using namespace densecore::simd;
 

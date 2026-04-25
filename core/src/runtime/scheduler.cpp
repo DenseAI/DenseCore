@@ -46,7 +46,7 @@ Scheduler::Scheduler(BlockManager* block_manager, const SchedulerConfig& config)
 
 int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, int priority,
                           const std::vector<int>* prefix_tokens, bool allow_chunked_prefill,
-                          bool require_hybrid_ssm_prefix_snapshot) {
+                          bool require_hybrid_ssm_prefix_snapshot, int max_prefill_chunk_tokens) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // Fast reject impossible requests:
@@ -65,6 +65,7 @@ int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, in
     group.priority = priority;
     group.arrival_time = std::chrono::steady_clock::now();
     group.num_tokens_to_process = prompt_len;
+    group.max_prefill_chunk_tokens = max_prefill_chunk_tokens > 0 ? max_prefill_chunk_tokens : -1;
 
     // Check for reusable full-block prefix hits.
     // Prefix reuse always leaves at least one token to execute so prompt-end
@@ -158,6 +159,8 @@ SchedulerOutput Scheduler::Schedule() {
     std::lock_guard<std::mutex> lock(mutex_);
 
     SchedulerOutput output;
+    last_empty_reason_ = SchedulerEmptyReason::None;
+    last_unschedulable_reason_ = SchedulerUnschedulableReason::None;
 
     // 1. Check memory pressure
     float memory_usage = GetMemoryUsage();
@@ -190,6 +193,8 @@ SchedulerOutput Scheduler::Schedule() {
             ScheduleWaiting(output);
             if (!output.prefill_seq_ids.empty()) {
                 consecutive_decode_batches_ = 0;
+                last_empty_reason_ = SchedulerEmptyReason::None;
+                last_unschedulable_reason_ = SchedulerUnschedulableReason::None;
                 return output;
             }
         }
@@ -230,6 +235,8 @@ SchedulerOutput Scheduler::Schedule() {
                 // blocked so the isolated-prefill fairness fallback can fire.
                 consecutive_decode_batches_++;
             }
+            last_empty_reason_ = SchedulerEmptyReason::None;
+            last_unschedulable_reason_ = SchedulerUnschedulableReason::None;
             return output;
         }
 
@@ -238,12 +245,23 @@ SchedulerOutput Scheduler::Schedule() {
         if (!output.prefill_seq_ids.empty()) {
             consecutive_decode_batches_ = 0;
         }
+        if (output.IsEmpty()) {
+            last_empty_reason_ = output.empty_reason;
+            last_unschedulable_reason_ = output.unschedulable_reason;
+        }
         return output;
     }
 
     // Legacy mixed-mode scheduling (for compatibility/debug).
     ScheduleRunning(output);
     ScheduleWaiting(output);
+    if (output.IsEmpty()) {
+        last_empty_reason_ = output.empty_reason;
+        last_unschedulable_reason_ = output.unschedulable_reason;
+    } else {
+        last_empty_reason_ = SchedulerEmptyReason::None;
+        last_unschedulable_reason_ = SchedulerUnschedulableReason::None;
+    }
 
     // std::cerr << "[DEBUG] Scheduler::Schedule exit. Empty? " <<
     // output.IsEmpty() << std::endl;
@@ -308,8 +326,16 @@ SequenceStatus Scheduler::GetStatus(int seq_id) const {
 
 void Scheduler::UpdateProgress(int seq_id, int tokens_generated) {
     std::lock_guard<std::mutex> lock(mutex_);
-    seq_generated_tokens_[seq_id] += tokens_generated;
-    seq_context_len_[seq_id] += tokens_generated;
+    if (tokens_generated <= 0) {
+        return;
+    }
+    SequenceGroup* waiting_group = FindWaitingGroupLocked(seq_id);
+    if (waiting_group != nullptr) {
+        const bool prefill_finished = waiting_group->num_tokens_to_process <= tokens_generated;
+        OnPrefillChunkCompleteLocked(seq_id, tokens_generated, prefill_finished);
+        return;
+    }
+    OnDecodeStepCompleteLocked(seq_id, tokens_generated);
 }
 
 void Scheduler::UpdateProgressBatch(const std::vector<std::pair<int, int>>& progress_updates) {
@@ -321,9 +347,24 @@ void Scheduler::UpdateProgressBatch(const std::vector<std::pair<int, int>>& prog
         if (update.first < 0 || update.second <= 0) {
             continue;
         }
-        seq_generated_tokens_[update.first] += update.second;
-        seq_context_len_[update.first] += update.second;
+        SequenceGroup* waiting_group = FindWaitingGroupLocked(update.first);
+        if (waiting_group != nullptr) {
+            const bool prefill_finished = waiting_group->num_tokens_to_process <= update.second;
+            OnPrefillChunkCompleteLocked(update.first, update.second, prefill_finished);
+            continue;
+        }
+        OnDecodeStepCompleteLocked(update.first, update.second);
     }
+}
+
+void Scheduler::OnPrefillChunkComplete(int seq_id, int tokens_processed, bool prefill_finished) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    OnPrefillChunkCompleteLocked(seq_id, tokens_processed, prefill_finished);
+}
+
+void Scheduler::OnDecodeStepComplete(int seq_id, int tokens_processed) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    OnDecodeStepCompleteLocked(seq_id, tokens_processed);
 }
 
 Scheduler::Stats Scheduler::GetStats() const {
@@ -333,6 +374,8 @@ Scheduler::Stats Scheduler::GetStats() const {
     stats.running_count = running_seqs_.size();
     stats.swapped_count = swapped_seqs_.size();
     stats.memory_usage = GetMemoryUsage();
+    stats.last_empty_reason = last_empty_reason_;
+    stats.last_unschedulable_reason = last_unschedulable_reason_;
     return stats;
 }
 
@@ -422,6 +465,101 @@ int Scheduler::GetSequenceContextLen(int seq_id) const {
 std::chrono::steady_clock::time_point Scheduler::GetSequenceArrival(int seq_id) const {
     auto it = seq_arrival_.find(seq_id);
     return (it != seq_arrival_.end()) ? it->second : std::chrono::steady_clock::now();
+}
+
+SequenceGroup* Scheduler::FindWaitingGroupLocked(int seq_id) {
+    for (auto& group : waiting_queue_) {
+        if (std::find(group.sequence_ids.begin(), group.sequence_ids.end(), seq_id) != group.sequence_ids.end()) {
+            return &group;
+        }
+    }
+    return nullptr;
+}
+
+const SequenceGroup* Scheduler::FindWaitingGroupLocked(int seq_id) const {
+    for (const auto& group : waiting_queue_) {
+        if (std::find(group.sequence_ids.begin(), group.sequence_ids.end(), seq_id) != group.sequence_ids.end()) {
+            return &group;
+        }
+    }
+    return nullptr;
+}
+
+void Scheduler::OnPrefillChunkCompleteLocked(int seq_id, int tokens_processed, bool prefill_finished) {
+    if (seq_id < 0 || tokens_processed <= 0) {
+        return;
+    }
+    seq_context_len_[seq_id] += tokens_processed;
+
+    SequenceGroup* waiting_group = FindWaitingGroupLocked(seq_id);
+    if (waiting_group == nullptr) {
+        if (prefill_finished) {
+            running_seqs_.insert(seq_id);
+            seq_status_[seq_id] = SequenceStatus::RUNNING;
+        }
+        return;
+    }
+
+    waiting_group->num_tokens_to_process = std::max(0, waiting_group->num_tokens_to_process - tokens_processed);
+    if (prefill_finished || waiting_group->num_tokens_to_process == 0) {
+        waiting_group->num_tokens_to_process = 0;
+        waiting_queue_.erase(std::remove_if(waiting_queue_.begin(), waiting_queue_.end(),
+                                            [seq_id](const SequenceGroup& group) {
+                                                return std::find(group.sequence_ids.begin(), group.sequence_ids.end(),
+                                                                 seq_id) != group.sequence_ids.end();
+                                            }),
+                             waiting_queue_.end());
+        running_seqs_.insert(seq_id);
+        seq_status_[seq_id] = SequenceStatus::RUNNING;
+        return;
+    }
+
+    seq_status_[seq_id] = SequenceStatus::WAITING;
+}
+
+void Scheduler::OnDecodeStepCompleteLocked(int seq_id, int tokens_processed) {
+    if (seq_id < 0 || tokens_processed <= 0) {
+        return;
+    }
+    running_seqs_.insert(seq_id);
+    seq_status_[seq_id] = SequenceStatus::RUNNING;
+    seq_generated_tokens_[seq_id] += tokens_processed;
+    seq_context_len_[seq_id] += tokens_processed;
+}
+
+const char* Scheduler::EmptyReasonName(SchedulerEmptyReason reason) {
+    switch (reason) {
+    case SchedulerEmptyReason::NoFreeBlocks: return "no_free_blocks";
+    case SchedulerEmptyReason::PrefillBudgetZero: return "prefill_budget_zero";
+    case SchedulerEmptyReason::ContextBucketMismatch: return "context_bucket_mismatch";
+    case SchedulerEmptyReason::MaxNumSeqsReached: return "max_num_seqs_reached";
+    case SchedulerEmptyReason::MoeBudgetDeferred: return "moe_budget_deferred";
+    case SchedulerEmptyReason::WaitingSeqPresentButUnschedulable: return "waiting_seq_present_but_unschedulable";
+    case SchedulerEmptyReason::RunningSeqPresentButDecodeUnschedulable:
+        return "running_seq_present_but_decode_unschedulable";
+    case SchedulerEmptyReason::None:
+    default: return "none";
+    }
+}
+
+const char* Scheduler::UnschedulableReasonName(SchedulerUnschedulableReason reason) {
+    switch (reason) {
+    case SchedulerUnschedulableReason::PromptExceedsBatchBudget: return "prompt_exceeds_batch_budget";
+    case SchedulerUnschedulableReason::RequiredBlocksExceedCapacity: return "required_blocks_exceed_capacity";
+    case SchedulerUnschedulableReason::None:
+    default: return "none";
+    }
+}
+
+std::string Scheduler::DescribeUnschedulableReason(const SchedulerOutput& output) {
+    if (output.unschedulable_reason == SchedulerUnschedulableReason::None) {
+        return "none";
+    }
+    std::string description = UnschedulableReasonName(output.unschedulable_reason);
+    if (output.diagnostic_seq_id >= 0) {
+        description += " seq_id=" + std::to_string(output.diagnostic_seq_id);
+    }
+    return description;
 }
 
 // ============================================================================

@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-#include "moe/profiler.h"
+#include "densecore/moe/profiler.h"
 
 using namespace densecore::moe;
 

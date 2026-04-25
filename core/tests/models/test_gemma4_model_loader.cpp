@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <gguf.h>
 
 #include <array>
@@ -11,7 +13,8 @@
 
 #include <ggml.h>
 
-#include "model_loader.h"
+#include "densecore/runtime/inference.h"
+#include "densecore/models/model_loader.h"
 
 namespace {
 
@@ -104,6 +107,55 @@ void AddDummyTensor(gguf_context* ctx, const char* name, int ne0 = 2) {
     ggml_free(tensor_ctx);
 }
 
+void AddDummyTensor2D(gguf_context* ctx, const char* name, int64_t ne0, int64_t ne1) {
+    const size_t elem_count = static_cast<size_t>(ne0 * ne1);
+    std::vector<float> dummy_data(elem_count, 0.0f);
+    ggml_init_params params = {
+        /*.mem_size=*/static_cast<size_t>(std::max<int64_t>(4096, elem_count * static_cast<int64_t>(sizeof(float)) + 1024)),
+        /*.mem_buffer=*/nullptr,
+        /*.no_alloc=*/false,
+    };
+    ggml_context* tensor_ctx = ggml_init(params);
+    ggml_tensor* tensor = ggml_new_tensor_2d(tensor_ctx, GGML_TYPE_F32, ne0, ne1);
+    ggml_set_name(tensor, name);
+    gguf_add_tensor(ctx, tensor);
+    gguf_set_tensor_data(ctx, name, dummy_data.data());
+    ggml_free(tensor_ctx);
+}
+
+void AddDummyTensor3D(gguf_context* ctx, const char* name, int64_t ne0, int64_t ne1, int64_t ne2) {
+    const size_t elem_count = static_cast<size_t>(ne0 * ne1 * ne2);
+    std::vector<float> dummy_data(elem_count, 0.0f);
+    ggml_init_params params = {
+        /*.mem_size=*/static_cast<size_t>(std::max<int64_t>(4096, elem_count * static_cast<int64_t>(sizeof(float)) + 1024)),
+        /*.mem_buffer=*/nullptr,
+        /*.no_alloc=*/false,
+    };
+    ggml_context* tensor_ctx = ggml_init(params);
+    ggml_tensor* tensor = ggml_new_tensor_3d(tensor_ctx, GGML_TYPE_F32, ne0, ne1, ne2);
+    ggml_set_name(tensor, name);
+    gguf_add_tensor(ctx, tensor);
+    gguf_set_tensor_data(ctx, name, dummy_data.data());
+    ggml_free(tensor_ctx);
+}
+
+void AddDummyTensor4D(gguf_context* ctx, const char* name, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
+    const size_t elem_count = static_cast<size_t>(ne0 * ne1 * ne2 * ne3);
+    std::vector<float> dummy_data(elem_count, 0.0f);
+    ggml_init_params params = {
+        /*.mem_size=*/static_cast<size_t>(
+            std::max<int64_t>(4096, elem_count * static_cast<int64_t>(sizeof(float)) + 1024)),
+        /*.mem_buffer=*/nullptr,
+        /*.no_alloc=*/false,
+    };
+    ggml_context* tensor_ctx = ggml_init(params);
+    ggml_tensor* tensor = ggml_new_tensor_4d(tensor_ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
+    ggml_set_name(tensor, name);
+    gguf_add_tensor(ctx, tensor);
+    gguf_set_tensor_data(ctx, name, dummy_data.data());
+    ggml_free(tensor_ctx);
+}
+
 bool WriteMetadataOnlyGguf(const std::string& path, void (*fill)(gguf_context*)) {
     gguf_context* ctx = gguf_init_empty();
     fill(ctx);
@@ -152,6 +204,29 @@ TEST(Gemma4ModelLoaderTest, InvalidAttentionLogitCapMetadataNormalizesToHfCompat
     EXPECT_FLOAT_EQ(model->gemma4_attention_logit_softcapping, 50.0f);
 }
 
+TEST(Gemma4ModelLoaderTest, NormalizesVocabSizeFromTokenizerMetadata) {
+    TempPath tmp;
+    auto fill = [](gguf_context* ctx) {
+        SetBaseGemma4Metadata(ctx);
+        gguf_set_val_u32(ctx, "gemma.vocab_size", 3);
+    };
+    std::unique_ptr<TransformerModel> model(LoadTempGemma4(tmp.path(), fill));
+    ASSERT_NE(model, nullptr);
+    EXPECT_EQ(model->hparams.n_vocab, 7u);
+    EXPECT_EQ(model->vocab_tokens.size(), 7u);
+}
+
+TEST(Gemma4ModelLoaderTest, RejectsTokenizerOutputVocabMismatch) {
+    TempPath tmp;
+    auto fill = [](gguf_context* ctx) {
+        SetBaseGemma4Metadata(ctx);
+        AddDummyTensor2D(ctx, "token_embd.weight", 8, 7);
+        AddDummyTensor2D(ctx, "output.weight", 8, 9);
+    };
+    std::unique_ptr<TransformerModel> model(LoadTempGemma4(tmp.path(), fill));
+    EXPECT_EQ(model, nullptr);
+}
+
 TEST(Gemma4ModelLoaderTest, RejectsMissingLayerTypesMetadata) {
     TempPath tmp;
     auto fill = [](gguf_context* ctx) {
@@ -193,4 +268,94 @@ TEST(Gemma4ModelLoaderTest, RejectsIncompleteTokenizerMetadata) {
     };
     std::unique_ptr<TransformerModel> model(LoadTempGemma4(tmp.path(), fill));
     EXPECT_EQ(model, nullptr);
+}
+
+TEST(Gemma4ModelLoaderTest, DiscoversGemma4PackedExpertLayoutFromFfnGateUpExpsAndDownExps) {
+    TempPath tmp;
+    auto fill = [](gguf_context* ctx) {
+        SetBaseGemma4Metadata(ctx);
+        gguf_set_val_u32(ctx, "gemma.num_experts", 4);
+        gguf_set_val_u32(ctx, "gemma.top_k_experts", 2);
+
+        // Real Gemma4 E26B/A4B-style MoE tensor names.
+        AddDummyTensor2D(ctx, "blk.0.ffn_gate_inp.weight", 8, 4);
+        AddDummyTensor3D(ctx, "blk.0.ffn_gate_up_exps.weight", 8, 16, 4);
+        AddDummyTensor3D(ctx, "blk.0.ffn_down_exps.weight", 8, 8, 4);
+        AddDummyTensor3D(ctx, "blk.0.ffn_down_exps.scale", 8, 8, 4);
+    };
+
+    std::unique_ptr<TransformerModel> model(LoadTempGemma4(tmp.path(), fill));
+    ASSERT_NE(model, nullptr);
+    ASSERT_GE(model->layers.size(), 2u);
+    EXPECT_EQ(model->hparams.n_experts, 4u);
+    EXPECT_EQ(model->hparams.n_experts_used, 2u);
+
+    const TransformerLayer& moe_layer = model->layers[0];
+    EXPECT_NE(moe_layer.Get(model_keys::kMoeGate), nullptr);
+    EXPECT_GT(moe_layer.NumExperts(), 0u);
+    EXPECT_TRUE(moe_layer.is_moe);
+
+    // Keep dense/non-MoE Gemma4 layers unchanged when expert tensors are absent.
+    const TransformerLayer& dense_layer = model->layers[1];
+    EXPECT_EQ(dense_layer.NumExperts(), 0u);
+    EXPECT_FALSE(dense_layer.is_moe);
+}
+
+TEST(Gemma4ModelLoaderTest, DiscoversGemma4PlaneSeparatedPackedExpertLayout) {
+    TempPath tmp;
+    auto fill = [](gguf_context* ctx) {
+        SetBaseGemma4Metadata(ctx);
+        gguf_set_val_u32(ctx, "gemma.num_experts", 4);
+        gguf_set_val_u32(ctx, "gemma.top_k_experts", 2);
+
+        AddDummyTensor2D(ctx, "blk.0.ffn_gate_inp.weight", 8, 4);
+        AddDummyTensor4D(ctx, "blk.0.ffn_gate_up_exps.weight", 8, 4, 2, 4);
+        AddDummyTensor4D(ctx, "blk.0.ffn_down_exps.weight", 4, 8, 1, 4);
+        AddDummyTensor4D(ctx, "blk.0.ffn_down_exps.scale", 4, 8, 1, 4);
+    };
+
+    std::unique_ptr<TransformerModel> model(LoadTempGemma4(tmp.path(), fill));
+    ASSERT_NE(model, nullptr);
+    const TransformerLayer& moe_layer = model->layers[0];
+    ASSERT_TRUE(moe_layer.is_moe);
+    ASSERT_GT(moe_layer.NumExperts(), 0u);
+
+    const ggml_tensor* gate = moe_layer.GetExpert(0, model_keys::kFfnGate);
+    const ggml_tensor* up = moe_layer.GetExpert(0, model_keys::kFfnUp);
+    const ggml_tensor* down = moe_layer.GetExpert(0, model_keys::kFfnDown);
+    const ggml_tensor* gate_up = moe_layer.GetExpert(0, model_keys::kGemma4PackedGateUpExpert);
+    const ggml_tensor* down_scale = moe_layer.GetExpert(0, model_keys::kGemma4PackedDownScale);
+    ASSERT_NE(gate, nullptr);
+    ASSERT_NE(up, nullptr);
+    ASSERT_NE(down, nullptr);
+    ASSERT_NE(gate_up, nullptr);
+    ASSERT_NE(down_scale, nullptr);
+
+    EXPECT_EQ(gate->ne[0], 8);
+    EXPECT_EQ(gate->ne[1], 4);
+    EXPECT_EQ(up->ne[0], 8);
+    EXPECT_EQ(up->ne[1], 4);
+    EXPECT_EQ(down->ne[0], 4);
+    EXPECT_EQ(down->ne[1], 8);
+    EXPECT_EQ(gate_up->ne[2], 2);
+}
+
+TEST(Gemma4ModelLoaderTest, Gemma4MoEBranchInputsKeepSharedAndRoutedPathsSeparate) {
+    const std::vector<float> attn_post_residual = {2.0f, -1.0f, 0.5f, 1.5f};
+    const std::vector<float> inp_ff = {0.25f, 3.0f, -2.0f, 1.0f};
+    const std::vector<float> ffn_norm_weight = {1.0f, 0.5f, 1.5f, 0.25f};
+    const std::vector<float> pre_moe_norm_weight = {0.1f, 2.0f, 0.3f, 1.25f};
+
+    const auto snapshot = densecore::testing::ComputeGemma4MoEBranchInputsForTest(
+        attn_post_residual, inp_ff, ffn_norm_weight, pre_moe_norm_weight, 1.0e-5f);
+
+    ASSERT_EQ(snapshot.shared_input.size(), attn_post_residual.size());
+    ASSERT_EQ(snapshot.routed_input.size(), inp_ff.size());
+    EXPECT_NE(snapshot.shared_input, snapshot.routed_input);
+
+    float max_abs_diff = 0.0f;
+    for (size_t i = 0; i < snapshot.shared_input.size(); ++i) {
+        max_abs_diff = std::max(max_abs_diff, std::fabs(snapshot.shared_input[i] - snapshot.routed_input[i]));
+    }
+    EXPECT_GT(max_abs_diff, 0.25f);
 }

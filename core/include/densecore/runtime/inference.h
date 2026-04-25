@@ -10,10 +10,10 @@
 #include <vector>
 
 #include "densecore/hal/tensor.h"
-#include "llm/config/runtime_config.h"
 #include "densecore/memory/kv_cache.h"
 #include "densecore/models/model_graph_capabilities.h"
 #include "densecore/models/model_types.h"
+#include "llm/config/runtime_config.h"
 
 #include <memory>
 #include <unordered_map>
@@ -137,6 +137,8 @@ struct InferenceDependencies {
 };
 
 static constexpr std::size_t kDecodePagedFallbackReasonCount = 16;
+static constexpr std::size_t kHybridSSMDispatchWeightCount = 4;
+static constexpr std::size_t kHybridSSMDispatchPathCount = 5;
 
 struct DecodeRuntimeStatsSnapshot {
     uint64_t path_total = 0;
@@ -149,6 +151,7 @@ struct DecodeRuntimeStatsSnapshot {
     uint64_t shared_quant_total = 0;
     uint64_t shared_quant_reused = 0;
     uint64_t shared_quant_tls = 0;
+    std::array<uint64_t, kHybridSSMDispatchWeightCount * kHybridSSMDispatchPathCount> hybrid_ssm_dispatch_counts{};
 };
 
 // Internal decode helpers shared between graph-build and worker graph-cache admission.
@@ -158,6 +161,8 @@ bool IsPagedDecodeCandidate(const PagedKVCache* cache, const BatchSpec& batch, i
 bool IsPagedDecodeModeAlwaysOn();
 DecodeRuntimeStatsSnapshot GetDecodeRuntimeStatsSnapshot();
 const char* GetDecodePagedFallbackReasonName(std::size_t index);
+const char* GetHybridSSMDispatchWeightName(std::size_t index);
+const char* GetHybridSSMDispatchPathName(std::size_t index);
 
 // ============================================================================
 // Persistent Compute Context for "Rebuild Graph, Reuse Memory" Strategy

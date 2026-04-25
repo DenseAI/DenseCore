@@ -35,6 +35,14 @@ option(
     "Prefer correctness-first ggml defaults on Linux ARM (disables KleidiAI, llamafile, repack, and native ISA auto-tuning unless explicitly overridden)"
     ${DENSECORE_ARM_CORRECTNESS_FIRST_DEFAULT}
 )
+option(
+    DENSECORE_TARGET_C4A
+    "Build for Google Cloud C4A / Axion / Neoverse V2 (Armv9 SVE2) instead of generic aarch64"
+    OFF
+)
+set(DENSECORE_C4A_MCPU "neoverse-v2" CACHE STRING "ARM -mcpu value used when DENSECORE_TARGET_C4A=ON")
+set(DENSECORE_C4A_GGML_ARCH "armv9-a+sve2+i8mm+bf16+dotprod" CACHE STRING
+    "ggml -march value used when DENSECORE_TARGET_C4A=ON")
 
 if(DENSECORE_COMMERCIAL)
     message(STATUS "[DenseCore] Commercial build ENABLED")
@@ -224,6 +232,21 @@ set(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE OFF)
 if(DENSECORE_LINUX_ARM64 AND DENSECORE_ARM_CORRECTNESS_FIRST)
     set(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE ON)
     message(STATUS "[DenseCore] ARM correctness-first defaults enabled")
+endif()
+
+if(DENSECORE_TARGET_C4A)
+    if(NOT DENSECORE_LINUX_ARM64)
+        message(FATAL_ERROR "DENSECORE_TARGET_C4A=ON requires a non-Apple Linux aarch64 target.")
+    endif()
+    if(NOT DENSECORE_ARM_MCPU AND NOT DENSECORE_ARM_MARCH)
+        set(DENSECORE_ARM_MCPU "${DENSECORE_C4A_MCPU}" CACHE STRING
+            "Explicit ARM CPU target for -mcpu (e.g. neoverse-v1, neoverse-v2, native)" FORCE)
+    endif()
+    if(NOT DEFINED GGML_CPU_ARM_ARCH OR "${GGML_CPU_ARM_ARCH}" STREQUAL "")
+        set(GGML_CPU_ARM_ARCH "${DENSECORE_C4A_GGML_ARCH}" CACHE STRING "ggml: CPU architecture for ARM" FORCE)
+    endif()
+    message(STATUS "[DenseCore][C4A] Targeting Google Axion/Neoverse V2: "
+                   "DENSECORE_ARM_MCPU=${DENSECORE_ARM_MCPU}, GGML_CPU_ARM_ARCH=${GGML_CPU_ARM_ARCH}")
 endif()
 
 # Configure ggml options before adding subdirectory
@@ -694,6 +717,9 @@ target_compile_definitions(densecore PRIVATE
 )
 if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
     target_compile_definitions(densecore PRIVATE DENSECORE_ARM_CORRECTNESS_FIRST=1)
+endif()
+if(DENSECORE_TARGET_C4A)
+    target_compile_definitions(densecore PRIVATE DENSECORE_TARGET_C4A=1)
 endif()
 
 # AddressSanitizer option for memory debugging

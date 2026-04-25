@@ -4,10 +4,12 @@
 #include <string>
 
 #include "models/model_prompt_templates.h"
-#include "model_types.h"
+#include "densecore/models/model_types.h"
 
 std::string DenseCoreTestOnlyApplyAutoChatTemplate(const TransformerModel* model, const std::string& prompt);
 bool DenseCoreTestOnlyPromptStartsInThinkBlock(const std::string& prompt);
+bool DenseCoreTestOnlySuppressesReasoningTagsForPrompt(const std::string& prompt);
+bool DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(const TransformerModel* model, const std::string& prompt);
 std::vector<int> DenseCoreTestOnlyQwenReasoningBlocklist(const TransformerModel* model);
 std::vector<int> DenseCoreTestOnlyGemma4TextBlocklist(const TransformerModel* model);
 std::string DenseCoreTestOnlyPrimeQwenNoThinking(const TransformerModel* model, const std::string& prompt);
@@ -84,6 +86,71 @@ TEST(ChatTemplateTest, Qwen3DefaultsToThinkingWhenEnvIsUnset) {
     EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
 }
 
+TEST(ChatTemplateTest, Qwen36DefaultsToThinkingWhenEnvIsUnset) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_EQ(wrapped,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n");
+}
+
+TEST(ChatTemplateTest, Qwen36ExplicitOverrideDisablesThinking) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_EQ(wrapped,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n");
+}
+
+TEST(ChatTemplateTest, Qwen36DisableDoesNotInjectNoThinkDirective) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_EQ(wrapped.find("/no_think"), std::string::npos);
+}
+
+TEST(ChatTemplateTest, Qwen36NoThinkingDoesNotPrimeAssistantAnswerCue) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "What is the capital of France?");
+    const std::string primed = DenseCoreTestOnlyPrimeQwenNoThinking(&model, wrapped);
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_EQ(primed, wrapped);
+}
+
 TEST(ChatTemplateTest, Qwen3NoThinkingPrimesAssistantAnswerCue) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN3;
@@ -150,6 +217,22 @@ TEST(ChatTemplateTest, QwenThinkingPromptStartsInsideThinkBlock) {
     EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
 }
 
+TEST(ChatTemplateTest, QwenThinkingPromptDoesNotSuppressReasoningTags) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "true", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_FALSE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, wrapped));
+    EXPECT_EQ(wrapped.find("Think step by step inside <think> and </think>"), std::string::npos);
+}
+
 TEST(ChatTemplateTest, QwenNoThinkingPromptDoesNotStartInsideThinkBlock) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
@@ -161,6 +244,21 @@ TEST(ChatTemplateTest, QwenNoThinkingPromptDoesNotStartInsideThinkBlock) {
     unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
 
     EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+}
+
+TEST(ChatTemplateTest, QwenNoThinkingPromptSuppressesReasoningTags) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_TRUE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, wrapped));
 }
 
 TEST(ChatTemplateTest, AutoTemplateCanBeDisabledForRawQaMode) {
@@ -199,6 +297,76 @@ TEST(CanonicalChatRenderTest, QwenCanonicalRendererMatchesChatMLPrompt) {
               "<|im_start|>user\n"
               "hello /no_think<|im_end|>\n"
               "<|im_start|>assistant\n");
+}
+
+TEST(CanonicalChatRenderTest, Qwen36DisableInjectsNoThinkDirective) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "hello";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    bool thinking_enabled = true;
+    const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {}, &thinking_enabled);
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_FALSE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n");
+}
+
+TEST(CanonicalChatRenderTest, Qwen36ThinkingUsesOfficialPromptWithoutReasoningDirective) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "true", 1);
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "hello";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    bool thinking_enabled = false;
+    const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {}, &thinking_enabled);
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_TRUE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n");
+}
+
+TEST(CanonicalChatRenderTest, Qwen36PreserveThinkingCanBeDisabledForAssistantHistory) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    densecore::models::CanonicalChatMessage user{};
+    user.role = "user";
+    user.content = "hello";
+    densecore::models::CanonicalChatMessage assistant{};
+    assistant.role = "assistant";
+    assistant.content = "final";
+    assistant.reasoning_content = "chain";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {user, assistant};
+    densecore::models::CanonicalChatRenderOptions options;
+    options.preserve_thinking = 0;
+
+    const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, options);
+
+    EXPECT_EQ(rendered.find("<think>"), std::string::npos);
+    EXPECT_NE(rendered.find("<|im_start|>assistant\nfinal<|im_end|>\n"), std::string::npos);
 }
 
 TEST(CanonicalChatRenderTest, GemmaCanonicalRendererMatchesTurnTags) {

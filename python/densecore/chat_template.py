@@ -156,6 +156,16 @@ def qwen_thinking_enabled(model_hint: Optional[str], enable_thinking: Optional[b
     if enable_thinking is not None:
         return enable_thinking
     lower = (model_hint or "").strip().lower()
+    if "qwen3.6" in lower or "qwen36" in lower:
+        env = os.getenv("DENSECORE_QWEN36_ENABLE_THINKING")
+        if env is not None and env.strip() != "":
+            return env.lower() in ("1", "true", "yes", "on")
+        return os.getenv("DENSECORE_QWEN35_ENABLE_THINKING", "true").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
     if any(token in lower for token in ("qwen3.5", "qwen3_5", "qwen3-5", "qwen35")):
         return os.getenv("DENSECORE_QWEN35_ENABLE_THINKING", "false").lower() in (
             "1",
@@ -218,10 +228,12 @@ def _render_qwen_content(message: dict[str, Any], profile: PromptProfile) -> str
     return _normalize_content(_render_structured_text(message.get("content", []), profile))
 
 
-def _render_qwen_assistant_message(message: dict[str, Any], profile: PromptProfile) -> str:
+def _render_qwen_assistant_message(
+    message: dict[str, Any], profile: PromptProfile, preserve_thinking: bool
+) -> str:
     content = _render_qwen_content(message, profile)
     reasoning = _normalize_content(str(message.get("reasoning_content", "")))
-    if reasoning:
+    if preserve_thinking and reasoning:
         return _normalize_content(f"<think>\n{reasoning}\n</think>\n\n{content}")
 
     tool_calls = message.get("tool_calls") or []
@@ -341,6 +353,7 @@ def format_chat_prompt(
     messages: list[dict[str, Any]],
     *,
     enable_thinking: Optional[bool] = None,
+    preserve_thinking: Optional[bool] = None,
     extra_system_messages: Optional[list[str]] = None,
     tokenizer_type: Optional[str] = None,
     chat_template: Optional[str] = None,
@@ -357,6 +370,8 @@ def format_chat_prompt(
 
     if profile.family == "qwen":
         thinking_enabled = qwen_thinking_enabled(model_hint, enable_thinking)
+        preserve_thinking = True if preserve_thinking is None else preserve_thinking
+        supports_no_think = "qwen3.6" not in (model_hint or "").lower() and "qwen36" not in (model_hint or "").lower()
         parts: list[str] = []
         last_user_index = -1
         for index, message in enumerate(normalized_messages):
@@ -374,12 +389,12 @@ def format_chat_prompt(
                         )
             elif role == "user":
                 content = _render_qwen_content(message, profile)
-                if content and not thinking_enabled and index == last_user_index:
+                if content and not thinking_enabled and supports_no_think and index == last_user_index:
                     content = append_qwen_no_think_directive(content)
                 if content:
                     parts.append(f"{profile.open_tag}user\n{content}{profile.close_tag}")
             elif role == "assistant":
-                content = _render_qwen_assistant_message(message, profile)
+                content = _render_qwen_assistant_message(message, profile, preserve_thinking)
                 if content:
                     parts.append(
                         f"{profile.open_tag}{profile.assistant_role}\n{content}{profile.close_tag}"
@@ -388,7 +403,13 @@ def format_chat_prompt(
                 content = _render_qwen_tool_response(message, profile)
                 if content:
                     parts.append(f"{profile.open_tag}user\n{content}{profile.close_tag}")
-        assistant_prefix = "<think>\n" if thinking_enabled else ""
+        assistant_prefix = (
+            "<think>\n"
+            if thinking_enabled
+            and "qwen3.6" not in (model_hint or "").lower()
+            and "qwen36" not in (model_hint or "").lower()
+            else ""
+        )
         parts.append(f"{profile.open_tag}{profile.assistant_role}\n{assistant_prefix}")
         return "".join(parts)
 

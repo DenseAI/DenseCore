@@ -597,14 +597,14 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                                             ? ud->quant_row_stride
                                             : densecore::AlignUp(quant_row_size, static_cast<size_t>(64));
         const int vec_dot_nrows = std::max<int>(1, static_cast<int>(type_traits_cpu->nrows));
-        const int quant_tile_cols =
-            std::max(1, std::min(kMaxSmallBatchColsHard,
-                                 ParsePositiveEnvInt("DENSECORE_BATCHED_QUANT_TILE_COLS", kMaxSmallBatchColsHard)));
         const bool can_quantize_inputs = input_type_traits && input_type_traits->from_float && quant_row_size > 0 &&
                                          quant_row_stride <= kMaxQuantInputBufferSize;
         const bool can_use_q4k_true_batched = can_quantize_inputs && weight_type == GGML_TYPE_Q4_K &&
                                               vec_dot_type == GGML_TYPE_Q8_K && IsQ4KTrueBatchedKernelEnabled() &&
                                               (N % QK_K == 0);
+        const int quant_tile_cols = ResolveQuantBatchedTileCols(
+            ParsePositiveEnvInt("DENSECORE_BATCHED_QUANT_TILE_COLS", kMaxSmallBatchColsHard), vec_dot_nrows,
+            can_use_q4k_true_batched);
 
         if (can_quantize_inputs) {
             thread_local std::vector<uint8_t> quant_inputs_tls;

@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "hardware_topology.h"
-#include "simd_ops.h"
+#include "densecore/backend/hardware_topology.h"
+#include "densecore/simd/simd_ops.h"
 
 namespace {
 

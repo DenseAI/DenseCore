@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 #include <vector>
 
-#include "aligned_allocator.h"
+#include "densecore/memory/aligned_allocator.h"
 
 using namespace densecore;
 

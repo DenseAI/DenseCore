@@ -8,7 +8,7 @@
 #include "densecore/hal/op_registry.h"
 #include "densecore/hal/operation_graph.h"
 #include "densecore/hal/tensor.h"
-#include "moe/moe_routing.h"
+#include "densecore/moe/moe_routing.h"
 
 #include <cmath>
 #include <cstdint>

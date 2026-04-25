@@ -255,11 +255,32 @@ func (p promptProfile) thinkingEnabled(modelHint string, templateKwargs *domain.
 	}
 }
 
+func (p promptProfile) preserveThinking(templateKwargs *domain.ChatTemplateKwargs) bool {
+	if p.family != promptFamilyQwen {
+		return true
+	}
+	if templateKwargs != nil && templateKwargs.PreserveThinking != nil {
+		return *templateKwargs.PreserveThinking
+	}
+	return true
+}
+
 func qwenThinkingEnabled(modelHint string, templateKwargs *domain.ChatTemplateKwargs) bool {
 	if templateKwargs != nil && templateKwargs.EnableThinking != nil {
 		return *templateKwargs.EnableThinking
 	}
 	lower := strings.ToLower(strings.TrimSpace(modelHint))
+	if isQwen36ModelHint(lower) {
+		if value, ok := os.LookupEnv("DENSECORE_QWEN36_ENABLE_THINKING"); ok {
+			switch strings.TrimSpace(strings.ToLower(value)) {
+			case "1", "true", "yes", "on":
+				return true
+			case "0", "false", "no", "off":
+				return false
+			}
+		}
+		return util.ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", true)
+	}
 	switch {
 	case strings.Contains(lower, "qwen3.5") || strings.Contains(lower, "qwen3_5") ||
 		strings.Contains(lower, "qwen3-5") || strings.Contains(lower, "qwen35"):

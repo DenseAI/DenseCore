@@ -7,7 +7,7 @@
 #include <gtest/gtest.h>
 #include <vector>
 
-#include "async_cpu_backend.h"
+#include "densecore/backend/async_cpu_backend.h"
 
 using namespace densecore;
 

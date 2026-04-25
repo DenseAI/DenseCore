@@ -243,7 +243,8 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
     config.kv_retention = LoadKVRetentionPolicy();
     config.bench_respect_threads = env::ParseTruthyEnv("DENSECORE_BENCH_RESPECT_THREADS", false);
     config.prefill_graph_cache.enabled = ParseLegacyEnabledBool("DENSECORE_PREFILL_GRAPH_CACHE", true);
-    config.prefill_graph_cache.lru_size = std::max(1, env::ParsePositiveEnvInt("DENSECORE_PREFILL_GRAPH_CACHE_LRU", 16));
+    config.prefill_graph_cache.lru_size =
+        std::max(1, env::ParsePositiveEnvInt("DENSECORE_PREFILL_GRAPH_CACHE_LRU", 16));
     const int prefill_graph_cache_mb =
         std::max(128, env::ParsePositiveEnvInt("DENSECORE_PREFILL_GRAPH_CACHE_MAX_MB", 1024));
     config.prefill_graph_cache.max_bytes = static_cast<std::size_t>(prefill_graph_cache_mb) * 1024ULL * 1024ULL;

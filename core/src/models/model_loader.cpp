@@ -311,11 +311,13 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
 
     const std::string arch_lower = ascii_lower_copy(arch);
-    const bool qwen35_architecture = arch_lower == "qwen35moe";
-    const bool qwen35_hf_model_type = ascii_lower_copy(hf_model_type) == "qwen3_5_moe";
+    const bool qwen35_architecture = arch_lower == "qwen35" || arch_lower == "qwen35moe";
+    const std::string hf_model_type_lower = ascii_lower_copy(hf_model_type);
+    const bool qwen35_hf_model_type = hf_model_type_lower == "qwen3_5_moe" || hf_model_type_lower == "qwen3_5_text";
     bool qwen35_hf_architecture = false;
     for (const auto& value : hf_architectures) {
-        if (ascii_lower_copy(value) == "qwen3_5moeforconditionalgeneration") {
+        const std::string lowered = ascii_lower_copy(value);
+        if (lowered == "qwen3_5moeforconditionalgeneration" || lowered == "qwen3_5forconditionalgeneration") {
             qwen35_hf_architecture = true;
             break;
         }
@@ -328,11 +330,12 @@ TransformerModel* LoadGGUFModel(const char* path) {
         qwen35_architecture || qwen35_hf_model_type || qwen35_hf_architecture || qwen36_named_variant;
     std::string qwen35_resolution_signal;
     if (qwen35_architecture) {
-        qwen35_resolution_signal = "general.architecture=qwen35moe";
+        qwen35_resolution_signal =
+            arch_lower == "qwen35" ? "general.architecture=qwen35" : "general.architecture=qwen35moe";
     } else if (qwen35_hf_model_type) {
-        qwen35_resolution_signal = "hf.model_type=qwen3_5_moe";
+        qwen35_resolution_signal = "hf.model_type=" + hf_model_type;
     } else if (qwen35_hf_architecture) {
-        qwen35_resolution_signal = "hf.architectures contains Qwen3_5MoeForConditionalGeneration";
+        qwen35_resolution_signal = "hf.architectures contains Qwen3_5*ForConditionalGeneration";
     } else if (contains_lower(general_name, "qwen3.6")) {
         qwen35_resolution_signal = "general.name contains Qwen3.6";
     } else if (contains_lower(general_basename, "qwen3.6")) {
@@ -345,7 +348,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
         qwen35_resolution_signal = "hf.repo_id contains Qwen3.6";
     }
     if (!resolved_arch.known && qwen35_family_aux) {
-        resolved_arch = densecore::models::ResolveModelDescriptor(qwen36_named_variant ? "qwen36" : "qwen35moe");
+        resolved_arch = densecore::models::ResolveModelDescriptor(qwen36_named_variant ? "qwen36" : "qwen35");
     } else if (resolved_arch.known && resolved_arch.arch == ModelArch::QWEN35 && qwen36_named_variant) {
         resolved_arch = densecore::models::ResolveModelDescriptor("qwen36");
     }
@@ -389,7 +392,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             prefixes.push_back(arch);
         }
         if (model->arch_flags.is_hybrid_ssm) {
-            static const char* kHybridPrefixes[] = {"qwen35moe", "qwen3_5_moe", "qwen3_5_moe_text", "qwen35", "qwen36"};
+            static const char* kHybridPrefixes[] = {"qwen35moe",    "qwen3_5_moe", "qwen3_5_moe_text",
+                                                    "qwen3_5_text", "qwen35",      "qwen36"};
             for (const char* prefix : kHybridPrefixes) {
                 if (!prefix) continue;
                 if (std::find(prefixes.begin(), prefixes.end(), prefix) == prefixes.end()) {
@@ -939,20 +943,48 @@ TransformerModel* LoadGGUFModel(const char* path) {
                   << " attention_layers=" << n_full_attn_layers << std::endl;
         if (model->variant == ModelVariant::QWEN36) {
             struct Qwen36ExpectedProfile {
-                int hidden_size = 2048;
-                int n_layer = 40;
+                const char* name = "dense-27b";
+                int hidden_size = 5120;
+                int n_layer = 64;
                 int full_attention_interval = 4;
-                int attn_heads = 16;
-                int kv_heads = 2;
-                int head_dim = 256;
+                int attn_heads = 24;
+                int kv_heads = 4;
+                int head_dim = 128;
                 int linear_key_heads = 16;
-                int linear_value_heads = 32;
+                int linear_value_heads = 48;
                 int linear_key_dim = 128;
                 int linear_value_dim = 128;
                 int conv_kernel = 4;
-                int experts = 256;
-                int experts_per_token = 8;
-            } expected;
+                int experts = 0;
+                int experts_per_token = 0;
+                int shared_experts = 0;
+                bool shared_experts_must_be_positive = false;
+            };
+            const bool qwen36_dense_profile =
+                model->hparams.n_experts == 0 && model->hparams.n_experts_used == 0 && model->moe_n_shared_experts == 0;
+            const Qwen36ExpectedProfile expected = [&]() {
+                Qwen36ExpectedProfile profile;
+                if (qwen36_dense_profile) {
+                    return profile;
+                }
+                profile.name = "moe-35b-a3b";
+                profile.hidden_size = 2048;
+                profile.n_layer = 40;
+                profile.full_attention_interval = 4;
+                profile.attn_heads = 16;
+                profile.kv_heads = 2;
+                profile.head_dim = 256;
+                profile.linear_key_heads = 16;
+                profile.linear_value_heads = 32;
+                profile.linear_key_dim = 128;
+                profile.linear_value_dim = 128;
+                profile.conv_kernel = 4;
+                profile.experts = 256;
+                profile.experts_per_token = 8;
+                profile.shared_experts = 1;
+                profile.shared_experts_must_be_positive = true;
+                return profile;
+            }();
 
             const bool strict_qwen36_profile = []() {
                 const char* env = std::getenv("DENSECORE_QWEN36_STRICT_PROFILE");
@@ -1004,13 +1036,17 @@ TransformerModel* LoadGGUFModel(const char* path) {
             if (static_cast<int>(model->hparams.n_experts_used) != expected.experts_per_token) {
                 mismatches.push_back("num_experts_per_tok");
             }
-            if (model->moe_n_shared_experts <= 0) {
+            if (expected.shared_experts_must_be_positive) {
+                if (model->moe_n_shared_experts <= 0) {
+                    mismatches.push_back("shared_expert");
+                }
+            } else if (model->moe_n_shared_experts != expected.shared_experts) {
                 mismatches.push_back("shared_expert");
             }
 
             if (!mismatches.empty()) {
-                std::cerr << "[DenseCore] Warning: Qwen3.6 profile metadata differs from the official 35B-A3B text "
-                             "profile in: ";
+                std::cerr << "[DenseCore] Warning: Qwen3.6 profile metadata differs from the official " << expected.name
+                          << " text profile in: ";
                 for (size_t i = 0; i < mismatches.size(); ++i) {
                     if (i != 0) std::cerr << ", ";
                     std::cerr << mismatches[i];
@@ -1795,8 +1831,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
                     const int gate_up_expert_axis =
                         packed_gate_up->ne[2] > 1 ? 2 : (packed_gate_up->ne[3] > 1 ? 3 : -1);
-                    const int down_expert_axis =
-                        packed_down->ne[2] > 1 ? 2 : (packed_down->ne[3] > 1 ? 3 : -1);
+                    const int down_expert_axis = packed_down->ne[2] > 1 ? 2 : (packed_down->ne[3] > 1 ? 3 : -1);
                     if (gate_up_expert_axis < 0 || down_expert_axis < 0) {
                         continue;
                     }
@@ -1806,13 +1841,14 @@ TransformerModel* LoadGGUFModel(const char* path) {
                     const size_t gate_up_offset = static_cast<size_t>(expert_idx) * gate_up_stride;
                     const size_t down_offset = static_cast<size_t>(expert_idx) * down_stride;
                     if (ggml_nbytes(packed_gate_up) > 0 &&
-                        gate_up_offset + static_cast<size_t>(packed_gate_up->ne[0]) * static_cast<size_t>(packed_gate_up->nb[1]) >
+                        gate_up_offset + static_cast<size_t>(packed_gate_up->ne[0]) *
+                                             static_cast<size_t>(packed_gate_up->nb[1]) >
                             static_cast<size_t>(ggml_nbytes(packed_gate_up))) {
                         continue;
                     }
-                    if (ggml_nbytes(packed_down) > 0 &&
-                        down_offset + static_cast<size_t>(packed_down->ne[0]) * static_cast<size_t>(packed_down->nb[1]) >
-                            static_cast<size_t>(ggml_nbytes(packed_down))) {
+                    if (ggml_nbytes(packed_down) > 0 && down_offset + static_cast<size_t>(packed_down->ne[0]) *
+                                                                          static_cast<size_t>(packed_down->nb[1]) >
+                                                            static_cast<size_t>(ggml_nbytes(packed_down))) {
                         continue;
                     }
                     struct ggml_tensor* gate_up_slice =

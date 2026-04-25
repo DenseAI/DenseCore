@@ -2,8 +2,8 @@
 
 #include <vector>
 
-#include "cpu_backend.h"
-#include "matmul_backend.h"
+#include "densecore/backend/cpu_backend.h"
+#include "densecore/backend/matmul_backend.h"
 #include "ggml.h"
 
 namespace densecore {

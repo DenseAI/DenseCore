@@ -73,4 +73,14 @@ struct ggml_tensor* ExecuteStandardAttentionPath(struct ggml_context* ctx_c, Tra
                                                  int n_head_kv, int head_dim_q, int fast_attn_sliding_window,
                                                  int attn_query_base_pos, bool use_explicit_attention_scale);
 
+#ifdef DENSECORE_TEST_BUILD
+namespace densecore::llm::attention::testing {
+void ResetSharedPrefillFlashMaskBuildsForTest();
+uint64_t GetSharedPrefillFlashMaskBuildsForTest();
+void ExerciseSharedPrefillFlashMaskBuildForTest(bool native_flash_selected, int n_total_tokens, int n_tokens,
+                                                int attn_query_base_pos, bool decode_only_batch,
+                                                int fast_attn_sliding_window);
+}  // namespace densecore::llm::attention::testing
+#endif
+
 #endif

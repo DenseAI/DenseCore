@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "kernel_context.h"
+#include "densecore/runtime/kernel_context.h"
 
 using namespace densecore;
 

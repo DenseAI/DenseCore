@@ -68,15 +68,11 @@ func (c *CPUConfig) Apply() {
 
 // OptimalThreadCount returns the optimal thread count for inference
 func (c *CPUConfig) OptimalThreadCount() int {
-	// For CPU inference, using all available threads is usually optimal
-	// But leave 1-2 threads for Go runtime if we have many cores
+	// Keep the serving thread budget aligned with the physical core budget.
+	// Phase-specific runtime policy decides when prefill/decode should use
+	// fewer threads; shaving the base budget here prevents those policies from
+	// ever seeing the intended cap.
 	threads := c.NumThreads
-	if threads > 8 {
-		threads -= 2 // Leave 2 threads for Go runtime
-	} else if threads > 4 {
-		threads-- // Leave 1 thread for Go runtime
-	}
-
 	if threads < 1 {
 		threads = 1
 	}

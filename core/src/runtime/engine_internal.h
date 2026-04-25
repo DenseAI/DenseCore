@@ -51,6 +51,28 @@ enum class EngineStatus {
     STOPPED    // Fully stopped, ready for cleanup
 };
 
+enum class DecodeFinishCause : uint8_t {
+    Unknown = 0,
+    StopToken,
+    StopSequence,
+    MaxTokens,
+    LoopGuard,
+    DecodeVisibleProgressTimeout,
+    SchedulerEmptyBatchStall,
+    SchedulerUnschedulable,
+    BatchBuildStall,
+    RequestCanceled,
+    OutOfMemory,
+    MissingTokens,
+    SchedulerRejected,
+};
+
+enum class DecodeSilentFinishReason : uint8_t {
+    None = 0,
+    ReasoningSuppressedOnly,
+    Utf8PendingOnly,
+};
+
 struct KVCacheConfig {
     int max_num_seqs = 4;
     int max_seq_len = 4096;
@@ -223,6 +245,7 @@ struct Request {
     std::vector<int> tokens;
     std::vector<int> token_history;
     std::vector<int> prompt_tokens_for_cache;  // Original prompt tokens for prefix cache registration
+    int prompt_token_count = 0;
     int registered_prefix_blocks = 0;
     std::string utf8_pending;
     std::string think_tag_pending;
@@ -284,6 +307,8 @@ struct Request {
     std::chrono::steady_clock::time_point start_time;
     std::chrono::steady_clock::time_point first_token_time;
     std::chrono::steady_clock::time_point last_token_time;
+    std::chrono::steady_clock::time_point last_sampled_token_time;
+    std::chrono::steady_clock::time_point last_external_emit_time;
 
     // Scheduling priority (lower value = higher priority)
     int priority = 100;
@@ -291,6 +316,22 @@ struct Request {
     int estimated_length = 0;
     uint64_t empty_schedule_stall_count = 0;
     uint64_t batch_build_stall_count = 0;
+    uint64_t decode_no_output_steps = 0;
+    uint64_t sampled_token_count = 0;
+    uint64_t visible_emitted_token_count = 0;
+    uint64_t suppressed_token_count = 0;
+    uint64_t scheduler_wait_ns = 0;
+    uint64_t batch_build_ns = 0;
+    uint64_t graph_build_rebind_ns = 0;
+    uint64_t graph_execute_ns = 0;
+    int prefill_thread_count = 0;
+    int decode_thread_count = 0;
+    std::string prefill_thread_policy;
+    std::string decode_thread_policy;
+    int first_sampled_token_id = -1;
+    int first_visible_token_id = -1;
+    DecodeFinishCause decode_finish_cause = DecodeFinishCause::Unknown;
+    DecodeSilentFinishReason decode_silent_finish_reason = DecodeSilentFinishReason::None;
     std::chrono::steady_clock::time_point last_progress_time{};
     int pending_scheduler_progress = 0;
 
@@ -317,6 +358,7 @@ struct Request {
         tokens.clear();
         token_history.clear();
         prompt_tokens_for_cache.clear();
+        prompt_token_count = 0;
         registered_prefix_blocks = 0;
         utf8_pending.clear();
         think_tag_pending.clear();
@@ -355,11 +397,33 @@ struct Request {
         stop_buffer_max = 0;
         grammar.enabled = false;
         grammar.is_json_mode = false;
+        arrival_time = std::chrono::steady_clock::time_point();
+        start_time = std::chrono::steady_clock::time_point();
+        first_token_time = std::chrono::steady_clock::time_point();
+        last_token_time = std::chrono::steady_clock::time_point();
+        last_sampled_token_time = std::chrono::steady_clock::time_point();
+        last_external_emit_time = std::chrono::steady_clock::time_point();
         priority = 100;
         is_high_priority = false;
         estimated_length = 0;
         empty_schedule_stall_count = 0;
         batch_build_stall_count = 0;
+        decode_no_output_steps = 0;
+        sampled_token_count = 0;
+        visible_emitted_token_count = 0;
+        suppressed_token_count = 0;
+        scheduler_wait_ns = 0;
+        batch_build_ns = 0;
+        graph_build_rebind_ns = 0;
+        graph_execute_ns = 0;
+        prefill_thread_count = 0;
+        decode_thread_count = 0;
+        prefill_thread_policy.clear();
+        decode_thread_policy.clear();
+        first_sampled_token_id = -1;
+        first_visible_token_id = -1;
+        decode_finish_cause = DecodeFinishCause::Unknown;
+        decode_silent_finish_reason = DecodeSilentFinishReason::None;
         last_progress_time = std::chrono::steady_clock::time_point();
         pending_scheduler_progress = 0;
         seq_id = -1;
@@ -687,7 +751,10 @@ struct EngineState {
         const auto stats = scheduler->GetStats();
         std::ostringstream oss;
         oss << "scheduler(waiting=" << stats.waiting_count << ", running=" << stats.running_count
-            << ", swapped=" << stats.swapped_count << ", mem_usage=" << stats.memory_usage << ")";
+            << ", swapped=" << stats.swapped_count << ", mem_usage=" << stats.memory_usage
+            << ", last_empty_reason=" << densecore::Scheduler::EmptyReasonName(stats.last_empty_reason)
+            << ", last_unschedulable_reason="
+            << densecore::Scheduler::UnschedulableReasonName(stats.last_unschedulable_reason) << ")";
         return oss.str();
     }
 
@@ -728,7 +795,19 @@ struct EngineState {
      * Calculate required context memory based on model parameters.
      * Returns size in bytes.
      */
-    static size_t CalculateGraphContextSize(const TransformerModel* model) {
+    struct GraphContextEstimate {
+        size_t base_graph_working_set_bytes = 0;
+        size_t hybrid_ssm_extra_bytes = 0;
+        size_t long_context_safety_pad_bytes = 0;
+        size_t env_extra_bytes = 0;
+        size_t total_bytes = 0;
+        size_t effective_seq_len = 0;
+        size_t effective_num_seqs = 0;
+        size_t chunk_token_hint = 0;
+    };
+
+    static GraphContextEstimate EstimateGraphContextSize(const TransformerModel* model, size_t seq_len_hint = 0,
+                                                         size_t num_seqs_hint = 0, size_t chunk_token_hint = 0) {
         auto parse_env_mb = [](const char* name, size_t default_mb, size_t min_mb, size_t hard_max_mb) -> size_t {
             const char* env = std::getenv(name);
             if (!env || env[0] == '\0') return default_mb;
@@ -752,7 +831,7 @@ struct EngineState {
 
         constexpr size_t MB = 1024ULL * 1024ULL;
         constexpr size_t HARD_MIN_MB = 128;
-        constexpr size_t HARD_MAX_MB = 16ULL * 1024ULL;  // 16 GB safety cap
+        constexpr size_t HARD_MAX_MB = 24ULL * 1024ULL;  // 24 GB safety cap
         auto parse_positive_ull = [](const char* text) -> unsigned long long {
             if (!text || text[0] == '\0') return 0;
             errno = 0;
@@ -811,15 +890,24 @@ struct EngineState {
 #endif
         };
 
+        GraphContextEstimate estimate{};
         if (!model) {
-            return 512ULL * 1024 * 1024;  // 512MB default if no model
+            estimate.total_bytes = 512ULL * 1024ULL * 1024ULL;
+            return estimate;
         }
 
         const auto& hp = model->hparams;
         const size_t runtime_max_seq_len = static_cast<size_t>(parse_env_int("DENSECORE_MAX_SEQ_LEN", 4096, 1));
         const size_t runtime_max_num_seqs = static_cast<size_t>(parse_env_int("DENSECORE_MAX_NUM_SEQS", 4, 1));
-        const size_t effective_seq_len = std::max<size_t>(
-            1, std::min<size_t>(static_cast<size_t>(std::max<int32_t>(1, hp.n_ctx)), runtime_max_seq_len));
+        const size_t model_max_seq_len = static_cast<size_t>(std::max<int32_t>(1, hp.n_ctx));
+        const size_t hinted_seq_len =
+            std::max<size_t>(1, std::min<size_t>(model_max_seq_len, std::max(seq_len_hint, chunk_token_hint)));
+        const size_t effective_seq_len =
+            std::max<size_t>(1, std::max(std::min<size_t>(model_max_seq_len, runtime_max_seq_len), hinted_seq_len));
+        const size_t effective_num_seqs = std::max<size_t>(1, std::max(runtime_max_num_seqs, num_seqs_hint));
+        estimate.effective_seq_len = effective_seq_len;
+        estimate.effective_num_seqs = effective_num_seqs;
+        estimate.chunk_token_hint = chunk_token_hint;
 
         // The graph context backs the persistent GGML compute pool used while
         // rebuilding and executing the active graph. It must cover:
@@ -830,7 +918,7 @@ struct EngineState {
         // The prior estimate only used O(n_head * seq), which under-sized the
         // pool for decoder attention graphs and caused ggml_new_object() aborts
         // once real OpenVLA/llm_universal paths exercised longer prompts.
-        const size_t token_working_set = runtime_max_num_seqs * effective_seq_len;
+        const size_t token_working_set = effective_num_seqs * effective_seq_len;
         const size_t hidden_working_set = static_cast<size_t>(std::max<int32_t>(1, hp.n_embd)) * token_working_set;
         const size_t hidden_bytes = hidden_working_set * sizeof(float);
 
@@ -842,7 +930,8 @@ struct EngineState {
         //   - ~7 hidden-sized buffers (norm/Q/K/V/attn_out/ffn/residual staging)
         //   - ~2 score-sized buffers (scores + probs/mask-expanded scratch)
         const size_t per_layer_activation_bytes = hidden_bytes * 7 + attention_score_bytes * 2;
-        size_t base_size = static_cast<size_t>(std::max<int32_t>(1, hp.n_layer)) * per_layer_activation_bytes;
+        const size_t base_size = static_cast<size_t>(std::max<int32_t>(1, hp.n_layer)) * per_layer_activation_bytes;
+        estimate.base_graph_working_set_bytes = base_size;
 
         // Residual/output/lm-head staging that can remain live across layers.
         size_t overhead = hidden_bytes * 4 + attention_score_bytes / 2;
@@ -850,21 +939,39 @@ struct EngineState {
         // Hybrid SSM / Gemma4 graphs need extra room for recurrent state views and
         // architecture-specific branch tensors, but still nowhere near full-model memory.
         if (model->arch_flags.is_hybrid_ssm) {
-            overhead += static_cast<size_t>(std::max(1, model->ssm_inner_size)) * token_working_set * sizeof(float) / 2;
+            estimate.hybrid_ssm_extra_bytes +=
+                static_cast<size_t>(std::max(1, model->ssm_inner_size)) * token_working_set * sizeof(float) / 2;
+            const size_t chunk_working_tokens = std::max<size_t>(chunk_token_hint, effective_seq_len);
+            estimate.hybrid_ssm_extra_bytes +=
+                static_cast<size_t>(std::max(1, model->ssm_inner_size)) * chunk_working_tokens * sizeof(float) / 4;
         }
         if (model->arch_flags.is_gemma4) {
             overhead += hidden_bytes;
         }
 
-        size_t total = base_size + overhead;
+        size_t total = base_size + overhead + estimate.hybrid_ssm_extra_bytes;
 
         // Leave explicit headroom for ggml object metadata, graph bookkeeping,
         // and architecture-specific scratch that are not modeled perfectly by
         // the coarse activation estimate above. Without this margin, real
         // decoder graphs tend to miss by a few MB and abort in ggml_new_object.
-        total += std::max(total / 4, static_cast<size_t>(128) * MB);
-        total += static_cast<size_t>(8) * MB;
-        total += static_cast<size_t>(4) * MB;
+        estimate.long_context_safety_pad_bytes += std::max(total / 4, static_cast<size_t>(128) * MB);
+        estimate.long_context_safety_pad_bytes += static_cast<size_t>(8) * MB;
+        estimate.long_context_safety_pad_bytes += static_cast<size_t>(4) * MB;
+        // Keep extra slack for long-context hybrid-SSM graphs where minor
+        // topology/scratch differences can exceed estimates by ~10+ MB and
+        // hard-abort inside ggml_new_object(). Fail-closed handling in serving
+        // cannot run if the process aborts here, so bias toward over-allocation.
+        if (model->arch_flags.is_hybrid_ssm && effective_seq_len > static_cast<size_t>(BLOCK_SIZE)) {
+            const size_t long_prompt_pad_mb =
+                std::clamp<size_t>(std::max<size_t>(128, (effective_seq_len / 1024ULL) * 64ULL), 128ULL, 1024ULL);
+            estimate.long_context_safety_pad_bytes += long_prompt_pad_mb * MB;
+        }
+        const size_t extra_headroom_mb =
+            parse_env_mb("DENSECORE_GRAPH_CTX_EXTRA_MB", /*default_mb=*/64, /*min_mb=*/0, HARD_MAX_MB);
+        estimate.env_extra_bytes = extra_headroom_mb * MB;
+        total += estimate.long_context_safety_pad_bytes;
+        total += estimate.env_extra_bytes;
 
         // Clamp to runtime-configurable bounds.
         // Defaults are chosen to keep previous behavior for small models while
@@ -898,7 +1005,13 @@ struct EngineState {
         if (total < MIN_SIZE) total = MIN_SIZE;
         if (total > MAX_SIZE) total = MAX_SIZE;
 
-        return total;
+        estimate.total_bytes = total;
+        return estimate;
+    }
+
+    static size_t CalculateGraphContextSize(const TransformerModel* model, size_t seq_len_hint = 0,
+                                            size_t num_seqs_hint = 0, size_t chunk_token_hint = 0) {
+        return EstimateGraphContextSize(model, seq_len_hint, num_seqs_hint, chunk_token_hint).total_bytes;
     }
 
     void InitGraphCache(const TransformerModel* model = nullptr) {

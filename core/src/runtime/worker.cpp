@@ -65,7 +65,7 @@ const densecore::llm::config::WorkerRuntimeConfig& GetWorkerRuntimeConfig() {
 }
 
 class ScopedFastPathRuntimeConfigBinder {
-  public:
+public:
     explicit ScopedFastPathRuntimeConfigBinder(const densecore::llm::config::FastPathRuntimeConfig* config)
         : previous_(tls_fast_path_runtime_config) {
         tls_fast_path_runtime_config = config;
@@ -73,7 +73,7 @@ class ScopedFastPathRuntimeConfigBinder {
 
     ~ScopedFastPathRuntimeConfigBinder() { tls_fast_path_runtime_config = previous_; }
 
-  private:
+private:
     const densecore::llm::config::FastPathRuntimeConfig* previous_ = nullptr;
 };
 
@@ -87,6 +87,18 @@ bool IsRuntimePathLoggingEnabled() {
 
 bool IsSchedulerStallDebugEnabled() {
     return GetWorkerRuntimeConfig().scheduler_stall_debug;
+}
+
+long GetEmptyScheduleWarnAfterMs() {
+    static const long value =
+        std::max<long>(0, densecore::env::ParseIntEnv("DENSECORE_EMPTY_SCHEDULE_WARN_AFTER_MS", 250));
+    return value;
+}
+
+long GetEmptyScheduleFailAfterMs() {
+    static const long value =
+        std::max<long>(0, densecore::env::ParseIntEnv("DENSECORE_EMPTY_SCHEDULE_FAIL_AFTER_MS", 2000));
+    return value;
 }
 
 bool IsMoEPathTraceDumpEnabled() {
@@ -785,9 +797,7 @@ void EngineLoop(EngineState* state) {
             state->empty_schedule_watchdog.last_seen = std::chrono::steady_clock::time_point();
             state->empty_schedule_watchdog.last_log = std::chrono::steady_clock::time_point();
         };
-        static constexpr auto kEmptyScheduleWarnAfter = std::chrono::milliseconds(250);
         static constexpr auto kEmptyScheduleLogEvery = std::chrono::seconds(1);
-        static constexpr auto kEmptyScheduleFailAfter = std::chrono::seconds(2);
 
         while (state->status != EngineStatus::STOPPED) {
             const bool global_bench_fast_path = IsBenchmarkFastPathEnabled();
@@ -995,6 +1005,9 @@ void EngineLoop(EngineState* state) {
                     if (req->tokens.empty()) {
                         LOG_CRITICAL("FATAL: Request {} has no tokens (should be pre-tokenized)", req->id);
                         req->finished = true;
+                        req->decode_finish_cause = DecodeFinishCause::MissingTokens;
+                        FinalizeDecodeSilentFinishReason(req);
+                        LogRequestDecodeSummary(req, current_model);
                         state->metrics.failed_requests++;
                         // Push error event to callback queue (instead of direct callback)
                         EmitRequestResult(state, req, "Error: Missing tokens", -1, true, true, global_direct_callback);
@@ -1028,6 +1041,9 @@ void EngineLoop(EngineState* state) {
                         // Scheduler rejected (e.g., queue full or impossible non-chunked prefill)
                         LOG_WARN("Scheduler rejected request {}", req->id);
                         req->finished = true;
+                        req->decode_finish_cause = DecodeFinishCause::SchedulerRejected;
+                        FinalizeDecodeSilentFinishReason(req);
+                        LogRequestDecodeSummary(req, current_model);
                         state->metrics.failed_requests++;
                         // Push error event to callback queue (instead of direct callback)
                         EmitRequestResult(state, req,
@@ -1074,11 +1090,12 @@ void EngineLoop(EngineState* state) {
                     if (req->cancelled.load(std::memory_order_relaxed) && !req->finished) {
                         LOG_INFO("Cancelling active request: {}", req->id);
                         req->finished = true;
+                        req->decode_finish_cause = DecodeFinishCause::RequestCanceled;
+                        FinalizeDecodeSilentFinishReason(req);
+                        LogRequestDecodeSummary(req, current_model);
                         state->metrics.failed_requests++;
-                        // Treat cooperative cancellation as a silent terminal event so
-                        // stop-marker driven early exits do not leak an error string
-                        // into user-visible output.
-                        EmitRequestResult(state, req, "", -1, true, true, global_direct_callback);
+                        EmitRequestResult(state, req, "Error: request canceled", -1, true, true,
+                                          global_direct_callback);
                         // Defer scheduler removal to avoid lock-order inversion
                         if (req->seq_id >= 0) {
                             cancelled_seq_ids.push_back(req->seq_id);
@@ -1139,7 +1156,8 @@ void EngineLoop(EngineState* state) {
 
                 if (scheduler_single_tenant && single_req && !single_req->finished && !single_req->is_embedding &&
                     !single_req->is_swapped && !single_req->cancelled.load(std::memory_order_relaxed) &&
-                    single_req->seq_id >= 0 && !single_req->tokens.empty()) {
+                    single_req->seq_id >= 0 && !single_req->tokens.empty() &&
+                    !ShouldBypassSingleRequestFastPathForLongHybridSSM(current_model, single_req)) {
                     const int tokens_to_process =
                         single_req->is_prefill ? static_cast<int>(single_req->tokens.size()) : 1;
                     if (tokens_to_process > 0) {
@@ -1393,7 +1411,16 @@ void EngineLoop(EngineState* state) {
                 bool should_log = false;
                 bool should_fail = false;
                 std::vector<Request*> stalled_requests;
+                Request* unschedulable_request = nullptr;
                 const auto now = std::chrono::steady_clock::now();
+                const bool scheduler_unschedulable =
+                    sched_output.unschedulable_reason != densecore::SchedulerUnschedulableReason::None;
+                if (scheduler_unschedulable && sched_output.diagnostic_seq_id >= 0) {
+                    auto req_it = seq_to_request.find(sched_output.diagnostic_seq_id);
+                    if (req_it != seq_to_request.end()) {
+                        unschedulable_request = req_it->second;
+                    }
+                }
                 {
                     std::lock_guard<std::mutex> lock(state->active_mu);
                     for (Request* req : state->active_requests) {
@@ -1407,8 +1434,10 @@ void EngineLoop(EngineState* state) {
                         const long idle_ms =
                             std::chrono::duration_cast<std::chrono::milliseconds>(now - last_progress).count();
                         oldest_idle_ms = std::max(oldest_idle_ms, idle_ms);
-                        if (idle_ms <
-                            std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleWarnAfter).count()) {
+                        if (scheduler_unschedulable) {
+                            continue;
+                        }
+                        if (idle_ms < GetEmptyScheduleWarnAfterMs()) {
                             continue;
                         }
                         req->empty_schedule_stall_count++;
@@ -1417,7 +1446,9 @@ void EngineLoop(EngineState* state) {
                 }
 
                 if (has_active) {
-                    if (!stalled_requests.empty()) {
+                    if (scheduler_unschedulable) {
+                        should_fail = true;
+                    } else if (!stalled_requests.empty()) {
                         std::lock_guard<std::mutex> watchdog_lock(state->scheduler_watchdog_mu);
                         auto& watchdog = state->empty_schedule_watchdog;
                         if (watchdog.consecutive_loops == 0) {
@@ -1429,14 +1460,11 @@ void EngineLoop(EngineState* state) {
                         stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(watchdog.last_seen -
                                                                                          watchdog.first_seen)
                                        .count();
-                        if (stall_ms >=
-                            std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleFailAfter).count()) {
+                        if (stall_ms >= GetEmptyScheduleFailAfterMs()) {
                             should_fail = true;
                             watchdog.failure_count++;
                             watchdog.last_log = now;
-                        } else if (stall_ms >=
-                                       std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleWarnAfter)
-                                           .count() &&
+                        } else if (stall_ms >= GetEmptyScheduleWarnAfterMs() &&
                                    (watchdog.last_log == std::chrono::steady_clock::time_point() ||
                                     now - watchdog.last_log >= kEmptyScheduleLogEvery)) {
                             should_log = true;
@@ -1450,10 +1478,23 @@ void EngineLoop(EngineState* state) {
                         const std::string scheduler_state = state->DescribeSchedulerState();
                         const std::string active_state = state->DescribeActiveRequests();
                         if (should_fail) {
-                            LOG_ERROR(
-                                "Broken scheduling state detected after {} ms (loops={}, oldest_idle_ms={}). {} {}",
-                                stall_ms, watchdog_loops, oldest_idle_ms, scheduler_state, active_state);
-                            for (Request* req : stalled_requests) {
+                            if (scheduler_unschedulable) {
+                                LOG_ERROR("Scheduler declared active request unschedulable (reason={}). {} {}",
+                                          densecore::Scheduler::DescribeUnschedulableReason(sched_output),
+                                          scheduler_state, active_state);
+                            } else {
+                                LOG_ERROR(
+                                    "Broken scheduling state detected after {} ms (loops={}, oldest_idle_ms={}). {} {}",
+                                    stall_ms, watchdog_loops, oldest_idle_ms, scheduler_state, active_state);
+                            }
+                            std::vector<Request*> failed_requests = stalled_requests;
+                            if (scheduler_unschedulable) {
+                                failed_requests.clear();
+                                if (unschedulable_request != nullptr) {
+                                    failed_requests.push_back(unschedulable_request);
+                                }
+                            }
+                            for (Request* req : failed_requests) {
                                 if (!req || req->finished) {
                                     continue;
                                 }
@@ -1468,9 +1509,18 @@ void EngineLoop(EngineState* state) {
                                           req->id, req->seq_id, req->is_prefill, req->tokens.size(), req->n_past,
                                           req->generated_count, req->empty_schedule_stall_count, idle_ms);
                                 req->finished = true;
+                                req->decode_finish_cause = scheduler_unschedulable
+                                                               ? DecodeFinishCause::SchedulerUnschedulable
+                                                               : DecodeFinishCause::SchedulerEmptyBatchStall;
+                                FinalizeDecodeSilentFinishReason(req);
+                                LogRequestDecodeSummary(req, current_model);
                                 state->metrics.failed_requests++;
-                                EmitRequestResult(state, req, "Error: Scheduler stalled while request remained active",
-                                                  -1, true, true, global_direct_callback);
+                                const std::string error_text =
+                                    scheduler_unschedulable
+                                        ? ("Error: Request cannot make scheduler progress (" +
+                                           densecore::Scheduler::DescribeUnschedulableReason(sched_output) + ")")
+                                        : "Error: Scheduler stalled while request remained active";
+                                EmitRequestResult(state, req, error_text, -1, true, true, global_direct_callback);
                                 if (!req->block_table.empty()) {
                                     current_kv_cache->block_manager->Free(req->block_table);
                                     req->block_table.clear();
@@ -1486,7 +1536,7 @@ void EngineLoop(EngineState* state) {
                             }
                             std::lock_guard<std::mutex> cv_lock(state->cv_mu);
                             state->queue_cv.notify_one();
-                        } else {
+                        } else if (!scheduler_unschedulable) {
                             LOG_WARN("Scheduler returned empty batch with stalled active requests for {} ms (loops={}, "
                                      "oldest_idle_ms={}). {} {}",
                                      stall_ms, watchdog_loops, oldest_idle_ms, scheduler_state, active_state);
@@ -1501,10 +1551,20 @@ void EngineLoop(EngineState* state) {
                     // Active requests exist but scheduler couldn't schedule them
                     // Wait with VERY short timeout for latency-sensitive operation
                     std::unique_lock<std::mutex> lock(state->cv_mu);
+                    const auto wait_begin = std::chrono::steady_clock::now();
                     state->queue_cv.wait_for(lock, std::chrono::microseconds(100), [state]() {
                         // Wake up if: new pending requests OR engine stopping
                         return !state->pending_requests.Empty() || state->status != EngineStatus::RUNNING;
                     });
+                    const auto wait_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                   std::chrono::steady_clock::now() - wait_begin)
+                                                                   .count());
+                    std::lock_guard<std::mutex> active_lock(state->active_mu);
+                    for (Request* req : state->active_requests) {
+                        if (req && !req->finished) {
+                            req->scheduler_wait_ns += wait_ns;
+                        }
+                    }
                 } else {
                     reap_finished_requests();
                     reset_empty_schedule_watchdog();
@@ -1526,6 +1586,7 @@ void EngineLoop(EngineState* state) {
             std::vector<Request*> batch_requests;
             std::vector<int> batch_token_counts;
             std::unordered_map<int, int> prefill_chunk_tokens;
+            const auto batch_build_begin = std::chrono::steady_clock::now();
             bool is_embedding_batch = false;
             bool first_request = true;
             batch.scheduler = state->scheduler.get();
@@ -1705,6 +1766,7 @@ void EngineLoop(EngineState* state) {
                 // Save original prompt tokens once for prefix cache registration.
                 if (req->prompt_tokens_for_cache.empty()) {
                     req->prompt_tokens_for_cache = req->tokens;
+                    req->prompt_token_count = static_cast<int>(req->tokens.size());
                 }
 
                 std::vector<int> tokens;
@@ -1807,6 +1869,15 @@ void EngineLoop(EngineState* state) {
                 batch_build_stats.stalled_requests.erase(
                     std::unique(batch_build_stats.stalled_requests.begin(), batch_build_stats.stalled_requests.end()),
                     batch_build_stats.stalled_requests.end());
+                const auto batch_build_ns =
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - batch_build_begin)
+                                              .count());
+                for (Request* req : batch_build_stats.stalled_requests) {
+                    if (req) {
+                        req->batch_build_ns += batch_build_ns;
+                    }
+                }
                 std::sort(batch_build_stats.missing_seq_ids.begin(), batch_build_stats.missing_seq_ids.end());
                 batch_build_stats.missing_seq_ids.erase(
                     std::unique(batch_build_stats.missing_seq_ids.begin(), batch_build_stats.missing_seq_ids.end()),
@@ -1830,13 +1901,9 @@ void EngineLoop(EngineState* state) {
                             std::max<long>(max_build_stall_loops, static_cast<long>(req->batch_build_stall_count));
                     }
 
-                    const bool should_fail =
-                        oldest_idle_ms >=
-                        std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleFailAfter).count();
+                    const bool should_fail = oldest_idle_ms >= GetEmptyScheduleFailAfterMs();
                     const bool should_log =
-                        IsSchedulerStallDebugEnabled() ||
-                        oldest_idle_ms >=
-                            std::chrono::duration_cast<std::chrono::milliseconds>(kEmptyScheduleWarnAfter).count();
+                        IsSchedulerStallDebugEnabled() || oldest_idle_ms >= GetEmptyScheduleWarnAfterMs();
 
                     if (should_log || should_fail) {
                         const std::string scheduler_state = state->DescribeSchedulerState();
@@ -1872,6 +1939,9 @@ void EngineLoop(EngineState* state) {
                                       req->id, req->seq_id, req->is_prefill, req->tokens.size(), req->n_past,
                                       req->generated_count, req->batch_build_stall_count);
                             req->finished = true;
+                            req->decode_finish_cause = DecodeFinishCause::BatchBuildStall;
+                            FinalizeDecodeSilentFinishReason(req);
+                            LogRequestDecodeSummary(req, current_model);
                             state->metrics.failed_requests++;
                             EmitRequestResult(state, req,
                                               "Error: Scheduler scheduled work but batch construction stalled", -1,
@@ -1901,6 +1971,15 @@ void EngineLoop(EngineState* state) {
                 continue;
             }
 
+            const auto batch_build_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                  std::chrono::steady_clock::now() - batch_build_begin)
+                                                                  .count());
+            for (Request* req : batch_requests) {
+                if (req) {
+                    req->batch_build_ns += batch_build_ns;
+                }
+            }
+
             batch.num_seqs = batch_requests.size();
 
             bool is_prefill_batch = false;
@@ -1914,24 +1993,46 @@ void EngineLoop(EngineState* state) {
             InferenceConfig& infer_cfg = InferenceConfig::Instance();
             int active_threads = base_threads;
             const int decode_batch_size = static_cast<int>(batch_requests.size());
+            int prefill_prompt_token_count = 0;
+            if (is_prefill_batch && decode_batch_size == 1 && !batch_requests.empty()) {
+                const Request* const req = batch_requests.front();
+                if (req && !req->prompt_tokens_for_cache.empty()) {
+                    prefill_prompt_token_count = static_cast<int>(req->prompt_tokens_for_cache.size());
+                } else if (!batch_token_counts.empty()) {
+                    prefill_prompt_token_count = batch_token_counts.front();
+                }
+            }
             const bool is_decode_batch = !is_prefill_batch && !is_embedding_batch;
-            const char* decode_thread_policy = is_prefill_batch ? "prefill" : "base";
+            const auto simd_level = densecore::simd::DetectSimdLevel();
+            const char* prefill_thread_policy = "prefill_base";
+            const char* decode_thread_policy = "base";
 
             // DENSECORE_BENCH_RESPECT_THREADS=1 forces full thread count for all phases
             const bool bench_respect_threads = state->fast_path_config.bench_respect_threads;
 
             if (bench_respect_threads) {
                 active_threads = base_threads;
-                decode_thread_policy = "bench_respect";
+                if (is_prefill_batch) {
+                    prefill_thread_policy = "bench_respect";
+                } else {
+                    decode_thread_policy = "bench_respect";
+                }
             } else if (!is_embedding_batch && infer_cfg.enable_split_thread_policy) {
                 const int configured_threads = is_prefill_batch ? infer_cfg.prefill_threads : infer_cfg.decode_threads;
                 if (configured_threads > 0) {
                     active_threads = configured_threads;
-                    decode_thread_policy = is_prefill_batch ? "prefill_override" : "decode_override";
+                    if (is_prefill_batch) {
+                        prefill_thread_policy = "prefill_override";
+                    } else {
+                        decode_thread_policy = "decode_override";
+                    }
                 } else {
                     if (is_prefill_batch) {
-                        active_threads = base_threads;
-                        decode_thread_policy = "prefill_base";
+                        const PrefillThreadPolicySelection selection = ResolvePrefillThreadPolicySelection(
+                            current_model, decode_batch_size, prefill_prompt_token_count, physical_core_count,
+                            base_threads, simd_level);
+                        active_threads = selection.threads;
+                        prefill_thread_policy = selection.label;
                     } else {
                         const int batch_override = DecodeThreadsBatchOverride(decode_batch_size);
                         if (batch_override > 0) {
@@ -1942,9 +2043,10 @@ void EngineLoop(EngineState* state) {
                                 ResolveLegacyDecodeThreads(decode_batch_size, physical_core_count, base_threads);
                             decode_thread_policy = "decode_legacy_auto";
                         } else {
-                            active_threads =
-                                ResolveAutoDecodeThreadsForBatch(decode_batch_size, physical_core_count, base_threads);
-                            decode_thread_policy = "decode_batch_auto";
+                            const DecodeThreadPolicySelection selection = ResolveDecodeThreadPolicySelection(
+                                current_model, decode_batch_size, physical_core_count, base_threads, simd_level);
+                            active_threads = selection.threads;
+                            decode_thread_policy = selection.label;
                         }
                     }
                 }
@@ -1953,7 +2055,7 @@ void EngineLoop(EngineState* state) {
                 const int debug_prefill_threads = PrefillThreadOverride();
                 if (debug_prefill_threads > 0) {
                     active_threads = debug_prefill_threads;
-                    decode_thread_policy = "prefill_debug_override";
+                    prefill_thread_policy = "prefill_debug_override";
                 }
             }
 
@@ -1987,13 +2089,29 @@ void EngineLoop(EngineState* state) {
                 GetDecodeWorkerStats().last_threads_by_batch[decode_batch_size].store(active_threads,
                                                                                       std::memory_order_relaxed);
             }
-            if (is_decode_batch && IsDebugDecodeThreadsEnabled()) {
+            if (!is_embedding_batch) {
+                for (Request* req : batch_requests) {
+                    if (!req) {
+                        continue;
+                    }
+                    if (is_prefill_batch) {
+                        req->prefill_thread_count = active_threads;
+                        req->prefill_thread_policy = prefill_thread_policy;
+                    } else {
+                        req->decode_thread_count = active_threads;
+                        req->decode_thread_policy = decode_thread_policy;
+                    }
+                }
+            }
+            if (IsDebugDecodeThreadsEnabled() && !is_embedding_batch) {
                 static std::atomic<uint64_t> logged_decode_thread_events{0};
                 const uint64_t event_idx = logged_decode_thread_events.fetch_add(1, std::memory_order_relaxed);
                 if (event_idx < 64) {
-                    std::cerr << "[DecodeThreads] batch=" << decode_batch_size << " selected=" << active_threads
+                    std::cerr << "[ThreadPolicy] phase=" << (is_prefill_batch ? "prefill" : "decode")
+                              << " batch=" << decode_batch_size << " selected=" << active_threads
                               << " base=" << base_threads << " physical=" << physical_core_count
-                              << " policy=" << decode_thread_policy << std::endl;
+                              << " policy=" << (is_prefill_batch ? prefill_thread_policy : decode_thread_policy)
+                              << std::endl;
                 }
             }
 
@@ -2039,6 +2157,7 @@ void EngineLoop(EngineState* state) {
             bool reused_decode_graph = false;
             bool using_cached_decode_graph = false;
             bool cached_graph_verified_paged_decode_op = false;
+            const auto graph_build_rebind_begin = std::chrono::steady_clock::now();
 
             // =========================================================================
             // BACKEND SELECTION (Abstracted via BackendSelector interface)
@@ -2130,8 +2249,26 @@ void EngineLoop(EngineState* state) {
                 prefill_graph_cache_policy.enabled && current_kv_cache != nullptr && prefill_graph_cache_lru_size > 0;
             const bool decode_graph_cache_active_effective = decode_graph_cache_active && !force_disable_graph_cache;
             const bool prefill_graph_cache_active_effective = prefill_graph_cache_active && !force_disable_graph_cache;
+            auto compute_graph_context_estimate = [&]() {
+                size_t seq_len_hint = 0;
+                size_t chunk_token_hint = 0;
+                for (size_t req_idx = 0; req_idx < batch_requests.size(); ++req_idx) {
+                    const Request* batch_req = batch_requests[req_idx];
+                    const int token_count =
+                        (req_idx < batch_token_counts.size()) ? std::max(0, batch_token_counts[req_idx]) : 0;
+                    const size_t prompt_hint = batch_req
+                                                   ? static_cast<size_t>(std::max(batch_req->prompt_token_count,
+                                                                                  batch_req->n_past + token_count))
+                                                   : static_cast<size_t>(token_count);
+                    seq_len_hint = std::max(seq_len_hint, prompt_hint);
+                    chunk_token_hint = std::max(chunk_token_hint, static_cast<size_t>(token_count));
+                }
+                return EngineState::EstimateGraphContextSize(
+                    current_model, seq_len_hint, static_cast<size_t>(std::max(1, batch.num_seqs)), chunk_token_hint);
+            };
+            const EngineState::GraphContextEstimate graph_ctx_estimate = compute_graph_context_estimate();
             const size_t prefill_graph_ctx_bytes =
-                prefill_graph_cache_active_effective ? state->CalculateGraphContextSize(current_model) : 0;
+                prefill_graph_cache_active_effective ? graph_ctx_estimate.total_bytes : 0;
             bool decode_single_token_layout = !is_embedding_batch && !is_prefill_batch && batch.num_seqs > 0 &&
                                               batch.num_seqs <= decode_graph_cache_max_batch &&
                                               batch_token_counts.size() == batch_requests.size() &&
@@ -2166,6 +2303,11 @@ void EngineLoop(EngineState* state) {
                                                      batch.lora_map.empty() &&
                                                      IsDecodeGraphCacheSafeForModel(current_model);
             const bool decode_reuse_candidate = decode_reuse_shape_eligible && cpu_backend_active;
+            const auto decode_model_descriptor = densecore::models::DescribeModel(current_model);
+            const size_t decode_model_variant_index =
+                std::min(static_cast<size_t>(decode_model_descriptor.variant), kDecodeGraphCacheTrackedVariants - 1);
+            const size_t decode_batch_bucket = static_cast<size_t>(
+                std::clamp(batch.num_seqs, 1, static_cast<int>(kDecodeGraphCacheTrackedBatches - 1)));
             const size_t decode_graph_uncacheable_limit =
                 static_cast<size_t>(std::max(1, decode_graph_cache_lru_size * 2));
             if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
@@ -2235,6 +2377,9 @@ void EngineLoop(EngineState* state) {
             if (decode_reuse_attempt_allowed) {
                 if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
                     GetDecodeWorkerStats().graph_cache_attempts.fetch_add(1, std::memory_order_relaxed);
+                    GetDecodeWorkerStats()
+                        .graph_cache_by_variant_batch[decode_model_variant_index][decode_batch_bucket]
+                        .attempts.fetch_add(1, std::memory_order_relaxed);
                 }
                 auto it = decode_graph_cache.find(decode_graph_key);
                 if (it != decode_graph_cache.end() && it->second.graph && it->second.output && it->second.embd_inp &&
@@ -2267,6 +2412,9 @@ void EngineLoop(EngineState* state) {
                         using_cached_decode_graph = true;
                         if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
                             GetDecodeWorkerStats().graph_cache_hits.fetch_add(1, std::memory_order_relaxed);
+                            GetDecodeWorkerStats()
+                                .graph_cache_by_variant_batch[decode_model_variant_index][decode_batch_bucket]
+                                .hits.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
                 }
@@ -2325,6 +2473,14 @@ void EngineLoop(EngineState* state) {
                                     cache_entry_admissible = false;
                                     const auto inserted_uncacheable = decode_graph_uncacheable.insert(decode_graph_key);
                                     if (inserted_uncacheable.second) {
+                                        if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
+                                            GetDecodeWorkerStats().graph_cache_rejected_uncacheable.fetch_add(
+                                                1, std::memory_order_relaxed);
+                                            GetDecodeWorkerStats()
+                                                .graph_cache_by_variant_batch[decode_model_variant_index]
+                                                                             [decode_batch_bucket]
+                                                .rejected_uncacheable.fetch_add(1, std::memory_order_relaxed);
+                                        }
                                         decode_graph_uncacheable_lru.push_back(decode_graph_key);
                                         while (decode_graph_uncacheable.size() > decode_graph_uncacheable_limit &&
                                                !decode_graph_uncacheable_lru.empty()) {
@@ -2367,6 +2523,10 @@ void EngineLoop(EngineState* state) {
                                     if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
                                         GetDecodeWorkerStats().graph_cache_builds.fetch_add(1,
                                                                                             std::memory_order_relaxed);
+                                        GetDecodeWorkerStats()
+                                            .graph_cache_by_variant_batch[decode_model_variant_index]
+                                                                         [decode_batch_bucket]
+                                            .builds.fetch_add(1, std::memory_order_relaxed);
                                     }
                                 }
                             }
@@ -2473,8 +2633,23 @@ void EngineLoop(EngineState* state) {
                         state->inference_ctx.compute_buffer_size > 0) {
                         std::memset(state->inference_ctx.compute_buffer, 0, state->inference_ctx.compute_buffer_size);
                     }
-                    if (!state->inference_ctx.IsInitialized()) {
-                        size_t ctx_size = state->CalculateGraphContextSize(current_model);
+                    const size_t ctx_size = graph_ctx_estimate.total_bytes;
+                    if (!state->inference_ctx.IsInitialized() || state->inference_ctx.compute_buffer_size < ctx_size) {
+                        if (state->inference_ctx.IsInitialized() &&
+                            state->inference_ctx.compute_buffer_size < ctx_size) {
+                            state->inference_ctx.Free();
+                        }
+                        const auto descriptor = densecore::models::DescribeModel(current_model);
+                        std::cerr << "[DenseCore] GraphCtxEstimate variant="
+                                  << densecore::models::ModelVariantName(descriptor.variant)
+                                  << " seq_hint=" << graph_ctx_estimate.effective_seq_len
+                                  << " num_seqs_hint=" << graph_ctx_estimate.effective_num_seqs
+                                  << " chunk_tokens=" << graph_ctx_estimate.chunk_token_hint
+                                  << " base_mb=" << (graph_ctx_estimate.base_graph_working_set_bytes / (1024 * 1024))
+                                  << " hybrid_mb=" << (graph_ctx_estimate.hybrid_ssm_extra_bytes / (1024 * 1024))
+                                  << " safety_mb=" << (graph_ctx_estimate.long_context_safety_pad_bytes / (1024 * 1024))
+                                  << " env_extra_mb=" << (graph_ctx_estimate.env_extra_bytes / (1024 * 1024))
+                                  << " total_mb=" << (ctx_size / (1024 * 1024)) << std::endl;
                         state->inference_ctx.Init(ctx_size);
                     }
 
@@ -2508,6 +2683,15 @@ void EngineLoop(EngineState* state) {
             if (!output || !embd_inp || !pos) {
                 LOG_ERROR("Fatal: Content creation failed or tensors missing");
                 continue;  // Recover
+            }
+            const auto graph_build_rebind_ns =
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - graph_build_rebind_begin)
+                                          .count());
+            for (Request* req : batch_requests) {
+                if (req) {
+                    req->graph_build_rebind_ns += graph_build_rebind_ns;
+                }
             }
 
             if (IsRuntimePathLoggingEnabled()) {
@@ -2601,9 +2785,13 @@ void EngineLoop(EngineState* state) {
             maybe_set_cpu_threads();
 
             static int decode_graph_regression_checked_steps = 0;
+            const bool decode_graph_regression_single_seq_hybrid =
+                batch.num_seqs == 1 && current_model && current_model->arch_flags.is_hybrid_ssm &&
+                densecore::models::DescribeModel(current_model).variant == ModelVariant::QWEN36;
             const bool run_decode_graph_cache_regression_check =
                 cpu_backend_active && current_kv_cache && using_cached_decode_graph && decode_single_token_layout &&
-                batch.num_seqs > 1 && batch.lora_map.empty() && IsDecodeGraphCacheRegressionEnabled() &&
+                (batch.num_seqs > 1 || decode_graph_regression_single_seq_hybrid) && batch.lora_map.empty() &&
+                IsDecodeGraphCacheRegressionEnabled() &&
                 decode_graph_regression_checked_steps < DecodeGraphCacheRegressionSteps();
             const bool run_batched_decode_correctness_check =
                 cpu_backend_active && IsBatchedDecodeCorrectnessCheckEnabled() && !is_embedding_batch &&
@@ -2882,6 +3070,13 @@ void EngineLoop(EngineState* state) {
             ResetMoEStrictFailure();
             ggml_backend_graph_compute(active_backend, gf);
             const auto compute_end = std::chrono::steady_clock::now();
+            const auto graph_execute_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(compute_end - compute_begin).count());
+            for (Request* req : batch_requests) {
+                if (req) {
+                    req->graph_execute_ns += graph_execute_ns;
+                }
+            }
             std::string moe_strict_failure;
             if (ConsumeMoEStrictFailure(&moe_strict_failure)) {
                 if (moe_strict_failure.empty()) {
@@ -3221,14 +3416,27 @@ void EngineLoop(EngineState* state) {
                 } else {
                     // Generation
                     const bool was_prefill_step = req->is_prefill;
+                    auto commit_prefill_scheduler_progress = [&](bool prefill_finished) {
+                        if (!state->scheduler || req->seq_id < 0) {
+                            req->pending_scheduler_progress = 0;
+                            return;
+                        }
+                        state->scheduler->OnPrefillChunkComplete(req->seq_id, processed_count, prefill_finished);
+                        req->pending_scheduler_progress = 0;
+                    };
+                    auto commit_decode_scheduler_progress = [&]() {
+                        if (!state->scheduler || req->seq_id < 0) {
+                            req->pending_scheduler_progress = 0;
+                            return;
+                        }
+                        state->scheduler->OnDecodeStepComplete(req->seq_id, processed_count);
+                        req->pending_scheduler_progress = 0;
+                    };
                     if (req->is_prefill) {
                         const int remaining_prompt_tokens = static_cast<int>(req->tokens.size());
                         req->n_past += processed_count;
                         req->empty_schedule_stall_count = 0;
                         req->last_progress_time = std::chrono::steady_clock::now();
-                        if (!global_bench_fast_path && req->seq_id >= 0) {
-                            req->pending_scheduler_progress += processed_count;
-                        }
 
                         // Register any newly completed full blocks immediately after
                         // this prefill chunk so prefix reuse can restore the exact
@@ -3265,12 +3473,14 @@ void EngineLoop(EngineState* state) {
 
                         // Chunked prefill in progress: continue prefill without sampling.
                         if (processed_count < remaining_prompt_tokens) {
+                            commit_prefill_scheduler_progress(/*prefill_finished=*/false);
                             determinism_chunked_prefill_reqs.insert(req->id);
                             req->tokens.erase(req->tokens.begin(), req->tokens.begin() + processed_count);
                             token_offset += processed_count;
                             continue;
                         }
 
+                        commit_prefill_scheduler_progress(/*prefill_finished=*/true);
                         req->tokens.clear();
                         req->is_prefill = false;
                         // Clear after registration, or after skipping cache registration for hybrid SSM.
@@ -3323,6 +3533,9 @@ void EngineLoop(EngineState* state) {
                     if (IsVerboseTokenTraceEnabled()) {
                         std::cerr << "[TRACE] Sampled token " << best_token << " for request " << req->id << std::endl;
                     }
+                    const auto decode_sample_time = std::chrono::steady_clock::now();
+                    NoteDecodeSampleProgress(req, decode_sample_time, best_token);
+                    bool terminal_error_emitted = false;
 
                     req->tokens.clear();
                     req->tokens.push_back(best_token);
@@ -3337,6 +3550,7 @@ void EngineLoop(EngineState* state) {
                     }
                     if (ShouldTerminateRepetitiveLoop(current_model, req)) {
                         req->finished = true;
+                        req->decode_finish_cause = DecodeFinishCause::LoopGuard;
                     }
 
                     std::string token_str;
@@ -3371,12 +3585,13 @@ void EngineLoop(EngineState* state) {
                             }
                         }
                     }
+                    const bool had_visible_text_before_suppression = !token_str.empty();
 
                     // Hide model-internal reasoning/tool blocks from streamed
                     // user output by default. Disable with
                     // DENSECORE_SUPPRESS_REASONING_TAGS=0.
-                    if (!req_bench_fast_path && !req->json_mode && !token_str.empty() &&
-                        req->suppress_reasoning_tags && IsReasoningTagSuppressionEnabled()) {
+                    if (!req_bench_fast_path && !req->json_mode && !token_str.empty() && req->suppress_reasoning_tags &&
+                        IsReasoningTagSuppressionEnabled()) {
                         const bool may_contain_tag =
                             req->in_think_block || req->in_tool_call_block || req->in_tool_response_block ||
                             !req->think_tag_pending.empty() || !req->tool_call_tag_pending.empty() ||
@@ -3389,6 +3604,9 @@ void EngineLoop(EngineState* state) {
                             SuppressTaggedBlock(&token_str, &req->in_tool_response_block,
                                                 &req->tool_response_tag_pending, "<tool_response>", "</tool_response>");
                         }
+                    }
+                    if (had_visible_text_before_suppression && token_str.empty()) {
+                        NoteSuppressedToken(req);
                     }
 
                     if (req->json_mode && !token_str.empty()) {
@@ -3418,6 +3636,9 @@ void EngineLoop(EngineState* state) {
                                 req->parity_debug_output_tokens++;
                             }
                             EmitRequestResult(state, req, token_str, best_token, false, false, global_direct_callback);
+                            if (!token_str.empty()) {
+                                NoteVisibleEmitProgress(req, decode_sample_time, best_token);
+                            }
                         }
                     }
 
@@ -3428,13 +3649,11 @@ void EngineLoop(EngineState* state) {
                     // that token is only sampled here and will be written to KV on
                     // the next decode iteration.
                     if (!was_prefill_step) {
-                        if (!global_bench_fast_path && req->seq_id >= 0) {
-                            req->pending_scheduler_progress += processed_count;
-                        }
                         req->n_past += processed_count;
                         auto now = std::chrono::steady_clock::now();
                         req->empty_schedule_stall_count = 0;
                         req->last_progress_time = now;
+                        commit_decode_scheduler_progress();
                         auto itl_us =
                             std::chrono::duration_cast<std::chrono::microseconds>(now - req->last_token_time).count();
                         state->metrics.RecordITL(itl_us);
@@ -3448,12 +3667,14 @@ void EngineLoop(EngineState* state) {
                         if (new_blocks.empty()) {
                             std::cerr << "[DenseCore] OOM during generation for req " << req->id << std::endl;
                             req->finished = true;
+                            req->decode_finish_cause = DecodeFinishCause::OutOfMemory;
                             state->metrics.oom_errors++;
                             state->metrics.failed_requests++;
                             // Push OOM error to callback queue (instead of direct callback)
                             if (req->callback || req->token_result_callback) {
                                 EmitRequestResult(state, req, "Error: Out of memory", -1, true, true,
                                                   global_direct_callback);
+                                terminal_error_emitted = true;
                             }
                             break;
                         }
@@ -3471,14 +3692,36 @@ void EngineLoop(EngineState* state) {
                             if (!seq.empty() && req->stop_buffer.size() >= seq.size() &&
                                 req->stop_buffer.compare(req->stop_buffer.size() - seq.size(), seq.size(), seq) == 0) {
                                 req->finished = true;
+                                req->decode_finish_cause = DecodeFinishCause::StopSequence;
                                 break;
                             }
+                        }
+                    }
+
+                    if (!req->finished && !req_bench_fast_path &&
+                        HasDecodeVisibleProgressStalled(req, decode_sample_time)) {
+                        LOG_ERROR("Failing decode-stalled request {} (seq_id={}, generated={}, silent_steps={})",
+                                  req->id, req->seq_id, req->generated_count, req->decode_no_output_steps);
+                        req->finished = true;
+                        req->decode_finish_cause = DecodeFinishCause::DecodeVisibleProgressTimeout;
+                        state->metrics.failed_requests++;
+                        if (req->callback || req->token_result_callback) {
+                            EmitRequestResult(state, req, "Error: decode made no externally visible progress", -1, true,
+                                              true, global_direct_callback);
+                            terminal_error_emitted = true;
                         }
                     }
 
                     // Check finish conditions
                     if (req->finished || IsStopTokenId(current_model, best_token) ||
                         req->generated_count >= req->max_tokens) {
+                        if (!req->finished) {
+                            if (IsStopTokenId(current_model, best_token)) {
+                                req->decode_finish_cause = DecodeFinishCause::StopToken;
+                            } else if (req->generated_count >= req->max_tokens) {
+                                req->decode_finish_cause = DecodeFinishCause::MaxTokens;
+                            }
+                        }
                         req->finished = true;
                         if (IsMoEPathTraceDumpEnabled() && !IsMoETracePlumbingDisabled()) {
                             const auto forward_calls =
@@ -3528,7 +3771,7 @@ void EngineLoop(EngineState* state) {
                                 std::cerr << std::endl;
                             }
                         }
-                        if (!req_bench_fast_path && !req->utf8_pending.empty() &&
+                        if (!terminal_error_emitted && !req_bench_fast_path && !req->utf8_pending.empty() &&
                             (req->callback || req->token_result_callback)) {
                             const size_t emit_len = Utf8ValidPrefixLength(req->utf8_pending);
                             if (emit_len > 0) {
@@ -3552,15 +3795,22 @@ void EngineLoop(EngineState* state) {
                                 if (!tail.empty() || req->token_result_callback) {
                                     EmitRequestResult(state, req, tail, best_token, false, false,
                                                       global_direct_callback);
+                                    if (!tail.empty()) {
+                                        NoteVisibleEmitProgress(req, decode_sample_time, best_token);
+                                    }
                                 }
                             }
-                            req->utf8_pending.clear();
                         }
+                        FinalizeDecodeSilentFinishReason(req);
+                        LogRequestDecodeSummary(req, current_model);
+                        req->utf8_pending.clear();
                         // Decode graph cache is keyed by batch shape/threading, not request ID.
-                        state->metrics.completed_requests++;
+                        if (!terminal_error_emitted) {
+                            state->metrics.completed_requests++;
+                        }
                         // Push finished signal to callback queue (instead of direct
                         // callback)
-                        if (req->callback || req->token_result_callback) {
+                        if (!terminal_error_emitted && (req->callback || req->token_result_callback)) {
                             EmitRequestResult(state, req, "", -1, true, false, global_direct_callback);
                         }
                         {

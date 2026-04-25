@@ -31,9 +31,16 @@ type ServerConfig struct {
 	RequestTimeout     time.Duration `json:"request_timeout"`
 
 	// Model settings
-	MainModelPath  string `json:"main_model_path"`
-	DraftModelPath string `json:"draft_model_path"`
-	Threads        int    `json:"threads"`
+	MainModelPath    string `json:"main_model_path"`
+	DraftModelPath   string `json:"draft_model_path"`
+	Threads          int    `json:"threads"`
+	EngineThreads    int    `json:"engine_threads"`
+	GoWorkers        int    `json:"go_workers"`
+	ServerInflight   int    `json:"server_inflight"`
+	KVType           string `json:"kv_type"`
+	MaxSeqLen        int    `json:"max_seq_len"`
+	KVTargetMB       int    `json:"kv_target_mb"`
+	BenchmarkProfile string `json:"benchmark_profile"`
 
 	// CPU Optimization
 	EnableCPUAffinity bool `json:"cpu_affinity"`
@@ -77,7 +84,14 @@ func DefaultConfig() *ServerConfig {
 		MaxRequestBodySize: 10 * 1024 * 1024, // 10MB
 		RequestTimeout:     120 * time.Second,
 
-		Threads: 0, // Auto-detect
+		Threads:          0, // Auto-detect
+		EngineThreads:    0,
+		GoWorkers:        0,
+		ServerInflight:   1024,
+		KVType:           "fp16",
+		MaxSeqLen:        0,
+		KVTargetMB:       0,
+		BenchmarkProfile: "",
 
 		EnableCPUAffinity: true,
 		MaxConcurrency:    0, // Auto
@@ -164,6 +178,37 @@ func LoadFromEnv() (*ServerConfig, error) {
 			cfg.Threads = threads
 		}
 	}
+	if v := os.Getenv("DENSECORE_ENGINE_THREADS"); v != "" {
+		if threads, err := strconv.Atoi(v); err == nil {
+			cfg.EngineThreads = threads
+		}
+	}
+	if v := os.Getenv("DENSECORE_GO_WORKERS"); v != "" {
+		if workers, err := strconv.Atoi(v); err == nil {
+			cfg.GoWorkers = workers
+		}
+	}
+	if v := os.Getenv("DENSECORE_SERVER_INFLIGHT"); v != "" {
+		if inflight, err := strconv.Atoi(v); err == nil {
+			cfg.ServerInflight = inflight
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("DENSECORE_KV_TYPE")); v != "" {
+		cfg.KVType = strings.ToLower(v)
+	}
+	if v := os.Getenv("DENSECORE_MAX_SEQ_LEN"); v != "" {
+		if maxSeqLen, err := strconv.Atoi(v); err == nil {
+			cfg.MaxSeqLen = maxSeqLen
+		}
+	}
+	if v := os.Getenv("DENSECORE_KV_TARGET_MB"); v != "" {
+		if targetMB, err := strconv.Atoi(v); err == nil {
+			cfg.KVTargetMB = targetMB
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("DENSECORE_BENCHMARK_PROFILE")); v != "" {
+		cfg.BenchmarkProfile = strings.ToLower(v)
+	}
 	// CPU Optimization
 	if v := os.Getenv("CPU_AFFINITY"); v != "" {
 		cfg.EnableCPUAffinity = strings.ToLower(v) == envValueTrue || v == "1"
@@ -229,6 +274,31 @@ func (c *ServerConfig) Validate() error {
 	if c.Threads < 0 {
 		return fmt.Errorf("invalid threads: %d", c.Threads)
 	}
+	if c.EngineThreads < 0 {
+		return fmt.Errorf("invalid engine threads: %d", c.EngineThreads)
+	}
+	if c.GoWorkers < 0 {
+		return fmt.Errorf("invalid go workers: %d", c.GoWorkers)
+	}
+	if c.ServerInflight <= 0 {
+		return fmt.Errorf("invalid server inflight: %d", c.ServerInflight)
+	}
+	if c.MaxSeqLen < 0 {
+		return fmt.Errorf("invalid max seq len: %d", c.MaxSeqLen)
+	}
+	if c.KVTargetMB < 0 {
+		return fmt.Errorf("invalid kv target mb: %d", c.KVTargetMB)
+	}
+	switch c.KVType {
+	case "", "fp16", "q8_0", "q4_0":
+	default:
+		return fmt.Errorf("invalid kv type: %s", c.KVType)
+	}
+	switch c.BenchmarkProfile {
+	case "", "single-e2e", "native-runtime", "go-server":
+	default:
+		return fmt.Errorf("invalid benchmark profile: %s", c.BenchmarkProfile)
+	}
 	if c.RateLimitReqPerSec < 0 {
 		return fmt.Errorf("invalid rate limit: %d", c.RateLimitReqPerSec)
 	}
@@ -243,7 +313,7 @@ func (c *ServerConfig) Address() string {
 // String returns a human-readable config summary
 func (c *ServerConfig) String() string {
 	return fmt.Sprintf(
-		"Config{addr=%s, profile=%s, llm_api=%v, threads=%d, rate_limit=%v(%d/s), timeout=%v}",
-		c.Address(), c.WorkloadProfile, c.LLMAPIEnabled, c.Threads, c.RateLimitEnabled, c.RateLimitReqPerSec, c.RequestTimeout,
+		"Config{addr=%s, profile=%s, llm_api=%v, threads=%d, engine_threads=%d, go_workers=%d, inflight=%d, kv_type=%s, benchmark=%s, rate_limit=%v(%d/s), timeout=%v}",
+		c.Address(), c.WorkloadProfile, c.LLMAPIEnabled, c.Threads, c.EngineThreads, c.GoWorkers, c.ServerInflight, c.KVType, c.BenchmarkProfile, c.RateLimitEnabled, c.RateLimitReqPerSec, c.RequestTimeout,
 	)
 }

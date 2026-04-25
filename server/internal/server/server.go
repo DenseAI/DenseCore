@@ -82,6 +82,35 @@ func (c denseCoreMetricsCollector) AppendPrometheus(builder *strings.Builder) {
 	builder.WriteString(c.handler.RenderMetrics())
 }
 
+func applyBenchmarkProfileDefaults(cfg *config.ServerConfig, cpuCfg *engine.CPUConfig) {
+	if cfg == nil {
+		return
+	}
+
+	switch cfg.BenchmarkProfile {
+	case "single-e2e":
+		if strings.TrimSpace(os.Getenv("DENSECORE_ENGINE_THREADS")) == "" && cfg.EngineThreads <= 0 && cpuCfg != nil {
+			cfg.EngineThreads = cpuCfg.OptimalThreadCount()
+			if cfg.EngineThreads > 16 {
+				cfg.EngineThreads = 16
+			}
+		}
+		if strings.TrimSpace(os.Getenv("DENSECORE_GO_WORKERS")) == "" && cfg.GoWorkers <= 0 {
+			cfg.GoWorkers = 1
+		}
+		if strings.TrimSpace(os.Getenv("DENSECORE_SERVER_INFLIGHT")) == "" && cfg.ServerInflight == 1024 {
+			cfg.ServerInflight = 1
+		}
+	case "go-server":
+		if strings.TrimSpace(os.Getenv("DENSECORE_GO_WORKERS")) == "" && cfg.GoWorkers <= 0 {
+			cfg.GoWorkers = 1
+		}
+		if strings.TrimSpace(os.Getenv("DENSECORE_SERVER_INFLIGHT")) == "" && cfg.ServerInflight == 1024 {
+			cfg.ServerInflight = 1
+		}
+	}
+}
+
 // Shutdown gracefully shuts down the server.
 func (s *ServerInstance) Shutdown(ctx context.Context) error {
 	if s == nil {
@@ -242,12 +271,28 @@ func Run(opts *Options) error {
 	// Detect and apply CPU configuration
 	cpuCfg := engine.DetectCPUConfig()
 	cpuCfg.Apply()
+	applyBenchmarkProfileDefaults(cfg, cpuCfg)
 
-	threads := cfg.Threads
+	threads := cfg.EngineThreads
+	if threads == 0 {
+		threads = cfg.Threads
+	}
 	if threads == 0 {
 		threads = cpuCfg.OptimalThreadCount()
 	}
-	slog.Info("inference threads configured", slog.Int("threads", threads))
+	goWorkers := cfg.GoWorkers
+	if goWorkers == 0 {
+		goWorkers = threads
+	}
+	slog.Info("runtime tuning configured",
+		slog.String("benchmark_profile", cfg.BenchmarkProfile),
+		slog.Int("engine_threads", threads),
+		slog.Int("go_workers", goWorkers),
+		slog.Int("server_inflight", cfg.ServerInflight),
+		slog.String("kv_type", cfg.KVType),
+		slog.Int("max_seq_len", cfg.MaxSeqLen),
+		slog.Int("kv_target_mb", cfg.KVTargetMB),
+	)
 
 	// Initialize services
 	modelService := service.NewModelService()
@@ -300,9 +345,9 @@ func Run(opts *Options) error {
 			slog.Info("no model path specified, use /v1/models/load to load a model")
 		}
 
-		requestQueue = queue.NewRequestQueue(1024)
+		requestQueue = queue.NewRequestQueue(cfg.ServerInflight)
 		workerPool = service.NewQueueProcessor(requestQueue, modelService)
-		workerPool.Start(threads)
+		workerPool.Start(goWorkers)
 		registerStartupRollback("worker pool", func(context.Context) error {
 			workerPool.Stop()
 			return nil
@@ -320,6 +365,15 @@ func Run(opts *Options) error {
 		api.WithMetricsNamespace(cfg.MetricsNamespace),
 		api.WithModelLifecycleProbes(cfg.ModelLifecycleProbesEnabled),
 		api.WithLLMAPIEnabled(cfg.LLMAPIEnabled),
+		api.WithRuntimeTuningProfile(api.RuntimeTuningProfile{
+			BenchmarkProfile: cfg.BenchmarkProfile,
+			EngineThreads:    threads,
+			GoWorkers:        goWorkers,
+			ServerInflight:   cfg.ServerInflight,
+			KVType:           cfg.KVType,
+			MaxSeqLen:        cfg.MaxSeqLen,
+			KVTargetMB:       cfg.KVTargetMB,
+		}),
 	}
 	if requestQueue != nil {
 		handlerOptions = append(handlerOptions, api.WithQueueStatsProvider(requestQueue))
@@ -470,8 +524,8 @@ func Run(opts *Options) error {
 		APIMux:      apiMux,
 		APIBasePath: "/v1",
 		RootMiddleware: []func(http.Handler) http.Handler{
-			cloudmw.Recovery(),
 			cloudmw.RequestID(),
+			cloudmw.Recovery(),
 			cloudmw.RequestTimeout(cfg.RequestTimeout),
 			cloudmw.Tracing("densecore-server"),
 			cloudmw.Logging(),

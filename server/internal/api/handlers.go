@@ -58,6 +58,17 @@ type Handler struct {
 	modelLifecycleProbes bool
 	llmAPIEnabled        bool
 	queueStatsProvider   QueueStatsProvider
+	runtimeTuning        RuntimeTuningProfile
+}
+
+type RuntimeTuningProfile struct {
+	BenchmarkProfile string `json:"benchmark_profile"`
+	EngineThreads    int    `json:"engine_threads"`
+	GoWorkers        int    `json:"go_workers"`
+	ServerInflight   int    `json:"server_inflight"`
+	KVType           string `json:"kv_type"`
+	MaxSeqLen        int    `json:"max_seq_len,omitempty"`
+	KVTargetMB       int    `json:"kv_target_mb,omitempty"`
 }
 
 // QueueStatsProvider exposes queue statistics for metrics and status endpoints.
@@ -97,6 +108,12 @@ func WithLLMAPIEnabled(enabled bool) HandlerOption {
 func WithQueueStatsProvider(provider QueueStatsProvider) HandlerOption {
 	return func(h *Handler) {
 		h.queueStatsProvider = provider
+	}
+}
+
+func WithRuntimeTuningProfile(profile RuntimeTuningProfile) HandlerOption {
+	return func(h *Handler) {
+		h.runtimeTuning = profile
 	}
 }
 
@@ -295,17 +312,32 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().Unix())
 	created := time.Now().Unix()
 	streamStarted := false
+	terminalSeen := false
 
 	for {
 		select {
 		case event, ok := <-outputChan:
 			if !ok {
+				if !terminalSeen {
+					err := <-errChan
+					if err == nil {
+						err = domain.ErrStreamClosedWithoutTerminal
+					}
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
+					return
+				}
 				if err := <-errChan; err != nil {
 					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 				}
 				return
 			}
-			if event.IsFinished {
+			if event.Terminal {
+				terminalSeen = true
+				if err := event.TerminalError(); err != nil {
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
+					<-errChan
+					return
+				}
 				if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
 					slog.Debug("SSE write error", slog.String("error", err.Error()))
 				}
@@ -377,17 +409,32 @@ func (h *Handler) handleCompletionStream(ctx context.Context, w http.ResponseWri
 	id := fmt.Sprintf("cmpl-%d", time.Now().Unix())
 	created := time.Now().Unix()
 	streamStarted := false
+	terminalSeen := false
 
 	for {
 		select {
 		case event, ok := <-outputChan:
 			if !ok {
+				if !terminalSeen {
+					err := <-errChan
+					if err == nil {
+						err = domain.ErrStreamClosedWithoutTerminal
+					}
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
+					return
+				}
 				if err := <-errChan; err != nil {
 					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 				}
 				return
 			}
-			if event.IsFinished {
+			if event.Terminal {
+				terminalSeen = true
+				if err := event.TerminalError(); err != nil {
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
+					<-errChan
+					return
+				}
 				if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
 					slog.Debug("SSE write error", slog.String("error", err.Error()))
 				}
@@ -443,25 +490,13 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 		errChan <- h.chatService.GenerateStream(ctx, req, outputChan)
 	}()
 
-	// Use strings.Builder for efficient concatenation
-	var responseBuilder strings.Builder
-	completionTokens := 0
-	for event := range outputChan {
-		if event.Token != "" {
-			responseBuilder.WriteString(event.Token)
-			completionTokens++
-		}
-		if event.IsFinished {
-			break
-		}
-	}
-	if err := <-errChan; err != nil {
+	responseText, completionTokens, err := collectSyncStream(outputChan, errChan)
+	if err != nil {
 		message, errType, code, statusCode := classifyGenerationError(err)
 		sendError(w, message, errType, code, statusCode)
 		return
 	}
 
-	responseText := responseBuilder.String()
 	promptTokens := h.countChatPromptTokens(req)
 	resp := domain.ChatCompletionResponse{
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
@@ -498,24 +533,13 @@ func (h *Handler) handleCompletionSync(ctx context.Context, w http.ResponseWrite
 		errChan <- h.chatService.GenerateStream(ctx, req, outputChan)
 	}()
 
-	var responseBuilder strings.Builder
-	completionTokens := 0
-	for event := range outputChan {
-		if event.Token != "" {
-			responseBuilder.WriteString(event.Token)
-			completionTokens++
-		}
-		if event.IsFinished {
-			break
-		}
-	}
-	if err := <-errChan; err != nil {
+	responseText, completionTokens, err := collectSyncStream(outputChan, errChan)
+	if err != nil {
 		message, errType, code, statusCode := classifyGenerationError(err)
 		sendError(w, message, errType, code, statusCode)
 		return
 	}
 
-	responseText := responseBuilder.String()
 	promptTokens := h.countTextTokens([]string{prompt}, true, false)
 	resp := domain.CompletionResponse{
 		ID:      fmt.Sprintf("cmpl-%d", time.Now().Unix()),
@@ -540,6 +564,37 @@ func (h *Handler) handleCompletionSync(ctx context.Context, w http.ResponseWrite
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		slog.Error("failed to encode response", slog.String("error", err.Error()))
 	}
+}
+
+func collectSyncStream(outputChan <-chan domain.StreamEvent, errChan <-chan error) (string, int, error) {
+	var responseBuilder strings.Builder
+	completionTokens := 0
+	terminalSeen := false
+
+	for event := range outputChan {
+		if event.Token != "" {
+			responseBuilder.WriteString(event.Token)
+			completionTokens++
+		}
+		if !event.Terminal {
+			continue
+		}
+		terminalSeen = true
+		if err := event.TerminalError(); err != nil {
+			<-errChan
+			return "", 0, err
+		}
+		break
+	}
+
+	if err := <-errChan; err != nil {
+		return "", 0, err
+	}
+	if !terminalSeen {
+		return "", 0, domain.ErrStreamClosedWithoutTerminal
+	}
+
+	return responseBuilder.String(), completionTokens, nil
 }
 
 func (h *Handler) EmbeddingsHandler(w http.ResponseWriter, r *http.Request) {
@@ -880,6 +935,7 @@ func (h *Handler) RuntimeProfileHandler(w http.ResponseWriter, r *http.Request) 
 		"model_lifecycle_probes_enabled": h.modelLifecycleProbes,
 		"metrics_namespace":              h.metricsNamespace,
 		"timestamp":                      time.Now().UTC().Format(time.RFC3339),
+		"runtime_tuning":                 h.runtimeTuning,
 	}
 	if h.queueStatsProvider != nil {
 		stats := h.queueStatsProvider.Stats()

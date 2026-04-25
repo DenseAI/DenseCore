@@ -9,12 +9,12 @@
 #include <string>
 #include <vector>
 
-#include "flash_attention.h"
-#include "densecore/inference_types_internal.h"
+#include "densecore/backend/flash_attention.h"
+#include "runtime/inference_types_internal.h"
 #include "ggml.h"
-#include "inference.h"
-#include "kv_cache.h"
-#include "model_types.h"
+#include "densecore/runtime/inference.h"
+#include "densecore/memory/kv_cache.h"
+#include "densecore/models/model_types.h"
 
 namespace densecore::testing {
 std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float>& q,
@@ -59,6 +59,43 @@ public:
     }
 
     ~ScopedFlashAttentionDisableForTest() { densecore::testing::SetFlashAttentionDisabledForTest(false); }
+};
+
+class ScopedEnvOverride {
+public:
+    ScopedEnvOverride(const char* name, const char* value) : name_(name ? name : "") {
+        const char* prev = std::getenv(name_.c_str());
+        if (prev) {
+            had_prev_ = true;
+            prev_value_ = prev;
+        }
+        Set(value);
+    }
+
+    ~ScopedEnvOverride() {
+        if (had_prev_) {
+            Set(prev_value_.c_str());
+        } else {
+            Set(nullptr);
+        }
+    }
+
+private:
+    void Set(const char* value) {
+#ifdef _WIN32
+        _putenv_s(name_.c_str(), value ? value : "");
+#else
+        if (value) {
+            setenv(name_.c_str(), value, 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+#endif
+    }
+
+    std::string name_;
+    bool had_prev_ = false;
+    std::string prev_value_;
 };
 
 void SetTensorData(struct ggml_tensor* tensor, const std::vector<float>& data) {
@@ -508,6 +545,27 @@ TEST(Gemma4FallbackDecodeTest, GraphLevelDecodeFallbackRespectsSlidingMask) {
     EXPECT_LT(full_logits[0], 1.0f);
 }
 
+TEST(Gemma4FallbackDecodeTest, PagedDecodeSlidingLayerProducesFiniteAttentionOutput) {
+    ScopedFlashAttentionDisableForTest flash_guard;
+    auto model = MakeSlidingDecodeGraphModel(/*sliding_enabled=*/true);
+    auto cache = MakeTinyGraphCache(model.get());
+    ASSERT_NE(cache, nullptr);
+
+    const int block_id = cache->block_manager->AllocateSingle();
+    ASSERT_GE(block_id, 0);
+
+    const std::vector<SlotVec> history_k = {{{10.0f, 0.0f}}, {{10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> history_v = {{{100.0f, 0.0f}}, {{0.0f, 100.0f}}, {{0.0f, 1.0f}}, {{0.0f, 0.0f}}};
+    WriteLayerSlots(cache.get(), /*layer=*/0, block_id, history_k, history_v);
+
+    const std::vector<float> paged_logits =
+        RunDecodeAttentionGraph(model.get(), cache.get(), block_id, /*target_layer=*/0);
+
+    ASSERT_EQ(paged_logits.size(), 2u);
+    EXPECT_TRUE(std::isfinite(paged_logits[0]));
+    EXPECT_TRUE(std::isfinite(paged_logits[1]));
+}
+
 TEST(Gemma4FallbackDecodeTest, SharedKvDecodeUsesSourceLayerAndStillAppliesSlidingMask) {
     ScopedFlashAttentionDisableForTest flash_guard;
     auto shared_model = MakeSharedKvGraphModel(/*shared_layer_1=*/true, /*sliding_enabled=*/true);
@@ -649,6 +707,35 @@ TEST(Gemma4FallbackDecodeTest, SharedKvDecodeDoesNotWriteLocalSharedLayerCache) 
     const SlotVec after_source_v = ReadVSlotVec(shared_cache.get(), /*layer=*/0, block_id, /*slot=*/3);
     const SlotVec after_local_v = ReadVSlotVec(shared_cache.get(), /*layer=*/1, block_id, /*slot=*/3);
 
+    EXPECT_EQ(after_local_k, before_local_k);
+    EXPECT_EQ(after_local_v, before_local_v);
+}
+
+TEST(Gemma4FallbackDecodeTest, PagedDecodeSharedKvDoesNotWriteLocalCache) {
+    ScopedFlashAttentionDisableForTest flash_guard;
+    auto model = MakeSharedKvGraphModel(/*shared_layer_1=*/true, /*sliding_enabled=*/true);
+    auto cache = MakeTinyGraphCache(model.get());
+    ASSERT_NE(cache, nullptr);
+
+    const int block_id = cache->block_manager->AllocateSingle();
+    ASSERT_GE(block_id, 0);
+
+    const std::vector<SlotVec> source_k = {{{-10.0f, 0.0f}}, {{-10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> source_v = {{{100.0f, 0.0f}}, {{0.0f, 100.0f}}, {{0.0f, 1.0f}}, {{0.0f, 0.0f}}};
+    const std::vector<SlotVec> local_k = {{{-10.0f, 0.0f}}, {{-10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{77.0f, 88.0f}}};
+    const std::vector<SlotVec> local_v = {{{100.0f, 0.0f}}, {{100.0f, 0.0f}}, {{4.0f, 0.0f}}, {{55.0f, 66.0f}}};
+
+    WriteLayerSlots(cache.get(), /*layer=*/0, block_id, source_k, source_v);
+    WriteLayerSlots(cache.get(), /*layer=*/1, block_id, local_k, local_v);
+
+    const SlotVec before_local_k = ReadKSlotVec(cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+    const SlotVec before_local_v = ReadVSlotVec(cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+    const std::vector<float> paged_logits =
+        RunDecodeAttentionGraph(model.get(), cache.get(), block_id, /*target_layer=*/1);
+    const SlotVec after_local_k = ReadKSlotVec(cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+    const SlotVec after_local_v = ReadVSlotVec(cache.get(), /*layer=*/1, block_id, /*slot=*/3);
+
+    ASSERT_EQ(paged_logits.size(), 2u);
     EXPECT_EQ(after_local_k, before_local_k);
     EXPECT_EQ(after_local_v, before_local_v);
 }

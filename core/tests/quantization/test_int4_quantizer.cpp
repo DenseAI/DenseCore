@@ -10,8 +10,8 @@
 #include <vector>
 
 #include "quantization/int4_quantizer.h"
-#include "quantization_config.h"
-#include "quantizer.h"
+#include "densecore/quantization/quantization_config.h"
+#include "densecore/quantization/quantizer.h"
 
 namespace densecore {
 namespace {

@@ -1,4 +1,4 @@
-#include "simd_ops.h"
+#include "densecore/simd/simd_ops.h"
 #include <cmath>
 #include <gtest/gtest.h>
 #include <random>

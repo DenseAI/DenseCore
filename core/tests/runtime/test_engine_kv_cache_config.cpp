@@ -3,7 +3,7 @@
 #include <cstdlib>
 #include <string>
 
-#include "engine_internal.h"
+#include "runtime/engine_internal.h"
 
 namespace {
 
@@ -218,6 +218,7 @@ TEST(EngineKVCacheConfig, HybridSsmGraphContextKeepsBatchFourHeadroom) {
     ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
     ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
     ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", nullptr);
+    ScopedEnvVar graph_ctx_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "8192");
 
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
@@ -231,4 +232,77 @@ TEST(EngineKVCacheConfig, HybridSsmGraphContextKeepsBatchFourHeadroom) {
     const size_t graph_ctx_bytes = EngineState::CalculateGraphContextSize(&model);
     EXPECT_GE(graph_ctx_bytes, static_cast<size_t>(4096) * 1024 * 1024)
         << "Hybrid Qwen3.5 batch decode graph context regressed below the known-safe 4 GB floor";
+}
+
+TEST(EngineKVCacheConfig, HybridSsmGraphContextCanGrowBeyondLaptopCeilingWhenMemoryAllows) {
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "4096");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+    ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
+    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", nullptr);
+    ScopedEnvVar graph_ctx_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "32768");
+
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_embd = 2048;
+    model.hparams.n_layer = 24;
+    model.hparams.n_head = 8;
+    model.hparams.n_ctx = 262144;
+    model.ssm_inner_size = 2048;
+
+    const size_t graph_ctx_bytes = EngineState::CalculateGraphContextSize(&model);
+    EXPECT_GT(graph_ctx_bytes, static_cast<size_t>(4096) * 1024 * 1024)
+        << "Adaptive graph context sizing should grow past the 4 GB laptop-era ceiling when host memory allows it";
+    EXPECT_LE(graph_ctx_bytes, static_cast<size_t>(16) * 1024 * 1024 * 1024)
+        << "Adaptive graph context sizing must still respect the hard 16 GB safety cap";
+}
+
+TEST(EngineKVCacheConfig, GraphContextHonorsExtraHeadroomEnv) {
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "1024");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+    ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
+    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", "4096");
+    ScopedEnvVar graph_ctx_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "16384");
+    ScopedEnvVar graph_ctx_extra_zero("DENSECORE_GRAPH_CTX_EXTRA_MB", "0");
+
+    TransformerModel model{};
+    model.arch = ModelArch::LLAMA;
+    model.hparams.n_embd = 1024;
+    model.hparams.n_layer = 8;
+    model.hparams.n_head = 8;
+    model.hparams.n_ctx = 8192;
+
+    const size_t without_extra = EngineState::CalculateGraphContextSize(&model);
+
+    ScopedEnvVar graph_ctx_extra_64("DENSECORE_GRAPH_CTX_EXTRA_MB", "64");
+    const size_t with_extra = EngineState::CalculateGraphContextSize(&model);
+
+    EXPECT_GE(with_extra, without_extra + static_cast<size_t>(64) * 1024 * 1024)
+        << "DENSECORE_GRAPH_CTX_EXTRA_MB should increase graph context budget";
+}
+
+TEST(EngineKVCacheConfig, HybridSsmGraphContextGrowsForLongContextHint) {
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "4096");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+    ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
+    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", "16384");
+    ScopedEnvVar graph_ctx_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "65536");
+
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_embd = 2048;
+    model.hparams.n_layer = 24;
+    model.hparams.n_head = 8;
+    model.hparams.n_ctx = 262144;
+    model.ssm_inner_size = 2048;
+
+    const auto default_estimate = EngineState::EstimateGraphContextSize(&model);
+    const auto long_hint_estimate = EngineState::EstimateGraphContextSize(&model, /*seq_len_hint=*/16384,
+                                                                          /*num_seqs_hint=*/1,
+                                                                          /*chunk_token_hint=*/2048);
+
+    EXPECT_GT(long_hint_estimate.effective_seq_len, default_estimate.effective_seq_len);
+    EXPECT_GE(long_hint_estimate.long_context_safety_pad_bytes, default_estimate.long_context_safety_pad_bytes);
+    EXPECT_GE(long_hint_estimate.total_bytes, default_estimate.total_bytes);
 }

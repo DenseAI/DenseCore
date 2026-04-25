@@ -3,11 +3,12 @@
 #include <cstdlib>
 #include <string>
 
-#include "inference.h"
-#include "model_types.h"
+#include "densecore/runtime/inference.h"
+#include "densecore/models/model_types.h"
 #include "models/model_inference_policy.h"
-#include "kv_cache.h"
-#include "worker_internal.h"
+#include "densecore/memory/kv_cache.h"
+#include "runtime/runtime_env.h"
+#include "runtime/worker_internal.h"
 
 namespace densecore::testing {
 extern bool ShouldUsePagedDecodeAttentionForBatchTest(const TransformerModel* model, const PagedKVCache* cache,
@@ -46,6 +47,17 @@ TransformerModel MakeDecodeModel(bool gemma4) {
     model.arch = gemma4 ? ModelArch::GEMMA : ModelArch::LLAMA;
     model.arch_flags.is_gemma4 = gemma4;
     model.hparams.n_embd = 1024;
+    model.hparams.n_head = 16;
+    model.hparams.n_head_kv = 8;
+    return model;
+}
+
+TransformerModel MakeQwen36HybridDecodeModel() {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_embd = 2048;
     model.hparams.n_head = 16;
     model.hparams.n_head_kv = 8;
     return model;
@@ -128,26 +140,37 @@ bool ShouldUsePagedDecodeAttentionForTestBatch(const TransformerModel* model, in
 
 }  // namespace
 
-TEST(DecodeGraphCachePolicyTest, Gemma4DisablesPagedDecodeSupportMonotonically) {
+TEST(DecodeGraphCachePolicyTest, Gemma4PagedDecodeSupportIsEnabledByDefault) {
     const TransformerModel gemma4 = MakeDecodeModel(true);
     const TransformerModel llama = MakeDecodeModel(false);
 
-    EXPECT_FALSE(densecore::models::SupportsPagedDecodeAttention(&gemma4));
+    EXPECT_TRUE(densecore::models::SupportsPagedDecodeAttention(&gemma4));
     EXPECT_TRUE(densecore::models::SupportsPagedDecodeAttention(&llama));
 }
 
-TEST(DecodeGraphCachePolicyTest, Gemma4BatchedDecodeTopologyIsNotTreatedAsStablePagedDecode) {
+TEST(DecodeGraphCachePolicyTest, Gemma4BatchedDecodeTopologyIsStableByDefault) {
     const TransformerModel gemma4 = MakeDecodeModel(true);
     const BatchSpec batch = MakeDecodeOnlyBatch(/*num_seqs=*/2, /*n_past=*/BLOCK_SIZE);
     PagedKVCache cache{};
     cache.cache_type = GGML_TYPE_F16;
     cache.max_blocks = 8;
 
-    EXPECT_FALSE(IsStablePagedDecodeTopologyForCache(&gemma4, &cache, batch));
+    EXPECT_TRUE(IsStablePagedDecodeTopologyForCache(&gemma4, &cache, batch));
 }
 
-TEST(DecodeGraphCachePolicyTest, Gemma4InferenceDecisionRejectsPagedDecodeForValidBatchedCandidate) {
+TEST(DecodeGraphCachePolicyTest, Gemma4InferenceDecisionUsesPagedDecodeByDefault) {
     const TransformerModel gemma4 = MakeDecodeModel(true);
+    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
+    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
+    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "on");
+    ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", nullptr);
+
+    EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&gemma4));
+}
+
+TEST(DecodeGraphCachePolicyTest, Gemma4InferenceDecisionCanFallBackToDenseBaselineEscapeHatch) {
+    const TransformerModel gemma4 = MakeDecodeModel(true);
+    ScopedEnvOverride dense_baseline_env("DENSECORE_GEMMA4_FORCE_DENSE_BASELINE", "1");
     ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
     ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
     ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "on");
@@ -196,6 +219,26 @@ TEST(DecodeGraphCachePolicyTest, NonGemmaInferenceDecisionUsesPagedDecodeWhenPol
     EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&llama));
 }
 
+TEST(RuntimeEnvTest, ParseTruthyEnvTreatsUnknownPresentValueAsFalse) {
+    ScopedEnvOverride mode_env("DENSECORE_TEST_TRUTHY_ENV", "maybe");
+    EXPECT_FALSE(densecore::env::ParseTruthyEnv("DENSECORE_TEST_TRUTHY_ENV", true));
+}
+
+TEST(RuntimeEnvTest, ParseRuntimeToggleModeNormalizesCommonAliases) {
+    ScopedEnvOverride on_env("DENSECORE_TEST_TOGGLE_ENV", "FORCE");
+    EXPECT_EQ(densecore::env::ParseRuntimeToggleMode("DENSECORE_TEST_TOGGLE_ENV",
+                                                     densecore::env::RuntimeToggleMode::Auto),
+              densecore::env::RuntimeToggleMode::On);
+}
+
+TEST(RuntimeEnvTest, ParsePositiveEnvIntRejectsZeroAndGarbage) {
+    ScopedEnvOverride zero_env("DENSECORE_TEST_INT_ENV", "0");
+    EXPECT_EQ(densecore::env::ParsePositiveEnvInt("DENSECORE_TEST_INT_ENV", 17), 17);
+
+    ScopedEnvOverride garbage_env("DENSECORE_TEST_INT_ENV", "abc");
+    EXPECT_EQ(densecore::env::ParsePositiveEnvInt("DENSECORE_TEST_INT_ENV", 23), 23);
+}
+
 TEST(DecodeGraphCachePolicyTest, AutoModeAllowsShortBatchedDecodeWithSeparateThreshold) {
     const TransformerModel llama = MakeDecodeModel(false);
     ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
@@ -216,4 +259,20 @@ TEST(DecodeGraphCachePolicyTest, AutoModeKeepsShortSingleDecodeOnStandardPath) {
     ScopedEnvOverride min_batch_ctx_env("DENSECORE_PAGED_DECODE_MIN_BATCH_CONTEXT", "64");
 
     EXPECT_FALSE(ShouldUsePagedDecodeAttentionForTestBatch(&llama, /*num_seqs=*/1, /*n_past=*/63));
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36SingleDecodeTopologyIsCacheStableWithoutForcedPagedDecode) {
+    const TransformerModel qwen36 = MakeQwen36HybridDecodeModel();
+    const BatchSpec batch = MakeDecodeOnlyBatch(/*num_seqs=*/1, /*n_past=*/63);
+    PagedKVCache cache{};
+    cache.cache_type = GGML_TYPE_F16;
+    cache.max_blocks = 8;
+
+    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
+    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
+    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "auto");
+    ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", "128");
+    ScopedEnvOverride min_batch_ctx_env("DENSECORE_PAGED_DECODE_MIN_BATCH_CONTEXT", "64");
+
+    EXPECT_TRUE(IsStablePagedDecodeTopologyForCache(&qwen36, &cache, batch));
 }

@@ -31,6 +31,8 @@ type preparedPrompt struct {
 	rawPassthroughUsed   bool
 	tokenizerType        string
 	chatTemplate         string
+	modelVariant         string
+	promptFamily         string
 }
 
 func NewChatService(modelService domain.ModelService, q *queue.RequestQueue) *ChatService {
@@ -72,39 +74,82 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 		return err
 	}
 
+	logQwen36 := isQwen36Request(modelHint, prepared.modelVariant)
+	visibleChunks := 0
+	visibleChars := 0
+
 	defer close(outputChan)
 	for {
 		select {
 		case event, ok := <-stream:
 			if !ok {
-				return nil
+				if logQwen36 {
+					slog.Info("qwen36 chat stream finished without terminal",
+						slog.Int("visible_chunks", visibleChunks),
+						slog.Int("visible_chars", visibleChars),
+					)
+				}
+				return domain.ErrStreamClosedWithoutTerminal
 			}
-			if event.Err != nil {
-				return event.Err
+			if event.Token != "" {
+				visibleChunks++
+				visibleChars += len(event.Token)
 			}
 			outputChan <- event
+			if event.Terminal {
+				if logQwen36 {
+					fields := []any{
+						slog.Int("visible_chunks", visibleChunks),
+						slog.Int("visible_chars", visibleChars),
+						slog.Bool("canceled", event.Canceled),
+					}
+					if err := event.TerminalError(); err != nil {
+						fields = append(fields, slog.String("terminal_error", err.Error()))
+					}
+					slog.Info("qwen36 chat stream terminal", fields...)
+				}
+				if err := event.TerminalError(); err != nil {
+					return err
+				}
+				return nil
+			}
 		case <-ctx.Done():
+			if logQwen36 {
+				slog.Info("qwen36 chat stream context done",
+					slog.Int("visible_chunks", visibleChunks),
+					slog.Int("visible_chars", visibleChars),
+					slog.String("error", ctx.Err().Error()),
+				)
+			}
 			return ctx.Err()
 		}
 	}
 }
 
 func (s *ChatService) preparePrompt(engine domain.Engine, req domain.ChatCompletionRequest, modelHint string) (preparedPrompt, error) {
+	profile := resolvePromptProfileWithMetadata(modelHint, engine.GetTokenizerType(), engine.GetChatTemplate())
 	prepared := preparedPrompt{
 		prompt:        req.RawPrompt,
 		promptSource:  "request_raw_prompt",
 		tokenizerType: engine.GetTokenizerType(),
 		chatTemplate:  engine.GetChatTemplate(),
+		modelVariant:  inferModelVariantHint(modelHint),
+		promptFamily:  promptFamilyName(profile.family),
+	}
+	if err := validateTextOnlyStructuredContent(modelHint, req.Messages); err != nil {
+		return prepared, err
 	}
 	if req.RawPrompt != "" {
 		return prepared, nil
 	}
 
 	var enableThinking *bool
+	var preserveThinking *bool
 	if req.ChatTemplateKwargs != nil {
 		enableThinking = req.ChatTemplateKwargs.EnableThinking
+		preserveThinking = req.ChatTemplateKwargs.PreserveThinking
 	}
-	rendered, err := engine.RenderChatPrompt(req.Messages, enableThinking)
+	rendered, err := engine.RenderChatPrompt(req.Messages, enableThinking, preserveThinking)
 	if err != nil {
 		return prepared, err
 	}
@@ -115,6 +160,8 @@ func (s *ChatService) preparePrompt(engine domain.Engine, req domain.ChatComplet
 	prepared.renderedTemplateUsed = true
 	prepared.tokenizerType = firstNonEmpty(rendered.TokenizerType, prepared.tokenizerType)
 	prepared.chatTemplate = firstNonEmpty(rendered.ChatTemplate, prepared.chatTemplate)
+	prepared.modelVariant = firstNonEmpty(rendered.ModelVariant, prepared.modelVariant)
+	prepared.promptFamily = firstNonEmpty(rendered.PromptFamily, prepared.promptFamily)
 
 	if !req.ParityMode && shouldPassThroughRawPrompt(modelHint, prepared.tokenizerType, prepared.chatTemplate, req.Messages, req.ChatTemplateKwargs) {
 		prepared.prompt = ExtractPrompt(req.Messages)
@@ -130,12 +177,13 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 	temperature, topP, topK, repetitionPenalty := s.normalizeSampling(modelHint, prepared.tokenizerType, prepared.chatTemplate, req)
 	engine := s.modelService.GetEngine()
 	exactAnswer := deriveExactAnswerConstraint(engine, req)
+	qualityProfile := resolveChatQualityProfile(modelHint, prepared.tokenizerType, prepared.chatTemplate, req, exactAnswer)
 	allowedTokenIDs := req.AllowedTokenIDs
 	allowedTokensStrict := req.AllowedTokensStrict
 	maxTokens := req.MaxTokens
 	if exactAnswer != nil && exactAnswer.text != "" && len(exactAnswer.allowedTokenIDs) == 0 {
 		s.logPromptPathDebug(engine, req, modelHint, prepared, temperature, topP, topK, repetitionPenalty,
-			allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, true)
+			allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, qualityProfile, true)
 		return syntheticExactAnswerStream(ctx, exactAnswer.text), nil
 	}
 	if exactAnswer != nil {
@@ -153,7 +201,7 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 		}
 	}
 	s.logPromptPathDebug(engine, req, modelHint, prepared, temperature, topP, topK, repetitionPenalty,
-		allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, false)
+		allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, qualityProfile, false)
 
 	queuedReq := &queue.QueuedRequest{
 		ID:                  uuid.New().String(),
@@ -203,6 +251,17 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 			slog.Int("input_ids", len(queuedReq.InputIDs)),
 		)
 	}
+	if isQwen36Request(modelHint, prepared.modelVariant) {
+		slog.Info("qwen36 chat request enqueued",
+			slog.String("trace_id", queuedReq.TraceID),
+			slog.String("queue_request_id", queuedReq.ID),
+			slog.String("prompt_source", prepared.promptSource),
+			slog.String("prompt_family", prepared.promptFamily),
+			slog.Int("max_tokens", queuedReq.MaxTokens),
+			slog.Int("prompt_len", len(queuedReq.Prompt)),
+			slog.Int("input_ids", len(queuedReq.InputIDs)),
+		)
+	}
 
 	if !s.requestQueue.Enqueue(queuedReq) {
 		return nil, domain.ErrServiceBusy
@@ -225,7 +284,7 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 
 func (s *ChatService) logPromptPathDebug(engine domain.Engine, req domain.ChatCompletionRequest, modelHint string,
 	prepared preparedPrompt, temperature, topP float64, topK int, repetitionPenalty float64,
-	allowedTokenIDs []int, allowedTokensStrict bool, maxTokens int, exactAnswer *exactAnswerConstraint,
+	allowedTokenIDs []int, allowedTokensStrict bool, maxTokens int, exactAnswer *exactAnswerConstraint, qualityProfile string,
 	syntheticExactAnswer bool) {
 	if !chatPathDebugEnabled() {
 		return
@@ -251,8 +310,11 @@ func (s *ChatService) logPromptPathDebug(engine domain.Engine, req domain.ChatCo
 		slog.Bool("rendered_chat_template", prepared.renderedTemplateUsed),
 		slog.Bool("raw_passthrough", prepared.rawPassthroughUsed),
 		slog.String("tokenizer_type", prepared.tokenizerType),
+		slog.String("model_variant", prepared.modelVariant),
+		slog.String("prompt_family", prepared.promptFamily),
 		slog.String("chat_template_id", templateID),
 		slog.String("chat_template_hash", templateHash),
+		slog.String("quality_profile", qualityProfile),
 		slog.String("rendered_prompt_preview", previewText(prepared.renderedPrompt, 160)),
 		slog.String("final_prompt_preview", previewText(prepared.prompt, 160)),
 		slog.String("input_token_source", tokenSource),
@@ -295,10 +357,19 @@ func syntheticExactAnswerStream(ctx context.Context, answer string) <-chan domai
 		select {
 		case <-ctx.Done():
 			return
-		case ch <- domain.StreamEvent{IsFinished: true}:
+		case ch <- domain.NewTerminalEvent(nil):
 		}
 	}()
 	return ch
+}
+
+func isQwen36Request(modelHint string, modelVariant string) bool {
+	variant := strings.ToLower(strings.TrimSpace(modelVariant))
+	if variant == "qwen36" || variant == "qwen3.6" {
+		return true
+	}
+	hint := strings.ToLower(modelHint)
+	return strings.Contains(hint, "qwen3.6")
 }
 
 func (s *ChatService) GetEmbeddings(req domain.EmbeddingRequest) ([]float32, error) {
@@ -357,6 +428,38 @@ func ExtractPrompt(messages []domain.Message) string {
 	return messages[len(messages)-1].FlattenedText()
 }
 
+func inferModelVariantHint(modelHint string) string {
+	if isQwen36ModelHint(modelHint) {
+		return "qwen36"
+	}
+	return ""
+}
+
+func promptFamilyName(family promptFamily) string {
+	switch family {
+	case promptFamilyQwen:
+		return "chatml"
+	case promptFamilyGemma:
+		return "turn_tags"
+	default:
+		return "generic"
+	}
+}
+
+func validateTextOnlyStructuredContent(modelHint string, messages []domain.Message) error {
+	if !isQwen36ModelHint(modelHint) {
+		return nil
+	}
+	for i, message := range messages {
+		if !message.HasNonTextStructuredContent() {
+			continue
+		}
+		return domain.ErrInvalidRequest("Qwen3.6 text-only path does not support image, video, or audio content").
+			WithParam(fmt.Sprintf("messages[%d].content", i))
+	}
+	return nil
+}
+
 func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate string, req domain.ChatCompletionRequest) (float64, float64, int, float64) {
 	temperature := req.Temperature
 	topP := req.TopP
@@ -370,12 +473,13 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	isGemma := profile.family == promptFamilyGemma
 	isQwen36 := isQwen && isQwen36ModelHint(modelHint)
 	thinkingEnabled := profile.thinkingEnabled(modelHint, req.ChatTemplateKwargs)
+	qwen36Default := resolveQwen36NoThinkingSamplingDefaults(req.MaxTokens)
 
 	if !req.TemperatureSet {
 		if isGemma {
 			temperature = 0.2
 		} else if isQwen36 && !thinkingEnabled {
-			temperature = 0.0
+			temperature = qwen36Default.temperature
 		} else if isQwen && !thinkingEnabled {
 			temperature = 0.7
 		} else {
@@ -385,6 +489,8 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	if !req.TopPSet {
 		if isGemma {
 			topP = 0.95
+		} else if isQwen36 && !thinkingEnabled {
+			topP = qwen36Default.topP
 		} else if isQwen && thinkingEnabled {
 			topP = 0.95
 		} else if isQwen {
@@ -396,6 +502,8 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	if !req.TopKSet {
 		if isGemma {
 			topK = 32
+		} else if isQwen36 && !thinkingEnabled {
+			topK = qwen36Default.topK
 		} else if isQwen {
 			topK = 20
 		} else {
@@ -405,6 +513,8 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	if !req.RepetitionPenaltySet {
 		if isGemma {
 			repetitionPenalty = 1.05
+		} else if isQwen36 && !thinkingEnabled {
+			repetitionPenalty = qwen36Default.repetitionPenalty
 		} else if isQwen {
 			repetitionPenalty = 1.05
 		} else {
@@ -431,6 +541,48 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	return temperature, topP, topK, repetitionPenalty
 }
 
+type qwen36SamplingDefaults struct {
+	temperature       float64
+	topP              float64
+	topK              int
+	repetitionPenalty float64
+	qualityProfile    string
+}
+
+func resolveQwen36NoThinkingSamplingDefaults(maxTokens int) qwen36SamplingDefaults {
+	if maxTokens >= 64 {
+		return qwen36SamplingDefaults{
+			temperature:       0.35,
+			topP:              0.95,
+			topK:              40,
+			repetitionPenalty: 1.08,
+			qualityProfile:    "qwen36_longform",
+		}
+	}
+	return qwen36SamplingDefaults{
+		temperature:       0.20,
+		topP:              0.95,
+		topK:              20,
+		repetitionPenalty: 1.05,
+		qualityProfile:    "qwen36_default",
+	}
+}
+
+func resolveChatQualityProfile(modelHint, tokenizerType, chatTemplate string, req domain.ChatCompletionRequest,
+	exactAnswer *exactAnswerConstraint) string {
+	if exactAnswer != nil {
+		return "exact_answer"
+	}
+	profile := resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate)
+	if profile.family != promptFamilyQwen || !isQwen36ModelHint(modelHint) {
+		return "standard"
+	}
+	if profile.thinkingEnabled(modelHint, req.ChatTemplateKwargs) {
+		return "standard"
+	}
+	return resolveQwen36NoThinkingSamplingDefaults(req.MaxTokens).qualityProfile
+}
+
 func isQwen36ModelHint(modelHint string) bool {
 	lower := strings.ToLower(strings.TrimSpace(modelHint))
 	return strings.Contains(lower, "qwen3.6") || strings.Contains(lower, "qwen36")
@@ -445,7 +597,7 @@ func shouldPassThroughRawPrompt(modelHint, tokenizerType, chatTemplate string, m
 	if profile.family == promptFamilyGemma {
 		return false
 	}
-	if templateKwargs != nil && templateKwargs.EnableThinking != nil {
+	if templateKwargs != nil && (templateKwargs.EnableThinking != nil || templateKwargs.PreserveThinking != nil) {
 		return false
 	}
 	if len(messages) != 1 {

@@ -57,6 +57,12 @@ void Scheduler::SetPredictedExperts(int seq_id, const std::vector<int>& experts)
 
 void Scheduler::ScheduleRunning(SchedulerOutput& output) {
     int tokens_budget = config_.max_num_batched_tokens - output.total_tokens;
+    if (tokens_budget <= 0) {
+        if (output.empty_reason == SchedulerEmptyReason::None && !running_seqs_.empty()) {
+            output.empty_reason = SchedulerEmptyReason::RunningSeqPresentButDecodeUnschedulable;
+        }
+        return;
+    }
     std::unordered_set<int> active_experts;
 
     std::vector<int> running_ids(running_seqs_.begin(), running_seqs_.end());
@@ -165,10 +171,17 @@ void Scheduler::ScheduleRunning(SchedulerOutput& output) {
         output.batch_context_len = target_context_len;
         tokens_budget--;
     }
+
+    if (output.decode_seq_ids.empty() && !running_seqs_.empty() && output.empty_reason == SchedulerEmptyReason::None) {
+        output.empty_reason = SchedulerEmptyReason::RunningSeqPresentButDecodeUnschedulable;
+    }
 }
 
 void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) {
     int tokens_budget = config_.max_num_batched_tokens - output.total_tokens;
+    SchedulerEmptyReason blocked_reason = SchedulerEmptyReason::None;
+    SchedulerUnschedulableReason unschedulable_reason = SchedulerUnschedulableReason::None;
+    int diagnostic_seq_id = -1;
 
     std::vector<SequenceGroup> sorted_queue(waiting_queue_.begin(), waiting_queue_.end());
     std::sort(sorted_queue.begin(), sorted_queue.end(), [](const SequenceGroup& a, const SequenceGroup& b) {
@@ -242,6 +255,10 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
     for (auto& group : sorted_queue) {
         bool deferred_for_moe_budget = false;
         if (scheduler_internal::ScheduledSeqCount(output) >= static_cast<size_t>(config_.max_num_seqs)) {
+            if (blocked_reason == SchedulerEmptyReason::None) {
+                blocked_reason = SchedulerEmptyReason::MaxNumSeqsReached;
+                diagnostic_seq_id = group.sequence_ids.empty() ? -1 : group.sequence_ids[0];
+            }
             still_waiting.push_back(group);
             continue;
         }
@@ -264,6 +281,10 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
                      " with chunked prefill disabled)");
             seq_status_[seq_id] = SequenceStatus::CANCELLED;
             CleanupSequenceState(seq_id, /*erase_from_waiting_queue=*/false, /*free_block_manager_blocks=*/true);
+            if (unschedulable_reason == SchedulerUnschedulableReason::None) {
+                unschedulable_reason = SchedulerUnschedulableReason::PromptExceedsBatchBudget;
+                diagnostic_seq_id = seq_id;
+            }
             continue;
         }
 
@@ -273,13 +294,24 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         }
         if (can_chunk) {
             prefill_budget = std::min(prefill_budget, config_.max_prefill_tokens);
+            if (group.max_prefill_chunk_tokens > 0) {
+                prefill_budget = std::min(prefill_budget, group.max_prefill_chunk_tokens);
+            }
         }
         if (!can_chunk && remaining > prefill_budget) {
+            if (blocked_reason == SchedulerEmptyReason::None) {
+                blocked_reason = SchedulerEmptyReason::PrefillBudgetZero;
+                diagnostic_seq_id = seq_id;
+            }
             still_waiting.push_back(group);
             continue;
         }
         const int tokens_needed = can_chunk ? std::min(remaining, prefill_budget) : remaining;
         if (tokens_needed <= 0) {
+            if (blocked_reason == SchedulerEmptyReason::None) {
+                blocked_reason = SchedulerEmptyReason::PrefillBudgetZero;
+                diagnostic_seq_id = seq_id;
+            }
             still_waiting.push_back(group);
             continue;
         }
@@ -287,6 +319,10 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         const int group_context = GetSequenceContextLen(seq_id);
         if (config_.enforce_homogeneous_batch_n_past && target_context_len >= 0 &&
             group_context != target_context_len) {
+            if (blocked_reason == SchedulerEmptyReason::None) {
+                blocked_reason = SchedulerEmptyReason::ContextBucketMismatch;
+                diagnostic_seq_id = seq_id;
+            }
             still_waiting.push_back(group);
             continue;
         }
@@ -299,6 +335,10 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         }
 
         if (deferred_for_moe_budget && !output.prefill_seq_ids.empty()) {
+            if (blocked_reason == SchedulerEmptyReason::None) {
+                blocked_reason = SchedulerEmptyReason::MoeBudgetDeferred;
+                diagnostic_seq_id = seq_id;
+            }
             still_waiting.push_back(group);
             continue;
         }
@@ -311,12 +351,24 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         const int required_context = group_context + tokens_needed;
         const int required_blocks = SequenceBlockTable::BlocksNeeded(required_context);
         const int blocks_to_allocate = std::max(0, required_blocks - static_cast<int>(seq_blocks.size()));
+        if (blocks_to_allocate > block_manager_->num_blocks) {
+            if (unschedulable_reason == SchedulerUnschedulableReason::None) {
+                unschedulable_reason = SchedulerUnschedulableReason::RequiredBlocksExceedCapacity;
+                diagnostic_seq_id = seq_id;
+            }
+            still_waiting.push_back(group);
+            continue;
+        }
 
         std::vector<int> new_blocks;
         if (blocks_to_allocate > 0) {
             if (block_manager_->GetFreeBlockCount() < blocks_to_allocate) {
                 LOG_DEBUG("Scheduler: Not enough blocks for seq ", seq_id, " (needed ", blocks_to_allocate, ", free ",
                           block_manager_->GetFreeBlockCount(), ")");
+                if (blocked_reason == SchedulerEmptyReason::None) {
+                    blocked_reason = SchedulerEmptyReason::NoFreeBlocks;
+                    diagnostic_seq_id = seq_id;
+                }
                 still_waiting.push_back(group);
                 continue;
             }
@@ -324,6 +376,10 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
             new_blocks = block_manager_->Allocate(blocks_to_allocate);
             if (static_cast<int>(new_blocks.size()) != blocks_to_allocate) {
                 LOG_DEBUG("Scheduler: Allocate failed for seq ", seq_id);
+                if (blocked_reason == SchedulerEmptyReason::None) {
+                    blocked_reason = SchedulerEmptyReason::NoFreeBlocks;
+                    diagnostic_seq_id = seq_id;
+                }
                 still_waiting.push_back(group);
                 continue;
             }
@@ -368,19 +424,18 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         if (prefill_token_cap >= 0) {
             prefill_token_cap = std::max(0, prefill_token_cap - tokens_needed);
         }
-
-        if (remaining > tokens_needed) {
-            group.num_tokens_to_process = remaining - tokens_needed;
-            seq_status_[seq_id] = SequenceStatus::WAITING;
-            still_waiting.push_back(group);
-        } else {
-            group.num_tokens_to_process = 0;
-            running_seqs_.insert(seq_id);
-            seq_status_[seq_id] = SequenceStatus::RUNNING;
-        }
+        seq_status_[seq_id] = SequenceStatus::WAITING;
+        still_waiting.push_back(group);
     }
 
     waiting_queue_ = std::move(still_waiting);
+    if (output.IsEmpty() && !waiting_queue_.empty()) {
+        output.empty_reason = (blocked_reason == SchedulerEmptyReason::None)
+                                  ? SchedulerEmptyReason::WaitingSeqPresentButUnschedulable
+                                  : blocked_reason;
+        output.unschedulable_reason = unschedulable_reason;
+        output.diagnostic_seq_id = diagnostic_seq_id;
+    }
 }
 
 void Scheduler::ScheduleSwapped(SchedulerOutput& output) {

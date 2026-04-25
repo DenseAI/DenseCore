@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	exactAnswerEnglishRe = regexp.MustCompile(`(?i)\banswer\s+with\s+only\s+["']?([^\s"'.!?]+)["']?`)
+	exactAnswerEnglishRe = regexp.MustCompile(`(?i)\banswer\s+with\s+only\s+(?:"([^"]+)"|'([^']+)'|([^.?!\n\r]+))`)
 	exactAnswerKoreanRe  = regexp.MustCompile(`([가-힣A-Za-z0-9_-]+)만\s+답해`)
 )
 
@@ -95,13 +95,41 @@ func extractExpectedExactAnswer(req domain.ChatCompletionRequest) string {
 }
 
 func extractExactAnswerFromText(text string) string {
-	if matches := exactAnswerEnglishRe.FindStringSubmatch(text); len(matches) == 2 {
-		return strings.TrimSpace(matches[1])
+	if matches := exactAnswerEnglishRe.FindStringSubmatch(text); len(matches) == 4 {
+		answer := ""
+		for _, candidate := range matches[1:] {
+			if strings.TrimSpace(candidate) != "" {
+				answer = strings.TrimSpace(candidate)
+				break
+			}
+		}
+		answer = strings.Trim(answer, `"' `)
+		if answer == "" || isGenericExactAnswerReference(answer) {
+			return ""
+		}
+		return answer
 	}
 	if matches := exactAnswerKoreanRe.FindStringSubmatch(text); len(matches) == 2 {
 		return strings.TrimSpace(matches[1])
 	}
 	return ""
+}
+
+func isGenericExactAnswerReference(answer string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(answer))
+	normalized = strings.Join(strings.Fields(normalized), " ")
+	switch normalized {
+	case "a", "an", "the", "it", "this", "that":
+		return true
+	case "answer", "token", "code", "value", "word", "number":
+		return true
+	case "the answer", "the token", "the code", "the value", "the word", "the number":
+		return true
+	case "only the answer", "only the token", "only the code", "only the value", "only the word", "only the number":
+		return true
+	default:
+		return false
+	}
 }
 
 func slicesCompact(values []int) []int {

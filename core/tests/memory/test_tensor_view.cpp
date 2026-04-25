@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "tensor_view.h"
+#include "densecore/runtime/tensor_view.h"
 
 using namespace densecore;
 

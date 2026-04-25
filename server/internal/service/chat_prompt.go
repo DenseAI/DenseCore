@@ -62,6 +62,8 @@ func splitChatMessages(messages []domain.Message) ([]domain.Message, []domain.Me
 func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwargs *domain.ChatTemplateKwargs) string {
 	profile := resolvePromptProfile(modelHint)
 	thinkingEnabled := profile.thinkingEnabled(modelHint, templateKwargs)
+	preserveThinking := profile.preserveThinking(templateKwargs)
+	supportsNoThinkDirective := !isQwen36ModelHint(modelHint)
 
 	var sb strings.Builder
 
@@ -77,22 +79,37 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 		sb.WriteString(profile.closeTag)
 	}
 
-	for idx, msg := range messages {
+	nextMessageIdx := 0
+	leadingSystemParts := make([]string, 0, len(messages))
+	for nextMessageIdx < len(messages) {
+		msg := messages[nextMessageIdx]
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		if role != roleSystem && role != roleDeveloper {
+			break
+		}
+		if content := renderQwenContent(msg, false); content != "" {
+			leadingSystemParts = append(leadingSystemParts, content)
+		}
+		nextMessageIdx++
+	}
+	if len(leadingSystemParts) > 0 {
+		writeChatMLBlock(roleSystem, strings.Join(leadingSystemParts, "\n\n"))
+	}
+
+	for idx := nextMessageIdx; idx < len(messages); idx++ {
+		msg := messages[idx]
 		role := strings.ToLower(strings.TrimSpace(msg.Role))
 		switch role {
 		case roleSystem, roleDeveloper:
-			// Qwen3.5 template only accepts a system message at the beginning.
-			if idx == 0 {
-				writeChatMLBlock(roleSystem, renderQwenContent(msg, false))
-			}
+			// Qwen ChatML only accepts an initial system block.
 		case roleUser:
 			content := renderQwenContent(msg, false)
-			if !thinkingEnabled && idx == len(messages)-1 {
+			if !thinkingEnabled && supportsNoThinkDirective && idx == len(messages)-1 {
 				content = appendQwenNoThinkDirective(content)
 			}
 			writeChatMLBlock(role, content)
 		case roleAssistant:
-			writeChatMLBlock(role, renderQwenAssistantMessage(msg))
+			writeChatMLBlock(role, renderQwenAssistantMessage(msg, preserveThinking))
 		case roleTool:
 			writeChatMLBlock(roleUser, renderQwenToolResponse(msg))
 		}
@@ -101,7 +118,7 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 	sb.WriteString(profile.openTag)
 	sb.WriteString(profile.assistantRole)
 	sb.WriteString("\n")
-	if thinkingEnabled {
+	if thinkingEnabled && !isQwen36ModelHint(modelHint) {
 		sb.WriteString("<think>\n")
 	}
 	return sb.String()
@@ -151,9 +168,9 @@ func renderQwenContent(msg domain.Message, isSystem bool) string {
 	))
 }
 
-func renderQwenAssistantMessage(msg domain.Message) string {
+func renderQwenAssistantMessage(msg domain.Message, preserveThinking bool) string {
 	content := renderQwenContent(msg, false)
-	if msg.ReasoningContent != "" {
+	if preserveThinking && msg.ReasoningContent != "" {
 		return normalizePromptContent("<think>\n" + msg.ReasoningContent + "\n</think>\n\n" + content)
 	}
 	if len(msg.ToolCalls) == 0 {

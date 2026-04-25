@@ -9,7 +9,7 @@
 #include "densecore/graph_builders/llm_config_generator.h"
 #include "densecore/models/model_graph_capabilities.h"
 #include "densecore/models/model_graph_bridge.h"
-#include "qwen35_ssm_math.h"
+#include "densecore/models/qwen35_ssm_math.h"
 
 namespace {
 
@@ -193,6 +193,129 @@ TEST(Qwen35SSMMathTest, PositiveALogStillProducesContractiveDecay) {
     for (float value : y) EXPECT_TRUE(std::isfinite(value));
 }
 
+TEST(Qwen35SSMMathTest, IsolatedWritebackMatchesInPlaceReference) {
+    const std::vector<float> input = {0.25f, -0.5f, 0.75f, -0.125f};
+    const std::vector<float> q = {0.3f, -0.8f};
+    const std::vector<float> k = {0.4f, 0.6f};
+    const std::vector<float> v = {1.0f, -0.5f, 0.75f};
+    const std::vector<float> z = {0.1f, -0.3f, 0.8f};
+    const std::vector<float> alpha_row = {0.2f, -0.1f, 0.05f, 0.3f};
+    const std::vector<float> beta_row = {-0.15f, 0.05f, 0.12f, -0.2f};
+    const std::vector<float> norm = {1.1f, 0.9f, 1.05f};
+    std::vector<float> state = {
+        0.2f, -0.1f, 0.4f,
+        -0.3f, 0.5f, 0.1f,
+    };
+    std::vector<float> expected_state = state;
+    std::vector<float> y(3, 0.0f);
+    std::vector<float> expected_y(3, 0.0f);
+
+    Qwen35SSMHeadStepConfig cfg{};
+    cfg.input_t = input.data();
+    cfg.q_head = q.data();
+    cfg.k_head = k.data();
+    cfg.v_head = v.data();
+    cfg.z_head = z.data();
+    cfg.alpha_row = alpha_row.data();
+    cfg.beta_row = beta_row.data();
+    cfg.norm_weight = norm.data();
+    cfg.n_embd = 4;
+    cfg.head_dim_k = 2;
+    cfg.head_dim_v = 3;
+    cfg.dt_bias = -0.2f;
+    cfg.a_log = -1.4f;
+    cfg.norm_eps = 1e-6f;
+
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(cfg, expected_state.data(), expected_y.data(), nullptr));
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepWithWriteback(cfg, state.data(), state.data(), y.data(), nullptr));
+
+    EXPECT_EQ(Qwen35SSMHeadStateElements(cfg.head_dim_k, cfg.head_dim_v), state.size());
+    EXPECT_EQ(state, expected_state);
+    EXPECT_EQ(y, expected_y);
+}
+
+TEST(Qwen35SSMMathTest, IsolatedWritebackIsDeterministicAcrossRepeatedRequests) {
+    const std::vector<float> input = {0.1f, -0.2f, 0.3f, -0.4f};
+    const std::vector<float> q = {0.5f, -0.3f};
+    const std::vector<float> k = {0.2f, 0.7f};
+    const std::vector<float> v = {-0.1f, 0.6f, 0.4f};
+    const std::vector<float> z = {0.3f, -0.2f, 0.1f};
+    const std::vector<float> alpha_row = {0.1f, -0.05f, 0.02f, 0.15f};
+    const std::vector<float> beta_row = {-0.08f, 0.03f, 0.06f, -0.1f};
+    const std::vector<float> norm = {1.0f, 1.0f, 1.0f};
+    std::vector<float> state1(6, 0.0f);
+    std::vector<float> state2(6, 0.0f);
+    std::vector<float> y1(3, 0.0f);
+    std::vector<float> y2(3, 0.0f);
+
+    Qwen35SSMHeadStepConfig cfg{};
+    cfg.input_t = input.data();
+    cfg.q_head = q.data();
+    cfg.k_head = k.data();
+    cfg.v_head = v.data();
+    cfg.z_head = z.data();
+    cfg.alpha_row = alpha_row.data();
+    cfg.beta_row = beta_row.data();
+    cfg.norm_weight = norm.data();
+    cfg.n_embd = 4;
+    cfg.head_dim_k = 2;
+    cfg.head_dim_v = 3;
+    cfg.dt_bias = -0.15f;
+    cfg.a_log = -1.2f;
+    cfg.norm_eps = 1e-6f;
+
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepWithWriteback(cfg, state1.data(), state1.data(), y1.data(), nullptr));
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepWithWriteback(cfg, state2.data(), state2.data(), y2.data(), nullptr));
+
+    EXPECT_EQ(state1, state2);
+    EXPECT_EQ(y1, y2);
+}
+
+TEST(Qwen35SSMMathTest, ReferenceSafeMatchesInPlaceReference) {
+    const std::vector<float> input = {0.25f, -0.5f, 0.75f, -0.125f};
+    const std::vector<float> q = {0.3f, -0.8f};
+    const std::vector<float> k = {0.4f, 0.6f};
+    const std::vector<float> v = {1.0f, -0.5f, 0.75f};
+    const std::vector<float> z = {0.1f, -0.3f, 0.8f};
+    const std::vector<float> alpha_row = {0.2f, -0.1f, 0.05f, 0.3f};
+    const std::vector<float> beta_row = {-0.15f, 0.05f, 0.12f, -0.2f};
+    const std::vector<float> norm = {1.1f, 0.9f, 1.05f};
+    std::vector<float> state = {
+        0.2f, -0.1f, 0.4f,
+        -0.3f, 0.5f, 0.1f,
+    };
+    std::vector<float> expected_state = state;
+    std::vector<float> y(3, 0.0f);
+    std::vector<float> expected_y(3, 0.0f);
+
+    Qwen35SSMHeadStepConfig cfg{};
+    cfg.input_t = input.data();
+    cfg.q_head = q.data();
+    cfg.k_head = k.data();
+    cfg.v_head = v.data();
+    cfg.z_head = z.data();
+    cfg.alpha_row = alpha_row.data();
+    cfg.beta_row = beta_row.data();
+    cfg.norm_weight = norm.data();
+    cfg.n_embd = 4;
+    cfg.head_dim_k = 2;
+    cfg.head_dim_v = 3;
+    cfg.dt_bias = -0.2f;
+    cfg.a_log = -1.4f;
+    cfg.norm_eps = 1e-6f;
+
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(cfg, expected_state.data(), expected_y.data(), nullptr));
+    Qwen35SSMHeadStepTrace trace{};
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepReferenceSafe(cfg, state.data(), state.data(), y.data(), nullptr, nullptr,
+                                                         &trace));
+
+    EXPECT_EQ(state, expected_state);
+    EXPECT_EQ(y, expected_y);
+    EXPECT_NE(trace.state_in_hash, 0ull);
+    EXPECT_NE(trace.state_out_hash, 0ull);
+    EXPECT_NE(trace.y_hash, 0ull);
+}
+
 TEST(Qwen35SSMMathTest, CanonicalizeFusedBAGroupedLayout) {
     constexpr int kEmbd = 3;
     constexpr int kVHeads = 4;
@@ -315,6 +438,97 @@ TEST(Qwen35SSMMathTest, CanonicalizesLoaderShapesAndOrientation) {
     const int64_t bad_norm_ne[4] = {3, 2, 1, 1};
     EXPECT_EQ(Qwen35CanonicalizeNorm(norm_full.data(), bad_norm_ne, 3, 6, &norm_out),
               Qwen35SSMNormLayout::INVALID);
+}
+
+TEST(Qwen35SSMMathTest, FusedBAAndSplitABProduceEquivalentHeadStep) {
+    const std::vector<float> input = {0.25f, -0.5f, 0.75f, -0.125f};
+    const std::vector<float> q = {0.3f, -0.8f};
+    const std::vector<float> k = {0.4f, 0.6f};
+    const std::vector<float> v = {1.0f, -0.5f, 0.75f};
+    const std::vector<float> z = {0.1f, -0.3f, 0.8f};
+    const std::vector<float> alpha_row = {0.2f, -0.1f, 0.05f, 0.3f};
+    const std::vector<float> beta_row = {-0.15f, 0.05f, 0.12f, -0.2f};
+    const std::vector<float> norm = {1.1f, 0.9f, 1.05f};
+    std::vector<float> split_state = {0.2f, -0.1f, 0.4f, -0.3f, 0.5f, 0.1f};
+    std::vector<float> fused_state = split_state;
+    std::vector<float> split_y(3, 0.0f);
+    std::vector<float> fused_y(3, 0.0f);
+
+    const int64_t fused_ne[4] = {4, 2, 1, 1};
+    const std::vector<float> fused_ba = {
+        beta_row[0], beta_row[1], beta_row[2], beta_row[3], alpha_row[0], alpha_row[1], alpha_row[2], alpha_row[3],
+    };
+    std::vector<float> beta_out;
+    std::vector<float> alpha_out;
+    ASSERT_TRUE(Qwen35CanonicalizeFusedBA(fused_ba.data(), fused_ne, 4, 1, 1, &beta_out, &alpha_out));
+
+    Qwen35SSMHeadStepConfig split_cfg{};
+    split_cfg.input_t = input.data();
+    split_cfg.q_head = q.data();
+    split_cfg.k_head = k.data();
+    split_cfg.v_head = v.data();
+    split_cfg.z_head = z.data();
+    split_cfg.alpha_row = alpha_row.data();
+    split_cfg.beta_row = beta_row.data();
+    split_cfg.norm_weight = norm.data();
+    split_cfg.n_embd = 4;
+    split_cfg.head_dim_k = 2;
+    split_cfg.head_dim_v = 3;
+    split_cfg.dt_bias = -0.2f;
+    split_cfg.a_log = -1.4f;
+    split_cfg.norm_eps = 1e-6f;
+
+    Qwen35SSMHeadStepConfig fused_cfg = split_cfg;
+    fused_cfg.alpha_row = alpha_out.data();
+    fused_cfg.beta_row = beta_out.data();
+
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(split_cfg, split_state.data(), split_y.data(), nullptr));
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(fused_cfg, fused_state.data(), fused_y.data(), nullptr));
+
+    EXPECT_LT(MaxAbsDiff(split_state, fused_state), 1e-6f);
+    EXPECT_LT(MaxAbsDiff(split_y, fused_y), 1e-6f);
+}
+
+TEST(Qwen35SSMMathTest, SharedAndFlattenedNormLayoutsMatchPerHeadSlice) {
+    const std::vector<float> input = {0.1f, -0.2f, 0.3f, 0.4f};
+    const std::vector<float> q = {0.5f, -0.25f};
+    const std::vector<float> k = {0.2f, 0.75f};
+    const std::vector<float> v = {0.6f, -0.1f, 0.25f};
+    const std::vector<float> z = {0.3f, -0.6f, 0.9f};
+    const std::vector<float> alpha_row = {0.05f, 0.1f, -0.2f, 0.15f};
+    const std::vector<float> beta_row = {-0.1f, 0.2f, 0.05f, -0.25f};
+    const std::vector<float> shared_norm = {1.0f, 0.8f, 1.2f};
+    const std::vector<float> flattened_norm = {0.4f, 0.4f, 0.4f, shared_norm[0], shared_norm[1], shared_norm[2]};
+    std::vector<float> shared_state = {0.05f, -0.1f, 0.15f, 0.2f, -0.3f, 0.1f};
+    std::vector<float> flattened_state = shared_state;
+    std::vector<float> shared_y(3, 0.0f);
+    std::vector<float> flattened_y(3, 0.0f);
+
+    Qwen35SSMHeadStepConfig cfg{};
+    cfg.input_t = input.data();
+    cfg.q_head = q.data();
+    cfg.k_head = k.data();
+    cfg.v_head = v.data();
+    cfg.z_head = z.data();
+    cfg.alpha_row = alpha_row.data();
+    cfg.beta_row = beta_row.data();
+    cfg.n_embd = 4;
+    cfg.head_dim_k = 2;
+    cfg.head_dim_v = 3;
+    cfg.dt_bias = -0.15f;
+    cfg.a_log = -0.9f;
+    cfg.norm_eps = 1e-6f;
+
+    Qwen35SSMHeadStepConfig shared_cfg = cfg;
+    shared_cfg.norm_weight = shared_norm.data();
+    Qwen35SSMHeadStepConfig flattened_cfg = cfg;
+    flattened_cfg.norm_weight = flattened_norm.data() + 3;
+
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(shared_cfg, shared_state.data(), shared_y.data(), nullptr));
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(flattened_cfg, flattened_state.data(), flattened_y.data(), nullptr));
+
+    EXPECT_LT(MaxAbsDiff(shared_state, flattened_state), 1e-6f);
+    EXPECT_LT(MaxAbsDiff(shared_y, flattened_y), 1e-6f);
 }
 
 TEST(Qwen35GraphDispatchTest, LlmConfigGeneratorRejectsHybridSSMModels) {

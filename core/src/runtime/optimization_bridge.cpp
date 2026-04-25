@@ -8,6 +8,8 @@
 
 #include "densecore/runtime/optimization_bridge.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <mutex>
 
@@ -15,6 +17,76 @@
 #include "kernels/hwy/hwy_kernels.h"
 
 namespace densecore {
+
+namespace {
+
+bool IsTruthyEnv(const char* name) {
+    const char* env = std::getenv(name);
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+const char* CompileTimeArmFeatures() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+#if defined(__ARM_FEATURE_SVE2)
+    return "aarch64+sve+sve2";
+#elif defined(__ARM_FEATURE_SVE)
+    return "aarch64+sve";
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    return "aarch64+neon";
+#else
+    return "aarch64";
+#endif
+#else
+    return "non-arm";
+#endif
+}
+
+bool CompiledWithArmSve() {
+#if defined(__ARM_FEATURE_SVE)
+    return true;
+#else
+    return false;
+#endif
+}
+
+void LogArmCompileFeatureDetails() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    std::cout << "[OpsRegistry] ARM compile-time features:"
+#if defined(DENSECORE_TARGET_C4A)
+              << " DENSECORE_TARGET_C4A=1"
+#else
+              << " DENSECORE_TARGET_C4A=0"
+#endif
+#if defined(__ARM_FEATURE_SVE)
+              << " __ARM_FEATURE_SVE=1"
+#else
+              << " __ARM_FEATURE_SVE=0"
+#endif
+#if defined(__ARM_FEATURE_SVE2)
+              << " __ARM_FEATURE_SVE2=1"
+#else
+              << " __ARM_FEATURE_SVE2=0"
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+              << " __ARM_FEATURE_DOTPROD=1"
+#else
+              << " __ARM_FEATURE_DOTPROD=0"
+#endif
+#if defined(__ARM_FEATURE_BF16)
+              << " __ARM_FEATURE_BF16=1"
+#else
+              << " __ARM_FEATURE_BF16=0"
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+              << " __ARM_FEATURE_MATMUL_INT8=1"
+#else
+              << " __ARM_FEATURE_MATMUL_INT8=0"
+#endif
+              << std::endl;
+#endif
+}
+
+}  // namespace
 
 // =============================================================================
 // Scalar Fallback Implementations
@@ -89,6 +161,17 @@ void OpsRegistry::Init() {
         const char* level_name = simd::SimdLevelName(level);
 
         std::cout << "[OpsRegistry] Detected SIMD level: " << level_name << std::endl;
+        std::cout << "[OpsRegistry] Compile-time SIMD features: " << CompileTimeArmFeatures() << std::endl;
+        LogArmCompileFeatureDetails();
+#if defined(__aarch64__) || defined(_M_ARM64)
+        if (level >= simd::SimdLevel::SVE && !CompiledWithArmSve()) {
+            std::cerr << "[OpsRegistry] Warning: runtime CPU reports " << level_name
+                      << " but this binary was not compiled with __ARM_FEATURE_SVE. "
+                         "GemmInt4 will use the NEON/scalar-safe path; rebuild with "
+                         "-DDENSECORE_TARGET_C4A=ON or explicit SVE/SVE2 ARM flags for C4A."
+                      << std::endl;
+        }
+#endif
 
         // -----------------------------------------------------------------
         // RoPE Dispatch — Highway (portable SIMD, all ISAs)
@@ -107,6 +190,7 @@ void OpsRegistry::Init() {
         // -----------------------------------------------------------------
         reg.GemmInt4Batched = hwy_kernels::GemmInt4Batched_Hwy;
         std::cout << "  [GemmInt4Batched] -> Highway (auto-dispatch)" << std::endl;
+        const char* selected_gemm_int4 = "unselected";
 
         // -----------------------------------------------------------------
         // GemmInt4 Dispatch
@@ -117,40 +201,50 @@ void OpsRegistry::Init() {
 #if defined(__AVX512F__)
         if (level >= simd::SimdLevel::AVX512) {
             reg.GemmInt4 = simd::GemmInt4Fp32_AVX512;
+            selected_gemm_int4 = "AVX-512";
             std::cout << "  [GemmInt4] -> AVX-512" << std::endl;
         } else if (level >= simd::SimdLevel::AVX2) {
             reg.GemmInt4 = simd::GemmInt4Fp32_AVX2;
+            selected_gemm_int4 = "AVX2";
             std::cout << "  [GemmInt4] -> AVX2 (runtime: no AVX-512, build has AVX-512)" << std::endl;
         } else {
             reg.GemmInt4 = GemmInt4Fp32_Scalar;
+            selected_gemm_int4 = "Scalar";
             std::cout << "  [GemmInt4] -> Scalar (runtime: no AVX2)" << std::endl;
         }
 #elif defined(__AVX2__)
         if (level >= simd::SimdLevel::AVX2) {
             reg.GemmInt4 = simd::GemmInt4Fp32_AVX2;
+            selected_gemm_int4 = "AVX2";
             std::cout << "  [GemmInt4] -> AVX2" << std::endl;
         } else {
             reg.GemmInt4 = GemmInt4Fp32_Scalar;
+            selected_gemm_int4 = "Scalar";
             std::cout << "  [GemmInt4] -> Scalar (runtime: no AVX2)" << std::endl;
         }
 #elif defined(__ARM_FEATURE_SVE)
         // SVE available at compile time — use SVE kernel (works on SVE and SVE2)
         if (simd::IsArmFamily(level) && level >= simd::SimdLevel::SVE) {
             reg.GemmInt4 = simd::GemmInt4Fp32_SVE;
+            selected_gemm_int4 = "ARM SVE";
             std::cout << "  [GemmInt4] -> ARM SVE" << std::endl;
         } else if (simd::IsArmFamily(level)) {
             reg.GemmInt4 = simd::GemmInt4Fp32_NEON;
+            selected_gemm_int4 = "ARM NEON";
             std::cout << "  [GemmInt4] -> ARM NEON (runtime: no SVE)" << std::endl;
         } else {
             reg.GemmInt4 = GemmInt4Fp32_Scalar;
+            selected_gemm_int4 = "Scalar";
             std::cout << "  [GemmInt4] -> Scalar" << std::endl;
         }
 #elif defined(DENSECORE_ARM) || defined(__aarch64__) || defined(_M_ARM64)
         // ARM build without SVE compile support — use NEON
         reg.GemmInt4 = simd::GemmInt4Fp32_NEON;
+        selected_gemm_int4 = "ARM NEON";
         std::cout << "  [GemmInt4] -> ARM NEON" << std::endl;
 #else
         reg.GemmInt4 = GemmInt4Fp32_Scalar;
+        selected_gemm_int4 = "Scalar";
         std::cout << "  [GemmInt4] -> Scalar (build without AVX2/AVX-512/ARM)" << std::endl;
 #endif
 
@@ -166,6 +260,12 @@ void OpsRegistry::Init() {
         // Store selected ISA name
         reg.selected_isa = level_name;
 
+        if (IsTruthyEnv("DENSECORE_DEBUG_MOE_MATMUL_PATHS") || IsTruthyEnv("DENSECORE_PROFILE_DECODE")) {
+            std::cout << "[OpsRegistry] INT4 dispatch summary: runtime_simd=" << level_name
+                      << " compile_features=" << CompileTimeArmFeatures()
+                      << " selected_gemm_int4=" << selected_gemm_int4
+                      << " selected_gemm_int4_batched=Highway(auto-dispatch)" << std::endl;
+        }
         std::cout << "[OpsRegistry] Initialization complete. Using: " << level_name << std::endl;
     });
 }
