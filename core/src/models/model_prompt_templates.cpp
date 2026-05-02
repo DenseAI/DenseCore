@@ -267,9 +267,43 @@ bool SupportsQwenNoThinkDirective(const TransformerModel* model) {
     return descriptor.variant != ModelVariant::QWEN36;
 }
 
+void AppendQwenAssistantGenerationCue(const TransformerModel* model, bool thinking_enabled, std::string* out) {
+    if (!out || !model) {
+        return;
+    }
+    const auto& descriptor = DescribeModel(model);
+    if (descriptor.variant == ModelVariant::QWEN36) {
+        if (thinking_enabled) {
+            out->append("<think>\n");
+        } else {
+            out->append("<think>\n\n</think>\n");
+        }
+        return;
+    }
+    if (thinking_enabled) {
+        out->append("<think>\n");
+    }
+}
+
 bool ShouldSuppressQwenReasoningTags(const TransformerModel* model) {
     if (!ModelUsesQwenThinkingEnv(model)) return false;
     return !ResolveQwenThinkingEnabled(model);
+}
+
+bool IsQwenLikelyControlToken(const std::string& token) {
+    if (token.empty()) {
+        return false;
+    }
+    static const char* kBlockedLiterals[] = {
+        "<|im_start|>",     "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>",
+        "</tool_response>", "<bos>",      "<eos>",   "<pad>",    "<unk>",       nullptr,
+    };
+    for (int i = 0; kBlockedLiterals[i] != nullptr; ++i) {
+        if (token == kBlockedLiterals[i]) {
+            return true;
+        }
+    }
+    return token.rfind("<|", 0) == 0 || token.rfind("</", 0) == 0 || token.rfind("<unused", 0) == 0;
 }
 
 std::string AppendQwenNoThinkDirective(std::string content) {
@@ -351,6 +385,62 @@ void ConfigureQwenReasoningTokenBlocklistForModel(const TransformerModel* model,
             req->disallowed_token_ids.push_back(it->second);
         }
     }
+    std::sort(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end());
+    req->disallowed_token_ids.erase(std::unique(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end()),
+                                    req->disallowed_token_ids.end());
+}
+
+void ConfigureQwen36TextTokenBlocklistForModel(const TransformerModel* model, Request* req) {
+    if (!model || !req || DescribeModel(model).variant != ModelVariant::QWEN36) {
+        return;
+    }
+    if (ResolveQwenThinkingEnabled(model)) {
+        return;
+    }
+    if (ParseBoolEnv("DENSECORE_QWEN36_DISABLE_TEXT_BLOCKLIST", false)) {
+        return;
+    }
+
+    auto is_stop_id = [&](int token_id) {
+        return std::binary_search(model->stop_token_ids.begin(), model->stop_token_ids.end(), token_id);
+    };
+
+    if (model->bos_token_id >= 0 && !is_stop_id(model->bos_token_id)) {
+        AppendDisallowedTokenId(req, model->bos_token_id);
+    }
+
+    const bool validated_token_types =
+        !model->token_types.empty() && model->token_types.size() == model->vocab_tokens.size();
+    if (validated_token_types) {
+        for (size_t i = 0; i < model->token_types.size(); ++i) {
+            const int32_t token_type = model->token_types[i];
+            if (token_type == 1 || token_type == 6) {
+                continue;
+            }
+            const int token_id = static_cast<int>(i);
+            if (!is_stop_id(token_id)) {
+                AppendDisallowedTokenId(req, token_id);
+            }
+        }
+    }
+
+    for (const auto& [token, token_id] : model->token_to_id) {
+        if (IsQwenLikelyControlToken(token) && !is_stop_id(token_id)) {
+            AppendDisallowedTokenId(req, token_id);
+        }
+    }
+
+    if (ParseBoolEnv("DENSECORE_QWEN36_STRICT_ASCII_TEXT", false)) {
+        for (const auto& [token, token_id] : model->token_to_id) {
+            if (is_stop_id(token_id)) {
+                continue;
+            }
+            if (!IsAsciiTextLikeToken(token)) {
+                AppendDisallowedTokenId(req, token_id);
+            }
+        }
+    }
+
     std::sort(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end());
     req->disallowed_token_ids.erase(std::unique(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end()),
                                     req->disallowed_token_ids.end());
@@ -443,8 +533,8 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         wrapped += profile.open_tag;
         wrapped += profile.assistant_role;
         wrapped += "\n";
-        if (profile.supports_thinking && profile.thinking_enabled && ShouldPreOpenThinkingBlock(model)) {
-            wrapped += "<think>\n";
+        if (profile.supports_thinking) {
+            AppendQwenAssistantGenerationCue(model, profile.thinking_enabled, &wrapped);
         }
         return wrapped;
     }
@@ -544,9 +634,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
         rendered += profile.open_tag;
         rendered += profile.assistant_role;
         rendered += "\n";
-        if (thinking_enabled && ShouldPreOpenThinkingBlock(model)) {
-            rendered += "<think>\n";
-        }
+        AppendQwenAssistantGenerationCue(model, thinking_enabled, &rendered);
         return rendered;
     }
 

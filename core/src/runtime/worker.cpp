@@ -121,6 +121,82 @@ bool IsHybridSSMSnapshotRestoreDisabled() {
     return GetWorkerRuntimeConfig().hybrid_ssm_snapshot_restore_disabled;
 }
 
+bool IsQwen36PrefixCacheReuseEnabled() {
+    return GetWorkerRuntimeConfig().qwen36_prefix_cache_reuse_enabled;
+}
+
+bool IsQwen36HybridSSMSnapshotRestoreEnabled() {
+    return GetWorkerRuntimeConfig().qwen36_hybrid_ssm_snapshot_restore_enabled;
+}
+
+bool IsQwen36HybridSSMModel(const TransformerModel* model) {
+    if (!model || !model->arch_flags.is_hybrid_ssm) {
+        return false;
+    }
+    return densecore::models::DescribeModel(model).variant == ModelVariant::QWEN36;
+}
+
+bool IsPrefixCacheAllowedForModel(const TransformerModel* model) {
+    if (IsPrefixCacheReuseDisabled()) {
+        return false;
+    }
+    if (IsQwen36HybridSSMModel(model) && !IsQwen36PrefixCacheReuseEnabled()) {
+        return false;
+    }
+    return true;
+}
+
+bool IsHybridSSMSnapshotRestoreAllowedForModel(const TransformerModel* model) {
+    if (IsHybridSSMSnapshotRestoreDisabled()) {
+        return false;
+    }
+    if (IsQwen36HybridSSMModel(model) && !IsQwen36HybridSSMSnapshotRestoreEnabled()) {
+        return false;
+    }
+    return true;
+}
+
+bool ResolveSamplingLogitsColumnForRequestImpl(int token_offset, int processed_count, int output_columns,
+                                               bool sampled_from_prefill, int remaining_prompt_tokens,
+                                               int n_past_before, int n_past_after, int* out_last_token_idx,
+                                               std::string* error) {
+    auto fail = [&](const char* message) {
+        if (error) {
+            *error = message ? message : "unknown logits-column validation failure";
+        }
+        return false;
+    };
+    if (!out_last_token_idx) {
+        return fail("missing logits-column output pointer");
+    }
+    if (token_offset < 0) {
+        return fail("negative token offset");
+    }
+    if (processed_count <= 0) {
+        return fail("processed_count must be positive");
+    }
+    if (output_columns <= 0) {
+        return fail("output tensor must expose at least one column");
+    }
+    const int last_token_idx = token_offset + processed_count - 1;
+    if (last_token_idx < token_offset || last_token_idx >= output_columns) {
+        return fail("sampling logits column is out of bounds for output tensor");
+    }
+    if (sampled_from_prefill) {
+        if (remaining_prompt_tokens <= 0) {
+            return fail("prefill sampling requires positive remaining prompt tokens");
+        }
+        if (processed_count != remaining_prompt_tokens) {
+            return fail("prefill sampling must use the final prompt chunk only");
+        }
+        if (n_past_after != n_past_before + processed_count) {
+            return fail("prefill sampling observed inconsistent n_past progression");
+        }
+    }
+    *out_last_token_idx = last_token_idx;
+    return true;
+}
+
 bool IsGraphCacheReuseDisabled() {
     return GetWorkerRuntimeConfig().graph_cache_reuse_disabled;
 }
@@ -216,6 +292,33 @@ bool ShouldZeroFillPrefillGraphBuffer() {
 
 bool ShouldZeroFillPrefillKVBlocks() {
     return GetWorkerRuntimeConfig().zero_fill_prefill_kv_blocks;
+}
+
+int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Request* req) {
+    if (!model || !req) {
+        return -1;
+    }
+    const auto descriptor = densecore::models::DescribeModel(model);
+    if (descriptor.variant != ModelVariant::QWEN36 || !model->arch_flags.is_hybrid_ssm ||
+        model->hparams.n_experts <= 0) {
+        return -1;
+    }
+    const densecore::env::RuntimeToggleMode mode = densecore::env::ParseRuntimeToggleMode(
+        "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS", densecore::env::RuntimeToggleMode::Auto);
+    if (mode == densecore::env::RuntimeToggleMode::Off) {
+        return -1;
+    }
+    const int explicit_tokens = densecore::env::ParsePositiveEnvInt("DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS", 0);
+    if (explicit_tokens > 0) {
+        return explicit_tokens;
+    }
+    if (mode == densecore::env::RuntimeToggleMode::On) {
+        return 256;
+    }
+    const int prompt_tokens = !req->prompt_tokens_for_cache.empty()
+                                  ? static_cast<int>(req->prompt_tokens_for_cache.size())
+                                  : req->prompt_token_count;
+    return prompt_tokens >= 512 ? 256 : -1;
 }
 
 int PrefillThreadOverride() {
@@ -410,6 +513,47 @@ bool IsHybridSSMSnapshotDebugEnabled() {
     return enabled;
 }
 
+bool IsGraphNodeDumpEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_GRAPH_NODES");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+int GraphNodeDumpLimit() {
+    const char* env = std::getenv("DENSECORE_DEBUG_GRAPH_NODE_LIMIT");
+    if (!env || env[0] == '\0') {
+        return 32;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0' || parsed <= 0 || parsed > 4096) {
+        return 32;
+    }
+    return static_cast<int>(parsed);
+}
+
+void DebugDumpGraphNodes(const struct ggml_cgraph* graph, const char* stage, int max_nodes = 32) {
+    if (!IsGraphNodeDumpEnabled() || !graph) {
+        return;
+    }
+    const int n_nodes = ggml_graph_n_nodes(const_cast<struct ggml_cgraph*>(graph));
+    const int configured_limit = GraphNodeDumpLimit();
+    const int limit = std::min(n_nodes, std::max(1, std::max(max_nodes, configured_limit)));
+    std::cerr << "[GraphNodeDump] stage=" << (stage ? stage : "<unknown>") << " nodes=" << n_nodes
+              << " showing=" << limit << std::endl;
+    for (int i = 0; i < limit; ++i) {
+        struct ggml_tensor* node = ggml_graph_node(const_cast<struct ggml_cgraph*>(graph), i);
+        std::cerr << "  node[" << i << "] " << TensorDebugSummary(node) << std::endl;
+        if (node) {
+            std::cerr << "    src0: " << TensorDebugSummary(node->src[0]) << std::endl;
+            std::cerr << "    src1: " << TensorDebugSummary(node->src[1]) << std::endl;
+            std::cerr << "    src2: " << TensorDebugSummary(node->src[2]) << std::endl;
+        }
+    }
+}
+
 void DebugLogHybridSSMSnapshot(const char* stage, int req_id, int cached_tokens, int block_id,
                                const std::vector<TransformerModel::SSMSequenceRuntimeState>& states) {
     if (!IsHybridSSMSnapshotDebugEnabled()) {
@@ -435,7 +579,13 @@ void ValidateMulNodesOrThrow(struct ggml_cgraph* graph, const char* stage) {
     const int n_nodes = ggml_graph_n_nodes(graph);
     for (int i = 0; i < n_nodes; ++i) {
         struct ggml_tensor* node = ggml_graph_node(graph, i);
-        if (!node || node->op != GGML_OP_MUL) {
+        if (!node) {
+            continue;
+        }
+
+        const bool is_binary_shape_checked_op =
+            node->op == GGML_OP_ADD || node->op == GGML_OP_SUB || node->op == GGML_OP_MUL || node->op == GGML_OP_DIV;
+        if (!is_binary_shape_checked_op) {
             continue;
         }
 
@@ -452,11 +602,13 @@ void ValidateMulNodesOrThrow(struct ggml_cgraph* graph, const char* stage) {
             issue = "src1 has invalid type";
         } else if (!ggml_can_repeat(src1, src0)) {
             issue = "src1 cannot broadcast to src0";
+        } else if (!ggml_are_same_shape(src0, node)) {
+            issue = "dst shape does not match src0";
         }
 
         if (!issue.empty()) {
             std::cerr << "[MulGraphValidation] stage=" << (stage ? stage : "<unknown>") << " node=" << i
-                      << " issue=" << issue << std::endl;
+                      << " op=" << SafeGgmlOpName(node->op) << " issue=" << issue << std::endl;
             std::cerr << "  dst:  " << TensorDebugSummary(node) << std::endl;
             std::cerr << "  src0: " << TensorDebugSummary(src0) << std::endl;
             std::cerr << "  src1: " << TensorDebugSummary(src1) << std::endl;
@@ -467,6 +619,50 @@ void ValidateMulNodesOrThrow(struct ggml_cgraph* graph, const char* stage) {
 }
 
 }  // namespace
+
+bool ResolveSamplingLogitsColumnForRequest(int token_offset, int processed_count, int output_columns,
+                                           bool sampled_from_prefill, int remaining_prompt_tokens, int n_past_before,
+                                           int n_past_after, int* out_last_token_idx, std::string* error) {
+    return ResolveSamplingLogitsColumnForRequestImpl(token_offset, processed_count, output_columns,
+                                                     sampled_from_prefill, remaining_prompt_tokens, n_past_before,
+                                                     n_past_after, out_last_token_idx, error);
+}
+
+int GetDebugSamplingLogitsOffset() {
+    static const int value = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SAMPLING_LOGITS_OFFSET");
+        if (!env || env[0] == '\0') {
+            return 0;
+        }
+        char* end = nullptr;
+        const long parsed = std::strtol(env, &end, 10);
+        if (end == env) {
+            return 0;
+        }
+        return static_cast<int>(parsed);
+    }();
+    return value;
+}
+
+int GetDebugFirstTokenSamplingLogitsOffset() {
+    static const int value = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_FIRST_TOKEN_SAMPLING_LOGITS_OFFSET");
+        if (!env || env[0] == '\0') {
+            return 0;
+        }
+        char* end = nullptr;
+        const long parsed = std::strtol(env, &end, 10);
+        if (end == env) {
+            return 0;
+        }
+        return static_cast<int>(parsed);
+    }();
+    return value;
+}
+
+int ResolveQwen36PrefillChunkTokens(const TransformerModel* model, const Request* req) {
+    return ResolveQwen36PrefillChunkTokensImpl(model, req);
+}
 
 // Worker Loop (Continuous Batching) - Uses Scheduler for batch formation
 void EngineLoop(EngineState* state) {
@@ -1021,7 +1217,7 @@ void EngineLoop(EngineState* state) {
                     // cross-contaminates sequences and forces single-request mode.
                     EnsureRequestHybridSSMRuntimeState(current_model, req);
                     LogDeterminismBoundary("after_tokenization", req, current_model,
-                                           /*prefix_cache_allowed=*/!IsPrefixCacheReuseDisabled(),
+                                           /*prefix_cache_allowed=*/IsPrefixCacheAllowedForModel(current_model),
                                            /*prefix_cache_hit=*/false,
                                            /*hybrid_restore_attempted=*/false,
                                            /*hybrid_restore_applied=*/false,
@@ -1031,11 +1227,13 @@ void EngineLoop(EngineState* state) {
                                            /*prefill_cache_active=*/false);
 
                     // Register with scheduler (blocks allocated by scheduler)
-                    int seq_id = state->scheduler->AddRequest(req->id, req->tokens.size(), req->max_tokens,
-                                                              req->priority, &req->tokens,
-                                                              /*allow_chunked_prefill=*/!req->is_embedding,
-                                                              /*require_hybrid_ssm_prefix_snapshot=*/current_model &&
-                                                                  current_model->arch_flags.is_hybrid_ssm);
+                    const int qwen36_prefill_chunk_tokens = ResolveQwen36PrefillChunkTokens(current_model, req);
+                    req->prefill_chunk_tokens_effective = std::max(0, qwen36_prefill_chunk_tokens);
+                    int seq_id = state->scheduler->AddRequest(
+                        req->id, req->tokens.size(), req->max_tokens, req->priority, &req->tokens,
+                        /*allow_chunked_prefill=*/!req->is_embedding,
+                        /*require_hybrid_ssm_prefix_snapshot=*/current_model && current_model->arch_flags.is_hybrid_ssm,
+                        qwen36_prefill_chunk_tokens);
 
                     if (seq_id < 0) {
                         // Scheduler rejected (e.g., queue full or impossible non-chunked prefill)
@@ -1218,7 +1416,7 @@ void EngineLoop(EngineState* state) {
                 }
             }
 
-            const bool prefix_cache_allowed = !IsPrefixCacheReuseDisabled();
+            const bool prefix_cache_allowed = IsPrefixCacheAllowedForModel(current_model);
             std::unordered_set<int> determinism_prefix_hit_reqs;
             std::unordered_set<int> determinism_hybrid_restore_attempt_reqs;
             std::unordered_set<int> determinism_hybrid_restore_applied_reqs;
@@ -1279,7 +1477,7 @@ void EngineLoop(EngineState* state) {
                                     return true;
                                 };
                             determinism_hybrid_restore_attempt_reqs.insert(req->id);
-                            if (IsHybridSSMSnapshotRestoreDisabled()) {
+                            if (!IsHybridSSMSnapshotRestoreAllowedForModel(current_model)) {
                                 if (IsHybridSSMSnapshotDebugEnabled()) {
                                     std::cerr << "[HybridSSMSnapshot] restore_disabled req=" << req->id
                                               << " cached_tokens=" << hit.cached_tokens
@@ -2101,6 +2299,7 @@ void EngineLoop(EngineState* state) {
                         req->decode_thread_count = active_threads;
                         req->decode_thread_policy = decode_thread_policy;
                     }
+                    req->active_thread_count = active_threads;
                 }
             }
             if (IsDebugDecodeThreadsEnabled() && !is_embedding_batch) {
@@ -2370,6 +2569,7 @@ void EngineLoop(EngineState* state) {
             }
 
             std::chrono::steady_clock::time_point graph_build_begin, graph_build_end;
+            bool graph_build_accounted = false;
             bool built_decode_graph_cache_entry = false;
             bool reused_prefill_graph = false;
             bool using_cached_prefill_graph = false;
@@ -2410,6 +2610,11 @@ void EngineLoop(EngineState* state) {
                         cached_graph_verified_paged_decode_op = it->second.verified_paged_decode_op;
                         reused_decode_graph = true;
                         using_cached_decode_graph = true;
+                        for (Request* req : batch_requests) {
+                            if (req) {
+                                req->graph_cache_hit_count++;
+                            }
+                        }
                         if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
                             GetDecodeWorkerStats().graph_cache_hits.fetch_add(1, std::memory_order_relaxed);
                             GetDecodeWorkerStats()
@@ -2431,6 +2636,11 @@ void EngineLoop(EngineState* state) {
                     pos = it->second.pos;
                     reused_prefill_graph = true;
                     using_cached_prefill_graph = true;
+                    for (Request* req : batch_requests) {
+                        if (req) {
+                            req->graph_cache_hit_count++;
+                        }
+                    }
                 }
             }
 
@@ -2520,6 +2730,11 @@ void EngineLoop(EngineState* state) {
                                     cached_graph_verified_paged_decode_op = entry.verified_paged_decode_op;
                                     built_decode_graph_cache_entry = true;
                                     using_cached_decode_graph = true;
+                                    for (Request* req : batch_requests) {
+                                        if (req) {
+                                            req->graph_cache_miss_count++;
+                                        }
+                                    }
                                     if (is_decode_batch && decode_batch_size >= 1 && decode_batch_size <= 4) {
                                         GetDecodeWorkerStats().graph_cache_builds.fetch_add(1,
                                                                                             std::memory_order_relaxed);
@@ -2614,6 +2829,11 @@ void EngineLoop(EngineState* state) {
                                 pos = entry.pos;
                                 built_prefill_graph_cache_entry = true;
                                 using_cached_prefill_graph = true;
+                                for (Request* req : batch_requests) {
+                                    if (req) {
+                                        req->graph_cache_miss_count++;
+                                    }
+                                }
                             }
                         }
                     }
@@ -2673,6 +2893,16 @@ void EngineLoop(EngineState* state) {
                     output = BuildTransformerGraph(current_model, current_kv_cache, ctx_nodes, batch,
                                                    is_embedding_batch, gf, &embd_inp, &pos);
                     graph_build_end = std::chrono::steady_clock::now();
+                    const auto graph_build_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(graph_build_end - graph_build_begin)
+                            .count());
+                    for (Request* req : batch_requests) {
+                        if (req) {
+                            req->graph_build_ns += graph_build_ns;
+                            req->graph_cache_miss_count++;
+                        }
+                    }
+                    graph_build_accounted = true;
                     if (Request* trace_req = !batch_requests.empty() ? batch_requests[0] : nullptr) {
                         LogPrefillStage("after_prefill_graph_build", trace_req, current_model, &state->inference_ctx,
                                         nullptr, 0, output, is_prefill_batch, active_threads);
@@ -2688,9 +2918,19 @@ void EngineLoop(EngineState* state) {
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                           std::chrono::steady_clock::now() - graph_build_rebind_begin)
                                           .count());
+            if (!graph_build_accounted && graph_build_begin != std::chrono::steady_clock::time_point() &&
+                graph_build_end != std::chrono::steady_clock::time_point() && graph_build_end >= graph_build_begin) {
+                const auto graph_build_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(graph_build_end - graph_build_begin).count());
+                for (Request* req : batch_requests) {
+                    if (req) {
+                        req->graph_build_ns += graph_build_ns;
+                    }
+                }
+            }
             for (Request* req : batch_requests) {
                 if (req) {
-                    req->graph_build_rebind_ns += graph_build_rebind_ns;
+                    req->graph_rebind_ns += graph_build_rebind_ns;
                 }
             }
 
@@ -2776,6 +3016,7 @@ void EngineLoop(EngineState* state) {
             // - Could fail under heavy load or on different CPU architectures
             // =======================================================================
             ResetInferenceWorkContext(work_ctx.get());
+            ResetQwen36Profile(work_ctx.get());
             SetCurrentBatch(&batch);
 
             // Note: Memory ordering for GGML worker threads is handled internally
@@ -3067,14 +3308,46 @@ void EngineLoop(EngineState* state) {
             const auto compute_begin = std::chrono::steady_clock::now();
             ValidateMulNodesOrThrow(gf, is_decode_batch ? "decode" : "prefill");
             MaybeLogMoEGraphSummary(gf, current_model, is_prefill_batch);
+            DebugDumpGraphNodes(gf, is_decode_batch ? "decode" : "prefill");
             ResetMoEStrictFailure();
             ggml_backend_graph_compute(active_backend, gf);
             const auto compute_end = std::chrono::steady_clock::now();
             const auto graph_execute_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(compute_end - compute_begin).count());
+            const Qwen36ProfileSnapshot qwen36_profile = GetQwen36ProfileSnapshot(work_ctx.get());
             for (Request* req : batch_requests) {
                 if (req) {
                     req->graph_execute_ns += graph_execute_ns;
+                    req->attention_ns += qwen36_profile.attention_ns;
+                    req->paged_attention_ns += qwen36_profile.paged_attention_ns;
+                    req->standard_attention_ns += qwen36_profile.standard_attention_ns;
+                    req->portable_flash_attention_ns += qwen36_profile.portable_flash_attention_ns;
+                    req->native_flash_attention_ns += qwen36_profile.native_flash_attention_ns;
+                    req->hal_attention_ns += qwen36_profile.hal_attention_ns;
+                    req->attention_repack_ns += qwen36_profile.attention_repack_ns;
+                    req->moe_forward_ns += qwen36_profile.moe_forward_ns;
+                    req->shared_expert_ns += qwen36_profile.shared_expert_ns;
+                    req->quant_matmul_ns += qwen36_profile.quant_matmul_ns;
+                    req->kv_update_ns += qwen36_profile.kv_update_ns;
+                    req->sample_ns += qwen36_profile.sample_ns;
+                    req->graph_cache_hit_count += qwen36_profile.graph_cache_hits;
+                    req->graph_cache_miss_count += qwen36_profile.graph_cache_misses;
+                    req->q4k_true_batched_used =
+                        std::max(req->q4k_true_batched_used, qwen36_profile.q4k_true_batched_used);
+                    req->arm_batched_quant_used =
+                        std::max(req->arm_batched_quant_used, qwen36_profile.arm_batched_quant_used);
+                    req->attention_path_paged =
+                        std::max(req->attention_path_paged, qwen36_profile.attention_path_paged);
+                    req->attention_path_standard =
+                        std::max(req->attention_path_standard, qwen36_profile.attention_path_standard);
+                    req->attention_path_portable_flash =
+                        std::max(req->attention_path_portable_flash, qwen36_profile.attention_path_portable_flash);
+                    req->attention_path_native_flash =
+                        std::max(req->attention_path_native_flash, qwen36_profile.attention_path_native_flash);
+                    req->attention_path_hal = std::max(req->attention_path_hal, qwen36_profile.attention_path_hal);
+                    req->moe_task_count = std::max(req->moe_task_count, qwen36_profile.moe_task_count);
+                    req->selected_expert_count =
+                        std::max(req->selected_expert_count, qwen36_profile.selected_expert_count);
                 }
             }
             std::string moe_strict_failure;
@@ -3416,6 +3689,9 @@ void EngineLoop(EngineState* state) {
                 } else {
                     // Generation
                     const bool was_prefill_step = req->is_prefill;
+                    const int n_past_before_step = req->n_past;
+                    const int remaining_prompt_tokens_before_step =
+                        was_prefill_step ? static_cast<int>(req->tokens.size()) : 0;
                     auto commit_prefill_scheduler_progress = [&](bool prefill_finished) {
                         if (!state->scheduler || req->seq_id < 0) {
                             req->pending_scheduler_progress = 0;
@@ -3503,6 +3779,37 @@ void EngineLoop(EngineState* state) {
                             /*prefill_cache_active=*/using_cached_prefill_graph);
                     }
 
+                    int sampling_logits_idx = last_token_idx;
+                    std::string sampling_guard_error;
+                    if (!ResolveSamplingLogitsColumnForRequest(
+                            token_offset, processed_count, static_cast<int>(output->ne[1]), was_prefill_step,
+                            remaining_prompt_tokens_before_step, n_past_before_step, req->n_past, &sampling_logits_idx,
+                            &sampling_guard_error)) {
+                        throw densecore::InvalidArgumentException("invalid sampling logits column for req " +
+                                                                  std::to_string(req->id) + ": " +
+                                                                  sampling_guard_error);
+                    }
+                    const int debug_sampling_logits_offset = GetDebugSamplingLogitsOffset();
+                    if (debug_sampling_logits_offset != 0) {
+                        const int adjusted = sampling_logits_idx + debug_sampling_logits_offset;
+                        if (adjusted < 0 || adjusted >= static_cast<int>(output->ne[1])) {
+                            throw densecore::InvalidArgumentException(
+                                "debug sampling logits offset moved column out of bounds for req " +
+                                std::to_string(req->id));
+                        }
+                        sampling_logits_idx = adjusted;
+                    }
+                    const int debug_first_token_sampling_logits_offset = GetDebugFirstTokenSamplingLogitsOffset();
+                    if (req->generated_count == 0 && debug_first_token_sampling_logits_offset != 0) {
+                        const int adjusted = sampling_logits_idx + debug_first_token_sampling_logits_offset;
+                        if (adjusted < 0 || adjusted >= static_cast<int>(output->ne[1])) {
+                            throw densecore::InvalidArgumentException(
+                                "debug first-token sampling logits offset moved column out of bounds for req " +
+                                std::to_string(req->id));
+                        }
+                        sampling_logits_idx = adjusted;
+                    }
+
                     // Sample token
                     SamplingParams sampling_params = req->sampling_params;
                     sampling_params.token_history = &req->token_history;
@@ -3529,7 +3836,12 @@ void EngineLoop(EngineState* state) {
                             /*prefill_cache_active=*/using_cached_prefill_graph);
                     }
 
-                    int best_token = SampleToken(output, last_token_idx, sampling_params);
+                    const auto sample_begin = std::chrono::steady_clock::now();
+                    int best_token = SampleToken(output, sampling_logits_idx, sampling_params);
+                    const auto sample_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                     std::chrono::steady_clock::now() - sample_begin)
+                                                                     .count());
+                    req->sample_ns += sample_ns;
                     if (IsVerboseTokenTraceEnabled()) {
                         std::cerr << "[TRACE] Sampled token " << best_token << " for request " << req->id << std::endl;
                     }
@@ -3563,6 +3875,14 @@ void EngineLoop(EngineState* state) {
                         !req_bench_fast_path || bench_fast_path_text_enabled || req->token_result_callback != nullptr;
                     if (should_detokenize) {
                         std::string token_piece = Tokenizer::Detokenize(current_model, best_token);
+                        if (const char* env = std::getenv("DENSECORE_DEBUG_FIRST_TOKEN_RAW");
+                            env && env[0] != '\0' && best_token >= 0 &&
+                            best_token < static_cast<int>(current_model->vocab_tokens.size()) &&
+                            req->generated_count == 1) {
+                            const std::string& raw_token = current_model->vocab_tokens[static_cast<size_t>(best_token)];
+                            std::cerr << "[FIRST_TOKEN_RAW] id=" << best_token << " raw=" << raw_token
+                                      << " detok=" << token_piece << std::endl;
+                        }
                         if (!token_piece.empty()) {
                             if (req->utf8_pending.empty()) {
                                 const size_t emit_len = Utf8ValidPrefixLength(token_piece);

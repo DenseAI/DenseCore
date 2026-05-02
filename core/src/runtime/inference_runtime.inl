@@ -1,8 +1,35 @@
 // ============================================================================
 // EXPLICIT INFERENCE WORK CONTEXT (per-thread, no implicit TLS pools)
 // ============================================================================
+struct Qwen36ProfileCounters {
+    std::atomic<uint64_t> attention_ns{0};
+    std::atomic<uint64_t> paged_attention_ns{0};
+    std::atomic<uint64_t> standard_attention_ns{0};
+    std::atomic<uint64_t> portable_flash_attention_ns{0};
+    std::atomic<uint64_t> native_flash_attention_ns{0};
+    std::atomic<uint64_t> hal_attention_ns{0};
+    std::atomic<uint64_t> attention_repack_ns{0};
+    std::atomic<uint64_t> moe_forward_ns{0};
+    std::atomic<uint64_t> shared_expert_ns{0};
+    std::atomic<uint64_t> quant_matmul_ns{0};
+    std::atomic<uint64_t> kv_update_ns{0};
+    std::atomic<uint64_t> sample_ns{0};
+    std::atomic<uint64_t> graph_cache_hits{0};
+    std::atomic<uint64_t> graph_cache_misses{0};
+    std::atomic<int> moe_task_count{0};
+    std::atomic<int> selected_expert_count{0};
+    std::atomic<int> q4k_true_batched_used{0};
+    std::atomic<int> arm_batched_quant_used{0};
+    std::atomic<int> attention_path_paged{0};
+    std::atomic<int> attention_path_standard{0};
+    std::atomic<int> attention_path_portable_flash{0};
+    std::atomic<int> attention_path_native_flash{0};
+    std::atomic<int> attention_path_hal{0};
+};
+
 struct InferenceWorkContext {
     const BatchSpec* batch = nullptr;
+    Qwen36ProfileCounters qwen36_profile;
     KVCacheUserData kv_pool[256];
     std::vector<Gemma4SharedKVState> gemma4_shared_kv_states;
     QKVUserData qkv_pool[256];
@@ -36,6 +63,104 @@ struct InferenceWorkContext {
     std::vector<ggml_bf16_t> bf16_buffer;
 };
 
+bool IsQwen36ProfilingEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_QWEN36_PROFILE");
+        if (env && env[0] != '\0') {
+            return std::strcmp(env, "0") != 0;
+        }
+        env = std::getenv("DENSECORE_QWEN36_PREFILL_PROFILE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+void ResetQwen36Profile(InferenceWorkContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    p.attention_ns.store(0, std::memory_order_relaxed);
+    p.paged_attention_ns.store(0, std::memory_order_relaxed);
+    p.standard_attention_ns.store(0, std::memory_order_relaxed);
+    p.portable_flash_attention_ns.store(0, std::memory_order_relaxed);
+    p.native_flash_attention_ns.store(0, std::memory_order_relaxed);
+    p.hal_attention_ns.store(0, std::memory_order_relaxed);
+    p.attention_repack_ns.store(0, std::memory_order_relaxed);
+    p.moe_forward_ns.store(0, std::memory_order_relaxed);
+    p.shared_expert_ns.store(0, std::memory_order_relaxed);
+    p.quant_matmul_ns.store(0, std::memory_order_relaxed);
+    p.kv_update_ns.store(0, std::memory_order_relaxed);
+    p.sample_ns.store(0, std::memory_order_relaxed);
+    p.graph_cache_hits.store(0, std::memory_order_relaxed);
+    p.graph_cache_misses.store(0, std::memory_order_relaxed);
+    p.moe_task_count.store(0, std::memory_order_relaxed);
+    p.selected_expert_count.store(0, std::memory_order_relaxed);
+    p.q4k_true_batched_used.store(0, std::memory_order_relaxed);
+    p.arm_batched_quant_used.store(0, std::memory_order_relaxed);
+    p.attention_path_paged.store(0, std::memory_order_relaxed);
+    p.attention_path_standard.store(0, std::memory_order_relaxed);
+    p.attention_path_portable_flash.store(0, std::memory_order_relaxed);
+    p.attention_path_native_flash.store(0, std::memory_order_relaxed);
+    p.attention_path_hal.store(0, std::memory_order_relaxed);
+}
+
+Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) {
+    Qwen36ProfileSnapshot snapshot;
+    if (!ctx) {
+        return snapshot;
+    }
+    const auto& p = ctx->qwen36_profile;
+    snapshot.attention_ns = p.attention_ns.load(std::memory_order_relaxed);
+    snapshot.paged_attention_ns = p.paged_attention_ns.load(std::memory_order_relaxed);
+    snapshot.standard_attention_ns = p.standard_attention_ns.load(std::memory_order_relaxed);
+    snapshot.portable_flash_attention_ns = p.portable_flash_attention_ns.load(std::memory_order_relaxed);
+    snapshot.native_flash_attention_ns = p.native_flash_attention_ns.load(std::memory_order_relaxed);
+    snapshot.hal_attention_ns = p.hal_attention_ns.load(std::memory_order_relaxed);
+    snapshot.attention_repack_ns = p.attention_repack_ns.load(std::memory_order_relaxed);
+    snapshot.moe_forward_ns = p.moe_forward_ns.load(std::memory_order_relaxed);
+    snapshot.shared_expert_ns = p.shared_expert_ns.load(std::memory_order_relaxed);
+    snapshot.quant_matmul_ns = p.quant_matmul_ns.load(std::memory_order_relaxed);
+    snapshot.kv_update_ns = p.kv_update_ns.load(std::memory_order_relaxed);
+    snapshot.sample_ns = p.sample_ns.load(std::memory_order_relaxed);
+    snapshot.graph_cache_hits = p.graph_cache_hits.load(std::memory_order_relaxed);
+    snapshot.graph_cache_misses = p.graph_cache_misses.load(std::memory_order_relaxed);
+    snapshot.moe_task_count = p.moe_task_count.load(std::memory_order_relaxed);
+    snapshot.selected_expert_count = p.selected_expert_count.load(std::memory_order_relaxed);
+    snapshot.q4k_true_batched_used = p.q4k_true_batched_used.load(std::memory_order_relaxed);
+    snapshot.arm_batched_quant_used = p.arm_batched_quant_used.load(std::memory_order_relaxed);
+    snapshot.attention_path_paged = p.attention_path_paged.load(std::memory_order_relaxed);
+    snapshot.attention_path_standard = p.attention_path_standard.load(std::memory_order_relaxed);
+    snapshot.attention_path_portable_flash = p.attention_path_portable_flash.load(std::memory_order_relaxed);
+    snapshot.attention_path_native_flash = p.attention_path_native_flash.load(std::memory_order_relaxed);
+    snapshot.attention_path_hal = p.attention_path_hal.load(std::memory_order_relaxed);
+    return snapshot;
+}
+
+static inline void AddQwen36ProfileNs(std::atomic<uint64_t>& counter, uint64_t value) {
+    if (!IsQwen36ProfilingEnabled() || value == 0) {
+        return;
+    }
+    counter.fetch_add(value, std::memory_order_relaxed);
+}
+
+static inline void SetQwen36ProfileMax(std::atomic<int>& counter, int value) {
+    if (!IsQwen36ProfilingEnabled() || value <= 0) {
+        return;
+    }
+    int current = counter.load(std::memory_order_relaxed);
+    while (current < value &&
+           !counter.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+static inline void MarkQwen36ProfileFlag(std::atomic<int>& counter) {
+    if (!IsQwen36ProfilingEnabled()) {
+        return;
+    }
+    counter.store(1, std::memory_order_relaxed);
+}
+
 InferenceWorkContext* CreateInferenceWorkContext() {
     return new InferenceWorkContext();
 }
@@ -47,6 +172,7 @@ void DestroyInferenceWorkContext(InferenceWorkContext* ctx) {
 void ResetInferenceWorkContext(InferenceWorkContext* ctx) {
     if (!ctx) return;
     ctx->batch = nullptr;
+    ResetQwen36Profile(ctx);
     ctx->gemma4_shared_kv_states.clear();
     ctx->qkv_index = 0;
     ctx->add_rmsnorm_index = 0;

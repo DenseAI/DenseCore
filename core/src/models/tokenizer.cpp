@@ -346,6 +346,17 @@ bool IsByteLevelBpeTokenizer(const TransformerModel* model) {
     return probe_hits >= 3;
 }
 
+bool UseByteUnicodeDetokenization(const TransformerModel* model) {
+    if (!model) return false;
+    if (densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE) {
+        const char* env = std::getenv("DENSECORE_QWEN35_DETOKENIZE_RAW_LITERAL");
+        if (env && env[0] != '\0' && std::strcmp(env, "0") != 0) {
+            return false;
+        }
+    }
+    return IsByteLevelBpeTokenizer(model);
+}
+
 std::string DetokenizeImpl(const TransformerModel* model, int token_id) {
     if (!model || token_id < 0 || token_id >= static_cast<int>(model->vocab_tokens.size())) {
         return "";
@@ -375,7 +386,7 @@ std::string DetokenizeImpl(const TransformerModel* model, int token_id) {
     std::string out;
     out.reserve(token.size());
 
-    if (!IsByteLevelBpeTokenizer(model)) {
+    if (!UseByteUnicodeDetokenization(model)) {
         for (const std::string& unit : units) {
             if (unit == "▁") {
                 out.push_back(' ');

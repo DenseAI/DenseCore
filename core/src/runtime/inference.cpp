@@ -74,6 +74,30 @@
 #endif
 
 namespace {
+
+bool IsDebugSharedExpertShapeEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_VALIDATE_MUL");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+void DebugLogSharedExpertTensor(const char* stage, int layer_idx, const struct ggml_tensor* tensor) {
+    if (!IsDebugSharedExpertShapeEnabled() || !tensor) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "[SharedExpertShape] layer=%d stage=%s name=%s type=%d ne=[%lld,%lld,%lld,%lld] "
+                 "nb=[%lld,%lld,%lld,%lld]\n",
+                 layer_idx, stage ? stage : "<unknown>", tensor->name[0] ? tensor->name : "<unnamed>",
+                 static_cast<int>(tensor->type), static_cast<long long>(tensor->ne[0]),
+                 static_cast<long long>(tensor->ne[1]), static_cast<long long>(tensor->ne[2]),
+                 static_cast<long long>(tensor->ne[3]), static_cast<long long>(tensor->nb[0]),
+                 static_cast<long long>(tensor->nb[1]), static_cast<long long>(tensor->nb[2]),
+                 static_cast<long long>(tensor->nb[3]));
+}
+
 using densecore::env::ParseIntEnv;
 using densecore::env::ParsePositiveEnvInt;
 using densecore::env::ParseRuntimeToggleMode;
@@ -301,6 +325,22 @@ static bool IsDebugFfnProjectionReferenceEnabled() {
 static bool IsDebugSSMCoreReferenceEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_SSM_CORE_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsQwen36AttentionGateDisabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_QWEN36_DISABLE_ATTENTION_GATE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsQwen36SharedExpertBranchDisabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_QWEN36_DISABLE_SHARED_EXPERT_BRANCH");
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
@@ -597,10 +637,32 @@ static bool IsQuantNrcBatchEnabled() {
     return enabled;
 }
 
+static bool ResolveQ4KTrueBatchedKernelEnabledPolicy(RuntimeToggleMode mode, densecore::simd::SimdLevel level,
+                                                     bool compiled_with_sve);
+
 // Deprecated path: keep disabled until a correctness/perf-positive
 // implementation is available.
 static bool IsQ4KTrueBatchedKernelEnabled() {
-    return false;
+    return ResolveQ4KTrueBatchedKernelEnabledPolicy(
+        ParseRuntimeToggleMode("DENSECORE_ENABLE_Q4K_TRUE_BATCHED", RuntimeToggleMode::Auto),
+        densecore::simd::DetectSimdLevel(),
+#if defined(__ARM_FEATURE_SVE)
+        true
+#else
+        false
+#endif
+    );
+}
+
+static bool ResolveQ4KTrueBatchedKernelEnabledPolicy(RuntimeToggleMode mode, densecore::simd::SimdLevel level,
+                                                     bool compiled_with_sve) {
+    if (mode == RuntimeToggleMode::Off) {
+        return false;
+    }
+    if (mode == RuntimeToggleMode::On) {
+        return true;
+    }
+    return compiled_with_sve && (level == densecore::simd::SimdLevel::SVE || level == densecore::simd::SimdLevel::SVE2);
 }
 
 static bool IsQ4KTrueBatchedAvx2Enabled() {
@@ -697,6 +759,29 @@ static int ResolveTaskCount(const BatchSpec* batch, int work_items) {
         n_tasks = std::min(n_tasks, work_items);
     }
     return std::max(1, n_tasks);
+}
+
+static bool IsQwen36MoEParallelEnabled(const TransformerModel* model, const BatchSpec* batch) {
+    const RuntimeToggleMode mode = ParseRuntimeToggleMode("DENSECORE_QWEN36_MOE_PARALLEL", RuntimeToggleMode::Auto);
+    if (mode == RuntimeToggleMode::Off) {
+        return false;
+    }
+    if (mode == RuntimeToggleMode::On) {
+        return true;
+    }
+    if (!model || !batch) {
+        return false;
+    }
+    return model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm && model->hparams.n_experts > 0;
+}
+
+static int ResolveQwen36MoECallbackTaskCount(const TransformerModel* model, const BatchSpec* batch, int top_k) {
+    (void)model;
+    (void)batch;
+    (void)top_k;
+    // Qwen3.6 MoE parallelism is backend-owned. Keep the ggml callback single-task
+    // so routing and reduction semantics run exactly once per forward.
+    return 1;
 }
 
 static densecore::simd::SimdLevel GetRuntimeSimdLevel() {
@@ -1955,11 +2040,41 @@ void cb_silu_mul_fused(struct ggml_tensor* dst, const struct ggml_tensor* a, con
     const float* up = reinterpret_cast<const float*>(b->data);
     float* out = reinterpret_cast<float*>(dst->data);
 
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return;
+    }
+    if (a->nb[0] != static_cast<int64_t>(sizeof(float)) || b->nb[0] != static_cast<int64_t>(sizeof(float)) ||
+        dst->nb[0] != static_cast<int64_t>(sizeof(float))) {
+        return;
+    }
+
     // Total elements (flattened)
     const size_t size = ggml_nelements(a);
 
-    // Use parallel SiLU×Mul from densecore/simd/simd_ops.h
-    densecore::simd::SiLUMulParallel(out, gate, up, size, ith, nth);
+    if (ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(dst)) {
+        densecore::simd::SiLUMulParallel(out, gate, up, size, ith, nth);
+        return;
+    }
+
+    const size_t begin = (size * static_cast<size_t>(ith)) / static_cast<size_t>(nth);
+    const size_t end = (size * static_cast<size_t>(ith + 1)) / static_cast<size_t>(nth);
+    const auto offset_bytes = [](const ggml_tensor* tensor, size_t flat_idx) -> size_t {
+        size_t rem = flat_idx;
+        size_t offset = 0;
+        for (int dim = 0; dim < 4; ++dim) {
+            const int64_t extent = tensor->ne[dim] > 0 ? tensor->ne[dim] : 1;
+            const size_t coord = rem % static_cast<size_t>(extent);
+            rem /= static_cast<size_t>(extent);
+            offset += coord * static_cast<size_t>(tensor->nb[dim]);
+        }
+        return offset;
+    };
+    for (size_t flat = begin; flat < end; ++flat) {
+        const float g = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(a->data) + offset_bytes(a, flat));
+        const float u = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(b->data) + offset_bytes(b, flat));
+        float* dst_ptr = reinterpret_cast<float*>(reinterpret_cast<char*>(dst->data) + offset_bytes(dst, flat));
+        *dst_ptr = (g / (1.0f + std::exp(-g))) * u;
+    }
 }
 
 void cb_gelu_mul_fused(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b, int ith,
@@ -1999,29 +2114,17 @@ void cb_gelu_tanh_unary(struct ggml_tensor* dst, const struct ggml_tensor* src, 
     }
 }
 
-struct SharedScalarGateApplyUserData {
-    const struct ggml_tensor* gate_logits_scalar = nullptr;
-};
-
-static inline SharedScalarGateApplyUserData* GetSharedScalarGateApplyUserData() {
-    static thread_local SharedScalarGateApplyUserData pool[64];
-    static thread_local int index = 0;
-    if (index >= 64) {
-        index = 0;
-    }
-    return &pool[index++];
-}
-
-static void cb_apply_shared_scalar_gate(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+static void cb_apply_shared_scalar_gate(struct ggml_tensor* dst, const struct ggml_tensor* src,
+                                        const struct ggml_tensor* gate_logits_scalar, int ith, int nth,
                                         void* userdata) {
-    auto* ud = static_cast<SharedScalarGateApplyUserData*>(userdata);
-    if (!dst || !src || !ud || !ud->gate_logits_scalar || !dst->data || !src->data || !ud->gate_logits_scalar->data) {
+    (void)userdata;
+    if (!dst || !src || !gate_logits_scalar || !dst->data || !src->data || !gate_logits_scalar->data) {
         return;
     }
 
     const int hidden = static_cast<int>(src->ne[0]);
     const int tokens = static_cast<int>(std::max<int64_t>(1, src->ne[1]));
-    const int scalar_elems = static_cast<int>(ggml_nelements(ud->gate_logits_scalar));
+    const int scalar_elems = static_cast<int>(ggml_nelements(gate_logits_scalar));
     if (hidden <= 0 || tokens <= 0 || scalar_elems < tokens) {
         return;
     }
@@ -2037,10 +2140,10 @@ static void cb_apply_shared_scalar_gate(struct ggml_tensor* dst, const struct gg
 
     const float* src_base = reinterpret_cast<const float*>(src->data);
     float* dst_base = reinterpret_cast<float*>(dst->data);
-    const float* gate_base = reinterpret_cast<const float*>(ud->gate_logits_scalar->data);
+    const float* gate_base = reinterpret_cast<const float*>(gate_logits_scalar->data);
     const ptrdiff_t src_row_stride = static_cast<ptrdiff_t>(src->nb[1] / sizeof(float));
     const ptrdiff_t dst_row_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
-    const ptrdiff_t gate_row_stride = static_cast<ptrdiff_t>(ud->gate_logits_scalar->nb[1] / sizeof(float));
+    const ptrdiff_t gate_row_stride = static_cast<ptrdiff_t>(gate_logits_scalar->nb[1] / sizeof(float));
 
     const int token_begin = (tokens * ith) / nth;
     const int token_end = (tokens * (ith + 1)) / nth;
@@ -2082,6 +2185,7 @@ struct SSMConv1DUserData {
     const float* weight;
     int channels;
     int kernel_size;
+    bool apply_silu = false;
     int layer_idx = -1;
     int ssm_ordinal = -1;
     const int* token_seq_ids = nullptr;
@@ -2128,6 +2232,7 @@ struct RmsNormReferenceUserData {
 struct HiddenSnapshotUserData {
     int layer_idx = -1;
     int token_idx = -1;
+    const int* token_ids = nullptr;
     const int* token_seq_ids = nullptr;
     const char* stage = nullptr;
     const char* var_name = nullptr;
@@ -2539,6 +2644,15 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
         if (!force_cpu_norm) {
             struct ggml_tensor* out = ggml_rms_norm(ctx_c, src, model->hparams.f_norm_rms_eps);
+            if (debug_name) {
+                char rms_name[96];
+                if (debug_layer_idx >= 0) {
+                    std::snprintf(rms_name, sizeof(rms_name), "blk.%d.%s_rms", debug_layer_idx, debug_name);
+                } else {
+                    std::snprintf(rms_name, sizeof(rms_name), "%s_rms", debug_name);
+                }
+                ggml_set_name(out, rms_name);
+            }
             out = ggml_mul(ctx_c, out, effective_norm_weight);
             if (debug_name) {
                 ggml_set_name(out, debug_name);
@@ -2699,6 +2813,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             if (hidden_ud) {
                 hidden_ud->layer_idx = il;
                 hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                hidden_ud->token_ids = batch.tokens.data();
                 hidden_ud->token_seq_ids = batch.seq_id.data();
                 hidden_ud->stage = "layer_input";
                 hidden_ud->var_name = "inpL";
@@ -2820,6 +2935,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             conv_ud->weight = ssm_rt.conv1d_f32.data();
             conv_ud->channels = conv_channels;
             conv_ud->kernel_size = conv_kernel;
+            conv_ud->apply_silu = (model->variant == ModelVariant::QWEN36);
             conv_ud->layer_idx = il;
             conv_ud->ssm_ordinal = ssm_ordinal;
             conv_ud->token_seq_ids = batch.seq_id.data();
@@ -2855,18 +2971,21 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             scan_ud->norm_eps = model->hparams.f_norm_rms_eps;
             scan_ud->layer_idx = il;
             scan_ud->ssm_ordinal = ssm_ordinal;
+            scan_ud->projection_profile = model->variant == ModelVariant::QWEN36
+                                              ? Qwen35SSMQkvProjectionProfile::QWEN36_OFFICIAL
+                                              : Qwen35SSMQkvProjectionProfile::QWEN35_LEGACY;
             scan_ud->token_seq_ids = batch.seq_id.data();
             scan_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
             scan_ud->z_tensor = z;
+            scan_ud->qkv_tensor = qkv_conv;
             scan_ud->input_tensor = cur;
-            if (gf) {
-                ggml_build_forward_expand(gf, z);
-                ggml_build_forward_expand(gf, cur);
-            }
-            struct ggml_tensor* y_scratch = ggml_map_custom1(ctx_c, qkv_conv, cb_ssm_qwen35_delta_qkv_only, 1, scan_ud);
-            struct ggml_tensor* y = ggml_cont(ctx_c, ggml_view_2d(ctx_c, y_scratch, d_inner, N, y_scratch->nb[1], 0));
+            struct ggml_tensor* y = ggml_map_custom2(ctx_c, z, qkv_conv, cb_ssm_qwen35_delta_z_qkv, 1, scan_ud);
 
-            // 4. Output projection: [d_inner, N] → [n_embd, N]
+            // 4. Output projection: [d_inner, N] -> [n_embd, N]
+            // Qwen3.6 hybrid SSM hits large-M prefill shapes here, and the generic
+            // quantized dispatcher can drift on C4A. Keep this projection on the
+            // plain ggml matmul path until the batched quantized path is proven
+            // exact for SSM output weights too.
             cur = smart_mul_mat(ctx_c, ssm_out_w, y, model);
             if (IsDebugSSMProjectionReferenceEnabled()) {
                 ProjectionReferenceUserData* out_ref_ud = GetProjectionReferenceUserData();
@@ -2883,6 +3002,18 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             attn_out = cur;
             attn_post_residual = ggml_add(ctx_c, cur, inpL);
             cur = attn_post_residual;
+            if (ShouldRunHiddenSnapshotProbe(il, "after_attn_residual")) {
+                auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
+                if (hidden_ud) {
+                    hidden_ud->layer_idx = il;
+                    hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                    hidden_ud->token_ids = batch.tokens.data();
+                    hidden_ud->token_seq_ids = batch.seq_id.data();
+                    hidden_ud->stage = "after_attn_residual";
+                    hidden_ud->var_name = "attn_post_residual";
+                    cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
+                }
+            }
         } else {
             // =================================================================
             // Attention Layer Forward Path
@@ -3031,9 +3162,14 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 Kcur = ggml_view_2d(ctx_c, qkv_merged, dim_k_fused, N, qkv_merged->nb[1], k_offset);
                 Vcur = ggml_view_2d(ctx_c, qkv_merged, dim_v_fused, N, qkv_merged->nb[1], v_offset);
             } else {
-                Qcur = smart_mul_mat(ctx_c, wq, cur, model);
-                Kcur = smart_mul_mat(ctx_c, wk, cur, model);
-                Vcur = smart_mul_mat(ctx_c, wv, cur, model);
+                const bool prefer_plain_attention_projections =
+                    model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm;
+                Qcur = prefer_plain_attention_projections ? ggml_mul_mat(ctx_c, wq, cur)
+                                                          : smart_mul_mat(ctx_c, wq, cur, model);
+                Kcur = prefer_plain_attention_projections ? ggml_mul_mat(ctx_c, wk, cur)
+                                                          : smart_mul_mat(ctx_c, wk, cur, model);
+                Vcur = prefer_plain_attention_projections ? ggml_mul_mat(ctx_c, wv, cur)
+                                                          : smart_mul_mat(ctx_c, wv, cur, model);
                 if (ShouldRunAttentionProjectionReferenceProbe(il)) {
                     ProjectionReferenceUserData* q_ref_ud = GetProjectionReferenceUserData();
                     q_ref_ud->weight_tensor = wq;
@@ -3761,6 +3897,21 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                                               attention_dispatch.portable_cpu_flash_attention_supported,
                                               attention_dispatch.hal_attention_offset_safe);
                 }
+                if (IsQwen36ProfilingEnabled()) {
+                    if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+                        if (use_paged_decode_attention) {
+                            MarkQwen36ProfileFlag(work_ctx->qwen36_profile.attention_path_paged);
+                        } else if (attention_dispatch.use_hal_attention_dispatch) {
+                            MarkQwen36ProfileFlag(work_ctx->qwen36_profile.attention_path_hal);
+                        } else if (attention_dispatch.use_portable_cpu_flash_attention) {
+                            MarkQwen36ProfileFlag(work_ctx->qwen36_profile.attention_path_portable_flash);
+                        } else if (attention_dispatch.use_flash_attention) {
+                            MarkQwen36ProfileFlag(work_ctx->qwen36_profile.attention_path_native_flash);
+                        } else {
+                            MarkQwen36ProfileFlag(work_ctx->qwen36_profile.attention_path_standard);
+                        }
+                    }
+                }
 
                 if (use_paged_decode_attention) {
                     KQV = ExecutePagedDecodeAttentionPath(ctx_c, model, cache, Qcur, Kcur, Vcur, il, kv_cache_layer,
@@ -3886,7 +4037,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             const int attn_out_head_dim = static_cast<int>(KQV_merged->ne[0]);
             cur = ggml_reshape_2d(ctx_c, KQV_merged, attn_out_head_dim * n_head, N);
-            if (attn_gate) {
+            if (attn_gate && !(model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm &&
+                               IsQwen36AttentionGateDisabled())) {
                 attn_gate = ggml_sigmoid(ctx_c, attn_gate);
                 cur = ggml_mul(ctx_c, cur, attn_gate);
             }
@@ -3907,7 +4059,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             if (!wo) {
                 throw densecore::InvalidArgumentException("Missing attn_output weight in TransformerLayer");
             }
-            cur = smart_mul_mat(ctx_c, wo, cur, model);
+            const bool prefer_plain_attn_output_matmul =
+                model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm;
+            cur = prefer_plain_attn_output_matmul ? ggml_mul_mat(ctx_c, wo, cur) : smart_mul_mat(ctx_c, wo, cur, model);
             if (ShouldRunAttentionProjectionReferenceProbe(il)) {
                 ProjectionReferenceUserData* o_ref_ud = GetProjectionReferenceUserData();
                 o_ref_ud->weight_tensor = wo;
@@ -3939,6 +4093,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 if (hidden_ud) {
                     hidden_ud->layer_idx = il;
                     hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                    hidden_ud->token_ids = batch.tokens.data();
                     hidden_ud->token_seq_ids = batch.seq_id.data();
                     hidden_ud->stage = "attn_out_pre_residual";
                     hidden_ud->var_name = "attn_out";
@@ -3953,6 +4108,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 if (hidden_ud) {
                     hidden_ud->layer_idx = il;
                     hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                    hidden_ud->token_ids = batch.tokens.data();
                     hidden_ud->token_seq_ids = batch.seq_id.data();
                     hidden_ud->stage = "after_attn_residual";
                     hidden_ud->var_name = "attn_post_residual";
@@ -4066,6 +4222,18 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         if (!used_fused_pre_ffn_norm) {
             cur = apply_weighted_rms_norm(cur, ffn_norm, "ffn_norm", il);
         }
+        if (ShouldRunHiddenSnapshotProbe(il, "after_ffn_norm")) {
+            auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
+            if (hidden_ud) {
+                hidden_ud->layer_idx = il;
+                hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                hidden_ud->token_ids = batch.tokens.data();
+                hidden_ud->token_seq_ids = batch.seq_id.data();
+                hidden_ud->stage = "after_ffn_norm";
+                hidden_ud->var_name = "ffn_norm";
+                cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
+            }
+        }
 
         if (model->layers[il].is_moe) {
             // =====================================================================
@@ -4139,6 +4307,12 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 moe_ud->k = model->hparams.n_experts_used;
                 moe_ud->batch = &batch;
                 moe_ud->scheduler = batch.scheduler;
+                if (IsQwen36ProfilingEnabled()) {
+                    if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+                        moe_ud->profile = &work_ctx->qwen36_profile;
+                        SetQwen36ProfileMax(work_ctx->qwen36_profile.moe_task_count, 1);
+                    }
+                }
                 // Resolve preferred device first, then guarantee CPU fallback for MoE.
                 densecore::BackendRegistry& registry = ResolveBackendRegistry(&batch);
                 densecore::ComputeBackend* preferred_backend = registry.Get(ResolvePreferredDevice(&batch));
@@ -4172,7 +4346,6 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             }
 
             // Use map_custom2: src0=cur, src1=gate_logits
-            // Use 1 task (single thread dispatch, threaded inside backend)
             g_moe_graph_wiring_debug_counter.fetch_add(1, std::memory_order_relaxed);
             cur = ggml_map_custom2(ctx_c, routed_input, gate_logits, cb_moe_forward, 1, moe_ud);
             {
@@ -4180,14 +4353,57 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 std::snprintf(moe_name, sizeof(moe_name), "blk.%d.moe_forward", il);
                 ggml_set_name(cur, moe_name);
             }
+            if (ShouldRunHiddenSnapshotProbe(il, "moe_routed_output")) {
+                auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
+                if (hidden_ud) {
+                    hidden_ud->layer_idx = il;
+                    hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                    hidden_ud->token_ids = batch.tokens.data();
+                    hidden_ud->token_seq_ids = batch.seq_id.data();
+                    hidden_ud->stage = "moe_routed_output";
+                    hidden_ud->var_name = "moe_forward";
+                    cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
+                }
+            }
 
             // Shared-expert branch runs in parallel with routed experts.
-            if (model->moe_n_shared_experts > 0 && ffn_gate && ffn_up && ffn_down) {
+            const bool disable_qwen35_shared_expert_branch =
+                model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
+            const bool disable_qwen36_shared_expert_branch = model->variant == ModelVariant::QWEN36 &&
+                                                             model->arch_flags.is_hybrid_ssm &&
+                                                             IsQwen36SharedExpertBranchDisabled();
+            if ((disable_qwen35_shared_expert_branch || disable_qwen36_shared_expert_branch) && il == 0) {
+                static bool logged_shared_expert_disable = false;
+                if (!logged_shared_expert_disable) {
+                    const char* reason =
+                        disable_qwen35_shared_expert_branch
+                            ? "Qwen3.5 shared-expert branch disabled on hybrid SSM path while routed expert generation "
+                              "correctness is recovered"
+                            : "Qwen3.6 shared-expert branch disabled on hybrid SSM path for garbage-output isolation";
+                    std::cerr << "[DenseCore] " << reason << std::endl;
+                    logged_shared_expert_disable = true;
+                }
+            }
+            if (!disable_qwen35_shared_expert_branch && !disable_qwen36_shared_expert_branch &&
+                model->moe_n_shared_experts > 0 && ffn_gate && ffn_up && ffn_down) {
                 if (!is_gemma4_moe && !ffn_shared_gate) {
                     throw densecore::InvalidArgumentException("Missing shared expert gate weight in TransformerLayer");
                 }
-                struct ggml_tensor* shared_gate = smart_mul_mat(ctx_c, ffn_gate, shared_input, model);
-                struct ggml_tensor* shared_up = smart_mul_mat(ctx_c, ffn_up, shared_input, model);
+                DebugLogSharedExpertTensor("shared_input", il, shared_input);
+                DebugLogSharedExpertTensor("ffn_gate_w", il, ffn_gate);
+                DebugLogSharedExpertTensor("ffn_up_w", il, ffn_up);
+                DebugLogSharedExpertTensor("ffn_down_w", il, ffn_down);
+                DebugLogSharedExpertTensor("ffn_shared_gate_w", il, ffn_shared_gate);
+                const bool prefer_plain_shared_expert_matmul =
+                    model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm;
+                struct ggml_tensor* shared_gate = prefer_plain_shared_expert_matmul
+                                                      ? ggml_mul_mat(ctx_c, ffn_gate, shared_input)
+                                                      : smart_mul_mat(ctx_c, ffn_gate, shared_input, model);
+                struct ggml_tensor* shared_up = prefer_plain_shared_expert_matmul
+                                                    ? ggml_mul_mat(ctx_c, ffn_up, shared_input)
+                                                    : smart_mul_mat(ctx_c, ffn_up, shared_input, model);
+                DebugLogSharedExpertTensor("shared_gate_proj", il, shared_gate);
+                DebugLogSharedExpertTensor("shared_up_proj", il, shared_up);
                 if (ShouldRunFfnProjectionReferenceProbe(il)) {
                     ProjectionReferenceUserData* shared_gate_ref_ud = GetProjectionReferenceUserData();
                     shared_gate_ref_ud->weight_tensor = ffn_gate;
@@ -4209,16 +4425,22 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     shared_up = ggml_map_custom1(ctx_c, shared_up, cb_projection_reference_probe, 1, shared_up_ref_ud);
                 }
                 struct ggml_tensor* shared_ffn = nullptr;
+                const bool prefer_native_silu_mul = prefer_plain_shared_expert_matmul;
                 if (is_gemma4_moe) {
                     // Match llama.cpp Gemma4 path: use native GEGLU so strided matmul
                     // outputs do not rely on custom flat-memory assumptions.
                     shared_ffn = ggml_geglu_split(ctx_c, shared_gate, shared_up);
+                } else if (prefer_native_silu_mul) {
+                    shared_ffn = ggml_mul(ctx_c, ggml_silu(ctx_c, shared_gate), shared_up);
                 } else {
                     shared_ffn =
                         ggml_map_custom2(ctx_c, shared_gate, shared_up, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
                 }
+                DebugLogSharedExpertTensor("shared_ffn_pre_down", il, shared_ffn);
                 struct ggml_tensor* shared_ffn_input = shared_ffn;
-                shared_ffn = smart_mul_mat(ctx_c, ffn_down, shared_ffn, model);
+                shared_ffn = prefer_plain_shared_expert_matmul ? ggml_mul_mat(ctx_c, ffn_down, shared_ffn)
+                                                               : smart_mul_mat(ctx_c, ffn_down, shared_ffn, model);
+                DebugLogSharedExpertTensor("shared_ffn_post_down", il, shared_ffn);
                 if (ShouldRunFfnProjectionReferenceProbe(il)) {
                     ProjectionReferenceUserData* shared_down_ref_ud = GetProjectionReferenceUserData();
                     shared_down_ref_ud->weight_tensor = ffn_down;
@@ -4240,8 +4462,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                                                       il);
                     }
                 } else {
-                    struct ggml_tensor* shared_gate_logits = smart_mul_mat(ctx_c, ffn_shared_gate, shared_input, model);
+                    struct ggml_tensor* shared_gate_logits = ggml_mul_mat(ctx_c, ffn_shared_gate, shared_input);
                     struct ggml_tensor* shared_gate_logits_scalar = shared_gate_logits;
+                    DebugLogSharedExpertTensor("shared_scalar_gate_proj", il, shared_gate_logits);
                     if (ShouldRunFfnProjectionReferenceProbe(il)) {
                         ProjectionReferenceUserData* shared_scalar_gate_ref_ud = GetProjectionReferenceUserData();
                         shared_scalar_gate_ref_ud->weight_tensor = ffn_shared_gate;
@@ -4273,12 +4496,11 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                                                               1, shared_scalar_gate_ref_ud);
                     }
                     struct ggml_tensor* shared_ffn_pre_scalar_gate = shared_ffn;
-                    SharedScalarGateApplyUserData* shared_gate_apply_ud = GetSharedScalarGateApplyUserData();
-                    shared_gate_apply_ud->gate_logits_scalar = shared_gate_logits_scalar;
                     const int shared_gate_tasks = ResolveTaskCount(
                         &batch, std::max<int>(1, static_cast<int>(std::max<int64_t>(1, shared_ffn->ne[1]))));
-                    shared_ffn = ggml_map_custom1(ctx_c, shared_ffn, cb_apply_shared_scalar_gate, shared_gate_tasks,
-                                                  shared_gate_apply_ud);
+                    shared_ffn = ggml_map_custom2(ctx_c, shared_ffn, shared_gate_logits_scalar,
+                                                  cb_apply_shared_scalar_gate, shared_gate_tasks, nullptr);
+                    DebugLogSharedExpertTensor("shared_ffn_post_scalar_gate", il, shared_ffn);
                     if (ShouldRunSharedScalarGateReferenceProbe(il)) {
                         SharedScalarGateReferenceUserData* shared_gate_runtime_ud =
                             GetSharedScalarGateReferenceUserData();
@@ -4293,6 +4515,18 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     }
                 }
                 cur = ggml_add(ctx_c, cur, shared_ffn);
+                if (ShouldRunHiddenSnapshotProbe(il, "moe_after_shared")) {
+                    auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
+                    if (hidden_ud) {
+                        hidden_ud->layer_idx = il;
+                        hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                        hidden_ud->token_ids = batch.tokens.data();
+                        hidden_ud->token_seq_ids = batch.seq_id.data();
+                        hidden_ud->stage = "moe_after_shared";
+                        hidden_ud->var_name = "moe_plus_shared";
+                        cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
+                    }
+                }
             }
         } else {
             // =====================================================================
@@ -4343,7 +4577,11 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 // outputs do not rely on custom flat-memory assumptions.
                 cur = ggml_geglu_split(ctx_c, w1, w3);
             } else {
-                cur = ggml_map_custom2(ctx_c, w1, w3, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+                if (model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm) {
+                    cur = ggml_mul(ctx_c, ggml_silu(ctx_c, w1), w3);
+                } else {
+                    cur = ggml_map_custom2(ctx_c, w1, w3, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+                }
             }
             ggml_set_name(cur, "ffn_silu_mul_fused");
 
@@ -4371,6 +4609,18 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         if (auto* gemma_post_ffn_norm = model->layers[il].Get(kGemma4PostFfnNormKey)) {
             cur = apply_weighted_rms_norm(cur, gemma_post_ffn_norm, "gemma4_post_feedforward_layernorm", il);
         }
+        if (ShouldRunHiddenSnapshotProbe(il, "ffn_out_pre_residual")) {
+            auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
+            if (hidden_ud) {
+                hidden_ud->layer_idx = il;
+                hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                hidden_ud->token_ids = batch.tokens.data();
+                hidden_ud->token_seq_ids = batch.seq_id.data();
+                hidden_ud->stage = "ffn_out_pre_residual";
+                hidden_ud->var_name = "ffn_out";
+                cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
+            }
+        }
 
         // Residual connection
         cur = ggml_add(ctx_c, cur, inpFF);
@@ -4379,6 +4629,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             if (hidden_ud) {
                 hidden_ud->layer_idx = il;
                 hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                hidden_ud->token_ids = batch.tokens.data();
                 hidden_ud->token_seq_ids = batch.seq_id.data();
                 hidden_ud->stage = "after_ffn_residual";
                 hidden_ud->var_name = "layer_output";
@@ -4409,6 +4660,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     if (hidden_ud) {
                         hidden_ud->layer_idx = il;
                         hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                        hidden_ud->token_ids = batch.tokens.data();
                         hidden_ud->token_seq_ids = batch.seq_id.data();
                         hidden_ud->stage = "after_per_layer_input";
                         hidden_ud->var_name = "layer_output";
@@ -4430,6 +4682,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     if (hidden_ud) {
                         hidden_ud->layer_idx = il;
                         hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                        hidden_ud->token_ids = batch.tokens.data();
                         hidden_ud->token_seq_ids = batch.seq_id.data();
                         hidden_ud->stage = "after_layer_output_scale";
                         hidden_ud->var_name = "layer_output";
@@ -4529,6 +4782,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         if (hidden_ud) {
             hidden_ud->layer_idx = static_cast<int>(model->layers.size());
             hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+            hidden_ud->token_ids = batch.tokens.data();
             hidden_ud->token_seq_ids = batch.seq_id.data();
             hidden_ud->stage = "pre_output_norm_hidden";
             hidden_ud->var_name = "cur";
@@ -4546,6 +4800,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         if (hidden_ud) {
             hidden_ud->layer_idx = static_cast<int>(model->layers.size());
             hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+            hidden_ud->token_ids = batch.tokens.data();
             hidden_ud->token_seq_ids = batch.seq_id.data();
             hidden_ud->stage = "pre_lm_head_hidden";
             hidden_ud->var_name = "cur";
@@ -4692,7 +4947,13 @@ bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchS
         int n_tasks;
         void* userdata;
     };
+    struct Custom2ParamsView {
+        ggml_custom2_op_t fun;
+        int n_tasks;
+        void* userdata;
+    };
     static_assert(sizeof(Custom1ParamsView) <= GGML_MAX_OP_PARAMS, "Custom1ParamsView too large");
+    static_assert(sizeof(Custom2ParamsView) <= GGML_MAX_OP_PARAMS, "Custom2ParamsView too large");
     static_assert(sizeof(Custom3ParamsView) <= GGML_MAX_OP_PARAMS, "Custom3ParamsView too large");
 
     int conv_rebinds = 0;
@@ -4726,6 +4987,21 @@ bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchS
             Custom3ParamsView params{};
             std::memcpy(&params, node->op_params, sizeof(params));
             if (params.fun == cb_ssm_qwen35_delta) {
+                auto* ud = static_cast<SSMQwen35DeltaUserData*>(params.userdata);
+                if (!ud) {
+                    return false;
+                }
+                ud->token_seq_ids = seq_ids;
+                ud->runtime_states = runtime_states;
+                delta_rebinds++;
+            }
+            continue;
+        }
+
+        if (node->op == GGML_OP_MAP_CUSTOM2) {
+            Custom2ParamsView params{};
+            std::memcpy(&params, node->op_params, sizeof(params));
+            if (params.fun == cb_ssm_qwen35_delta_z_qkv) {
                 auto* ud = static_cast<SSMQwen35DeltaUserData*>(params.userdata);
                 if (!ud) {
                     return false;
@@ -5056,9 +5332,7 @@ std::vector<float> ApplySharedScalarGateForTest(const std::vector<float>& shared
 
     std::memcpy(src->data, shared_ffn_pre_gate.data(), shared_ffn_pre_gate.size() * sizeof(float));
     std::memcpy(gate->data, shared_gate_logits_scalar.data(), shared_gate_logits_scalar.size() * sizeof(float));
-    SharedScalarGateApplyUserData ud{};
-    ud.gate_logits_scalar = gate;
-    ::cb_apply_shared_scalar_gate(dst, src, 0, 1, &ud);
+    ::cb_apply_shared_scalar_gate(dst, src, gate, 0, 1, nullptr);
 
     std::vector<float> out(static_cast<size_t>(tokens * hidden_dim), 0.0f);
     std::memcpy(out.data(), dst->data, out.size() * sizeof(float));
@@ -5119,6 +5393,13 @@ struct ggml_tensor* SmartMulMatTest(struct ggml_context* ctx, struct ggml_tensor
 }
 int ResolveQuantBatchedTileColsForTest(int requested_cols, int vec_dot_nrows, bool allow_true_batched_q4k) {
     return ::ResolveQuantBatchedTileCols(requested_cols, vec_dot_nrows, allow_true_batched_q4k);
+}
+bool ResolveQ4KTrueBatchedKernelPolicyForTest(int mode, int simd_level, bool compiled_with_sve) {
+    return ::ResolveQ4KTrueBatchedKernelEnabledPolicy(
+        static_cast<RuntimeToggleMode>(mode), static_cast<densecore::simd::SimdLevel>(simd_level), compiled_with_sve);
+}
+int ResolveQwen36MoECallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int top_k) {
+    return ::ResolveQwen36MoECallbackTaskCount(model, batch, top_k);
 }
 }  // namespace testing
 }  // namespace densecore

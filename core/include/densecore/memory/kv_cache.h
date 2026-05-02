@@ -2,13 +2,15 @@
 #define DENSECORE_KV_CACHE_H
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "densecore/memory/block_allocator.h"
 #include "densecore/memory/numa_allocator.h"
 #include "densecore/models/model_types.h"
-#include <functional>
 
 // ============================================================================
 // vLLM-style PagedAttention v2 for CPU
@@ -213,10 +215,21 @@ struct BlockManager {
 // Paged KV Cache Structure
 // ============================================================================
 struct KVRuntimeStatsSnapshot {
+    uint64_t single_slot_read_count = 0;
+    uint64_t single_slot_write_count = 0;
+    uint64_t bulk_read_count = 0;
+    uint64_t bulk_write_count = 0;
+    uint64_t slot_fallback_count = 0;
+    // Legacy field name kept for compatibility with existing summary logging.
+    // This reports scratch-buffer grow events, not literal allocation attempts.
+    uint64_t hot_path_alloc_count = 0;
     uint64_t bulk_read_calls = 0;
     uint64_t bulk_read_slots = 0;
     uint64_t bulk_write_calls = 0;
     uint64_t bulk_write_slots = 0;
+    uint64_t slot_read_fallback_calls = 0;
+    uint64_t slot_write_fallback_calls = 0;
+    uint64_t scratch_buffer_grows = 0;
 };
 
 KVRuntimeStatsSnapshot GetKVRuntimeStatsSnapshot();

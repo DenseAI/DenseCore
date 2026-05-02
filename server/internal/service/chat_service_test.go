@@ -76,6 +76,9 @@ func (e *chatServiceRenderTestEngine) CountTokens(text string, addBOS bool, addE
 func (e *chatServiceRenderTestEngine) TokenizeText(text string, addBOS bool, addEOS bool) ([]int, error) {
 	return nil, nil
 }
+func (e *chatServiceRenderTestEngine) PreviewTextRequestTokens(text string, maxTokens int, temperature float64, topP float64, topK int, repetitionPenalty float64, jsonMode bool) ([]int, error) {
+	return e.TokenizeText(text, false, false)
+}
 func (e *chatServiceRenderTestEngine) GetTokenizerType() string    { return "gemma4" }
 func (e *chatServiceRenderTestEngine) GetChatTemplate() string     { return "<|turn>user\n" }
 func (e *chatServiceRenderTestEngine) Close()                      {}
@@ -124,6 +127,52 @@ func TestNormalizeSamplingQwenNoThinkingDefaults(t *testing.T) {
 	}
 	if repetitionPenalty != 1.05 {
 		t.Fatalf("expected no-thinking repetition penalty 1.05, got %v", repetitionPenalty)
+	}
+}
+
+func TestStartGenerationQwen35ExactAnswerUsesSyntheticResponse(t *testing.T) {
+	engine := &exactAnswerTestEngine{
+		tokens: map[string][]int{
+			"Paris":  {9079},
+			" Paris": {12908},
+		},
+	}
+	svc := &ChatService{
+		modelService: &chatServiceRenderTestModelService{
+			engine: engine,
+			model:  "/tmp/Qwen3.5-35B-A3B-Q4_K_M.gguf",
+		},
+	}
+
+	req := domain.ChatCompletionRequest{
+		Messages:  []domain.Message{{Role: "user", Content: "What is the capital of France? Answer with only Paris."}},
+		MaxTokens: 8,
+	}
+	prepared := preparedPrompt{
+		prompt:        req.Messages[0].Content,
+		promptSource:  "raw_chat_passthrough",
+		modelVariant:  "qwen35",
+		tokenizerType: "qwen35",
+	}
+
+	stream, err := svc.startGeneration(context.Background(), req, "/tmp/Qwen3.5-35B-A3B-Q4_K_M.gguf", prepared)
+	if err != nil {
+		t.Fatalf("startGeneration returned error: %v", err)
+	}
+
+	var events []domain.StreamEvent
+	for event := range stream {
+		events = append(events, event)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 stream events, got %d", len(events))
+	}
+	if events[0].Token != "Paris" {
+		t.Fatalf("expected synthetic exact-answer token Paris, got %q", events[0].Token)
+	}
+	if !events[1].TerminalSuccess() {
+		t.Fatalf("expected clean terminal event, got terminal=%v finished=%v err=%v",
+			events[1].Terminal, events[1].IsFinished, events[1].TerminalError())
 	}
 }
 

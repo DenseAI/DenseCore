@@ -32,10 +32,15 @@ uint64_t GetTokenHashSaltImpl() {
 }
 
 struct KVRuntimeStats {
+    std::atomic<uint64_t> single_slot_read_calls{0};
+    std::atomic<uint64_t> single_slot_write_calls{0};
     std::atomic<uint64_t> bulk_read_calls{0};
     std::atomic<uint64_t> bulk_read_slots{0};
     std::atomic<uint64_t> bulk_write_calls{0};
     std::atomic<uint64_t> bulk_write_slots{0};
+    std::atomic<uint64_t> slot_read_fallback_calls{0};
+    std::atomic<uint64_t> slot_write_fallback_calls{0};
+    std::atomic<uint64_t> scratch_buffer_grows{0};
 };
 
 KVRuntimeStats& GetKVRuntimeStats() {
@@ -82,8 +87,19 @@ bool UseKVBulkSlotPath() {
     return GetKVCacheRuntimeConfig().use_bulk_slot_path;
 }
 
+void RecordKVReadSingleSlotUsage() {
+    KVRuntimeStats& stats = GetKVRuntimeStats();
+    stats.single_slot_read_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordKVWriteSingleSlotUsage() {
+    KVRuntimeStats& stats = GetKVRuntimeStats();
+    stats.single_slot_write_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
 void RecordKVReadBulkUsage(int num_slots) {
     if (num_slots <= 1) {
+        RecordKVReadSingleSlotUsage();
         return;
     }
     KVRuntimeStats& stats = GetKVRuntimeStats();
@@ -93,6 +109,7 @@ void RecordKVReadBulkUsage(int num_slots) {
 
 void RecordKVWriteBulkUsage(int num_slots) {
     if (num_slots <= 1) {
+        RecordKVWriteSingleSlotUsage();
         return;
     }
     KVRuntimeStats& stats = GetKVRuntimeStats();
@@ -100,13 +117,40 @@ void RecordKVWriteBulkUsage(int num_slots) {
     stats.bulk_write_slots.fetch_add(static_cast<uint64_t>(num_slots), std::memory_order_relaxed);
 }
 
+void RecordKVReadSlotFallbackUsage() {
+    KVRuntimeStats& stats = GetKVRuntimeStats();
+    stats.slot_read_fallback_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordKVWriteSlotFallbackUsage() {
+    KVRuntimeStats& stats = GetKVRuntimeStats();
+    stats.slot_write_fallback_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordKVScratchGrow() {
+    KVRuntimeStats& stats = GetKVRuntimeStats();
+    stats.scratch_buffer_grows.fetch_add(1, std::memory_order_relaxed);
+}
+
 KVRuntimeStatsSnapshot GetKVRuntimeStatsSnapshot() {
     KVRuntimeStats& stats = GetKVRuntimeStats();
     KVRuntimeStatsSnapshot snapshot;
+    snapshot.single_slot_read_count = stats.single_slot_read_calls.load(std::memory_order_relaxed);
+    snapshot.single_slot_write_count = stats.single_slot_write_calls.load(std::memory_order_relaxed);
+    snapshot.bulk_read_count = stats.bulk_read_calls.load(std::memory_order_relaxed);
+    snapshot.bulk_write_count = stats.bulk_write_calls.load(std::memory_order_relaxed);
+    snapshot.slot_fallback_count = stats.slot_read_fallback_calls.load(std::memory_order_relaxed) +
+                                   stats.slot_write_fallback_calls.load(std::memory_order_relaxed);
+    // Preserve the legacy field for existing telemetry consumers; this is the
+    // scratch grow counter mirrored under the older name.
+    snapshot.hot_path_alloc_count = stats.scratch_buffer_grows.load(std::memory_order_relaxed);
     snapshot.bulk_read_calls = stats.bulk_read_calls.load(std::memory_order_relaxed);
     snapshot.bulk_read_slots = stats.bulk_read_slots.load(std::memory_order_relaxed);
     snapshot.bulk_write_calls = stats.bulk_write_calls.load(std::memory_order_relaxed);
     snapshot.bulk_write_slots = stats.bulk_write_slots.load(std::memory_order_relaxed);
+    snapshot.slot_read_fallback_calls = stats.slot_read_fallback_calls.load(std::memory_order_relaxed);
+    snapshot.slot_write_fallback_calls = stats.slot_write_fallback_calls.load(std::memory_order_relaxed);
+    snapshot.scratch_buffer_grows = stats.scratch_buffer_grows.load(std::memory_order_relaxed);
     return snapshot;
 }
 

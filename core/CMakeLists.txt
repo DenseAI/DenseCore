@@ -40,6 +40,11 @@ option(
     "Build for Google Cloud C4A / Axion / Neoverse V2 (Armv9 SVE2) instead of generic aarch64"
     OFF
 )
+option(
+    DENSECORE_C4A_ENABLE_GGML_FASTKERNELS
+    "Enable ggml KleidiAI/repack/llamafile fast kernels on C4A builds"
+    OFF
+)
 set(DENSECORE_C4A_MCPU "neoverse-v2" CACHE STRING "ARM -mcpu value used when DENSECORE_TARGET_C4A=ON")
 set(DENSECORE_C4A_GGML_ARCH "armv9-a+sve2+i8mm+bf16+dotprod" CACHE STRING
     "ggml -march value used when DENSECORE_TARGET_C4A=ON")
@@ -265,6 +270,9 @@ set(DENSECORE_GGML_CPU_FEATURES_DEFAULT ON)
 if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
     set(DENSECORE_GGML_CPU_FEATURES_DEFAULT OFF)
 endif()
+if(DENSECORE_TARGET_C4A AND NOT DENSECORE_C4A_ENABLE_GGML_FASTKERNELS)
+    set(DENSECORE_GGML_CPU_FEATURES_DEFAULT OFF)
+endif()
 if(NOT DEFINED GGML_LLAMAFILE)
     set(GGML_LLAMAFILE ${DENSECORE_GGML_CPU_FEATURES_DEFAULT} CACHE BOOL "Enable ggml llamafile kernels")
 endif()
@@ -274,6 +282,9 @@ endif()
 set(DENSECORE_CAN_USE_KLEIDIAI OFF)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND NOT DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
     set(DENSECORE_CAN_USE_KLEIDIAI ON)
+endif()
+if(DENSECORE_TARGET_C4A AND NOT DENSECORE_C4A_ENABLE_GGML_FASTKERNELS)
+    set(DENSECORE_CAN_USE_KLEIDIAI OFF)
 endif()
 if(NOT DEFINED GGML_CPU_KLEIDIAI)
     set(GGML_CPU_KLEIDIAI ${DENSECORE_CAN_USE_KLEIDIAI} CACHE BOOL "Enable ggml KleidiAI kernels")
@@ -1160,11 +1171,6 @@ install(FILES include/densecore.h
     DESTINATION include
 )
 
-# ==========================================
-# Testing Infrastructure (GoogleTest)
-# ==========================================
-option(DENSECORE_BUILD_TESTS "Build DenseCore tests" ON)
-
 if(DENSECORE_BUILD_TESTS)
     include(FetchContent)
     FetchContent_Declare(
@@ -1307,6 +1313,14 @@ if(DENSECORE_BUILD_TESTS)
     # Enable mock model for E2E tests (allows InitEngine("mock", ...))
     target_compile_definitions(densecore_tests PRIVATE DENSECORE_TEST_BUILD)
     target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_TEST_BUILD)
+    if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+        target_compile_definitions(densecore_tests PRIVATE DENSECORE_ARM_CORRECTNESS_FIRST=1)
+        target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_ARM_CORRECTNESS_FIRST=1)
+    endif()
+    if(DENSECORE_TARGET_C4A)
+        target_compile_definitions(densecore_tests PRIVATE DENSECORE_TARGET_C4A=1)
+        target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_TARGET_C4A=1)
+    endif()
 
     if(DENSECORE_USE_SPDLOG)
         target_link_libraries(densecore_tests PRIVATE spdlog::spdlog)
@@ -1384,4 +1398,16 @@ message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "System: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "Processor: ${CMAKE_SYSTEM_PROCESSOR}")
 message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "DENSECORE_TARGET_C4A: ${DENSECORE_TARGET_C4A}")
+message(STATUS "DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE: ${DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE}")
+message(STATUS "DENSECORE_ARM_MCPU: ${DENSECORE_ARM_MCPU}")
+message(STATUS "DENSECORE_ARM_MARCH: ${DENSECORE_ARM_MARCH}")
+message(STATUS "GGML_CPU_ARM_ARCH: ${GGML_CPU_ARM_ARCH}")
+message(STATUS "GGML_NATIVE: ${GGML_NATIVE}")
+message(STATUS "GGML_LLAMAFILE: ${GGML_LLAMAFILE}")
+message(STATUS "GGML_CPU_REPACK: ${GGML_CPU_REPACK}")
+message(STATUS "GGML_CPU_KLEIDIAI: ${GGML_CPU_KLEIDIAI}")
+message(STATUS "C4A performance configure: cmake -S core -B build-c4a -DCMAKE_BUILD_TYPE=Release "
+               "-DDENSECORE_TARGET_C4A=ON -DDENSECORE_ARM_CORRECTNESS_FIRST=OFF "
+               "-DDENSECORE_BUILD_TESTS=ON -DDENSECORE_BUILD_BENCHMARKS=ON")
 message(STATUS "==========================================")

@@ -758,6 +758,45 @@ func (e *DenseEngine) TokenizeText(text string, addBOS bool, addEOS bool) ([]int
 	return out, nil
 }
 
+func (e *DenseEngine) PreviewTextRequestTokens(text string, maxTokens int, temperature float64, topP float64, topK int,
+	repetitionPenalty float64, jsonMode bool) ([]int, error) {
+	cText := C.CString(text)
+	defer C.free(unsafe.Pointer(cText))
+
+	jsonModeInt := 0
+	if jsonMode {
+		jsonModeInt = 1
+	}
+
+	var snapshot C.DenseCoreRequestSnapshot
+	e.mu.Lock()
+	ret := C.DenseCorePreviewTextRequest(
+		e.handle,
+		cText,
+		C.int(maxTokens),
+		C.float(temperature),
+		C.float(topP),
+		C.int(topK),
+		C.float(repetitionPenalty),
+		C.int(jsonModeInt),
+		&snapshot,
+	)
+	e.mu.Unlock()
+	if ret < 0 {
+		return nil, fmt.Errorf("preview request failed with error code %d", ret)
+	}
+	if snapshot.token_ids == nil || snapshot.num_token_ids <= 0 {
+		return nil, nil
+	}
+
+	ids := unsafe.Slice((*C.int)(unsafe.Pointer(snapshot.token_ids)), int(snapshot.num_token_ids))
+	out := make([]int, len(ids))
+	for i, id := range ids {
+		out[i] = int(id)
+	}
+	return out, nil
+}
+
 func (e *DenseEngine) GetTokenizerType() string {
 	cValue := C.GetTokenizerType(e.handle)
 	if cValue == nil {

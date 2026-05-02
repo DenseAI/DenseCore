@@ -17,6 +17,8 @@ struct WorkerRuntimeConfig {
     bool determinism_boundary_debug = false;
     bool prefix_cache_reuse_disabled = false;
     bool hybrid_ssm_snapshot_restore_disabled = false;
+    bool qwen36_prefix_cache_reuse_enabled = false;
+    bool qwen36_hybrid_ssm_snapshot_restore_enabled = false;
     bool graph_cache_reuse_disabled = false;
     bool moe_trace_plumbing_disabled = false;
     bool moe_graph_summary = false;

@@ -172,7 +172,7 @@ func TestFormatChatPromptQwen36NoThinkingUsesOfficialPromptWithoutDirective(t *t
 	if strings.Contains(prompt, "/no_think") {
 		t.Fatalf("expected qwen3.6 no-thinking prompt to avoid /no_think, got %q", prompt)
 	}
-	if prompt != "<|im_start|>user\n안녕?<|im_end|>\n<|im_start|>assistant\n" {
+	if prompt != "<|im_start|>user\n안녕?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n" {
 		t.Fatalf("unexpected qwen3.6 no-thinking prompt: %q", prompt)
 	}
 }
@@ -197,10 +197,7 @@ func TestFormatChatPromptQwen36ThinkingDoesNotPreopenThinkBlock(t *testing.T) {
 		{Role: "user", Content: "hello"},
 	}, &domain.ChatTemplateKwargs{EnableThinking: &enableThinking})
 
-	if strings.Contains(prompt, "<think>\n") {
-		t.Fatalf("expected qwen3.6 prompt to avoid synthetic think preamble, got %q", prompt)
-	}
-	if prompt != "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n" {
+	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n<think>\n") {
 		t.Fatalf("unexpected qwen3.6 thinking prompt: %q", prompt)
 	}
 }
@@ -213,7 +210,10 @@ func TestFormatChatPromptQwen36CanStripAssistantReasoningHistory(t *testing.T) {
 	}, &domain.ChatTemplateKwargs{PreserveThinking: &preserveThinking})
 
 	if strings.Contains(prompt, "<think>") {
-		t.Fatalf("expected preserve_thinking=false to strip assistant reasoning history, got %q", prompt)
+		expectedSuffix := "<|im_start|>assistant\n<think>\n"
+		if !strings.HasSuffix(prompt, expectedSuffix) {
+			t.Fatalf("expected preserve_thinking=false to strip assistant reasoning history, got %q", prompt)
+		}
 	}
 	if !strings.Contains(prompt, "<|im_start|>assistant\nfinal<|im_end|>\n") {
 		t.Fatalf("expected assistant content to remain after stripping reasoning, got %q", prompt)

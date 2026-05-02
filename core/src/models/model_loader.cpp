@@ -41,9 +41,158 @@ constexpr const char* kGemma4PreMoeNormKey = "gemma4.pre_feedforward_layernorm_2
 constexpr const char* kGemma4PostSharedNormKey = "gemma4.post_feedforward_layernorm_1.weight";
 constexpr const char* kGemma4PostMoeNormKey = "gemma4.post_feedforward_layernorm_2.weight";
 constexpr const char* kGemma4PostFfnNormKey = "gemma4.post_feedforward_layernorm.weight";
+
+bool ResolveGenericPackedProjectionBinding(ggml_context* vctx, const TransformerModel::Int4WeightBinding& root_binding,
+                                           ggml_tensor* packed_view, int64_t cols, int64_t rows, int64_t row_start,
+                                           int expert_axis, int expert_index,
+                                           TransformerModel::Int4WeightBinding* out) {
+    if (!out) {
+        return false;
+    }
+    *out = TransformerModel::Int4WeightBinding{};
+    if (!vctx || !packed_view || !packed_view->data || !root_binding.packed || !root_binding.scales ||
+        !root_binding.zeros || !root_binding.packed->data || !root_binding.scales->data || !root_binding.zeros->data) {
+        return false;
+    }
+    if (root_binding.group_size <= 0 || cols <= 0 || rows <= 0 || row_start < 0 || root_binding.k != cols ||
+        row_start + rows > root_binding.n) {
+        return false;
+    }
+
+    const int64_t groups_per_row = root_binding.k / root_binding.group_size;
+    if (groups_per_row <= 0 || root_binding.scales->nb[1] == 0 || root_binding.zeros->nb[1] == 0) {
+        return false;
+    }
+
+    size_t scales_offset = static_cast<size_t>(row_start) * static_cast<size_t>(root_binding.scales->nb[1]);
+    size_t zeros_offset = static_cast<size_t>(row_start) * static_cast<size_t>(root_binding.zeros->nb[1]);
+    if (expert_axis >= 0 && expert_index >= 0) {
+        if (root_binding.scales->ne[expert_axis] <= expert_index ||
+            root_binding.zeros->ne[expert_axis] <= expert_index || root_binding.scales->nb[expert_axis] == 0 ||
+            root_binding.zeros->nb[expert_axis] == 0) {
+            return false;
+        }
+        scales_offset += static_cast<size_t>(expert_index) * static_cast<size_t>(root_binding.scales->nb[expert_axis]);
+        zeros_offset += static_cast<size_t>(expert_index) * static_cast<size_t>(root_binding.zeros->nb[expert_axis]);
+    }
+
+    ggml_tensor* scales_view = ggml_view_2d(vctx, const_cast<ggml_tensor*>(root_binding.scales), groups_per_row, rows,
+                                            root_binding.scales->nb[1], scales_offset);
+    ggml_tensor* zeros_view = ggml_view_2d(vctx, const_cast<ggml_tensor*>(root_binding.zeros), groups_per_row, rows,
+                                           root_binding.zeros->nb[1], zeros_offset);
+    if (!scales_view || !zeros_view) {
+        return false;
+    }
+
+    out->packed = packed_view;
+    out->scales = scales_view;
+    out->zeros = zeros_view;
+    out->group_size = root_binding.group_size;
+    out->k = cols;
+    out->n = rows;
+    return true;
+}
+
+bool FindInt4BindingInViewChain(const TransformerModel* model, const ggml_tensor* tensor,
+                                const ggml_tensor** root_tensor_out,
+                                TransformerModel::Int4WeightBinding* root_binding_out, size_t* total_view_offs_out) {
+    if (!model || !tensor || !root_tensor_out || !root_binding_out || !total_view_offs_out) {
+        return false;
+    }
+    const ggml_tensor* current = tensor;
+    size_t total_view_offs = 0;
+    while (current) {
+        const auto it = model->int4_weight_bindings.find(current);
+        if (it != model->int4_weight_bindings.end()) {
+            *root_tensor_out = current;
+            *root_binding_out = it->second;
+            *total_view_offs_out = total_view_offs;
+            return true;
+        }
+        total_view_offs += current->view_offs;
+        current = current->view_src;
+    }
+    return false;
+}
+
+bool ResolveStackedInt4ViewBinding(ggml_context* vctx, const ggml_tensor* root_tensor,
+                                   const TransformerModel::Int4WeightBinding& root_binding, ggml_tensor* packed_view,
+                                   size_t total_view_offs, TransformerModel::Int4WeightBinding* out) {
+    if (!out) {
+        return false;
+    }
+    *out = TransformerModel::Int4WeightBinding{};
+    if (!vctx || !root_tensor || !packed_view || !packed_view->data || !root_binding.packed || !root_binding.scales ||
+        !root_binding.zeros || !root_binding.packed->data || !root_binding.scales->data || !root_binding.zeros->data) {
+        return false;
+    }
+
+    const int64_t expected_k = packed_view->ne[0];
+    const int64_t expected_n = packed_view->ne[1];
+    if (root_binding.group_size <= 0 || expected_k <= 0 || expected_n <= 0 || root_binding.k != expected_k ||
+        root_binding.n < expected_n) {
+        return false;
+    }
+
+    const size_t row_stride_bytes = static_cast<size_t>(root_tensor->nb[1]);
+    if (row_stride_bytes == 0) {
+        return false;
+    }
+    const size_t plane_stride_bytes =
+        (root_tensor->ne[2] > 1 && root_tensor->nb[2] > 0) ? static_cast<size_t>(root_tensor->nb[2]) : 0;
+
+    size_t expert_idx = 0;
+    size_t row_offs_bytes = total_view_offs;
+    if (plane_stride_bytes > 0) {
+        expert_idx = total_view_offs / plane_stride_bytes;
+        row_offs_bytes = total_view_offs % plane_stride_bytes;
+    }
+    if ((row_offs_bytes % row_stride_bytes) != 0) {
+        return false;
+    }
+
+    const size_t row_start = row_offs_bytes / row_stride_bytes;
+    if (row_start + static_cast<size_t>(expected_n) > static_cast<size_t>(root_binding.n)) {
+        return false;
+    }
+
+    const int64_t groups_per_row = root_binding.k / root_binding.group_size;
+    if (groups_per_row <= 0 || root_binding.scales->nb[1] == 0 || root_binding.zeros->nb[1] == 0) {
+        return false;
+    }
+
+    size_t scales_off = row_start * static_cast<size_t>(root_binding.scales->nb[1]);
+    size_t zeros_off = row_start * static_cast<size_t>(root_binding.zeros->nb[1]);
+    if (expert_idx > 0) {
+        if (root_binding.scales->ne[2] <= static_cast<int64_t>(expert_idx) ||
+            root_binding.zeros->ne[2] <= static_cast<int64_t>(expert_idx) || root_binding.scales->nb[2] == 0 ||
+            root_binding.zeros->nb[2] == 0) {
+            return false;
+        }
+        scales_off += expert_idx * static_cast<size_t>(root_binding.scales->nb[2]);
+        zeros_off += expert_idx * static_cast<size_t>(root_binding.zeros->nb[2]);
+    }
+
+    ggml_tensor* scales_view = ggml_view_2d(vctx, const_cast<ggml_tensor*>(root_binding.scales), groups_per_row,
+                                            expected_n, root_binding.scales->nb[1], scales_off);
+    ggml_tensor* zeros_view = ggml_view_2d(vctx, const_cast<ggml_tensor*>(root_binding.zeros), groups_per_row,
+                                           expected_n, root_binding.zeros->nb[1], zeros_off);
+    if (!scales_view || !zeros_view) {
+        return false;
+    }
+
+    out->packed = packed_view;
+    out->scales = scales_view;
+    out->zeros = zeros_view;
+    out->group_size = root_binding.group_size;
+    out->k = expected_k;
+    out->n = expected_n;
+    return true;
+}
 }  // namespace
 
 bool IsMoELoaderDebugEnabled();
+bool IsQwen36MoEBindingDebugEnabled();
 
 // ============================================================================
 // Mock Model (Test Build Only)
@@ -899,14 +1048,26 @@ TransformerModel* LoadGGUFModel(const char* path) {
             }
         } else if (model->arch == ModelArch::QWEN35 && has_full_attention_interval_key &&
                    model->ssm_full_attn_interval == 4) {
+            int full_attention_phase = 3;
+            if (model->variant == ModelVariant::QWEN36) {
+                const char* env = std::getenv("DENSECORE_QWEN36_FULL_ATTN_PHASE");
+                if (env && env[0] != '\0') {
+                    char* end = nullptr;
+                    const long parsed = std::strtol(env, &end, 10);
+                    if (end != env && end && *end == '\0') {
+                        full_attention_phase = static_cast<int>((parsed % 4 + 4) % 4);
+                    }
+                }
+            }
             model->hybrid_layer_is_ssm.assign(model->hparams.n_layer, 1);
             for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
-                if (((i + 1) % 4) == 0) {
+                if (static_cast<int>(i % 4) == full_attention_phase) {
                     model->hybrid_layer_is_ssm[i] = 0;
                 }
             }
             std::cout << "[DenseCore] Reconstructed hybrid layer schedule from full_attention_interval="
-                      << model->ssm_full_attn_interval << " because layer_types metadata is missing" << std::endl;
+                      << model->ssm_full_attn_interval << " because layer_types metadata is missing"
+                      << " (full_attention_phase=" << full_attention_phase << ")" << std::endl;
         } else {
             return fail_hybrid_ssm("missing reliable layer_types/full_attention_interval metadata");
         }
@@ -1761,6 +1922,15 @@ TransformerModel* LoadGGUFModel(const char* path) {
             }
         }
 
+        if (IsQwen36MoEBindingDebugEnabled() && model->variant == ModelVariant::QWEN36 &&
+            model->hparams.n_experts > 0 && i < 2) {
+            std::fprintf(
+                stderr, "[QWEN36_MOE_PACKED_TENSORS] layer=%u packed_gate_up=%s packed_down=%s packed_down_scale=%s\n",
+                i, packed_gate_up ? (packed_gate_up->name[0] ? packed_gate_up->name : "<unnamed>") : "<null>",
+                packed_down ? (packed_down->name[0] ? packed_down->name : "<unnamed>") : "<null>",
+                packed_down_scale ? (packed_down_scale->name[0] ? packed_down_scale->name : "<unnamed>") : "<null>");
+        }
+
         if (packed_gate_up && packed_down &&
             i >= static_cast<uint32_t>(std::max(0, model->moe_first_k_dense_replace))) {
             densecore::gemma4::PackedExpertLayout packed_layout{};
@@ -1854,6 +2024,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
                     struct ggml_tensor* gate_up_slice =
                         ggml_view_2d(vctx, const_cast<struct ggml_tensor*>(packed_gate_up), packed_gate_up->ne[0],
                                      packed_gate_up->ne[1], packed_gate_up->nb[1], gate_up_offset);
+                    if (!gate_up_slice) {
+                        continue;
+                    }
                     const int64_t gate_up_rows = gate_up_slice->ne[1];
                     if (gate_up_rows < 2 || (gate_up_rows % 2) != 0) {
                         continue;
@@ -1867,9 +2040,37 @@ TransformerModel* LoadGGUFModel(const char* path) {
                     struct ggml_tensor* down_w =
                         ggml_view_2d(vctx, const_cast<struct ggml_tensor*>(packed_down), packed_down->ne[0],
                                      packed_down->ne[1], packed_down->nb[1], down_offset);
+                    if (!gate_w || !up_w || !down_w) {
+                        continue;
+                    }
                     layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kFfnGate, gate_w);
                     layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kFfnUp, up_w);
                     layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kFfnDown, down_w);
+
+                    const auto gate_it = model->int4_weight_bindings.find(packed_gate_up);
+                    if (gate_it != model->int4_weight_bindings.end()) {
+                        TransformerModel::Int4WeightBinding gate_binding{};
+                        if (ResolveGenericPackedProjectionBinding(vctx, gate_it->second, gate_w, gate_w->ne[0],
+                                                                  gate_w->ne[1], 0, gate_up_expert_axis, expert_idx,
+                                                                  &gate_binding)) {
+                            model->int4_weight_bindings[gate_w] = gate_binding;
+                        }
+                        TransformerModel::Int4WeightBinding up_binding{};
+                        if (ResolveGenericPackedProjectionBinding(vctx, gate_it->second, up_w, up_w->ne[0], up_w->ne[1],
+                                                                  intermediate, gate_up_expert_axis, expert_idx,
+                                                                  &up_binding)) {
+                            model->int4_weight_bindings[up_w] = up_binding;
+                        }
+                    }
+                    const auto down_it = model->int4_weight_bindings.find(packed_down);
+                    if (down_it != model->int4_weight_bindings.end()) {
+                        TransformerModel::Int4WeightBinding down_binding{};
+                        if (ResolveGenericPackedProjectionBinding(vctx, down_it->second, down_w, down_w->ne[0],
+                                                                  down_w->ne[1], 0, down_expert_axis, expert_idx,
+                                                                  &down_binding)) {
+                            model->int4_weight_bindings[down_w] = down_binding;
+                        }
+                    }
                 }
             }
         }
@@ -1964,13 +2165,33 @@ TransformerModel* LoadGGUFModel(const char* path) {
             } else if (layer.NumExperts() == 0) {
                 reason_code = expert_name_candidates > 0 ? 3 : 2;  // 3: candidates but unmatched, 2: no candidates
             }
+            size_t gate_int4_bindings = 0;
+            size_t up_int4_bindings = 0;
+            size_t down_int4_bindings = 0;
+            size_t fused_gate_up_available = 0;
+            for (size_t expert_idx = 0; expert_idx < layer.NumExperts(); ++expert_idx) {
+                const bool has_gate_int4 =
+                    model->int4_weight_bindings.find(layer.GetExpert(expert_idx, model_keys::kFfnGate)) !=
+                    model->int4_weight_bindings.end();
+                const bool has_up_int4 =
+                    model->int4_weight_bindings.find(layer.GetExpert(expert_idx, model_keys::kFfnUp)) !=
+                    model->int4_weight_bindings.end();
+                const bool has_down_int4 =
+                    model->int4_weight_bindings.find(layer.GetExpert(expert_idx, model_keys::kFfnDown)) !=
+                    model->int4_weight_bindings.end();
+                gate_int4_bindings += has_gate_int4 ? 1u : 0u;
+                up_int4_bindings += has_up_int4 ? 1u : 0u;
+                down_int4_bindings += has_down_int4 ? 1u : 0u;
+                fused_gate_up_available += (has_gate_int4 && has_up_int4) ? 1u : 0u;
+            }
             std::fprintf(stderr,
                          "[MOE_LOADER_LAYER] layer=%u is_moe=%d has_moe_gate=%d num_experts=%zu packed_gate_up=%d "
                          "packed_down=%d used_packed=%d used_sep=%d regex_hits=%d expert_name_candidates=%d "
-                         "reason_code=%d\n",
+                         "gate_int4=%zu up_int4=%zu down_int4=%zu fused_gate_up=%zu reason_code=%d\n",
                          i, layer.is_moe ? 1 : 0, layer.Get(model_keys::kMoeGate) ? 1 : 0, layer.NumExperts(),
                          packed_gate_up ? 1 : 0, packed_down ? 1 : 0, used_packed_expert_slices ? 1 : 0,
-                         used_sep_expert_slices ? 1 : 0, expert_regex_hits, expert_name_candidates, reason_code);
+                         used_sep_expert_slices ? 1 : 0, expert_regex_hits, expert_name_candidates, gate_int4_bindings,
+                         up_int4_bindings, down_int4_bindings, fused_gate_up_available, reason_code);
         }
 
         if (model->arch_flags.is_glm_dsa) {
@@ -2038,7 +2259,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
     if (model->hparams.n_experts > 0) {
         std::cout << "[DenseCore] MoE summary: experts=" << model->hparams.n_experts
                   << " top_k=" << model->hparams.n_experts_used << " shared_experts=" << model->moe_n_shared_experts
-                  << std::endl;
+                  << " n_group=" << model->moe_n_group << " topk_group=" << model->moe_topk_group
+                  << " norm_topk_prob=" << (model->moe_norm_topk_prob ? 1 : 0)
+                  << " routed_scaling_factor=" << model->moe_routed_scaling_factor << std::endl;
     }
 
     // Auto-compute head dimensions from weight tensor shapes.
@@ -2257,6 +2480,13 @@ TransformerModel* LoadGGUFModel(const char* path) {
             }
             if (Qwen35CanonicalizeFusedBA(raw.data(), t ? t->ne : nullptr, static_cast<int>(model->hparams.n_embd),
                                           n_heads, model->ssm_group_count, &beta_out, &alpha_out)) {
+                if (model->variant == ModelVariant::QWEN36 && model->ssm_group_count > 0 &&
+                    model->ssm_group_count != n_heads) {
+                    Qwen35ReorderVHeadsGroupedToTiled(&beta_out, static_cast<int>(model->hparams.n_embd),
+                                                      model->ssm_group_count, n_heads);
+                    Qwen35ReorderVHeadsGroupedToTiled(&alpha_out, static_cast<int>(model->hparams.n_embd),
+                                                      model->ssm_group_count, n_heads);
+                }
                 return validate_finite("ssm_ba/beta", beta_out, layer_idx) &&
                        validate_finite("ssm_ba/alpha", alpha_out, layer_idx);
             }
@@ -2328,12 +2558,16 @@ TransformerModel* LoadGGUFModel(const char* path) {
                     delete model;
                     return nullptr;
                 }
-
                 if (i == 0) {
+                    const char* ssm_debug_values = std::getenv("DENSECORE_DEBUG_QWEN36_SSM_VALUES");
                     std::cout << "[DenseCore] Qwen3.5 SSM tensor types: conv1d=" << ggml_type_name(conv->type)
                               << " alpha=" << ggml_type_name(alpha->type) << " beta=" << ggml_type_name(beta->type)
                               << " dt_bias=" << ggml_type_name(dt->type) << " ssm_a=" << ggml_type_name(ssm_a->type)
                               << " norm=" << ggml_type_name(norm->type) << std::endl;
+                    std::cout << "[DenseCore] Qwen3.5 SSM tensor names: alpha="
+                              << (alpha && alpha->name[0] ? alpha->name : "<unnamed>")
+                              << " beta=" << (beta && beta->name[0] ? beta->name : "<unnamed>")
+                              << " fused_ba=" << (has_fused_ba ? "true" : "false") << std::endl;
                     std::cout << "[DenseCore] Qwen3.5 SSM tensor shapes: conv1d=" << shape_string(conv)
                               << " alpha=" << shape_string(alpha) << " beta=" << shape_string(beta)
                               << " dt_bias=" << shape_string(dt) << " A_log=" << shape_string(ssm_a)
@@ -2346,6 +2580,21 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                   : state.norm_layout == Qwen35SSMNormLayout::FLATTENED_D_INNER ? "flattened_d_inner"
                                                                                                 : "invalid")
                               << std::endl;
+                    if (ssm_debug_values && ssm_debug_values[0] != '\0' && std::strcmp(ssm_debug_values, "0") != 0) {
+                        auto print_head = [](const char* label, const std::vector<float>& values) {
+                            std::cerr << "[QWEN36_SSM_VALUES] " << label << "=";
+                            const size_t limit = std::min<size_t>(8, values.size());
+                            for (size_t idx = 0; idx < limit; ++idx) {
+                                if (idx != 0) std::cerr << ",";
+                                std::cerr << values[idx];
+                            }
+                            std::cerr << std::endl;
+                        };
+                        print_head("a_log", state.a_log_f32);
+                        print_head("dt_bias", state.dt_bias_f32);
+                        print_head("alpha", state.alpha_f32);
+                        print_head("beta", state.beta_f32);
+                    }
                 }
             }
             ++ssm_ordinal;
@@ -2827,6 +3076,137 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
         if (fp8_bound > 0) {
             std::cout << "[DenseCore] Registered " << fp8_bound << " FP8 custom weight bindings" << std::endl;
+        }
+
+        auto bind_expert_view_int4 = [&](ggml_tensor* tensor) {
+            if (!tensor || model->int4_weight_bindings.find(tensor) != model->int4_weight_bindings.end()) {
+                return;
+            }
+            const ggml_tensor* root_tensor = nullptr;
+            TransformerModel::Int4WeightBinding root_binding{};
+            size_t total_view_offs = 0;
+            if (!FindInt4BindingInViewChain(model, tensor, &root_tensor, &root_binding, &total_view_offs)) {
+                return;
+            }
+            TransformerModel::Int4WeightBinding resolved{};
+            if (ResolveStackedInt4ViewBinding(model->ctx_views ? model->ctx_views : model->ctx_w, root_tensor,
+                                              root_binding, tensor, total_view_offs, &resolved)) {
+                model->int4_weight_bindings[tensor] = resolved;
+            }
+        };
+
+        for (size_t layer_idx = 0; layer_idx < model->layers.size(); ++layer_idx) {
+            auto& layer = model->layers[layer_idx];
+            if (!layer.is_moe || layer.NumExperts() == 0) {
+                continue;
+            }
+            size_t gate_int4_bindings = 0;
+            size_t up_int4_bindings = 0;
+            size_t down_int4_bindings = 0;
+            size_t fused_gate_up_available = 0;
+            for (size_t expert_idx = 0; expert_idx < layer.NumExperts(); ++expert_idx) {
+                ggml_tensor* gate = layer.GetExpert(expert_idx, model_keys::kFfnGate);
+                ggml_tensor* up = layer.GetExpert(expert_idx, model_keys::kFfnUp);
+                ggml_tensor* down = layer.GetExpert(expert_idx, model_keys::kFfnDown);
+                bind_expert_view_int4(gate);
+                bind_expert_view_int4(up);
+                bind_expert_view_int4(down);
+
+                const bool has_gate_int4 = model->int4_weight_bindings.find(gate) != model->int4_weight_bindings.end();
+                const bool has_up_int4 = model->int4_weight_bindings.find(up) != model->int4_weight_bindings.end();
+                const bool has_down_int4 = model->int4_weight_bindings.find(down) != model->int4_weight_bindings.end();
+                gate_int4_bindings += has_gate_int4 ? 1u : 0u;
+                up_int4_bindings += has_up_int4 ? 1u : 0u;
+                down_int4_bindings += has_down_int4 ? 1u : 0u;
+                fused_gate_up_available += (has_gate_int4 && has_up_int4) ? 1u : 0u;
+            }
+
+            if (IsMoELoaderDebugEnabled() || IsQwen36MoEBindingDebugEnabled()) {
+                std::fprintf(stderr,
+                             "[QWEN36_MOE_BINDINGS] layer=%zu expert_count=%zu gate_binding_count=%zu "
+                             "up_binding_count=%zu down_binding_count=%zu fused_gate_up_availability=%zu\n",
+                             layer_idx, layer.NumExperts(), gate_int4_bindings, up_int4_bindings, down_int4_bindings,
+                             fused_gate_up_available);
+                if (IsQwen36MoEBindingDebugEnabled() && layer.NumExperts() > 0) {
+                    const auto dump_tensor = [](const char* tag, const ggml_tensor* tensor) {
+                        if (!tensor) {
+                            std::fprintf(stderr, "[QWEN36_MOE_BINDINGS] %s=<null>\n", tag);
+                            return;
+                        }
+                        std::fprintf(stderr,
+                                     "[QWEN36_MOE_BINDINGS] %s name=%s type=%s ne=[%lld,%lld,%lld,%lld] "
+                                     "view_offs=%zu view_src=%s\n",
+                                     tag, tensor->name[0] ? tensor->name : "<unnamed>", ggml_type_name(tensor->type),
+                                     static_cast<long long>(tensor->ne[0]), static_cast<long long>(tensor->ne[1]),
+                                     static_cast<long long>(tensor->ne[2]), static_cast<long long>(tensor->ne[3]),
+                                     tensor->view_offs,
+                                     tensor->view_src
+                                         ? (tensor->view_src->name[0] ? tensor->view_src->name : "<unnamed>")
+                                         : "<null>");
+                    };
+                    const auto dump_binding = [model](const char* tag, const ggml_tensor* tensor) {
+                        if (!tensor) {
+                            return;
+                        }
+                        const auto it = model->int4_weight_bindings.find(tensor);
+                        if (it != model->int4_weight_bindings.end()) {
+                            std::fprintf(
+                                stderr,
+                                "[QWEN36_MOE_BINDINGS] %s binding group_size=%d K=%lld N=%lld "
+                                "packed=%s scales=%s zeros=%s\n",
+                                tag, it->second.group_size, static_cast<long long>(it->second.k),
+                                static_cast<long long>(it->second.n),
+                                it->second.packed && it->second.packed->name[0] ? it->second.packed->name : "<unnamed>",
+                                it->second.scales && it->second.scales->name[0] ? it->second.scales->name : "<unnamed>",
+                                it->second.zeros && it->second.zeros->name[0] ? it->second.zeros->name : "<unnamed>");
+                            return;
+                        }
+                        if (tensor->view_src) {
+                            const auto root_it = model->int4_weight_bindings.find(tensor->view_src);
+                            if (root_it != model->int4_weight_bindings.end()) {
+                                std::fprintf(stderr,
+                                             "[QWEN36_MOE_BINDINGS] %s root_binding group_size=%d K=%lld N=%lld "
+                                             "root=%s scales=%s zeros=%s\n",
+                                             tag, root_it->second.group_size, static_cast<long long>(root_it->second.k),
+                                             static_cast<long long>(root_it->second.n),
+                                             root_it->second.packed && root_it->second.packed->name[0]
+                                                 ? root_it->second.packed->name
+                                                 : "<unnamed>",
+                                             root_it->second.scales && root_it->second.scales->name[0]
+                                                 ? root_it->second.scales->name
+                                                 : "<unnamed>",
+                                             root_it->second.zeros && root_it->second.zeros->name[0]
+                                                 ? root_it->second.zeros->name
+                                                 : "<unnamed>");
+                            }
+                        }
+                    };
+                    const auto dump_expert = [&](size_t expert_idx, const char* prefix) {
+                        auto* gate = layer.GetExpert(expert_idx, model_keys::kFfnGate);
+                        auto* up = layer.GetExpert(expert_idx, model_keys::kFfnUp);
+                        auto* down = layer.GetExpert(expert_idx, model_keys::kFfnDown);
+                        std::string gate_tag = std::string(prefix) + "_gate";
+                        std::string up_tag = std::string(prefix) + "_up";
+                        std::string down_tag = std::string(prefix) + "_down";
+                        dump_tensor(gate_tag.c_str(), gate);
+                        dump_tensor(up_tag.c_str(), up);
+                        dump_tensor(down_tag.c_str(), down);
+                        dump_binding(gate_tag.c_str(), gate);
+                        dump_binding(up_tag.c_str(), up);
+                        dump_binding(down_tag.c_str(), down);
+                    };
+                    dump_tensor("shared_gate_tensor", layer.Get(model_keys::kFfnGate));
+                    dump_tensor("shared_up_tensor", layer.Get(model_keys::kFfnUp));
+                    dump_tensor("shared_down_tensor", layer.Get(model_keys::kFfnDown));
+                    dump_expert(0, "expert0");
+                    if (layer.NumExperts() > 1) {
+                        dump_expert(1, "expert1");
+                    }
+                    if (layer.NumExperts() > 2) {
+                        dump_expert(layer.NumExperts() - 1, "expert_last");
+                    }
+                }
+            }
         }
     }
 
@@ -3476,6 +3856,14 @@ TransformerModel* LoadModelFromExternal(const TransformerHParams& hparams, const
 bool IsMoELoaderDebugEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_MOE_LOADER");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool IsQwen36MoEBindingDebugEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_QWEN36_MOE_BINDINGS");
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;

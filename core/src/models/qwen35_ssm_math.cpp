@@ -1,7 +1,10 @@
 #include "densecore/models/qwen35_ssm_math.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -60,6 +63,13 @@ inline float SigmoidStable(float x) {
 
 inline float SiluStable(float x) {
     return x * SigmoidStable(x);
+}
+
+inline float ResolveSSMA(float stored, bool prefer_materialized) {
+    if (prefer_materialized && stored <= 0.0f) {
+        return stored;
+    }
+    return -std::exp(stored);
 }
 
 inline bool IsVectorShape(const int64_t ne[4], int expected) {
@@ -228,6 +238,11 @@ inline float SumSquares(const float* values, int n) {
     return DotSquares(values, n);
 }
 
+bool IsQwen36SSMDebugTimingEnabled() {
+    const char* env = std::getenv("DENSECORE_QWEN36_SSM_DEBUG_TIMING");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
 inline void ApplyRmsNormGate(float* y_head, const float* norm_weight, const float* z_head, float inv_rms, int n) {
 #if defined(__AVX512F__)
     const __m512 v_inv_rms = _mm512_set1_ps(inv_rms);
@@ -339,6 +354,10 @@ bool Qwen35CanonicalizeFusedBA(const float* raw, const int64_t ne[4], int n_embd
 
     auto beta_slot = [&](int head_idx) { return beta_out->data() + static_cast<size_t>(head_idx) * n_embd; };
     auto alpha_slot = [&](int head_idx) { return alpha_out->data() + static_cast<size_t>(head_idx) * n_embd; };
+    const bool swap_qwen36_fused_ba = []() {
+        const char* env = std::getenv("DENSECORE_QWEN36_SWAP_FUSED_BA_ORDER");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
 
     if (ne[0] == n_embd && ne[1] == fused_width) {
         for (int group = 0; group < n_groups; ++group) {
@@ -346,8 +365,10 @@ bool Qwen35CanonicalizeFusedBA(const float* raw, const int64_t ne[4], int n_embd
             const int fused_base = group * (2 * heads_per_group);
             for (int local_head = 0; local_head < heads_per_group; ++local_head) {
                 const int head_idx = group_base + local_head;
-                const int beta_col = fused_base + local_head;
-                const int alpha_col = fused_base + heads_per_group + local_head;
+                const int first_col = fused_base + local_head;
+                const int second_col = fused_base + heads_per_group + local_head;
+                const int beta_col = swap_qwen36_fused_ba ? second_col : first_col;
+                const int alpha_col = swap_qwen36_fused_ba ? first_col : second_col;
                 std::copy(raw + static_cast<size_t>(beta_col) * n_embd,
                           raw + static_cast<size_t>(beta_col + 1) * n_embd, beta_slot(head_idx));
                 std::copy(raw + static_cast<size_t>(alpha_col) * n_embd,
@@ -363,8 +384,10 @@ bool Qwen35CanonicalizeFusedBA(const float* raw, const int64_t ne[4], int n_embd
             const int fused_base = group * (2 * heads_per_group);
             for (int local_head = 0; local_head < heads_per_group; ++local_head) {
                 const int head_idx = group_base + local_head;
-                const int beta_row = fused_base + local_head;
-                const int alpha_row = fused_base + heads_per_group + local_head;
+                const int first_row = fused_base + local_head;
+                const int second_row = fused_base + heads_per_group + local_head;
+                const int beta_row = swap_qwen36_fused_ba ? second_row : first_row;
+                const int alpha_row = swap_qwen36_fused_ba ? first_row : second_row;
                 for (int embd_idx = 0; embd_idx < n_embd; ++embd_idx) {
                     beta_slot(head_idx)[embd_idx] = raw[static_cast<size_t>(embd_idx) * fused_width + beta_row];
                     alpha_slot(head_idx)[embd_idx] = raw[static_cast<size_t>(embd_idx) * fused_width + alpha_row];
@@ -387,6 +410,27 @@ bool Qwen35CanonicalizePerHeadVector(const float* raw, const int64_t ne[4], int 
     return true;
 }
 
+void Qwen35ReorderVHeadsGroupedToTiled(std::vector<float>* values, int row_width, int num_k_heads, int num_v_heads) {
+    if (!values || row_width <= 0 || num_k_heads <= 0 || num_v_heads <= 0 || (num_v_heads % num_k_heads) != 0) {
+        return;
+    }
+    const int num_v_per_k = num_v_heads / num_k_heads;
+    if (num_v_per_k <= 1 || values->size() != static_cast<size_t>(row_width) * static_cast<size_t>(num_v_heads)) {
+        return;
+    }
+
+    std::vector<float> reordered(values->size(), 0.0f);
+    for (int tiled_idx = 0; tiled_idx < num_v_heads; ++tiled_idx) {
+        const int src_group = tiled_idx % num_k_heads;
+        const int src_local = tiled_idx / num_k_heads;
+        const int src_idx = src_group * num_v_per_k + src_local;
+        std::memcpy(reordered.data() + static_cast<size_t>(tiled_idx) * row_width,
+                    values->data() + static_cast<size_t>(src_idx) * row_width,
+                    static_cast<size_t>(row_width) * sizeof(float));
+    }
+    values->swap(reordered);
+}
+
 Qwen35SSMNormLayout Qwen35CanonicalizeNorm(const float* raw, const int64_t ne[4], int head_dim_v, int d_inner,
                                            std::vector<float>* out) {
     if (!raw || !out) {
@@ -402,6 +446,65 @@ Qwen35SSMNormLayout Qwen35CanonicalizeNorm(const float* raw, const int64_t ne[4]
     }
     out->clear();
     return Qwen35SSMNormLayout::INVALID;
+}
+
+Qwen35SSMQkvProjectionContract ResolveQwen35SSMQkvProjectionContract(Qwen35SSMQkvProjectionProfile profile) {
+    Qwen35SSMQkvProjectionContract contract;
+    contract.profile = profile;
+    switch (profile) {
+    case Qwen35SSMQkvProjectionProfile::QWEN35_LEGACY:
+        contract.raw_layout = Qwen35SSMQkvRawLayout::QKV;
+        contract.activation = Qwen35SSMQkvActivationPlacement::FULL_ROW_SILU;
+        contract.share_qk_by_group = true;
+        contract.dense_value_heads = true;
+        break;
+    case Qwen35SSMQkvProjectionProfile::QWEN36_OFFICIAL:
+        contract.raw_layout = Qwen35SSMQkvRawLayout::QKV;
+        contract.activation = Qwen35SSMQkvActivationPlacement::NONE;
+        contract.share_qk_by_group = true;
+        contract.dense_value_heads = true;
+        break;
+    }
+    return contract;
+}
+
+bool Qwen35CanonicalizeProjectedQkvRow(const float* raw_row, int num_k_heads, int num_v_heads, int head_dim_k,
+                                       int head_dim_v, const Qwen35SSMQkvProjectionContract& contract,
+                                       std::vector<float>* canonical_qkv) {
+    if (!raw_row || !canonical_qkv || num_k_heads <= 0 || num_v_heads <= 0 || head_dim_k <= 0 || head_dim_v <= 0) {
+        return false;
+    }
+
+    const int qk_total = num_k_heads * head_dim_k;
+    const int value_total = num_v_heads * head_dim_v;
+    const int conv_channels = qk_total * 2 + value_total;
+    if (conv_channels <= 0) {
+        return false;
+    }
+
+    canonical_qkv->assign(static_cast<size_t>(conv_channels), 0.0f);
+    auto apply_activation = [&](float value) {
+        switch (contract.activation) {
+        case Qwen35SSMQkvActivationPlacement::NONE: return value;
+        case Qwen35SSMQkvActivationPlacement::FULL_ROW_SILU: return SiluStable(value);
+        }
+        return value;
+    };
+    auto copy_span = [&](int dst_offset, int src_offset, int count) {
+        for (int i = 0; i < count; ++i) {
+            (*canonical_qkv)[static_cast<size_t>(dst_offset + i)] = apply_activation(raw_row[src_offset + i]);
+        }
+    };
+
+    switch (contract.raw_layout) {
+    case Qwen35SSMQkvRawLayout::QKV:
+        copy_span(/*dst_offset=*/0, /*src_offset=*/0, qk_total);
+        copy_span(/*dst_offset=*/qk_total, /*src_offset=*/qk_total, qk_total);
+        copy_span(/*dst_offset=*/2 * qk_total, /*src_offset=*/2 * qk_total, value_total);
+        break;
+    }
+
+    return true;
 }
 
 size_t Qwen35SSMHeadStateElements(int head_dim_k, int head_dim_v) {
@@ -428,6 +531,14 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
     k_norm.resize(static_cast<size_t>(cfg.head_dim_k));
     kv_mem.resize(static_cast<size_t>(cfg.head_dim_v));
     delta.resize(static_cast<size_t>(cfg.head_dim_v));
+    const bool log_timing = IsQwen36SSMDebugTimingEnabled();
+    const bool collect_timing = stats != nullptr || log_timing;
+    const auto ms_since = [](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    };
+
+    const auto alpha_beta_begin =
+        collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     float alpha = cfg.dt_bias;
     float beta = 0.0f;
@@ -435,18 +546,20 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
         alpha += cfg.alpha_row[i] * cfg.input_t[i];
         beta += cfg.beta_row[i] * cfg.input_t[i];
     }
+    const double alpha_beta_dot_ms = collect_timing ? ms_since(alpha_beta_begin) : 0.0;
 
     const float softplus_alpha = SoftplusStable(alpha);
-    const float exp_a_log = std::exp(cfg.a_log);
-    const float g = -exp_a_log * softplus_alpha;
+    const float ssm_a = ResolveSSMA(cfg.a_log, cfg.a_log_prescaled);
+    const float exp_a_log = -ssm_a;
+    const float g = ssm_a * softplus_alpha;
     const float decay = std::exp(g);
     const float beta_gate = SigmoidStable(beta);
 
+    const auto norm_begin = collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const float q_sum_sq = DotSquares(cfg.q_head, cfg.head_dim_k);
     const float k_sum_sq = DotSquares(cfg.k_head, cfg.head_dim_k);
-    const float q_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k));
-    const float q_inv_norm = q_scale / std::sqrt(q_sum_sq + cfg.norm_eps);
-    const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+    const float q_inv_norm = 1.0f / std::max(std::sqrt(q_sum_sq), cfg.norm_eps);
+    const float k_inv_norm = 1.0f / std::max(std::sqrt(k_sum_sq), cfg.norm_eps);
     ScaleCopy(q_norm.data(), cfg.q_head, q_inv_norm, cfg.head_dim_k);
     ScaleCopy(k_norm.data(), cfg.k_head, k_inv_norm, cfg.head_dim_k);
     if (debug && debug->q_norm) {
@@ -459,13 +572,19 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
             debug->k_norm[i] = k_norm[static_cast<size_t>(i)];
         }
     }
+    const double norm_ms = collect_timing ? ms_since(norm_begin) : 0.0;
 
     const size_t state_elems = static_cast<size_t>(cfg.head_dim_k) * static_cast<size_t>(cfg.head_dim_v);
 
+    const auto decay_state_begin =
+        collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ScaleInPlace(state_kv, decay, state_elems);
+    const double decay_state_ms = collect_timing ? ms_since(decay_state_begin) : 0.0;
 
-    std::fill(kv_mem.begin(), kv_mem.end(), 0.0f);
-    for (int k = 0; k < cfg.head_dim_k; ++k) {
+    const auto kv_mem_begin =
+        collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ScaleCopy(kv_mem.data(), state_kv, k_norm[0], cfg.head_dim_v);
+    for (int k = 1; k < cfg.head_dim_k; ++k) {
         const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
         AccumulateScaled(kv_mem.data(), state_row, k_norm[static_cast<size_t>(k)], cfg.head_dim_v);
     }
@@ -482,29 +601,43 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
             debug->delta[v] = delta[static_cast<size_t>(v)];
         }
     }
+    const double kv_mem_ms = collect_timing ? ms_since(kv_mem_begin) : 0.0;
 
     // State update: state_kv[k, v] += k_norm[k] * delta[v]
+    const auto state_update_begin =
+        collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (int k = 0; k < cfg.head_dim_k; ++k) {
         const float k_val = k_norm[static_cast<size_t>(k)];
         float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
         AccumulateScaled(state_row, delta.data(), k_val, cfg.head_dim_v);
     }
+    const double state_update_ms = collect_timing ? ms_since(state_update_begin) : 0.0;
 
-    std::fill(y_head, y_head + cfg.head_dim_v, 0.0f);
-    for (int k = 0; k < cfg.head_dim_k; ++k) {
+    const auto output_accum_begin =
+        collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ScaleCopy(y_head, state_kv, q_norm[0], cfg.head_dim_v);
+    for (int k = 1; k < cfg.head_dim_k; ++k) {
         const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
         AccumulateScaled(y_head, state_row, q_norm[static_cast<size_t>(k)], cfg.head_dim_v);
     }
+    // llama.cpp's fused GDN applies the attention scale after the state-query
+    // dot product. Keeping it here preserves q/k l2_norm parity while matching
+    // the fused output contract.
+    ScaleInPlace(y_head, 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_v)), cfg.head_dim_v);
     if (debug && debug->y_pre_norm) {
         for (int v = 0; v < cfg.head_dim_v; ++v) {
             debug->y_pre_norm[v] = y_head[v];
         }
     }
+    const double output_accum_ms = collect_timing ? ms_since(output_accum_begin) : 0.0;
 
+    const auto rms_gate_begin =
+        collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const float sum_sq = SumSquares(y_head, cfg.head_dim_v);
     const float rms = std::sqrt(sum_sq / cfg.head_dim_v + cfg.norm_eps);
     const float inv_rms = 1.0f / rms;
     ApplyRmsNormGate(y_head, cfg.norm_weight, cfg.z_head, inv_rms, cfg.head_dim_v);
+    const double rms_gate_ms = collect_timing ? ms_since(rms_gate_begin) : 0.0;
 
     if (stats) {
         stats->alpha = alpha;
@@ -517,6 +650,24 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
         stats->q_sum_sq = q_sum_sq;
         stats->k_sum_sq = k_sum_sq;
         stats->rms = rms;
+        stats->alpha_beta_dot_ms = alpha_beta_dot_ms;
+        stats->norm_ms = norm_ms;
+        stats->decay_state_ms = decay_state_ms;
+        stats->kv_mem_ms = kv_mem_ms;
+        stats->state_update_ms = state_update_ms;
+        stats->output_accum_ms = output_accum_ms;
+        stats->rms_gate_ms = rms_gate_ms;
+    }
+
+    if (log_timing) {
+        std::fprintf(stderr,
+                     "[Qwen36SSMTiming] n_embd=%d head_k=%d head_v=%d alpha_beta_dot_ms=%.3f norm_ms=%.3f "
+                     "decay_state_ms=%.3f kv_mem_ms=%.3f state_update_ms=%.3f output_accum_ms=%.3f "
+                     "rms_gate_ms=%.3f total_ms=%.3f\n",
+                     cfg.n_embd, cfg.head_dim_k, cfg.head_dim_v, alpha_beta_dot_ms, norm_ms, decay_state_ms, kv_mem_ms,
+                     state_update_ms, output_accum_ms, rms_gate_ms,
+                     alpha_beta_dot_ms + norm_ms + decay_state_ms + kv_mem_ms + state_update_ms + output_accum_ms +
+                         rms_gate_ms);
     }
 
     return true;

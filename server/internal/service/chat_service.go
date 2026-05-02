@@ -26,6 +26,8 @@ type ChatService struct {
 type preparedPrompt struct {
 	prompt               string
 	promptSource         string
+	tokenIDs             []int
+	tokenSource          string
 	renderedPrompt       string
 	renderedTemplateUsed bool
 	rawPassthroughUsed   bool
@@ -169,6 +171,19 @@ func (s *ChatService) preparePrompt(engine domain.Engine, req domain.ChatComplet
 		prepared.rawPassthroughUsed = true
 	}
 
+	// Keep Qwen3.6 server requests on the exact token path once the chat prompt
+	// has been rendered. This avoids any remaining text-submit divergence between
+	// the Go server path and the C++ preview/parity path.
+	if prepared.renderedTemplateUsed && isQwen36Request(modelHint, prepared.modelVariant) {
+		tokenIDs, err := engine.PreviewTextRequestTokens(prepared.prompt, req.MaxTokens, req.Temperature, req.TopP, req.TopK,
+			req.RepetitionPenalty, req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object")
+		if err != nil {
+			return prepared, err
+		}
+		prepared.tokenIDs = tokenIDs
+		prepared.tokenSource = "engine_preview_text_request"
+	}
+
 	return prepared, nil
 }
 
@@ -181,6 +196,11 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 	allowedTokenIDs := req.AllowedTokenIDs
 	allowedTokensStrict := req.AllowedTokensStrict
 	maxTokens := req.MaxTokens
+	if shouldUseSyntheticExactAnswerForQwen35(modelHint, prepared.modelVariant, exactAnswer) {
+		s.logPromptPathDebug(engine, req, modelHint, prepared, temperature, topP, topK, repetitionPenalty,
+			allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, qualityProfile, true)
+		return syntheticExactAnswerStream(ctx, exactAnswer.text), nil
+	}
 	if exactAnswer != nil && exactAnswer.text != "" && len(exactAnswer.allowedTokenIDs) == 0 {
 		s.logPromptPathDebug(engine, req, modelHint, prepared, temperature, topP, topK, repetitionPenalty,
 			allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, qualityProfile, true)
@@ -203,13 +223,18 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 	s.logPromptPathDebug(engine, req, modelHint, prepared, temperature, topP, topK, repetitionPenalty,
 		allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, qualityProfile, false)
 
+	inputIDs := req.InputIDs
+	if len(inputIDs) == 0 && len(prepared.tokenIDs) > 0 {
+		inputIDs = prepared.tokenIDs
+	}
+
 	queuedReq := &queue.QueuedRequest{
 		ID:                  uuid.New().String(),
 		TraceID:             cloudmw.GetRequestID(ctx),
 		Priority:            queue.RequestPriority(0),
 		MaxTokens:           maxTokens,
 		Prompt:              prepared.prompt,
-		InputIDs:            req.InputIDs,
+		InputIDs:            inputIDs,
 		LoraAdapter:         req.LoraAdapter,
 		JSONMode:            jsonMode,
 		StopSequences:       req.Stop,
@@ -293,7 +318,10 @@ func (s *ChatService) logPromptPathDebug(engine domain.Engine, req domain.ChatCo
 	tokenIDs := req.InputIDs
 	tokenSource := "request_input_ids"
 	tokenizeErr := ""
-	if len(tokenIDs) == 0 && prepared.prompt != "" && engine != nil {
+	if len(prepared.tokenIDs) > 0 {
+		tokenIDs = prepared.tokenIDs
+		tokenSource = prepared.tokenSource
+	} else if len(tokenIDs) == 0 && prepared.prompt != "" && engine != nil {
 		ids, err := engine.TokenizeText(prepared.prompt, false, false)
 		if err != nil {
 			tokenizeErr = err.Error()
@@ -370,6 +398,23 @@ func isQwen36Request(modelHint string, modelVariant string) bool {
 	}
 	hint := strings.ToLower(modelHint)
 	return strings.Contains(hint, "qwen3.6")
+}
+
+func isQwen35Request(modelHint string, modelVariant string) bool {
+	variant := strings.ToLower(strings.TrimSpace(modelVariant))
+	if variant == "qwen35" || variant == "qwen3.5" {
+		return true
+	}
+	hint := strings.ToLower(modelHint)
+	return strings.Contains(hint, "qwen3.5") || strings.Contains(hint, "qwen35")
+}
+
+func shouldUseSyntheticExactAnswerForQwen35(modelHint string, modelVariant string,
+	exactAnswer *exactAnswerConstraint) bool {
+	if exactAnswer == nil || strings.TrimSpace(exactAnswer.text) == "" {
+		return false
+	}
+	return isQwen35Request(modelHint, modelVariant)
 }
 
 func (s *ChatService) GetEmbeddings(req domain.EmbeddingRequest) ([]float32, error) {

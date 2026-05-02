@@ -50,6 +50,7 @@
 // Forward declaration shared across namespaces.
 struct TransformerLayer;
 struct BatchSpec;
+struct TransformerModel;
 
 namespace densecore {
 
@@ -565,6 +566,9 @@ public:
     void ForwardMoE(const TransformerLayer* layer_key, int layer_idx, const BatchSpec* batch, const Tensor& input,
                     const moe::MoERouteResult& routing, const std::vector<ExpertWeights>& experts, Tensor* output);
     void ForwardMoE(const TransformerLayer* layer_key, const Tensor& input, const moe::MoERouteResult& routing,
+                    const ExpertWeights* experts, int num_experts, Tensor* output);
+    void ForwardMoE(const TransformerModel* model, const TransformerLayer* layer_key, int layer_idx,
+                    const BatchSpec* batch, const Tensor& input, const moe::MoERouteResult& routing,
                     const ExpertWeights* experts, int num_experts, Tensor* output);
     void ForwardMoE(const TransformerLayer* layer_key, int layer_idx, const BatchSpec* batch, const Tensor& input,
                     const moe::MoERouteResult& routing, const ExpertWeights* experts, int num_experts, Tensor* output);

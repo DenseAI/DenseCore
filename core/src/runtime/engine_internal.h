@@ -322,12 +322,38 @@ struct Request {
     uint64_t suppressed_token_count = 0;
     uint64_t scheduler_wait_ns = 0;
     uint64_t batch_build_ns = 0;
-    uint64_t graph_build_rebind_ns = 0;
+    uint64_t graph_build_ns = 0;
+    uint64_t graph_rebind_ns = 0;
     uint64_t graph_execute_ns = 0;
+    uint64_t attention_ns = 0;
+    uint64_t paged_attention_ns = 0;
+    uint64_t standard_attention_ns = 0;
+    uint64_t portable_flash_attention_ns = 0;
+    uint64_t native_flash_attention_ns = 0;
+    uint64_t hal_attention_ns = 0;
+    uint64_t attention_repack_ns = 0;
+    uint64_t moe_forward_ns = 0;
+    uint64_t shared_expert_ns = 0;
+    uint64_t quant_matmul_ns = 0;
+    uint64_t kv_update_ns = 0;
+    uint64_t sample_ns = 0;
+    uint64_t graph_cache_hit_count = 0;
+    uint64_t graph_cache_miss_count = 0;
     int prefill_thread_count = 0;
     int decode_thread_count = 0;
+    int active_thread_count = 0;
+    int prefill_chunk_tokens_effective = 0;
     std::string prefill_thread_policy;
     std::string decode_thread_policy;
+    int q4k_true_batched_used = 0;
+    int arm_batched_quant_used = 0;
+    int attention_path_paged = 0;
+    int attention_path_standard = 0;
+    int attention_path_portable_flash = 0;
+    int attention_path_native_flash = 0;
+    int attention_path_hal = 0;
+    int moe_task_count = 0;
+    int selected_expert_count = 0;
     int first_sampled_token_id = -1;
     int first_visible_token_id = -1;
     DecodeFinishCause decode_finish_cause = DecodeFinishCause::Unknown;
@@ -414,12 +440,38 @@ struct Request {
         suppressed_token_count = 0;
         scheduler_wait_ns = 0;
         batch_build_ns = 0;
-        graph_build_rebind_ns = 0;
+        graph_build_ns = 0;
+        graph_rebind_ns = 0;
         graph_execute_ns = 0;
+        attention_ns = 0;
+        paged_attention_ns = 0;
+        standard_attention_ns = 0;
+        portable_flash_attention_ns = 0;
+        native_flash_attention_ns = 0;
+        hal_attention_ns = 0;
+        attention_repack_ns = 0;
+        moe_forward_ns = 0;
+        shared_expert_ns = 0;
+        quant_matmul_ns = 0;
+        kv_update_ns = 0;
+        sample_ns = 0;
+        graph_cache_hit_count = 0;
+        graph_cache_miss_count = 0;
         prefill_thread_count = 0;
         decode_thread_count = 0;
+        active_thread_count = 0;
+        prefill_chunk_tokens_effective = 0;
         prefill_thread_policy.clear();
         decode_thread_policy.clear();
+        q4k_true_batched_used = 0;
+        arm_batched_quant_used = 0;
+        attention_path_paged = 0;
+        attention_path_standard = 0;
+        attention_path_portable_flash = 0;
+        attention_path_native_flash = 0;
+        attention_path_hal = 0;
+        moe_task_count = 0;
+        selected_expert_count = 0;
         first_sampled_token_id = -1;
         first_visible_token_id = -1;
         decode_finish_cause = DecodeFinishCause::Unknown;
@@ -985,10 +1037,18 @@ struct EngineState {
         size_t recommended_max_mb = 8192;
         const size_t available_memory_mb = detect_available_memory_mb();
         if (available_memory_mb > 0) {
-            // The graph context is scratch, not the whole runtime footprint.
-            // Reserve at least half of the observed host/container memory for
-            // weights, KV cache, process overhead, and the rest of the stack.
-            recommended_max_mb = std::clamp<std::size_t>(available_memory_mb / 2, recommended_min_mb, HARD_MAX_MB);
+            // `MemAvailable` / cgroup free memory is already post-weights/post-KV
+            // runtime headroom. Halving it again was too conservative on C4A: the
+            // serving path could need just over 20 GB of graph scratch while the
+            // heuristic hard-capped the pool around 19.6 GB and aborted before the
+            // first token. Keep a system reserve, but allow the graph context to
+            // use most of the remaining free memory up to the 24 GB safety cap.
+            const size_t reserved_system_mb =
+                std::clamp<std::size_t>(available_memory_mb / 8, static_cast<size_t>(4096), static_cast<size_t>(12288));
+            const size_t usable_graph_mb = available_memory_mb > reserved_system_mb
+                                               ? (available_memory_mb - reserved_system_mb)
+                                               : recommended_min_mb;
+            recommended_max_mb = std::clamp<std::size_t>(usable_graph_mb, recommended_min_mb, HARD_MAX_MB);
         } else if (model->arch_flags.is_hybrid_ssm && std::max<int32_t>(1, hp.n_embd) <= 2048 &&
                    std::max<int32_t>(1, hp.n_layer) <= 24 && effective_seq_len <= 4096 && runtime_max_num_seqs <= 4) {
             recommended_max_mb = 4096;

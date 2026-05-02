@@ -24,8 +24,6 @@ const (
 	DefaultMaxTokens = 100
 	// MaxAllowedTokens is the hard limit for max_tokens parameter
 	MaxAllowedTokens = 32000
-	// DefaultThreads is the default number of threads for model loading
-	DefaultThreads = 4
 
 	// KVCacheCriticalThreshold is the KV cache usage percent above which
 	// the service is considered degraded and readiness probe fails.
@@ -842,6 +840,19 @@ func (h *Handler) countSingleTextTokens(text string, addBOS bool, addEOS bool) i
 	return count
 }
 
+func (h *Handler) resolveLoadModelThreads(requested int) int {
+	if requested > 0 {
+		return requested
+	}
+	if requested < 0 {
+		return 0
+	}
+	if h.runtimeTuning.EngineThreads > 0 {
+		return h.runtimeTuning.EngineThreads
+	}
+	return 0
+}
+
 func (h *Handler) LoadModelHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		sendError(w, "Method not allowed", "invalid_request_error", ErrCodeMethodNotAllowed, http.StatusMethodNotAllowed)
@@ -863,9 +874,7 @@ func (h *Handler) LoadModelHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Threads == 0 {
-		req.Threads = DefaultThreads
-	}
+	req.Threads = h.resolveLoadModelThreads(req.Threads)
 
 	err := h.modelService.LoadModel(req.ModelPath, req.DraftModelPath, req.Threads)
 	if err != nil {

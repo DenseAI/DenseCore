@@ -18,8 +18,11 @@ struct Qwen35SSMHeadStepConfig {
     int head_dim_k = 0;
     int head_dim_v = 0;
     float dt_bias = 0.0f;
+    // GGUFs in this family may expose either raw A_log or converter-materialized
+    // ssm_a = -exp(A_log). The step code resolves the stored form before use.
     float a_log = 0.0f;
     float norm_eps = 1e-6f;
+    bool a_log_prescaled = false;
 };
 
 struct Qwen35SSMHeadStepStats {
@@ -33,6 +36,13 @@ struct Qwen35SSMHeadStepStats {
     float q_sum_sq = 0.0f;
     float k_sum_sq = 0.0f;
     float rms = 0.0f;
+    double alpha_beta_dot_ms = 0.0;
+    double norm_ms = 0.0;
+    double decay_state_ms = 0.0;
+    double kv_mem_ms = 0.0;
+    double state_update_ms = 0.0;
+    double output_accum_ms = 0.0;
+    double rms_gate_ms = 0.0;
 };
 
 struct Qwen35SSMHeadStepDebugBuffers {
@@ -49,6 +59,28 @@ struct Qwen35SSMHeadStepTrace {
     uint64_t y_hash = 0;
 };
 
+enum class Qwen35SSMQkvRawLayout {
+    QKV = 0,
+};
+
+enum class Qwen35SSMQkvActivationPlacement {
+    NONE = 0,
+    FULL_ROW_SILU,
+};
+
+enum class Qwen35SSMQkvProjectionProfile {
+    QWEN35_LEGACY = 0,
+    QWEN36_OFFICIAL,
+};
+
+struct Qwen35SSMQkvProjectionContract {
+    Qwen35SSMQkvProjectionProfile profile = Qwen35SSMQkvProjectionProfile::QWEN35_LEGACY;
+    Qwen35SSMQkvRawLayout raw_layout = Qwen35SSMQkvRawLayout::QKV;
+    Qwen35SSMQkvActivationPlacement activation = Qwen35SSMQkvActivationPlacement::FULL_ROW_SILU;
+    bool share_qk_by_group = true;
+    bool dense_value_heads = true;
+};
+
 enum class Qwen35SSMNormLayout {
     INVALID = 0,
     SHARED_HEAD_DIM,
@@ -62,6 +94,11 @@ bool Qwen35CanonicalizeFusedBA(const float* raw, const int64_t ne[4], int n_embd
 bool Qwen35CanonicalizePerHeadVector(const float* raw, const int64_t ne[4], int n_heads, std::vector<float>* out);
 Qwen35SSMNormLayout Qwen35CanonicalizeNorm(const float* raw, const int64_t ne[4], int head_dim_v, int d_inner,
                                            std::vector<float>* out);
+void Qwen35ReorderVHeadsGroupedToTiled(std::vector<float>* values, int row_width, int num_k_heads, int num_v_heads);
+Qwen35SSMQkvProjectionContract ResolveQwen35SSMQkvProjectionContract(Qwen35SSMQkvProjectionProfile profile);
+bool Qwen35CanonicalizeProjectedQkvRow(const float* raw_row, int num_k_heads, int num_v_heads, int head_dim_k,
+                                       int head_dim_v, const Qwen35SSMQkvProjectionContract& contract,
+                                       std::vector<float>* canonical_qkv);
 
 size_t Qwen35SSMHeadStateElements(int head_dim_k, int head_dim_v);
 

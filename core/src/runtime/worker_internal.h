@@ -134,11 +134,15 @@ int DecodeVisibleProgressTimeoutMs();
 int DecodeVisibleProgressMaxSilentSteps();
 const char* DecodeFinishCauseName(DecodeFinishCause cause);
 const char* DecodeSilentFinishReasonName(DecodeSilentFinishReason reason);
+bool ResolveSamplingLogitsColumnForRequest(int token_offset, int processed_count, int output_columns,
+                                           bool sampled_from_prefill, int remaining_prompt_tokens, int n_past_before,
+                                           int n_past_after, int* out_last_token_idx, std::string* error = nullptr);
 void NoteDecodeSampleProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id);
 void NoteSuppressedToken(Request* req);
 void NoteVisibleEmitProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id);
 void FinalizeDecodeSilentFinishReason(Request* req);
 void LogRequestDecodeSummary(const Request* req, const TransformerModel* model);
 bool HasDecodeVisibleProgressStalled(const Request* req, std::chrono::steady_clock::time_point now);
+int ResolveQwen36PrefillChunkTokens(const TransformerModel* model, const Request* req);
 
 #endif  // DENSECORE_WORKER_INTERNAL_H

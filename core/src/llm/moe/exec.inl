@@ -247,6 +247,11 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
     size_t n_experts = layer->NumExperts();
     experts.reserve(n_experts);
 
+    const bool force_qwen36_moe_safe_reference = []() {
+        const char* env = std::getenv("DENSECORE_QWEN36_MOE_FORCE_SAFE_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+
     for (size_t i = 0; i < n_experts; ++i) {
         ExpertWeights w;
         w.w1 = {nullptr, 0};
@@ -290,6 +295,10 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
         }
 
         if (w.w2_scale_tensor) {
+            w.force_safe_reference = true;
+        }
+        if (force_qwen36_moe_safe_reference && model && model->variant == ModelVariant::QWEN36 &&
+            model->hparams.n_experts > 0) {
             w.force_safe_reference = true;
         }
 
@@ -629,6 +638,16 @@ static bool EnsureMoERouteStorage(densecore::moe::MoERouteResult* routing, int b
     return true;
 }
 
+static bool ForceMoESoftmaxRouting() {
+    const char* env = std::getenv("DENSECORE_FORCE_MOE_SOFTMAX_ROUTING");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static bool ForceMoEGroupedSigmoidRouting() {
+    const char* env = std::getenv("DENSECORE_FORCE_MOE_GROUPED_SIGMOID_ROUTING");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
 static bool RouteMoEGroupedSigmoid(const struct ggml_tensor* gate_logits, const MoEUserData* ud,
                                    densecore::moe::MoERouteResult* routing) {
     if (!gate_logits || !ud || !ud->model || !routing) {
@@ -838,9 +857,12 @@ static bool RouteMoEGemma4TopK(const struct ggml_tensor* gate_logits, const MoEU
 void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
                     int nth, void* userdata) {
     (void)nth;
-    if (ith != 0) return;
-    g_moe_callback_entry_count.fetch_add(1, std::memory_order_relaxed);
-    if (IsMoEDebugLoggingEnabled()) {
+    const auto profile_begin =
+        (ith == 0 && IsQwen36ProfilingEnabled()) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (ith == 0) {
+        g_moe_callback_entry_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (IsMoEDebugLoggingEnabled() && ith == 0) {
         static std::atomic<int> moe_call_count{0};
         int call_id = moe_call_count.fetch_add(1);
         fprintf(stderr, "[DBG] cb_moe_forward #%d src0=[%lld,%lld] src1=[%lld,%lld]\n", call_id, (long long)src0->ne[0],
@@ -849,6 +871,9 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
             DebugLogTensorFiniteStats("MOE_IN", src0);
             DebugLogTensorFiniteStats("MOE_GATE", src1);
         }
+    }
+    if (ith != 0) {
+        return;
     }
     auto* ud = static_cast<MoEUserData*>(userdata);
     if (!ud || !ud->layer) {
@@ -884,7 +909,16 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     const bool debug_stage_timing = IsMoEStageTimingEnabled();
     const auto route_begin = debug_stage_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     thread_local densecore::moe::MoERouteResult routing;
-    const bool routed = (ud->model && ud->model->arch_flags.is_glm_moe)
+    bool use_grouped_sigmoid_routing =
+        ud->model &&
+        (ud->model->arch_flags.is_glm_moe ||
+         (ud->model->variant == ModelVariant::QWEN36 && ud->model->moe_n_group > 1 && ud->model->moe_topk_group > 0));
+    if (ForceMoESoftmaxRouting()) {
+        use_grouped_sigmoid_routing = false;
+    } else if (ForceMoEGroupedSigmoidRouting()) {
+        use_grouped_sigmoid_routing = true;
+    }
+    const bool routed = use_grouped_sigmoid_routing
                             ? RouteMoEGroupedSigmoid(src1, ud, &routing)
                         : densecore::models::IsGemma4MoEModel(ud->model, ud->layer) ? RouteMoEGemma4TopK(src1, ud, &routing)
                                                                 : RouteMoESoftmaxTopK(src1, ud, &routing);
@@ -901,18 +935,46 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
         FailClosedMoECallback(dst, &g_moe_callback_empty_routing_count, "MoE routing produced no experts");
         return;
     }
-    DumpMoERouteTrace(src1, ud, routing);
+    if (ith == 0) {
+        DumpMoERouteTrace(src1, ud, routing);
+    }
     const auto route_end = debug_stage_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    UpdateSchedulerExperts(ud, routing);
+    if (ith == 0) {
+        UpdateSchedulerExperts(ud, routing);
+    }
     const auto scheduler_end =
         debug_stage_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (ud->profile) {
+        SetQwen36ProfileMax(ud->profile->moe_task_count, 1);
+        int unique_experts = 0;
+        for (size_t i = 0; i < routing.expert_ids.size(); ++i) {
+            const int expert_id = routing.expert_ids[i];
+            bool seen = false;
+            for (size_t j = 0; j < i; ++j) {
+                if (routing.expert_ids[j] == expert_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                ++unique_experts;
+            }
+        }
+        SetQwen36ProfileMax(ud->profile->selected_expert_count, unique_experts);
+    }
 
     // Forward (src0 = input, dst = output)
     densecore::Tensor t_input = GgmlToRowMajorTensor(src0);
     densecore::Tensor t_output = GgmlToRowMajorTensor(dst);
-
-    ud->backend->ForwardMoE(ud->layer, ud->layer_idx, ud->batch, t_input, routing, ud->experts, ud->n_experts,
-                            &t_output);
+    ud->backend->ForwardMoE(ud->model, ud->layer, ud->layer_idx, ud->batch, t_input, routing, ud->experts,
+                            ud->n_experts, &t_output);
+    if (ud->profile && profile_begin != std::chrono::steady_clock::time_point()) {
+        AddQwen36ProfileNs(
+            ud->profile->moe_forward_ns,
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profile_begin)
+                    .count()));
+    }
     if (debug_stage_timing) {
         const auto backend_end = std::chrono::steady_clock::now();
         const auto route_us =
@@ -1265,12 +1327,13 @@ static void cb_hidden_snapshot_probe(struct ggml_tensor* dst, const struct ggml_
     if (!std::isfinite(min_v)) min_v = 0.0f;
     if (!std::isfinite(max_v)) max_v = 0.0f;
 
+    const int token_id = (ud->token_ids && token_idx >= 0) ? ud->token_ids[token_idx] : -1;
     const int seq_id = (ud->token_seq_ids && token_idx >= 0) ? ud->token_seq_ids[token_idx] : -1;
     std::fprintf(stderr,
-                 "[HIDDEN_SNAPSHOT] layer=%d stage=%s var=%s token=%d seq=%d width=%d nan=%d inf=%d min=%.8g "
+                 "[HIDDEN_SNAPSHOT] layer=%d stage=%s var=%s token=%d token_id=%d seq=%d width=%d nan=%d inf=%d min=%.8g "
                  "max=%.8g max_abs=%.8g mean=%.8g rms=%.8g\n",
                  ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown",
-                 token_idx, seq_id, width, nan_ct, inf_ct, min_v, max_v, max_abs,
+                 token_idx, token_id, seq_id, width, nan_ct, inf_ct, min_v, max_v, max_abs,
                  finite_ct > 0 ? (sum / finite_ct) : 0.0, finite_ct > 0 ? std::sqrt(sum_sq / finite_ct) : 0.0);
 
     const int preview = std::min(width, 8);
@@ -1830,8 +1893,9 @@ static bool RunQwen35ReferenceHeadStep(const Qwen35SSMHeadStepConfig& cfg, float
     }
 
     const float softplus_alpha = SoftplusStable(alpha);
-    const float exp_a_log = std::exp(cfg.a_log);
-    const float g = -exp_a_log * softplus_alpha;
+    const float ssm_a = (cfg.a_log_prescaled && cfg.a_log <= 0.0f) ? cfg.a_log : -std::exp(cfg.a_log);
+    const float exp_a_log = -ssm_a;
+    const float g = ssm_a * softplus_alpha;
     const float decay = std::exp(g);
     const float beta_gate = SigmoidStable(beta);
 
@@ -1841,9 +1905,8 @@ static bool RunQwen35ReferenceHeadStep(const Qwen35SSMHeadStepConfig& cfg, float
         q_sum_sq += cfg.q_head[i] * cfg.q_head[i];
         k_sum_sq += cfg.k_head[i] * cfg.k_head[i];
     }
-    const float q_inv_norm =
-        (1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k))) / std::sqrt(q_sum_sq + cfg.norm_eps);
-    const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+    const float q_inv_norm = 1.0f / std::max(std::sqrt(q_sum_sq), cfg.norm_eps);
+    const float k_inv_norm = 1.0f / std::max(std::sqrt(k_sum_sq), cfg.norm_eps);
     for (int i = 0; i < cfg.head_dim_k; ++i) {
         q_norm[static_cast<size_t>(i)] = cfg.q_head[i] * q_inv_norm;
         k_norm[static_cast<size_t>(i)] = cfg.k_head[i] * k_inv_norm;
@@ -1874,8 +1937,8 @@ static bool RunQwen35ReferenceHeadStep(const Qwen35SSMHeadStepConfig& cfg, float
         for (int k = 0; k < cfg.head_dim_k; ++k) {
             sum += state_kv[static_cast<size_t>(k) * cfg.head_dim_v + v] * q_norm[static_cast<size_t>(k)];
         }
-        y_head[v] = sum;
-        sum_sq += sum * sum;
+        y_head[v] = sum / std::sqrt(static_cast<float>(cfg.head_dim_v));
+        sum_sq += y_head[v] * y_head[v];
     }
     const float rms = std::sqrt(sum_sq / cfg.head_dim_v + cfg.norm_eps);
     for (int v = 0; v < cfg.head_dim_v; ++v) {
@@ -1902,13 +1965,24 @@ static bool RunQwen35ReferenceHeadStep(const Qwen35SSMHeadStepConfig& cfg, float
 static void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* userdata) {
     (void)nth;
     if (ith != 0) return;
+    const bool ssm_passthrough = (std::getenv("SSM_PASSTHROUGH") != nullptr);
+    const bool ssm_conv_passthrough = (std::getenv("DENSECORE_SSM_CONV_PASSTHROUGH") != nullptr);
+    const float* input = src ? reinterpret_cast<const float*>(src->data) : nullptr;
+    float* output = dst ? reinterpret_cast<float*>(dst->data) : nullptr;
+    if ((ssm_passthrough || ssm_conv_passthrough) && src && dst && input && output) {
+        const int N = static_cast<int>(src->ne[1]);
+        const ptrdiff_t input_stride = static_cast<ptrdiff_t>(src->nb[1] / sizeof(float));
+        const ptrdiff_t output_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
+        const size_t copy_elems =
+            static_cast<size_t>(std::min<int64_t>(src->ne[0], dst->ne[0]));
+        for (int t = 0; t < N; ++t) {
+            std::memcpy(output + static_cast<ptrdiff_t>(t) * output_stride,
+                        input + static_cast<ptrdiff_t>(t) * input_stride, copy_elems * sizeof(float));
+        }
+        return;
+    }
     auto* ud = static_cast<SSMConv1DUserData*>(userdata);
-    const float* input = reinterpret_cast<const float*>(src->data);
-    float* output = reinterpret_cast<float*>(dst->data);
     if (!ud || !input || !output) return;
-
-    static const bool ssm_passthrough = (std::getenv("SSM_PASSTHROUGH") != nullptr);
-    static const bool ssm_conv_passthrough = (std::getenv("DENSECORE_SSM_CONV_PASSTHROUGH") != nullptr);
     const int N = static_cast<int>(src->ne[1]);
     const ptrdiff_t input_stride = static_cast<ptrdiff_t>(src->nb[1] / sizeof(float));
     const ptrdiff_t output_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
@@ -1964,6 +2038,20 @@ static void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src
         densecore::hwy_kernels::SSMConv1DDecode_Hwy(conv_state, input + static_cast<ptrdiff_t>(t) * input_stride,
                                                     ud->weight, output + static_cast<ptrdiff_t>(t) * output_stride,
                                                     ud->channels, ud->kernel_size);
+        if (ud->apply_silu) {
+            float* out_t = output + static_cast<ptrdiff_t>(t) * output_stride;
+            const auto silu = [](float x) -> float {
+                if (x >= 0.0f) {
+                    const float z = std::exp(-x);
+                    return x * (1.0f / (1.0f + z));
+                }
+                const float z = std::exp(x);
+                return x * (z / (1.0f + z));
+            };
+            for (int c = 0; c < ud->channels; ++c) {
+                out_t[c] = silu(out_t[c]);
+            }
+        }
         const int seq_idx = (ud->token_seq_ids && t < N) ? ud->token_seq_ids[t] : -1;
         if (debug_conv_ref && !conv_ref.empty()) {
             RunSSMConv1DReference(conv_state_before.data(), input + static_cast<ptrdiff_t>(t) * input_stride,
@@ -1989,7 +2077,43 @@ void cb_ssm_qwen35_delta_qkv_only(struct ggml_tensor* dst, const struct ggml_ten
     if (!dst || !src || !ud || !ud->z_tensor || !ud->input_tensor) {
         return;
     }
+    if (std::getenv("SSM_PASSTHROUGH") != nullptr || std::getenv("DENSECORE_SSM_DELTA_PASSTHROUGH") != nullptr) {
+        if (ith == 0 && dst->data) {
+            std::memset(dst->data, 0, ggml_nbytes(dst));
+        }
+        return;
+    }
     cb_ssm_qwen35_delta(dst, ud->z_tensor, src, ud->input_tensor, ith, nth, userdata);
+}
+
+void cb_ssm_qwen35_delta_z_qkv(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
+                               int ith, int nth, void* userdata) {
+    auto* ud = static_cast<SSMQwen35DeltaUserData*>(userdata);
+    if (!dst || !a || !b || !ud || !ud->input_tensor) {
+        return;
+    }
+    if (std::getenv("SSM_PASSTHROUGH") != nullptr || std::getenv("DENSECORE_SSM_DELTA_PASSTHROUGH") != nullptr) {
+        if (ith == 0 && dst->data) {
+            std::memset(dst->data, 0, ggml_nbytes(dst));
+        }
+        return;
+    }
+    cb_ssm_qwen35_delta(dst, a, b, ud->input_tensor, ith, nth, userdata);
+}
+
+void cb_ssm_qwen35_delta_z_only(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                void* userdata) {
+    auto* ud = static_cast<SSMQwen35DeltaUserData*>(userdata);
+    if (!dst || !src || !ud || !ud->qkv_tensor || !ud->input_tensor) {
+        return;
+    }
+    if (std::getenv("SSM_PASSTHROUGH") != nullptr || std::getenv("DENSECORE_SSM_DELTA_PASSTHROUGH") != nullptr) {
+        if (ith == 0 && dst->data) {
+            std::memset(dst->data, 0, ggml_nbytes(dst));
+        }
+        return;
+    }
+    cb_ssm_qwen35_delta(dst, src, ud->qkv_tensor, ud->input_tensor, ith, nth, userdata);
 }
 
 // Qwen3.5 recurrent delta-net callback.
@@ -2033,6 +2157,17 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
     const int qk_total = head_k_dim * num_k_heads;
     const int state_stride = head_k_dim * head_v_dim;
     const int heads_per_group = (num_k_heads > 0) ? std::max(1, num_v_heads / num_k_heads) : 1;
+    const auto resolve_src_k_head = [&](int v_head_idx) -> int {
+        if (num_k_heads == num_v_heads) {
+            return v_head_idx;
+        }
+        if (ud->projection_profile == Qwen35SSMQkvProjectionProfile::QWEN36_OFFICIAL) {
+            // llama.cpp enables fused GDN for Qwen3.6 by default. Its CPU
+            // kernel broadcasts Q/K heads with iv1 % H_k, not grouped repeat.
+            return v_head_idx % num_k_heads;
+        }
+        return std::min(num_k_heads - 1, v_head_idx / heads_per_group);
+    };
 
     // =========================================================================
     // LAYOUT ASSERTIONS & RUNTIME CONTRACT CHECK
@@ -2069,10 +2204,9 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
     if (c->ne[0] != ud->n_embd) {
         FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM input tensor shape mismatch");
     }
-    // ggml_map_custom3() allocates the output tensor with the same shape as `a`
-    // (here, qkv_conv). The SSM block only writes the first d_inner values per row,
-    // and the caller later views that prefix as [d_inner, N].
-    if (dst->ne[0] < ud->d_inner) {
+    // ggml_map_custom3() allocates the output tensor with the same shape as its
+    // first source tensor `a`, which is the z projection [d_inner, N].
+    if (dst->ne[0] != ud->d_inner || dst->ne[1] != a->ne[1]) {
         FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM output tensor shape mismatch");
     }
 
@@ -2084,6 +2218,9 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
     }
     if (input_stride < ud->n_embd) {
         FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM input row stride is smaller than element count");
+    }
+    if (out_stride < ud->d_inner) {
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM output row stride is smaller than element count");
     }
 
 
@@ -2120,6 +2257,8 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
 
     static thread_local std::vector<float> canonical_qkv_row;
     canonical_qkv_row.resize(static_cast<size_t>(expected_conv_channels));
+    const Qwen35SSMQkvProjectionContract projection_contract =
+        ResolveQwen35SSMQkvProjectionContract(ud->projection_profile);
 
     for (int t = 0; t < N; ++t) {
         float* const y = y_out + static_cast<ptrdiff_t>(t) * out_stride;
@@ -2133,29 +2272,17 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
         const float* v_base;
 
         const float* qkv_t = qkv_conv + static_cast<ptrdiff_t>(t) * qkv_stride;
-        float* canonical_qkv = canonical_qkv_row.data();
-        int i = 0;
-        for (; i + 4 <= expected_conv_channels; i += 4) {
-            const float x0 = qkv_t[i];
-            const float x1 = qkv_t[i + 1];
-            const float x2 = qkv_t[i + 2];
-            const float x3 = qkv_t[i + 3];
-            canonical_qkv[i] = x0 * SigmoidStable(x0);
-            canonical_qkv[i + 1] = x1 * SigmoidStable(x1);
-            canonical_qkv[i + 2] = x2 * SigmoidStable(x2);
-            canonical_qkv[i + 3] = x3 * SigmoidStable(x3);
-        }
-        for (; i < expected_conv_channels; ++i) {
-            const float raw = qkv_t[i];
-            canonical_qkv[i] = raw * SigmoidStable(raw);
+        if (!Qwen35CanonicalizeProjectedQkvRow(qkv_t, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
+                                               projection_contract, &canonical_qkv_row)) {
+            FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, -1,
+                                       "failed to canonicalize hybrid SSM projected QKV row");
         }
         q_base = canonical_qkv_row.data();
         k_base = canonical_qkv_row.data() + qk_total;
         v_base = canonical_qkv_row.data() + 2 * qk_total;
         if (debug_core_ref) {
             for (int h = 0; h < num_v_heads; ++h) {
-                const int src_k_head =
-                    (num_k_heads == num_v_heads) ? h : std::min(num_k_heads - 1, h / heads_per_group);
+                const int src_k_head = resolve_src_k_head(h);
                 std::memcpy(q_expanded.data() + static_cast<size_t>(h) * head_k_dim,
                             q_base + static_cast<size_t>(src_k_head) * head_k_dim,
                             static_cast<size_t>(head_k_dim) * sizeof(float));
@@ -2189,8 +2316,7 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
             if (IsTraceQwen35SSMRuntimeContractEnabled() && t < TraceQwen35SSMMaxTokens() && token_ssm_state_base) {
                 uint64_t token_hash = 1469598103934665603ull;
                 for (int h = 0; h < std::min(num_v_heads, TraceQwen35SSMMaxHeads()); ++h) {
-                    const int src_k_head =
-                        (num_k_heads == num_v_heads) ? h : std::min(num_k_heads - 1, h / heads_per_group);
+                    const int src_k_head = resolve_src_k_head(h);
                     const bool grouped_src_reused = (num_k_heads != num_v_heads);
                     const size_t state_offset_bytes =
                         static_cast<size_t>(h) * static_cast<size_t>(state_stride) * sizeof(float);
@@ -2222,7 +2348,7 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
 
         uint64_t layer_aggregate_hash = 1469598103934665603ull;
         for (int h = 0; h < num_v_heads; ++h) {
-            const int src_k_head = (num_k_heads == num_v_heads) ? h : std::min(num_k_heads - 1, h / heads_per_group);
+            const int src_k_head = resolve_src_k_head(h);
             
             // Boundary check for QKV head slicing within the logical row
             if (src_k_head < 0 || src_k_head >= num_k_heads) {
@@ -2289,6 +2415,7 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
             cfg.dt_bias = ud->dt_bias[h];
             cfg.a_log = ud->a_log[h];
             cfg.norm_eps = ud->norm_eps;
+            cfg.a_log_prescaled = (ud->projection_profile == Qwen35SSMQkvProjectionProfile::QWEN36_OFFICIAL);
 
             Qwen35SSMHeadStepStats ref_stats{};
             const float* q_ref_head = q_head;
@@ -2313,6 +2440,10 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
             Qwen35SSMHeadStepStats step_stats{};
             Qwen35SSMHeadStepDebugBuffers step_debug{};
             Qwen35SSMHeadStepTrace step_trace{};
+            std::vector<float> state_before_snapshot;
+            if (IsCompareReferenceSafeQwen35SSMDeltaEnabled()) {
+                state_before_snapshot.assign(state, state + state_elems);
+            }
             step_debug.q_norm = q_norm;
             step_debug.k_norm = k_norm;
             step_debug.kv_mem = kv_mem;
@@ -2335,11 +2466,13 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
             if (IsCompareReferenceSafeQwen35SSMDeltaEnabled()) {
                 std::vector<float> reference_state(state_elems, 0.0f);
                 std::vector<float> reference_y(static_cast<size_t>(head_v_dim), 0.0f);
-                std::memcpy(reference_state.data(), token_ssm_state_base + state_offset, state_elems * sizeof(float));
-                std::memcpy(reference_state.data(), state, state_elems * sizeof(float));
-                std::memcpy(reference_state.data(), token_ssm_state_base + state_offset, state_elems * sizeof(float));
+                if (state_before_snapshot.size() != state_elems) {
+                    FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h,
+                                               "reference-safe compare lost original SSM state snapshot");
+                }
+                std::memcpy(reference_state.data(), state_before_snapshot.data(), state_elems * sizeof(float));
                 Qwen35SSMHeadStepTrace reference_trace{};
-                if (!Qwen35RunGatedDeltaHeadStepReferenceSafe(cfg, token_ssm_state_base + state_offset,
+                if (!Qwen35RunGatedDeltaHeadStepReferenceSafe(cfg, state_before_snapshot.data(),
                                                               reference_state.data(), reference_y.data(), nullptr,
                                                               nullptr, &reference_trace)) {
                     FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h,

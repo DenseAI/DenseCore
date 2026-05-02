@@ -44,6 +44,7 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
 std::string RenderModelChatMessages(const TransformerModel* model, const std::vector<CanonicalChatMessage>& messages,
                                     const CanonicalChatRenderOptions& options, bool* thinking_enabled = nullptr);
 void ConfigureQwenReasoningTokenBlocklistForModel(const TransformerModel* model, Request* req);
+void ConfigureQwen36TextTokenBlocklistForModel(const TransformerModel* model, Request* req);
 void ConfigureGemma4TextTokenBlocklistForModel(const TransformerModel* model, Request* req);
 
 }  // namespace densecore::models

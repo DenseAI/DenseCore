@@ -11,6 +11,7 @@
 
 #include "densecore/arm_runtime.h"
 #include "densecore/backend/cpu_backend.h"
+#include "densecore/backend/hardware_topology.h"
 #include "densecore/exceptions.h"
 #include "densecore/models/model_descriptor.h"
 #include "ggml.h"
@@ -99,6 +100,22 @@ bool GraphContainsPagedDecodeCustomOp(const struct ggml_cgraph* graph) {
         }
     }
     return false;
+}
+
+bool CompiledWithArmSveForSummary() {
+#if defined(__ARM_FEATURE_SVE)
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool CompiledWithArmSve2ForSummary() {
+#if defined(__ARM_FEATURE_SVE2)
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool ResolvePagedDecodeHeadDims(const TransformerModel* model, int* n_head_out, int* n_head_kv_out, int* head_dim_q_out,
@@ -748,13 +765,27 @@ DecodeThreadPolicySelection ResolveDecodeThreadPolicySelection(const Transformer
     const int env_override = densecore::env::ParsePositiveEnvInt("DENSECORE_QWEN36_SINGLE_DECODE_THREADS", 0);
     if (env_override > 0) {
         selection.threads = std::max(1, std::min(cap, env_override));
-        selection.label = "decode_qwen36_single_env_override";
+        selection.label =
+            (model->hparams.n_experts > 0) ? "decode_qwen36_a3b_env_override" : "decode_qwen36_single_env_override";
         return selection;
     }
 
     if (model->hparams.n_experts > 0) {
+        const bool arm_c4a_wide_simd =
+            densecore::simd::IsArmFamily(simd_level) &&
+            (simd_level == densecore::simd::SimdLevel::SVE || simd_level == densecore::simd::SimdLevel::SVE2);
+        if (arm_c4a_wide_simd && physical_core_count >= 16 && cap >= 16) {
+            selection.threads = 16;
+            selection.label = "decode_qwen36_a3b_c4a_moe_16";
+            return selection;
+        }
+        if (arm_c4a_wide_simd && cap >= 12) {
+            selection.threads = 12;
+            selection.label = "decode_qwen36_a3b_arm_safe_cap";
+            return selection;
+        }
         selection.threads = std::max(1, std::min(cap, 8));
-        selection.label = "decode_qwen36_a3b_c4_sweet_spot";
+        selection.label = "decode_qwen36_a3b_safe_cap";
         return selection;
     }
 
@@ -1300,27 +1331,73 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         steady_visible_tokens > 0 ? point_to_ms(req->first_token_time, req->last_external_emit_time) : 0.0;
     const double steady_visible_tok_s =
         (decode_visible_ms > 0.0) ? (static_cast<double>(steady_visible_tokens) / (decode_visible_ms / 1000.0)) : 0.0;
-    std::cerr << "[Qwen36DecodeSummary] req=" << req->id
-              << " finish_cause=" << DecodeFinishCauseName(req->decode_finish_cause)
-              << " silent_reason=" << DecodeSilentFinishReasonName(req->decode_silent_finish_reason)
-              << " prompt_tokens=" << prompt_tokens << " sampled_tokens=" << req->sampled_token_count
-              << " visible_tokens=" << req->visible_emitted_token_count
-              << " steady_visible_tokens=" << steady_visible_tokens
-              << " long_form_visible=" << (req->visible_emitted_token_count >= 64 ? 1 : 0)
-              << " nonempty_visible_output=" << (req->visible_emitted_token_count > 0 ? 1 : 0)
-              << " suppressed_tokens=" << req->suppressed_token_count << " prefill_ttft_ms=" << prefill_ttft_ms
-              << " decode_visible_ms=" << decode_visible_ms << " steady_visible_tok_s=" << steady_visible_tok_s
-              << " prefill_threads=" << req->prefill_thread_count << " prefill_policy="
-              << (req->prefill_thread_policy.empty() ? "none" : req->prefill_thread_policy.c_str())
-              << " decode_threads=" << req->decode_thread_count
-              << " decode_policy=" << (req->decode_thread_policy.empty() ? "none" : req->decode_thread_policy.c_str())
-              << " scheduler_wait_ms=" << ns_to_ms(req->scheduler_wait_ns)
-              << " batch_build_ms=" << ns_to_ms(req->batch_build_ns)
-              << " graph_build_rebind_ms=" << ns_to_ms(req->graph_build_rebind_ns)
-              << " graph_execute_ms=" << ns_to_ms(req->graph_execute_ns)
-              << " first_sampled_token_id=" << req->first_sampled_token_id
-              << " first_visible_token_id=" << req->first_visible_token_id
-              << " generated_count=" << req->generated_count << " n_past=" << req->n_past << std::endl;
+    const DecodeRuntimeStatsSnapshot runtime = GetDecodeRuntimeStatsSnapshot();
+    const KVRuntimeStatsSnapshot kv_stats = GetKVRuntimeStatsSnapshot();
+    const double paged_hit_rate =
+        runtime.path_total > 0 ? (100.0 * static_cast<double>(runtime.path_paged) / runtime.path_total) : 0.0;
+    const densecore::simd::SimdLevel simd_level = densecore::simd::DetectSimdLevel();
+    const int physical_core_count = densecore::HardwareTopology::GetInstance().GetPhysicalCoreCount();
+    const bool sve_runtime_detected = densecore::simd::HasArmSveOrBetter(simd_level);
+    const bool sve_compiled_enabled = CompiledWithArmSveForSummary();
+    const bool sve2_compiled_enabled = CompiledWithArmSve2ForSummary();
+    std::cerr
+        << "[Qwen36DecodeSummary] req=" << req->id
+        << " finish_cause=" << DecodeFinishCauseName(req->decode_finish_cause)
+        << " silent_reason=" << DecodeSilentFinishReasonName(req->decode_silent_finish_reason)
+        << " prompt_tokens=" << prompt_tokens << " sampled_tokens=" << req->sampled_token_count
+        << " visible_tokens=" << req->visible_emitted_token_count << " steady_visible_tokens=" << steady_visible_tokens
+        << " long_form_visible=" << (req->visible_emitted_token_count >= 64 ? 1 : 0)
+        << " nonempty_visible_output=" << (req->visible_emitted_token_count > 0 ? 1 : 0)
+        << " suppressed_tokens=" << req->suppressed_token_count << " prefill_ttft_ms=" << prefill_ttft_ms
+        << " decode_visible_ms=" << decode_visible_ms << " steady_visible_tok_s=" << steady_visible_tok_s
+        << " active_threads=" << req->active_thread_count << " prefill_threads=" << req->prefill_thread_count
+        << " prefill_policy=" << (req->prefill_thread_policy.empty() ? "none" : req->prefill_thread_policy.c_str())
+        << " decode_threads=" << req->decode_thread_count
+        << " decode_policy=" << (req->decode_thread_policy.empty() ? "none" : req->decode_thread_policy.c_str())
+        << " simd_level=" << densecore::simd::SimdLevelName(simd_level) << " physical_cores=" << physical_core_count
+        << " scheduler_wait_ms=" << ns_to_ms(req->scheduler_wait_ns)
+        << " batch_build_ms=" << ns_to_ms(req->batch_build_ns) << " graph_build_ms=" << ns_to_ms(req->graph_build_ns)
+        << " graph_rebind_ms=" << ns_to_ms(req->graph_rebind_ns)
+        << " graph_execute_ms=" << ns_to_ms(req->graph_execute_ns) << " attention_ms=" << ns_to_ms(req->attention_ns)
+        << " paged_attention_ms=" << ns_to_ms(req->paged_attention_ns)
+        << " standard_attention_ms=" << ns_to_ms(req->standard_attention_ns)
+        << " portable_flash_attention_ms=" << ns_to_ms(req->portable_flash_attention_ns)
+        << " native_flash_attention_ms=" << ns_to_ms(req->native_flash_attention_ns)
+        << " hal_attention_ms=" << ns_to_ms(req->hal_attention_ns)
+        << " attention_repack_ms=" << ns_to_ms(req->attention_repack_ns)
+        << " moe_forward_ms=" << ns_to_ms(req->moe_forward_ns)
+        << " shared_expert_ms=" << ns_to_ms(req->shared_expert_ns)
+        << " quant_matmul_ms=" << ns_to_ms(req->quant_matmul_ns) << " kv_update_ms=" << ns_to_ms(req->kv_update_ns)
+        << " sample_ms=" << ns_to_ms(req->sample_ns) << " graph_cache_hits=" << req->graph_cache_hit_count
+        << " graph_cache_misses=" << req->graph_cache_miss_count << " paged_hit_rate=" << paged_hit_rate
+        << " paged_path_hits=" << runtime.path_paged << " decode_path_total=" << runtime.path_total
+        << " prefill_chunk_tokens_effective=" << req->prefill_chunk_tokens_effective
+        << " q4k_true_batched_used=" << req->q4k_true_batched_used
+        << " arm_batched_quant_used=" << req->arm_batched_quant_used
+        << " sve_runtime_detected=" << (sve_runtime_detected ? 1 : 0)
+        << " sve_compiled_enabled=" << (sve_compiled_enabled ? 1 : 0)
+        << " sve2_compiled_enabled=" << (sve2_compiled_enabled ? 1 : 0)
+        << " attention_path_paged=" << req->attention_path_paged
+        << " attention_path_standard=" << req->attention_path_standard
+        << " attention_path_portable_flash=" << req->attention_path_portable_flash
+        << " attention_path_native_flash=" << req->attention_path_native_flash
+        << " attention_path_hal=" << req->attention_path_hal << " moe_task_count=" << req->moe_task_count
+        << " selected_expert_count=" << req->selected_expert_count
+        << " shared_quant_reused=" << runtime.shared_quant_reused
+        << " shared_quant_total=" << runtime.shared_quant_total
+        << " kv_single_slot_read_count=" << kv_stats.single_slot_read_count
+        << " kv_single_slot_write_count=" << kv_stats.single_slot_write_count
+        << " kv_bulk_read_count=" << kv_stats.bulk_read_count << " kv_bulk_write_count=" << kv_stats.bulk_write_count
+        << " kv_slot_fallback_count=" << kv_stats.slot_fallback_count
+        << " kv_hot_path_alloc_count=" << kv_stats.hot_path_alloc_count << " kv_bulk_reads=" << kv_stats.bulk_read_calls
+        << " kv_bulk_read_slots=" << kv_stats.bulk_read_slots << " kv_bulk_writes=" << kv_stats.bulk_write_calls
+        << " kv_bulk_write_slots=" << kv_stats.bulk_write_slots
+        << " kv_slot_read_fallbacks=" << kv_stats.slot_read_fallback_calls
+        << " kv_slot_write_fallbacks=" << kv_stats.slot_write_fallback_calls
+        << " kv_scratch_grows=" << kv_stats.scratch_buffer_grows
+        << " first_sampled_token_id=" << req->first_sampled_token_id
+        << " first_visible_token_id=" << req->first_visible_token_id << " generated_count=" << req->generated_count
+        << " n_past=" << req->n_past << std::endl;
 }
 
 bool HasDecodeVisibleProgressStalled(const Request* req, std::chrono::steady_clock::time_point now) {

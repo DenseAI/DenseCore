@@ -89,6 +89,10 @@ func (m *MockEngine) TokenizeText(text string, addBOS bool, addEOS bool) ([]int,
 	return []int{len(text)}, nil
 }
 
+func (m *MockEngine) PreviewTextRequestTokens(text string, maxTokens int, temperature float64, topP float64, topK int, repetitionPenalty float64, jsonMode bool) ([]int, error) {
+	return m.TokenizeText(text, false, false)
+}
+
 func (m *MockEngine) GetTokenizerType() string { return "" }
 
 func (m *MockEngine) GetChatTemplate() string { return "" }
@@ -99,8 +103,11 @@ func (m *MockEngine) CancelRequest(reqID uintptr) {}
 
 // MockModelService provides a test model service
 type MockModelService struct {
-	engine    *MockEngine
-	modelName string
+	engine          *MockEngine
+	modelName       string
+	lastLoadMain    string
+	lastLoadDraft   string
+	lastLoadThreads int
 }
 
 func NewMockModelService() *MockModelService {
@@ -123,6 +130,9 @@ func (m *MockModelService) GetModelIdentity() (string, string, string) {
 }
 
 func (m *MockModelService) LoadModel(mainPath, draftPath string, threads int) error {
+	m.lastLoadMain = mainPath
+	m.lastLoadDraft = draftPath
+	m.lastLoadThreads = threads
 	return nil
 }
 
@@ -797,6 +807,52 @@ func TestModelsHandler(t *testing.T) {
 
 	if resp["object"] != "list" {
 		t.Errorf("Expected object='list', got %v", resp["object"])
+	}
+}
+
+func TestLoadModelHandlerDefaultsToRuntimeTuningThreads(t *testing.T) {
+	mockModelService := NewMockModelService()
+	q := queue.NewRequestQueue(10)
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(
+		chatService,
+		mockModelService,
+		WithRuntimeTuningProfile(RuntimeTuningProfile{EngineThreads: 16}),
+	)
+
+	req := makeRequest("POST", "/v1/models/load", map[string]interface{}{
+		"model_path": "/models/qwen.gguf",
+	})
+	w := httptest.NewRecorder()
+
+	handler.LoadModelHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", w.Code)
+	}
+	if mockModelService.lastLoadThreads != 16 {
+		t.Fatalf("LoadModel threads = %d, want 16", mockModelService.lastLoadThreads)
+	}
+}
+
+func TestLoadModelHandlerFallsBackToAutoThreads(t *testing.T) {
+	mockModelService := NewMockModelService()
+	q := queue.NewRequestQueue(10)
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/models/load", map[string]interface{}{
+		"model_path": "/models/qwen.gguf",
+	})
+	w := httptest.NewRecorder()
+
+	handler.LoadModelHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", w.Code)
+	}
+	if mockModelService.lastLoadThreads != 0 {
+		t.Fatalf("LoadModel threads = %d, want 0 for auto-detect", mockModelService.lastLoadThreads)
 	}
 }
 

@@ -205,11 +205,40 @@ struct InferenceContext {
 // Explicit per-thread work context for inference callbacks
 struct InferenceWorkContext;
 
+struct Qwen36ProfileSnapshot {
+    uint64_t attention_ns = 0;
+    uint64_t paged_attention_ns = 0;
+    uint64_t standard_attention_ns = 0;
+    uint64_t portable_flash_attention_ns = 0;
+    uint64_t native_flash_attention_ns = 0;
+    uint64_t hal_attention_ns = 0;
+    uint64_t attention_repack_ns = 0;
+    uint64_t moe_forward_ns = 0;
+    uint64_t shared_expert_ns = 0;
+    uint64_t quant_matmul_ns = 0;
+    uint64_t kv_update_ns = 0;
+    uint64_t sample_ns = 0;
+    uint64_t graph_cache_hits = 0;
+    uint64_t graph_cache_misses = 0;
+    int moe_task_count = 0;
+    int selected_expert_count = 0;
+    int q4k_true_batched_used = 0;
+    int arm_batched_quant_used = 0;
+    int attention_path_paged = 0;
+    int attention_path_standard = 0;
+    int attention_path_portable_flash = 0;
+    int attention_path_native_flash = 0;
+    int attention_path_hal = 0;
+};
+
 InferenceWorkContext* CreateInferenceWorkContext();
 void DestroyInferenceWorkContext(InferenceWorkContext* ctx);
 void ResetInferenceWorkContext(InferenceWorkContext* ctx);
 void SetCurrentWorkContext(InferenceWorkContext* ctx);
 InferenceWorkContext* GetCurrentWorkContext();
+bool IsQwen36ProfilingEnabled();
+void ResetQwen36Profile(InferenceWorkContext* ctx);
+Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx);
 
 GgmlTensorHandle* BuildTransformerGraph(TransformerModel* model, PagedKVCache* cache, GgmlContextHandle* ctx_c,
                                         const BatchSpec& batch, bool embedding_mode = false,

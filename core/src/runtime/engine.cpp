@@ -618,6 +618,9 @@ void ApplyTokenIdConstraints(Request* req, const TransformerModel* model, const 
 }
 
 bool ShouldPrimeQwenNoThinkingPrompt(const TransformerModel* model) {
+    if (model && model->variant == ModelVariant::QWEN36) {
+        return false;
+    }
     const auto& descriptor = densecore::models::DescribeModel(model);
     if (!descriptor.uses_qwen_thinking_env) {
         return false;
@@ -628,10 +631,29 @@ bool ShouldPrimeQwenNoThinkingPrompt(const TransformerModel* model) {
     if (descriptor.variant == ModelVariant::QWEN35) {
         return !ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", false);
     }
-    if (descriptor.variant == ModelVariant::QWEN36) {
+    return false;
+}
+
+bool ShouldPrimeQwenNoThinkingPromptText(const TransformerModel* model) {
+    if (!model) {
         return false;
     }
-    return false;
+    const auto& descriptor = densecore::models::DescribeModel(model);
+    if (!descriptor.uses_qwen_thinking_env) {
+        return false;
+    }
+    if (descriptor.variant == ModelVariant::QWEN36 || model->variant == ModelVariant::QWEN36) {
+        const char* env = std::getenv("DENSECORE_QWEN36_ENABLE_THINKING");
+        bool thinking_disabled = false;
+        if (env && env[0] != '\0') {
+            thinking_disabled =
+                std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 || std::strcmp(env, "False") == 0;
+        } else {
+            thinking_disabled = !ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", true);
+        }
+        return thinking_disabled && ParseBoolEnv("DENSECORE_QWEN36_PRIME_NO_THINKING", false);
+    }
+    return ShouldPrimeQwenNoThinkingPrompt(model);
 }
 
 std::string PrimeQwenNoThinkingText(std::string prompt_text) {
@@ -653,7 +675,7 @@ std::string PrimeQwenNoThinkingText(std::string prompt_text) {
 }
 
 void MaybePrimeQwenNoThinkingPromptText(const TransformerModel* model, std::string* prompt_text) {
-    if (!prompt_text || !ShouldPrimeQwenNoThinkingPrompt(model)) {
+    if (!prompt_text || !ShouldPrimeQwenNoThinkingPromptText(model)) {
         return;
     }
     *prompt_text = PrimeQwenNoThinkingText(std::move(*prompt_text));
@@ -674,6 +696,26 @@ void MaybePrimeQwenNoThinking(const TransformerModel* model, std::vector<int>* t
     }
 
     *tokens = Tokenizer::Tokenize(model, primed_text, /*add_bos=*/false, /*add_eos=*/false);
+}
+
+bool ShouldDisableBosForRenderedQwen36Prompt(const TransformerModel* model, const std::string& prompt) {
+    if (!model) {
+        return false;
+    }
+    if (densecore::models::DescribeModel(model).variant != ModelVariant::QWEN36) {
+        return false;
+    }
+    return prompt.find("<|im_start|>") != std::string::npos || prompt.find("<|im_end|>") != std::string::npos;
+}
+
+bool ResolveAddBosForPrompt(const TransformerModel* model, const std::string& prompt) {
+    if (!model) {
+        return false;
+    }
+    if (ShouldDisableBosForRenderedQwen36Prompt(model, prompt)) {
+        return false;
+    }
+    return model->tokenizer_add_bos;
 }
 
 void ConfigureQwenReasoningTokenBlocklist(const TransformerModel* model, Request* req) {
@@ -868,6 +910,13 @@ std::vector<int> DenseCoreTestOnlyGemma4TextBlocklist(const TransformerModel* mo
     Request req{};
     ConfigureGemma4TextTokenBlocklist(model, &req);
     return req.disallowed_token_ids;
+}
+
+std::string DenseCoreTestOnlyPrimeQwenNoThinkingPromptText(const TransformerModel* model, const std::string& prompt) {
+    if (!ShouldPrimeQwenNoThinkingPromptText(model)) {
+        return prompt;
+    }
+    return PrimeQwenNoThinkingText(prompt);
 }
 
 std::string DenseCoreTestOnlyPrimeQwenNoThinking(const TransformerModel* model, const std::string& prompt) {
@@ -1077,11 +1126,13 @@ int SubmitRequestWithSamplingConstraintsEx(DenseCoreHandle handle, const char* p
     req->parity_debug_text_primed = (req->prompt != prompt_before_text_priming);
     InitializePromptSuppressionState(req);
     ConfigurePromptSuppressionForModel(model_entry->model.get(), req);
-    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
+    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt,
+                                      ResolveAddBosForPrompt(model_entry->model.get(), req->prompt));
     const std::vector<int> tokens_before_priming = req->tokens;
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
     req->parity_debug_token_primed = (req->tokens != tokens_before_priming);
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
+    densecore::models::ConfigureQwen36TextTokenBlocklistForModel(model_entry->model.get(), req);
     ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
     if ((allowed_token_ids && num_allowed_token_ids > 0) || (disallowed_token_ids && num_disallowed_token_ids > 0)) {
         ApplyTokenIdConstraints(req, model_entry->model.get(), allowed_token_ids, num_allowed_token_ids,
@@ -1129,7 +1180,8 @@ int SubmitRequestWithTokenResults(DenseCoreHandle handle, const char* prompt, in
     req->parity_debug_text_primed = (req->prompt != token_result_prompt_before_text_priming);
     InitializePromptSuppressionState(req);
     ConfigurePromptSuppressionForModel(model_entry->model.get(), req);
-    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
+    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt,
+                                      ResolveAddBosForPrompt(model_entry->model.get(), req->prompt));
     const std::vector<int> token_result_tokens_before_priming = req->tokens;
     MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
     req->parity_debug_token_primed = (req->tokens != token_result_tokens_before_priming);
@@ -1397,7 +1449,8 @@ int DenseCorePreviewTextRequest(DenseCoreHandle handle, const char* prompt, int 
     const std::string before_text_priming = rendered_prompt;
     MaybePrimeQwenNoThinkingPromptText(entry->model.get(), &rendered_prompt);
     const bool text_primed = rendered_prompt != before_text_priming;
-    g_preview_token_ids = Tokenizer::Tokenize(entry->model.get(), rendered_prompt, entry->model->tokenizer_add_bos);
+    g_preview_token_ids = Tokenizer::Tokenize(entry->model.get(), rendered_prompt,
+                                              ResolveAddBosForPrompt(entry->model.get(), rendered_prompt));
     const std::vector<int> before_token_priming = g_preview_token_ids;
     MaybePrimeQwenNoThinking(entry->model.get(), &g_preview_token_ids);
     const bool token_primed = g_preview_token_ids != before_token_priming;
@@ -2151,7 +2204,8 @@ int SubmitRequest(DenseCoreHandle handle, const char* prompt, int max_tokens, co
     MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
     InitializePromptSuppressionState(req);
     ConfigurePromptSuppressionForModel(model_entry->model.get(), req);
-    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
+    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt,
+                                      ResolveAddBosForPrompt(model_entry->model.get(), req->prompt));
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
     LogRequestRuntimePath(state, model_entry->model.get(), prompt, req);
@@ -2234,7 +2288,8 @@ int SubmitRequestWithFormatEx(DenseCoreHandle handle, const char* prompt, int ma
     MaybePrimeQwenNoThinkingPromptText(model_entry->model.get(), &req->prompt);
     InitializePromptSuppressionState(req);
     ConfigurePromptSuppressionForModel(model_entry->model.get(), req);
-    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt, model_entry->model->tokenizer_add_bos);
+    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt,
+                                      ResolveAddBosForPrompt(model_entry->model.get(), req->prompt));
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
     LogRequestRuntimePath(state, model_entry->model.get(), prompt, req);

@@ -246,8 +246,8 @@ func (h *DenseCoreHandler) LoadModel(ctx context.Context, req *LoadModelRequest)
 	}
 
 	threads := int(req.Threads)
-	if threads <= 0 {
-		threads = 4 // Default thread count
+	if threads < 0 {
+		threads = 0
 	}
 
 	if err := h.modelService.LoadModel(req.ModelPath, req.DraftModelPath, threads); err != nil {

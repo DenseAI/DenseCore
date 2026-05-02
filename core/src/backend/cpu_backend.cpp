@@ -109,6 +109,36 @@ bool ParseCpuBackendEnvBool(const char* name, bool default_value) {
     return std::strcmp(value, "0") != 0;
 }
 
+int ParseCpuBackendEnvPositiveInt(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    if (!value || *value == '\0') {
+        return default_value;
+    }
+    const int parsed = std::atoi(value);
+    return parsed > 0 ? parsed : default_value;
+}
+
+bool IsArmInt4SplitNEnabled() {
+    return ParseCpuBackendEnvBool("DENSECORE_ARM_INT4_SPLIT_N", false);
+}
+
+int GetArmInt4SplitNMinN() {
+    return ParseCpuBackendEnvPositiveInt("DENSECORE_ARM_INT4_SPLIT_N_MIN_N", 128);
+}
+
+bool IsInt4PathDebugEnabled() {
+    return ParseCpuBackendEnvBool("DENSECORE_DEBUG_INT4_PATHS", false) ||
+           ParseCpuBackendEnvBool("DENSECORE_DEBUG_MOE_MATMUL_PATHS", false);
+}
+
+void LogInt4PathSelection(const char* path, int M, int K, int N, int group_size, int threads) {
+    if (!IsInt4PathDebugEnabled()) {
+        return;
+    }
+    std::cerr << "[INT4_PATH] path=" << (path ? path : "unknown") << " M=" << M << " K=" << K << " N=" << N
+              << " group_size=" << group_size << " threads=" << threads << '\n';
+}
+
 size_t GetMoEPrefetchBytes() {
     static const size_t bytes = []() -> size_t {
         const char* env = std::getenv("DENSECORE_MOE_PREFETCH_BYTES");
@@ -1060,18 +1090,25 @@ void CpuBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
     const float* scales_data = scales.DataAs<float>();
     const float* zeros_data = zero_points.DataAs<float>();
     float* c_data = C->DataAs<float>();
+    auto& pool = GetThreadPool(numa_node_id);
+    const int n_threads = pool.GetNumThreads();
 
 #if defined(__aarch64__) || defined(_M_ARM64)
+    const bool arm_split_n_decode =
+        (M == 1) && n_threads > 1 && IsArmInt4SplitNEnabled() && N >= GetArmInt4SplitNMinN();
     // ARM correctness issue narrowed to the Highway INT4 path. Route through
     // the runtime-selected DenseCore kernel (NEON/SVE) until Highway INT4 on
     // ARM is verified against the same reference path.
-    if (!OpsRegistry::IsInitialized()) {
-        OpsRegistry::Init();
-    }
-    auto& reg = OpsRegistry::Instance();
-    if (reg.GemmInt4) {
-        reg.GemmInt4(c_data, a_data, w_data, scales_data, zeros_data, M, N, K, group_size);
-        return;
+    if (!arm_split_n_decode) {
+        if (!OpsRegistry::IsInitialized()) {
+            OpsRegistry::Init();
+        }
+        auto& reg = OpsRegistry::Instance();
+        if (reg.GemmInt4) {
+            LogInt4PathSelection("arm_runtime_gemmint4", M, K, N, group_size, n_threads);
+            reg.GemmInt4(c_data, a_data, w_data, scales_data, zeros_data, M, N, K, group_size);
+            return;
+        }
     }
 #endif
 
@@ -1083,8 +1120,6 @@ void CpuBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
     // parallelizes across the N dimension for better utilization.
     // ===========================================================================
     if (M == 1) {
-        auto& pool = GetThreadPool(numa_node_id);
-        const int n_threads = pool.GetNumThreads();
 #ifdef __APPLE__
         if (apple::HasCustomInt4Kernels()) {
             if (n_threads <= 1) {
@@ -1098,6 +1133,17 @@ void CpuBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
             return;
         }
 #endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+        if (IsArmInt4SplitNEnabled() && N >= GetArmInt4SplitNMinN() && n_threads > 1) {
+            LogInt4PathSelection("arm_split_n_hwy", M, K, N, group_size, n_threads);
+            pool.ParallelFor(N, [&](int n_start, int n_end, int /*thread_id*/) {
+                hwy_kernels::GemvInt4_Hwy(c_data, a_data, w_data, scales_data, zeros_data, K, N, group_size, n_start,
+                                          n_end);
+            });
+            return;
+        }
+#endif
+        LogInt4PathSelection("gemv_hwy", M, K, N, group_size, n_threads);
         if (n_threads <= 1) {
             // Single-threaded: process all N at once
             hwy_kernels::GemvInt4_Hwy(c_data, a_data, w_data, scales_data, zeros_data, K, N, group_size, 0, N);
@@ -1150,8 +1196,6 @@ void CpuBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
 #endif
     };
 
-    auto& pool = GetThreadPool(numa_node_id);
-    const int n_threads = pool.GetNumThreads();
     const int64_t total_work = static_cast<int64_t>(M) * static_cast<int64_t>(N) * static_cast<int64_t>(K);
     const bool should_parallelize = n_threads > 1 && N >= 128 && total_work >= (1ll << 18);
 

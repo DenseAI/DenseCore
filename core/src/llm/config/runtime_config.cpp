@@ -36,6 +36,10 @@ WorkerRuntimeConfig LoadWorkerRuntimeConfig() {
     config.prefix_cache_reuse_disabled = env::ParseNonZeroEnv("DENSECORE_DEBUG_DISABLE_PREFIX_CACHE_REUSE", false);
     config.hybrid_ssm_snapshot_restore_disabled =
         env::ParseNonZeroEnv("DENSECORE_DEBUG_DISABLE_HYBRID_SSM_RESTORE", false);
+    config.qwen36_prefix_cache_reuse_enabled =
+        env::ParseNonZeroEnv("DENSECORE_QWEN36_ENABLE_PREFIX_CACHE_REUSE", false);
+    config.qwen36_hybrid_ssm_snapshot_restore_enabled =
+        env::ParseNonZeroEnv("DENSECORE_QWEN36_ENABLE_HYBRID_SSM_SNAPSHOT_RESTORE", false);
     config.graph_cache_reuse_disabled = env::ParseNonZeroEnv("DENSECORE_DEBUG_DISABLE_GRAPH_CACHE_REUSE", false);
     config.moe_trace_plumbing_disabled = env::ParseNonZeroEnv("DENSECORE_DEBUG_DISABLE_MOE_TRACE_PLUMBING", false);
     config.moe_graph_summary = env::ParseNonZeroEnv("DENSECORE_DEBUG_MOE_GRAPH_SUMMARY", false);

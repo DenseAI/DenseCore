@@ -8,6 +8,7 @@
 #include <limits>
 #include <vector>
 
+#include "densecore/models/model_descriptor.h"
 #include "densecore/simd/simd_ops.h"
 #include "ggml.h"
 #include "models/model_inference_policy.h"
@@ -28,14 +29,18 @@ int EffectiveAutoPagedContextFloor(const TransformerModel* model, int requested_
         return requested_floor;
     }
 
+    const auto& descriptor = densecore::models::DescribeModel(model);
+
     // Qwen-family decode attention stays structurally compatible with paged decode
     // at much shorter contexts than the generic AVX2 heuristic. The global default
     // was tuned conservatively and leaves short interactive prompts on the slower
     // fallback path. Keep the generic floor for other models and relax it only for
     // Qwen dense / hybrid-attention layers.
-    if (model->arch == ModelArch::QWEN3 ||
-        (model->arch == ModelArch::QWEN35 && model->variant == ModelVariant::QWEN36 &&
-         densecore::models::SupportsPagedDecodeAttention(model))) {
+    const bool relaxed_qwen_short_context =
+        descriptor.arch == ModelArch::QWEN3 ||
+        (descriptor.arch == ModelArch::QWEN35 && descriptor.variant == ModelVariant::QWEN36 &&
+         densecore::models::SupportsPagedDecodeAttention(model));
+    if (relaxed_qwen_short_context) {
         return std::min(requested_floor, n_tokens_in_batch > 1 ? 32 : 16);
     }
     return requested_floor;

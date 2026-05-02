@@ -22,6 +22,7 @@ type Engine interface {
 	GetMaxContextTokens() int
 	CountTokens(text string, addBOS bool, addEOS bool) (int, error)
 	TokenizeText(text string, addBOS bool, addEOS bool) ([]int, error)
+	PreviewTextRequestTokens(text string, maxTokens int, temperature float64, topP float64, topK int, repetitionPenalty float64, jsonMode bool) ([]int, error)
 	GetTokenizerType() string
 	GetChatTemplate() string
 	Close()

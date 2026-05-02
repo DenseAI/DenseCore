@@ -483,6 +483,8 @@ static inline bool ComputeQ4KQ8KBatchedRow(const void* weight_row, const uint8_t
  * reusing each weight row across M tokens before evicting it from cache.
  */
 void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    const auto profile_begin =
+        (ith == 0 && IsQwen36ProfilingEnabled()) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto* ud = static_cast<GemvBatchedUserData*>(userdata);
     if (!ud || !ud->weight_tensor) return;
     if (nth <= 0) return;
@@ -514,6 +516,23 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
     const size_t weight_row_stride = static_cast<size_t>(weight_tensor->nb[1]);
     const ggml_type weight_type = weight_tensor->type;
     const char* weight_name = weight_tensor->name[0] ? weight_tensor->name : "(unnamed)";
+    const auto record_quant_profile = [&](bool used_quantized, bool used_true_batched) {
+        if (ith != 0 || profile_begin == std::chrono::steady_clock::time_point()) {
+            return;
+        }
+        InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+        AddQwen36ProfileNs(
+            work_ctx->qwen36_profile.quant_matmul_ns,
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profile_begin)
+                    .count()));
+        if (used_quantized && densecore::simd::IsArmFamily(GetRuntimeSimdLevel())) {
+            MarkQwen36ProfileFlag(work_ctx->qwen36_profile.arm_batched_quant_used);
+        }
+        if (used_true_batched) {
+            MarkQwen36ProfileFlag(work_ctx->qwen36_profile.q4k_true_batched_used);
+        }
+    };
 
     thread_local std::vector<const float*> x_rows;
     thread_local std::vector<float> gathered_inputs;
@@ -566,6 +585,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
             float* C = reinterpret_cast<float*>(output_base);
             // k_start/k_end map to n_start/n_end in GEMM Split-N convention
             densecore::hwy_kernels::GemmFP32_Hwy(C, A, B, M, K, N, k_start, k_end);
+            record_quant_profile(false, false);
             return;
         }
 
@@ -584,6 +604,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 store_out(m, k, sums[static_cast<size_t>(m)]);
             }
         }
+        record_quant_profile(false, false);
         return;
     }
 
@@ -737,6 +758,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         }
                     }
                     if (all_rows_ok) {
+                        record_quant_profile(true, true);
                         continue;
                     }
                 }
@@ -751,6 +773,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     }
                 }
             }
+            record_quant_profile(true, false);
             return;
         }
     }
@@ -787,6 +810,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
             store_out(m, k, sums[static_cast<size_t>(m)]);
         }
     }
+    record_quant_profile(ggml_is_quantized(weight_type), false);
 }
 
 static void ComputeFlashAttentionReference(const float* q, const float* k, const float* v, float* out, int n_head,
@@ -1169,8 +1193,9 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     // Each thread handles a disjoint subset of decode tokens, then synchronizes
     // via an epoch barrier before any thread starts attention reads.
     const bool do_profile = (ith == 0) && IsDecodeProfileEnabled();
+    const bool do_qwen36_profile = (ith == 0) && IsQwen36ProfilingEnabled();
     std::chrono::steady_clock::time_point kv_begin, kv_end;
-    if (do_profile) kv_begin = std::chrono::steady_clock::now();
+    if (do_profile || do_qwen36_profile) kv_begin = std::chrono::steady_clock::now();
 
     const char* k_base = reinterpret_cast<const char*>(k_tensor->data);
     const char* v_base = reinterpret_cast<const char*>(v_tensor->data);
@@ -1311,7 +1336,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
             }
         }
     }
-    if (do_profile && ith == 0) kv_end = std::chrono::steady_clock::now();
+    if (do_profile || do_qwen36_profile) kv_end = std::chrono::steady_clock::now();
 
     // Prefetch next layer's KV blocks to warm L2 cache and TLB before the next
     // layer's callback starts. Only thread 0 issues prefetches to avoid duplicate
@@ -1413,7 +1438,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     };
 
     std::chrono::steady_clock::time_point attn_begin;
-    if (do_profile) attn_begin = std::chrono::steady_clock::now();
+    if (do_profile || do_qwen36_profile) attn_begin = std::chrono::steady_clock::now();
 
     if (q_tokens == 1 && hwy_ready && ud->shared_k_block_ptrs && ud->shared_v_block_ptrs) {
         if (ith == 0) {
@@ -1604,10 +1629,25 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     }
 
     // Decode profiling: log KV write + attention compute timing (thread 0, every 100th call)
-    if (do_profile) {
+    if (do_profile || do_qwen36_profile) {
         const auto attn_end = std::chrono::steady_clock::now();
+        if (do_qwen36_profile) {
+            InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+            AddQwen36ProfileNs(
+                work_ctx->qwen36_profile.kv_update_ns,
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(kv_end - kv_begin).count()));
+            AddQwen36ProfileNs(
+                work_ctx->qwen36_profile.paged_attention_ns,
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(attn_end - attn_begin).count()));
+            AddQwen36ProfileNs(
+                work_ctx->qwen36_profile.attention_ns,
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(attn_end - attn_begin).count()));
+            MarkQwen36ProfileFlag(work_ctx->qwen36_profile.attention_path_paged);
+        }
         static thread_local int profile_cb_count = 0;
-        if (++profile_cb_count % 100 == 0) {
+        if (do_profile && ++profile_cb_count % 100 == 0) {
             const long kv_us = std::chrono::duration_cast<std::chrono::microseconds>(kv_end - kv_begin).count();
             const long attn_us = std::chrono::duration_cast<std::chrono::microseconds>(attn_end - attn_begin).count();
             fprintf(stderr, "[DecodeProfile] bs=%d threads=%d layer=%d token_parallel=%d kv_us=%ld attn_us=%ld\n",
@@ -3272,6 +3312,21 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const int N_dim = static_cast<int>(weight->ne[1]);
     const char* w_name = (weight->name[0] ? weight->name : "(unnamed)");
     const bool is_hybrid_ssm_qkv = model && model->arch_flags.is_hybrid_ssm && IsHybridSSMQkvWeightName(w_name);
+    const bool is_qwen35_hybrid_ssm = model && model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
+    const bool is_qwen35_hybrid_ssm_gate = is_qwen35_hybrid_ssm && std::strstr(w_name, "attn_gate");
+    const bool is_qwen35_hybrid_ssm_out = is_qwen35_hybrid_ssm && std::strstr(w_name, "ssm_out");
+    const bool is_qwen36_hybrid_ssm_out = model && model->variant == ModelVariant::QWEN36 &&
+                                          model->arch_flags.is_hybrid_ssm && std::strstr(w_name, "ssm_out");
+    const bool is_qwen36_lm_head = model && model->output == weight && model->variant == ModelVariant::QWEN36 &&
+                                   model->arch_flags.is_hybrid_ssm;
+    bool qwen36_lm_head_q4k_prefill_fast_path_eligible = false;
+    if (is_qwen36_lm_head && M > 1 && weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 &&
+        weight->ne[0] == input->ne[0] && !IsBatchedQuantDisabled() && IsQ4KTrueBatchedKernelEnabled()) {
+        const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight->type);
+        qwen36_lm_head_q4k_prefill_fast_path_eligible =
+            type_traits_cpu && type_traits_cpu->vec_dot && type_traits_cpu->vec_dot_type == GGML_TYPE_Q8_K &&
+            (input->ne[0] % QK_K == 0);
+    }
 
     // ========================================================================
     // HYBRID SSM QKV CONSERVATIVE FALLBACK (Highest priority for correctness)
@@ -3283,6 +3338,60 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         LogMatmulDispatch(w_name, "PLAIN_GGML", M, N_dim, K_dim, "CONSERVATIVE_FALLBACK");
         LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "PLAIN_GGML_CONSERVATIVE_FALLBACK", false, false, false);
         return ggml_mul_mat(ctx, weight, input);
+    }
+
+    // Qwen3.5 long-form correctness on C4A is currently gated by the hybrid-SSM
+    // producer projections. The custom quantized projection lane can corrupt the
+    // graph during large-M prefill. Keep qkv, gate, and ssm_out on native GGML
+    // until long-context serving is stable again.
+    if ((is_qwen35_hybrid_ssm_gate || is_qwen35_hybrid_ssm_out || is_hybrid_ssm_qkv) &&
+        ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 && M > 1) {
+        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
+                          "qwen35_hybrid_ssm_prefill_correctness");
+        return ggml_mul_mat(ctx, weight, input);
+    }
+
+    // The wider qwen35 long-prefill graph is still unstable on C4A when the
+    // custom quantized projection lane is used outside the SSM blocks as well.
+    // Keep qwen35 quantized prefill projections on native GGML until the graph
+    // is fully stable end-to-end. Decode (M==1) remains on the faster path.
+    if (model && model->variant == ModelVariant::QWEN35 && ggml_is_quantized(weight->type) &&
+        input->type == GGML_TYPE_F32 && M > 1) {
+        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
+                          "qwen35_prefill_quant_correctness");
+        return ggml_mul_mat(ctx, weight, input);
+    }
+
+    // Qwen3.6 long-prefill logits are release-critical for correctness. The
+    // current ARM batched-quant path can silently corrupt large-M lm_head
+    // results, while native GGML matmul remains correct. Keep the hot custom
+    // path for inner model projections and decode, but force the lm_head back
+    // to GGML once prompt batches get large enough to trigger the bad lane.
+    if (is_qwen36_lm_head && ggml_is_quantized(weight->type) && M > 1 &&
+        !qwen36_lm_head_q4k_prefill_fast_path_eligible) {
+        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
+                          "qwen36_lm_head_prefill_correctness");
+        return ggml_mul_mat(ctx, weight, input);
+    }
+
+    // Qwen3.6 hybrid SSM output projection is correctness-critical on C4A.
+    // Native ggml quantized matmul can drift on long prefill and can also hit
+    // a short-prompt shape assert for q8_0 weights. Route this one tensor
+    // family through the custom GEMV/GEMM path, which owns the output shape and
+    // can safely fall back to rowwise dequantized accumulation.
+    if (is_qwen36_hybrid_ssm_out && ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 && weight->ne[0] == input->ne[0]) {
+        if (M == 1) {
+            LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
+                              "GEMV_QUANT", "qwen36_ssm_out_safe_custom");
+            GemvUserData* ud = GetGemvUserData();
+            ud->force_reference_scalar = false;
+            return ggml_mul_mat_gemv(ctx, weight, input, ud);
+        }
+        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
+                          "GGML_QUANT_NRC_M", "qwen36_ssm_out_safe_custom");
+        GemvBatchedUserData* ud = GetGemvBatchedUserData();
+        ud->force_reference_scalar = false;
+        return ggml_mul_mat_gemv_batched(ctx, weight, input, ud);
     }
 
     // ========================================================================
@@ -3413,14 +3522,20 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             return ggml_mul_mat(ctx, weight, input);
         }
         if (is_small_batch_quant_candidate) {
-            LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "GGML_QUANT_NRC_M");
+            const bool use_true_batched_q4k_path = quant_true_batched_kernel_ready && weight->type == GGML_TYPE_Q4_K;
+            LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim,
+                              use_true_batched_q4k_path ? "GGML_QUANT_Q4K_TRUE_BATCHED" : "GGML_QUANT_NRC_M");
         } else {
             LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "BATCHED_F32");
         }
         GemvBatchedUserData* ud = GetGemvBatchedUserData();
         ud->force_reference_scalar = false;
         LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
-                                is_small_batch_quant_candidate ? "GGML_QUANT_NRC_M" : "BATCHED_F32",
+                                is_small_batch_quant_candidate
+                                    ? (quant_true_batched_kernel_ready && weight->type == GGML_TYPE_Q4_K
+                                           ? "GGML_QUANT_Q4K_TRUE_BATCHED"
+                                           : "GGML_QUANT_NRC_M")
+                                    : "BATCHED_F32",
                                 is_small_batch_quant_candidate, false, false);
         return ggml_mul_mat_gemv_batched(ctx, weight, input, ud);
     }

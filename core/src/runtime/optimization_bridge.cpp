@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <stdexcept>
 
 #include "densecore/simd/simd_ops.h"
 #include "kernels/hwy/hwy_kernels.h"
@@ -81,6 +82,11 @@ void LogArmCompileFeatureDetails() {
               << " __ARM_FEATURE_MATMUL_INT8=1"
 #else
               << " __ARM_FEATURE_MATMUL_INT8=0"
+#endif
+#if defined(__ARM_FEATURE_I8MM)
+              << " __ARM_FEATURE_I8MM=1"
+#else
+              << " __ARM_FEATURE_I8MM=0"
 #endif
               << std::endl;
 #endif
@@ -165,11 +171,18 @@ void OpsRegistry::Init() {
         LogArmCompileFeatureDetails();
 #if defined(__aarch64__) || defined(_M_ARM64)
         if (level >= simd::SimdLevel::SVE && !CompiledWithArmSve()) {
-            std::cerr << "[OpsRegistry] Warning: runtime CPU reports " << level_name
-                      << " but this binary was not compiled with __ARM_FEATURE_SVE. "
-                         "GemmInt4 will use the NEON/scalar-safe path; rebuild with "
-                         "-DDENSECORE_TARGET_C4A=ON or explicit SVE/SVE2 ARM flags for C4A."
+            const bool strict_c4a_sve = IsTruthyEnv("DENSECORE_REQUIRE_C4A_SVE");
+            std::cerr << "[OpsRegistry] C4A_SVE_MISMATCH runtime_simd=" << level_name
+                      << " compile_features=" << CompileTimeArmFeatures() << " strict=" << (strict_c4a_sve ? 1 : 0)
+                      << " message=\"runtime CPU reports SVE-class SIMD but this binary was not compiled with "
+                         "__ARM_FEATURE_SVE; GemmInt4 will use the NEON/scalar-safe path. Rebuild with "
+                         "-DDENSECORE_TARGET_C4A=ON or explicit SVE/SVE2 ARM flags for C4A.\""
                       << std::endl;
+            if (strict_c4a_sve) {
+                throw std::runtime_error(
+                    "DENSECORE_REQUIRE_C4A_SVE=1 but runtime CPU reports SVE-class SIMD while the binary lacks "
+                    "__ARM_FEATURE_SVE");
+            }
         }
 #endif
 
@@ -260,12 +273,10 @@ void OpsRegistry::Init() {
         // Store selected ISA name
         reg.selected_isa = level_name;
 
-        if (IsTruthyEnv("DENSECORE_DEBUG_MOE_MATMUL_PATHS") || IsTruthyEnv("DENSECORE_PROFILE_DECODE")) {
-            std::cout << "[OpsRegistry] INT4 dispatch summary: runtime_simd=" << level_name
-                      << " compile_features=" << CompileTimeArmFeatures()
-                      << " selected_gemm_int4=" << selected_gemm_int4
-                      << " selected_gemm_int4_batched=Highway(auto-dispatch)" << std::endl;
-        }
+        std::cout << "[OpsRegistry] INT4 dispatch summary: runtime_simd=" << level_name
+                  << " compile_features=" << CompileTimeArmFeatures() << " selected_gemm_int4=" << selected_gemm_int4
+                  << " selected_gemm_int4_batched=Highway(auto-dispatch)"
+                  << " strict_sve_required=" << (IsTruthyEnv("DENSECORE_REQUIRE_C4A_SVE") ? 1 : 0) << std::endl;
         std::cout << "[OpsRegistry] Initialization complete. Using: " << level_name << std::endl;
     });
 }

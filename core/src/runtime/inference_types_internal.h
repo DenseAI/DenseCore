@@ -17,8 +17,10 @@
 
 // Forward declarations
 struct ggml_context;
+struct ggml_tensor;
 struct BatchSpec;
 struct TransformerModel;
+struct Qwen36ProfileCounters;
 
 #ifndef GGML_KQ_MASK_PAD
 #define GGML_KQ_MASK_PAD 32
@@ -65,6 +67,7 @@ struct MoEUserData {
     int n_experts = 0;
     bool experts_registered = false;
     bool test_force_empty_routing = false;
+    Qwen36ProfileCounters* profile = nullptr;
 };
 
 // Allocate MoE user data from graph context
@@ -111,9 +114,11 @@ struct SSMQwen35DeltaUserData {
     float norm_eps;
     int layer_idx = -1;
     int ssm_ordinal = -1;
+    Qwen35SSMQkvProjectionProfile projection_profile = Qwen35SSMQkvProjectionProfile::QWEN35_LEGACY;
     const int* token_seq_ids = nullptr;
     const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
     const ggml_tensor* z_tensor = nullptr;
+    const ggml_tensor* qkv_tensor = nullptr;
     const ggml_tensor* input_tensor = nullptr;
 };
 
@@ -121,6 +126,10 @@ struct SSMQwen35DeltaUserData {
 void cb_ssm_conv1d_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
 void cb_ssm_qwen35_delta_qkv_only(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
                                   void* userdata);
+void cb_ssm_qwen35_delta_z_qkv(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
+                               int ith, int nth, void* userdata);
+void cb_ssm_qwen35_delta_z_only(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                void* userdata);
 void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
                          const struct ggml_tensor* c, int ith, int nth, void* userdata);
 void cb_ssm_qwen35_delta_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);

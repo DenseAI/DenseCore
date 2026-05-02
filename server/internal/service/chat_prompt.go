@@ -118,7 +118,13 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 	sb.WriteString(profile.openTag)
 	sb.WriteString(profile.assistantRole)
 	sb.WriteString("\n")
-	if thinkingEnabled && !isQwen36ModelHint(modelHint) {
+	if isQwen36ModelHint(modelHint) {
+		if thinkingEnabled {
+			sb.WriteString("<think>\n")
+		} else {
+			sb.WriteString("<think>\n\n</think>\n")
+		}
+	} else if thinkingEnabled {
 		sb.WriteString("<think>\n")
 	}
 	return sb.String()
