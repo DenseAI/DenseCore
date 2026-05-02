@@ -1064,7 +1064,7 @@ void CpuBackend::GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales
                                 n_end, input_stride_bytes);
             return true;
         }
-#if defined(__AVX2__)
+#if defined(__AVX2__) && DENSECORE_HAS_FMA
         simd::GemmInt4Fp32Batched_AVX2(c_data, a_data, w_data, scales_data, zeros_data, M, N, K, group_size, n_start,
                                        n_end);
         return true;

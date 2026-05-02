@@ -38,11 +38,23 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24.1'
+          go-version: '1.25.0'
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Build C++ library for Go analysis
+        run: |
+          cmake -S core -B core/build -DCMAKE_BUILD_TYPE=Release -DDENSECORE_BUILD_TESTS=OFF -DDENSECORE_USE_MIMALLOC=OFF
+          cmake --build core/build --target densecore -j$(nproc)
 
       - name: Run Go format check
         run: make format-check-go

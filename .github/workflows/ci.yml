@@ -49,6 +49,7 @@ jobs:
           path: |
             core/build/libdensecore.so*
             core/build/libggml*.so*
+            core/build/libspdlog.so*
           if-no-files-found: warn
           retention-days: 7
 
@@ -89,6 +90,7 @@ jobs:
   go-test:
     name: Test Go Server
     runs-on: ubuntu-latest
+    needs: cpp-build
 
     steps:
       - name: Checkout code
@@ -100,6 +102,12 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: server/go.mod
+
+      - name: Download C++ artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: libdensecore-linux
+          path: core/build
 
       - name: Run Go tests
         working-directory: server
