@@ -17,7 +17,7 @@ ARG DEBIAN_VERSION=bookworm
 # ============================================
 # Stage 1: Dependency Builder (ggml cache layer)
 # ============================================
-FROM golang:1.24-${DEBIAN_VERSION} AS deps-builder
+FROM golang:1.25-${DEBIAN_VERSION} AS deps-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
