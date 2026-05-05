@@ -923,7 +923,10 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
 
     // Routing (src1 = gate_logits)
     const bool debug_stage_timing = IsMoEStageTimingEnabled();
-    const auto route_begin = debug_stage_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool collect_profile = ud->profile && profile_begin != std::chrono::steady_clock::time_point{};
+    const auto route_begin =
+        (debug_stage_timing || collect_profile) ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
     thread_local densecore::moe::MoERouteResult routing;
     bool use_grouped_sigmoid_routing =
         ud->model &&
@@ -954,7 +957,9 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     if (ith == 0) {
         DumpMoERouteTrace(src1, ud, routing);
     }
-    const auto route_end = debug_stage_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto route_end =
+        (debug_stage_timing || collect_profile) ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
     if (ith == 0) {
         UpdateSchedulerExperts(ud, routing);
     }
@@ -982,14 +987,31 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     // Forward (src0 = input, dst = output)
     densecore::Tensor t_input = GgmlToRowMajorTensor(src0);
     densecore::Tensor t_output = GgmlToRowMajorTensor(dst);
+    densecore::CpuBackend::MoEForwardProfile moe_profile;
+    densecore::CpuBackend::MoEForwardProfile* moe_profile_ptr = collect_profile ? &moe_profile : nullptr;
+    if (collect_profile && route_end >= route_begin) {
+        moe_profile.route_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(route_end - route_begin).count());
+    }
     ud->backend->ForwardMoE(ud->model, ud->layer, ud->layer_idx, ud->batch, t_input, routing, ud->experts,
-                            ud->n_experts, &t_output);
-    if (ud->profile && profile_begin != std::chrono::steady_clock::time_point()) {
+                            ud->n_experts, &t_output, moe_profile_ptr);
+    if (collect_profile) {
         AddQwen36ProfileNs(
             ud->profile->moe_forward_ns,
             static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profile_begin)
                     .count()));
+        AddQwen36ProfileNs(ud->profile->moe_route_ns, moe_profile.route_ns);
+        AddQwen36ProfileNs(ud->profile->moe_reorder_ns, moe_profile.reorder_ns);
+        AddQwen36ProfileNs(ud->profile->moe_expert_ns, moe_profile.expert_ns);
+        AddQwen36ProfileNs(ud->profile->moe_reduce_ns, moe_profile.reduce_ns);
+        AddQwen36ProfileNs(ud->profile->moe_w1w3_ns, moe_profile.w1w3_ns);
+        AddQwen36ProfileNs(ud->profile->moe_w2_ns, moe_profile.w2_ns);
+        AddQwen36ProfileNs(ud->profile->moe_rowblock_ns, moe_profile.rowblock_ns);
+        AddQwen36ProfileNs(ud->profile->moe_rowblock_w1w3_ns, moe_profile.rowblock_w1w3_ns);
+        AddQwen36ProfileNs(ud->profile->moe_rowblock_w2_ns, moe_profile.rowblock_w2_ns);
+        SetQwen36ProfileMax(ud->profile->moe_rowblock_used, moe_profile.rowblock_used);
+        SetQwen36ProfileMax(ud->profile->moe_rowblock_tasks, moe_profile.rowblock_tasks);
     }
     if (debug_stage_timing) {
         const auto backend_end = std::chrono::steady_clock::now();
@@ -2986,11 +3008,11 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
     }
     if (IsQwen36ProfilingEnabled() && ud && ud->profile) {
         const auto profile_end = std::chrono::steady_clock::now();
-        AddQwen36ProfileNs(ud->profile->ssm_delta_ns,
-                           static_cast<uint64_t>(
-                               std::chrono::duration_cast<std::chrono::nanoseconds>(profile_end - profile_begin)
-                                   .count()));
+        const uint64_t elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(profile_end - profile_begin).count());
+        AddQwen36ProfileNs(ud->profile->ssm_delta_ns, elapsed_ns);
         if (ith == 0) {
+            AddQwen36ProfileNs(ud->profile->ssm_delta_wall_ns, elapsed_ns);
             ud->profile->ssm_delta_calls.fetch_add(1, std::memory_order_relaxed);
         }
     }

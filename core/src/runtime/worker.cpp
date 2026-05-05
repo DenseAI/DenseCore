@@ -81,6 +81,41 @@ bool IsMulGraphValidationEnabled() {
     return GetWorkerRuntimeConfig().validate_mul;
 }
 
+bool HasNamePrefix(const ggml_tensor* tensor, const char* prefix) {
+    return tensor && prefix && tensor->name[0] != '\0' && std::strncmp(tensor->name, prefix, std::strlen(prefix)) == 0;
+}
+
+void AccumulateQwen36SSMProjectionNodeTimes(InferenceWorkContext* work_ctx, ggml_cgraph* graph) {
+    if (!work_ctx || !graph) {
+        return;
+    }
+    uint64_t qkv_ns = 0;
+    uint64_t gate_ns = 0;
+    uint64_t out_ns = 0;
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor* node = ggml_graph_node(graph, i);
+        if (!node) {
+            continue;
+        }
+        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
+        if (elapsed_us <= 0) {
+            continue;
+        }
+        const uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_us) * 1000ULL;
+        if (HasNamePrefix(node, "qwen36_ssm_qkv_proj")) {
+            qkv_ns += elapsed_ns;
+        } else if (HasNamePrefix(node, "qwen36_ssm_gate_proj")) {
+            gate_ns += elapsed_ns;
+        } else if (HasNamePrefix(node, "qwen36_ssm_out_proj")) {
+            out_ns += elapsed_ns;
+        }
+    }
+    if (qkv_ns || gate_ns || out_ns) {
+        AddQwen36SSMProjectionWallProfile(work_ctx, qkv_ns, gate_ns, out_ns);
+    }
+}
+
 bool IsRuntimePathLoggingEnabled() {
     return GetWorkerRuntimeConfig().runtime_path_logging;
 }
@@ -3337,6 +3372,7 @@ void EngineLoop(EngineState* state) {
             ResetMoEStrictFailure();
             ggml_backend_graph_compute(active_backend, gf);
             const auto compute_end = std::chrono::steady_clock::now();
+            AccumulateQwen36SSMProjectionNodeTimes(work_ctx.get(), gf);
             const auto graph_execute_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(compute_end - compute_begin).count());
             const Qwen36ProfileSnapshot qwen36_profile = GetQwen36ProfileSnapshot(work_ctx.get());
@@ -3351,8 +3387,21 @@ void EngineLoop(EngineState* state) {
                     req->hal_attention_ns += qwen36_profile.hal_attention_ns;
                     req->attention_repack_ns += qwen36_profile.attention_repack_ns;
                     req->moe_forward_ns += qwen36_profile.moe_forward_ns;
+                    req->moe_route_ns += qwen36_profile.moe_route_ns;
+                    req->moe_reorder_ns += qwen36_profile.moe_reorder_ns;
+                    req->moe_expert_ns += qwen36_profile.moe_expert_ns;
+                    req->moe_reduce_ns += qwen36_profile.moe_reduce_ns;
+                    req->moe_w1w3_ns += qwen36_profile.moe_w1w3_ns;
+                    req->moe_w2_ns += qwen36_profile.moe_w2_ns;
+                    req->moe_rowblock_ns += qwen36_profile.moe_rowblock_ns;
+                    req->moe_rowblock_w1w3_ns += qwen36_profile.moe_rowblock_w1w3_ns;
+                    req->moe_rowblock_w2_ns += qwen36_profile.moe_rowblock_w2_ns;
                     req->shared_expert_ns += qwen36_profile.shared_expert_ns;
                     req->quant_matmul_ns += qwen36_profile.quant_matmul_ns;
+                    req->ssm_qkv_wall_ns += qwen36_profile.ssm_qkv_wall_ns;
+                    req->ssm_gate_wall_ns += qwen36_profile.ssm_gate_wall_ns;
+                    req->ssm_delta_wall_ns += qwen36_profile.ssm_delta_wall_ns;
+                    req->ssm_out_wall_ns += qwen36_profile.ssm_out_wall_ns;
                     req->ssm_conv1d_ns += qwen36_profile.ssm_conv1d_ns;
                     req->ssm_delta_ns += qwen36_profile.ssm_delta_ns;
                     req->kv_update_ns += qwen36_profile.kv_update_ns;
@@ -3373,6 +3422,8 @@ void EngineLoop(EngineState* state) {
                         std::max(req->attention_path_native_flash, qwen36_profile.attention_path_native_flash);
                     req->attention_path_hal = std::max(req->attention_path_hal, qwen36_profile.attention_path_hal);
                     req->moe_task_count = std::max(req->moe_task_count, qwen36_profile.moe_task_count);
+                    req->moe_rowblock_used = std::max(req->moe_rowblock_used, qwen36_profile.moe_rowblock_used);
+                    req->moe_rowblock_tasks = std::max(req->moe_rowblock_tasks, qwen36_profile.moe_rowblock_tasks);
                     req->selected_expert_count =
                         std::max(req->selected_expert_count, qwen36_profile.selected_expert_count);
                     req->ssm_conv1d_calls = std::max(req->ssm_conv1d_calls, qwen36_profile.ssm_conv1d_calls);

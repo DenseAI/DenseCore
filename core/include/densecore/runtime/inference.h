@@ -214,8 +214,21 @@ struct Qwen36ProfileSnapshot {
     uint64_t hal_attention_ns = 0;
     uint64_t attention_repack_ns = 0;
     uint64_t moe_forward_ns = 0;
+    uint64_t moe_route_ns = 0;
+    uint64_t moe_reorder_ns = 0;
+    uint64_t moe_expert_ns = 0;
+    uint64_t moe_reduce_ns = 0;
+    uint64_t moe_w1w3_ns = 0;
+    uint64_t moe_w2_ns = 0;
+    uint64_t moe_rowblock_ns = 0;
+    uint64_t moe_rowblock_w1w3_ns = 0;
+    uint64_t moe_rowblock_w2_ns = 0;
     uint64_t shared_expert_ns = 0;
     uint64_t quant_matmul_ns = 0;
+    uint64_t ssm_qkv_wall_ns = 0;
+    uint64_t ssm_gate_wall_ns = 0;
+    uint64_t ssm_delta_wall_ns = 0;
+    uint64_t ssm_out_wall_ns = 0;
     uint64_t ssm_conv1d_ns = 0;
     uint64_t ssm_delta_ns = 0;
     uint64_t kv_update_ns = 0;
@@ -223,6 +236,8 @@ struct Qwen36ProfileSnapshot {
     uint64_t graph_cache_hits = 0;
     uint64_t graph_cache_misses = 0;
     int moe_task_count = 0;
+    int moe_rowblock_used = 0;
+    int moe_rowblock_tasks = 0;
     int selected_expert_count = 0;
     int ssm_conv1d_calls = 0;
     int ssm_delta_calls = 0;
@@ -243,6 +258,7 @@ InferenceWorkContext* GetCurrentWorkContext();
 bool IsQwen36ProfilingEnabled();
 void ResetQwen36Profile(InferenceWorkContext* ctx);
 Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx);
+void AddQwen36SSMProjectionWallProfile(InferenceWorkContext* ctx, uint64_t qkv_ns, uint64_t gate_ns, uint64_t out_ns);
 
 GgmlTensorHandle* BuildTransformerGraph(TransformerModel* model, PagedKVCache* cache, GgmlContextHandle* ctx_c,
                                         const BatchSpec& batch, bool embedding_mode = false,

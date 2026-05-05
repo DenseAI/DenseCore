@@ -426,6 +426,11 @@ public:
         uint64_t reduce_ns = 0;
         uint64_t w1w3_ns = 0;
         uint64_t w2_ns = 0;
+        uint64_t rowblock_ns = 0;
+        uint64_t rowblock_w1w3_ns = 0;
+        uint64_t rowblock_w2_ns = 0;
+        int rowblock_used = 0;
+        int rowblock_tasks = 0;
     };
 
     /**

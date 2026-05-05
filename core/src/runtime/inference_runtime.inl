@@ -10,8 +10,21 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> hal_attention_ns{0};
     std::atomic<uint64_t> attention_repack_ns{0};
     std::atomic<uint64_t> moe_forward_ns{0};
+    std::atomic<uint64_t> moe_route_ns{0};
+    std::atomic<uint64_t> moe_reorder_ns{0};
+    std::atomic<uint64_t> moe_expert_ns{0};
+    std::atomic<uint64_t> moe_reduce_ns{0};
+    std::atomic<uint64_t> moe_w1w3_ns{0};
+    std::atomic<uint64_t> moe_w2_ns{0};
+    std::atomic<uint64_t> moe_rowblock_ns{0};
+    std::atomic<uint64_t> moe_rowblock_w1w3_ns{0};
+    std::atomic<uint64_t> moe_rowblock_w2_ns{0};
     std::atomic<uint64_t> shared_expert_ns{0};
     std::atomic<uint64_t> quant_matmul_ns{0};
+    std::atomic<uint64_t> ssm_qkv_wall_ns{0};
+    std::atomic<uint64_t> ssm_gate_wall_ns{0};
+    std::atomic<uint64_t> ssm_delta_wall_ns{0};
+    std::atomic<uint64_t> ssm_out_wall_ns{0};
     std::atomic<uint64_t> ssm_conv1d_ns{0};
     std::atomic<uint64_t> ssm_delta_ns{0};
     std::atomic<uint64_t> kv_update_ns{0};
@@ -19,6 +32,8 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> graph_cache_hits{0};
     std::atomic<uint64_t> graph_cache_misses{0};
     std::atomic<int> moe_task_count{0};
+    std::atomic<int> moe_rowblock_used{0};
+    std::atomic<int> moe_rowblock_tasks{0};
     std::atomic<int> selected_expert_count{0};
     std::atomic<int> ssm_conv1d_calls{0};
     std::atomic<int> ssm_delta_calls{0};
@@ -92,8 +107,21 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.hal_attention_ns.store(0, std::memory_order_relaxed);
     p.attention_repack_ns.store(0, std::memory_order_relaxed);
     p.moe_forward_ns.store(0, std::memory_order_relaxed);
+    p.moe_route_ns.store(0, std::memory_order_relaxed);
+    p.moe_reorder_ns.store(0, std::memory_order_relaxed);
+    p.moe_expert_ns.store(0, std::memory_order_relaxed);
+    p.moe_reduce_ns.store(0, std::memory_order_relaxed);
+    p.moe_w1w3_ns.store(0, std::memory_order_relaxed);
+    p.moe_w2_ns.store(0, std::memory_order_relaxed);
+    p.moe_rowblock_ns.store(0, std::memory_order_relaxed);
+    p.moe_rowblock_w1w3_ns.store(0, std::memory_order_relaxed);
+    p.moe_rowblock_w2_ns.store(0, std::memory_order_relaxed);
     p.shared_expert_ns.store(0, std::memory_order_relaxed);
     p.quant_matmul_ns.store(0, std::memory_order_relaxed);
+    p.ssm_qkv_wall_ns.store(0, std::memory_order_relaxed);
+    p.ssm_gate_wall_ns.store(0, std::memory_order_relaxed);
+    p.ssm_delta_wall_ns.store(0, std::memory_order_relaxed);
+    p.ssm_out_wall_ns.store(0, std::memory_order_relaxed);
     p.ssm_conv1d_ns.store(0, std::memory_order_relaxed);
     p.ssm_delta_ns.store(0, std::memory_order_relaxed);
     p.kv_update_ns.store(0, std::memory_order_relaxed);
@@ -101,6 +129,8 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.graph_cache_hits.store(0, std::memory_order_relaxed);
     p.graph_cache_misses.store(0, std::memory_order_relaxed);
     p.moe_task_count.store(0, std::memory_order_relaxed);
+    p.moe_rowblock_used.store(0, std::memory_order_relaxed);
+    p.moe_rowblock_tasks.store(0, std::memory_order_relaxed);
     p.selected_expert_count.store(0, std::memory_order_relaxed);
     p.ssm_conv1d_calls.store(0, std::memory_order_relaxed);
     p.ssm_delta_calls.store(0, std::memory_order_relaxed);
@@ -127,8 +157,21 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.hal_attention_ns = p.hal_attention_ns.load(std::memory_order_relaxed);
     snapshot.attention_repack_ns = p.attention_repack_ns.load(std::memory_order_relaxed);
     snapshot.moe_forward_ns = p.moe_forward_ns.load(std::memory_order_relaxed);
+    snapshot.moe_route_ns = p.moe_route_ns.load(std::memory_order_relaxed);
+    snapshot.moe_reorder_ns = p.moe_reorder_ns.load(std::memory_order_relaxed);
+    snapshot.moe_expert_ns = p.moe_expert_ns.load(std::memory_order_relaxed);
+    snapshot.moe_reduce_ns = p.moe_reduce_ns.load(std::memory_order_relaxed);
+    snapshot.moe_w1w3_ns = p.moe_w1w3_ns.load(std::memory_order_relaxed);
+    snapshot.moe_w2_ns = p.moe_w2_ns.load(std::memory_order_relaxed);
+    snapshot.moe_rowblock_ns = p.moe_rowblock_ns.load(std::memory_order_relaxed);
+    snapshot.moe_rowblock_w1w3_ns = p.moe_rowblock_w1w3_ns.load(std::memory_order_relaxed);
+    snapshot.moe_rowblock_w2_ns = p.moe_rowblock_w2_ns.load(std::memory_order_relaxed);
     snapshot.shared_expert_ns = p.shared_expert_ns.load(std::memory_order_relaxed);
     snapshot.quant_matmul_ns = p.quant_matmul_ns.load(std::memory_order_relaxed);
+    snapshot.ssm_qkv_wall_ns = p.ssm_qkv_wall_ns.load(std::memory_order_relaxed);
+    snapshot.ssm_gate_wall_ns = p.ssm_gate_wall_ns.load(std::memory_order_relaxed);
+    snapshot.ssm_delta_wall_ns = p.ssm_delta_wall_ns.load(std::memory_order_relaxed);
+    snapshot.ssm_out_wall_ns = p.ssm_out_wall_ns.load(std::memory_order_relaxed);
     snapshot.ssm_conv1d_ns = p.ssm_conv1d_ns.load(std::memory_order_relaxed);
     snapshot.ssm_delta_ns = p.ssm_delta_ns.load(std::memory_order_relaxed);
     snapshot.kv_update_ns = p.kv_update_ns.load(std::memory_order_relaxed);
@@ -136,6 +179,8 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.graph_cache_hits = p.graph_cache_hits.load(std::memory_order_relaxed);
     snapshot.graph_cache_misses = p.graph_cache_misses.load(std::memory_order_relaxed);
     snapshot.moe_task_count = p.moe_task_count.load(std::memory_order_relaxed);
+    snapshot.moe_rowblock_used = p.moe_rowblock_used.load(std::memory_order_relaxed);
+    snapshot.moe_rowblock_tasks = p.moe_rowblock_tasks.load(std::memory_order_relaxed);
     snapshot.selected_expert_count = p.selected_expert_count.load(std::memory_order_relaxed);
     snapshot.ssm_conv1d_calls = p.ssm_conv1d_calls.load(std::memory_order_relaxed);
     snapshot.ssm_delta_calls = p.ssm_delta_calls.load(std::memory_order_relaxed);
@@ -147,6 +192,17 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.attention_path_native_flash = p.attention_path_native_flash.load(std::memory_order_relaxed);
     snapshot.attention_path_hal = p.attention_path_hal.load(std::memory_order_relaxed);
     return snapshot;
+}
+
+void AddQwen36SSMProjectionWallProfile(InferenceWorkContext* ctx, uint64_t qkv_ns, uint64_t gate_ns,
+                                        uint64_t out_ns) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    p.ssm_qkv_wall_ns.fetch_add(qkv_ns, std::memory_order_relaxed);
+    p.ssm_gate_wall_ns.fetch_add(gate_ns, std::memory_order_relaxed);
+    p.ssm_out_wall_ns.fetch_add(out_ns, std::memory_order_relaxed);
 }
 
 static inline void AddQwen36ProfileNs(std::atomic<uint64_t>& counter, uint64_t value) {

@@ -1370,13 +1370,22 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " native_flash_attention_ms=" << ns_to_ms(req->native_flash_attention_ns)
         << " hal_attention_ms=" << ns_to_ms(req->hal_attention_ns)
         << " attention_repack_ms=" << ns_to_ms(req->attention_repack_ns)
-        << " moe_forward_ms=" << ns_to_ms(req->moe_forward_ns)
+        << " moe_forward_ms=" << ns_to_ms(req->moe_forward_ns) << " moe_route_ms=" << ns_to_ms(req->moe_route_ns)
+        << " moe_reorder_ms=" << ns_to_ms(req->moe_reorder_ns) << " moe_expert_ms=" << ns_to_ms(req->moe_expert_ns)
+        << " moe_reduce_ms=" << ns_to_ms(req->moe_reduce_ns) << " moe_w1w3_ms=" << ns_to_ms(req->moe_w1w3_ns)
+        << " moe_w2_ms=" << ns_to_ms(req->moe_w2_ns) << " moe_rowblock_used=" << req->moe_rowblock_used
+        << " moe_rowblock_ms=" << ns_to_ms(req->moe_rowblock_ns)
+        << " moe_rowblock_w1w3_ms=" << ns_to_ms(req->moe_rowblock_w1w3_ns)
+        << " moe_rowblock_w2_ms=" << ns_to_ms(req->moe_rowblock_w2_ns)
         << " shared_expert_ms=" << ns_to_ms(req->shared_expert_ns)
-        << " quant_matmul_ms=" << ns_to_ms(req->quant_matmul_ns) << " ssm_conv1d_ms=" << ns_to_ms(req->ssm_conv1d_ns)
-        << " ssm_delta_ms=" << ns_to_ms(req->ssm_delta_ns) << " kv_update_ms=" << ns_to_ms(req->kv_update_ns)
-        << " sample_ms=" << ns_to_ms(req->sample_ns) << " graph_cache_hits=" << req->graph_cache_hit_count
-        << " graph_cache_misses=" << req->graph_cache_miss_count << " paged_hit_rate=" << paged_hit_rate
-        << " paged_path_hits=" << runtime.path_paged << " decode_path_total=" << runtime.path_total
+        << " quant_matmul_ms=" << ns_to_ms(req->quant_matmul_ns) << " ssm_qkv_ms=" << ns_to_ms(req->ssm_qkv_wall_ns)
+        << " ssm_gate_ms=" << ns_to_ms(req->ssm_gate_wall_ns)
+        << " ssm_delta_wall_ms=" << ns_to_ms(req->ssm_delta_wall_ns) << " ssm_out_ms=" << ns_to_ms(req->ssm_out_wall_ns)
+        << " ssm_conv1d_ms=" << ns_to_ms(req->ssm_conv1d_ns) << " ssm_delta_ms=" << ns_to_ms(req->ssm_delta_ns)
+        << " kv_update_ms=" << ns_to_ms(req->kv_update_ns) << " sample_ms=" << ns_to_ms(req->sample_ns)
+        << " graph_cache_hits=" << req->graph_cache_hit_count << " graph_cache_misses=" << req->graph_cache_miss_count
+        << " paged_hit_rate=" << paged_hit_rate << " paged_path_hits=" << runtime.path_paged
+        << " decode_path_total=" << runtime.path_total
         << " prefill_chunk_tokens_effective=" << req->prefill_chunk_tokens_effective
         << " q4k_true_batched_used=" << req->q4k_true_batched_used
         << " arm_batched_quant_used=" << req->arm_batched_quant_used
@@ -1388,8 +1397,9 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " attention_path_portable_flash=" << req->attention_path_portable_flash
         << " attention_path_native_flash=" << req->attention_path_native_flash
         << " attention_path_hal=" << req->attention_path_hal << " moe_task_count=" << req->moe_task_count
-        << " selected_expert_count=" << req->selected_expert_count << " ssm_conv1d_calls=" << req->ssm_conv1d_calls
-        << " ssm_delta_calls=" << req->ssm_delta_calls << " shared_quant_reused=" << runtime.shared_quant_reused
+        << " moe_rowblock_tasks=" << req->moe_rowblock_tasks << " selected_expert_count=" << req->selected_expert_count
+        << " ssm_conv1d_calls=" << req->ssm_conv1d_calls << " ssm_delta_calls=" << req->ssm_delta_calls
+        << " shared_quant_reused=" << runtime.shared_quant_reused
         << " shared_quant_total=" << runtime.shared_quant_total
         << " kv_single_slot_read_count=" << kv_stats.single_slot_read_count
         << " kv_single_slot_write_count=" << kv_stats.single_slot_write_count

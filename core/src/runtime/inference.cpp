@@ -2911,6 +2911,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // 1. qkv_mixed projection: normed input [n_embd, N] → [conv_channels, N]
             struct ggml_tensor* qkv_mixed = smart_mul_mat(ctx_c, attn_qkv, cur, model);
+            if (model->variant == ModelVariant::QWEN36) {
+                ggml_set_name(qkv_mixed, "qwen36_ssm_qkv_proj");
+            }
             if (IsDebugSSMQkvReferenceEnabled() || IsDebugSSMProjectionReferenceEnabled()) {
                 ProjectionReferenceUserData* qkv_ref_ud = GetProjectionReferenceUserData();
                 qkv_ref_ud->weight_tensor = attn_qkv;
@@ -2963,6 +2966,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // 3. z projection and recurrent Qwen3.5 delta-net block.
             struct ggml_tensor* z = smart_mul_mat(ctx_c, attn_gate_w, cur, model);
+            if (model->variant == ModelVariant::QWEN36) {
+                ggml_set_name(z, "qwen36_ssm_gate_proj");
+            }
             if (IsDebugSSMProjectionReferenceEnabled()) {
                 ProjectionReferenceUserData* z_ref_ud = GetProjectionReferenceUserData();
                 z_ref_ud->weight_tensor = attn_gate_w;
@@ -3047,6 +3053,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             // plain ggml matmul path until the batched quantized path is proven
             // exact for SSM output weights too.
             cur = smart_mul_mat(ctx_c, ssm_out_w, y, model);
+            if (model->variant == ModelVariant::QWEN36) {
+                ggml_set_name(cur, "qwen36_ssm_out_proj");
+            }
             if (IsDebugSSMProjectionReferenceEnabled()) {
                 ProjectionReferenceUserData* out_ref_ud = GetProjectionReferenceUserData();
                 out_ref_ud->weight_tensor = ssm_out_w;
@@ -4365,10 +4374,6 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 moe_ud->layer = &model->layers[il];
                 moe_ud->layer_idx = il;
                 int moe_top_k = static_cast<int>(model->hparams.n_experts_used);
-                if (model->variant == ModelVariant::QWEN36 && batch.num_seqs == 1 && batch.tokens.size() > 1) {
-                    const int prefill_cap = ParsePositiveEnvInt("DENSECORE_QWEN36_PREFILL_MOE_TOP_K_CAP", moe_top_k);
-                    moe_top_k = std::max(1, std::min(moe_top_k, prefill_cap));
-                }
                 moe_ud->k = moe_top_k;
                 moe_ud->batch = &batch;
                 moe_ud->scheduler = batch.scheduler;
