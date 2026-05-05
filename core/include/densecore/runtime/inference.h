@@ -216,12 +216,16 @@ struct Qwen36ProfileSnapshot {
     uint64_t moe_forward_ns = 0;
     uint64_t shared_expert_ns = 0;
     uint64_t quant_matmul_ns = 0;
+    uint64_t ssm_conv1d_ns = 0;
+    uint64_t ssm_delta_ns = 0;
     uint64_t kv_update_ns = 0;
     uint64_t sample_ns = 0;
     uint64_t graph_cache_hits = 0;
     uint64_t graph_cache_misses = 0;
     int moe_task_count = 0;
     int selected_expert_count = 0;
+    int ssm_conv1d_calls = 0;
+    int ssm_delta_calls = 0;
     int q4k_true_batched_used = 0;
     int arm_batched_quant_used = 0;
     int attention_path_paged = 0;

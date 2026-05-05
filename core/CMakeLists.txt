@@ -42,7 +42,12 @@ option(
 )
 option(
     DENSECORE_C4A_ENABLE_GGML_FASTKERNELS
-    "Enable ggml KleidiAI/repack/llamafile fast kernels on C4A builds"
+    "Enable ggml native/repack/llamafile fast kernels on C4A builds; KleidiAI remains separately quality-gated"
+    OFF
+)
+option(
+    DENSECORE_C4A_ENABLE_KLEIDIAI
+    "Enable ggml KleidiAI kernels on C4A builds. Keep OFF unless the Qwen3.6 quality gate passes."
     OFF
 )
 set(DENSECORE_C4A_MCPU "neoverse-v2" CACHE STRING "ARM -mcpu value used when DENSECORE_TARGET_C4A=ON")
@@ -284,6 +289,9 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND NOT DENSECORE_AR
     set(DENSECORE_CAN_USE_KLEIDIAI ON)
 endif()
 if(DENSECORE_TARGET_C4A AND NOT DENSECORE_C4A_ENABLE_GGML_FASTKERNELS)
+    set(DENSECORE_CAN_USE_KLEIDIAI OFF)
+endif()
+if(DENSECORE_TARGET_C4A AND NOT DENSECORE_C4A_ENABLE_KLEIDIAI)
     set(DENSECORE_CAN_USE_KLEIDIAI OFF)
 endif()
 if(NOT DEFINED GGML_CPU_KLEIDIAI)

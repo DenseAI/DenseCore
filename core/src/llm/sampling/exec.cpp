@@ -720,13 +720,11 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
     }
 
     thread_local std::vector<SamplingCandidate> candidates;
-    thread_local std::unordered_map<int, int> candidate_lookup;
     candidates.clear();
-    candidate_lookup.clear();
     candidates.reserve(static_cast<size_t>(k));
-    candidate_lookup.reserve(static_cast<size_t>(k) * 2U + 1U);
 
     float max_logit = -INFINITY;
+    float sum_exp = 0.0f;
     int best_token = range_start;
     bool found_finite = false;
 
@@ -734,10 +732,26 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         const float v = adjusted_logit_at(i);
         if (!std::isfinite(v)) continue;
         const int token_id = range_start + i;
-        if (!found_finite || v > max_logit || (v == max_logit && token_id < best_token)) {
+        if (!found_finite) {
             max_logit = v;
             best_token = token_id;
             found_finite = true;
+            sum_exp = 1.0f;
+        } else {
+            if (v > max_logit) {
+                const float rescaled_sum = sum_exp * std::exp(max_logit - v);
+                sum_exp = (std::isfinite(rescaled_sum) ? rescaled_sum : 0.0f) + 1.0f;
+                max_logit = v;
+                best_token = token_id;
+            } else {
+                const float mass = std::exp(v - max_logit);
+                if (std::isfinite(mass)) {
+                    sum_exp += mass;
+                }
+                if (v == max_logit && token_id < best_token) {
+                    best_token = token_id;
+                }
+            }
         }
 
         if (k < active_vocab) {
@@ -764,30 +778,92 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         return token;
     }
 
+    if (k < active_vocab && params.top_p >= 1.0f && params.min_p <= 0.0f) {
+        std::sort(candidates.begin(), candidates.end(), candidate_desc);
+        if (candidates.empty()) {
+            maybe_record_sampling_trace(best_token);
+            debug_dump_top_candidates("empty_candidates_fallback", best_token);
+            debug_log_sample(best_token);
+            return best_token;
+        }
+
+        const float candidate_max_logit = candidates.front().logit;
+        float total_mass = 0.0f;
+        for (auto& candidate : candidates) {
+            float mass = std::exp(candidate.logit - candidate_max_logit);
+            if (!std::isfinite(mass)) {
+                mass = 0.0f;
+            }
+            candidate.mass = mass;
+            total_mass += mass;
+        }
+        if (!(total_mass > 0.0f) || !std::isfinite(total_mass)) {
+            maybe_record_sampling_trace(candidates.front().token_id);
+            debug_dump_top_candidates("front_candidate_fallback", candidates.front().token_id);
+            debug_log_sample(candidates.front().token_id);
+            return candidates.front().token_id;
+        }
+
+        thread_local std::unique_ptr<std::mt19937> rng;
+        thread_local uint64_t last_seed = 0;
+        thread_local bool seeded_from_device = false;
+        if (!rng) {
+            rng = std::make_unique<std::mt19937>(std::random_device{}());
+            seeded_from_device = true;
+            last_seed = 0;
+        }
+        if (params.seed != 0) {
+            if (last_seed != params.seed || seeded_from_device) {
+                std::seed_seq seq{static_cast<uint32_t>(params.seed), static_cast<uint32_t>(params.seed >> 32)};
+                rng->seed(seq);
+                last_seed = params.seed;
+                seeded_from_device = false;
+            }
+        } else if (!seeded_from_device) {
+            rng->seed(std::random_device{}());
+            last_seed = 0;
+            seeded_from_device = true;
+        }
+
+        std::uniform_real_distribution<float> dist(0.0f, total_mass);
+        const float random_val = dist(*rng);
+        float cumulative_mass = 0.0f;
+        for (const auto& candidate : candidates) {
+            cumulative_mass += candidate.mass;
+            if (random_val <= cumulative_mass) {
+                maybe_record_sampling_trace(candidate.token_id);
+                debug_dump_top_candidates("sampled", candidate.token_id);
+                debug_log_sample(candidate.token_id);
+                return candidate.token_id;
+            }
+        }
+
+        maybe_record_sampling_trace(candidates.front().token_id);
+        debug_dump_top_candidates("sorted_front_fallback", candidates.front().token_id);
+        debug_log_sample(candidates.front().token_id);
+        return candidates.front().token_id;
+    }
+
     if (k < active_vocab) {
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            candidate_lookup.emplace(candidates[i].token_id, static_cast<int>(i));
+        for (auto& candidate : candidates) {
+            float mass = std::exp(candidate.logit - max_logit);
+            if (!std::isfinite(mass)) {
+                mass = 0.0f;
+            }
+            candidate.mass = mass;
         }
     } else {
         candidates.reserve(static_cast<size_t>(active_vocab));
-    }
-
-    float sum_exp = 0.0f;
-    for (int i = 0; i < active_vocab; ++i) {
-        const float v = adjusted_logit_at(i);
-        if (!std::isfinite(v)) continue;
-        float mass = std::exp(v - max_logit);
-        if (!std::isfinite(mass)) {
-            mass = 0.0f;
-        }
-        sum_exp += mass;
-        const int token_id = range_start + i;
-        if (k < active_vocab) {
-            auto it = candidate_lookup.find(token_id);
-            if (it != candidate_lookup.end()) {
-                candidates[static_cast<size_t>(it->second)].mass = mass;
+        sum_exp = 0.0f;
+        for (int i = 0; i < active_vocab; ++i) {
+            const float v = adjusted_logit_at(i);
+            if (!std::isfinite(v)) continue;
+            float mass = std::exp(v - max_logit);
+            if (!std::isfinite(mass)) {
+                mass = 0.0f;
             }
-        } else {
+            sum_exp += mass;
+            const int token_id = range_start + i;
             SamplingCandidate cand;
             cand.logit = v;
             cand.mass = mass;

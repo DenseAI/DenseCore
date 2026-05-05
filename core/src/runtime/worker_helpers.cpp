@@ -704,6 +704,11 @@ PrefillThreadPolicySelection ResolvePrefillThreadPolicySelection(const Transform
     selection.label = "prefill_base";
 
     if (IsQwen36HybridSsmSingleRequest(model, num_seqs) && IsWideSimdLevel(simd_level)) {
+        if ((simd_level == densecore::simd::SimdLevel::SVE || simd_level == densecore::simd::SimdLevel::SVE2) &&
+            physical_core_count >= 16) {
+            selection.label = "prefill_qwen36_single_c4a_full_core";
+            return selection;
+        }
         if (prompt_token_count > 0 && prompt_token_count < 64) {
             selection.threads = std::min(selection.threads, 8);
             selection.label = "prefill_qwen36_single_short_prompt";
@@ -1367,7 +1372,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " attention_repack_ms=" << ns_to_ms(req->attention_repack_ns)
         << " moe_forward_ms=" << ns_to_ms(req->moe_forward_ns)
         << " shared_expert_ms=" << ns_to_ms(req->shared_expert_ns)
-        << " quant_matmul_ms=" << ns_to_ms(req->quant_matmul_ns) << " kv_update_ms=" << ns_to_ms(req->kv_update_ns)
+        << " quant_matmul_ms=" << ns_to_ms(req->quant_matmul_ns) << " ssm_conv1d_ms=" << ns_to_ms(req->ssm_conv1d_ns)
+        << " ssm_delta_ms=" << ns_to_ms(req->ssm_delta_ns) << " kv_update_ms=" << ns_to_ms(req->kv_update_ns)
         << " sample_ms=" << ns_to_ms(req->sample_ns) << " graph_cache_hits=" << req->graph_cache_hit_count
         << " graph_cache_misses=" << req->graph_cache_miss_count << " paged_hit_rate=" << paged_hit_rate
         << " paged_path_hits=" << runtime.path_paged << " decode_path_total=" << runtime.path_total
@@ -1382,8 +1388,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " attention_path_portable_flash=" << req->attention_path_portable_flash
         << " attention_path_native_flash=" << req->attention_path_native_flash
         << " attention_path_hal=" << req->attention_path_hal << " moe_task_count=" << req->moe_task_count
-        << " selected_expert_count=" << req->selected_expert_count
-        << " shared_quant_reused=" << runtime.shared_quant_reused
+        << " selected_expert_count=" << req->selected_expert_count << " ssm_conv1d_calls=" << req->ssm_conv1d_calls
+        << " ssm_delta_calls=" << req->ssm_delta_calls << " shared_quant_reused=" << runtime.shared_quant_reused
         << " shared_quant_total=" << runtime.shared_quant_total
         << " kv_single_slot_read_count=" << kv_stats.single_slot_read_count
         << " kv_single_slot_write_count=" << kv_stats.single_slot_write_count

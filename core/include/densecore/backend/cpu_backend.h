@@ -419,6 +419,15 @@ public:
         MoEProjectionPath selected_path = MoEProjectionPath::Unknown;
     };
 
+    struct MoEForwardProfile {
+        uint64_t route_ns = 0;
+        uint64_t reorder_ns = 0;
+        uint64_t expert_ns = 0;
+        uint64_t reduce_ns = 0;
+        uint64_t w1w3_ns = 0;
+        uint64_t w2_ns = 0;
+    };
+
     /**
      * @brief Migrate hot expert weights to local NUMA node
      *
@@ -569,7 +578,8 @@ public:
                     const ExpertWeights* experts, int num_experts, Tensor* output);
     void ForwardMoE(const TransformerModel* model, const TransformerLayer* layer_key, int layer_idx,
                     const BatchSpec* batch, const Tensor& input, const moe::MoERouteResult& routing,
-                    const ExpertWeights* experts, int num_experts, Tensor* output);
+                    const ExpertWeights* experts, int num_experts, Tensor* output,
+                    MoEForwardProfile* profile = nullptr);
     void ForwardMoE(const TransformerLayer* layer_key, int layer_idx, const BatchSpec* batch, const Tensor& input,
                     const moe::MoERouteResult& routing, const ExpertWeights* experts, int num_experts, Tensor* output);
     MoERuntimeStatsSnapshot GetMoERuntimeStatsSnapshot() const;

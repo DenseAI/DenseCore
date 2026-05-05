@@ -120,6 +120,9 @@ struct SSMQwen35DeltaUserData {
     const ggml_tensor* z_tensor = nullptr;
     const ggml_tensor* qkv_tensor = nullptr;
     const ggml_tensor* input_tensor = nullptr;
+    const ggml_tensor* alpha_beta_tensor = nullptr;
+    Qwen36ProfileCounters* profile = nullptr;
+    bool fast_silu_gate = false;
 };
 
 // SSM delta recurrent callback

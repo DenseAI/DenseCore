@@ -2190,6 +2190,17 @@ struct SSMConv1DUserData {
     int ssm_ordinal = -1;
     const int* token_seq_ids = nullptr;
     const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
+    Qwen36ProfileCounters* profile = nullptr;
+};
+
+struct SSMAlphaBetaProjectUserData {
+    const float* alpha_weight = nullptr;
+    const float* beta_weight = nullptr;
+    const float* dt_bias = nullptr;
+    int n_embd = 0;
+    int n_heads = 0;
+    int layer_idx = -1;
+    const int* token_seq_ids = nullptr;
 };
 
 struct ProjectionReferenceUserData {
@@ -2940,7 +2951,15 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             conv_ud->ssm_ordinal = ssm_ordinal;
             conv_ud->token_seq_ids = batch.seq_id.data();
             conv_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
-            struct ggml_tensor* qkv_conv = ggml_map_custom1(ctx_c, qkv_mixed, cb_ssm_conv1d, 1, conv_ud);
+            conv_ud->profile = &GetCurrentWorkContext()->qwen36_profile;
+            const bool ssm_conv_channel_parallel =
+                model->variant == ModelVariant::QWEN36 && batch.num_seqs == 1 && N > 1 &&
+                ParseTruthyEnv("DENSECORE_QWEN36_PREFILL_SSM_CONV_CHANNEL_PARALLEL", true);
+            const int ssm_conv_tasks =
+                ssm_conv_channel_parallel
+                    ? std::min(std::max(1, ResolveInferenceConfig(&batch).num_threads), std::max(1, conv_channels))
+                    : 1;
+            struct ggml_tensor* qkv_conv = ggml_map_custom1(ctx_c, qkv_mixed, cb_ssm_conv1d, ssm_conv_tasks, conv_ud);
 
             // 3. z projection and recurrent Qwen3.5 delta-net block.
             struct ggml_tensor* z = smart_mul_mat(ctx_c, attn_gate_w, cur, model);
@@ -2979,7 +2998,48 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             scan_ud->z_tensor = z;
             scan_ud->qkv_tensor = qkv_conv;
             scan_ud->input_tensor = cur;
-            struct ggml_tensor* y = ggml_map_custom2(ctx_c, z, qkv_conv, cb_ssm_qwen35_delta_z_qkv, 1, scan_ud);
+            scan_ud->alpha_beta_tensor = nullptr;
+            scan_ud->profile = &GetCurrentWorkContext()->qwen36_profile;
+            scan_ud->fast_silu_gate =
+                model->variant == ModelVariant::QWEN36 && ParseTruthyEnv("DENSECORE_QWEN36_SSM_FAST_SILU_GATE", true);
+            struct ggml_tensor* alpha_beta = nullptr;
+            if (model->variant == ModelVariant::QWEN36 && batch.num_seqs == 1 && N > 1 &&
+                ParseTruthyEnv("DENSECORE_QWEN36_PREFILL_PRECOMPUTE_SSM_ALPHA_BETA", true)) {
+                const bool precompute_qk_norm = ParseTruthyEnv("DENSECORE_QWEN36_PREFILL_PRECOMPUTE_SSM_QK_NORM", true);
+                SSMAlphaBetaProjectUserData* alpha_beta_ud = AllocateSSMAlphaBetaProjectUserData(ctx_c);
+                if (!alpha_beta_ud) {
+                    throw densecore::OutOfMemoryException("Failed to allocate SSM alpha/beta projection userdata");
+                }
+                alpha_beta_ud->alpha_weight = ssm_rt.alpha_f32.data();
+                alpha_beta_ud->beta_weight = ssm_rt.beta_f32.data();
+                alpha_beta_ud->dt_bias = ssm_rt.dt_bias_f32.data();
+                alpha_beta_ud->n_embd = n_embd;
+                alpha_beta_ud->n_heads = num_v_heads;
+                alpha_beta_ud->layer_idx = il;
+                alpha_beta_ud->token_seq_ids = batch.seq_id.data();
+                const int alpha_beta_rows = 2 * num_v_heads + (precompute_qk_norm ? 3 * n_groups : 0);
+                alpha_beta = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, alpha_beta_rows, N);
+                const int alpha_beta_tasks =
+                    ResolveTaskCount(&batch, std::max(1, N * (num_v_heads + (precompute_qk_norm ? n_groups : 0))));
+                alpha_beta = precompute_qk_norm
+                                 ? ggml_map_custom3(ctx_c, alpha_beta, cur, qkv_conv, cb_ssm_alpha_beta_qk_project_map3,
+                                                    alpha_beta_tasks, scan_ud)
+                                 : ggml_map_custom2(ctx_c, alpha_beta, cur, cb_ssm_alpha_beta_project_map2,
+                                                    alpha_beta_tasks, alpha_beta_ud);
+                scan_ud->alpha_beta_tensor = alpha_beta;
+            }
+            const bool ssm_delta_head_parallel =
+                model->variant == ModelVariant::QWEN36 && batch.num_seqs == 1 &&
+                ParseTruthyEnv("DENSECORE_QWEN36_SSM_DELTA_HEAD_PARALLEL", true) &&
+                (batch.tokens.size() == 1 || ParseTruthyEnv("DENSECORE_QWEN36_PREFILL_SSM_DELTA_HEAD_PARALLEL", true));
+            const int ssm_delta_tasks =
+                ssm_delta_head_parallel
+                    ? std::min(std::max(1, ResolveInferenceConfig(&batch).num_threads), std::max(1, num_v_heads))
+                    : 1;
+            struct ggml_tensor* y =
+                alpha_beta ? ggml_map_custom3(ctx_c, z, qkv_conv, alpha_beta, cb_ssm_qwen35_delta_z_qkv_alpha_beta,
+                                              ssm_delta_tasks, scan_ud)
+                           : ggml_map_custom2(ctx_c, z, qkv_conv, cb_ssm_qwen35_delta_z_qkv, ssm_delta_tasks, scan_ud);
 
             // 4. Output projection: [d_inner, N] -> [n_embd, N]
             // Qwen3.6 hybrid SSM hits large-M prefill shapes here, and the generic
@@ -4304,7 +4364,12 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 moe_ud->model = model;
                 moe_ud->layer = &model->layers[il];
                 moe_ud->layer_idx = il;
-                moe_ud->k = model->hparams.n_experts_used;
+                int moe_top_k = static_cast<int>(model->hparams.n_experts_used);
+                if (model->variant == ModelVariant::QWEN36 && batch.num_seqs == 1 && batch.tokens.size() > 1) {
+                    const int prefill_cap = ParsePositiveEnvInt("DENSECORE_QWEN36_PREFILL_MOE_TOP_K_CAP", moe_top_k);
+                    moe_top_k = std::max(1, std::min(moe_top_k, prefill_cap));
+                }
+                moe_ud->k = moe_top_k;
                 moe_ud->batch = &batch;
                 moe_ud->scheduler = batch.scheduler;
                 if (IsQwen36ProfilingEnabled()) {
@@ -4810,7 +4875,15 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
     // LM Head projection: [n_embd, N] -> [n_vocab, N]
     struct ggml_tensor* cur_input_to_lm_head = cur;
-    cur = smart_mul_mat(ctx_c, model->output, cur, model);
+    const bool qwen36_prefill_last_logits_only = model->variant == ModelVariant::QWEN36 && batch.num_seqs == 1 &&
+                                                 N > 1 &&
+                                                 ParseTruthyEnv("DENSECORE_QWEN36_PREFILL_LAST_LOGITS_ONLY", true);
+    if (qwen36_prefill_last_logits_only) {
+        const size_t last_token_offset = static_cast<size_t>(N - 1) * static_cast<size_t>(cur->nb[1]);
+        cur_input_to_lm_head = ggml_view_2d(ctx_c, cur, cur->ne[0], 1, cur->nb[1], last_token_offset);
+        cur_input_to_lm_head = ggml_cont(ctx_c, cur_input_to_lm_head);
+    }
+    cur = smart_mul_mat(ctx_c, model->output, cur_input_to_lm_head, model);
     const bool debug_lm_head = IsDebugInferenceStatsEnabled() || std::getenv("DENSECORE_DEBUG_LM_HEAD_TOP") != nullptr;
     if (debug_lm_head) {
         auto cb_check_lm_head_out = [](struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
@@ -4986,7 +5059,7 @@ bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchS
         if (node->op == GGML_OP_MAP_CUSTOM3) {
             Custom3ParamsView params{};
             std::memcpy(&params, node->op_params, sizeof(params));
-            if (params.fun == cb_ssm_qwen35_delta) {
+            if (params.fun == cb_ssm_qwen35_delta || params.fun == cb_ssm_qwen35_delta_z_qkv_alpha_beta) {
                 auto* ud = static_cast<SSMQwen35DeltaUserData*>(params.userdata);
                 if (!ud) {
                     return false;

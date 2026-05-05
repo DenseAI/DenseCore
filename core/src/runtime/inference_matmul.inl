@@ -48,6 +48,27 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
 
     const ggml_type weight_type = weight_tensor->type;
     const char* weight_name = weight_tensor->name[0] ? weight_tensor->name : "(unnamed)";
+    const bool debug_gemv_timing = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_GEMV_TIMING");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    const auto gemv_begin =
+        (debug_gemv_timing && ith == 0) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto maybe_log_gemv_timing = [&](const char* path) {
+        if (!debug_gemv_timing || ith != 0) {
+            return;
+        }
+        static std::atomic<int> log_budget{0};
+        const int current = log_budget.fetch_add(1, std::memory_order_relaxed);
+        if (current >= 256) {
+            return;
+        }
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gemv_begin).count();
+        std::fprintf(stderr,
+                     "[GEMV_TIMING] weight=%s type=%s path=%s K_out=%d N_in=%d nth=%d ith0_ms=%.3f\n",
+                     weight_name, ggml_type_name(weight_type), path ? path : "unknown", K, N, nth, ms);
+    };
 
     // ==========================================================================
     // SHARED PRE-QUANTIZATION (token-position synchronized):
@@ -114,6 +135,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
         }
         const float* weight = reinterpret_cast<const float*>(weight_data);
         densecore::simd::GemvParallel(output, x_f32, weight, N, K, ith, nth);
+        maybe_log_gemv_timing("f32");
         return;
     }
 
@@ -133,10 +155,33 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
             LogHybridSSMQkvDispatch(weight_name, weight_type, 1, K, N, "GEMV_NATIVE_VECDOT_CALLBACK", false, true,
                                     false);
         }
-        for (int k = k_start; k < k_end; k++) {
-            const void* row_ptr = reinterpret_cast<const char*>(weight_data) + k * row_stride;
+        const bool can_use_rowpair =
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_MATMUL_INT8)
+            weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K &&
+            (N % ggml_blck_size(weight_type)) == 0;
+#else
+            false;
+#endif
+        int k = k_start;
+        if (can_use_rowpair && (k & 1)) {
+            const void* row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
+            type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
+            ++k;
+        }
+        if (can_use_rowpair) {
+            for (; k + 1 < k_end; k += 2) {
+                const void* row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
+                float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                type_traits_cpu->vec_dot(N, sums, 2, row_ptr, row_stride, quant_input, 0, 2);
+                output[k] = sums[0];
+                output[k + 1] = sums[1];
+            }
+        }
+        for (; k < k_end; ++k) {
+            const void* row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
             type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
         }
+        maybe_log_gemv_timing(can_use_rowpair ? "quant_vecdot_rowpair" : "quant_vecdot");
         return;
     }
 
@@ -165,6 +210,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
         }
         output[k] = sum;
     }
+    maybe_log_gemv_timing("dequant_reference");
 }
 
 struct DensecoreBlockQ8K {
@@ -3304,7 +3350,6 @@ inline struct ggml_tensor* ggml_mul_mat_fp8(struct ggml_context* ctx, struct ggm
  * - If incompatible (e.g., transposed layout mismatch), falls back to
  *   ggml_mul_mat which handles stride/transpose correctly.
  */
-// NOTE: Not inline - needs external linkage for graph_builders/
 struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* weight, struct ggml_tensor* input,
                                   TransformerModel* model) {
     const int M = static_cast<int>(input->ne[1]);
@@ -3315,6 +3360,10 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const bool is_qwen35_hybrid_ssm = model && model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
     const bool is_qwen35_hybrid_ssm_gate = is_qwen35_hybrid_ssm && std::strstr(w_name, "attn_gate");
     const bool is_qwen35_hybrid_ssm_out = is_qwen35_hybrid_ssm && std::strstr(w_name, "ssm_out");
+    const bool is_qwen36_hybrid_ssm = model && model->variant == ModelVariant::QWEN36 &&
+                                      model->arch_flags.is_hybrid_ssm;
+    const bool is_qwen36_hybrid_ssm_qkv = is_qwen36_hybrid_ssm && std::strstr(w_name, "attn_qkv");
+    const bool is_qwen36_hybrid_ssm_gate = is_qwen36_hybrid_ssm && std::strstr(w_name, "attn_gate");
     const bool is_qwen36_hybrid_ssm_out = model && model->variant == ModelVariant::QWEN36 &&
                                           model->arch_flags.is_hybrid_ssm && std::strstr(w_name, "ssm_out");
     const bool is_qwen36_lm_head = model && model->output == weight && model->variant == ModelVariant::QWEN36 &&
@@ -3340,14 +3389,18 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         return ggml_mul_mat(ctx, weight, input);
     }
 
-    // Qwen3.5 long-form correctness on C4A is currently gated by the hybrid-SSM
-    // producer projections. The custom quantized projection lane can corrupt the
-    // graph during large-M prefill. Keep qkv, gate, and ssm_out on native GGML
-    // until long-context serving is stable again.
-    if ((is_qwen35_hybrid_ssm_gate || is_qwen35_hybrid_ssm_out || is_hybrid_ssm_qkv) &&
+    // Hybrid-SSM producer/output projections are correctness-critical on C4A.
+    // Keep quantized large-M prefill for qkv, gate, and ssm_out on native GGML;
+    // custom quant lanes for Qwen3.6 hybrid SSM have crashed the Go-server path.
+    const bool force_plain_hybrid_ssm_prefill =
+        is_qwen35_hybrid_ssm_gate || is_qwen35_hybrid_ssm_out ||
+        (is_hybrid_ssm_qkv &&
+         (!model || model->variant != ModelVariant::QWEN36)) ||
+        is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out;
+    if (force_plain_hybrid_ssm_prefill &&
         ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 && M > 1) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
-                          "qwen35_hybrid_ssm_prefill_correctness");
+                          "hybrid_ssm_prefill_correctness");
         return ggml_mul_mat(ctx, weight, input);
     }
 
@@ -3372,26 +3425,6 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "qwen36_lm_head_prefill_correctness");
         return ggml_mul_mat(ctx, weight, input);
-    }
-
-    // Qwen3.6 hybrid SSM output projection is correctness-critical on C4A.
-    // Native ggml quantized matmul can drift on long prefill and can also hit
-    // a short-prompt shape assert for q8_0 weights. Route this one tensor
-    // family through the custom GEMV/GEMM path, which owns the output shape and
-    // can safely fall back to rowwise dequantized accumulation.
-    if (is_qwen36_hybrid_ssm_out && ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 && weight->ne[0] == input->ne[0]) {
-        if (M == 1) {
-            LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
-                              "GEMV_QUANT", "qwen36_ssm_out_safe_custom");
-            GemvUserData* ud = GetGemvUserData();
-            ud->force_reference_scalar = false;
-            return ggml_mul_mat_gemv(ctx, weight, input, ud);
-        }
-        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
-                          "GGML_QUANT_NRC_M", "qwen36_ssm_out_safe_custom");
-        GemvBatchedUserData* ud = GetGemvBatchedUserData();
-        ud->force_reference_scalar = false;
-        return ggml_mul_mat_gemv_batched(ctx, weight, input, ud);
     }
 
     // ========================================================================

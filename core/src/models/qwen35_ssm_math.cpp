@@ -65,6 +65,30 @@ inline float SiluStable(float x) {
     return x * SigmoidStable(x);
 }
 
+inline float FastExpApprox(float x) {
+    constexpr float kLog2E = 1.4426950408889634f;
+    constexpr float kMinExp = -50.0f;
+    constexpr float kMaxExp = 50.0f;
+
+    x = std::max(std::min(x, kMaxExp), kMinExp);
+    const float y = x * kLog2E;
+    const float i_f = std::floor(y);
+    const float f = y - i_f;
+
+    float p = 0.07944023841053369f * f + 0.224494337302845f;
+    p = p * f + 0.6960656421638072f;
+    p = p * f + 1.0f;
+
+    const int32_t exp_bits = (static_cast<int32_t>(i_f) + 127) << 23;
+    float two_i = 0.0f;
+    std::memcpy(&two_i, &exp_bits, sizeof(two_i));
+    return p * two_i;
+}
+
+inline float SiluFast(float x) {
+    return x / (1.0f + FastExpApprox(-x));
+}
+
 inline float ResolveSSMA(float stored, bool prefer_materialized) {
     if (prefer_materialized && stored <= 0.0f) {
         return stored;
@@ -234,16 +258,245 @@ inline void AccumulateScaled(float* dst, const float* src, float scale, int n) {
 #endif
 }
 
+inline void AccumulateTwoScaled(float* dst_a, float* dst_b, const float* src, float scale_a, float scale_b, int n) {
+#if defined(__AVX512F__)
+    const __m512 va = _mm512_set1_ps(scale_a);
+    const __m512 vb = _mm512_set1_ps(scale_b);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 s = _mm512_loadu_ps(src + i);
+        const __m512 da = _mm512_loadu_ps(dst_a + i);
+        const __m512 db = _mm512_loadu_ps(dst_b + i);
+        _mm512_storeu_ps(dst_a + i, _mm512_add_ps(da, _mm512_mul_ps(s, va)));
+        _mm512_storeu_ps(dst_b + i, _mm512_add_ps(db, _mm512_mul_ps(s, vb)));
+    }
+    for (; i < n; ++i) {
+        const float value = src[i];
+        dst_a[i] += value * scale_a;
+        dst_b[i] += value * scale_b;
+    }
+#elif defined(__AVX2__)
+    const __m256 va = _mm256_set1_ps(scale_a);
+    const __m256 vb = _mm256_set1_ps(scale_b);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 s = _mm256_loadu_ps(src + i);
+        const __m256 da = _mm256_loadu_ps(dst_a + i);
+        const __m256 db = _mm256_loadu_ps(dst_b + i);
+        _mm256_storeu_ps(dst_a + i, _mm256_add_ps(da, _mm256_mul_ps(s, va)));
+        _mm256_storeu_ps(dst_b + i, _mm256_add_ps(db, _mm256_mul_ps(s, vb)));
+    }
+    for (; i < n; ++i) {
+        const float value = src[i];
+        dst_a[i] += value * scale_a;
+        dst_b[i] += value * scale_b;
+    }
+#elif defined(DENSECORE_NEON_SSM)
+    const float32x4_t va = vdupq_n_f32(scale_a);
+    const float32x4_t vb = vdupq_n_f32(scale_b);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t s = vld1q_f32(src + i);
+        const float32x4_t da = vld1q_f32(dst_a + i);
+        const float32x4_t db = vld1q_f32(dst_b + i);
+        vst1q_f32(dst_a + i, vfmaq_f32(da, s, va));
+        vst1q_f32(dst_b + i, vfmaq_f32(db, s, vb));
+    }
+    for (; i < n; ++i) {
+        const float value = src[i];
+        dst_a[i] += value * scale_a;
+        dst_b[i] += value * scale_b;
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        const float value = src[i];
+        dst_a[i] += value * scale_a;
+        dst_b[i] += value * scale_b;
+    }
+#endif
+}
+
+inline void DecayAddScaled(float* dst, const float* src, float decay, float scale, int n) {
+#if defined(__AVX512F__)
+    const __m512 vdecay = _mm512_set1_ps(decay);
+    const __m512 vscale = _mm512_set1_ps(scale);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 d = _mm512_loadu_ps(dst + i);
+        const __m512 s = _mm512_loadu_ps(src + i);
+        _mm512_storeu_ps(dst + i, _mm512_add_ps(_mm512_mul_ps(d, vdecay), _mm512_mul_ps(s, vscale)));
+    }
+    for (; i < n; ++i) {
+        dst[i] = decay * dst[i] + scale * src[i];
+    }
+#elif defined(__AVX2__)
+    const __m256 vdecay = _mm256_set1_ps(decay);
+    const __m256 vscale = _mm256_set1_ps(scale);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 d = _mm256_loadu_ps(dst + i);
+        const __m256 s = _mm256_loadu_ps(src + i);
+        _mm256_storeu_ps(dst + i, _mm256_add_ps(_mm256_mul_ps(d, vdecay), _mm256_mul_ps(s, vscale)));
+    }
+    for (; i < n; ++i) {
+        dst[i] = decay * dst[i] + scale * src[i];
+    }
+#elif defined(DENSECORE_NEON_SSM)
+    const float32x4_t vdecay = vdupq_n_f32(decay);
+    const float32x4_t vscale = vdupq_n_f32(scale);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t d = vld1q_f32(dst + i);
+        const float32x4_t s = vld1q_f32(src + i);
+        vst1q_f32(dst + i, vfmaq_f32(vmulq_f32(d, vdecay), s, vscale));
+    }
+    for (; i < n; ++i) {
+        dst[i] = decay * dst[i] + scale * src[i];
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        dst[i] = decay * dst[i] + scale * src[i];
+    }
+#endif
+}
+
+inline void DecayAddScaledAndAccumulate(float* state_row, const float* delta, float* y_head, float decay, float k_scale,
+                                        float q_scale, int n) {
+#if defined(__AVX512F__)
+    const __m512 vdecay = _mm512_set1_ps(decay);
+    const __m512 vk = _mm512_set1_ps(k_scale);
+    const __m512 vq = _mm512_set1_ps(q_scale);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 old_state = _mm512_loadu_ps(state_row + i);
+        const __m512 d = _mm512_loadu_ps(delta + i);
+        const __m512 updated = _mm512_add_ps(_mm512_mul_ps(old_state, vdecay), _mm512_mul_ps(d, vk));
+        const __m512 y = _mm512_loadu_ps(y_head + i);
+        _mm512_storeu_ps(state_row + i, updated);
+        _mm512_storeu_ps(y_head + i, _mm512_add_ps(y, _mm512_mul_ps(updated, vq)));
+    }
+    for (; i < n; ++i) {
+        const float updated = decay * state_row[i] + k_scale * delta[i];
+        state_row[i] = updated;
+        y_head[i] += updated * q_scale;
+    }
+#elif defined(__AVX2__)
+    const __m256 vdecay = _mm256_set1_ps(decay);
+    const __m256 vk = _mm256_set1_ps(k_scale);
+    const __m256 vq = _mm256_set1_ps(q_scale);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 old_state = _mm256_loadu_ps(state_row + i);
+        const __m256 d = _mm256_loadu_ps(delta + i);
+        const __m256 updated = _mm256_add_ps(_mm256_mul_ps(old_state, vdecay), _mm256_mul_ps(d, vk));
+        const __m256 y = _mm256_loadu_ps(y_head + i);
+        _mm256_storeu_ps(state_row + i, updated);
+        _mm256_storeu_ps(y_head + i, _mm256_add_ps(y, _mm256_mul_ps(updated, vq)));
+    }
+    for (; i < n; ++i) {
+        const float updated = decay * state_row[i] + k_scale * delta[i];
+        state_row[i] = updated;
+        y_head[i] += updated * q_scale;
+    }
+#elif defined(DENSECORE_NEON_SSM)
+    const float32x4_t vdecay = vdupq_n_f32(decay);
+    const float32x4_t vk = vdupq_n_f32(k_scale);
+    const float32x4_t vq = vdupq_n_f32(q_scale);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t old_state = vld1q_f32(state_row + i);
+        const float32x4_t d = vld1q_f32(delta + i);
+        const float32x4_t updated = vfmaq_f32(vmulq_f32(old_state, vdecay), d, vk);
+        const float32x4_t y = vld1q_f32(y_head + i);
+        vst1q_f32(state_row + i, updated);
+        vst1q_f32(y_head + i, vfmaq_f32(y, updated, vq));
+    }
+    for (; i < n; ++i) {
+        const float updated = decay * state_row[i] + k_scale * delta[i];
+        state_row[i] = updated;
+        y_head[i] += updated * q_scale;
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        const float updated = decay * state_row[i] + k_scale * delta[i];
+        state_row[i] = updated;
+        y_head[i] += updated * q_scale;
+    }
+#endif
+}
+
+inline void FinalizeDeltaOutput(float* y_head, const float* delta, float decay, float qk_dot, float output_scale,
+                                int n) {
+#if defined(__AVX512F__)
+    const __m512 vdecay = _mm512_set1_ps(decay);
+    const __m512 vqk = _mm512_set1_ps(qk_dot);
+    const __m512 vout = _mm512_set1_ps(output_scale);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 y = _mm512_loadu_ps(y_head + i);
+        const __m512 d = _mm512_loadu_ps(delta + i);
+        _mm512_storeu_ps(y_head + i,
+                         _mm512_mul_ps(_mm512_add_ps(_mm512_mul_ps(y, vdecay), _mm512_mul_ps(d, vqk)), vout));
+    }
+    for (; i < n; ++i) {
+        y_head[i] = (decay * y_head[i] + qk_dot * delta[i]) * output_scale;
+    }
+#elif defined(__AVX2__)
+    const __m256 vdecay = _mm256_set1_ps(decay);
+    const __m256 vqk = _mm256_set1_ps(qk_dot);
+    const __m256 vout = _mm256_set1_ps(output_scale);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 y = _mm256_loadu_ps(y_head + i);
+        const __m256 d = _mm256_loadu_ps(delta + i);
+        _mm256_storeu_ps(y_head + i,
+                         _mm256_mul_ps(_mm256_add_ps(_mm256_mul_ps(y, vdecay), _mm256_mul_ps(d, vqk)), vout));
+    }
+    for (; i < n; ++i) {
+        y_head[i] = (decay * y_head[i] + qk_dot * delta[i]) * output_scale;
+    }
+#elif defined(DENSECORE_NEON_SSM)
+    const float32x4_t vdecay = vdupq_n_f32(decay);
+    const float32x4_t vqk = vdupq_n_f32(qk_dot);
+    const float32x4_t vout = vdupq_n_f32(output_scale);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t y = vld1q_f32(y_head + i);
+        const float32x4_t d = vld1q_f32(delta + i);
+        vst1q_f32(y_head + i, vmulq_f32(vfmaq_f32(vmulq_f32(y, vdecay), d, vqk), vout));
+    }
+    for (; i < n; ++i) {
+        y_head[i] = (decay * y_head[i] + qk_dot * delta[i]) * output_scale;
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        y_head[i] = (decay * y_head[i] + qk_dot * delta[i]) * output_scale;
+    }
+#endif
+}
+
 inline float SumSquares(const float* values, int n) {
     return DotSquares(values, n);
 }
 
 bool IsQwen36SSMDebugTimingEnabled() {
-    const char* env = std::getenv("DENSECORE_QWEN36_SSM_DEBUG_TIMING");
-    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_QWEN36_SSM_DEBUG_TIMING");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
 }
 
-inline void ApplyRmsNormGate(float* y_head, const float* norm_weight, const float* z_head, float inv_rms, int n) {
+bool UseUpdatedStateOutputAccumulation() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_QWEN36_SSM_UPDATED_STATE_OUTPUT_ACCUM");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+inline void ApplyRmsNormGate(float* y_head, const float* norm_weight, const float* z_head, float inv_rms, int n,
+                             bool use_fast_silu) {
 #if defined(__AVX512F__)
     const __m512 v_inv_rms = _mm512_set1_ps(inv_rms);
     int i = 0;
@@ -268,7 +521,7 @@ inline void ApplyRmsNormGate(float* y_head, const float* norm_weight, const floa
     }
     for (; i < n; ++i) {
         const float norm = norm_weight ? norm_weight[i] : 1.0f;
-        y_head[i] = (y_head[i] * inv_rms) * norm * SiluStable(z_head[i]);
+        y_head[i] = (y_head[i] * inv_rms) * norm * (use_fast_silu ? SiluFast(z_head[i]) : SiluStable(z_head[i]));
     }
 #elif defined(__AVX2__)
     const __m256 v_inv_rms = _mm256_set1_ps(inv_rms);
@@ -279,7 +532,7 @@ inline void ApplyRmsNormGate(float* y_head, const float* norm_weight, const floa
         _mm256_store_ps(z_buf, _mm256_loadu_ps(z_head + i));
         alignas(32) float silu_buf[8];
         for (int lane = 0; lane < 8; ++lane) {
-            silu_buf[lane] = SiluStable(z_buf[lane]);
+            silu_buf[lane] = use_fast_silu ? SiluFast(z_buf[lane]) : SiluStable(z_buf[lane]);
         }
         const __m256 silu = _mm256_load_ps(silu_buf);
         const __m256 norm = norm_weight ? _mm256_loadu_ps(norm_weight + i) : _mm256_set1_ps(1.0f);
@@ -287,7 +540,7 @@ inline void ApplyRmsNormGate(float* y_head, const float* norm_weight, const floa
     }
     for (; i < n; ++i) {
         const float norm = norm_weight ? norm_weight[i] : 1.0f;
-        y_head[i] = (y_head[i] * inv_rms) * norm * SiluStable(z_head[i]);
+        y_head[i] = (y_head[i] * inv_rms) * norm * (use_fast_silu ? SiluFast(z_head[i]) : SiluStable(z_head[i]));
     }
 #elif defined(DENSECORE_NEON_SSM)
     const float32x4_t v_inv_rms = vdupq_n_f32(inv_rms);
@@ -297,7 +550,7 @@ inline void ApplyRmsNormGate(float* y_head, const float* norm_weight, const floa
         vst1q_f32(z_buf, vld1q_f32(z_head + i));
         alignas(16) float silu_buf[4];
         for (int lane = 0; lane < 4; ++lane) {
-            silu_buf[lane] = SiluStable(z_buf[lane]);
+            silu_buf[lane] = use_fast_silu ? SiluFast(z_buf[lane]) : SiluStable(z_buf[lane]);
         }
         const float32x4_t y = vmulq_f32(vld1q_f32(y_head + i), v_inv_rms);
         const float32x4_t silu = vld1q_f32(silu_buf);
@@ -306,12 +559,12 @@ inline void ApplyRmsNormGate(float* y_head, const float* norm_weight, const floa
     }
     for (; i < n; ++i) {
         const float norm = norm_weight ? norm_weight[i] : 1.0f;
-        y_head[i] = (y_head[i] * inv_rms) * norm * SiluStable(z_head[i]);
+        y_head[i] = (y_head[i] * inv_rms) * norm * (use_fast_silu ? SiluFast(z_head[i]) : SiluStable(z_head[i]));
     }
 #else
     for (int i = 0; i < n; ++i) {
         const float norm = norm_weight ? norm_weight[i] : 1.0f;
-        y_head[i] = (y_head[i] * inv_rms) * norm * SiluStable(z_head[i]);
+        y_head[i] = (y_head[i] * inv_rms) * norm * (use_fast_silu ? SiluFast(z_head[i]) : SiluStable(z_head[i]));
     }
 #endif
 }
@@ -527,10 +780,12 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
     static thread_local std::vector<float> k_norm;
     static thread_local std::vector<float> kv_mem;
     static thread_local std::vector<float> delta;
-    q_norm.resize(static_cast<size_t>(cfg.head_dim_k));
-    k_norm.resize(static_cast<size_t>(cfg.head_dim_k));
-    kv_mem.resize(static_cast<size_t>(cfg.head_dim_v));
-    delta.resize(static_cast<size_t>(cfg.head_dim_v));
+    const size_t head_dim_k = static_cast<size_t>(cfg.head_dim_k);
+    const size_t head_dim_v = static_cast<size_t>(cfg.head_dim_v);
+    if (q_norm.size() != head_dim_k) q_norm.resize(head_dim_k);
+    if (k_norm.size() != head_dim_k) k_norm.resize(head_dim_k);
+    if (kv_mem.size() != head_dim_v) kv_mem.resize(head_dim_v);
+    if (delta.size() != head_dim_v) delta.resize(head_dim_v);
     const bool log_timing = IsQwen36SSMDebugTimingEnabled();
     const bool collect_timing = stats != nullptr || log_timing;
     const auto ms_since = [](std::chrono::steady_clock::time_point start) {
@@ -542,9 +797,14 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
 
     float alpha = cfg.dt_bias;
     float beta = 0.0f;
-    for (int i = 0; i < cfg.n_embd; ++i) {
-        alpha += cfg.alpha_row[i] * cfg.input_t[i];
-        beta += cfg.beta_row[i] * cfg.input_t[i];
+    if (cfg.has_precomputed_alpha_beta) {
+        alpha = cfg.precomputed_alpha;
+        beta = cfg.precomputed_beta;
+    } else {
+        for (int i = 0; i < cfg.n_embd; ++i) {
+            alpha += cfg.alpha_row[i] * cfg.input_t[i];
+            beta += cfg.beta_row[i] * cfg.input_t[i];
+        }
     }
     const double alpha_beta_dot_ms = collect_timing ? ms_since(alpha_beta_begin) : 0.0;
 
@@ -574,21 +834,25 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
     }
     const double norm_ms = collect_timing ? ms_since(norm_begin) : 0.0;
 
-    const size_t state_elems = static_cast<size_t>(cfg.head_dim_k) * static_cast<size_t>(cfg.head_dim_v);
-
-    const auto decay_state_begin =
-        collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    ScaleInPlace(state_kv, decay, state_elems);
-    const double decay_state_ms = collect_timing ? ms_since(decay_state_begin) : 0.0;
-
     const auto kv_mem_begin =
         collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    ScaleCopy(kv_mem.data(), state_kv, k_norm[0], cfg.head_dim_v);
-    for (int k = 1; k < cfg.head_dim_k; ++k) {
+    std::fill(kv_mem.begin(), kv_mem.end(), 0.0f);
+    std::fill(y_head, y_head + cfg.head_dim_v, 0.0f);
+    const bool updated_state_output_accum = UseUpdatedStateOutputAccumulation();
+    float qk_dot = 0.0f;
+    for (int k = 0; k < cfg.head_dim_k; ++k) {
         const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
-        AccumulateScaled(kv_mem.data(), state_row, k_norm[static_cast<size_t>(k)], cfg.head_dim_v);
+        const float k_val = k_norm[static_cast<size_t>(k)];
+        const float q_val = q_norm[static_cast<size_t>(k)];
+        if (updated_state_output_accum) {
+            AccumulateScaled(kv_mem.data(), state_row, k_val, cfg.head_dim_v);
+        } else {
+            AccumulateTwoScaled(kv_mem.data(), y_head, state_row, k_val, q_val, cfg.head_dim_v);
+        }
+        qk_dot += q_val * k_val;
     }
     for (int v = 0; v < cfg.head_dim_v; ++v) {
+        kv_mem[static_cast<size_t>(v)] *= decay;
         delta[static_cast<size_t>(v)] = (cfg.v_head[v] - kv_mem[static_cast<size_t>(v)]) * beta_gate;
     }
     if (debug && debug->kv_mem) {
@@ -602,28 +866,33 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
         }
     }
     const double kv_mem_ms = collect_timing ? ms_since(kv_mem_begin) : 0.0;
+    const double decay_state_ms = 0.0;
 
-    // State update: state_kv[k, v] += k_norm[k] * delta[v]
+    // State update: state_kv[k, v] = decay * state_kv[k, v] + k_norm[k] * delta[v]
     const auto state_update_begin =
         collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const float attention_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_v));
     for (int k = 0; k < cfg.head_dim_k; ++k) {
         const float k_val = k_norm[static_cast<size_t>(k)];
+        const float q_val = q_norm[static_cast<size_t>(k)];
         float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
-        AccumulateScaled(state_row, delta.data(), k_val, cfg.head_dim_v);
+        if (updated_state_output_accum) {
+            DecayAddScaledAndAccumulate(state_row, delta.data(), y_head, decay, k_val, q_val * attention_scale,
+                                        cfg.head_dim_v);
+        } else {
+            DecayAddScaled(state_row, delta.data(), decay, k_val, cfg.head_dim_v);
+        }
     }
     const double state_update_ms = collect_timing ? ms_since(state_update_begin) : 0.0;
 
     const auto output_accum_begin =
         collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    ScaleCopy(y_head, state_kv, q_norm[0], cfg.head_dim_v);
-    for (int k = 1; k < cfg.head_dim_k; ++k) {
-        const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
-        AccumulateScaled(y_head, state_row, q_norm[static_cast<size_t>(k)], cfg.head_dim_v);
-    }
     // llama.cpp's fused GDN applies the attention scale after the state-query
     // dot product. Keeping it here preserves q/k l2_norm parity while matching
     // the fused output contract.
-    ScaleInPlace(y_head, 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_v)), cfg.head_dim_v);
+    if (!updated_state_output_accum) {
+        FinalizeDeltaOutput(y_head, delta.data(), decay, qk_dot, attention_scale, cfg.head_dim_v);
+    }
     if (debug && debug->y_pre_norm) {
         for (int v = 0; v < cfg.head_dim_v; ++v) {
             debug->y_pre_norm[v] = y_head[v];
@@ -636,7 +905,7 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
     const float sum_sq = SumSquares(y_head, cfg.head_dim_v);
     const float rms = std::sqrt(sum_sq / cfg.head_dim_v + cfg.norm_eps);
     const float inv_rms = 1.0f / rms;
-    ApplyRmsNormGate(y_head, cfg.norm_weight, cfg.z_head, inv_rms, cfg.head_dim_v);
+    ApplyRmsNormGate(y_head, cfg.norm_weight, cfg.z_head, inv_rms, cfg.head_dim_v, cfg.use_fast_silu);
     const double rms_gate_ms = collect_timing ? ms_since(rms_gate_begin) : 0.0;
 
     if (stats) {
@@ -670,6 +939,93 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
                          rms_gate_ms);
     }
 
+    return true;
+}
+
+bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head) {
+    if (!cfg.input_t || !cfg.q_head || !cfg.k_head || !cfg.v_head || !cfg.z_head || !cfg.alpha_row || !cfg.beta_row ||
+        !state_kv || !y_head || cfg.n_embd <= 0 || cfg.head_dim_k <= 0 || cfg.head_dim_v <= 0) {
+        return false;
+    }
+    float alpha = cfg.dt_bias;
+    float beta = 0.0f;
+    if (cfg.has_precomputed_alpha_beta) {
+        alpha = cfg.precomputed_alpha;
+        beta = cfg.precomputed_beta;
+    } else {
+        for (int i = 0; i < cfg.n_embd; ++i) {
+            alpha += cfg.alpha_row[i] * cfg.input_t[i];
+            beta += cfg.beta_row[i] * cfg.input_t[i];
+        }
+    }
+
+    const float softplus_alpha = SoftplusStable(alpha);
+    const float ssm_a = ResolveSSMA(cfg.a_log, cfg.a_log_prescaled);
+    const float g = ssm_a * softplus_alpha;
+    const float decay = std::exp(g);
+    const float beta_gate = SigmoidStable(beta);
+
+    float q_inv_norm = cfg.precomputed_q_inv_norm;
+    float k_inv_norm = cfg.precomputed_k_inv_norm;
+    float qk_dot = cfg.precomputed_qk_dot;
+    if (!cfg.has_precomputed_qk_norm) {
+        const float q_sum_sq = DotSquares(cfg.q_head, cfg.head_dim_k);
+        const float k_sum_sq = DotSquares(cfg.k_head, cfg.head_dim_k);
+        q_inv_norm = 1.0f / std::max(std::sqrt(q_sum_sq), cfg.norm_eps);
+        k_inv_norm = 1.0f / std::max(std::sqrt(k_sum_sq), cfg.norm_eps);
+        qk_dot = 0.0f;
+    }
+
+    static thread_local std::vector<float> delta;
+    const size_t head_dim_v = static_cast<size_t>(cfg.head_dim_v);
+    if (delta.size() != head_dim_v) {
+        delta.resize(head_dim_v);
+    }
+
+    std::fill(delta.begin(), delta.end(), 0.0f);
+    std::fill(y_head, y_head + cfg.head_dim_v, 0.0f);
+
+    const bool updated_state_output_accum = UseUpdatedStateOutputAccumulation();
+    for (int k = 0; k < cfg.head_dim_k; ++k) {
+        const float k_val = cfg.k_head[k] * k_inv_norm;
+        const float q_val = cfg.q_head[k] * q_inv_norm;
+        const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        if (updated_state_output_accum) {
+            AccumulateScaled(delta.data(), state_row, k_val, cfg.head_dim_v);
+        } else {
+            AccumulateTwoScaled(delta.data(), y_head, state_row, k_val, q_val, cfg.head_dim_v);
+        }
+        if (!cfg.has_precomputed_qk_norm && !updated_state_output_accum) {
+            qk_dot += q_val * k_val;
+        }
+    }
+
+    for (int v = 0; v < cfg.head_dim_v; ++v) {
+        delta[static_cast<size_t>(v)] = (cfg.v_head[v] - delta[static_cast<size_t>(v)] * decay) * beta_gate;
+    }
+
+    for (int k = 0; k < cfg.head_dim_k; ++k) {
+        const float k_val = cfg.k_head[k] * k_inv_norm;
+        const float q_val = cfg.q_head[k] * q_inv_norm;
+        float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        if (updated_state_output_accum) {
+            const float attention_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_v));
+            DecayAddScaledAndAccumulate(state_row, delta.data(), y_head, decay, k_val, q_val * attention_scale,
+                                        cfg.head_dim_v);
+        } else {
+            DecayAddScaled(state_row, delta.data(), decay, k_val, cfg.head_dim_v);
+        }
+    }
+
+    if (!updated_state_output_accum) {
+        const float attention_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_v));
+        FinalizeDeltaOutput(y_head, delta.data(), decay, qk_dot, attention_scale, cfg.head_dim_v);
+    }
+
+    const float sum_sq = SumSquares(y_head, cfg.head_dim_v);
+    const float rms = std::sqrt(sum_sq / cfg.head_dim_v + cfg.norm_eps);
+    const float inv_rms = 1.0f / rms;
+    ApplyRmsNormGate(y_head, cfg.norm_weight, cfg.z_head, inv_rms, cfg.head_dim_v, cfg.use_fast_silu);
     return true;
 }
 

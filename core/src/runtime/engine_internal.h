@@ -335,6 +335,8 @@ struct Request {
     uint64_t moe_forward_ns = 0;
     uint64_t shared_expert_ns = 0;
     uint64_t quant_matmul_ns = 0;
+    uint64_t ssm_conv1d_ns = 0;
+    uint64_t ssm_delta_ns = 0;
     uint64_t kv_update_ns = 0;
     uint64_t sample_ns = 0;
     uint64_t graph_cache_hit_count = 0;
@@ -354,6 +356,8 @@ struct Request {
     int attention_path_hal = 0;
     int moe_task_count = 0;
     int selected_expert_count = 0;
+    int ssm_conv1d_calls = 0;
+    int ssm_delta_calls = 0;
     int first_sampled_token_id = -1;
     int first_visible_token_id = -1;
     DecodeFinishCause decode_finish_cause = DecodeFinishCause::Unknown;
@@ -453,6 +457,8 @@ struct Request {
         moe_forward_ns = 0;
         shared_expert_ns = 0;
         quant_matmul_ns = 0;
+        ssm_conv1d_ns = 0;
+        ssm_delta_ns = 0;
         kv_update_ns = 0;
         sample_ns = 0;
         graph_cache_hit_count = 0;
@@ -472,6 +478,8 @@ struct Request {
         attention_path_hal = 0;
         moe_task_count = 0;
         selected_expert_count = 0;
+        ssm_conv1d_calls = 0;
+        ssm_delta_calls = 0;
         first_sampled_token_id = -1;
         first_visible_token_id = -1;
         decode_finish_cause = DecodeFinishCause::Unknown;

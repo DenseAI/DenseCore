@@ -178,10 +178,6 @@ bool ResolveSamplingLogitsColumnForRequestImpl(int token_offset, int processed_c
     if (output_columns <= 0) {
         return fail("output tensor must expose at least one column");
     }
-    const int last_token_idx = token_offset + processed_count - 1;
-    if (last_token_idx < token_offset || last_token_idx >= output_columns) {
-        return fail("sampling logits column is out of bounds for output tensor");
-    }
     if (sampled_from_prefill) {
         if (remaining_prompt_tokens <= 0) {
             return fail("prefill sampling requires positive remaining prompt tokens");
@@ -192,6 +188,14 @@ bool ResolveSamplingLogitsColumnForRequestImpl(int token_offset, int processed_c
         if (n_past_after != n_past_before + processed_count) {
             return fail("prefill sampling observed inconsistent n_past progression");
         }
+    }
+    const int last_token_idx = token_offset + processed_count - 1;
+    if (sampled_from_prefill && output_columns == 1) {
+        *out_last_token_idx = 0;
+        return true;
+    }
+    if (last_token_idx < token_offset || last_token_idx >= output_columns) {
+        return fail("sampling logits column is out of bounds for output tensor");
     }
     *out_last_token_idx = last_token_idx;
     return true;
@@ -303,22 +307,44 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
         model->hparams.n_experts <= 0) {
         return -1;
     }
-    const densecore::env::RuntimeToggleMode mode = densecore::env::ParseRuntimeToggleMode(
-        "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS", densecore::env::RuntimeToggleMode::Auto);
-    if (mode == densecore::env::RuntimeToggleMode::Off) {
-        return -1;
-    }
+    const auto default_chunk_tokens = []() {
+        return densecore::env::ParsePositiveEnvInt("DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS", 192);
+    };
     const int explicit_tokens = densecore::env::ParsePositiveEnvInt("DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS", 0);
     if (explicit_tokens > 0) {
         return explicit_tokens;
     }
-    if (mode == densecore::env::RuntimeToggleMode::On) {
-        return 256;
+    const char* env_value = std::getenv("DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS");
+    bool explicit_auto = false;
+    if (env_value && env_value[0] != '\0') {
+        const std::string lowered = densecore::env::AsciiLowerCopy(env_value);
+        if (lowered == "off" || lowered == "false" || lowered == "no") {
+            return -1;
+        }
+        if (lowered == "on" || lowered == "true" || lowered == "yes" || lowered == "force") {
+            return default_chunk_tokens();
+        }
+        explicit_auto = (lowered == "0" || lowered == "auto");
+    }
+    if (!explicit_auto) {
+        const densecore::env::RuntimeToggleMode mode = densecore::env::ParseRuntimeToggleMode(
+            "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS", densecore::env::RuntimeToggleMode::Auto);
+        if (mode == densecore::env::RuntimeToggleMode::Off) {
+            return -1;
+        }
+        if (mode == densecore::env::RuntimeToggleMode::On) {
+            return default_chunk_tokens();
+        }
     }
     const int prompt_tokens = !req->prompt_tokens_for_cache.empty()
                                   ? static_cast<int>(req->prompt_tokens_for_cache.size())
                                   : req->prompt_token_count;
-    return prompt_tokens >= 512 ? 256 : -1;
+    if (prompt_tokens <= 0) {
+        return default_chunk_tokens();
+    }
+    const int auto_min_tokens =
+        densecore::env::ParsePositiveEnvInt("DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS", 1536);
+    return prompt_tokens >= auto_min_tokens ? default_chunk_tokens() : -1;
 }
 
 int PrefillThreadOverride() {
@@ -2187,7 +2213,6 @@ void EngineLoop(EngineState* state) {
                     break;
                 }
             }
-
             InferenceConfig& infer_cfg = InferenceConfig::Instance();
             int active_threads = base_threads;
             const int decode_batch_size = static_cast<int>(batch_requests.size());
@@ -3328,6 +3353,8 @@ void EngineLoop(EngineState* state) {
                     req->moe_forward_ns += qwen36_profile.moe_forward_ns;
                     req->shared_expert_ns += qwen36_profile.shared_expert_ns;
                     req->quant_matmul_ns += qwen36_profile.quant_matmul_ns;
+                    req->ssm_conv1d_ns += qwen36_profile.ssm_conv1d_ns;
+                    req->ssm_delta_ns += qwen36_profile.ssm_delta_ns;
                     req->kv_update_ns += qwen36_profile.kv_update_ns;
                     req->sample_ns += qwen36_profile.sample_ns;
                     req->graph_cache_hit_count += qwen36_profile.graph_cache_hits;
@@ -3348,6 +3375,8 @@ void EngineLoop(EngineState* state) {
                     req->moe_task_count = std::max(req->moe_task_count, qwen36_profile.moe_task_count);
                     req->selected_expert_count =
                         std::max(req->selected_expert_count, qwen36_profile.selected_expert_count);
+                    req->ssm_conv1d_calls = std::max(req->ssm_conv1d_calls, qwen36_profile.ssm_conv1d_calls);
+                    req->ssm_delta_calls = std::max(req->ssm_delta_calls, qwen36_profile.ssm_delta_calls);
                 }
             }
             std::string moe_strict_failure;
