@@ -108,11 +108,11 @@ bool MoETopKRoute(const float* router_logits, int batch_size, int n_experts, int
                   MoERouteResult* result, MoERoutingWorkspace* ws);
 
 /**
- * @brief Select top-k experts using sigmoid routing (Gemma4 MoE style)
+ * @brief Select top-k experts using independent sigmoid routing
  *
  * Applies sigmoid independently to each logit (not softmax), selects top-k
  * by sigmoid score, and uses those scores directly as weights without renormalization.
- * This matches Gemma4's expert routing specification.
+ * Gemma4 does not use this path; it uses softmax top-k renormalization.
  *
  * @param router_logits [batch_size * n_experts] flat row-major logits
  * @param batch_size Number of tokens

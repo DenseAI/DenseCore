@@ -49,12 +49,16 @@ class ScopedEnvVar {
 TEST(LLMRuntimeConfigTest, WorkerRuntimeFlagsUseCentralizedParsing) {
     ScopedEnvVar runtime_path("DENSECORE_DEBUG_RUNTIME_PATH", "1");
     ScopedEnvVar disable_prefix("DENSECORE_DEBUG_DISABLE_PREFIX_CACHE_REUSE", "1");
+    ScopedEnvVar enable_qwen36_prefix("DENSECORE_QWEN36_ENABLE_PREFIX_CACHE_REUSE", "1");
+    ScopedEnvVar enable_qwen36_snapshot("DENSECORE_QWEN36_ENABLE_HYBRID_SSM_SNAPSHOT_RESTORE", "1");
     ScopedEnvVar prefill_threads("DENSECORE_DEBUG_PREFILL_THREADS", "7");
 
     const auto config = densecore::llm::config::LoadWorkerRuntimeConfig();
 
     EXPECT_TRUE(config.runtime_path_logging);
     EXPECT_TRUE(config.prefix_cache_reuse_disabled);
+    EXPECT_TRUE(config.qwen36_prefix_cache_reuse_enabled);
+    EXPECT_TRUE(config.qwen36_hybrid_ssm_snapshot_restore_enabled);
     EXPECT_EQ(config.prefill_thread_override, 7);
 }
 

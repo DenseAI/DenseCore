@@ -8,6 +8,11 @@ MoEUserData* AllocateMoEUserData(struct ggml_context* ctx_c) {
     if (!ctx_c) {
         return nullptr;
     }
+    if (ggml_get_no_alloc(ctx_c)) {
+        thread_local MoEUserData dry_run_storage;
+        dry_run_storage = MoEUserData{};
+        return &dry_run_storage;
+    }
     struct ggml_tensor* storage = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I8, sizeof(MoEUserData));
     if (!storage || !storage->data) {
         return nullptr;
@@ -20,6 +25,11 @@ static GLMDSAPackUserData* AllocateGLMDSAPackUserData(struct ggml_context* ctx_c
     if (!ctx_c) {
         return nullptr;
     }
+    if (ggml_get_no_alloc(ctx_c)) {
+        thread_local GLMDSAPackUserData dry_run_storage;
+        dry_run_storage = GLMDSAPackUserData{};
+        return &dry_run_storage;
+    }
     struct ggml_tensor* storage = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I8, sizeof(GLMDSAPackUserData));
     if (!storage || !storage->data) {
         return nullptr;
@@ -30,6 +40,11 @@ static GLMDSAPackUserData* AllocateGLMDSAPackUserData(struct ggml_context* ctx_c
 static HiddenSnapshotUserData* AllocateHiddenSnapshotUserData(struct ggml_context* ctx_c) {
     if (!ctx_c) {
         return nullptr;
+    }
+    if (ggml_get_no_alloc(ctx_c)) {
+        thread_local HiddenSnapshotUserData dry_run_storage;
+        dry_run_storage = HiddenSnapshotUserData{};
+        return &dry_run_storage;
     }
     struct ggml_tensor* storage = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I8, sizeof(HiddenSnapshotUserData));
     if (!storage || !storage->data) {
@@ -43,6 +58,11 @@ static Gemma4KVSummaryUserData* AllocateGemma4KVSummaryUserData(struct ggml_cont
     if (!ctx_c) {
         return nullptr;
     }
+    if (ggml_get_no_alloc(ctx_c)) {
+        thread_local Gemma4KVSummaryUserData dry_run_storage;
+        dry_run_storage = Gemma4KVSummaryUserData{};
+        return &dry_run_storage;
+    }
     struct ggml_tensor* storage = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I8, sizeof(Gemma4KVSummaryUserData));
     if (!storage || !storage->data) {
         return nullptr;
@@ -54,6 +74,11 @@ static Gemma4KVSummaryUserData* AllocateGemma4KVSummaryUserData(struct ggml_cont
 static SSMAlphaBetaProjectUserData* AllocateSSMAlphaBetaProjectUserData(struct ggml_context* ctx_c) {
     if (!ctx_c) {
         return nullptr;
+    }
+    if (ggml_get_no_alloc(ctx_c)) {
+        thread_local SSMAlphaBetaProjectUserData dry_run_storage;
+        dry_run_storage = SSMAlphaBetaProjectUserData{};
+        return &dry_run_storage;
     }
     struct ggml_tensor* storage = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I8, sizeof(SSMAlphaBetaProjectUserData));
     if (!storage || !storage->data) {
@@ -267,6 +292,8 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
         const char* env = std::getenv("DENSECORE_QWEN36_MOE_FORCE_SAFE_REFERENCE");
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
+    const densecore::models::DecoderLayerSpec* layer_spec =
+        densecore::models::ResolveDecoderLayerSpecForLayer(model, layer);
 
     for (size_t i = 0; i < n_experts; ++i) {
         ExpertWeights w;
@@ -275,8 +302,10 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
         w.w3 = {nullptr, 0};
         w.hidden_dim = 0;
         w.intermediate_dim = 0;
-        w.use_gelu_activation = densecore::models::IsGemma4MoEModel(model, layer);
-        w.force_safe_reference = model && model->arch_flags.is_gemma4 && w.use_gelu_activation;
+        w.use_gelu_activation =
+            layer_spec ? layer_spec->ffn.activation == densecore::models::DecoderActivation::GeluPytorchTanh
+                       : densecore::models::IsGemma4MoEModel(model, layer);
+        w.force_safe_reference = false;
         w.gate_up_tensor = layer->GetExpert(i, model_keys::kGemma4PackedGateUpExpert);
         w.w2_scale_tensor = layer->GetExpert(i, model_keys::kGemma4PackedDownScale);
         w.uses_canonical_gemma4_packed_layout = (w.gate_up_tensor != nullptr);
@@ -310,9 +339,6 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
             w.w3_int4 = make_int4_binding(gw3, w.hidden_dim, w.intermediate_dim);
         }
 
-        if (w.w2_scale_tensor) {
-            w.force_safe_reference = true;
-        }
         if (force_qwen36_moe_safe_reference && model && model->variant == ModelVariant::QWEN36 &&
             model->hparams.n_experts > 0) {
             w.force_safe_reference = true;
@@ -545,11 +571,11 @@ static void EnsureMoERebalanceThread(densecore::CpuBackend* backend) {
 }
 
 static void UpdateSchedulerExperts(const MoEUserData* ud, const densecore::moe::MoERouteResult& routing) {
-    if (!ud || !ud->scheduler || !ud->batch) {
+    if (!ud) {
         return;
     }
-    const BatchSpec* batch = ud->batch;
-    if (batch->seq_id.empty() || batch->scheduler_seq_ids.empty()) {
+    const BatchSpec* batch = GetCurrentBatch();
+    if (!batch || !batch->scheduler || batch->seq_id.empty() || batch->scheduler_seq_ids.empty()) {
         return;
     }
 
@@ -599,7 +625,7 @@ static void UpdateSchedulerExperts(const MoEUserData* ud, const densecore::moe::
             if (sched_seq_id < 0) {
                 continue;
             }
-            ud->scheduler->SetPredictedExperts(sched_seq_id, experts);
+            batch->scheduler->SetPredictedExperts(sched_seq_id, experts);
         }
         return;
     }
@@ -634,7 +660,7 @@ static void UpdateSchedulerExperts(const MoEUserData* ud, const densecore::moe::
             std::sort(experts.begin(), experts.end());
             experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
         }
-        ud->scheduler->SetPredictedExperts(sched_seq_id, experts);
+        batch->scheduler->SetPredictedExperts(sched_seq_id, experts);
     }
 }
 
@@ -848,23 +874,16 @@ static bool RouteMoEGemma4TopK(const struct ggml_tensor* gate_logits, const MoEU
                                                  n_experts, top_k)) {
         return false;
     }
-    // Gemma4 MoE uses sigmoid routing: sigmoid applied independently to each expert
-    // logit, with top-k selected by sigmoid score (weights not renormalized).
-    if (!densecore::moe::MoETopKRouteSigmoid(logits, batch_size, n_experts, top_k, routing, &ws)) {
+    // Gemma4/HF router uses softmax probabilities followed by top-k
+    // renormalization. The per-expert scale is represented as a down-projection
+    // sidecar in GGUF and is applied in the expert projection path, not as a
+    // second router-probability multiplier.
+    if (!densecore::moe::MoETopKRoute(logits, batch_size, n_experts, top_k, /*normalize_weights=*/true, routing,
+                                      &ws)) {
         return false;
     }
 
-    const struct ggml_tensor* per_expert_scale_t = ud->layer->Get(kGemma4RouterPerExpertScaleKey);
-    const float* per_expert_scale =
-        (per_expert_scale_t && per_expert_scale_t->type == GGML_TYPE_F32) ? reinterpret_cast<const float*>(per_expert_scale_t->data)
-                                                                          : nullptr;
-    const float scale = ud->model->moe_routed_scaling_factor;
     for (size_t i = 0; i < routing->weights.size(); ++i) {
-        const int expert_id = routing->expert_ids[i];
-        if (per_expert_scale && expert_id >= 0 && expert_id < n_experts) {
-            routing->weights[i] *= per_expert_scale[expert_id];
-        }
-        routing->weights[i] *= scale;
         routing->token_indices[i] = static_cast<int>(i / static_cast<size_t>(top_k));
     }
     return true;
@@ -928,19 +947,23 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
         (debug_stage_timing || collect_profile) ? std::chrono::steady_clock::now()
                                                 : std::chrono::steady_clock::time_point{};
     thread_local densecore::moe::MoERouteResult routing;
-    bool use_grouped_sigmoid_routing =
-        ud->model &&
-        (ud->model->arch_flags.is_glm_moe ||
-         (ud->model->variant == ModelVariant::QWEN36 && ud->model->moe_n_group > 1 && ud->model->moe_topk_group > 0));
+    const densecore::models::DecoderLayerSpec* layer_spec =
+        densecore::models::ResolveDecoderLayerSpecForLayer(ud->model, ud->layer);
+    densecore::models::DecoderMoERouter router =
+        layer_spec ? layer_spec->ffn.router : densecore::models::DecoderMoERouter::SoftmaxTopK;
+    bool use_grouped_sigmoid_routing = router == densecore::models::DecoderMoERouter::GroupedSigmoidTopK;
     if (ForceMoESoftmaxRouting()) {
         use_grouped_sigmoid_routing = false;
+        router = densecore::models::DecoderMoERouter::SoftmaxTopK;
     } else if (ForceMoEGroupedSigmoidRouting()) {
         use_grouped_sigmoid_routing = true;
+        router = densecore::models::DecoderMoERouter::GroupedSigmoidTopK;
     }
-    const bool routed = use_grouped_sigmoid_routing
-                            ? RouteMoEGroupedSigmoid(src1, ud, &routing)
-                        : densecore::models::IsGemma4MoEModel(ud->model, ud->layer) ? RouteMoEGemma4TopK(src1, ud, &routing)
-                                                                : RouteMoESoftmaxTopK(src1, ud, &routing);
+    const bool routed =
+        use_grouped_sigmoid_routing
+            ? RouteMoEGroupedSigmoid(src1, ud, &routing)
+            : (router == densecore::models::DecoderMoERouter::Gemma4SoftmaxTopK ? RouteMoEGemma4TopK(src1, ud, &routing)
+                                                                                : RouteMoESoftmaxTopK(src1, ud, &routing));
     if (!routed) {
         FailClosedMoECallback(dst, &g_moe_callback_routing_failure_count, "MoE routing failed");
         return;
@@ -993,7 +1016,8 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
         moe_profile.route_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(route_end - route_begin).count());
     }
-    ud->backend->ForwardMoE(ud->model, ud->layer, ud->layer_idx, ud->batch, t_input, routing, ud->experts,
+    const BatchSpec* active_batch = GetCurrentBatch();
+    ud->backend->ForwardMoE(ud->model, ud->layer, ud->layer_idx, active_batch, t_input, routing, ud->experts,
                             ud->n_experts, &t_output, moe_profile_ptr);
     if (collect_profile) {
         AddQwen36ProfileNs(

@@ -40,6 +40,15 @@ TEST(DecodeGraphCachePolicyTest, DenseTransformerModelsDoNotRequireRuntimeRebind
     EXPECT_FALSE(DoesDecodeGraphCacheRequireRuntimeRebind(&model));
 }
 
+TEST(DecodeGraphCachePolicyTest, Gemma4ModelsAreNotDecodeGraphCacheSafeYet) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+
+    EXPECT_FALSE(IsDecodeGraphCacheSafeForModel(&model));
+    EXPECT_FALSE(DoesDecodeGraphCacheRequireRuntimeRebind(&model));
+}
+
 namespace {
 
 TransformerModel MakeDecodeModel(bool gemma4) {

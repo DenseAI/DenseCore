@@ -37,6 +37,8 @@
       "inherits": "base-release",
       "binaryDir": "${sourceDir}/../build-c4a-perf",
       "cacheVariables": {
+        "DENSECORE_TARGET_C4A": "ON",
+        "DENSECORE_C4A_ENABLE_GGML_FASTKERNELS": "OFF",
         "DENSECORE_ARM_CORRECTNESS_FIRST": "OFF",
         "DENSECORE_ARM_MCPU": "neoverse-v2",
         "DENSECORE_LTO": "ON",

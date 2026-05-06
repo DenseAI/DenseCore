@@ -4,6 +4,7 @@
 #include <sstream>
 #include <utility>
 
+#include "densecore/models/decoder_model_spec.h"
 #include "densecore/models/model_descriptor.h"
 
 namespace densecore::models {
@@ -13,25 +14,53 @@ template <typename T, typename Predicate> bool AnyLayer(const std::vector<T>& va
     return std::any_of(values.begin(), values.end(), std::forward<Predicate>(predicate));
 }
 
-bool HasSharedGemma4KvSource(const TransformerModel* model) {
-    if (!model || model->gemma4_layer_kv_source.empty()) {
-        return false;
-    }
-    for (size_t i = 0; i < model->gemma4_layer_kv_source.size(); ++i) {
-        const int32_t source = model->gemma4_layer_kv_source[i];
-        if (source >= 0 && source != static_cast<int32_t>(i)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool HasPerLayerKvHeadVariability(const TransformerModel* model) {
-    if (!model || model->gemma4_layer_n_head_kv.empty()) {
+bool HasPerLayerKvHeadVariabilityFallback(const TransformerModel* model) {
+    if (!model || !model->layers.empty() || model->gemma4_layer_n_head_kv.empty()) {
         return false;
     }
     return AnyLayer(model->gemma4_layer_n_head_kv,
                     [model](int32_t n_head_kv) { return n_head_kv > 0 && n_head_kv != model->hparams.n_head_kv; });
+}
+
+bool AnyLayerSpec(const DecoderModelSpec* spec, bool (*predicate)(const DecoderLayerSpec&)) {
+    return spec && AnyLayer(spec->layers, predicate);
+}
+
+bool LayerReadsSharedKv(const DecoderLayerSpec& layer) {
+    return layer.attention.reads_shared_kv;
+}
+
+bool LayerUsesSlidingWindow(const DecoderLayerSpec& layer) {
+    return layer.attention.is_sliding_window;
+}
+
+bool LayerUsesHybridSsm(const DecoderLayerSpec& layer) {
+    return layer.attention.has_hybrid_ssm_mixer;
+}
+
+bool LayerUsesMoe(const DecoderLayerSpec& layer) {
+    return layer.ffn.is_moe;
+}
+
+bool LayerRequiresQNorm(const DecoderLayerSpec& layer) {
+    return layer.attention.requires_q_norm;
+}
+
+bool LayerRequiresKNorm(const DecoderLayerSpec& layer) {
+    return layer.attention.requires_k_norm;
+}
+
+bool LayerRequiresVNorm(const DecoderLayerSpec& layer) {
+    return layer.attention.requires_v_norm;
+}
+
+bool LayerHasPerLayerKvHeadCount(const TransformerModel* model, const DecoderLayerSpec& layer) {
+    return model && layer.attention.kv_head_count > 0 && layer.attention.kv_head_count != model->hparams.n_head_kv;
+}
+
+bool LayerRequiresSpecialResidualScaling(const DecoderLayerSpec& layer) {
+    return layer.ffn.has_shared_dense_branch || layer.ffn.has_pre_moe_norm || layer.ffn.has_post_shared_norm ||
+           layer.ffn.has_post_moe_norm || layer.ffn.has_post_ffn_norm;
 }
 
 std::vector<GraphFamily> CandidateFamilies(const GraphFamilyResolution& resolution) {
@@ -108,12 +137,13 @@ ModelGraphCapabilities ResolveModelGraphCapabilities(const TransformerModel* mod
     ModelArchFlags effective_flags = descriptor.default_flags;
     effective_flags.requires_q_norm = effective_flags.requires_q_norm || model->arch_flags.requires_q_norm;
     effective_flags.requires_k_norm = effective_flags.requires_k_norm || model->arch_flags.requires_k_norm;
-    effective_flags.is_hybrid_ssm = effective_flags.is_hybrid_ssm || model->arch_flags.is_hybrid_ssm;
-    effective_flags.is_glm_moe = effective_flags.is_glm_moe || model->arch_flags.is_glm_moe;
-    effective_flags.is_glm_dsa = effective_flags.is_glm_dsa || model->arch_flags.is_glm_dsa;
     effective_flags.is_gemma4 = effective_flags.is_gemma4 || model->arch_flags.is_gemma4;
-    effective_flags.uses_unit_offset_rms_norm =
-        effective_flags.uses_unit_offset_rms_norm || model->arch_flags.uses_unit_offset_rms_norm;
+    std::shared_ptr<const DecoderModelSpec> scratch_spec;
+    const DecoderModelSpec* decoder_spec = GetDecoderModelSpec(model);
+    if (!decoder_spec) {
+        scratch_spec = MakeDecoderModelSpec(model);
+        decoder_spec = scratch_spec.get();
+    }
 
     capabilities.arch = model->arch;
     capabilities.variant = descriptor.variant;
@@ -134,18 +164,28 @@ ModelGraphCapabilities ResolveModelGraphCapabilities(const TransformerModel* mod
     default: capabilities.topology = GraphTopology::DECODER_ONLY; break;
     }
     capabilities.has_dense_attention = capabilities.topology == GraphTopology::DECODER_ONLY;
-    capabilities.has_sliding_window_attention =
-        effective_flags.is_gemma4 &&
-        AnyLayer(model->gemma4_layer_is_sliding, [](int32_t enabled) { return enabled != 0; });
-    capabilities.has_shared_kv_source = effective_flags.is_gemma4 && HasSharedGemma4KvSource(model);
-    capabilities.has_hybrid_ssm_mixer = effective_flags.is_hybrid_ssm;
-    capabilities.has_moe = model->hparams.n_experts > 0;
-    capabilities.requires_q_norm = effective_flags.requires_q_norm;
-    capabilities.requires_k_norm = effective_flags.requires_k_norm;
-    capabilities.requires_v_norm = effective_flags.is_gemma4;
-    capabilities.has_per_layer_kv_head_variability = HasPerLayerKvHeadVariability(model);
+    capabilities.has_sliding_window_attention = decoder_spec && (decoder_spec->has_sliding_window_attention ||
+                                                                 AnyLayerSpec(decoder_spec, LayerUsesSlidingWindow));
+    capabilities.has_shared_kv_source =
+        decoder_spec && (decoder_spec->has_shared_kv || AnyLayerSpec(decoder_spec, LayerReadsSharedKv));
+    capabilities.has_hybrid_ssm_mixer =
+        decoder_spec && (decoder_spec->has_hybrid_ssm_mixer || AnyLayerSpec(decoder_spec, LayerUsesHybridSsm));
+    capabilities.has_moe = decoder_spec && (decoder_spec->has_moe || AnyLayerSpec(decoder_spec, LayerUsesMoe));
+    capabilities.requires_q_norm = AnyLayerSpec(decoder_spec, LayerRequiresQNorm) ||
+                                   (decoder_spec && decoder_spec->layers.empty() && effective_flags.requires_q_norm);
+    capabilities.requires_k_norm = AnyLayerSpec(decoder_spec, LayerRequiresKNorm) ||
+                                   (decoder_spec && decoder_spec->layers.empty() && effective_flags.requires_k_norm);
+    capabilities.requires_v_norm = AnyLayerSpec(decoder_spec, LayerRequiresVNorm) ||
+                                   (decoder_spec && decoder_spec->layers.empty() && effective_flags.is_gemma4);
+    capabilities.has_per_layer_kv_head_variability =
+        (decoder_spec &&
+         AnyLayer(decoder_spec->layers,
+                  [model](const DecoderLayerSpec& layer) { return LayerHasPerLayerKvHeadCount(model, layer); })) ||
+        HasPerLayerKvHeadVariabilityFallback(model);
     capabilities.requires_special_attention_mask = capabilities.has_sliding_window_attention;
-    capabilities.requires_special_residual_scaling = effective_flags.is_gemma4;
+    capabilities.requires_special_residual_scaling =
+        (decoder_spec && AnyLayerSpec(decoder_spec, LayerRequiresSpecialResidualScaling)) ||
+        (decoder_spec && decoder_spec->layers.empty() && effective_flags.is_gemma4);
 
     // Multimodal decoder projection is reserved for an explicit future load
     // path that exposes projector semantics in TransformerModel metadata.

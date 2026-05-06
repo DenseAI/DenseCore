@@ -845,7 +845,7 @@ bool PopulatePositionTensor(TransformerModel* model, const BatchSpec& batch, str
         const int32_t p = batch.pos[static_cast<size_t>(i)];
         for (int j = 0; j < ids_per_token; ++j) {
             const size_t offset = static_cast<size_t>(j) * static_cast<size_t>(n_tokens) + static_cast<size_t>(i);
-            dst[offset] = p;
+            dst[offset] = (ids_per_token == GGML_MROPE_SECTIONS && j == 3) ? 0 : p;
         }
     }
 

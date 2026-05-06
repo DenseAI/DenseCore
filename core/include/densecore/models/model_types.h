@@ -89,6 +89,9 @@ namespace densecore {
 namespace simd {
 struct RoPETable;
 }  // namespace simd
+namespace models {
+struct DecoderModelSpec;
+}  // namespace models
 }  // namespace densecore
 
 // ============================================================================
@@ -442,6 +445,7 @@ struct TransformerModel {
     struct ggml_tensor* output;
 
     std::vector<TransformerLayer> layers;
+    std::shared_ptr<const densecore::models::DecoderModelSpec> decoder_spec;
 
     // Context & Backend
     struct ggml_context* ctx_w = nullptr;      // weight context

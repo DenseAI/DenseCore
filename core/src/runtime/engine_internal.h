@@ -892,6 +892,7 @@ struct EngineState {
         size_t env_extra_bytes = 0;
         size_t total_bytes = 0;
         size_t effective_seq_len = 0;
+        size_t effective_query_len = 0;
         size_t effective_num_seqs = 0;
         size_t chunk_token_hint = 0;
     };
@@ -921,7 +922,7 @@ struct EngineState {
 
         constexpr size_t MB = 1024ULL * 1024ULL;
         constexpr size_t HARD_MIN_MB = 128;
-        constexpr size_t HARD_MAX_MB = 24ULL * 1024ULL;  // 24 GB safety cap
+        constexpr size_t HARD_MAX_MB = 48ULL * 1024ULL;
         auto parse_positive_ull = [](const char* text) -> unsigned long long {
             if (!text || text[0] == '\0') return 0;
             errno = 0;
@@ -990,53 +991,80 @@ struct EngineState {
         const size_t runtime_max_seq_len = static_cast<size_t>(parse_env_int("DENSECORE_MAX_SEQ_LEN", 4096, 1));
         const size_t runtime_max_num_seqs = static_cast<size_t>(parse_env_int("DENSECORE_MAX_NUM_SEQS", 4, 1));
         const size_t model_max_seq_len = static_cast<size_t>(std::max<int32_t>(1, hp.n_ctx));
-        const size_t hinted_seq_len =
+        const bool has_request_shape_hint = seq_len_hint > 0 || chunk_token_hint > 0 || num_seqs_hint > 0;
+        const size_t default_seq_len = std::max<size_t>(1, std::min<size_t>(model_max_seq_len, runtime_max_seq_len));
+        const size_t request_key_len =
             std::max<size_t>(1, std::min<size_t>(model_max_seq_len, std::max(seq_len_hint, chunk_token_hint)));
-        const size_t effective_seq_len =
-            std::max<size_t>(1, std::max(std::min<size_t>(model_max_seq_len, runtime_max_seq_len), hinted_seq_len));
-        const size_t effective_num_seqs = std::max<size_t>(1, std::max(runtime_max_num_seqs, num_seqs_hint));
+        const size_t effective_seq_len = has_request_shape_hint ? request_key_len : default_seq_len;
+        const size_t effective_query_len =
+            has_request_shape_hint
+                ? std::max<size_t>(
+                      1, std::min<size_t>(model_max_seq_len, chunk_token_hint > 0 ? chunk_token_hint : request_key_len))
+                : default_seq_len;
+        const size_t effective_num_seqs = std::max<size_t>(
+            1, has_request_shape_hint ? (num_seqs_hint > 0 ? num_seqs_hint : 1) : runtime_max_num_seqs);
         estimate.effective_seq_len = effective_seq_len;
+        estimate.effective_query_len = effective_query_len;
         estimate.effective_num_seqs = effective_num_seqs;
         estimate.chunk_token_hint = chunk_token_hint;
 
         // The graph context backs the persistent GGML compute pool used while
         // rebuilding and executing the active graph. It must cover:
-        //   - per-layer hidden-state / QKV / FFN activations (O(n_embd * seq))
-        //   - attention score / probability scratch (O(n_head * seq^2))
+        //   - per-layer hidden-state / QKV / FFN activations (O(n_embd * query))
+        //   - attention score / probability scratch (O(n_head * query * key))
         //   - a few live residual/output buffers outside the layer loop
         //
         // The prior estimate only used O(n_head * seq), which under-sized the
         // pool for decoder attention graphs and caused ggml_new_object() aborts
         // once real OpenVLA/llm_universal paths exercised longer prompts.
-        const size_t token_working_set = effective_num_seqs * effective_seq_len;
-        const size_t hidden_working_set = static_cast<size_t>(std::max<int32_t>(1, hp.n_embd)) * token_working_set;
-        const size_t hidden_bytes = hidden_working_set * sizeof(float);
+        //
+        // For request-shaped graph builds, do not inflate a single decode step
+        // back to runtime max batch/sequence. Decode has long K/V history but a
+        // tiny query chunk, so using seq^2 here over-materializes the pool by
+        // tens of GB on Gemma4 MoE long-context serving.
+        const size_t query_token_working_set = effective_num_seqs * effective_query_len;
+        const size_t key_token_working_set = effective_num_seqs * effective_seq_len;
+        const int n_head = std::max<int32_t>(1, hp.n_head);
+        const int n_head_kv = std::max<int32_t>(1, hp.n_head_kv > 0 ? hp.n_head_kv : hp.n_head);
+        const int head_dim_k = std::max<int32_t>(1, hp.n_embd_head_k > 0 ? hp.n_embd_head_k : hp.n_embd / n_head);
+        const int head_dim_v = std::max<int32_t>(1, hp.n_embd_head_v > 0 ? hp.n_embd_head_v : head_dim_k);
+        const size_t kv_history_width = static_cast<size_t>(head_dim_k + head_dim_v) * static_cast<size_t>(n_head_kv);
+        const size_t hidden_query_working_set =
+            static_cast<size_t>(std::max<int32_t>(1, hp.n_embd)) * query_token_working_set;
+        const size_t kv_history_working_set = kv_history_width * key_token_working_set;
+        const size_t hidden_query_bytes = hidden_query_working_set * sizeof(float);
+        const size_t kv_history_bytes = kv_history_working_set * sizeof(float);
 
         const size_t attention_score_elems =
-            static_cast<size_t>(std::max<int32_t>(1, hp.n_head)) * token_working_set * effective_seq_len;
+            static_cast<size_t>(n_head) * effective_num_seqs * effective_query_len * effective_seq_len;
         const size_t attention_score_bytes = attention_score_elems * sizeof(float);
+        const size_t attention_score_buffer_count =
+            (model->arch_flags.is_gemma4 && effective_query_len > 1) ? 3ULL : 2ULL;
 
         // Conservative layer-local upper bound:
-        //   - ~7 hidden-sized buffers (norm/Q/K/V/attn_out/ffn/residual staging)
-        //   - ~2 score-sized buffers (scores + probs/mask-expanded scratch)
-        const size_t per_layer_activation_bytes = hidden_bytes * 7 + attention_score_bytes * 2;
+        //   - ~7 query hidden-sized buffers (norm/Q/attn_out/ffn/residual staging)
+        //   - K/V history materialization at the actual KV width, not n_embd
+        //   - score-sized buffers (scores + probs/mask-expanded scratch; Gemma4
+        //     softcap attention keeps one extra score-shaped stage live)
+        const size_t per_layer_activation_bytes =
+            hidden_query_bytes * 7 + kv_history_bytes + attention_score_bytes * attention_score_buffer_count;
         const size_t base_size = static_cast<size_t>(std::max<int32_t>(1, hp.n_layer)) * per_layer_activation_bytes;
         estimate.base_graph_working_set_bytes = base_size;
 
         // Residual/output/lm-head staging that can remain live across layers.
-        size_t overhead = hidden_bytes * 4 + attention_score_bytes / 2;
+        size_t overhead = hidden_query_bytes * 4 + kv_history_bytes + attention_score_bytes / 2;
 
         // Hybrid SSM / Gemma4 graphs need extra room for recurrent state views and
         // architecture-specific branch tensors, but still nowhere near full-model memory.
         if (model->arch_flags.is_hybrid_ssm) {
             estimate.hybrid_ssm_extra_bytes +=
-                static_cast<size_t>(std::max(1, model->ssm_inner_size)) * token_working_set * sizeof(float) / 2;
-            const size_t chunk_working_tokens = std::max<size_t>(chunk_token_hint, effective_seq_len);
+                static_cast<size_t>(std::max(1, model->ssm_inner_size)) * query_token_working_set * sizeof(float) / 2;
+            const size_t chunk_working_tokens = std::max<size_t>(chunk_token_hint, effective_query_len);
             estimate.hybrid_ssm_extra_bytes +=
                 static_cast<size_t>(std::max(1, model->ssm_inner_size)) * chunk_working_tokens * sizeof(float) / 4;
         }
         if (model->arch_flags.is_gemma4) {
-            overhead += hidden_bytes;
+            overhead += hidden_query_bytes + kv_history_bytes;
         }
 
         size_t total = base_size + overhead + estimate.hybrid_ssm_extra_bytes;
@@ -1057,6 +1085,14 @@ struct EngineState {
                 std::clamp<size_t>(std::max<size_t>(128, (effective_seq_len / 1024ULL) * 64ULL), 128ULL, 1024ULL);
             estimate.long_context_safety_pad_bytes += long_prompt_pad_mb * MB;
         }
+        if (model->arch_flags.is_gemma4 && effective_query_len > 512ULL) {
+            const size_t gemma4_long_prefill_pad_mb =
+                std::clamp<size_t>(std::max<size_t>(1280, (effective_query_len / 1024ULL) * 256ULL), 1280ULL, 2048ULL);
+            estimate.long_context_safety_pad_bytes += gemma4_long_prefill_pad_mb * MB;
+        }
+        if (model->arch_flags.is_gemma4 && effective_query_len >= 128ULL) {
+            estimate.long_context_safety_pad_bytes += static_cast<size_t>(256) * MB;
+        }
         const size_t extra_headroom_mb =
             parse_env_mb("DENSECORE_GRAPH_CTX_EXTRA_MB", /*default_mb=*/64, /*min_mb=*/0, HARD_MAX_MB);
         estimate.env_extra_bytes = extra_headroom_mb * MB;
@@ -1067,7 +1103,7 @@ struct EngineState {
         // Defaults are chosen to keep previous behavior for small models while
         // allowing larger graphs (e.g., Qwen3-4B batch=4 decode) to avoid 2GB
         // hard-cap OOM.
-        size_t recommended_min_mb = model->arch_flags.is_gemma4 ? 384 : (model->arch_flags.is_hybrid_ssm ? 320 : 256);
+        size_t recommended_min_mb = model->arch_flags.is_gemma4 ? 1536 : (model->arch_flags.is_hybrid_ssm ? 320 : 256);
         if (!model->arch_flags.is_gemma4 && !model->arch_flags.is_hybrid_ssm &&
             std::max<int32_t>(1, hp.n_layer) >= 24 && std::max<int32_t>(1, hp.n_embd) >= 3072) {
             recommended_min_mb = std::max(recommended_min_mb, static_cast<size_t>(2560));

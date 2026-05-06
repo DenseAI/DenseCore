@@ -29,6 +29,7 @@
 #endif
 
 #include "densecore/backend/apple/apple_silicon.h"
+#include "densecore/models/decoder_model_spec.h"
 #include "densecore/models/qwen35_ssm_math.h"
 #include "densecore/runtime/dtype_utils.h"
 #include "models/gemma4_packed_expert_layout.h"
@@ -284,6 +285,7 @@ static TransformerModel* CreateMockModel() {
         model->layers[i].Set(model_keys::kFfnUp, create_tensor(model->hparams.n_embd, model->hparams.n_embd * 4));
     }
 
+    model->decoder_spec = densecore::models::MakeDecoderModelSpec(model);
     return model;
 }
 #endif  // DENSECORE_TEST_BUILD
@@ -752,6 +754,12 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
     // Load RoPE parameters
     get_f32("attention.scale", model->hparams.f_attention_scale);
+    if (model->arch_flags.is_gemma4 && !(model->hparams.f_attention_scale > 0.0f)) {
+        // Gemma4 uses self.scaling = 1.0. When GGUF omits attention.scale,
+        // keep the fast attention kernels on the same no-pre-scale semantics
+        // instead of falling back to the generic 1/sqrt(head_dim) scale.
+        model->hparams.f_attention_scale = 1.0f;
+    }
     get_f32("rope.freq_base", model->hparams.rope_freq_base);
     get_f32("rope.freq_scale", model->hparams.rope_freq_scale);
     get_i32_arr4("rope.dimension_sections", model->hparams.rope_sections);
@@ -1689,6 +1697,13 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                                       "mlp_layernorm.weight"}));
         model->layers[i].Set(model_keys::kPostAttnNorm, get_layer_tensor_any(i, {"post_attention_norm.weight",
                                                                                  "post_attention_layernorm.weight"}));
+        if (model->arch_flags.is_gemma4) {
+            // Gemma4 GGUF uses blk.N.post_attention_norm.weight for the FFN
+            // post norm (llama.cpp ffn_post_norm), not for an attention-output
+            // norm. Applying it before the attention residual silently corrupts
+            // logits from the first sampled token.
+            model->layers[i].Set(model_keys::kPostAttnNorm, nullptr);
+        }
         // Fallback: Qwen3.5 uses post_attention_norm instead of ffn_norm
         if (!model->layers[i].Get(model_keys::kFfnNorm) && model->layers[i].Get(model_keys::kPostAttnNorm)) {
             model->layers[i].Set(model_keys::kFfnNorm, model->layers[i].Get(model_keys::kPostAttnNorm));
@@ -1706,14 +1721,15 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                                                           "mlp.up_proj.weight", "up_proj.weight"}));
         model->layers[i].Set(model_keys::kFfnSharedGate,
                              get_layer_tensor_any(i, {"ffn_gate_inp_shexp.weight", "shared_expert_gate.weight"}));
-        model->layers[i].Set(kGemma4RouterScaleKey, get_layer_tensor_any(i, {"router.scale"}));
+        model->layers[i].Set(kGemma4RouterScaleKey, get_layer_tensor_any(i, {"router.scale", "ffn_gate_inp.scale"}));
         model->layers[i].Set(kGemma4RouterPerExpertScaleKey, get_layer_tensor_any(i, {"router.per_expert_scale"}));
         model->layers[i].Set(kGemma4PreMoeNormKey, get_layer_tensor_any(i, {"pre_feedforward_layernorm_2.weight"}));
         model->layers[i].Set(kGemma4PostSharedNormKey,
                              get_layer_tensor_any(i, {"post_feedforward_layernorm_1.weight"}));
         model->layers[i].Set(kGemma4PostMoeNormKey, get_layer_tensor_any(i, {"post_feedforward_layernorm_2.weight"}));
         model->layers[i].Set(kGemma4PostFfnNormKey,
-                             get_layer_tensor_any(i, {"post_feedforward_layernorm.weight", "post_ffw_norm.weight"}));
+                             get_layer_tensor_any(i, {"post_feedforward_layernorm.weight", "post_attention_norm.weight",
+                                                      "post_ffw_norm.weight"}));
         model->layers[i].Set(model_keys::kGemma4PerLayerInputGate, get_layer_tensor_any(i, {"inp_gate.weight"}));
         model->layers[i].Set(model_keys::kGemma4PerLayerProjection, get_layer_tensor_any(i, {"proj.weight"}));
         model->layers[i].Set(model_keys::kGemma4PostPerLayerInputNorm, get_layer_tensor_any(i, {"post_norm.weight"}));
@@ -1938,18 +1954,32 @@ TransformerModel* LoadGGUFModel(const char* path) {
             const bool has_canonical_gemma4_layout =
                 model->arch_flags.is_gemma4 && densecore::gemma4::InferPackedExpertLayout(
                                                    packed_gate_up, packed_down, &packed_layout, &packed_layout_reason);
+            if (model->arch_flags.is_gemma4 && !has_canonical_gemma4_layout) {
+                std::cerr << "[DenseCore] FATAL: unsupported Gemma4 packed MoE layout at layer " << i << ": "
+                          << packed_layout_reason << std::endl;
+                return nullptr;
+            }
+            if (model->arch_flags.is_gemma4 && !packed_down_scale) {
+                std::cerr << "[DenseCore] FATAL: missing Gemma4 packed MoE down-scale sidecar at layer " << i
+                          << std::endl;
+                return nullptr;
+            }
             int packed_experts = 0;
             if (has_canonical_gemma4_layout) {
                 packed_experts = packed_layout.num_experts;
-            } else if (packed_gate_up->ne[2] > 0) {
+            } else if (packed_gate_up->ne[2] > 1) {
                 packed_experts = static_cast<int>(packed_gate_up->ne[2]);
-            } else if (packed_gate_up->ne[3] > 0) {
+            } else if (packed_gate_up->ne[3] > 1) {
                 packed_experts = static_cast<int>(packed_gate_up->ne[3]);
             }
             if (model->hparams.n_experts == 0 && packed_experts > 0) {
                 model->hparams.n_experts = static_cast<uint32_t>(packed_experts);
             }
             const int expert_count = std::min<int>(packed_experts, static_cast<int>(model->hparams.n_experts));
+            if (model->arch_flags.is_gemma4 && expert_count > 0 && !layer.Get(model_keys::kMoeGate)) {
+                std::cerr << "[DenseCore] FATAL: missing Gemma4 MoE router weight for packed layer " << i << std::endl;
+                return nullptr;
+            }
             if (expert_count > 0 && layer.Get(model_keys::kMoeGate)) {
                 layer.is_moe = true;
                 used_packed_expert_slices = true;
@@ -1963,7 +1993,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                 const_cast<struct ggml_tensor*>(packed_down),
                                 const_cast<struct ggml_tensor*>(packed_down_scale), expert_idx, &expert_views,
                                 &packed_view_reason)) {
-                            continue;
+                            std::cerr << "[DenseCore] FATAL: Gemma4 packed MoE view creation failed at layer " << i
+                                      << " expert " << expert_idx << ": " << packed_view_reason << std::endl;
+                            return nullptr;
                         }
                         layer.SetExpert(static_cast<size_t>(expert_idx), model_keys::kGemma4PackedGateUpExpert,
                                         expert_views.gate_up);
@@ -1978,22 +2010,39 @@ TransformerModel* LoadGGUFModel(const char* path) {
                         const auto gate_it = model->int4_weight_bindings.find(packed_gate_up);
                         if (gate_it != model->int4_weight_bindings.end()) {
                             TransformerModel::Int4WeightBinding gate_binding{};
-                            if (densecore::gemma4::ResolvePackedProjectionBinding(
-                                    vctx, gate_it->second, expert_views.gate_view, &gate_binding)) {
+                            std::string gate_binding_reason;
+                            if (densecore::gemma4::ResolvePackedProjectionBinding(vctx, gate_it->second,
+                                                                                  expert_views.gate_view, &gate_binding,
+                                                                                  &gate_binding_reason)) {
                                 model->int4_weight_bindings[expert_views.gate] = gate_binding;
+                            } else {
+                                std::cerr << "[DenseCore] FATAL: Gemma4 gate INT4 binding failed at layer " << i
+                                          << " expert " << expert_idx << ": " << gate_binding_reason << std::endl;
+                                return nullptr;
                             }
                             TransformerModel::Int4WeightBinding up_binding{};
-                            if (densecore::gemma4::ResolvePackedProjectionBinding(vctx, gate_it->second,
-                                                                                  expert_views.up_view, &up_binding)) {
+                            std::string up_binding_reason;
+                            if (densecore::gemma4::ResolvePackedProjectionBinding(
+                                    vctx, gate_it->second, expert_views.up_view, &up_binding, &up_binding_reason)) {
                                 model->int4_weight_bindings[expert_views.up] = up_binding;
+                            } else {
+                                std::cerr << "[DenseCore] FATAL: Gemma4 up INT4 binding failed at layer " << i
+                                          << " expert " << expert_idx << ": " << up_binding_reason << std::endl;
+                                return nullptr;
                             }
                         }
                         const auto down_it = model->int4_weight_bindings.find(packed_down);
                         if (down_it != model->int4_weight_bindings.end()) {
                             TransformerModel::Int4WeightBinding down_binding{};
-                            if (densecore::gemma4::ResolvePackedProjectionBinding(
-                                    vctx, down_it->second, expert_views.down_view, &down_binding)) {
+                            std::string down_binding_reason;
+                            if (densecore::gemma4::ResolvePackedProjectionBinding(vctx, down_it->second,
+                                                                                  expert_views.down_view, &down_binding,
+                                                                                  &down_binding_reason)) {
                                 model->int4_weight_bindings[expert_views.down] = down_binding;
+                            } else {
+                                std::cerr << "[DenseCore] FATAL: Gemma4 down INT4 binding failed at layer " << i
+                                          << " expert " << expert_idx << ": " << down_binding_reason << std::endl;
+                                return nullptr;
                             }
                         }
                         continue;
@@ -2327,10 +2376,10 @@ TransformerModel* LoadGGUFModel(const char* path) {
             const uint32_t meta_value_len =
                 is_sliding ? model->gemma4_value_length_swa : model->gemma4_value_length_full;
             if (meta_key_len > 0) {
-                max_head_k = std::max(max_head_k, meta_key_len / layer_n_head_kv);
+                max_head_k = std::max(max_head_k, meta_key_len);
             }
             if (meta_value_len > 0) {
-                max_head_v = std::max(max_head_v, meta_value_len / layer_n_head_kv);
+                max_head_v = std::max(max_head_v, meta_value_len);
             }
         }
         if (max_head_k > 0) model->hparams.n_embd_head_k = max_head_k;
@@ -3314,6 +3363,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
 #endif
 
+    model->decoder_spec = densecore::models::MakeDecoderModelSpec(model);
     std::cout << "[DenseCore] Model loaded successfully" << std::endl;
     return model;
 }
@@ -3849,6 +3899,7 @@ TransformerModel* LoadModelFromExternal(const TransformerHParams& hparams, const
         model->layers[i].Set(model_keys::kFfnUp, get_tensor(layer_prefix + "ffn_up.weight"));
     }
 
+    model->decoder_spec = densecore::models::MakeDecoderModelSpec(model);
     std::cout << "[DenseCore] SmartLoader: Model loaded successfully (" << ctx_size / 1024 << " KB header)."
               << std::endl;
     return model;

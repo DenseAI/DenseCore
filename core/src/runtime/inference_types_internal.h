@@ -61,8 +61,6 @@ struct MoEUserData {
     int layer_idx = -1;
     int k;  // Number of experts to use (top-k)
     densecore::CpuBackend* backend;
-    const BatchSpec* batch;
-    densecore::Scheduler* scheduler;
     const densecore::CpuBackend::ExpertWeights* experts = nullptr;
     int n_experts = 0;
     bool experts_registered = false;

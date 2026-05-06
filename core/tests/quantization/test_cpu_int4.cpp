@@ -7,10 +7,13 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <gtest/gtest.h>
 #include <random>
+#include <string>
 #include <vector>
 
+#include "densecore/backend/cpu_backend.h"
 #include "kernels/hwy/hwy_kernels.h"
 #include "densecore/simd/simd_ops.h"
 using namespace densecore::hwy_kernels;
@@ -18,6 +21,51 @@ using namespace densecore::hwy_kernels;
 namespace densecore {
 namespace kernels {
 namespace {
+
+class ScopedEnvVar {
+public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name ? name : "") {
+        const char* prev = std::getenv(name_.c_str());
+        if (prev) {
+            had_prev_ = true;
+            prev_value_ = prev;
+        }
+        if (value) {
+#if defined(_WIN32)
+            _putenv_s(name_.c_str(), value);
+#else
+            setenv(name_.c_str(), value, 1);
+#endif
+        } else {
+#if defined(_WIN32)
+            _putenv_s(name_.c_str(), "");
+#else
+            unsetenv(name_.c_str());
+#endif
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (had_prev_) {
+#if defined(_WIN32)
+            _putenv_s(name_.c_str(), prev_value_.c_str());
+#else
+            setenv(name_.c_str(), prev_value_.c_str(), 1);
+#endif
+        } else {
+#if defined(_WIN32)
+            _putenv_s(name_.c_str(), "");
+#else
+            unsetenv(name_.c_str());
+#endif
+        }
+    }
+
+private:
+    std::string name_;
+    bool had_prev_ = false;
+    std::string prev_value_;
+};
 
 // =============================================================================
 // Reference Scalar Implementation (for validation)
@@ -160,6 +208,53 @@ void GemvInt4DualFusedSilu_Reference(float* output, const float* input, const ui
     for (int n = n_start; n < n_end; ++n) {
         const float g = gate[n];
         output[n] = (g / (1.0f + std::exp(-g))) * up[n];
+    }
+}
+
+uint8_t PackSignedInt4(int8_t low, int8_t high) {
+    return static_cast<uint8_t>((low & 0x0F) | ((high & 0x0F) << 4));
+}
+
+void FillRandomInt4Problem(int M, int K, int N, int group_size, uint32_t seed, std::vector<float>* input,
+                           std::vector<uint8_t>* weights, std::vector<float>* scales, std::vector<float>* zeros,
+                           float input_min = -1.0f, float input_max = 1.0f, float scale_min = 1.0e-3f,
+                           float scale_max = 0.25f) {
+    ASSERT_NE(input, nullptr);
+    ASSERT_NE(weights, nullptr);
+    ASSERT_NE(scales, nullptr);
+    ASSERT_NE(zeros, nullptr);
+    ASSERT_GT(group_size, 0);
+    ASSERT_EQ(K % group_size, 0);
+
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> input_dist(input_min, input_max);
+    std::uniform_real_distribution<float> scale_dist(scale_min, scale_max);
+    std::uniform_real_distribution<float> zero_dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> int4_dist(-8, 7);
+
+    const int packed_K = (K + 1) / 2;
+    const int num_groups = K / group_size;
+
+    input->resize(static_cast<size_t>(M * K));
+    weights->resize(static_cast<size_t>(N * packed_K));
+    scales->resize(static_cast<size_t>(N * num_groups));
+    zeros->resize(static_cast<size_t>(N * num_groups));
+
+    for (float& v : *input) {
+        v = input_dist(rng);
+    }
+    for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; k += 2) {
+            const int8_t w0 = static_cast<int8_t>(int4_dist(rng));
+            const int8_t w1 = static_cast<int8_t>((k + 1 < K) ? int4_dist(rng) : 0);
+            (*weights)[static_cast<size_t>(n * packed_K + k / 2)] = PackSignedInt4(w0, w1);
+        }
+    }
+    for (float& v : *scales) {
+        v = scale_dist(rng);
+    }
+    for (float& v : *zeros) {
+        v = zero_dist(rng);
     }
 }
 
@@ -433,6 +528,121 @@ TEST_F(GemvInt4Test, DualFusedSilu_UnalignedK_257_GroupSize32) {
     }
 }
 
+TEST(Int4Qwen36KernelTest, GateUpLikeBatchedMatchesReferenceForQwen36Shapes) {
+    constexpr int K = 2048;
+    constexpr int N = 512;
+    constexpr int group_size = 32;
+    constexpr float kTolerance = 2e-2f;
+    const int packed_K = (K + 1) / 2;
+
+    for (int M : {1, 2, 4}) {
+        std::vector<float> input;
+        std::vector<uint8_t> weights;
+        std::vector<float> scales;
+        std::vector<float> zeros;
+        FillRandomInt4Problem(M, K, N, group_size, static_cast<uint32_t>(1000 + M), &input, &weights, &scales, &zeros);
+
+        std::vector<float> reference(static_cast<size_t>(M * N), 0.0f);
+        std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+        GemmInt4_Reference(reference.data(), input.data(), weights.data(), scales.data(), zeros.data(), M, K, N,
+                           group_size);
+        GemmInt4Batched_Hwy(output.data(), input.data(), weights.data(), scales.data(), zeros.data(), M, K, N,
+                            group_size, 0, M, 0, N, static_cast<size_t>(K) * sizeof(float));
+
+        for (int i = 0; i < M * N; ++i) {
+            EXPECT_NEAR(output[static_cast<size_t>(i)], reference[static_cast<size_t>(i)], kTolerance)
+                << "Mismatch for gate/up shape at M=" << M << " index=" << i << " packed_K=" << packed_K;
+        }
+    }
+}
+
+TEST(Int4Qwen36KernelTest, DownLikeBatchedMatchesReferenceForQwen36Shapes) {
+    constexpr int K = 512;
+    constexpr int N = 2048;
+    constexpr int group_size = 32;
+    constexpr float kTolerance = 2e-2f;
+
+    for (int M : {1, 2, 4}) {
+        std::vector<float> input;
+        std::vector<uint8_t> weights;
+        std::vector<float> scales;
+        std::vector<float> zeros;
+        FillRandomInt4Problem(M, K, N, group_size, static_cast<uint32_t>(2000 + M), &input, &weights, &scales, &zeros);
+
+        std::vector<float> reference(static_cast<size_t>(M * N), 0.0f);
+        std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+        GemmInt4_Reference(reference.data(), input.data(), weights.data(), scales.data(), zeros.data(), M, K, N,
+                           group_size);
+        GemmInt4Batched_Hwy(output.data(), input.data(), weights.data(), scales.data(), zeros.data(), M, K, N,
+                            group_size, 0, M, 0, N, static_cast<size_t>(K) * sizeof(float));
+
+        for (int i = 0; i < M * N; ++i) {
+            EXPECT_NEAR(output[static_cast<size_t>(i)], reference[static_cast<size_t>(i)], kTolerance)
+                << "Mismatch for down shape at M=" << M << " index=" << i;
+        }
+    }
+}
+
+TEST(Int4Qwen36KernelTest, GateUpLikeZeroInputProducesZeroOutput) {
+    constexpr int M = 4;
+    constexpr int K = 2048;
+    constexpr int N = 512;
+    constexpr int group_size = 32;
+
+    std::vector<float> input(static_cast<size_t>(M * K), 0.0f);
+    std::vector<uint8_t> weights;
+    std::vector<float> scales;
+    std::vector<float> zeros;
+    FillRandomInt4Problem(M, K, N, group_size, 3004, &input, &weights, &scales, &zeros);
+    std::fill(input.begin(), input.end(), 0.0f);
+
+    std::vector<float> output(static_cast<size_t>(M * N), 1.0f);
+    GemmInt4Batched_Hwy(output.data(), input.data(), weights.data(), scales.data(), zeros.data(), M, K, N, group_size,
+                        0, M, 0, N, static_cast<size_t>(K) * sizeof(float));
+    for (float value : output) {
+        EXPECT_FLOAT_EQ(value, 0.0f);
+    }
+}
+
+TEST(Int4Qwen36KernelTest, GateUpLikeFusedSiluMatchesReferenceForQwen36Shapes) {
+    constexpr int K = 2048;
+    constexpr int N = 512;
+    constexpr int group_size = 32;
+    constexpr float kTolerance = 2e-2f;
+
+    for (int M : {1, 2, 4}) {
+        std::vector<float> input;
+        std::vector<uint8_t> gate_weights;
+        std::vector<float> gate_scales;
+        std::vector<float> gate_zeros;
+        std::vector<uint8_t> up_weights;
+        std::vector<float> up_scales;
+        std::vector<float> up_zeros;
+        FillRandomInt4Problem(M, K, N, group_size, static_cast<uint32_t>(4000 + M), &input, &gate_weights, &gate_scales,
+                              &gate_zeros);
+        FillRandomInt4Problem(M, K, N, group_size, static_cast<uint32_t>(5000 + M), &input, &up_weights, &up_scales,
+                              &up_zeros);
+
+        std::vector<float> reference(static_cast<size_t>(M * N), 0.0f);
+        std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+        for (int m = 0; m < M; ++m) {
+            GemvInt4DualFusedSilu_Reference(reference.data() + static_cast<size_t>(m) * N,
+                                           input.data() + static_cast<size_t>(m) * K, gate_weights.data(),
+                                           gate_scales.data(), gate_zeros.data(), up_weights.data(), up_scales.data(),
+                                           up_zeros.data(), K, N, group_size, 0, N);
+            GemvInt4DualFusedSilu_Hwy(output.data() + static_cast<size_t>(m) * N,
+                                      input.data() + static_cast<size_t>(m) * K, gate_weights.data(),
+                                      gate_scales.data(), gate_zeros.data(), up_weights.data(), up_scales.data(),
+                                      up_zeros.data(), K, N, group_size, 0, N);
+        }
+
+        for (int i = 0; i < M * N; ++i) {
+            EXPECT_NEAR(output[static_cast<size_t>(i)], reference[static_cast<size_t>(i)], kTolerance)
+                << "Mismatch for fused SwiGLU shape at M=" << M << " index=" << i;
+        }
+    }
+}
+
 #if defined(__aarch64__) || defined(_M_ARM64)
 TEST_F(GemvInt4Test, ArmNeonGemvMatchesReference) {
     const int K = 128;
@@ -492,6 +702,94 @@ TEST_F(GemvInt4Test, ArmNeonBatchedMatchesReference) {
 
     for (int i = 0; i < M * N; ++i) {
         EXPECT_NEAR(batched_output[i], batched_reference[i], 1e-4f) << "Mismatch at index " << i;
+    }
+}
+
+TEST(Int4Qwen36KernelTest, ArmSplitNBackendGateUpLikeShapesMatchReference) {
+    constexpr int group_size = 32;
+    constexpr float kTolerance = 2e-2f;
+
+    for (int M : {1, 2, 4}) {
+        constexpr int K = 2048;
+        constexpr int N = 512;
+        std::vector<float> input;
+        std::vector<uint8_t> weights;
+        std::vector<float> scales;
+        std::vector<float> zeros;
+        FillRandomInt4Problem(M, K, N, group_size, static_cast<uint32_t>(6000 + M), &input, &weights, &scales,
+                              &zeros);
+
+        std::vector<float> reference(static_cast<size_t>(M * N), 0.0f);
+        std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+        GemmInt4_Reference(reference.data(), input.data(), weights.data(), scales.data(), zeros.data(), M, K, N,
+                           group_size);
+
+        Tensor A = Tensor::Make2D(input.data(), M, K);
+        Tensor W = Tensor::Make2D(weights.data(), N, K, DType::INT8);
+        Tensor S = Tensor::Make2D(scales.data(), N, K / group_size);
+        Tensor Z = Tensor::Make2D(zeros.data(), N, K / group_size);
+        Tensor C = Tensor::Make2D(output.data(), M, N);
+
+        ScopedEnvVar split_n("DENSECORE_ARM_INT4_SPLIT_N", "1");
+        ScopedEnvVar split_n_min("DENSECORE_ARM_INT4_SPLIT_N_MIN_N", "128");
+        ScopedEnvVar debug_paths("DENSECORE_DEBUG_INT4_PATHS", "1");
+        if (M == 1) {
+            ::testing::internal::CaptureStderr();
+        }
+        densecore::GetCpuBackend().GemmInt4(A, W, S, Z, &C, group_size);
+        if (M == 1) {
+            const std::string stderr_output = ::testing::internal::GetCapturedStderr();
+            EXPECT_NE(stderr_output.find("[INT4_PATH] path=arm_split_n_hwy"), std::string::npos);
+        }
+
+        for (int i = 0; i < M * N; ++i) {
+            EXPECT_NEAR(output[static_cast<size_t>(i)], reference[static_cast<size_t>(i)], kTolerance)
+                << "M=" << M << " index=" << i;
+        }
+    }
+}
+
+TEST(Int4Qwen36KernelTest, ArmSplitNBackendDownLikeShapesMatchReference) {
+    constexpr int group_size = 32;
+    constexpr float kTolerance = 2e-2f;
+
+    for (int M : {1, 2, 4}) {
+        constexpr int K = 512;
+        constexpr int N = 2048;
+        std::vector<float> input;
+        std::vector<uint8_t> weights;
+        std::vector<float> scales;
+        std::vector<float> zeros;
+        FillRandomInt4Problem(M, K, N, group_size, static_cast<uint32_t>(7000 + M), &input, &weights, &scales,
+                              &zeros);
+
+        std::vector<float> reference(static_cast<size_t>(M * N), 0.0f);
+        std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+        GemmInt4_Reference(reference.data(), input.data(), weights.data(), scales.data(), zeros.data(), M, K, N,
+                           group_size);
+
+        Tensor A = Tensor::Make2D(input.data(), M, K);
+        Tensor W = Tensor::Make2D(weights.data(), N, K, DType::INT8);
+        Tensor S = Tensor::Make2D(scales.data(), N, K / group_size);
+        Tensor Z = Tensor::Make2D(zeros.data(), N, K / group_size);
+        Tensor C = Tensor::Make2D(output.data(), M, N);
+
+        ScopedEnvVar split_n("DENSECORE_ARM_INT4_SPLIT_N", "1");
+        ScopedEnvVar split_n_min("DENSECORE_ARM_INT4_SPLIT_N_MIN_N", "128");
+        ScopedEnvVar debug_paths("DENSECORE_DEBUG_INT4_PATHS", "1");
+        if (M == 1) {
+            ::testing::internal::CaptureStderr();
+        }
+        densecore::GetCpuBackend().GemmInt4(A, W, S, Z, &C, group_size);
+        if (M == 1) {
+            const std::string stderr_output = ::testing::internal::GetCapturedStderr();
+            EXPECT_NE(stderr_output.find("[INT4_PATH] path=arm_split_n_hwy"), std::string::npos);
+        }
+
+        for (int i = 0; i < M * N; ++i) {
+            EXPECT_NEAR(output[static_cast<size_t>(i)], reference[static_cast<size_t>(i)], kTolerance)
+                << "M=" << M << " index=" << i;
+        }
     }
 }
 #endif

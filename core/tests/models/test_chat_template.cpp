@@ -12,7 +12,9 @@ bool DenseCoreTestOnlySuppressesReasoningTagsForPrompt(const std::string& prompt
 bool DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(const TransformerModel* model, const std::string& prompt);
 std::vector<int> DenseCoreTestOnlyQwenReasoningBlocklist(const TransformerModel* model);
 std::vector<int> DenseCoreTestOnlyGemma4TextBlocklist(const TransformerModel* model);
+std::string DenseCoreTestOnlyPrimeQwenNoThinkingPromptText(const TransformerModel* model, const std::string& prompt);
 std::string DenseCoreTestOnlyPrimeQwenNoThinking(const TransformerModel* model, const std::string& prompt);
+bool DenseCoreTestOnlyResolveAddBosForPrompt(const TransformerModel* model, const std::string& prompt);
 
 TEST(ChatTemplateTest, GemmaAutoTemplateUsesOfficialTurnFormatWithImplicitInstructions) {
     TransformerModel model{};
@@ -97,11 +99,12 @@ TEST(ChatTemplateTest, Qwen36DefaultsToThinkingWhenEnvIsUnset) {
     unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
     const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
 
-    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
     EXPECT_EQ(wrapped,
               "<|im_start|>user\n"
               "hello<|im_end|>\n"
-              "<|im_start|>assistant\n");
+              "<|im_start|>assistant\n"
+              "<think>\n");
 }
 
 TEST(ChatTemplateTest, Qwen36ExplicitOverrideDisablesThinking) {
@@ -119,7 +122,8 @@ TEST(ChatTemplateTest, Qwen36ExplicitOverrideDisablesThinking) {
     EXPECT_EQ(wrapped,
               "<|im_start|>user\n"
               "hello<|im_end|>\n"
-              "<|im_start|>assistant\n");
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n");
 }
 
 TEST(ChatTemplateTest, Qwen36DisableDoesNotInjectNoThinkDirective) {
@@ -149,6 +153,66 @@ TEST(ChatTemplateTest, Qwen36NoThinkingDoesNotPrimeAssistantAnswerCue) {
     unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
 
     EXPECT_EQ(primed, wrapped);
+}
+
+TEST(ChatTemplateTest, Qwen36NoThinkingPromptTextDoesNotPrimeAssistantAnswerCueByDefault) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    const std::string primed = DenseCoreTestOnlyPrimeQwenNoThinkingPromptText(
+        &model, "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_EQ(primed,
+              "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n");
+}
+
+TEST(ChatTemplateTest, Qwen35NoThinkingDoesNotPrimeAssistantAnswerCue) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "What is the capital of France?");
+    const std::string primed = DenseCoreTestOnlyPrimeQwenNoThinking(&model, wrapped);
+
+    EXPECT_EQ(primed, wrapped);
+    EXPECT_EQ(primed.find("<|im_start|>assistant\nAnswer: "), std::string::npos);
+}
+
+TEST(ChatTemplateTest, Qwen35RenderedChatMLDisablesBos) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.tokenizer_add_bos = true;
+
+    const std::string rendered = "<|im_start|>user\nhello /no_think<|im_end|>\n<|im_start|>assistant\n";
+
+    EXPECT_FALSE(DenseCoreTestOnlyResolveAddBosForPrompt(&model, rendered));
+    EXPECT_TRUE(DenseCoreTestOnlyResolveAddBosForPrompt(&model, "hello"));
+}
+
+TEST(ChatTemplateTest, Qwen36NoThinkingPromptTextCanPrimeAssistantAnswerCueWhenExplicitlyEnabled) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    setenv("DENSECORE_QWEN36_PRIME_NO_THINKING", "1", 1);
+    const std::string primed = DenseCoreTestOnlyPrimeQwenNoThinkingPromptText(
+        &model, "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n");
+    unsetenv("DENSECORE_QWEN36_PRIME_NO_THINKING");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_NE(primed.find("<|im_start|>assistant\nAnswer: "), std::string::npos);
 }
 
 TEST(ChatTemplateTest, Qwen3NoThinkingPrimesAssistantAnswerCue) {
@@ -228,7 +292,7 @@ TEST(ChatTemplateTest, QwenThinkingPromptDoesNotSuppressReasoningTags) {
     const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
     unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
 
-    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
     EXPECT_FALSE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, wrapped));
     EXPECT_EQ(wrapped.find("Think step by step inside <think> and </think>"), std::string::npos);
 }
@@ -255,10 +319,9 @@ TEST(ChatTemplateTest, QwenNoThinkingPromptSuppressesReasoningTags) {
 
     setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
     const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
-    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
-
     EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
     EXPECT_TRUE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, wrapped));
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
 }
 
 TEST(ChatTemplateTest, AutoTemplateCanBeDisabledForRawQaMode) {
@@ -319,7 +382,8 @@ TEST(CanonicalChatRenderTest, Qwen36DisableInjectsNoThinkDirective) {
     EXPECT_EQ(rendered,
               "<|im_start|>user\n"
               "hello<|im_end|>\n"
-              "<|im_start|>assistant\n");
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n");
 }
 
 TEST(CanonicalChatRenderTest, Qwen36ThinkingUsesOfficialPromptWithoutReasoningDirective) {
@@ -342,7 +406,8 @@ TEST(CanonicalChatRenderTest, Qwen36ThinkingUsesOfficialPromptWithoutReasoningDi
     EXPECT_EQ(rendered,
               "<|im_start|>user\n"
               "hello<|im_end|>\n"
-              "<|im_start|>assistant\n");
+              "<|im_start|>assistant\n"
+              "<think>\n");
 }
 
 TEST(CanonicalChatRenderTest, Qwen36PreserveThinkingCanBeDisabledForAssistantHistory) {
@@ -365,8 +430,8 @@ TEST(CanonicalChatRenderTest, Qwen36PreserveThinkingCanBeDisabledForAssistantHis
 
     const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, options);
 
-    EXPECT_EQ(rendered.find("<think>"), std::string::npos);
     EXPECT_NE(rendered.find("<|im_start|>assistant\nfinal<|im_end|>\n"), std::string::npos);
+    EXPECT_EQ(rendered.find("<|im_start|>assistant\n<think>\nchain"), std::string::npos);
 }
 
 TEST(CanonicalChatRenderTest, GemmaCanonicalRendererMatchesTurnTags) {

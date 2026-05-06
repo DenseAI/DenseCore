@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -86,4 +87,29 @@ TEST(WorkerResultDispatchTest, QueuedDispatchEnqueuesResultEvent) {
     EXPECT_FALSE(event.finished);
     EXPECT_FALSE(event.error);
     EXPECT_EQ(event.callback, TokenCallbackCapture);
+}
+
+TEST(WorkerResultDispatchTest, Qwen35DecodeSummaryUsesDedicatedTag) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+
+    Request req{};
+    req.id = 7;
+    req.prompt_token_count = 11;
+    req.sampled_token_count = 3;
+    req.visible_emitted_token_count = 3;
+    req.decode_finish_cause = DecodeFinishCause::MaxTokens;
+    req.start_time = std::chrono::steady_clock::now();
+    req.first_token_time = req.start_time + std::chrono::milliseconds(10);
+    req.last_external_emit_time = req.first_token_time + std::chrono::milliseconds(20);
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("[Qwen35DecodeSummary]"), std::string::npos);
+    EXPECT_NE(captured.find("prompt_tokens=11"), std::string::npos);
+    EXPECT_NE(captured.find("attention_ms="), std::string::npos);
+    EXPECT_NE(captured.find("moe_forward_ms="), std::string::npos);
 }

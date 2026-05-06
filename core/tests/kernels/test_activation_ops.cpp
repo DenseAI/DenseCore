@@ -6,11 +6,13 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 #include "densecore/hal/op_registry.h"
 #include "densecore/hal/tensor.h"
 #include "densecore/hal/transformer_ops.h"
+#include "runtime/inference_types_internal.h"
 
 namespace densecore {
 namespace {
@@ -203,6 +205,60 @@ TEST_F(ActivationOpsTest, SiLULargeTensor) {
     float expected = 1.5f / (1.0f + std::exp(-1.5f));
     EXPECT_NEAR(output_data[0], expected, 1e-4f);
     EXPECT_NEAR(output_data[n - 1], expected, 1e-4f);
+}
+
+TEST_F(ActivationOpsTest, FusedSiLUMulHandlesStridedViewsSafely) {
+    constexpr int64_t cols = 4;
+    constexpr int64_t rows = 2;
+    constexpr int64_t padded_cols = 8;
+
+    std::vector<float> gate_storage(static_cast<size_t>(padded_cols * rows), 0.0f);
+    std::vector<float> up_storage(static_cast<size_t>(padded_cols * rows), 0.0f);
+    std::vector<float> out_storage(static_cast<size_t>(padded_cols * rows), 0.0f);
+
+    const float gate_values[rows][cols] = {
+        {-1.0f, -0.5f, 0.5f, 1.0f},
+        {1.5f, -2.0f, 2.5f, -3.0f},
+    };
+    const float up_values[rows][cols] = {
+        {2.0f, 3.0f, 4.0f, 5.0f},
+        {6.0f, 7.0f, 8.0f, 9.0f},
+    };
+
+    for (int64_t r = 0; r < rows; ++r) {
+        std::memcpy(gate_storage.data() + r * padded_cols, gate_values[r], sizeof(gate_values[r]));
+        std::memcpy(up_storage.data() + r * padded_cols, up_values[r], sizeof(up_values[r]));
+    }
+
+    ggml_tensor gate = {};
+    ggml_tensor up = {};
+    ggml_tensor out = {};
+    gate.type = GGML_TYPE_F32;
+    up.type = GGML_TYPE_F32;
+    out.type = GGML_TYPE_F32;
+    gate.data = gate_storage.data();
+    up.data = up_storage.data();
+    out.data = out_storage.data();
+    gate.ne[0] = cols; gate.ne[1] = rows; gate.ne[2] = 1; gate.ne[3] = 1;
+    up.ne[0] = cols; up.ne[1] = rows; up.ne[2] = 1; up.ne[3] = 1;
+    out.ne[0] = cols; out.ne[1] = rows; out.ne[2] = 1; out.ne[3] = 1;
+    gate.nb[0] = sizeof(float); gate.nb[1] = padded_cols * sizeof(float);
+    up.nb[0] = sizeof(float); up.nb[1] = padded_cols * sizeof(float);
+    out.nb[0] = sizeof(float); out.nb[1] = padded_cols * sizeof(float);
+    gate.nb[2] = gate.nb[1] * rows; gate.nb[3] = gate.nb[2];
+    up.nb[2] = up.nb[1] * rows; up.nb[3] = up.nb[2];
+    out.nb[2] = out.nb[1] * rows; out.nb[3] = out.nb[2];
+
+    cb_silu_mul_fused(&out, &gate, &up, 0, 1, nullptr);
+
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t c = 0; c < cols; ++c) {
+            const float g = gate_values[r][c];
+            const float expected = (g / (1.0f + std::exp(-g))) * up_values[r][c];
+            EXPECT_NEAR(out_storage[static_cast<size_t>(r * padded_cols + c)], expected, 1e-5f)
+                << "row=" << r << " col=" << c;
+        }
+    }
 }
 
 }  // namespace

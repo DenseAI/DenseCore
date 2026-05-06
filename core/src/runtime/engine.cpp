@@ -629,7 +629,7 @@ bool ShouldPrimeQwenNoThinkingPrompt(const TransformerModel* model) {
         return !ParseBoolEnv("DENSECORE_QWEN3_ENABLE_THINKING", true);
     }
     if (descriptor.variant == ModelVariant::QWEN35) {
-        return !ParseBoolEnv("DENSECORE_QWEN35_ENABLE_THINKING", false);
+        return false;
     }
     return false;
 }
@@ -698,11 +698,12 @@ void MaybePrimeQwenNoThinking(const TransformerModel* model, std::vector<int>* t
     *tokens = Tokenizer::Tokenize(model, primed_text, /*add_bos=*/false, /*add_eos=*/false);
 }
 
-bool ShouldDisableBosForRenderedQwen36Prompt(const TransformerModel* model, const std::string& prompt) {
+bool ShouldDisableBosForRenderedQwenPrompt(const TransformerModel* model, const std::string& prompt) {
     if (!model) {
         return false;
     }
-    if (densecore::models::DescribeModel(model).variant != ModelVariant::QWEN36) {
+    const auto variant = densecore::models::DescribeModel(model).variant;
+    if (variant != ModelVariant::QWEN35 && variant != ModelVariant::QWEN36) {
         return false;
     }
     return prompt.find("<|im_start|>") != std::string::npos || prompt.find("<|im_end|>") != std::string::npos;
@@ -712,7 +713,7 @@ bool ResolveAddBosForPrompt(const TransformerModel* model, const std::string& pr
     if (!model) {
         return false;
     }
-    if (ShouldDisableBosForRenderedQwen36Prompt(model, prompt)) {
+    if (ShouldDisableBosForRenderedQwenPrompt(model, prompt)) {
         return false;
     }
     return model->tokenizer_add_bos;
@@ -924,6 +925,10 @@ std::string DenseCoreTestOnlyPrimeQwenNoThinking(const TransformerModel* model, 
         return prompt;
     }
     return PrimeQwenNoThinkingText(prompt);
+}
+
+bool DenseCoreTestOnlyResolveAddBosForPrompt(const TransformerModel* model, const std::string& prompt) {
+    return ResolveAddBosForPrompt(model, prompt);
 }
 #endif
 

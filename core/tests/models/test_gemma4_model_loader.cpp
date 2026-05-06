@@ -204,6 +204,19 @@ TEST(Gemma4ModelLoaderTest, InvalidAttentionLogitCapMetadataNormalizesToHfCompat
     EXPECT_FLOAT_EQ(model->gemma4_attention_logit_softcapping, 50.0f);
 }
 
+TEST(Gemma4ModelLoaderTest, MapsPostAttentionNormAsGemma4FfnPostNorm) {
+    TempPath tmp;
+    auto fill = [](gguf_context* ctx) {
+        SetBaseGemma4Metadata(ctx);
+        AddDummyTensor(ctx, "blk.0.post_attention_norm.weight", 8);
+    };
+    std::unique_ptr<TransformerModel> model(LoadTempGemma4(tmp.path(), fill));
+    ASSERT_NE(model, nullptr);
+    ASSERT_FALSE(model->layers.empty());
+
+    EXPECT_NE(model->layers[0].Get("gemma4.post_feedforward_layernorm.weight"), nullptr);
+}
+
 TEST(Gemma4ModelLoaderTest, NormalizesVocabSizeFromTokenizerMetadata) {
     TempPath tmp;
     auto fill = [](gguf_context* ctx) {

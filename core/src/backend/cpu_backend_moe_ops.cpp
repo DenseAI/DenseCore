@@ -1139,6 +1139,82 @@ bool IsGemma4PackedChecksumDebugEnabled() {
     return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
+struct MoEExecutionTraceContext {
+    int layer_idx = -1;
+    int seq_id = -1;
+    int token_idx = -1;
+    int decode_step = -1;
+    int n_past = -1;
+    int expert_id = -1;
+};
+
+bool IsGemma4ParityTraceEnabled() {
+    const char* env = std::getenv("DENSECORE_GEMMA4_PARITY_TRACE");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+int Gemma4ParityTraceLayerFilter() {
+    const char* env = std::getenv("DENSECORE_GEMMA4_PARITY_TRACE_LAYER");
+    if (!env || env[0] == '\0') {
+        return -1;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(env, &end, 10);
+    return end == env ? -1 : static_cast<int>(parsed);
+}
+
+void LogGemma4MoETensorStats(const char* stage, const Tensor& tensor, const MoEExecutionTraceContext* trace_ctx) {
+    if (!IsGemma4ParityTraceEnabled() || !stage || !trace_ctx || trace_ctx->layer_idx < 0 || !tensor.IsValid() ||
+        tensor.dtype != DType::F32 || tensor.ndim != 2) {
+        return;
+    }
+    const int layer_filter = Gemma4ParityTraceLayerFilter();
+    if (layer_filter >= 0 && trace_ctx->layer_idx != layer_filter) {
+        return;
+    }
+    static std::atomic<int> log_budget{0};
+    const int current = log_budget.fetch_add(1, std::memory_order_relaxed);
+    if (current >= 512) {
+        return;
+    }
+    const float* data = tensor.DataAs<float>();
+    if (!data) {
+        return;
+    }
+    const size_t elems = static_cast<size_t>(tensor.shape[0]) * static_cast<size_t>(tensor.shape[1]);
+    size_t nonfinite = 0;
+    float min_v = std::numeric_limits<float>::infinity();
+    float max_v = -std::numeric_limits<float>::infinity();
+    double sum_sq = 0.0;
+    uint64_t finite_hash = 1469598103934665603ull;
+    for (size_t i = 0; i < elems; ++i) {
+        const float v = data[i];
+        if (!std::isfinite(v)) {
+            ++nonfinite;
+            continue;
+        }
+        min_v = std::min(min_v, v);
+        max_v = std::max(max_v, v);
+        sum_sq += static_cast<double>(v) * static_cast<double>(v);
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        finite_hash ^= static_cast<uint64_t>(bits);
+        finite_hash *= 1099511628211ull;
+    }
+    if (elems == nonfinite) {
+        min_v = std::numeric_limits<float>::quiet_NaN();
+        max_v = std::numeric_limits<float>::quiet_NaN();
+    }
+    const double rms = elems > nonfinite ? std::sqrt(sum_sq / static_cast<double>(elems - nonfinite)) : NAN;
+    std::fprintf(stderr,
+                 "[GEMMA4_MOE_TRACE] layer=%d expert=%d token=%d seq=%d n_past=%d decode_step=%d stage=%s "
+                 "shape=%lldx%lld nonfinite=%zu min=%g max=%g rms=%g hash=0x%llx\n",
+                 trace_ctx->layer_idx, trace_ctx->expert_id, trace_ctx->token_idx, trace_ctx->seq_id, trace_ctx->n_past,
+                 trace_ctx->decode_step, stage, static_cast<long long>(tensor.shape[0]),
+                 static_cast<long long>(tensor.shape[1]), nonfinite, min_v, max_v, rms,
+                 static_cast<unsigned long long>(finite_hash));
+}
+
 uint64_t Fnv1a64(const void* data, size_t size) {
     const auto* bytes = static_cast<const uint8_t*>(data);
     uint64_t hash = 1469598103934665603ull;
@@ -1328,15 +1404,6 @@ CpuBackend::MoEProjectionPath ParseMoEProjectionPath(const char* path) {
     }
     return CpuBackend::MoEProjectionPath::Unknown;
 }
-
-struct MoEExecutionTraceContext {
-    int layer_idx = -1;
-    int seq_id = -1;
-    int token_idx = -1;
-    int decode_step = -1;
-    int n_past = -1;
-    int expert_id = -1;
-};
 
 void MaybeLogGemma4PackedChecksum(const CpuBackend::ExpertWeights& expert, const Tensor& w1, const Tensor& w2,
                                   const Tensor& w3, const Tensor& post_gate_up, const Tensor& post_down,
@@ -1562,6 +1629,40 @@ bool ApplyScaleSidecarInPlace(const ggml_tensor* scale_tensor, int64_t rows, int
         }
     }
     return true;
+}
+
+bool IsScalarScaleSidecar(const ggml_tensor* scale_tensor) {
+    if (!scale_tensor) {
+        return false;
+    }
+    if (!scale_tensor->data || scale_tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+    return scale_tensor->ne[0] == 1 && scale_tensor->ne[1] == 1 && scale_tensor->ne[2] == 1 && scale_tensor->ne[3] == 1;
+}
+
+float ReadScalarScaleSidecar(const ggml_tensor* scale_tensor) {
+    if (!IsScalarScaleSidecar(scale_tensor)) {
+        return 1.0f;
+    }
+    return *reinterpret_cast<const float*>(scale_tensor->data);
+}
+
+void ApplyScalarScaleToTensor(Tensor* tensor, float scale) {
+    if (!tensor || !tensor->IsValid() || tensor->dtype != DType::F32 || scale == 1.0f) {
+        return;
+    }
+    float* data = tensor->DataAs<float>();
+    if (!data) {
+        return;
+    }
+    size_t total = 1;
+    for (int i = 0; i < tensor->ndim; ++i) {
+        total *= static_cast<size_t>(std::max<int64_t>(1, tensor->shape[i]));
+    }
+    for (size_t i = 0; i < total; ++i) {
+        data[i] *= scale;
+    }
 }
 
 bool DequantExpertMatrixToF32(const CpuBackend::ExpertWeights& expert, const CpuBackend::ExpertWeight& weight,
@@ -1847,6 +1948,40 @@ bool ExecuteMoEReferencePath(const float* input_data, int batch_size, int hidden
     return true;
 }
 
+void RecordMoEReferencePathTrace(CpuBackend* backend, int layer_idx, const BatchSpec* batch,
+                                 const moe::MoERouteResult& routing, int num_experts) {
+    if (!backend) {
+        return;
+    }
+    const char projections[3] = {'1', '3', '2'};
+    for (size_t i = 0; i < routing.expert_ids.size(); ++i) {
+        const int expert_id = routing.expert_ids[i];
+        if (expert_id < 0 || expert_id >= num_experts) {
+            continue;
+        }
+        const int token_idx = routing.token_indices.empty() ? static_cast<int>(i / static_cast<size_t>(routing.top_k))
+                                                            : routing.token_indices[i];
+        for (char projection : projections) {
+            CpuBackend::MoEPathTraceEntry entry;
+            entry.layer_idx = layer_idx;
+            entry.token_idx = token_idx;
+            entry.expert_id = expert_id;
+            entry.force_safe_reference = true;
+            entry.safe_reference_mode = true;
+            entry.projection[0] = projection;
+            entry.projection[1] = '\0';
+            entry.selected_path = CpuBackend::MoEProjectionPath::ReferenceF32;
+            if (batch && token_idx >= 0 && token_idx < static_cast<int>(batch->seq_id.size())) {
+                entry.seq_id = batch->seq_id[static_cast<size_t>(token_idx)];
+                if (entry.seq_id >= 0 && entry.seq_id < static_cast<int>(batch->n_past.size())) {
+                    entry.n_past = batch->n_past[static_cast<size_t>(entry.seq_id)];
+                }
+            }
+            backend->RecordMoEPathTrace(entry);
+        }
+    }
+}
+
 template <size_t N> bool CopyIntVectorToFixedArray(const std::vector<int>& src, std::array<int, N>* dst, int* count) {
     if (!dst || !count) {
         return false;
@@ -1905,7 +2040,8 @@ bool ExpertHasGgmlQuantizedWeights(const CpuBackend::ExpertWeights& expert) {
 // Complexity: O(M * N * K) where expert matrices are [N, K].
 bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, int ggml_type_id, const Tensor& input,
                                    Tensor* output, int64_t N, int64_t K, int numa_node, bool allow_parallel = true,
-                                   QuantizedProjectionInputCache* input_cache = nullptr) {
+                                   QuantizedProjectionInputCache* input_cache = nullptr,
+                                   bool allow_kquant_rowpair_vec_dot = true) {
     if (!backend || !weight_ptr || !output || !input.IsValid() || !output->IsValid()) return false;
     if (input.dtype != DType::F32 || output->dtype != DType::F32) return false;
     if (input.ndim != 2 || output->ndim != 2) return false;
@@ -1960,9 +2096,10 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
         qinput_data = qinput_buf.data();
     }
 
-    const bool use_kquant_rowpair_vec_dot =
-        CanUseKQuantRowPairVecDotFastPath() && (wtype == GGML_TYPE_Q4_K || wtype == GGML_TYPE_Q6_K) &&
-        iq_type == GGML_TYPE_Q8_K && M >= 2 && K % ggml_blck_size(wtype) == 0 && N >= 2;
+    const bool use_kquant_rowpair_vec_dot = allow_kquant_rowpair_vec_dot && CanUseKQuantRowPairVecDotFastPath() &&
+                                            (wtype == GGML_TYPE_Q4_K || wtype == GGML_TYPE_Q6_K) &&
+                                            iq_type == GGML_TYPE_Q8_K && M >= 2 && K % ggml_blck_size(wtype) == 0 &&
+                                            N >= 2;
     if (CanUseMoEQ4KRawBatchedScalar() && wtype == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K && M > 1 &&
         K % ggml_blck_size(GGML_TYPE_Q4_K) == 0) {
         if (RunMoEQ4KRawBatchedProjection(backend, weight_ptr, qinput_data, iq_row_bytes, out_data, M, N, K, numa_node,
@@ -1992,15 +2129,17 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
         auto& pool = backend->GetThreadPool(numa_node);
         const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
         const int64_t pair_count = N / 2;
-        for (int64_t m = 0; m + 1 < M; m += 2) {
-            float* out_row0 = out_data + static_cast<size_t>(m) * N;
-            const void* qi0 = qinput_data + static_cast<size_t>(m) * iq_row_bytes;
+        for (int64_t m = 0; m < M; ++m) {
+            float* out_row = out_data + static_cast<size_t>(m) * N;
+            const void* qi = qinput_data + static_cast<size_t>(m) * iq_row_bytes;
             const auto compute_pair_range = [&](int pair_start, int pair_end) {
                 for (int pair = pair_start; pair < pair_end; ++pair) {
                     const int64_t n = static_cast<int64_t>(pair) * 2;
                     const void* w_row = w_data + static_cast<size_t>(n) * w_row_bytes;
-                    type_traits_cpu->vec_dot(static_cast<int>(K), out_row0 + n, static_cast<size_t>(N), w_row,
-                                             w_row_bytes, qi0, iq_row_bytes, 2);
+                    float sums[32] = {};
+                    type_traits_cpu->vec_dot(static_cast<int>(K), sums, 16, w_row, w_row_bytes, qi, 0, 2);
+                    out_row[n] = sums[0];
+                    out_row[n + 1] = sums[1];
                 }
             };
             if (n_threads <= 1) {
@@ -2012,26 +2151,7 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
             if ((N & 1) != 0) {
                 const int64_t n = N - 1;
                 const void* w_row = w_data + static_cast<size_t>(n) * w_row_bytes;
-                type_traits_cpu->vec_dot(static_cast<int>(K), out_row0 + n, 0, w_row, 0, qi0, 0, 1);
-                type_traits_cpu->vec_dot(static_cast<int>(K), out_row0 + static_cast<size_t>(N) + n, 0, w_row, 0,
-                                         static_cast<const uint8_t*>(qi0) + iq_row_bytes, 0, 1);
-            }
-        }
-        if ((M & 1) != 0) {
-            const int64_t m = M - 1;
-            float* out_row = out_data + static_cast<size_t>(m) * N;
-            const void* qi = qinput_data + static_cast<size_t>(m) * iq_row_bytes;
-            const auto compute_range = [&](int n_start, int n_end) {
-                for (int n = n_start; n < n_end; ++n) {
-                    const void* w_row = w_data + static_cast<size_t>(n) * w_row_bytes;
-                    type_traits_cpu->vec_dot(static_cast<int>(K), out_row + n, 0, w_row, 0, qi, 0, 1);
-                }
-            };
-            if (n_threads <= 1) {
-                compute_range(0, static_cast<int>(N));
-            } else {
-                pool.ParallelFor(static_cast<int>(N),
-                                 [&](int n_start, int n_end, int) { compute_range(n_start, n_end); });
+                type_traits_cpu->vec_dot(static_cast<int>(K), out_row + n, 0, w_row, 0, qi, 0, 1);
             }
         }
         const char* path_name = wtype == GGML_TYPE_Q4_K ? "ggml_q4k_rowpair_m2_vecdot" : "ggml_q6k_rowpair_m2_vecdot";
@@ -2039,8 +2159,9 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
         return true;
     }
 
-    const bool use_q5k_colpair_vec_dot = CanUseKQuantRowPairVecDotFastPath() && wtype == GGML_TYPE_Q5_K &&
-                                         iq_type == GGML_TYPE_Q8_K && K % ggml_blck_size(GGML_TYPE_Q5_K) == 0 && N >= 2;
+    const bool use_q5k_colpair_vec_dot = allow_kquant_rowpair_vec_dot && CanUseKQuantRowPairVecDotFastPath() &&
+                                         wtype == GGML_TYPE_Q5_K && iq_type == GGML_TYPE_Q8_K &&
+                                         K % ggml_blck_size(GGML_TYPE_Q5_K) == 0 && N >= 2;
     if (use_q5k_colpair_vec_dot) {
         auto& pool = backend->GetThreadPool(numa_node);
         const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
@@ -2052,7 +2173,10 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                 for (int pair = pair_start; pair < pair_end; ++pair) {
                     const int64_t n = static_cast<int64_t>(pair) * 2;
                     const void* w_row = w_data + static_cast<size_t>(n) * w_row_bytes;
-                    type_traits_cpu->vec_dot(static_cast<int>(K), out_row + n, 0, w_row, w_row_bytes, qi, 0, 2);
+                    float sums[32] = {};
+                    type_traits_cpu->vec_dot(static_cast<int>(K), sums, 16, w_row, w_row_bytes, qi, 0, 2);
+                    out_row[n] = sums[0];
+                    out_row[n + 1] = sums[1];
                 }
             };
             if (n_threads <= 1) {
@@ -2105,9 +2229,10 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
         }
     }
 
-    const bool use_q4k_rowpair_vec_dot =
-        CanUseQ4KRowPairVecDotFastPath() && (wtype == GGML_TYPE_Q4_K || wtype == GGML_TYPE_Q5_K) &&
-        iq_type == GGML_TYPE_Q8_K && M == 1 && K % ggml_blck_size(wtype) == 0 && N >= 4;
+    const bool use_q4k_rowpair_vec_dot = allow_kquant_rowpair_vec_dot && CanUseQ4KRowPairVecDotFastPath() &&
+                                         (wtype == GGML_TYPE_Q4_K || wtype == GGML_TYPE_Q5_K) &&
+                                         iq_type == GGML_TYPE_Q8_K && M == 1 && K % ggml_blck_size(wtype) == 0 &&
+                                         N >= 4;
     auto& pool = backend->GetThreadPool(numa_node);
     const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
 
@@ -2121,8 +2246,8 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                 for (int pair = pair_start; pair < pair_end; ++pair) {
                     const int64_t n = static_cast<int64_t>(pair) * 2;
                     const void* w_row = w_data + static_cast<size_t>(n) * w_row_bytes;
-                    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    type_traits_cpu->vec_dot(static_cast<int>(K), sums, 2, w_row, w_row_bytes, qi, 0, 2);
+                    float sums[32] = {};
+                    type_traits_cpu->vec_dot(static_cast<int>(K), sums, 16, w_row, w_row_bytes, qi, 0, 2);
                     out_row[n] = sums[0];
                     out_row[n + 1] = sums[1];
                 }
@@ -2268,24 +2393,20 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
     }
     if (use_q4k_rowpair_m2_vec_dot) {
         const int64_t pair_count = N / 2;
-        for (int64_t m = 0; m + 1 < M; m += 2) {
-            float* out_row0 = out_data + static_cast<size_t>(m) * N;
-            float* out_row1 = out_row0 + N;
-            const void* qi0 = qinput_data + static_cast<size_t>(m) * iq_row_bytes;
+        for (int64_t m = 0; m < M; ++m) {
+            float* out_row = out_data + static_cast<size_t>(m) * N;
+            const void* qi = qinput_data + static_cast<size_t>(m) * iq_row_bytes;
             const auto compute_pair_range = [&](int pair_start, int pair_end) {
                 for (int pair = pair_start; pair < pair_end; ++pair) {
                     const int64_t n = static_cast<int64_t>(pair) * 2;
                     const void* gate_row = gate_data + static_cast<size_t>(n) * gate_row_bytes;
                     const void* up_row = up_data + static_cast<size_t>(n) * up_row_bytes;
-                    float gate_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    float up_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    gate_traits_cpu->vec_dot(static_cast<int>(K), gate_sums, 2, gate_row, gate_row_bytes, qi0,
-                                             iq_row_bytes, 2);
-                    up_traits_cpu->vec_dot(static_cast<int>(K), up_sums, 2, up_row, up_row_bytes, qi0, iq_row_bytes, 2);
-                    out_row0[n] = (gate_sums[0] / (1.0f + internal::FastExp(-gate_sums[0]))) * up_sums[0];
-                    out_row0[n + 1] = (gate_sums[1] / (1.0f + internal::FastExp(-gate_sums[1]))) * up_sums[1];
-                    out_row1[n] = (gate_sums[2] / (1.0f + internal::FastExp(-gate_sums[2]))) * up_sums[2];
-                    out_row1[n + 1] = (gate_sums[3] / (1.0f + internal::FastExp(-gate_sums[3]))) * up_sums[3];
+                    float gate_sums[32] = {};
+                    float up_sums[32] = {};
+                    gate_traits_cpu->vec_dot(static_cast<int>(K), gate_sums, 16, gate_row, gate_row_bytes, qi, 0, 2);
+                    up_traits_cpu->vec_dot(static_cast<int>(K), up_sums, 16, up_row, up_row_bytes, qi, 0, 2);
+                    out_row[n] = (gate_sums[0] / (1.0f + internal::FastExp(-gate_sums[0]))) * up_sums[0];
+                    out_row[n + 1] = (gate_sums[1] / (1.0f + internal::FastExp(-gate_sums[1]))) * up_sums[1];
                 }
             };
             if (n_threads <= 1) {
@@ -2298,36 +2419,11 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
                 const int64_t n = N - 1;
                 const void* gate_row = gate_data + static_cast<size_t>(n) * gate_row_bytes;
                 const void* up_row = up_data + static_cast<size_t>(n) * up_row_bytes;
-                for (int row = 0; row < 2; ++row) {
-                    float gate_sum = 0.0f;
-                    float up_sum = 0.0f;
-                    const void* qi = static_cast<const uint8_t*>(qi0) + static_cast<size_t>(row) * iq_row_bytes;
-                    gate_traits_cpu->vec_dot(static_cast<int>(K), &gate_sum, 0, gate_row, 0, qi, 0, 1);
-                    up_traits_cpu->vec_dot(static_cast<int>(K), &up_sum, 0, up_row, 0, qi, 0, 1);
-                    (row == 0 ? out_row0 : out_row1)[n] = (gate_sum / (1.0f + internal::FastExp(-gate_sum))) * up_sum;
-                }
-            }
-        }
-        if ((M & 1) != 0) {
-            const int64_t m = M - 1;
-            float* out_row = out_data + static_cast<size_t>(m) * N;
-            const void* qi = qinput_data + static_cast<size_t>(m) * iq_row_bytes;
-            const auto compute_range = [&](int n_start, int n_end) {
-                for (int n = n_start; n < n_end; ++n) {
-                    float gate_sum = 0.0f;
-                    float up_sum = 0.0f;
-                    const void* gate_row = gate_data + static_cast<size_t>(n) * gate_row_bytes;
-                    const void* up_row = up_data + static_cast<size_t>(n) * up_row_bytes;
-                    gate_traits_cpu->vec_dot(static_cast<int>(K), &gate_sum, 0, gate_row, 0, qi, 0, 1);
-                    up_traits_cpu->vec_dot(static_cast<int>(K), &up_sum, 0, up_row, 0, qi, 0, 1);
-                    out_row[n] = (gate_sum / (1.0f + internal::FastExp(-gate_sum))) * up_sum;
-                }
-            };
-            if (n_threads <= 1) {
-                compute_range(0, static_cast<int>(N));
-            } else {
-                pool.ParallelFor(static_cast<int>(N),
-                                 [&](int n_start, int n_end, int) { compute_range(n_start, n_end); });
+                float gate_sum = 0.0f;
+                float up_sum = 0.0f;
+                gate_traits_cpu->vec_dot(static_cast<int>(K), &gate_sum, 0, gate_row, 0, qi, 0, 1);
+                up_traits_cpu->vec_dot(static_cast<int>(K), &up_sum, 0, up_row, 0, qi, 0, 1);
+                out_row[n] = (gate_sum / (1.0f + internal::FastExp(-gate_sum))) * up_sum;
             }
         }
         LogMoEMatmulPath("ggml_q4k_rowpair_m2_fused_swiglu", static_cast<int>(M), static_cast<int>(K),
@@ -2363,10 +2459,10 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
                     const int64_t n = static_cast<int64_t>(pair) * 2;
                     const void* gate_row = gate_data + static_cast<size_t>(n) * gate_row_bytes;
                     const void* up_row = up_data + static_cast<size_t>(n) * up_row_bytes;
-                    float gate_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    float up_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    gate_traits_cpu->vec_dot(static_cast<int>(K), gate_sums, 2, gate_row, gate_row_bytes, qi, 0, 2);
-                    up_traits_cpu->vec_dot(static_cast<int>(K), up_sums, 2, up_row, up_row_bytes, qi, 0, 2);
+                    float gate_sums[32] = {};
+                    float up_sums[32] = {};
+                    gate_traits_cpu->vec_dot(static_cast<int>(K), gate_sums, 16, gate_row, gate_row_bytes, qi, 0, 2);
+                    up_traits_cpu->vec_dot(static_cast<int>(K), up_sums, 16, up_row, up_row_bytes, qi, 0, 2);
                     out_row[n] = (gate_sums[0] / (1.0f + internal::FastExp(-gate_sums[0]))) * up_sums[0];
                     out_row[n + 1] = (gate_sums[1] / (1.0f + internal::FastExp(-gate_sums[1]))) * up_sums[1];
                 }
@@ -2613,19 +2709,32 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
             entry.selected_path = ParseMoEProjectionPath(path_name);
             backend->RecordMoEPathTrace(entry);
         };
+        const bool projection_has_scale = projection_slot == '2' && expert.w2_scale_tensor != nullptr;
+        const bool projection_scalar_scale = projection_has_scale && IsScalarScaleSidecar(expert.w2_scale_tensor);
+        const bool quantized_scale_supported = !projection_has_scale || projection_scalar_scale;
         // Path 1: Packed INT4 (custom DenseCore format)
         CpuBackend::MoEProjectionPath packed_path = CpuBackend::MoEProjectionPath::Unknown;
-        if (!safe_reference_mode && TryRunPackedInt4Projection(backend, int4_binding, src, dst, numa_node,
-                                                               enable_inner_parallel, &packed_path)) {
+        if (!safe_reference_mode && quantized_scale_supported &&
+            TryRunPackedInt4Projection(backend, int4_binding, src, dst, numa_node, enable_inner_parallel,
+                                       &packed_path)) {
+            if (projection_scalar_scale) {
+                ApplyScalarScaleToTensor(dst, ReadScalarScaleSidecar(expert.w2_scale_tensor));
+            }
             record_path(packed_path == CpuBackend::MoEProjectionPath::PackedInt4Fast ? "direct_hwy"
                                                                                      : "backend_gemmint4");
             return;
         }
         // Path 2: Native ggml quantized GEMV (Q4_K, Q4_0, etc.) -> zero dequantization
-        if (!safe_reference_mode && raw_weight.ptr && ggml_type_id != GGML_TYPE_F32 &&
+        const bool allow_rowpair_vec_dot =
+            !(expert.use_gelu_activation && projection_slot == '2' && ggml_type_id == GGML_TYPE_Q4_K);
+        if (!safe_reference_mode && quantized_scale_supported && raw_weight.ptr && ggml_type_id != GGML_TYPE_F32 &&
             TryRunGgmlQuantizedProjection(
                 backend, raw_weight.ptr, ggml_type_id, src, dst, proj_rows, proj_cols, numa_node, enable_inner_parallel,
-                src.DataAs<float>() == input.DataAs<float>() ? input_projection_cache : nullptr)) {
+                src.DataAs<float>() == input.DataAs<float>() ? input_projection_cache : nullptr,
+                allow_rowpair_vec_dot)) {
+            if (projection_scalar_scale) {
+                ApplyScalarScaleToTensor(dst, ReadScalarScaleSidecar(expert.w2_scale_tensor));
+            }
             LogMoEMatmulPath("ggml_quantized_vecdot", static_cast<int>(src.shape[0]), static_cast<int>(src.shape[1]),
                              static_cast<int>(dst->shape[1]), int4_binding.group_size, enable_inner_parallel);
             record_path("ggml_quantized_vecdot");
@@ -2652,6 +2761,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
             debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         run_projection('1', input, w1, expert.w1_int4, expert.w1, expert.w1_type, intermediate_dim, hidden_dim,
                        &hidden);
+        LogGemma4MoETensorStats("w1", hidden, trace_ctx);
         if (debug_ffn_timing) {
             w1_duration += (std::chrono::steady_clock::now() - w1_begin);
         }
@@ -2663,6 +2773,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         const auto gate_begin =
             debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         run_projection('3', input, w3, expert.w3_int4, expert.w3, expert.w3_type, intermediate_dim, hidden_dim, &gate);
+        LogGemma4MoETensorStats("w3", gate, trace_ctx);
         if (debug_ffn_timing) {
             gate_duration += (std::chrono::steady_clock::now() - gate_begin);
         }
@@ -2694,6 +2805,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         if (debug_ffn_timing) {
             activation_duration += (std::chrono::steady_clock::now() - activation_begin);
         }
+        LogGemma4MoETensorStats("activated_gate_up", hidden, trace_ctx);
     }
     if (profile_enabled) {
         profile->w1w3_ns += static_cast<uint64_t>(
@@ -2705,6 +2817,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     const auto w2_profile_begin =
         profile_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     run_projection('2', hidden, w2, expert.w2_int4, expert.w2, expert.w2_type, hidden_dim, intermediate_dim, output);
+    LogGemma4MoETensorStats("w2", *output, trace_ctx);
     MaybeLogGemma4PackedChecksum(expert, w1, w2, w3, hidden, *output, trace_ctx);
     if (profile_enabled) {
         profile->w2_ns += static_cast<uint64_t>(
@@ -3099,6 +3212,20 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
     const bool safe_reference_mode =
         qwen36_short_prefill_safe_reference ||
         (num_experts > 0 ? IsMoESafeReferenceModeEnabled(&experts[0]) : IsMoESafeReferenceModeEnabled());
+    const bool gemma4_safe_reference_mode = model && model->arch_flags.is_gemma4 && safe_reference_mode;
+    if (gemma4_safe_reference_mode) {
+        if (!ExecuteMoEReferencePath(input_data, batch_size, static_cast<int>(hidden_dim), routing, experts,
+                                     num_experts, out_data)) {
+            std::fprintf(stderr, "[MoE_REF_EXEC] Gemma4 safe-reference execution failed; output left zeroed\n");
+            return;
+        }
+        RecordMoEReferencePathTrace(this, layer_idx, batch, routing, num_experts);
+        if (ShouldRunMoEReferenceCheck()) {
+            RunMoEReferenceCheck(input_data, batch_size, static_cast<int>(hidden_dim), routing, experts, num_experts,
+                                 out_data);
+        }
+        return;
+    }
     if (qwen36_short_prefill_safe_reference &&
         ExecuteMoEReferencePath(input_data, batch_size, static_cast<int>(hidden_dim), routing, experts, num_experts,
                                 out_data)) {
@@ -3770,7 +3897,8 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
 
             // When expert weights are ggml-quantized (Q4_K etc.), skip F32 dequant entirely.
             // The quantized GEMV path in DispatchExpertFFNImpl handles these directly via vec_dot.
-            const bool has_ggml_quant = !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp);
+            const bool has_ggml_quant = !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp) &&
+                                        (!exp.w2_scale_tensor || IsScalarScaleSidecar(exp.w2_scale_tensor));
 
             size_t dequantized_bytes = 0;
             bool dequantized_any = false;
@@ -4395,8 +4523,10 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 // The ggml vec_dot projection path is validated for small prefill
                 // expert batches; avoid building dense weights when the quantized
                 // dispatch can consume the raw ggml rows directly.
-                const bool can_use_ggml_quant_gen = !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp) &&
-                                                    work.count <= kMoEQuantizedProjectionMaxBatch;
+                const bool can_use_ggml_quant_gen =
+                    !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp) &&
+                    (!exp.w2_scale_tensor || IsScalarScaleSidecar(exp.w2_scale_tensor)) &&
+                    work.count <= kMoEQuantizedProjectionMaxBatch;
                 if (!can_use_ggml_quant_gen) {
                     w1 = make_weight_f32(
                         exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr, static_cast<int64_t>(exp.intermediate_dim),

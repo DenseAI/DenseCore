@@ -865,9 +865,9 @@ static void ComputeFlashAttentionReference(const float* q, const float* k, const
                                            float logit_softcap = 0.0f);
 
 static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, const std::vector<int>& block_table,
-                                             int context_len, const KVRetentionSpan& retained_span, int current_pos,
-                                             float scale, const float* q_data, float* out_data, int h_start,
-                                             int h_end) {
+                                             int context_len, const KVRetentionSpan& retained_span,
+                                             const KVRetentionSpan& mask_span, int current_pos, float scale,
+                                             const float* q_data, float* out_data, int h_start, int h_end) {
     if (!ud || !ud->cache || !q_data || !out_data) {
         return;
     }
@@ -936,6 +936,16 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
                 (t < retained_span.history_kept)
                     ? densecore::llm::config::MapRetainedHistoryIndex(retained_span, t)
                     : current_pos;
+            const int mask_key_pos =
+                (ud->sliding_window >= 0)
+                    ? ((t < mask_span.history_kept) ? densecore::llm::config::MapRetainedHistoryIndex(mask_span, t)
+                                                    : (current_pos + (t - mask_span.history_kept)))
+                    : token_pos;
+            if (mask_key_pos > current_pos ||
+                (ud->sliding_window >= 0 && mask_key_pos < (current_pos - ud->sliding_window))) {
+                scores[static_cast<size_t>(t)] = -INFINITY;
+                continue;
+            }
             const int logical_block = token_pos / BLOCK_SIZE;
             const int slot_idx = token_pos % BLOCK_SIZE;
             if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) {
@@ -996,6 +1006,15 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
                 (t < retained_span.history_kept)
                     ? densecore::llm::config::MapRetainedHistoryIndex(retained_span, t)
                     : current_pos;
+            const int mask_key_pos =
+                (ud->sliding_window >= 0)
+                    ? ((t < mask_span.history_kept) ? densecore::llm::config::MapRetainedHistoryIndex(mask_span, t)
+                                                    : (current_pos + (t - mask_span.history_kept)))
+                    : token_pos;
+            if (mask_key_pos > current_pos ||
+                (ud->sliding_window >= 0 && mask_key_pos < (current_pos - ud->sliding_window))) {
+                continue;
+            }
             const int logical_block = token_pos / BLOCK_SIZE;
             const int slot_idx = token_pos % BLOCK_SIZE;
             if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) continue;
@@ -1243,10 +1262,6 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     std::chrono::steady_clock::time_point kv_begin, kv_end;
     if (do_profile || do_qwen36_profile) kv_begin = std::chrono::steady_clock::now();
 
-    const char* k_base = reinterpret_cast<const char*>(k_tensor->data);
-    const char* v_base = reinterpret_cast<const char*>(v_tensor->data);
-    const size_t k_token_stride = static_cast<size_t>(k_tensor->nb[2]);
-    const size_t v_token_stride = static_cast<size_t>(v_tensor->nb[2]);
     const bool write_current_kv = ud->write_current_kv;
 
     if (!write_current_kv) {
@@ -1256,28 +1271,12 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         // Each thread writes KV for exactly token_idx == ith. No barrier needed
         // because each thread only reads from its own token's KV cache slot.
         const int token_idx = ith;
-        const int seq_idx = batch->seq_id[static_cast<size_t>(token_idx)];
-        if (seq_idx >= 0 && seq_idx < batch->num_seqs) {
-            const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
-            if (!block_table.empty()) {
-                const int pos_i = batch->pos[static_cast<size_t>(token_idx)];
-                if (pos_i >= 0) {
-                    const int logical_block = pos_i / BLOCK_SIZE;
-                    const int slot = pos_i % BLOCK_SIZE;
-                    if (logical_block >= 0 && logical_block < static_cast<int>(block_table.size())) {
-                        const int block_id = block_table[static_cast<size_t>(logical_block)];
-                        if (block_id >= 0 && block_id < ud->cache->max_blocks) {
-                            const float* k_src = reinterpret_cast<const float*>(
-                                k_base + static_cast<size_t>(token_idx) * k_token_stride);
-                            const float* v_src = reinterpret_cast<const float*>(
-                                v_base + static_cast<size_t>(token_idx) * v_token_stride);
-                            ud->cache->WriteKSlot(block_id, ud->write_layer, slot, k_src);
-                            ud->cache->WriteVSlot(block_id, ud->write_layer, slot, v_src);
-                        }
-                    }
-                }
-            }
-        }
+        int writes_ok = 0;
+        int writes_skipped = 0;
+        WriteCurrentBatchKvToCache(batch, k_tensor, ud->cache, ud->write_layer, ud->head_dim, n_head_kv,
+                                   /*is_k=*/true, token_idx, token_idx + 1, &writes_ok, &writes_skipped);
+        WriteCurrentBatchKvToCache(batch, v_tensor, ud->cache, ud->write_layer, v_head_dim, n_head_kv,
+                                   /*is_k=*/false, token_idx, token_idx + 1, &writes_ok, &writes_skipped);
     } else if (q_tokens == 1) {
         // Single-token decode only has one KV write, but the legacy barrier made
         // every GGML worker participate in kv_writers_done and spin until the last
@@ -1286,26 +1285,12 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         uint64_t epoch = 0;
         if (ith == 0) {
             epoch = ud->epoch_started.fetch_add(1, std::memory_order_acq_rel) + 1;
-            const int seq_idx = batch->seq_id[0];
-            if (seq_idx >= 0 && seq_idx < batch->num_seqs && !batch->block_tables.empty()) {
-                const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
-                if (!block_table.empty()) {
-                    const int pos_i = batch->pos[0];
-                    if (pos_i >= 0) {
-                        const int logical_block = pos_i / BLOCK_SIZE;
-                        const int slot = pos_i % BLOCK_SIZE;
-                        if (logical_block >= 0 && logical_block < static_cast<int>(block_table.size())) {
-                            const int block_id = block_table[static_cast<size_t>(logical_block)];
-                            if (block_id >= 0 && block_id < ud->cache->max_blocks) {
-                                const float* k_src = reinterpret_cast<const float*>(k_base);
-                                const float* v_src = reinterpret_cast<const float*>(v_base);
-                                ud->cache->WriteKSlot(block_id, ud->write_layer, slot, k_src);
-                                ud->cache->WriteVSlot(block_id, ud->write_layer, slot, v_src);
-                            }
-                        }
-                    }
-                }
-            }
+            int writes_ok = 0;
+            int writes_skipped = 0;
+            WriteCurrentBatchKvToCache(batch, k_tensor, ud->cache, ud->write_layer, ud->head_dim, n_head_kv,
+                                       /*is_k=*/true, 0, 1, &writes_ok, &writes_skipped);
+            WriteCurrentBatchKvToCache(batch, v_tensor, ud->cache, ud->write_layer, v_head_dim, n_head_kv,
+                                       /*is_k=*/false, 0, 1, &writes_ok, &writes_skipped);
             ud->epoch_done.store(epoch, std::memory_order_release);
         } else {
             int spin_count = 0;
@@ -1342,34 +1327,12 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         }
 
         for (int i = ith; i < q_tokens; i += nth) {
-            const int seq_idx = batch->seq_id[static_cast<size_t>(i)];
-            if (seq_idx < 0 || seq_idx >= batch->num_seqs) {
-                continue;
-            }
-            const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
-            if (block_table.empty()) {
-                continue;
-            }
-
-            const int pos_i = batch->pos[static_cast<size_t>(i)];
-            if (pos_i < 0) {
-                continue;
-            }
-            const int logical_block = pos_i / BLOCK_SIZE;
-            const int slot = pos_i % BLOCK_SIZE;
-            if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) {
-                continue;
-            }
-
-            const int block_id = block_table[static_cast<size_t>(logical_block)];
-            if (block_id < 0 || block_id >= ud->cache->max_blocks) {
-                continue;
-            }
-
-            const float* k_src = reinterpret_cast<const float*>(k_base + static_cast<size_t>(i) * k_token_stride);
-            const float* v_src = reinterpret_cast<const float*>(v_base + static_cast<size_t>(i) * v_token_stride);
-            ud->cache->WriteKSlot(block_id, ud->write_layer, slot, k_src);
-            ud->cache->WriteVSlot(block_id, ud->write_layer, slot, v_src);
+            int writes_ok = 0;
+            int writes_skipped = 0;
+            WriteCurrentBatchKvToCache(batch, k_tensor, ud->cache, ud->write_layer, ud->head_dim, n_head_kv,
+                                       /*is_k=*/true, i, i + 1, &writes_ok, &writes_skipped);
+            WriteCurrentBatchKvToCache(batch, v_tensor, ud->cache, ud->write_layer, v_head_dim, n_head_kv,
+                                       /*is_k=*/false, i, i + 1, &writes_ok, &writes_skipped);
         }
 
         const int writers_done = ud->kv_writers_done.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -1470,6 +1433,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     int cached_context_start_pos = 0;
     int cached_pos_i = -1;
     KVRetentionSpan cached_retained_span{};
+    KVRetentionSpan cached_attention_mask_span{};
     bool cached_retention_truncated = false;
     bool cached_noncontiguous_retention = false;
     bool cached_token_valid = false;
@@ -1532,6 +1496,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
             cached_context_start_pos = 0;
             cached_pos_i = -1;
             cached_retained_span = {};
+            cached_attention_mask_span = {};
             cached_retention_truncated = false;
             cached_noncontiguous_retention = false;
             cached_token_valid = false;
@@ -1553,18 +1518,22 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                         cached_block_table = &block_table;
                         cached_pos_i = pos_i;
                         KVRetentionPolicy retention_policy = GetKVRetentionPolicy();
-                        if (ud->force_full_history) {
+                        if (ud->force_full_history || ud->sliding_window >= 0) {
                             retention_policy.enabled = false;
                             retention_policy.sliding_window = -1;
                             retention_policy.sink_tokens = 0;
                         }
-                        if (ud->sliding_window >= 0) {
-                            retention_policy.enabled = true;
-                            retention_policy.sliding_window = ud->sliding_window;
-                            retention_policy.sink_tokens = 0;
-                        }
                         cached_retained_span =
                             densecore::llm::config::ComputeKVRetentionSpan(n_past_i, retention_policy);
+                        KVRetentionPolicy attention_mask_policy;
+                        attention_mask_policy.enabled = ud->sliding_window >= 0;
+                        attention_mask_policy.sliding_window = ud->sliding_window >= 0 ? ud->sliding_window : -1;
+                        attention_mask_policy.sink_tokens =
+                            std::max(0, densecore::env::ParseIntEnv(
+                                            "DENSECORE_KV_SINK_TOKENS",
+                                            densecore::env::ParseIntEnv("DENSECORE_SINK_TOKENS", 0)));
+                        cached_attention_mask_span =
+                            densecore::llm::config::ComputeKVRetentionSpan(n_past_i, attention_mask_policy);
                         cached_retention_truncated = cached_retained_span.history_kept < n_past_i;
                         cached_noncontiguous_retention =
                             cached_retention_truncated && cached_retained_span.sink_kept > 0;
@@ -1593,8 +1562,9 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         const auto& block_table = *cached_block_table;
 
         if (!hwy_ready || cached_noncontiguous_retention) {
-            ComputePagedAttentionScalarHeads(ud, block_table, cached_context_len, cached_retained_span, cached_pos_i,
-                                             scale, q_token, out_token, h_start, h_end);
+            ComputePagedAttentionScalarHeads(ud, block_table, cached_context_len, cached_retained_span,
+                                             cached_attention_mask_span, cached_pos_i, scale, q_token, out_token,
+                                             h_start, h_end);
             if (ShouldRunPagedAttentionEagerReferenceProbe(ud->layer, token_idx)) {
                 LogPagedAttentionEagerReferenceProbe(ud, block_table, cached_context_len, cached_retained_span,
                                                     cached_pos_i, q_token, out_token, token_idx, cached_seq_idx,
@@ -1624,7 +1594,10 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
             q_token, shared_k_block_ptrs_data ? shared_k_block_ptrs_data : k_block_ptrs.data(),
             shared_v_block_ptrs_data ? shared_v_block_ptrs_data : v_block_ptrs.data(), cache_type_id, ud->n_head,
             ud->head_dim, v_head_dim, ud->cache->n_head_kv, static_cast<int32_t>(block_table.size()),
-            cached_context_len, cached_context_start_pos, static_cast<int64_t>(k_cache_layout.head_stride_bytes),
+            cached_context_len, cached_context_start_pos, cached_pos_i, ud->sliding_window,
+            cached_attention_mask_span.history_kept, cached_attention_mask_span.sink_kept,
+            cached_attention_mask_span.tail_start,
+            static_cast<int64_t>(k_cache_layout.head_stride_bytes),
             static_cast<int64_t>(k_cache_layout.slot_stride_bytes),
             static_cast<int64_t>(v_cache_layout.head_stride_bytes),
             static_cast<int64_t>(v_cache_layout.slot_stride_bytes), scale, ud->logit_softcap, out_token, h_start,
@@ -1634,8 +1607,9 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
             thread_local std::vector<float> scalar_ref;
             const size_t token_elems = static_cast<size_t>(ud->n_head) * static_cast<size_t>(v_head_dim);
             scalar_ref.assign(token_elems, 0.0f);
-            ComputePagedAttentionScalarHeads(ud, block_table, cached_context_len, cached_retained_span, cached_pos_i,
-                                             scale, q_token, scalar_ref.data(), h_start, h_end);
+            ComputePagedAttentionScalarHeads(ud, block_table, cached_context_len, cached_retained_span,
+                                             cached_attention_mask_span, cached_pos_i, scale, q_token,
+                                             scalar_ref.data(), h_start, h_end);
 
             float max_abs_diff = 0.0f;
             int max_h = -1;
@@ -3412,6 +3386,15 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         input->type == GGML_TYPE_F32 && M > 1) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "qwen35_prefill_quant_correctness");
+        return ggml_mul_mat(ctx, weight, input);
+    }
+
+    const int gemma4_prefill_native_quant_max_cols =
+        ParsePositiveEnvInt("DENSECORE_GEMMA4_PREFILL_NATIVE_QUANT_MAX_COLS", 512);
+    if (model && model->arch_flags.is_gemma4 && ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 &&
+        M > 1 && M <= gemma4_prefill_native_quant_max_cols) {
+        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
+                          "gemma4_short_prefill_quant_correctness");
         return ggml_mul_mat(ctx, weight, input);
     }
 

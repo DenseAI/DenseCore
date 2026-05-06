@@ -27,6 +27,7 @@
 #include "densecore/backend/cpu_backend.h"
 #include "densecore.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "densecore/runtime/inference.h"
 #include "densecore/models/model_types.h"
 #include "densecore/moe/profiler.h"
@@ -52,6 +53,15 @@ std::vector<float> ComputeSharedExpertMergedOutputForTest(const std::vector<floa
                                                           const std::vector<float>& down_weight,
                                                           const std::vector<float>& shared_gate_logits_scalar,
                                                           int tokens, int hidden_dim, int intermediate_dim);
+bool ShouldRunMoESharedDenseBranchForTest(const TransformerModel* model, bool is_gemma4_moe,
+                                          const struct ggml_tensor* ffn_gate, const struct ggml_tensor* ffn_up,
+                                          const struct ggml_tensor* ffn_down);
+bool RunGgmlQuantizedProjectionForTest(CpuBackend* backend, const void* weight_ptr, int ggml_type_id,
+                                       const Tensor& input, Tensor* output, int64_t N, int64_t K);
+bool RunGgmlQuantizedFusedSwiGLUProjectionForTest(CpuBackend* backend, const void* gate_weight_ptr,
+                                                  int gate_ggml_type_id, const void* up_weight_ptr,
+                                                  int up_ggml_type_id, const Tensor& input, Tensor* output,
+                                                  int64_t N, int64_t K);
 }  // namespace densecore::testing
 
 namespace {
@@ -124,6 +134,50 @@ void DenseExpertReference(const float* input, const float* w1, const float* w2, 
     DenseMatMulTransBReference(hidden.data(), w2, output, batch, intermediate_dim, hidden_dim);
 }
 
+void QuantizeRowsForTest(ggml_type qtype, const std::vector<float>& src, int rows, int cols,
+                         std::vector<uint8_t>* quantized) {
+    ASSERT_NE(quantized, nullptr);
+    const auto* traits = ggml_get_type_traits_cpu(qtype);
+    ASSERT_NE(traits, nullptr);
+    ASSERT_NE(traits->from_float, nullptr);
+    const size_t row_bytes = ggml_row_size(qtype, cols);
+    quantized->assign(static_cast<size_t>(rows) * row_bytes, 0);
+    for (int row = 0; row < rows; ++row) {
+        traits->from_float(src.data() + static_cast<size_t>(row) * cols,
+                           quantized->data() + static_cast<size_t>(row) * row_bytes, cols);
+    }
+}
+
+void GgmlQuantizedProjectionVecDotReference(ggml_type weight_type, const std::vector<uint8_t>& weight,
+                                            const std::vector<float>& input, int M, int K, int N,
+                                            std::vector<float>* output) {
+    ASSERT_NE(output, nullptr);
+    const auto* weight_traits = ggml_get_type_traits_cpu(weight_type);
+    ASSERT_NE(weight_traits, nullptr);
+    ASSERT_NE(weight_traits->vec_dot, nullptr);
+    const ggml_type input_type = weight_traits->vec_dot_type;
+    const auto* input_traits = ggml_get_type_traits_cpu(input_type);
+    ASSERT_NE(input_traits, nullptr);
+    ASSERT_NE(input_traits->from_float, nullptr);
+
+    const size_t weight_row_bytes = ggml_row_size(weight_type, K);
+    const size_t input_row_bytes = ggml_row_size(input_type, K);
+    std::vector<uint8_t> qinput(static_cast<size_t>(M) * input_row_bytes);
+    for (int m = 0; m < M; ++m) {
+        input_traits->from_float(input.data() + static_cast<size_t>(m) * K,
+                                 qinput.data() + static_cast<size_t>(m) * input_row_bytes, K);
+    }
+
+    output->assign(static_cast<size_t>(M * N), 0.0f);
+    for (int m = 0; m < M; ++m) {
+        const void* qi = qinput.data() + static_cast<size_t>(m) * input_row_bytes;
+        for (int n = 0; n < N; ++n) {
+            const void* w_row = weight.data() + static_cast<size_t>(n) * weight_row_bytes;
+            weight_traits->vec_dot(K, output->data() + static_cast<size_t>(m * N + n), 0, w_row, 0, qi, 0, 1);
+        }
+    }
+}
+
 class EnvGuard {
 public:
     EnvGuard(const char* name, const char* value) : name_(name ? name : "") {
@@ -172,6 +226,17 @@ struct PackedExpertFixture {
     std::vector<float> w2_zeros;
     std::vector<float> w3_scales;
     std::vector<float> w3_zeros;
+    CpuBackend::ExpertWeights expert;
+};
+
+struct QuantizedExpertFixture {
+    std::vector<float> input;
+    std::vector<float> w1_ref;
+    std::vector<float> w2_ref;
+    std::vector<float> w3_ref;
+    std::vector<uint8_t> w1_quant;
+    std::vector<uint8_t> w2_quant;
+    std::vector<uint8_t> w3_quant;
     CpuBackend::ExpertWeights expert;
 };
 
@@ -228,6 +293,65 @@ PackedExpertFixture BuildPackedExpertFixture(int batch, int hidden_dim, int inte
                               intermediate_dim, hidden_dim};
     fixture.expert.w3_int4 = {fixture.w3_packed.data(), fixture.w3_scales.data(), fixture.w3_zeros.data(), group_size,
                               hidden_dim, intermediate_dim};
+    return fixture;
+}
+
+QuantizedExpertFixture BuildQuantizedExpertFixture(int batch, int hidden_dim, int intermediate_dim, ggml_type qtype,
+                                                   int seed) {
+    const ggml_type_traits_cpu* traits = ggml_get_type_traits_cpu(qtype);
+    QuantizedExpertFixture fixture;
+    if (!traits || !traits->from_float) {
+        ADD_FAILURE() << "Missing ggml quantize traits for qtype=" << static_cast<int>(qtype);
+        return fixture;
+    }
+    const ggml_type_traits* type_traits = ggml_get_type_traits(qtype);
+    if (!type_traits || !type_traits->to_float) {
+        ADD_FAILURE() << "Missing ggml dequantize traits for qtype=" << static_cast<int>(qtype);
+        return fixture;
+    }
+
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> input_dist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> weight_dist(-0.25f, 0.25f);
+
+    fixture.input.resize(static_cast<size_t>(batch * hidden_dim));
+    for (float& v : fixture.input) {
+        v = input_dist(rng);
+    }
+
+    auto quantize_rows = [&](int rows, int cols, std::vector<uint8_t>* quant_out, std::vector<float>* ref_out) {
+        if (!quant_out || !ref_out) {
+            ADD_FAILURE() << "Missing quantized fixture outputs";
+            return;
+        }
+        std::vector<float> src(static_cast<size_t>(rows * cols), 0.0f);
+        for (float& v : src) {
+            v = weight_dist(rng);
+        }
+        const size_t row_bytes = ggml_row_size(qtype, cols);
+        quant_out->resize(static_cast<size_t>(rows) * row_bytes);
+        ref_out->resize(static_cast<size_t>(rows * cols), 0.0f);
+        for (int r = 0; r < rows; ++r) {
+            const float* src_row = src.data() + static_cast<size_t>(r) * cols;
+            uint8_t* quant_row = quant_out->data() + static_cast<size_t>(r) * row_bytes;
+            float* ref_row = ref_out->data() + static_cast<size_t>(r) * cols;
+            traits->from_float(src_row, quant_row, cols);
+            type_traits->to_float(quant_row, ref_row, cols);
+        }
+    };
+
+    quantize_rows(intermediate_dim, hidden_dim, &fixture.w1_quant, &fixture.w1_ref);
+    quantize_rows(hidden_dim, intermediate_dim, &fixture.w2_quant, &fixture.w2_ref);
+    quantize_rows(intermediate_dim, hidden_dim, &fixture.w3_quant, &fixture.w3_ref);
+
+    fixture.expert.hidden_dim = hidden_dim;
+    fixture.expert.intermediate_dim = intermediate_dim;
+    fixture.expert.w1 = {fixture.w1_quant.data(), fixture.w1_quant.size()};
+    fixture.expert.w2 = {fixture.w2_quant.data(), fixture.w2_quant.size()};
+    fixture.expert.w3 = {fixture.w3_quant.data(), fixture.w3_quant.size()};
+    fixture.expert.w1_type = static_cast<int>(qtype);
+    fixture.expert.w2_type = static_cast<int>(qtype);
+    fixture.expert.w3_type = static_cast<int>(qtype);
     return fixture;
 }
 
@@ -1257,6 +1381,460 @@ TEST(NumaStickyRouting, ForwardMoE_ExpertFlagForcesReferencePathOnArm) {
 #endif
 }
 
+TEST(NumaStickyRouting, ForwardMoESmallDecodeExpertParallelMatchesSerialRoutingOrder) {
+    if (std::thread::hardware_concurrency() < 2) {
+        GTEST_SKIP() << "Needs at least two hardware threads to exercise expert-parallel small decode.";
+    }
+
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int batch = 1;
+    constexpr int top_k = 8;
+    constexpr int hidden_dim = 512;
+    constexpr int intermediate_dim = 1024;
+    constexpr int group_size = 32;
+
+    std::vector<PackedExpertFixture> fixtures;
+    fixtures.reserve(top_k);
+    for (int expert_id = 0; expert_id < top_k; ++expert_id) {
+        fixtures.emplace_back(BuildPackedExpertFixture(batch, hidden_dim, intermediate_dim, group_size, 1200 + expert_id));
+    }
+
+    const std::vector<float> shared_input = fixtures.front().input;
+    std::vector<CpuBackend::ExpertWeights> experts;
+    experts.reserve(top_k);
+    for (int expert_id = 0; expert_id < top_k; ++expert_id) {
+        experts.push_back(fixtures[static_cast<size_t>(expert_id)].expert);
+    }
+
+    moe::MoERouteResult routing;
+    routing.batch_size = batch;
+    routing.top_k = top_k;
+    routing.expert_ids.resize(top_k);
+    routing.weights = {0.19f, 0.17f, 0.15f, 0.13f, 0.11f, 0.10f, 0.08f, 0.07f};
+    routing.token_indices.resize(top_k, 0);
+    for (int expert_id = 0; expert_id < top_k; ++expert_id) {
+        routing.expert_ids[static_cast<size_t>(expert_id)] = expert_id;
+    }
+
+    std::vector<float> serial_output(static_cast<size_t>(batch * hidden_dim), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(const_cast<float*>(shared_input.data()), batch, hidden_dim);
+    Tensor serial_output_tensor = Tensor::Make2D(serial_output.data(), batch, hidden_dim);
+    backend.ForwardMoE(input_tensor, routing, experts, &serial_output_tensor);
+
+    std::vector<float> parallel_output(static_cast<size_t>(batch * hidden_dim), 0.0f);
+    Tensor parallel_output_tensor = Tensor::Make2D(parallel_output.data(), batch, hidden_dim);
+    EnvGuard parallel_enable("DENSECORE_MOE_SMALL_DECODE_EXPERT_PARALLEL", "1");
+    EnvGuard parallel_workers("DENSECORE_MOE_SMALL_DECODE_EXPERT_WORKERS", "4");
+    EnvGuard matmul_trace("DENSECORE_DEBUG_MOE_MATMUL_PATHS", "1");
+    ::testing::internal::CaptureStderr();
+    backend.ForwardMoE(input_tensor, routing, experts, &parallel_output_tensor);
+    const std::string stderr_output = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(stderr_output.find("[MOE_SMALL_DECODE] path=expert_parallel"), std::string::npos);
+    for (size_t i = 0; i < serial_output.size(); ++i) {
+        EXPECT_NEAR(parallel_output[i], serial_output[i], 1e-5f) << "index=" << i;
+    }
+}
+
+TEST(NumaStickyRouting, GgmlQ4KRawBatchedMoEProjectionMatchesVecDotReference) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 8;
+    constexpr int K = 256;
+    constexpr int N = 32;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_K;
+
+    std::mt19937 rng(1801);
+    std::uniform_real_distribution<float> input_dist(-0.75f, 0.75f);
+    std::uniform_real_distribution<float> weight_dist(-0.20f, 0.20f);
+
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> weight_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : weight_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> weight_q4k;
+    QuantizeRowsForTest(qtype, weight_f32, N, K, &weight_q4k);
+
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> reference(static_cast<size_t>(M * N), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+
+    std::vector<float> weight_deq(static_cast<size_t>(N * K), 0.0f);
+    {
+        const auto* traits = ggml_get_type_traits(qtype);
+        ASSERT_NE(traits, nullptr);
+        ASSERT_NE(traits->to_float, nullptr);
+        const size_t row_bytes = ggml_row_size(qtype, K);
+        for (int row = 0; row < N; ++row) {
+            traits->to_float(weight_q4k.data() + static_cast<size_t>(row) * row_bytes,
+                             weight_deq.data() + static_cast<size_t>(row) * K, K);
+        }
+    }
+    DenseMatMulTransBReference(input.data(), weight_deq.data(), reference.data(), M, K, N);
+
+    EnvGuard raw_batched("DENSECORE_MOE_ENABLE_Q4K_RAW_BATCHED_SCALAR", "1");
+    ASSERT_TRUE(densecore::testing::RunGgmlQuantizedProjectionForTest(
+        &backend, weight_q4k.data(), static_cast<int>(qtype), input_tensor, &output_tensor, N, K));
+
+    ASSERT_EQ(output.size(), reference.size());
+    for (size_t i = 0; i < output.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 4e-2f) << "index=" << i;
+    }
+}
+
+TEST(NumaStickyRouting, GgmlQ5KMultiRowMoEProjectionMatchesVecDotReference) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 7;
+    constexpr int K = 256;
+    constexpr int N = 40;
+    constexpr ggml_type qtype = GGML_TYPE_Q5_K;
+
+    std::mt19937 rng(1804);
+    std::uniform_real_distribution<float> input_dist(-0.75f, 0.75f);
+    std::uniform_real_distribution<float> weight_dist(-0.20f, 0.20f);
+
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> weight_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : weight_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> weight_q5k;
+    QuantizeRowsForTest(qtype, weight_f32, N, K, &weight_q5k);
+
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> reference;
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+
+    GgmlQuantizedProjectionVecDotReference(qtype, weight_q5k, input, M, K, N, &reference);
+
+    ASSERT_TRUE(densecore::testing::RunGgmlQuantizedProjectionForTest(
+        &backend, weight_q5k.data(), static_cast<int>(qtype), input_tensor, &output_tensor, N, K));
+
+    ASSERT_EQ(output.size(), reference.size());
+    for (size_t i = 0; i < output.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 1e-5f) << "index=" << i;
+    }
+}
+
+TEST(NumaStickyRouting, GgmlQ4KRepackedPrefillGemmProjectionMatchesDenseReferenceWithTail) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 5;
+    constexpr int K = 256;
+    constexpr int N = 32;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_K;
+
+    std::mt19937 rng(1803);
+    std::uniform_real_distribution<float> input_dist(-0.50f, 0.50f);
+    std::uniform_real_distribution<float> weight_dist(-0.20f, 0.20f);
+
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> weight_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : weight_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> weight_q4k;
+    QuantizeRowsForTest(qtype, weight_f32, N, K, &weight_q4k);
+
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> reference(static_cast<size_t>(M * N), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+
+    std::vector<float> weight_deq(static_cast<size_t>(N * K), 0.0f);
+    const auto* traits = ggml_get_type_traits(qtype);
+    ASSERT_NE(traits, nullptr);
+    ASSERT_NE(traits->to_float, nullptr);
+    const size_t row_bytes = ggml_row_size(qtype, K);
+    for (int row = 0; row < N; ++row) {
+        traits->to_float(weight_q4k.data() + static_cast<size_t>(row) * row_bytes,
+                         weight_deq.data() + static_cast<size_t>(row) * K, K);
+    }
+    DenseMatMulTransBReference(input.data(), weight_deq.data(), reference.data(), M, K, N);
+
+    EnvGuard repacked_prefill("DENSECORE_MOE_ENABLE_Q4K_REPACKED_PREFILL", "1");
+    ASSERT_TRUE(densecore::testing::RunGgmlQuantizedProjectionForTest(
+        &backend, weight_q4k.data(), static_cast<int>(qtype), input_tensor, &output_tensor, N, K));
+
+    ASSERT_EQ(output.size(), reference.size());
+    for (size_t i = 0; i < output.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 4e-2f) << "index=" << i;
+    }
+}
+
+TEST(NumaStickyRouting, GgmlQ4KRawBatchedFusedSwiGLUMatchesSeparateVecDotReference) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 8;
+    constexpr int K = 256;
+    constexpr int N = 32;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_K;
+
+    std::mt19937 rng(1802);
+    std::uniform_real_distribution<float> input_dist(-0.50f, 0.50f);
+    std::uniform_real_distribution<float> weight_dist(-0.15f, 0.15f);
+
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> gate_f32(static_cast<size_t>(N * K));
+    std::vector<float> up_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : gate_f32) v = weight_dist(rng);
+    for (float& v : up_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> gate_q4k;
+    std::vector<uint8_t> up_q4k;
+    QuantizeRowsForTest(qtype, gate_f32, N, K, &gate_q4k);
+    QuantizeRowsForTest(qtype, up_f32, N, K, &up_q4k);
+
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> reference(static_cast<size_t>(M * N), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+
+    EnvGuard stale_paired_env("DENSECORE_MOE_ENABLE_Q4K_PAIRED_VEC_DOT", "1");
+    {
+        const auto* traits = ggml_get_type_traits(qtype);
+        ASSERT_NE(traits, nullptr);
+        ASSERT_NE(traits->to_float, nullptr);
+        const size_t row_bytes = ggml_row_size(qtype, K);
+        std::vector<float> gate_deq(static_cast<size_t>(N * K), 0.0f);
+        std::vector<float> up_deq(static_cast<size_t>(N * K), 0.0f);
+        for (int row = 0; row < N; ++row) {
+            traits->to_float(gate_q4k.data() + static_cast<size_t>(row) * row_bytes,
+                             gate_deq.data() + static_cast<size_t>(row) * K, K);
+            traits->to_float(up_q4k.data() + static_cast<size_t>(row) * row_bytes,
+                             up_deq.data() + static_cast<size_t>(row) * K, K);
+        }
+        std::vector<float> gate_ref(static_cast<size_t>(M * N), 0.0f);
+        std::vector<float> up_ref(static_cast<size_t>(M * N), 0.0f);
+        DenseMatMulTransBReference(input.data(), gate_deq.data(), gate_ref.data(), M, K, N);
+        DenseMatMulTransBReference(input.data(), up_deq.data(), up_ref.data(), M, K, N);
+        for (size_t i = 0; i < reference.size(); ++i) {
+            const float gate = gate_ref[i];
+            reference[i] = (gate / (1.0f + std::exp(-gate))) * up_ref[i];
+        }
+    }
+    EnvGuard raw_batched("DENSECORE_MOE_ENABLE_Q4K_RAW_BATCHED_SCALAR", "1");
+    ASSERT_TRUE(densecore::testing::RunGgmlQuantizedFusedSwiGLUProjectionForTest(
+        &backend, gate_q4k.data(), static_cast<int>(qtype), up_q4k.data(), static_cast<int>(qtype), input_tensor,
+        &output_tensor, N, K));
+
+    ASSERT_EQ(output.size(), reference.size());
+    for (size_t i = 0; i < output.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 5e-2f) << "index=" << i;
+    }
+}
+
+TEST(NumaStickyRouting, GgmlQ4KRepackedPrefillGemmFusedSwiGLUMatchesDenseReferenceWithTail) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 5;
+    constexpr int K = 256;
+    constexpr int N = 32;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_K;
+
+    std::mt19937 rng(1804);
+    std::uniform_real_distribution<float> input_dist(-0.50f, 0.50f);
+    std::uniform_real_distribution<float> weight_dist(-0.15f, 0.15f);
+
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> gate_f32(static_cast<size_t>(N * K));
+    std::vector<float> up_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : gate_f32) v = weight_dist(rng);
+    for (float& v : up_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> gate_q4k;
+    std::vector<uint8_t> up_q4k;
+    QuantizeRowsForTest(qtype, gate_f32, N, K, &gate_q4k);
+    QuantizeRowsForTest(qtype, up_f32, N, K, &up_q4k);
+
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> reference(static_cast<size_t>(M * N), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+
+    const auto* traits = ggml_get_type_traits(qtype);
+    ASSERT_NE(traits, nullptr);
+    ASSERT_NE(traits->to_float, nullptr);
+    const size_t row_bytes = ggml_row_size(qtype, K);
+    std::vector<float> gate_deq(static_cast<size_t>(N * K), 0.0f);
+    std::vector<float> up_deq(static_cast<size_t>(N * K), 0.0f);
+    for (int row = 0; row < N; ++row) {
+        traits->to_float(gate_q4k.data() + static_cast<size_t>(row) * row_bytes,
+                         gate_deq.data() + static_cast<size_t>(row) * K, K);
+        traits->to_float(up_q4k.data() + static_cast<size_t>(row) * row_bytes,
+                         up_deq.data() + static_cast<size_t>(row) * K, K);
+    }
+    std::vector<float> gate_ref(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> up_ref(static_cast<size_t>(M * N), 0.0f);
+    DenseMatMulTransBReference(input.data(), gate_deq.data(), gate_ref.data(), M, K, N);
+    DenseMatMulTransBReference(input.data(), up_deq.data(), up_ref.data(), M, K, N);
+    for (size_t i = 0; i < reference.size(); ++i) {
+        const float gate = gate_ref[i];
+        reference[i] = (gate / (1.0f + std::exp(-gate))) * up_ref[i];
+    }
+
+    EnvGuard repacked_prefill("DENSECORE_MOE_ENABLE_Q4K_REPACKED_PREFILL", "1");
+    ASSERT_TRUE(densecore::testing::RunGgmlQuantizedFusedSwiGLUProjectionForTest(
+        &backend, gate_q4k.data(), static_cast<int>(qtype), up_q4k.data(), static_cast<int>(qtype), input_tensor,
+        &output_tensor, N, K));
+
+    ASSERT_EQ(output.size(), reference.size());
+    for (size_t i = 0; i < output.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 5e-2f) << "index=" << i;
+    }
+}
+
+TEST(NumaStickyRouting, ForwardMoEGgmlQuantizedGeneralPathFallsBackToDenseDequantForWideExpertBatches) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int batch = 8;
+    constexpr int hidden_dim = 32;
+    constexpr int intermediate_dim = 64;
+
+    QuantizedExpertFixture fixture =
+        BuildQuantizedExpertFixture(batch, hidden_dim, intermediate_dim, GGML_TYPE_Q4_0, 1701);
+
+    moe::MoERouteResult routing;
+    routing.batch_size = batch;
+    routing.top_k = 1;
+    routing.expert_ids.resize(static_cast<size_t>(batch), 0);
+    routing.weights.resize(static_cast<size_t>(batch), 1.0f);
+    routing.token_indices.resize(static_cast<size_t>(batch), 0);
+    for (int i = 0; i < batch; ++i) {
+        routing.token_indices[static_cast<size_t>(i)] = i;
+    }
+
+    std::vector<float> output(static_cast<size_t>(batch * hidden_dim), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(fixture.input.data(), batch, hidden_dim);
+    Tensor output_tensor = Tensor::Make2D(output.data(), batch, hidden_dim);
+    std::vector<CpuBackend::ExpertWeights> experts = {fixture.expert};
+
+    EnvGuard matmul_trace("DENSECORE_DEBUG_MOE_MATMUL_PATHS", "1");
+    ::testing::internal::CaptureStderr();
+    backend.ForwardMoE(input_tensor, routing, experts, &output_tensor);
+    const std::string stderr_output = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(stderr_output.find("path=dense_f32"), std::string::npos);
+    EXPECT_EQ(stderr_output.find("path=ggml_quantized_vecdot"), std::string::npos);
+
+    std::vector<float> reference(static_cast<size_t>(batch * hidden_dim), 0.0f);
+    DenseExpertReference(fixture.input.data(), fixture.w1_ref.data(), fixture.w2_ref.data(), fixture.w3_ref.data(),
+                         reference.data(), batch, hidden_dim, intermediate_dim);
+    for (size_t i = 0; i < reference.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 2e-3f) << "index=" << i;
+    }
+}
+
+TEST(NumaStickyRouting, ForwardMoEQwen36ShortPrefillSafeReferenceMatchesDenseReference) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int batch = 8;
+    constexpr int hidden_dim = 32;
+    constexpr int intermediate_dim = 64;
+    EnvGuard qwen36_short_prefill_reference("DENSECORE_QWEN36_SHORT_PREFILL_SAFE_REFERENCE", "1");
+
+    QuantizedExpertFixture fixture =
+        BuildQuantizedExpertFixture(batch, hidden_dim, intermediate_dim, GGML_TYPE_Q4_0, 1777);
+
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+
+    BatchSpec batch_spec{};
+    batch_spec.num_seqs = 1;
+    batch_spec.seq_id.resize(static_cast<size_t>(batch), 0);
+    batch_spec.n_past = {28};
+
+    moe::MoERouteResult routing;
+    routing.batch_size = batch;
+    routing.top_k = 1;
+    routing.expert_ids.resize(static_cast<size_t>(batch), 0);
+    routing.weights.resize(static_cast<size_t>(batch), 1.0f);
+    routing.token_indices.resize(static_cast<size_t>(batch), 0);
+    for (int i = 0; i < batch; ++i) {
+        routing.token_indices[static_cast<size_t>(i)] = i;
+    }
+
+    std::vector<float> output(static_cast<size_t>(batch * hidden_dim), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(fixture.input.data(), batch, hidden_dim);
+    Tensor output_tensor = Tensor::Make2D(output.data(), batch, hidden_dim);
+    std::vector<CpuBackend::ExpertWeights> experts = {fixture.expert};
+
+    backend.ForwardMoE(&model, nullptr, /*layer_idx=*/0, &batch_spec, input_tensor, routing, experts.data(),
+                       static_cast<int>(experts.size()), &output_tensor);
+
+    std::vector<float> reference(static_cast<size_t>(batch * hidden_dim), 0.0f);
+    DenseExpertReference(fixture.input.data(), fixture.w1_ref.data(), fixture.w2_ref.data(), fixture.w3_ref.data(),
+                         reference.data(), batch, hidden_dim, intermediate_dim);
+    for (size_t i = 0; i < reference.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 1e-5f) << "index=" << i;
+    }
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST(NumaStickyRouting, ForwardMoEQwen36A3BLikePackedInt4AvoidsF32FallbackOnArm) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int num_experts = 256;
+    constexpr int top_k = 8;
+    constexpr int hidden_dim = 256;
+    constexpr int intermediate_dim = 512;
+    constexpr int group_size = 32;
+
+    EnvGuard direct_hwy("DENSECORE_MOE_ARM_ENABLE_DIRECT_HWY", "0");
+    EnvGuard fused_hwy("DENSECORE_MOE_ARM_ENABLE_FUSED_SWIGLU", "0");
+    EnvGuard matmul_trace("DENSECORE_DEBUG_MOE_MATMUL_PATHS", "1");
+
+    for (int batch = 1; batch <= 4; ++batch) {
+        std::vector<float> input(static_cast<size_t>(batch * hidden_dim), 0.0f);
+        for (size_t i = 0; i < input.size(); ++i) {
+            input[i] = static_cast<float>((static_cast<int>(i % 23) - 11)) * 0.125f;
+        }
+
+        std::vector<CpuBackend::ExpertWeights> experts(static_cast<size_t>(num_experts));
+        std::vector<PackedExpertFixture> active_fixtures;
+        active_fixtures.reserve(static_cast<size_t>(batch * top_k));
+        std::vector<int> active_ids;
+        active_ids.reserve(static_cast<size_t>(batch * top_k));
+        for (int token = 0; token < batch; ++token) {
+            for (int k = 0; k < top_k; ++k) {
+                active_ids.push_back(token * 64 + k);
+            }
+        }
+        for (size_t i = 0; i < active_ids.size(); ++i) {
+            active_fixtures.emplace_back(
+                BuildPackedExpertFixture(1, hidden_dim, intermediate_dim, group_size, 2000 + static_cast<int>(i)));
+            experts[static_cast<size_t>(active_ids[i])] = active_fixtures.back().expert;
+        }
+
+        moe::MoERouteResult routing;
+        routing.batch_size = batch;
+        routing.top_k = top_k;
+        routing.expert_ids.resize(static_cast<size_t>(batch * top_k));
+        routing.weights.resize(static_cast<size_t>(batch * top_k), 1.0f / static_cast<float>(top_k));
+        routing.token_indices.resize(static_cast<size_t>(batch * top_k), 0);
+        for (int token = 0; token < batch; ++token) {
+            for (int k = 0; k < top_k; ++k) {
+                const size_t idx = static_cast<size_t>(token * top_k + k);
+                routing.expert_ids[idx] = token * 64 + k;
+                routing.token_indices[idx] = token;
+            }
+        }
+
+        std::vector<float> output(static_cast<size_t>(batch * hidden_dim), 0.0f);
+        Tensor input_tensor = Tensor::Make2D(input.data(), batch, hidden_dim);
+        Tensor output_tensor = Tensor::Make2D(output.data(), batch, hidden_dim);
+        ::testing::internal::CaptureStderr();
+        backend.ForwardMoE(input_tensor, routing, experts, &output_tensor);
+        const std::string stderr_output = ::testing::internal::GetCapturedStderr();
+
+        EXPECT_NE(stderr_output.find("path=backend_gemmint4"), std::string::npos) << "batch=" << batch;
+        EXPECT_EQ(stderr_output.find("path=dense_f32"), std::string::npos) << "batch=" << batch;
+        EXPECT_EQ(stderr_output.find("path=reference_f32"), std::string::npos) << "batch=" << batch;
+        EXPECT_EQ(stderr_output.find("path=direct_hwy"), std::string::npos) << "batch=" << batch;
+    }
+}
+#endif
+
 TEST(NumaStickyRouting, RoutingOracleSoftmaxTopKMatchesReference) {
     struct ggml_init_params params{};
     params.mem_size = 64 * 1024;
@@ -1582,6 +2160,41 @@ TEST(NumaStickyRouting, SharedExpertBranchIntegrationLikePathMatchesReference) {
     }
 }
 
+TEST(NumaStickyRouting, Gemma4RunsDenseMlpBranchWithoutSharedExpertMetadata) {
+    struct ggml_init_params params {};
+    params.mem_size = 64 * 1024;
+    params.no_alloc = false;
+    struct ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    auto* gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 4);
+    auto* up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 4);
+    auto* down = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 4);
+    ASSERT_NE(gate, nullptr);
+    ASSERT_NE(up, nullptr);
+    ASSERT_NE(down, nullptr);
+
+    TransformerModel gemma4{};
+    gemma4.arch = ModelArch::GEMMA;
+    gemma4.variant = ModelVariant::GEMMA4;
+    gemma4.arch_flags.is_gemma4 = true;
+    gemma4.moe_n_shared_experts = 0;
+
+    EXPECT_TRUE(densecore::testing::ShouldRunMoESharedDenseBranchForTest(&gemma4, true, gate, up, down));
+
+    TransformerModel qwen{};
+    qwen.arch = ModelArch::QWEN35;
+    qwen.variant = ModelVariant::QWEN36;
+    qwen.arch_flags.is_hybrid_ssm = true;
+    qwen.moe_n_shared_experts = 0;
+    EXPECT_FALSE(densecore::testing::ShouldRunMoESharedDenseBranchForTest(&qwen, false, gate, up, down));
+
+    qwen.moe_n_shared_experts = 1;
+    EXPECT_TRUE(densecore::testing::ShouldRunMoESharedDenseBranchForTest(&qwen, false, gate, up, down));
+
+    ggml_free(ctx);
+}
+
 TEST(NumaStickyRouting, BuildExpertWeightsReconstructsStackedPackedInt4Slices) {
     const int hidden_dim = 8;
     const int intermediate_dim = 4;
@@ -1762,7 +2375,7 @@ TEST(NumaStickyRouting, BuildExpertWeightsReconstructsBasePackedInt4Slices) {
     ggml_free(ctx);
 }
 
-TEST(NumaStickyRouting, BuildExpertWeightsMarksGemma4MoEExpertsForceSafeReference) {
+TEST(NumaStickyRouting, BuildExpertWeightsKeepsGemma4MoEExpertsOnFastPathByDefault) {
     struct ggml_init_params params{};
     params.mem_size = 64 * 1024;
     params.no_alloc = false;
@@ -1775,9 +2388,11 @@ TEST(NumaStickyRouting, BuildExpertWeightsMarksGemma4MoEExpertsForceSafeReferenc
     auto* w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_dim, intermediate_dim);
     auto* w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, intermediate_dim, hidden_dim);
     auto* w3 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_dim, intermediate_dim);
+    auto* down_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
     ASSERT_NE(w1, nullptr);
     ASSERT_NE(w2, nullptr);
     ASSERT_NE(w3, nullptr);
+    ASSERT_NE(down_scale, nullptr);
 
     std::vector<float> w1_data(static_cast<size_t>(hidden_dim * intermediate_dim), 0.1f);
     std::vector<float> w2_data(static_cast<size_t>(hidden_dim * intermediate_dim), 0.2f);
@@ -1785,12 +2400,14 @@ TEST(NumaStickyRouting, BuildExpertWeightsMarksGemma4MoEExpertsForceSafeReferenc
     std::memcpy(w1->data, w1_data.data(), w1_data.size() * sizeof(float));
     std::memcpy(w2->data, w2_data.data(), w2_data.size() * sizeof(float));
     std::memcpy(w3->data, w3_data.data(), w3_data.size() * sizeof(float));
+    *reinterpret_cast<float*>(down_scale->data) = 1.0f;
 
     TransformerLayer layer{};
     layer.is_moe = true;
     layer.SetExpert(0, model_keys::kFfnGate, w1);
     layer.SetExpert(0, model_keys::kFfnDown, w2);
     layer.SetExpert(0, model_keys::kFfnUp, w3);
+    layer.SetExpert(0, model_keys::kGemma4PackedDownScale, down_scale);
 
     TransformerModel gemma4_model{};
     gemma4_model.arch = ModelArch::GEMMA;
@@ -1799,7 +2416,8 @@ TEST(NumaStickyRouting, BuildExpertWeightsMarksGemma4MoEExpertsForceSafeReferenc
     const auto gemma4_experts = densecore::testing::BuildExpertWeightsForTest(&layer, &gemma4_model);
     ASSERT_EQ(gemma4_experts.size(), 1u);
     EXPECT_TRUE(gemma4_experts[0].use_gelu_activation);
-    EXPECT_TRUE(gemma4_experts[0].force_safe_reference);
+    EXPECT_FALSE(gemma4_experts[0].force_safe_reference);
+    EXPECT_EQ(gemma4_experts[0].w2_scale_tensor, down_scale);
 
     TransformerModel baseline_model{};
     baseline_model.arch = ModelArch::LLAMA;

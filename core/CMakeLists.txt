@@ -518,6 +518,7 @@ set(SOURCES
     src/llm/sampling/exec.cpp
     src/runtime/inference.cpp
     src/models/model_types.cpp
+    src/models/decoder_model_spec.cpp
     src/models/model_loader.cpp
     src/models/tokenizer.cpp
     src/runtime/memory/kv_cache.cpp
@@ -1200,6 +1201,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_qwen36_model_loader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_chat_template.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_model_descriptor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_decoder_model_spec.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_tokenizer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_gemma4_model_loader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_transformer_graph_dispatch.cpp

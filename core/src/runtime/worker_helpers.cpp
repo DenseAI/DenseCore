@@ -406,7 +406,16 @@ bool IsDecodeGraphCacheEnabled() {
 }
 
 bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model) {
-    return model != nullptr;
+    if (!model) {
+        return false;
+    }
+    // Gemma4 graphs still contain request-local custom-op userdata on the MoE,
+    // norm, and probe paths. Keep paged decode enabled, but rebuild the graph
+    // per step until those nodes have complete runtime rebind coverage.
+    if (model->arch_flags.is_gemma4) {
+        return false;
+    }
+    return true;
 }
 
 bool DoesDecodeGraphCacheRequireRuntimeRebind(const TransformerModel* model) {
@@ -1315,7 +1324,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         return;
     }
     const auto descriptor = densecore::models::DescribeModel(model);
-    if (descriptor.variant != ModelVariant::QWEN36) {
+    if (descriptor.variant != ModelVariant::QWEN35 && descriptor.variant != ModelVariant::QWEN36 &&
+        descriptor.variant != ModelVariant::GEMMA4) {
         return;
     }
     const auto ns_to_ms = [](uint64_t ns) { return static_cast<double>(ns) / 1000000.0; };
@@ -1345,9 +1355,14 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const bool sve_runtime_detected = densecore::simd::HasArmSveOrBetter(simd_level);
     const bool sve_compiled_enabled = CompiledWithArmSveForSummary();
     const bool sve2_compiled_enabled = CompiledWithArmSve2ForSummary();
+    const char* summary_tag = "[Qwen36DecodeSummary]";
+    if (descriptor.variant == ModelVariant::QWEN35) {
+        summary_tag = "[Qwen35DecodeSummary]";
+    } else if (descriptor.variant == ModelVariant::GEMMA4) {
+        summary_tag = "[Gemma4DecodeSummary]";
+    }
     std::cerr
-        << "[Qwen36DecodeSummary] req=" << req->id
-        << " finish_cause=" << DecodeFinishCauseName(req->decode_finish_cause)
+        << summary_tag << " req=" << req->id << " finish_cause=" << DecodeFinishCauseName(req->decode_finish_cause)
         << " silent_reason=" << DecodeSilentFinishReasonName(req->decode_silent_finish_reason)
         << " prompt_tokens=" << prompt_tokens << " sampled_tokens=" << req->sampled_token_count
         << " visible_tokens=" << req->visible_emitted_token_count << " steady_visible_tokens=" << steady_visible_tokens

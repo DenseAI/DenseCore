@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
 
 #include "densecore/models/model_graph_capabilities.h"
 #include "densecore/models/model_descriptor.h"
 #include "densecore/models/model_types.h"
 #include "models/model_inference_policy.h"
+#include "models/model_prompt_templates.h"
 
 TEST(ModelDescriptorTest, ResolveGemma4AliasPreservesRuntimeFlags) {
     const auto resolved = densecore::models::ResolveModelDescriptor("gemma4_text");
@@ -55,6 +57,25 @@ TEST(ModelDescriptorTest, ResolveQwen35AliasMarksHybridSSM) {
     EXPECT_TRUE(resolved.arch_flags.requires_k_norm);
 }
 
+TEST(ModelDescriptorTest, Qwen35NoThinkingBlocklistIncludesNoThinkDirectives) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.token_to_id["<think>"] = 101;
+    model.token_to_id["/no_think"] = 102;
+    model.token_to_id["/nothink"] = 103;
+
+    Request req{};
+    densecore::models::ConfigureQwenReasoningTokenBlocklistForModel(&model, &req);
+
+    EXPECT_NE(std::find(req.disallowed_token_ids.begin(), req.disallowed_token_ids.end(), 101),
+              req.disallowed_token_ids.end());
+    EXPECT_NE(std::find(req.disallowed_token_ids.begin(), req.disallowed_token_ids.end(), 102),
+              req.disallowed_token_ids.end());
+    EXPECT_NE(std::find(req.disallowed_token_ids.begin(), req.disallowed_token_ids.end(), 103),
+              req.disallowed_token_ids.end());
+}
+
 TEST(ModelDescriptorTest, ResolveQwen36AliasReusesHybridSsmRuntimeWithVariantOverride) {
     const auto resolved = densecore::models::ResolveModelDescriptor("Qwen3.6-35B-A3B");
 
@@ -100,14 +121,14 @@ TEST(ModelDescriptorTest, TokenizerMetadataOverridesDescriptorFamily) {
               densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE);
 }
 
-TEST(ModelDescriptorTest, Qwen36TokenizerMetadataUsesQwen35UnicodeFamily) {
+TEST(ModelDescriptorTest, Qwen36TokenizerMetadataUsesQwenByteBpeFamily) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
     model.variant = ModelVariant::QWEN36;
     model.tokenizer_type = "qwen3.6";
 
     EXPECT_EQ(densecore::models::ResolveTokenizerFamily(&model),
-              densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE);
+              densecore::models::TokenizerFamily::QWEN_BYTE_BPE);
 }
 
 TEST(ModelDescriptorTest, Qwen36TokenizerAliasIsRecognizedWithoutCompatibilityWarning) {

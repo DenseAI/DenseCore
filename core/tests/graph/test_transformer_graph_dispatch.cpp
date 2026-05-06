@@ -1,10 +1,43 @@
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <string>
+
+#include "densecore/models/decoder_model_spec.h"
 #include "densecore/models/transformer_graph_builder.h"
 #include "densecore/runtime/inference.h"
 #include "densecore/models/model_types.h"
 
 namespace {
+
+class ScopedEnvOverride {
+public:
+    ScopedEnvOverride(const char* name, const char* value) : name_(name ? name : "") {
+        const char* previous = std::getenv(name_.c_str());
+        if (previous) {
+            had_previous_ = true;
+            previous_ = previous;
+        }
+        if (value) {
+            setenv(name_.c_str(), value, 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+    ~ScopedEnvOverride() {
+        if (had_previous_) {
+            setenv(name_.c_str(), previous_.c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+private:
+    std::string name_;
+    bool had_previous_ = false;
+    std::string previous_;
+};
 
 TEST(BuildTransformerGraphDispatchTest, DenseDecoderSelectsRegistryBuilderRoute) {
     TransformerModel model{};
@@ -46,6 +79,27 @@ TEST(BuildTransformerGraphDispatchTest, Gemma4SelectsInlineSlidingSharedKvRoute)
     EXPECT_EQ(plan.resolution.preferred_family, densecore::models::GraphFamily::DecoderSlidingWindowSharedKV);
     EXPECT_EQ(plan.route, densecore::TransformerGraphExecutionRoute::InlineSlidingWindowSharedKV);
     EXPECT_TRUE(plan.selected_builder_name.empty());
+}
+
+TEST(BuildTransformerGraphDispatchTest, Gemma4GraphCapabilitiesUseEnvResolvedDecoderSpecSemantics) {
+    ScopedEnvOverride disable_sliding("DENSECORE_GEMMA4_DISABLE_SLIDING_WINDOW", "1");
+    ScopedEnvOverride disable_shared_kv("DENSECORE_GEMMA4_DISABLE_SHARED_KV", "1");
+
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.gemma4_layer_is_sliding = {1, 0};
+    model.gemma4_layer_kv_source = {0, 0};
+    model.gemma4_layer_n_head_kv = {4, 2};
+    model.hparams.n_head_kv = 4;
+
+    const auto spec = densecore::models::BuildDecoderModelSpec(&model);
+    const auto capabilities = densecore::models::ResolveModelGraphCapabilities(&model);
+
+    EXPECT_FALSE(spec.has_sliding_window_attention);
+    EXPECT_FALSE(spec.has_shared_kv);
+    EXPECT_FALSE(capabilities.has_sliding_window_attention);
+    EXPECT_FALSE(capabilities.has_shared_kv_source);
 }
 
 TEST(BuildTransformerGraphDispatchTest, UnsupportedMultimodalProjectionFailsClosed) {

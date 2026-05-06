@@ -251,17 +251,17 @@ TEST(EngineKVCacheConfig, HybridSsmGraphContextCanGrowBeyondLaptopCeilingWhenMem
     model.ssm_inner_size = 2048;
 
     const size_t graph_ctx_bytes = EngineState::CalculateGraphContextSize(&model);
-    EXPECT_GT(graph_ctx_bytes, static_cast<size_t>(4096) * 1024 * 1024)
-        << "Adaptive graph context sizing should grow past the 4 GB laptop-era ceiling when host memory allows it";
-    EXPECT_LE(graph_ctx_bytes, static_cast<size_t>(16) * 1024 * 1024 * 1024)
-        << "Adaptive graph context sizing must still respect the hard 16 GB safety cap";
+    EXPECT_GT(graph_ctx_bytes, static_cast<size_t>(16) * 1024 * 1024 * 1024)
+        << "Adaptive graph context sizing should no longer stop at the old half-free-memory 16 GB ceiling";
+    EXPECT_LE(graph_ctx_bytes, static_cast<size_t>(32) * 1024 * 1024 * 1024)
+        << "Adaptive graph context sizing must still leave headroom on 32 GB available-memory hosts";
 }
 
 TEST(EngineKVCacheConfig, GraphContextHonorsExtraHeadroomEnv) {
     ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "1024");
     ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
     ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
-    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", "4096");
+    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", "8192");
     ScopedEnvVar graph_ctx_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "16384");
     ScopedEnvVar graph_ctx_extra_zero("DENSECORE_GRAPH_CTX_EXTRA_MB", "0");
 
@@ -303,6 +303,69 @@ TEST(EngineKVCacheConfig, HybridSsmGraphContextGrowsForLongContextHint) {
                                                                           /*chunk_token_hint=*/2048);
 
     EXPECT_GT(long_hint_estimate.effective_seq_len, default_estimate.effective_seq_len);
-    EXPECT_GE(long_hint_estimate.long_context_safety_pad_bytes, default_estimate.long_context_safety_pad_bytes);
-    EXPECT_GE(long_hint_estimate.total_bytes, default_estimate.total_bytes);
+    EXPECT_EQ(long_hint_estimate.effective_query_len, 2048U);
+    EXPECT_EQ(long_hint_estimate.effective_num_seqs, 1U);
+    EXPECT_GT(long_hint_estimate.total_bytes, static_cast<size_t>(1024) * 1024 * 1024)
+        << "Long-context chunked graph builds still need GB-scale scratch even when the actual batch is smaller than "
+           "the runtime max batch";
+}
+
+TEST(EngineKVCacheConfig, Gemma4DecodeGraphContextUsesActualQueryShape) {
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "1024");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+    ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
+    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", "57344");
+    ScopedEnvVar graph_ctx_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "65536");
+    ScopedEnvVar graph_ctx_extra("DENSECORE_GRAPH_CTX_EXTRA_MB", "0");
+
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_embd = 4096;
+    model.hparams.n_layer = 46;
+    model.hparams.n_head = 16;
+    model.hparams.n_head_kv = 8;
+    model.hparams.n_embd_head_k = 256;
+    model.hparams.n_embd_head_v = 256;
+    model.hparams.n_ctx = 131072;
+
+    const auto decode_estimate = EngineState::EstimateGraphContextSize(&model, /*seq_len_hint=*/1264,
+                                                                       /*num_seqs_hint=*/1,
+                                                                       /*chunk_token_hint=*/1);
+
+    EXPECT_EQ(decode_estimate.effective_seq_len, 1264U);
+    EXPECT_EQ(decode_estimate.effective_query_len, 1U);
+    EXPECT_EQ(decode_estimate.effective_num_seqs, 1U);
+    EXPECT_LT(decode_estimate.total_bytes, static_cast<size_t>(2) * 1024 * 1024 * 1024)
+        << "Single-token Gemma4 decode must not be estimated like a 4-sequence long prefill graph";
+}
+
+TEST(EngineKVCacheConfig, Gemma4PrefillGraphContextDoesNotUseRuntimeBatchMaxForSingleRequest) {
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "1024");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+    ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
+    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", "57344");
+    ScopedEnvVar graph_ctx_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "65536");
+    ScopedEnvVar graph_ctx_extra("DENSECORE_GRAPH_CTX_EXTRA_MB", "0");
+
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_embd = 4096;
+    model.hparams.n_layer = 46;
+    model.hparams.n_head = 16;
+    model.hparams.n_head_kv = 8;
+    model.hparams.n_embd_head_k = 256;
+    model.hparams.n_embd_head_v = 256;
+    model.hparams.n_ctx = 131072;
+
+    const auto prefill_estimate = EngineState::EstimateGraphContextSize(&model, /*seq_len_hint=*/1641,
+                                                                        /*num_seqs_hint=*/1,
+                                                                        /*chunk_token_hint=*/1641);
+
+    EXPECT_EQ(prefill_estimate.effective_seq_len, 1641U);
+    EXPECT_EQ(prefill_estimate.effective_query_len, 1641U);
+    EXPECT_EQ(prefill_estimate.effective_num_seqs, 1U);
+    EXPECT_LT(prefill_estimate.total_bytes, static_cast<size_t>(48) * 1024 * 1024 * 1024)
+        << "Single-request Gemma4 prefill should not inherit DENSECORE_MAX_NUM_SEQS=4 graph scratch";
 }

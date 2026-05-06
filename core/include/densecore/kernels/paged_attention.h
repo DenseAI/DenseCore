@@ -19,6 +19,8 @@ namespace kernels {
 struct PagedAttentionConfig {
     int context_len = 0;
     int context_start_pos = 0;
+    int query_pos = -1;
+    int sliding_window = -1;
     float scale = 0.0f;
     float logit_softcap = 0.0f;
 };

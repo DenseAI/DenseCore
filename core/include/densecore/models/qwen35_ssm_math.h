@@ -78,6 +78,7 @@ enum class Qwen35SSMQkvActivationPlacement {
 
 enum class Qwen35SSMQkvProjectionProfile {
     QWEN35_LEGACY = 0,
+    QWEN35_OFFICIAL,
     QWEN36_OFFICIAL,
 };
 

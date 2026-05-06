@@ -69,7 +69,7 @@ struct ggml_tensor* ExecuteNativeFlashAttentionPath(
     int* shared_prefill_mask_n, int* shared_prefill_mask_n_past, int* shared_prefill_mask_sliding_window);
 struct ggml_tensor* ExecuteStandardAttentionPath(struct ggml_context* ctx_c, TransformerModel* model,
                                                  struct ggml_tensor* Qcur, struct ggml_tensor* K, struct ggml_tensor* V,
-                                                 int n_tokens, int n_past_val, int n_total_tokens, int n_head,
+                                                 int il, int n_tokens, int n_past_val, int n_total_tokens, int n_head,
                                                  int n_head_kv, int head_dim_q, int fast_attn_sliding_window,
                                                  int attn_query_base_pos, bool use_explicit_attention_scale);
 

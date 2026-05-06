@@ -203,13 +203,12 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
         for (int layer = 0; layer < cache->n_layer; ++layer) {
             const bool is_sliding = layer < static_cast<int>(model->gemma4_layer_is_sliding.size()) &&
                                     model->gemma4_layer_is_sliding[static_cast<size_t>(layer)] != 0;
-            const int layer_n_head_kv = std::max(1, cache->layer_n_head_kv[static_cast<size_t>(layer)]);
             const int layer_k_total = is_sliding ? swa_k_total : full_k_total;
             const int layer_v_total = is_sliding ? swa_v_total : full_v_total;
             cache->layer_head_dims[static_cast<size_t>(layer)] =
-                layer_k_total > 0 ? std::max(1, layer_k_total / layer_n_head_kv) : cache->head_dim;
+                layer_k_total > 0 ? std::max(1, layer_k_total) : cache->head_dim;
             cache->layer_v_head_dims[static_cast<size_t>(layer)] =
-                layer_v_total > 0 ? std::max(1, layer_v_total / layer_n_head_kv) : cache->v_head_dim;
+                layer_v_total > 0 ? std::max(1, layer_v_total) : cache->v_head_dim;
         }
         cache->head_dim = *std::max_element(cache->layer_head_dims.begin(), cache->layer_head_dims.end());
         cache->v_head_dim = *std::max_element(cache->layer_v_head_dims.begin(), cache->layer_v_head_dims.end());

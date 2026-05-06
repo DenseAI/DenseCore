@@ -504,6 +504,123 @@ TEST(PagedKVCache, InitRejectsInvalidDimensions) {
     EXPECT_EQ(zero_len, nullptr);
 }
 
+TEST(PagedKVCache, F16VariableLayerKVLayoutUsesPerHeadPadding) {
+    TransformerModel model = MakeTestModel();
+    model.hparams.n_layer = 2;
+    model.hparams.n_head = 2;
+    model.hparams.n_head_kv = 2;
+    model.hparams.n_embd_head_k = 8;
+    model.hparams.n_embd_head_v = 8;
+    model.hparams.n_embd = 16;
+
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(&model, 1, 32, GGML_TYPE_F16, -1));
+    ASSERT_NE(cache, nullptr);
+    cache->layer_n_head_kv = {1, 2};
+    cache->layer_head_dims = {4, 8};
+    cache->layer_v_head_dims = {6, 8};
+
+    std::vector<int> blocks = cache->block_manager->Allocate(1);
+    ASSERT_EQ(blocks.size(), 1u);
+
+    const std::vector<float> k_input = {1.0f, 2.0f, 3.0f, 4.0f};
+    const std::vector<float> v_input = {10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f};
+    cache->WriteKSlot(blocks[0], /*layer=*/0, /*slot=*/0, k_input.data());
+    cache->WriteVSlot(blocks[0], /*layer=*/0, /*slot=*/0, v_input.data());
+
+    const auto k_layout = cache->GetBlockLayout();
+    const auto v_layout = cache->GetVBlockLayout();
+    ASSERT_EQ(k_layout.head_stride_bytes, static_cast<size_t>(cache->head_dim) * sizeof(ggml_fp16_t));
+    ASSERT_EQ(v_layout.head_stride_bytes, static_cast<size_t>(cache->v_head_dim) * sizeof(ggml_fp16_t));
+
+    const auto* k_slot = static_cast<const ggml_fp16_t*>(cache->GetKSlotPtr(blocks[0], 0, 0));
+    const auto* v_slot = static_cast<const ggml_fp16_t*>(cache->GetVSlotPtr(blocks[0], 0, 0));
+    ASSERT_NE(k_slot, nullptr);
+    ASSERT_NE(v_slot, nullptr);
+
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_NEAR(ggml_fp16_to_fp32(k_slot[i]), k_input[static_cast<size_t>(i)], 1e-3f);
+    }
+    for (int i = 4; i < cache->head_dim; ++i) {
+        EXPECT_FLOAT_EQ(ggml_fp16_to_fp32(k_slot[i]), 0.0f);
+    }
+    for (int i = 0; i < cache->head_dim; ++i) {
+        EXPECT_FLOAT_EQ(ggml_fp16_to_fp32(k_slot[cache->head_dim + i]), 0.0f);
+    }
+
+    for (int i = 0; i < 6; ++i) {
+        EXPECT_NEAR(ggml_fp16_to_fp32(v_slot[i]), v_input[static_cast<size_t>(i)], 1e-3f);
+    }
+    for (int i = 6; i < cache->v_head_dim; ++i) {
+        EXPECT_FLOAT_EQ(ggml_fp16_to_fp32(v_slot[i]), 0.0f);
+    }
+    for (int i = 0; i < cache->v_head_dim; ++i) {
+        EXPECT_FLOAT_EQ(ggml_fp16_to_fp32(v_slot[cache->v_head_dim + i]), 0.0f);
+    }
+
+    std::vector<float> k_roundtrip(4, 0.0f);
+    std::vector<float> v_roundtrip(6, 0.0f);
+    cache->ReadKSlot(blocks[0], 0, 0, k_roundtrip.data());
+    cache->ReadVSlot(blocks[0], 0, 0, v_roundtrip.data());
+    EXPECT_EQ(k_roundtrip, k_input);
+    EXPECT_EQ(v_roundtrip, v_input);
+}
+
+TEST(PagedKVCache, F32VariableLayerKVLayoutUsesPerHeadPadding) {
+    TransformerModel model = MakeTestModel();
+    model.hparams.n_layer = 2;
+    model.hparams.n_head = 2;
+    model.hparams.n_head_kv = 2;
+    model.hparams.n_embd_head_k = 8;
+    model.hparams.n_embd_head_v = 8;
+    model.hparams.n_embd = 16;
+
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(&model, 1, 32, GGML_TYPE_F32, -1));
+    ASSERT_NE(cache, nullptr);
+    cache->layer_n_head_kv = {1, 2};
+    cache->layer_head_dims = {4, 8};
+    cache->layer_v_head_dims = {6, 8};
+
+    std::vector<int> blocks = cache->block_manager->Allocate(1);
+    ASSERT_EQ(blocks.size(), 1u);
+
+    const std::vector<float> k_input = {1.5f, 2.5f, 3.5f, 4.5f};
+    const std::vector<float> v_input = {20.0f, 21.0f, 22.0f, 23.0f, 24.0f, 25.0f};
+    cache->WriteKSlot(blocks[0], /*layer=*/0, /*slot=*/0, k_input.data());
+    cache->WriteVSlot(blocks[0], /*layer=*/0, /*slot=*/0, v_input.data());
+
+    const auto* k_slot = static_cast<const float*>(cache->GetKSlotPtr(blocks[0], 0, 0));
+    const auto* v_slot = static_cast<const float*>(cache->GetVSlotPtr(blocks[0], 0, 0));
+    ASSERT_NE(k_slot, nullptr);
+    ASSERT_NE(v_slot, nullptr);
+
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_FLOAT_EQ(k_slot[i], k_input[static_cast<size_t>(i)]);
+    }
+    for (int i = 4; i < cache->head_dim; ++i) {
+        EXPECT_FLOAT_EQ(k_slot[i], 0.0f);
+    }
+    for (int i = 0; i < cache->head_dim; ++i) {
+        EXPECT_FLOAT_EQ(k_slot[cache->head_dim + i], 0.0f);
+    }
+
+    for (int i = 0; i < 6; ++i) {
+        EXPECT_FLOAT_EQ(v_slot[i], v_input[static_cast<size_t>(i)]);
+    }
+    for (int i = 6; i < cache->v_head_dim; ++i) {
+        EXPECT_FLOAT_EQ(v_slot[i], 0.0f);
+    }
+    for (int i = 0; i < cache->v_head_dim; ++i) {
+        EXPECT_FLOAT_EQ(v_slot[cache->v_head_dim + i], 0.0f);
+    }
+
+    std::vector<float> k_roundtrip(4, 0.0f);
+    std::vector<float> v_roundtrip(6, 0.0f);
+    cache->ReadKSlot(blocks[0], 0, 0, k_roundtrip.data());
+    cache->ReadVSlot(blocks[0], 0, 0, v_roundtrip.data());
+    EXPECT_EQ(k_roundtrip, k_input);
+    EXPECT_EQ(v_roundtrip, v_input);
+}
+
 TEST(PagedKVCache, Q40RoundTripReadWrite) {
     TransformerModel model = MakeTestModel();
     model.hparams.n_embd_head_k = 64;

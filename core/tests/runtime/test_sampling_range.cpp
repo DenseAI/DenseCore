@@ -15,6 +15,7 @@
 
 #include "ggml.h"
 #include "densecore/runtime/inference.h"
+#include "runtime/worker_internal.h"
 
 namespace {
 
@@ -444,6 +445,45 @@ TEST(SamplingRangeTest, TemperatureZeroUsesGreedyEvenWithTopKAndTopP) {
     params.seed = 123;
 
     EXPECT_EQ(SampleToken(logits, 0, params), 3);
+}
+
+TEST(SamplingRangeTest, PrefillSamplingGuardUsesLastPromptColumnForUnchunkedPrefill) {
+    int logits_idx = -1;
+    std::string error;
+    EXPECT_TRUE(ResolveSamplingLogitsColumnForRequest(
+        /*token_offset=*/0, /*processed_count=*/6, /*output_columns=*/6, /*sampled_from_prefill=*/true,
+        /*remaining_prompt_tokens=*/6, /*n_past_before=*/0, /*n_past_after=*/6, &logits_idx, &error));
+    EXPECT_EQ(logits_idx, 5);
+    EXPECT_TRUE(error.empty());
+}
+
+TEST(SamplingRangeTest, PrefillSamplingGuardAcceptsSingleColumnLastLogitPrefill) {
+    int logits_idx = -1;
+    std::string error;
+    EXPECT_TRUE(ResolveSamplingLogitsColumnForRequest(
+        /*token_offset=*/0, /*processed_count=*/6, /*output_columns=*/1, /*sampled_from_prefill=*/true,
+        /*remaining_prompt_tokens=*/6, /*n_past_before=*/0, /*n_past_after=*/6, &logits_idx, &error));
+    EXPECT_EQ(logits_idx, 0);
+    EXPECT_TRUE(error.empty());
+}
+
+TEST(SamplingRangeTest, PrefillSamplingGuardUsesFinalChunkColumnForChunkedPrefill) {
+    int logits_idx = -1;
+    std::string error;
+    EXPECT_TRUE(ResolveSamplingLogitsColumnForRequest(
+        /*token_offset=*/4, /*processed_count=*/3, /*output_columns=*/9, /*sampled_from_prefill=*/true,
+        /*remaining_prompt_tokens=*/3, /*n_past_before=*/8, /*n_past_after=*/11, &logits_idx, &error));
+    EXPECT_EQ(logits_idx, 6);
+    EXPECT_TRUE(error.empty());
+}
+
+TEST(SamplingRangeTest, PrefillSamplingGuardRejectsNonFinalPromptChunkSampling) {
+    int logits_idx = -1;
+    std::string error;
+    EXPECT_FALSE(ResolveSamplingLogitsColumnForRequest(
+        /*token_offset=*/0, /*processed_count=*/4, /*output_columns=*/4, /*sampled_from_prefill=*/true,
+        /*remaining_prompt_tokens=*/7, /*n_past_before=*/0, /*n_past_after=*/4, &logits_idx, &error));
+    EXPECT_NE(error.find("final prompt chunk"), std::string::npos);
 }
 
 }  // namespace densecore

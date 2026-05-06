@@ -376,8 +376,8 @@ void ConfigureQwenReasoningTokenBlocklistForModel(const TransformerModel* model,
     }
 
     static const char* kBlockedLiterals[] = {
-        "<think>",         "</think>",         "<tool_call>",  "</tool_call>",
-        "<tool_response>", "</tool_response>", "<|im_start|>", nullptr,
+        "<think>",          "</think>",     "<tool_call>", "</tool_call>", "<tool_response>",
+        "</tool_response>", "<|im_start|>", "/no_think",   "/nothink",     nullptr,
     };
     for (int i = 0; kBlockedLiterals[i] != nullptr; ++i) {
         auto it = model->token_to_id.find(kBlockedLiterals[i]);

@@ -125,7 +125,67 @@ inline ggml_tensor* Make2DView(ggml_context* vctx, ggml_tensor* root, int64_t co
     if (!vctx || !root || cols <= 0 || rows <= 0) {
         return nullptr;
     }
+    const size_t row_bytes = ggml_row_size(root->type, cols);
+    const size_t extent = row_bytes + static_cast<size_t>(rows - 1) * static_cast<size_t>(root->nb[1]);
+    if (extent > 0 && offset_bytes + extent > static_cast<size_t>(ggml_nbytes(root))) {
+        return nullptr;
+    }
     return ggml_view_2d(vctx, root, cols, rows, root->nb[1], offset_bytes);
+}
+
+inline ggml_tensor* Make3DView(ggml_context* vctx, ggml_tensor* root, int64_t cols, int64_t rows, int64_t depth,
+                               size_t nb1, size_t nb2, size_t offset_bytes) {
+    if (!vctx || !root || cols <= 0 || rows <= 0 || depth <= 0) {
+        return nullptr;
+    }
+    const size_t row_bytes = ggml_row_size(root->type, cols);
+    const size_t extent = row_bytes + static_cast<size_t>(rows - 1) * nb1 + static_cast<size_t>(depth - 1) * nb2;
+    if (extent > 0 && offset_bytes + extent > static_cast<size_t>(ggml_nbytes(root))) {
+        return nullptr;
+    }
+    return ggml_view_3d(vctx, root, cols, rows, depth, nb1, nb2, offset_bytes);
+}
+
+inline ggml_tensor* MakeDownScaleView(ggml_context* vctx, ggml_tensor* scale_root, const PackedExpertLayout& layout,
+                                      int expert_index, std::string* reason = nullptr) {
+    if (!scale_root) {
+        return nullptr;
+    }
+    if (expert_index < 0 || expert_index >= layout.num_experts) {
+        if (reason) *reason = "Gemma4 down scale expert index out of range";
+        return nullptr;
+    }
+    if (scale_root->type != GGML_TYPE_F32) {
+        if (reason) *reason = "Gemma4 down scale sidecar must be F32";
+        return nullptr;
+    }
+
+    for (int axis = 0; axis < GGML_MAX_DIMS; ++axis) {
+        if (scale_root->ne[axis] != layout.num_experts) {
+            continue;
+        }
+        bool other_axes_are_scalar = true;
+        for (int other = 0; other < GGML_MAX_DIMS; ++other) {
+            if (other != axis && scale_root->ne[other] != 1) {
+                other_axes_are_scalar = false;
+                break;
+            }
+        }
+        if (other_axes_are_scalar) {
+            return Make2DView(vctx, scale_root, 1, 1,
+                              static_cast<size_t>(expert_index) * static_cast<size_t>(scale_root->nb[axis]));
+        }
+    }
+
+    if (scale_root->ne[0] == layout.intermediate_dim && scale_root->ne[1] == layout.hidden_dim &&
+        layout.down_expert_axis >= 0 && scale_root->ne[layout.down_expert_axis] == layout.num_experts) {
+        return Make2DView(vctx, scale_root, layout.intermediate_dim, layout.hidden_dim,
+                          static_cast<size_t>(expert_index) *
+                              static_cast<size_t>(scale_root->nb[layout.down_expert_axis]));
+    }
+
+    if (reason) *reason = "unsupported Gemma4 down scale sidecar layout";
+    return nullptr;
 }
 
 inline bool ResolvePackedProjectionBinding(ggml_context* vctx, const TransformerModel::Int4WeightBinding& root_binding,
@@ -198,8 +258,8 @@ inline bool MakePackedExpertViews(ggml_context* vctx, ggml_tensor* gate_up_root,
             static_cast<size_t>(expert_index) * static_cast<size_t>(gate_up_root->nb[layout.gate_up_expert_axis]);
     }
     if (layout.gate_up_kind == PackedGateUpLayoutKind::RowStacked3D) {
-        out->gate_up = ggml_view_2d(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim * 2,
-                                    gate_up_root->nb[1], gate_up_expert_offset);
+        out->gate_up =
+            Make2DView(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim * 2, gate_up_expert_offset);
         out->gate_view = {
             Make2DView(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim, gate_up_expert_offset),
             expert_index,
@@ -223,8 +283,8 @@ inline bool MakePackedExpertViews(ggml_context* vctx, ggml_tensor* gate_up_root,
                         gate_up_expert_offset +
                             static_cast<size_t>(layout.intermediate_dim) * static_cast<size_t>(gate_up_root->nb[1])};
     } else {
-        out->gate_up = ggml_view_3d(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim, 2,
-                                    gate_up_root->nb[1], gate_up_root->nb[2], gate_up_expert_offset);
+        out->gate_up = Make3DView(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim, 2,
+                                  gate_up_root->nb[1], gate_up_root->nb[2], gate_up_expert_offset);
         out->gate_view = {
             Make2DView(vctx, gate_up_root, layout.hidden_dim, layout.intermediate_dim, gate_up_expert_offset),
             expert_index,
@@ -263,13 +323,10 @@ inline bool MakePackedExpertViews(ggml_context* vctx, ggml_tensor* gate_up_root,
     out->down = out->down_view.tensor;
 
     if (down_scale_root) {
-        if (down_scale_root->type != GGML_TYPE_F32) {
-            if (reason) *reason = "Gemma4 down scale sidecar must be F32";
+        out->down_scale = MakeDownScaleView(vctx, down_scale_root, layout, expert_index, reason);
+        if (!out->down_scale) {
             return false;
         }
-        out->down_scale = Make2DView(vctx, down_scale_root, layout.intermediate_dim, layout.hidden_dim,
-                                     static_cast<size_t>(expert_index) *
-                                         static_cast<size_t>(down_scale_root->nb[layout.down_expert_axis]));
     }
 
     if (!out->gate || !out->up || !out->down || !out->gate_up) {

@@ -711,6 +711,7 @@ Qwen35SSMQkvProjectionContract ResolveQwen35SSMQkvProjectionContract(Qwen35SSMQk
         contract.share_qk_by_group = true;
         contract.dense_value_heads = true;
         break;
+    case Qwen35SSMQkvProjectionProfile::QWEN35_OFFICIAL:
     case Qwen35SSMQkvProjectionProfile::QWEN36_OFFICIAL:
         contract.raw_layout = Qwen35SSMQkvRawLayout::QKV;
         contract.activation = Qwen35SSMQkvActivationPlacement::NONE;

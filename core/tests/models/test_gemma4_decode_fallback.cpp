@@ -281,6 +281,20 @@ BatchSpec MakeSingleTokenDecodeBatch(int token_id, int n_past, int block_id) {
     return batch;
 }
 
+BatchSpec MakeSingleSequencePrefillBatch(std::vector<int> tokens) {
+    BatchSpec batch{};
+    batch.num_seqs = 1;
+    batch.tokens = std::move(tokens);
+    batch.seq_id.assign(batch.tokens.size(), 0);
+    batch.pos.resize(batch.tokens.size());
+    for (size_t i = 0; i < batch.pos.size(); ++i) {
+        batch.pos[i] = static_cast<int>(i);
+    }
+    batch.block_tables = {{0}};
+    batch.n_past = {0};
+    return batch;
+}
+
 void WriteLayerSlots(PagedKVCache* cache, int layer, int block_id, const std::vector<SlotVec>& k_slots,
                      const std::vector<SlotVec>& v_slots) {
     ASSERT_NE(cache, nullptr);
@@ -443,6 +457,21 @@ TEST(Gemma4FallbackDecodeTest, LayerOutputScaleAppliesAfterResidualAddition) {
 
     EXPECT_LT(L1Diff(runtime, expected_scaled_after_residual), 1e-4f);
     EXPECT_GT(L1Diff(runtime, expected_scaled_branch_only), 0.1f);
+}
+
+TEST(Gemma4FallbackDecodeTest, MoEPrefillGraphReturnsOnlyPromptEndLogits) {
+    auto moe_model = MakeBaseGemma4GraphModel(/*n_layer=*/0);
+    moe_model->hparams.n_experts = 128;
+    const BatchSpec prefill = MakeSingleSequencePrefillBatch({1, 1, 1});
+
+    const std::vector<float> moe_logits =
+        densecore::testing::ExecuteTransformerGraphForTest(moe_model.get(), nullptr, prefill, /*num_threads=*/1);
+    ASSERT_EQ(moe_logits.size(), static_cast<size_t>(kTinyGraphVocab));
+
+    auto dense_model = MakeBaseGemma4GraphModel(/*n_layer=*/0);
+    const std::vector<float> dense_logits =
+        densecore::testing::ExecuteTransformerGraphForTest(dense_model.get(), nullptr, prefill, /*num_threads=*/1);
+    ASSERT_EQ(dense_logits.size(), static_cast<size_t>(kTinyGraphVocab * prefill.tokens.size()));
 }
 
 TEST(Gemma4FallbackDecodeTest, SlidingWindowDecodeMasksRetainedHistoryInStandardPath) {

@@ -144,5 +144,6 @@ void FinalizeDecodeSilentFinishReason(Request* req);
 void LogRequestDecodeSummary(const Request* req, const TransformerModel* model);
 bool HasDecodeVisibleProgressStalled(const Request* req, std::chrono::steady_clock::time_point now);
 int ResolveQwen36PrefillChunkTokens(const TransformerModel* model, const Request* req);
+int ResolveGemma4PrefillChunkTokens(const TransformerModel* model, const Request* req);
 
 #endif  // DENSECORE_WORKER_INTERNAL_H

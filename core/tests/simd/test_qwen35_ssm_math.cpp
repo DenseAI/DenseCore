@@ -44,7 +44,8 @@ void RunReferenceStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float
         beta += cfg.beta_row[i] * cfg.input_t[i];
     }
 
-    const float g = -std::exp(cfg.a_log) * SoftplusRef(alpha);
+    const float g = cfg.a_log_prescaled ? (cfg.a_log * SoftplusRef(alpha))
+                                        : (-std::exp(cfg.a_log) * SoftplusRef(alpha));
     const float decay = std::exp(g);
     const float beta_gate = SigmoidRef(beta);
 
@@ -55,9 +56,8 @@ void RunReferenceStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float
         k_sum_sq += cfg.k_head[i] * cfg.k_head[i];
     }
 
-    const float q_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k));
-    const float q_inv_norm = q_scale / std::sqrt(q_sum_sq + cfg.norm_eps);
-    const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+    const float q_inv_norm = 1.0f / std::max(std::sqrt(q_sum_sq), cfg.norm_eps);
+    const float k_inv_norm = 1.0f / std::max(std::sqrt(k_sum_sq), cfg.norm_eps);
     for (int i = 0; i < cfg.head_dim_k; ++i) {
         q_norm[static_cast<size_t>(i)] = cfg.q_head[i] * q_inv_norm;
         k_norm[static_cast<size_t>(i)] = cfg.k_head[i] * k_inv_norm;
@@ -88,8 +88,8 @@ void RunReferenceStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float
         for (int k = 0; k < cfg.head_dim_k; ++k) {
             sum += state_kv[static_cast<size_t>(k) * cfg.head_dim_v + v] * q_norm[static_cast<size_t>(k)];
         }
-        y_head[v] = sum;
-        sum_sq += sum * sum;
+        y_head[v] = sum / std::sqrt(static_cast<float>(cfg.head_dim_v));
+        sum_sq += y_head[v] * y_head[v];
     }
 
     const float rms = std::sqrt(sum_sq / cfg.head_dim_v + cfg.norm_eps);
@@ -143,12 +143,26 @@ TEST(Qwen35SSMMathTest, MatchesReferenceStep) {
     cfg.norm_eps = 1e-6f;
 
     Qwen35SSMHeadStepStats stats{};
+    stats.alpha_beta_dot_ms = -1.0;
+    stats.norm_ms = -1.0;
+    stats.decay_state_ms = -1.0;
+    stats.kv_mem_ms = -1.0;
+    stats.state_update_ms = -1.0;
+    stats.output_accum_ms = -1.0;
+    stats.rms_gate_ms = -1.0;
     ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(cfg, state.data(), y.data(), &stats));
     RunReferenceStep(cfg, ref_state.data(), ref_y.data());
 
     EXPECT_TRUE(std::isfinite(stats.g));
     EXPECT_LT(stats.decay, 1.0f);
     EXPECT_GT(stats.decay, 0.0f);
+    EXPECT_GE(stats.alpha_beta_dot_ms, 0.0);
+    EXPECT_GE(stats.norm_ms, 0.0);
+    EXPECT_GE(stats.decay_state_ms, 0.0);
+    EXPECT_GE(stats.kv_mem_ms, 0.0);
+    EXPECT_GE(stats.state_update_ms, 0.0);
+    EXPECT_GE(stats.output_accum_ms, 0.0);
+    EXPECT_GE(stats.rms_gate_ms, 0.0);
     EXPECT_LT(MaxAbsDiff(state, ref_state), 1e-6f);
     EXPECT_LT(MaxAbsDiff(y, ref_y), 1e-6f);
 }
@@ -191,6 +205,66 @@ TEST(Qwen35SSMMathTest, PositiveALogStillProducesContractiveDecay) {
     EXPECT_GT(stats.decay, 0.0f);
     for (float value : state) EXPECT_TRUE(std::isfinite(value));
     for (float value : y) EXPECT_TRUE(std::isfinite(value));
+}
+
+TEST(Qwen35SSMMathTest, PrescaledALogMatchesReferenceStep) {
+    const std::vector<float> input = {0.2f, -0.4f, 0.1f, 0.3f};
+    const std::vector<float> q = {0.15f, -0.35f};
+    const std::vector<float> k = {0.45f, 0.25f};
+    const std::vector<float> v = {0.8f, -0.2f, 0.6f};
+    const std::vector<float> z = {-0.1f, 0.4f, 0.2f};
+    const std::vector<float> alpha_row = {0.12f, -0.08f, 0.04f, 0.11f};
+    const std::vector<float> beta_row = {-0.05f, 0.02f, 0.09f, -0.03f};
+    const std::vector<float> norm = {0.95f, 1.05f, 1.0f};
+    std::vector<float> state = {
+        0.05f, -0.15f, 0.25f,
+        -0.2f, 0.1f, 0.3f,
+    };
+    std::vector<float> ref_state = state;
+    std::vector<float> y(3, 0.0f);
+    std::vector<float> ref_y(3, 0.0f);
+
+    Qwen35SSMHeadStepConfig cfg{};
+    cfg.input_t = input.data();
+    cfg.q_head = q.data();
+    cfg.k_head = k.data();
+    cfg.v_head = v.data();
+    cfg.z_head = z.data();
+    cfg.alpha_row = alpha_row.data();
+    cfg.beta_row = beta_row.data();
+    cfg.norm_weight = norm.data();
+    cfg.n_embd = 4;
+    cfg.head_dim_k = 2;
+    cfg.head_dim_v = 3;
+    cfg.dt_bias = -0.15f;
+    cfg.a_log = -0.035f;
+    cfg.norm_eps = 1e-6f;
+    cfg.a_log_prescaled = true;
+
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(cfg, state.data(), y.data(), nullptr));
+    RunReferenceStep(cfg, ref_state.data(), ref_y.data());
+
+    EXPECT_LT(MaxAbsDiff(state, ref_state), 1e-6f);
+    EXPECT_LT(MaxAbsDiff(y, ref_y), 1e-6f);
+}
+
+TEST(Qwen35SSMMathTest, ReordersGroupedValueHeadsToTiledOrder) {
+    std::vector<float> values = {
+        10.0f, 11.0f,
+        12.0f, 13.0f,
+        20.0f, 21.0f,
+        22.0f, 23.0f,
+    };
+
+    Qwen35ReorderVHeadsGroupedToTiled(&values, 2, 2, 4);
+
+    const std::vector<float> expected = {
+        10.0f, 11.0f,
+        20.0f, 21.0f,
+        12.0f, 13.0f,
+        22.0f, 23.0f,
+    };
+    EXPECT_EQ(values, expected);
 }
 
 TEST(Qwen35SSMMathTest, IsolatedWritebackMatchesInPlaceReference) {

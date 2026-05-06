@@ -103,8 +103,11 @@ struct PromptArtifacts {
     std::string user_prompt;
     std::string prompt;
     std::vector<int> input_token_ids;
+    uint64_t input_token_hash = 0;
+    bool parity_trace_enabled = false;
     std::vector<int> token_results_ids;
     std::vector<int> sampling_constraints_ids;
+    int first_sampled_token_id = -1;
     std::vector<std::string> debug_lines;
     std::vector<densecore::CpuBackend::MoEPathTraceEntry> moe_path_trace;
     uint64_t moe_forward_invocation_count = 0;
@@ -163,6 +166,19 @@ std::string JsonStringArray(const std::vector<std::string>& values) {
     }
     out << "]";
     return out.str();
+}
+
+uint64_t HashTokenIds(const std::vector<int>& token_ids) {
+    uint64_t hash = 1469598103934665603ull;
+    auto mix = [&](uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    mix(static_cast<uint64_t>(token_ids.size()));
+    for (int token_id : token_ids) {
+        mix(static_cast<uint64_t>(static_cast<uint32_t>(token_id)));
+    }
+    return hash;
 }
 
 void OnTokenResult(const TokenResult* result, void* user_data) {
@@ -341,10 +357,13 @@ std::vector<std::string> ExtractDebugLines(const std::string& captured_stderr) {
     std::string line;
     while (std::getline(input, line)) {
         if (line.rfind("[LM_HEAD_TOP]", 0) == 0 || line.rfind("  [TOP]", 0) == 0 ||
+            line.rfind("[SAMPLE_TOP]", 0) == 0 || line.rfind("[SAMPLE_DBG", 0) == 0 ||
             line.rfind("[HIDDEN_SNAPSHOT]", 0) == 0 || line.rfind("[GEMMA4_SHARED_KV]", 0) == 0 ||
             line.rfind("[KV_ROUNDTRIP]", 0) == 0 ||
             line.rfind("[GEMMA4_KV_WRITE]", 0) == 0 ||
             line.rfind("[RuntimePath]", 0) == 0 || line.rfind("[REQUEST_STATE]", 0) == 0 ||
+            line.rfind("[ATTN_CORE_REF]", 0) == 0 || line.rfind("[ATTN_POST_REF]", 0) == 0 ||
+            line.rfind("[ADD_RMS_REF]", 0) == 0 || line.rfind("[SHARED_GATE_REF]", 0) == 0 ||
             line.rfind("[MOE_LOADER_LAYER]", 0) == 0 ||
             line.rfind("[MOE_WIRING_MODEL]", 0) == 0 || line.rfind("[MOE_WIRING_LAYER]", 0) == 0 ||
             line.rfind("[MOE_WIRING_SUMMARY]", 0) == 0 ||
@@ -361,14 +380,31 @@ std::vector<std::string> ExtractDebugLines(const std::string& captured_stderr) {
 PromptArtifacts BuildArtifacts(DenseCoreHandle handle, const std::string& user_prompt, const std::string& rendered_prompt) {
     PromptArtifacts artifacts;
     artifacts.user_prompt = user_prompt;
+    const bool parity_trace = []() {
+        const char* env = std::getenv("DENSECORE_GEMMA4_PARITY_TRACE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
     ScopedEnvOverride disable_auto_template("DENSECORE_AUTO_CHAT_TEMPLATE", "0");
     ScopedEnvOverride enable_lm_head_top("DENSECORE_DEBUG_LM_HEAD_TOP", "20");
     ScopedEnvOverride enable_request_state("DENSECORE_DEBUG_REQUEST_STATE", "1");
     ScopedEnvOverride enable_sampler_trace("DENSECORE_DEBUG_SAMPLER_TRACE", "1");
     ScopedEnvOverride enable_gemma4_packed_checksum("DENSECORE_DEBUG_GEMMA4_PACKED_CHECKSUM", "1");
+    ScopedEnvOverride enable_moe_trace("DENSECORE_DEBUG_MOE_TRACE", parity_trace ? "1" : nullptr);
+    ScopedEnvOverride select_moe_token("DENSECORE_DEBUG_MOE_TOKEN", parity_trace ? "0" : nullptr);
+    ScopedEnvOverride enable_sample_top("DENSECORE_DEBUG_SAMPLE", parity_trace ? "1" : nullptr);
+    ScopedEnvOverride enable_shared_kv("DENSECORE_DEBUG_GEMMA4_SHARED_KV", parity_trace ? "1" : nullptr);
+    ScopedEnvOverride enable_attention_path("DENSECORE_LOG_DECODE_ATTENTION_PATH", parity_trace ? "1" : nullptr);
+    ScopedEnvOverride enable_attention_core("DENSECORE_DEBUG_ATTN_CORE_REFERENCE", parity_trace ? "1" : nullptr);
+    ScopedEnvOverride attention_core_max_calls("DENSECORE_DEBUG_ATTN_CORE_REFERENCE_MAX_CALLS",
+                                               parity_trace ? "8" : nullptr);
+    ScopedEnvOverride enable_attention_post("DENSECORE_DEBUG_ATTN_POST_REFERENCE", parity_trace ? "1" : nullptr);
+    ScopedEnvOverride attention_post_max_calls("DENSECORE_DEBUG_ATTN_POST_REFERENCE_MAX_CALLS",
+                                               parity_trace ? "8" : nullptr);
     const DenseCoreRequestSnapshot snapshot = PreviewRuntimeRequest(handle, rendered_prompt);
     artifacts.prompt = snapshot.rendered_prompt ? snapshot.rendered_prompt : rendered_prompt;
     artifacts.input_token_ids = TokenizeText(handle, rendered_prompt);
+    artifacts.input_token_hash = HashTokenIds(artifacts.input_token_ids);
+    artifacts.parity_trace_enabled = parity_trace;
     densecore::GetTelemetryCpuBackend().ResetMoEPathTrace();
     ResetMoECallbackEntryCounter();
     ResetSamplingDebugTrace();
@@ -388,6 +424,11 @@ PromptArtifacts BuildArtifacts(DenseCoreHandle handle, const std::string& user_p
     artifacts.moe_callback_empty_routing_count = GetMoECallbackEmptyRoutingCounter();
     artifacts.moe_callback_fail_closed_count = GetMoECallbackFailClosedCounter();
     artifacts.sampling_trace = GetSamplingDebugTraceSnapshot();
+    if (!artifacts.sampling_trace.empty()) {
+        artifacts.first_sampled_token_id = artifacts.sampling_trace.front().sampled_token_id;
+    } else if (!artifacts.token_results_ids.empty()) {
+        artifacts.first_sampled_token_id = artifacts.token_results_ids.front();
+    }
     return artifacts;
 }
 
@@ -450,8 +491,11 @@ void WriteArtifactsJson(const PromptArtifacts& artifacts, const std::string& out
     out << "  \"user_prompt\": \"" << JsonEscape(artifacts.user_prompt) << "\",\n";
     out << "  \"prompt\": \"" << JsonEscape(artifacts.prompt) << "\",\n";
     out << "  \"input_token_ids\": " << JsonArray(artifacts.input_token_ids) << ",\n";
+    out << "  \"input_token_hash\": \"0x" << std::hex << artifacts.input_token_hash << std::dec << "\",\n";
+    out << "  \"parity_trace_enabled\": " << (artifacts.parity_trace_enabled ? "true" : "false") << ",\n";
     out << "  \"token_results_ids\": " << JsonArray(artifacts.token_results_ids) << ",\n";
     out << "  \"sampling_constraints_ids\": " << JsonArray(artifacts.sampling_constraints_ids) << ",\n";
+    out << "  \"first_sampled_token_id\": " << artifacts.first_sampled_token_id << ",\n";
     out << "  \"debug_lines\": " << JsonStringArray(artifacts.debug_lines) << ",\n";
     out << "  \"moe_forward_invocation_count\": " << artifacts.moe_forward_invocation_count << ",\n";
     out << "  \"moe_graph_wiring_count\": " << artifacts.moe_graph_wiring_count << ",\n";

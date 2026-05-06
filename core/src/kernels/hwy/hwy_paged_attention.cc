@@ -371,6 +371,8 @@ template <class D> HWY_INLINE void AccumulateQ4_0(D d, float* accum, const void*
 void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, const void* const* v_block_ptrs,
                         int32_t cache_type, int32_t num_heads, int32_t qk_head_dim, int32_t v_head_dim,
                         int32_t n_head_kv, int32_t block_table_size, int32_t context_len, int32_t context_start_pos,
+                        int32_t query_pos, int32_t sliding_window,
+                        int32_t mask_history_kept, int32_t mask_sink_kept, int32_t mask_tail_start,
                         int64_t k_head_stride_bytes_in, int64_t k_slot_stride_bytes_in,
                         int64_t v_head_stride_bytes_in, int64_t v_slot_stride_bytes_in, float scale,
                         float logit_softcap, float* output, int32_t head_start, int32_t head_end,
@@ -503,6 +505,23 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
                 float score = 0.0f;
                 // Calculate byte pointer to the specific K token vector
                 const int slot_idx = slot_begin + t;
+                const int physical_key_pos = block_abs_start + slot_idx;
+                const int context_index = physical_key_pos - context_start_pos;
+                int key_pos = physical_key_pos;
+                if (sliding_window >= 0 && mask_history_kept >= 0) {
+                    if (context_index < mask_history_kept) {
+                        key_pos = context_index < mask_sink_kept
+                                      ? context_index
+                                      : (mask_tail_start + (context_index - mask_sink_kept));
+                    } else {
+                        key_pos = query_pos + (context_index - mask_history_kept);
+                    }
+                }
+                if (query_pos >= 0 && (key_pos > query_pos ||
+                                       (sliding_window >= 0 && key_pos < (query_pos - sliding_window)))) {
+                    block_scores[t] = -INFINITY;
+                    continue;
+                }
                 const uint8_t* k_ptr_bytes = k_block_base + slot_idx * k_slot_stride_bytes + k_head_offset_bytes;
 
                 if (cache_type == 8) {  // Q8_0
@@ -634,14 +653,17 @@ HWY_EXPORT(PagedAttentionImpl);
 void PagedAttention_Hwy(const float* query, const void* const* k_block_ptrs, const void* const* v_block_ptrs,
                         int32_t cache_type, int32_t num_heads, int32_t qk_head_dim, int32_t v_head_dim,
                         int32_t n_head_kv, int32_t block_table_size, int32_t context_len, int32_t context_start_pos,
+                        int32_t query_pos, int32_t sliding_window,
+                        int32_t mask_history_kept, int32_t mask_sink_kept, int32_t mask_tail_start,
                         int64_t k_head_stride_bytes, int64_t k_slot_stride_bytes, int64_t v_head_stride_bytes,
                         int64_t v_slot_stride_bytes, float scale, float logit_softcap, float* output, int32_t head_start,
                         int32_t head_end, int32_t num_heads_total) {
 
     HWY_DYNAMIC_DISPATCH(PagedAttentionImpl)
     (query, k_block_ptrs, v_block_ptrs, cache_type, num_heads, qk_head_dim, v_head_dim, n_head_kv, block_table_size,
-     context_len, context_start_pos, k_head_stride_bytes, k_slot_stride_bytes, v_head_stride_bytes,
-     v_slot_stride_bytes, scale, logit_softcap, output, head_start, head_end, num_heads_total);
+     context_len, context_start_pos, query_pos, sliding_window, mask_history_kept, mask_sink_kept, mask_tail_start,
+     k_head_stride_bytes, k_slot_stride_bytes, v_head_stride_bytes, v_slot_stride_bytes, scale, logit_softcap, output,
+     head_start, head_end, num_heads_total);
 }
 
 }  // namespace hwy_kernels
@@ -710,9 +732,10 @@ void PagedAttention(const Tensor& query, const PagedKVCache& cache, int layer, c
     densecore::hwy_kernels::PagedAttention_Hwy(
         (const float*)query.data, k_block_ptrs.data(), v_block_ptrs.data(), cache_type_id, num_heads, head_dim,
         v_head_dim, cache.n_head_kv, (int32_t)block_table.size(), config.context_len, config.context_start_pos,
-        static_cast<int64_t>(k_layout.head_stride_bytes), static_cast<int64_t>(k_layout.slot_stride_bytes),
-        static_cast<int64_t>(v_layout.head_stride_bytes), static_cast<int64_t>(v_layout.slot_stride_bytes),
-        config.scale, config.logit_softcap, (float*)output->data, head_start, head_end, num_heads_total);
+        config.query_pos, config.sliding_window, -1, 0, 0, static_cast<int64_t>(k_layout.head_stride_bytes),
+        static_cast<int64_t>(k_layout.slot_stride_bytes), static_cast<int64_t>(v_layout.head_stride_bytes),
+        static_cast<int64_t>(v_layout.slot_stride_bytes), config.scale, config.logit_softcap, (float*)output->data,
+        head_start, head_end, num_heads_total);
 }
 
 }  // namespace kernels

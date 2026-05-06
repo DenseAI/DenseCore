@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
@@ -16,6 +17,9 @@
 #include <iostream>
 #include <limits>
 #include <list>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <memory>
 #include <mutex>
 #include <string>
@@ -83,6 +87,169 @@ bool IsMulGraphValidationEnabled() {
 
 bool HasNamePrefix(const ggml_tensor* tensor, const char* prefix) {
     return tensor && prefix && tensor->name[0] != '\0' && std::strncmp(tensor->name, prefix, std::strlen(prefix)) == 0;
+}
+
+size_t AlignUpBytes(size_t value, size_t alignment) {
+    if (alignment == 0) {
+        return value;
+    }
+    const size_t remainder = value % alignment;
+    return remainder == 0 ? value : value + (alignment - remainder);
+}
+
+size_t ParseSizeEnvMb(const char* name, size_t default_mb, size_t min_mb, size_t max_mb) {
+    const char* raw = std::getenv(name);
+    if (!raw || raw[0] == '\0') {
+        return default_mb;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long value = std::strtoull(raw, &end, 10);
+    if (errno != 0 || end == raw || *end != '\0') {
+        return default_mb;
+    }
+    return static_cast<size_t>(std::clamp<unsigned long long>(value, min_mb, max_mb));
+}
+
+bool ParseBoolEnvDefault(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (!raw || raw[0] == '\0') {
+        return default_value;
+    }
+    return !(std::strcmp(raw, "0") == 0 || std::strcmp(raw, "false") == 0 || std::strcmp(raw, "FALSE") == 0 ||
+             std::strcmp(raw, "off") == 0 || std::strcmp(raw, "OFF") == 0);
+}
+
+bool IsFlexibleGraphPoolSizingEnabled(const TransformerModel* model) {
+    return model && model->arch_flags.is_gemma4 && ParseBoolEnvDefault("DENSECORE_FLEXIBLE_GRAPH_POOL", true);
+}
+
+void AccumulateDryRunTensorBytes(const ggml_tensor* tensor, std::unordered_set<const ggml_tensor*>& seen,
+                                 size_t& data_bytes) {
+    if (!tensor || !seen.insert(tensor).second) {
+        return;
+    }
+    if (tensor->view_src) {
+        AccumulateDryRunTensorBytes(tensor->view_src, seen, data_bytes);
+    } else if (!tensor->data) {
+        data_bytes += ggml_nbytes_pad(tensor);
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        AccumulateDryRunTensorBytes(tensor->src[i], seen, data_bytes);
+    }
+}
+
+struct FlexibleGraphPoolSizing {
+    bool ok = false;
+    size_t required_bytes = 0;
+    size_t reserved_bytes = 0;
+    size_t dry_context_bytes = 0;
+    size_t dry_metadata_bytes = 0;
+    size_t graph_tensor_bytes = 0;
+    size_t margin_bytes = 0;
+    int graph_nodes = 0;
+};
+
+size_t ApplyFlexibleGraphPoolGrowthReserve(size_t required_bytes,
+                                           const EngineState::GraphContextEstimate& graph_estimate) {
+    if (required_bytes == 0 || graph_estimate.effective_query_len <= 1) {
+        return required_bytes;
+    }
+    constexpr size_t MB = 1024ULL * 1024ULL;
+    constexpr size_t kTwoGb = 2048ULL * MB;
+    size_t reserve_bytes = 0;
+    if (required_bytes < 4096ULL * MB) {
+        reserve_bytes = std::max<size_t>(required_bytes, std::min<size_t>(required_bytes * 2, required_bytes + kTwoGb));
+    } else if (required_bytes < 16384ULL * MB) {
+        reserve_bytes = required_bytes + std::max<size_t>(required_bytes / 2, kTwoGb);
+    } else {
+        reserve_bytes = required_bytes + std::max<size_t>(required_bytes / 4, kTwoGb);
+    }
+    return AlignUpBytes(reserve_bytes, 512ULL * MB);
+}
+
+FlexibleGraphPoolSizing MeasureFlexibleGraphPoolSize(TransformerModel* model, PagedKVCache* cache,
+                                                     const BatchSpec& batch, bool embedding_mode,
+                                                     const EngineState::GraphContextEstimate& fallback_estimate) {
+    FlexibleGraphPoolSizing result{};
+    if (!IsFlexibleGraphPoolSizingEnabled(model)) {
+        return result;
+    }
+
+    constexpr size_t MB = 1024ULL * 1024ULL;
+    const size_t fallback_mb = std::max<size_t>(512, fallback_estimate.total_bytes / MB);
+    const size_t default_dry_mb = std::min<size_t>(std::max<size_t>(fallback_mb, 1024), 4096);
+    const size_t dry_mb = ParseSizeEnvMb("DENSECORE_GRAPH_DRY_RUN_CTX_MB", default_dry_mb, 512, 8192);
+    const size_t dry_context_bytes = dry_mb * MB;
+
+    void* dry_buffer = nullptr;
+#if defined(_WIN32)
+    dry_buffer = _aligned_malloc(dry_context_bytes, 64);
+#else
+    if (posix_memalign(&dry_buffer, 64, dry_context_bytes) != 0) {
+        dry_buffer = nullptr;
+    }
+#endif
+    if (!dry_buffer) {
+        return result;
+    }
+
+    ggml_context* dry_ctx = nullptr;
+    try {
+        ggml_init_params params{
+            .mem_size = dry_context_bytes,
+            .mem_buffer = dry_buffer,
+            .no_alloc = true,
+        };
+        dry_ctx = ggml_init(params);
+        if (!dry_ctx) {
+            throw densecore::OutOfMemoryException("flexible graph pool dry-run ggml_init failed");
+        }
+        ggml_cgraph* dry_graph = ggml_new_graph_custom(dry_ctx, 32768, false);
+        ggml_tensor* dry_embd = nullptr;
+        ggml_tensor* dry_pos = nullptr;
+        ggml_tensor* dry_output =
+            BuildTransformerGraph(model, cache, dry_ctx, batch, embedding_mode, dry_graph, &dry_embd, &dry_pos);
+        if (!dry_graph || !dry_output || !dry_embd || !dry_pos) {
+            throw densecore::GraphBuildException("flexible graph pool dry-run graph build returned incomplete graph");
+        }
+
+        std::unordered_set<const ggml_tensor*> seen;
+        size_t data_bytes = 0;
+        const int n_nodes = ggml_graph_n_nodes(dry_graph);
+        for (int i = 0; i < n_nodes; ++i) {
+            AccumulateDryRunTensorBytes(ggml_graph_node(dry_graph, i), seen, data_bytes);
+        }
+        AccumulateDryRunTensorBytes(dry_embd, seen, data_bytes);
+        AccumulateDryRunTensorBytes(dry_pos, seen, data_bytes);
+        AccumulateDryRunTensorBytes(dry_output, seen, data_bytes);
+
+        const size_t metadata_bytes = ggml_used_mem(dry_ctx);
+        const size_t measured_bytes = metadata_bytes + data_bytes;
+        const size_t percent_margin = measured_bytes / 8;
+        const size_t min_margin = model->arch_flags.is_gemma4 ? 512ULL * MB : 128ULL * MB;
+        const size_t margin_bytes = std::max(percent_margin, min_margin);
+        result.ok = true;
+        result.required_bytes = AlignUpBytes(measured_bytes + margin_bytes, 64ULL * MB);
+        result.reserved_bytes = ApplyFlexibleGraphPoolGrowthReserve(result.required_bytes, fallback_estimate);
+        result.dry_context_bytes = dry_context_bytes;
+        result.dry_metadata_bytes = metadata_bytes;
+        result.graph_tensor_bytes = data_bytes;
+        result.margin_bytes = margin_bytes;
+        result.graph_nodes = n_nodes;
+    } catch (const std::exception& e) {
+        std::cerr << "[DenseCore] FlexibleGraphPool dry-run skipped: " << e.what() << std::endl;
+    }
+
+    if (dry_ctx) {
+        ggml_free(dry_ctx);
+    }
+#if defined(_WIN32)
+    _aligned_free(dry_buffer);
+#else
+    std::free(dry_buffer);
+#endif
+    return result;
 }
 
 void AccumulateQwen36SSMProjectionNodeTimes(InferenceWorkContext* work_ctx, ggml_cgraph* graph) {
@@ -333,6 +500,56 @@ bool ShouldZeroFillPrefillKVBlocks() {
     return GetWorkerRuntimeConfig().zero_fill_prefill_kv_blocks;
 }
 
+int RequestPromptTokenCountForChunking(const Request* req) {
+    if (!req) {
+        return 0;
+    }
+    return !req->prompt_tokens_for_cache.empty() ? static_cast<int>(req->prompt_tokens_for_cache.size())
+                                                 : req->prompt_token_count;
+}
+
+int ResolvePrefillChunkTokensFromEnv(const Request* req, const char* chunk_env, const char* default_env,
+                                     int default_chunk_tokens, const char* auto_min_env, int default_auto_min_tokens) {
+    if (!req || !chunk_env || !default_env || !auto_min_env) {
+        return -1;
+    }
+    const auto resolve_default_chunk_tokens = [&]() {
+        return densecore::env::ParsePositiveEnvInt(default_env, default_chunk_tokens);
+    };
+    const int explicit_tokens = densecore::env::ParsePositiveEnvInt(chunk_env, 0);
+    if (explicit_tokens > 0) {
+        return explicit_tokens;
+    }
+    const char* env_value = std::getenv(chunk_env);
+    bool explicit_auto = false;
+    if (env_value && env_value[0] != '\0') {
+        const std::string lowered = densecore::env::AsciiLowerCopy(env_value);
+        if (lowered == "off" || lowered == "false" || lowered == "no") {
+            return -1;
+        }
+        if (lowered == "on" || lowered == "true" || lowered == "yes" || lowered == "force") {
+            return resolve_default_chunk_tokens();
+        }
+        explicit_auto = (lowered == "0" || lowered == "auto");
+    }
+    if (!explicit_auto) {
+        const densecore::env::RuntimeToggleMode mode =
+            densecore::env::ParseRuntimeToggleMode(chunk_env, densecore::env::RuntimeToggleMode::Auto);
+        if (mode == densecore::env::RuntimeToggleMode::Off) {
+            return -1;
+        }
+        if (mode == densecore::env::RuntimeToggleMode::On) {
+            return resolve_default_chunk_tokens();
+        }
+    }
+    const int prompt_tokens = RequestPromptTokenCountForChunking(req);
+    if (prompt_tokens <= 0) {
+        return resolve_default_chunk_tokens();
+    }
+    const int auto_min_tokens = densecore::env::ParsePositiveEnvInt(auto_min_env, default_auto_min_tokens);
+    return prompt_tokens >= auto_min_tokens ? resolve_default_chunk_tokens() : -1;
+}
+
 int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Request* req) {
     if (!model || !req) {
         return -1;
@@ -342,44 +559,34 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
         model->hparams.n_experts <= 0) {
         return -1;
     }
-    const auto default_chunk_tokens = []() {
-        return densecore::env::ParsePositiveEnvInt("DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS", 192);
-    };
-    const int explicit_tokens = densecore::env::ParsePositiveEnvInt("DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS", 0);
-    if (explicit_tokens > 0) {
-        return explicit_tokens;
+    return ResolvePrefillChunkTokensFromEnv(req, "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS",
+                                            "DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS", 192,
+                                            "DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS", 1536);
+}
+
+int ResolveGemma4PrefillChunkTokensImpl(const TransformerModel* model, const Request* req) {
+    if (!model || !req) {
+        return -1;
     }
-    const char* env_value = std::getenv("DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS");
-    bool explicit_auto = false;
-    if (env_value && env_value[0] != '\0') {
-        const std::string lowered = densecore::env::AsciiLowerCopy(env_value);
-        if (lowered == "off" || lowered == "false" || lowered == "no") {
-            return -1;
-        }
-        if (lowered == "on" || lowered == "true" || lowered == "yes" || lowered == "force") {
-            return default_chunk_tokens();
-        }
-        explicit_auto = (lowered == "0" || lowered == "auto");
+    const auto descriptor = densecore::models::DescribeModel(model);
+    if (descriptor.variant != ModelVariant::GEMMA4 || model->hparams.n_experts <= 0) {
+        return -1;
     }
-    if (!explicit_auto) {
-        const densecore::env::RuntimeToggleMode mode = densecore::env::ParseRuntimeToggleMode(
-            "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS", densecore::env::RuntimeToggleMode::Auto);
-        if (mode == densecore::env::RuntimeToggleMode::Off) {
-            return -1;
-        }
-        if (mode == densecore::env::RuntimeToggleMode::On) {
-            return default_chunk_tokens();
-        }
+    // Gemma4-A4B long-prefill quality regresses when the auto chunk is too
+    // small. Keep chunking enabled for memory safety, but use a larger default
+    // chunk so long prompts preserve first-token quality on the real serving
+    // path.
+    return ResolvePrefillChunkTokensFromEnv(req, "DENSECORE_GEMMA4_PREFILL_CHUNK_TOKENS",
+                                            "DENSECORE_GEMMA4_PREFILL_CHUNK_DEFAULT_TOKENS", 256,
+                                            "DENSECORE_GEMMA4_PREFILL_CHUNK_AUTO_MIN_TOKENS", 1024);
+}
+
+int ResolveModelPrefillChunkTokens(const TransformerModel* model, const Request* req) {
+    const int qwen36_tokens = ResolveQwen36PrefillChunkTokensImpl(model, req);
+    if (qwen36_tokens != -1) {
+        return qwen36_tokens;
     }
-    const int prompt_tokens = !req->prompt_tokens_for_cache.empty()
-                                  ? static_cast<int>(req->prompt_tokens_for_cache.size())
-                                  : req->prompt_token_count;
-    if (prompt_tokens <= 0) {
-        return default_chunk_tokens();
-    }
-    const int auto_min_tokens =
-        densecore::env::ParsePositiveEnvInt("DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS", 1536);
-    return prompt_tokens >= auto_min_tokens ? default_chunk_tokens() : -1;
+    return ResolveGemma4PrefillChunkTokensImpl(model, req);
 }
 
 int PrefillThreadOverride() {
@@ -725,6 +932,10 @@ int ResolveQwen36PrefillChunkTokens(const TransformerModel* model, const Request
     return ResolveQwen36PrefillChunkTokensImpl(model, req);
 }
 
+int ResolveGemma4PrefillChunkTokens(const TransformerModel* model, const Request* req) {
+    return ResolveGemma4PrefillChunkTokensImpl(model, req);
+}
+
 // Worker Loop (Continuous Batching) - Uses Scheduler for batch formation
 void EngineLoop(EngineState* state) {
     struct WorkContextBinder {
@@ -961,6 +1172,7 @@ void EngineLoop(EngineState* state) {
         std::unordered_map<PrefillGraphCacheKey, PrefillGraphCacheEntry, PrefillGraphCacheKeyHash> prefill_graph_cache;
         std::list<PrefillGraphCacheKey> prefill_graph_lru;
         size_t prefill_graph_cache_bytes = 0;
+        std::unordered_map<std::string, FlexibleGraphPoolSizing> flexible_graph_pool_sizing_cache;
 
         auto free_decode_graph_entry = [](DecodeGraphCacheEntry* entry) {
             if (!entry) return;
@@ -1288,13 +1500,13 @@ void EngineLoop(EngineState* state) {
                                            /*prefill_cache_active=*/false);
 
                     // Register with scheduler (blocks allocated by scheduler)
-                    const int qwen36_prefill_chunk_tokens = ResolveQwen36PrefillChunkTokens(current_model, req);
-                    req->prefill_chunk_tokens_effective = std::max(0, qwen36_prefill_chunk_tokens);
+                    const int prefill_chunk_tokens = ResolveModelPrefillChunkTokens(current_model, req);
+                    req->prefill_chunk_tokens_effective = std::max(0, prefill_chunk_tokens);
                     int seq_id = state->scheduler->AddRequest(
                         req->id, req->tokens.size(), req->max_tokens, req->priority, &req->tokens,
                         /*allow_chunked_prefill=*/!req->is_embedding,
                         /*require_hybrid_ssm_prefix_snapshot=*/current_model && current_model->arch_flags.is_hybrid_ssm,
-                        qwen36_prefill_chunk_tokens);
+                        prefill_chunk_tokens);
 
                     if (seq_id < 0) {
                         // Scheduler rejected (e.g., queue full or impossible non-chunked prefill)
@@ -2515,11 +2727,10 @@ void EngineLoop(EngineState* state) {
                     const Request* batch_req = batch_requests[req_idx];
                     const int token_count =
                         (req_idx < batch_token_counts.size()) ? std::max(0, batch_token_counts[req_idx]) : 0;
-                    const size_t prompt_hint = batch_req
-                                                   ? static_cast<size_t>(std::max(batch_req->prompt_token_count,
-                                                                                  batch_req->n_past + token_count))
-                                                   : static_cast<size_t>(token_count);
-                    seq_len_hint = std::max(seq_len_hint, prompt_hint);
+                    const size_t request_key_hint =
+                        batch_req ? static_cast<size_t>(std::max(1, batch_req->n_past + token_count))
+                                  : static_cast<size_t>(std::max(1, token_count));
+                    seq_len_hint = std::max(seq_len_hint, request_key_hint);
                     chunk_token_hint = std::max(chunk_token_hint, static_cast<size_t>(token_count));
                 }
                 return EngineState::EstimateGraphContextSize(
@@ -2913,23 +3124,74 @@ void EngineLoop(EngineState* state) {
                         state->inference_ctx.compute_buffer_size > 0) {
                         std::memset(state->inference_ctx.compute_buffer, 0, state->inference_ctx.compute_buffer_size);
                     }
-                    const size_t ctx_size = graph_ctx_estimate.total_bytes;
-                    if (!state->inference_ctx.IsInitialized() || state->inference_ctx.compute_buffer_size < ctx_size) {
+                    size_t ctx_size = graph_ctx_estimate.total_bytes;
+                    FlexibleGraphPoolSizing flexible_sizing{};
+                    bool used_flexible_sizing = false;
+                    if (IsFlexibleGraphPoolSizingEnabled(current_model)) {
+                        std::string sizing_key = std::to_string(reinterpret_cast<uintptr_t>(current_model));
+                        sizing_key += ":" + std::to_string(static_cast<int>(is_embedding_batch));
+                        sizing_key += ":" + std::to_string(graph_ctx_estimate.effective_seq_len);
+                        sizing_key += ":" + std::to_string(graph_ctx_estimate.effective_query_len);
+                        sizing_key += ":" + std::to_string(graph_ctx_estimate.effective_num_seqs);
+                        sizing_key += ":" + std::to_string(graph_ctx_estimate.chunk_token_hint);
+                        auto cached_sizing = flexible_graph_pool_sizing_cache.find(sizing_key);
+                        if (cached_sizing == flexible_graph_pool_sizing_cache.end()) {
+                            flexible_sizing = MeasureFlexibleGraphPoolSize(current_model, current_kv_cache, batch,
+                                                                           is_embedding_batch, graph_ctx_estimate);
+                            if (flexible_sizing.ok) {
+                                cached_sizing =
+                                    flexible_graph_pool_sizing_cache.emplace(sizing_key, flexible_sizing).first;
+                            }
+                        }
+                        if (cached_sizing != flexible_graph_pool_sizing_cache.end() && cached_sizing->second.ok) {
+                            flexible_sizing = cached_sizing->second;
+                            ctx_size = flexible_sizing.reserved_bytes > 0 ? flexible_sizing.reserved_bytes
+                                                                          : flexible_sizing.required_bytes;
+                            if (state->inference_ctx.IsInitialized() &&
+                                state->inference_ctx.compute_buffer_size < ctx_size) {
+                                const size_t grow_ahead = std::max<size_t>(state->inference_ctx.compute_buffer_size / 2,
+                                                                           2048ULL * 1024ULL * 1024ULL);
+                                ctx_size = std::max<size_t>(
+                                    ctx_size, AlignUpBytes(state->inference_ctx.compute_buffer_size + grow_ahead,
+                                                           512ULL * 1024ULL * 1024ULL));
+                            }
+                            used_flexible_sizing = true;
+                        }
+                    }
+                    const bool graph_pool_oversized =
+                        IsFlexibleGraphPoolSizingEnabled(current_model) && state->inference_ctx.IsInitialized() &&
+                        state->inference_ctx.compute_buffer_size > ctx_size * 2 &&
+                        (state->inference_ctx.compute_buffer_size - ctx_size) > (2048ULL * 1024ULL * 1024ULL);
+                    if (!state->inference_ctx.IsInitialized() || state->inference_ctx.compute_buffer_size < ctx_size ||
+                        graph_pool_oversized) {
                         if (state->inference_ctx.IsInitialized() &&
-                            state->inference_ctx.compute_buffer_size < ctx_size) {
+                            (state->inference_ctx.compute_buffer_size < ctx_size || graph_pool_oversized)) {
                             state->inference_ctx.Free();
                         }
                         const auto descriptor = densecore::models::DescribeModel(current_model);
                         std::cerr << "[DenseCore] GraphCtxEstimate variant="
                                   << densecore::models::ModelVariantName(descriptor.variant)
                                   << " seq_hint=" << graph_ctx_estimate.effective_seq_len
+                                  << " query_tokens=" << graph_ctx_estimate.effective_query_len
                                   << " num_seqs_hint=" << graph_ctx_estimate.effective_num_seqs
                                   << " chunk_tokens=" << graph_ctx_estimate.chunk_token_hint
                                   << " base_mb=" << (graph_ctx_estimate.base_graph_working_set_bytes / (1024 * 1024))
                                   << " hybrid_mb=" << (graph_ctx_estimate.hybrid_ssm_extra_bytes / (1024 * 1024))
                                   << " safety_mb=" << (graph_ctx_estimate.long_context_safety_pad_bytes / (1024 * 1024))
                                   << " env_extra_mb=" << (graph_ctx_estimate.env_extra_bytes / (1024 * 1024))
-                                  << " total_mb=" << (ctx_size / (1024 * 1024)) << std::endl;
+                                  << " total_mb=" << (ctx_size / (1024 * 1024));
+                        if (used_flexible_sizing) {
+                            std::cerr << " flexible=1 dry_ctx_mb="
+                                      << (flexible_sizing.dry_context_bytes / (1024 * 1024))
+                                      << " dry_meta_mb=" << (flexible_sizing.dry_metadata_bytes / (1024 * 1024))
+                                      << " graph_tensor_mb=" << (flexible_sizing.graph_tensor_bytes / (1024 * 1024))
+                                      << " margin_mb=" << (flexible_sizing.margin_bytes / (1024 * 1024))
+                                      << " required_mb=" << (flexible_sizing.required_bytes / (1024 * 1024))
+                                      << " reserved_mb=" << (ctx_size / (1024 * 1024))
+                                      << " graph_nodes=" << flexible_sizing.graph_nodes
+                                      << " shrink=" << (graph_pool_oversized ? 1 : 0);
+                        }
+                        std::cerr << std::endl;
                         state->inference_ctx.Init(ctx_size);
                     }
 
