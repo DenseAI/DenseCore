@@ -171,6 +171,13 @@ func (h *Handler) ChatCompletionHandler(w http.ResponseWriter, r *http.Request) 
 		if maxCtx := engine.GetMaxContextTokens(); maxCtx > 0 && req.MaxTokens > maxCtx {
 			sendError(w, fmt.Sprintf("max_tokens exceeds model context limit (%d)", maxCtx), "invalid_request_error", ErrCodeInvalidRequest, http.StatusBadRequest)
 			return
+		} else if maxCtx > 0 {
+			promptTokens := h.countChatPromptTokens(req)
+			if promptTokens > 0 && promptTokens+req.MaxTokens > maxCtx {
+				sendError(w, fmt.Sprintf("prompt tokens (%d) plus max_tokens (%d) exceeds model context limit (%d)",
+					promptTokens, req.MaxTokens, maxCtx), "invalid_request_error", ErrCodeInvalidRequest, http.StatusBadRequest)
+				return
+			}
 		}
 	}
 	if req.Model == "" {
@@ -233,6 +240,13 @@ func (h *Handler) CompletionHandler(w http.ResponseWriter, r *http.Request) {
 		if maxCtx := engine.GetMaxContextTokens(); maxCtx > 0 && chatReq.MaxTokens > maxCtx {
 			sendError(w, fmt.Sprintf("max_tokens exceeds model context limit (%d)", maxCtx), "invalid_request_error", ErrCodeInvalidRequest, http.StatusBadRequest)
 			return
+		} else if maxCtx > 0 {
+			promptTokens := h.countChatPromptTokens(chatReq)
+			if promptTokens > 0 && promptTokens+chatReq.MaxTokens > maxCtx {
+				sendError(w, fmt.Sprintf("prompt tokens (%d) plus max_tokens (%d) exceeds model context limit (%d)",
+					promptTokens, chatReq.MaxTokens, maxCtx), "invalid_request_error", ErrCodeInvalidRequest, http.StatusBadRequest)
+				return
+			}
 		}
 	}
 	if chatReq.Model == "" {
@@ -255,19 +269,10 @@ func (h *Handler) CompletionHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func completionRequestToChatRequest(req domain.CompletionRequest) domain.ChatCompletionRequest {
-	rawPrompt := ""
-	var chatTemplateKwargs *domain.ChatTemplateKwargs
-	if req.ParityMode {
-		rawPrompt = req.Prompt
-	} else {
-		enableThinking := false
-		chatTemplateKwargs = &domain.ChatTemplateKwargs{EnableThinking: &enableThinking}
-	}
 	return domain.ChatCompletionRequest{
 		Model:                req.Model,
 		Messages:             []domain.Message{{Role: "user", Content: req.Prompt}},
-		RawPrompt:            rawPrompt,
-		ChatTemplateKwargs:   chatTemplateKwargs,
+		RawPrompt:            req.Prompt,
 		MaxTokens:            req.MaxTokens,
 		Temperature:          req.Temperature,
 		TopP:                 req.TopP,
@@ -813,6 +818,9 @@ func (h *Handler) countChatPromptTokens(req domain.ChatCompletionRequest) int {
 	if len(req.InputIDs) > 0 {
 		return len(req.InputIDs)
 	}
+	if req.RawPrompt != "" {
+		return h.countSingleTextTokens(req.RawPrompt, true, false)
+	}
 	return h.countSingleTextTokens(service.BuildChatPrompt(h.modelService.GetCurrentModel(), req.Messages, req.ChatTemplateKwargs), true, false)
 }
 
@@ -1311,7 +1319,10 @@ func sendError(w http.ResponseWriter, message, errType, code string, statusCode 
 }
 
 func classifyGenerationError(err error) (message, errType, code string, statusCode int) {
+	var appErr *domain.AppError
 	switch {
+	case errors.As(err, &appErr):
+		return appErr.Message, string(appErr.Code), string(appErr.Code), appErr.StatusCode
 	case errors.Is(err, context.DeadlineExceeded):
 		return "request timed out before completion", "timeout_error", ErrCodeRequestTimeout, http.StatusGatewayTimeout
 	case errors.Is(err, context.Canceled):

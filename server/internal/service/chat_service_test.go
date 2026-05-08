@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"descore-server/internal/domain"
@@ -12,6 +13,13 @@ import (
 type chatServiceRenderTestEngine struct {
 	renderedPrompt        string
 	lastPrompt            string
+	lastInputIDs          []int
+	lastAllowedTokenIDs   []int
+	lastAllowedStrict     bool
+	textSubmitCalled      bool
+	tokenSubmitCalled     bool
+	previewTokenIDs       []int
+	previewText           string
 	renderedTokenizerType string
 	renderedChatTemplate  string
 	renderedModelVariant  string
@@ -32,11 +40,18 @@ func (e *chatServiceRenderTestEngine) GenerateStreamWithFormat(ctx context.Conte
 }
 func (e *chatServiceRenderTestEngine) GenerateStreamWithSampling(ctx context.Context, prompt string, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) error {
 	e.lastPrompt = prompt
+	e.lastAllowedTokenIDs = append([]int(nil), allowedTokenIDs...)
+	e.lastAllowedStrict = allowedTokensStrict
+	e.textSubmitCalled = true
 	outputChan <- domain.NewTerminalEvent(nil)
 	close(outputChan)
 	return nil
 }
 func (e *chatServiceRenderTestEngine) GenerateStreamTokensWithSampling(ctx context.Context, inputIDs []int, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) error {
+	e.lastInputIDs = append([]int(nil), inputIDs...)
+	e.lastAllowedTokenIDs = append([]int(nil), allowedTokenIDs...)
+	e.lastAllowedStrict = allowedTokensStrict
+	e.tokenSubmitCalled = true
 	outputChan <- domain.NewTerminalEvent(nil)
 	close(outputChan)
 	return nil
@@ -74,9 +89,16 @@ func (e *chatServiceRenderTestEngine) CountTokens(text string, addBOS bool, addE
 	return 0, nil
 }
 func (e *chatServiceRenderTestEngine) TokenizeText(text string, addBOS bool, addEOS bool) ([]int, error) {
-	return nil, nil
+	if len(e.previewTokenIDs) > 0 {
+		return append([]int(nil), e.previewTokenIDs...), nil
+	}
+	return []int{len(text)}, nil
 }
 func (e *chatServiceRenderTestEngine) PreviewTextRequestTokens(text string, maxTokens int, temperature float64, topP float64, topK int, repetitionPenalty float64, jsonMode bool) ([]int, error) {
+	e.previewText = text
+	if len(e.previewTokenIDs) > 0 {
+		return append([]int(nil), e.previewTokenIDs...), nil
+	}
 	return e.TokenizeText(text, false, false)
 }
 func (e *chatServiceRenderTestEngine) GetTokenizerType() string    { return "gemma4" }
@@ -130,7 +152,7 @@ func TestNormalizeSamplingQwenNoThinkingDefaults(t *testing.T) {
 	}
 }
 
-func TestStartGenerationQwen35ExactAnswerUsesSyntheticResponse(t *testing.T) {
+func TestStartGenerationQwen35ExactAnswerUsesEnginePath(t *testing.T) {
 	engine := &exactAnswerTestEngine{
 		tokens: map[string][]int{
 			"Paris":  {9079},
@@ -142,7 +164,11 @@ func TestStartGenerationQwen35ExactAnswerUsesSyntheticResponse(t *testing.T) {
 			engine: engine,
 			model:  "/tmp/Qwen3.5-35B-A3B-Q4_K_M.gguf",
 		},
+		requestQueue: queue.NewRequestQueue(4),
 	}
+	workerPool := NewQueueProcessor(svc.requestQueue, svc.modelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
 
 	req := domain.ChatCompletionRequest{
 		Messages:  []domain.Message{{Role: "user", Content: "What is the capital of France? Answer with only Paris."}},
@@ -164,15 +190,21 @@ func TestStartGenerationQwen35ExactAnswerUsesSyntheticResponse(t *testing.T) {
 	for event := range stream {
 		events = append(events, event)
 	}
-	if len(events) != 2 {
-		t.Fatalf("expected 2 stream events, got %d", len(events))
+	if len(events) != 1 {
+		t.Fatalf("expected terminal stream event from engine path, got %d", len(events))
 	}
-	if events[0].Token != "Paris" {
-		t.Fatalf("expected synthetic exact-answer token Paris, got %q", events[0].Token)
-	}
-	if !events[1].TerminalSuccess() {
+	if !events[0].TerminalSuccess() {
 		t.Fatalf("expected clean terminal event, got terminal=%v finished=%v err=%v",
-			events[1].Terminal, events[1].IsFinished, events[1].TerminalError())
+			events[0].Terminal, events[0].IsFinished, events[0].TerminalError())
+	}
+	if !engine.textSubmitCalled {
+		t.Fatalf("expected exact-answer request to be submitted to engine text path")
+	}
+	if got, want := engine.lastAllowedTokenIDs, []int{9079, 12908}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("allowedTokenIDs=%v want %v", got, want)
+	}
+	if !engine.lastAllowedStrict {
+		t.Fatalf("expected strict exact-answer token constraint")
 	}
 }
 
@@ -390,6 +422,46 @@ func TestGenerateStreamParityModeUsesCanonicalRenderer(t *testing.T) {
 	}
 	if engine.lastPrompt != engine.renderedPrompt {
 		t.Fatalf("expected canonical rendered prompt, got %q", engine.lastPrompt)
+	}
+}
+
+func TestGenerateStreamQwen35RenderedPromptUsesPreviewTokenIDs(t *testing.T) {
+	engine := &chatServiceRenderTestEngine{
+		renderedPrompt:        "<|im_start|>user\nWhat is the capital of France? /no_think<|im_end|>\n<|im_start|>assistant\n",
+		renderedTokenizerType: "qwen35",
+		renderedChatTemplate:  "<|im_start|>{role}\n",
+		renderedModelVariant:  "qwen35",
+		renderedPromptFamily:  "chatml",
+		previewTokenIDs:       []int{101, 202, 303},
+	}
+	modelService := &chatServiceRenderTestModelService{
+		engine: engine,
+		model:  "/tmp/Qwen3.5-9B-Q4_K_M.gguf",
+	}
+	svc := NewChatService(modelService, queue.NewRequestQueue(4))
+	workerPool := NewQueueProcessor(svc.requestQueue, modelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	out := make(chan domain.StreamEvent, 4)
+	err := svc.GenerateStream(context.Background(), domain.ChatCompletionRequest{
+		Messages:  []domain.Message{{Role: "user", Content: "What is the capital of France?"}},
+		MaxTokens: 8,
+	}, out)
+	if err != nil {
+		t.Fatalf("GenerateStream returned error: %v", err)
+	}
+	if !engine.tokenSubmitCalled {
+		t.Fatalf("expected Qwen3.5 rendered request to submit preview token IDs")
+	}
+	if engine.textSubmitCalled {
+		t.Fatalf("expected Qwen3.5 rendered request to avoid text submit path")
+	}
+	if !reflect.DeepEqual(engine.lastInputIDs, engine.previewTokenIDs) {
+		t.Fatalf("inputIDs=%v want %v", engine.lastInputIDs, engine.previewTokenIDs)
+	}
+	if engine.previewText != engine.renderedPrompt {
+		t.Fatalf("preview text=%q want rendered prompt %q", engine.previewText, engine.renderedPrompt)
 	}
 }
 

@@ -70,6 +70,9 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 	if prepared.prompt == "" && !hasInputIDs {
 		return errors.New("no user message found")
 	}
+	if err := validatePreparedContextWindow(engine, prepared, req.InputIDs, req.MaxTokens); err != nil {
+		return err
+	}
 
 	stream, err := s.startGeneration(ctx, req, modelHint, prepared)
 	if err != nil {
@@ -171,10 +174,10 @@ func (s *ChatService) preparePrompt(engine domain.Engine, req domain.ChatComplet
 		prepared.rawPassthroughUsed = true
 	}
 
-	// Keep Qwen3.6 server requests on the exact token path once the chat prompt
+	// Keep Qwen3.5/Qwen3.6 server requests on the exact token path once the chat prompt
 	// has been rendered. This avoids any remaining text-submit divergence between
 	// the Go server path and the C++ preview/parity path.
-	if prepared.renderedTemplateUsed && isQwen36Request(modelHint, prepared.modelVariant) {
+	if prepared.renderedTemplateUsed && isQwenRenderedTokenPathRequest(modelHint, prepared.modelVariant) {
 		tokenIDs, err := engine.PreviewTextRequestTokens(prepared.prompt, req.MaxTokens, req.Temperature, req.TopP, req.TopK,
 			req.RepetitionPenalty, req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object")
 		if err != nil {
@@ -196,26 +199,23 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 	allowedTokenIDs := req.AllowedTokenIDs
 	allowedTokensStrict := req.AllowedTokensStrict
 	maxTokens := req.MaxTokens
-	if shouldUseSyntheticExactAnswerForQwen35(modelHint, prepared.modelVariant, exactAnswer) {
-		s.logPromptPathDebug(engine, req, modelHint, prepared, temperature, topP, topK, repetitionPenalty,
-			allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, qualityProfile, true)
-		return syntheticExactAnswerStream(ctx, exactAnswer.text), nil
-	}
-	if exactAnswer != nil && exactAnswer.text != "" && len(exactAnswer.allowedTokenIDs) == 0 {
-		s.logPromptPathDebug(engine, req, modelHint, prepared, temperature, topP, topK, repetitionPenalty,
-			allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, qualityProfile, true)
-		return syntheticExactAnswerStream(ctx, exactAnswer.text), nil
-	}
 	if exactAnswer != nil {
-		if os.Getenv("DENSECORE_DEBUG_EXACT_QA") != "" {
-			slog.Info("applying exact-answer token constraint",
-				slog.Any("allowed_token_ids", exactAnswer.allowedTokenIDs),
+		if len(exactAnswer.allowedTokenIDs) > 0 {
+			if os.Getenv("DENSECORE_DEBUG_EXACT_QA") != "" {
+				slog.Info("applying exact-answer token constraint",
+					slog.Any("allowed_token_ids", exactAnswer.allowedTokenIDs),
+					slog.Int("max_tokens", exactAnswer.maxTokens),
+					slog.Bool("strict", exactAnswer.strict),
+				)
+			}
+			allowedTokenIDs = exactAnswer.allowedTokenIDs
+			allowedTokensStrict = exactAnswer.strict
+		} else if os.Getenv("DENSECORE_DEBUG_EXACT_QA") != "" {
+			slog.Info("exact-answer token constraint unavailable; using real model generation",
+				slog.String("answer", exactAnswer.text),
 				slog.Int("max_tokens", exactAnswer.maxTokens),
-				slog.Bool("strict", exactAnswer.strict),
 			)
 		}
-		allowedTokenIDs = exactAnswer.allowedTokenIDs
-		allowedTokensStrict = exactAnswer.strict
 		if exactAnswer.maxTokens > 0 {
 			maxTokens = exactAnswer.maxTokens
 		}
@@ -373,24 +373,6 @@ func (s *ChatService) logPromptPathDebug(engine domain.Engine, req domain.ChatCo
 	slog.Info("chat request debug", fields...)
 }
 
-func syntheticExactAnswerStream(ctx context.Context, answer string) <-chan domain.StreamEvent {
-	ch := make(chan domain.StreamEvent, 2)
-	go func() {
-		defer close(ch)
-		select {
-		case <-ctx.Done():
-			return
-		case ch <- domain.StreamEvent{Token: answer}:
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case ch <- domain.NewTerminalEvent(nil):
-		}
-	}()
-	return ch
-}
-
 func isQwen36Request(modelHint string, modelVariant string) bool {
 	variant := strings.ToLower(strings.TrimSpace(modelVariant))
 	if variant == "qwen36" || variant == "qwen3.6" {
@@ -409,12 +391,34 @@ func isQwen35Request(modelHint string, modelVariant string) bool {
 	return strings.Contains(hint, "qwen3.5") || strings.Contains(hint, "qwen35")
 }
 
-func shouldUseSyntheticExactAnswerForQwen35(modelHint string, modelVariant string,
-	exactAnswer *exactAnswerConstraint) bool {
-	if exactAnswer == nil || strings.TrimSpace(exactAnswer.text) == "" {
-		return false
+func isQwenRenderedTokenPathRequest(modelHint string, modelVariant string) bool {
+	return isQwen35Request(modelHint, modelVariant) || isQwen36Request(modelHint, modelVariant)
+}
+
+func validatePreparedContextWindow(engine domain.Engine, prepared preparedPrompt, requestInputIDs []int, maxTokens int) error {
+	if engine == nil {
+		return nil
 	}
-	return isQwen35Request(modelHint, modelVariant)
+	maxCtx := engine.GetMaxContextTokens()
+	if maxCtx <= 0 {
+		return nil
+	}
+	inputTokens := len(requestInputIDs)
+	if inputTokens == 0 {
+		inputTokens = len(prepared.tokenIDs)
+	}
+	if inputTokens == 0 && prepared.prompt != "" {
+		count, err := engine.CountTokens(prepared.prompt, false, false)
+		if err != nil {
+			return fmt.Errorf("count prompt tokens: %w", err)
+		}
+		inputTokens = count
+	}
+	if inputTokens > 0 && inputTokens+maxTokens > maxCtx {
+		return domain.ErrInvalidRequest(fmt.Sprintf("prompt tokens (%d) plus max_tokens (%d) exceeds model context limit (%d)",
+			inputTokens, maxTokens, maxCtx)).WithParam("max_tokens")
+	}
+	return nil
 }
 
 func (s *ChatService) GetEmbeddings(req domain.EmbeddingRequest) ([]float32, error) {
@@ -476,6 +480,9 @@ func ExtractPrompt(messages []domain.Message) string {
 func inferModelVariantHint(modelHint string) string {
 	if isQwen36ModelHint(modelHint) {
 		return "qwen36"
+	}
+	if isQwen35Request(modelHint, "") {
+		return "qwen35"
 	}
 	return ""
 }

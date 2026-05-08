@@ -19,6 +19,7 @@ import (
 // MockEngine implements a simple mock inference engine for testing
 type MockEngine struct {
 	generateStreamFunc func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error
+	maxContextTokens   int
 }
 
 func (m *MockEngine) GenerateStream(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
@@ -68,6 +69,9 @@ func (m *MockEngine) GetDetailedMetrics() *domain.DetailedMetrics {
 }
 
 func (m *MockEngine) GetMaxContextTokens() int {
+	if m.maxContextTokens > 0 {
+		return m.maxContextTokens
+	}
 	return 4096
 }
 
@@ -446,6 +450,31 @@ func TestCompletionHandler_Stream(t *testing.T) {
 	}
 }
 
+func TestCompletionHandlerRejectsPromptPlusMaxTokensBeyondContext(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.engine.maxContextTokens = 12
+
+	q := queue.NewRequestQueue(10)
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/completions", domain.CompletionRequest{
+		Model:     "test-model",
+		Prompt:    "1234567890",
+		MaxTokens: 8,
+	})
+	w := httptest.NewRecorder()
+
+	handler.CompletionHandler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d body=%s", http.StatusBadRequest, w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "plus max_tokens") {
+		t.Fatalf("expected combined context error, got %s", w.Body.String())
+	}
+}
+
 func TestChatCompletionHandlerSyncTimeoutReturnsStructuredTimeout(t *testing.T) {
 	mockModelService := NewMockModelService()
 	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
@@ -706,7 +735,7 @@ func TestCompletionRequestToChatRequestPreservesParityRawPrompt(t *testing.T) {
 	}
 }
 
-func TestCompletionRequestToChatRequestUsesCanonicalChatPathByDefault(t *testing.T) {
+func TestCompletionRequestToChatRequestUsesRawPromptByDefault(t *testing.T) {
 	req := domain.CompletionRequest{
 		Model:     "test-model",
 		Prompt:    "The capital of France is",
@@ -718,11 +747,11 @@ func TestCompletionRequestToChatRequestUsesCanonicalChatPathByDefault(t *testing
 	if chatReq.ParityMode {
 		t.Fatalf("expected parity mode to remain disabled")
 	}
-	if chatReq.RawPrompt != "" {
-		t.Fatalf("expected non-parity completion requests to avoid raw prompt passthrough, got %q", chatReq.RawPrompt)
+	if chatReq.RawPrompt != req.Prompt {
+		t.Fatalf("expected non-parity completion requests to preserve raw prompt passthrough, got %q", chatReq.RawPrompt)
 	}
-	if chatReq.ChatTemplateKwargs == nil || chatReq.ChatTemplateKwargs.EnableThinking == nil || *chatReq.ChatTemplateKwargs.EnableThinking {
-		t.Fatalf("expected non-parity completion requests to disable thinking by default, got %+v", chatReq.ChatTemplateKwargs)
+	if chatReq.ChatTemplateKwargs != nil {
+		t.Fatalf("expected prompt completions to avoid chat-template kwargs by default, got %+v", chatReq.ChatTemplateKwargs)
 	}
 	if len(chatReq.Messages) != 1 || chatReq.Messages[0].Content != req.Prompt {
 		t.Fatalf("expected compatibility message to keep original prompt, got %+v", chatReq.Messages)

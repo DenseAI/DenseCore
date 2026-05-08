@@ -9,7 +9,11 @@ import (
 )
 
 type exactAnswerTestEngine struct {
-	tokens map[string][]int
+	tokens              map[string][]int
+	lastAllowedTokenIDs []int
+	lastAllowedStrict   bool
+	textSubmitCalled    bool
+	tokenSubmitCalled   bool
 }
 
 func (e *exactAnswerTestEngine) GenerateStream(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
@@ -19,10 +23,20 @@ func (e *exactAnswerTestEngine) GenerateStreamWithFormat(ctx context.Context, pr
 	panic("not used")
 }
 func (e *exactAnswerTestEngine) GenerateStreamWithSampling(ctx context.Context, prompt string, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) error {
-	panic("not used")
+	e.lastAllowedTokenIDs = append([]int(nil), allowedTokenIDs...)
+	e.lastAllowedStrict = allowedTokensStrict
+	e.textSubmitCalled = true
+	outputChan <- domain.NewTerminalEvent(nil)
+	close(outputChan)
+	return nil
 }
 func (e *exactAnswerTestEngine) GenerateStreamTokensWithSampling(ctx context.Context, inputIDs []int, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) error {
-	panic("not used")
+	e.lastAllowedTokenIDs = append([]int(nil), allowedTokenIDs...)
+	e.lastAllowedStrict = allowedTokensStrict
+	e.tokenSubmitCalled = true
+	outputChan <- domain.NewTerminalEvent(nil)
+	close(outputChan)
+	return nil
 }
 func (e *exactAnswerTestEngine) GetEmbeddings(prompt string) ([]float32, error) { panic("not used") }
 func (e *exactAnswerTestEngine) GetEmbeddingsWithOptions(prompt string, poolingType string, normalize *bool) ([]float32, error) {
