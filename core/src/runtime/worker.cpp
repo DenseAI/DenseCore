@@ -121,7 +121,10 @@ bool ParseBoolEnvDefault(const char* name, bool default_value) {
 }
 
 bool IsFlexibleGraphPoolSizingEnabled(const TransformerModel* model) {
-    return model && model->arch_flags.is_gemma4 && ParseBoolEnvDefault("DENSECORE_FLEXIBLE_GRAPH_POOL", true);
+    if (!model) {
+        return false;
+    }
+    return ParseBoolEnvDefault("DENSECORE_FLEXIBLE_GRAPH_POOL", true);
 }
 
 void AccumulateDryRunTensorBytes(const ggml_tensor* tensor, std::unordered_set<const ggml_tensor*>& seen,
@@ -4360,20 +4363,6 @@ void EngineLoop(EngineState* state) {
                         }
                     }
 
-                    if (!req->finished && !req_bench_fast_path &&
-                        HasDecodeVisibleProgressStalled(req, decode_sample_time)) {
-                        LOG_ERROR("Failing decode-stalled request {} (seq_id={}, generated={}, silent_steps={})",
-                                  req->id, req->seq_id, req->generated_count, req->decode_no_output_steps);
-                        req->finished = true;
-                        req->decode_finish_cause = DecodeFinishCause::DecodeVisibleProgressTimeout;
-                        state->metrics.failed_requests++;
-                        if (req->callback || req->token_result_callback) {
-                            EmitRequestResult(state, req, "Error: decode made no externally visible progress", -1, true,
-                                              true, global_direct_callback);
-                            terminal_error_emitted = true;
-                        }
-                    }
-
                     // Check finish conditions
                     if (req->finished || IsStopTokenId(current_model, best_token) ||
                         req->generated_count >= req->max_tokens) {
@@ -4459,9 +4448,23 @@ void EngineLoop(EngineState* state) {
                                                       global_direct_callback);
                                     if (!tail.empty()) {
                                         NoteVisibleEmitProgress(req, decode_sample_time, best_token);
-                                    }
-                                }
                             }
+                        }
+                    }
+
+                    if (!req->finished && !req_bench_fast_path &&
+                        HasDecodeVisibleProgressStalled(req, decode_sample_time)) {
+                        LOG_ERROR("Failing decode-stalled request {} (seq_id={}, generated={}, silent_steps={})",
+                                  req->id, req->seq_id, req->generated_count, req->decode_no_output_steps);
+                        req->finished = true;
+                        req->decode_finish_cause = DecodeFinishCause::DecodeVisibleProgressTimeout;
+                        state->metrics.failed_requests++;
+                        if (req->callback || req->token_result_callback) {
+                            EmitRequestResult(state, req, "Error: decode made no externally visible progress", -1, true,
+                                              true, global_direct_callback);
+                            terminal_error_emitted = true;
+                        }
+                    }
                         }
                         FinalizeDecodeSilentFinishReason(req);
                         LogRequestDecodeSummary(req, current_model);

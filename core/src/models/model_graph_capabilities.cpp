@@ -63,6 +63,20 @@ bool LayerRequiresSpecialResidualScaling(const DecoderLayerSpec& layer) {
            layer.ffn.has_post_moe_norm || layer.ffn.has_post_ffn_norm;
 }
 
+DecoderRuntimeTopology InferDecoderRuntimeTopologyFromCapabilities(const ModelGraphCapabilities& capabilities) {
+    if (capabilities.has_sliding_window_attention || capabilities.has_shared_kv_source) {
+        return capabilities.has_moe ? DecoderRuntimeTopology::SlidingSharedKVMoE
+                                    : DecoderRuntimeTopology::SlidingSharedKV;
+    }
+    if (capabilities.has_hybrid_ssm_mixer) {
+        return capabilities.has_moe ? DecoderRuntimeTopology::HybridSSMMoE : DecoderRuntimeTopology::HybridSSM;
+    }
+    if (capabilities.has_moe) {
+        return DecoderRuntimeTopology::DenseAttentionMoE;
+    }
+    return DecoderRuntimeTopology::DenseAttention;
+}
+
 std::vector<GraphFamily> CandidateFamilies(const GraphFamilyResolution& resolution) {
     std::vector<GraphFamily> candidates;
     candidates.reserve(1 + resolution.fallback_chain.size());
@@ -87,6 +101,37 @@ void AddReason(bool condition, const std::string& reason, std::vector<std::strin
     if (condition && out) {
         out->push_back(reason);
     }
+}
+
+template <typename T> void AddUnique(std::vector<T>* values, T value) {
+    if (!values) {
+        return;
+    }
+    if (std::find(values->begin(), values->end(), value) == values->end()) {
+        values->push_back(value);
+    }
+}
+
+template <typename T> bool ContainsAll(const std::vector<T>& supported, const std::vector<T>& required) {
+    for (const T value : required) {
+        if (std::find(supported.begin(), supported.end(), value) == supported.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename T, typename NameFn> std::string JoinNames(const std::vector<T>& values, NameFn name_fn) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << name_fn(values[i]);
+    }
+    oss << "]";
+    return oss.str();
 }
 
 }  // namespace
@@ -182,10 +227,34 @@ ModelGraphCapabilities ResolveModelGraphCapabilities(const TransformerModel* mod
          AnyLayer(decoder_spec->layers,
                   [model](const DecoderLayerSpec& layer) { return LayerHasPerLayerKvHeadCount(model, layer); })) ||
         HasPerLayerKvHeadVariabilityFallback(model);
+    capabilities.decoder_runtime_topology =
+        decoder_spec ? decoder_spec->runtime_topology : DecoderRuntimeTopology::Unknown;
     capabilities.requires_special_attention_mask = capabilities.has_sliding_window_attention;
     capabilities.requires_special_residual_scaling =
         (decoder_spec && AnyLayerSpec(decoder_spec, LayerRequiresSpecialResidualScaling)) ||
         (decoder_spec && decoder_spec->layers.empty() && effective_flags.is_gemma4);
+    if (decoder_spec) {
+        AddUnique(&capabilities.required_prefill_logits_policies, decoder_spec->output.prefill_logits_policy);
+        for (const DecoderLayerSpec& layer : decoder_spec->layers) {
+            AddUnique(&capabilities.required_rope_kinds, layer.attention.rope_kind);
+            for (const DecoderSemanticOp& op : layer.semantic_ops) {
+                AddUnique(&capabilities.required_semantic_ops, op.kind);
+            }
+            if (layer.ffn.is_moe) {
+                AddUnique(&capabilities.required_moe_routers, layer.ffn.router);
+                AddUnique(&capabilities.required_ffn_activations, layer.ffn.activation);
+            } else {
+                AddUnique(&capabilities.required_ffn_activations, layer.ffn.activation);
+            }
+            capabilities.requires_shared_dense_ffn =
+                capabilities.requires_shared_dense_ffn || layer.ffn.has_shared_dense_branch;
+            capabilities.requires_moe_down_scale_sidecar =
+                capabilities.requires_moe_down_scale_sidecar || layer.ffn.has_down_scale_sidecar;
+            capabilities.requires_ffn_post_norms = capabilities.requires_ffn_post_norms ||
+                                                   layer.ffn.has_post_shared_norm || layer.ffn.has_post_moe_norm ||
+                                                   layer.ffn.has_post_ffn_norm;
+        }
+    }
 
     // Multimodal decoder projection is reserved for an explicit future load
     // path that exposes projector semantics in TransformerModel metadata.
@@ -214,6 +283,29 @@ GraphFamilyResolution ResolveGraphFamily(const TransformerModel* model) {
         resolution.preferred_family = GraphFamily::UNKNOWN;
         resolution.fail_closed = true;
         return resolution;
+    }
+
+    const DecoderRuntimeTopology decoder_topology =
+        capabilities.decoder_runtime_topology != DecoderRuntimeTopology::Unknown
+            ? capabilities.decoder_runtime_topology
+            : InferDecoderRuntimeTopologyFromCapabilities(capabilities);
+    switch (decoder_topology) {
+    case DecoderRuntimeTopology::HybridSSM:
+    case DecoderRuntimeTopology::HybridSSMMoE:
+        resolution.preferred_family = GraphFamily::DecoderHybridSSM;
+        resolution.fallback_chain = {GraphFamily::DecoderDenseAttention};
+        resolution.fail_closed = true;
+        return resolution;
+    case DecoderRuntimeTopology::SlidingSharedKV:
+    case DecoderRuntimeTopology::SlidingSharedKVMoE:
+        resolution.preferred_family = GraphFamily::DecoderSlidingWindowSharedKV;
+        resolution.fallback_chain = {GraphFamily::DecoderDenseAttention};
+        resolution.fail_closed = true;
+        return resolution;
+    case DecoderRuntimeTopology::DenseAttention:
+    case DecoderRuntimeTopology::DenseAttentionMoE:
+    case DecoderRuntimeTopology::Unknown:
+    default: break;
     }
 
     if (capabilities.has_hybrid_ssm_mixer) {
@@ -267,6 +359,31 @@ GraphAdmissionResult AdmitGraphBuilder(const GraphFamilyResolution& resolution, 
                   "requires special residual/input/output scaling", &reasons);
         AddReason(capabilities.has_multimodal_projection && !support.supports_multimodal_projection,
                   "requires multimodal projection semantics", &reasons);
+        AddReason(capabilities.requires_shared_dense_ffn && !support.supports_shared_dense_ffn,
+                  "requires shared dense FFN branch semantics", &reasons);
+        AddReason(capabilities.requires_moe_down_scale_sidecar && !support.supports_moe_down_scale_sidecar,
+                  "requires MoE down-projection scale sidecar semantics", &reasons);
+        AddReason(capabilities.requires_ffn_post_norms && !support.supports_ffn_post_norms,
+                  "requires FFN post-norm ordering semantics", &reasons);
+        AddReason(!ContainsAll(support.supported_moe_routers, capabilities.required_moe_routers),
+                  "requires MoE router kinds " +
+                      JoinNames(capabilities.required_moe_routers, DecoderMoERouterName),
+                  &reasons);
+        AddReason(!ContainsAll(support.supported_ffn_activations, capabilities.required_ffn_activations),
+                  "requires FFN activation kinds " +
+                      JoinNames(capabilities.required_ffn_activations, DecoderActivationName),
+                  &reasons);
+        AddReason(!ContainsAll(support.supported_rope_kinds, capabilities.required_rope_kinds),
+                  "requires RoPE kinds " + JoinNames(capabilities.required_rope_kinds, DecoderRopeKindName),
+                  &reasons);
+        AddReason(!ContainsAll(support.supported_prefill_logits_policies,
+                               capabilities.required_prefill_logits_policies),
+                  "requires prefill logits policies " +
+                      JoinNames(capabilities.required_prefill_logits_policies, DecoderPrefillLogitsPolicyName),
+                  &reasons);
+        AddReason(!ContainsAll(support.supported_semantic_ops, capabilities.required_semantic_ops),
+                  "requires semantic ops " + JoinNames(capabilities.required_semantic_ops, DecoderSemanticOpKindName),
+                  &reasons);
 
         if (reasons.empty()) {
             result.admitted = true;
@@ -292,6 +409,15 @@ GraphBuilderSupport MakeDenseDecoderGenericSupport(const char* builder_name) {
     GraphBuilderSupport support{};
     support.builder_name = builder_name;
     support.supported_families = {GraphFamily::DecoderDenseAttention};
+    support.supported_ffn_activations = {DecoderActivation::Silu};
+    support.supported_rope_kinds = {DecoderRopeKind::Standard};
+    support.supported_prefill_logits_policies = {DecoderPrefillLogitsPolicy::FullSequence};
+    support.supported_semantic_ops = {
+        DecoderSemanticOpKind::AttentionNorm, DecoderSemanticOpKind::AttentionProjection,
+        DecoderSemanticOpKind::AttentionCore, DecoderSemanticOpKind::AttentionOutputProjection,
+        DecoderSemanticOpKind::FfnNorm,       DecoderSemanticOpKind::DenseFfn,
+        DecoderSemanticOpKind::ResidualAdd,
+    };
     return support;
 }
 
@@ -299,6 +425,7 @@ std::string FormatModelGraphCapabilities(const ModelGraphCapabilities& capabilit
     std::ostringstream oss;
     oss << "arch=" << static_cast<int>(capabilities.arch) << ", variant=" << static_cast<int>(capabilities.variant)
         << ", topology=" << GraphTopologyName(capabilities.topology)
+        << ", decoder_topology=" << DecoderRuntimeTopologyName(capabilities.decoder_runtime_topology)
         << ", dense_attention=" << (capabilities.has_dense_attention ? "true" : "false")
         << ", sliding_window=" << (capabilities.has_sliding_window_attention ? "true" : "false")
         << ", shared_kv=" << (capabilities.has_shared_kv_source ? "true" : "false")
@@ -310,7 +437,16 @@ std::string FormatModelGraphCapabilities(const ModelGraphCapabilities& capabilit
         << ", per_layer_kv_heads=" << (capabilities.has_per_layer_kv_head_variability ? "true" : "false")
         << ", special_mask=" << (capabilities.requires_special_attention_mask ? "true" : "false")
         << ", special_scaling=" << (capabilities.requires_special_residual_scaling ? "true" : "false")
-        << ", multimodal_projection=" << (capabilities.has_multimodal_projection ? "true" : "false");
+        << ", multimodal_projection=" << (capabilities.has_multimodal_projection ? "true" : "false")
+        << ", shared_dense_ffn=" << (capabilities.requires_shared_dense_ffn ? "true" : "false")
+        << ", moe_down_scale_sidecar=" << (capabilities.requires_moe_down_scale_sidecar ? "true" : "false")
+        << ", ffn_post_norms=" << (capabilities.requires_ffn_post_norms ? "true" : "false")
+        << ", moe_routers=" << JoinNames(capabilities.required_moe_routers, DecoderMoERouterName)
+        << ", ffn_activations=" << JoinNames(capabilities.required_ffn_activations, DecoderActivationName)
+        << ", rope_kinds=" << JoinNames(capabilities.required_rope_kinds, DecoderRopeKindName)
+        << ", prefill_logits_policies="
+        << JoinNames(capabilities.required_prefill_logits_policies, DecoderPrefillLogitsPolicyName)
+        << ", semantic_ops=" << JoinNames(capabilities.required_semantic_ops, DecoderSemanticOpKindName);
     return oss.str();
 }
 

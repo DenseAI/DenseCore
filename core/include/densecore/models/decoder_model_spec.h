@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "densecore/models/model_types.h"
@@ -34,6 +35,16 @@ enum class DecoderPrefillLogitsPolicy : uint8_t {
     LastTokenForMoE,
 };
 
+enum class DecoderRuntimeTopology : uint8_t {
+    Unknown = 0,
+    DenseAttention,
+    DenseAttentionMoE,
+    HybridSSM,
+    HybridSSMMoE,
+    SlidingSharedKV,
+    SlidingSharedKVMoE,
+};
+
 enum class DecoderSemanticOpKind : uint8_t {
     AttentionNorm = 0,
     AttentionProjection,
@@ -51,8 +62,31 @@ enum class DecoderSemanticOpKind : uint8_t {
     ResidualAdd,
 };
 
+enum class DecoderSpecializationKind : uint8_t {
+    HybridSSMMixer = 0,
+    SlidingWindowAttention,
+    SharedKV,
+    PerLayerKVHeads,
+    QNorm,
+    KNorm,
+    VNorm,
+    AttentionLogitSoftcap,
+    MoE,
+    GroupedMoERouter,
+    Gemma4MoERouter,
+    SharedDenseFfn,
+    MoEDownScaleSidecar,
+    FfnPostNorms,
+    PrefillLastLogits,
+};
+
 struct DecoderSemanticOp {
     DecoderSemanticOpKind kind = DecoderSemanticOpKind::AttentionNorm;
+    int layer_index = -1;
+};
+
+struct DecoderSpecialization {
+    DecoderSpecializationKind kind = DecoderSpecializationKind::HybridSSMMixer;
     int layer_index = -1;
 };
 
@@ -102,12 +136,19 @@ struct DecoderOutputSpec {
 struct DecoderModelSpec {
     ModelArch arch = ModelArch::UNKNOWN;
     ModelVariant variant = ModelVariant::UNKNOWN;
+    DecoderRuntimeTopology runtime_topology = DecoderRuntimeTopology::Unknown;
     bool has_moe = false;
     bool has_hybrid_ssm_mixer = false;
     bool has_sliding_window_attention = false;
     bool has_shared_kv = false;
     DecoderOutputSpec output;
     std::vector<DecoderLayerSpec> layers;
+    std::vector<DecoderSpecialization> specializations;
+};
+
+struct DecoderPrefillRuntimePolicy {
+    bool qwen35_prefill_last_logits_only = false;
+    bool qwen36_prefill_last_logits_only = true;
 };
 
 DecoderModelSpec BuildDecoderModelSpec(const TransformerModel* model);
@@ -115,13 +156,21 @@ const DecoderModelSpec* GetDecoderModelSpec(const TransformerModel* model);
 const DecoderLayerSpec* GetDecoderLayerSpec(const DecoderModelSpec* spec, int layer_idx);
 const DecoderLayerSpec* ResolveDecoderLayerSpecForLayer(const TransformerModel* model, const TransformerLayer* layer);
 std::shared_ptr<const DecoderModelSpec> MakeDecoderModelSpec(const TransformerModel* model);
-bool ShouldUsePrefillLastLogitsOnly(const DecoderModelSpec* spec, int num_seqs, int n_tokens);
+DecoderPrefillRuntimePolicy DefaultDecoderPrefillRuntimePolicy();
+bool ShouldUsePrefillLastLogitsOnly(const DecoderModelSpec* spec, int num_seqs, int n_tokens,
+                                    DecoderPrefillRuntimePolicy policy = DefaultDecoderPrefillRuntimePolicy());
 
 const char* DecoderActivationName(DecoderActivation activation);
 const char* DecoderMoERouterName(DecoderMoERouter router);
 const char* DecoderRopeKindName(DecoderRopeKind kind);
 const char* DecoderPrefillLogitsPolicyName(DecoderPrefillLogitsPolicy policy);
+const char* DecoderRuntimeTopologyName(DecoderRuntimeTopology topology);
 const char* DecoderSemanticOpKindName(DecoderSemanticOpKind kind);
+const char* DecoderSpecializationKindName(DecoderSpecializationKind kind);
+bool DecoderModelSpecHasSpecialization(const DecoderModelSpec& spec, DecoderSpecializationKind kind);
+std::string FormatDecoderLayerSpec(const DecoderLayerSpec& layer);
+std::string FormatDecoderSpecializations(const DecoderModelSpec& spec);
+std::string FormatDecoderModelSpec(const DecoderModelSpec& spec);
 
 }  // namespace densecore::models
 

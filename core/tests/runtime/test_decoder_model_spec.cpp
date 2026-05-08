@@ -3,6 +3,7 @@
 #include <ggml.h>
 
 #include <algorithm>
+#include <string>
 #include <vector>
 
 #include "densecore/models/decoder_model_spec.h"
@@ -69,6 +70,19 @@ TEST(DecoderModelSpec, Gemma4MoEResolvesSemanticLayerContract) {
     EXPECT_TRUE(spec.has_moe);
     EXPECT_TRUE(spec.has_shared_kv);
     EXPECT_TRUE(spec.has_sliding_window_attention);
+    EXPECT_EQ(spec.runtime_topology, densecore::models::DecoderRuntimeTopology::SlidingSharedKVMoE);
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        spec, densecore::models::DecoderSpecializationKind::SlidingWindowAttention));
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        spec, densecore::models::DecoderSpecializationKind::SharedKV));
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        spec, densecore::models::DecoderSpecializationKind::Gemma4MoERouter));
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        spec, densecore::models::DecoderSpecializationKind::MoEDownScaleSidecar));
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        spec, densecore::models::DecoderSpecializationKind::AttentionLogitSoftcap));
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        spec, densecore::models::DecoderSpecializationKind::PrefillLastLogits));
     EXPECT_EQ(spec.output.prefill_logits_policy, densecore::models::DecoderPrefillLogitsPolicy::LastTokenForMoE);
     EXPECT_TRUE(densecore::models::ShouldUsePrefillLastLogitsOnly(&spec, /*num_seqs=*/1, /*n_tokens=*/8));
     EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&spec, /*num_seqs=*/2, /*n_tokens=*/8));
@@ -93,6 +107,7 @@ TEST(DecoderModelSpec, Gemma4MoEResolvesSemanticLayerContract) {
 
     const auto& shared = spec.layers[1];
     EXPECT_FALSE(shared.ffn.is_moe);
+    EXPECT_EQ(shared.ffn.activation, densecore::models::DecoderActivation::GeluPytorchTanh);
     EXPECT_TRUE(shared.attention.reads_shared_kv);
     EXPECT_FALSE(shared.attention.requires_k_norm);
     EXPECT_EQ(shared.attention.kv_source_layer, 0);
@@ -100,6 +115,16 @@ TEST(DecoderModelSpec, Gemma4MoEResolvesSemanticLayerContract) {
     EXPECT_EQ(shared.attention.rope_kind, densecore::models::DecoderRopeKind::Proportional);
     EXPECT_TRUE(HasOp(shared, densecore::models::DecoderSemanticOpKind::SharedKVRead));
     EXPECT_TRUE(HasOp(shared, densecore::models::DecoderSemanticOpKind::DenseFfn));
+
+    const std::string formatted = densecore::models::FormatDecoderModelSpec(spec);
+    EXPECT_NE(formatted.find("topology=sliding_shared_kv_moe"), std::string::npos);
+    EXPECT_NE(formatted.find("prefill_logits=last_token_for_moe"), std::string::npos);
+    EXPECT_NE(formatted.find("specializations=[prefill_last_logits"), std::string::npos);
+    EXPECT_NE(formatted.find("gemma4_moe_router@layer0"), std::string::npos);
+    EXPECT_NE(formatted.find("router=gemma4_softmax_top_k"), std::string::npos);
+    EXPECT_NE(formatted.find("activation=gelu_pytorch_tanh"), std::string::npos);
+    EXPECT_NE(formatted.find("shared_kv_read=true"), std::string::npos);
+    EXPECT_NE(formatted.find("ops=[attention_norm,attention_projection"), std::string::npos);
 
     ggml_free(ctx);
 }
@@ -120,6 +145,13 @@ TEST(DecoderModelSpec, Qwen36HybridMoEResolvesReusableSoftmaxContract) {
 
     const auto spec = densecore::models::BuildDecoderModelSpec(&model);
     ASSERT_EQ(spec.layers.size(), 2u);
+    EXPECT_EQ(spec.runtime_topology, densecore::models::DecoderRuntimeTopology::HybridSSMMoE);
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        spec, densecore::models::DecoderSpecializationKind::HybridSSMMixer));
+    EXPECT_TRUE(
+        densecore::models::DecoderModelSpecHasSpecialization(spec, densecore::models::DecoderSpecializationKind::MoE));
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        spec, densecore::models::DecoderSpecializationKind::PrefillLastLogits));
     EXPECT_TRUE(spec.has_hybrid_ssm_mixer);
     EXPECT_TRUE(spec.layers[0].attention.has_hybrid_ssm_mixer);
     EXPECT_FALSE(spec.layers[1].attention.has_hybrid_ssm_mixer);
@@ -147,5 +179,52 @@ TEST(DecoderModelSpec, Qwen36GroupedRouterIsDeclaredBySpecNotRuntimeBranch) {
 
     const auto spec = densecore::models::BuildDecoderModelSpec(&model);
     ASSERT_EQ(spec.layers.size(), 1u);
+    EXPECT_EQ(spec.runtime_topology, densecore::models::DecoderRuntimeTopology::HybridSSMMoE);
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        spec, densecore::models::DecoderSpecializationKind::GroupedMoERouter));
     EXPECT_EQ(spec.layers[0].ffn.router, densecore::models::DecoderMoERouter::GroupedSigmoidTopK);
+}
+
+TEST(DecoderModelSpec, PrefillLastLogitsPolicyUsesExplicitRuntimePolicy) {
+    TransformerModel qwen35{};
+    qwen35.arch = ModelArch::QWEN35;
+    qwen35.variant = ModelVariant::QWEN35;
+    qwen35.hparams.n_layer = 1;
+    qwen35.layers.resize(1);
+
+    const auto qwen35_spec = densecore::models::BuildDecoderModelSpec(&qwen35);
+    EXPECT_EQ(qwen35_spec.runtime_topology, densecore::models::DecoderRuntimeTopology::DenseAttention);
+    EXPECT_EQ(qwen35_spec.output.prefill_logits_policy,
+              densecore::models::DecoderPrefillLogitsPolicy::LastTokenEnvOptIn);
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        qwen35_spec, densecore::models::DecoderSpecializationKind::PrefillLastLogits));
+    EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen35_spec, /*num_seqs=*/1, /*n_tokens=*/8));
+
+    densecore::models::DecoderPrefillRuntimePolicy opt_in_policy =
+        densecore::models::DefaultDecoderPrefillRuntimePolicy();
+    opt_in_policy.qwen35_prefill_last_logits_only = true;
+    EXPECT_TRUE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen35_spec, /*num_seqs=*/1, /*n_tokens=*/8,
+                                                                  opt_in_policy));
+
+    TransformerModel qwen36{};
+    qwen36.arch = ModelArch::QWEN35;
+    qwen36.variant = ModelVariant::QWEN36;
+    qwen36.hparams.n_layer = 1;
+    qwen36.layers.resize(1);
+
+    const auto qwen36_spec = densecore::models::BuildDecoderModelSpec(&qwen36);
+    EXPECT_EQ(qwen36_spec.runtime_topology, densecore::models::DecoderRuntimeTopology::DenseAttention);
+    EXPECT_EQ(qwen36_spec.output.prefill_logits_policy,
+              densecore::models::DecoderPrefillLogitsPolicy::LastTokenEnvDefaultOn);
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        qwen36_spec, densecore::models::DecoderSpecializationKind::PrefillLastLogits));
+    EXPECT_TRUE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen36_spec, /*num_seqs=*/1, /*n_tokens=*/8));
+
+    densecore::models::DecoderPrefillRuntimePolicy opt_out_policy =
+        densecore::models::DefaultDecoderPrefillRuntimePolicy();
+    opt_out_policy.qwen36_prefill_last_logits_only = false;
+    EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen36_spec, /*num_seqs=*/1, /*n_tokens=*/8,
+                                                                   opt_out_policy));
+    EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen36_spec, /*num_seqs=*/2, /*n_tokens=*/8,
+                                                                   opt_in_policy));
 }

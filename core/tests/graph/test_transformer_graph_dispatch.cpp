@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <memory>
 #include <string>
 
 #include "densecore/models/decoder_model_spec.h"
@@ -100,6 +101,57 @@ TEST(BuildTransformerGraphDispatchTest, Gemma4GraphCapabilitiesUseEnvResolvedDec
     EXPECT_FALSE(spec.has_shared_kv);
     EXPECT_FALSE(capabilities.has_sliding_window_attention);
     EXPECT_FALSE(capabilities.has_shared_kv_source);
+}
+
+TEST(BuildTransformerGraphDispatchTest, ExecutionPlanFollowsAttachedDecoderSpecBeforeRawArchDefaults) {
+    TransformerModel model{};
+    model.arch = ModelArch::LLAMA;
+
+    densecore::models::DecoderModelSpec spec{};
+    spec.arch = ModelArch::LLAMA;
+    spec.has_hybrid_ssm_mixer = true;
+    spec.output.prefill_logits_policy = densecore::models::DecoderPrefillLogitsPolicy::FullSequence;
+    model.decoder_spec = std::make_shared<const densecore::models::DecoderModelSpec>(spec);
+
+    const auto plan = densecore::ResolveTransformerGraphExecutionPlan(&model);
+
+    EXPECT_TRUE(plan.resolution.capabilities.has_hybrid_ssm_mixer);
+    EXPECT_EQ(plan.resolution.preferred_family, densecore::models::GraphFamily::DecoderHybridSSM);
+    EXPECT_EQ(plan.route, densecore::TransformerGraphExecutionRoute::InlineHybridSSM);
+}
+
+TEST(BuildTransformerGraphDispatchTest, AdmissionRejectsMissingFineGrainedMoERouterContract) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_experts = 4;
+    model.hparams.n_experts_used = 2;
+    model.layers.resize(1);
+    model.layers[0].is_moe = true;
+
+    densecore::models::GraphBuilderSupport support{};
+    support.builder_name = "unit-test-partial-moe";
+    support.supported_families = {densecore::models::GraphFamily::DecoderDenseAttention};
+    support.supports_moe = true;
+    support.supported_ffn_activations = {densecore::models::DecoderActivation::GeluPytorchTanh};
+    support.supported_rope_kinds = {densecore::models::DecoderRopeKind::Proportional};
+    support.supported_prefill_logits_policies = {densecore::models::DecoderPrefillLogitsPolicy::LastTokenForMoE};
+    support.supported_semantic_ops = {
+        densecore::models::DecoderSemanticOpKind::AttentionNorm,
+        densecore::models::DecoderSemanticOpKind::AttentionProjection,
+        densecore::models::DecoderSemanticOpKind::AttentionCore,
+        densecore::models::DecoderSemanticOpKind::AttentionOutputProjection,
+        densecore::models::DecoderSemanticOpKind::FfnNorm,
+        densecore::models::DecoderSemanticOpKind::MoERouter,
+        densecore::models::DecoderSemanticOpKind::MoEExpertDispatch,
+        densecore::models::DecoderSemanticOpKind::ResidualAdd,
+    };
+
+    const auto admission = densecore::models::AdmitGraphBuilder(densecore::models::ResolveGraphFamily(&model), support);
+
+    EXPECT_FALSE(admission.admitted);
+    EXPECT_NE(admission.Summary().find("MoE router kinds [gemma4_softmax_top_k]"), std::string::npos);
 }
 
 TEST(BuildTransformerGraphDispatchTest, UnsupportedMultimodalProjectionFailsClosed) {

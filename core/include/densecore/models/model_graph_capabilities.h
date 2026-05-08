@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "densecore/models/decoder_model_spec.h"
 #include "densecore/models/model_types.h"
 
 namespace densecore::models {
@@ -44,6 +45,7 @@ struct ModelGraphCapabilities {
     ModelArch arch = ModelArch::UNKNOWN;
     ModelVariant variant = ModelVariant::UNKNOWN;
     GraphTopology topology = GraphTopology::UNKNOWN;
+    DecoderRuntimeTopology decoder_runtime_topology = DecoderRuntimeTopology::Unknown;
     bool has_dense_attention = false;
     bool has_sliding_window_attention = false;
     bool has_shared_kv_source = false;
@@ -56,6 +58,14 @@ struct ModelGraphCapabilities {
     bool requires_special_attention_mask = false;
     bool requires_special_residual_scaling = false;
     bool has_multimodal_projection = false;
+    bool requires_shared_dense_ffn = false;
+    bool requires_moe_down_scale_sidecar = false;
+    bool requires_ffn_post_norms = false;
+    std::vector<DecoderMoERouter> required_moe_routers;
+    std::vector<DecoderActivation> required_ffn_activations;
+    std::vector<DecoderRopeKind> required_rope_kinds;
+    std::vector<DecoderPrefillLogitsPolicy> required_prefill_logits_policies;
+    std::vector<DecoderSemanticOpKind> required_semantic_ops;
 };
 
 struct GraphFamilyResolution {
@@ -79,6 +89,14 @@ struct GraphBuilderSupport {
     bool supports_special_attention_mask = false;
     bool supports_special_residual_scaling = false;
     bool supports_multimodal_projection = false;
+    bool supports_shared_dense_ffn = false;
+    bool supports_moe_down_scale_sidecar = false;
+    bool supports_ffn_post_norms = false;
+    std::vector<DecoderMoERouter> supported_moe_routers;
+    std::vector<DecoderActivation> supported_ffn_activations;
+    std::vector<DecoderRopeKind> supported_rope_kinds;
+    std::vector<DecoderPrefillLogitsPolicy> supported_prefill_logits_policies;
+    std::vector<DecoderSemanticOpKind> supported_semantic_ops;
 };
 
 struct GraphAdmissionResult {

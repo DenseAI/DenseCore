@@ -409,10 +409,11 @@ bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model) {
     if (!model) {
         return false;
     }
-    // Gemma4 graphs still contain request-local custom-op userdata on the MoE,
-    // norm, and probe paths. Keep paged decode enabled, but rebuild the graph
-    // per step until those nodes have complete runtime rebind coverage.
-    if (model->arch_flags.is_gemma4) {
+    // Gemma4 and hybrid-SSM graphs still contain request-local custom-op
+    // userdata on model-specific attention/state paths. Keep paged decode
+    // enabled, but rebuild the graph per step until those nodes have complete
+    // runtime rebind coverage.
+    if (model->arch_flags.is_gemma4 || model->arch_flags.is_hybrid_ssm) {
         return false;
     }
     return true;

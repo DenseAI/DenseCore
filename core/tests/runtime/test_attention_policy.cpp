@@ -1,5 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <memory>
+
+#include "densecore/models/decoder_model_spec.h"
+#include "densecore/models/model_descriptor.h"
 #include "densecore/simd/simd_ops.h"
 #include "llm/attention/internal.h"
 #include "runtime/runtime_env.h"
@@ -188,6 +192,25 @@ TEST(AttentionPolicyTest, Gemma4MoEPrefillProjectsOnlyPromptEndLogits) {
     TransformerModel gemma4_dense = MakeModel(ModelArch::GEMMA, true);
     EXPECT_FALSE(densecore::testing::ShouldUsePrefillLastLogitsOnlyForTest(&gemma4_dense, /*num_seqs=*/1,
                                                                            /*n_tokens=*/384));
+}
+
+TEST(AttentionPolicyTest, PrefillLastLogitsPolicyUsesAttachedDecoderSpecBeforeRawModelFlags) {
+    TransformerModel gemma4_moe = MakeModel(ModelArch::GEMMA, true);
+    gemma4_moe.hparams.n_experts = 128;
+
+    densecore::models::DecoderModelSpec full_sequence_spec{};
+    full_sequence_spec.output.prefill_logits_policy = densecore::models::DecoderPrefillLogitsPolicy::FullSequence;
+    gemma4_moe.decoder_spec = std::make_shared<const densecore::models::DecoderModelSpec>(full_sequence_spec);
+
+    EXPECT_FALSE(densecore::testing::ShouldUsePrefillLastLogitsOnlyForTest(&gemma4_moe, /*num_seqs=*/1,
+                                                                           /*n_tokens=*/384));
+
+    TransformerModel dense = MakeModel(ModelArch::LLAMA);
+    densecore::models::DecoderModelSpec last_token_spec{};
+    last_token_spec.output.prefill_logits_policy = densecore::models::DecoderPrefillLogitsPolicy::LastTokenForMoE;
+    dense.decoder_spec = std::make_shared<const densecore::models::DecoderModelSpec>(last_token_spec);
+
+    EXPECT_TRUE(densecore::testing::ShouldUsePrefillLastLogitsOnlyForTest(&dense, /*num_seqs=*/1, /*n_tokens=*/384));
 }
 
 TEST(AttentionPolicyTest, Qwen35PrefillLastLogitsOnlyIsOptIn) {

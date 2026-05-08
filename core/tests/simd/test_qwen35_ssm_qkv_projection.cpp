@@ -159,8 +159,6 @@ uint64_t HashFloatVector(const std::vector<float>& values) {
 }  // namespace
 
 TEST(Qwen35SSMHeadStep, FastDefaultMatchesReferenceStep) {
-    ScopedEnvVar disable_updated_accum("DENSECORE_QWEN36_SSM_UPDATED_STATE_OUTPUT_ACCUM", "0");
-
     constexpr int n_embd = 64;
     constexpr int head_dim_k = 16;
     constexpr int head_dim_v = 32;
@@ -628,7 +626,8 @@ TEST(Qwen35SSMQkvProjection, Qwen36CallbackMatchesOfficialProjectionContract) {
     const float* v_base = k_base + kTestQKTotal;
 
     for (int h = 0; h < kTestNHeads; ++h) {
-        const int src_k_head = h % kTestNGroups;
+        const int heads_per_group = kTestNHeads / kTestNGroups;
+        const int src_k_head = std::min(kTestNGroups - 1, h / heads_per_group);
         Qwen35SSMHeadStepConfig cfg{};
         cfg.input_t = input_t.data();
         cfg.q_head = q_base + src_k_head * kTestHeadDimK;

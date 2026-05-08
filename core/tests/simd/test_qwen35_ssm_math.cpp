@@ -56,8 +56,8 @@ void RunReferenceStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float
         k_sum_sq += cfg.k_head[i] * cfg.k_head[i];
     }
 
-    const float q_inv_norm = 1.0f / std::max(std::sqrt(q_sum_sq), cfg.norm_eps);
-    const float k_inv_norm = 1.0f / std::max(std::sqrt(k_sum_sq), cfg.norm_eps);
+    const float q_inv_norm = 1.0f / std::sqrt(q_sum_sq + cfg.norm_eps);
+    const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
     for (int i = 0; i < cfg.head_dim_k; ++i) {
         q_norm[static_cast<size_t>(i)] = cfg.q_head[i] * q_inv_norm;
         k_norm[static_cast<size_t>(i)] = cfg.k_head[i] * k_inv_norm;
@@ -88,13 +88,14 @@ void RunReferenceStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float
         for (int k = 0; k < cfg.head_dim_k; ++k) {
             sum += state_kv[static_cast<size_t>(k) * cfg.head_dim_v + v] * q_norm[static_cast<size_t>(k)];
         }
-        y_head[v] = sum / std::sqrt(static_cast<float>(cfg.head_dim_v));
+        y_head[v] = sum / std::sqrt(static_cast<float>(cfg.head_dim_k));
         sum_sq += y_head[v] * y_head[v];
     }
 
     const float rms = std::sqrt(sum_sq / cfg.head_dim_v + cfg.norm_eps);
     for (int v = 0; v < cfg.head_dim_v; ++v) {
-        const float norm_w = cfg.norm_weight ? cfg.norm_weight[v] : 1.0f;
+        const float norm_w =
+            cfg.norm_weight ? cfg.norm_weight[v] + (cfg.norm_weight_uses_unit_offset ? 1.0f : 0.0f) : 1.0f;
         y_head[v] = (y_head[v] / rms) * norm_w * SiluRef(cfg.z_head[v]);
     }
 }
@@ -267,7 +268,7 @@ TEST(Qwen35SSMMathTest, ReordersGroupedValueHeadsToTiledOrder) {
     EXPECT_EQ(values, expected);
 }
 
-TEST(Qwen35SSMMathTest, IsolatedWritebackMatchesInPlaceReference) {
+TEST(Qwen35SSMMathTest, DefaultStepMatchesInPlaceReference) {
     const std::vector<float> input = {0.25f, -0.5f, 0.75f, -0.125f};
     const std::vector<float> q = {0.3f, -0.8f};
     const std::vector<float> k = {0.4f, 0.6f};
@@ -301,7 +302,7 @@ TEST(Qwen35SSMMathTest, IsolatedWritebackMatchesInPlaceReference) {
     cfg.norm_eps = 1e-6f;
 
     ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(cfg, expected_state.data(), expected_y.data(), nullptr));
-    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepWithWriteback(cfg, state.data(), state.data(), y.data(), nullptr));
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepFastDefault(cfg, state.data(), y.data()));
 
     EXPECT_EQ(Qwen35SSMHeadStateElements(cfg.head_dim_k, cfg.head_dim_v), state.size());
     EXPECT_EQ(state, expected_state);
@@ -338,14 +339,14 @@ TEST(Qwen35SSMMathTest, IsolatedWritebackIsDeterministicAcrossRepeatedRequests) 
     cfg.a_log = -1.2f;
     cfg.norm_eps = 1e-6f;
 
-    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepWithWriteback(cfg, state1.data(), state1.data(), y1.data(), nullptr));
-    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepWithWriteback(cfg, state2.data(), state2.data(), y2.data(), nullptr));
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepFastDefault(cfg, state1.data(), y1.data()));
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepFastDefault(cfg, state2.data(), y2.data()));
 
     EXPECT_EQ(state1, state2);
     EXPECT_EQ(y1, y2);
 }
 
-TEST(Qwen35SSMMathTest, ReferenceSafeMatchesInPlaceReference) {
+TEST(Qwen35SSMMathTest, FastDefaultMatchesInPlaceReference) {
     const std::vector<float> input = {0.25f, -0.5f, 0.75f, -0.125f};
     const std::vector<float> q = {0.3f, -0.8f};
     const std::vector<float> k = {0.4f, 0.6f};
@@ -379,15 +380,10 @@ TEST(Qwen35SSMMathTest, ReferenceSafeMatchesInPlaceReference) {
     cfg.norm_eps = 1e-6f;
 
     ASSERT_TRUE(Qwen35RunGatedDeltaHeadStep(cfg, expected_state.data(), expected_y.data(), nullptr));
-    Qwen35SSMHeadStepTrace trace{};
-    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepReferenceSafe(cfg, state.data(), state.data(), y.data(), nullptr, nullptr,
-                                                         &trace));
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepFastDefault(cfg, state.data(), y.data()));
 
     EXPECT_EQ(state, expected_state);
     EXPECT_EQ(y, expected_y);
-    EXPECT_NE(trace.state_in_hash, 0ull);
-    EXPECT_NE(trace.state_out_hash, 0ull);
-    EXPECT_NE(trace.y_hash, 0ull);
 }
 
 TEST(Qwen35SSMMathTest, CanonicalizeFusedBAGroupedLayout) {

@@ -1,0 +1,2266 @@
+namespace {
+
+bool IsDebugSharedExpertShapeEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_VALIDATE_MUL");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+void DebugLogSharedExpertTensor(const char* stage, int layer_idx, const struct ggml_tensor* tensor) {
+    if (!IsDebugSharedExpertShapeEnabled() || !tensor) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "[SharedExpertShape] layer=%d stage=%s name=%s type=%d ne=[%lld,%lld,%lld,%lld] "
+                 "nb=[%lld,%lld,%lld,%lld]\n",
+                 layer_idx, stage ? stage : "<unknown>", tensor->name[0] ? tensor->name : "<unnamed>",
+                 static_cast<int>(tensor->type), static_cast<long long>(tensor->ne[0]),
+                 static_cast<long long>(tensor->ne[1]), static_cast<long long>(tensor->ne[2]),
+                 static_cast<long long>(tensor->ne[3]), static_cast<long long>(tensor->nb[0]),
+                 static_cast<long long>(tensor->nb[1]), static_cast<long long>(tensor->nb[2]),
+                 static_cast<long long>(tensor->nb[3]));
+}
+
+bool ShouldRunMoESharedDenseBranch(const TransformerModel* model, const densecore::models::DecoderLayerSpec* layer_spec,
+                                   bool is_gemma4_moe, const struct ggml_tensor* ffn_gate,
+                                   const struct ggml_tensor* ffn_up, const struct ggml_tensor* ffn_down) {
+    if (!model || !ffn_gate || !ffn_up || !ffn_down) {
+        return false;
+    }
+    if (layer_spec) {
+        return layer_spec->ffn.has_shared_dense_branch;
+    }
+    if (model->moe_n_shared_experts > 0) {
+        return true;
+    }
+    // Gemma4-26B-A4B carries a regular dense MLP branch alongside the sparse
+    // MoE branch. Some GGUF exports do not advertise it via n_shared_experts,
+    // so the presence of the shared FFN tensors is the load-bearing signal.
+    return is_gemma4_moe;
+}
+
+using densecore::env::ParseIntEnv;
+using densecore::env::ParsePositiveEnvInt;
+using densecore::env::ParseRuntimeToggleMode;
+using densecore::env::ParseTruthyEnv;
+using densecore::env::RuntimeToggleMode;
+using densecore::llm::config::DecodePagedAttentionMode;
+using densecore::llm::config::DecodePagedAttentionPolicy;
+using densecore::llm::config::KVRetentionPolicy;
+using densecore::llm::config::KVRetentionSpan;
+
+constexpr const char* kGemma4RouterScaleKey = "gemma4.router.scale";
+constexpr const char* kGemma4RouterPerExpertScaleKey = "gemma4.router.per_expert_scale";
+constexpr const char* kGemma4PreMoeNormKey = "gemma4.pre_feedforward_layernorm_2.weight";
+constexpr const char* kGemma4PostSharedNormKey = "gemma4.post_feedforward_layernorm_1.weight";
+constexpr const char* kGemma4PostMoeNormKey = "gemma4.post_feedforward_layernorm_2.weight";
+constexpr const char* kGemma4PostFfnNormKey = "gemma4.post_feedforward_layernorm.weight";
+std::atomic<uint64_t> g_moe_graph_wiring_debug_counter{0};
+
+bool ShouldUsePrefillLastLogitsOnly(const TransformerModel* model, const BatchSpec& batch, int n_tokens) {
+    return densecore::llm::decoder::ShouldUsePrefillLastLogitsOnly(model, batch, n_tokens);
+}
+
+enum class MoEWiringReasonCode : int {
+    Wired = 0,
+    ModelHasNoMoE = 1,
+    LayerFlagFalse = 2,
+    MissingMoeGate = 3,
+    NoExperts = 4,
+    DenseReplaceGate = 5,
+    LayerFlagMismatch = 6,
+};
+
+bool IsMoEWiringDebugEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_MOE_WIRING_DEBUG");
+        if (!env || env[0] == '\0') {
+            env = std::getenv("DENSECORE_DEBUG_MOE_WIRING");
+        }
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+using densecore::llm::runtime::IsMixedRoutingEnabled;
+using densecore::llm::runtime::ResolveBackendRegistry;
+using densecore::llm::runtime::ResolveFastPathRuntimeConfig;
+using densecore::llm::runtime::ResolveHardwareTopology;
+using densecore::llm::runtime::ResolveInferenceConfig;
+using densecore::llm::runtime::ResolvePreferredAttentionDevice;
+using densecore::llm::runtime::ResolvePreferredDevice;
+using densecore::llm::runtime::ResolvePreferredMatmulDevice;
+using densecore::llm::runtime::ResolvePreferredNormDevice;
+
+static bool IsVerboseGraphBuildLoggingEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_VERBOSE_GRAPH_BUILD");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugInferenceStatsEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_INFERENCE_STATS");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugGemvSelectionEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_GEMV_SELECTION");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugMatmulPathLoggingEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_MATMUL_PATH");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugMatmulDispatchEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_MATMUL_DISPATCH");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Dispatch path labels for instrumentation
+static const char* MatmulWeightTypeLabel(ggml_type wtype, bool is_packed_int4, bool is_packed_fp8) {
+    if (is_packed_int4) return "PACKED_INT4";
+    if (is_packed_fp8) return "PACKED_FP8";
+    if (ggml_is_quantized(wtype)) return "GGML_QUANT";
+    if (wtype == GGML_TYPE_F32) return "FLOAT_F32";
+    if (wtype == GGML_TYPE_F16) return "FLOAT_F16";
+    if (wtype == GGML_TYPE_BF16) return "FLOAT_BF16";
+    return "UNKNOWN";
+}
+
+static const char* DetectedISATier() {
+#if defined(__AVX512F__)
+    return "AVX-512";
+#elif defined(__AVX2__)
+    return "AVX2";
+#elif defined(__aarch64__)
+    return "NEON";
+#else
+    return "SCALAR";
+#endif
+}
+
+static void LogMatmulDispatch(const char* weight_name, const char* weight_type_label, int M, int N, int K,
+                              const char* path_label, const char* fallback_reason = nullptr) {
+    if (!IsDebugMatmulDispatchEnabled()) return;
+    if (fallback_reason) {
+        fprintf(stderr, "[DISPATCH] w=%s type=%s M=%d N=%d K=%d isa=%s path=%s fallback=%s\n",
+                weight_name ? weight_name : "(unnamed)", weight_type_label, M, N, K, DetectedISATier(), path_label,
+                fallback_reason);
+    } else {
+        fprintf(stderr, "[DISPATCH] w=%s type=%s M=%d N=%d K=%d isa=%s path=%s\n",
+                weight_name ? weight_name : "(unnamed)", weight_type_label, M, N, K, DetectedISATier(), path_label);
+    }
+}
+
+static bool IsDebugSSMQkvReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SSM_QKV_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugSSMProjectionReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SSM_PROJECTION_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugAttentionProjectionReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_ATTN_PROJECTION_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static void ValidateAttentionProjectionShape3D(const struct ggml_tensor* tensor, const char* tensor_name, int layer_idx,
+                                               int ne0, int ne1, int ne2, int projected_dim, int n_heads) {
+    if (!tensor) {
+        throw densecore::InvalidArgumentException("Missing attention projection tensor for " +
+                                                  std::string(tensor_name ? tensor_name : "unknown") + " in layer " +
+                                                  std::to_string(layer_idx));
+    }
+    if (projected_dim <= 0 || n_heads <= 0 || ne2 <= 0) {
+        throw densecore::InvalidArgumentException(
+            "Invalid attention reshape parameters for " + std::string(tensor_name ? tensor_name : "unknown") +
+            " in layer " + std::to_string(layer_idx) + ": projected_dim=" + std::to_string(projected_dim) +
+            " n_heads=" + std::to_string(n_heads) + " n_tokens=" + std::to_string(ne2));
+    }
+    if ((projected_dim % n_heads) != 0) {
+        throw densecore::InvalidArgumentException("Attention projection dimension is not divisible by head count for " +
+                                                  std::string(tensor_name ? tensor_name : "unknown") + " in layer " +
+                                                  std::to_string(layer_idx) + ": dim=" + std::to_string(projected_dim) +
+                                                  " n_heads=" + std::to_string(n_heads));
+    }
+    const int64_t expected = static_cast<int64_t>(ne0) * static_cast<int64_t>(ne1) * static_cast<int64_t>(ne2);
+    const int64_t actual = ggml_nelements(tensor);
+    if (actual != expected) {
+        throw densecore::InvalidArgumentException(
+            "Attention reshape contract mismatch for " + std::string(tensor_name ? tensor_name : "unknown") +
+            " in layer " + std::to_string(layer_idx) + ": tensor=[" + std::to_string(tensor->ne[0]) + "," +
+            std::to_string(tensor->ne[1]) + "," + std::to_string(tensor->ne[2]) + "," + std::to_string(tensor->ne[3]) +
+            "] projected_dim=" + std::to_string(projected_dim) + " n_heads=" + std::to_string(n_heads) + " target=[" +
+            std::to_string(ne0) + "," + std::to_string(ne1) + "," + std::to_string(ne2) +
+            "] actual_nelements=" + std::to_string(actual) + " expected_nelements=" + std::to_string(expected));
+    }
+}
+
+static bool IsDebugFinalProjectionReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_FINAL_PROJECTION_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugHiddenSnapshotEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugGemma4SharedKVEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_GEMMA4_SHARED_KV");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugFfnProjectionReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_FFN_PROJECTION_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugSSMCoreReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SSM_CORE_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+using densecore::llm::models::IsHybridSSMQkvWeightName;
+using densecore::llm::models::ShouldForcePlainGgmlForHybridSSMQkv;
+
+static std::array<std::atomic<uint64_t>, kHybridSSMDispatchWeightCount * kHybridSSMDispatchPathCount>
+    g_hybrid_ssm_dispatch_counters{};
+
+static std::size_t ResolveHybridSSMDispatchWeightIndex(const char* name) {
+    if (!name) {
+        return 3;
+    }
+    if (std::strstr(name, "qkv_mixed")) return 0;
+    if (std::strcmp(name, "z") == 0 || std::strstr(name, ".z")) return 1;
+    if (std::strstr(name, "ssm_out")) return 2;
+    return 3;
+}
+
+static std::size_t ResolveHybridSSMDispatchPathIndex(const char* path) {
+    if (!path) {
+        return 4;
+    }
+    if (std::strstr(path, "PLAIN_GGML_CONSERVATIVE_FALLBACK")) return 0;
+    if (std::strstr(path, "GEMV_QUANT")) return 1;
+    if (std::strstr(path, "GGML_QUANT_NRC_M")) return 2;
+    if (std::strstr(path, "GGML_NATIVE")) return 3;
+    return 4;
+}
+
+static void LogHybridSSMQkvDispatch(const char* weight_name, ggml_type weight_type, int M, int N, int K,
+                                    const char* chosen_path, bool used_batched_quant_nrc, bool used_native_q4k_vecdot,
+                                    bool used_direct_int4_fastpath) {
+    if (!densecore::llm::models::IsHybridSSMQkvWeightName(weight_name)) {
+        return;
+    }
+    const std::size_t weight_index = ResolveHybridSSMDispatchWeightIndex(weight_name);
+    const std::size_t path_index = ResolveHybridSSMDispatchPathIndex(chosen_path);
+    g_hybrid_ssm_dispatch_counters[weight_index * kHybridSSMDispatchPathCount + path_index].fetch_add(
+        1, std::memory_order_relaxed);
+    if (!IsDebugMatmulDispatchEnabled()) {
+        return;
+    }
+    fprintf(stderr,
+            "[SSM_QKV_DISPATCH] w=%s ggml_type=%s M=%d N=%d K=%d path=%s batched_quant_nrc=%d native_q4k_vecdot=%d "
+            "direct_int4_fastpath=%d\n",
+            weight_name ? weight_name : "(unnamed)", ggml_type_name(weight_type), M, N, K,
+            chosen_path ? chosen_path : "unknown", used_batched_quant_nrc ? 1 : 0, used_native_q4k_vecdot ? 1 : 0,
+            used_direct_int4_fastpath ? 1 : 0);
+}
+
+// Env-tunable thresholds declared here, defined after ParsePositiveEnvInt.
+static int GetBatchedMinM();
+static int GetBatchedMinN();
+static int GetBatchedMinK();
+
+static void LogMatmulPathOnce(const char* path) {
+    if (!path || !IsDebugMatmulPathLoggingEnabled()) {
+        return;
+    }
+
+    static std::atomic<bool> logged_ggml_mul_mat{false};
+    static std::atomic<bool> logged_gemv_batched_quant_nrc{false};
+    std::atomic<bool>* once_flag = nullptr;
+
+    if (std::strcmp(path, "ggml_mul_mat") == 0) {
+        once_flag = &logged_ggml_mul_mat;
+    } else if (std::strcmp(path, "gemv_batched_quant_nrc") == 0) {
+        once_flag = &logged_gemv_batched_quant_nrc;
+    } else {
+        return;
+    }
+
+    bool expected = false;
+    if (once_flag->compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        fprintf(stderr, "[DenseCore][MatmulPath] %s\n", path);
+    }
+}
+
+[[maybe_unused]] static void LogMatmulValidationOnce(const char* path, bool ok, float max_abs_diff) {
+    if (!path || !IsDebugMatmulPathLoggingEnabled()) {
+        return;
+    }
+
+    static std::mutex mu;
+    static std::unordered_map<std::string, bool> logged;
+    std::lock_guard<std::mutex> lock(mu);
+    if (logged[path]) {
+        return;
+    }
+    logged[path] = true;
+    fprintf(stderr, "[DenseCore][MatmulValidate] %s status=%s max_abs_diff=%.8f\n", path, ok ? "pass" : "fail",
+            static_cast<double>(max_abs_diff));
+}
+
+[[maybe_unused]] static RuntimeToggleMode GetArmQ4KNativeVecDotMode();
+
+static bool ShouldUseArmNativeQ4KVecDotValidated(ggml_type weight_type, const ggml_type_traits_cpu* type_traits_cpu,
+                                                 const char* weight_name, const void* sample_row_ptr,
+                                                 const void* sample_quant_input, const float* sample_input_f32, int N) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (weight_type != GGML_TYPE_Q4_K) {
+        return type_traits_cpu && type_traits_cpu->vec_dot;
+    }
+    if (!type_traits_cpu || !type_traits_cpu->vec_dot || !sample_row_ptr || !sample_quant_input || !sample_input_f32 ||
+        N <= 0) {
+        return false;
+    }
+
+    const RuntimeToggleMode mode = GetArmQ4KNativeVecDotMode();
+    if (mode == RuntimeToggleMode::Off) {
+        return false;
+    }
+    if (mode == RuntimeToggleMode::On) {
+        return true;
+    }
+
+    const bool is_hybrid_ssm_qkv = densecore::llm::models::IsHybridSSMQkvWeightName(weight_name);
+    if (is_hybrid_ssm_qkv && densecore::llm::models::ShouldForcePlainGgmlForHybridSSMQkv()) {
+        return false;  // Always fail-closed for hybrid SSM QKV on ARM unless specifically opted out
+    }
+
+    // Multi-sample validation: test multiple representative weight rows
+    static std::atomic<int> state{0};
+    int current = state.load(std::memory_order_acquire);
+    if (current != 0) {
+        return current == 1;
+    }
+
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    current = state.load(std::memory_order_relaxed);
+    if (current == 0) {
+        const auto* type_traits = ggml_get_type_traits(weight_type);
+        bool ok = false;
+        float global_max_abs_diff = 0.0f;
+        if (type_traits && type_traits->to_float) {
+            thread_local std::vector<float> dequant_buffer;
+            dequant_buffer.resize(static_cast<size_t>(N));
+            const size_t row_stride = ggml_row_size(weight_type, N);
+
+            // Validate at least kMinValidationRows representative rows.
+            // Rows are sampled at the base pointer (row 0) and at evenly
+            // spaced offsets to detect position-dependent accuracy loss.
+            static constexpr int kMinValidationRows = 4;
+            ok = true;
+            for (int sample = 0; sample < kMinValidationRows; ++sample) {
+                const void* row_ptr =
+                    reinterpret_cast<const char*>(sample_row_ptr) + static_cast<size_t>(sample) * row_stride;
+
+                float native_sum = 0.0f;
+                type_traits_cpu->vec_dot(N, &native_sum, 0, row_ptr, 0, sample_quant_input, 0, 1);
+
+                type_traits->to_float(row_ptr, dequant_buffer.data(), N);
+                float ref_sum = 0.0f;
+                for (int i = 0; i < N; ++i) {
+                    ref_sum += dequant_buffer[static_cast<size_t>(i)] * sample_input_f32[i];
+                }
+
+                const float diff = std::fabs(native_sum - ref_sum);
+                global_max_abs_diff = std::max(global_max_abs_diff, diff);
+
+                // Tighter tolerance than before (was 5e-4 relative, now 2e-4).
+                // Fail closed: any single row exceeding tolerance disables the path.
+                const float tol = std::max(1e-3f, 2e-4f * std::fabs(ref_sum));
+                if (!std::isfinite(native_sum) || diff > tol) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        state.store(ok ? 1 : 2, std::memory_order_release);
+        LogMatmulValidationOnce("arm_q4k_native_vecdot", ok, global_max_abs_diff);
+        current = ok ? 1 : 2;
+    }
+
+    return current == 1;
+#else
+    (void)weight_type;
+    (void)weight_name;
+    (void)sample_row_ptr;
+    (void)sample_quant_input;
+    (void)sample_input_f32;
+    (void)N;
+    return type_traits_cpu && type_traits_cpu->vec_dot;
+#endif
+}
+
+
+static bool IsCustomGemvDisabled() {
+    static const bool disabled = []() {
+        const char* legacy_env = std::getenv("DENSECORE_DISABLE_CUSTOM_GEMV");
+        if (legacy_env && legacy_env[0] != '\0') {
+            return std::strcmp(legacy_env, "0") != 0;
+        }
+
+        const char* mode_env = std::getenv("DENSECORE_CUSTOM_GEMV_MODE");
+        if (mode_env && mode_env[0] != '\0') {
+            std::string mode(mode_env);
+            for (char& c : mode) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (mode == "on" || mode == "1" || mode == "true" || mode == "force") {
+                return false;
+            }
+            if (mode == "off" || mode == "0" || mode == "false") {
+                return true;
+            }
+        }
+
+        // Auto mode: keep custom GEMV enabled unless architecture-specific
+        // logic in smart_mul_mat selects native GGML GEMV for better throughput.
+        return false;
+    }();
+    return disabled;
+}
+
+static bool IsPackedInt4CustomDisabled() {
+    static const bool disabled = []() {
+        const char* env = std::getenv("DENSECORE_DISABLE_PACKED_INT4_CUSTOM");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return disabled;
+}
+
+// Legacy opt-in (kept for backward compat, but batched quant is now always-on by default)
+static bool IsSmallBatchQuantGemmEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_SMALL_BATCH_GEMV_QUANT");
+        if (!env || env[0] == '\0') {
+            return true;
+        }
+        if (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 || std::strcmp(env, "FALSE") == 0 ||
+            std::strcmp(env, "off") == 0 || std::strcmp(env, "OFF") == 0 || std::strcmp(env, "no") == 0 ||
+            std::strcmp(env, "NO") == 0) {
+            return false;
+        }
+        return true;
+    }();
+    return enabled;
+}
+
+// Primary opt-out: DENSECORE_DISABLE_BATCHED_QUANT=1 disables the shared-quant nrc=M fast path.
+// Batched quant is ON by default for all quant weights with M>=2.
+static bool IsBatchedQuantDisabled() {
+    static const bool disabled = []() {
+        const char* env = std::getenv("DENSECORE_DISABLE_BATCHED_QUANT");
+        if (env && env[0] != '\0' && std::strcmp(env, "0") != 0) {
+            return true;
+        }
+        // Honor legacy env as well
+        return !IsSmallBatchQuantGemmEnabled();
+    }();
+    return disabled;
+}
+
+// ARM small-batch quantized matmul policy.
+// Default to the DenseCore batched path on ARM and keep an opt-out for
+// diagnostics. Falling back to generic GGML on this model family was both
+// slower and numerically unstable on real prefill traffic.
+static bool IsArmBatchedQuantSafeByDefault() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    static const bool enabled = []() {
+        const char* disable_env = std::getenv("DENSECORE_ARM_DISABLE_BATCHED_QUANT");
+        if (disable_env && disable_env[0] != '\0' && std::strcmp(disable_env, "0") != 0) {
+            return false;
+        }
+        const char* enable_env = std::getenv("DENSECORE_ARM_ENABLE_BATCHED_QUANT");
+        if (enable_env && enable_env[0] != '\0') {
+            return std::strcmp(enable_env, "0") != 0;
+        }
+        return true;
+    }();
+    return enabled;
+#else
+    return true;
+#endif
+}
+
+// Enable nrc-batched quant path by default and rely on per-type runtime checks
+// (vec_dot nrows >= M) before dispatching to the fast path.
+// DENSECORE_ENABLE_QUANT_NRC_BATCH=0 can be used to force-disable it.
+static bool IsQuantNrcBatchEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_ENABLE_QUANT_NRC_BATCH");
+        if (env && env[0] != '\0') {
+            return std::strcmp(env, "0") != 0;
+        }
+        return true;
+    }();
+    return enabled;
+}
+
+static bool ResolveQ4KTrueBatchedKernelEnabledPolicy(RuntimeToggleMode mode, densecore::simd::SimdLevel level,
+                                                     bool compiled_with_sve);
+
+// Deprecated path: keep disabled until a correctness/perf-positive
+// implementation is available.
+static bool IsQ4KTrueBatchedKernelEnabled() {
+    return ResolveQ4KTrueBatchedKernelEnabledPolicy(
+        ParseRuntimeToggleMode("DENSECORE_ENABLE_Q4K_TRUE_BATCHED", RuntimeToggleMode::Auto),
+        densecore::simd::DetectSimdLevel(),
+#if defined(__ARM_FEATURE_SVE)
+        true
+#else
+        false
+#endif
+    );
+}
+
+static bool ResolveQ4KTrueBatchedKernelEnabledPolicy(RuntimeToggleMode mode, densecore::simd::SimdLevel level,
+                                                     bool compiled_with_sve) {
+    if (mode == RuntimeToggleMode::Off) {
+        return false;
+    }
+    if (mode == RuntimeToggleMode::On) {
+        return true;
+    }
+    return compiled_with_sve && (level == densecore::simd::SimdLevel::SVE || level == densecore::simd::SimdLevel::SVE2);
+}
+
+static bool IsQ4KTrueBatchedAvx2Enabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_ENABLE_Q4K_BATCHED_AVX2");
+        if (!env || env[0] == '\0') {
+            return true;
+        }
+        return std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static inline void SpinPause(int spin_count) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    if ((spin_count & 0x3F) != 0) {
+        _mm_pause();
+        return;
+    }
+#elif defined(__aarch64__)
+    if ((spin_count & 0x3F) != 0) {
+        asm volatile("yield");
+        return;
+    }
+#endif
+    std::this_thread::yield();
+}
+
+static uint64_t ComputeGemvBatchedQuantStamp(const BatchSpec* batch, int M, int slot_id, const void* src_data_ptr,
+                                             const void* weight_data_ptr) {
+    // FNV-1a over stable per-op metadata to avoid stale-buffer reuse when
+    // slot_id repeats across different batched inputs.
+    uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&](uint64_t v) {
+        hash ^= v;
+        hash *= 1099511628211ull;
+    };
+
+    mix(static_cast<uint64_t>(static_cast<uint32_t>(slot_id)));
+    mix(static_cast<uint64_t>(static_cast<uint32_t>(M)));
+    mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(src_data_ptr)));
+    mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(weight_data_ptr)));
+    if (batch) {
+        mix(static_cast<uint64_t>(batch->tokens.size()));
+        const int n_pos = std::min(M, static_cast<int>(batch->pos.size()));
+        for (int i = 0; i < n_pos; ++i) {
+            mix(static_cast<uint64_t>(static_cast<uint32_t>(batch->pos[static_cast<size_t>(i)])));
+        }
+    }
+
+    // Zero is the reset sentinel for stamps.
+    return hash == 0 ? 1 : hash;
+}
+
+static const KVRetentionPolicy& GetKVRetentionPolicy(const BatchSpec* batch = nullptr) {
+    return ResolveFastPathRuntimeConfig(batch).kv_retention;
+}
+
+// Env-tunable thresholds for batched GEMM/GEMV routing
+[[maybe_unused]] static int GetBatchedMinM() {
+    static const int val = ParsePositiveEnvInt("DENSECORE_MATMUL_BATCHED_MIN_M", 2);
+    return val;
+}
+
+[[maybe_unused]] static int GetBatchedMinN() {
+    static const int val = ParsePositiveEnvInt("DENSECORE_MATMUL_BATCHED_MIN_N", 32);
+    return val;
+}
+
+[[maybe_unused]] static int GetBatchedMinK() {
+    static const int val = ParsePositiveEnvInt("DENSECORE_MATMUL_BATCHED_MIN_K", 32);
+    return val;
+}
+
+[[maybe_unused]] static RuntimeToggleMode GetArmQ4KNativeVecDotMode() {
+    return densecore::llm::config::LoadArmQ4KNativeVecDotMode();
+}
+
+[[maybe_unused]] static RuntimeToggleMode GetArmInt4DirectFastPathMode() {
+    return densecore::llm::config::LoadArmInt4DirectFastPathMode();
+}
+
+static int ResolveTaskCount(const BatchSpec* batch, int work_items) {
+    int n_tasks = ResolveInferenceConfig(batch).num_threads;
+    if (n_tasks <= 0) {
+        n_tasks = std::thread::hardware_concurrency();
+        if (n_tasks <= 0) n_tasks = 4;
+    }
+    int physical_cores = ResolveHardwareTopology(batch).GetPhysicalCoreCount();
+    if (physical_cores > 0) {
+        n_tasks = std::min(n_tasks, physical_cores);
+    }
+    if (work_items > 0) {
+        n_tasks = std::min(n_tasks, work_items);
+    }
+    return std::max(1, n_tasks);
+}
+
+static int ResolveQwen36MoECallbackTaskCount(const TransformerModel* model, const BatchSpec* batch, int top_k) {
+    (void)model;
+    (void)batch;
+    (void)top_k;
+    // Qwen3.6 MoE parallelism is backend-owned. Keep the ggml callback single-task
+    // so routing and reduction semantics run exactly once per forward.
+    return 1;
+}
+
+static densecore::simd::SimdLevel GetRuntimeSimdLevel() {
+    static const densecore::simd::SimdLevel level = densecore::simd::DetectSimdLevel();
+    return level;
+}
+
+static DecodePagedAttentionMode ParseDecodePagedAttentionMode() {
+    return densecore::llm::config::LoadDecodePagedAttentionMode();
+}
+
+static const DecodePagedAttentionPolicy& ResolveDecodePagedAttentionPolicy(const BatchSpec* batch = nullptr) {
+    return ResolveFastPathRuntimeConfig(batch).decode_paged_attention;
+}
+
+bool IsPagedDecodeModeAlwaysOnImpl() {
+    return ParseDecodePagedAttentionMode() == DecodePagedAttentionMode::On;
+}
+
+struct DecodeContextSummary {
+    int min_context = 0;
+    int max_context = 0;
+    int avg_context = 0;
+    bool valid = false;
+};
+
+[[maybe_unused]] static bool IsBatchedPagedDecodeEnabled() {
+    static const bool enabled = ParseTruthyEnv("DENSECORE_ENABLE_BATCHED_PAGED_DECODE", false);
+    return enabled;
+}
+
+bool IsDecodeOnlyBatchLayoutImpl(const BatchSpec& batch, int n_tokens_in_batch) {
+    if (n_tokens_in_batch <= 0) {
+        return false;
+    }
+    if (batch.num_seqs != n_tokens_in_batch) {
+        return false;
+    }
+    if (static_cast<int>(batch.tokens.size()) != n_tokens_in_batch ||
+        static_cast<int>(batch.seq_id.size()) != n_tokens_in_batch ||
+        static_cast<int>(batch.pos.size()) != n_tokens_in_batch) {
+        return false;
+    }
+    if (static_cast<int>(batch.block_tables.size()) != n_tokens_in_batch ||
+        static_cast<int>(batch.n_past.size()) != n_tokens_in_batch) {
+        return false;
+    }
+
+    std::vector<uint8_t> seen(static_cast<size_t>(n_tokens_in_batch), 0);
+    for (int i = 0; i < n_tokens_in_batch; ++i) {
+        const int seq_idx = batch.seq_id[static_cast<size_t>(i)];
+        if (seq_idx < 0 || seq_idx >= n_tokens_in_batch) {
+            return false;
+        }
+        if (seen[static_cast<size_t>(seq_idx)] != 0) {
+            return false;
+        }
+        seen[static_cast<size_t>(seq_idx)] = 1;
+    }
+
+    return true;
+}
+
+static DecodeContextSummary SummarizeDecodeContext(const BatchSpec& batch, int n_tokens_in_batch) {
+    DecodeContextSummary summary;
+    if (!IsDecodeOnlyBatchLayoutImpl(batch, n_tokens_in_batch)) {
+        return summary;
+    }
+
+    summary.min_context = std::numeric_limits<int>::max();
+    summary.max_context = 0;
+    int64_t sum_context = 0;
+    std::vector<uint8_t> seen(static_cast<size_t>(batch.num_seqs), 0);
+
+    for (int i = 0; i < n_tokens_in_batch; ++i) {
+        const int seq_idx = batch.seq_id[static_cast<size_t>(i)];
+        if (seq_idx < 0 || seq_idx >= batch.num_seqs) {
+            return DecodeContextSummary{};
+        }
+        if (seen[static_cast<size_t>(seq_idx)] != 0) {
+            return DecodeContextSummary{};
+        }
+        seen[static_cast<size_t>(seq_idx)] = 1;
+
+        const int pos_i = batch.pos[static_cast<size_t>(i)];
+        if (pos_i < 0) {
+            return DecodeContextSummary{};
+        }
+
+        const auto& block_table = batch.block_tables[static_cast<size_t>(seq_idx)];
+        if (block_table.empty()) {
+            return DecodeContextSummary{};
+        }
+        const int logical_block = pos_i / BLOCK_SIZE;
+        if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) {
+            return DecodeContextSummary{};
+        }
+
+        const int n_past_i = batch.n_past[static_cast<size_t>(seq_idx)];
+        if (n_past_i < 0) {
+            return DecodeContextSummary{};
+        }
+
+        const KVRetentionSpan retained =
+            densecore::llm::config::ComputeKVRetentionSpan(n_past_i, GetKVRetentionPolicy(&batch));
+        const int max_context_i = static_cast<int>(block_table.size()) * BLOCK_SIZE;
+        const int context_len_i = std::max(1, std::min(retained.history_kept + 1, max_context_i));
+        summary.min_context = std::min(summary.min_context, context_len_i);
+        summary.max_context = std::max(summary.max_context, context_len_i);
+        sum_context += context_len_i;
+    }
+
+    summary.avg_context = static_cast<int>((sum_context + n_tokens_in_batch - 1) / n_tokens_in_batch);
+    summary.valid = true;
+    return summary;
+}
+
+using DecodePagedFallbackReason = densecore::llm::attention::DecodePagedFallbackReason;
+using DecodePagedDecision = densecore::llm::attention::DecodePagedDecision;
+using BasePagedDecodeExecutionDecision = densecore::llm::attention::BasePagedDecodeExecutionDecision;
+
+#ifdef DENSECORE_TEST_BUILD
+static std::atomic<int> g_test_force_flash_attention_disabled{0};
+#endif
+
+static int ResolveAttentionQueryBasePosition(const BatchSpec& batch) {
+    if (batch.n_past.empty()) {
+        return 0;
+    }
+    int max_n_past = 0;
+    for (int n_past_i : batch.n_past) {
+        max_n_past = std::max(max_n_past, n_past_i);
+    }
+    return max_n_past;
+}
+
+static bool IsFlashAttentionDisabled() {
+#ifdef DENSECORE_TEST_BUILD
+    if (g_test_force_flash_attention_disabled.load(std::memory_order_relaxed) != 0) {
+        return true;
+    }
+#endif
+    static const bool disabled = []() {
+        if (ParseRuntimeToggleMode("DENSECORE_FLASH_ATTN_MODE", RuntimeToggleMode::Auto) == RuntimeToggleMode::Off) {
+            return true;
+        }
+        const char* legacy_env = std::getenv("DENSECORE_DISABLE_FLASH_ATTN");
+        return legacy_env && legacy_env[0] != '\0' && std::strcmp(legacy_env, "0") != 0;
+    }();
+    return disabled;
+}
+
+static bool IsPagedAttentionHwyEnabled() {
+    static const bool enabled = []() {
+        const char* legacy_env = std::getenv("DENSECORE_PAGED_ATTN_USE_HWY");
+        if (legacy_env && legacy_env[0] != '\0') {
+            return std::strcmp(legacy_env, "0") != 0;
+        }
+
+        const RuntimeToggleMode mode = ParseRuntimeToggleMode("DENSECORE_PAGED_ATTN_HWY_MODE", RuntimeToggleMode::Auto);
+        if (mode == RuntimeToggleMode::On) {
+            return true;
+        }
+        if (mode == RuntimeToggleMode::Off) {
+            return false;
+        }
+
+        // Auto mode: use Highway on SIMD-capable hosts and scalar on true
+        // scalar-only CPUs.
+        return GetRuntimeSimdLevel() != densecore::simd::SimdLevel::NONE;
+    }();
+    return enabled;
+}
+
+static bool IsDebugPagedAttentionReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_PAGED_ATTN_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugPagedAttentionEagerReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_PAGED_ATTN_EAGER_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugAttentionCoreReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_ATTN_CORE_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugAddRmsNormReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_ADD_RMSNORM_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool ShouldRunAddRmsNormReferenceProbe(int layer_idx) {
+    if (!IsDebugAddRmsNormReferenceEnabled()) {
+        return false;
+    }
+    int configured_layer = -1;
+    if (const char* env = std::getenv("DENSECORE_DEBUG_ADD_RMSNORM_REFERENCE_LAYER")) {
+        if (env[0] != '\0') {
+            configured_layer = std::atoi(env);
+        }
+    }
+    return configured_layer < 0 || configured_layer == layer_idx;
+}
+
+static bool IsDebugAttentionPostReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_ATTN_POST_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDebugKvRoundTripEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_KV_ROUNDTRIP");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static float ResolveGemma4AttentionLogitSoftcapRuntime(const TransformerModel* model) {
+    return densecore::llm::attention::ResolveGemma4AttentionLogitSoftcapRuntime(model);
+}
+
+static bool ShouldRunKvRoundTripProbe(int layer, bool is_k) {
+    if (!IsDebugKvRoundTripEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_KV_ROUNDTRIP_LAYER", -1);
+    static const int target_kind = ParseIntEnv("DENSECORE_DEBUG_KV_ROUNDTRIP_KIND", -1);  // -1 both, 0 V, 1 K
+    static std::atomic<int> remaining_budget{ParsePositiveEnvInt("DENSECORE_DEBUG_KV_ROUNDTRIP_MAX_CALLS", 1)};
+
+    if (target_layer >= 0 && layer != target_layer) {
+        return false;
+    }
+    if (target_kind >= 0 && target_kind != (is_k ? 1 : 0)) {
+        return false;
+    }
+
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldRunPagedAttentionReferenceProbe(int layer, int token_idx) {
+    if (!IsDebugPagedAttentionReferenceEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_PAGED_ATTN_REFERENCE_LAYER", -1);
+    static const int target_token = ParseIntEnv("DENSECORE_DEBUG_PAGED_ATTN_REFERENCE_TOKEN", 0);
+    static std::atomic<int> remaining_budget{ParsePositiveEnvInt("DENSECORE_DEBUG_PAGED_ATTN_REFERENCE_MAX_CALLS", 1)};
+
+    if (target_layer >= 0 && layer != target_layer) {
+        return false;
+    }
+    if (target_token >= 0 && token_idx != target_token) {
+        return false;
+    }
+
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldRunPagedAttentionEagerReferenceProbe(int layer, int token_idx) {
+    if (!IsDebugPagedAttentionEagerReferenceEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_PAGED_ATTN_EAGER_REFERENCE_LAYER", -1);
+    static const int target_token = ParseIntEnv("DENSECORE_DEBUG_PAGED_ATTN_EAGER_REFERENCE_TOKEN", 0);
+    static std::atomic<int> remaining_budget{
+        ParsePositiveEnvInt("DENSECORE_DEBUG_PAGED_ATTN_EAGER_REFERENCE_MAX_CALLS", 1)};
+
+    if (target_layer >= 0 && layer != target_layer) {
+        return false;
+    }
+    if (target_token >= 0 && token_idx != target_token) {
+        return false;
+    }
+
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldRunAttentionCoreReferenceProbe(int layer, int token_idx) {
+    if (!IsDebugAttentionCoreReferenceEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_ATTN_CORE_REFERENCE_LAYER", -1);
+    static const int target_token = ParseIntEnv("DENSECORE_DEBUG_ATTN_CORE_REFERENCE_TOKEN", 0);
+    static std::atomic<int> remaining_budget{ParsePositiveEnvInt("DENSECORE_DEBUG_ATTN_CORE_REFERENCE_MAX_CALLS", 1)};
+
+    if (target_layer >= 0 && layer != target_layer) {
+        return false;
+    }
+    if (target_token >= 0 && token_idx != target_token) {
+        return false;
+    }
+
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldRunAttentionPostReferenceProbe(int layer, int token_idx) {
+    if (!IsDebugAttentionPostReferenceEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_ATTN_POST_REFERENCE_LAYER", -1);
+    static const int target_token = ParseIntEnv("DENSECORE_DEBUG_ATTN_POST_REFERENCE_TOKEN", 0);
+    static std::atomic<int> remaining_budget{ParsePositiveEnvInt("DENSECORE_DEBUG_ATTN_POST_REFERENCE_MAX_CALLS", 1)};
+
+    if (target_layer >= 0 && layer != target_layer) {
+        return false;
+    }
+    if (target_token >= 0 && token_idx != target_token) {
+        return false;
+    }
+
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldRunAttentionProjectionReferenceProbe(int layer) {
+    if (!IsDebugAttentionProjectionReferenceEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_ATTN_PROJECTION_REFERENCE_LAYER", -1);
+    static std::atomic<int> remaining_budget{
+        ParsePositiveEnvInt("DENSECORE_DEBUG_ATTN_PROJECTION_REFERENCE_MAX_CALLS", 8)};
+
+    if (target_layer >= 0 && layer != target_layer) {
+        return false;
+    }
+
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldRunFinalProjectionReferenceProbe() {
+    if (!IsDebugFinalProjectionReferenceEnabled()) {
+        return false;
+    }
+
+    static std::atomic<int> remaining_budget{
+        ParsePositiveEnvInt("DENSECORE_DEBUG_FINAL_PROJECTION_REFERENCE_MAX_CALLS", 1)};
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldRunHiddenSnapshotProbe(int layer, const char* stage) {
+    if (!IsDebugHiddenSnapshotEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_LAYER", -2);
+    if (target_layer >= -1 && layer != target_layer) {
+        return false;
+    }
+
+    static const std::string target_stage = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_STAGE");
+        return (env && env[0] != '\0') ? std::string(env) : std::string();
+    }();
+    if (!target_stage.empty() && stage && target_stage != stage) {
+        return false;
+    }
+
+    static std::atomic<int> remaining_budget{ParsePositiveEnvInt("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_MAX_CALLS", 4)};
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldRunFfnProjectionReferenceProbe(int layer) {
+    if (!IsDebugFfnProjectionReferenceEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_FFN_PROJECTION_REFERENCE_LAYER", -1);
+    static std::atomic<int> remaining_budget{
+        ParsePositiveEnvInt("DENSECORE_DEBUG_FFN_PROJECTION_REFERENCE_MAX_CALLS", 8)};
+    if (target_layer >= 0 && layer != target_layer) {
+        return false;
+    }
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool IsDebugRmsNormReferenceEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_RMSNORM_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool ShouldRunRmsNormReferenceProbe(int layer) {
+    if (!IsDebugRmsNormReferenceEnabled()) {
+        return false;
+    }
+
+    static const int target_layer = ParseIntEnv("DENSECORE_DEBUG_RMSNORM_REFERENCE_LAYER", -1);
+    static std::atomic<int> remaining_budget{ParsePositiveEnvInt("DENSECORE_DEBUG_RMSNORM_REFERENCE_MAX_CALLS", 8)};
+    if (target_layer >= 0 && layer != target_layer) {
+        return false;
+    }
+
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void DebugLogTensorFiniteStats(const char* tag, const struct ggml_tensor* tensor) {
+    if (!tag || !tensor || !tensor->data || tensor->type != GGML_TYPE_F32) {
+        return;
+    }
+    const float* data = reinterpret_cast<const float*>(tensor->data);
+    const int n = ggml_nelements(tensor);
+    if (n <= 0) {
+        return;
+    }
+
+    int nan_ct = 0;
+    int inf_ct = 0;
+    int zero_ct = 0;
+    int finite_ct = 0;
+    float mn = std::numeric_limits<float>::infinity();
+    float mx = -std::numeric_limits<float>::infinity();
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const float v = data[i];
+        if (std::isnan(v)) {
+            ++nan_ct;
+            continue;
+        }
+        if (!std::isfinite(v)) {
+            ++inf_ct;
+            continue;
+        }
+        if (v == 0.0f) {
+            ++zero_ct;
+        }
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+        sum += v;
+        sum_sq += static_cast<double>(v) * static_cast<double>(v);
+        ++finite_ct;
+    }
+
+    if (!std::isfinite(mn)) mn = 0.0f;
+    if (!std::isfinite(mx)) mx = 0.0f;
+    const double mean = finite_ct > 0 ? (sum / finite_ct) : 0.0;
+    const double rms = finite_ct > 0 ? std::sqrt(sum_sq / finite_ct) : 0.0;
+    std::fprintf(
+        stderr,
+        "[%s] type=%d shape=[%ld,%ld,%ld] total=%d zero=%d nan=%d inf=%d min=%.6f max=%.6f mean=%.6f rms=%.6f\n", tag,
+        static_cast<int>(tensor->type), static_cast<long>(tensor->ne[0]), static_cast<long>(tensor->ne[1]),
+        static_cast<long>(tensor->ne[2]), n, zero_ct, nan_ct, inf_ct, mn, mx, mean, rms);
+}
+
+static void ComputeMatmulReferenceF32(const struct ggml_tensor* weight, const struct ggml_tensor* input,
+                                      std::vector<float>* out) {
+    constexpr int kMatmulReferenceMaxDequant = 16384;
+    constexpr size_t kMatmulReferenceMaxQuantRowBytes = 1u << 16;
+    if (!weight || !input || !out || !weight->data || !input->data || input->type != GGML_TYPE_F32) {
+        out->clear();
+        return;
+    }
+    const int M = static_cast<int>(input->ne[1]);
+    if (M <= 0) {
+        out->clear();
+        return;
+    }
+
+    const int input_dim = static_cast<int>(input->ne[0]);
+    const int ne0 = static_cast<int>(weight->ne[0]);
+    const int ne1 = static_cast<int>(weight->ne[1]);
+    const char* weight_base = reinterpret_cast<const char*>(weight->data);
+    const char* input_base = reinterpret_cast<const char*>(input->data);
+
+    if (weight->type == GGML_TYPE_F32 && input_dim == ne1 && ne0 > 0 && ne1 > 0) {
+        out->assign(static_cast<size_t>(ne0) * static_cast<size_t>(M), 0.0f);
+        for (int m = 0; m < M; ++m) {
+            const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(input->nb[1]);
+            for (int out_idx = 0; out_idx < ne0; ++out_idx) {
+                float sum = 0.0f;
+                for (int in_idx = 0; in_idx < ne1; ++in_idx) {
+                    const char* weight_row =
+                        weight_base + static_cast<size_t>(in_idx) * static_cast<size_t>(weight->nb[1]);
+                    const float w =
+                        *reinterpret_cast<const float*>(weight_row + static_cast<size_t>(out_idx) * weight->nb[0]);
+                    const float x =
+                        *reinterpret_cast<const float*>(src_col + static_cast<size_t>(in_idx) * input->nb[0]);
+                    sum += w * x;
+                }
+                (*out)[static_cast<size_t>(m) * static_cast<size_t>(ne0) + static_cast<size_t>(out_idx)] = sum;
+            }
+        }
+        return;
+    }
+
+    const int N = ne0;
+    const int K = ne1;
+    if (N <= 0 || K <= 0 || input_dim != N) {
+        out->clear();
+        return;
+    }
+
+    out->assign(static_cast<size_t>(K) * static_cast<size_t>(M), 0.0f);
+    if (weight->type == GGML_TYPE_F32) {
+        for (int k = 0; k < K; ++k) {
+            const char* row_ptr = weight_base + static_cast<size_t>(k) * static_cast<size_t>(weight->nb[1]);
+            for (int m = 0; m < M; ++m) {
+                const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(input->nb[1]);
+                float sum = 0.0f;
+                for (int i = 0; i < N; ++i) {
+                    const float w = *reinterpret_cast<const float*>(row_ptr + static_cast<size_t>(i) * weight->nb[0]);
+                    const float x = *reinterpret_cast<const float*>(src_col + static_cast<size_t>(i) * input->nb[0]);
+                    sum += w * x;
+                }
+                (*out)[static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k)] = sum;
+            }
+        }
+        return;
+    }
+
+    const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight->type);
+    if (type_traits_cpu && type_traits_cpu->vec_dot) {
+        const ggml_type vec_dot_type = type_traits_cpu->vec_dot_type;
+        const auto* input_type_traits = ggml_get_type_traits_cpu(vec_dot_type);
+        const size_t quant_row_size = ggml_row_size(vec_dot_type, static_cast<int64_t>(N));
+        if (input_type_traits && input_type_traits->from_float && quant_row_size > 0 &&
+            quant_row_size <= kMatmulReferenceMaxQuantRowBytes) {
+            std::vector<uint8_t> quant_rows(quant_row_size * static_cast<size_t>(M));
+            for (int m = 0; m < M; ++m) {
+                const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(input->nb[1]);
+                std::vector<float> gathered_input(static_cast<size_t>(N), 0.0f);
+                for (int i = 0; i < N; ++i) {
+                    gathered_input[static_cast<size_t>(i)] =
+                        *reinterpret_cast<const float*>(src_col + static_cast<size_t>(i) * input->nb[0]);
+                }
+                input_type_traits->from_float(gathered_input.data(),
+                                              quant_rows.data() + quant_row_size * static_cast<size_t>(m),
+                                              static_cast<int64_t>(N));
+            }
+
+            out->assign(static_cast<size_t>(K) * static_cast<size_t>(M), 0.0f);
+            for (int k = 0; k < K; ++k) {
+                const void* row_ptr = weight_base + static_cast<size_t>(k) * static_cast<size_t>(weight->nb[1]);
+                for (int m = 0; m < M; ++m) {
+                    float sum = 0.0f;
+                    const void* q_ptr = quant_rows.data() + quant_row_size * static_cast<size_t>(m);
+                    type_traits_cpu->vec_dot(N, &sum, 0, row_ptr, 0, q_ptr, 0, 1);
+                    (*out)[static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k)] = sum;
+                }
+            }
+            return;
+        }
+    }
+
+    const auto* type_traits = ggml_get_type_traits(weight->type);
+    if (!type_traits || !type_traits->to_float || N > kMatmulReferenceMaxDequant) {
+        out->clear();
+        return;
+    }
+
+    std::vector<float> dequant_row(static_cast<size_t>(N), 0.0f);
+    for (int k = 0; k < K; ++k) {
+        const void* row_ptr = weight_base + static_cast<size_t>(k) * static_cast<size_t>(weight->nb[1]);
+        type_traits->to_float(row_ptr, dequant_row.data(), N);
+        for (int m = 0; m < M; ++m) {
+            const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(input->nb[1]);
+            float sum = 0.0f;
+            for (int i = 0; i < N; ++i) {
+                const float x = *reinterpret_cast<const float*>(src_col + static_cast<size_t>(i) * input->nb[0]);
+                sum += dequant_row[static_cast<size_t>(i)] * x;
+            }
+            (*out)[static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k)] = sum;
+        }
+    }
+}
+
+static bool IsDecodeProfileEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_PROFILE_DECODE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsDecodeAttentionPathLoggingEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_LOG_DECODE_ATTENTION_PATH");
+        if (env && env[0] != '\0' && std::strcmp(env, "0") != 0) {
+            return true;
+        }
+        return IsDecodeProfileEnabled() || IsDebugInferenceStatsEnabled();
+    }();
+    return enabled;
+}
+
+using DecodeAttentionPathKind = densecore::llm::attention::DecodeAttentionPathKind;
+
+static void RecordDecodePagedFallbackReason(DecodePagedFallbackReason reason, int layer, int N) {
+    (void)layer;
+    densecore::llm::attention::RecordDecodePagedFallbackReason(reason, N);
+}
+
+static void RecordSharedQuantReuse(bool reused_shared_buffer) {
+    densecore::llm::attention::RecordSharedQuantReuse(reused_shared_buffer);
+}
+
+static void RecordDecodeAttentionPath(DecodeAttentionPathKind kind, int layer, int N, int n_past_val, int n_head,
+                                      int n_head_kv, densecore::DeviceType preferred_device, bool native_layout,
+                                      bool paged_candidate, bool paged_selected, bool portable_supported,
+                                      bool offset_safe) {
+    (void)layer;
+    densecore::llm::attention::RecordDecodeAttentionPath(
+        kind, N, n_past_val, n_head, n_head_kv, preferred_device, native_layout, paged_candidate, paged_selected,
+        portable_supported, offset_safe, IsDebugInferenceStatsEnabled());
+}
+
+static bool IsForceSafeGqaDecodeEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_FORCE_SAFE_GQA_DECODE");
+        if (!env || env[0] == '\0') return true;
+        return std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool IsFlashAttentionForced() {
+    static const bool forced = []() { return ParseTruthyEnv("DENSECORE_FORCE_FLASH_ATTN", false); }();
+    return forced;
+}
+
+static bool IsFlashAttentionIsaSupported() {
+    static const bool supported = []() { return densecore::simd::HasX86Avx512OrBetter(GetRuntimeSimdLevel()); }();
+    return supported;
+}
+
+static bool IsPortableCpuFlashAttentionEnabled() {
+    static const bool enabled = []() {
+        const RuntimeToggleMode mode =
+            ParseRuntimeToggleMode("DENSECORE_PORTABLE_FLASH_ATTN_MODE", RuntimeToggleMode::Auto);
+        if (mode == RuntimeToggleMode::On) {
+            return true;
+        }
+        if (mode == RuntimeToggleMode::Off) {
+            return false;
+        }
+        // Auto mode: enable portable flash attention on all platforms.
+        // The prior ARM correctness issue was caused by K/V tensors not being
+        // registered in the GGML graph's src[] dependency chain, which meant
+        // their ggml_cont ops were never executed during graph compute.
+        return true;
+    }();
+    return enabled;
+}
+
+static bool IsInt4SingleThreadingLayerEnabled() {
+    static const bool enabled = []() {
+        const char* legacy = std::getenv("DENSECORE_INT4_USE_BACKEND_THREADPOOL");
+        if (legacy && legacy[0] != '\0') {
+            return std::strcmp(legacy, "0") == 0;
+        }
+        const RuntimeToggleMode mode = ParseRuntimeToggleMode(
+            "DENSECORE_INT4_THREADING_MODE",
+            DENSECORE_DEFAULT_INT4_SINGLE_THREADING_LAYER ? RuntimeToggleMode::On : RuntimeToggleMode::Off);
+        return mode != RuntimeToggleMode::Off;
+    }();
+    return enabled;
+}
+
+static bool IsPrecomputedRoPEEnabled() {
+    static const bool enabled = []() {
+        const RuntimeToggleMode mode =
+            ParseRuntimeToggleMode("DENSECORE_ROPE_PRECOMPUTED_MODE",
+                                   DENSECORE_DEFAULT_PRECOMPUTED_ROPE ? RuntimeToggleMode::On : RuntimeToggleMode::Off);
+        return mode != RuntimeToggleMode::Off;
+    }();
+    return enabled;
+}
+
+static bool IsFusedResidualRmsNormEnabled() {
+    static const bool enabled = []() {
+        const RuntimeToggleMode mode = ParseRuntimeToggleMode(
+            "DENSECORE_FUSED_RESIDUAL_RMSNORM_MODE",
+            DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM ? RuntimeToggleMode::On : RuntimeToggleMode::Off);
+        return mode != RuntimeToggleMode::Off;
+    }();
+    return enabled;
+}
+
+static bool IsFusedQKVEnabled() {
+    static const bool enabled = []() {
+        const RuntimeToggleMode mode = ParseRuntimeToggleMode(
+            "DENSECORE_FUSED_QKV_MODE", DENSECORE_DEFAULT_FUSED_QKV ? RuntimeToggleMode::Auto : RuntimeToggleMode::Off);
+        if (mode == RuntimeToggleMode::On) {
+            return true;
+        }
+        if (mode == RuntimeToggleMode::Off) {
+            return false;
+        }
+
+        const densecore::simd::SimdLevel simd = GetRuntimeSimdLevel();
+        return densecore::simd::HasX86Avx2OrBetter(simd) || densecore::simd::IsArmFamily(simd);
+    }();
+    return enabled;
+}
+}  // namespace
+
+bool IsDecodeOnlyBatchLayout(const BatchSpec& batch, int n_tokens_in_batch) {
+    return densecore::llm::attention::IsDecodeOnlyBatchLayoutImpl(batch, n_tokens_in_batch);
+}
+
+bool IsPagedDecodeCandidate(const PagedKVCache* cache, const BatchSpec& batch, int n_tokens_in_batch, int n_head,
+                            int n_head_kv, int head_dim_q, int head_dim_kv) {
+    return densecore::llm::attention::IsPagedDecodeCandidateImpl(cache, batch, n_tokens_in_batch, n_head, n_head_kv,
+                                                                 head_dim_q, head_dim_kv);
+}
+
+bool IsPagedDecodeModeAlwaysOn() {
+    return IsPagedDecodeModeAlwaysOnImpl();
+}
+
+DecodeRuntimeStatsSnapshot GetDecodeRuntimeStatsSnapshot() {
+    DecodeRuntimeStatsSnapshot snapshot = densecore::llm::attention::GetDecodeRuntimeStatsSnapshotImpl();
+    for (std::size_t i = 0; i < snapshot.hybrid_ssm_dispatch_counts.size(); ++i) {
+        snapshot.hybrid_ssm_dispatch_counts[i] = g_hybrid_ssm_dispatch_counters[i].load(std::memory_order_relaxed);
+    }
+    return snapshot;
+}
+
+const char* GetDecodePagedFallbackReasonName(std::size_t index) {
+    if (index >= kDecodePagedFallbackReasonCount) {
+        return "unknown";
+    }
+    return densecore::llm::attention::DecodePagedFallbackReasonName(
+        static_cast<densecore::llm::attention::DecodePagedFallbackReason>(index));
+}
+
+const char* GetHybridSSMDispatchWeightName(std::size_t index) {
+    switch (index) {
+    case 0: return "qkv_mixed";
+    case 1: return "z";
+    case 2: return "ssm_out";
+    case 3:
+    default: return "other";
+    }
+}
+
+const char* GetHybridSSMDispatchPathName(std::size_t index) {
+    switch (index) {
+    case 0: return "PLAIN_GGML_CONSERVATIVE_FALLBACK";
+    case 1: return "GEMV_QUANT";
+    case 2: return "GGML_QUANT_NRC_M";
+    case 3: return "GGML_NATIVE";
+    case 4:
+    default: return "OTHER";
+    }
+}
+
+// Forward declaration for explicit work context
+struct InferenceWorkContext;
+static thread_local InferenceWorkContext* tls_work_ctx = nullptr;
+static std::atomic<const BatchSpec*> g_shared_batch{nullptr};
+
+
+// ============================================================================
+// NEW: Robust KV Cache Update and Gather UserData
+// ============================================================================
+// This replaces the fragile cb_kv_manage approach that relied on ggml_pad
+// assumptions. The new approach explicitly:
+//   1. Writes current K/V to the PagedKVCache
+//   2. Reads history from the cache into destination tensor
+//   3. Appends current K/V to destination tensor
+// ============================================================================
+
+struct KVUpdateGatherUserData {
+    PagedKVCache* cache;               // KV cache instance
+    const BatchSpec* batch;            // Batch specification with block tables
+    int layer;                         // Current transformer layer
+    int head_dim;                      // Dimension per head
+    int n_head_kv;                     // Number of KV heads
+    int N;                             // Current batch size (new tokens)
+    int n_past;                        // Number of past/history tokens
+    bool is_k;                         // True for K tensor, false for V tensor
+    bool read_only_shared_kv = false;  // Shared Gemma4 layers reuse cache without writing
+    struct ggml_tensor* src_tensor;    // Pointer to Kcur/Vcur tensor (data accessed at runtime)
+};
+
+// Pool size for KVUpdateGatherUserData
+static constexpr int kMaxKVUpdateGatherSlots = 256;
+
+KVUpdateGatherUserData* GetKVUpdateGatherUserData(int layer, bool is_k);
+
+// ============================================================================
+// Multi-LoRA Batching Callback
+// ============================================================================
+// Applies per-request LoRA adapters during inference graph execution.
+// Uses thread-local batch context to access the adapter-to-token mapping.
+// The tensor name (e.g., "blk.0.attn_q") identifies which layer weights to use.
+// ============================================================================
+
+static const BatchSpec* GetCurrentBatch();
+
+/**
+ * @brief GGML callback for Multi-LoRA application during inference.
+ *
+ * 각 LoRA 가능 레이어(QKV, Output Projection, FFN)에서 호출됩니다.
+ * Gather-Compute-Scatter 패턴으로 배치 내 각 토큰에 해당하는 LoRA 어댑터를 적용합니다.
+ *
+ * Time Complexity: O(N * R * D) where N=tokens, R=rank, D=hidden_dim
+ * Space Complexity: O(N * max(R, D)) for scratch buffers (thread-local)
+ *
+ * @param dst Output tensor (base projection result, LoRA delta added in-place)
+ * @param src0 First input (projection output tensor, same as dst)
+ * @param src1 Second input (pre-projection hidden states, used for Gather)
+ * @param ith Thread index (only thread 0 executes to avoid races)
+ * @param nth Total threads
+ * @param userdata Unused (uses GetCurrentBatch() for batch context)
+ */
+void cb_apply_multi_lora(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1,
+                         int ith, int nth, void* userdata) {
+    (void)nth;
+    (void)userdata;
+
+    // Single-threaded execution: LoRA application is already parallelized internally
+    if (ith != 0) return;
+
+    if (!dst || !src0 || !dst->data || !src0->data) return;
+
+    // Get current batch from explicit work context
+    const BatchSpec* batch = GetCurrentBatch();
+    if (!batch) return;
+
+    // NOTE: ggml_map_custom2() allocates dst with ggml_dup_tensor(a), which only
+    // duplicates metadata (shape/type) and does not copy payload. We must copy
+    // base projection output (src0) into dst first, then apply LoRA deltas.
+    if (dst->data != src0->data) {
+        if (src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) && src0->ne[0] == dst->ne[0] &&
+            src0->ne[1] == dst->ne[1]) {
+            const size_t row_bytes = static_cast<size_t>(src0->ne[0]) * sizeof(float);
+            for (int64_t row = 0; row < src0->ne[1]; ++row) {
+                const auto* src_row = reinterpret_cast<const uint8_t*>(src0->data) + row * src0->nb[1];
+                auto* dst_row = reinterpret_cast<uint8_t*>(dst->data) + row * dst->nb[1];
+                memcpy(dst_row, src_row, row_bytes);
+            }
+        } else {
+            memcpy(dst->data, src0->data, std::min(ggml_nbytes(dst), ggml_nbytes(src0)));
+        }
+    }
+
+    // Early exit if no LoRA adapters in this batch
+    if (batch->lora_map.empty()) return;
+
+    // Validate tensor data - src1 is the pre-projection hidden states
+    if (!src1 || !src1->data) return;
+
+    // Extract layer name from tensor name (e.g., "blk.0.attn_q" -> "blk.0.attn_q")
+    // The tensor name is set by apply_lora lambda in BuildTransformerGraph
+    const char* layer_name = dst->name;
+    if (!layer_name || layer_name[0] == '\0') return;
+
+    // Convert GGML tensors to DenseCore Tensor format
+    // src1 = pre-projection hidden states (input to LoRA)
+    densecore::Tensor t_input;
+    t_input.data = const_cast<void*>(src1->data);
+    t_input.dtype = densecore::GgmlTypeToDType(src1->type);
+    t_input.ndim = 2;
+    t_input.shape[0] = src1->ne[1];  // tokens (GGML: ne[1] = rows after mul_mat)
+    t_input.shape[1] = src1->ne[0];  // hidden_dim
+    t_input.stride[0] = src1->nb[1];
+    t_input.stride[1] = src1->nb[0];
+
+    // dst = projection output (LoRA delta added in-place)
+    densecore::Tensor t_output;
+    t_output.data = dst->data;
+    t_output.dtype = densecore::GgmlTypeToDType(dst->type);
+    t_output.ndim = 2;
+    t_output.shape[0] = dst->ne[1];  // tokens
+    t_output.shape[1] = dst->ne[0];  // output_dim
+    t_output.stride[0] = dst->nb[1];
+    t_output.stride[1] = dst->nb[0];
+
+    // Dispatch to CpuBackend (NUMA-aware, parallelized internally)
+    densecore::CpuBackend& backend = densecore::GetCpuBackend();
+    backend.ApplyMultiLoRA(t_input, std::string(layer_name), batch->lora_map, &t_output);
+}
+
+// ============================================================================
+// Fused Add + RMSNorm Callback (AVX-512 Optimized)
+// ============================================================================
+// Combines residual connection (x += residual) and RMSNorm in a single pass
+// to reduce memory bandwidth by loading/storing data once instead of twice.
+// ============================================================================
+
+/**
+ * User data for fused Add+RMSNorm operation
+ */
+struct AddRMSNormUserData {
+    const float* residual;                ///< Residual tensor data [n_embd, N]
+    const float* rms_weight;              ///< RMSNorm weight [n_embd]
+    int n_embd;                           ///< Embedding dimension
+    int n_tokens;                         ///< Number of tokens
+    float eps;                            ///< RMSNorm epsilon
+    ptrdiff_t residual_row_stride = 0;    ///< Residual row stride in float elements
+    std::vector<float> owned_rms_weight;  ///< Optional canonicalized RMS weight storage
+    int layer_idx = -1;
+    const int* token_seq_ids = nullptr;
+    const char* stage = nullptr;
+    const char* var_name = nullptr;
+};
+
+// Thread-local pool for AddRMSNorm user data
+static constexpr int kMaxAddRMSNormSlots = 256;
+
+AddRMSNormUserData* GetAddRMSNormUserData();
+
+// =============================================================================
+// Parallel GEMV User Data + Buffers
+// =============================================================================
+static constexpr int kMaxGemvUserDataSlots = 2048;
+static constexpr size_t kMaxQuantInputBufferSize = 65536;  // 64KB for large N
+static constexpr int kMaxSmallBatchColsHard = 16;
+static constexpr size_t kMaxDequantBufferSize = 16384;
+
+static int ResolveQuantBatchedTileCols(int requested_cols, int vec_dot_nrows, bool allow_true_batched_q4k) {
+    int tile_cols = std::max(1, std::min(kMaxSmallBatchColsHard, requested_cols));
+    if (!allow_true_batched_q4k && vec_dot_nrows > 0) {
+        tile_cols = std::min(tile_cols, vec_dot_nrows);
+    }
+    return std::max(1, tile_cols);
+}
+/**
+ * User data for parallel GEMV operation
+ */
+struct GemvUserData {
+    struct ggml_tensor* weight_tensor;  // Weight tensor (data accessed at runtime)
+    int N;                              // Input dimension
+    int K;                              // Output dimension
+    ggml_type weight_type;              // Tensor type (F32, Q4_K, Q8_0, etc.)
+    ggml_type input_quant_type;         // Quantization type for input (Q8_K, Q8_0, or F32)
+    bool force_reference_scalar = false;
+    int slot_id = -1;
+    uint8_t* quant_input_shared = nullptr;
+    std::atomic<uint64_t>* quantized_stamp = nullptr;
+};
+
+struct GemvBatchedUserData {
+    struct ggml_tensor* weight_tensor = nullptr;  // Weight tensor (data accessed at runtime)
+    int N = 0;                                    // Input dimension
+    int K = 0;                                    // Output dimension
+    int M = 0;                                    // Number of input columns (tokens)
+    ggml_type weight_type = GGML_TYPE_F32;
+    bool force_reference_scalar = false;
+    int slot_id = -1;
+    ggml_type input_quant_type = GGML_TYPE_F32;
+    size_t quant_row_stride = 0;  // Pre-computed aligned row stride for quantized input
+    uint8_t* quant_input_shared = nullptr;
+    std::atomic<uint64_t>* quantized_stamp = nullptr;
+};
+
+inline int ResolvePagedAttentionDecodeHeadTile(int n_head, int n_tokens, int n_tasks) {
+    const int configured_head_tile = std::max(1, ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", 8));
+    if (n_head <= 0 || n_tokens <= 0 || n_tasks <= 0) {
+        return configured_head_tile;
+    }
+
+    // For latency-sensitive decode (batch 1-4), expose enough head tiles to keep
+    // CPU workers occupied. The historical fixed tile=8 leaves batch=1 with only
+    // four tasks on 32-head Qwen models, which strands cores during decode.
+    if (n_tokens <= 4) {
+        const int target_tiles_per_token = std::max(1, (n_tasks + n_tokens - 1) / n_tokens);
+        const int adaptive_head_tile = std::max(1, (n_head + target_tiles_per_token - 1) / target_tiles_per_token);
+        return std::min(configured_head_tile, adaptive_head_tile);
+    }
+    return configured_head_tile;
+}
+
+/**
+ * Custom callback for fused Add + RMSNorm
+ *
+ * Input tensor (src): Current tensor to add residual to and normalize
+ * Output tensor (dst): Result of (src + residual) normalized with RMSNorm
+ *
+ * Uses AVX-512 fused kernel for optimal memory bandwidth utilization.
+ */
+void cb_residual_rmsnorm_fused(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                               void* userdata) {
+    auto* ud = (AddRMSNormUserData*)userdata;
+    if (!ud || !ud->rms_weight) return;
+    if (!src || !dst || !src->data || !dst->data) return;
+    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return;
+    if (src->nb[0] != static_cast<int64_t>(sizeof(float)) || dst->nb[0] != static_cast<int64_t>(sizeof(float))) return;
+
+    const int n_embd = ud->n_embd;
+    const int n_tokens = ud->n_tokens;
+    const float eps = ud->eps;
+    const bool has_residual = ud->residual != nullptr;
+    const ptrdiff_t src_row_stride = static_cast<ptrdiff_t>(src->nb[1] / sizeof(float));
+    const ptrdiff_t dst_row_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
+    const ptrdiff_t residual_row_stride = ud->residual_row_stride > 0 ? ud->residual_row_stride : n_embd;
+    const bool run_reference_probe = ShouldRunAddRmsNormReferenceProbe(ud->layer_idx);
+
+    // Partition work across tokens
+    const int tokens_per_thread = (n_tokens + nth - 1) / nth;
+    const int t_start = ith * tokens_per_thread;
+    const int t_end = std::min(t_start + tokens_per_thread, n_tokens);
+
+    if (t_start >= n_tokens) return;
+
+    // Process assigned tokens
+    for (int t = t_start; t < t_end; t++) {
+        const float* x_ptr = reinterpret_cast<const float*>(src->data) + static_cast<ptrdiff_t>(t) * src_row_stride;
+        float* out_ptr = reinterpret_cast<float*>(dst->data) + static_cast<ptrdiff_t>(t) * dst_row_stride;
+        const float* res_ptr =
+            has_residual ? (ud->residual + static_cast<ptrdiff_t>(t) * residual_row_stride) : nullptr;
+
+        if (has_residual) {
+            // Use unified AddRMSNorm dispatcher (Runtime AVX512/AVX2/Scalar)
+            densecore::simd::AddRMSNorm(out_ptr, x_ptr, res_ptr, ud->rms_weight, static_cast<size_t>(n_embd), eps);
+        } else {
+            densecore::simd::RMSNorm(x_ptr, ud->rms_weight, out_ptr, static_cast<size_t>(n_embd), eps);
+        }
+
+        if (run_reference_probe) {
+            static std::atomic<int> emitted{0};
+            const int max_calls = ParsePositiveEnvInt("DENSECORE_DEBUG_ADD_RMSNORM_REFERENCE_MAX_CALLS", 8);
+            const int prior = emitted.load(std::memory_order_relaxed);
+            if (prior < max_calls && emitted.fetch_add(1, std::memory_order_relaxed) < max_calls) {
+                std::vector<float> summed(static_cast<size_t>(n_embd));
+                double sum_sq = 0.0;
+                for (int i = 0; i < n_embd; ++i) {
+                    float val = x_ptr[i];
+                    if (res_ptr) {
+                        val += res_ptr[i];
+                    }
+                    summed[static_cast<size_t>(i)] = val;
+                    sum_sq += static_cast<double>(val) * static_cast<double>(val);
+                }
+
+                const float inv_rms = 1.0f / std::sqrt(static_cast<float>(sum_sq / std::max(1, n_embd)) + eps);
+                float max_abs_diff = 0.0f;
+                int first_bad_idx = -1;
+                float first_actual = 0.0f;
+                float first_ref = 0.0f;
+                bool actual_nonfinite = false;
+                bool ref_nonfinite = false;
+                for (int i = 0; i < n_embd; ++i) {
+                    const float ref = summed[static_cast<size_t>(i)] * inv_rms * ud->rms_weight[i];
+                    const float actual = out_ptr[i];
+                    actual_nonfinite = actual_nonfinite || !std::isfinite(actual);
+                    ref_nonfinite = ref_nonfinite || !std::isfinite(ref);
+                    const float diff = std::fabs(actual - ref);
+                    if (diff > max_abs_diff) {
+                        max_abs_diff = diff;
+                        first_bad_idx = i;
+                        first_actual = actual;
+                        first_ref = ref;
+                    }
+                }
+                const int seq_id = ud->token_seq_ids ? ud->token_seq_ids[t] : -1;
+                fprintf(stderr,
+                        "[ADD_RMS_REF] layer=%d stage=%s var=%s token=%d seq=%d has_residual=%d "
+                        "max_abs_diff=%.9g first_idx=%d actual=%.9g ref=%.9g actual_nonfinite=%d "
+                        "ref_nonfinite=%d\n",
+                        ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown", t,
+                        seq_id, has_residual ? 1 : 0, max_abs_diff, first_bad_idx, first_actual, first_ref,
+                        actual_nonfinite ? 1 : 0, ref_nonfinite ? 1 : 0);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Fused SiLU×Mul Callback (SwiGLU FFN Optimization)
+// ============================================================================
+// Computes: out = silu(gate) * up in a single pass
+// Saves memory by avoiding intermediate silu(gate) tensor allocation.
+// ============================================================================
+
+/**
+ * Custom callback for fused SiLU×Mul (SwiGLU FFN)
+ *
+ * Signature compatible with ggml_map_custom2:
+ *   void (*)(struct ggml_tensor *dst, const struct ggml_tensor *a,
+ *            const struct ggml_tensor *b, int ith, int nth, void *userdata)
+ */
+void cb_silu_mul_fused(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b, int ith,
+                       int nth, void* userdata) {
+    (void)userdata;  // Not needed since we use a/b directly
+
+    // a = gate tensor (w1 output, SiLU input)
+    // b = up tensor (w3 output)
+    // dst = output tensor
+
+    if (!a || !b || !dst || !a->data || !b->data || !dst->data) return;
+
+    const float* gate = reinterpret_cast<const float*>(a->data);
+    const float* up = reinterpret_cast<const float*>(b->data);
+    float* out = reinterpret_cast<float*>(dst->data);
+
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return;
+    }
+    if (a->nb[0] != static_cast<int64_t>(sizeof(float)) || b->nb[0] != static_cast<int64_t>(sizeof(float)) ||
+        dst->nb[0] != static_cast<int64_t>(sizeof(float))) {
+        return;
+    }
+
+    // Total elements (flattened)
+    const size_t size = ggml_nelements(a);
+
+    if (ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(dst)) {
+        densecore::simd::SiLUMulParallel(out, gate, up, size, ith, nth);
+        return;
+    }
+
+    const size_t begin = (size * static_cast<size_t>(ith)) / static_cast<size_t>(nth);
+    const size_t end = (size * static_cast<size_t>(ith + 1)) / static_cast<size_t>(nth);
+    const auto offset_bytes = [](const ggml_tensor* tensor, size_t flat_idx) -> size_t {
+        size_t rem = flat_idx;
+        size_t offset = 0;
+        for (int dim = 0; dim < 4; ++dim) {
+            const int64_t extent = tensor->ne[dim] > 0 ? tensor->ne[dim] : 1;
+            const size_t coord = rem % static_cast<size_t>(extent);
+            rem /= static_cast<size_t>(extent);
+            offset += coord * static_cast<size_t>(tensor->nb[dim]);
+        }
+        return offset;
+    };
+    for (size_t flat = begin; flat < end; ++flat) {
+        const float g = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(a->data) + offset_bytes(a, flat));
+        const float u = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(b->data) + offset_bytes(b, flat));
+        float* dst_ptr = reinterpret_cast<float*>(reinterpret_cast<char*>(dst->data) + offset_bytes(dst, flat));
+        *dst_ptr = (g / (1.0f + std::exp(-g))) * u;
+    }
+}
+
+void cb_gelu_mul_fused(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b, int ith,
+                       int nth, void* userdata) {
+    (void)userdata;
+    if (!a || !b || !dst || !a->data || !b->data || !dst->data) return;
+
+    const float* gate = reinterpret_cast<const float*>(a->data);
+    const float* up = reinterpret_cast<const float*>(b->data);
+    float* out = reinterpret_cast<float*>(dst->data);
+    const size_t size = ggml_nelements(a);
+
+    const size_t begin = (size * static_cast<size_t>(ith)) / static_cast<size_t>(nth);
+    const size_t end = (size * static_cast<size_t>(ith + 1)) / static_cast<size_t>(nth);
+    for (size_t i = begin; i < end; ++i) {
+        const float x = gate[i];
+        const float x3 = x * x * x;
+        const float gelu = 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x3)));
+        out[i] = gelu * up[i];
+    }
+}
+
+void cb_gelu_tanh_unary(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* userdata) {
+    (void)userdata;
+    if (!src || !dst || !src->data || !dst->data) return;
+
+    const float* in = reinterpret_cast<const float*>(src->data);
+    float* out = reinterpret_cast<float*>(dst->data);
+    const size_t size = ggml_nelements(src);
+
+    const size_t begin = (size * static_cast<size_t>(ith)) / static_cast<size_t>(nth);
+    const size_t end = (size * static_cast<size_t>(ith + 1)) / static_cast<size_t>(nth);
+    for (size_t i = begin; i < end; ++i) {
+        const float x = in[i];
+        const float x3 = x * x * x;
+        out[i] = 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x3)));
+    }
+}
+
+static void cb_apply_shared_scalar_gate(struct ggml_tensor* dst, const struct ggml_tensor* src,
+                                        const struct ggml_tensor* gate_logits_scalar, int ith, int nth,
+                                        void* userdata) {
+    (void)userdata;
+    if (!dst || !src || !gate_logits_scalar || !dst->data || !src->data || !gate_logits_scalar->data) {
+        return;
+    }
+
+    const int hidden = static_cast<int>(src->ne[0]);
+    const int tokens = static_cast<int>(std::max<int64_t>(1, src->ne[1]));
+    const int scalar_elems = static_cast<int>(ggml_nelements(gate_logits_scalar));
+    if (hidden <= 0 || tokens <= 0 || scalar_elems < tokens) {
+        return;
+    }
+
+    const auto stable_sigmoid = [](float x) -> float {
+        if (x >= 0.0f) {
+            const float z = std::exp(-x);
+            return 1.0f / (1.0f + z);
+        }
+        const float z = std::exp(x);
+        return z / (1.0f + z);
+    };
+
+    const float* src_base = reinterpret_cast<const float*>(src->data);
+    float* dst_base = reinterpret_cast<float*>(dst->data);
+    const float* gate_base = reinterpret_cast<const float*>(gate_logits_scalar->data);
+    const ptrdiff_t src_row_stride = static_cast<ptrdiff_t>(src->nb[1] / sizeof(float));
+    const ptrdiff_t dst_row_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
+    const ptrdiff_t gate_row_stride = static_cast<ptrdiff_t>(gate_logits_scalar->nb[1] / sizeof(float));
+
+    const int token_begin = (tokens * ith) / nth;
+    const int token_end = (tokens * (ith + 1)) / nth;
+    for (int t = token_begin; t < token_end; ++t) {
+        const float gate = stable_sigmoid(gate_base[static_cast<ptrdiff_t>(t) * gate_row_stride]);
+        const float* src_row = src_base + static_cast<ptrdiff_t>(t) * src_row_stride;
+        float* dst_row = dst_base + static_cast<ptrdiff_t>(t) * dst_row_stride;
+        densecore::simd::ScaleF32(dst_row, src_row, gate, static_cast<size_t>(hidden));
+    }
+}
+
+// ============================================================================
+// Fused QKV Projection Callback (Tensor-Level Parallelism)
+// ============================================================================
+
+// Computes Q, K, V projections in a single pass with intra-operator parallelism
+// across the output dimension (dim_q + dim_k + dim_v). This enables
+// multi-thread utilization during decode when batch_size=1.
+// ============================================================================
+
+/**
+ * User data for fused Q/K/V projection operation
+ */
+struct QKVUserData {
+    const float* w_q;  ///< Q weight [dim_q, n_embd] (row-major)
+    const float* w_k;  ///< K weight [dim_k, n_embd] (row-major)
+    const float* w_v;  ///< V weight [dim_v, n_embd] (row-major)
+    int n_embd;        ///< Input embedding dimension
+    int dim_q;         ///< Q output dimension (n_head * head_dim)
+    int dim_k;         ///< K output dimension (n_head_kv * head_dim)
+    int dim_v;         ///< V output dimension (n_head_kv * head_dim)
+};
+
+// ============================================================================
+// SSM (Mamba2) Callback UserData Structs
+// ============================================================================
+struct SSMConv1DUserData {
+    float* conv_state;
+    const float* weight;
+    int channels;
+    int kernel_size;
+    bool apply_silu = false;
+    int layer_idx = -1;
+    int ssm_ordinal = -1;
+    const int* token_seq_ids = nullptr;
+    const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
+    Qwen36ProfileCounters* profile = nullptr;
+};
+
+struct SSMAlphaBetaProjectUserData {
+    const float* alpha_weight = nullptr;
+    const float* beta_weight = nullptr;
+    const float* dt_bias = nullptr;
+    int n_embd = 0;
+    int n_heads = 0;
+    int layer_idx = -1;
+    const int* token_seq_ids = nullptr;
+};
+
+struct ProjectionReferenceUserData {
+    const struct ggml_tensor* weight_tensor = nullptr;
+    const struct ggml_tensor* input_tensor = nullptr;
+    const uint8_t* int4_packed = nullptr;
+    const float* int4_scales = nullptr;
+    const float* int4_zeros = nullptr;
+    int int4_group_size = 0;
+    int int4_k = 0;
+    int int4_n = 0;
+    const uint8_t* fp8_packed = nullptr;
+    TransformerModel::FP8Format fp8_format = TransformerModel::FP8Format::E4M3FN;
+    int fp8_k = 0;
+    int fp8_n = 0;
+    int layer_idx = -1;
+    const int* token_seq_ids = nullptr;
+    const char* stage = nullptr;
+    const char* var_name = nullptr;
+};
+
+struct SharedScalarGateReferenceUserData {
+    const struct ggml_tensor* shared_ffn_pre_gate = nullptr;
+    const struct ggml_tensor* shared_gate_logits_scalar = nullptr;
+    int layer_idx = -1;
+    const int* token_seq_ids = nullptr;
+    const char* stage = nullptr;
+    const char* var_name = nullptr;
+};
+
+struct RmsNormReferenceUserData {
+    const struct ggml_tensor* input_tensor = nullptr;
+    const struct ggml_tensor* norm_weight = nullptr;
+    int layer_idx = -1;
+    const int* token_seq_ids = nullptr;
+    const char* stage = nullptr;
+    const char* var_name = nullptr;
+};
+
+struct HiddenSnapshotUserData {
+    int layer_idx = -1;
+    int token_idx = -1;
+    const int* token_ids = nullptr;
+    const int* token_seq_ids = nullptr;
+    const char* stage = nullptr;
+    const char* var_name = nullptr;
+};
+
+struct Gemma4KVSummaryUserData {
+    int layer_idx = -1;
+    int source_layer = -1;
+    const char* action = nullptr;
+    const char* kind = nullptr;
+};
+
+static Gemma4KVSummaryUserData* AllocateGemma4KVSummaryUserData(struct ggml_context* ctx_c);
+static void cb_gemma4_kv_summary_probe(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                       void* userdata);
+
+static struct ggml_tensor* MaybeAttachGemma4SharedKVProbe(struct ggml_context* ctx_c, struct ggml_tensor* tensor,
+                                                          const char* action, const char* kind, int layer_idx,
+                                                          int source_layer) {
+    const char* env = std::getenv("DENSECORE_DEBUG_GEMMA4_SHARED_KV");
+    const bool enabled = env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    if (!enabled || !ctx_c || !tensor) {
+        return tensor;
+    }
+    auto* ud = AllocateGemma4KVSummaryUserData(ctx_c);
+    if (!ud) {
+        return tensor;
+    }
+    ud->layer_idx = layer_idx;
+    ud->source_layer = source_layer;
+    ud->action = action;
+    ud->kind = kind;
+    return ggml_map_custom1(ctx_c, tensor, cb_gemma4_kv_summary_probe, 1, ud);
+}
+
+static void ComputeMatmulReferenceInt4BindingF32(const ProjectionReferenceUserData* ud, std::vector<float>* out) {
+    if (!ud || !out || !ud->input_tensor || !ud->input_tensor->data || ud->input_tensor->type != GGML_TYPE_F32 ||
+        !ud->int4_packed || !ud->int4_scales || !ud->int4_zeros || ud->int4_group_size <= 0 || ud->int4_k <= 0 ||
+        ud->int4_n <= 0) {
+        out->clear();
+        return;
+    }
+    const int K = ud->int4_k;
+    const int N = ud->int4_n;
+    const int M = static_cast<int>(ud->input_tensor->ne[1]);
+    if (M <= 0 || static_cast<int>(ud->input_tensor->ne[0]) != K || (K % ud->int4_group_size) != 0 ||
+        (ud->int4_group_size & 1) != 0) {
+        out->clear();
+        return;
+    }
+
+    const int num_groups = K / ud->int4_group_size;
+    const int packed_k = (K + 1) / 2;
+    out->assign(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+
+    const char* input_base = reinterpret_cast<const char*>(ud->input_tensor->data);
+    for (int m = 0; m < M; ++m) {
+        const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(ud->input_tensor->nb[1]);
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            for (int g = 0; g < num_groups; ++g) {
+                const float scale = ud->int4_scales[n * num_groups + g];
+                const float zero = ud->int4_zeros[n * num_groups + g];
+                const int k_start = g * ud->int4_group_size;
+                const uint8_t* w_packed = ud->int4_packed + static_cast<size_t>(n) * packed_k +
+                                          static_cast<size_t>(g) * (ud->int4_group_size / 2);
+                for (int k = 0; k < ud->int4_group_size; ++k) {
+                    const int byte_idx = k / 2;
+                    const int nibble_idx = k % 2;
+                    const uint8_t packed_byte = w_packed[byte_idx];
+                    int8_t q = (nibble_idx == 0) ? static_cast<int8_t>(packed_byte & 0x0F)
+                                                 : static_cast<int8_t>((packed_byte >> 4) & 0x0F);
+                    if (q & 0x08) {
+                        q = static_cast<int8_t>(q | static_cast<int8_t>(0xF0));
+                    }
+                    const float x = *reinterpret_cast<const float*>(src_col + static_cast<size_t>(k_start + k) *
+                                                                                  ud->input_tensor->nb[0]);
+                    sum += x * (scale * (static_cast<float>(q) - zero));
+                }
+            }
+            (*out)[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = sum;
+        }
+    }
+}
+
+static void ComputeMatmulReferenceFp8BindingF32(const ProjectionReferenceUserData* ud, std::vector<float>* out) {
+    if (!ud || !out || !ud->input_tensor || !ud->input_tensor->data || ud->input_tensor->type != GGML_TYPE_F32 ||
+        !ud->fp8_packed || ud->fp8_k <= 0 || ud->fp8_n <= 0) {
+        out->clear();
+        return;
+    }
+    const int K = ud->fp8_k;
+    const int N = ud->fp8_n;
+    const int M = static_cast<int>(ud->input_tensor->ne[1]);
+    if (M <= 0 || static_cast<int>(ud->input_tensor->ne[0]) != K) {
+        out->clear();
+        return;
+    }
+
+    out->assign(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+    std::vector<float> dequant_row(static_cast<size_t>(K), 0.0f);
+    const char* input_base = reinterpret_cast<const char*>(ud->input_tensor->data);
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* packed_row = ud->fp8_packed + static_cast<size_t>(n) * static_cast<size_t>(K);
+        if (ud->fp8_format == TransformerModel::FP8Format::E5M2) {
+            densecore::hwy_kernels::ConvertFP8E5M2ToFP32_Hwy(packed_row, dequant_row.data(), static_cast<int64_t>(K));
+        } else {
+            densecore::hwy_kernels::ConvertFP8E4M3FNToFP32_Hwy(packed_row, dequant_row.data(), static_cast<int64_t>(K));
+        }
+        for (int m = 0; m < M; ++m) {
+            const char* src_col = input_base + static_cast<size_t>(m) * static_cast<size_t>(ud->input_tensor->nb[1]);
+            float sum = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                const float x =
+                    *reinterpret_cast<const float*>(src_col + static_cast<size_t>(k) * ud->input_tensor->nb[0]);
+                sum += dequant_row[static_cast<size_t>(k)] * x;
+            }
+            (*out)[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = sum;
+        }
+    }
+}
+
+static bool ShouldRunSharedScalarGateReferenceProbe(int layer_idx) {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SHARED_SCALAR_GATE_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    if (!enabled) return false;
+    static const int target_layer = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SHARED_SCALAR_GATE_REFERENCE_LAYER");
+        if (!env || env[0] == '\0') return -1;
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        return (end == env) ? -1 : static_cast<int>(parsed);
+    }();
+    static std::atomic<int> remaining_budget{[]() {
+        const char* env = std::getenv("DENSECORE_DEBUG_SHARED_SCALAR_GATE_REFERENCE_MAX_CALLS");
+        if (!env || env[0] == '\0') return 4;
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        return (end == env || parsed <= 0) ? 4 : static_cast<int>(parsed);
+    }()};
+    if (target_layer >= 0 && layer_idx != target_layer) return false;
+    int remaining = remaining_budget.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (remaining_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct AttentionCoreReferenceUserData {
+    const struct ggml_tensor* value_tensor = nullptr;
+    const struct ggml_tensor* gate_tensor = nullptr;
+    int layer_idx = -1;
+    int n_head = 0;
+    int n_head_kv = 0;
+    int head_dim_q = 0;
+    int head_dim_k = 0;
+    int head_dim_v = 0;
+    int n_past = 0;
+    int sliding_window = -1;
+    float attention_scale = 0.0f;
+    float logit_softcap = 0.0f;
+    const int* token_seq_ids = nullptr;
+    const char* stage = nullptr;
+    const char* var_name = nullptr;
+};
+
+#ifdef DENSECORE_TEST_BUILD
+static std::atomic<int> g_test_capture_attention_layer{-1};
+static std::vector<float>* g_test_capture_attention_out = nullptr;
+
+static void cb_test_capture_attention_tensor(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
+                                             void* userdata) {
+    (void)nth;
+    (void)userdata;
+    if (!dst || !src || !dst->data || !src->data) return;
+    std::memcpy(dst->data, src->data, ggml_nbytes(src));
+    if (ith != 0 || !g_test_capture_attention_out || src->type != GGML_TYPE_F32) {
+        return;
+    }
+    const int elems = static_cast<int>(ggml_nelements(src));
+    g_test_capture_attention_out->resize(static_cast<size_t>(elems));
+    std::memcpy(g_test_capture_attention_out->data(), src->data, static_cast<size_t>(elems) * sizeof(float));
+}
+#endif
+
+
+// ============================================================================
+// SSM Delta Callback Helper logic
+// ============================================================================
+
+struct GLMDSAPackUserData {
+    int n_heads;
+    int qk_nope_head_dim;
+    int qk_rope_head_dim;
+    int v_head_dim;
+};

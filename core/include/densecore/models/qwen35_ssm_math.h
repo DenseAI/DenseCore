@@ -23,13 +23,13 @@ struct Qwen35SSMHeadStepConfig {
     float a_log = 0.0f;
     float norm_eps = 1e-6f;
     bool a_log_prescaled = false;
+    bool norm_weight_uses_unit_offset = false;
     bool has_precomputed_alpha_beta = false;
     float precomputed_alpha = 0.0f;
     float precomputed_beta = 0.0f;
     bool has_precomputed_qk_norm = false;
     float precomputed_q_inv_norm = 0.0f;
     float precomputed_k_inv_norm = 0.0f;
-    float precomputed_qk_dot = 0.0f;
     bool use_fast_silu = false;
 };
 
@@ -123,21 +123,5 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
 // Default serving fast path for the same math as Qwen35RunGatedDeltaHeadStep.
 // It avoids materializing q_norm/k_norm scratch when diagnostics are disabled.
 bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head);
-
-// Runs the same head step through an isolated scratch copy, then writes the
-// entire canonical [K, V] state span back to `state_out_kv`.
-bool Qwen35RunGatedDeltaHeadStepWithWriteback(const Qwen35SSMHeadStepConfig& cfg, const float* state_in_kv,
-                                              float* state_out_kv, float* y_head,
-                                              Qwen35SSMHeadStepStats* stats = nullptr,
-                                              Qwen35SSMHeadStepDebugBuffers* debug = nullptr);
-
-// Debug-only correctness-first path:
-// materialize state into scratch, run the delta step, write the full result into
-// a freshly zeroed destination slice, then copy that slice back out.
-bool Qwen35RunGatedDeltaHeadStepReferenceSafe(const Qwen35SSMHeadStepConfig& cfg, const float* state_in_kv,
-                                              float* state_out_kv, float* y_head,
-                                              Qwen35SSMHeadStepStats* stats = nullptr,
-                                              Qwen35SSMHeadStepDebugBuffers* debug = nullptr,
-                                              Qwen35SSMHeadStepTrace* trace = nullptr);
 
 #endif  // DENSECORE_QWEN35_SSM_MATH_H

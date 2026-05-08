@@ -510,12 +510,14 @@ set(SOURCES
     src/runtime/worker.cpp
     src/runtime/worker_helpers.cpp
     src/llm/config/runtime_config.cpp
+    src/llm/decoder/spec_runtime.cpp
     src/llm/runtime/deps.cpp
     src/llm/attention/internal.cpp
     src/llm/attention/exec.cpp
     src/llm/graph/planning.cpp
     src/llm/models/common/family_internal.cpp
     src/llm/sampling/exec.cpp
+    src/runtime/inference_context.cpp
     src/runtime/inference.cpp
     src/models/model_types.cpp
     src/models/decoder_model_spec.cpp

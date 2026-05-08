@@ -1,8 +1,7 @@
 #include "densecore/models/decoder_model_spec.h"
 
 #include <algorithm>
-#include <cstdlib>
-#include <cstring>
+#include <sstream>
 
 #include "models/model_inference_policy.h"
 
@@ -112,12 +111,88 @@ void AppendLayerSemanticOps(DecoderLayerSpec* layer_spec) {
     add(DecoderSemanticOpKind::ResidualAdd);
 }
 
-bool ParseBoolEnv(const char* name, bool default_value) {
-    const char* env = std::getenv(name);
-    if (!env || env[0] == '\0') {
-        return default_value;
+void AddSpecialization(DecoderModelSpec* spec, DecoderSpecializationKind kind, int layer_idx = -1) {
+    if (!spec) {
+        return;
     }
-    return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0;
+    const auto exists = std::any_of(spec->specializations.begin(), spec->specializations.end(),
+                                    [kind, layer_idx](const DecoderSpecialization& specialization) {
+                                        return specialization.kind == kind && specialization.layer_index == layer_idx;
+                                    });
+    if (!exists) {
+        spec->specializations.push_back({kind, layer_idx});
+    }
+}
+
+DecoderRuntimeTopology ResolveRuntimeTopology(const DecoderModelSpec& spec) {
+    if (spec.has_sliding_window_attention || spec.has_shared_kv) {
+        return spec.has_moe ? DecoderRuntimeTopology::SlidingSharedKVMoE : DecoderRuntimeTopology::SlidingSharedKV;
+    }
+    if (spec.has_hybrid_ssm_mixer) {
+        return spec.has_moe ? DecoderRuntimeTopology::HybridSSMMoE : DecoderRuntimeTopology::HybridSSM;
+    }
+    if (spec.has_moe) {
+        return DecoderRuntimeTopology::DenseAttentionMoE;
+    }
+    return DecoderRuntimeTopology::DenseAttention;
+}
+
+void AppendModelSpecializations(DecoderModelSpec* spec, const TransformerModel* model) {
+    if (!spec) {
+        return;
+    }
+    if (spec->output.prefill_logits_policy != DecoderPrefillLogitsPolicy::FullSequence) {
+        AddSpecialization(spec, DecoderSpecializationKind::PrefillLastLogits);
+    }
+    for (const DecoderLayerSpec& layer : spec->layers) {
+        const int layer_idx = layer.layer_index;
+        const DecoderAttentionSpec& attention = layer.attention;
+        const DecoderFfnSpec& ffn = layer.ffn;
+        if (attention.has_hybrid_ssm_mixer) {
+            AddSpecialization(spec, DecoderSpecializationKind::HybridSSMMixer, layer_idx);
+        }
+        if (attention.is_sliding_window) {
+            AddSpecialization(spec, DecoderSpecializationKind::SlidingWindowAttention, layer_idx);
+        }
+        if (attention.reads_shared_kv || attention.publishes_shared_kv) {
+            AddSpecialization(spec, DecoderSpecializationKind::SharedKV, layer_idx);
+        }
+        if (model && model->hparams.n_head_kv > 0 && attention.kv_head_count > 0 &&
+            attention.kv_head_count != static_cast<int>(model->hparams.n_head_kv)) {
+            AddSpecialization(spec, DecoderSpecializationKind::PerLayerKVHeads, layer_idx);
+        }
+        if (attention.requires_q_norm) {
+            AddSpecialization(spec, DecoderSpecializationKind::QNorm, layer_idx);
+        }
+        if (attention.requires_k_norm) {
+            AddSpecialization(spec, DecoderSpecializationKind::KNorm, layer_idx);
+        }
+        if (attention.requires_v_norm) {
+            AddSpecialization(spec, DecoderSpecializationKind::VNorm, layer_idx);
+        }
+        if (attention.logit_softcap > 0.0f) {
+            AddSpecialization(spec, DecoderSpecializationKind::AttentionLogitSoftcap, layer_idx);
+        }
+        if (ffn.is_moe) {
+            AddSpecialization(spec, DecoderSpecializationKind::MoE, layer_idx);
+        }
+        if (ffn.router == DecoderMoERouter::GroupedSigmoidTopK) {
+            AddSpecialization(spec, DecoderSpecializationKind::GroupedMoERouter, layer_idx);
+        }
+        if (ffn.router == DecoderMoERouter::Gemma4SoftmaxTopK) {
+            AddSpecialization(spec, DecoderSpecializationKind::Gemma4MoERouter, layer_idx);
+        }
+        if (ffn.has_shared_dense_branch) {
+            AddSpecialization(spec, DecoderSpecializationKind::SharedDenseFfn, layer_idx);
+        }
+        if (ffn.has_down_scale_sidecar) {
+            AddSpecialization(spec, DecoderSpecializationKind::MoEDownScaleSidecar, layer_idx);
+        }
+        if (ffn.has_post_shared_norm || ffn.has_post_moe_norm || ffn.has_post_ffn_norm) {
+            AddSpecialization(spec, DecoderSpecializationKind::FfnPostNorms, layer_idx);
+        }
+    }
+    spec->runtime_topology = ResolveRuntimeTopology(*spec);
 }
 
 }  // namespace
@@ -169,7 +244,7 @@ DecoderModelSpec BuildDecoderModelSpec(const TransformerModel* model) {
         ffn.is_moe = layer.is_moe;
         ffn.num_experts = static_cast<int>(layer.NumExperts());
         ffn.top_k = static_cast<int>(model->hparams.n_experts_used);
-        ffn.activation = is_gemma4_moe ? DecoderActivation::GeluPytorchTanh : DecoderActivation::Silu;
+        ffn.activation = model->arch_flags.is_gemma4 ? DecoderActivation::GeluPytorchTanh : DecoderActivation::Silu;
         ffn.router = ResolveMoERouter(model, layer, is_gemma4_moe);
         ffn.has_shared_dense_branch = LayerHasSharedDenseBranch(model, layer, is_gemma4_moe);
         ffn.has_pre_moe_norm = layer.Get(kGemma4PreMoeNormKey) != nullptr;
@@ -198,6 +273,7 @@ DecoderModelSpec BuildDecoderModelSpec(const TransformerModel* model) {
         }
     }
 
+    AppendModelSpecializations(&spec, model);
     return spec;
 }
 
@@ -232,15 +308,20 @@ std::shared_ptr<const DecoderModelSpec> MakeDecoderModelSpec(const TransformerMo
     return std::make_shared<const DecoderModelSpec>(BuildDecoderModelSpec(model));
 }
 
-bool ShouldUsePrefillLastLogitsOnly(const DecoderModelSpec* spec, int num_seqs, int n_tokens) {
+DecoderPrefillRuntimePolicy DefaultDecoderPrefillRuntimePolicy() {
+    return {};
+}
+
+bool ShouldUsePrefillLastLogitsOnly(const DecoderModelSpec* spec, int num_seqs, int n_tokens,
+                                    DecoderPrefillRuntimePolicy policy) {
     if (!spec || num_seqs != 1 || n_tokens <= 1) {
         return false;
     }
     switch (spec->output.prefill_logits_policy) {
     case DecoderPrefillLogitsPolicy::LastTokenEnvOptIn:
-        return ParseBoolEnv("DENSECORE_QWEN35_PREFILL_LAST_LOGITS_ONLY", false);
+        return policy.qwen35_prefill_last_logits_only;
     case DecoderPrefillLogitsPolicy::LastTokenEnvDefaultOn:
-        return ParseBoolEnv("DENSECORE_QWEN36_PREFILL_LAST_LOGITS_ONLY", true);
+        return policy.qwen36_prefill_last_logits_only;
     case DecoderPrefillLogitsPolicy::LastTokenForMoE: return true;
     case DecoderPrefillLogitsPolicy::FullSequence:
     default: return false;
@@ -284,6 +365,19 @@ const char* DecoderPrefillLogitsPolicyName(DecoderPrefillLogitsPolicy policy) {
     return "unknown";
 }
 
+const char* DecoderRuntimeTopologyName(DecoderRuntimeTopology topology) {
+    switch (topology) {
+    case DecoderRuntimeTopology::Unknown: return "unknown";
+    case DecoderRuntimeTopology::DenseAttention: return "dense_attention";
+    case DecoderRuntimeTopology::DenseAttentionMoE: return "dense_attention_moe";
+    case DecoderRuntimeTopology::HybridSSM: return "hybrid_ssm";
+    case DecoderRuntimeTopology::HybridSSMMoE: return "hybrid_ssm_moe";
+    case DecoderRuntimeTopology::SlidingSharedKV: return "sliding_shared_kv";
+    case DecoderRuntimeTopology::SlidingSharedKVMoE: return "sliding_shared_kv_moe";
+    }
+    return "unknown";
+}
+
 const char* DecoderSemanticOpKindName(DecoderSemanticOpKind kind) {
     switch (kind) {
     case DecoderSemanticOpKind::AttentionNorm: return "attention_norm";
@@ -302,6 +396,98 @@ const char* DecoderSemanticOpKindName(DecoderSemanticOpKind kind) {
     case DecoderSemanticOpKind::ResidualAdd: return "residual_add";
     }
     return "unknown";
+}
+
+const char* DecoderSpecializationKindName(DecoderSpecializationKind kind) {
+    switch (kind) {
+    case DecoderSpecializationKind::HybridSSMMixer: return "hybrid_ssm_mixer";
+    case DecoderSpecializationKind::SlidingWindowAttention: return "sliding_window_attention";
+    case DecoderSpecializationKind::SharedKV: return "shared_kv";
+    case DecoderSpecializationKind::PerLayerKVHeads: return "per_layer_kv_heads";
+    case DecoderSpecializationKind::QNorm: return "q_norm";
+    case DecoderSpecializationKind::KNorm: return "k_norm";
+    case DecoderSpecializationKind::VNorm: return "v_norm";
+    case DecoderSpecializationKind::AttentionLogitSoftcap: return "attention_logit_softcap";
+    case DecoderSpecializationKind::MoE: return "moe";
+    case DecoderSpecializationKind::GroupedMoERouter: return "grouped_moe_router";
+    case DecoderSpecializationKind::Gemma4MoERouter: return "gemma4_moe_router";
+    case DecoderSpecializationKind::SharedDenseFfn: return "shared_dense_ffn";
+    case DecoderSpecializationKind::MoEDownScaleSidecar: return "moe_down_scale_sidecar";
+    case DecoderSpecializationKind::FfnPostNorms: return "ffn_post_norms";
+    case DecoderSpecializationKind::PrefillLastLogits: return "prefill_last_logits";
+    }
+    return "unknown";
+}
+
+bool DecoderModelSpecHasSpecialization(const DecoderModelSpec& spec, DecoderSpecializationKind kind) {
+    return std::any_of(spec.specializations.begin(), spec.specializations.end(),
+                       [kind](const DecoderSpecialization& specialization) {
+                           return specialization.kind == kind;
+                       });
+}
+
+std::string FormatDecoderLayerSpec(const DecoderLayerSpec& layer) {
+    std::ostringstream oss;
+    oss << "layer=" << layer.layer_index << " attention={hybrid_ssm="
+        << (layer.attention.has_hybrid_ssm_mixer ? "true" : "false")
+        << ", sliding=" << (layer.attention.is_sliding_window ? "true" : "false")
+        << ", shared_kv_read=" << (layer.attention.reads_shared_kv ? "true" : "false")
+        << ", shared_kv_publish=" << (layer.attention.publishes_shared_kv ? "true" : "false")
+        << ", kv_source=" << layer.attention.kv_source_layer << ", kv_heads=" << layer.attention.kv_head_count
+        << ", rope=" << DecoderRopeKindName(layer.attention.rope_kind)
+        << ", rope_dim=" << layer.attention.rope_dim << ", softcap=" << layer.attention.logit_softcap
+        << "} ffn={moe=" << (layer.ffn.is_moe ? "true" : "false")
+        << ", router=" << DecoderMoERouterName(layer.ffn.router)
+        << ", activation=" << DecoderActivationName(layer.ffn.activation)
+        << ", experts=" << layer.ffn.num_experts << ", top_k=" << layer.ffn.top_k
+        << ", shared_dense=" << (layer.ffn.has_shared_dense_branch ? "true" : "false")
+        << ", down_scale_sidecar=" << (layer.ffn.has_down_scale_sidecar ? "true" : "false")
+        << ", post_norms="
+        << ((layer.ffn.has_post_shared_norm || layer.ffn.has_post_moe_norm || layer.ffn.has_post_ffn_norm) ? "true"
+                                                                                                           : "false")
+        << "} ops=[";
+    for (size_t i = 0; i < layer.semantic_ops.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << DecoderSemanticOpKindName(layer.semantic_ops[i].kind);
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string FormatDecoderSpecializations(const DecoderModelSpec& spec) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < spec.specializations.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        const DecoderSpecialization& specialization = spec.specializations[i];
+        oss << DecoderSpecializationKindName(specialization.kind);
+        if (specialization.layer_index >= 0) {
+            oss << "@layer" << specialization.layer_index;
+        }
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string FormatDecoderModelSpec(const DecoderModelSpec& spec) {
+    std::ostringstream oss;
+    oss << "DecoderModelSpec{arch=" << static_cast<int>(spec.arch)
+        << ", variant=" << static_cast<int>(spec.variant) << ", layers=" << spec.layers.size()
+        << ", topology=" << DecoderRuntimeTopologyName(spec.runtime_topology)
+        << ", moe=" << (spec.has_moe ? "true" : "false")
+        << ", hybrid_ssm=" << (spec.has_hybrid_ssm_mixer ? "true" : "false")
+        << ", sliding=" << (spec.has_sliding_window_attention ? "true" : "false")
+        << ", shared_kv=" << (spec.has_shared_kv ? "true" : "false")
+        << ", prefill_logits=" << DecoderPrefillLogitsPolicyName(spec.output.prefill_logits_policy)
+        << ", specializations=" << FormatDecoderSpecializations(spec) << "}";
+    for (const DecoderLayerSpec& layer : spec.layers) {
+        oss << "\n  " << FormatDecoderLayerSpec(layer);
+    }
+    return oss.str();
 }
 
 }  // namespace densecore::models

@@ -20,6 +20,39 @@ densecore::models::GraphBuilderSupport MakeDenseCoreInlineGraphSupport() {
     support.supports_per_layer_kv_head_variability = true;
     support.supports_special_attention_mask = true;
     support.supports_special_residual_scaling = true;
+    support.supports_shared_dense_ffn = true;
+    support.supports_moe_down_scale_sidecar = true;
+    support.supports_ffn_post_norms = true;
+    support.supported_moe_routers = {densecore::models::DecoderMoERouter::SoftmaxTopK,
+                                     densecore::models::DecoderMoERouter::Gemma4SoftmaxTopK,
+                                     densecore::models::DecoderMoERouter::GroupedSigmoidTopK};
+    support.supported_ffn_activations = {densecore::models::DecoderActivation::Silu,
+                                         densecore::models::DecoderActivation::GeluPytorchTanh};
+    support.supported_rope_kinds = {densecore::models::DecoderRopeKind::Standard,
+                                    densecore::models::DecoderRopeKind::Neox,
+                                    densecore::models::DecoderRopeKind::Proportional};
+    support.supported_prefill_logits_policies = {
+        densecore::models::DecoderPrefillLogitsPolicy::FullSequence,
+        densecore::models::DecoderPrefillLogitsPolicy::LastTokenEnvOptIn,
+        densecore::models::DecoderPrefillLogitsPolicy::LastTokenEnvDefaultOn,
+        densecore::models::DecoderPrefillLogitsPolicy::LastTokenForMoE,
+    };
+    support.supported_semantic_ops = {
+        densecore::models::DecoderSemanticOpKind::AttentionNorm,
+        densecore::models::DecoderSemanticOpKind::AttentionProjection,
+        densecore::models::DecoderSemanticOpKind::HybridSSMMixer,
+        densecore::models::DecoderSemanticOpKind::SharedKVRead,
+        densecore::models::DecoderSemanticOpKind::SharedKVPublish,
+        densecore::models::DecoderSemanticOpKind::AttentionCore,
+        densecore::models::DecoderSemanticOpKind::AttentionOutputProjection,
+        densecore::models::DecoderSemanticOpKind::FfnNorm,
+        densecore::models::DecoderSemanticOpKind::MoERouter,
+        densecore::models::DecoderSemanticOpKind::MoEExpertDispatch,
+        densecore::models::DecoderSemanticOpKind::SharedDenseFfn,
+        densecore::models::DecoderSemanticOpKind::DenseFfn,
+        densecore::models::DecoderSemanticOpKind::FfnPostNorm,
+        densecore::models::DecoderSemanticOpKind::ResidualAdd,
+    };
     return support;
 }
 

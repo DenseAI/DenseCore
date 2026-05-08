@@ -15,12 +15,12 @@ extern bool ShouldUsePagedDecodeAttentionForBatchTest(const TransformerModel* mo
                                                       const BatchSpec& batch);
 }
 
-TEST(DecodeGraphCachePolicyTest, HybridSSMModelsRemainCacheEligible) {
+TEST(DecodeGraphCachePolicyTest, HybridSSMModelsAreNotDecodeGraphCacheSafeYet) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
     model.arch_flags.is_hybrid_ssm = true;
 
-    EXPECT_TRUE(IsDecodeGraphCacheSafeForModel(&model));
+    EXPECT_FALSE(IsDecodeGraphCacheSafeForModel(&model));
 }
 
 TEST(DecodeGraphCachePolicyTest, HybridSSMModelsRequireRuntimeRebind) {

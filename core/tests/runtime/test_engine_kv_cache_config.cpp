@@ -308,6 +308,10 @@ TEST(EngineKVCacheConfig, HybridSsmGraphContextGrowsForLongContextHint) {
     EXPECT_GT(long_hint_estimate.total_bytes, static_cast<size_t>(1024) * 1024 * 1024)
         << "Long-context chunked graph builds still need GB-scale scratch even when the actual batch is smaller than "
            "the runtime max batch";
+    EXPECT_GE(long_hint_estimate.long_context_safety_pad_bytes,
+              static_cast<size_t>(2528) * 1024 * 1024)
+        << "Hybrid Qwen3.5 long-prefill graph sizing regressed below the safety headroom needed to avoid "
+           "ggml_new_object aborts on the Go server path";
 }
 
 TEST(EngineKVCacheConfig, Gemma4DecodeGraphContextUsesActualQueryShape) {

@@ -1697,13 +1697,6 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                                       "mlp_layernorm.weight"}));
         model->layers[i].Set(model_keys::kPostAttnNorm, get_layer_tensor_any(i, {"post_attention_norm.weight",
                                                                                  "post_attention_layernorm.weight"}));
-        if (model->arch_flags.is_gemma4) {
-            // Gemma4 GGUF uses blk.N.post_attention_norm.weight for the FFN
-            // post norm (llama.cpp ffn_post_norm), not for an attention-output
-            // norm. Applying it before the attention residual silently corrupts
-            // logits from the first sampled token.
-            model->layers[i].Set(model_keys::kPostAttnNorm, nullptr);
-        }
         // Fallback: Qwen3.5 uses post_attention_norm instead of ffn_norm
         if (!model->layers[i].Get(model_keys::kFfnNorm) && model->layers[i].Get(model_keys::kPostAttnNorm)) {
             model->layers[i].Set(model_keys::kFfnNorm, model->layers[i].Get(model_keys::kPostAttnNorm));
@@ -1728,8 +1721,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
                              get_layer_tensor_any(i, {"post_feedforward_layernorm_1.weight"}));
         model->layers[i].Set(kGemma4PostMoeNormKey, get_layer_tensor_any(i, {"post_feedforward_layernorm_2.weight"}));
         model->layers[i].Set(kGemma4PostFfnNormKey,
-                             get_layer_tensor_any(i, {"post_feedforward_layernorm.weight", "post_attention_norm.weight",
-                                                      "post_ffw_norm.weight"}));
+                             get_layer_tensor_any(i, {"post_feedforward_layernorm.weight", "post_ffw_norm.weight"}));
         model->layers[i].Set(model_keys::kGemma4PerLayerInputGate, get_layer_tensor_any(i, {"inp_gate.weight"}));
         model->layers[i].Set(model_keys::kGemma4PerLayerProjection, get_layer_tensor_any(i, {"proj.weight"}));
         model->layers[i].Set(model_keys::kGemma4PostPerLayerInputNorm, get_layer_tensor_any(i, {"post_norm.weight"}));

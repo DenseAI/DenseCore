@@ -34,6 +34,18 @@ void TokenResultCallbackCapture(const TokenResult* result, void* user_data) {
     capture->finished_flags.push_back(result->is_finished);
 }
 
+void InitDecodeSummaryRequest(Request* req) {
+    ASSERT_NE(req, nullptr);
+    req->id = 7;
+    req->prompt_token_count = 11;
+    req->sampled_token_count = 3;
+    req->visible_emitted_token_count = 3;
+    req->decode_finish_cause = DecodeFinishCause::MaxTokens;
+    req->start_time = std::chrono::steady_clock::now();
+    req->first_token_time = req->start_time + std::chrono::milliseconds(10);
+    req->last_external_emit_time = req->first_token_time + std::chrono::milliseconds(20);
+}
+
 }  // namespace
 
 TEST(WorkerResultDispatchTest, DirectTokenCallbackInvokesCallbackImmediately) {
@@ -95,14 +107,7 @@ TEST(WorkerResultDispatchTest, Qwen35DecodeSummaryUsesDedicatedTag) {
     model.variant = ModelVariant::QWEN35;
 
     Request req{};
-    req.id = 7;
-    req.prompt_token_count = 11;
-    req.sampled_token_count = 3;
-    req.visible_emitted_token_count = 3;
-    req.decode_finish_cause = DecodeFinishCause::MaxTokens;
-    req.start_time = std::chrono::steady_clock::now();
-    req.first_token_time = req.start_time + std::chrono::milliseconds(10);
-    req.last_external_emit_time = req.first_token_time + std::chrono::milliseconds(20);
+    InitDecodeSummaryRequest(&req);
 
     ::testing::internal::CaptureStderr();
     LogRequestDecodeSummary(&req, &model);
@@ -112,4 +117,45 @@ TEST(WorkerResultDispatchTest, Qwen35DecodeSummaryUsesDedicatedTag) {
     EXPECT_NE(captured.find("prompt_tokens=11"), std::string::npos);
     EXPECT_NE(captured.find("attention_ms="), std::string::npos);
     EXPECT_NE(captured.find("moe_forward_ms="), std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, DecodeSummaryTagsQwen36AndGemma4Variants) {
+    struct Case {
+        ModelArch arch;
+        ModelVariant variant;
+        const char* tag;
+    };
+    const Case cases[] = {
+        {ModelArch::QWEN35, ModelVariant::QWEN36, "[Qwen36DecodeSummary]"},
+        {ModelArch::GEMMA, ModelVariant::GEMMA4, "[Gemma4DecodeSummary]"},
+    };
+
+    for (const Case& test_case : cases) {
+        TransformerModel model{};
+        model.arch = test_case.arch;
+        model.variant = test_case.variant;
+        Request req{};
+        InitDecodeSummaryRequest(&req);
+
+        ::testing::internal::CaptureStderr();
+        LogRequestDecodeSummary(&req, &model);
+        const std::string captured = ::testing::internal::GetCapturedStderr();
+
+        EXPECT_NE(captured.find(test_case.tag), std::string::npos) << test_case.tag;
+        EXPECT_NE(captured.find("prompt_tokens=11"), std::string::npos) << test_case.tag;
+    }
+}
+
+TEST(WorkerResultDispatchTest, DecodeSummarySkipsGenericDecoderVariants) {
+    TransformerModel model{};
+    model.arch = ModelArch::LLAMA;
+    model.variant = ModelVariant::LLAMA;
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_TRUE(captured.empty());
 }

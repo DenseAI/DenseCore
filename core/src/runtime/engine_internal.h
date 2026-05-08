@@ -1085,6 +1085,16 @@ struct EngineState {
                 std::clamp<size_t>(std::max<size_t>(128, (effective_seq_len / 1024ULL) * 64ULL), 128ULL, 1024ULL);
             estimate.long_context_safety_pad_bytes += long_prompt_pad_mb * MB;
         }
+        if (model->arch_flags.is_hybrid_ssm && effective_query_len >= 1024ULL) {
+            // Hybrid-SSM long-prefill graphs can still miss the coarse estimate by
+            // a few-to-tens of MB because ggml object metadata and branch-local
+            // scratch grow with the actual query chunk shape. Keep explicit
+            // object-pool headroom here so serving does not hard-abort in
+            // ggml_new_object() before fail-closed handling can run.
+            const size_t hybrid_long_prefill_object_pad_mb =
+                std::clamp<size_t>(((effective_query_len + 1023ULL) / 1024ULL) * 64ULL, 64ULL, 512ULL);
+            estimate.long_context_safety_pad_bytes += hybrid_long_prefill_object_pad_mb * MB;
+        }
         if (model->arch_flags.is_gemma4 && effective_query_len > 512ULL) {
             const size_t gemma4_long_prefill_pad_mb =
                 std::clamp<size_t>(std::max<size_t>(1280, (effective_query_len / 1024ULL) * 256ULL), 1280ULL, 2048ULL);
