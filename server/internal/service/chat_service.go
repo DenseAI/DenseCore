@@ -582,11 +582,7 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 			topK = 1
 		}
 		if !req.RepetitionPenaltySet {
-			if isGemma {
-				repetitionPenalty = 1.05
-			} else {
-				repetitionPenalty = 1.0
-			}
+			repetitionPenalty = 1.0
 		}
 	}
 

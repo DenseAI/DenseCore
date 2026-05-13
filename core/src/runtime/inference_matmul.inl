@@ -1,3 +1,94 @@
+struct Q8RepackedGemvWeight {
+    int64_t rows = 0;
+    int64_t cols = 0;
+    int64_t blocks_per_row = 0;
+    size_t bytes = 0;
+    std::vector<uint8_t> data;
+};
+
+struct Q8RepackedGemvKey {
+    const void* weight = nullptr;
+    int64_t rows = 0;
+    int64_t cols = 0;
+
+    bool operator==(const Q8RepackedGemvKey& other) const {
+        return weight == other.weight && rows == other.rows && cols == other.cols;
+    }
+};
+
+struct Q8RepackedGemvKeyHash {
+    size_t operator()(const Q8RepackedGemvKey& key) const {
+        size_t h = std::hash<const void*>{}(key.weight);
+        h ^= std::hash<int64_t>{}(key.rows) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(key.cols) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+constexpr int kQ8RepackedGemvMinOutputRows = 4096;
+
+static bool IsGemma4SharedDenseFfnWeightName(const char* weight_name) {
+    if (!weight_name) {
+        return false;
+    }
+    return std::strstr(weight_name, ".ffn_gate.weight") || std::strstr(weight_name, ".ffn_up.weight") ||
+           std::strstr(weight_name, ".ffn_down.weight");
+}
+
+static bool IsQ8RepackedGemvEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_DISABLE_Q8_REPACKED_GEMV");
+        if (env && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
+            std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0) {
+            return false;
+        }
+#if defined(__aarch64__) || defined(_M_ARM64)
+        return ggml_cpu_has_neon() && ggml_cpu_has_dotprod();
+#else
+        const char* enable_env = std::getenv("DENSECORE_ENABLE_Q8_REPACKED_GEMV");
+        return enable_env && enable_env[0] != '\0' && std::strcmp(enable_env, "0") != 0 &&
+               std::strcmp(enable_env, "false") != 0 && std::strcmp(enable_env, "off") != 0;
+#endif
+    }();
+    return enabled;
+}
+
+static std::shared_ptr<Q8RepackedGemvWeight> GetOrCreateQ8RepackedGemvWeight(const void* weight_data, int64_t rows,
+                                                                              int64_t cols) {
+    if (!weight_data || rows <= 0 || cols <= 0 || (rows % 4) != 0 || (cols % QK8_0) != 0 ||
+        !IsQ8RepackedGemvEnabled()) {
+        return nullptr;
+    }
+    static std::mutex mutex;
+    static std::unordered_map<Q8RepackedGemvKey, std::shared_ptr<Q8RepackedGemvWeight>, Q8RepackedGemvKeyHash> cache;
+
+    const Q8RepackedGemvKey key{weight_data, rows, cols};
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+    }
+
+    const size_t src_bytes = static_cast<size_t>(rows) * ggml_row_size(GGML_TYPE_Q8_0, cols);
+    const size_t block_bytes = 4 * sizeof(ggml_fp16_t) + QK8_0 * 4;
+    const size_t dst_bytes = static_cast<size_t>(rows / 4) * static_cast<size_t>(cols / QK8_0) * block_bytes;
+    auto packed = std::make_shared<Q8RepackedGemvWeight>();
+    packed->rows = rows;
+    packed->cols = cols;
+    packed->blocks_per_row = cols / QK8_0;
+    packed->bytes = dst_bytes;
+    packed->data.resize(dst_bytes);
+    if (ggml_repack_q8_0_4x8(weight_data, src_bytes, rows, cols, packed->data.data(), packed->data.size()) != 0) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+    auto [it, inserted] = cache.emplace(key, packed);
+    return inserted ? packed : it->second;
+}
+
 /**
  * Custom callback for parallel GEMV (decode-phase)
  *
@@ -155,9 +246,47 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
             LogHybridSSMQkvDispatch(weight_name, weight_type, 1, K, N, "GEMV_NATIVE_VECDOT_CALLBACK", false, true,
                                     false);
         }
+        const int q8_repacked_min_rows =
+            IsGemma4SharedDenseFfnWeightName(weight_name)
+                ? ParsePositiveEnvInt("DENSECORE_GEMMA4_SHARED_Q8_REPACKED_MIN_ROWS",
+                                      kQ8RepackedGemvMinOutputRows)
+                : kQ8RepackedGemvMinOutputRows;
+        if (!ud->disable_q8_repacked_gemv && weight_type == GGML_TYPE_Q8_0 && ud->input_quant_type == GGML_TYPE_Q8_0 &&
+            K >= q8_repacked_min_rows &&
+            (N % QK8_0) == 0 && (K % 4) == 0) {
+            auto packed = GetOrCreateQ8RepackedGemvWeight(weight_data, K, N);
+            if (packed && packed->blocks_per_row > 0) {
+                const size_t block_bytes = 4 * sizeof(ggml_fp16_t) + QK8_0 * 4;
+                int k = k_start;
+                for (; k < k_end && (k & 3); ++k) {
+                    const void* row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
+                    type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
+                }
+                const int packed_end = k_end & ~3;
+                if (k < packed_end) {
+                    const size_t packed_offset =
+                        static_cast<size_t>(k / 4) * static_cast<size_t>(packed->blocks_per_row) * block_bytes;
+                    ggml_gemv_q8_0_4x8_q8_0(N, output + k, 0, packed->data.data() + packed_offset, quant_input, 1,
+                                            packed_end - k);
+                    k = packed_end;
+                }
+                for (; k < k_end; ++k) {
+                    const void* row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
+                    type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
+                }
+                maybe_log_gemv_timing("q8_0_repacked_4x8");
+                return;
+            }
+        }
+        static const bool q8_rowpair_enabled = []() {
+            const char* env = std::getenv("DENSECORE_ENABLE_Q8_ROWPAIR_VEC_DOT");
+            return env && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
+                   std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
+        }();
         const bool can_use_rowpair =
 #if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_MATMUL_INT8)
-            weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K &&
+            ((weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K) ||
+             (q8_rowpair_enabled && weight_type == GGML_TYPE_Q8_0 && ud->input_quant_type == GGML_TYPE_Q8_0)) &&
             (N % ggml_blck_size(weight_type)) == 0;
 #else
             false;
@@ -872,7 +1001,7 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
         return;
     }
 
-    const int n_head_kv = ud->cache->n_head_kv;
+    const int n_head_kv = ud->n_head_kv > 0 ? ud->n_head_kv : ud->cache->n_head_kv;
     const int n_head_total = ud->n_head;
     const int head_dim = ud->head_dim;
     const int v_head_dim = ud->v_head_dim > 0 ? ud->v_head_dim : ud->head_dim;
@@ -980,10 +1109,11 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
             for (int d = 0; d < head_dim; ++d) {
                 dot += q_head[d] * k_head[d];
             }
-            float score = dot * scale;
+            float score = dot;
             if (ud->logit_softcap > 0.0f && std::isfinite(score)) {
                 score = std::tanh(score / ud->logit_softcap) * ud->logit_softcap;
             }
+            score *= scale;
             scores[static_cast<size_t>(t)] = score;
             if (std::isfinite(score) && score > max_score) {
                 max_score = score;
@@ -1062,7 +1192,7 @@ static void LogPagedAttentionEagerReferenceProbe(const PagedAttentionUserData* u
         return;
     }
 
-    const int n_head_kv = ud->cache->n_head_kv;
+    const int n_head_kv = ud->n_head_kv > 0 ? ud->n_head_kv : ud->cache->n_head_kv;
     const int v_head_dim = ud->v_head_dim > 0 ? ud->v_head_dim : ud->head_dim;
     if (n_head_kv <= 0 || ud->n_head % n_head_kv != 0 || v_head_dim <= 0) {
         return;
@@ -1197,7 +1327,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         return;
     }
 
-    const int n_head_kv = ud->cache->n_head_kv;
+    const int n_head_kv = ud->n_head_kv > 0 ? ud->n_head_kv : ud->cache->n_head_kv;
     if (n_head_kv <= 0 || (ud->n_head % n_head_kv) != 0) {
         if (ith == 0) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
@@ -1518,7 +1648,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                         cached_block_table = &block_table;
                         cached_pos_i = pos_i;
                         KVRetentionPolicy retention_policy = GetKVRetentionPolicy();
-                        if (ud->force_full_history || ud->sliding_window >= 0) {
+                        if (ud->force_full_history) {
                             retention_policy.enabled = false;
                             retention_policy.sliding_window = -1;
                             retention_policy.sink_tokens = 0;
@@ -1534,6 +1664,13 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                                             densecore::env::ParseIntEnv("DENSECORE_SINK_TOKENS", 0)));
                         cached_attention_mask_span =
                             densecore::llm::config::ComputeKVRetentionSpan(n_past_i, attention_mask_policy);
+                        if (ud->sliding_window >= 0) {
+                            // Sliding-window attention must read the same logical
+                            // tail tokens it masks as visible. Keeping full
+                            // history here made long prompts read early KV slots
+                            // while labeling them as tail positions.
+                            cached_retained_span = cached_attention_mask_span;
+                        }
                         cached_retention_truncated = cached_retained_span.history_kept < n_past_i;
                         cached_noncontiguous_retention =
                             cached_retention_truncated && cached_retained_span.sink_kept > 0;
@@ -1593,7 +1730,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         densecore::hwy_kernels::PagedAttention_Hwy(
             q_token, shared_k_block_ptrs_data ? shared_k_block_ptrs_data : k_block_ptrs.data(),
             shared_v_block_ptrs_data ? shared_v_block_ptrs_data : v_block_ptrs.data(), cache_type_id, ud->n_head,
-            ud->head_dim, v_head_dim, ud->cache->n_head_kv, static_cast<int32_t>(block_table.size()),
+            ud->head_dim, v_head_dim, n_head_kv, static_cast<int32_t>(block_table.size()),
             cached_context_len, cached_context_start_pos, cached_pos_i, ud->sliding_window,
             cached_attention_mask_span.history_kept, cached_attention_mask_span.sink_kept,
             cached_attention_mask_span.tail_start,
@@ -1698,7 +1835,7 @@ void cb_glm_dsa_attention_custom(struct ggml_tensor* dst, int ith, int nth, void
 
     const int q_tokens = static_cast<int>(q_tensor->ne[2]);
     const int n_head = ud->n_head;
-    const int n_head_kv = ud->cache->n_head_kv;
+    const int n_head_kv = ud->n_head_kv > 0 ? ud->n_head_kv : ud->cache->n_head_kv;
     const int head_dim = ud->head_dim;
     const int v_head_dim = ud->v_head_dim > 0 ? ud->v_head_dim : ud->head_dim;
     const int index_n_heads = ud->index_n_heads;
@@ -2481,10 +2618,10 @@ static void ComputeFlashAttentionReference(const float* q, const float* k, const
                 for (int d = 0; d < head_dim; ++d) {
                     score += q_row[d] * k_row[d];
                 }
-                score *= scale;
                 if (logit_softcap > 0.0f) {
                     score = std::tanh(score / logit_softcap) * logit_softcap;
                 }
+                score *= scale;
                 scores[static_cast<size_t>(tk)] = score;
                 row_max = std::max(row_max, score);
             }
@@ -2805,8 +2942,9 @@ struct ggml_tensor* ggml_flash_attention_hal(struct ggml_context* ctx, struct gg
     result->src[1] = K;
     result->src[2] = V;
 
+    const int n_tasks = preferred_device == densecore::DeviceType::CPU ? GGML_N_TASKS_MAX : 1;
     HalAttentionCustomParams params = {cb_flash_attention_hal_custom,
-                                       1,
+                                       n_tasks,
                                        nullptr,
                                        {scale, n_head_kv, q_start_offset, kv_start_offset, sliding_window, logit_softcap,
                                         semantic_flags,
@@ -3326,6 +3464,14 @@ inline struct ggml_tensor* ggml_mul_mat_fp8(struct ggml_context* ctx, struct ggm
  */
 struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* weight, struct ggml_tensor* input,
                                   TransformerModel* model) {
+    bool using_cpu_repack_alias = false;
+    if (model && input && input->type == GGML_TYPE_F32) {
+        auto it_repack = model->cpu_repack_aliases.find(weight);
+        if (it_repack != model->cpu_repack_aliases.end() && it_repack->second) {
+            weight = it_repack->second;
+            using_cpu_repack_alias = true;
+        }
+    }
     const int M = static_cast<int>(input->ne[1]);
     const int K_dim = static_cast<int>(weight->ne[0]);
     const int N_dim = static_cast<int>(weight->ne[1]);
@@ -3360,6 +3506,12 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     if (is_hybrid_ssm_qkv && ShouldForcePlainGgmlForHybridSSMQkv()) {
         LogMatmulDispatch(w_name, "PLAIN_GGML", M, N_dim, K_dim, "CONSERVATIVE_FALLBACK");
         LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "PLAIN_GGML_CONSERVATIVE_FALLBACK", false, false, false);
+        return ggml_mul_mat(ctx, weight, input);
+    }
+
+    if (using_cpu_repack_alias) {
+        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
+                          "GGML_CPU_REPACK");
         return ggml_mul_mat(ctx, weight, input);
     }
 
@@ -3520,6 +3672,10 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                           ggml_is_quantized(weight->type) ? "GEMV_QUANT" : "GEMV_F32");
         GemvUserData* ud = GetGemvUserData();
         ud->force_reference_scalar = false;
+        const bool gemma4_q8_repacked_enabled =
+            densecore::env::ParseNonZeroEnv("DENSECORE_GEMMA4_ENABLE_Q8_REPACKED_GEMV", false);
+        ud->disable_q8_repacked_gemv = model && model->arch_flags.is_gemma4 && !gemma4_q8_repacked_enabled &&
+                                       !IsGemma4SharedDenseFfnWeightName(w_name);
         LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
                                 ggml_is_quantized(weight->type) ? "GEMV_QUANT" : "GEMV_F32", false, false, false);
         return ggml_mul_mat_gemv(ctx, weight, input, ud);

@@ -123,17 +123,26 @@ bool ResolvePagedDecodeHeadDims(const TransformerModel* model, int* n_head_out, 
     if (!model || !n_head_out || !n_head_kv_out || !head_dim_q_out || !head_dim_kv_out) {
         return false;
     }
+    const int n_head = model->hparams.n_head;
+    int n_head_kv = model->hparams.n_head_kv;
+    if (n_head <= 0) {
+        return false;
+    }
     if (!model->gemma4_layer_n_head_kv.empty()) {
-        for (size_t i = 0; i < model->gemma4_layer_n_head_kv.size(); ++i) {
-            const uint32_t layer_n_head_kv = model->gemma4_layer_n_head_kv[i];
-            if (layer_n_head_kv > 0 && layer_n_head_kv != model->hparams.n_head_kv) {
+        for (uint32_t layer_n_head_kv : model->gemma4_layer_n_head_kv) {
+            if (layer_n_head_kv == 0) {
                 return false;
+            }
+            const int layer_heads = static_cast<int>(layer_n_head_kv);
+            if ((n_head % layer_heads) != 0) {
+                return false;
+            }
+            if (n_head_kv <= 0) {
+                n_head_kv = layer_heads;
             }
         }
     }
-    const int n_head = model->hparams.n_head;
-    const int n_head_kv = model->hparams.n_head_kv;
-    if (n_head <= 0 || n_head_kv <= 0) {
+    if (n_head_kv <= 0 || (n_head % n_head_kv) != 0) {
         return false;
     }
 
@@ -231,7 +240,7 @@ bool ShouldBypassSingleRequestFastPathForLongHybridSSM(const TransformerModel* m
     if (densecore::env::ParseNonZeroEnv("DENSECORE_DISABLE_SINGLE_REQ_FAST_PATH_FOR_LONG_HYBRID_SSM", false)) {
         return true;
     }
-    return req->n_past > 0 || static_cast<int>(req->tokens.size()) > BLOCK_SIZE;
+    return req->is_prefill && static_cast<int>(req->tokens.size()) > BLOCK_SIZE;
 }
 
 bool IsBenchmarkFastPathEnabled() {
@@ -409,11 +418,15 @@ bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model) {
     if (!model) {
         return false;
     }
-    // Gemma4 and hybrid-SSM graphs still contain request-local custom-op
-    // userdata on model-specific attention/state paths. Keep paged decode
-    // enabled, but rebuild the graph per step until those nodes have complete
-    // runtime rebind coverage.
-    if (model->arch_flags.is_gemma4 || model->arch_flags.is_hybrid_ssm) {
+    // Gemma4 graph reuse is safe only when every decode attention layer uses
+    // paged attention. Mixed sliding-paged + full standard attention embeds
+    // n_past-dependent graph shapes and drifts when reused across tokens.
+    if (model->arch_flags.is_gemma4) {
+        return densecore::models::SupportsPagedDecodeAttention(model);
+    }
+    // Hybrid-SSM graphs still contain request-local state pointers until all
+    // runtime rebind coverage is complete.
+    if (model->arch_flags.is_hybrid_ssm) {
         return false;
     }
     return true;
@@ -769,6 +782,35 @@ DecodeThreadPolicySelection ResolveDecodeThreadPolicySelection(const Transformer
         ResolveAutoDecodeThreadsForBatchWithSimd(num_seqs, physical_core_count, base_threads, simd_level);
     selection.label = "decode_batch_auto";
 
+    const bool gemma4_moe_single_request =
+        model && model->arch_flags.is_gemma4 && model->hparams.n_experts > 0 && num_seqs == 1;
+    if (gemma4_moe_single_request && IsWideSimdLevel(simd_level)) {
+        const int cap = CapThreadsToAvailableCores(physical_core_count, base_threads);
+        const int env_override = densecore::env::ParsePositiveEnvInt("DENSECORE_GEMMA4_SINGLE_DECODE_THREADS", 0);
+        if (env_override > 0) {
+            selection.threads = std::max(1, std::min(cap, env_override));
+            selection.label = "decode_gemma4_a4b_env_override";
+            return selection;
+        }
+
+        const bool arm_c4a_wide_simd =
+            densecore::simd::IsArmFamily(simd_level) &&
+            (simd_level == densecore::simd::SimdLevel::SVE || simd_level == densecore::simd::SimdLevel::SVE2);
+        if (arm_c4a_wide_simd && physical_core_count >= 16 && cap >= 16) {
+            selection.threads = 16;
+            selection.label = "decode_gemma4_a4b_c4a_moe_16";
+            return selection;
+        }
+        if (arm_c4a_wide_simd && cap >= 12) {
+            selection.threads = 12;
+            selection.label = "decode_gemma4_a4b_arm_safe_cap";
+            return selection;
+        }
+        selection.threads = std::max(1, std::min(cap, 8));
+        selection.label = "decode_gemma4_a4b_safe_cap";
+        return selection;
+    }
+
     if (!IsQwen36HybridSsmSingleRequest(model, num_seqs)) {
         return selection;
     }
@@ -816,12 +858,58 @@ int ResolveAutoDecodeThreadsForBatch(int num_seqs, int physical_core_count, int 
 
 bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const PagedKVCache* cache,
                                          const BatchSpec& batch) {
-    if (!model || !cache || model->arch_flags.is_glm_dsa || !densecore::models::SupportsPagedDecodeAttention(model)) {
+    static std::atomic<int> debug_budget{densecore::env::ParsePositiveEnvInt(
+        "DENSECORE_DEBUG_DECODE_GRAPH_CACHE_STABILITY_MAX", 0)};
+    const auto debug_fail = [&](const char* reason, int n_tokens_in_batch = -1, int n_head = 0, int n_head_kv = 0,
+                                int head_dim_q = 0, int head_dim_kv = 0) {
+        int remaining = debug_budget.load(std::memory_order_relaxed);
+        while (remaining > 0 &&
+               !debug_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
+        }
+        if (remaining > 0) {
+            std::cerr << "[DecodeGraphCacheStability] stable=0 reason=" << (reason ? reason : "unknown")
+                      << " num_seqs=" << batch.num_seqs << " tokens=" << batch.tokens.size()
+                      << " n_tokens_in_batch=" << n_tokens_in_batch << " n_head=" << n_head
+                      << " n_head_kv=" << n_head_kv << " head_dim_q=" << head_dim_q
+                      << " head_dim_kv=" << head_dim_kv << " has_cache=" << (cache ? 1 : 0);
+            if (cache) {
+                std::cerr << " max_blocks=" << cache->max_blocks << " cache_type=" << static_cast<int>(cache->cache_type);
+            }
+            if (!batch.seq_id.empty()) {
+                std::cerr << " seq0=" << batch.seq_id[0];
+            }
+            if (!batch.pos.empty()) {
+                std::cerr << " pos0=" << batch.pos[0];
+            }
+            if (!batch.n_past.empty()) {
+                std::cerr << " n_past0=" << batch.n_past[0];
+            }
+            if (!batch.block_tables.empty()) {
+                std::cerr << " block_table0_size=" << batch.block_tables[0].size();
+                if (!batch.block_tables[0].empty()) {
+                    std::cerr << " block0=" << batch.block_tables[0][0];
+                }
+            }
+            std::cerr << std::endl;
+        }
         return false;
+    };
+
+    if (!model) {
+        return debug_fail("missing_model");
+    }
+    if (!cache) {
+        return debug_fail("missing_cache");
+    }
+    if (model->arch_flags.is_glm_dsa) {
+        return debug_fail("glm_dsa");
+    }
+    if (!densecore::models::SupportsPagedDecodeAttention(model)) {
+        return debug_fail("unsupported_model");
     }
     const int n_tokens_in_batch = static_cast<int>(batch.tokens.size());
     if (!IsDecodeOnlyBatchLayout(batch, n_tokens_in_batch)) {
-        return false;
+        return debug_fail("non_decode_layout", n_tokens_in_batch);
     }
 
     int n_head = 0;
@@ -829,10 +917,16 @@ bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const Pa
     int head_dim_q = 0;
     int head_dim_kv = 0;
     if (!ResolvePagedDecodeHeadDims(model, &n_head, &n_head_kv, &head_dim_q, &head_dim_kv)) {
-        return false;
+        return debug_fail("head_dim_resolve_failed", n_tokens_in_batch, n_head, n_head_kv, head_dim_q, head_dim_kv);
     }
-    if (!IsPagedDecodeCandidate(cache, batch, n_tokens_in_batch, n_head, n_head_kv, head_dim_q, head_dim_kv)) {
-        return false;
+    // Gemma4 carries fixed heterogeneous attention shapes; the actual per-layer
+    // paged-decode graph is deterministic, but the generic topology candidate
+    // helper only needs a shape-compatible head tuple to validate sequence and
+    // block-table invariants.
+    const int candidate_head_dim_kv = model->arch_flags.is_gemma4 ? head_dim_q : head_dim_kv;
+    if (!IsPagedDecodeCandidate(cache, batch, n_tokens_in_batch, n_head, n_head_kv, head_dim_q,
+                                candidate_head_dim_kv)) {
+        return debug_fail("paged_candidate_failed", n_tokens_in_batch, n_head, n_head_kv, head_dim_q, head_dim_kv);
     }
 
     if (batch.num_seqs > 1) {

@@ -207,6 +207,11 @@ bool IsLikelyControlTokenLiteral(const std::string& token) {
     return false;
 }
 
+bool IsGemma4GenerationChannelToken(const TransformerModel* model, const std::string& token) {
+    return model && densecore::models::DescribeModel(model).variant == ModelVariant::GEMMA4 &&
+           (token == "<|channel>" || token == "<channel|>");
+}
+
 bool IsAtomicSpecialTokenLiteral(const TransformerModel* model, const std::string& token) {
     if (!model || token.empty()) {
         return false;
@@ -363,6 +368,10 @@ std::string DetokenizeImpl(const TransformerModel* model, int token_id) {
     }
 
     const std::string& token = model->vocab_tokens[static_cast<size_t>(token_id)];
+
+    if (IsGemma4GenerationChannelToken(model, token)) {
+        return token;
+    }
 
     if (token_id < static_cast<int>(model->token_types.size())) {
         const int32_t token_type = model->token_types[static_cast<size_t>(token_id)];

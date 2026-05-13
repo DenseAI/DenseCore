@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <memory>
+#include <string>
 
 #include "densecore/models/decoder_model_spec.h"
 #include "densecore/models/model_descriptor.h"
@@ -59,10 +61,68 @@ BatchSpec MakeDecodeBatch(int num_seqs, int n_past) {
     return batch;
 }
 
+class ScopedEnvOverride {
+public:
+    ScopedEnvOverride(const char* name, const char* value) : name_(name ? name : "") {
+        const char* prev = std::getenv(name_.c_str());
+        if (prev) {
+            had_prev_ = true;
+            prev_value_ = prev;
+        }
+        Set(value);
+    }
+
+    ~ScopedEnvOverride() {
+        Set(had_prev_ ? prev_value_.c_str() : nullptr);
+    }
+
+private:
+    void Set(const char* value) {
+#ifdef _WIN32
+        _putenv_s(name_.c_str(), value ? value : "");
+#else
+        if (value) {
+            setenv(name_.c_str(), value, 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+#endif
+    }
+
+    std::string name_;
+    bool had_prev_ = false;
+    std::string prev_value_;
+};
+
+TransformerModel MakeGemma4LayerPolicyModel() {
+    TransformerModel model = MakeModel(ModelArch::GEMMA, true);
+    model.gemma4_layer_is_sliding = {1, 0};
+    return model;
+}
+
+densecore::llm::attention::DecodeAttentionDispatchDecision ResolveLayerDispatch(const TransformerModel& model,
+                                                                                 int layer_idx) {
+    densecore::llm::attention::BasePagedDecodeExecutionDecision base{};
+    base.paged_decode_supported = true;
+    base.decode_only_batch = true;
+    base.use_paged_decode_attention = true;
+    base.paged_decode_decision.candidate = true;
+    base.paged_decode_decision.requested = true;
+    return densecore::llm::attention::ResolveDecodeAttentionDispatchDecision(
+        &model, base, /*use_cache=*/true, layer_idx, /*n_tokens_in_batch=*/1, /*n_past_val=*/32,
+        /*n_head=*/16, /*n_head_kv=*/8, /*head_dim_q=*/256, /*head_dim_kv=*/256, /*head_dim_v=*/256,
+        densecore::DeviceType::CPU, /*flash_attention_disabled=*/true, /*flash_attention_forced=*/false,
+        /*flash_attention_isa_supported=*/false, /*portable_cpu_flash_attention_enabled=*/false,
+        /*ops_registry_initialized=*/false, /*force_safe_gqa_decode_enabled=*/false,
+        /*debug_disable_fast_attn_from_layer=*/-1, /*qcur_contiguous=*/true, /*k_contiguous=*/true,
+        /*v_contiguous=*/true, /*single_seq_layout=*/true);
+}
+
 }  // namespace
 
-TEST(AttentionPolicyTest, Gemma4SoftcapDefaultsToFifty) {
+TEST(AttentionPolicyTest, Gemma4TextAttentionSoftcapMatchesLoadedMetadata) {
     TransformerModel gemma4 = MakeModel(ModelArch::GEMMA, true);
+    gemma4.gemma4_attention_logit_softcapping = 50.0f;
     EXPECT_FLOAT_EQ(densecore::llm::attention::ResolveGemma4AttentionLogitSoftcapRuntime(&gemma4), 50.0f);
 }
 
@@ -70,6 +130,22 @@ TEST(AttentionPolicyTest, PagedFallbackReasonNameMatchesPolicyOff) {
     EXPECT_STREQ(densecore::llm::attention::DecodePagedFallbackReasonName(
                      densecore::llm::attention::DecodePagedFallbackReason::PolicyOff),
                  "policy_off");
+}
+
+TEST(AttentionPolicyTest, Gemma4PagedDecodeDefaultsToAllLayers) {
+    ScopedEnvOverride layer_mode("DENSECORE_GEMMA4_PAGED_DECODE_LAYER_MODE", nullptr);
+    const TransformerModel gemma4 = MakeGemma4LayerPolicyModel();
+
+    EXPECT_TRUE(ResolveLayerDispatch(gemma4, 0).use_paged_decode_attention);
+    EXPECT_TRUE(ResolveLayerDispatch(gemma4, 1).use_paged_decode_attention);
+}
+
+TEST(AttentionPolicyTest, Gemma4PagedDecodeLayerModeAllUsesEveryLayer) {
+    ScopedEnvOverride layer_mode("DENSECORE_GEMMA4_PAGED_DECODE_LAYER_MODE", "all");
+    const TransformerModel gemma4 = MakeGemma4LayerPolicyModel();
+
+    EXPECT_TRUE(ResolveLayerDispatch(gemma4, 0).use_paged_decode_attention);
+    EXPECT_TRUE(ResolveLayerDispatch(gemma4, 1).use_paged_decode_attention);
 }
 
 TEST(AttentionPolicyTest, BaseDecisionRejectsInvalidDecodeLayout) {

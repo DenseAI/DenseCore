@@ -34,7 +34,7 @@ func Resolve(name string) Profile {
 			Description:                "Cloud-native CPU inference engine with OpenAI-compatible API",
 			EnableLLMAPI:               true,
 			EnableModelLifecycleProbes: true,
-			EnableGRPC:                 true,
+			EnableGRPC:                 false,
 		}
 	}
 }

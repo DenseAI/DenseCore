@@ -335,6 +335,7 @@ struct SamplingParams {
     float repetition_penalty = 1.0f;
     float frequency_penalty = 0.0f;
     float presence_penalty = 0.0f;
+    float final_logit_softcap = 0.0f;
 
     // Optional vocab subrange restriction for action-token decoding.
     // When action_token_count > 0, sampling is restricted to:

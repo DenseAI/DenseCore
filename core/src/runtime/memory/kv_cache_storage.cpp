@@ -17,6 +17,69 @@ std::vector<float>& GetKVFloatScratch(size_t elements) {
     return scratch;
 }
 
+void PackLayerSlotsToStorageLayout(float* dst, const float* src, int num_slots, int storage_head_dim,
+                                   int storage_heads, int layer_head_dim, int layer_heads) {
+    const int storage_elems = storage_head_dim * storage_heads;
+    const int layer_elems = layer_head_dim * layer_heads;
+    std::fill(dst, dst + static_cast<size_t>(storage_elems) * static_cast<size_t>(num_slots), 0.0f);
+    for (int s = 0; s < num_slots; ++s) {
+        float* slot_dst = dst + static_cast<size_t>(s) * static_cast<size_t>(storage_elems);
+        const float* slot_src = src + static_cast<size_t>(s) * static_cast<size_t>(layer_elems);
+        for (int h = 0; h < layer_heads; ++h) {
+            std::memcpy(slot_dst + static_cast<size_t>(h) * static_cast<size_t>(storage_head_dim),
+                        slot_src + static_cast<size_t>(h) * static_cast<size_t>(layer_head_dim),
+                        static_cast<size_t>(layer_head_dim) * sizeof(float));
+        }
+    }
+}
+
+void UnpackStorageSlotsToLayerLayout(float* dst, const float* src, int num_slots, int storage_head_dim,
+                                     int storage_heads, int layer_head_dim, int layer_heads) {
+    (void)storage_heads;
+    const int storage_elems = storage_head_dim * storage_heads;
+    const int layer_elems = layer_head_dim * layer_heads;
+    for (int s = 0; s < num_slots; ++s) {
+        const float* slot_src = src + static_cast<size_t>(s) * static_cast<size_t>(storage_elems);
+        float* slot_dst = dst + static_cast<size_t>(s) * static_cast<size_t>(layer_elems);
+        for (int h = 0; h < layer_heads; ++h) {
+            std::memcpy(slot_dst + static_cast<size_t>(h) * static_cast<size_t>(layer_head_dim),
+                        slot_src + static_cast<size_t>(h) * static_cast<size_t>(storage_head_dim),
+                        static_cast<size_t>(layer_head_dim) * sizeof(float));
+        }
+    }
+}
+
+void WriteLayerSlotsToF16Storage(ggml_fp16_t* dst, const float* src, int num_slots, int storage_head_dim,
+                                 int storage_heads, int layer_head_dim, int layer_heads) {
+    const int storage_elems = storage_head_dim * storage_heads;
+    const int layer_elems = layer_head_dim * layer_heads;
+    std::fill(dst, dst + static_cast<size_t>(storage_elems) * static_cast<size_t>(num_slots), ggml_fp16_t(0));
+    for (int s = 0; s < num_slots; ++s) {
+        ggml_fp16_t* slot_dst = dst + static_cast<size_t>(s) * static_cast<size_t>(storage_elems);
+        const float* slot_src = src + static_cast<size_t>(s) * static_cast<size_t>(layer_elems);
+        for (int h = 0; h < layer_heads; ++h) {
+            densecore::simd::ConvertF32ToF16(slot_dst + static_cast<size_t>(h) * static_cast<size_t>(storage_head_dim),
+                                             slot_src + static_cast<size_t>(h) * static_cast<size_t>(layer_head_dim),
+                                             layer_head_dim);
+        }
+    }
+}
+
+void ReadLayerSlotsFromF16Storage(float* dst, const ggml_fp16_t* src, int num_slots, int storage_head_dim,
+                                  int storage_heads, int layer_head_dim, int layer_heads) {
+    const int storage_elems = storage_head_dim * storage_heads;
+    const int layer_elems = layer_head_dim * layer_heads;
+    for (int s = 0; s < num_slots; ++s) {
+        const ggml_fp16_t* slot_src = src + static_cast<size_t>(s) * static_cast<size_t>(storage_elems);
+        float* slot_dst = dst + static_cast<size_t>(s) * static_cast<size_t>(layer_elems);
+        for (int h = 0; h < layer_heads; ++h) {
+            densecore::simd::ConvertF16ToF32(
+                slot_dst + static_cast<size_t>(h) * static_cast<size_t>(layer_head_dim),
+                slot_src + static_cast<size_t>(h) * static_cast<size_t>(storage_head_dim), layer_head_dim);
+        }
+    }
+}
+
 }  // namespace
 
 size_t PagedKVCache::GetBytesPerSlot() const {
@@ -500,10 +563,31 @@ void PagedKVCache::WriteKSlots(int block_id, int layer, int start_slot, int num_
     const int layer_n_head_kv = GetHeadCountForLayer(layer);
     const int layer_head_dim = GetHeadDimForLayer(layer);
     if (layer_n_head_kv != n_head_kv || layer_head_dim != head_dim) {
-        const int elems_per_slot = GetElementsPerSlot(layer);
-        for (int i = 0; i < num_slots; ++i) {
-            WriteKSlot(block_id, layer, start_slot + i, data + static_cast<size_t>(i) * elems_per_slot);
+        if (!UseKVBulkSlotPath()) {
+            const int elems_per_slot = GetElementsPerSlot(layer);
+            for (int i = 0; i < num_slots; ++i) {
+                WriteKSlot(block_id, layer, start_slot + i, data + static_cast<size_t>(i) * elems_per_slot);
+            }
+            return;
         }
+        void* ptr = GetKSlotPtr(block_id, layer, start_slot);
+        if (!ptr) return;
+        RecordKVWriteBulkUsage(num_slots);
+        if (cache_type == GGML_TYPE_F16) {
+            WriteLayerSlotsToF16Storage(static_cast<ggml_fp16_t*>(ptr), data, num_slots, head_dim, n_head_kv,
+                                        layer_head_dim, layer_n_head_kv);
+            return;
+        }
+        if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+            auto& padded = GetKVFloatScratch(static_cast<size_t>(GetElementsPerSlot()) * static_cast<size_t>(num_slots));
+            PackLayerSlotsToStorageLayout(padded.data(), data, num_slots, head_dim, n_head_kv, layer_head_dim,
+                                          layer_n_head_kv);
+            ggml_quantize_chunk(cache_type, padded.data(), ptr, 0,
+                                static_cast<int64_t>(num_slots) * static_cast<int64_t>(n_head_kv), head_dim, nullptr);
+            return;
+        }
+        PackLayerSlotsToStorageLayout(static_cast<float*>(ptr), data, num_slots, head_dim, n_head_kv, layer_head_dim,
+                                      layer_n_head_kv);
         return;
     }
     if (!UseKVBulkSlotPath()) {
@@ -559,10 +643,32 @@ void PagedKVCache::WriteVSlots(int block_id, int layer, int start_slot, int num_
     const int layer_n_head_kv = GetHeadCountForLayer(layer);
     const int layer_head_dim = GetVHeadDimForLayer(layer);
     if (layer_n_head_kv != n_head_kv || layer_head_dim != v_head_dim) {
-        const int elems_per_slot = GetVElementsPerSlot(layer);
-        for (int i = 0; i < num_slots; ++i) {
-            WriteVSlot(block_id, layer, start_slot + i, data + static_cast<size_t>(i) * elems_per_slot);
+        if (!UseKVBulkSlotPath()) {
+            const int elems_per_slot = GetVElementsPerSlot(layer);
+            for (int i = 0; i < num_slots; ++i) {
+                WriteVSlot(block_id, layer, start_slot + i, data + static_cast<size_t>(i) * elems_per_slot);
+            }
+            return;
         }
+        void* ptr = GetVSlotPtr(block_id, layer, start_slot);
+        if (!ptr) return;
+        RecordKVWriteBulkUsage(num_slots);
+        if (cache_type == GGML_TYPE_F16) {
+            WriteLayerSlotsToF16Storage(static_cast<ggml_fp16_t*>(ptr), data, num_slots, v_head_dim, n_head_kv,
+                                        layer_head_dim, layer_n_head_kv);
+            return;
+        }
+        if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+            auto& padded =
+                GetKVFloatScratch(static_cast<size_t>(GetVElementsPerSlot()) * static_cast<size_t>(num_slots));
+            PackLayerSlotsToStorageLayout(padded.data(), data, num_slots, v_head_dim, n_head_kv, layer_head_dim,
+                                          layer_n_head_kv);
+            ggml_quantize_chunk(cache_type, padded.data(), ptr, 0,
+                                static_cast<int64_t>(num_slots) * static_cast<int64_t>(n_head_kv), v_head_dim, nullptr);
+            return;
+        }
+        PackLayerSlotsToStorageLayout(static_cast<float*>(ptr), data, num_slots, v_head_dim, n_head_kv, layer_head_dim,
+                                      layer_n_head_kv);
         return;
     }
     if (!UseKVBulkSlotPath()) {
@@ -618,10 +724,38 @@ void PagedKVCache::ReadKSlots(int block_id, int layer, int start_slot, int num_s
     const int layer_n_head_kv = GetHeadCountForLayer(layer);
     const int layer_head_dim = GetHeadDimForLayer(layer);
     if (layer_n_head_kv != n_head_kv || layer_head_dim != head_dim) {
-        const int elems_per_slot = GetElementsPerSlot(layer);
-        for (int i = 0; i < num_slots; ++i) {
-            ReadKSlot(block_id, layer, start_slot + i, out + static_cast<size_t>(i) * elems_per_slot);
+        if (!UseKVBulkSlotPath()) {
+            const int elems_per_slot = GetElementsPerSlot(layer);
+            for (int i = 0; i < num_slots; ++i) {
+                ReadKSlot(block_id, layer, start_slot + i, out + static_cast<size_t>(i) * elems_per_slot);
+            }
+            return;
         }
+        const void* ptr = const_cast<PagedKVCache*>(this)->GetKSlotPtr(block_id, layer, start_slot);
+        if (!ptr) return;
+        RecordKVReadBulkUsage(num_slots);
+        if (cache_type == GGML_TYPE_F16) {
+            ReadLayerSlotsFromF16Storage(out, static_cast<const ggml_fp16_t*>(ptr), num_slots, head_dim, n_head_kv,
+                                         layer_head_dim, layer_n_head_kv);
+            return;
+        }
+        if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+            const auto* type_traits = ggml_get_type_traits(cache_type);
+            if (!type_traits || !type_traits->to_float) return;
+            const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(head_dim));
+            const auto* src = static_cast<const uint8_t*>(ptr);
+            auto& padded = GetKVFloatScratch(static_cast<size_t>(GetElementsPerSlot()) * static_cast<size_t>(num_slots));
+            for (int row = 0; row < num_slots * n_head_kv; ++row) {
+                type_traits->to_float(src + static_cast<size_t>(row) * head_stride,
+                                      padded.data() + static_cast<size_t>(row) * static_cast<size_t>(head_dim),
+                                      head_dim);
+            }
+            UnpackStorageSlotsToLayerLayout(out, padded.data(), num_slots, head_dim, n_head_kv, layer_head_dim,
+                                            layer_n_head_kv);
+            return;
+        }
+        UnpackStorageSlotsToLayerLayout(out, static_cast<const float*>(ptr), num_slots, head_dim, n_head_kv,
+                                        layer_head_dim, layer_n_head_kv);
         return;
     }
     if (!UseKVBulkSlotPath()) {
@@ -664,10 +798,39 @@ void PagedKVCache::ReadVSlots(int block_id, int layer, int start_slot, int num_s
     const int layer_n_head_kv = GetHeadCountForLayer(layer);
     const int layer_head_dim = GetVHeadDimForLayer(layer);
     if (layer_n_head_kv != n_head_kv || layer_head_dim != v_head_dim) {
-        const int elems_per_slot = GetVElementsPerSlot(layer);
-        for (int i = 0; i < num_slots; ++i) {
-            ReadVSlot(block_id, layer, start_slot + i, out + static_cast<size_t>(i) * elems_per_slot);
+        if (!UseKVBulkSlotPath()) {
+            const int elems_per_slot = GetVElementsPerSlot(layer);
+            for (int i = 0; i < num_slots; ++i) {
+                ReadVSlot(block_id, layer, start_slot + i, out + static_cast<size_t>(i) * elems_per_slot);
+            }
+            return;
         }
+        const void* ptr = const_cast<PagedKVCache*>(this)->GetVSlotPtr(block_id, layer, start_slot);
+        if (!ptr) return;
+        RecordKVReadBulkUsage(num_slots);
+        if (cache_type == GGML_TYPE_F16) {
+            ReadLayerSlotsFromF16Storage(out, static_cast<const ggml_fp16_t*>(ptr), num_slots, v_head_dim, n_head_kv,
+                                         layer_head_dim, layer_n_head_kv);
+            return;
+        }
+        if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
+            const auto* type_traits = ggml_get_type_traits(cache_type);
+            if (!type_traits || !type_traits->to_float) return;
+            const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(v_head_dim));
+            const auto* src = static_cast<const uint8_t*>(ptr);
+            auto& padded =
+                GetKVFloatScratch(static_cast<size_t>(GetVElementsPerSlot()) * static_cast<size_t>(num_slots));
+            for (int row = 0; row < num_slots * n_head_kv; ++row) {
+                type_traits->to_float(src + static_cast<size_t>(row) * head_stride,
+                                      padded.data() + static_cast<size_t>(row) * static_cast<size_t>(v_head_dim),
+                                      v_head_dim);
+            }
+            UnpackStorageSlotsToLayerLayout(out, padded.data(), num_slots, v_head_dim, n_head_kv, layer_head_dim,
+                                            layer_n_head_kv);
+            return;
+        }
+        UnpackStorageSlotsToLayerLayout(out, static_cast<const float*>(ptr), num_slots, v_head_dim, n_head_kv,
+                                        layer_head_dim, layer_n_head_kv);
         return;
     }
     if (!UseKVBulkSlotPath()) {

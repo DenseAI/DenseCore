@@ -108,11 +108,12 @@ func TestFormatChatPromptGemmaUsesTurnTemplate(t *testing.T) {
 		{Role: "user", Content: "안녕?"},
 	}, nil)
 
-	if strings.Contains(prompt, "<|turn>system\nYou are a helpful assistant.<turn|>\n") {
+	if strings.Contains(prompt, "<|turn>system\nYou are a helpful assistant.\n") {
 		t.Fatalf("expected no implicit gemma system prompt, got %q", prompt)
 	}
-	if prompt != "<bos><|turn>user\n안녕?<turn|>\n<|turn>model\n" {
-		t.Fatalf("expected bare gemma turn template, got %q", prompt)
+	expected := "<bos><|turn>user\n안녕?<turn|>\n<|turn>model\n"
+	if prompt != expected {
+		t.Fatalf("expected llama.cpp-compatible gemma turn template, got %q", prompt)
 	}
 }
 
@@ -136,8 +137,11 @@ func TestFormatChatPromptGemmaThinkingInjectsSystemThinkMarker(t *testing.T) {
 		{Role: "user", Content: "Hello"},
 	}, &domain.ChatTemplateKwargs{EnableThinking: &enableThinking})
 
-	if !strings.HasPrefix(prompt, "<bos><|turn>system\n<|think|><turn|>\n<|turn>user\nHello<turn|>\n") {
+	if !strings.HasPrefix(prompt, "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nHello<turn|>\n") {
 		t.Fatalf("expected gemma thinking marker in system turn, got %q", prompt)
+	}
+	if !strings.HasSuffix(prompt, "<|turn>model\n<|channel>thought\n<channel|>") {
+		t.Fatalf("expected gemma assistant channel cue, got %q", prompt)
 	}
 }
 
@@ -172,7 +176,7 @@ func TestFormatChatPromptQwen36NoThinkingUsesOfficialPromptWithoutDirective(t *t
 	if strings.Contains(prompt, "/no_think") {
 		t.Fatalf("expected qwen3.6 no-thinking prompt to avoid /no_think, got %q", prompt)
 	}
-	if prompt != "<|im_start|>user\n안녕?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n" {
+	if prompt != "<|im_start|>user\n안녕?<|im_end|>\n<|im_start|>assistant\n<think>\n" {
 		t.Fatalf("unexpected qwen3.6 no-thinking prompt: %q", prompt)
 	}
 }

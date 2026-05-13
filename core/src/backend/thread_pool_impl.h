@@ -24,6 +24,10 @@ namespace densecore {
 #define DENSECORE_THREADPOOL_DEBUG 0
 #endif
 
+namespace detail {
+inline thread_local const void* g_active_thread_pool = nullptr;
+}  // namespace detail
+
 /**
  * @brief NUMA-aware thread pool for CpuBackend parallelism
  *
@@ -114,13 +118,15 @@ public:
 
         // Single-threaded fast path
         const int active_threads = std::max(1, std::min(num_threads_, total_work));
-        if (active_threads <= 1) {
+        if (active_threads <= 1 || detail::g_active_thread_pool == this ||
+            active_parallel_dispatch_.load(std::memory_order_acquire)) {
             work_fn(0, total_work, 0);
             return;
         }
 
         // Ensure pool is initialized (thread-safe)
         EnsureInitialized();
+        active_parallel_dispatch_.store(true, std::memory_order_release);
 
         // Store work function and range
         current_work_fn_ = &work_fn;
@@ -156,6 +162,7 @@ public:
         active_threads_.store(1, std::memory_order_release);
         current_work_fn_ = nullptr;
         total_work_ = 0;
+        active_parallel_dispatch_.store(false, std::memory_order_release);
     }
 
     /**
@@ -164,12 +171,14 @@ public:
      */
     void ParallelGemv(float* output, const float* input, const float* weight, int K, int N) {
         const int active_threads = std::max(1, std::min(num_threads_, std::max(1, N)));
-        if (active_threads <= 1) {
+        if (active_threads <= 1 || detail::g_active_thread_pool == this ||
+            active_parallel_dispatch_.load(std::memory_order_acquire)) {
             simd::GemvParallel(output, input, weight, K, N, 0, 1);
             return;
         }
 
         EnsureInitialized();
+        active_parallel_dispatch_.store(true, std::memory_order_release);
 
         // Store GEMV parameters
         gemv_output_ = output;
@@ -208,6 +217,7 @@ public:
         gemv_weight_ = nullptr;
         gemv_K_ = 0;
         gemv_N_ = 0;
+        active_parallel_dispatch_.store(false, std::memory_order_release);
     }
 
 private:
@@ -311,6 +321,8 @@ private:
         // Workers are pinned in EnsureInitialized() via PinThreadPool().
         // Avoid re-pinning here to preserve per-pool NUMA binding.
 
+        const void* previous_pool = detail::g_active_thread_pool;
+        detail::g_active_thread_pool = this;
         uint64_t my_generation = 0;
 
         while (true) {
@@ -329,6 +341,7 @@ private:
 
             for (int spin = 0; spin < kSpinIterations; ++spin) {
                 if (shutdown_.load(std::memory_order_acquire)) {
+                    detail::g_active_thread_pool = previous_pool;
                     return;
                 }
                 // Check for new work without lock
@@ -351,7 +364,10 @@ private:
                 cv_work_.wait(
                     lock, [this, &my_generation] { return shutdown_ || (work_ready_ && generation_ > my_generation); });
 
-                if (shutdown_) return;
+                if (shutdown_) {
+                    detail::g_active_thread_pool = previous_pool;
+                    return;
+                }
             }
 
             // Important: Always update my_generation to the current generation
@@ -418,6 +434,7 @@ private:
     alignas(64) std::atomic<bool> shutdown_{false};    // lock-free spin check
     alignas(64) std::atomic<uint64_t> generation_{0};  // lock-free spin check
     alignas(64) std::atomic<int> active_threads_{1};
+    alignas(64) std::atomic<bool> active_parallel_dispatch_{false};
 
     // Work specification (generic parallel_for).
     //

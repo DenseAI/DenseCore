@@ -370,6 +370,13 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
             if (config.causal && (kv_base + j) > (q_base + i + q_len - 1)) {
                 continue;
             }
+            if (config.sliding_window >= 0) {
+                const int latest_key_pos = kv_base + kv_end - 1;
+                const int first_query_pos = q_base + i;
+                if (latest_key_pos < (first_query_pos - config.sliding_window)) {
+                    continue;
+                }
+            }
 
 // Step 1: Compute Q @ K^T for this tile
 // S_ij = Q[i:i+Br] @ K[j:j+Bc]^T * scale

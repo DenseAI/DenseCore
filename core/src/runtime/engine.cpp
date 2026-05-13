@@ -2,11 +2,13 @@
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <sstream>
 
@@ -126,6 +128,75 @@ std::unique_ptr<ModelEntry> MakeModelEntry(std::string model_id, std::string mod
 
 int ReadEnvInt(const char* name, int default_value, bool* was_set = nullptr) {
     return densecore::llm::config::ReadPositiveIntEnv(name, default_value, was_set);
+}
+
+size_t ReadAvailableMemoryMbForKVAutoSizing() {
+    const char* hint = std::getenv("DENSECORE_KV_AVAILABLE_MB_HINT");
+    if (hint && hint[0] != '\0') {
+        char* end = nullptr;
+        const unsigned long long hinted = std::strtoull(hint, &end, 10);
+        if (end != hint && hinted > 0) {
+            return static_cast<size_t>(hinted);
+        }
+    }
+#if defined(__linux__)
+    std::FILE* file = std::fopen("/proc/meminfo", "r");
+    if (!file) {
+        return 0;
+    }
+    char line[256] = {};
+    unsigned long long kb = 0;
+    while (std::fgets(line, sizeof(line), file)) {
+        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            std::fclose(file);
+            return static_cast<size_t>(kb / 1024ULL);
+        }
+    }
+    std::fclose(file);
+#endif
+    return 0;
+}
+
+size_t SaturatingMulSize(size_t a, size_t b) {
+    if (a == 0 || b == 0) {
+        return 0;
+    }
+    if (a > std::numeric_limits<size_t>::max() / b) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return a * b;
+}
+
+size_t ResolveAutoKVTargetMb(int max_num_seqs, size_t bytes_per_token, int max_seq_len) {
+    const size_t available_mb = ReadAvailableMemoryMbForKVAutoSizing();
+    if (available_mb == 0) {
+        return 512;
+    }
+
+    const size_t seqs = static_cast<size_t>(std::max(1, max_num_seqs));
+    constexpr size_t MB = 1024ULL * 1024ULL;
+    const size_t available_bytes = SaturatingMulSize(available_mb, MB);
+
+    // KV is one of several large resident pools. By default, keep the cache
+    // request-aware but leave automatic headroom for graph scratch, repack
+    // arenas, allocator metadata, and the OS. Explicit DENSECORE_KV_TARGET_MB
+    // remains the escape hatch for controlled experiments.
+    const size_t runtime_reserve_bytes = std::max<size_t>(available_bytes / 8, 512ULL * MB);
+    const size_t after_reserve_bytes =
+        available_bytes > runtime_reserve_bytes ? available_bytes - runtime_reserve_bytes : available_bytes / 2;
+    size_t total_kv_budget_bytes = after_reserve_bytes / 2;
+
+    if (bytes_per_token > 0 && max_seq_len > 0) {
+        const size_t requested_per_seq_bytes =
+            SaturatingMulSize(bytes_per_token, static_cast<size_t>(std::max(1, max_seq_len)));
+        const size_t requested_total_bytes = SaturatingMulSize(requested_per_seq_bytes, seqs);
+        if (requested_total_bytes > 0) {
+            total_kv_budget_bytes = std::min(total_kv_budget_bytes, requested_total_bytes);
+        }
+    }
+
+    const size_t per_seq_budget_mb = (total_kv_budget_bytes / seqs) / MB;
+    return std::max<size_t>(512, per_seq_budget_mb);
 }
 
 const densecore::llm::config::FastPathRuntimeConfig& ResolveFastPathRuntimeConfig(const EngineState* state) {
@@ -304,10 +375,8 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
     config.requested_cache_type = requested_cache_type;
     config.effective_cache_type = ResolveEffectiveKVCacheType(model, requested_cache_type);
     config.max_num_seqs = ReadEnvInt("DENSECORE_MAX_NUM_SEQS", 4);
-    config.max_seq_len = ReadEnvInt("DENSECORE_MAX_SEQ_LEN", 4096, &max_seq_len_env_set);
-
-    int target_mb = ReadEnvInt("DENSECORE_KV_TARGET_MB", 512);
-    config.target_kv_memory = static_cast<size_t>(target_mb) * 1024ULL * 1024ULL;
+    const int model_ctx = model ? std::max<int32_t>(1, model->hparams.n_ctx) : 4096;
+    config.max_seq_len = ReadEnvInt("DENSECORE_MAX_SEQ_LEN", model_ctx, &max_seq_len_env_set);
 
     const int k_head_dim = ResolveKVHeadDim(model);
     const int v_head_dim = ResolveKVValueHeadDim(model);
@@ -321,10 +390,23 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
         config.bytes_per_token = 1;
     }
 
+    bool target_mb_env_set = false;
+    int target_mb = ReadEnvInt("DENSECORE_KV_TARGET_MB", 0, &target_mb_env_set);
+    if (target_mb <= 0) {
+        target_mb =
+            static_cast<int>(ResolveAutoKVTargetMb(config.max_num_seqs, config.bytes_per_token, config.max_seq_len));
+    }
+    config.target_kv_memory = static_cast<size_t>(target_mb) * 1024ULL * 1024ULL;
+
     int optimal_seq_len = static_cast<int>(config.target_kv_memory / config.bytes_per_token);
     optimal_seq_len = std::max(256, std::min(optimal_seq_len, config.max_seq_len));
 
-    if (!max_seq_len_env_set && config.bytes_per_token < 1024) {
+    if (!target_mb_env_set && !max_seq_len_env_set) {
+        const size_t target_total_tokens =
+            (config.target_kv_memory * static_cast<size_t>(std::max(1, config.max_num_seqs))) / config.bytes_per_token;
+        optimal_seq_len = std::max(optimal_seq_len, static_cast<int>(target_total_tokens / static_cast<size_t>(std::max(1, config.max_num_seqs))));
+        optimal_seq_len = std::min(optimal_seq_len, config.max_seq_len);
+    } else if (!max_seq_len_env_set && config.bytes_per_token < 1024) {
         optimal_seq_len = std::min(optimal_seq_len * 2, 8192);
     }
 

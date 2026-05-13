@@ -29,6 +29,10 @@ bool ShouldRunMoESharedDenseBranch(const TransformerModel* model, const densecor
     if (!model || !ffn_gate || !ffn_up || !ffn_down) {
         return false;
     }
+    if (is_gemma4_moe &&
+        densecore::env::ParseNonZeroEnv("DENSECORE_GEMMA4_DISABLE_SHARED_DENSE_BRANCH", false)) {
+        return false;
+    }
     if (layer_spec) {
         return layer_spec->ffn.has_shared_dense_branch;
     }
@@ -57,6 +61,11 @@ constexpr const char* kGemma4PreMoeNormKey = "gemma4.pre_feedforward_layernorm_2
 constexpr const char* kGemma4PostSharedNormKey = "gemma4.post_feedforward_layernorm_1.weight";
 constexpr const char* kGemma4PostMoeNormKey = "gemma4.post_feedforward_layernorm_2.weight";
 constexpr const char* kGemma4PostFfnNormKey = "gemma4.post_feedforward_layernorm.weight";
+constexpr const char* kGemma4PackedGateUpExpertsWeightKey = "ffn_gate_up_exps.weight";
+constexpr const char* kGemma4PackedGateUpExpertsKey = "ffn_gate_up_exps";
+constexpr const char* kGemma4PackedDownExpertsWeightKey = "ffn_down_exps.weight";
+constexpr const char* kGemma4PackedDownExpertsKey = "ffn_down_exps";
+constexpr const char* kGemma4PackedDownExpertsScaleKey = "ffn_down_exps.scale";
 std::atomic<uint64_t> g_moe_graph_wiring_debug_counter{0};
 
 bool ShouldUsePrefillLastLogitsOnly(const TransformerModel* model, const BatchSpec& batch, int n_tokens) {
@@ -82,6 +91,237 @@ bool IsMoEWiringDebugEnabled() {
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
+}
+
+bool IsGemma4NativeMoEGraphEnabled() {
+    return true;
+}
+
+struct Gemma4PackedMoERoots {
+    ggml_tensor* gate_up = nullptr;
+    ggml_tensor* down = nullptr;
+    ggml_tensor* down_scale = nullptr;
+    densecore::gemma4::PackedExpertLayout layout{};
+};
+
+ggml_tensor* GetLayerTensorAny(TransformerLayer* layer, std::initializer_list<const char*> keys) {
+    if (!layer) {
+        return nullptr;
+    }
+    for (const char* key : keys) {
+        if (!key) {
+            continue;
+        }
+        if (ggml_tensor* tensor = layer->Get(key)) {
+            return tensor;
+        }
+    }
+    return nullptr;
+}
+
+bool ResolveGemma4PackedMoERoots(TransformerLayer* layer, Gemma4PackedMoERoots* roots) {
+    if (!layer || !roots) {
+        return false;
+    }
+    roots->gate_up = GetLayerTensorAny(layer, {kGemma4PackedGateUpExpertsWeightKey, kGemma4PackedGateUpExpertsKey});
+    roots->down = GetLayerTensorAny(layer, {kGemma4PackedDownExpertsWeightKey, kGemma4PackedDownExpertsKey});
+    roots->down_scale = GetLayerTensorAny(layer, {kGemma4PackedDownExpertsScaleKey});
+    if (!roots->gate_up || !roots->down || !roots->down_scale) {
+        return false;
+    }
+    std::string reason;
+    if (!densecore::gemma4::InferPackedExpertLayout(roots->gate_up, roots->down, &roots->layout, &reason)) {
+        if (IsMoEWiringDebugEnabled()) {
+            std::fprintf(stderr, "[Gemma4NativeMoE] packed root rejected: %s\n", reason.c_str());
+        }
+        return false;
+    }
+    return roots->layout.num_experts > 0 && roots->layout.hidden_dim > 0 && roots->layout.intermediate_dim > 0;
+}
+
+ggml_tensor* UseCpuRepackAliasIfAvailable(TransformerModel* model, ggml_tensor* tensor) {
+    if (!model || !tensor) {
+        return tensor;
+    }
+    auto it = model->cpu_repack_aliases.find(tensor);
+    return it == model->cpu_repack_aliases.end() ? tensor : it->second;
+}
+
+ggml_tensor* BuildGemma4PackedGateOrUp3DView(ggml_context* ctx, const Gemma4PackedMoERoots& roots,
+                                             bool up_projection) {
+    ggml_tensor* root = roots.gate_up;
+    const auto& layout = roots.layout;
+    if (!ctx || !root) {
+        return nullptr;
+    }
+    if (layout.gate_up_kind == densecore::gemma4::PackedGateUpLayoutKind::RowStacked3D) {
+        const size_t offset = up_projection ? static_cast<size_t>(layout.intermediate_dim) *
+                                                  static_cast<size_t>(root->nb[1])
+                                            : 0;
+        return ggml_view_3d(ctx, root, layout.hidden_dim, layout.intermediate_dim, layout.num_experts, root->nb[1],
+                            root->nb[2], offset);
+    }
+    if (layout.gate_up_kind == densecore::gemma4::PackedGateUpLayoutKind::PlaneSeparated4D) {
+        const size_t offset = up_projection ? static_cast<size_t>(root->nb[2]) : 0;
+        return ggml_view_3d(ctx, root, layout.hidden_dim, layout.intermediate_dim, layout.num_experts, root->nb[1],
+                            root->nb[3], offset);
+    }
+    return nullptr;
+}
+
+ggml_tensor* BuildGemma4PackedGateUpMerged3DView(ggml_context* ctx, const Gemma4PackedMoERoots& roots) {
+    ggml_tensor* root = roots.gate_up;
+    const auto& layout = roots.layout;
+    if (!ctx || !root) {
+        return nullptr;
+    }
+    const int64_t merged_rows = layout.intermediate_dim * 2;
+    if (layout.gate_up_kind == densecore::gemma4::PackedGateUpLayoutKind::RowStacked3D) {
+        return ggml_view_3d(ctx, root, layout.hidden_dim, merged_rows, layout.num_experts, root->nb[1], root->nb[2],
+                            0);
+    }
+    if (layout.gate_up_kind == densecore::gemma4::PackedGateUpLayoutKind::PlaneSeparated4D &&
+        root->nb[2] == root->nb[1] * layout.intermediate_dim) {
+        return ggml_view_3d(ctx, root, layout.hidden_dim, merged_rows, layout.num_experts, root->nb[1], root->nb[3],
+                            0);
+    }
+    return nullptr;
+}
+
+ggml_tensor* BuildGemma4PackedDown3DView(ggml_context* ctx, const Gemma4PackedMoERoots& roots) {
+    ggml_tensor* root = roots.down;
+    const auto& layout = roots.layout;
+    if (!ctx || !root || layout.down_expert_axis < 0) {
+        return nullptr;
+    }
+    return ggml_view_3d(ctx, root, layout.intermediate_dim, layout.hidden_dim, layout.num_experts, root->nb[1],
+                        root->nb[layout.down_expert_axis], 0);
+}
+
+ggml_tensor* BuildGemma4PackedDownScaleRows(ggml_context* ctx, const Gemma4PackedMoERoots& roots) {
+    ggml_tensor* scale = roots.down_scale;
+    if (!ctx || !scale || scale->type != GGML_TYPE_F32 || scale->ne[0] != roots.layout.num_experts) {
+        return nullptr;
+    }
+    return ggml_reshape_2d(ctx, scale, 1, roots.layout.num_experts);
+}
+
+ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, TransformerModel* model,
+                                          TransformerLayer* layer, int layer_idx, ggml_tensor* routed_input,
+                                          ggml_tensor* gate_logits, int top_k) {
+    if (!ctx || !gf || !model || !layer || !routed_input || !gate_logits || !model->arch_flags.is_gemma4 ||
+        !IsGemma4NativeMoEGraphEnabled()) {
+        return nullptr;
+    }
+    Gemma4PackedMoERoots roots;
+    if (!ResolveGemma4PackedMoERoots(layer, &roots)) {
+        return nullptr;
+    }
+    roots.gate_up = UseCpuRepackAliasIfAvailable(model, roots.gate_up);
+    roots.down = UseCpuRepackAliasIfAvailable(model, roots.down);
+    std::string repack_reason;
+    if (!densecore::gemma4::InferPackedExpertLayout(roots.gate_up, roots.down, &roots.layout, &repack_reason)) {
+        if (IsMoEWiringDebugEnabled()) {
+            std::fprintf(stderr, "[Gemma4NativeMoE] CPU_REPACK alias rejected: %s\n", repack_reason.c_str());
+        }
+        return nullptr;
+    }
+    const int64_t n_tokens = routed_input->ne[1];
+    const int64_t n_embd = roots.layout.hidden_dim;
+    const int64_t n_expert_used = std::max<int64_t>(1, std::min<int64_t>(top_k, roots.layout.num_experts));
+    if (n_tokens <= 0 || routed_input->ne[0] != n_embd || gate_logits->ne[0] != roots.layout.num_experts ||
+        gate_logits->ne[1] != n_tokens) {
+        return nullptr;
+    }
+
+    ggml_tensor* gate_up_exps = BuildGemma4PackedGateUpMerged3DView(ctx, roots);
+    if (gate_up_exps && gate_up_exps->view_src && gate_up_exps->view_src->buffer && !gate_up_exps->buffer) {
+        ggml_backend_view_init(gate_up_exps);
+    }
+    ggml_tensor* gate_exps = nullptr;
+    ggml_tensor* up_exps = nullptr;
+    if (!gate_up_exps) {
+        gate_exps = BuildGemma4PackedGateOrUp3DView(ctx, roots, /*up_projection=*/false);
+        up_exps = BuildGemma4PackedGateOrUp3DView(ctx, roots, /*up_projection=*/true);
+        if (gate_exps && gate_exps->view_src && gate_exps->view_src->buffer && !gate_exps->buffer) {
+            ggml_backend_view_init(gate_exps);
+        }
+        if (up_exps && up_exps->view_src && up_exps->view_src->buffer && !up_exps->buffer) {
+            ggml_backend_view_init(up_exps);
+        }
+    }
+    ggml_tensor* down_exps = BuildGemma4PackedDown3DView(ctx, roots);
+    if (down_exps && down_exps->view_src && down_exps->view_src->buffer && !down_exps->buffer) {
+        ggml_backend_view_init(down_exps);
+    }
+    ggml_tensor* scale_rows = BuildGemma4PackedDownScaleRows(ctx, roots);
+    if ((!gate_up_exps && (!gate_exps || !up_exps)) || !down_exps || !scale_rows) {
+        return nullptr;
+    }
+
+    ggml_tensor* probs = ggml_soft_max(ctx, gate_logits);
+    ggml_set_name(probs, "gemma4_native_moe_probs");
+    ggml_tensor* selected_experts = ggml_argsort_top_k(ctx, probs, static_cast<int>(n_expert_used));
+    ggml_set_name(selected_experts, "gemma4_native_moe_topk");
+    probs = ggml_reshape_3d(ctx, probs, 1, roots.layout.num_experts, n_tokens);
+    ggml_tensor* weights = ggml_get_rows(ctx, probs, selected_experts);
+    weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+    ggml_tensor* weight_sum = ggml_sum_rows(ctx, weights);
+    weight_sum = ggml_clamp(ctx, weight_sum, 6.103515625e-5f, INFINITY);
+    weights = ggml_div(ctx, weights, weight_sum);
+    weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+
+    scale_rows = ggml_repeat_4d(ctx, scale_rows, 1, roots.layout.num_experts, n_tokens, 1);
+    ggml_tensor* selected_scales = ggml_get_rows(ctx, scale_rows, selected_experts);
+    weights = ggml_mul(ctx, weights, selected_scales);
+    ggml_set_name(weights, "gemma4_native_moe_weights");
+    ggml_build_forward_expand(gf, weights);
+
+    ggml_tensor* cur3 = ggml_reshape_3d(ctx, routed_input, n_embd, 1, n_tokens);
+    ggml_tensor* gate = nullptr;
+    ggml_tensor* up = nullptr;
+    if (gate_up_exps) {
+        ggml_tensor* gate_up = ggml_mul_mat_id(ctx, gate_up_exps, cur3, selected_experts);
+        ggml_set_name(gate_up, "gemma4_native_moe_gate_up");
+        gate = ggml_view_3d(ctx, gate_up, roots.layout.intermediate_dim, n_expert_used, n_tokens, gate_up->nb[1],
+                            gate_up->nb[2], 0);
+        ggml_set_name(gate, "gemma4_native_moe_gate");
+        up = ggml_view_3d(ctx, gate_up, roots.layout.intermediate_dim, n_expert_used, n_tokens, gate_up->nb[1],
+                          gate_up->nb[2], static_cast<size_t>(roots.layout.intermediate_dim) *
+                                              static_cast<size_t>(gate_up->nb[0]));
+        ggml_set_name(up, "gemma4_native_moe_up");
+    } else {
+        up = ggml_mul_mat_id(ctx, up_exps, cur3, selected_experts);
+        ggml_set_name(up, "gemma4_native_moe_up");
+        gate = ggml_mul_mat_id(ctx, gate_exps, cur3, selected_experts);
+        ggml_set_name(gate, "gemma4_native_moe_gate");
+    }
+    ggml_tensor* hidden = ggml_geglu_split(ctx, gate, up);
+    ggml_set_name(hidden, "gemma4_native_moe_geglu");
+    ggml_tensor* experts = ggml_mul_mat_id(ctx, down_exps, hidden, selected_experts);
+    experts = ggml_mul(ctx, experts, weights);
+    ggml_set_name(experts, "gemma4_native_moe_weighted_down");
+
+    ggml_tensor* expert_views[32] = {nullptr};
+    if (n_expert_used > static_cast<int64_t>(std::size(expert_views))) {
+        return nullptr;
+    }
+    for (int64_t i = 0; i < n_expert_used; ++i) {
+        expert_views[i] = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2],
+                                       static_cast<size_t>(i) * static_cast<size_t>(experts->nb[1]));
+        ggml_build_forward_expand(gf, expert_views[i]);
+    }
+    ggml_tensor* out = expert_views[0];
+    for (int64_t i = 1; i < n_expert_used; ++i) {
+        out = ggml_add(ctx, out, expert_views[i]);
+    }
+    if (n_expert_used == 1) {
+        out = ggml_cont(ctx, out);
+    }
+    char name[80];
+    std::snprintf(name, sizeof(name), "blk.%d.gemma4_native_moe_out", layer_idx);
+    ggml_set_name(out, name);
+    return out;
 }
 
 using densecore::llm::runtime::IsMixedRoutingEnabled;
@@ -1701,6 +1941,7 @@ struct GemvUserData {
     ggml_type weight_type;              // Tensor type (F32, Q4_K, Q8_0, etc.)
     ggml_type input_quant_type;         // Quantization type for input (Q8_K, Q8_0, or F32)
     bool force_reference_scalar = false;
+    bool disable_q8_repacked_gemv = false;
     int slot_id = -1;
     uint8_t* quant_input_shared = nullptr;
     std::atomic<uint64_t>* quantized_stamp = nullptr;
@@ -1829,6 +2070,43 @@ void cb_residual_rmsnorm_fused(struct ggml_tensor* dst, const struct ggml_tensor
                         actual_nonfinite ? 1 : 0, ref_nonfinite ? 1 : 0);
             }
         }
+    }
+}
+
+void cb_residual_rmsnorm_fused2(struct ggml_tensor* dst, const struct ggml_tensor* src,
+                                const struct ggml_tensor* residual, int ith, int nth, void* userdata) {
+    auto* ud = (AddRMSNormUserData*)userdata;
+    if (!ud || !ud->rms_weight) return;
+    if (!src || !residual || !dst || !src->data || !residual->data || !dst->data) return;
+    if (src->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return;
+    if (src->nb[0] != static_cast<int64_t>(sizeof(float)) ||
+        residual->nb[0] != static_cast<int64_t>(sizeof(float)) ||
+        dst->nb[0] != static_cast<int64_t>(sizeof(float))) {
+        return;
+    }
+
+    const int n_embd = ud->n_embd;
+    const int n_tokens = ud->n_tokens;
+    if (n_embd <= 0 || n_tokens <= 0 || src->ne[0] != n_embd || residual->ne[0] != n_embd ||
+        dst->ne[0] != n_embd) {
+        return;
+    }
+
+    const float eps = ud->eps;
+    const ptrdiff_t src_row_stride = static_cast<ptrdiff_t>(src->nb[1] / sizeof(float));
+    const ptrdiff_t residual_row_stride = static_cast<ptrdiff_t>(residual->nb[1] / sizeof(float));
+    const ptrdiff_t dst_row_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
+    const int tokens_per_thread = (n_tokens + nth - 1) / nth;
+    const int t_start = ith * tokens_per_thread;
+    const int t_end = std::min(t_start + tokens_per_thread, n_tokens);
+    if (t_start >= n_tokens) return;
+
+    for (int t = t_start; t < t_end; ++t) {
+        const float* x_ptr = reinterpret_cast<const float*>(src->data) + static_cast<ptrdiff_t>(t) * src_row_stride;
+        const float* res_ptr =
+            reinterpret_cast<const float*>(residual->data) + static_cast<ptrdiff_t>(t) * residual_row_stride;
+        float* out_ptr = reinterpret_cast<float*>(dst->data) + static_cast<ptrdiff_t>(t) * dst_row_stride;
+        densecore::simd::AddRMSNorm(out_ptr, x_ptr, res_ptr, ud->rms_weight, static_cast<size_t>(n_embd), eps);
     }
 }
 

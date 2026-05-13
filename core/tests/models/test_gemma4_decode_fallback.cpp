@@ -546,6 +546,7 @@ TEST(Gemma4FallbackDecodeTest, SlidingWindowDecodeMasksRetainedHistoryInStandard
 
 TEST(Gemma4FallbackDecodeTest, GraphLevelDecodeFallbackRespectsSlidingMask) {
     ScopedFlashAttentionDisableForTest flash_guard;
+    ScopedEnvOverride paged_decode_mode("DENSECORE_GEMMA4_PAGED_DECODE_LAYER_MODE", "off");
     auto masked_model = MakeSlidingDecodeGraphModel(/*sliding_enabled=*/true);
     auto full_model = MakeSlidingDecodeGraphModel(/*sliding_enabled=*/false);
     auto masked_cache = MakeTinyGraphCache(masked_model.get());

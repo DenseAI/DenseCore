@@ -20,6 +20,10 @@ import (
 type MockEngine struct {
 	generateStreamFunc func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error
 	maxContextTokens   int
+	renderedPrompt     string
+	lastCountText      string
+	lastCountAddBOS    bool
+	lastCountAddEOS    bool
 }
 
 func (m *MockEngine) GenerateStream(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
@@ -49,6 +53,9 @@ func (m *MockEngine) GenerateStreamTokensWithSampling(ctx context.Context, input
 
 func (m *MockEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool,
 	preserveThinking *bool) (*domain.RenderedChatPrompt, error) {
+	if m.renderedPrompt != "" {
+		return &domain.RenderedChatPrompt{RenderedPrompt: m.renderedPrompt}, nil
+	}
 	return &domain.RenderedChatPrompt{RenderedPrompt: "mock prompt"}, nil
 }
 
@@ -76,6 +83,9 @@ func (m *MockEngine) GetMaxContextTokens() int {
 }
 
 func (m *MockEngine) CountTokens(text string, addBOS bool, addEOS bool) (int, error) {
+	m.lastCountText = text
+	m.lastCountAddBOS = addBOS
+	m.lastCountAddEOS = addEOS
 	count := len(text)
 	if addBOS {
 		count++
@@ -84,6 +94,43 @@ func (m *MockEngine) CountTokens(text string, addBOS bool, addEOS bool) (int, er
 		count++
 	}
 	return count, nil
+}
+
+func TestCountChatPromptTokensUsesCanonicalRenderedPromptWithoutExtraBOS(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.engine.renderedPrompt = "<bos><|turn>user\nhello<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+	q := queue.NewRequestQueue(10)
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	enableThinking := false
+	got := handler.countChatPromptTokens(domain.ChatCompletionRequest{
+		Model: "gemma4",
+		Messages: []domain.Message{
+			{Role: "user", Content: "hello"},
+		},
+		ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking},
+	})
+
+	if got != len(mockModelService.engine.renderedPrompt) {
+		t.Fatalf("expected rendered prompt token count %d, got %d", len(mockModelService.engine.renderedPrompt), got)
+	}
+	if mockModelService.engine.lastCountText != mockModelService.engine.renderedPrompt {
+		t.Fatalf("expected token count to use rendered prompt, got %q", mockModelService.engine.lastCountText)
+	}
+	if mockModelService.engine.lastCountAddBOS || mockModelService.engine.lastCountAddEOS {
+		t.Fatalf("expected no synthetic BOS/EOS for rendered chat prompt, got addBOS=%v addEOS=%v",
+			mockModelService.engine.lastCountAddBOS, mockModelService.engine.lastCountAddEOS)
+	}
+}
+
+func TestResolveSyncFinishReasonReportsLengthAtMaxTokens(t *testing.T) {
+	if got := resolveSyncFinishReason(16, 16); got != "length" {
+		t.Fatalf("expected length finish reason at max_tokens, got %q", got)
+	}
+	if got := resolveSyncFinishReason(7, 80); got != "stop" {
+		t.Fatalf("expected stop finish reason before max_tokens, got %q", got)
+	}
 }
 
 func (m *MockEngine) TokenizeText(text string, addBOS bool, addEOS bool) ([]int, error) {
@@ -291,6 +338,80 @@ func TestChatCompletionHandler(t *testing.T) {
 				tt.checkResponse(t, resp)
 			}
 		})
+	}
+}
+
+func TestSplitGemma4ReasoningResponse(t *testing.T) {
+	content, reasoning := splitGemma4ReasoningResponse(
+		"gemma4",
+		"<|channel>thought\n<channel|>consider Paris\n<|channel>final\n<channel|>Paris is the capital of France.",
+	)
+	if content != "Paris is the capital of France." {
+		t.Fatalf("expected final content, got %q", content)
+	}
+	if reasoning != "consider Paris" {
+		t.Fatalf("expected reasoning content, got %q", reasoning)
+	}
+}
+
+func TestSplitGemma4ReasoningResponseHandlesBareBodyMarkerAsContent(t *testing.T) {
+	content, reasoning := splitGemma4ReasoningResponse("gemma4", "<channel|>Paris is the capital of France.")
+	if content != "Paris is the capital of France." || reasoning != "" {
+		t.Fatalf("expected body marker to be stripped into content, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitGemma4ReasoningResponseTrimsTrailingControlArtifacts(t *testing.T) {
+	content, reasoning := splitGemma4ReasoningResponse(
+		"gemma4",
+		"Answer is complete. <|be_thought_out|>\n<channel|>Answer is complete.",
+	)
+	if content != "Answer is complete." || reasoning != "" {
+		t.Fatalf("expected trailing Gemma control artifacts stripped, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitGemma4ReasoningResponseStripsBareThoughtPrelude(t *testing.T) {
+	content, reasoning := splitGemma4ReasoningResponse(
+		"gemma4",
+		"thought\n think silently.\n\nParis is the capital of France.",
+	)
+	if content != "Paris is the capital of France." || reasoning != "" {
+		t.Fatalf("expected bare Gemma thought prelude stripped, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitGemma4ReasoningResponseKeepsBareChannelParityToken(t *testing.T) {
+	content, reasoning := splitGemma4ReasoningResponse("gemma4", "<|channel>")
+	if content != "<|channel>" || reasoning != "" {
+		t.Fatalf("expected bare channel token to remain content, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitGemma4ReasoningResponseKeepsNonGemmaContent(t *testing.T) {
+	content, reasoning := splitGemma4ReasoningResponse("qwen3.6", "<|channel>thought\nnot a gemma response")
+	if content != "<|channel>thought\nnot a gemma response" || reasoning != "" {
+		t.Fatalf("expected non-gemma content unchanged, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitReasoningResponseQwen36OpenThinkMatchesLlamaCpp(t *testing.T) {
+	content, reasoning := splitReasoningResponse("qwen3.6", "Here is the model reasoning so far")
+	if content != "" {
+		t.Fatalf("expected qwen3.6 thinking tokens to stay out of content, got %q", content)
+	}
+	if reasoning != "Here is the model reasoning so far" {
+		t.Fatalf("expected qwen3.6 reasoning_content, got %q", reasoning)
+	}
+}
+
+func TestSplitReasoningResponseQwen36ClosedThinkKeepsFinalContent(t *testing.T) {
+	content, reasoning := splitReasoningResponse("Qwen3.6-35B-A3B", "plan\n</think>\n\nParis is the capital.")
+	if content != "Paris is the capital." {
+		t.Fatalf("expected final content, got %q", content)
+	}
+	if reasoning != "plan" {
+		t.Fatalf("expected reasoning content, got %q", reasoning)
 	}
 }
 

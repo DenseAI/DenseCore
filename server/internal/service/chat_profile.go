@@ -293,5 +293,16 @@ func qwenThinkingEnabled(modelHint string, templateKwargs *domain.ChatTemplateKw
 }
 
 func gemmaThinkingEnabled(_ string, templateKwargs *domain.ChatTemplateKwargs) bool {
-	return templateKwargs != nil && templateKwargs.EnableThinking != nil && *templateKwargs.EnableThinking
+	if templateKwargs != nil && templateKwargs.EnableThinking != nil {
+		return *templateKwargs.EnableThinking
+	}
+	if value, ok := os.LookupEnv("DENSECORE_GEMMA4_ENABLE_THINKING"); ok {
+		switch strings.TrimSpace(strings.ToLower(value)) {
+		case "0", "false", "no", "off":
+			return false
+		case "1", "true", "yes", "on":
+			return true
+		}
+	}
+	return false
 }

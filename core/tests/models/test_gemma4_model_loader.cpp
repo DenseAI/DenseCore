@@ -182,7 +182,7 @@ TEST(Gemma4ModelLoaderTest, AcceptsExplicitMetadataAndDisablesAutoBosForGemma4) 
     EXPECT_FLOAT_EQ(model->gemma4_attention_logit_softcapping, 50.0f);
 }
 
-TEST(Gemma4ModelLoaderTest, MissingAttentionLogitCapDefaultsToHfCompatible50) {
+TEST(Gemma4ModelLoaderTest, MissingAttentionLogitCapUsesLlamaCppGemmaDefault) {
     TempPath tmp;
     auto fill = [](gguf_context* ctx) {
         SetBaseGemma4Metadata(ctx);
@@ -193,7 +193,7 @@ TEST(Gemma4ModelLoaderTest, MissingAttentionLogitCapDefaultsToHfCompatible50) {
     EXPECT_FLOAT_EQ(model->gemma4_attention_logit_softcapping, 50.0f);
 }
 
-TEST(Gemma4ModelLoaderTest, InvalidAttentionLogitCapMetadataNormalizesToHfCompatible50) {
+TEST(Gemma4ModelLoaderTest, InvalidAttentionLogitCapMetadataLeavesGemma4TextAttentionSoftcapDisabled) {
     TempPath tmp;
     auto fill = [](gguf_context* ctx) {
         SetBaseGemma4Metadata(ctx);
@@ -201,10 +201,10 @@ TEST(Gemma4ModelLoaderTest, InvalidAttentionLogitCapMetadataNormalizesToHfCompat
     };
     std::unique_ptr<TransformerModel> model(LoadTempGemma4(tmp.path(), fill));
     ASSERT_NE(model, nullptr);
-    EXPECT_FLOAT_EQ(model->gemma4_attention_logit_softcapping, 50.0f);
+    EXPECT_FLOAT_EQ(model->gemma4_attention_logit_softcapping, 0.0f);
 }
 
-TEST(Gemma4ModelLoaderTest, MapsPostAttentionNormAsGemma4FfnPostNorm) {
+TEST(Gemma4ModelLoaderTest, MapsPostAttentionNormAsAttentionPostNormLikeLlamaCpp) {
     TempPath tmp;
     auto fill = [](gguf_context* ctx) {
         SetBaseGemma4Metadata(ctx);
@@ -214,7 +214,26 @@ TEST(Gemma4ModelLoaderTest, MapsPostAttentionNormAsGemma4FfnPostNorm) {
     ASSERT_NE(model, nullptr);
     ASSERT_FALSE(model->layers.empty());
 
-    EXPECT_NE(model->layers[0].Get("gemma4.post_feedforward_layernorm.weight"), nullptr);
+    EXPECT_NE(model->layers[0].Get(model_keys::kPostAttnNorm), nullptr);
+    EXPECT_NE(model->layers[0].Get(model_keys::kFfnNorm), nullptr);
+    EXPECT_EQ(model->layers[0].Get("gemma4.post_feedforward_layernorm.weight"), nullptr);
+}
+
+TEST(Gemma4ModelLoaderTest, MapsLlamaCppGemma4MoeNormAliases) {
+    TempPath tmp;
+    auto fill = [](gguf_context* ctx) {
+        SetBaseGemma4Metadata(ctx);
+        AddDummyTensor(ctx, "blk.0.pre_ffw_norm_2.weight", 8);
+        AddDummyTensor(ctx, "blk.0.post_ffw_norm_1.weight", 8);
+        AddDummyTensor(ctx, "blk.0.post_ffw_norm_2.weight", 8);
+    };
+    std::unique_ptr<TransformerModel> model(LoadTempGemma4(tmp.path(), fill));
+    ASSERT_NE(model, nullptr);
+    ASSERT_FALSE(model->layers.empty());
+
+    EXPECT_NE(model->layers[0].Get("gemma4.pre_feedforward_layernorm_2.weight"), nullptr);
+    EXPECT_NE(model->layers[0].Get("gemma4.post_feedforward_layernorm_1.weight"), nullptr);
+    EXPECT_NE(model->layers[0].Get("gemma4.post_feedforward_layernorm_2.weight"), nullptr);
 }
 
 TEST(Gemma4ModelLoaderTest, NormalizesVocabSizeFromTokenizerMetadata) {

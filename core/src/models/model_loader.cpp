@@ -1,5 +1,6 @@
 #include "densecore/models/model_loader.h"
 
+#include <ggml-alloc.h>
 #include <ggml-cpu.h>
 #ifdef __APPLE__
 #include <ggml-metal.h>
@@ -189,6 +190,380 @@ bool ResolveStackedInt4ViewBinding(ggml_context* vctx, const ggml_tensor* root_t
     out->k = expected_k;
     out->n = expected_n;
     return true;
+}
+
+bool EnvFlagEnabled(const char* name, bool default_value) {
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return default_value;
+    }
+    std::string text(value);
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (text == "0" || text == "false" || text == "off" || text == "no") {
+        return false;
+    }
+    if (text == "1" || text == "true" || text == "on" || text == "yes" || text == "force") {
+        return true;
+    }
+    return default_value;
+}
+
+ggml_backend_buffer_type_t FindCpuRepackBufferType(ggml_backend_t backend) {
+    ggml_backend_dev_t device = backend ? ggml_backend_get_device(backend) : ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+    if (!device) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+    auto* proc = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts"));
+    if (!proc) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t* bufts = proc(device);
+    if (!bufts) {
+        return nullptr;
+    }
+    for (size_t i = 0; bufts[i] != nullptr; ++i) {
+        const char* name = ggml_backend_buft_name(bufts[i]);
+        if (name && std::strcmp(name, "CPU_REPACK") == 0) {
+            return bufts[i];
+        }
+    }
+    return nullptr;
+}
+
+void PrepareGemma4NativeMoERepackAliases(TransformerModel* model) {
+    if (!model || !model->arch_flags.is_gemma4 || model->layers.empty()) {
+        return;
+    }
+    if (!EnvFlagEnabled("DENSECORE_GEMMA4_CPU_REPACK_NATIVE_MOE", true)) {
+        return;
+    }
+
+    ggml_backend_buffer_type_t repack_buft = FindCpuRepackBufferType(model->cpu_backend ? model->cpu_backend : model->backend);
+    if (!repack_buft) {
+        if (EnvFlagEnabled("DENSECORE_DEBUG_GEMMA4_CPU_REPACK", false)) {
+            std::cerr << "[DenseCore] Gemma4 CPU_REPACK aliases unavailable: ggml CPU_REPACK buffer type not present"
+                      << std::endl;
+        }
+        return;
+    }
+
+    struct PendingAlias {
+        ggml_tensor* source = nullptr;
+        ggml_tensor* alias = nullptr;
+        std::vector<uint8_t> bytes;
+    };
+    struct PendingFusedAlias {
+        TransformerLayer* layer = nullptr;
+        ggml_tensor* alias = nullptr;
+        std::string key;
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<PendingAlias> pending;
+    std::vector<PendingFusedAlias> pending_fused;
+
+    if (!model->ctx_cpu_repack) {
+        const size_t tensor_slots = static_cast<size_t>(std::max<uint32_t>(1, model->hparams.n_layer)) * 12 + 64;
+        struct ggml_init_params params = {
+            /*.mem_size   =*/tensor_slots * ggml_tensor_overhead() + 1024 * 1024,
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
+        };
+        model->ctx_cpu_repack = ggml_init(params);
+        if (!model->ctx_cpu_repack) {
+            std::cerr << "[DenseCore] Warning: failed to allocate Gemma4 CPU_REPACK metadata context" << std::endl;
+            return;
+        }
+    }
+
+    auto register_alias = [&](ggml_tensor* source, ggml_tensor* alias, const char* suffix,
+                              std::vector<uint8_t> bytes = {}) -> bool {
+        if (!source || !alias) {
+            return false;
+        }
+        if (model->cpu_repack_aliases.find(source) != model->cpu_repack_aliases.end()) {
+            return true;
+        }
+        const std::string name = std::string(source->name[0] ? source->name : "gemma4_moe_weight") + suffix;
+        ggml_set_name(alias, name.c_str());
+        if (bytes.empty() && ggml_nbytes(alias) != ggml_nbytes(source)) {
+            std::cerr << "[DenseCore] Warning: skipping Gemma4 CPU_REPACK alias for "
+                      << (source->name[0] ? source->name : "<unnamed>") << " because packed byte size differs"
+                      << std::endl;
+            return false;
+        }
+        if (!bytes.empty() && bytes.size() != ggml_nbytes(alias)) {
+            std::cerr << "[DenseCore] Warning: skipping Gemma4 CPU_REPACK alias for "
+                      << (source->name[0] ? source->name : "<unnamed>")
+                      << " because converted byte size does not match alias" << std::endl;
+            return false;
+        }
+        model->cpu_repack_aliases[source] = alias;
+        pending.push_back({source, alias, std::move(bytes)});
+        return true;
+    };
+
+    auto make_alias_2d = [&](ggml_tensor* source, const char* suffix) -> bool {
+        if (!source || !source->data || source->view_src || source->ne[0] <= 0 || source->ne[1] <= 0) {
+            return false;
+        }
+        ggml_tensor* alias = ggml_new_tensor_2d(model->ctx_cpu_repack, source->type, source->ne[0], source->ne[1]);
+        return register_alias(source, alias, suffix);
+    };
+
+    auto make_alias_3d = [&](ggml_tensor* source, int64_t ne0, int64_t ne1, int64_t ne2, const char* suffix) -> bool {
+        if (!source || !source->data || ne0 <= 0 || ne1 <= 0 || ne2 <= 0) {
+            return false;
+        }
+        ggml_tensor* alias = ggml_new_tensor_3d(model->ctx_cpu_repack, source->type, ne0, ne1, ne2);
+        return register_alias(source, alias, suffix);
+    };
+
+    auto make_q5_1_down_q8_0_alias_3d = [&](ggml_tensor* source, int64_t ne0, int64_t ne1, int64_t ne2,
+                                            const char* suffix) -> bool {
+        if (!EnvFlagEnabled("DENSECORE_GEMMA4_REQUANT_Q5_1_DOWN_TO_Q8_0", false)) {
+            return false;
+        }
+        if (!source || !source->data || source->type != GGML_TYPE_Q5_1 || source->view_src || ne0 <= 0 || ne1 <= 0 ||
+            ne2 <= 0 || source->ne[0] != ne0 || source->ne[1] != ne1 || source->ne[2] != ne2) {
+            return false;
+        }
+        const ggml_type_traits* src_traits = ggml_get_type_traits(source->type);
+        const ggml_type_traits_cpu* dst_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+        if (!src_traits || !src_traits->to_float || !dst_traits || !dst_traits->from_float) {
+            return false;
+        }
+        ggml_tensor* alias = ggml_new_tensor_3d(model->ctx_cpu_repack, GGML_TYPE_Q8_0, ne0, ne1, ne2);
+        if (!alias) {
+            return false;
+        }
+        std::vector<uint8_t> converted(ggml_nbytes(alias));
+        std::vector<float> row(static_cast<size_t>(ne0), 0.0f);
+        const size_t dst_row_size = ggml_row_size(GGML_TYPE_Q8_0, ne0);
+        for (int64_t expert = 0; expert < ne2; ++expert) {
+            for (int64_t row_idx = 0; row_idx < ne1; ++row_idx) {
+                const char* src_row = static_cast<const char*>(source->data) +
+                                      static_cast<size_t>(expert) * static_cast<size_t>(source->nb[2]) +
+                                      static_cast<size_t>(row_idx) * static_cast<size_t>(source->nb[1]);
+                uint8_t* dst_row = converted.data() +
+                                   (static_cast<size_t>(expert) * static_cast<size_t>(ne1) +
+                                    static_cast<size_t>(row_idx)) *
+                                       dst_row_size;
+                src_traits->to_float(src_row, row.data(), ne0);
+                dst_traits->from_float(row.data(), dst_row, ne0);
+            }
+        }
+        return register_alias(source, alias, suffix, std::move(converted));
+    };
+
+    auto make_fused_pair_alias = [&](TransformerLayer& layer, uint32_t layer_idx, const char* env_name,
+                                     const char* output_key, const char* name_fragment, ggml_tensor* first,
+                                     ggml_tensor* second) -> bool {
+        if (!EnvFlagEnabled(env_name, true)) {
+            return false;
+        }
+        if (!first || !second || !first->data || !second->data || first->view_src || second->view_src) {
+            return false;
+        }
+        if (first->type != second->type || first->ne[0] != second->ne[0]) {
+            return false;
+        }
+        if (!ggml_is_quantized(first->type) || first->ne[0] <= 0 || first->ne[1] <= 0 || second->ne[1] <= 0) {
+            return false;
+        }
+
+        const size_t row_bytes = ggml_row_size(first->type, first->ne[0]);
+        if (row_bytes == 0 || first->nb[1] < static_cast<int64_t>(row_bytes) ||
+            second->nb[1] < static_cast<int64_t>(row_bytes)) {
+            return false;
+        }
+
+        const int64_t fused_rows = first->ne[1] + second->ne[1];
+        ggml_tensor* alias = ggml_new_tensor_2d(model->ctx_cpu_repack, first->type, first->ne[0], fused_rows);
+        if (!alias) {
+            return false;
+        }
+        char name[128];
+        std::snprintf(name, sizeof(name), "blk.%u.%s.cpu_repack_fused_2d", layer_idx, name_fragment);
+        ggml_set_name(alias, name);
+
+        PendingFusedAlias fused{};
+        fused.layer = &layer;
+        fused.alias = alias;
+        fused.key = output_key;
+        fused.bytes.resize(row_bytes * static_cast<size_t>(fused_rows));
+
+        size_t dst_row = 0;
+        auto append_rows = [&](const ggml_tensor* src) {
+            const uint8_t* src_bytes = static_cast<const uint8_t*>(src->data);
+            for (int64_t r = 0; r < src->ne[1]; ++r) {
+                std::memcpy(fused.bytes.data() + dst_row * row_bytes,
+                            src_bytes + static_cast<size_t>(r) * static_cast<size_t>(src->nb[1]), row_bytes);
+                ++dst_row;
+            }
+        };
+        append_rows(first);
+        append_rows(second);
+        pending_fused.push_back(std::move(fused));
+        return true;
+    };
+
+    auto make_fused_qkv_alias = [&](TransformerLayer& layer, uint32_t layer_idx) -> bool {
+        if (!EnvFlagEnabled("DENSECORE_GEMMA4_CPU_REPACK_FUSED_QKV", true)) {
+            return false;
+        }
+        ggml_tensor* q = layer.Get(model_keys::kAttnQWeight);
+        ggml_tensor* k = layer.Get(model_keys::kAttnKWeight);
+        ggml_tensor* v = layer.Get(model_keys::kAttnVWeight);
+        if (!q || !k || !v || !q->data || !k->data || !v->data || q->view_src || k->view_src || v->view_src) {
+            return false;
+        }
+        if (q->type != k->type || q->type != v->type || q->ne[0] != k->ne[0] || q->ne[0] != v->ne[0]) {
+            return false;
+        }
+        if (!ggml_is_quantized(q->type) || q->ne[0] <= 0 || q->ne[1] <= 0 || k->ne[1] <= 0 || v->ne[1] <= 0) {
+            return false;
+        }
+
+        const size_t row_bytes = ggml_row_size(q->type, q->ne[0]);
+        if (row_bytes == 0 || q->nb[1] < static_cast<int64_t>(row_bytes) ||
+            k->nb[1] < static_cast<int64_t>(row_bytes) || v->nb[1] < static_cast<int64_t>(row_bytes)) {
+            return false;
+        }
+
+        const int64_t fused_rows = q->ne[1] + k->ne[1] + v->ne[1];
+        ggml_tensor* alias = ggml_new_tensor_2d(model->ctx_cpu_repack, q->type, q->ne[0], fused_rows);
+        if (!alias) {
+            return false;
+        }
+        char name[128];
+        std::snprintf(name, sizeof(name), "blk.%u.attn_qkv.weight.cpu_repack_fused_2d", layer_idx);
+        ggml_set_name(alias, name);
+
+        PendingFusedAlias fused{};
+        fused.layer = &layer;
+        fused.alias = alias;
+        fused.key = "attn_qkv.cpu_repack_fused";
+        fused.bytes.resize(row_bytes * static_cast<size_t>(fused_rows));
+
+        size_t dst_row = 0;
+        auto append_rows = [&](const ggml_tensor* src) {
+            const uint8_t* src_bytes = static_cast<const uint8_t*>(src->data);
+            for (int64_t r = 0; r < src->ne[1]; ++r) {
+                std::memcpy(fused.bytes.data() + dst_row * row_bytes,
+                            src_bytes + static_cast<size_t>(r) * static_cast<size_t>(src->nb[1]), row_bytes);
+                ++dst_row;
+            }
+        };
+        append_rows(q);
+        append_rows(k);
+        append_rows(v);
+        pending_fused.push_back(std::move(fused));
+        return true;
+    };
+
+    make_alias_2d(model->tok_embeddings, ".cpu_repack_2d");
+    make_alias_2d(model->output, ".cpu_repack_2d");
+    for (uint32_t i = 0; i < model->layers.size(); ++i) {
+        auto& layer = model->layers[i];
+        make_fused_qkv_alias(layer, i);
+        make_fused_pair_alias(layer, i, "DENSECORE_GEMMA4_CPU_REPACK_FUSED_SHARED_FFN",
+                              "ffn_gate_up.cpu_repack_fused", "ffn_gate_up.weight",
+                              layer.Get(model_keys::kFfnGate), layer.Get(model_keys::kFfnUp));
+        make_alias_2d(layer.Get(model_keys::kAttnQWeight), ".cpu_repack_2d");
+        make_alias_2d(layer.Get(model_keys::kAttnKWeight), ".cpu_repack_2d");
+        make_alias_2d(layer.Get(model_keys::kAttnVWeight), ".cpu_repack_2d");
+        make_alias_2d(layer.Get(model_keys::kAttnOWeight), ".cpu_repack_2d");
+        make_alias_2d(layer.Get(model_keys::kFfnGate), ".cpu_repack_2d");
+        make_alias_2d(layer.Get(model_keys::kFfnUp), ".cpu_repack_2d");
+        make_alias_2d(layer.Get(model_keys::kFfnDown), ".cpu_repack_2d");
+    }
+
+    for (uint32_t i = 0; i < model->layers.size(); ++i) {
+        auto& layer = model->layers[i];
+        ggml_tensor* gate_up =
+            layer.Get("ffn_gate_up_exps.weight") ? layer.Get("ffn_gate_up_exps.weight") : layer.Get("ffn_gate_up_exps");
+        ggml_tensor* down =
+            layer.Get("ffn_down_exps.weight") ? layer.Get("ffn_down_exps.weight") : layer.Get("ffn_down_exps");
+        if (!gate_up || !down) {
+            continue;
+        }
+        densecore::gemma4::PackedExpertLayout layout{};
+        std::string reason;
+        if (!densecore::gemma4::InferPackedExpertLayout(gate_up, down, &layout, &reason)) {
+            continue;
+        }
+        make_alias_3d(gate_up, layout.hidden_dim, layout.intermediate_dim * 2, layout.num_experts,
+                      ".cpu_repack_gate_up_3d");
+        if (!make_q5_1_down_q8_0_alias_3d(down, layout.intermediate_dim, layout.hidden_dim, layout.num_experts,
+                                           ".cpu_repack_down_q8_0_3d")) {
+            make_alias_3d(down, layout.intermediate_dim, layout.hidden_dim, layout.num_experts,
+                          ".cpu_repack_down_3d");
+        }
+    }
+
+    if (pending.empty() && pending_fused.empty()) {
+        return;
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(model->ctx_cpu_repack, repack_buft);
+    if (!buffer) {
+        std::cerr << "[DenseCore] Warning: failed to allocate Gemma4 CPU_REPACK buffer" << std::endl;
+        model->cpu_repack_aliases.clear();
+        return;
+    }
+    model->cpu_repack_buffers.push_back(buffer);
+
+    std::vector<PendingAlias> supported;
+    supported.reserve(pending.size());
+    for (const auto& item : pending) {
+        if (!item.alias || !item.source || !item.alias->extra) {
+            if (EnvFlagEnabled("DENSECORE_DEBUG_GEMMA4_CPU_REPACK", false)) {
+                std::cerr << "[DenseCore] Warning: Gemma4 CPU_REPACK did not support tensor "
+                          << (item.source && item.source->name[0] ? item.source->name : "<unnamed>")
+                          << " type=" << (item.source ? ggml_type_name(item.source->type) : "<null>")
+                          << " alias_ne=[" << (item.alias ? item.alias->ne[0] : 0) << ","
+                          << (item.alias ? item.alias->ne[1] : 0) << "," << (item.alias ? item.alias->ne[2] : 0)
+                          << "," << (item.alias ? item.alias->ne[3] : 0)
+                          << "]; keeping raw tensor for that projection" << std::endl;
+            }
+            if (item.source) {
+                model->cpu_repack_aliases.erase(item.source);
+            }
+            continue;
+        }
+        supported.push_back(item);
+    }
+    size_t fused_supported = 0;
+    for (auto& item : pending_fused) {
+        if (!item.alias || !item.alias->extra || !item.layer || item.bytes.empty()) {
+            continue;
+        }
+        ggml_backend_tensor_set(item.alias, item.bytes.data(), 0, item.bytes.size());
+        item.layer->Set(item.key, item.alias);
+        ++fused_supported;
+    }
+    if (supported.empty() && fused_supported == 0) {
+        std::cerr << "[DenseCore] Warning: no Gemma4 CPU_REPACK aliases were supported by this ggml build" << std::endl;
+        model->cpu_repack_aliases.clear();
+        return;
+    }
+    size_t bytes = 0;
+    for (const auto& item : supported) {
+        const void* data = item.bytes.empty() ? item.source->data : item.bytes.data();
+        const size_t nbytes = item.bytes.empty() ? ggml_nbytes(item.source) : item.bytes.size();
+        ggml_backend_tensor_set(item.alias, data, 0, nbytes);
+        bytes += ggml_nbytes(item.alias);
+    }
+    for (const auto& item : pending_fused) {
+        if (item.alias && item.alias->extra) {
+            bytes += ggml_nbytes(item.alias);
+        }
+    }
+    std::cout << "[DenseCore] Gemma4 CPU_REPACK aliases prepared: tensors=" << supported.size()
+              << ", fused_qkv=" << fused_supported << ", bytes=" << (bytes / 1024 / 1024) << " MiB" << std::endl;
 }
 }  // namespace
 
@@ -816,14 +1191,6 @@ TransformerModel* LoadGGUFModel(const char* path) {
         float gemma4_attention_logit_cap = 50.0f;
         if (has_key("attention_logit_cap")) {
             get_f32("attention_logit_cap", gemma4_attention_logit_cap);
-        } else {
-            static bool warned_gemma4_softcap_default = false;
-            if (!warned_gemma4_softcap_default) {
-                std::cerr << "[DenseCore] Warning: Gemma4 GGUF is missing attention_logit_cap metadata; "
-                             "using HF-compatible default 50.0"
-                          << std::endl;
-                warned_gemma4_softcap_default = true;
-            }
         }
         model->gemma4_attention_logit_softcapping =
             densecore::models::SanitizeAttentionLogitSoftcapForLoad(model, gemma4_attention_logit_cap);
@@ -1716,10 +2083,15 @@ TransformerModel* LoadGGUFModel(const char* path) {
                              get_layer_tensor_any(i, {"ffn_gate_inp_shexp.weight", "shared_expert_gate.weight"}));
         model->layers[i].Set(kGemma4RouterScaleKey, get_layer_tensor_any(i, {"router.scale", "ffn_gate_inp.scale"}));
         model->layers[i].Set(kGemma4RouterPerExpertScaleKey, get_layer_tensor_any(i, {"router.per_expert_scale"}));
-        model->layers[i].Set(kGemma4PreMoeNormKey, get_layer_tensor_any(i, {"pre_feedforward_layernorm_2.weight"}));
+        model->layers[i].Set(kGemma4PreMoeNormKey,
+                             get_layer_tensor_any(i, {"pre_ffw_norm_2.weight",
+                                                      "pre_feedforward_layernorm_2.weight"}));
         model->layers[i].Set(kGemma4PostSharedNormKey,
-                             get_layer_tensor_any(i, {"post_feedforward_layernorm_1.weight"}));
-        model->layers[i].Set(kGemma4PostMoeNormKey, get_layer_tensor_any(i, {"post_feedforward_layernorm_2.weight"}));
+                             get_layer_tensor_any(i, {"post_ffw_norm_1.weight",
+                                                      "post_feedforward_layernorm_1.weight"}));
+        model->layers[i].Set(kGemma4PostMoeNormKey,
+                             get_layer_tensor_any(i, {"post_ffw_norm_2.weight",
+                                                      "post_feedforward_layernorm_2.weight"}));
         model->layers[i].Set(kGemma4PostFfnNormKey,
                              get_layer_tensor_any(i, {"post_feedforward_layernorm.weight", "post_ffw_norm.weight"}));
         model->layers[i].Set(model_keys::kGemma4PerLayerInputGate, get_layer_tensor_any(i, {"inp_gate.weight"}));
@@ -2438,7 +2810,6 @@ TransformerModel* LoadGGUFModel(const char* path) {
         const int n_heads = model->ssm_time_step_rank;
         const int head_dim = model->ssm_inner_size / std::max(1, n_heads);
         const int conv_expected = conv_channels * model->ssm_conv_kernel;
-        const int alpha_beta_expected = n_heads * static_cast<int>(model->hparams.n_embd);
         const int per_head_expected = n_heads;
         const int norm_head_expected = head_dim;
         const int norm_full_expected = model->ssm_inner_size;
@@ -2523,6 +2894,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                           n_heads, model->ssm_group_count, &beta_out, &alpha_out)) {
                 if (model->variant == ModelVariant::QWEN36 && model->ssm_group_count > 0 &&
                     model->ssm_group_count != n_heads) {
+                    // llama.cpp's qwen35moe path treats V heads as tiled after
+                    // conversion and repeats Q/K with h % num_k_heads. Keep the
+                    // alpha/beta rows in that same tiled V-head order.
                     Qwen35ReorderVHeadsGroupedToTiled(&beta_out, static_cast<int>(model->hparams.n_embd),
                                                       model->ssm_group_count, n_heads);
                     Qwen35ReorderVHeadsGroupedToTiled(&alpha_out, static_cast<int>(model->hparams.n_embd),
@@ -3250,6 +3624,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             }
         }
     }
+
+    PrepareGemma4NativeMoERepackAliases(model);
 
     // ==========================================================================
     // oneDNN Weight Prepack (Prefill MatMul Acceleration)

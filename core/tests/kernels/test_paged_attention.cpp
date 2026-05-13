@@ -141,10 +141,11 @@ void ComputeReferenceSingleHeadWindowed(const PagedKVCache& cache, const std::ve
         for (int d = 0; d < static_cast<int>(query.size()); ++d) {
             dot += query[static_cast<size_t>(d)] * k_head[static_cast<size_t>(d)];
         }
-        float score = dot * scale;
+        float score = dot;
         if (logit_softcap > 0.0f && std::isfinite(score)) {
             score = std::tanh(score / logit_softcap) * logit_softcap;
         }
+        score *= scale;
         scores[static_cast<size_t>(t)] = score;
         if (score > max_score) {
             max_score = score;
@@ -372,7 +373,7 @@ TEST_F(PagedAttentionTest, ContextStartOffsetMatchesReference) {
     densecore::kernels::PagedAttentionConfig config;
     config.context_len = 16;
     config.context_start_pos = 16;
-    config.scale = 1.0f;
+    config.scale = 1.0f / std::sqrt(64.0f);
     densecore::kernels::PagedAttention(query, *cache, 0, block_table, config, &output);
 
     std::vector<float> ref;
@@ -414,7 +415,7 @@ TEST_F(PagedAttentionTest, LogitSoftcapMatchesReference) {
 
     std::vector<float> ref;
     ComputeReferenceSingleHeadWindowed(*cache, block_table, /*context_start_pos=*/0, /*context_len=*/16, query_data,
-                                       /*scale=*/1.0f, /*logit_softcap=*/8.0f, &ref);
+                                       config.scale, /*logit_softcap=*/8.0f, &ref);
 
     EXPECT_NEAR(output_data[0], ref[0], 5e-5f);
 }

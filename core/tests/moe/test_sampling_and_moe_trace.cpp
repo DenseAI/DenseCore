@@ -17,6 +17,7 @@ std::vector<CpuBackend::ExpertWeights> BuildExpertWeightsForTest(const Transform
 int ResolveQwen36MoECallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int top_k);
 bool ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(bool is_qwen36_hybrid_moe, int physical_cores,
                                                                int simd_level);
+bool ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(int physical_cores, int simd_level);
 int ResolveQwen36SmallDecodeExpertWorkersForTest(int top_k, int worker_cap, int requested_override);
 bool RouteMoEGemma4TopKForTest(const struct ggml_tensor* gate_logits, const TransformerModel* model,
                                const TransformerLayer* layer, int top_k, densecore::moe::MoERouteResult* routing);
@@ -235,6 +236,17 @@ TEST(MoETrace, Qwen36SmallDecodeExpertParallelAutoPolicyTargetsC4AShape) {
         true, 16, static_cast<int>(SimdLevel::AVX512)));
     EXPECT_FALSE(densecore::testing::ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(
         false, 16, static_cast<int>(SimdLevel::SVE2)));
+}
+
+TEST(MoETrace, Gemma4SmallDecodeExpertParallelAutoPolicyTargetsC4AShape) {
+    using densecore::simd::SimdLevel;
+
+    EXPECT_TRUE(densecore::testing::ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(
+        16, static_cast<int>(SimdLevel::SVE2)));
+    EXPECT_FALSE(densecore::testing::ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(
+        8, static_cast<int>(SimdLevel::SVE2)));
+    EXPECT_FALSE(densecore::testing::ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(
+        16, static_cast<int>(SimdLevel::AVX512)));
 }
 
 TEST(MoETrace, Qwen36SmallDecodeExpertParallelWorkerDefaultCapsAtEight) {

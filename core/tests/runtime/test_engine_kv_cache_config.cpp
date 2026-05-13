@@ -213,6 +213,35 @@ TEST(EngineKVCacheConfig, GLMIndexCacheContributesToBudgeting) {
     EXPECT_EQ(config.max_seq_len, expected_seq_len);
 }
 
+TEST(EngineKVCacheConfig, AutoKVTargetUsesAvailableMemoryWhenNoEnvTargetIsSet) {
+    ScopedEnvVar target_mb("DENSECORE_KV_TARGET_MB", nullptr);
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", nullptr);
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+    ScopedEnvVar available_hint("DENSECORE_KV_AVAILABLE_MB_HINT", "65536");
+
+    TransformerModel model = MakeModel(/*head_dim_k=*/256, /*n_head_kv=*/10, /*n_layer=*/48);
+    model.hparams.n_ctx = 131072;
+    const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_F16);
+
+    EXPECT_EQ(config.max_num_seqs, 4);
+    EXPECT_EQ(config.target_kv_memory / (1024ULL * 1024ULL), 7168ULL);
+    EXPECT_EQ(config.max_seq_len, 15291);
+}
+
+TEST(EngineKVCacheConfig, ExplicitKVTargetStillActsAsOverride) {
+    ScopedEnvVar target_mb("DENSECORE_KV_TARGET_MB", "512");
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", nullptr);
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+    ScopedEnvVar available_hint("DENSECORE_KV_AVAILABLE_MB_HINT", "65536");
+
+    TransformerModel model = MakeModel(/*head_dim_k=*/256, /*n_head_kv=*/10, /*n_layer=*/48);
+    model.hparams.n_ctx = 131072;
+    const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_F16);
+
+    EXPECT_EQ(config.target_kv_memory / (1024ULL * 1024ULL), 512ULL);
+    EXPECT_EQ(config.max_seq_len, 1092);
+}
+
 TEST(EngineKVCacheConfig, HybridSsmGraphContextKeepsBatchFourHeadroom) {
     ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "512");
     ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");

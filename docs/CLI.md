@@ -100,7 +100,7 @@ The server reads configuration from environment variables. The commonly used one
 | `THREADS` | inference threads | `0` |
 | `AUTH_ENABLED` | enable API key auth | `false` |
 | `API_KEYS` | comma-separated API keys | unset |
-| `GRPC_ENABLED` | enable gRPC | `true` |
+| `GRPC_ENABLED` | enable gRPC | `false` |
 | `GRPC_PORT` | gRPC port | `50051` |
 | `RATE_LIMIT_ENABLED` | enable rate limiting | `true` |
 | `RATE_LIMIT_RPS` | request rate limit | `100` |

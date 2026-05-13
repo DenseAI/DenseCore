@@ -356,7 +356,7 @@ func TestNormalizeSamplingDeterministicTemperatureForcesGreedyLikeDefaults(t *te
 		Temperature:    0.0,
 		TemperatureSet: true,
 	})
-	if temperature != 0.0 || topP != 1.0 || topK != 1 || repetitionPenalty != 1.05 {
+	if temperature != 0.0 || topP != 1.0 || topK != 1 || repetitionPenalty != 1.0 {
 		t.Fatalf("expected deterministic defaults for temp=0, got temp=%v top_p=%v top_k=%v rep=%v",
 			temperature, topP, topK, repetitionPenalty)
 	}
@@ -403,7 +403,7 @@ func TestShouldPassThroughRawPromptGenericOnlyWithDebugFlag(t *testing.T) {
 
 func TestGenerateStreamParityModeUsesCanonicalRenderer(t *testing.T) {
 	engine := &chatServiceRenderTestEngine{
-		renderedPrompt: "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
+		renderedPrompt: "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
 	}
 	modelService := &chatServiceRenderTestModelService{
 		engine: engine,
@@ -467,7 +467,7 @@ func TestGenerateStreamQwen35RenderedPromptUsesPreviewTokenIDs(t *testing.T) {
 
 func TestGenerateStreamNonParityModeGemmaUsesRenderedPrompt(t *testing.T) {
 	engine := &chatServiceRenderTestEngine{
-		renderedPrompt: "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
+		renderedPrompt: "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
 	}
 	modelService := &chatServiceRenderTestModelService{
 		engine: engine,
@@ -486,7 +486,7 @@ func TestGenerateStreamNonParityModeGemmaUsesRenderedPrompt(t *testing.T) {
 	if engine.lastPrompt != engine.renderedPrompt {
 		t.Fatalf("expected rendered prompt for Gemma chat path, got %q", engine.lastPrompt)
 	}
-	if engine.lastPrompt != "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n" {
+	if engine.lastPrompt != "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n" {
 		t.Fatalf("expected Gemma BOS/turn-tag/assistant-prefix prompt, got %q", engine.lastPrompt)
 	}
 }
@@ -494,7 +494,7 @@ func TestGenerateStreamNonParityModeGemmaUsesRenderedPrompt(t *testing.T) {
 func TestGenerateStreamFailsWhenUpstreamClosesWithoutTerminalEvent(t *testing.T) {
 	engine := &chatServiceBrokenStreamTestEngine{
 		chatServiceRenderTestEngine: chatServiceRenderTestEngine{
-			renderedPrompt: "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
+			renderedPrompt: "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
 		},
 	}
 	modelService := &chatServiceRenderTestModelService{

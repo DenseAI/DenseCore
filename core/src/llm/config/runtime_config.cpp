@@ -1,6 +1,7 @@
 #include "llm/config/runtime_config.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -21,6 +22,25 @@ bool ParseLegacyEnabledBool(const char* name, bool default_value) {
         return default_value;
     }
     return std::strcmp(env_value, "0") != 0;
+}
+
+std::size_t ReadAvailableMemoryMbForAutoRuntimeCache() {
+#if defined(__linux__)
+    std::FILE* file = std::fopen("/proc/meminfo", "r");
+    if (!file) {
+        return 0;
+    }
+    char line[256] = {};
+    unsigned long long kb = 0;
+    while (std::fgets(line, sizeof(line), file)) {
+        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            std::fclose(file);
+            return static_cast<std::size_t>(kb / 1024ULL);
+        }
+    }
+    std::fclose(file);
+#endif
+    return 0;
 }
 
 }  // namespace
@@ -249,8 +269,11 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
     config.prefill_graph_cache.enabled = ParseLegacyEnabledBool("DENSECORE_PREFILL_GRAPH_CACHE", true);
     config.prefill_graph_cache.lru_size =
         std::max(1, env::ParsePositiveEnvInt("DENSECORE_PREFILL_GRAPH_CACHE_LRU", 16));
+    const std::size_t available_mb = ReadAvailableMemoryMbForAutoRuntimeCache();
+    const int auto_prefill_graph_cache_mb =
+        available_mb > 0 ? static_cast<int>(std::max<std::size_t>(128, available_mb / 32)) : 1024;
     const int prefill_graph_cache_mb =
-        std::max(128, env::ParsePositiveEnvInt("DENSECORE_PREFILL_GRAPH_CACHE_MAX_MB", 1024));
+        std::max(128, ReadPositiveIntEnv("DENSECORE_PREFILL_GRAPH_CACHE_MAX_MB", auto_prefill_graph_cache_mb));
     config.prefill_graph_cache.max_bytes = static_cast<std::size_t>(prefill_graph_cache_mb) * 1024ULL * 1024ULL;
     return config;
 }

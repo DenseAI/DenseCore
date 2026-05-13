@@ -358,6 +358,8 @@ std::vector<std::string> ExtractDebugLines(const std::string& captured_stderr) {
     while (std::getline(input, line)) {
         if (line.rfind("[LM_HEAD_TOP]", 0) == 0 || line.rfind("  [TOP]", 0) == 0 ||
             line.rfind("[SAMPLE_TOP]", 0) == 0 || line.rfind("[SAMPLE_DBG", 0) == 0 ||
+            line.rfind("[LM_HEAD_TOP]", 0) == 0 || line.rfind("[LM_HEAD_OUT", 0) == 0 ||
+            line.rfind("[PROJ_REF]", 0) == 0 || line.rfind("[RMS_REF]", 0) == 0 ||
             line.rfind("[HIDDEN_SNAPSHOT]", 0) == 0 || line.rfind("[GEMMA4_SHARED_KV]", 0) == 0 ||
             line.rfind("[KV_ROUNDTRIP]", 0) == 0 ||
             line.rfind("[GEMMA4_KV_WRITE]", 0) == 0 ||

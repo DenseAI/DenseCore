@@ -1612,10 +1612,11 @@ static void cb_attention_core_reference_probe(struct ggml_tensor* dst, const str
                 for (int d = 0; d < ud->head_dim_q; ++d) {
                     dot += q_head[d] * k_head[d];
                 }
-                float score = dot * scale;
+                float score = dot;
                 if (ud->logit_softcap > 0.0f) {
                     score = std::tanh(score / ud->logit_softcap) * ud->logit_softcap;
                 }
+                score *= scale;
                 scores[static_cast<size_t>(k_idx)] = score;
                 max_score = std::max(max_score, score);
             }
@@ -2485,6 +2486,9 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
     const auto resolve_src_k_head = [&](int v_head_idx) -> int {
         if (num_k_heads == num_v_heads) {
             return v_head_idx;
+        }
+        if (ud->projection_profile == Qwen35SSMQkvProjectionProfile::QWEN36_OFFICIAL) {
+            return v_head_idx % num_k_heads;
         }
         return std::min(num_k_heads - 1, v_head_idx / heads_per_group);
     };

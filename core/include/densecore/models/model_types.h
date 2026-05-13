@@ -633,6 +633,13 @@ struct TransformerModel {
     };
     std::unordered_map<const struct ggml_tensor*, Int4WeightBinding> int4_weight_bindings;
 
+    // Optional ggml CPU_REPACK tensor aliases. These keep selected immutable
+    // GGUF weights in backend-owned repacked buffers while preserving the raw
+    // GGUF tensors for loader metadata, fallback paths, and parity probes.
+    struct ggml_context* ctx_cpu_repack = nullptr;
+    std::vector<ggml_backend_buffer_t> cpu_repack_buffers;
+    std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_repack_aliases;
+
     // FP8 format variants for custom packed INT8 tensor storage.
     enum class FP8Format : uint8_t {
         E5M2 = 0,

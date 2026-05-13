@@ -76,13 +76,6 @@ bool PreserveThinkingForRender(const CanonicalChatRenderOptions& options) {
     return true;
 }
 
-bool ShouldPreOpenThinkingBlock(const TransformerModel* model) {
-    if (!model) {
-        return false;
-    }
-    return DescribeModel(model).variant != ModelVariant::QWEN36;
-}
-
 std::string RenderQwenAssistantMessage(const CanonicalChatMessage& message, bool preserve_thinking) {
     const std::string content = TrimCopy(message.content);
     if (!preserve_thinking) {
@@ -140,6 +133,8 @@ bool IsGemma4LikelyControlToken(const std::string& token) {
         "<bos>",
         "<unk>",
         "<mask>",
+        "<|channel>",
+        "<channel|>",
         "<|think|>",
         "<|turn>",
         "<turn|>",
@@ -149,8 +144,6 @@ bool IsGemma4LikelyControlToken(const std::string& token) {
         "<tool_call|>",
         "<|tool_response>",
         "<tool_response|>",
-        "<|channel>",
-        "<channel|>",
         "<table>",
         "</table>",
         "<html>",
@@ -167,6 +160,10 @@ bool IsGemma4LikelyControlToken(const std::string& token) {
         }
     }
     return token.rfind("<unused", 0) == 0;
+}
+
+bool IsGemma4GenerationChannelToken(const std::string& token) {
+    return token == "<|channel>" || token == "<channel|>";
 }
 
 bool IsAsciiTextLikeToken(const std::string& token) {
@@ -273,10 +270,11 @@ void AppendQwenAssistantGenerationCue(const TransformerModel* model, bool thinki
     }
     const auto& descriptor = DescribeModel(model);
     if (descriptor.variant == ModelVariant::QWEN36) {
+        // Qwen3.6 GGUF chat templates do not support the older /no_think
+        // directive. Only prime the reasoning channel when thinking is enabled;
+        // no-thinking mode must leave the assistant cue clean for suppression.
         if (thinking_enabled) {
             out->append("<think>\n");
-        } else {
-            out->append("<think>\n\n</think>\n");
         }
         return;
     }
@@ -330,7 +328,7 @@ PromptTemplateProfile ResolveModelPromptTemplateProfile(const TransformerModel* 
     const bool has_role_tokens = HasTokenLiteral(model, "<|user|>") && HasTokenLiteral(model, "<|assistant|>");
     const bool has_turn_tokens = HasTokenLiteral(model, "<|turn>") && HasTokenLiteral(model, "<turn|>");
     const bool template_looks_chatml = TemplateContains(model, "<|im_start|>");
-    const bool template_looks_turn_tags = TemplateContains(model, "<|turn>") && TemplateContains(model, "<turn|>");
+    const bool template_looks_turn_tags = TemplateContains(model, "<|turn>");
 
     if (prompt_family == PromptTemplateFamily::CHATML || has_chatml_tokens || template_looks_chatml) {
         profile.kind = PromptTemplateKind::CHATML;
@@ -466,6 +464,9 @@ void ConfigureGemma4TextTokenBlocklistForModel(const TransformerModel* model, Re
             if (token_type == 1 || token_type == 6) {
                 continue;
             }
+            if (i < model->vocab_tokens.size() && IsGemma4GenerationChannelToken(model->vocab_tokens[i])) {
+                continue;
+            }
             const int token_id = static_cast<int>(i);
             if (!is_stop_id(token_id)) {
                 AppendDisallowedTokenId(req, token_id);
@@ -556,7 +557,7 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         if (profile.supports_thinking && profile.thinking_enabled) {
             wrapped += profile.open_tag;
             wrapped += profile.system_role;
-            wrapped += "\n<|think|>";
+            wrapped += "\n<|think|>\n";
             wrapped += profile.close_tag;
         }
         wrapped += profile.open_tag;
@@ -567,6 +568,10 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         wrapped += profile.open_tag;
         wrapped += profile.assistant_role;
         wrapped += "\n";
+        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking &&
+            profile.thinking_enabled) {
+            wrapped += "<|channel>thought\n<channel|>";
+        }
         return wrapped;
     }
 
@@ -661,7 +666,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
             rendered += profile.system_role;
             rendered += "\n";
             if (thinking_enabled) {
-                rendered += "<|think|>";
+                rendered += "<|think|>\n";
             }
             for (size_t i = 0; i < system_parts.size(); ++i) {
                 if (i != 0) {
@@ -699,6 +704,10 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
         rendered += profile.open_tag;
         rendered += profile.assistant_role;
         rendered += "\n";
+        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking &&
+            thinking_enabled) {
+            rendered += "<|channel>thought\n<channel|>";
+        }
         return rendered;
     }
 

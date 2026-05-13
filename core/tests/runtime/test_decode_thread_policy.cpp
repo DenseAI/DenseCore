@@ -179,6 +179,20 @@ TEST(DecodeThreadPolicy, Qwen36A3BSingleDecodeUsesC4AWideSimdPolicyOnArm) {
     EXPECT_STREQ(selection.label, "decode_qwen36_a3b_c4a_moe_16");
 }
 
+TEST(DecodeThreadPolicy, Gemma4A4BSingleDecodeUsesC4AWideSimdPolicyOnArm) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_experts = 128;
+
+    const DecodeThreadPolicySelection selection =
+        ResolveDecodeThreadPolicySelection(&model, 1, 16, 16, SimdLevel::SVE2);
+
+    EXPECT_EQ(selection.threads, 16);
+    EXPECT_STREQ(selection.label, "decode_gemma4_a4b_c4a_moe_16");
+}
+
 TEST(DecodeThreadPolicy, Qwen36SingleDecodeEnvOverrideStillWins) {
     ScopedEnvVar decode_override("DENSECORE_QWEN36_SINGLE_DECODE_THREADS", "11");
 
@@ -220,7 +234,7 @@ TEST(DecodeThreadPolicy, LongHybridSsmPromptBypassesSingleRequestFastPath) {
     EXPECT_TRUE(ShouldBypassSingleRequestFastPathForLongHybridSSM(&model, &req));
 }
 
-TEST(DecodeThreadPolicy, HybridSsmDecodeReentryBypassesSingleRequestFastPath) {
+TEST(DecodeThreadPolicy, HybridSsmDecodeReentryKeepsSingleRequestFastPathEligible) {
     ScopedEnvVar disable_override("DENSECORE_DISABLE_SINGLE_REQ_FAST_PATH_FOR_LONG_HYBRID_SSM", nullptr);
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
@@ -231,7 +245,7 @@ TEST(DecodeThreadPolicy, HybridSsmDecodeReentryBypassesSingleRequestFastPath) {
     req.tokens = {1};
     req.n_past = 1024;
 
-    EXPECT_TRUE(ShouldBypassSingleRequestFastPathForLongHybridSSM(&model, &req));
+    EXPECT_FALSE(ShouldBypassSingleRequestFastPathForLongHybridSSM(&model, &req));
 }
 
 TEST(DecodeThreadPolicy, ShortFreshHybridSsmPromptKeepsSingleRequestFastPathEligible) {
@@ -364,7 +378,12 @@ TEST(DecodeThreadPolicy, Gemma4MoEPrefillChunkAutoChunksLongPrompts) {
     req.prompt_token_count = 1536;
     req.prompt_tokens_for_cache.resize(1536, 1);
 
-    EXPECT_EQ(ResolveGemma4PrefillChunkTokens(&model, &req), 256);
+    EXPECT_EQ(ResolveGemma4PrefillChunkTokens(&model, &req), 64);
+
+    req.prompt_token_count = 3066;
+    req.prompt_tokens_for_cache.resize(3066, 1);
+
+    EXPECT_EQ(ResolveGemma4PrefillChunkTokens(&model, &req), 128);
 }
 
 TEST(DecodeThreadPolicy, Gemma4MoEPrefillChunkAutoKeepsShortPromptsUnchunked) {

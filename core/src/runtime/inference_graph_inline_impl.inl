@@ -400,7 +400,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // 1. qkv_mixed projection: normed input [n_embd, N] → [conv_channels, N]
             const bool prefer_plain_qwen35_hybrid_matmul =
-                model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
+                (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+                model->arch_flags.is_hybrid_ssm;
             struct ggml_tensor* qkv_mixed = prefer_plain_qwen35_hybrid_matmul
                                                 ? ggml_mul_mat(ctx_c, attn_qkv, cur)
                                                 : smart_mul_mat(ctx_c, attn_qkv, cur, model);
@@ -618,6 +619,15 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // Optional fused QKV projection (single pass over input per token).
             // Falls back to per-projection matmul for non-F32/quantized weights.
+            struct ggml_tensor* gemma4_fused_qkv_repack = nullptr;
+            if (model->arch_flags.is_gemma4 && IsFusedQKVEnabled() && cur->type == GGML_TYPE_F32) {
+                gemma4_fused_qkv_repack = layer.Get("attn_qkv.cpu_repack_fused");
+                if (gemma4_fused_qkv_repack &&
+                    (gemma4_fused_qkv_repack->ne[0] != cur->ne[0] ||
+                     gemma4_fused_qkv_repack->ne[1] != wq->ne[1] + wk->ne[1] + wv->ne[1])) {
+                    gemma4_fused_qkv_repack = nullptr;
+                }
+            }
             const bool fused_qkv_supported = !use_glm_dsa_mla && IsFusedQKVEnabled() && cur->type == GGML_TYPE_F32 &&
                                              wq->type == GGML_TYPE_F32 && wk->type == GGML_TYPE_F32 &&
                                              wv->type == GGML_TYPE_F32 && wq->data && wk->data && wv->data &&
@@ -699,6 +709,23 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     glm_index_key = smart_mul_mat(ctx_c, indexer_wk, cur, model);
                     glm_index_key = apply_weighted_rms_norm(glm_index_key, indexer_k_norm, "glm_index_k_norm", il);
                 }
+            } else if (gemma4_fused_qkv_repack) {
+                const int dim_q_fused = static_cast<int>(wq->ne[1]);
+                const int dim_k_fused = static_cast<int>(wk->ne[1]);
+                const int dim_v_fused = static_cast<int>(wv->ne[1]);
+                const int merged_dim = dim_q_fused + dim_k_fused + dim_v_fused;
+
+                struct ggml_tensor* qkv_mixed = ggml_mul_mat(ctx_c, gemma4_fused_qkv_repack, cur);
+                char qkv_name[96];
+                std::snprintf(qkv_name, sizeof(qkv_name), "blk.%d.attn_qkv.cpu_repack_fused", il);
+                ggml_set_name(qkv_mixed, qkv_name);
+
+                const size_t k_offset = static_cast<size_t>(dim_q_fused) * sizeof(float);
+                const size_t v_offset = static_cast<size_t>(dim_q_fused + dim_k_fused) * sizeof(float);
+                Qcur = ggml_view_2d(ctx_c, qkv_mixed, dim_q_fused, N, qkv_mixed->nb[1], 0);
+                Kcur = ggml_view_2d(ctx_c, qkv_mixed, dim_k_fused, N, qkv_mixed->nb[1], k_offset);
+                Vcur = ggml_view_2d(ctx_c, qkv_mixed, dim_v_fused, N, qkv_mixed->nb[1], v_offset);
+                (void)merged_dim;
             } else if (fused_qkv_supported) {
                 const int dim_q_fused = static_cast<int>(wq->ne[1]);
                 const int dim_k_fused = static_cast<int>(wk->ne[1]);
@@ -1396,6 +1423,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 // =========================================================================
                 struct ggml_tensor* K = K_all;
                 struct ggml_tensor* V = V_all;
+                int attn_kv_start_pos = 0;
                 attn_ref_k = K;
                 attn_ref_v = V;
                 attn_core_reference_eligible = true;
@@ -1442,6 +1470,21 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                         << std::endl;
                 }
 
+                if (attention_dispatch.use_portable_cpu_flash_attention && fast_attn_sliding_window >= 0 &&
+                    attn_query_base_pos > fast_attn_sliding_window && K && V && K->ne[2] == V->ne[2]) {
+                    const int64_t kv_tokens = K->ne[2];
+                    const int64_t drop_tokens =
+                        std::min<int64_t>(kv_tokens - 1, attn_query_base_pos - fast_attn_sliding_window);
+                    if (drop_tokens > 0 && drop_tokens < kv_tokens) {
+                        const int64_t kept_tokens = kv_tokens - drop_tokens;
+                        K = ggml_view_3d(ctx_c, K, K->ne[0], K->ne[1], kept_tokens, K->nb[1], K->nb[2],
+                                         static_cast<size_t>(drop_tokens) * static_cast<size_t>(K->nb[2]));
+                        V = ggml_view_3d(ctx_c, V, V->ne[0], V->ne[1], kept_tokens, V->nb[1], V->nb[2],
+                                         static_cast<size_t>(drop_tokens) * static_cast<size_t>(V->nb[2]));
+                        attn_kv_start_pos = static_cast<int>(drop_tokens);
+                    }
+                }
+
                 if (decode_paged_policy.debug_log && il == 0 && (decode_only_batch || N == 1)) {
                     const char* path = use_paged_decode_attention
                                            ? "paged_decode"
@@ -1483,7 +1526,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 if (use_paged_decode_attention) {
                     KQV = ExecutePagedDecodeAttentionPath(ctx_c, model, cache, Qcur, Kcur, Vcur, il, kv_cache_layer,
                                                           gemma4_shared_kv_layer, gemma4_shared_kv_source_layer,
-                                                          head_dim_q, head_dim_v, n_head, n_total_tokens,
+                                                          head_dim_q, head_dim_v, n_head, n_head_kv, n_total_tokens,
                                                           fast_attn_logit_softcap, use_explicit_attention_scale);
                 } else if (attention_dispatch.use_hal_attention_dispatch) {
                     KQV = ExecuteHalAttentionPath(ctx_c, model, Qcur, K, V, il, N, head_dim_q, n_head_kv,
@@ -1493,7 +1536,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 } else if (attention_dispatch.use_portable_cpu_flash_attention) {
                     KQV = ExecutePortableCpuFlashAttentionPath(
                         ctx_c, model, Qcur, K, V, il, N, head_dim_q, head_dim_kv, head_dim_v, n_head_kv,
-                        attn_query_base_pos, fast_attn_sliding_window, fast_attn_logit_softcap,
+                        attn_query_base_pos, attn_kv_start_pos, fast_attn_sliding_window, fast_attn_logit_softcap,
                         fast_attn_semantic_flags, use_explicit_attention_scale,
                         attention_dispatch.use_portable_cpu_flash_native_decode_layout);
                 } else if (attention_dispatch.use_flash_attention) {
@@ -1652,6 +1695,17 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 cur = apply_weighted_rms_norm(cur, post_attn_norm, "post_attention_norm", il);
             }
 
+            if (il == static_cast<int>(model->layers.size()) - 1 && ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
+                const size_t last_token_offset = static_cast<size_t>(N - 1) * static_cast<size_t>(cur->nb[1]);
+                cur = ggml_view_2d(ctx_c, cur, cur->ne[0], 1, cur->nb[1], last_token_offset);
+                cur = ggml_cont(ctx_c, cur);
+
+                const size_t residual_last_token_offset =
+                    static_cast<size_t>(N - 1) * static_cast<size_t>(inpL->nb[1]);
+                inpL = ggml_view_2d(ctx_c, inpL, inpL->ne[0], 1, inpL->nb[1], residual_last_token_offset);
+                inpL = ggml_cont(ctx_c, inpL);
+            }
+
             // Residual Connection
             attn_out = cur;
             if (ShouldRunHiddenSnapshotProbe(il, "attn_out_pre_residual")) {
@@ -1765,11 +1819,12 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         }
 
         bool used_fused_pre_ffn_norm = false;
-        if (IsFusedResidualRmsNormEnabled() && attn_out && inpL && attn_out->type == GGML_TYPE_F32 &&
-            inpL->type == GGML_TYPE_F32 && ffn_norm->type == GGML_TYPE_F32 && attn_out->data && inpL->data &&
-            ffn_norm->data) {
+        const bool fused_pre_ffn_norm_graph_cache_safe = !decode_only_batch_layout;
+        if (fused_pre_ffn_norm_graph_cache_safe && IsFusedResidualRmsNormEnabled() && attn_out && inpL &&
+            attn_out->type == GGML_TYPE_F32 &&
+            inpL->type == GGML_TYPE_F32 && ffn_norm->type == GGML_TYPE_F32 && ffn_norm->data) {
             AddRMSNormUserData* fused_ud = GetAddRMSNormUserData();
-            fused_ud->residual = reinterpret_cast<const float*>(inpL->data);
+            fused_ud->residual = nullptr;
             bind_add_rmsnorm_weight(fused_ud, ffn_norm, "ffn_norm");
             fused_ud->n_embd = static_cast<int>(attn_out->ne[0]);
             fused_ud->n_tokens = static_cast<int>(attn_out->ne[1]);
@@ -1781,7 +1836,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             fused_ud->var_name = "ffn_norm";
 
             const int n_tasks = ResolveTaskCount(&batch, std::max<int>(1, fused_ud->n_tokens));
-            cur = ggml_map_custom1(ctx_c, attn_out, cb_residual_rmsnorm_fused, n_tasks, fused_ud);
+            cur = ggml_map_custom2(ctx_c, attn_out, inpL, cb_residual_rmsnorm_fused2, n_tasks, fused_ud);
+            ggml_set_name(cur, "pre_ffn_add_rmsnorm_fused");
             used_fused_pre_ffn_norm = true;
         }
 
@@ -1817,6 +1873,18 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             if (is_gemma4_moe && gemma_pre_moe_norm) {
                 routed_input =
                     apply_weighted_rms_norm(inpFF, gemma_pre_moe_norm, "gemma4_pre_feedforward_layernorm_2", il);
+            }
+            if (ShouldRunHiddenSnapshotProbe(il, "moe_routed_input")) {
+                auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
+                if (hidden_ud) {
+                    hidden_ud->layer_idx = il;
+                    hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                    hidden_ud->token_ids = batch.tokens.data();
+                    hidden_ud->token_seq_ids = batch.seq_id.data();
+                    hidden_ud->stage = "moe_routed_input";
+                    hidden_ud->var_name = "ffn_norm_2";
+                    routed_input = ggml_map_custom1(ctx_c, routed_input, cb_hidden_snapshot_probe, 1, hidden_ud);
+                }
             }
             struct ggml_tensor* router_input = cur;
             if (is_gemma4_moe) {
@@ -1869,58 +1937,65 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             }
 
             // 2. Dispatch
-            MoEUserData* moe_ud = AllocateMoEUserData(ctx_c);
-            if (moe_ud) {
-                moe_ud->model = model;
-                moe_ud->layer = &model->layers[il];
-                moe_ud->layer_idx = il;
-                int moe_top_k = layer_spec ? layer_spec->ffn.top_k : static_cast<int>(model->hparams.n_experts_used);
-                moe_ud->k = moe_top_k;
-                if (IsQwen36ProfilingEnabled()) {
-                    if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
-                        moe_ud->profile = &work_ctx->qwen36_profile;
-                        SetQwen36ProfileMax(work_ctx->qwen36_profile.moe_task_count, 1);
+            int moe_top_k = layer_spec ? layer_spec->ffn.top_k : static_cast<int>(model->hparams.n_experts_used);
+            struct ggml_tensor* native_moe =
+                TryBuildGemma4NativeMoEGraph(ctx_c, gf, model, &model->layers[il], il, routed_input, gate_logits,
+                                             moe_top_k);
+            if (native_moe) {
+                cur = native_moe;
+            } else {
+                MoEUserData* moe_ud = AllocateMoEUserData(ctx_c);
+                if (moe_ud) {
+                    moe_ud->model = model;
+                    moe_ud->layer = &model->layers[il];
+                    moe_ud->layer_idx = il;
+                    moe_ud->k = moe_top_k;
+                    if (IsQwen36ProfilingEnabled()) {
+                        if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+                            moe_ud->profile = &work_ctx->qwen36_profile;
+                            SetQwen36ProfileMax(work_ctx->qwen36_profile.moe_task_count, 1);
+                        }
+                    }
+                    // Resolve preferred device first, then guarantee CPU fallback for MoE.
+                    densecore::BackendRegistry& registry = ResolveBackendRegistry(&batch);
+                    densecore::ComputeBackend* preferred_backend = registry.Get(ResolvePreferredDevice(&batch));
+                    moe_ud->backend = dynamic_cast<densecore::CpuBackend*>(preferred_backend);
+                    if (!moe_ud->backend) {
+                        moe_ud->backend = dynamic_cast<densecore::CpuBackend*>(registry.Get(densecore::DeviceType::CPU));
+                    }
+                    if (!moe_ud->backend) {
+                        moe_ud->backend = &densecore::GetTelemetryCpuBackend();
+                    }
+                    if (moe_ud->backend && !ggml_get_no_alloc(ctx_c)) {
+                        const densecore::CpuBackend::ExpertWeights* registered_experts = nullptr;
+                        int registered_count = 0;
+                        if (!moe_ud->backend->GetRegisteredExpertsView(moe_ud->layer, &registered_experts,
+                                                                       &registered_count) ||
+                            !registered_experts || registered_count <= 0) {
+                            auto experts = BuildExpertWeights(moe_ud->layer, model);
+                            const int n_experts = static_cast<int>(experts.size());
+                            moe_ud->backend->InitMoEProfiler(moe_ud->layer, n_experts);
+                            moe_ud->backend->RegisterMoEExperts(moe_ud->layer, experts);
+                            moe_ud->backend->GetRegisteredExpertsView(moe_ud->layer, &registered_experts,
+                                                                      &registered_count);
+                        }
+                        EnsureMoERebalanceThread(moe_ud->backend);
+                        if (registered_experts && registered_count > 0) {
+                            moe_ud->experts = registered_experts;
+                            moe_ud->n_experts = registered_count;
+                            moe_ud->experts_registered = true;
+                        }
                     }
                 }
-                // Resolve preferred device first, then guarantee CPU fallback for MoE.
-                densecore::BackendRegistry& registry = ResolveBackendRegistry(&batch);
-                densecore::ComputeBackend* preferred_backend = registry.Get(ResolvePreferredDevice(&batch));
-                moe_ud->backend = dynamic_cast<densecore::CpuBackend*>(preferred_backend);
-                if (!moe_ud->backend) {
-                    moe_ud->backend = dynamic_cast<densecore::CpuBackend*>(registry.Get(densecore::DeviceType::CPU));
-                }
-                if (!moe_ud->backend) {
-                    moe_ud->backend = &densecore::GetTelemetryCpuBackend();
-                }
-                if (moe_ud->backend && !ggml_get_no_alloc(ctx_c)) {
-                    const densecore::CpuBackend::ExpertWeights* registered_experts = nullptr;
-                    int registered_count = 0;
-                    if (!moe_ud->backend->GetRegisteredExpertsView(moe_ud->layer, &registered_experts,
-                                                                   &registered_count) ||
-                        !registered_experts || registered_count <= 0) {
-                        auto experts = BuildExpertWeights(moe_ud->layer, model);
-                        const int n_experts = static_cast<int>(experts.size());
-                        moe_ud->backend->InitMoEProfiler(moe_ud->layer, n_experts);
-                        moe_ud->backend->RegisterMoEExperts(moe_ud->layer, experts);
-                        moe_ud->backend->GetRegisteredExpertsView(moe_ud->layer, &registered_experts,
-                                                                  &registered_count);
-                    }
-                    EnsureMoERebalanceThread(moe_ud->backend);
-                    if (registered_experts && registered_count > 0) {
-                        moe_ud->experts = registered_experts;
-                        moe_ud->n_experts = registered_count;
-                        moe_ud->experts_registered = true;
-                    }
-                }
-            }
 
-            // Use map_custom2: src0=cur, src1=gate_logits
-            g_moe_graph_wiring_debug_counter.fetch_add(1, std::memory_order_relaxed);
-            cur = ggml_map_custom2(ctx_c, routed_input, gate_logits, cb_moe_forward, 1, moe_ud);
-            {
-                char moe_name[64];
-                std::snprintf(moe_name, sizeof(moe_name), "blk.%d.moe_forward", il);
-                ggml_set_name(cur, moe_name);
+                // Use map_custom2: src0=cur, src1=gate_logits
+                g_moe_graph_wiring_debug_counter.fetch_add(1, std::memory_order_relaxed);
+                cur = ggml_map_custom2(ctx_c, routed_input, gate_logits, cb_moe_forward, 1, moe_ud);
+                {
+                    char moe_name[64];
+                    std::snprintf(moe_name, sizeof(moe_name), "blk.%d.moe_forward", il);
+                    ggml_set_name(cur, moe_name);
+                }
             }
             if (ShouldRunHiddenSnapshotProbe(il, "moe_routed_output")) {
                 auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
@@ -1959,12 +2034,35 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 DebugLogSharedExpertTensor("ffn_shared_gate_w", il, ffn_shared_gate);
                 const bool prefer_plain_shared_expert_matmul =
                     model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm;
-                struct ggml_tensor* shared_gate = prefer_plain_shared_expert_matmul
-                                                      ? ggml_mul_mat(ctx_c, ffn_gate, shared_input)
-                                                      : smart_mul_mat(ctx_c, ffn_gate, shared_input, model);
-                struct ggml_tensor* shared_up = prefer_plain_shared_expert_matmul
-                                                    ? ggml_mul_mat(ctx_c, ffn_up, shared_input)
-                                                    : smart_mul_mat(ctx_c, ffn_up, shared_input, model);
+                struct ggml_tensor* shared_gate = nullptr;
+                struct ggml_tensor* shared_up = nullptr;
+                struct ggml_tensor* shared_gate_up_fused =
+                    (is_gemma4_moe && !prefer_plain_shared_expert_matmul && shared_input->type == GGML_TYPE_F32)
+                        ? layer.Get("ffn_gate_up.cpu_repack_fused")
+                        : nullptr;
+                if (shared_gate_up_fused &&
+                    (shared_gate_up_fused->ne[0] != shared_input->ne[0] ||
+                     shared_gate_up_fused->ne[1] != ffn_gate->ne[1] + ffn_up->ne[1])) {
+                    shared_gate_up_fused = nullptr;
+                }
+                if (shared_gate_up_fused) {
+                    struct ggml_tensor* shared_gate_up = ggml_mul_mat(ctx_c, shared_gate_up_fused, shared_input);
+                    char fused_name[96];
+                    std::snprintf(fused_name, sizeof(fused_name), "blk.%d.shared_ffn_gate_up.cpu_repack_fused", il);
+                    ggml_set_name(shared_gate_up, fused_name);
+                    const size_t up_offset = static_cast<size_t>(ffn_gate->ne[1]) * sizeof(float);
+                    shared_gate = ggml_view_2d(ctx_c, shared_gate_up, ffn_gate->ne[1], shared_input->ne[1],
+                                               shared_gate_up->nb[1], 0);
+                    shared_up = ggml_view_2d(ctx_c, shared_gate_up, ffn_up->ne[1], shared_input->ne[1],
+                                             shared_gate_up->nb[1], up_offset);
+                } else {
+                    shared_gate = prefer_plain_shared_expert_matmul
+                                      ? ggml_mul_mat(ctx_c, ffn_gate, shared_input)
+                                      : smart_mul_mat(ctx_c, ffn_gate, shared_input, model);
+                    shared_up = prefer_plain_shared_expert_matmul
+                                    ? ggml_mul_mat(ctx_c, ffn_up, shared_input)
+                                    : smart_mul_mat(ctx_c, ffn_up, shared_input, model);
+                }
                 DebugLogSharedExpertTensor("shared_gate_proj", il, shared_gate);
                 DebugLogSharedExpertTensor("shared_up_proj", il, shared_up);
                 if (ShouldRunFfnProjectionReferenceProbe(il)) {
@@ -2387,8 +2485,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
     // LM Head projection: [n_embd, N] -> [n_vocab, N]
     struct ggml_tensor* cur_input_to_lm_head = cur;
-    if (ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
-        const size_t last_token_offset = static_cast<size_t>(N - 1) * static_cast<size_t>(cur->nb[1]);
+    if (cur->ne[1] > 1 && ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
+        const int64_t actual_tokens = cur->ne[1];
+        const size_t last_token_offset = static_cast<size_t>(actual_tokens - 1) * static_cast<size_t>(cur->nb[1]);
         cur_input_to_lm_head = ggml_view_2d(ctx_c, cur, cur->ne[0], 1, cur->nb[1], last_token_offset);
         cur_input_to_lm_head = ggml_cont(ctx_c, cur_input_to_lm_head);
     }
@@ -2495,7 +2594,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         cur = ggml_map_custom1(ctx_c, cur, cb_projection_reference_probe, 1, final_ref_ud);
     }
     if (model->arch_flags.is_gemma4 && model->gemma4_final_logit_softcapping > 0.0f &&
-        !densecore::models::IsGemma4FinalLogitSoftcapDisabled()) {
+        !densecore::models::IsGemma4FinalLogitSoftcapDisabled() &&
+        std::getenv("DENSECORE_GEMMA4_GRAPH_FINAL_LOGIT_SOFTCAP") != nullptr) {
         const float inv_softcap = 1.0f / model->gemma4_final_logit_softcapping;
         cur = ggml_scale(ctx_c, cur, inv_softcap);
         cur = ggml_tanh(ctx_c, cur);

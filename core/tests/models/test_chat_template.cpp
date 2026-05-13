@@ -5,6 +5,7 @@
 
 #include "models/model_prompt_templates.h"
 #include "densecore/models/model_types.h"
+#include "densecore/models/tokenizer.h"
 
 std::string DenseCoreTestOnlyApplyAutoChatTemplate(const TransformerModel* model, const std::string& prompt);
 bool DenseCoreTestOnlyPromptStartsInThinkBlock(const std::string& prompt);
@@ -41,7 +42,7 @@ TEST(ChatTemplateTest, AutoTemplateLeavesGemmaPromptUntouchedWhenAlreadyTemplate
     model.token_to_id["<|turn>"] = 1;
     model.token_to_id["<turn|>"] = 2;
 
-    const std::string prompt = "<bos><|turn>user\nhello\n<turn|>\n<|turn>model\n";
+    const std::string prompt = "<bos><|turn>user\nhello\n<|turn>model\n";
     EXPECT_EQ(DenseCoreTestOnlyApplyAutoChatTemplate(&model, prompt), prompt);
 }
 
@@ -122,8 +123,7 @@ TEST(ChatTemplateTest, Qwen36ExplicitOverrideDisablesThinking) {
     EXPECT_EQ(wrapped,
               "<|im_start|>user\n"
               "hello<|im_end|>\n"
-              "<|im_start|>assistant\n"
-              "<think>\n\n</think>\n");
+              "<|im_start|>assistant\n");
 }
 
 TEST(ChatTemplateTest, Qwen36DisableDoesNotInjectNoThinkDirective) {
@@ -244,11 +244,14 @@ TEST(ChatTemplateTest, GemmaThinkingAutoTemplateInjectsThinkSystemTurn) {
     EXPECT_EQ(wrapped,
               "<bos>"
               "<|turn>system\n"
-              "<|think|><turn|>\n"
+              "<|think|>\n"
+              "<turn|>\n"
               "<|turn>user\n"
               "hello"
               "<turn|>\n"
-              "<|turn>model\n");
+              "<|turn>model\n"
+              "<|channel>thought\n"
+              "<channel|>");
 }
 
 TEST(ChatTemplateTest, RoleTagAutoTemplateUsesDedicatedSystemAndAssistantTags) {
@@ -448,12 +451,18 @@ TEST(CanonicalChatRenderTest, GemmaCanonicalRendererMatchesTurnTags) {
     bool thinking_enabled = false;
     const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {}, &thinking_enabled);
 
-    EXPECT_FALSE(thinking_enabled);
+    EXPECT_TRUE(thinking_enabled);
     EXPECT_EQ(rendered,
               "<bos>"
+              "<|turn>system\n"
+              "<|think|>\n"
+              "<turn|>\n"
               "<|turn>user\n"
-              "What is the capital of France?<turn|>\n"
-              "<|turn>model\n");
+              "What is the capital of France?"
+              "<turn|>\n"
+              "<|turn>model\n"
+              "<|channel>thought\n"
+              "<channel|>");
 }
 
 TEST(QwenReasoningBlocklistTest, NoThinkingBlocksReasoningTagsButKeepsChatTerminator) {
@@ -485,7 +494,8 @@ TEST(Gemma4TextBlocklistTest, BlocksControlAndUnusedTokensButKeepsStopIds) {
     model.arch_flags.is_gemma4 = true;
     model.eos_token_id = 99;
     model.stop_token_ids = {99};
-    model.vocab_tokens = {"normal", "<unk>", "<|think|>", "<|turn>", "<unused7>", "<0x41>", "<eos>", "plain"};
+    model.vocab_tokens = {"normal", "<unk>", "<|think|>", "<|turn>", "<unused7>", "<0x41>",
+                          "<eos>", "plain", "<|channel>", "<channel|>"};
     model.token_to_id["normal"] = 0;
     model.token_to_id["<unk>"] = 1;
     model.token_to_id["<|think|>"] = 2;
@@ -494,7 +504,9 @@ TEST(Gemma4TextBlocklistTest, BlocksControlAndUnusedTokensButKeepsStopIds) {
     model.token_to_id["<0x41>"] = 5;
     model.token_to_id["<eos>"] = 6;
     model.token_to_id["plain"] = 7;
-    model.token_types = {1, 2, 3, 4, 5, 6, 1, 1};
+    model.token_to_id["<|channel>"] = 8;
+    model.token_to_id["<channel|>"] = 9;
+    model.token_types = {1, 2, 3, 4, 5, 6, 1, 1, 3, 3};
 
     const std::vector<int> blocked = DenseCoreTestOnlyGemma4TextBlocklist(&model);
 
@@ -506,6 +518,8 @@ TEST(Gemma4TextBlocklistTest, BlocksControlAndUnusedTokensButKeepsStopIds) {
     EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 5), blocked.end());
     EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 6), blocked.end());
     EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 7), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 8), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 9), blocked.end());
     EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 99), blocked.end());
 }
 
@@ -536,4 +550,17 @@ TEST(Gemma4TextBlocklistTest, HandlesPartialTokenTypeMetadata) {
     EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 6), blocked.end());
     EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 7), blocked.end());
     EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 99), blocked.end());
+}
+
+TEST(Gemma4TextBlocklistTest, DetokenizesGenerationChannelTokensLikeLlamaCpp) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.vocab_tokens = {"<|channel>", "<channel|>", "<|turn>"};
+    model.token_types = {3, 3, 3};
+
+    EXPECT_EQ(Tokenizer::Detokenize(&model, 0), "<|channel>");
+    EXPECT_EQ(Tokenizer::Detokenize(&model, 1), "<channel|>");
+    EXPECT_EQ(Tokenizer::Detokenize(&model, 2), "");
 }

@@ -37,6 +37,7 @@
 #include "densecore/runtime/optimization_bridge.h"  // Runtime SIMD dispatch
 #include "densecore/simd/simd_ops.h"
 #include "ggml.h"
+#include "llm/attention/exec.h"
 #include "llm/config/runtime_config.h"
 #include "runtime/engine_internal.h"
 #include "runtime/runtime_env.h"
@@ -50,6 +51,17 @@
 #include "densecore/models/model_descriptor.h"
 #include "densecore/runtime/inference.h"
 #include "models/model_inference_policy.h"
+
+void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_matmul_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_matmul_hal_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_matmul_int4_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_matmul_fp8_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_rope_precomputed_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
 
 namespace {
 
@@ -127,6 +139,25 @@ bool IsFlexibleGraphPoolSizingEnabled(const TransformerModel* model) {
     return ParseBoolEnvDefault("DENSECORE_FLEXIBLE_GRAPH_POOL", true);
 }
 
+size_t ReadAvailableMemoryBytesForRuntimePools() {
+#if defined(__linux__)
+    std::FILE* file = std::fopen("/proc/meminfo", "r");
+    if (!file) {
+        return 0;
+    }
+    char line[256] = {};
+    unsigned long long kb = 0;
+    while (std::fgets(line, sizeof(line), file)) {
+        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            std::fclose(file);
+            return static_cast<size_t>(kb) * 1024ULL;
+        }
+    }
+    std::fclose(file);
+#endif
+    return 0;
+}
+
 void AccumulateDryRunTensorBytes(const ggml_tensor* tensor, std::unordered_set<const ggml_tensor*>& seen,
                                  size_t& data_bytes) {
     if (!tensor || !seen.insert(tensor).second) {
@@ -159,15 +190,8 @@ size_t ApplyFlexibleGraphPoolGrowthReserve(size_t required_bytes,
         return required_bytes;
     }
     constexpr size_t MB = 1024ULL * 1024ULL;
-    constexpr size_t kTwoGb = 2048ULL * MB;
-    size_t reserve_bytes = 0;
-    if (required_bytes < 4096ULL * MB) {
-        reserve_bytes = std::max<size_t>(required_bytes, std::min<size_t>(required_bytes * 2, required_bytes + kTwoGb));
-    } else if (required_bytes < 16384ULL * MB) {
-        reserve_bytes = required_bytes + std::max<size_t>(required_bytes / 2, kTwoGb);
-    } else {
-        reserve_bytes = required_bytes + std::max<size_t>(required_bytes / 4, kTwoGb);
-    }
+    const size_t measured_margin = std::max(required_bytes / 8, graph_estimate.long_context_safety_pad_bytes);
+    const size_t reserve_bytes = required_bytes + std::max<size_t>(measured_margin, 128ULL * MB);
     return AlignUpBytes(reserve_bytes, 512ULL * MB);
 }
 
@@ -181,8 +205,12 @@ FlexibleGraphPoolSizing MeasureFlexibleGraphPoolSize(TransformerModel* model, Pa
 
     constexpr size_t MB = 1024ULL * 1024ULL;
     const size_t fallback_mb = std::max<size_t>(512, fallback_estimate.total_bytes / MB);
-    const size_t default_dry_mb = std::min<size_t>(std::max<size_t>(fallback_mb, 1024), 4096);
-    const size_t dry_mb = ParseSizeEnvMb("DENSECORE_GRAPH_DRY_RUN_CTX_MB", default_dry_mb, 512, 8192);
+    const size_t available_bytes = ReadAvailableMemoryBytesForRuntimePools();
+    const size_t available_mb = available_bytes / MB;
+    const size_t auto_dry_cap_mb = available_mb > 0 ? std::max<size_t>(512, (available_mb * 3) / 4)
+                                                    : std::max<size_t>(fallback_mb, 1024);
+    const size_t default_dry_mb = std::min<size_t>(std::max<size_t>(fallback_mb, 1024), auto_dry_cap_mb);
+    const size_t dry_mb = ParseSizeEnvMb("DENSECORE_GRAPH_DRY_RUN_CTX_MB", default_dry_mb, 512, auto_dry_cap_mb);
     const size_t dry_context_bytes = dry_mb * MB;
 
     void* dry_buffer = nullptr;
@@ -283,6 +311,209 @@ void AccumulateQwen36SSMProjectionNodeTimes(InferenceWorkContext* work_ctx, ggml
     }
     if (qkv_ns || gate_ns || out_ns) {
         AddQwen36SSMProjectionWallProfile(work_ctx, qkv_ns, gate_ns, out_ns);
+    }
+}
+
+bool IsGemma4NodeTimingDumpEnabled() {
+    static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_DEBUG_GEMMA4_NODE_TIMES", false);
+    return enabled;
+}
+
+int Gemma4NodeTimingDumpLimit() {
+    return densecore::env::ParsePositiveEnvInt("DENSECORE_DEBUG_GEMMA4_NODE_TIMES_LIMIT", 24);
+}
+
+const char* Gemma4WeightClass(const char* name) {
+    if (!name || name[0] == '\0') {
+        return "unnamed_weight";
+    }
+    if (std::strcmp(name, "output.weight") == 0 || std::strcmp(name, "output") == 0 ||
+        std::strstr(name, "lm_head") || std::strstr(name, "output.weight")) {
+        return "lm_head";
+    }
+    if (std::strstr(name, "attn_q.weight") || std::strstr(name, "attn_q")) {
+        return "attn_q";
+    }
+    if (std::strstr(name, "attn_k.weight") || std::strstr(name, "attn_k")) {
+        return "attn_k";
+    }
+    if (std::strstr(name, "attn_v.weight") || std::strstr(name, "attn_v")) {
+        return "attn_v";
+    }
+    if (std::strstr(name, "attn_output.weight") || std::strstr(name, "attn_out") || std::strstr(name, "attn_o")) {
+        return "attn_o";
+    }
+    if (std::strstr(name, "ffn_gate_inp") || std::strstr(name, "moe_gate")) {
+        return "router";
+    }
+    if (std::strstr(name, "ffn_gate_exps") || std::strstr(name, "ffn_gate_up_exps")) {
+        return "moe_gate_up";
+    }
+    if (std::strstr(name, "ffn_down_exps")) {
+        return "moe_down";
+    }
+    if (std::strstr(name, "ffn_gate.weight")) {
+        return "shared_gate";
+    }
+    if (std::strstr(name, "ffn_up.weight")) {
+        return "shared_up";
+    }
+    if (std::strstr(name, "ffn_down.weight")) {
+        return "shared_down";
+    }
+    return "other_weight";
+}
+
+std::string Gemma4CustomNodeClass(const ggml_tensor* node) {
+    if (!node || node->op != GGML_OP_CUSTOM) {
+        return {};
+    }
+    struct CustomOpParamsView {
+        ggml_custom_op_t fun;
+        int n_tasks;
+        void* userdata;
+    };
+    static_assert(sizeof(CustomOpParamsView) <= GGML_MAX_OP_PARAMS, "custom op params view too large");
+    CustomOpParamsView params{};
+    std::memcpy(&params, node->op_params, sizeof(params));
+    if (params.fun == cb_gemv_custom || params.fun == cb_gemv_batched_custom) {
+        const ggml_tensor* weight = node->src[1];
+        const char* weight_name = weight && weight->name[0] ? weight->name : "<unnamed_weight>";
+        std::string label = params.fun == cb_gemv_custom ? "gemv/" : "gemv_batched/";
+        label += Gemma4WeightClass(weight_name);
+        label += "/";
+        label += weight_name;
+        return label;
+    }
+    if (params.fun == cb_paged_attention_decode) {
+        return "paged_attention_decode";
+    }
+    if (params.fun == cb_flash_attention_hal_custom) {
+        return "flash_attention_hal";
+    }
+    if (params.fun == cb_kv_update_and_gather_custom) {
+        return "kv_update_and_gather";
+    }
+    if (params.fun == cb_rope_precomputed_custom) {
+        return "rope_precomputed";
+    }
+    if (params.fun == cb_matmul_custom) {
+        return "matmul_custom";
+    }
+    if (params.fun == cb_matmul_hal_custom) {
+        return "matmul_hal_custom";
+    }
+    if (params.fun == cb_matmul_int4_custom) {
+        return "matmul_int4_custom";
+    }
+    if (params.fun == cb_matmul_fp8_custom) {
+        return "matmul_fp8_custom";
+    }
+    return "custom_other";
+}
+
+void DebugDumpGemma4NodeTimes(const TransformerModel* model, const ggml_cgraph* graph, const char* stage) {
+    if (!model || !model->arch_flags.is_gemma4 || !graph || !IsGemma4NodeTimingDumpEnabled()) {
+        return;
+    }
+    struct Entry {
+        std::string key;
+        uint64_t total_us = 0;
+        int count = 0;
+    };
+    std::unordered_map<std::string, Entry> by_key;
+    std::unordered_map<std::string, Entry> by_op;
+    uint64_t measured_us = 0;
+    const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
+        if (!node) {
+            continue;
+        }
+        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
+        if (elapsed_us <= 0) {
+            continue;
+        }
+        const char* name = node->name[0] ? node->name : "<unnamed>";
+        const char* op = ggml_op_name(node->op);
+        std::string op_key = op ? op : "<op>";
+        const std::string custom_class = Gemma4CustomNodeClass(node);
+        if (!custom_class.empty()) {
+            op_key += "/";
+            op_key += custom_class;
+        }
+        std::string key = op_key + ":" + name;
+        Entry& entry = by_key[key];
+        entry.key = std::move(key);
+        entry.total_us += static_cast<uint64_t>(elapsed_us);
+        entry.count += 1;
+        Entry& op_entry = by_op[op_key];
+        op_entry.key = std::move(op_key);
+        op_entry.total_us += static_cast<uint64_t>(elapsed_us);
+        op_entry.count += 1;
+        measured_us += static_cast<uint64_t>(elapsed_us);
+    }
+    auto make_sorted_entries = [](std::unordered_map<std::string, Entry>& values) {
+        std::vector<Entry> entries;
+        entries.reserve(values.size());
+        for (auto& kv : values) {
+            entries.push_back(std::move(kv.second));
+        }
+        std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+            if (a.total_us != b.total_us) {
+                return a.total_us > b.total_us;
+            }
+            return a.key < b.key;
+        });
+        return entries;
+    };
+    std::vector<Entry> entries = make_sorted_entries(by_key);
+    std::vector<Entry> op_entries = make_sorted_entries(by_op);
+    const int op_limit = std::min<int>(8, op_entries.size());
+    std::cerr << "[Gemma4NodeTimesByOp] stage=" << (stage ? stage : "<unknown>") << " showing=" << op_limit;
+    for (int i = 0; i < op_limit; ++i) {
+        const Entry& entry = op_entries[static_cast<size_t>(i)];
+        std::cerr << " op" << (i + 1) << "=" << entry.key << ":" << (static_cast<double>(entry.total_us) / 1000.0)
+                  << "ms/" << entry.count;
+    }
+    std::cerr << std::endl;
+    const int limit = std::min<int>(Gemma4NodeTimingDumpLimit(), entries.size());
+    std::cerr << "[Gemma4NodeTimes] stage=" << (stage ? stage : "<unknown>") << " nodes=" << n_nodes
+              << " measured_ms=" << (static_cast<double>(measured_us) / 1000.0) << " showing=" << limit
+              << std::endl;
+    for (int i = 0; i < limit; ++i) {
+        const Entry& entry = entries[static_cast<size_t>(i)];
+        std::cerr << "  rank=" << (i + 1) << " total_ms=" << (static_cast<double>(entry.total_us) / 1000.0)
+                  << " count=" << entry.count << " key=" << entry.key << std::endl;
+    }
+}
+
+void ResetPagedDecodeGraphExecutionState(ggml_cgraph* graph) {
+    if (!graph) {
+        return;
+    }
+    struct CustomOpParamsView {
+        ggml_custom_op_t fun;
+        int n_tasks;
+        void* userdata;
+    };
+    static_assert(sizeof(CustomOpParamsView) <= GGML_MAX_OP_PARAMS, "custom op params view too large");
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor* node = ggml_graph_node(graph, i);
+        if (!node || node->op != GGML_OP_CUSTOM) {
+            continue;
+        }
+        CustomOpParamsView params{};
+        std::memcpy(&params, node->op_params, sizeof(params));
+        if (params.fun != cb_paged_attention_decode || !params.userdata) {
+            continue;
+        }
+        auto* ud = static_cast<PagedAttentionUserData*>(params.userdata);
+        ud->epoch_started.store(0, std::memory_order_relaxed);
+        ud->epoch_done.store(0, std::memory_order_relaxed);
+        ud->kv_writers_done.store(0, std::memory_order_relaxed);
+        ud->shared_block_ptrs_ready.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -507,8 +738,13 @@ int RequestPromptTokenCountForChunking(const Request* req) {
     if (!req) {
         return 0;
     }
-    return !req->prompt_tokens_for_cache.empty() ? static_cast<int>(req->prompt_tokens_for_cache.size())
-                                                 : req->prompt_token_count;
+    if (!req->prompt_tokens_for_cache.empty()) {
+        return static_cast<int>(req->prompt_tokens_for_cache.size());
+    }
+    if (req->prompt_token_count > 0) {
+        return req->prompt_token_count;
+    }
+    return static_cast<int>(req->tokens.size());
 }
 
 int ResolvePrefillChunkTokensFromEnv(const Request* req, const char* chunk_env, const char* default_env,
@@ -575,13 +811,55 @@ int ResolveGemma4PrefillChunkTokensImpl(const TransformerModel* model, const Req
     if (descriptor.variant != ModelVariant::GEMMA4 || model->hparams.n_experts <= 0) {
         return -1;
     }
-    // Gemma4-A4B long-prefill quality regresses when the auto chunk is too
-    // small. Keep chunking enabled for memory safety, but use a larger default
-    // chunk so long prompts preserve first-token quality on the real serving
-    // path.
-    return ResolvePrefillChunkTokensFromEnv(req, "DENSECORE_GEMMA4_PREFILL_CHUNK_TOKENS",
-                                            "DENSECORE_GEMMA4_PREFILL_CHUNK_DEFAULT_TOKENS", 256,
-                                            "DENSECORE_GEMMA4_PREFILL_CHUNK_AUTO_MIN_TOKENS", 1024);
+    const char* chunk_env = "DENSECORE_GEMMA4_PREFILL_CHUNK_TOKENS";
+    const char* default_env = "DENSECORE_GEMMA4_PREFILL_CHUNK_DEFAULT_TOKENS";
+    const char* auto_min_env = "DENSECORE_GEMMA4_PREFILL_CHUNK_AUTO_MIN_TOKENS";
+    const int explicit_tokens = densecore::env::ParsePositiveEnvInt(chunk_env, 0);
+    if (explicit_tokens > 0) {
+        return explicit_tokens;
+    }
+
+    const auto resolve_manual_default = [&]() {
+        return densecore::env::ParsePositiveEnvInt(default_env, 128);
+    };
+    const char* env_value = std::getenv(chunk_env);
+    bool explicit_auto = false;
+    if (env_value && env_value[0] != '\0') {
+        const std::string lowered = densecore::env::AsciiLowerCopy(env_value);
+        if (lowered == "off" || lowered == "false" || lowered == "no") {
+            return -1;
+        }
+        if (lowered == "on" || lowered == "true" || lowered == "yes" || lowered == "force") {
+            return resolve_manual_default();
+        }
+        explicit_auto = (lowered == "0" || lowered == "auto");
+    }
+    if (!explicit_auto) {
+        const densecore::env::RuntimeToggleMode mode =
+            densecore::env::ParseRuntimeToggleMode(chunk_env, densecore::env::RuntimeToggleMode::Auto);
+        if (mode == densecore::env::RuntimeToggleMode::Off) {
+            return -1;
+        }
+        if (mode == densecore::env::RuntimeToggleMode::On) {
+            return resolve_manual_default();
+        }
+    }
+
+    const int prompt_tokens = RequestPromptTokenCountForChunking(req);
+    if (prompt_tokens <= 0) {
+        return resolve_manual_default();
+    }
+    const int auto_min_tokens = densecore::env::ParsePositiveEnvInt(auto_min_env, 1024);
+    if (prompt_tokens < auto_min_tokens) {
+        return -1;
+    }
+    if (densecore::env::ParsePositiveEnvInt(default_env, 0) > 0) {
+        return resolve_manual_default();
+    }
+
+    // C4A Gemma4-A4B measurements show medium prompts are fastest with a
+    // smaller working set, while long prompts need fewer KV history gathers.
+    return prompt_tokens < 2048 ? 64 : 128;
 }
 
 int ResolveModelPrefillChunkTokens(const TransformerModel* model, const Request* req) {
@@ -3161,9 +3439,10 @@ void EngineLoop(EngineState* state) {
                             used_flexible_sizing = true;
                         }
                     }
+                    const bool graph_pool_shrink_allowed = !is_decode_batch;
                     const bool graph_pool_oversized =
-                        IsFlexibleGraphPoolSizingEnabled(current_model) && state->inference_ctx.IsInitialized() &&
-                        state->inference_ctx.compute_buffer_size > ctx_size * 2 &&
+                        graph_pool_shrink_allowed && IsFlexibleGraphPoolSizingEnabled(current_model) &&
+                        state->inference_ctx.IsInitialized() && state->inference_ctx.compute_buffer_size > ctx_size * 2 &&
                         (state->inference_ctx.compute_buffer_size - ctx_size) > (2048ULL * 1024ULL * 1024ULL);
                     if (!state->inference_ctx.IsInitialized() || state->inference_ctx.compute_buffer_size < ctx_size ||
                         graph_pool_oversized) {
@@ -3354,10 +3633,13 @@ void EngineLoop(EngineState* state) {
             const bool decode_graph_regression_single_seq_hybrid =
                 batch.num_seqs == 1 && current_model && current_model->arch_flags.is_hybrid_ssm &&
                 densecore::models::DescribeModel(current_model).variant == ModelVariant::QWEN36;
+            const bool decode_graph_regression_single_seq_gemma4 =
+                batch.num_seqs == 1 && current_model && current_model->arch_flags.is_gemma4;
             const bool run_decode_graph_cache_regression_check =
                 cpu_backend_active && current_kv_cache && using_cached_decode_graph && decode_single_token_layout &&
-                (batch.num_seqs > 1 || decode_graph_regression_single_seq_hybrid) && batch.lora_map.empty() &&
-                IsDecodeGraphCacheRegressionEnabled() &&
+                (batch.num_seqs > 1 || decode_graph_regression_single_seq_hybrid ||
+                 decode_graph_regression_single_seq_gemma4) &&
+                batch.lora_map.empty() && IsDecodeGraphCacheRegressionEnabled() &&
                 decode_graph_regression_checked_steps < DecodeGraphCacheRegressionSteps();
             const bool run_batched_decode_correctness_check =
                 cpu_backend_active && IsBatchedDecodeCorrectnessCheckEnabled() && !is_embedding_batch &&
@@ -3429,6 +3711,7 @@ void EngineLoop(EngineState* state) {
                         // state; restore again before the real decode compute so this
                         // regression mode does not perturb generation.
                         MaybeLogMoEGraphSummary(gf, current_model, is_prefill_batch);
+                        ResetPagedDecodeGraphExecutionState(gf);
                         ggml_backend_graph_compute(active_backend, gf);
 
                         if (!output || !output->data) {
@@ -3508,6 +3791,7 @@ void EngineLoop(EngineState* state) {
                                             maybe_set_cpu_threads();
 
                                             MaybeLogMoEGraphSummary(uncached_gf, current_model, is_prefill_batch);
+                                            ResetPagedDecodeGraphExecutionState(uncached_gf);
                                             ggml_backend_graph_compute(active_backend, uncached_gf);
                                             if (!uncached_output->data) {
                                                 std::cerr << "[DecodeGraphCacheCheck] skipped due to shape mismatch: "
@@ -3635,9 +3919,11 @@ void EngineLoop(EngineState* state) {
             MaybeLogMoEGraphSummary(gf, current_model, is_prefill_batch);
             DebugDumpGraphNodes(gf, is_decode_batch ? "decode" : "prefill");
             ResetMoEStrictFailure();
+            ResetPagedDecodeGraphExecutionState(gf);
             ggml_backend_graph_compute(active_backend, gf);
             const auto compute_end = std::chrono::steady_clock::now();
             AccumulateQwen36SSMProjectionNodeTimes(work_ctx.get(), gf);
+            DebugDumpGemma4NodeTimes(current_model, gf, is_decode_batch ? "decode" : "prefill");
             const auto graph_execute_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(compute_end - compute_begin).count());
             const Qwen36ProfileSnapshot qwen36_profile = GetQwen36ProfileSnapshot(work_ctx.get());
@@ -4161,6 +4447,11 @@ void EngineLoop(EngineState* state) {
                     sampling_params.disallowed_token_ids = &req->disallowed_token_ids;
                     sampling_params.request_id = req->id;
                     sampling_params.output_token_index = req->generated_count;
+                    if (current_model && current_model->arch_flags.is_gemma4 &&
+                        current_model->gemma4_final_logit_softcapping > 0.0f &&
+                        !densecore::models::IsGemma4FinalLogitSoftcapDisabled()) {
+                        sampling_params.final_logit_softcap = current_model->gemma4_final_logit_softcapping;
+                    }
                     if (std::getenv("DENSECORE_DEBUG_SAMPLE") != nullptr ||
                         std::getenv("DENSECORE_DEBUG_SAMPLE_TOP") != nullptr) {
                         sampling_params.vocab = &current_model->vocab_tokens;

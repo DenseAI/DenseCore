@@ -172,8 +172,8 @@ struct ggml_tensor* ExecutePagedDecodeAttentionPath(struct ggml_context* ctx_c, 
                                                     struct ggml_tensor* Kcur, struct ggml_tensor* Vcur, int il,
                                                     int kv_cache_layer, bool gemma4_shared_kv_layer,
                                                     bool gemma4_shared_kv_source_layer, int head_dim_q, int head_dim_v,
-                                                    int n_head, int n_total_tokens, float fast_attn_logit_softcap,
-                                                    bool use_explicit_attention_scale) {
+                                                    int n_head, int n_head_kv, int n_total_tokens,
+                                                    float fast_attn_logit_softcap, bool use_explicit_attention_scale) {
     struct ggml_tensor* Q_decode = ggml_is_contiguous(Qcur) ? Qcur : ggml_cont(ctx_c, Qcur);
     struct ggml_tensor* K_decode = ggml_is_contiguous(Kcur) ? Kcur : ggml_cont(ctx_c, Kcur);
     struct ggml_tensor* V_decode = ggml_is_contiguous(Vcur) ? Vcur : ggml_cont(ctx_c, Vcur);
@@ -192,6 +192,7 @@ struct ggml_tensor* ExecutePagedDecodeAttentionPath(struct ggml_context* ctx_c, 
     ud->head_dim = head_dim_q;
     ud->v_head_dim = head_dim_v;
     ud->n_head = n_head;
+    ud->n_head_kv = n_head_kv;
     ud->write_current_kv = !gemma4_shared_kv_layer;
     ud->force_full_history = gemma4_shared_kv_layer || gemma4_shared_kv_source_layer;
     ud->sliding_window = paged_attn_sliding_window;
@@ -229,7 +230,7 @@ struct ggml_tensor* ExecuteHalAttentionPath(struct ggml_context* ctx_c, Transfor
 struct ggml_tensor* ExecutePortableCpuFlashAttentionPath(
     struct ggml_context* ctx_c, TransformerModel* model, struct ggml_tensor* Qcur, struct ggml_tensor* K,
     struct ggml_tensor* V, int il, int n_tokens, int head_dim_q, int head_dim_kv, int head_dim_v, int n_head_kv,
-    int attn_query_base_pos, int fast_attn_sliding_window, float fast_attn_logit_softcap,
+    int attn_query_base_pos, int attn_kv_start_pos, int fast_attn_sliding_window, float fast_attn_logit_softcap,
     uint32_t fast_attn_semantic_flags, bool use_explicit_attention_scale, bool native_decode_layout) {
     const float scale = ResolveAttentionScaleForRuntime(head_dim_q, use_explicit_attention_scale);
     const bool hal_causal = (n_tokens > 1);
@@ -238,7 +239,7 @@ struct ggml_tensor* ExecutePortableCpuFlashAttentionPath(
         return ggml_flash_attention_hal(ctx_c, Qcur, K, V, scale, false, n_head_kv, fast_attn_sliding_window,
                                         fast_attn_logit_softcap, fast_attn_semantic_flags, il,
                                         densecore::DeviceType::CPU, HalAttentionTensorLayout::GgmlDimHeadSeq,
-                                        flash_q_start_offset, 0);
+                                        flash_q_start_offset, attn_kv_start_pos);
     }
 
     struct ggml_tensor* Q_hal = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
@@ -251,7 +252,7 @@ struct ggml_tensor* ExecutePortableCpuFlashAttentionPath(
     struct ggml_tensor* KQV =
         ggml_flash_attention_hal(ctx_c, Q_hal, K_hal, V_hal, scale, hal_causal, n_head_kv, fast_attn_sliding_window,
                                  fast_attn_logit_softcap, fast_attn_semantic_flags, il, densecore::DeviceType::CPU,
-                                 HalAttentionTensorLayout::HeadSeq, flash_q_start_offset, 0);
+                                 HalAttentionTensorLayout::HeadSeq, flash_q_start_offset, attn_kv_start_pos);
     return ggml_permute(ctx_c, KQV, 0, 2, 1, 3);
 }
 
@@ -303,12 +304,13 @@ struct ggml_tensor* ExecuteStandardAttentionPath(struct ggml_context* ctx_c, Tra
     const float gemma4_attention_softcap = densecore::llm::attention::ResolveGemma4AttentionLogitSoftcapRuntime(model);
     if (model->arch_flags.is_gemma4 && gemma4_attention_softcap > 0.0f) {
         const float inv_softcap = 1.0f / gemma4_attention_softcap;
-        struct ggml_tensor* Q_scaled = ggml_scale(ctx_c, Q, scale * inv_softcap);
+        struct ggml_tensor* Q_scaled = ggml_scale(ctx_c, Q, inv_softcap);
         Q_scaled = MaybeTraceGemma4AttentionTensor(ctx_c, model, Q_scaled, il, "standard_q_scaled");
         struct ggml_tensor* KQ = ggml_mul_mat(ctx_c, K_att, Q_scaled);
         KQ = MaybeTraceGemma4AttentionTensor(ctx_c, model, KQ, il, "standard_kq_presoftcap");
         KQ = ggml_tanh(ctx_c, KQ);
         KQ = ggml_scale(ctx_c, KQ, gemma4_attention_softcap);
+        KQ = ggml_scale(ctx_c, KQ, scale);
         KQ = MaybeTraceGemma4AttentionTensor(ctx_c, model, KQ, il, "standard_kq_softcapped");
         if (densecore::llm::attention::ShouldBuildExplicitStandardAttentionMask(n_tokens, fast_attn_sliding_window)) {
             if (fast_attn_sliding_window >= 0) {

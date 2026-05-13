@@ -119,11 +119,10 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 	sb.WriteString(profile.assistantRole)
 	sb.WriteString("\n")
 	if isQwen36ModelHint(modelHint) {
-		if thinkingEnabled {
-			sb.WriteString("<think>\n")
-		} else {
-			sb.WriteString("<think>\n\n</think>\n")
-		}
+		// Qwen3.6 does not accept the older /no_think directive. Keep the
+		// llama.cpp-compatible assistant cue instead of injecting an empty
+		// reasoning block that changes the rendered prompt.
+		sb.WriteString("<think>\n")
 	} else if thinkingEnabled {
 		sb.WriteString("<think>\n")
 	}
@@ -287,7 +286,7 @@ func formatGemmaTurnPrompt(modelHint string, messages []domain.Message, template
 		sb.WriteString(profile.systemRole)
 		sb.WriteString("\n")
 		if thinkingEnabled {
-			sb.WriteString("<|think|>")
+			sb.WriteString("<|think|>\n")
 		}
 		if len(systemParts) > 0 {
 			sb.WriteString(strings.Join(systemParts, "\n\n"))
@@ -310,6 +309,9 @@ func formatGemmaTurnPrompt(modelHint string, messages []domain.Message, template
 	sb.WriteString(profile.openTag)
 	sb.WriteString(profile.assistantRole)
 	sb.WriteString("\n")
+	if profile.family == promptFamilyGemma && thinkingEnabled {
+		sb.WriteString("<|channel>thought\n<channel|>")
+	}
 	return sb.String()
 }
 

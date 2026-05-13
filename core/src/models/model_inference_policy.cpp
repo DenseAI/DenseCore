@@ -36,6 +36,10 @@ bool IsGemma4SlidingWindowDisabled() {
     return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_SLIDING_WINDOW", false);
 }
 
+bool IsGemma4PagedDecodeEnabled() {
+    return ParseBoolEnv("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", true);
+}
+
 }  // namespace
 
 float ResolveInputEmbeddingScale(const TransformerModel* model) {
@@ -53,22 +57,15 @@ bool SupportsPagedDecodeAttention(const TransformerModel* model) {
     if (!model || !model->arch_flags.is_gemma4) {
         return true;
     }
-    if (IsGemma4ForceDenseBaselineEnabled() || UseGemma4BenchQualityFallback()) {
+    if (IsGemma4ForceDenseBaselineEnabled()) {
         return false;
     }
-    return true;
+    return IsGemma4PagedDecodeEnabled();
 }
 
 float SanitizeAttentionLogitSoftcapForLoad(const TransformerModel* model, float gguf_softcap) {
-    if (model && model->arch_flags.is_gemma4 && gguf_softcap <= 0.0f) {
-        static bool warned_invalid_gemma4_softcap = false;
-        if (!warned_invalid_gemma4_softcap) {
-            std::cerr << "[DenseCore] Warning: Gemma4 attention_logit_cap must be positive; "
-                         "normalizing non-positive metadata to HF-compatible default 50.0"
-                      << std::endl;
-            warned_invalid_gemma4_softcap = true;
-        }
-        return 50.0f;
+    if (model && model->arch_flags.is_gemma4) {
+        return std::isfinite(gguf_softcap) && gguf_softcap > 0.0f ? gguf_softcap : 0.0f;
     }
     return gguf_softcap;
 }
@@ -114,7 +111,7 @@ bool IsGemma4DecodeSpecialTransformDisabled() {
 }
 
 bool IsGemma4VNormDisabled() {
-    return ParseBoolEnv("DENSECORE_GEMMA4_DISABLE_V_NORM", false);
+    return true;
 }
 
 bool IsGemma4FullRopeFreqsDisabled() {

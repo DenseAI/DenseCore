@@ -49,7 +49,7 @@ func init() {
 	serveCmd.Flags().StringP("model", "m", "", "Path to GGUF model file")
 	serveCmd.Flags().IntP("threads", "t", 0, "Number of inference threads (0 = auto-detect)")
 	serveCmd.Flags().Bool("auth", false, "Enable API Key authentication")
-	serveCmd.Flags().Bool("grpc", true, "Enable gRPC server")
+	serveCmd.Flags().Bool("grpc", false, "Enable gRPC server")
 	serveCmd.Flags().Int("grpc-port", 50051, "gRPC server port")
 
 	cobra.CheckErr(viper.BindPFlag("model", serveCmd.Flags().Lookup("model")))

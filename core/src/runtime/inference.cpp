@@ -57,6 +57,7 @@
 #include "llm/graph/planning.h"
 #include "llm/models/common/family_internal.h"
 #include "llm/runtime/deps.h"
+#include "models/gemma4_packed_expert_layout.h"
 #include "runtime/runtime_env.h"
 
 #ifndef DENSECORE_DEFAULT_INT4_SINGLE_THREADING_LAYER

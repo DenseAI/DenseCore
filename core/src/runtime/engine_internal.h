@@ -1095,13 +1095,9 @@ struct EngineState {
                 std::clamp<size_t>(((effective_query_len + 1023ULL) / 1024ULL) * 64ULL, 64ULL, 512ULL);
             estimate.long_context_safety_pad_bytes += hybrid_long_prefill_object_pad_mb * MB;
         }
-        if (model->arch_flags.is_gemma4 && effective_query_len > 512ULL) {
-            const size_t gemma4_long_prefill_pad_mb =
-                std::clamp<size_t>(std::max<size_t>(1280, (effective_query_len / 1024ULL) * 256ULL), 1280ULL, 2048ULL);
-            estimate.long_context_safety_pad_bytes += gemma4_long_prefill_pad_mb * MB;
-        }
-        if (model->arch_flags.is_gemma4 && effective_query_len >= 128ULL) {
-            estimate.long_context_safety_pad_bytes += static_cast<size_t>(256) * MB;
+        if (model->arch_flags.is_gemma4 && effective_query_len > 1) {
+            estimate.long_context_safety_pad_bytes +=
+                std::max(hidden_query_bytes / 2, attention_score_bytes / 8);
         }
         const size_t extra_headroom_mb =
             parse_env_mb("DENSECORE_GRAPH_CTX_EXTRA_MB", /*default_mb=*/64, /*min_mb=*/0, HARD_MAX_MB);

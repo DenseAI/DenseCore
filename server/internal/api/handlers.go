@@ -501,6 +501,7 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 	}
 
 	promptTokens := h.countChatPromptTokens(req)
+	content, reasoningContent := splitReasoningResponse(req.Model, responseText)
 	resp := domain.ChatCompletionResponse{
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 		Object:  "chat.completion",
@@ -510,10 +511,11 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 			{
 				Index: 0,
 				Message: domain.Message{
-					Role:    "assistant",
-					Content: responseText,
+					Role:             "assistant",
+					Content:          content,
+					ReasoningContent: reasoningContent,
 				},
-				FinishReason: "stop",
+				FinishReason: resolveSyncFinishReason(completionTokens, req.MaxTokens),
 			},
 		},
 		Usage: domain.Usage{
@@ -527,6 +529,141 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		slog.Error("failed to encode response", slog.String("error", err.Error()))
 	}
+}
+
+func splitReasoningResponse(modelHint, text string) (string, string) {
+	if isQwen36ModelHint(modelHint) {
+		return splitQwenThinkResponse(text)
+	}
+	return splitGemma4ReasoningResponse(modelHint, text)
+}
+
+func splitQwenThinkResponse(text string) (string, string) {
+	const openTag = "<think>"
+	const closeTag = "</think>"
+	if idx := strings.Index(text, closeTag); idx >= 0 {
+		reasoning := strings.TrimSpace(strings.TrimPrefix(text[:idx], openTag))
+		content := strings.TrimSpace(text[idx+len(closeTag):])
+		return content, reasoning
+	}
+	if strings.HasPrefix(text, openTag) {
+		return "", strings.TrimSpace(strings.TrimPrefix(text, openTag))
+	}
+	// Qwen3.6 generation starts after the assistant-side `<think>\n` cue.
+	// llama.cpp reports these tokens as reasoning_content until </think>.
+	return "", strings.TrimSpace(text)
+}
+
+func splitGemma4ReasoningResponse(modelHint, text string) (string, string) {
+	if !isGemma4ModelHint(modelHint) {
+		return text, ""
+	}
+	if !strings.Contains(text, "<|channel>thought") {
+		if strings.HasPrefix(text, "<channel|>") {
+			return sanitizeGemma4VisibleContent(strings.TrimPrefix(text, "<channel|>")), ""
+		}
+		return sanitizeGemma4VisibleContent(text), ""
+	}
+
+	const marker = "<|channel>"
+	const bodyMarker = "<channel|>"
+	var content strings.Builder
+	var reasoning strings.Builder
+	offset := 0
+
+	for {
+		idx := strings.Index(text[offset:], marker)
+		if idx < 0 {
+			if offset < len(text) {
+				content.WriteString(text[offset:])
+			}
+			break
+		}
+		idx += offset
+		if idx > offset {
+			content.WriteString(text[offset:idx])
+		}
+
+		channelStart := idx + len(marker)
+		nextIdx := strings.Index(text[channelStart:], marker)
+		segmentEnd := len(text)
+		if nextIdx >= 0 {
+			segmentEnd = channelStart + nextIdx
+		}
+		segment := text[channelStart:segmentEnd]
+		newline := strings.IndexByte(segment, '\n')
+		channel := strings.TrimSpace(segment)
+		body := ""
+		if newline >= 0 {
+			channel = strings.TrimSpace(segment[:newline])
+			body = segment[newline+1:]
+		}
+		body = strings.TrimPrefix(body, bodyMarker)
+
+		switch channel {
+		case "thought", "analysis":
+			reasoning.WriteString(body)
+		case "final", "answer":
+			content.WriteString(body)
+		default:
+			content.WriteString(marker)
+			content.WriteString(segment)
+		}
+		offset = segmentEnd
+	}
+
+	if reasoning.Len() == 0 {
+		return sanitizeGemma4VisibleContent(text), ""
+	}
+	return sanitizeGemma4VisibleContent(content.String()), sanitizeGemma4VisibleContent(reasoning.String())
+}
+
+func sanitizeGemma4VisibleContent(text string) string {
+	text = stripGemma4BareThoughtPrelude(text)
+	cut := len(text)
+	for _, marker := range []string{
+		"<|be_thought_out|>",
+		"<|channel>thought",
+		"<|channel>analysis",
+		"<|channel>final",
+		"<|channel>answer",
+		"<channel|>",
+	} {
+		if idx := strings.Index(text, marker); idx > 0 && idx < cut {
+			cut = idx
+		}
+	}
+	return strings.TrimSpace(text[:cut])
+}
+
+func stripGemma4BareThoughtPrelude(text string) string {
+	trimmed := strings.TrimSpace(text)
+	lower := strings.ToLower(trimmed)
+	for _, prefix := range []string{"thought\r\n", "thought\n"} {
+		if strings.HasPrefix(lower, prefix) {
+			trimmed = strings.TrimSpace(trimmed[len(prefix):])
+			lower = strings.ToLower(trimmed)
+			break
+		}
+	}
+	for _, prefix := range []string{"think silently.\r\n", "think silently.\n", "think silently."} {
+		if strings.HasPrefix(lower, prefix) {
+			trimmed = strings.TrimSpace(trimmed[len(prefix):])
+			break
+		}
+	}
+	return trimmed
+}
+
+func isGemma4ModelHint(modelHint string) bool {
+	lower := strings.ToLower(strings.TrimSpace(modelHint))
+	return strings.Contains(lower, "gemma4") || strings.Contains(lower, "gemma-4")
+}
+
+func isQwen36ModelHint(modelHint string) bool {
+	lower := strings.ToLower(strings.TrimSpace(modelHint))
+	return strings.Contains(lower, "qwen3.6") || strings.Contains(lower, "qwen3_6") ||
+		strings.Contains(lower, "qwen36") || strings.Contains(lower, "qwen3next")
 }
 
 func (h *Handler) handleCompletionSync(ctx context.Context, w http.ResponseWriter, req domain.ChatCompletionRequest, prompt string) {
@@ -553,7 +690,7 @@ func (h *Handler) handleCompletionSync(ctx context.Context, w http.ResponseWrite
 			{
 				Index:        0,
 				Text:         responseText,
-				FinishReason: "stop",
+				FinishReason: resolveSyncFinishReason(completionTokens, req.MaxTokens),
 			},
 		},
 		Usage: domain.Usage{
@@ -567,6 +704,13 @@ func (h *Handler) handleCompletionSync(ctx context.Context, w http.ResponseWrite
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		slog.Error("failed to encode response", slog.String("error", err.Error()))
 	}
+}
+
+func resolveSyncFinishReason(completionTokens, maxTokens int) string {
+	if maxTokens > 0 && completionTokens >= maxTokens {
+		return "length"
+	}
+	return "stop"
 }
 
 func collectSyncStream(outputChan <-chan domain.StreamEvent, errChan <-chan error) (string, int, error) {
@@ -821,7 +965,21 @@ func (h *Handler) countChatPromptTokens(req domain.ChatCompletionRequest) int {
 	if req.RawPrompt != "" {
 		return h.countSingleTextTokens(req.RawPrompt, true, false)
 	}
-	return h.countSingleTextTokens(service.BuildChatPrompt(h.modelService.GetCurrentModel(), req.Messages, req.ChatTemplateKwargs), true, false)
+	engine := h.modelService.GetEngine()
+	if engine == nil {
+		return 0
+	}
+	var enableThinking *bool
+	var preserveThinking *bool
+	if req.ChatTemplateKwargs != nil {
+		enableThinking = req.ChatTemplateKwargs.EnableThinking
+		preserveThinking = req.ChatTemplateKwargs.PreserveThinking
+	}
+	if rendered, err := engine.RenderChatPrompt(req.Messages, enableThinking, preserveThinking); err == nil && rendered != nil &&
+		rendered.RenderedPrompt != "" {
+		return h.countSingleTextTokens(rendered.RenderedPrompt, false, false)
+	}
+	return h.countSingleTextTokens(service.BuildChatPrompt(h.modelService.GetCurrentModel(), req.Messages, req.ChatTemplateKwargs), false, false)
 }
 
 func (h *Handler) countTextTokens(texts []string, addBOS bool, addEOS bool) int {

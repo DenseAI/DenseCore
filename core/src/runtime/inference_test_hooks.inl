@@ -110,10 +110,11 @@ std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float
                 for (int d = 0; d < head_dim_q; ++d) {
                     dot += q_head[d] * k_head[d];
                 }
-                float score = dot * scale;
+                float score = dot;
                 if (logit_softcap > 0.0f && std::isfinite(score)) {
                     score = std::tanh(score / logit_softcap) * logit_softcap;
                 }
+                score *= scale;
                 scores[static_cast<size_t>(k_idx)] = score;
                 max_score = std::max(max_score, score);
             }

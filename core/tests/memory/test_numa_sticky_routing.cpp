@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -61,7 +62,10 @@ bool RunGgmlQuantizedProjectionForTest(CpuBackend* backend, const void* weight_p
 bool RunGgmlQuantizedFusedSwiGLUProjectionForTest(CpuBackend* backend, const void* gate_weight_ptr,
                                                   int gate_ggml_type_id, const void* up_weight_ptr,
                                                   int up_ggml_type_id, const Tensor& input, Tensor* output,
-                                                  int64_t N, int64_t K);
+                                                  int64_t N, int64_t K, bool use_gelu_activation = false);
+bool RunGgmlQuantizedFusedGEGLUProjectionForTest(CpuBackend* backend, const void* gate_weight_ptr,
+                                                 int gate_ggml_type_id, const void* up_weight_ptr, int up_ggml_type_id,
+                                                 const Tensor& input, Tensor* output, int64_t N, int64_t K);
 }  // namespace densecore::testing
 
 namespace {
@@ -119,6 +123,11 @@ void DenseMatMulTransBReference(const float* input, const float* weights, float*
             output_row[n] = sum;
         }
     }
+}
+
+float GeluTanhReference(float x) {
+    constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
+    return 0.5f * x * (1.0f + std::tanh(kSqrtTwoOverPi * (x + 0.044715f * x * x * x)));
 }
 
 void DenseExpertReference(const float* input, const float* w1, const float* w2, const float* w3, float* output,
@@ -789,6 +798,22 @@ TEST(NumaStickyRouting, ThreadPool_ConfigureLargeCountClampsToLogicalCapacity) {
     ThreadPool pool(0, 1);
     pool.Configure(std::numeric_limits<int>::max());
     EXPECT_EQ(pool.GetNumThreads(), expected);
+}
+
+TEST(NumaStickyRouting, ThreadPool_NestedParallelForFromWorkerCompletesInline) {
+    ThreadPool pool(0, 4);
+    std::atomic<int> inner_visits{0};
+
+    pool.ParallelFor(4, [&](int start, int end, int /*thread_id*/) {
+        for (int i = start; i < end; ++i) {
+            (void)i;
+            pool.ParallelFor(3, [&](int inner_start, int inner_end, int /*inner_thread_id*/) {
+                inner_visits.fetch_add(inner_end - inner_start, std::memory_order_relaxed);
+            });
+        }
+    });
+
+    EXPECT_EQ(inner_visits.load(std::memory_order_relaxed), 12);
 }
 
 // =============================================================================
@@ -1518,6 +1543,41 @@ TEST(NumaStickyRouting, GgmlQ5KMultiRowMoEProjectionMatchesVecDotReference) {
     }
 }
 
+TEST(NumaStickyRouting, GgmlQ8SingleRowMoEProjectionMatchesVecDotReference) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 1;
+    constexpr int K = 256;
+    constexpr int N = 40;
+    constexpr ggml_type qtype = GGML_TYPE_Q8_0;
+
+    std::mt19937 rng(1808);
+    std::uniform_real_distribution<float> input_dist(-0.75f, 0.75f);
+    std::uniform_real_distribution<float> weight_dist(-0.20f, 0.20f);
+
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> weight_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : weight_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> weight_q8;
+    QuantizeRowsForTest(qtype, weight_f32, N, K, &weight_q8);
+
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> reference;
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+
+    GgmlQuantizedProjectionVecDotReference(qtype, weight_q8, input, M, K, N, &reference);
+
+    ASSERT_TRUE(densecore::testing::RunGgmlQuantizedProjectionForTest(
+        &backend, weight_q8.data(), static_cast<int>(qtype), input_tensor, &output_tensor, N, K));
+
+    ASSERT_EQ(output.size(), reference.size());
+    for (size_t i = 0; i < output.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 1e-5f) << "index=" << i;
+    }
+}
+
 TEST(NumaStickyRouting, GgmlQ4KRepackedPrefillGemmProjectionMatchesDenseReferenceWithTail) {
     CpuBackend& backend = GetCpuBackend();
     constexpr int M = 5;
@@ -1683,6 +1743,165 @@ TEST(NumaStickyRouting, GgmlQ4KRepackedPrefillGemmFusedSwiGLUMatchesDenseReferen
     for (size_t i = 0; i < output.size(); ++i) {
         EXPECT_NEAR(output[i], reference[i], 5e-2f) << "index=" << i;
     }
+}
+
+TEST(NumaStickyRouting, GgmlQ4KMultiRowFusedGEGLUStaysOffSwiGLUSpecificPath) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 5;
+    constexpr int K = 256;
+    constexpr int N = 64;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_K;
+
+    std::mt19937 rng(1805);
+    std::uniform_real_distribution<float> input_dist(-0.50f, 0.50f);
+    std::uniform_real_distribution<float> weight_dist(-0.15f, 0.15f);
+
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> gate_f32(static_cast<size_t>(N * K));
+    std::vector<float> up_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : gate_f32) v = weight_dist(rng);
+    for (float& v : up_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> gate_q4k;
+    std::vector<uint8_t> up_q4k;
+    QuantizeRowsForTest(qtype, gate_f32, N, K, &gate_q4k);
+    QuantizeRowsForTest(qtype, up_f32, N, K, &up_q4k);
+
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+
+    EnvGuard paired("DENSECORE_MOE_ENABLE_Q4K_PAIRED_VEC_DOT", "1");
+    EXPECT_FALSE(densecore::testing::RunGgmlQuantizedFusedSwiGLUProjectionForTest(
+        &backend, gate_q4k.data(), static_cast<int>(qtype), up_q4k.data(), static_cast<int>(qtype), input_tensor,
+        &output_tensor, N, K, /*use_gelu_activation=*/true));
+}
+
+TEST(NumaStickyRouting, GgmlQ4KRawBatchedFusedGEGLUMatchesDenseReference) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 8;
+    constexpr int K = 256;
+    constexpr int N = 32;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_K;
+
+    std::mt19937 rng(1806);
+    std::uniform_real_distribution<float> input_dist(-0.50f, 0.50f);
+    std::uniform_real_distribution<float> weight_dist(-0.15f, 0.15f);
+
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> gate_f32(static_cast<size_t>(N * K));
+    std::vector<float> up_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : gate_f32) v = weight_dist(rng);
+    for (float& v : up_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> gate_q4k;
+    std::vector<uint8_t> up_q4k;
+    QuantizeRowsForTest(qtype, gate_f32, N, K, &gate_q4k);
+    QuantizeRowsForTest(qtype, up_f32, N, K, &up_q4k);
+
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> reference(static_cast<size_t>(M * N), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+
+    const auto* traits = ggml_get_type_traits(qtype);
+    ASSERT_NE(traits, nullptr);
+    ASSERT_NE(traits->to_float, nullptr);
+    const size_t row_bytes = ggml_row_size(qtype, K);
+    std::vector<float> gate_deq(static_cast<size_t>(N * K), 0.0f);
+    std::vector<float> up_deq(static_cast<size_t>(N * K), 0.0f);
+    for (int row = 0; row < N; ++row) {
+        traits->to_float(gate_q4k.data() + static_cast<size_t>(row) * row_bytes,
+                         gate_deq.data() + static_cast<size_t>(row) * K, K);
+        traits->to_float(up_q4k.data() + static_cast<size_t>(row) * row_bytes,
+                         up_deq.data() + static_cast<size_t>(row) * K, K);
+    }
+    std::vector<float> gate_ref(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> up_ref(static_cast<size_t>(M * N), 0.0f);
+    DenseMatMulTransBReference(input.data(), gate_deq.data(), gate_ref.data(), M, K, N);
+    DenseMatMulTransBReference(input.data(), up_deq.data(), up_ref.data(), M, K, N);
+    for (size_t i = 0; i < reference.size(); ++i) {
+        const float x = gate_ref[i];
+        const float x3 = x * x * x;
+        const float gelu = 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x3)));
+        reference[i] = gelu * up_ref[i];
+    }
+
+    ASSERT_TRUE(densecore::testing::RunGgmlQuantizedFusedGEGLUProjectionForTest(
+        &backend, gate_q4k.data(), static_cast<int>(qtype), up_q4k.data(), static_cast<int>(qtype), input_tensor,
+        &output_tensor, N, K));
+
+    ASSERT_EQ(output.size(), reference.size());
+    for (size_t i = 0; i < output.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 5e-2f) << "index=" << i;
+    }
+}
+
+TEST(NumaStickyRouting, GgmlQ4KSingleRowFusedGEGLUMatchesDenseReference) {
+#if !((defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_MATMUL_INT8))
+    GTEST_SKIP() << "Q4_K single-row fused GEGLU uses the ARM rowpair vec-dot path";
+#else
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 1;
+    constexpr int K = 256;
+    constexpr int N = 64;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_K;
+
+    std::mt19937 rng(1807);
+    std::uniform_real_distribution<float> input_dist(-0.50f, 0.50f);
+    std::uniform_real_distribution<float> weight_dist(-0.15f, 0.15f);
+
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> gate_f32(static_cast<size_t>(N * K));
+    std::vector<float> up_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : gate_f32) v = weight_dist(rng);
+    for (float& v : up_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> gate_q4k;
+    std::vector<uint8_t> up_q4k;
+    QuantizeRowsForTest(qtype, gate_f32, N, K, &gate_q4k);
+    QuantizeRowsForTest(qtype, up_f32, N, K, &up_q4k);
+
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> reference(static_cast<size_t>(M * N), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+
+    const auto* traits = ggml_get_type_traits(qtype);
+    ASSERT_NE(traits, nullptr);
+    ASSERT_NE(traits->to_float, nullptr);
+    const size_t row_bytes = ggml_row_size(qtype, K);
+    std::vector<float> gate_deq(static_cast<size_t>(N * K), 0.0f);
+    std::vector<float> up_deq(static_cast<size_t>(N * K), 0.0f);
+    for (int row = 0; row < N; ++row) {
+        traits->to_float(gate_q4k.data() + static_cast<size_t>(row) * row_bytes,
+                         gate_deq.data() + static_cast<size_t>(row) * K, K);
+        traits->to_float(up_q4k.data() + static_cast<size_t>(row) * row_bytes,
+                         up_deq.data() + static_cast<size_t>(row) * K, K);
+    }
+    std::vector<float> gate_ref(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> up_ref(static_cast<size_t>(M * N), 0.0f);
+    DenseMatMulTransBReference(input.data(), gate_deq.data(), gate_ref.data(), M, K, N);
+    DenseMatMulTransBReference(input.data(), up_deq.data(), up_ref.data(), M, K, N);
+    for (size_t i = 0; i < reference.size(); ++i) {
+        const float x = gate_ref[i];
+        const float x3 = x * x * x;
+        const float gelu = 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x3)));
+        reference[i] = gelu * up_ref[i];
+    }
+
+    ASSERT_TRUE(densecore::testing::RunGgmlQuantizedFusedGEGLUProjectionForTest(
+        &backend, gate_q4k.data(), static_cast<int>(qtype), up_q4k.data(), static_cast<int>(qtype), input_tensor,
+        &output_tensor, N, K));
+
+    ASSERT_EQ(output.size(), reference.size());
+    for (size_t i = 0; i < output.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 5e-2f) << "index=" << i;
+    }
+#endif
 }
 
 TEST(NumaStickyRouting, ForwardMoEGgmlQuantizedGeneralPathFallsBackToDenseDequantForWideExpertBatches) {

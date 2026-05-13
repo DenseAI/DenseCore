@@ -164,7 +164,7 @@ TEST(DecoderModelSpec, Qwen36HybridMoEResolvesReusableSoftmaxContract) {
     EXPECT_FALSE(HasOp(spec.layers[0], densecore::models::DecoderSemanticOpKind::AttentionCore));
 }
 
-TEST(DecoderModelSpec, Qwen36GroupedRouterIsDeclaredBySpecNotRuntimeBranch) {
+TEST(DecoderModelSpec, Qwen36GroupedMetadataStillUsesLlamaCppSoftmaxRouter) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
     model.variant = ModelVariant::QWEN36;
@@ -180,9 +180,9 @@ TEST(DecoderModelSpec, Qwen36GroupedRouterIsDeclaredBySpecNotRuntimeBranch) {
     const auto spec = densecore::models::BuildDecoderModelSpec(&model);
     ASSERT_EQ(spec.layers.size(), 1u);
     EXPECT_EQ(spec.runtime_topology, densecore::models::DecoderRuntimeTopology::HybridSSMMoE);
-    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+    EXPECT_FALSE(densecore::models::DecoderModelSpecHasSpecialization(
         spec, densecore::models::DecoderSpecializationKind::GroupedMoERouter));
-    EXPECT_EQ(spec.layers[0].ffn.router, densecore::models::DecoderMoERouter::GroupedSigmoidTopK);
+    EXPECT_EQ(spec.layers[0].ffn.router, densecore::models::DecoderMoERouter::SoftmaxTopK);
 }
 
 TEST(DecoderModelSpec, PrefillLastLogitsPolicyUsesExplicitRuntimePolicy) {

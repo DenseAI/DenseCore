@@ -4,6 +4,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <vector>
@@ -23,6 +25,28 @@ struct DecodeContextSummary {
     int avg_context = 0;
     bool valid = false;
 };
+
+bool ShouldUseGemma4PagedDecodeForLayer(const TransformerModel* model, int layer_idx) {
+    if (!model || !model->arch_flags.is_gemma4) {
+        return true;
+    }
+
+    const char* mode_env = std::getenv("DENSECORE_GEMMA4_PAGED_DECODE_LAYER_MODE");
+    const char* mode = (mode_env && mode_env[0] != '\0') ? mode_env : "all";
+    const bool is_sliding_layer = densecore::models::IsGemma4SlidingLayer(model, layer_idx);
+
+    if (std::strcmp(mode, "all") == 0) {
+        return true;
+    }
+    if (std::strcmp(mode, "full") == 0) {
+        return !is_sliding_layer;
+    }
+    if (std::strcmp(mode, "off") == 0 || std::strcmp(mode, "none") == 0) {
+        return false;
+    }
+
+    return is_sliding_layer;
+}
 
 int EffectiveAutoPagedContextFloor(const TransformerModel* model, int requested_floor, int n_tokens_in_batch) {
     if (!model) {
@@ -425,6 +449,9 @@ DecodeAttentionDispatchDecision ResolveDecodeAttentionDispatchDecision(
     (void)layer_idx;
     DecodeAttentionDispatchDecision decision;
     decision.use_paged_decode_attention = base_paged_decode.use_paged_decode_attention;
+    if (decision.use_paged_decode_attention && !ShouldUseGemma4PagedDecodeForLayer(model, layer_idx)) {
+        decision.use_paged_decode_attention = false;
+    }
     decision.paged_decode_candidate = base_paged_decode.paged_decode_decision.candidate;
     decision.paged_decode_supported = base_paged_decode.paged_decode_supported;
 
@@ -483,7 +510,7 @@ float ResolveGemma4AttentionLogitSoftcapRuntime(const TransformerModel* model) {
     if (!model || !model->arch_flags.is_gemma4) {
         return 0.0f;
     }
-    return model->gemma4_attention_logit_softcapping > 0.0f ? model->gemma4_attention_logit_softcapping : 50.0f;
+    return model->gemma4_attention_logit_softcapping;
 }
 
 void RecordDecodePagedFallbackReason(DecodePagedFallbackReason reason, int n_tokens_in_batch) {

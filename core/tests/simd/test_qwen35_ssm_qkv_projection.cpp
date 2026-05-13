@@ -626,8 +626,8 @@ TEST(Qwen35SSMQkvProjection, Qwen36CallbackMatchesOfficialProjectionContract) {
     const float* v_base = k_base + kTestQKTotal;
 
     for (int h = 0; h < kTestNHeads; ++h) {
-        const int heads_per_group = kTestNHeads / kTestNGroups;
-        const int src_k_head = std::min(kTestNGroups - 1, h / heads_per_group);
+        // llama.cpp's qwen35moe path repeats Q/K into tiled V-head order.
+        const int src_k_head = h % kTestNGroups;
         Qwen35SSMHeadStepConfig cfg{};
         cfg.input_t = input_t.data();
         cfg.q_head = q_base + src_k_head * kTestHeadDimK;

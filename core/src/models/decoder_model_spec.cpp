@@ -40,8 +40,7 @@ DecoderMoERouter ResolveMoERouter(const TransformerModel* model, const Transform
     if (is_gemma4_moe) {
         return DecoderMoERouter::Gemma4SoftmaxTopK;
     }
-    if (model && (model->arch_flags.is_glm_moe || model->arch_flags.is_glm_dsa ||
-                  (model->variant == ModelVariant::QWEN36 && model->moe_n_group > 1 && model->moe_topk_group > 0))) {
+    if (model && (model->arch_flags.is_glm_moe || model->arch_flags.is_glm_dsa)) {
         return DecoderMoERouter::GroupedSigmoidTopK;
     }
     return DecoderMoERouter::SoftmaxTopK;

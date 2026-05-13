@@ -534,10 +534,10 @@ void PagedAttentionImpl(const float* query, const void* const* k_block_ptrs, con
                     score = DotProductF32(d, q_head, reinterpret_cast<const float*>(k_ptr_bytes), qk_head_dim);
                 }
 
-                score *= scale;
                 if (logit_softcap > 0.0f && std::isfinite(score)) {
                     score = std::tanh(score / logit_softcap) * logit_softcap;
                 }
+                score *= scale;
                 block_scores[t] = score;
                 if (score > m_block) m_block = score;
             }
