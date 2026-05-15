@@ -102,7 +102,7 @@ dense-base:
     extraPorts: []
 
   grpc:
-    enabled: true
+    enabled: false
     port: 50051
     tls:
       enabled: false
@@ -183,7 +183,7 @@ dense-base:
     - name: SERVICE_DESCRIPTION
       value: ""
     - name: GRPC_ENABLED
-      value: "true"
+      value: "false"
     - name: GRPC_PORT
       value: "50051"
     - name: GRPC_TLS_ENABLED

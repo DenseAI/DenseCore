@@ -38,6 +38,17 @@ TransformerModel MakeQwen36HybridDecodeModel() {
     return model;
 }
 
+TransformerModel MakeQwen35HybridDecodeModel() {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_embd = 2048;
+    model.hparams.n_head = 16;
+    model.hparams.n_head_kv = 8;
+    return model;
+}
+
 BatchSpec MakeDecodeOnlyBatch(int num_seqs, int n_past) {
     BatchSpec batch{};
     batch.num_seqs = num_seqs;
@@ -99,12 +110,27 @@ private:
 
 }  // namespace
 
-TEST(DecodeGraphCachePolicyTest, HybridSSMModelsAreNotDecodeGraphCacheSafeYet) {
+TEST(DecodeGraphCachePolicyTest, UnqualifiedHybridSSMModelsAreNotDecodeGraphCacheSafeYet) {
     TransformerModel model{};
-    model.arch = ModelArch::QWEN35;
+    model.arch = ModelArch::LLAMA;
+    model.variant = ModelVariant::UNKNOWN;
     model.arch_flags.is_hybrid_ssm = true;
 
     EXPECT_FALSE(IsDecodeGraphCacheSafeForModel(&model));
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen35HybridSSMSingleDecodeCanUseDecodeGraphCache) {
+    const TransformerModel model = MakeQwen35HybridDecodeModel();
+
+    EXPECT_TRUE(IsDecodeGraphCacheSafeForModel(&model));
+    EXPECT_TRUE(DoesDecodeGraphCacheRequireRuntimeRebind(&model));
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36HybridSSMSingleDecodeCanUseDecodeGraphCache) {
+    const TransformerModel model = MakeQwen36HybridDecodeModel();
+
+    EXPECT_TRUE(IsDecodeGraphCacheSafeForModel(&model));
+    EXPECT_TRUE(DoesDecodeGraphCacheRequireRuntimeRebind(&model));
 }
 
 TEST(DecodeGraphCachePolicyTest, HybridSSMModelsRequireRuntimeRebind) {
@@ -347,7 +373,9 @@ TEST(DecodeGraphCachePolicyTest, AutoModeKeepsShortSingleDecodeOnStandardPath) {
 }
 
 TEST(DecodeGraphCachePolicyTest, Qwen36SingleDecodeTopologyIsCacheStableWithoutForcedPagedDecode) {
-    const TransformerModel qwen36 = MakeQwen36HybridDecodeModel();
+    TransformerModel qwen36 = MakeQwen36HybridDecodeModel();
+    qwen36.hparams.n_head_kv = 2;
+    qwen36.hparams.n_embd_head_k = 256;
     const BatchSpec batch = MakeDecodeOnlyBatch(/*num_seqs=*/1, /*n_past=*/63);
     PagedKVCache cache{};
     cache.cache_type = GGML_TYPE_F16;

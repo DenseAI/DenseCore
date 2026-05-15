@@ -61,12 +61,12 @@ int CapThreadsToAvailableCores(int physical_core_count, int base_threads) {
     return std::max(1, cap);
 }
 
-bool IsQwen36HybridSsmSingleRequest(const TransformerModel* model, int num_seqs) {
+bool IsQwen35HybridSsmSingleRequest(const TransformerModel* model, int num_seqs) {
     if (num_seqs != 1 || !model || !model->arch_flags.is_hybrid_ssm) {
         return false;
     }
     const auto descriptor = densecore::models::DescribeModel(model);
-    return descriptor.variant == ModelVariant::QWEN36;
+    return descriptor.variant == ModelVariant::QWEN35 || descriptor.variant == ModelVariant::QWEN36;
 }
 
 int ResolveQwen36WideSimdSingleDecodeFallbackThreads(int cap) {
@@ -147,7 +147,11 @@ bool ResolvePagedDecodeHeadDims(const TransformerModel* model, int* n_head_out, 
         return false;
     }
 
-    const int head_dim_q = model->hparams.n_embd / n_head;
+    const auto descriptor = densecore::models::DescribeModel(model);
+    const bool qwen36_hybrid_ssm = model->arch_flags.is_hybrid_ssm && descriptor.variant == ModelVariant::QWEN36;
+    const int head_dim_q =
+        (qwen36_hybrid_ssm && model->hparams.n_embd_head_k > 0) ? model->hparams.n_embd_head_k
+                                                                : (model->hparams.n_embd / n_head);
     const int head_dim_kv =
         (model->hparams.n_embd_head_k > 0) ? model->hparams.n_embd_head_k : (model->hparams.n_embd / n_head);
     if (head_dim_q <= 0 || head_dim_kv <= 0) {
@@ -177,6 +181,8 @@ size_t LongestTagCarry(const std::string& text, const std::string& open, const s
 }
 
 }  // namespace
+
+bool IsQwen36SingleDecodeCacheCandidate(const TransformerModel* model);
 
 bool IsDebugGraphLoggingEnabled() {
     static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_DEBUG_GRAPH", false);
@@ -425,8 +431,13 @@ bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model) {
     if (model->arch_flags.is_gemma4) {
         return densecore::models::SupportsPagedDecodeAttention(model);
     }
-    // Hybrid-SSM graphs still contain request-local state pointers until all
-    // runtime rebind coverage is complete.
+    // Qwen3.6 hybrid-SSM single-token decode has stable paged-attention topology
+    // and the SSM custom-op runtime state is rebound on every cache reuse.
+    if (IsQwen36SingleDecodeCacheCandidate(model)) {
+        return true;
+    }
+    // Other hybrid-SSM graphs still contain request-local state pointers until
+    // their runtime rebind coverage is qualified.
     if (model->arch_flags.is_hybrid_ssm) {
         return false;
     }
@@ -692,7 +703,7 @@ bool IsQwen36SingleDecodeCacheCandidate(const TransformerModel* model) {
         return false;
     }
     const auto descriptor = densecore::models::DescribeModel(model);
-    return descriptor.variant == ModelVariant::QWEN36;
+    return descriptor.variant == ModelVariant::QWEN35 || descriptor.variant == ModelVariant::QWEN36;
 }
 
 int ResolveLegacyDecodeThreads(int num_seqs, int physical_core_count, int base_threads) {
@@ -727,7 +738,7 @@ PrefillThreadPolicySelection ResolvePrefillThreadPolicySelection(const Transform
     selection.threads = CapThreadsToAvailableCores(physical_core_count, base_threads);
     selection.label = "prefill_base";
 
-    if (IsQwen36HybridSsmSingleRequest(model, num_seqs) && IsWideSimdLevel(simd_level)) {
+    if (IsQwen35HybridSsmSingleRequest(model, num_seqs) && IsWideSimdLevel(simd_level)) {
         if ((simd_level == densecore::simd::SimdLevel::SVE || simd_level == densecore::simd::SimdLevel::SVE2) &&
             physical_core_count >= 16) {
             selection.label = "prefill_qwen36_single_c4a_full_core";
@@ -806,7 +817,7 @@ DecodeThreadPolicySelection ResolveDecodeThreadPolicySelection(const Transformer
         return selection;
     }
 
-    if (!IsQwen36HybridSsmSingleRequest(model, num_seqs)) {
+    if (!IsQwen35HybridSsmSingleRequest(model, num_seqs)) {
         return selection;
     }
     if (!IsWideSimdLevel(simd_level)) {

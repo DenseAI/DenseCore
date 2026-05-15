@@ -1941,6 +1941,10 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             struct ggml_tensor* native_moe =
                 TryBuildGemma4NativeMoEGraph(ctx_c, gf, model, &model->layers[il], il, routed_input, gate_logits,
                                              moe_top_k);
+            if (!native_moe) {
+                native_moe = TryBuildQwen35NativeMoEGraph(ctx_c, gf, model, &model->layers[il], il, routed_input,
+                                                          gate_logits, moe_top_k, layer_spec);
+            }
             if (native_moe) {
                 cur = native_moe;
             } else {
@@ -2018,19 +2022,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             }
 
             // Shared-expert branch runs in parallel with routed experts.
-            const bool disable_qwen35_shared_expert_branch =
-                model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
-            if (disable_qwen35_shared_expert_branch && il == 0) {
-                static bool logged_shared_expert_disable = false;
-                if (!logged_shared_expert_disable) {
-                    std::cerr << "[DenseCore] Qwen3.5 shared-expert branch disabled on hybrid SSM path while routed "
-                                 "expert generation correctness is recovered"
-                              << std::endl;
-                    logged_shared_expert_disable = true;
-                }
-            }
-            if (!disable_qwen35_shared_expert_branch &&
-                ShouldRunMoESharedDenseBranch(model, layer_spec, is_gemma4_moe, ffn_gate, ffn_up, ffn_down)) {
+            if (ShouldRunMoESharedDenseBranch(model, layer_spec, is_gemma4_moe, ffn_gate, ffn_up, ffn_down)) {
                 if (!is_gemma4_moe && !ffn_shared_gate) {
                     throw densecore::InvalidArgumentException("Missing shared expert gate weight in TransformerLayer");
                 }
@@ -2040,7 +2032,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 DebugLogSharedExpertTensor("ffn_down_w", il, ffn_down);
                 DebugLogSharedExpertTensor("ffn_shared_gate_w", il, ffn_shared_gate);
                 const bool prefer_plain_shared_expert_matmul =
-                    model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm;
+                    (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+                    model->arch_flags.is_hybrid_ssm;
                 struct ggml_tensor* shared_gate = nullptr;
                 struct ggml_tensor* shared_up = nullptr;
                 struct ggml_tensor* shared_gate_up_fused =

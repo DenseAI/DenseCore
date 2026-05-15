@@ -2487,7 +2487,8 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
         if (num_k_heads == num_v_heads) {
             return v_head_idx;
         }
-        if (ud->projection_profile == Qwen35SSMQkvProjectionProfile::QWEN36_OFFICIAL) {
+        if (ud->projection_profile == Qwen35SSMQkvProjectionProfile::QWEN35_OFFICIAL ||
+            ud->projection_profile == Qwen35SSMQkvProjectionProfile::QWEN36_OFFICIAL) {
             return v_head_idx % num_k_heads;
         }
         return std::min(num_k_heads - 1, v_head_idx / heads_per_group);

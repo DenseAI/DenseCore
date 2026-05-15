@@ -115,9 +115,9 @@ bool IsGemma4DecodeSpecialTransformDisabled() {
 }
 
 bool IsGemma4VNormDisabled() {
-    // llama.cpp Gemma4 applies Q/K RMS norm and attention post-norm, but no V
-    // RMS norm. Do not keep an env-controlled alternate semantic path here.
-    return true;
+    // llama.cpp Gemma4 applies an unweighted RMS norm to V after reshape and
+    // before RoPE. Keep that as the maintained semantic path.
+    return false;
 }
 
 bool IsGemma4FullRopeFreqsDisabled() {

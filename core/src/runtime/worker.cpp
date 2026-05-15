@@ -868,8 +868,8 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
         return -1;
     }
     const auto descriptor = densecore::models::DescribeModel(model);
-    if (descriptor.variant != ModelVariant::QWEN36 || !model->arch_flags.is_hybrid_ssm ||
-        model->hparams.n_experts <= 0) {
+    if ((descriptor.variant != ModelVariant::QWEN35 && descriptor.variant != ModelVariant::QWEN36) ||
+        !model->arch_flags.is_hybrid_ssm || model->hparams.n_experts <= 0) {
         return -1;
     }
     return ResolvePrefillChunkTokensFromEnv(req, "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS",
@@ -3788,7 +3788,9 @@ void EngineLoop(EngineState* state) {
             std::vector<int> decode_check_write_blocks;
             std::vector<uint8_t> decode_check_pre_k;
             std::vector<uint8_t> decode_check_pre_v;
+            std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>> decode_check_pre_ssm;
             bool decode_check_ready = false;
+            bool decode_check_ssm_ready = false;
 
             if (need_decode_check_kv_snapshot) {
                 // Snapshot only blocks written in this decode step for decode
@@ -3831,18 +3833,53 @@ void EngineLoop(EngineState* state) {
                                                        &decode_check_pre_v);
                     decode_check_ready = true;
                 }
+
+                if (current_model && current_model->arch_flags.is_hybrid_ssm) {
+                    decode_check_ssm_ready =
+                        batch.hybrid_ssm_runtime_states.size() == static_cast<size_t>(batch.num_seqs);
+                    if (decode_check_ssm_ready) {
+                        decode_check_pre_ssm.reserve(batch.hybrid_ssm_runtime_states.size());
+                        for (auto* states : batch.hybrid_ssm_runtime_states) {
+                            if (!states) {
+                                decode_check_ssm_ready = false;
+                                decode_check_pre_ssm.clear();
+                                break;
+                            }
+                            decode_check_pre_ssm.push_back(*states);
+                        }
+                    }
+                } else {
+                    decode_check_ssm_ready = true;
+                }
             }
+            const auto restore_decode_check_state = [&]() {
+                current_kv_cache->RestoreBlocksFromHost(decode_check_write_blocks, decode_check_pre_k,
+                                                        decode_check_pre_v);
+                if (!decode_check_pre_ssm.empty() &&
+                    decode_check_pre_ssm.size() == batch.hybrid_ssm_runtime_states.size()) {
+                    for (size_t i = 0; i < decode_check_pre_ssm.size(); ++i) {
+                        if (batch.hybrid_ssm_runtime_states[i]) {
+                            *batch.hybrid_ssm_runtime_states[i] = decode_check_pre_ssm[i];
+                        }
+                    }
+                }
+                ResetInferenceWorkContext(work_ctx.get());
+                SetCurrentBatch(&batch);
+            };
 
             if (run_decode_graph_cache_regression_check) {
                 if (!decode_check_ready) {
                     std::cerr << "[DecodeGraphCacheCheck] skipped: unable to snapshot decode-step KV pre-state"
                               << std::endl;
+                } else if (!decode_check_ssm_ready) {
+                    std::cerr << "[DecodeGraphCacheCheck] skipped: unable to snapshot hybrid SSM pre-state"
+                              << std::endl;
                 } else {
                     try {
                         // Both cached and uncached verification runs write decode-step
-                        // KV blocks, so each must start from the same pre-step KV
-                        // state; restore again before the real decode compute so this
-                        // regression mode does not perturb generation.
+                        // KV and hybrid-SSM recurrent state, so each must start from
+                        // the same pre-step state. Restore again before the real decode
+                        // compute so this regression mode does not perturb generation.
                         MaybeLogMoEGraphSummary(gf, current_model, is_prefill_batch);
                         ResetPagedDecodeGraphExecutionState(gf);
                         ggml_backend_graph_compute(active_backend, gf);
@@ -3878,10 +3915,7 @@ void EngineLoop(EngineState* state) {
                                     std::memcpy(dst_row, src_row, static_cast<size_t>(n_vocab) * sizeof(float));
                                 }
 
-                                current_kv_cache->RestoreBlocksFromHost(decode_check_write_blocks, decode_check_pre_k,
-                                                                        decode_check_pre_v);
-                                ResetInferenceWorkContext(work_ctx.get());
-                                SetCurrentBatch(&batch);
+                                restore_decode_check_state();
 
                                 struct ggml_init_params uncached_params = {
                                     .mem_size = DecodeGraphCacheCtxBytes(),
@@ -4034,16 +4068,10 @@ void EngineLoop(EngineState* state) {
                             }
                         }
                     } catch (const std::exception&) {
-                        current_kv_cache->RestoreBlocksFromHost(decode_check_write_blocks, decode_check_pre_k,
-                                                                decode_check_pre_v);
-                        ResetInferenceWorkContext(work_ctx.get());
-                        SetCurrentBatch(&batch);
+                        restore_decode_check_state();
                         throw;
                     }
-                    current_kv_cache->RestoreBlocksFromHost(decode_check_write_blocks, decode_check_pre_k,
-                                                            decode_check_pre_v);
-                    ResetInferenceWorkContext(work_ctx.get());
-                    SetCurrentBatch(&batch);
+                    restore_decode_check_state();
                 }
             }
 
