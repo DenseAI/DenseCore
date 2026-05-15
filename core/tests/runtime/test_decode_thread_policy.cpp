@@ -364,7 +364,7 @@ TEST(DecodeThreadPolicy, Qwen36PrefillChunkOffDisablesLongPromptAdmission) {
     EXPECT_EQ(ResolveQwen36PrefillChunkTokens(&model, &req), -1);
 }
 
-TEST(DecodeThreadPolicy, Gemma4MoEPrefillChunkAutoChunksLongPrompts) {
+TEST(DecodeThreadPolicy, Gemma4MoEPrefillChunkAutoKeepsLongPromptsUnchunkedByDefault) {
     ScopedEnvVar chunk_override("DENSECORE_GEMMA4_PREFILL_CHUNK_TOKENS", "0");
     ScopedEnvVar auto_min("DENSECORE_GEMMA4_PREFILL_CHUNK_AUTO_MIN_TOKENS", nullptr);
     ScopedEnvVar default_tokens("DENSECORE_GEMMA4_PREFILL_CHUNK_DEFAULT_TOKENS", nullptr);
@@ -378,12 +378,12 @@ TEST(DecodeThreadPolicy, Gemma4MoEPrefillChunkAutoChunksLongPrompts) {
     req.prompt_token_count = 1536;
     req.prompt_tokens_for_cache.resize(1536, 1);
 
-    EXPECT_EQ(ResolveGemma4PrefillChunkTokens(&model, &req), 64);
+    EXPECT_EQ(ResolveGemma4PrefillChunkTokens(&model, &req), -1);
 
     req.prompt_token_count = 3066;
     req.prompt_tokens_for_cache.resize(3066, 1);
 
-    EXPECT_EQ(ResolveGemma4PrefillChunkTokens(&model, &req), 128);
+    EXPECT_EQ(ResolveGemma4PrefillChunkTokens(&model, &req), -1);
 }
 
 TEST(DecodeThreadPolicy, Gemma4MoEPrefillChunkAutoKeepsShortPromptsUnchunked) {

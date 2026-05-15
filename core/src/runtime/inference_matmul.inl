@@ -447,6 +447,81 @@ static inline bool ComputeQ4KQ8KBatchedRowScalar(const void* weight_row, const u
     return true;
 }
 
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+static inline bool ComputeQ4KQ8KBatchedRowDotprod(const void* weight_row, const uint8_t* quant_input_base,
+                                                  size_t quant_row_stride, int M, int N, float* out_sums) {
+    if (!weight_row || !quant_input_base || !out_sums) return false;
+    if (M <= 0 || M > kMaxSmallBatchColsHard) return false;
+    if (N <= 0 || (N % QK_K) != 0) return false;
+    if (quant_row_stride < static_cast<size_t>(sizeof(DensecoreBlockQ8K)) * static_cast<size_t>(N / QK_K)) {
+        return false;
+    }
+
+    std::fill(out_sums, out_sums + M, 0.0f);
+    const auto* q4_blocks = reinterpret_cast<const block_q4_K*>(weight_row);
+    const int nb = N / QK_K;
+
+    static constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    static constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    static constexpr uint32_t kmask3 = 0x03030303;
+    const uint8x16_t low_mask = vdupq_n_u8(0x0F);
+
+    for (int bi = 0; bi < nb; ++bi) {
+        const auto& xb = q4_blocks[bi];
+
+        uint32_t utmp[4];
+        std::memcpy(utmp, xb.scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const auto* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
+        const auto* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
+        const float q4_d = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.d));
+        const float q4_dmin = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.dmin));
+
+        int8x16_t q4_vec[QK_K / 32][2];
+        const uint8_t* q4 = xb.qs;
+        for (int chunk = 0; chunk < QK_K / 64; ++chunk) {
+            const uint8x16_t packed0 = vld1q_u8(q4);
+            const uint8x16_t packed1 = vld1q_u8(q4 + 16);
+            q4 += 32;
+            q4_vec[2 * chunk][0] = vreinterpretq_s8_u8(vandq_u8(packed0, low_mask));
+            q4_vec[2 * chunk][1] = vreinterpretq_s8_u8(vandq_u8(packed1, low_mask));
+            q4_vec[2 * chunk + 1][0] = vreinterpretq_s8_u8(vshrq_n_u8(packed0, 4));
+            q4_vec[2 * chunk + 1][1] = vreinterpretq_s8_u8(vshrq_n_u8(packed1, 4));
+        }
+
+        for (int m = 0; m < M; ++m) {
+            const auto* q8_blocks = reinterpret_cast<const DensecoreBlockQ8K*>(
+                quant_input_base + static_cast<size_t>(m) * quant_row_stride);
+            const auto& yb = q8_blocks[bi];
+
+            int32_t min_dot = 0;
+            for (int j = 0; j < QK_K / 16; ++j) {
+                min_dot += static_cast<int32_t>(yb.bsums[j]) * static_cast<int32_t>(mins[j / 2]);
+            }
+
+            int32_t dot_scaled = 0;
+            const int8_t* q8 = yb.qs;
+            for (int group = 0; group < QK_K / 32; ++group) {
+                int32x4_t acc = vdupq_n_s32(0);
+                acc = vdotq_s32(acc, vld1q_s8(q8 + group * 32), q4_vec[group][0]);
+                acc = vdotq_s32(acc, vld1q_s8(q8 + group * 32 + 16), q4_vec[group][1]);
+                dot_scaled += static_cast<int32_t>(scales[group]) * vaddvq_s32(acc);
+            }
+
+            const float d = q4_d * yb.d;
+            const float dmin = q4_dmin * yb.d;
+            out_sums[m] += d * static_cast<float>(dot_scaled) - dmin * static_cast<float>(min_dot);
+        }
+    }
+    return true;
+}
+#endif
+
 #if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
 static inline __m256i M256SetM128i(const __m128i hi, const __m128i lo) {
     return _mm256_insertf128_si256(_mm256_castsi128_si256(lo), hi, 1);
@@ -624,6 +699,22 @@ static inline bool ComputeQ4KQ8KBatchedRowAvx2(const void* weight_row, const uin
 
 static inline bool ComputeQ4KQ8KBatchedRow(const void* weight_row, const uint8_t* quant_input_base,
                                            size_t quant_row_stride, int M, int N, float* out_sums) {
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+    static const bool debug_q4k_path = []() {
+        const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_PATH");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    static std::atomic<bool> logged_dotprod{false};
+    if (ComputeQ4KQ8KBatchedRowDotprod(weight_row, quant_input_base, quant_row_stride, M, N, out_sums)) {
+        if (debug_q4k_path) {
+            bool expected = false;
+            if (logged_dotprod.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+                std::cerr << "[Q4K_BATCHED_PATH] arm_dotprod" << std::endl;
+            }
+        }
+        return true;
+    }
+#endif
 #if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
     static const bool debug_q4k_path = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_PATH");
@@ -1109,11 +1200,10 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
             for (int d = 0; d < head_dim; ++d) {
                 dot += q_head[d] * k_head[d];
             }
-            float score = dot;
+            float score = dot * scale;
             if (ud->logit_softcap > 0.0f && std::isfinite(score)) {
                 score = std::tanh(score / ud->logit_softcap) * ud->logit_softcap;
             }
-            score *= scale;
             scores[static_cast<size_t>(t)] = score;
             if (std::isfinite(score) && score > max_score) {
                 max_score = score;
@@ -2618,10 +2708,10 @@ static void ComputeFlashAttentionReference(const float* q, const float* k, const
                 for (int d = 0; d < head_dim; ++d) {
                     score += q_row[d] * k_row[d];
                 }
+                score *= scale;
                 if (logit_softcap > 0.0f) {
                     score = std::tanh(score / logit_softcap) * logit_softcap;
                 }
-                score *= scale;
                 scores[static_cast<size_t>(tk)] = score;
                 row_max = std::max(row_max, score);
             }
@@ -3465,17 +3555,42 @@ inline struct ggml_tensor* ggml_mul_mat_fp8(struct ggml_context* ctx, struct ggm
 struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* weight, struct ggml_tensor* input,
                                   TransformerModel* model) {
     bool using_cpu_repack_alias = false;
+    const bool prefer_gemma4_q4k_prefill_densecore_path =
+        model && model->arch_flags.is_gemma4 && input && input->type == GGML_TYPE_F32 &&
+        weight && weight->type == GGML_TYPE_Q4_K && input->ne[1] > 1 && input->ne[0] == weight->ne[0] &&
+        !IsBatchedQuantDisabled() && IsArmBatchedQuantSafeByDefault() && IsQ4KTrueBatchedKernelEnabled();
     if (model && input && input->type == GGML_TYPE_F32) {
         auto it_repack = model->cpu_repack_aliases.find(weight);
         if (it_repack != model->cpu_repack_aliases.end() && it_repack->second) {
-            weight = it_repack->second;
-            using_cpu_repack_alias = true;
+            if (!prefer_gemma4_q4k_prefill_densecore_path) {
+                weight = it_repack->second;
+                using_cpu_repack_alias = true;
+            }
         }
     }
     const int M = static_cast<int>(input->ne[1]);
     const int K_dim = static_cast<int>(weight->ne[0]);
     const int N_dim = static_cast<int>(weight->ne[1]);
     const char* w_name = (weight->name[0] ? weight->name : "(unnamed)");
+    densecore::runtime::KernelAdmissionDescriptor kleidiai_desc{};
+    kleidiai_desc.model_variant = model ? model->variant : ModelVariant::UNKNOWN;
+    kleidiai_desc.is_gemma4 = model && model->arch_flags.is_gemma4;
+    kleidiai_desc.is_hybrid_ssm = model && model->arch_flags.is_hybrid_ssm;
+    kleidiai_desc.is_moe = model && model->hparams.n_experts > 0;
+    kleidiai_desc.is_lm_head = model && model->output == weight;
+    kleidiai_desc.weight_name = w_name;
+    kleidiai_desc.weight_type = weight->type;
+    kleidiai_desc.input_type = input ? input->type : GGML_TYPE_COUNT;
+    kleidiai_desc.m = M;
+    kleidiai_desc.n = N_dim;
+    kleidiai_desc.k = K_dim;
+    const auto kleidiai_admission = densecore::runtime::EvaluateKleidiAIAdmission(kleidiai_desc);
+    RecordKleidiAIAdmissionDecision(GetCurrentWorkContext(), kleidiai_admission);
+    if (kleidiai_admission.candidate && IsDebugMatmulDispatchEnabled()) {
+        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
+                          kleidiai_admission.allowed ? "KLEIDIAI_ADMITTED" : "KLEIDIAI_REJECTED",
+                          densecore::runtime::KernelAdmissionRejectReasonName(kleidiai_admission.reject_reason));
+    }
     const bool is_hybrid_ssm_qkv = model && model->arch_flags.is_hybrid_ssm && IsHybridSSMQkvWeightName(w_name);
     const bool is_qwen35_hybrid_ssm = model && model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
     const bool is_qwen35_hybrid_ssm_gate = is_qwen35_hybrid_ssm && std::strstr(w_name, "attn_gate");
@@ -3541,12 +3656,11 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         return ggml_mul_mat(ctx, weight, input);
     }
 
-    const int gemma4_prefill_native_quant_max_cols =
-        ParsePositiveEnvInt("DENSECORE_GEMMA4_PREFILL_NATIVE_QUANT_MAX_COLS", 512);
+    const bool gemma4_q4k_prefill_fast_path_eligible = prefer_gemma4_q4k_prefill_densecore_path;
     if (model && model->arch_flags.is_gemma4 && ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 &&
-        M > 1 && M <= gemma4_prefill_native_quant_max_cols) {
+        M > 1 && !gemma4_q4k_prefill_fast_path_eligible) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
-                          "gemma4_short_prefill_quant_correctness");
+                          "gemma4_prefill_quant_native");
         return ggml_mul_mat(ctx, weight, input);
     }
 

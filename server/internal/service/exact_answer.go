@@ -121,11 +121,13 @@ func isGenericExactAnswerReference(answer string) bool {
 	switch normalized {
 	case "a", "an", "the", "it", "this", "that":
 		return true
-	case "answer", "token", "code", "value", "word", "number":
+	case "answer", "token", "code", "value", "word", "number", "codename", "name", "id", "identifier", "key":
 		return true
-	case "the answer", "the token", "the code", "the value", "the word", "the number":
+	case "the answer", "the token", "the code", "the value", "the word", "the number", "the codename", "the name", "the id",
+		"the identifier", "the key":
 		return true
-	case "only the answer", "only the token", "only the code", "only the value", "only the word", "only the number":
+	case "only the answer", "only the token", "only the code", "only the value", "only the word", "only the number",
+		"only the codename", "only the name", "only the id", "only the identifier", "only the key":
 		return true
 	default:
 		return false

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Qwen3.6-35B-A3B text-only support**: DenseCore now aliases Qwen3.6 GGUF/HF metadata onto the hardened
+  `qwen35moe` hybrid-SSM runtime, reconstructs the 3-linear/1-full layer schedule from `full_attention_interval=4`
+  when needed, and keeps multimodal execution fail-closed while skipping auxiliary vision tensors on the text path.
+
 ## [1.0.0] - 2026-03-28
 
 ### Highlights

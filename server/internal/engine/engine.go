@@ -140,9 +140,12 @@ func requestLifecycleDebugEnabled() bool {
 }
 
 func parseKVCacheType(raw string) (C.DenseCoreKVType, bool, error) {
-	switch strings.TrimSpace(strings.ToLower(raw)) {
-	case "", "fp16", "f16":
+	value := strings.TrimSpace(strings.ToLower(raw))
+	switch value {
+	case "":
 		return C.DENSECORE_KV_FP16, false, nil
+	case "fp16", "f16":
+		return C.DENSECORE_KV_FP16, true, nil
 	case "q8_0", "int8", "q8":
 		return C.DENSECORE_KV_INT8, true, nil
 	case "q4_0", "int4", "q4":

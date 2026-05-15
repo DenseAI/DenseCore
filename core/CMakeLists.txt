@@ -297,7 +297,7 @@ endif()
 if(NOT DEFINED GGML_CPU_KLEIDIAI)
     set(GGML_CPU_KLEIDIAI ${DENSECORE_CAN_USE_KLEIDIAI} CACHE BOOL "Enable ggml KleidiAI kernels")
 elseif(GGML_CPU_KLEIDIAI AND NOT DENSECORE_CAN_USE_KLEIDIAI)
-    message(STATUS "[DenseCore] Disabling GGML_CPU_KLEIDIAI for non-ARM target: ${CMAKE_SYSTEM_PROCESSOR}")
+    message(STATUS "[DenseCore] Disabling GGML_CPU_KLEIDIAI until the DenseCore KleidiAI quality gate is enabled")
     set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "Enable ggml KleidiAI kernels" FORCE)
 endif()
 if(NOT DEFINED GGML_CPU_ARM_ARCH)
@@ -736,6 +736,7 @@ target_compile_definitions(densecore PRIVATE
     DENSECORE_DEFAULT_PRECOMPUTED_ROPE=$<IF:$<BOOL:${DENSECORE_DEFAULT_PRECOMPUTED_ROPE}>,1,0>
     DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM=$<IF:$<BOOL:${DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM}>,1,0>
     DENSECORE_DEFAULT_FUSED_QKV=$<IF:$<BOOL:${DENSECORE_DEFAULT_FUSED_QKV}>,1,0>
+    DENSECORE_GGML_CPU_KLEIDIAI=$<IF:$<BOOL:${GGML_CPU_KLEIDIAI}>,1,0>
 )
 if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
     target_compile_definitions(densecore PRIVATE DENSECORE_ARM_CORRECTNESS_FIRST=1)
@@ -1325,6 +1326,10 @@ if(DENSECORE_BUILD_TESTS)
     # Enable mock model for E2E tests (allows InitEngine("mock", ...))
     target_compile_definitions(densecore_tests PRIVATE DENSECORE_TEST_BUILD)
     target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_TEST_BUILD)
+    target_compile_definitions(densecore_tests PRIVATE
+        DENSECORE_GGML_CPU_KLEIDIAI=$<IF:$<BOOL:${GGML_CPU_KLEIDIAI}>,1,0>)
+    target_compile_definitions(gemma4_parity_probe PRIVATE
+        DENSECORE_GGML_CPU_KLEIDIAI=$<IF:$<BOOL:${GGML_CPU_KLEIDIAI}>,1,0>)
     if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
         target_compile_definitions(densecore_tests PRIVATE DENSECORE_ARM_CORRECTNESS_FIRST=1)
         target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_ARM_CORRECTNESS_FIRST=1)

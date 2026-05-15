@@ -15,6 +15,7 @@
 #include "densecore/exceptions.h"
 #include "densecore/models/model_descriptor.h"
 #include "ggml.h"
+#include "runtime/kernel_admission.h"
 #include "models/model_inference_policy.h"
 #include "runtime/runtime_env.h"
 
@@ -782,32 +783,26 @@ DecodeThreadPolicySelection ResolveDecodeThreadPolicySelection(const Transformer
         ResolveAutoDecodeThreadsForBatchWithSimd(num_seqs, physical_core_count, base_threads, simd_level);
     selection.label = "decode_batch_auto";
 
-    const bool gemma4_moe_single_request =
-        model && model->arch_flags.is_gemma4 && model->hparams.n_experts > 0 && num_seqs == 1;
-    if (gemma4_moe_single_request && IsWideSimdLevel(simd_level)) {
+    const bool gemma4_single_request = model && model->arch_flags.is_gemma4 && num_seqs == 1;
+    if (gemma4_single_request && IsWideSimdLevel(simd_level)) {
         const int cap = CapThreadsToAvailableCores(physical_core_count, base_threads);
-        const int env_override = densecore::env::ParsePositiveEnvInt("DENSECORE_GEMMA4_SINGLE_DECODE_THREADS", 0);
-        if (env_override > 0) {
-            selection.threads = std::max(1, std::min(cap, env_override));
-            selection.label = "decode_gemma4_a4b_env_override";
-            return selection;
-        }
-
         const bool arm_c4a_wide_simd =
             densecore::simd::IsArmFamily(simd_level) &&
             (simd_level == densecore::simd::SimdLevel::SVE || simd_level == densecore::simd::SimdLevel::SVE2);
         if (arm_c4a_wide_simd && physical_core_count >= 16 && cap >= 16) {
             selection.threads = 16;
-            selection.label = "decode_gemma4_a4b_c4a_moe_16";
+            selection.label =
+                (model->hparams.n_experts > 0) ? "decode_gemma4_a4b_c4a_moe_16" : "decode_gemma4_dense_c4a_16";
             return selection;
         }
         if (arm_c4a_wide_simd && cap >= 12) {
             selection.threads = 12;
-            selection.label = "decode_gemma4_a4b_arm_safe_cap";
+            selection.label =
+                (model->hparams.n_experts > 0) ? "decode_gemma4_a4b_arm_safe_cap" : "decode_gemma4_dense_arm_12";
             return selection;
         }
         selection.threads = std::max(1, std::min(cap, 8));
-        selection.label = "decode_gemma4_a4b_safe_cap";
+        selection.label = (model->hparams.n_experts > 0) ? "decode_gemma4_a4b_safe_cap" : "decode_gemma4_dense_safe_cap";
         return selection;
     }
 
@@ -1493,6 +1488,13 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " ssm_delta_wall_ms=" << ns_to_ms(req->ssm_delta_wall_ns) << " ssm_out_ms=" << ns_to_ms(req->ssm_out_wall_ns)
         << " ssm_conv1d_ms=" << ns_to_ms(req->ssm_conv1d_ns) << " ssm_delta_ms=" << ns_to_ms(req->ssm_delta_ns)
         << " kv_update_ms=" << ns_to_ms(req->kv_update_ns) << " sample_ms=" << ns_to_ms(req->sample_ns)
+        << " kleidiai_compiled_enabled=" << req->kleidiai_compiled_enabled
+        << " kleidiai_candidate_ops=" << req->kleidiai_candidate_ops
+        << " kleidiai_allowed_ops=" << req->kleidiai_allowed_ops
+        << " kleidiai_rejected_ops=" << req->kleidiai_rejected_ops
+        << " kleidiai_last_reject_reason="
+        << densecore::runtime::KernelAdmissionRejectReasonName(
+               static_cast<densecore::runtime::KernelAdmissionRejectReason>(req->kleidiai_last_reject_reason))
         << " graph_cache_hits=" << req->graph_cache_hit_count << " graph_cache_misses=" << req->graph_cache_miss_count
         << " paged_hit_rate=" << paged_hit_rate << " paged_path_hits=" << runtime.path_paged
         << " decode_path_total=" << runtime.path_total

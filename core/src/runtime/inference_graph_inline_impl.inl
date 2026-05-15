@@ -1944,6 +1944,10 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             if (native_moe) {
                 cur = native_moe;
             } else {
+                if (is_gemma4_moe) {
+                    throw densecore::InvalidArgumentException(
+                        "Gemma4 MoE native graph construction failed; refusing slow CPU backend MoE fallback");
+                }
                 MoEUserData* moe_ud = AllocateMoEUserData(ctx_c);
                 if (moe_ud) {
                     moe_ud->model = model;
@@ -1966,7 +1970,10 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     if (!moe_ud->backend) {
                         moe_ud->backend = &densecore::GetTelemetryCpuBackend();
                     }
-                    if (moe_ud->backend && !ggml_get_no_alloc(ctx_c)) {
+                    if (moe_ud->backend) {
+                        // Expert registration is CPU-side metadata, not ggml arena allocation.
+                        // Prefill callback graphs are built under no-alloc planning and still
+                        // need registered experts before graph execution.
                         const densecore::CpuBackend::ExpertWeights* registered_experts = nullptr;
                         int registered_count = 0;
                         if (!moe_ud->backend->GetRegisteredExpertsView(moe_ud->layer, &registered_experts,
@@ -2199,10 +2206,31 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             }
             const bool prefer_plain_qwen35_hybrid_ffn =
                 model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
-            struct ggml_tensor* w1 = prefer_plain_qwen35_hybrid_ffn ? ggml_mul_mat(ctx_c, ffn_gate, cur)
-                                                                    : smart_mul_mat(ctx_c, ffn_gate, cur, model);
-            struct ggml_tensor* w3 = prefer_plain_qwen35_hybrid_ffn ? ggml_mul_mat(ctx_c, ffn_up, cur)
-                                                                    : smart_mul_mat(ctx_c, ffn_up, cur, model);
+            struct ggml_tensor* w1 = nullptr;
+            struct ggml_tensor* w3 = nullptr;
+            struct ggml_tensor* dense_gate_up_fused =
+                (model->arch_flags.is_gemma4 && !prefer_plain_qwen35_hybrid_ffn && cur->type == GGML_TYPE_F32)
+                    ? layer.Get("ffn_gate_up.cpu_repack_fused")
+                    : nullptr;
+            if (dense_gate_up_fused &&
+                (dense_gate_up_fused->ne[0] != cur->ne[0] ||
+                 dense_gate_up_fused->ne[1] != ffn_gate->ne[1] + ffn_up->ne[1])) {
+                dense_gate_up_fused = nullptr;
+            }
+            if (dense_gate_up_fused) {
+                struct ggml_tensor* gate_up = ggml_mul_mat(ctx_c, dense_gate_up_fused, cur);
+                char fused_name[96];
+                std::snprintf(fused_name, sizeof(fused_name), "blk.%d.ffn_gate_up.cpu_repack_fused", il);
+                ggml_set_name(gate_up, fused_name);
+                const size_t up_offset = static_cast<size_t>(ffn_gate->ne[1]) * sizeof(float);
+                w1 = ggml_view_2d(ctx_c, gate_up, ffn_gate->ne[1], cur->ne[1], gate_up->nb[1], 0);
+                w3 = ggml_view_2d(ctx_c, gate_up, ffn_up->ne[1], cur->ne[1], gate_up->nb[1], up_offset);
+            } else {
+                w1 = prefer_plain_qwen35_hybrid_ffn ? ggml_mul_mat(ctx_c, ffn_gate, cur)
+                                                    : smart_mul_mat(ctx_c, ffn_gate, cur, model);
+                w3 = prefer_plain_qwen35_hybrid_ffn ? ggml_mul_mat(ctx_c, ffn_up, cur)
+                                                    : smart_mul_mat(ctx_c, ffn_up, cur, model);
+            }
             if (ShouldRunFfnProjectionReferenceProbe(il)) {
                 ProjectionReferenceUserData* w1_ref_ud = GetProjectionReferenceUserData();
                 w1_ref_ud->weight_tensor = ffn_gate;
@@ -2464,6 +2492,14 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
         }
     }
+    if (batch.skip_output_logits && !embedding_mode) {
+        ggml_set_name(cur, "prefill_no_logits_output");
+        if (gf) {
+            ggml_build_forward_expand(gf, cur);
+        }
+        return cur;
+    }
+
     cur = apply_weighted_rms_norm(cur, model->output_norm, "output_norm", static_cast<int>(model->layers.size()));
 
     if (embedding_mode) {

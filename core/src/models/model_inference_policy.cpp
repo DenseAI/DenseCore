@@ -65,7 +65,11 @@ bool SupportsPagedDecodeAttention(const TransformerModel* model) {
 
 float SanitizeAttentionLogitSoftcapForLoad(const TransformerModel* model, float gguf_softcap) {
     if (model && model->arch_flags.is_gemma4) {
-        return std::isfinite(gguf_softcap) && gguf_softcap > 0.0f ? gguf_softcap : 0.0f;
+        // llama.cpp's Gemma4 loader does not enable attention logit softcapping;
+        // only final logits are softcapped. Keep the runtime contract aligned
+        // with that reference path even if older GGUF metadata exposes a
+        // generic attention_logit_cap key.
+        return 0.0f;
     }
     return gguf_softcap;
 }
@@ -111,6 +115,8 @@ bool IsGemma4DecodeSpecialTransformDisabled() {
 }
 
 bool IsGemma4VNormDisabled() {
+    // llama.cpp Gemma4 applies Q/K RMS norm and attention post-norm, but no V
+    // RMS norm. Do not keep an env-controlled alternate semantic path here.
     return true;
 }
 

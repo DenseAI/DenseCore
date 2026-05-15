@@ -327,6 +327,10 @@ ggml_type ResolveEffectiveKVCacheType(const TransformerModel* model, ggml_type r
         return GGML_TYPE_F16;
     }
 
+    if (model && model->arch_flags.is_gemma4 && requested_cache_type == GGML_TYPE_Q4_0) {
+        return ResolveEffectiveKVCacheType(model, GGML_TYPE_Q8_0);
+    }
+
     if (!ggml_is_quantized(requested_cache_type)) {
         return requested_cache_type;
     }
@@ -340,6 +344,14 @@ ggml_type ResolveEffectiveKVCacheType(const TransformerModel* model, ggml_type r
     }
 
     return requested_cache_type;
+}
+
+ggml_type ResolveDefaultKVCacheType(const TransformerModel* model) {
+    if (model && model->arch_flags.is_gemma4 &&
+        ResolveEffectiveKVCacheType(model, GGML_TYPE_Q8_0) == GGML_TYPE_Q8_0) {
+        return GGML_TYPE_Q8_0;
+    }
+    return GGML_TYPE_F16;
 }
 
 size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int k_head_dim, int v_head_dim, int n_head_kv, int n_layer,
@@ -1726,7 +1738,8 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
         // Initialize OpRegistry (Dependency Injection)
         state->op_registry = std::make_unique<densecore::OpRegistry>();
 
-        KVCacheConfig kv_config = ComputeKVCacheConfig(model, GGML_TYPE_F16);
+        const ggml_type default_cache_type = ResolveDefaultKVCacheType(model);
+        KVCacheConfig kv_config = ComputeKVCacheConfig(model, default_cache_type);
 
         std::cout << "[DenseCore] Auto-configured max_seq_len: " << kv_config.max_seq_len << " (KV cache: ~"
                   << (kv_config.bytes_per_token * kv_config.max_seq_len / 1024 / 1024) << " MB, "
@@ -1751,8 +1764,8 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
         }
 
         // Initialize Paged KV Cache with NUMA-aware allocation
-        PagedKVCache* cache =
-            InitPagedKVCache(model, kv_config.max_num_seqs, kv_config.max_seq_len, GGML_TYPE_F16, state->numa_node_id);
+        PagedKVCache* cache = InitPagedKVCache(model, kv_config.max_num_seqs, kv_config.max_seq_len,
+                                               kv_config.effective_cache_type, state->numa_node_id);
         if (!cache) {
             delete model;
             // state is automatically cleaned up by unique_ptr
@@ -1765,8 +1778,8 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
                                     std::unique_ptr<PagedKVCache>(cache));
         state->models["default"] = std::move(entry);
         state->default_model_id = "default";
-        if (!LoadOptionalDraftModel(state.get(), canonical_model_path, canonical_draft_model_path, GGML_TYPE_F16,
-                                    "InitEngineEx")) {
+        if (!LoadOptionalDraftModel(state.get(), canonical_model_path, canonical_draft_model_path,
+                                    kv_config.effective_cache_type, "InitEngineEx")) {
             return nullptr;
         }
 
@@ -1892,7 +1905,7 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
         KVCacheConfig kv_config = ComputeKVCacheConfig(model, cache_type);
         if (kv_config.effective_cache_type != kv_config.requested_cache_type) {
             std::cout << "[DenseCore] Requested " << KVCacheTypeDisplayName(kv_config.requested_cache_type)
-                      << " KV cache, but head_dim=" << ResolveKVHeadDim(model) << " is incompatible; using "
+                      << " KV cache is not supported for this model/runtime; using "
                       << KVCacheTypeDisplayName(kv_config.effective_cache_type) << " instead" << std::endl;
         }
 

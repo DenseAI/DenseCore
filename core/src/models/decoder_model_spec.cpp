@@ -66,7 +66,7 @@ DecoderPrefillLogitsPolicy ResolvePrefillLogitsPolicy(const TransformerModel* mo
     if (model->variant == ModelVariant::QWEN36) {
         return DecoderPrefillLogitsPolicy::LastTokenEnvDefaultOn;
     }
-    if (model->arch_flags.is_gemma4 && model->hparams.n_experts > 0) {
+    if (model->arch_flags.is_gemma4) {
         return DecoderPrefillLogitsPolicy::LastTokenForMoE;
     }
     return DecoderPrefillLogitsPolicy::FullSequence;

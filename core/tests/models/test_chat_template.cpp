@@ -32,7 +32,9 @@ TEST(ChatTemplateTest, GemmaAutoTemplateUsesOfficialTurnFormatWithImplicitInstru
               "<|turn>user\n"
               "hello"
               "<turn|>\n"
-              "<|turn>model\n");
+              "<|turn>model\n"
+              "<|channel>thought\n"
+              "<channel|>");
 }
 
 TEST(ChatTemplateTest, AutoTemplateLeavesGemmaPromptUntouchedWhenAlreadyTemplated) {
@@ -249,9 +251,7 @@ TEST(ChatTemplateTest, GemmaThinkingAutoTemplateInjectsThinkSystemTurn) {
               "<|turn>user\n"
               "hello"
               "<turn|>\n"
-              "<|turn>model\n"
-              "<|channel>thought\n"
-              "<channel|>");
+              "<|turn>model\n");
 }
 
 TEST(ChatTemplateTest, RoleTagAutoTemplateUsesDedicatedSystemAndAssistantTags) {

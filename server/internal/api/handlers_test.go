@@ -341,6 +341,108 @@ func TestChatCompletionHandler(t *testing.T) {
 	}
 }
 
+func TestChatCompletionHandlerEmitsToolCalls(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.modelName = "hermes-test"
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			outputChan <- domain.StreamEvent{Token: `{"tool_calls":[{"function":{"name":"read_file","arguments":{"path":"src/main.cpp"}}}]}`}
+			outputChan <- domain.NewTerminalEvent(nil)
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	handler := NewHandler(service.NewChatService(mockModelService, q), mockModelService)
+	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
+		Model:     "hermes-test",
+		Messages:  []domain.Message{{Role: "user", Content: "read it"}},
+		MaxTokens: 16,
+		Tools: []domain.Tool{{
+			Type: "function",
+			Function: domain.ToolFunction{
+				Name:       "read_file",
+				Parameters: map[string]interface{}{"type": "object", "required": []interface{}{"path"}},
+			},
+		}},
+		ToolChoice: "auto",
+	})
+	w := httptest.NewRecorder()
+
+	handler.ChatCompletionHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	choice := resp["choices"].([]interface{})[0].(map[string]interface{})
+	if choice["finish_reason"] != "tool_calls" {
+		t.Fatalf("finish_reason=%v", choice["finish_reason"])
+	}
+	message := choice["message"].(map[string]interface{})
+	toolCalls := message["tool_calls"].([]interface{})
+	call := toolCalls[0].(map[string]interface{})
+	fn := call["function"].(map[string]interface{})
+	if fn["name"] != "read_file" || fn["arguments"] != `{"path":"src/main.cpp"}` {
+		t.Fatalf("unexpected function payload: %#v", fn)
+	}
+}
+
+func TestChatCompletionStreamingEmitsToolCallDeltaAndDone(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.modelName = "qwen3.6-test"
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			for _, token := range []string{"<tool_", "call>{\"name\":\"read_", "file\",\"arguments\":{\"path\":\"src/main.cpp\"}}</tool_call>"} {
+				outputChan <- domain.StreamEvent{Token: token}
+			}
+			outputChan <- domain.NewTerminalEvent(nil)
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	handler := NewHandler(service.NewChatService(mockModelService, q), mockModelService)
+	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
+		Model:     "qwen3.6-test",
+		Messages:  []domain.Message{{Role: "user", Content: "read it"}},
+		MaxTokens: 16,
+		Stream:    true,
+		Tools: []domain.Tool{{
+			Type: "function",
+			Function: domain.ToolFunction{
+				Name:       "read_file",
+				Parameters: map[string]interface{}{"type": "object", "required": []interface{}{"path"}},
+			},
+		}},
+		ToolChoice: "auto",
+	})
+	w := httptest.NewRecorder()
+
+	handler.ChatCompletionHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"tool_calls"`) || !strings.Contains(body, `"finish_reason":"tool_calls"`) || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("stream did not include tool delta, final tool_calls reason, and DONE: %s", body)
+	}
+}
+
 func TestSplitGemma4ReasoningResponse(t *testing.T) {
 	content, reasoning := splitGemma4ReasoningResponse(
 		"gemma4",

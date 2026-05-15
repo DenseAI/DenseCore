@@ -15,8 +15,12 @@ import (
 	"github.com/google/uuid"
 
 	"descore-server/internal/domain"
+	"descore-server/internal/promptcache"
 	"descore-server/internal/queue"
+	agenttools "descore-server/internal/tools"
 )
+
+var agentPromptCache = promptcache.NewManager(promptcache.ConfigFromEnv())
 
 type ChatService struct {
 	modelService domain.ModelService
@@ -154,7 +158,33 @@ func (s *ChatService) preparePrompt(engine domain.Engine, req domain.ChatComplet
 		enableThinking = req.ChatTemplateKwargs.EnableThinking
 		preserveThinking = req.ChatTemplateKwargs.PreserveThinking
 	}
-	rendered, err := engine.RenderChatPrompt(req.Messages, enableThinking, preserveThinking)
+	messages := req.Messages
+	if len(req.Tools) > 0 {
+		renderedTools, normalized, err := (agenttools.DefaultRenderer{}).RenderTools(
+			firstNonEmpty(modelHint, req.Model, prepared.modelVariant),
+			req.Tools,
+			req.ToolChoice,
+		)
+		if err != nil {
+			return prepared, err
+		}
+		if renderedTools != "" {
+			family := agenttools.ResolveParserFamily(agenttools.ModelDescriptor{
+				ModelID:      firstNonEmpty(modelHint, req.Model),
+				ModelVariant: prepared.modelVariant,
+			})
+			slog.Info("tool_parser_selected",
+				slog.String("model_id", firstNonEmpty(req.Model, modelHint)),
+				slog.String("model_family", string(family)),
+				slog.String("parser_family", string(family)),
+				slog.Int("tools", len(normalized.Tools)),
+				slog.String("tool_schema_hash", normalized.SchemaHash),
+			)
+			messages = agenttools.InjectToolPrompt(req.Messages, renderedTools)
+		}
+	}
+
+	rendered, err := engine.RenderChatPrompt(messages, enableThinking, preserveThinking)
 	if err != nil {
 		return prepared, err
 	}
@@ -226,6 +256,17 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 	inputIDs := req.InputIDs
 	if len(inputIDs) == 0 && len(prepared.tokenIDs) > 0 {
 		inputIDs = prepared.tokenIDs
+	}
+	cacheTokens := append([]int(nil), inputIDs...)
+	if len(cacheTokens) == 0 && prepared.prompt != "" && engine != nil {
+		if ids, err := engine.TokenizeText(prepared.prompt, false, false); err == nil {
+			cacheTokens = ids
+		}
+	}
+	if len(cacheTokens) > 0 {
+		identity := buildPromptCacheIdentity(req, prepared, modelHint)
+		decision := agentPromptCache.LookupAndStore(identity, cacheTokens)
+		logPromptCacheDecision(req, modelHint, decision)
 	}
 
 	queuedReq := &queue.QueuedRequest{
@@ -485,6 +526,96 @@ func inferModelVariantHint(modelHint string) string {
 		return "qwen35"
 	}
 	return ""
+}
+
+func buildPromptCacheIdentity(req domain.ChatCompletionRequest, prepared preparedPrompt, modelHint string) promptcache.Identity {
+	modelID := firstNonEmpty(req.Model, modelHint)
+	_, templateHash := chatTemplateIdentity(prepared.chatTemplate)
+	toolSchemaHash := ""
+	if len(req.Tools) > 0 {
+		if normalized, err := agenttools.NormalizeTools(req.Tools, req.ToolChoice); err == nil {
+			toolSchemaHash = normalized.SchemaHash
+		}
+	}
+	systemPromptHash := hashSystemPrompt(req.Messages)
+	parserFamily := agenttools.ResolveParserFamily(agenttools.ModelDescriptor{
+		ModelID:       modelID,
+		TokenizerType: prepared.tokenizerType,
+		ChatTemplate:  prepared.chatTemplate,
+		ModelVariant:  prepared.modelVariant,
+	})
+	identity := promptcache.Identity{
+		ModelID:          modelID,
+		ModelPath:        modelHint,
+		ModelFingerprint: modelHint,
+		TokenizerHash:    shortHash(prepared.tokenizerType),
+		ChatTemplateHash: templateHash,
+		ToolSchemaHash:   toolSchemaHash,
+		SystemPromptHash: systemPromptHash,
+		LoraAdapterID:    req.LoraAdapter,
+		KVDType:          firstNonEmpty(os.Getenv("DENSECORE_KV_TYPE"), "fp16"),
+		RopeConfig:       "engine_default",
+		GraphFamily:      firstNonEmpty(prepared.promptFamily, "generic"),
+		SlidingWindow:    "default",
+		SSMPolicy:        "none",
+		ParserFamily:     string(parserFamily),
+		Supported:        true,
+	}
+	if req.CacheControl != nil {
+		identity.ConversationID = req.CacheControl.ConversationID
+		identity.CacheID = req.CacheControl.CacheID
+	}
+	if isQwen35Request(modelID, prepared.modelVariant) || isQwen36Request(modelID, prepared.modelVariant) {
+		identity.RequiresSSM = true
+		identity.HasSSMSnapshot = false
+		identity.SSMPolicy = "hybrid_ssm_snapshot_required"
+	}
+	if strings.Contains(strings.ToLower(modelID+" "+prepared.modelVariant), "gemma4") || prepared.promptFamily == "turn_tags" {
+		identity.GraphFamily = "decoder_sliding_sharedkv"
+		identity.SlidingWindow = "enabled"
+	}
+	return identity
+}
+
+func hashSystemPrompt(messages []domain.Message) string {
+	var parts []string
+	for _, msg := range messages {
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		if role == roleSystem || role == roleDeveloper {
+			parts = append(parts, msg.FlattenedText())
+		}
+	}
+	return shortHash(strings.Join(parts, "\n\n"))
+}
+
+func shortHash(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:12])
+}
+
+func logPromptCacheDecision(req domain.ChatCompletionRequest, modelHint string, decision promptcache.Decision) {
+	fields := []any{
+		slog.String("request_id", ""),
+		slog.String("model_id", firstNonEmpty(req.Model, modelHint)),
+		slog.String("cache_id", cacheIDForLog(req)),
+		slog.Int("reuse_tokens", decision.ReusedTokens),
+		slog.String("reason", decision.InvalidationReason),
+	}
+	switch {
+	case !decision.Enabled:
+		slog.Info("prompt_cache_disabled", fields...)
+	case decision.Hit:
+		slog.Info("prompt_cache_hit", fields...)
+	default:
+		slog.Info("prompt_cache_miss", fields...)
+	}
+}
+
+func cacheIDForLog(req domain.ChatCompletionRequest) string {
+	if req.CacheControl == nil {
+		return ""
+	}
+	return firstNonEmpty(req.CacheControl.CacheID, req.CacheControl.ConversationID)
 }
 
 func promptFamilyName(family promptFamily) string {

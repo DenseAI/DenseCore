@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "runtime/worker_internal.h"
+#include "runtime/kernel_admission.h"
 
 namespace {
 
@@ -117,6 +118,9 @@ TEST(WorkerResultDispatchTest, Qwen35DecodeSummaryUsesDedicatedTag) {
     EXPECT_NE(captured.find("prompt_tokens=11"), std::string::npos);
     EXPECT_NE(captured.find("attention_ms="), std::string::npos);
     EXPECT_NE(captured.find("moe_forward_ms="), std::string::npos);
+    EXPECT_NE(captured.find("kleidiai_compiled_enabled="), std::string::npos);
+    EXPECT_NE(captured.find("kleidiai_candidate_ops="), std::string::npos);
+    EXPECT_NE(captured.find("kleidiai_last_reject_reason="), std::string::npos);
 }
 
 TEST(WorkerResultDispatchTest, DecodeSummaryTagsQwen36AndGemma4Variants) {
@@ -158,4 +162,45 @@ TEST(WorkerResultDispatchTest, DecodeSummarySkipsGenericDecoderVariants) {
     const std::string captured = ::testing::internal::GetCapturedStderr();
 
     EXPECT_TRUE(captured.empty());
+}
+
+TEST(KernelAdmissionTest, KleidiAIDefaultsToQualityGateDenyForKnownModels) {
+    densecore::runtime::KernelAdmissionDescriptor desc{};
+    desc.model_variant = ModelVariant::GEMMA4;
+    desc.is_gemma4 = true;
+    desc.weight_name = "blk.0.ffn_gate.weight";
+    desc.weight_type = GGML_TYPE_Q4_0;
+    desc.input_type = GGML_TYPE_F32;
+    desc.m = 128;
+    desc.n = 4096;
+    desc.k = 4096;
+
+    const auto decision = densecore::runtime::EvaluateKleidiAIAdmission(desc);
+
+    EXPECT_TRUE(decision.candidate);
+    EXPECT_FALSE(decision.allowed);
+    if (densecore::runtime::KleidiAICompiledEnabled()) {
+        EXPECT_EQ(decision.reject_reason, densecore::runtime::KernelAdmissionRejectReason::QualityGateUnpromoted);
+    } else {
+        EXPECT_EQ(decision.reject_reason, densecore::runtime::KernelAdmissionRejectReason::BackendNotCompiled);
+    }
+    EXPECT_EQ(decision.op_kind, densecore::runtime::KernelOpKind::FfnGate);
+}
+
+TEST(KernelAdmissionTest, KleidiAIRejectsQ4KUntilSeparateParityGateExists) {
+    densecore::runtime::KernelAdmissionDescriptor desc{};
+    desc.model_variant = ModelVariant::QWEN36;
+    desc.is_hybrid_ssm = true;
+    desc.weight_name = "output.weight";
+    desc.weight_type = GGML_TYPE_Q4_K;
+    desc.input_type = GGML_TYPE_F32;
+    desc.m = 128;
+    desc.n = 4096;
+    desc.k = 4096;
+
+    const auto decision = densecore::runtime::EvaluateKleidiAIAdmission(desc);
+
+    EXPECT_FALSE(decision.candidate);
+    EXPECT_FALSE(decision.allowed);
+    EXPECT_EQ(decision.reject_reason, densecore::runtime::KernelAdmissionRejectReason::UnsupportedTensorType);
 }

@@ -290,7 +290,7 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("invalid kv target mb: %d", c.KVTargetMB)
 	}
 	switch c.KVType {
-	case "", "fp16", "q8_0", "q4_0":
+	case "", "fp16", "f16", "q8_0", "q4_0":
 	default:
 		return fmt.Errorf("invalid kv type: %s", c.KVType)
 	}

@@ -233,7 +233,6 @@ ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         gate_logits->ne[1] != n_tokens) {
         return nullptr;
     }
-
     ggml_tensor* gate_up_exps = BuildGemma4PackedGateUpMerged3DView(ctx, roots);
     if (gate_up_exps && gate_up_exps->view_src && gate_up_exps->view_src->buffer && !gate_up_exps->buffer) {
         ggml_backend_view_init(gate_up_exps);
@@ -1973,7 +1972,7 @@ inline int ResolvePagedAttentionDecodeHeadTile(int n_head, int n_tokens, int n_t
     if (n_tokens <= 4) {
         const int target_tiles_per_token = std::max(1, (n_tasks + n_tokens - 1) / n_tokens);
         const int adaptive_head_tile = std::max(1, (n_head + target_tiles_per_token - 1) / target_tiles_per_token);
-        return std::min(configured_head_tile, adaptive_head_tile);
+        return std::min(configured_head_tile, std::max(1, adaptive_head_tile));
     }
     return configured_head_tile;
 }

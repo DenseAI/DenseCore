@@ -352,6 +352,9 @@ struct Request {
     uint64_t ssm_delta_ns = 0;
     uint64_t kv_update_ns = 0;
     uint64_t sample_ns = 0;
+    uint64_t kleidiai_candidate_ops = 0;
+    uint64_t kleidiai_allowed_ops = 0;
+    uint64_t kleidiai_rejected_ops = 0;
     uint64_t graph_cache_hit_count = 0;
     uint64_t graph_cache_miss_count = 0;
     int prefill_thread_count = 0;
@@ -367,6 +370,8 @@ struct Request {
     int attention_path_portable_flash = 0;
     int attention_path_native_flash = 0;
     int attention_path_hal = 0;
+    int kleidiai_compiled_enabled = 0;
+    int kleidiai_last_reject_reason = 0;
     int moe_task_count = 0;
     int moe_rowblock_used = 0;
     int moe_rowblock_tasks = 0;
@@ -489,6 +494,9 @@ struct Request {
         ssm_delta_ns = 0;
         kv_update_ns = 0;
         sample_ns = 0;
+        kleidiai_candidate_ops = 0;
+        kleidiai_allowed_ops = 0;
+        kleidiai_rejected_ops = 0;
         graph_cache_hit_count = 0;
         graph_cache_miss_count = 0;
         prefill_thread_count = 0;
@@ -504,6 +512,8 @@ struct Request {
         attention_path_portable_flash = 0;
         attention_path_native_flash = 0;
         attention_path_hal = 0;
+        kleidiai_compiled_enabled = 0;
+        kleidiai_last_reject_reason = 0;
         moe_task_count = 0;
         moe_rowblock_used = 0;
         moe_rowblock_tasks = 0;

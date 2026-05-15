@@ -569,7 +569,7 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         wrapped += profile.assistant_role;
         wrapped += "\n";
         if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking &&
-            profile.thinking_enabled) {
+            !profile.thinking_enabled) {
             wrapped += "<|channel>thought\n<channel|>";
         }
         return wrapped;
@@ -705,7 +705,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
         rendered += profile.assistant_role;
         rendered += "\n";
         if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking &&
-            thinking_enabled) {
+            !thinking_enabled) {
             rendered += "<|channel>thought\n<channel|>";
         }
         return rendered;

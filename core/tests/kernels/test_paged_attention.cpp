@@ -141,11 +141,10 @@ void ComputeReferenceSingleHeadWindowed(const PagedKVCache& cache, const std::ve
         for (int d = 0; d < static_cast<int>(query.size()); ++d) {
             dot += query[static_cast<size_t>(d)] * k_head[static_cast<size_t>(d)];
         }
-        float score = dot;
+        float score = dot * scale;
         if (logit_softcap > 0.0f && std::isfinite(score)) {
             score = std::tanh(score / logit_softcap) * logit_softcap;
         }
-        score *= scale;
         scores[static_cast<size_t>(t)] = score;
         if (score > max_score) {
             max_score = score;

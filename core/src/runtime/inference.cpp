@@ -35,6 +35,9 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
 
 #include "densecore/backend/cpu_backend.h"
 #include "densecore/exceptions.h"
@@ -58,6 +61,7 @@
 #include "llm/models/common/family_internal.h"
 #include "llm/runtime/deps.h"
 #include "models/gemma4_packed_expert_layout.h"
+#include "runtime/kernel_admission.h"
 #include "runtime/runtime_env.h"
 
 #ifndef DENSECORE_DEFAULT_INT4_SINGLE_THREADING_LAYER

@@ -637,6 +637,7 @@ struct TransformerModel {
     // GGUF weights in backend-owned repacked buffers while preserving the raw
     // GGUF tensors for loader metadata, fallback paths, and parity probes.
     struct ggml_context* ctx_cpu_repack = nullptr;
+    struct ggml_context* ctx_cpu_kleidiai = nullptr;
     std::vector<ggml_backend_buffer_t> cpu_repack_buffers;
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_repack_aliases;
 

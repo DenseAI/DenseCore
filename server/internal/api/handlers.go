@@ -14,8 +14,10 @@ import (
 
 	"descore-server/internal/buildinfo"
 	"descore-server/internal/domain"
+	"descore-server/internal/promptcache"
 	"descore-server/internal/queue"
 	"descore-server/internal/service"
+	agenttools "descore-server/internal/tools"
 )
 
 // API constants for consistent behavior and easier maintenance
@@ -305,6 +307,10 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return
 	}
+	if toolParsingEnabled(req) {
+		h.handleToolStream(ctx, w, req, flusher)
+		return
+	}
 
 	outputChan := make(chan domain.StreamEvent, StreamChannelBufferSize)
 	errChan := make(chan error, 1)
@@ -322,15 +328,20 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 		case event, ok := <-outputChan:
 			if !ok {
 				if !terminalSeen {
-					err := <-errChan
+					var err error
+					if errChan != nil {
+						err = <-errChan
+					}
 					if err == nil {
 						err = domain.ErrStreamClosedWithoutTerminal
 					}
 					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 					return
 				}
-				if err := <-errChan; err != nil {
-					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
+				if errChan != nil {
+					if err := <-errChan; err != nil {
+						writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
+					}
 				}
 				return
 			}
@@ -502,6 +513,22 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 
 	promptTokens := h.countChatPromptTokens(req)
 	content, reasoningContent := splitReasoningResponse(req.Model, responseText)
+	var toolCalls []domain.ToolCall
+	finishReason := resolveSyncFinishReason(completionTokens, req.MaxTokens)
+	if toolParsingEnabled(req) {
+		parsed, err := h.parseToolOutput(req, responseText)
+		if err != nil {
+			message, errType, code, statusCode := classifyGenerationError(domain.ErrInvalidRequest(err.Error()))
+			sendError(w, message, errType, code, statusCode)
+			return
+		}
+		content = parsed.Content
+		reasoningContent = parsed.ReasoningContent
+		toolCalls = parsed.ToolCalls
+		if len(toolCalls) > 0 {
+			finishReason = "tool_calls"
+		}
+	}
 	resp := domain.ChatCompletionResponse{
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 		Object:  "chat.completion",
@@ -514,8 +541,9 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 					Role:             "assistant",
 					Content:          content,
 					ReasoningContent: reasoningContent,
+					ToolCalls:        toolCalls,
 				},
-				FinishReason: resolveSyncFinishReason(completionTokens, req.MaxTokens),
+				FinishReason: finishReason,
 			},
 		},
 		Usage: domain.Usage{
@@ -529,6 +557,197 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		slog.Error("failed to encode response", slog.String("error", err.Error()))
 	}
+}
+
+func (h *Handler) handleToolStream(ctx context.Context, w http.ResponseWriter, req domain.ChatCompletionRequest, flusher http.Flusher) {
+	outputChan := make(chan domain.StreamEvent, StreamChannelBufferSize)
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- h.chatService.GenerateStream(ctx, req, outputChan)
+	}()
+
+	id := fmt.Sprintf("chatcmpl-%d", time.Now().Unix())
+	created := time.Now().Unix()
+	streamStarted := false
+	var responseBuilder strings.Builder
+	terminalSeen := false
+
+	for {
+		select {
+		case event, ok := <-outputChan:
+			if !ok {
+				if !terminalSeen {
+					err := <-errChan
+					if err == nil {
+						err = domain.ErrStreamClosedWithoutTerminal
+					}
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
+					return
+				}
+				if err := <-errChan; err != nil {
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
+				}
+				return
+			}
+			if event.Terminal {
+				terminalSeen = true
+				if err := event.TerminalError(); err != nil {
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
+					if errChan != nil {
+						<-errChan
+					}
+					return
+				}
+				parsed, err := h.parseToolOutput(req, responseBuilder.String())
+				if err != nil {
+					writeGenerationError(ctx, w, flusher, req.Model, domain.ErrInvalidRequest(err.Error()), streamStarted)
+					if errChan != nil {
+						<-errChan
+					}
+					return
+				}
+				if err := h.writeParsedToolStreamChunk(w, flusher, id, created, req.Model, parsed); err != nil {
+					slog.Debug("SSE write error", slog.String("error", err.Error()))
+					return
+				}
+				streamStarted = true
+				finishReason := "stop"
+				if len(parsed.ToolCalls) > 0 {
+					finishReason = "tool_calls"
+				}
+				finalChunk := domain.ChatCompletionChunk{
+					ID:      id,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   req.Model,
+					Choices: []domain.ChunkChoice{{
+						Index:        0,
+						Delta:        domain.ChunkDelta{},
+						FinishReason: finishReason,
+					}},
+				}
+				if err := writeSSEJSON(w, flusher, finalChunk); err != nil {
+					slog.Debug("SSE write error", slog.String("error", err.Error()))
+					return
+				}
+				if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
+					slog.Debug("SSE write error", slog.String("error", err.Error()))
+				}
+				flusher.Flush()
+				if errChan != nil {
+					if err := <-errChan; err != nil {
+						writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
+					}
+				}
+				return
+			}
+			responseBuilder.WriteString(event.Token)
+		case err := <-errChan:
+			if err != nil {
+				writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
+				return
+			}
+			errChan = nil
+		case <-ctx.Done():
+			writeGenerationError(ctx, w, flusher, req.Model, ctx.Err(), streamStarted)
+			return
+		}
+	}
+}
+
+func (h *Handler) writeParsedToolStreamChunk(w http.ResponseWriter, flusher http.Flusher, id string, created int64, model string, parsed agenttools.ParseResult) error {
+	delta := domain.ChunkDelta{Role: "assistant"}
+	if len(parsed.ToolCalls) > 0 {
+		for i, call := range parsed.ToolCalls {
+			delta.ToolCalls = append(delta.ToolCalls, domain.ToolCallDelta{
+				Index: i,
+				ID:    call.ID,
+				Type:  call.Type,
+				Function: domain.ToolCallDeltaFunction{
+					Name:      call.Function.Name,
+					Arguments: call.Function.Arguments,
+				},
+			})
+		}
+	} else {
+		delta.Content = parsed.Content
+		delta.ReasoningContent = parsed.ReasoningContent
+	}
+	chunk := domain.ChatCompletionChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: created,
+		Model:   model,
+		Choices: []domain.ChunkChoice{{
+			Index:        0,
+			Delta:        delta,
+			FinishReason: nil,
+		}},
+	}
+	return writeSSEJSON(w, flusher, chunk)
+}
+
+func writeSSEJSON(w http.ResponseWriter, flusher http.Flusher, payload interface{}) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func (h *Handler) parseToolOutput(req domain.ChatCompletionRequest, responseText string) (agenttools.ParseResult, error) {
+	normalized, err := agenttools.NormalizeTools(req.Tools, req.ToolChoice)
+	if err != nil {
+		return agenttools.ParseResult{}, err
+	}
+	family := agenttools.ResolveParserFamily(agenttools.ModelDescriptor{ModelID: apiFirstNonEmpty(req.Model, h.modelService.GetCurrentModel())})
+	result, err := agenttools.ParseOutput(responseText, family, normalized)
+	if err != nil {
+		slog.Warn("tool_parse_failed",
+			slog.String("model_id", req.Model),
+			slog.String("parser_family", string(family)),
+			slog.String("reason", err.Error()),
+		)
+		return result, err
+	}
+	if result.Recovered {
+		slog.Info("tool_parse_recovered",
+			slog.String("model_id", req.Model),
+			slog.String("parser_family", string(family)),
+		)
+	}
+	for _, call := range result.ToolCalls {
+		slog.Info("tool_call_emitted",
+			slog.String("model_id", req.Model),
+			slog.String("parser_family", string(family)),
+			slog.String("tool_name", call.Function.Name),
+		)
+	}
+	return result, nil
+}
+
+func toolParsingEnabled(req domain.ChatCompletionRequest) bool {
+	if len(req.Tools) == 0 {
+		return false
+	}
+	choice, err := agenttools.NormalizeToolChoice(req.ToolChoice)
+	if err != nil {
+		return true
+	}
+	return choice.Mode != agenttools.ToolChoiceNone
+}
+
+func apiFirstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func splitReasoningResponse(modelHint, text string) (string, string) {
@@ -975,11 +1194,21 @@ func (h *Handler) countChatPromptTokens(req domain.ChatCompletionRequest) int {
 		enableThinking = req.ChatTemplateKwargs.EnableThinking
 		preserveThinking = req.ChatTemplateKwargs.PreserveThinking
 	}
-	if rendered, err := engine.RenderChatPrompt(req.Messages, enableThinking, preserveThinking); err == nil && rendered != nil &&
+	messages := req.Messages
+	if len(req.Tools) > 0 {
+		if renderedTools, _, err := (agenttools.DefaultRenderer{}).RenderTools(
+			apiFirstNonEmpty(req.Model, h.modelService.GetCurrentModel()),
+			req.Tools,
+			req.ToolChoice,
+		); err == nil && renderedTools != "" {
+			messages = agenttools.InjectToolPrompt(req.Messages, renderedTools)
+		}
+	}
+	if rendered, err := engine.RenderChatPrompt(messages, enableThinking, preserveThinking); err == nil && rendered != nil &&
 		rendered.RenderedPrompt != "" {
 		return h.countSingleTextTokens(rendered.RenderedPrompt, false, false)
 	}
-	return h.countSingleTextTokens(service.BuildChatPrompt(h.modelService.GetCurrentModel(), req.Messages, req.ChatTemplateKwargs), false, false)
+	return h.countSingleTextTokens(service.BuildChatPrompt(h.modelService.GetCurrentModel(), messages, req.ChatTemplateKwargs), false, false)
 }
 
 func (h *Handler) countTextTokens(texts []string, addBOS bool, addEOS bool) int {
@@ -1337,6 +1566,26 @@ func (h *Handler) RenderMetrics() string {
 	fmt.Fprintf(&w, "# HELP %s Model loaded status (1=loaded)\n", metric("model_loaded"))
 	fmt.Fprintf(&w, "# TYPE %s gauge\n", metric("model_loaded"))
 	fmt.Fprintf(&w, "%s %d\n\n", metric("model_loaded"), modelLoaded)
+
+	toolMetrics := agenttools.SnapshotMetrics()
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("agent_tool_parse_success_total"), metric("agent_tool_parse_success_total"), toolMetrics.ToolParseSuccessTotal)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("agent_tool_parse_failure_total"), metric("agent_tool_parse_failure_total"), toolMetrics.ToolParseFailureTotal)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("agent_tool_parse_recovery_total"), metric("agent_tool_parse_recovery_total"), toolMetrics.ToolParseRecoveryTotal)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("agent_tool_call_emitted_total"), metric("agent_tool_call_emitted_total"), toolMetrics.ToolCallEmittedTotal)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("agent_reasoning_blocks_total"), metric("agent_reasoning_blocks_total"), toolMetrics.ReasoningBlocksTotal)
+
+	cacheMetrics := promptcache.SnapshotMetrics()
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("prompt_cache_hit_total"), metric("prompt_cache_hit_total"), cacheMetrics.PromptCacheHitTotal)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("prompt_cache_miss_total"), metric("prompt_cache_miss_total"), cacheMetrics.PromptCacheMissTotal)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("prompt_cache_disabled_total"), metric("prompt_cache_disabled_total"), cacheMetrics.PromptCacheDisabledTotal)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("prompt_cache_evictions_total"), metric("prompt_cache_evictions_total"), cacheMetrics.PromptCacheEvictionsTotal)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("prompt_cache_tokens_reused_total"), metric("prompt_cache_tokens_reused_total"), cacheMetrics.PromptCacheTokensReusedTotal)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("prompt_cache_prefill_tokens_skipped_total"), metric("prompt_cache_prefill_tokens_skipped_total"), cacheMetrics.PromptCachePrefillSkippedTotal)
+	fmt.Fprintf(&w, "# TYPE %s gauge\n%s %.9f\n\n", metric("prompt_cache_restore_seconds"), metric("prompt_cache_restore_seconds"), cacheMetrics.PromptCacheRestoreSeconds)
+	fmt.Fprintf(&w, "# TYPE %s gauge\n%s %.9f\n\n", metric("prompt_cache_lookup_seconds"), metric("prompt_cache_lookup_seconds"), cacheMetrics.PromptCacheLookupSeconds)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("ssm_snapshot_hit_total"), metric("ssm_snapshot_hit_total"), cacheMetrics.SSMSnapshotHitTotal)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("ssm_snapshot_miss_total"), metric("ssm_snapshot_miss_total"), cacheMetrics.SSMSnapshotMissTotal)
+	fmt.Fprintf(&w, "# TYPE %s counter\n%s %d\n\n", metric("ssm_snapshot_restore_failure_total"), metric("ssm_snapshot_restore_failure_total"), cacheMetrics.SSMSnapshotRestoreFailureTotal)
 
 	if h.queueStatsProvider != nil {
 		queueStats := h.queueStatsProvider.Stats()

@@ -65,6 +65,10 @@ type ChatCompletionRequest struct {
 	RawPrompt           string              `json:"raw_prompt,omitempty"`
 	LoraAdapter         string              `json:"lora_adapter,omitempty"`
 	ChatTemplateKwargs  *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
+	Tools               []Tool              `json:"tools,omitempty"`
+	ToolChoice          interface{}         `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool               `json:"parallel_tool_calls,omitempty"`
+	CacheControl        *CacheControl       `json:"cache_control,omitempty"`
 	MaxTokens           int                 `json:"max_tokens,omitempty"`
 	Temperature         float64             `json:"temperature,omitempty"`
 	TopP                float64             `json:"top_p,omitempty"`
@@ -93,6 +97,10 @@ func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
 		RawPrompt           string              `json:"raw_prompt,omitempty"`
 		LoraAdapter         string              `json:"lora_adapter,omitempty"`
 		ChatTemplateKwargs  *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
+		Tools               []Tool              `json:"tools,omitempty"`
+		ToolChoice          interface{}         `json:"tool_choice,omitempty"`
+		ParallelToolCalls   *bool               `json:"parallel_tool_calls,omitempty"`
+		CacheControl        *CacheControl       `json:"cache_control,omitempty"`
 		MaxTokens           int                 `json:"max_tokens,omitempty"`
 		Temperature         *float64            `json:"temperature,omitempty"`
 		TopP                *float64            `json:"top_p,omitempty"`
@@ -119,6 +127,10 @@ func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
 	r.RawPrompt = raw.RawPrompt
 	r.LoraAdapter = raw.LoraAdapter
 	r.ChatTemplateKwargs = raw.ChatTemplateKwargs
+	r.Tools = raw.Tools
+	r.ToolChoice = raw.ToolChoice
+	r.ParallelToolCalls = raw.ParallelToolCalls
+	r.CacheControl = raw.CacheControl
 	r.MaxTokens = raw.MaxTokens
 	r.AllowedTokenIDs = raw.AllowedTokenIDs
 	r.AllowedTokensStrict = raw.AllowedTokensStrict
@@ -167,6 +179,12 @@ type ResponseFormat struct {
 type ChatTemplateKwargs struct {
 	EnableThinking   *bool `json:"enable_thinking,omitempty"`
 	PreserveThinking *bool `json:"preserve_thinking,omitempty"`
+}
+
+type CacheControl struct {
+	Type           string `json:"type,omitempty"`
+	ConversationID string `json:"conversation_id,omitempty"`
+	CacheID        string `json:"cache_id,omitempty"`
 }
 
 type Message struct {
@@ -454,8 +472,10 @@ type ChunkChoice struct {
 }
 
 type ChunkDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string          `json:"role,omitempty"`
+	Content          string          `json:"content,omitempty"`
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCallDelta `json:"tool_calls,omitempty"`
 }
 
 type Usage struct {
@@ -619,6 +639,18 @@ type ToolCall struct {
 type ToolCallFunction struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"` // JSON string
+}
+
+type ToolCallDelta struct {
+	Index    int                   `json:"index"`
+	ID       string                `json:"id,omitempty"`
+	Type     string                `json:"type,omitempty"`
+	Function ToolCallDeltaFunction `json:"function,omitempty"`
+}
+
+type ToolCallDeltaFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 // Extended Message with tool support

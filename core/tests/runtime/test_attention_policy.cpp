@@ -244,7 +244,7 @@ TEST(AttentionPolicyTest, Gemma4QuantizedPrefillProjectionUsesNativeGgml) {
     ggml_tensor* weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, /*ne0=*/2816, /*ne1=*/4096);
     ASSERT_NE(weight, nullptr);
     ggml_set_name(weight, "blk.0.attn_q.weight");
-    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, /*ne0=*/2816, /*ne1=*/512);
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, /*ne0=*/2816, /*ne1=*/613);
     ASSERT_NE(input, nullptr);
 
     ggml_tensor* result = densecore::testing::SmartMulMatTest(ctx, weight, input, &gemma4);
@@ -254,7 +254,7 @@ TEST(AttentionPolicyTest, Gemma4QuantizedPrefillProjectionUsesNativeGgml) {
     ggml_free(ctx);
 }
 
-TEST(AttentionPolicyTest, Gemma4MoEPrefillProjectsOnlyPromptEndLogits) {
+TEST(AttentionPolicyTest, Gemma4PrefillProjectsOnlyPromptEndLogits) {
     TransformerModel gemma4_moe = MakeModel(ModelArch::GEMMA, true);
     gemma4_moe.hparams.n_experts = 128;
 
@@ -266,7 +266,9 @@ TEST(AttentionPolicyTest, Gemma4MoEPrefillProjectsOnlyPromptEndLogits) {
                                                                            /*n_tokens=*/384));
 
     TransformerModel gemma4_dense = MakeModel(ModelArch::GEMMA, true);
-    EXPECT_FALSE(densecore::testing::ShouldUsePrefillLastLogitsOnlyForTest(&gemma4_dense, /*num_seqs=*/1,
+    EXPECT_TRUE(densecore::testing::ShouldUsePrefillLastLogitsOnlyForTest(&gemma4_dense, /*num_seqs=*/1,
+                                                                          /*n_tokens=*/384));
+    EXPECT_FALSE(densecore::testing::ShouldUsePrefillLastLogitsOnlyForTest(&gemma4_dense, /*num_seqs=*/2,
                                                                            /*n_tokens=*/384));
 }
 

@@ -29,6 +29,9 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> ssm_delta_ns{0};
     std::atomic<uint64_t> kv_update_ns{0};
     std::atomic<uint64_t> sample_ns{0};
+    std::atomic<uint64_t> kleidiai_candidate_ops{0};
+    std::atomic<uint64_t> kleidiai_allowed_ops{0};
+    std::atomic<uint64_t> kleidiai_rejected_ops{0};
     std::atomic<uint64_t> graph_cache_hits{0};
     std::atomic<uint64_t> graph_cache_misses{0};
     std::atomic<int> moe_task_count{0};
@@ -44,6 +47,8 @@ struct Qwen36ProfileCounters {
     std::atomic<int> attention_path_portable_flash{0};
     std::atomic<int> attention_path_native_flash{0};
     std::atomic<int> attention_path_hal{0};
+    std::atomic<int> kleidiai_compiled_enabled{0};
+    std::atomic<int> kleidiai_last_reject_reason{0};
 };
 
 struct InferenceWorkContext {
@@ -126,6 +131,9 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.ssm_delta_ns.store(0, std::memory_order_relaxed);
     p.kv_update_ns.store(0, std::memory_order_relaxed);
     p.sample_ns.store(0, std::memory_order_relaxed);
+    p.kleidiai_candidate_ops.store(0, std::memory_order_relaxed);
+    p.kleidiai_allowed_ops.store(0, std::memory_order_relaxed);
+    p.kleidiai_rejected_ops.store(0, std::memory_order_relaxed);
     p.graph_cache_hits.store(0, std::memory_order_relaxed);
     p.graph_cache_misses.store(0, std::memory_order_relaxed);
     p.moe_task_count.store(0, std::memory_order_relaxed);
@@ -141,6 +149,10 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.attention_path_portable_flash.store(0, std::memory_order_relaxed);
     p.attention_path_native_flash.store(0, std::memory_order_relaxed);
     p.attention_path_hal.store(0, std::memory_order_relaxed);
+    p.kleidiai_compiled_enabled.store(densecore::runtime::KleidiAICompiledEnabled() ? 1 : 0,
+                                      std::memory_order_relaxed);
+    p.kleidiai_last_reject_reason.store(
+        static_cast<int>(densecore::runtime::KernelAdmissionRejectReason::None), std::memory_order_relaxed);
 }
 
 Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) {
@@ -176,6 +188,9 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.ssm_delta_ns = p.ssm_delta_ns.load(std::memory_order_relaxed);
     snapshot.kv_update_ns = p.kv_update_ns.load(std::memory_order_relaxed);
     snapshot.sample_ns = p.sample_ns.load(std::memory_order_relaxed);
+    snapshot.kleidiai_candidate_ops = p.kleidiai_candidate_ops.load(std::memory_order_relaxed);
+    snapshot.kleidiai_allowed_ops = p.kleidiai_allowed_ops.load(std::memory_order_relaxed);
+    snapshot.kleidiai_rejected_ops = p.kleidiai_rejected_ops.load(std::memory_order_relaxed);
     snapshot.graph_cache_hits = p.graph_cache_hits.load(std::memory_order_relaxed);
     snapshot.graph_cache_misses = p.graph_cache_misses.load(std::memory_order_relaxed);
     snapshot.moe_task_count = p.moe_task_count.load(std::memory_order_relaxed);
@@ -191,7 +206,29 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.attention_path_portable_flash = p.attention_path_portable_flash.load(std::memory_order_relaxed);
     snapshot.attention_path_native_flash = p.attention_path_native_flash.load(std::memory_order_relaxed);
     snapshot.attention_path_hal = p.attention_path_hal.load(std::memory_order_relaxed);
+    snapshot.kleidiai_compiled_enabled = p.kleidiai_compiled_enabled.load(std::memory_order_relaxed);
+    snapshot.kleidiai_last_reject_reason = p.kleidiai_last_reject_reason.load(std::memory_order_relaxed);
     return snapshot;
+}
+
+static inline void RecordKleidiAIAdmissionDecision(
+    InferenceWorkContext* ctx, const densecore::runtime::KernelAdmissionDecision& decision) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    p.kleidiai_compiled_enabled.store(densecore::runtime::KleidiAICompiledEnabled() ? 1 : 0,
+                                      std::memory_order_relaxed);
+    if (!decision.candidate) {
+        return;
+    }
+    p.kleidiai_candidate_ops.fetch_add(1, std::memory_order_relaxed);
+    if (decision.allowed) {
+        p.kleidiai_allowed_ops.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        p.kleidiai_rejected_ops.fetch_add(1, std::memory_order_relaxed);
+        p.kleidiai_last_reject_reason.store(static_cast<int>(decision.reject_reason), std::memory_order_relaxed);
+    }
 }
 
 void AddQwen36SSMProjectionWallProfile(InferenceWorkContext* ctx, uint64_t qkv_ns, uint64_t gate_ns,

@@ -70,6 +70,7 @@ func TestExtractExactAnswerFromText(t *testing.T) {
 	}{
 		{"What is the capital of France? Answer with only Paris.", "Paris"},
 		{"What is the secret token? Answer with only the token.", ""},
+		{"What is the deployment codename? Answer with only the codename.", ""},
 		{"Repeat the exact secret code only. Answer with only BLUE-PEARL-471.", "BLUE-PEARL-471"},
 		{"What is the capital of France? Answer with only \"Paris\".", "Paris"},
 		{"한국의 수도는 어디인가요? 서울만 답해 주세요.", "서울"},

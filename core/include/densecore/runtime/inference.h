@@ -80,6 +80,7 @@ struct BatchSpec {
     std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*> hybrid_ssm_runtime_states;  // [NumSeqs]
     densecore::Scheduler* scheduler = nullptr;
     int num_seqs;
+    bool skip_output_logits = false;  // Intermediate prefill chunks update KV only; no sampling consumes logits.
 
     // Multi-LoRA Configuration
     // Map: Adapter -> Token Indices in this batch
@@ -233,6 +234,9 @@ struct Qwen36ProfileSnapshot {
     uint64_t ssm_delta_ns = 0;
     uint64_t kv_update_ns = 0;
     uint64_t sample_ns = 0;
+    uint64_t kleidiai_candidate_ops = 0;
+    uint64_t kleidiai_allowed_ops = 0;
+    uint64_t kleidiai_rejected_ops = 0;
     uint64_t graph_cache_hits = 0;
     uint64_t graph_cache_misses = 0;
     int moe_task_count = 0;
@@ -248,6 +252,8 @@ struct Qwen36ProfileSnapshot {
     int attention_path_portable_flash = 0;
     int attention_path_native_flash = 0;
     int attention_path_hal = 0;
+    int kleidiai_compiled_enabled = 0;
+    int kleidiai_last_reject_reason = 0;
 };
 
 InferenceWorkContext* CreateInferenceWorkContext();
