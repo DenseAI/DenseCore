@@ -1,6 +1,6 @@
 /**
  * @file densecore/backend/matmul_backend.h
- * @brief Matmul backend abstraction for selective acceleration (DenseCore vs oneDNN)
+ * @brief Matmul backend abstraction for DenseCore CPU kernels
  */
 #ifndef DENSECORE_MATMUL_BACKEND_H
 #define DENSECORE_MATMUL_BACKEND_H
@@ -14,7 +14,6 @@ namespace densecore {
 
 enum class MatmulBackendKind : uint8_t {
     DenseCore = 0,
-    OneDNN = 1,
 };
 
 struct MatmulQuantParams {
@@ -56,9 +55,6 @@ struct MatmulHeuristics {
 };
 
 struct MatmulConfig {
-    bool enable_onednn = false;
-    int onednn_mode = 0;  // -1 force off, 0 auto, 1 force on
-    int pack_m_hint = 128;
     MatmulHeuristics heuristics;
 };
 
@@ -75,7 +71,6 @@ public:
 };
 
 DENSECORE_API MatmulBackend& GetDenseCoreMatmulBackend();
-DENSECORE_API MatmulBackend& GetOneDnnMatmulBackend();
 
 DENSECORE_API MatmulBackendKind SelectMatmulBackend(const MatmulParams& params, bool is_prefill);
 

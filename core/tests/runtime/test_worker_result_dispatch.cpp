@@ -25,6 +25,15 @@ void TokenCallbackCapture(const char* token, int is_final, void* user_data) {
     capture->finished_flags.push_back(is_final);
 }
 
+void TokenCallbackExCapture(const char* token, int len, int token_id, int is_final, void* user_data) {
+    auto* capture = static_cast<CallbackCapture*>(user_data);
+    ASSERT_NE(capture, nullptr);
+    std::lock_guard<std::mutex> lock(capture->mu);
+    capture->tokens.emplace_back(token && len > 0 ? std::string(token, token + len) : "");
+    capture->token_ids.push_back(token_id);
+    capture->finished_flags.push_back(is_final);
+}
+
 void TokenResultCallbackCapture(const TokenResult* result, void* user_data) {
     auto* capture = static_cast<CallbackCapture*>(user_data);
     ASSERT_NE(capture, nullptr);
@@ -59,6 +68,22 @@ TEST(WorkerResultDispatchTest, DirectTokenCallbackInvokesCallbackImmediately) {
 
     ASSERT_EQ(capture.tokens.size(), 1u);
     EXPECT_EQ(capture.tokens[0], "hello");
+    ASSERT_EQ(capture.finished_flags.size(), 1u);
+    EXPECT_EQ(capture.finished_flags[0], 0);
+}
+
+TEST(WorkerResultDispatchTest, DirectTokenCallbackExReceivesLengthAndTokenID) {
+    CallbackCapture capture;
+    Request req{};
+    req.callback_ex = TokenCallbackExCapture;
+    req.user_data = &capture;
+
+    EmitRequestResult(nullptr, &req, std::string("he\0llo", 6), 123, false, false, /*use_direct_callback=*/true);
+
+    ASSERT_EQ(capture.tokens.size(), 1u);
+    EXPECT_EQ(capture.tokens[0], std::string("he\0llo", 6));
+    ASSERT_EQ(capture.token_ids.size(), 1u);
+    EXPECT_EQ(capture.token_ids[0], 123);
     ASSERT_EQ(capture.finished_flags.size(), 1u);
     EXPECT_EQ(capture.finished_flags[0], 0);
 }
@@ -121,6 +146,38 @@ TEST(WorkerResultDispatchTest, Qwen35DecodeSummaryUsesDedicatedTag) {
     EXPECT_NE(captured.find("kleidiai_compiled_enabled="), std::string::npos);
     EXPECT_NE(captured.find("kleidiai_candidate_ops="), std::string::npos);
     EXPECT_NE(captured.find("kleidiai_last_reject_reason="), std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, DecodeSummaryIncludesPrefixCacheMetrics) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.prefix_cache_allowed = true;
+    req.prefix_cache_hit = true;
+    req.prefix_cache_skipped_tokens = 32;
+    req.prefix_cache_hit_blocks = 2;
+    req.prefix_cache_registered_blocks = 3;
+    req.prefix_cache_extended_blocks = 1;
+    req.hybrid_ssm_snapshot_restore_attempted = true;
+    req.hybrid_ssm_snapshot_restore_applied = true;
+    req.prefix_cache_skip_reason = "none";
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("prefix_cache_allowed=1"), std::string::npos);
+    EXPECT_NE(captured.find("prefix_cache_hit=1"), std::string::npos);
+    EXPECT_NE(captured.find("prefix_cache_skipped_tokens=32"), std::string::npos);
+    EXPECT_NE(captured.find("prefix_cache_hit_blocks=2"), std::string::npos);
+    EXPECT_NE(captured.find("prefix_cache_registered_blocks=3"), std::string::npos);
+    EXPECT_NE(captured.find("prefix_cache_extended_blocks=1"), std::string::npos);
+    EXPECT_NE(captured.find("hybrid_ssm_snapshot_restore_attempted=1"), std::string::npos);
+    EXPECT_NE(captured.find("hybrid_ssm_snapshot_restore_applied=1"), std::string::npos);
+    EXPECT_NE(captured.find("prefix_cache_skip_reason=none"), std::string::npos);
 }
 
 TEST(WorkerResultDispatchTest, DecodeSummaryTagsQwen36AndGemma4Variants) {

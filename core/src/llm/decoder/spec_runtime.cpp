@@ -9,9 +9,6 @@ namespace {
 
 models::DecoderPrefillRuntimePolicy LoadDecoderPrefillRuntimePolicy() {
     models::DecoderPrefillRuntimePolicy policy = models::DefaultDecoderPrefillRuntimePolicy();
-    policy.qwen35_prefill_last_logits_only =
-        densecore::env::ParseTruthyEnv("DENSECORE_QWEN35_PREFILL_LAST_LOGITS_ONLY",
-                                       policy.qwen35_prefill_last_logits_only);
     policy.qwen36_prefill_last_logits_only =
         densecore::env::ParseTruthyEnv("DENSECORE_QWEN36_PREFILL_LAST_LOGITS_ONLY",
                                        policy.qwen36_prefill_last_logits_only);

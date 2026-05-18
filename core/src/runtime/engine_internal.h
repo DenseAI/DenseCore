@@ -92,7 +92,8 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
 
 struct EngineState;
 void PushResultEvent(EngineState* state, int request_id, const std::string& token, int token_id, bool finished,
-                     bool error, TokenCallback cb, TokenResultCallback token_result_cb, void* user_data);
+                     bool error, TokenCallback cb, TokenCallbackEx cb_ex, TokenResultCallback token_result_cb,
+                     void* user_data);
 void PushEmbeddingResultEvent(EngineState* state, int request_id, std::vector<float> embedding_data,
                               EmbeddingCallback cb, void* user_data);
 
@@ -175,6 +176,7 @@ struct ResultEvent {
 
     // Callback pointers (copied from Request at event creation time)
     TokenCallback callback;
+    TokenCallbackEx callback_ex;
     TokenResultCallback token_result_callback;
     EmbeddingCallback emb_callback;
     void* user_data;
@@ -188,6 +190,7 @@ struct ResultEvent {
           finished(false),
           error(false),
           callback(nullptr),
+          callback_ex(nullptr),
           token_result_callback(nullptr),
           emb_callback(nullptr),
           user_data(nullptr) {}
@@ -239,14 +242,25 @@ struct Request {
     std::string lora_name;
     int max_tokens;
     TokenCallback callback;
+    TokenCallbackEx callback_ex = nullptr;
     void* user_data;
 
     // Generation state
     std::vector<int> tokens;
     std::vector<int> token_history;
-    std::vector<int> prompt_tokens_for_cache;  // Original prompt tokens for prefix cache registration
+    std::vector<int> prompt_tokens_for_cache;           // Full prompt tokens for prefix cache registration
+    std::vector<int> original_prompt_tokens_for_cache;  // Immutable copy before prefix-hit token erasure
     int prompt_token_count = 0;
     int registered_prefix_blocks = 0;
+    bool prefix_cache_allowed = false;
+    bool prefix_cache_hit = false;
+    int prefix_cache_skipped_tokens = 0;
+    int prefix_cache_hit_blocks = 0;
+    int prefix_cache_registered_blocks = 0;
+    int prefix_cache_extended_blocks = 0;
+    bool hybrid_ssm_snapshot_restore_attempted = false;
+    bool hybrid_ssm_snapshot_restore_applied = false;
+    std::string prefix_cache_skip_reason;
     std::string utf8_pending;
     std::string think_tag_pending;
     std::string tool_call_tag_pending;
@@ -357,6 +371,8 @@ struct Request {
     uint64_t kleidiai_rejected_ops = 0;
     uint64_t graph_cache_hit_count = 0;
     uint64_t graph_cache_miss_count = 0;
+    uint64_t graph_cache_skip_count = 0;
+    std::string graph_cache_last_skip_reason;
     int prefill_thread_count = 0;
     int decode_thread_count = 0;
     int active_thread_count = 0;
@@ -404,12 +420,23 @@ struct Request {
         lora_name.clear();
         max_tokens = 0;
         callback = nullptr;
+        callback_ex = nullptr;
         user_data = nullptr;
         tokens.clear();
         token_history.clear();
         prompt_tokens_for_cache.clear();
+        original_prompt_tokens_for_cache.clear();
         prompt_token_count = 0;
         registered_prefix_blocks = 0;
+        prefix_cache_allowed = false;
+        prefix_cache_hit = false;
+        prefix_cache_skipped_tokens = 0;
+        prefix_cache_hit_blocks = 0;
+        prefix_cache_registered_blocks = 0;
+        prefix_cache_extended_blocks = 0;
+        hybrid_ssm_snapshot_restore_attempted = false;
+        hybrid_ssm_snapshot_restore_applied = false;
+        prefix_cache_skip_reason.clear();
         utf8_pending.clear();
         think_tag_pending.clear();
         tool_call_tag_pending.clear();
@@ -499,6 +526,8 @@ struct Request {
         kleidiai_rejected_ops = 0;
         graph_cache_hit_count = 0;
         graph_cache_miss_count = 0;
+        graph_cache_skip_count = 0;
+        graph_cache_last_skip_reason.clear();
         prefill_thread_count = 0;
         decode_thread_count = 0;
         active_thread_count = 0;
@@ -1102,7 +1131,7 @@ struct EngineState {
             // object-pool headroom here so serving does not hard-abort in
             // ggml_new_object() before fail-closed handling can run.
             const size_t hybrid_long_prefill_object_pad_mb =
-                std::clamp<size_t>(((effective_query_len + 1023ULL) / 1024ULL) * 64ULL, 64ULL, 512ULL);
+                std::clamp<size_t>(((effective_query_len + 1023ULL) / 1024ULL) * 96ULL, 96ULL, 768ULL);
             estimate.long_context_safety_pad_bytes += hybrid_long_prefill_object_pad_mb * MB;
         }
         if (model->arch_flags.is_gemma4 && effective_query_len > 1) {
@@ -1307,6 +1336,7 @@ struct EngineState {
                 struct ShutdownCallback {
                     int request_id = -1;
                     TokenCallback callback = nullptr;
+                    TokenCallbackEx callback_ex = nullptr;
                     TokenResultCallback token_result_callback = nullptr;
                     void* user_data = nullptr;
                 };
@@ -1323,9 +1353,9 @@ struct EngineState {
                     for (Request* req : active_requests) {
                         req->finished = true;
                         req->cancelled.store(true, std::memory_order_relaxed);
-                        if (req->callback || req->token_result_callback) {
-                            shutdown_callbacks.push_back(
-                                {req->id, req->callback, req->token_result_callback, req->user_data});
+                        if (req->callback || req->callback_ex || req->token_result_callback) {
+                            shutdown_callbacks.push_back({req->id, req->callback, req->callback_ex,
+                                                          req->token_result_callback, req->user_data});
                         }
                         // We just mark them finished; the loop or pool will handle release,
                         // or we rely on pool destructor
@@ -1333,7 +1363,7 @@ struct EngineState {
                 }
                 for (const auto& entry : shutdown_callbacks) {
                     PushResultEvent(this, entry.request_id, "Error: Engine shutdown", -1, true, true, entry.callback,
-                                    entry.token_result_callback, entry.user_data);
+                                    entry.callback_ex, entry.token_result_callback, entry.user_data);
                 }
                 break;
             }
@@ -1454,7 +1484,8 @@ inline void ApplyResultQueueBackpressure(EngineState* state, std::unique_lock<st
 
 // Helper to push result events to the callback queue with backpressure
 inline void PushResultEvent(EngineState* state, int request_id, const std::string& token, int token_id, bool finished,
-                            bool error, TokenCallback cb, TokenResultCallback token_result_cb, void* user_data) {
+                            bool error, TokenCallback cb, TokenCallbackEx cb_ex,
+                            TokenResultCallback token_result_cb, void* user_data) {
     ResultEvent event;
     event.request_id = request_id;
     event.token_str = token;
@@ -1462,6 +1493,7 @@ inline void PushResultEvent(EngineState* state, int request_id, const std::strin
     event.finished = finished;
     event.error = error;
     event.callback = cb;
+    event.callback_ex = cb_ex;
     event.token_result_callback = token_result_cb;
     event.user_data = user_data;
     event.emb_callback = nullptr;

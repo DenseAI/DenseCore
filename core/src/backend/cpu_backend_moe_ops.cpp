@@ -421,27 +421,12 @@ bool RunMoEQ4KRawBatchedFusedGEGLU(CpuBackend* backend, const void* gate_weight_
 }
 
 bool CanUseMoEQ4KRawBatchedScalar() {
-    const char* disable_env = std::getenv("DENSECORE_MOE_DISABLE_Q4K_RAW_BATCHED_SCALAR");
-    if (disable_env && disable_env[0] != '\0' && std::strcmp(disable_env, "0") != 0 &&
-        std::strcmp(disable_env, "false") != 0 && std::strcmp(disable_env, "off") != 0) {
-        return false;
-    }
-    const char* enable_env = std::getenv("DENSECORE_MOE_ENABLE_Q4K_RAW_BATCHED_SCALAR");
-    if (enable_env && enable_env[0] != '\0') {
-        return std::strcmp(enable_env, "0") != 0 && std::strcmp(enable_env, "false") != 0 &&
-               std::strcmp(enable_env, "off") != 0;
-    }
     return true;
 }
 
 bool CanUseKQuantRowPairVecDotFastPath() {
 #if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_MATMUL_INT8)
-    const char* generic_env = std::getenv("DENSECORE_MOE_DISABLE_KQUANT_ROWPAIR_VEC_DOT");
-    if (generic_env && generic_env[0] != '\0' && std::strcmp(generic_env, "0") != 0) {
-        return false;
-    }
-    const char* env = std::getenv("DENSECORE_MOE_DISABLE_Q4K_ROWPAIR_VEC_DOT");
-    return !env || env[0] == '\0' || std::strcmp(env, "0") == 0;
+    return true;
 #else
     return false;
 #endif
@@ -457,61 +442,26 @@ bool IsKQuantRowPairGatedProjectionType(ggml_type weight_type, ggml_type input_t
 }
 
 bool CanUseQ4KRepackedMoEGemvFastPath() {
-    const char* enable_env = std::getenv("DENSECORE_MOE_ENABLE_Q4K_REPACKED_GEMV");
-    if (enable_env && enable_env[0] != '\0') {
-        if (std::strcmp(enable_env, "0") == 0 || std::strcmp(enable_env, "false") == 0 ||
-            std::strcmp(enable_env, "off") == 0) {
-            return false;
-        }
-        return true;
-    }
-    const char* env = std::getenv("DENSECORE_MOE_DISABLE_Q4K_REPACKED_GEMV");
-    if (env && env[0] != '\0' && std::strcmp(env, "0") != 0) {
-        return false;
-    }
+#if defined(__aarch64__) || defined(_M_ARM64)
     return false;
+#else
+    return ggml_cpu_has_avx2();
+#endif
 }
 
 bool CanUseQ4KRepackedMoEGEGLUFastPath() {
-    const char* enable_env = std::getenv("DENSECORE_MOE_ENABLE_Q4K_REPACKED_GEGLU");
-    if (!enable_env || enable_env[0] == '\0' || std::strcmp(enable_env, "0") == 0 ||
-        std::strcmp(enable_env, "false") == 0 || std::strcmp(enable_env, "off") == 0) {
-        return false;
-    }
-    const char* disable_env = std::getenv("DENSECORE_MOE_DISABLE_Q4K_REPACKED_GEGLU");
-    if (disable_env && disable_env[0] != '\0' && std::strcmp(disable_env, "0") != 0 &&
-        std::strcmp(disable_env, "false") != 0 && std::strcmp(disable_env, "off") != 0) {
-        return false;
-    }
 #if defined(__aarch64__) || defined(_M_ARM64)
-    return ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8();
+    return false;
 #else
-    return true;
+    return ggml_cpu_has_avx2();
 #endif
 }
 
 bool CanUseQ4KRepackedMoEPrefillFastPath() {
-    const char* disable_env = std::getenv("DENSECORE_MOE_DISABLE_Q4K_REPACKED_PREFILL");
-    if (disable_env && disable_env[0] != '\0' && std::strcmp(disable_env, "0") != 0 &&
-        std::strcmp(disable_env, "false") != 0 && std::strcmp(disable_env, "off") != 0) {
-        return false;
-    }
-    const char* enable_env = std::getenv("DENSECORE_MOE_ENABLE_Q4K_REPACKED_PREFILL");
-    if (enable_env && enable_env[0] != '\0') {
-        if (std::strcmp(enable_env, "0") == 0 || std::strcmp(enable_env, "false") == 0 ||
-            std::strcmp(enable_env, "off") == 0) {
-            return false;
-        }
-        if (std::strcmp(enable_env, "force") == 0) {
-            return true;
-        }
-    } else {
-        return false;
-    }
 #if defined(__aarch64__) || defined(_M_ARM64)
-    return ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == 32;
+    return false;
 #else
-    return true;
+    return ggml_cpu_has_avx2();
 #endif
 }
 
@@ -1233,11 +1183,7 @@ bool CanUsePackedInt4MoEFastPath() {
     // CpuBackend::GemmInt4() instead of the direct Highway small-batch kernels.
     // That preserves the intended fast path while reusing the verified
     // runtime-selected ARM INT4 kernel selection.
-    const char* env = std::getenv("DENSECORE_MOE_ENABLE_ARM_PACKED_INT4");
-    if (!env || env[0] == '\0') {
-        return true;
-    }
-    return std::strcmp(env, "0") != 0;
+    return true;
 #else
     return true;
 #endif
@@ -1305,33 +1251,12 @@ bool IsMoEMatmulPathDebugEnabled() {
     return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
-bool IsArmDirectHwyProjectionDisabled() {
-    const char* env = std::getenv("DENSECORE_MOE_ARM_DISABLE_DIRECT_HWY");
-    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-}
-
-bool IsArmFusedSwiGLUProjectionDisabled() {
-    const char* env = std::getenv("DENSECORE_MOE_ARM_DISABLE_FUSED_SWIGLU");
-    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-}
-
-bool IsArmDirectHwyProjectionEnabled() {
-    const char* env = std::getenv("DENSECORE_MOE_ARM_ENABLE_DIRECT_HWY");
-    if (env && env[0] != '\0') {
-        return std::strcmp(env, "0") != 0;
-    }
+#if defined(__aarch64__) || defined(_M_ARM64)
+bool IsArmPackedInt4HwyProjectionSupported() {
     const densecore::simd::SimdLevel level = densecore::simd::DetectSimdLevel();
     return level == densecore::simd::SimdLevel::SVE || level == densecore::simd::SimdLevel::SVE2;
 }
-
-bool IsArmFusedSwiGLUProjectionEnabled() {
-    const char* env = std::getenv("DENSECORE_MOE_ARM_ENABLE_FUSED_SWIGLU");
-    if (env && env[0] != '\0') {
-        return std::strcmp(env, "0") != 0;
-    }
-    const densecore::simd::SimdLevel level = densecore::simd::DetectSimdLevel();
-    return level == densecore::simd::SimdLevel::SVE || level == densecore::simd::SimdLevel::SVE2;
-}
+#endif
 
 bool IsMoECachePolicyDebugEnabled() {
     const char* env = std::getenv("DENSECORE_DEBUG_MOE_CACHE_POLICY");
@@ -2926,7 +2851,7 @@ bool TryRunPackedInt4ProjectionDirect(CpuBackend* backend, const CpuBackend::Exp
     }
 
 #if defined(__aarch64__) || defined(_M_ARM64)
-    if (IsArmDirectHwyProjectionDisabled() || !IsArmDirectHwyProjectionEnabled()) {
+    if (!IsArmPackedInt4HwyProjectionSupported()) {
         (void)backend;
         (void)numa_node;
         (void)allow_parallel;
@@ -2993,7 +2918,7 @@ bool TryRunPackedInt4FusedSwiGLUProjectionDirect(CpuBackend* backend,
     }
 
 #if defined(__aarch64__) || defined(_M_ARM64)
-    if (IsArmFusedSwiGLUProjectionDisabled() || !IsArmFusedSwiGLUProjectionEnabled()) {
+    if (!IsArmPackedInt4HwyProjectionSupported()) {
         (void)backend;
         (void)numa_node;
         (void)allow_parallel;

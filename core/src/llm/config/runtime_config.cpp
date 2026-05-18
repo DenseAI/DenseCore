@@ -143,32 +143,9 @@ KVCacheRuntimeConfig LoadKVCacheRuntimeConfig() {
     return config;
 }
 
-DecodePagedAttentionMode LoadDecodePagedAttentionMode() {
-    if (env::ParseTruthyEnv("DENSECORE_FORCE_PAGED_DECODE", false)) {
-        return DecodePagedAttentionMode::On;
-    }
-
-    const char* explicit_mode_env = std::getenv("DENSECORE_PAGED_ATTN_DECODE_MODE");
-    switch (env::ParseRuntimeToggleMode("DENSECORE_PAGED_ATTN_DECODE_MODE", env::RuntimeToggleMode::Auto)) {
-    case env::RuntimeToggleMode::Off: return DecodePagedAttentionMode::Off;
-    case env::RuntimeToggleMode::On: return DecodePagedAttentionMode::On;
-    case env::RuntimeToggleMode::Auto:
-        if (explicit_mode_env && explicit_mode_env[0] != '\0') {
-            return DecodePagedAttentionMode::Auto;
-        }
-        break;
-    }
-
-    if (env::ParseTruthyEnv("DENSECORE_ENABLE_PAGED_ATTN_DECODE", false)) {
-        return DecodePagedAttentionMode::On;
-    }
-
-    return DecodePagedAttentionMode::On;
-}
-
 DecodePagedAttentionPolicy LoadDecodePagedAttentionPolicy() {
     DecodePagedAttentionPolicy policy;
-    policy.mode = LoadDecodePagedAttentionMode();
+    policy.mode = DecodePagedAttentionMode::On;
 
     const densecore::simd::SimdLevel simd = densecore::simd::DetectSimdLevel();
     const bool has_avx2_or_better = densecore::simd::HasX86Avx2OrBetter(simd);
@@ -236,27 +213,11 @@ int MapRetainedHistoryIndex(const KVRetentionSpan& span, int retained_index) {
 }
 
 env::RuntimeToggleMode LoadArmQ4KNativeVecDotMode() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    const char* legacy = std::getenv("DENSECORE_ARM_ALLOW_Q4K_NATIVE_VECDOT");
-    if (legacy && legacy[0] != '\0') {
-        if (std::strcmp(legacy, "0") == 0 || std::strcmp(legacy, "false") == 0 || std::strcmp(legacy, "FALSE") == 0) {
-            return env::RuntimeToggleMode::Off;
-        }
-        return env::RuntimeToggleMode::On;
-    }
-
-    return env::ParseRuntimeToggleMode("DENSECORE_ARM_Q4K_NATIVE_VECDOT_MODE", env::RuntimeToggleMode::Auto);
-#else
     return env::RuntimeToggleMode::On;
-#endif
 }
 
 env::RuntimeToggleMode LoadArmInt4DirectFastPathMode() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return env::ParseRuntimeToggleMode("DENSECORE_ARM_INT4_DIRECT_FASTPATH_MODE", env::RuntimeToggleMode::Auto);
-#else
     return env::RuntimeToggleMode::On;
-#endif
 }
 
 FastPathRuntimeConfig LoadFastPathRuntimeConfig() {

@@ -4,6 +4,10 @@
 #include <arm_neon.h>
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
+
 MoEUserData* AllocateMoEUserData(struct ggml_context* ctx_c) {
     if (!ctx_c) {
         return nullptr;
@@ -69,23 +73,6 @@ static Gemma4KVSummaryUserData* AllocateGemma4KVSummaryUserData(struct ggml_cont
     }
     std::memset(storage->data, 0, sizeof(Gemma4KVSummaryUserData));
     return reinterpret_cast<Gemma4KVSummaryUserData*>(storage->data);
-}
-
-static SSMAlphaBetaProjectUserData* AllocateSSMAlphaBetaProjectUserData(struct ggml_context* ctx_c) {
-    if (!ctx_c) {
-        return nullptr;
-    }
-    if (ggml_get_no_alloc(ctx_c)) {
-        thread_local SSMAlphaBetaProjectUserData dry_run_storage;
-        dry_run_storage = SSMAlphaBetaProjectUserData{};
-        return &dry_run_storage;
-    }
-    struct ggml_tensor* storage = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I8, sizeof(SSMAlphaBetaProjectUserData));
-    if (!storage || !storage->data) {
-        return nullptr;
-    }
-    std::memset(storage->data, 0, sizeof(SSMAlphaBetaProjectUserData));
-    return reinterpret_cast<SSMAlphaBetaProjectUserData*>(storage->data);
 }
 
 void cb_pack_glm_dsa_q(struct ggml_tensor* dst, const struct ggml_tensor* src0, const struct ggml_tensor* src1, int ith,
@@ -1079,6 +1066,160 @@ static inline float SigmoidStable(float x) {
     }
     const float z = std::exp(x);
     return z / (1.0f + z);
+}
+
+static inline void DotPairProducts(const float* lhs0, const float* lhs1, const float* rhs, int n, float* out0,
+                                   float* out1) {
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+#if defined(__AVX512F__)
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 x = _mm512_loadu_ps(rhs + i);
+        acc0 = _mm512_add_ps(acc0, _mm512_mul_ps(_mm512_loadu_ps(lhs0 + i), x));
+        acc1 = _mm512_add_ps(acc1, _mm512_mul_ps(_mm512_loadu_ps(lhs1 + i), x));
+    }
+    sum0 = _mm512_reduce_add_ps(acc0);
+    sum1 = _mm512_reduce_add_ps(acc1);
+    for (; i < n; ++i) {
+        const float x = rhs[i];
+        sum0 += lhs0[i] * x;
+        sum1 += lhs1[i] * x;
+    }
+#elif defined(__AVX2__)
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 x = _mm256_loadu_ps(rhs + i);
+        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(lhs0 + i), x));
+        acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(_mm256_loadu_ps(lhs1 + i), x));
+    }
+    alignas(32) float lanes0[8];
+    alignas(32) float lanes1[8];
+    _mm256_store_ps(lanes0, acc0);
+    _mm256_store_ps(lanes1, acc1);
+    for (int lane = 0; lane < 8; ++lane) {
+        sum0 += lanes0[lane];
+        sum1 += lanes1[lane];
+    }
+    for (; i < n; ++i) {
+        const float x = rhs[i];
+        sum0 += lhs0[i] * x;
+        sum1 += lhs1[i] * x;
+    }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t x = vld1q_f32(rhs + i);
+        acc0 = vfmaq_f32(acc0, vld1q_f32(lhs0 + i), x);
+        acc1 = vfmaq_f32(acc1, vld1q_f32(lhs1 + i), x);
+    }
+    sum0 = vaddvq_f32(acc0);
+    sum1 = vaddvq_f32(acc1);
+    for (; i < n; ++i) {
+        const float x = rhs[i];
+        sum0 += lhs0[i] * x;
+        sum1 += lhs1[i] * x;
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        const float x = rhs[i];
+        sum0 += lhs0[i] * x;
+        sum1 += lhs1[i] * x;
+    }
+#endif
+    *out0 = sum0;
+    *out1 = sum1;
+}
+
+static inline void QKNormProducts(const float* q_head, const float* k_head, int n, float* q_sum_sq, float* k_sum_sq,
+                                  float* qk_raw_dot) {
+    float q_sum = 0.0f;
+    float k_sum = 0.0f;
+    float qk_sum = 0.0f;
+#if defined(__AVX512F__)
+    __m512 q_acc = _mm512_setzero_ps();
+    __m512 k_acc = _mm512_setzero_ps();
+    __m512 qk_acc = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 qv = _mm512_loadu_ps(q_head + i);
+        const __m512 kv = _mm512_loadu_ps(k_head + i);
+        q_acc = _mm512_add_ps(q_acc, _mm512_mul_ps(qv, qv));
+        k_acc = _mm512_add_ps(k_acc, _mm512_mul_ps(kv, kv));
+        qk_acc = _mm512_add_ps(qk_acc, _mm512_mul_ps(qv, kv));
+    }
+    q_sum = _mm512_reduce_add_ps(q_acc);
+    k_sum = _mm512_reduce_add_ps(k_acc);
+    qk_sum = _mm512_reduce_add_ps(qk_acc);
+    for (; i < n; ++i) {
+        q_sum += q_head[i] * q_head[i];
+        k_sum += k_head[i] * k_head[i];
+        qk_sum += q_head[i] * k_head[i];
+    }
+#elif defined(__AVX2__)
+    __m256 q_acc = _mm256_setzero_ps();
+    __m256 k_acc = _mm256_setzero_ps();
+    __m256 qk_acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 qv = _mm256_loadu_ps(q_head + i);
+        const __m256 kv = _mm256_loadu_ps(k_head + i);
+        q_acc = _mm256_add_ps(q_acc, _mm256_mul_ps(qv, qv));
+        k_acc = _mm256_add_ps(k_acc, _mm256_mul_ps(kv, kv));
+        qk_acc = _mm256_add_ps(qk_acc, _mm256_mul_ps(qv, kv));
+    }
+    alignas(32) float q_lanes[8];
+    alignas(32) float k_lanes[8];
+    alignas(32) float qk_lanes[8];
+    _mm256_store_ps(q_lanes, q_acc);
+    _mm256_store_ps(k_lanes, k_acc);
+    _mm256_store_ps(qk_lanes, qk_acc);
+    for (int lane = 0; lane < 8; ++lane) {
+        q_sum += q_lanes[lane];
+        k_sum += k_lanes[lane];
+        qk_sum += qk_lanes[lane];
+    }
+    for (; i < n; ++i) {
+        q_sum += q_head[i] * q_head[i];
+        k_sum += k_head[i] * k_head[i];
+        qk_sum += q_head[i] * k_head[i];
+    }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    float32x4_t q_acc = vdupq_n_f32(0.0f);
+    float32x4_t k_acc = vdupq_n_f32(0.0f);
+    float32x4_t qk_acc = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t qv = vld1q_f32(q_head + i);
+        const float32x4_t kv = vld1q_f32(k_head + i);
+        q_acc = vfmaq_f32(q_acc, qv, qv);
+        k_acc = vfmaq_f32(k_acc, kv, kv);
+        qk_acc = vfmaq_f32(qk_acc, qv, kv);
+    }
+    q_sum = vaddvq_f32(q_acc);
+    k_sum = vaddvq_f32(k_acc);
+    qk_sum = vaddvq_f32(qk_acc);
+    for (; i < n; ++i) {
+        q_sum += q_head[i] * q_head[i];
+        k_sum += k_head[i] * k_head[i];
+        qk_sum += q_head[i] * k_head[i];
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        q_sum += q_head[i] * q_head[i];
+        k_sum += k_head[i] * k_head[i];
+        qk_sum += q_head[i] * k_head[i];
+    }
+#endif
+    *q_sum_sq = q_sum;
+    *k_sum_sq = k_sum;
+    *qk_raw_dot = qk_sum;
 }
 
 static bool IsSSMNonFiniteDebugEnabled() {
@@ -2186,138 +2327,6 @@ void cb_ssm_qwen35_delta_z_qkv_alpha_beta(struct ggml_tensor* dst, const struct 
     cb_ssm_qwen35_delta(dst, z, qkv, ud->input_tensor, ith, nth, userdata);
 }
 
-void cb_ssm_alpha_beta_project(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
-                               void* userdata) {
-    const auto* ud = static_cast<SSMAlphaBetaProjectUserData*>(userdata);
-    if (!ud || !dst || !src || !dst->data || !src->data || !ud->alpha_weight || !ud->beta_weight || !ud->dt_bias ||
-        ud->n_embd <= 0 || ud->n_heads <= 0 || nth <= 0 || ith < 0 || ith >= nth) {
-        return;
-    }
-    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || static_cast<int>(src->ne[0]) != ud->n_embd ||
-        static_cast<int>(dst->ne[0]) != 2 * ud->n_heads || src->ne[1] != dst->ne[1]) {
-        return;
-    }
-
-    const int N = static_cast<int>(src->ne[1]);
-    const ptrdiff_t input_stride = static_cast<ptrdiff_t>(src->nb[1] / sizeof(float));
-    const ptrdiff_t out_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
-    const float* input = reinterpret_cast<const float*>(src->data);
-    float* out = reinterpret_cast<float*>(dst->data);
-    const int total = N * ud->n_heads;
-    const int per_task = (total + nth - 1) / nth;
-    const int begin = ith * per_task;
-    const int end = std::min(total, begin + per_task);
-    for (int idx = begin; idx < end; ++idx) {
-        const int t = idx / ud->n_heads;
-        const int h = idx - t * ud->n_heads;
-        const float* input_t = input + static_cast<ptrdiff_t>(t) * input_stride;
-        const float* alpha_row = ud->alpha_weight + static_cast<size_t>(h) * static_cast<size_t>(ud->n_embd);
-        const float* beta_row = ud->beta_weight + static_cast<size_t>(h) * static_cast<size_t>(ud->n_embd);
-        float alpha = ud->dt_bias[h];
-        float beta = 0.0f;
-#if defined(__aarch64__) || defined(_M_ARM64)
-        float32x4_t alpha_acc = vdupq_n_f32(0.0f);
-        float32x4_t beta_acc = vdupq_n_f32(0.0f);
-        int i = 0;
-        for (; i + 4 <= ud->n_embd; i += 4) {
-            const float32x4_t x = vld1q_f32(input_t + i);
-            alpha_acc = vfmaq_f32(alpha_acc, vld1q_f32(alpha_row + i), x);
-            beta_acc = vfmaq_f32(beta_acc, vld1q_f32(beta_row + i), x);
-        }
-        alpha += vaddvq_f32(alpha_acc);
-        beta += vaddvq_f32(beta_acc);
-        for (; i < ud->n_embd; ++i) {
-            const float x = input_t[i];
-            alpha += alpha_row[i] * x;
-            beta += beta_row[i] * x;
-        }
-#else
-        for (int i = 0; i < ud->n_embd; ++i) {
-            const float x = input_t[i];
-            alpha += alpha_row[i] * x;
-            beta += beta_row[i] * x;
-        }
-#endif
-        float* out_t = out + static_cast<ptrdiff_t>(t) * out_stride;
-        out_t[h] = alpha;
-        out_t[ud->n_heads + h] = beta;
-    }
-}
-
-void cb_ssm_alpha_beta_project_map2(struct ggml_tensor* dst, const struct ggml_tensor* placeholder,
-                                    const struct ggml_tensor* src, int ith, int nth, void* userdata) {
-    (void)placeholder;
-    cb_ssm_alpha_beta_project(dst, src, ith, nth, userdata);
-}
-
-void cb_ssm_qk_norm_project_map2(struct ggml_tensor* dst, const struct ggml_tensor* placeholder,
-                                 const struct ggml_tensor* qkv, int ith, int nth, void* userdata) {
-    (void)placeholder;
-    const auto* ud = static_cast<SSMQwen35DeltaUserData*>(userdata);
-    if (!ud || !dst || !qkv || !dst->data || !qkv->data || ud->n_groups <= 0 || ud->head_dim_k <= 0 || nth <= 0 ||
-        ith < 0 || ith >= nth) {
-        return;
-    }
-    if (qkv->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-        static_cast<int>(dst->ne[0]) != 3 * ud->n_groups || qkv->ne[1] != dst->ne[1]) {
-        return;
-    }
-
-    const int N = static_cast<int>(qkv->ne[1]);
-    const int qk_total = ud->n_groups * ud->head_dim_k;
-    const ptrdiff_t qkv_stride = static_cast<ptrdiff_t>(qkv->nb[1] / sizeof(float));
-    const ptrdiff_t out_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
-    const float* qkv_data = reinterpret_cast<const float*>(qkv->data);
-    float* out = reinterpret_cast<float*>(dst->data);
-    const int total = N * ud->n_groups;
-    const int per_task = (total + nth - 1) / nth;
-    const int begin = ith * per_task;
-    const int end = std::min(total, begin + per_task);
-    for (int idx = begin; idx < end; ++idx) {
-        const int t = idx / ud->n_groups;
-        const int h = idx - t * ud->n_groups;
-        const float* row = qkv_data + static_cast<ptrdiff_t>(t) * qkv_stride;
-        const float* q_head = row + static_cast<size_t>(h) * ud->head_dim_k;
-        const float* k_head = row + static_cast<size_t>(qk_total) + static_cast<size_t>(h) * ud->head_dim_k;
-        float q_sum_sq = 0.0f;
-        float k_sum_sq = 0.0f;
-        float qk_raw_dot = 0.0f;
-#if defined(__aarch64__) || defined(_M_ARM64)
-        float32x4_t q_acc = vdupq_n_f32(0.0f);
-        float32x4_t k_acc = vdupq_n_f32(0.0f);
-        float32x4_t qk_acc = vdupq_n_f32(0.0f);
-        int i = 0;
-        for (; i + 4 <= ud->head_dim_k; i += 4) {
-            const float32x4_t qv = vld1q_f32(q_head + i);
-            const float32x4_t kv = vld1q_f32(k_head + i);
-            q_acc = vfmaq_f32(q_acc, qv, qv);
-            k_acc = vfmaq_f32(k_acc, kv, kv);
-            qk_acc = vfmaq_f32(qk_acc, qv, kv);
-        }
-        q_sum_sq = vaddvq_f32(q_acc);
-        k_sum_sq = vaddvq_f32(k_acc);
-        qk_raw_dot = vaddvq_f32(qk_acc);
-        for (; i < ud->head_dim_k; ++i) {
-            q_sum_sq += q_head[i] * q_head[i];
-            k_sum_sq += k_head[i] * k_head[i];
-            qk_raw_dot += q_head[i] * k_head[i];
-        }
-#else
-        for (int i = 0; i < ud->head_dim_k; ++i) {
-            q_sum_sq += q_head[i] * q_head[i];
-            k_sum_sq += k_head[i] * k_head[i];
-            qk_raw_dot += q_head[i] * k_head[i];
-        }
-#endif
-        const float q_inv_norm = 1.0f / std::sqrt(q_sum_sq + ud->norm_eps);
-        const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + ud->norm_eps);
-        float* out_t = out + static_cast<ptrdiff_t>(t) * out_stride;
-        out_t[h] = q_inv_norm;
-        out_t[ud->n_groups + h] = k_inv_norm;
-        out_t[2 * ud->n_groups + h] = qk_raw_dot * q_inv_norm * k_inv_norm;
-    }
-}
-
 void cb_ssm_alpha_beta_qk_project_map3(struct ggml_tensor* dst, const struct ggml_tensor* placeholder,
                                        const struct ggml_tensor* input_src, const struct ggml_tensor* qkv,
                                        int ith, int nth, void* userdata) {
@@ -2357,31 +2366,11 @@ void cb_ssm_alpha_beta_qk_project_map3(struct ggml_tensor* dst, const struct ggm
             const float* input_t = input + static_cast<ptrdiff_t>(t) * input_stride;
             const float* alpha_row = ud->alpha_weight + static_cast<size_t>(h) * static_cast<size_t>(ud->n_embd);
             const float* beta_row = ud->beta_weight + static_cast<size_t>(h) * static_cast<size_t>(ud->n_embd);
-            float alpha = ud->dt_bias[h];
-            float beta = 0.0f;
-#if defined(__aarch64__) || defined(_M_ARM64)
-            float32x4_t alpha_acc = vdupq_n_f32(0.0f);
-            float32x4_t beta_acc = vdupq_n_f32(0.0f);
-            int i = 0;
-            for (; i + 4 <= ud->n_embd; i += 4) {
-                const float32x4_t x = vld1q_f32(input_t + i);
-                alpha_acc = vfmaq_f32(alpha_acc, vld1q_f32(alpha_row + i), x);
-                beta_acc = vfmaq_f32(beta_acc, vld1q_f32(beta_row + i), x);
-            }
-            alpha += vaddvq_f32(alpha_acc);
-            beta += vaddvq_f32(beta_acc);
-            for (; i < ud->n_embd; ++i) {
-                const float x = input_t[i];
-                alpha += alpha_row[i] * x;
-                beta += beta_row[i] * x;
-            }
-#else
-            for (int i = 0; i < ud->n_embd; ++i) {
-                const float x = input_t[i];
-                alpha += alpha_row[i] * x;
-                beta += beta_row[i] * x;
-            }
-#endif
+            float alpha_dot = 0.0f;
+            float beta_dot = 0.0f;
+            DotPairProducts(alpha_row, beta_row, input_t, ud->n_embd, &alpha_dot, &beta_dot);
+            const float alpha = ud->dt_bias[h] + alpha_dot;
+            const float beta = beta_dot;
             float* out_t = out + static_cast<ptrdiff_t>(t) * out_stride;
             out_t[h] = alpha;
             out_t[ud->n_heads + h] = beta;
@@ -2397,33 +2386,7 @@ void cb_ssm_alpha_beta_qk_project_map3(struct ggml_tensor* dst, const struct ggm
         float q_sum_sq = 0.0f;
         float k_sum_sq = 0.0f;
         float qk_raw_dot = 0.0f;
-#if defined(__aarch64__) || defined(_M_ARM64)
-        float32x4_t q_acc = vdupq_n_f32(0.0f);
-        float32x4_t k_acc = vdupq_n_f32(0.0f);
-        float32x4_t qk_acc = vdupq_n_f32(0.0f);
-        int i = 0;
-        for (; i + 4 <= ud->head_dim_k; i += 4) {
-            const float32x4_t qv = vld1q_f32(q_head + i);
-            const float32x4_t kv = vld1q_f32(k_head + i);
-            q_acc = vfmaq_f32(q_acc, qv, qv);
-            k_acc = vfmaq_f32(k_acc, kv, kv);
-            qk_acc = vfmaq_f32(qk_acc, qv, kv);
-        }
-        q_sum_sq = vaddvq_f32(q_acc);
-        k_sum_sq = vaddvq_f32(k_acc);
-        qk_raw_dot = vaddvq_f32(qk_acc);
-        for (; i < ud->head_dim_k; ++i) {
-            q_sum_sq += q_head[i] * q_head[i];
-            k_sum_sq += k_head[i] * k_head[i];
-            qk_raw_dot += q_head[i] * k_head[i];
-        }
-#else
-        for (int i = 0; i < ud->head_dim_k; ++i) {
-            q_sum_sq += q_head[i] * q_head[i];
-            k_sum_sq += k_head[i] * k_head[i];
-            qk_raw_dot += q_head[i] * k_head[i];
-        }
-#endif
+        QKNormProducts(q_head, k_head, ud->head_dim_k, &q_sum_sq, &k_sum_sq, &qk_raw_dot);
         const float q_inv_norm = 1.0f / std::sqrt(q_sum_sq + ud->norm_eps);
         const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + ud->norm_eps);
         float* out_t = out + static_cast<ptrdiff_t>(t) * out_stride + 2 * ud->n_heads;
@@ -2765,6 +2728,7 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
                 cfg.has_precomputed_qk_norm = true;
                 cfg.precomputed_q_inv_norm = qk_norm_t[src_k_head];
                 cfg.precomputed_k_inv_norm = qk_norm_t[num_k_heads + src_k_head];
+                cfg.precomputed_qk_dot = qk_norm_t[2 * num_k_heads + src_k_head];
             }
 
             Qwen35SSMHeadStepStats ref_stats{};

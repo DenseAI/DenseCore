@@ -1243,6 +1243,116 @@ TEST(Qwen35SSMQkvProjection, DispatchEquivalence) {
 
 }
 
+TEST(Qwen35SSMQkvProjection, SmartMulMatSkipsAmxAliasForDecode) {
+    struct ggml_init_params params = {
+        .mem_size = 1024 * 1024 * 8,
+        .mem_buffer = nullptr,
+        .no_alloc = false,
+    };
+    struct ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    InferenceWorkContext* work_ctx = CreateInferenceWorkContext();
+    ASSERT_NE(work_ctx, nullptr);
+    SetCurrentWorkContext(work_ctx);
+    struct Guard {
+        InferenceWorkContext* work_ctx;
+        struct ggml_context* ctx;
+        ~Guard() {
+            SetCurrentWorkContext(nullptr);
+            DestroyInferenceWorkContext(work_ctx);
+            ggml_free(ctx);
+        }
+    } guard{work_ctx, ctx};
+
+    TransformerModel model;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+
+    constexpr int K = 16;
+    constexpr int N = 32;
+    ggml_tensor* weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_set_name(weight, "blk.0.ffn_gate.weight");
+    ggml_tensor* amx_alias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_set_name(amx_alias, "blk.0.ffn_gate.weight.amx_alias");
+    model.cpu_repack_aliases[weight] = amx_alias;
+    model.cpu_amx_aliases[amx_alias] = true;
+
+    ggml_tensor* decode_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 1);
+    auto result_uses_tensor = [](const ggml_tensor* result, const ggml_tensor* tensor) {
+        if (!result || !tensor) {
+            return false;
+        }
+        if (result == tensor) {
+            return true;
+        }
+        for (ggml_tensor* src : result->src) {
+            if (src == tensor) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    ggml_tensor* decode_result = densecore::testing::SmartMulMatTest(ctx, weight, decode_input, &model);
+    ASSERT_NE(decode_result, nullptr);
+    EXPECT_TRUE(result_uses_tensor(decode_result, weight));
+    EXPECT_FALSE(result_uses_tensor(decode_result, amx_alias));
+
+    ggml_tensor* prefill_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 4);
+    ggml_tensor* prefill_result = densecore::testing::SmartMulMatTest(ctx, weight, prefill_input, &model);
+    ASSERT_NE(prefill_result, nullptr);
+}
+
+TEST(Qwen35SSMQkvProjection, Qwen36HybridSSMQ4KPrefillUsesNativeGgmlInsteadOfRepackAlias) {
+    struct ggml_init_params params = {
+        .mem_size = 1024 * 1024 * 32,
+        .mem_buffer = nullptr,
+        .no_alloc = false,
+    };
+    struct ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    InferenceWorkContext* work_ctx = CreateInferenceWorkContext();
+    ASSERT_NE(work_ctx, nullptr);
+    SetCurrentWorkContext(work_ctx);
+    struct Guard {
+        InferenceWorkContext* work_ctx;
+        struct ggml_context* ctx;
+        ~Guard() {
+            SetCurrentWorkContext(nullptr);
+            DestroyInferenceWorkContext(work_ctx);
+            ggml_free(ctx);
+        }
+    } guard{work_ctx, ctx};
+
+    TransformerModel model;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+
+    constexpr int K = 256;
+    constexpr int N = 128;
+    constexpr int M = 4;
+    static_assert(K % QK_K == 0, "Q4_K true-batched path requires QK_K alignment");
+
+    ggml_tensor* weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, K, N);
+    ASSERT_NE(weight, nullptr);
+    ggml_set_name(weight, "blk.0.attn_qkv.weight");
+    ggml_tensor* repack_alias = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, N);
+    ASSERT_NE(repack_alias, nullptr);
+    ggml_set_name(repack_alias, "blk.0.attn_qkv.weight.cpu_repack");
+    model.cpu_repack_aliases[weight] = repack_alias;
+
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
+    ASSERT_NE(input, nullptr);
+    ggml_tensor* result = densecore::testing::SmartMulMatTest(ctx, weight, input, &model);
+    ASSERT_NE(result, nullptr);
+
+    EXPECT_EQ(result->op, GGML_OP_MUL_MAT);
+    EXPECT_EQ(result->src[0], weight);
+    EXPECT_NE(result->src[0], repack_alias);
+}
+
 TEST(Qwen35SSMQkvProjection, Qwen36LmHeadLargeBatchQ40FallsBackToNativeGgml) {
     struct ggml_init_params params = {
         .mem_size = 1024 * 1024 * 128,
@@ -1327,8 +1437,7 @@ TEST(Qwen35SSMQkvProjection, Qwen36LmHeadLargeBatchQ40FallsBackToNativeGgml) {
     }
 }
 
-TEST(Qwen35SSMQkvProjection, Qwen36LmHeadLargeBatchQ4KUsesTrueBatchedPathAndMatchesNativeGgml) {
-    ScopedEnvVar enable_q4k_true_batched("DENSECORE_ENABLE_Q4K_TRUE_BATCHED", "on");
+TEST(Qwen35SSMQkvProjection, Qwen36LmHeadLargeBatchQ4KUsesNativeGgmlForHybridPrefill) {
     ScopedEnvVar enable_qwen36_profile("DENSECORE_QWEN36_PROFILE", "1");
 
     struct ggml_init_params params = {
@@ -1394,7 +1503,7 @@ TEST(Qwen35SSMQkvProjection, Qwen36LmHeadLargeBatchQ4KUsesTrueBatchedPathAndMatc
 
     struct ggml_tensor* result = densecore::testing::SmartMulMatTest(ctx, weight, input, &model);
     ASSERT_NE(result, nullptr);
-    EXPECT_EQ(result->op, GGML_OP_CUSTOM);
+    EXPECT_EQ(result->op, GGML_OP_MUL_MAT);
     struct ggml_cgraph* gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, result);
     ggml_graph_compute_with_ctx(ctx, gf, 4);
@@ -1415,10 +1524,7 @@ TEST(Qwen35SSMQkvProjection, Qwen36LmHeadLargeBatchQ4KUsesTrueBatchedPathAndMatc
     }
 }
 
-TEST(Qwen35SSMQkvProjection, Qwen36HybridSSMQ4KPrefillKeepsNativeProjectionBeforeDelta) {
-    ScopedEnvVar enable_q4k_true_batched("DENSECORE_ENABLE_Q4K_TRUE_BATCHED", "on");
-    ScopedEnvVar enable_fast_silu("DENSECORE_QWEN36_SSM_FAST_SILU_GATE", "1");
-
+TEST(Qwen35SSMQkvProjection, Qwen36HybridSSMQ4KPrefillUsesNativeProjectionAndMatchesNative) {
     struct ggml_init_params params = {
         .mem_size = 1024 * 1024 * 192,
         .mem_buffer = nullptr,
@@ -1555,8 +1661,18 @@ TEST(Qwen35SSMQkvProjection, Qwen36HybridSSMQ4KPrefillKeepsNativeProjectionBefor
     ASSERT_EQ(out->ne[0], d_inner);
     ASSERT_EQ(out->ne[1], batch_cols);
 
+    ggml_tensor* expected_qkv = ggml_mul_mat(ctx, attn_qkv, input);
+    ASSERT_NE(expected_qkv, nullptr);
+    ggml_tensor* expected_z = ggml_mul_mat(ctx, attn_gate, input);
+    ASSERT_NE(expected_z, nullptr);
+    ggml_tensor* expected_out = ggml_mul_mat(ctx, ssm_out, y);
+    ASSERT_NE(expected_out, nullptr);
+
     struct ggml_cgraph* gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
+    ggml_build_forward_expand(gf, expected_qkv);
+    ggml_build_forward_expand(gf, expected_z);
+    ggml_build_forward_expand(gf, expected_out);
     ggml_graph_compute_with_ctx(ctx, gf, 4);
 
     const float* got = reinterpret_cast<const float*>(out->data);
@@ -1567,4 +1683,13 @@ TEST(Qwen35SSMQkvProjection, Qwen36HybridSSMQ4KPrefillKeepsNativeProjectionBefor
     }
     EXPECT_GT(energy, 1e-8f);
     EXPECT_EQ(qkv_conv->type, GGML_TYPE_F32);
+    EXPECT_LE(MaxAbsDiff(reinterpret_cast<const float*>(qkv_mixed->data),
+                         reinterpret_cast<const float*>(expected_qkv->data), conv_channels * batch_cols),
+              2e-4f);
+    EXPECT_LE(MaxAbsDiff(reinterpret_cast<const float*>(z->data), reinterpret_cast<const float*>(expected_z->data),
+                         d_inner * batch_cols),
+              2e-4f);
+    EXPECT_LE(MaxAbsDiff(reinterpret_cast<const float*>(out->data), reinterpret_cast<const float*>(expected_out->data),
+                         d_inner * batch_cols),
+              2e-4f);
 }

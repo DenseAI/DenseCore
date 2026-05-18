@@ -20,16 +20,9 @@ struct ArmComputeAffinityPolicy {
 bool IsDebugGraphLoggingEnabled();
 bool IsVerboseTokenTraceEnabled();
 bool IsReasoningTagSuppressionEnabled();
-bool IsDirectCallbackEnabled();
-bool ShouldUseDirectResultCallbacks(bool benchmark_fast_path);
 void EmitRequestResult(EngineState* state, Request* req, const std::string& token, int token_id, bool finished,
                        bool error, bool use_direct_callback);
-bool IsSingleRequestFastPathEnabled();
 bool ShouldBypassSingleRequestFastPathForLongHybridSSM(const TransformerModel* model, const Request* req);
-bool IsBenchmarkFastPathEnabled();
-bool IsBenchmarkDirectCallbackEnabled();
-bool IsBenchmarkDecodeBatchFastPathEnabled();
-int BenchmarkFastPathMaxBatch();
 bool AllowDecodeThreadsOverBase();
 bool IsDecodeBatchPerfLoggingEnabled();
 bool IsDecodeProfileEnabled();
@@ -44,15 +37,6 @@ ArmComputeAffinityPolicy ResolveArmComputeAffinityPolicy();
 bool IsDecodeGraphCacheEnabled();
 bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model);
 bool DoesDecodeGraphCacheRequireRuntimeRebind(const TransformerModel* model);
-bool IsBatchedPagedDecodeEnabled();
-bool IsPagedDecodeGloballyDisabled();
-bool IsForcePagedDecodeEnabled();
-bool IsPagedDecodeModeForcedOn();
-bool IsFlashAttentionForcedForCacheKey();
-bool IsFlashAttentionDisabledForCacheKey();
-bool IsPrecomputedRoPEEnabledForCacheKey();
-bool IsFusedResidualRMSNormEnabledForCacheKey();
-bool IsFusedQKVEnabledForCacheKey();
 bool IsDecodeGraphCacheRegressionEnabled();
 int DecodeGraphCacheRegressionSteps();
 uint64_t BuildDecodeGraphFeatureFlags(const TransformerModel* model);
@@ -91,7 +75,7 @@ bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const Pa
                                          const BatchSpec& batch);
 
 static constexpr std::size_t kDecodeGraphCacheTrackedVariants = static_cast<std::size_t>(ModelVariant::QWEN_VL) + 1;
-static constexpr std::size_t kDecodeGraphCacheTrackedBatches = 5;
+static constexpr std::size_t kDecodeGraphCacheTrackedBatches = 9;
 
 struct DecodeGraphCacheBucketStats {
     std::atomic<uint64_t> attempts{0};
@@ -107,10 +91,16 @@ struct DecodeWorkerStats {
     std::atomic<uint64_t> graph_cache_builds{0};
     std::atomic<uint64_t> graph_cache_rejected_uncacheable{0};
     std::atomic<uint64_t> graph_cache_skip_disabled{0};
+    std::atomic<uint64_t> graph_cache_skip_layout{0};
+    std::atomic<uint64_t> graph_cache_skip_max_batch{0};
     std::atomic<uint64_t> graph_cache_skip_unstable{0};
     std::atomic<uint64_t> graph_cache_skip_lora{0};
+    std::atomic<uint64_t> graph_cache_skip_model{0};
     std::atomic<uint64_t> graph_cache_skip_backend{0};
-    std::array<std::atomic<int>, 5> last_threads_by_batch{};
+    std::atomic<uint64_t> graph_cache_skip_uncacheable{0};
+    std::atomic<uint64_t> graph_cache_skip_build_failure{0};
+    std::atomic<uint64_t> graph_cache_skip_rebind_failure{0};
+    std::array<std::atomic<int>, kDecodeGraphCacheTrackedBatches> last_threads_by_batch{};
     std::array<std::array<DecodeGraphCacheBucketStats, kDecodeGraphCacheTrackedBatches>,
                kDecodeGraphCacheTrackedVariants>
         graph_cache_by_variant_batch{};

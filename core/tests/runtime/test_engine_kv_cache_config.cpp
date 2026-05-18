@@ -224,8 +224,33 @@ TEST(EngineKVCacheConfig, AutoKVTargetUsesAvailableMemoryWhenNoEnvTargetIsSet) {
     const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_F16);
 
     EXPECT_EQ(config.max_num_seqs, 4);
-    EXPECT_EQ(config.target_kv_memory / (1024ULL * 1024ULL), 7168ULL);
-    EXPECT_EQ(config.max_seq_len, 15291);
+    EXPECT_GT(config.target_kv_memory / (1024ULL * 1024ULL), 7168ULL)
+        << "Auto KV sizing should use current available capacity after generic runtime headroom, not the old "
+           "fixed half-of-available split";
+    EXPECT_LT(config.target_kv_memory / (1024ULL * 1024ULL), 65536ULL / 4ULL);
+    EXPECT_GT(config.max_seq_len, 15291);
+    EXPECT_LE(config.max_seq_len, model.hparams.n_ctx);
+}
+
+TEST(EngineKVCacheConfig, AutoKVTargetKeepsLargeGemma4ContextUsableWithoutEnvOverride) {
+    ScopedEnvVar target_mb("DENSECORE_KV_TARGET_MB", nullptr);
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", nullptr);
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+    ScopedEnvVar available_hint("DENSECORE_KV_AVAILABLE_MB_HINT", "65536");
+
+    TransformerModel model = MakeModel(/*head_dim_k=*/512, /*n_head_kv=*/16, /*n_layer=*/60, /*head_dim_v=*/512);
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_ctx = 262144;
+
+    const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_Q8_0);
+
+    EXPECT_EQ(config.max_num_seqs, 4);
+    EXPECT_EQ(config.effective_cache_type, GGML_TYPE_Q8_0);
+    EXPECT_GT(config.max_seq_len, 4096)
+        << "Large Gemma4 models should derive usable long-context capacity from current memory and bytes/token "
+           "instead of requiring a model-specific DENSECORE_MAX_SEQ_LEN override";
+    EXPECT_LE(config.max_seq_len, model.hparams.n_ctx);
 }
 
 TEST(EngineKVCacheConfig, ExplicitKVTargetStillActsAsOverride) {

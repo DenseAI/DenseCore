@@ -79,9 +79,7 @@ TEST(LLMRuntimeConfigTest, KVRetentionPolicyHonorsPrimaryEnvNames) {
     EXPECT_EQ(span.history_kept, 36);
 }
 
-TEST(LLMRuntimeConfigTest, DecodePagedAttentionPolicyRespectsForceAndLegacyQuantizedAlias) {
-    ScopedEnvVar force_paged("DENSECORE_FORCE_PAGED_DECODE", "1");
-    ScopedEnvVar mode("DENSECORE_PAGED_ATTN_DECODE_MODE", "off");
+TEST(LLMRuntimeConfigTest, DecodePagedAttentionPolicyKeepsPagedDecodeOnAndRespectsQuantizedAlias) {
     ScopedEnvVar legacy_quantized("DENSECORE_PAGED_ATTN_DECODE_ALLOW_Q8", "0");
     ScopedEnvVar primary_quantized("DENSECORE_PAGED_ATTN_DECODE_ALLOW_QUANTIZED", nullptr);
     ScopedEnvVar debug_log("DENSECORE_DEBUG_PAGED_ATTN_DECODE", "1");

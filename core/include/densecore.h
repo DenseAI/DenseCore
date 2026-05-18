@@ -192,6 +192,24 @@ typedef struct {
 typedef void (*TokenCallback)(const char* token, int is_finished, void* user_data);
 
 /**
+ * @brief Length-aware callback function for streaming generated tokens
+ *
+ * This callback is equivalent to TokenCallback but supplies the byte length and
+ * generated token ID so callers do not need to scan for a NUL terminator on the
+ * per-token hot path.
+ *
+ * @param data The generated token bytes; may be NULL for empty terminal events
+ * @param len Number of bytes in data
+ * @param token_id Generated token ID, or -1 when unavailable
+ * @param is_finished 1 if this is the final token/chunk, 0 otherwise
+ * @param user_data User-provided pointer passed back to the callback
+ *
+ * @note Thread-safety: callbacks are invoked from a background thread.
+ * @note Ownership: The data pointer is only valid during the callback execution.
+ */
+typedef void (*TokenCallbackEx)(const char* data, int len, int token_id, int is_finished, void* user_data);
+
+/**
  * @brief Callback function for structured token results
  *
  * Enhanced callback that provides token ID for HuggingFace tokenizer decoding.
@@ -466,6 +484,18 @@ DENSECORE_API int SubmitRequestWithSamplingConstraintsEx(
     int num_disallowed_token_ids, TokenCallback callback, void* user_data);
 
 /**
+ * Submit a request with full sampling parameters and a length-aware callback.
+ *
+ * This preserves SubmitRequestWithSamplingConstraintsEx semantics while avoiding
+ * null-terminated token conversion in callback consumers.
+ */
+DENSECORE_API int SubmitRequestWithSamplingConstraintsCallbackEx(
+    DenseCoreHandle handle, const char* prompt, int max_tokens, const char* lora_name, float temperature, float top_p,
+    int top_k, float repetition_penalty, const char** stop_sequences, int json_mode, const int* allowed_token_ids,
+    int num_allowed_token_ids, int allowed_token_ids_strict, const int* disallowed_token_ids,
+    int num_disallowed_token_ids, TokenCallbackEx callback, void* user_data);
+
+/**
  * Submit a request with structured token results and full sampling parameters
  * (Non-blocking)
  *
@@ -541,6 +571,15 @@ DENSECORE_API int SubmitRequestIdsWithSamplingConstraintsEx(
     float top_p, int top_k, float repetition_penalty, const char** stop_sequences, int json_mode,
     const int* allowed_token_ids, int num_allowed_token_ids, int allowed_token_ids_strict,
     const int* disallowed_token_ids, int num_disallowed_token_ids, TokenCallback callback, void* user_data);
+
+/**
+ * Submit a token-ID request with full sampling parameters and a length-aware callback.
+ */
+DENSECORE_API int SubmitRequestIdsWithSamplingConstraintsCallbackEx(
+    DenseCoreHandle handle, const int* tokens, int n_tokens, int max_tokens, const char* lora_name, float temperature,
+    float top_p, int top_k, float repetition_penalty, const char** stop_sequences, int json_mode,
+    const int* allowed_token_ids, int num_allowed_token_ids, int allowed_token_ids_strict,
+    const int* disallowed_token_ids, int num_disallowed_token_ids, TokenCallbackEx callback, void* user_data);
 
 /**
  * Submit a request with token IDs and format specification (Non-blocking)

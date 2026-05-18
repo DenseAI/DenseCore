@@ -383,9 +383,9 @@ struct ggml_tensor* SmartMulMatTest(struct ggml_context* ctx, struct ggml_tensor
 int ResolveQuantBatchedTileColsForTest(int requested_cols, int vec_dot_nrows, bool allow_true_batched_q4k) {
     return ::ResolveQuantBatchedTileCols(requested_cols, vec_dot_nrows, allow_true_batched_q4k);
 }
-bool ResolveQ4KTrueBatchedKernelPolicyForTest(int mode, int simd_level, bool compiled_with_sve) {
-    return ::ResolveQ4KTrueBatchedKernelEnabledPolicy(
-        static_cast<RuntimeToggleMode>(mode), static_cast<densecore::simd::SimdLevel>(simd_level), compiled_with_sve);
+bool ResolveQ4KTrueBatchedKernelPolicyForTest(int simd_level, bool compiled_with_sve) {
+    return ::ResolveQ4KTrueBatchedKernelEnabledPolicy(static_cast<densecore::simd::SimdLevel>(simd_level),
+                                                      compiled_with_sve);
 }
 int ResolveQwen36MoECallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int top_k) {
     return ::ResolveQwen36MoECallbackTaskCount(model, batch, top_k);

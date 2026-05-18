@@ -27,6 +27,10 @@ TransformerModel MakeDecodeModel(bool gemma4) {
     return model;
 }
 
+ggml_tensor* NewTensor2D(ggml_context* ctx, int rows, int cols) {
+    return ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, cols);
+}
+
 TransformerModel MakeQwen36HybridDecodeModel() {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
@@ -251,7 +255,6 @@ TEST(DecodeGraphCachePolicyTest, Gemma4LayerHeadKvPatternCanStillUseStablePagedD
     cache.cache_type = GGML_TYPE_F16;
     cache.max_blocks = 8;
     ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "1");
-    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "on");
 
     EXPECT_TRUE(IsStablePagedDecodeTopologyForCache(&gemma4, &cache, batch));
 }
@@ -259,9 +262,6 @@ TEST(DecodeGraphCachePolicyTest, Gemma4LayerHeadKvPatternCanStillUseStablePagedD
 TEST(DecodeGraphCachePolicyTest, Gemma4InferenceDecisionUsesPagedDecodeByDefault) {
     const TransformerModel gemma4 = MakeDecodeModel(true);
     ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", nullptr);
-    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
-    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
-    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "on");
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", nullptr);
 
     EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&gemma4));
@@ -270,9 +270,6 @@ TEST(DecodeGraphCachePolicyTest, Gemma4InferenceDecisionUsesPagedDecodeByDefault
 TEST(DecodeGraphCachePolicyTest, Gemma4InferenceDecisionCanUsePagedDecodeWhenQualified) {
     const TransformerModel gemma4 = MakeDecodeModel(true);
     ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "1");
-    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
-    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
-    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "on");
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", nullptr);
 
     EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&gemma4));
@@ -282,9 +279,6 @@ TEST(DecodeGraphCachePolicyTest, Gemma4InferenceDecisionCanFallBackToDenseBaseli
     const TransformerModel gemma4 = MakeDecodeModel(true);
     ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "1");
     ScopedEnvOverride dense_baseline_env("DENSECORE_GEMMA4_FORCE_DENSE_BASELINE", "1");
-    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
-    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
-    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "on");
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", nullptr);
 
     EXPECT_FALSE(ShouldUsePagedDecodeAttentionForTestBatch(&gemma4));
@@ -300,31 +294,22 @@ TEST(DecodeGraphCachePolicyTest, NonGemmaBatchedDecodeTopologyRemainsStablePaged
     EXPECT_TRUE(IsStablePagedDecodeTopologyForCache(&llama, &cache, batch));
 }
 
-TEST(DecodeGraphCachePolicyTest, NonGemmaInferenceDecisionRespectsExplicitPolicyOff) {
+TEST(DecodeGraphCachePolicyTest, NonGemmaInferenceDecisionKeepsPagedDecodeOn) {
     const TransformerModel llama = MakeDecodeModel(false);
-    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
-    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
-    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "off");
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", nullptr);
 
-    EXPECT_FALSE(ShouldUsePagedDecodeAttentionForTestBatch(&llama));
+    EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&llama));
 }
 
-TEST(DecodeGraphCachePolicyTest, NonGemmaInferenceDecisionRespectsAutoModeDecline) {
+TEST(DecodeGraphCachePolicyTest, NonGemmaInferenceDecisionDoesNotUseEnvModeDecline) {
     const TransformerModel llama = MakeDecodeModel(false);
-    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
-    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
-    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "auto");
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", "9999");
 
-    EXPECT_FALSE(ShouldUsePagedDecodeAttentionForTestBatch(&llama));
+    EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&llama));
 }
 
 TEST(DecodeGraphCachePolicyTest, NonGemmaInferenceDecisionUsesPagedDecodeWhenPolicyRequestsIt) {
     const TransformerModel llama = MakeDecodeModel(false);
-    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
-    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
-    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "on");
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", nullptr);
 
     EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&llama));
@@ -350,26 +335,20 @@ TEST(RuntimeEnvTest, ParsePositiveEnvIntRejectsZeroAndGarbage) {
     EXPECT_EQ(densecore::env::ParsePositiveEnvInt("DENSECORE_TEST_INT_ENV", 23), 23);
 }
 
-TEST(DecodeGraphCachePolicyTest, AutoModeAllowsShortBatchedDecodeWithSeparateThreshold) {
+TEST(DecodeGraphCachePolicyTest, PagedDecodeAllowsShortBatchedDecode) {
     const TransformerModel llama = MakeDecodeModel(false);
-    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
-    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
-    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "auto");
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", "128");
     ScopedEnvOverride min_batch_ctx_env("DENSECORE_PAGED_DECODE_MIN_BATCH_CONTEXT", "64");
 
     EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&llama, /*num_seqs=*/2, /*n_past=*/63));
 }
 
-TEST(DecodeGraphCachePolicyTest, AutoModeKeepsShortSingleDecodeOnStandardPath) {
+TEST(DecodeGraphCachePolicyTest, PagedDecodeAllowsShortSingleDecode) {
     const TransformerModel llama = MakeDecodeModel(false);
-    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
-    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
-    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "auto");
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", "128");
     ScopedEnvOverride min_batch_ctx_env("DENSECORE_PAGED_DECODE_MIN_BATCH_CONTEXT", "64");
 
-    EXPECT_FALSE(ShouldUsePagedDecodeAttentionForTestBatch(&llama, /*num_seqs=*/1, /*n_past=*/63));
+    EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&llama, /*num_seqs=*/1, /*n_past=*/63));
 }
 
 TEST(DecodeGraphCachePolicyTest, Qwen36SingleDecodeTopologyIsCacheStableWithoutForcedPagedDecode) {
@@ -381,11 +360,35 @@ TEST(DecodeGraphCachePolicyTest, Qwen36SingleDecodeTopologyIsCacheStableWithoutF
     cache.cache_type = GGML_TYPE_F16;
     cache.max_blocks = 8;
 
-    ScopedEnvOverride force_env("DENSECORE_FORCE_PAGED_DECODE", nullptr);
-    ScopedEnvOverride legacy_env("DENSECORE_ENABLE_PAGED_ATTN_DECODE", nullptr);
-    ScopedEnvOverride mode_env("DENSECORE_PAGED_ATTN_DECODE_MODE", "auto");
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", "128");
     ScopedEnvOverride min_batch_ctx_env("DENSECORE_PAGED_DECODE_MIN_BATCH_CONTEXT", "64");
 
     EXPECT_TRUE(IsStablePagedDecodeTopologyForCache(&qwen36, &cache, batch));
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen35SingleDecodeTopologyUsesAttentionWeightHeadDims) {
+    ggml_init_params params{};
+    params.mem_size = 1 << 20;
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    TransformerModel qwen35 = MakeQwen35HybridDecodeModel();
+    qwen35.hparams.n_embd = 128;
+    qwen35.hparams.n_head_kv = 2;
+    qwen35.hparams.n_embd_head_k = 16;
+    qwen35.layers.resize(1);
+    qwen35.layers[0].Set(model_keys::kAttnQWeight, NewTensor2D(ctx, 128, 256));
+    qwen35.layers[0].Set(model_keys::kAttnKWeight, NewTensor2D(ctx, 128, 16));
+
+    const BatchSpec batch = MakeDecodeOnlyBatch(/*num_seqs=*/1, /*n_past=*/63);
+    PagedKVCache cache{};
+    cache.cache_type = GGML_TYPE_F16;
+    cache.max_blocks = 8;
+
+    ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", "128");
+    ScopedEnvOverride min_batch_ctx_env("DENSECORE_PAGED_DECODE_MIN_BATCH_CONTEXT", "64");
+
+    EXPECT_TRUE(IsStablePagedDecodeTopologyForCache(&qwen35, &cache, batch));
+
+    ggml_free(ctx);
 }

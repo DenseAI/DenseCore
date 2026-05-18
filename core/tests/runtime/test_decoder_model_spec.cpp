@@ -185,7 +185,7 @@ TEST(DecoderModelSpec, Qwen36GroupedMetadataStillUsesLlamaCppSoftmaxRouter) {
     EXPECT_EQ(spec.layers[0].ffn.router, densecore::models::DecoderMoERouter::SoftmaxTopK);
 }
 
-TEST(DecoderModelSpec, PrefillLastLogitsPolicyUsesExplicitRuntimePolicy) {
+TEST(DecoderModelSpec, QwenPrefillLastLogitsPolicyDefaultsOnForQwen35AndQwen36) {
     TransformerModel qwen35{};
     qwen35.arch = ModelArch::QWEN35;
     qwen35.variant = ModelVariant::QWEN35;
@@ -195,16 +195,10 @@ TEST(DecoderModelSpec, PrefillLastLogitsPolicyUsesExplicitRuntimePolicy) {
     const auto qwen35_spec = densecore::models::BuildDecoderModelSpec(&qwen35);
     EXPECT_EQ(qwen35_spec.runtime_topology, densecore::models::DecoderRuntimeTopology::DenseAttention);
     EXPECT_EQ(qwen35_spec.output.prefill_logits_policy,
-              densecore::models::DecoderPrefillLogitsPolicy::LastTokenEnvOptIn);
+              densecore::models::DecoderPrefillLogitsPolicy::LastTokenEnvDefaultOn);
     EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
         qwen35_spec, densecore::models::DecoderSpecializationKind::PrefillLastLogits));
-    EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen35_spec, /*num_seqs=*/1, /*n_tokens=*/8));
-
-    densecore::models::DecoderPrefillRuntimePolicy opt_in_policy =
-        densecore::models::DefaultDecoderPrefillRuntimePolicy();
-    opt_in_policy.qwen35_prefill_last_logits_only = true;
-    EXPECT_TRUE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen35_spec, /*num_seqs=*/1, /*n_tokens=*/8,
-                                                                  opt_in_policy));
+    EXPECT_TRUE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen35_spec, /*num_seqs=*/1, /*n_tokens=*/8));
 
     TransformerModel qwen36{};
     qwen36.arch = ModelArch::QWEN35;
@@ -225,6 +219,5 @@ TEST(DecoderModelSpec, PrefillLastLogitsPolicyUsesExplicitRuntimePolicy) {
     opt_out_policy.qwen36_prefill_last_logits_only = false;
     EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen36_spec, /*num_seqs=*/1, /*n_tokens=*/8,
                                                                    opt_out_policy));
-    EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen36_spec, /*num_seqs=*/2, /*n_tokens=*/8,
-                                                                   opt_in_policy));
+    EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen36_spec, /*num_seqs=*/2, /*n_tokens=*/8));
 }

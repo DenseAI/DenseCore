@@ -411,10 +411,6 @@ if(DENSECORE_USE_SPDLOG)
     FetchContent_MakeAvailable(spdlog)
 endif()
 
-# ==========================================================================
-# oneDNN (optional)
-# ==========================================================================
-option(DENSECORE_USE_ONEDNN "Enable oneDNN matmul backend" OFF)
 option(DENSECORE_DEFAULT_INT4_SINGLE_THREADING_LAYER "Default to GGML-only threading for INT4 custom op" ON)
 option(DENSECORE_DEFAULT_PREFILL_FLASH_MASK_REUSE "Default to prefill flash-mask reuse across layers" ON)
 option(DENSECORE_DEFAULT_PRECOMPUTED_ROPE "Default to precomputed RoPE table custom-op path" ON)
@@ -489,21 +485,6 @@ if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     endif()
 endif()
 
-set(DENSECORE_ONEDNN_LIB "")
-if(DENSECORE_USE_ONEDNN)
-    find_package(dnnl QUIET)
-    if(NOT dnnl_FOUND)
-        find_package(DNNL QUIET)
-    endif()
-    if(dnnl_FOUND)
-        set(DENSECORE_ONEDNN_LIB dnnl)
-    elseif(DNNL_FOUND)
-        set(DENSECORE_ONEDNN_LIB DNNL::dnnl)
-    else()
-        message(FATAL_ERROR "DENSECORE_USE_ONEDNN=ON but oneDNN (dnnl) not found")
-    endif()
-endif()
-
 # Source files (DenseCore specific only)
 set(SOURCES
     src/runtime/engine.cpp
@@ -551,7 +532,6 @@ set(SOURCES
     src/models/qwen35_ssm_math.cpp
     src/backend/matmul_backend.cpp
     src/backend/matmul_backend_densecore.cpp
-    src/backend/matmul_backend_onednn.cpp
     # Kernels (optimized SIMD implementations)
 
     src/runtime/memory/kv_cache_encoder.cpp
@@ -711,10 +691,6 @@ target_link_libraries(densecore PRIVATE ggml hwy)
 if(TARGET simdjson)
     target_link_libraries(densecore PRIVATE simdjson)
 endif()
-if(DENSECORE_USE_ONEDNN)
-    target_link_libraries(densecore PRIVATE ${DENSECORE_ONEDNN_LIB})
-    target_compile_definitions(densecore PRIVATE DENSECORE_USE_ONEDNN)
-endif()
 
 if(DENSECORE_USE_MIMALLOC)
     target_link_libraries(densecore PRIVATE mimalloc-static)
@@ -770,23 +746,6 @@ target_compile_options(densecore PRIVATE
 # ==========================================================================
 # Tests and Benchmarks (optional)
 # ==========================================================================
-
-# Helper function to create oneDNN-linked executables
-function(add_densecore_onednn_executable TARGET_NAME SOURCE_FILE)
-    add_executable(${TARGET_NAME} ${SOURCE_FILE})
-    target_link_libraries(${TARGET_NAME} PRIVATE densecore ggml ${DENSECORE_ONEDNN_LIB})
-    target_include_directories(${TARGET_NAME} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_BINARY_DIR}/include
-        ${GGML_DIR}/include
-    )
-endfunction()
-
-
-
-if(DENSECORE_BUILD_BENCHMARKS AND DENSECORE_USE_ONEDNN)
-    add_densecore_onednn_executable(densecore_onednn_matmul_bench ../benchmarks/onednn_matmul_bench.cpp)
-endif()
 
 if(DENSECORE_BUILD_BENCHMARKS)
     add_executable(alloc_bench ../benchmarks/alloc_bench.cpp)

@@ -16,7 +16,7 @@ extern struct ggml_tensor* SmartMulMatTest(struct ggml_context* ctx, struct ggml
                                            struct ggml_tensor* input, TransformerModel* model);
 extern bool ShouldUsePrefillLastLogitsOnlyForTest(const TransformerModel* model, int num_seqs, int n_tokens);
 extern int ResolveQuantBatchedTileColsForTest(int requested_cols, int vec_dot_nrows, bool allow_true_batched_q4k);
-extern bool ResolveQ4KTrueBatchedKernelPolicyForTest(int mode, int simd_level, bool compiled_with_sve);
+extern bool ResolveQ4KTrueBatchedKernelPolicyForTest(int simd_level, bool compiled_with_sve);
 }  // namespace testing
 namespace llm::attention::testing {
 extern void ResetSharedPrefillFlashMaskBuildsForTest();
@@ -436,17 +436,18 @@ TEST(AttentionPolicyTest, QuantTileKeepsRequestedWidthWhenTrueBatchedPathExists)
 }
 
 TEST(AttentionPolicyTest, Q4KTrueBatchedAutoPolicy) {
-    using densecore::env::RuntimeToggleMode;
     using densecore::simd::SimdLevel;
 
-    EXPECT_FALSE(densecore::testing::ResolveQ4KTrueBatchedKernelPolicyForTest(
-        static_cast<int>(RuntimeToggleMode::Auto), static_cast<int>(SimdLevel::AVX2), /*compiled_with_sve=*/false));
     EXPECT_TRUE(densecore::testing::ResolveQ4KTrueBatchedKernelPolicyForTest(
-        static_cast<int>(RuntimeToggleMode::Auto), static_cast<int>(SimdLevel::SVE2), /*compiled_with_sve=*/true));
+        static_cast<int>(SimdLevel::AVX2), /*compiled_with_sve=*/false));
     EXPECT_TRUE(densecore::testing::ResolveQ4KTrueBatchedKernelPolicyForTest(
-        static_cast<int>(RuntimeToggleMode::On), static_cast<int>(SimdLevel::AVX2), /*compiled_with_sve=*/false));
+        static_cast<int>(SimdLevel::AVX512), /*compiled_with_sve=*/false));
+    EXPECT_TRUE(densecore::testing::ResolveQ4KTrueBatchedKernelPolicyForTest(
+        static_cast<int>(SimdLevel::AMX), /*compiled_with_sve=*/false));
+    EXPECT_TRUE(densecore::testing::ResolveQ4KTrueBatchedKernelPolicyForTest(
+        static_cast<int>(SimdLevel::SVE2), /*compiled_with_sve=*/true));
     EXPECT_FALSE(densecore::testing::ResolveQ4KTrueBatchedKernelPolicyForTest(
-        static_cast<int>(RuntimeToggleMode::Off), static_cast<int>(SimdLevel::SVE2), /*compiled_with_sve=*/true));
+        static_cast<int>(SimdLevel::NEON), /*compiled_with_sve=*/false));
 }
 
 TEST(AttentionPolicyTest, SharedPrefillFlashMaskBuildsOnlyWhenNativeFlashPathRuns) {

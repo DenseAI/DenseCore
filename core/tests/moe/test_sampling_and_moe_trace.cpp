@@ -26,8 +26,11 @@ bool RouteMoEGemma4TopKForTest(const struct ggml_tensor* gate_logits, const Tran
 namespace {
 
 float GeluTanhApproxTest(float x) {
-    const float x3 = x * x * x;
-    return 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x3)));
+    const ggml_fp16_t fp16 = ggml_fp32_to_fp16(x);
+    const float rounded = ggml_fp16_to_fp32(fp16);
+    const float x3 = rounded * rounded * rounded;
+    const float y = 0.5f * rounded * (1.0f + std::tanh(0.7978845608028654f * (rounded + 0.044715f * x3)));
+    return ggml_fp16_to_fp32(ggml_fp32_to_fp16(y));
 }
 
 float ReadTensorF32(const ggml_tensor* tensor, int64_t row, int64_t col) {

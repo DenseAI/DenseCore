@@ -141,6 +141,49 @@ TEST(SchedulerArchitecture, DoesNotMixPrefillAndDecodeInSingleStep) {
     EXPECT_TRUE(mixed_check.prefill_seq_ids.empty());
 }
 
+TEST(SchedulerArchitecture, PrefixCacheHitRequiresExplicitPrefixTokens) {
+    BlockManager block_manager(/*num_blocks=*/256, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, MakeTestConfig());
+
+    std::vector<int> prefix(BLOCK_SIZE);
+    std::vector<int> full_prompt(2 * BLOCK_SIZE);
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        prefix[i] = 10 + i;
+        full_prompt[i] = prefix[i];
+        full_prompt[BLOCK_SIZE + i] = 100 + i;
+    }
+
+    const int block_id = block_manager.AllocateSingle();
+    ASSERT_GE(block_id, 0);
+    const uint64_t hash = BlockManager::ComputeTokenHash(prefix.data(), BLOCK_SIZE);
+    block_manager.RegisterPrefixBlockWithTokens(block_id, hash, prefix.data(), BLOCK_SIZE);
+
+    const int no_cache_seq = scheduler.AddRequest(/*request_id=*/1, static_cast<int>(full_prompt.size()),
+                                                  /*max_output_len=*/8, /*priority=*/0,
+                                                  /*prefix_tokens=*/nullptr,
+                                                  /*allow_chunked_prefill=*/true,
+                                                  /*require_hybrid_ssm_prefix_snapshot=*/false);
+    ASSERT_GE(no_cache_seq, 0);
+    SchedulerOutput no_cache = scheduler.Schedule();
+    EXPECT_TRUE(no_cache.prefix_cache_hits.empty());
+    scheduler.RemoveRequest(no_cache_seq, /*free_blocks=*/true);
+
+    const int cache_seq = scheduler.AddRequest(/*request_id=*/2, static_cast<int>(full_prompt.size()),
+                                               /*max_output_len=*/8, /*priority=*/0, &full_prompt,
+                                               /*allow_chunked_prefill=*/true,
+                                               /*require_hybrid_ssm_prefix_snapshot=*/false);
+    ASSERT_GE(cache_seq, 0);
+    SchedulerOutput with_cache = scheduler.Schedule();
+    ASSERT_EQ(with_cache.prefix_cache_hits.size(), 1u);
+    EXPECT_EQ(with_cache.prefix_cache_hits[0].seq_id, cache_seq);
+    EXPECT_EQ(with_cache.prefix_cache_hits[0].cached_tokens, BLOCK_SIZE);
+    ASSERT_EQ(with_cache.prefix_cache_hits[0].cached_block_ids.size(), 1u);
+    EXPECT_EQ(with_cache.prefix_cache_hits[0].cached_block_ids[0], block_id);
+    scheduler.RemoveRequest(cache_seq, /*free_blocks=*/true);
+
+    block_manager.FreeSingle(block_id);
+}
+
 TEST(SchedulerArchitecture, MoEClusteringIsOptInByDefault) {
     SchedulerConfig cfg;
     EXPECT_FALSE(cfg.enable_moe_clustering);

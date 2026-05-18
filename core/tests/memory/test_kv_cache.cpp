@@ -486,6 +486,53 @@ TEST_F(BlockManagerTest, PrefixCachingWithVerification) {
     EXPECT_EQ(manager->GetRefCount(block_id), 0);  // Now fully freed
 }
 
+TEST_F(BlockManagerTest, PrefixCachingProgressivelyExtendsFullPromptBlocks) {
+    std::vector<int> prompt_a(BLOCK_SIZE);
+    std::vector<int> prompt_b(BLOCK_SIZE);
+    std::vector<int> prompt_c(BLOCK_SIZE);
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        prompt_a[i] = 100 + i;
+        prompt_b[i] = 200 + i;
+        prompt_c[i] = 300 + i;
+    }
+
+    std::vector<int> prompt_ab;
+    prompt_ab.insert(prompt_ab.end(), prompt_a.begin(), prompt_a.end());
+    prompt_ab.insert(prompt_ab.end(), prompt_b.begin(), prompt_b.end());
+    std::vector<int> prompt_abc = prompt_ab;
+    prompt_abc.insert(prompt_abc.end(), prompt_c.begin(), prompt_c.end());
+
+    const int block_a = manager->AllocateSingle();
+    ASSERT_GE(block_a, 0);
+    const uint64_t hash_a = BlockManager::ComputeTokenHash(prompt_a.data(), BLOCK_SIZE);
+    manager->RegisterPrefixBlockWithTokens(block_a, hash_a, prompt_a.data(), BLOCK_SIZE);
+
+    auto hit_a =
+        manager->FindLongestCachedPrefixWithVerification(prompt_ab.data(), static_cast<int>(prompt_ab.size()),
+                                                         /*require_hybrid_ssm_snapshot=*/false);
+    EXPECT_EQ(hit_a.cached_tokens, BLOCK_SIZE);
+    ASSERT_EQ(hit_a.cached_block_ids.size(), 1u);
+    EXPECT_EQ(hit_a.cached_block_ids[0], block_a);
+
+    const int block_b = manager->AllocateSingle();
+    ASSERT_GE(block_b, 0);
+    const uint64_t hash_b = BlockManager::ComputeTokenHash(prompt_ab.data() + BLOCK_SIZE, BLOCK_SIZE);
+    manager->RegisterPrefixBlockWithTokens(block_b, hash_b, prompt_ab.data() + BLOCK_SIZE, BLOCK_SIZE);
+
+    auto hit_ab =
+        manager->FindLongestCachedPrefixWithVerification(prompt_abc.data(), static_cast<int>(prompt_abc.size()),
+                                                         /*require_hybrid_ssm_snapshot=*/false);
+    EXPECT_EQ(hit_ab.cached_tokens, 2 * BLOCK_SIZE);
+    ASSERT_EQ(hit_ab.cached_block_ids.size(), 2u);
+    EXPECT_EQ(hit_ab.cached_block_ids[0], block_a);
+    EXPECT_EQ(hit_ab.cached_block_ids[1], block_b);
+
+    manager->Free(hit_a.cached_block_ids);
+    manager->Free(hit_ab.cached_block_ids);
+    manager->FreeSingle(block_a);
+    manager->FreeSingle(block_b);
+}
+
 // =============================================================================
 // BLOCK_SIZE constant test
 // =============================================================================

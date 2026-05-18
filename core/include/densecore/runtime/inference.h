@@ -107,14 +107,6 @@ struct InferenceConfig {
     int prefill_threads = 0;  // Prefill phase thread count override (0 = auto)
     bool enable_split_thread_policy = true;
 
-    // oneDNN matmul offload (prefill-only)
-    bool enable_onednn = false;
-    int onednn_pack_m = 128;
-    int onednn_min_m = 4;
-    int onednn_min_n = 256;
-    int onednn_min_k = 256;
-    int64_t onednn_min_mnk = 2000000;
-
     // Singleton instance
     static InferenceConfig& Instance() {
         static InferenceConfig config;
@@ -259,6 +251,7 @@ struct Qwen36ProfileSnapshot {
 InferenceWorkContext* CreateInferenceWorkContext();
 void DestroyInferenceWorkContext(InferenceWorkContext* ctx);
 void ResetInferenceWorkContext(InferenceWorkContext* ctx);
+void ResetCachedDecodeGraphWorkContext(InferenceWorkContext* ctx);
 void SetCurrentWorkContext(InferenceWorkContext* ctx);
 InferenceWorkContext* GetCurrentWorkContext();
 bool IsQwen36ProfilingEnabled();
@@ -425,7 +418,7 @@ Gemma4MoEBranchInputsSnapshot ComputeGemma4MoEBranchInputsForTest(const std::vec
 // Internal Ops Exposed for Graph Builders
 // ============================================================================
 
-// Smart matrix multiplication (dispatches to GEMV, oneDNN, or GEMM)
+// Smart matrix multiplication (dispatches to GEMV or GEMM)
 GgmlTensorHandle* smart_mul_mat(GgmlContextHandle* ctx, GgmlTensorHandle* weight, GgmlTensorHandle* input,
                                 TransformerModel* model);
 inline GgmlTensorHandle* smart_mul_mat(GgmlContextHandle* ctx, GgmlTensorHandle* weight, GgmlTensorHandle* input) {

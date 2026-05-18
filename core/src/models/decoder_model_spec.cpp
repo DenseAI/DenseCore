@@ -61,7 +61,7 @@ DecoderPrefillLogitsPolicy ResolvePrefillLogitsPolicy(const TransformerModel* mo
         return DecoderPrefillLogitsPolicy::FullSequence;
     }
     if (model->variant == ModelVariant::QWEN35) {
-        return DecoderPrefillLogitsPolicy::LastTokenEnvOptIn;
+        return DecoderPrefillLogitsPolicy::LastTokenEnvDefaultOn;
     }
     if (model->variant == ModelVariant::QWEN36) {
         return DecoderPrefillLogitsPolicy::LastTokenEnvDefaultOn;

@@ -147,7 +147,7 @@ struct DecoderModelSpec {
 };
 
 struct DecoderPrefillRuntimePolicy {
-    bool qwen35_prefill_last_logits_only = false;
+    bool qwen35_prefill_last_logits_only = true;
     bool qwen36_prefill_last_logits_only = true;
 };
 

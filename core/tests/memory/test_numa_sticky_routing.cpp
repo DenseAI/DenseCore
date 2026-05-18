@@ -32,6 +32,7 @@
 #include "densecore/runtime/inference.h"
 #include "densecore/models/model_types.h"
 #include "densecore/moe/profiler.h"
+#include "densecore/simd/simd_ops.h"
 
 using namespace densecore;
 using namespace densecore::moe;
@@ -1498,7 +1499,6 @@ TEST(NumaStickyRouting, GgmlQ4KRawBatchedMoEProjectionMatchesVecDotReference) {
     }
     DenseMatMulTransBReference(input.data(), weight_deq.data(), reference.data(), M, K, N);
 
-    EnvGuard raw_batched("DENSECORE_MOE_ENABLE_Q4K_RAW_BATCHED_SCALAR", "1");
     ASSERT_TRUE(densecore::testing::RunGgmlQuantizedProjectionForTest(
         &backend, weight_q4k.data(), static_cast<int>(qtype), input_tensor, &output_tensor, N, K));
 
@@ -1613,7 +1613,6 @@ TEST(NumaStickyRouting, GgmlQ4KRepackedPrefillGemmProjectionMatchesDenseReferenc
     }
     DenseMatMulTransBReference(input.data(), weight_deq.data(), reference.data(), M, K, N);
 
-    EnvGuard repacked_prefill("DENSECORE_MOE_ENABLE_Q4K_REPACKED_PREFILL", "1");
     ASSERT_TRUE(densecore::testing::RunGgmlQuantizedProjectionForTest(
         &backend, weight_q4k.data(), static_cast<int>(qtype), input_tensor, &output_tensor, N, K));
 
@@ -1651,7 +1650,6 @@ TEST(NumaStickyRouting, GgmlQ4KRawBatchedFusedSwiGLUMatchesSeparateVecDotReferen
     Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
     Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
 
-    EnvGuard stale_paired_env("DENSECORE_MOE_ENABLE_Q4K_PAIRED_VEC_DOT", "1");
     {
         const auto* traits = ggml_get_type_traits(qtype);
         ASSERT_NE(traits, nullptr);
@@ -1674,7 +1672,6 @@ TEST(NumaStickyRouting, GgmlQ4KRawBatchedFusedSwiGLUMatchesSeparateVecDotReferen
             reference[i] = (gate / (1.0f + std::exp(-gate))) * up_ref[i];
         }
     }
-    EnvGuard raw_batched("DENSECORE_MOE_ENABLE_Q4K_RAW_BATCHED_SCALAR", "1");
     ASSERT_TRUE(densecore::testing::RunGgmlQuantizedFusedSwiGLUProjectionForTest(
         &backend, gate_q4k.data(), static_cast<int>(qtype), up_q4k.data(), static_cast<int>(qtype), input_tensor,
         &output_tensor, N, K));
@@ -1734,7 +1731,6 @@ TEST(NumaStickyRouting, GgmlQ4KRepackedPrefillGemmFusedSwiGLUMatchesDenseReferen
         reference[i] = (gate / (1.0f + std::exp(-gate))) * up_ref[i];
     }
 
-    EnvGuard repacked_prefill("DENSECORE_MOE_ENABLE_Q4K_REPACKED_PREFILL", "1");
     ASSERT_TRUE(densecore::testing::RunGgmlQuantizedFusedSwiGLUProjectionForTest(
         &backend, gate_q4k.data(), static_cast<int>(qtype), up_q4k.data(), static_cast<int>(qtype), input_tensor,
         &output_tensor, N, K));
@@ -1772,7 +1768,6 @@ TEST(NumaStickyRouting, GgmlQ4KMultiRowFusedGEGLUStaysOffSwiGLUSpecificPath) {
     Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
     Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
 
-    EnvGuard paired("DENSECORE_MOE_ENABLE_Q4K_PAIRED_VEC_DOT", "1");
     EXPECT_FALSE(densecore::testing::RunGgmlQuantizedFusedSwiGLUProjectionForTest(
         &backend, gate_q4k.data(), static_cast<int>(qtype), up_q4k.data(), static_cast<int>(qtype), input_tensor,
         &output_tensor, N, K, /*use_gelu_activation=*/true));
@@ -1840,8 +1835,9 @@ TEST(NumaStickyRouting, GgmlQ4KRawBatchedFusedGEGLUMatchesDenseReference) {
 }
 
 TEST(NumaStickyRouting, GgmlQ4KSingleRowFusedGEGLUMatchesDenseReference) {
-#if !((defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_MATMUL_INT8))
-    GTEST_SKIP() << "Q4_K single-row fused GEGLU uses the ARM rowpair vec-dot path";
+#if !((defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_MATMUL_INT8)) && \
+    !(defined(__x86_64__) || defined(_M_X64))
+    GTEST_SKIP() << "Q4_K single-row fused GEGLU requires an ARM rowpair or x86 repacked path";
 #else
     CpuBackend& backend = GetCpuBackend();
     constexpr int M = 1;
@@ -1999,9 +1995,10 @@ TEST(NumaStickyRouting, ForwardMoEQwen36A3BLikePackedInt4AvoidsF32FallbackOnArm)
     constexpr int intermediate_dim = 512;
     constexpr int group_size = 32;
 
-    EnvGuard direct_hwy("DENSECORE_MOE_ARM_ENABLE_DIRECT_HWY", "0");
-    EnvGuard fused_hwy("DENSECORE_MOE_ARM_ENABLE_FUSED_SWIGLU", "0");
     EnvGuard matmul_trace("DENSECORE_DEBUG_MOE_MATMUL_PATHS", "1");
+    const densecore::simd::SimdLevel simd_level = densecore::simd::DetectSimdLevel();
+    const bool expect_hwy =
+        simd_level == densecore::simd::SimdLevel::SVE || simd_level == densecore::simd::SimdLevel::SVE2;
 
     for (int batch = 1; batch <= 4; ++batch) {
         std::vector<float> input(static_cast<size_t>(batch * hidden_dim), 0.0f);
@@ -2046,10 +2043,16 @@ TEST(NumaStickyRouting, ForwardMoEQwen36A3BLikePackedInt4AvoidsF32FallbackOnArm)
         backend.ForwardMoE(input_tensor, routing, experts, &output_tensor);
         const std::string stderr_output = ::testing::internal::GetCapturedStderr();
 
-        EXPECT_NE(stderr_output.find("path=backend_gemmint4"), std::string::npos) << "batch=" << batch;
         EXPECT_EQ(stderr_output.find("path=dense_f32"), std::string::npos) << "batch=" << batch;
         EXPECT_EQ(stderr_output.find("path=reference_f32"), std::string::npos) << "batch=" << batch;
-        EXPECT_EQ(stderr_output.find("path=direct_hwy"), std::string::npos) << "batch=" << batch;
+        if (expect_hwy) {
+            EXPECT_NE(stderr_output.find("path=fused_swiglu_hwy"), std::string::npos) << "batch=" << batch;
+            EXPECT_NE(stderr_output.find("path=direct_hwy"), std::string::npos) << "batch=" << batch;
+            EXPECT_EQ(stderr_output.find("path=backend_gemmint4"), std::string::npos) << "batch=" << batch;
+        } else {
+            EXPECT_NE(stderr_output.find("path=backend_gemmint4"), std::string::npos) << "batch=" << batch;
+            EXPECT_EQ(stderr_output.find("path=direct_hwy"), std::string::npos) << "batch=" << batch;
+        }
     }
 }
 #endif

@@ -26,6 +26,7 @@ TransformerModel::~TransformerModel() {
 
     // Standard GGML cleanup
     if (ctx_cpu_kleidiai) ggml_free(ctx_cpu_kleidiai);
+    if (ctx_cpu_amx) ggml_free(ctx_cpu_amx);
     if (ctx_cpu_repack) ggml_free(ctx_cpu_repack);
     if (ctx_views) ggml_free(ctx_views);
     if (ctx_w) ggml_free(ctx_w);

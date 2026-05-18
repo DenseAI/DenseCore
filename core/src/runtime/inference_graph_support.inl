@@ -47,7 +47,6 @@ bool ShouldRunMoESharedDenseBranch(const TransformerModel* model, const densecor
 
 using densecore::env::ParseIntEnv;
 using densecore::env::ParsePositiveEnvInt;
-using densecore::env::ParseRuntimeToggleMode;
 using densecore::env::ParseTruthyEnv;
 using densecore::env::RuntimeToggleMode;
 using densecore::llm::config::DecodePagedAttentionMode;
@@ -67,6 +66,7 @@ constexpr const char* kGemma4PackedDownExpertsWeightKey = "ffn_down_exps.weight"
 constexpr const char* kGemma4PackedDownExpertsKey = "ffn_down_exps";
 constexpr const char* kGemma4PackedDownExpertsScaleKey = "ffn_down_exps.scale";
 std::atomic<uint64_t> g_moe_graph_wiring_debug_counter{0};
+constexpr int64_t kQwen36C4AmxGraphMaxTokens = 128;
 
 bool ShouldUsePrefillLastLogitsOnly(const TransformerModel* model, const BatchSpec& batch, int n_tokens) {
     return densecore::llm::decoder::ShouldUsePrefillLastLogitsOnly(model, batch, n_tokens);
@@ -145,6 +145,270 @@ ggml_tensor* UseCpuRepackAliasIfAvailable(TransformerModel* model, ggml_tensor* 
     }
     auto it = model->cpu_repack_aliases.find(tensor);
     return it == model->cpu_repack_aliases.end() ? tensor : it->second;
+}
+
+ggml_tensor* UseCpuRepackAliasForTokenCount(TransformerModel* model, ggml_tensor* tensor, int64_t n_tokens) {
+    if (!model || !tensor) {
+        return tensor;
+    }
+    auto it = model->cpu_repack_aliases.find(tensor);
+    if (it == model->cpu_repack_aliases.end() || !it->second) {
+        return tensor;
+    }
+    if (model->variant == ModelVariant::QWEN36 && n_tokens > 0 && n_tokens <= kQwen36C4AmxGraphMaxTokens &&
+        model->cpu_amx_aliases.find(it->second) != model->cpu_amx_aliases.end()) {
+        return tensor;
+    }
+    return it->second;
+}
+
+void cb_moe_expert_weighted_sum_with_weights(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    (void)userdata;
+    if (!dst || !dst->src[0] || !dst->src[1] || !dst->data || !dst->src[0]->data || !dst->src[1]->data || nth <= 0) {
+        return;
+    }
+    const ggml_tensor* experts = dst->src[0];
+    const ggml_tensor* weights = dst->src[1];
+    if (dst->type != GGML_TYPE_F32 || experts->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 ||
+        experts->ne[0] != dst->ne[0] || experts->ne[2] != dst->ne[1] || experts->ne[1] <= 0 ||
+        weights->ne[0] != 1 || weights->ne[1] != experts->ne[1] || weights->ne[2] != experts->ne[2]) {
+        return;
+    }
+
+    const int64_t n_embd = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+    const int64_t n_expert_used = experts->ne[1];
+    const int64_t total = n_embd * n_tokens;
+    const int64_t start = (total * ith) / nth;
+    const int64_t end = (total * (ith + 1)) / nth;
+
+    const char* src_base = static_cast<const char*>(experts->data);
+    const char* weight_base = static_cast<const char*>(weights->data);
+    char* dst_base = static_cast<char*>(dst->data);
+    const size_t dense_expert_stride = static_cast<size_t>(n_embd) * sizeof(float);
+    const bool dense_strides =
+        experts->nb[0] == static_cast<int64_t>(sizeof(float)) &&
+        experts->nb[1] == dense_expert_stride &&
+        weights->nb[0] == static_cast<int64_t>(sizeof(float)) &&
+        dst->nb[0] == static_cast<int64_t>(sizeof(float));
+    if (dense_strides) {
+        int64_t idx = start;
+        while (idx < end) {
+            const int64_t tok = idx / n_embd;
+            const int64_t embd0 = idx - tok * n_embd;
+            const int64_t embd1 = std::min<int64_t>(n_embd, end - tok * n_embd);
+            const int64_t count = embd1 - embd0;
+            const float w0 =
+                *reinterpret_cast<const float*>(weight_base + tok * weights->nb[2]);
+            const float* src0 = reinterpret_cast<const float*>(src_base + tok * experts->nb[2] + embd0 * experts->nb[0]);
+            float* dst_ptr = reinterpret_cast<float*>(dst_base + tok * dst->nb[1] + embd0 * dst->nb[0]);
+            if (n_expert_used == 8) {
+                const float* src1 = reinterpret_cast<const float*>(
+                    src_base + tok * experts->nb[2] + experts->nb[1] + embd0 * experts->nb[0]);
+                const float* src2 = reinterpret_cast<const float*>(
+                    src_base + tok * experts->nb[2] + 2 * experts->nb[1] + embd0 * experts->nb[0]);
+                const float* src3 = reinterpret_cast<const float*>(
+                    src_base + tok * experts->nb[2] + 3 * experts->nb[1] + embd0 * experts->nb[0]);
+                const float* src4 = reinterpret_cast<const float*>(
+                    src_base + tok * experts->nb[2] + 4 * experts->nb[1] + embd0 * experts->nb[0]);
+                const float* src5 = reinterpret_cast<const float*>(
+                    src_base + tok * experts->nb[2] + 5 * experts->nb[1] + embd0 * experts->nb[0]);
+                const float* src6 = reinterpret_cast<const float*>(
+                    src_base + tok * experts->nb[2] + 6 * experts->nb[1] + embd0 * experts->nb[0]);
+                const float* src7 = reinterpret_cast<const float*>(
+                    src_base + tok * experts->nb[2] + 7 * experts->nb[1] + embd0 * experts->nb[0]);
+                const float w1 =
+                    *reinterpret_cast<const float*>(weight_base + tok * weights->nb[2] + weights->nb[1]);
+                const float w2 =
+                    *reinterpret_cast<const float*>(weight_base + tok * weights->nb[2] + 2 * weights->nb[1]);
+                const float w3 =
+                    *reinterpret_cast<const float*>(weight_base + tok * weights->nb[2] + 3 * weights->nb[1]);
+                const float w4 =
+                    *reinterpret_cast<const float*>(weight_base + tok * weights->nb[2] + 4 * weights->nb[1]);
+                const float w5 =
+                    *reinterpret_cast<const float*>(weight_base + tok * weights->nb[2] + 5 * weights->nb[1]);
+                const float w6 =
+                    *reinterpret_cast<const float*>(weight_base + tok * weights->nb[2] + 6 * weights->nb[1]);
+                const float w7 =
+                    *reinterpret_cast<const float*>(weight_base + tok * weights->nb[2] + 7 * weights->nb[1]);
+                for (int64_t i = 0; i < count; ++i) {
+                    float sum = src0[i] * w0;
+                    sum += src1[i] * w1;
+                    sum += src2[i] * w2;
+                    sum += src3[i] * w3;
+                    sum += src4[i] * w4;
+                    sum += src5[i] * w5;
+                    sum += src6[i] * w6;
+                    sum += src7[i] * w7;
+                    dst_ptr[i] = sum;
+                }
+                idx += count;
+                continue;
+            }
+            for (int64_t i = 0; i < count; ++i) {
+                dst_ptr[i] = src0[i] * w0;
+            }
+            for (int64_t expert = 1; expert < n_expert_used; ++expert) {
+                const float weight = *reinterpret_cast<const float*>(
+                    weight_base + tok * weights->nb[2] + expert * weights->nb[1]);
+                const float* src_ptr = reinterpret_cast<const float*>(
+                    src_base + tok * experts->nb[2] + expert * experts->nb[1] + embd0 * experts->nb[0]);
+                for (int64_t i = 0; i < count; ++i) {
+                    dst_ptr[i] += src_ptr[i] * weight;
+                }
+            }
+            idx += count;
+        }
+        return;
+    }
+
+    for (int64_t idx = start; idx < end; ++idx) {
+        const int64_t embd = idx % n_embd;
+        const int64_t tok = idx / n_embd;
+        float sum = 0.0f;
+        for (int64_t expert = 0; expert < n_expert_used; ++expert) {
+            const char* src_ptr = src_base + embd * experts->nb[0] + expert * experts->nb[1] + tok * experts->nb[2];
+            const char* weight_ptr = weight_base + expert * weights->nb[1] + tok * weights->nb[2];
+            const float weighted = *reinterpret_cast<const float*>(src_ptr) * *reinterpret_cast<const float*>(weight_ptr);
+            sum += weighted;
+        }
+        char* dst_ptr = dst_base + embd * dst->nb[0] + tok * dst->nb[1];
+        *reinterpret_cast<float*>(dst_ptr) = sum;
+    }
+}
+
+ggml_tensor* BuildMoeExpertWeightedSumWithWeights(struct ggml_context* ctx, ggml_tensor* experts, ggml_tensor* weights,
+                                                  int64_t n_embd, int64_t n_tokens, const char* name) {
+    if (!ctx || !experts || !weights || experts->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 ||
+        n_embd <= 0 || n_tokens <= 0 || experts->ne[0] != n_embd || experts->ne[2] != n_tokens ||
+        experts->ne[1] <= 0 || weights->ne[0] != 1 || weights->ne[1] != experts->ne[1] ||
+        weights->ne[2] != n_tokens) {
+        return nullptr;
+    }
+    ggml_tensor* args[] = {experts, weights};
+    ggml_tensor* out = ggml_custom_4d(ctx, GGML_TYPE_F32, n_embd, n_tokens, 1, 1, args, 2,
+                                      cb_moe_expert_weighted_sum_with_weights, GGML_N_TASKS_MAX, nullptr);
+    ggml_set_name(out, name);
+    return out;
+}
+
+void cb_moe_topk_weights_from_logits(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    (void)userdata;
+    if (!dst || !dst->src[0] || !dst->src[1] || !dst->data || !dst->src[0]->data || !dst->src[1]->data || nth <= 0) {
+        return;
+    }
+    const ggml_tensor* logits = dst->src[0];
+    const ggml_tensor* selected = dst->src[1];
+    if (dst->type != GGML_TYPE_F32 || logits->type != GGML_TYPE_F32 || selected->type != GGML_TYPE_I32 ||
+        logits->ne[0] <= 0 || logits->ne[1] <= 0 || selected->ne[0] <= 0 || selected->ne[1] != logits->ne[1] ||
+        dst->ne[0] != 1 || dst->ne[1] != selected->ne[0] || dst->ne[2] != logits->ne[1]) {
+        return;
+    }
+
+    const int64_t n_experts = logits->ne[0];
+    const int64_t n_tokens = logits->ne[1];
+    const int64_t top_k = selected->ne[0];
+    const int64_t start = (n_tokens * ith) / nth;
+    const int64_t end = (n_tokens * (ith + 1)) / nth;
+    const char* logits_base = static_cast<const char*>(logits->data);
+    const char* selected_base = static_cast<const char*>(selected->data);
+    char* dst_base = static_cast<char*>(dst->data);
+
+    for (int64_t tok = start; tok < end; ++tok) {
+        float max_logit = -INFINITY;
+        for (int64_t k = 0; k < top_k; ++k) {
+            const int32_t expert =
+                *reinterpret_cast<const int32_t*>(selected_base + k * selected->nb[0] + tok * selected->nb[1]);
+            if (expert >= 0 && expert < n_experts) {
+                const float logit =
+                    *reinterpret_cast<const float*>(logits_base + expert * logits->nb[0] + tok * logits->nb[1]);
+                max_logit = std::max(max_logit, logit);
+            }
+        }
+        if (!std::isfinite(max_logit)) {
+            max_logit = 0.0f;
+        }
+
+        float denom = 0.0f;
+        for (int64_t k = 0; k < top_k; ++k) {
+            const int32_t expert =
+                *reinterpret_cast<const int32_t*>(selected_base + k * selected->nb[0] + tok * selected->nb[1]);
+            if (expert >= 0 && expert < n_experts) {
+                const float logit =
+                    *reinterpret_cast<const float*>(logits_base + expert * logits->nb[0] + tok * logits->nb[1]);
+                denom += std::exp(logit - max_logit);
+            }
+        }
+        denom = std::max(denom, 6.103515625e-5f);
+
+        for (int64_t k = 0; k < top_k; ++k) {
+            const int32_t expert =
+                *reinterpret_cast<const int32_t*>(selected_base + k * selected->nb[0] + tok * selected->nb[1]);
+            float value = 0.0f;
+            if (expert >= 0 && expert < n_experts) {
+                const float logit =
+                    *reinterpret_cast<const float*>(logits_base + expert * logits->nb[0] + tok * logits->nb[1]);
+                value = std::exp(logit - max_logit) / denom;
+            }
+            *reinterpret_cast<float*>(dst_base + k * dst->nb[1] + tok * dst->nb[2]) = value;
+        }
+    }
+}
+
+ggml_tensor* BuildMoETopKWeightsFromLogits(struct ggml_context* ctx, ggml_tensor* logits, ggml_tensor* selected,
+                                           const char* name) {
+    if (!ctx || !logits || !selected || logits->type != GGML_TYPE_F32 || selected->type != GGML_TYPE_I32 ||
+        logits->ne[0] <= 0 || logits->ne[1] <= 0 || selected->ne[0] <= 0 || selected->ne[1] != logits->ne[1]) {
+        return nullptr;
+    }
+    const int n_tasks = static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(GGML_N_TASKS_MAX, logits->ne[1])));
+    ggml_tensor* args[] = {logits, selected};
+    ggml_tensor* out =
+        ggml_custom_4d(ctx, GGML_TYPE_F32, 1, selected->ne[0], logits->ne[1], 1, args, 2,
+                       cb_moe_topk_weights_from_logits, n_tasks, nullptr);
+    ggml_set_name(out, name);
+    return out;
+}
+
+void cb_fused_gate_up_silu_mul(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    (void)userdata;
+    if (!dst || !dst->src[0] || !dst->data || !dst->src[0]->data || nth <= 0) {
+        return;
+    }
+    const ggml_tensor* gate_up = dst->src[0];
+    if (dst->type != GGML_TYPE_F32 || gate_up->type != GGML_TYPE_F32 ||
+        dst->nb[0] != static_cast<int64_t>(sizeof(float)) ||
+        gate_up->nb[0] != static_cast<int64_t>(sizeof(float)) || gate_up->ne[0] != 2 * dst->ne[0] ||
+        gate_up->ne[1] != dst->ne[1]) {
+        return;
+    }
+
+    const int64_t n_ff = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+    const char* src_base = static_cast<const char*>(gate_up->data);
+    char* dst_base = static_cast<char*>(dst->data);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        const float* gate =
+            reinterpret_cast<const float*>(src_base + static_cast<size_t>(token) * static_cast<size_t>(gate_up->nb[1]));
+        const float* up = gate + n_ff;
+        float* out =
+            reinterpret_cast<float*>(dst_base + static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
+        densecore::simd::SiLUMulParallel(out, gate, up, static_cast<size_t>(n_ff), ith, nth);
+    }
+}
+
+ggml_tensor* BuildFusedGateUpSiluMul(struct ggml_context* ctx, ggml_tensor* gate_up, int64_t n_ff, int64_t n_tokens,
+                                    const char* name) {
+    if (!ctx || !gate_up || gate_up->type != GGML_TYPE_F32 || n_ff <= 0 || n_tokens <= 0 ||
+        gate_up->ne[0] != 2 * n_ff || gate_up->ne[1] != n_tokens ||
+        gate_up->nb[0] != static_cast<int64_t>(sizeof(float))) {
+        return nullptr;
+    }
+    ggml_tensor* args[] = {gate_up};
+    ggml_tensor* out = ggml_custom_4d(ctx, GGML_TYPE_F32, n_ff, n_tokens, 1, 1, args, 1,
+                                      cb_fused_gate_up_silu_mul, GGML_N_TASKS_MAX, nullptr);
+    ggml_set_name(out, name);
+    return out;
 }
 
 ggml_tensor* BuildGemma4PackedGateOrUp3DView(ggml_context* ctx, const Gemma4PackedMoERoots& roots,
@@ -335,19 +599,22 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     if (layer_spec && layer_spec->ffn.router != densecore::models::DecoderMoERouter::SoftmaxTopK) {
         return nullptr;
     }
-
     ggml_tensor* gate_exps = GetLayerTensorAny(layer, {"ffn_gate_exps.weight", "ffn_gate_exps"});
     ggml_tensor* up_exps = GetLayerTensorAny(layer, {"ffn_up_exps.weight", "ffn_up_exps"});
     ggml_tensor* down_exps = GetLayerTensorAny(layer, {"ffn_down_exps.weight", "ffn_down_exps"});
+    ggml_tensor* gate_up_exps = GetLayerTensorAny(layer, {"ffn_gate_up_exps.cpu_repack_fused"});
     if (!gate_exps || !up_exps || !down_exps) {
         return nullptr;
     }
 
-    gate_exps = UseCpuRepackAliasIfAvailable(model, gate_exps);
-    up_exps = UseCpuRepackAliasIfAvailable(model, up_exps);
-    down_exps = UseCpuRepackAliasIfAvailable(model, down_exps);
-
     const int64_t n_tokens = routed_input->ne[1];
+    gate_exps = UseCpuRepackAliasForTokenCount(model, gate_exps, n_tokens);
+    up_exps = UseCpuRepackAliasForTokenCount(model, up_exps, n_tokens);
+    down_exps = UseCpuRepackAliasForTokenCount(model, down_exps, n_tokens);
+    if (gate_up_exps) {
+        gate_up_exps = UseCpuRepackAliasForTokenCount(model, gate_up_exps, n_tokens);
+    }
+
     const int64_t n_embd = routed_input->ne[0];
     const int64_t n_experts = gate_logits->ne[0];
     const int64_t n_expert_used = std::max<int64_t>(1, std::min<int64_t>(top_k, n_experts));
@@ -371,56 +638,64 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         }
         return nullptr;
     }
+    const bool use_fused_gate_up =
+        gate_up_exps && gate_up_exps->type == gate_exps->type && gate_up_exps->ne[0] == gate_exps->ne[0] &&
+        gate_up_exps->ne[1] == gate_exps->ne[1] + up_exps->ne[1] && gate_up_exps->ne[2] == n_experts;
 
-    ggml_tensor* probs = ggml_soft_max(ctx, gate_logits);
-    ggml_set_name(probs, "qwen35_native_moe_probs");
-    ggml_tensor* selected_experts = ggml_argsort_top_k(ctx, probs, static_cast<int>(n_expert_used));
+    ggml_tensor* selected_experts = ggml_argsort_top_k(ctx, gate_logits, static_cast<int>(n_expert_used));
     ggml_set_name(selected_experts, "qwen35_native_moe_topk");
     ggml_build_forward_expand(gf, selected_experts);
 
-    probs = ggml_reshape_3d(ctx, probs, 1, n_experts, n_tokens);
-    ggml_tensor* weights = ggml_get_rows(ctx, probs, selected_experts);
-    ggml_set_name(weights, "qwen35_native_moe_weights");
+    ggml_tensor* weights = nullptr;
     if (model->moe_norm_topk_prob) {
-        weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
-        ggml_tensor* weight_sum = ggml_sum_rows(ctx, weights);
-        weight_sum = ggml_clamp(ctx, weight_sum, 6.103515625e-5f, INFINITY);
-        weights = ggml_div(ctx, weights, weight_sum);
-        weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+        weights = BuildMoETopKWeightsFromLogits(ctx, gate_logits, selected_experts, "qwen35_native_moe_norm_weights");
+        if (!weights) {
+            return nullptr;
+        }
+        if (model->moe_routed_scaling_factor != 0.0f && model->moe_routed_scaling_factor != 1.0f) {
+            weights = ggml_scale(ctx, weights, model->moe_routed_scaling_factor);
+            ggml_set_name(weights, "qwen35_native_moe_scaled_weights");
+        }
+    } else {
+        ggml_tensor* probs = ggml_soft_max(ctx, gate_logits);
+        ggml_set_name(probs, "qwen35_native_moe_probs");
+        probs = ggml_reshape_3d(ctx, probs, 1, n_experts, n_tokens);
+        weights = ggml_get_rows(ctx, probs, selected_experts);
+        ggml_set_name(weights, "qwen35_native_moe_weights");
+        if (model->moe_routed_scaling_factor != 0.0f && model->moe_routed_scaling_factor != 1.0f) {
+            weights = ggml_scale(ctx, weights, model->moe_routed_scaling_factor);
+        }
     }
-    if (model->moe_routed_scaling_factor != 0.0f && model->moe_routed_scaling_factor != 1.0f) {
-        weights = ggml_scale(ctx, weights, model->moe_routed_scaling_factor);
-    }
-    ggml_set_name(weights, "qwen35_native_moe_norm_weights");
     ggml_build_forward_expand(gf, weights);
 
     ggml_tensor* cur3 = ggml_reshape_3d(ctx, routed_input, n_embd, 1, n_tokens);
-    ggml_tensor* gate = ggml_mul_mat_id(ctx, gate_exps, cur3, selected_experts);
-    ggml_set_name(gate, "qwen35_native_moe_gate");
-    ggml_tensor* up = ggml_mul_mat_id(ctx, up_exps, cur3, selected_experts);
-    ggml_set_name(up, "qwen35_native_moe_up");
-    ggml_tensor* hidden = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+    ggml_tensor* gate = nullptr;
+    ggml_tensor* up = nullptr;
+    if (use_fused_gate_up) {
+        ggml_tensor* gate_up = ggml_mul_mat_id(ctx, gate_up_exps, cur3, selected_experts);
+        ggml_set_name(gate_up, "qwen35_native_moe_gate_up");
+        gate = ggml_view_3d(ctx, gate_up, gate_exps->ne[1], n_expert_used, n_tokens, gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_set_name(gate, "qwen35_native_moe_gate");
+        up = ggml_view_3d(ctx, gate_up, up_exps->ne[1], n_expert_used, n_tokens, gate_up->nb[1], gate_up->nb[2],
+                          static_cast<size_t>(gate_exps->ne[1]) * static_cast<size_t>(gate_up->nb[0]));
+        ggml_set_name(up, "qwen35_native_moe_up");
+    } else {
+        gate = ggml_mul_mat_id(ctx, gate_exps, cur3, selected_experts);
+        ggml_set_name(gate, "qwen35_native_moe_gate");
+        up = ggml_mul_mat_id(ctx, up_exps, cur3, selected_experts);
+        ggml_set_name(up, "qwen35_native_moe_up");
+    }
+    ggml_tensor* hidden = ggml_swiglu_split(ctx, gate, up);
     ggml_set_name(hidden, "qwen35_native_moe_swiglu");
     ggml_tensor* experts = ggml_mul_mat_id(ctx, down_exps, hidden, selected_experts);
-    experts = ggml_mul(ctx, experts, weights);
-    ggml_set_name(experts, "qwen35_native_moe_weighted_down");
+    ggml_set_name(experts, "qwen35_native_moe_down");
 
-    ggml_tensor* expert_views[32] = {nullptr};
-    if (n_expert_used > static_cast<int64_t>(std::size(expert_views))) {
+    ggml_tensor* out =
+        BuildMoeExpertWeightedSumWithWeights(ctx, experts, weights, n_embd, n_tokens, "qwen35_native_moe_expert_sum");
+    if (!out) {
         return nullptr;
     }
-    for (int64_t i = 0; i < n_expert_used; ++i) {
-        expert_views[i] = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2],
-                                       static_cast<size_t>(i) * static_cast<size_t>(experts->nb[1]));
-        ggml_build_forward_expand(gf, expert_views[i]);
-    }
-    ggml_tensor* out = expert_views[0];
-    for (int64_t i = 1; i < n_expert_used; ++i) {
-        out = ggml_add(ctx, out, expert_views[i]);
-    }
-    if (n_expert_used == 1) {
-        out = ggml_cont(ctx, out);
-    }
+    ggml_build_forward_expand(gf, out);
     char name[80];
     std::snprintf(name, sizeof(name), "blk.%d.qwen35_native_moe_out", layer_idx);
     ggml_set_name(out, name);
@@ -796,118 +1071,10 @@ static bool ShouldUseArmNativeQ4KVecDotValidated(ggml_type weight_type, const gg
 }
 
 
-static bool IsCustomGemvDisabled() {
-    static const bool disabled = []() {
-        const char* legacy_env = std::getenv("DENSECORE_DISABLE_CUSTOM_GEMV");
-        if (legacy_env && legacy_env[0] != '\0') {
-            return std::strcmp(legacy_env, "0") != 0;
-        }
+static bool ResolveQ4KTrueBatchedKernelEnabledPolicy(densecore::simd::SimdLevel level, bool compiled_with_sve);
 
-        const char* mode_env = std::getenv("DENSECORE_CUSTOM_GEMV_MODE");
-        if (mode_env && mode_env[0] != '\0') {
-            std::string mode(mode_env);
-            for (char& c : mode) {
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            }
-            if (mode == "on" || mode == "1" || mode == "true" || mode == "force") {
-                return false;
-            }
-            if (mode == "off" || mode == "0" || mode == "false") {
-                return true;
-            }
-        }
-
-        // Auto mode: keep custom GEMV enabled unless architecture-specific
-        // logic in smart_mul_mat selects native GGML GEMV for better throughput.
-        return false;
-    }();
-    return disabled;
-}
-
-static bool IsPackedInt4CustomDisabled() {
-    static const bool disabled = []() {
-        const char* env = std::getenv("DENSECORE_DISABLE_PACKED_INT4_CUSTOM");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return disabled;
-}
-
-// Legacy opt-in (kept for backward compat, but batched quant is now always-on by default)
-static bool IsSmallBatchQuantGemmEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_SMALL_BATCH_GEMV_QUANT");
-        if (!env || env[0] == '\0') {
-            return true;
-        }
-        if (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 || std::strcmp(env, "FALSE") == 0 ||
-            std::strcmp(env, "off") == 0 || std::strcmp(env, "OFF") == 0 || std::strcmp(env, "no") == 0 ||
-            std::strcmp(env, "NO") == 0) {
-            return false;
-        }
-        return true;
-    }();
-    return enabled;
-}
-
-// Primary opt-out: DENSECORE_DISABLE_BATCHED_QUANT=1 disables the shared-quant nrc=M fast path.
-// Batched quant is ON by default for all quant weights with M>=2.
-static bool IsBatchedQuantDisabled() {
-    static const bool disabled = []() {
-        const char* env = std::getenv("DENSECORE_DISABLE_BATCHED_QUANT");
-        if (env && env[0] != '\0' && std::strcmp(env, "0") != 0) {
-            return true;
-        }
-        // Honor legacy env as well
-        return !IsSmallBatchQuantGemmEnabled();
-    }();
-    return disabled;
-}
-
-// ARM small-batch quantized matmul policy.
-// Default to the DenseCore batched path on ARM and keep an opt-out for
-// diagnostics. Falling back to generic GGML on this model family was both
-// slower and numerically unstable on real prefill traffic.
-static bool IsArmBatchedQuantSafeByDefault() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    static const bool enabled = []() {
-        const char* disable_env = std::getenv("DENSECORE_ARM_DISABLE_BATCHED_QUANT");
-        if (disable_env && disable_env[0] != '\0' && std::strcmp(disable_env, "0") != 0) {
-            return false;
-        }
-        const char* enable_env = std::getenv("DENSECORE_ARM_ENABLE_BATCHED_QUANT");
-        if (enable_env && enable_env[0] != '\0') {
-            return std::strcmp(enable_env, "0") != 0;
-        }
-        return true;
-    }();
-    return enabled;
-#else
-    return true;
-#endif
-}
-
-// Enable nrc-batched quant path by default and rely on per-type runtime checks
-// (vec_dot nrows >= M) before dispatching to the fast path.
-// DENSECORE_ENABLE_QUANT_NRC_BATCH=0 can be used to force-disable it.
-static bool IsQuantNrcBatchEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_ENABLE_QUANT_NRC_BATCH");
-        if (env && env[0] != '\0') {
-            return std::strcmp(env, "0") != 0;
-        }
-        return true;
-    }();
-    return enabled;
-}
-
-static bool ResolveQ4KTrueBatchedKernelEnabledPolicy(RuntimeToggleMode mode, densecore::simd::SimdLevel level,
-                                                     bool compiled_with_sve);
-
-// Deprecated path: keep disabled until a correctness/perf-positive
-// implementation is available.
 static bool IsQ4KTrueBatchedKernelEnabled() {
     return ResolveQ4KTrueBatchedKernelEnabledPolicy(
-        ParseRuntimeToggleMode("DENSECORE_ENABLE_Q4K_TRUE_BATCHED", RuntimeToggleMode::Auto),
         densecore::simd::DetectSimdLevel(),
 #if defined(__ARM_FEATURE_SVE)
         true
@@ -917,26 +1084,16 @@ static bool IsQ4KTrueBatchedKernelEnabled() {
     );
 }
 
-static bool ResolveQ4KTrueBatchedKernelEnabledPolicy(RuntimeToggleMode mode, densecore::simd::SimdLevel level,
-                                                     bool compiled_with_sve) {
-    if (mode == RuntimeToggleMode::Off) {
-        return false;
-    }
-    if (mode == RuntimeToggleMode::On) {
+static bool ResolveQ4KTrueBatchedKernelEnabledPolicy(densecore::simd::SimdLevel level, bool compiled_with_sve) {
+    if (compiled_with_sve && (level == densecore::simd::SimdLevel::SVE || level == densecore::simd::SimdLevel::SVE2)) {
         return true;
     }
-    return compiled_with_sve && (level == densecore::simd::SimdLevel::SVE || level == densecore::simd::SimdLevel::SVE2);
-}
-
-static bool IsQ4KTrueBatchedAvx2Enabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_ENABLE_Q4K_BATCHED_AVX2");
-        if (!env || env[0] == '\0') {
-            return true;
-        }
-        return std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
+#if defined(__AVX2__) || defined(__AVX512F__) || defined(DENSECORE_X86)
+    return level == densecore::simd::SimdLevel::AVX2 || level == densecore::simd::SimdLevel::AVX512 ||
+           level == densecore::simd::SimdLevel::AMX;
+#else
+    return false;
+#endif
 }
 
 static inline void SpinPause(int spin_count) {
@@ -1038,16 +1195,8 @@ static densecore::simd::SimdLevel GetRuntimeSimdLevel() {
     return level;
 }
 
-static DecodePagedAttentionMode ParseDecodePagedAttentionMode() {
-    return densecore::llm::config::LoadDecodePagedAttentionMode();
-}
-
 static const DecodePagedAttentionPolicy& ResolveDecodePagedAttentionPolicy(const BatchSpec* batch = nullptr) {
     return ResolveFastPathRuntimeConfig(batch).decode_paged_attention;
-}
-
-bool IsPagedDecodeModeAlwaysOnImpl() {
-    return ParseDecodePagedAttentionMode() == DecodePagedAttentionMode::On;
 }
 
 struct DecodeContextSummary {
@@ -1056,11 +1205,6 @@ struct DecodeContextSummary {
     int avg_context = 0;
     bool valid = false;
 };
-
-[[maybe_unused]] static bool IsBatchedPagedDecodeEnabled() {
-    static const bool enabled = ParseTruthyEnv("DENSECORE_ENABLE_BATCHED_PAGED_DECODE", false);
-    return enabled;
-}
 
 bool IsDecodeOnlyBatchLayoutImpl(const BatchSpec& batch, int n_tokens_in_batch) {
     if (n_tokens_in_batch <= 0) {
@@ -1173,36 +1317,7 @@ static bool IsFlashAttentionDisabled() {
         return true;
     }
 #endif
-    static const bool disabled = []() {
-        if (ParseRuntimeToggleMode("DENSECORE_FLASH_ATTN_MODE", RuntimeToggleMode::Auto) == RuntimeToggleMode::Off) {
-            return true;
-        }
-        const char* legacy_env = std::getenv("DENSECORE_DISABLE_FLASH_ATTN");
-        return legacy_env && legacy_env[0] != '\0' && std::strcmp(legacy_env, "0") != 0;
-    }();
-    return disabled;
-}
-
-static bool IsPagedAttentionHwyEnabled() {
-    static const bool enabled = []() {
-        const char* legacy_env = std::getenv("DENSECORE_PAGED_ATTN_USE_HWY");
-        if (legacy_env && legacy_env[0] != '\0') {
-            return std::strcmp(legacy_env, "0") != 0;
-        }
-
-        const RuntimeToggleMode mode = ParseRuntimeToggleMode("DENSECORE_PAGED_ATTN_HWY_MODE", RuntimeToggleMode::Auto);
-        if (mode == RuntimeToggleMode::On) {
-            return true;
-        }
-        if (mode == RuntimeToggleMode::Off) {
-            return false;
-        }
-
-        // Auto mode: use Highway on SIMD-capable hosts and scalar on true
-        // scalar-only CPUs.
-        return GetRuntimeSimdLevel() != densecore::simd::SimdLevel::NONE;
-    }();
-    return enabled;
+    return false;
 }
 
 static bool IsDebugPagedAttentionReferenceEnabled() {
@@ -1730,84 +1845,17 @@ static bool IsForceSafeGqaDecodeEnabled() {
     return enabled;
 }
 
-static bool IsFlashAttentionForced() {
-    static const bool forced = []() { return ParseTruthyEnv("DENSECORE_FORCE_FLASH_ATTN", false); }();
-    return forced;
-}
-
 static bool IsFlashAttentionIsaSupported() {
     static const bool supported = []() { return densecore::simd::HasX86Avx512OrBetter(GetRuntimeSimdLevel()); }();
     return supported;
 }
 
-static bool IsPortableCpuFlashAttentionEnabled() {
-    static const bool enabled = []() {
-        const RuntimeToggleMode mode =
-            ParseRuntimeToggleMode("DENSECORE_PORTABLE_FLASH_ATTN_MODE", RuntimeToggleMode::Auto);
-        if (mode == RuntimeToggleMode::On) {
-            return true;
-        }
-        if (mode == RuntimeToggleMode::Off) {
-            return false;
-        }
-        // Auto mode: enable portable flash attention on all platforms.
-        // The prior ARM correctness issue was caused by K/V tensors not being
-        // registered in the GGML graph's src[] dependency chain, which meant
-        // their ggml_cont ops were never executed during graph compute.
-        return true;
-    }();
-    return enabled;
-}
-
-static bool IsInt4SingleThreadingLayerEnabled() {
-    static const bool enabled = []() {
-        const char* legacy = std::getenv("DENSECORE_INT4_USE_BACKEND_THREADPOOL");
-        if (legacy && legacy[0] != '\0') {
-            return std::strcmp(legacy, "0") == 0;
-        }
-        const RuntimeToggleMode mode = ParseRuntimeToggleMode(
-            "DENSECORE_INT4_THREADING_MODE",
-            DENSECORE_DEFAULT_INT4_SINGLE_THREADING_LAYER ? RuntimeToggleMode::On : RuntimeToggleMode::Off);
-        return mode != RuntimeToggleMode::Off;
-    }();
-    return enabled;
-}
-
-static bool IsPrecomputedRoPEEnabled() {
-    static const bool enabled = []() {
-        const RuntimeToggleMode mode =
-            ParseRuntimeToggleMode("DENSECORE_ROPE_PRECOMPUTED_MODE",
-                                   DENSECORE_DEFAULT_PRECOMPUTED_ROPE ? RuntimeToggleMode::On : RuntimeToggleMode::Off);
-        return mode != RuntimeToggleMode::Off;
-    }();
-    return enabled;
-}
-
-static bool IsFusedResidualRmsNormEnabled() {
-    static const bool enabled = []() {
-        const RuntimeToggleMode mode = ParseRuntimeToggleMode(
-            "DENSECORE_FUSED_RESIDUAL_RMSNORM_MODE",
-            DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM ? RuntimeToggleMode::On : RuntimeToggleMode::Off);
-        return mode != RuntimeToggleMode::Off;
-    }();
-    return enabled;
-}
-
 static bool IsFusedQKVEnabled() {
-    static const bool enabled = []() {
-        const RuntimeToggleMode mode = ParseRuntimeToggleMode(
-            "DENSECORE_FUSED_QKV_MODE", DENSECORE_DEFAULT_FUSED_QKV ? RuntimeToggleMode::Auto : RuntimeToggleMode::Off);
-        if (mode == RuntimeToggleMode::On) {
-            return true;
-        }
-        if (mode == RuntimeToggleMode::Off) {
-            return false;
-        }
-
-        const densecore::simd::SimdLevel simd = GetRuntimeSimdLevel();
-        return densecore::simd::HasX86Avx2OrBetter(simd) || densecore::simd::IsArmFamily(simd);
-    }();
-    return enabled;
+    if (DENSECORE_DEFAULT_FUSED_QKV == 0) {
+        return false;
+    }
+    const densecore::simd::SimdLevel simd = GetRuntimeSimdLevel();
+    return densecore::simd::HasX86Avx2OrBetter(simd) || densecore::simd::IsArmFamily(simd);
 }
 }  // namespace
 
@@ -1822,7 +1870,7 @@ bool IsPagedDecodeCandidate(const PagedKVCache* cache, const BatchSpec& batch, i
 }
 
 bool IsPagedDecodeModeAlwaysOn() {
-    return IsPagedDecodeModeAlwaysOnImpl();
+    return true;
 }
 
 DecodeRuntimeStatsSnapshot GetDecodeRuntimeStatsSnapshot() {
@@ -2392,16 +2440,6 @@ struct SSMConv1DUserData {
     const int* token_seq_ids = nullptr;
     const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
     Qwen36ProfileCounters* profile = nullptr;
-};
-
-struct SSMAlphaBetaProjectUserData {
-    const float* alpha_weight = nullptr;
-    const float* beta_weight = nullptr;
-    const float* dt_bias = nullptr;
-    int n_embd = 0;
-    int n_heads = 0;
-    int layer_idx = -1;
-    const int* token_seq_ids = nullptr;
 };
 
 struct ProjectionReferenceUserData {

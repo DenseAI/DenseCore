@@ -280,6 +280,8 @@ void AppendQwenAssistantGenerationCue(const TransformerModel* model, bool thinki
     }
     if (thinking_enabled) {
         out->append("<think>\n");
+    } else if (descriptor.variant == ModelVariant::QWEN35) {
+        out->append("<think>\n\n</think>\n\n");
     }
 }
 
@@ -369,6 +371,9 @@ PromptTemplateProfile ResolveModelPromptTemplateProfile(const TransformerModel* 
 void ConfigureQwenReasoningTokenBlocklistForModel(const TransformerModel* model, Request* req) {
     if (!model || !req) return;
     req->disallowed_token_ids.clear();
+    if (req->in_think_block) {
+        return;
+    }
     if (!ShouldSuppressQwenReasoningTags(model)) {
         return;
     }

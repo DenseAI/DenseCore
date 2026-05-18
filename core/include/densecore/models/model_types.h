@@ -613,15 +613,6 @@ struct TransformerModel {
     std::vector<float> rope_cos_sin;
     int rope_head_dim = 0;  // Head dim used for RoPE table
 
-    // oneDNN packed weight metadata (prepacked at load time)
-    struct OneDnnWeightMeta {
-        const struct ggml_tensor* weight = nullptr;
-        densecore::DType dtype = densecore::DType::UNKNOWN;
-        int64_t k = 0;
-        int64_t n = 0;
-    };
-    std::vector<OneDnnWeightMeta> onednn_weights;
-
     // DenseCore custom INT4 format bindings loaded from GGUF metadata.
     struct Int4WeightBinding {
         const struct ggml_tensor* packed = nullptr;  // Packed INT4 bytes
@@ -637,9 +628,12 @@ struct TransformerModel {
     // GGUF weights in backend-owned repacked buffers while preserving the raw
     // GGUF tensors for loader metadata, fallback paths, and parity probes.
     struct ggml_context* ctx_cpu_repack = nullptr;
+    struct ggml_context* ctx_cpu_amx = nullptr;
     struct ggml_context* ctx_cpu_kleidiai = nullptr;
     std::vector<ggml_backend_buffer_t> cpu_repack_buffers;
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_repack_aliases;
+    std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_decode_repack_aliases;
+    std::unordered_map<const struct ggml_tensor*, bool> cpu_amx_aliases;
 
     // FP8 format variants for custom packed INT8 tensor storage.
     enum class FP8Format : uint8_t {

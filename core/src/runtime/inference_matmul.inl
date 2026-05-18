@@ -26,6 +26,7 @@ struct Q8RepackedGemvKeyHash {
 };
 
 constexpr int kQ8RepackedGemvMinOutputRows = 4096;
+constexpr int64_t kQwen36C4AmxSmartMatmulMaxTokens = 128;
 
 static bool IsGemma4SharedDenseFfnWeightName(const char* weight_name) {
     if (!weight_name) {
@@ -36,7 +37,7 @@ static bool IsGemma4SharedDenseFfnWeightName(const char* weight_name) {
 }
 
 static bool IsQ8RepackedGemvEnabled() {
-    static const bool enabled = []() {
+    static const bool enabled = []() -> bool {
         const char* env = std::getenv("DENSECORE_DISABLE_Q8_REPACKED_GEMV");
         if (env && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
             std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0) {
@@ -139,7 +140,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
 
     const ggml_type weight_type = weight_tensor->type;
     const char* weight_name = weight_tensor->name[0] ? weight_tensor->name : "(unnamed)";
-    const bool debug_gemv_timing = []() {
+    static const bool debug_gemv_timing = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_GEMV_TIMING");
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
@@ -197,10 +198,19 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                     } else {
                         int spin_count = 0;
                         while (ud->quantized_stamp->load(std::memory_order_acquire) != expected_stamp) {
+                            if (spin_count >= 4096) {
+                                alignas(64) thread_local std::vector<uint8_t> quant_input_tls;
+                                quant_input_tls.resize(quant_input_size);
+                                input_type_traits->from_float(x_f32, quant_input_tls.data(), static_cast<int64_t>(N));
+                                quant_input = quant_input_tls.data();
+                                break;
+                            }
                             SpinPause(spin_count++);
                         }
-                        quant_input = ud->quant_input_shared;
-                        used_shared_quant_buffer = true;
+                        if (!quant_input) {
+                            quant_input = ud->quant_input_shared;
+                            used_shared_quant_buffer = true;
+                        }
                     }
                 }
             }
@@ -722,8 +732,7 @@ static inline bool ComputeQ4KQ8KBatchedRow(const void* weight_row, const uint8_t
     }();
     static std::atomic<bool> logged_avx2{false};
     static std::atomic<bool> logged_scalar{false};
-    if (IsQ4KTrueBatchedAvx2Enabled() &&
-        ComputeQ4KQ8KBatchedRowAvx2(weight_row, quant_input_base, quant_row_stride, M, N, out_sums)) {
+    if (ComputeQ4KQ8KBatchedRowAvx2(weight_row, quant_input_base, quant_row_stride, M, N, out_sums)) {
         if (debug_q4k_path) {
             bool expected = false;
             if (logged_avx2.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
@@ -908,6 +917,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 const size_t quant_total_size = quant_row_stride * static_cast<size_t>(tile_m);
                 const bool use_shared_quant_buffer = can_sync_on_stamp && tile_start == 0;
                 const uint8_t* quant_input_base = nullptr;
+                bool used_local_quant_buffer = false;
 
                 if (use_shared_quant_buffer) {
                     if (ith == 0) {
@@ -920,11 +930,22 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     } else {
                         int spin_count = 0;
                         while (ud->quantized_stamp->load(std::memory_order_acquire) != expected_stamp) {
+                            if (spin_count >= 4096) {
+                                quant_inputs_tls.resize(quant_total_size);
+                                for (int m = 0; m < tile_m; ++m) {
+                                    uint8_t* q_ptr =
+                                        quant_inputs_tls.data() + static_cast<size_t>(m) * quant_row_stride;
+                                    input_type_traits->from_float(x_rows[static_cast<size_t>(tile_start + m)], q_ptr,
+                                                                  static_cast<int64_t>(N));
+                                }
+                                used_local_quant_buffer = true;
+                                break;
+                            }
                             SpinPause(spin_count++);
                         }
                     }
-                    quant_input_base = ud->quant_input_shared;
-                    if (ith == 0 && !logged_quant_reuse) {
+                    quant_input_base = used_local_quant_buffer ? quant_inputs_tls.data() : ud->quant_input_shared;
+                    if (quant_input_base == ud->quant_input_shared && ith == 0 && !logged_quant_reuse) {
                         RecordSharedQuantReuse(true);
                         logged_quant_reuse = true;
                     }
@@ -1615,7 +1636,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         return;
     }
 
-    const bool use_hwy = IsPagedAttentionHwyEnabled();
+    const bool use_hwy = GetRuntimeSimdLevel() != densecore::simd::SimdLevel::NONE;
     const float scale =
         ud->attention_scale > 0.0f ? ud->attention_scale : (1.0f / std::sqrt(static_cast<float>(ud->head_dim)));
     const char* q_base = reinterpret_cast<const char*>(q_tensor->data);
@@ -2386,7 +2407,7 @@ struct ggml_tensor* ggml_paged_attention_decode(struct ggml_context* ctx, struct
     n_tasks = std::max(1, std::min(n_tasks, total_tiles));
     // Scalar fallback remains correctness-first, but we keep the same token/head
     // tiling to preserve parallelism on non-Highway hosts.
-    if (!token_parallel && !IsPagedAttentionHwyEnabled()) {
+    if (!token_parallel && GetRuntimeSimdLevel() == densecore::simd::SimdLevel::NONE) {
         const int scalar_tasks = ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_SCALAR_TASKS", n_tasks);
         n_tasks = std::max(1, std::min(scalar_tasks, total_tiles));
     }
@@ -2406,109 +2427,6 @@ struct ggml_tensor* ggml_paged_attention_decode(struct ggml_context* ctx, struct
     } params = {cb_paged_attention_decode, n_tasks, userdata};
     static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "params too large");
     std::memcpy(result->op_params, &params, sizeof(params));
-
-    return result;
-}
-
-// ============================================================================
-// oneDNN MatMul Custom Op (Prefill-only acceleration)
-// ============================================================================
-
-struct MatmulOpData {
-    densecore::MatmulBackendKind backend;
-    densecore::DType a_type;
-    densecore::DType b_type;
-    densecore::DType c_type;
-    bool convert_a_f32_to_bf16 = false;
-};
-
-struct MatmulCustomParams {
-    ggml_custom_op_t fun;
-    int n_tasks;
-    void* userdata;
-    MatmulOpData data;
-};
-
-// GgmlTypeToDType is now defined in densecore/runtime/dtype_utils.h
-
-void cb_matmul_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
-    (void)userdata;
-    if (ith != 0 || nth <= 0) {
-        return;
-    }
-
-    const auto* params = reinterpret_cast<const MatmulCustomParams*>(dst->op_params);
-    if (!params || !dst || !dst->src[0] || !dst->src[1]) return;
-    const MatmulOpData& ud = params->data;
-
-    const struct ggml_tensor* input = dst->src[0];
-    const struct ggml_tensor* weight = dst->src[1];
-    if (!input->data || !weight->data || !dst->data) return;
-
-    const int64_t M = input->ne[1];
-    const int64_t K = input->ne[0];
-    const int64_t N = weight->ne[1];
-
-    const int64_t lda = input->nb[1] / ggml_type_size(input->type);
-    const int64_t ldb = weight->nb[1] / ggml_type_size(weight->type);
-    const int64_t ldc = dst->nb[1] / ggml_type_size(dst->type);
-
-    densecore::MatmulParams matmul_params;
-    const void* a_ptr = input->data;
-    InferenceWorkContext* work_ctx = GetCurrentWorkContext();
-    if (!work_ctx) {
-        throw densecore::InvalidArgumentException("cb_matmul_custom called without active InferenceWorkContext");
-    }
-    std::vector<ggml_bf16_t>& bf16_buffer = work_ctx->bf16_buffer;
-    bool used_bf16_buffer = false;
-    if (ud.convert_a_f32_to_bf16 && input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_BF16 && M > 1) {
-        const size_t total = static_cast<size_t>(M * K);
-        if (bf16_buffer.size() < total) {
-            bf16_buffer.resize(total);
-        }
-        for (int64_t m = 0; m < M; ++m) {
-            const float* src =
-                reinterpret_cast<const float*>(reinterpret_cast<const char*>(input->data) + m * input->nb[1]);
-            ggml_fp32_to_bf16_row(src, bf16_buffer.data() + m * K, K);
-        }
-        a_ptr = bf16_buffer.data();
-        used_bf16_buffer = true;
-    }
-    matmul_params.a = a_ptr;
-    matmul_params.b = weight->data;
-    matmul_params.c = dst->data;
-    matmul_params.M = M;
-    matmul_params.N = N;
-    matmul_params.K = K;
-    matmul_params.lda = used_bf16_buffer ? K : lda;
-    matmul_params.ldb = ldb;
-    matmul_params.ldc = ldc;
-    matmul_params.trans_b = true;
-    matmul_params.a_type = ud.a_type;
-    matmul_params.b_type = ud.b_type;
-    matmul_params.c_type = ud.c_type;
-
-    densecore::MatmulBackend& backend = (ud.backend == densecore::MatmulBackendKind::OneDNN)
-                                            ? densecore::GetOneDnnMatmulBackend()
-                                            : densecore::GetDenseCoreMatmulBackend();
-    backend.Execute(matmul_params);
-}
-
-inline struct ggml_tensor* ggml_mul_mat_onednn(struct ggml_context* ctx, struct ggml_tensor* weight,
-                                               struct ggml_tensor* input, const MatmulOpData& data) {
-    const int64_t N = weight->ne[1];  // Output dimension
-    const int64_t M = input->ne[1];   // Tokens
-
-    const int64_t ne_res[4] = {N, M, 1, 1};
-    struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_res);
-
-    result->op = GGML_OP_CUSTOM;
-    result->src[0] = input;
-    result->src[1] = weight;
-
-    MatmulCustomParams params = {cb_matmul_custom, 1, nullptr, data};
-    static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "params too large");
-    memcpy(result->op_params, &params, sizeof(params));
 
     return result;
 }
@@ -3229,7 +3147,7 @@ void cb_matmul_int4_custom(struct ggml_tensor* dst, int ith, int nth, void* user
     const bool input_contig =
         input->nb[0] == sizeof(float) && input->nb[1] == static_cast<size_t>(ud.K) * sizeof(float);
     const bool output_contig = dst->nb[0] == sizeof(float) && dst->nb[1] == static_cast<size_t>(ud.N) * sizeof(float);
-    const bool single_threading_layer = IsInt4SingleThreadingLayerEnabled();
+    constexpr bool single_threading_layer = DENSECORE_DEFAULT_INT4_SINGLE_THREADING_LAYER != 0;
     const bool allow_direct_fast_path = ShouldUseArmInt4DirectFastPath(input, ud, ith);
 
     // Legacy escape hatch: keep DenseCore backend threadpool path for
@@ -3357,7 +3275,7 @@ inline struct ggml_tensor* ggml_mul_mat_int4(struct ggml_context* ctx, struct gg
     Int4MatmulCustomParams params = {};
     params.fun = cb_matmul_int4_custom;
     const BatchSpec* batch = GetCurrentBatch();
-    if (IsInt4SingleThreadingLayerEnabled()) {
+    if (DENSECORE_DEFAULT_INT4_SINGLE_THREADING_LAYER != 0) {
         params.n_tasks = ResolveTaskCount(batch, static_cast<int>(std::max<int64_t>(1, binding.n)));
     } else {
         params.n_tasks = 1;
@@ -3555,14 +3473,44 @@ inline struct ggml_tensor* ggml_mul_mat_fp8(struct ggml_context* ctx, struct ggm
 struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* weight, struct ggml_tensor* input,
                                   TransformerModel* model) {
     bool using_cpu_repack_alias = false;
+    const int original_input_cols = input ? static_cast<int>(input->ne[1]) : 0;
+    const char* original_w_name = (weight && weight->name[0]) ? weight->name : "(unnamed)";
+    const bool original_qwen_hybrid_ssm_projection =
+        model && model->arch_flags.is_hybrid_ssm &&
+        (IsHybridSSMQkvWeightName(original_w_name) || std::strstr(original_w_name, "attn_gate") ||
+         std::strstr(original_w_name, "ssm_out"));
+    const bool qwen35_dense_hybrid_prefill =
+        model && model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm &&
+        model->hparams.n_experts <= 0 && original_input_cols > 1;
+    const bool prefer_qwen_hybrid_ssm_quant_batched_over_repack =
+        original_qwen_hybrid_ssm_projection && !qwen35_dense_hybrid_prefill && original_input_cols > 1 && weight && input &&
+        weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 && weight->ne[0] == input->ne[0] &&
+        (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled()
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+        ;
+#else
+        && false;
+#endif
     const bool prefer_gemma4_q4k_prefill_densecore_path =
         model && model->arch_flags.is_gemma4 && input && input->type == GGML_TYPE_F32 &&
         weight && weight->type == GGML_TYPE_Q4_K && input->ne[1] > 1 && input->ne[0] == weight->ne[0] &&
-        !IsBatchedQuantDisabled() && IsArmBatchedQuantSafeByDefault() && IsQ4KTrueBatchedKernelEnabled();
+        IsQ4KTrueBatchedKernelEnabled();
     if (model && input && input->type == GGML_TYPE_F32) {
+        if (input->ne[1] <= 1) {
+            auto it_decode_repack = model->cpu_decode_repack_aliases.find(weight);
+            if (it_decode_repack != model->cpu_decode_repack_aliases.end() && it_decode_repack->second) {
+                weight = it_decode_repack->second;
+                using_cpu_repack_alias = true;
+            }
+        }
         auto it_repack = model->cpu_repack_aliases.find(weight);
-        if (it_repack != model->cpu_repack_aliases.end() && it_repack->second) {
-            if (!prefer_gemma4_q4k_prefill_densecore_path) {
+        if (!using_cpu_repack_alias && it_repack != model->cpu_repack_aliases.end() && it_repack->second) {
+            const bool amx_alias = model->cpu_amx_aliases.find(it_repack->second) != model->cpu_amx_aliases.end();
+            const bool amx_decode_regression_risk =
+                (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) && amx_alias &&
+                input->ne[1] == 1;
+            if (!prefer_gemma4_q4k_prefill_densecore_path && !prefer_qwen_hybrid_ssm_quant_batched_over_repack &&
+                !amx_decode_regression_risk) {
                 weight = it_repack->second;
                 using_cpu_repack_alias = true;
             }
@@ -3603,9 +3551,19 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                                           model->arch_flags.is_hybrid_ssm && std::strstr(w_name, "ssm_out");
     const bool is_qwen36_lm_head = model && model->output == weight && model->variant == ModelVariant::QWEN36 &&
                                    model->arch_flags.is_hybrid_ssm;
+    const bool qwen_hybrid_ssm_quant_prefill_fast_path_eligible =
+        (is_hybrid_ssm_qkv || is_qwen35_hybrid_ssm_gate || is_qwen35_hybrid_ssm_out ||
+         is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
+        M > 1 && weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 && weight->ne[0] == input->ne[0] &&
+        (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled()
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+        ;
+#else
+        && false;
+#endif
     bool qwen36_lm_head_q4k_prefill_fast_path_eligible = false;
     if (is_qwen36_lm_head && M > 1 && weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 &&
-        weight->ne[0] == input->ne[0] && !IsBatchedQuantDisabled() && IsQ4KTrueBatchedKernelEnabled()) {
+        weight->ne[0] == input->ne[0] && IsQ4KTrueBatchedKernelEnabled()) {
         const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight->type);
         qwen36_lm_head_q4k_prefill_fast_path_eligible =
             type_traits_cpu && type_traits_cpu->vec_dot && type_traits_cpu->vec_dot_type == GGML_TYPE_Q8_K &&
@@ -3638,7 +3596,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         (is_hybrid_ssm_qkv &&
          (!model || model->variant != ModelVariant::QWEN36)) ||
         is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out;
-    if (force_plain_hybrid_ssm_prefill &&
+    if (force_plain_hybrid_ssm_prefill && !qwen_hybrid_ssm_quant_prefill_fast_path_eligible &&
         ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 && M > 1) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "hybrid_ssm_prefill_correctness");
@@ -3650,7 +3608,13 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     // Keep qwen35 quantized prefill projections on native GGML until the graph
     // is fully stable end-to-end. Decode (M==1) remains on the faster path.
     if (model && model->variant == ModelVariant::QWEN35 && ggml_is_quantized(weight->type) &&
-        input->type == GGML_TYPE_F32 && M > 1) {
+        input->type == GGML_TYPE_F32 && M > 1 &&
+#if defined(__aarch64__) || defined(_M_ARM64)
+        true
+#else
+        false
+#endif
+    ) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "qwen35_prefill_quant_correctness");
         return ggml_mul_mat(ctx, weight, input);
@@ -3684,7 +3648,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         if (it_int4 != model->int4_weight_bindings.end()) {
             const auto& binding = it_int4->second;
             if (binding.k > 0 && binding.n > 0 && binding.group_size > 0 && binding.packed && binding.scales &&
-                binding.zeros && !IsPackedInt4CustomDisabled()) {
+                binding.zeros) {
                 LogMatmulDispatch(w_name, "PACKED_INT4", M, N_dim, K_dim,
                                   M == 1 ? "HWY_INT4_GEMV" : "HWY_INT4_BATCHED");
                 LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
@@ -3722,8 +3686,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         return ggml_mul_mat_hal(ctx, weight, input, preferred_matmul_device);
     }
 
-    const int max_small_batch_cols = ParsePositiveEnvInt("DENSECORE_SMALL_BATCH_GEMV_MAX_COLS", kMaxSmallBatchColsHard);
-    const int max_small_batch_quant_cols = ParsePositiveEnvInt("DENSECORE_SMALL_BATCH_GEMV_QUANT_MAX_COLS", 4096);
+    const int max_small_batch_cols = kMaxSmallBatchColsHard;
+    constexpr int max_small_batch_quant_cols = 4096;
     const bool is_gemv_candidate =
         (input_cols == 1) && (weight->type == GGML_TYPE_F32 || ggml_is_quantized(weight->type));
     const bool is_small_batch_f32_candidate = (input_cols > 1 && input_cols <= max_small_batch_cols &&
@@ -3744,17 +3708,25 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                 quant_input_size_ok = (quant_row_size > 0 && quant_row_size <= kMaxQuantInputBufferSize);
             }
             const int vec_dot_nrows = std::max<int>(1, static_cast<int>(type_traits_cpu->nrows));
-            quant_nrc_batch_ready =
-                IsQuantNrcBatchEnabled() && vec_dot_nrows >= std::min(input_cols, kMaxSmallBatchColsHard);
+            quant_nrc_batch_ready = vec_dot_nrows >= std::min(input_cols, kMaxSmallBatchColsHard);
             quant_true_batched_kernel_ready = IsQ4KTrueBatchedKernelEnabled() && (weight->type == GGML_TYPE_Q4_K) &&
                                               (type_traits_cpu->vec_dot_type == GGML_TYPE_Q8_K) &&
                                               (input->ne[0] % QK_K == 0);
         }
     }
+    const bool qwen35_dense_prefill_prefers_ggml_quant =
+        model && model->variant == ModelVariant::QWEN35 && model->hparams.n_experts <= 0 && input_cols > 1 &&
+#if defined(__aarch64__) || defined(_M_ARM64)
+        true;
+#else
+        false;
+#endif
+    const bool qwen36_prefill_prefers_ggml_quant =
+        model && model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm && input_cols > 1;
     const bool is_small_batch_quant_candidate =
         (input_cols > 1 && input_cols <= max_small_batch_quant_cols && input->type == GGML_TYPE_F32 &&
-         ggml_is_quantized(weight->type) && !IsBatchedQuantDisabled() && IsArmBatchedQuantSafeByDefault() &&
-         has_quant_vec_dot && has_quant_from_float && quant_input_size_ok);
+         ggml_is_quantized(weight->type) && !qwen35_dense_prefill_prefers_ggml_quant &&
+         !qwen36_prefill_prefers_ggml_quant && has_quant_vec_dot && has_quant_from_float && quant_input_size_ok);
     const bool is_small_batch_candidate = is_small_batch_f32_candidate || is_small_batch_quant_candidate;
 
     const char* wtype_label = MatmulWeightTypeLabel(weight->type, false, false);
@@ -3772,7 +3744,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     // ========================================================================
     // PATH 2: M==1 GEMV (decode single-token)
     // ========================================================================
-    if (!IsCustomGemvDisabled() && is_gemv_candidate && is_compatible) {
+    if (is_gemv_candidate && is_compatible) {
         if (ShouldForcePlainGgmlForHybridSSMQkv() && is_hybrid_ssm_qkv) {
             LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "GGML_NATIVE", "forced_ssm_qkv_plain_ggml");
             LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "GGML_NATIVE", false, false, false);
@@ -3786,9 +3758,11 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                           ggml_is_quantized(weight->type) ? "GEMV_QUANT" : "GEMV_F32");
         GemvUserData* ud = GetGemvUserData();
         ud->force_reference_scalar = false;
-        const bool gemma4_q8_repacked_enabled =
-            densecore::env::ParseNonZeroEnv("DENSECORE_GEMMA4_ENABLE_Q8_REPACKED_GEMV", false);
-        ud->disable_q8_repacked_gemv = model && model->arch_flags.is_gemma4 && !gemma4_q8_repacked_enabled &&
+        const bool is_gemma4_model = model && model->arch_flags.is_gemma4;
+        static const bool gemma4_q8_repacked_enabled = []() {
+            return densecore::env::ParseNonZeroEnv("DENSECORE_GEMMA4_ENABLE_Q8_REPACKED_GEMV", false);
+        }();
+        ud->disable_q8_repacked_gemv = is_gemma4_model && !gemma4_q8_repacked_enabled &&
                                        !IsGemma4SharedDenseFfnWeightName(w_name);
         LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
                                 ggml_is_quantized(weight->type) ? "GEMV_QUANT" : "GEMV_F32", false, false, false);
@@ -3800,7 +3774,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     //   - GGML_QUANT: shared-quant + nrc=M vec_dot (weight row reuse)
     //   - FP32: batched dot with weight row reuse
     // ========================================================================
-    if (!IsCustomGemvDisabled() && is_small_batch_candidate && is_compatible) {
+    if (is_small_batch_candidate && is_compatible) {
         if (ShouldForcePlainGgmlForHybridSSMQkv() && is_hybrid_ssm_qkv) {
             LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "GGML_NATIVE", "forced_ssm_qkv_plain_ggml");
             LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "GGML_NATIVE", false, false, false);
@@ -3830,14 +3804,12 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     if (IsDebugMatmulDispatchEnabled() && input_cols > 1 && ggml_is_quantized(weight->type) && is_compatible &&
         !is_small_batch_quant_candidate) {
         const char* reason = "unknown";
-        if (IsCustomGemvDisabled())
-            reason = "custom_gemv_disabled";
-        else if (input_cols > max_small_batch_quant_cols)
+        if (input_cols > max_small_batch_quant_cols)
             reason = "M>max_quant_cols";
-        else if (IsBatchedQuantDisabled())
-            reason = "batched_quant_disabled";
-        else if (!IsArmBatchedQuantSafeByDefault())
-            reason = "batched_quant_arm_guard";
+        else if (qwen35_dense_prefill_prefers_ggml_quant)
+            reason = "qwen35_dense_prefill_ggml_quant";
+        else if (qwen36_prefill_prefers_ggml_quant)
+            reason = "qwen36_prefill_ggml_quant";
         else if (!has_quant_vec_dot)
             reason = "no_vec_dot";
         else if (!has_quant_from_float)
@@ -3847,41 +3819,6 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         else if (!quant_nrc_batch_ready && !quant_true_batched_kernel_ready)
             reason = "quant_batched_kernel_unavailable";
         LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "GGML_FALLBACK", reason);
-    }
-
-    // ========================================================================
-    // PATH 4: OneDNN for large batches (prefill)
-    // ========================================================================
-    if (is_compatible && input_cols > 1) {
-        densecore::MatmulParams params;
-        params.M = input->ne[1];
-        params.K = input->ne[0];
-        params.N = weight->ne[1];
-        params.lda = input->nb[1] / ggml_type_size(input->type);
-        params.ldb = weight->nb[1] / ggml_type_size(weight->type);
-        params.ldc = params.N;
-        params.trans_b = true;
-        params.a_type = densecore::GgmlTypeToDType(input->type);
-        params.b_type = densecore::GgmlTypeToDType(weight->type);
-        params.c_type = densecore::DType::F32;
-
-        const bool convert_f32_to_bf16 =
-            (input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_BF16 && input_cols > 1);
-        if (convert_f32_to_bf16) {
-            params.a_type = densecore::DType::BF16;
-        }
-
-        if (densecore::SelectMatmulBackend(params, true) == densecore::MatmulBackendKind::OneDNN) {
-            LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "ONEDNN_GEMM");
-            LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "ONEDNN_GEMM", false, false, false);
-            MatmulOpData data;
-            data.backend = densecore::MatmulBackendKind::OneDNN;
-            data.a_type = params.a_type;
-            data.b_type = params.b_type;
-            data.c_type = params.c_type;
-            data.convert_a_f32_to_bf16 = convert_f32_to_bf16;
-            return ggml_mul_mat_onednn(ctx, weight, input, data);
-        }
     }
 
     // Standard GGML fallback (handles transpose/stride correctly)

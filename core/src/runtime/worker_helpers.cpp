@@ -148,6 +148,30 @@ bool ResolvePagedDecodeHeadDims(const TransformerModel* model, int* n_head_out, 
     }
 
     const auto descriptor = densecore::models::DescribeModel(model);
+    if (model->arch_flags.is_hybrid_ssm && descriptor.variant == ModelVariant::QWEN35) {
+        for (const TransformerLayer& layer : model->layers) {
+            const ggml_tensor* wq = layer.Get(model_keys::kAttnQWeight);
+            const ggml_tensor* wk = layer.Get(model_keys::kAttnKWeight);
+            if (!wq || !wk || wq->ne[1] <= 0 || wk->ne[1] <= 0) {
+                continue;
+            }
+            int head_dim_q = 0;
+            const int64_t q_out = wq->ne[1];
+            if (q_out % (2LL * n_head) == 0) {
+                head_dim_q = static_cast<int>(q_out / (2LL * n_head));
+            } else if (q_out % n_head == 0) {
+                head_dim_q = static_cast<int>(q_out / n_head);
+            }
+            const int head_dim_kv = (wk->ne[1] % n_head_kv) == 0 ? static_cast<int>(wk->ne[1] / n_head_kv) : 0;
+            if (head_dim_q > 0 && head_dim_kv > 0) {
+                *n_head_out = n_head;
+                *n_head_kv_out = n_head_kv;
+                *head_dim_q_out = head_dim_q;
+                *head_dim_kv_out = head_dim_kv;
+                return true;
+            }
+        }
+    }
     const bool qwen36_hybrid_ssm = model->arch_flags.is_hybrid_ssm && descriptor.variant == ModelVariant::QWEN36;
     const int head_dim_q =
         (qwen36_hybrid_ssm && model->hparams.n_embd_head_k > 0) ? model->hparams.n_embd_head_k
@@ -199,23 +223,17 @@ bool IsReasoningTagSuppressionEnabled() {
     return enabled;
 }
 
-bool IsDirectCallbackEnabled() {
-    static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_DIRECT_CALLBACK", false);
-    return enabled;
-}
-
-bool ShouldUseDirectResultCallbacks(bool benchmark_fast_path) {
-    return IsDirectCallbackEnabled() || (benchmark_fast_path && IsBenchmarkDirectCallbackEnabled());
-}
-
 void EmitRequestResult(EngineState* state, Request* req, const std::string& token, int token_id, bool finished,
                        bool error, bool use_direct_callback) {
-    if (!req || (!req->callback && !req->token_result_callback)) {
+    if (!req || (!req->callback && !req->callback_ex && !req->token_result_callback)) {
         return;
     }
 
     if (use_direct_callback) {
-        if (req->callback) {
+        if (req->callback_ex) {
+            req->callback_ex(token.data(), static_cast<int>(token.size()), token_id, finished ? 1 : (error ? 1 : 0),
+                             req->user_data);
+        } else if (req->callback) {
             req->callback(token.c_str(), finished ? 1 : 0, req->user_data);
         } else if (req->token_result_callback) {
             TokenResult result;
@@ -231,54 +249,15 @@ void EmitRequestResult(EngineState* state, Request* req, const std::string& toke
         return;
     }
 
-    PushResultEvent(state, req->id, token, token_id, finished, error, req->callback, req->token_result_callback,
-                    req->user_data);
-}
-
-bool IsSingleRequestFastPathEnabled() {
-    static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_SINGLE_REQUEST_FAST_PATH", true);
-    return enabled;
+    PushResultEvent(state, req->id, token, token_id, finished, error, req->callback, req->callback_ex,
+                    req->token_result_callback, req->user_data);
 }
 
 bool ShouldBypassSingleRequestFastPathForLongHybridSSM(const TransformerModel* model, const Request* req) {
     if (!model || !req || !model->arch_flags.is_hybrid_ssm) {
         return false;
     }
-    if (densecore::env::ParseNonZeroEnv("DENSECORE_DISABLE_SINGLE_REQ_FAST_PATH_FOR_LONG_HYBRID_SSM", false)) {
-        return true;
-    }
     return req->is_prefill && static_cast<int>(req->tokens.size()) > BLOCK_SIZE;
-}
-
-bool IsBenchmarkFastPathEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_BENCH_MODE");
-        const bool on = env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-        if (on) {
-            std::cerr << "[DenseCore] DENSECORE_BENCH_MODE enabled; benchmark fast-path bypasses normal scheduler "
-                         "behavior and can mask serving-path stalls."
-                      << std::endl;
-        }
-        return on;
-    }();
-    return enabled;
-}
-
-bool IsBenchmarkDirectCallbackEnabled() {
-    static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_BENCH_DIRECT_CALLBACK", false);
-    return enabled;
-}
-
-bool IsBenchmarkDecodeBatchFastPathEnabled() {
-    static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_BENCH_DECODE_BATCH_FAST_PATH", false);
-    return enabled;
-}
-
-int BenchmarkFastPathMaxBatch() {
-    static const int max_batch = []() {
-        return densecore::env::ParsePositiveEnvInt("DENSECORE_BENCH_FAST_PATH_MAX_BATCH", 8);
-    }();
-    return max_batch;
 }
 
 bool AllowDecodeThreadsOverBase() {
@@ -448,92 +427,6 @@ bool DoesDecodeGraphCacheRequireRuntimeRebind(const TransformerModel* model) {
     return model && model->arch_flags.is_hybrid_ssm;
 }
 
-bool IsBatchedPagedDecodeEnabled() {
-    static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_ENABLE_BATCHED_PAGED_DECODE", false);
-    return enabled;
-}
-
-bool IsPagedDecodeGloballyDisabled() {
-    static const bool disabled = []() {
-        if (densecore::env::ParseNonZeroEnv("DENSECORE_FORCE_PAGED_DECODE", false)) {
-            return false;
-        }
-        return densecore::env::ParseRuntimeToggleMode("DENSECORE_PAGED_ATTN_DECODE_MODE",
-                                                      densecore::env::RuntimeToggleMode::Auto) ==
-               densecore::env::RuntimeToggleMode::Off;
-    }();
-    return disabled;
-}
-
-bool IsForcePagedDecodeEnabled() {
-    static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_FORCE_PAGED_DECODE", false);
-    return enabled;
-}
-
-bool IsPagedDecodeModeForcedOn() {
-    static const bool forced_on = []() {
-        if (IsForcePagedDecodeEnabled()) {
-            return true;
-        }
-        if (densecore::env::ParseRuntimeToggleMode("DENSECORE_PAGED_ATTN_DECODE_MODE",
-                                                   densecore::env::RuntimeToggleMode::Auto) ==
-            densecore::env::RuntimeToggleMode::On) {
-            return true;
-        }
-        return densecore::env::ParseNonZeroEnv("DENSECORE_ENABLE_PAGED_ATTN_DECODE", false);
-    }();
-    return forced_on;
-}
-
-bool IsFlashAttentionForcedForCacheKey() {
-    static const bool forced = densecore::env::ParseNonZeroEnv("DENSECORE_FORCE_FLASH_ATTN", false);
-    return forced;
-}
-
-bool IsFlashAttentionDisabledForCacheKey() {
-    static const bool disabled = []() {
-        if (densecore::env::ParseRuntimeToggleMode("DENSECORE_FLASH_ATTN_MODE",
-                                                   densecore::env::RuntimeToggleMode::Auto) ==
-            densecore::env::RuntimeToggleMode::Off) {
-            return true;
-        }
-        return densecore::env::ParseNonZeroEnv("DENSECORE_DISABLE_FLASH_ATTN", false);
-    }();
-    return disabled;
-}
-
-bool IsPrecomputedRoPEEnabledForCacheKey() {
-    static const bool enabled = []() {
-        const densecore::env::RuntimeToggleMode mode = densecore::env::ParseRuntimeToggleMode(
-            "DENSECORE_ROPE_PRECOMPUTED_MODE", DENSECORE_DEFAULT_PRECOMPUTED_ROPE
-                                                   ? densecore::env::RuntimeToggleMode::On
-                                                   : densecore::env::RuntimeToggleMode::Off);
-        return mode != densecore::env::RuntimeToggleMode::Off;
-    }();
-    return enabled;
-}
-
-bool IsFusedResidualRMSNormEnabledForCacheKey() {
-    static const bool enabled = []() {
-        const densecore::env::RuntimeToggleMode mode = densecore::env::ParseRuntimeToggleMode(
-            "DENSECORE_FUSED_RESIDUAL_RMSNORM_MODE", DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM
-                                                         ? densecore::env::RuntimeToggleMode::On
-                                                         : densecore::env::RuntimeToggleMode::Off);
-        return mode != densecore::env::RuntimeToggleMode::Off;
-    }();
-    return enabled;
-}
-
-bool IsFusedQKVEnabledForCacheKey() {
-    static const bool enabled = []() {
-        const densecore::env::RuntimeToggleMode mode = densecore::env::ParseRuntimeToggleMode(
-            "DENSECORE_FUSED_QKV_MODE", DENSECORE_DEFAULT_FUSED_QKV ? densecore::env::RuntimeToggleMode::On
-                                                                    : densecore::env::RuntimeToggleMode::Off);
-        return mode != densecore::env::RuntimeToggleMode::Off;
-    }();
-    return enabled;
-}
-
 bool IsDecodeGraphCacheDebugValidationEnabled() {
 #ifndef NDEBUG
     static const bool enabled = []() {
@@ -571,17 +464,13 @@ int DecodeGraphCacheRegressionSteps() {
 
 uint64_t BuildDecodeGraphFeatureFlags(const TransformerModel* model) {
     uint64_t feature_flags = 0;
-    if (IsForcePagedDecodeEnabled()) feature_flags |= (1ull << 0);
-    if (IsPagedDecodeModeForcedOn()) feature_flags |= (1ull << 1);
-    if (IsBatchedPagedDecodeEnabled()) feature_flags |= (1ull << 2);
-    if (IsPagedDecodeGloballyDisabled()) feature_flags |= (1ull << 3);
-    if (IsFlashAttentionForcedForCacheKey()) feature_flags |= (1ull << 4);
-    if (IsFlashAttentionDisabledForCacheKey()) feature_flags |= (1ull << 5);
+    feature_flags |= (1ull << 1);  // paged decode is the maintained decode path.
+    feature_flags |= (1ull << 2);  // batched paged decode is admitted by model/shape checks.
     if (model && model->arch_flags.requires_q_norm) feature_flags |= (1ull << 6);
     if (model && model->arch_flags.requires_k_norm) feature_flags |= (1ull << 7);
-    if (IsPrecomputedRoPEEnabledForCacheKey()) feature_flags |= (1ull << 8);
-    if (IsFusedResidualRMSNormEnabledForCacheKey()) feature_flags |= (1ull << 9);
-    if (IsFusedQKVEnabledForCacheKey()) feature_flags |= (1ull << 10);
+    if (DENSECORE_DEFAULT_PRECOMPUTED_ROPE != 0) feature_flags |= (1ull << 8);
+    if (DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM != 0) feature_flags |= (1ull << 9);
+    if (DENSECORE_DEFAULT_FUSED_QKV != 0) feature_flags |= (1ull << 10);
     return feature_flags;
 }
 
@@ -825,14 +714,13 @@ DecodeThreadPolicySelection ResolveDecodeThreadPolicySelection(const Transformer
     }
 
     const int cap = CapThreadsToAvailableCores(physical_core_count, base_threads);
-    const int env_override = densecore::env::ParsePositiveEnvInt("DENSECORE_QWEN36_SINGLE_DECODE_THREADS", 0);
-    if (env_override > 0) {
-        selection.threads = std::max(1, std::min(cap, env_override));
-        selection.label =
-            (model->hparams.n_experts > 0) ? "decode_qwen36_a3b_env_override" : "decode_qwen36_single_env_override";
+    const auto descriptor = densecore::models::DescribeModel(model);
+    if (descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts <= 0 &&
+        !densecore::simd::IsArmFamily(simd_level) && physical_core_count >= 16 && cap >= 16) {
+        selection.threads = 16;
+        selection.label = "decode_qwen35_dense_c4_16";
         return selection;
     }
-
     if (model->hparams.n_experts > 0) {
         const bool arm_c4a_wide_simd =
             densecore::simd::IsArmFamily(simd_level) &&
@@ -845,6 +733,11 @@ DecodeThreadPolicySelection ResolveDecodeThreadPolicySelection(const Transformer
         if (arm_c4a_wide_simd && cap >= 12) {
             selection.threads = 12;
             selection.label = "decode_qwen36_a3b_arm_safe_cap";
+            return selection;
+        }
+        if (!densecore::simd::IsArmFamily(simd_level) && cap >= 16) {
+            selection.threads = 16;
+            selection.label = "decode_qwen36_a3b_c4_moe_16";
             return selection;
         }
         selection.threads = std::max(1, std::min(cap, 8));
@@ -1001,8 +894,8 @@ void MaybeLogDecodeRuntimeStats() {
                       << ", tls=" << runtime.shared_quant_tls << ")"
                       << " decode_threads[b1=" << worker_stats.last_threads_by_batch[1].load(std::memory_order_relaxed)
                       << ",b2=" << worker_stats.last_threads_by_batch[2].load(std::memory_order_relaxed)
-                      << ",b3=" << worker_stats.last_threads_by_batch[3].load(std::memory_order_relaxed)
-                      << ",b4=" << worker_stats.last_threads_by_batch[4].load(std::memory_order_relaxed) << "]"
+                      << ",b4=" << worker_stats.last_threads_by_batch[4].load(std::memory_order_relaxed)
+                      << ",b8=" << worker_stats.last_threads_by_batch[8].load(std::memory_order_relaxed) << "]"
                       << " moe[avg_unique=" << moe_avg_unique_experts << ",local_hot=" << moe_local_hot_ratio
                       << "%,reuse=" << moe_step_reuse << "%,concentration=" << moe_concentration
                       << "%,avg_cached=" << moe_avg_cached_experts << ",avg_dequant=" << moe_avg_dequant_experts;
@@ -1049,9 +942,18 @@ void MaybeLogDecodeRuntimeStats() {
 
             std::cerr << " graph_cache_skips[disabled="
                       << worker_stats.graph_cache_skip_disabled.load(std::memory_order_relaxed)
+                      << ",layout=" << worker_stats.graph_cache_skip_layout.load(std::memory_order_relaxed)
+                      << ",max_batch=" << worker_stats.graph_cache_skip_max_batch.load(std::memory_order_relaxed)
                       << ",unstable=" << worker_stats.graph_cache_skip_unstable.load(std::memory_order_relaxed)
                       << ",lora=" << worker_stats.graph_cache_skip_lora.load(std::memory_order_relaxed)
+                      << ",model=" << worker_stats.graph_cache_skip_model.load(std::memory_order_relaxed)
                       << ",backend=" << worker_stats.graph_cache_skip_backend.load(std::memory_order_relaxed)
+                      << ",key_uncacheable="
+                      << worker_stats.graph_cache_skip_uncacheable.load(std::memory_order_relaxed)
+                      << ",build_failure="
+                      << worker_stats.graph_cache_skip_build_failure.load(std::memory_order_relaxed)
+                      << ",rebind_failure="
+                      << worker_stats.graph_cache_skip_rebind_failure.load(std::memory_order_relaxed)
                       << ",uncacheable="
                       << worker_stats.graph_cache_rejected_uncacheable.load(std::memory_order_relaxed) << "]";
 
@@ -1449,8 +1351,14 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         (decode_visible_ms > 0.0) ? (static_cast<double>(steady_visible_tokens) / (decode_visible_ms / 1000.0)) : 0.0;
     const DecodeRuntimeStatsSnapshot runtime = GetDecodeRuntimeStatsSnapshot();
     const KVRuntimeStatsSnapshot kv_stats = GetKVRuntimeStatsSnapshot();
-    const double paged_hit_rate =
+    const double paged_runtime_hit_rate =
         runtime.path_total > 0 ? (100.0 * static_cast<double>(runtime.path_paged) / runtime.path_total) : 0.0;
+    const int attention_path_total = req->attention_path_paged + req->attention_path_standard +
+                                     req->attention_path_portable_flash + req->attention_path_native_flash +
+                                     req->attention_path_hal;
+    const double paged_hit_rate =
+        attention_path_total > 0 ? (100.0 * static_cast<double>(req->attention_path_paged) / attention_path_total)
+                                 : paged_runtime_hit_rate;
     const densecore::simd::SimdLevel simd_level = densecore::simd::DetectSimdLevel();
     const int physical_core_count = densecore::HardwareTopology::GetInstance().GetPhysicalCoreCount();
     const bool sve_runtime_detected = densecore::simd::HasArmSveOrBetter(simd_level);
@@ -1507,8 +1415,25 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << densecore::runtime::KernelAdmissionRejectReasonName(
                static_cast<densecore::runtime::KernelAdmissionRejectReason>(req->kleidiai_last_reject_reason))
         << " graph_cache_hits=" << req->graph_cache_hit_count << " graph_cache_misses=" << req->graph_cache_miss_count
-        << " paged_hit_rate=" << paged_hit_rate << " paged_path_hits=" << runtime.path_paged
-        << " decode_path_total=" << runtime.path_total
+        << " graph_cache_skips=" << req->graph_cache_skip_count
+        << " graph_cache_last_skip_reason="
+        << (req->graph_cache_last_skip_reason.empty() ? "none" : req->graph_cache_last_skip_reason.c_str())
+        << " prefix_cache_allowed=" << (req->prefix_cache_allowed ? 1 : 0)
+        << " prefix_cache_hit=" << (req->prefix_cache_hit ? 1 : 0)
+        << " prefix_cache_skipped_tokens=" << req->prefix_cache_skipped_tokens
+        << " prefix_cache_hit_blocks=" << req->prefix_cache_hit_blocks
+        << " prefix_cache_registered_blocks=" << req->prefix_cache_registered_blocks
+        << " prefix_cache_extended_blocks=" << req->prefix_cache_extended_blocks
+        << " hybrid_ssm_snapshot_restore_attempted="
+        << (req->hybrid_ssm_snapshot_restore_attempted ? 1 : 0)
+        << " hybrid_ssm_snapshot_restore_applied=" << (req->hybrid_ssm_snapshot_restore_applied ? 1 : 0)
+        << " prefix_cache_skip_reason="
+        << (req->prefix_cache_skip_reason.empty() ? "none" : req->prefix_cache_skip_reason.c_str())
+        << " paged_hit_rate=" << paged_hit_rate << " paged_path_hits=" << req->attention_path_paged
+        << " decode_path_total=" << attention_path_total
+        << " paged_runtime_hit_rate=" << paged_runtime_hit_rate
+        << " paged_runtime_path_hits=" << runtime.path_paged
+        << " decode_runtime_path_total=" << runtime.path_total
         << " prefill_chunk_tokens_effective=" << req->prefill_chunk_tokens_effective
         << " q4k_true_batched_used=" << req->q4k_true_batched_used
         << " arm_batched_quant_used=" << req->arm_batched_quant_used

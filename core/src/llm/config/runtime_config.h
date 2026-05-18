@@ -69,7 +69,6 @@ struct DecodePagedAttentionPolicy {
     bool debug_log = false;
 };
 
-DecodePagedAttentionMode LoadDecodePagedAttentionMode();
 DecodePagedAttentionPolicy LoadDecodePagedAttentionPolicy();
 
 struct KVRetentionPolicy {

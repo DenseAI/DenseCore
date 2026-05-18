@@ -30,6 +30,7 @@ struct Qwen35SSMHeadStepConfig {
     bool has_precomputed_qk_norm = false;
     float precomputed_q_inv_norm = 0.0f;
     float precomputed_k_inv_norm = 0.0f;
+    float precomputed_qk_dot = 0.0f;
     bool use_fast_silu = false;
 };
 
@@ -51,6 +52,9 @@ struct Qwen35SSMHeadStepStats {
     double state_update_ms = 0.0;
     double output_accum_ms = 0.0;
     double rms_gate_ms = 0.0;
+    double first_pass_dual_dot_ms = 0.0;
+    double state_update_only_ms = 0.0;
+    double total_fast_ssm_ms = 0.0;
 };
 
 struct Qwen35SSMHeadStepDebugBuffers {
@@ -122,6 +126,8 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
 
 // Default serving fast path for the same math as Qwen35RunGatedDeltaHeadStep.
 // It avoids materializing q_norm/k_norm scratch when diagnostics are disabled.
-bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head);
+bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head,
+                                            Qwen35SSMHeadStepStats* stats = nullptr,
+                                            float* y_pre_norm = nullptr);
 
 #endif  // DENSECORE_QWEN35_SSM_MATH_H

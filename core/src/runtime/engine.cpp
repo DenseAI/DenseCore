@@ -139,20 +139,66 @@ size_t ReadAvailableMemoryMbForKVAutoSizing() {
             return static_cast<size_t>(hinted);
         }
     }
+    constexpr unsigned long long MB = 1024ULL * 1024ULL;
+    auto read_ull_file = [](const char* path) -> unsigned long long {
+        std::FILE* file = std::fopen(path, "r");
+        if (!file) {
+            return 0;
+        }
+        char buffer[128] = {};
+        if (!std::fgets(buffer, sizeof(buffer), file)) {
+            std::fclose(file);
+            return 0;
+        }
+        std::fclose(file);
+        if (std::strncmp(buffer, "max", 3) == 0) {
+            return 0;
+        }
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(buffer, &end, 10);
+        if (end == buffer || value == 0 || value > (1ULL << 50)) {
+            return 0;
+        }
+        return value;
+    };
+
 #if defined(__linux__)
+    size_t cgroup_available_mb = 0;
+    const unsigned long long cgroup_v2_limit = read_ull_file("/sys/fs/cgroup/memory.max");
+    const unsigned long long cgroup_v2_current = read_ull_file("/sys/fs/cgroup/memory.current");
+    if (cgroup_v2_limit > 0) {
+        cgroup_available_mb = static_cast<size_t>(
+            ((cgroup_v2_current > 0 && cgroup_v2_limit > cgroup_v2_current) ? (cgroup_v2_limit - cgroup_v2_current)
+                                                                            : cgroup_v2_limit) /
+            MB);
+    }
+    const unsigned long long cgroup_v1_limit = read_ull_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    const unsigned long long cgroup_v1_current = read_ull_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+    if (cgroup_available_mb == 0 && cgroup_v1_limit > 0) {
+        cgroup_available_mb = static_cast<size_t>(
+            ((cgroup_v1_current > 0 && cgroup_v1_limit > cgroup_v1_current) ? (cgroup_v1_limit - cgroup_v1_current)
+                                                                            : cgroup_v1_limit) /
+            MB);
+    }
+
     std::FILE* file = std::fopen("/proc/meminfo", "r");
     if (!file) {
-        return 0;
+        return cgroup_available_mb;
     }
     char line[256] = {};
     unsigned long long kb = 0;
     while (std::fgets(line, sizeof(line), file)) {
         if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
             std::fclose(file);
-            return static_cast<size_t>(kb / 1024ULL);
+            const size_t mem_available_mb = static_cast<size_t>(kb / 1024ULL);
+            if (cgroup_available_mb > 0) {
+                return std::min(mem_available_mb, cgroup_available_mb);
+            }
+            return mem_available_mb;
         }
     }
     std::fclose(file);
+    return cgroup_available_mb;
 #endif
     return 0;
 }
@@ -167,7 +213,7 @@ size_t SaturatingMulSize(size_t a, size_t b) {
     return a * b;
 }
 
-size_t ResolveAutoKVTargetMb(int max_num_seqs, size_t bytes_per_token, int max_seq_len) {
+size_t ResolveAutoKVTargetMb(const TransformerModel* model, int max_num_seqs, size_t bytes_per_token, int max_seq_len) {
     const size_t available_mb = ReadAvailableMemoryMbForKVAutoSizing();
     if (available_mb == 0) {
         return 512;
@@ -177,14 +223,24 @@ size_t ResolveAutoKVTargetMb(int max_num_seqs, size_t bytes_per_token, int max_s
     constexpr size_t MB = 1024ULL * 1024ULL;
     const size_t available_bytes = SaturatingMulSize(available_mb, MB);
 
-    // KV is one of several large resident pools. By default, keep the cache
-    // request-aware but leave automatic headroom for graph scratch, repack
-    // arenas, allocator metadata, and the OS. Explicit DENSECORE_KV_TARGET_MB
-    // remains the escape hatch for controlled experiments.
-    const size_t runtime_reserve_bytes = std::max<size_t>(available_bytes / 8, 512ULL * MB);
-    const size_t after_reserve_bytes =
-        available_bytes > runtime_reserve_bytes ? available_bytes - runtime_reserve_bytes : available_bytes / 2;
-    size_t total_kv_budget_bytes = after_reserve_bytes / 2;
+    // KV sizing should follow the current host/container state instead of a
+    // model-name table. The model contributes bytes_per_token and context; the
+    // host contributes current free memory. Keep generic runtime and allocator
+    // slack, then let the cache use the remaining capacity up to model context.
+    const size_t runtime_reserve_bytes = std::max<size_t>(available_bytes / 10, 512ULL * MB);
+    const size_t allocator_slack_bytes = std::max<size_t>(available_bytes / 32, 256ULL * MB);
+    size_t graph_reserve_bytes = std::max<size_t>(available_bytes / 6, 1024ULL * MB);
+    if (model) {
+        const size_t graph_seq_hint = static_cast<size_t>(std::max(1, std::min(max_seq_len, 2048)));
+        const size_t graph_chunk_hint = model->arch_flags.is_hybrid_ssm ? graph_seq_hint : std::min<size_t>(graph_seq_hint, 192);
+        const auto graph_estimate = EngineState::EstimateGraphContextSize(model, graph_seq_hint, 1, graph_chunk_hint);
+        graph_reserve_bytes = std::max(graph_reserve_bytes, graph_estimate.total_bytes);
+        graph_reserve_bytes += std::max<size_t>(graph_estimate.total_bytes / 4, 2048ULL * MB);
+    }
+    const size_t total_reserve_bytes =
+        SaturatingMulSize(1, runtime_reserve_bytes + allocator_slack_bytes + graph_reserve_bytes);
+    size_t total_kv_budget_bytes =
+        available_bytes > total_reserve_bytes ? available_bytes - total_reserve_bytes : available_bytes / 2;
 
     if (bytes_per_token > 0 && max_seq_len > 0) {
         const size_t requested_per_seq_bytes =
@@ -406,7 +462,8 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
     int target_mb = ReadEnvInt("DENSECORE_KV_TARGET_MB", 0, &target_mb_env_set);
     if (target_mb <= 0) {
         target_mb =
-            static_cast<int>(ResolveAutoKVTargetMb(config.max_num_seqs, config.bytes_per_token, config.max_seq_len));
+            static_cast<int>(
+                ResolveAutoKVTargetMb(model, config.max_num_seqs, config.bytes_per_token, config.max_seq_len));
     }
     config.target_kv_memory = static_cast<size_t>(target_mb) * 1024ULL * 1024ULL;
 
@@ -1085,10 +1142,11 @@ void ApplyDefaultLora(EngineState* state, Request* req) {
 
 void InitCommonRequest(EngineState* state, Request* req, int max_tokens, float temperature, float top_p, int top_k,
                        float repetition_penalty, const char** stop_sequences, int json_mode, TokenCallback callback,
-                       void* user_data) {
+                       void* user_data, TokenCallbackEx callback_ex = nullptr) {
     ResetMoEGraphWiringDebugCounter();
     req->max_tokens = max_tokens;
     req->callback = callback;
+    req->callback_ex = callback_ex;
     req->user_data = user_data;
     req->json_mode = (json_mode != 0);
 
@@ -1191,22 +1249,23 @@ int SubmitRequestWithSamplingEx(DenseCoreHandle handle, const char* prompt, int 
                                                   /*num_disallowed_token_ids=*/0, callback, user_data);
 }
 
-int SubmitRequestWithSamplingConstraintsEx(DenseCoreHandle handle, const char* prompt, int max_tokens,
-                                           const char* lora_name, float temperature, float top_p, int top_k,
-                                           float repetition_penalty, const char** stop_sequences, int json_mode,
-                                           const int* allowed_token_ids, int num_allowed_token_ids,
-                                           int allowed_token_ids_strict, const int* disallowed_token_ids,
-                                           int num_disallowed_token_ids, TokenCallback callback, void* user_data) {
+static int SubmitRequestWithSamplingConstraintsImpl(DenseCoreHandle handle, const char* prompt, int max_tokens,
+                                                    const char* lora_name, float temperature, float top_p, int top_k,
+                                                    float repetition_penalty, const char** stop_sequences,
+                                                    int json_mode, const int* allowed_token_ids,
+                                                    int num_allowed_token_ids, int allowed_token_ids_strict,
+                                                    const int* disallowed_token_ids, int num_disallowed_token_ids,
+                                                    TokenCallback callback, TokenCallbackEx callback_ex,
+                                                    void* user_data, const char* error_context) {
     if (!handle || !prompt) {
-        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "SubmitRequestWithSamplingConstraintsEx: invalid arguments");
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, std::string(error_context) + ": invalid arguments");
         return DENSECORE_STATUS_INVALID_ARGUMENT;
     }
     EngineState* state = (EngineState*)handle;
 
     ModelEntry* model_entry = state->GetDefaultModel();
     if (!model_entry || !model_entry->is_loaded) {
-        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED,
-                 "SubmitRequestWithSamplingConstraintsEx: default model not loaded");
+        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, std::string(error_context) + ": default model not loaded");
         return DENSECORE_STATUS_MODEL_LOAD_FAILED;
     }
 
@@ -1215,7 +1274,7 @@ int SubmitRequestWithSamplingConstraintsEx(DenseCoreHandle handle, const char* p
     req->parity_debug_submit_api = "SubmitRequestWithSamplingConstraintsEx";
 
     InitCommonRequest(state, req, max_tokens, temperature, top_p, top_k, repetition_penalty, stop_sequences, json_mode,
-                      callback, user_data);
+                      callback, user_data, callback_ex);
 
     // Tokenize prompt
     req->prompt = MaybeApplyAutoChatTemplate(model_entry->model.get(), prompt);
@@ -1247,6 +1306,31 @@ int SubmitRequestWithSamplingConstraintsEx(DenseCoreHandle handle, const char* p
     EnqueueRequest(state, req);
     ClearError();
     return req->id;
+}
+
+int SubmitRequestWithSamplingConstraintsEx(DenseCoreHandle handle, const char* prompt, int max_tokens,
+                                           const char* lora_name, float temperature, float top_p, int top_k,
+                                           float repetition_penalty, const char** stop_sequences, int json_mode,
+                                           const int* allowed_token_ids, int num_allowed_token_ids,
+                                           int allowed_token_ids_strict, const int* disallowed_token_ids,
+                                           int num_disallowed_token_ids, TokenCallback callback, void* user_data) {
+    return SubmitRequestWithSamplingConstraintsImpl(
+        handle, prompt, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty, stop_sequences, json_mode,
+        allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict, disallowed_token_ids,
+        num_disallowed_token_ids, callback, nullptr, user_data, "SubmitRequestWithSamplingConstraintsEx");
+}
+
+int SubmitRequestWithSamplingConstraintsCallbackEx(DenseCoreHandle handle, const char* prompt, int max_tokens,
+                                                   const char* lora_name, float temperature, float top_p, int top_k,
+                                                   float repetition_penalty, const char** stop_sequences,
+                                                   int json_mode, const int* allowed_token_ids,
+                                                   int num_allowed_token_ids, int allowed_token_ids_strict,
+                                                   const int* disallowed_token_ids, int num_disallowed_token_ids,
+                                                   TokenCallbackEx callback, void* user_data) {
+    return SubmitRequestWithSamplingConstraintsImpl(
+        handle, prompt, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty, stop_sequences, json_mode,
+        allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict, disallowed_token_ids,
+        num_disallowed_token_ids, nullptr, callback, user_data, "SubmitRequestWithSamplingConstraintsCallbackEx");
 }
 
 int SubmitRequestWithTokenResults(DenseCoreHandle handle, const char* prompt, int max_tokens, float temperature,
@@ -1316,14 +1400,17 @@ int SubmitRequestIdsWithSamplingEx(DenseCoreHandle handle, const int* tokens, in
                                                      /*num_disallowed_token_ids=*/0, callback, user_data);
 }
 
-int SubmitRequestIdsWithSamplingConstraintsEx(DenseCoreHandle handle, const int* tokens, int n_tokens, int max_tokens,
-                                              const char* lora_name, float temperature, float top_p, int top_k,
-                                              float repetition_penalty, const char** stop_sequences, int json_mode,
-                                              const int* allowed_token_ids, int num_allowed_token_ids,
-                                              int allowed_token_ids_strict, const int* disallowed_token_ids,
-                                              int num_disallowed_token_ids, TokenCallback callback, void* user_data) {
+static int SubmitRequestIdsWithSamplingConstraintsImpl(DenseCoreHandle handle, const int* tokens, int n_tokens,
+                                                       int max_tokens, const char* lora_name, float temperature,
+                                                       float top_p, int top_k, float repetition_penalty,
+                                                       const char** stop_sequences, int json_mode,
+                                                       const int* allowed_token_ids, int num_allowed_token_ids,
+                                                       int allowed_token_ids_strict, const int* disallowed_token_ids,
+                                                       int num_disallowed_token_ids, TokenCallback callback,
+                                                       TokenCallbackEx callback_ex, void* user_data,
+                                                       const char* error_context) {
     if (!handle || !tokens || n_tokens <= 0) {
-        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "SubmitRequestIdsWithSamplingConstraintsEx: invalid arguments");
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, std::string(error_context) + ": invalid arguments");
         return DENSECORE_STATUS_INVALID_ARGUMENT;
     }
     EngineState* state = (EngineState*)handle;
@@ -1333,7 +1420,7 @@ int SubmitRequestIdsWithSamplingConstraintsEx(DenseCoreHandle handle, const int*
     req->parity_debug_submit_api = "SubmitRequestIdsWithSamplingConstraintsEx";
 
     InitCommonRequest(state, req, max_tokens, temperature, top_p, top_k, repetition_penalty, stop_sequences, json_mode,
-                      callback, user_data);
+                      callback, user_data, callback_ex);
 
     // Assign pre-tokenized input
     req->tokens.assign(tokens, tokens + n_tokens);
@@ -1359,6 +1446,32 @@ int SubmitRequestIdsWithSamplingConstraintsEx(DenseCoreHandle handle, const int*
     EnqueueRequest(state, req);
     ClearError();
     return req->id;
+}
+
+int SubmitRequestIdsWithSamplingConstraintsEx(DenseCoreHandle handle, const int* tokens, int n_tokens, int max_tokens,
+                                              const char* lora_name, float temperature, float top_p, int top_k,
+                                              float repetition_penalty, const char** stop_sequences, int json_mode,
+                                              const int* allowed_token_ids, int num_allowed_token_ids,
+                                              int allowed_token_ids_strict, const int* disallowed_token_ids,
+                                              int num_disallowed_token_ids, TokenCallback callback, void* user_data) {
+    return SubmitRequestIdsWithSamplingConstraintsImpl(
+        handle, tokens, n_tokens, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty, stop_sequences,
+        json_mode, allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict, disallowed_token_ids,
+        num_disallowed_token_ids, callback, nullptr, user_data, "SubmitRequestIdsWithSamplingConstraintsEx");
+}
+
+int SubmitRequestIdsWithSamplingConstraintsCallbackEx(DenseCoreHandle handle, const int* tokens, int n_tokens,
+                                                      int max_tokens, const char* lora_name, float temperature,
+                                                      float top_p, int top_k, float repetition_penalty,
+                                                      const char** stop_sequences, int json_mode,
+                                                      const int* allowed_token_ids, int num_allowed_token_ids,
+                                                      int allowed_token_ids_strict,
+                                                      const int* disallowed_token_ids, int num_disallowed_token_ids,
+                                                      TokenCallbackEx callback, void* user_data) {
+    return SubmitRequestIdsWithSamplingConstraintsImpl(
+        handle, tokens, n_tokens, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty, stop_sequences,
+        json_mode, allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict, disallowed_token_ids,
+        num_disallowed_token_ids, nullptr, callback, user_data, "SubmitRequestIdsWithSamplingConstraintsCallbackEx");
 }
 
 int SubmitBatchEmbeddingRequest(DenseCoreHandle handle, const char** prompts, int num_prompts, int pooling_type,
@@ -2240,7 +2353,10 @@ void CallbackLoop(EngineState* state) {
             // Execute callback OUTSIDE the lock (GIL acquisition happens here)
             // This is the ONLY place callbacks should be invoked!
             try {
-                if (event.callback) {
+                if (event.callback_ex) {
+                    event.callback_ex(event.token_str.data(), static_cast<int>(event.token_str.size()),
+                                      event.token_id, event.finished ? 1 : (event.error ? 1 : 0), event.user_data);
+                } else if (event.callback) {
                     event.callback(event.token_str.c_str(), event.finished ? 1 : (event.error ? 1 : 0),
                                    event.user_data);
                 } else if (event.token_result_callback) {

@@ -3,7 +3,7 @@
  * @brief GEMM routing configuration and M-threshold tuning
  *
  * Separates prefill (M>1) and decode (M=1) paths, and configures
- * the branching point between oneDNN and custom kernels.
+ * custom-kernel tile thresholds.
  */
 #ifndef DENSECORE_GEMM_CONFIG_H
 #define DENSECORE_GEMM_CONFIG_H
@@ -26,17 +26,6 @@ struct GemmThresholdConfig {
     int prefill_m_threshold = 1;  // M <= threshold -> GEMV (decode), M > threshold -> GEMM (prefill)
 
     // ===========================================================================
-    // oneDNN usage conditions (applied only in prefill path)
-    // ===========================================================================
-    // oneDNN has overhead for small matrices, so minimum size is restricted.
-    // Typically effective with prefill batch>=4, hidden_dim>=4096 in LLMs.
-    // ===========================================================================
-    int onednn_min_M = 4;                // Minimum batch size (effective at 4+)
-    int onednn_min_K = 256;              // Minimum input dimension
-    int onednn_min_N = 256;              // Minimum output dimension
-    int64_t onednn_min_flops = 2000000;  // Minimum FLOPs (2 MFLOPs = ~2ms latency target)
-
-    // ===========================================================================
     // BLAS/Accelerate usage conditions (Apple/ARM only)
     // ===========================================================================
     int blas_min_M = 2;    // BLAS minimum batch size
@@ -44,7 +33,7 @@ struct GemmThresholdConfig {
     int blas_min_N = 128;  // BLAS minimum N
 
     // ===========================================================================
-    // Custom kernel tile sizes (fallback when oneDNN/BLAS not used)
+    // Custom kernel tile sizes
     // ===========================================================================
     // Default values are conservative (safe for L1=32KB, L2=256KB).
     // Call ComputeOptimalTiles() at startup with detected CacheHierarchy
@@ -95,17 +84,6 @@ struct GemmThresholdConfig {
     }
 
     /**
-     * @brief Determine whether to use oneDNN
-     * @return true if oneDNN should be used for this GEMM
-     */
-    bool ShouldUseOneDNN(int64_t M, int64_t K, int64_t N) const {
-        if (M <= prefill_m_threshold) return false;  // Use GEMV for decode
-        if (M < onednn_min_M || K < onednn_min_K || N < onednn_min_N) return false;
-        int64_t flops = 2 * M * K * N;  // 2*M*K*N for GEMM
-        return flops >= onednn_min_flops;
-    }
-
-    /**
      * @brief Determine whether to use BLAS (Apple/OpenBLAS)
      */
     bool ShouldUseBLAS(int64_t M, int64_t K, int64_t N) const {
@@ -118,7 +96,7 @@ struct GemmThresholdConfig {
  * @brief Global GEMM config accessor
  *
  * To adjust thresholds at runtime:
- *   GetGemmConfig().onednn_min_M = 8;
+ *   GetGemmConfig().tile_K = 256;
  */
 inline GemmThresholdConfig& GetGemmConfig() {
     static GemmThresholdConfig config;

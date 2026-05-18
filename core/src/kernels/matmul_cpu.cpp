@@ -128,29 +128,9 @@ bool ExecuteTransBViaMatmulBackend(const Tensor& A, const Tensor& B, Tensor* C) 
     params.b_type = B.dtype;
     params.c_type = C->dtype;
 
-    thread_local std::vector<ggml_bf16_t> a_bf16_buffer;
-    if (A.dtype == DType::F32 && B.dtype == DType::BF16 && params.M > 1) {
-        MatmulParams bf16_candidate = params;
-        bf16_candidate.a_type = DType::BF16;
-        if (SelectMatmulBackend(bf16_candidate, true) == MatmulBackendKind::OneDNN) {
-            const size_t total = static_cast<size_t>(params.M * params.K);
-            a_bf16_buffer.resize(total);
-            const float* a_f32 = A.DataAs<float>();
-            for (int64_t m = 0; m < params.M; ++m) {
-                ggml_fp32_to_bf16_row(a_f32 + static_cast<size_t>(m) * params.lda,
-                                      a_bf16_buffer.data() + static_cast<size_t>(m) * params.K,
-                                      static_cast<int>(params.K));
-            }
-            params.a = a_bf16_buffer.data();
-            params.lda = params.K;
-            params.a_type = DType::BF16;
-        }
-    }
-
     const bool is_prefill = params.M > 1;
-    MatmulBackendKind kind = SelectMatmulBackend(params, is_prefill);
-    MatmulBackend* backend =
-        (kind == MatmulBackendKind::OneDNN) ? &GetOneDnnMatmulBackend() : &GetDenseCoreMatmulBackend();
+    (void)SelectMatmulBackend(params, is_prefill);
+    MatmulBackend* backend = &GetDenseCoreMatmulBackend();
     if (!backend->Supports(params)) {
         backend = &GetDenseCoreMatmulBackend();
         if (!backend->Supports(params)) {

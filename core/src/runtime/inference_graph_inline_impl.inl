@@ -137,8 +137,12 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             IsMixedRoutingEnabled(&batch) && ResolvePreferredNormDevice(&batch) == densecore::DeviceType::CPU &&
             ResolvePreferredDevice(&batch) != densecore::DeviceType::CPU && src->type == GGML_TYPE_F32 &&
             effective_norm_weight->type == GGML_TYPE_F32 && src->nb[0] == static_cast<int64_t>(sizeof(float));
+        const bool use_qwen_weighted_rms_norm =
+            (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+            src->type == GGML_TYPE_F32 &&
+            effective_norm_weight->type == GGML_TYPE_F32 && src->nb[0] == static_cast<int64_t>(sizeof(float));
 
-        if (!force_cpu_norm) {
+        if (!force_cpu_norm && !use_qwen_weighted_rms_norm) {
             struct ggml_tensor* norm_src = ensure_rms_norm_f32_input(src, debug_name, debug_layer_idx);
             struct ggml_tensor* out = ggml_rms_norm(ctx_c, norm_src, model->hparams.f_norm_rms_eps);
             if (debug_name) {
@@ -399,12 +403,28 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             }
 
             // 1. qkv_mixed projection: normed input [n_embd, N] → [conv_channels, N]
+#if defined(__aarch64__) || defined(_M_ARM64)
             const bool prefer_plain_qwen35_hybrid_matmul =
                 (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
                 model->arch_flags.is_hybrid_ssm;
-            struct ggml_tensor* qkv_mixed = prefer_plain_qwen35_hybrid_matmul
-                                                ? ggml_mul_mat(ctx_c, attn_qkv, cur)
-                                                : smart_mul_mat(ctx_c, attn_qkv, cur, model);
+#else
+            const bool prefer_plain_qwen35_hybrid_matmul =
+                model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm;
+#endif
+            ggml_tensor* fused_qkv_gate = nullptr;
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+            if (model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm &&
+                model->hparams.n_experts > 0 && N == 1) {
+                if (ggml_tensor* fused_w = layer.Get("attn_qkv_gate.amx_fused_decode")) {
+                    fused_qkv_gate = ggml_mul_mat(ctx_c, fused_w, cur);
+                    ggml_set_name(fused_qkv_gate, "qwen35_ssm_qkv_gate_fused_proj");
+                }
+            }
+#endif
+            struct ggml_tensor* qkv_mixed =
+                fused_qkv_gate ? ggml_view_2d(ctx_c, fused_qkv_gate, conv_channels, N, fused_qkv_gate->nb[1], 0)
+                               : (prefer_plain_qwen35_hybrid_matmul ? ggml_mul_mat(ctx_c, attn_qkv, cur)
+                                                                     : smart_mul_mat(ctx_c, attn_qkv, cur, model));
             if (model->variant == ModelVariant::QWEN36) {
                 ggml_set_name(qkv_mixed, "qwen36_ssm_qkv_proj");
             }
@@ -451,8 +471,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             conv_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
             conv_ud->profile = &GetCurrentWorkContext()->qwen36_profile;
             const bool ssm_conv_channel_parallel =
-                model->variant == ModelVariant::QWEN36 && batch.num_seqs == 1 && N > 1 &&
-                ParseTruthyEnv("DENSECORE_QWEN36_PREFILL_SSM_CONV_CHANNEL_PARALLEL", true);
+                (model->variant == ModelVariant::QWEN36 ||
+                 (model->variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0)) &&
+                batch.num_seqs == 1 && N > 1;
             const int ssm_conv_tasks =
                 ssm_conv_channel_parallel
                     ? std::min(std::max(1, ResolveInferenceConfig(&batch).num_threads), std::max(1, conv_channels))
@@ -460,8 +481,12 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             struct ggml_tensor* qkv_conv = ggml_map_custom1(ctx_c, qkv_mixed, cb_ssm_conv1d, ssm_conv_tasks, conv_ud);
 
             // 3. z projection and recurrent Qwen3.5 delta-net block.
-            struct ggml_tensor* z = prefer_plain_qwen35_hybrid_matmul ? ggml_mul_mat(ctx_c, attn_gate_w, cur)
-                                                                      : smart_mul_mat(ctx_c, attn_gate_w, cur, model);
+            struct ggml_tensor* z =
+                fused_qkv_gate
+                    ? ggml_view_2d(ctx_c, fused_qkv_gate, d_inner, N, fused_qkv_gate->nb[1],
+                                   static_cast<size_t>(conv_channels) * static_cast<size_t>(fused_qkv_gate->nb[0]))
+                    : (prefer_plain_qwen35_hybrid_matmul ? ggml_mul_mat(ctx_c, attn_gate_w, cur)
+                                                         : smart_mul_mat(ctx_c, attn_gate_w, cur, model));
             if (model->variant == ModelVariant::QWEN36) {
                 ggml_set_name(z, "qwen36_ssm_gate_proj");
             }
@@ -493,8 +518,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             scan_ud->layer_idx = il;
             scan_ud->ssm_ordinal = ssm_ordinal;
             scan_ud->projection_profile = model->variant == ModelVariant::QWEN36
-                                              ? Qwen35SSMQkvProjectionProfile::QWEN36_OFFICIAL
-                                              : Qwen35SSMQkvProjectionProfile::QWEN35_OFFICIAL;
+                                               ? Qwen35SSMQkvProjectionProfile::QWEN36_OFFICIAL
+                                               : Qwen35SSMQkvProjectionProfile::QWEN35_OFFICIAL;
             scan_ud->token_seq_ids = batch.seq_id.data();
             scan_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
             scan_ud->z_tensor = z;
@@ -502,38 +527,24 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             scan_ud->input_tensor = cur;
             scan_ud->alpha_beta_tensor = nullptr;
             scan_ud->profile = &GetCurrentWorkContext()->qwen36_profile;
-            scan_ud->fast_silu_gate =
-                model->variant == ModelVariant::QWEN36 && ParseTruthyEnv("DENSECORE_QWEN36_SSM_FAST_SILU_GATE", true);
+            scan_ud->fast_silu_gate = model->variant == ModelVariant::QWEN36;
             struct ggml_tensor* alpha_beta = nullptr;
-            if (model->variant == ModelVariant::QWEN36 && batch.num_seqs == 1 && N > 1 &&
-                ParseTruthyEnv("DENSECORE_QWEN36_PREFILL_PRECOMPUTE_SSM_ALPHA_BETA", true)) {
-                const bool precompute_qk_norm = ParseTruthyEnv("DENSECORE_QWEN36_PREFILL_PRECOMPUTE_SSM_QK_NORM", true);
-                SSMAlphaBetaProjectUserData* alpha_beta_ud = AllocateSSMAlphaBetaProjectUserData(ctx_c);
-                if (!alpha_beta_ud) {
-                    throw densecore::OutOfMemoryException("Failed to allocate SSM alpha/beta projection userdata");
-                }
-                alpha_beta_ud->alpha_weight = ssm_rt.alpha_f32.data();
-                alpha_beta_ud->beta_weight = ssm_rt.beta_f32.data();
-                alpha_beta_ud->dt_bias = ssm_rt.dt_bias_f32.data();
-                alpha_beta_ud->n_embd = n_embd;
-                alpha_beta_ud->n_heads = num_v_heads;
-                alpha_beta_ud->layer_idx = il;
-                alpha_beta_ud->token_seq_ids = batch.seq_id.data();
-                const int alpha_beta_rows = 2 * num_v_heads + (precompute_qk_norm ? 3 * n_groups : 0);
+            const bool precompute_qwen_hybrid_ssm_scalars =
+                (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+                model->arch_flags.is_hybrid_ssm && batch.num_seqs == 1 && N > 1;
+            if (precompute_qwen_hybrid_ssm_scalars) {
+                const int alpha_beta_rows = 2 * num_v_heads + 3 * n_groups;
                 alpha_beta = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, alpha_beta_rows, N);
                 const int alpha_beta_tasks =
-                    ResolveTaskCount(&batch, std::max(1, N * (num_v_heads + (precompute_qk_norm ? n_groups : 0))));
-                alpha_beta = precompute_qk_norm
-                                 ? ggml_map_custom3(ctx_c, alpha_beta, cur, qkv_conv, cb_ssm_alpha_beta_qk_project_map3,
-                                                    alpha_beta_tasks, scan_ud)
-                                 : ggml_map_custom2(ctx_c, alpha_beta, cur, cb_ssm_alpha_beta_project_map2,
-                                                    alpha_beta_tasks, alpha_beta_ud);
+                    ResolveTaskCount(&batch, std::max(1, N * (num_v_heads + n_groups)));
+                alpha_beta = ggml_map_custom3(ctx_c, alpha_beta, cur, qkv_conv, cb_ssm_alpha_beta_qk_project_map3,
+                                               alpha_beta_tasks, scan_ud);
                 scan_ud->alpha_beta_tensor = alpha_beta;
             }
             const bool ssm_delta_head_parallel =
-                model->variant == ModelVariant::QWEN36 && batch.num_seqs == 1 &&
-                ParseTruthyEnv("DENSECORE_QWEN36_SSM_DELTA_HEAD_PARALLEL", true) &&
-                (batch.tokens.size() == 1 || ParseTruthyEnv("DENSECORE_QWEN36_PREFILL_SSM_DELTA_HEAD_PARALLEL", true));
+                (model->variant == ModelVariant::QWEN36 ||
+                 (model->variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0)) &&
+                batch.num_seqs == 1;
             const int ssm_delta_tasks =
                 ssm_delta_head_parallel
                     ? std::min(std::max(1, ResolveInferenceConfig(&batch).num_threads), std::max(1, num_v_heads))
@@ -544,10 +555,11 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                            : ggml_map_custom2(ctx_c, z, qkv_conv, cb_ssm_qwen35_delta_z_qkv, ssm_delta_tasks, scan_ud);
 
             // 4. Output projection: [d_inner, N] -> [n_embd, N]
-            // Qwen3.6 hybrid SSM hits large-M prefill shapes here, and the generic
-            // quantized dispatcher can drift on C4A. Keep this projection on the
-            // plain ggml matmul path until the batched quantized path is proven
-            // exact for SSM output weights too.
+            // Qwen3.6 hybrid SSM hits large-M prefill shapes here; keep that
+            // model on the conservative plain path until the batched quantized
+            // path is proven faster and exact for SSM projection weights.
+            // Qwen3.5 x86 C4 uses the same smart dispatch policy as
+            // attention/FFN projections.
             cur = prefer_plain_qwen35_hybrid_matmul ? ggml_mul_mat(ctx_c, ssm_out_w, y)
                                                     : smart_mul_mat(ctx_c, ssm_out_w, y, model);
             if (model->variant == ModelVariant::QWEN36) {
@@ -754,9 +766,13 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 Kcur = ggml_view_2d(ctx_c, qkv_merged, dim_k_fused, N, qkv_merged->nb[1], k_offset);
                 Vcur = ggml_view_2d(ctx_c, qkv_merged, dim_v_fused, N, qkv_merged->nb[1], v_offset);
             } else {
+#if defined(__aarch64__) || defined(_M_ARM64)
                 const bool prefer_plain_attention_projections =
                     (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
                     model->arch_flags.is_hybrid_ssm;
+#else
+                const bool prefer_plain_attention_projections = false;
+#endif
                 Qcur = prefer_plain_attention_projections ? ggml_mul_mat(ctx_c, wq, cur)
                                                           : smart_mul_mat(ctx_c, wq, cur, model);
                 Kcur = prefer_plain_attention_projections ? ggml_mul_mat(ctx_c, wk, cur)
@@ -1088,7 +1104,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 struct ggml_tensor* Q_rope_fast = nullptr;
                 struct ggml_tensor* K_rope_fast = nullptr;
                 const bool can_use_precomputed_rope =
-                    IsPrecomputedRoPEEnabled() &&
+                    (DENSECORE_DEFAULT_PRECOMPUTED_ROPE != 0) &&
                     (!model->arch_flags.is_gemma4 ||
                      (use_gemma4_proportional_rope && rope_freq_factors == nullptr && !gemma4_shared_kv_layer));
                 if (can_use_precomputed_rope) {
@@ -1254,8 +1270,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 const densecore::DeviceType preferred_attention_device = ResolvePreferredAttentionDevice(&batch);
                 const auto attention_dispatch = densecore::llm::attention::ResolveDecodeAttentionDispatchDecision(
                     model, base_paged_decode, use_cache, il, N, n_past_val, n_head, n_head_kv, head_dim_q, head_dim_kv,
-                    head_dim_v, preferred_attention_device, IsFlashAttentionDisabled(), IsFlashAttentionForced(),
-                    IsFlashAttentionIsaSupported(), IsPortableCpuFlashAttentionEnabled(),
+                    head_dim_v, preferred_attention_device, IsFlashAttentionDisabled(), false,
+                    IsFlashAttentionIsaSupported(), true,
                     densecore::OpsRegistry::IsInitialized(), IsForceSafeGqaDecodeEnabled(), -1,
                     ggml_is_contiguous(Qcur), ggml_is_contiguous(K_all),
                     ggml_is_contiguous(V_all), batch.num_seqs == 1 && !batch.seq_id.empty());
@@ -1461,15 +1477,6 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 const bool fast_attn_requires_extended_semantics = fast_attn_logit_softcap > 0.0f;
                 const uint32_t fast_attn_semantic_flags =
                     fast_attn_requires_extended_semantics ? kFastAttentionSemanticLogitSoftcap : 0u;
-                const bool flash_attn_forced = IsFlashAttentionForced();
-                if (flash_attn_forced && !attention_dispatch.flash_attn_runtime_supported && il == 0 &&
-                    IsVerboseGraphBuildLoggingEnabled()) {
-                    std::cerr
-                        << "[DenseCore] DENSECORE_FORCE_FLASH_ATTN requested but native ggml flash is unavailable; "
-                           "falling back to DenseCore portable flash attention or standard attention."
-                        << std::endl;
-                }
-
                 if (attention_dispatch.use_portable_cpu_flash_attention && fast_attn_sliding_window >= 0 &&
                     attn_query_base_pos > fast_attn_sliding_window && K && V && K->ne[2] == V->ne[2]) {
                     const int64_t kv_tokens = K->ne[2];
@@ -1661,15 +1668,31 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 post_ref_ud->var_name = "cur_input_to_wo";
                 cur = ggml_map_custom2(ctx_c, cur, KQV_merged, cb_attention_post_reference_probe, 1, post_ref_ud);
             }
+            if (ShouldRunHiddenSnapshotProbe(il, "attn_pre_output_proj")) {
+                auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
+                if (hidden_ud) {
+                    hidden_ud->layer_idx = il;
+                    hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                    hidden_ud->token_ids = batch.tokens.data();
+                    hidden_ud->token_seq_ids = batch.seq_id.data();
+                    hidden_ud->stage = "attn_pre_output_proj";
+                    hidden_ud->var_name = "cur_input_to_wo";
+                    cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
+                }
+            }
 
             // Output Projection (using smart dispatcher for Parallel GEMV)
             struct ggml_tensor* cur_input_to_wo = cur;
             if (!wo) {
                 throw densecore::InvalidArgumentException("Missing attn_output weight in TransformerLayer");
             }
+#if defined(__aarch64__) || defined(_M_ARM64)
             const bool prefer_plain_attn_output_matmul =
                 (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
                 model->arch_flags.is_hybrid_ssm;
+#else
+            const bool prefer_plain_attn_output_matmul = false;
+#endif
             cur = prefer_plain_attn_output_matmul ? ggml_mul_mat(ctx_c, wo, cur) : smart_mul_mat(ctx_c, wo, cur, model);
             if (ShouldRunAttentionProjectionReferenceProbe(il)) {
                 ProjectionReferenceUserData* o_ref_ud = GetProjectionReferenceUserData();
@@ -1819,9 +1842,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         }
 
         bool used_fused_pre_ffn_norm = false;
-        const bool fused_pre_ffn_norm_graph_cache_safe = !decode_only_batch_layout;
-        if (fused_pre_ffn_norm_graph_cache_safe && IsFusedResidualRmsNormEnabled() && attn_out && inpL &&
-            attn_out->type == GGML_TYPE_F32 &&
+        const bool use_fused_pre_ffn_norm = model->variant == ModelVariant::QWEN35;
+        if (use_fused_pre_ffn_norm && attn_out && inpL && attn_out->type == GGML_TYPE_F32 &&
             inpL->type == GGML_TYPE_F32 && ffn_norm->type == GGML_TYPE_F32 && ffn_norm->data) {
             AddRMSNormUserData* fused_ud = GetAddRMSNormUserData();
             fused_ud->residual = nullptr;
@@ -1938,9 +1960,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // 2. Dispatch
             int moe_top_k = layer_spec ? layer_spec->ffn.top_k : static_cast<int>(model->hparams.n_experts_used);
-            struct ggml_tensor* native_moe =
-                TryBuildGemma4NativeMoEGraph(ctx_c, gf, model, &model->layers[il], il, routed_input, gate_logits,
-                                             moe_top_k);
+            struct ggml_tensor* native_moe = TryBuildGemma4NativeMoEGraph(
+                ctx_c, gf, model, &model->layers[il], il, routed_input, gate_logits, moe_top_k);
             if (!native_moe) {
                 native_moe = TryBuildQwen35NativeMoEGraph(ctx_c, gf, model, &model->layers[il], il, routed_input,
                                                           gate_logits, moe_top_k, layer_spec);
@@ -2031,13 +2052,19 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 DebugLogSharedExpertTensor("ffn_up_w", il, ffn_up);
                 DebugLogSharedExpertTensor("ffn_down_w", il, ffn_down);
                 DebugLogSharedExpertTensor("ffn_shared_gate_w", il, ffn_shared_gate);
+#if defined(__aarch64__) || defined(_M_ARM64)
                 const bool prefer_plain_shared_expert_matmul =
                     (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
                     model->arch_flags.is_hybrid_ssm;
+#else
+                const bool prefer_plain_shared_expert_matmul = false;
+#endif
                 struct ggml_tensor* shared_gate = nullptr;
                 struct ggml_tensor* shared_up = nullptr;
                 struct ggml_tensor* shared_gate_up_fused =
-                    (is_gemma4_moe && !prefer_plain_shared_expert_matmul && shared_input->type == GGML_TYPE_F32)
+                    ((is_gemma4_moe || model->variant == ModelVariant::QWEN35 ||
+                      model->variant == ModelVariant::QWEN36) &&
+                     !prefer_plain_shared_expert_matmul && shared_input->type == GGML_TYPE_F32)
                         ? layer.Get("ffn_gate_up.cpu_repack_fused")
                         : nullptr;
                 if (shared_gate_up_fused &&
@@ -2062,6 +2089,11 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     shared_up = prefer_plain_shared_expert_matmul
                                     ? ggml_mul_mat(ctx_c, ffn_up, shared_input)
                                     : smart_mul_mat(ctx_c, ffn_up, shared_input, model);
+                    char shared_proj_name[96];
+                    std::snprintf(shared_proj_name, sizeof(shared_proj_name), "blk.%d.shared_ffn_gate_proj", il);
+                    ggml_set_name(shared_gate, shared_proj_name);
+                    std::snprintf(shared_proj_name, sizeof(shared_proj_name), "blk.%d.shared_ffn_up_proj", il);
+                    ggml_set_name(shared_up, shared_proj_name);
                 }
                 DebugLogSharedExpertTensor("shared_gate_proj", il, shared_gate);
                 DebugLogSharedExpertTensor("shared_up_proj", il, shared_up);
@@ -2101,6 +2133,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 struct ggml_tensor* shared_ffn_input = shared_ffn;
                 shared_ffn = prefer_plain_shared_expert_matmul ? ggml_mul_mat(ctx_c, ffn_down, shared_ffn)
                                                                : smart_mul_mat(ctx_c, ffn_down, shared_ffn, model);
+                char shared_down_name[96];
+                std::snprintf(shared_down_name, sizeof(shared_down_name), "blk.%d.shared_ffn_down_proj", il);
+                ggml_set_name(shared_ffn, shared_down_name);
                 DebugLogSharedExpertTensor("shared_ffn_post_down", il, shared_ffn);
                 if (ShouldRunFfnProjectionReferenceProbe(il)) {
                     ProjectionReferenceUserData* shared_down_ref_ud = GetProjectionReferenceUserData();
@@ -2124,6 +2159,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     }
                 } else {
                     struct ggml_tensor* shared_gate_logits = ggml_mul_mat(ctx_c, ffn_shared_gate, shared_input);
+                    char shared_scalar_name[96];
+                    std::snprintf(shared_scalar_name, sizeof(shared_scalar_name), "blk.%d.shared_ffn_scalar_gate", il);
+                    ggml_set_name(shared_gate_logits, shared_scalar_name);
                     struct ggml_tensor* shared_gate_logits_scalar = shared_gate_logits;
                     DebugLogSharedExpertTensor("shared_scalar_gate_proj", il, shared_gate_logits);
                     if (ShouldRunFfnProjectionReferenceProbe(il)) {
@@ -2197,14 +2235,26 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             if (!ffn_gate || !ffn_up || !ffn_down) {
                 throw densecore::InvalidArgumentException("Missing FFN weights in TransformerLayer");
             }
+#if defined(__aarch64__) || defined(_M_ARM64)
             const bool prefer_plain_qwen35_hybrid_ffn =
                 model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
+#else
+            const bool prefer_plain_qwen35_hybrid_ffn = false;
+#endif
             struct ggml_tensor* w1 = nullptr;
             struct ggml_tensor* w3 = nullptr;
+            struct ggml_tensor* fused_gate_up_swiglu = nullptr;
             struct ggml_tensor* dense_gate_up_fused =
-                (model->arch_flags.is_gemma4 && !prefer_plain_qwen35_hybrid_ffn && cur->type == GGML_TYPE_F32)
+                ((model->arch_flags.is_gemma4 || model->variant == ModelVariant::QWEN35 ||
+                  model->variant == ModelVariant::QWEN36) &&
+                 !prefer_plain_qwen35_hybrid_ffn && cur->type == GGML_TYPE_F32)
                     ? layer.Get("ffn_gate_up.cpu_repack_fused")
                     : nullptr;
+            if (model->variant == ModelVariant::QWEN35 && cur->ne[1] <= 32) {
+                if (struct ggml_tensor* decode_fused = layer.Get("ffn_gate_up.cpu_repack_fused_decode")) {
+                    dense_gate_up_fused = decode_fused;
+                }
+            }
             if (dense_gate_up_fused &&
                 (dense_gate_up_fused->ne[0] != cur->ne[0] ||
                  dense_gate_up_fused->ne[1] != ffn_gate->ne[1] + ffn_up->ne[1])) {
@@ -2215,9 +2265,17 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 char fused_name[96];
                 std::snprintf(fused_name, sizeof(fused_name), "blk.%d.ffn_gate_up.cpu_repack_fused", il);
                 ggml_set_name(gate_up, fused_name);
-                const size_t up_offset = static_cast<size_t>(ffn_gate->ne[1]) * sizeof(float);
-                w1 = ggml_view_2d(ctx_c, gate_up, ffn_gate->ne[1], cur->ne[1], gate_up->nb[1], 0);
-                w3 = ggml_view_2d(ctx_c, gate_up, ffn_up->ne[1], cur->ne[1], gate_up->nb[1], up_offset);
+                const bool can_fuse_gate_up_activation =
+                    !model->arch_flags.is_gemma4 && batch.lora_map.empty() && !ShouldRunFfnProjectionReferenceProbe(il);
+                fused_gate_up_swiglu =
+                    can_fuse_gate_up_activation
+                        ? BuildFusedGateUpSiluMul(ctx_c, gate_up, ffn_gate->ne[1], cur->ne[1], "ffn_silu_mul_fused")
+                        : nullptr;
+                if (!fused_gate_up_swiglu) {
+                    const size_t up_offset = static_cast<size_t>(ffn_gate->ne[1]) * sizeof(float);
+                    w1 = ggml_view_2d(ctx_c, gate_up, ffn_gate->ne[1], cur->ne[1], gate_up->nb[1], 0);
+                    w3 = ggml_view_2d(ctx_c, gate_up, ffn_up->ne[1], cur->ne[1], gate_up->nb[1], up_offset);
+                }
             } else {
                 w1 = prefer_plain_qwen35_hybrid_ffn ? ggml_mul_mat(ctx_c, ffn_gate, cur)
                                                     : smart_mul_mat(ctx_c, ffn_gate, cur, model);
@@ -2245,7 +2303,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             }
 
             // Apply Multi-LoRA [FFN Gate/Up]
-            if (!batch.lora_map.empty()) {
+            if (!fused_gate_up_swiglu && !batch.lora_map.empty()) {
                 char name_buf[64];
                 snprintf(name_buf, sizeof(name_buf), "blk.%d.ffn_gate", il);
                 ggml_set_name(w1, name_buf);
@@ -2258,7 +2316,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // Fused SiLU×Mul: silu(w1) * w3 in single pass (avoids intermediate tensor)
             // This saves ~50% memory bandwidth in FFN forward pass.
-            if (model->arch_flags.is_gemma4) {
+            if (fused_gate_up_swiglu) {
+                cur = fused_gate_up_swiglu;
+            } else if (model->arch_flags.is_gemma4) {
                 // Match llama.cpp Gemma4 path: use native GEGLU so strided matmul
                 // outputs do not rely on custom flat-memory assumptions.
                 cur = ggml_geglu_split(ctx_c, w1, w3);
@@ -2271,6 +2331,18 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 }
             }
             ggml_set_name(cur, "ffn_silu_mul_fused");
+            if (ShouldRunHiddenSnapshotProbe(il, "ffn_pre_down")) {
+                auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
+                if (hidden_ud) {
+                    hidden_ud->layer_idx = il;
+                    hidden_ud->token_idx = ParseIntEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_TOKEN", -1);
+                    hidden_ud->token_ids = batch.tokens.data();
+                    hidden_ud->token_seq_ids = batch.seq_id.data();
+                    hidden_ud->stage = "ffn_pre_down";
+                    hidden_ud->var_name = "ffn_swiglu";
+                    cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
+                }
+            }
 
             // Apply Multi-LoRA [FFN Down]
             struct ggml_tensor* ffn_input = cur;

@@ -296,6 +296,15 @@ void ResetInferenceWorkContext(InferenceWorkContext* ctx) {
     g_shared_batch.store(nullptr, std::memory_order_release);
 }
 
+void ResetCachedDecodeGraphWorkContext(InferenceWorkContext* ctx) {
+    if (!ctx) return;
+    ResetQwen36Profile(ctx);
+    ctx->paged_attention_shared_k_block_ptrs.clear();
+    ctx->paged_attention_shared_v_block_ptrs.clear();
+    ctx->gemv_quantized_stamp.store(0, std::memory_order_relaxed);
+    ctx->gemv_batched_quantized_stamp.store(0, std::memory_order_relaxed);
+}
+
 void SetCurrentWorkContext(InferenceWorkContext* ctx) {
     tls_work_ctx = ctx;
 }

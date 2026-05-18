@@ -61,7 +61,8 @@ TEST(ChatTemplateTest, QwenNoThinkingAutoTemplateKeepsChatMLScaffoldForUnicodePr
     EXPECT_EQ(wrapped,
               "<|im_start|>user\n"
               "안녕? /no_think<|im_end|>\n"
-              "<|im_start|>assistant\n");
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
 }
 
 TEST(ChatTemplateTest, Qwen35DefaultsToNoThinkingWhenEnvIsUnset) {
@@ -76,7 +77,8 @@ TEST(ChatTemplateTest, Qwen35DefaultsToNoThinkingWhenEnvIsUnset) {
     EXPECT_EQ(wrapped,
               "<|im_start|>user\n"
               "hello /no_think<|im_end|>\n"
-              "<|im_start|>assistant\n");
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
 }
 
 TEST(ChatTemplateTest, Qwen3DefaultsToThinkingWhenEnvIsUnset) {

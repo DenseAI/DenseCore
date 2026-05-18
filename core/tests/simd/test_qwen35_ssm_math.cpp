@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -106,6 +107,102 @@ float MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b) {
         max_abs = std::max(max_abs, std::fabs(a[i] - b[i]));
     }
     return max_abs;
+}
+
+void ExpectVectorNear(const std::vector<float>& actual, const std::vector<float>& expected, float abs_tol) {
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t i = 0; i < actual.size(); ++i) {
+        EXPECT_NEAR(actual[i], expected[i], abs_tol) << "index=" << i;
+    }
+}
+
+float PseudoRandomValue(size_t index, float scale) {
+    const float a = std::sin(static_cast<float>(index + 1) * 12.9898f);
+    const float b = std::cos(static_cast<float>(index + 3) * 78.233f);
+    return (a * b) * scale;
+}
+
+void FillPseudoRandom(std::vector<float>* values, float scale) {
+    ASSERT_NE(values, nullptr);
+    for (size_t i = 0; i < values->size(); ++i) {
+        (*values)[i] = PseudoRandomValue(i, scale);
+    }
+}
+
+bool RunLegacyFastDefaultForComparison(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head,
+                                       float* y_pre_norm) {
+    if (!cfg.input_t || !cfg.q_head || !cfg.k_head || !cfg.v_head || !cfg.z_head || !cfg.alpha_row || !cfg.beta_row ||
+        !state_kv || !y_head || !y_pre_norm || cfg.n_embd <= 0 || cfg.head_dim_k <= 0 || cfg.head_dim_v <= 0) {
+        return false;
+    }
+
+    float alpha = cfg.dt_bias;
+    float beta = 0.0f;
+    if (cfg.has_precomputed_alpha_beta) {
+        alpha = cfg.precomputed_alpha;
+        beta = cfg.precomputed_beta;
+    } else {
+        for (int i = 0; i < cfg.n_embd; ++i) {
+            alpha += cfg.alpha_row[i] * cfg.input_t[i];
+            beta += cfg.beta_row[i] * cfg.input_t[i];
+        }
+    }
+
+    const float ssm_a = cfg.a_log_prescaled ? cfg.a_log : -std::exp(cfg.a_log);
+    const float decay = std::exp(ssm_a * SoftplusRef(alpha));
+    const float beta_gate = SigmoidRef(beta);
+
+    float q_inv_norm = cfg.precomputed_q_inv_norm;
+    float k_inv_norm = cfg.precomputed_k_inv_norm;
+    if (!cfg.has_precomputed_qk_norm) {
+        float q_sum_sq = 0.0f;
+        float k_sum_sq = 0.0f;
+        for (int k = 0; k < cfg.head_dim_k; ++k) {
+            q_sum_sq += cfg.q_head[k] * cfg.q_head[k];
+            k_sum_sq += cfg.k_head[k] * cfg.k_head[k];
+        }
+        q_inv_norm = 1.0f / std::sqrt(q_sum_sq + cfg.norm_eps);
+        k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+    }
+
+    std::vector<float> delta(static_cast<size_t>(cfg.head_dim_v), 0.0f);
+    for (int k = 0; k < cfg.head_dim_k; ++k) {
+        const float k_val = cfg.k_head[k] * k_inv_norm;
+        const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        for (int v = 0; v < cfg.head_dim_v; ++v) {
+            delta[static_cast<size_t>(v)] += state_row[v] * k_val;
+        }
+    }
+    for (int v = 0; v < cfg.head_dim_v; ++v) {
+        delta[static_cast<size_t>(v)] = (cfg.v_head[v] - delta[static_cast<size_t>(v)] * decay) * beta_gate;
+        y_head[v] = 0.0f;
+    }
+
+    const float attention_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k));
+    for (int k = 0; k < cfg.head_dim_k; ++k) {
+        const float k_val = cfg.k_head[k] * k_inv_norm;
+        const float q_val = cfg.q_head[k] * q_inv_norm * attention_scale;
+        float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        for (int v = 0; v < cfg.head_dim_v; ++v) {
+            const float updated = decay * state_row[v] + k_val * delta[static_cast<size_t>(v)];
+            state_row[v] = updated;
+            y_head[v] += updated * q_val;
+        }
+    }
+
+    std::memcpy(y_pre_norm, y_head, static_cast<size_t>(cfg.head_dim_v) * sizeof(float));
+    float sum_sq = 0.0f;
+    for (int v = 0; v < cfg.head_dim_v; ++v) {
+        sum_sq += y_head[v] * y_head[v];
+    }
+    const float rms = std::sqrt(sum_sq / cfg.head_dim_v + cfg.norm_eps);
+    const float inv_rms = 1.0f / rms;
+    for (int v = 0; v < cfg.head_dim_v; ++v) {
+        const float norm = cfg.norm_weight ? cfg.norm_weight[v] + (cfg.norm_weight_uses_unit_offset ? 1.0f : 0.0f)
+                                           : 1.0f;
+        y_head[v] = (y_head[v] * inv_rms) * norm * SiluRef(cfg.z_head[v]);
+    }
+    return true;
 }
 
 }  // namespace
@@ -306,7 +403,7 @@ TEST(Qwen35SSMMathTest, DefaultStepMatchesInPlaceReference) {
 
     EXPECT_EQ(Qwen35SSMHeadStateElements(cfg.head_dim_k, cfg.head_dim_v), state.size());
     EXPECT_EQ(state, expected_state);
-    EXPECT_EQ(y, expected_y);
+    ExpectVectorNear(y, expected_y, 2e-6f);
 }
 
 TEST(Qwen35SSMMathTest, IsolatedWritebackIsDeterministicAcrossRepeatedRequests) {
@@ -383,7 +480,86 @@ TEST(Qwen35SSMMathTest, FastDefaultMatchesInPlaceReference) {
     ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepFastDefault(cfg, state.data(), y.data()));
 
     EXPECT_EQ(state, expected_state);
-    EXPECT_EQ(y, expected_y);
+    ExpectVectorNear(y, expected_y, 2e-6f);
+}
+
+TEST(Qwen35SSMMathTest, OptimizedFastDefaultMatchesLegacyTwoPassFastPath) {
+    constexpr int n_embd = 192;
+    constexpr int head_dim_k = 64;
+    constexpr int head_dim_v = 128;
+    const size_t state_elems = Qwen35SSMHeadStateElements(head_dim_k, head_dim_v);
+    ASSERT_GT(state_elems, 0u);
+
+    for (int iter = 0; iter < 8; ++iter) {
+        std::vector<float> input(static_cast<size_t>(n_embd));
+        std::vector<float> q(static_cast<size_t>(head_dim_k));
+        std::vector<float> k(static_cast<size_t>(head_dim_k));
+        std::vector<float> v(static_cast<size_t>(head_dim_v));
+        std::vector<float> z(static_cast<size_t>(head_dim_v));
+        std::vector<float> alpha(static_cast<size_t>(n_embd));
+        std::vector<float> beta(static_cast<size_t>(n_embd));
+        std::vector<float> norm(static_cast<size_t>(head_dim_v));
+        std::vector<float> state_legacy(state_elems);
+
+        FillPseudoRandom(&input, 0.08f + 0.005f * iter);
+        FillPseudoRandom(&q, 0.11f + 0.003f * iter);
+        FillPseudoRandom(&k, 0.10f + 0.002f * iter);
+        FillPseudoRandom(&v, 0.13f + 0.004f * iter);
+        FillPseudoRandom(&z, 0.09f + 0.002f * iter);
+        FillPseudoRandom(&alpha, 0.02f);
+        FillPseudoRandom(&beta, 0.02f);
+        FillPseudoRandom(&norm, 0.025f);
+        FillPseudoRandom(&state_legacy, 0.05f + 0.002f * iter);
+        for (float& value : norm) {
+            value += 1.0f;
+        }
+
+        std::vector<float> state_optimized = state_legacy;
+        std::vector<float> y_legacy(static_cast<size_t>(head_dim_v), 0.0f);
+        std::vector<float> y_optimized(static_cast<size_t>(head_dim_v), 0.0f);
+        std::vector<float> y_legacy_pre(static_cast<size_t>(head_dim_v), 0.0f);
+        std::vector<float> y_optimized_pre(static_cast<size_t>(head_dim_v), 0.0f);
+
+        Qwen35SSMHeadStepConfig cfg{};
+        cfg.input_t = input.data();
+        cfg.q_head = q.data();
+        cfg.k_head = k.data();
+        cfg.v_head = v.data();
+        cfg.z_head = z.data();
+        cfg.alpha_row = alpha.data();
+        cfg.beta_row = beta.data();
+        cfg.norm_weight = norm.data();
+        cfg.n_embd = n_embd;
+        cfg.head_dim_k = head_dim_k;
+        cfg.head_dim_v = head_dim_v;
+        cfg.dt_bias = -0.03f + 0.01f * iter;
+        cfg.a_log = -1.15f + 0.02f * iter;
+        cfg.norm_eps = 1e-6f;
+        cfg.a_log_prescaled = (iter % 2) == 0;
+        cfg.norm_weight_uses_unit_offset = (iter % 3) == 0;
+
+        Qwen35SSMHeadStepStats stats{};
+        ASSERT_TRUE(RunLegacyFastDefaultForComparison(cfg, state_legacy.data(), y_legacy.data(), y_legacy_pre.data()));
+        ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepFastDefault(cfg, state_optimized.data(), y_optimized.data(), &stats,
+                                                           y_optimized_pre.data()));
+
+        float max_state_err = 0.0f;
+        for (size_t i = 0; i < state_legacy.size(); ++i) {
+            max_state_err = std::max(max_state_err, std::fabs(state_optimized[i] - state_legacy[i]));
+        }
+        float max_pre_err = 0.0f;
+        float max_post_err = 0.0f;
+        for (size_t i = 0; i < y_legacy.size(); ++i) {
+            max_pre_err = std::max(max_pre_err, std::fabs(y_optimized_pre[i] - y_legacy_pre[i]));
+            max_post_err = std::max(max_post_err, std::fabs(y_optimized[i] - y_legacy[i]));
+        }
+
+        EXPECT_LE(max_state_err, 1e-6f) << "iter=" << iter;
+        EXPECT_LE(max_pre_err, 1e-5f) << "iter=" << iter;
+        EXPECT_LE(max_post_err, 1e-5f) << "iter=" << iter;
+        EXPECT_GT(stats.first_pass_dual_dot_ms + stats.state_update_only_ms + stats.total_fast_ssm_ms, 0.0);
+        EXPECT_EQ(stats.output_accum_ms, 0.0);
+    }
 }
 
 TEST(Qwen35SSMMathTest, CanonicalizeFusedBAGroupedLayout) {
