@@ -199,6 +199,11 @@ TEST(DecoderModelSpec, QwenPrefillLastLogitsPolicyDefaultsOnForQwen35AndQwen36) 
     EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
         qwen35_spec, densecore::models::DecoderSpecializationKind::PrefillLastLogits));
     EXPECT_TRUE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen35_spec, /*num_seqs=*/1, /*n_tokens=*/8));
+    densecore::models::DecoderPrefillRuntimePolicy qwen35_opt_out_policy =
+        densecore::models::DefaultDecoderPrefillRuntimePolicy();
+    qwen35_opt_out_policy.qwen35_prefill_last_logits_only = false;
+    EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen35_spec, /*num_seqs=*/1, /*n_tokens=*/8,
+                                                                   qwen35_opt_out_policy));
 
     TransformerModel qwen36{};
     qwen36.arch = ModelArch::QWEN35;

@@ -582,6 +582,18 @@ DENSECORE_API int SubmitRequestIdsWithSamplingConstraintsCallbackEx(
     const int* disallowed_token_ids, int num_disallowed_token_ids, TokenCallbackEx callback, void* user_data);
 
 /**
+ * Submit an already-rendered prompt as token IDs with the rendered prompt kept
+ * on the request for prompt-state/suppression/blocklist parity. The prompt is
+ * not re-tokenized and no automatic chat template is applied.
+ */
+DENSECORE_API int SubmitRenderedRequestIdsWithSamplingConstraintsCallbackEx(
+    DenseCoreHandle handle, const char* rendered_prompt, const int* tokens, int n_tokens, int max_tokens,
+    const char* lora_name, float temperature, float top_p, int top_k, float repetition_penalty,
+    const char** stop_sequences, int json_mode, const int* allowed_token_ids, int num_allowed_token_ids,
+    int allowed_token_ids_strict, const int* disallowed_token_ids, int num_disallowed_token_ids,
+    TokenCallbackEx callback, void* user_data);
+
+/**
  * Submit a request with token IDs and format specification (Non-blocking)
  *
  * @param handle Handle to the DenseCore engine
@@ -748,17 +760,48 @@ typedef struct {
     int template_applied;
     int text_primed;
     int token_primed;
+    const char* tokenizer_type;
+    const char* model_variant;
+    const char* prompt_family;
+    int caller_owns_buffers;
 } DenseCoreRequestSnapshot;
+
+typedef struct {
+    int struct_size;
+    int token_id_submit_supported;
+    int prefix_cache_reuse_enabled;
+    int hybrid_ssm_snapshot_restore_enabled;
+    int prefill_graph_cache_enabled;
+    int prefill_arena_reuse_enabled;
+    int decode_graph_cache_enabled;
+    int decode_graph_cache_max_batch;
+    int decode_graph_cache_lru_size;
+    int moe_dequant_cache_mb;
+    char active_thread_policy_label[64];
+} DenseCoreRuntimeOptimizationState;
 
 DENSECORE_API int DenseCoreRenderChatPrompt(DenseCoreHandle handle, const DenseCoreChatMessage* messages,
                                             int num_messages, const DenseCoreChatTemplateOptions* options,
                                             DenseCoreRenderedChatPrompt* out);
+/* Deprecated borrowed-pointer preview APIs. Returned pointers are thread-local and valid only until
+ * the next preview/render call on the same thread. Concurrent request preparation should use the
+ * caller-owned DenseCoreBuildRequestSnapshot APIs below and release with DenseCoreFreeRequestSnapshot. */
 DENSECORE_API int DenseCorePreviewTextRequest(DenseCoreHandle handle, const char* prompt, int max_tokens,
                                               float temperature, float top_p, int top_k, float repetition_penalty,
                                               int json_mode, DenseCoreRequestSnapshot* out);
 DENSECORE_API int DenseCorePreviewTokenRequest(DenseCoreHandle handle, const int* token_ids, int num_token_ids,
                                                int max_tokens, float temperature, float top_p, int top_k,
                                                float repetition_penalty, int json_mode, DenseCoreRequestSnapshot* out);
+DENSECORE_API int DenseCoreBuildRequestSnapshot(DenseCoreHandle handle, const char* prompt, int max_tokens,
+                                                float temperature, float top_p, int top_k, float repetition_penalty,
+                                                int json_mode, DenseCoreRequestSnapshot* out);
+DENSECORE_API int DenseCoreBuildRenderedRequestSnapshot(DenseCoreHandle handle, const char* rendered_prompt,
+                                                        int max_tokens, float temperature, float top_p, int top_k,
+                                                        float repetition_penalty, int json_mode,
+                                                        DenseCoreRequestSnapshot* out);
+DENSECORE_API void DenseCoreFreeRequestSnapshot(DenseCoreRequestSnapshot* snapshot);
+DENSECORE_API int DenseCoreGetRuntimeOptimizationState(DenseCoreHandle handle,
+                                                       DenseCoreRuntimeOptimizationState* out);
 
 /**
  * Cancel a running request

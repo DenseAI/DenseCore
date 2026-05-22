@@ -28,12 +28,12 @@ TEST(OpRegistryDITest, IndependentInstances) {
 TEST(OpRegistryDITest, GlobalRegistrarIntegration) {
     // Add a global registrar
     OpRegistry::AddGlobalRegistrar([](OpRegistry& r) {
-        r.Register<MockOpDI>(OpType::Softmax, DeviceType::CPU);
+        r.Register<MockOpDI>(OpType::Custom, DeviceType::CPU);
     });
 
     // New instance should automatically have the global registration
     OpRegistry registry;
-    EXPECT_NE(registry.Get(OpType::Softmax, DeviceType::CPU), nullptr);
+    EXPECT_NE(registry.Get(OpType::Custom, DeviceType::CPU), nullptr);
 }
 
 } // namespace

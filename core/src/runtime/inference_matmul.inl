@@ -1,3 +1,7 @@
+#include "kernels/q4k_repacked_gemv.h"
+
+#include <condition_variable>
+
 struct Q8RepackedGemvWeight {
     int64_t rows = 0;
     int64_t cols = 0;
@@ -27,6 +31,727 @@ struct Q8RepackedGemvKeyHash {
 
 constexpr int kQ8RepackedGemvMinOutputRows = 4096;
 constexpr int64_t kQwen36C4AmxSmartMatmulMaxTokens = 128;
+
+enum class Q4KRepackedGemvRejectReason : int {
+    None = 0,
+    EnvOff = 1,
+    UnsupportedIsa = 2,
+    NotDecode = 3,
+    NotQ4K = 4,
+    DynamicLora = 5,
+    Shape = 6,
+    MissingVecDot = 7,
+    Cache = 8,
+    RealKernelUnavailable = 9,
+    CopiedExperimentDisabled = 10,
+    ProbeFailed = 11,
+    ReferenceForced = 12,
+};
+
+const char* Q4KRepackedGemvRejectReasonName(int reason) {
+    switch (static_cast<Q4KRepackedGemvRejectReason>(reason)) {
+        case Q4KRepackedGemvRejectReason::None:
+            return "none";
+        case Q4KRepackedGemvRejectReason::EnvOff:
+            return "env_off";
+        case Q4KRepackedGemvRejectReason::UnsupportedIsa:
+            return "unsupported_isa";
+        case Q4KRepackedGemvRejectReason::NotDecode:
+            return "not_decode";
+        case Q4KRepackedGemvRejectReason::NotQ4K:
+            return "not_q4k";
+        case Q4KRepackedGemvRejectReason::DynamicLora:
+            return "dynamic_lora";
+        case Q4KRepackedGemvRejectReason::Shape:
+            return "shape";
+        case Q4KRepackedGemvRejectReason::MissingVecDot:
+            return "missing_vec_dot";
+        case Q4KRepackedGemvRejectReason::Cache:
+            return "cache";
+        case Q4KRepackedGemvRejectReason::RealKernelUnavailable:
+            return "real_kernel_unavailable";
+        case Q4KRepackedGemvRejectReason::CopiedExperimentDisabled:
+            return "copied_experiment_disabled";
+        case Q4KRepackedGemvRejectReason::ProbeFailed:
+            return "probe_failed";
+        case Q4KRepackedGemvRejectReason::ReferenceForced:
+            return "reference_forced";
+    }
+    return "unknown";
+}
+
+enum class Q4KCopiedGemvExperimentRejectReason : int {
+    None = 0,
+    Disabled = 1,
+    DynamicLora = 2,
+    Shape = 3,
+    MissingVecDot = 4,
+    Cache = 5,
+};
+
+const char* Q4KCopiedGemvExperimentRejectReasonName(int reason) {
+    switch (static_cast<Q4KCopiedGemvExperimentRejectReason>(reason)) {
+        case Q4KCopiedGemvExperimentRejectReason::None:
+            return "none";
+        case Q4KCopiedGemvExperimentRejectReason::Disabled:
+            return "copied_experiment_disabled";
+        case Q4KCopiedGemvExperimentRejectReason::DynamicLora:
+            return "dynamic_lora";
+        case Q4KCopiedGemvExperimentRejectReason::Shape:
+            return "shape";
+        case Q4KCopiedGemvExperimentRejectReason::MissingVecDot:
+            return "missing_vec_dot";
+        case Q4KCopiedGemvExperimentRejectReason::Cache:
+            return "cache";
+    }
+    return "unknown";
+}
+
+enum class Qwen36SSMQ8PrefillAMXRejectReason : int {
+    None = 0,
+    EnvOff = 1,
+    NotQwen36HybridSsm = 2,
+    NotPrefill = 3,
+    NotSSMProjection = 4,
+    NotQ8_0 = 5,
+    DynamicLora = 6,
+    BackendUnavailable = 7,
+    AliasUnavailable = 8,
+    ProbeUnavailable = 9,
+    Admitted = 10,
+    DecodeOriginalQ8 = 11,
+    ResidentDecodeRegressionRisk = 12,
+    PhaseUnknown = 13,
+};
+
+const char* Qwen36SSMQ8PrefillAMXRejectReasonName(int reason) {
+    switch (static_cast<Qwen36SSMQ8PrefillAMXRejectReason>(reason)) {
+        case Qwen36SSMQ8PrefillAMXRejectReason::None:
+            return "none";
+        case Qwen36SSMQ8PrefillAMXRejectReason::EnvOff:
+            return "env_off";
+        case Qwen36SSMQ8PrefillAMXRejectReason::NotQwen36HybridSsm:
+            return "not_qwen36_hybrid_ssm";
+        case Qwen36SSMQ8PrefillAMXRejectReason::NotPrefill:
+            return "not_prefill";
+        case Qwen36SSMQ8PrefillAMXRejectReason::NotSSMProjection:
+            return "not_ssm_projection";
+        case Qwen36SSMQ8PrefillAMXRejectReason::NotQ8_0:
+            return "not_q8_0";
+        case Qwen36SSMQ8PrefillAMXRejectReason::DynamicLora:
+            return "dynamic_lora";
+        case Qwen36SSMQ8PrefillAMXRejectReason::BackendUnavailable:
+            return "backend_unavailable";
+        case Qwen36SSMQ8PrefillAMXRejectReason::AliasUnavailable:
+            return "alias_unavailable";
+        case Qwen36SSMQ8PrefillAMXRejectReason::ProbeUnavailable:
+            return "probe_unavailable";
+        case Qwen36SSMQ8PrefillAMXRejectReason::Admitted:
+            return "admitted";
+        case Qwen36SSMQ8PrefillAMXRejectReason::DecodeOriginalQ8:
+            return "decode_original_q8";
+        case Qwen36SSMQ8PrefillAMXRejectReason::ResidentDecodeRegressionRisk:
+            return "resident_decode_regression_risk";
+        case Qwen36SSMQ8PrefillAMXRejectReason::PhaseUnknown:
+            return "phase_unknown";
+    }
+    return "unknown";
+}
+
+static Qwen36SSMQ8PrefillAMXRejectReason ResolveQwen36SSMQ8PrefillAMXReason(
+    densecore::llm::config::Qwen36SSMQ8PrefillAMXMode mode, InferenceExecutionPhase phase, bool lora_active) {
+    if (mode == densecore::llm::config::Qwen36SSMQ8PrefillAMXMode::Off) {
+        return Qwen36SSMQ8PrefillAMXRejectReason::EnvOff;
+    }
+    if (phase == InferenceExecutionPhase::Unknown) {
+        return Qwen36SSMQ8PrefillAMXRejectReason::PhaseUnknown;
+    }
+    if (phase != InferenceExecutionPhase::Prefill) {
+        return Qwen36SSMQ8PrefillAMXRejectReason::NotPrefill;
+    }
+    if (lora_active) {
+        return Qwen36SSMQ8PrefillAMXRejectReason::DynamicLora;
+    }
+    return Qwen36SSMQ8PrefillAMXRejectReason::None;
+}
+
+static int Qwen36SSMProjectionKind(const char* name) {
+    if (!name) {
+        return 0;
+    }
+    if (std::strstr(name, "attn_qkv")) {
+        return 1;
+    }
+    if (std::strstr(name, "attn_gate")) {
+        return 2;
+    }
+    if (std::strstr(name, "ssm_out")) {
+        return 3;
+    }
+    return 0;
+}
+
+static void RecordQwen36SSMQ8PrefillAMXReject(InferenceWorkContext* ctx,
+                                               Qwen36SSMQ8PrefillAMXRejectReason reason) {
+    if (!ctx || reason == Qwen36SSMQ8PrefillAMXRejectReason::None) {
+        return;
+    }
+    ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_last_reject_reason.store(static_cast<int>(reason),
+                                                                           std::memory_order_relaxed);
+}
+
+static void RecordQwen36SSMQ8PrefillAMXUsed(InferenceWorkContext* ctx, int projection_kind) {
+    if (!ctx) {
+        return;
+    }
+    ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_used.store(1, std::memory_order_relaxed);
+    switch (projection_kind) {
+        case 1:
+            ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_qkv_count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case 2:
+            ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_gate_count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case 3:
+            ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_out_count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        default:
+            break;
+    }
+}
+
+struct Q4KCopiedGemvExperimentWeight {
+    int64_t rows = 0;
+    int64_t cols = 0;
+    ggml_type type = GGML_TYPE_Q4_K;
+    size_t row_bytes = 0;
+    std::vector<uint8_t> data;
+};
+
+struct Q4KCopiedGemvExperimentKey {
+    const void* weight = nullptr;
+    uintptr_t model = 0;
+    int64_t rows = 0;
+    int64_t cols = 0;
+    int type = GGML_TYPE_COUNT;
+    uint64_t lora_epoch = 0;
+
+    bool operator==(const Q4KCopiedGemvExperimentKey& other) const {
+        return weight == other.weight && model == other.model && rows == other.rows && cols == other.cols &&
+               type == other.type && lora_epoch == other.lora_epoch;
+    }
+};
+
+struct Q4KCopiedGemvExperimentKeyHash {
+    size_t operator()(const Q4KCopiedGemvExperimentKey& key) const {
+        size_t h = std::hash<const void*>{}(key.weight);
+        auto mix = [&](uint64_t value) {
+            h ^= std::hash<uint64_t>{}(value) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        };
+        mix(static_cast<uint64_t>(key.model));
+        mix(static_cast<uint64_t>(key.rows));
+        mix(static_cast<uint64_t>(key.cols));
+        mix(static_cast<uint64_t>(key.type));
+        mix(key.lora_epoch);
+        return h;
+    }
+};
+
+struct Q4KCopiedGemvCacheState {
+    std::mutex mutex;
+    std::unordered_map<Q4KCopiedGemvExperimentKey, std::shared_ptr<Q4KCopiedGemvExperimentWeight>,
+                       Q4KCopiedGemvExperimentKeyHash>
+        cache;
+    std::vector<Q4KCopiedGemvExperimentKey> insertion_order;
+    size_t bytes = 0;
+    uint64_t pack_count = 0;
+};
+
+static bool Q4KCopiedGemvExperimentEnabled(const densecore::llm::config::FastPathRuntimeConfig& config) {
+    return config.q4k_copied_gemv_experiment;
+}
+
+static bool Q4KRepackedGemvEnabled(const densecore::llm::config::FastPathRuntimeConfig& config,
+                                   Q4KRepackedGemvRejectReason* reject_reason) {
+    if (config.q4k_repacked_gemv == densecore::env::RuntimeToggleMode::Off) {
+        if (reject_reason) *reject_reason = Q4KRepackedGemvRejectReason::EnvOff;
+        return false;
+    }
+    const bool supported = densecore::kernels::Q4KRepackedGemvIsaSupported();
+    if (!supported) {
+        if (reject_reason) *reject_reason = Q4KRepackedGemvRejectReason::UnsupportedIsa;
+        return false;
+    }
+    if (!densecore::kernels::Q4KRealPackedGemvKernelAvailable()) {
+        if (reject_reason) *reject_reason = Q4KRepackedGemvRejectReason::RealKernelUnavailable;
+        return false;
+    }
+    return true;
+}
+
+struct Q4KRepackedGemvProbeKey {
+    const void* weight = nullptr;
+    int64_t rows = 0;
+    int64_t cols = 0;
+    uint64_t fingerprint = 0;
+
+    bool operator==(const Q4KRepackedGemvProbeKey& other) const {
+        return weight == other.weight && rows == other.rows && cols == other.cols && fingerprint == other.fingerprint;
+    }
+};
+
+struct Q4KRepackedGemvProbeKeyHash {
+    size_t operator()(const Q4KRepackedGemvProbeKey& key) const {
+        size_t h = std::hash<const void*>{}(key.weight);
+        h ^= std::hash<int64_t>{}(key.rows) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(key.cols) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h ^= std::hash<uint64_t>{}(key.fingerprint) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct Q4KRepackedGemvProbeEntry {
+    bool running = false;
+    bool done = false;
+    bool passed = false;
+    std::condition_variable cv;
+};
+
+static bool RunQ4KRepackedGemvProbe(const std::shared_ptr<densecore::kernels::Q4KRepackedGemvWeight>& packed,
+                                    const void* weight_data, const void* quant_input, int64_t rows, int64_t cols) {
+    const auto* type_traits_cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
+    if (!packed || !type_traits_cpu || !type_traits_cpu->vec_dot || !weight_data || !quant_input || rows <= 0 ||
+        cols <= 0) {
+        return false;
+    }
+    const int tile_count = static_cast<int>(rows / 8);
+    if (tile_count <= 0) {
+        return false;
+    }
+    std::array<int, 3> sample_tiles{0, tile_count / 2, tile_count - 1};
+    std::vector<float> probe(static_cast<size_t>(rows), 0.0f);
+    const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, cols);
+    const size_t q4_row_bytes = ggml_row_size(GGML_TYPE_Q4_K, cols);
+    const auto* weight_base = static_cast<const uint8_t*>(weight_data);
+    for (const int tile : sample_tiles) {
+        const int clamped_tile = std::clamp(tile, 0, tile_count - 1);
+        if (!densecore::kernels::RunQ4KRepackedGemv(packed, static_cast<const uint8_t*>(quant_input), q8_row_bytes,
+                                                   probe.data(), rows, clamped_tile, clamped_tile + 1)) {
+            return false;
+        }
+        const int row_begin = clamped_tile * 8;
+        const int row_end = std::min(row_begin + 8, static_cast<int>(rows));
+        for (int row = row_begin; row < row_end; ++row) {
+            const void* row_ptr = weight_base + static_cast<size_t>(row) * q4_row_bytes;
+            float reference = 0.0f;
+            type_traits_cpu->vec_dot(cols, &reference, 0, row_ptr, 0, quant_input, 0, 1);
+            const float diff = std::fabs(reference - probe[static_cast<size_t>(row)]);
+            const float tol = std::max(1.0e-3f, 1.0e-3f * std::fabs(reference));
+            if (!std::isfinite(reference) || !std::isfinite(probe[static_cast<size_t>(row)]) || diff > tol) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool Q4KRepackedGemvProbePassed(const std::shared_ptr<densecore::kernels::Q4KRepackedGemvWeight>& packed,
+                                       const void* weight_data, const void* quant_input, int64_t rows, int64_t cols) {
+    if (!packed) {
+        return false;
+    }
+    static std::mutex mutex;
+    static std::unordered_map<Q4KRepackedGemvProbeKey, std::shared_ptr<Q4KRepackedGemvProbeEntry>,
+                              Q4KRepackedGemvProbeKeyHash>
+        decisions;
+    const Q4KRepackedGemvProbeKey key{
+        weight_data, rows, cols,
+        densecore::kernels::Q4KRepackedGemvWeightFingerprint(weight_data, rows, cols),
+    };
+
+    std::shared_ptr<Q4KRepackedGemvProbeEntry> entry;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        auto found = decisions.find(key);
+        if (found != decisions.end()) {
+            entry = found->second;
+            if (entry->done) {
+                return entry->passed;
+            }
+            entry->cv.wait(lock, [&]() { return entry->done; });
+            return entry->passed;
+        }
+        entry = std::make_shared<Q4KRepackedGemvProbeEntry>();
+        entry->running = true;
+        decisions.emplace(key, entry);
+    }
+
+    const bool passed = RunQ4KRepackedGemvProbe(packed, weight_data, quant_input, rows, cols);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        entry->passed = passed;
+        entry->done = true;
+        entry->running = false;
+        entry->cv.notify_all();
+    }
+    return passed;
+}
+
+static Q4KCopiedGemvCacheState& Q4KCopiedGemvCache() {
+    static Q4KCopiedGemvCacheState state;
+    return state;
+}
+
+static size_t Q4KCopiedGemvCacheLimitBytes() {
+    return static_cast<size_t>(densecore::env::ParsePositiveEnvInt("DENSECORE_Q4K_COPIED_GEMV_CACHE_MB", 256)) *
+           1024ULL * 1024ULL;
+}
+
+// This copied-weight path is a debug experiment only. It is not a real packed
+// GEMV kernel and must not be used as a performance claim.
+void ClearQ4KCopiedGemvExperimentCache() {
+    auto& state = Q4KCopiedGemvCache();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.cache.clear();
+    state.insertion_order.clear();
+    state.bytes = 0;
+}
+
+void ClearQ4KCopiedGemvExperimentCacheForModel(uintptr_t model_identity) {
+    auto& state = Q4KCopiedGemvCache();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (auto it = state.cache.begin(); it != state.cache.end();) {
+        if (it->first.model == model_identity) {
+            state.bytes -= it->second ? it->second->data.size() : 0;
+            it = state.cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    state.insertion_order.erase(std::remove_if(state.insertion_order.begin(), state.insertion_order.end(),
+                                               [model_identity](const Q4KCopiedGemvExperimentKey& key) {
+                                                   return key.model == model_identity;
+                                               }),
+                                state.insertion_order.end());
+}
+
+static std::shared_ptr<Q4KCopiedGemvExperimentWeight> GetOrCreateQ4KCopiedGemvExperimentWeight(
+    const void* weight_data, uintptr_t model_identity, int64_t rows, int64_t cols, ggml_type type, uint64_t lora_epoch,
+    bool* cache_hit) {
+    if (cache_hit) *cache_hit = false;
+    if (!weight_data || type != GGML_TYPE_Q4_K || rows <= 0 || cols <= 0 || (cols % QK_K) != 0) {
+        return nullptr;
+    }
+    const size_t row_bytes = ggml_row_size(type, cols);
+    if (row_bytes == 0) {
+        return nullptr;
+    }
+    const Q4KCopiedGemvExperimentKey key{weight_data, model_identity, rows, cols, static_cast<int>(type), lora_epoch};
+    const size_t packed_bytes = static_cast<size_t>(rows) * row_bytes;
+    const size_t cache_limit = Q4KCopiedGemvCacheLimitBytes();
+    if (packed_bytes == 0 || packed_bytes > cache_limit) {
+        return nullptr;
+    }
+
+    auto& state = Q4KCopiedGemvCache();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    auto it = state.cache.find(key);
+    if (it != state.cache.end()) {
+        if (cache_hit) *cache_hit = true;
+        return it->second;
+    }
+    auto packed = std::make_shared<Q4KCopiedGemvExperimentWeight>();
+    packed->rows = rows;
+    packed->cols = cols;
+    packed->type = type;
+    packed->row_bytes = row_bytes;
+    packed->data.resize(packed_bytes);
+    std::memcpy(packed->data.data(), weight_data, packed->data.size());
+    while (state.bytes + packed_bytes > cache_limit && !state.insertion_order.empty()) {
+        const Q4KCopiedGemvExperimentKey evict_key = state.insertion_order.front();
+        state.insertion_order.erase(state.insertion_order.begin());
+        auto evict_it = state.cache.find(evict_key);
+        if (evict_it != state.cache.end()) {
+            state.bytes -= evict_it->second ? evict_it->second->data.size() : 0;
+            state.cache.erase(evict_it);
+        }
+    }
+    state.cache.emplace(key, packed);
+    state.insertion_order.push_back(key);
+    state.bytes += packed_bytes;
+    ++state.pack_count;
+    return packed;
+}
+
+static bool RunQ4KCopiedGemvExperimentRows(const void* weight_data, const void* q8_input, uintptr_t model_identity,
+                                           int64_t rows, int64_t cols, uint64_t lora_epoch, float* output,
+                                           bool* cache_hit) {
+    if (!q8_input || !output || rows <= 0 || cols <= 0 || (cols % QK_K) != 0) {
+        return false;
+    }
+    const auto* type_traits_cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
+    if (!type_traits_cpu || !type_traits_cpu->vec_dot || type_traits_cpu->vec_dot_type != GGML_TYPE_Q8_K) {
+        return false;
+    }
+    auto packed = GetOrCreateQ4KCopiedGemvExperimentWeight(weight_data, model_identity, rows, cols, GGML_TYPE_Q4_K,
+                                                           lora_epoch, cache_hit);
+    if (!packed) {
+        return false;
+    }
+    const char* packed_base = reinterpret_cast<const char*>(packed->data.data());
+    for (int64_t row = 0; row < rows; ++row) {
+        const void* row_ptr = packed_base + static_cast<size_t>(row) * packed->row_bytes;
+        type_traits_cpu->vec_dot(cols, output + row, 0, row_ptr, 0, q8_input, 0, 1);
+    }
+    return true;
+}
+
+static void RecordQActCacheHit(InferenceWorkContext* ctx, size_t bytes) {
+    if (!ctx) return;
+    ctx->qwen36_profile.qact_cache_hits.fetch_add(1, std::memory_order_relaxed);
+    ctx->qwen36_profile.qact_cache_reused_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+static void RecordQActCacheMiss(InferenceWorkContext* ctx) {
+    if (!ctx) return;
+    ctx->qwen36_profile.qact_cache_misses.fetch_add(1, std::memory_order_relaxed);
+}
+
+static bool QuantizedActivationCacheEnabled(const densecore::llm::config::FastPathRuntimeConfig& config) {
+    if (config.qact_cache == densecore::env::RuntimeToggleMode::Off) {
+        return false;
+    }
+    return config.qact_cache == densecore::env::RuntimeToggleMode::On ||
+           config.qact_cache == densecore::env::RuntimeToggleMode::Auto;
+}
+
+static const uint8_t* GetOrFillQuantizedActivationCache(InferenceWorkContext* ctx, const ggml_tensor* src_tensor,
+                                                        const void* source, const float* x_f32, int64_t len,
+                                                        ggml_type quant_type, size_t quant_bytes, int slot_id,
+                                                        int64_t token_pos,
+                                                        const ggml_type_traits_cpu* input_type_traits) {
+    if (!ctx || !src_tensor || !source || !x_f32 || len <= 0 || quant_type == GGML_TYPE_F32 || quant_bytes == 0 ||
+        !input_type_traits || !input_type_traits->from_float) {
+        return nullptr;
+    }
+    const bool data_pointer_matches_different_tensor =
+        ctx->qact_source == source && ctx->qact_tensor && ctx->qact_tensor != src_tensor;
+#ifndef NDEBUG
+    if (data_pointer_matches_different_tensor) {
+        static const bool strict_qact_cache_assert = []() {
+            const char* env = std::getenv("DENSECORE_DEBUG_QACT_CACHE_ASSERT");
+            return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+        }();
+        if (strict_qact_cache_assert) {
+            assert(ctx->qact_tensor == src_tensor && "qact cache data pointer reused by a different tensor");
+        }
+    }
+#endif
+    if (ctx->qact_generation == ctx->execution_generation && ctx->qact_tensor == src_tensor &&
+        ctx->qact_source == source && ctx->qact_len == len && ctx->qact_type == quant_type &&
+        ctx->qact_bytes == quant_bytes && ctx->qact_slot_id == slot_id && ctx->qact_token_pos == token_pos &&
+        ctx->qact_buffer.size() == quant_bytes) {
+        RecordQActCacheHit(ctx, quant_bytes);
+        return ctx->qact_buffer.data();
+    }
+    ctx->qact_buffer.resize(quant_bytes);
+    input_type_traits->from_float(x_f32, ctx->qact_buffer.data(), len);
+    ctx->qact_tensor = src_tensor;
+    ctx->qact_generation = ctx->execution_generation;
+    ctx->qact_source = source;
+    ctx->qact_len = len;
+    ctx->qact_type = quant_type;
+    ctx->qact_bytes = quant_bytes;
+    ctx->qact_slot_id = slot_id;
+    ctx->qact_token_pos = token_pos;
+    RecordQActCacheMiss(ctx);
+    return ctx->qact_buffer.data();
+}
+
+enum class Qwen36Q4KBatchedAdmissionState : int { Unknown = 0, Pass = 1, Reject = 2 };
+
+enum class Qwen36PrefillQ4KBatchedRejectReason : int {
+    None = 0,
+    EnvOff = 1,
+    LoraActive = 2,
+    UnsupportedShape = 3,
+    MissingVecDot = 4,
+    KernelUnavailable = 5,
+    ProbeMismatch = 6,
+    ProbeInternalError = 7,
+    Admitted = 8,
+    RejectedCached = 9,
+    NotQ4K = 10,
+};
+
+const char* Qwen36PrefillQ4KBatchedRejectReasonName(int reason) {
+    switch (static_cast<Qwen36PrefillQ4KBatchedRejectReason>(reason)) {
+        case Qwen36PrefillQ4KBatchedRejectReason::None:
+            return "none";
+        case Qwen36PrefillQ4KBatchedRejectReason::EnvOff:
+            return "env_off";
+        case Qwen36PrefillQ4KBatchedRejectReason::LoraActive:
+            return "lora_active";
+        case Qwen36PrefillQ4KBatchedRejectReason::UnsupportedShape:
+            return "unsupported_shape";
+        case Qwen36PrefillQ4KBatchedRejectReason::MissingVecDot:
+            return "missing_vec_dot";
+        case Qwen36PrefillQ4KBatchedRejectReason::KernelUnavailable:
+            return "kernel_unavailable";
+        case Qwen36PrefillQ4KBatchedRejectReason::ProbeMismatch:
+            return "probe_mismatch";
+        case Qwen36PrefillQ4KBatchedRejectReason::ProbeInternalError:
+            return "probe_internal_error";
+        case Qwen36PrefillQ4KBatchedRejectReason::Admitted:
+            return "admitted";
+        case Qwen36PrefillQ4KBatchedRejectReason::RejectedCached:
+            return "rejected_cached";
+        case Qwen36PrefillQ4KBatchedRejectReason::NotQ4K:
+            return "not_q4k";
+    }
+    return "unknown";
+}
+
+static Qwen36PrefillQ4KBatchedRejectReason ResolveQwen36PrefillQ4KBatchedReason(
+    bool relevant, bool mode_off, bool lora_active, bool weight_is_q4k, bool shape_supported, bool kernel_available,
+    bool has_vec_dot, bool candidate_ready, bool mode_on, bool mode_probe,
+    Qwen36Q4KBatchedAdmissionState admission_state) {
+    if (!relevant) {
+        return Qwen36PrefillQ4KBatchedRejectReason::None;
+    }
+    if (mode_off) {
+        return Qwen36PrefillQ4KBatchedRejectReason::EnvOff;
+    }
+    if (lora_active) {
+        return Qwen36PrefillQ4KBatchedRejectReason::LoraActive;
+    }
+    if (!weight_is_q4k) {
+        return Qwen36PrefillQ4KBatchedRejectReason::NotQ4K;
+    }
+    if (!shape_supported) {
+        return Qwen36PrefillQ4KBatchedRejectReason::UnsupportedShape;
+    }
+    if (!kernel_available) {
+        return Qwen36PrefillQ4KBatchedRejectReason::KernelUnavailable;
+    }
+    if (!has_vec_dot) {
+        return Qwen36PrefillQ4KBatchedRejectReason::MissingVecDot;
+    }
+    if (!candidate_ready) {
+        return Qwen36PrefillQ4KBatchedRejectReason::UnsupportedShape;
+    }
+    if (mode_probe && admission_state == Qwen36Q4KBatchedAdmissionState::Reject) {
+        return Qwen36PrefillQ4KBatchedRejectReason::RejectedCached;
+    }
+    if (mode_on || (mode_probe && admission_state == Qwen36Q4KBatchedAdmissionState::Pass)) {
+        return Qwen36PrefillQ4KBatchedRejectReason::Admitted;
+    }
+    return Qwen36PrefillQ4KBatchedRejectReason::None;
+}
+
+struct Qwen36Q4KBatchedAdmissionValue {
+    Qwen36Q4KBatchedAdmissionState state = Qwen36Q4KBatchedAdmissionState::Unknown;
+    float max_abs_error = 0.0f;
+    Qwen36PrefillQ4KBatchedRejectReason reject_reason = Qwen36PrefillQ4KBatchedRejectReason::None;
+};
+
+static std::mutex& Qwen36Q4KBatchedAdmissionMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::unordered_map<uint64_t, Qwen36Q4KBatchedAdmissionValue>& Qwen36Q4KBatchedAdmissionMap() {
+    static std::unordered_map<uint64_t, Qwen36Q4KBatchedAdmissionValue> map;
+    return map;
+}
+
+static std::atomic<int>& Qwen36Q4KBatchedProbeForceFailThreadForTest() {
+    static std::atomic<int> value{-1};
+    return value;
+}
+
+static uint64_t HashQwen36Q4KBatchedAdmissionKey(const TransformerModel* model, const ggml_tensor* weight,
+                                                 const ggml_tensor* input, int M, int N, int K) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    mix(reinterpret_cast<uintptr_t>(model));
+    mix(model ? static_cast<uint64_t>(model->variant) : 0);
+    mix(model ? static_cast<uint64_t>(model->arch) : 0);
+    mix(reinterpret_cast<uintptr_t>(weight));
+    mix(reinterpret_cast<uintptr_t>(weight ? weight->data : nullptr));
+    mix(weight ? static_cast<uint64_t>(weight->type) : 0);
+    mix(input ? static_cast<uint64_t>(input->type) : 0);
+    mix(static_cast<uint64_t>(M));
+    mix(static_cast<uint64_t>(N));
+    mix(static_cast<uint64_t>(K));
+    if (weight && weight->name[0]) {
+        for (const char* p = weight->name; *p; ++p) {
+            mix(static_cast<unsigned char>(*p));
+        }
+    }
+    return h;
+}
+
+static Qwen36Q4KBatchedAdmissionValue LookupQwen36Q4KBatchedAdmission(uint64_t key) {
+    std::lock_guard<std::mutex> lock(Qwen36Q4KBatchedAdmissionMutex());
+    auto& map = Qwen36Q4KBatchedAdmissionMap();
+    auto it = map.find(key);
+    return it == map.end() ? Qwen36Q4KBatchedAdmissionValue{} : it->second;
+}
+
+static void StoreQwen36Q4KBatchedAdmission(uint64_t key, Qwen36Q4KBatchedAdmissionState state, float max_abs_error,
+                                           Qwen36PrefillQ4KBatchedRejectReason reason) {
+    std::lock_guard<std::mutex> lock(Qwen36Q4KBatchedAdmissionMutex());
+    auto& value = Qwen36Q4KBatchedAdmissionMap()[key];
+    if (value.state == Qwen36Q4KBatchedAdmissionState::Reject && state != Qwen36Q4KBatchedAdmissionState::Reject) {
+        return;
+    }
+    value.state = state;
+    value.max_abs_error = max_abs_error;
+    value.reject_reason = reason;
+}
+
+static void RecordQwen36Q4KBatchedProbeResult(InferenceWorkContext* ctx, bool pass, float max_abs_error,
+                                              Qwen36PrefillQ4KBatchedRejectReason reason) {
+    if (!ctx) return;
+    ctx->qwen36_profile.qwen36_prefill_q4k_batched_probe_pass.store(pass ? 1 : 0, std::memory_order_relaxed);
+    uint32_t bits = 0;
+    std::memcpy(&bits, &max_abs_error, sizeof(float));
+    ctx->qwen36_profile.qwen36_prefill_q4k_batched_max_abs_error_bits.store(bits, std::memory_order_relaxed);
+    ctx->qwen36_profile.qwen36_prefill_q4k_batched_last_reject_reason.store(static_cast<int>(reason),
+                                                                            std::memory_order_relaxed);
+}
+
+static void DowngradeQwen36Q4KBatchedAdmissionOnRuntimeFailure(
+    uint64_t key, float max_abs_error, Qwen36PrefillQ4KBatchedRejectReason reason, InferenceWorkContext* ctx) {
+    if (!key) {
+        return;
+    }
+    StoreQwen36Q4KBatchedAdmission(key, Qwen36Q4KBatchedAdmissionState::Reject, max_abs_error, reason);
+    if (ctx) {
+        ctx->qwen36_profile.qwen36_prefill_q4k_admission_downgraded.fetch_add(1, std::memory_order_relaxed);
+        ctx->qwen36_profile.qwen36_prefill_q4k_batched_last_reject_reason.store(static_cast<int>(reason),
+                                                                                std::memory_order_relaxed);
+    }
+}
+
+static void AtomicMaxFloatBits(std::atomic<uint32_t>& target, float value) {
+    if (!std::isfinite(value) || value < 0.0f) {
+        value = std::numeric_limits<float>::infinity();
+    }
+    uint32_t desired = 0;
+    std::memcpy(&desired, &value, sizeof(float));
+    uint32_t current = target.load(std::memory_order_relaxed);
+    float current_value = 0.0f;
+    std::memcpy(&current_value, &current, sizeof(float));
+    while (value > current_value &&
+           !target.compare_exchange_weak(current, desired, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        std::memcpy(&current_value, &current, sizeof(float));
+    }
+}
 
 static bool IsGemma4SharedDenseFfnWeightName(const char* weight_name) {
     if (!weight_name) {
@@ -191,7 +916,23 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                         input_type_traits->from_float(x_f32, quant_input_tls.data(), static_cast<int64_t>(N));
                         quant_input = quant_input_tls.data();
                     } else if (ith == 0) {
-                        input_type_traits->from_float(x_f32, ud->quant_input_shared, static_cast<int64_t>(N));
+                        InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+                        const auto& qact_config = ResolveFastPathRuntimeConfig(batch);
+                        const int64_t token_pos =
+                            (batch && batch->num_seqs == 1 && !batch->pos.empty()) ? batch->pos.front()
+                                                                                   : std::numeric_limits<int64_t>::min();
+                        const uint8_t* cached_qact =
+                            QuantizedActivationCacheEnabled(qact_config)
+                                ? GetOrFillQuantizedActivationCache(work_ctx, src, src->data, x_f32,
+                                                                    static_cast<int64_t>(N), ud->input_quant_type,
+                                                                    quant_input_size, ud->slot_id, token_pos,
+                                                                    input_type_traits)
+                                : nullptr;
+                        if (cached_qact) {
+                            std::memcpy(ud->quant_input_shared, cached_qact, quant_input_size);
+                        } else {
+                            input_type_traits->from_float(x_f32, ud->quant_input_shared, static_cast<int64_t>(N));
+                        }
                         ud->quantized_stamp->store(expected_stamp, std::memory_order_release);
                         quant_input = ud->quant_input_shared;
                         used_shared_quant_buffer = true;
@@ -226,6 +967,149 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     const int k_end = std::min(k_start + k_per_thread, K);
 
     if (k_start >= K) return;
+
+    if (weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K && quant_input &&
+        (ud->dynamic_lora_active || ud->force_reference_scalar) && ith == 0) {
+        if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+            work_ctx->qwen36_profile.q4k_repacked_gemv_last_reject_reason.store(
+                static_cast<int>(ud->dynamic_lora_active ? Q4KRepackedGemvRejectReason::DynamicLora
+                                                         : Q4KRepackedGemvRejectReason::ReferenceForced),
+                std::memory_order_relaxed);
+            work_ctx->qwen36_profile.q4k_copied_gemv_experiment_last_reject_reason.store(
+                static_cast<int>(ud->dynamic_lora_active ? Q4KCopiedGemvExperimentRejectReason::DynamicLora
+                                                         : Q4KCopiedGemvExperimentRejectReason::Disabled),
+                std::memory_order_relaxed);
+        }
+    }
+    if (weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K && quant_input &&
+        !ud->dynamic_lora_active && !ud->force_reference_scalar) {
+        Q4KRepackedGemvRejectReason reject = Q4KRepackedGemvRejectReason::None;
+        InferenceWorkContext* dispatch_work_ctx = GetCurrentWorkContext();
+        const BatchSpec* batch = dispatch_work_ctx ? GetCurrentBatch() : nullptr;
+        const auto& fast_config = ResolveFastPathRuntimeConfig(batch);
+        const bool real_repacked_enabled = Q4KRepackedGemvEnabled(fast_config, &reject);
+        const bool use_copied_experiment = !real_repacked_enabled && Q4KCopiedGemvExperimentEnabled(fast_config);
+        const bool phase_allows_repacked =
+            dispatch_work_ctx && batch &&
+            (dispatch_work_ctx->phase == InferenceExecutionPhase::Decode ||
+             (fast_config.q4k_repacked_gemv_allow_prefill &&
+              dispatch_work_ctx->phase == InferenceExecutionPhase::Prefill));
+        if (real_repacked_enabled && !phase_allows_repacked) {
+            reject = Q4KRepackedGemvRejectReason::NotDecode;
+        }
+        if (real_repacked_enabled && phase_allows_repacked) {
+            const bool shape_ok = N > 0 && K > 0 && (N % QK_K) == 0 && (K % 8) == 0;
+            if (shape_ok) {
+                densecore::kernels::Q4KRepackedGemvCacheLookup cache_lookup;
+                auto packed = densecore::kernels::GetOrCreateQ4KRepackedGemvWeight(weight_data, K, N, &cache_lookup);
+                const int tile_count = K / 8;
+                const int tile_start = (tile_count * ith) / nth;
+                const int tile_end = (tile_count * (ith + 1)) / nth;
+                const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, N);
+                bool probe_ok = true;
+                if (packed && fast_config.q4k_repacked_gemv_probe) {
+                    probe_ok = Q4KRepackedGemvProbePassed(packed, weight_data, quant_input, K, N);
+                }
+                if (packed && probe_ok &&
+                    densecore::kernels::RunQ4KRepackedGemv(packed, static_cast<const uint8_t*>(quant_input),
+                                                           q8_row_bytes, output, K, tile_start, tile_end)) {
+                    if (ith == 0) {
+                        InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+                        if (work_ctx) {
+                            work_ctx->qwen36_profile.q4k_repacked_gemv_used.store(1, std::memory_order_relaxed);
+                            work_ctx->qwen36_profile.q4k_repacked_gemv_last_reject_reason.store(
+                                static_cast<int>(Q4KRepackedGemvRejectReason::None), std::memory_order_relaxed);
+                            if (cache_lookup.waited) {
+                                work_ctx->qwen36_profile.q4k_repacked_gemv_cache_waited_hits.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            } else if (cache_lookup.cache_hit) {
+                                work_ctx->qwen36_profile.q4k_repacked_gemv_cache_hits.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            } else {
+                                work_ctx->qwen36_profile.q4k_repacked_gemv_cache_misses.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                    maybe_log_gemv_timing("q4k_repacked_gemv");
+                    return;
+                }
+                reject = packed && !probe_ok ? Q4KRepackedGemvRejectReason::ProbeFailed
+                                             : Q4KRepackedGemvRejectReason::Cache;
+            } else {
+                reject = Q4KRepackedGemvRejectReason::Shape;
+            }
+        }
+        // This copied-weight path is a debug experiment only. It is not a real
+        // packed GEMV kernel and must not be used as a performance claim.
+        if (use_copied_experiment) {
+            const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight_type);
+            if (type_traits_cpu && type_traits_cpu->vec_dot && N > 0 && (N % QK_K) == 0) {
+                bool cache_hit = false;
+                auto packed = GetOrCreateQ4KCopiedGemvExperimentWeight(weight_data, ud->model_identity, K, N,
+                                                                       weight_type, /*lora_epoch=*/0, &cache_hit);
+                if (packed) {
+                    const size_t packed_row_stride = packed->row_bytes;
+                    const char* packed_base = reinterpret_cast<const char*>(packed->data.data());
+                    for (int k = k_start; k < k_end; ++k) {
+                        const void* row_ptr = packed_base + static_cast<size_t>(k) * packed_row_stride;
+                        float sum = 0.0f;
+                        type_traits_cpu->vec_dot(N, &sum, 0, row_ptr, 0, quant_input, 0, 1);
+                        output[k] = sum;
+                    }
+                    if (ith == 0) {
+                        InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+                        if (work_ctx) {
+                            if (reject != Q4KRepackedGemvRejectReason::None) {
+                                work_ctx->qwen36_profile.q4k_repacked_gemv_last_reject_reason.store(
+                                    static_cast<int>(reject), std::memory_order_relaxed);
+                            }
+                            work_ctx->qwen36_profile.q4k_copied_gemv_experiment_used.store(
+                                1, std::memory_order_relaxed);
+                            if (cache_hit) {
+                                work_ctx->qwen36_profile.q4k_copied_gemv_experiment_cache_hits.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            } else {
+                                work_ctx->qwen36_profile.q4k_copied_gemv_experiment_cache_misses.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                    maybe_log_gemv_timing("q4k_copied_weight_experiment");
+                    return;
+                }
+                if (ith == 0) {
+                    if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+                        work_ctx->qwen36_profile.q4k_copied_gemv_experiment_last_reject_reason.store(
+                            static_cast<int>(Q4KCopiedGemvExperimentRejectReason::Cache),
+                            std::memory_order_relaxed);
+                    }
+                }
+            } else {
+                if (ith == 0) {
+                    const auto copied_reason =
+                        (N <= 0 || (N % QK_K) != 0) ? Q4KCopiedGemvExperimentRejectReason::Shape
+                                                     : Q4KCopiedGemvExperimentRejectReason::MissingVecDot;
+                    if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+                        work_ctx->qwen36_profile.q4k_copied_gemv_experiment_last_reject_reason.store(
+                            static_cast<int>(copied_reason), std::memory_order_relaxed);
+                    }
+                }
+            }
+        } else if (ith == 0) {
+            if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+                work_ctx->qwen36_profile.q4k_copied_gemv_experiment_last_reject_reason.store(
+                    static_cast<int>(Q4KCopiedGemvExperimentRejectReason::Disabled), std::memory_order_relaxed);
+            }
+        }
+        if (ith == 0) {
+            InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+            if (work_ctx) {
+                work_ctx->qwen36_profile.q4k_repacked_gemv_last_reject_reason.store(
+                    static_cast<int>(reject), std::memory_order_relaxed);
+            }
+        }
+    }
 
     // ==========================================================================
     // CASE A: FP32 weights - use optimized simd::GemvParallel
@@ -796,6 +1680,9 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
             return;
         }
         InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+        if (!work_ctx) {
+            return;
+        }
         AddQwen36ProfileNs(
             work_ctx->qwen36_profile.quant_matmul_ns,
             static_cast<uint64_t>(
@@ -806,6 +1693,55 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         }
         if (used_true_batched) {
             MarkQwen36ProfileFlag(work_ctx->qwen36_profile.q4k_true_batched_used);
+        }
+    };
+    bool qwen36_probe_local_failed = false;
+    bool qwen36_probe_local_internal_error = false;
+    float qwen36_probe_local_max_abs_error = 0.0f;
+    const auto finalize_qwen36_probe = [&]() {
+        if (!ud->qwen36_prefill_q4k_probe || !ud->qwen36_prefill_q4k_admission_key) {
+            return;
+        }
+        InferenceWorkContext* probe_work_ctx = GetCurrentWorkContext();
+        if (!probe_work_ctx) {
+            probe_work_ctx = ud->work_ctx;
+        }
+        if (probe_work_ctx) {
+            probe_work_ctx->qwen36_profile.qwen36_prefill_q4k_probe_participants.fetch_add(
+                1, std::memory_order_relaxed);
+            if (qwen36_probe_local_failed || qwen36_probe_local_internal_error) {
+                probe_work_ctx->qwen36_profile.qwen36_prefill_q4k_probe_failures.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
+        AtomicMaxFloatBits(ud->qwen36_prefill_q4k_probe_max_abs_error_bits, qwen36_probe_local_max_abs_error);
+        if (qwen36_probe_local_internal_error) {
+            ud->qwen36_prefill_q4k_probe_internal_errors.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (qwen36_probe_local_failed || qwen36_probe_local_internal_error) {
+            ud->qwen36_prefill_q4k_probe_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Only row-owning partitions participate here. Threads with
+        // k_start >= K return before finalize(), so this is intentionally not nth.
+        const int participants = std::max(1, (K + k_per_thread - 1) / k_per_thread);
+        const int done = ud->qwen36_prefill_q4k_probe_done.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (done == participants) {
+            const int failures = ud->qwen36_prefill_q4k_probe_failures.load(std::memory_order_acquire);
+            const int internal_errors = ud->qwen36_prefill_q4k_probe_internal_errors.load(std::memory_order_acquire);
+            const uint32_t bits =
+                ud->qwen36_prefill_q4k_probe_max_abs_error_bits.load(std::memory_order_acquire);
+            float max_abs_error = 0.0f;
+            std::memcpy(&max_abs_error, &bits, sizeof(float));
+            const bool pass = failures == 0 && internal_errors == 0;
+            const auto reason = pass ? Qwen36PrefillQ4KBatchedRejectReason::Admitted
+                                     : (internal_errors > 0
+                                            ? Qwen36PrefillQ4KBatchedRejectReason::ProbeInternalError
+                                            : Qwen36PrefillQ4KBatchedRejectReason::ProbeMismatch);
+            StoreQwen36Q4KBatchedAdmission(
+                ud->qwen36_prefill_q4k_admission_key,
+                pass ? Qwen36Q4KBatchedAdmissionState::Pass : Qwen36Q4KBatchedAdmissionState::Reject,
+                max_abs_error, reason);
+            RecordQwen36Q4KBatchedProbeResult(probe_work_ctx, pass, max_abs_error, reason);
         }
     };
 
@@ -987,7 +1923,9 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     continue;
                 }
 
-                if (!ud->force_reference_scalar && can_use_q4k_true_batched && quant_input_base) {
+                if (!ud->force_reference_scalar && can_use_q4k_true_batched && quant_input_base &&
+                    (!ud->qwen36_prefill_q4k_admission_key || ud->qwen36_prefill_q4k_admitted ||
+                     ud->qwen36_prefill_q4k_probe)) {
                     alignas(64) std::array<float, kMaxSmallBatchColsHard> row_sums{};
                     static const bool debug_q4k_kernel_check = []() {
                         const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_CHECK");
@@ -1008,20 +1946,45 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     float max_diff_batched = 0.0f;
                     float max_diff_ref = 0.0f;
                     bool all_rows_ok = true;
+                    bool probe_failed = false;
+                    const bool run_qwen36_probe = ud->qwen36_prefill_q4k_probe && ud->qwen36_prefill_q4k_admission_key;
+                    constexpr float kQwen36Q4KBatchedProbeTol = 1e-3f;
                     for (int k = k_start; k < k_end; ++k) {
                         const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
                         if (!ComputeQ4KQ8KBatchedRow(row_ptr, quant_input_base, quant_row_stride, tile_m, N,
                                                      row_sums.data())) {
                             all_rows_ok = false;
+                            if (run_qwen36_probe) {
+                                qwen36_probe_local_internal_error = true;
+                                for (int m = 0; m < tile_m; ++m) {
+                                    float ref = 0.0f;
+                                    const void* q_ptr = quant_input_base + static_cast<size_t>(m) * quant_row_stride;
+                                    type_traits_cpu->vec_dot(N, &ref, 0, row_ptr, 0, q_ptr, 0, 1);
+                                    store_out(tile_start + m, k, ref);
+                                }
+                                continue;
+                            }
                             break;
                         }
 
-                        if (debug_q4k_kernel_check) {
+                        if (debug_q4k_kernel_check || run_qwen36_probe) {
                             for (int m = 0; m < tile_m; ++m) {
                                 float ref = 0.0f;
                                 const void* q_ptr = quant_input_base + static_cast<size_t>(m) * quant_row_stride;
                                 type_traits_cpu->vec_dot(N, &ref, 0, row_ptr, 0, q_ptr, 0, 1);
-                                const float diff = std::fabs(row_sums[static_cast<size_t>(m)] - ref);
+                                float probe_value = row_sums[static_cast<size_t>(m)];
+                                if (run_qwen36_probe &&
+                                    Qwen36Q4KBatchedProbeForceFailThreadForTest().load(std::memory_order_relaxed) ==
+                                        ith &&
+                                    k == k_start && m == 0) {
+                                    probe_value += 1.0f;
+                                }
+                                const float diff = std::fabs(probe_value - ref);
+                                if (run_qwen36_probe &&
+                                    (!std::isfinite(diff) || diff > kQwen36Q4KBatchedProbeTol)) {
+                                    probe_failed = true;
+                                    qwen36_probe_local_failed = true;
+                                }
                                 if (diff > max_abs_diff) {
                                     max_abs_diff = diff;
                                     max_diff_k = k;
@@ -1029,12 +1992,32 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                                     max_diff_batched = row_sums[static_cast<size_t>(m)];
                                     max_diff_ref = ref;
                                 }
+                                if (run_qwen36_probe) {
+                                    store_out(tile_start + m, k, ref);
+                                }
                             }
+                        }
+                        if (run_qwen36_probe) {
+                            qwen36_probe_local_max_abs_error =
+                                std::max(qwen36_probe_local_max_abs_error, max_abs_diff);
+                            continue;
+                        }
+                        if (probe_failed) {
+                            all_rows_ok = false;
+                            break;
                         }
 
                         for (int m = 0; m < tile_m; ++m) {
                             store_out(tile_start + m, k, row_sums[static_cast<size_t>(m)]);
                         }
+                    }
+                    if (run_qwen36_probe) {
+                        qwen36_probe_local_max_abs_error =
+                            std::max(qwen36_probe_local_max_abs_error, max_abs_diff);
+                        if (probe_failed || !all_rows_ok) {
+                            qwen36_probe_local_failed = true;
+                        }
+                        continue;
                     }
                     if (debug_q4k_kernel_check && max_abs_diff > kDebugKernelWarnDiff) {
                         const int warn_idx = q4k_kernel_warn_count.fetch_add(1, std::memory_order_relaxed);
@@ -1044,7 +2027,24 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                                       << " batched=" << max_diff_batched << " ref=" << max_diff_ref << std::endl;
                         }
                     }
+                    if (!all_rows_ok && ud->qwen36_prefill_q4k_admitted &&
+                        ud->qwen36_prefill_q4k_admission_key) {
+                        InferenceWorkContext* downgrade_ctx = GetCurrentWorkContext();
+                        if (!downgrade_ctx) {
+                            downgrade_ctx = ud->work_ctx;
+                        }
+                        DowngradeQwen36Q4KBatchedAdmissionOnRuntimeFailure(
+                            ud->qwen36_prefill_q4k_admission_key, max_abs_diff,
+                            Qwen36PrefillQ4KBatchedRejectReason::ProbeInternalError, downgrade_ctx);
+                    }
                     if (all_rows_ok) {
+                        if (ith == 0 && ud->qwen36_prefill_q4k_admission_key) {
+                            InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+                            if (work_ctx) {
+                                work_ctx->qwen36_profile.qwen36_prefill_q4k_batched_used.store(
+                                    1, std::memory_order_relaxed);
+                            }
+                        }
                         record_quant_profile(true, true);
                         continue;
                     }
@@ -1061,6 +2061,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 }
             }
             record_quant_profile(true, false);
+            finalize_qwen36_probe();
             return;
         }
     }
@@ -1618,6 +2619,12 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
 
     // Phase 2: Attention computation
     const int head_tile = ResolvePagedAttentionDecodeHeadTile(ud->n_head, q_tokens, nth);
+    if (ith == 0 && IsQwen36ProfilingEnabled()) {
+        InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+        if (work_ctx) {
+            SetQwen36ProfileMax(work_ctx->qwen36_profile.paged_attn_decode_head_tile_effective, head_tile);
+        }
+    }
     const int tiles_per_token = std::max(1, (ud->n_head + head_tile - 1) / head_tile);
     int tile_start, tile_end;
     if (token_parallel_mode) {
@@ -2235,6 +3242,11 @@ inline struct ggml_tensor* ggml_mul_mat_gemv(struct ggml_context* ctx, struct gg
     userdata->K = K;
     userdata->weight_type = weight->type;
     userdata->input_quant_type = GGML_TYPE_F32;
+    userdata->model_identity = 0;
+    userdata->dynamic_lora_active = false;
+    if (const BatchSpec* batch = GetCurrentBatch()) {
+        userdata->dynamic_lora_active = !batch->lora_map.empty();
+    }
 
     const ggml_type wtype = weight->type;
     if (ggml_is_quantized(wtype)) {
@@ -3473,8 +4485,21 @@ inline struct ggml_tensor* ggml_mul_mat_fp8(struct ggml_context* ctx, struct ggm
 struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* weight, struct ggml_tensor* input,
                                   TransformerModel* model) {
     bool using_cpu_repack_alias = false;
+    bool using_qwen36_ssm_q8_prefill_amx_alias = false;
+    ggml_tensor* const original_weight = weight;
     const int original_input_cols = input ? static_cast<int>(input->ne[1]) : 0;
     const char* original_w_name = (weight && weight->name[0]) ? weight->name : "(unnamed)";
+    const BatchSpec* current_batch = GetCurrentBatch();
+    const auto& fast_path_config = ResolveFastPathRuntimeConfig(current_batch);
+    InferenceWorkContext* dispatch_work_ctx = GetCurrentWorkContext();
+    const InferenceExecutionPhase dispatch_phase =
+        dispatch_work_ctx ? dispatch_work_ctx->phase : InferenceExecutionPhase::Unknown;
+    if (dispatch_work_ctx) {
+        dispatch_work_ctx->qwen36_profile.qwen36_prefill_q4k_batched_mode.store(
+            static_cast<int>(fast_path_config.qwen36_prefill_q4k_batched), std::memory_order_relaxed);
+        dispatch_work_ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_mode.store(
+            static_cast<int>(fast_path_config.qwen36_ssm_q8_prefill_amx), std::memory_order_relaxed);
+    }
     const bool original_qwen_hybrid_ssm_projection =
         model && model->arch_flags.is_hybrid_ssm &&
         (IsHybridSSMQkvWeightName(original_w_name) || std::strstr(original_w_name, "attn_gate") ||
@@ -3513,6 +4538,47 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                 !amx_decode_regression_risk) {
                 weight = it_repack->second;
                 using_cpu_repack_alias = true;
+            }
+        }
+        const int qwen36_ssm_projection_kind = Qwen36SSMProjectionKind(original_w_name);
+        const bool original_qwen36_ssm_q8_projection =
+            model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm &&
+            qwen36_ssm_projection_kind != 0 && original_weight && original_weight->type == GGML_TYPE_Q8_0 &&
+            input->type == GGML_TYPE_F32 && original_weight->ne[0] == input->ne[0];
+        if (original_qwen36_ssm_q8_projection && original_input_cols <= 1 && weight == original_weight) {
+            dispatch_work_ctx = dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext();
+            if (dispatch_work_ctx) {
+                dispatch_work_ctx->qwen36_profile.qwen36_ssm_q8_decode_used_original_q8_path.store(
+                    1, std::memory_order_relaxed);
+                RecordQwen36SSMQ8PrefillAMXReject(
+                    dispatch_work_ctx,
+                    ResolveQwen36SSMQ8PrefillAMXReason(fast_path_config.qwen36_ssm_q8_prefill_amx,
+                                                        dispatch_phase,
+                                                        current_batch && !current_batch->lora_map.empty()));
+            }
+        }
+        if (original_qwen36_ssm_q8_projection && original_input_cols > 1) {
+            dispatch_work_ctx = dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext();
+            auto reject_q8_prefill = [&](Qwen36SSMQ8PrefillAMXRejectReason reason) {
+                RecordQwen36SSMQ8PrefillAMXReject(dispatch_work_ctx, reason);
+            };
+            const Qwen36SSMQ8PrefillAMXRejectReason q8_prefill_gate = ResolveQwen36SSMQ8PrefillAMXReason(
+                fast_path_config.qwen36_ssm_q8_prefill_amx, dispatch_phase,
+                current_batch && !current_batch->lora_map.empty());
+            if (q8_prefill_gate != Qwen36SSMQ8PrefillAMXRejectReason::None) {
+                reject_q8_prefill(q8_prefill_gate);
+            } else {
+                auto it_prefill_amx = model->qwen36_ssm_q8_prefill_amx_aliases.find(original_weight);
+                if (it_prefill_amx == model->qwen36_ssm_q8_prefill_amx_aliases.end() || !it_prefill_amx->second) {
+                    reject_q8_prefill(Qwen36SSMQ8PrefillAMXRejectReason::AliasUnavailable);
+                } else if (model->cpu_amx_aliases.find(it_prefill_amx->second) == model->cpu_amx_aliases.end()) {
+                    reject_q8_prefill(Qwen36SSMQ8PrefillAMXRejectReason::BackendUnavailable);
+                } else {
+                    weight = it_prefill_amx->second;
+                    using_qwen36_ssm_q8_prefill_amx_alias = true;
+                    using_cpu_repack_alias = false;
+                    RecordQwen36SSMQ8PrefillAMXUsed(dispatch_work_ctx, qwen36_ssm_projection_kind);
+                }
             }
         }
     }
@@ -3561,6 +4627,38 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
 #else
         && false;
 #endif
+    const bool qwen36_hybrid_ssm_q4k_prefill_relevant =
+        (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) && M > 1 &&
+        input->type == GGML_TYPE_F32;
+    const bool qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k =
+        qwen36_hybrid_ssm_q4k_prefill_relevant && weight->type == GGML_TYPE_Q4_K;
+    const bool qwen36_hybrid_ssm_q4k_prefill_shape_supported =
+        qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k && weight->ne[0] == input->ne[0] &&
+        (input->ne[0] % QK_K == 0);
+    const bool qwen36_hybrid_ssm_q4k_prefill_kernel_available = IsQ4KTrueBatchedKernelEnabled();
+    const bool qwen36_hybrid_ssm_q4k_prefill_lora_active = current_batch && !current_batch->lora_map.empty();
+    const bool qwen36_hybrid_ssm_q4k_prefill_probe_candidate =
+        (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) && M > 1 &&
+        weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 && weight->ne[0] == input->ne[0] &&
+        (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled() &&
+        (!current_batch || current_batch->lora_map.empty());
+    Qwen36PrefillQ4KBatchedRejectReason qwen36_q4k_reject_reason =
+        Qwen36PrefillQ4KBatchedRejectReason::None;
+    const uint64_t qwen36_q4k_admission_key =
+        qwen36_hybrid_ssm_q4k_prefill_probe_candidate
+            ? HashQwen36Q4KBatchedAdmissionKey(model, weight, input, M, N_dim, K_dim)
+            : 0;
+    const Qwen36Q4KBatchedAdmissionValue qwen36_q4k_admission =
+        qwen36_q4k_admission_key ? LookupQwen36Q4KBatchedAdmission(qwen36_q4k_admission_key)
+                                 : Qwen36Q4KBatchedAdmissionValue{};
+    const bool qwen36_q4k_mode_off =
+        fast_path_config.qwen36_prefill_q4k_batched == densecore::llm::config::Qwen36PrefillQ4KBatchedMode::Off;
+    const bool qwen36_q4k_mode_on =
+        fast_path_config.qwen36_prefill_q4k_batched == densecore::llm::config::Qwen36PrefillQ4KBatchedMode::On;
+    const bool qwen36_q4k_mode_probe =
+        fast_path_config.qwen36_prefill_q4k_batched == densecore::llm::config::Qwen36PrefillQ4KBatchedMode::Probe;
+    const bool qwen36_q4k_probe_rejected =
+        qwen36_q4k_mode_probe && qwen36_q4k_admission.state == Qwen36Q4KBatchedAdmissionState::Reject;
     bool qwen36_lm_head_q4k_prefill_fast_path_eligible = false;
     if (is_qwen36_lm_head && M > 1 && weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 &&
         weight->ne[0] == input->ne[0] && IsQ4KTrueBatchedKernelEnabled()) {
@@ -3586,6 +4684,24 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
                           "GGML_CPU_REPACK");
         return ggml_mul_mat(ctx, weight, input);
+    }
+    if (using_qwen36_ssm_q8_prefill_amx_alias) {
+        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
+                          "GGML_AMX_Q8_PREFILL", "qwen36_ssm_q8_prefill_amx");
+        return ggml_mul_mat(ctx, weight, input);
+    }
+
+    if (qwen36_hybrid_ssm_q4k_prefill_relevant && !qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k) {
+        // Qwen3.6 UD-Q4_K_M keeps the hybrid-SSM qkv/gate/out projection
+        // tensors in Q8_0. That is an expected GGUF layout, not a failed Q4_K
+        // admission. Report it explicitly before the conservative SSM fallback
+        // returns through native GGML so summaries do not misleadingly say
+        // "none" or "admitted".
+        qwen36_q4k_reject_reason = Qwen36PrefillQ4KBatchedRejectReason::NotQ4K;
+        if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+            work_ctx->qwen36_profile.qwen36_prefill_q4k_batched_last_reject_reason.store(
+                static_cast<int>(qwen36_q4k_reject_reason), std::memory_order_relaxed);
+        }
     }
 
     // Hybrid-SSM producer/output projections are correctness-critical on C4A.
@@ -3674,7 +4790,6 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
 
     // STRICT COMPATIBILITY CHECK (zero-overhead: evaluated at graph build time)
     const bool is_compatible = (weight->ne[0] == input->ne[0]);
-    const BatchSpec* current_batch = GetCurrentBatch();
     const densecore::DeviceType preferred_matmul_device = ResolvePreferredMatmulDevice(current_batch);
     const bool hal_matmul_candidate = preferred_matmul_device != densecore::DeviceType::CPU && is_compatible &&
                                       weight->type == GGML_TYPE_F32 && input->type == GGML_TYPE_F32 &&
@@ -3714,6 +4829,25 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                                               (input->ne[0] % QK_K == 0);
         }
     }
+    const bool qwen36_q4k_candidate_ready =
+        qwen36_hybrid_ssm_q4k_prefill_probe_candidate && has_quant_vec_dot && has_quant_from_float &&
+        quant_input_size_ok && quant_true_batched_kernel_ready;
+    qwen36_q4k_reject_reason = ResolveQwen36PrefillQ4KBatchedReason(
+        qwen36_hybrid_ssm_q4k_prefill_relevant, qwen36_q4k_mode_off, qwen36_hybrid_ssm_q4k_prefill_lora_active,
+        qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k, qwen36_hybrid_ssm_q4k_prefill_shape_supported,
+        qwen36_hybrid_ssm_q4k_prefill_kernel_available, has_quant_vec_dot, qwen36_q4k_candidate_ready,
+        qwen36_q4k_mode_on, qwen36_q4k_mode_probe,
+        qwen36_q4k_admission.state);
+    if (qwen36_q4k_reject_reason != Qwen36PrefillQ4KBatchedRejectReason::None) {
+        if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+            work_ctx->qwen36_profile.qwen36_prefill_q4k_batched_last_reject_reason.store(
+                static_cast<int>(qwen36_q4k_reject_reason), std::memory_order_relaxed);
+        }
+    }
+    const bool qwen36_q4k_probe_admitted =
+        qwen36_q4k_candidate_ready &&
+        (qwen36_q4k_mode_on ||
+         (qwen36_q4k_mode_probe && qwen36_q4k_admission.state != Qwen36Q4KBatchedAdmissionState::Reject));
     const bool qwen35_dense_prefill_prefers_ggml_quant =
         model && model->variant == ModelVariant::QWEN35 && model->hparams.n_experts <= 0 && input_cols > 1 &&
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -3722,7 +4856,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         false;
 #endif
     const bool qwen36_prefill_prefers_ggml_quant =
-        model && model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm && input_cols > 1;
+        model && model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm && input_cols > 1 &&
+        (!qwen36_q4k_probe_admitted || qwen36_q4k_mode_off || qwen36_q4k_probe_rejected);
     const bool is_small_batch_quant_candidate =
         (input_cols > 1 && input_cols <= max_small_batch_quant_cols && input->type == GGML_TYPE_F32 &&
          ggml_is_quantized(weight->type) && !qwen35_dense_prefill_prefers_ggml_quant &&
@@ -3758,6 +4893,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                           ggml_is_quantized(weight->type) ? "GEMV_QUANT" : "GEMV_F32");
         GemvUserData* ud = GetGemvUserData();
         ud->force_reference_scalar = false;
+        ud->model_identity = reinterpret_cast<uintptr_t>(model);
         const bool is_gemma4_model = model && model->arch_flags.is_gemma4;
         static const bool gemma4_q8_repacked_enabled = []() {
             return densecore::env::ParseNonZeroEnv("DENSECORE_GEMMA4_ENABLE_Q8_REPACKED_GEMV", false);
@@ -3790,6 +4926,10 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         }
         GemvBatchedUserData* ud = GetGemvBatchedUserData();
         ud->force_reference_scalar = false;
+        ud->qwen36_prefill_q4k_admission_key = qwen36_q4k_admission_key;
+        ud->qwen36_prefill_q4k_probe =
+            qwen36_q4k_mode_probe && qwen36_q4k_admission.state == Qwen36Q4KBatchedAdmissionState::Unknown;
+        ud->qwen36_prefill_q4k_admitted = qwen36_q4k_probe_admitted;
         LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
                                 is_small_batch_quant_candidate
                                     ? (quant_true_batched_kernel_ready && weight->type == GGML_TYPE_Q4_K

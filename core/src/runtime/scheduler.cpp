@@ -46,7 +46,8 @@ Scheduler::Scheduler(BlockManager* block_manager, const SchedulerConfig& config)
 
 int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, int priority,
                           const std::vector<int>* prefix_tokens, bool allow_chunked_prefill,
-                          bool require_hybrid_ssm_prefix_snapshot, int max_prefill_chunk_tokens) {
+                          bool require_hybrid_ssm_prefix_snapshot, int max_prefill_chunk_tokens,
+                          const BlockManager::HybridSSMSnapshotValidator& hybrid_ssm_snapshot_validator) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // Fast reject impossible requests:
@@ -71,8 +72,8 @@ int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, in
     // Prefix reuse always leaves at least one token to execute so prompt-end
     // logits are still computed by the normal prefill path.
     if (prefix_tokens && !prefix_tokens->empty()) {
-        auto match = block_manager_->FindLongestCachedPrefixWithVerification(prefix_tokens->data(), prompt_len,
-                                                                             require_hybrid_ssm_prefix_snapshot);
+        auto match = block_manager_->FindLongestCachedPrefixWithVerification(
+            prefix_tokens->data(), prompt_len, require_hybrid_ssm_prefix_snapshot, hybrid_ssm_snapshot_validator);
         if (match.cached_tokens > 0 && !match.cached_block_ids.empty()) {
             group.shared_prefix_len = match.cached_tokens;
             group.shared_block_ids = std::move(match.cached_block_ids);

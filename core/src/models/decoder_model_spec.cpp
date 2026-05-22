@@ -320,7 +320,8 @@ bool ShouldUsePrefillLastLogitsOnly(const DecoderModelSpec* spec, int num_seqs, 
     case DecoderPrefillLogitsPolicy::LastTokenEnvOptIn:
         return policy.qwen35_prefill_last_logits_only;
     case DecoderPrefillLogitsPolicy::LastTokenEnvDefaultOn:
-        return policy.qwen36_prefill_last_logits_only;
+        return spec->variant == ModelVariant::QWEN35 ? policy.qwen35_prefill_last_logits_only
+                                                     : policy.qwen36_prefill_last_logits_only;
     case DecoderPrefillLogitsPolicy::LastTokenForMoE: return true;
     case DecoderPrefillLogitsPolicy::FullSequence:
     default: return false;

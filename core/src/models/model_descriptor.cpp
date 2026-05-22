@@ -335,7 +335,7 @@ TokenizerFamily ResolveTokenizerFamilyFromMetadata(std::string_view tokenizer_ty
         return TokenizerFamily::UNKNOWN;
     }
     if (lowered.find("qwen36") != std::string::npos || lowered.find("qwen3.6") != std::string::npos) {
-        return TokenizerFamily::QWEN35_UNICODE_BPE;
+        return TokenizerFamily::QWEN_BYTE_BPE;
     }
     if (lowered.find("qwen35") != std::string::npos || lowered.find("qwen3.5") != std::string::npos) {
         return TokenizerFamily::QWEN35_UNICODE_BPE;

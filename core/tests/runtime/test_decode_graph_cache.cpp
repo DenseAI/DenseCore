@@ -1,9 +1,14 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cmath>
+#include <atomic>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "densecore/runtime/inference.h"
+#include "ggml-cpu.h"
 #include "densecore/models/model_types.h"
 #include "models/model_inference_policy.h"
 #include "densecore/memory/kv_cache.h"
@@ -13,6 +18,34 @@
 namespace densecore::testing {
 extern bool ShouldUsePagedDecodeAttentionForBatchTest(const TransformerModel* model, const PagedKVCache* cache,
                                                       const BatchSpec& batch);
+extern int ResolvePagedAttentionDecodeHeadTileForTest(int n_head, int n_tokens, int n_tasks);
+extern uint64_t HashQwen36Q4KBatchedAdmissionKeyForTest(const TransformerModel* model, const ggml_tensor* weight,
+                                                        const ggml_tensor* input, int M, int N, int K);
+extern void StoreQwen36Q4KBatchedAdmissionForTest(uint64_t key, bool pass, float max_abs_error, const char* reason);
+extern int LookupQwen36Q4KBatchedAdmissionForTest(uint64_t key);
+extern void DowngradeQwen36Q4KBatchedAdmissionForTest(uint64_t key, float max_abs_error);
+extern bool GetOrCreateQ4KCopiedGemvExperimentWeightForTest(const void* weight_data, uintptr_t model_identity,
+                                                           int64_t rows, int64_t cols, ggml_type type,
+                                                           uint64_t lora_epoch, bool* cache_hit);
+extern bool RunQ4KCopiedGemvExperimentRowsForTest(const void* weight_data, const void* q8_input,
+                                                  uintptr_t model_identity, int64_t rows, int64_t cols,
+                                                  uint64_t lora_epoch, float* output, bool* cache_hit);
+extern void ClearQ4KCopiedGemvExperimentCacheForTest(uintptr_t model_identity);
+extern void ClearAllQ4KCopiedGemvExperimentCacheForTest();
+extern size_t Q4KCopiedGemvExperimentCacheEntryCountForTest();
+extern uint64_t Q4KCopiedGemvExperimentCachePackCountForTest();
+extern bool Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode mode, int* reject_reason);
+extern bool QActCacheSharedDataDifferentTensorMissesForTest();
+extern bool QActCacheSameTensorDifferentTokenOrSlotMissesForTest(bool change_token_pos);
+extern bool QActCacheResetAcrossCachedDecodeReuseForTest();
+extern bool RunQwen36Q4KBatchedShadowProbeForTest(int nth, int force_fail_ith, bool* output_matches_reference,
+                                                  int* admission_state, int* reject_reason);
+extern int ResolveQwen36PrefillQ4KBatchedReasonForTest(bool relevant, bool mode_off, bool lora_active,
+                                                       bool weight_is_q4k, bool shape_supported,
+                                                       bool kernel_available, bool has_vec_dot, bool candidate_ready,
+                                                       bool mode_on, bool mode_probe, int admission_state);
+extern const char* Qwen36SSMQ8PrefillAMXRejectReasonNameForTest(int reason);
+extern int ResolveQwen36SSMQ8PrefillAMXReasonForTest(int mode, int phase, bool lora_active);
 }
 
 namespace {
@@ -113,6 +146,287 @@ private:
 };
 
 }  // namespace
+
+TEST(DecodeGraphCachePolicyTest, ServerBatchingDefaultsUseSixteenSeqCacheWindow) {
+    EXPECT_GE(DecodeGraphCacheMaxBatch(), 16);
+    EXPECT_GE(DecodeGraphCacheLruSize(), 32);
+    EXPECT_GE(DecodeGraphCacheCtxBytes(), 192ULL * 1024ULL * 1024ULL);
+}
+
+TEST(DecodeGraphCachePolicyTest, AdaptivePagedDecodeHeadTileKeepsSingleTokenBusy) {
+    ScopedEnvOverride tile_env("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", nullptr);
+    EXPECT_LE(densecore::testing::ResolvePagedAttentionDecodeHeadTileForTest(32, 1, 16), 2);
+    EXPECT_GE(densecore::testing::ResolvePagedAttentionDecodeHeadTileForTest(8, 1, 16), 1);
+}
+
+TEST(DecodeGraphCachePolicyTest, PagedDecodeHeadTileEnvOverrideWins) {
+    ScopedEnvOverride tile_env("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", "8");
+    EXPECT_EQ(densecore::testing::ResolvePagedAttentionDecodeHeadTileForTest(32, 1, 16), 8);
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36PrefillQ4KAdmissionKeySeparatesShapeAndTensor) {
+    ggml_init_params params{16 * 1024, nullptr, false};
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+    TransformerModel model = MakeQwen36HybridDecodeModel();
+    ggml_tensor* w0 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, QK_K, 4);
+    ggml_tensor* w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, QK_K, 4);
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, QK_K, 2);
+    ASSERT_NE(w0, nullptr);
+    ASSERT_NE(w1, nullptr);
+    ASSERT_NE(input, nullptr);
+    const uint64_t key0 = densecore::testing::HashQwen36Q4KBatchedAdmissionKeyForTest(&model, w0, input, 2, 4, QK_K);
+    const uint64_t key1 = densecore::testing::HashQwen36Q4KBatchedAdmissionKeyForTest(&model, w1, input, 2, 4, QK_K);
+    const uint64_t key2 = densecore::testing::HashQwen36Q4KBatchedAdmissionKeyForTest(&model, w0, input, 3, 4, QK_K);
+    EXPECT_NE(key0, key1);
+    EXPECT_NE(key0, key2);
+    densecore::testing::StoreQwen36Q4KBatchedAdmissionForTest(key0, false, 0.25f, "probe_mismatch");
+    EXPECT_EQ(densecore::testing::LookupQwen36Q4KBatchedAdmissionForTest(key0), 2);
+    densecore::testing::StoreQwen36Q4KBatchedAdmissionForTest(key0, true, 0.0f, "pass");
+    EXPECT_EQ(densecore::testing::LookupQwen36Q4KBatchedAdmissionForTest(key0), 2);
+    EXPECT_EQ(densecore::testing::LookupQwen36Q4KBatchedAdmissionForTest(key1), 0);
+    densecore::testing::StoreQwen36Q4KBatchedAdmissionForTest(key1, true, 0.0f, "pass");
+    EXPECT_EQ(densecore::testing::LookupQwen36Q4KBatchedAdmissionForTest(key1), 1);
+    densecore::testing::StoreQwen36Q4KBatchedAdmissionForTest(key1, false, 0.5f, "probe_mismatch");
+    EXPECT_EQ(densecore::testing::LookupQwen36Q4KBatchedAdmissionForTest(key1), 2);
+    ggml_free(ctx);
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36PrefillQ4KRuntimeFailureDowngradesAdmittedKey) {
+    constexpr uint64_t key = 0x5157333651344bULL;
+    densecore::testing::StoreQwen36Q4KBatchedAdmissionForTest(key, true, 0.0f, "pass");
+    EXPECT_EQ(densecore::testing::LookupQwen36Q4KBatchedAdmissionForTest(key), 1);
+    densecore::testing::DowngradeQwen36Q4KBatchedAdmissionForTest(key, 1.0f);
+    EXPECT_EQ(densecore::testing::LookupQwen36Q4KBatchedAdmissionForTest(key), 2);
+    densecore::testing::StoreQwen36Q4KBatchedAdmissionForTest(key, true, 0.0f, "pass");
+    EXPECT_EQ(densecore::testing::LookupQwen36Q4KBatchedAdmissionForTest(key), 2);
+}
+
+TEST(DecodeGraphCachePolicyTest, Q4KCopiedGemvExperimentCacheKeySeparatesTensorShapeAndLoraEpoch) {
+    densecore::testing::ClearAllQ4KCopiedGemvExperimentCacheForTest();
+    std::vector<uint8_t> w0(ggml_row_size(GGML_TYPE_Q4_K, QK_K) * 4);
+    std::vector<uint8_t> w1(ggml_row_size(GGML_TYPE_Q4_K, QK_K) * 4);
+    bool hit = true;
+    EXPECT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
+        w0.data(), 7, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
+    EXPECT_FALSE(hit);
+    EXPECT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
+        w0.data(), 7, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
+    EXPECT_TRUE(hit);
+    EXPECT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
+        w1.data(), 7, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
+    EXPECT_FALSE(hit);
+    EXPECT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
+        w0.data(), 7, 4, QK_K, GGML_TYPE_Q4_K, 1, &hit));
+    EXPECT_FALSE(hit);
+}
+
+TEST(DecodeGraphCachePolicyTest, Q4KCopiedGemvExperimentCacheDoesNotDuplicateConcurrentFirstUse) {
+    densecore::testing::ClearAllQ4KCopiedGemvExperimentCacheForTest();
+    std::vector<uint8_t> weight(ggml_row_size(GGML_TYPE_Q4_K, QK_K) * 4);
+    constexpr int thread_count = 8;
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+    for (int i = 0; i < thread_count; ++i) {
+        threads.emplace_back([&]() {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            bool hit = false;
+            EXPECT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
+                weight.data(), 77, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != thread_count) {
+        std::this_thread::yield();
+    }
+    const uint64_t before = densecore::testing::Q4KCopiedGemvExperimentCachePackCountForTest();
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    EXPECT_EQ(densecore::testing::Q4KCopiedGemvExperimentCacheEntryCountForTest(), 1u);
+    EXPECT_EQ(densecore::testing::Q4KCopiedGemvExperimentCachePackCountForTest() - before, 1u);
+}
+
+TEST(DecodeGraphCachePolicyTest, Q4KCopiedGemvExperimentCacheClearForModelRemovesOnlyThatModel) {
+    densecore::testing::ClearAllQ4KCopiedGemvExperimentCacheForTest();
+    std::vector<uint8_t> w0(ggml_row_size(GGML_TYPE_Q4_K, QK_K) * 4);
+    std::vector<uint8_t> w1(ggml_row_size(GGML_TYPE_Q4_K, QK_K) * 4);
+    bool hit = false;
+    ASSERT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
+        w0.data(), 101, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
+    ASSERT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
+        w1.data(), 202, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
+    ASSERT_EQ(densecore::testing::Q4KCopiedGemvExperimentCacheEntryCountForTest(), 2u);
+    densecore::testing::ClearQ4KCopiedGemvExperimentCacheForTest(101);
+    EXPECT_EQ(densecore::testing::Q4KCopiedGemvExperimentCacheEntryCountForTest(), 1u);
+    densecore::testing::ClearAllQ4KCopiedGemvExperimentCacheForTest();
+    EXPECT_EQ(densecore::testing::Q4KCopiedGemvExperimentCacheEntryCountForTest(), 0u);
+}
+
+TEST(DecodeGraphCachePolicyTest, Q4KRepackedGateAdmitsWhenRealKernelIsAvailable) {
+    int reject_reason = 0;
+    EXPECT_FALSE(densecore::testing::Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode::Off,
+                                                                   &reject_reason));
+    EXPECT_EQ(reject_reason, 1);
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+    EXPECT_TRUE(densecore::testing::Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode::On,
+                                                                  &reject_reason));
+    EXPECT_EQ(reject_reason, 0);
+#else
+    EXPECT_FALSE(densecore::testing::Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode::On,
+                                                                   &reject_reason));
+    EXPECT_NE(reject_reason, 0);
+#endif
+}
+
+TEST(DecodeGraphCachePolicyTest, QActCacheDoesNotReuseWhenDifferentTensorsShareDataPointer) {
+    EXPECT_TRUE(densecore::testing::QActCacheSharedDataDifferentTensorMissesForTest());
+}
+
+TEST(DecodeGraphCachePolicyTest, QActCacheMissesWhenTokenPositionChanges) {
+    EXPECT_TRUE(densecore::testing::QActCacheSameTensorDifferentTokenOrSlotMissesForTest(/*change_token_pos=*/true));
+}
+
+TEST(DecodeGraphCachePolicyTest, QActCacheMissesWhenSlotIdChanges) {
+    EXPECT_TRUE(densecore::testing::QActCacheSameTensorDifferentTokenOrSlotMissesForTest(/*change_token_pos=*/false));
+}
+
+TEST(DecodeGraphCachePolicyTest, QActCacheResetsAcrossCachedDecodeGraphReuse) {
+    EXPECT_TRUE(densecore::testing::QActCacheResetAcrossCachedDecodeReuseForTest());
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36PrefillQ4KReasonDoesNotAdmitInvalidCandidates) {
+    constexpr int kPass = 1;
+    EXPECT_EQ(densecore::testing::ResolveQwen36PrefillQ4KBatchedReasonForTest(
+                  true, false, true, true, true, true, true, true, true, false, kPass),
+              2);
+    EXPECT_EQ(densecore::testing::ResolveQwen36PrefillQ4KBatchedReasonForTest(
+                  true, false, false, true, false, true, true, true, true, false, kPass),
+              3);
+    EXPECT_EQ(densecore::testing::ResolveQwen36PrefillQ4KBatchedReasonForTest(
+                  true, false, false, true, true, false, true, true, true, false, kPass),
+              5);
+    EXPECT_EQ(densecore::testing::ResolveQwen36PrefillQ4KBatchedReasonForTest(
+                  true, false, false, true, true, true, false, true, true, false, kPass),
+              4);
+    EXPECT_EQ(densecore::testing::ResolveQwen36PrefillQ4KBatchedReasonForTest(
+                  true, false, false, false, false, true, true, true, true, false, kPass),
+              10);
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36PrefillQ4KReasonAdmitsOnlyValidOnOrPassedProbe) {
+    constexpr int kUnknown = 0;
+    constexpr int kPass = 1;
+    constexpr int kReject = 2;
+    EXPECT_EQ(densecore::testing::ResolveQwen36PrefillQ4KBatchedReasonForTest(
+                  true, false, false, true, true, true, true, true, true, false, kUnknown),
+              8);
+    EXPECT_EQ(densecore::testing::ResolveQwen36PrefillQ4KBatchedReasonForTest(
+                  true, false, false, true, true, true, true, true, false, true, kPass),
+              8);
+    EXPECT_EQ(densecore::testing::ResolveQwen36PrefillQ4KBatchedReasonForTest(
+                  true, false, false, true, true, true, true, true, false, true, kReject),
+              9);
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36SSMQ8PrefillAMXRejectReasonsAreStableStrings) {
+    EXPECT_STREQ(densecore::testing::Qwen36SSMQ8PrefillAMXRejectReasonNameForTest(1), "env_off");
+    EXPECT_STREQ(densecore::testing::Qwen36SSMQ8PrefillAMXRejectReasonNameForTest(6), "dynamic_lora");
+    EXPECT_STREQ(densecore::testing::Qwen36SSMQ8PrefillAMXRejectReasonNameForTest(9), "probe_unavailable");
+    EXPECT_STREQ(densecore::testing::Qwen36SSMQ8PrefillAMXRejectReasonNameForTest(10), "admitted");
+    EXPECT_STREQ(densecore::testing::Qwen36SSMQ8PrefillAMXRejectReasonNameForTest(11), "decode_original_q8");
+    EXPECT_STREQ(densecore::testing::Qwen36SSMQ8PrefillAMXRejectReasonNameForTest(12),
+                 "resident_decode_regression_risk");
+    EXPECT_STREQ(densecore::testing::Qwen36SSMQ8PrefillAMXRejectReasonNameForTest(13), "phase_unknown");
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36SSMQ8PrefillAMXAdmissionRequiresExplicitPrefillPhase) {
+    constexpr int kModeOn = 2;
+    constexpr int kUnknown = 0;
+    constexpr int kPrefill = 1;
+    constexpr int kDecode = 2;
+    EXPECT_EQ(densecore::testing::ResolveQwen36SSMQ8PrefillAMXReasonForTest(kModeOn, kUnknown, false), 13);
+    EXPECT_EQ(densecore::testing::ResolveQwen36SSMQ8PrefillAMXReasonForTest(kModeOn, kDecode, false), 3);
+    EXPECT_EQ(densecore::testing::ResolveQwen36SSMQ8PrefillAMXReasonForTest(kModeOn, kPrefill, true), 6);
+    EXPECT_EQ(densecore::testing::ResolveQwen36SSMQ8PrefillAMXReasonForTest(kModeOn, kPrefill, false), 0);
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36ProbeUnknownPublishesReferenceOutput) {
+    bool output_matches_reference = false;
+    int admission_state = 0;
+    int reject_reason = 0;
+    ASSERT_TRUE(densecore::testing::RunQwen36Q4KBatchedShadowProbeForTest(
+        /*nth=*/2, /*force_fail_ith=*/-1, &output_matches_reference, &admission_state, &reject_reason));
+    EXPECT_TRUE(output_matches_reference);
+    EXPECT_NE(admission_state, 0);
+    EXPECT_TRUE(reject_reason == 6 || reject_reason == 8);
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36ProbeRejectsIfAnyWorkerPartitionFails) {
+    bool output_matches_reference = false;
+    int admission_state = 0;
+    int reject_reason = 0;
+    ASSERT_TRUE(densecore::testing::RunQwen36Q4KBatchedShadowProbeForTest(
+        /*nth=*/2, /*force_fail_ith=*/1, &output_matches_reference, &admission_state, &reject_reason));
+    EXPECT_TRUE(output_matches_reference);
+    EXPECT_EQ(admission_state, 2);
+    EXPECT_EQ(reject_reason, 6);
+}
+
+TEST(DecodeGraphCachePolicyTest, Q4KCopiedGemvExperimentMatchesVecDotReference) {
+    densecore::testing::ClearAllQ4KCopiedGemvExperimentCacheForTest();
+    constexpr int rows = 4;
+    constexpr int cols = QK_K;
+    const auto* q4_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    ASSERT_NE(q4_traits, nullptr);
+    ASSERT_NE(q8_traits, nullptr);
+    ASSERT_NE(q4_traits->from_float, nullptr);
+    ASSERT_NE(q4_traits->vec_dot, nullptr);
+    ASSERT_NE(q8_traits->from_float, nullptr);
+    ASSERT_EQ(q4_traits->vec_dot_type, GGML_TYPE_Q8_K);
+
+    std::vector<float> weights(static_cast<size_t>(rows * cols));
+    std::vector<float> x(static_cast<size_t>(cols));
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            weights[static_cast<size_t>(r * cols + c)] =
+                std::sin(static_cast<float>(r * 17 + c) * 0.031f) * 0.25f;
+        }
+    }
+    for (int c = 0; c < cols; ++c) {
+        x[static_cast<size_t>(c)] = std::cos(static_cast<float>(c) * 0.027f) * 0.5f;
+    }
+
+    const size_t q4_row_bytes = ggml_row_size(GGML_TYPE_Q4_K, cols);
+    const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, cols);
+    std::vector<uint8_t> q4(static_cast<size_t>(rows) * q4_row_bytes);
+    std::vector<uint8_t> q8(q8_row_bytes);
+    for (int r = 0; r < rows; ++r) {
+        q4_traits->from_float(weights.data() + static_cast<size_t>(r * cols),
+                              q4.data() + static_cast<size_t>(r) * q4_row_bytes, cols);
+    }
+    q8_traits->from_float(x.data(), q8.data(), cols);
+
+    std::vector<float> ref(rows, 0.0f);
+    std::vector<float> got(rows, 0.0f);
+    for (int r = 0; r < rows; ++r) {
+        q4_traits->vec_dot(cols, &ref[static_cast<size_t>(r)], 0,
+                           q4.data() + static_cast<size_t>(r) * q4_row_bytes, 0, q8.data(), 0, 1);
+    }
+    bool hit = true;
+    ASSERT_TRUE(densecore::testing::RunQ4KCopiedGemvExperimentRowsForTest(q4.data(), q8.data(), 99, rows, cols, 0,
+                                                                          got.data(), &hit));
+    EXPECT_FALSE(hit);
+    for (int r = 0; r < rows; ++r) {
+        EXPECT_NEAR(got[static_cast<size_t>(r)], ref[static_cast<size_t>(r)], 1e-6f);
+    }
+}
 
 TEST(DecodeGraphCachePolicyTest, UnqualifiedHybridSSMModelsAreNotDecodeGraphCacheSafeYet) {
     TransformerModel model{};
@@ -351,7 +665,7 @@ TEST(DecodeGraphCachePolicyTest, PagedDecodeAllowsShortSingleDecode) {
     EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&llama, /*num_seqs=*/1, /*n_past=*/63));
 }
 
-TEST(DecodeGraphCachePolicyTest, Qwen36SingleDecodeTopologyIsCacheStableWithoutForcedPagedDecode) {
+TEST(DecodeGraphCachePolicyTest, QwenHybridSingleDecodeTopologyIsCacheStableWithoutForcedPagedDecode) {
     TransformerModel qwen36 = MakeQwen36HybridDecodeModel();
     qwen36.hparams.n_head_kv = 2;
     qwen36.hparams.n_embd_head_k = 256;

@@ -298,8 +298,9 @@ int BlockManager::FindCachedBlockWithVerification(uint64_t hash, const int* toke
     return block_id;
 }
 
-BlockManager::PrefixCacheMatch BlockManager::FindLongestCachedPrefixWithVerification(const int* tokens, int n_tokens,
-                                                                                     bool require_hybrid_ssm_snapshot) {
+BlockManager::PrefixCacheMatch BlockManager::FindLongestCachedPrefixWithVerification(
+    const int* tokens, int n_tokens, bool require_hybrid_ssm_snapshot,
+    const HybridSSMSnapshotValidator& hybrid_ssm_snapshot_validator) {
     PrefixCacheMatch match;
     if (!tokens || n_tokens <= BLOCK_SIZE) {
         return match;
@@ -312,6 +313,7 @@ BlockManager::PrefixCacheMatch BlockManager::FindLongestCachedPrefixWithVerifica
 
     std::vector<int> acquired_blocks;
     acquired_blocks.reserve(max_reusable_tokens / BLOCK_SIZE);
+    int terminal_snapshot_block_count = require_hybrid_ssm_snapshot ? 0 : -1;
 
     for (int offset = 0; offset < max_reusable_tokens; offset += BLOCK_SIZE) {
         const uint64_t hash = ComputeTokenHash(tokens + offset, BLOCK_SIZE);
@@ -320,13 +322,25 @@ BlockManager::PrefixCacheMatch BlockManager::FindLongestCachedPrefixWithVerifica
             break;
         }
 
-        if (require_hybrid_ssm_snapshot &&
-            block_hybrid_ssm_snapshots.find(block_id) == block_hybrid_ssm_snapshots.end()) {
-            FreeSingle(block_id);
-            break;
-        }
-
         acquired_blocks.push_back(block_id);
+        if (require_hybrid_ssm_snapshot) {
+            std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot;
+            if (LoadHybridSSMSnapshotForBlock(block_id, &snapshot) &&
+                (!hybrid_ssm_snapshot_validator || hybrid_ssm_snapshot_validator(snapshot))) {
+                terminal_snapshot_block_count = static_cast<int>(acquired_blocks.size());
+            }
+        }
+    }
+
+    if (require_hybrid_ssm_snapshot) {
+        if (terminal_snapshot_block_count <= 0) {
+            Free(acquired_blocks);
+            acquired_blocks.clear();
+        } else if (terminal_snapshot_block_count < static_cast<int>(acquired_blocks.size())) {
+            std::vector<int> dropped(acquired_blocks.begin() + terminal_snapshot_block_count, acquired_blocks.end());
+            Free(dropped);
+            acquired_blocks.resize(static_cast<size_t>(terminal_snapshot_block_count));
+        }
     }
 
     match.cached_block_ids = std::move(acquired_blocks);

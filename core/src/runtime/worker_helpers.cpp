@@ -61,6 +61,17 @@ int CapThreadsToAvailableCores(int physical_core_count, int base_threads) {
     return std::max(1, cap);
 }
 
+int EffectiveWorkerThreadCap(int physical_core_count, int base_threads) {
+    int cap = CapThreadsToAvailableCores(physical_core_count, base_threads);
+    if (physical_core_count > 0) {
+        cap = std::max(cap, physical_core_count);
+    }
+    if (base_threads > 0) {
+        cap = std::max(cap, base_threads);
+    }
+    return std::max(1, std::min(cap, 256));
+}
+
 bool IsQwen35HybridSsmSingleRequest(const TransformerModel* model, int num_seqs) {
     if (num_seqs != 1 || !model || !model->arch_flags.is_hybrid_ssm) {
         return false;
@@ -206,7 +217,7 @@ size_t LongestTagCarry(const std::string& text, const std::string& open, const s
 
 }  // namespace
 
-bool IsQwen36SingleDecodeCacheCandidate(const TransformerModel* model);
+bool IsQwenHybridSSMSingleDecodeCacheCandidate(const TransformerModel* model);
 
 bool IsDebugGraphLoggingEnabled() {
     static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_DEBUG_GRAPH", false);
@@ -410,9 +421,9 @@ bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model) {
     if (model->arch_flags.is_gemma4) {
         return densecore::models::SupportsPagedDecodeAttention(model);
     }
-    // Qwen3.6 hybrid-SSM single-token decode has stable paged-attention topology
-    // and the SSM custom-op runtime state is rebound on every cache reuse.
-    if (IsQwen36SingleDecodeCacheCandidate(model)) {
+    // Qwen3.5/Qwen3.6 hybrid-SSM single-token decode has stable paged-attention
+    // topology and the SSM custom-op runtime state is rebound on every cache reuse.
+    if (IsQwenHybridSSMSingleDecodeCacheCandidate(model)) {
         return true;
     }
     // Other hybrid-SSM graphs still contain request-local state pointers until
@@ -522,18 +533,18 @@ void DebugVerifyCachedDecodeGraphReuseState(const struct ggml_cgraph* graph, int
 }
 
 int DecodeGraphCacheMaxBatch() {
-    static const int max_batch = ParsePositiveEnvIntOrDefault("DENSECORE_DECODE_GRAPH_CACHE_MAX_BATCH", 4);
+    static const int max_batch = ParsePositiveEnvIntOrDefault("DENSECORE_DECODE_GRAPH_CACHE_MAX_BATCH", 16);
     return max_batch;
 }
 
 int DecodeGraphCacheLruSize() {
-    static const int lru = ParsePositiveEnvIntOrDefault("DENSECORE_DECODE_GRAPH_CACHE_LRU_SIZE", 8);
+    static const int lru = ParsePositiveEnvIntOrDefault("DENSECORE_DECODE_GRAPH_CACHE_LRU_SIZE", 32);
     return lru;
 }
 
 size_t DecodeGraphCacheCtxBytes() {
     static const size_t bytes = []() {
-        const int mb = ParsePositiveEnvIntOrDefault("DENSECORE_DECODE_GRAPH_CACHE_CTX_MB", 96);
+        const int mb = ParsePositiveEnvIntOrDefault("DENSECORE_DECODE_GRAPH_CACHE_CTX_MB", 192);
         return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
     }();
     return bytes;
@@ -587,7 +598,7 @@ bool UseLegacyDecodeGraphCachePolicy() {
     return legacy;
 }
 
-bool IsQwen36SingleDecodeCacheCandidate(const TransformerModel* model) {
+bool IsQwenHybridSSMSingleDecodeCacheCandidate(const TransformerModel* model) {
     if (!model || !model->arch_flags.is_hybrid_ssm) {
         return false;
     }
@@ -641,6 +652,15 @@ PrefillThreadPolicySelection ResolvePrefillThreadPolicySelection(const Transform
             selection.label = "prefill_qwen36_single_medium_prompt";
         } else {
             selection.label = "prefill_qwen36_single_long_prompt";
+        }
+    }
+    if (model && model->arch_flags.is_gemma4 && num_seqs == 1 && model->hparams.n_experts > 0 &&
+        IsWideSimdLevel(simd_level)) {
+        const int cap = CapThreadsToAvailableCores(physical_core_count, base_threads);
+        if (cap >= 16) {
+            selection.threads = 16;
+            selection.label = densecore::simd::IsArmFamily(simd_level) ? "prefill_gemma4_a4b_c4a_moe_16"
+                                                                      : "prefill_gemma4_a4b_c4_moe_16";
         }
     }
     return selection;
@@ -701,6 +721,11 @@ DecodeThreadPolicySelection ResolveDecodeThreadPolicySelection(const Transformer
                 (model->hparams.n_experts > 0) ? "decode_gemma4_a4b_arm_safe_cap" : "decode_gemma4_dense_arm_12";
             return selection;
         }
+        if (!densecore::simd::IsArmFamily(simd_level) && model->hparams.n_experts > 0 && cap >= 16) {
+            selection.threads = 16;
+            selection.label = "decode_gemma4_a4b_c4_moe_16";
+            return selection;
+        }
         selection.threads = std::max(1, std::min(cap, 8));
         selection.label = (model->hparams.n_experts > 0) ? "decode_gemma4_a4b_safe_cap" : "decode_gemma4_dense_safe_cap";
         return selection;
@@ -722,26 +747,32 @@ DecodeThreadPolicySelection ResolveDecodeThreadPolicySelection(const Transformer
         return selection;
     }
     if (model->hparams.n_experts > 0) {
+        const int qwen_moe_cap = EffectiveWorkerThreadCap(physical_core_count, base_threads);
+        const bool qwen35_a3b = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0;
+        const bool qwen36_a3b = descriptor.variant == ModelVariant::QWEN36 && model->hparams.n_experts > 0;
+        if (!qwen35_a3b && !qwen36_a3b) {
+            return selection;
+        }
         const bool arm_c4a_wide_simd =
             densecore::simd::IsArmFamily(simd_level) &&
             (simd_level == densecore::simd::SimdLevel::SVE || simd_level == densecore::simd::SimdLevel::SVE2);
-        if (arm_c4a_wide_simd && physical_core_count >= 16 && cap >= 16) {
+        if (arm_c4a_wide_simd && qwen_moe_cap >= 16) {
             selection.threads = 16;
-            selection.label = "decode_qwen36_a3b_c4a_moe_16";
+            selection.label = qwen35_a3b ? "decode_qwen35_a3b_c4a_moe_16" : "decode_qwen36_a3b_c4a_moe_16";
             return selection;
         }
-        if (arm_c4a_wide_simd && cap >= 12) {
+        if (arm_c4a_wide_simd && qwen_moe_cap >= 12) {
             selection.threads = 12;
-            selection.label = "decode_qwen36_a3b_arm_safe_cap";
+            selection.label = qwen35_a3b ? "decode_qwen35_a3b_arm_safe_cap" : "decode_qwen36_a3b_arm_safe_cap";
             return selection;
         }
-        if (!densecore::simd::IsArmFamily(simd_level) && cap >= 16) {
+        if (!densecore::simd::IsArmFamily(simd_level) && qwen_moe_cap >= 16) {
             selection.threads = 16;
-            selection.label = "decode_qwen36_a3b_c4_moe_16";
+            selection.label = qwen35_a3b ? "decode_qwen35_a3b_c4_moe_16" : "decode_qwen36_a3b_c4_moe_16";
             return selection;
         }
-        selection.threads = std::max(1, std::min(cap, 8));
-        selection.label = "decode_qwen36_a3b_safe_cap";
+        selection.threads = std::max(1, std::min(qwen_moe_cap, 8));
+        selection.label = qwen35_a3b ? "decode_qwen35_a3b_safe_cap" : "decode_qwen36_a3b_safe_cap";
         return selection;
     }
 
@@ -831,7 +862,7 @@ bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const Pa
     if (batch.num_seqs > 1) {
         return true;
     }
-    return IsPagedDecodeModeAlwaysOn() || IsQwen36SingleDecodeCacheCandidate(model);
+    return IsPagedDecodeModeAlwaysOn() || IsQwenHybridSSMSingleDecodeCacheCandidate(model);
 }
 
 DecodeWorkerStats& GetDecodeWorkerStats() {
@@ -956,6 +987,13 @@ void MaybeLogDecodeRuntimeStats() {
                       << worker_stats.graph_cache_skip_rebind_failure.load(std::memory_order_relaxed)
                       << ",uncacheable="
                       << worker_stats.graph_cache_rejected_uncacheable.load(std::memory_order_relaxed) << "]";
+            std::cerr << " prefill_arena_reuse[hit="
+                      << worker_stats.prefill_arena_reuse_hit.load(std::memory_order_relaxed)
+                      << ",miss=" << worker_stats.prefill_arena_reuse_miss.load(std::memory_order_relaxed) << "]";
+            std::cerr << " prefill_graph_reuse[hit="
+                      << worker_stats.prefill_graph_reuse_hit.load(std::memory_order_relaxed)
+                      << ",skip_model="
+                      << worker_stats.prefill_graph_reuse_skip_model.load(std::memory_order_relaxed) << "]";
 
             bool wrote_variant_bucket = false;
             for (std::size_t variant_idx = 0; variant_idx < kDecodeGraphCacheTrackedVariants; ++variant_idx) {
@@ -1377,6 +1415,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " visible_tokens=" << req->visible_emitted_token_count << " steady_visible_tokens=" << steady_visible_tokens
         << " long_form_visible=" << (req->visible_emitted_token_count >= 64 ? 1 : 0)
         << " nonempty_visible_output=" << (req->visible_emitted_token_count > 0 ? 1 : 0)
+        << " token_id_submit_used=" << (req->token_id_submit_used ? 1 : 0)
+        << " callback_mode=" << (req->callback_mode.empty() ? "unknown" : req->callback_mode.c_str())
         << " suppressed_tokens=" << req->suppressed_token_count << " prefill_ttft_ms=" << prefill_ttft_ms
         << " decode_visible_ms=" << decode_visible_ms << " steady_visible_tok_s=" << steady_visible_tok_s
         << " active_threads=" << req->active_thread_count << " prefill_threads=" << req->prefill_thread_count
@@ -1436,6 +1476,57 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " decode_runtime_path_total=" << runtime.path_total
         << " prefill_chunk_tokens_effective=" << req->prefill_chunk_tokens_effective
         << " q4k_true_batched_used=" << req->q4k_true_batched_used
+        << " qwen36_prefill_q4k_batched_mode=" << req->qwen36_prefill_q4k_batched_mode
+        << " qwen36_prefill_q4k_batched_used=" << req->qwen36_prefill_q4k_batched_used
+        << " qwen36_prefill_q4k_batched_probe_pass=" << req->qwen36_prefill_q4k_batched_probe_pass
+        << " qwen36_prefill_q4k_batched_reject_reason="
+        << (req->qwen36_prefill_q4k_batched_reject_reason.empty()
+                ? "none"
+                : req->qwen36_prefill_q4k_batched_reject_reason.c_str())
+        << " qwen36_prefill_q4k_batched_max_abs_error=" << req->qwen36_prefill_q4k_batched_max_abs_error
+        << " qwen36_prefill_q4k_probe_participants=" << req->qwen36_prefill_q4k_probe_participants
+        << " qwen36_prefill_q4k_probe_failures=" << req->qwen36_prefill_q4k_probe_failures
+        << " qwen36_prefill_q4k_admission_downgraded=" << req->qwen36_prefill_q4k_admission_downgraded
+        << " qwen36_ssm_q8_prefill_amx_mode=" << req->qwen36_ssm_q8_prefill_amx_mode
+        << " qwen36_ssm_q8_prefill_amx_prepared=" << req->qwen36_ssm_q8_prefill_amx_prepared
+        << " qwen36_ssm_q8_prefill_amx_used=" << req->qwen36_ssm_q8_prefill_amx_used
+        << " qwen36_ssm_q8_prefill_amx_reject_reason="
+        << (req->qwen36_ssm_q8_prefill_amx_reject_reason.empty()
+                ? "none"
+                : req->qwen36_ssm_q8_prefill_amx_reject_reason.c_str())
+        << " qwen36_ssm_q8_prefill_amx_prepared_projection_counts="
+        << (req->qwen36_ssm_q8_prefill_amx_prepared_projection_counts.empty()
+                ? "none"
+                : req->qwen36_ssm_q8_prefill_amx_prepared_projection_counts.c_str())
+        << " qwen36_ssm_q8_prefill_amx_projection_counts="
+        << (req->qwen36_ssm_q8_prefill_amx_projection_counts.empty()
+                ? "none"
+                : req->qwen36_ssm_q8_prefill_amx_projection_counts.c_str())
+        << " qwen36_ssm_q8_decode_used_original_q8_path="
+        << req->qwen36_ssm_q8_decode_used_original_q8_path
+        << " qwen36_ssm_projection_quant_preserved=" << req->qwen36_ssm_projection_quant_preserved
+        << " qwen36_ssm_projection_dequantized_count=" << req->qwen36_ssm_projection_dequantized_count
+        << " qwen36_ssm_projection_actual_types="
+        << (req->qwen36_ssm_projection_actual_types.empty() ? "none"
+                                                            : req->qwen36_ssm_projection_actual_types.c_str())
+        << " q4k_repacked_gemv_used=" << req->q4k_repacked_gemv_used
+        << " q4k_repacked_gemv_cache_hits=" << req->q4k_repacked_gemv_cache_hits
+        << " q4k_repacked_gemv_cache_waited_hits=" << req->q4k_repacked_gemv_cache_waited_hits
+        << " q4k_repacked_gemv_cache_misses=" << req->q4k_repacked_gemv_cache_misses
+        << " q4k_repacked_gemv_reject_reason="
+        << (req->q4k_repacked_gemv_reject_reason.empty() ? "none" : req->q4k_repacked_gemv_reject_reason.c_str())
+        << " q4k_copied_gemv_experiment_used=" << req->q4k_copied_gemv_experiment_used
+        << " q4k_copied_gemv_experiment_cache_hits=" << req->q4k_copied_gemv_experiment_cache_hits
+        << " q4k_copied_gemv_experiment_cache_misses=" << req->q4k_copied_gemv_experiment_cache_misses
+        << " q4k_copied_gemv_experiment_reject_reason="
+        << (req->q4k_copied_gemv_experiment_reject_reason.empty()
+                ? "none"
+                : req->q4k_copied_gemv_experiment_reject_reason.c_str())
+        << " qact_cache_hits=" << req->qact_cache_hits << " qact_cache_misses=" << req->qact_cache_misses
+        << " qact_cache_reused_bytes=" << req->qact_cache_reused_bytes
+        << " paged_attn_decode_head_tile_effective=" << req->paged_attn_decode_head_tile_effective
+        << " moe_decode_scratch_reused=" << req->moe_decode_scratch_reused
+        << " moe_decode_allocations_avoided=" << req->moe_decode_allocations_avoided
         << " arm_batched_quant_used=" << req->arm_batched_quant_used
         << " sve_runtime_detected=" << (sve_runtime_detected ? 1 : 0)
         << " sve_compiled_enabled=" << (sve_compiled_enabled ? 1 : 0)

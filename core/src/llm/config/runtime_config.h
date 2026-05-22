@@ -9,6 +9,8 @@
 namespace densecore::llm::config {
 
 struct WorkerRuntimeConfig {
+    enum class CallbackMode { Async = 0, Direct = 1 };
+
     bool validate_mul = false;
     bool runtime_path_logging = false;
     bool scheduler_stall_debug = false;
@@ -26,6 +28,7 @@ struct WorkerRuntimeConfig {
     bool zero_fill_prefill_graph_buffer = false;
     bool zero_fill_prefill_kv_blocks = false;
     int prefill_thread_override = 0;
+    CallbackMode callback_mode = CallbackMode::Async;
 };
 
 WorkerRuntimeConfig LoadWorkerRuntimeConfig();
@@ -58,6 +61,8 @@ struct KVCacheRuntimeConfig {
 KVCacheRuntimeConfig LoadKVCacheRuntimeConfig();
 
 enum class DecodePagedAttentionMode { Off = 0, Auto = 1, On = 2 };
+enum class Qwen36PrefillQ4KBatchedMode { Off = 0, Probe = 1, On = 2 };
+enum class Qwen36SSMQ8PrefillAMXMode { Off = 0, Probe = 1, On = 2 };
 
 struct DecodePagedAttentionPolicy {
     DecodePagedAttentionMode mode = DecodePagedAttentionMode::Auto;
@@ -102,6 +107,16 @@ struct FastPathRuntimeConfig {
     DecodePagedAttentionPolicy decode_paged_attention{};
     KVRetentionPolicy kv_retention{};
     PrefillGraphCachePolicy prefill_graph_cache{};
+    Qwen36PrefillQ4KBatchedMode qwen36_prefill_q4k_batched = Qwen36PrefillQ4KBatchedMode::Probe;
+    densecore::env::RuntimeToggleMode qwen36_ssm_q8_amx_alias = densecore::env::RuntimeToggleMode::Off;
+    Qwen36SSMQ8PrefillAMXMode qwen36_ssm_q8_prefill_amx = Qwen36SSMQ8PrefillAMXMode::Probe;
+    int qwen36_ssm_q8_prefill_amx_min_tokens = 256;
+    densecore::env::RuntimeToggleMode qwen36_expert_cpu_repack = densecore::env::RuntimeToggleMode::Auto;
+    densecore::env::RuntimeToggleMode q4k_repacked_gemv = densecore::env::RuntimeToggleMode::Auto;
+    bool q4k_repacked_gemv_allow_prefill = false;
+    bool q4k_repacked_gemv_probe = true;
+    bool q4k_copied_gemv_experiment = false;
+    densecore::env::RuntimeToggleMode qact_cache = densecore::env::RuntimeToggleMode::Off;
     bool bench_respect_threads = false;
 };
 

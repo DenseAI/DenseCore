@@ -163,6 +163,9 @@ static std::vector<float> ExecuteTransformerGraphForTestImpl(TransformerModel* m
 
     SetCurrentWorkContext(work_ctx.get());
     ResetInferenceWorkContext(work_ctx.get());
+    SetCurrentExecutionPhase(static_cast<int>(batch.tokens.size()) > std::max(1, batch.num_seqs)
+                                 ? InferenceExecutionPhase::Prefill
+                                 : InferenceExecutionPhase::Decode);
     SetCurrentBatch(&batch);
 
     struct ggml_init_params params = {
@@ -386,6 +389,279 @@ int ResolveQuantBatchedTileColsForTest(int requested_cols, int vec_dot_nrows, bo
 bool ResolveQ4KTrueBatchedKernelPolicyForTest(int simd_level, bool compiled_with_sve) {
     return ::ResolveQ4KTrueBatchedKernelEnabledPolicy(static_cast<densecore::simd::SimdLevel>(simd_level),
                                                       compiled_with_sve);
+}
+int ResolvePagedAttentionDecodeHeadTileForTest(int n_head, int n_tokens, int n_tasks) {
+    return ::ResolvePagedAttentionDecodeHeadTile(n_head, n_tokens, n_tasks);
+}
+uint64_t HashQwen36Q4KBatchedAdmissionKeyForTest(const TransformerModel* model, const ggml_tensor* weight,
+                                                 const ggml_tensor* input, int M, int N, int K) {
+    return ::HashQwen36Q4KBatchedAdmissionKey(model, weight, input, M, N, K);
+}
+void StoreQwen36Q4KBatchedAdmissionForTest(uint64_t key, bool pass, float max_abs_error, const char* reason) {
+    const auto parsed_reason =
+        (reason && std::strcmp(reason, "probe_mismatch") == 0)
+            ? ::Qwen36PrefillQ4KBatchedRejectReason::ProbeMismatch
+            : (pass ? ::Qwen36PrefillQ4KBatchedRejectReason::Admitted
+                    : ::Qwen36PrefillQ4KBatchedRejectReason::ProbeInternalError);
+    ::StoreQwen36Q4KBatchedAdmission(key,
+                                     pass ? ::Qwen36Q4KBatchedAdmissionState::Pass
+                                          : ::Qwen36Q4KBatchedAdmissionState::Reject,
+                                     max_abs_error, parsed_reason);
+}
+int LookupQwen36Q4KBatchedAdmissionForTest(uint64_t key) {
+    return static_cast<int>(::LookupQwen36Q4KBatchedAdmission(key).state);
+}
+void DowngradeQwen36Q4KBatchedAdmissionForTest(uint64_t key, float max_abs_error) {
+    ::DowngradeQwen36Q4KBatchedAdmissionOnRuntimeFailure(
+        key, max_abs_error, ::Qwen36PrefillQ4KBatchedRejectReason::ProbeInternalError, nullptr);
+}
+bool GetOrCreateQ4KCopiedGemvExperimentWeightForTest(const void* weight_data, uintptr_t model_identity, int64_t rows,
+                                                     int64_t cols, ggml_type type, uint64_t lora_epoch,
+                                                     bool* cache_hit) {
+    return static_cast<bool>(::GetOrCreateQ4KCopiedGemvExperimentWeight(weight_data, model_identity, rows, cols, type,
+                                                                        lora_epoch, cache_hit));
+}
+bool RunQ4KCopiedGemvExperimentRowsForTest(const void* weight_data, const void* q8_input, uintptr_t model_identity,
+                                           int64_t rows, int64_t cols, uint64_t lora_epoch, float* output,
+                                           bool* cache_hit) {
+    return ::RunQ4KCopiedGemvExperimentRows(weight_data, q8_input, model_identity, rows, cols, lora_epoch, output,
+                                            cache_hit);
+}
+void ClearQ4KCopiedGemvExperimentCacheForTest(uintptr_t model_identity) {
+    ::ClearQ4KCopiedGemvExperimentCacheForModel(model_identity);
+}
+void ClearAllQ4KCopiedGemvExperimentCacheForTest() {
+    ::ClearQ4KCopiedGemvExperimentCache();
+}
+size_t Q4KCopiedGemvExperimentCacheEntryCountForTest() {
+    auto& state = ::Q4KCopiedGemvCache();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.cache.size();
+}
+uint64_t Q4KCopiedGemvExperimentCachePackCountForTest() {
+    auto& state = ::Q4KCopiedGemvCache();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.pack_count;
+}
+bool Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode mode, int* reject_reason) {
+    densecore::llm::config::FastPathRuntimeConfig config{};
+    config.q4k_repacked_gemv = mode;
+    Q4KRepackedGemvRejectReason reject = Q4KRepackedGemvRejectReason::None;
+    const bool enabled = ::Q4KRepackedGemvEnabled(config, &reject);
+    if (reject_reason) {
+        *reject_reason = static_cast<int>(reject);
+    }
+    return enabled;
+}
+int ResolveQwen36PrefillQ4KBatchedReasonForTest(bool relevant, bool mode_off, bool lora_active,
+                                                bool weight_is_q4k, bool shape_supported, bool kernel_available,
+                                                bool has_vec_dot, bool candidate_ready, bool mode_on,
+                                                bool mode_probe, int admission_state) {
+    return static_cast<int>(::ResolveQwen36PrefillQ4KBatchedReason(
+        relevant, mode_off, lora_active, weight_is_q4k, shape_supported, kernel_available, has_vec_dot,
+        candidate_ready, mode_on, mode_probe, static_cast<::Qwen36Q4KBatchedAdmissionState>(admission_state)));
+}
+const char* Qwen36SSMQ8PrefillAMXRejectReasonNameForTest(int reason) {
+    return ::Qwen36SSMQ8PrefillAMXRejectReasonName(reason);
+}
+int ResolveQwen36SSMQ8PrefillAMXReasonForTest(int mode, int phase, bool lora_active) {
+    return static_cast<int>(::ResolveQwen36SSMQ8PrefillAMXReason(
+        static_cast<densecore::llm::config::Qwen36SSMQ8PrefillAMXMode>(mode),
+        static_cast<InferenceExecutionPhase>(phase), lora_active));
+}
+bool QActCacheSharedDataDifferentTensorMissesForTest() {
+    InferenceWorkContext ctx{};
+    ctx.execution_generation = 42;
+    std::array<float, QK_K> values{};
+    for (int i = 0; i < QK_K; ++i) {
+        values[static_cast<size_t>(i)] = static_cast<float>(i) * 0.01f;
+    }
+    ggml_init_params params{16 * 1024, nullptr, false};
+    ggml_context* ggml_ctx = ggml_init(params);
+    if (!ggml_ctx) {
+        return false;
+    }
+    ggml_tensor* t0 = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_F32, QK_K);
+    ggml_tensor* t1 = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_F32, QK_K);
+    if (!t0 || !t1) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+    t0->data = values.data();
+    t1->data = values.data();
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    const size_t q8_bytes = ggml_row_size(GGML_TYPE_Q8_K, QK_K);
+    const uint8_t* first =
+        ::GetOrFillQuantizedActivationCache(&ctx, t0, t0->data, values.data(), QK_K, GGML_TYPE_Q8_K, q8_bytes, 1, 7,
+                                            q8_traits);
+    const uint64_t misses_after_first = ctx.qwen36_profile.qact_cache_misses.load(std::memory_order_relaxed);
+    const uint8_t* second =
+        ::GetOrFillQuantizedActivationCache(&ctx, t1, t1->data, values.data(), QK_K, GGML_TYPE_Q8_K, q8_bytes, 1, 7,
+                                            q8_traits);
+    const uint64_t misses_after_second = ctx.qwen36_profile.qact_cache_misses.load(std::memory_order_relaxed);
+    ggml_free(ggml_ctx);
+    return first && second && misses_after_first == 1 && misses_after_second == 2;
+}
+bool QActCacheSameTensorDifferentTokenOrSlotMissesForTest(bool change_token_pos) {
+    InferenceWorkContext ctx{};
+    ctx.execution_generation = 42;
+    std::array<float, QK_K> values{};
+    for (int i = 0; i < QK_K; ++i) {
+        values[static_cast<size_t>(i)] = static_cast<float>(i) * 0.02f;
+    }
+    ggml_init_params params{16 * 1024, nullptr, false};
+    ggml_context* ggml_ctx = ggml_init(params);
+    if (!ggml_ctx) {
+        return false;
+    }
+    ggml_tensor* t0 = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_F32, QK_K);
+    if (!t0) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+    t0->data = values.data();
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    const size_t q8_bytes = ggml_row_size(GGML_TYPE_Q8_K, QK_K);
+    const uint8_t* first =
+        ::GetOrFillQuantizedActivationCache(&ctx, t0, t0->data, values.data(), QK_K, GGML_TYPE_Q8_K, q8_bytes, 1, 7,
+                                            q8_traits);
+    const uint64_t misses_after_first = ctx.qwen36_profile.qact_cache_misses.load(std::memory_order_relaxed);
+    const int second_slot = change_token_pos ? 1 : 2;
+    const int64_t second_pos = change_token_pos ? 8 : 7;
+    const uint8_t* second =
+        ::GetOrFillQuantizedActivationCache(&ctx, t0, t0->data, values.data(), QK_K, GGML_TYPE_Q8_K, q8_bytes,
+                                            second_slot, second_pos, q8_traits);
+    const uint64_t misses_after_second = ctx.qwen36_profile.qact_cache_misses.load(std::memory_order_relaxed);
+    ggml_free(ggml_ctx);
+    return first && second && misses_after_first == 1 && misses_after_second == 2;
+}
+bool QActCacheResetAcrossCachedDecodeReuseForTest() {
+    InferenceWorkContext ctx{};
+    ctx.execution_generation = 42;
+    std::array<float, QK_K> values{};
+    ggml_init_params params{16 * 1024, nullptr, false};
+    ggml_context* ggml_ctx = ggml_init(params);
+    if (!ggml_ctx) {
+        return false;
+    }
+    ggml_tensor* t0 = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_F32, QK_K);
+    if (!t0) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+    t0->data = values.data();
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    const size_t q8_bytes = ggml_row_size(GGML_TYPE_Q8_K, QK_K);
+    const uint8_t* first =
+        ::GetOrFillQuantizedActivationCache(&ctx, t0, t0->data, values.data(), QK_K, GGML_TYPE_Q8_K, q8_bytes, 1, 7,
+                                            q8_traits);
+    const bool filled = first && ctx.qact_tensor == t0 && ctx.qact_source == t0->data && !ctx.qact_buffer.empty();
+    ::ResetCachedDecodeGraphWorkContext(&ctx);
+    const bool reset = ctx.qact_tensor == nullptr && ctx.qact_source == nullptr && ctx.qact_buffer.empty() &&
+                       ctx.qact_slot_id == -1;
+    ggml_free(ggml_ctx);
+    return filled && reset;
+}
+bool RunQwen36Q4KBatchedShadowProbeForTest(int nth, int force_fail_ith, bool* output_matches_reference,
+                                           int* admission_state, int* reject_reason) {
+    if (output_matches_reference) *output_matches_reference = false;
+    if (admission_state) *admission_state = 0;
+    if (reject_reason) *reject_reason = 0;
+    constexpr int rows = 8;
+    constexpr int cols = QK_K;
+    constexpr int tokens = 2;
+    const auto* q4_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    if (!q4_traits || !q8_traits || !q4_traits->from_float || !q4_traits->vec_dot || !q8_traits->from_float) {
+        return false;
+    }
+    ggml_init_params params{256 * 1024, nullptr, false};
+    ggml_context* ggml_ctx = ggml_init(params);
+    if (!ggml_ctx) {
+        return false;
+    }
+    ggml_tensor* input = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, cols, tokens);
+    ggml_tensor* weight = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_Q4_K, cols, rows);
+    ggml_tensor* dst = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, rows, tokens);
+    if (!input || !weight || !dst || !input->data || !weight->data || !dst->data) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+    dst->src[0] = input;
+    dst->src[1] = weight;
+    std::snprintf(weight->name, sizeof(weight->name), "blk.0.attn_qkv.weight");
+    auto* input_f32 = reinterpret_cast<float*>(input->data);
+    for (int m = 0; m < tokens; ++m) {
+        for (int c = 0; c < cols; ++c) {
+            input_f32[static_cast<size_t>(m) * cols + c] =
+                std::sin(static_cast<float>(m * 31 + c) * 0.013f) * 0.75f;
+        }
+    }
+    std::vector<float> weight_f32(static_cast<size_t>(rows) * cols);
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            weight_f32[static_cast<size_t>(r) * cols + c] =
+                std::cos(static_cast<float>(r * 17 + c) * 0.021f) * 0.5f;
+        }
+        q4_traits->from_float(weight_f32.data() + static_cast<size_t>(r) * cols,
+                              static_cast<uint8_t*>(weight->data) +
+                                  static_cast<size_t>(r) * ggml_row_size(GGML_TYPE_Q4_K, cols),
+                              cols);
+    }
+    std::fill_n(reinterpret_cast<float*>(dst->data), rows * tokens, 12345.0f);
+    const uint64_t key = 0x9d360000ull + static_cast<uint64_t>(force_fail_ith + 2);
+    {
+        std::lock_guard<std::mutex> lock(::Qwen36Q4KBatchedAdmissionMutex());
+        ::Qwen36Q4KBatchedAdmissionMap().erase(key);
+    }
+    GemvBatchedUserData ud{};
+    ud.weight_tensor = weight;
+    ud.N = cols;
+    ud.K = rows;
+    ud.M = tokens;
+    ud.weight_type = GGML_TYPE_Q4_K;
+    ud.input_quant_type = GGML_TYPE_Q8_K;
+    ud.quant_row_stride = densecore::AlignUp(ggml_row_size(GGML_TYPE_Q8_K, cols), static_cast<size_t>(64));
+    ud.slot_id = -1;
+    ud.qwen36_prefill_q4k_admission_key = key;
+    ud.qwen36_prefill_q4k_probe = true;
+    ud.qwen36_prefill_q4k_admitted = true;
+    InferenceWorkContext work_ctx{};
+    ResetInferenceWorkContext(&work_ctx);
+    ud.work_ctx = &work_ctx;
+    SetCurrentWorkContext(&work_ctx);
+    Qwen36Q4KBatchedProbeForceFailThreadForTest().store(force_fail_ith, std::memory_order_relaxed);
+    for (int ith = 0; ith < std::max(1, nth); ++ith) {
+        cb_gemv_batched_custom(dst, ith, std::max(1, nth), &ud);
+    }
+    Qwen36Q4KBatchedProbeForceFailThreadForTest().store(-1, std::memory_order_relaxed);
+    SetCurrentWorkContext(nullptr);
+    std::vector<uint8_t> q8(static_cast<size_t>(tokens) * ud.quant_row_stride);
+    for (int m = 0; m < tokens; ++m) {
+        q8_traits->from_float(input_f32 + static_cast<size_t>(m) * cols,
+                              q8.data() + static_cast<size_t>(m) * ud.quant_row_stride, cols);
+    }
+    bool matches = true;
+    auto* out = reinterpret_cast<float*>(dst->data);
+    for (int r = 0; r < rows; ++r) {
+        const void* row_ptr = static_cast<const uint8_t*>(weight->data) +
+                              static_cast<size_t>(r) * ggml_row_size(GGML_TYPE_Q4_K, cols);
+        for (int m = 0; m < tokens; ++m) {
+            float ref = 0.0f;
+            q4_traits->vec_dot(cols, &ref, 0, row_ptr, 0, q8.data() + static_cast<size_t>(m) * ud.quant_row_stride, 0,
+                               1);
+            const float got = out[static_cast<size_t>(m) * rows + r];
+            if (std::fabs(got - ref) > 1e-5f) {
+                matches = false;
+            }
+        }
+    }
+    const auto value = ::LookupQwen36Q4KBatchedAdmission(key);
+    if (output_matches_reference) *output_matches_reference = matches;
+    if (admission_state) *admission_state = static_cast<int>(value.state);
+    if (reject_reason) *reject_reason = static_cast<int>(value.reject_reason);
+    ggml_free(ggml_ctx);
+    return true;
 }
 int ResolveQwen36MoECallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int top_k) {
     return ::ResolveQwen36MoECallbackTaskCount(model, batch, top_k);

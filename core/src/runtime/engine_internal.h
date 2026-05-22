@@ -372,6 +372,16 @@ struct Request {
     uint64_t graph_cache_hit_count = 0;
     uint64_t graph_cache_miss_count = 0;
     uint64_t graph_cache_skip_count = 0;
+    uint64_t q4k_repacked_gemv_cache_hits = 0;
+    uint64_t q4k_repacked_gemv_cache_waited_hits = 0;
+    uint64_t q4k_repacked_gemv_cache_misses = 0;
+    uint64_t q4k_copied_gemv_experiment_cache_hits = 0;
+    uint64_t q4k_copied_gemv_experiment_cache_misses = 0;
+    uint64_t qact_cache_hits = 0;
+    uint64_t qact_cache_misses = 0;
+    uint64_t qact_cache_reused_bytes = 0;
+    uint64_t moe_decode_scratch_reused = 0;
+    uint64_t moe_decode_allocations_avoided = 0;
     std::string graph_cache_last_skip_reason;
     int prefill_thread_count = 0;
     int decode_thread_count = 0;
@@ -380,6 +390,32 @@ struct Request {
     std::string prefill_thread_policy;
     std::string decode_thread_policy;
     int q4k_true_batched_used = 0;
+    int qwen36_prefill_q4k_batched_mode = 1;
+    int qwen36_prefill_q4k_batched_used = 0;
+    int qwen36_prefill_q4k_batched_probe_pass = 0;
+    float qwen36_prefill_q4k_batched_max_abs_error = 0.0f;
+    uint64_t qwen36_prefill_q4k_probe_participants = 0;
+    uint64_t qwen36_prefill_q4k_probe_failures = 0;
+    uint64_t qwen36_prefill_q4k_admission_downgraded = 0;
+    std::string qwen36_prefill_q4k_batched_reject_reason;
+    int qwen36_ssm_q8_prefill_amx_mode = 0;
+    int qwen36_ssm_q8_prefill_amx_prepared = 0;
+    int qwen36_ssm_q8_prefill_amx_used = 0;
+    std::string qwen36_ssm_q8_prefill_amx_reject_reason;
+    std::string qwen36_ssm_q8_prefill_amx_prepared_projection_counts;
+    std::string qwen36_ssm_q8_prefill_amx_projection_counts;
+    int qwen36_ssm_q8_decode_used_original_q8_path = 0;
+    std::string qwen36_ssm_projection_actual_types;
+    int qwen36_ssm_projection_quant_preserved = 0;
+    int qwen36_ssm_projection_dequantized_count = 0;
+    int q4k_repacked_gemv_used = 0;
+    int q4k_repacked_gemv_last_reject_reason = 0;
+    std::string q4k_repacked_gemv_reject_reason;
+    int q4k_copied_gemv_experiment_used = 0;
+    int q4k_copied_gemv_experiment_last_reject_reason = 0;
+    std::string q4k_copied_gemv_experiment_reject_reason;
+    std::string callback_mode;
+    int paged_attn_decode_head_tile_effective = 0;
     int arm_batched_quant_used = 0;
     int attention_path_paged = 0;
     int attention_path_standard = 0;
@@ -394,6 +430,7 @@ struct Request {
     int selected_expert_count = 0;
     int ssm_conv1d_calls = 0;
     int ssm_delta_calls = 0;
+    bool token_id_submit_used = false;
     int first_sampled_token_id = -1;
     int first_visible_token_id = -1;
     DecodeFinishCause decode_finish_cause = DecodeFinishCause::Unknown;
@@ -454,6 +491,7 @@ struct Request {
         parity_debug_token_primed = false;
         parity_debug_template_applied = false;
         parity_debug_submit_api.clear();
+        token_id_submit_used = false;
         cancelled = false;
         tier = "standard";
         block_table.clear();
@@ -527,6 +565,16 @@ struct Request {
         graph_cache_hit_count = 0;
         graph_cache_miss_count = 0;
         graph_cache_skip_count = 0;
+        q4k_repacked_gemv_cache_hits = 0;
+        q4k_repacked_gemv_cache_waited_hits = 0;
+        q4k_repacked_gemv_cache_misses = 0;
+        q4k_copied_gemv_experiment_cache_hits = 0;
+        q4k_copied_gemv_experiment_cache_misses = 0;
+        qact_cache_hits = 0;
+        qact_cache_misses = 0;
+        qact_cache_reused_bytes = 0;
+        moe_decode_scratch_reused = 0;
+        moe_decode_allocations_avoided = 0;
         graph_cache_last_skip_reason.clear();
         prefill_thread_count = 0;
         decode_thread_count = 0;
@@ -535,6 +583,32 @@ struct Request {
         prefill_thread_policy.clear();
         decode_thread_policy.clear();
         q4k_true_batched_used = 0;
+        qwen36_prefill_q4k_batched_mode = 1;
+        qwen36_prefill_q4k_batched_used = 0;
+        qwen36_prefill_q4k_batched_probe_pass = 0;
+        qwen36_prefill_q4k_batched_max_abs_error = 0.0f;
+        qwen36_prefill_q4k_probe_participants = 0;
+        qwen36_prefill_q4k_probe_failures = 0;
+        qwen36_prefill_q4k_admission_downgraded = 0;
+        qwen36_prefill_q4k_batched_reject_reason.clear();
+        qwen36_ssm_q8_prefill_amx_mode = 0;
+        qwen36_ssm_q8_prefill_amx_prepared = 0;
+        qwen36_ssm_q8_prefill_amx_used = 0;
+        qwen36_ssm_q8_prefill_amx_reject_reason.clear();
+        qwen36_ssm_q8_prefill_amx_prepared_projection_counts.clear();
+        qwen36_ssm_q8_prefill_amx_projection_counts.clear();
+        qwen36_ssm_q8_decode_used_original_q8_path = 0;
+        qwen36_ssm_projection_actual_types.clear();
+        qwen36_ssm_projection_quant_preserved = 0;
+        qwen36_ssm_projection_dequantized_count = 0;
+        q4k_repacked_gemv_used = 0;
+        q4k_repacked_gemv_last_reject_reason = 0;
+        q4k_repacked_gemv_reject_reason.clear();
+        q4k_copied_gemv_experiment_used = 0;
+        q4k_copied_gemv_experiment_last_reject_reason = 0;
+        q4k_copied_gemv_experiment_reject_reason.clear();
+        callback_mode.clear();
+        paged_attn_decode_head_tile_effective = 0;
         arm_batched_quant_used = 0;
         attention_path_paged = 0;
         attention_path_standard = 0;
@@ -1296,7 +1370,10 @@ struct EngineState {
 
         if (!lru_id.empty()) {
             LOG_INFO("Evicting LRU model: ", lru_id);
-            // Smart pointers automatically cleanup when erased
+            auto it = models.find(lru_id);
+            if (it != models.end() && it->second && it->second->model) {
+                ClearQ4KCopiedGemvExperimentCacheForModel(reinterpret_cast<uintptr_t>(it->second->model.get()));
+            }
             models.erase(lru_id);
         }
     }
@@ -1415,7 +1492,12 @@ struct EngineState {
             request_pool.Release(pending);
         }
 
-        // Join callback thread after draining result queue
+        // The worker can enqueue final events while it exits. Wake the callback
+        // thread again after worker/pending cleanup so it cannot miss the
+        // STOPPED transition while the shutdown path waits in join().
+        result_cv.notify_all();
+
+        // Join callback thread after draining result queue.
         if (callback_thread.joinable()) {
             callback_thread.join();
         }
@@ -1423,6 +1505,7 @@ struct EngineState {
         // Cleanup all models - smart pointers handle automatic cleanup
         {
             std::lock_guard<std::mutex> lock(models_mu);
+            ClearQ4KCopiedGemvExperimentCache();
             models.clear();
         }
 

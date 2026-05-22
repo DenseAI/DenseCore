@@ -81,6 +81,28 @@ TEST(ChatTemplateTest, Qwen35DefaultsToNoThinkingWhenEnvIsUnset) {
               "<think>\n\n</think>\n\n");
 }
 
+TEST(ChatTemplateTest, Qwen35CanonicalRenderKeepsNoThinkingAssistantScaffold) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false", 1);
+    densecore::models::CanonicalChatMessage message;
+    message.role = "user";
+    message.content = "hello";
+    const std::string rendered = densecore::models::RenderModelChatMessages(
+        &model, {message}, densecore::models::CanonicalChatRenderOptions{});
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+
+    EXPECT_EQ(rendered,
+              "<|im_start|>user\n"
+              "hello /no_think<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
+}
+
 TEST(ChatTemplateTest, Qwen3DefaultsToThinkingWhenEnvIsUnset) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN3;
@@ -364,7 +386,8 @@ TEST(CanonicalChatRenderTest, QwenCanonicalRendererMatchesChatMLPrompt) {
     EXPECT_EQ(rendered,
               "<|im_start|>user\n"
               "hello /no_think<|im_end|>\n"
-              "<|im_start|>assistant\n");
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
 }
 
 TEST(CanonicalChatRenderTest, Qwen36DisableInjectsNoThinkDirective) {

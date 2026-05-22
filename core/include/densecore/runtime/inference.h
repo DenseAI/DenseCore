@@ -60,6 +60,12 @@ struct InferenceDependencies;
 
 enum class BatchInputKind { Tokens = 0, Tensors = 1 };
 
+enum class InferenceExecutionPhase : uint8_t {
+    Unknown = 0,
+    Prefill = 1,
+    Decode = 2,
+};
+
 struct GenericInput {
     BatchInputKind kind = BatchInputKind::Tokens;
     std::vector<int> tokens;   // Text tokens
@@ -231,6 +237,16 @@ struct Qwen36ProfileSnapshot {
     uint64_t kleidiai_rejected_ops = 0;
     uint64_t graph_cache_hits = 0;
     uint64_t graph_cache_misses = 0;
+    uint64_t q4k_repacked_gemv_cache_hits = 0;
+    uint64_t q4k_repacked_gemv_cache_waited_hits = 0;
+    uint64_t q4k_repacked_gemv_cache_misses = 0;
+    uint64_t q4k_copied_gemv_experiment_cache_hits = 0;
+    uint64_t q4k_copied_gemv_experiment_cache_misses = 0;
+    uint64_t qact_cache_hits = 0;
+    uint64_t qact_cache_misses = 0;
+    uint64_t qact_cache_reused_bytes = 0;
+    uint64_t moe_decode_scratch_reused = 0;
+    uint64_t moe_decode_allocations_avoided = 0;
     int moe_task_count = 0;
     int moe_rowblock_used = 0;
     int moe_rowblock_tasks = 0;
@@ -238,6 +254,27 @@ struct Qwen36ProfileSnapshot {
     int ssm_conv1d_calls = 0;
     int ssm_delta_calls = 0;
     int q4k_true_batched_used = 0;
+    int qwen36_prefill_q4k_batched_mode = 1;
+    int qwen36_prefill_q4k_batched_used = 0;
+    int qwen36_prefill_q4k_batched_probe_pass = 0;
+    float qwen36_prefill_q4k_batched_max_abs_error = 0.0f;
+    int qwen36_prefill_q4k_batched_last_reject_reason = 0;
+    uint64_t qwen36_prefill_q4k_probe_participants = 0;
+    uint64_t qwen36_prefill_q4k_probe_failures = 0;
+    uint64_t qwen36_prefill_q4k_admission_downgraded = 0;
+    int qwen36_ssm_q8_prefill_amx_mode = 0;
+    int qwen36_ssm_q8_prefill_amx_prepared = 0;
+    int qwen36_ssm_q8_prefill_amx_used = 0;
+    int qwen36_ssm_q8_prefill_amx_last_reject_reason = 0;
+    uint64_t qwen36_ssm_q8_prefill_amx_qkv_count = 0;
+    uint64_t qwen36_ssm_q8_prefill_amx_gate_count = 0;
+    uint64_t qwen36_ssm_q8_prefill_amx_out_count = 0;
+    int qwen36_ssm_q8_decode_used_original_q8_path = 0;
+    int q4k_repacked_gemv_used = 0;
+    int q4k_repacked_gemv_last_reject_reason = 0;
+    int q4k_copied_gemv_experiment_used = 0;
+    int q4k_copied_gemv_experiment_last_reject_reason = 0;
+    int paged_attn_decode_head_tile_effective = 0;
     int arm_batched_quant_used = 0;
     int attention_path_paged = 0;
     int attention_path_standard = 0;
@@ -254,10 +291,23 @@ void ResetInferenceWorkContext(InferenceWorkContext* ctx);
 void ResetCachedDecodeGraphWorkContext(InferenceWorkContext* ctx);
 void SetCurrentWorkContext(InferenceWorkContext* ctx);
 InferenceWorkContext* GetCurrentWorkContext();
+void SetCurrentExecutionPhase(InferenceExecutionPhase phase);
+InferenceExecutionPhase GetCurrentExecutionPhase();
+const BatchSpec* GetCurrentBatch();
+void ClearCurrentBatch();
 bool IsQwen36ProfilingEnabled();
 void ResetQwen36Profile(InferenceWorkContext* ctx);
 Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx);
 void AddQwen36SSMProjectionWallProfile(InferenceWorkContext* ctx, uint64_t qkv_ns, uint64_t gate_ns, uint64_t out_ns);
+void RecordQwen36SSMQ8PrefillAMXPrepared(InferenceWorkContext* ctx, int mode);
+const char* Q4KRepackedGemvRejectReasonName(int reason);
+const char* Q4KCopiedGemvExperimentRejectReasonName(int reason);
+const char* Qwen36PrefillQ4KBatchedRejectReasonName(int reason);
+const char* Qwen36SSMQ8PrefillAMXRejectReasonName(int reason);
+void ClearQ4KCopiedGemvExperimentCacheForModel(uintptr_t model_identity);
+void ClearQ4KCopiedGemvExperimentCache();
+bool PrepareQwen36SSMQ8PrefillAMXAliasesForExecution(TransformerModel* model);
+void ClearQwen36SSMQ8PrefillAMXAliases(TransformerModel* model);
 
 GgmlTensorHandle* BuildTransformerGraph(TransformerModel* model, PagedKVCache* cache, GgmlContextHandle* ctx_c,
                                         const BatchSpec& batch, bool embedding_mode = false,

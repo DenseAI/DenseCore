@@ -291,13 +291,13 @@ TEST(AttentionPolicyTest, PrefillLastLogitsPolicyUsesAttachedDecoderSpecBeforeRa
     EXPECT_TRUE(densecore::testing::ShouldUsePrefillLastLogitsOnlyForTest(&dense, /*num_seqs=*/1, /*n_tokens=*/384));
 }
 
-TEST(AttentionPolicyTest, Qwen35PrefillLastLogitsOnlyIsOptIn) {
+TEST(AttentionPolicyTest, Qwen35PrefillLastLogitsOnlyDefaultsOn) {
     TransformerModel qwen35 = MakeModel(ModelArch::QWEN35);
     qwen35.variant = ModelVariant::QWEN35;
     qwen35.arch_flags.is_hybrid_ssm = true;
 
-    EXPECT_FALSE(densecore::testing::ShouldUsePrefillLastLogitsOnlyForTest(&qwen35, /*num_seqs=*/1,
-                                                                           /*n_tokens=*/384));
+    EXPECT_TRUE(densecore::testing::ShouldUsePrefillLastLogitsOnlyForTest(&qwen35, /*num_seqs=*/1,
+                                                                          /*n_tokens=*/384));
     EXPECT_FALSE(densecore::testing::ShouldUsePrefillLastLogitsOnlyForTest(&qwen35, /*num_seqs=*/1,
                                                                            /*n_tokens=*/1));
     EXPECT_FALSE(densecore::testing::ShouldUsePrefillLastLogitsOnlyForTest(&qwen35, /*num_seqs=*/2,

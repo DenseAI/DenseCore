@@ -100,6 +100,10 @@ struct DecodeWorkerStats {
     std::atomic<uint64_t> graph_cache_skip_uncacheable{0};
     std::atomic<uint64_t> graph_cache_skip_build_failure{0};
     std::atomic<uint64_t> graph_cache_skip_rebind_failure{0};
+    std::atomic<uint64_t> prefill_arena_reuse_hit{0};
+    std::atomic<uint64_t> prefill_arena_reuse_miss{0};
+    std::atomic<uint64_t> prefill_graph_reuse_hit{0};
+    std::atomic<uint64_t> prefill_graph_reuse_skip_model{0};
     std::array<std::atomic<int>, kDecodeGraphCacheTrackedBatches> last_threads_by_batch{};
     std::array<std::array<DecodeGraphCacheBucketStats, kDecodeGraphCacheTrackedBatches>,
                kDecodeGraphCacheTrackedVariants>

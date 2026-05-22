@@ -34,6 +34,16 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> kleidiai_rejected_ops{0};
     std::atomic<uint64_t> graph_cache_hits{0};
     std::atomic<uint64_t> graph_cache_misses{0};
+    std::atomic<uint64_t> q4k_repacked_gemv_cache_hits{0};
+    std::atomic<uint64_t> q4k_repacked_gemv_cache_waited_hits{0};
+    std::atomic<uint64_t> q4k_repacked_gemv_cache_misses{0};
+    std::atomic<uint64_t> q4k_copied_gemv_experiment_cache_hits{0};
+    std::atomic<uint64_t> q4k_copied_gemv_experiment_cache_misses{0};
+    std::atomic<uint64_t> qact_cache_hits{0};
+    std::atomic<uint64_t> qact_cache_misses{0};
+    std::atomic<uint64_t> qact_cache_reused_bytes{0};
+    std::atomic<uint64_t> moe_decode_scratch_reused{0};
+    std::atomic<uint64_t> moe_decode_allocations_avoided{0};
     std::atomic<int> moe_task_count{0};
     std::atomic<int> moe_rowblock_used{0};
     std::atomic<int> moe_rowblock_tasks{0};
@@ -41,6 +51,27 @@ struct Qwen36ProfileCounters {
     std::atomic<int> ssm_conv1d_calls{0};
     std::atomic<int> ssm_delta_calls{0};
     std::atomic<int> q4k_true_batched_used{0};
+    std::atomic<int> qwen36_prefill_q4k_batched_mode{1};
+    std::atomic<int> qwen36_prefill_q4k_batched_used{0};
+    std::atomic<int> qwen36_prefill_q4k_batched_probe_pass{0};
+    std::atomic<uint32_t> qwen36_prefill_q4k_batched_max_abs_error_bits{0};
+    std::atomic<int> qwen36_prefill_q4k_batched_last_reject_reason{0};
+    std::atomic<uint64_t> qwen36_prefill_q4k_probe_participants{0};
+    std::atomic<uint64_t> qwen36_prefill_q4k_probe_failures{0};
+    std::atomic<uint64_t> qwen36_prefill_q4k_admission_downgraded{0};
+    std::atomic<int> qwen36_ssm_q8_prefill_amx_mode{0};
+    std::atomic<int> qwen36_ssm_q8_prefill_amx_prepared{0};
+    std::atomic<int> qwen36_ssm_q8_prefill_amx_used{0};
+    std::atomic<int> qwen36_ssm_q8_prefill_amx_last_reject_reason{0};
+    std::atomic<uint64_t> qwen36_ssm_q8_prefill_amx_qkv_count{0};
+    std::atomic<uint64_t> qwen36_ssm_q8_prefill_amx_gate_count{0};
+    std::atomic<uint64_t> qwen36_ssm_q8_prefill_amx_out_count{0};
+    std::atomic<int> qwen36_ssm_q8_decode_used_original_q8_path{0};
+    std::atomic<int> q4k_repacked_gemv_used{0};
+    std::atomic<int> q4k_repacked_gemv_last_reject_reason{0};
+    std::atomic<int> q4k_copied_gemv_experiment_used{0};
+    std::atomic<int> q4k_copied_gemv_experiment_last_reject_reason{0};
+    std::atomic<int> paged_attn_decode_head_tile_effective{0};
     std::atomic<int> arm_batched_quant_used{0};
     std::atomic<int> attention_path_paged{0};
     std::atomic<int> attention_path_standard{0};
@@ -53,6 +84,7 @@ struct Qwen36ProfileCounters {
 
 struct InferenceWorkContext {
     const BatchSpec* batch = nullptr;
+    InferenceExecutionPhase phase = InferenceExecutionPhase::Unknown;
     Qwen36ProfileCounters qwen36_profile;
     KVCacheUserData kv_pool[256];
     std::vector<Gemma4SharedKVState> gemma4_shared_kv_states;
@@ -63,6 +95,16 @@ struct InferenceWorkContext {
     int add_rmsnorm_index = 0;
     alignas(64) std::array<uint8_t, kMaxQuantInputBufferSize> gemv_quant_input_shared{};
     std::atomic<uint64_t> gemv_quantized_stamp{0};
+    uint64_t execution_generation = 0;
+    uint64_t qact_generation = 0;
+    const ggml_tensor* qact_tensor = nullptr;
+    const void* qact_source = nullptr;
+    int64_t qact_len = 0;
+    ggml_type qact_type = GGML_TYPE_COUNT;
+    size_t qact_bytes = 0;
+    int qact_slot_id = -1;
+    int64_t qact_token_pos = std::numeric_limits<int64_t>::min();
+    std::vector<uint8_t> qact_buffer;
     alignas(
         64) std::array<uint8_t, kMaxQuantInputBufferSize * kMaxSmallBatchColsHard> gemv_batched_quant_input_shared{};
     std::atomic<uint64_t> gemv_batched_quantized_stamp{0};
@@ -136,6 +178,16 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.kleidiai_rejected_ops.store(0, std::memory_order_relaxed);
     p.graph_cache_hits.store(0, std::memory_order_relaxed);
     p.graph_cache_misses.store(0, std::memory_order_relaxed);
+    p.q4k_repacked_gemv_cache_hits.store(0, std::memory_order_relaxed);
+    p.q4k_repacked_gemv_cache_waited_hits.store(0, std::memory_order_relaxed);
+    p.q4k_repacked_gemv_cache_misses.store(0, std::memory_order_relaxed);
+    p.q4k_copied_gemv_experiment_cache_hits.store(0, std::memory_order_relaxed);
+    p.q4k_copied_gemv_experiment_cache_misses.store(0, std::memory_order_relaxed);
+    p.qact_cache_hits.store(0, std::memory_order_relaxed);
+    p.qact_cache_misses.store(0, std::memory_order_relaxed);
+    p.qact_cache_reused_bytes.store(0, std::memory_order_relaxed);
+    p.moe_decode_scratch_reused.store(0, std::memory_order_relaxed);
+    p.moe_decode_allocations_avoided.store(0, std::memory_order_relaxed);
     p.moe_task_count.store(0, std::memory_order_relaxed);
     p.moe_rowblock_used.store(0, std::memory_order_relaxed);
     p.moe_rowblock_tasks.store(0, std::memory_order_relaxed);
@@ -143,6 +195,27 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.ssm_conv1d_calls.store(0, std::memory_order_relaxed);
     p.ssm_delta_calls.store(0, std::memory_order_relaxed);
     p.q4k_true_batched_used.store(0, std::memory_order_relaxed);
+    p.qwen36_prefill_q4k_batched_mode.store(1, std::memory_order_relaxed);
+    p.qwen36_prefill_q4k_batched_used.store(0, std::memory_order_relaxed);
+    p.qwen36_prefill_q4k_batched_probe_pass.store(0, std::memory_order_relaxed);
+    p.qwen36_prefill_q4k_batched_max_abs_error_bits.store(0, std::memory_order_relaxed);
+    p.qwen36_prefill_q4k_batched_last_reject_reason.store(0, std::memory_order_relaxed);
+    p.qwen36_prefill_q4k_probe_participants.store(0, std::memory_order_relaxed);
+    p.qwen36_prefill_q4k_probe_failures.store(0, std::memory_order_relaxed);
+    p.qwen36_prefill_q4k_admission_downgraded.store(0, std::memory_order_relaxed);
+    p.qwen36_ssm_q8_prefill_amx_mode.store(0, std::memory_order_relaxed);
+    p.qwen36_ssm_q8_prefill_amx_prepared.store(0, std::memory_order_relaxed);
+    p.qwen36_ssm_q8_prefill_amx_used.store(0, std::memory_order_relaxed);
+    p.qwen36_ssm_q8_prefill_amx_last_reject_reason.store(0, std::memory_order_relaxed);
+    p.qwen36_ssm_q8_prefill_amx_qkv_count.store(0, std::memory_order_relaxed);
+    p.qwen36_ssm_q8_prefill_amx_gate_count.store(0, std::memory_order_relaxed);
+    p.qwen36_ssm_q8_prefill_amx_out_count.store(0, std::memory_order_relaxed);
+    p.qwen36_ssm_q8_decode_used_original_q8_path.store(0, std::memory_order_relaxed);
+    p.q4k_repacked_gemv_used.store(0, std::memory_order_relaxed);
+    p.q4k_repacked_gemv_last_reject_reason.store(0, std::memory_order_relaxed);
+    p.q4k_copied_gemv_experiment_used.store(0, std::memory_order_relaxed);
+    p.q4k_copied_gemv_experiment_last_reject_reason.store(0, std::memory_order_relaxed);
+    p.paged_attn_decode_head_tile_effective.store(0, std::memory_order_relaxed);
     p.arm_batched_quant_used.store(0, std::memory_order_relaxed);
     p.attention_path_paged.store(0, std::memory_order_relaxed);
     p.attention_path_standard.store(0, std::memory_order_relaxed);
@@ -193,6 +266,19 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.kleidiai_rejected_ops = p.kleidiai_rejected_ops.load(std::memory_order_relaxed);
     snapshot.graph_cache_hits = p.graph_cache_hits.load(std::memory_order_relaxed);
     snapshot.graph_cache_misses = p.graph_cache_misses.load(std::memory_order_relaxed);
+    snapshot.q4k_repacked_gemv_cache_hits = p.q4k_repacked_gemv_cache_hits.load(std::memory_order_relaxed);
+    snapshot.q4k_repacked_gemv_cache_waited_hits =
+        p.q4k_repacked_gemv_cache_waited_hits.load(std::memory_order_relaxed);
+    snapshot.q4k_repacked_gemv_cache_misses = p.q4k_repacked_gemv_cache_misses.load(std::memory_order_relaxed);
+    snapshot.q4k_copied_gemv_experiment_cache_hits =
+        p.q4k_copied_gemv_experiment_cache_hits.load(std::memory_order_relaxed);
+    snapshot.q4k_copied_gemv_experiment_cache_misses =
+        p.q4k_copied_gemv_experiment_cache_misses.load(std::memory_order_relaxed);
+    snapshot.qact_cache_hits = p.qact_cache_hits.load(std::memory_order_relaxed);
+    snapshot.qact_cache_misses = p.qact_cache_misses.load(std::memory_order_relaxed);
+    snapshot.qact_cache_reused_bytes = p.qact_cache_reused_bytes.load(std::memory_order_relaxed);
+    snapshot.moe_decode_scratch_reused = p.moe_decode_scratch_reused.load(std::memory_order_relaxed);
+    snapshot.moe_decode_allocations_avoided = p.moe_decode_allocations_avoided.load(std::memory_order_relaxed);
     snapshot.moe_task_count = p.moe_task_count.load(std::memory_order_relaxed);
     snapshot.moe_rowblock_used = p.moe_rowblock_used.load(std::memory_order_relaxed);
     snapshot.moe_rowblock_tasks = p.moe_rowblock_tasks.load(std::memory_order_relaxed);
@@ -200,6 +286,43 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.ssm_conv1d_calls = p.ssm_conv1d_calls.load(std::memory_order_relaxed);
     snapshot.ssm_delta_calls = p.ssm_delta_calls.load(std::memory_order_relaxed);
     snapshot.q4k_true_batched_used = p.q4k_true_batched_used.load(std::memory_order_relaxed);
+    snapshot.qwen36_prefill_q4k_batched_mode = p.qwen36_prefill_q4k_batched_mode.load(std::memory_order_relaxed);
+    snapshot.qwen36_prefill_q4k_batched_used = p.qwen36_prefill_q4k_batched_used.load(std::memory_order_relaxed);
+    snapshot.qwen36_prefill_q4k_batched_probe_pass =
+        p.qwen36_prefill_q4k_batched_probe_pass.load(std::memory_order_relaxed);
+    const uint32_t max_abs_bits = p.qwen36_prefill_q4k_batched_max_abs_error_bits.load(std::memory_order_relaxed);
+    std::memcpy(&snapshot.qwen36_prefill_q4k_batched_max_abs_error, &max_abs_bits, sizeof(float));
+    snapshot.qwen36_prefill_q4k_batched_last_reject_reason =
+        p.qwen36_prefill_q4k_batched_last_reject_reason.load(std::memory_order_relaxed);
+    snapshot.qwen36_prefill_q4k_probe_participants =
+        p.qwen36_prefill_q4k_probe_participants.load(std::memory_order_relaxed);
+    snapshot.qwen36_prefill_q4k_probe_failures =
+        p.qwen36_prefill_q4k_probe_failures.load(std::memory_order_relaxed);
+    snapshot.qwen36_prefill_q4k_admission_downgraded =
+        p.qwen36_prefill_q4k_admission_downgraded.load(std::memory_order_relaxed);
+    snapshot.qwen36_ssm_q8_prefill_amx_mode = p.qwen36_ssm_q8_prefill_amx_mode.load(std::memory_order_relaxed);
+    snapshot.qwen36_ssm_q8_prefill_amx_prepared =
+        p.qwen36_ssm_q8_prefill_amx_prepared.load(std::memory_order_relaxed);
+    snapshot.qwen36_ssm_q8_prefill_amx_used = p.qwen36_ssm_q8_prefill_amx_used.load(std::memory_order_relaxed);
+    snapshot.qwen36_ssm_q8_prefill_amx_last_reject_reason =
+        p.qwen36_ssm_q8_prefill_amx_last_reject_reason.load(std::memory_order_relaxed);
+    snapshot.qwen36_ssm_q8_prefill_amx_qkv_count =
+        p.qwen36_ssm_q8_prefill_amx_qkv_count.load(std::memory_order_relaxed);
+    snapshot.qwen36_ssm_q8_prefill_amx_gate_count =
+        p.qwen36_ssm_q8_prefill_amx_gate_count.load(std::memory_order_relaxed);
+    snapshot.qwen36_ssm_q8_prefill_amx_out_count =
+        p.qwen36_ssm_q8_prefill_amx_out_count.load(std::memory_order_relaxed);
+    snapshot.qwen36_ssm_q8_decode_used_original_q8_path =
+        p.qwen36_ssm_q8_decode_used_original_q8_path.load(std::memory_order_relaxed);
+    snapshot.q4k_repacked_gemv_used = p.q4k_repacked_gemv_used.load(std::memory_order_relaxed);
+    snapshot.q4k_repacked_gemv_last_reject_reason =
+        p.q4k_repacked_gemv_last_reject_reason.load(std::memory_order_relaxed);
+    snapshot.q4k_copied_gemv_experiment_used =
+        p.q4k_copied_gemv_experiment_used.load(std::memory_order_relaxed);
+    snapshot.q4k_copied_gemv_experiment_last_reject_reason =
+        p.q4k_copied_gemv_experiment_last_reject_reason.load(std::memory_order_relaxed);
+    snapshot.paged_attn_decode_head_tile_effective =
+        p.paged_attn_decode_head_tile_effective.load(std::memory_order_relaxed);
     snapshot.arm_batched_quant_used = p.arm_batched_quant_used.load(std::memory_order_relaxed);
     snapshot.attention_path_paged = p.attention_path_paged.load(std::memory_order_relaxed);
     snapshot.attention_path_standard = p.attention_path_standard.load(std::memory_order_relaxed);
@@ -242,6 +365,14 @@ void AddQwen36SSMProjectionWallProfile(InferenceWorkContext* ctx, uint64_t qkv_n
     p.ssm_out_wall_ns.fetch_add(out_ns, std::memory_order_relaxed);
 }
 
+void RecordQwen36SSMQ8PrefillAMXPrepared(InferenceWorkContext* ctx, int mode) {
+    if (!ctx) {
+        return;
+    }
+    ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_prepared.store(1, std::memory_order_relaxed);
+    ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_mode.store(mode, std::memory_order_relaxed);
+}
+
 static inline void AddQwen36ProfileNs(std::atomic<uint64_t>& counter, uint64_t value) {
     if (!IsQwen36ProfilingEnabled() || value == 0) {
         return;
@@ -276,12 +407,24 @@ void DestroyInferenceWorkContext(InferenceWorkContext* ctx) {
 
 void ResetInferenceWorkContext(InferenceWorkContext* ctx) {
     if (!ctx) return;
+    static std::atomic<uint64_t> generation_counter{1};
     ctx->batch = nullptr;
+    ctx->phase = InferenceExecutionPhase::Unknown;
+    ctx->execution_generation = generation_counter.fetch_add(1, std::memory_order_relaxed);
     ResetQwen36Profile(ctx);
     ctx->gemma4_shared_kv_states.clear();
     ctx->qkv_index = 0;
     ctx->add_rmsnorm_index = 0;
     ctx->gemv_quantized_stamp.store(0, std::memory_order_relaxed);
+    ctx->qact_generation = 0;
+    ctx->qact_tensor = nullptr;
+    ctx->qact_source = nullptr;
+    ctx->qact_len = 0;
+    ctx->qact_type = GGML_TYPE_COUNT;
+    ctx->qact_bytes = 0;
+    ctx->qact_slot_id = -1;
+    ctx->qact_token_pos = std::numeric_limits<int64_t>::min();
+    ctx->qact_buffer.clear();
     ctx->gemv_batched_quantized_stamp.store(0, std::memory_order_relaxed);
     ctx->gemv_userdata_index = 0;
     ctx->gemv_batched_userdata_index = 0;
@@ -298,10 +441,22 @@ void ResetInferenceWorkContext(InferenceWorkContext* ctx) {
 
 void ResetCachedDecodeGraphWorkContext(InferenceWorkContext* ctx) {
     if (!ctx) return;
+    static std::atomic<uint64_t> generation_counter{1000000000ull};
+    ctx->phase = InferenceExecutionPhase::Decode;
+    ctx->execution_generation = generation_counter.fetch_add(1, std::memory_order_relaxed);
     ResetQwen36Profile(ctx);
     ctx->paged_attention_shared_k_block_ptrs.clear();
     ctx->paged_attention_shared_v_block_ptrs.clear();
     ctx->gemv_quantized_stamp.store(0, std::memory_order_relaxed);
+    ctx->qact_generation = 0;
+    ctx->qact_tensor = nullptr;
+    ctx->qact_source = nullptr;
+    ctx->qact_len = 0;
+    ctx->qact_type = GGML_TYPE_COUNT;
+    ctx->qact_bytes = 0;
+    ctx->qact_slot_id = -1;
+    ctx->qact_token_pos = std::numeric_limits<int64_t>::min();
+    ctx->qact_buffer.clear();
     ctx->gemv_batched_quantized_stamp.store(0, std::memory_order_relaxed);
 }
 
@@ -311,6 +466,19 @@ void SetCurrentWorkContext(InferenceWorkContext* ctx) {
 
 InferenceWorkContext* GetCurrentWorkContext() {
     return tls_work_ctx;
+}
+
+void SetCurrentExecutionPhase(InferenceExecutionPhase phase) {
+    InferenceWorkContext* ctx = GetCurrentWorkContext();
+    if (!ctx) {
+        return;
+    }
+    ctx->phase = phase;
+}
+
+InferenceExecutionPhase GetCurrentExecutionPhase() {
+    InferenceWorkContext* ctx = GetCurrentWorkContext();
+    return ctx ? ctx->phase : InferenceExecutionPhase::Unknown;
 }
 
 void SetCurrentBatch(const BatchSpec* batch) {
@@ -325,12 +493,20 @@ void SetCurrentBatch(const BatchSpec* batch) {
     g_shared_batch.store(batch, std::memory_order_release);
 }
 
-static const BatchSpec* GetCurrentBatch() {
+const BatchSpec* GetCurrentBatch() {
     InferenceWorkContext* ctx = GetCurrentWorkContext();
     if (ctx && ctx->batch) {
         return ctx->batch;
     }
     return g_shared_batch.load(std::memory_order_acquire);
+}
+
+void ClearCurrentBatch() {
+    InferenceWorkContext* ctx = GetCurrentWorkContext();
+    if (ctx) {
+        ctx->batch = nullptr;
+    }
+    g_shared_batch.store(nullptr, std::memory_order_release);
 }
 
 static Gemma4SharedKVState* GetGemma4SharedKVStateSlot(int layer) {
@@ -1692,5 +1868,13 @@ inline GemvBatchedUserData* GetGemvBatchedUserData() {
     ud->input_quant_type = GGML_TYPE_F32;
     ud->quant_input_shared = ctx->gemv_batched_quant_input_shared.data();
     ud->quantized_stamp = &ctx->gemv_batched_quantized_stamp;
+    ud->work_ctx = ctx;
+    ud->qwen36_prefill_q4k_admission_key = 0;
+    ud->qwen36_prefill_q4k_probe = false;
+    ud->qwen36_prefill_q4k_admitted = false;
+    ud->qwen36_prefill_q4k_probe_done.store(0, std::memory_order_relaxed);
+    ud->qwen36_prefill_q4k_probe_failures.store(0, std::memory_order_relaxed);
+    ud->qwen36_prefill_q4k_probe_internal_errors.store(0, std::memory_order_relaxed);
+    ud->qwen36_prefill_q4k_probe_max_abs_error_bits.store(0, std::memory_order_relaxed);
     return ud;
 }

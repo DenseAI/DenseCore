@@ -24,6 +24,57 @@ bool ParseLegacyEnabledBool(const char* name, bool default_value) {
     return std::strcmp(env_value, "0") != 0;
 }
 
+Qwen36PrefillQ4KBatchedMode ParseQwen36PrefillQ4KBatchedMode(const char* value) {
+    const std::string mode = env::AsciiLowerCopy(value);
+    if (mode.empty() || mode == "probe" || mode == "auto") {
+        return Qwen36PrefillQ4KBatchedMode::Probe;
+    }
+    if (mode == "off" || mode == "0" || mode == "false" || mode == "no") {
+        return Qwen36PrefillQ4KBatchedMode::Off;
+    }
+    if (mode == "on" || mode == "1" || mode == "true" || mode == "yes" || mode == "force") {
+        return Qwen36PrefillQ4KBatchedMode::On;
+    }
+    return Qwen36PrefillQ4KBatchedMode::Off;
+}
+
+Qwen36SSMQ8PrefillAMXMode ParseQwen36SSMQ8PrefillAMXMode(const char* value) {
+    const std::string mode = env::AsciiLowerCopy(value);
+    if (mode.empty()) {
+        return Qwen36SSMQ8PrefillAMXMode::Probe;
+    }
+    if (mode == "probe" || mode == "auto") {
+        return Qwen36SSMQ8PrefillAMXMode::Probe;
+    }
+    if (mode == "off" || mode == "0" || mode == "false" || mode == "no") {
+        return Qwen36SSMQ8PrefillAMXMode::Off;
+    }
+    if (mode == "on" || mode == "1" || mode == "true" || mode == "yes" || mode == "force") {
+        return Qwen36SSMQ8PrefillAMXMode::On;
+    }
+    return Qwen36SSMQ8PrefillAMXMode::Off;
+}
+
+densecore::env::RuntimeToggleMode ParseRuntimeToggleEnvFailClosed(const char* name,
+                                                                  densecore::env::RuntimeToggleMode default_mode) {
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return default_mode;
+    }
+    return densecore::env::ParseRuntimeToggleModeValue(value, densecore::env::RuntimeToggleMode::Off);
+}
+
+WorkerRuntimeConfig::CallbackMode ParseCallbackMode() {
+    if (env::ParseTruthyEnv("DENSECORE_DIRECT_CALLBACK", false)) {
+        return WorkerRuntimeConfig::CallbackMode::Direct;
+    }
+    const std::string mode = env::AsciiLowerCopy(std::getenv("DENSECORE_CALLBACK_MODE"));
+    if (mode == "direct" || mode == "1" || mode == "true" || mode == "yes" || mode == "on") {
+        return WorkerRuntimeConfig::CallbackMode::Direct;
+    }
+    return WorkerRuntimeConfig::CallbackMode::Async;
+}
+
 std::size_t ReadAvailableMemoryMbForAutoRuntimeCache() {
 #if defined(__linux__)
     std::FILE* file = std::fopen("/proc/meminfo", "r");
@@ -57,9 +108,11 @@ WorkerRuntimeConfig LoadWorkerRuntimeConfig() {
     config.hybrid_ssm_snapshot_restore_disabled =
         env::ParseNonZeroEnv("DENSECORE_DEBUG_DISABLE_HYBRID_SSM_RESTORE", false);
     config.qwen36_prefix_cache_reuse_enabled =
-        env::ParseNonZeroEnv("DENSECORE_QWEN36_ENABLE_PREFIX_CACHE_REUSE", false);
+        !config.prefix_cache_reuse_disabled &&
+        ParseLegacyEnabledBool("DENSECORE_QWEN36_ENABLE_PREFIX_CACHE_REUSE", true);
     config.qwen36_hybrid_ssm_snapshot_restore_enabled =
-        env::ParseNonZeroEnv("DENSECORE_QWEN36_ENABLE_HYBRID_SSM_SNAPSHOT_RESTORE", false);
+        !config.hybrid_ssm_snapshot_restore_disabled &&
+        ParseLegacyEnabledBool("DENSECORE_QWEN36_ENABLE_HYBRID_SSM_SNAPSHOT_RESTORE", true);
     config.graph_cache_reuse_disabled = env::ParseNonZeroEnv("DENSECORE_DEBUG_DISABLE_GRAPH_CACHE_REUSE", false);
     config.moe_trace_plumbing_disabled = env::ParseNonZeroEnv("DENSECORE_DEBUG_DISABLE_MOE_TRACE_PLUMBING", false);
     config.moe_graph_summary = env::ParseNonZeroEnv("DENSECORE_DEBUG_MOE_GRAPH_SUMMARY", false);
@@ -69,6 +122,7 @@ WorkerRuntimeConfig LoadWorkerRuntimeConfig() {
         env::ParseNonZeroEnv("DENSECORE_DEBUG_ZERO_FILL_PREFILL_GRAPH_BUFFER", false);
     config.zero_fill_prefill_kv_blocks = env::ParseNonZeroEnv("DENSECORE_DEBUG_ZERO_FILL_PREFILL_KV_BLOCKS", false);
     config.prefill_thread_override = env::ParsePositiveEnvInt("DENSECORE_DEBUG_PREFILL_THREADS", 0);
+    config.callback_mode = ParseCallbackMode();
     return config;
 }
 
@@ -236,6 +290,37 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
     const int prefill_graph_cache_mb =
         std::max(128, ReadPositiveIntEnv("DENSECORE_PREFILL_GRAPH_CACHE_MAX_MB", auto_prefill_graph_cache_mb));
     config.prefill_graph_cache.max_bytes = static_cast<std::size_t>(prefill_graph_cache_mb) * 1024ULL * 1024ULL;
+    config.qwen36_prefill_q4k_batched =
+        ParseQwen36PrefillQ4KBatchedMode(std::getenv("DENSECORE_QWEN36_PREFILL_Q4K_BATCHED"));
+    config.qwen36_ssm_q8_amx_alias = ParseRuntimeToggleEnvFailClosed(
+        "DENSECORE_QWEN36_SSM_Q8_AMX_ALIAS", env::RuntimeToggleMode::Off);
+    config.qwen36_ssm_q8_prefill_amx =
+        ParseQwen36SSMQ8PrefillAMXMode(std::getenv("DENSECORE_QWEN36_SSM_Q8_PREFILL_AMX"));
+    config.qwen36_ssm_q8_prefill_amx_min_tokens =
+        env::ParsePositiveEnvInt("DENSECORE_QWEN36_SSM_Q8_PREFILL_AMX_MIN_TOKENS", 256);
+    config.qwen36_expert_cpu_repack = ParseRuntimeToggleEnvFailClosed(
+        "DENSECORE_QWEN36_EXPERT_CPU_REPACK", env::RuntimeToggleMode::Auto);
+    const char* q4k_gemv_env = std::getenv("DENSECORE_Q4K_REPACKED_GEMV");
+    if (!q4k_gemv_env || q4k_gemv_env[0] == '\0') {
+        q4k_gemv_env = std::getenv("DENSECORE_ENABLE_Q4K_REPACKED_GEMV");
+    }
+    config.q4k_repacked_gemv =
+        (!q4k_gemv_env || q4k_gemv_env[0] == '\0')
+            ? env::RuntimeToggleMode::Auto
+            : env::ParseRuntimeToggleModeValue(q4k_gemv_env, env::RuntimeToggleMode::Off);
+    config.q4k_repacked_gemv_allow_prefill =
+        env::ParseTruthyEnv("DENSECORE_Q4K_REPACKED_GEMV_ALLOW_PREFILL", false);
+    config.q4k_repacked_gemv_probe =
+        env::ParseTruthyEnv("DENSECORE_Q4K_REPACKED_GEMV_PROBE",
+                            config.q4k_repacked_gemv != env::RuntimeToggleMode::On);
+    const char* q4k_copied_experiment_env = std::getenv("DENSECORE_ENABLE_Q4K_COPIED_GEMV_EXPERIMENT");
+    config.q4k_copied_gemv_experiment =
+        q4k_copied_experiment_env && std::strcmp(q4k_copied_experiment_env, "1") == 0;
+    const char* qact_cache_env = std::getenv("DENSECORE_ENABLE_QACT_CACHE");
+    config.qact_cache =
+        (!qact_cache_env || qact_cache_env[0] == '\0')
+            ? env::RuntimeToggleMode::Off
+            : env::ParseRuntimeToggleModeValue(qact_cache_env, env::RuntimeToggleMode::Off);
     return config;
 }
 

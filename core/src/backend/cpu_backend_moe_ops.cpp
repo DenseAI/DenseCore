@@ -1,6 +1,7 @@
 #include "backend/cpu_backend_internal.h"
 #include "ggml-cpu.h"  // For ggml_get_type_traits_cpu (vec_dot)
 #include "kernels/hwy/hwy_kernels.h"
+#include "kernels/q4k_repacked_gemv.h"
 #include "runtime/runtime_env.h"
 
 #include <algorithm>
@@ -48,6 +49,8 @@ struct AlignedScratch {
             capacity = required;
         }
     }
+
+    bool HasCapacity(size_t required) const { return ptr != nullptr && required <= capacity; }
 };
 
 // Qwen3.5-35B-A3B: 256 experts x top-8 -> batch=4 yields 32 assignments
@@ -502,14 +505,7 @@ bool CanUseSmallDecodeQuantizedTileParallel() {
     return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
-struct MoEQ4Kx8Block {
-    uint16_t d[8];
-    uint16_t dmin[8];
-    uint8_t scales[96];
-    uint8_t qs[1024];
-};
-static_assert(sizeof(MoEQ4Kx8Block) == 16 * sizeof(uint16_t) + 8 * K_SCALE_SIZE + QK_K * 4,
-              "MoE Q4_Kx8 block layout must match ggml block_q4_Kx8");
+using MoEQ4Kx8Block = densecore::kernels::Q4KRepackedGemvBlock;
 
 struct MoEQ5Kx8Block {
     uint16_t d[8];
@@ -530,7 +526,10 @@ struct MoEQ6Kx8Block {
 static_assert(sizeof(MoEQ6Kx8Block) == 8 * sizeof(uint16_t) + (QK_K / 16) * 8 + (3 * QK_K / 4) * 8,
               "MoE Q6_Kx8 block layout must match ggml block_q6_Kx8");
 
-size_t GetQ4KRepackedMoECacheLimitBytes() {
+size_t GetRepackedMoECacheLimitBytes() {
+    // Backward-compatible name: this cache limit now applies to the remaining
+    // MoE-local Q5_K/Q6_K repack caches. Q4_K uses the shared single-flight
+    // densecore::kernels::Q4KRepackedGemvWeight cache below.
     const char* env = std::getenv("DENSECORE_MOE_Q4K_REPACK_CACHE_MB");
     if (!env || env[0] == '\0') {
         constexpr size_t kMinBytes = 1024ull * 1024ull * 1024ull;
@@ -555,20 +554,20 @@ size_t GetQ4KRepackedMoECacheLimitBytes() {
     return static_cast<size_t>(mb) * 1024ull * 1024ull;
 }
 
-struct Q4KRepackedMoEKey {
+struct RepackedMoEKey {
     const void* weight_ptr = nullptr;
     int64_t rows = 0;
     int64_t cols = 0;
     uint64_t fingerprint = 0;
 
-    bool operator==(const Q4KRepackedMoEKey& other) const {
+    bool operator==(const RepackedMoEKey& other) const {
         return weight_ptr == other.weight_ptr && rows == other.rows && cols == other.cols &&
                fingerprint == other.fingerprint;
     }
 };
 
-struct Q4KRepackedMoEKeyHash {
-    size_t operator()(const Q4KRepackedMoEKey& key) const {
+struct RepackedMoEKeyHash {
+    size_t operator()(const RepackedMoEKey& key) const {
         size_t h = std::hash<const void*>{}(key.weight_ptr);
         h ^= std::hash<int64_t>{}(key.rows) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
         h ^= std::hash<int64_t>{}(key.cols) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
@@ -600,14 +599,7 @@ uint64_t FingerprintRepackedMoEWeight(const void* weight_ptr, size_t bytes) {
     return h;
 }
 
-struct Q4KRepackedMoEWeight {
-    int64_t rows = 0;
-    int64_t cols = 0;
-    int64_t blocks_per_row = 0;
-    size_t bytes = 0;
-    uint64_t last_use = 0;
-    std::vector<MoEQ4Kx8Block> blocks;
-};
+using Q4KRepackedMoEWeight = densecore::kernels::Q4KRepackedGemvWeight;
 
 std::shared_ptr<Q4KRepackedMoEWeight> GetOrCreateQ4KRepackedMoEWeight(const void* weight_ptr, int64_t rows,
                                                                       int64_t cols) {
@@ -616,71 +608,7 @@ std::shared_ptr<Q4KRepackedMoEWeight> GetOrCreateQ4KRepackedMoEWeight(const void
           CanUseQ4KRepackedMoEGEGLUFastPath())) {
         return nullptr;
     }
-    const size_t cache_limit = GetQ4KRepackedMoECacheLimitBytes();
-    if (cache_limit == 0) {
-        return nullptr;
-    }
-
-    static std::mutex mutex;
-    static std::unordered_map<Q4KRepackedMoEKey, std::shared_ptr<Q4KRepackedMoEWeight>, Q4KRepackedMoEKeyHash> cache;
-    static size_t cache_bytes = 0;
-    static std::atomic<uint64_t> use_clock{0};
-
-    const size_t raw_bytes = static_cast<size_t>(rows) * ggml_row_size(GGML_TYPE_Q4_K, cols);
-    const Q4KRepackedMoEKey key{weight_ptr, rows, cols, FingerprintRepackedMoEWeight(weight_ptr, raw_bytes)};
-    const uint64_t now = use_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-
-    const int64_t blocks_per_row = cols / QK_K;
-    const size_t packed_blocks = static_cast<size_t>(rows / 8) * static_cast<size_t>(blocks_per_row);
-
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto found = cache.find(key);
-        if (found != cache.end()) {
-            found->second->last_use = now;
-            return found->second;
-        }
-    }
-
-    auto candidate = std::make_shared<Q4KRepackedMoEWeight>();
-    candidate->rows = rows;
-    candidate->cols = cols;
-    candidate->blocks_per_row = blocks_per_row;
-    candidate->blocks.resize(packed_blocks);
-    candidate->bytes = candidate->blocks.size() * sizeof(MoEQ4Kx8Block);
-    candidate->last_use = now;
-
-    if (ggml_repack_q4_K_8x8(weight_ptr, raw_bytes, rows, cols, candidate->blocks.data(), candidate->bytes) != 0) {
-        return nullptr;
-    }
-
-    std::lock_guard<std::mutex> lock(mutex);
-    auto found = cache.find(key);
-    if (found != cache.end()) {
-        found->second->last_use = now;
-        return found->second;
-    }
-
-    cache.emplace(key, candidate);
-    cache_bytes += candidate->bytes;
-    while (cache_bytes > cache_limit && cache.size() > 1) {
-        auto oldest = cache.end();
-        for (auto it = cache.begin(); it != cache.end(); ++it) {
-            if (it->first == key) {
-                continue;
-            }
-            if (oldest == cache.end() || it->second->last_use < oldest->second->last_use) {
-                oldest = it;
-            }
-        }
-        if (oldest == cache.end()) {
-            break;
-        }
-        cache_bytes -= oldest->second->bytes;
-        cache.erase(oldest);
-    }
-
-    return candidate;
+    return densecore::kernels::GetOrCreateQ4KRepackedGemvWeight(weight_ptr, rows, cols);
 }
 
 struct Q5KRepackedMoEWeight {
@@ -698,18 +626,18 @@ std::shared_ptr<Q5KRepackedMoEWeight> GetOrCreateQ5KRepackedMoEWeight(const void
         !CanUseQ5KRepackedMoEGemvFastPath()) {
         return nullptr;
     }
-    const size_t cache_limit = GetQ4KRepackedMoECacheLimitBytes();
+    const size_t cache_limit = GetRepackedMoECacheLimitBytes();
     if (cache_limit == 0) {
         return nullptr;
     }
 
     static std::mutex mutex;
-    static std::unordered_map<Q4KRepackedMoEKey, std::shared_ptr<Q5KRepackedMoEWeight>, Q4KRepackedMoEKeyHash> cache;
+    static std::unordered_map<RepackedMoEKey, std::shared_ptr<Q5KRepackedMoEWeight>, RepackedMoEKeyHash> cache;
     static size_t cache_bytes = 0;
     static std::atomic<uint64_t> use_clock{0};
 
     const size_t raw_bytes = static_cast<size_t>(rows) * ggml_row_size(GGML_TYPE_Q5_K, cols);
-    const Q4KRepackedMoEKey key{weight_ptr, rows, cols, FingerprintRepackedMoEWeight(weight_ptr, raw_bytes)};
+    const RepackedMoEKey key{weight_ptr, rows, cols, FingerprintRepackedMoEWeight(weight_ptr, raw_bytes)};
     const uint64_t now = use_clock.fetch_add(1, std::memory_order_relaxed) + 1;
 
     std::lock_guard<std::mutex> lock(mutex);
@@ -770,18 +698,18 @@ std::shared_ptr<Q6KRepackedMoEWeight> GetOrCreateQ6KRepackedMoEWeight(const void
         !CanUseQ6KRepackedMoEGemvFastPath()) {
         return nullptr;
     }
-    const size_t cache_limit = GetQ4KRepackedMoECacheLimitBytes();
+    const size_t cache_limit = GetRepackedMoECacheLimitBytes();
     if (cache_limit == 0) {
         return nullptr;
     }
 
     static std::mutex mutex;
-    static std::unordered_map<Q4KRepackedMoEKey, std::shared_ptr<Q6KRepackedMoEWeight>, Q4KRepackedMoEKeyHash> cache;
+    static std::unordered_map<RepackedMoEKey, std::shared_ptr<Q6KRepackedMoEWeight>, RepackedMoEKeyHash> cache;
     static size_t cache_bytes = 0;
     static std::atomic<uint64_t> use_clock{0};
 
     const size_t raw_bytes = static_cast<size_t>(rows) * ggml_row_size(GGML_TYPE_Q6_K, cols);
-    const Q4KRepackedMoEKey key{weight_ptr, rows, cols, FingerprintRepackedMoEWeight(weight_ptr, raw_bytes)};
+    const RepackedMoEKey key{weight_ptr, rows, cols, FingerprintRepackedMoEWeight(weight_ptr, raw_bytes)};
     const uint64_t now = use_clock.fetch_add(1, std::memory_order_relaxed) + 1;
 
     std::lock_guard<std::mutex> lock(mutex);
@@ -838,26 +766,20 @@ bool RunQ4KRepackedMoEGemv(CpuBackend* backend, const std::shared_ptr<Q4KRepacke
     auto& pool = backend->GetThreadPool(numa_node);
     const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
     const int tile_count = static_cast<int>(cols / 8);
-    const int blocks_per_row = static_cast<int>(packed->blocks_per_row);
-
-    for (int64_t row = 0; row < rows; ++row) {
-        const auto* qi = qinput_data + static_cast<size_t>(row) * qinput_row_bytes;
-        float* out = output_data + static_cast<size_t>(row) * cols;
-        const auto compute_tiles = [&](int tile_start, int tile_end) {
-            if (tile_start >= tile_end) {
-                return;
+    const auto compute_tiles = [&](int tile_start, int tile_end) {
+        return densecore::kernels::RunQ4KRepackedGemvRows(packed, qinput_data, qinput_row_bytes, output_data, rows,
+                                                          cols, tile_start, tile_end);
+    };
+    if (n_threads > 1 && tile_count >= 2) {
+        std::atomic<bool> ok{true};
+        pool.ParallelFor(tile_count, [&](int start, int end, int) {
+            if (!compute_tiles(start, end)) {
+                ok.store(false, std::memory_order_relaxed);
             }
-            const void* vx = packed->blocks.data() + static_cast<size_t>(tile_start) * blocks_per_row;
-            ggml_gemv_q4_K_8x8_q8_K(static_cast<int>(packed->cols), out + static_cast<size_t>(tile_start) * 8, 0, vx,
-                                    qi, 1, (tile_end - tile_start) * 8);
-        };
-        if (n_threads > 1 && tile_count >= 2) {
-            pool.ParallelFor(tile_count, [&](int start, int end, int) { compute_tiles(start, end); });
-        } else {
-            compute_tiles(0, tile_count);
-        }
+        });
+        return ok.load(std::memory_order_relaxed);
     }
-    return true;
+    return compute_tiles(0, tile_count);
 }
 
 bool RunQ4KRepackedMoEGemmM4(CpuBackend* backend, const std::shared_ptr<Q4KRepackedMoEWeight>& packed,
@@ -1263,11 +1185,6 @@ bool IsMoECachePolicyDebugEnabled() {
     return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
-bool IsSmallDecodeExpertParallelEnabled() {
-    const char* env = std::getenv("DENSECORE_MOE_SMALL_DECODE_EXPERT_PARALLEL");
-    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-}
-
 int GetSmallDecodeExpertWorkers() {
     const char* env = std::getenv("DENSECORE_MOE_SMALL_DECODE_EXPERT_WORKERS");
     if (!env || env[0] == '\0') {
@@ -1431,9 +1348,10 @@ void LogSmallDecodeFallback(const char* reason, int assignments, int workers, in
                  reason ? reason : "unknown", assignments, workers, batch_size);
 }
 
-bool IsQwen36HybridMoEModel(const TransformerModel* model) {
-    return model && model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm &&
-           model->hparams.n_experts > 0;
+bool IsQwenA3BHybridMoEModel(const TransformerModel* model) {
+    return model && (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+           model->arch_flags.is_hybrid_ssm && model->hparams.n_experts > 0 &&
+           model->hparams.n_experts_used > 1;
 }
 
 bool IsGemma4MoEModelForSmallDecodeParallel(const TransformerModel* model) {
@@ -1441,19 +1359,44 @@ bool IsGemma4MoEModelForSmallDecodeParallel(const TransformerModel* model) {
 }
 
 bool IsSmallDecodeExpertParallelAutoModel(const TransformerModel* model) {
-    return IsQwen36HybridMoEModel(model) || IsGemma4MoEModelForSmallDecodeParallel(model);
+    return IsQwenA3BHybridMoEModel(model) || IsGemma4MoEModelForSmallDecodeParallel(model);
 }
 
-bool IsArmWideSimdLevel(densecore::simd::SimdLevel level) {
-    return level == densecore::simd::SimdLevel::SVE || level == densecore::simd::SimdLevel::SVE2;
+bool IsSmallDecodeExpertParallelSimdLevel(densecore::simd::SimdLevel level) {
+    return level == densecore::simd::SimdLevel::SVE || level == densecore::simd::SimdLevel::SVE2 ||
+           densecore::simd::HasX86Avx2OrBetter(level);
 }
 
-bool ResolveQwen36SmallDecodeExpertParallelAutoEligible(const TransformerModel* model, int physical_cores,
-                                                        densecore::simd::SimdLevel level) {
-    return IsSmallDecodeExpertParallelAutoModel(model) && physical_cores >= 16 && IsArmWideSimdLevel(level);
+densecore::env::RuntimeToggleMode ResolveSmallDecodeExpertParallelMode(const TransformerModel* model) {
+    const densecore::env::RuntimeToggleMode generic_mode = densecore::env::ParseRuntimeToggleMode(
+        "DENSECORE_MOE_SMALL_DECODE_EXPERT_PARALLEL", densecore::env::RuntimeToggleMode::Auto);
+    if (std::getenv("DENSECORE_MOE_SMALL_DECODE_EXPERT_PARALLEL")) {
+        return generic_mode;
+    }
+    if (model && model->variant == ModelVariant::QWEN35 && std::getenv("DENSECORE_QWEN35_MOE_PARALLEL")) {
+        return densecore::env::ParseRuntimeToggleMode("DENSECORE_QWEN35_MOE_PARALLEL",
+                                                      densecore::env::RuntimeToggleMode::Auto);
+    }
+    if (model && model->variant == ModelVariant::QWEN36 && std::getenv("DENSECORE_QWEN36_MOE_PARALLEL")) {
+        return densecore::env::ParseRuntimeToggleMode("DENSECORE_QWEN36_MOE_PARALLEL",
+                                                      densecore::env::RuntimeToggleMode::Auto);
+    }
+    return densecore::env::RuntimeToggleMode::Auto;
 }
 
-int ResolveQwen36SmallDecodeExpertWorkers(int top_k, int worker_cap, int requested_override) {
+bool ResolveSmallDecodeExpertParallelAutoEligible(const TransformerModel* model, int physical_cores, int worker_cap,
+                                                  densecore::simd::SimdLevel level) {
+    const int effective_cores = std::max(physical_cores, worker_cap);
+    return IsSmallDecodeExpertParallelAutoModel(model) && worker_cap > 1 && effective_cores >= 16 &&
+           IsSmallDecodeExpertParallelSimdLevel(level);
+}
+
+bool ResolveSmallDecodeExpertParallelAutoEligible(const TransformerModel* model, int physical_cores,
+                                                  densecore::simd::SimdLevel level) {
+    return ResolveSmallDecodeExpertParallelAutoEligible(model, physical_cores, physical_cores, level);
+}
+
+int ResolveSmallDecodeExpertWorkers(int top_k, int worker_cap, int requested_override) {
     const int requested = requested_override > 0 ? requested_override : std::min(std::max(1, top_k), 8);
     return std::max(1, std::min(std::max(1, worker_cap), requested));
 }
@@ -1471,21 +1414,9 @@ SmallDecodeExpertParallelDecision ResolveSmallDecodeExpertParallelDecision(const
                                                                            bool safe_reference_mode, int worker_cap) {
     SmallDecodeExpertParallelDecision decision;
     const int requested_override = GetSmallDecodeExpertWorkers();
-    decision.workers = ResolveQwen36SmallDecodeExpertWorkers(top_k, worker_cap, requested_override);
+    decision.workers = ResolveSmallDecodeExpertWorkers(top_k, worker_cap, requested_override);
 
-    const char* legacy_env = std::getenv("DENSECORE_MOE_SMALL_DECODE_EXPERT_PARALLEL");
-    if (legacy_env && legacy_env[0] != '\0') {
-        decision.requested = IsSmallDecodeExpertParallelEnabled();
-        decision.enabled = decision.requested && !safe_reference_mode && decision.workers > 1;
-        decision.reason = decision.enabled      ? "legacy_override"
-                          : !decision.requested ? "legacy_disabled"
-                          : safe_reference_mode ? "safe_reference"
-                                                : "insufficient_workers";
-        return decision;
-    }
-
-    const densecore::env::RuntimeToggleMode mode = densecore::env::ParseRuntimeToggleMode(
-        "DENSECORE_QWEN36_MOE_PARALLEL", densecore::env::RuntimeToggleMode::Auto);
+    const densecore::env::RuntimeToggleMode mode = ResolveSmallDecodeExpertParallelMode(model);
     decision.forced_on = mode == densecore::env::RuntimeToggleMode::On;
     if (mode == densecore::env::RuntimeToggleMode::Off) {
         decision.reason = "mode_off";
@@ -1501,17 +1432,18 @@ SmallDecodeExpertParallelDecision ResolveSmallDecodeExpertParallelDecision(const
     if (physical_cores <= 0) {
         physical_cores = worker_cap;
     }
+    const int effective_cores = std::max(physical_cores, worker_cap);
     const densecore::simd::SimdLevel simd_level = densecore::simd::DetectSimdLevel();
-    if (!IsArmWideSimdLevel(simd_level)) {
-        decision.reason = "simd_not_sve";
+    if (!IsSmallDecodeExpertParallelSimdLevel(simd_level)) {
+        decision.reason = "simd_not_supported";
         return decision;
     }
-    if (physical_cores < 16) {
-        decision.reason = "insufficient_physical_cores";
+    if (worker_cap <= 1 || effective_cores < 16) {
+        decision.reason = "insufficient_worker_threads";
         return decision;
     }
-    if (batch_size != 1) {
-        decision.reason = "not_single_decode";
+    if (batch_size <= 0 || batch_size > 4) {
+        decision.reason = "not_small_decode";
         return decision;
     }
     if (top_k <= 1) {
@@ -1525,7 +1457,7 @@ SmallDecodeExpertParallelDecision ResolveSmallDecodeExpertParallelDecision(const
         return decision;
     }
     if (decision.workers <= 1) {
-        decision.reason = "insufficient_workers";
+        decision.reason = "insufficient_worker_threads";
         return decision;
     }
 
@@ -2979,6 +2911,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     const bool enable_inner_parallel =
         allow_inner_parallel && ShouldParallelizeExpertFFNInner(batch, hidden_dim, intermediate_dim);
     const bool safe_reference_mode = IsMoESafeReferenceModeEnabled(&expert);
+    const bool ggml_quantized_vecdot_safe = batch == 1;
 
     hidden_scratch.Resize(backend, hidden_size);
     Tensor hidden = Tensor::Make2D(hidden_scratch.ptr, batch, intermediate_dim);
@@ -2995,17 +2928,19 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
                          static_cast<int>(hidden.shape[1]), expert.w1_int4.group_size, enable_inner_parallel);
     }
 	    const bool used_fused_ggml_quant_swiglu =
-	        !used_fused_int4_swiglu && !safe_reference_mode && !expert.use_gelu_activation && expert.w1.ptr &&
-	        expert.w3.ptr &&
-	        TryRunGgmlQuantizedFusedSwiGLUProjection(backend, expert.w1.ptr, expert.w1_type, expert.w3.ptr, expert.w3_type,
-	                                                 input, &hidden, intermediate_dim, hidden_dim, numa_node,
-	                                                 enable_inner_parallel, input_projection_cache);
+        !used_fused_int4_swiglu && !safe_reference_mode && ggml_quantized_vecdot_safe &&
+        !expert.use_gelu_activation && expert.w1.ptr &&
+        expert.w3.ptr &&
+        TryRunGgmlQuantizedFusedSwiGLUProjection(backend, expert.w1.ptr, expert.w1_type, expert.w3.ptr, expert.w3_type,
+                                                 input, &hidden, intermediate_dim, hidden_dim, numa_node,
+                                                 enable_inner_parallel, input_projection_cache);
     if (used_fused_ggml_quant_swiglu) {
 	        LogMoEMatmulPath("ggml_quantized_fused_swiglu", static_cast<int>(input.shape[0]),
 	                         static_cast<int>(input.shape[1]), static_cast<int>(hidden.shape[1]), 0, enable_inner_parallel);
 	    }
     const bool used_fused_ggml_quant_geglu =
         !used_fused_int4_swiglu && !used_fused_ggml_quant_swiglu && !safe_reference_mode &&
+        ggml_quantized_vecdot_safe &&
         expert.use_gelu_activation && expert.w1.ptr && expert.w3.ptr &&
         TryRunGgmlQuantizedFusedGEGLUProjection(backend, expert.w1.ptr, expert.w1_type, expert.w3.ptr, expert.w3_type,
                                                 input, &hidden, intermediate_dim, hidden_dim, numa_node,
@@ -3062,7 +2997,8 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         // Path 2: Native ggml quantized GEMV (Q4_K, Q4_0, etc.) -> zero dequantization
         const bool allow_rowpair_vec_dot =
             !(expert.use_gelu_activation && projection_slot == '2' && ggml_type_id == GGML_TYPE_Q4_K);
-        if (!safe_reference_mode && quantized_scale_supported && raw_weight.ptr && ggml_type_id != GGML_TYPE_F32 &&
+        if (!safe_reference_mode && ggml_quantized_vecdot_safe && quantized_scale_supported && raw_weight.ptr &&
+            ggml_type_id != GGML_TYPE_F32 &&
             TryRunGgmlQuantizedProjection(
                 backend, raw_weight.ptr, ggml_type_id, src, dst, proj_rows, proj_cols, numa_node, enable_inner_parallel,
                 src.DataAs<float>() == input.DataAs<float>() ? input_projection_cache : nullptr,
@@ -3487,13 +3423,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
 
     auto registry = GetMoELayerRegistry(layer_key);
     RecordExpertAccess(layer_key, routing.expert_ids.data(), static_cast<int>(routing.expert_ids.size()));
-#if defined(__aarch64__) || defined(_M_ARM64)
-    // Keep ARM profiler/locality snapshots active, but avoid the mutable
-    // registry-backed dequant cache until that shared-state lane is proven safe.
-    const bool arm_disable_registry_dequant_cache = true;
-#else
     const bool arm_disable_registry_dequant_cache = false;
-#endif
 
     float* out_data = output->DataAs<float>();
     std::memset(out_data, 0, batch_size * hidden_dim * sizeof(float));
@@ -3800,9 +3730,22 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 const int gate_splits =
                     std::min<int>(2, std::max<int>(1, static_cast<int>(small_decode_intermediate_dim / 128)));
                 const int down_splits = std::min<int>(4, std::max<int>(1, static_cast<int>(hidden_dim / 512)));
-                std::vector<float> assignment_hiddens(
-                    static_cast<size_t>(total_assignments) * static_cast<size_t>(small_decode_intermediate_dim), 0.0f);
-                std::vector<float> assignment_outputs(static_cast<size_t>(total_assignments) * hidden_dim, 0.0f);
+                const size_t assignment_hidden_elems =
+                    static_cast<size_t>(total_assignments) * static_cast<size_t>(small_decode_intermediate_dim);
+                const size_t assignment_output_elems = static_cast<size_t>(total_assignments) * hidden_dim;
+                const bool reused_assignment_scratch =
+                    expert_input_scratch.HasCapacity(assignment_hidden_elems) &&
+                    expert_output_scratch.HasCapacity(assignment_output_elems);
+                expert_input_scratch.Resize(this, assignment_hidden_elems);
+                expert_output_scratch.Resize(this, assignment_output_elems);
+                float* assignment_hiddens = expert_input_scratch.ptr;
+                float* assignment_outputs = expert_output_scratch.ptr;
+                std::fill_n(assignment_hiddens, assignment_hidden_elems, 0.0f);
+                std::fill_n(assignment_outputs, assignment_output_elems, 0.0f);
+                if (profile && reused_assignment_scratch) {
+                    profile->decode_scratch_reused += 2;
+                    profile->decode_allocations_avoided += 2;
+                }
                 std::vector<QuantizedProjectionInputCache> down_input_projection_caches(
                     static_cast<size_t>(total_assignments));
                 QuantizedProjectionInputCache shared_decode_input_projection_cache;
@@ -3858,8 +3801,8 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                             Tensor::Make2D(const_cast<float*>(input_data + static_cast<size_t>(token_idx) * hidden_dim),
                                            1, static_cast<int64_t>(hidden_dim));
                         float* hidden_tile =
-                            assignment_hiddens.data() +
-                            static_cast<size_t>(i) * static_cast<size_t>(small_decode_intermediate_dim) +
+                            assignment_hiddens + static_cast<size_t>(i) *
+                                                    static_cast<size_t>(small_decode_intermediate_dim) +
                             static_cast<size_t>(tile_start);
                         Tensor hidden_tensor = Tensor::Make2D(hidden_tile, 1, tile_rows);
                         QuantizedProjectionInputCache local_input_projection_cache;
@@ -3898,7 +3841,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                                 }
                                 auto& cache = down_input_projection_caches[static_cast<size_t>(i)];
                                 const float* hidden_row =
-                                    assignment_hiddens.data() +
+                                    assignment_hiddens +
                                     static_cast<size_t>(i) * static_cast<size_t>(small_decode_intermediate_dim);
                                 cache.source = hidden_row;
                                 cache.rows = 1;
@@ -3941,10 +3884,10 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                             const char* down_ptr = static_cast<const char*>(exp.w2.ptr) +
                                                    static_cast<ptrdiff_t>(tile_start * down_row_bytes);
                             Tensor hidden_tensor = Tensor::Make2D(
-                                assignment_hiddens.data() +
+                                assignment_hiddens +
                                     static_cast<size_t>(i) * static_cast<size_t>(small_decode_intermediate_dim),
                                 1, small_decode_intermediate_dim);
-                            float* output_tile = assignment_outputs.data() + static_cast<size_t>(i) * hidden_dim +
+                            float* output_tile = assignment_outputs + static_cast<size_t>(i) * hidden_dim +
                                                  static_cast<size_t>(tile_start);
                             Tensor output_tensor = Tensor::Make2D(output_tile, 1, tile_rows);
                             QuantizedProjectionInputCache local_down_input_projection_cache;
@@ -3982,7 +3925,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                             continue;
                         }
                         float* dst = out_data + static_cast<size_t>(token_idx) * hidden_dim;
-                        const float* src = assignment_outputs.data() + static_cast<size_t>(i) * hidden_dim;
+                        const float* src = assignment_outputs + static_cast<size_t>(i) * hidden_dim;
                         for (size_t d = 0; d < hidden_dim; ++d) {
                             dst[d] += weight * src[d];
                         }
@@ -3998,7 +3941,13 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
         if (use_small_decode_expert_parallel) {
             LogSmallDecodeExecutionPath("expert_parallel", total_assignments, effective_small_decode_workers,
                                         batch_size);
-            small_decode_output_scratch.Resize(this, static_cast<size_t>(total_assignments) * hidden_dim);
+            const size_t assignment_output_elems = static_cast<size_t>(total_assignments) * hidden_dim;
+            const bool reused_output_scratch = small_decode_output_scratch.HasCapacity(assignment_output_elems);
+            small_decode_output_scratch.Resize(this, assignment_output_elems);
+            if (profile && reused_output_scratch) {
+                profile->decode_scratch_reused += 1;
+                profile->decode_allocations_avoided += 1;
+            }
             float* assignment_outputs = small_decode_output_scratch.ptr;
             QuantizedProjectionInputCache shared_decode_input_projection_cache;
             QuantizedProjectionInputCache* shared_decode_input_projection_cache_ptr = nullptr;
@@ -4108,7 +4057,12 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                                    batch_size);
         }
 
+        const bool reused_single_output_scratch = small_decode_output_scratch.HasCapacity(hidden_dim);
         small_decode_output_scratch.Resize(this, hidden_dim);
+        if (profile && reused_single_output_scratch) {
+            profile->decode_scratch_reused += 1;
+            profile->decode_allocations_avoided += 1;
+        }
         QuantizedProjectionInputCache small_decode_input_projection_cache;
         for (int i = 0; i < total_assignments; ++i) {
             const int expert_id = routing.expert_ids[static_cast<size_t>(i)];
@@ -4652,12 +4606,6 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
     std::chrono::steady_clock::duration dequant_duration{};
     std::chrono::steady_clock::duration expert_duration{};
     std::mutex work_stats_mutex;
-    // Qwen3.5-35B-A3B on C4A-class ARM can reach this expert-parallel path during
-    // multi-token prefill. The current shared-registry/cache access inside the
-    // worker lambda is not hardened enough for that path and has produced
-    // invalid-mutex crashes in production-style runs. Keep the reordered MoE
-    // path, but serialize expert execution on ARM until the parallel cache
-    // coordination is made safe.
     const bool force_inner_parallel_prefill =
         ShouldForcePrefillInnerParallelExperts() && !small_decode_step && batch_size > 1;
     const bool prefer_inner_parallel_prefill =
@@ -4665,7 +4613,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
         (!small_decode_step && batch_size > 1 && active_work.size() < static_cast<size_t>(worker_threads));
     const bool parallelize_experts = !prefer_inner_parallel_prefill && !small_decode_step && batch_size > 1 &&
                                      active_work.size() >= static_cast<size_t>(std::max(4, worker_threads / 2)) &&
-                                     (!arm_disable_registry_dequant_cache || !dequant_cache_enabled);
+                                     registry != nullptr;
     if (IsMoECachePolicyDebugEnabled()) {
         std::fprintf(
             stderr,
@@ -4674,9 +4622,8 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             arm_disable_registry_dequant_cache ? 1 : 0, registry ? 1 : 0, dequant_cache_enabled ? 1 : 0,
             parallelize_experts ? 1 : 0,
             force_inner_parallel_prefill ? "prefill_inner_parallel_forced"
-            : prefer_inner_parallel_prefill
-                ? "prefill_inner_parallel"
-                : (arm_disable_registry_dequant_cache ? "arm_mutable_dequant_cache_bypassed" : "cache_lane_available"));
+            : prefer_inner_parallel_prefill ? "prefill_inner_parallel"
+                                            : "cache_lane_available");
     }
 
     if (parallelize_experts && ShouldBalanceParallelExpertWork() && active_work.size() > 1) {
@@ -4898,7 +4845,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 const bool can_use_ggml_quant_gen =
                     !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp) &&
                     (!exp.w2_scale_tensor || IsScalarScaleSidecar(exp.w2_scale_tensor)) &&
-                    work.count <= kMoEQuantizedProjectionMaxBatch;
+                    work.count == 1 && work.count <= kMoEQuantizedProjectionMaxBatch;
                 if (!can_use_ggml_quant_gen) {
                     w1 = make_weight_f32(
                         exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr, static_cast<int64_t>(exp.intermediate_dim),
@@ -5075,9 +5022,10 @@ bool ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(bool is_qwen36_hy
         model.variant = ModelVariant::QWEN36;
         model.arch_flags.is_hybrid_ssm = true;
         model.hparams.n_experts = 256;
+        model.hparams.n_experts_used = 8;
     }
-    return ResolveQwen36SmallDecodeExpertParallelAutoEligible(is_qwen36_hybrid_moe ? &model : nullptr, physical_cores,
-                                                              static_cast<densecore::simd::SimdLevel>(simd_level));
+    return ResolveSmallDecodeExpertParallelAutoEligible(is_qwen36_hybrid_moe ? &model : nullptr, physical_cores,
+                                                        static_cast<densecore::simd::SimdLevel>(simd_level));
 }
 
 bool ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(int physical_cores, int simd_level) {
@@ -5086,12 +5034,12 @@ bool ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(int physical_core
     model.variant = ModelVariant::GEMMA4;
     model.arch_flags.is_gemma4 = true;
     model.hparams.n_experts = 128;
-    return ResolveQwen36SmallDecodeExpertParallelAutoEligible(&model, physical_cores,
-                                                              static_cast<densecore::simd::SimdLevel>(simd_level));
+    return ResolveSmallDecodeExpertParallelAutoEligible(&model, physical_cores,
+                                                        static_cast<densecore::simd::SimdLevel>(simd_level));
 }
 
 int ResolveQwen36SmallDecodeExpertWorkersForTest(int top_k, int worker_cap, int requested_override) {
-    return ResolveQwen36SmallDecodeExpertWorkers(top_k, worker_cap, requested_override);
+    return ResolveSmallDecodeExpertWorkers(top_k, worker_cap, requested_override);
 }
 
 bool RunGgmlQuantizedProjectionForTest(CpuBackend* backend, const void* weight_ptr, int ggml_type_id,

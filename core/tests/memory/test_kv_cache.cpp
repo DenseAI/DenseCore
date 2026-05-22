@@ -533,6 +533,227 @@ TEST_F(BlockManagerTest, PrefixCachingProgressivelyExtendsFullPromptBlocks) {
     manager->FreeSingle(block_b);
 }
 
+TEST_F(BlockManagerTest, HybridPrefixReuseTrimsToTerminalSnapshotBlock) {
+    std::vector<int> prompt_a(BLOCK_SIZE);
+    std::vector<int> prompt_b(BLOCK_SIZE);
+    std::vector<int> prompt_c(BLOCK_SIZE);
+    std::vector<int> prompt_d(BLOCK_SIZE);
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        prompt_a[i] = 100 + i;
+        prompt_b[i] = 200 + i;
+        prompt_c[i] = 300 + i;
+        prompt_d[i] = 400 + i;
+    }
+
+    std::vector<int> prompt_abcd;
+    prompt_abcd.insert(prompt_abcd.end(), prompt_a.begin(), prompt_a.end());
+    prompt_abcd.insert(prompt_abcd.end(), prompt_b.begin(), prompt_b.end());
+    prompt_abcd.insert(prompt_abcd.end(), prompt_c.begin(), prompt_c.end());
+    prompt_abcd.insert(prompt_abcd.end(), prompt_d.begin(), prompt_d.end());
+
+    const int block_a = manager->AllocateSingle();
+    const int block_b = manager->AllocateSingle();
+    const int block_c = manager->AllocateSingle();
+    ASSERT_GE(block_a, 0);
+    ASSERT_GE(block_b, 0);
+    ASSERT_GE(block_c, 0);
+
+    manager->RegisterPrefixBlockWithTokens(block_a, BlockManager::ComputeTokenHash(prompt_a.data(), BLOCK_SIZE),
+                                           prompt_a.data(), BLOCK_SIZE);
+    std::vector<TransformerModel::SSMSequenceRuntimeState> terminal_snapshot(1);
+    manager->RegisterPrefixBlockWithTokens(block_b, BlockManager::ComputeTokenHash(prompt_b.data(), BLOCK_SIZE),
+                                           prompt_b.data(), BLOCK_SIZE, &terminal_snapshot);
+    manager->RegisterPrefixBlockWithTokens(block_c, BlockManager::ComputeTokenHash(prompt_c.data(), BLOCK_SIZE),
+                                           prompt_c.data(), BLOCK_SIZE);
+
+    auto hit = manager->FindLongestCachedPrefixWithVerification(prompt_abcd.data(),
+                                                                static_cast<int>(prompt_abcd.size()),
+                                                                /*require_hybrid_ssm_snapshot=*/true);
+    EXPECT_EQ(hit.cached_tokens, 2 * BLOCK_SIZE);
+    ASSERT_EQ(hit.cached_block_ids.size(), 2u);
+    EXPECT_EQ(hit.cached_block_ids[0], block_a);
+    EXPECT_EQ(hit.cached_block_ids[1], block_b);
+
+    manager->Free(hit.cached_block_ids);
+    manager->FreeSingle(block_a);
+    manager->FreeSingle(block_b);
+    manager->FreeSingle(block_c);
+}
+
+TEST_F(BlockManagerTest, HybridPrefixReuseKeepsEarlierBlocksWithoutSnapshotsWhenTerminalHasSnapshot) {
+    std::vector<int> prompt_a(BLOCK_SIZE);
+    std::vector<int> prompt_b(BLOCK_SIZE);
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        prompt_a[i] = 500 + i;
+        prompt_b[i] = 600 + i;
+    }
+
+    std::vector<int> prompt_ab_next;
+    prompt_ab_next.insert(prompt_ab_next.end(), prompt_a.begin(), prompt_a.end());
+    prompt_ab_next.insert(prompt_ab_next.end(), prompt_b.begin(), prompt_b.end());
+    prompt_ab_next.push_back(700);
+
+    const int block_a = manager->AllocateSingle();
+    const int block_b = manager->AllocateSingle();
+    ASSERT_GE(block_a, 0);
+    ASSERT_GE(block_b, 0);
+
+    manager->RegisterPrefixBlockWithTokens(block_a, BlockManager::ComputeTokenHash(prompt_a.data(), BLOCK_SIZE),
+                                           prompt_a.data(), BLOCK_SIZE);
+    std::vector<TransformerModel::SSMSequenceRuntimeState> terminal_snapshot(1);
+    terminal_snapshot[0].conv_state = {1.0f};
+    terminal_snapshot[0].ssm_state = {2.0f};
+    manager->RegisterPrefixBlockWithTokens(block_b, BlockManager::ComputeTokenHash(prompt_b.data(), BLOCK_SIZE),
+                                           prompt_b.data(), BLOCK_SIZE, &terminal_snapshot);
+
+    auto hit = manager->FindLongestCachedPrefixWithVerification(prompt_ab_next.data(),
+                                                                static_cast<int>(prompt_ab_next.size()),
+                                                                /*require_hybrid_ssm_snapshot=*/true);
+    EXPECT_EQ(hit.cached_tokens, 2 * BLOCK_SIZE);
+    ASSERT_EQ(hit.cached_block_ids.size(), 2u);
+    EXPECT_EQ(hit.cached_block_ids[0], block_a);
+    EXPECT_EQ(hit.cached_block_ids[1], block_b);
+
+    manager->Free(hit.cached_block_ids);
+    manager->FreeSingle(block_a);
+    manager->FreeSingle(block_b);
+}
+
+TEST_F(BlockManagerTest, HybridPrefixReuseTrimsBackWhenLaterBlockLacksSnapshot) {
+    std::vector<int> prompt_a(BLOCK_SIZE);
+    std::vector<int> prompt_b(BLOCK_SIZE);
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        prompt_a[i] = 700 + i;
+        prompt_b[i] = 800 + i;
+    }
+
+    std::vector<int> prompt_ab_next;
+    prompt_ab_next.insert(prompt_ab_next.end(), prompt_a.begin(), prompt_a.end());
+    prompt_ab_next.insert(prompt_ab_next.end(), prompt_b.begin(), prompt_b.end());
+    prompt_ab_next.push_back(900);
+
+    const int block_a = manager->AllocateSingle();
+    const int block_b = manager->AllocateSingle();
+    ASSERT_GE(block_a, 0);
+    ASSERT_GE(block_b, 0);
+
+    std::vector<TransformerModel::SSMSequenceRuntimeState> terminal_snapshot(1);
+    terminal_snapshot[0].conv_state = {3.0f};
+    terminal_snapshot[0].ssm_state = {4.0f};
+    manager->RegisterPrefixBlockWithTokens(block_a, BlockManager::ComputeTokenHash(prompt_a.data(), BLOCK_SIZE),
+                                           prompt_a.data(), BLOCK_SIZE, &terminal_snapshot);
+    manager->RegisterPrefixBlockWithTokens(block_b, BlockManager::ComputeTokenHash(prompt_b.data(), BLOCK_SIZE),
+                                           prompt_b.data(), BLOCK_SIZE);
+
+    auto hit = manager->FindLongestCachedPrefixWithVerification(prompt_ab_next.data(),
+                                                                static_cast<int>(prompt_ab_next.size()),
+                                                                /*require_hybrid_ssm_snapshot=*/true);
+    EXPECT_EQ(hit.cached_tokens, BLOCK_SIZE);
+    ASSERT_EQ(hit.cached_block_ids.size(), 1u);
+    EXPECT_EQ(hit.cached_block_ids[0], block_a);
+    EXPECT_EQ(manager->GetRefCount(block_b), 1);
+
+    manager->Free(hit.cached_block_ids);
+    manager->FreeSingle(block_a);
+    manager->FreeSingle(block_b);
+}
+
+TEST_F(BlockManagerTest, HybridPrefixReuseReturnsEmptyWithoutTerminalSnapshot) {
+    std::vector<int> prompt_a(BLOCK_SIZE);
+    std::vector<int> prompt_b(BLOCK_SIZE);
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        prompt_a[i] = 900 + i;
+        prompt_b[i] = 1000 + i;
+    }
+
+    std::vector<int> prompt_ab_next;
+    prompt_ab_next.insert(prompt_ab_next.end(), prompt_a.begin(), prompt_a.end());
+    prompt_ab_next.insert(prompt_ab_next.end(), prompt_b.begin(), prompt_b.end());
+    prompt_ab_next.push_back(1100);
+
+    const int block_a = manager->AllocateSingle();
+    const int block_b = manager->AllocateSingle();
+    ASSERT_GE(block_a, 0);
+    ASSERT_GE(block_b, 0);
+
+    manager->RegisterPrefixBlockWithTokens(block_a, BlockManager::ComputeTokenHash(prompt_a.data(), BLOCK_SIZE),
+                                           prompt_a.data(), BLOCK_SIZE);
+    manager->RegisterPrefixBlockWithTokens(block_b, BlockManager::ComputeTokenHash(prompt_b.data(), BLOCK_SIZE),
+                                           prompt_b.data(), BLOCK_SIZE);
+
+    auto hit = manager->FindLongestCachedPrefixWithVerification(prompt_ab_next.data(),
+                                                                static_cast<int>(prompt_ab_next.size()),
+                                                                /*require_hybrid_ssm_snapshot=*/true);
+    EXPECT_EQ(hit.cached_tokens, 0);
+    EXPECT_TRUE(hit.cached_block_ids.empty());
+    EXPECT_EQ(manager->GetRefCount(block_a), 1);
+    EXPECT_EQ(manager->GetRefCount(block_b), 1);
+
+    manager->FreeSingle(block_a);
+    manager->FreeSingle(block_b);
+}
+
+TEST_F(BlockManagerTest, HybridPrefixReuseRejectsTokenMismatchEvenWithSnapshot) {
+    std::vector<int> prompt(BLOCK_SIZE);
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        prompt[i] = 1100 + i;
+    }
+
+    const int block_id = manager->AllocateSingle();
+    ASSERT_GE(block_id, 0);
+
+    std::vector<TransformerModel::SSMSequenceRuntimeState> terminal_snapshot(1);
+    terminal_snapshot[0].conv_state = {5.0f};
+    terminal_snapshot[0].ssm_state = {6.0f};
+    const uint64_t hash = BlockManager::ComputeTokenHash(prompt.data(), BLOCK_SIZE);
+    manager->RegisterPrefixBlockWithTokens(block_id, hash, prompt.data(), BLOCK_SIZE, &terminal_snapshot);
+
+    std::vector<int> mismatched = prompt;
+    mismatched[BLOCK_SIZE - 1] += 1;
+
+    auto hit = manager->FindLongestCachedPrefixWithVerification(mismatched.data(),
+                                                                static_cast<int>(mismatched.size()),
+                                                                /*require_hybrid_ssm_snapshot=*/true);
+    EXPECT_EQ(hit.cached_tokens, 0);
+    EXPECT_TRUE(hit.cached_block_ids.empty());
+    EXPECT_EQ(manager->FindCachedBlockWithVerification(hash, mismatched.data(), BLOCK_SIZE), -1);
+    EXPECT_EQ(manager->GetRefCount(block_id), 1);
+
+    manager->FreeSingle(block_id);
+}
+
+TEST_F(BlockManagerTest, HybridPrefixReuseRejectsSnapshotShapeMismatchBeforeAdmission) {
+    std::vector<int> prompt(BLOCK_SIZE);
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        prompt[i] = 1300 + i;
+    }
+
+    const int block_id = manager->AllocateSingle();
+    ASSERT_GE(block_id, 0);
+
+    std::vector<TransformerModel::SSMSequenceRuntimeState> mismatched_snapshot(1);
+    mismatched_snapshot[0].conv_state = {1.0f, 2.0f};
+    mismatched_snapshot[0].ssm_state = {3.0f};
+    const uint64_t hash = BlockManager::ComputeTokenHash(prompt.data(), BLOCK_SIZE);
+    manager->RegisterPrefixBlockWithTokens(block_id, hash, prompt.data(), BLOCK_SIZE, &mismatched_snapshot);
+
+    std::vector<int> prompt_with_next = prompt;
+    prompt_with_next.push_back(1400);
+    auto shape_validator = [](const std::vector<TransformerModel::SSMSequenceRuntimeState>& snapshot) {
+        return snapshot.size() == 1 && snapshot[0].conv_state.size() == 1 && snapshot[0].ssm_state.size() == 1;
+    };
+
+    auto hit = manager->FindLongestCachedPrefixWithVerification(prompt_with_next.data(),
+                                                                static_cast<int>(prompt_with_next.size()),
+                                                                /*require_hybrid_ssm_snapshot=*/true,
+                                                                shape_validator);
+    EXPECT_EQ(hit.cached_tokens, 0);
+    EXPECT_TRUE(hit.cached_block_ids.empty());
+    EXPECT_EQ(manager->GetRefCount(block_id), 1);
+
+    manager->FreeSingle(block_id);
+}
+
 // =============================================================================
 // BLOCK_SIZE constant test
 // =============================================================================

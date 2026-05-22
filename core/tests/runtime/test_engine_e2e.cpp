@@ -18,8 +18,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstring>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "densecore.h"
@@ -135,6 +138,62 @@ TEST_F(EngineE2ETest, InitEngineEx_MockModel) {
     // Test extended init with explicit thread/NUMA config
     engine_ = InitEngineEx("mock", nullptr, 2, -1, 0);
     ASSERT_NE(engine_, nullptr) << "InitEngineEx failed: " << DenseCoreGetLastError();
+}
+
+TEST_F(EngineE2ETest, RequestSnapshotCAPIABIAndOwnedFree) {
+    static_assert(std::is_standard_layout<DenseCoreRequestSnapshot>::value,
+                  "DenseCoreRequestSnapshot must remain CGO-compatible");
+    static_assert(std::is_standard_layout<DenseCoreRuntimeOptimizationState>::value,
+                  "DenseCoreRuntimeOptimizationState must remain CGO-compatible");
+    static_assert(offsetof(DenseCoreRequestSnapshot, token_ids) > offsetof(DenseCoreRequestSnapshot, rendered_prompt),
+                  "DenseCoreRequestSnapshot field order changed unexpectedly");
+    static_assert(offsetof(DenseCoreRequestSnapshot, caller_owns_buffers) >
+                      offsetof(DenseCoreRequestSnapshot, prompt_family),
+                  "DenseCoreRequestSnapshot ownership marker must stay after owned pointer fields");
+    static_assert(offsetof(DenseCoreRuntimeOptimizationState, active_thread_policy_label) >
+                      offsetof(DenseCoreRuntimeOptimizationState, moe_dequant_cache_mb),
+                  "Runtime optimization state label must stay after scalar fields");
+
+    engine_ = InitEngine("mock", nullptr, 2);
+    ASSERT_NE(engine_, nullptr) << "InitEngine failed: " << DenseCoreGetLastError();
+
+    DenseCoreRequestSnapshot snapshot{};
+    int rc = DenseCoreBuildRequestSnapshot(engine_, "hello", 8, 0.7f, 0.9f, 40, 1.1f, 0, &snapshot);
+    ASSERT_EQ(rc, DENSECORE_STATUS_OK) << DenseCoreGetLastError();
+    EXPECT_NE(snapshot.rendered_prompt, nullptr);
+    EXPECT_EQ(snapshot.caller_owns_buffers, 1);
+    EXPECT_GE(snapshot.num_token_ids, 0);
+    EXPECT_NE(snapshot.model_variant, nullptr);
+    EXPECT_NE(snapshot.prompt_family, nullptr);
+    DenseCoreFreeRequestSnapshot(&snapshot);
+    EXPECT_EQ(snapshot.rendered_prompt, nullptr);
+    EXPECT_EQ(snapshot.token_ids, nullptr);
+    EXPECT_EQ(snapshot.num_token_ids, 0);
+    EXPECT_EQ(snapshot.tokenizer_type, nullptr);
+    EXPECT_EQ(snapshot.model_variant, nullptr);
+    EXPECT_EQ(snapshot.prompt_family, nullptr);
+    EXPECT_EQ(snapshot.caller_owns_buffers, 0);
+
+    rc = DenseCoreBuildRenderedRequestSnapshot(engine_, "<rendered>hello</rendered>", 8, 0.7f, 0.9f, 40, 1.1f, 0,
+                                               &snapshot);
+    ASSERT_EQ(rc, DENSECORE_STATUS_OK) << DenseCoreGetLastError();
+    EXPECT_NE(snapshot.rendered_prompt, nullptr);
+    EXPECT_EQ(snapshot.template_applied, 0);
+    EXPECT_EQ(snapshot.text_primed, 0);
+    EXPECT_EQ(snapshot.token_primed, 0);
+    EXPECT_EQ(snapshot.caller_owns_buffers, 1);
+    DenseCoreFreeRequestSnapshot(&snapshot);
+    EXPECT_EQ(snapshot.rendered_prompt, nullptr);
+    EXPECT_EQ(snapshot.token_ids, nullptr);
+    EXPECT_EQ(snapshot.caller_owns_buffers, 0);
+
+    DenseCoreRuntimeOptimizationState runtime_state{};
+    rc = DenseCoreGetRuntimeOptimizationState(engine_, &runtime_state);
+    ASSERT_EQ(rc, DENSECORE_STATUS_OK) << DenseCoreGetLastError();
+    EXPECT_EQ(runtime_state.struct_size, static_cast<int>(sizeof(DenseCoreRuntimeOptimizationState)));
+    EXPECT_EQ(runtime_state.token_id_submit_supported, 1);
+    EXPECT_GE(runtime_state.decode_graph_cache_max_batch, 1);
+    EXPECT_GT(strlen(runtime_state.active_thread_policy_label), 0u);
 }
 
 TEST_F(EngineE2ETest, InitEngine_NullPath) {

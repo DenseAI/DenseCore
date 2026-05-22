@@ -24,9 +24,17 @@ TransformerModel::~TransformerModel() {
     }
     cpu_repack_buffers.clear();
 
+    for (auto* buffer : qwen36_ssm_q8_prefill_amx_buffers) {
+        if (buffer) {
+            ggml_backend_buffer_free(buffer);
+        }
+    }
+    qwen36_ssm_q8_prefill_amx_buffers.clear();
+
     // Standard GGML cleanup
     if (ctx_cpu_kleidiai) ggml_free(ctx_cpu_kleidiai);
     if (ctx_cpu_amx) ggml_free(ctx_cpu_amx);
+    if (ctx_qwen36_ssm_q8_prefill_amx) ggml_free(ctx_qwen36_ssm_q8_prefill_amx);
     if (ctx_cpu_repack) ggml_free(ctx_cpu_repack);
     if (ctx_views) ggml_free(ctx_views);
     if (ctx_w) ggml_free(ctx_w);

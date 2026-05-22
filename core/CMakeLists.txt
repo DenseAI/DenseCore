@@ -525,6 +525,7 @@ set(SOURCES
     src/models/lora_storage.cpp
     src/backend/cpu_backend.cpp
     src/backend/cpu_backend_moe_ops.cpp
+    src/kernels/q4k_repacked_gemv.cpp
     src/backend/cpu_backend_moe_registry.cpp
     src/backend/backend_registry.cpp
     src/hal/kernel_context.cpp

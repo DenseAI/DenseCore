@@ -20,14 +20,16 @@
     {
       "name": "c4-perf",
       "displayName": "C4 Performance",
-      "description": "Intel C4 performance profile with oneDNN, LTO, and native ISA enabled for prefill/decode tuning.",
+      "description": "Intel C4 performance profile with LTO and native ISA enabled for prefill/decode tuning.",
       "inherits": "base-release",
       "binaryDir": "${sourceDir}/../build-c4-perf",
       "cacheVariables": {
-        "DENSECORE_USE_ONEDNN": "ON",
         "DENSECORE_LTO": "ON",
         "DENSECORE_ARM_CORRECTNESS_FIRST": "OFF",
-        "GGML_NATIVE": "ON"
+        "GGML_NATIVE": "ON",
+        "GGML_AMX_TILE": "ON",
+        "GGML_AMX_INT8": "ON",
+        "GGML_AMX_BF16": "ON"
       }
     },
     {
@@ -38,11 +40,10 @@
       "binaryDir": "${sourceDir}/../build-c4a-perf",
       "cacheVariables": {
         "DENSECORE_TARGET_C4A": "ON",
-        "DENSECORE_C4A_ENABLE_GGML_FASTKERNELS": "OFF",
+        "DENSECORE_C4A_ENABLE_GGML_FASTKERNELS": "ON",
         "DENSECORE_ARM_CORRECTNESS_FIRST": "OFF",
         "DENSECORE_ARM_MCPU": "neoverse-v2",
         "DENSECORE_LTO": "ON",
-        "DENSECORE_USE_ONEDNN": "OFF",
         "GGML_NATIVE": "ON"
       }
     }

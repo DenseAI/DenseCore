@@ -408,8 +408,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
                 model->arch_flags.is_hybrid_ssm;
 #else
-            const bool prefer_plain_qwen35_hybrid_matmul =
-                model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm;
+            const bool prefer_plain_qwen35_hybrid_matmul = false;
 #endif
             ggml_tensor* fused_qkv_gate = nullptr;
 #if !defined(__aarch64__) && !defined(_M_ARM64)
@@ -471,8 +470,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             conv_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
             conv_ud->profile = &GetCurrentWorkContext()->qwen36_profile;
             const bool ssm_conv_channel_parallel =
-                (model->variant == ModelVariant::QWEN36 ||
-                 (model->variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0)) &&
+                (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
                 batch.num_seqs == 1 && N > 1;
             const int ssm_conv_tasks =
                 ssm_conv_channel_parallel
@@ -542,8 +540,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 scan_ud->alpha_beta_tensor = alpha_beta;
             }
             const bool ssm_delta_head_parallel =
-                (model->variant == ModelVariant::QWEN36 ||
-                 (model->variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0)) &&
+                (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
                 batch.num_seqs == 1;
             const int ssm_delta_tasks =
                 ssm_delta_head_parallel
@@ -555,11 +552,10 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                            : ggml_map_custom2(ctx_c, z, qkv_conv, cb_ssm_qwen35_delta_z_qkv, ssm_delta_tasks, scan_ud);
 
             // 4. Output projection: [d_inner, N] -> [n_embd, N]
-            // Qwen3.6 hybrid SSM hits large-M prefill shapes here; keep that
-            // model on the conservative plain path until the batched quantized
-            // path is proven faster and exact for SSM projection weights.
-            // Qwen3.5 x86 C4 uses the same smart dispatch policy as
-            // attention/FFN projections.
+            // Qwen x86 C4 uses smart dispatch for all hybrid-SSM projections so
+            // qkv/gate/out can share the same Q4_K true-batched admission logic.
+            // ARM remains conservative above because C4A validation historically
+            // found silent SSM projection corruption outside the native path.
             cur = prefer_plain_qwen35_hybrid_matmul ? ggml_mul_mat(ctx_c, ssm_out_w, y)
                                                     : smart_mul_mat(ctx_c, ssm_out_w, y, model);
             if (model->variant == ModelVariant::QWEN36) {

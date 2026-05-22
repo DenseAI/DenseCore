@@ -27,8 +27,10 @@
 #include "densecore/models/model_graph_bridge.h"  // Universal graph execution bridge
 #include "densecore/models/tokenizer.h"
 #include "densecore/runtime/inference.h"  // For InitRoPETable
+#include "llm/config/runtime_config.h"
 
 #if defined(__linux__)
+#include <malloc.h>
 #include <sys/mman.h>  // For mmap, MAP_HUGETLB
 #endif
 
@@ -347,6 +349,132 @@ bool CanUseCpuKleidiaiRepack(ggml_type type) {
     return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0;
 }
 
+bool IsQwen36SSMQ8ProjectionTensor(const ggml_tensor* source) {
+    if (!source || source->type != GGML_TYPE_Q8_0 || !source->name[0]) {
+        return false;
+    }
+    const char* name = source->name;
+    return std::strstr(name, "attn_qkv.weight") || std::strstr(name, "attn_gate.weight") ||
+           std::strstr(name, "ssm_out.weight");
+}
+
+void ClearQwen36SSMQ8PrefillAMXAliasesImpl(TransformerModel* model) {
+    if (!model) {
+        return;
+    }
+    const bool has_scoped_alias_state = !model->qwen36_ssm_q8_prefill_amx_aliases.empty() ||
+                                        !model->qwen36_ssm_q8_prefill_amx_buffers.empty() ||
+                                        model->ctx_qwen36_ssm_q8_prefill_amx != nullptr;
+    if (!has_scoped_alias_state) {
+        return;
+    }
+    for (const auto& kv : model->qwen36_ssm_q8_prefill_amx_aliases) {
+        if (kv.second) {
+            model->cpu_amx_aliases.erase(kv.second);
+        }
+    }
+    model->qwen36_ssm_q8_prefill_amx_aliases.clear();
+    for (auto* buffer : model->qwen36_ssm_q8_prefill_amx_buffers) {
+        if (buffer) {
+            ggml_backend_buffer_free(buffer);
+        }
+    }
+    model->qwen36_ssm_q8_prefill_amx_buffers.clear();
+    if (model->ctx_qwen36_ssm_q8_prefill_amx) {
+        ggml_free(model->ctx_qwen36_ssm_q8_prefill_amx);
+        model->ctx_qwen36_ssm_q8_prefill_amx = nullptr;
+    }
+#if defined(__linux__)
+    // Scoped prefill AMX aliases can temporarily allocate large Q8 buffers.
+    // Return freed pages promptly before decode continues on canonical Q8_0.
+    malloc_trim(0);
+#endif
+}
+
+bool PrepareQwen36SSMQ8PrefillAMXAliasesForExecutionImpl(TransformerModel* model) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    (void)model;
+    return false;
+#else
+    if (!model || model->variant != ModelVariant::QWEN36 || !model->arch_flags.is_hybrid_ssm) {
+        return false;
+    }
+    if (!model->qwen36_ssm_q8_prefill_amx_aliases.empty() &&
+        !model->qwen36_ssm_q8_prefill_amx_buffers.empty()) {
+        return true;
+    }
+    ClearQwen36SSMQ8PrefillAMXAliasesImpl(model);
+
+    const CpuRepackBufferTypes repack_bufts =
+        FindCpuRepackBufferTypes(model->cpu_backend ? model->cpu_backend : model->backend);
+    if (!repack_bufts.cpu_amx) {
+        return false;
+    }
+
+    const size_t tensor_slots = static_cast<size_t>(std::max<uint32_t>(1, model->hparams.n_layer)) * 3 + 16;
+    ggml_init_params params{
+        /*.mem_size   =*/tensor_slots * ggml_tensor_overhead() + 1024 * 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    model->ctx_qwen36_ssm_q8_prefill_amx = ggml_init(params);
+    if (!model->ctx_qwen36_ssm_q8_prefill_amx) {
+        return false;
+    }
+
+    std::vector<std::pair<ggml_tensor*, ggml_tensor*>> pending;
+    pending.reserve(static_cast<size_t>(model->hparams.n_layer) * 3);
+    auto add_alias = [&](ggml_tensor* source) {
+        if (!source || !source->data || source->view_src || source->ne[0] <= 0 || source->ne[1] <= 0 ||
+            source->ne[2] != 1 || source->ne[3] != 1 || !IsQwen36SSMQ8ProjectionTensor(source)) {
+            return;
+        }
+        ggml_tensor* alias =
+            ggml_new_tensor_2d(model->ctx_qwen36_ssm_q8_prefill_amx, source->type, source->ne[0], source->ne[1]);
+        if (!alias) {
+            return;
+        }
+        const std::string name = std::string(source->name[0] ? source->name : "weight") + ".prefill_amx_scoped";
+        ggml_set_name(alias, name.c_str());
+        model->qwen36_ssm_q8_prefill_amx_aliases[source] = alias;
+        model->cpu_amx_aliases[alias] = true;
+        pending.emplace_back(source, alias);
+    };
+
+    for (auto& layer : model->layers) {
+        add_alias(layer.Get(model_keys::kAttnQkvWeight));
+        add_alias(layer.Get(model_keys::kAttnGate));
+        add_alias(layer.Get(model_keys::kSSMOut));
+    }
+    if (pending.empty()) {
+        ClearQwen36SSMQ8PrefillAMXAliasesImpl(model);
+        return false;
+    }
+
+    ggml_backend_buffer_t buffer =
+        ggml_backend_alloc_ctx_tensors_from_buft(model->ctx_qwen36_ssm_q8_prefill_amx, repack_bufts.cpu_amx);
+    if (!buffer) {
+        ClearQwen36SSMQ8PrefillAMXAliasesImpl(model);
+        return false;
+    }
+    model->qwen36_ssm_q8_prefill_amx_buffers.push_back(buffer);
+
+    bool ok = true;
+    for (const auto& item : pending) {
+        if (!item.first || !item.second || !item.second->extra) {
+            ok = false;
+            break;
+        }
+        ggml_backend_tensor_set(item.second, item.first->data, 0, ggml_nbytes(item.first));
+    }
+    if (!ok) {
+        ClearQwen36SSMQ8PrefillAMXAliasesImpl(model);
+        return false;
+    }
+    return true;
+#endif
+}
+
 void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
     if (!model || model->arch_flags.is_gemma4 || model->layers.empty()) {
         return;
@@ -400,15 +528,76 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
     std::vector<PendingAlias> pending_cpu_repack;
     pending_cpu_repack.reserve(model->layers.size() * 8);
     std::vector<PendingFusedAlias> pending_fused_cpu_repack;
+    auto is_qwen36_ssm_q8_projection = [&](const ggml_tensor* source) -> bool {
+        if (!source || source->type != GGML_TYPE_Q8_0 || !source->name[0]) {
+            return false;
+        }
+        const char* name = source->name;
+        return std::strstr(name, "attn_qkv.weight") || std::strstr(name, "attn_gate.weight") ||
+               std::strstr(name, "ssm_out.weight");
+    };
+    auto model_has_qwen36_ssm_q8_projection = [&]() -> bool {
+        if (model->variant != ModelVariant::QWEN36 || !model->arch_flags.is_hybrid_ssm) {
+            return false;
+        }
+        for (const auto& layer : model->layers) {
+            for (const char* key : {model_keys::kAttnQkvWeight, model_keys::kAttnGate, model_keys::kSSMOut}) {
+                if (is_qwen36_ssm_q8_projection(layer.Get(key))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
     std::vector<PendingAlias> pending_cpu_amx;
     pending_cpu_amx.reserve(model->layers.size() * 8);
     std::vector<PendingFusedAlias> pending_fused_cpu_amx;
+    const auto loader_config = densecore::llm::config::LoadFastPathRuntimeConfig();
+    const bool qwen36_has_ssm_q8_projection = model_has_qwen36_ssm_q8_projection();
+    const bool qwen36_ssm_q8_amx_alias_enabled =
+        model->variant == ModelVariant::QWEN36 && qwen36_has_ssm_q8_projection && repack_bufts.cpu_amx &&
+        loader_config.qwen36_ssm_q8_amx_alias != densecore::env::RuntimeToggleMode::Off;
+    const bool qwen36_ssm_q8_prefill_amx_requested =
+        model->variant == ModelVariant::QWEN36 && qwen36_has_ssm_q8_projection && repack_bufts.cpu_amx &&
+        loader_config.qwen36_ssm_q8_prefill_amx == densecore::llm::config::Qwen36SSMQ8PrefillAMXMode::On;
+    // C4 validation showed model-owned AMX aliases for the Qwen3.6 SSM Q8_0
+    // projections move long-prefill from ~101 to ~115 tok/s but also push
+    // single-token decode from ~25 to ~16 tok/s. Keep this fail-closed until
+    // the AMX storage is request/prefill-local or otherwise proven not to
+    // perturb decode residency/locality.
+    const bool qwen36_ssm_q8_prefill_amx_enabled = false;
+    const bool qwen36_expert_cpu_repack_enabled =
+        model->variant != ModelVariant::QWEN36 ||
+        loader_config.qwen36_expert_cpu_repack == densecore::env::RuntimeToggleMode::On ||
+        (loader_config.qwen36_expert_cpu_repack == densecore::env::RuntimeToggleMode::Auto &&
+         !qwen36_ssm_q8_amx_alias_enabled);
+    if (model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm) {
+        std::cout << "[DenseCore] Qwen3.6 fast-matmul alias policy: ssm_q8_amx="
+                  << (qwen36_ssm_q8_amx_alias_enabled ? "enabled" : "disabled")
+                  << ", ssm_q8_prefill_loader_alias="
+                  << (qwen36_ssm_q8_prefill_amx_enabled ? "enabled" : "disabled")
+                  << ", ssm_q8_prefill_scoped_amx="
+                  << (qwen36_ssm_q8_prefill_amx_requested ? "requested" : "disabled")
+                  << ", expert_cpu_repack=" << (qwen36_expert_cpu_repack_enabled ? "enabled" : "disabled")
+                  << ", ssm_q8_projection=" << (qwen36_has_ssm_q8_projection ? "present" : "absent")
+                  << std::endl;
+    }
 
     auto choose_alias_buffer = [&](const ggml_tensor* source, bool is_2d) -> ggml_backend_buffer_type_t {
         if (!source) {
             return nullptr;
         }
         if (model->variant == ModelVariant::QWEN36 && is_2d) {
+            // The Qwen3.6 UD-Q4_K_M GGUF stores SSM qkv/gate/out projections
+            // as Q8_0, so the Q4_K prefill probe is not applicable there. The
+            // load-time AMX alias remains an explicit experiment only because
+            // it is not phase-aware and can push single-token decode onto an
+            // unfavorable layout. The maintained Q8 prefill path prepares a
+            // scoped alias during prefill execution and clears it before decode.
+            if (qwen36_ssm_q8_amx_alias_enabled && is_qwen36_ssm_q8_projection(source)) {
+                return repack_bufts.cpu_amx;
+            }
             return nullptr;
         }
 #if !defined(__aarch64__) && !defined(_M_ARM64)
@@ -418,6 +607,9 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         }
 #endif
         if (model->arch_flags.is_hybrid_ssm) {
+            if (model->variant == ModelVariant::QWEN36 && !is_2d && !qwen36_expert_cpu_repack_enabled) {
+                return nullptr;
+            }
             if (!repack_bufts.cpu_repack || (!ggml_is_quantized(source->type) && source->type != GGML_TYPE_F16)) {
                 return nullptr;
             }
@@ -1352,6 +1544,14 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
 }
 }  // namespace
 
+void ClearQwen36SSMQ8PrefillAMXAliases(TransformerModel* model) {
+    ClearQwen36SSMQ8PrefillAMXAliasesImpl(model);
+}
+
+bool PrepareQwen36SSMQ8PrefillAMXAliasesForExecution(TransformerModel* model) {
+    return PrepareQwen36SSMQ8PrefillAMXAliasesForExecutionImpl(model);
+}
+
 bool IsMoELoaderDebugEnabled();
 bool IsQwen36MoEBindingDebugEnabled();
 
@@ -1368,6 +1568,8 @@ static TransformerModel* CreateMockModel() {
     std::cout << "[DenseCore] Initializing MOCK model..." << std::endl;
     TransformerModel* model = new TransformerModel();
     model->is_mock = true;
+    model->arch = ModelArch::LLAMA;
+    model->variant = ModelVariant::LLAMA;
     model->hparams.n_vocab = 32000;
     model->hparams.n_embd = 256;
     model->hparams.n_layer = 2;  // Small for mock
@@ -1381,6 +1583,12 @@ static TransformerModel* CreateMockModel() {
         std::string s = "t" + std::to_string(i);
         model->vocab_tokens.push_back(s);
         model->token_to_id[s] = i;
+    }
+    for (int c = 1; c < 128; ++c) {
+        const int id = c;
+        std::string s(1, static_cast<char>(c));
+        model->vocab_tokens[static_cast<size_t>(id)] = s;
+        model->token_to_id[s] = id;
     }
 
     // Initialize backend
@@ -1973,12 +2181,15 @@ TransformerModel* LoadGGUFModel(const char* path) {
         get_u32("embedding_length_per_layer_input", tmp_u32);
         model->gemma4_hidden_size_per_layer_input = static_cast<int>(tmp_u32);
 
-        float gemma4_attention_logit_cap = 0.0f;
-        if (has_key("attention_logit_cap")) {
+        float gemma4_attention_logit_cap = 50.0f;
+        const bool has_attention_logit_cap = has_key("attention_logit_cap");
+        if (has_attention_logit_cap) {
             get_f32("attention_logit_cap", gemma4_attention_logit_cap);
         }
         model->gemma4_attention_logit_softcapping =
-            densecore::models::SanitizeAttentionLogitSoftcapForLoad(model, gemma4_attention_logit_cap);
+            (has_attention_logit_cap && gemma4_attention_logit_cap == 0.0f)
+                ? 0.0f
+                : densecore::models::SanitizeAttentionLogitSoftcapForLoad(model, gemma4_attention_logit_cap);
         get_f32("final_logit_softcapping", model->gemma4_final_logit_softcapping);
 
         std::vector<uint8_t> sliding_pattern;

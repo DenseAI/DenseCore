@@ -429,6 +429,8 @@ public:
         uint64_t rowblock_ns = 0;
         uint64_t rowblock_w1w3_ns = 0;
         uint64_t rowblock_w2_ns = 0;
+        uint64_t decode_scratch_reused = 0;
+        uint64_t decode_allocations_avoided = 0;
         int rowblock_used = 0;
         int rowblock_tasks = 0;
     };

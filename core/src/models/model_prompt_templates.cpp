@@ -270,11 +270,10 @@ void AppendQwenAssistantGenerationCue(const TransformerModel* model, bool thinki
     }
     const auto& descriptor = DescribeModel(model);
     if (descriptor.variant == ModelVariant::QWEN36) {
-        // Qwen3.6 GGUF chat templates do not support the older /no_think
-        // directive. Only prime the reasoning channel when thinking is enabled;
-        // no-thinking mode must leave the assistant cue clean for suppression.
         if (thinking_enabled) {
             out->append("<think>\n");
+        } else {
+            out->append("<think>\n\n</think>\n");
         }
         return;
     }
@@ -353,7 +352,7 @@ PromptTemplateProfile ResolveModelPromptTemplateProfile(const TransformerModel* 
         profile.assistant_role = "model";
         profile.supports_thinking = DescribeModel(model).supports_thinking;
         profile.thinking_enabled =
-            DescribeModel(model).supports_thinking ? ParseBoolEnv("DENSECORE_GEMMA4_ENABLE_THINKING", false) : false;
+            DescribeModel(model).supports_thinking ? ParseBoolEnv("DENSECORE_GEMMA4_ENABLE_THINKING", true) : false;
         return profile;
     }
 
@@ -480,6 +479,9 @@ void ConfigureGemma4TextTokenBlocklistForModel(const TransformerModel* model, Re
     }
 
     for (const auto& [token, token_id] : model->token_to_id) {
+        if (IsGemma4GenerationChannelToken(token)) {
+            continue;
+        }
         if (IsGemma4LikelyControlToken(token) && !is_stop_id(token_id)) {
             AppendDisallowedTokenId(req, token_id);
         }
@@ -540,7 +542,12 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         wrapped += profile.assistant_role;
         wrapped += "\n";
         if (profile.supports_thinking) {
-            AppendQwenAssistantGenerationCue(model, profile.thinking_enabled, &wrapped);
+            const auto& descriptor = DescribeModel(model);
+            if (profile.thinking_enabled) {
+                wrapped += "<think>\n";
+            } else if (descriptor.variant == ModelVariant::QWEN35) {
+                wrapped += "<think>\n\n</think>\n\n";
+            }
         }
         return wrapped;
     }
@@ -559,7 +566,10 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         std::string wrapped;
         wrapped.reserve(prompt.size() + 104);
         wrapped += "<bos>";
-        if (profile.supports_thinking && profile.thinking_enabled) {
+        bool gemma4_thinking_env = false;
+        bool gemma4_thinking_explicit = TryParseBoolEnv("DENSECORE_GEMMA4_ENABLE_THINKING", &gemma4_thinking_env);
+        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking &&
+            gemma4_thinking_explicit && gemma4_thinking_env) {
             wrapped += profile.open_tag;
             wrapped += profile.system_role;
             wrapped += "\n<|think|>\n";
@@ -574,7 +584,7 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         wrapped += profile.assistant_role;
         wrapped += "\n";
         if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking &&
-            !profile.thinking_enabled) {
+            !(gemma4_thinking_explicit && gemma4_thinking_env)) {
             wrapped += "<|channel>thought\n<channel|>";
         }
         return wrapped;
@@ -709,8 +719,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
         rendered += profile.open_tag;
         rendered += profile.assistant_role;
         rendered += "\n";
-        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking &&
-            !thinking_enabled) {
+        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking && thinking_enabled) {
             rendered += "<|channel>thought\n<channel|>";
         }
         return rendered;

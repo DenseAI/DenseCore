@@ -187,7 +187,8 @@ public:
      */
     int AddRequest(int request_id, int prompt_len, int max_output_len, int priority = 100,
                    const std::vector<int>* prefix_tokens = nullptr, bool allow_chunked_prefill = true,
-                   bool require_hybrid_ssm_prefix_snapshot = false, int max_prefill_chunk_tokens = -1);
+                   bool require_hybrid_ssm_prefix_snapshot = false, int max_prefill_chunk_tokens = -1,
+                   const BlockManager::HybridSSMSnapshotValidator& hybrid_ssm_snapshot_validator = {});
 
     /**
      * Remove a request (cancel or complete)

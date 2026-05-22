@@ -235,7 +235,7 @@ TEST(MoETrace, Qwen36SmallDecodeExpertParallelAutoPolicyTargetsC4AShape) {
         true, 32, static_cast<int>(SimdLevel::SVE)));
     EXPECT_FALSE(densecore::testing::ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(
         true, 8, static_cast<int>(SimdLevel::SVE2)));
-    EXPECT_FALSE(densecore::testing::ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(
+    EXPECT_TRUE(densecore::testing::ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(
         true, 16, static_cast<int>(SimdLevel::AVX512)));
     EXPECT_FALSE(densecore::testing::ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(
         false, 16, static_cast<int>(SimdLevel::SVE2)));
@@ -248,7 +248,7 @@ TEST(MoETrace, Gemma4SmallDecodeExpertParallelAutoPolicyTargetsC4AShape) {
         16, static_cast<int>(SimdLevel::SVE2)));
     EXPECT_FALSE(densecore::testing::ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(
         8, static_cast<int>(SimdLevel::SVE2)));
-    EXPECT_FALSE(densecore::testing::ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(
+    EXPECT_TRUE(densecore::testing::ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(
         16, static_cast<int>(SimdLevel::AVX512)));
 }
 

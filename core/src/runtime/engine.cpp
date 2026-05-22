@@ -37,6 +37,7 @@
 #include "llm/config/runtime_config.h"
 #include "models/model_prompt_templates.h"
 #include "runtime/engine_internal.h"
+#include "runtime/worker_internal.h"
 
 #ifdef __APPLE__
 static void ConfigureHybridScheduler(EngineState* state, TransformerModel* model) {
@@ -1408,7 +1409,8 @@ static int SubmitRequestIdsWithSamplingConstraintsImpl(DenseCoreHandle handle, c
                                                        int allowed_token_ids_strict, const int* disallowed_token_ids,
                                                        int num_disallowed_token_ids, TokenCallback callback,
                                                        TokenCallbackEx callback_ex, void* user_data,
-                                                       const char* error_context) {
+                                                       const char* rendered_prompt, bool tokens_already_snapshot_primed,
+                                                       const char* submit_api, const char* error_context) {
     if (!handle || !tokens || n_tokens <= 0) {
         SetError(DENSECORE_STATUS_INVALID_ARGUMENT, std::string(error_context) + ": invalid arguments");
         return DENSECORE_STATUS_INVALID_ARGUMENT;
@@ -1417,7 +1419,8 @@ static int SubmitRequestIdsWithSamplingConstraintsImpl(DenseCoreHandle handle, c
 
     Request* req = AcquireAndInitRequest(state);
     req->lora_name = lora_name ? lora_name : "";
-    req->parity_debug_submit_api = "SubmitRequestIdsWithSamplingConstraintsEx";
+    req->parity_debug_submit_api = submit_api ? submit_api : "SubmitRequestIdsWithSamplingConstraintsEx";
+    req->token_id_submit_used = true;
 
     InitCommonRequest(state, req, max_tokens, temperature, top_p, top_k, repetition_penalty, stop_sequences, json_mode,
                       callback, user_data, callback_ex);
@@ -1426,10 +1429,24 @@ static int SubmitRequestIdsWithSamplingConstraintsImpl(DenseCoreHandle handle, c
     req->tokens.assign(tokens, tokens + n_tokens);
     ModelEntry* model_entry = state->GetDefaultModel();
     if (model_entry && model_entry->model) {
-        const std::vector<int> ids_tokens_before_priming = req->tokens;
-        MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
-        req->parity_debug_token_primed = (req->tokens != ids_tokens_before_priming);
+        if (rendered_prompt && rendered_prompt[0] != '\0') {
+            // The Go chat path has already rendered and tokenized this prompt
+            // via DenseCoreBuildRenderedRequestSnapshot. Keep that text on the
+            // request for prompt-state decisions, but never re-template or
+            // re-tokenize it here.
+            req->prompt = rendered_prompt;
+            InitializePromptSuppressionState(req);
+            ConfigurePromptSuppressionForModel(model_entry->model.get(), req);
+            req->parity_debug_template_applied = false;
+            req->parity_debug_text_primed = false;
+        }
+        if (!tokens_already_snapshot_primed) {
+            const std::vector<int> ids_tokens_before_priming = req->tokens;
+            MaybePrimeQwenNoThinking(model_entry->model.get(), &req->tokens);
+            req->parity_debug_token_primed = (req->tokens != ids_tokens_before_priming);
+        }
         ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
+        densecore::models::ConfigureQwen36TextTokenBlocklistForModel(model_entry->model.get(), req);
         ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
         if ((allowed_token_ids && num_allowed_token_ids > 0) ||
             (disallowed_token_ids && num_disallowed_token_ids > 0)) {
@@ -1439,6 +1456,7 @@ static int SubmitRequestIdsWithSamplingConstraintsImpl(DenseCoreHandle handle, c
             ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
         }
         DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "ids_sampling");
+        LogRequestRuntimePath(state, model_entry->model.get(), req->prompt.c_str(), req);
     }
     req->token_history = req->tokens;
 
@@ -1457,7 +1475,9 @@ int SubmitRequestIdsWithSamplingConstraintsEx(DenseCoreHandle handle, const int*
     return SubmitRequestIdsWithSamplingConstraintsImpl(
         handle, tokens, n_tokens, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty, stop_sequences,
         json_mode, allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict, disallowed_token_ids,
-        num_disallowed_token_ids, callback, nullptr, user_data, "SubmitRequestIdsWithSamplingConstraintsEx");
+        num_disallowed_token_ids, callback, nullptr, user_data, /*rendered_prompt=*/nullptr,
+        /*tokens_already_snapshot_primed=*/false, "SubmitRequestIdsWithSamplingConstraintsEx",
+        "SubmitRequestIdsWithSamplingConstraintsEx");
 }
 
 int SubmitRequestIdsWithSamplingConstraintsCallbackEx(DenseCoreHandle handle, const int* tokens, int n_tokens,
@@ -1471,7 +1491,28 @@ int SubmitRequestIdsWithSamplingConstraintsCallbackEx(DenseCoreHandle handle, co
     return SubmitRequestIdsWithSamplingConstraintsImpl(
         handle, tokens, n_tokens, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty, stop_sequences,
         json_mode, allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict, disallowed_token_ids,
-        num_disallowed_token_ids, nullptr, callback, user_data, "SubmitRequestIdsWithSamplingConstraintsCallbackEx");
+        num_disallowed_token_ids, nullptr, callback, user_data, /*rendered_prompt=*/nullptr,
+        /*tokens_already_snapshot_primed=*/false, "SubmitRequestIdsWithSamplingConstraintsCallbackEx",
+        "SubmitRequestIdsWithSamplingConstraintsCallbackEx");
+}
+
+int SubmitRenderedRequestIdsWithSamplingConstraintsCallbackEx(
+    DenseCoreHandle handle, const char* rendered_prompt, const int* tokens, int n_tokens, int max_tokens,
+    const char* lora_name, float temperature, float top_p, int top_k, float repetition_penalty,
+    const char** stop_sequences, int json_mode, const int* allowed_token_ids, int num_allowed_token_ids,
+    int allowed_token_ids_strict, const int* disallowed_token_ids, int num_disallowed_token_ids,
+    TokenCallbackEx callback, void* user_data) {
+    if (!rendered_prompt || rendered_prompt[0] == '\0') {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT,
+                 "SubmitRenderedRequestIdsWithSamplingConstraintsCallbackEx: rendered_prompt is required");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+    return SubmitRequestIdsWithSamplingConstraintsImpl(
+        handle, tokens, n_tokens, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty, stop_sequences,
+        json_mode, allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict, disallowed_token_ids,
+        num_disallowed_token_ids, nullptr, callback, user_data, rendered_prompt,
+        /*tokens_already_snapshot_primed=*/true, "SubmitRenderedRequestIdsWithSamplingConstraintsCallbackEx",
+        "SubmitRenderedRequestIdsWithSamplingConstraintsCallbackEx");
 }
 
 int SubmitBatchEmbeddingRequest(DenseCoreHandle handle, const char** prompts, int num_prompts, int pooling_type,
@@ -1592,6 +1633,51 @@ DenseCoreSubmitPath ResolveSubmitPathForPreview(bool token_ids, bool json_mode, 
     }
     return sampling ? DENSECORE_SUBMIT_PATH_TEXT_WITH_SAMPLING : DENSECORE_SUBMIT_PATH_TEXT;
 }
+
+char* CopyCStringOwned(const std::string& value) {
+    if (value.empty()) {
+        return nullptr;
+    }
+    void* raw = std::malloc(value.size() + 1);
+    if (!raw) {
+        return nullptr;
+    }
+    char* out = static_cast<char*>(raw);
+    std::memcpy(out, value.data(), value.size());
+    out[value.size()] = '\0';
+    return out;
+}
+
+int* CopyTokenIdsOwned(const std::vector<int>& ids) {
+    if (ids.empty()) {
+        return nullptr;
+    }
+    void* raw = std::malloc(sizeof(int) * ids.size());
+    if (!raw) {
+        return nullptr;
+    }
+    int* out = static_cast<int*>(raw);
+    std::memcpy(out, ids.data(), sizeof(int) * ids.size());
+    return out;
+}
+
+void FillSnapshotMetadata(DenseCoreRequestSnapshot* out, const TransformerModel* model, DenseCoreSubmitPath path,
+                          float temperature, float top_p, int top_k, float repetition_penalty, int json_mode,
+                          bool template_applied, bool text_primed, bool token_primed) {
+    out->submit_path = path;
+    out->temperature = temperature;
+    out->top_p = top_p;
+    out->top_k = top_k;
+    out->repetition_penalty = repetition_penalty;
+    out->json_mode = json_mode != 0 ? 1 : 0;
+    out->template_applied = template_applied ? 1 : 0;
+    out->text_primed = text_primed ? 1 : 0;
+    out->token_primed = token_primed ? 1 : 0;
+    out->tokenizer_type = (model && !model->tokenizer_type.empty()) ? model->tokenizer_type.c_str() : nullptr;
+    out->model_variant = g_rendered_model_variant.empty() ? nullptr : g_rendered_model_variant.c_str();
+    out->prompt_family = g_rendered_prompt_family.empty() ? nullptr : g_rendered_prompt_family.c_str();
+    out->caller_owns_buffers = 0;
+}
 }  // namespace
 
 int DenseCoreRenderChatPrompt(DenseCoreHandle handle, const DenseCoreChatMessage* messages, int num_messages,
@@ -1672,14 +1758,13 @@ int DenseCorePreviewTextRequest(DenseCoreHandle handle, const char* prompt, int 
     out->token_ids = g_preview_token_ids.empty() ? nullptr : g_preview_token_ids.data();
     out->num_token_ids = static_cast<int>(g_preview_token_ids.size());
     out->submit_path = ResolveSubmitPathForPreview(false, json_mode != 0, true);
-    out->temperature = temperature;
-    out->top_p = top_p;
-    out->top_k = top_k;
-    out->repetition_penalty = repetition_penalty;
-    out->json_mode = json_mode != 0 ? 1 : 0;
-    out->template_applied = template_applied ? 1 : 0;
-    out->text_primed = text_primed ? 1 : 0;
-    out->token_primed = token_primed ? 1 : 0;
+    const auto descriptor = densecore::models::DescribeModel(entry->model.get());
+    g_rendered_model_variant = densecore::models::ModelVariantName(descriptor.variant);
+    g_rendered_prompt_family =
+        densecore::models::PromptTemplateFamilyName(densecore::models::ResolvePromptTemplateFamily(entry->model.get()));
+    FillSnapshotMetadata(out, entry->model.get(), ResolveSubmitPathForPreview(false, json_mode != 0, true),
+                         temperature, top_p, top_k, repetition_penalty, json_mode, template_applied, text_primed,
+                         token_primed);
     ClearError();
     return DENSECORE_STATUS_OK;
 }
@@ -1709,15 +1794,165 @@ int DenseCorePreviewTokenRequest(DenseCoreHandle handle, const int* token_ids, i
     out->rendered_prompt = nullptr;
     out->token_ids = g_preview_token_ids.data();
     out->num_token_ids = static_cast<int>(g_preview_token_ids.size());
-    out->submit_path = ResolveSubmitPathForPreview(true, json_mode != 0, true);
+    const auto descriptor = densecore::models::DescribeModel(entry->model.get());
+    g_rendered_model_variant = densecore::models::ModelVariantName(descriptor.variant);
+    g_rendered_prompt_family =
+        densecore::models::PromptTemplateFamilyName(densecore::models::ResolvePromptTemplateFamily(entry->model.get()));
+    FillSnapshotMetadata(out, entry->model.get(), ResolveSubmitPathForPreview(true, json_mode != 0, true), temperature,
+                         top_p, top_k, repetition_penalty, json_mode, false, false, token_primed);
+    ClearError();
+    return DENSECORE_STATUS_OK;
+}
+
+namespace {
+
+int BuildRequestSnapshotImpl(DenseCoreHandle handle, const char* prompt, int max_tokens, float temperature,
+                             float top_p, int top_k, float repetition_penalty, int json_mode,
+                             bool input_already_rendered, DenseCoreRequestSnapshot* out) {
+    (void)max_tokens;
+    if (!handle || !prompt || !out) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCoreBuildRequestSnapshot: invalid arguments");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+    *out = DenseCoreRequestSnapshot{};
+
+    EngineState* state = (EngineState*)handle;
+    ModelEntry* entry = state->GetDefaultModel();
+    if (!entry || !entry->model) {
+        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "DenseCoreBuildRequestSnapshot: no model loaded");
+        return DENSECORE_STATUS_MODEL_LOAD_FAILED;
+    }
+
+    std::string rendered_prompt = input_already_rendered ? std::string(prompt)
+                                                         : MaybeApplyAutoChatTemplate(entry->model.get(), prompt);
+    const bool template_applied = !input_already_rendered && rendered_prompt != prompt;
+    const std::string before_text_priming = rendered_prompt;
+    if (!input_already_rendered) {
+        MaybePrimeQwenNoThinkingPromptText(entry->model.get(), &rendered_prompt);
+    }
+    const bool text_primed = rendered_prompt != before_text_priming;
+    std::vector<int> token_ids = Tokenizer::Tokenize(entry->model.get(), rendered_prompt,
+                                                     ResolveAddBosForPrompt(entry->model.get(), rendered_prompt));
+    const std::vector<int> before_token_priming = token_ids;
+    if (!input_already_rendered) {
+        MaybePrimeQwenNoThinking(entry->model.get(), &token_ids);
+    }
+    const bool token_primed = token_ids != before_token_priming;
+
+    const auto descriptor = densecore::models::DescribeModel(entry->model.get());
+    const std::string variant = densecore::models::ModelVariantName(descriptor.variant);
+    const std::string prompt_family =
+        densecore::models::PromptTemplateFamilyName(densecore::models::ResolvePromptTemplateFamily(entry->model.get()));
+
+    char* owned_prompt = CopyCStringOwned(rendered_prompt);
+    int* owned_tokens = CopyTokenIdsOwned(token_ids);
+    char* owned_tokenizer = CopyCStringOwned(entry->model->tokenizer_type);
+    char* owned_variant = CopyCStringOwned(variant);
+    char* owned_family = CopyCStringOwned(prompt_family);
+    if (!owned_prompt || (!token_ids.empty() && !owned_tokens)) {
+        std::free(owned_prompt);
+        std::free(owned_tokens);
+        std::free(owned_tokenizer);
+        std::free(owned_variant);
+        std::free(owned_family);
+        SetError(DENSECORE_STATUS_OUT_OF_MEMORY, "DenseCoreBuildRequestSnapshot: allocation failed");
+        return DENSECORE_STATUS_OUT_OF_MEMORY;
+    }
+
+    out->rendered_prompt = owned_prompt;
+    out->token_ids = owned_tokens;
+    out->num_token_ids = static_cast<int>(token_ids.size());
+    out->submit_path = ResolveSubmitPathForPreview(false, json_mode != 0, true);
     out->temperature = temperature;
     out->top_p = top_p;
     out->top_k = top_k;
     out->repetition_penalty = repetition_penalty;
     out->json_mode = json_mode != 0 ? 1 : 0;
-    out->template_applied = 0;
-    out->text_primed = 0;
+    out->template_applied = template_applied ? 1 : 0;
+    out->text_primed = text_primed ? 1 : 0;
     out->token_primed = token_primed ? 1 : 0;
+    out->tokenizer_type = owned_tokenizer;
+    out->model_variant = owned_variant;
+    out->prompt_family = owned_family;
+    out->caller_owns_buffers = 1;
+    ClearError();
+    return DENSECORE_STATUS_OK;
+}
+}  // namespace
+
+int DenseCoreBuildRequestSnapshot(DenseCoreHandle handle, const char* prompt, int max_tokens, float temperature,
+                                  float top_p, int top_k, float repetition_penalty, int json_mode,
+                                  DenseCoreRequestSnapshot* out) {
+    return BuildRequestSnapshotImpl(handle, prompt, max_tokens, temperature, top_p, top_k, repetition_penalty,
+                                    json_mode, /*input_already_rendered=*/false, out);
+}
+
+int DenseCoreBuildRenderedRequestSnapshot(DenseCoreHandle handle, const char* rendered_prompt, int max_tokens,
+                                          float temperature, float top_p, int top_k, float repetition_penalty,
+                                          int json_mode, DenseCoreRequestSnapshot* out) {
+    return BuildRequestSnapshotImpl(handle, rendered_prompt, max_tokens, temperature, top_p, top_k,
+                                    repetition_penalty, json_mode, /*input_already_rendered=*/true, out);
+}
+
+void DenseCoreFreeRequestSnapshot(DenseCoreRequestSnapshot* snapshot) {
+    if (!snapshot) {
+        return;
+    }
+    if (snapshot->caller_owns_buffers != 0) {
+        std::free(const_cast<char*>(snapshot->rendered_prompt));
+        std::free(const_cast<int*>(snapshot->token_ids));
+        std::free(const_cast<char*>(snapshot->tokenizer_type));
+        std::free(const_cast<char*>(snapshot->model_variant));
+        std::free(const_cast<char*>(snapshot->prompt_family));
+    }
+    *snapshot = DenseCoreRequestSnapshot{};
+}
+
+int DenseCoreGetRuntimeOptimizationState(DenseCoreHandle handle, DenseCoreRuntimeOptimizationState* out) {
+    if (!handle || !out) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCoreGetRuntimeOptimizationState: invalid arguments");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out = DenseCoreRuntimeOptimizationState{};
+    out->struct_size = static_cast<int>(sizeof(DenseCoreRuntimeOptimizationState));
+
+    EngineState* state = static_cast<EngineState*>(handle);
+    const ModelEntry* entry = state->GetDefaultModel();
+    const TransformerModel* model = (entry && entry->model) ? entry->model.get() : nullptr;
+    const auto& config = ResolveFastPathRuntimeConfig(state);
+    const bool graph_reuse_globally_enabled = !config.worker.graph_cache_reuse_disabled;
+    const bool prefill_graph_model_eligible =
+        model && model->hparams.n_experts == 0 && !model->arch_flags.is_hybrid_ssm;
+    const bool prefill_arena_model_eligible = model && model->arch_flags.is_gemma4;
+    out->token_id_submit_supported = 1;
+    out->prefix_cache_reuse_enabled = config.worker.prefix_cache_reuse_disabled ? 0 : 1;
+    out->hybrid_ssm_snapshot_restore_enabled = config.worker.hybrid_ssm_snapshot_restore_disabled ? 0 : 1;
+    out->prefill_graph_cache_enabled =
+        (config.prefill_graph_cache.enabled && graph_reuse_globally_enabled && prefill_graph_model_eligible) ? 1 : 0;
+    // The maintained Gemma4 safety lane keeps graph topology reuse fail-closed.
+    // Arena/context reuse is the safe prefill optimization represented by the
+    // same graph-cache disable gate until the dedicated arena pool grows a
+    // separate runtime knob.
+    out->prefill_arena_reuse_enabled = (graph_reuse_globally_enabled && prefill_arena_model_eligible) ? 1 : 0;
+    out->decode_graph_cache_enabled = (IsDecodeGraphCacheEnabled() && graph_reuse_globally_enabled) ? 1 : 0;
+    out->decode_graph_cache_max_batch = DecodeGraphCacheMaxBatch();
+    out->decode_graph_cache_lru_size = DecodeGraphCacheLruSize();
+    out->moe_dequant_cache_mb = []() -> int {
+        const char* env = std::getenv("DENSECORE_MOE_DEQUANT_CACHE_MB");
+        if (!env || *env == '\0') {
+            return 512;
+        }
+        char* end = nullptr;
+        const long parsed = std::strtol(env, &end, 10);
+        if (end == env || *end != '\0' || parsed < 0) {
+            return 512;
+        }
+        return static_cast<int>(std::min<long>(parsed, std::numeric_limits<int>::max()));
+    }();
+
+    const char* label = UseLegacyDecodeThreadPolicy() ? "legacy_decode_thread_policy" : "model_aware_thread_policy";
+    std::snprintf(out->active_thread_policy_label, sizeof(out->active_thread_policy_label), "%s", label);
     ClearError();
     return DENSECORE_STATUS_OK;
 }
@@ -2754,6 +2989,10 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
     // Add to pool
     {
         std::lock_guard<std::mutex> lock(state->models_mu);
+        auto old = state->models.find(model_id);
+        if (old != state->models.end() && old->second && old->second->model) {
+            ClearQ4KCopiedGemvExperimentCacheForModel(reinterpret_cast<uintptr_t>(old->second->model.get()));
+        }
         state->models[model_id] = std::move(entry);
 
         // Set as default if no default exists
@@ -2787,7 +3026,9 @@ int UnloadModel(DenseCoreHandle handle, const char* model_id) {
         return DENSECORE_STATUS_INVALID_ARGUMENT;  // Cannot unload last model
     }
 
-    // Smart pointers automatically cleanup when erased
+    if (it->second && it->second->model) {
+        ClearQ4KCopiedGemvExperimentCacheForModel(reinterpret_cast<uintptr_t>(it->second->model.get()));
+    }
     state->models.erase(it);
 
     // Update default if needed

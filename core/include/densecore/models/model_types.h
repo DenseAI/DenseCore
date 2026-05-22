@@ -633,6 +633,12 @@ struct TransformerModel {
     std::vector<ggml_backend_buffer_t> cpu_repack_buffers;
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_repack_aliases;
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_decode_repack_aliases;
+    // Scoped Qwen3.6 SSM prefill-only AMX aliases. They are prepared only for
+    // a prefill execution and cleared before decode so the canonical Q8_0 GGUF
+    // tensors remain the decode-visible representation.
+    struct ggml_context* ctx_qwen36_ssm_q8_prefill_amx = nullptr;
+    std::vector<ggml_backend_buffer_t> qwen36_ssm_q8_prefill_amx_buffers;
+    std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> qwen36_ssm_q8_prefill_amx_aliases;
     std::unordered_map<const struct ggml_tensor*, bool> cpu_amx_aliases;
 
     // FP8 format variants for custom packed INT8 tensor storage.

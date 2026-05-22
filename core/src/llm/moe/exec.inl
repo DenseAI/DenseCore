@@ -1021,6 +1021,10 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
         AddQwen36ProfileNs(ud->profile->moe_rowblock_ns, moe_profile.rowblock_ns);
         AddQwen36ProfileNs(ud->profile->moe_rowblock_w1w3_ns, moe_profile.rowblock_w1w3_ns);
         AddQwen36ProfileNs(ud->profile->moe_rowblock_w2_ns, moe_profile.rowblock_w2_ns);
+        ud->profile->moe_decode_scratch_reused.fetch_add(moe_profile.decode_scratch_reused,
+                                                         std::memory_order_relaxed);
+        ud->profile->moe_decode_allocations_avoided.fetch_add(moe_profile.decode_allocations_avoided,
+                                                              std::memory_order_relaxed);
         SetQwen36ProfileMax(ud->profile->moe_rowblock_used, moe_profile.rowblock_used);
         SetQwen36ProfileMax(ud->profile->moe_rowblock_tasks, moe_profile.rowblock_tasks);
     }

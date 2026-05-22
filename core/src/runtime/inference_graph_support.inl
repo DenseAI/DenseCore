@@ -1952,8 +1952,6 @@ KVUpdateGatherUserData* GetKVUpdateGatherUserData(int layer, bool is_k);
 // The tensor name (e.g., "blk.0.attn_q") identifies which layer weights to use.
 // ============================================================================
 
-static const BatchSpec* GetCurrentBatch();
-
 /**
  * @brief GGML callback for Multi-LoRA application during inference.
  *
@@ -2096,6 +2094,8 @@ struct GemvUserData {
     int slot_id = -1;
     uint8_t* quant_input_shared = nullptr;
     std::atomic<uint64_t>* quantized_stamp = nullptr;
+    uintptr_t model_identity = 0;
+    bool dynamic_lora_active = false;
 };
 
 struct GemvBatchedUserData {
@@ -2110,21 +2110,40 @@ struct GemvBatchedUserData {
     size_t quant_row_stride = 0;  // Pre-computed aligned row stride for quantized input
     uint8_t* quant_input_shared = nullptr;
     std::atomic<uint64_t>* quantized_stamp = nullptr;
+    InferenceWorkContext* work_ctx = nullptr;
+    uint64_t qwen36_prefill_q4k_admission_key = 0;
+    bool qwen36_prefill_q4k_probe = false;
+    bool qwen36_prefill_q4k_admitted = false;
+    std::atomic<int> qwen36_prefill_q4k_probe_done{0};
+    std::atomic<int> qwen36_prefill_q4k_probe_failures{0};
+    std::atomic<int> qwen36_prefill_q4k_probe_internal_errors{0};
+    std::atomic<uint32_t> qwen36_prefill_q4k_probe_max_abs_error_bits{0};
 };
 
 inline int ResolvePagedAttentionDecodeHeadTile(int n_head, int n_tokens, int n_tasks) {
-    const int configured_head_tile = std::max(1, ParsePositiveEnvInt("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", 8));
+    bool env_set = false;
+    const int configured_head_tile =
+        std::max(1, densecore::llm::config::ReadPositiveIntEnv("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", 8, &env_set));
     if (n_head <= 0 || n_tokens <= 0 || n_tasks <= 0) {
         return configured_head_tile;
     }
+    if (env_set) {
+        return configured_head_tile;
+    }
 
-    // For latency-sensitive decode (batch 1-4), expose enough head tiles to keep
-    // CPU workers occupied. The historical fixed tile=8 leaves batch=1 with only
-    // four tasks on 32-head Qwen models, which strands cores during decode.
+    if (n_tokens == 1) {
+        const int active_threads = std::max(1, n_tasks);
+        const int target_tasks = std::min(n_head, std::max(active_threads, active_threads * 2));
+        int adaptive_head_tile = std::max(1, (n_head + std::max(1, target_tasks) - 1) / std::max(1, target_tasks));
+        if (n_head <= active_threads / 2) {
+            adaptive_head_tile = std::max(adaptive_head_tile, 2);
+        }
+        return std::clamp(adaptive_head_tile, 1, 8);
+    }
     if (n_tokens <= 4) {
         const int target_tiles_per_token = std::max(1, (n_tasks + n_tokens - 1) / n_tokens);
         const int adaptive_head_tile = std::max(1, (n_head + target_tiles_per_token - 1) / target_tiles_per_token);
-        return std::min(configured_head_tile, std::max(1, adaptive_head_tile));
+        return std::clamp(adaptive_head_tile, 1, 8);
     }
     return configured_head_tile;
 }
