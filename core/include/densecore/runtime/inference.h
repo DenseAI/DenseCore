@@ -138,6 +138,30 @@ struct InferenceDependencies {
 static constexpr std::size_t kDecodePagedFallbackReasonCount = 16;
 static constexpr std::size_t kHybridSSMDispatchWeightCount = 4;
 static constexpr std::size_t kHybridSSMDispatchPathCount = 5;
+static constexpr std::size_t kMatmulWeightTypeHistCount = 7;
+static constexpr std::size_t kMatmulQuantInputTypeHistCount = 4;
+static constexpr std::size_t kMatmulPathHistCount = 7;
+static constexpr std::size_t kMatmulDispatchTopSlowCount = 10;
+static constexpr std::size_t kMatmulTopShapeCount = 8;
+
+struct MatmulDispatchCensusEntry {
+    std::string phase;
+    std::string dispatch_path;
+    std::string weight_type;
+    std::string shape_bucket;
+    uint64_t wall_ns = 0;
+    uint64_t ops = 0;
+};
+
+struct MatmulShapeCensusEntry {
+    std::string phase;
+    std::string dispatch_path;
+    std::string weight_type;
+    std::string shape_bucket;
+    std::string left_name;
+    std::string right_name;
+    uint64_t ops = 0;
+};
 
 struct DecodeRuntimeStatsSnapshot {
     uint64_t path_total = 0;
@@ -219,6 +243,7 @@ struct Qwen36ProfileSnapshot {
     uint64_t moe_reduce_ns = 0;
     uint64_t moe_w1w3_ns = 0;
     uint64_t moe_w2_ns = 0;
+    uint64_t native_moe_graph_ns = 0;
     uint64_t moe_rowblock_ns = 0;
     uint64_t moe_rowblock_w1w3_ns = 0;
     uint64_t moe_rowblock_w2_ns = 0;
@@ -240,6 +265,13 @@ struct Qwen36ProfileSnapshot {
     uint64_t q4k_repacked_gemv_cache_hits = 0;
     uint64_t q4k_repacked_gemv_cache_waited_hits = 0;
     uint64_t q4k_repacked_gemv_cache_misses = 0;
+    uint64_t q4k_repacked_gemv_cache_evictions = 0;
+    uint64_t q4k_repacked_gemv_cache_evicted_bytes = 0;
+    uint64_t q4k_repacked_gemv_repack_bytes = 0;
+    uint64_t q4k_repacked_gemv_probe_ns = 0;
+    uint64_t q4k_repacked_gemv_resident_bytes = 0;
+    uint64_t q4k_repacked_gemv_distinct_weights_seen = 0;
+    uint64_t q4k_repacked_gemv_repeated_repack_count = 0;
     uint64_t q4k_copied_gemv_experiment_cache_hits = 0;
     uint64_t q4k_copied_gemv_experiment_cache_misses = 0;
     uint64_t qact_cache_hits = 0;
@@ -269,9 +301,103 @@ struct Qwen36ProfileSnapshot {
     uint64_t qwen36_ssm_q8_prefill_amx_qkv_count = 0;
     uint64_t qwen36_ssm_q8_prefill_amx_gate_count = 0;
     uint64_t qwen36_ssm_q8_prefill_amx_out_count = 0;
+    uint64_t qwen36_ssm_q8_prefill_amx_candidate_ops = 0;
+    uint64_t qwen36_ssm_q8_prefill_amx_used_ops = 0;
+    uint64_t qwen36_ssm_q8_prefill_amx_rejected_ops = 0;
     int qwen36_ssm_q8_decode_used_original_q8_path = 0;
+    std::array<uint64_t, kMatmulWeightTypeHistCount> qwen36_ssm_projection_weight_type_hist{};
     int q4k_repacked_gemv_used = 0;
+    uint64_t q4k_repacked_gemv_seen_ops = 0;
+    uint64_t q4k_repacked_gemv_candidate_ops = 0;
+    uint64_t q4k_repacked_gemv_used_ops = 0;
+    uint64_t q4k_repacked_gemv_rejected_ops = 0;
     int q4k_repacked_gemv_last_reject_reason = 0;
+    int q4k_repacked_gemv_primary_disable_reason = 0;
+    uint64_t gemv_custom_total_ops = 0;
+    uint64_t gemv_custom_decode_ops = 0;
+    uint64_t gemv_custom_prefill_ops = 0;
+    uint64_t gemv_custom_q4k_seen_ops = 0;
+    uint64_t gemv_custom_non_q4k_ops = 0;
+    uint64_t gemv_custom_quant_input_null_ops = 0;
+    uint64_t gemv_custom_shape_reject_ops = 0;
+    uint64_t gemv_custom_phase_unknown_ops = 0;
+    uint64_t gemv_custom_force_reference_ops = 0;
+    uint64_t gemv_custom_dynamic_lora_ops = 0;
+    std::array<uint64_t, kMatmulWeightTypeHistCount> gemv_custom_weight_type_hist{};
+    std::array<uint64_t, kMatmulQuantInputTypeHistCount> gemv_custom_quant_input_type_hist{};
+    int gemv_custom_tasks_effective = 0;
+    int gemv_custom_tasks_cap_reason = 0;
+    uint64_t decode_matmul_created_ops = 0;
+    std::array<uint64_t, kMatmulWeightTypeHistCount> decode_matmul_weight_type_hist{};
+    std::array<uint64_t, kMatmulPathHistCount> decode_matmul_path_hist{};
+    std::array<uint64_t, kMatmulWeightTypeHistCount> prefill_matmul_weight_type_hist{};
+    std::array<uint64_t, kMatmulPathHistCount> prefill_matmul_path_hist{};
+    std::vector<MatmulShapeCensusEntry> decode_matmul_top_shapes;
+    uint64_t q6k_gemv_seen_ops = 0;
+    uint64_t q6k_gemv_candidate_ops = 0;
+    uint64_t q6k_gemv_used_ops = 0;
+    uint64_t q6k_gemv_rejected_ops = 0;
+    uint64_t q6k_gemv_reject_quant_input_null_ops = 0;
+    uint64_t q6k_gemv_reject_unsupported_quant_input_ops = 0;
+    uint64_t q6k_gemv_reject_shape_ops = 0;
+    uint64_t q6k_gemv_reject_phase_ops = 0;
+    uint64_t q6k_gemv_reject_kernel_unavailable_ops = 0;
+    int q6k_gemv_last_reject_reason = 0;
+    uint64_t q6k_gemv_total_ns = 0;
+    std::string q6k_gemv_effective_phase;
+    std::string q6k_gemv_graph_phase;
+    std::string q6k_gemv_callback_phase;
+    std::vector<MatmulShapeCensusEntry> q6k_gemv_weight_shapes;
+    std::vector<MatmulShapeCensusEntry> native_moe_graph_top_slow_nodes;
+    std::string native_moe_graph_node_hist;
+    int native_moe_timing_missing = 0;
+    uint64_t moe_small_decode_parallel_candidate_ops = 0;
+    uint64_t moe_small_decode_parallel_used_ops = 0;
+    uint64_t moe_small_decode_parallel_rejected_ops = 0;
+    std::string moe_small_decode_parallel_last_reject_reason;
+    std::array<uint64_t, kMatmulWeightTypeHistCount> moe_expert_matmul_weight_type_hist{};
+    uint64_t moe_q4k_repacked_candidate_ops = 0;
+    uint64_t moe_q4k_repacked_used_ops = 0;
+    uint64_t moe_q4k_repacked_rejected_ops = 0;
+    std::string moe_q4k_repacked_last_reject_reason;
+    uint64_t native_moe_fast_decode_candidate_ops = 0;
+    uint64_t native_moe_fast_decode_used_ops = 0;
+    uint64_t native_moe_fast_decode_rejected_ops = 0;
+    std::string native_moe_fast_decode_last_reject_reason;
+    uint64_t native_moe_fast_decode_w1w3_used_ops = 0;
+    uint64_t native_moe_fast_decode_w2_used_ops = 0;
+    uint64_t native_moe_fast_decode_ns = 0;
+    uint64_t native_moe_fast_w1w3_ns = 0;
+    uint64_t native_moe_fast_w2_ns = 0;
+    uint64_t native_moe_fast_reduce_ns = 0;
+    uint64_t native_moe_fast_total_ns = 0;
+    uint64_t native_moe_fast_w1w3_used_ops = 0;
+    uint64_t native_moe_fast_w2_used_ops = 0;
+    uint64_t native_moe_fast_w2_q5k_candidate_ops = 0;
+    uint64_t native_moe_fast_w2_q5k_used_ops = 0;
+    uint64_t native_moe_fast_w2_q5k_rejected_ops = 0;
+    std::string native_moe_fast_w2_q5k_last_reject_reason;
+    uint64_t native_moe_fast_w2_q5k_ns = 0;
+    int qwen35_moe_path = 0;
+    uint64_t qwen35_moe_layers_seen = 0;
+    uint64_t qwen35_moe_forward_calls = 0;
+    std::array<uint64_t, kMatmulWeightTypeHistCount> qwen35_moe_w1w3_weight_type_hist{};
+    std::array<uint64_t, kMatmulWeightTypeHistCount> qwen35_moe_w2_weight_type_hist{};
+    int qwen35_moe_selected_expert_count = 0;
+    int qwen35_moe_top_k = 0;
+    int qwen35_moe_instrumentation_missing = 0;
+    int moe_selected_expert_count = 0;
+    int moe_top_k = 0;
+    int moe_expert_parallel_tasks = 0;
+    std::vector<MatmulDispatchCensusEntry> matmul_dispatch_top_slow_entries;
+    std::vector<MatmulShapeCensusEntry> qwen36_prefill_top_slow_ops;
+    uint64_t qwen36_prefill_total_ns = 0;
+    uint64_t qwen36_prefill_ssm_projection_ns = 0;
+    uint64_t qwen36_prefill_ssm_delta_state_ns = 0;
+    uint64_t qwen36_prefill_attention_ns = 0;
+    uint64_t qwen36_prefill_mlp_or_moe_ns = 0;
+    uint64_t qwen36_prefill_graph_build_ns = 0;
+    uint64_t qwen36_prefill_graph_execute_ns = 0;
     int q4k_copied_gemv_experiment_used = 0;
     int q4k_copied_gemv_experiment_last_reject_reason = 0;
     int paged_attn_decode_head_tile_effective = 0;
@@ -300,7 +426,33 @@ void ResetQwen36Profile(InferenceWorkContext* ctx);
 Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx);
 void AddQwen36SSMProjectionWallProfile(InferenceWorkContext* ctx, uint64_t qkv_ns, uint64_t gate_ns, uint64_t out_ns);
 void RecordQwen36SSMQ8PrefillAMXPrepared(InferenceWorkContext* ctx, int mode);
+void RecordQwen36SSMProjectionWeightType(InferenceWorkContext* ctx, ggml_type weight_type);
+void RecordMoESmallDecodeParallelDecision(InferenceWorkContext* ctx, bool candidate, bool used,
+                                          const char* reject_reason, int selected_expert_count, int top_k,
+                                          int task_count);
+void RecordMoEExpertMatmulWeightType(InferenceWorkContext* ctx, ggml_type weight_type);
+void RecordMoEQ4KRepackedDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason);
+void RecordMatmulDispatchCensus(InferenceWorkContext* ctx, InferenceExecutionPhase phase, const char* dispatch_path,
+                                ggml_type weight_type, int64_t m, int64_t n, int64_t k, uint64_t wall_ns);
+void RecordGraphBuildMatmulCensus(InferenceWorkContext* ctx, InferenceExecutionPhase phase, const char* dispatch_path,
+                                  ggml_type weight_type, int64_t m, int64_t n, int64_t k, const char* left_name,
+                                  const char* right_name, bool expected_decode);
+void RecordQ6KGemvDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,
+                           const char* weight_name, int64_t m, int64_t n, int64_t k, uint64_t wall_ns,
+                           const char* effective_phase = nullptr, const char* graph_phase = nullptr,
+                           const char* callback_phase = nullptr);
+void RecordNativeMoEFastDecodeDecision(InferenceWorkContext* ctx, bool candidate, bool used,
+                                       const char* reject_reason, bool w1w3_used, bool w2_used,
+                                       uint64_t wall_ns = 0);
+void RecordNativeMoEFastW2Q5KDecision(InferenceWorkContext* ctx, bool candidate, bool used,
+                                      const char* reject_reason, uint64_t wall_ns = 0);
+void RecordQwen35MoEGraphPath(InferenceWorkContext* ctx, const char* path, int top_k, int selected_expert_count,
+                              ggml_type w1w3_type, ggml_type w2_type);
 const char* Q4KRepackedGemvRejectReasonName(int reason);
+const char* Q6KGemvRejectReasonName(int reason);
+const char* Qwen35MoEPathName(int code);
+bool Q4KRepackedGemvRejectReasonIsCacheThrash(int reason);
+const char* GemvCustomTaskCapReasonName(int reason);
 const char* Q4KCopiedGemvExperimentRejectReasonName(int reason);
 const char* Qwen36PrefillQ4KBatchedRejectReasonName(int reason);
 const char* Qwen36SSMQ8PrefillAMXRejectReasonName(int reason);

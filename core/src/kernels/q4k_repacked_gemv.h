@@ -33,11 +33,30 @@ struct Q4KRepackedGemvWeight {
 struct Q4KRepackedGemvCacheLookup {
     bool cache_hit = false;
     bool waited = false;
+    bool repacked = false;
+    bool cache_limit_too_small = false;
+    bool working_set_exceeds_cache = false;
+    uint64_t weight_key = 0;
+    uint64_t cache_evictions = 0;
+    uint64_t cache_evicted_bytes = 0;
+    uint64_t repack_bytes = 0;
+    uint64_t resident_bytes = 0;
+    uint64_t cache_limit_bytes = 0;
+    uint64_t weight_bytes = 0;
+};
+
+struct Q4KRepackedGemvCacheStats {
+    uint64_t evictions = 0;
+    uint64_t evicted_bytes = 0;
+    uint64_t repack_bytes = 0;
+    uint64_t resident_bytes = 0;
 };
 
 bool Q4KRepackedGemvIsaSupported();
 bool Q4KRealPackedGemvKernelAvailable();
 size_t Q4KRepackedGemvCacheLimitBytes();
+Q4KRepackedGemvCacheStats Q4KRepackedGemvCacheStatsSnapshot();
+Q4KRepackedGemvCacheStats Q4KRepackedGemvTrimCacheToBytes(size_t target_bytes);
 uint64_t FingerprintQ4KRepackedGemvWeight(const void* weight_ptr, size_t bytes);
 uint64_t Q4KRepackedGemvWeightFingerprint(const void* weight_ptr, int64_t rows, int64_t cols);
 

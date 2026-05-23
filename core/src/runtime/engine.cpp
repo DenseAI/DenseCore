@@ -1894,6 +1894,29 @@ int DenseCoreBuildRenderedRequestSnapshot(DenseCoreHandle handle, const char* re
                                     repetition_penalty, json_mode, /*input_already_rendered=*/true, out);
 }
 
+int DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx(
+    DenseCoreHandle handle, const char* rendered_prompt, int max_tokens, const char* lora_name, float temperature,
+    float top_p, int top_k, float repetition_penalty, const char** stop_sequences, int json_mode,
+    const int* allowed_token_ids, int num_allowed_token_ids, int allowed_token_ids_strict,
+    const int* disallowed_token_ids, int num_disallowed_token_ids, TokenCallbackEx callback, void* user_data) {
+    DenseCoreRequestSnapshot snapshot{};
+    const int status = BuildRequestSnapshotImpl(handle, rendered_prompt, max_tokens, temperature, top_p, top_k,
+                                                repetition_penalty, json_mode, /*input_already_rendered=*/true,
+                                                &snapshot);
+    if (status < 0) {
+        return status;
+    }
+    const int request_id = SubmitRequestIdsWithSamplingConstraintsImpl(
+        handle, snapshot.token_ids, snapshot.num_token_ids, max_tokens, lora_name, temperature, top_p, top_k,
+        repetition_penalty, stop_sequences, json_mode, allowed_token_ids, num_allowed_token_ids,
+        allowed_token_ids_strict, disallowed_token_ids, num_disallowed_token_ids, nullptr, callback, user_data,
+        snapshot.rendered_prompt, /*tokens_already_snapshot_primed=*/true,
+        "DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx",
+        "DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx");
+    DenseCoreFreeRequestSnapshot(&snapshot);
+    return request_id;
+}
+
 void DenseCoreFreeRequestSnapshot(DenseCoreRequestSnapshot* snapshot) {
     if (!snapshot) {
         return;

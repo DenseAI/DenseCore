@@ -40,6 +40,7 @@
 #include "densecore/simd/simd_ops.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
+#include "kernels/q4k_repacked_gemv.h"
 #include "llm/attention/exec.h"
 #include "llm/config/runtime_config.h"
 #include "runtime/engine_internal.h"
@@ -355,14 +356,25 @@ RuntimeGraphPoolReservation ClampRuntimeGraphPoolReservation(size_t requested_by
         return {requested_bytes, requested_bytes, 0};
     }
     constexpr size_t MB = 1024ULL * 1024ULL;
+    const size_t max_total_bytes =
+        available_bytes > 256ULL * MB ? available_bytes - 256ULL * MB : (available_bytes * 3) / 4;
     const size_t runtime_reserve_bytes = std::clamp<size_t>(available_bytes / 12, 512ULL * MB, 8192ULL * MB);
     const size_t allocator_slack_bytes = std::max<size_t>(available_bytes / 64, 128ULL * MB);
     const size_t reserved_bytes = runtime_reserve_bytes + allocator_slack_bytes;
     const size_t usable_bytes = available_bytes > reserved_bytes ? available_bytes - reserved_bytes : available_bytes / 2;
     const size_t payload_bytes = std::min(requested_bytes, std::max<size_t>(usable_bytes, 512ULL * MB));
     const size_t context_object_slack_bytes = std::clamp<size_t>(payload_bytes / 6, 128ULL * MB, 2048ULL * MB);
-    return {AlignUpBytes(payload_bytes + context_object_slack_bytes, 64ULL * MB), payload_bytes,
-            context_object_slack_bytes};
+    size_t total_bytes = AlignUpBytes(payload_bytes + context_object_slack_bytes, 64ULL * MB);
+    size_t capped_payload_bytes = payload_bytes;
+    size_t capped_slack_bytes = context_object_slack_bytes;
+    if (max_total_bytes > 0 && total_bytes > max_total_bytes) {
+        total_bytes = std::max(512ULL * MB, (max_total_bytes / (64ULL * MB)) * (64ULL * MB));
+        capped_slack_bytes = std::min(context_object_slack_bytes, std::max<size_t>(128ULL * MB, total_bytes / 16));
+        capped_payload_bytes = total_bytes > capped_slack_bytes ? total_bytes - capped_slack_bytes : total_bytes;
+        capped_payload_bytes = std::min(capped_payload_bytes, requested_bytes);
+        capped_slack_bytes = total_bytes > capped_payload_bytes ? total_bytes - capped_payload_bytes : 0;
+    }
+    return {total_bytes, capped_payload_bytes, capped_slack_bytes};
 }
 
 FlexibleGraphPoolSizing MeasureFlexibleGraphPoolSize(TransformerModel* model, PagedKVCache* cache,
@@ -497,6 +509,185 @@ void AccumulateQwen36SSMProjectionNodeTimes(InferenceWorkContext* work_ctx, ggml
     if (qkv_ns || gate_ns || out_ns) {
         AddQwen36SSMProjectionWallProfile(work_ctx, qkv_ns, gate_ns, out_ns);
     }
+}
+
+struct Qwen36PrefillBreakdown {
+    uint64_t ssm_projection_ns = 0;
+    uint64_t ssm_delta_state_ns = 0;
+    uint64_t attention_ns = 0;
+    uint64_t mlp_or_moe_ns = 0;
+    std::vector<MatmulShapeCensusEntry> top_slow_ops;
+};
+
+struct NativeMoEGraphTimingBreakdown {
+    uint64_t route_ns = 0;
+    uint64_t w1w3_ns = 0;
+    uint64_t activation_ns = 0;
+    uint64_t w2_ns = 0;
+    uint64_t reduce_ns = 0;
+    uint64_t total_ns = 0;
+    uint64_t route_count = 0;
+    uint64_t w1w3_count = 0;
+    uint64_t activation_count = 0;
+    uint64_t w2_count = 0;
+    uint64_t reduce_count = 0;
+    uint64_t native_node_count = 0;
+    std::string node_hist;
+    std::vector<MatmulShapeCensusEntry> top_slow_nodes;
+};
+
+Qwen36PrefillBreakdown SummarizeQwen36PrefillNodeTimes(const TransformerModel* model, const ggml_cgraph* graph) {
+    Qwen36PrefillBreakdown out;
+    if (!model || model->variant != ModelVariant::QWEN36 || !graph) {
+        return out;
+    }
+    const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
+        if (!node) {
+            continue;
+        }
+        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
+        if (elapsed_us <= 0) {
+            continue;
+        }
+        const uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_us) * 1000ULL;
+        const char* name = node->name[0] ? node->name : "unnamed";
+        const bool is_ssm_proj = HasNamePrefix(node, "qwen36_ssm_qkv_proj") ||
+                                 HasNamePrefix(node, "qwen36_ssm_gate_proj") ||
+                                 HasNamePrefix(node, "qwen36_ssm_out_proj");
+        if (is_ssm_proj) {
+            out.ssm_projection_ns += elapsed_ns;
+        } else if (std::strstr(name, "delta") || std::strstr(name, "ssm_scan") || std::strstr(name, "conv1d")) {
+            out.ssm_delta_state_ns += elapsed_ns;
+        } else if (std::strstr(name, "attn") || std::strstr(name, "flash") || std::strstr(name, "kv_")) {
+            out.attention_ns += elapsed_ns;
+        } else if (std::strstr(name, "moe") || std::strstr(name, "ffn") || std::strstr(name, "mlp")) {
+            out.mlp_or_moe_ns += elapsed_ns;
+        }
+        MatmulShapeCensusEntry entry;
+        entry.phase = "prefill";
+        entry.dispatch_path = is_ssm_proj ? "ssm_projection"
+                                          : (std::strstr(name, "moe") ? "mlp_or_moe" : ggml_op_name(node->op));
+        entry.weight_type = "node";
+        std::ostringstream shape;
+        shape << "M=" << node->ne[1] << ",N=" << node->ne[0] << ",K=" << (node->ne[2] > 1 ? node->ne[2] : 0);
+        entry.shape_bucket = shape.str();
+        entry.left_name = name;
+        entry.right_name = "elapsed_us";
+        entry.ops = static_cast<uint64_t>(elapsed_us);
+        out.top_slow_ops.push_back(std::move(entry));
+    }
+    std::sort(out.top_slow_ops.begin(), out.top_slow_ops.end(), [](const auto& a, const auto& b) {
+        return a.ops != b.ops ? a.ops > b.ops : a.left_name < b.left_name;
+    });
+    if (out.top_slow_ops.size() > kMatmulTopShapeCount) {
+        out.top_slow_ops.resize(kMatmulTopShapeCount);
+    }
+    return out;
+}
+
+NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const TransformerModel* model,
+                                                                   const ggml_cgraph* graph) {
+    NativeMoEGraphTimingBreakdown out;
+    if (!model || (model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36) || !graph) {
+        return out;
+    }
+    struct Bucket {
+        const char* name = "other";
+        uint64_t ns = 0;
+        uint64_t count = 0;
+    };
+    std::array<Bucket, 6> buckets = {{{"route", 0, 0},
+                                      {"w1w3", 0, 0},
+                                      {"activation", 0, 0},
+                                      {"w2", 0, 0},
+                                      {"reduce", 0, 0},
+                                      {"other", 0, 0}}};
+    enum BucketIndex { Route = 0, W1W3 = 1, Activation = 2, W2 = 3, Reduce = 4, Other = 5 };
+    const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
+    bool has_native_qwen_moe = false;
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
+        if (node && node->name[0] && std::strstr(node->name, "qwen35_native_moe")) {
+            has_native_qwen_moe = true;
+            break;
+        }
+    }
+    if (!has_native_qwen_moe) {
+        return out;
+    }
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
+        if (!node) {
+            continue;
+        }
+        const char* name = node->name[0] ? node->name : "unnamed";
+        const bool native_moe_node = std::strstr(name, "qwen35_native_moe") ||
+                                     std::strstr(name, ".moe_gate_logits");
+        if (!native_moe_node) {
+            continue;
+        }
+        ++out.native_node_count;
+        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
+        if (elapsed_us <= 0) {
+            continue;
+        }
+        const uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_us) * 1000ULL;
+        BucketIndex bucket = Other;
+        if (std::strstr(name, ".moe_gate_logits") || std::strstr(name, "_topk") ||
+            std::strstr(name, "_norm_weights") || std::strstr(name, "_probs") ||
+            std::strstr(name, "_weights") || std::strstr(name, "_scaled_weights")) {
+            bucket = Route;
+        } else if (std::strstr(name, "_gate_up") || std::strstr(name, "_gate") || std::strstr(name, "_up")) {
+            bucket = W1W3;
+        } else if (std::strstr(name, "_swiglu")) {
+            bucket = Activation;
+        } else if (std::strstr(name, "_down")) {
+            bucket = W2;
+        } else if (std::strstr(name, "_expert_sum") || std::strstr(name, "_moe_out")) {
+            bucket = Reduce;
+        }
+        buckets[static_cast<std::size_t>(bucket)].ns += elapsed_ns;
+        buckets[static_cast<std::size_t>(bucket)].count += 1;
+        out.total_ns += elapsed_ns;
+
+        MatmulShapeCensusEntry entry;
+        entry.phase = model->variant == ModelVariant::QWEN36 ? "qwen36" : "qwen35";
+        entry.dispatch_path = buckets[static_cast<std::size_t>(bucket)].name;
+        entry.weight_type = ggml_op_name(node->op);
+        std::ostringstream shape;
+        shape << "M=" << node->ne[1] << ",N=" << node->ne[0] << ",K=" << (node->ne[2] > 1 ? node->ne[2] : 0);
+        entry.shape_bucket = shape.str();
+        entry.left_name = name;
+        entry.right_name = "elapsed_us";
+        entry.ops = static_cast<uint64_t>(elapsed_us);
+        out.top_slow_nodes.push_back(std::move(entry));
+    }
+    out.route_ns = buckets[Route].ns;
+    out.w1w3_ns = buckets[W1W3].ns;
+    out.activation_ns = buckets[Activation].ns;
+    out.w2_ns = buckets[W2].ns;
+    out.reduce_ns = buckets[Reduce].ns;
+    out.route_count = buckets[Route].count;
+    out.w1w3_count = buckets[W1W3].count;
+    out.activation_count = buckets[Activation].count;
+    out.w2_count = buckets[W2].count;
+    out.reduce_count = buckets[Reduce].count;
+    std::ostringstream hist;
+    for (std::size_t i = 0; i < buckets.size(); ++i) {
+        if (i != 0) hist << ",";
+        hist << buckets[i].name << ":count=" << buckets[i].count << ":ms="
+             << (static_cast<double>(buckets[i].ns) / 1.0e6);
+    }
+    out.node_hist = hist.str();
+    std::sort(out.top_slow_nodes.begin(), out.top_slow_nodes.end(), [](const auto& a, const auto& b) {
+        return a.ops != b.ops ? a.ops > b.ops : a.left_name < b.left_name;
+    });
+    if (out.top_slow_nodes.size() > kMatmulTopShapeCount) {
+        out.top_slow_nodes.resize(kMatmulTopShapeCount);
+    }
+    return out;
 }
 
 bool IsGemma4NodeTimingDumpEnabled() {
@@ -1215,9 +1406,11 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
         return -1;
     }
     const bool qwen35_dense = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts <= 0;
+    const bool qwen35_moe = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0;
     const bool qwen_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
-    const int base_chunk_tokens = qwen35_dense ? 768 : (qwen_hybrid_ssm ? 384 : 192);
-    const int base_auto_min_tokens = qwen35_dense ? 1024 : 1536;
+    const int base_chunk_tokens = qwen35_dense ? 768 : ((qwen35_moe || qwen_hybrid_ssm) ? 384 : 192);
+    const int base_auto_min_tokens =
+        qwen35_dense ? 1024 : (qwen35_moe ? 1024 : (qwen_hybrid_ssm ? 1280 : 1536));
     const char* chunk_env = "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS";
     const char* default_env = "DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS";
     const char* auto_min_env = "DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS";
@@ -1319,6 +1512,85 @@ int ResolveModelPrefillChunkTokens(const TransformerModel* model, const Request*
         return qwen36_tokens;
     }
     return ResolveGemma4PrefillChunkTokensImpl(model, req);
+}
+
+size_t GraphContextSafetyMarginBytes() {
+    return ParseSizeEnvMb("DENSECORE_GRAPH_CTX_SAFETY_MARGIN_MB", /*default_mb=*/512, /*min_mb=*/0,
+                          /*max_mb=*/65536) *
+           1024ULL * 1024ULL;
+}
+
+bool IsGraphContextAutoDowngradeEnabled() {
+    return ParseBoolEnvDefault("DENSECORE_GRAPH_CTX_AUTO_DOWNGRADE", true);
+}
+
+bool IsGraphContextFailClosedEnabled() {
+    return ParseBoolEnvDefault("DENSECORE_GRAPH_CTX_FAIL_CLOSED", false);
+}
+
+int ApplyGraphContextPrefillChunkDowngrade(const TransformerModel* model, Request* req, int chunk_tokens) {
+    if (!model || !req || !IsGraphContextAutoDowngradeEnabled()) {
+        return chunk_tokens;
+    }
+    const size_t available_bytes = ReadAvailableMemoryBytesForRuntimePools();
+    if (available_bytes == 0) {
+        return chunk_tokens;
+    }
+    const size_t safety_margin_bytes = GraphContextSafetyMarginBytes();
+    const size_t prompt_tokens = static_cast<size_t>(std::max(1, RequestPromptTokenCountForChunking(req)));
+    int effective_chunk = chunk_tokens;
+    const bool originally_unchunked = effective_chunk <= 1;
+    const auto initial_estimate =
+        EngineState::EstimateGraphContextSize(model, prompt_tokens, /*num_seqs_hint=*/1,
+                                              originally_unchunked ? 0 : static_cast<size_t>(effective_chunk));
+    req->graph_ctx_requested_mb = initial_estimate.total_bytes / (1024ULL * 1024ULL);
+    req->graph_ctx_available_mb = available_bytes / (1024ULL * 1024ULL);
+    req->graph_ctx_safety_margin_mb = safety_margin_bytes / (1024ULL * 1024ULL);
+    if (initial_estimate.total_bytes + safety_margin_bytes <= available_bytes) {
+        return chunk_tokens;
+    }
+    if (originally_unchunked) {
+        const auto descriptor = densecore::models::DescribeModel(model);
+        const bool qwen35_moe = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0;
+        const bool qwen_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
+        effective_chunk = (qwen35_moe || qwen_hybrid_ssm) ? 384 : 512;
+        effective_chunk = std::max(1, std::min<int>(effective_chunk, static_cast<int>(prompt_tokens)));
+    }
+    const int best_effort_pressure_chunk = std::max(1, effective_chunk);
+
+    while (effective_chunk > 1) {
+        const auto estimate =
+            EngineState::EstimateGraphContextSize(model, prompt_tokens, /*num_seqs_hint=*/1,
+                                                  static_cast<size_t>(effective_chunk));
+        if (estimate.total_bytes + safety_margin_bytes <= available_bytes) {
+            req->graph_ctx_downgraded_chunk_tokens = effective_chunk;
+            req->graph_ctx_fail_reason.clear();
+            std::cerr << "[DenseCore] GraphCtxAutoDowngrade"
+                      << " req=" << req->id
+                      << " original_chunk_tokens=" << (originally_unchunked ? 0 : chunk_tokens)
+                      << " downgraded_chunk_tokens=" << effective_chunk
+                      << " requested_mb=" << (initial_estimate.total_bytes / (1024ULL * 1024ULL))
+                      << " downgraded_mb=" << (estimate.total_bytes / (1024ULL * 1024ULL))
+                      << " available_mb=" << req->graph_ctx_available_mb
+                      << " safety_margin_mb=" << req->graph_ctx_safety_margin_mb << std::endl;
+            return effective_chunk;
+        }
+        effective_chunk = std::max(1, effective_chunk / 2);
+    }
+
+    effective_chunk = std::max(1, best_effort_pressure_chunk);
+    req->graph_ctx_downgraded_chunk_tokens = effective_chunk;
+    req->graph_ctx_fail_reason.clear();
+    std::cerr << "[DenseCore] GraphCtxAutoDowngrade"
+              << " req=" << req->id
+              << " original_chunk_tokens=" << (originally_unchunked ? 0 : chunk_tokens)
+              << " downgraded_chunk_tokens=" << effective_chunk
+              << " requested_mb=" << (initial_estimate.total_bytes / (1024ULL * 1024ULL))
+              << " downgraded_mb=unknown"
+              << " available_mb=" << req->graph_ctx_available_mb
+              << " safety_margin_mb=" << req->graph_ctx_safety_margin_mb
+              << " reason=best_effort_pressure_chunk" << std::endl;
+    return effective_chunk;
 }
 
 int PrefillThreadOverride() {
@@ -2256,7 +2528,9 @@ void EngineLoop(EngineState* state) {
                                            /*prefill_cache_active=*/false);
 
                     // Register with scheduler (blocks allocated by scheduler)
-                    const int prefill_chunk_tokens = ResolveModelPrefillChunkTokens(current_model, req);
+                    const int resolved_prefill_chunk_tokens = ResolveModelPrefillChunkTokens(current_model, req);
+                    const int prefill_chunk_tokens =
+                        ApplyGraphContextPrefillChunkDowngrade(current_model, req, resolved_prefill_chunk_tokens);
                     req->prefill_chunk_tokens_effective = std::max(0, prefill_chunk_tokens);
                     const std::vector<int>* scheduler_prefix_tokens =
                         req->prefix_cache_allowed ? &req->original_prompt_tokens_for_cache : nullptr;
@@ -2945,6 +3219,9 @@ void EngineLoop(EngineState* state) {
                 if (chunk_it != prefill_chunk_tokens.end()) {
                     tokens_to_take = std::min(tokens_to_take, chunk_it->second);
                 }
+                if (req_it->second && req_it->second->prefill_chunk_tokens_effective > 0) {
+                    tokens_to_take = std::min(tokens_to_take, req_it->second->prefill_chunk_tokens_effective);
+                }
                 if (tokens_to_take > 0) {
                     reserved_batch_tokens += static_cast<size_t>(tokens_to_take);
                 }
@@ -2999,6 +3276,9 @@ void EngineLoop(EngineState* state) {
                 auto chunk_it = prefill_chunk_tokens.find(seq_id);
                 if (chunk_it != prefill_chunk_tokens.end()) {
                     tokens_to_take = std::min(tokens_to_take, chunk_it->second);
+                }
+                if (req->prefill_chunk_tokens_effective > 0) {
+                    tokens_to_take = std::min(tokens_to_take, req->prefill_chunk_tokens_effective);
                 }
                 if (tokens_to_take <= 0) continue;
 
@@ -3255,6 +3535,7 @@ void EngineLoop(EngineState* state) {
             bool main_work_context_bound_for_current_graph = false;
             std::unique_ptr<ScopedBatchWorkContext> main_work_context_scope;
             auto bind_main_work_context_for_graph = [&](const BatchSpec& graph_batch, InferenceExecutionPhase phase) {
+                main_work_context_scope.reset();
                 main_work_context_scope =
                     std::make_unique<ScopedBatchWorkContext>(work_ctx.get(), &graph_batch, phase);
                 main_work_context_bound_for_current_graph = true;
@@ -3375,7 +3656,20 @@ void EngineLoop(EngineState* state) {
             if (!is_prefill_batch && base_threads > 0 && !AllowDecodeThreadsOverBase()) {
                 active_threads = std::min(active_threads, base_threads);
             }
-            active_threads = std::max(1, std::min(active_threads, std::max(1, physical_core_count)));
+            int final_thread_cap = std::max(1, physical_core_count);
+            if (current_model && base_threads >= 16) {
+                const auto descriptor = densecore::models::DescribeModel(current_model);
+                const bool qwen35_or_qwen36 =
+                    descriptor.variant == ModelVariant::QWEN35 || descriptor.variant == ModelVariant::QWEN36;
+                const char* benchmark_profile_env = std::getenv("DENSECORE_BENCHMARK_PROFILE");
+                const bool benchmark_or_server_perf_profile =
+                    state->fast_path_config.bench_respect_threads ||
+                    (benchmark_profile_env && benchmark_profile_env[0] != '\0');
+                if (qwen35_or_qwen36 && benchmark_or_server_perf_profile) {
+                    final_thread_cap = std::max(final_thread_cap, base_threads);
+                }
+            }
+            active_threads = std::max(1, std::min(active_threads, final_thread_cap));
             infer_cfg.num_threads = active_threads;
             if (is_decode_batch && decode_batch_size >= 1 &&
                 decode_batch_size < static_cast<int>(kDecodeGraphCacheTrackedBatches)) {
@@ -4120,8 +4414,17 @@ void EngineLoop(EngineState* state) {
                             }
                             if (cached_sizing != flexible_graph_pool_sizing_cache.end() && cached_sizing->second.ok) {
                                 flexible_sizing = cached_sizing->second;
-                                ctx_size = flexible_sizing.reserved_bytes > 0 ? flexible_sizing.reserved_bytes
-                                                                              : flexible_sizing.required_bytes;
+                                ctx_size = flexible_sizing.required_bytes > 0 ? flexible_sizing.required_bytes
+                                                                              : flexible_sizing.reserved_bytes;
+                                const size_t measured_floor =
+                                    AlignUpBytes(flexible_sizing.dry_metadata_bytes + flexible_sizing.graph_tensor_bytes +
+                                                     flexible_sizing.margin_bytes,
+                                                 64ULL * 1024ULL * 1024ULL);
+                                if (measured_floor > 0 && ctx_size < measured_floor) {
+                                    const RuntimeGraphPoolReservation measured_floor_reservation =
+                                        ClampRuntimeGraphPoolReservation(measured_floor, flexible_sizing.available_bytes);
+                                    ctx_size = std::max(ctx_size, measured_floor_reservation.total_bytes);
+                                }
                                 if (state->inference_ctx.IsInitialized() &&
                                     state->inference_ctx.compute_buffer_size < ctx_size) {
                                     const size_t grow_ahead =
@@ -4134,17 +4437,60 @@ void EngineLoop(EngineState* state) {
                                 used_flexible_sizing = true;
                             }
                         }
-                        const bool graph_pool_shrink_allowed = !is_decode_batch && !used_flexible_sizing;
+                        const bool graph_pool_shrink_allowed =
+                            IsFlexibleGraphPoolSizingEnabled(current_model) &&
+                            is_decode_batch && used_flexible_sizing;
                         const bool graph_pool_oversized =
-                            graph_pool_shrink_allowed && IsFlexibleGraphPoolSizingEnabled(current_model) &&
-                            state->inference_ctx.IsInitialized() &&
+                            graph_pool_shrink_allowed && state->inference_ctx.IsInitialized() &&
                             state->inference_ctx.compute_buffer_size > ctx_size * 2 &&
                             (state->inference_ctx.compute_buffer_size - ctx_size) > (2048ULL * 1024ULL * 1024ULL);
+                        const size_t flexible_dry_context_floor =
+                            used_flexible_sizing
+                                ? AlignUpBytes(flexible_sizing.dry_context_bytes + 512ULL * 1024ULL * 1024ULL,
+                                               64ULL * 1024ULL * 1024ULL)
+                                : 0;
                         if (!state->inference_ctx.IsInitialized() ||
                             state->inference_ctx.compute_buffer_size < ctx_size || graph_pool_oversized) {
                             if (state->inference_ctx.IsInitialized() &&
                                 (state->inference_ctx.compute_buffer_size < ctx_size || graph_pool_oversized)) {
                                 state->inference_ctx.Free();
+                                if (graph_pool_oversized && flexible_dry_context_floor > ctx_size) {
+                                    const size_t available_after_free = ReadAvailableMemoryBytesForRuntimePools();
+                                    constexpr size_t kPostShrinkReserveBytes = 128ULL * 1024ULL * 1024ULL;
+                                    if (available_after_free == 0 ||
+                                        flexible_dry_context_floor + kPostShrinkReserveBytes <= available_after_free) {
+                                        ctx_size = flexible_dry_context_floor;
+                                    }
+                                }
+                            }
+                            if (is_prefill_batch && graph_ctx_estimate.effective_query_len > 1 &&
+                                ctx_size >= 1024ULL * 1024ULL * 1024ULL) {
+                                const size_t available_after_free = ReadAvailableMemoryBytesForRuntimePools();
+                                const auto q4k_cache_before =
+                                    densecore::kernels::Q4KRepackedGemvCacheStatsSnapshot();
+                                const size_t desired_headroom =
+                                    std::max<size_t>(1024ULL * 1024ULL * 1024ULL, ctx_size / 4);
+                                const size_t needed_bytes = ctx_size + desired_headroom;
+                                if (q4k_cache_before.resident_bytes > 0 && available_after_free > 0 &&
+                                    available_after_free < needed_bytes) {
+                                    const size_t deficit = needed_bytes - available_after_free;
+                                    const size_t target_bytes =
+                                        q4k_cache_before.resident_bytes > deficit
+                                            ? static_cast<size_t>(q4k_cache_before.resident_bytes - deficit)
+                                            : 0;
+                                    const auto q4k_cache_after =
+                                        densecore::kernels::Q4KRepackedGemvTrimCacheToBytes(target_bytes);
+                                    if (q4k_cache_after.resident_bytes < q4k_cache_before.resident_bytes) {
+                                        std::cerr << "[DenseCore] Q4KRepackedCacheTrim before_large_prefill"
+                                                  << " before_mb="
+                                                  << (q4k_cache_before.resident_bytes / (1024 * 1024))
+                                                  << " after_mb="
+                                                  << (q4k_cache_after.resident_bytes / (1024 * 1024))
+                                                  << " ctx_mb=" << (ctx_size / (1024 * 1024))
+                                                  << " available_mb="
+                                                  << (available_after_free / (1024 * 1024)) << std::endl;
+                                    }
+                                }
                             }
                             const auto descriptor = densecore::models::DescribeModel(current_model);
                             std::cerr
@@ -4177,7 +4523,83 @@ void EngineLoop(EngineState* state) {
                                           << " shrink=" << (graph_pool_oversized ? 1 : 0);
                             }
                             std::cerr << std::endl;
-                            state->inference_ctx.Init(ctx_size);
+                            const size_t graph_ctx_available_bytes = ReadAvailableMemoryBytesForRuntimePools();
+                            const size_t graph_ctx_safety_margin_bytes = GraphContextSafetyMarginBytes();
+                            for (Request* req : batch_requests) {
+                                if (!req) {
+                                    continue;
+                                }
+                                req->graph_ctx_requested_mb = ctx_size / (1024ULL * 1024ULL);
+                                req->graph_ctx_available_mb = graph_ctx_available_bytes / (1024ULL * 1024ULL);
+                                req->graph_ctx_safety_margin_mb =
+                                    graph_ctx_safety_margin_bytes / (1024ULL * 1024ULL);
+                            }
+                            const auto fail_graph_ctx_requests = [&](const std::string& fail_reason,
+                                                                     const char* error_message) {
+                                for (Request* req : batch_requests) {
+                                    if (!req || req->finished) {
+                                        continue;
+                                    }
+                                    req->graph_ctx_fail_reason = fail_reason;
+                                    req->finished = true;
+                                    req->decode_finish_cause = DecodeFinishCause::OutOfMemory;
+                                    FinalizeDecodeSilentFinishReason(req);
+                                    LogRequestDecodeSummary(req, current_model);
+                                    state->metrics.oom_errors++;
+                                    state->metrics.failed_requests++;
+                                    EmitRequestResult(state, req, error_message, -1, true, true,
+                                                      global_direct_callback);
+                                    if (!req->block_table.empty() && current_kv_cache &&
+                                        current_kv_cache->block_manager) {
+                                        current_kv_cache->block_manager->Free(req->block_table);
+                                        req->block_table.clear();
+                                    }
+                                    if (req->seq_id >= 0) {
+                                        state->scheduler->RemoveRequest(req->seq_id, false);
+                                        seq_to_request.erase(req->seq_id);
+                                    }
+                                    std::lock_guard<std::mutex> lk(req->mu);
+                                    req->cv.notify_all();
+                                }
+                            };
+                            const bool graph_ctx_pressure =
+                                graph_ctx_available_bytes > 0 &&
+                                ctx_size + graph_ctx_safety_margin_bytes > graph_ctx_available_bytes;
+                            if (graph_ctx_pressure) {
+                                const std::string pressure_reason =
+                                    is_prefill_batch ? "prefill_graph_ctx_pressure_after_chunk_downgrade"
+                                                     : "graph_ctx_pressure";
+                                std::cerr << "[DenseCore] GraphCtxPressure"
+                                          << " requested_mb=" << (ctx_size / (1024ULL * 1024ULL))
+                                          << " available_mb=" << (graph_ctx_available_bytes / (1024ULL * 1024ULL))
+                                          << " safety_margin_mb="
+                                          << (graph_ctx_safety_margin_bytes / (1024ULL * 1024ULL))
+                                          << " reason=" << pressure_reason
+                                          << " fail_closed=" << (IsGraphContextFailClosedEnabled() ? 1 : 0)
+                                          << std::endl;
+                                if (IsGraphContextFailClosedEnabled()) {
+                                    const std::string fail_reason =
+                                        is_prefill_batch
+                                            ? "prefill_graph_ctx_exceeds_available_after_chunk_downgrade"
+                                            : "graph_ctx_exceeds_available";
+                                    fail_graph_ctx_requests(
+                                        fail_reason, "Error: graph context reservation exceeds safe available memory");
+                                    continue;
+                                }
+                            }
+                            try {
+                                state->inference_ctx.Init(ctx_size);
+                            } catch (const densecore::OutOfMemoryException& e) {
+                                std::cerr << "[DenseCore] GraphCtxAllocationFailed"
+                                          << " requested_mb=" << (ctx_size / (1024ULL * 1024ULL))
+                                          << " available_mb=" << (graph_ctx_available_bytes / (1024ULL * 1024ULL))
+                                          << " safety_margin_mb="
+                                          << (graph_ctx_safety_margin_bytes / (1024ULL * 1024ULL))
+                                          << " error=" << e.what() << std::endl;
+                                fail_graph_ctx_requests("graph_ctx_allocation_failed",
+                                                        "Error: graph context allocation failed");
+                                continue;
+                            }
                         }
 
                         if (Request* trace_req = !batch_requests.empty() ? batch_requests[0] : nullptr) {
@@ -4664,6 +5086,8 @@ void EngineLoop(EngineState* state) {
                 }
             }
 
+            const densecore::kernels::Q4KRepackedGemvCacheStats q4k_cache_before =
+                densecore::kernels::Q4KRepackedGemvCacheStatsSnapshot();
             const auto compute_begin = std::chrono::steady_clock::now();
             ValidateMulNodesOrThrow(gf, is_decode_batch ? "decode" : "prefill");
             MaybeLogMoEGraphSummary(gf, current_model, is_prefill_batch);
@@ -4673,14 +5097,117 @@ void EngineLoop(EngineState* state) {
             ggml_backend_graph_compute(active_backend, gf);
             const auto compute_end = std::chrono::steady_clock::now();
             AccumulateQwen36SSMProjectionNodeTimes(work_ctx.get(), gf);
+            const Qwen36PrefillBreakdown qwen36_prefill_breakdown =
+                is_prefill_batch ? SummarizeQwen36PrefillNodeTimes(current_model, gf) : Qwen36PrefillBreakdown{};
+            const NativeMoEGraphTimingBreakdown native_moe_graph_timing =
+                SummarizeNativeQwenMoEGraphNodeTimes(current_model, gf);
             DebugDumpLLMNodeTimes(current_model, gf, is_decode_batch ? "decode" : "prefill");
             DebugDumpGemma4NodeTimes(current_model, gf, is_decode_batch ? "decode" : "prefill");
             const auto graph_execute_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(compute_end - compute_begin).count());
             const Qwen36ProfileSnapshot qwen36_profile = GetQwen36ProfileSnapshot(work_ctx.get());
+            const densecore::kernels::Q4KRepackedGemvCacheStats q4k_cache_after =
+                densecore::kernels::Q4KRepackedGemvCacheStatsSnapshot();
+            const uint64_t q4k_cache_evictions_delta =
+                q4k_cache_after.evictions >= q4k_cache_before.evictions
+                    ? q4k_cache_after.evictions - q4k_cache_before.evictions
+                    : 0;
+            const uint64_t q4k_cache_evicted_bytes_delta =
+                q4k_cache_after.evicted_bytes >= q4k_cache_before.evicted_bytes
+                    ? q4k_cache_after.evicted_bytes - q4k_cache_before.evicted_bytes
+                    : 0;
+            const uint64_t q4k_repack_bytes_delta =
+                q4k_cache_after.repack_bytes >= q4k_cache_before.repack_bytes
+                    ? q4k_cache_after.repack_bytes - q4k_cache_before.repack_bytes
+                    : 0;
+            const uint64_t qwen36_prefill_graph_build_ns =
+                (is_prefill_batch && graph_build_begin != std::chrono::steady_clock::time_point() &&
+                 graph_build_end != std::chrono::steady_clock::time_point() && graph_build_end >= graph_build_begin)
+                    ? static_cast<uint64_t>(
+                          std::chrono::duration_cast<std::chrono::nanoseconds>(graph_build_end - graph_build_begin)
+                              .count())
+                    : 0;
             for (Request* req : batch_requests) {
                 if (req) {
                     req->graph_execute_ns += graph_execute_ns;
+                    if (is_prefill_batch && current_model && current_model->variant == ModelVariant::QWEN36) {
+                        req->qwen36_prefill_graph_build_ns += qwen36_prefill_graph_build_ns;
+                        req->qwen36_prefill_graph_execute_ns += graph_execute_ns;
+                        req->qwen36_prefill_total_ns += qwen36_prefill_graph_build_ns + graph_execute_ns;
+                        req->qwen36_prefill_ssm_projection_ns += qwen36_prefill_breakdown.ssm_projection_ns;
+                        req->qwen36_prefill_ssm_delta_state_ns += qwen36_prefill_breakdown.ssm_delta_state_ns;
+                        req->qwen36_prefill_attention_ns += qwen36_prefill_breakdown.attention_ns;
+                        req->qwen36_prefill_mlp_or_moe_ns += qwen36_prefill_breakdown.mlp_or_moe_ns;
+                        auto merge_prefill_slow_entries = [](std::vector<MatmulShapeCensusEntry>& dst,
+                                                             const std::vector<MatmulShapeCensusEntry>& src) {
+                            for (const auto& entry : src) {
+                                dst.push_back(entry);
+                            }
+                            std::sort(dst.begin(), dst.end(), [](const auto& a, const auto& b) {
+                                return a.ops != b.ops ? a.ops > b.ops : a.left_name < b.left_name;
+                            });
+                            if (dst.size() > kMatmulTopShapeCount) {
+                                dst.resize(kMatmulTopShapeCount);
+                            }
+                        };
+                        merge_prefill_slow_entries(req->qwen36_prefill_top_slow_ops,
+                                                   qwen36_prefill_breakdown.top_slow_ops);
+                    }
+                    if (native_moe_graph_timing.native_node_count > 0) {
+                        req->native_moe_graph_ns += native_moe_graph_timing.total_ns;
+                        if (!is_prefill_batch) {
+                            req->native_moe_fallback_w1w3_ns += native_moe_graph_timing.w1w3_ns;
+                            req->native_moe_fallback_w2_ns += native_moe_graph_timing.w2_ns;
+                            req->native_moe_fallback_w1w3_ops += native_moe_graph_timing.w1w3_count;
+                            req->native_moe_fallback_w2_ops += native_moe_graph_timing.w2_count;
+                            req->native_moe_fallback_ops += native_moe_graph_timing.w1w3_count +
+                                                            native_moe_graph_timing.w2_count +
+                                                            native_moe_graph_timing.reduce_count;
+                            const auto descriptor = densecore::models::DescribeModel(current_model);
+                            if (descriptor.variant == ModelVariant::QWEN35 ||
+                                descriptor.variant == ModelVariant::QWEN36) {
+                                req->native_moe_fast_decode_candidate_ops += 1;
+                                req->native_moe_fast_decode_rejected_ops += 1;
+                                req->native_moe_fast_decode_last_reject_reason = "fallback_safety";
+                                req->native_moe_fast_w2_q5k_candidate_ops +=
+                                    native_moe_graph_timing.w2_count > 0 ? 1 : 0;
+                                req->native_moe_fast_w2_q5k_rejected_ops +=
+                                    native_moe_graph_timing.w2_count > 0 ? 1 : 0;
+                                if (native_moe_graph_timing.w2_count > 0) {
+                                    req->native_moe_fast_w2_q5k_last_reject_reason = "fallback_safety";
+                                }
+                            }
+                        } else if (current_model && current_model->variant == ModelVariant::QWEN36) {
+                            req->qwen36_prefill_native_moe_fast_candidate_ops +=
+                                native_moe_graph_timing.w1w3_count + native_moe_graph_timing.w2_count;
+                            req->qwen36_prefill_native_moe_fast_rejected_ops +=
+                                native_moe_graph_timing.w1w3_count + native_moe_graph_timing.w2_count;
+                            req->qwen36_prefill_native_moe_fast_last_reject_reason =
+                                "prefill_batch_shape_not_supported";
+                        }
+                        req->moe_route_ns += native_moe_graph_timing.route_ns;
+                        req->moe_w1w3_ns += native_moe_graph_timing.w1w3_ns;
+                        req->moe_w2_ns += native_moe_graph_timing.w2_ns;
+                        req->moe_reduce_ns += native_moe_graph_timing.reduce_ns;
+                        req->moe_expert_ns += native_moe_graph_timing.w1w3_ns +
+                                               native_moe_graph_timing.activation_ns +
+                                               native_moe_graph_timing.w2_ns;
+                        req->native_moe_graph_node_hist = native_moe_graph_timing.node_hist;
+                        req->native_moe_graph_top_slow_nodes.insert(
+                            req->native_moe_graph_top_slow_nodes.end(),
+                            native_moe_graph_timing.top_slow_nodes.begin(),
+                            native_moe_graph_timing.top_slow_nodes.end());
+                        std::sort(req->native_moe_graph_top_slow_nodes.begin(),
+                                  req->native_moe_graph_top_slow_nodes.end(), [](const auto& a, const auto& b) {
+                                      return a.ops != b.ops ? a.ops > b.ops : a.left_name < b.left_name;
+                                  });
+                        if (req->native_moe_graph_top_slow_nodes.size() > kMatmulTopShapeCount) {
+                            req->native_moe_graph_top_slow_nodes.resize(kMatmulTopShapeCount);
+                        }
+                        if (native_moe_graph_timing.total_ns == 0) {
+                            req->native_moe_timing_missing = 1;
+                        }
+                    }
                     req->attention_ns += qwen36_profile.attention_ns;
                     req->paged_attention_ns += qwen36_profile.paged_attention_ns;
                     req->standard_attention_ns += qwen36_profile.standard_attention_ns;
@@ -4717,6 +5244,23 @@ void EngineLoop(EngineState* state) {
                     req->q4k_repacked_gemv_cache_waited_hits +=
                         qwen36_profile.q4k_repacked_gemv_cache_waited_hits;
                     req->q4k_repacked_gemv_cache_misses += qwen36_profile.q4k_repacked_gemv_cache_misses;
+                    req->q4k_repacked_gemv_cache_evictions +=
+                        std::max(qwen36_profile.q4k_repacked_gemv_cache_evictions, q4k_cache_evictions_delta);
+                    req->q4k_repacked_gemv_cache_evicted_bytes +=
+                        std::max(qwen36_profile.q4k_repacked_gemv_cache_evicted_bytes,
+                                 q4k_cache_evicted_bytes_delta);
+                    req->q4k_repacked_gemv_repack_bytes +=
+                        std::max(qwen36_profile.q4k_repacked_gemv_repack_bytes, q4k_repack_bytes_delta);
+                    req->q4k_repacked_gemv_probe_ns += qwen36_profile.q4k_repacked_gemv_probe_ns;
+                    req->q4k_repacked_gemv_resident_bytes =
+                        std::max(req->q4k_repacked_gemv_resident_bytes,
+                                 std::max(qwen36_profile.q4k_repacked_gemv_resident_bytes,
+                                          q4k_cache_after.resident_bytes));
+                    req->q4k_repacked_gemv_distinct_weights_seen =
+                        std::max(req->q4k_repacked_gemv_distinct_weights_seen,
+                                 qwen36_profile.q4k_repacked_gemv_distinct_weights_seen);
+                    req->q4k_repacked_gemv_repeated_repack_count +=
+                        qwen36_profile.q4k_repacked_gemv_repeated_repack_count;
                     req->q4k_copied_gemv_experiment_cache_hits +=
                         qwen36_profile.q4k_copied_gemv_experiment_cache_hits;
                     req->q4k_copied_gemv_experiment_cache_misses +=
@@ -4785,6 +5329,16 @@ void EngineLoop(EngineState* state) {
                                   << ",ssm_out:" << qwen36_profile.qwen36_ssm_q8_prefill_amx_out_count;
                         req->qwen36_ssm_q8_prefill_amx_projection_counts = q8_counts.str();
                     }
+                    req->qwen36_ssm_q8_prefill_amx_candidate_ops +=
+                        qwen36_profile.qwen36_ssm_q8_prefill_amx_candidate_ops;
+                    req->qwen36_ssm_q8_prefill_amx_used_ops +=
+                        qwen36_profile.qwen36_ssm_q8_prefill_amx_used_ops;
+                    req->qwen36_ssm_q8_prefill_amx_rejected_ops +=
+                        qwen36_profile.qwen36_ssm_q8_prefill_amx_rejected_ops;
+                    for (std::size_t i = 0; i < req->qwen36_ssm_projection_weight_type_hist.size(); ++i) {
+                        req->qwen36_ssm_projection_weight_type_hist[i] +=
+                            qwen36_profile.qwen36_ssm_projection_weight_type_hist[i];
+                    }
                     if (IsQwen36HybridSSMModel(current_model) &&
                         Qwen36HybridSSMProjectionWeightsAreNotQ4K(current_model)) {
                         const auto& fast_config = GetFastPathRuntimeConfig();
@@ -4804,12 +5358,246 @@ void EngineLoop(EngineState* state) {
                     }
                     req->q4k_repacked_gemv_used =
                         std::max(req->q4k_repacked_gemv_used, qwen36_profile.q4k_repacked_gemv_used);
+                    req->q4k_repacked_gemv_seen_ops += qwen36_profile.q4k_repacked_gemv_seen_ops;
+                    req->q4k_repacked_gemv_candidate_ops += qwen36_profile.q4k_repacked_gemv_candidate_ops;
+                    req->q4k_repacked_gemv_used_ops += qwen36_profile.q4k_repacked_gemv_used_ops;
+                    req->q4k_repacked_gemv_rejected_ops += qwen36_profile.q4k_repacked_gemv_rejected_ops;
                     if (qwen36_profile.q4k_repacked_gemv_last_reject_reason != 0) {
                         req->q4k_repacked_gemv_last_reject_reason =
                             qwen36_profile.q4k_repacked_gemv_last_reject_reason;
-                        req->q4k_repacked_gemv_reject_reason =
+                        req->q4k_repacked_gemv_last_reject_reason_text =
                             Q4KRepackedGemvRejectReasonName(qwen36_profile.q4k_repacked_gemv_last_reject_reason);
                     }
+                    if (qwen36_profile.q4k_repacked_gemv_primary_disable_reason != 0 &&
+                        req->q4k_repacked_gemv_primary_disable_reason == 0) {
+                        req->q4k_repacked_gemv_primary_disable_reason =
+                            qwen36_profile.q4k_repacked_gemv_primary_disable_reason;
+                        req->q4k_repacked_gemv_primary_disable_reason_text =
+                            Q4KRepackedGemvRejectReasonName(
+                                qwen36_profile.q4k_repacked_gemv_primary_disable_reason);
+                    }
+                    req->q4k_repacked_gemv_cache_thrash_detected =
+                        (req->q4k_repacked_gemv_repeated_repack_count > 0 ||
+                         Q4KRepackedGemvRejectReasonIsCacheThrash(req->q4k_repacked_gemv_primary_disable_reason))
+                            ? 1
+                            : 0;
+                    if (req->q4k_repacked_gemv_primary_disable_reason != 0) {
+                        req->q4k_repacked_gemv_effective_state = "disabled";
+                    } else if (req->q4k_repacked_gemv_used != 0 || req->q4k_repacked_gemv_used_ops != 0) {
+                        req->q4k_repacked_gemv_effective_state = "used";
+                    } else if (req->q4k_repacked_gemv_rejected_ops != 0) {
+                        req->q4k_repacked_gemv_effective_state = "rejected";
+                    } else {
+                        req->q4k_repacked_gemv_effective_state = "unused";
+                    }
+                    req->gemv_custom_tasks_effective =
+                        std::max(req->gemv_custom_tasks_effective, qwen36_profile.gemv_custom_tasks_effective);
+                    req->gemv_custom_total_ops += qwen36_profile.gemv_custom_total_ops;
+                    req->gemv_custom_decode_ops += qwen36_profile.gemv_custom_decode_ops;
+                    req->gemv_custom_prefill_ops += qwen36_profile.gemv_custom_prefill_ops;
+                    req->gemv_custom_q4k_seen_ops += qwen36_profile.gemv_custom_q4k_seen_ops;
+                    req->gemv_custom_non_q4k_ops += qwen36_profile.gemv_custom_non_q4k_ops;
+                    req->gemv_custom_quant_input_null_ops += qwen36_profile.gemv_custom_quant_input_null_ops;
+                    req->gemv_custom_shape_reject_ops += qwen36_profile.gemv_custom_shape_reject_ops;
+                    req->gemv_custom_phase_unknown_ops += qwen36_profile.gemv_custom_phase_unknown_ops;
+                    req->gemv_custom_force_reference_ops += qwen36_profile.gemv_custom_force_reference_ops;
+                    req->gemv_custom_dynamic_lora_ops += qwen36_profile.gemv_custom_dynamic_lora_ops;
+                    for (std::size_t i = 0; i < req->gemv_custom_weight_type_hist.size(); ++i) {
+                        req->gemv_custom_weight_type_hist[i] += qwen36_profile.gemv_custom_weight_type_hist[i];
+                    }
+                    for (std::size_t i = 0; i < req->gemv_custom_quant_input_type_hist.size(); ++i) {
+                        req->gemv_custom_quant_input_type_hist[i] +=
+                            qwen36_profile.gemv_custom_quant_input_type_hist[i];
+                    }
+                    if (qwen36_profile.gemv_custom_tasks_cap_reason != 0) {
+                        req->gemv_custom_tasks_cap_reason =
+                            GemvCustomTaskCapReasonName(qwen36_profile.gemv_custom_tasks_cap_reason);
+                    }
+                    req->decode_matmul_created_ops += qwen36_profile.decode_matmul_created_ops;
+                    for (std::size_t i = 0; i < req->decode_matmul_weight_type_hist.size(); ++i) {
+                        req->decode_matmul_weight_type_hist[i] += qwen36_profile.decode_matmul_weight_type_hist[i];
+                    }
+                    for (std::size_t i = 0; i < req->decode_matmul_path_hist.size(); ++i) {
+                        req->decode_matmul_path_hist[i] += qwen36_profile.decode_matmul_path_hist[i];
+                    }
+                    for (std::size_t i = 0; i < req->prefill_matmul_weight_type_hist.size(); ++i) {
+                        req->prefill_matmul_weight_type_hist[i] += qwen36_profile.prefill_matmul_weight_type_hist[i];
+                    }
+                    for (std::size_t i = 0; i < req->prefill_matmul_path_hist.size(); ++i) {
+                        req->prefill_matmul_path_hist[i] += qwen36_profile.prefill_matmul_path_hist[i];
+                    }
+                    auto merge_shape_entries = [](std::vector<MatmulShapeCensusEntry>& dst,
+                                                  const std::vector<MatmulShapeCensusEntry>& src) {
+                        for (const auto& entry : src) {
+                            auto it = std::find_if(dst.begin(), dst.end(), [&](const MatmulShapeCensusEntry& existing) {
+                                return existing.phase == entry.phase && existing.dispatch_path == entry.dispatch_path &&
+                                       existing.weight_type == entry.weight_type &&
+                                       existing.shape_bucket == entry.shape_bucket &&
+                                       existing.left_name == entry.left_name && existing.right_name == entry.right_name;
+                            });
+                            if (it == dst.end()) {
+                                dst.push_back(entry);
+                            } else {
+                                it->ops += entry.ops;
+                            }
+                        }
+                        std::sort(dst.begin(), dst.end(), [](const auto& a, const auto& b) {
+                            return a.ops != b.ops ? a.ops > b.ops : a.shape_bucket < b.shape_bucket;
+                        });
+                        if (dst.size() > kMatmulTopShapeCount) {
+                            dst.resize(kMatmulTopShapeCount);
+                        }
+                    };
+                    merge_shape_entries(req->decode_matmul_top_shapes, qwen36_profile.decode_matmul_top_shapes);
+                    req->q6k_gemv_seen_ops += qwen36_profile.q6k_gemv_seen_ops;
+                    req->q6k_gemv_candidate_ops += qwen36_profile.q6k_gemv_candidate_ops;
+                    req->q6k_gemv_used_ops += qwen36_profile.q6k_gemv_used_ops;
+                    req->q6k_gemv_rejected_ops += qwen36_profile.q6k_gemv_rejected_ops;
+                    req->q6k_gemv_reject_quant_input_null_ops +=
+                        qwen36_profile.q6k_gemv_reject_quant_input_null_ops;
+                    req->q6k_gemv_reject_unsupported_quant_input_ops +=
+                        qwen36_profile.q6k_gemv_reject_unsupported_quant_input_ops;
+                    req->q6k_gemv_reject_shape_ops += qwen36_profile.q6k_gemv_reject_shape_ops;
+                    req->q6k_gemv_reject_phase_ops += qwen36_profile.q6k_gemv_reject_phase_ops;
+                    req->q6k_gemv_reject_kernel_unavailable_ops +=
+                        qwen36_profile.q6k_gemv_reject_kernel_unavailable_ops;
+                    req->q6k_gemv_total_ns += qwen36_profile.q6k_gemv_total_ns;
+                    if (qwen36_profile.q6k_gemv_last_reject_reason != 0) {
+                        req->q6k_gemv_last_reject_reason =
+                            Q6KGemvRejectReasonName(qwen36_profile.q6k_gemv_last_reject_reason);
+                    }
+                    if (!qwen36_profile.q6k_gemv_effective_phase.empty()) {
+                        req->q6k_gemv_effective_phase = qwen36_profile.q6k_gemv_effective_phase;
+                    }
+                    if (!qwen36_profile.q6k_gemv_graph_phase.empty()) {
+                        req->q6k_gemv_graph_phase = qwen36_profile.q6k_gemv_graph_phase;
+                    }
+                    if (!qwen36_profile.q6k_gemv_callback_phase.empty()) {
+                        req->q6k_gemv_callback_phase = qwen36_profile.q6k_gemv_callback_phase;
+                    }
+                    merge_shape_entries(req->q6k_gemv_weight_shapes, qwen36_profile.q6k_gemv_weight_shapes);
+                    req->moe_small_decode_parallel_candidate_ops +=
+                        qwen36_profile.moe_small_decode_parallel_candidate_ops;
+                    req->moe_small_decode_parallel_used_ops += qwen36_profile.moe_small_decode_parallel_used_ops;
+                    req->moe_small_decode_parallel_rejected_ops +=
+                        qwen36_profile.moe_small_decode_parallel_rejected_ops;
+                    if (!qwen36_profile.moe_small_decode_parallel_last_reject_reason.empty()) {
+                        req->moe_small_decode_parallel_last_reject_reason =
+                            qwen36_profile.moe_small_decode_parallel_last_reject_reason;
+                    }
+                    for (std::size_t i = 0; i < req->moe_expert_matmul_weight_type_hist.size(); ++i) {
+                        req->moe_expert_matmul_weight_type_hist[i] +=
+                            qwen36_profile.moe_expert_matmul_weight_type_hist[i];
+                    }
+                    req->moe_q4k_repacked_candidate_ops += qwen36_profile.moe_q4k_repacked_candidate_ops;
+                    req->moe_q4k_repacked_used_ops += qwen36_profile.moe_q4k_repacked_used_ops;
+                    req->moe_q4k_repacked_rejected_ops += qwen36_profile.moe_q4k_repacked_rejected_ops;
+                    if (!qwen36_profile.moe_q4k_repacked_last_reject_reason.empty()) {
+                        req->moe_q4k_repacked_last_reject_reason =
+                            qwen36_profile.moe_q4k_repacked_last_reject_reason;
+                    }
+                    req->native_moe_fast_decode_candidate_ops +=
+                        qwen36_profile.native_moe_fast_decode_candidate_ops;
+                    req->native_moe_fast_decode_used_ops += qwen36_profile.native_moe_fast_decode_used_ops;
+                    req->native_moe_fast_decode_rejected_ops +=
+                        qwen36_profile.native_moe_fast_decode_rejected_ops;
+                    req->native_moe_fast_decode_w1w3_used_ops +=
+                        qwen36_profile.native_moe_fast_decode_w1w3_used_ops;
+                    req->native_moe_fast_decode_w2_used_ops +=
+                        qwen36_profile.native_moe_fast_decode_w2_used_ops;
+                    req->native_moe_fast_decode_ns += qwen36_profile.native_moe_fast_decode_ns;
+                    req->native_moe_fast_w1w3_ns += qwen36_profile.native_moe_fast_w1w3_ns;
+                    req->native_moe_fast_w2_ns += qwen36_profile.native_moe_fast_w2_ns;
+                    req->native_moe_fast_reduce_ns += qwen36_profile.native_moe_fast_reduce_ns;
+                    req->native_moe_fast_total_ns += qwen36_profile.native_moe_fast_total_ns;
+                    req->native_moe_fast_w1w3_used_ops += qwen36_profile.native_moe_fast_w1w3_used_ops;
+                    req->native_moe_fast_w2_used_ops += qwen36_profile.native_moe_fast_w2_used_ops;
+                    req->native_moe_fast_w2_q5k_candidate_ops +=
+                        qwen36_profile.native_moe_fast_w2_q5k_candidate_ops;
+                    req->native_moe_fast_w2_q5k_used_ops += qwen36_profile.native_moe_fast_w2_q5k_used_ops;
+                    req->native_moe_fast_w2_q5k_rejected_ops +=
+                        qwen36_profile.native_moe_fast_w2_q5k_rejected_ops;
+                    req->native_moe_fast_w2_q5k_ns += qwen36_profile.native_moe_fast_w2_q5k_ns;
+                    if (!qwen36_profile.native_moe_fast_decode_last_reject_reason.empty()) {
+                        req->native_moe_fast_decode_last_reject_reason =
+                            qwen36_profile.native_moe_fast_decode_last_reject_reason;
+                    }
+                    if (!qwen36_profile.native_moe_fast_w2_q5k_last_reject_reason.empty()) {
+                        req->native_moe_fast_w2_q5k_last_reject_reason =
+                            qwen36_profile.native_moe_fast_w2_q5k_last_reject_reason;
+                    }
+                    if (req->native_moe_fast_decode_used_ops > 0 &&
+                        (req->native_moe_fallback_w1w3_ops > 0 || req->native_moe_fallback_w2_ops > 0)) {
+                        req->native_moe_fast_duplicate_work_detected = 1;
+                    }
+                    if (req->native_moe_fast_decode_candidate_ops > 0 &&
+                        req->native_moe_fast_decode_w2_used_ops == 0) {
+                        req->native_moe_fast_missing_w2 = 1;
+                    }
+                    if (qwen36_profile.qwen35_moe_path != 0) {
+                        req->qwen35_moe_path = Qwen35MoEPathName(qwen36_profile.qwen35_moe_path);
+                    }
+                    req->qwen35_moe_layers_seen += qwen36_profile.qwen35_moe_layers_seen;
+                    req->qwen35_moe_forward_calls += qwen36_profile.qwen35_moe_forward_calls;
+                    for (std::size_t i = 0; i < req->qwen35_moe_w1w3_weight_type_hist.size(); ++i) {
+                        req->qwen35_moe_w1w3_weight_type_hist[i] +=
+                            qwen36_profile.qwen35_moe_w1w3_weight_type_hist[i];
+                        req->qwen35_moe_w2_weight_type_hist[i] += qwen36_profile.qwen35_moe_w2_weight_type_hist[i];
+                    }
+                    req->qwen35_moe_selected_expert_count =
+                        std::max(req->qwen35_moe_selected_expert_count,
+                                 qwen36_profile.qwen35_moe_selected_expert_count);
+                    req->qwen35_moe_top_k = std::max(req->qwen35_moe_top_k, qwen36_profile.qwen35_moe_top_k);
+                    req->native_moe_selected_experts = std::max(req->native_moe_selected_experts,
+                                                                qwen36_profile.qwen35_moe_selected_expert_count);
+                    req->native_moe_fast_covered_experts =
+                        req->native_moe_fast_decode_used_ops > 0 ? req->native_moe_selected_experts : 0;
+                    if (req->native_moe_fast_decode_used_ops > 0 &&
+                        req->native_moe_fast_covered_experts < req->native_moe_selected_experts) {
+                        req->native_moe_fast_partial_expert_coverage = 1;
+                    }
+                    req->qwen35_moe_instrumentation_missing =
+                        std::max(req->qwen35_moe_instrumentation_missing,
+                                 qwen36_profile.qwen35_moe_instrumentation_missing);
+                    req->moe_selected_expert_count =
+                        std::max(req->moe_selected_expert_count, qwen36_profile.moe_selected_expert_count);
+                    req->moe_top_k = std::max(req->moe_top_k, qwen36_profile.moe_top_k);
+                    req->moe_expert_parallel_tasks =
+                        std::max(req->moe_expert_parallel_tasks, qwen36_profile.moe_expert_parallel_tasks);
+                    for (const auto& entry : qwen36_profile.matmul_dispatch_top_slow_entries) {
+                        auto it = std::find_if(req->matmul_dispatch_top_slow_entries.begin(),
+                                               req->matmul_dispatch_top_slow_entries.end(),
+                                               [&](const MatmulDispatchCensusEntry& existing) {
+                                                   return existing.phase == entry.phase &&
+                                                          existing.dispatch_path == entry.dispatch_path &&
+                                                          existing.weight_type == entry.weight_type &&
+                                                          existing.shape_bucket == entry.shape_bucket;
+                                               });
+                        if (it == req->matmul_dispatch_top_slow_entries.end()) {
+                            req->matmul_dispatch_top_slow_entries.push_back(entry);
+                        } else {
+                            it->wall_ns += entry.wall_ns;
+                            it->ops += entry.ops;
+                        }
+                    }
+                    std::sort(req->matmul_dispatch_top_slow_entries.begin(),
+                              req->matmul_dispatch_top_slow_entries.end(), [](const auto& a, const auto& b) {
+                                  return a.wall_ns != b.wall_ns ? a.wall_ns > b.wall_ns : a.ops > b.ops;
+                              });
+                    if (req->matmul_dispatch_top_slow_entries.size() > kMatmulDispatchTopSlowCount) {
+                        req->matmul_dispatch_top_slow_entries.resize(kMatmulDispatchTopSlowCount);
+                    }
+                    merge_shape_entries(req->qwen36_prefill_top_slow_ops,
+                                        qwen36_profile.qwen36_prefill_top_slow_ops);
+                    req->qwen36_prefill_total_ns += qwen36_profile.qwen36_prefill_total_ns;
+                    req->qwen36_prefill_ssm_projection_ns +=
+                        qwen36_profile.qwen36_prefill_ssm_projection_ns;
+                    req->qwen36_prefill_ssm_delta_state_ns +=
+                        qwen36_profile.qwen36_prefill_ssm_delta_state_ns;
+                    req->qwen36_prefill_attention_ns += qwen36_profile.qwen36_prefill_attention_ns;
+                    req->qwen36_prefill_mlp_or_moe_ns += qwen36_profile.qwen36_prefill_mlp_or_moe_ns;
+                    req->qwen36_prefill_graph_build_ns += qwen36_profile.qwen36_prefill_graph_build_ns;
+                    req->qwen36_prefill_graph_execute_ns += qwen36_profile.qwen36_prefill_graph_execute_ns;
                     req->q4k_copied_gemv_experiment_used =
                         std::max(req->q4k_copied_gemv_experiment_used,
                                  qwen36_profile.q4k_copied_gemv_experiment_used);

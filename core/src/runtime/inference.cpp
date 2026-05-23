@@ -30,6 +30,7 @@
 #include <numeric>
 #include <queue>
 #include <random>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <vector>

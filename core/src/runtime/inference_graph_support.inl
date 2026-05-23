@@ -53,6 +53,7 @@ using densecore::llm::config::DecodePagedAttentionMode;
 using densecore::llm::config::DecodePagedAttentionPolicy;
 using densecore::llm::config::KVRetentionPolicy;
 using densecore::llm::config::KVRetentionSpan;
+using densecore::llm::runtime::ResolveFastPathRuntimeConfig;
 
 constexpr const char* kGemma4RouterScaleKey = "gemma4.router.scale";
 constexpr const char* kGemma4RouterPerExpertScaleKey = "gemma4.router.per_expert_scale";
@@ -641,6 +642,73 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     const bool use_fused_gate_up =
         gate_up_exps && gate_up_exps->type == gate_exps->type && gate_up_exps->ne[0] == gate_exps->ne[0] &&
         gate_up_exps->ne[1] == gate_exps->ne[1] + up_exps->ne[1] && gate_up_exps->ne[2] == n_experts;
+    const ggml_type w1w3_type = use_fused_gate_up ? gate_up_exps->type : gate_exps->type;
+    if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+        const BatchSpec* current_batch = GetCurrentBatch();
+        const auto& fast_config = ResolveFastPathRuntimeConfig(current_batch);
+        const InferenceExecutionPhase phase = GetCurrentExecutionPhase();
+        const auto* w1w3_traits = ggml_get_type_traits_cpu(w1w3_type);
+        const auto* w2_traits = ggml_get_type_traits_cpu(down_exps->type);
+        const bool dynamic_lora_active = current_batch && !current_batch->lora_map.empty();
+        const bool supported_quant = w1w3_type == GGML_TYPE_Q4_K && down_exps->type == GGML_TYPE_Q5_K;
+        const bool supported_w1w3_quant = w1w3_type == GGML_TYPE_Q4_K;
+        const bool supported_w2_quant = down_exps->type == GGML_TYPE_Q5_K;
+        const bool supported_shape = phase == InferenceExecutionPhase::Decode && n_tokens > 0 && n_tokens <= 4;
+        const bool selected_experts_available = n_expert_used > 0 && n_expert_used <= n_experts;
+        const bool fast_kernel_available =
+            w1w3_traits && w1w3_traits->vec_dot && w2_traits && w2_traits->vec_dot;
+        const bool fast_decode_candidate =
+            phase == InferenceExecutionPhase::Decode && n_experts > 0 &&
+            (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36);
+        const bool fast_decode_supported =
+            fast_decode_candidate && fast_config.native_moe_fast_decode != densecore::env::RuntimeToggleMode::Off &&
+            supported_shape && selected_experts_available && supported_quant && !dynamic_lora_active &&
+            fast_kernel_available;
+        const bool fast_decode_used = false;
+        if (fast_decode_candidate) {
+            const char* reason = fast_decode_supported ? "fallback_safety" : "none";
+            if (fast_config.native_moe_fast_decode == densecore::env::RuntimeToggleMode::Off) {
+                reason = "disabled";
+            } else if (!supported_shape) {
+                reason = "unsupported_shape";
+            } else if (!selected_experts_available) {
+                reason = "missing_selected_experts";
+            } else if (dynamic_lora_active) {
+                reason = "dynamic_lora";
+            } else if (!supported_w1w3_quant) {
+                reason = "unsupported_w1w3_quant";
+            } else if (!supported_w2_quant) {
+                reason = "unsupported_w2_quant";
+            } else if (!fast_kernel_available) {
+                reason = "no_fast_kernel";
+            }
+            RecordNativeMoEFastDecodeDecision(work_ctx, /*candidate=*/true, fast_decode_used, reason,
+                                             /*w1w3_used=*/fast_decode_used,
+                                             /*w2_used=*/fast_decode_used);
+            if (supported_w2_quant) {
+                RecordNativeMoEFastW2Q5KDecision(work_ctx, /*candidate=*/true, /*used=*/false, reason);
+            }
+        }
+    }
+    if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+        const InferenceExecutionPhase phase = GetCurrentExecutionPhase();
+        RecordGraphBuildMatmulCensus(work_ctx, phase, "moe_native", w1w3_type, n_tokens,
+                                     use_fused_gate_up ? gate_up_exps->ne[1] : gate_exps->ne[1], n_embd,
+                                     use_fused_gate_up ? gate_up_exps->name : gate_exps->name, routed_input->name,
+                                     n_tokens <= 1 || phase == InferenceExecutionPhase::Decode);
+        if (!use_fused_gate_up) {
+            RecordGraphBuildMatmulCensus(work_ctx, phase, "moe_native", up_exps->type, n_tokens, up_exps->ne[1],
+                                         n_embd, up_exps->name, routed_input->name,
+                                         n_tokens <= 1 || phase == InferenceExecutionPhase::Decode);
+        }
+        RecordGraphBuildMatmulCensus(work_ctx, phase, "moe_native", down_exps->type, n_tokens, n_embd,
+                                     down_exps->ne[0], down_exps->name, "qwen35_native_moe_swiglu",
+                                     n_tokens <= 1 || phase == InferenceExecutionPhase::Decode);
+        if (model->variant == ModelVariant::QWEN35) {
+            RecordQwen35MoEGraphPath(work_ctx, "native_graph", static_cast<int>(n_expert_used),
+                                     static_cast<int>(n_expert_used), w1w3_type, down_exps->type);
+        }
+    }
 
     ggml_tensor* selected_experts = ggml_argsort_top_k(ctx, gate_logits, static_cast<int>(n_expert_used));
     ggml_set_name(selected_experts, "qwen35_native_moe_topk");
@@ -2096,6 +2164,8 @@ struct GemvUserData {
     std::atomic<uint64_t>* quantized_stamp = nullptr;
     uintptr_t model_identity = 0;
     bool dynamic_lora_active = false;
+    InferenceWorkContext* work_ctx = nullptr;
+    InferenceExecutionPhase phase_snapshot = InferenceExecutionPhase::Unknown;
 };
 
 struct GemvBatchedUserData {

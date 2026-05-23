@@ -24,6 +24,19 @@ bool ParseLegacyEnabledBool(const char* name, bool default_value) {
     return std::strcmp(env_value, "0") != 0;
 }
 
+double ParsePositiveDoubleEnv(const char* name, double default_value) {
+    const char* env_value = std::getenv(name);
+    if (!env_value || env_value[0] == '\0') {
+        return default_value;
+    }
+    char* end = nullptr;
+    const double parsed = std::strtod(env_value, &end);
+    if (end == env_value || end == nullptr || *end != '\0' || !(parsed > 0.0)) {
+        return default_value;
+    }
+    return parsed;
+}
+
 Qwen36PrefillQ4KBatchedMode ParseQwen36PrefillQ4KBatchedMode(const char* value) {
     const std::string mode = env::AsciiLowerCopy(value);
     if (mode.empty() || mode == "probe" || mode == "auto") {
@@ -300,6 +313,8 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
         env::ParsePositiveEnvInt("DENSECORE_QWEN36_SSM_Q8_PREFILL_AMX_MIN_TOKENS", 256);
     config.qwen36_expert_cpu_repack = ParseRuntimeToggleEnvFailClosed(
         "DENSECORE_QWEN36_EXPERT_CPU_REPACK", env::RuntimeToggleMode::Auto);
+    config.native_moe_fast_decode = ParseRuntimeToggleEnvFailClosed("DENSECORE_NATIVE_MOE_FAST_DECODE",
+                                                                    env::RuntimeToggleMode::Auto);
     const char* q4k_gemv_env = std::getenv("DENSECORE_Q4K_REPACKED_GEMV");
     if (!q4k_gemv_env || q4k_gemv_env[0] == '\0') {
         q4k_gemv_env = std::getenv("DENSECORE_ENABLE_Q4K_REPACKED_GEMV");
@@ -308,11 +323,22 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
         (!q4k_gemv_env || q4k_gemv_env[0] == '\0')
             ? env::RuntimeToggleMode::Auto
             : env::ParseRuntimeToggleModeValue(q4k_gemv_env, env::RuntimeToggleMode::Off);
+    config.q6k_repacked_gemv = ParseRuntimeToggleEnvFailClosed("DENSECORE_Q6K_REPACKED_GEMV",
+                                                               env::RuntimeToggleMode::Auto);
     config.q4k_repacked_gemv_allow_prefill =
         env::ParseTruthyEnv("DENSECORE_Q4K_REPACKED_GEMV_ALLOW_PREFILL", false);
     config.q4k_repacked_gemv_probe =
         env::ParseTruthyEnv("DENSECORE_Q4K_REPACKED_GEMV_PROBE",
                             config.q4k_repacked_gemv != env::RuntimeToggleMode::On);
+    config.q4k_repacked_gemv_disable_on_thrash =
+        env::ParseTruthyEnv("DENSECORE_Q4K_REPACKED_GEMV_DISABLE_ON_THRASH",
+                            config.q4k_repacked_gemv == env::RuntimeToggleMode::Auto);
+    config.q4k_repacked_gemv_thrash_repack_mb =
+        env::ParsePositiveEnvInt("DENSECORE_Q4K_REPACKED_GEMV_THRASH_REPACK_MB", 256);
+    config.q4k_repacked_gemv_thrash_eviction_ratio = std::clamp(
+        ParsePositiveDoubleEnv("DENSECORE_Q4K_REPACKED_GEMV_THRASH_EVICTION_RATIO", 0.25), 0.01, 1.0);
+    config.q4k_repacked_gemv_thrash_repack_cache_fraction = std::clamp(
+        ParsePositiveDoubleEnv("DENSECORE_Q4K_REPACKED_GEMV_THRASH_REPACK_CACHE_FRACTION", 0.50), 0.01, 4.0);
     const char* q4k_copied_experiment_env = std::getenv("DENSECORE_ENABLE_Q4K_COPIED_GEMV_EXPERIMENT");
     config.q4k_copied_gemv_experiment =
         q4k_copied_experiment_env && std::strcmp(q4k_copied_experiment_env, "1") == 0;
@@ -321,6 +347,7 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
         (!qact_cache_env || qact_cache_env[0] == '\0')
             ? env::RuntimeToggleMode::Off
             : env::ParseRuntimeToggleModeValue(qact_cache_env, env::RuntimeToggleMode::Off);
+    config.matmul_dispatch_census = env::ParseTruthyEnv("DENSECORE_MATMUL_DISPATCH_CENSUS", false);
     return config;
 }
 

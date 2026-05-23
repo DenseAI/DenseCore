@@ -500,9 +500,19 @@ bool CanUseQ5KRepackedMoEGemvFastPath() {
 #endif
 }
 
-bool CanUseSmallDecodeQuantizedTileParallel() {
+bool IsQwenA3BHybridMoEModel(const TransformerModel* model);
+
+bool CanUseSmallDecodeQuantizedTileParallel(const TransformerModel* model) {
     const char* env = std::getenv("DENSECORE_MOE_ENABLE_SMALL_DECODE_QUANT_TILE_PARALLEL");
-    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    if (env && env[0] != '\0') {
+        return std::strcmp(env, "0") != 0 && std::strcmp(env, "off") != 0 && std::strcmp(env, "OFF") != 0;
+    }
+    const char* fast_decode = std::getenv("DENSECORE_NATIVE_MOE_FAST_DECODE");
+    const bool fast_decode_forced =
+        fast_decode && fast_decode[0] != '\0' &&
+        (std::strcmp(fast_decode, "1") == 0 || std::strcmp(fast_decode, "on") == 0 ||
+         std::strcmp(fast_decode, "ON") == 0);
+    return fast_decode_forced && IsQwenA3BHybridMoEModel(model);
 }
 
 using MoEQ4Kx8Block = densecore::kernels::Q4KRepackedGemvBlock;
@@ -2150,6 +2160,25 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
 
     const ggml_type wtype = static_cast<ggml_type>(ggml_type_id);
     if (wtype == GGML_TYPE_F32 || !ggml_is_quantized(wtype)) return false;
+    InferenceWorkContext* census_ctx = GetCurrentWorkContext();
+    RecordMoEExpertMatmulWeightType(census_ctx, wtype);
+    const bool dispatch_census_enabled = []() {
+        const char* env = std::getenv("DENSECORE_MATMUL_DISPATCH_CENSUS");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
+               std::strcmp(env, "off") != 0;
+    }();
+    const auto dispatch_begin = dispatch_census_enabled ? std::chrono::steady_clock::now()
+                                                        : std::chrono::steady_clock::time_point{};
+    const auto record_dispatch = [&](const char* path) {
+        if (!dispatch_census_enabled) {
+            return;
+        }
+        const uint64_t wall_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - dispatch_begin)
+                .count());
+        RecordMatmulDispatchCensus(census_ctx, GetCurrentExecutionPhase(), path, wtype, input.shape[0], N, K,
+                                   wall_ns);
+    };
 
     const auto* type_traits = ggml_get_type_traits(wtype);
     const auto* type_traits_cpu = ggml_get_type_traits_cpu(wtype);
@@ -2197,6 +2226,16 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
         }
         qinput_data = qinput_buf.data();
     }
+    const bool q4k_repacked_candidate =
+        wtype == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K && (N % 8) == 0 &&
+        (K % ggml_blck_size(GGML_TYPE_Q4_K)) == 0;
+    bool q4k_repacked_reported = false;
+    const auto record_q4k_repacked = [&](bool used, const char* reject_reason) {
+        if (q4k_repacked_candidate && !q4k_repacked_reported) {
+            RecordMoEQ4KRepackedDecision(census_ctx, true, used, reject_reason);
+            q4k_repacked_reported = true;
+        }
+    };
 
     const bool use_kquant_rowpair_vec_dot = allow_kquant_rowpair_vec_dot && CanUseKQuantRowPairVecDotFastPath() &&
                                             (wtype == GGML_TYPE_Q4_K || wtype == GGML_TYPE_Q6_K) &&
@@ -2208,6 +2247,8 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                                           allow_parallel)) {
             LogMoEMatmulPath("ggml_q4k_raw_batched", static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0,
                              allow_parallel);
+            record_q4k_repacked(false, "raw_batched_used");
+            record_dispatch("moe_expert");
             return true;
         }
     }
@@ -2218,12 +2259,16 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
             RunQ4KRepackedMoEGemmM4(backend, packed, in_data, out_data, M, N, K, numa_node, allow_parallel)) {
             LogMoEMatmulPath("ggml_q4k_repacked_prefill_gemm_m4", static_cast<int>(M), static_cast<int>(K),
                              static_cast<int>(N), 0, allow_parallel);
+            record_q4k_repacked(true, nullptr);
+            record_dispatch("q4k_repacked_gemv");
             return true;
         }
         if (packed && RunQ4KRepackedMoEGemv(backend, packed, qinput_data, iq_row_bytes, out_data, M, N, numa_node,
                                             allow_parallel)) {
             LogMoEMatmulPath("ggml_q4k_repacked_prefill_gemv", static_cast<int>(M), static_cast<int>(K),
                              static_cast<int>(N), 0, allow_parallel);
+            record_q4k_repacked(true, nullptr);
+            record_dispatch("q4k_repacked_gemv");
             return true;
         }
     }
@@ -2258,6 +2303,8 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
         }
         const char* path_name = wtype == GGML_TYPE_Q4_K ? "ggml_q4k_rowpair_m2_vecdot" : "ggml_q6k_rowpair_m2_vecdot";
         LogMoEMatmulPath(path_name, static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0, allow_parallel);
+        record_q4k_repacked(false, "rowpair_used");
+        record_dispatch("moe_rowblock");
         return true;
     }
 
@@ -2295,6 +2342,7 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
         }
         LogMoEMatmulPath("ggml_q5k_colpair_vecdot", static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0,
                          allow_parallel);
+        record_dispatch("moe_rowblock");
         return true;
     }
 
@@ -2305,6 +2353,7 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                                             allow_parallel)) {
             LogMoEMatmulPath("ggml_q6k_repacked_gemv", static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0,
                              allow_parallel);
+            record_dispatch("moe_expert");
             return true;
         }
     }
@@ -2316,6 +2365,7 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                                             allow_parallel)) {
             LogMoEMatmulPath("ggml_q5k_repacked_gemv", static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0,
                              allow_parallel);
+            record_dispatch("moe_expert");
             return true;
         }
     }
@@ -2327,6 +2377,8 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                                             allow_parallel)) {
             LogMoEMatmulPath("ggml_q4k_repacked_gemv", static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0,
                              allow_parallel);
+            record_q4k_repacked(true, nullptr);
+            record_dispatch("q4k_repacked_gemv");
             return true;
         }
     }
@@ -2388,6 +2440,8 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                                                       : "ggml_q4k_rowpair_m1_vecdot";
         LogMoEMatmulPath(path, static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0, allow_parallel);
     }
+    record_q4k_repacked(false, use_q4k_rowpair_vec_dot ? "rowpair_used" : "native_vecdot");
+    record_dispatch(use_q4k_rowpair_vec_dot ? "moe_rowblock" : "moe_expert");
     return true;
 }
 
@@ -2440,6 +2494,19 @@ bool TryRunGgmlQuantizedFusedGEGLUProjection(CpuBackend* backend, const void* ga
     const size_t up_row_bytes = ggml_row_size(up_type, K);
     const char* gate_data = static_cast<const char*>(gate_weight_ptr);
     const char* up_data = static_cast<const char*>(up_weight_ptr);
+    InferenceWorkContext* census_ctx = GetCurrentWorkContext();
+    RecordMoEExpertMatmulWeightType(census_ctx, gate_type);
+    RecordMoEExpertMatmulWeightType(census_ctx, up_type);
+    const bool q4k_repacked_candidate =
+        gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K && (N % 8) == 0 &&
+        (K % ggml_blck_size(GGML_TYPE_Q4_K)) == 0;
+    bool q4k_repacked_reported = false;
+    const auto record_q4k_repacked = [&](bool used, const char* reject_reason) {
+        if (q4k_repacked_candidate && !q4k_repacked_reported) {
+            RecordMoEQ4KRepackedDecision(census_ctx, true, used, reject_reason);
+            q4k_repacked_reported = true;
+        }
+    };
 
     const size_t total_qbytes = static_cast<size_t>(M) * iq_row_bytes;
     uint8_t* qinput_data = nullptr;
@@ -2475,6 +2542,7 @@ bool TryRunGgmlQuantizedFusedGEGLUProjection(CpuBackend* backend, const void* ga
                                           M, N, K, numa_node, allow_parallel)) {
             LogMoEMatmulPath("ggml_q4k_raw_batched_fused_geglu", static_cast<int>(M), static_cast<int>(K),
                              static_cast<int>(N), 0, allow_parallel);
+            record_q4k_repacked(false, "raw_batched_used");
             return true;
         }
     }
@@ -2487,6 +2555,7 @@ bool TryRunGgmlQuantizedFusedGEGLUProjection(CpuBackend* backend, const void* ga
                                         M, N, K, numa_node, allow_parallel)) {
             LogMoEMatmulPath("ggml_q4k_repacked_fused_geglu", static_cast<int>(M), static_cast<int>(K),
                              static_cast<int>(N), 0, allow_parallel);
+            record_q4k_repacked(true, nullptr);
             return true;
         }
     }
@@ -2534,6 +2603,7 @@ bool TryRunGgmlQuantizedFusedGEGLUProjection(CpuBackend* backend, const void* ga
                            : gate_type == GGML_TYPE_Q5_1 ? "ggml_q5_1_rowpair_m1_fused_geglu"
                                                          : "ggml_q4k_rowpair_m1_fused_geglu";
         LogMoEMatmulPath(path, static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0, allow_parallel);
+        record_q4k_repacked(false, "rowpair_used");
         return true;
     }
     return false;
@@ -2588,6 +2658,19 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
     float* out_data = output->DataAs<float>();
     const char* gate_data = static_cast<const char*>(gate_weight_ptr);
     const char* up_data = static_cast<const char*>(up_weight_ptr);
+    InferenceWorkContext* census_ctx = GetCurrentWorkContext();
+    RecordMoEExpertMatmulWeightType(census_ctx, gate_type);
+    RecordMoEExpertMatmulWeightType(census_ctx, up_type);
+    const bool q4k_repacked_candidate =
+        gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K && (N % 8) == 0 &&
+        (K % ggml_blck_size(GGML_TYPE_Q4_K)) == 0;
+    bool q4k_repacked_reported = false;
+    const auto record_q4k_repacked = [&](bool used, const char* reject_reason) {
+        if (q4k_repacked_candidate && !q4k_repacked_reported) {
+            RecordMoEQ4KRepackedDecision(census_ctx, true, used, reject_reason);
+            q4k_repacked_reported = true;
+        }
+    };
 
     const size_t total_qbytes = static_cast<size_t>(M) * iq_row_bytes;
     uint8_t* qinput_data = nullptr;
@@ -2629,6 +2712,7 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
                                            M, N, K, numa_node, allow_parallel)) {
             LogMoEMatmulPath("ggml_q4k_raw_batched_fused_swiglu", static_cast<int>(M), static_cast<int>(K),
                              static_cast<int>(N), 0, allow_parallel);
+            record_q4k_repacked(false, "raw_batched_used");
             return true;
         }
     }
@@ -2642,6 +2726,7 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
                 LogMoEMatmulPath(M >= 4 ? "ggml_q4k_repacked_prefill_gemm_m4_tile_fused_swiglu"
                                         : "ggml_q4k_repacked_prefill_tile_fused_swiglu",
                                  static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0, allow_parallel);
+                record_q4k_repacked(true, nullptr);
                 return true;
             }
         }
@@ -2683,6 +2768,7 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
         }
         LogMoEMatmulPath("ggml_q4k_rowpair_m2_fused_swiglu", static_cast<int>(M), static_cast<int>(K),
                          static_cast<int>(N), 0, allow_parallel);
+        record_q4k_repacked(false, "rowpair_used");
         return true;
     }
     if (M == 1 && gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K &&
@@ -2694,6 +2780,7 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
                                                out_data, M, N, K, numa_node, allow_parallel)) {
                 LogMoEMatmulPath("ggml_q4k_repacked_tile_fused_swiglu", static_cast<int>(M), static_cast<int>(K),
                                  static_cast<int>(N), 0, allow_parallel);
+                record_q4k_repacked(true, nullptr);
                 return true;
             }
         }
@@ -2763,6 +2850,7 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
         LogMoEMatmulPath("ggml_q4k_rowpair_m1_fused_swiglu", static_cast<int>(M), static_cast<int>(K),
                          static_cast<int>(N), 0, allow_parallel);
     }
+    record_q4k_repacked(false, use_q4k_rowpair_vec_dot ? "rowpair_used" : "native_vecdot");
     return true;
 }
 
@@ -3576,6 +3664,15 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
     const bool small_decode_ready = small_decode_candidate && !small_decode_requires_general_path &&
                                     small_step_snapshot_ok && small_step_max_expert_batch <= 1 &&
                                     small_step_current_batch_expert_count > 0;
+    if (!small_decode_ready) {
+        const char* reject_reason = !small_decode_candidate        ? "not_small_decode"
+                                    : small_decode_requires_general_path ? "requires_general_path"
+                                    : !small_step_snapshot_ok          ? "snapshot_unavailable"
+                                    : small_step_max_expert_batch > 1  ? "expert_batch_gt_1"
+                                                                        : "no_active_experts";
+        RecordMoESmallDecodeParallelDecision(GetCurrentWorkContext(), small_decode_candidate, false, reject_reason,
+                                             small_step_current_batch_expert_count, top_k, total_assignments);
+    }
     if (small_decode_ready) {
         int reuse_intersection = 0;
         if (small_step_previous_batch_count > 0) {
@@ -3684,6 +3781,10 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
         const int effective_small_decode_workers = std::min(total_assignments, expert_parallel_decision.workers);
         const bool use_small_decode_expert_parallel =
             expert_parallel_decision.enabled && effective_small_decode_workers > 1;
+        RecordMoESmallDecodeParallelDecision(
+            GetCurrentWorkContext(), true, use_small_decode_expert_parallel,
+            use_small_decode_expert_parallel ? nullptr : expert_parallel_decision.reason,
+            small_step_current_batch_expert_count, top_k, effective_small_decode_workers);
         int64_t small_decode_intermediate_dim = 0;
         for (int i = 0; i < total_assignments && small_decode_intermediate_dim <= 0; ++i) {
             const int expert_id = routing.expert_ids[static_cast<size_t>(i)];
@@ -3693,7 +3794,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             }
         }
         const bool use_small_decode_quantized_tile_parallel =
-            CanUseSmallDecodeQuantizedTileParallel() && expert_parallel_decision.enabled && !safe_reference_mode &&
+            CanUseSmallDecodeQuantizedTileParallel(model) && expert_parallel_decision.enabled && !safe_reference_mode &&
             batch_size == 1 && small_decode_worker_cap >= 16 && total_assignments >= 4 && hidden_dim >= 1024 &&
             small_decode_intermediate_dim >= 256;
         if (use_small_decode_quantized_tile_parallel) {

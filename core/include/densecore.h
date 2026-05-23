@@ -594,6 +594,17 @@ DENSECORE_API int SubmitRenderedRequestIdsWithSamplingConstraintsCallbackEx(
     TokenCallbackEx callback, void* user_data);
 
 /**
+ * Submit an already-rendered chat prompt with sampling constraints. DenseCore
+ * tokenizes/previews the rendered prompt and submits the resulting token IDs
+ * internally, avoiding a C++ -> Go -> C++ token-ID round trip.
+ */
+DENSECORE_API int DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx(
+    DenseCoreHandle handle, const char* rendered_prompt, int max_tokens, const char* lora_name, float temperature,
+    float top_p, int top_k, float repetition_penalty, const char** stop_sequences, int json_mode,
+    const int* allowed_token_ids, int num_allowed_token_ids, int allowed_token_ids_strict,
+    const int* disallowed_token_ids, int num_disallowed_token_ids, TokenCallbackEx callback, void* user_data);
+
+/**
  * Submit a request with token IDs and format specification (Non-blocking)
  *
  * @param handle Handle to the DenseCore engine

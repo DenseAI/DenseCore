@@ -99,7 +99,7 @@ TEST(DecodeThreadPolicy, Qwen36SinglePrefillUsesFullCoreProfileOnC4A) {
         ResolvePrefillThreadPolicySelection(&model, 1, 32, 16, 16, SimdLevel::SVE2);
 
     EXPECT_EQ(selection.threads, 16);
-    EXPECT_STREQ(selection.label, "prefill_qwen36_single_c4a_full_core");
+    EXPECT_STREQ(selection.label, "prefill_qwen36_single_long_prompt");
 }
 
 TEST(DecodeThreadPolicy, Qwen36SinglePrefillUsesMediumPromptProfileOnWideSimd) {
@@ -112,7 +112,7 @@ TEST(DecodeThreadPolicy, Qwen36SinglePrefillUsesMediumPromptProfileOnWideSimd) {
         ResolvePrefillThreadPolicySelection(&model, 1, 96, 16, 16, SimdLevel::AVX512);
 
     EXPECT_EQ(selection.threads, 12);
-    EXPECT_STREQ(selection.label, "prefill_qwen36_single_medium_prompt");
+    EXPECT_STREQ(selection.label, "prefill_qwen36_single_short_prompt");
 }
 
 TEST(DecodeThreadPolicy, Qwen36SinglePrefillUsesLongPromptProfileOnWideSimd) {
@@ -137,8 +137,8 @@ TEST(DecodeThreadPolicy, Qwen36DenseSingleDecodeUsesC4SweetSpotOnWideSimd) {
     const DecodeThreadPolicySelection selection =
         ResolveDecodeThreadPolicySelection(&model, 1, 16, 16, SimdLevel::AVX512);
 
-    EXPECT_EQ(selection.threads, 10);
-    EXPECT_STREQ(selection.label, "decode_qwen36_dense27_c4_sweet_spot");
+    EXPECT_EQ(selection.threads, 16);
+    EXPECT_STREQ(selection.label, "decode_qwen36_dense_c4_16");
 }
 
 TEST(DecodeThreadPolicy, Qwen36A3BSingleDecodeUsesC4SweetSpotOnWideSimd) {
@@ -236,8 +236,8 @@ TEST(DecodeThreadPolicy, Qwen36SingleDecodeIgnoresLegacyEnvOverride) {
     const DecodeThreadPolicySelection selection =
         ResolveDecodeThreadPolicySelection(&model, 1, 16, 16, SimdLevel::AVX512);
 
-    EXPECT_EQ(selection.threads, 10);
-    EXPECT_STREQ(selection.label, "decode_qwen36_dense27_c4_sweet_spot");
+    EXPECT_EQ(selection.threads, 16);
+    EXPECT_STREQ(selection.label, "decode_qwen36_dense_c4_16");
 }
 
 TEST(DecodeThreadPolicy, Qwen35HybridSsmSingleDecodeUsesC4FullCorePath) {
@@ -470,6 +470,42 @@ TEST(DecodeThreadPolicy, Qwen35MoEPrefillChunkAutoUsesC4MeasuredChunkForLongProm
     Request req{};
     req.prompt_token_count = 1536;
     req.prompt_tokens_for_cache.resize(1536, 1);
+
+    EXPECT_EQ(ResolveQwen36PrefillChunkTokens(&model, &req), ExpectedHybridSsmChunkTokensForRuntime());
+}
+
+TEST(DecodeThreadPolicy, Qwen35MoEPrefillChunkAutoChunksC4LongPrompt) {
+    ScopedEnvVar chunk_override("DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS", nullptr);
+    ScopedEnvVar auto_min("DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS", nullptr);
+    ScopedEnvVar default_tokens("DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS", nullptr);
+
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = false;
+    model.hparams.n_experts = 128;
+
+    Request req{};
+    req.prompt_token_count = 1457;
+    req.prompt_tokens_for_cache.resize(1457, 1);
+
+    EXPECT_EQ(ResolveQwen36PrefillChunkTokens(&model, &req), ExpectedHybridSsmChunkTokensForRuntime());
+}
+
+TEST(DecodeThreadPolicy, Qwen36PrefillChunkAutoChunksC4LongPrompt) {
+    ScopedEnvVar chunk_override("DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS", nullptr);
+    ScopedEnvVar auto_min("DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS", nullptr);
+    ScopedEnvVar default_tokens("DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS", nullptr);
+
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_experts = 128;
+
+    Request req{};
+    req.prompt_token_count = 1457;
+    req.prompt_tokens_for_cache.resize(1457, 1);
 
     EXPECT_EQ(ResolveQwen36PrefillChunkTokens(&model, &req), ExpectedHybridSsmChunkTokensForRuntime());
 }

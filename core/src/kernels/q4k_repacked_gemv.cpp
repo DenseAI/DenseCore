@@ -37,6 +37,14 @@ struct Q4KRepackedGemvKeyHash {
     }
 };
 
+uint64_t Q4KRepackedGemvStableKey(const Q4KRepackedGemvKey& key) {
+    uint64_t h = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(key.weight_ptr));
+    h ^= static_cast<uint64_t>(key.rows) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    h ^= static_cast<uint64_t>(key.cols) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    h ^= key.fingerprint + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    return h;
+}
+
 struct Q4KRepackedGemvCacheEntry {
     std::shared_ptr<Q4KRepackedGemvWeight> weight;
     bool building = false;
@@ -48,6 +56,9 @@ struct Q4KRepackedGemvCacheState {
     std::unordered_map<Q4KRepackedGemvKey, std::shared_ptr<Q4KRepackedGemvCacheEntry>, Q4KRepackedGemvKeyHash> entries;
     size_t cache_bytes = 0;
     std::atomic<uint64_t> use_clock{0};
+    std::atomic<uint64_t> evictions{0};
+    std::atomic<uint64_t> evicted_bytes{0};
+    std::atomic<uint64_t> repack_bytes{0};
 };
 
 Q4KRepackedGemvCacheState& CacheState() {
@@ -56,7 +67,7 @@ Q4KRepackedGemvCacheState& CacheState() {
 }
 
 void EvictIfNeededLocked(Q4KRepackedGemvCacheState& state, const Q4KRepackedGemvKey& protected_key,
-                         size_t cache_limit) {
+                         size_t cache_limit, uint64_t* evictions, uint64_t* evicted_bytes) {
     while (state.cache_bytes > cache_limit && state.entries.size() > 1) {
         auto oldest = state.entries.end();
         for (auto it = state.entries.begin(); it != state.entries.end(); ++it) {
@@ -71,7 +82,16 @@ void EvictIfNeededLocked(Q4KRepackedGemvCacheState& state, const Q4KRepackedGemv
         if (oldest == state.entries.end()) {
             break;
         }
-        state.cache_bytes -= oldest->second->weight->bytes;
+        const size_t bytes = oldest->second->weight->bytes;
+        state.cache_bytes -= bytes;
+        state.evictions.fetch_add(1, std::memory_order_relaxed);
+        state.evicted_bytes.fetch_add(static_cast<uint64_t>(bytes), std::memory_order_relaxed);
+        if (evictions) {
+            ++(*evictions);
+        }
+        if (evicted_bytes) {
+            *evicted_bytes += static_cast<uint64_t>(bytes);
+        }
         state.entries.erase(oldest);
     }
 }
@@ -91,9 +111,9 @@ bool Q4KRealPackedGemvKernelAvailable() {
 }
 
 size_t Q4KRepackedGemvCacheLimitBytes() {
-    const char* env = std::getenv("DENSECORE_MOE_Q4K_REPACK_CACHE_MB");
+    const char* env = std::getenv("DENSECORE_Q4K_REPACKED_GEMV_CACHE_MB");
     if (!env || env[0] == '\0') {
-        env = std::getenv("DENSECORE_Q4K_REPACKED_GEMV_CACHE_MB");
+        env = std::getenv("DENSECORE_MOE_Q4K_REPACK_CACHE_MB");
     }
     if (!env || env[0] == '\0') {
         constexpr size_t kMinBytes = 1024ull * 1024ull * 1024ull;
@@ -115,6 +135,48 @@ size_t Q4KRepackedGemvCacheLimitBytes() {
         return 0;
     }
     return static_cast<size_t>(mb) * 1024ull * 1024ull;
+}
+
+Q4KRepackedGemvCacheStats Q4KRepackedGemvCacheStatsSnapshot() {
+    auto& state = CacheState();
+    Q4KRepackedGemvCacheStats stats;
+    stats.evictions = state.evictions.load(std::memory_order_relaxed);
+    stats.evicted_bytes = state.evicted_bytes.load(std::memory_order_relaxed);
+    stats.repack_bytes = state.repack_bytes.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(state.mutex);
+    stats.resident_bytes = static_cast<uint64_t>(state.cache_bytes);
+    return stats;
+}
+
+Q4KRepackedGemvCacheStats Q4KRepackedGemvTrimCacheToBytes(size_t target_bytes) {
+    auto& state = CacheState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    while (state.cache_bytes > target_bytes) {
+        auto oldest = state.entries.end();
+        for (auto it = state.entries.begin(); it != state.entries.end(); ++it) {
+            if (!it->second || it->second->building || !it->second->weight) {
+                continue;
+            }
+            if (oldest == state.entries.end() ||
+                it->second->weight->last_use < oldest->second->weight->last_use) {
+                oldest = it;
+            }
+        }
+        if (oldest == state.entries.end()) {
+            break;
+        }
+        const size_t bytes = oldest->second->weight->bytes;
+        state.cache_bytes -= bytes;
+        state.evictions.fetch_add(1, std::memory_order_relaxed);
+        state.evicted_bytes.fetch_add(static_cast<uint64_t>(bytes), std::memory_order_relaxed);
+        state.entries.erase(oldest);
+    }
+    Q4KRepackedGemvCacheStats stats;
+    stats.evictions = state.evictions.load(std::memory_order_relaxed);
+    stats.evicted_bytes = state.evicted_bytes.load(std::memory_order_relaxed);
+    stats.repack_bytes = state.repack_bytes.load(std::memory_order_relaxed);
+    stats.resident_bytes = static_cast<uint64_t>(state.cache_bytes);
+    return stats;
 }
 
 uint64_t FingerprintQ4KRepackedGemvWeight(const void* weight_ptr, size_t bytes) {
@@ -163,7 +225,25 @@ std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(
     }
 
     const size_t raw_bytes = static_cast<size_t>(rows) * ggml_row_size(GGML_TYPE_Q4_K, cols);
+    const size_t blocks_per_row = static_cast<size_t>(cols / kQ4KSuperBlock);
+    const size_t packed_blocks = static_cast<size_t>(rows / 8) * blocks_per_row;
+    const size_t packed_bytes = packed_blocks * sizeof(Q4KRepackedGemvBlock);
+    if (lookup) {
+        lookup->cache_limit_bytes = static_cast<uint64_t>(cache_limit);
+        lookup->weight_bytes = static_cast<uint64_t>(packed_bytes);
+    }
+    if (packed_bytes == 0 || packed_bytes > cache_limit) {
+        if (lookup) {
+            lookup->cache_limit_too_small = true;
+            lookup->working_set_exceeds_cache = packed_bytes > cache_limit;
+            lookup->resident_bytes = Q4KRepackedGemvCacheStatsSnapshot().resident_bytes;
+        }
+        return nullptr;
+    }
     const Q4KRepackedGemvKey key{weight_ptr, rows, cols, FingerprintQ4KRepackedGemvWeight(weight_ptr, raw_bytes)};
+    if (lookup) {
+        lookup->weight_key = Q4KRepackedGemvStableKey(key);
+    }
     const uint64_t now = CacheState().use_clock.fetch_add(1, std::memory_order_relaxed) + 1;
     auto& state = CacheState();
 
@@ -177,6 +257,7 @@ std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(
                 entry->weight->last_use = now;
                 if (lookup) {
                     lookup->cache_hit = true;
+                    lookup->resident_bytes = static_cast<uint64_t>(state.cache_bytes);
                 }
                 return entry->weight;
             }
@@ -189,6 +270,7 @@ std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(
                     entry->weight->last_use = now;
                     if (lookup) {
                         lookup->cache_hit = true;
+                        lookup->resident_bytes = static_cast<uint64_t>(state.cache_bytes);
                     }
                     return entry->weight;
                 }
@@ -206,12 +288,17 @@ std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(
     candidate->rows = rows;
     candidate->cols = cols;
     candidate->blocks_per_row = cols / kQ4KSuperBlock;
-    const size_t packed_blocks = static_cast<size_t>(rows / 8) * static_cast<size_t>(candidate->blocks_per_row);
     candidate->blocks.resize(packed_blocks);
-    candidate->bytes = candidate->blocks.size() * sizeof(Q4KRepackedGemvBlock);
+    candidate->bytes = packed_bytes;
     candidate->last_use = now;
     if (ggml_repack_q4_K_8x8(weight_ptr, raw_bytes, rows, cols, candidate->blocks.data(), candidate->bytes) != 0) {
         candidate.reset();
+    } else {
+        state.repack_bytes.fetch_add(static_cast<uint64_t>(packed_bytes), std::memory_order_relaxed);
+        if (lookup) {
+            lookup->repacked = true;
+            lookup->repack_bytes = static_cast<uint64_t>(packed_bytes);
+        }
     }
 
     {
@@ -219,9 +306,19 @@ std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(
         if (candidate) {
             entry->weight = candidate;
             state.cache_bytes += candidate->bytes;
-            EvictIfNeededLocked(state, key, cache_limit);
+            uint64_t evictions = 0;
+            uint64_t evicted_bytes = 0;
+            EvictIfNeededLocked(state, key, cache_limit, &evictions, &evicted_bytes);
+            if (lookup) {
+                lookup->cache_evictions = evictions;
+                lookup->cache_evicted_bytes = evicted_bytes;
+                lookup->resident_bytes = static_cast<uint64_t>(state.cache_bytes);
+            }
         } else if (!entry->weight) {
             state.entries.erase(key);
+            if (lookup) {
+                lookup->resident_bytes = static_cast<uint64_t>(state.cache_bytes);
+            }
         }
         entry->building = false;
         entry->cv.notify_all();

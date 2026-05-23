@@ -46,6 +46,12 @@ enum class Q4KRepackedGemvRejectReason : int {
     CopiedExperimentDisabled = 10,
     ProbeFailed = 11,
     ReferenceForced = 12,
+    CacheThrashing = 13,
+    CacheLimitTooSmall = 14,
+    WorkingSetExceedsCache = 15,
+    RepeatedRepack = 16,
+    EvictionRatioHigh = 17,
+    RepackBytesHigh = 18,
 };
 
 const char* Q4KRepackedGemvRejectReasonName(int reason) {
@@ -76,6 +82,62 @@ const char* Q4KRepackedGemvRejectReasonName(int reason) {
             return "probe_failed";
         case Q4KRepackedGemvRejectReason::ReferenceForced:
             return "reference_forced";
+        case Q4KRepackedGemvRejectReason::CacheThrashing:
+            return "cache_thrashing";
+        case Q4KRepackedGemvRejectReason::CacheLimitTooSmall:
+            return "cache_limit_too_small";
+        case Q4KRepackedGemvRejectReason::WorkingSetExceedsCache:
+            return "working_set_exceeds_cache";
+        case Q4KRepackedGemvRejectReason::RepeatedRepack:
+            return "repeated_repack";
+        case Q4KRepackedGemvRejectReason::EvictionRatioHigh:
+            return "eviction_ratio_high";
+        case Q4KRepackedGemvRejectReason::RepackBytesHigh:
+            return "repack_bytes_high";
+    }
+    return "unknown";
+}
+
+bool Q4KRepackedGemvRejectReasonIsCacheThrash(int reason) {
+    switch (static_cast<Q4KRepackedGemvRejectReason>(reason)) {
+        case Q4KRepackedGemvRejectReason::CacheThrashing:
+        case Q4KRepackedGemvRejectReason::CacheLimitTooSmall:
+        case Q4KRepackedGemvRejectReason::WorkingSetExceedsCache:
+        case Q4KRepackedGemvRejectReason::RepeatedRepack:
+        case Q4KRepackedGemvRejectReason::EvictionRatioHigh:
+        case Q4KRepackedGemvRejectReason::RepackBytesHigh:
+            return true;
+        default:
+            return false;
+    }
+}
+
+enum class GemvCustomTaskCapReason : int {
+    Unknown = 0,
+    PhysicalCore = 1,
+    PerformanceProfileConfiguredThreads = 2,
+    SmallK64 = 3,
+    SmallK512 = 4,
+    SmallK1536 = 5,
+    SmallK3072 = 6,
+};
+
+const char* GemvCustomTaskCapReasonName(int reason) {
+    switch (static_cast<GemvCustomTaskCapReason>(reason)) {
+        case GemvCustomTaskCapReason::Unknown:
+            return "unknown";
+        case GemvCustomTaskCapReason::PhysicalCore:
+            return "physical_cores";
+        case GemvCustomTaskCapReason::PerformanceProfileConfiguredThreads:
+            return "perf_profile_configured_threads";
+        case GemvCustomTaskCapReason::SmallK64:
+            return "small_k_lt_64";
+        case GemvCustomTaskCapReason::SmallK512:
+            return "small_k_lt_512";
+        case GemvCustomTaskCapReason::SmallK1536:
+            return "small_k_lt_1536";
+        case GemvCustomTaskCapReason::SmallK3072:
+            return "small_k_lt_3072";
     }
     return "unknown";
 }
@@ -205,6 +267,7 @@ static void RecordQwen36SSMQ8PrefillAMXUsed(InferenceWorkContext* ctx, int proje
         return;
     }
     ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_used.store(1, std::memory_order_relaxed);
+    ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_used_ops.fetch_add(1, std::memory_order_relaxed);
     switch (projection_kind) {
         case 1:
             ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_qkv_count.fetch_add(1, std::memory_order_relaxed);
@@ -289,6 +352,112 @@ static bool Q4KRepackedGemvEnabled(const densecore::llm::config::FastPathRuntime
     return true;
 }
 
+static inline void RecordQ4KRepackedGemvCacheLookup(InferenceWorkContext* work_ctx,
+                                                    const densecore::kernels::Q4KRepackedGemvCacheLookup& lookup) {
+    if (!work_ctx) {
+        return;
+    }
+    auto& profile = work_ctx->qwen36_profile;
+    if (lookup.waited) {
+        profile.q4k_repacked_gemv_cache_waited_hits.fetch_add(1, std::memory_order_relaxed);
+    } else if (lookup.cache_hit) {
+        profile.q4k_repacked_gemv_cache_hits.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        profile.q4k_repacked_gemv_cache_misses.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (lookup.cache_evictions != 0) {
+        profile.q4k_repacked_gemv_cache_evictions.fetch_add(lookup.cache_evictions, std::memory_order_relaxed);
+    }
+    if (lookup.cache_evicted_bytes != 0) {
+        profile.q4k_repacked_gemv_cache_evicted_bytes.fetch_add(lookup.cache_evicted_bytes,
+                                                                std::memory_order_relaxed);
+    }
+    if (lookup.repack_bytes != 0) {
+        profile.q4k_repacked_gemv_repack_bytes.fetch_add(lookup.repack_bytes, std::memory_order_relaxed);
+    }
+    if (lookup.resident_bytes != 0) {
+        profile.q4k_repacked_gemv_resident_bytes.store(lookup.resident_bytes, std::memory_order_relaxed);
+    }
+    if (lookup.weight_key != 0) {
+        std::lock_guard<std::mutex> lock(work_ctx->q4k_repacked_gemv_request_mutex);
+        auto [it, inserted] = work_ctx->q4k_repacked_gemv_repack_counts.emplace(lookup.weight_key, 0);
+        if (inserted) {
+            profile.q4k_repacked_gemv_distinct_weights_seen.store(
+                static_cast<uint64_t>(work_ctx->q4k_repacked_gemv_repack_counts.size()), std::memory_order_relaxed);
+        }
+        if (lookup.repacked) {
+            ++it->second;
+            if (it->second > 1) {
+                profile.q4k_repacked_gemv_repeated_repack_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+}
+
+static inline void SetQ4KRepackedGemvAutoDisable(InferenceWorkContext* work_ctx, Q4KRepackedGemvRejectReason local_reason,
+                                                 Q4KRepackedGemvRejectReason* reason) {
+    if (!work_ctx || local_reason == Q4KRepackedGemvRejectReason::None) {
+        return;
+    }
+    const int encoded = static_cast<int>(local_reason);
+    int expected = 0;
+    work_ctx->qwen36_profile.q4k_repacked_gemv_primary_disable_reason.compare_exchange_strong(
+        expected, encoded, std::memory_order_relaxed);
+    work_ctx->qwen36_profile.q4k_repacked_gemv_last_reject_reason.store(encoded, std::memory_order_relaxed);
+    if (reason) {
+        *reason = local_reason;
+    }
+}
+
+static inline bool Q4KRepackedGemvShouldAutoDisableForLookup(
+    InferenceWorkContext* work_ctx, const densecore::llm::config::FastPathRuntimeConfig& config,
+    const densecore::kernels::Q4KRepackedGemvCacheLookup& lookup, Q4KRepackedGemvRejectReason* reason) {
+    if (!work_ctx || !config.q4k_repacked_gemv_disable_on_thrash ||
+        config.q4k_repacked_gemv != densecore::env::RuntimeToggleMode::Auto) {
+        return false;
+    }
+    Q4KRepackedGemvRejectReason local_reason = Q4KRepackedGemvRejectReason::None;
+    const uint64_t repeated_repack_count =
+        work_ctx->qwen36_profile.q4k_repacked_gemv_repeated_repack_count.load(std::memory_order_relaxed);
+    const uint64_t cache_evictions =
+        work_ctx->qwen36_profile.q4k_repacked_gemv_cache_evictions.load(std::memory_order_relaxed);
+    const uint64_t used_ops = work_ctx->qwen36_profile.q4k_repacked_gemv_used_ops.load(std::memory_order_relaxed);
+    const uint64_t repack_bytes =
+        work_ctx->qwen36_profile.q4k_repacked_gemv_repack_bytes.load(std::memory_order_relaxed);
+    const uint64_t repack_threshold_bytes =
+        static_cast<uint64_t>(std::max(1, config.q4k_repacked_gemv_thrash_repack_mb)) * 1024ULL * 1024ULL;
+    const uint64_t cache_fraction_threshold =
+        lookup.cache_limit_bytes == 0
+            ? 0
+            : static_cast<uint64_t>(static_cast<double>(lookup.cache_limit_bytes) *
+                                    config.q4k_repacked_gemv_thrash_repack_cache_fraction);
+    const uint64_t eviction_ratio_denominator = std::max<uint64_t>(1, used_ops);
+
+    if (repeated_repack_count > 0) {
+        local_reason = Q4KRepackedGemvRejectReason::RepeatedRepack;
+    } else if (lookup.working_set_exceeds_cache) {
+        local_reason = Q4KRepackedGemvRejectReason::WorkingSetExceedsCache;
+    } else if (lookup.cache_limit_too_small) {
+        local_reason = Q4KRepackedGemvRejectReason::CacheLimitTooSmall;
+    } else if (cache_evictions > 0 && repack_bytes >= repack_threshold_bytes &&
+               static_cast<double>(cache_evictions) / static_cast<double>(eviction_ratio_denominator) >
+                   config.q4k_repacked_gemv_thrash_eviction_ratio) {
+        local_reason = Q4KRepackedGemvRejectReason::EvictionRatioHigh;
+    } else if (repack_bytes >= repack_threshold_bytes &&
+               cache_fraction_threshold > 0 && repack_bytes > cache_fraction_threshold) {
+        local_reason = Q4KRepackedGemvRejectReason::RepackBytesHigh;
+    } else if (lookup.repacked && lookup.cache_evictions != 0 &&
+               work_ctx->qwen36_profile.q4k_repacked_gemv_cache_evictions.load(std::memory_order_relaxed) >
+                   lookup.cache_evictions) {
+        local_reason = Q4KRepackedGemvRejectReason::CacheThrashing;
+    }
+    if (local_reason == Q4KRepackedGemvRejectReason::None) {
+        return false;
+    }
+    SetQ4KRepackedGemvAutoDisable(work_ctx, local_reason, reason);
+    return true;
+}
+
 struct Q4KRepackedGemvProbeKey {
     const void* weight = nullptr;
     int64_t rows = 0;
@@ -364,6 +533,9 @@ static bool Q4KRepackedGemvProbePassed(const std::shared_ptr<densecore::kernels:
     static std::unordered_map<Q4KRepackedGemvProbeKey, std::shared_ptr<Q4KRepackedGemvProbeEntry>,
                               Q4KRepackedGemvProbeKeyHash>
         decisions;
+    static std::vector<Q4KRepackedGemvProbeKey> insertion_order;
+    const size_t max_entries = static_cast<size_t>(
+        std::max(1, densecore::env::ParsePositiveEnvInt("DENSECORE_Q4K_REPACKED_GEMV_PROBE_CACHE_MAX_ENTRIES", 4096)));
     const Q4KRepackedGemvProbeKey key{
         weight_data, rows, cols,
         densecore::kernels::Q4KRepackedGemvWeightFingerprint(weight_data, rows, cols),
@@ -384,6 +556,17 @@ static bool Q4KRepackedGemvProbePassed(const std::shared_ptr<densecore::kernels:
         entry = std::make_shared<Q4KRepackedGemvProbeEntry>();
         entry->running = true;
         decisions.emplace(key, entry);
+        insertion_order.push_back(key);
+        while (decisions.size() > max_entries && !insertion_order.empty()) {
+            auto victim = decisions.find(insertion_order.front());
+            if (victim != decisions.end() && victim->second && victim->second->running) {
+                break;
+            }
+            if (victim != decisions.end()) {
+                decisions.erase(victim);
+            }
+            insertion_order.erase(insertion_order.begin());
+        }
     }
 
     const bool passed = RunQ4KRepackedGemvProbe(packed, weight_data, quant_input, rows, cols);
@@ -828,6 +1011,11 @@ static std::shared_ptr<Q8RepackedGemvWeight> GetOrCreateQ8RepackedGemvWeight(con
 void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     auto* ud = static_cast<GemvUserData*>(userdata);
     if (!ud || !ud->weight_tensor) return;
+    InferenceWorkContext* callback_work_ctx = ud->work_ctx ? ud->work_ctx : GetCurrentWorkContext();
+    const BatchSpec* callback_batch =
+        (callback_work_ctx && callback_work_ctx->batch) ? callback_work_ctx->batch : GetCurrentBatch();
+    const InferenceExecutionPhase callback_phase =
+        callback_work_ctx ? callback_work_ctx->phase : ud->phase_snapshot;
 
     // Extract input tensor from dst->src[0] (GGML_OP_CUSTOM convention)
     const struct ggml_tensor* src = dst->src[0];
@@ -865,12 +1053,44 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
 
     const ggml_type weight_type = weight_tensor->type;
     const char* weight_name = weight_tensor->name[0] ? weight_tensor->name : "(unnamed)";
+    if (ith == 0 && callback_work_ctx) {
+        auto& profile = callback_work_ctx->qwen36_profile;
+        profile.gemv_custom_total_ops.fetch_add(1, std::memory_order_relaxed);
+        profile.gemv_custom_weight_type_hist[MatmulWeightTypeHistIndex(weight_type)].fetch_add(
+            1, std::memory_order_relaxed);
+        if (callback_phase == InferenceExecutionPhase::Decode) {
+            profile.gemv_custom_decode_ops.fetch_add(1, std::memory_order_relaxed);
+        } else if (callback_phase == InferenceExecutionPhase::Prefill) {
+            profile.gemv_custom_prefill_ops.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            profile.gemv_custom_phase_unknown_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (weight_type == GGML_TYPE_Q4_K) {
+            profile.gemv_custom_q4k_seen_ops.fetch_add(1, std::memory_order_relaxed);
+            profile.q4k_repacked_gemv_seen_ops.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            profile.gemv_custom_non_q4k_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (ud->dynamic_lora_active) {
+            profile.gemv_custom_dynamic_lora_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (ud->force_reference_scalar) {
+            profile.gemv_custom_force_reference_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     static const bool debug_gemv_timing = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_GEMV_TIMING");
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     const auto gemv_begin =
         (debug_gemv_timing && ith == 0) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool matmul_dispatch_census_enabled =
+        ith == 0 && callback_work_ctx && ResolveFastPathRuntimeConfig(callback_batch).matmul_dispatch_census;
+    const auto census_begin = matmul_dispatch_census_enabled ? std::chrono::steady_clock::now()
+                                                             : std::chrono::steady_clock::time_point{};
+    const auto q6k_begin = (ith == 0 && weight_type == GGML_TYPE_Q6_K) ? std::chrono::steady_clock::now()
+                                                                       : std::chrono::steady_clock::time_point{};
+    bool q6k_decision_recorded = false;
     const auto maybe_log_gemv_timing = [&](const char* path) {
         if (!debug_gemv_timing || ith != 0) {
             return;
@@ -886,6 +1106,49 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                      "[GEMV_TIMING] weight=%s type=%s path=%s K_out=%d N_in=%d nth=%d ith0_ms=%.3f\n",
                      weight_name, ggml_type_name(weight_type), path ? path : "unknown", K, N, nth, ms);
     };
+    const auto record_gemv_dispatch_census = [&](const char* dispatch_path) {
+        uint64_t wall_ns = 0;
+        if (census_begin != std::chrono::steady_clock::time_point{}) {
+            wall_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - census_begin)
+                    .count());
+        }
+        if (ith == 0 && weight_type == GGML_TYPE_Q6_K && callback_work_ctx && !q6k_decision_recorded) {
+            if (wall_ns == 0 && q6k_begin != std::chrono::steady_clock::time_point{}) {
+                wall_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - q6k_begin)
+                        .count());
+            }
+            const auto* q6_type_traits_cpu_for_census = ggml_get_type_traits_cpu(weight_type);
+            const bool q6_shape_decode_for_census = N > 0 && K > 0 && (N % QK_K) == 0 && K >= 1024 && N >= 1024;
+            const bool q6_effective_decode_for_census =
+                callback_phase == InferenceExecutionPhase::Decode || q6_shape_decode_for_census;
+            const bool q6_decode_candidate =
+                q6_effective_decode_for_census && dispatch_path &&
+                std::strcmp(dispatch_path, "q6k_direct_vecdot") == 0;
+            const bool q6_used = q6_decode_candidate && dispatch_path &&
+                                 std::strcmp(dispatch_path, "q6k_direct_vecdot") == 0 &&
+                                 q6_type_traits_cpu_for_census && q6_type_traits_cpu_for_census->vec_dot;
+            const char* reject_reason = "none";
+            if (!q6_decode_candidate) {
+                reject_reason = "not_decode";
+            } else if (!q6_type_traits_cpu_for_census || !q6_type_traits_cpu_for_census->vec_dot) {
+                reject_reason = "kernel_unavailable";
+            } else if (!q6_used) {
+                reject_reason = "fallback";
+            }
+            const char* callback_phase_name = MatmulPhaseName(callback_phase);
+            const char* graph_phase_name = q6_shape_decode_for_census ? "decode_shape" : callback_phase_name;
+            const char* effective_phase_name = q6_effective_decode_for_census ? "decode" : callback_phase_name;
+            RecordQ6KGemvDecision(callback_work_ctx, q6_decode_candidate, q6_used, reject_reason, weight_name, 1, K, N,
+                                  wall_ns, effective_phase_name, graph_phase_name, callback_phase_name);
+            q6k_decision_recorded = true;
+        }
+        if (!matmul_dispatch_census_enabled) {
+            return;
+        }
+        RecordMatmulDispatchCensus(callback_work_ctx, callback_phase, dispatch_path, weight_type, 1, K, N, wall_ns);
+    };
 
     // ==========================================================================
     // SHARED PRE-QUANTIZATION (token-position synchronized):
@@ -899,7 +1162,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
         if (input_type_traits && input_type_traits->from_float) {
             const size_t quant_input_size = ggml_row_size(ud->input_quant_type, N);
             if (quant_input_size > 0 && quant_input_size <= kMaxQuantInputBufferSize) {
-                const BatchSpec* batch = GetCurrentBatch();
+                const BatchSpec* batch = callback_batch;
                 const bool has_valid_stamp = ud->slot_id >= 0;
                 const uint64_t expected_stamp =
                     ComputeGemvBatchedQuantStamp(batch, 1, ud->slot_id, src->data, weight_tensor->data);
@@ -916,7 +1179,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                         input_type_traits->from_float(x_f32, quant_input_tls.data(), static_cast<int64_t>(N));
                         quant_input = quant_input_tls.data();
                     } else if (ith == 0) {
-                        InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+                        InferenceWorkContext* work_ctx = callback_work_ctx;
                         const auto& qact_config = ResolveFastPathRuntimeConfig(batch);
                         const int64_t token_pos =
                             (batch && batch->num_seqs == 1 && !batch->pos.empty()) ? batch->pos.front()
@@ -960,6 +1223,32 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     if (ith == 0 && quant_input) {
         RecordSharedQuantReuse(used_shared_quant_buffer);
     }
+    const bool q4k_candidate_shape_ok = N > 0 && K > 0 && (N % QK_K) == 0 && (K % 8) == 0;
+    const bool q4k_repacked_candidate =
+        weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K && quant_input &&
+        q4k_candidate_shape_ok;
+    const bool q6k_candidate_shape_ok = N > 0 && K > 0 && (N % QK_K) == 0 && K >= 1024 && N >= 1024;
+    const bool q6k_effective_decode_gemv =
+        callback_phase == InferenceExecutionPhase::Decode || q6k_candidate_shape_ok;
+    const bool q6k_decode_candidate =
+        weight_type == GGML_TYPE_Q6_K && q6k_effective_decode_gemv && ud->input_quant_type == GGML_TYPE_Q8_K &&
+        quant_input && q6k_candidate_shape_ok &&
+        !ud->dynamic_lora_active && !ud->force_reference_scalar;
+    if (ith == 0 && callback_work_ctx) {
+        auto& profile = callback_work_ctx->qwen36_profile;
+        profile.gemv_custom_quant_input_type_hist[MatmulQuantInputTypeHistIndex(ud->input_quant_type, quant_input != nullptr)]
+            .fetch_add(1, std::memory_order_relaxed);
+        if (!quant_input) {
+            profile.gemv_custom_quant_input_null_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K && quant_input &&
+            !q4k_candidate_shape_ok) {
+            profile.gemv_custom_shape_reject_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (q4k_repacked_candidate) {
+            profile.q4k_repacked_gemv_candidate_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 
     // Partition output dimension across threads
     const int k_per_thread = (K + nth - 1) / nth;
@@ -968,9 +1257,14 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
 
     if (k_start >= K) return;
 
+    const size_t row_stride = weight_tensor->nb[1];  // Bytes per row
+
     if (weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K && quant_input &&
         (ud->dynamic_lora_active || ud->force_reference_scalar) && ith == 0) {
-        if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+        if (InferenceWorkContext* work_ctx = callback_work_ctx) {
+            if (q4k_repacked_candidate) {
+                work_ctx->qwen36_profile.q4k_repacked_gemv_rejected_ops.fetch_add(1, std::memory_order_relaxed);
+            }
             work_ctx->qwen36_profile.q4k_repacked_gemv_last_reject_reason.store(
                 static_cast<int>(ud->dynamic_lora_active ? Q4KRepackedGemvRejectReason::DynamicLora
                                                          : Q4KRepackedGemvRejectReason::ReferenceForced),
@@ -981,61 +1275,126 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                 std::memory_order_relaxed);
         }
     }
+    if (weight_type == GGML_TYPE_Q6_K) {
+        const auto& fast_config = ResolveFastPathRuntimeConfig(callback_batch);
+        const auto* q6_type_traits_cpu = ggml_get_type_traits_cpu(weight_type);
+        const bool q6_env_enabled = fast_config.q6k_repacked_gemv != densecore::env::RuntimeToggleMode::Off;
+        const bool q6_can_use_direct = q6k_decode_candidate && q6_env_enabled && q6_type_traits_cpu &&
+                                       q6_type_traits_cpu->vec_dot;
+        const char* q6_reject_reason = "none";
+        if (!q6k_decode_candidate) {
+            if (!q6k_effective_decode_gemv) {
+                q6_reject_reason = "not_decode";
+            } else if (ud->dynamic_lora_active) {
+                q6_reject_reason = "dynamic_lora";
+            } else if (ud->force_reference_scalar) {
+                q6_reject_reason = "reference_forced";
+            } else if (!quant_input) {
+                q6_reject_reason = "quant_input_null";
+            } else if (ud->input_quant_type != GGML_TYPE_Q8_K) {
+                q6_reject_reason = "unsupported_quant_input";
+            } else {
+                q6_reject_reason = "unsupported_shape";
+            }
+        } else if (!q6_env_enabled) {
+            q6_reject_reason = "disabled";
+        } else if (!q6_type_traits_cpu || !q6_type_traits_cpu->vec_dot) {
+            q6_reject_reason = "kernel_unavailable";
+        }
+        if (q6_can_use_direct) {
+            for (int k = k_start; k < k_end; ++k) {
+                const void* row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
+                q6_type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
+            }
+            maybe_log_gemv_timing("q6k_direct_vecdot");
+            record_gemv_dispatch_census("q6k_direct_vecdot");
+            return;
+        }
+        if (ith == 0 && callback_work_ctx) {
+            const char* callback_phase_name = MatmulPhaseName(callback_phase);
+            const char* graph_phase_name = q6k_candidate_shape_ok ? "decode_shape" : callback_phase_name;
+            const char* effective_phase_name = q6k_effective_decode_gemv ? "decode" : callback_phase_name;
+            RecordQ6KGemvDecision(callback_work_ctx, q6k_decode_candidate, /*used=*/false, q6_reject_reason,
+                                  weight_name, 1, K, N, 0, effective_phase_name, graph_phase_name,
+                                  callback_phase_name);
+            q6k_decision_recorded = true;
+        }
+    }
     if (weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K && quant_input &&
         !ud->dynamic_lora_active && !ud->force_reference_scalar) {
         Q4KRepackedGemvRejectReason reject = Q4KRepackedGemvRejectReason::None;
-        InferenceWorkContext* dispatch_work_ctx = GetCurrentWorkContext();
-        const BatchSpec* batch = dispatch_work_ctx ? GetCurrentBatch() : nullptr;
+        InferenceWorkContext* dispatch_work_ctx = callback_work_ctx;
+        const BatchSpec* batch = (dispatch_work_ctx && dispatch_work_ctx->batch) ? dispatch_work_ctx->batch : callback_batch;
         const auto& fast_config = ResolveFastPathRuntimeConfig(batch);
         const bool real_repacked_enabled = Q4KRepackedGemvEnabled(fast_config, &reject);
         const bool use_copied_experiment = !real_repacked_enabled && Q4KCopiedGemvExperimentEnabled(fast_config);
+        if (dispatch_work_ctx) {
+            const int disable_reason =
+                dispatch_work_ctx->qwen36_profile.q4k_repacked_gemv_primary_disable_reason.load(
+                    std::memory_order_relaxed);
+            if (disable_reason != 0 && fast_config.q4k_repacked_gemv == densecore::env::RuntimeToggleMode::Auto) {
+                reject = static_cast<Q4KRepackedGemvRejectReason>(disable_reason);
+            }
+        }
         const bool phase_allows_repacked =
             dispatch_work_ctx && batch &&
-            (dispatch_work_ctx->phase == InferenceExecutionPhase::Decode ||
+            (callback_phase == InferenceExecutionPhase::Decode ||
              (fast_config.q4k_repacked_gemv_allow_prefill &&
-              dispatch_work_ctx->phase == InferenceExecutionPhase::Prefill));
+              callback_phase == InferenceExecutionPhase::Prefill));
         if (real_repacked_enabled && !phase_allows_repacked) {
             reject = Q4KRepackedGemvRejectReason::NotDecode;
         }
-        if (real_repacked_enabled && phase_allows_repacked) {
-            const bool shape_ok = N > 0 && K > 0 && (N % QK_K) == 0 && (K % 8) == 0;
+        if (real_repacked_enabled && phase_allows_repacked && reject == Q4KRepackedGemvRejectReason::None) {
+            const bool shape_ok = q4k_candidate_shape_ok;
             if (shape_ok) {
                 densecore::kernels::Q4KRepackedGemvCacheLookup cache_lookup;
                 auto packed = densecore::kernels::GetOrCreateQ4KRepackedGemvWeight(weight_data, K, N, &cache_lookup);
+                RecordQ4KRepackedGemvCacheLookup(dispatch_work_ctx, cache_lookup);
+                Q4KRepackedGemvShouldAutoDisableForLookup(dispatch_work_ctx, fast_config, cache_lookup, &reject);
                 const int tile_count = K / 8;
                 const int tile_start = (tile_count * ith) / nth;
                 const int tile_end = (tile_count * (ith + 1)) / nth;
                 const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, N);
                 bool probe_ok = true;
-                if (packed && fast_config.q4k_repacked_gemv_probe) {
+                if (reject == Q4KRepackedGemvRejectReason::None && packed && fast_config.q4k_repacked_gemv_probe) {
+                    const auto probe_begin = std::chrono::steady_clock::now();
                     probe_ok = Q4KRepackedGemvProbePassed(packed, weight_data, quant_input, K, N);
+                    if (dispatch_work_ctx) {
+                        AddQwen36ProfileNs(
+                            dispatch_work_ctx->qwen36_profile.q4k_repacked_gemv_probe_ns,
+                            static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - probe_begin)
+                                    .count()));
+                    }
                 }
-                if (packed && probe_ok &&
+                if (reject == Q4KRepackedGemvRejectReason::None && packed && probe_ok &&
                     densecore::kernels::RunQ4KRepackedGemv(packed, static_cast<const uint8_t*>(quant_input),
                                                            q8_row_bytes, output, K, tile_start, tile_end)) {
                     if (ith == 0) {
-                        InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+                        InferenceWorkContext* work_ctx = callback_work_ctx;
                         if (work_ctx) {
                             work_ctx->qwen36_profile.q4k_repacked_gemv_used.store(1, std::memory_order_relaxed);
+                            work_ctx->qwen36_profile.q4k_repacked_gemv_used_ops.fetch_add(
+                                1, std::memory_order_relaxed);
                             work_ctx->qwen36_profile.q4k_repacked_gemv_last_reject_reason.store(
                                 static_cast<int>(Q4KRepackedGemvRejectReason::None), std::memory_order_relaxed);
-                            if (cache_lookup.waited) {
-                                work_ctx->qwen36_profile.q4k_repacked_gemv_cache_waited_hits.fetch_add(
-                                    1, std::memory_order_relaxed);
-                            } else if (cache_lookup.cache_hit) {
-                                work_ctx->qwen36_profile.q4k_repacked_gemv_cache_hits.fetch_add(
-                                    1, std::memory_order_relaxed);
-                            } else {
-                                work_ctx->qwen36_profile.q4k_repacked_gemv_cache_misses.fetch_add(
-                                    1, std::memory_order_relaxed);
-                            }
                         }
                     }
                     maybe_log_gemv_timing("q4k_repacked_gemv");
+                    record_gemv_dispatch_census("q4k_repacked_gemv");
                     return;
                 }
-                reject = packed && !probe_ok ? Q4KRepackedGemvRejectReason::ProbeFailed
-                                             : Q4KRepackedGemvRejectReason::Cache;
+                if (reject == Q4KRepackedGemvRejectReason::None) {
+                    if (cache_lookup.working_set_exceeds_cache) {
+                        reject = Q4KRepackedGemvRejectReason::WorkingSetExceedsCache;
+                    } else if (cache_lookup.cache_limit_too_small) {
+                        reject = Q4KRepackedGemvRejectReason::CacheLimitTooSmall;
+                    } else {
+                        reject = packed && !probe_ok ? Q4KRepackedGemvRejectReason::ProbeFailed
+                                                     : Q4KRepackedGemvRejectReason::Cache;
+                    }
+                }
             } else {
                 reject = Q4KRepackedGemvRejectReason::Shape;
             }
@@ -1058,7 +1417,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                         output[k] = sum;
                     }
                     if (ith == 0) {
-                        InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+                        InferenceWorkContext* work_ctx = callback_work_ctx;
                         if (work_ctx) {
                             if (reject != Q4KRepackedGemvRejectReason::None) {
                                 work_ctx->qwen36_profile.q4k_repacked_gemv_last_reject_reason.store(
@@ -1076,10 +1435,11 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                         }
                     }
                     maybe_log_gemv_timing("q4k_copied_weight_experiment");
+                    record_gemv_dispatch_census("other");
                     return;
                 }
                 if (ith == 0) {
-                    if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+                    if (InferenceWorkContext* work_ctx = callback_work_ctx) {
                         work_ctx->qwen36_profile.q4k_copied_gemv_experiment_last_reject_reason.store(
                             static_cast<int>(Q4KCopiedGemvExperimentRejectReason::Cache),
                             std::memory_order_relaxed);
@@ -1090,21 +1450,27 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                     const auto copied_reason =
                         (N <= 0 || (N % QK_K) != 0) ? Q4KCopiedGemvExperimentRejectReason::Shape
                                                      : Q4KCopiedGemvExperimentRejectReason::MissingVecDot;
-                    if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+                    if (InferenceWorkContext* work_ctx = callback_work_ctx) {
                         work_ctx->qwen36_profile.q4k_copied_gemv_experiment_last_reject_reason.store(
                             static_cast<int>(copied_reason), std::memory_order_relaxed);
                     }
                 }
             }
         } else if (ith == 0) {
-            if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+            if (InferenceWorkContext* work_ctx = callback_work_ctx) {
                 work_ctx->qwen36_profile.q4k_copied_gemv_experiment_last_reject_reason.store(
                     static_cast<int>(Q4KCopiedGemvExperimentRejectReason::Disabled), std::memory_order_relaxed);
             }
         }
         if (ith == 0) {
-            InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+            InferenceWorkContext* work_ctx = callback_work_ctx;
             if (work_ctx) {
+                if (reject != Q4KRepackedGemvRejectReason::None) {
+                    if (q4k_repacked_candidate) {
+                        work_ctx->qwen36_profile.q4k_repacked_gemv_rejected_ops.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                }
                 work_ctx->qwen36_profile.q4k_repacked_gemv_last_reject_reason.store(
                     static_cast<int>(reject), std::memory_order_relaxed);
             }
@@ -1121,13 +1487,13 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
         const float* weight = reinterpret_cast<const float*>(weight_data);
         densecore::simd::GemvParallel(output, x_f32, weight, N, K, ith, nth);
         maybe_log_gemv_timing("f32");
+        record_gemv_dispatch_census("generic_gemv");
         return;
     }
 
     // ==========================================================================
     // CASE B: Quantized weights with pre-quantized input - use native vec_dot
     // ==========================================================================
-    const size_t row_stride = weight_tensor->nb[1];  // Bytes per row
     const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight_type);
     const void* sample_row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k_start) * row_stride;
     const bool allow_native_q4k_vecdot =
@@ -1169,6 +1535,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                     type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
                 }
                 maybe_log_gemv_timing("q8_0_repacked_4x8");
+                record_gemv_dispatch_census("generic_gemv");
                 return;
             }
         }
@@ -1205,6 +1572,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
             type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
         }
         maybe_log_gemv_timing(can_use_rowpair ? "quant_vecdot_rowpair" : "quant_vecdot");
+        record_gemv_dispatch_census("generic_gemv");
         return;
     }
 
@@ -1215,6 +1583,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     const auto* type_traits = ggml_get_type_traits(weight_type);
     if (!type_traits || !type_traits->to_float || N > static_cast<int>(kMaxDequantBufferSize)) {
         for (int k = k_start; k < k_end; k++) output[k] = 0.0f;
+        record_gemv_dispatch_census("other");
         return;
     }
     if (IsHybridSSMQkvWeightName(weight_name) && IsDebugMatmulDispatchEnabled() && ith == 0) {
@@ -1234,6 +1603,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
         output[k] = sum;
     }
     maybe_log_gemv_timing("dequant_reference");
+    record_gemv_dispatch_census("generic_gemv");
 }
 
 struct DensecoreBlockQ8K {
@@ -1675,11 +2045,14 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
     const size_t weight_row_stride = static_cast<size_t>(weight_tensor->nb[1]);
     const ggml_type weight_type = weight_tensor->type;
     const char* weight_name = weight_tensor->name[0] ? weight_tensor->name : "(unnamed)";
+    InferenceWorkContext* callback_work_ctx = ud->work_ctx ? ud->work_ctx : GetCurrentWorkContext();
+    const BatchSpec* callback_batch =
+        (callback_work_ctx && callback_work_ctx->batch) ? callback_work_ctx->batch : GetCurrentBatch();
     const auto record_quant_profile = [&](bool used_quantized, bool used_true_batched) {
         if (ith != 0 || profile_begin == std::chrono::steady_clock::time_point()) {
             return;
         }
-        InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+        InferenceWorkContext* work_ctx = callback_work_ctx;
         if (!work_ctx) {
             return;
         }
@@ -1702,10 +2075,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         if (!ud->qwen36_prefill_q4k_probe || !ud->qwen36_prefill_q4k_admission_key) {
             return;
         }
-        InferenceWorkContext* probe_work_ctx = GetCurrentWorkContext();
-        if (!probe_work_ctx) {
-            probe_work_ctx = ud->work_ctx;
-        }
+        InferenceWorkContext* probe_work_ctx = callback_work_ctx;
         if (probe_work_ctx) {
             probe_work_ctx->qwen36_profile.qwen36_prefill_q4k_probe_participants.fetch_add(
                 1, std::memory_order_relaxed);
@@ -1840,12 +2210,12 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
 
         if (can_quantize_inputs) {
             thread_local std::vector<uint8_t> quant_inputs_tls;
-            const BatchSpec* batch = GetCurrentBatch();
             const bool can_sync_on_stamp =
                 M <= quant_tile_cols && nth > 1 && ud->slot_id >= 0 && ud->quant_input_shared && ud->quantized_stamp;
             const uint64_t expected_stamp =
-                can_sync_on_stamp ? ComputeGemvBatchedQuantStamp(batch, M, ud->slot_id, src->data, weight_tensor->data)
-                                  : 0;
+                can_sync_on_stamp
+                    ? ComputeGemvBatchedQuantStamp(callback_batch, M, ud->slot_id, src->data, weight_tensor->data)
+                    : 0;
             bool logged_quant_reuse = false;
 
             for (int tile_start = 0; tile_start < M; tile_start += quant_tile_cols) {
@@ -2029,17 +2399,14 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     }
                     if (!all_rows_ok && ud->qwen36_prefill_q4k_admitted &&
                         ud->qwen36_prefill_q4k_admission_key) {
-                        InferenceWorkContext* downgrade_ctx = GetCurrentWorkContext();
-                        if (!downgrade_ctx) {
-                            downgrade_ctx = ud->work_ctx;
-                        }
+                        InferenceWorkContext* downgrade_ctx = callback_work_ctx;
                         DowngradeQwen36Q4KBatchedAdmissionOnRuntimeFailure(
                             ud->qwen36_prefill_q4k_admission_key, max_abs_diff,
                             Qwen36PrefillQ4KBatchedRejectReason::ProbeInternalError, downgrade_ctx);
                     }
                     if (all_rows_ok) {
                         if (ith == 0 && ud->qwen36_prefill_q4k_admission_key) {
-                            InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+                            InferenceWorkContext* work_ctx = callback_work_ctx;
                             if (work_ctx) {
                                 work_ctx->qwen36_profile.qwen36_prefill_q4k_batched_used.store(
                                     1, std::memory_order_relaxed);
@@ -3224,6 +3591,46 @@ inline struct ggml_tensor* ggml_glm_dsa_attention(struct ggml_context* ctx, stru
     return result;
 }
 
+static inline bool IsGemvServerPerformanceProfile(const densecore::llm::config::FastPathRuntimeConfig& fast_config) {
+    if (fast_config.bench_respect_threads) {
+        return true;
+    }
+    const std::string profile = densecore::env::AsciiLowerCopy(std::getenv("DENSECORE_BENCHMARK_PROFILE"));
+    return profile == "single-e2e" || profile == "go-server" || profile == "native-runtime";
+}
+
+static inline int ResolveGemvCustomOpTaskCount(const BatchSpec* batch, int N, int K, int requested_threads,
+                                               int physical_cores, GemvCustomTaskCapReason* cap_reason) {
+    int n_threads = std::max(1, requested_threads);
+    GemvCustomTaskCapReason reason = GemvCustomTaskCapReason::Unknown;
+    const auto& fast_config = ResolveFastPathRuntimeConfig(batch);
+    if (physical_cores > 0 && !(IsGemvServerPerformanceProfile(fast_config) && requested_threads >= 16)) {
+        n_threads = std::min(n_threads, physical_cores);
+        reason = GemvCustomTaskCapReason::PhysicalCore;
+    } else if (IsGemvServerPerformanceProfile(fast_config) && requested_threads >= 16) {
+        reason = GemvCustomTaskCapReason::PerformanceProfileConfiguredThreads;
+    }
+
+    if (K < 64) {
+        n_threads = 1;
+        reason = GemvCustomTaskCapReason::SmallK64;
+    } else if (K < 512) {
+        n_threads = std::min(n_threads, 2);
+        reason = GemvCustomTaskCapReason::SmallK512;
+    } else if (K < 1536) {
+        n_threads = std::min(n_threads, 4);
+        reason = GemvCustomTaskCapReason::SmallK1536;
+    } else if (K < 3072) {
+        n_threads = std::min(n_threads, 6);
+        reason = GemvCustomTaskCapReason::SmallK3072;
+    }
+    if (cap_reason) {
+        *cap_reason = reason;
+    }
+    (void)N;
+    return std::max(1, n_threads);
+}
+
 /**
  * Create a custom GGML operation for parallel GEMV
  *
@@ -3244,6 +3651,8 @@ inline struct ggml_tensor* ggml_mul_mat_gemv(struct ggml_context* ctx, struct gg
     userdata->input_quant_type = GGML_TYPE_F32;
     userdata->model_identity = 0;
     userdata->dynamic_lora_active = false;
+    userdata->work_ctx = GetCurrentWorkContext();
+    userdata->phase_snapshot = GetCurrentExecutionPhase();
     if (const BatchSpec* batch = GetCurrentBatch()) {
         userdata->dynamic_lora_active = !batch->lora_map.empty();
     }
@@ -3273,16 +3682,12 @@ inline struct ggml_tensor* ggml_mul_mat_gemv(struct ggml_context* ctx, struct gg
     int physical_cores = ResolveHardwareTopology(batch).GetPhysicalCoreCount();
     if (physical_cores <= 0) physical_cores = 4;
 
-    n_threads = std::min(n_threads, physical_cores);
-
-    if (K < 64) {
-        n_threads = 1;
-    } else if (K < 512) {
-        n_threads = std::min(n_threads, 2);
-    } else if (K < 1536) {
-        n_threads = std::min(n_threads, 4);
-    } else if (K < 3072) {
-        n_threads = std::min(n_threads, 6);
+    GemvCustomTaskCapReason cap_reason = GemvCustomTaskCapReason::Unknown;
+    n_threads = ResolveGemvCustomOpTaskCount(batch, N, K, n_threads, physical_cores, &cap_reason);
+    if (userdata->work_ctx) {
+        SetQwen36ProfileMax(userdata->work_ctx->qwen36_profile.gemv_custom_tasks_effective, n_threads);
+        userdata->work_ctx->qwen36_profile.gemv_custom_tasks_cap_reason.store(
+            static_cast<int>(cap_reason), std::memory_order_relaxed);
     }
 
     // ===========================================================================
@@ -4541,6 +4946,10 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             }
         }
         const int qwen36_ssm_projection_kind = Qwen36SSMProjectionKind(original_w_name);
+        if (dispatch_work_ctx && model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm &&
+            qwen36_ssm_projection_kind != 0 && original_weight) {
+            RecordQwen36SSMProjectionWeightType(dispatch_work_ctx, original_weight->type);
+        }
         const bool original_qwen36_ssm_q8_projection =
             model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm &&
             qwen36_ssm_projection_kind != 0 && original_weight && original_weight->type == GGML_TYPE_Q8_0 &&
@@ -4559,20 +4968,28 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         }
         if (original_qwen36_ssm_q8_projection && original_input_cols > 1) {
             dispatch_work_ctx = dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext();
-            auto reject_q8_prefill = [&](Qwen36SSMQ8PrefillAMXRejectReason reason) {
+            auto reject_q8_prefill = [&](Qwen36SSMQ8PrefillAMXRejectReason reason, bool candidate) {
+                if (candidate && dispatch_work_ctx) {
+                    dispatch_work_ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_rejected_ops.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
                 RecordQwen36SSMQ8PrefillAMXReject(dispatch_work_ctx, reason);
             };
             const Qwen36SSMQ8PrefillAMXRejectReason q8_prefill_gate = ResolveQwen36SSMQ8PrefillAMXReason(
                 fast_path_config.qwen36_ssm_q8_prefill_amx, dispatch_phase,
                 current_batch && !current_batch->lora_map.empty());
             if (q8_prefill_gate != Qwen36SSMQ8PrefillAMXRejectReason::None) {
-                reject_q8_prefill(q8_prefill_gate);
+                reject_q8_prefill(q8_prefill_gate, false);
             } else {
+                if (dispatch_work_ctx) {
+                    dispatch_work_ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_candidate_ops.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
                 auto it_prefill_amx = model->qwen36_ssm_q8_prefill_amx_aliases.find(original_weight);
                 if (it_prefill_amx == model->qwen36_ssm_q8_prefill_amx_aliases.end() || !it_prefill_amx->second) {
-                    reject_q8_prefill(Qwen36SSMQ8PrefillAMXRejectReason::AliasUnavailable);
+                    reject_q8_prefill(Qwen36SSMQ8PrefillAMXRejectReason::AliasUnavailable, true);
                 } else if (model->cpu_amx_aliases.find(it_prefill_amx->second) == model->cpu_amx_aliases.end()) {
-                    reject_q8_prefill(Qwen36SSMQ8PrefillAMXRejectReason::BackendUnavailable);
+                    reject_q8_prefill(Qwen36SSMQ8PrefillAMXRejectReason::BackendUnavailable, true);
                 } else {
                     weight = it_prefill_amx->second;
                     using_qwen36_ssm_q8_prefill_amx_alias = true;
@@ -4586,6 +5003,19 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const int K_dim = static_cast<int>(weight->ne[0]);
     const int N_dim = static_cast<int>(weight->ne[1]);
     const char* w_name = (weight->name[0] ? weight->name : "(unnamed)");
+    const char* input_name = (input && input->name[0]) ? input->name : "(unnamed)";
+    const bool matmul_expected_decode = M <= 1 || dispatch_phase == InferenceExecutionPhase::Decode;
+    const auto record_graph_matmul = [&](const char* selected_path) {
+        const char* census_path = selected_path;
+        if (original_qwen_hybrid_ssm_projection || (model && model->variant == ModelVariant::QWEN36 &&
+                                                    model->arch_flags.is_hybrid_ssm &&
+                                                    Qwen36SSMProjectionKind(original_w_name) != 0)) {
+            census_path = "ssm_projection";
+        }
+        RecordGraphBuildMatmulCensus(dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext(), dispatch_phase,
+                                     census_path, weight->type, M, N_dim, K_dim, w_name, input_name,
+                                     matmul_expected_decode);
+    };
     densecore::runtime::KernelAdmissionDescriptor kleidiai_desc{};
     kleidiai_desc.model_variant = model ? model->variant : ModelVariant::UNKNOWN;
     kleidiai_desc.is_gemma4 = model && model->arch_flags.is_gemma4;
@@ -4677,17 +5107,20 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     if (is_hybrid_ssm_qkv && ShouldForcePlainGgmlForHybridSSMQkv()) {
         LogMatmulDispatch(w_name, "PLAIN_GGML", M, N_dim, K_dim, "CONSERVATIVE_FALLBACK");
         LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "PLAIN_GGML_CONSERVATIVE_FALLBACK", false, false, false);
+        record_graph_matmul("ggml_mul_mat");
         return ggml_mul_mat(ctx, weight, input);
     }
 
     if (using_cpu_repack_alias) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
                           "GGML_CPU_REPACK");
+        record_graph_matmul("ggml_mul_mat");
         return ggml_mul_mat(ctx, weight, input);
     }
     if (using_qwen36_ssm_q8_prefill_amx_alias) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
                           "GGML_AMX_Q8_PREFILL", "qwen36_ssm_q8_prefill_amx");
+        record_graph_matmul("ssm_projection");
         return ggml_mul_mat(ctx, weight, input);
     }
 
@@ -4712,10 +5145,15 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         (is_hybrid_ssm_qkv &&
          (!model || model->variant != ModelVariant::QWEN36)) ||
         is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out;
-    if (force_plain_hybrid_ssm_prefill && !qwen_hybrid_ssm_quant_prefill_fast_path_eligible &&
+    const bool force_qwen36_hybrid_ssm_q4k_native_prefill =
+        (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
+        qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k && !qwen36_q4k_mode_on;
+    if (force_plain_hybrid_ssm_prefill &&
+        (!qwen_hybrid_ssm_quant_prefill_fast_path_eligible || force_qwen36_hybrid_ssm_q4k_native_prefill) &&
         ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 && M > 1) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "hybrid_ssm_prefill_correctness");
+        record_graph_matmul("ggml_mul_mat");
         return ggml_mul_mat(ctx, weight, input);
     }
 
@@ -4733,6 +5171,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     ) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "qwen35_prefill_quant_correctness");
+        record_graph_matmul("ggml_mul_mat");
         return ggml_mul_mat(ctx, weight, input);
     }
 
@@ -4741,6 +5180,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         M > 1 && !gemma4_q4k_prefill_fast_path_eligible) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "gemma4_prefill_quant_native");
+        record_graph_matmul("ggml_mul_mat");
         return ggml_mul_mat(ctx, weight, input);
     }
 
@@ -4753,6 +5193,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         !qwen36_lm_head_q4k_prefill_fast_path_eligible) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "qwen36_lm_head_prefill_correctness");
+        record_graph_matmul("ggml_mul_mat");
         return ggml_mul_mat(ctx, weight, input);
     }
 
@@ -4769,6 +5210,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                                   M == 1 ? "HWY_INT4_GEMV" : "HWY_INT4_BATCHED");
                 LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
                                         M == 1 ? "HWY_INT4_GEMV" : "HWY_INT4_BATCHED", false, false, true);
+                record_graph_matmul(M == 1 ? "custom_gemv" : "custom_batched_gemv");
                 return ggml_mul_mat_int4(ctx, weight, input, binding);
             }
         }
@@ -4781,6 +5223,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                 LogMatmulDispatch(w_name, "PACKED_FP8", M, N_dim, K_dim, M == 1 ? "FP8_GEMV" : "FP8_TILED_GEMM");
                 LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, M == 1 ? "FP8_GEMV" : "FP8_TILED_GEMM",
                                         false, false, false);
+                record_graph_matmul(M == 1 ? "custom_gemv" : "custom_batched_gemv");
                 return ggml_mul_mat_fp8(ctx, weight, input, binding);
             }
         }
@@ -4798,6 +5241,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     if (hal_matmul_candidate) {
         LogMatmulDispatch(w_name, "FLOAT_F32", M, N_dim, K_dim, "HAL_MATMUL_ROUTE");
         LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "HAL_MATMUL_ROUTE", false, false, false);
+        record_graph_matmul("other");
         return ggml_mul_mat_hal(ctx, weight, input, preferred_matmul_device);
     }
 
@@ -4884,6 +5328,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "GGML_NATIVE", "forced_ssm_qkv_plain_ggml");
             LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "GGML_NATIVE", false, false, false);
             LogMatmulPathOnce("ggml_mul_mat");
+            record_graph_matmul("ggml_mul_mat");
             return ggml_mul_mat(ctx, weight, input);
         }
         if (input->type != GGML_TYPE_F32) {
@@ -4902,6 +5347,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                                        !IsGemma4SharedDenseFfnWeightName(w_name);
         LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
                                 ggml_is_quantized(weight->type) ? "GEMV_QUANT" : "GEMV_F32", false, false, false);
+        record_graph_matmul("custom_gemv");
         return ggml_mul_mat_gemv(ctx, weight, input, ud);
     }
 
@@ -4915,6 +5361,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "GGML_NATIVE", "forced_ssm_qkv_plain_ggml");
             LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "GGML_NATIVE", false, false, false);
             LogMatmulPathOnce("ggml_mul_mat");
+            record_graph_matmul("ggml_mul_mat");
             return ggml_mul_mat(ctx, weight, input);
         }
         if (is_small_batch_quant_candidate) {
@@ -4937,6 +5384,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                                            : "GGML_QUANT_NRC_M")
                                     : "BATCHED_F32",
                                 is_small_batch_quant_candidate, false, false);
+        record_graph_matmul("custom_batched_gemv");
         return ggml_mul_mat_gemv_batched(ctx, weight, input, ud);
     }
 
@@ -4965,6 +5413,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "GGML_NATIVE");
     LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "GGML_NATIVE", false, false, false);
     LogMatmulPathOnce("ggml_mul_mat");
+    record_graph_matmul("ggml_mul_mat");
     return ggml_mul_mat(ctx, weight, input);
 }
 

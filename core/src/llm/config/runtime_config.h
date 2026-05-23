@@ -112,11 +112,18 @@ struct FastPathRuntimeConfig {
     Qwen36SSMQ8PrefillAMXMode qwen36_ssm_q8_prefill_amx = Qwen36SSMQ8PrefillAMXMode::Probe;
     int qwen36_ssm_q8_prefill_amx_min_tokens = 256;
     densecore::env::RuntimeToggleMode qwen36_expert_cpu_repack = densecore::env::RuntimeToggleMode::Auto;
+    densecore::env::RuntimeToggleMode native_moe_fast_decode = densecore::env::RuntimeToggleMode::Auto;
     densecore::env::RuntimeToggleMode q4k_repacked_gemv = densecore::env::RuntimeToggleMode::Auto;
+    densecore::env::RuntimeToggleMode q6k_repacked_gemv = densecore::env::RuntimeToggleMode::Auto;
     bool q4k_repacked_gemv_allow_prefill = false;
     bool q4k_repacked_gemv_probe = true;
+    bool q4k_repacked_gemv_disable_on_thrash = true;
+    int q4k_repacked_gemv_thrash_repack_mb = 256;
+    double q4k_repacked_gemv_thrash_eviction_ratio = 0.25;
+    double q4k_repacked_gemv_thrash_repack_cache_fraction = 0.50;
     bool q4k_copied_gemv_experiment = false;
     densecore::env::RuntimeToggleMode qact_cache = densecore::env::RuntimeToggleMode::Off;
+    bool matmul_dispatch_census = false;
     bool bench_respect_threads = false;
 };
 

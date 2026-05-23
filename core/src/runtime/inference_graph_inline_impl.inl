@@ -2018,6 +2018,14 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
                 // Use map_custom2: src0=cur, src1=gate_logits
                 g_moe_graph_wiring_debug_counter.fetch_add(1, std::memory_order_relaxed);
+                if (model->variant == ModelVariant::QWEN35) {
+                    ggml_tensor* gate_exps = GetLayerTensorAny(&model->layers[il], {"ffn_gate_exps.weight", "ffn_gate_exps"});
+                    ggml_tensor* down_exps =
+                        GetLayerTensorAny(&model->layers[il], {"ffn_down_exps.weight", "ffn_down_exps"});
+                    RecordQwen35MoEGraphPath(GetCurrentWorkContext(), "cb_moe_forward", moe_top_k, moe_top_k,
+                                             gate_exps ? gate_exps->type : GGML_TYPE_COUNT,
+                                             down_exps ? down_exps->type : GGML_TYPE_COUNT);
+                }
                 cur = ggml_map_custom2(ctx_c, routed_input, gate_logits, cb_moe_forward, 1, moe_ud);
                 {
                     char moe_name[64];
