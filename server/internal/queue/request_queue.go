@@ -5,6 +5,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"descore-server/internal/domain"
 )
 
 // RequestPriority defines request priority levels
@@ -20,6 +22,7 @@ type QueuedRequest struct {
 	JSONMode            bool
 	Prompt              string
 	InputIDs            []int
+	RenderedChatSubmit  bool
 	LoraAdapter         string
 	StopSequences       []string
 	Temperature         float64
@@ -31,6 +34,8 @@ type QueuedRequest struct {
 	DisallowedTokenIDs  []int
 	Context             context.Context
 	ResultChan          chan interface{}
+	OutputChan          chan domain.StreamEvent
+	DoneChan            chan struct{}
 
 	// MoE optimization: predicted or last-used expert IDs for this request
 	// Used by MoEAwareDequeue to group requests with similar expert affinity

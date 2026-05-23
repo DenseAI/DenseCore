@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"descore-server/internal/domain"
 	"descore-server/internal/queue"
@@ -13,6 +14,26 @@ import (
 type QueueProcessor struct {
 	queue        *queue.RequestQueue
 	modelService domain.ModelService
+}
+
+type awaitableEngine interface {
+	GenerateStreamWithSamplingAwaitable(ctx context.Context, prompt string, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) (<-chan struct{}, error)
+	GenerateStreamTokensWithSamplingAwaitable(ctx context.Context, inputIDs []int, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) (<-chan struct{}, error)
+}
+
+type renderedTokenAwaitableEngine interface {
+	GenerateStreamRenderedTokensWithSamplingAwaitable(ctx context.Context, renderedPrompt string, inputIDs []int, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) (<-chan struct{}, error)
+}
+
+type renderedChatAwaitableEngine interface {
+	GenerateStreamRenderedChatWithSamplingAwaitable(ctx context.Context, renderedPrompt string, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) (<-chan struct{}, error)
+}
+
+type generationResult struct {
+	OutputChan     chan domain.StreamEvent
+	CompletionChan <-chan struct{}
+	QueueWaitMS    float64
+	EngineSubmitMS float64
 }
 
 // NewQueueProcessor creates a new processor.
@@ -37,8 +58,9 @@ func (p *QueueProcessor) Stop() {
 	p.queue.Close()
 }
 
-// workerLoop continuously processes requests from the queue.
-// It acts as a proxy, holding the "slot" until the request is fully streamed.
+// workerLoop continuously processes requests from the queue. Workers are
+// submitters: they hold a slot only until C++ accepts the request, then return
+// to dequeue more work so the runtime scheduler can form decode batches.
 func (p *QueueProcessor) workerLoop(workerID int) {
 	ctx := context.Background() // Long-running context for the worker itself
 	activeExperts := make(map[int]struct{})
@@ -69,12 +91,12 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 			slog.String("req_id", req.ID),
 			slog.String("priority", fmtPriority(req.Priority)),
 		)
+		queueWaitMS := durationMillis(time.Since(req.EnqueueTime))
 
-		// 2. Prepare channels
-		// workerChan: receives tokens from Engine (C++)
-		// userChan: receives tokens forwarded by Worker (sent to ChatService)
-		workerChan := make(chan domain.StreamEvent, 100)
-		userChan := make(chan domain.StreamEvent, 100)
+		outputChan := req.OutputChan
+		if outputChan == nil {
+			outputChan = make(chan domain.StreamEvent, defaultStreamEventBufferSize())
+		}
 
 		// 3. Get Engine (Dynamic)
 		engine := p.modelService.GetEngine()
@@ -88,42 +110,9 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 		}
 
 		// 4. Submit to Engine
-		var err error
-		if len(req.InputIDs) > 0 {
-			err = engine.GenerateStreamTokensWithSampling(
-				req.Context,
-				req.InputIDs,
-				req.MaxTokens,
-				req.LoraAdapter,
-				req.JSONMode,
-				req.Temperature,
-				req.TopP,
-				req.TopK,
-				req.RepetitionPenalty,
-				req.StopSequences,
-				req.AllowedTokenIDs,
-				req.AllowedTokensStrict,
-				req.DisallowedTokenIDs,
-				workerChan,
-			)
-		} else {
-			err = engine.GenerateStreamWithSampling(
-				req.Context,
-				req.Prompt,
-				req.MaxTokens,
-				req.LoraAdapter,
-				req.JSONMode,
-				req.Temperature,
-				req.TopP,
-				req.TopK,
-				req.RepetitionPenalty,
-				req.StopSequences,
-				req.AllowedTokenIDs,
-				req.AllowedTokensStrict,
-				req.DisallowedTokenIDs,
-				workerChan,
-			)
-		}
+		submitStart := time.Now()
+		completionCh, err := p.submitRequestToEngine(engine, req, outputChan)
+		engineSubmitMS := durationMillis(time.Since(submitStart))
 
 		if err != nil {
 			slog.Error("engine submission failed",
@@ -140,10 +129,24 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 			continue
 		}
 
-		// 4. Send userChan to ChatService so it can start listening
-		// Submission succeeded, so we give them the channel to read tokens.
+		trackerStarted := false
+		startTracker := func(abandoned bool) {
+			if trackerStarted {
+				return
+			}
+			trackerStarted = true
+			go p.trackCompletion(req, outputChan, completionCh, abandoned)
+		}
+
+		// Submission succeeded, so give ChatService the callback channel directly.
+		// Completion/cancellation cleanup is supervised outside the worker slot.
 		select {
-		case req.ResultChan <- userChan:
+		case req.ResultChan <- generationResult{
+			OutputChan:     outputChan,
+			CompletionChan: completionCh,
+			QueueWaitMS:    queueWaitMS,
+			EngineSubmitMS: engineSubmitMS,
+		}:
 			if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
 				slog.Info("request lifecycle: engine submission succeeded",
 					slog.String("trace_id", req.TraceID),
@@ -151,25 +154,176 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 					slog.Int("worker_id", workerID),
 				)
 			}
-			// 5. Proxy Loop (The Monitor)
-			// This keeps the worker "busy" until generation finishes.
-			proxyStream(req.Context, req.TraceID, req.ID, workerChan, userChan)
+			startTracker(false)
 		default:
 			slog.Warn("request result channel abandoned after submission", slog.String("req_id", req.ID))
-			// We just drain and exit.
-			// context cancellation handled by engine
-			go func() {
-				for range workerChan {
-				}
-			}()
-			close(userChan)
+			startTracker(true)
 		}
 
-		slog.Debug("worker finished request", slog.Int("worker_id", workerID), slog.String("req_id", req.ID))
+		slog.Debug("worker submitted request", slog.Int("worker_id", workerID), slog.String("req_id", req.ID))
+	}
+}
+
+func (p *QueueProcessor) submitRequestToEngine(engine domain.Engine, req *queue.QueuedRequest, outputChan chan domain.StreamEvent) (<-chan struct{}, error) {
+	if awaitable, ok := engine.(awaitableEngine); ok {
+		if req.RenderedChatSubmit && req.Prompt != "" {
+			if renderedChat, ok := engine.(renderedChatAwaitableEngine); ok {
+				return renderedChat.GenerateStreamRenderedChatWithSamplingAwaitable(
+					req.Context,
+					req.Prompt,
+					req.MaxTokens,
+					req.LoraAdapter,
+					req.JSONMode,
+					req.Temperature,
+					req.TopP,
+					req.TopK,
+					req.RepetitionPenalty,
+					req.StopSequences,
+					req.AllowedTokenIDs,
+					req.AllowedTokensStrict,
+					req.DisallowedTokenIDs,
+					outputChan,
+				)
+			}
+		}
+		if len(req.InputIDs) > 0 {
+			if renderedAwaitable, ok := engine.(renderedTokenAwaitableEngine); ok && req.Prompt != "" {
+				return renderedAwaitable.GenerateStreamRenderedTokensWithSamplingAwaitable(
+					req.Context,
+					req.Prompt,
+					req.InputIDs,
+					req.MaxTokens,
+					req.LoraAdapter,
+					req.JSONMode,
+					req.Temperature,
+					req.TopP,
+					req.TopK,
+					req.RepetitionPenalty,
+					req.StopSequences,
+					req.AllowedTokenIDs,
+					req.AllowedTokensStrict,
+					req.DisallowedTokenIDs,
+					outputChan,
+				)
+			}
+			return awaitable.GenerateStreamTokensWithSamplingAwaitable(
+				req.Context,
+				req.InputIDs,
+				req.MaxTokens,
+				req.LoraAdapter,
+				req.JSONMode,
+				req.Temperature,
+				req.TopP,
+				req.TopK,
+				req.RepetitionPenalty,
+				req.StopSequences,
+				req.AllowedTokenIDs,
+				req.AllowedTokensStrict,
+				req.DisallowedTokenIDs,
+				outputChan,
+			)
+		}
+		return awaitable.GenerateStreamWithSamplingAwaitable(
+			req.Context,
+			req.Prompt,
+			req.MaxTokens,
+			req.LoraAdapter,
+			req.JSONMode,
+			req.Temperature,
+			req.TopP,
+			req.TopK,
+			req.RepetitionPenalty,
+			req.StopSequences,
+			req.AllowedTokenIDs,
+			req.AllowedTokensStrict,
+			req.DisallowedTokenIDs,
+			outputChan,
+		)
+	}
+
+	if len(req.InputIDs) > 0 {
+		if err := engine.GenerateStreamTokensWithSampling(
+			req.Context,
+			req.InputIDs,
+			req.MaxTokens,
+			req.LoraAdapter,
+			req.JSONMode,
+			req.Temperature,
+			req.TopP,
+			req.TopK,
+			req.RepetitionPenalty,
+			req.StopSequences,
+			req.AllowedTokenIDs,
+			req.AllowedTokensStrict,
+			req.DisallowedTokenIDs,
+			outputChan,
+		); err != nil {
+			return nil, err
+		}
+	} else if err := engine.GenerateStreamWithSampling(
+		req.Context,
+		req.Prompt,
+		req.MaxTokens,
+		req.LoraAdapter,
+		req.JSONMode,
+		req.Temperature,
+		req.TopP,
+		req.TopK,
+		req.RepetitionPenalty,
+		req.StopSequences,
+		req.AllowedTokenIDs,
+		req.AllowedTokensStrict,
+		req.DisallowedTokenIDs,
+		outputChan,
+	); err != nil {
+		return nil, err
+	}
+	done := make(chan struct{})
+	close(done)
+	return done, nil
+}
+
+func (p *QueueProcessor) trackCompletion(req *queue.QueuedRequest, outputChan <-chan domain.StreamEvent, completionCh <-chan struct{}, abandoned bool) {
+	if abandoned && outputChan != nil {
+		go func() {
+			for range outputChan {
+			}
+		}()
+	}
+	p.waitForCompletion(req, completionCh)
+	if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
+		slog.Info("request lifecycle: completion tracked",
+			slog.String("trace_id", req.TraceID),
+			slog.String("queue_request_id", req.ID),
+			slog.Bool("abandoned", abandoned),
+		)
+	}
+}
+
+func (p *QueueProcessor) waitForCompletion(req *queue.QueuedRequest, completionCh <-chan struct{}) {
+	if completionCh == nil {
+		return
+	}
+	select {
+	case <-completionCh:
+	case <-req.Context.Done():
+		select {
+		case <-completionCh:
+		case <-req.DoneChan:
+		case <-time.After(5 * time.Second):
+			slog.Warn("request completion wait timed out",
+				slog.String("trace_id", req.TraceID),
+				slog.String("req_id", req.ID),
+				slog.String("error", req.Context.Err().Error()),
+			)
+		}
 	}
 }
 
 // proxyStream forwards events from source to dest until source closes.
+// Legacy/test-only: production chat generation passes QueueRequest.OutputChan
+// directly into the engine and should not route hot-path tokens through this
+// worker-level proxy.
 func proxyStream(ctx context.Context, traceID string, queueReqID string, src <-chan domain.StreamEvent, dst chan<- domain.StreamEvent) {
 	defer close(dst)
 	dstAbandoned := false

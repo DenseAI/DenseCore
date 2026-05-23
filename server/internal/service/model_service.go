@@ -2,13 +2,23 @@ package service
 
 import (
 	"log"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"descore-server/internal/domain"
 	"descore-server/internal/engine"
+)
+
+type modelLoadStrategy int
+
+const (
+	modelLoadStrategyAuto modelLoadStrategy = iota
+	modelLoadStrategyBlueGreen
+	modelLoadStrategyForce
 )
 
 type ModelService struct {
@@ -29,11 +39,16 @@ func NewModelService() *ModelService {
 	return &ModelService{}
 }
 
-// LoadModel loads a model with Blue/Green deployment strategy.
+// LoadModel loads a model using the configured deployment strategy.
 //
-// If force=false (default): Loads new engine first, then swaps atomically, then closes old.
+// If force=false and DENSECORE_MODEL_LOAD_STRATEGY=blue_green:
+// Loads new engine first, then swaps atomically, then closes old.
 //   - Zero downtime during model updates
 //   - Requires 2x memory temporarily
+//
+// If force=false and DENSECORE_MODEL_LOAD_STRATEGY=auto (default):
+// Uses Blue/Green only when basic memory headroom checks indicate that the new
+// model can be loaded alongside the current one. Otherwise it uses force mode.
 //
 // If force=true: Unloads old engine first, then loads new one.
 //   - Has downtime window
@@ -48,7 +63,9 @@ func (s *ModelService) LoadModelWithOptions(mainModelPath, draftModelPath string
 	s.loadingError.Store(nil)
 
 	var err error
-	if force {
+	strategy := resolveModelLoadStrategy(os.Getenv("DENSECORE_MODEL_LOAD_STRATEGY"))
+	if force || strategy == modelLoadStrategyForce ||
+		(strategy == modelLoadStrategyAuto && s.shouldForceModelLoadForMemory(mainModelPath, draftModelPath)) {
 		err = s.loadModelForce(mainModelPath, draftModelPath, threads)
 	} else {
 		err = s.loadModelBlueGreen(mainModelPath, draftModelPath, threads)
@@ -63,6 +80,86 @@ func (s *ModelService) LoadModelWithOptions(mainModelPath, draftModelPath string
 	s.loadingError.Store(nil)
 	s.loadingStatus.Store(int32(domain.StatusReady))
 	return nil
+}
+
+func resolveModelLoadStrategy(value string) modelLoadStrategy {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "auto":
+		return modelLoadStrategyAuto
+	case "blue_green", "blue-green", "bluegreen":
+		return modelLoadStrategyBlueGreen
+	case "force":
+		return modelLoadStrategyForce
+	default:
+		log.Printf("[ModelService] Unknown DENSECORE_MODEL_LOAD_STRATEGY=%q, using auto", value)
+		return modelLoadStrategyAuto
+	}
+}
+
+func (s *ModelService) hasCurrentEngine() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentEngine != nil
+}
+
+func (s *ModelService) shouldForceModelLoadForMemory(mainModelPath, draftModelPath string) bool {
+	if !s.hasCurrentEngine() {
+		return false
+	}
+
+	requiredBytes, ok := estimateModelFileBytes(mainModelPath, draftModelPath)
+	if !ok || requiredBytes == 0 {
+		return false
+	}
+	availableBytes, ok := linuxMemAvailableBytes("/proc/meminfo")
+	if !ok {
+		return false
+	}
+
+	if availableBytes < requiredBytes {
+		log.Printf(
+			"[ModelService] Auto load strategy selected force mode: mem_available_mb=%d estimated_new_model_file_mb=%d",
+			availableBytes/(1024*1024), requiredBytes/(1024*1024),
+		)
+		return true
+	}
+	return false
+}
+
+func estimateModelFileBytes(paths ...string) (uint64, bool) {
+	var total uint64
+	var sawPath bool
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() || info.Size() <= 0 {
+			return 0, false
+		}
+		total += uint64(info.Size())
+		sawPath = true
+	}
+	return total, sawPath
+}
+
+func linuxMemAvailableBytes(path string) (uint64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "MemAvailable:" {
+			continue
+		}
+		kb, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return kb * 1024, true
+	}
+	return 0, false
 }
 
 // loadModelBlueGreen implements zero-downtime Blue/Green deployment.

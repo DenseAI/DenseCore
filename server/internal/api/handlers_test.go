@@ -24,6 +24,8 @@ type MockEngine struct {
 	lastCountText      string
 	lastCountAddBOS    bool
 	lastCountAddEOS    bool
+	runtimeState       domain.RuntimeOptimizationState
+	runtimeStateErr    error
 }
 
 func (m *MockEngine) GenerateStream(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
@@ -49,6 +51,66 @@ func (m *MockEngine) GenerateStreamWithSampling(ctx context.Context, prompt stri
 
 func (m *MockEngine) GenerateStreamTokensWithSampling(ctx context.Context, inputIDs []int, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) error {
 	return m.GenerateStream(ctx, "", maxTokens, outputChan)
+}
+
+func TestSSEStreamWriterCoalescesByTokenLimit(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writer := newSSEStreamWriter(rec, rec, sseFlushPolicy{tokenLimit: 2, byteLimit: 4096, interval: time.Hour})
+
+	if err := writer.WriteJSONData([]byte(`{"delta":"a"}`)); err != nil {
+		t.Fatalf("first write failed: %v", err)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected first event to remain buffered, got %q", rec.Body.String())
+	}
+	if err := writer.WriteJSONData([]byte(`{"delta":"b"}`)); err != nil {
+		t.Fatalf("second write failed: %v", err)
+	}
+	body := rec.Body.String()
+	if got := strings.Count(body, "data: "); got != 2 {
+		t.Fatalf("expected two coalesced SSE events, got %d in %q", got, body)
+	}
+	if !writer.Started() {
+		t.Fatal("expected writer to mark stream started after flush")
+	}
+}
+
+func TestSSEFlushPolicyDefaultsToProductionCoalescing(t *testing.T) {
+	h := NewHandler(nil, nil)
+	policy := h.sseFlushPolicy()
+	if policy.tokenLimit != 4 || policy.byteLimit != 4096 || policy.interval != 20*time.Millisecond {
+		t.Fatalf("unexpected default SSE policy: %+v", policy)
+	}
+}
+
+func TestSSEFlushPolicyEnvRestoresTokenByToken(t *testing.T) {
+	t.Setenv("DENSECORE_STREAM_COALESCE_TOKENS", "1")
+	t.Setenv("DENSECORE_STREAM_COALESCE_INTERVAL_MS", "0")
+
+	h := NewHandler(nil, nil)
+	policy := h.sseFlushPolicy()
+	if policy.tokenLimit != 1 || policy.interval != 0 {
+		t.Fatalf("expected token-by-token SSE policy from env, got %+v", policy)
+	}
+}
+
+func TestSSEStreamWriterDoneFlushesBufferedEventsImmediately(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writer := newSSEStreamWriter(rec, rec, sseFlushPolicy{tokenLimit: 4, byteLimit: 4096, interval: time.Hour})
+
+	if err := writer.WriteJSONData([]byte(`{"delta":"a"}`)); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected event to remain buffered before terminal chunk, got %q", rec.Body.String())
+	}
+	if err := writer.WriteDone(); err != nil {
+		t.Fatalf("done write failed: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `{"delta":"a"}`) || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("expected terminal write to flush buffered event and DONE chunk, got %q", body)
+	}
 }
 
 func (m *MockEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool,
@@ -144,9 +206,20 @@ func (m *MockEngine) PreviewTextRequestTokens(text string, maxTokens int, temper
 	return m.TokenizeText(text, false, false)
 }
 
+func (m *MockEngine) PreviewRenderedRequestTokens(renderedPrompt string, maxTokens int, temperature float64, topP float64, topK int, repetitionPenalty float64, jsonMode bool) ([]int, error) {
+	return m.TokenizeText(renderedPrompt, false, false)
+}
+
 func (m *MockEngine) GetTokenizerType() string { return "" }
 
 func (m *MockEngine) GetChatTemplate() string { return "" }
+
+func (m *MockEngine) GetRuntimeOptimizationState() (domain.RuntimeOptimizationState, error) {
+	if m.runtimeStateErr != nil {
+		return domain.RuntimeOptimizationState{}, m.runtimeStateErr
+	}
+	return m.runtimeState, nil
+}
 
 func (m *MockEngine) Close() {}
 

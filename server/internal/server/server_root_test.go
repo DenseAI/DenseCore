@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"descore-server/internal/config"
 )
 
 func TestMakeRootHandlerDoesNotMutateConfiguredEndpoints(t *testing.T) {
@@ -57,5 +59,33 @@ func TestBuildEndpointsIncludesCompletionsWhenLLMAPIEnabled(t *testing.T) {
 	endpoints := buildEndpoints(true)
 	if got := endpoints["completions"]; got != "/v1/completions" {
 		t.Fatalf("expected completions endpoint, got %q", got)
+	}
+}
+
+func TestDefaultGoWorkersScaleWithEngineCapacity(t *testing.T) {
+	if got := defaultGoWorkersForEngineCapacity(16, 4); got != 16 {
+		t.Fatalf("workers = %d, want 16", got)
+	}
+	if got := defaultGoWorkersForEngineCapacity(2, 4); got != 8 {
+		t.Fatalf("workers = %d, want floor 8", got)
+	}
+	if got := defaultGoWorkersForEngineCapacity(64, 16); got != 32 {
+		t.Fatalf("workers = %d, want cap 32", got)
+	}
+}
+
+func TestGoServerBenchmarkProfileDoesNotSerializeAdmission(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.BenchmarkProfile = "go-server"
+	applyBenchmarkProfileDefaults(cfg, nil)
+	if cfg.GoWorkers == 1 || cfg.ServerInflight == 1 {
+		t.Fatalf("go-server profile serialized admission: workers=%d inflight=%d", cfg.GoWorkers, cfg.ServerInflight)
+	}
+
+	cfg = config.DefaultConfig()
+	cfg.BenchmarkProfile = "single-e2e"
+	applyBenchmarkProfileDefaults(cfg, nil)
+	if cfg.GoWorkers != 1 || cfg.ServerInflight != 1 {
+		t.Fatalf("single-e2e should serialize admission: workers=%d inflight=%d", cfg.GoWorkers, cfg.ServerInflight)
 	}
 }

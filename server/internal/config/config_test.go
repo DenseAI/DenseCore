@@ -7,6 +7,7 @@ func TestLoadFromEnvReadsDenseCorePerformanceKnobs(t *testing.T) {
 	t.Setenv("DENSECORE_GO_WORKERS", "1")
 	t.Setenv("DENSECORE_SERVER_INFLIGHT", "2")
 	t.Setenv("DENSECORE_KV_TYPE", "q8_0")
+	t.Setenv("DENSECORE_MAX_NUM_SEQS", "16")
 	t.Setenv("DENSECORE_MAX_SEQ_LEN", "16384")
 	t.Setenv("DENSECORE_KV_TARGET_MB", "4096")
 	t.Setenv("DENSECORE_BENCHMARK_PROFILE", "single-e2e")
@@ -27,6 +28,9 @@ func TestLoadFromEnvReadsDenseCorePerformanceKnobs(t *testing.T) {
 	}
 	if cfg.KVType != "q8_0" {
 		t.Fatalf("KVType = %q, want q8_0", cfg.KVType)
+	}
+	if cfg.MaxNumSeqs != 16 {
+		t.Fatalf("MaxNumSeqs = %d, want 16", cfg.MaxNumSeqs)
 	}
 	if cfg.MaxSeqLen != 16384 {
 		t.Fatalf("MaxSeqLen = %d, want 16384", cfg.MaxSeqLen)

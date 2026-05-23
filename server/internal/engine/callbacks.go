@@ -16,6 +16,7 @@ package engine
 
 // Forward declaration of the Go callback
 extern void streamCallbackGateway(char* token, int is_finished, void* user_data);
+extern void streamCallbackExGateway(char* data, int len, int token_id, int is_finished, void* user_data);
 
 // Wrapper function to call SubmitRequest with the callback
 static int SubmitRequestWrapper(DenseCoreHandle handle, const char* prompt, int max_tokens, void* user_data) {
@@ -42,8 +43,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -54,6 +58,14 @@ import (
 type requestItem struct {
 	ch        chan domain.StreamEvent
 	createdAt time.Time
+	stats     *callbackSendStats
+}
+
+type callbackSendStats struct {
+	sendNSTotal   atomic.Uint64
+	blockNS       atomic.Uint64
+	blockEvents   atomic.Uint64
+	droppedEvents atomic.Uint64
 }
 
 // RequestChannelMap is an optimized channel storage with RWMutex.
@@ -75,14 +87,20 @@ func (m *RequestChannelMap) Store(id uintptr, ch chan domain.StreamEvent) {
 	m.channels[id] = requestItem{
 		ch:        ch,
 		createdAt: time.Now(),
+		stats:     &callbackSendStats{},
 	}
 	m.mu.Unlock()
 }
 
-func (m *RequestChannelMap) Load(id uintptr) (chan domain.StreamEvent, bool) {
+func (m *RequestChannelMap) LoadItem(id uintptr) (requestItem, bool) {
 	m.mu.RLock()
 	item, ok := m.channels[id]
 	m.mu.RUnlock()
+	return item, ok
+}
+
+func (m *RequestChannelMap) Load(id uintptr) (chan domain.StreamEvent, bool) {
+	item, ok := m.LoadItem(id)
 	return item.ch, ok
 }
 
@@ -218,6 +236,24 @@ func (m *CompletionChannelMap) Signal(id uintptr) {
 var requestChannels = NewRequestChannelMap()
 var embeddingChannels = NewEmbeddingChannelMap()
 var completionChannels = NewCompletionChannelMap()
+var streamCallbackBlockNS atomic.Uint64
+var streamCallbackBlockEvents atomic.Uint64
+var streamCallbackSendNSTotal atomic.Uint64
+var streamCallbackDroppedEvents atomic.Uint64
+var streamCallbackBlockThresholdDuration = parseStreamCallbackBlockThreshold()
+
+func parseStreamCallbackBlockThreshold() time.Duration {
+	const defaultThresholdUS = 100
+	raw := strings.TrimSpace(os.Getenv("DENSECORE_STREAM_CALLBACK_BLOCK_THRESHOLD_US"))
+	if raw == "" {
+		return time.Duration(defaultThresholdUS) * time.Microsecond
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return time.Duration(defaultThresholdUS) * time.Microsecond
+	}
+	return time.Duration(value) * time.Microsecond
+}
 
 // Cleanup removes all resources associated with a request ID.
 // Safe to call multiple times.
@@ -248,23 +284,101 @@ func terminalErrorFromCallbackToken(token string) error {
 	}
 }
 
+func callbackTokenString(token *C.char) string {
+	if token == nil {
+		return ""
+	}
+	// Legacy callback path. The hot sampling path uses streamCallbackExGateway
+	// so Go can copy a known byte span without a NUL scan on every token.
+	return C.GoString(token)
+}
+
+func callbackTokenStringN(token *C.char, length C.int) string {
+	if token == nil || length <= 0 {
+		return ""
+	}
+	return C.GoStringN(token, length)
+}
+
+func sendCallbackEvent(id uintptr, item requestItem, event domain.StreamEvent) {
+	start := time.Now()
+	item.ch <- event
+	blocked := time.Since(start)
+	ns := uint64(blocked.Nanoseconds())
+	streamCallbackSendNSTotal.Add(ns)
+	if item.stats != nil {
+		item.stats.sendNSTotal.Add(ns)
+	}
+	if blocked >= streamCallbackBlockThresholdDuration {
+		streamCallbackBlockNS.Add(ns)
+		streamCallbackBlockEvents.Add(1)
+		if item.stats != nil {
+			item.stats.blockNS.Add(ns)
+			item.stats.blockEvents.Add(1)
+		}
+	}
+	if event.Terminal {
+		requestNS := uint64(0)
+		requestEvents := uint64(0)
+		requestSendNS := uint64(0)
+		requestDropped := uint64(0)
+		if item.stats != nil {
+			requestSendNS = item.stats.sendNSTotal.Load()
+			requestNS = item.stats.blockNS.Load()
+			requestEvents = item.stats.blockEvents.Load()
+			requestDropped = item.stats.droppedEvents.Load()
+		}
+		log.Printf("stream_callback_backpressure callback_id=%d stream_callback_send_ns_total=%d stream_callback_block_ns=%d stream_callback_block_events=%d stream_callback_dropped_events=%d aggregate_stream_callback_send_ns_total=%d aggregate_stream_callback_block_ns=%d aggregate_stream_callback_block_events=%d aggregate_stream_callback_dropped_events=%d",
+			id,
+			requestSendNS,
+			requestNS,
+			requestEvents,
+			requestDropped,
+			streamCallbackSendNSTotal.Load(),
+			streamCallbackBlockNS.Load(),
+			streamCallbackBlockEvents.Load(),
+			streamCallbackDroppedEvents.Load(),
+		)
+	}
+}
+
 //export streamCallbackGateway
 func streamCallbackGateway(token *C.char, isFinished C.int, userData unsafe.Pointer) {
 	id := uintptr(userData)
-	if ch, ok := requestChannels.Load(id); ok {
-		tokenStr := C.GoString(token)
+	if item, ok := requestChannels.LoadItem(id); ok {
+		tokenStr := callbackTokenString(token)
 		event := domain.StreamEvent{Token: tokenStr}
 		if isFinished != 0 {
 			event = domain.NewTerminalEvent(terminalErrorFromCallbackToken(tokenStr))
 		}
-		ch <- event
+		sendCallbackEvent(id, item, event)
 
 		if isFinished != 0 {
 			// Signal completion BEFORE cleanup to ensure watcher goroutine exits
 			completionChannels.Signal(id)
 			// Close the channel to unblock any range loops (e.g. in worker pool)
-			close(ch)
+			close(item.ch)
 			// Clean up request channel
+			requestChannels.Delete(id)
+		}
+	}
+}
+
+//export streamCallbackExGateway
+func streamCallbackExGateway(data *C.char, length C.int, tokenID C.int, isFinished C.int, userData unsafe.Pointer) {
+	id := uintptr(userData)
+	if item, ok := requestChannels.LoadItem(id); ok {
+		tokenStr := callbackTokenStringN(data, length)
+		event := domain.StreamEvent{Token: tokenStr, TokenID: int(tokenID)}
+		if isFinished != 0 {
+			event = domain.NewTerminalEvent(terminalErrorFromCallbackToken(tokenStr))
+			event.TokenID = int(tokenID)
+		}
+		sendCallbackEvent(id, item, event)
+
+		if isFinished != 0 {
+			completionChannels.Signal(id)
+			close(item.ch)
 			requestChannels.Delete(id)
 		}
 	}

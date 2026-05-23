@@ -54,6 +54,9 @@ func (e *exactAnswerTestEngine) TokenizeText(text string, addBOS bool, addEOS bo
 func (e *exactAnswerTestEngine) PreviewTextRequestTokens(text string, maxTokens int, temperature float64, topP float64, topK int, repetitionPenalty float64, jsonMode bool) ([]int, error) {
 	return e.TokenizeText(text, false, false)
 }
+func (e *exactAnswerTestEngine) PreviewRenderedRequestTokens(renderedPrompt string, maxTokens int, temperature float64, topP float64, topK int, repetitionPenalty float64, jsonMode bool) ([]int, error) {
+	return e.TokenizeText(renderedPrompt, false, false)
+}
 func (e *exactAnswerTestEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool,
 	preserveThinking *bool) (*domain.RenderedChatPrompt, error) {
 	return &domain.RenderedChatPrompt{RenderedPrompt: messages[0].Content}, nil

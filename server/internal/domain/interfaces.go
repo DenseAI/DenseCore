@@ -23,10 +23,28 @@ type Engine interface {
 	CountTokens(text string, addBOS bool, addEOS bool) (int, error)
 	TokenizeText(text string, addBOS bool, addEOS bool) ([]int, error)
 	PreviewTextRequestTokens(text string, maxTokens int, temperature float64, topP float64, topK int, repetitionPenalty float64, jsonMode bool) ([]int, error)
+	PreviewRenderedRequestTokens(renderedPrompt string, maxTokens int, temperature float64, topP float64, topK int, repetitionPenalty float64, jsonMode bool) ([]int, error)
 	GetTokenizerType() string
 	GetChatTemplate() string
 	Close()
 	CancelRequest(reqID uintptr)
+}
+
+type RuntimeOptimizationState struct {
+	TokenIDSubmitSupported          bool   `json:"token_id_submit_supported"`
+	PrefixCacheReuseEnabled         bool   `json:"prefix_cache_reuse_enabled"`
+	HybridSSMSnapshotRestoreEnabled bool   `json:"hybrid_ssm_snapshot_restore_enabled"`
+	PrefillGraphCacheEnabled        bool   `json:"prefill_graph_cache_enabled"`
+	PrefillArenaReuseEnabled        bool   `json:"prefill_arena_reuse_enabled"`
+	DecodeGraphCacheEnabled         bool   `json:"decode_graph_cache_enabled"`
+	DecodeGraphCacheMaxBatch        int    `json:"decode_graph_cache_max_batch,omitempty"`
+	DecodeGraphCacheLRUSize         int    `json:"decode_graph_cache_lru_size,omitempty"`
+	MoEDequantCacheMB               int    `json:"moe_dequant_cache_mb,omitempty"`
+	ActiveThreadPolicyLabel         string `json:"active_thread_policy_label,omitempty"`
+}
+
+type RuntimeOptimizationStateProvider interface {
+	GetRuntimeOptimizationState() (RuntimeOptimizationState, error)
 }
 
 // LoadingStatus represents the model loading state

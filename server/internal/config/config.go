@@ -38,6 +38,7 @@ type ServerConfig struct {
 	GoWorkers        int    `json:"go_workers"`
 	ServerInflight   int    `json:"server_inflight"`
 	KVType           string `json:"kv_type"`
+	MaxNumSeqs       int    `json:"max_num_seqs"`
 	MaxSeqLen        int    `json:"max_seq_len"`
 	KVTargetMB       int    `json:"kv_target_mb"`
 	BenchmarkProfile string `json:"benchmark_profile"`
@@ -89,6 +90,7 @@ func DefaultConfig() *ServerConfig {
 		GoWorkers:        0,
 		ServerInflight:   1024,
 		KVType:           "fp16",
+		MaxNumSeqs:       4,
 		MaxSeqLen:        0,
 		KVTargetMB:       0,
 		BenchmarkProfile: "",
@@ -196,6 +198,11 @@ func LoadFromEnv() (*ServerConfig, error) {
 	if v := strings.TrimSpace(os.Getenv("DENSECORE_KV_TYPE")); v != "" {
 		cfg.KVType = strings.ToLower(v)
 	}
+	if v := os.Getenv("DENSECORE_MAX_NUM_SEQS"); v != "" {
+		if maxNumSeqs, err := strconv.Atoi(v); err == nil {
+			cfg.MaxNumSeqs = maxNumSeqs
+		}
+	}
 	if v := os.Getenv("DENSECORE_MAX_SEQ_LEN"); v != "" {
 		if maxSeqLen, err := strconv.Atoi(v); err == nil {
 			cfg.MaxSeqLen = maxSeqLen
@@ -283,6 +290,9 @@ func (c *ServerConfig) Validate() error {
 	if c.ServerInflight <= 0 {
 		return fmt.Errorf("invalid server inflight: %d", c.ServerInflight)
 	}
+	if c.MaxNumSeqs <= 0 {
+		return fmt.Errorf("invalid max num seqs: %d", c.MaxNumSeqs)
+	}
 	if c.MaxSeqLen < 0 {
 		return fmt.Errorf("invalid max seq len: %d", c.MaxSeqLen)
 	}
@@ -313,7 +323,7 @@ func (c *ServerConfig) Address() string {
 // String returns a human-readable config summary
 func (c *ServerConfig) String() string {
 	return fmt.Sprintf(
-		"Config{addr=%s, profile=%s, llm_api=%v, threads=%d, engine_threads=%d, go_workers=%d, inflight=%d, kv_type=%s, benchmark=%s, rate_limit=%v(%d/s), timeout=%v}",
-		c.Address(), c.WorkloadProfile, c.LLMAPIEnabled, c.Threads, c.EngineThreads, c.GoWorkers, c.ServerInflight, c.KVType, c.BenchmarkProfile, c.RateLimitEnabled, c.RateLimitReqPerSec, c.RequestTimeout,
+		"Config{addr=%s, profile=%s, llm_api=%v, threads=%d, engine_threads=%d, go_workers=%d, inflight=%d, kv_type=%s, max_num_seqs=%d, benchmark=%s, rate_limit=%v(%d/s), timeout=%v}",
+		c.Address(), c.WorkloadProfile, c.LLMAPIEnabled, c.Threads, c.EngineThreads, c.GoWorkers, c.ServerInflight, c.KVType, c.MaxNumSeqs, c.BenchmarkProfile, c.RateLimitEnabled, c.RateLimitReqPerSec, c.RequestTimeout,
 	)
 }

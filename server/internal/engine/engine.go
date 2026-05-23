@@ -17,6 +17,7 @@ package engine
 
 // Forward declaration of the Go callback (exported from callbacks.go)
 extern void streamCallbackGateway(char* token, int is_finished, void* user_data);
+extern void streamCallbackExGateway(char* data, int len, int token_id, int is_finished, void* user_data);
 
 // Wrapper function to call SubmitRequest with the callback
 static int SubmitRequestWrapper(DenseCoreHandle handle, const char* prompt, int max_tokens, uintptr_t user_data) {
@@ -46,11 +47,11 @@ static int SubmitRequestWithSamplingConstraintsWrapper(DenseCoreHandle handle, c
                                                        int allowed_token_ids_strict,
                                                        const int* disallowed_token_ids,
                                                        int num_disallowed_token_ids, uintptr_t user_data) {
-    return SubmitRequestWithSamplingConstraintsEx(handle, prompt, max_tokens, lora_name, temperature, top_p, top_k,
-                                                  repetition_penalty, stop_sequences, json_mode, allowed_token_ids,
-                                                  num_allowed_token_ids, allowed_token_ids_strict,
-                                                  disallowed_token_ids, num_disallowed_token_ids,
-                                                  (TokenCallback)streamCallbackGateway, (void*)user_data);
+    return SubmitRequestWithSamplingConstraintsCallbackEx(handle, prompt, max_tokens, lora_name, temperature, top_p, top_k,
+                                                          repetition_penalty, stop_sequences, json_mode, allowed_token_ids,
+                                                          num_allowed_token_ids, allowed_token_ids_strict,
+                                                          disallowed_token_ids, num_disallowed_token_ids,
+                                                          (TokenCallbackEx)streamCallbackExGateway, (void*)user_data);
 }
 
 // Wrapper function for SubmitRequestIdsWithSamplingEx (per-request LoRA)
@@ -71,12 +72,55 @@ static int SubmitRequestIdsWithSamplingConstraintsWrapper(DenseCoreHandle handle
                                                           int num_allowed_token_ids, int allowed_token_ids_strict,
                                                           const int* disallowed_token_ids,
                                                           int num_disallowed_token_ids, uintptr_t user_data) {
-    return SubmitRequestIdsWithSamplingConstraintsEx(handle, tokens, n_tokens, max_tokens, lora_name, temperature,
-                                                     top_p, top_k, repetition_penalty, stop_sequences, json_mode,
-                                                     allowed_token_ids, num_allowed_token_ids,
-                                                     allowed_token_ids_strict, disallowed_token_ids,
-                                                     num_disallowed_token_ids, (TokenCallback)streamCallbackGateway,
-                                                     (void*)user_data);
+    return SubmitRequestIdsWithSamplingConstraintsCallbackEx(handle, tokens, n_tokens, max_tokens, lora_name,
+                                                             temperature, top_p, top_k, repetition_penalty,
+                                                             stop_sequences, json_mode, allowed_token_ids,
+                                                             num_allowed_token_ids, allowed_token_ids_strict,
+                                                             disallowed_token_ids, num_disallowed_token_ids,
+                                                             (TokenCallbackEx)streamCallbackExGateway,
+                                                             (void*)user_data);
+}
+
+static int SubmitRenderedRequestIdsWithSamplingConstraintsWrapper(DenseCoreHandle handle,
+                                                                  const char* rendered_prompt,
+                                                                  const int* tokens, int n_tokens,
+                                                                  int max_tokens, const char* lora_name,
+                                                                  float temperature, float top_p, int top_k,
+                                                                  float repetition_penalty,
+                                                                  const char** stop_sequences, int json_mode,
+                                                                  const int* allowed_token_ids,
+                                                                  int num_allowed_token_ids,
+                                                                  int allowed_token_ids_strict,
+                                                                  const int* disallowed_token_ids,
+                                                                  int num_disallowed_token_ids,
+                                                                  uintptr_t user_data) {
+    return SubmitRenderedRequestIdsWithSamplingConstraintsCallbackEx(handle, rendered_prompt, tokens, n_tokens,
+                                                                     max_tokens, lora_name, temperature, top_p, top_k,
+                                                                     repetition_penalty, stop_sequences, json_mode,
+                                                                     allowed_token_ids, num_allowed_token_ids,
+                                                                     allowed_token_ids_strict, disallowed_token_ids,
+                                                                     num_disallowed_token_ids,
+                                                                     (TokenCallbackEx)streamCallbackExGateway,
+                                                                     (void*)user_data);
+}
+
+static int SubmitRenderedChatWithSamplingConstraintsWrapper(DenseCoreHandle handle,
+                                                            const char* rendered_prompt,
+                                                            int max_tokens, const char* lora_name,
+                                                            float temperature, float top_p, int top_k,
+                                                            float repetition_penalty,
+                                                            const char** stop_sequences, int json_mode,
+                                                            const int* allowed_token_ids,
+                                                            int num_allowed_token_ids,
+                                                            int allowed_token_ids_strict,
+                                                            const int* disallowed_token_ids,
+                                                            int num_disallowed_token_ids,
+                                                            uintptr_t user_data) {
+    return DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx(
+        handle, rendered_prompt, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty,
+        stop_sequences, json_mode, allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict,
+        disallowed_token_ids, num_disallowed_token_ids, (TokenCallbackEx)streamCallbackExGateway,
+        (void*)user_data);
 }
 
 // Forward declaration of the Go callback for embeddings (exported from callbacks.go)
@@ -349,6 +393,17 @@ func (e *DenseEngine) GenerateStreamWithSampling(ctx context.Context, prompt str
 	loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64,
 	stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int,
 	outputChan chan domain.StreamEvent) error {
+	_, err := e.GenerateStreamWithSamplingAwaitable(ctx, prompt, maxTokens, loraAdapter, jsonMode, temperature, topP, topK,
+		repetitionPenalty, stop, allowedTokenIDs, allowedTokensStrict, disallowedTokenIDs, outputChan)
+	return err
+}
+
+// GenerateStreamWithSamplingAwaitable submits a text request and returns a
+// completion signal that closes when the C++ callback sends its terminal event.
+func (e *DenseEngine) GenerateStreamWithSamplingAwaitable(ctx context.Context, prompt string, maxTokens int,
+	loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64,
+	stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int,
+	outputChan chan domain.StreamEvent) (<-chan struct{}, error) {
 	cPrompt := C.CString(prompt)
 	defer C.free(unsafe.Pointer(cPrompt))
 	cLora := C.CString(loraAdapter)
@@ -394,7 +449,6 @@ func (e *DenseEngine) GenerateStreamWithSampling(ctx context.Context, prompt str
 		allowedStrictInt = 1
 	}
 
-	e.mu.Lock()
 	ret := C.SubmitRequestWithSamplingConstraintsWrapper(
 		e.handle,
 		cPrompt,
@@ -413,10 +467,9 @@ func (e *DenseEngine) GenerateStreamWithSampling(ctx context.Context, prompt str
 		C.int(len(cDisallowed)),
 		C.uintptr_t(reqID),
 	)
-	e.mu.Unlock()
 	if ret < 0 {
 		Cleanup(reqID)
-		return fmt.Errorf("submission failed with error code %d", ret)
+		return nil, fmt.Errorf("submission failed with error code %d", ret)
 	}
 	engineReqID := int(ret)
 	if requestLifecycleDebugEnabled() {
@@ -426,7 +479,7 @@ func (e *DenseEngine) GenerateStreamWithSampling(ctx context.Context, prompt str
 
 	go e.watchContext(ctx, reqID, engineReqID, completionCh)
 
-	return nil
+	return completionCh, nil
 }
 
 // GenerateStreamTokensWithSampling generates response using pre-tokenized input IDs and sampling options.
@@ -434,8 +487,118 @@ func (e *DenseEngine) GenerateStreamTokensWithSampling(ctx context.Context, inpu
 	loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64,
 	stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int,
 	outputChan chan domain.StreamEvent) error {
+	_, err := e.GenerateStreamTokensWithSamplingAwaitable(ctx, inputIDs, maxTokens, loraAdapter, jsonMode, temperature, topP, topK,
+		repetitionPenalty, stop, allowedTokenIDs, allowedTokensStrict, disallowedTokenIDs, outputChan)
+	return err
+}
+
+// GenerateStreamTokensWithSamplingAwaitable submits a token-id request and
+// returns a completion signal that closes when the C++ callback finishes.
+func (e *DenseEngine) GenerateStreamTokensWithSamplingAwaitable(ctx context.Context, inputIDs []int, maxTokens int,
+	loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64,
+	stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int,
+	outputChan chan domain.StreamEvent) (<-chan struct{}, error) {
+	return e.generateStreamTokensWithSamplingAwaitable(ctx, "", inputIDs, maxTokens, loraAdapter, jsonMode,
+		temperature, topP, topK, repetitionPenalty, stop, allowedTokenIDs, allowedTokensStrict, disallowedTokenIDs,
+		outputChan)
+}
+
+// GenerateStreamRenderedTokensWithSamplingAwaitable submits a token-id request
+// while preserving the already-rendered prompt on the C++ request. This keeps
+// token-ID submit on the fast path without losing prompt-state behavior used by
+// suppression, model blocklists, and runtime-path diagnostics.
+func (e *DenseEngine) GenerateStreamRenderedTokensWithSamplingAwaitable(ctx context.Context, renderedPrompt string, inputIDs []int, maxTokens int,
+	loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64,
+	stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int,
+	outputChan chan domain.StreamEvent) (<-chan struct{}, error) {
+	return e.generateStreamTokensWithSamplingAwaitable(ctx, renderedPrompt, inputIDs, maxTokens, loraAdapter, jsonMode,
+		temperature, topP, topK, repetitionPenalty, stop, allowedTokenIDs, allowedTokensStrict, disallowedTokenIDs,
+		outputChan)
+}
+
+func (e *DenseEngine) GenerateStreamRenderedChatWithSamplingAwaitable(ctx context.Context, renderedPrompt string, maxTokens int,
+	loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64,
+	stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int,
+	outputChan chan domain.StreamEvent) (<-chan struct{}, error) {
+	if strings.TrimSpace(renderedPrompt) == "" {
+		return nil, fmt.Errorf("rendered prompt must not be empty")
+	}
+	cRenderedPrompt := C.CString(renderedPrompt)
+	defer C.free(unsafe.Pointer(cRenderedPrompt))
+	cLora := C.CString(loraAdapter)
+	defer C.free(unsafe.Pointer(cLora))
+	stopPtr, stopCleanup := buildStopSequences(stop)
+	if stopCleanup != nil {
+		defer stopCleanup()
+	}
+
+	id := atomic.AddUint64(&requestIDCounter, 1)
+	reqID := uintptr(id)
+	requestChannels.Store(reqID, outputChan)
+	completionCh := completionChannels.Register(reqID)
+
+	jsonModeInt := 0
+	if jsonMode {
+		jsonModeInt = 1
+	}
+	var allowedPtr *C.int
+	var disallowedPtr *C.int
+	cAllowed := make([]C.int, len(allowedTokenIDs))
+	for i, id := range allowedTokenIDs {
+		cAllowed[i] = C.int(id)
+	}
+	if len(cAllowed) > 0 {
+		allowedPtr = (*C.int)(unsafe.Pointer(&cAllowed[0]))
+	}
+	cDisallowed := make([]C.int, len(disallowedTokenIDs))
+	for i, id := range disallowedTokenIDs {
+		cDisallowed[i] = C.int(id)
+	}
+	if len(cDisallowed) > 0 {
+		disallowedPtr = (*C.int)(unsafe.Pointer(&cDisallowed[0]))
+	}
+	allowedStrictInt := 0
+	if allowedTokensStrict {
+		allowedStrictInt = 1
+	}
+
+	ret := C.SubmitRenderedChatWithSamplingConstraintsWrapper(
+		e.handle,
+		cRenderedPrompt,
+		C.int(maxTokens),
+		cLora,
+		C.float(temperature),
+		C.float(topP),
+		C.int(topK),
+		C.float(repetitionPenalty),
+		stopPtr,
+		C.int(jsonModeInt),
+		allowedPtr,
+		C.int(len(cAllowed)),
+		C.int(allowedStrictInt),
+		disallowedPtr,
+		C.int(len(cDisallowed)),
+		C.uintptr_t(reqID),
+	)
+	if ret < 0 {
+		Cleanup(reqID)
+		return nil, fmt.Errorf("submission failed with error code %d", ret)
+	}
+	engineReqID := int(ret)
+	if requestLifecycleDebugEnabled() {
+		log.Printf("request lifecycle: submit_rendered_chat callback_id=%d engine_request_id=%d max_tokens=%d json_mode=%t allowed=%d disallowed=%d",
+			reqID, engineReqID, maxTokens, jsonMode, len(allowedTokenIDs), len(disallowedTokenIDs))
+	}
+	go e.watchContext(ctx, reqID, engineReqID, completionCh)
+	return completionCh, nil
+}
+
+func (e *DenseEngine) generateStreamTokensWithSamplingAwaitable(ctx context.Context, renderedPrompt string, inputIDs []int, maxTokens int,
+	loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64,
+	stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int,
+	outputChan chan domain.StreamEvent) (<-chan struct{}, error) {
 	if len(inputIDs) == 0 {
-		return fmt.Errorf("input_ids must not be empty")
+		return nil, fmt.Errorf("input_ids must not be empty")
 	}
 
 	cTokens := make([]C.int, len(inputIDs))
@@ -449,6 +612,11 @@ func (e *DenseEngine) GenerateStreamTokensWithSampling(ctx context.Context, inpu
 	}
 	cLora := C.CString(loraAdapter)
 	defer C.free(unsafe.Pointer(cLora))
+	var cRenderedPrompt *C.char
+	if renderedPrompt != "" {
+		cRenderedPrompt = C.CString(renderedPrompt)
+		defer C.free(unsafe.Pointer(cRenderedPrompt))
+	}
 
 	// Register request channel
 	id := atomic.AddUint64(&requestIDCounter, 1)
@@ -485,30 +653,52 @@ func (e *DenseEngine) GenerateStreamTokensWithSampling(ctx context.Context, inpu
 		allowedStrictInt = 1
 	}
 
-	e.mu.Lock()
-	ret := C.SubmitRequestIdsWithSamplingConstraintsWrapper(
-		e.handle,
-		(*C.int)(unsafe.Pointer(&cTokens[0])),
-		C.int(len(cTokens)),
-		C.int(maxTokens),
-		cLora,
-		C.float(temperature),
-		C.float(topP),
-		C.int(topK),
-		C.float(repetitionPenalty),
-		stopPtr,
-		C.int(jsonModeInt),
-		allowedPtr,
-		C.int(len(cAllowed)),
-		C.int(allowedStrictInt),
-		disallowedPtr,
-		C.int(len(cDisallowed)),
-		C.uintptr_t(reqID),
-	)
-	e.mu.Unlock()
+	var ret C.int
+	if cRenderedPrompt != nil {
+		ret = C.SubmitRenderedRequestIdsWithSamplingConstraintsWrapper(
+			e.handle,
+			cRenderedPrompt,
+			(*C.int)(unsafe.Pointer(&cTokens[0])),
+			C.int(len(cTokens)),
+			C.int(maxTokens),
+			cLora,
+			C.float(temperature),
+			C.float(topP),
+			C.int(topK),
+			C.float(repetitionPenalty),
+			stopPtr,
+			C.int(jsonModeInt),
+			allowedPtr,
+			C.int(len(cAllowed)),
+			C.int(allowedStrictInt),
+			disallowedPtr,
+			C.int(len(cDisallowed)),
+			C.uintptr_t(reqID),
+		)
+	} else {
+		ret = C.SubmitRequestIdsWithSamplingConstraintsWrapper(
+			e.handle,
+			(*C.int)(unsafe.Pointer(&cTokens[0])),
+			C.int(len(cTokens)),
+			C.int(maxTokens),
+			cLora,
+			C.float(temperature),
+			C.float(topP),
+			C.int(topK),
+			C.float(repetitionPenalty),
+			stopPtr,
+			C.int(jsonModeInt),
+			allowedPtr,
+			C.int(len(cAllowed)),
+			C.int(allowedStrictInt),
+			disallowedPtr,
+			C.int(len(cDisallowed)),
+			C.uintptr_t(reqID),
+		)
+	}
 	if ret < 0 {
 		Cleanup(reqID)
-		return fmt.Errorf("submission failed with error code %d", ret)
+		return nil, fmt.Errorf("submission failed with error code %d", ret)
 	}
 	engineReqID := int(ret)
 	if requestLifecycleDebugEnabled() {
@@ -518,7 +708,7 @@ func (e *DenseEngine) GenerateStreamTokensWithSampling(ctx context.Context, inpu
 
 	go e.watchContext(ctx, reqID, engineReqID, completionCh)
 
-	return nil
+	return completionCh, nil
 }
 
 // watchContext monitors for context cancellation and cancels the C++ request if needed.
@@ -766,28 +956,55 @@ func (e *DenseEngine) PreviewTextRequestTokens(text string, maxTokens int, tempe
 	cText := C.CString(text)
 	defer C.free(unsafe.Pointer(cText))
 
+	return e.buildRequestSnapshotTokens(cText, maxTokens, temperature, topP, topK, repetitionPenalty, jsonMode, false)
+}
+
+func (e *DenseEngine) PreviewRenderedRequestTokens(renderedPrompt string, maxTokens int, temperature float64,
+	topP float64, topK int, repetitionPenalty float64, jsonMode bool) ([]int, error) {
+	cText := C.CString(renderedPrompt)
+	defer C.free(unsafe.Pointer(cText))
+
+	return e.buildRequestSnapshotTokens(cText, maxTokens, temperature, topP, topK, repetitionPenalty, jsonMode, true)
+}
+
+func (e *DenseEngine) buildRequestSnapshotTokens(cText *C.char, maxTokens int, temperature float64, topP float64,
+	topK int, repetitionPenalty float64, jsonMode bool, rendered bool) ([]int, error) {
 	jsonModeInt := 0
 	if jsonMode {
 		jsonModeInt = 1
 	}
 
 	var snapshot C.DenseCoreRequestSnapshot
-	e.mu.Lock()
-	ret := C.DenseCorePreviewTextRequest(
-		e.handle,
-		cText,
-		C.int(maxTokens),
-		C.float(temperature),
-		C.float(topP),
-		C.int(topK),
-		C.float(repetitionPenalty),
-		C.int(jsonModeInt),
-		&snapshot,
-	)
-	e.mu.Unlock()
+	var ret C.int
+	if rendered {
+		ret = C.DenseCoreBuildRenderedRequestSnapshot(
+			e.handle,
+			cText,
+			C.int(maxTokens),
+			C.float(temperature),
+			C.float(topP),
+			C.int(topK),
+			C.float(repetitionPenalty),
+			C.int(jsonModeInt),
+			&snapshot,
+		)
+	} else {
+		ret = C.DenseCoreBuildRequestSnapshot(
+			e.handle,
+			cText,
+			C.int(maxTokens),
+			C.float(temperature),
+			C.float(topP),
+			C.int(topK),
+			C.float(repetitionPenalty),
+			C.int(jsonModeInt),
+			&snapshot,
+		)
+	}
 	if ret < 0 {
 		return nil, fmt.Errorf("preview request failed with error code %d", ret)
 	}
+	defer C.DenseCoreFreeRequestSnapshot(&snapshot)
 	if snapshot.token_ids == nil || snapshot.num_token_ids <= 0 {
 		return nil, nil
 	}
@@ -814,6 +1031,32 @@ func (e *DenseEngine) GetChatTemplate() string {
 		return ""
 	}
 	return C.GoString(cValue)
+}
+
+func (e *DenseEngine) GetRuntimeOptimizationState() (domain.RuntimeOptimizationState, error) {
+	var cState C.DenseCoreRuntimeOptimizationState
+	ret := C.DenseCoreGetRuntimeOptimizationState(e.handle, &cState)
+	if ret < 0 {
+		return domain.RuntimeOptimizationState{}, fmt.Errorf("runtime optimization state failed with error code %d", ret)
+	}
+
+	label := ""
+	if cState.active_thread_policy_label[0] != 0 {
+		label = C.GoString((*C.char)(unsafe.Pointer(&cState.active_thread_policy_label[0])))
+	}
+
+	return domain.RuntimeOptimizationState{
+		TokenIDSubmitSupported:          cState.token_id_submit_supported != 0,
+		PrefixCacheReuseEnabled:         cState.prefix_cache_reuse_enabled != 0,
+		HybridSSMSnapshotRestoreEnabled: cState.hybrid_ssm_snapshot_restore_enabled != 0,
+		PrefillGraphCacheEnabled:        cState.prefill_graph_cache_enabled != 0,
+		PrefillArenaReuseEnabled:        cState.prefill_arena_reuse_enabled != 0,
+		DecodeGraphCacheEnabled:         cState.decode_graph_cache_enabled != 0,
+		DecodeGraphCacheMaxBatch:        int(cState.decode_graph_cache_max_batch),
+		DecodeGraphCacheLRUSize:         int(cState.decode_graph_cache_lru_size),
+		MoEDequantCacheMB:               int(cState.moe_dequant_cache_mb),
+		ActiveThreadPolicyLabel:         label,
+	}, nil
 }
 
 func chatTemplateOptionValue(value *bool) int {

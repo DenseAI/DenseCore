@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	cloudmw "github.com/DenseAI/DenseCloud/go/middleware"
 	"github.com/google/uuid"
@@ -28,17 +30,27 @@ type ChatService struct {
 }
 
 type preparedPrompt struct {
-	prompt               string
-	promptSource         string
-	tokenIDs             []int
-	tokenSource          string
-	renderedPrompt       string
-	renderedTemplateUsed bool
-	rawPassthroughUsed   bool
-	tokenizerType        string
-	chatTemplate         string
-	modelVariant         string
-	promptFamily         string
+	prompt                   string
+	promptSource             string
+	tokenIDs                 []int
+	tokenSource              string
+	renderedChatSubmit       bool
+	promptTokenCountDeferred bool
+	promptTokenCountSource   string
+	promptTokenIDs           []int
+	promptTokenCount         int
+	renderedPrompt           string
+	renderedTemplateUsed     bool
+	rawPassthroughUsed       bool
+	tokenizerType            string
+	chatTemplate             string
+	modelVariant             string
+	promptFamily             string
+}
+
+type generationStartMetrics struct {
+	queueWaitMS    float64
+	engineSubmitMS float64
 }
 
 func NewChatService(modelService domain.ModelService, q *queue.RequestQueue) *ChatService {
@@ -52,6 +64,7 @@ func NewChatService(modelService domain.ModelService, q *queue.RequestQueue) *Ch
 // Accepts context.Context for propagating cancellation to the C++ engine.
 // Returns an error if the model is not loaded or if the request is invalid.
 func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatCompletionRequest, outputChan chan domain.StreamEvent) error {
+	serverStart := time.Now()
 	engine := s.modelService.GetEngine()
 	if engine == nil {
 		return errors.New("no model loaded")
@@ -66,7 +79,9 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 	}
 
 	modelHint := s.modelService.GetCurrentModel()
+	prepareStart := time.Now()
 	prepared, err := s.preparePrompt(engine, req, modelHint)
+	servicePrepareMS := durationMillis(time.Since(prepareStart))
 	if err != nil {
 		return err
 	}
@@ -78,59 +93,125 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 		return err
 	}
 
-	stream, err := s.startGeneration(ctx, req, modelHint, prepared)
+	_, completionCh, done, startMetrics, err := s.startGeneration(ctx, req, modelHint, prepared, outputChan)
 	if err != nil {
 		return err
 	}
+	defer done()
+	if completionCh == nil {
+		logServerSubmitOverhead("stream", prepared.promptTokenCount, servicePrepareMS, startMetrics.engineSubmitMS,
+			startMetrics.queueWaitMS, 0, 0, durationMillis(time.Since(serverStart)))
+		return nil
+	}
+	select {
+	case <-completionCh:
+		logServerSubmitOverhead("stream", prepared.promptTokenCount, servicePrepareMS, startMetrics.engineSubmitMS,
+			startMetrics.queueWaitMS, 0, 0, durationMillis(time.Since(serverStart)))
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// GenerateSync runs the same C++ generation path as streaming requests but
+// collects tokens inside the service, avoiding the handler-side proxy channel
+// used only for SSE formatting.
+func (s *ChatService) GenerateSync(ctx context.Context, req domain.ChatCompletionRequest) (string, int, int, error) {
+	serverStart := time.Now()
+	engine := s.modelService.GetEngine()
+	if engine == nil {
+		return "", 0, 0, errors.New("no model loaded")
+	}
+
+	if req.MaxTokens < 0 {
+		return "", 0, 0, errors.New("max_tokens must be non-negative")
+	}
+	if maxCtx := engine.GetMaxContextTokens(); maxCtx > 0 && req.MaxTokens > maxCtx {
+		return "", 0, 0, fmt.Errorf("max_tokens exceeds maximum limit (%d)", maxCtx)
+	}
+
+	modelHint := s.modelService.GetCurrentModel()
+	prepareStart := time.Now()
+	prepared, err := s.preparePrompt(engine, req, modelHint)
+	servicePrepareMS := durationMillis(time.Since(prepareStart))
+	if err != nil {
+		return "", 0, prepared.promptTokenCount, err
+	}
+	hasInputIDs := len(req.InputIDs) > 0
+	if prepared.prompt == "" && !hasInputIDs {
+		return "", 0, prepared.promptTokenCount, errors.New("no user message found")
+	}
+	if err := validatePreparedContextWindow(engine, prepared, req.InputIDs, req.MaxTokens); err != nil {
+		return "", 0, prepared.promptTokenCount, err
+	}
+
+	submitStart := time.Now()
+	stream, _, done, startMetrics, err := s.startGeneration(ctx, req, modelHint, prepared, nil)
+	if err != nil {
+		return "", 0, prepared.promptTokenCount, err
+	}
+	defer done()
+	firstCallbackMS := 0.0
+	lastCallbackMS := 0.0
 
 	logQwen36 := isQwen36Request(modelHint, prepared.modelVariant)
+	var responseBuilder strings.Builder
+	completionTokens := 0
 	visibleChunks := 0
 	visibleChars := 0
 
-	defer close(outputChan)
 	for {
 		select {
 		case event, ok := <-stream:
 			if !ok {
 				if logQwen36 {
-					slog.Info("qwen36 chat stream finished without terminal",
+					slog.Info("qwen36 chat sync finished without terminal",
 						slog.Int("visible_chunks", visibleChunks),
 						slog.Int("visible_chars", visibleChars),
 					)
 				}
-				return domain.ErrStreamClosedWithoutTerminal
+				return "", completionTokens, prepared.promptTokenCount, domain.ErrStreamClosedWithoutTerminal
 			}
 			if event.Token != "" {
+				if completionTokens == 0 {
+					firstCallbackMS = durationMillis(time.Since(submitStart))
+				}
+				lastCallbackMS = durationMillis(time.Since(submitStart))
+				responseBuilder.WriteString(event.Token)
+				completionTokens++
 				visibleChunks++
 				visibleChars += len(event.Token)
 			}
-			outputChan <- event
-			if event.Terminal {
-				if logQwen36 {
-					fields := []any{
-						slog.Int("visible_chunks", visibleChunks),
-						slog.Int("visible_chars", visibleChars),
-						slog.Bool("canceled", event.Canceled),
-					}
-					if err := event.TerminalError(); err != nil {
-						fields = append(fields, slog.String("terminal_error", err.Error()))
-					}
-					slog.Info("qwen36 chat stream terminal", fields...)
+			if !event.Terminal {
+				continue
+			}
+			if logQwen36 {
+				fields := []any{
+					slog.Int("visible_chunks", visibleChunks),
+					slog.Int("visible_chars", visibleChars),
+					slog.Bool("canceled", event.Canceled),
 				}
 				if err := event.TerminalError(); err != nil {
-					return err
+					fields = append(fields, slog.String("terminal_error", err.Error()))
 				}
-				return nil
+				slog.Info("qwen36 chat sync terminal", fields...)
 			}
+			if err := event.TerminalError(); err != nil {
+				return "", completionTokens, prepared.promptTokenCount, err
+			}
+			logServerOverhead("sync", prepared.promptTokenCount, completionTokens, servicePrepareMS,
+				startMetrics.engineSubmitMS, startMetrics.queueWaitMS, firstCallbackMS, lastCallbackMS,
+				durationMillis(time.Since(serverStart)))
+			return responseBuilder.String(), completionTokens, prepared.promptTokenCount, nil
 		case <-ctx.Done():
 			if logQwen36 {
-				slog.Info("qwen36 chat stream context done",
+				slog.Info("qwen36 chat sync context done",
 					slog.Int("visible_chunks", visibleChunks),
 					slog.Int("visible_chars", visibleChars),
 					slog.String("error", ctx.Err().Error()),
 				)
 			}
-			return ctx.Err()
+			return "", completionTokens, prepared.promptTokenCount, ctx.Err()
 		}
 	}
 }
@@ -149,6 +230,7 @@ func (s *ChatService) preparePrompt(engine domain.Engine, req domain.ChatComplet
 		return prepared, err
 	}
 	if req.RawPrompt != "" {
+		s.populatePromptTokenCount(engine, req, &prepared)
 		return prepared, nil
 	}
 
@@ -204,23 +286,54 @@ func (s *ChatService) preparePrompt(engine domain.Engine, req domain.ChatComplet
 		prepared.rawPassthroughUsed = true
 	}
 
-	// Keep Qwen3.5/Qwen3.6 server requests on the exact token path once the chat prompt
+	// Keep supported server requests on the exact token path once the chat prompt
 	// has been rendered. This avoids any remaining text-submit divergence between
 	// the Go server path and the C++ preview/parity path.
-	if prepared.renderedTemplateUsed && isQwenRenderedTokenPathRequest(modelHint, prepared.modelVariant) {
-		tokenIDs, err := engine.PreviewTextRequestTokens(prepared.prompt, req.MaxTokens, req.Temperature, req.TopP, req.TopK,
-			req.RepetitionPenalty, req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object")
-		if err != nil {
-			return prepared, err
+	if prepared.renderedTemplateUsed && isRenderedTokenPathRequest(modelHint, prepared.modelVariant, prepared.tokenizerType) {
+		if _, ok := engine.(interface {
+			GenerateStreamRenderedChatWithSamplingAwaitable(context.Context, string, int, string, bool, float64, float64, int, float64, []string, []int, bool, []int, chan domain.StreamEvent) (<-chan struct{}, error)
+		}); ok {
+			prepared.renderedChatSubmit = true
+			prepared.tokenSource = "engine_submit_rendered_chat"
+		} else {
+			tokenIDs, err := engine.PreviewRenderedRequestTokens(prepared.prompt, req.MaxTokens, req.Temperature, req.TopP, req.TopK,
+				req.RepetitionPenalty, req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object")
+			if err != nil {
+				return prepared, err
+			}
+			prepared.tokenIDs = tokenIDs
+			prepared.tokenSource = "engine_preview_rendered_request"
 		}
-		prepared.tokenIDs = tokenIDs
-		prepared.tokenSource = "engine_preview_text_request"
 	}
+	s.populatePromptTokenCount(engine, req, &prepared)
 
 	return prepared, nil
 }
 
-func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatCompletionRequest, modelHint string, prepared preparedPrompt) (<-chan domain.StreamEvent, error) {
+func (s *ChatService) populatePromptTokenCount(engine domain.Engine, req domain.ChatCompletionRequest, prepared *preparedPrompt) {
+	if prepared == nil {
+		return
+	}
+	switch {
+	case len(req.InputIDs) > 0:
+		prepared.promptTokenCount = len(req.InputIDs)
+		prepared.promptTokenIDs = append(prepared.promptTokenIDs[:0], req.InputIDs...)
+	case len(prepared.tokenIDs) > 0:
+		prepared.promptTokenCount = len(prepared.tokenIDs)
+		prepared.promptTokenIDs = append(prepared.promptTokenIDs[:0], prepared.tokenIDs...)
+	case prepared.renderedChatSubmit && req.Stream:
+		prepared.promptTokenCountDeferred = true
+		prepared.promptTokenCountSource = "rendered_chat_stream_runtime_usage"
+	case prepared.prompt != "" && engine != nil:
+		if ids, err := engine.TokenizeText(prepared.prompt, false, false); err == nil {
+			prepared.promptTokenCount = len(ids)
+			prepared.promptTokenIDs = ids
+			prepared.promptTokenCountSource = "engine_tokenize"
+		}
+	}
+}
+
+func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatCompletionRequest, modelHint string, prepared preparedPrompt, outputChan chan domain.StreamEvent) (<-chan domain.StreamEvent, <-chan struct{}, func(), generationStartMetrics, error) {
 	jsonMode := req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object"
 	temperature, topP, topK, repetitionPenalty := s.normalizeSampling(modelHint, prepared.tokenizerType, prepared.chatTemplate, req)
 	engine := s.modelService.GetEngine()
@@ -258,15 +371,24 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 		inputIDs = prepared.tokenIDs
 	}
 	cacheTokens := append([]int(nil), inputIDs...)
-	if len(cacheTokens) == 0 && prepared.prompt != "" && engine != nil {
-		if ids, err := engine.TokenizeText(prepared.prompt, false, false); err == nil {
-			cacheTokens = ids
-		}
+	if len(cacheTokens) == 0 && len(prepared.promptTokenIDs) > 0 {
+		cacheTokens = append([]int(nil), prepared.promptTokenIDs...)
 	}
 	if len(cacheTokens) > 0 {
 		identity := buildPromptCacheIdentity(req, prepared, modelHint)
 		decision := agentPromptCache.LookupAndStore(identity, cacheTokens)
 		logPromptCacheDecision(req, modelHint, decision)
+	}
+
+	if outputChan == nil {
+		outputChan = make(chan domain.StreamEvent, defaultStreamEventBufferSize())
+	}
+	doneChan := make(chan struct{})
+	var doneOnce sync.Once
+	done := func() {
+		doneOnce.Do(func() {
+			close(doneChan)
+		})
 	}
 
 	queuedReq := &queue.QueuedRequest{
@@ -276,6 +398,7 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 		MaxTokens:           maxTokens,
 		Prompt:              prepared.prompt,
 		InputIDs:            inputIDs,
+		RenderedChatSubmit:  prepared.renderedChatSubmit,
 		LoraAdapter:         req.LoraAdapter,
 		JSONMode:            jsonMode,
 		StopSequences:       req.Stop,
@@ -288,6 +411,8 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 		DisallowedTokenIDs:  req.DisallowedTokenIDs,
 		Context:             ctx,
 		ResultChan:          make(chan interface{}, 1),
+		OutputChan:          outputChan,
+		DoneChan:            doneChan,
 		ExpertCluster:       req.ExpertCluster,
 	}
 	if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
@@ -301,8 +426,16 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 		)
 	}
 	if envFlagEnabled("DENSECORE_DEBUG_REQUEST_STATE") {
+		submitAPI := "SubmitRequestWithSamplingConstraintsEx"
+		if len(queuedReq.InputIDs) > 0 {
+			if queuedReq.Prompt != "" {
+				submitAPI = "SubmitRenderedRequestIdsWithSamplingConstraintsCallbackEx"
+			} else {
+				submitAPI = "SubmitRequestIdsWithSamplingConstraintsEx"
+			}
+		}
 		slog.Info("normalized_request_state",
-			slog.String("submit_api", "SubmitRequestWithSamplingConstraintsEx"),
+			slog.String("submit_api", submitAPI),
 			slog.Int("max_tokens", queuedReq.MaxTokens),
 			slog.Float64("temperature", queuedReq.Temperature),
 			slog.Float64("top_p", queuedReq.TopP),
@@ -330,21 +463,30 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 	}
 
 	if !s.requestQueue.Enqueue(queuedReq) {
-		return nil, domain.ErrServiceBusy
+		done()
+		return nil, nil, nil, generationStartMetrics{}, domain.ErrServiceBusy
 	}
 
 	select {
 	case result := <-queuedReq.ResultChan:
 		switch v := result.(type) {
 		case error:
-			return nil, v
+			done()
+			return nil, nil, nil, generationStartMetrics{}, v
 		case chan domain.StreamEvent:
-			return v, nil
+			return v, nil, done, generationStartMetrics{}, nil
+		case generationResult:
+			return v.OutputChan, v.CompletionChan, done, generationStartMetrics{
+				queueWaitMS:    v.QueueWaitMS,
+				engineSubmitMS: v.EngineSubmitMS,
+			}, nil
 		default:
-			return nil, fmt.Errorf("unexpected result type from worker")
+			done()
+			return nil, nil, nil, generationStartMetrics{}, fmt.Errorf("unexpected result type from worker")
 		}
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		done()
+		return nil, nil, nil, generationStartMetrics{}, ctx.Err()
 	}
 }
 
@@ -362,7 +504,7 @@ func (s *ChatService) logPromptPathDebug(engine domain.Engine, req domain.ChatCo
 	if len(prepared.tokenIDs) > 0 {
 		tokenIDs = prepared.tokenIDs
 		tokenSource = prepared.tokenSource
-	} else if len(tokenIDs) == 0 && prepared.prompt != "" && engine != nil {
+	} else if len(tokenIDs) == 0 && prepared.prompt != "" && engine != nil && !prepared.renderedChatSubmit {
 		ids, err := engine.TokenizeText(prepared.prompt, false, false)
 		if err != nil {
 			tokenizeErr = err.Error()
@@ -434,6 +576,19 @@ func isQwen35Request(modelHint string, modelVariant string) bool {
 
 func isQwenRenderedTokenPathRequest(modelHint string, modelVariant string) bool {
 	return isQwen35Request(modelHint, modelVariant) || isQwen36Request(modelHint, modelVariant)
+}
+
+func isGemmaRenderedTokenPathRequest(modelHint string, modelVariant string, tokenizerType string) bool {
+	variant := strings.ToLower(strings.TrimSpace(modelVariant))
+	tokenizer := strings.ToLower(strings.TrimSpace(tokenizerType))
+	hint := strings.ToLower(modelHint)
+	return strings.Contains(variant, "gemma") || strings.Contains(tokenizer, "gemma") ||
+		strings.Contains(hint, "gemma")
+}
+
+func isRenderedTokenPathRequest(modelHint string, modelVariant string, tokenizerType string) bool {
+	return isQwenRenderedTokenPathRequest(modelHint, modelVariant) ||
+		isGemmaRenderedTokenPathRequest(modelHint, modelVariant, tokenizerType)
 }
 
 func validatePreparedContextWindow(engine domain.Engine, prepared preparedPrompt, requestInputIDs []int, maxTokens int) error {
@@ -767,6 +922,12 @@ func isQwen36ModelHint(modelHint string) bool {
 	return strings.Contains(lower, "qwen3.6") || strings.Contains(lower, "qwen36")
 }
 
+func isQwen35ModelHint(modelHint string) bool {
+	lower := strings.ToLower(strings.TrimSpace(modelHint))
+	return strings.Contains(lower, "qwen3.5") || strings.Contains(lower, "qwen3_5") ||
+		strings.Contains(lower, "qwen3-5") || strings.Contains(lower, "qwen35")
+}
+
 func shouldPassThroughRawPrompt(modelHint, tokenizerType, chatTemplate string, messages []domain.Message,
 	templateKwargs *domain.ChatTemplateKwargs) bool {
 	if !allowDebugChatRawPassthrough() {
@@ -801,6 +962,43 @@ func chatPathDebugEnabled() bool {
 
 func allowDebugChatRawPassthrough() bool {
 	return envFlagEnabled("DENSECORE_DEBUG_CHAT_RAW_PASSTHROUGH")
+}
+
+func durationMillis(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000.0
+}
+
+func logServerOverhead(mode string, promptTokens, completionTokens int, servicePrepareMS, engineSubmitMS, queueWaitMS, firstCallbackMS, lastCallbackMS, serverTotalMS float64) {
+	if !envFlagEnabled("DENSECORE_DEBUG_SERVER_OVERHEAD") && !envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
+		return
+	}
+	slog.Info("server_overhead",
+		slog.String("mode", mode),
+		slog.Float64("service_prepare_ms", servicePrepareMS),
+		slog.Float64("queue_wait_ms", queueWaitMS),
+		slog.Float64("engine_submit_ms", engineSubmitMS),
+		slog.Float64("first_callback_ms", firstCallbackMS),
+		slog.Float64("last_callback_ms", lastCallbackMS),
+		slog.Float64("server_total_ms", serverTotalMS),
+		slog.Int("prompt_tokens", promptTokens),
+		slog.Int("completion_tokens", completionTokens),
+	)
+}
+
+func logServerSubmitOverhead(mode string, promptTokens int, servicePrepareMS, engineSubmitMS, queueWaitMS, firstCallbackMS, lastCallbackMS, serverTotalMS float64) {
+	if !envFlagEnabled("DENSECORE_DEBUG_SERVER_OVERHEAD") && !envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
+		return
+	}
+	slog.Info("server_submit_overhead",
+		slog.String("mode", mode),
+		slog.Float64("service_prepare_ms", servicePrepareMS),
+		slog.Float64("queue_wait_ms", queueWaitMS),
+		slog.Float64("engine_submit_ms", engineSubmitMS),
+		slog.Float64("first_callback_ms", firstCallbackMS),
+		slog.Float64("last_callback_ms", lastCallbackMS),
+		slog.Float64("server_total_ms", serverTotalMS),
+		slog.Int("prompt_tokens", promptTokens),
+	)
 }
 
 func envFlagEnabled(key string) bool {

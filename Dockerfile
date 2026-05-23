@@ -45,7 +45,7 @@ RUN mkdir -p core/src core/tests && \
              /^[[:space:]]*set\(TEST_SOURCES$/ { in_tests=1; next } \
              in_tests && /^[[:space:]]*\)/ { in_tests=0; next } \
              in_sources || in_tests { print $1 }' core/CMakeLists.txt; \
-        printf '%s\n' src/quantize.cpp; \
+        printf '%s\n' src/tools/quantize.cpp; \
     } | \
     sed -e 's/#.*$//' \
         -e 's/^[[:space:]]*//' \
@@ -60,8 +60,8 @@ RUN mkdir -p core/src core/tests && \
 # For multi-arch ARM builds:
 # - GGML_NATIVE=OFF: Disable native CPU feature detection
 # - DENSEVLA_ARM_TARGET: Select ARM ISA profile (generic/jetson_orin/rpi5/qualcomm_rb5/custom)
-ARG TARGETARCH
 ARG DENSEVLA_ARM_TARGET=generic
+ARG TARGETARCH
 RUN mkdir -p build && cd build && \
     if [ "$TARGETARCH" = "arm64" ]; then \
     EXTRA_FLAGS="-DCMAKE_TOOLCHAIN_FILE=../core/cmake/aarch64-toolchain.cmake -DDENSEVLA_ARM_TARGET=${DENSEVLA_ARM_TARGET}"; \

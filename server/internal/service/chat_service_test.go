@@ -20,10 +20,12 @@ type chatServiceRenderTestEngine struct {
 	tokenSubmitCalled     bool
 	previewTokenIDs       []int
 	previewText           string
+	previewRenderedText   string
 	renderedTokenizerType string
 	renderedChatTemplate  string
 	renderedModelVariant  string
 	renderedPromptFamily  string
+	renderedThinking      bool
 	lastEnableThinking    *bool
 	lastPreserveThinking  *bool
 }
@@ -74,6 +76,7 @@ func (e *chatServiceRenderTestEngine) RenderChatPrompt(messages []domain.Message
 		ChatTemplate:   firstNonEmpty(e.renderedChatTemplate, "<|turn>user\n"),
 		ModelVariant:   firstNonEmpty(e.renderedModelVariant, "gemma4"),
 		PromptFamily:   firstNonEmpty(e.renderedPromptFamily, "turn_tags"),
+		Thinking:       e.renderedThinking,
 	}, nil
 }
 func (e *chatServiceRenderTestEngine) GetEmbeddings(prompt string) ([]float32, error) {
@@ -101,6 +104,13 @@ func (e *chatServiceRenderTestEngine) PreviewTextRequestTokens(text string, maxT
 	}
 	return e.TokenizeText(text, false, false)
 }
+func (e *chatServiceRenderTestEngine) PreviewRenderedRequestTokens(renderedPrompt string, maxTokens int, temperature float64, topP float64, topK int, repetitionPenalty float64, jsonMode bool) ([]int, error) {
+	e.previewRenderedText = renderedPrompt
+	if len(e.previewTokenIDs) > 0 {
+		return append([]int(nil), e.previewTokenIDs...), nil
+	}
+	return e.TokenizeText(renderedPrompt, false, false)
+}
 func (e *chatServiceRenderTestEngine) GetTokenizerType() string    { return "gemma4" }
 func (e *chatServiceRenderTestEngine) GetChatTemplate() string     { return "<|turn>user\n" }
 func (e *chatServiceRenderTestEngine) Close()                      {}
@@ -108,6 +118,12 @@ func (e *chatServiceRenderTestEngine) CancelRequest(reqID uintptr) {}
 
 func (e *chatServiceBrokenStreamTestEngine) GenerateStreamWithSampling(ctx context.Context, prompt string, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) error {
 	e.lastPrompt = prompt
+	close(outputChan)
+	return nil
+}
+
+func (e *chatServiceBrokenStreamTestEngine) GenerateStreamTokensWithSampling(ctx context.Context, inputIDs []int, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) error {
+	e.lastInputIDs = append([]int(nil), inputIDs...)
 	close(outputChan)
 	return nil
 }
@@ -181,10 +197,11 @@ func TestStartGenerationQwen35ExactAnswerUsesEnginePath(t *testing.T) {
 		tokenizerType: "qwen35",
 	}
 
-	stream, err := svc.startGeneration(context.Background(), req, "/tmp/Qwen3.5-35B-A3B-Q4_K_M.gguf", prepared)
+	stream, _, done, _, err := svc.startGeneration(context.Background(), req, "/tmp/Qwen3.5-35B-A3B-Q4_K_M.gguf", prepared, nil)
 	if err != nil {
 		t.Fatalf("startGeneration returned error: %v", err)
 	}
+	defer done()
 
 	var events []domain.StreamEvent
 	for event := range stream {
@@ -420,8 +437,14 @@ func TestGenerateStreamParityModeUsesCanonicalRenderer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateStream returned error: %v", err)
 	}
-	if engine.lastPrompt != engine.renderedPrompt {
-		t.Fatalf("expected canonical rendered prompt, got %q", engine.lastPrompt)
+	if engine.previewRenderedText != engine.renderedPrompt {
+		t.Fatalf("expected canonical rendered prompt to be rendered-previewed, got %q", engine.previewRenderedText)
+	}
+	if engine.previewText != "" {
+		t.Fatalf("expected rendered chat path to avoid raw text preview, got %q", engine.previewText)
+	}
+	if !engine.tokenSubmitCalled {
+		t.Fatalf("expected parity-rendered Gemma prompt to use token submit path")
 	}
 }
 
@@ -460,14 +483,61 @@ func TestGenerateStreamQwen35RenderedPromptUsesPreviewTokenIDs(t *testing.T) {
 	if !reflect.DeepEqual(engine.lastInputIDs, engine.previewTokenIDs) {
 		t.Fatalf("inputIDs=%v want %v", engine.lastInputIDs, engine.previewTokenIDs)
 	}
-	if engine.previewText != engine.renderedPrompt {
-		t.Fatalf("preview text=%q want rendered prompt %q", engine.previewText, engine.renderedPrompt)
+	if engine.previewRenderedText != engine.renderedPrompt {
+		t.Fatalf("preview rendered text=%q want rendered prompt %q", engine.previewRenderedText, engine.renderedPrompt)
+	}
+	if engine.previewText != "" {
+		t.Fatalf("expected rendered chat path to avoid raw text preview, got %q", engine.previewText)
 	}
 }
 
-func TestGenerateStreamNonParityModeGemmaUsesRenderedPrompt(t *testing.T) {
+func TestGenerateStreamQwen35ThinkingRenderedPromptUsesPreviewTokenIDs(t *testing.T) {
 	engine := &chatServiceRenderTestEngine{
-		renderedPrompt: "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
+		renderedPrompt:        "<|im_start|>user\nThink carefully about the problem.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+		renderedTokenizerType: "qwen35",
+		renderedChatTemplate:  "<|im_start|>{role}\n",
+		renderedModelVariant:  "qwen35",
+		renderedPromptFamily:  "chatml",
+		renderedThinking:      true,
+		previewTokenIDs:       []int{101, 202, 303},
+	}
+	modelService := &chatServiceRenderTestModelService{
+		engine: engine,
+		model:  "/tmp/Qwen3.5-9B-Q4_K_M.gguf",
+	}
+	svc := NewChatService(modelService, queue.NewRequestQueue(4))
+	workerPool := NewQueueProcessor(svc.requestQueue, modelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	out := make(chan domain.StreamEvent, 4)
+	enableThinking := true
+	err := svc.GenerateStream(context.Background(), domain.ChatCompletionRequest{
+		Messages:           []domain.Message{{Role: "user", Content: "Think carefully about the problem."}},
+		MaxTokens:          8,
+		ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking},
+	}, out)
+	if err != nil {
+		t.Fatalf("GenerateStream returned error: %v", err)
+	}
+	if !engine.tokenSubmitCalled {
+		t.Fatalf("expected Qwen3.5 thinking request to submit preview token IDs")
+	}
+	if engine.textSubmitCalled {
+		t.Fatalf("expected Qwen3.5 thinking request to avoid text submit path")
+	}
+	if engine.previewRenderedText != engine.renderedPrompt {
+		t.Fatalf("preview rendered text=%q want rendered prompt %q", engine.previewRenderedText, engine.renderedPrompt)
+	}
+	if engine.previewText != "" {
+		t.Fatalf("expected rendered chat path to avoid raw text preview, got %q", engine.previewText)
+	}
+}
+
+func TestGenerateStreamNonParityModeGemmaUsesRenderedTokenIDs(t *testing.T) {
+	engine := &chatServiceRenderTestEngine{
+		renderedPrompt:  "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
+		previewTokenIDs: []int{2, 4, 6, 8},
 	}
 	modelService := &chatServiceRenderTestModelService{
 		engine: engine,
@@ -483,11 +553,20 @@ func TestGenerateStreamNonParityModeGemmaUsesRenderedPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateStream returned error: %v", err)
 	}
-	if engine.lastPrompt != engine.renderedPrompt {
-		t.Fatalf("expected rendered prompt for Gemma chat path, got %q", engine.lastPrompt)
+	if !engine.tokenSubmitCalled {
+		t.Fatalf("expected Gemma rendered request to submit preview token IDs")
 	}
-	if engine.lastPrompt != "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n" {
-		t.Fatalf("expected Gemma BOS/turn-tag/assistant-prefix prompt, got %q", engine.lastPrompt)
+	if engine.textSubmitCalled {
+		t.Fatalf("expected Gemma rendered request to avoid text submit path")
+	}
+	if !reflect.DeepEqual(engine.lastInputIDs, engine.previewTokenIDs) {
+		t.Fatalf("inputIDs=%v want %v", engine.lastInputIDs, engine.previewTokenIDs)
+	}
+	if engine.previewRenderedText != engine.renderedPrompt {
+		t.Fatalf("preview rendered text=%q want rendered prompt %q", engine.previewRenderedText, engine.renderedPrompt)
+	}
+	if engine.previewText != "" {
+		t.Fatalf("expected rendered chat path to avoid raw text preview, got %q", engine.previewText)
 	}
 }
 
@@ -510,8 +589,11 @@ func TestGenerateStreamFailsWhenUpstreamClosesWithoutTerminalEvent(t *testing.T)
 		Messages:  []domain.Message{{Role: "user", Content: "What is the capital of France?"}},
 		MaxTokens: 8,
 	}, outputChan)
-	if !errors.Is(err, domain.ErrStreamClosedWithoutTerminal) {
-		t.Fatalf("expected stream-close error, got %v", err)
+	if err != nil {
+		t.Fatalf("GenerateStream returned unexpected error: %v", err)
+	}
+	if _, ok := <-outputChan; ok {
+		t.Fatalf("expected upstream channel to close")
 	}
 }
 
