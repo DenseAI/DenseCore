@@ -909,19 +909,6 @@ static bool Qwen35NativeMoEGateUpQuantizeInput(const ggml_tensor* input, int64_t
     return true;
 }
 
-static bool Qwen35NativeMoEGateUpDotRawQ4K(const ggml_tensor* exps, int32_t expert, int64_t row, const uint8_t* qbuf,
-                                           float* out_value) {
-    if (!exps || !exps->data || !qbuf || !out_value || exps->type != GGML_TYPE_Q4_K) return false;
-    if (expert < 0 || expert >= exps->ne[2] || row < 0 || row >= exps->ne[1]) return false;
-    const auto* w_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
-    if (!w_traits || !w_traits->vec_dot || w_traits->vec_dot_type != GGML_TYPE_Q8_K) return false;
-    const char* weight_row = static_cast<const char*>(exps->data) +
-                             static_cast<size_t>(expert) * static_cast<size_t>(exps->nb[2]) +
-                             static_cast<size_t>(row) * static_cast<size_t>(exps->nb[1]);
-    w_traits->vec_dot(static_cast<int>(exps->ne[0]), out_value, 0, weight_row, 0, qbuf, 0, 1);
-    return true;
-}
-
 static void RunQwen35NativeMoEGateUpRawQ4KSwiGLU(ggml_tensor* dst, const ggml_tensor* gate_exps,
                                                  const ggml_tensor* up_exps, const ggml_tensor* input,
                                                  const ggml_tensor* selected_experts, int ith, int nth) {
@@ -939,6 +926,8 @@ static void RunQwen35NativeMoEGateUpRawQ4KSwiGLU(ggml_tensor* dst, const ggml_te
     }
 
     thread_local std::vector<uint8_t> qbuf;
+    const auto* w_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
+    if (!w_traits || !w_traits->vec_dot || w_traits->vec_dot_type != GGML_TYPE_Q8_K) return;
     const int64_t row_start = (static_cast<int64_t>(ith) * n_ff) / nth;
     const int64_t row_end = (static_cast<int64_t>(ith + 1) * n_ff) / nth;
     for (int64_t token = 0; token < n_tokens; ++token) {
@@ -946,13 +935,17 @@ static void RunQwen35NativeMoEGateUpRawQ4KSwiGLU(ggml_tensor* dst, const ggml_te
         for (int64_t k = 0; k < top_k; ++k) {
             int32_t expert = -1;
             if (!Qwen35NativeMoEDownQ5KReadExpert(selected_experts, gate_exps, token, k, &expert)) continue;
+            const char* gate_base = static_cast<const char*>(gate_exps->data) +
+                                    static_cast<size_t>(expert) * static_cast<size_t>(gate_exps->nb[2]);
+            const char* up_base = static_cast<const char*>(up_exps->data) +
+                                  static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]);
             for (int64_t row = row_start; row < row_end; ++row) {
                 float gate_value = 0.0f;
                 float up_value = 0.0f;
-                if (!Qwen35NativeMoEGateUpDotRawQ4K(gate_exps, expert, row, qbuf.data(), &gate_value) ||
-                    !Qwen35NativeMoEGateUpDotRawQ4K(up_exps, expert, row, qbuf.data(), &up_value)) {
-                    continue;
-                }
+                const char* gate_row = gate_base + static_cast<size_t>(row) * static_cast<size_t>(gate_exps->nb[1]);
+                const char* up_row = up_base + static_cast<size_t>(row) * static_cast<size_t>(up_exps->nb[1]);
+                w_traits->vec_dot(static_cast<int>(gate_exps->ne[0]), &gate_value, 0, gate_row, 0, qbuf.data(), 0, 1);
+                w_traits->vec_dot(static_cast<int>(up_exps->ne[0]), &up_value, 0, up_row, 0, qbuf.data(), 0, 1);
                 const float silu = gate_value / (1.0f + std::exp(-gate_value));
                 *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
                                           static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
