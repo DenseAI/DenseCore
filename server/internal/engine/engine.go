@@ -168,16 +168,22 @@ import (
 	"descore-server/internal/util"
 )
 
-// Engine configuration constants
-const (
-	// EmbeddingTimeout is the maximum time to wait for embedding generation.
-	// TODO(debt): Make configurable via environment variable or config.
-	EmbeddingTimeout = 30 * time.Second
-)
-
 var cleanupOnce sync.Once
 var pluginMu sync.Mutex
 var pluginRefCount int
+
+// EmbeddingTimeout is the maximum time to wait for embedding generation.
+var EmbeddingTimeout = func() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("DENSECORE_EMBEDDING_TIMEOUT")); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+		if seconds, err := time.ParseDuration(raw + "s"); err == nil && seconds > 0 {
+			return seconds
+		}
+	}
+	return 30 * time.Second
+}()
 
 func requestLifecycleDebugEnabled() bool {
 	return util.ParseBoolEnv("DENSECORE_DEBUG_REQUEST_LIFECYCLE", false)

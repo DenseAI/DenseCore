@@ -148,6 +148,25 @@ TEST(ModelDescriptorTest, BertTokenizerMetadataUsesWordPieceFamily) {
                  "bert_wordpiece");
 }
 
+TEST(ModelDescriptorTest, JinaV2TokenizerMetadataUsesWordPieceFamily) {
+    TransformerModel model{};
+    model.arch = ModelArch::BERT;
+    model.tokenizer_type = "jina-v2-en";
+
+    EXPECT_EQ(densecore::models::ResolveTokenizerFamily(&model),
+              densecore::models::TokenizerFamily::BERT_WORDPIECE);
+    EXPECT_TRUE(densecore::models::IsKnownTokenizerModel("jina-v2-en"));
+}
+
+TEST(ModelDescriptorTest, NomicBertArchAliasResolvesToBertDescriptor) {
+    auto resolved = densecore::models::ResolveModelDescriptor("nomic-bert");
+
+    EXPECT_TRUE(resolved.known);
+    ASSERT_NE(resolved.descriptor, nullptr);
+    EXPECT_EQ(resolved.descriptor->arch, ModelArch::BERT);
+    EXPECT_EQ(resolved.descriptor->tokenizer_family, densecore::models::TokenizerFamily::BERT_WORDPIECE);
+}
+
 TEST(ModelDescriptorTest, T5TokenizerMetadataUsesSentencePieceFamily) {
     TransformerModel model{};
     model.arch = ModelArch::BERT;

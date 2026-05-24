@@ -2680,6 +2680,54 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
     }
 
+    if (model->arch == ModelArch::BERT) {
+        auto find_token = [&](std::initializer_list<const char*> literals) -> int32_t {
+            for (const char* literal : literals) {
+                auto it = model->token_to_id.find(literal);
+                if (it != model->token_to_id.end()) {
+                    return static_cast<int32_t>(it->second);
+                }
+            }
+            return -1;
+        };
+        auto id_matches = [&](int32_t id, std::initializer_list<const char*> literals) -> bool {
+            if (id < 0 || id >= static_cast<int32_t>(model->vocab_tokens.size())) {
+                return false;
+            }
+            const std::string& token = model->vocab_tokens[static_cast<size_t>(id)];
+            for (const char* literal : literals) {
+                if (token == literal) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        if (!id_matches(model->unk_token_id, {"[UNK]", "<unk>"})) {
+            model->unk_token_id = find_token({"[UNK]", "<unk>"});
+        }
+        if (!id_matches(model->pad_token_id, {"[PAD]", "<pad>"})) {
+            model->pad_token_id = find_token({"[PAD]", "<pad>"});
+        }
+        if (!id_matches(model->mask_token_id, {"[MASK]", "<mask>"})) {
+            model->mask_token_id = find_token({"[MASK]", "<mask>"});
+        }
+
+        if (!id_matches(model->bos_token_id, {"[CLS]", "<s>"})) {
+            model->bos_token_id = find_token({"[CLS]", "<s>"});
+        }
+        if (!id_matches(model->sep_token_id, {"[SEP]", "</s>", "<sep>"})) {
+            model->sep_token_id = find_token({"[SEP]", "</s>", "<sep>"});
+        }
+        if (model->sep_token_id >= 0 && !id_matches(model->eos_token_id, {"[SEP]", "</s>", "<eos>"})) {
+            model->eos_token_id = model->sep_token_id;
+        }
+        if (model->bos_token_id >= 0) {
+            add_bos = true;
+        }
+        model->tokenizer_add_bos = add_bos;
+    }
+
     std::cout << "[DenseCore] Model params: n_vocab=" << model->hparams.n_vocab << ", n_embd=" << model->hparams.n_embd
               << ", n_layer=" << model->hparams.n_layer << ", n_head=" << model->hparams.n_head
               << ", n_head_kv=" << model->hparams.n_head_kv << ", n_rot=" << model->hparams.n_rot
@@ -2999,6 +3047,10 @@ TransformerModel* LoadGGUFModel(const char* path) {
     model->token_embd_norm = get_tensor("token_embd_norm.weight");
     model->token_embd_norm_bias = get_tensor("token_embd_norm.bias");
     model->output_norm = get_tensor("output_norm.weight");
+    if (arch_lower == "nomic-bert") {
+        return fail_load("nomic-bert GGUF embeddings are not enabled: this encoder uses fused QKV/RoPE/SwiGLU "
+                         "layout and has not passed DenseCore embedding parity QA");
+    }
     if (model->arch_flags.is_gemma4) {
         model->gemma4_per_layer_model_projection = get_tensor("per_layer_model_proj.weight");
         model->gemma4_per_layer_projection_norm = get_tensor("per_layer_proj_norm.weight");

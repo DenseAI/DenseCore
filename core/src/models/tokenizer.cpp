@@ -717,8 +717,34 @@ bool WordPieceShouldLower(const TransformerModel* model) {
     if (lowered.find("cased") != std::string::npos) {
         return false;
     }
+    if (model->token_to_id.find("▁the") != model->token_to_id.end() &&
+        model->token_to_id.find("▁The") == model->token_to_id.end()) {
+        return true;
+    }
+    for (const auto& item : model->token_to_id) {
+        const std::string& token = item.first;
+        if (token.rfind("▁", 0) != 0 || token.size() < 4) {
+            continue;
+        }
+        const unsigned char first_ascii = static_cast<unsigned char>(token[3]);
+        if (first_ascii < 'a' || first_ascii > 'z') {
+            continue;
+        }
+        std::string upper = token;
+        upper[3] = static_cast<char>(std::toupper(first_ascii));
+        if (model->token_to_id.find(upper) == model->token_to_id.end()) {
+            return true;
+        }
+    }
     return model->token_to_id.find("the") != model->token_to_id.end() &&
            model->token_to_id.find("The") == model->token_to_id.end();
+}
+
+bool WordPieceUsesSentencePieceSurface(const TransformerModel* model) {
+    if (!model) return false;
+    return model->token_to_id.find("▁the") != model->token_to_id.end() ||
+           model->token_to_id.find("▁.") != model->token_to_id.end() ||
+           model->token_to_id.find("▁,") != model->token_to_id.end();
 }
 
 std::vector<std::string> PretokenizeForWordPiece(const TransformerModel* model, const std::string& text) {
@@ -771,8 +797,67 @@ int FindWordPieceUnkId(const TransformerModel* model) {
     return FindSentencePieceUnkId(model);
 }
 
+void AppendSentencePieceSurfaceWordPieceTokens(const TransformerModel* model, const std::string& span,
+                                               std::vector<int>* out) {
+    if (!model || !out || span.empty()) {
+        return;
+    }
+
+    const int unk_id = FindWordPieceUnkId(model);
+    for (const std::string& piece : PretokenizeForWordPiece(model, span)) {
+        if (piece.empty()) {
+            continue;
+        }
+
+        const auto cps = DecodeUtf8Codepoints(piece);
+        std::vector<int> piece_ids;
+        bool failed = cps.empty();
+        size_t start = 0;
+        while (!failed && start < cps.size()) {
+            size_t end = cps.size();
+            int found_id = -1;
+            size_t found_end = start;
+
+            while (end > start) {
+                const size_t byte_begin = cps[start].start;
+                const size_t byte_end = (end < cps.size()) ? cps[end].start : piece.size();
+                std::string candidate = piece.substr(byte_begin, byte_end - byte_begin);
+                if (start == 0) {
+                    candidate.insert(0, "▁");
+                }
+                auto it = model->token_to_id.find(candidate);
+                if (it != model->token_to_id.end()) {
+                    found_id = it->second;
+                    found_end = end;
+                    break;
+                }
+                --end;
+            }
+
+            if (found_id < 0) {
+                failed = true;
+                break;
+            }
+            piece_ids.push_back(found_id);
+            start = found_end;
+        }
+
+        if (failed) {
+            if (unk_id >= 0) {
+                out->push_back(unk_id);
+            }
+        } else {
+            out->insert(out->end(), piece_ids.begin(), piece_ids.end());
+        }
+    }
+}
+
 void AppendWordPieceTokens(const TransformerModel* model, const std::string& span, std::vector<int>* out) {
     if (!model || !out || span.empty()) {
+        return;
+    }
+    if (WordPieceUsesSentencePieceSurface(model)) {
+        AppendSentencePieceSurfaceWordPieceTokens(model, span, out);
         return;
     }
 

@@ -285,7 +285,7 @@ ResolvedModelDescriptor ResolveModelDescriptorFromArchName(std::string_view arch
     if (MatchesAny(lowered, std::array<std::string_view, 2>{"phi", "phi3"})) {
         return make_result(DescribeModelVariant(ModelVariant::PHI));
     }
-    if (MatchesAny(lowered, std::array<std::string_view, 3>{"bert", "bge", "xlm-roberta"})) {
+    if (MatchesAny(lowered, std::array<std::string_view, 4>{"bert", "bge", "xlm-roberta", "nomic-bert"})) {
         return make_result(DescribeModelVariant(ModelVariant::BERT));
     }
     if (MatchesAny(lowered, std::array<std::string_view, 2>{"vit", "vision_transformer"})) {
@@ -364,7 +364,8 @@ TokenizerFamily ResolveTokenizerFamilyFromMetadata(std::string_view tokenizer_ty
         lowered == "t5") {
         return TokenizerFamily::LLAMA_SENTENCEPIECE;
     }
-    if (lowered == "bert" || lowered.find("wordpiece") != std::string::npos ||
+    if (lowered == "bert" || lowered.find("jina-v2") != std::string::npos ||
+        lowered.find("wordpiece") != std::string::npos ||
         lowered.find("wpm") != std::string::npos) {
         return TokenizerFamily::BERT_WORDPIECE;
     }
@@ -444,11 +445,11 @@ PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model) 
 
 bool IsKnownTokenizerModel(std::string_view tokenizer_name) {
     const std::string lowered = AsciiLower(tokenizer_name);
-    static constexpr std::array<std::string_view, 23> kKnown = {
+    static constexpr std::array<std::string_view, 24> kKnown = {
         "llama",   "gpt2",      "qwen2",  "qwen2.5", "qwen3",       "qwen3next",        "qwen35",
         "qwen3.5", "qwen35moe", "qwen36", "qwen3.6", "qwen3_5_moe", "qwen3_5_moe_text", "mistral",
         "gemma",   "gemma4",    "bpe",    "glm4",    "glm",         "sentencepiece",    "spm",
-        "bert",    "t5",
+        "bert",    "jina-v2-en", "t5",
     };
     return MatchesAny(lowered, kKnown);
 }

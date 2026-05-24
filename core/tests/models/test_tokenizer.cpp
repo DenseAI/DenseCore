@@ -134,6 +134,51 @@ TransformerModel MakeBertWordPieceModel() {
     return model;
 }
 
+TransformerModel MakeBertSentencePieceSurfaceModel() {
+    TransformerModel model{};
+    model.arch = ModelArch::BERT;
+    model.variant = ModelVariant::BERT;
+    model.tokenizer_type = "bert";
+    model.bos_token_id = 101;
+    model.sep_token_id = 102;
+    model.eos_token_id = 102;
+    model.unk_token_id = 100;
+    model.pad_token_id = 0;
+    model.mask_token_id = 103;
+    model.vocab_tokens.resize(30000);
+
+    auto add_token = [&](int id, const char* token, int32_t token_type = 1) {
+        if (static_cast<size_t>(id) >= model.vocab_tokens.size()) {
+            model.vocab_tokens.resize(static_cast<size_t>(id) + 1);
+        }
+        model.vocab_tokens[static_cast<size_t>(id)] = token;
+        model.token_to_id[token] = id;
+        if (static_cast<size_t>(id) >= model.token_types.size()) {
+            model.token_types.resize(static_cast<size_t>(id) + 1, 1);
+        }
+        model.token_types[static_cast<size_t>(id)] = token_type;
+    };
+
+    add_token(0, "[PAD]", 3);
+    add_token(100, "[UNK]", 2);
+    add_token(101, "[CLS]", 3);
+    add_token(102, "[SEP]", 3);
+    add_token(103, "[MASK]", 3);
+    add_token(9742, "▁dense");
+    add_token(17345, "core");
+    add_token(3216, "▁runs");
+    add_token(17368, "▁cpu");
+    add_token(28937, "▁inference");
+    add_token(1999, "▁in");
+    add_token(13970, "▁ku");
+    add_token(5677, "ber");
+    add_token(7159, "net");
+    add_token(2229, "es");
+    add_token(1012, "▁.");
+
+    return model;
+}
+
 }  // namespace
 
 TEST(TokenizerTest, Gemma4ControlTokensRemainAtomicWithoutMergeMetadata) {
@@ -218,5 +263,16 @@ TEST(TokenizerTest, BertWordPieceKeepsBracketSpecialTokensAtomic) {
         Tokenizer::Tokenize(&model, "[CLS] the [MASK]", /*add_bos=*/false, /*add_eos=*/true);
 
     const std::vector<int> expected = {101, 104, 103, 102};
+    EXPECT_EQ(tokens, expected);
+}
+
+TEST(TokenizerTest, BertSentencePieceSurfaceGreedyMatchesBgeSmallIds) {
+    TransformerModel model = MakeBertSentencePieceSurfaceModel();
+
+    const std::vector<int> tokens =
+        Tokenizer::Tokenize(&model, "DenseCore runs CPU inference in Kubernetes.", /*add_bos=*/true,
+                            /*add_eos=*/true);
+
+    const std::vector<int> expected = {101, 9742, 17345, 3216, 17368, 28937, 1999, 13970, 5677, 7159, 2229, 1012, 102};
     EXPECT_EQ(tokens, expected);
 }

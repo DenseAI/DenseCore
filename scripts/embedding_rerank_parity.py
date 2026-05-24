@@ -58,15 +58,19 @@ def max_abs_delta(a: list[float], b: list[float]) -> float:
     return max((abs(x - y) for x, y in zip(a, b)), default=0.0)
 
 
-def load_reference_model(model_id: str, device: str):
+def load_reference_model(model_id: str, device: str, trust_remote_code: bool):
     try:
         import torch
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoConfig, AutoModel, AutoTokenizer
     except ImportError as exc:
         raise RuntimeError("install torch and transformers to run reference parity") from exc
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModel.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if not hasattr(config, "rope_theta") and isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+        setattr(config, "rope_theta", rope_parameters["rope_theta"])
+    model = AutoModel.from_pretrained(model_id, config=config, trust_remote_code=trust_remote_code)
     model.eval()
     model.to(device)
     return torch, tokenizer, model
@@ -91,12 +95,14 @@ def pool_hidden(torch, outputs, attention_mask, pooling: str):
     return summed / counts
 
 
-def reference_embeddings(model_id: str, texts: list[str], pooling: str, normalize: bool, device: str) -> list[list[float]]:
-    torch, tokenizer, model = load_reference_model(model_id, device)
+def reference_embeddings(
+    model_id: str, texts: list[str], pooling: str, normalize: bool, device: str, trust_remote_code: bool
+) -> list[list[float]]:
+    torch, tokenizer, model = load_reference_model(model_id, device, trust_remote_code)
     batch = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
     batch = {k: v.to(device) for k, v in batch.items()}
     with torch.no_grad():
-        outputs = model(**batch)
+        outputs = model(**batch, use_cache=False)
         vectors = pool_hidden(torch, outputs, batch["attention_mask"], pooling)
         if normalize:
             vectors = torch.nn.functional.normalize(vectors, p=2, dim=1)
@@ -144,6 +150,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
     parser.add_argument("--reference-model", required=True, help="Transformers model id or local path")
+    parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to Transformers")
     parser.add_argument("--densecore-model-path", default="", help="Optional model path to load into DenseCore first")
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--pooling", choices=["mean", "cls", "last", "max"], default="mean")
@@ -152,39 +159,63 @@ def main() -> int:
     parser.add_argument("--max-abs-delta", type=float, default=0.02)
     parser.add_argument("--query", default=DEFAULT_QUERY)
     parser.add_argument("--text", action="append", dest="texts", help="Text to embed; repeat for multiple inputs")
+    parser.add_argument("--text-prefix", default="", help="Prefix applied to all embedding texts for both engines")
+    parser.add_argument("--query-prefix", default="", help="Prefix applied to rerank query for both engines")
+    parser.add_argument("--document-prefix", default="", help="Prefix applied to rerank documents for both engines")
     parser.add_argument("--top-n", type=int, default=2)
+    parser.add_argument("--skip-rerank", action="store_true", help="Only validate /v1/embeddings")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
 
-    texts = args.texts or DEFAULT_TEXTS
+    raw_texts = args.texts or DEFAULT_TEXTS
+    texts = [args.text_prefix + text for text in raw_texts]
     if args.densecore_model_path:
         payload: dict[str, Any] = {"model_path": args.densecore_model_path}
         if args.threads > 0:
             payload["threads"] = args.threads
         post_json(args.base_url, "/v1/models/load", payload, args.timeout)
 
-    ref = reference_embeddings(args.reference_model, texts, args.pooling, args.normalize, args.device)
+    ref = reference_embeddings(
+        args.reference_model, texts, args.pooling, args.normalize, args.device, args.trust_remote_code
+    )
     got = densecore_embeddings(args.base_url, texts, args.pooling, args.normalize, args.timeout)
 
     failures: list[str] = []
     for idx, (dense_vec, ref_vec) in enumerate(zip(got, ref)):
+        if len(dense_vec) != len(ref_vec):
+            failures.append(f"embedding[{idx}] dim mismatch: densecore={len(dense_vec)} reference={len(ref_vec)}")
         sim = cosine(dense_vec, ref_vec)
         delta = max_abs_delta(dense_vec, ref_vec)
-        print(f"embedding[{idx}]\tcosine={sim:.8f}\tmax_abs_delta={delta:.8f}\ttext={texts[idx]!r}")
+        print(
+            f"embedding[{idx}]\tcosine={sim:.8f}\tmax_abs_delta={delta:.8f}"
+            f"\tdim_dense={len(dense_vec)}\tdim_ref={len(ref_vec)}\ttext={raw_texts[idx]!r}"
+        )
         if sim < args.min_cosine:
             failures.append(f"embedding[{idx}] cosine {sim:.8f} < {args.min_cosine}")
         if delta > args.max_abs_delta:
             failures.append(f"embedding[{idx}] max_abs_delta {delta:.8f} > {args.max_abs_delta}")
 
-    ref_all = reference_embeddings(args.reference_model, [args.query] + texts, args.pooling, args.normalize, args.device)
-    ref_query = ref_all[0]
-    ref_docs = ref_all[1:]
-    ref_ranking = sorted(range(len(texts)), key=lambda idx: cosine(ref_query, ref_docs[idx]), reverse=True)[: args.top_n]
-    dense_ranking = densecore_rerank(args.base_url, args.query, texts, args.top_n, args.timeout)
-    print(f"rerank\treference={ref_ranking}\tdensecore={dense_ranking}")
-    if dense_ranking != ref_ranking:
-        failures.append(f"rerank order mismatch: reference={ref_ranking}, densecore={dense_ranking}")
+    if not args.skip_rerank:
+        rerank_query = args.query_prefix + args.query
+        rerank_docs = [args.document_prefix + text for text in raw_texts]
+        ref_all = reference_embeddings(
+            args.reference_model,
+            [rerank_query] + rerank_docs,
+            args.pooling,
+            args.normalize,
+            args.device,
+            args.trust_remote_code,
+        )
+        ref_query = ref_all[0]
+        ref_docs = ref_all[1:]
+        ref_ranking = sorted(range(len(rerank_docs)), key=lambda idx: cosine(ref_query, ref_docs[idx]), reverse=True)[
+            : args.top_n
+        ]
+        dense_ranking = densecore_rerank(args.base_url, rerank_query, rerank_docs, args.top_n, args.timeout)
+        print(f"rerank\treference={ref_ranking}\tdensecore={dense_ranking}")
+        if dense_ranking != ref_ranking:
+            failures.append(f"rerank order mismatch: reference={ref_ranking}, densecore={dense_ranking}")
 
     if failures:
         for failure in failures:
