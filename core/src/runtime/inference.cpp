@@ -54,6 +54,7 @@
 #include "densecore/runtime/dtype_utils.h"      // For GgmlTypeToDType
 #include "densecore/runtime/scheduler.h"
 #include "densecore/simd/simd_ops.h"
+#include "kernels/q4k_repacked_gemv.h"
 #include "kernels/hwy/hwy_kernels.h"
 #include "llm/attention/exec.h"
 #include "llm/attention/internal.h"

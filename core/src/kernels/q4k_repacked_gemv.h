@@ -54,9 +54,13 @@ struct Q4KRepackedGemvCacheStats {
 
 bool Q4KRepackedGemvIsaSupported();
 bool Q4KRealPackedGemvKernelAvailable();
+bool Q4KRepackedGemvManualCacheLimitConfigured();
 size_t Q4KRepackedGemvCacheLimitBytes();
+size_t Q4KRepackedGemvAutoCacheLimitBytes(size_t reserved_bytes);
+size_t Q4KRepackedGemvRefreshRuntimeCacheBudget(size_t reserved_bytes);
 Q4KRepackedGemvCacheStats Q4KRepackedGemvCacheStatsSnapshot();
 Q4KRepackedGemvCacheStats Q4KRepackedGemvTrimCacheToBytes(size_t target_bytes);
+Q4KRepackedGemvCacheStats Q4KRepackedGemvTrimCacheForAvailableMemory(size_t reserved_bytes);
 uint64_t FingerprintQ4KRepackedGemvWeight(const void* weight_ptr, size_t bytes);
 uint64_t Q4KRepackedGemvWeightFingerprint(const void* weight_ptr, int64_t rows, int64_t cols);
 

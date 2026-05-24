@@ -69,6 +69,11 @@ constexpr const char* kGemma4PackedDownExpertsScaleKey = "ffn_down_exps.scale";
 std::atomic<uint64_t> g_moe_graph_wiring_debug_counter{0};
 constexpr int64_t kQwen36C4AmxGraphMaxTokens = 128;
 
+bool IsQwen35NativeMoEDownQ5KDiagEnabled() {
+    static const bool enabled = densecore::env::ParseTruthyEnv("DENSECORE_NATIVE_MOE_FAST_W2_Q5K_DIAG", false);
+    return enabled;
+}
+
 bool ShouldUsePrefillLastLogitsOnly(const TransformerModel* model, const BatchSpec& batch, int n_tokens) {
     return densecore::llm::decoder::ShouldUsePrefillLastLogitsOnly(model, batch, n_tokens);
 }
@@ -588,6 +593,295 @@ ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     return out;
 }
 
+// ============================================================================
+// Qwen3.5 W2 Q5_K fast down projection — replaces ggml_mul_mat_id with a
+// direct custom callback so all ggml threads participate in the GEMV without
+// ggml_mul_mat_id dispatch overhead. Uses GGML_N_TASKS_MAX to engage all
+// available threads for row-parallel Q5_K vec_dot.
+// ============================================================================
+
+static const float* Qwen35NativeMoEDownHiddenRowPtr(const ggml_tensor* hidden, int64_t token, int64_t topk_index) {
+    if (!hidden || !hidden->data) return nullptr;
+    return reinterpret_cast<const float*>(static_cast<const char*>(hidden->data) +
+                                          static_cast<size_t>(topk_index) * static_cast<size_t>(hidden->nb[1]) +
+                                          static_cast<size_t>(token) * static_cast<size_t>(hidden->nb[2]));
+}
+
+static bool Qwen35NativeMoEDownQ5KQuantizeHidden(const ggml_tensor* hidden, int64_t token, int64_t topk_index,
+                                                 std::vector<uint8_t>& qbuf) {
+    if (!hidden || !hidden->data || hidden->type != GGML_TYPE_F32) return false;
+    const int64_t cols = hidden->ne[0];
+    const size_t qrow_bytes = ggml_row_size(GGML_TYPE_Q8_K, cols);
+    if (qrow_bytes == 0) return false;
+    qbuf.resize(qrow_bytes);
+    const auto* q_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    if (!q_traits || !q_traits->from_float) return false;
+    const float* hidden_row = Qwen35NativeMoEDownHiddenRowPtr(hidden, token, topk_index);
+    if (!hidden_row) return false;
+    q_traits->from_float(hidden_row, qbuf.data(), cols);
+    return true;
+}
+
+static bool Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(const ggml_tensor* down_exps, int32_t expert, int64_t row,
+                                                           const uint8_t* qbuf, float* out_value) {
+    if (!down_exps || !qbuf || !out_value) return false;
+    if (expert < 0 || expert >= down_exps->ne[2] || row < 0 || row >= down_exps->ne[1]) return false;
+    const int64_t cols = down_exps->ne[0];
+    const auto* w_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q5_K);
+    if (!w_traits || !w_traits->vec_dot || w_traits->vec_dot_type != GGML_TYPE_Q8_K) return false;
+    const char* weight_row = static_cast<const char*>(down_exps->data) +
+                             static_cast<size_t>(expert) * static_cast<size_t>(down_exps->nb[2]) +
+                             static_cast<size_t>(row) * static_cast<size_t>(down_exps->nb[1]);
+    w_traits->vec_dot(static_cast<int>(cols), out_value, 0, weight_row, 0, qbuf, 0, 1);
+    return true;
+}
+
+static bool Qwen35NativeMoEDownQ5KReadExpert(const ggml_tensor* selected_experts, const ggml_tensor* down_exps,
+                                              int64_t token, int64_t topk_index, int32_t* expert_out) {
+    if (!selected_experts || !down_exps || !selected_experts->data || !expert_out) return false;
+    const int32_t expert = *reinterpret_cast<const int32_t*>(
+        static_cast<const char*>(selected_experts->data) +
+        static_cast<size_t>(topk_index) * static_cast<size_t>(selected_experts->nb[0]) +
+        static_cast<size_t>(token) * static_cast<size_t>(selected_experts->nb[1]));
+    if (expert < 0 || expert >= down_exps->ne[2]) return false;
+    *expert_out = expert;
+    return true;
+}
+
+static bool Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(const ggml_tensor* down_exps, int32_t expert,
+                                                               int64_t row, const uint8_t* qbuf, float* out0,
+                                                               float* out1) {
+    if (!down_exps || !qbuf || !out0 || !out1) return false;
+    if (expert < 0 || expert >= down_exps->ne[2] || row < 0 || row + 1 >= down_exps->ne[1]) return false;
+    // Q5_K's x86 vec_dot implementation is single-row only (nrc == 1). Keep
+    // the pair-shaped loop partitioning, but compute each row with the exact
+    // fallback-compatible primitive instead of relying on unsupported nrc=2.
+    return Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qbuf, out0) &&
+           Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row + 1, qbuf, out1);
+}
+
+static void RunQwen35NativeMoEDownQ5KFastPath(ggml_tensor* dst, const ggml_tensor* down_exps,
+                                               const ggml_tensor* hidden, const ggml_tensor* selected_experts,
+                                               int ith, int nth) {
+    if (!dst || !down_exps || !hidden || !selected_experts || !dst->data || !down_exps->data ||
+        !hidden->data || !selected_experts->data || nth <= 0) return;
+    const int64_t n_embd = down_exps->ne[1];
+    const int64_t top_k = selected_experts->ne[0];
+    const int64_t n_tokens = selected_experts->ne[1];
+    thread_local std::vector<uint8_t> qbuf;
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t k = 0; k < top_k; ++k) {
+            int32_t expert = -1;
+            if (!Qwen35NativeMoEDownQ5KReadExpert(selected_experts, down_exps, token, k, &expert)) continue;
+            if (!Qwen35NativeMoEDownQ5KQuantizeHidden(hidden, token, k, qbuf)) continue;
+            const int64_t pair_count = n_embd / 2;
+            const int64_t pair_start = (static_cast<int64_t>(ith) * pair_count) / nth;
+            const int64_t pair_end = (static_cast<int64_t>(ith + 1) * pair_count) / nth;
+            for (int64_t pair = pair_start; pair < pair_end; ++pair) {
+                const int64_t row = pair * 2;
+                float value0 = 0.0f;
+                float value1 = 0.0f;
+                if (Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(down_exps, expert, row, qbuf.data(), &value0,
+                                                                       &value1)) {
+                    *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                              static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                              static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
+                                              static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2])) = value0;
+                    *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                              static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0]) +
+                                              static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
+                                              static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2])) = value1;
+                }
+            }
+            if ((n_embd & 1) != 0 && ith == nth - 1) {
+                const int64_t row = n_embd - 1;
+                float value = 0.0f;
+                if (Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qbuf.data(), &value)) {
+                    *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                              static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                              static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
+                                              static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2])) = value;
+                }
+            }
+        }
+    }
+}
+
+static const float* Qwen35NativeMoEDownWeightPtr(const ggml_tensor* weights, int64_t token, int64_t topk_index) {
+    if (!weights || !weights->data || weights->type != GGML_TYPE_F32) return nullptr;
+    return reinterpret_cast<const float*>(static_cast<const char*>(weights->data) +
+                                          static_cast<size_t>(topk_index) * static_cast<size_t>(weights->nb[1]) +
+                                          static_cast<size_t>(token) * static_cast<size_t>(weights->nb[2]));
+}
+
+static void RunQwen35NativeMoEDownQ5KWeightedSumFastPath(ggml_tensor* dst, const ggml_tensor* down_exps,
+                                                          const ggml_tensor* hidden,
+                                                          const ggml_tensor* selected_experts,
+                                                          const ggml_tensor* weights, int ith, int nth) {
+    if (!dst || !down_exps || !hidden || !selected_experts || !weights || !dst->data || !down_exps->data ||
+        !hidden->data || !selected_experts->data || !weights->data || nth <= 0) {
+        return;
+    }
+    const int64_t n_embd = down_exps->ne[1];
+    const int64_t top_k = selected_experts->ne[0];
+    const int64_t n_tokens = selected_experts->ne[1];
+    if (dst->type != GGML_TYPE_F32 || dst->ne[0] != n_embd || dst->ne[1] != n_tokens ||
+        hidden->ne[1] != top_k || hidden->ne[2] != n_tokens || weights->type != GGML_TYPE_F32 ||
+        weights->ne[0] != 1 || weights->ne[1] != top_k || weights->ne[2] != n_tokens) {
+        return;
+    }
+
+    thread_local std::vector<uint8_t> qbuf;
+    const int64_t pair_count = n_embd / 2;
+    const int64_t pair_start = (static_cast<int64_t>(ith) * pair_count) / nth;
+    const int64_t pair_end = (static_cast<int64_t>(ith + 1) * pair_count) / nth;
+    const bool owns_odd_tail = (n_embd & 1) != 0 && ith == nth - 1;
+
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t pair = pair_start; pair < pair_end; ++pair) {
+            const int64_t row = pair * 2;
+            *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                      static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                      static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1])) = 0.0f;
+            *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                      static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0]) +
+                                      static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1])) = 0.0f;
+        }
+        if (owns_odd_tail) {
+            const int64_t row = n_embd - 1;
+            *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                      static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                      static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1])) = 0.0f;
+        }
+
+        for (int64_t k = 0; k < top_k; ++k) {
+            int32_t expert = -1;
+            if (!Qwen35NativeMoEDownQ5KReadExpert(selected_experts, down_exps, token, k, &expert)) continue;
+            const float* weight_ptr = Qwen35NativeMoEDownWeightPtr(weights, token, k);
+            if (!weight_ptr) continue;
+            const float gate_weight = *weight_ptr;
+            if (gate_weight == 0.0f) continue;
+            if (!Qwen35NativeMoEDownQ5KQuantizeHidden(hidden, token, k, qbuf)) continue;
+            for (int64_t pair = pair_start; pair < pair_end; ++pair) {
+                const int64_t row = pair * 2;
+                float value0 = 0.0f;
+                float value1 = 0.0f;
+                if (!Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(down_exps, expert, row, qbuf.data(), &value0,
+                                                                       &value1)) {
+                    continue;
+                }
+                float* dst0 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                       static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                                       static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
+                float* dst1 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                       static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0]) +
+                                                       static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
+                *dst0 += value0 * gate_weight;
+                *dst1 += value1 * gate_weight;
+            }
+            if (owns_odd_tail) {
+                const int64_t row = n_embd - 1;
+                float value = 0.0f;
+                if (Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qbuf.data(), &value)) {
+                    float* dst_ptr =
+                        reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                 static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                                 static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
+                    *dst_ptr += value * gate_weight;
+                }
+            }
+        }
+    }
+}
+
+static void cb_qwen35_native_moe_down_q5k(struct ggml_tensor* dst, int ith, int nth, void* /*userdata*/) {
+    if (ith == 0 && IsQwen35NativeMoEDownQ5KDiagEnabled()) {
+        static std::atomic<int> exec_count{0};
+        int c = exec_count.fetch_add(1, std::memory_order_relaxed);
+        if (c < 5 || (c % 200 == 0)) {
+            std::fprintf(stderr, "[W2_Q5K_DIAG] CALLBACK EXECUTING: count=%d nth=%d\n", c + 1, nth);
+        }
+    }
+    RunQwen35NativeMoEDownQ5KFastPath(dst, dst ? dst->src[0] : nullptr,
+                                      dst ? dst->src[1] : nullptr,
+                                      dst ? dst->src[2] : nullptr, ith, nth);
+}
+
+static void cb_qwen35_native_moe_down_q5k_weighted_sum(struct ggml_tensor* dst, int ith, int nth,
+                                                        void* /*userdata*/) {
+    if (ith == 0 && IsQwen35NativeMoEDownQ5KDiagEnabled()) {
+        static std::atomic<int> exec_count{0};
+        int c = exec_count.fetch_add(1, std::memory_order_relaxed);
+        if (c < 5 || (c % 200 == 0)) {
+            std::fprintf(stderr, "[W2_Q5K_DIAG] WEIGHTED CALLBACK EXECUTING: count=%d nth=%d\n", c + 1, nth);
+        }
+    }
+    RunQwen35NativeMoEDownQ5KWeightedSumFastPath(dst, dst ? dst->src[0] : nullptr,
+                                                dst ? dst->src[1] : nullptr,
+                                                dst ? dst->src[2] : nullptr,
+                                                dst ? dst->src[3] : nullptr, ith, nth);
+}
+
+static bool CanReplaceQwen35W2WithCustomCallback(const TransformerModel* model, const ggml_tensor* down_exps,
+                                                  const ggml_tensor* hidden, const ggml_tensor* selected_experts) {
+    auto reject = [](const char* reason) {
+        if (IsQwen35NativeMoEDownQ5KDiagEnabled()) {
+            std::fprintf(stderr, "[W2_Q5K_DIAG] rejected: %s\n", reason);
+        }
+        return false;
+    };
+    if (!model || !down_exps || !hidden || !selected_experts) return reject("null_ptr");
+    if (model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36) return reject("wrong_variant");
+    if (!model->arch_flags.is_hybrid_ssm) return reject("not_hybrid_ssm");
+    if (model->hparams.n_experts <= 0) return reject("no_experts");
+    if (down_exps->type != GGML_TYPE_Q5_K) return reject("down_not_q5k");
+    if (hidden->type != GGML_TYPE_F32) return reject("hidden_not_f32");
+    if (selected_experts->type != GGML_TYPE_I32) return reject("experts_not_i32");
+    if (down_exps->ne[0] % ggml_blck_size(GGML_TYPE_Q5_K) != 0) return reject("bad_alignment");
+    const auto* w_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q5_K);
+    const auto* q_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    if (!w_traits || !w_traits->vec_dot || w_traits->vec_dot_type != GGML_TYPE_Q8_K) return reject("no_vec_dot");
+    if (!q_traits || !q_traits->from_float) return reject("no_from_float");
+    const InferenceExecutionPhase phase = GetCurrentExecutionPhase();
+    if (phase != InferenceExecutionPhase::Decode) return reject("not_decode_phase");
+    const BatchSpec* current_batch = GetCurrentBatch();
+    const auto& fast_config = ResolveFastPathRuntimeConfig(current_batch);
+    if (fast_config.native_moe_fast_decode == densecore::env::RuntimeToggleMode::Off) {
+        return reject("native_moe_fast_decode_off");
+    }
+    if (current_batch && !current_batch->lora_map.empty()) {
+        return reject("dynamic_lora");
+    }
+    if (selected_experts->ne[1] <= 0 || selected_experts->ne[1] > 4) {
+        return reject("unsupported_token_count");
+    }
+    if (IsQwen35NativeMoEDownQ5KDiagEnabled()) {
+        std::fprintf(stderr, "[W2_Q5K_DIAG] ACCEPTED — replacing ggml_mul_mat_id with custom Q5K callback\n");
+    }
+    return true;
+}
+
+static bool CanFuseQwen35W2WeightedSumWithCustomCallback(const TransformerModel* model, const ggml_tensor* down_exps,
+                                                          const ggml_tensor* hidden,
+                                                          const ggml_tensor* selected_experts,
+                                                          const ggml_tensor* weights) {
+    if (!CanReplaceQwen35W2WithCustomCallback(model, down_exps, hidden, selected_experts)) {
+        return false;
+    }
+    auto reject = [](const char* reason) {
+        if (IsQwen35NativeMoEDownQ5KDiagEnabled()) {
+            std::fprintf(stderr, "[W2_Q5K_DIAG] weighted_sum rejected: %s\n", reason);
+        }
+        return false;
+    };
+    if (!weights || weights->type != GGML_TYPE_F32) return reject("weights_not_f32");
+    if (weights->ne[0] != 1 || weights->ne[1] != selected_experts->ne[0] ||
+        weights->ne[2] != selected_experts->ne[1]) {
+        return reject("weights_shape");
+    }
+    return true;
+}
+
 ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, TransformerModel* model,
                                           TransformerLayer* layer, int layer_idx, ggml_tensor* routed_input,
                                           ggml_tensor* gate_logits, int top_k,
@@ -664,8 +958,8 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             fast_decode_candidate && fast_config.native_moe_fast_decode != densecore::env::RuntimeToggleMode::Off &&
             supported_shape && selected_experts_available && supported_quant && !dynamic_lora_active &&
             fast_kernel_available;
-        const bool fast_decode_used = false;
-        if (fast_decode_candidate) {
+        const bool defer_to_native_w2_custom_node = fast_decode_supported;
+        if (fast_decode_candidate && !defer_to_native_w2_custom_node) {
             const char* reason = fast_decode_supported ? "fallback_safety" : "none";
             if (fast_config.native_moe_fast_decode == densecore::env::RuntimeToggleMode::Off) {
                 reason = "disabled";
@@ -682,9 +976,9 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             } else if (!fast_kernel_available) {
                 reason = "no_fast_kernel";
             }
-            RecordNativeMoEFastDecodeDecision(work_ctx, /*candidate=*/true, fast_decode_used, reason,
-                                             /*w1w3_used=*/fast_decode_used,
-                                             /*w2_used=*/fast_decode_used);
+            RecordNativeMoEFastDecodeDecision(work_ctx, /*candidate=*/true, /*used=*/false, reason,
+                                             /*w1w3_used=*/false,
+                                             /*w2_used=*/false);
             if (supported_w2_quant) {
                 RecordNativeMoEFastW2Q5KDecision(work_ctx, /*candidate=*/true, /*used=*/false, reason);
             }
@@ -739,6 +1033,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     ggml_tensor* cur3 = ggml_reshape_3d(ctx, routed_input, n_embd, 1, n_tokens);
     ggml_tensor* gate = nullptr;
     ggml_tensor* up = nullptr;
+    ggml_tensor* hidden = nullptr;
     if (use_fused_gate_up) {
         ggml_tensor* gate_up = ggml_mul_mat_id(ctx, gate_up_exps, cur3, selected_experts);
         ggml_set_name(gate_up, "qwen35_native_moe_gate_up");
@@ -753,10 +1048,39 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         up = ggml_mul_mat_id(ctx, up_exps, cur3, selected_experts);
         ggml_set_name(up, "qwen35_native_moe_up");
     }
-    ggml_tensor* hidden = ggml_swiglu_split(ctx, gate, up);
-    ggml_set_name(hidden, "qwen35_native_moe_swiglu");
-    ggml_tensor* experts = ggml_mul_mat_id(ctx, down_exps, hidden, selected_experts);
-    ggml_set_name(experts, "qwen35_native_moe_down");
+    if (!hidden) {
+        hidden = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(hidden, "qwen35_native_moe_swiglu");
+    }
+    ggml_tensor* fused_out = nullptr;
+    if (CanFuseQwen35W2WeightedSumWithCustomCallback(model, down_exps, hidden, selected_experts, weights)) {
+        ggml_tensor* args[] = {down_exps, hidden, selected_experts, weights};
+        fused_out = ggml_custom_4d(ctx, GGML_TYPE_F32, down_exps->ne[1], selected_experts->ne[1], 1, 1, args, 4,
+                                   cb_qwen35_native_moe_down_q5k_weighted_sum, GGML_N_TASKS_MAX, nullptr);
+        ggml_set_name(fused_out, "qwen35_native_moe_down_q5k_fast_weighted_sum");
+    }
+    if (fused_out) {
+        ggml_build_forward_expand(gf, fused_out);
+        char name[80];
+        std::snprintf(name, sizeof(name), "blk.%d.qwen35_native_moe_down_q5k_fast_out", layer_idx);
+        ggml_set_name(fused_out, name);
+        return fused_out;
+    }
+    ggml_tensor* experts = nullptr;
+    if (CanReplaceQwen35W2WithCustomCallback(model, down_exps, hidden, selected_experts)) {
+        ggml_tensor* args[] = {down_exps, hidden, selected_experts};
+        experts = ggml_custom_4d(ctx, GGML_TYPE_F32, down_exps->ne[1], selected_experts->ne[0],
+                                 selected_experts->ne[1], 1, args, 3,
+                                 cb_qwen35_native_moe_down_q5k, GGML_N_TASKS_MAX, nullptr);
+        ggml_set_name(experts, "qwen35_native_moe_down_q5k_fast");
+    }
+    if (!experts) {
+        if (IsQwen35NativeMoEDownQ5KDiagEnabled()) {
+            std::fprintf(stderr, "[W2_Q5K_DIAG] FALLBACK: layer=%d using ggml_mul_mat_id\n", layer_idx);
+        }
+        experts = ggml_mul_mat_id(ctx, down_exps, hidden, selected_experts);
+        ggml_set_name(experts, "qwen35_native_moe_down");
+    }
 
     ggml_tensor* out =
         BuildMoeExpertWeightedSumWithWeights(ctx, experts, weights, n_embd, n_tokens, "qwen35_native_moe_expert_sum");

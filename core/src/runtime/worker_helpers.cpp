@@ -18,6 +18,7 @@
 #include "densecore/exceptions.h"
 #include "densecore/models/model_descriptor.h"
 #include "ggml.h"
+#include "kernels/q4k_repacked_gemv.h"
 #include "runtime/kernel_admission.h"
 #include "models/model_inference_policy.h"
 #include "runtime/runtime_env.h"
@@ -82,6 +83,24 @@ bool IsBenchmarkOrServerPerfProfile() {
     }
     const std::string profile = densecore::env::AsciiLowerCopy(std::getenv("DENSECORE_BENCHMARK_PROFILE"));
     return profile == "single-e2e" || profile == "go-server" || profile == "native-runtime";
+}
+
+const char* RuntimeToggleModeSummaryName(densecore::env::RuntimeToggleMode mode) {
+    switch (mode) {
+    case densecore::env::RuntimeToggleMode::Off: return "off";
+    case densecore::env::RuntimeToggleMode::Auto: return "auto";
+    case densecore::env::RuntimeToggleMode::On: return "on";
+    }
+    return "off";
+}
+
+densecore::env::RuntimeToggleMode ParseSummaryRuntimeToggleFailClosed(const char* name,
+                                                                      densecore::env::RuntimeToggleMode default_mode) {
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return default_mode;
+    }
+    return densecore::env::ParseRuntimeToggleModeValue(value, densecore::env::RuntimeToggleMode::Off);
 }
 
 int EffectiveCloudWorkerCap(int physical_core_count, int base_threads, bool benchmark_or_server_perf_profile) {
@@ -706,9 +725,18 @@ int ResolveAutoDecodeThreadsForBatchWithSimd(int num_seqs, int physical_core_cou
     switch (simd_level) {
     case densecore::simd::SimdLevel::AMX:
     case densecore::simd::SimdLevel::AVX512:
+        // Single-sequence decode on 16+ core machines: use all cores.
+        // MoE GEMV is memory-bandwidth bound — more threads = more parallel
+        // expert tile work. Multi-seq keeps 8 to avoid per-seq contention.
+        threads_per_seq = (cap >= 16 && num_seqs == 1) ? cap : 8;
+        break;
     case densecore::simd::SimdLevel::SVE:
-    case densecore::simd::SimdLevel::SVE2: threads_per_seq = 8; break;
-    case densecore::simd::SimdLevel::NEON: threads_per_seq = 6; break;
+    case densecore::simd::SimdLevel::SVE2:
+        threads_per_seq = (cap >= 16 && num_seqs == 1) ? cap : 8;
+        break;
+    case densecore::simd::SimdLevel::NEON:
+        threads_per_seq = (cap >= 16 && num_seqs == 1) ? cap : 6;
+        break;
     default: break;
     }
 
@@ -1514,6 +1542,52 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const std::string qwen35_moe_w1w3_hist = weight_hist_string(req->qwen35_moe_w1w3_weight_type_hist);
     const std::string qwen35_moe_w2_hist = weight_hist_string(req->qwen35_moe_w2_weight_type_hist);
     const std::string qwen36_prefill_top_slow_ops = shape_census_string(req->qwen36_prefill_top_slow_ops);
+    const auto native_moe_fast_decode_config =
+        ParseSummaryRuntimeToggleFailClosed("DENSECORE_NATIVE_MOE_FAST_DECODE",
+                                            densecore::env::RuntimeToggleMode::Auto);
+    const bool native_moe_fast_w2_q5k_used = req->native_moe_fast_w2_q5k_used_ops > 0;
+    const bool native_moe_fast_w2_q5k_rejected = req->native_moe_fast_w2_q5k_rejected_ops > 0;
+    const char* native_moe_fast_mode_effective = "auto_discovery_only";
+    if (native_moe_fast_decode_config == densecore::env::RuntimeToggleMode::Off) {
+        native_moe_fast_mode_effective = "off";
+    } else if (req->native_moe_fast_decode_used_ops > 0) {
+        native_moe_fast_mode_effective = "auto_used_native_graph_w2_q5k";
+    } else if (req->native_moe_fast_decode_rejected_ops > 0) {
+        native_moe_fast_mode_effective = "auto_rejected_noop";
+    } else if (native_moe_fast_decode_config == densecore::env::RuntimeToggleMode::On) {
+        native_moe_fast_mode_effective = "on_noop";
+    }
+    const char* native_moe_fast_w2_q5k_effective_state = "candidate";
+    if (native_moe_fast_w2_q5k_used) {
+        native_moe_fast_w2_q5k_effective_state = "used";
+    } else if (native_moe_fast_w2_q5k_rejected) {
+        native_moe_fast_w2_q5k_effective_state = "rejected";
+    } else if (steady_visible_tokens == 0 || req->qwen35_moe_forward_calls == 0) {
+        native_moe_fast_w2_q5k_effective_state = "off";
+    }
+    const uint64_t native_moe_fast_w1w3_seen_ops =
+        req->native_moe_fallback_w1w3_ops + req->native_moe_fast_w1w3_used_ops;
+    const uint64_t native_moe_fast_w2_seen_ops =
+        req->native_moe_fallback_w2_ops + req->native_moe_fast_w2_used_ops;
+    const uint64_t native_moe_fast_w2_q5k_seen_ops =
+        std::max(req->native_moe_fast_w2_q5k_candidate_ops,
+                 req->native_moe_fast_w2_q5k_used_ops + req->native_moe_fast_w2_q5k_rejected_ops);
+    const uint64_t native_moe_fast_decode_seen_ops =
+        std::max(req->native_moe_fast_decode_candidate_ops,
+                 req->native_moe_fast_decode_used_ops + req->native_moe_fast_decode_rejected_ops);
+    const char* qwen35_native_moe_down_exec_path =
+        native_moe_fast_w2_q5k_used ? "custom_op" : (req->native_moe_fallback_w2_ops > 0 ? "ggml_mul_mat_id" : "none");
+    const char* native_graph_moe_down_q5k_applicability = "unsupported";
+    if (native_moe_fast_w2_q5k_used) {
+        native_graph_moe_down_q5k_applicability = "used";
+    } else if (native_moe_fast_w2_q5k_rejected) {
+        native_graph_moe_down_q5k_applicability = "rejected";
+    } else if (steady_visible_tokens > 0 && req->qwen35_moe_forward_calls > 0) {
+        native_graph_moe_down_q5k_applicability = "active";
+    }
+    const int moe_w2_fast_path_wrong_boundary =
+        req->native_moe_fast_w2_q5k_used_ops == 0 && req->native_moe_fallback_w2_ops == 0 &&
+        steady_visible_tokens > 0 && req->qwen35_moe_forward_calls > 0 ? 1 : 0;
     const bool qwen35_moe_descriptor =
         descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0;
     const int qwen35_moe_instrumentation_missing =
@@ -1703,6 +1777,10 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " q4k_repacked_gemv_repack_bytes=" << req->q4k_repacked_gemv_repack_bytes
         << " q4k_repacked_gemv_probe_ms=" << (static_cast<double>(req->q4k_repacked_gemv_probe_ns) / 1.0e6)
         << " q4k_repacked_gemv_resident_bytes=" << req->q4k_repacked_gemv_resident_bytes
+        << " q4k_repacked_gemv_cache_limit_bytes="
+        << densecore::kernels::Q4KRepackedGemvCacheLimitBytes()
+        << " q4k_repacked_gemv_cache_limit_source="
+        << (densecore::kernels::Q4KRepackedGemvManualCacheLimitConfigured() ? "manual" : "auto")
         << " q4k_repacked_gemv_distinct_weights_seen=" << req->q4k_repacked_gemv_distinct_weights_seen
         << " q4k_repacked_gemv_repeated_repack_count=" << req->q4k_repacked_gemv_repeated_repack_count
         << " q4k_repacked_gemv_last_reject_reason="
@@ -1787,6 +1865,12 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << (req->native_moe_graph_node_hist.empty() ? "none" : req->native_moe_graph_node_hist.c_str())
         << " native_moe_graph_top_slow_nodes=" << native_moe_graph_top_slow_nodes
         << " native_moe_timing_missing=" << native_moe_timing_missing
+        << " native_moe_fast_decode_config=" << RuntimeToggleModeSummaryName(native_moe_fast_decode_config)
+        << " native_moe_fast_mode_effective=" << native_moe_fast_mode_effective
+        << " native_moe_fast_decode_seen_ops=" << native_moe_fast_decode_seen_ops
+        << " native_moe_fast_w1w3_seen_ops=" << native_moe_fast_w1w3_seen_ops
+        << " native_moe_fast_w2_seen_ops=" << native_moe_fast_w2_seen_ops
+        << " native_moe_fast_w2_q5k_seen_ops=" << native_moe_fast_w2_q5k_seen_ops
         << " native_moe_fast_decode_candidate_ops=" << req->native_moe_fast_decode_candidate_ops
         << " native_moe_fast_decode_used_ops=" << req->native_moe_fast_decode_used_ops
         << " native_moe_fast_decode_rejected_ops=" << req->native_moe_fast_decode_rejected_ops
@@ -1822,6 +1906,24 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                 ? "none"
                 : req->native_moe_fast_w2_q5k_last_reject_reason.c_str())
         << " native_moe_fast_w2_q5k_ms=" << ns_to_ms(req->native_moe_fast_w2_q5k_ns)
+        << " native_moe_fast_w2_q5k_config=builtin"
+        << " native_moe_fast_w2_q5k_effective_state=" << native_moe_fast_w2_q5k_effective_state
+        << " qwen35_native_moe_down_exec_path=" << qwen35_native_moe_down_exec_path
+        << " qwen35_native_moe_down_q5k_config=builtin"
+        << " qwen35_native_moe_down_q5k_seen_ops=" << native_moe_fast_w2_q5k_seen_ops
+        << " qwen35_native_moe_down_q5k_candidate_ops=" << req->native_moe_fast_w2_q5k_candidate_ops
+        << " qwen35_native_moe_down_q5k_used_ops=" << req->native_moe_fast_w2_q5k_used_ops
+        << " qwen35_native_moe_down_q5k_rejected_ops=" << req->native_moe_fast_w2_q5k_rejected_ops
+        << " qwen35_native_moe_down_q5k_last_reject_reason="
+        << (req->native_moe_fast_w2_q5k_last_reject_reason.empty()
+                ? "none"
+                : req->native_moe_fast_w2_q5k_last_reject_reason.c_str())
+        << " qwen35_native_moe_down_q5k_ms=" << ns_to_ms(req->native_moe_fast_w2_q5k_ns)
+        << " qwen35_native_moe_down_q5k_replaced_fallback_ops=" << req->native_moe_fast_replaced_fallback_ops
+        << " qwen35_native_moe_down_q5k_duplicate_work_detected="
+        << req->native_moe_fast_duplicate_work_detected
+        << " native_graph_moe_down_q5k_applicability=" << native_graph_moe_down_q5k_applicability
+        << " moe_w2_fast_path_wrong_boundary=" << moe_w2_fast_path_wrong_boundary
         << " qwen35_moe_path=" << (req->qwen35_moe_path.empty() ? "none" : req->qwen35_moe_path.c_str())
         << " qwen35_moe_layers_seen=" << req->qwen35_moe_layers_seen
         << " qwen35_moe_forward_calls=" << req->qwen35_moe_forward_calls

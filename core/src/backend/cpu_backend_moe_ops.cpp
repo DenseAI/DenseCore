@@ -507,12 +507,9 @@ bool CanUseSmallDecodeQuantizedTileParallel(const TransformerModel* model) {
     if (env && env[0] != '\0') {
         return std::strcmp(env, "0") != 0 && std::strcmp(env, "off") != 0 && std::strcmp(env, "OFF") != 0;
     }
-    const char* fast_decode = std::getenv("DENSECORE_NATIVE_MOE_FAST_DECODE");
-    const bool fast_decode_forced =
-        fast_decode && fast_decode[0] != '\0' &&
-        (std::strcmp(fast_decode, "1") == 0 || std::strcmp(fast_decode, "on") == 0 ||
-         std::strcmp(fast_decode, "ON") == 0);
-    return fast_decode_forced && IsQwenA3BHybridMoEModel(model);
+    // Enable by default for Qwen A3B hybrid MoE models — tile-parallel GEMV
+    // spreads expert work across all available cores during single-token decode.
+    return IsQwenA3BHybridMoEModel(model);
 }
 
 using MoEQ4Kx8Block = densecore::kernels::Q4KRepackedGemvBlock;
@@ -3793,10 +3790,26 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                     static_cast<int64_t>(experts[static_cast<size_t>(expert_id)].intermediate_dim);
             }
         }
+        const bool tile_par_can_use = CanUseSmallDecodeQuantizedTileParallel(model);
+        const bool tile_par_ep_enabled = expert_parallel_decision.enabled;
         const bool use_small_decode_quantized_tile_parallel =
-            CanUseSmallDecodeQuantizedTileParallel(model) && expert_parallel_decision.enabled && !safe_reference_mode &&
-            batch_size == 1 && small_decode_worker_cap >= 16 && total_assignments >= 4 && hidden_dim >= 1024 &&
+            tile_par_can_use && tile_par_ep_enabled && !safe_reference_mode &&
+            batch_size == 1 && small_decode_worker_cap >= 16 && total_assignments >= 2 && hidden_dim >= 1024 &&
             small_decode_intermediate_dim >= 256;
+        {
+            static std::atomic<int> tile_par_diag_count{0};
+            if (tile_par_diag_count.fetch_add(1, std::memory_order_relaxed) < 3) {
+                std::fprintf(stderr,
+                    "[MOE_TILE_DIAG] tile_parallel=%d can_use=%d ep_enabled=%d ep_reason=%s safe_ref=%d "
+                    "batch=%d worker_cap=%d assignments=%d hidden=%lld intermediate=%lld\n",
+                    use_small_decode_quantized_tile_parallel ? 1 : 0,
+                    tile_par_can_use ? 1 : 0, tile_par_ep_enabled ? 1 : 0,
+                    expert_parallel_decision.reason ? expert_parallel_decision.reason : "null",
+                    safe_reference_mode ? 1 : 0, batch_size, small_decode_worker_cap,
+                    total_assignments, static_cast<long long>(hidden_dim),
+                    static_cast<long long>(small_decode_intermediate_dim));
+            }
+        }
         if (use_small_decode_quantized_tile_parallel) {
             bool all_assignments_supported = true;
             for (int i = 0; i < total_assignments; ++i) {
@@ -3823,14 +3836,40 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                     ggml_is_quantized(static_cast<ggml_type>(exp.w3_type)) && down_scale_supported;
                 if (!has_quantized_gated_ffn) {
                     all_assignments_supported = false;
+                    static std::atomic<int> qgf_diag{0};
+                    if (qgf_diag.fetch_add(1, std::memory_order_relaxed) < 2) {
+                        std::fprintf(stderr,
+                            "[MOE_TILE_DIAG] quantized_gated_ffn FAIL expert=%d w1=%d w3=%d w2=%d "
+                            "gelu=%d down_scale=%d w1_ptr=%d w3_ptr=%d w2_ptr=%d\n",
+                            expert_id, exp.w1_type, exp.w3_type, exp.w2_type,
+                            exp.use_gelu_activation ? 1 : 0, down_scale_supported ? 1 : 0,
+                            exp.w1.ptr ? 1 : 0, exp.w3.ptr ? 1 : 0, exp.w2.ptr ? 1 : 0);
+                    }
                     break;
                 }
             }
 
             if (all_assignments_supported) {
-                const int gate_splits =
-                    std::min<int>(2, std::max<int>(1, static_cast<int>(small_decode_intermediate_dim / 128)));
-                const int down_splits = std::min<int>(4, std::max<int>(1, static_cast<int>(hidden_dim / 512)));
+                // Scale splits to utilize available cores. With 2 assignments and
+                // 16 cores, target_parallelism = 8, giving up to 8 gate splits
+                // and 8 down splits per expert — each core gets a tile of the GEMV.
+                const int target_parallelism = std::max(1, small_decode_worker_cap / std::max(1, total_assignments));
+                const int max_gate_splits = std::min<int>(
+                    target_parallelism, std::max<int>(1, static_cast<int>(small_decode_intermediate_dim / 64)));
+                const int gate_splits = std::max<int>(1, std::min<int>(max_gate_splits, 8));
+                const int down_splits = std::min<int>(
+                    std::max<int>(1, small_decode_worker_cap / std::max(1, total_assignments)),
+                    std::max<int>(1, static_cast<int>(hidden_dim / 256)));
+                {
+                    static std::atomic<int> tile_enter_diag{0};
+                    if (tile_enter_diag.fetch_add(1, std::memory_order_relaxed) < 2) {
+                        std::fprintf(stderr,
+                            "[MOE_TILE_DIAG] ENTERING tile_parallel gate_splits=%d down_splits=%d "
+                            "target_par=%d workers=%d assignments=%d\n",
+                            gate_splits, down_splits, target_parallelism,
+                            small_decode_worker_cap, total_assignments);
+                    }
+                }
                 const size_t assignment_hidden_elems =
                     static_cast<size_t>(total_assignments) * static_cast<size_t>(small_decode_intermediate_dim);
                 const size_t assignment_output_elems = static_cast<size_t>(total_assignments) * hidden_dim;
@@ -4040,6 +4079,15 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             }
         }
         if (use_small_decode_expert_parallel) {
+            {
+                static std::atomic<int> ep_diag{0};
+                if (ep_diag.fetch_add(1, std::memory_order_relaxed) < 2) {
+                    std::fprintf(stderr,
+                        "[MOE_TILE_DIAG] FALLBACK to expert_parallel (NOT tile_parallel) "
+                        "workers=%d assignments=%d\n",
+                        effective_small_decode_workers, total_assignments);
+                }
+            }
             LogSmallDecodeExecutionPath("expert_parallel", total_assignments, effective_small_decode_workers,
                                         batch_size);
             const size_t assignment_output_elems = static_cast<size_t>(total_assignments) * hidden_dim;

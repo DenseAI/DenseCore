@@ -524,12 +524,14 @@ struct NativeMoEGraphTimingBreakdown {
     uint64_t w1w3_ns = 0;
     uint64_t activation_ns = 0;
     uint64_t w2_ns = 0;
+    uint64_t w2_fast_ns = 0;
     uint64_t reduce_ns = 0;
     uint64_t total_ns = 0;
     uint64_t route_count = 0;
     uint64_t w1w3_count = 0;
     uint64_t activation_count = 0;
     uint64_t w2_count = 0;
+    uint64_t w2_fast_count = 0;
     uint64_t reduce_count = 0;
     uint64_t native_node_count = 0;
     std::string node_hist;
@@ -648,8 +650,13 @@ NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const Transfo
         } else if (std::strstr(name, "_expert_sum") || std::strstr(name, "_moe_out")) {
             bucket = Reduce;
         }
+        const bool fast_w2_node = bucket == W2 && std::strstr(name, "_down_q5k_fast");
         buckets[static_cast<std::size_t>(bucket)].ns += elapsed_ns;
         buckets[static_cast<std::size_t>(bucket)].count += 1;
+        if (fast_w2_node) {
+            out.w2_fast_ns += elapsed_ns;
+            out.w2_fast_count += 1;
+        }
         out.total_ns += elapsed_ns;
 
         MatmulShapeCensusEntry entry;
@@ -3730,7 +3737,6 @@ void EngineLoop(EngineState* state) {
             if (!batch.lora_map.empty()) {
                 LOG_TRACE("Multi-LoRA batch: {} adapters", batch.lora_map.size());
             }
-
             // =========================================================================
             // 9. Run Inference
             // =========================================================================
@@ -4465,21 +4471,17 @@ void EngineLoop(EngineState* state) {
                             }
                             if (is_prefill_batch && graph_ctx_estimate.effective_query_len > 1 &&
                                 ctx_size >= 1024ULL * 1024ULL * 1024ULL) {
-                                const size_t available_after_free = ReadAvailableMemoryBytesForRuntimePools();
                                 const auto q4k_cache_before =
                                     densecore::kernels::Q4KRepackedGemvCacheStatsSnapshot();
                                 const size_t desired_headroom =
                                     std::max<size_t>(1024ULL * 1024ULL * 1024ULL, ctx_size / 4);
-                                const size_t needed_bytes = ctx_size + desired_headroom;
-                                if (q4k_cache_before.resident_bytes > 0 && available_after_free > 0 &&
-                                    available_after_free < needed_bytes) {
-                                    const size_t deficit = needed_bytes - available_after_free;
-                                    const size_t target_bytes =
-                                        q4k_cache_before.resident_bytes > deficit
-                                            ? static_cast<size_t>(q4k_cache_before.resident_bytes - deficit)
-                                            : 0;
+                                const size_t reserved_for_prefill = ctx_size + desired_headroom;
+                                const size_t q4k_cache_limit =
+                                    densecore::kernels::Q4KRepackedGemvRefreshRuntimeCacheBudget(
+                                        reserved_for_prefill);
+                                if (q4k_cache_before.resident_bytes > q4k_cache_limit) {
                                     const auto q4k_cache_after =
-                                        densecore::kernels::Q4KRepackedGemvTrimCacheToBytes(target_bytes);
+                                        densecore::kernels::Q4KRepackedGemvTrimCacheToBytes(q4k_cache_limit);
                                     if (q4k_cache_after.resident_bytes < q4k_cache_before.resident_bytes) {
                                         std::cerr << "[DenseCore] Q4KRepackedCacheTrim before_large_prefill"
                                                   << " before_mb="
@@ -4487,9 +4489,12 @@ void EngineLoop(EngineState* state) {
                                                   << " after_mb="
                                                   << (q4k_cache_after.resident_bytes / (1024 * 1024))
                                                   << " ctx_mb=" << (ctx_size / (1024 * 1024))
-                                                  << " available_mb="
-                                                  << (available_after_free / (1024 * 1024)) << std::endl;
+                                                  << " reserve_mb=" << (reserved_for_prefill / (1024 * 1024))
+                                                  << " cache_limit_mb=" << (q4k_cache_limit / (1024 * 1024))
+                                                  << std::endl;
                                     }
+                                } else {
+                                    (void)q4k_cache_limit;
                                 }
                             }
                             const auto descriptor = densecore::models::DescribeModel(current_model);
@@ -4589,6 +4594,7 @@ void EngineLoop(EngineState* state) {
                             }
                             try {
                                 state->inference_ctx.Init(ctx_size);
+                                densecore::kernels::Q4KRepackedGemvRefreshRuntimeCacheBudget(0);
                             } catch (const densecore::OutOfMemoryException& e) {
                                 std::cerr << "[DenseCore] GraphCtxAllocationFailed"
                                           << " requested_mb=" << (ctx_size / (1024ULL * 1024ULL))
@@ -5156,24 +5162,43 @@ void EngineLoop(EngineState* state) {
                     if (native_moe_graph_timing.native_node_count > 0) {
                         req->native_moe_graph_ns += native_moe_graph_timing.total_ns;
                         if (!is_prefill_batch) {
+                            const uint64_t fast_w2_count =
+                                std::min(native_moe_graph_timing.w2_fast_count, native_moe_graph_timing.w2_count);
+                            const uint64_t fast_w2_ns =
+                                std::min(native_moe_graph_timing.w2_fast_ns, native_moe_graph_timing.w2_ns);
+                            const uint64_t fallback_w2_count = native_moe_graph_timing.w2_count - fast_w2_count;
+                            const uint64_t fallback_w2_ns = native_moe_graph_timing.w2_ns - fast_w2_ns;
                             req->native_moe_fallback_w1w3_ns += native_moe_graph_timing.w1w3_ns;
-                            req->native_moe_fallback_w2_ns += native_moe_graph_timing.w2_ns;
+                            req->native_moe_fallback_w2_ns += fallback_w2_ns;
                             req->native_moe_fallback_w1w3_ops += native_moe_graph_timing.w1w3_count;
-                            req->native_moe_fallback_w2_ops += native_moe_graph_timing.w2_count;
+                            req->native_moe_fallback_w2_ops += fallback_w2_count;
                             req->native_moe_fallback_ops += native_moe_graph_timing.w1w3_count +
-                                                            native_moe_graph_timing.w2_count +
+                                                            fallback_w2_count +
                                                             native_moe_graph_timing.reduce_count;
+                            if (fast_w2_count > 0) {
+                                req->native_moe_fast_decode_candidate_ops += fast_w2_count;
+                                req->native_moe_fast_decode_used_ops += fast_w2_count;
+                                req->native_moe_fast_decode_w2_used_ops += fast_w2_count;
+                                req->native_moe_fast_decode_ns += fast_w2_ns;
+                                req->native_moe_fast_w2_ns += fast_w2_ns;
+                                req->native_moe_fast_total_ns += fast_w2_ns;
+                                req->native_moe_fast_w2_used_ops += fast_w2_count;
+                                req->native_moe_fast_w2_q5k_candidate_ops += fast_w2_count;
+                                req->native_moe_fast_w2_q5k_used_ops += fast_w2_count;
+                                req->native_moe_fast_w2_q5k_ns += fast_w2_ns;
+                                req->native_moe_fast_replaced_fallback_ops += fast_w2_count;
+                            }
                             const auto descriptor = densecore::models::DescribeModel(current_model);
                             if (descriptor.variant == ModelVariant::QWEN35 ||
                                 descriptor.variant == ModelVariant::QWEN36) {
-                                req->native_moe_fast_decode_candidate_ops += 1;
-                                req->native_moe_fast_decode_rejected_ops += 1;
-                                req->native_moe_fast_decode_last_reject_reason = "fallback_safety";
-                                req->native_moe_fast_w2_q5k_candidate_ops +=
-                                    native_moe_graph_timing.w2_count > 0 ? 1 : 0;
-                                req->native_moe_fast_w2_q5k_rejected_ops +=
-                                    native_moe_graph_timing.w2_count > 0 ? 1 : 0;
-                                if (native_moe_graph_timing.w2_count > 0) {
+                                if (fast_w2_count == 0) {
+                                    req->native_moe_fast_decode_candidate_ops += 1;
+                                    req->native_moe_fast_decode_rejected_ops += 1;
+                                    req->native_moe_fast_decode_last_reject_reason = "fallback_safety";
+                                }
+                                if (fallback_w2_count > 0) {
+                                    req->native_moe_fast_w2_q5k_candidate_ops += 1;
+                                    req->native_moe_fast_w2_q5k_rejected_ops += 1;
                                     req->native_moe_fast_w2_q5k_last_reject_reason = "fallback_safety";
                                 }
                             }
@@ -5526,8 +5551,8 @@ void EngineLoop(EngineState* state) {
                         req->native_moe_fast_w2_q5k_last_reject_reason =
                             qwen36_profile.native_moe_fast_w2_q5k_last_reject_reason;
                     }
-                    if (req->native_moe_fast_decode_used_ops > 0 &&
-                        (req->native_moe_fallback_w1w3_ops > 0 || req->native_moe_fallback_w2_ops > 0)) {
+                    if ((req->native_moe_fast_decode_w1w3_used_ops > 0 && req->native_moe_fallback_w1w3_ops > 0) ||
+                        (req->native_moe_fast_decode_w2_used_ops > 0 && req->native_moe_fallback_w2_ops > 0)) {
                         req->native_moe_fast_duplicate_work_detected = 1;
                     }
                     if (req->native_moe_fast_decode_candidate_ops > 0 &&
