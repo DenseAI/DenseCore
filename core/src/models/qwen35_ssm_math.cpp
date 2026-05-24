@@ -1052,13 +1052,18 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
     }
     const double norm_ms = collect_timing ? ms_since(norm_begin) : 0.0;
 
-    static thread_local std::vector<float> delta;
     const size_t head_dim_v = static_cast<size_t>(cfg.head_dim_v);
-    if (delta.size() != head_dim_v) {
-        delta.resize(head_dim_v);
+    alignas(64) float delta_stack[256];
+    float* delta_data = delta_stack;
+    static thread_local std::vector<float> delta_fallback;
+    if (head_dim_v > (sizeof(delta_stack) / sizeof(delta_stack[0]))) {
+        if (delta_fallback.size() != head_dim_v) {
+            delta_fallback.resize(head_dim_v);
+        }
+        delta_data = delta_fallback.data();
     }
 
-    std::fill(delta.begin(), delta.end(), 0.0f);
+    std::fill(delta_data, delta_data + cfg.head_dim_v, 0.0f);
     std::fill(y_head, y_head + cfg.head_dim_v, 0.0f);
 
     const float qk_dot =
@@ -1072,14 +1077,14 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
         const float k_val = cfg.k_head[k] * k_inv_norm;
         const float q_val = cfg.q_head[k] * q_inv_norm;
         const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
-        AccumulateScaledPair(delta.data(), y_head, state_row, k_val, q_val, cfg.head_dim_v);
+        AccumulateScaledPair(delta_data, y_head, state_row, k_val, q_val, cfg.head_dim_v);
     }
     const double first_pass_dual_dot_ms = collect_timing ? ms_since(first_pass_begin) : 0.0;
 
     const float attention_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k));
     for (int v = 0; v < cfg.head_dim_v; ++v) {
-        delta[static_cast<size_t>(v)] = (cfg.v_head[v] - delta[static_cast<size_t>(v)] * decay) * beta_gate;
-        y_head[v] = (decay * y_head[v] + qk_dot * delta[static_cast<size_t>(v)]) * attention_scale;
+        delta_data[v] = (cfg.v_head[v] - delta_data[v] * decay) * beta_gate;
+        y_head[v] = (decay * y_head[v] + qk_dot * delta_data[v]) * attention_scale;
     }
     if (y_pre_norm) {
         std::memcpy(y_pre_norm, y_head, head_dim_v * sizeof(float));
@@ -1090,7 +1095,7 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
     for (int k = 0; k < cfg.head_dim_k; ++k) {
         const float k_val = cfg.k_head[k] * k_inv_norm;
         float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
-        UpdateStateFromDelta(state_row, delta.data(), decay, k_val, cfg.head_dim_v);
+        UpdateStateFromDelta(state_row, delta_data, decay, k_val, cfg.head_dim_v);
     }
     const double state_update_only_ms = collect_timing ? ms_since(state_update_begin) : 0.0;
 
