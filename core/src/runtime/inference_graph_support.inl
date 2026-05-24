@@ -74,6 +74,12 @@ bool IsQwen35NativeMoEDownQ5KDiagEnabled() {
     return enabled;
 }
 
+bool IsQwen35NativeMoEGateUpRawQ4KEnabled() {
+    static const bool enabled =
+        densecore::env::ParseTruthyEnv("DENSECORE_QWEN35_NATIVE_MOE_GATEUP_RAW_Q4K", false);
+    return enabled;
+}
+
 bool ShouldUsePrefillLastLogitsOnly(const TransformerModel* model, const BatchSpec& batch, int n_tokens) {
     return densecore::llm::decoder::ShouldUsePrefillLastLogitsOnly(model, batch, n_tokens);
 }
@@ -882,6 +888,116 @@ static bool CanFuseQwen35W2WeightedSumWithCustomCallback(const TransformerModel*
     return true;
 }
 
+static const float* Qwen35NativeMoEGateUpInputRowPtr(const ggml_tensor* input, int64_t token) {
+    if (!input || !input->data || input->type != GGML_TYPE_F32 || token < 0 || token >= input->ne[1]) {
+        return nullptr;
+    }
+    return reinterpret_cast<const float*>(static_cast<const char*>(input->data) +
+                                          static_cast<size_t>(token) * static_cast<size_t>(input->nb[1]));
+}
+
+static bool Qwen35NativeMoEGateUpQuantizeInput(const ggml_tensor* input, int64_t token, std::vector<uint8_t>& qbuf) {
+    const float* input_row = Qwen35NativeMoEGateUpInputRowPtr(input, token);
+    if (!input_row) return false;
+    const int64_t cols = input->ne[0];
+    const size_t qrow_bytes = ggml_row_size(GGML_TYPE_Q8_K, cols);
+    if (qrow_bytes == 0) return false;
+    const auto* q_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    if (!q_traits || !q_traits->from_float) return false;
+    qbuf.resize(qrow_bytes);
+    q_traits->from_float(input_row, qbuf.data(), cols);
+    return true;
+}
+
+static bool Qwen35NativeMoEGateUpDotRawQ4K(const ggml_tensor* exps, int32_t expert, int64_t row, const uint8_t* qbuf,
+                                           float* out_value) {
+    if (!exps || !exps->data || !qbuf || !out_value || exps->type != GGML_TYPE_Q4_K) return false;
+    if (expert < 0 || expert >= exps->ne[2] || row < 0 || row >= exps->ne[1]) return false;
+    const auto* w_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
+    if (!w_traits || !w_traits->vec_dot || w_traits->vec_dot_type != GGML_TYPE_Q8_K) return false;
+    const char* weight_row = static_cast<const char*>(exps->data) +
+                             static_cast<size_t>(expert) * static_cast<size_t>(exps->nb[2]) +
+                             static_cast<size_t>(row) * static_cast<size_t>(exps->nb[1]);
+    w_traits->vec_dot(static_cast<int>(exps->ne[0]), out_value, 0, weight_row, 0, qbuf, 0, 1);
+    return true;
+}
+
+static void RunQwen35NativeMoEGateUpRawQ4KSwiGLU(ggml_tensor* dst, const ggml_tensor* gate_exps,
+                                                 const ggml_tensor* up_exps, const ggml_tensor* input,
+                                                 const ggml_tensor* selected_experts, int ith, int nth) {
+    if (!dst || !gate_exps || !up_exps || !input || !selected_experts || !dst->data || nth <= 0) {
+        return;
+    }
+    const int64_t n_ff = dst->ne[0];
+    const int64_t top_k = selected_experts->ne[0];
+    const int64_t n_tokens = selected_experts->ne[1];
+    if (dst->type != GGML_TYPE_F32 || gate_exps->type != GGML_TYPE_Q4_K || up_exps->type != GGML_TYPE_Q4_K ||
+        input->type != GGML_TYPE_F32 || selected_experts->type != GGML_TYPE_I32 || gate_exps->ne[1] != n_ff ||
+        up_exps->ne[1] != n_ff || dst->ne[1] != top_k || dst->ne[2] != n_tokens ||
+        gate_exps->ne[2] != up_exps->ne[2]) {
+        return;
+    }
+
+    thread_local std::vector<uint8_t> qbuf;
+    const int64_t row_start = (static_cast<int64_t>(ith) * n_ff) / nth;
+    const int64_t row_end = (static_cast<int64_t>(ith + 1) * n_ff) / nth;
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        if (!Qwen35NativeMoEGateUpQuantizeInput(input, token, qbuf)) continue;
+        for (int64_t k = 0; k < top_k; ++k) {
+            int32_t expert = -1;
+            if (!Qwen35NativeMoEDownQ5KReadExpert(selected_experts, gate_exps, token, k, &expert)) continue;
+            for (int64_t row = row_start; row < row_end; ++row) {
+                float gate_value = 0.0f;
+                float up_value = 0.0f;
+                if (!Qwen35NativeMoEGateUpDotRawQ4K(gate_exps, expert, row, qbuf.data(), &gate_value) ||
+                    !Qwen35NativeMoEGateUpDotRawQ4K(up_exps, expert, row, qbuf.data(), &up_value)) {
+                    continue;
+                }
+                const float silu = gate_value / (1.0f + std::exp(-gate_value));
+                *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                          static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                          static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
+                                          static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2])) =
+                    silu * up_value;
+            }
+        }
+    }
+}
+
+static void cb_qwen35_native_moe_gateup_raw_q4k_swiglu(struct ggml_tensor* dst, int ith, int nth,
+                                                        void* /*userdata*/) {
+    RunQwen35NativeMoEGateUpRawQ4KSwiGLU(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
+                                         dst ? dst->src[2] : nullptr, dst ? dst->src[3] : nullptr, ith, nth);
+}
+
+static bool CanUseQwen35NativeMoEGateUpRawQ4KSwiGLU(const TransformerModel* model, const ggml_tensor* gate_exps,
+                                                    const ggml_tensor* up_exps, const ggml_tensor* input,
+                                                    const ggml_tensor* selected_experts) {
+    if (!IsQwen35NativeMoEGateUpRawQ4KEnabled()) return false;
+    if (!model || !gate_exps || !up_exps || !input || !selected_experts) return false;
+    if (model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36) return false;
+    if (!model->arch_flags.is_hybrid_ssm) return false;
+    if (GetCurrentExecutionPhase() != InferenceExecutionPhase::Decode) return false;
+    const BatchSpec* current_batch = GetCurrentBatch();
+    const auto& fast_config = ResolveFastPathRuntimeConfig(current_batch);
+    if (fast_config.native_moe_fast_decode == densecore::env::RuntimeToggleMode::Off) return false;
+    if (current_batch && !current_batch->lora_map.empty()) return false;
+    if (gate_exps->type != GGML_TYPE_Q4_K || up_exps->type != GGML_TYPE_Q4_K ||
+        input->type != GGML_TYPE_F32 || selected_experts->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (!gate_exps->data || !up_exps->data || gate_exps->view_src || up_exps->view_src) return false;
+    if (input->ne[1] <= 0 || input->ne[1] > 4 || selected_experts->ne[1] != input->ne[1]) return false;
+    if (gate_exps->ne[0] != input->ne[0] || up_exps->ne[0] != input->ne[0] ||
+        gate_exps->ne[1] != up_exps->ne[1] || gate_exps->ne[2] != up_exps->ne[2]) {
+        return false;
+    }
+    const auto* w_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
+    const auto* q_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    return w_traits && w_traits->vec_dot && w_traits->vec_dot_type == GGML_TYPE_Q8_K &&
+           q_traits && q_traits->from_float;
+}
+
 ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, TransformerModel* model,
                                           TransformerLayer* layer, int layer_idx, ggml_tensor* routed_input,
                                           ggml_tensor* gate_logits, int top_k,
@@ -903,6 +1019,8 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     }
 
     const int64_t n_tokens = routed_input->ne[1];
+    ggml_tensor* raw_gate_exps = gate_exps;
+    ggml_tensor* raw_up_exps = up_exps;
     gate_exps = UseCpuRepackAliasForTokenCount(model, gate_exps, n_tokens);
     up_exps = UseCpuRepackAliasForTokenCount(model, up_exps, n_tokens);
     down_exps = UseCpuRepackAliasForTokenCount(model, down_exps, n_tokens);
@@ -1034,7 +1152,12 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     ggml_tensor* gate = nullptr;
     ggml_tensor* up = nullptr;
     ggml_tensor* hidden = nullptr;
-    if (use_fused_gate_up) {
+    if (CanUseQwen35NativeMoEGateUpRawQ4KSwiGLU(model, raw_gate_exps, raw_up_exps, routed_input, selected_experts)) {
+        ggml_tensor* args[] = {raw_gate_exps, raw_up_exps, routed_input, selected_experts};
+        hidden = ggml_custom_4d(ctx, GGML_TYPE_F32, raw_gate_exps->ne[1], n_expert_used, n_tokens, 1, args, 4,
+                                cb_qwen35_native_moe_gateup_raw_q4k_swiglu, GGML_N_TASKS_MAX, nullptr);
+        ggml_set_name(hidden, "qwen35_native_moe_gateup_raw_q4k_swiglu");
+    } else if (use_fused_gate_up) {
         ggml_tensor* gate_up = ggml_mul_mat_id(ctx, gate_up_exps, cur3, selected_experts);
         ggml_set_name(gate_up, "qwen35_native_moe_gate_up");
         gate = ggml_view_3d(ctx, gate_up, gate_exps->ne[1], n_expert_used, n_tokens, gate_up->nb[1], gate_up->nb[2], 0);
