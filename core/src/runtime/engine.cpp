@@ -453,8 +453,12 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
     const int n_head_kv = model ? model->hparams.n_head_kv : 0;
     const int n_layer = model ? model->hparams.n_layer : 0;
 
-    config.bytes_per_token = ComputeKVCacheBytesPerToken(config.effective_cache_type, k_head_dim, v_head_dim, n_head_kv,
-                                                         n_layer, index_head_dim);
+    if (model && model->arch == ModelArch::BERT) {
+        config.bytes_per_token = 4;
+    } else {
+        config.bytes_per_token = ComputeKVCacheBytesPerToken(config.effective_cache_type, k_head_dim, v_head_dim,
+                                                             n_head_kv, n_layer, index_head_dim);
+    }
     if (config.bytes_per_token == 0) {
         config.bytes_per_token = 1;
     }
@@ -1219,8 +1223,13 @@ int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char* prompt, int poo
     req->pooling_type = static_cast<densecore::PoolingStrategy>(pooling_type);
     req->normalize_embedding = (normalize != 0);
 
-    // Tokenize immediately (outside hot path)
-    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), prompt, model_entry->model->tokenizer_add_bos);
+    // Tokenize immediately (outside hot path). BERT-family encoders such as
+    // bge-m3 are trained with both <s>/</s> sentinel tokens.
+    const bool add_eos =
+        model_entry->model->arch == ModelArch::BERT &&
+        (model_entry->model->sep_token_id >= 0 || model_entry->model->eos_token_id >= 0);
+    req->tokens =
+        Tokenizer::Tokenize(model_entry->model.get(), prompt, model_entry->model->tokenizer_add_bos, add_eos);
 
     // Embeddings get premium tier explicitly
     req->priority = 50;

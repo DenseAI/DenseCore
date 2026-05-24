@@ -38,6 +38,14 @@ static InlineDenseDecoderRegistryBuilderRegistrar g_inline_dense_decoder_registr
 struct ggml_tensor* BuildTransformerGraph(TransformerModel* model, PagedKVCache* cache, struct ggml_context* ctx_c,
                                           const BatchSpec& batch, bool embedding_mode, struct ggml_cgraph* gf,
                                           struct ggml_tensor** out_embd, struct ggml_tensor** out_pos) {
+    if (model && model->arch == ModelArch::BERT) {
+        if (!embedding_mode) {
+            throw densecore::GraphBuildException("BERT encoder GGUF models support embedding requests only");
+        }
+        (void)cache;
+        return BuildBertEncoderEmbeddingGraph(model, ctx_c, batch, gf, out_embd, out_pos);
+    }
+
     const densecore::TransformerGraphExecutionPlan* bound_plan =
         (batch.deps && batch.deps->transformer_execution_plan) ? batch.deps->transformer_execution_plan : nullptr;
     const densecore::TransformerGraphExecutionPlan fallback_plan =

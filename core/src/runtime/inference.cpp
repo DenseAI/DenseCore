@@ -99,6 +99,9 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                                                            struct ggml_context* ctx_c, const BatchSpec& batch,
                                                            bool embedding_mode, struct ggml_cgraph* gf,
                                                            struct ggml_tensor** out_embd, struct ggml_tensor** out_pos);
+static struct ggml_tensor* BuildBertEncoderEmbeddingGraph(TransformerModel* model, struct ggml_context* ctx_c,
+                                                          const BatchSpec& batch, struct ggml_cgraph* gf,
+                                                          struct ggml_tensor** out_embd, struct ggml_tensor** out_pos);
 
 #include "runtime/inference_graph_dispatch.inl"
 

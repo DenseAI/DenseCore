@@ -19,6 +19,11 @@ import (
 // MockEngine implements a simple mock inference engine for testing
 type MockEngine struct {
 	generateStreamFunc func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error
+	embeddingFunc      func(prompt string) ([]float32, error)
+	embeddingPrompts   []string
+	embeddingPooling   []string
+	embeddingNormalize []bool
+	embeddingNormSet   []bool
 	maxContextTokens   int
 	renderedPrompt     string
 	lastCountText      string
@@ -122,10 +127,20 @@ func (m *MockEngine) RenderChatPrompt(messages []domain.Message, enableThinking 
 }
 
 func (m *MockEngine) GetEmbeddings(prompt string) ([]float32, error) {
+	if m.embeddingFunc != nil {
+		return m.embeddingFunc(prompt)
+	}
 	return []float32{0.1, 0.2, 0.3}, nil
 }
 
 func (m *MockEngine) GetEmbeddingsWithOptions(prompt string, poolingType string, normalize *bool) ([]float32, error) {
+	m.embeddingPrompts = append(m.embeddingPrompts, prompt)
+	m.embeddingPooling = append(m.embeddingPooling, poolingType)
+	m.embeddingNormSet = append(m.embeddingNormSet, normalize != nil)
+	m.embeddingNormalize = append(m.embeddingNormalize, normalize != nil && *normalize)
+	if m.embeddingFunc != nil {
+		return m.embeddingFunc(prompt)
+	}
 	return []float32{0.1, 0.2, 0.3}, nil
 }
 
@@ -1107,6 +1122,127 @@ func TestEmbeddingsHandler(t *testing.T) {
 			// Assert
 			if w.Code != tt.expectedStatus {
 				t.Errorf("Expected status %d, got %d", tt.expectedStatus, w.Code)
+			}
+		})
+	}
+}
+
+func TestEmbeddingsHandlerForwardsPoolingAndNormalizeOptions(t *testing.T) {
+	mockModelService := NewMockModelService()
+	q := queue.NewRequestQueue(10)
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+	normalize := false
+
+	req := makeRequest("POST", "/v1/embeddings", domain.EmbeddingRequest{
+		Model:       "test-model",
+		Input:       []string{"first", "second"},
+		PoolingType: "last",
+		Normalize:   &normalize,
+	})
+	w := httptest.NewRecorder()
+
+	handler.EmbeddingsHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := mockModelService.engine.embeddingPrompts; len(got) != 2 || got[0] != "first" || got[1] != "second" {
+		t.Fatalf("expected both embedding inputs to reach engine, got %#v", got)
+	}
+	if got := mockModelService.engine.embeddingPooling; len(got) != 2 || got[0] != "last" || got[1] != "last" {
+		t.Fatalf("expected pooling_type=last for both inputs, got %#v", got)
+	}
+	if got := mockModelService.engine.embeddingNormSet; len(got) != 2 || !got[0] || !got[1] {
+		t.Fatalf("expected normalize option to be forwarded for both inputs, got %#v", got)
+	}
+	if got := mockModelService.engine.embeddingNormalize; len(got) != 2 || got[0] || got[1] {
+		t.Fatalf("expected normalize=false for both inputs, got %#v", got)
+	}
+}
+
+func TestRerankHandler(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.engine.embeddingFunc = func(prompt string) ([]float32, error) {
+		switch prompt {
+		case "cpu inference":
+			return []float32{1, 0}, nil
+		case "DenseCore runs CPU inference":
+			return []float32{0.95, 0.05}, nil
+		case "A cooking recipe":
+			return []float32{0, 1}, nil
+		default:
+			return []float32{0.5, 0.5}, nil
+		}
+	}
+	q := queue.NewRequestQueue(10)
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/rerank", domain.RerankRequest{
+		Model:           "test-model",
+		Query:           "cpu inference",
+		Documents:       []interface{}{"A cooking recipe", "DenseCore runs CPU inference"},
+		TopN:            1,
+		ReturnDocuments: true,
+	})
+	w := httptest.NewRecorder()
+
+	handler.RerankHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp domain.RerankResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode rerank response: %v", err)
+	}
+	if len(resp.Results) != 1 {
+		t.Fatalf("expected top_n=1 result, got %d", len(resp.Results))
+	}
+	if resp.Results[0].Index != 1 {
+		t.Fatalf("expected DenseCore document to rank first with original index 1, got %+v", resp.Results[0])
+	}
+	if resp.Results[0].Document == nil || resp.Results[0].Document.Text != "DenseCore runs CPU inference" {
+		t.Fatalf("expected returned document text, got %+v", resp.Results[0].Document)
+	}
+}
+
+func TestRerankHandlerValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		request domain.RerankRequest
+	}{
+		{
+			name: "missing query",
+			request: domain.RerankRequest{
+				Model:     "test-model",
+				Documents: []interface{}{"doc"},
+			},
+		},
+		{
+			name: "empty documents",
+			request: domain.RerankRequest{
+				Model:     "test-model",
+				Query:     "query",
+				Documents: []interface{}{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockModelService := NewMockModelService()
+			q := queue.NewRequestQueue(10)
+			chatService := service.NewChatService(mockModelService, q)
+			handler := NewHandler(chatService, mockModelService)
+
+			req := makeRequest("POST", "/v1/rerank", tt.request)
+			w := httptest.NewRecorder()
+			handler.RerankHandler(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected status 400, got %d: %s", w.Code, w.Body.String())
 			}
 		})
 	}

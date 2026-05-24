@@ -33,6 +33,7 @@ enum class ModelArch : uint8_t {
     MISTRAL,
     GEMMA,
     PHI,
+    BERT,
 
     // Vision Architectures
     VIT,          // Vision Transformer (ViT-B/L/H)
@@ -64,6 +65,7 @@ enum class ModelVariant : uint8_t {
     GEMMA,
     GEMMA4,
     PHI,
+    BERT,
     VIT,
     CLIP_VISION,
     SIGLIP,
@@ -184,6 +186,8 @@ static constexpr const char* kAttnQBias = "attn_q.bias";
 static constexpr const char* kAttnKBias = "attn_k.bias";
 static constexpr const char* kAttnVBias = "attn_v.bias";
 static constexpr const char* kAttnOBias = "attn_output.bias";
+static constexpr const char* kAttnOutputNorm = "attn_output_norm.weight";
+static constexpr const char* kAttnOutputNormBias = "attn_output_norm.bias";
 static constexpr const char* kAttnQNorm = "attn_q_norm.weight";
 static constexpr const char* kAttnKNorm = "attn_k_norm.weight";
 static constexpr const char* kAttnVNorm = "attn_v_norm.weight";
@@ -195,7 +199,11 @@ static constexpr const char* kAttnNorm = "attention_norm.weight";
 static constexpr const char* kFfnNorm = "ffn_norm.weight";
 static constexpr const char* kFfnGate = "ffn_gate.weight";
 static constexpr const char* kFfnUp = "ffn_up.weight";
+static constexpr const char* kFfnUpBias = "ffn_up.bias";
 static constexpr const char* kFfnDown = "ffn_down.weight";
+static constexpr const char* kFfnDownBias = "ffn_down.bias";
+static constexpr const char* kLayerOutputNorm = "layer_output_norm.weight";
+static constexpr const char* kLayerOutputNormBias = "layer_output_norm.bias";
 static constexpr const char* kFfnSharedGate = "ffn_shared_gate.weight";
 static constexpr const char* kMoeGate = "moe_gate.weight";
 static constexpr const char* kMoeCorrectionBias = "moe_e_score_correction_bias";
@@ -441,6 +449,10 @@ struct TransformerModel {
     TransformerHParams hparams;
 
     struct ggml_tensor* tok_embeddings;
+    struct ggml_tensor* position_embeddings = nullptr;
+    struct ggml_tensor* token_type_embeddings = nullptr;
+    struct ggml_tensor* token_embd_norm = nullptr;
+    struct ggml_tensor* token_embd_norm_bias = nullptr;
     struct ggml_tensor* output_norm;
     struct ggml_tensor* output;
 
@@ -604,6 +616,10 @@ struct TransformerModel {
     std::vector<std::string> stream_token_pieces;
     int32_t bos_token_id = 1;
     int32_t eos_token_id = 2;
+    int32_t unk_token_id = -1;
+    int32_t sep_token_id = -1;
+    int32_t pad_token_id = -1;
+    int32_t mask_token_id = -1;
     std::string tokenizer_type;
     bool tokenizer_add_bos = false;
 

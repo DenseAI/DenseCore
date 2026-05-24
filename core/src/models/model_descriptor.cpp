@@ -127,6 +127,15 @@ constexpr ModelDescriptor kDescriptors[] = {
      false,
      true,
      {}},
+    {ModelVariant::BERT,
+     ModelArch::BERT,
+     "bert",
+     TokenizerFamily::BERT_WORDPIECE,
+     PromptTemplateFamily::PLAIN,
+     false,
+     false,
+     false,
+     {}},
     {ModelVariant::VIT,
      ModelArch::VIT,
      "vit",
@@ -204,6 +213,7 @@ ModelVariant InferVariantFromModel(const TransformerModel* model) {
     case ModelArch::MISTRAL: return ModelVariant::MISTRAL;
     case ModelArch::GEMMA: return model->arch_flags.is_gemma4 ? ModelVariant::GEMMA4 : ModelVariant::GEMMA;
     case ModelArch::PHI: return ModelVariant::PHI;
+    case ModelArch::BERT: return ModelVariant::BERT;
     case ModelArch::VIT: return ModelVariant::VIT;
     case ModelArch::CLIP_VISION: return ModelVariant::CLIP_VISION;
     case ModelArch::SIGLIP: return ModelVariant::SIGLIP;
@@ -274,6 +284,9 @@ ResolvedModelDescriptor ResolveModelDescriptorFromArchName(std::string_view arch
     }
     if (MatchesAny(lowered, std::array<std::string_view, 2>{"phi", "phi3"})) {
         return make_result(DescribeModelVariant(ModelVariant::PHI));
+    }
+    if (MatchesAny(lowered, std::array<std::string_view, 3>{"bert", "bge", "xlm-roberta"})) {
+        return make_result(DescribeModelVariant(ModelVariant::BERT));
     }
     if (MatchesAny(lowered, std::array<std::string_view, 2>{"vit", "vision_transformer"})) {
         return make_result(DescribeModelVariant(ModelVariant::VIT));
@@ -347,8 +360,13 @@ TokenizerFamily ResolveTokenizerFamilyFromMetadata(std::string_view tokenizer_ty
         return TokenizerFamily::GEMMA_SENTENCEPIECE;
     }
     if (lowered.find("llama") != std::string::npos || lowered.find("sentencepiece") != std::string::npos ||
-        lowered.find("spm") != std::string::npos) {
+        lowered.find("spm") != std::string::npos || lowered.find("xlm-roberta") != std::string::npos ||
+        lowered == "t5") {
         return TokenizerFamily::LLAMA_SENTENCEPIECE;
+    }
+    if (lowered == "bert" || lowered.find("wordpiece") != std::string::npos ||
+        lowered.find("wpm") != std::string::npos) {
+        return TokenizerFamily::BERT_WORDPIECE;
     }
     if (lowered.find("gpt2") != std::string::npos || lowered == "bpe") {
         return TokenizerFamily::GPT2_BYTE_BPE;
@@ -388,6 +406,7 @@ PromptTemplateFamily ResolvePromptTemplateFamilyFromMetadata(std::string_view to
     case TokenizerFamily::LLAMA_SENTENCEPIECE: return PromptTemplateFamily::ROLE_TAGS;
     case TokenizerFamily::GPT2_BYTE_BPE:
     case TokenizerFamily::GLM_BYTE_BPE:
+    case TokenizerFamily::BERT_WORDPIECE:
     case TokenizerFamily::UNKNOWN:
     default: return PromptTemplateFamily::PLAIN;
     }
@@ -425,10 +444,11 @@ PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model) 
 
 bool IsKnownTokenizerModel(std::string_view tokenizer_name) {
     const std::string lowered = AsciiLower(tokenizer_name);
-    static constexpr std::array<std::string_view, 21> kKnown = {
+    static constexpr std::array<std::string_view, 23> kKnown = {
         "llama",   "gpt2",      "qwen2",  "qwen2.5", "qwen3",       "qwen3next",        "qwen35",
         "qwen3.5", "qwen35moe", "qwen36", "qwen3.6", "qwen3_5_moe", "qwen3_5_moe_text", "mistral",
         "gemma",   "gemma4",    "bpe",    "glm4",    "glm",         "sentencepiece",    "spm",
+        "bert",    "t5",
     };
     return MatchesAny(lowered, kKnown);
 }
@@ -447,6 +467,7 @@ const char* ModelVariantName(ModelVariant variant) {
     case ModelVariant::GEMMA: return "gemma";
     case ModelVariant::GEMMA4: return "gemma4";
     case ModelVariant::PHI: return "phi";
+    case ModelVariant::BERT: return "bert";
     case ModelVariant::VIT: return "vit";
     case ModelVariant::CLIP_VISION: return "clip_vision";
     case ModelVariant::SIGLIP: return "siglip";
@@ -466,6 +487,7 @@ const char* TokenizerFamilyName(TokenizerFamily family) {
     case TokenizerFamily::QWEN35_UNICODE_BPE: return "qwen35_unicode_bpe";
     case TokenizerFamily::GEMMA_SENTENCEPIECE: return "gemma_sentencepiece";
     case TokenizerFamily::GLM_BYTE_BPE: return "glm_byte_bpe";
+    case TokenizerFamily::BERT_WORDPIECE: return "bert_wordpiece";
     case TokenizerFamily::UNKNOWN:
     default: return "unknown";
     }

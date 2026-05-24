@@ -169,11 +169,14 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
         return nullptr;
     }
 
-    cache->head_dim = model->hparams.n_embd_head_k;
-    cache->v_head_dim = model->hparams.n_embd_head_v > 0 ? model->hparams.n_embd_head_v : model->hparams.n_embd_head_k;
-    cache->index_head_dim = model->arch_flags.is_glm_dsa ? model->glm_index_head_dim : 0;
-    cache->n_head_kv = model->hparams.n_head_kv;
-    cache->n_layer = model->hparams.n_layer;
+    const bool embedding_only_encoder = model && model->arch == ModelArch::BERT;
+    cache->head_dim = embedding_only_encoder ? 1 : model->hparams.n_embd_head_k;
+    cache->v_head_dim =
+        embedding_only_encoder ? 1 : (model->hparams.n_embd_head_v > 0 ? model->hparams.n_embd_head_v
+                                                                        : model->hparams.n_embd_head_k);
+    cache->index_head_dim = (!embedding_only_encoder && model->arch_flags.is_glm_dsa) ? model->glm_index_head_dim : 0;
+    cache->n_head_kv = embedding_only_encoder ? 1 : model->hparams.n_head_kv;
+    cache->n_layer = embedding_only_encoder ? 1 : model->hparams.n_layer;
     cache->layer_n_head_kv.assign(static_cast<size_t>(cache->n_layer), std::max(1, cache->n_head_kv));
     cache->layer_head_dims.assign(static_cast<size_t>(cache->n_layer), cache->head_dim);
     cache->layer_v_head_dims.assign(static_cast<size_t>(cache->n_layer), cache->v_head_dim);

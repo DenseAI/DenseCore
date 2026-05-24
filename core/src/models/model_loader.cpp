@@ -1772,7 +1772,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
     if (idx_tokenizer_pre != -1) {
         tokenizer_pre = gguf_get_val_str(ctx_gguf, idx_tokenizer_pre);
     }
-    std::string tokenizer_type = !tokenizer_pre.empty() ? tokenizer_pre : tokenizer_model;
+    std::string tokenizer_type =
+        (!tokenizer_pre.empty() && tokenizer_pre != "default") ? tokenizer_pre : tokenizer_model;
     std::string tokenizer_lower = tokenizer_type;
     std::transform(tokenizer_lower.begin(), tokenizer_lower.end(), tokenizer_lower.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -2114,9 +2115,13 @@ TransformerModel* LoadGGUFModel(const char* path) {
         model->hparams.n_rot = fallback_rot;
     }
 
-    // Load RMS epsilon
+    // Load norm epsilon. Decoder models generally expose RMSNorm epsilon;
+    // encoder-only BERT GGUFs expose standard LayerNorm epsilon.
     model->hparams.f_norm_rms_eps = 1e-5f;
     get_f32("attention.layer_norm_rms_epsilon", model->hparams.f_norm_rms_eps);
+    if (model->arch == ModelArch::BERT) {
+        get_f32("attention.layer_norm_epsilon", model->hparams.f_norm_rms_eps);
+    }
 
     std::cout << "[DenseCore] Loaded RMS norm epsilon: " << model->hparams.f_norm_rms_eps << std::endl;
 
@@ -2608,6 +2613,13 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
     int idx_eos = gguf_find_key(ctx_gguf, "tokenizer.ggml.eos_token_id");
     if (idx_eos != -1) model->eos_token_id = gguf_get_val_u32(ctx_gguf, idx_eos);
+    int idx_unk = gguf_find_key(ctx_gguf, "tokenizer.ggml.unknown_token_id");
+    if (idx_unk != -1) model->unk_token_id = gguf_get_val_u32(ctx_gguf, idx_unk);
+    int idx_sep = gguf_find_key(ctx_gguf, "tokenizer.ggml.seperator_token_id");
+    if (idx_sep == -1) idx_sep = gguf_find_key(ctx_gguf, "tokenizer.ggml.separator_token_id");
+    if (idx_sep != -1) model->sep_token_id = gguf_get_val_u32(ctx_gguf, idx_sep);
+    int idx_mask = gguf_find_key(ctx_gguf, "tokenizer.ggml.mask_token_id");
+    if (idx_mask != -1) model->mask_token_id = gguf_get_val_u32(ctx_gguf, idx_mask);
 
     // Check if model actually wants BOS added
     int idx_add_bos = gguf_find_key(ctx_gguf, "tokenizer.ggml.add_bos_token");
@@ -2637,6 +2649,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
     int idx_pad = gguf_find_key(ctx_gguf, "tokenizer.ggml.padding_token_id");
     if (idx_pad != -1) {
         uint32_t pad_id = gguf_get_val_u32(ctx_gguf, idx_pad);
+        model->pad_token_id = static_cast<int32_t>(pad_id);
         if (model->bos_token_id == (int)pad_id) {
             std::cout << "[DenseCore] BOS == PAD, disabling BOS (model likely "
                          "doesn't use BOS)"
@@ -2981,6 +2994,10 @@ TransformerModel* LoadGGUFModel(const char* path) {
     };
 
     model->tok_embeddings = get_tensor("token_embd.weight");
+    model->position_embeddings = get_tensor("position_embd.weight");
+    model->token_type_embeddings = get_tensor("token_types.weight");
+    model->token_embd_norm = get_tensor("token_embd_norm.weight");
+    model->token_embd_norm_bias = get_tensor("token_embd_norm.bias");
     model->output_norm = get_tensor("output_norm.weight");
     if (model->arch_flags.is_gemma4) {
         model->gemma4_per_layer_model_projection = get_tensor("per_layer_model_proj.weight");
@@ -3060,6 +3077,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                                       "mlp_layernorm.weight"}));
         model->layers[i].Set(model_keys::kPostAttnNorm, get_layer_tensor_any(i, {"post_attention_norm.weight",
                                                                                  "post_attention_layernorm.weight"}));
+        model->layers[i].Set(model_keys::kAttnOutputNorm, get_layer_tensor_any(i, {"attn_output_norm.weight"}));
+        model->layers[i].Set(model_keys::kAttnOutputNormBias, get_layer_tensor_any(i, {"attn_output_norm.bias"}));
         // Fallback: Qwen3.5 uses post_attention_norm instead of ffn_norm
         if (!model->layers[i].Get(model_keys::kFfnNorm) && model->layers[i].Get(model_keys::kPostAttnNorm)) {
             model->layers[i].Set(model_keys::kFfnNorm, model->layers[i].Get(model_keys::kPostAttnNorm));
@@ -3072,9 +3091,13 @@ TransformerModel* LoadGGUFModel(const char* path) {
             model_keys::kFfnDown,
             get_layer_tensor_any(i, {"ffn_down.weight", "ffn_down_shexp.weight", "shared_expert.down_proj.weight",
                                      "mlp.down_proj.weight", "down_proj.weight"}));
+        model->layers[i].Set(model_keys::kFfnDownBias, get_layer_tensor_any(i, {"ffn_down.bias"}));
         model->layers[i].Set(model_keys::kFfnUp, get_layer_tensor_any(i, {"ffn_up.weight", "ffn_up_shexp.weight",
                                                                           "shared_expert.up_proj.weight",
                                                                           "mlp.up_proj.weight", "up_proj.weight"}));
+        model->layers[i].Set(model_keys::kFfnUpBias, get_layer_tensor_any(i, {"ffn_up.bias"}));
+        model->layers[i].Set(model_keys::kLayerOutputNorm, get_layer_tensor_any(i, {"layer_output_norm.weight"}));
+        model->layers[i].Set(model_keys::kLayerOutputNormBias, get_layer_tensor_any(i, {"layer_output_norm.bias"}));
         model->layers[i].Set(model_keys::kFfnSharedGate,
                              get_layer_tensor_any(i, {"ffn_gate_inp_shexp.weight", "shared_expert_gate.weight"}));
         model->layers[i].Set(kGemma4RouterScaleKey, get_layer_tensor_any(i, {"router.scale", "ffn_gate_inp.scale"}));
@@ -4283,7 +4306,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
     // Initialize pre-computed RoPE table for LLM architectures only
     // Vision models use absolute/learned positional embeddings
     // Whisper uses sinusoidal positional encodings (pre-computed)
-    bool needs_rope = !model->has_vision && !model->has_whisper && model->arch != ModelArch::UNKNOWN;
+    bool needs_rope = !model->has_vision && !model->has_whisper && model->arch != ModelArch::UNKNOWN &&
+                      model->arch != ModelArch::BERT;
     if (needs_rope && model->hparams.n_ctx > 0 && model->hparams.n_rot > 0) {
         std::cout << "[DenseCore] Initializing RoPE table..." << std::endl;
         InitRoPETable(model);

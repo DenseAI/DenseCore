@@ -636,21 +636,27 @@ func (s *ChatService) GetEmbeddings(req domain.EmbeddingRequest) ([]float32, err
 		}
 	}
 
-	return engine.GetEmbeddings(inputText)
+	return engine.GetEmbeddingsWithOptions(inputText, normalizePoolingType(req.PoolingType), req.Normalize)
 }
 
 // GetBatchEmbeddings processes multiple texts and returns their embeddings.
 // This is more efficient than calling GetEmbeddings in a loop as it reduces
 // per-call overhead, though the underlying engine still processes sequentially.
 func (s *ChatService) GetBatchEmbeddings(texts []string) ([][]float32, error) {
+	return s.GetBatchEmbeddingsWithOptions(texts, "mean", nil)
+}
+
+// GetBatchEmbeddingsWithOptions processes multiple texts with explicit pooling and normalization.
+func (s *ChatService) GetBatchEmbeddingsWithOptions(texts []string, poolingType string, normalize *bool) ([][]float32, error) {
 	engine := s.modelService.GetEngine()
 	if engine == nil {
 		return nil, errors.New("no model loaded")
 	}
 
 	results := make([][]float32, len(texts))
+	poolingType = normalizePoolingType(poolingType)
 	for i, text := range texts {
-		embd, err := engine.GetEmbeddings(text)
+		embd, err := engine.GetEmbeddingsWithOptions(text, poolingType, normalize)
 		if err != nil {
 			return nil, fmt.Errorf("embedding failed for text %d: %w", i, err)
 		}
@@ -658,6 +664,15 @@ func (s *ChatService) GetBatchEmbeddings(texts []string) ([][]float32, error) {
 	}
 
 	return results, nil
+}
+
+func normalizePoolingType(poolingType string) string {
+	switch strings.ToLower(strings.TrimSpace(poolingType)) {
+	case "cls", "last", "max":
+		return strings.ToLower(strings.TrimSpace(poolingType))
+	default:
+		return "mean"
+	}
 }
 
 func ExtractPrompt(messages []domain.Message) string {

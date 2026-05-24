@@ -204,6 +204,9 @@ bool IsLikelyControlTokenLiteral(const std::string& token) {
         token == "<unk>" || token == "<mask>") {
         return true;
     }
+    if (token == "[CLS]" || token == "[SEP]" || token == "[PAD]" || token == "[UNK]" || token == "[MASK]") {
+        return true;
+    }
     return false;
 }
 
@@ -322,6 +325,10 @@ bool UseSentencePieceUnigramTokenizer(const TransformerModel* model) {
     }
 }
 
+bool UseWordPieceTokenizer(const TransformerModel* model) {
+    return densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::BERT_WORDPIECE;
+}
+
 bool IsByteLevelBpeTokenizer(const TransformerModel* model) {
     if (!model) return false;
 
@@ -331,6 +338,7 @@ bool IsByteLevelBpeTokenizer(const TransformerModel* model) {
     case densecore::models::TokenizerFamily::QWEN_BYTE_BPE:
     case densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE:
     case densecore::models::TokenizerFamily::GLM_BYTE_BPE: return true;
+    case densecore::models::TokenizerFamily::BERT_WORDPIECE: return false;
     case densecore::models::TokenizerFamily::LLAMA_SENTENCEPIECE:
     case densecore::models::TokenizerFamily::UNKNOWN: break;
     }
@@ -360,6 +368,17 @@ bool UseByteUnicodeDetokenization(const TransformerModel* model) {
         }
     }
     return IsByteLevelBpeTokenizer(model);
+}
+
+int ResolveEndTokenId(const TransformerModel* model) {
+    if (!model) {
+        return -1;
+    }
+    if (densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::BERT_WORDPIECE &&
+        model->sep_token_id >= 0) {
+        return model->sep_token_id;
+    }
+    return model->eos_token_id;
 }
 
 std::string DetokenizeImpl(const TransformerModel* model, int token_id) {
@@ -543,6 +562,21 @@ bool IsUnicodeLetterOrMark(uint32_t cp, bool qwen35_mode) {
     return IsUnicodeLetter(cp) || (qwen35_mode && IsUnicodeAccentMark(cp));
 }
 
+bool IsCjkCodepoint(uint32_t cp) {
+    return (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3400 && cp <= 0x4DBF) ||
+           (cp >= 0x20000 && cp <= 0x2A6DF) || (cp >= 0x2A700 && cp <= 0x2B73F) ||
+           (cp >= 0x2B740 && cp <= 0x2B81F) || (cp >= 0x2B820 && cp <= 0x2CEAF) ||
+           (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0x2F800 && cp <= 0x2FA1F);
+}
+
+std::string AsciiLowerSpan(const std::string& value) {
+    std::string out = value;
+    for (char& ch : out) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return out;
+}
+
 std::string SliceCodepointSpan(const std::string& text, const std::vector<Utf8Codepoint>& cps, size_t begin,
                                size_t end) {
     if (begin >= end || begin >= cps.size()) {
@@ -672,6 +706,123 @@ std::vector<std::string> PretokenizeQwenUnicode(const std::string& text, bool qw
         pieces.push_back(text);
     }
     return pieces;
+}
+
+bool WordPieceShouldLower(const TransformerModel* model) {
+    if (!model) return false;
+    const std::string lowered = AsciiLowerCopy(model->tokenizer_type);
+    if (lowered.find("uncased") != std::string::npos) {
+        return true;
+    }
+    if (lowered.find("cased") != std::string::npos) {
+        return false;
+    }
+    return model->token_to_id.find("the") != model->token_to_id.end() &&
+           model->token_to_id.find("The") == model->token_to_id.end();
+}
+
+std::vector<std::string> PretokenizeForWordPiece(const TransformerModel* model, const std::string& text) {
+    const bool lowercase = WordPieceShouldLower(model);
+    const auto cps = DecodeUtf8Codepoints(text);
+    std::vector<std::string> pieces;
+    pieces.reserve(std::max<size_t>(1, cps.size() / 2));
+
+    std::string current;
+    auto flush = [&]() {
+        if (!current.empty()) {
+            pieces.push_back(lowercase ? AsciiLowerSpan(current) : current);
+            current.clear();
+        }
+    };
+
+    for (size_t i = 0; i < cps.size(); ++i) {
+        const uint32_t cp = cps[i].cp;
+        const std::string unit = text.substr(cps[i].start, cps[i].len);
+        if (IsUnicodeWhitespace(cp)) {
+            flush();
+            continue;
+        }
+        if (IsCjkCodepoint(cp) || IsUnicodePunctuationOrSymbol(cp)) {
+            flush();
+            pieces.push_back(lowercase ? AsciiLowerSpan(unit) : unit);
+            continue;
+        }
+        current.append(unit);
+    }
+    flush();
+    return pieces;
+}
+
+int FindWordPieceUnkId(const TransformerModel* model) {
+    if (!model) {
+        return -1;
+    }
+    if (model->unk_token_id >= 0) {
+        return model->unk_token_id;
+    }
+    auto lit = model->token_to_id.find("[UNK]");
+    if (lit != model->token_to_id.end()) {
+        return lit->second;
+    }
+    lit = model->token_to_id.find("<unk>");
+    if (lit != model->token_to_id.end()) {
+        return lit->second;
+    }
+    return FindSentencePieceUnkId(model);
+}
+
+void AppendWordPieceTokens(const TransformerModel* model, const std::string& span, std::vector<int>* out) {
+    if (!model || !out || span.empty()) {
+        return;
+    }
+
+    const int unk_id = FindWordPieceUnkId(model);
+    for (const std::string& piece : PretokenizeForWordPiece(model, span)) {
+        if (piece.empty()) {
+            continue;
+        }
+
+        const auto cps = DecodeUtf8Codepoints(piece);
+        std::vector<int> piece_ids;
+        bool failed = cps.empty();
+        size_t start = 0;
+        while (!failed && start < cps.size()) {
+            size_t end = cps.size();
+            int found_id = -1;
+            size_t found_end = start;
+
+            while (end > start) {
+                const size_t byte_begin = cps[start].start;
+                const size_t byte_end = (end < cps.size()) ? cps[end].start : piece.size();
+                std::string candidate = piece.substr(byte_begin, byte_end - byte_begin);
+                if (start > 0) {
+                    candidate.insert(0, "##");
+                }
+                auto it = model->token_to_id.find(candidate);
+                if (it != model->token_to_id.end()) {
+                    found_id = it->second;
+                    found_end = end;
+                    break;
+                }
+                --end;
+            }
+
+            if (found_id < 0) {
+                failed = true;
+                break;
+            }
+            piece_ids.push_back(found_id);
+            start = found_end;
+        }
+
+        if (failed) {
+            if (unk_id >= 0) {
+                out->push_back(unk_id);
+            }
+            continue;
+        }
+        out->insert(out->end(), piece_ids.begin(), piece_ids.end());
+    }
 }
 
 std::vector<std::string> PretokenizeForByteBpe(const TransformerModel* model, const std::string& text) {
@@ -1012,8 +1163,9 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
     }
 
     if (text.empty()) {
-        if (add_eos && model->eos_token_id >= 0) {
-            result.push_back(model->eos_token_id);
+        const int end_token_id = ResolveEndTokenId(model);
+        if (add_eos && end_token_id >= 0) {
+            result.push_back(end_token_id);
         }
         return result;
     }
@@ -1022,6 +1174,10 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
         if (span.empty()) return;
         if (UseSentencePieceUnigramTokenizer(model) && model->bpe_merge_ranks.empty()) {
             AppendSentencePieceUnigram(model, span, &result);
+            return;
+        }
+        if (UseWordPieceTokenizer(model)) {
+            AppendWordPieceTokens(model, span, &result);
             return;
         }
         if (!model->bpe_merge_ranks.empty()) {
@@ -1066,10 +1222,11 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
     size_t cursor = 0;
     size_t span_start = 0;
     while (cursor < text.size()) {
-        if (text[cursor] == '<') {
-            const size_t close = text.find('>', cursor + 1);
-            if (close != std::string::npos) {
-                const size_t tok_end = close + 1;
+        if (text[cursor] == '<' || text[cursor] == '[') {
+            const char close_ch = text[cursor] == '<' ? '>' : ']';
+            const size_t special_close = text.find(close_ch, cursor + 1);
+            if (special_close != std::string::npos) {
+                const size_t tok_end = special_close + 1;
                 const std::string special = text.substr(cursor, tok_end - cursor);
                 if (IsAtomicSpecialTokenLiteral(model, special)) {
                     auto it = model->token_to_id.find(special);
@@ -1085,8 +1242,9 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
     }
     tokenize_plain_span(text.substr(span_start));
 
-    if (add_eos && model->eos_token_id >= 0) {
-        result.push_back(model->eos_token_id);
+    const int end_token_id = ResolveEndTokenId(model);
+    if (add_eos && end_token_id >= 0) {
+        result.push_back(end_token_id);
     }
 
     if (IsDebugTokenizerEnabled()) {
@@ -1138,7 +1296,8 @@ std::string Tokenizer::Detokenize(const TransformerModel* model, int token_id) {
 std::string Tokenizer::DetokenizeMultiple(const TransformerModel* model, const std::vector<int>& token_ids) {
     std::string result;
     for (int id : token_ids) {
-        if (id == model->bos_token_id || id == model->eos_token_id) {
+        if (id == model->bos_token_id || id == model->eos_token_id || id == model->sep_token_id ||
+            id == model->pad_token_id) {
             continue;
         }
         result += Detokenize(model, id);

@@ -136,6 +136,28 @@ TEST(ModelDescriptorTest, Qwen36TokenizerAliasIsRecognizedWithoutCompatibilityWa
     EXPECT_TRUE(densecore::models::IsKnownTokenizerModel("qwen3_5_moe"));
 }
 
+TEST(ModelDescriptorTest, BertTokenizerMetadataUsesWordPieceFamily) {
+    TransformerModel model{};
+    model.arch = ModelArch::BERT;
+    model.tokenizer_type = "bert";
+
+    EXPECT_EQ(densecore::models::ResolveTokenizerFamily(&model),
+              densecore::models::TokenizerFamily::BERT_WORDPIECE);
+    EXPECT_TRUE(densecore::models::IsKnownTokenizerModel("bert"));
+    EXPECT_STREQ(densecore::models::TokenizerFamilyName(densecore::models::TokenizerFamily::BERT_WORDPIECE),
+                 "bert_wordpiece");
+}
+
+TEST(ModelDescriptorTest, T5TokenizerMetadataUsesSentencePieceFamily) {
+    TransformerModel model{};
+    model.arch = ModelArch::BERT;
+    model.tokenizer_type = "t5";
+
+    EXPECT_EQ(densecore::models::ResolveTokenizerFamily(&model),
+              densecore::models::TokenizerFamily::LLAMA_SENTENCEPIECE);
+    EXPECT_TRUE(densecore::models::IsKnownTokenizerModel("t5"));
+}
+
 TEST(ModelDescriptorTest, ChatTemplateMetadataOverridesPromptFamily) {
     TransformerModel model{};
     model.arch = ModelArch::LLAMA;

@@ -93,6 +93,47 @@ TransformerModel MakeGemma4SentencePieceModel() {
     return model;
 }
 
+TransformerModel MakeBertWordPieceModel() {
+    TransformerModel model{};
+    model.arch = ModelArch::BERT;
+    model.variant = ModelVariant::BERT;
+    model.tokenizer_type = "bert";
+    model.bos_token_id = 101;
+    model.sep_token_id = 102;
+    model.unk_token_id = 100;
+    model.pad_token_id = 0;
+    model.mask_token_id = 103;
+    model.vocab_tokens.resize(256);
+
+    auto add_token = [&](int id, const char* token, int32_t token_type = 1) {
+        if (static_cast<size_t>(id) >= model.vocab_tokens.size()) {
+            model.vocab_tokens.resize(static_cast<size_t>(id) + 1);
+        }
+        model.vocab_tokens[static_cast<size_t>(id)] = token;
+        model.token_to_id[token] = id;
+        if (static_cast<size_t>(id) >= model.token_types.size()) {
+            model.token_types.resize(static_cast<size_t>(id) + 1, 1);
+        }
+        model.token_types[static_cast<size_t>(id)] = token_type;
+    };
+
+    add_token(0, "[PAD]", 3);
+    add_token(100, "[UNK]", 2);
+    add_token(101, "[CLS]", 3);
+    add_token(102, "[SEP]", 3);
+    add_token(103, "[MASK]", 3);
+    add_token(104, "the");
+    add_token(105, "quick");
+    add_token(106, "play");
+    add_token(107, "##ing");
+    add_token(108, ",");
+    add_token(109, "dense");
+    add_token(110, "##core");
+    add_token(111, "works");
+
+    return model;
+}
+
 }  // namespace
 
 TEST(TokenizerTest, Gemma4ControlTokensRemainAtomicWithoutMergeMetadata) {
@@ -147,5 +188,35 @@ TEST(TokenizerTest, Gemma4SentencePieceUsesUnigramScoresForWholePieces) {
     const std::vector<int> tokens = Tokenizer::Tokenize(&model, "hello world", /*add_bos=*/false, /*add_eos=*/false);
 
     const std::vector<int> expected = {500, 501};
+    EXPECT_EQ(tokens, expected);
+}
+
+TEST(TokenizerTest, BertWordPieceGreedySplitsContinuationPieces) {
+    TransformerModel model = MakeBertWordPieceModel();
+
+    const std::vector<int> tokens =
+        Tokenizer::Tokenize(&model, "The quick playing, DenseCore", /*add_bos=*/true, /*add_eos=*/true);
+
+    const std::vector<int> expected = {101, 104, 105, 106, 107, 108, 109, 110, 102};
+    EXPECT_EQ(tokens, expected);
+}
+
+TEST(TokenizerTest, BertWordPieceUsesUnknownForUnsegmentablePieces) {
+    TransformerModel model = MakeBertWordPieceModel();
+
+    const std::vector<int> tokens =
+        Tokenizer::Tokenize(&model, "The unavailable", /*add_bos=*/true, /*add_eos=*/true);
+
+    const std::vector<int> expected = {101, 104, 100, 102};
+    EXPECT_EQ(tokens, expected);
+}
+
+TEST(TokenizerTest, BertWordPieceKeepsBracketSpecialTokensAtomic) {
+    TransformerModel model = MakeBertWordPieceModel();
+
+    const std::vector<int> tokens =
+        Tokenizer::Tokenize(&model, "[CLS] the [MASK]", /*add_bos=*/false, /*add_eos=*/true);
+
+    const std::vector<int> expected = {101, 104, 103, 102};
     EXPECT_EQ(tokens, expected);
 }
