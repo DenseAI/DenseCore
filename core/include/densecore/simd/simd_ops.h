@@ -4675,8 +4675,91 @@ inline void GemvParallel(float* output, const float* x, const float* weight, int
 
     [[maybe_unused]] static const SimdLevel level = DetectSimdLevel();
 
-#if (defined(__AVX2__) || defined(__AVX512F__)) && DENSECORE_HAS_FMA
-    // AVX2/AVX512 path with 2x unrolling
+#if defined(__AVX512F__) && DENSECORE_HAS_FMA
+    // AVX-512 path with 4-row blocking. This is used by decode-time router
+    // projections such as Qwen A3B ffn_gate_inp, where K is small enough that
+    // reusing each loaded activation vector across several output rows matters.
+    constexpr int UNROLL = 4;
+
+    auto hsum512 = [](__m512 v) -> float {
+        return _mm512_reduce_add_ps(v);
+    };
+
+    constexpr int PREFETCH_DISTANCE = 8;
+
+    int k = k_start;
+    for (; k + UNROLL <= k_end; k += UNROLL) {
+        if (k + PREFETCH_DISTANCE < k_end) {
+            const float* pf_w0 = weight + (k + PREFETCH_DISTANCE) * N;
+            const float* pf_w1 = weight + (k + PREFETCH_DISTANCE + 1) * N;
+            const float* pf_w2 = weight + (k + PREFETCH_DISTANCE + 2) * N;
+            const float* pf_w3 = weight + (k + PREFETCH_DISTANCE + 3) * N;
+            _mm_prefetch(reinterpret_cast<const char*>(pf_w0), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(pf_w1), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(pf_w2), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(pf_w3), _MM_HINT_T0);
+        }
+
+        __m512 acc0 = _mm512_setzero_ps();
+        __m512 acc1 = _mm512_setzero_ps();
+        __m512 acc2 = _mm512_setzero_ps();
+        __m512 acc3 = _mm512_setzero_ps();
+
+        const float* w0 = weight + (k + 0) * N;
+        const float* w1 = weight + (k + 1) * N;
+        const float* w2 = weight + (k + 2) * N;
+        const float* w3 = weight + (k + 3) * N;
+
+        int n = 0;
+        for (; n + 16 <= N; n += 16) {
+            if (n + 128 < N) {
+                _mm_prefetch(reinterpret_cast<const char*>(w0 + n + 128), _MM_HINT_T1);
+                _mm_prefetch(reinterpret_cast<const char*>(w1 + n + 128), _MM_HINT_T1);
+                _mm_prefetch(reinterpret_cast<const char*>(w2 + n + 128), _MM_HINT_T1);
+                _mm_prefetch(reinterpret_cast<const char*>(w3 + n + 128), _MM_HINT_T1);
+            }
+            const __m512 x_vec = _mm512_loadu_ps(x + n);
+            acc0 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w0 + n), acc0);
+            acc1 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w1 + n), acc1);
+            acc2 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w2 + n), acc2);
+            acc3 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w3 + n), acc3);
+        }
+
+        float sum0 = hsum512(acc0);
+        float sum1 = hsum512(acc1);
+        float sum2 = hsum512(acc2);
+        float sum3 = hsum512(acc3);
+        for (; n < N; ++n) {
+            const float xv = x[n];
+            sum0 += xv * w0[n];
+            sum1 += xv * w1[n];
+            sum2 += xv * w2[n];
+            sum3 += xv * w3[n];
+        }
+        output[k + 0] = sum0;
+        output[k + 1] = sum1;
+        output[k + 2] = sum2;
+        output[k + 3] = sum3;
+    }
+
+    for (; k < k_end; ++k) {
+        if (k + 1 < k_end) {
+            _mm_prefetch(reinterpret_cast<const char*>(weight + (k + 1) * N), _MM_HINT_T0);
+        }
+        __m512 acc = _mm512_setzero_ps();
+        const float* w = weight + k * N;
+        int n = 0;
+        for (; n + 16 <= N; n += 16) {
+            acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + n), _mm512_loadu_ps(w + n), acc);
+        }
+        float sum = hsum512(acc);
+        for (; n < N; ++n) {
+            sum += x[n] * w[n];
+        }
+        output[k] = sum;
+    }
+#elif defined(__AVX2__) && DENSECORE_HAS_FMA
+    // AVX2 path with 2x unrolling
     constexpr int UNROLL = 2;
 
     auto hsum256 = [](__m256 v) -> float {

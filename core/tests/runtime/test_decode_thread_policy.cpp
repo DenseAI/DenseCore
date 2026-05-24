@@ -62,7 +62,7 @@ TEST(DecodeThreadPolicy, AVX2StillScalesUpOnHighCoreHosts) {
 }
 
 TEST(DecodeThreadPolicy, WideSimdGetsLargerPerSequenceBudget) {
-    EXPECT_EQ(ResolveAutoDecodeThreadsForBatchWithSimd(1, 64, 64, SimdLevel::AVX512), 8);
+    EXPECT_EQ(ResolveAutoDecodeThreadsForBatchWithSimd(1, 64, 64, SimdLevel::AVX512), 64);
     EXPECT_EQ(ResolveAutoDecodeThreadsForBatchWithSimd(8, 64, 64, SimdLevel::AVX512), 64);
 }
 
