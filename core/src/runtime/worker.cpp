@@ -5551,10 +5551,9 @@ void EngineLoop(EngineState* state) {
                         req->native_moe_fast_w2_q5k_last_reject_reason =
                             qwen36_profile.native_moe_fast_w2_q5k_last_reject_reason;
                     }
-                    if ((req->native_moe_fast_decode_w1w3_used_ops > 0 && req->native_moe_fallback_w1w3_ops > 0) ||
-                        (req->native_moe_fast_decode_w2_used_ops > 0 && req->native_moe_fallback_w2_ops > 0)) {
-                        req->native_moe_fast_duplicate_work_detected = 1;
-                    }
+                    // Mixed fast/fallback counts across different native-MoE nodes are expected when only a subset of
+                    // layers or quant types can use the custom path. Same-node duplicate work must be reported by the
+                    // executing node itself; global coexistence is not sufficient evidence.
                     if (req->native_moe_fast_decode_candidate_ops > 0 &&
                         req->native_moe_fast_decode_w2_used_ops == 0) {
                         req->native_moe_fast_missing_w2 = 1;
