@@ -329,6 +329,10 @@ bool UseWordPieceTokenizer(const TransformerModel* model) {
     return densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::BERT_WORDPIECE;
 }
 
+bool UseBertBpeTokenizer(const TransformerModel* model) {
+    return densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::BERT_BPE;
+}
+
 bool IsByteLevelBpeTokenizer(const TransformerModel* model) {
     if (!model) return false;
 
@@ -339,6 +343,7 @@ bool IsByteLevelBpeTokenizer(const TransformerModel* model) {
     case densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE:
     case densecore::models::TokenizerFamily::GLM_BYTE_BPE: return true;
     case densecore::models::TokenizerFamily::BERT_WORDPIECE: return false;
+    case densecore::models::TokenizerFamily::BERT_BPE: return false;
     case densecore::models::TokenizerFamily::LLAMA_SENTENCEPIECE:
     case densecore::models::TokenizerFamily::UNKNOWN: break;
     }
@@ -910,6 +915,87 @@ void AppendWordPieceTokens(const TransformerModel* model, const std::string& spa
     }
 }
 
+void AppendBertBpeTokens(const TransformerModel* model, const std::string& span, std::vector<int>* out) {
+    if (!model || !out || span.empty()) {
+        return;
+    }
+
+    const std::string normalized = NormalizeSentencePieceText(span);
+    const auto cps = DecodeUtf8Codepoints(normalized);
+    if (cps.empty()) {
+        return;
+    }
+
+    const int unk_id = FindWordPieceUnkId(model);
+    size_t max_virtual_bytes = 0;
+    for (const std::string& token : model->vocab_tokens) {
+        if (token.rfind("▁", 0) == 0 && token.size() > 3) {
+            max_virtual_bytes = std::max(max_virtual_bytes, token.size() - 3);
+        }
+    }
+    if (max_virtual_bytes == 0) {
+        return;
+    }
+
+    const double kInf = std::numeric_limits<double>::infinity();
+    std::vector<double> best(cps.size() + 1, kInf);
+    std::vector<int> best_id(cps.size(), -1);
+    std::vector<size_t> best_next(cps.size(), cps.size());
+    best[cps.size()] = 0.0;
+
+    for (int i_signed = static_cast<int>(cps.size()) - 1; i_signed >= 0; --i_signed) {
+        const size_t i = static_cast<size_t>(i_signed);
+        for (size_t end = i + 1; end <= cps.size(); ++end) {
+            const size_t byte_begin = cps[i].start;
+            const size_t byte_end = (end < cps.size()) ? cps[end].start : normalized.size();
+            const size_t virtual_len = byte_end - byte_begin;
+            if (virtual_len > max_virtual_bytes) {
+                break;
+            }
+
+            std::string candidate = "▁";
+            candidate.append(normalized, byte_begin, virtual_len);
+            auto it = model->token_to_id.find(candidate);
+            if (it == model->token_to_id.end() || !std::isfinite(best[end])) {
+                continue;
+            }
+
+            const double candidate_cost = std::log1p(static_cast<double>(std::max(0, it->second))) + best[end];
+            if (candidate_cost < best[i]) {
+                best[i] = candidate_cost;
+                best_id[i] = it->second;
+                best_next[i] = end;
+            }
+        }
+        if (best_id[i] < 0 && cps[i].len == 3 && normalized.compare(cps[i].start, 3, "▁") == 0 &&
+            std::isfinite(best[i + 1])) {
+            best[i] = best[i + 1];
+            best_next[i] = i + 1;
+        }
+    }
+
+    for (size_t i = 0; i < cps.size();) {
+        const int id = best_id[i];
+        if (id >= 0) {
+            out->push_back(id);
+            const size_t next = best_next[i];
+            if (next <= i) {
+                break;
+            }
+            i = next;
+            continue;
+        }
+        if (best_next[i] == i + 1 && cps[i].len == 3 && normalized.compare(cps[i].start, 3, "▁") == 0) {
+            ++i;
+            continue;
+        }
+        if (unk_id >= 0) {
+            out->push_back(unk_id);
+        }
+        ++i;
+    }
+}
+
 std::vector<std::string> PretokenizeForByteBpe(const TransformerModel* model, const std::string& text) {
     if (UseGemmaPretokenizer(model)) {
         // Hugging Face GemmaTokenizer normalizes spaces to U+2581 before BPE
@@ -1263,6 +1349,10 @@ std::vector<int> Tokenizer::Tokenize(const TransformerModel* model, const std::s
         }
         if (UseWordPieceTokenizer(model)) {
             AppendWordPieceTokens(model, span, &result);
+            return;
+        }
+        if (UseBertBpeTokenizer(model)) {
+            AppendBertBpeTokens(model, span, &result);
             return;
         }
         if (!model->bpe_merge_ranks.empty()) {

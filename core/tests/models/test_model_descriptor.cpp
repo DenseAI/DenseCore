@@ -177,6 +177,16 @@ TEST(ModelDescriptorTest, T5TokenizerMetadataUsesSentencePieceFamily) {
     EXPECT_TRUE(densecore::models::IsKnownTokenizerModel("t5"));
 }
 
+TEST(ModelDescriptorTest, BertBpeTokenizerMetadataUsesBertBpeFamily) {
+    TransformerModel model{};
+    model.arch = ModelArch::BERT;
+    model.tokenizer_type = "bert-bpe";
+
+    EXPECT_EQ(densecore::models::ResolveTokenizerFamily(&model), densecore::models::TokenizerFamily::BERT_BPE);
+    EXPECT_TRUE(densecore::models::IsKnownTokenizerModel("bert-bpe"));
+    EXPECT_STREQ(densecore::models::TokenizerFamilyName(densecore::models::TokenizerFamily::BERT_BPE), "bert_bpe");
+}
+
 TEST(ModelDescriptorTest, ChatTemplateMetadataOverridesPromptFamily) {
     TransformerModel model{};
     model.arch = ModelArch::LLAMA;

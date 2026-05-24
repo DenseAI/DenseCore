@@ -3051,6 +3051,14 @@ TransformerModel* LoadGGUFModel(const char* path) {
         return fail_load("nomic-bert GGUF embeddings are not enabled: this encoder uses fused QKV/RoPE/SwiGLU "
                          "layout and has not passed DenseCore embedding parity QA");
     }
+    if (arch_lower == "jina-bert-v2") {
+        return fail_load("jina-bert-v2 GGUF embeddings are not enabled: this encoder architecture has not passed "
+                         "DenseCore embedding parity QA");
+    }
+    if (tokenizer_lower == "bert-bpe") {
+        return fail_load("bert-bpe GGUF embeddings are not enabled: this tokenizer/model combination has not passed "
+                         "DenseCore embedding parity QA");
+    }
     if (model->arch_flags.is_gemma4) {
         model->gemma4_per_layer_model_projection = get_tensor("per_layer_model_proj.weight");
         model->gemma4_per_layer_projection_norm = get_tensor("per_layer_proj_norm.weight");

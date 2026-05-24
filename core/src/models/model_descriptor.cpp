@@ -364,6 +364,9 @@ TokenizerFamily ResolveTokenizerFamilyFromMetadata(std::string_view tokenizer_ty
         lowered == "t5") {
         return TokenizerFamily::LLAMA_SENTENCEPIECE;
     }
+    if (lowered == "bert-bpe") {
+        return TokenizerFamily::BERT_BPE;
+    }
     if (lowered == "bert" || lowered.find("jina-v2") != std::string::npos ||
         lowered.find("wordpiece") != std::string::npos ||
         lowered.find("wpm") != std::string::npos) {
@@ -408,6 +411,7 @@ PromptTemplateFamily ResolvePromptTemplateFamilyFromMetadata(std::string_view to
     case TokenizerFamily::GPT2_BYTE_BPE:
     case TokenizerFamily::GLM_BYTE_BPE:
     case TokenizerFamily::BERT_WORDPIECE:
+    case TokenizerFamily::BERT_BPE:
     case TokenizerFamily::UNKNOWN:
     default: return PromptTemplateFamily::PLAIN;
     }
@@ -445,11 +449,11 @@ PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model) 
 
 bool IsKnownTokenizerModel(std::string_view tokenizer_name) {
     const std::string lowered = AsciiLower(tokenizer_name);
-    static constexpr std::array<std::string_view, 24> kKnown = {
+    static constexpr std::array<std::string_view, 25> kKnown = {
         "llama",   "gpt2",      "qwen2",  "qwen2.5", "qwen3",       "qwen3next",        "qwen35",
         "qwen3.5", "qwen35moe", "qwen36", "qwen3.6", "qwen3_5_moe", "qwen3_5_moe_text", "mistral",
         "gemma",   "gemma4",    "bpe",    "glm4",    "glm",         "sentencepiece",    "spm",
-        "bert",    "jina-v2-en", "t5",
+        "bert",    "bert-bpe",   "jina-v2-en", "t5",
     };
     return MatchesAny(lowered, kKnown);
 }
@@ -489,6 +493,7 @@ const char* TokenizerFamilyName(TokenizerFamily family) {
     case TokenizerFamily::GEMMA_SENTENCEPIECE: return "gemma_sentencepiece";
     case TokenizerFamily::GLM_BYTE_BPE: return "glm_byte_bpe";
     case TokenizerFamily::BERT_WORDPIECE: return "bert_wordpiece";
+    case TokenizerFamily::BERT_BPE: return "bert_bpe";
     case TokenizerFamily::UNKNOWN:
     default: return "unknown";
     }

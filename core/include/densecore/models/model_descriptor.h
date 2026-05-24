@@ -17,6 +17,7 @@ enum class TokenizerFamily : uint8_t {
     GEMMA_SENTENCEPIECE,
     GLM_BYTE_BPE,
     BERT_WORDPIECE,
+    BERT_BPE,
 };
 
 enum class PromptTemplateFamily : uint8_t {
