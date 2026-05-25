@@ -114,6 +114,11 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 	firstCallbackMS := 0.0
 	lastCallbackMS := 0.0
 	completionTokens := 0
+	reasoningModelHint := h.reasoningModelHint(req)
+	var gemma4Filter *gemma4StreamFilter
+	if isGemma4ModelHint(reasoningModelHint) {
+		gemma4Filter = newGemma4StreamFilter()
+	}
 
 	for {
 		select {
@@ -153,13 +158,20 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 				}
 				return
 			}
-			if event.Token != "" {
+			token := event.Token
+			if token != "" && gemma4Filter != nil {
+				token = gemma4Filter.Filter(token)
+			}
+			if token != "" {
 				completionTokens++
 				elapsedMS := serviceDurationMillis(time.Since(streamStart))
 				if firstCallbackMS == 0 {
 					firstCallbackMS = elapsedMS
 				}
 				lastCallbackMS = elapsedMS
+			}
+			if event.Token != "" && token == "" {
+				continue
 			}
 
 			chunk := domain.ChatCompletionChunk{
@@ -171,7 +183,7 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 					{
 						Index: 0,
 						Delta: domain.ChunkDelta{
-							Content: event.Token,
+							Content: token,
 						},
 						FinishReason: nil,
 					},
@@ -210,7 +222,7 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 		return
 	}
 
-	content, reasoningContent := splitReasoningResponse(req.Model, responseText)
+	content, reasoningContent := splitReasoningResponse(h.reasoningModelHint(req), responseText)
 	var toolCalls []domain.ToolCall
 	finishReason := resolveSyncFinishReason(completionTokens, req.MaxTokens)
 	if toolParsingEnabled(req) {

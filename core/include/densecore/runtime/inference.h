@@ -155,12 +155,18 @@ struct MatmulDispatchCensusEntry {
 
 struct MatmulShapeCensusEntry {
     std::string phase;
+    std::string op_type;
     std::string dispatch_path;
     std::string weight_type;
+    std::string weight_class;
     std::string shape_bucket;
     std::string left_name;
     std::string right_name;
+    uint64_t wall_ns = 0;
     uint64_t ops = 0;
+    uint64_t calls = 0;
+    int active_threads = 0;
+    int contiguous_or_copy_input = 0;
 };
 
 struct DecodeRuntimeStatsSnapshot {
@@ -391,6 +397,15 @@ struct Qwen36ProfileSnapshot {
     int moe_expert_parallel_tasks = 0;
     std::vector<MatmulDispatchCensusEntry> matmul_dispatch_top_slow_entries;
     std::vector<MatmulShapeCensusEntry> qwen36_prefill_top_slow_ops;
+    std::vector<MatmulShapeCensusEntry> gemma4_prefill_top_slow_ops;
+    uint64_t gemma4_prefill_total_ns = 0;
+    uint64_t gemma4_prefill_graph_build_ns = 0;
+    uint64_t gemma4_prefill_graph_execute_ns = 0;
+    uint64_t gemma4_prefill_attention_ns = 0;
+    uint64_t gemma4_prefill_moe_or_mlp_ns = 0;
+    uint64_t gemma4_prefill_mul_mat_id_ns = 0;
+    uint64_t gemma4_prefill_mul_mat_ns = 0;
+    uint64_t gemma4_prefill_flash_attention_ns = 0;
     uint64_t qwen36_prefill_total_ns = 0;
     uint64_t qwen36_prefill_ssm_projection_ns = 0;
     uint64_t qwen36_prefill_ssm_delta_state_ns = 0;
@@ -407,6 +422,13 @@ struct Qwen36ProfileSnapshot {
     int attention_path_portable_flash = 0;
     int attention_path_native_flash = 0;
     int attention_path_hal = 0;
+    uint64_t flash_attention_headseq_prefill_calls = 0;
+    uint64_t flash_attention_native_decode_calls = 0;
+    uint64_t flash_attention_reference_calls = 0;
+    uint64_t flash_attention_non_avx512_tiled_calls = 0;
+    uint64_t flash_attention_avx512_tiled_calls = 0;
+    int flash_attention_last_nth = 0;
+    int flash_attention_last_active_threads = 0;
     int kleidiai_compiled_enabled = 0;
     int kleidiai_last_reject_reason = 0;
 };

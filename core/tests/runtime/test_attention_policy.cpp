@@ -17,6 +17,8 @@ extern struct ggml_tensor* SmartMulMatTest(struct ggml_context* ctx, struct ggml
 extern bool ShouldUsePrefillLastLogitsOnlyForTest(const TransformerModel* model, int num_seqs, int n_tokens);
 extern int ResolveQuantBatchedTileColsForTest(int requested_cols, int vec_dot_nrows, bool allow_true_batched_q4k);
 extern bool ResolveQ4KTrueBatchedKernelPolicyForTest(int simd_level, bool compiled_with_sve);
+extern bool ShouldUsePortableFlashHeadSeqReferenceFallbackForTest(bool explicit_debug_reference);
+extern bool CompiledWithX86Avx512ForFlashAttentionForTest();
 }  // namespace testing
 namespace llm::attention::testing {
 extern void ResetSharedPrefillFlashMaskBuildsForTest();
@@ -231,6 +233,12 @@ TEST(AttentionPolicyTest, Gemma4PrefillUsesPortableCpuFlashForGqaSoftcapSemantic
 
     EXPECT_TRUE(decision.use_portable_cpu_flash_attention);
     EXPECT_EQ(decision.attention_path_kind, densecore::llm::attention::DecodeAttentionPathKind::PortableCpuFlash);
+}
+
+TEST(AttentionPolicyTest, HeadSeqPortableFlashReferenceFallbackRequiresExplicitDebugOptIn) {
+    EXPECT_FALSE(densecore::testing::ShouldUsePortableFlashHeadSeqReferenceFallbackForTest(false));
+    EXPECT_TRUE(densecore::testing::ShouldUsePortableFlashHeadSeqReferenceFallbackForTest(true));
+    (void)densecore::testing::CompiledWithX86Avx512ForFlashAttentionForTest();
 }
 
 TEST(AttentionPolicyTest, Gemma4QuantizedPrefillProjectionUsesNativeGgml) {

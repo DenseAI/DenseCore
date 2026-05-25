@@ -1,4 +1,6 @@
 autoscaling:
+  # Legacy resource-based HPA. Prefer dense-base.keda for inference-aware
+  # scaling from product metrics such as queue depth or active requests.
   enabled: false
   minReplicas: 1
   maxReplicas: 10
@@ -19,6 +21,8 @@ autoscaling:
           periodSeconds: 60
 
 networkPolicy:
+  # Legacy DenseCore NetworkPolicy helper. Prefer dense-base.networkPolicy for
+  # portable, explicit ingress/egress rules across clouds and on-prem clusters.
   enabled: false
   allowIngressController: true
   ingressControllerNamespaceLabels:
@@ -49,7 +53,7 @@ dense-base:
       maxSurge: 1
 
   image:
-    repository: densecore/densecore
+    repository: denseai/densecore
     tag: ""
     pullPolicy: IfNotPresent
   imagePullSecrets: []
@@ -113,7 +117,7 @@ dense-base:
       clientCAFile: /etc/densecore/grpc/client-ca/ca.crt
       requireClientCert: false
     service:
-      enabled: true
+      enabled: false
       type: ClusterIP
       port: 50051
       annotations: {}
@@ -364,13 +368,13 @@ dense-base:
             serverAddress: "http://prometheus-server.monitoring.svc.cluster.local:80"
             metricName: "densecore_pending_requests"
             threshold: "5"
-            query: "sum(densecore_pending_requests) or vector(0)"
+            query: "sum(densecore_pending_requests)"
         - type: prometheus
           metadata:
             serverAddress: "http://prometheus-server.monitoring.svc.cluster.local:80"
             metricName: "densecore_active_requests"
             threshold: "8"
-            query: "sum(densecore_active_requests) or vector(0)"
+            query: "sum(densecore_active_requests)"
 
   podDisruptionBudget:
     enabled: false

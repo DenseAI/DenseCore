@@ -96,6 +96,7 @@ type queueSubmitterTestEngine struct {
 	firstSubmitted          chan struct{}
 	allowCompletion         chan struct{}
 	renderedPromptSubmitted string
+	renderedChatSubmitted   string
 }
 
 func (e *queueSubmitterTestEngine) GenerateStreamWithSamplingAwaitable(ctx context.Context, prompt string, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) (<-chan struct{}, error) {
@@ -111,6 +112,11 @@ func (e *queueSubmitterTestEngine) GenerateStreamRenderedTokensWithSamplingAwait
 	return e.awaitSubmit()
 }
 
+func (e *queueSubmitterTestEngine) GenerateStreamRenderedChatWithSamplingAwaitable(ctx context.Context, renderedPrompt string, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) (<-chan struct{}, error) {
+	e.renderedChatSubmitted = renderedPrompt
+	return e.awaitSubmit()
+}
+
 func (e *queueSubmitterTestEngine) awaitSubmit() (<-chan struct{}, error) {
 	count := atomic.AddInt32(&e.submitCount, 1)
 	if count == 1 {
@@ -122,6 +128,45 @@ func (e *queueSubmitterTestEngine) awaitSubmit() (<-chan struct{}, error) {
 		close(done)
 	}()
 	return done, nil
+}
+
+func TestQueueProcessorSubmitsRenderedChatBeforeRenderedTokenIDs(t *testing.T) {
+	engine := &queueSubmitterTestEngine{
+		firstSubmitted:  make(chan struct{}),
+		allowCompletion: make(chan struct{}),
+	}
+	modelService := &chatServiceRenderTestModelService{engine: engine, model: "/tmp/test.gguf"}
+	requestQueue := queue.NewRequestQueue(1)
+	processor := NewQueueProcessor(requestQueue, modelService)
+	processor.Start(1)
+	defer processor.Stop()
+	defer close(engine.allowCompletion)
+
+	req := &queue.QueuedRequest{
+		ID:                 "req-rendered-chat",
+		Context:            context.Background(),
+		Prompt:             "<|turn>user\nhello<turn|>\n<|turn>model\n",
+		InputIDs:           []int{10, 20, 30},
+		RenderedChatSubmit: true,
+		MaxTokens:          1,
+		ResultChan:         make(chan interface{}, 1),
+		OutputChan:         make(chan domain.StreamEvent, 1),
+		DoneChan:           make(chan struct{}),
+	}
+	if !requestQueue.Enqueue(req) {
+		t.Fatal("failed to enqueue test request")
+	}
+	select {
+	case <-engine.firstSubmitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("request was not submitted")
+	}
+	if engine.renderedChatSubmitted != req.Prompt {
+		t.Fatalf("rendered chat submitted=%q want %q", engine.renderedChatSubmitted, req.Prompt)
+	}
+	if engine.renderedPromptSubmitted != "" {
+		t.Fatalf("expected rendered-token fallback to stay unused, got %q", engine.renderedPromptSubmitted)
+	}
 }
 
 func TestQueueProcessorSubmitsRenderedPromptWithTokenIDs(t *testing.T) {

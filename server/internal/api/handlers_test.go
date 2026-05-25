@@ -571,6 +571,34 @@ func TestSplitGemma4ReasoningResponseStripsBareThoughtPrelude(t *testing.T) {
 	}
 }
 
+func TestSplitGemma4ReasoningResponseTreatsThoughtOnlyChannelAsContent(t *testing.T) {
+	content, reasoning := splitGemma4ReasoningResponse(
+		"gemma4",
+		"<|channel>thought\n<channel|>CPU MoE inference handles prefill and decode differently.",
+	)
+	if content != "CPU MoE inference handles prefill and decode differently." || reasoning != "" {
+		t.Fatalf("expected thought-only channel to become visible content, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestGemma4StreamFilterSanitizesIncrementally(t *testing.T) {
+	filter := newGemma4StreamFilter()
+	var out strings.Builder
+	for _, token := range []string{"<|chan", "nel>", "thought\n", "<channel|>", "CPU ", "MoE ", "answer"} {
+		out.WriteString(filter.Filter(token))
+	}
+	if got := out.String(); got != "CPU MoE answer" {
+		t.Fatalf("unexpected filtered stream: %q", got)
+	}
+}
+
+func TestGemma4StreamFilterPassesPlainText(t *testing.T) {
+	filter := newGemma4StreamFilter()
+	if got := filter.Filter("Plain answer"); got != "Plain answer" {
+		t.Fatalf("plain text should pass through, got %q", got)
+	}
+}
+
 func TestSplitGemma4ReasoningResponseKeepsBareChannelParityToken(t *testing.T) {
 	content, reasoning := splitGemma4ReasoningResponse("gemma4", "<|channel>")
 	if content != "<|channel>" || reasoning != "" {
@@ -641,6 +669,51 @@ func TestChatCompletionHandler_Stream(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, "data:") || !strings.Contains(body, "Paris") {
 		t.Fatalf("streaming response missing expected SSE frames: %q", body)
+	}
+}
+
+func TestChatCompletionHandler_StreamSanitizesGemma4CurrentModel(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.modelName = "/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			for _, token := range []string{"<|channel>", "thought\n", "<channel|>", "CPU MoE answer"} {
+				outputChan <- domain.StreamEvent{Token: token}
+			}
+			outputChan <- domain.NewTerminalEvent(nil)
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
+		Model: "densecore-v1",
+		Messages: []domain.Message{
+			{Role: "user", Content: "Explain."},
+		},
+		Stream: true,
+	})
+	w := httptest.NewRecorder()
+
+	handler.ChatCompletionHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "<|channel>") || strings.Contains(body, "<channel|>") || strings.Contains(body, "thought") {
+		t.Fatalf("streaming response leaked Gemma channel tags: %q", body)
+	}
+	if !strings.Contains(body, "CPU MoE answer") {
+		t.Fatalf("streaming response missing sanitized content: %q", body)
 	}
 }
 

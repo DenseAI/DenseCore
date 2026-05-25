@@ -1,4 +1,7 @@
 {{- if .Values.autoscaling.enabled }}
+{{- if and (not .Values.autoscaling.targetCPUUtilizationPercentage) (not .Values.autoscaling.targetMemoryUtilizationPercentage) -}}
+{{- fail "autoscaling.enabled requires targetCPUUtilizationPercentage, targetMemoryUtilizationPercentage, or dense-base.keda.enabled with custom triggers" -}}
+{{- end -}}
 {{- $base := index .Values "dense-base" -}}
 {{- $ctx := dict "root" . "values" $base -}}
 apiVersion: autoscaling/v2

@@ -390,6 +390,12 @@ bool ResolveQ4KTrueBatchedKernelPolicyForTest(int simd_level, bool compiled_with
     return ::ResolveQ4KTrueBatchedKernelEnabledPolicy(static_cast<densecore::simd::SimdLevel>(simd_level),
                                                       compiled_with_sve);
 }
+bool ShouldUsePortableFlashHeadSeqReferenceFallbackForTest(bool explicit_debug_reference) {
+    return ::ShouldUsePortableFlashHeadSeqReferenceFallback(explicit_debug_reference);
+}
+bool CompiledWithX86Avx512ForFlashAttentionForTest() {
+    return ::CompiledWithX86Avx512ForFlashAttention();
+}
 int ResolvePagedAttentionDecodeHeadTileForTest(int n_head, int n_tokens, int n_tasks) {
     return ::ResolvePagedAttentionDecodeHeadTile(n_head, n_tokens, n_tasks);
 }

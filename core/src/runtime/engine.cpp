@@ -2128,6 +2128,11 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
 
         // Log Flash Attention status based on CPU capabilities
         densecore::simd::SimdLevel simd_level = densecore::simd::DetectSimdLevel();
+#if defined(__AVX512F__)
+        constexpr bool compiled_with_x86_avx512 = true;
+#else
+        constexpr bool compiled_with_x86_avx512 = false;
+#endif
         if (densecore::simd::HasX86Avx512OrBetter(simd_level)) {
             LOG_INFO("Native x86 Flash Attention Enabled ({} detected)", densecore::simd::SimdLevelName(simd_level));
         } else if (densecore::simd::IsArmFamily(simd_level)) {
@@ -2137,6 +2142,8 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
             LOG_WARN("Native x86 Flash Attention Disabled (requires AVX-512, detected: {})",
                      densecore::simd::SimdLevelName(simd_level));
         }
+        LOG_INFO("Compile-time SIMD features: x86_avx512={} runtime_simd={}",
+                 compiled_with_x86_avx512 ? "1" : "0", densecore::simd::SimdLevelName(simd_level));
 
         // Log NUMA configuration
         if (state->numa_node_id >= 0) {

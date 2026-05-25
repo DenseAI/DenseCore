@@ -233,7 +233,8 @@ void ComputeReferenceGQA(const PagedKVCache& cache, const std::vector<int>& bloc
 
 void ComputeFlashReferenceWithOffsets(const float* q, const float* k, const float* v, float* out, int n_head,
                                       int n_head_kv, int seq_q, int seq_kv, int head_dim, float scale, bool causal,
-                                      int q_start_offset, int kv_start_offset) {
+                                      int q_start_offset, int kv_start_offset, int sliding_window = -1,
+                                      float logit_softcap = 0.0f) {
     const int n_rep = n_head / n_head_kv;
     for (int h = 0; h < n_head; ++h) {
         const int kv_head = h / n_rep;
@@ -250,7 +251,12 @@ void ComputeFlashReferenceWithOffsets(const float* q, const float* k, const floa
             std::vector<float> probs(static_cast<size_t>(seq_kv), -std::numeric_limits<float>::infinity());
             float row_max = -std::numeric_limits<float>::infinity();
             for (int tk = 0; tk < seq_kv; ++tk) {
-                if (causal && (kv_start_offset + tk) > (q_start_offset + tq)) {
+                const int query_pos = q_start_offset + tq;
+                const int key_pos = kv_start_offset + tk;
+                if (causal && key_pos > query_pos) {
+                    continue;
+                }
+                if (sliding_window >= 0 && key_pos < (query_pos - sliding_window)) {
                     continue;
                 }
                 const float* k_row = k_head + static_cast<size_t>(tk) * head_dim;
@@ -259,6 +265,9 @@ void ComputeFlashReferenceWithOffsets(const float* q, const float* k, const floa
                     score += q_row[d] * k_row[d];
                 }
                 score *= scale;
+                if (logit_softcap > 0.0f && std::isfinite(score)) {
+                    score = std::tanh(score / logit_softcap) * logit_softcap;
+                }
                 probs[static_cast<size_t>(tk)] = score;
                 row_max = std::max(row_max, score);
             }
@@ -285,6 +294,12 @@ void ComputeFlashReferenceWithOffsets(const float* q, const float* k, const floa
                 }
             }
         }
+    }
+}
+
+void FillDeterministic(std::vector<float>* values, float scale) {
+    for (size_t i = 0; i < values->size(); ++i) {
+        (*values)[i] = scale * static_cast<float>((static_cast<int>(i * 17 + 3) % 29) - 14);
     }
 }
 
@@ -520,6 +535,82 @@ TEST_F(PagedAttentionTest, FlashAttentionGqaQwenChunkedPrefillMatchesReference) 
     }
 }
 
+TEST_F(PagedAttentionTest, FlashAttentionGqaGemma4SoftcapSlidingWindowMatchesReference) {
+    constexpr int n_head = 8;
+    constexpr int n_head_kv = 2;
+    constexpr int seq_q = 5;
+    constexpr int seq_kv = 11;
+    constexpr int head_dim = 64;
+
+    std::vector<float> q(static_cast<size_t>(n_head * seq_q * head_dim));
+    std::vector<float> k(static_cast<size_t>(n_head_kv * seq_kv * head_dim));
+    std::vector<float> v(static_cast<size_t>(n_head_kv * seq_kv * head_dim));
+    std::vector<float> out(static_cast<size_t>(n_head * seq_q * head_dim), 0.0f);
+    std::vector<float> ref(out.size(), 0.0f);
+
+    FillDeterministic(&q, 0.07f);
+    FillDeterministic(&k, 0.05f);
+    FillDeterministic(&v, 0.03f);
+
+    densecore::FlashAttentionConfig config = densecore::AutoTuneFlashConfig(head_dim, seq_kv);
+    config.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    config.causal = true;
+    config.q_start_offset = 6;
+    config.kv_start_offset = 0;
+    config.sliding_window = 4;
+    config.logit_softcap = 50.0f;
+
+    for (int ith = 0; ith < 4; ++ith) {
+        densecore::FlashAttentionGQA(q.data(), k.data(), v.data(), out.data(), 1, n_head, n_head_kv, seq_q, seq_kv,
+                                     head_dim, config, ith, /*nth=*/4);
+    }
+    ComputeFlashReferenceWithOffsets(q.data(), k.data(), v.data(), ref.data(), n_head, n_head_kv, seq_q, seq_kv,
+                                     head_dim, config.scale, true, config.q_start_offset, config.kv_start_offset,
+                                     config.sliding_window, config.logit_softcap);
+
+    for (size_t i = 0; i < out.size(); ++i) {
+        EXPECT_NEAR(out[i], ref[i], 1e-4f) << "Mismatch at index " << i;
+    }
+}
+
+TEST_F(PagedAttentionTest, FlashAttentionMhaGemma4SoftcapSlidingWindowMatchesReference) {
+    constexpr int n_head = 4;
+    constexpr int n_head_kv = 4;
+    constexpr int seq_q = 4;
+    constexpr int seq_kv = 9;
+    constexpr int head_dim = 32;
+
+    std::vector<float> q(static_cast<size_t>(n_head * seq_q * head_dim));
+    std::vector<float> k(static_cast<size_t>(n_head_kv * seq_kv * head_dim));
+    std::vector<float> v(static_cast<size_t>(n_head_kv * seq_kv * head_dim));
+    std::vector<float> out(static_cast<size_t>(n_head * seq_q * head_dim), 0.0f);
+    std::vector<float> ref(out.size(), 0.0f);
+
+    FillDeterministic(&q, 0.09f);
+    FillDeterministic(&k, 0.04f);
+    FillDeterministic(&v, 0.02f);
+
+    densecore::FlashAttentionConfig config = densecore::AutoTuneFlashConfig(head_dim, seq_kv);
+    config.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    config.causal = true;
+    config.q_start_offset = 5;
+    config.kv_start_offset = 0;
+    config.sliding_window = 5;
+    config.logit_softcap = 50.0f;
+
+    for (int ith = 0; ith < 3; ++ith) {
+        densecore::FlashAttentionBatched(q.data(), k.data(), v.data(), out.data(), 1, n_head, seq_q, seq_kv, head_dim,
+                                         config, ith, /*nth=*/3);
+    }
+    ComputeFlashReferenceWithOffsets(q.data(), k.data(), v.data(), ref.data(), n_head, n_head_kv, seq_q, seq_kv,
+                                     head_dim, config.scale, true, config.q_start_offset, config.kv_start_offset,
+                                     config.sliding_window, config.logit_softcap);
+
+    for (size_t i = 0; i < out.size(); ++i) {
+        EXPECT_NEAR(out[i], ref[i], 1e-4f) << "Mismatch at index " << i;
+    }
+}
+
 TEST_F(PagedAttentionTest, CpuBackendFlashAttentionPrefillNativeStridedMatchesPacked) {
     constexpr int batch = 2;
     constexpr int n_head = 3;
@@ -622,6 +713,102 @@ TEST_F(PagedAttentionTest, CpuBackendFlashAttentionPrefillNativeStridedMatchesPa
                         << "b=" << b << " s=" << s << " h=" << h << " d=" << d;
                 }
             }
+        }
+    }
+}
+
+TEST_F(PagedAttentionTest, CpuBackendFlashAttentionGemma4SoftcapNativeDecodeStridedMatchesPacked) {
+    constexpr int batch = 1;
+    constexpr int n_head = 4;
+    constexpr int n_head_kv = 2;
+    constexpr int seq_q = 1;
+    constexpr int seq_kv = 7;
+    constexpr int head_dim = 8;
+
+    const size_t native_q_elems = static_cast<size_t>(batch) * seq_q * n_head * head_dim;
+    const size_t native_kv_elems = static_cast<size_t>(batch) * seq_kv * n_head_kv * head_dim;
+    const size_t packed_q_elems = static_cast<size_t>(batch) * n_head * seq_q * head_dim;
+    const size_t packed_kv_elems = static_cast<size_t>(batch) * n_head_kv * seq_kv * head_dim;
+
+    std::vector<float> q_native(native_q_elems);
+    std::vector<float> k_native(native_kv_elems);
+    std::vector<float> v_native(native_kv_elems);
+    std::vector<float> q_packed(packed_q_elems);
+    std::vector<float> k_packed(packed_kv_elems);
+    std::vector<float> v_packed(packed_kv_elems);
+    std::vector<float> out_native(native_q_elems, 0.0f);
+    std::vector<float> out_packed(packed_q_elems, 0.0f);
+
+    FillDeterministic(&q_native, 0.08f);
+    FillDeterministic(&k_native, 0.06f);
+    FillDeterministic(&v_native, 0.04f);
+
+    for (int b = 0; b < batch; ++b) {
+        for (int s = 0; s < seq_q; ++s) {
+            for (int h = 0; h < n_head; ++h) {
+                const size_t native_base = ((static_cast<size_t>(b) * seq_q + s) * n_head + h) * head_dim;
+                const size_t packed_base = ((static_cast<size_t>(b) * n_head + h) * seq_q + s) * head_dim;
+                std::copy_n(q_native.data() + native_base, head_dim, q_packed.data() + packed_base);
+            }
+        }
+        for (int s = 0; s < seq_kv; ++s) {
+            for (int h = 0; h < n_head_kv; ++h) {
+                const size_t native_base = ((static_cast<size_t>(b) * seq_kv + s) * n_head_kv + h) * head_dim;
+                const size_t packed_base = ((static_cast<size_t>(b) * n_head_kv + h) * seq_kv + s) * head_dim;
+                std::copy_n(k_native.data() + native_base, head_dim, k_packed.data() + packed_base);
+                std::copy_n(v_native.data() + native_base, head_dim, v_packed.data() + packed_base);
+            }
+        }
+    }
+
+    densecore::Tensor q_native_t;
+    q_native_t.data = q_native.data();
+    q_native_t.ndim = 4;
+    q_native_t.dtype = densecore::DType::F32;
+    q_native_t.device_type = densecore::DeviceType::CPU;
+    q_native_t.shape = {batch, n_head, seq_q, head_dim};
+    q_native_t.stride = {static_cast<int64_t>(seq_q) * n_head * head_dim, head_dim,
+                         static_cast<int64_t>(n_head) * head_dim, 1};
+
+    densecore::Tensor k_native_t;
+    k_native_t.data = k_native.data();
+    k_native_t.ndim = 4;
+    k_native_t.dtype = densecore::DType::F32;
+    k_native_t.device_type = densecore::DeviceType::CPU;
+    k_native_t.shape = {batch, n_head_kv, seq_kv, head_dim};
+    k_native_t.stride = {static_cast<int64_t>(seq_kv) * n_head_kv * head_dim, head_dim,
+                         static_cast<int64_t>(n_head_kv) * head_dim, 1};
+
+    densecore::Tensor v_native_t = k_native_t;
+    v_native_t.data = v_native.data();
+
+    densecore::Tensor out_native_t = q_native_t;
+    out_native_t.data = out_native.data();
+
+    densecore::Tensor q_packed_t = densecore::Tensor::Make4D(q_packed.data(), batch, n_head, seq_q, head_dim);
+    densecore::Tensor k_packed_t =
+        densecore::Tensor::Make4D(k_packed.data(), batch, n_head_kv, seq_kv, head_dim);
+    densecore::Tensor v_packed_t =
+        densecore::Tensor::Make4D(v_packed.data(), batch, n_head_kv, seq_kv, head_dim);
+    densecore::Tensor out_packed_t =
+        densecore::Tensor::Make4D(out_packed.data(), batch, n_head, seq_q, head_dim);
+
+    auto& backend = densecore::GetCpuBackend();
+    backend.FlashAttention(q_native_t, k_native_t, v_native_t, &out_native_t,
+                           1.0f / std::sqrt(static_cast<float>(head_dim)),
+                           /*causal=*/true, n_head_kv, /*sliding_window=*/3, /*logit_softcap=*/50.0f,
+                           /*semantic_flags=*/0, /*q_start_offset=*/6, /*kv_start_offset=*/0);
+    backend.FlashAttention(q_packed_t, k_packed_t, v_packed_t, &out_packed_t,
+                           1.0f / std::sqrt(static_cast<float>(head_dim)),
+                           /*causal=*/true, n_head_kv, /*sliding_window=*/3, /*logit_softcap=*/50.0f,
+                           /*semantic_flags=*/0, /*q_start_offset=*/6, /*kv_start_offset=*/0);
+
+    for (int h = 0; h < n_head; ++h) {
+        const size_t native_base = static_cast<size_t>(h) * head_dim;
+        const size_t packed_base = static_cast<size_t>(h) * seq_q * head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+            EXPECT_NEAR(out_native[native_base + d], out_packed[packed_base + d], 1e-5f)
+                << "h=" << h << " d=" << d;
         }
     }
 }

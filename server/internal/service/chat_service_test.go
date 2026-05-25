@@ -34,6 +34,10 @@ type chatServiceBrokenStreamTestEngine struct {
 	chatServiceRenderTestEngine
 }
 
+type chatServiceRenderedChatTestEngine struct {
+	chatServiceRenderTestEngine
+}
+
 func (e *chatServiceRenderTestEngine) GenerateStream(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
 	panic("not used")
 }
@@ -57,6 +61,12 @@ func (e *chatServiceRenderTestEngine) GenerateStreamTokensWithSampling(ctx conte
 	outputChan <- domain.NewTerminalEvent(nil)
 	close(outputChan)
 	return nil
+}
+
+func (e *chatServiceRenderedChatTestEngine) GenerateStreamRenderedChatWithSamplingAwaitable(ctx context.Context, renderedPrompt string, maxTokens int, loraAdapter string, jsonMode bool, temperature float64, topP float64, topK int, repetitionPenalty float64, stop []string, allowedTokenIDs []int, allowedTokensStrict bool, disallowedTokenIDs []int, outputChan chan domain.StreamEvent) (<-chan struct{}, error) {
+	done := make(chan struct{})
+	close(done)
+	return done, nil
 }
 func cloneBoolPtr(value *bool) *bool {
 	if value == nil {
@@ -567,6 +577,38 @@ func TestGenerateStreamNonParityModeGemmaUsesRenderedTokenIDs(t *testing.T) {
 	}
 	if engine.previewText != "" {
 		t.Fatalf("expected rendered chat path to avoid raw text preview, got %q", engine.previewText)
+	}
+}
+
+func TestPreparePromptGemmaRenderedChatSubmitAvoidsPreviewTokenizationWhenSupported(t *testing.T) {
+	engine := &chatServiceRenderedChatTestEngine{
+		chatServiceRenderTestEngine: chatServiceRenderTestEngine{
+			renderedPrompt:  "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
+			previewTokenIDs: []int{2, 4, 6, 8},
+		},
+	}
+	modelService := &chatServiceRenderTestModelService{
+		engine: engine,
+		model:  "/tmp/gemma-4-26B-A4B-it-Q4_K_M.gguf",
+	}
+	svc := NewChatService(modelService, queue.NewRequestQueue(4))
+
+	prepared, err := svc.preparePrompt(engine, domain.ChatCompletionRequest{
+		Messages:  []domain.Message{{Role: "user", Content: "What is the capital of France?"}},
+		MaxTokens: 8,
+	}, modelService.model)
+	if err != nil {
+		t.Fatalf("preparePrompt returned error: %v", err)
+	}
+	if !prepared.renderedChatSubmit {
+		t.Fatalf("expected rendered chat submit path")
+	}
+	if prepared.tokenSource != "engine_submit_rendered_chat" {
+		t.Fatalf("tokenSource=%q want engine_submit_rendered_chat", prepared.tokenSource)
+	}
+	if engine.previewRenderedText != "" || engine.previewText != "" {
+		t.Fatalf("expected rendered chat path to avoid preview tokenization, previewRendered=%q previewText=%q",
+			engine.previewRenderedText, engine.previewText)
 	}
 }
 

@@ -390,7 +390,7 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
 
             if (config.logit_softcap > 0.0f) {
                 for (int qi = 0; qi < q_len; ++qi) {
-                    float* row = scratch.qk_block.data() + static_cast<size_t>(qi) * Bc;
+                    float* row = scratch.qk_block.data() + static_cast<size_t>(qi) * kv_len;
                     for (int kj = 0; kj < kv_len; ++kj) {
                         row[kj] = ApplyAttentionLogitSoftcap(row[kj], config.logit_softcap);
                     }
@@ -404,7 +404,7 @@ inline void FlashAttentionForward(const float* Q, const float* K, const float* V
                 } else {
                     for (int qi = 0; qi < q_len; ++qi) {
                         const int query_pos = q_base + i + qi;
-                        float* row = scratch.qk_block.data() + static_cast<size_t>(qi) * Bc;
+                        float* row = scratch.qk_block.data() + static_cast<size_t>(qi) * kv_len;
                         for (int kj = 0; kj < kv_len; ++kj) {
                             const int key_pos = kv_base + j + kj;
                             if (IsAttentionKeyMasked(config, query_pos, key_pos)) {

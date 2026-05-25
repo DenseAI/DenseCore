@@ -1,6 +1,8 @@
 #include "densecore/models/qwen35_ssm_math.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -93,14 +95,36 @@ inline void DotPairProducts(const float* lhs0, const float* lhs1, const float* r
     float sum0 = 0.0f;
     float sum1 = 0.0f;
 #if defined(__AVX512F__)
-    __m512 acc0 = _mm512_setzero_ps();
-    __m512 acc1 = _mm512_setzero_ps();
+    __m512 acc0a = _mm512_setzero_ps();
+    __m512 acc0b = _mm512_setzero_ps();
+    __m512 acc0c = _mm512_setzero_ps();
+    __m512 acc0d = _mm512_setzero_ps();
+    __m512 acc1a = _mm512_setzero_ps();
+    __m512 acc1b = _mm512_setzero_ps();
+    __m512 acc1c = _mm512_setzero_ps();
+    __m512 acc1d = _mm512_setzero_ps();
     int i = 0;
+    for (; i + 64 <= n; i += 64) {
+        const __m512 x0 = _mm512_loadu_ps(rhs + i);
+        const __m512 x1 = _mm512_loadu_ps(rhs + i + 16);
+        const __m512 x2 = _mm512_loadu_ps(rhs + i + 32);
+        const __m512 x3 = _mm512_loadu_ps(rhs + i + 48);
+        acc0a = _mm512_fmadd_ps(_mm512_loadu_ps(lhs0 + i), x0, acc0a);
+        acc0b = _mm512_fmadd_ps(_mm512_loadu_ps(lhs0 + i + 16), x1, acc0b);
+        acc0c = _mm512_fmadd_ps(_mm512_loadu_ps(lhs0 + i + 32), x2, acc0c);
+        acc0d = _mm512_fmadd_ps(_mm512_loadu_ps(lhs0 + i + 48), x3, acc0d);
+        acc1a = _mm512_fmadd_ps(_mm512_loadu_ps(lhs1 + i), x0, acc1a);
+        acc1b = _mm512_fmadd_ps(_mm512_loadu_ps(lhs1 + i + 16), x1, acc1b);
+        acc1c = _mm512_fmadd_ps(_mm512_loadu_ps(lhs1 + i + 32), x2, acc1c);
+        acc1d = _mm512_fmadd_ps(_mm512_loadu_ps(lhs1 + i + 48), x3, acc1d);
+    }
     for (; i + 16 <= n; i += 16) {
         const __m512 x = _mm512_loadu_ps(rhs + i);
-        acc0 = _mm512_add_ps(acc0, _mm512_mul_ps(_mm512_loadu_ps(lhs0 + i), x));
-        acc1 = _mm512_add_ps(acc1, _mm512_mul_ps(_mm512_loadu_ps(lhs1 + i), x));
+        acc0a = _mm512_fmadd_ps(_mm512_loadu_ps(lhs0 + i), x, acc0a);
+        acc1a = _mm512_fmadd_ps(_mm512_loadu_ps(lhs1 + i), x, acc1a);
     }
+    const __m512 acc0 = _mm512_add_ps(_mm512_add_ps(acc0a, acc0b), _mm512_add_ps(acc0c, acc0d));
+    const __m512 acc1 = _mm512_add_ps(_mm512_add_ps(acc1a, acc1b), _mm512_add_ps(acc1c, acc1d));
     sum0 = _mm512_reduce_add_ps(acc0);
     sum1 = _mm512_reduce_add_ps(acc1);
     for (; i < n; ++i) {
@@ -109,14 +133,36 @@ inline void DotPairProducts(const float* lhs0, const float* lhs1, const float* r
         sum1 += lhs1[i] * x;
     }
 #elif defined(__AVX2__)
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc0a = _mm256_setzero_ps();
+    __m256 acc0b = _mm256_setzero_ps();
+    __m256 acc0c = _mm256_setzero_ps();
+    __m256 acc0d = _mm256_setzero_ps();
+    __m256 acc1a = _mm256_setzero_ps();
+    __m256 acc1b = _mm256_setzero_ps();
+    __m256 acc1c = _mm256_setzero_ps();
+    __m256 acc1d = _mm256_setzero_ps();
     int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        const __m256 x0 = _mm256_loadu_ps(rhs + i);
+        const __m256 x1 = _mm256_loadu_ps(rhs + i + 8);
+        const __m256 x2 = _mm256_loadu_ps(rhs + i + 16);
+        const __m256 x3 = _mm256_loadu_ps(rhs + i + 24);
+        acc0a = _mm256_fmadd_ps(_mm256_loadu_ps(lhs0 + i), x0, acc0a);
+        acc0b = _mm256_fmadd_ps(_mm256_loadu_ps(lhs0 + i + 8), x1, acc0b);
+        acc0c = _mm256_fmadd_ps(_mm256_loadu_ps(lhs0 + i + 16), x2, acc0c);
+        acc0d = _mm256_fmadd_ps(_mm256_loadu_ps(lhs0 + i + 24), x3, acc0d);
+        acc1a = _mm256_fmadd_ps(_mm256_loadu_ps(lhs1 + i), x0, acc1a);
+        acc1b = _mm256_fmadd_ps(_mm256_loadu_ps(lhs1 + i + 8), x1, acc1b);
+        acc1c = _mm256_fmadd_ps(_mm256_loadu_ps(lhs1 + i + 16), x2, acc1c);
+        acc1d = _mm256_fmadd_ps(_mm256_loadu_ps(lhs1 + i + 24), x3, acc1d);
+    }
     for (; i + 8 <= n; i += 8) {
         const __m256 x = _mm256_loadu_ps(rhs + i);
-        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(lhs0 + i), x));
-        acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(_mm256_loadu_ps(lhs1 + i), x));
+        acc0a = _mm256_fmadd_ps(_mm256_loadu_ps(lhs0 + i), x, acc0a);
+        acc1a = _mm256_fmadd_ps(_mm256_loadu_ps(lhs1 + i), x, acc1a);
     }
+    const __m256 acc0 = _mm256_add_ps(_mm256_add_ps(acc0a, acc0b), _mm256_add_ps(acc0c, acc0d));
+    const __m256 acc1 = _mm256_add_ps(_mm256_add_ps(acc1a, acc1b), _mm256_add_ps(acc1c, acc1d));
     alignas(32) float lanes0[8];
     alignas(32) float lanes1[8];
     _mm256_store_ps(lanes0, acc0);
@@ -131,14 +177,36 @@ inline void DotPairProducts(const float* lhs0, const float* lhs1, const float* r
         sum1 += lhs1[i] * x;
     }
 #elif defined(DENSECORE_NEON_SSM)
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc0a = vdupq_n_f32(0.0f);
+    float32x4_t acc0b = vdupq_n_f32(0.0f);
+    float32x4_t acc0c = vdupq_n_f32(0.0f);
+    float32x4_t acc0d = vdupq_n_f32(0.0f);
+    float32x4_t acc1a = vdupq_n_f32(0.0f);
+    float32x4_t acc1b = vdupq_n_f32(0.0f);
+    float32x4_t acc1c = vdupq_n_f32(0.0f);
+    float32x4_t acc1d = vdupq_n_f32(0.0f);
     int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const float32x4_t x0 = vld1q_f32(rhs + i);
+        const float32x4_t x1 = vld1q_f32(rhs + i + 4);
+        const float32x4_t x2 = vld1q_f32(rhs + i + 8);
+        const float32x4_t x3 = vld1q_f32(rhs + i + 12);
+        acc0a = vfmaq_f32(acc0a, vld1q_f32(lhs0 + i), x0);
+        acc0b = vfmaq_f32(acc0b, vld1q_f32(lhs0 + i + 4), x1);
+        acc0c = vfmaq_f32(acc0c, vld1q_f32(lhs0 + i + 8), x2);
+        acc0d = vfmaq_f32(acc0d, vld1q_f32(lhs0 + i + 12), x3);
+        acc1a = vfmaq_f32(acc1a, vld1q_f32(lhs1 + i), x0);
+        acc1b = vfmaq_f32(acc1b, vld1q_f32(lhs1 + i + 4), x1);
+        acc1c = vfmaq_f32(acc1c, vld1q_f32(lhs1 + i + 8), x2);
+        acc1d = vfmaq_f32(acc1d, vld1q_f32(lhs1 + i + 12), x3);
+    }
     for (; i + 4 <= n; i += 4) {
         const float32x4_t x = vld1q_f32(rhs + i);
-        acc0 = vfmaq_f32(acc0, vld1q_f32(lhs0 + i), x);
-        acc1 = vfmaq_f32(acc1, vld1q_f32(lhs1 + i), x);
+        acc0a = vfmaq_f32(acc0a, vld1q_f32(lhs0 + i), x);
+        acc1a = vfmaq_f32(acc1a, vld1q_f32(lhs1 + i), x);
     }
+    const float32x4_t acc0 = vaddq_f32(vaddq_f32(acc0a, acc0b), vaddq_f32(acc0c, acc0d));
+    const float32x4_t acc1 = vaddq_f32(vaddq_f32(acc1a, acc1b), vaddq_f32(acc1c, acc1d));
     sum0 = vaddvq_f32(acc0);
     sum1 = vaddvq_f32(acc1);
     for (; i < n; ++i) {
@@ -171,23 +239,51 @@ inline bool IsVectorShape(const int64_t ne[4], int expected) {
 inline float DotSquares(const float* values, int n) {
     float sum = 0.0f;
 #if defined(__AVX512F__)
-    __m512 acc = _mm512_setzero_ps();
+    __m512 acc_a = _mm512_setzero_ps();
+    __m512 acc_b = _mm512_setzero_ps();
+    __m512 acc_c = _mm512_setzero_ps();
+    __m512 acc_d = _mm512_setzero_ps();
     int i = 0;
+    for (; i + 64 <= n; i += 64) {
+        const __m512 v0 = _mm512_loadu_ps(values + i);
+        const __m512 v1 = _mm512_loadu_ps(values + i + 16);
+        const __m512 v2 = _mm512_loadu_ps(values + i + 32);
+        const __m512 v3 = _mm512_loadu_ps(values + i + 48);
+        acc_a = _mm512_fmadd_ps(v0, v0, acc_a);
+        acc_b = _mm512_fmadd_ps(v1, v1, acc_b);
+        acc_c = _mm512_fmadd_ps(v2, v2, acc_c);
+        acc_d = _mm512_fmadd_ps(v3, v3, acc_d);
+    }
     for (; i + 16 <= n; i += 16) {
         const __m512 v = _mm512_loadu_ps(values + i);
-        acc = _mm512_add_ps(acc, _mm512_mul_ps(v, v));
+        acc_a = _mm512_fmadd_ps(v, v, acc_a);
     }
+    const __m512 acc = _mm512_add_ps(_mm512_add_ps(acc_a, acc_b), _mm512_add_ps(acc_c, acc_d));
     sum = _mm512_reduce_add_ps(acc);
     for (; i < n; ++i) {
         sum += values[i] * values[i];
     }
 #elif defined(__AVX2__)
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc_a = _mm256_setzero_ps();
+    __m256 acc_b = _mm256_setzero_ps();
+    __m256 acc_c = _mm256_setzero_ps();
+    __m256 acc_d = _mm256_setzero_ps();
     int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        const __m256 v0 = _mm256_loadu_ps(values + i);
+        const __m256 v1 = _mm256_loadu_ps(values + i + 8);
+        const __m256 v2 = _mm256_loadu_ps(values + i + 16);
+        const __m256 v3 = _mm256_loadu_ps(values + i + 24);
+        acc_a = _mm256_fmadd_ps(v0, v0, acc_a);
+        acc_b = _mm256_fmadd_ps(v1, v1, acc_b);
+        acc_c = _mm256_fmadd_ps(v2, v2, acc_c);
+        acc_d = _mm256_fmadd_ps(v3, v3, acc_d);
+    }
     for (; i + 8 <= n; i += 8) {
         const __m256 v = _mm256_loadu_ps(values + i);
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(v, v));
+        acc_a = _mm256_fmadd_ps(v, v, acc_a);
     }
+    const __m256 acc = _mm256_add_ps(_mm256_add_ps(acc_a, acc_b), _mm256_add_ps(acc_c, acc_d));
     alignas(32) float lanes[8];
     _mm256_store_ps(lanes, acc);
     for (float lane : lanes) {
@@ -197,12 +293,26 @@ inline float DotSquares(const float* values, int n) {
         sum += values[i] * values[i];
     }
 #elif defined(DENSECORE_NEON_SSM)
-    float32x4_t acc = vdupq_n_f32(0.0f);
+    float32x4_t acc_a = vdupq_n_f32(0.0f);
+    float32x4_t acc_b = vdupq_n_f32(0.0f);
+    float32x4_t acc_c = vdupq_n_f32(0.0f);
+    float32x4_t acc_d = vdupq_n_f32(0.0f);
     int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const float32x4_t v0 = vld1q_f32(values + i);
+        const float32x4_t v1 = vld1q_f32(values + i + 4);
+        const float32x4_t v2 = vld1q_f32(values + i + 8);
+        const float32x4_t v3 = vld1q_f32(values + i + 12);
+        acc_a = vfmaq_f32(acc_a, v0, v0);
+        acc_b = vfmaq_f32(acc_b, v1, v1);
+        acc_c = vfmaq_f32(acc_c, v2, v2);
+        acc_d = vfmaq_f32(acc_d, v3, v3);
+    }
     for (; i + 4 <= n; i += 4) {
         const float32x4_t v = vld1q_f32(values + i);
-        acc = vmlaq_f32(acc, v, v);
+        acc_a = vfmaq_f32(acc_a, v, v);
     }
+    const float32x4_t acc = vaddq_f32(vaddq_f32(acc_a, acc_b), vaddq_f32(acc_c, acc_d));
     sum = vaddvq_f32(acc);
     for (; i < n; ++i) {
         sum += values[i] * values[i];
@@ -335,8 +445,8 @@ inline void AccumulateScaledPair(float* dst0, float* dst1, const float* src, flo
         const __m512 s = _mm512_loadu_ps(src + i);
         const __m512 d0 = _mm512_loadu_ps(dst0 + i);
         const __m512 d1 = _mm512_loadu_ps(dst1 + i);
-        _mm512_storeu_ps(dst0 + i, _mm512_add_ps(d0, _mm512_mul_ps(s, vscale0)));
-        _mm512_storeu_ps(dst1 + i, _mm512_add_ps(d1, _mm512_mul_ps(s, vscale1)));
+        _mm512_storeu_ps(dst0 + i, _mm512_fmadd_ps(s, vscale0, d0));
+        _mm512_storeu_ps(dst1 + i, _mm512_fmadd_ps(s, vscale1, d1));
     }
     for (; i < n; ++i) {
         const float s = src[i];
@@ -351,8 +461,8 @@ inline void AccumulateScaledPair(float* dst0, float* dst1, const float* src, flo
         const __m256 s = _mm256_loadu_ps(src + i);
         const __m256 d0 = _mm256_loadu_ps(dst0 + i);
         const __m256 d1 = _mm256_loadu_ps(dst1 + i);
-        _mm256_storeu_ps(dst0 + i, _mm256_add_ps(d0, _mm256_mul_ps(s, vscale0)));
-        _mm256_storeu_ps(dst1 + i, _mm256_add_ps(d1, _mm256_mul_ps(s, vscale1)));
+        _mm256_storeu_ps(dst0 + i, _mm256_fmadd_ps(s, vscale0, d0));
+        _mm256_storeu_ps(dst1 + i, _mm256_fmadd_ps(s, vscale1, d1));
     }
     for (; i < n; ++i) {
         const float s = src[i];
@@ -392,7 +502,8 @@ inline void UpdateStateFromDelta(float* state_row, const float* delta, float dec
     for (; i + 16 <= n; i += 16) {
         const __m512 old_state = _mm512_loadu_ps(state_row + i);
         const __m512 d = _mm512_loadu_ps(delta + i);
-        _mm512_storeu_ps(state_row + i, _mm512_add_ps(_mm512_mul_ps(old_state, vdecay), _mm512_mul_ps(d, vk)));
+        const __m512 decayed = _mm512_mul_ps(old_state, vdecay);
+        _mm512_storeu_ps(state_row + i, _mm512_fmadd_ps(d, vk, decayed));
     }
     for (; i < n; ++i) {
         state_row[i] = decay * state_row[i] + k_scale * delta[i];
@@ -404,7 +515,8 @@ inline void UpdateStateFromDelta(float* state_row, const float* delta, float dec
     for (; i + 8 <= n; i += 8) {
         const __m256 old_state = _mm256_loadu_ps(state_row + i);
         const __m256 d = _mm256_loadu_ps(delta + i);
-        _mm256_storeu_ps(state_row + i, _mm256_add_ps(_mm256_mul_ps(old_state, vdecay), _mm256_mul_ps(d, vk)));
+        const __m256 decayed = _mm256_mul_ps(old_state, vdecay);
+        _mm256_storeu_ps(state_row + i, _mm256_fmadd_ps(d, vk, decayed));
     }
     for (; i < n; ++i) {
         state_row[i] = decay * state_row[i] + k_scale * delta[i];
@@ -438,10 +550,11 @@ inline void DecayAddScaledAndAccumulate(float* state_row, const float* delta, fl
     for (; i + 16 <= n; i += 16) {
         const __m512 old_state = _mm512_loadu_ps(state_row + i);
         const __m512 d = _mm512_loadu_ps(delta + i);
-        const __m512 updated = _mm512_add_ps(_mm512_mul_ps(old_state, vdecay), _mm512_mul_ps(d, vk));
+        const __m512 decayed = _mm512_mul_ps(old_state, vdecay);
+        const __m512 updated = _mm512_fmadd_ps(d, vk, decayed);
         const __m512 y = _mm512_loadu_ps(y_head + i);
         _mm512_storeu_ps(state_row + i, updated);
-        _mm512_storeu_ps(y_head + i, _mm512_add_ps(y, _mm512_mul_ps(updated, vq)));
+        _mm512_storeu_ps(y_head + i, _mm512_fmadd_ps(updated, vq, y));
     }
     for (; i < n; ++i) {
         const float updated = decay * state_row[i] + k_scale * delta[i];
@@ -456,10 +569,11 @@ inline void DecayAddScaledAndAccumulate(float* state_row, const float* delta, fl
     for (; i + 8 <= n; i += 8) {
         const __m256 old_state = _mm256_loadu_ps(state_row + i);
         const __m256 d = _mm256_loadu_ps(delta + i);
-        const __m256 updated = _mm256_add_ps(_mm256_mul_ps(old_state, vdecay), _mm256_mul_ps(d, vk));
+        const __m256 decayed = _mm256_mul_ps(old_state, vdecay);
+        const __m256 updated = _mm256_fmadd_ps(d, vk, decayed);
         const __m256 y = _mm256_loadu_ps(y_head + i);
         _mm256_storeu_ps(state_row + i, updated);
-        _mm256_storeu_ps(y_head + i, _mm256_add_ps(y, _mm256_mul_ps(updated, vq)));
+        _mm256_storeu_ps(y_head + i, _mm256_fmadd_ps(updated, vq, y));
     }
     for (; i < n; ++i) {
         const float updated = decay * state_row[i] + k_scale * delta[i];
@@ -500,21 +614,41 @@ inline float SumSquares(const float* values, int n) {
 inline float DotProduct(const float* lhs, const float* rhs, int n) {
     float sum = 0.0f;
 #if defined(__AVX512F__)
-    __m512 acc = _mm512_setzero_ps();
+    __m512 acc_a = _mm512_setzero_ps();
+    __m512 acc_b = _mm512_setzero_ps();
+    __m512 acc_c = _mm512_setzero_ps();
+    __m512 acc_d = _mm512_setzero_ps();
     int i = 0;
-    for (; i + 16 <= n; i += 16) {
-        acc = _mm512_add_ps(acc, _mm512_mul_ps(_mm512_loadu_ps(lhs + i), _mm512_loadu_ps(rhs + i)));
+    for (; i + 64 <= n; i += 64) {
+        acc_a = _mm512_fmadd_ps(_mm512_loadu_ps(lhs + i), _mm512_loadu_ps(rhs + i), acc_a);
+        acc_b = _mm512_fmadd_ps(_mm512_loadu_ps(lhs + i + 16), _mm512_loadu_ps(rhs + i + 16), acc_b);
+        acc_c = _mm512_fmadd_ps(_mm512_loadu_ps(lhs + i + 32), _mm512_loadu_ps(rhs + i + 32), acc_c);
+        acc_d = _mm512_fmadd_ps(_mm512_loadu_ps(lhs + i + 48), _mm512_loadu_ps(rhs + i + 48), acc_d);
     }
+    for (; i + 16 <= n; i += 16) {
+        acc_a = _mm512_fmadd_ps(_mm512_loadu_ps(lhs + i), _mm512_loadu_ps(rhs + i), acc_a);
+    }
+    const __m512 acc = _mm512_add_ps(_mm512_add_ps(acc_a, acc_b), _mm512_add_ps(acc_c, acc_d));
     sum = _mm512_reduce_add_ps(acc);
     for (; i < n; ++i) {
         sum += lhs[i] * rhs[i];
     }
 #elif defined(__AVX2__)
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc_a = _mm256_setzero_ps();
+    __m256 acc_b = _mm256_setzero_ps();
+    __m256 acc_c = _mm256_setzero_ps();
+    __m256 acc_d = _mm256_setzero_ps();
     int i = 0;
-    for (; i + 8 <= n; i += 8) {
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_loadu_ps(lhs + i), _mm256_loadu_ps(rhs + i)));
+    for (; i + 32 <= n; i += 32) {
+        acc_a = _mm256_fmadd_ps(_mm256_loadu_ps(lhs + i), _mm256_loadu_ps(rhs + i), acc_a);
+        acc_b = _mm256_fmadd_ps(_mm256_loadu_ps(lhs + i + 8), _mm256_loadu_ps(rhs + i + 8), acc_b);
+        acc_c = _mm256_fmadd_ps(_mm256_loadu_ps(lhs + i + 16), _mm256_loadu_ps(rhs + i + 16), acc_c);
+        acc_d = _mm256_fmadd_ps(_mm256_loadu_ps(lhs + i + 24), _mm256_loadu_ps(rhs + i + 24), acc_d);
     }
+    for (; i + 8 <= n; i += 8) {
+        acc_a = _mm256_fmadd_ps(_mm256_loadu_ps(lhs + i), _mm256_loadu_ps(rhs + i), acc_a);
+    }
+    const __m256 acc = _mm256_add_ps(_mm256_add_ps(acc_a, acc_b), _mm256_add_ps(acc_c, acc_d));
     alignas(32) float lanes[8];
     _mm256_store_ps(lanes, acc);
     for (float lane : lanes) {
@@ -524,11 +658,21 @@ inline float DotProduct(const float* lhs, const float* rhs, int n) {
         sum += lhs[i] * rhs[i];
     }
 #elif defined(DENSECORE_NEON_SSM)
-    float32x4_t acc = vdupq_n_f32(0.0f);
+    float32x4_t acc_a = vdupq_n_f32(0.0f);
+    float32x4_t acc_b = vdupq_n_f32(0.0f);
+    float32x4_t acc_c = vdupq_n_f32(0.0f);
+    float32x4_t acc_d = vdupq_n_f32(0.0f);
     int i = 0;
-    for (; i + 4 <= n; i += 4) {
-        acc = vfmaq_f32(acc, vld1q_f32(lhs + i), vld1q_f32(rhs + i));
+    for (; i + 16 <= n; i += 16) {
+        acc_a = vfmaq_f32(acc_a, vld1q_f32(lhs + i), vld1q_f32(rhs + i));
+        acc_b = vfmaq_f32(acc_b, vld1q_f32(lhs + i + 4), vld1q_f32(rhs + i + 4));
+        acc_c = vfmaq_f32(acc_c, vld1q_f32(lhs + i + 8), vld1q_f32(rhs + i + 8));
+        acc_d = vfmaq_f32(acc_d, vld1q_f32(lhs + i + 12), vld1q_f32(rhs + i + 12));
     }
+    for (; i + 4 <= n; i += 4) {
+        acc_a = vfmaq_f32(acc_a, vld1q_f32(lhs + i), vld1q_f32(rhs + i));
+    }
+    const float32x4_t acc = vaddq_f32(vaddq_f32(acc_a, acc_b), vaddq_f32(acc_c, acc_d));
     sum = vaddvq_f32(acc);
     for (; i < n; ++i) {
         sum += lhs[i] * rhs[i];
@@ -999,6 +1143,65 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
     return true;
 }
 
+#ifndef NDEBUG
+inline bool Qwen35RunGatedDeltaHeadStepFastDefaultUntiledReference(const Qwen35SSMHeadStepConfig& cfg,
+                                                                   float* state_kv, float* y_head,
+                                                                   float* y_pre_norm, float q_inv_norm,
+                                                                   float k_inv_norm, float qk_dot, float decay,
+                                                                   float beta_gate) {
+    if (!cfg.q_head || !cfg.k_head || !cfg.v_head || !cfg.z_head || !cfg.norm_weight || !state_kv || !y_head ||
+        cfg.head_dim_k <= 0 || cfg.head_dim_v <= 0) {
+        return false;
+    }
+
+    static thread_local std::vector<float> delta_ref;
+    const size_t head_dim_v = static_cast<size_t>(cfg.head_dim_v);
+    if (delta_ref.size() != head_dim_v) {
+        delta_ref.resize(head_dim_v);
+    }
+
+    std::fill(delta_ref.begin(), delta_ref.end(), 0.0f);
+    std::fill(y_head, y_head + cfg.head_dim_v, 0.0f);
+
+    for (int k = 0; k < cfg.head_dim_k; ++k) {
+        const float k_val = cfg.k_head[k] * k_inv_norm;
+        const float q_val = cfg.q_head[k] * q_inv_norm;
+        const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        AccumulateScaledPair(delta_ref.data(), y_head, state_row, k_val, q_val, cfg.head_dim_v);
+    }
+
+    const float attention_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k));
+    for (int v = 0; v < cfg.head_dim_v; ++v) {
+        delta_ref[static_cast<size_t>(v)] = (cfg.v_head[v] - delta_ref[static_cast<size_t>(v)] * decay) * beta_gate;
+        y_head[v] = (decay * y_head[v] + qk_dot * delta_ref[static_cast<size_t>(v)]) * attention_scale;
+    }
+    if (y_pre_norm) {
+        std::memcpy(y_pre_norm, y_head, head_dim_v * sizeof(float));
+    }
+
+    for (int k = 0; k < cfg.head_dim_k; ++k) {
+        const float k_val = cfg.k_head[k] * k_inv_norm;
+        float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        UpdateStateFromDelta(state_row, delta_ref.data(), decay, k_val, cfg.head_dim_v);
+    }
+
+    const float sum_sq = SumSquares(y_head, cfg.head_dim_v);
+    const float rms = std::sqrt(sum_sq / cfg.head_dim_v + cfg.norm_eps);
+    const float inv_rms = 1.0f / rms;
+    ApplyRmsNormGate(y_head, cfg.norm_weight, cfg.z_head, inv_rms, cfg.head_dim_v, cfg.use_fast_silu,
+                     cfg.norm_weight_uses_unit_offset);
+    return true;
+}
+
+inline float MaxAbsDiff(const float* lhs, const float* rhs, size_t n) {
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        max_diff = std::max(max_diff, std::fabs(lhs[i] - rhs[i]));
+    }
+    return max_diff;
+}
+#endif
+
 bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head,
                                             Qwen35SSMHeadStepStats* stats, float* y_pre_norm) {
     if (!cfg.input_t || !cfg.q_head || !cfg.k_head || !cfg.v_head || !cfg.z_head || !cfg.alpha_row || !cfg.beta_row ||
@@ -1071,33 +1274,67 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
             ? cfg.precomputed_qk_dot
             : DotProduct(cfg.q_head, cfg.k_head, cfg.head_dim_k) * q_inv_norm * k_inv_norm;
 
-    const auto first_pass_begin =
-        collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    for (int k = 0; k < cfg.head_dim_k; ++k) {
-        const float k_val = cfg.k_head[k] * k_inv_norm;
-        const float q_val = cfg.q_head[k] * q_inv_norm;
-        const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
-        AccumulateScaledPair(delta_data, y_head, state_row, k_val, q_val, cfg.head_dim_v);
+#ifndef NDEBUG
+    static std::atomic<int> debug_equivalence_checks{0};
+    constexpr int kQwen35FastDefaultDebugChecks = 4;
+    const bool debug_compare_untiled =
+        debug_equivalence_checks.fetch_add(1, std::memory_order_relaxed) < kQwen35FastDefaultDebugChecks;
+    std::vector<float> debug_state_ref;
+    std::vector<float> debug_y_ref;
+    std::vector<float> debug_pre_norm_ref;
+    if (debug_compare_untiled) {
+        const size_t state_elems = static_cast<size_t>(cfg.head_dim_k) * static_cast<size_t>(cfg.head_dim_v);
+        debug_state_ref.assign(state_kv, state_kv + state_elems);
+        debug_y_ref.resize(head_dim_v);
+        if (y_pre_norm) {
+            debug_pre_norm_ref.resize(head_dim_v);
+        }
+        const bool ref_ok = Qwen35RunGatedDeltaHeadStepFastDefaultUntiledReference(
+            cfg, debug_state_ref.data(), debug_y_ref.data(), y_pre_norm ? debug_pre_norm_ref.data() : nullptr,
+            q_inv_norm, k_inv_norm, qk_dot, decay, beta_gate);
+        assert(ref_ok);
     }
-    const double first_pass_dual_dot_ms = collect_timing ? ms_since(first_pass_begin) : 0.0;
+#endif
 
     const float attention_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k));
-    for (int v = 0; v < cfg.head_dim_v; ++v) {
-        delta_data[v] = (cfg.v_head[v] - delta_data[v] * decay) * beta_gate;
-        y_head[v] = (decay * y_head[v] + qk_dot * delta_data[v]) * attention_scale;
+    constexpr int kQwen35FastDefaultVChunk = 64;
+    double first_pass_dual_dot_ms = 0.0;
+    double state_update_only_ms = 0.0;
+    for (int v0 = 0; v0 < cfg.head_dim_v; v0 += kQwen35FastDefaultVChunk) {
+        const int v_end = std::min(v0 + kQwen35FastDefaultVChunk, cfg.head_dim_v);
+        const int chunk = v_end - v0;
+
+        const auto first_pass_begin =
+            collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        for (int k = 0; k < cfg.head_dim_k; ++k) {
+            const float k_val = cfg.k_head[k] * k_inv_norm;
+            const float q_val = cfg.q_head[k] * q_inv_norm;
+            const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v + v0;
+            AccumulateScaledPair(delta_data + v0, y_head + v0, state_row, k_val, q_val, chunk);
+        }
+        if (collect_timing) {
+            first_pass_dual_dot_ms += ms_since(first_pass_begin);
+        }
+
+        for (int v = v0; v < v_end; ++v) {
+            delta_data[v] = (cfg.v_head[v] - delta_data[v] * decay) * beta_gate;
+            y_head[v] = (decay * y_head[v] + qk_dot * delta_data[v]) * attention_scale;
+        }
+
+        const auto state_update_begin =
+            collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        for (int k = 0; k < cfg.head_dim_k; ++k) {
+            const float k_val = cfg.k_head[k] * k_inv_norm;
+            float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v + v0;
+            UpdateStateFromDelta(state_row, delta_data + v0, decay, k_val, chunk);
+        }
+        if (collect_timing) {
+            state_update_only_ms += ms_since(state_update_begin);
+        }
     }
     if (y_pre_norm) {
         std::memcpy(y_pre_norm, y_head, head_dim_v * sizeof(float));
     }
-
-    const auto state_update_begin =
-        collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    for (int k = 0; k < cfg.head_dim_k; ++k) {
-        const float k_val = cfg.k_head[k] * k_inv_norm;
-        float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
-        UpdateStateFromDelta(state_row, delta_data, decay, k_val, cfg.head_dim_v);
-    }
-    const double state_update_only_ms = collect_timing ? ms_since(state_update_begin) : 0.0;
 
     const auto rms_gate_begin =
         collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1107,6 +1344,18 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
     ApplyRmsNormGate(y_head, cfg.norm_weight, cfg.z_head, inv_rms, cfg.head_dim_v, cfg.use_fast_silu,
                      cfg.norm_weight_uses_unit_offset);
     const double rms_gate_ms = collect_timing ? ms_since(rms_gate_begin) : 0.0;
+#ifndef NDEBUG
+    if (debug_compare_untiled) {
+        constexpr float kQwen35FastDefaultEquivalenceTol = 1e-4f;
+        const size_t state_elems = static_cast<size_t>(cfg.head_dim_k) * static_cast<size_t>(cfg.head_dim_v);
+        assert(MaxAbsDiff(y_head, debug_y_ref.data(), head_dim_v) <= kQwen35FastDefaultEquivalenceTol);
+        assert(MaxAbsDiff(state_kv, debug_state_ref.data(), state_elems) <= kQwen35FastDefaultEquivalenceTol);
+        if (y_pre_norm) {
+            assert(MaxAbsDiff(y_pre_norm, debug_pre_norm_ref.data(), head_dim_v) <=
+                   kQwen35FastDefaultEquivalenceTol);
+        }
+    }
+#endif
     if (stats) {
         stats->alpha = alpha;
         stats->beta = beta;

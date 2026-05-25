@@ -1,6 +1,9 @@
 # DenseCore Helm Chart
 
-This chart wraps `dense-base` and supplies DenseCore-specific defaults for the API server.
+This chart wraps the DenseAI `dense-base` library chart and supplies DenseCore
+server defaults. The chart is intentionally model, cloud, and node-type neutral:
+SREs should choose the model source, resource shape, scheduling rules, network
+policy, and scaling signal for their own cluster.
 
 ## Install
 
@@ -8,7 +11,16 @@ From source:
 
 ```bash
 helm dependency update ./charts/densecore
-helm install densecore ./charts/densecore
+helm upgrade --install densecore ./charts/densecore -f values.yaml
+```
+
+The `dense-base` dependency is published from the DenseAI chart registry:
+
+```yaml
+dependencies:
+  - name: dense-base
+    version: 1.0.0
+    repository: oci://ghcr.io/DenseAI/charts
 ```
 
 ## What The Chart Deploys
@@ -16,60 +28,81 @@ helm install densecore ./charts/densecore
 - DenseCore API server
 - HTTP service on port `8080`
 - optional gRPC service on port `50051`
-- model init container by default
-- readiness, liveness, and startup probes
+- optional model init container
+- startup, readiness, and liveness probes
+- optional ServiceMonitor, KEDA ScaledObject, NetworkPolicy, PDB, and Grafana dashboards
 
-Most runtime settings live under `dense-base.*`.
+Most platform settings live under `dense-base.*`.
 
-## Important Defaults
+## SRE Override Surface
 
-The checked-in values currently default to:
+Use these values instead of editing templates:
 
-- server image: `denseai/densecore`
-- downloader image: `densecore/downloader:0.3.0`
-- HTTP port: `8080`
-- gRPC enabled: `true`
-- init-container model repo: `Qwen/Qwen2.5-0.5B-Instruct-GGUF`
-- init-container model file: `qwen2.5-0.5b-instruct-q4_k_m.gguf`
+- `dense-base.image.*`: server image repository, tag, and pull policy.
+- `dense-base.model.*`: model volume source, path, filename, and env var name.
+- `dense-base.initContainers`: model downloader or any product-specific bootstrap.
+- `dense-base.resources`: CPU and memory requests/limits.
+- `dense-base.nodeSelector`, `affinity`, `tolerations`, `topologySpreadConstraints`: provider-specific scheduling.
+- `dense-base.serviceMonitor.*`: Prometheus Operator scraping.
+- `dense-base.keda.triggers.custom`: inference-aware autoscaling signals.
+- `dense-base.networkPolicy.*`: explicit ingress and egress policy.
+- `dense-base.extraEnv`, `extraEnvFrom`, `extraVolumes`, `extraVolumeMounts`: cluster-specific extension points.
 
-## Common Overrides
+Top-level `autoscaling` and `networkPolicy` are legacy helpers kept for
+compatibility. Prefer `dense-base.keda` and `dense-base.networkPolicy` for new
+production installs.
+
+The checked-in defaults include a small Hugging Face model downloader so a
+development install can become ready without an external PVC. Treat that as a
+demo bootstrap, not as a production model policy. Production installs should
+normally replace `dense-base.initContainers`, `dense-base.model.*`, and
+`dense-base.resources` in their own values file.
+
+## Generic CPU Inference Override
+
+This example does not assume a cloud provider or model family. Replace the PVC,
+filename, resource shape, and scheduling labels with cluster-local values.
 
 ```yaml
 dense-base:
   image:
     repository: denseai/densecore
-    tag: "latest"
+    tag: "1.0.0"
 
   model:
     source: pvc
-    existingClaim: densecore-models-pvc
-    filename: main_model.gguf
+    existingClaim: densecore-models
+    path: /models
+    filename: model.gguf
+    envVarName: MAIN_MODEL_PATH
 
-  env:
-    - name: MAIN_MODEL_PATH
-      value: /models/main_model.gguf
-    - name: GRPC_ENABLED
-      value: "true"
-```
+  initContainers: []
 
-Apply:
+  resources:
+    requests:
+      cpu: "16"
+      memory: "64Gi"
+    limits:
+      cpu: "16"
+      memory: "64Gi"
 
-```bash
-helm upgrade --install densecore ./charts/densecore -f my-values.yaml
+  extraEnv:
+    - name: THREADS
+      value: "16"
+    - name: DENSECORE_MAX_NUM_SEQS
+      value: "4"
+
+  nodeSelector:
+    inference.dense.ai/cpu: "true"
+
+  tolerations: []
+  affinity: {}
 ```
 
 ## Autoscaling
 
-HPA:
-
-```yaml
-autoscaling:
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 10
-```
-
-KEDA through `dense-base`:
+For LLM inference, queue depth and active requests are usually better scaling
+signals than raw CPU utilization. Use KEDA when Prometheus is available:
 
 ```yaml
 autoscaling:
@@ -78,13 +111,157 @@ autoscaling:
 dense-base:
   keda:
     enabled: true
+    minReplicaCount: 1
+    maxReplicaCount: 10
+    triggers:
+      custom:
+        - type: prometheus
+          metadata:
+            serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+            metricName: densecore_pending_requests
+            threshold: "5"
+            query: sum(densecore_pending_requests)
+        - type: prometheus
+          metadata:
+            serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+            metricName: densecore_active_requests
+            threshold: "8"
+            query: sum(densecore_active_requests)
 ```
 
-Do not enable both HPA and KEDA at the same time.
-Validate KEDA behavior against your Prometheus/KEDA environment before treating it as the default production path.
+Do not enable top-level HPA and `dense-base.keda.enabled` at the same time.
+Avoid hiding missing scrape data with fallback PromQL such as `or vector(0)` in
+production autoscaling signals.
 
-## Notes
+## Prompt Cache Affinity
 
-- The chart uses `dense-base` as the main platform layer.
-- The model downloader creates `/models/main_model.gguf`.
-- For the full value surface, inspect [`values.yaml`](values.yaml).
+DenseCore prefix/KV cache is local to each pod. Multi-replica Kubernetes
+serving should route repeated conversation or document prefixes back to the
+same pod instead of using plain round-robin.
+
+Clients can send a stable key with either:
+
+- `X-DenseCore-Cache-Affinity`
+- `cache_control.affinity_key`
+- `cache_control.cache_id`
+- `cache_control.conversation_id`
+
+DenseCore returns the hashed key in `X-DenseCore-Cache-Affinity-Key` for client
+replay. Configure the ingress or service mesh to hash on
+`X-DenseCore-Cache-Affinity` before forwarding to the service. For NGINX
+Ingress:
+
+```yaml
+dense-base:
+  ingress:
+    enabled: true
+    annotations:
+      nginx.ingress.kubernetes.io/upstream-hash-by: "$http_x_densecore_cache_affinity"
+```
+
+Envoy/Istio deployments should use an equivalent route hash policy on the same
+header. This preserves pod-local cache hits without moving KV blocks through an
+external cache.
+
+## Monitoring
+
+DenseCore exposes DenseCloud HTTP RED metrics and DenseCore inference metrics on
+the same `/metrics` endpoint. Enable a ServiceMonitor when Prometheus Operator is
+installed:
+
+```yaml
+dense-base:
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: prometheus
+    path: /metrics
+```
+
+Optional Grafana dashboard ConfigMaps can be enabled separately:
+
+```yaml
+grafana:
+  dashboards:
+    enabled: true
+```
+
+## Network Policy
+
+Prefer the DenseCloud shared NetworkPolicy shape for new installs:
+
+```yaml
+networkPolicy:
+  enabled: false
+
+dense-base:
+  networkPolicy:
+    enabled: true
+    ingress:
+      enabled: true
+      allowAll: false
+      allowSameNamespace: false
+      peers:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+    egress:
+      enabled: true
+      allowDNS: true
+      allowAll: false
+      peers: []
+      ports: []
+```
+
+## Provider-Specific Scheduling
+
+Cloud and on-prem labels differ. Keep provider-specific placement in values:
+
+```yaml
+dense-base:
+  nodeSelector:
+    cloud.google.com/machine-family: c4
+
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: inference
+      effect: NoSchedule
+```
+
+Use the equivalent labels for AWS, Azure, bare metal, or private Kubernetes.
+
+## Validation
+
+Chart rendering only proves Kubernetes resources are valid. API readiness needs
+separate server checks:
+
+```bash
+python3 scripts/server_api_smoke.py --base-url http://127.0.0.1:8080
+```
+
+After loading a generation model, include chat and completion checks:
+
+```bash
+python3 scripts/server_api_smoke.py \
+  --base-url http://127.0.0.1:8080 \
+  --model-path /models/model.gguf \
+  --threads 16
+```
+
+If `/v1/embeddings` or `/v1/rerank` are part of the exposed product surface,
+run them against an embedding-capable DenseCore model and the matching
+Transformers reference:
+
+```bash
+python3 scripts/embedding_rerank_parity.py \
+  --base-url http://127.0.0.1:8080 \
+  --reference-model /models/reference-hf \
+  --densecore-model-path /models/embedding-model.gguf \
+  --min-cosine 0.9999
+```
+
+Generation-model chat QA does not prove embedding or rerank correctness.

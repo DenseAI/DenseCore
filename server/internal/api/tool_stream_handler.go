@@ -192,6 +192,86 @@ func splitReasoningResponse(modelHint, text string) (string, string) {
 	return splitGemma4ReasoningResponse(modelHint, text)
 }
 
+func (h *Handler) reasoningModelHint(req domain.ChatCompletionRequest) string {
+	current := ""
+	if h != nil && h.modelService != nil {
+		current = h.modelService.GetCurrentModel()
+	}
+	if isGemma4ModelHint(current) && !isGemma4ModelHint(req.Model) {
+		return current
+	}
+	if isQwen36ModelHint(current) && !isQwen36ModelHint(req.Model) {
+		return current
+	}
+	return apiFirstNonEmpty(req.Model, current)
+}
+
+type gemma4StreamFilter struct {
+	pending     string
+	started     bool
+	channelMode bool
+}
+
+func newGemma4StreamFilter() *gemma4StreamFilter {
+	return &gemma4StreamFilter{}
+}
+
+func (f *gemma4StreamFilter) Filter(token string) string {
+	if f == nil || token == "" {
+		return token
+	}
+	if f.started {
+		if !f.channelMode {
+			return token
+		}
+		return stripGemma4StreamMarkers(token)
+	}
+
+	f.pending += token
+	trimmed := strings.TrimLeft(f.pending, " \t\r\n")
+	const marker = "<|channel>"
+	if strings.HasPrefix(marker, trimmed) {
+		return ""
+	}
+	if !strings.HasPrefix(trimmed, marker) {
+		out := f.pending
+		f.pending = ""
+		f.started = true
+		return out
+	}
+
+	const bodyMarker = "<channel|>"
+	bodyStart := strings.Index(trimmed, bodyMarker)
+	if bodyStart < 0 {
+		return ""
+	}
+	body := strings.TrimLeft(trimmed[bodyStart+len(bodyMarker):], " \t\r\n")
+	f.pending = ""
+	f.started = true
+	f.channelMode = true
+	return stripGemma4StreamMarkers(body)
+}
+
+func stripGemma4StreamMarkers(token string) string {
+	const marker = "<|channel>"
+	const bodyMarker = "<channel|>"
+	if token == "" {
+		return ""
+	}
+	if idx := strings.Index(token, marker); idx >= 0 {
+		prefix := token[:idx]
+		rest := token[idx+len(marker):]
+		if bodyIdx := strings.Index(rest, bodyMarker); bodyIdx >= 0 {
+			return prefix + strings.TrimLeft(rest[bodyIdx+len(bodyMarker):], " \t\r\n")
+		}
+		return prefix
+	}
+	if idx := strings.Index(token, bodyMarker); idx >= 0 {
+		return strings.TrimLeft(token[idx+len(bodyMarker):], " \t\r\n")
+	}
+	return token
+}
+
 func splitQwenThinkResponse(text string) (string, string) {
 	const openTag = "<think>"
 	const closeTag = "</think>"
@@ -269,6 +349,9 @@ func splitGemma4ReasoningResponse(modelHint, text string) (string, string) {
 	if reasoning.Len() == 0 {
 		return sanitizeGemma4VisibleContent(text), ""
 	}
+	if content.Len() == 0 {
+		return sanitizeGemma4VisibleContent(reasoning.String()), ""
+	}
 	return sanitizeGemma4VisibleContent(content.String()), sanitizeGemma4VisibleContent(reasoning.String())
 }
 
@@ -293,6 +376,24 @@ func sanitizeGemma4VisibleContent(text string) string {
 func stripGemma4BareThoughtPrelude(text string) string {
 	trimmed := strings.TrimSpace(text)
 	lower := strings.ToLower(trimmed)
+	for _, channel := range []string{
+		"<|channel>thought",
+		"<|channel>analysis",
+		"<|channel>final",
+		"<|channel>answer",
+	} {
+		if !strings.HasPrefix(lower, channel) {
+			continue
+		}
+		body := strings.TrimSpace(trimmed[len(channel):])
+		if strings.HasPrefix(body, "<channel|>") {
+			body = strings.TrimSpace(strings.TrimPrefix(body, "<channel|>"))
+		}
+		if newline := strings.IndexByte(body, '\n'); newline == 0 {
+			body = strings.TrimSpace(body[1:])
+		}
+		return body
+	}
 	for _, prefix := range []string{"thought\r\n", "thought\n"} {
 		if strings.HasPrefix(lower, prefix) {
 			trimmed = strings.TrimSpace(trimmed[len(prefix):])

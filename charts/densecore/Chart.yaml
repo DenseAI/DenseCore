@@ -12,8 +12,8 @@ appVersion: "1.0.0"
 
 dependencies:
   - name: dense-base
-    version: 0.3.0
-    repository: oci://ghcr.io/denseseries/charts
+    version: 1.0.0
+    repository: oci://ghcr.io/DenseAI/charts
 
 keywords:
   - llm
@@ -25,22 +25,22 @@ keywords:
   - openai
   - machine-learning
 
-home: https://github.com/DenseCore/DenseCore
+home: https://github.com/DenseAI/DenseCore
 
 sources:
-  - https://github.com/DenseCore/DenseCore
+  - https://github.com/DenseAI/DenseCore
 
 maintainers:
   - name: DenseCore Team
     email: maintainers@densecore.dev
 
-icon: https://raw.githubusercontent.com/DenseCore/DenseCore/main/docs/images/logo.png
+icon: https://raw.githubusercontent.com/DenseAI/DenseCore/main/docs/images/logo.png
 
 annotations:
   category: AI/ML
   artifacthub.io/license: Apache-2.0
   artifacthub.io/links: |
     - name: Documentation
-      url: https://github.com/DenseCore/DenseCore/tree/main/docs
+      url: https://github.com/DenseAI/DenseCore/tree/main/docs
     - name: Docker Hub
-      url: https://hub.docker.com/r/densecore/densecore
+      url: https://hub.docker.com/r/denseai/densecore

@@ -4006,6 +4006,26 @@ static bool ShouldRunPortableFlashParityCheck(int layer) {
     return false;
 }
 
+static bool IsPortableFlashReferenceFallbackForced() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_PORTABLE_FLASH_ATTN_FORCE_REFERENCE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool ShouldUsePortableFlashHeadSeqReferenceFallback(bool explicit_debug_reference) {
+    return explicit_debug_reference;
+}
+
+static constexpr bool CompiledWithX86Avx512ForFlashAttention() {
+#if defined(__AVX512F__)
+    return true;
+#else
+    return false;
+#endif
+}
+
 static void ComputeFlashAttentionReference(const float* q, const float* k, const float* v, float* out, int n_head,
                                            int n_head_kv, int seq_q, int seq_kv, int head_dim, float scale, bool causal,
                                            int q_start_offset, int kv_start_offset, int sliding_window,
@@ -4213,22 +4233,40 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
             const float* v_data = reinterpret_cast<const float*>(v->data);
             float* o_data = reinterpret_cast<float*>(dst->data);
 
-            #if defined(DENSECORE_X86) && !defined(__AVX512F__)
+            const bool force_reference =
+                ShouldUsePortableFlashHeadSeqReferenceFallback(IsPortableFlashReferenceFallbackForced());
             if (ith == 0) {
+                if (auto* work_ctx = GetCurrentWorkContext()) {
+                    auto& profile = work_ctx->qwen36_profile;
+                    profile.flash_attention_headseq_prefill_calls.fetch_add(1, std::memory_order_relaxed);
+                    profile.flash_attention_last_nth.store(nth, std::memory_order_relaxed);
+                    profile.flash_attention_last_active_threads.store(
+                        force_reference ? 1 : std::max(1, std::min(nth, n_head)), std::memory_order_relaxed);
+                    if (force_reference) {
+                        profile.flash_attention_reference_calls.fetch_add(1, std::memory_order_relaxed);
+                    } else if (CompiledWithX86Avx512ForFlashAttention()) {
+                        profile.flash_attention_avx512_tiled_calls.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        profile.flash_attention_non_avx512_tiled_calls.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+
+            if (force_reference) {
+                if (ith != 0) {
+                    return;
+                }
                 ComputeFlashAttentionReference(q_data, k_data, v_data, o_data, n_head, n_head_kv, seq_q, seq_kv,
                                                head_dim, params->data.scale, params->data.causal != 0,
                                                params->data.q_start_offset, params->data.kv_start_offset,
                                                params->data.sliding_window, params->data.logit_softcap);
-            }
-            #else
-            if (n_head == n_head_kv) {
+            } else if (n_head == n_head_kv) {
                 densecore::FlashAttentionBatched(q_data, k_data, v_data, o_data, 1, n_head, seq_q, seq_kv, head_dim,
                                                  config, ith, nth);
             } else {
                 densecore::FlashAttentionGQA(q_data, k_data, v_data, o_data, 1, n_head, n_head_kv, seq_q, seq_kv,
                                              head_dim, config, ith, nth);
             }
-            #endif
         } else {
             if (seq_q != 1 || q->nb[0] != sizeof(float) || k->nb[0] != sizeof(float) || v->nb[0] != sizeof(float) ||
                 dst->nb[0] != sizeof(float)) {
@@ -4243,6 +4281,16 @@ void cb_flash_attention_hal_custom(struct ggml_tensor* dst, int ith, int nth, vo
             const int work_start = ith * work_per_thread;
             const int work_end = std::min(total_work, work_start + work_per_thread);
             const int n_rep = n_head / n_head_kv;
+
+            if (ith == 0) {
+                if (auto* work_ctx = GetCurrentWorkContext()) {
+                    auto& profile = work_ctx->qwen36_profile;
+                    profile.flash_attention_native_decode_calls.fetch_add(1, std::memory_order_relaxed);
+                    profile.flash_attention_last_nth.store(nth, std::memory_order_relaxed);
+                    profile.flash_attention_last_active_threads.store(std::max(1, std::min(nth, n_head)),
+                                                                      std::memory_order_relaxed);
+                }
+            }
 
             const float* q_data = reinterpret_cast<const float*>(q->data);
             const float* k_data = reinterpret_cast<const float*>(k->data);

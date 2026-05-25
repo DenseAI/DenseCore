@@ -4869,67 +4869,6 @@ inline void GemvParallel(float* output, const float* x, const float* weight, int
 }
 
 // =============================================================================
-// Quantized Dot Product Dispatcher (defined in simd_ops.cpp)
-// =============================================================================
-// These functions use GGML's native vec_dot kernels for zero-allocation
-// dot products. The input must be PRE-QUANTIZED by the caller.
-// =============================================================================
-
-/**
- * @brief Compute dot product between quantized weight row and pre-quantized
- * input
- *
- * Uses GGML's native vec_dot kernels for maximum performance.
- * ZERO ALLOCATION: No memory is allocated inside this function.
- *
- * @param weight_type GGML type of the weight row (e.g., GGML_TYPE_Q4_K)
- * @param w_row Pointer to quantized weight row
- * @param input Pointer to PRE-QUANTIZED input (Q8_K for K-quants, Q8_0 for
- * Q8_0, F32 for F32)
- * @param n Number of elements
- * @param output Pointer to output scalar (single float result)
- *
- * NOTE: The caller must pre-quantize the input to the correct format:
- *   - Q4_K, Q5_K, Q6_K weights → input must be Q8_K
- *   - Q8_0 weights → input must be Q8_0
- *   - F32/F16 weights → input must be F32
- */
-void ComputeDotProduct(int weight_type, const void* w_row, const void* input, int n, float* output);
-
-/**
- * @brief Compute multiple dot products for a range of output rows
- *
- * Uses native vec_dot kernels with pre-quantized input for zero-allocation
- * performance. Useful for parallel GEMV where each thread handles a subset
- * of output rows.
- *
- * @param weight_type GGML type of the weight tensor
- * @param weight Base pointer to weight tensor data
- * @param row_stride Stride in bytes between rows
- * @param input Pre-quantized input vector (same format requirements as above)
- * @param n Number of elements per row
- * @param output Float output vector [k_end - k_start]
- * @param k_start First output row index (inclusive)
- * @param k_end Last output row index (exclusive)
- */
-void ComputeDotProductBatch(int weight_type, const void* weight, size_t row_stride, const void* input, int n,
-                            float* output, int k_start, int k_end);
-
-/**
- * @brief Query the maximum supported buffer size for dequantization
- * @return Maximum number of float elements that can be dequantized
- * @note With pre-quantization, this is less relevant but kept for API compat
- */
-size_t GetDequantizationBufferSize();
-
-/**
- * @brief Check if a GGML type is supported by ComputeDotProduct
- * @param type GGML type to check
- * @return true if type is supported, false otherwise
- */
-bool IsTypeSupported(int type);
-
-// =============================================================================
 // SiLU×Mul Fused Kernel (SwiGLU FFN Optimization)
 // =============================================================================
 // Computes: out[i] = silu(gate[i]) * up[i]

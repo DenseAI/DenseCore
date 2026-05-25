@@ -165,6 +165,13 @@ struct Qwen36ProfileCounters {
     std::atomic<int> attention_path_portable_flash{0};
     std::atomic<int> attention_path_native_flash{0};
     std::atomic<int> attention_path_hal{0};
+    std::atomic<uint64_t> flash_attention_headseq_prefill_calls{0};
+    std::atomic<uint64_t> flash_attention_native_decode_calls{0};
+    std::atomic<uint64_t> flash_attention_reference_calls{0};
+    std::atomic<uint64_t> flash_attention_non_avx512_tiled_calls{0};
+    std::atomic<uint64_t> flash_attention_avx512_tiled_calls{0};
+    std::atomic<int> flash_attention_last_nth{0};
+    std::atomic<int> flash_attention_last_active_threads{0};
     std::atomic<int> kleidiai_compiled_enabled{0};
     std::atomic<int> kleidiai_last_reject_reason{0};
 };
@@ -444,10 +451,16 @@ static void AddMatmulShapeCensusEntry(std::vector<MatmulShapeCensusEntry>* entri
         return;
     }
     for (auto& existing : *entries) {
-        if (existing.phase == entry.phase && existing.dispatch_path == entry.dispatch_path &&
-            existing.weight_type == entry.weight_type && existing.shape_bucket == entry.shape_bucket &&
+        if (existing.phase == entry.phase && existing.op_type == entry.op_type &&
+            existing.dispatch_path == entry.dispatch_path && existing.weight_type == entry.weight_type &&
+            existing.weight_class == entry.weight_class && existing.shape_bucket == entry.shape_bucket &&
             existing.left_name == entry.left_name && existing.right_name == entry.right_name) {
             existing.ops += entry.ops;
+            existing.wall_ns += entry.wall_ns;
+            existing.calls += entry.calls;
+            existing.active_threads = std::max(existing.active_threads, entry.active_threads);
+            existing.contiguous_or_copy_input =
+                std::max(existing.contiguous_or_copy_input, entry.contiguous_or_copy_input);
             return;
         }
     }
@@ -459,8 +472,10 @@ static void SortAndTrimMatmulShapeCensusEntries(std::vector<MatmulShapeCensusEnt
         return;
     }
     std::sort(entries->begin(), entries->end(), [](const auto& a, const auto& b) {
-        if (a.ops != b.ops) {
-            return a.ops > b.ops;
+        const uint64_t a_cost = a.wall_ns != 0 ? a.wall_ns : a.ops;
+        const uint64_t b_cost = b.wall_ns != 0 ? b.wall_ns : b.ops;
+        if (a_cost != b_cost) {
+            return a_cost > b_cost;
         }
         return a.shape_bucket < b.shape_bucket;
     });
@@ -699,6 +714,13 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.attention_path_portable_flash.store(0, std::memory_order_relaxed);
     p.attention_path_native_flash.store(0, std::memory_order_relaxed);
     p.attention_path_hal.store(0, std::memory_order_relaxed);
+    p.flash_attention_headseq_prefill_calls.store(0, std::memory_order_relaxed);
+    p.flash_attention_native_decode_calls.store(0, std::memory_order_relaxed);
+    p.flash_attention_reference_calls.store(0, std::memory_order_relaxed);
+    p.flash_attention_non_avx512_tiled_calls.store(0, std::memory_order_relaxed);
+    p.flash_attention_avx512_tiled_calls.store(0, std::memory_order_relaxed);
+    p.flash_attention_last_nth.store(0, std::memory_order_relaxed);
+    p.flash_attention_last_active_threads.store(0, std::memory_order_relaxed);
     p.kleidiai_compiled_enabled.store(densecore::runtime::KleidiAICompiledEnabled() ? 1 : 0,
                                       std::memory_order_relaxed);
     p.kleidiai_last_reject_reason.store(
@@ -948,6 +970,18 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.attention_path_portable_flash = p.attention_path_portable_flash.load(std::memory_order_relaxed);
     snapshot.attention_path_native_flash = p.attention_path_native_flash.load(std::memory_order_relaxed);
     snapshot.attention_path_hal = p.attention_path_hal.load(std::memory_order_relaxed);
+    snapshot.flash_attention_headseq_prefill_calls =
+        p.flash_attention_headseq_prefill_calls.load(std::memory_order_relaxed);
+    snapshot.flash_attention_native_decode_calls =
+        p.flash_attention_native_decode_calls.load(std::memory_order_relaxed);
+    snapshot.flash_attention_reference_calls = p.flash_attention_reference_calls.load(std::memory_order_relaxed);
+    snapshot.flash_attention_non_avx512_tiled_calls =
+        p.flash_attention_non_avx512_tiled_calls.load(std::memory_order_relaxed);
+    snapshot.flash_attention_avx512_tiled_calls =
+        p.flash_attention_avx512_tiled_calls.load(std::memory_order_relaxed);
+    snapshot.flash_attention_last_nth = p.flash_attention_last_nth.load(std::memory_order_relaxed);
+    snapshot.flash_attention_last_active_threads =
+        p.flash_attention_last_active_threads.load(std::memory_order_relaxed);
     snapshot.kleidiai_compiled_enabled = p.kleidiai_compiled_enabled.load(std::memory_order_relaxed);
     snapshot.kleidiai_last_reject_reason = p.kleidiai_last_reject_reason.load(std::memory_order_relaxed);
     return snapshot;
