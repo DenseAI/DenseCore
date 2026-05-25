@@ -25,6 +25,16 @@ const (
 
 	// DefaultMetricsNamespace is the default Prometheus metric namespace.
 	DefaultMetricsNamespace = "densecore"
+
+	// CacheAffinityRequestHeader is the request header that gateways may
+	// hash on before forwarding to DenseCore pods.
+	CacheAffinityRequestHeader = "X-DenseCore-Cache-Affinity"
+	// CacheAffinityResponseHeader returns DenseCore's canonical hashed route
+	// key for observability and client-side sticky routing.
+	CacheAffinityResponseHeader = "X-DenseCore-Cache-Affinity-Key"
+	// CacheAffinitySourceHeader identifies which request field produced the
+	// response affinity key.
+	CacheAffinitySourceHeader = "X-DenseCore-Cache-Affinity-Source"
 )
 
 type Handler struct {
@@ -49,6 +59,8 @@ type RuntimeTuningProfile struct {
 	KVTargetMB               int    `json:"kv_target_mb,omitempty"`
 	TokenIDSubmit            bool   `json:"token_id_submit_default"`
 	PrefixCacheAuto          bool   `json:"prefix_cache_auto"`
+	CacheAffinityHeader      string `json:"cache_affinity_header"`
+	CacheAffinityEnabled     bool   `json:"cache_affinity_enabled"`
 	SSMSnapshotAuto          bool   `json:"ssm_snapshot_restore_auto"`
 	PrefillArenaReuse        bool   `json:"prefill_arena_reuse"`
 	DecodeGraphCacheMaxBatch int    `json:"decode_graph_cache_max_batch,omitempty"`

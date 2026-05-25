@@ -50,6 +50,15 @@ paths:
       responses:
         '200':
           description: OK
+          headers:
+            X-DenseCore-Cache-Affinity-Key:
+              description: Opaque hashed route key suitable for sticky client or gateway routing.
+              schema:
+                type: string
+            X-DenseCore-Cache-Affinity-Source:
+              description: Request field used to derive the cache affinity key.
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -224,6 +233,8 @@ components:
         frequency_penalty:
           type: number
           default: 0
+        cache_control:
+          $ref: '#/components/schemas/CacheControl'
         tools:
           type: array
           items:
@@ -244,6 +255,22 @@ components:
                     name:
                       type: string
           description: Controls which tool is called
+
+    CacheControl:
+      type: object
+      properties:
+        type:
+          type: string
+          description: Optional cache policy label for compatible clients.
+        conversation_id:
+          type: string
+          description: Stable conversation identifier used for prompt-cache lineage and pod affinity.
+        cache_id:
+          type: string
+          description: Stable document/session cache identifier used for prompt-cache lineage and pod affinity.
+        affinity_key:
+          type: string
+          description: Explicit Kubernetes routing key. DenseCore hashes this before returning it in affinity headers.
 
     ChatCompletionMessage:
       type: object

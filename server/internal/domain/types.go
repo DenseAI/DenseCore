@@ -185,6 +185,10 @@ type CacheControl struct {
 	Type           string `json:"type,omitempty"`
 	ConversationID string `json:"conversation_id,omitempty"`
 	CacheID        string `json:"cache_id,omitempty"`
+	// AffinityKey is a caller-provided stable routing key for Kubernetes
+	// ingress/gateway hash policies. It is hashed before it is emitted in
+	// response headers or metrics-adjacent logs.
+	AffinityKey string `json:"affinity_key,omitempty"`
 }
 
 type Message struct {

@@ -734,6 +734,7 @@ func buildPromptCacheIdentity(req domain.ChatCompletionRequest, prepared prepare
 	if req.CacheControl != nil {
 		identity.ConversationID = req.CacheControl.ConversationID
 		identity.CacheID = req.CacheControl.CacheID
+		identity.AffinityKey = req.CacheControl.AffinityKey
 	}
 	if isQwen35Request(modelID, prepared.modelVariant) || isQwen36Request(modelID, prepared.modelVariant) {
 		identity.RequiresSSM = true
@@ -785,7 +786,7 @@ func cacheIDForLog(req domain.ChatCompletionRequest) string {
 	if req.CacheControl == nil {
 		return ""
 	}
-	return firstNonEmpty(req.CacheControl.CacheID, req.CacheControl.ConversationID)
+	return firstNonEmpty(req.CacheControl.CacheID, req.CacheControl.ConversationID, req.CacheControl.AffinityKey)
 }
 
 func promptFamilyName(family promptFamily) string {

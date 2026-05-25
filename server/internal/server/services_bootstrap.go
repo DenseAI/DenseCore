@@ -103,6 +103,8 @@ func assembleServices(cfg *config.ServerConfig, tuning runtimeTuning, registerRo
 			KVTargetMB:               cfg.KVTargetMB,
 			TokenIDSubmit:            true,
 			PrefixCacheAuto:          !envFlagEnabled("DENSECORE_DEBUG_DISABLE_PREFIX_CACHE_REUSE"),
+			CacheAffinityHeader:      api.CacheAffinityRequestHeader,
+			CacheAffinityEnabled:     cfg.LLMAPIEnabled,
 			SSMSnapshotAuto:          !envFlagEnabled("DENSECORE_DEBUG_DISABLE_HYBRID_SSM_RESTORE"),
 			PrefillArenaReuse:        !envFlagEnabled("DENSECORE_DEBUG_DISABLE_GRAPH_CACHE_REUSE"),
 			DecodeGraphCacheMaxBatch: envIntDefault("DENSECORE_DECODE_GRAPH_CACHE_MAX_BATCH", minInt(maxInt(cfg.MaxNumSeqs, 16), 32)),

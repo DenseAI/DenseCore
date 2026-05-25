@@ -32,6 +32,8 @@ func TestRuntimeProfileHandlerIncludesRuntimeTuning(t *testing.T) {
 			KVTargetMB:               4096,
 			TokenIDSubmit:            true,
 			PrefixCacheAuto:          true,
+			CacheAffinityHeader:      CacheAffinityRequestHeader,
+			CacheAffinityEnabled:     true,
 			SSMSnapshotAuto:          true,
 			DecodeGraphCacheMaxBatch: 16,
 			MoEDequantCacheMB:        512,
@@ -73,6 +75,9 @@ func TestRuntimeProfileHandlerIncludesRuntimeTuning(t *testing.T) {
 	}
 	if !response.RuntimeTuning.TokenIDSubmit {
 		t.Fatal("expected token-id submit default to be reported")
+	}
+	if response.RuntimeTuning.CacheAffinityHeader != CacheAffinityRequestHeader || !response.RuntimeTuning.CacheAffinityEnabled {
+		t.Fatalf("unexpected cache affinity profile: %+v", response.RuntimeTuning)
 	}
 	if response.RuntimeTuning.DecodeGraphCacheMaxBatch != 16 {
 		t.Fatalf("DecodeGraphCacheMaxBatch = %d, want 16", response.RuntimeTuning.DecodeGraphCacheMaxBatch)

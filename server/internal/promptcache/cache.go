@@ -45,6 +45,7 @@ type Identity struct {
 	ParserFamily     string
 	ConversationID   string
 	CacheID          string
+	AffinityKey      string
 	RequiresSSM      bool
 	HasSSMSnapshot   bool
 	Supported        bool
@@ -230,7 +231,7 @@ func (m *Manager) Store(identity Identity, tokens []int) {
 	}
 	m.entries[key] = e
 	m.lineage[lineage] = append(m.lineage[lineage], key)
-	if identity.ConversationID != "" || identity.CacheID != "" {
+	if identity.ConversationID != "" || identity.CacheID != "" || identity.AffinityKey != "" {
 		sessionLineage := sessionLineageKey(identity)
 		m.lineage[sessionLineage] = append(m.lineage[sessionLineage], key)
 	}
@@ -248,7 +249,7 @@ func (m *Manager) Clear() {
 
 func (m *Manager) longestVerifiedPrefixLocked(identity Identity, tokens []int) int {
 	lineages := []string{lineageKey(identity)}
-	if identity.ConversationID != "" || identity.CacheID != "" {
+	if identity.ConversationID != "" || identity.CacheID != "" || identity.AffinityKey != "" {
 		lineages = append([]string{sessionLineageKey(identity)}, lineages...)
 	}
 	best := 0
@@ -351,7 +352,7 @@ func lineageKey(identity Identity) string {
 }
 
 func sessionLineageKey(identity Identity) string {
-	return lineageKey(identity) + "\x00" + identity.ConversationID + "\x00" + identity.CacheID
+	return lineageKey(identity) + "\x00" + identity.ConversationID + "\x00" + identity.CacheID + "\x00" + identity.AffinityKey
 }
 
 func commonPrefix(a, b []int) int {
@@ -383,6 +384,9 @@ type MetricsSnapshot struct {
 	PromptCacheEvictionsTotal      uint64
 	PromptCacheTokensReusedTotal   uint64
 	PromptCachePrefillSkippedTotal uint64
+	CacheAffinityKeyTotal          uint64
+	CacheAffinityExplicitTotal     uint64
+	CacheAffinityFallbackTotal     uint64
 	PromptCacheLookupSeconds       float64
 	PromptCacheRestoreSeconds      float64
 	SSMSnapshotHitTotal            uint64
@@ -397,11 +401,23 @@ var metrics struct {
 	promptCacheEvictions      atomic.Uint64
 	promptCacheTokensReused   atomic.Uint64
 	promptCachePrefillSkipped atomic.Uint64
+	cacheAffinityKey          atomic.Uint64
+	cacheAffinityExplicit     atomic.Uint64
+	cacheAffinityFallback     atomic.Uint64
 	promptCacheLookupNanos    atomic.Uint64
 	promptCacheRestoreNanos   atomic.Uint64
 	ssmSnapshotHit            atomic.Uint64
 	ssmSnapshotMiss           atomic.Uint64
 	ssmSnapshotRestoreFailure atomic.Uint64
+}
+
+func RecordAffinityKey(explicit bool) {
+	metrics.cacheAffinityKey.Add(1)
+	if explicit {
+		metrics.cacheAffinityExplicit.Add(1)
+	} else {
+		metrics.cacheAffinityFallback.Add(1)
+	}
 }
 
 func SnapshotMetrics() MetricsSnapshot {
@@ -412,6 +428,9 @@ func SnapshotMetrics() MetricsSnapshot {
 		PromptCacheEvictionsTotal:      metrics.promptCacheEvictions.Load(),
 		PromptCacheTokensReusedTotal:   metrics.promptCacheTokensReused.Load(),
 		PromptCachePrefillSkippedTotal: metrics.promptCachePrefillSkipped.Load(),
+		CacheAffinityKeyTotal:          metrics.cacheAffinityKey.Load(),
+		CacheAffinityExplicitTotal:     metrics.cacheAffinityExplicit.Load(),
+		CacheAffinityFallbackTotal:     metrics.cacheAffinityFallback.Load(),
 		PromptCacheLookupSeconds:       float64(metrics.promptCacheLookupNanos.Load()) / float64(time.Second),
 		PromptCacheRestoreSeconds:      float64(metrics.promptCacheRestoreNanos.Load()) / float64(time.Second),
 		SSMSnapshotHitTotal:            metrics.ssmSnapshotHit.Load(),

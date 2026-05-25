@@ -76,6 +76,19 @@ func TestPartialPrefixReuseAndTokenVerification(t *testing.T) {
 	}
 }
 
+func TestAffinityKeyScopesVerifiedPrefixLineage(t *testing.T) {
+	m := NewManager(Config{Mode: ModeOn, TTL: time.Hour})
+	id := baseIdentity()
+	id.AffinityKey = "tenant-a/document-a"
+	m.LookupAndStore(id, []int{1, 2, 3, 4})
+
+	extended := id
+	got := m.LookupAndStore(extended, []int{1, 2, 3, 9})
+	if !got.Hit || got.ReusedTokens != 3 {
+		t.Fatalf("expected affinity-key lineage to reuse verified prefix, got %#v", got)
+	}
+}
+
 func TestTTLEvictionAndMemoryPressure(t *testing.T) {
 	now := time.Unix(100, 0)
 	m := NewManager(Config{Mode: ModeOn, TTL: time.Second, MaxBytes: 16, MaxSessions: 8})

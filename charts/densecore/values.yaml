@@ -133,6 +133,16 @@ dense-base:
     enabled: false
     className: ""
     annotations: {}
+    # DenseCore prefix/KV cache is pod-local. For multi-replica serving, configure
+    # the ingress or service mesh to hash on X-DenseCore-Cache-Affinity so
+    # repeated conversation/document prefixes return to the same warm pod.
+    #
+    # NGINX Ingress example:
+    # annotations:
+    #   nginx.ingress.kubernetes.io/upstream-hash-by: "$http_x_densecore_cache_affinity"
+    #
+    # Envoy/Istio users should configure a header_hash_policy for
+    # X-DenseCore-Cache-Affinity on the route or destination rule layer.
     hosts:
       - host: densecore.local
         paths:
@@ -263,6 +273,10 @@ dense-base:
     - name: OTEL_SAMPLING_RATE
       value: "1.0"
   extraEnv: []
+  # Clients or gateways should set X-DenseCore-Cache-Affinity or
+  # cache_control.affinity_key/cache_id/conversation_id on /v1/chat/completions.
+  # DenseCore returns X-DenseCore-Cache-Affinity-Key for client replay and emits
+  # cache_affinity_* Prometheus counters for routing coverage.
   extraEnvFrom: []
 
   initContainers:

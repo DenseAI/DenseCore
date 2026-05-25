@@ -59,11 +59,14 @@ func (h *Handler) ChatCompletionHandler(w http.ResponseWriter, r *http.Request) 
 		modelID, _, _ := h.modelService.GetModelIdentity()
 		req.Model = modelID
 	}
+	affinity := applyCacheAffinity(w, r, &req)
 
 	slog.Info("processing chat completion request",
 		slog.String("model", req.Model),
 		slog.Int("max_tokens", req.MaxTokens),
 		slog.Bool("stream", req.Stream),
+		slog.String("cache_affinity_key", affinity.Key),
+		slog.String("cache_affinity_source", affinity.Source),
 	)
 	logHandlerOverhead("chat", handlerDecodeMS)
 
