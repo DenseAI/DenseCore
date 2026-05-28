@@ -390,6 +390,12 @@ bool ResolveQ4KTrueBatchedKernelPolicyForTest(int simd_level, bool compiled_with
     return ::ResolveQ4KTrueBatchedKernelEnabledPolicy(static_cast<densecore::simd::SimdLevel>(simd_level),
                                                       compiled_with_sve);
 }
+float Gemma4GeluTanhExactForTest(float x) {
+    return ::Gemma4GeluTanh(x);
+}
+float Gemma4GeluTanhApproxForTest(float x) {
+    return ::Gemma4GeluTanhApproxScalar(x);
+}
 bool ShouldUsePortableFlashHeadSeqReferenceFallbackForTest(bool explicit_debug_reference) {
     return ::ShouldUsePortableFlashHeadSeqReferenceFallback(explicit_debug_reference);
 }
@@ -432,6 +438,17 @@ bool RunQ4KCopiedGemvExperimentRowsForTest(const void* weight_data, const void* 
                                            bool* cache_hit) {
     return ::RunQ4KCopiedGemvExperimentRows(weight_data, q8_input, model_identity, rows, cols, lora_epoch, output,
                                             cache_hit);
+}
+bool RunQwen35NativeMoEQ4KQ8KDotRowForTest(const void* weight_row, const void* q8_input, int64_t cols,
+                                           float* output) {
+    return ::Qwen35NativeMoEQ4KQ8KDotRow(weight_row, static_cast<const uint8_t*>(q8_input), cols, output);
+}
+bool RunQwen35NativeMoEQ5KQ8KDotRowForTest(const void* weight_row, const void* q8_input, int64_t cols,
+                                           float* output) {
+    return densecore::hwy_kernels::DotQ5KQ8K_Hwy(weight_row, q8_input, cols, output);
+}
+bool RunQwen35NativeQuantizeRowQ8KForTest(const float* input, void* q8_output, int64_t cols) {
+    return ::Qwen35NativeQuantizeRowQ8K(input, static_cast<uint8_t*>(q8_output), cols);
 }
 void ClearQ4KCopiedGemvExperimentCacheForTest(uintptr_t model_identity) {
     ::ClearQ4KCopiedGemvExperimentCacheForModel(model_identity);

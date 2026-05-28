@@ -104,6 +104,12 @@ struct Qwen36ProfileCounters {
     std::array<std::atomic<uint64_t>, kMatmulPathHistCount> decode_matmul_path_hist{};
     std::array<std::atomic<uint64_t>, kMatmulWeightTypeHistCount> prefill_matmul_weight_type_hist{};
     std::array<std::atomic<uint64_t>, kMatmulPathHistCount> prefill_matmul_path_hist{};
+    std::atomic<uint64_t> qwen_target_ggml_compute_ops{0};
+    std::atomic<uint64_t> qwen_target_ggml_matmul_ops{0};
+    std::atomic<uint64_t> qwen_target_ggml_matmul_id_ops{0};
+    std::atomic<uint64_t> qwen_target_ggml_quant_vecdot_ops{0};
+    std::atomic<uint64_t> qwen_target_ggml_quantize_kv_ops{0};
+    std::atomic<uint64_t> qwen_target_ggml_attention_ops{0};
     std::atomic<uint64_t> q6k_gemv_seen_ops{0};
     std::atomic<uint64_t> q6k_gemv_candidate_ops{0};
     std::atomic<uint64_t> q6k_gemv_used_ops{0};
@@ -122,6 +128,55 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> moe_q4k_repacked_candidate_ops{0};
     std::atomic<uint64_t> moe_q4k_repacked_used_ops{0};
     std::atomic<uint64_t> moe_q4k_repacked_rejected_ops{0};
+    std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_candidate_ops{0};
+    std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_used_ops{0};
+    std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_rejected_ops{0};
+    std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_gate_up_used{0};
+    std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_down_used{0};
+    std::atomic<uint64_t> gemma4_native_moe_prefill_candidate_layers{0};
+    std::atomic<uint64_t> gemma4_native_moe_prefill_used_layers{0};
+    std::atomic<uint64_t> gemma4_native_moe_prefill_rejected_layers{0};
+    std::atomic<uint64_t> gemma4_native_moe_prefill_gate_up_ns{0};
+    std::atomic<uint64_t> gemma4_native_moe_prefill_down_ns{0};
+    std::atomic<uint64_t> gemma4_native_moe_prefill_total_ns{0};
+    std::atomic<uint64_t> gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops{0};
+    std::atomic<uint64_t> gemma4_native_moe_prefill_duplicate_work_detected{0};
+    std::atomic<uint64_t> gemma4_dense_prefill_native_candidate_ops{0};
+    std::atomic<uint64_t> gemma4_dense_prefill_native_used_ops{0};
+    std::atomic<uint64_t> gemma4_dense_prefill_native_rejected_ops{0};
+    std::atomic<uint64_t> gemma4_dense_prefill_native_q4k_ops{0};
+    std::atomic<uint64_t> gemma4_dense_prefill_native_q8_0_ops{0};
+    std::atomic<uint64_t> gemma4_dense_prefill_native_ns{0};
+    std::atomic<uint64_t> gemma4_dense_prefill_replaced_ggml_mul_mat_ops{0};
+    std::atomic<uint64_t> gemma4_dense_prefill_duplicate_work_detected{0};
+    std::atomic<uint64_t> gemma4_fast_gelu_enabled{0};
+    std::atomic<uint64_t> gemma4_fast_gelu_used{0};
+    std::atomic<uint64_t> gemma4_fast_gelu_ns{0};
+    std::atomic<uint64_t> gemma4_native_moe_prefill_gate_up_fast_gelu_ns{0};
+    std::atomic<uint64_t> gemma4_decode_native_candidate_ops{0};
+    std::atomic<uint64_t> gemma4_decode_native_used_ops{0};
+    std::atomic<uint64_t> gemma4_decode_native_rejected_ops{0};
+    std::atomic<uint64_t> gemma4_decode_native_moe_used_ops{0};
+    std::atomic<uint64_t> gemma4_decode_native_dense_used_ops{0};
+    std::atomic<uint64_t> gemma4_decode_native_lm_head_used_ops{0};
+    std::atomic<uint64_t> gemma4_decode_native_ns{0};
+    std::atomic<uint64_t> gemma4_decode_replaced_ggml_mul_mat_ops{0};
+    std::atomic<uint64_t> gemma4_decode_replaced_ggml_mul_mat_id_ops{0};
+    std::atomic<uint64_t> gemma4_decode_duplicate_work_detected{0};
+    std::atomic<uint64_t> gemma4_native_int4_gemv_candidate_ops{0};
+    std::atomic<uint64_t> gemma4_native_int4_gemv_used_ops{0};
+    std::atomic<uint64_t> gemma4_native_int4_gemv_ns{0};
+    std::atomic<uint64_t> gemma4_native_int4_repacked_weight_count{0};
+    std::atomic<uint64_t> gemma4_native_int4_repacked_bytes{0};
+    std::atomic<uint64_t> gemma4_native_fused_gateup_used_ops{0};
+    std::atomic<uint64_t> ggml_delegated_quant_gemv_ops{0};
+    std::atomic<uint64_t> gemma4_native_paged_attention_candidate_ops{0};
+    std::atomic<uint64_t> gemma4_native_paged_attention_used_ops{0};
+    std::atomic<uint64_t> gemma4_native_paged_attention_ns{0};
+    std::atomic<uint64_t> gemma4_ggml_attention_fallback_ops{0};
+    std::atomic<int> gemma4_paged_attention_cache_type{-1};
+    std::atomic<int> gemma4_paged_attention_context_len{0};
+    std::atomic<uint64_t> gemma4_paged_attention_head_range{0};
     std::atomic<uint64_t> native_moe_fast_decode_candidate_ops{0};
     std::atomic<uint64_t> native_moe_fast_decode_used_ops{0};
     std::atomic<uint64_t> native_moe_fast_decode_rejected_ops{0};
@@ -215,6 +270,13 @@ struct InferenceWorkContext {
     mutable std::mutex profile_string_mutex;
     std::string moe_small_decode_parallel_last_reject_reason;
     std::string moe_q4k_repacked_last_reject_reason;
+    std::string gemma4_moe_prefill_quant_batch_last_reject_reason;
+    std::string gemma4_native_moe_prefill_last_reject_reason;
+    std::string gemma4_dense_prefill_native_last_reject_reason;
+    std::string gemma4_decode_native_last_reject_reason;
+    std::string qwen_target_ggml_compute_last_reason;
+    std::string qwen_target_ggml_compute_last_op;
+    std::string qwen_target_ggml_compute_target;
     std::string native_moe_fast_decode_last_reject_reason;
     std::string native_moe_fast_w2_q5k_last_reject_reason;
     std::string q6k_gemv_effective_phase;
@@ -636,6 +698,12 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     ResetAtomicHistogram(p.decode_matmul_path_hist);
     ResetAtomicHistogram(p.prefill_matmul_weight_type_hist);
     ResetAtomicHistogram(p.prefill_matmul_path_hist);
+    p.qwen_target_ggml_compute_ops.store(0, std::memory_order_relaxed);
+    p.qwen_target_ggml_matmul_ops.store(0, std::memory_order_relaxed);
+    p.qwen_target_ggml_matmul_id_ops.store(0, std::memory_order_relaxed);
+    p.qwen_target_ggml_quant_vecdot_ops.store(0, std::memory_order_relaxed);
+    p.qwen_target_ggml_quantize_kv_ops.store(0, std::memory_order_relaxed);
+    p.qwen_target_ggml_attention_ops.store(0, std::memory_order_relaxed);
     p.q6k_gemv_seen_ops.store(0, std::memory_order_relaxed);
     p.q6k_gemv_candidate_ops.store(0, std::memory_order_relaxed);
     p.q6k_gemv_used_ops.store(0, std::memory_order_relaxed);
@@ -654,6 +722,55 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.moe_q4k_repacked_candidate_ops.store(0, std::memory_order_relaxed);
     p.moe_q4k_repacked_used_ops.store(0, std::memory_order_relaxed);
     p.moe_q4k_repacked_rejected_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_moe_prefill_quant_batch_candidate_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_moe_prefill_quant_batch_used_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_moe_prefill_quant_batch_rejected_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_moe_prefill_quant_batch_gate_up_used.store(0, std::memory_order_relaxed);
+    p.gemma4_moe_prefill_quant_batch_down_used.store(0, std::memory_order_relaxed);
+    p.gemma4_native_moe_prefill_candidate_layers.store(0, std::memory_order_relaxed);
+    p.gemma4_native_moe_prefill_used_layers.store(0, std::memory_order_relaxed);
+    p.gemma4_native_moe_prefill_rejected_layers.store(0, std::memory_order_relaxed);
+    p.gemma4_native_moe_prefill_gate_up_ns.store(0, std::memory_order_relaxed);
+    p.gemma4_native_moe_prefill_down_ns.store(0, std::memory_order_relaxed);
+    p.gemma4_native_moe_prefill_total_ns.store(0, std::memory_order_relaxed);
+    p.gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_native_moe_prefill_duplicate_work_detected.store(0, std::memory_order_relaxed);
+    p.gemma4_dense_prefill_native_candidate_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_dense_prefill_native_used_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_dense_prefill_native_rejected_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_dense_prefill_native_q4k_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_dense_prefill_native_q8_0_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_dense_prefill_native_ns.store(0, std::memory_order_relaxed);
+    p.gemma4_dense_prefill_replaced_ggml_mul_mat_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_dense_prefill_duplicate_work_detected.store(0, std::memory_order_relaxed);
+    p.gemma4_fast_gelu_enabled.store(0, std::memory_order_relaxed);
+    p.gemma4_fast_gelu_used.store(0, std::memory_order_relaxed);
+    p.gemma4_fast_gelu_ns.store(0, std::memory_order_relaxed);
+    p.gemma4_native_moe_prefill_gate_up_fast_gelu_ns.store(0, std::memory_order_relaxed);
+    p.gemma4_decode_native_candidate_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_decode_native_used_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_decode_native_rejected_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_decode_native_moe_used_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_decode_native_dense_used_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_decode_native_lm_head_used_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_decode_native_ns.store(0, std::memory_order_relaxed);
+    p.gemma4_decode_replaced_ggml_mul_mat_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_decode_replaced_ggml_mul_mat_id_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_decode_duplicate_work_detected.store(0, std::memory_order_relaxed);
+    p.gemma4_native_int4_gemv_candidate_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_native_int4_gemv_used_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_native_int4_gemv_ns.store(0, std::memory_order_relaxed);
+    p.gemma4_native_int4_repacked_weight_count.store(0, std::memory_order_relaxed);
+    p.gemma4_native_int4_repacked_bytes.store(0, std::memory_order_relaxed);
+    p.gemma4_native_fused_gateup_used_ops.store(0, std::memory_order_relaxed);
+    p.ggml_delegated_quant_gemv_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_native_paged_attention_candidate_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_native_paged_attention_used_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_native_paged_attention_ns.store(0, std::memory_order_relaxed);
+    p.gemma4_ggml_attention_fallback_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_paged_attention_cache_type.store(-1, std::memory_order_relaxed);
+    p.gemma4_paged_attention_context_len.store(0, std::memory_order_relaxed);
+    p.gemma4_paged_attention_head_range.store(0, std::memory_order_relaxed);
     p.native_moe_fast_decode_candidate_ops.store(0, std::memory_order_relaxed);
     p.native_moe_fast_decode_used_ops.store(0, std::memory_order_relaxed);
     p.native_moe_fast_decode_rejected_ops.store(0, std::memory_order_relaxed);
@@ -692,6 +809,13 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
         std::lock_guard<std::mutex> lock(ctx->profile_string_mutex);
         ctx->moe_small_decode_parallel_last_reject_reason.clear();
         ctx->moe_q4k_repacked_last_reject_reason.clear();
+        ctx->gemma4_moe_prefill_quant_batch_last_reject_reason.clear();
+        ctx->gemma4_native_moe_prefill_last_reject_reason.clear();
+        ctx->gemma4_dense_prefill_native_last_reject_reason.clear();
+        ctx->gemma4_decode_native_last_reject_reason.clear();
+        ctx->qwen_target_ggml_compute_last_reason.clear();
+        ctx->qwen_target_ggml_compute_last_op.clear();
+        ctx->qwen_target_ggml_compute_target.clear();
         ctx->native_moe_fast_decode_last_reject_reason.clear();
         ctx->native_moe_fast_w2_q5k_last_reject_reason.clear();
         ctx->q6k_gemv_effective_phase.clear();
@@ -863,6 +987,14 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     SnapshotAtomicHistogram(snapshot.decode_matmul_path_hist, p.decode_matmul_path_hist);
     SnapshotAtomicHistogram(snapshot.prefill_matmul_weight_type_hist, p.prefill_matmul_weight_type_hist);
     SnapshotAtomicHistogram(snapshot.prefill_matmul_path_hist, p.prefill_matmul_path_hist);
+    snapshot.qwen_target_ggml_compute_ops = p.qwen_target_ggml_compute_ops.load(std::memory_order_relaxed);
+    snapshot.qwen_target_ggml_matmul_ops = p.qwen_target_ggml_matmul_ops.load(std::memory_order_relaxed);
+    snapshot.qwen_target_ggml_matmul_id_ops = p.qwen_target_ggml_matmul_id_ops.load(std::memory_order_relaxed);
+    snapshot.qwen_target_ggml_quant_vecdot_ops =
+        p.qwen_target_ggml_quant_vecdot_ops.load(std::memory_order_relaxed);
+    snapshot.qwen_target_ggml_quantize_kv_ops =
+        p.qwen_target_ggml_quantize_kv_ops.load(std::memory_order_relaxed);
+    snapshot.qwen_target_ggml_attention_ops = p.qwen_target_ggml_attention_ops.load(std::memory_order_relaxed);
     snapshot.q6k_gemv_seen_ops = p.q6k_gemv_seen_ops.load(std::memory_order_relaxed);
     snapshot.q6k_gemv_candidate_ops = p.q6k_gemv_candidate_ops.load(std::memory_order_relaxed);
     snapshot.q6k_gemv_used_ops = p.q6k_gemv_used_ops.load(std::memory_order_relaxed);
@@ -887,6 +1019,98 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.moe_q4k_repacked_candidate_ops = p.moe_q4k_repacked_candidate_ops.load(std::memory_order_relaxed);
     snapshot.moe_q4k_repacked_used_ops = p.moe_q4k_repacked_used_ops.load(std::memory_order_relaxed);
     snapshot.moe_q4k_repacked_rejected_ops = p.moe_q4k_repacked_rejected_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_moe_prefill_quant_batch_candidate_ops =
+        p.gemma4_moe_prefill_quant_batch_candidate_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_moe_prefill_quant_batch_used_ops =
+        p.gemma4_moe_prefill_quant_batch_used_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_moe_prefill_quant_batch_rejected_ops =
+        p.gemma4_moe_prefill_quant_batch_rejected_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_moe_prefill_quant_batch_gate_up_used =
+        p.gemma4_moe_prefill_quant_batch_gate_up_used.load(std::memory_order_relaxed);
+    snapshot.gemma4_moe_prefill_quant_batch_down_used =
+        p.gemma4_moe_prefill_quant_batch_down_used.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_moe_prefill_candidate_layers =
+        p.gemma4_native_moe_prefill_candidate_layers.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_moe_prefill_used_layers =
+        p.gemma4_native_moe_prefill_used_layers.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_moe_prefill_rejected_layers =
+        p.gemma4_native_moe_prefill_rejected_layers.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_moe_prefill_gate_up_ns =
+        p.gemma4_native_moe_prefill_gate_up_ns.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_moe_prefill_down_ns =
+        p.gemma4_native_moe_prefill_down_ns.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_moe_prefill_total_ns =
+        p.gemma4_native_moe_prefill_total_ns.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops =
+        p.gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_moe_prefill_duplicate_work_detected =
+        p.gemma4_native_moe_prefill_duplicate_work_detected.load(std::memory_order_relaxed);
+    snapshot.gemma4_dense_prefill_native_candidate_ops =
+        p.gemma4_dense_prefill_native_candidate_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_dense_prefill_native_used_ops =
+        p.gemma4_dense_prefill_native_used_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_dense_prefill_native_rejected_ops =
+        p.gemma4_dense_prefill_native_rejected_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_dense_prefill_native_q4k_ops =
+        p.gemma4_dense_prefill_native_q4k_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_dense_prefill_native_q8_0_ops =
+        p.gemma4_dense_prefill_native_q8_0_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_dense_prefill_native_ns =
+        p.gemma4_dense_prefill_native_ns.load(std::memory_order_relaxed);
+    snapshot.gemma4_dense_prefill_replaced_ggml_mul_mat_ops =
+        p.gemma4_dense_prefill_replaced_ggml_mul_mat_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_dense_prefill_duplicate_work_detected =
+        p.gemma4_dense_prefill_duplicate_work_detected.load(std::memory_order_relaxed);
+    snapshot.gemma4_fast_gelu_enabled = p.gemma4_fast_gelu_enabled.load(std::memory_order_relaxed);
+    snapshot.gemma4_fast_gelu_used = p.gemma4_fast_gelu_used.load(std::memory_order_relaxed);
+    snapshot.gemma4_fast_gelu_ns = p.gemma4_fast_gelu_ns.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_moe_prefill_gate_up_fast_gelu_ns =
+        p.gemma4_native_moe_prefill_gate_up_fast_gelu_ns.load(std::memory_order_relaxed);
+    snapshot.gemma4_decode_native_candidate_ops =
+        p.gemma4_decode_native_candidate_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_decode_native_used_ops =
+        p.gemma4_decode_native_used_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_decode_native_rejected_ops =
+        p.gemma4_decode_native_rejected_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_decode_native_moe_used_ops =
+        p.gemma4_decode_native_moe_used_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_decode_native_dense_used_ops =
+        p.gemma4_decode_native_dense_used_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_decode_native_lm_head_used_ops =
+        p.gemma4_decode_native_lm_head_used_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_decode_native_ns = p.gemma4_decode_native_ns.load(std::memory_order_relaxed);
+    snapshot.gemma4_decode_replaced_ggml_mul_mat_ops =
+        p.gemma4_decode_replaced_ggml_mul_mat_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_decode_replaced_ggml_mul_mat_id_ops =
+        p.gemma4_decode_replaced_ggml_mul_mat_id_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_decode_duplicate_work_detected =
+        p.gemma4_decode_duplicate_work_detected.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_int4_gemv_candidate_ops =
+        p.gemma4_native_int4_gemv_candidate_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_int4_gemv_used_ops =
+        p.gemma4_native_int4_gemv_used_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_int4_gemv_ns = p.gemma4_native_int4_gemv_ns.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_int4_repacked_weight_count =
+        p.gemma4_native_int4_repacked_weight_count.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_int4_repacked_bytes =
+        p.gemma4_native_int4_repacked_bytes.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_fused_gateup_used_ops =
+        p.gemma4_native_fused_gateup_used_ops.load(std::memory_order_relaxed);
+    snapshot.ggml_delegated_quant_gemv_ops = p.ggml_delegated_quant_gemv_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_paged_attention_candidate_ops =
+        p.gemma4_native_paged_attention_candidate_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_paged_attention_used_ops =
+        p.gemma4_native_paged_attention_used_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_native_paged_attention_ns =
+        p.gemma4_native_paged_attention_ns.load(std::memory_order_relaxed);
+    snapshot.gemma4_ggml_attention_fallback_ops =
+        p.gemma4_ggml_attention_fallback_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_paged_attention_cache_type =
+        p.gemma4_paged_attention_cache_type.load(std::memory_order_relaxed);
+    snapshot.gemma4_paged_attention_context_len =
+        p.gemma4_paged_attention_context_len.load(std::memory_order_relaxed);
+    snapshot.gemma4_paged_attention_head_range =
+        p.gemma4_paged_attention_head_range.load(std::memory_order_relaxed);
     snapshot.native_moe_fast_decode_candidate_ops =
         p.native_moe_fast_decode_candidate_ops.load(std::memory_order_relaxed);
     snapshot.native_moe_fast_decode_used_ops =
@@ -939,6 +1163,20 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
         snapshot.moe_small_decode_parallel_last_reject_reason =
             ctx->moe_small_decode_parallel_last_reject_reason;
         snapshot.moe_q4k_repacked_last_reject_reason = ctx->moe_q4k_repacked_last_reject_reason;
+        snapshot.gemma4_moe_prefill_quant_batch_last_reject_reason =
+            ctx->gemma4_moe_prefill_quant_batch_last_reject_reason;
+        snapshot.gemma4_native_moe_prefill_last_reject_reason =
+            ctx->gemma4_native_moe_prefill_last_reject_reason;
+        snapshot.gemma4_dense_prefill_native_last_reject_reason =
+            ctx->gemma4_dense_prefill_native_last_reject_reason;
+        snapshot.gemma4_decode_native_last_reject_reason =
+            ctx->gemma4_decode_native_last_reject_reason;
+        snapshot.qwen_target_ggml_compute_last_reason =
+            ctx->qwen_target_ggml_compute_last_reason;
+        snapshot.qwen_target_ggml_compute_last_op =
+            ctx->qwen_target_ggml_compute_last_op;
+        snapshot.qwen_target_ggml_compute_target =
+            ctx->qwen_target_ggml_compute_target;
         snapshot.native_moe_fast_decode_last_reject_reason =
             ctx->native_moe_fast_decode_last_reject_reason;
         snapshot.native_moe_fast_w2_q5k_last_reject_reason =
@@ -1091,6 +1329,180 @@ void RecordMoEQ4KRepackedDecision(InferenceWorkContext* ctx, bool candidate, boo
     }
 }
 
+void RecordGemma4MoEPrefillQuantBatchDecision(InferenceWorkContext* ctx, bool candidate, bool used,
+                                              const char* reject_reason, bool gate_up_used, bool down_used) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    if (candidate) {
+        p.gemma4_moe_prefill_quant_batch_candidate_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (used) {
+        p.gemma4_moe_prefill_quant_batch_used_ops.fetch_add(1, std::memory_order_relaxed);
+    } else if (candidate && reject_reason && reject_reason[0] != '\0') {
+        p.gemma4_moe_prefill_quant_batch_rejected_ops.fetch_add(1, std::memory_order_relaxed);
+    } else if (reject_reason && reject_reason[0] != '\0') {
+        p.gemma4_moe_prefill_quant_batch_rejected_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (gate_up_used) {
+        p.gemma4_moe_prefill_quant_batch_gate_up_used.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (down_used) {
+        p.gemma4_moe_prefill_quant_batch_down_used.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (reject_reason && reject_reason[0] != '\0') {
+        std::lock_guard<std::mutex> lock(ctx->profile_string_mutex);
+        ctx->gemma4_moe_prefill_quant_batch_last_reject_reason = reject_reason;
+    }
+}
+
+void RecordGemma4NativeMoEPrefillDecision(InferenceWorkContext* ctx, bool candidate, bool used,
+                                          const char* reject_reason, uint64_t replaced_mul_mat_id_ops,
+                                          bool duplicate_work_detected) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    if (candidate) {
+        p.gemma4_native_moe_prefill_candidate_layers.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (used) {
+        p.gemma4_native_moe_prefill_used_layers.fetch_add(1, std::memory_order_relaxed);
+    } else if (candidate && reject_reason && reject_reason[0] != '\0') {
+        p.gemma4_native_moe_prefill_rejected_layers.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (replaced_mul_mat_id_ops > 0) {
+        p.gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops.fetch_add(replaced_mul_mat_id_ops,
+                                                                           std::memory_order_relaxed);
+    }
+    if (duplicate_work_detected) {
+        p.gemma4_native_moe_prefill_duplicate_work_detected.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (reject_reason && reject_reason[0] != '\0') {
+        std::lock_guard<std::mutex> lock(ctx->profile_string_mutex);
+        ctx->gemma4_native_moe_prefill_last_reject_reason = reject_reason;
+    }
+}
+
+void RecordGemma4NativeMoEPrefillTiming(InferenceWorkContext* ctx, uint64_t gate_up_ns, uint64_t down_ns,
+                                        uint64_t total_ns) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    if (gate_up_ns > 0) {
+        p.gemma4_native_moe_prefill_gate_up_ns.fetch_add(gate_up_ns, std::memory_order_relaxed);
+    }
+    if (down_ns > 0) {
+        p.gemma4_native_moe_prefill_down_ns.fetch_add(down_ns, std::memory_order_relaxed);
+    }
+    if (total_ns > 0) {
+        p.gemma4_native_moe_prefill_total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    }
+}
+
+void RecordGemma4DensePrefillNativeDecision(InferenceWorkContext* ctx, bool candidate, bool used,
+                                            const char* reject_reason, ggml_type weight_type,
+                                            uint64_t replaced_mul_mat_ops, bool duplicate_work_detected) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    if (candidate) {
+        p.gemma4_dense_prefill_native_candidate_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (used) {
+        p.gemma4_dense_prefill_native_used_ops.fetch_add(1, std::memory_order_relaxed);
+        if (weight_type == GGML_TYPE_Q4_K) {
+            p.gemma4_dense_prefill_native_q4k_ops.fetch_add(1, std::memory_order_relaxed);
+        } else if (weight_type == GGML_TYPE_Q8_0) {
+            p.gemma4_dense_prefill_native_q8_0_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (candidate && reject_reason && reject_reason[0] != '\0') {
+        p.gemma4_dense_prefill_native_rejected_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (replaced_mul_mat_ops > 0) {
+        p.gemma4_dense_prefill_replaced_ggml_mul_mat_ops.fetch_add(replaced_mul_mat_ops,
+                                                                   std::memory_order_relaxed);
+    }
+    if (duplicate_work_detected) {
+        p.gemma4_dense_prefill_duplicate_work_detected.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (reject_reason && reject_reason[0] != '\0') {
+        std::lock_guard<std::mutex> lock(ctx->profile_string_mutex);
+        ctx->gemma4_dense_prefill_native_last_reject_reason = reject_reason;
+    }
+}
+
+void RecordGemma4DensePrefillNativeTiming(InferenceWorkContext* ctx, uint64_t wall_ns) {
+    if (!ctx || wall_ns == 0) {
+        return;
+    }
+    ctx->qwen36_profile.gemma4_dense_prefill_native_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+}
+
+void RecordGemma4FastGeluDecision(InferenceWorkContext* ctx, bool enabled, bool used, uint64_t wall_ns) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    if (enabled) {
+        p.gemma4_fast_gelu_enabled.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (used) {
+        p.gemma4_fast_gelu_used.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (wall_ns > 0) {
+        p.gemma4_fast_gelu_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+        p.gemma4_native_moe_prefill_gate_up_fast_gelu_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+    }
+}
+
+void RecordGemma4DecodeNativeDecision(InferenceWorkContext* ctx, bool candidate, bool used,
+                                      const char* reject_reason, bool moe_used, bool dense_used,
+                                      bool lm_head_used, uint64_t wall_ns, uint64_t replaced_mul_mat_ops,
+                                      uint64_t replaced_mul_mat_id_ops, bool duplicate_work_detected) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    if (candidate) {
+        p.gemma4_decode_native_candidate_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (used) {
+        p.gemma4_decode_native_used_ops.fetch_add(1, std::memory_order_relaxed);
+        if (moe_used) {
+            p.gemma4_decode_native_moe_used_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (dense_used) {
+            p.gemma4_decode_native_dense_used_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (lm_head_used) {
+            p.gemma4_decode_native_lm_head_used_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (candidate && reject_reason && reject_reason[0] != '\0') {
+        p.gemma4_decode_native_rejected_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (wall_ns > 0) {
+        p.gemma4_decode_native_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+    }
+    if (replaced_mul_mat_ops > 0) {
+        p.gemma4_decode_replaced_ggml_mul_mat_ops.fetch_add(replaced_mul_mat_ops, std::memory_order_relaxed);
+    }
+    if (replaced_mul_mat_id_ops > 0) {
+        p.gemma4_decode_replaced_ggml_mul_mat_id_ops.fetch_add(replaced_mul_mat_id_ops,
+                                                               std::memory_order_relaxed);
+    }
+    if (duplicate_work_detected) {
+        p.gemma4_decode_duplicate_work_detected.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (reject_reason && reject_reason[0] != '\0') {
+        std::lock_guard<std::mutex> lock(ctx->profile_string_mutex);
+        ctx->gemma4_decode_native_last_reject_reason = reject_reason;
+    }
+}
+
 void RecordNativeMoEFastDecodeDecision(InferenceWorkContext* ctx, bool candidate, bool used,
                                        const char* reject_reason, bool w1w3_used, bool w2_used,
                                        uint64_t wall_ns) {
@@ -1195,6 +1607,74 @@ void RecordGraphBuildMatmulCensus(InferenceWorkContext* ctx, InferenceExecutionP
         p.prefill_matmul_weight_type_hist[weight_idx].fetch_add(1, std::memory_order_relaxed);
         p.prefill_matmul_path_hist[path_idx].fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+void RecordQwenTargetGgmlComputeFallback(InferenceWorkContext* ctx, const TransformerModel* model,
+                                         densecore::runtime::GgmlComputeOp op, const char* reason,
+                                         const char* tensor_name, InferenceExecutionPhase phase) {
+    const densecore::runtime::QwenHotPathPlan plan = densecore::runtime::ResolveQwenHotPathPlan(model);
+    if (!plan.target_model) {
+        return;
+    }
+
+    if (densecore::runtime::ShouldRejectQwenGgmlCompute(plan, reason)) {
+        std::string message = "Qwen target GGML compute rejected: op=";
+        message += densecore::runtime::GgmlComputeOpName(op);
+        message += " target=";
+        message += densecore::runtime::QwenHotPathTargetLabel(plan);
+        message += " phase=";
+        message += MatmulPhaseName(phase);
+        message += " reason=";
+        message += (reason && reason[0] ? reason : "unclassified");
+        if (tensor_name && tensor_name[0]) {
+            message += " tensor=";
+            message += tensor_name;
+        }
+        throw densecore::InvalidArgumentException(message);
+    }
+
+    if (!ctx) {
+        return;
+    }
+
+    auto& p = ctx->qwen36_profile;
+    p.qwen_target_ggml_compute_ops.fetch_add(1, std::memory_order_relaxed);
+    switch (op) {
+    case densecore::runtime::GgmlComputeOp::Matmul:
+        p.qwen_target_ggml_matmul_ops.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case densecore::runtime::GgmlComputeOp::MatmulId:
+        p.qwen_target_ggml_matmul_id_ops.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case densecore::runtime::GgmlComputeOp::QuantVecDot:
+        p.qwen_target_ggml_quant_vecdot_ops.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case densecore::runtime::GgmlComputeOp::QuantizeKv:
+        p.qwen_target_ggml_quantize_kv_ops.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case densecore::runtime::GgmlComputeOp::Attention:
+        p.qwen_target_ggml_attention_ops.fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->profile_string_mutex);
+    ctx->qwen_target_ggml_compute_last_reason = reason && reason[0] ? reason : "unclassified";
+    ctx->qwen_target_ggml_compute_last_op = densecore::runtime::GgmlComputeOpName(op);
+    ctx->qwen_target_ggml_compute_target = densecore::runtime::QwenHotPathTargetLabel(plan);
+}
+
+void RecordGemma4GgmlAttentionFallback(InferenceWorkContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->qwen36_profile.gemma4_ggml_attention_fallback_ops.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordGemma4NativeFusedGateUpUsed(InferenceWorkContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->qwen36_profile.gemma4_native_fused_gateup_used_ops.fetch_add(1, std::memory_order_relaxed);
 }
 
 void RecordQ6KGemvDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,

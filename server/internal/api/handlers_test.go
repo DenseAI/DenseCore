@@ -633,6 +633,32 @@ func TestSplitReasoningResponseQwen36ClosedThinkKeepsFinalContent(t *testing.T) 
 	}
 }
 
+func TestPromoteExactAnswerContentMovesQwen36ReasoningOnlyAnswer(t *testing.T) {
+	req := domain.ChatCompletionRequest{
+		Messages: []domain.Message{
+			{Role: "user", Content: "What is the capital of France? Answer with only Paris."},
+		},
+	}
+
+	content, reasoning := promoteExactAnswerContent(req, "", "Paris")
+	if content != "Paris" || reasoning != "" {
+		t.Fatalf("expected exact answer promoted to content, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestPromoteExactAnswerContentDoesNotExposeNonExactReasoning(t *testing.T) {
+	req := domain.ChatCompletionRequest{
+		Messages: []domain.Message{
+			{Role: "user", Content: "What is the capital of France? Answer with only Paris."},
+		},
+	}
+
+	content, reasoning := promoteExactAnswerContent(req, "", "I should answer Paris")
+	if content != "" || reasoning != "I should answer Paris" {
+		t.Fatalf("expected non-exact reasoning to remain hidden, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
 func TestChatCompletionHandler_Stream(t *testing.T) {
 	mockModelService := NewMockModelService()
 	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {

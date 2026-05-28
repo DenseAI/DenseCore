@@ -80,6 +80,10 @@ func max(a, b int) int {
 }
 
 func extractExpectedExactAnswer(req domain.ChatCompletionRequest) string {
+	return ExtractExpectedExactAnswer(req)
+}
+
+func ExtractExpectedExactAnswer(req domain.ChatCompletionRequest) string {
 	if len(req.Messages) > 0 {
 		for i := len(req.Messages) - 1; i >= 0; i-- {
 			text := strings.TrimSpace(req.Messages[i].FlattenedText())

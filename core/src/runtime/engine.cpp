@@ -31,6 +31,7 @@
 #include "densecore/models/model_loader.h"
 #include "densecore/models/model_types.h"
 #include "densecore/models/tokenizer.h"
+#include "densecore/runtime/ggml_compute_policy.h"
 #include "densecore/runtime/inference.h"
 #include "densecore/runtime/optimization_bridge.h"  // Runtime SIMD dispatch
 #include "densecore/simd/simd_ops.h"
@@ -390,6 +391,10 @@ ggml_type ResolveEffectiveKVCacheType(const TransformerModel* model, ggml_type r
 
     if (!ggml_is_quantized(requested_cache_type)) {
         return requested_cache_type;
+    }
+
+    if (model && densecore::runtime::IsQwenTargetVariant(model->variant)) {
+        return GGML_TYPE_F16;
     }
 
     const int k_head_dim = ResolveKVHeadDim(model);

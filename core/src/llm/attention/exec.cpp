@@ -33,6 +33,13 @@ bool IsGemma4ParityTraceEnabled() {
     return enabled;
 }
 
+void RecordGemma4GgmlAttentionFallback(TransformerModel* model) {
+    if (!model || !model->arch_flags.is_gemma4 || !IsQwen36ProfilingEnabled()) return;
+    InferenceWorkContext* work_ctx = GetCurrentWorkContext();
+    if (!work_ctx) return;
+    ::RecordGemma4GgmlAttentionFallback(work_ctx);
+}
+
 int Gemma4ParityTraceLayer() {
     static const int layer = []() {
         const char* env = std::getenv("DENSECORE_GEMMA4_PARITY_TRACE_LAYER");
@@ -195,6 +202,7 @@ struct ggml_tensor* ExecutePagedDecodeAttentionPath(struct ggml_context* ctx_c, 
     ud->n_head_kv = n_head_kv;
     ud->write_current_kv = !gemma4_shared_kv_layer;
     ud->force_full_history = gemma4_shared_kv_layer || gemma4_shared_kv_source_layer;
+    ud->is_gemma4 = model && model->arch_flags.is_gemma4;
     ud->sliding_window = paged_attn_sliding_window;
     ud->attention_scale = paged_attn_scale;
     ud->logit_softcap = fast_attn_logit_softcap;
@@ -262,6 +270,7 @@ struct ggml_tensor* ExecuteNativeFlashAttentionPath(
     int attn_query_base_pos, int fast_attn_sliding_window, bool decode_only_batch, bool use_explicit_attention_scale,
     struct ggml_tensor** shared_prefill_flash_mask, int* shared_prefill_mask_n_total, int* shared_prefill_mask_n_padded,
     int* shared_prefill_mask_n, int* shared_prefill_mask_n_past, int* shared_prefill_mask_sliding_window) {
+    RecordGemma4GgmlAttentionFallback(model);
     struct ggml_tensor* Q = ggml_permute(ctx_c, Qcur, 0, 2, 1, 3);
     struct ggml_tensor* K_fa = ggml_permute(ctx_c, K, 0, 2, 1, 3);
     struct ggml_tensor* V_fa = ggml_permute(ctx_c, V, 0, 2, 1, 3);
@@ -285,6 +294,7 @@ struct ggml_tensor* ExecuteStandardAttentionPath(struct ggml_context* ctx_c, Tra
                                                  int il, int n_tokens, int n_past_val, int n_total_tokens, int n_head,
                                                  int n_head_kv, int head_dim_q, int fast_attn_sliding_window,
                                                  int attn_query_base_pos, bool use_explicit_attention_scale) {
+    RecordGemma4GgmlAttentionFallback(model);
     const float scale = ResolveAttentionScaleForRuntime(head_dim_q, use_explicit_attention_scale);
 
     const bool skip_attn_cont = (n_tokens > 1) && densecore::llm::attention::IsPrefillAttentionSkipContEnabled();

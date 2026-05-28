@@ -192,6 +192,41 @@ DENSECORE_API void GemvInt4DualFusedSilu_Hwy(float* output, const float* input, 
                                              int K, int N, int group_size, int n_start, int n_end);
 
 /**
+ * @brief Dual-output INT4 GEMV with fused GEGLU activation for Gemma-family FFNs
+ *
+ * Computes `output = gelu(gate) * up` for a single input row where both
+ * `gate` and `up` come from packed canonical INT4 projections sharing the same
+ * input vector.
+ */
+DENSECORE_API void GemvInt4DualFusedGelu_Hwy(float* output, const float* input, const uint8_t* gate_weights,
+                                             const float* gate_scales, const float* gate_zeros,
+                                             const uint8_t* up_weights, const float* up_scales, const float* up_zeros,
+                                             int K, int N, int group_size, int n_start, int n_end);
+
+/**
+ * @brief Batched dual-output INT4 GEMM with fused SwiGLU activation.
+ *
+ * Reuses each unpacked gate/up weight tile across up to 4 input rows:
+ * `output[M,N] = silu(input[M,K] * gate[N,K]^T) * (input[M,K] * up[N,K]^T)`.
+ */
+DENSECORE_API void GemmInt4DualFusedSiluBatched_Hwy(float* output, const float* input,
+                                                    const uint8_t* gate_weights, const float* gate_scales,
+                                                    const float* gate_zeros, const uint8_t* up_weights,
+                                                    const float* up_scales, const float* up_zeros, int M, int K,
+                                                    int N, int group_size, int m_start, int m_end, int n_start,
+                                                    int n_end, size_t input_stride_bytes);
+
+/**
+ * @brief Batched dual-output INT4 GEMM with fused GEGLU activation.
+ */
+DENSECORE_API void GemmInt4DualFusedGeluBatched_Hwy(float* output, const float* input,
+                                                    const uint8_t* gate_weights, const float* gate_scales,
+                                                    const float* gate_zeros, const uint8_t* up_weights,
+                                                    const float* up_scales, const float* up_zeros, int M, int K,
+                                                    int N, int group_size, int m_start, int m_end, int n_start,
+                                                    int n_end, size_t input_stride_bytes);
+
+/**
  * @brief Batched INT4 GEMM with M-blocking for weight reuse
  *
  * For M>1, loads each weight tile once and applies to M_BLOCK=4 input rows.
@@ -205,6 +240,31 @@ DENSECORE_API void GemmInt4Batched_Hwy(float* output, const float* input, const 
 
 DENSECORE_API void PrepackInt4WeightsInterleaved_Hwy(const uint8_t* src, uint8_t* dst, int K, int N, int group_size,
                                                      int block_size);
+
+// ============================================================================
+// GGML K-quant compatible MoE primitives
+// ============================================================================
+
+/**
+ * @brief Quantize one F32 activation row into GGML-compatible Q8_K bytes.
+ *
+ * This is used by DenseCore MoE decode kernels to avoid calling GGML
+ * `from_float` in runtime hot paths while preserving the existing Q8_K row
+ * layout consumed by K-quant expert weights.
+ */
+DENSECORE_API bool QuantizeRowQ8K_Hwy(const float* input, void* q8_output, int64_t cols);
+
+/**
+ * @brief Dot one GGML-compatible Q4_K weight row with one Q8_K activation row.
+ */
+DENSECORE_API bool DotQ4KQ8K_Hwy(const void* q4_weight_row, const void* q8_input_row, int64_t cols,
+                                 float* output);
+
+/**
+ * @brief Dot one GGML-compatible Q5_K weight row with one Q8_K activation row.
+ */
+DENSECORE_API bool DotQ5KQ8K_Hwy(const void* q5_weight_row, const void* q8_input_row, int64_t cols,
+                                 float* output);
 
 // ============================================================================
 // FP8
@@ -243,35 +303,6 @@ DENSECORE_API void Gemv_FP8_E4M3FN_Hwy(const int M, const int N, const float alp
  */
 DENSECORE_API void SSMConv1DDecode_Hwy(float* conv_state, const float* input, const float* weight, float* output,
                                        int channels, int kernel_size);
-
-/**
- * @brief Mamba2 selective scan — single token decode.
- *
- * Updates recurrent state in-place and produces output for one token.
- * `dt_A` and `dt_B` must be AFTER softplus.
- *
- * @param x       [d_inner]                  activated SSM input
- * @param dt_A    [n_heads]                  per-head timestep used for A discretization
- * @param dt_B    [n_heads]                  per-head timestep scaling applied to B/input update
- * @param A_log   [n_heads]                  log-space diagonal A
- * @param B       [n_groups*d_state]         input→state projection
- * @param C       [n_groups*d_state]         state→output projection
- * @param state   [n_heads*head_dim*d_state] recurrent state (read/write)
- * @param output  [d_inner]                  scan output
- */
-DENSECORE_API void SSMScanDecode_Hwy(const float* x, const float* dt_A, const float* dt_B, const float* A_log,
-                                     const float* B, const float* C, float* state, float* output, int n_heads,
-                                     int head_dim, int d_state, int n_groups);
-
-/**
- * @brief Mamba2 selective scan — multi-token prefill (sequential).
- *
- * Processes seq_len tokens sequentially, updating state.
- * dt_raw is BEFORE softplus (softplus applied internally).
- */
-DENSECORE_API void SSMScanPrefill_Hwy(const float* x, const float* dt_raw, const float* A_log, const float* B,
-                                      const float* C, float* state, float* output, int seq_len, int n_heads,
-                                      int head_dim, int d_state, int n_groups);
 
 }  // namespace hwy_kernels
 }  // namespace densecore

@@ -18,6 +18,7 @@ struct PagedAttentionUserData {
     int n_head_kv = 0;
     bool write_current_kv = true;
     bool force_full_history = false;
+    bool is_gemma4 = false;
     int sliding_window = -1;
     float attention_scale = 0.0f;
     float logit_softcap = 0.0f;

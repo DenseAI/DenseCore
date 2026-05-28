@@ -566,11 +566,24 @@ void GemvInt4Impl(float* HWY_RESTRICT output, const float* HWY_RESTRICT input, c
     }
 }
 
-void GemvInt4DualFusedSiluImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT input,
-                               const uint8_t* HWY_RESTRICT gate_weights, const float* HWY_RESTRICT gate_scales,
-                               const float* HWY_RESTRICT gate_zeros, const uint8_t* HWY_RESTRICT up_weights,
-                               const float* HWY_RESTRICT up_scales, const float* HWY_RESTRICT up_zeros, int K, int N,
-                               int group_size, int n_start, int n_end) {
+HWY_INLINE float GeluTanhScalar(float x) {
+    constexpr float kSqrt2OverPi = 0.7978845608028654f;
+    constexpr float kCoeff = 0.044715f;
+    const float x3 = x * x * x;
+    return 0.5f * x * (1.0f + std::tanh(kSqrt2OverPi * (x + kCoeff * x3)));
+}
+
+HWY_INLINE float ActivateGateScalar(float gate, bool gelu_gate) {
+    return gelu_gate ? GeluTanhScalar(gate) : (gate / (1.0f + FastExpScalar(-gate)));
+}
+
+void GemvInt4DualFusedActivationImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT input,
+                                      const uint8_t* HWY_RESTRICT gate_weights,
+                                      const float* HWY_RESTRICT gate_scales,
+                                      const float* HWY_RESTRICT gate_zeros,
+                                      const uint8_t* HWY_RESTRICT up_weights,
+                                      const float* HWY_RESTRICT up_scales, const float* HWY_RESTRICT up_zeros, int K,
+                                      int N, int group_size, int n_start, int n_end, bool gelu_gate) {
     if (!output || !input || !gate_weights || !up_weights || K <= 0 || N <= 0 || group_size <= 0) return;
     if ((group_size & 1) != 0) return;
 
@@ -688,9 +701,253 @@ void GemvInt4DualFusedSiluImpl(float* HWY_RESTRICT output, const float* HWY_REST
             }
         }
 
-        const float silu = gate_sum / (1.0f + FastExpScalar(-gate_sum));
-        output[n] = silu * up_sum;
+        const float activated_gate = ActivateGateScalar(gate_sum, gelu_gate);
+        output[n] = activated_gate * up_sum;
     }
+}
+
+void GemvInt4DualFusedSiluImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT input,
+                               const uint8_t* HWY_RESTRICT gate_weights, const float* HWY_RESTRICT gate_scales,
+                               const float* HWY_RESTRICT gate_zeros, const uint8_t* HWY_RESTRICT up_weights,
+                               const float* HWY_RESTRICT up_scales, const float* HWY_RESTRICT up_zeros, int K, int N,
+                               int group_size, int n_start, int n_end) {
+    GemvInt4DualFusedActivationImpl(output, input, gate_weights, gate_scales, gate_zeros, up_weights, up_scales,
+                                    up_zeros, K, N, group_size, n_start, n_end, false);
+}
+
+void GemvInt4DualFusedGeluImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT input,
+                               const uint8_t* HWY_RESTRICT gate_weights, const float* HWY_RESTRICT gate_scales,
+                               const float* HWY_RESTRICT gate_zeros, const uint8_t* HWY_RESTRICT up_weights,
+                               const float* HWY_RESTRICT up_scales, const float* HWY_RESTRICT up_zeros, int K, int N,
+                               int group_size, int n_start, int n_end) {
+    GemvInt4DualFusedActivationImpl(output, input, gate_weights, gate_scales, gate_zeros, up_weights, up_scales,
+                                    up_zeros, K, N, group_size, n_start, n_end, true);
+}
+
+void GemmInt4DualFusedActivationBatchedImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT input,
+                                            const uint8_t* HWY_RESTRICT gate_weights,
+                                            const float* HWY_RESTRICT gate_scales,
+                                            const float* HWY_RESTRICT gate_zeros,
+                                            const uint8_t* HWY_RESTRICT up_weights,
+                                            const float* HWY_RESTRICT up_scales, const float* HWY_RESTRICT up_zeros,
+                                            int M, int K, int N, int group_size, int m_start, int m_end, int n_start,
+                                            int n_end, size_t input_stride_bytes, bool gelu_gate) {
+    if (!output || !input || !gate_weights || !up_weights || M <= 0 || K <= 0 || N <= 0 || group_size <= 0) return;
+    if ((group_size & 1) != 0) return;
+    if (input_stride_bytes < static_cast<size_t>(K) * sizeof(float)) return;
+
+    m_start = std::max(0, m_start);
+    m_end = std::min(M, m_end);
+    n_start = std::max(0, n_start);
+    n_end = std::min(N, n_end);
+    if (m_start >= m_end || n_start >= n_end) return;
+
+    const size_t input_stride = input_stride_bytes / sizeof(float);
+    if (m_start == 0 && m_end == 1 && M == 1) {
+        GemvInt4DualFusedActivationImpl(output, input, gate_weights, gate_scales, gate_zeros, up_weights, up_scales,
+                                        up_zeros, K, N, group_size, n_start, n_end, gelu_gate);
+        return;
+    }
+
+    const hn::ScalableTag<float> df;
+    using Di8 = hn::Rebind<int8_t, hn::ScalableTag<float>>;
+    using Du8 = hn::Rebind<uint8_t, hn::ScalableTag<float>>;
+    using Di16 = hn::Rebind<int16_t, hn::ScalableTag<float>>;
+    using Di32 = hn::Rebind<int32_t, hn::ScalableTag<float>>;
+
+    const Di8 di8;
+    const Du8 du8;
+    const Di16 di16;
+    const Di32 di32;
+
+    const size_t lanes_f = hn::Lanes(df);
+    const int lanes = static_cast<int>(lanes_f);
+    const int vec_step = (lanes >= 2 && (lanes % 2 == 0)) ? lanes : 0;
+    const int prefetch_vec_iters_ahead = PrefetchVecItersAhead(lanes);
+
+    const int num_full_groups = K / group_size;
+    const int remainder = K % group_size;
+    const int packed_K = PackedBytesForInt4(K);
+    if (num_full_groups > 0 && (!gate_scales || !gate_zeros || !up_scales || !up_zeros)) return;
+
+    const auto iota_u8 = hn::Iota(du8, 0);
+    const auto tbl_indices = hn::ShiftRight<1>(iota_u8);
+    const auto mask_bit = hn::And(iota_u8, hn::Set(du8, 1));
+    const auto mask_odd_u8 = hn::Eq(mask_bit, hn::Set(du8, 1));
+    const auto mask_odd = hn::RebindMask(di8, mask_odd_u8);
+
+    constexpr int M_BLOCK = 4;
+
+    for (int n = n_start; n < n_end; ++n) {
+        const uint8_t* gate_row = gate_weights + static_cast<int64_t>(n) * packed_K;
+        const uint8_t* up_row = up_weights + static_cast<int64_t>(n) * packed_K;
+        const float gate_s_tail = (num_full_groups > 0)
+                                      ? gate_scales[static_cast<int64_t>(n) * num_full_groups + num_full_groups - 1]
+                                      : 1.0f;
+        const float gate_z_tail = (num_full_groups > 0)
+                                      ? gate_zeros[static_cast<int64_t>(n) * num_full_groups + num_full_groups - 1]
+                                      : 0.0f;
+        const float up_s_tail = (num_full_groups > 0)
+                                    ? up_scales[static_cast<int64_t>(n) * num_full_groups + num_full_groups - 1]
+                                    : 1.0f;
+        const float up_z_tail = (num_full_groups > 0)
+                                    ? up_zeros[static_cast<int64_t>(n) * num_full_groups + num_full_groups - 1]
+                                    : 0.0f;
+
+        int m = m_start;
+        for (; m + M_BLOCK <= m_end; m += M_BLOCK) {
+            auto gate_acc0 = hn::Zero(df);
+            auto gate_acc1 = hn::Zero(df);
+            auto gate_acc2 = hn::Zero(df);
+            auto gate_acc3 = hn::Zero(df);
+            auto up_acc0 = hn::Zero(df);
+            auto up_acc1 = hn::Zero(df);
+            auto up_acc2 = hn::Zero(df);
+            auto up_acc3 = hn::Zero(df);
+            float gate_scalar0 = 0.0f, gate_scalar1 = 0.0f, gate_scalar2 = 0.0f, gate_scalar3 = 0.0f;
+            float up_scalar0 = 0.0f, up_scalar1 = 0.0f, up_scalar2 = 0.0f, up_scalar3 = 0.0f;
+
+            const float* in0 = input + static_cast<int64_t>(m + 0) * input_stride;
+            const float* in1 = input + static_cast<int64_t>(m + 1) * input_stride;
+            const float* in2 = input + static_cast<int64_t>(m + 2) * input_stride;
+            const float* in3 = input + static_cast<int64_t>(m + 3) * input_stride;
+
+            for (int g = 0; g < num_full_groups; ++g) {
+                const int k_base = g * group_size;
+                const float gate_s = gate_scales[static_cast<int64_t>(n) * num_full_groups + g];
+                const float gate_z = gate_zeros[static_cast<int64_t>(n) * num_full_groups + g];
+                const float up_s = up_scales[static_cast<int64_t>(n) * num_full_groups + g];
+                const float up_z = up_zeros[static_cast<int64_t>(n) * num_full_groups + g];
+                const auto v_gate_s = hn::Set(df, gate_s);
+                const auto v_gate_nsz = hn::Set(df, -gate_s * gate_z);
+                const auto v_up_s = hn::Set(df, up_s);
+                const auto v_up_nsz = hn::Set(df, -up_s * up_z);
+                const uint8_t* gate_ptr = gate_row + g * (group_size / 2);
+                const uint8_t* up_ptr = up_row + g * (group_size / 2);
+
+                int k = 0;
+                for (; vec_step > 0 && k + vec_step <= group_size; k += vec_step) {
+                    if (k + vec_step * prefetch_vec_iters_ahead < group_size) {
+                        const int pf_k = k + vec_step * prefetch_vec_iters_ahead;
+                        const int pf_kk = k_base + pf_k;
+                        ::hwy::Prefetch(gate_ptr + pf_k / 2);
+                        ::hwy::Prefetch(up_ptr + pf_k / 2);
+                        ::hwy::Prefetch(in0 + pf_kk);
+                        ::hwy::Prefetch(in1 + pf_kk);
+                        ::hwy::Prefetch(in2 + pf_kk);
+                        ::hwy::Prefetch(in3 + pf_kk);
+                    }
+
+                    const int byte_off = k / 2;
+                    auto gate_bytes = hn::LoadN(du8, gate_ptr + byte_off, lanes_f / 2);
+                    auto gate_exp = hn::BitCast(di8, hn::TableLookupBytes(gate_bytes, tbl_indices));
+                    auto gate_lo = hn::ShiftRight<4>(hn::ShiftLeft<4>(gate_exp));
+                    auto gate_hi = hn::ShiftRight<4>(gate_exp);
+                    auto gate_i8 = hn::IfThenElse(mask_odd, gate_hi, gate_lo);
+                    auto gate_f = hn::ConvertTo(df, hn::PromoteTo(di32, hn::PromoteTo(di16, gate_i8)));
+                    auto gate_dq = hn::MulAdd(v_gate_s, gate_f, v_gate_nsz);
+
+                    auto up_bytes = hn::LoadN(du8, up_ptr + byte_off, lanes_f / 2);
+                    auto up_exp = hn::BitCast(di8, hn::TableLookupBytes(up_bytes, tbl_indices));
+                    auto up_lo = hn::ShiftRight<4>(hn::ShiftLeft<4>(up_exp));
+                    auto up_hi = hn::ShiftRight<4>(up_exp);
+                    auto up_i8 = hn::IfThenElse(mask_odd, up_hi, up_lo);
+                    auto up_f = hn::ConvertTo(df, hn::PromoteTo(di32, hn::PromoteTo(di16, up_i8)));
+                    auto up_dq = hn::MulAdd(v_up_s, up_f, v_up_nsz);
+
+                    const int kk = k_base + k;
+                    const auto v_in0 = hn::LoadU(df, in0 + kk);
+                    const auto v_in1 = hn::LoadU(df, in1 + kk);
+                    const auto v_in2 = hn::LoadU(df, in2 + kk);
+                    const auto v_in3 = hn::LoadU(df, in3 + kk);
+                    gate_acc0 = hn::MulAdd(v_in0, gate_dq, gate_acc0);
+                    gate_acc1 = hn::MulAdd(v_in1, gate_dq, gate_acc1);
+                    gate_acc2 = hn::MulAdd(v_in2, gate_dq, gate_acc2);
+                    gate_acc3 = hn::MulAdd(v_in3, gate_dq, gate_acc3);
+                    up_acc0 = hn::MulAdd(v_in0, up_dq, up_acc0);
+                    up_acc1 = hn::MulAdd(v_in1, up_dq, up_acc1);
+                    up_acc2 = hn::MulAdd(v_in2, up_dq, up_acc2);
+                    up_acc3 = hn::MulAdd(v_in3, up_dq, up_acc3);
+                }
+
+                for (; k < group_size; ++k) {
+                    const int kk = k_base + k;
+                    const float gate_dq = UnpackNibbleScalar(gate_ptr, k, gate_s, gate_z);
+                    const float up_dq = UnpackNibbleScalar(up_ptr, k, up_s, up_z);
+                    gate_scalar0 += in0[kk] * gate_dq;
+                    gate_scalar1 += in1[kk] * gate_dq;
+                    gate_scalar2 += in2[kk] * gate_dq;
+                    gate_scalar3 += in3[kk] * gate_dq;
+                    up_scalar0 += in0[kk] * up_dq;
+                    up_scalar1 += in1[kk] * up_dq;
+                    up_scalar2 += in2[kk] * up_dq;
+                    up_scalar3 += in3[kk] * up_dq;
+                }
+            }
+
+            float gate0 = hn::ReduceSum(df, gate_acc0) + gate_scalar0;
+            float gate1 = hn::ReduceSum(df, gate_acc1) + gate_scalar1;
+            float gate2 = hn::ReduceSum(df, gate_acc2) + gate_scalar2;
+            float gate3 = hn::ReduceSum(df, gate_acc3) + gate_scalar3;
+            float up0 = hn::ReduceSum(df, up_acc0) + up_scalar0;
+            float up1 = hn::ReduceSum(df, up_acc1) + up_scalar1;
+            float up2 = hn::ReduceSum(df, up_acc2) + up_scalar2;
+            float up3 = hn::ReduceSum(df, up_acc3) + up_scalar3;
+
+            if (remainder > 0) {
+                for (int kk = num_full_groups * group_size; kk < K; ++kk) {
+                    const float gate_dq = UnpackNibbleScalar(gate_row, kk, gate_s_tail, gate_z_tail);
+                    const float up_dq = UnpackNibbleScalar(up_row, kk, up_s_tail, up_z_tail);
+                    gate0 += in0[kk] * gate_dq;
+                    gate1 += in1[kk] * gate_dq;
+                    gate2 += in2[kk] * gate_dq;
+                    gate3 += in3[kk] * gate_dq;
+                    up0 += in0[kk] * up_dq;
+                    up1 += in1[kk] * up_dq;
+                    up2 += in2[kk] * up_dq;
+                    up3 += in3[kk] * up_dq;
+                }
+            }
+
+            output[static_cast<int64_t>(m + 0) * N + n] = ActivateGateScalar(gate0, gelu_gate) * up0;
+            output[static_cast<int64_t>(m + 1) * N + n] = ActivateGateScalar(gate1, gelu_gate) * up1;
+            output[static_cast<int64_t>(m + 2) * N + n] = ActivateGateScalar(gate2, gelu_gate) * up2;
+            output[static_cast<int64_t>(m + 3) * N + n] = ActivateGateScalar(gate3, gelu_gate) * up3;
+        }
+
+        for (; m < m_end; ++m) {
+            GemvInt4DualFusedActivationImpl(output + static_cast<int64_t>(m) * N,
+                                            input + static_cast<int64_t>(m) * input_stride, gate_weights, gate_scales,
+                                            gate_zeros, up_weights, up_scales, up_zeros, K, N, group_size, n, n + 1,
+                                            gelu_gate);
+        }
+    }
+}
+
+void GemmInt4DualFusedSiluBatchedImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT input,
+                                      const uint8_t* HWY_RESTRICT gate_weights,
+                                      const float* HWY_RESTRICT gate_scales,
+                                      const float* HWY_RESTRICT gate_zeros,
+                                      const uint8_t* HWY_RESTRICT up_weights,
+                                      const float* HWY_RESTRICT up_scales, const float* HWY_RESTRICT up_zeros, int M,
+                                      int K, int N, int group_size, int m_start, int m_end, int n_start, int n_end,
+                                      size_t input_stride_bytes) {
+    GemmInt4DualFusedActivationBatchedImpl(output, input, gate_weights, gate_scales, gate_zeros, up_weights, up_scales,
+                                           up_zeros, M, K, N, group_size, m_start, m_end, n_start, n_end,
+                                           input_stride_bytes, false);
+}
+
+void GemmInt4DualFusedGeluBatchedImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT input,
+                                      const uint8_t* HWY_RESTRICT gate_weights,
+                                      const float* HWY_RESTRICT gate_scales,
+                                      const float* HWY_RESTRICT gate_zeros,
+                                      const uint8_t* HWY_RESTRICT up_weights,
+                                      const float* HWY_RESTRICT up_scales, const float* HWY_RESTRICT up_zeros, int M,
+                                      int K, int N, int group_size, int m_start, int m_end, int n_start, int n_end,
+                                      size_t input_stride_bytes) {
+    GemmInt4DualFusedActivationBatchedImpl(output, input, gate_weights, gate_scales, gate_zeros, up_weights, up_scales,
+                                           up_zeros, M, K, N, group_size, m_start, m_end, n_start, n_end,
+                                           input_stride_bytes, true);
 }
 
 // ============================================================================
@@ -951,6 +1208,9 @@ namespace hwy_kernels {
 
 HWY_EXPORT(GemvInt4Impl);
 HWY_EXPORT(GemvInt4DualFusedSiluImpl);
+HWY_EXPORT(GemvInt4DualFusedGeluImpl);
+HWY_EXPORT(GemmInt4DualFusedSiluBatchedImpl);
+HWY_EXPORT(GemmInt4DualFusedGeluBatchedImpl);
 HWY_EXPORT(GemmInt4BatchedImpl);
 HWY_EXPORT(PrepackInt4WeightsInterleavedImpl);
 
@@ -965,6 +1225,34 @@ void GemvInt4DualFusedSilu_Hwy(float* output, const float* input, const uint8_t*
                                int n_start, int n_end) {
     HWY_DYNAMIC_DISPATCH(GemvInt4DualFusedSiluImpl)(output, input, gate_weights, gate_scales, gate_zeros, up_weights,
                                                     up_scales, up_zeros, K, N, group_size, n_start, n_end);
+}
+
+void GemvInt4DualFusedGelu_Hwy(float* output, const float* input, const uint8_t* gate_weights,
+                               const float* gate_scales, const float* gate_zeros, const uint8_t* up_weights,
+                               const float* up_scales, const float* up_zeros, int K, int N, int group_size,
+                               int n_start, int n_end) {
+    HWY_DYNAMIC_DISPATCH(GemvInt4DualFusedGeluImpl)(output, input, gate_weights, gate_scales, gate_zeros, up_weights,
+                                                    up_scales, up_zeros, K, N, group_size, n_start, n_end);
+}
+
+void GemmInt4DualFusedSiluBatched_Hwy(float* output, const float* input, const uint8_t* gate_weights,
+                                      const float* gate_scales, const float* gate_zeros,
+                                      const uint8_t* up_weights, const float* up_scales, const float* up_zeros, int M,
+                                      int K, int N, int group_size, int m_start, int m_end, int n_start, int n_end,
+                                      size_t input_stride_bytes) {
+    HWY_DYNAMIC_DISPATCH(GemmInt4DualFusedSiluBatchedImpl)(output, input, gate_weights, gate_scales, gate_zeros,
+                                                           up_weights, up_scales, up_zeros, M, K, N, group_size,
+                                                           m_start, m_end, n_start, n_end, input_stride_bytes);
+}
+
+void GemmInt4DualFusedGeluBatched_Hwy(float* output, const float* input, const uint8_t* gate_weights,
+                                      const float* gate_scales, const float* gate_zeros,
+                                      const uint8_t* up_weights, const float* up_scales, const float* up_zeros, int M,
+                                      int K, int N, int group_size, int m_start, int m_end, int n_start, int n_end,
+                                      size_t input_stride_bytes) {
+    HWY_DYNAMIC_DISPATCH(GemmInt4DualFusedGeluBatchedImpl)(output, input, gate_weights, gate_scales, gate_zeros,
+                                                           up_weights, up_scales, up_zeros, M, K, N, group_size,
+                                                           m_start, m_end, n_start, n_end, input_stride_bytes);
 }
 
 void GemmInt4Batched_Hwy(float* output, const float* input, const uint8_t* weights, const float* scales,

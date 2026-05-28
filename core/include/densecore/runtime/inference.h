@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "densecore/runtime/ggml_compute_policy.h"
+
 #include "densecore/hal/tensor.h"
 #include "densecore/memory/kv_cache.h"
 #include "densecore/models/model_graph_capabilities.h"
@@ -339,6 +341,15 @@ struct Qwen36ProfileSnapshot {
     std::array<uint64_t, kMatmulWeightTypeHistCount> prefill_matmul_weight_type_hist{};
     std::array<uint64_t, kMatmulPathHistCount> prefill_matmul_path_hist{};
     std::vector<MatmulShapeCensusEntry> decode_matmul_top_shapes;
+    uint64_t qwen_target_ggml_compute_ops = 0;
+    uint64_t qwen_target_ggml_matmul_ops = 0;
+    uint64_t qwen_target_ggml_matmul_id_ops = 0;
+    uint64_t qwen_target_ggml_quant_vecdot_ops = 0;
+    uint64_t qwen_target_ggml_quantize_kv_ops = 0;
+    uint64_t qwen_target_ggml_attention_ops = 0;
+    std::string qwen_target_ggml_compute_last_reason;
+    std::string qwen_target_ggml_compute_last_op;
+    std::string qwen_target_ggml_compute_target;
     uint64_t q6k_gemv_seen_ops = 0;
     uint64_t q6k_gemv_candidate_ops = 0;
     uint64_t q6k_gemv_used_ops = 0;
@@ -366,6 +377,59 @@ struct Qwen36ProfileSnapshot {
     uint64_t moe_q4k_repacked_used_ops = 0;
     uint64_t moe_q4k_repacked_rejected_ops = 0;
     std::string moe_q4k_repacked_last_reject_reason;
+    uint64_t gemma4_moe_prefill_quant_batch_candidate_ops = 0;
+    uint64_t gemma4_moe_prefill_quant_batch_used_ops = 0;
+    uint64_t gemma4_moe_prefill_quant_batch_rejected_ops = 0;
+    std::string gemma4_moe_prefill_quant_batch_last_reject_reason;
+    uint64_t gemma4_moe_prefill_quant_batch_gate_up_used = 0;
+    uint64_t gemma4_moe_prefill_quant_batch_down_used = 0;
+    uint64_t gemma4_native_moe_prefill_candidate_layers = 0;
+    uint64_t gemma4_native_moe_prefill_used_layers = 0;
+    uint64_t gemma4_native_moe_prefill_rejected_layers = 0;
+    std::string gemma4_native_moe_prefill_last_reject_reason;
+    uint64_t gemma4_native_moe_prefill_gate_up_ns = 0;
+    uint64_t gemma4_native_moe_prefill_down_ns = 0;
+    uint64_t gemma4_native_moe_prefill_total_ns = 0;
+    uint64_t gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops = 0;
+    uint64_t gemma4_native_moe_prefill_duplicate_work_detected = 0;
+    uint64_t gemma4_dense_prefill_native_candidate_ops = 0;
+    uint64_t gemma4_dense_prefill_native_used_ops = 0;
+    uint64_t gemma4_dense_prefill_native_rejected_ops = 0;
+    std::string gemma4_dense_prefill_native_last_reject_reason;
+    uint64_t gemma4_dense_prefill_native_q4k_ops = 0;
+    uint64_t gemma4_dense_prefill_native_q8_0_ops = 0;
+    uint64_t gemma4_dense_prefill_native_ns = 0;
+    uint64_t gemma4_dense_prefill_replaced_ggml_mul_mat_ops = 0;
+    uint64_t gemma4_dense_prefill_duplicate_work_detected = 0;
+    uint64_t gemma4_fast_gelu_enabled = 0;
+    uint64_t gemma4_fast_gelu_used = 0;
+    uint64_t gemma4_fast_gelu_ns = 0;
+    uint64_t gemma4_native_moe_prefill_gate_up_fast_gelu_ns = 0;
+    uint64_t gemma4_decode_native_candidate_ops = 0;
+    uint64_t gemma4_decode_native_used_ops = 0;
+    uint64_t gemma4_decode_native_rejected_ops = 0;
+    std::string gemma4_decode_native_last_reject_reason;
+    uint64_t gemma4_decode_native_moe_used_ops = 0;
+    uint64_t gemma4_decode_native_dense_used_ops = 0;
+    uint64_t gemma4_decode_native_lm_head_used_ops = 0;
+    uint64_t gemma4_decode_native_ns = 0;
+    uint64_t gemma4_decode_replaced_ggml_mul_mat_ops = 0;
+    uint64_t gemma4_decode_replaced_ggml_mul_mat_id_ops = 0;
+    uint64_t gemma4_decode_duplicate_work_detected = 0;
+    uint64_t gemma4_native_int4_gemv_candidate_ops = 0;
+    uint64_t gemma4_native_int4_gemv_used_ops = 0;
+    uint64_t gemma4_native_int4_gemv_ns = 0;
+    uint64_t gemma4_native_int4_repacked_weight_count = 0;
+    uint64_t gemma4_native_int4_repacked_bytes = 0;
+    uint64_t gemma4_native_fused_gateup_used_ops = 0;
+    uint64_t ggml_delegated_quant_gemv_ops = 0;
+    uint64_t gemma4_native_paged_attention_candidate_ops = 0;
+    uint64_t gemma4_native_paged_attention_used_ops = 0;
+    uint64_t gemma4_native_paged_attention_ns = 0;
+    uint64_t gemma4_ggml_attention_fallback_ops = 0;
+    int gemma4_paged_attention_cache_type = -1;
+    int gemma4_paged_attention_context_len = 0;
+    uint64_t gemma4_paged_attention_head_range = 0;
     uint64_t native_moe_fast_decode_candidate_ops = 0;
     uint64_t native_moe_fast_decode_used_ops = 0;
     uint64_t native_moe_fast_decode_rejected_ops = 0;
@@ -454,11 +518,32 @@ void RecordMoESmallDecodeParallelDecision(InferenceWorkContext* ctx, bool candid
                                           int task_count);
 void RecordMoEExpertMatmulWeightType(InferenceWorkContext* ctx, ggml_type weight_type);
 void RecordMoEQ4KRepackedDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason);
+void RecordGemma4MoEPrefillQuantBatchDecision(InferenceWorkContext* ctx, bool candidate, bool used,
+                                              const char* reject_reason, bool gate_up_used, bool down_used);
+void RecordGemma4NativeMoEPrefillDecision(InferenceWorkContext* ctx, bool candidate, bool used,
+                                          const char* reject_reason, uint64_t replaced_mul_mat_id_ops,
+                                          bool duplicate_work_detected);
+void RecordGemma4NativeMoEPrefillTiming(InferenceWorkContext* ctx, uint64_t gate_up_ns, uint64_t down_ns,
+                                        uint64_t total_ns);
+void RecordGemma4DensePrefillNativeDecision(InferenceWorkContext* ctx, bool candidate, bool used,
+                                            const char* reject_reason, ggml_type weight_type,
+                                            uint64_t replaced_mul_mat_ops, bool duplicate_work_detected);
+void RecordGemma4DensePrefillNativeTiming(InferenceWorkContext* ctx, uint64_t wall_ns);
+void RecordGemma4FastGeluDecision(InferenceWorkContext* ctx, bool enabled, bool used, uint64_t wall_ns);
+void RecordGemma4DecodeNativeDecision(InferenceWorkContext* ctx, bool candidate, bool used,
+                                      const char* reject_reason, bool moe_used, bool dense_used,
+                                      bool lm_head_used, uint64_t wall_ns, uint64_t replaced_mul_mat_ops,
+                                      uint64_t replaced_mul_mat_id_ops, bool duplicate_work_detected);
+void RecordGemma4GgmlAttentionFallback(InferenceWorkContext* ctx);
+void RecordGemma4NativeFusedGateUpUsed(InferenceWorkContext* ctx);
 void RecordMatmulDispatchCensus(InferenceWorkContext* ctx, InferenceExecutionPhase phase, const char* dispatch_path,
                                 ggml_type weight_type, int64_t m, int64_t n, int64_t k, uint64_t wall_ns);
 void RecordGraphBuildMatmulCensus(InferenceWorkContext* ctx, InferenceExecutionPhase phase, const char* dispatch_path,
                                   ggml_type weight_type, int64_t m, int64_t n, int64_t k, const char* left_name,
                                   const char* right_name, bool expected_decode);
+void RecordQwenTargetGgmlComputeFallback(InferenceWorkContext* ctx, const TransformerModel* model,
+                                         densecore::runtime::GgmlComputeOp op, const char* reason,
+                                         const char* tensor_name, InferenceExecutionPhase phase);
 void RecordQ6KGemvDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,
                            const char* weight_name, int64_t m, int64_t n, int64_t k, uint64_t wall_ns,
                            const char* effective_phase = nullptr, const char* graph_phase = nullptr,

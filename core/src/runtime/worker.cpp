@@ -5960,6 +5960,114 @@ void EngineLoop(EngineState* state) {
                         req->moe_q4k_repacked_last_reject_reason =
                             qwen36_profile.moe_q4k_repacked_last_reject_reason;
                     }
+                    req->gemma4_moe_prefill_quant_batch_candidate_ops +=
+                        qwen36_profile.gemma4_moe_prefill_quant_batch_candidate_ops;
+                    req->gemma4_moe_prefill_quant_batch_used_ops +=
+                        qwen36_profile.gemma4_moe_prefill_quant_batch_used_ops;
+                    req->gemma4_moe_prefill_quant_batch_rejected_ops +=
+                        qwen36_profile.gemma4_moe_prefill_quant_batch_rejected_ops;
+                    req->gemma4_moe_prefill_quant_batch_gate_up_used +=
+                        qwen36_profile.gemma4_moe_prefill_quant_batch_gate_up_used;
+                    req->gemma4_moe_prefill_quant_batch_down_used +=
+                        qwen36_profile.gemma4_moe_prefill_quant_batch_down_used;
+                    if (!qwen36_profile.gemma4_moe_prefill_quant_batch_last_reject_reason.empty()) {
+                        req->gemma4_moe_prefill_quant_batch_last_reject_reason =
+                            qwen36_profile.gemma4_moe_prefill_quant_batch_last_reject_reason;
+                    }
+                    req->gemma4_native_moe_prefill_candidate_layers +=
+                        qwen36_profile.gemma4_native_moe_prefill_candidate_layers;
+                    req->gemma4_native_moe_prefill_used_layers +=
+                        qwen36_profile.gemma4_native_moe_prefill_used_layers;
+                    req->gemma4_native_moe_prefill_rejected_layers +=
+                        qwen36_profile.gemma4_native_moe_prefill_rejected_layers;
+                    req->gemma4_native_moe_prefill_gate_up_ns +=
+                        qwen36_profile.gemma4_native_moe_prefill_gate_up_ns;
+                    req->gemma4_native_moe_prefill_down_ns +=
+                        qwen36_profile.gemma4_native_moe_prefill_down_ns;
+                    req->gemma4_native_moe_prefill_total_ns +=
+                        qwen36_profile.gemma4_native_moe_prefill_total_ns;
+                    req->gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops +=
+                        qwen36_profile.gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops;
+                    req->gemma4_native_moe_prefill_duplicate_work_detected +=
+                        qwen36_profile.gemma4_native_moe_prefill_duplicate_work_detected;
+                    if (!qwen36_profile.gemma4_native_moe_prefill_last_reject_reason.empty()) {
+                        req->gemma4_native_moe_prefill_last_reject_reason =
+                            qwen36_profile.gemma4_native_moe_prefill_last_reject_reason;
+                    }
+                    req->gemma4_dense_prefill_native_candidate_ops +=
+                        qwen36_profile.gemma4_dense_prefill_native_candidate_ops;
+                    req->gemma4_dense_prefill_native_used_ops +=
+                        qwen36_profile.gemma4_dense_prefill_native_used_ops;
+                    req->gemma4_dense_prefill_native_rejected_ops +=
+                        qwen36_profile.gemma4_dense_prefill_native_rejected_ops;
+                    req->gemma4_dense_prefill_native_q4k_ops +=
+                        qwen36_profile.gemma4_dense_prefill_native_q4k_ops;
+                    req->gemma4_dense_prefill_native_q8_0_ops +=
+                        qwen36_profile.gemma4_dense_prefill_native_q8_0_ops;
+                    req->gemma4_dense_prefill_native_ns +=
+                        qwen36_profile.gemma4_dense_prefill_native_ns;
+                    req->gemma4_dense_prefill_replaced_ggml_mul_mat_ops +=
+                        qwen36_profile.gemma4_dense_prefill_replaced_ggml_mul_mat_ops;
+                    req->gemma4_dense_prefill_duplicate_work_detected +=
+                        qwen36_profile.gemma4_dense_prefill_duplicate_work_detected;
+                    if (!qwen36_profile.gemma4_dense_prefill_native_last_reject_reason.empty()) {
+                        req->gemma4_dense_prefill_native_last_reject_reason =
+                            qwen36_profile.gemma4_dense_prefill_native_last_reject_reason;
+                    }
+                    req->gemma4_fast_gelu_enabled += qwen36_profile.gemma4_fast_gelu_enabled;
+                    req->gemma4_fast_gelu_used += qwen36_profile.gemma4_fast_gelu_used;
+                    req->gemma4_fast_gelu_ns += qwen36_profile.gemma4_fast_gelu_ns;
+                    req->gemma4_native_moe_prefill_gate_up_fast_gelu_ns +=
+                        qwen36_profile.gemma4_native_moe_prefill_gate_up_fast_gelu_ns;
+                    req->gemma4_decode_native_candidate_ops +=
+                        qwen36_profile.gemma4_decode_native_candidate_ops;
+                    req->gemma4_decode_native_used_ops += qwen36_profile.gemma4_decode_native_used_ops;
+                    req->gemma4_decode_native_rejected_ops +=
+                        qwen36_profile.gemma4_decode_native_rejected_ops;
+                    req->gemma4_decode_native_moe_used_ops +=
+                        qwen36_profile.gemma4_decode_native_moe_used_ops;
+                    req->gemma4_decode_native_dense_used_ops +=
+                        qwen36_profile.gemma4_decode_native_dense_used_ops;
+                    req->gemma4_decode_native_lm_head_used_ops +=
+                        qwen36_profile.gemma4_decode_native_lm_head_used_ops;
+                    req->gemma4_decode_native_ns += qwen36_profile.gemma4_decode_native_ns;
+                    req->gemma4_decode_replaced_ggml_mul_mat_ops +=
+                        qwen36_profile.gemma4_decode_replaced_ggml_mul_mat_ops;
+                    req->gemma4_decode_replaced_ggml_mul_mat_id_ops +=
+                        qwen36_profile.gemma4_decode_replaced_ggml_mul_mat_id_ops;
+                    req->gemma4_decode_duplicate_work_detected +=
+                        qwen36_profile.gemma4_decode_duplicate_work_detected;
+                    req->gemma4_native_int4_gemv_candidate_ops +=
+                        qwen36_profile.gemma4_native_int4_gemv_candidate_ops;
+                    req->gemma4_native_int4_gemv_used_ops += qwen36_profile.gemma4_native_int4_gemv_used_ops;
+                    req->gemma4_native_int4_gemv_ns += qwen36_profile.gemma4_native_int4_gemv_ns;
+                    req->gemma4_native_int4_repacked_weight_count +=
+                        qwen36_profile.gemma4_native_int4_repacked_weight_count;
+                    req->gemma4_native_int4_repacked_bytes += qwen36_profile.gemma4_native_int4_repacked_bytes;
+                    req->gemma4_native_fused_gateup_used_ops +=
+                        qwen36_profile.gemma4_native_fused_gateup_used_ops;
+                    req->ggml_delegated_quant_gemv_ops += qwen36_profile.ggml_delegated_quant_gemv_ops;
+                    req->gemma4_native_paged_attention_candidate_ops +=
+                        qwen36_profile.gemma4_native_paged_attention_candidate_ops;
+                    req->gemma4_native_paged_attention_used_ops +=
+                        qwen36_profile.gemma4_native_paged_attention_used_ops;
+                    req->gemma4_native_paged_attention_ns +=
+                        qwen36_profile.gemma4_native_paged_attention_ns;
+                    req->gemma4_ggml_attention_fallback_ops +=
+                        qwen36_profile.gemma4_ggml_attention_fallback_ops;
+                    req->gemma4_paged_attention_cache_type =
+                        qwen36_profile.gemma4_paged_attention_cache_type;
+                    req->gemma4_paged_attention_context_len =
+                        std::max(req->gemma4_paged_attention_context_len,
+                                 qwen36_profile.gemma4_paged_attention_context_len);
+                    if (qwen36_profile.gemma4_paged_attention_head_range != 0) {
+                        req->gemma4_paged_attention_head_range =
+                            qwen36_profile.gemma4_paged_attention_head_range;
+                    }
+                    if (!qwen36_profile.gemma4_decode_native_last_reject_reason.empty()) {
+                        req->gemma4_decode_native_last_reject_reason =
+                            qwen36_profile.gemma4_decode_native_last_reject_reason;
+                    }
                     req->native_moe_fast_decode_candidate_ops +=
                         qwen36_profile.native_moe_fast_decode_candidate_ops;
                     req->native_moe_fast_decode_used_ops += qwen36_profile.native_moe_fast_decode_used_ops;
@@ -6049,6 +6157,24 @@ void EngineLoop(EngineState* state) {
                               });
                     if (req->matmul_dispatch_top_slow_entries.size() > kMatmulDispatchTopSlowCount) {
                         req->matmul_dispatch_top_slow_entries.resize(kMatmulDispatchTopSlowCount);
+                    }
+                    req->qwen_target_ggml_compute_ops += qwen36_profile.qwen_target_ggml_compute_ops;
+                    req->qwen_target_ggml_matmul_ops += qwen36_profile.qwen_target_ggml_matmul_ops;
+                    req->qwen_target_ggml_matmul_id_ops += qwen36_profile.qwen_target_ggml_matmul_id_ops;
+                    req->qwen_target_ggml_quant_vecdot_ops += qwen36_profile.qwen_target_ggml_quant_vecdot_ops;
+                    req->qwen_target_ggml_quantize_kv_ops += qwen36_profile.qwen_target_ggml_quantize_kv_ops;
+                    req->qwen_target_ggml_attention_ops += qwen36_profile.qwen_target_ggml_attention_ops;
+                    if (!qwen36_profile.qwen_target_ggml_compute_last_reason.empty()) {
+                        req->qwen_target_ggml_compute_last_reason =
+                            qwen36_profile.qwen_target_ggml_compute_last_reason;
+                    }
+                    if (!qwen36_profile.qwen_target_ggml_compute_last_op.empty()) {
+                        req->qwen_target_ggml_compute_last_op =
+                            qwen36_profile.qwen_target_ggml_compute_last_op;
+                    }
+                    if (!qwen36_profile.qwen_target_ggml_compute_target.empty()) {
+                        req->qwen_target_ggml_compute_target =
+                            qwen36_profile.qwen_target_ggml_compute_target;
                     }
                     merge_shape_entries(req->qwen36_prefill_top_slow_ops,
                                         qwen36_profile.qwen36_prefill_top_slow_ops);

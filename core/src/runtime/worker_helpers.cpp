@@ -1722,6 +1722,18 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                   << " gemma4_prefill_mul_mat_id_ms=" << ns_to_ms(req->gemma4_prefill_mul_mat_id_ns)
                   << " gemma4_prefill_mul_mat_ms=" << ns_to_ms(req->gemma4_prefill_mul_mat_ns)
                   << " gemma4_prefill_flash_attention_ms=" << ns_to_ms(req->gemma4_prefill_flash_attention_ns)
+                  << " gemma4_dense_prefill_native_used_ops=" << req->gemma4_dense_prefill_native_used_ops
+                  << " gemma4_dense_prefill_native_ms=" << ns_to_ms(req->gemma4_dense_prefill_native_ns)
+                  << " gemma4_dense_prefill_replaced_ggml_mul_mat_ops="
+                  << req->gemma4_dense_prefill_replaced_ggml_mul_mat_ops
+                  << " gemma4_fast_gelu_used=" << req->gemma4_fast_gelu_used
+                  << " gemma4_fast_gelu_ms=" << ns_to_ms(req->gemma4_fast_gelu_ns)
+                  << " gemma4_native_moe_prefill_gate_up_ms="
+                  << ns_to_ms(req->gemma4_native_moe_prefill_gate_up_ns)
+                  << " gemma4_native_moe_prefill_down_ms="
+                  << ns_to_ms(req->gemma4_native_moe_prefill_down_ns)
+                  << " gemma4_native_moe_prefill_total_ms="
+                  << ns_to_ms(req->gemma4_native_moe_prefill_total_ns)
                   << " gemma4_prefill_top_slow_ops=" << gemma4_prefill_top_slow_ops
                   << " moe_forward_ms=" << ns_to_ms(req->moe_forward_ns)
                   << " moe_route_ms=" << ns_to_ms(req->moe_route_ns)
@@ -1998,6 +2010,113 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " moe_q4k_repacked_last_reject_reason="
         << (req->moe_q4k_repacked_last_reject_reason.empty() ? "none"
                                                              : req->moe_q4k_repacked_last_reject_reason.c_str())
+        << " gemma4_moe_prefill_quant_batch_candidate_ops="
+        << req->gemma4_moe_prefill_quant_batch_candidate_ops
+        << " gemma4_moe_prefill_quant_batch_used_ops=" << req->gemma4_moe_prefill_quant_batch_used_ops
+        << " gemma4_moe_prefill_quant_batch_rejected_ops="
+        << req->gemma4_moe_prefill_quant_batch_rejected_ops
+        << " gemma4_moe_prefill_quant_batch_last_reject_reason="
+        << (req->gemma4_moe_prefill_quant_batch_last_reject_reason.empty()
+                ? "none"
+                : req->gemma4_moe_prefill_quant_batch_last_reject_reason.c_str())
+        << " gemma4_moe_prefill_quant_batch_gate_up_used="
+        << req->gemma4_moe_prefill_quant_batch_gate_up_used
+        << " gemma4_moe_prefill_quant_batch_down_used="
+        << req->gemma4_moe_prefill_quant_batch_down_used
+        << " gemma4_native_moe_prefill_candidate_layers="
+        << req->gemma4_native_moe_prefill_candidate_layers
+        << " gemma4_native_moe_prefill_used_layers=" << req->gemma4_native_moe_prefill_used_layers
+        << " gemma4_native_moe_prefill_rejected_layers=" << req->gemma4_native_moe_prefill_rejected_layers
+        << " gemma4_native_moe_prefill_last_reject_reason="
+        << (req->gemma4_native_moe_prefill_last_reject_reason.empty()
+                ? "none"
+                : req->gemma4_native_moe_prefill_last_reject_reason.c_str())
+        << " gemma4_native_moe_prefill_gate_up_ms="
+        << ns_to_ms(req->gemma4_native_moe_prefill_gate_up_ns)
+        << " gemma4_native_moe_prefill_down_ms="
+        << ns_to_ms(req->gemma4_native_moe_prefill_down_ns)
+        << " gemma4_native_moe_prefill_total_ms="
+        << ns_to_ms(req->gemma4_native_moe_prefill_total_ns)
+        << " gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops="
+        << req->gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops
+        << " gemma4_native_moe_prefill_duplicate_work_detected="
+        << req->gemma4_native_moe_prefill_duplicate_work_detected
+        << " gemma4_dense_prefill_native_candidate_ops="
+        << req->gemma4_dense_prefill_native_candidate_ops
+        << " gemma4_dense_prefill_native_used_ops=" << req->gemma4_dense_prefill_native_used_ops
+        << " gemma4_dense_prefill_native_rejected_ops="
+        << req->gemma4_dense_prefill_native_rejected_ops
+        << " gemma4_dense_prefill_native_last_reject_reason="
+        << (req->gemma4_dense_prefill_native_last_reject_reason.empty()
+                ? "none"
+                : req->gemma4_dense_prefill_native_last_reject_reason.c_str())
+        << " gemma4_dense_prefill_native_q4k_ops=" << req->gemma4_dense_prefill_native_q4k_ops
+        << " gemma4_dense_prefill_native_q8_0_ops=" << req->gemma4_dense_prefill_native_q8_0_ops
+        << " gemma4_dense_prefill_native_ms="
+        << ns_to_ms(req->gemma4_dense_prefill_native_ns)
+        << " gemma4_dense_prefill_replaced_ggml_mul_mat_ops="
+        << req->gemma4_dense_prefill_replaced_ggml_mul_mat_ops
+        << " gemma4_dense_prefill_duplicate_work_detected="
+        << req->gemma4_dense_prefill_duplicate_work_detected
+        << " gemma4_fast_gelu_enabled=" << req->gemma4_fast_gelu_enabled
+        << " gemma4_fast_gelu_used=" << req->gemma4_fast_gelu_used
+        << " gemma4_fast_gelu_ms=" << ns_to_ms(req->gemma4_fast_gelu_ns)
+        << " gemma4_native_moe_prefill_gate_up_fast_gelu_ms="
+        << ns_to_ms(req->gemma4_native_moe_prefill_gate_up_fast_gelu_ns)
+        << " gemma4_decode_native_candidate_ops=" << req->gemma4_decode_native_candidate_ops
+        << " gemma4_decode_native_used_ops=" << req->gemma4_decode_native_used_ops
+        << " gemma4_decode_native_rejected_ops=" << req->gemma4_decode_native_rejected_ops
+        << " gemma4_decode_native_last_reject_reason="
+        << (req->gemma4_decode_native_last_reject_reason.empty()
+                ? "none"
+                : req->gemma4_decode_native_last_reject_reason.c_str())
+        << " gemma4_decode_native_moe_used_ops=" << req->gemma4_decode_native_moe_used_ops
+        << " gemma4_decode_native_dense_used_ops=" << req->gemma4_decode_native_dense_used_ops
+        << " gemma4_decode_native_lm_head_used_ops=" << req->gemma4_decode_native_lm_head_used_ops
+        << " gemma4_decode_native_ms=" << ns_to_ms(req->gemma4_decode_native_ns)
+        << " gemma4_decode_replaced_ggml_mul_mat_ops="
+        << req->gemma4_decode_replaced_ggml_mul_mat_ops
+        << " gemma4_decode_replaced_ggml_mul_mat_id_ops="
+        << req->gemma4_decode_replaced_ggml_mul_mat_id_ops
+        << " gemma4_decode_duplicate_work_detected=" << req->gemma4_decode_duplicate_work_detected
+        << " gemma4_native_int4_gemv_candidate_ops="
+        << req->gemma4_native_int4_gemv_candidate_ops
+        << " gemma4_native_int4_gemv_used_ops=" << req->gemma4_native_int4_gemv_used_ops
+        << " gemma4_native_int4_gemv_ms=" << ns_to_ms(req->gemma4_native_int4_gemv_ns)
+        << " gemma4_native_int4_repacked_weight_count="
+        << req->gemma4_native_int4_repacked_weight_count
+        << " gemma4_native_int4_repacked_bytes=" << req->gemma4_native_int4_repacked_bytes
+        << " gemma4_native_fused_gateup_used_ops="
+        << req->gemma4_native_fused_gateup_used_ops
+        << " ggml_delegated_quant_gemv_ops=" << req->ggml_delegated_quant_gemv_ops
+        << " gemma4_native_paged_attention_candidate_ops="
+        << req->gemma4_native_paged_attention_candidate_ops
+        << " gemma4_native_paged_attention_used_ops="
+        << req->gemma4_native_paged_attention_used_ops
+        << " gemma4_native_paged_attention_ms="
+        << ns_to_ms(req->gemma4_native_paged_attention_ns)
+        << " gemma4_ggml_attention_fallback_ops="
+        << req->gemma4_ggml_attention_fallback_ops
+        << " gemma4_paged_attention_cache_type="
+        << req->gemma4_paged_attention_cache_type
+        << " gemma4_paged_attention_context_len="
+        << req->gemma4_paged_attention_context_len
+        << " gemma4_paged_attention_head_range="
+        << req->gemma4_paged_attention_head_range
+        << " gemma4_ggml_mul_mat_prefill_remaining_ms="
+        << ns_to_ms(req->gemma4_prefill_mul_mat_ns)
+        << " gemma4_ggml_mul_mat_id_prefill_remaining_ms="
+        << ns_to_ms(req->gemma4_prefill_mul_mat_id_ns)
+        << " gemma4_ggml_mul_mat_decode_remaining_ms="
+        << ns_to_ms(req->decode_graph_node_mul_mat_ns)
+        << " gemma4_ggml_mul_mat_id_decode_remaining_ms="
+        << ns_to_ms(req->decode_graph_node_mul_mat_id_ns)
+        << " gemma4_native_prefill_replaced_ggml_ops="
+        << (req->gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops +
+            req->gemma4_dense_prefill_replaced_ggml_mul_mat_ops)
+        << " gemma4_native_decode_replaced_ggml_ops="
+        << (req->gemma4_decode_replaced_ggml_mul_mat_ops +
+            req->gemma4_decode_replaced_ggml_mul_mat_id_ops)
         << " native_moe_graph_ms=" << ns_to_ms(req->native_moe_graph_ns)
         << " native_moe_graph_node_hist="
         << (req->native_moe_graph_node_hist.empty() ? "none" : req->native_moe_graph_node_hist.c_str())
@@ -2082,6 +2201,20 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " moe_top_k=" << req->moe_top_k
         << " moe_expert_parallel_tasks=" << req->moe_expert_parallel_tasks
         << " matmul_dispatch_top_slow=" << matmul_top_slow
+        << " qwen_target_ggml_compute_ops=" << req->qwen_target_ggml_compute_ops
+        << " qwen_target_ggml_matmul_ops=" << req->qwen_target_ggml_matmul_ops
+        << " qwen_target_ggml_matmul_id_ops=" << req->qwen_target_ggml_matmul_id_ops
+        << " qwen_target_ggml_quant_vecdot_ops=" << req->qwen_target_ggml_quant_vecdot_ops
+        << " qwen_target_ggml_quantize_kv_ops=" << req->qwen_target_ggml_quantize_kv_ops
+        << " qwen_target_ggml_attention_ops=" << req->qwen_target_ggml_attention_ops
+        << " qwen_target_ggml_compute_last_reason="
+        << (req->qwen_target_ggml_compute_last_reason.empty()
+                ? "none"
+                : req->qwen_target_ggml_compute_last_reason.c_str())
+        << " qwen_target_ggml_compute_last_op="
+        << (req->qwen_target_ggml_compute_last_op.empty() ? "none" : req->qwen_target_ggml_compute_last_op.c_str())
+        << " qwen_target_ggml_compute_target="
+        << (req->qwen_target_ggml_compute_target.empty() ? "none" : req->qwen_target_ggml_compute_target.c_str())
         << " qwen36_prefill_total_ms=" << ns_to_ms(req->qwen36_prefill_total_ns)
         << " qwen36_prefill_ssm_projection_ms=" << ns_to_ms(req->qwen36_prefill_ssm_projection_ns)
         << " qwen36_prefill_ssm_delta_state_ms=" << ns_to_ms(req->qwen36_prefill_ssm_delta_state_ns)

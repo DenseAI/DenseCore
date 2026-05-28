@@ -64,6 +64,7 @@
 #include "llm/models/common/family_internal.h"
 #include "llm/runtime/deps.h"
 #include "models/gemma4_packed_expert_layout.h"
+#include "densecore/runtime/ggml_compute_policy.h"
 #include "runtime/kernel_admission.h"
 #include "runtime/runtime_env.h"
 

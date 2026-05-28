@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -80,9 +81,12 @@ struct QuantizedProjectionInputCache {
 
 constexpr int64_t kMoEQuantizedProjectionMaxBatch = 256;
 constexpr int kMoEQ4KRawBatchedTileM = 8;
+constexpr const char* kGemma4MoEPrefillQuantBatchEnv = "DENSECORE_GEMMA4_MOE_PREFILL_QUANT_BATCH";
 
 inline float GeluTanhApprox(float x);
 const std::array<float, 1 << 16>& GetGeluF16LookupTable();
+bool ExpertHasGgmlQuantizedWeights(const CpuBackend::ExpertWeights& expert);
+bool IsScalarScaleSidecar(const ggml_tensor* scale_tensor);
 
 struct MoEBlockQ8K {
     float d;
@@ -460,12 +464,87 @@ bool CanUseQ4KRepackedMoEGEGLUFastPath() {
 #endif
 }
 
+densecore::env::RuntimeToggleMode Gemma4NativeFusedGeluMode() {
+    return densecore::env::ParseRuntimeToggleMode("DENSECORE_GEMMA4_NATIVE_FUSED_GELU",
+                                                  densecore::env::RuntimeToggleMode::Auto);
+}
+
 bool CanUseQ4KRepackedMoEPrefillFastPath() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return false;
 #else
     return ggml_cpu_has_avx2();
 #endif
+}
+
+densecore::env::RuntimeToggleMode Gemma4MoEPrefillQuantBatchMode() {
+    return densecore::env::ParseRuntimeToggleMode(kGemma4MoEPrefillQuantBatchEnv,
+                                                  densecore::env::RuntimeToggleMode::Auto);
+}
+
+bool Gemma4MoEPrefillQuantBatchX86Supported() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return false;
+#else
+    const densecore::simd::SimdLevel level = densecore::simd::DetectSimdLevel();
+    return densecore::simd::HasX86Avx2OrBetter(level) && ggml_cpu_has_avx2();
+#endif
+}
+
+bool IsGemma4MoEPrefillQuantBatchEnabled(const TransformerModel* model) {
+    const auto mode = Gemma4MoEPrefillQuantBatchMode();
+    if (mode == densecore::env::RuntimeToggleMode::Off) {
+        return false;
+    }
+    if (!model || !model->arch_flags.is_gemma4 || model->hparams.n_experts <= 0) {
+        return false;
+    }
+    if (mode == densecore::env::RuntimeToggleMode::On) {
+        return true;
+    }
+    return Gemma4MoEPrefillQuantBatchX86Supported();
+}
+
+bool IsGemma4MoEPrefillQuantBatchForcedOn(const TransformerModel* model) {
+    return model && model->arch_flags.is_gemma4 && model->hparams.n_experts > 0 &&
+           Gemma4MoEPrefillQuantBatchMode() == densecore::env::RuntimeToggleMode::On;
+}
+
+bool CanUseGgmlQuantizedMoEPrefillBatch(const CpuBackend::ExpertWeights& exp, int64_t batch, int64_t hidden_dim,
+                                        int64_t intermediate_dim, bool safe_reference_mode,
+                                        const char** reject_reason = nullptr) {
+    auto reject = [&](const char* reason) {
+        if (reject_reason) {
+            *reject_reason = reason;
+        }
+        return false;
+    };
+    if (safe_reference_mode) return reject("safe_reference_mode");
+    if (batch <= 0 || batch > kMoEQuantizedProjectionMaxBatch) return reject("unsupported_batch");
+    if (!ExpertHasGgmlQuantizedWeights(exp)) return reject("not_ggml_quantized");
+    if (exp.w2_scale_tensor && !IsScalarScaleSidecar(exp.w2_scale_tensor)) return reject("unsupported_scale_sidecar");
+
+    const auto w1_type = static_cast<ggml_type>(exp.w1_type);
+    const auto w2_type = static_cast<ggml_type>(exp.w2_type);
+    const auto w3_type = static_cast<ggml_type>(exp.w3_type);
+
+    if (!ggml_is_quantized(w1_type) || !ggml_is_quantized(w2_type)) return reject("w1_w2_not_quantized");
+    if (exp.w3.ptr && !ggml_is_quantized(w3_type)) return reject("w3_not_quantized");
+
+    const bool q4k_gate_up =
+        exp.w1.ptr && exp.w3.ptr && w1_type == GGML_TYPE_Q4_K && w3_type == GGML_TYPE_Q4_K &&
+        hidden_dim % ggml_blck_size(GGML_TYPE_Q4_K) == 0 && intermediate_dim % 8 == 0;
+
+    const bool q4k_down =
+        exp.w2.ptr && w2_type == GGML_TYPE_Q4_K &&
+        intermediate_dim % ggml_blck_size(GGML_TYPE_Q4_K) == 0 && hidden_dim % 8 == 0;
+
+    if (!q4k_gate_up) return reject("unsupported_gate_up_shape_or_type");
+    if (!q4k_down) return reject("unsupported_down_shape_or_type");
+    if (reject_reason) {
+        *reject_reason = "none";
+    }
+    return true;
 }
 
 bool CanUseQ6KRepackedMoEGemvFastPath() {
@@ -1430,7 +1509,7 @@ SmallDecodeExpertParallelDecision ResolveSmallDecodeExpertParallelDecision(const
         return decision;
     }
 
-    if (!IsSmallDecodeExpertParallelAutoModel(model)) {
+    if (!decision.forced_on && !IsSmallDecodeExpertParallelAutoModel(model)) {
         decision.reason = "not_auto_moe_model";
         return decision;
     }
@@ -2150,7 +2229,8 @@ bool ExpertHasGgmlQuantizedWeights(const CpuBackend::ExpertWeights& expert) {
 bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, int ggml_type_id, const Tensor& input,
                                    Tensor* output, int64_t N, int64_t K, int numa_node, bool allow_parallel = true,
                                    QuantizedProjectionInputCache* input_cache = nullptr,
-                                   bool allow_kquant_rowpair_vec_dot = true) {
+                                   bool allow_kquant_rowpair_vec_dot = true,
+                                   bool prefer_q4k_repacked_prefill = false) {
     if (!backend || !weight_ptr || !output || !input.IsValid() || !output->IsValid()) return false;
     if (input.dtype != DType::F32 || output->dtype != DType::F32) return false;
     if (input.ndim != 2 || output->ndim != 2) return false;
@@ -2238,6 +2318,29 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                                             (wtype == GGML_TYPE_Q4_K || wtype == GGML_TYPE_Q6_K) &&
                                             iq_type == GGML_TYPE_Q8_K && M >= 2 && K % ggml_blck_size(wtype) == 0 &&
                                             N >= 2;
+    const bool q4k_prefill_repacked_eligible =
+        CanUseQ4KRepackedMoEPrefillFastPath() && wtype == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K && M > 1 &&
+        (N % 8) == 0 && (K % ggml_blck_size(GGML_TYPE_Q4_K)) == 0;
+    const bool enable_q4k_repacked_projection_prefill = false;
+    if (enable_q4k_repacked_projection_prefill && q4k_prefill_repacked_eligible && prefer_q4k_repacked_prefill) {
+        auto packed = GetOrCreateQ4KRepackedMoEWeight(weight_ptr, N, K);
+        if (packed && M >= 4 &&
+            RunQ4KRepackedMoEGemmM4(backend, packed, in_data, out_data, M, N, K, numa_node, allow_parallel)) {
+            LogMoEMatmulPath("ggml_q4k_repacked_prefill_gemm_m4", static_cast<int>(M), static_cast<int>(K),
+                             static_cast<int>(N), 0, allow_parallel);
+            record_q4k_repacked(true, nullptr);
+            record_dispatch("q4k_repacked_gemv");
+            return true;
+        }
+        if (packed && RunQ4KRepackedMoEGemv(backend, packed, qinput_data, iq_row_bytes, out_data, M, N, numa_node,
+                                            allow_parallel)) {
+            LogMoEMatmulPath("ggml_q4k_repacked_prefill_gemv", static_cast<int>(M), static_cast<int>(K),
+                             static_cast<int>(N), 0, allow_parallel);
+            record_q4k_repacked(true, nullptr);
+            record_dispatch("q4k_repacked_gemv");
+            return true;
+        }
+    }
     if (CanUseMoEQ4KRawBatchedScalar() && wtype == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K && M > 1 &&
         K % ggml_blck_size(GGML_TYPE_Q4_K) == 0) {
         if (RunMoEQ4KRawBatchedProjection(backend, weight_ptr, qinput_data, iq_row_bytes, out_data, M, N, K, numa_node,
@@ -2249,8 +2352,7 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
             return true;
         }
     }
-    if (CanUseQ4KRepackedMoEPrefillFastPath() && wtype == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K && M > 1 &&
-        (N % 8) == 0 && (K % ggml_blck_size(GGML_TYPE_Q4_K)) == 0) {
+    if (enable_q4k_repacked_projection_prefill && q4k_prefill_repacked_eligible && !prefer_q4k_repacked_prefill) {
         auto packed = GetOrCreateQ4KRepackedMoEWeight(weight_ptr, N, K);
         if (packed && M >= 4 &&
             RunQ4KRepackedMoEGemmM4(backend, packed, in_data, out_data, M, N, K, numa_node, allow_parallel)) {
@@ -2446,7 +2548,8 @@ bool TryRunGgmlQuantizedFusedGEGLUProjection(CpuBackend* backend, const void* ga
                                               const void* up_weight_ptr, int up_ggml_type_id, const Tensor& input,
                                               Tensor* output, int64_t N, int64_t K, int numa_node,
                                               bool allow_parallel = true,
-                                              QuantizedProjectionInputCache* input_cache = nullptr) {
+                                              QuantizedProjectionInputCache* input_cache = nullptr,
+                                              bool prefer_q4k_repacked_prefill = false) {
     if (!backend || !gate_weight_ptr || !up_weight_ptr || !output || !input.IsValid() || !output->IsValid()) {
         return false;
     }
@@ -2533,6 +2636,26 @@ bool TryRunGgmlQuantizedFusedGEGLUProjection(CpuBackend* backend, const void* ga
         qinput_data = qinput_buf.data();
     }
 
+    const bool q4k_prefill_repacked_eligible =
+        CanUseQ4KRepackedMoEGEGLUFastPath() && gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K &&
+        iq_type == GGML_TYPE_Q8_K && M > 1 && (N % 8) == 0 && (K % QK_K) == 0;
+    // The graph-level Gemma4 native prefill path owns Q4_K GEGLU micro-batches.
+    // This older backend helper can crash in ggml_gemm_q4_K_8x8_q8_K on small
+    // synthetic M>1 GEGLU fixtures, so keep it out of admission here.
+    const bool enable_q4k_repacked_geglu_prefill = false;
+    if (enable_q4k_repacked_geglu_prefill && q4k_prefill_repacked_eligible && prefer_q4k_repacked_prefill) {
+        auto gate_packed = GetOrCreateQ4KRepackedMoEWeight(gate_weight_ptr, N, K);
+        auto up_packed = GetOrCreateQ4KRepackedMoEWeight(up_weight_ptr, N, K);
+        if (gate_packed && up_packed &&
+            RunQ4KRepackedMoEFusedGEGLU(backend, gate_packed, up_packed, in_data, qinput_data, iq_row_bytes, out_data,
+                                        M, N, K, numa_node, allow_parallel)) {
+            LogMoEMatmulPath(M >= 4 ? "ggml_q4k_repacked_prefill_gemm_m4_fused_geglu"
+                                    : "ggml_q4k_repacked_prefill_fused_geglu",
+                             static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0, allow_parallel);
+            record_q4k_repacked(true, nullptr);
+            return true;
+        }
+    }
     if (CanUseMoEQ4KRawBatchedScalar() && gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K &&
         iq_type == GGML_TYPE_Q8_K && M > 1 && K % ggml_blck_size(GGML_TYPE_Q4_K) == 0) {
         if (RunMoEQ4KRawBatchedFusedGEGLU(backend, gate_weight_ptr, up_weight_ptr, qinput_data, iq_row_bytes, out_data,
@@ -2550,8 +2673,10 @@ bool TryRunGgmlQuantizedFusedGEGLUProjection(CpuBackend* backend, const void* ga
         if (gate_packed && up_packed &&
             RunQ4KRepackedMoEFusedGEGLU(backend, gate_packed, up_packed, in_data, qinput_data, iq_row_bytes, out_data,
                                         M, N, K, numa_node, allow_parallel)) {
-            LogMoEMatmulPath("ggml_q4k_repacked_fused_geglu", static_cast<int>(M), static_cast<int>(K),
-                             static_cast<int>(N), 0, allow_parallel);
+            LogMoEMatmulPath(M > 1 ? (M >= 4 ? "ggml_q4k_repacked_prefill_gemm_m4_fused_geglu"
+                                             : "ggml_q4k_repacked_prefill_fused_geglu")
+                                   : "ggml_q4k_repacked_fused_geglu",
+                             static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0, allow_parallel);
             record_q4k_repacked(true, nullptr);
             return true;
         }
@@ -2610,7 +2735,8 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
                                               const void* up_weight_ptr, int up_ggml_type_id, const Tensor& input,
                                               Tensor* output, int64_t N, int64_t K, int numa_node,
                                               bool allow_parallel = true,
-                                              QuantizedProjectionInputCache* input_cache = nullptr) {
+                                              QuantizedProjectionInputCache* input_cache = nullptr,
+                                              bool prefer_q4k_repacked_prefill = false) {
     if (!backend || !gate_weight_ptr || !up_weight_ptr || !output || !input.IsValid() || !output->IsValid()) {
         return false;
     }
@@ -2703,6 +2829,23 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
                                             up_type == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K &&
                                             gate_traits_cpu->vec_dot == up_traits_cpu->vec_dot && M >= 2 &&
                                             K % ggml_blck_size(GGML_TYPE_Q4_K) == 0 && N >= 2;
+    const bool q4k_prefill_repacked_eligible =
+        CanUseQ4KRepackedMoEPrefillFastPath() && gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K &&
+        iq_type == GGML_TYPE_Q8_K && M > 1 && (N % 8) == 0 && (K % ggml_blck_size(GGML_TYPE_Q4_K)) == 0;
+    if (q4k_prefill_repacked_eligible && prefer_q4k_repacked_prefill) {
+        auto gate_packed = GetOrCreateQ4KRepackedMoEWeight(gate_weight_ptr, N, K);
+        auto up_packed = GetOrCreateQ4KRepackedMoEWeight(up_weight_ptr, N, K);
+        if (gate_packed && up_packed) {
+            if (RunQ4KRepackedMoEFusedSwiGLUM4(backend, gate_packed, up_packed, in_data, qinput_data, iq_row_bytes,
+                                               out_data, M, N, K, numa_node, allow_parallel)) {
+                LogMoEMatmulPath(M >= 4 ? "ggml_q4k_repacked_prefill_gemm_m4_tile_fused_swiglu"
+                                        : "ggml_q4k_repacked_prefill_tile_fused_swiglu",
+                                 static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0, allow_parallel);
+                record_q4k_repacked(true, nullptr);
+                return true;
+            }
+        }
+    }
     if (CanUseMoEQ4KRawBatchedScalar() && gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K &&
         iq_type == GGML_TYPE_Q8_K && M > 1 && K % ggml_blck_size(GGML_TYPE_Q4_K) == 0) {
         if (RunMoEQ4KRawBatchedFusedSwiGLU(backend, gate_weight_ptr, up_weight_ptr, qinput_data, iq_row_bytes, out_data,
@@ -2713,8 +2856,7 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
             return true;
         }
     }
-    if (CanUseQ4KRepackedMoEPrefillFastPath() && gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K &&
-        iq_type == GGML_TYPE_Q8_K && M > 1 && (N % 8) == 0 && (K % ggml_blck_size(GGML_TYPE_Q4_K)) == 0) {
+    if (q4k_prefill_repacked_eligible && !prefer_q4k_repacked_prefill) {
         auto gate_packed = GetOrCreateQ4KRepackedMoEWeight(gate_weight_ptr, N, K);
         auto up_packed = GetOrCreateQ4KRepackedMoEWeight(up_weight_ptr, N, K);
         if (gate_packed && up_packed) {
@@ -2914,18 +3056,18 @@ bool TryRunPackedInt4ProjectionDirect(CpuBackend* backend, const CpuBackend::Exp
     return false;
 }
 
-bool TryRunPackedInt4FusedSwiGLUProjectionDirect(CpuBackend* backend,
+bool TryRunPackedInt4FusedGateUpProjectionDirect(CpuBackend* backend,
                                                  const CpuBackend::ExpertPackedInt4Weight& gate_binding,
                                                  const CpuBackend::ExpertPackedInt4Weight& up_binding,
                                                  const Tensor& input, Tensor* output, int numa_node,
-                                                 bool allow_parallel = true) {
+                                                 bool use_gelu_activation, bool allow_parallel = true) {
     if (!backend || !output || !gate_binding.IsValid() || !up_binding.IsValid() || !input.IsValid() ||
         !output->IsValid() || input.dtype != DType::F32 || output->dtype != DType::F32 || input.ndim != 2 ||
         output->ndim != 2) {
         return false;
     }
 
-    // All platforms: Highway fused SwiGLU INT4 kernels with runtime ISA dispatch
+    // All platforms: Highway fused INT4 gate/up kernels with runtime ISA dispatch.
     const int M = static_cast<int>(input.shape[0]);
     const int K = static_cast<int>(input.shape[1]);
     const int N = static_cast<int>(output->shape[1]);
@@ -2948,21 +3090,25 @@ bool TryRunPackedInt4FusedSwiGLUProjectionDirect(CpuBackend* backend,
     auto& pool = backend->GetThreadPool(numa_node);
     const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
 
-    for (int m = 0; m < M; ++m) {
-        const float* row_input = input_data + static_cast<size_t>(m) * K;
-        float* row_output = output_data + static_cast<size_t>(m) * N;
-        if (n_threads <= 1) {
-            densecore::hwy_kernels::GemvInt4DualFusedSilu_Hwy(
-                row_output, row_input, gate_binding.packed_weights, gate_binding.scales, gate_binding.zeros,
-                up_binding.packed_weights, up_binding.scales, up_binding.zeros, K, N, gate_binding.group_size, 0, N);
+    const size_t input_stride_bytes = static_cast<size_t>(K) * sizeof(float);
+    auto compute_range = [&](int n_start, int n_end) {
+        if (use_gelu_activation) {
+            densecore::hwy_kernels::GemmInt4DualFusedGeluBatched_Hwy(
+                output_data, input_data, gate_binding.packed_weights, gate_binding.scales, gate_binding.zeros,
+                up_binding.packed_weights, up_binding.scales, up_binding.zeros, M, K, N, gate_binding.group_size, 0, M,
+                n_start, n_end, input_stride_bytes);
         } else {
-            pool.ParallelFor(N, [&](int n_start, int n_end, int /*thread_id*/) {
-                densecore::hwy_kernels::GemvInt4DualFusedSilu_Hwy(
-                    row_output, row_input, gate_binding.packed_weights, gate_binding.scales, gate_binding.zeros,
-                    up_binding.packed_weights, up_binding.scales, up_binding.zeros, K, N, gate_binding.group_size,
-                    n_start, n_end);
-            });
+            densecore::hwy_kernels::GemmInt4DualFusedSiluBatched_Hwy(
+                output_data, input_data, gate_binding.packed_weights, gate_binding.scales, gate_binding.zeros,
+                up_binding.packed_weights, up_binding.scales, up_binding.zeros, M, K, N, gate_binding.group_size, 0, M,
+                n_start, n_end, input_stride_bytes);
         }
+    };
+
+    if (n_threads <= 1 || N < 128) {
+        compute_range(0, N);
+    } else {
+        pool.ParallelFor(N, [&](int n_start, int n_end, int /*thread_id*/) { compute_range(n_start, n_end); });
     }
     return true;
 }
@@ -2972,7 +3118,9 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
                            const Tensor& w3, Tensor* output, bool allow_inner_parallel = true,
                            const MoEExecutionTraceContext* trace_ctx = nullptr,
                            QuantizedProjectionInputCache* shared_input_projection_cache = nullptr,
-                           CpuBackend::MoEForwardProfile* profile = nullptr) {
+                           CpuBackend::MoEForwardProfile* profile = nullptr,
+                           bool allow_gemma4_quant_prefill_batch = false,
+                           bool force_gemma4_quant_prefill_batch = false) {
     if (!backend || !output) {
         return;
     }
@@ -2984,6 +3132,7 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     static thread_local AlignedScratch hidden_scratch;
     static thread_local AlignedScratch gate_scratch;
     QuantizedProjectionInputCache local_input_projection_cache;
+    QuantizedProjectionInputCache local_down_projection_cache;
     QuantizedProjectionInputCache* input_projection_cache =
         shared_input_projection_cache ? shared_input_projection_cache : &local_input_projection_cache;
 
@@ -2996,50 +3145,77 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     const bool enable_inner_parallel =
         allow_inner_parallel && ShouldParallelizeExpertFFNInner(batch, hidden_dim, intermediate_dim);
     const bool safe_reference_mode = IsMoESafeReferenceModeEnabled(&expert);
-    const bool ggml_quantized_vecdot_safe = batch == 1;
+    const char* gemma4_quant_prefill_reject_reason = "none";
+    const bool gemma4_quant_prefill_batch_safe =
+        allow_gemma4_quant_prefill_batch &&
+        CanUseGgmlQuantizedMoEPrefillBatch(expert, batch, hidden_dim, intermediate_dim, safe_reference_mode,
+                                           &gemma4_quant_prefill_reject_reason);
+    const bool ggml_quantized_vecdot_safe = batch == 1 || gemma4_quant_prefill_batch_safe;
+    const bool force_gemma4_quant_prefill_fast_path =
+        force_gemma4_quant_prefill_batch && gemma4_quant_prefill_batch_safe;
+    InferenceWorkContext* gemma4_quant_prefill_ctx = GetCurrentWorkContext();
 
     hidden_scratch.Resize(backend, hidden_size);
     Tensor hidden = Tensor::Make2D(hidden_scratch.ptr, batch, intermediate_dim);
     const bool profile_enabled = profile != nullptr;
     const auto w1w3_profile_begin =
         profile_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const bool used_fused_int4_swiglu =
-        !safe_reference_mode && !expert.use_gelu_activation &&
-        TryRunPackedInt4FusedSwiGLUProjectionDirect(backend, expert.w1_int4, expert.w3_int4, input, &hidden, numa_node,
-                                                    enable_inner_parallel);
-    if (used_fused_int4_swiglu) {
+    const bool used_fused_int4_gateup =
+        !safe_reference_mode &&
+        (!expert.use_gelu_activation ||
+         Gemma4NativeFusedGeluMode() != densecore::env::RuntimeToggleMode::Off) &&
+        TryRunPackedInt4FusedGateUpProjectionDirect(backend, expert.w1_int4, expert.w3_int4, input, &hidden, numa_node,
+                                                    expert.use_gelu_activation, enable_inner_parallel);
+    if (used_fused_int4_gateup) {
+        if (expert.use_gelu_activation && gemma4_quant_prefill_ctx) {
+            RecordGemma4NativeFusedGateUpUsed(gemma4_quant_prefill_ctx);
+        }
         GetMoEInt4PathHistogram().fused_swiglu_hwy.fetch_add(1, std::memory_order_relaxed);
-        LogMoEMatmulPath("fused_swiglu_hwy", static_cast<int>(input.shape[0]), static_cast<int>(input.shape[1]),
+        LogMoEMatmulPath(expert.use_gelu_activation ? "fused_geglu_hwy" : "fused_swiglu_hwy",
+                         static_cast<int>(input.shape[0]), static_cast<int>(input.shape[1]),
                          static_cast<int>(hidden.shape[1]), expert.w1_int4.group_size, enable_inner_parallel);
     }
-	    const bool used_fused_ggml_quant_swiglu =
-        !used_fused_int4_swiglu && !safe_reference_mode && ggml_quantized_vecdot_safe &&
+    const bool used_fused_ggml_quant_swiglu =
+        !used_fused_int4_gateup && !safe_reference_mode && ggml_quantized_vecdot_safe &&
         !expert.use_gelu_activation && expert.w1.ptr &&
         expert.w3.ptr &&
         TryRunGgmlQuantizedFusedSwiGLUProjection(backend, expert.w1.ptr, expert.w1_type, expert.w3.ptr, expert.w3_type,
                                                  input, &hidden, intermediate_dim, hidden_dim, numa_node,
-                                                 enable_inner_parallel, input_projection_cache);
+                                                 enable_inner_parallel, input_projection_cache,
+                                                 gemma4_quant_prefill_batch_safe);
     if (used_fused_ggml_quant_swiglu) {
-	        LogMoEMatmulPath("ggml_quantized_fused_swiglu", static_cast<int>(input.shape[0]),
-	                         static_cast<int>(input.shape[1]), static_cast<int>(hidden.shape[1]), 0, enable_inner_parallel);
-	    }
+        LogMoEMatmulPath("ggml_quantized_fused_swiglu", static_cast<int>(input.shape[0]),
+                         static_cast<int>(input.shape[1]), static_cast<int>(hidden.shape[1]), 0,
+                         enable_inner_parallel);
+        if (gemma4_quant_prefill_batch_safe) {
+            RecordGemma4MoEPrefillQuantBatchDecision(gemma4_quant_prefill_ctx, false, true, nullptr, true, false);
+        }
+    }
     const bool used_fused_ggml_quant_geglu =
-        !used_fused_int4_swiglu && !used_fused_ggml_quant_swiglu && !safe_reference_mode &&
+        !used_fused_int4_gateup && !used_fused_ggml_quant_swiglu && !safe_reference_mode &&
         ggml_quantized_vecdot_safe &&
         expert.use_gelu_activation && expert.w1.ptr && expert.w3.ptr &&
         TryRunGgmlQuantizedFusedGEGLUProjection(backend, expert.w1.ptr, expert.w1_type, expert.w3.ptr, expert.w3_type,
                                                 input, &hidden, intermediate_dim, hidden_dim, numa_node,
-                                                enable_inner_parallel, input_projection_cache);
+                                                enable_inner_parallel, input_projection_cache,
+                                                gemma4_quant_prefill_batch_safe);
     if (used_fused_ggml_quant_geglu) {
         LogMoEMatmulPath("ggml_quantized_fused_geglu", static_cast<int>(input.shape[0]),
                          static_cast<int>(input.shape[1]), static_cast<int>(hidden.shape[1]), 0, enable_inner_parallel);
+        if (gemma4_quant_prefill_batch_safe) {
+            RecordGemma4MoEPrefillQuantBatchDecision(gemma4_quant_prefill_ctx, false, true, nullptr, true, false);
+        }
     }
     const bool used_fused_gate_up =
-        used_fused_int4_swiglu || used_fused_ggml_quant_swiglu || used_fused_ggml_quant_geglu;
-	    if (!used_fused_gate_up &&
-	        (w3.IsValid() || expert.w3_int4.IsValid() || expert.w3.ptr)) {
-	        gate_scratch.Resize(backend, hidden_size);
-	    }
+        used_fused_int4_gateup || used_fused_ggml_quant_swiglu || used_fused_ggml_quant_geglu;
+    if (!used_fused_gate_up && (w3.IsValid() || expert.w3_int4.IsValid() || expert.w3.ptr)) {
+        if (force_gemma4_quant_prefill_fast_path && expert.w1.ptr && expert.w3.ptr) {
+            RecordGemma4MoEPrefillQuantBatchDecision(gemma4_quant_prefill_ctx, false, false,
+                                                     "gate_up_fast_path_failed", true, false);
+            throw std::runtime_error("Gemma4 MoE prefill quant batch gate/up fast path failed");
+        }
+        gate_scratch.Resize(backend, hidden_size);
+    }
 
     // Unified projection dispatch: packed INT4 -> ggml quantized GEMV -> F32 dense
     const auto run_projection = [&](const char projection_slot, const Tensor& src, const Tensor& dense_weight,
@@ -3086,15 +3262,24 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
             ggml_type_id != GGML_TYPE_F32 &&
             TryRunGgmlQuantizedProjection(
                 backend, raw_weight.ptr, ggml_type_id, src, dst, proj_rows, proj_cols, numa_node, enable_inner_parallel,
-                src.DataAs<float>() == input.DataAs<float>() ? input_projection_cache : nullptr,
-                allow_rowpair_vec_dot)) {
+                src.DataAs<float>() == input.DataAs<float>() ? input_projection_cache : &local_down_projection_cache,
+                allow_rowpair_vec_dot, gemma4_quant_prefill_batch_safe)) {
             if (projection_scalar_scale) {
                 ApplyScalarScaleToTensor(dst, ReadScalarScaleSidecar(expert.w2_scale_tensor));
             }
             LogMoEMatmulPath("ggml_quantized_vecdot", static_cast<int>(src.shape[0]), static_cast<int>(src.shape[1]),
                              static_cast<int>(dst->shape[1]), int4_binding.group_size, enable_inner_parallel);
             record_path("ggml_quantized_vecdot");
+            if (gemma4_quant_prefill_batch_safe && projection_slot == '2') {
+                RecordGemma4MoEPrefillQuantBatchDecision(gemma4_quant_prefill_ctx, false, true, nullptr, false, true);
+            }
             return;
+        }
+        if (force_gemma4_quant_prefill_fast_path && projection_slot == '2' && quantized_scale_supported &&
+            raw_weight.ptr && ggml_type_id != GGML_TYPE_F32) {
+            RecordGemma4MoEPrefillQuantBatchDecision(gemma4_quant_prefill_ctx, false, false,
+                                                     "down_fast_path_failed", false, true);
+            throw std::runtime_error("Gemma4 MoE prefill quant batch down fast path failed");
         }
         // Path 3: F32 dense matmul fallback (requires pre-dequantized weight)
         if (dense_weight.IsValid()) {
@@ -4873,8 +5058,29 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             const auto dequant_begin =
                 debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> cached_entry;
+            const bool prefill_phase =
+                GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill || GetCurrentWorkContext() == nullptr;
+            const bool gemma4_quant_prefill_enabled =
+                prefill_phase && model && model->arch_flags.is_gemma4 && IsGemma4MoEPrefillQuantBatchEnabled(model);
+            const bool gemma4_quant_prefill_forced =
+                prefill_phase && IsGemma4MoEPrefillQuantBatchForcedOn(model);
+            const char* gemma4_quant_prefill_reject_reason = "none";
+            const bool can_use_gemma4_quant_prefill_batch =
+                gemma4_quant_prefill_enabled &&
+                CanUseGgmlQuantizedMoEPrefillBatch(exp, work.count, static_cast<int64_t>(hidden_dim),
+                                                   static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode,
+                                                   &gemma4_quant_prefill_reject_reason);
+            if (gemma4_quant_prefill_enabled && work.count > 1) {
+                RecordGemma4MoEPrefillQuantBatchDecision(
+                    GetCurrentWorkContext(), true, false,
+                    can_use_gemma4_quant_prefill_batch ? nullptr : gemma4_quant_prefill_reject_reason, false, false);
+                if (gemma4_quant_prefill_forced && !can_use_gemma4_quant_prefill_batch) {
+                    throw std::runtime_error(std::string("Gemma4 MoE prefill quant batch rejected: ") +
+                                             gemma4_quant_prefill_reject_reason);
+                }
+            }
             const bool should_try_cache =
-                dequant_cache_enabled &&
+                dequant_cache_enabled && !can_use_gemma4_quant_prefill_batch &&
                 (cache_all_active_experts || work.local_hot ||
                  previous_batch_set.find(work.expert_id) != previous_batch_set.end() || work.count > 1);
             const size_t cacheable_bytes =
@@ -4988,13 +5194,13 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 }
                 ++local_cached_experts;
             } else {
-                // The ggml vec_dot projection path is validated for small prefill
-                // expert batches; avoid building dense weights when the quantized
-                // dispatch can consume the raw ggml rows directly.
+                // Avoid building dense weights when quantized dispatch can consume
+                // the raw ggml rows directly.
                 const bool can_use_ggml_quant_gen =
                     !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp) &&
                     (!exp.w2_scale_tensor || IsScalarScaleSidecar(exp.w2_scale_tensor)) &&
-                    work.count == 1 && work.count <= kMoEQuantizedProjectionMaxBatch;
+                    work.count <= kMoEQuantizedProjectionMaxBatch &&
+                    (work.count == 1 || can_use_gemma4_quant_prefill_batch);
                 if (!can_use_ggml_quant_gen) {
                     w1 = make_weight_f32(
                         exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr, static_cast<int64_t>(exp.intermediate_dim),
@@ -5047,7 +5253,8 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 }
             }
             DispatchExpertFFNImpl(this, work.numa_node, expert_input, exp, w1, w2, w3, &expert_out,
-                                  allow_inner_parallel, &trace_ctx, nullptr, profile);
+                                  allow_inner_parallel, &trace_ctx, nullptr, profile,
+                                  can_use_gemma4_quant_prefill_batch, gemma4_quant_prefill_forced);
             if (profile) {
                 profile->expert_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                 std::chrono::steady_clock::now() - expert_profile_begin)
@@ -5215,6 +5422,13 @@ bool RunGgmlQuantizedFusedGEGLUProjectionForTest(CpuBackend* backend, const void
     return TryRunGgmlQuantizedFusedGEGLUProjection(backend, gate_weight_ptr, gate_ggml_type_id, up_weight_ptr,
                                                    up_ggml_type_id, input, output, N, K, /*numa_node=*/0,
                                                    /*allow_parallel=*/false, nullptr);
+}
+
+bool CanUseGgmlQuantizedMoEPrefillBatchForTest(const CpuBackend::ExpertWeights& exp, int64_t batch,
+                                               int64_t hidden_dim, int64_t intermediate_dim,
+                                               bool safe_reference_mode, const char** reject_reason) {
+    return CanUseGgmlQuantizedMoEPrefillBatch(exp, batch, hidden_dim, intermediate_dim, safe_reference_mode,
+                                              reject_reason);
 }
 
 }  // namespace testing

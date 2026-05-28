@@ -4,10 +4,12 @@ package api
 import (
 	"context"
 	"descore-server/internal/domain"
+	"descore-server/internal/service"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -223,6 +225,7 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 	}
 
 	content, reasoningContent := splitReasoningResponse(h.reasoningModelHint(req), responseText)
+	content, reasoningContent = promoteExactAnswerContent(req, content, reasoningContent)
 	var toolCalls []domain.ToolCall
 	finishReason := resolveSyncFinishReason(completionTokens, req.MaxTokens)
 	if toolParsingEnabled(req) {
@@ -267,4 +270,18 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		slog.Error("failed to encode response", slog.String("error", err.Error()))
 	}
+}
+
+func promoteExactAnswerContent(req domain.ChatCompletionRequest, content, reasoningContent string) (string, string) {
+	if strings.TrimSpace(content) != "" || strings.TrimSpace(reasoningContent) == "" {
+		return content, reasoningContent
+	}
+	expected := service.ExtractExpectedExactAnswer(req)
+	if expected == "" {
+		return content, reasoningContent
+	}
+	if strings.EqualFold(strings.TrimSpace(reasoningContent), expected) {
+		return expected, ""
+	}
+	return content, reasoningContent
 }

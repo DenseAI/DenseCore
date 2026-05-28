@@ -631,6 +631,7 @@ set(SOURCES
     src/kernels/hwy/hwy_invariant_point_attention.cc
     src/kernels/hwy/hwy_triangular_attention.cc
     src/kernels/hwy/hwy_ssm.cc
+    src/kernels/hwy/hwy_moe_quant.cc
 )
 
 # ==========================================================================

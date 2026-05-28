@@ -83,6 +83,9 @@ void ReadLayerSlotsFromF16Storage(float* dst, const ggml_fp16_t* src, int num_sl
 }  // namespace
 
 size_t PagedKVCache::GetBytesPerSlot() const {
+    if (k_bytes_per_slot != 0) {
+        return k_bytes_per_slot;
+    }
     const int64_t elements = static_cast<int64_t>(head_dim) * static_cast<int64_t>(n_head_kv);
     if (elements <= 0) {
         return 0;
@@ -96,6 +99,9 @@ size_t PagedKVCache::GetBytesPerSlot() const {
 }
 
 size_t PagedKVCache::GetVBytesPerSlot() const {
+    if (v_bytes_per_slot != 0) {
+        return v_bytes_per_slot;
+    }
     const int64_t elements = static_cast<int64_t>(v_head_dim) * static_cast<int64_t>(n_head_kv);
     if (elements <= 0) {
         return 0;
@@ -109,6 +115,9 @@ size_t PagedKVCache::GetVBytesPerSlot() const {
 }
 
 size_t PagedKVCache::GetIndexBytesPerSlot() const {
+    if (index_bytes_per_slot != 0) {
+        return index_bytes_per_slot;
+    }
     if (!has_index_cache || index_head_dim <= 0) {
         return 0;
     }
@@ -116,12 +125,21 @@ size_t PagedKVCache::GetIndexBytesPerSlot() const {
 }
 
 size_t PagedKVCache::GetBytesPerBlock() const {
+    if (k_bytes_per_block != 0) {
+        return k_bytes_per_block;
+    }
     return GetBytesPerSlot() * BLOCK_SIZE;
 }
 size_t PagedKVCache::GetVBytesPerBlock() const {
+    if (v_bytes_per_block != 0) {
+        return v_bytes_per_block;
+    }
     return GetVBytesPerSlot() * BLOCK_SIZE;
 }
 size_t PagedKVCache::GetIndexBytesPerBlock() const {
+    if (index_bytes_per_block != 0) {
+        return index_bytes_per_block;
+    }
     return GetIndexBytesPerSlot() * BLOCK_SIZE;
 }
 
@@ -168,11 +186,13 @@ PagedKVCache::BlockLayout PagedKVCache::GetVBlockLayout() const {
 void* PagedKVCache::GetKBlockPtr(int block_id, int layer) {
     if (block_id < 0 || block_id >= max_blocks || layer < 0 || layer >= n_layer) return nullptr;
 
-    int64_t block_index = static_cast<int64_t>(layer) * max_blocks + block_id;
-    size_t byte_offset = block_index * GetBytesPerBlock();
-
     if (use_block_allocator && k_allocator) {
-        void* ptr = static_cast<char*>(k_allocator->ArenaBase()) + byte_offset;
+        const size_t layer_offset =
+            k_layer_stride_bytes != 0 ? k_layer_stride_bytes * static_cast<size_t>(layer)
+                                      : GetBytesPerBlock() * static_cast<size_t>(max_blocks) *
+                                            static_cast<size_t>(layer);
+        const size_t block_offset = GetBytesPerBlock() * static_cast<size_t>(block_id);
+        void* ptr = static_cast<char*>(k_allocator->ArenaBase()) + layer_offset + block_offset;
         DENSECORE_ASSERT_ALIGNED_64(ptr);
         return ptr;
     }
@@ -186,11 +206,13 @@ const void* PagedKVCache::GetKBlockPtr(int block_id, int layer) const {
 void* PagedKVCache::GetVBlockPtr(int block_id, int layer) {
     if (block_id < 0 || block_id >= max_blocks || layer < 0 || layer >= n_layer) return nullptr;
 
-    int64_t block_index = static_cast<int64_t>(layer) * max_blocks + block_id;
-    size_t byte_offset = block_index * GetVBytesPerBlock();
-
     if (use_block_allocator && v_allocator) {
-        void* ptr = static_cast<char*>(v_allocator->ArenaBase()) + byte_offset;
+        const size_t layer_offset =
+            v_layer_stride_bytes != 0 ? v_layer_stride_bytes * static_cast<size_t>(layer)
+                                      : GetVBytesPerBlock() * static_cast<size_t>(max_blocks) *
+                                            static_cast<size_t>(layer);
+        const size_t block_offset = GetVBytesPerBlock() * static_cast<size_t>(block_id);
+        void* ptr = static_cast<char*>(v_allocator->ArenaBase()) + layer_offset + block_offset;
         DENSECORE_ASSERT_ALIGNED_64(ptr);
         return ptr;
     }
@@ -205,9 +227,12 @@ void* PagedKVCache::GetIndexBlockPtr(int block_id, int layer) {
     if (!has_index_cache || !index_allocator) return nullptr;
     if (block_id < 0 || block_id >= max_blocks || layer < 0 || layer >= n_layer) return nullptr;
 
-    int64_t block_index = static_cast<int64_t>(layer) * max_blocks + block_id;
-    size_t byte_offset = block_index * GetIndexBytesPerBlock();
-    void* ptr = static_cast<char*>(index_allocator->ArenaBase()) + byte_offset;
+    const size_t layer_offset =
+        index_layer_stride_bytes != 0
+            ? index_layer_stride_bytes * static_cast<size_t>(layer)
+            : GetIndexBytesPerBlock() * static_cast<size_t>(max_blocks) * static_cast<size_t>(layer);
+    const size_t block_offset = GetIndexBytesPerBlock() * static_cast<size_t>(block_id);
+    void* ptr = static_cast<char*>(index_allocator->ArenaBase()) + layer_offset + block_offset;
     DENSECORE_ASSERT_ALIGNED_64(ptr);
     return ptr;
 }
@@ -232,6 +257,34 @@ void* PagedKVCache::GetIndexSlotPtr(int block_id, int layer, int slot) {
     void* block_ptr = GetIndexBlockPtr(block_id, layer);
     if (!block_ptr || slot < 0 || slot >= BLOCK_SIZE) return nullptr;
     return static_cast<char*>(block_ptr) + static_cast<size_t>(slot) * GetIndexBytesPerSlot();
+}
+
+void PagedKVCache::FillBlockPtrsForLayer(const std::vector<int>& block_ids, int layer,
+                                         std::vector<const void*>* k_blocks, std::vector<const void*>* v_blocks) const {
+    if (!k_blocks || !v_blocks) return;
+    k_blocks->assign(block_ids.size(), nullptr);
+    v_blocks->assign(block_ids.size(), nullptr);
+    if (layer < 0 || layer >= n_layer || !use_block_allocator || !k_allocator || !v_allocator) return;
+
+    const auto* k_base = static_cast<const char*>(k_allocator->ArenaBase());
+    const auto* v_base = static_cast<const char*>(v_allocator->ArenaBase());
+    const size_t k_layer_offset =
+        k_layer_stride_bytes != 0
+            ? k_layer_stride_bytes * static_cast<size_t>(layer)
+            : GetBytesPerBlock() * static_cast<size_t>(max_blocks) * static_cast<size_t>(layer);
+    const size_t v_layer_offset =
+        v_layer_stride_bytes != 0
+            ? v_layer_stride_bytes * static_cast<size_t>(layer)
+            : GetVBytesPerBlock() * static_cast<size_t>(max_blocks) * static_cast<size_t>(layer);
+    const size_t k_block_stride = GetBytesPerBlock();
+    const size_t v_block_stride = GetVBytesPerBlock();
+
+    for (size_t i = 0; i < block_ids.size(); ++i) {
+        const int block_id = block_ids[i];
+        if (block_id < 0 || block_id >= max_blocks) continue;
+        (*k_blocks)[i] = k_base + k_layer_offset + k_block_stride * static_cast<size_t>(block_id);
+        (*v_blocks)[i] = v_base + v_layer_offset + v_block_stride * static_cast<size_t>(block_id);
+    }
 }
 
 void PagedKVCache::CopyBlockData(int src_block_id, int dst_block_id) {

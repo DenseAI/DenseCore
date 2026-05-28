@@ -113,6 +113,10 @@ struct FastPathRuntimeConfig {
     int qwen36_ssm_q8_prefill_amx_min_tokens = 256;
     densecore::env::RuntimeToggleMode qwen36_expert_cpu_repack = densecore::env::RuntimeToggleMode::Auto;
     densecore::env::RuntimeToggleMode native_moe_fast_decode = densecore::env::RuntimeToggleMode::Auto;
+    densecore::env::RuntimeToggleMode gemma4_native_int4_decode = densecore::env::RuntimeToggleMode::Auto;
+    densecore::env::RuntimeToggleMode gemma4_int4_repack_on_load = densecore::env::RuntimeToggleMode::Auto;
+    densecore::env::RuntimeToggleMode gemma4_native_fused_gelu = densecore::env::RuntimeToggleMode::Auto;
+    densecore::env::RuntimeToggleMode gemma4_fast_softcap = densecore::env::RuntimeToggleMode::Auto;
     densecore::env::RuntimeToggleMode q4k_repacked_gemv = densecore::env::RuntimeToggleMode::Auto;
     densecore::env::RuntimeToggleMode q6k_repacked_gemv = densecore::env::RuntimeToggleMode::Auto;
     bool q4k_repacked_gemv_allow_prefill = false;

@@ -261,6 +261,15 @@ struct PagedKVCache {
     std::vector<int> layer_n_head_kv;
     std::vector<int> layer_head_dims;
     std::vector<int> layer_v_head_dims;
+    size_t k_bytes_per_slot = 0;
+    size_t v_bytes_per_slot = 0;
+    size_t index_bytes_per_slot = 0;
+    size_t k_bytes_per_block = 0;
+    size_t v_bytes_per_block = 0;
+    size_t index_bytes_per_block = 0;
+    size_t k_layer_stride_bytes = 0;
+    size_t v_layer_stride_bytes = 0;
+    size_t index_layer_stride_bytes = 0;
 
     // Cache type
     ggml_type cache_type;
@@ -328,6 +337,11 @@ struct PagedKVCache {
     // Expose packed KV layout (strides + packing) for direct kernel addressing.
     BlockLayout GetBlockLayout() const;
     BlockLayout GetVBlockLayout() const;
+
+    // Fill block pointer tables for one layer without repeated stride/type
+    // recomputation. Used by paged-attention hot paths.
+    void FillBlockPtrsForLayer(const std::vector<int>& block_ids, int layer, std::vector<const void*>* k_blocks,
+                               std::vector<const void*>* v_blocks) const;
 
     // -------------------------------------------------------------------------
     // Quantized KV Cache Operations

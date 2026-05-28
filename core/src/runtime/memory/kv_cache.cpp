@@ -245,10 +245,20 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
     cache->max_blocks = static_cast<int>(max_blocks);
     cache->block_manager = new BlockManager(cache->max_blocks, BLOCK_SIZE);
 
+    cache->k_bytes_per_slot = cache->GetBytesPerSlot();
+    cache->v_bytes_per_slot = cache->GetVBytesPerSlot();
+    cache->index_bytes_per_slot = cache->GetIndexBytesPerSlot();
+    cache->k_bytes_per_block = cache->k_bytes_per_slot * BLOCK_SIZE;
+    cache->v_bytes_per_block = cache->v_bytes_per_slot * BLOCK_SIZE;
+    cache->index_bytes_per_block = cache->index_bytes_per_slot * BLOCK_SIZE;
+    cache->k_layer_stride_bytes = cache->k_bytes_per_block * static_cast<size_t>(cache->max_blocks);
+    cache->v_layer_stride_bytes = cache->v_bytes_per_block * static_cast<size_t>(cache->max_blocks);
+    cache->index_layer_stride_bytes = cache->index_bytes_per_block * static_cast<size_t>(cache->max_blocks);
+
     int64_t n_layer_blocks = static_cast<int64_t>(cache->max_blocks) * cache->n_layer;
-    size_t k_block_stride = cache->GetBytesPerBlock();
-    size_t v_block_stride = cache->GetVBytesPerBlock();
-    size_t index_block_stride = cache->GetIndexBytesPerBlock();
+    size_t k_block_stride = cache->k_bytes_per_block;
+    size_t v_block_stride = cache->v_bytes_per_block;
+    size_t index_block_stride = cache->index_bytes_per_block;
     size_t total_logical_blocks = static_cast<size_t>(n_layer_blocks);
     size_t k_tensor_size = k_block_stride * total_logical_blocks;
     size_t v_tensor_size = v_block_stride * total_logical_blocks;
