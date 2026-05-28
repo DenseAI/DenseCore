@@ -1745,7 +1745,13 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
     const bool qwen35_dense = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts <= 0;
     const bool qwen35_moe = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0;
     const bool qwen_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
-    const int base_chunk_tokens = qwen35_dense ? 768 : ((qwen35_moe || qwen_hybrid_ssm) ? 384 : 192);
+    const int hybrid_ssm_chunk_tokens =
+#if defined(__aarch64__) || defined(_M_ARM64)
+        192;
+#else
+        384;
+#endif
+    const int base_chunk_tokens = qwen35_dense ? 768 : ((qwen35_moe || qwen_hybrid_ssm) ? hybrid_ssm_chunk_tokens : 192);
     const int base_auto_min_tokens =
         qwen35_dense ? 1024 : (qwen35_moe ? 1024 : (qwen_hybrid_ssm ? 1280 : 1536));
     const char* chunk_env = "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS";

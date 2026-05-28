@@ -118,8 +118,12 @@ RuntimeToggleMode Gemma4NativeMoEPrefillMode() {
     return densecore::env::ParseRuntimeToggleMode(kGemma4NativeMoEPrefillEnv, RuntimeToggleMode::Auto);
 }
 
-bool Gemma4NativeMoEPrefillX86Supported() {
+bool Gemma4NativeMoEPrefillKernelSupported() {
 #if defined(__aarch64__) || defined(_M_ARM64)
+    // The current Gemma4 fused gate/up prefill callback consumes Q4_Kx8
+    // repacked blocks. C4A/SVE exposes the generic ggml symbol, but not a
+    // validated ARM repack layout for this path; enabling it produced repeated
+    // long-form output under the server QA gate.
     return false;
 #else
     return ggml_cpu_has_avx2();
@@ -133,7 +137,7 @@ bool IsGemma4NativeMoEPrefillEnabledForMode(RuntimeToggleMode mode) {
     if (mode == RuntimeToggleMode::On) {
         return true;
     }
-    return Gemma4NativeMoEPrefillX86Supported();
+    return Gemma4NativeMoEPrefillKernelSupported();
 }
 
 struct Gemma4PackedMoERoots {
@@ -1305,7 +1309,7 @@ static bool CanUseGemma4GateUpQ4KPrefillFusedGEGLU(const TransformerModel* model
         return false;
     }
     if ((input->ne[0] % QK_K) != 0 || (intermediate_dim % 8) != 0) return false;
-    return ggml_cpu_has_avx2();
+    return Gemma4NativeMoEPrefillKernelSupported();
 }
 
 static bool CanUseGemma4DownQ4KPrefill(const TransformerModel* model, const ggml_tensor* down_exps,
@@ -1328,7 +1332,7 @@ static bool CanUseGemma4DownQ4KPrefill(const TransformerModel* model, const ggml
         return false;
     }
     if ((intermediate_dim % QK_K) != 0 || (hidden_dim % 8) != 0) return false;
-    return ggml_cpu_has_avx2();
+    return Gemma4NativeMoEPrefillKernelSupported();
 }
 
 static bool CanUseGemma4DownQ8_0Prefill(const TransformerModel* model, const ggml_tensor* down_exps,
@@ -1353,7 +1357,7 @@ static bool CanUseGemma4DownQ8_0Prefill(const TransformerModel* model, const ggm
     const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, intermediate_dim);
     if (row_bytes == 0 || down_exps->nb[1] != row_bytes) return false;
     if ((intermediate_dim % QK8_0) != 0 || (hidden_dim % 4) != 0) return false;
-    return ggml_cpu_has_avx2();
+    return Gemma4NativeMoEPrefillKernelSupported();
 }
 
 static bool CanUseGemma4DownNativePrefill(const TransformerModel* model, const ggml_tensor* down_exps,
@@ -2379,8 +2383,8 @@ static bool CanReplaceQwen35W2WithCustomCallback(const TransformerModel* model, 
     }
     const BatchSpec* current_batch = GetCurrentBatch();
     const auto& fast_config = ResolveFastPathRuntimeConfig(current_batch);
-    if (fast_config.native_moe_fast_decode == densecore::env::RuntimeToggleMode::Off) {
-        return reject("native_moe_fast_decode_off");
+    if (fast_config.native_moe_fast_decode != densecore::env::RuntimeToggleMode::On) {
+        return reject("native_moe_fast_decode_not_forced");
     }
     if (current_batch && !current_batch->lora_map.empty()) {
         return reject("dynamic_lora");
@@ -2591,7 +2595,9 @@ static bool CanUseQwen35NativeMoEGateUpRawQ4KSwiGLU(const TransformerModel* mode
     }
     const BatchSpec* current_batch = GetCurrentBatch();
     const auto& fast_config = ResolveFastPathRuntimeConfig(current_batch);
-    if (fast_config.native_moe_fast_decode == densecore::env::RuntimeToggleMode::Off) return reject("fast_decode_off");
+    if (fast_config.native_moe_fast_decode != densecore::env::RuntimeToggleMode::On) {
+        return reject("fast_decode_not_forced");
+    }
     if (current_batch && !current_batch->lora_map.empty()) return reject("dynamic_lora");
     if (gate_exps->type != GGML_TYPE_Q4_K || up_exps->type != GGML_TYPE_Q4_K ||
         input->type != GGML_TYPE_F32 || selected_experts->type != GGML_TYPE_I32) {
@@ -2614,10 +2620,121 @@ static bool CanUseQwen35NativeMoEGateUpRawQ4KSwiGLU(const TransformerModel* mode
     return true;
 }
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+static ggml_tensor* TryBuildQwen35NativeMoEGraphArmLegacy(ggml_context* ctx, ggml_cgraph* gf,
+                                                          TransformerModel* model, TransformerLayer* layer,
+                                                          int layer_idx, ggml_tensor* routed_input,
+                                                          ggml_tensor* gate_logits, int top_k,
+                                                          const densecore::models::DecoderLayerSpec* layer_spec) {
+    if (!ctx || !gf || !model || !layer || !routed_input || !gate_logits ||
+        (model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36) ||
+        !model->arch_flags.is_hybrid_ssm) {
+        return nullptr;
+    }
+    if (layer_spec && layer_spec->ffn.router != densecore::models::DecoderMoERouter::SoftmaxTopK) {
+        return nullptr;
+    }
+
+    ggml_tensor* gate_exps = GetLayerTensorAny(layer, {"ffn_gate_exps.weight", "ffn_gate_exps"});
+    ggml_tensor* up_exps = GetLayerTensorAny(layer, {"ffn_up_exps.weight", "ffn_up_exps"});
+    ggml_tensor* down_exps = GetLayerTensorAny(layer, {"ffn_down_exps.weight", "ffn_down_exps"});
+    if (!gate_exps || !up_exps || !down_exps) {
+        return nullptr;
+    }
+
+    gate_exps = UseCpuRepackAliasIfAvailable(model, gate_exps);
+    up_exps = UseCpuRepackAliasIfAvailable(model, up_exps);
+    down_exps = UseCpuRepackAliasIfAvailable(model, down_exps);
+
+    const int64_t n_tokens = routed_input->ne[1];
+    const int64_t n_embd = routed_input->ne[0];
+    const int64_t n_experts = gate_logits->ne[0];
+    const int64_t n_expert_used = std::max<int64_t>(1, std::min<int64_t>(top_k, n_experts));
+    if (n_tokens <= 0 || n_embd <= 0 || n_experts <= 0 || gate_logits->ne[1] != n_tokens ||
+        gate_exps->ne[0] != n_embd || up_exps->ne[0] != n_embd || gate_exps->ne[2] != n_experts ||
+        up_exps->ne[2] != n_experts || down_exps->ne[2] != n_experts || gate_exps->ne[1] != up_exps->ne[1] ||
+        down_exps->ne[0] != gate_exps->ne[1] || down_exps->ne[1] != n_embd) {
+        if (IsMoEWiringDebugEnabled()) {
+            std::fprintf(stderr,
+                         "[Qwen35NativeMoE][ARM] rejected layer=%d input=[%lld,%lld] logits=[%lld,%lld] "
+                         "gate=[%lld,%lld,%lld,%lld] up=[%lld,%lld,%lld,%lld] down=[%lld,%lld,%lld,%lld]\n",
+                         layer_idx, static_cast<long long>(routed_input->ne[0]),
+                         static_cast<long long>(routed_input->ne[1]), static_cast<long long>(gate_logits->ne[0]),
+                         static_cast<long long>(gate_logits->ne[1]), static_cast<long long>(gate_exps->ne[0]),
+                         static_cast<long long>(gate_exps->ne[1]), static_cast<long long>(gate_exps->ne[2]),
+                         static_cast<long long>(gate_exps->ne[3]), static_cast<long long>(up_exps->ne[0]),
+                         static_cast<long long>(up_exps->ne[1]), static_cast<long long>(up_exps->ne[2]),
+                         static_cast<long long>(up_exps->ne[3]), static_cast<long long>(down_exps->ne[0]),
+                         static_cast<long long>(down_exps->ne[1]), static_cast<long long>(down_exps->ne[2]),
+                         static_cast<long long>(down_exps->ne[3]));
+        }
+        return nullptr;
+    }
+
+    ggml_tensor* probs = ggml_soft_max(ctx, gate_logits);
+    ggml_set_name(probs, "qwen35_native_moe_probs");
+    ggml_tensor* selected_experts = ggml_argsort_top_k(ctx, probs, static_cast<int>(n_expert_used));
+    ggml_set_name(selected_experts, "qwen35_native_moe_topk");
+    ggml_build_forward_expand(gf, selected_experts);
+
+    probs = ggml_reshape_3d(ctx, probs, 1, n_experts, n_tokens);
+    ggml_tensor* weights = ggml_get_rows(ctx, probs, selected_experts);
+    ggml_set_name(weights, "qwen35_native_moe_weights");
+    if (model->moe_norm_topk_prob) {
+        weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+        ggml_tensor* weight_sum = ggml_sum_rows(ctx, weights);
+        weight_sum = ggml_clamp(ctx, weight_sum, 6.103515625e-5f, INFINITY);
+        weights = ggml_div(ctx, weights, weight_sum);
+        weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+    }
+    if (model->moe_routed_scaling_factor != 0.0f && model->moe_routed_scaling_factor != 1.0f) {
+        weights = ggml_scale(ctx, weights, model->moe_routed_scaling_factor);
+    }
+    ggml_set_name(weights, "qwen35_native_moe_norm_weights");
+    ggml_build_forward_expand(gf, weights);
+
+    ggml_tensor* cur3 = ggml_reshape_3d(ctx, routed_input, n_embd, 1, n_tokens);
+    ggml_tensor* gate = ggml_mul_mat_id(ctx, gate_exps, cur3, selected_experts);
+    ggml_set_name(gate, "qwen35_native_moe_gate");
+    ggml_tensor* up = ggml_mul_mat_id(ctx, up_exps, cur3, selected_experts);
+    ggml_set_name(up, "qwen35_native_moe_up");
+    ggml_tensor* hidden = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+    ggml_set_name(hidden, "qwen35_native_moe_swiglu");
+    ggml_tensor* experts = ggml_mul_mat_id(ctx, down_exps, hidden, selected_experts);
+    experts = ggml_mul(ctx, experts, weights);
+    ggml_set_name(experts, "qwen35_native_moe_weighted_down");
+
+    ggml_tensor* expert_views[32] = {nullptr};
+    if (n_expert_used > static_cast<int64_t>(std::size(expert_views))) {
+        return nullptr;
+    }
+    for (int64_t i = 0; i < n_expert_used; ++i) {
+        expert_views[i] = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2],
+                                       static_cast<size_t>(i) * static_cast<size_t>(experts->nb[1]));
+        ggml_build_forward_expand(gf, expert_views[i]);
+    }
+    ggml_tensor* out = expert_views[0];
+    for (int64_t i = 1; i < n_expert_used; ++i) {
+        out = ggml_add(ctx, out, expert_views[i]);
+    }
+    if (n_expert_used == 1) {
+        out = ggml_cont(ctx, out);
+    }
+    char name[80];
+    std::snprintf(name, sizeof(name), "blk.%d.qwen35_native_moe_out", layer_idx);
+    ggml_set_name(out, name);
+    return out;
+}
+#endif
+
 ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, TransformerModel* model,
                                           TransformerLayer* layer, int layer_idx, ggml_tensor* routed_input,
                                           ggml_tensor* gate_logits, int top_k,
                                           const densecore::models::DecoderLayerSpec* layer_spec) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return TryBuildQwen35NativeMoEGraphArmLegacy(ctx, gf, model, layer, layer_idx, routed_input, gate_logits, top_k,
+                                                 layer_spec);
+#else
     if (!ctx || !gf || !model || !layer || !routed_input || !gate_logits ||
         (model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36) ||
         !model->arch_flags.is_hybrid_ssm) {
@@ -2688,14 +2805,14 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             phase == InferenceExecutionPhase::Decode && n_experts > 0 &&
             (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36);
         const bool fast_decode_supported =
-            fast_decode_candidate && fast_config.native_moe_fast_decode != densecore::env::RuntimeToggleMode::Off &&
+            fast_decode_candidate && fast_config.native_moe_fast_decode == densecore::env::RuntimeToggleMode::On &&
             supported_shape && selected_experts_available && supported_quant && !dynamic_lora_active &&
             fast_kernel_available;
         const bool defer_to_native_w2_custom_node = fast_decode_supported;
         if (fast_decode_candidate && !defer_to_native_w2_custom_node) {
             const char* reason = fast_decode_supported ? "fallback_safety" : "none";
-            if (fast_config.native_moe_fast_decode == densecore::env::RuntimeToggleMode::Off) {
-                reason = "disabled";
+            if (fast_config.native_moe_fast_decode != densecore::env::RuntimeToggleMode::On) {
+                reason = "not_forced";
             } else if (!supported_shape) {
                 reason = "unsupported_shape";
             } else if (!selected_experts_available) {
@@ -2859,6 +2976,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     std::snprintf(name, sizeof(name), "blk.%d.qwen35_native_moe_out", layer_idx);
     ggml_set_name(out, name);
     return out;
+#endif
 }
 
 using densecore::llm::runtime::IsMixedRoutingEnabled;
