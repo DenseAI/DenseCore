@@ -1,8 +1,8 @@
 #ifndef DENSECORE_PUBLIC_RUNTIME_GGML_COMPUTE_POLICY_H
 #define DENSECORE_PUBLIC_RUNTIME_GGML_COMPUTE_POLICY_H
 
-#include <cstring>
 #include <cstdint>
+#include <cstring>
 
 #include "densecore/models/model_types.h"
 
@@ -147,9 +147,9 @@ inline DenseCoreLayerRole ResolveDenseCoreLayerRole(const TransformerModel* mode
 }
 
 inline DenseCoreMatmulPlan ResolveDenseCoreMatmulPlan(const TransformerModel* model, ggml_type weight_type,
-                                                       ggml_type input_type, int64_t m, int64_t n, int64_t k,
-                                                       DenseCoreMatmulPhase phase, const char* weight_name,
-                                                       bool is_lm_head, bool compatible) {
+                                                      ggml_type input_type, int64_t m, int64_t n, int64_t k,
+                                                      DenseCoreMatmulPhase phase, const char* weight_name,
+                                                      bool is_lm_head, bool compatible) {
     DenseCoreMatmulPlan plan;
     plan.qwen = ResolveQwenHotPathPlan(model);
     plan.variant = model ? model->variant : ModelVariant::UNKNOWN;
@@ -185,8 +185,7 @@ inline bool IsExplicitTemporaryReferenceFallback(const char* reason) {
         return false;
     }
     return std::strncmp(reason, "temporary_reference_", 20) == 0 ||
-           std::strncmp(reason, "reference_parity_", 17) == 0 ||
-           std::strcmp(reason, "gguf_scaffold") == 0 ||
+           std::strncmp(reason, "reference_parity_", 17) == 0 || std::strcmp(reason, "gguf_scaffold") == 0 ||
            std::strcmp(reason, "test_reference") == 0;
 }
 

@@ -93,7 +93,8 @@ size_t ReadAvailableMemoryBytes() {
     struct sysinfo info {};
     if (sysinfo(&info) == 0 && info.mem_unit > 0) {
         const uint64_t unit = static_cast<uint64_t>(info.mem_unit);
-        return static_cast<size_t>((static_cast<uint64_t>(info.freeram) + static_cast<uint64_t>(info.bufferram)) * unit);
+        return static_cast<size_t>((static_cast<uint64_t>(info.freeram) + static_cast<uint64_t>(info.bufferram)) *
+                                   unit);
     }
 #endif
     return 0;
@@ -117,16 +118,15 @@ size_t ManualCacheLimitBytes() {
     return limit;
 }
 
-void EvictIfNeededLocked(Q4KRepackedGemvCacheState& state, const Q4KRepackedGemvKey& protected_key,
-                         size_t cache_limit, uint64_t* evictions, uint64_t* evicted_bytes) {
+void EvictIfNeededLocked(Q4KRepackedGemvCacheState& state, const Q4KRepackedGemvKey& protected_key, size_t cache_limit,
+                         uint64_t* evictions, uint64_t* evicted_bytes) {
     while (state.cache_bytes > cache_limit && state.entries.size() > 1) {
         auto oldest = state.entries.end();
         for (auto it = state.entries.begin(); it != state.entries.end(); ++it) {
             if (it->first == protected_key || !it->second || it->second->building || !it->second->weight) {
                 continue;
             }
-            if (oldest == state.entries.end() ||
-                it->second->weight->last_use < oldest->second->weight->last_use) {
+            if (oldest == state.entries.end() || it->second->weight->last_use < oldest->second->weight->last_use) {
                 oldest = it;
             }
         }
@@ -225,8 +225,7 @@ Q4KRepackedGemvCacheStats Q4KRepackedGemvTrimCacheToBytes(size_t target_bytes) {
             if (!it->second || it->second->building || !it->second->weight) {
                 continue;
             }
-            if (oldest == state.entries.end() ||
-                it->second->weight->last_use < oldest->second->weight->last_use) {
+            if (oldest == state.entries.end() || it->second->weight->last_use < oldest->second->weight->last_use) {
                 oldest = it;
             }
         }
@@ -283,8 +282,9 @@ uint64_t Q4KRepackedGemvWeightFingerprint(const void* weight_ptr, int64_t rows, 
     return FingerprintQ4KRepackedGemvWeight(weight_ptr, raw_bytes);
 }
 
-std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(
-    const void* weight_ptr, int64_t rows, int64_t cols, Q4KRepackedGemvCacheLookup* lookup) {
+std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(const void* weight_ptr, int64_t rows,
+                                                                        int64_t cols,
+                                                                        Q4KRepackedGemvCacheLookup* lookup) {
     if (lookup) {
         *lookup = {};
     }
@@ -409,9 +409,8 @@ bool RunQ4KRepackedGemv(const std::shared_ptr<Q4KRepackedGemvWeight>& packed, co
 bool RunQ4KRepackedGemvRows(const std::shared_ptr<Q4KRepackedGemvWeight>& packed, const uint8_t* qinput_data,
                             size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t output_cols,
                             int tile_start, int tile_end) {
-    if (!packed || !qinput_data || !output_data || rows <= 0 || packed->rows != output_cols ||
-        (output_cols % 8) != 0 || packed->cols <= 0 || tile_start < 0 || tile_end < tile_start ||
-        tile_end > output_cols / 8) {
+    if (!packed || !qinput_data || !output_data || rows <= 0 || packed->rows != output_cols || (output_cols % 8) != 0 ||
+        packed->cols <= 0 || tile_start < 0 || tile_end < tile_start || tile_end > output_cols / 8) {
         return false;
     }
     const int blocks_per_row = static_cast<int>(packed->blocks_per_row);
@@ -422,8 +421,8 @@ bool RunQ4KRepackedGemvRows(const std::shared_ptr<Q4KRepackedGemvWeight>& packed
             continue;
         }
         const void* vx = packed->blocks.data() + static_cast<size_t>(tile_start) * blocks_per_row;
-        ggml_gemv_q4_K_8x8_q8_K(static_cast<int>(packed->cols), out + static_cast<size_t>(tile_start) * 8, 0, vx,
-                                qi, 1, (tile_end - tile_start) * 8);
+        ggml_gemv_q4_K_8x8_q8_K(static_cast<int>(packed->cols), out + static_cast<size_t>(tile_start) * 8, 0, vx, qi, 1,
+                                (tile_end - tile_start) * 8);
     }
     return true;
 }

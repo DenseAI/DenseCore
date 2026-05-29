@@ -614,7 +614,9 @@ func TestSplitGemma4ReasoningResponseKeepsNonGemmaContent(t *testing.T) {
 }
 
 func TestSplitReasoningResponseQwen36OpenThinkMatchesLlamaCpp(t *testing.T) {
-	content, reasoning := splitReasoningResponse("qwen3.6", "Here is the model reasoning so far")
+	enableThinking := true
+	req := domain.ChatCompletionRequest{ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking}}
+	content, reasoning := splitReasoningResponse(req, "qwen3.6", "Here is the model reasoning so far")
 	if content != "" {
 		t.Fatalf("expected qwen3.6 thinking tokens to stay out of content, got %q", content)
 	}
@@ -624,12 +626,23 @@ func TestSplitReasoningResponseQwen36OpenThinkMatchesLlamaCpp(t *testing.T) {
 }
 
 func TestSplitReasoningResponseQwen36ClosedThinkKeepsFinalContent(t *testing.T) {
-	content, reasoning := splitReasoningResponse("Qwen3.6-35B-A3B", "plan\n</think>\n\nParis is the capital.")
+	enableThinking := true
+	req := domain.ChatCompletionRequest{ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking}}
+	content, reasoning := splitReasoningResponse(req, "Qwen3.6-35B-A3B", "plan\n</think>\n\nParis is the capital.")
 	if content != "Paris is the capital." {
 		t.Fatalf("expected final content, got %q", content)
 	}
 	if reasoning != "plan" {
 		t.Fatalf("expected reasoning content, got %q", reasoning)
+	}
+}
+
+func TestSplitReasoningResponseQwen36NoThinkingKeepsVisibleContent(t *testing.T) {
+	enableThinking := false
+	req := domain.ChatCompletionRequest{ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking}}
+	content, reasoning := splitReasoningResponse(req, "Qwen3.6-35B-A3B", "Paris is the capital.")
+	if content != "Paris is the capital." || reasoning != "" {
+		t.Fatalf("expected no-thinking qwen3.6 text as visible content, got content=%q reasoning=%q", content, reasoning)
 	}
 }
 
@@ -740,6 +753,56 @@ func TestChatCompletionHandler_StreamSanitizesGemma4CurrentModel(t *testing.T) {
 	}
 	if !strings.Contains(body, "CPU MoE answer") {
 		t.Fatalf("streaming response missing sanitized content: %q", body)
+	}
+}
+
+func TestChatCompletionHandler_StreamRoutesQwen36ThinkingToReasoningContent(t *testing.T) {
+	enableThinking := true
+	mockModelService := NewMockModelService()
+	mockModelService.modelName = "/models/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			for _, token := range []string{"internal plan", "</think>\n\nFinal answer"} {
+				outputChan <- domain.StreamEvent{Token: token}
+			}
+			outputChan <- domain.NewTerminalEvent(nil)
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
+		Model: "densecore-v1",
+		Messages: []domain.Message{
+			{Role: "user", Content: "Explain."},
+		},
+		ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking},
+		Stream:             true,
+	})
+	w := httptest.NewRecorder()
+
+	handler.ChatCompletionHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, `"content":"internal plan"`) {
+		t.Fatalf("streaming response leaked Qwen3.6 thinking as content: %q", body)
+	}
+	if !strings.Contains(body, `"reasoning_content":"internal plan"`) {
+		t.Fatalf("streaming response missing Qwen3.6 reasoning_content: %q", body)
+	}
+	if !strings.Contains(body, `"content":"Final answer"`) {
+		t.Fatalf("streaming response missing final visible content: %q", body)
 	}
 }
 

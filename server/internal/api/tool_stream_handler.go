@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -23,27 +24,19 @@ func (h *Handler) handleToolStream(ctx context.Context, w http.ResponseWriter, r
 	created := time.Now().Unix()
 	streamStarted := false
 	var responseBuilder strings.Builder
-	terminalSeen := false
 
 	for {
 		select {
 		case event, ok := <-outputChan:
 			if !ok {
-				if !terminalSeen {
-					err := waitGenerationError(errChan)
-					if err == nil {
-						err = domain.ErrStreamClosedWithoutTerminal
-					}
-					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
-					return
+				err := waitGenerationError(errChan)
+				if err == nil {
+					err = domain.ErrStreamClosedWithoutTerminal
 				}
-				if err := waitGenerationError(errChan); err != nil {
-					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
-				}
+				writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 				return
 			}
 			if event.Terminal {
-				terminalSeen = true
 				if err := event.TerminalError(); err != nil {
 					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 					_ = waitGenerationError(errChan)
@@ -185,8 +178,11 @@ func apiFirstNonEmpty(values ...string) string {
 	return ""
 }
 
-func splitReasoningResponse(modelHint, text string) (string, string) {
+func splitReasoningResponse(req domain.ChatCompletionRequest, modelHint, text string) (string, string) {
 	if isQwen36ModelHint(modelHint) {
+		if !qwen36ReasoningEnabled(req, modelHint) {
+			return text, ""
+		}
 		return splitQwenThinkResponse(text)
 	}
 	return splitGemma4ReasoningResponse(modelHint, text)
@@ -286,6 +282,113 @@ func splitQwenThinkResponse(text string) (string, string) {
 	// Qwen3.6 generation starts after the assistant-side `<think>\n` cue.
 	// llama.cpp reports these tokens as reasoning_content until </think>.
 	return "", strings.TrimSpace(text)
+}
+
+type qwen36StreamFilter struct {
+	inReasoning bool
+	pending     string
+}
+
+func newQwen36StreamFilter() *qwen36StreamFilter {
+	return &qwen36StreamFilter{inReasoning: true}
+}
+
+func (f *qwen36StreamFilter) Filter(token string) (string, string) {
+	if f == nil || token == "" {
+		return token, ""
+	}
+	f.pending += token
+	if f.inReasoning {
+		return f.filterReasoningPending(false)
+	}
+	return f.flushContentPending(false), ""
+}
+
+func (f *qwen36StreamFilter) filterReasoningPending(flush bool) (string, string) {
+	const openTag = "<think>"
+	const closeTag = "</think>"
+	f.pending = strings.ReplaceAll(f.pending, openTag, "")
+	if idx := strings.Index(f.pending, closeTag); idx >= 0 {
+		reasoning := strings.TrimSpace(f.pending[:idx])
+		f.pending = strings.TrimLeft(f.pending[idx+len(closeTag):], " \t\r\n")
+		f.inReasoning = false
+		content := f.flushContentPending(flush)
+		return content, reasoning
+	}
+	if !flush && isSuffixOf(f.pending, closeTag) {
+		return "", ""
+	}
+	reasoning := f.pending
+	if !flush {
+		keep := longestSuffixPrefixLen(f.pending, closeTag)
+		if keep > 0 {
+			reasoning = f.pending[:len(f.pending)-keep]
+			f.pending = f.pending[len(f.pending)-keep:]
+		} else {
+			f.pending = ""
+		}
+	} else {
+		f.pending = ""
+	}
+	return "", strings.TrimSpace(reasoning)
+}
+
+func (f *qwen36StreamFilter) flushContentPending(flush bool) string {
+	if flush || !isSuffixOf(f.pending, "</think>") {
+		content := f.pending
+		f.pending = ""
+		return content
+	}
+	keep := longestSuffixPrefixLen(f.pending, "</think>")
+	content := f.pending[:len(f.pending)-keep]
+	f.pending = f.pending[len(f.pending)-keep:]
+	return content
+}
+
+func qwen36StreamingReasoningEnabled(req domain.ChatCompletionRequest, modelHint string) bool {
+	return qwen36ReasoningEnabled(req, modelHint)
+}
+
+func qwen36ReasoningEnabled(req domain.ChatCompletionRequest, modelHint string) bool {
+	if !isQwen36ModelHint(modelHint) {
+		return false
+	}
+	if req.ChatTemplateKwargs != nil && req.ChatTemplateKwargs.EnableThinking != nil {
+		return *req.ChatTemplateKwargs.EnableThinking
+	}
+	if value, ok := os.LookupEnv("DENSECORE_QWEN36_ENABLE_THINKING"); ok {
+		return parseTruthyEnv(value)
+	}
+	if value, ok := os.LookupEnv("DENSECORE_QWEN35_ENABLE_THINKING"); ok {
+		return parseTruthyEnv(value)
+	}
+	return true
+}
+
+func parseTruthyEnv(value string) bool {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSuffixOf(value, target string) bool {
+	return longestSuffixPrefixLen(value, target) == len(value) && len(value) < len(target)
+}
+
+func longestSuffixPrefixLen(value, target string) int {
+	max := len(value)
+	if len(target) < max {
+		max = len(target)
+	}
+	for n := max; n > 0; n-- {
+		if strings.HasSuffix(value, target[:n]) {
+			return n
+		}
+	}
+	return 0
 }
 
 func splitGemma4ReasoningResponse(modelHint, text string) (string, string) {

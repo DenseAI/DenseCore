@@ -99,6 +99,7 @@ func TestTTLEvictionAndMemoryPressure(t *testing.T) {
 	if got := m.LookupAndStore(id, []int{1, 2, 3}); got.Hit {
 		t.Fatalf("expired entry must miss")
 	}
+	now = now.Add(time.Nanosecond)
 	m.Store(id, []int{1, 2, 3, 4, 5})
 	if len(m.entries) != 0 {
 		t.Fatalf("entry over max bytes should be evicted")

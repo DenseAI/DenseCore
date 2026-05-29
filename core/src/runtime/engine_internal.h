@@ -520,10 +520,16 @@ struct Request {
     uint64_t moe_q4k_repacked_used_ops = 0;
     uint64_t moe_q4k_repacked_rejected_ops = 0;
     std::string moe_q4k_repacked_last_reject_reason;
+    uint64_t moe_q5k_repacked_candidate_ops = 0;
+    uint64_t moe_q5k_repacked_used_ops = 0;
+    uint64_t moe_q5k_repacked_rejected_ops = 0;
+    std::string moe_q5k_repacked_last_reject_reason;
     uint64_t gemma4_moe_prefill_quant_batch_candidate_ops = 0;
     uint64_t gemma4_moe_prefill_quant_batch_used_ops = 0;
     uint64_t gemma4_moe_prefill_quant_batch_rejected_ops = 0;
     std::string gemma4_moe_prefill_quant_batch_last_reject_reason;
+    uint64_t gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops = 0;
+    uint64_t gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops = 0;
     uint64_t gemma4_moe_prefill_quant_batch_gate_up_used = 0;
     uint64_t gemma4_moe_prefill_quant_batch_down_used = 0;
     uint64_t gemma4_native_moe_prefill_candidate_layers = 0;
@@ -948,10 +954,16 @@ struct Request {
         moe_q4k_repacked_used_ops = 0;
         moe_q4k_repacked_rejected_ops = 0;
         moe_q4k_repacked_last_reject_reason.clear();
+        moe_q5k_repacked_candidate_ops = 0;
+        moe_q5k_repacked_used_ops = 0;
+        moe_q5k_repacked_rejected_ops = 0;
+        moe_q5k_repacked_last_reject_reason.clear();
         gemma4_moe_prefill_quant_batch_candidate_ops = 0;
         gemma4_moe_prefill_quant_batch_used_ops = 0;
         gemma4_moe_prefill_quant_batch_rejected_ops = 0;
         gemma4_moe_prefill_quant_batch_last_reject_reason.clear();
+        gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops = 0;
+        gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops = 0;
         gemma4_moe_prefill_quant_batch_gate_up_used = 0;
         gemma4_moe_prefill_quant_batch_down_used = 0;
         gemma4_native_moe_prefill_candidate_layers = 0;
@@ -1680,8 +1692,7 @@ struct EngineState {
             estimate.long_context_safety_pad_bytes += hybrid_long_prefill_object_pad_mb * MB;
         }
         if (model->arch_flags.is_gemma4 && effective_query_len > 1) {
-            estimate.long_context_safety_pad_bytes +=
-                std::max(hidden_query_bytes / 2, attention_score_bytes / 8);
+            estimate.long_context_safety_pad_bytes += std::max(hidden_query_bytes / 2, attention_score_bytes / 8);
         }
         const size_t extra_headroom_mb =
             parse_env_mb("DENSECORE_GRAPH_CTX_EXTRA_MB", /*default_mb=*/64, /*min_mb=*/0, HARD_MAX_MB);
@@ -1902,8 +1913,8 @@ struct EngineState {
                         req->finished = true;
                         req->cancelled.store(true, std::memory_order_relaxed);
                         if (req->callback || req->callback_ex || req->token_result_callback) {
-                            shutdown_callbacks.push_back({req->id, req->callback, req->callback_ex,
-                                                          req->token_result_callback, req->user_data});
+                            shutdown_callbacks.push_back(
+                                {req->id, req->callback, req->callback_ex, req->token_result_callback, req->user_data});
                         }
                         // We just mark them finished; the loop or pool will handle release,
                         // or we rely on pool destructor
@@ -2038,8 +2049,8 @@ inline void ApplyResultQueueBackpressure(EngineState* state, std::unique_lock<st
 
 // Helper to push result events to the callback queue with backpressure
 inline void PushResultEvent(EngineState* state, int request_id, const std::string& token, int token_id, bool finished,
-                            bool error, TokenCallback cb, TokenCallbackEx cb_ex,
-                            TokenResultCallback token_result_cb, void* user_data) {
+                            bool error, TokenCallback cb, TokenCallbackEx cb_ex, TokenResultCallback token_result_cb,
+                            void* user_data) {
     ResultEvent event;
     event.request_id = request_id;
     event.token_str = token;

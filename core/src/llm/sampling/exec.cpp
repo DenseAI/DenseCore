@@ -407,8 +407,8 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         }
         return range_start;
     };
-    auto finite_argmax_raw = [last_logits, range_start, range_end, &is_disallowed, &is_allowed,
-                              &first_allowed_token, &params]() -> int {
+    auto finite_argmax_raw = [last_logits, range_start, range_end, &is_disallowed, &is_allowed, &first_allowed_token,
+                              &params]() -> int {
         int best_idx = range_start;
         float best_val = -INFINITY;
         bool found = false;
@@ -429,8 +429,8 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         }
         size_t disallowed_pos = 0;
         if (unrestricted_allow && disallowed && !disallowed->empty()) {
-            disallowed_pos = static_cast<size_t>(
-                std::lower_bound(disallowed->begin(), disallowed->end(), range_start) - disallowed->begin());
+            disallowed_pos = static_cast<size_t>(std::lower_bound(disallowed->begin(), disallowed->end(), range_start) -
+                                                 disallowed->begin());
         }
         for (int i = range_start; i < range_end; ++i) {
             const float v = last_logits[i];
@@ -531,8 +531,7 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
 
     auto base_logit_at = [&](int local_token) -> float {
         if (requires_working_logits) {
-            return ApplyFinalLogitSoftcap(working_logits[static_cast<size_t>(local_token)],
-                                          params.final_logit_softcap);
+            return ApplyFinalLogitSoftcap(working_logits[static_cast<size_t>(local_token)], params.final_logit_softcap);
         }
         return ApplyFinalLogitSoftcap(last_logits[range_start + local_token], params.final_logit_softcap);
     };

@@ -242,8 +242,7 @@ size_t Requantized3DQ8Bytes(int64_t ne0, int64_t ne1, int64_t ne2) {
     }
     const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, ne0);
     const uint64_t rows = static_cast<uint64_t>(ne1) * static_cast<uint64_t>(ne2);
-    if (row_bytes == 0 || rows == 0 ||
-        rows > std::numeric_limits<size_t>::max() / static_cast<uint64_t>(row_bytes)) {
+    if (row_bytes == 0 || rows == 0 || rows > std::numeric_limits<size_t>::max() / static_cast<uint64_t>(row_bytes)) {
         return 0;
     }
     return row_bytes * static_cast<size_t>(rows);
@@ -255,10 +254,10 @@ size_t EstimateGemma4Q5DownRequantBytes(const TransformerModel* model) {
     }
     size_t total = 0;
     for (const auto& layer : model->layers) {
-        ggml_tensor* gate_up = layer.Get("ffn_gate_up_exps.weight") ? layer.Get("ffn_gate_up_exps.weight")
-                                                                    : layer.Get("ffn_gate_up_exps");
-        ggml_tensor* down = layer.Get("ffn_down_exps.weight") ? layer.Get("ffn_down_exps.weight")
-                                                              : layer.Get("ffn_down_exps");
+        ggml_tensor* gate_up =
+            layer.Get("ffn_gate_up_exps.weight") ? layer.Get("ffn_gate_up_exps.weight") : layer.Get("ffn_gate_up_exps");
+        ggml_tensor* down =
+            layer.Get("ffn_down_exps.weight") ? layer.Get("ffn_down_exps.weight") : layer.Get("ffn_down_exps");
         if (!gate_up || !down || !down->data || down->type != GGML_TYPE_Q5_1 || down->view_src) {
             continue;
         }
@@ -284,10 +283,10 @@ size_t EstimateGemma4Q4GateUpRequantBytes(const TransformerModel* model) {
     }
     size_t total = 0;
     for (const auto& layer : model->layers) {
-        ggml_tensor* gate_up = layer.Get("ffn_gate_up_exps.weight") ? layer.Get("ffn_gate_up_exps.weight")
-                                                                    : layer.Get("ffn_gate_up_exps");
-        ggml_tensor* down = layer.Get("ffn_down_exps.weight") ? layer.Get("ffn_down_exps.weight")
-                                                              : layer.Get("ffn_down_exps");
+        ggml_tensor* gate_up =
+            layer.Get("ffn_gate_up_exps.weight") ? layer.Get("ffn_gate_up_exps.weight") : layer.Get("ffn_gate_up_exps");
+        ggml_tensor* down =
+            layer.Get("ffn_down_exps.weight") ? layer.Get("ffn_down_exps.weight") : layer.Get("ffn_down_exps");
         if (!gate_up || !down || !gate_up->data || gate_up->type != GGML_TYPE_Q4_K || gate_up->view_src) {
             continue;
         }
@@ -296,8 +295,7 @@ size_t EstimateGemma4Q4GateUpRequantBytes(const TransformerModel* model) {
         if (!densecore::gemma4::InferPackedExpertLayout(gate_up, down, &layout, &reason)) {
             continue;
         }
-        const size_t bytes =
-            Requantized3DQ8Bytes(layout.hidden_dim, layout.intermediate_dim * 2, layout.num_experts);
+        const size_t bytes = Requantized3DQ8Bytes(layout.hidden_dim, layout.intermediate_dim * 2, layout.num_experts);
         if (bytes == 0) {
             continue;
         }
@@ -316,7 +314,8 @@ struct CpuRepackBufferTypes {
 
 CpuRepackBufferTypes FindCpuRepackBufferTypes(ggml_backend_t backend) {
     CpuRepackBufferTypes result{};
-    ggml_backend_dev_t device = backend ? ggml_backend_get_device(backend) : ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+    ggml_backend_dev_t device =
+        backend ? ggml_backend_get_device(backend) : ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
     if (!device) {
         return result;
     }
@@ -399,8 +398,7 @@ bool PrepareQwen36SSMQ8PrefillAMXAliasesForExecutionImpl(TransformerModel* model
     if (!model || model->variant != ModelVariant::QWEN36 || !model->arch_flags.is_hybrid_ssm) {
         return false;
     }
-    if (!model->qwen36_ssm_q8_prefill_amx_aliases.empty() &&
-        !model->qwen36_ssm_q8_prefill_amx_buffers.empty()) {
+    if (!model->qwen36_ssm_q8_prefill_amx_aliases.empty() && !model->qwen36_ssm_q8_prefill_amx_buffers.empty()) {
         return true;
     }
     ClearQwen36SSMQ8PrefillAMXAliasesImpl(model);
@@ -503,8 +501,7 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         };
         *ctx = ggml_init(params);
         if (!*ctx) {
-            std::cerr << "[DenseCore] Warning: failed to allocate " << name << " alias metadata context"
-                      << std::endl;
+            std::cerr << "[DenseCore] Warning: failed to allocate " << name << " alias metadata context" << std::endl;
             return false;
         }
         return true;
@@ -575,13 +572,10 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
     if (model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm) {
         std::cout << "[DenseCore] Qwen3.6 fast-matmul alias policy: ssm_q8_amx="
                   << (qwen36_ssm_q8_amx_alias_enabled ? "enabled" : "disabled")
-                  << ", ssm_q8_prefill_loader_alias="
-                  << (qwen36_ssm_q8_prefill_amx_enabled ? "enabled" : "disabled")
-                  << ", ssm_q8_prefill_scoped_amx="
-                  << (qwen36_ssm_q8_prefill_amx_requested ? "requested" : "disabled")
+                  << ", ssm_q8_prefill_loader_alias=" << (qwen36_ssm_q8_prefill_amx_enabled ? "enabled" : "disabled")
+                  << ", ssm_q8_prefill_scoped_amx=" << (qwen36_ssm_q8_prefill_amx_requested ? "requested" : "disabled")
                   << ", expert_cpu_repack=" << (qwen36_expert_cpu_repack_enabled ? "enabled" : "disabled")
-                  << ", ssm_q8_projection=" << (qwen36_has_ssm_q8_projection ? "present" : "absent")
-                  << std::endl;
+                  << ", ssm_q8_projection=" << (qwen36_has_ssm_q8_projection ? "present" : "absent") << std::endl;
     }
 
     auto choose_alias_buffer = [&](const ggml_tensor* source, bool is_2d) -> ggml_backend_buffer_type_t {
@@ -644,9 +638,9 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         if (!init_alias_context(ctx, buft_name)) {
             return;
         }
-        ggml_tensor* alias = is_2d ? ggml_new_tensor_2d(*ctx, source->type, source->ne[0], source->ne[1])
-                                   : ggml_new_tensor_3d(*ctx, source->type, source->ne[0], source->ne[1],
-                                                        source->ne[2]);
+        ggml_tensor* alias = is_2d
+                                 ? ggml_new_tensor_2d(*ctx, source->type, source->ne[0], source->ne[1])
+                                 : ggml_new_tensor_3d(*ctx, source->type, source->ne[0], source->ne[1], source->ne[2]);
         if (!alias) {
             return;
         }
@@ -697,8 +691,8 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         if (!first || !second || !first->data || !second->data || first->view_src || second->view_src) {
             return;
         }
-        if (first->type != second->type || first->ne[0] != second->ne[0] || first->ne[2] != 1 ||
-            second->ne[2] != 1 || first->ne[3] != 1 || second->ne[3] != 1) {
+        if (first->type != second->type || first->ne[0] != second->ne[0] || first->ne[2] != 1 || second->ne[2] != 1 ||
+            first->ne[3] != 1 || second->ne[3] != 1) {
             return;
         }
         if (!ggml_is_quantized(first->type) || first->ne[0] <= 0 || first->ne[1] <= 0 || second->ne[1] <= 0) {
@@ -874,16 +868,14 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         make_alias(model->output, ".fast_matmul_2d");
     }
 #if !defined(__aarch64__) && !defined(_M_ARM64)
-    if (model->output &&
-        (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+    if (model->output && (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
         ggml_is_quantized(model->output->type)) {
         make_decode_alias(model->output, ".decode_fast_matmul");
     }
 #endif
     for (auto& layer : model->layers) {
         for (const auto& item : layer.tensors) {
-            if (model->arch_flags.is_hybrid_ssm &&
-                model->variant == ModelVariant::QWEN35 &&
+            if (model->arch_flags.is_hybrid_ssm && model->variant == ModelVariant::QWEN35 &&
                 (item.first.find("ffn_gate_exps") != std::string::npos ||
                  item.first.find("ffn_up_exps") != std::string::npos)) {
                 continue;
@@ -906,11 +898,10 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
                                       /*force_cpu_repack=*/true);
             }
             if (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) {
-                make_fused_expert_pair_alias(layer, i, "ffn_gate_up_exps.cpu_repack_fused", "ffn_gate_up_exps.weight",
-                                             layer.Get("ffn_gate_exps.weight") ? layer.Get("ffn_gate_exps.weight")
-                                                                               : layer.Get("ffn_gate_exps"),
-                                             layer.Get("ffn_up_exps.weight") ? layer.Get("ffn_up_exps.weight")
-                                                                             : layer.Get("ffn_up_exps"));
+                make_fused_expert_pair_alias(
+                    layer, i, "ffn_gate_up_exps.cpu_repack_fused", "ffn_gate_up_exps.weight",
+                    layer.Get("ffn_gate_exps.weight") ? layer.Get("ffn_gate_exps.weight") : layer.Get("ffn_gate_exps"),
+                    layer.Get("ffn_up_exps.weight") ? layer.Get("ffn_up_exps.weight") : layer.Get("ffn_up_exps"));
             }
         }
     }
@@ -1018,9 +1009,8 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
             type_summary << ggml_type_name(type) << ":" << count;
         }
         std::cout << "[DenseCore] CPU fast matmul aliases prepared: buft=" << buft_name
-                  << ", aliases=" << supported_count << ", fused_ffn=" << fused_supported_count
-                  << ", alias_types=[" << type_summary.str() << "]"
-                  << ", bytes=" << (bytes / 1024 / 1024) << " MiB" << std::endl;
+                  << ", aliases=" << supported_count << ", fused_ffn=" << fused_supported_count << ", alias_types=["
+                  << type_summary.str() << "]" << ", bytes=" << (bytes / 1024 / 1024) << " MiB" << std::endl;
         return supported_count + fused_supported_count;
     };
 
@@ -1075,8 +1065,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         };
         *ctx = ggml_init(params);
         if (!*ctx) {
-            std::cerr << "[DenseCore] Warning: failed to allocate Gemma4 " << label << " metadata context"
-                      << std::endl;
+            std::cerr << "[DenseCore] Warning: failed to allocate Gemma4 " << label << " metadata context" << std::endl;
             return false;
         }
         return true;
@@ -1172,7 +1161,8 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         if (!repack_buffer_available_for_type(source->type)) {
             return false;
         }
-        ggml_tensor* alias = ggml_new_tensor_2d(context_for_type(source->type), source->type, source->ne[0], source->ne[1]);
+        ggml_tensor* alias =
+            ggml_new_tensor_2d(context_for_type(source->type), source->type, source->ne[0], source->ne[1]);
         return register_alias(source, alias, suffix);
     };
 
@@ -1193,17 +1183,16 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
     const bool auto_requant_q5_1_down_to_q8_0 =
         available_requant_bytes > 0 &&
         available_requant_bytes >= q5_down_requant_bytes + kGemma4RequantSafetyHeadroomBytes;
-    const bool auto_requant_q4_gate_up_to_q8_0 =
-        available_requant_bytes > 0 && q4_gate_up_requant_bytes > 0 &&
-        available_requant_bytes >=
-            q5_down_requant_bytes + q4_gate_up_requant_bytes + kGemma4GateUpRequantSafetyHeadroomBytes;
+    const bool auto_requant_q4_gate_up_to_q8_0 = available_requant_bytes > 0 && q4_gate_up_requant_bytes > 0 &&
+                                                 available_requant_bytes >= q5_down_requant_bytes +
+                                                                                q4_gate_up_requant_bytes +
+                                                                                kGemma4GateUpRequantSafetyHeadroomBytes;
     if (q5_down_requant_bytes > 0) {
         std::cout << "[DenseCore] Gemma4 Q5_1 down-expert Q8_0 repack auto "
                   << (auto_requant_q5_1_down_to_q8_0 ? "enabled" : "disabled")
                   << ": required=" << (q5_down_requant_bytes / 1024 / 1024)
                   << " MiB available=" << (available_requant_bytes / 1024 / 1024)
-                  << " MiB headroom=" << (kGemma4RequantSafetyHeadroomBytes / 1024 / 1024) << " MiB"
-                  << std::endl;
+                  << " MiB headroom=" << (kGemma4RequantSafetyHeadroomBytes / 1024 / 1024) << " MiB" << std::endl;
     }
     if (q4_gate_up_requant_bytes > 0) {
         std::cout << "[DenseCore] Gemma4 Q4_K gate/up-expert Q8_0 repack auto "
@@ -1211,8 +1200,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
                   << ": required_gate_up=" << (q4_gate_up_requant_bytes / 1024 / 1024)
                   << " MiB required_down=" << (q5_down_requant_bytes / 1024 / 1024)
                   << " MiB available=" << (available_requant_bytes / 1024 / 1024)
-                  << " MiB headroom=" << (kGemma4GateUpRequantSafetyHeadroomBytes / 1024 / 1024) << " MiB"
-                  << std::endl;
+                  << " MiB headroom=" << (kGemma4GateUpRequantSafetyHeadroomBytes / 1024 / 1024) << " MiB" << std::endl;
     }
     auto make_requant_q8_0_alias_3d = [&](ggml_tensor* source, int64_t ne0, int64_t ne1, int64_t ne2,
                                           const char* suffix, bool enabled) -> bool {
@@ -1243,10 +1231,9 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
                 const char* src_row = static_cast<const char*>(source->data) +
                                       static_cast<size_t>(expert) * static_cast<size_t>(source->nb[2]) +
                                       static_cast<size_t>(row_idx) * static_cast<size_t>(source->nb[1]);
-                uint8_t* dst_row = converted.data() +
-                                   (static_cast<size_t>(expert) * static_cast<size_t>(ne1) +
-                                    static_cast<size_t>(row_idx)) *
-                                       dst_row_size;
+                uint8_t* dst_row = converted.data() + (static_cast<size_t>(expert) * static_cast<size_t>(ne1) +
+                                                       static_cast<size_t>(row_idx)) *
+                                                          dst_row_size;
                 src_traits->to_float(src_row, row.data(), ne0);
                 dst_traits->from_float(row.data(), dst_row, ne0);
             }
@@ -1398,14 +1385,13 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
             continue;
         }
         if (!make_requant_q8_0_alias_3d(gate_up, layout.hidden_dim, layout.intermediate_dim * 2, layout.num_experts,
-                                         ".cpu_repack_gate_up_q8_0_3d", auto_requant_q4_gate_up_to_q8_0)) {
+                                        ".cpu_repack_gate_up_q8_0_3d", auto_requant_q4_gate_up_to_q8_0)) {
             make_alias_3d(gate_up, layout.hidden_dim, layout.intermediate_dim * 2, layout.num_experts,
                           ".cpu_repack_gate_up_3d");
         }
         if (!make_requant_q8_0_alias_3d(down, layout.intermediate_dim, layout.hidden_dim, layout.num_experts,
-                                         ".cpu_repack_down_q8_0_3d", auto_requant_q5_1_down_to_q8_0)) {
-            make_alias_3d(down, layout.intermediate_dim, layout.hidden_dim, layout.num_experts,
-                          ".cpu_repack_down_3d");
+                                        ".cpu_repack_down_q8_0_3d", auto_requant_q5_1_down_to_q8_0)) {
+            make_alias_3d(down, layout.intermediate_dim, layout.hidden_dim, layout.num_experts, ".cpu_repack_down_3d");
         }
     }
 
@@ -1548,9 +1534,8 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
             if (EnvFlagEnabled("DENSECORE_DEBUG_GEMMA4_CPU_REPACK", false)) {
                 std::cerr << "[DenseCore] Warning: Gemma4 CPU_REPACK did not support tensor "
                           << (item.source->name[0] ? item.source->name : "<unnamed>")
-                          << " type=" << ggml_type_name(item.source->type)
-                          << " alias_ne=[" << item.alias->ne[0] << "," << item.alias->ne[1] << ","
-                          << item.alias->ne[2] << "," << item.alias->ne[3]
+                          << " type=" << ggml_type_name(item.source->type) << " alias_ne=[" << item.alias->ne[0] << ","
+                          << item.alias->ne[1] << "," << item.alias->ne[2] << "," << item.alias->ne[3]
                           << "]; keeping raw tensor for that projection" << std::endl;
             }
             model->cpu_repack_aliases.erase(item.source);
@@ -1605,11 +1590,9 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
               << (cpu_kleidiai_aliases > 0 ? std::string(primary_repack_buft_name) + "+CPU_KLEIDIAI"
                                            : std::string(primary_repack_buft_name))
               << ", kleidiai_available=" << (repack_bufts.cpu_kleidiai ? 1 : 0)
-              << ", kleidiai_aliases=" << cpu_kleidiai_aliases
-              << ", cpu_repack_aliases=" << cpu_repack_aliases
-              << ", alias_types=[" << type_summary.str() << "]"
-              << ", tensors=" << supported.size() << ", fused_aliases=" << fused_supported
-              << ", bytes=" << (bytes / 1024 / 1024) << " MiB" << std::endl;
+              << ", kleidiai_aliases=" << cpu_kleidiai_aliases << ", cpu_repack_aliases=" << cpu_repack_aliases
+              << ", alias_types=[" << type_summary.str() << "]" << ", tensors=" << supported.size()
+              << ", fused_aliases=" << fused_supported << ", bytes=" << (bytes / 1024 / 1024) << " MiB" << std::endl;
 }
 }  // namespace
 
@@ -3232,14 +3215,12 @@ TransformerModel* LoadGGUFModel(const char* path) {
         model->layers[i].Set(kGemma4RouterScaleKey, get_layer_tensor_any(i, {"router.scale", "ffn_gate_inp.scale"}));
         model->layers[i].Set(kGemma4RouterPerExpertScaleKey, get_layer_tensor_any(i, {"router.per_expert_scale"}));
         model->layers[i].Set(kGemma4PreMoeNormKey,
-                             get_layer_tensor_any(i, {"pre_ffw_norm_2.weight",
-                                                      "pre_feedforward_layernorm_2.weight"}));
-        model->layers[i].Set(kGemma4PostSharedNormKey,
-                             get_layer_tensor_any(i, {"post_ffw_norm_1.weight",
-                                                      "post_feedforward_layernorm_1.weight"}));
-        model->layers[i].Set(kGemma4PostMoeNormKey,
-                             get_layer_tensor_any(i, {"post_ffw_norm_2.weight",
-                                                      "post_feedforward_layernorm_2.weight"}));
+                             get_layer_tensor_any(i, {"pre_ffw_norm_2.weight", "pre_feedforward_layernorm_2.weight"}));
+        model->layers[i].Set(
+            kGemma4PostSharedNormKey,
+            get_layer_tensor_any(i, {"post_ffw_norm_1.weight", "post_feedforward_layernorm_1.weight"}));
+        model->layers[i].Set(kGemma4PostMoeNormKey, get_layer_tensor_any(i, {"post_ffw_norm_2.weight",
+                                                                             "post_feedforward_layernorm_2.weight"}));
         model->layers[i].Set(kGemma4PostFfnNormKey,
                              get_layer_tensor_any(i, {"post_feedforward_layernorm.weight", "post_ffw_norm.weight"}));
         model->layers[i].Set(model_keys::kGemma4PerLayerInputGate, get_layer_tensor_any(i, {"inp_gate.weight"}));

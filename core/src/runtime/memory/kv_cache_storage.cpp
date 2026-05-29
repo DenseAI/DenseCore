@@ -17,8 +17,8 @@ std::vector<float>& GetKVFloatScratch(size_t elements) {
     return scratch;
 }
 
-void PackLayerSlotsToStorageLayout(float* dst, const float* src, int num_slots, int storage_head_dim,
-                                   int storage_heads, int layer_head_dim, int layer_heads) {
+void PackLayerSlotsToStorageLayout(float* dst, const float* src, int num_slots, int storage_head_dim, int storage_heads,
+                                   int layer_head_dim, int layer_heads) {
     const int storage_elems = storage_head_dim * storage_heads;
     const int layer_elems = layer_head_dim * layer_heads;
     std::fill(dst, dst + static_cast<size_t>(storage_elems) * static_cast<size_t>(num_slots), 0.0f);
@@ -73,9 +73,9 @@ void ReadLayerSlotsFromF16Storage(float* dst, const ggml_fp16_t* src, int num_sl
         const ggml_fp16_t* slot_src = src + static_cast<size_t>(s) * static_cast<size_t>(storage_elems);
         float* slot_dst = dst + static_cast<size_t>(s) * static_cast<size_t>(layer_elems);
         for (int h = 0; h < layer_heads; ++h) {
-            densecore::simd::ConvertF16ToF32(
-                slot_dst + static_cast<size_t>(h) * static_cast<size_t>(layer_head_dim),
-                slot_src + static_cast<size_t>(h) * static_cast<size_t>(storage_head_dim), layer_head_dim);
+            densecore::simd::ConvertF16ToF32(slot_dst + static_cast<size_t>(h) * static_cast<size_t>(layer_head_dim),
+                                             slot_src + static_cast<size_t>(h) * static_cast<size_t>(storage_head_dim),
+                                             layer_head_dim);
         }
     }
 }
@@ -187,10 +187,9 @@ void* PagedKVCache::GetKBlockPtr(int block_id, int layer) {
     if (block_id < 0 || block_id >= max_blocks || layer < 0 || layer >= n_layer) return nullptr;
 
     if (use_block_allocator && k_allocator) {
-        const size_t layer_offset =
-            k_layer_stride_bytes != 0 ? k_layer_stride_bytes * static_cast<size_t>(layer)
-                                      : GetBytesPerBlock() * static_cast<size_t>(max_blocks) *
-                                            static_cast<size_t>(layer);
+        const size_t layer_offset = k_layer_stride_bytes != 0 ? k_layer_stride_bytes * static_cast<size_t>(layer)
+                                                              : GetBytesPerBlock() * static_cast<size_t>(max_blocks) *
+                                                                    static_cast<size_t>(layer);
         const size_t block_offset = GetBytesPerBlock() * static_cast<size_t>(block_id);
         void* ptr = static_cast<char*>(k_allocator->ArenaBase()) + layer_offset + block_offset;
         DENSECORE_ASSERT_ALIGNED_64(ptr);
@@ -207,10 +206,9 @@ void* PagedKVCache::GetVBlockPtr(int block_id, int layer) {
     if (block_id < 0 || block_id >= max_blocks || layer < 0 || layer >= n_layer) return nullptr;
 
     if (use_block_allocator && v_allocator) {
-        const size_t layer_offset =
-            v_layer_stride_bytes != 0 ? v_layer_stride_bytes * static_cast<size_t>(layer)
-                                      : GetVBytesPerBlock() * static_cast<size_t>(max_blocks) *
-                                            static_cast<size_t>(layer);
+        const size_t layer_offset = v_layer_stride_bytes != 0 ? v_layer_stride_bytes * static_cast<size_t>(layer)
+                                                              : GetVBytesPerBlock() * static_cast<size_t>(max_blocks) *
+                                                                    static_cast<size_t>(layer);
         const size_t block_offset = GetVBytesPerBlock() * static_cast<size_t>(block_id);
         void* ptr = static_cast<char*>(v_allocator->ArenaBase()) + layer_offset + block_offset;
         DENSECORE_ASSERT_ALIGNED_64(ptr);
@@ -269,13 +267,11 @@ void PagedKVCache::FillBlockPtrsForLayer(const std::vector<int>& block_ids, int 
     const auto* k_base = static_cast<const char*>(k_allocator->ArenaBase());
     const auto* v_base = static_cast<const char*>(v_allocator->ArenaBase());
     const size_t k_layer_offset =
-        k_layer_stride_bytes != 0
-            ? k_layer_stride_bytes * static_cast<size_t>(layer)
-            : GetBytesPerBlock() * static_cast<size_t>(max_blocks) * static_cast<size_t>(layer);
+        k_layer_stride_bytes != 0 ? k_layer_stride_bytes * static_cast<size_t>(layer)
+                                  : GetBytesPerBlock() * static_cast<size_t>(max_blocks) * static_cast<size_t>(layer);
     const size_t v_layer_offset =
-        v_layer_stride_bytes != 0
-            ? v_layer_stride_bytes * static_cast<size_t>(layer)
-            : GetVBytesPerBlock() * static_cast<size_t>(max_blocks) * static_cast<size_t>(layer);
+        v_layer_stride_bytes != 0 ? v_layer_stride_bytes * static_cast<size_t>(layer)
+                                  : GetVBytesPerBlock() * static_cast<size_t>(max_blocks) * static_cast<size_t>(layer);
     const size_t k_block_stride = GetBytesPerBlock();
     const size_t v_block_stride = GetVBytesPerBlock();
 
@@ -632,7 +628,8 @@ void PagedKVCache::WriteKSlots(int block_id, int layer, int start_slot, int num_
             return;
         }
         if (cache_type == GGML_TYPE_Q8_0 || cache_type == GGML_TYPE_Q4_0) {
-            auto& padded = GetKVFloatScratch(static_cast<size_t>(GetElementsPerSlot()) * static_cast<size_t>(num_slots));
+            auto& padded =
+                GetKVFloatScratch(static_cast<size_t>(GetElementsPerSlot()) * static_cast<size_t>(num_slots));
             PackLayerSlotsToStorageLayout(padded.data(), data, num_slots, head_dim, n_head_kv, layer_head_dim,
                                           layer_n_head_kv);
             ggml_quantize_chunk(cache_type, padded.data(), ptr, 0,
@@ -797,7 +794,8 @@ void PagedKVCache::ReadKSlots(int block_id, int layer, int start_slot, int num_s
             if (!type_traits || !type_traits->to_float) return;
             const size_t head_stride = ggml_row_size(cache_type, static_cast<int64_t>(head_dim));
             const auto* src = static_cast<const uint8_t*>(ptr);
-            auto& padded = GetKVFloatScratch(static_cast<size_t>(GetElementsPerSlot()) * static_cast<size_t>(num_slots));
+            auto& padded =
+                GetKVFloatScratch(static_cast<size_t>(GetElementsPerSlot()) * static_cast<size_t>(num_slots));
             for (int row = 0; row < num_slots * n_head_kv; ++row) {
                 type_traits->to_float(src + static_cast<size_t>(row) * head_stride,
                                       padded.data() + static_cast<size_t>(row) * static_cast<size_t>(head_dim),

@@ -962,6 +962,15 @@ static bool IsQ8RepackedGemvEnabled() {
     return enabled;
 }
 
+static bool IsGemma4LmHeadQ8RepackedGemvEnabled() {
+    static const bool enabled = []() -> bool {
+        const char* disable = std::getenv("DENSECORE_GEMMA4_DISABLE_LM_HEAD_Q8_REPACKED_GEMV");
+        return !(disable && disable[0] != '\0' && std::strcmp(disable, "0") != 0 &&
+                 std::strcmp(disable, "false") != 0 && std::strcmp(disable, "off") != 0);
+    }();
+    return enabled;
+}
+
 static std::shared_ptr<Q8RepackedGemvWeight> GetOrCreateQ8RepackedGemvWeight(const void* weight_data, int64_t rows,
                                                                               int64_t cols,
                                                                               bool force_enable = false) {
@@ -973,12 +982,10 @@ static std::shared_ptr<Q8RepackedGemvWeight> GetOrCreateQ8RepackedGemvWeight(con
     static std::unordered_map<Q8RepackedGemvKey, std::shared_ptr<Q8RepackedGemvWeight>, Q8RepackedGemvKeyHash> cache;
 
     const Q8RepackedGemvKey key{weight_data, rows, cols};
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto it = cache.find(key);
-        if (it != cache.end()) {
-            return it->second;
-        }
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
     }
 
     const size_t src_bytes = static_cast<size_t>(rows) * ggml_row_size(GGML_TYPE_Q8_0, cols);
@@ -994,9 +1001,8 @@ static std::shared_ptr<Q8RepackedGemvWeight> GetOrCreateQ8RepackedGemvWeight(con
         return nullptr;
     }
 
-    std::lock_guard<std::mutex> lock(mutex);
-    auto [it, inserted] = cache.emplace(key, packed);
-    return inserted ? packed : it->second;
+    auto [insert_it, inserted] = cache.emplace(key, packed);
+    return inserted ? packed : insert_it->second;
 }
 
 /**
@@ -1536,9 +1542,9 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                                       kQ8RepackedGemvMinOutputRows)
                 : kQ8RepackedGemvMinOutputRows;
         if (!ud->disable_q8_repacked_gemv && weight_type == GGML_TYPE_Q8_0 && ud->input_quant_type == GGML_TYPE_Q8_0 &&
-            K >= q8_repacked_min_rows &&
+            (K >= q8_repacked_min_rows || ud->force_q8_repacked_gemv) &&
             (N % QK8_0) == 0 && (K % 4) == 0) {
-            auto packed = GetOrCreateQ8RepackedGemvWeight(weight_data, K, N);
+            auto packed = GetOrCreateQ8RepackedGemvWeight(weight_data, K, N, ud->force_q8_repacked_gemv);
             if (packed && packed->blocks_per_row > 0) {
                 const size_t block_bytes = 4 * sizeof(ggml_fp16_t) + QK8_0 * 4;
                 int k = k_start;
@@ -1559,7 +1565,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                     type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
                 }
                 maybe_log_gemv_timing("q8_0_repacked_4x8");
-                record_gemv_dispatch_census("generic_gemv");
+                record_gemv_dispatch_census("q8_0_repacked_4x8");
                 return;
             }
         }
@@ -3746,6 +3752,7 @@ inline struct ggml_tensor* ggml_mul_mat_gemv(struct ggml_context* ctx, struct gg
     userdata->input_quant_type = GGML_TYPE_F32;
     userdata->model_identity = 0;
     userdata->dynamic_lora_active = false;
+    userdata->force_q8_repacked_gemv = false;
     userdata->work_ctx = GetCurrentWorkContext();
     userdata->phase_snapshot = GetCurrentExecutionPhase();
     userdata->gemma4_decode_native = false;
@@ -5170,6 +5177,7 @@ static bool CanUseGemma4DensePrefillNative(const TransformerModel* model, const 
 
 static bool CanUseGemma4DecodeNative(const TransformerModel* model, const ggml_tensor* weight,
                                      const ggml_tensor* input, const BatchSpec* batch,
+                                     InferenceExecutionPhase dispatch_phase,
                                      Gemma4NativeMatmulReject* reject_reason) {
     auto reject = [&](Gemma4NativeMatmulReject reason) {
         if (reject_reason) {
@@ -5180,7 +5188,8 @@ static bool CanUseGemma4DecodeNative(const TransformerModel* model, const ggml_t
     const auto mode = Gemma4DecodeNativeMode();
     if (mode == densecore::env::RuntimeToggleMode::Off) return reject(Gemma4NativeMatmulReject::EnvOff);
     if (!model || !model->arch_flags.is_gemma4) return reject(Gemma4NativeMatmulReject::NotGemma4);
-    if (GetCurrentExecutionPhase() != InferenceExecutionPhase::Decode) {
+    const bool decode_shaped = input && input->ne[1] <= 1;
+    if (dispatch_phase != InferenceExecutionPhase::Decode && !decode_shaped) {
         return reject(Gemma4NativeMatmulReject::WrongPhase);
     }
     if (!weight || !input || input->type != GGML_TYPE_F32 || input->ne[1] > 1) {
@@ -5333,7 +5342,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
 	    const int N_dim = static_cast<int>(weight->ne[1]);
 	    const char* w_name = (weight->name[0] ? weight->name : "(unnamed)");
 	    const char* input_name = (input && input->name[0]) ? input->name : "(unnamed)";
-	    const bool gemma4_lm_head = model && model->output == weight;
+	    const bool gemma4_lm_head = model && (model->output == weight || model->output == original_weight);
 	    const bool is_compatible = (weight->ne[0] == input->ne[0]);
 	    const densecore::runtime::DenseCoreMatmulPhase matmul_plan_phase =
 	        dispatch_phase == InferenceExecutionPhase::Prefill
@@ -5371,7 +5380,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     }
     Gemma4NativeMatmulReject gemma4_decode_native_reject = Gemma4NativeMatmulReject::None;
     const bool gemma4_decode_native_allowed =
-        CanUseGemma4DecodeNative(model, weight, input, current_batch, &gemma4_decode_native_reject);
+        CanUseGemma4DecodeNative(model, weight, input, current_batch, dispatch_phase,
+                                 &gemma4_decode_native_reject);
     const bool gemma4_decode_candidate =
         model && model->arch_flags.is_gemma4 && input && input->type == GGML_TYPE_F32 && M <= 1 &&
         (weight->type == GGML_TYPE_F32 || ggml_is_quantized(weight->type)) &&
@@ -5746,8 +5756,13 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         static const bool gemma4_q8_repacked_enabled = []() {
             return densecore::env::ParseNonZeroEnv("DENSECORE_GEMMA4_ENABLE_Q8_REPACKED_GEMV", false);
         }();
-        ud->disable_q8_repacked_gemv = is_gemma4_model && !gemma4_q8_repacked_enabled &&
-                                       !IsGemma4SharedDenseFfnWeightName(w_name);
+        const bool gemma4_lm_head_q8_repacked =
+            is_gemma4_model && gemma4_lm_head && weight->type == GGML_TYPE_Q8_0 && input->type == GGML_TYPE_F32 &&
+            M == 1 && IsGemma4LmHeadQ8RepackedGemvEnabled();
+        ud->force_q8_repacked_gemv = gemma4_lm_head_q8_repacked;
+        ud->disable_q8_repacked_gemv =
+            is_gemma4_model && !gemma4_q8_repacked_enabled && !gemma4_lm_head_q8_repacked &&
+            !IsGemma4SharedDenseFfnWeightName(w_name);
         ud->gemma4_decode_native = gemma4_decode_native_allowed;
         ud->gemma4_decode_lm_head = gemma4_lm_head;
         if (dispatch_work_ctx && is_gemma4_model && ggml_is_quantized(weight->type)) {

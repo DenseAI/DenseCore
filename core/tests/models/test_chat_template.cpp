@@ -410,8 +410,7 @@ TEST(CanonicalChatRenderTest, Qwen36DisableInjectsNoThinkDirective) {
     EXPECT_EQ(rendered,
               "<|im_start|>user\n"
               "hello<|im_end|>\n"
-              "<|im_start|>assistant\n"
-              "<think>\n\n</think>\n");
+              "<|im_start|>assistant\n");
 }
 
 TEST(CanonicalChatRenderTest, Qwen36ThinkingUsesOfficialPromptWithoutReasoningDirective) {

@@ -180,6 +180,48 @@ TEST(WorkerResultDispatchTest, DecodeSummaryIncludesPrefixCacheMetrics) {
     EXPECT_NE(captured.find("prefix_cache_skip_reason=none"), std::string::npos);
 }
 
+TEST(WorkerResultDispatchTest, DecodeSummaryIncludesQ5MoeTelemetry) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.moe_q5k_repacked_candidate_ops = 3;
+    req.moe_q5k_repacked_used_ops = 1;
+    req.moe_q5k_repacked_rejected_ops = 2;
+    req.moe_q5k_repacked_last_reject_reason = "env_or_kernel_disabled";
+    req.gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops = 4;
+    req.gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops = 5;
+    req.qwen35_moe_w1w3_weight_type_hist[2] = 6;
+    req.qwen35_moe_w2_weight_type_hist[3] = 7;
+    MatmulDispatchCensusEntry census{};
+    census.model_family = "qwen36";
+    census.phase = "decode";
+    census.dispatch_path = "ggml_mul_mat_id";
+    census.weight_type = "q5_k";
+    census.shape_bucket = "m1xn4096xk4096";
+    census.wall_ns = 2000000;
+    census.ops = 8;
+    req.matmul_dispatch_top_slow_entries.push_back(census);
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("moe_q5k_repacked_candidate_ops=3"), std::string::npos);
+    EXPECT_NE(captured.find("moe_q5k_repacked_used_ops=1"), std::string::npos);
+    EXPECT_NE(captured.find("moe_q5k_repacked_rejected_ops=2"), std::string::npos);
+    EXPECT_NE(captured.find("moe_q5k_repacked_last_reject_reason=env_or_kernel_disabled"), std::string::npos);
+    EXPECT_NE(captured.find("gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops=4"),
+              std::string::npos);
+    EXPECT_NE(captured.find("gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops=5"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_native_moe_w1w3_weight_type_hist="), std::string::npos);
+    EXPECT_NE(captured.find("qwen_native_moe_w2_weight_type_hist="), std::string::npos);
+    EXPECT_NE(captured.find("matmul_dispatch_top_slow=qwen36:decode:ggml_mul_mat_id:q5_k:m1xn4096xk4096"),
+              std::string::npos);
+}
+
 TEST(WorkerResultDispatchTest, DecodeSummaryTagsQwen36AndGemma4Variants) {
     struct Case {
         ModelArch arch;

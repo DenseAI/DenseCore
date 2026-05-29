@@ -322,7 +322,7 @@ func CacheKey(identity Identity, tokens []int) string {
 		sum.Write([]byte{0})
 	}
 	for _, tok := range tokens {
-		sum.Write([]byte(fmt.Sprintf("%d,", tok)))
+		_, _ = fmt.Fprintf(sum, "%d,", tok)
 	}
 	return hex.EncodeToString(sum.Sum(nil))
 }

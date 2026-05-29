@@ -412,7 +412,6 @@ func proxyStream(ctx context.Context, traceID string, queueReqID string, src <-c
 				dstAbandoned = true
 				if !terminalSeen {
 					sendEvent(domain.NewTerminalEvent(ctx.Err()))
-					terminalSeen = true
 				}
 				return
 			}
@@ -421,7 +420,6 @@ func proxyStream(ctx context.Context, traceID string, queueReqID string, src <-c
 			dstAbandoned = true
 			if !terminalSeen {
 				sendEvent(domain.NewTerminalEvent(ctx.Err()))
-				terminalSeen = true
 			}
 			return
 		}

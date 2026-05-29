@@ -371,7 +371,10 @@ def format_chat_prompt(
     if profile.family == "qwen":
         thinking_enabled = qwen_thinking_enabled(model_hint, enable_thinking)
         preserve_thinking = True if preserve_thinking is None else preserve_thinking
-        supports_no_think = "qwen3.6" not in (model_hint or "").lower() and "qwen36" not in (model_hint or "").lower()
+        supports_no_think = (
+            "qwen3.6" not in (model_hint or "").lower()
+            and "qwen36" not in (model_hint or "").lower()
+        )
         parts: list[str] = []
         last_user_index = -1
         for index, message in enumerate(normalized_messages):
@@ -389,7 +392,12 @@ def format_chat_prompt(
                         )
             elif role == "user":
                 content = _render_qwen_content(message, profile)
-                if content and not thinking_enabled and supports_no_think and index == last_user_index:
+                if (
+                    content
+                    and not thinking_enabled
+                    and supports_no_think
+                    and index == last_user_index
+                ):
                     content = append_qwen_no_think_directive(content)
                 if content:
                     parts.append(f"{profile.open_tag}user\n{content}{profile.close_tag}")

@@ -366,21 +366,19 @@ GraphAdmissionResult AdmitGraphBuilder(const GraphFamilyResolution& resolution, 
         AddReason(capabilities.requires_ffn_post_norms && !support.supports_ffn_post_norms,
                   "requires FFN post-norm ordering semantics", &reasons);
         AddReason(!ContainsAll(support.supported_moe_routers, capabilities.required_moe_routers),
-                  "requires MoE router kinds " +
-                      JoinNames(capabilities.required_moe_routers, DecoderMoERouterName),
+                  "requires MoE router kinds " + JoinNames(capabilities.required_moe_routers, DecoderMoERouterName),
                   &reasons);
         AddReason(!ContainsAll(support.supported_ffn_activations, capabilities.required_ffn_activations),
                   "requires FFN activation kinds " +
                       JoinNames(capabilities.required_ffn_activations, DecoderActivationName),
                   &reasons);
         AddReason(!ContainsAll(support.supported_rope_kinds, capabilities.required_rope_kinds),
-                  "requires RoPE kinds " + JoinNames(capabilities.required_rope_kinds, DecoderRopeKindName),
-                  &reasons);
-        AddReason(!ContainsAll(support.supported_prefill_logits_policies,
-                               capabilities.required_prefill_logits_policies),
-                  "requires prefill logits policies " +
-                      JoinNames(capabilities.required_prefill_logits_policies, DecoderPrefillLogitsPolicyName),
-                  &reasons);
+                  "requires RoPE kinds " + JoinNames(capabilities.required_rope_kinds, DecoderRopeKindName), &reasons);
+        AddReason(
+            !ContainsAll(support.supported_prefill_logits_policies, capabilities.required_prefill_logits_policies),
+            "requires prefill logits policies " +
+                JoinNames(capabilities.required_prefill_logits_policies, DecoderPrefillLogitsPolicyName),
+            &reasons);
         AddReason(!ContainsAll(support.supported_semantic_ops, capabilities.required_semantic_ops),
                   "requires semantic ops " + JoinNames(capabilities.required_semantic_ops, DecoderSemanticOpKindName),
                   &reasons);

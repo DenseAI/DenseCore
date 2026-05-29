@@ -88,7 +88,7 @@ func writeToolList(sb *strings.Builder, tools []domain.Tool) {
 func writeToolChoice(sb *strings.Builder, choice ToolChoice) {
 	switch choice.Mode {
 	case ToolChoiceForced:
-		sb.WriteString(fmt.Sprintf("You must call the function %q.\n", choice.ForcedName))
+		fmt.Fprintf(sb, "You must call the function %q.\n", choice.ForcedName)
 	case ToolChoiceRequired:
 		sb.WriteString("You must call at least one tool.\n")
 	case ToolChoiceNone:

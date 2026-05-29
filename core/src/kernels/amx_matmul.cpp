@@ -20,9 +20,9 @@
  * Runtime CPUID check before use.
  */
 
+#include "densecore/backend/cpu_backend.h"
 #include "densecore/hal/op_registry.h"
 #include "densecore/hal/transformer_ops.h"
-#include "densecore/backend/cpu_backend.h"
 #include "densecore/simd/simd_platform.h"
 
 #include <algorithm>
@@ -89,9 +89,8 @@ inline float QuantizeRowToInt8(const float* input, int8_t* output, int K) {
     __m512 vmax = _mm512_setzero_ps();
     for (; i + 16 <= K; i += 16) {
         __m512 v = _mm512_loadu_ps(input + i);
-        vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(
-            _mm512_andnot_si512(_mm512_set1_epi32(0x80000000),
-                                _mm512_castps_si512(v))));
+        vmax = _mm512_max_ps(
+            vmax, _mm512_castsi512_ps(_mm512_andnot_si512(_mm512_set1_epi32(0x80000000), _mm512_castps_si512(v))));
     }
     max_abs = _mm512_reduce_max_ps(vmax);
 #endif
@@ -130,12 +129,11 @@ inline float QuantizeRowToInt8(const float* input, int8_t* output, int K) {
 // Output C is FP32.
 //
 // This handles the core tile loop. Caller handles partitioning.
-void AmxInt8GemmTiled(
-    const float* A, int lda,           // [M, K] FP32 activations
-    const int8_t* B_int8, int ldb,     // [K, N] INT8 weights (row-major)
-    const float* b_scales, int N_scales, // Per-column weight scales
-    float* C, int ldc,                 // [M, N] FP32 output
-    int M, int K, int N) {
+void AmxInt8GemmTiled(const float* A, int lda,              // [M, K] FP32 activations
+                      const int8_t* B_int8, int ldb,        // [K, N] INT8 weights (row-major)
+                      const float* b_scales, int N_scales,  // Per-column weight scales
+                      float* C, int ldc,                    // [M, N] FP32 output
+                      int M, int K, int N) {
 
     constexpr int TILE_M = 16;
     constexpr int TILE_K = 64;
@@ -165,14 +163,10 @@ void AmxInt8GemmTiled(
 
                 // Quantize A tile rows
                 for (int mi = 0; mi < m_tile; ++mi) {
-                    a_scales[mi] = QuantizeRowToInt8(
-                        A + (m0 + mi) * lda + k0,
-                        a_int8_buf + mi * TILE_K,
-                        k_tile);
+                    a_scales[mi] = QuantizeRowToInt8(A + (m0 + mi) * lda + k0, a_int8_buf + mi * TILE_K, k_tile);
                     // Zero-pad if k_tile < TILE_K
                     if (k_tile < TILE_K) {
-                        std::memset(a_int8_buf + mi * TILE_K + k_tile, 0,
-                                    static_cast<size_t>(TILE_K - k_tile));
+                        std::memset(a_int8_buf + mi * TILE_K + k_tile, 0, static_cast<size_t>(TILE_K - k_tile));
                     }
                 }
 
@@ -181,8 +175,7 @@ void AmxInt8GemmTiled(
                 std::memset(b_vnni_buf, 0, sizeof(b_vnni_buf));
                 for (int ki = 0; ki < k_tile; ++ki) {
                     for (int ni = 0; ni < n_tile; ++ni) {
-                        b_vnni_buf[(ki / 4) * (TILE_N * 4) + ni * 4 + (ki % 4)] =
-                            B_int8[(k0 + ki) * ldb + (n0 + ni)];
+                        b_vnni_buf[(ki / 4) * (TILE_N * 4) + ni * 4 + (ki % 4)] = B_int8[(k0 + ki) * ldb + (n0 + ni)];
                     }
                 }
 
@@ -190,11 +183,11 @@ void AmxInt8GemmTiled(
                 if (m_tile == TILE_M && k_tile == TILE_K && n_tile == TILE_N) {
                     ConfigureTilesForGemm(TILE_M, TILE_K, TILE_N);
 
-                    _tile_loadd(0, c_int32, TILE_N * 4);            // tmm0 = C accumulator
-                    _tile_loadd(1, a_int8_buf, TILE_K);              // tmm1 = A
-                    _tile_loadd(2, b_vnni_buf, TILE_N * 4);          // tmm2 = B (VNNI format)
-                    _tile_dpbssd(0, 1, 2);                            // tmm0 += tmm1 × tmm2
-                    _tile_stored(0, c_int32, TILE_N * 4);            // Store result
+                    _tile_loadd(0, c_int32, TILE_N * 4);     // tmm0 = C accumulator
+                    _tile_loadd(1, a_int8_buf, TILE_K);      // tmm1 = A
+                    _tile_loadd(2, b_vnni_buf, TILE_N * 4);  // tmm2 = B (VNNI format)
+                    _tile_dpbssd(0, 1, 2);                   // tmm0 += tmm1 × tmm2
+                    _tile_stored(0, c_int32, TILE_N * 4);    // Store result
 
                     _tile_release();
                 } else {
@@ -228,8 +221,7 @@ void AmxInt8GemmTiled(
 // OpRegistry wrapper for AMX INT8 MatMul
 class CpuAmxInt8MatMulOp final : public DenseCoreOp {
 public:
-    void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
-                 const void* params) override {
+    void Execute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, const void* params) override {
         // This op is invoked by the HAL when AMX is available and the operand
         // types match (FP32 activation × Q8 weight → FP32 output).
         if (inputs.size() < 2 || outputs.empty()) return;

@@ -158,9 +158,8 @@ inline void QuantizeQueryToU8(const float* query, QuantizedQuery* out, int head_
     for (; i + 16 <= head_dim; i += 16) {
         __m512 v = _mm512_loadu_ps(query + i);
         // abs via clearing sign bit
-        vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(
-            _mm512_andnot_si512(_mm512_set1_epi32(0x80000000),
-                                _mm512_castps_si512(v))));
+        vmax = _mm512_max_ps(
+            vmax, _mm512_castsi512_ps(_mm512_andnot_si512(_mm512_set1_epi32(0x80000000), _mm512_castps_si512(v))));
     }
     float max_abs = _mm512_reduce_max_ps(vmax);
     for (; i < head_dim; ++i) {
@@ -228,10 +227,8 @@ inline float DotProductQ8_0_VNNI(const QuantizedQuery* qq, const void* k_data, i
         const int8_t* ks = blocks[b].qs;
 
         // Load 32 uint8 query and 32 int8 key values
-        __m256i q_vec = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(qq->q_u8 + q_offset));
-        __m256i k_vec = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(ks));
+        __m256i q_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qq->q_u8 + q_offset));
+        __m256i k_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ks));
 
         // VNNI: 8 groups of 4-element unsigned×signed dot products
         __m256i dp = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q_vec, k_vec);
@@ -240,9 +237,9 @@ inline float DotProductQ8_0_VNNI(const QuantizedQuery* qq, const void* k_data, i
         // dp = [d0, d1, d2, d3, d4, d5, d6, d7]
         __m128i dp_hi = _mm256_extracti128_si256(dp, 1);
         __m128i dp_lo = _mm256_castsi256_si128(dp);
-        __m128i sum4 = _mm_add_epi32(dp_lo, dp_hi);          // [d0+d4, d1+d5, d2+d6, d3+d7]
-        __m128i sum2 = _mm_add_epi32(sum4, _mm_shuffle_epi32(sum4, 0x4E)); // swap high/low pairs
-        __m128i sum1 = _mm_add_epi32(sum2, _mm_shuffle_epi32(sum2, 0xB1)); // swap adjacent
+        __m128i sum4 = _mm_add_epi32(dp_lo, dp_hi);                         // [d0+d4, d1+d5, d2+d6, d3+d7]
+        __m128i sum2 = _mm_add_epi32(sum4, _mm_shuffle_epi32(sum4, 0x4E));  // swap high/low pairs
+        __m128i sum1 = _mm_add_epi32(sum2, _mm_shuffle_epi32(sum2, 0xB1));  // swap adjacent
         int32_t raw_dot = _mm_cvtsi128_si32(sum1);
 
         // Compute sum of key int8 values for zero-point correction
@@ -251,10 +248,8 @@ inline float DotProductQ8_0_VNNI(const QuantizedQuery* qq, const void* k_data, i
         __m256i k_16_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(k_vec));
         __m256i k_16_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(k_vec, 1));
         // Sum 16 int16 values from each half
-        __m128i k_sum_lo = _mm_add_epi16(_mm256_castsi256_si128(k_16_lo),
-                                          _mm256_extracti128_si256(k_16_lo, 1));
-        __m128i k_sum_hi = _mm_add_epi16(_mm256_castsi256_si128(k_16_hi),
-                                          _mm256_extracti128_si256(k_16_hi, 1));
+        __m128i k_sum_lo = _mm_add_epi16(_mm256_castsi256_si128(k_16_lo), _mm256_extracti128_si256(k_16_lo, 1));
+        __m128i k_sum_hi = _mm_add_epi16(_mm256_castsi256_si128(k_16_hi), _mm256_extracti128_si256(k_16_hi, 1));
         __m128i k_sum = _mm_add_epi16(k_sum_lo, k_sum_hi);
         // Pairwise horizontal add to collapse 8 int16 → 4 int32 → single
         __m128i k_sum32 = _mm_madd_epi16(k_sum, _mm_set1_epi16(1));

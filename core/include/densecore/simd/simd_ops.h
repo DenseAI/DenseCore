@@ -4681,9 +4681,7 @@ inline void GemvParallel(float* output, const float* x, const float* weight, int
     // reusing each loaded activation vector across several output rows matters.
     constexpr int UNROLL = 4;
 
-    auto hsum512 = [](__m512 v) -> float {
-        return _mm512_reduce_add_ps(v);
-    };
+    auto hsum512 = [](__m512 v) -> float { return _mm512_reduce_add_ps(v); };
 
     constexpr int PREFETCH_DISTANCE = 8;
 

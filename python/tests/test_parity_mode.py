@@ -1,7 +1,7 @@
 import threading
 
 from densecore.chat_template import resolve_prompt_profile
-from densecore.engine import DenseCore
+from densecore.engine import CALLBACK_TYPE, DenseCore
 
 
 class _DummyTokenizer:
@@ -12,6 +12,10 @@ class _DummyTokenizer:
 class _FakeLib:
     def __init__(self):
         self.last_call = None
+
+    @staticmethod
+    def _int_value(value):
+        return int(value.value) if hasattr(value, "value") else int(value)
 
     def SubmitRequestWithSampling(
         self,
@@ -32,7 +36,7 @@ class _FakeLib:
             "handle": handle,
             "prompt": prompt.decode("utf-8"),
             "max_tokens": max_tokens,
-            "json_mode": int(json_mode),
+            "json_mode": self._int_value(json_mode),
         }
         return 1
 
@@ -56,7 +60,7 @@ class _FakeLib:
             "handle": handle,
             "tokens": [int(tokens[index]) for index in range(n_tokens)],
             "max_tokens": max_tokens,
-            "json_mode": int(json_mode),
+            "json_mode": self._int_value(json_mode),
         }
         return 1
 
@@ -68,7 +72,7 @@ def _make_engine(model_path="/tmp/model.gguf"):
     engine._active_ctypes_refs = {}
     engine._requests = {}
     engine._request_parity_mode = {}
-    engine._c_callback = object()
+    engine._c_callback = CALLBACK_TYPE(lambda _token, _finished, _req_id: None)
     engine._lib = _FakeLib()
     engine._has_sampling_api = True
     engine._has_lora_sampling_api = False
@@ -180,11 +184,13 @@ def test_chat_parity_mode_uses_engine_metadata_and_skips_defaults(monkeypatch):
         return "ok"
 
     engine.generate = fake_generate
-    engine.render_chat_prompt = lambda messages, enable_thinking=None, extra_system_messages=None: {
-        "prompt": "<|im_start|>user\nHello /no_think<|im_end|>\n<|im_start|>assistant\n",
-        "tokenizer_type": "qwen35",
-        "chat_template": "<|im_start|>user\n",
-    }
+    engine.render_chat_prompt = (
+        lambda messages, enable_thinking=None, preserve_thinking=None, extra_system_messages=None: {
+            "prompt": "<|im_start|>user\nHello /no_think<|im_end|>\n<|im_start|>assistant\n",
+            "tokenizer_type": "qwen35",
+            "chat_template": "<|im_start|>user\n",
+        }
+    )
     monkeypatch.setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false")
 
     result = engine.chat(
@@ -209,11 +215,13 @@ def test_chat_parity_mode_disables_gemma_raw_passthrough():
         return "ok"
 
     engine.generate = fake_generate
-    engine.render_chat_prompt = lambda messages, enable_thinking=None, extra_system_messages=None: {
-        "prompt": "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
-        "tokenizer_type": "gemma4",
-        "chat_template": "<|turn>user\n",
-    }
+    engine.render_chat_prompt = (
+        lambda messages, enable_thinking=None, preserve_thinking=None, extra_system_messages=None: {
+            "prompt": "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
+            "tokenizer_type": "gemma4",
+            "chat_template": "<|turn>user\n",
+        }
+    )
 
     engine.chat(
         [{"role": "user", "content": "What is the capital of France?"}],

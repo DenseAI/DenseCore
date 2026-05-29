@@ -317,8 +317,7 @@ bool ShouldUsePrefillLastLogitsOnly(const DecoderModelSpec* spec, int num_seqs, 
         return false;
     }
     switch (spec->output.prefill_logits_policy) {
-    case DecoderPrefillLogitsPolicy::LastTokenEnvOptIn:
-        return policy.qwen35_prefill_last_logits_only;
+    case DecoderPrefillLogitsPolicy::LastTokenEnvOptIn: return policy.qwen35_prefill_last_logits_only;
     case DecoderPrefillLogitsPolicy::LastTokenEnvDefaultOn:
         return spec->variant == ModelVariant::QWEN35 ? policy.qwen35_prefill_last_logits_only
                                                      : policy.qwen36_prefill_last_logits_only;
@@ -421,28 +420,23 @@ const char* DecoderSpecializationKindName(DecoderSpecializationKind kind) {
 
 bool DecoderModelSpecHasSpecialization(const DecoderModelSpec& spec, DecoderSpecializationKind kind) {
     return std::any_of(spec.specializations.begin(), spec.specializations.end(),
-                       [kind](const DecoderSpecialization& specialization) {
-                           return specialization.kind == kind;
-                       });
+                       [kind](const DecoderSpecialization& specialization) { return specialization.kind == kind; });
 }
 
 std::string FormatDecoderLayerSpec(const DecoderLayerSpec& layer) {
     std::ostringstream oss;
-    oss << "layer=" << layer.layer_index << " attention={hybrid_ssm="
-        << (layer.attention.has_hybrid_ssm_mixer ? "true" : "false")
+    oss << "layer=" << layer.layer_index
+        << " attention={hybrid_ssm=" << (layer.attention.has_hybrid_ssm_mixer ? "true" : "false")
         << ", sliding=" << (layer.attention.is_sliding_window ? "true" : "false")
         << ", shared_kv_read=" << (layer.attention.reads_shared_kv ? "true" : "false")
         << ", shared_kv_publish=" << (layer.attention.publishes_shared_kv ? "true" : "false")
         << ", kv_source=" << layer.attention.kv_source_layer << ", kv_heads=" << layer.attention.kv_head_count
-        << ", rope=" << DecoderRopeKindName(layer.attention.rope_kind)
-        << ", rope_dim=" << layer.attention.rope_dim << ", softcap=" << layer.attention.logit_softcap
-        << "} ffn={moe=" << (layer.ffn.is_moe ? "true" : "false")
+        << ", rope=" << DecoderRopeKindName(layer.attention.rope_kind) << ", rope_dim=" << layer.attention.rope_dim
+        << ", softcap=" << layer.attention.logit_softcap << "} ffn={moe=" << (layer.ffn.is_moe ? "true" : "false")
         << ", router=" << DecoderMoERouterName(layer.ffn.router)
-        << ", activation=" << DecoderActivationName(layer.ffn.activation)
-        << ", experts=" << layer.ffn.num_experts << ", top_k=" << layer.ffn.top_k
-        << ", shared_dense=" << (layer.ffn.has_shared_dense_branch ? "true" : "false")
-        << ", down_scale_sidecar=" << (layer.ffn.has_down_scale_sidecar ? "true" : "false")
-        << ", post_norms="
+        << ", activation=" << DecoderActivationName(layer.ffn.activation) << ", experts=" << layer.ffn.num_experts
+        << ", top_k=" << layer.ffn.top_k << ", shared_dense=" << (layer.ffn.has_shared_dense_branch ? "true" : "false")
+        << ", down_scale_sidecar=" << (layer.ffn.has_down_scale_sidecar ? "true" : "false") << ", post_norms="
         << ((layer.ffn.has_post_shared_norm || layer.ffn.has_post_moe_norm || layer.ffn.has_post_ffn_norm) ? "true"
                                                                                                            : "false")
         << "} ops=[";
@@ -475,9 +469,8 @@ std::string FormatDecoderSpecializations(const DecoderModelSpec& spec) {
 
 std::string FormatDecoderModelSpec(const DecoderModelSpec& spec) {
     std::ostringstream oss;
-    oss << "DecoderModelSpec{arch=" << static_cast<int>(spec.arch)
-        << ", variant=" << static_cast<int>(spec.variant) << ", layers=" << spec.layers.size()
-        << ", topology=" << DecoderRuntimeTopologyName(spec.runtime_topology)
+    oss << "DecoderModelSpec{arch=" << static_cast<int>(spec.arch) << ", variant=" << static_cast<int>(spec.variant)
+        << ", layers=" << spec.layers.size() << ", topology=" << DecoderRuntimeTopologyName(spec.runtime_topology)
         << ", moe=" << (spec.has_moe ? "true" : "false")
         << ", hybrid_ssm=" << (spec.has_hybrid_ssm_mixer ? "true" : "false")
         << ", sliding=" << (spec.has_sliding_window_attention ? "true" : "false")

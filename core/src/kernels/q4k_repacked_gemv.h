@@ -64,12 +64,12 @@ Q4KRepackedGemvCacheStats Q4KRepackedGemvTrimCacheForAvailableMemory(size_t rese
 uint64_t FingerprintQ4KRepackedGemvWeight(const void* weight_ptr, size_t bytes);
 uint64_t Q4KRepackedGemvWeightFingerprint(const void* weight_ptr, int64_t rows, int64_t cols);
 
-std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(
-    const void* weight_ptr, int64_t rows, int64_t cols, Q4KRepackedGemvCacheLookup* lookup = nullptr);
+std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(const void* weight_ptr, int64_t rows,
+                                                                        int64_t cols,
+                                                                        Q4KRepackedGemvCacheLookup* lookup = nullptr);
 
 bool RunQ4KRepackedGemv(const std::shared_ptr<Q4KRepackedGemvWeight>& packed, const uint8_t* qinput_data,
-                        size_t qinput_row_bytes, float* output_data, int64_t output_cols, int tile_start,
-                        int tile_end);
+                        size_t qinput_row_bytes, float* output_data, int64_t output_cols, int tile_start, int tile_end);
 
 bool RunQ4KRepackedGemvRows(const std::shared_ptr<Q4KRepackedGemvWeight>& packed, const uint8_t* qinput_data,
                             size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t output_cols,

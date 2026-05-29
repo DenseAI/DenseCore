@@ -119,7 +119,6 @@ func (h *Handler) handleCompletionStream(ctx context.Context, w http.ResponseWri
 
 	id := fmt.Sprintf("cmpl-%d", time.Now().Unix())
 	created := time.Now().Unix()
-	terminalSeen := false
 	streamWriter := newSSEStreamWriter(w, flusher, h.sseFlushPolicy())
 	streamStart := time.Now()
 	firstCallbackMS := 0.0
@@ -130,23 +129,15 @@ func (h *Handler) handleCompletionStream(ctx context.Context, w http.ResponseWri
 		select {
 		case event, ok := <-outputChan:
 			if !ok {
-				if !terminalSeen {
-					err := waitGenerationError(errChan)
-					if err == nil {
-						err = domain.ErrStreamClosedWithoutTerminal
-					}
-					_ = streamWriter.Flush()
-					writeGenerationError(ctx, w, flusher, req.Model, err, streamWriter.Started())
-					return
+				err := waitGenerationError(errChan)
+				if err == nil {
+					err = domain.ErrStreamClosedWithoutTerminal
 				}
-				if err := waitGenerationError(errChan); err != nil {
-					_ = streamWriter.Flush()
-					writeGenerationError(ctx, w, flusher, req.Model, err, streamWriter.Started())
-				}
+				_ = streamWriter.Flush()
+				writeGenerationError(ctx, w, flusher, req.Model, err, streamWriter.Started())
 				return
 			}
 			if event.Terminal {
-				terminalSeen = true
 				if err := event.TerminalError(); err != nil {
 					_ = streamWriter.Flush()
 					writeGenerationError(ctx, w, flusher, req.Model, err, streamWriter.Started())

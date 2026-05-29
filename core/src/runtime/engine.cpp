@@ -169,18 +169,18 @@ size_t ReadAvailableMemoryMbForKVAutoSizing() {
     const unsigned long long cgroup_v2_limit = read_ull_file("/sys/fs/cgroup/memory.max");
     const unsigned long long cgroup_v2_current = read_ull_file("/sys/fs/cgroup/memory.current");
     if (cgroup_v2_limit > 0) {
-        cgroup_available_mb = static_cast<size_t>(
-            ((cgroup_v2_current > 0 && cgroup_v2_limit > cgroup_v2_current) ? (cgroup_v2_limit - cgroup_v2_current)
-                                                                            : cgroup_v2_limit) /
-            MB);
+        cgroup_available_mb = static_cast<size_t>(((cgroup_v2_current > 0 && cgroup_v2_limit > cgroup_v2_current)
+                                                       ? (cgroup_v2_limit - cgroup_v2_current)
+                                                       : cgroup_v2_limit) /
+                                                  MB);
     }
     const unsigned long long cgroup_v1_limit = read_ull_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
     const unsigned long long cgroup_v1_current = read_ull_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
     if (cgroup_available_mb == 0 && cgroup_v1_limit > 0) {
-        cgroup_available_mb = static_cast<size_t>(
-            ((cgroup_v1_current > 0 && cgroup_v1_limit > cgroup_v1_current) ? (cgroup_v1_limit - cgroup_v1_current)
-                                                                            : cgroup_v1_limit) /
-            MB);
+        cgroup_available_mb = static_cast<size_t>(((cgroup_v1_current > 0 && cgroup_v1_limit > cgroup_v1_current)
+                                                       ? (cgroup_v1_limit - cgroup_v1_current)
+                                                       : cgroup_v1_limit) /
+                                                  MB);
     }
 
     std::FILE* file = std::fopen("/proc/meminfo", "r");
@@ -234,7 +234,8 @@ size_t ResolveAutoKVTargetMb(const TransformerModel* model, int max_num_seqs, si
     size_t graph_reserve_bytes = std::max<size_t>(available_bytes / 6, 1024ULL * MB);
     if (model) {
         const size_t graph_seq_hint = static_cast<size_t>(std::max(1, std::min(max_seq_len, 2048)));
-        const size_t graph_chunk_hint = model->arch_flags.is_hybrid_ssm ? graph_seq_hint : std::min<size_t>(graph_seq_hint, 192);
+        const size_t graph_chunk_hint =
+            model->arch_flags.is_hybrid_ssm ? graph_seq_hint : std::min<size_t>(graph_seq_hint, 192);
         const auto graph_estimate = EngineState::EstimateGraphContextSize(model, graph_seq_hint, 1, graph_chunk_hint);
         graph_reserve_bytes = std::max(graph_reserve_bytes, graph_estimate.total_bytes);
         graph_reserve_bytes += std::max<size_t>(graph_estimate.total_bytes / 4, 2048ULL * MB);
@@ -409,8 +410,7 @@ ggml_type ResolveEffectiveKVCacheType(const TransformerModel* model, ggml_type r
 }
 
 ggml_type ResolveDefaultKVCacheType(const TransformerModel* model) {
-    if (model && model->arch_flags.is_gemma4 &&
-        ResolveEffectiveKVCacheType(model, GGML_TYPE_Q8_0) == GGML_TYPE_Q8_0) {
+    if (model && model->arch_flags.is_gemma4 && ResolveEffectiveKVCacheType(model, GGML_TYPE_Q8_0) == GGML_TYPE_Q8_0) {
         return GGML_TYPE_Q8_0;
     }
     return GGML_TYPE_F16;
@@ -471,9 +471,8 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
     bool target_mb_env_set = false;
     int target_mb = ReadEnvInt("DENSECORE_KV_TARGET_MB", 0, &target_mb_env_set);
     if (target_mb <= 0) {
-        target_mb =
-            static_cast<int>(
-                ResolveAutoKVTargetMb(model, config.max_num_seqs, config.bytes_per_token, config.max_seq_len));
+        target_mb = static_cast<int>(
+            ResolveAutoKVTargetMb(model, config.max_num_seqs, config.bytes_per_token, config.max_seq_len));
     }
     config.target_kv_memory = static_cast<size_t>(target_mb) * 1024ULL * 1024ULL;
 
@@ -483,7 +482,9 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
     if (!target_mb_env_set && !max_seq_len_env_set) {
         const size_t target_total_tokens =
             (config.target_kv_memory * static_cast<size_t>(std::max(1, config.max_num_seqs))) / config.bytes_per_token;
-        optimal_seq_len = std::max(optimal_seq_len, static_cast<int>(target_total_tokens / static_cast<size_t>(std::max(1, config.max_num_seqs))));
+        optimal_seq_len =
+            std::max(optimal_seq_len,
+                     static_cast<int>(target_total_tokens / static_cast<size_t>(std::max(1, config.max_num_seqs))));
         optimal_seq_len = std::min(optimal_seq_len, config.max_seq_len);
     } else if (!max_seq_len_env_set && config.bytes_per_token < 1024) {
         optimal_seq_len = std::min(optimal_seq_len * 2, 8192);
@@ -1230,11 +1231,9 @@ int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char* prompt, int poo
 
     // Tokenize immediately (outside hot path). BERT-family encoders such as
     // bge-m3 are trained with both <s>/</s> sentinel tokens.
-    const bool add_eos =
-        model_entry->model->arch == ModelArch::BERT &&
-        (model_entry->model->sep_token_id >= 0 || model_entry->model->eos_token_id >= 0);
-    req->tokens =
-        Tokenizer::Tokenize(model_entry->model.get(), prompt, model_entry->model->tokenizer_add_bos, add_eos);
+    const bool add_eos = model_entry->model->arch == ModelArch::BERT &&
+                         (model_entry->model->sep_token_id >= 0 || model_entry->model->eos_token_id >= 0);
+    req->tokens = Tokenizer::Tokenize(model_entry->model.get(), prompt, model_entry->model->tokenizer_add_bos, add_eos);
 
     // Embeddings get premium tier explicitly
     req->priority = 50;
@@ -1337,11 +1336,11 @@ int SubmitRequestWithSamplingConstraintsEx(DenseCoreHandle handle, const char* p
 
 int SubmitRequestWithSamplingConstraintsCallbackEx(DenseCoreHandle handle, const char* prompt, int max_tokens,
                                                    const char* lora_name, float temperature, float top_p, int top_k,
-                                                   float repetition_penalty, const char** stop_sequences,
-                                                   int json_mode, const int* allowed_token_ids,
-                                                   int num_allowed_token_ids, int allowed_token_ids_strict,
-                                                   const int* disallowed_token_ids, int num_disallowed_token_ids,
-                                                   TokenCallbackEx callback, void* user_data) {
+                                                   float repetition_penalty, const char** stop_sequences, int json_mode,
+                                                   const int* allowed_token_ids, int num_allowed_token_ids,
+                                                   int allowed_token_ids_strict, const int* disallowed_token_ids,
+                                                   int num_disallowed_token_ids, TokenCallbackEx callback,
+                                                   void* user_data) {
     return SubmitRequestWithSamplingConstraintsImpl(
         handle, prompt, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty, stop_sequences, json_mode,
         allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict, disallowed_token_ids,
@@ -1415,16 +1414,13 @@ int SubmitRequestIdsWithSamplingEx(DenseCoreHandle handle, const int* tokens, in
                                                      /*num_disallowed_token_ids=*/0, callback, user_data);
 }
 
-static int SubmitRequestIdsWithSamplingConstraintsImpl(DenseCoreHandle handle, const int* tokens, int n_tokens,
-                                                       int max_tokens, const char* lora_name, float temperature,
-                                                       float top_p, int top_k, float repetition_penalty,
-                                                       const char** stop_sequences, int json_mode,
-                                                       const int* allowed_token_ids, int num_allowed_token_ids,
-                                                       int allowed_token_ids_strict, const int* disallowed_token_ids,
-                                                       int num_disallowed_token_ids, TokenCallback callback,
-                                                       TokenCallbackEx callback_ex, void* user_data,
-                                                       const char* rendered_prompt, bool tokens_already_snapshot_primed,
-                                                       const char* submit_api, const char* error_context) {
+static int SubmitRequestIdsWithSamplingConstraintsImpl(
+    DenseCoreHandle handle, const int* tokens, int n_tokens, int max_tokens, const char* lora_name, float temperature,
+    float top_p, int top_k, float repetition_penalty, const char** stop_sequences, int json_mode,
+    const int* allowed_token_ids, int num_allowed_token_ids, int allowed_token_ids_strict,
+    const int* disallowed_token_ids, int num_disallowed_token_ids, TokenCallback callback, TokenCallbackEx callback_ex,
+    void* user_data, const char* rendered_prompt, bool tokens_already_snapshot_primed, const char* submit_api,
+    const char* error_context) {
     if (!handle || !tokens || n_tokens <= 0) {
         SetError(DENSECORE_STATUS_INVALID_ARGUMENT, std::string(error_context) + ": invalid arguments");
         return DENSECORE_STATUS_INVALID_ARGUMENT;
@@ -1494,14 +1490,11 @@ int SubmitRequestIdsWithSamplingConstraintsEx(DenseCoreHandle handle, const int*
         "SubmitRequestIdsWithSamplingConstraintsEx");
 }
 
-int SubmitRequestIdsWithSamplingConstraintsCallbackEx(DenseCoreHandle handle, const int* tokens, int n_tokens,
-                                                      int max_tokens, const char* lora_name, float temperature,
-                                                      float top_p, int top_k, float repetition_penalty,
-                                                      const char** stop_sequences, int json_mode,
-                                                      const int* allowed_token_ids, int num_allowed_token_ids,
-                                                      int allowed_token_ids_strict,
-                                                      const int* disallowed_token_ids, int num_disallowed_token_ids,
-                                                      TokenCallbackEx callback, void* user_data) {
+int SubmitRequestIdsWithSamplingConstraintsCallbackEx(
+    DenseCoreHandle handle, const int* tokens, int n_tokens, int max_tokens, const char* lora_name, float temperature,
+    float top_p, int top_k, float repetition_penalty, const char** stop_sequences, int json_mode,
+    const int* allowed_token_ids, int num_allowed_token_ids, int allowed_token_ids_strict,
+    const int* disallowed_token_ids, int num_disallowed_token_ids, TokenCallbackEx callback, void* user_data) {
     return SubmitRequestIdsWithSamplingConstraintsImpl(
         handle, tokens, n_tokens, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty, stop_sequences,
         json_mode, allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict, disallowed_token_ids,
@@ -1776,9 +1769,8 @@ int DenseCorePreviewTextRequest(DenseCoreHandle handle, const char* prompt, int 
     g_rendered_model_variant = densecore::models::ModelVariantName(descriptor.variant);
     g_rendered_prompt_family =
         densecore::models::PromptTemplateFamilyName(densecore::models::ResolvePromptTemplateFamily(entry->model.get()));
-    FillSnapshotMetadata(out, entry->model.get(), ResolveSubmitPathForPreview(false, json_mode != 0, true),
-                         temperature, top_p, top_k, repetition_penalty, json_mode, template_applied, text_primed,
-                         token_primed);
+    FillSnapshotMetadata(out, entry->model.get(), ResolveSubmitPathForPreview(false, json_mode != 0, true), temperature,
+                         top_p, top_k, repetition_penalty, json_mode, template_applied, text_primed, token_primed);
     ClearError();
     return DENSECORE_STATUS_OK;
 }
@@ -1820,9 +1812,9 @@ int DenseCorePreviewTokenRequest(DenseCoreHandle handle, const int* token_ids, i
 
 namespace {
 
-int BuildRequestSnapshotImpl(DenseCoreHandle handle, const char* prompt, int max_tokens, float temperature,
-                             float top_p, int top_k, float repetition_penalty, int json_mode,
-                             bool input_already_rendered, DenseCoreRequestSnapshot* out) {
+int BuildRequestSnapshotImpl(DenseCoreHandle handle, const char* prompt, int max_tokens, float temperature, float top_p,
+                             int top_k, float repetition_penalty, int json_mode, bool input_already_rendered,
+                             DenseCoreRequestSnapshot* out) {
     (void)max_tokens;
     if (!handle || !prompt || !out) {
         SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCoreBuildRequestSnapshot: invalid arguments");
@@ -1837,8 +1829,8 @@ int BuildRequestSnapshotImpl(DenseCoreHandle handle, const char* prompt, int max
         return DENSECORE_STATUS_MODEL_LOAD_FAILED;
     }
 
-    std::string rendered_prompt = input_already_rendered ? std::string(prompt)
-                                                         : MaybeApplyAutoChatTemplate(entry->model.get(), prompt);
+    std::string rendered_prompt =
+        input_already_rendered ? std::string(prompt) : MaybeApplyAutoChatTemplate(entry->model.get(), prompt);
     const bool template_applied = !input_already_rendered && rendered_prompt != prompt;
     const std::string before_text_priming = rendered_prompt;
     if (!input_already_rendered) {
@@ -1904,8 +1896,8 @@ int DenseCoreBuildRequestSnapshot(DenseCoreHandle handle, const char* prompt, in
 int DenseCoreBuildRenderedRequestSnapshot(DenseCoreHandle handle, const char* rendered_prompt, int max_tokens,
                                           float temperature, float top_p, int top_k, float repetition_penalty,
                                           int json_mode, DenseCoreRequestSnapshot* out) {
-    return BuildRequestSnapshotImpl(handle, rendered_prompt, max_tokens, temperature, top_p, top_k,
-                                    repetition_penalty, json_mode, /*input_already_rendered=*/true, out);
+    return BuildRequestSnapshotImpl(handle, rendered_prompt, max_tokens, temperature, top_p, top_k, repetition_penalty,
+                                    json_mode, /*input_already_rendered=*/true, out);
 }
 
 int DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx(
@@ -1914,9 +1906,9 @@ int DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx(
     const int* allowed_token_ids, int num_allowed_token_ids, int allowed_token_ids_strict,
     const int* disallowed_token_ids, int num_disallowed_token_ids, TokenCallbackEx callback, void* user_data) {
     DenseCoreRequestSnapshot snapshot{};
-    const int status = BuildRequestSnapshotImpl(handle, rendered_prompt, max_tokens, temperature, top_p, top_k,
-                                                repetition_penalty, json_mode, /*input_already_rendered=*/true,
-                                                &snapshot);
+    const int status =
+        BuildRequestSnapshotImpl(handle, rendered_prompt, max_tokens, temperature, top_p, top_k, repetition_penalty,
+                                 json_mode, /*input_already_rendered=*/true, &snapshot);
     if (status < 0) {
         return status;
     }
@@ -2147,8 +2139,8 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
             LOG_WARN("Native x86 Flash Attention Disabled (requires AVX-512, detected: {})",
                      densecore::simd::SimdLevelName(simd_level));
         }
-        LOG_INFO("Compile-time SIMD features: x86_avx512={} runtime_simd={}",
-                 compiled_with_x86_avx512 ? "1" : "0", densecore::simd::SimdLevelName(simd_level));
+        LOG_INFO("Compile-time SIMD features: x86_avx512={} runtime_simd={}", compiled_with_x86_avx512 ? "1" : "0",
+                 densecore::simd::SimdLevelName(simd_level));
 
         // Log NUMA configuration
         if (state->numa_node_id >= 0) {
@@ -2633,8 +2625,8 @@ void CallbackLoop(EngineState* state) {
             // This is the ONLY place callbacks should be invoked!
             try {
                 if (event.callback_ex) {
-                    event.callback_ex(event.token_str.data(), static_cast<int>(event.token_str.size()),
-                                      event.token_id, event.finished ? 1 : (event.error ? 1 : 0), event.user_data);
+                    event.callback_ex(event.token_str.data(), static_cast<int>(event.token_str.size()), event.token_id,
+                                      event.finished ? 1 : (event.error ? 1 : 0), event.user_data);
                 } else if (event.callback) {
                     event.callback(event.token_str.c_str(), event.finished ? 1 : (event.error ? 1 : 0),
                                    event.user_data);

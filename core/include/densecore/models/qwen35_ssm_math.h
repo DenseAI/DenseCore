@@ -127,7 +127,6 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
 // Default serving fast path for the same math as Qwen35RunGatedDeltaHeadStep.
 // It avoids materializing q_norm/k_norm scratch when diagnostics are disabled.
 bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head,
-                                            Qwen35SSMHeadStepStats* stats = nullptr,
-                                            float* y_pre_norm = nullptr);
+                                            Qwen35SSMHeadStepStats* stats = nullptr, float* y_pre_norm = nullptr);
 
 #endif  // DENSECORE_QWEN35_SSM_MATH_H

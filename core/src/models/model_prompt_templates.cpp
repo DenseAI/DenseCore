@@ -272,8 +272,6 @@ void AppendQwenAssistantGenerationCue(const TransformerModel* model, bool thinki
     if (descriptor.variant == ModelVariant::QWEN36) {
         if (thinking_enabled) {
             out->append("<think>\n");
-        } else {
-            out->append("<think>\n\n</think>\n");
         }
         return;
     }

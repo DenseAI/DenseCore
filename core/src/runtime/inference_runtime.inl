@@ -128,9 +128,14 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> moe_q4k_repacked_candidate_ops{0};
     std::atomic<uint64_t> moe_q4k_repacked_used_ops{0};
     std::atomic<uint64_t> moe_q4k_repacked_rejected_ops{0};
+    std::atomic<uint64_t> moe_q5k_repacked_candidate_ops{0};
+    std::atomic<uint64_t> moe_q5k_repacked_used_ops{0};
+    std::atomic<uint64_t> moe_q5k_repacked_rejected_ops{0};
     std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_candidate_ops{0};
     std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_used_ops{0};
     std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_rejected_ops{0};
+    std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops{0};
+    std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops{0};
     std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_gate_up_used{0};
     std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_down_used{0};
     std::atomic<uint64_t> gemma4_native_moe_prefill_candidate_layers{0};
@@ -233,6 +238,7 @@ struct Qwen36ProfileCounters {
 
 struct InferenceWorkContext {
     const BatchSpec* batch = nullptr;
+    ModelVariant model_variant = ModelVariant::UNKNOWN;
     InferenceExecutionPhase phase = InferenceExecutionPhase::Unknown;
     Qwen36ProfileCounters qwen36_profile;
     KVCacheUserData kv_pool[256];
@@ -270,6 +276,7 @@ struct InferenceWorkContext {
     mutable std::mutex profile_string_mutex;
     std::string moe_small_decode_parallel_last_reject_reason;
     std::string moe_q4k_repacked_last_reject_reason;
+    std::string moe_q5k_repacked_last_reject_reason;
     std::string gemma4_moe_prefill_quant_batch_last_reject_reason;
     std::string gemma4_native_moe_prefill_last_reject_reason;
     std::string gemma4_dense_prefill_native_last_reject_reason;
@@ -352,6 +359,25 @@ static const char* MatmulPhaseName(InferenceExecutionPhase phase) {
         case InferenceExecutionPhase::Decode:
             return "decode";
         case InferenceExecutionPhase::Unknown:
+        default:
+            return "unknown";
+    }
+}
+
+static const char* MatmulModelFamilyName(ModelVariant variant) {
+    switch (variant) {
+        case ModelVariant::QWEN35:
+            return "qwen35";
+        case ModelVariant::QWEN36:
+            return "qwen36";
+        case ModelVariant::GEMMA4:
+            return "gemma4";
+        case ModelVariant::GEMMA:
+            return "gemma";
+        case ModelVariant::QWEN3:
+            return "qwen3";
+        case ModelVariant::QWEN3NEXT:
+            return "qwen3next";
         default:
             return "unknown";
     }
@@ -513,10 +539,11 @@ static void AddMatmulShapeCensusEntry(std::vector<MatmulShapeCensusEntry>* entri
         return;
     }
     for (auto& existing : *entries) {
-        if (existing.phase == entry.phase && existing.op_type == entry.op_type &&
-            existing.dispatch_path == entry.dispatch_path && existing.weight_type == entry.weight_type &&
-            existing.weight_class == entry.weight_class && existing.shape_bucket == entry.shape_bucket &&
-            existing.left_name == entry.left_name && existing.right_name == entry.right_name) {
+        if (existing.model_family == entry.model_family && existing.phase == entry.phase &&
+            existing.op_type == entry.op_type && existing.dispatch_path == entry.dispatch_path &&
+            existing.weight_type == entry.weight_type && existing.weight_class == entry.weight_class &&
+            existing.shape_bucket == entry.shape_bucket && existing.left_name == entry.left_name &&
+            existing.right_name == entry.right_name) {
             existing.ops += entry.ops;
             existing.wall_ns += entry.wall_ns;
             existing.calls += entry.calls;
@@ -566,7 +593,8 @@ static void AddMatmulDispatchCensusEntry(std::vector<MatmulDispatchCensusEntry>*
         return;
     }
     for (auto& existing : *entries) {
-        if (existing.phase == entry.phase && existing.dispatch_path == entry.dispatch_path &&
+        if (existing.model_family == entry.model_family && existing.phase == entry.phase &&
+            existing.dispatch_path == entry.dispatch_path &&
             existing.weight_type == entry.weight_type && existing.shape_bucket == entry.shape_bucket) {
             existing.wall_ns += entry.wall_ns;
             existing.ops += entry.ops;
@@ -595,6 +623,7 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     if (!ctx) {
         return;
     }
+    ctx->model_variant = ModelVariant::UNKNOWN;
     auto& p = ctx->qwen36_profile;
     p.attention_ns.store(0, std::memory_order_relaxed);
     p.paged_attention_ns.store(0, std::memory_order_relaxed);
@@ -722,9 +751,14 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.moe_q4k_repacked_candidate_ops.store(0, std::memory_order_relaxed);
     p.moe_q4k_repacked_used_ops.store(0, std::memory_order_relaxed);
     p.moe_q4k_repacked_rejected_ops.store(0, std::memory_order_relaxed);
+    p.moe_q5k_repacked_candidate_ops.store(0, std::memory_order_relaxed);
+    p.moe_q5k_repacked_used_ops.store(0, std::memory_order_relaxed);
+    p.moe_q5k_repacked_rejected_ops.store(0, std::memory_order_relaxed);
     p.gemma4_moe_prefill_quant_batch_candidate_ops.store(0, std::memory_order_relaxed);
     p.gemma4_moe_prefill_quant_batch_used_ops.store(0, std::memory_order_relaxed);
     p.gemma4_moe_prefill_quant_batch_rejected_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops.store(0, std::memory_order_relaxed);
+    p.gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops.store(0, std::memory_order_relaxed);
     p.gemma4_moe_prefill_quant_batch_gate_up_used.store(0, std::memory_order_relaxed);
     p.gemma4_moe_prefill_quant_batch_down_used.store(0, std::memory_order_relaxed);
     p.gemma4_native_moe_prefill_candidate_layers.store(0, std::memory_order_relaxed);
@@ -809,6 +843,7 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
         std::lock_guard<std::mutex> lock(ctx->profile_string_mutex);
         ctx->moe_small_decode_parallel_last_reject_reason.clear();
         ctx->moe_q4k_repacked_last_reject_reason.clear();
+        ctx->moe_q5k_repacked_last_reject_reason.clear();
         ctx->gemma4_moe_prefill_quant_batch_last_reject_reason.clear();
         ctx->gemma4_native_moe_prefill_last_reject_reason.clear();
         ctx->gemma4_dense_prefill_native_last_reject_reason.clear();
@@ -1019,12 +1054,19 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.moe_q4k_repacked_candidate_ops = p.moe_q4k_repacked_candidate_ops.load(std::memory_order_relaxed);
     snapshot.moe_q4k_repacked_used_ops = p.moe_q4k_repacked_used_ops.load(std::memory_order_relaxed);
     snapshot.moe_q4k_repacked_rejected_ops = p.moe_q4k_repacked_rejected_ops.load(std::memory_order_relaxed);
+    snapshot.moe_q5k_repacked_candidate_ops = p.moe_q5k_repacked_candidate_ops.load(std::memory_order_relaxed);
+    snapshot.moe_q5k_repacked_used_ops = p.moe_q5k_repacked_used_ops.load(std::memory_order_relaxed);
+    snapshot.moe_q5k_repacked_rejected_ops = p.moe_q5k_repacked_rejected_ops.load(std::memory_order_relaxed);
     snapshot.gemma4_moe_prefill_quant_batch_candidate_ops =
         p.gemma4_moe_prefill_quant_batch_candidate_ops.load(std::memory_order_relaxed);
     snapshot.gemma4_moe_prefill_quant_batch_used_ops =
         p.gemma4_moe_prefill_quant_batch_used_ops.load(std::memory_order_relaxed);
     snapshot.gemma4_moe_prefill_quant_batch_rejected_ops =
         p.gemma4_moe_prefill_quant_batch_rejected_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops =
+        p.gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops.load(std::memory_order_relaxed);
+    snapshot.gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops =
+        p.gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops.load(std::memory_order_relaxed);
     snapshot.gemma4_moe_prefill_quant_batch_gate_up_used =
         p.gemma4_moe_prefill_quant_batch_gate_up_used.load(std::memory_order_relaxed);
     snapshot.gemma4_moe_prefill_quant_batch_down_used =
@@ -1163,6 +1205,7 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
         snapshot.moe_small_decode_parallel_last_reject_reason =
             ctx->moe_small_decode_parallel_last_reject_reason;
         snapshot.moe_q4k_repacked_last_reject_reason = ctx->moe_q4k_repacked_last_reject_reason;
+        snapshot.moe_q5k_repacked_last_reject_reason = ctx->moe_q5k_repacked_last_reject_reason;
         snapshot.gemma4_moe_prefill_quant_batch_last_reject_reason =
             ctx->gemma4_moe_prefill_quant_batch_last_reject_reason;
         snapshot.gemma4_native_moe_prefill_last_reject_reason =
@@ -1329,6 +1372,25 @@ void RecordMoEQ4KRepackedDecision(InferenceWorkContext* ctx, bool candidate, boo
     }
 }
 
+void RecordMoEQ5KRepackedDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    if (candidate) {
+        p.moe_q5k_repacked_candidate_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (used) {
+        p.moe_q5k_repacked_used_ops.fetch_add(1, std::memory_order_relaxed);
+    } else if (candidate) {
+        p.moe_q5k_repacked_rejected_ops.fetch_add(1, std::memory_order_relaxed);
+        if (reject_reason && reject_reason[0] != '\0') {
+            std::lock_guard<std::mutex> lock(ctx->profile_string_mutex);
+            ctx->moe_q5k_repacked_last_reject_reason = reject_reason;
+        }
+    }
+}
+
 void RecordGemma4MoEPrefillQuantBatchDecision(InferenceWorkContext* ctx, bool candidate, bool used,
                                               const char* reject_reason, bool gate_up_used, bool down_used) {
     if (!ctx) {
@@ -1344,6 +1406,11 @@ void RecordGemma4MoEPrefillQuantBatchDecision(InferenceWorkContext* ctx, bool ca
         p.gemma4_moe_prefill_quant_batch_rejected_ops.fetch_add(1, std::memory_order_relaxed);
     } else if (reject_reason && reject_reason[0] != '\0') {
         p.gemma4_moe_prefill_quant_batch_rejected_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (reject_reason && std::strcmp(reject_reason, "unsupported_gate_up_shape_or_type") == 0) {
+        p.gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops.fetch_add(1, std::memory_order_relaxed);
+    } else if (reject_reason && std::strcmp(reject_reason, "unsupported_down_shape_or_type") == 0) {
+        p.gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops.fetch_add(1, std::memory_order_relaxed);
     }
     if (gate_up_used) {
         p.gemma4_moe_prefill_quant_batch_gate_up_used.fetch_add(1, std::memory_order_relaxed);
@@ -1571,6 +1638,7 @@ void RecordMatmulDispatchCensus(InferenceWorkContext* ctx, InferenceExecutionPha
     }
     MatmulDispatchCensusEntry entry;
     entry.phase = MatmulPhaseName(phase);
+    entry.model_family = MatmulModelFamilyName(ctx->model_variant);
     entry.dispatch_path = dispatch_path;
     entry.weight_type = MatmulWeightTypeHistLabel(MatmulWeightTypeHistIndex(weight_type));
     entry.shape_bucket = MatmulShapeBucket(m, n, k);
@@ -1595,6 +1663,7 @@ void RecordGraphBuildMatmulCensus(InferenceWorkContext* ctx, InferenceExecutionP
         p.decode_matmul_path_hist[path_idx].fetch_add(1, std::memory_order_relaxed);
         MatmulShapeCensusEntry entry;
         entry.phase = "decode";
+        entry.model_family = MatmulModelFamilyName(ctx->model_variant);
         entry.dispatch_path = MatmulPathHistLabel(path_idx);
         entry.weight_type = MatmulWeightTypeHistLabel(weight_idx);
         entry.shape_bucket = MatmulShapeBucket(m, n, k);
@@ -1712,6 +1781,7 @@ void RecordQ6KGemvDecision(InferenceWorkContext* ctx, bool candidate, bool used,
     }
     {
         MatmulShapeCensusEntry entry;
+        entry.model_family = MatmulModelFamilyName(ctx->model_variant);
         entry.phase = effective_phase && effective_phase[0] ? effective_phase : MatmulPhaseName(ctx->phase);
         entry.dispatch_path = used ? "q6k_direct_vecdot" : (candidate ? "candidate_rejected" : "pre_candidate_rejected");
         entry.weight_type = "q6_k";
@@ -1861,6 +1931,13 @@ void SetCurrentWorkContext(InferenceWorkContext* ctx) {
 
 InferenceWorkContext* GetCurrentWorkContext() {
     return tls_work_ctx;
+}
+
+void SetInferenceWorkContextModelVariant(InferenceWorkContext* ctx, ModelVariant variant) {
+    if (!ctx) {
+        return;
+    }
+    ctx->model_variant = variant;
 }
 
 void SetCurrentExecutionPhase(InferenceExecutionPhase phase) {

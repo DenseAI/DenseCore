@@ -79,7 +79,7 @@ jobs:
         working-directory: python
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) pip install -e ".[dev]"
 
       - name: Run Python tests
         working-directory: python
@@ -100,6 +100,19 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: server/go.mod
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Build DenseCore runtime for cgo tests
+        run: |
+          cmake -S core -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDENSECORE_BUILD_TESTS=OFF \
+            -DDENSECORE_LTO=ON
+          cmake --build build -j$(nproc)
 
       - name: Run Go tests
         working-directory: server

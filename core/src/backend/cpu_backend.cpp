@@ -166,15 +166,15 @@ bool IsMoENextExpertPrefetchEnabled() {
 }
 
 size_t GetMoEDequantCacheBytes() {
-	    static const size_t bytes = []() -> size_t {
-	        const char* env = std::getenv("DENSECORE_MOE_DEQUANT_CACHE_MB");
-	        if (!env || *env == '\0') {
-	            return 512ULL * 1024ULL * 1024ULL;
-	        }
+    static const size_t bytes = []() -> size_t {
+        const char* env = std::getenv("DENSECORE_MOE_DEQUANT_CACHE_MB");
+        if (!env || *env == '\0') {
+            return 512ULL * 1024ULL * 1024ULL;
+        }
         char* end = nullptr;
         const unsigned long long parsed_mb = std::strtoull(env, &end, 10);
         if (end == env || *end != '\0') {
-	            return 512ULL * 1024ULL * 1024ULL;
+            return 512ULL * 1024ULL * 1024ULL;
         }
         return static_cast<size_t>(parsed_mb) * 1024ULL * 1024ULL;
     }();

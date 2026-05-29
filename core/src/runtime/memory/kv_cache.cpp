@@ -171,9 +171,9 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
 
     const bool embedding_only_encoder = model && model->arch == ModelArch::BERT;
     cache->head_dim = embedding_only_encoder ? 1 : model->hparams.n_embd_head_k;
-    cache->v_head_dim =
-        embedding_only_encoder ? 1 : (model->hparams.n_embd_head_v > 0 ? model->hparams.n_embd_head_v
-                                                                        : model->hparams.n_embd_head_k);
+    cache->v_head_dim = embedding_only_encoder ? 1
+                                               : (model->hparams.n_embd_head_v > 0 ? model->hparams.n_embd_head_v
+                                                                                   : model->hparams.n_embd_head_k);
     cache->index_head_dim = (!embedding_only_encoder && model->arch_flags.is_glm_dsa) ? model->glm_index_head_dim : 0;
     cache->n_head_kv = embedding_only_encoder ? 1 : model->hparams.n_head_kv;
     cache->n_layer = embedding_only_encoder ? 1 : model->hparams.n_layer;

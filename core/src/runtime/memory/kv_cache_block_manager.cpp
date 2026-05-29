@@ -298,9 +298,9 @@ int BlockManager::FindCachedBlockWithVerification(uint64_t hash, const int* toke
     return block_id;
 }
 
-BlockManager::PrefixCacheMatch BlockManager::FindLongestCachedPrefixWithVerification(
-    const int* tokens, int n_tokens, bool require_hybrid_ssm_snapshot,
-    const HybridSSMSnapshotValidator& hybrid_ssm_snapshot_validator) {
+BlockManager::PrefixCacheMatch
+BlockManager::FindLongestCachedPrefixWithVerification(const int* tokens, int n_tokens, bool require_hybrid_ssm_snapshot,
+                                                      const HybridSSMSnapshotValidator& hybrid_ssm_snapshot_validator) {
     PrefixCacheMatch match;
     if (!tokens || n_tokens <= BLOCK_SIZE) {
         return match;

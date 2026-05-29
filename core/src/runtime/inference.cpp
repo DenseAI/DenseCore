@@ -52,10 +52,11 @@
 #include "densecore/moe/moe_routing.h"
 #include "densecore/quantization/int4_types.h"  // For TensorInt4
 #include "densecore/runtime/dtype_utils.h"      // For GgmlTypeToDType
+#include "densecore/runtime/ggml_compute_policy.h"
 #include "densecore/runtime/scheduler.h"
 #include "densecore/simd/simd_ops.h"
-#include "kernels/q4k_repacked_gemv.h"
 #include "kernels/hwy/hwy_kernels.h"
+#include "kernels/q4k_repacked_gemv.h"
 #include "llm/attention/exec.h"
 #include "llm/attention/internal.h"
 #include "llm/config/runtime_config.h"
@@ -64,7 +65,6 @@
 #include "llm/models/common/family_internal.h"
 #include "llm/runtime/deps.h"
 #include "models/gemma4_packed_expert_layout.h"
-#include "densecore/runtime/ggml_compute_policy.h"
 #include "runtime/kernel_admission.h"
 #include "runtime/runtime_env.h"
 

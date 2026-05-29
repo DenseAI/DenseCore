@@ -1144,9 +1144,8 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
 }
 
 #ifndef NDEBUG
-inline bool Qwen35RunGatedDeltaHeadStepFastDefaultUntiledReference(const Qwen35SSMHeadStepConfig& cfg,
-                                                                   float* state_kv, float* y_head,
-                                                                   float* y_pre_norm, float q_inv_norm,
+inline bool Qwen35RunGatedDeltaHeadStepFastDefaultUntiledReference(const Qwen35SSMHeadStepConfig& cfg, float* state_kv,
+                                                                   float* y_head, float* y_pre_norm, float q_inv_norm,
                                                                    float k_inv_norm, float qk_dot, float decay,
                                                                    float beta_gate) {
     if (!cfg.q_head || !cfg.k_head || !cfg.v_head || !cfg.z_head || !cfg.norm_weight || !state_kv || !y_head ||
@@ -1269,10 +1268,9 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
     std::fill(delta_data, delta_data + cfg.head_dim_v, 0.0f);
     std::fill(y_head, y_head + cfg.head_dim_v, 0.0f);
 
-    const float qk_dot =
-        cfg.has_precomputed_qk_norm
-            ? cfg.precomputed_qk_dot
-            : DotProduct(cfg.q_head, cfg.k_head, cfg.head_dim_k) * q_inv_norm * k_inv_norm;
+    const float qk_dot = cfg.has_precomputed_qk_norm
+                             ? cfg.precomputed_qk_dot
+                             : DotProduct(cfg.q_head, cfg.k_head, cfg.head_dim_k) * q_inv_norm * k_inv_norm;
 
 #ifndef NDEBUG
     static std::atomic<int> debug_equivalence_checks{0};
@@ -1351,8 +1349,7 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
         assert(MaxAbsDiff(y_head, debug_y_ref.data(), head_dim_v) <= kQwen35FastDefaultEquivalenceTol);
         assert(MaxAbsDiff(state_kv, debug_state_ref.data(), state_elems) <= kQwen35FastDefaultEquivalenceTol);
         if (y_pre_norm) {
-            assert(MaxAbsDiff(y_pre_norm, debug_pre_norm_ref.data(), head_dim_v) <=
-                   kQwen35FastDefaultEquivalenceTol);
+            assert(MaxAbsDiff(y_pre_norm, debug_pre_norm_ref.data(), head_dim_v) <= kQwen35FastDefaultEquivalenceTol);
         }
     }
 #endif
@@ -1384,8 +1381,8 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
                      "[Qwen36SSMTimingFast] n_embd=%d head_k=%d head_v=%d alpha_beta_dot_ms=%.3f "
                      "norm_ms=%.3f first_pass_dual_dot_ms=%.3f state_update_only_ms=%.3f "
                      "output_accum_ms=0.000 rms_gate_ms=%.3f total_fast_ssm_ms=%.3f\n",
-                     cfg.n_embd, cfg.head_dim_k, cfg.head_dim_v, alpha_beta_dot_ms, norm_ms,
-                     first_pass_dual_dot_ms, state_update_only_ms, rms_gate_ms, total_fast_ssm_ms);
+                     cfg.n_embd, cfg.head_dim_k, cfg.head_dim_v, alpha_beta_dot_ms, norm_ms, first_pass_dual_dot_ms,
+                     state_update_only_ms, rms_gate_ms, total_fast_ssm_ms);
     }
     return true;
 }

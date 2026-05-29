@@ -110,7 +110,6 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().Unix())
 	created := time.Now().Unix()
-	terminalSeen := false
 	streamWriter := newSSEStreamWriter(w, flusher, h.sseFlushPolicy())
 	streamStart := time.Now()
 	firstCallbackMS := 0.0
@@ -121,28 +120,24 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 	if isGemma4ModelHint(reasoningModelHint) {
 		gemma4Filter = newGemma4StreamFilter()
 	}
+	var qwen36Filter *qwen36StreamFilter
+	if qwen36StreamingReasoningEnabled(req, reasoningModelHint) {
+		qwen36Filter = newQwen36StreamFilter()
+	}
 
 	for {
 		select {
 		case event, ok := <-outputChan:
 			if !ok {
-				if !terminalSeen {
-					err := waitGenerationError(errChan)
-					if err == nil {
-						err = domain.ErrStreamClosedWithoutTerminal
-					}
-					_ = streamWriter.Flush()
-					writeGenerationError(ctx, w, flusher, req.Model, err, streamWriter.Started())
-					return
+				err := waitGenerationError(errChan)
+				if err == nil {
+					err = domain.ErrStreamClosedWithoutTerminal
 				}
-				if err := waitGenerationError(errChan); err != nil {
-					_ = streamWriter.Flush()
-					writeGenerationError(ctx, w, flusher, req.Model, err, streamWriter.Started())
-				}
+				_ = streamWriter.Flush()
+				writeGenerationError(ctx, w, flusher, req.Model, err, streamWriter.Started())
 				return
 			}
 			if event.Terminal {
-				terminalSeen = true
 				if err := event.TerminalError(); err != nil {
 					_ = streamWriter.Flush()
 					writeGenerationError(ctx, w, flusher, req.Model, err, streamWriter.Started())
@@ -176,6 +171,17 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 				continue
 			}
 
+			var content string
+			var reasoningContent string
+			if qwen36Filter != nil {
+				content, reasoningContent = qwen36Filter.Filter(token)
+			} else {
+				content = token
+			}
+			if token != "" && content == "" && reasoningContent == "" {
+				continue
+			}
+
 			chunk := domain.ChatCompletionChunk{
 				ID:      id,
 				Object:  "chat.completion.chunk",
@@ -185,7 +191,8 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 					{
 						Index: 0,
 						Delta: domain.ChunkDelta{
-							Content: token,
+							Content:          content,
+							ReasoningContent: reasoningContent,
 						},
 						FinishReason: nil,
 					},
@@ -224,7 +231,7 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 		return
 	}
 
-	content, reasoningContent := splitReasoningResponse(h.reasoningModelHint(req), responseText)
+	content, reasoningContent := splitReasoningResponse(req, h.reasoningModelHint(req), responseText)
 	content, reasoningContent = promoteExactAnswerContent(req, content, reasoningContent)
 	var toolCalls []domain.ToolCall
 	finishReason := resolveSyncFinishReason(completionTokens, req.MaxTokens)

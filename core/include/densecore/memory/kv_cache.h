@@ -192,9 +192,9 @@ struct BlockManager {
     // Find the longest reusable full-block prefix for a prompt.
     // Returns only full BLOCK_SIZE chunks and always leaves at least one token
     // to execute, so prompt-end logits are still computed normally.
-    PrefixCacheMatch FindLongestCachedPrefixWithVerification(
-        const int* tokens, int n_tokens, bool require_hybrid_ssm_snapshot,
-        const HybridSSMSnapshotValidator& hybrid_ssm_snapshot_validator = {});
+    PrefixCacheMatch
+    FindLongestCachedPrefixWithVerification(const int* tokens, int n_tokens, bool require_hybrid_ssm_snapshot,
+                                            const HybridSSMSnapshotValidator& hybrid_ssm_snapshot_validator = {});
 
     // Register a block in prefix cache
     void RegisterPrefixBlock(int block_id, uint64_t hash);

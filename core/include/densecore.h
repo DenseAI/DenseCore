@@ -811,8 +811,7 @@ DENSECORE_API int DenseCoreBuildRenderedRequestSnapshot(DenseCoreHandle handle, 
                                                         float repetition_penalty, int json_mode,
                                                         DenseCoreRequestSnapshot* out);
 DENSECORE_API void DenseCoreFreeRequestSnapshot(DenseCoreRequestSnapshot* snapshot);
-DENSECORE_API int DenseCoreGetRuntimeOptimizationState(DenseCoreHandle handle,
-                                                       DenseCoreRuntimeOptimizationState* out);
+DENSECORE_API int DenseCoreGetRuntimeOptimizationState(DenseCoreHandle handle, DenseCoreRuntimeOptimizationState* out);
 
 /**
  * Cancel a running request

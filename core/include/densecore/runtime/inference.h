@@ -147,6 +147,7 @@ static constexpr std::size_t kMatmulDispatchTopSlowCount = 10;
 static constexpr std::size_t kMatmulTopShapeCount = 8;
 
 struct MatmulDispatchCensusEntry {
+    std::string model_family;
     std::string phase;
     std::string dispatch_path;
     std::string weight_type;
@@ -156,6 +157,7 @@ struct MatmulDispatchCensusEntry {
 };
 
 struct MatmulShapeCensusEntry {
+    std::string model_family;
     std::string phase;
     std::string op_type;
     std::string dispatch_path;
@@ -377,10 +379,16 @@ struct Qwen36ProfileSnapshot {
     uint64_t moe_q4k_repacked_used_ops = 0;
     uint64_t moe_q4k_repacked_rejected_ops = 0;
     std::string moe_q4k_repacked_last_reject_reason;
+    uint64_t moe_q5k_repacked_candidate_ops = 0;
+    uint64_t moe_q5k_repacked_used_ops = 0;
+    uint64_t moe_q5k_repacked_rejected_ops = 0;
+    std::string moe_q5k_repacked_last_reject_reason;
     uint64_t gemma4_moe_prefill_quant_batch_candidate_ops = 0;
     uint64_t gemma4_moe_prefill_quant_batch_used_ops = 0;
     uint64_t gemma4_moe_prefill_quant_batch_rejected_ops = 0;
     std::string gemma4_moe_prefill_quant_batch_last_reject_reason;
+    uint64_t gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops = 0;
+    uint64_t gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops = 0;
     uint64_t gemma4_moe_prefill_quant_batch_gate_up_used = 0;
     uint64_t gemma4_moe_prefill_quant_batch_down_used = 0;
     uint64_t gemma4_native_moe_prefill_candidate_layers = 0;
@@ -503,6 +511,7 @@ void ResetInferenceWorkContext(InferenceWorkContext* ctx);
 void ResetCachedDecodeGraphWorkContext(InferenceWorkContext* ctx);
 void SetCurrentWorkContext(InferenceWorkContext* ctx);
 InferenceWorkContext* GetCurrentWorkContext();
+void SetInferenceWorkContextModelVariant(InferenceWorkContext* ctx, ModelVariant variant);
 void SetCurrentExecutionPhase(InferenceExecutionPhase phase);
 InferenceExecutionPhase GetCurrentExecutionPhase();
 const BatchSpec* GetCurrentBatch();
@@ -518,6 +527,7 @@ void RecordMoESmallDecodeParallelDecision(InferenceWorkContext* ctx, bool candid
                                           int task_count);
 void RecordMoEExpertMatmulWeightType(InferenceWorkContext* ctx, ggml_type weight_type);
 void RecordMoEQ4KRepackedDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason);
+void RecordMoEQ5KRepackedDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason);
 void RecordGemma4MoEPrefillQuantBatchDecision(InferenceWorkContext* ctx, bool candidate, bool used,
                                               const char* reject_reason, bool gate_up_used, bool down_used);
 void RecordGemma4NativeMoEPrefillDecision(InferenceWorkContext* ctx, bool candidate, bool used,
@@ -530,10 +540,10 @@ void RecordGemma4DensePrefillNativeDecision(InferenceWorkContext* ctx, bool cand
                                             uint64_t replaced_mul_mat_ops, bool duplicate_work_detected);
 void RecordGemma4DensePrefillNativeTiming(InferenceWorkContext* ctx, uint64_t wall_ns);
 void RecordGemma4FastGeluDecision(InferenceWorkContext* ctx, bool enabled, bool used, uint64_t wall_ns);
-void RecordGemma4DecodeNativeDecision(InferenceWorkContext* ctx, bool candidate, bool used,
-                                      const char* reject_reason, bool moe_used, bool dense_used,
-                                      bool lm_head_used, uint64_t wall_ns, uint64_t replaced_mul_mat_ops,
-                                      uint64_t replaced_mul_mat_id_ops, bool duplicate_work_detected);
+void RecordGemma4DecodeNativeDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,
+                                      bool moe_used, bool dense_used, bool lm_head_used, uint64_t wall_ns,
+                                      uint64_t replaced_mul_mat_ops, uint64_t replaced_mul_mat_id_ops,
+                                      bool duplicate_work_detected);
 void RecordGemma4GgmlAttentionFallback(InferenceWorkContext* ctx);
 void RecordGemma4NativeFusedGateUpUsed(InferenceWorkContext* ctx);
 void RecordMatmulDispatchCensus(InferenceWorkContext* ctx, InferenceExecutionPhase phase, const char* dispatch_path,
@@ -548,11 +558,10 @@ void RecordQ6KGemvDecision(InferenceWorkContext* ctx, bool candidate, bool used,
                            const char* weight_name, int64_t m, int64_t n, int64_t k, uint64_t wall_ns,
                            const char* effective_phase = nullptr, const char* graph_phase = nullptr,
                            const char* callback_phase = nullptr);
-void RecordNativeMoEFastDecodeDecision(InferenceWorkContext* ctx, bool candidate, bool used,
-                                       const char* reject_reason, bool w1w3_used, bool w2_used,
-                                       uint64_t wall_ns = 0);
-void RecordNativeMoEFastW2Q5KDecision(InferenceWorkContext* ctx, bool candidate, bool used,
-                                      const char* reject_reason, uint64_t wall_ns = 0);
+void RecordNativeMoEFastDecodeDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,
+                                       bool w1w3_used, bool w2_used, uint64_t wall_ns = 0);
+void RecordNativeMoEFastW2Q5KDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,
+                                      uint64_t wall_ns = 0);
 void RecordQwen35MoEGraphPath(InferenceWorkContext* ctx, const char* path, int top_k, int selected_expert_count,
                               ggml_type w1w3_type, ggml_type w2_type);
 const char* Q4KRepackedGemvRejectReasonName(int reason);

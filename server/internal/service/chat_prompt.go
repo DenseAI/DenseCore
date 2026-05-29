@@ -119,10 +119,9 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 	sb.WriteString(profile.assistantRole)
 	sb.WriteString("\n")
 	if isQwen36ModelHint(modelHint) {
-		// Qwen3.6 does not accept the older /no_think directive. Keep the
-		// llama.cpp-compatible assistant cue instead of injecting an empty
-		// reasoning block that changes the rendered prompt.
-		sb.WriteString("<think>\n")
+		if thinkingEnabled {
+			sb.WriteString("<think>\n")
+		}
 	} else if thinkingEnabled {
 		sb.WriteString("<think>\n")
 	} else if isQwen35ModelHint(modelHint) {

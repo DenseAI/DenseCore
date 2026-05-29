@@ -7,10 +7,6 @@ import (
 )
 
 // Runtime utility ownership: environment parsing and small sizing helpers used by bootstrap phases.
-func defaultGoWorkersForThreadCount(threads int) int {
-	return defaultGoWorkersForEngineCapacity(threads, 4)
-}
-
 func defaultGoWorkersForEngineCapacity(threads int, maxNumSeqs int) int {
 	target := maxInt(threads, maxNumSeqs)
 	target = maxInt(target, 8)

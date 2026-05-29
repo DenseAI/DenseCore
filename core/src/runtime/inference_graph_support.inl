@@ -140,6 +140,22 @@ bool IsGemma4NativeMoEPrefillEnabledForMode(RuntimeToggleMode mode) {
     return Gemma4NativeMoEPrefillKernelSupported();
 }
 
+constexpr const char* kGemma4NativeMoEDecodeEnv = "DENSECORE_GEMMA4_NATIVE_MOE_DECODE";
+
+RuntimeToggleMode Gemma4NativeMoEDecodeMode() {
+    return densecore::env::ParseRuntimeToggleMode(kGemma4NativeMoEDecodeEnv, RuntimeToggleMode::Off);
+}
+
+bool IsGemma4NativeMoEDecodeEnabledForMode(RuntimeToggleMode mode) {
+    if (mode == RuntimeToggleMode::Off) {
+        return false;
+    }
+    if (mode == RuntimeToggleMode::On) {
+        return true;
+    }
+    return Gemma4NativeMoEPrefillKernelSupported();
+}
+
 struct Gemma4PackedMoERoots {
     ggml_tensor* gate_up = nullptr;
     ggml_tensor* down = nullptr;
@@ -1293,6 +1309,273 @@ static void cb_gemma4_down_q8_0_prefill(struct ggml_tensor* dst, int ith, int nt
     }
 }
 
+struct Gemma4DecodeMoEUserData {
+    int64_t hidden_dim = 0;
+    int64_t intermediate_dim = 0;
+    int64_t top_k = 0;
+    int64_t n_tokens = 0;
+    int64_t n_experts = 0;
+};
+
+static Gemma4DecodeMoEUserData* AllocateGemma4DecodeMoEUserData(ggml_context* ctx, int64_t hidden_dim,
+                                                                 int64_t intermediate_dim, int64_t top_k,
+                                                                 int64_t n_tokens, int64_t n_experts) {
+    if (!ctx || hidden_dim <= 0 || intermediate_dim <= 0 || top_k <= 0 || n_tokens <= 0 || n_experts <= 0) {
+        return nullptr;
+    }
+    if (ggml_get_no_alloc(ctx)) {
+        thread_local Gemma4DecodeMoEUserData dry_ud;
+        dry_ud.hidden_dim = hidden_dim;
+        dry_ud.intermediate_dim = intermediate_dim;
+        dry_ud.top_k = top_k;
+        dry_ud.n_tokens = n_tokens;
+        dry_ud.n_experts = n_experts;
+        return &dry_ud;
+    }
+    ggml_tensor* storage = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, sizeof(Gemma4DecodeMoEUserData));
+    if (!storage || !storage->data) {
+        return nullptr;
+    }
+    auto* ud = new (storage->data) Gemma4DecodeMoEUserData();
+    ud->hidden_dim = hidden_dim;
+    ud->intermediate_dim = intermediate_dim;
+    ud->top_k = top_k;
+    ud->n_tokens = n_tokens;
+    ud->n_experts = n_experts;
+    return ud;
+}
+
+static bool Gemma4DecodeReadSelectedExpert(const ggml_tensor* selected_experts, const Gemma4DecodeMoEUserData* ud,
+                                           int64_t token, int64_t slot, int32_t* expert_out) {
+    if (!selected_experts || !ud || !selected_experts->data || !expert_out || selected_experts->type != GGML_TYPE_I32 ||
+        token < 0 || token >= ud->n_tokens || slot < 0 || slot >= ud->top_k) {
+        return false;
+    }
+    const int32_t expert = *reinterpret_cast<const int32_t*>(
+        static_cast<const char*>(selected_experts->data) + static_cast<size_t>(slot) * selected_experts->nb[0] +
+        static_cast<size_t>(token) * selected_experts->nb[1]);
+    if (expert < 0 || expert >= ud->n_experts) {
+        return false;
+    }
+    *expert_out = expert;
+    return true;
+}
+
+static const float* Gemma4DecodeWeightPtr(const ggml_tensor* weights, const Gemma4DecodeMoEUserData* ud,
+                                          int64_t token, int64_t slot) {
+    if (!weights || !ud || !weights->data || weights->type != GGML_TYPE_F32 || weights->ne[0] != 1 ||
+        weights->ne[1] != ud->top_k || weights->ne[2] != ud->n_tokens || token < 0 || token >= ud->n_tokens ||
+        slot < 0 || slot >= ud->top_k) {
+        return nullptr;
+    }
+    return reinterpret_cast<const float*>(static_cast<const char*>(weights->data) +
+                                          static_cast<size_t>(slot) * weights->nb[1] +
+                                          static_cast<size_t>(token) * weights->nb[2]);
+}
+
+static bool Gemma4QuantizeRowQ8K(const float* src, uint8_t* dst, int64_t cols) {
+    return densecore::hwy_kernels::QuantizeRowQ8K_Hwy(src, dst, cols);
+}
+
+static void RunGemma4DecodeGateUpQ5KGEGLU(ggml_tensor* dst, const ggml_tensor* gate_up_exps,
+                                          const ggml_tensor* input, const ggml_tensor* selected_experts, int ith,
+                                          int nth, Gemma4DecodeMoEUserData* ud) {
+    if (!dst || !gate_up_exps || !input || !selected_experts || !ud || !dst->data || !gate_up_exps->data ||
+        !input->data || nth <= 0 || ith < 0 || ith >= nth) {
+        return;
+    }
+    if (dst->type != GGML_TYPE_F32 || gate_up_exps->type != GGML_TYPE_Q5_K || input->type != GGML_TYPE_F32 ||
+        selected_experts->type != GGML_TYPE_I32 || dst->ne[0] != ud->intermediate_dim || dst->ne[1] != ud->top_k ||
+        dst->ne[2] != ud->n_tokens || input->ne[0] != ud->hidden_dim || input->ne[1] != ud->n_tokens ||
+        gate_up_exps->ne[0] != ud->hidden_dim || gate_up_exps->ne[1] != 2 * ud->intermediate_dim ||
+        gate_up_exps->ne[2] != ud->n_experts || (ud->hidden_dim % QK_K) != 0) {
+        return;
+    }
+    const int64_t row_start = (static_cast<int64_t>(ith) * ud->intermediate_dim) / nth;
+    const int64_t row_end = (static_cast<int64_t>(ith + 1) * ud->intermediate_dim) / nth;
+    if (row_start >= row_end) {
+        return;
+    }
+
+    thread_local std::vector<uint8_t> q8_input;
+    q8_input.resize(ggml_row_size(GGML_TYPE_Q8_K, ud->hidden_dim));
+    const bool use_fast_gelu = Gemma4UseFastGeluApprox();
+    uint64_t fast_gelu_ns = 0;
+
+    for (int64_t token = 0; token < ud->n_tokens; ++token) {
+        const float* input_row = reinterpret_cast<const float*>(static_cast<const char*>(input->data) +
+                                                                static_cast<size_t>(token) * input->nb[1]);
+        if (!Gemma4QuantizeRowQ8K(input_row, q8_input.data(), ud->hidden_dim)) {
+            continue;
+        }
+        for (int64_t slot = 0; slot < ud->top_k; ++slot) {
+            int32_t expert = -1;
+            if (!Gemma4DecodeReadSelectedExpert(selected_experts, ud, token, slot, &expert)) {
+                continue;
+            }
+            const char* expert_base = static_cast<const char*>(gate_up_exps->data) +
+                                      static_cast<size_t>(expert) * gate_up_exps->nb[2];
+            for (int64_t row = row_start; row < row_end; ++row) {
+                const void* gate_row = expert_base + static_cast<size_t>(row) * gate_up_exps->nb[1];
+                const void* up_row = expert_base + static_cast<size_t>(row + ud->intermediate_dim) *
+                                                       gate_up_exps->nb[1];
+                float gate_value = 0.0f;
+                float up_value = 0.0f;
+                if (!densecore::hwy_kernels::DotQ5KQ8K_Hwy(gate_row, q8_input.data(), ud->hidden_dim, &gate_value) ||
+                    !densecore::hwy_kernels::DotQ5KQ8K_Hwy(up_row, q8_input.data(), ud->hidden_dim, &up_value)) {
+                    continue;
+                }
+                const auto gelu_begin =
+                    use_fast_gelu ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const float geglu = (use_fast_gelu ? Gemma4GeluTanhApproxScalar(gate_value)
+                                                   : Gemma4GeluTanh(gate_value)) *
+                                    up_value;
+                if (gelu_begin != std::chrono::steady_clock::time_point{}) {
+                    fast_gelu_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - gelu_begin)
+                            .count());
+                }
+                *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                          static_cast<size_t>(row) * dst->nb[0] +
+                                          static_cast<size_t>(slot) * dst->nb[1] +
+                                          static_cast<size_t>(token) * dst->nb[2]) = geglu;
+            }
+        }
+    }
+    if (use_fast_gelu && fast_gelu_ns > 0) {
+        RecordGemma4FastGeluDecision(GetCurrentWorkContext(), false, true, fast_gelu_ns);
+    }
+}
+
+static void cb_gemma4_decode_gateup_q5k_geglu(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    RunGemma4DecodeGateUpQ5KGEGLU(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
+                                  dst ? dst->src[2] : nullptr, ith, nth,
+                                  static_cast<Gemma4DecodeMoEUserData*>(userdata));
+}
+
+static void RunGemma4DecodeDownQ8_0WeightedSum(ggml_tensor* dst, const ggml_tensor* down_exps,
+                                               const ggml_tensor* hidden, const ggml_tensor* selected_experts,
+                                               const ggml_tensor* weights, int ith, int nth,
+                                               Gemma4DecodeMoEUserData* ud) {
+    if (!dst || !down_exps || !hidden || !selected_experts || !weights || !ud || !dst->data || !down_exps->data ||
+        !hidden->data || nth <= 0 || ith < 0 || ith >= nth) {
+        return;
+    }
+    if (dst->type != GGML_TYPE_F32 || down_exps->type != GGML_TYPE_Q8_0 || hidden->type != GGML_TYPE_F32 ||
+        selected_experts->type != GGML_TYPE_I32 || weights->type != GGML_TYPE_F32 ||
+        dst->ne[0] != ud->hidden_dim || dst->ne[1] != ud->n_tokens || hidden->ne[0] != ud->intermediate_dim ||
+        hidden->ne[1] != ud->top_k || hidden->ne[2] != ud->n_tokens || down_exps->ne[0] != ud->intermediate_dim ||
+        down_exps->ne[1] != ud->hidden_dim || down_exps->ne[2] != ud->n_experts ||
+        weights->ne[0] != 1 || weights->ne[1] != ud->top_k || weights->ne[2] != ud->n_tokens ||
+        (ud->intermediate_dim % QK8_0) != 0) {
+        return;
+    }
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+    if (!q8_traits || !q8_traits->from_float || !q8_traits->vec_dot) {
+        return;
+    }
+    const int64_t row_start = (static_cast<int64_t>(ith) * ud->hidden_dim) / nth;
+    const int64_t row_end = (static_cast<int64_t>(ith + 1) * ud->hidden_dim) / nth;
+    if (row_start >= row_end) {
+        return;
+    }
+
+    thread_local std::vector<uint8_t> q8_hidden;
+    q8_hidden.resize(ggml_row_size(GGML_TYPE_Q8_0, ud->intermediate_dim));
+    for (int64_t token = 0; token < ud->n_tokens; ++token) {
+        for (int64_t row = row_start; row < row_end; ++row) {
+            *reinterpret_cast<float*>(static_cast<char*>(dst->data) + static_cast<size_t>(row) * dst->nb[0] +
+                                      static_cast<size_t>(token) * dst->nb[1]) = 0.0f;
+        }
+        for (int64_t slot = 0; slot < ud->top_k; ++slot) {
+            int32_t expert = -1;
+            if (!Gemma4DecodeReadSelectedExpert(selected_experts, ud, token, slot, &expert)) {
+                continue;
+            }
+            const float* weight = Gemma4DecodeWeightPtr(weights, ud, token, slot);
+            if (!weight || *weight == 0.0f) {
+                continue;
+            }
+            const float* hidden_row = reinterpret_cast<const float*>(static_cast<const char*>(hidden->data) +
+                                                                     static_cast<size_t>(slot) * hidden->nb[1] +
+                                                                     static_cast<size_t>(token) * hidden->nb[2]);
+            q8_traits->from_float(hidden_row, q8_hidden.data(), ud->intermediate_dim);
+            const char* expert_base =
+                static_cast<const char*>(down_exps->data) + static_cast<size_t>(expert) * down_exps->nb[2];
+            for (int64_t row = row_start; row < row_end; ++row) {
+                const void* down_row = expert_base + static_cast<size_t>(row) * down_exps->nb[1];
+                float value = 0.0f;
+                q8_traits->vec_dot(ud->intermediate_dim, &value, 0, down_row, 0, q8_hidden.data(), 0, 1);
+                float* out = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                      static_cast<size_t>(row) * dst->nb[0] +
+                                                      static_cast<size_t>(token) * dst->nb[1]);
+                *out += value * (*weight);
+            }
+        }
+    }
+}
+
+static void cb_gemma4_decode_down_q8_0_weighted_sum(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    const auto begin = std::chrono::steady_clock::now();
+    RunGemma4DecodeDownQ8_0WeightedSum(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
+                                       dst ? dst->src[2] : nullptr, dst ? dst->src[3] : nullptr, ith, nth,
+                                       static_cast<Gemma4DecodeMoEUserData*>(userdata));
+    if (ith == 0) {
+        const uint64_t ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+        RecordNativeMoEFastDecodeDecision(GetCurrentWorkContext(), /*candidate=*/false, /*used=*/true, nullptr,
+                                          /*w1w3_used=*/true, /*w2_used=*/true, ns);
+    }
+}
+
+static bool CanUseGemma4DecodeQ5Q8FastPath(const TransformerModel* model, const ggml_tensor* gate_up_exps,
+                                           const ggml_tensor* down_exps, const ggml_tensor* routed_input,
+                                           const ggml_tensor* selected_experts, const ggml_tensor* weights,
+                                           const Gemma4PackedMoERoots& roots, int64_t n_tokens,
+                                           const char** reject_reason) {
+    auto reject = [&](const char* reason) {
+        if (reject_reason) {
+            *reject_reason = reason;
+        }
+        return false;
+    };
+    const RuntimeToggleMode mode = Gemma4NativeMoEDecodeMode();
+    if (mode == RuntimeToggleMode::Off) return reject("env_off");
+    if (!IsGemma4NativeMoEDecodeEnabledForMode(mode)) return reject("kernel_unavailable");
+    if (!model || !model->arch_flags.is_gemma4 || !gate_up_exps || !down_exps || !routed_input ||
+        !selected_experts || !weights) {
+        return reject("missing_arg");
+    }
+    const BatchSpec* current_batch = GetCurrentBatch();
+    if (current_batch && !current_batch->lora_map.empty()) return reject("dynamic_lora");
+    if (n_tokens != 1 || routed_input->ne[1] != n_tokens || selected_experts->ne[1] != n_tokens) {
+        return reject("not_single_token_decode");
+    }
+    if (gate_up_exps->type != GGML_TYPE_Q5_K) return reject("gate_up_not_q5k");
+    if (down_exps->type != GGML_TYPE_Q8_0) return reject("down_not_q8_0");
+    if (routed_input->type != GGML_TYPE_F32 || selected_experts->type != GGML_TYPE_I32 || weights->type != GGML_TYPE_F32) {
+        return reject("unsupported_input_type");
+    }
+    if (routed_input->ne[0] != roots.layout.hidden_dim || gate_up_exps->ne[0] != roots.layout.hidden_dim ||
+        gate_up_exps->ne[1] != 2 * roots.layout.intermediate_dim ||
+        gate_up_exps->ne[2] != roots.layout.num_experts || down_exps->ne[0] != roots.layout.intermediate_dim ||
+        down_exps->ne[1] != roots.layout.hidden_dim || down_exps->ne[2] != roots.layout.num_experts ||
+        selected_experts->ne[0] != std::max<int64_t>(1, std::min<int64_t>(roots.layout.num_experts, selected_experts->ne[0])) ||
+        weights->ne[0] != 1 || weights->ne[1] != selected_experts->ne[0] || weights->ne[2] != n_tokens) {
+        return reject("shape");
+    }
+    if ((roots.layout.hidden_dim % QK_K) != 0 || (roots.layout.intermediate_dim % QK8_0) != 0) {
+        return reject("alignment");
+    }
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+    if (!q8_traits || !q8_traits->from_float || !q8_traits->vec_dot) return reject("q8_kernel_unavailable");
+    if (reject_reason) {
+        *reject_reason = nullptr;
+    }
+    return true;
+}
+
 static bool CanUseGemma4GateUpQ4KPrefillFusedGEGLU(const TransformerModel* model, const ggml_tensor* gate_up_exps,
                                                    const ggml_tensor* input, const ggml_tensor* selected_experts,
                                                    int64_t intermediate_dim, int64_t n_experts) {
@@ -1390,7 +1673,10 @@ ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         }
         roots.down = UseCpuRepackAliasIfAvailable(model, roots.down);
     } else {
-        roots.gate_up = UseCpuRepackAliasIfAvailable(model, roots.gate_up);
+        ggml_tensor* gate_up_repack = UseCpuRepackAliasIfAvailable(model, roots.gate_up);
+        if (!gate_up_repack || gate_up_repack->type == roots.gate_up->type) {
+            roots.gate_up = gate_up_repack;
+        }
     }
     std::string repack_reason;
     if (!densecore::gemma4::InferPackedExpertLayout(roots.gate_up, roots.down, &roots.layout, &repack_reason)) {
@@ -1448,6 +1734,51 @@ ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     weights = ggml_mul(ctx, weights, selected_scales);
     ggml_set_name(weights, "gemma4_native_moe_weights");
     ggml_build_forward_expand(gf, weights);
+
+    const char* gemma4_decode_reject = nullptr;
+    if (CanUseGemma4DecodeQ5Q8FastPath(model, gate_up_exps, down_exps, routed_input, selected_experts, weights,
+                                       roots, n_tokens, &gemma4_decode_reject)) {
+        Gemma4DecodeMoEUserData* gateup_ud = AllocateGemma4DecodeMoEUserData(
+            ctx, roots.layout.hidden_dim, roots.layout.intermediate_dim, n_expert_used, n_tokens,
+            roots.layout.num_experts);
+        Gemma4DecodeMoEUserData* down_ud = AllocateGemma4DecodeMoEUserData(
+            ctx, roots.layout.hidden_dim, roots.layout.intermediate_dim, n_expert_used, n_tokens,
+            roots.layout.num_experts);
+        if (gateup_ud && down_ud) {
+            ggml_tensor* gateup_args[] = {gate_up_exps, routed_input, selected_experts};
+            ggml_tensor* hidden_native =
+                ggml_custom_4d(ctx, GGML_TYPE_F32, roots.layout.intermediate_dim, n_expert_used, n_tokens, 1,
+                               gateup_args, 3, cb_gemma4_decode_gateup_q5k_geglu, GGML_N_TASKS_MAX, gateup_ud);
+            ggml_set_name(hidden_native, "gemma4_decode_moe_gateup_q5k_geglu");
+            ggml_tensor* down_args[] = {down_exps, hidden_native, selected_experts, weights};
+            ggml_tensor* out = ggml_custom_4d(ctx, GGML_TYPE_F32, roots.layout.hidden_dim, n_tokens, 1, 1,
+                                              down_args, 4, cb_gemma4_decode_down_q8_0_weighted_sum,
+                                              GGML_N_TASKS_MAX, down_ud);
+            ggml_set_name(out, "gemma4_decode_moe_q5q8_fast_out");
+            ggml_build_forward_expand(gf, out);
+            RecordGemma4DecodeNativeDecision(GetCurrentWorkContext(), /*candidate=*/true, /*used=*/true, nullptr,
+                                             /*moe_used=*/true, /*dense_used=*/false, /*lm_head_used=*/false,
+                                             /*wall_ns=*/0, /*replaced_mul_mat_ops=*/0,
+                                             /*replaced_mul_mat_id_ops=*/2, /*duplicate_work_detected=*/false);
+            RecordNativeMoEFastDecodeDecision(GetCurrentWorkContext(), /*candidate=*/true, /*used=*/true, nullptr,
+                                              /*w1w3_used=*/true, /*w2_used=*/true);
+            char native_name[80];
+            std::snprintf(native_name, sizeof(native_name), "blk.%d.gemma4_decode_moe_q5q8_fast_out", layer_idx);
+            ggml_set_name(out, native_name);
+            return out;
+        }
+        gemma4_decode_reject = "userdata_allocation_failed";
+    }
+    if (n_tokens == 1 && Gemma4NativeMoEDecodeMode() != RuntimeToggleMode::Off) {
+        RecordGemma4DecodeNativeDecision(GetCurrentWorkContext(), /*candidate=*/true, /*used=*/false,
+                                         gemma4_decode_reject ? gemma4_decode_reject : "not_applicable",
+                                         /*moe_used=*/false, /*dense_used=*/false, /*lm_head_used=*/false,
+                                         /*wall_ns=*/0, /*replaced_mul_mat_ops=*/0,
+                                         /*replaced_mul_mat_id_ops=*/0, /*duplicate_work_detected=*/false);
+        RecordNativeMoEFastDecodeDecision(GetCurrentWorkContext(), /*candidate=*/true, /*used=*/false,
+                                          gemma4_decode_reject ? gemma4_decode_reject : "not_applicable",
+                                          /*w1w3_used=*/false, /*w2_used=*/false);
+    }
 
     const RuntimeToggleMode native_prefill_mode = Gemma4NativeMoEPrefillMode();
     const bool native_prefill_forced = native_prefill_mode == RuntimeToggleMode::On;
@@ -2848,7 +3179,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         RecordGraphBuildMatmulCensus(work_ctx, phase, "moe_native", down_exps->type, n_tokens, n_embd,
                                      down_exps->ne[0], down_exps->name, "qwen35_native_moe_swiglu",
                                      n_tokens <= 1 || phase == InferenceExecutionPhase::Decode);
-        if (model->variant == ModelVariant::QWEN35) {
+        if (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) {
             RecordQwen35MoEGraphPath(work_ctx, "native_graph", static_cast<int>(n_expert_used),
                                      static_cast<int>(n_expert_used), w1w3_type, down_exps->type);
         }
@@ -4368,6 +4699,7 @@ struct GemvUserData {
     ggml_type input_quant_type;         // Quantization type for input (Q8_K, Q8_0, or F32)
     bool force_reference_scalar = false;
     bool disable_q8_repacked_gemv = false;
+    bool force_q8_repacked_gemv = false;
     int slot_id = -1;
     uint8_t* quant_input_shared = nullptr;
     std::atomic<uint64_t>* quantized_stamp = nullptr;

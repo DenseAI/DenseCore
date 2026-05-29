@@ -209,22 +209,22 @@ DENSECORE_API void GemvInt4DualFusedGelu_Hwy(float* output, const float* input, 
  * Reuses each unpacked gate/up weight tile across up to 4 input rows:
  * `output[M,N] = silu(input[M,K] * gate[N,K]^T) * (input[M,K] * up[N,K]^T)`.
  */
-DENSECORE_API void GemmInt4DualFusedSiluBatched_Hwy(float* output, const float* input,
-                                                    const uint8_t* gate_weights, const float* gate_scales,
-                                                    const float* gate_zeros, const uint8_t* up_weights,
-                                                    const float* up_scales, const float* up_zeros, int M, int K,
-                                                    int N, int group_size, int m_start, int m_end, int n_start,
-                                                    int n_end, size_t input_stride_bytes);
+DENSECORE_API void GemmInt4DualFusedSiluBatched_Hwy(float* output, const float* input, const uint8_t* gate_weights,
+                                                    const float* gate_scales, const float* gate_zeros,
+                                                    const uint8_t* up_weights, const float* up_scales,
+                                                    const float* up_zeros, int M, int K, int N, int group_size,
+                                                    int m_start, int m_end, int n_start, int n_end,
+                                                    size_t input_stride_bytes);
 
 /**
  * @brief Batched dual-output INT4 GEMM with fused GEGLU activation.
  */
-DENSECORE_API void GemmInt4DualFusedGeluBatched_Hwy(float* output, const float* input,
-                                                    const uint8_t* gate_weights, const float* gate_scales,
-                                                    const float* gate_zeros, const uint8_t* up_weights,
-                                                    const float* up_scales, const float* up_zeros, int M, int K,
-                                                    int N, int group_size, int m_start, int m_end, int n_start,
-                                                    int n_end, size_t input_stride_bytes);
+DENSECORE_API void GemmInt4DualFusedGeluBatched_Hwy(float* output, const float* input, const uint8_t* gate_weights,
+                                                    const float* gate_scales, const float* gate_zeros,
+                                                    const uint8_t* up_weights, const float* up_scales,
+                                                    const float* up_zeros, int M, int K, int N, int group_size,
+                                                    int m_start, int m_end, int n_start, int n_end,
+                                                    size_t input_stride_bytes);
 
 /**
  * @brief Batched INT4 GEMM with M-blocking for weight reuse
@@ -257,14 +257,12 @@ DENSECORE_API bool QuantizeRowQ8K_Hwy(const float* input, void* q8_output, int64
 /**
  * @brief Dot one GGML-compatible Q4_K weight row with one Q8_K activation row.
  */
-DENSECORE_API bool DotQ4KQ8K_Hwy(const void* q4_weight_row, const void* q8_input_row, int64_t cols,
-                                 float* output);
+DENSECORE_API bool DotQ4KQ8K_Hwy(const void* q4_weight_row, const void* q8_input_row, int64_t cols, float* output);
 
 /**
  * @brief Dot one GGML-compatible Q5_K weight row with one Q8_K activation row.
  */
-DENSECORE_API bool DotQ5KQ8K_Hwy(const void* q5_weight_row, const void* q8_input_row, int64_t cols,
-                                 float* output);
+DENSECORE_API bool DotQ5KQ8K_Hwy(const void* q5_weight_row, const void* q8_input_row, int64_t cols, float* output);
 
 // ============================================================================
 // FP8

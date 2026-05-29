@@ -19,8 +19,8 @@
 #include "densecore/models/model_descriptor.h"
 #include "ggml.h"
 #include "kernels/q4k_repacked_gemv.h"
-#include "runtime/kernel_admission.h"
 #include "models/model_inference_policy.h"
+#include "runtime/kernel_admission.h"
 #include "runtime/runtime_env.h"
 
 #ifndef DENSECORE_DEFAULT_PRECOMPUTED_ROPE
@@ -230,9 +230,8 @@ bool ResolvePagedDecodeHeadDims(const TransformerModel* model, int* n_head_out, 
         }
     }
     const bool qwen36_hybrid_ssm = model->arch_flags.is_hybrid_ssm && descriptor.variant == ModelVariant::QWEN36;
-    const int head_dim_q =
-        (qwen36_hybrid_ssm && model->hparams.n_embd_head_k > 0) ? model->hparams.n_embd_head_k
-                                                                : (model->hparams.n_embd / n_head);
+    const int head_dim_q = (qwen36_hybrid_ssm && model->hparams.n_embd_head_k > 0) ? model->hparams.n_embd_head_k
+                                                                                   : (model->hparams.n_embd / n_head);
     const int head_dim_kv =
         (model->hparams.n_embd_head_k > 0) ? model->hparams.n_embd_head_k : (model->hparams.n_embd / n_head);
     if (head_dim_q <= 0 || head_dim_kv <= 0) {
@@ -714,7 +713,7 @@ PrefillThreadPolicySelection ResolvePrefillThreadPolicySelection(const Transform
         if (cap >= 16) {
             selection.threads = 16;
             selection.label = densecore::simd::IsArmFamily(simd_level) ? "prefill_gemma4_a4b_c4a_moe_16"
-                                                                      : "prefill_gemma4_a4b_c4_moe_16";
+                                                                       : "prefill_gemma4_a4b_c4_moe_16";
         }
     }
     return selection;
@@ -739,12 +738,8 @@ int ResolveAutoDecodeThreadsForBatchWithSimd(int num_seqs, int physical_core_cou
         threads_per_seq = (cap >= 16 && num_seqs == 1) ? cap : 8;
         break;
     case densecore::simd::SimdLevel::SVE:
-    case densecore::simd::SimdLevel::SVE2:
-        threads_per_seq = (cap >= 16 && num_seqs == 1) ? cap : 8;
-        break;
-    case densecore::simd::SimdLevel::NEON:
-        threads_per_seq = (cap >= 16 && num_seqs == 1) ? cap : 6;
-        break;
+    case densecore::simd::SimdLevel::SVE2: threads_per_seq = (cap >= 16 && num_seqs == 1) ? cap : 8; break;
+    case densecore::simd::SimdLevel::NEON: threads_per_seq = (cap >= 16 && num_seqs == 1) ? cap : 6; break;
     default: break;
     }
 
@@ -790,7 +785,8 @@ DecodeThreadPolicySelection ResolveDecodeThreadPolicySelection(const Transformer
             return selection;
         }
         selection.threads = std::max(1, std::min(cap, 8));
-        selection.label = (model->hparams.n_experts > 0) ? "decode_gemma4_a4b_safe_cap" : "decode_gemma4_dense_safe_cap";
+        selection.label =
+            (model->hparams.n_experts > 0) ? "decode_gemma4_a4b_safe_cap" : "decode_gemma4_dense_safe_cap";
         return selection;
     }
 
@@ -857,22 +853,22 @@ int ResolveAutoDecodeThreadsForBatch(int num_seqs, int physical_core_count, int 
 
 bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const PagedKVCache* cache,
                                          const BatchSpec& batch) {
-    static std::atomic<int> debug_budget{densecore::env::ParsePositiveEnvInt(
-        "DENSECORE_DEBUG_DECODE_GRAPH_CACHE_STABILITY_MAX", 0)};
+    static std::atomic<int> debug_budget{
+        densecore::env::ParsePositiveEnvInt("DENSECORE_DEBUG_DECODE_GRAPH_CACHE_STABILITY_MAX", 0)};
     const auto debug_fail = [&](const char* reason, int n_tokens_in_batch = -1, int n_head = 0, int n_head_kv = 0,
                                 int head_dim_q = 0, int head_dim_kv = 0) {
         int remaining = debug_budget.load(std::memory_order_relaxed);
         while (remaining > 0 &&
-               !debug_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {
-        }
+               !debug_budget.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed)) {}
         if (remaining > 0) {
             std::cerr << "[DecodeGraphCacheStability] stable=0 reason=" << (reason ? reason : "unknown")
                       << " num_seqs=" << batch.num_seqs << " tokens=" << batch.tokens.size()
                       << " n_tokens_in_batch=" << n_tokens_in_batch << " n_head=" << n_head
-                      << " n_head_kv=" << n_head_kv << " head_dim_q=" << head_dim_q
-                      << " head_dim_kv=" << head_dim_kv << " has_cache=" << (cache ? 1 : 0);
+                      << " n_head_kv=" << n_head_kv << " head_dim_q=" << head_dim_q << " head_dim_kv=" << head_dim_kv
+                      << " has_cache=" << (cache ? 1 : 0);
             if (cache) {
-                std::cerr << " max_blocks=" << cache->max_blocks << " cache_type=" << static_cast<int>(cache->cache_type);
+                std::cerr << " max_blocks=" << cache->max_blocks
+                          << " cache_type=" << static_cast<int>(cache->cache_type);
             }
             if (!batch.seq_id.empty()) {
                 std::cerr << " seq0=" << batch.seq_id[0];
@@ -1049,20 +1045,18 @@ void MaybeLogDecodeRuntimeStats() {
                       << ",model=" << worker_stats.graph_cache_skip_model.load(std::memory_order_relaxed)
                       << ",backend=" << worker_stats.graph_cache_skip_backend.load(std::memory_order_relaxed)
                       << ",key_uncacheable="
-                      << worker_stats.graph_cache_skip_uncacheable.load(std::memory_order_relaxed)
-                      << ",build_failure="
+                      << worker_stats.graph_cache_skip_uncacheable.load(std::memory_order_relaxed) << ",build_failure="
                       << worker_stats.graph_cache_skip_build_failure.load(std::memory_order_relaxed)
                       << ",rebind_failure="
-                      << worker_stats.graph_cache_skip_rebind_failure.load(std::memory_order_relaxed)
-                      << ",uncacheable="
+                      << worker_stats.graph_cache_skip_rebind_failure.load(std::memory_order_relaxed) << ",uncacheable="
                       << worker_stats.graph_cache_rejected_uncacheable.load(std::memory_order_relaxed) << "]";
             std::cerr << " prefill_arena_reuse[hit="
                       << worker_stats.prefill_arena_reuse_hit.load(std::memory_order_relaxed)
                       << ",miss=" << worker_stats.prefill_arena_reuse_miss.load(std::memory_order_relaxed) << "]";
             std::cerr << " prefill_graph_reuse[hit="
                       << worker_stats.prefill_graph_reuse_hit.load(std::memory_order_relaxed)
-                      << ",skip_model="
-                      << worker_stats.prefill_graph_reuse_skip_model.load(std::memory_order_relaxed) << "]";
+                      << ",skip_model=" << worker_stats.prefill_graph_reuse_skip_model.load(std::memory_order_relaxed)
+                      << "]";
 
             bool wrote_variant_bucket = false;
             for (std::size_t variant_idx = 0; variant_idx < kDecodeGraphCacheTrackedVariants; ++variant_idx) {
@@ -1452,10 +1446,9 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const uint64_t steady_visible_tokens =
         req->visible_emitted_token_count > 0 ? (req->visible_emitted_token_count - 1) : 0;
     const double prefill_ttft_ms = point_to_ms(req->start_time, req->first_token_time);
-    const double prefill_tok_s =
-        (prefill_ttft_ms > 0.0 && prompt_tokens > 0)
-            ? (static_cast<double>(prompt_tokens) / (prefill_ttft_ms / 1000.0))
-            : 0.0;
+    const double prefill_tok_s = (prefill_ttft_ms > 0.0 && prompt_tokens > 0)
+                                     ? (static_cast<double>(prompt_tokens) / (prefill_ttft_ms / 1000.0))
+                                     : 0.0;
     const double decode_visible_ms =
         steady_visible_tokens > 0 ? point_to_ms(req->first_token_time, req->last_external_emit_time) : 0.0;
     const double steady_visible_tok_s =
@@ -1467,9 +1460,9 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const int attention_path_total = req->attention_path_paged + req->attention_path_standard +
                                      req->attention_path_portable_flash + req->attention_path_native_flash +
                                      req->attention_path_hal;
-    const double paged_hit_rate =
-        attention_path_total > 0 ? (100.0 * static_cast<double>(req->attention_path_paged) / attention_path_total)
-                                 : paged_runtime_hit_rate;
+    const double paged_hit_rate = attention_path_total > 0
+                                      ? (100.0 * static_cast<double>(req->attention_path_paged) / attention_path_total)
+                                      : paged_runtime_hit_rate;
     const densecore::simd::SimdLevel simd_level = densecore::simd::DetectSimdLevel();
     const int physical_core_count = densecore::HardwareTopology::GetInstance().GetPhysicalCoreCount();
     const bool sve_runtime_detected = densecore::simd::HasArmSveOrBetter(simd_level);
@@ -1503,8 +1496,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     };
     const auto path_hist_string = [](const std::array<uint64_t, kMatmulPathHistCount>& hist) {
         static constexpr const char* labels[kMatmulPathHistCount] = {
-            "ggml_mul_mat", "ggml_mul_mat_id", "custom_gemv", "custom_batched_gemv", "moe_native", "ssm_projection",
-            "other"};
+            "ggml_mul_mat", "ggml_mul_mat_id", "custom_gemv", "custom_batched_gemv",
+            "moe_native",   "ssm_projection",  "other"};
         std::ostringstream oss;
         for (std::size_t i = 0; i < kMatmulPathHistCount; ++i) {
             if (i != 0) oss << ",";
@@ -1528,8 +1521,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         for (std::size_t i = 0; i < entries.size(); ++i) {
             const auto& entry = entries[i];
             if (i != 0) oss << ";";
-            oss << safe(entry.phase) << ":" << safe(entry.dispatch_path) << ":" << safe(entry.weight_type) << ":"
-                << safe(entry.shape_bucket);
+            oss << safe(entry.model_family.empty() ? "unknown" : entry.model_family) << ":" << safe(entry.phase) << ":"
+                << safe(entry.dispatch_path) << ":" << safe(entry.weight_type) << ":" << safe(entry.shape_bucket);
             if (!entry.op_type.empty()) {
                 oss << ":op=" << safe(entry.op_type);
             }
@@ -1560,9 +1553,9 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         for (std::size_t i = 0; i < entries.size(); ++i) {
             const auto& entry = entries[i];
             if (i != 0) oss << ";";
-            oss << entry.phase << ":" << entry.dispatch_path << ":" << entry.weight_type << ":"
-                << entry.shape_bucket << ":ms=" << (static_cast<double>(entry.wall_ns) / 1.0e6)
-                << ",ops=" << entry.ops;
+            oss << (entry.model_family.empty() ? "unknown" : entry.model_family) << ":" << entry.phase << ":"
+                << entry.dispatch_path << ":" << entry.weight_type << ":" << entry.shape_bucket
+                << ":ms=" << (static_cast<double>(entry.wall_ns) / 1.0e6) << ",ops=" << entry.ops;
         }
         return oss.str();
     };
@@ -1600,9 +1593,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const std::string qwen35_moe_w2_hist = weight_hist_string(req->qwen35_moe_w2_weight_type_hist);
     const std::string qwen36_prefill_top_slow_ops = shape_census_string(req->qwen36_prefill_top_slow_ops);
     const std::string gemma4_prefill_top_slow_ops = shape_census_string(req->gemma4_prefill_top_slow_ops);
-    const auto native_moe_fast_decode_config =
-        ParseSummaryRuntimeToggleFailClosed("DENSECORE_NATIVE_MOE_FAST_DECODE",
-                                            densecore::env::RuntimeToggleMode::Auto);
+    const auto native_moe_fast_decode_config = ParseSummaryRuntimeToggleFailClosed(
+        "DENSECORE_NATIVE_MOE_FAST_DECODE", densecore::env::RuntimeToggleMode::Auto);
     const bool native_moe_fast_w2_q5k_used = req->native_moe_fast_w2_q5k_used_ops > 0;
     const bool native_moe_fast_w2_q5k_rejected = req->native_moe_fast_w2_q5k_rejected_ops > 0;
     const char* native_moe_fast_mode_effective = "auto_discovery_only";
@@ -1625,8 +1617,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     }
     const uint64_t native_moe_fast_w1w3_seen_ops =
         req->native_moe_fallback_w1w3_ops + req->native_moe_fast_w1w3_used_ops;
-    const uint64_t native_moe_fast_w2_seen_ops =
-        req->native_moe_fallback_w2_ops + req->native_moe_fast_w2_used_ops;
+    const uint64_t native_moe_fast_w2_seen_ops = req->native_moe_fallback_w2_ops + req->native_moe_fast_w2_used_ops;
     const uint64_t native_moe_fast_w2_q5k_seen_ops =
         std::max(req->native_moe_fast_w2_q5k_candidate_ops,
                  req->native_moe_fast_w2_q5k_used_ops + req->native_moe_fast_w2_q5k_rejected_ops);
@@ -1643,11 +1634,12 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     } else if (steady_visible_tokens > 0 && req->qwen35_moe_forward_calls > 0) {
         native_graph_moe_down_q5k_applicability = "active";
     }
-    const int moe_w2_fast_path_wrong_boundary =
-        req->native_moe_fast_w2_q5k_used_ops == 0 && req->native_moe_fallback_w2_ops == 0 &&
-        steady_visible_tokens > 0 && req->qwen35_moe_forward_calls > 0 ? 1 : 0;
-    const bool qwen35_moe_descriptor =
-        descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0;
+    const int moe_w2_fast_path_wrong_boundary = req->native_moe_fast_w2_q5k_used_ops == 0 &&
+                                                        req->native_moe_fallback_w2_ops == 0 &&
+                                                        steady_visible_tokens > 0 && req->qwen35_moe_forward_calls > 0
+                                                    ? 1
+                                                    : 0;
+    const bool qwen35_moe_descriptor = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0;
     const int qwen35_moe_instrumentation_missing =
         qwen35_moe_descriptor && req->qwen35_moe_forward_calls == 0 ? 1 : req->qwen35_moe_instrumentation_missing;
     const bool native_moe_expected =
@@ -1680,8 +1672,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         q4k_applicability = "no_q4k_seen";
     }
     auto resolve_effective_attention_path = [&]() {
-        const bool gemma4_prefill_flash_seen = descriptor.variant == ModelVariant::GEMMA4 &&
-                                               req->flash_attention_headseq_prefill_calls > 0;
+        const bool gemma4_prefill_flash_seen =
+            descriptor.variant == ModelVariant::GEMMA4 && req->flash_attention_headseq_prefill_calls > 0;
         if (gemma4_prefill_flash_seen) {
             return req->flash_attention_reference_calls > 0 ? "portable_cpu_flash_reference" : "portable_cpu_flash";
         }
@@ -1704,11 +1696,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     };
     const char* effective_attention_path = resolve_effective_attention_path();
     if (descriptor.variant == ModelVariant::GEMMA4) {
-        std::cerr << "[Gemma4PrefillSummary]"
-                  << " req=" << req->id
-                  << " prefill_ttft_ms=" << prefill_ttft_ms
-                  << " prompt_tokens=" << prompt_tokens
-                  << " prefill_tok_s=" << prefill_tok_s
+        std::cerr << "[Gemma4PrefillSummary]" << " req=" << req->id << " prefill_ttft_ms=" << prefill_ttft_ms
+                  << " prompt_tokens=" << prompt_tokens << " prefill_tok_s=" << prefill_tok_s
                   << " graph_build_ms=" << ns_to_ms(req->graph_build_ns)
                   << " graph_execute_ms=" << ns_to_ms(req->graph_execute_ns)
                   << " portable_flash_attention_ms=" << ns_to_ms(req->portable_flash_attention_ns)
@@ -1728,19 +1717,15 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                   << req->gemma4_dense_prefill_replaced_ggml_mul_mat_ops
                   << " gemma4_fast_gelu_used=" << req->gemma4_fast_gelu_used
                   << " gemma4_fast_gelu_ms=" << ns_to_ms(req->gemma4_fast_gelu_ns)
-                  << " gemma4_native_moe_prefill_gate_up_ms="
-                  << ns_to_ms(req->gemma4_native_moe_prefill_gate_up_ns)
-                  << " gemma4_native_moe_prefill_down_ms="
-                  << ns_to_ms(req->gemma4_native_moe_prefill_down_ns)
-                  << " gemma4_native_moe_prefill_total_ms="
-                  << ns_to_ms(req->gemma4_native_moe_prefill_total_ns)
+                  << " gemma4_native_moe_prefill_gate_up_ms=" << ns_to_ms(req->gemma4_native_moe_prefill_gate_up_ns)
+                  << " gemma4_native_moe_prefill_down_ms=" << ns_to_ms(req->gemma4_native_moe_prefill_down_ns)
+                  << " gemma4_native_moe_prefill_total_ms=" << ns_to_ms(req->gemma4_native_moe_prefill_total_ns)
                   << " gemma4_prefill_top_slow_ops=" << gemma4_prefill_top_slow_ops
                   << " moe_forward_ms=" << ns_to_ms(req->moe_forward_ns)
                   << " moe_route_ms=" << ns_to_ms(req->moe_route_ns)
                   << " moe_expert_ms=" << ns_to_ms(req->moe_expert_ns)
                   << " shared_expert_ms=" << ns_to_ms(req->shared_expert_ns)
-                  << " kv_update_ms=" << ns_to_ms(req->kv_update_ns)
-                  << " active_threads=" << req->active_thread_count
+                  << " kv_update_ms=" << ns_to_ms(req->kv_update_ns) << " active_threads=" << req->active_thread_count
                   << " simd_level=" << densecore::simd::SimdLevelName(simd_level)
                   << " compute_flash_attention_reference_used=" << (req->flash_attention_reference_calls > 0 ? 1 : 0)
                   << " x86_avx512_compiled_enabled=" << (x86_avx512_compiled_enabled ? 1 : 0)
@@ -1750,38 +1735,28 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                   << " flash_attention_non_avx512_tiled_calls=" << req->flash_attention_non_avx512_tiled_calls
                   << " flash_attention_avx512_tiled_calls=" << req->flash_attention_avx512_tiled_calls
                   << " flash_attention_last_nth=" << req->flash_attention_last_nth
-                  << " flash_attention_last_active_threads=" << req->flash_attention_last_active_threads
-                  << std::endl;
+                  << " flash_attention_last_active_threads=" << req->flash_attention_last_active_threads << std::endl;
     }
     if (req->native_moe_fast_decode_candidate_ops > 0 && req->native_moe_fast_decode_used_ops == 0) {
-        std::cerr << summary_tag << "[WARN] native_moe_fast_decode_candidate_without_use"
-                  << " req=" << req->id
+        std::cerr << summary_tag << "[WARN] native_moe_fast_decode_candidate_without_use" << " req=" << req->id
                   << " candidates=" << req->native_moe_fast_decode_candidate_ops
-                  << " rejected=" << req->native_moe_fast_decode_rejected_ops
-                  << " reason="
+                  << " rejected=" << req->native_moe_fast_decode_rejected_ops << " reason="
                   << (req->native_moe_fast_decode_last_reject_reason.empty()
                           ? "none"
                           : req->native_moe_fast_decode_last_reject_reason.c_str())
                   << std::endl;
     }
     if (req->q6k_gemv_seen_ops > 0 && req->q6k_gemv_candidate_ops == 0) {
-        std::cerr << summary_tag << "[WARN] q6k_gemv_seen_without_candidate"
-                  << " req=" << req->id
-                  << " seen=" << req->q6k_gemv_seen_ops
-                  << " rejected=" << req->q6k_gemv_rejected_ops
-                  << " reason=" << q6k_last_reject_reason
-                  << std::endl;
+        std::cerr << summary_tag << "[WARN] q6k_gemv_seen_without_candidate" << " req=" << req->id
+                  << " seen=" << req->q6k_gemv_seen_ops << " rejected=" << req->q6k_gemv_rejected_ops
+                  << " reason=" << q6k_last_reject_reason << std::endl;
     }
     if (req->graph_ctx_requested_mb > 0 && req->graph_ctx_available_mb > 0 &&
         req->graph_ctx_requested_mb + req->graph_ctx_safety_margin_mb > req->graph_ctx_available_mb) {
-        std::cerr << summary_tag << "[WARN] graph_ctx_request_exceeds_safe_available"
-                  << " req=" << req->id
-                  << " requested_mb=" << req->graph_ctx_requested_mb
-                  << " available_mb=" << req->graph_ctx_available_mb
-                  << " safety_margin_mb=" << req->graph_ctx_safety_margin_mb
-                  << " fail_reason="
-                  << (req->graph_ctx_fail_reason.empty() ? "none" : req->graph_ctx_fail_reason.c_str())
-                  << std::endl;
+        std::cerr << summary_tag << "[WARN] graph_ctx_request_exceeds_safe_available" << " req=" << req->id
+                  << " requested_mb=" << req->graph_ctx_requested_mb << " available_mb=" << req->graph_ctx_available_mb
+                  << " safety_margin_mb=" << req->graph_ctx_safety_margin_mb << " fail_reason="
+                  << (req->graph_ctx_fail_reason.empty() ? "none" : req->graph_ctx_fail_reason.c_str()) << std::endl;
     }
     std::cerr
         << summary_tag << " req=" << req->id << " finish_cause=" << DecodeFinishCauseName(req->decode_finish_cause)
@@ -1843,13 +1818,11 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " kleidiai_compiled_enabled=" << req->kleidiai_compiled_enabled
         << " kleidiai_candidate_ops=" << req->kleidiai_candidate_ops
         << " kleidiai_allowed_ops=" << req->kleidiai_allowed_ops
-        << " kleidiai_rejected_ops=" << req->kleidiai_rejected_ops
-        << " kleidiai_last_reject_reason="
+        << " kleidiai_rejected_ops=" << req->kleidiai_rejected_ops << " kleidiai_last_reject_reason="
         << densecore::runtime::KernelAdmissionRejectReasonName(
                static_cast<densecore::runtime::KernelAdmissionRejectReason>(req->kleidiai_last_reject_reason))
         << " graph_cache_hits=" << req->graph_cache_hit_count << " graph_cache_misses=" << req->graph_cache_miss_count
-        << " graph_cache_skips=" << req->graph_cache_skip_count
-        << " graph_cache_last_skip_reason="
+        << " graph_cache_skips=" << req->graph_cache_skip_count << " graph_cache_last_skip_reason="
         << (req->graph_cache_last_skip_reason.empty() ? "none" : req->graph_cache_last_skip_reason.c_str())
         << " prefix_cache_allowed=" << (req->prefix_cache_allowed ? 1 : 0)
         << " prefix_cache_hit=" << (req->prefix_cache_hit ? 1 : 0)
@@ -1857,22 +1830,18 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " prefix_cache_hit_blocks=" << req->prefix_cache_hit_blocks
         << " prefix_cache_registered_blocks=" << req->prefix_cache_registered_blocks
         << " prefix_cache_extended_blocks=" << req->prefix_cache_extended_blocks
-        << " hybrid_ssm_snapshot_restore_attempted="
-        << (req->hybrid_ssm_snapshot_restore_attempted ? 1 : 0)
+        << " hybrid_ssm_snapshot_restore_attempted=" << (req->hybrid_ssm_snapshot_restore_attempted ? 1 : 0)
         << " hybrid_ssm_snapshot_restore_applied=" << (req->hybrid_ssm_snapshot_restore_applied ? 1 : 0)
         << " prefix_cache_skip_reason="
         << (req->prefix_cache_skip_reason.empty() ? "none" : req->prefix_cache_skip_reason.c_str())
         << " paged_hit_rate=" << paged_hit_rate << " paged_path_hits=" << req->attention_path_paged
-        << " decode_path_total=" << attention_path_total
-        << " paged_runtime_hit_rate=" << paged_runtime_hit_rate
-        << " paged_runtime_path_hits=" << runtime.path_paged
-        << " decode_runtime_path_total=" << runtime.path_total
+        << " decode_path_total=" << attention_path_total << " paged_runtime_hit_rate=" << paged_runtime_hit_rate
+        << " paged_runtime_path_hits=" << runtime.path_paged << " decode_runtime_path_total=" << runtime.path_total
         << " prefill_chunk_tokens_effective=" << req->prefill_chunk_tokens_effective
         << " graph_ctx_requested_mb=" << req->graph_ctx_requested_mb
         << " graph_ctx_available_mb=" << req->graph_ctx_available_mb
         << " graph_ctx_safety_margin_mb=" << req->graph_ctx_safety_margin_mb
-        << " graph_ctx_downgraded_chunk_tokens=" << req->graph_ctx_downgraded_chunk_tokens
-        << " graph_ctx_fail_reason="
+        << " graph_ctx_downgraded_chunk_tokens=" << req->graph_ctx_downgraded_chunk_tokens << " graph_ctx_fail_reason="
         << (req->graph_ctx_fail_reason.empty() ? "none" : req->graph_ctx_fail_reason.c_str())
         << " q4k_true_batched_used=" << req->q4k_true_batched_used
         << " qwen36_prefill_q4k_batched_mode=" << req->qwen36_prefill_q4k_batched_mode
@@ -1890,9 +1859,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " qwen36_ssm_q8_prefill_amx_prepared=" << req->qwen36_ssm_q8_prefill_amx_prepared
         << " qwen36_ssm_q8_prefill_amx_used=" << req->qwen36_ssm_q8_prefill_amx_used
         << " qwen36_ssm_q8_prefill_amx_reject_reason="
-        << (req->qwen36_ssm_q8_prefill_amx_reject_reason.empty()
-                ? "none"
-                : req->qwen36_ssm_q8_prefill_amx_reject_reason.c_str())
+        << (req->qwen36_ssm_q8_prefill_amx_reject_reason.empty() ? "none"
+                                                                 : req->qwen36_ssm_q8_prefill_amx_reject_reason.c_str())
         << " qwen36_ssm_q8_prefill_amx_prepared_projection_counts="
         << (req->qwen36_ssm_q8_prefill_amx_prepared_projection_counts.empty()
                 ? "none"
@@ -1902,18 +1870,14 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                 ? "none"
                 : req->qwen36_ssm_q8_prefill_amx_projection_counts.c_str())
         << " qwen36_ssm_projection_weight_type_hist=" << ssm_weight_hist
-        << " qwen36_ssm_q8_prefill_amx_candidate_ops="
-        << req->qwen36_ssm_q8_prefill_amx_candidate_ops
+        << " qwen36_ssm_q8_prefill_amx_candidate_ops=" << req->qwen36_ssm_q8_prefill_amx_candidate_ops
         << " qwen36_ssm_q8_prefill_amx_used_ops=" << req->qwen36_ssm_q8_prefill_amx_used_ops
-        << " qwen36_ssm_q8_prefill_amx_rejected_ops="
-        << req->qwen36_ssm_q8_prefill_amx_rejected_ops
-        << " qwen36_ssm_q8_decode_used_original_q8_path="
-        << req->qwen36_ssm_q8_decode_used_original_q8_path
+        << " qwen36_ssm_q8_prefill_amx_rejected_ops=" << req->qwen36_ssm_q8_prefill_amx_rejected_ops
+        << " qwen36_ssm_q8_decode_used_original_q8_path=" << req->qwen36_ssm_q8_decode_used_original_q8_path
         << " qwen36_ssm_projection_quant_preserved=" << req->qwen36_ssm_projection_quant_preserved
         << " qwen36_ssm_projection_dequantized_count=" << req->qwen36_ssm_projection_dequantized_count
         << " qwen36_ssm_projection_actual_types="
-        << (req->qwen36_ssm_projection_actual_types.empty() ? "none"
-                                                            : req->qwen36_ssm_projection_actual_types.c_str())
+        << (req->qwen36_ssm_projection_actual_types.empty() ? "none" : req->qwen36_ssm_projection_actual_types.c_str())
         << " q4k_repacked_gemv_used=" << req->q4k_repacked_gemv_used
         << " q4k_repacked_gemv_seen_ops=" << req->q4k_repacked_gemv_seen_ops
         << " q4k_repacked_gemv_candidate_ops=" << req->q4k_repacked_gemv_candidate_ops
@@ -1927,8 +1891,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " q4k_repacked_gemv_repack_bytes=" << req->q4k_repacked_gemv_repack_bytes
         << " q4k_repacked_gemv_probe_ms=" << (static_cast<double>(req->q4k_repacked_gemv_probe_ns) / 1.0e6)
         << " q4k_repacked_gemv_resident_bytes=" << req->q4k_repacked_gemv_resident_bytes
-        << " q4k_repacked_gemv_cache_limit_bytes="
-        << densecore::kernels::Q4KRepackedGemvCacheLimitBytes()
+        << " q4k_repacked_gemv_cache_limit_bytes=" << densecore::kernels::Q4KRepackedGemvCacheLimitBytes()
         << " q4k_repacked_gemv_cache_limit_source="
         << (densecore::kernels::Q4KRepackedGemvManualCacheLimitConfigured() ? "manual" : "auto")
         << " q4k_repacked_gemv_distinct_weights_seen=" << req->q4k_repacked_gemv_distinct_weights_seen
@@ -1943,8 +1906,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                 : req->q4k_repacked_gemv_primary_disable_reason_text.c_str())
         << " q4k_repacked_gemv_cache_thrash_detected=" << req->q4k_repacked_gemv_cache_thrash_detected
         << " q4k_repacked_gemv_effective_state="
-        << (req->q4k_repacked_gemv_effective_state.empty() ? "unused"
-                                                            : req->q4k_repacked_gemv_effective_state.c_str())
+        << (req->q4k_repacked_gemv_effective_state.empty() ? "unused" : req->q4k_repacked_gemv_effective_state.c_str())
         << " q4k_repacked_gemv_applicability=" << q4k_applicability
         << " gemv_custom_total_ops=" << req->gemv_custom_total_ops
         << " gemv_custom_decode_ops=" << req->gemv_custom_decode_ops
@@ -1958,30 +1920,24 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " gemv_custom_dynamic_lora_ops=" << req->gemv_custom_dynamic_lora_ops
         << " gemv_custom_weight_type_hist=" << gemv_weight_hist
         << " gemv_custom_quant_input_type_hist=" << gemv_quant_input_hist
-        << " gemv_custom_tasks_effective=" << req->gemv_custom_tasks_effective
-        << " gemv_custom_tasks_cap_reason="
+        << " gemv_custom_tasks_effective=" << req->gemv_custom_tasks_effective << " gemv_custom_tasks_cap_reason="
         << (req->gemv_custom_tasks_cap_reason.empty() ? "none" : req->gemv_custom_tasks_cap_reason.c_str())
         << " decode_matmul_created_ops=" << req->decode_matmul_created_ops
         << " decode_matmul_weight_type_hist=" << decode_matmul_weight_hist
         << " decode_matmul_path_hist=" << decode_matmul_path_hist
         << " decode_matmul_top_shapes=" << decode_matmul_top_shapes
         << " prefill_matmul_weight_type_hist=" << prefill_matmul_weight_hist
-        << " prefill_matmul_path_hist=" << prefill_matmul_path_hist
-        << " q6k_gemv_seen_ops=" << req->q6k_gemv_seen_ops
-        << " q6k_gemv_candidate_ops=" << req->q6k_gemv_candidate_ops
-        << " q6k_gemv_used_ops=" << req->q6k_gemv_used_ops
+        << " prefill_matmul_path_hist=" << prefill_matmul_path_hist << " q6k_gemv_seen_ops=" << req->q6k_gemv_seen_ops
+        << " q6k_gemv_candidate_ops=" << req->q6k_gemv_candidate_ops << " q6k_gemv_used_ops=" << req->q6k_gemv_used_ops
         << " q6k_gemv_rejected_ops=" << req->q6k_gemv_rejected_ops
         << " q6k_gemv_reject_quant_input_null_ops=" << req->q6k_gemv_reject_quant_input_null_ops
-        << " q6k_gemv_reject_unsupported_quant_input_ops="
-        << req->q6k_gemv_reject_unsupported_quant_input_ops
+        << " q6k_gemv_reject_unsupported_quant_input_ops=" << req->q6k_gemv_reject_unsupported_quant_input_ops
         << " q6k_gemv_reject_shape_ops=" << req->q6k_gemv_reject_shape_ops
         << " q6k_gemv_reject_phase_ops=" << req->q6k_gemv_reject_phase_ops
         << " q6k_gemv_reject_kernel_unavailable_ops=" << req->q6k_gemv_reject_kernel_unavailable_ops
-        << " q6k_gemv_last_reject_reason=" << q6k_last_reject_reason
-        << " q6k_gemv_effective_phase="
+        << " q6k_gemv_last_reject_reason=" << q6k_last_reject_reason << " q6k_gemv_effective_phase="
         << (req->q6k_gemv_effective_phase.empty() ? "none" : req->q6k_gemv_effective_phase.c_str())
-        << " q6k_gemv_graph_phase="
-        << (req->q6k_gemv_graph_phase.empty() ? "none" : req->q6k_gemv_graph_phase.c_str())
+        << " q6k_gemv_graph_phase=" << (req->q6k_gemv_graph_phase.empty() ? "none" : req->q6k_gemv_graph_phase.c_str())
         << " q6k_gemv_callback_phase="
         << (req->q6k_gemv_callback_phase.empty() ? "none" : req->q6k_gemv_callback_phase.c_str())
         << " q6k_gemv_weight_shapes=" << q6k_gemv_weight_shapes
@@ -2010,54 +1966,51 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " moe_q4k_repacked_last_reject_reason="
         << (req->moe_q4k_repacked_last_reject_reason.empty() ? "none"
                                                              : req->moe_q4k_repacked_last_reject_reason.c_str())
-        << " gemma4_moe_prefill_quant_batch_candidate_ops="
-        << req->gemma4_moe_prefill_quant_batch_candidate_ops
+        << " moe_q5k_repacked_candidate_ops=" << req->moe_q5k_repacked_candidate_ops
+        << " moe_q5k_repacked_used_ops=" << req->moe_q5k_repacked_used_ops
+        << " moe_q5k_repacked_rejected_ops=" << req->moe_q5k_repacked_rejected_ops
+        << " moe_q5k_repacked_last_reject_reason="
+        << (req->moe_q5k_repacked_last_reject_reason.empty() ? "none"
+                                                             : req->moe_q5k_repacked_last_reject_reason.c_str())
+        << " gemma4_moe_prefill_quant_batch_candidate_ops=" << req->gemma4_moe_prefill_quant_batch_candidate_ops
         << " gemma4_moe_prefill_quant_batch_used_ops=" << req->gemma4_moe_prefill_quant_batch_used_ops
-        << " gemma4_moe_prefill_quant_batch_rejected_ops="
-        << req->gemma4_moe_prefill_quant_batch_rejected_ops
+        << " gemma4_moe_prefill_quant_batch_rejected_ops=" << req->gemma4_moe_prefill_quant_batch_rejected_ops
         << " gemma4_moe_prefill_quant_batch_last_reject_reason="
         << (req->gemma4_moe_prefill_quant_batch_last_reject_reason.empty()
                 ? "none"
                 : req->gemma4_moe_prefill_quant_batch_last_reject_reason.c_str())
-        << " gemma4_moe_prefill_quant_batch_gate_up_used="
-        << req->gemma4_moe_prefill_quant_batch_gate_up_used
-        << " gemma4_moe_prefill_quant_batch_down_used="
-        << req->gemma4_moe_prefill_quant_batch_down_used
-        << " gemma4_native_moe_prefill_candidate_layers="
-        << req->gemma4_native_moe_prefill_candidate_layers
+        << " gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops="
+        << req->gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops
+        << " gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops="
+        << req->gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops
+        << " gemma4_moe_prefill_quant_batch_gate_up_used=" << req->gemma4_moe_prefill_quant_batch_gate_up_used
+        << " gemma4_moe_prefill_quant_batch_down_used=" << req->gemma4_moe_prefill_quant_batch_down_used
+        << " gemma4_native_moe_prefill_candidate_layers=" << req->gemma4_native_moe_prefill_candidate_layers
         << " gemma4_native_moe_prefill_used_layers=" << req->gemma4_native_moe_prefill_used_layers
         << " gemma4_native_moe_prefill_rejected_layers=" << req->gemma4_native_moe_prefill_rejected_layers
         << " gemma4_native_moe_prefill_last_reject_reason="
         << (req->gemma4_native_moe_prefill_last_reject_reason.empty()
                 ? "none"
                 : req->gemma4_native_moe_prefill_last_reject_reason.c_str())
-        << " gemma4_native_moe_prefill_gate_up_ms="
-        << ns_to_ms(req->gemma4_native_moe_prefill_gate_up_ns)
-        << " gemma4_native_moe_prefill_down_ms="
-        << ns_to_ms(req->gemma4_native_moe_prefill_down_ns)
-        << " gemma4_native_moe_prefill_total_ms="
-        << ns_to_ms(req->gemma4_native_moe_prefill_total_ns)
+        << " gemma4_native_moe_prefill_gate_up_ms=" << ns_to_ms(req->gemma4_native_moe_prefill_gate_up_ns)
+        << " gemma4_native_moe_prefill_down_ms=" << ns_to_ms(req->gemma4_native_moe_prefill_down_ns)
+        << " gemma4_native_moe_prefill_total_ms=" << ns_to_ms(req->gemma4_native_moe_prefill_total_ns)
         << " gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops="
         << req->gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops
         << " gemma4_native_moe_prefill_duplicate_work_detected="
         << req->gemma4_native_moe_prefill_duplicate_work_detected
-        << " gemma4_dense_prefill_native_candidate_ops="
-        << req->gemma4_dense_prefill_native_candidate_ops
+        << " gemma4_dense_prefill_native_candidate_ops=" << req->gemma4_dense_prefill_native_candidate_ops
         << " gemma4_dense_prefill_native_used_ops=" << req->gemma4_dense_prefill_native_used_ops
-        << " gemma4_dense_prefill_native_rejected_ops="
-        << req->gemma4_dense_prefill_native_rejected_ops
+        << " gemma4_dense_prefill_native_rejected_ops=" << req->gemma4_dense_prefill_native_rejected_ops
         << " gemma4_dense_prefill_native_last_reject_reason="
         << (req->gemma4_dense_prefill_native_last_reject_reason.empty()
                 ? "none"
                 : req->gemma4_dense_prefill_native_last_reject_reason.c_str())
         << " gemma4_dense_prefill_native_q4k_ops=" << req->gemma4_dense_prefill_native_q4k_ops
         << " gemma4_dense_prefill_native_q8_0_ops=" << req->gemma4_dense_prefill_native_q8_0_ops
-        << " gemma4_dense_prefill_native_ms="
-        << ns_to_ms(req->gemma4_dense_prefill_native_ns)
-        << " gemma4_dense_prefill_replaced_ggml_mul_mat_ops="
-        << req->gemma4_dense_prefill_replaced_ggml_mul_mat_ops
-        << " gemma4_dense_prefill_duplicate_work_detected="
-        << req->gemma4_dense_prefill_duplicate_work_detected
+        << " gemma4_dense_prefill_native_ms=" << ns_to_ms(req->gemma4_dense_prefill_native_ns)
+        << " gemma4_dense_prefill_replaced_ggml_mul_mat_ops=" << req->gemma4_dense_prefill_replaced_ggml_mul_mat_ops
+        << " gemma4_dense_prefill_duplicate_work_detected=" << req->gemma4_dense_prefill_duplicate_work_detected
         << " gemma4_fast_gelu_enabled=" << req->gemma4_fast_gelu_enabled
         << " gemma4_fast_gelu_used=" << req->gemma4_fast_gelu_used
         << " gemma4_fast_gelu_ms=" << ns_to_ms(req->gemma4_fast_gelu_ns)
@@ -2067,58 +2020,39 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " gemma4_decode_native_used_ops=" << req->gemma4_decode_native_used_ops
         << " gemma4_decode_native_rejected_ops=" << req->gemma4_decode_native_rejected_ops
         << " gemma4_decode_native_last_reject_reason="
-        << (req->gemma4_decode_native_last_reject_reason.empty()
-                ? "none"
-                : req->gemma4_decode_native_last_reject_reason.c_str())
+        << (req->gemma4_decode_native_last_reject_reason.empty() ? "none"
+                                                                 : req->gemma4_decode_native_last_reject_reason.c_str())
         << " gemma4_decode_native_moe_used_ops=" << req->gemma4_decode_native_moe_used_ops
         << " gemma4_decode_native_dense_used_ops=" << req->gemma4_decode_native_dense_used_ops
         << " gemma4_decode_native_lm_head_used_ops=" << req->gemma4_decode_native_lm_head_used_ops
         << " gemma4_decode_native_ms=" << ns_to_ms(req->gemma4_decode_native_ns)
-        << " gemma4_decode_replaced_ggml_mul_mat_ops="
-        << req->gemma4_decode_replaced_ggml_mul_mat_ops
-        << " gemma4_decode_replaced_ggml_mul_mat_id_ops="
-        << req->gemma4_decode_replaced_ggml_mul_mat_id_ops
+        << " gemma4_decode_replaced_ggml_mul_mat_ops=" << req->gemma4_decode_replaced_ggml_mul_mat_ops
+        << " gemma4_decode_replaced_ggml_mul_mat_id_ops=" << req->gemma4_decode_replaced_ggml_mul_mat_id_ops
         << " gemma4_decode_duplicate_work_detected=" << req->gemma4_decode_duplicate_work_detected
-        << " gemma4_native_int4_gemv_candidate_ops="
-        << req->gemma4_native_int4_gemv_candidate_ops
+        << " gemma4_native_int4_gemv_candidate_ops=" << req->gemma4_native_int4_gemv_candidate_ops
         << " gemma4_native_int4_gemv_used_ops=" << req->gemma4_native_int4_gemv_used_ops
         << " gemma4_native_int4_gemv_ms=" << ns_to_ms(req->gemma4_native_int4_gemv_ns)
-        << " gemma4_native_int4_repacked_weight_count="
-        << req->gemma4_native_int4_repacked_weight_count
+        << " gemma4_native_int4_repacked_weight_count=" << req->gemma4_native_int4_repacked_weight_count
         << " gemma4_native_int4_repacked_bytes=" << req->gemma4_native_int4_repacked_bytes
-        << " gemma4_native_fused_gateup_used_ops="
-        << req->gemma4_native_fused_gateup_used_ops
+        << " gemma4_native_fused_gateup_used_ops=" << req->gemma4_native_fused_gateup_used_ops
         << " ggml_delegated_quant_gemv_ops=" << req->ggml_delegated_quant_gemv_ops
-        << " gemma4_native_paged_attention_candidate_ops="
-        << req->gemma4_native_paged_attention_candidate_ops
-        << " gemma4_native_paged_attention_used_ops="
-        << req->gemma4_native_paged_attention_used_ops
-        << " gemma4_native_paged_attention_ms="
-        << ns_to_ms(req->gemma4_native_paged_attention_ns)
-        << " gemma4_ggml_attention_fallback_ops="
-        << req->gemma4_ggml_attention_fallback_ops
-        << " gemma4_paged_attention_cache_type="
-        << req->gemma4_paged_attention_cache_type
-        << " gemma4_paged_attention_context_len="
-        << req->gemma4_paged_attention_context_len
-        << " gemma4_paged_attention_head_range="
-        << req->gemma4_paged_attention_head_range
-        << " gemma4_ggml_mul_mat_prefill_remaining_ms="
-        << ns_to_ms(req->gemma4_prefill_mul_mat_ns)
-        << " gemma4_ggml_mul_mat_id_prefill_remaining_ms="
-        << ns_to_ms(req->gemma4_prefill_mul_mat_id_ns)
-        << " gemma4_ggml_mul_mat_decode_remaining_ms="
-        << ns_to_ms(req->decode_graph_node_mul_mat_ns)
-        << " gemma4_ggml_mul_mat_id_decode_remaining_ms="
-        << ns_to_ms(req->decode_graph_node_mul_mat_id_ns)
+        << " gemma4_native_paged_attention_candidate_ops=" << req->gemma4_native_paged_attention_candidate_ops
+        << " gemma4_native_paged_attention_used_ops=" << req->gemma4_native_paged_attention_used_ops
+        << " gemma4_native_paged_attention_ms=" << ns_to_ms(req->gemma4_native_paged_attention_ns)
+        << " gemma4_ggml_attention_fallback_ops=" << req->gemma4_ggml_attention_fallback_ops
+        << " gemma4_paged_attention_cache_type=" << req->gemma4_paged_attention_cache_type
+        << " gemma4_paged_attention_context_len=" << req->gemma4_paged_attention_context_len
+        << " gemma4_paged_attention_head_range=" << req->gemma4_paged_attention_head_range
+        << " gemma4_ggml_mul_mat_prefill_remaining_ms=" << ns_to_ms(req->gemma4_prefill_mul_mat_ns)
+        << " gemma4_ggml_mul_mat_id_prefill_remaining_ms=" << ns_to_ms(req->gemma4_prefill_mul_mat_id_ns)
+        << " gemma4_ggml_mul_mat_decode_remaining_ms=" << ns_to_ms(req->decode_graph_node_mul_mat_ns)
+        << " gemma4_ggml_mul_mat_id_decode_remaining_ms=" << ns_to_ms(req->decode_graph_node_mul_mat_id_ns)
         << " gemma4_native_prefill_replaced_ggml_ops="
         << (req->gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops +
             req->gemma4_dense_prefill_replaced_ggml_mul_mat_ops)
         << " gemma4_native_decode_replaced_ggml_ops="
-        << (req->gemma4_decode_replaced_ggml_mul_mat_ops +
-            req->gemma4_decode_replaced_ggml_mul_mat_id_ops)
-        << " native_moe_graph_ms=" << ns_to_ms(req->native_moe_graph_ns)
-        << " native_moe_graph_node_hist="
+        << (req->gemma4_decode_replaced_ggml_mul_mat_ops + req->gemma4_decode_replaced_ggml_mul_mat_id_ops)
+        << " native_moe_graph_ms=" << ns_to_ms(req->native_moe_graph_ns) << " native_moe_graph_node_hist="
         << (req->native_moe_graph_node_hist.empty() ? "none" : req->native_moe_graph_node_hist.c_str())
         << " native_moe_graph_top_slow_nodes=" << native_moe_graph_top_slow_nodes
         << " native_moe_timing_missing=" << native_moe_timing_missing
@@ -2177,8 +2111,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                 : req->native_moe_fast_w2_q5k_last_reject_reason.c_str())
         << " qwen35_native_moe_down_q5k_ms=" << ns_to_ms(req->native_moe_fast_w2_q5k_ns)
         << " qwen35_native_moe_down_q5k_replaced_fallback_ops=" << req->native_moe_fast_replaced_fallback_ops
-        << " qwen35_native_moe_down_q5k_duplicate_work_detected="
-        << req->native_moe_fast_duplicate_work_detected
+        << " qwen35_native_moe_down_q5k_duplicate_work_detected=" << req->native_moe_fast_duplicate_work_detected
         << " native_graph_moe_down_q5k_applicability=" << native_graph_moe_down_q5k_applicability
         << " moe_w2_fast_path_wrong_boundary=" << moe_w2_fast_path_wrong_boundary
         << " qwen35_moe_path=" << (req->qwen35_moe_path.empty() ? "none" : req->qwen35_moe_path.c_str())
@@ -2186,19 +2119,18 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " qwen35_moe_forward_calls=" << req->qwen35_moe_forward_calls
         << " qwen35_moe_w1w3_weight_type_hist=" << qwen35_moe_w1w3_hist
         << " qwen35_moe_w2_weight_type_hist=" << qwen35_moe_w2_hist
+        << " qwen_native_moe_w1w3_weight_type_hist=" << qwen35_moe_w1w3_hist
+        << " qwen_native_moe_w2_weight_type_hist=" << qwen35_moe_w2_hist
         << " qwen35_moe_route_ms=" << ns_to_ms(req->moe_route_ns)
-        << " qwen35_moe_w1w3_ms=" << ns_to_ms(req->moe_w1w3_ns)
-        << " qwen35_moe_w2_ms=" << ns_to_ms(req->moe_w2_ns)
+        << " qwen35_moe_w1w3_ms=" << ns_to_ms(req->moe_w1w3_ns) << " qwen35_moe_w2_ms=" << ns_to_ms(req->moe_w2_ns)
         << " qwen35_moe_reduce_ms=" << ns_to_ms(req->moe_reduce_ns)
         << " qwen35_moe_selected_expert_count=" << req->qwen35_moe_selected_expert_count
         << " qwen35_moe_top_k=" << req->qwen35_moe_top_k
         << " qwen35_moe_instrumentation_missing=" << qwen35_moe_instrumentation_missing
         << " qwen36_moe_route_ms=" << ns_to_ms(req->moe_route_ns)
-        << " qwen36_moe_w1w3_ms=" << ns_to_ms(req->moe_w1w3_ns)
-        << " qwen36_moe_w2_ms=" << ns_to_ms(req->moe_w2_ns)
+        << " qwen36_moe_w1w3_ms=" << ns_to_ms(req->moe_w1w3_ns) << " qwen36_moe_w2_ms=" << ns_to_ms(req->moe_w2_ns)
         << " qwen36_moe_reduce_ms=" << ns_to_ms(req->moe_reduce_ns)
-        << " moe_selected_expert_count=" << req->moe_selected_expert_count
-        << " moe_top_k=" << req->moe_top_k
+        << " moe_selected_expert_count=" << req->moe_selected_expert_count << " moe_top_k=" << req->moe_top_k
         << " moe_expert_parallel_tasks=" << req->moe_expert_parallel_tasks
         << " matmul_dispatch_top_slow=" << matmul_top_slow
         << " qwen_target_ggml_compute_ops=" << req->qwen_target_ggml_compute_ops
@@ -2208,9 +2140,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " qwen_target_ggml_quantize_kv_ops=" << req->qwen_target_ggml_quantize_kv_ops
         << " qwen_target_ggml_attention_ops=" << req->qwen_target_ggml_attention_ops
         << " qwen_target_ggml_compute_last_reason="
-        << (req->qwen_target_ggml_compute_last_reason.empty()
-                ? "none"
-                : req->qwen_target_ggml_compute_last_reason.c_str())
+        << (req->qwen_target_ggml_compute_last_reason.empty() ? "none"
+                                                              : req->qwen_target_ggml_compute_last_reason.c_str())
         << " qwen_target_ggml_compute_last_op="
         << (req->qwen_target_ggml_compute_last_op.empty() ? "none" : req->qwen_target_ggml_compute_last_op.c_str())
         << " qwen_target_ggml_compute_target="
@@ -2220,11 +2151,9 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " qwen36_prefill_ssm_delta_state_ms=" << ns_to_ms(req->qwen36_prefill_ssm_delta_state_ns)
         << " qwen36_prefill_attention_ms=" << ns_to_ms(req->qwen36_prefill_attention_ns)
         << " qwen36_prefill_mlp_or_moe_ms=" << ns_to_ms(req->qwen36_prefill_mlp_or_moe_ns)
-        << " qwen36_prefill_native_moe_fast_candidate_ops="
-        << req->qwen36_prefill_native_moe_fast_candidate_ops
+        << " qwen36_prefill_native_moe_fast_candidate_ops=" << req->qwen36_prefill_native_moe_fast_candidate_ops
         << " qwen36_prefill_native_moe_fast_used_ops=" << req->qwen36_prefill_native_moe_fast_used_ops
-        << " qwen36_prefill_native_moe_fast_rejected_ops="
-        << req->qwen36_prefill_native_moe_fast_rejected_ops
+        << " qwen36_prefill_native_moe_fast_rejected_ops=" << req->qwen36_prefill_native_moe_fast_rejected_ops
         << " qwen36_prefill_native_moe_fast_last_reject_reason="
         << (req->qwen36_prefill_native_moe_fast_last_reject_reason.empty()
                 ? "none"
@@ -2255,8 +2184,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " attention_path_standard=" << req->attention_path_standard
         << " attention_path_portable_flash=" << req->attention_path_portable_flash
         << " attention_path_native_flash=" << req->attention_path_native_flash
-        << " attention_path_hal=" << req->attention_path_hal
-        << " effective_attention_path=" << effective_attention_path
+        << " attention_path_hal=" << req->attention_path_hal << " effective_attention_path=" << effective_attention_path
         << " flash_attention_headseq_prefill_calls=" << req->flash_attention_headseq_prefill_calls
         << " flash_attention_native_decode_calls=" << req->flash_attention_native_decode_calls
         << " flash_attention_reference_calls=" << req->flash_attention_reference_calls
@@ -2265,10 +2193,9 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " flash_attention_last_nth=" << req->flash_attention_last_nth
         << " flash_attention_last_active_threads=" << req->flash_attention_last_active_threads
         << " compute_flash_attention_reference_used=" << (req->flash_attention_reference_calls > 0 ? 1 : 0)
-        << " moe_task_count=" << req->moe_task_count
-        << " moe_rowblock_tasks=" << req->moe_rowblock_tasks << " selected_expert_count=" << req->selected_expert_count
-        << " ssm_conv1d_calls=" << req->ssm_conv1d_calls << " ssm_delta_calls=" << req->ssm_delta_calls
-        << " shared_quant_reused=" << runtime.shared_quant_reused
+        << " moe_task_count=" << req->moe_task_count << " moe_rowblock_tasks=" << req->moe_rowblock_tasks
+        << " selected_expert_count=" << req->selected_expert_count << " ssm_conv1d_calls=" << req->ssm_conv1d_calls
+        << " ssm_delta_calls=" << req->ssm_delta_calls << " shared_quant_reused=" << runtime.shared_quant_reused
         << " shared_quant_total=" << runtime.shared_quant_total
         << " kv_single_slot_read_count=" << kv_stats.single_slot_read_count
         << " kv_single_slot_write_count=" << kv_stats.single_slot_write_count
