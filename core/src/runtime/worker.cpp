@@ -364,7 +364,13 @@ RuntimeGraphPoolReservation ClampRuntimeGraphPoolReservation(size_t requested_by
         available_bytes > reserved_bytes ? available_bytes - reserved_bytes : available_bytes / 2;
     const size_t payload_bytes = std::min(requested_bytes, std::max<size_t>(usable_bytes, 512ULL * MB));
     const size_t context_object_slack_bytes = std::clamp<size_t>(payload_bytes / 6, 128ULL * MB, 2048ULL * MB);
-    size_t total_bytes = AlignUpBytes(payload_bytes + context_object_slack_bytes, 64ULL * MB);
+    // Dry-run sizing can still undercount ggml object-pool pressure when the
+    // live request shape is not byte-identical to the calibration shape. Scale
+    // that reserve from the measured payload instead of baking in a VM-specific
+    // RAM number; larger hosts and larger graphs naturally get more cushion.
+    const size_t object_pool_variance_bytes = std::max(payload_bytes / 16, requested_bytes / 32);
+    size_t total_bytes =
+        AlignUpBytes(payload_bytes + context_object_slack_bytes + object_pool_variance_bytes, 64ULL * MB);
     size_t capped_payload_bytes = payload_bytes;
     size_t capped_slack_bytes = context_object_slack_bytes;
     if (max_total_bytes > 0 && total_bytes > max_total_bytes) {
@@ -391,7 +397,11 @@ FlexibleGraphPoolSizing MeasureFlexibleGraphPoolSize(TransformerModel* model, Pa
     const size_t available_mb = available_bytes / MB;
     const size_t auto_dry_cap_mb =
         available_mb > 0 ? std::max<size_t>(512, (available_mb * 3) / 4) : std::max<size_t>(fallback_mb, 1024);
-    const size_t default_dry_mb = std::min<size_t>(std::max<size_t>(fallback_mb, 1024), auto_dry_cap_mb);
+    const size_t dry_run_headroom_mb = fallback_estimate.effective_query_len > 1
+                                           ? std::max<size_t>(512, fallback_mb / 8)
+                                           : std::max<size_t>(128, fallback_mb / 16);
+    const size_t default_dry_mb =
+        std::min<size_t>(std::max<size_t>(fallback_mb + dry_run_headroom_mb, 1024), auto_dry_cap_mb);
     const size_t dry_mb = ParseSizeEnvMb("DENSECORE_GRAPH_DRY_RUN_CTX_MB", default_dry_mb, 512, auto_dry_cap_mb);
     const size_t dry_context_bytes = dry_mb * MB;
 
@@ -1849,7 +1859,7 @@ bool IsGraphContextAutoDowngradeEnabled() {
 }
 
 bool IsGraphContextFailClosedEnabled() {
-    return ParseBoolEnvDefault("DENSECORE_GRAPH_CTX_FAIL_CLOSED", false);
+    return ParseBoolEnvDefault("DENSECORE_GRAPH_CTX_FAIL_CLOSED", true);
 }
 
 int ApplyGraphContextPrefillChunkDowngrade(const TransformerModel* model, Request* req, int chunk_tokens) {
@@ -2509,6 +2519,7 @@ void EngineLoop(EngineState* state) {
         std::unordered_map<PrefillGraphCacheKey, PrefillArenaEntry, PrefillGraphCacheKeyHash> prefill_arena_pool;
         std::list<PrefillGraphCacheKey> prefill_arena_lru;
         std::unordered_map<std::string, FlexibleGraphPoolSizing> flexible_graph_pool_sizing_cache;
+        size_t content_dependent_prefill_grown_until_bytes = 0;
 
         auto free_decode_graph_entry = [](DecodeGraphCacheEntry* entry) {
             if (!entry) return;
@@ -4711,25 +4722,41 @@ void EngineLoop(EngineState* state) {
                         FlexibleGraphPoolSizing flexible_sizing{};
                         bool used_flexible_sizing = false;
                         if (IsFlexibleGraphPoolSizingEnabled(current_model)) {
+                            const bool content_dependent_prefill_graph =
+                                is_prefill_batch && current_model &&
+                                (current_model->arch_flags.is_hybrid_ssm || current_model->arch_flags.is_gemma4 ||
+                                 current_model->hparams.n_experts > 0);
                             std::string sizing_key = std::to_string(reinterpret_cast<uintptr_t>(current_model));
                             sizing_key += ":" + std::to_string(static_cast<int>(is_embedding_batch));
                             sizing_key += ":" + std::to_string(graph_ctx_estimate.effective_seq_len);
                             sizing_key += ":" + std::to_string(graph_ctx_estimate.effective_query_len);
                             sizing_key += ":" + std::to_string(graph_ctx_estimate.effective_num_seqs);
                             sizing_key += ":" + std::to_string(graph_ctx_estimate.chunk_token_hint);
-                            auto cached_sizing = flexible_graph_pool_sizing_cache.find(sizing_key);
+                            auto cached_sizing = content_dependent_prefill_graph
+                                                     ? flexible_graph_pool_sizing_cache.end()
+                                                     : flexible_graph_pool_sizing_cache.find(sizing_key);
                             if (cached_sizing == flexible_graph_pool_sizing_cache.end()) {
                                 flexible_sizing = MeasureFlexibleGraphPoolSize(current_model, current_kv_cache, batch,
                                                                                is_embedding_batch, graph_ctx_estimate);
-                                if (flexible_sizing.ok) {
+                                if (flexible_sizing.ok && !content_dependent_prefill_graph) {
                                     cached_sizing =
                                         flexible_graph_pool_sizing_cache.emplace(sizing_key, flexible_sizing).first;
                                 }
                             }
-                            if (cached_sizing != flexible_graph_pool_sizing_cache.end() && cached_sizing->second.ok) {
+                            if (content_dependent_prefill_graph && flexible_sizing.ok) {
+                                used_flexible_sizing = true;
+                            } else if (cached_sizing != flexible_graph_pool_sizing_cache.end() &&
+                                       cached_sizing->second.ok) {
                                 flexible_sizing = cached_sizing->second;
+                                used_flexible_sizing = true;
+                            }
+                            if (used_flexible_sizing) {
                                 ctx_size = flexible_sizing.required_bytes > 0 ? flexible_sizing.required_bytes
                                                                               : flexible_sizing.reserved_bytes;
+                                bool content_dependent_grow_applied = false;
+                                if (is_prefill_batch && graph_ctx_estimate.effective_query_len > 1) {
+                                    ctx_size = std::max(ctx_size, flexible_sizing.reserved_bytes);
+                                }
                                 const size_t measured_floor =
                                     AlignUpBytes(flexible_sizing.dry_metadata_bytes +
                                                      flexible_sizing.graph_tensor_bytes + flexible_sizing.margin_bytes,
@@ -4740,15 +4767,28 @@ void EngineLoop(EngineState* state) {
                                                                          flexible_sizing.available_bytes);
                                     ctx_size = std::max(ctx_size, measured_floor_reservation.total_bytes);
                                 }
+                                if (content_dependent_prefill_graph && state->inference_ctx.IsInitialized() &&
+                                    state->inference_ctx.compute_buffer_size > 0 &&
+                                    state->inference_ctx.compute_buffer_size >= ctx_size &&
+                                    state->inference_ctx.compute_buffer_size >
+                                        content_dependent_prefill_grown_until_bytes) {
+                                    const size_t current_pool_size = state->inference_ctx.compute_buffer_size;
+                                    const size_t content_dependent_grow_ahead =
+                                        std::max<size_t>(1, current_pool_size / 32);
+                                    ctx_size = AlignUpBytes(current_pool_size + content_dependent_grow_ahead,
+                                                            64ULL * 1024ULL * 1024ULL);
+                                    content_dependent_prefill_grown_until_bytes = ctx_size;
+                                    content_dependent_grow_applied = true;
+                                }
                                 if (state->inference_ctx.IsInitialized() &&
-                                    state->inference_ctx.compute_buffer_size < ctx_size) {
+                                    state->inference_ctx.compute_buffer_size < ctx_size &&
+                                    !content_dependent_grow_applied) {
                                     const size_t grow_ahead = std::max<size_t>(
                                         state->inference_ctx.compute_buffer_size / 2, 2048ULL * 1024ULL * 1024ULL);
                                     ctx_size = std::max<size_t>(
                                         ctx_size, AlignUpBytes(state->inference_ctx.compute_buffer_size + grow_ahead,
                                                                512ULL * 1024ULL * 1024ULL));
                                 }
-                                used_flexible_sizing = true;
                             }
                         }
                         const bool graph_pool_shrink_allowed =
@@ -4762,6 +4802,32 @@ void EngineLoop(EngineState* state) {
                                 ? AlignUpBytes(flexible_sizing.dry_context_bytes + 512ULL * 1024ULL * 1024ULL,
                                                64ULL * 1024ULL * 1024ULL)
                                 : 0;
+                        const auto fail_graph_ctx_requests = [&](const std::string& fail_reason,
+                                                                 const char* error_message) {
+                            for (Request* req : batch_requests) {
+                                if (!req || req->finished) {
+                                    continue;
+                                }
+                                req->graph_ctx_fail_reason = fail_reason;
+                                req->finished = true;
+                                req->decode_finish_cause = DecodeFinishCause::OutOfMemory;
+                                FinalizeDecodeSilentFinishReason(req);
+                                LogRequestDecodeSummary(req, current_model);
+                                state->metrics.oom_errors++;
+                                state->metrics.failed_requests++;
+                                EmitRequestResult(state, req, error_message, -1, true, true, global_direct_callback);
+                                if (!req->block_table.empty() && current_kv_cache && current_kv_cache->block_manager) {
+                                    current_kv_cache->block_manager->Free(req->block_table);
+                                    req->block_table.clear();
+                                }
+                                if (req->seq_id >= 0) {
+                                    state->scheduler->RemoveRequest(req->seq_id, false);
+                                    seq_to_request.erase(req->seq_id);
+                                }
+                                std::lock_guard<std::mutex> lk(req->mu);
+                                req->cv.notify_all();
+                            }
+                        };
                         if (!state->inference_ctx.IsInitialized() ||
                             state->inference_ctx.compute_buffer_size < ctx_size || graph_pool_oversized) {
                             if (state->inference_ctx.IsInitialized() &&
@@ -4840,34 +4906,6 @@ void EngineLoop(EngineState* state) {
                                 req->graph_ctx_available_mb = graph_ctx_available_bytes / (1024ULL * 1024ULL);
                                 req->graph_ctx_safety_margin_mb = graph_ctx_safety_margin_bytes / (1024ULL * 1024ULL);
                             }
-                            const auto fail_graph_ctx_requests = [&](const std::string& fail_reason,
-                                                                     const char* error_message) {
-                                for (Request* req : batch_requests) {
-                                    if (!req || req->finished) {
-                                        continue;
-                                    }
-                                    req->graph_ctx_fail_reason = fail_reason;
-                                    req->finished = true;
-                                    req->decode_finish_cause = DecodeFinishCause::OutOfMemory;
-                                    FinalizeDecodeSilentFinishReason(req);
-                                    LogRequestDecodeSummary(req, current_model);
-                                    state->metrics.oom_errors++;
-                                    state->metrics.failed_requests++;
-                                    EmitRequestResult(state, req, error_message, -1, true, true,
-                                                      global_direct_callback);
-                                    if (!req->block_table.empty() && current_kv_cache &&
-                                        current_kv_cache->block_manager) {
-                                        current_kv_cache->block_manager->Free(req->block_table);
-                                        req->block_table.clear();
-                                    }
-                                    if (req->seq_id >= 0) {
-                                        state->scheduler->RemoveRequest(req->seq_id, false);
-                                        seq_to_request.erase(req->seq_id);
-                                    }
-                                    std::lock_guard<std::mutex> lk(req->mu);
-                                    req->cv.notify_all();
-                                }
-                            };
                             const bool graph_ctx_pressure =
                                 graph_ctx_available_bytes > 0 &&
                                 ctx_size + graph_ctx_safety_margin_bytes > graph_ctx_available_bytes;
@@ -4905,6 +4943,28 @@ void EngineLoop(EngineState* state) {
                                                         "Error: graph context allocation failed");
                                 continue;
                             }
+                        }
+
+                        const size_t steady_available_bytes = ReadAvailableMemoryBytesForRuntimePools();
+                        const size_t steady_safety_margin_bytes = GraphContextSafetyMarginBytes();
+                        if (is_prefill_batch && steady_available_bytes > 0 &&
+                            steady_available_bytes < steady_safety_margin_bytes && IsGraphContextFailClosedEnabled()) {
+                            for (Request* req : batch_requests) {
+                                if (!req) {
+                                    continue;
+                                }
+                                req->graph_ctx_requested_mb = ctx_size / (1024ULL * 1024ULL);
+                                req->graph_ctx_available_mb = steady_available_bytes / (1024ULL * 1024ULL);
+                                req->graph_ctx_safety_margin_mb = steady_safety_margin_bytes / (1024ULL * 1024ULL);
+                            }
+                            std::cerr << "[DenseCore] GraphCtxPressure"
+                                      << " requested_mb=" << (ctx_size / (1024ULL * 1024ULL))
+                                      << " available_mb=" << (steady_available_bytes / (1024ULL * 1024ULL))
+                                      << " safety_margin_mb=" << (steady_safety_margin_bytes / (1024ULL * 1024ULL))
+                                      << " reason=prefill_graph_ctx_headroom_exhausted fail_closed=1" << std::endl;
+                            fail_graph_ctx_requests("prefill_graph_ctx_headroom_exhausted",
+                                                    "Error: graph context headroom exhausted");
+                            continue;
                         }
 
                         if (Request* trace_req = !batch_requests.empty() ? batch_requests[0] : nullptr) {

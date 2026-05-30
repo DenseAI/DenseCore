@@ -1585,7 +1585,13 @@ struct EngineState {
 
         const auto& hp = model->hparams;
         const size_t runtime_max_seq_len = static_cast<size_t>(parse_env_int("DENSECORE_MAX_SEQ_LEN", 4096, 1));
-        const size_t runtime_max_num_seqs = static_cast<size_t>(parse_env_int("DENSECORE_MAX_NUM_SEQS", 4, 1));
+        const bool large_hidden_model =
+            std::max<int32_t>(1, hp.n_layer) >= 40 && std::max<int32_t>(1, hp.n_embd) >= 2048;
+        const bool large_weight_shared_llm =
+            large_hidden_model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_gemma4 || hp.n_experts > 0);
+        const int default_max_num_seqs = large_weight_shared_llm ? 2 : 4;
+        const size_t runtime_max_num_seqs =
+            static_cast<size_t>(parse_env_int("DENSECORE_MAX_NUM_SEQS", default_max_num_seqs, 1));
         const size_t model_max_seq_len = static_cast<size_t>(std::max<int32_t>(1, hp.n_ctx));
         const bool has_request_shape_hint = seq_len_hint > 0 || chunk_token_hint > 0 || num_seqs_hint > 0;
         const size_t default_seq_len = std::max<size_t>(1, std::min<size_t>(model_max_seq_len, runtime_max_seq_len));

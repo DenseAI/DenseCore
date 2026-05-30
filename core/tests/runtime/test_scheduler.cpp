@@ -111,6 +111,7 @@ class ScopedEnvOverride {
 SchedulerConfig MakeTestConfig() {
     SchedulerConfig cfg;
     cfg.max_num_seqs = 16;
+    cfg.max_prefill_seqs = 16;
     cfg.max_num_batched_tokens = 256;
     cfg.enable_priority = true;
     cfg.enable_chunked_prefill = false;
@@ -118,6 +119,39 @@ SchedulerConfig MakeTestConfig() {
     cfg.isolate_prefill_decode = true;
     cfg.max_consecutive_decode_batches = 2;
     return cfg;
+}
+
+TEST(SchedulerArchitecture, PrefillSeqLimitSerializesWaitingPrefillWithoutLoweringActiveSeqLimit) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = true;
+    cfg.max_num_seqs = 2;
+    cfg.max_prefill_seqs = 1;
+    cfg.max_prefill_tokens = 16;
+    cfg.max_consecutive_decode_batches = 0;
+
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    const int seq_a = scheduler.AddRequest(/*request_id=*/101, /*prompt_len=*/8, /*max_output_len=*/32);
+    const int seq_b = scheduler.AddRequest(/*request_id=*/102, /*prompt_len=*/8, /*max_output_len=*/32);
+    ASSERT_GT(seq_a, 0);
+    ASSERT_GT(seq_b, 0);
+
+    SchedulerOutput first = scheduler.Schedule();
+    ASSERT_EQ(first.prefill_seq_ids.size(), 1u);
+    EXPECT_EQ(first.prefill_seq_ids[0], seq_a);
+    ASSERT_EQ(first.prefill_chunk_info.size(), 1u);
+    scheduler.UpdateProgress(seq_a, first.prefill_chunk_info[0].chunk_tokens);
+
+    SchedulerOutput second = scheduler.Schedule();
+    ASSERT_EQ(second.prefill_seq_ids.size(), 1u);
+    EXPECT_EQ(second.prefill_seq_ids[0], seq_b);
+    ASSERT_EQ(second.prefill_chunk_info.size(), 1u);
+    scheduler.UpdateProgress(seq_b, second.prefill_chunk_info[0].chunk_tokens);
+
+    SchedulerOutput decode = scheduler.Schedule();
+    EXPECT_EQ(decode.decode_seq_ids.size(), 2u);
+    EXPECT_TRUE(decode.prefill_seq_ids.empty());
 }
 
 TEST(SchedulerArchitecture, DoesNotMixPrefillAndDecodeInSingleStep) {

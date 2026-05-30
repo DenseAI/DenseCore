@@ -236,7 +236,8 @@ size_t ResolveAutoKVTargetMb(const TransformerModel* model, int max_num_seqs, si
         const size_t graph_seq_hint = static_cast<size_t>(std::max(1, std::min(max_seq_len, 2048)));
         const size_t graph_chunk_hint =
             model->arch_flags.is_hybrid_ssm ? graph_seq_hint : std::min<size_t>(graph_seq_hint, 192);
-        const auto graph_estimate = EngineState::EstimateGraphContextSize(model, graph_seq_hint, 1, graph_chunk_hint);
+        const auto graph_estimate =
+            EngineState::EstimateGraphContextSize(model, graph_seq_hint, seqs, graph_chunk_hint);
         graph_reserve_bytes = std::max(graph_reserve_bytes, graph_estimate.total_bytes);
         graph_reserve_bytes += std::max<size_t>(graph_estimate.total_bytes / 4, 2048ULL * MB);
     }
@@ -256,6 +257,28 @@ size_t ResolveAutoKVTargetMb(const TransformerModel* model, int max_num_seqs, si
 
     const size_t per_seq_budget_mb = (total_kv_budget_bytes / seqs) / MB;
     return std::max<size_t>(512, per_seq_budget_mb);
+}
+
+int ResolveDefaultMaxNumSeqs(const TransformerModel* model) {
+    if (!model) {
+        return 4;
+    }
+
+    const auto& hp = model->hparams;
+    const bool large_hidden_model = std::max<int32_t>(1, hp.n_layer) >= 40 && std::max<int32_t>(1, hp.n_embd) >= 2048;
+    const bool large_weight_shared_llm =
+        large_hidden_model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_gemma4 || hp.n_experts > 0);
+    return large_weight_shared_llm ? 2 : 4;
+}
+
+densecore::SchedulerConfig BuildRuntimeSchedulerConfig(const KVCacheConfig& kv_config) {
+    densecore::SchedulerConfig config;
+    config.max_num_seqs = std::max(1, kv_config.max_num_seqs);
+    config.max_prefill_seqs = config.max_num_seqs <= 2 ? 1 : config.max_num_seqs;
+    config.max_model_len = std::max(1, kv_config.max_seq_len);
+    config.max_num_batched_tokens = std::max(1, config.max_num_batched_tokens);
+    config.max_prefill_tokens = std::min(std::max(1, config.max_prefill_tokens), config.max_num_batched_tokens);
+    return config;
 }
 
 const densecore::llm::config::FastPathRuntimeConfig& ResolveFastPathRuntimeConfig(const EngineState* state) {
@@ -448,7 +471,7 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
 
     config.requested_cache_type = requested_cache_type;
     config.effective_cache_type = ResolveEffectiveKVCacheType(model, requested_cache_type);
-    config.max_num_seqs = ReadEnvInt("DENSECORE_MAX_NUM_SEQS", 4);
+    config.max_num_seqs = ReadEnvInt("DENSECORE_MAX_NUM_SEQS", ResolveDefaultMaxNumSeqs(model));
     const int model_ctx = model ? std::max<int32_t>(1, model->hparams.n_ctx) : 4096;
     config.max_seq_len = ReadEnvInt("DENSECORE_MAX_SEQ_LEN", model_ctx, &max_seq_len_env_set);
 
@@ -2180,8 +2203,8 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
         // Note: The scheduler takes a raw pointer to BlockManager, ownership
         // remains with PagedKVCache
         if (state->models["default"]->kv_cache && state->models["default"]->kv_cache->block_manager) {
-            state->scheduler =
-                std::make_unique<densecore::Scheduler>(state->models["default"]->kv_cache->block_manager);
+            state->scheduler = std::make_unique<densecore::Scheduler>(state->models["default"]->kv_cache->block_manager,
+                                                                      BuildRuntimeSchedulerConfig(kv_config));
             LOG_INFO("Scheduler initialized.");
 
             // Initialize compute buffer (Persistent, Aligned)
@@ -2330,8 +2353,8 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
 
         // Initialize Scheduler
         if (state->models["default"]->kv_cache && state->models["default"]->kv_cache->block_manager) {
-            state->scheduler =
-                std::make_unique<densecore::Scheduler>(state->models["default"]->kv_cache->block_manager);
+            state->scheduler = std::make_unique<densecore::Scheduler>(state->models["default"]->kv_cache->block_manager,
+                                                                      BuildRuntimeSchedulerConfig(kv_config));
             std::cout << "[DenseCore] Scheduler initialized." << std::endl;
         } else {
             std::cerr << "[DenseCore] FATAL: Failed to initialize Scheduler." << std::endl;

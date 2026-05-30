@@ -8,7 +8,7 @@
 namespace {
 
 class ScopedEnvVar {
-  public:
+public:
     ScopedEnvVar(const char* name, const char* value) : name_(name ? name : "") {
         const char* prev = std::getenv(name_.c_str());
         if (prev) {
@@ -48,7 +48,7 @@ class ScopedEnvVar {
 #endif
     }
 
-  private:
+private:
     std::string name_;
     bool had_prev_ = false;
     std::string prev_value_;
@@ -232,6 +232,52 @@ TEST(EngineKVCacheConfig, AutoKVTargetUsesAvailableMemoryWhenNoEnvTargetIsSet) {
     EXPECT_LE(config.max_seq_len, model.hparams.n_ctx);
 }
 
+TEST(EngineKVCacheConfig, LargeHybridSsmDefaultsToTwoWeightSharedSequences) {
+    ScopedEnvVar target_mb("DENSECORE_KV_TARGET_MB", "4096");
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "8192");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", nullptr);
+
+    TransformerModel model = MakeModel(/*head_dim_k=*/256, /*n_head_kv=*/8, /*n_layer=*/48);
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_ctx = 262144;
+
+    const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_F16);
+
+    EXPECT_EQ(config.max_num_seqs, 2)
+        << "Large 35B-class hybrid-SSM serving should reserve KV for c=2 by default instead of over-reserving c=4";
+}
+
+TEST(EngineKVCacheConfig, ExplicitMaxNumSeqsOverridesLargeModelDefault) {
+    ScopedEnvVar target_mb("DENSECORE_KV_TARGET_MB", "4096");
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "8192");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
+
+    TransformerModel model = MakeModel(/*head_dim_k=*/256, /*n_head_kv=*/8, /*n_layer=*/48);
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_ctx = 262144;
+
+    const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_F16);
+
+    EXPECT_EQ(config.max_num_seqs, 4);
+}
+
+TEST(EngineKVCacheConfig, SmallModelKeepsBatchFourDefault) {
+    ScopedEnvVar target_mb("DENSECORE_KV_TARGET_MB", "512");
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "4096");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", nullptr);
+
+    TransformerModel model = MakeModel(/*head_dim_k=*/64, /*n_head_kv=*/8, /*n_layer=*/16);
+    model.hparams.n_ctx = 8192;
+
+    const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_F16);
+
+    EXPECT_EQ(config.max_num_seqs, 4);
+}
+
 TEST(EngineKVCacheConfig, AutoKVTargetKeepsLargeGemma4ContextUsableWithoutEnvOverride) {
     ScopedEnvVar target_mb("DENSECORE_KV_TARGET_MB", nullptr);
     ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", nullptr);
@@ -362,8 +408,7 @@ TEST(EngineKVCacheConfig, HybridSsmGraphContextGrowsForLongContextHint) {
     EXPECT_GT(long_hint_estimate.total_bytes, static_cast<size_t>(1024) * 1024 * 1024)
         << "Long-context chunked graph builds still need GB-scale scratch even when the actual batch is smaller than "
            "the runtime max batch";
-    EXPECT_GE(long_hint_estimate.long_context_safety_pad_bytes,
-              static_cast<size_t>(2528) * 1024 * 1024)
+    EXPECT_GE(long_hint_estimate.long_context_safety_pad_bytes, static_cast<size_t>(2528) * 1024 * 1024)
         << "Hybrid Qwen3.5 long-prefill graph sizing regressed below the safety headroom needed to avoid "
            "ggml_new_object aborts on the Go server path";
 }
