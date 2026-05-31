@@ -296,6 +296,8 @@ struct InferenceWorkContext {
     std::vector<MatmulShapeCensusEntry> qwen36_prefill_slow_entries;
     SSMConv1DUserData ssm_conv1d_pool[128];
     int ssm_conv1d_index = 0;
+    LFM2ShortConvUserData lfm2_shortconv_pool[128];
+    int lfm2_shortconv_index = 0;
     ProjectionReferenceUserData projection_reference_pool[384];
     int projection_reference_index = 0;
     RmsNormReferenceUserData rmsnorm_reference_pool[256];
@@ -1893,6 +1895,7 @@ void ResetInferenceWorkContext(InferenceWorkContext* ctx) {
     ctx->paged_attention_shared_k_block_ptrs.clear();
     ctx->paged_attention_shared_v_block_ptrs.clear();
     ctx->ssm_conv1d_index = 0;
+    ctx->lfm2_shortconv_index = 0;
     ctx->projection_reference_index = 0;
     ctx->rmsnorm_reference_index = 0;
     ctx->attention_core_reference_index = 0;
@@ -2111,6 +2114,19 @@ inline SSMConv1DUserData* GetSSMConv1DUserData() {
         throw densecore::OutOfMemoryException("SSMConv1DUserData pool exhausted");
     }
     return &ctx->ssm_conv1d_pool[idx];
+}
+
+inline LFM2ShortConvUserData* GetLFM2ShortConvUserData() {
+    InferenceWorkContext* ctx = GetCurrentWorkContext();
+    if (!ctx) {
+        throw densecore::InvalidArgumentException("GetLFM2ShortConvUserData called without active InferenceWorkContext");
+    }
+    int idx = ctx->lfm2_shortconv_index++;
+    if (idx >= 128) {
+        ctx->lfm2_shortconv_index = 0;
+        throw densecore::OutOfMemoryException("LFM2ShortConvUserData pool exhausted");
+    }
+    return &ctx->lfm2_shortconv_pool[idx];
 }
 
 inline ProjectionReferenceUserData* GetProjectionReferenceUserData() {

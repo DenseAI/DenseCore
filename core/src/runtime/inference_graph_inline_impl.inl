@@ -472,12 +472,54 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         }
         cur = apply_weighted_rms_norm(cur, attn_norm, "attn_norm", il);
 
-        // SSM / Attention layer dispatch
+        // Short-conv / SSM / Attention layer dispatch
+        const bool is_conv_layer = model->IsLFM2ConvLayer(il);
         const bool is_ssm_layer = model->IsHybridSSMLayer(il);
         struct ggml_tensor* attn_out = nullptr;
         struct ggml_tensor* attn_post_residual = nullptr;
 
-        if (is_ssm_layer) {
+        if (is_conv_layer) {
+            // =================================================================
+            // LFM2 / LFM2.5 double-gated short-conv mixer
+            //   BCx = in_proj(x_norm); y = C * conv(B * x); out = out_proj(y)
+            // =================================================================
+            auto* in_proj = layer.Get(model_keys::kShortConvInProj);
+            auto* out_proj = layer.Get(model_keys::kShortConvOutProj);
+            if (!in_proj || !out_proj) {
+                throw densecore::InvalidArgumentException("Missing LFM2 short-conv weights in layer " +
+                                                          std::to_string(il));
+            }
+            const int conv_ordinal = model->LFM2ConvOrdinal(il);
+            if (conv_ordinal < 0 || conv_ordinal >= static_cast<int>(model->lfm2_conv_weight_f32.size())) {
+                throw densecore::InvalidArgumentException("LFM2 conv ordinal out of range in layer " +
+                                                          std::to_string(il));
+            }
+            const int channels = static_cast<int>(in_proj->ne[1] / 3);
+
+            // 1. in_proj: [n_embd, N] -> [3*channels, N] (rows: B, C, x)
+            struct ggml_tensor* bcx = smart_mul_mat(ctx_c, in_proj, cur, model);
+            ggml_set_name(bcx, "lfm2_shortconv_bcx");
+
+            // 2. gated depthwise causal conv (updates per-seq conv state) -> [channels, N]
+            struct ggml_tensor* y = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, channels, N);
+            LFM2ShortConvUserData* conv_ud = GetLFM2ShortConvUserData();
+            conv_ud->conv_weight = model->lfm2_conv_weight_f32[static_cast<size_t>(conv_ordinal)].data();
+            conv_ud->channels = channels;
+            conv_ud->kernel = model->lfm2_conv_kernel;
+            conv_ud->conv_ordinal = conv_ordinal;
+            conv_ud->layer_idx = il;
+            conv_ud->token_seq_ids = batch.seq_id.data();
+            conv_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
+            y = ggml_map_custom2(ctx_c, y, bcx, cb_lfm2_shortconv, 1, conv_ud);
+            ggml_set_name(y, "lfm2_shortconv_y");
+
+            // 3. out_proj: [channels, N] -> [n_embd, N], then residual add.
+            struct ggml_tensor* mixer_out = smart_mul_mat(ctx_c, out_proj, y, model);
+            ggml_set_name(mixer_out, "lfm2_shortconv_out");
+            attn_out = mixer_out;
+            attn_post_residual = ggml_add(ctx_c, mixer_out, inpL);
+            cur = attn_post_residual;
+        } else if (is_ssm_layer) {
             // =================================================================
             // SSM/Mamba2 Layer Forward Path
             // =================================================================

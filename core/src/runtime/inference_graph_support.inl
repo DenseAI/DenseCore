@@ -5075,6 +5075,20 @@ struct SSMConv1DUserData {
     Qwen36ProfileCounters* profile = nullptr;
 };
 
+// LFM2 / LFM2.5 double-gated short-conv mixer. The custom op reads the packed
+// BCx projection [3*channels, N] and writes the gated conv output [channels, N],
+// carrying per-sequence conv state across decode steps (reusing the same
+// SSMSequenceRuntimeState.conv_state buffer; ssm_state is unused for LFM2).
+struct LFM2ShortConvUserData {
+    const float* conv_weight = nullptr;  // [channels * kernel], layout [channel * kernel + tap]
+    int channels = 0;
+    int kernel = 0;
+    int conv_ordinal = -1;  // index among short-conv layers (state slot)
+    int layer_idx = -1;
+    const int* token_seq_ids = nullptr;
+    const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
+};
+
 struct ProjectionReferenceUserData {
     const struct ggml_tensor* weight_tensor = nullptr;
     const struct ggml_tensor* input_tensor = nullptr;

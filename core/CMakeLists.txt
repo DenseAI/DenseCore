@@ -531,6 +531,7 @@ set(SOURCES
     src/hal/kernel_context.cpp
     src/backend/async_cpu_backend.cpp
     src/models/qwen35_ssm_math.cpp
+    src/models/lfm2_shortconv_math.cpp
     src/backend/matmul_backend.cpp
     src/backend/matmul_backend_densecore.cpp
     # Kernels (optimized SIMD implementations)
@@ -1161,6 +1162,7 @@ if(DENSECORE_BUILD_TESTS)
     set(TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_simd_ops.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_qwen35_ssm_math.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_lfm2_shortconv_math.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_qwen35_ssm_qkv_projection.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_qwen36_model_loader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_chat_template.cpp

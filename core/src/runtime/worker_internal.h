@@ -119,6 +119,7 @@ struct DecodeWorkerStats {
 DecodeWorkerStats& GetDecodeWorkerStats();
 void MaybeLogDecodeRuntimeStats();
 void EnsureRequestHybridSSMRuntimeState(TransformerModel* model, Request* req);
+void EnsureRequestLFM2RuntimeState(TransformerModel* model, Request* req);
 void SuppressTaggedBlock(std::string* token_text, bool* in_block, std::string* pending, const char* open_tag,
                          const char* close_tag);
 bool IsStopTokenId(const TransformerModel* model, int token_id);

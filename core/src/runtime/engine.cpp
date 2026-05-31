@@ -264,22 +264,25 @@ int ResolveDefaultMaxNumSeqs(const TransformerModel* model) {
         return 4;
     }
 
-    const auto& hp = model->hparams;
-    const bool large_hidden_model = std::max<int32_t>(1, hp.n_layer) >= 40 && std::max<int32_t>(1, hp.n_embd) >= 2048;
-    const bool large_weight_shared_llm =
-        large_hidden_model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_gemma4 || hp.n_experts > 0);
-    return large_weight_shared_llm ? 2 : 4;
+    return 4;
 }
+
+}  // namespace
 
 densecore::SchedulerConfig BuildRuntimeSchedulerConfig(const KVCacheConfig& kv_config) {
     densecore::SchedulerConfig config;
     config.max_num_seqs = std::max(1, kv_config.max_num_seqs);
-    config.max_prefill_seqs = config.max_num_seqs <= 2 ? 1 : config.max_num_seqs;
+    config.max_prefill_seqs = 1;
     config.max_model_len = std::max(1, kv_config.max_seq_len);
     config.max_num_batched_tokens = std::max(1, config.max_num_batched_tokens);
     config.max_prefill_tokens = std::min(std::max(1, config.max_prefill_tokens), config.max_num_batched_tokens);
+    config.enable_mixed_prefill_decode = true;
+    config.max_mixed_prefill_tokens = std::min(std::max(1, config.max_mixed_prefill_tokens),
+                                               std::max(1, config.max_prefill_tokens / 4));
     return config;
 }
+
+namespace {
 
 const densecore::llm::config::FastPathRuntimeConfig& ResolveFastPathRuntimeConfig(const EngineState* state) {
     if (state) {

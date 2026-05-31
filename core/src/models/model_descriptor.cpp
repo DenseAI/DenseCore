@@ -73,6 +73,15 @@ constexpr ModelDescriptor kDescriptors[] = {
      true,
      false,
      {.requires_q_norm = true, .requires_k_norm = true, .is_hybrid_ssm = true}},
+    {ModelVariant::LFM2MOE,
+     ModelArch::LFM2,
+     "lfm2moe",
+     TokenizerFamily::GPT2_BYTE_BPE,
+     PromptTemplateFamily::CHATML,
+     false,
+     false,
+     false,
+     {.requires_q_norm = true, .requires_k_norm = true, .is_lfm2_shortconv = true}},
     {ModelVariant::GLM4_MOE,
      ModelArch::GLM4_MOE,
      "glm4_moe",
@@ -208,6 +217,7 @@ ModelVariant InferVariantFromModel(const TransformerModel* model) {
     case ModelArch::QWEN2: return ModelVariant::QWEN2;
     case ModelArch::QWEN3: return ModelVariant::QWEN3;
     case ModelArch::QWEN35: return ModelVariant::QWEN35;
+    case ModelArch::LFM2: return ModelVariant::LFM2MOE;
     case ModelArch::GLM4_MOE: return ModelVariant::GLM4_MOE;
     case ModelArch::GLM5_DSA: return ModelVariant::GLM5_DSA;
     case ModelArch::MISTRAL: return ModelVariant::MISTRAL;
@@ -266,6 +276,9 @@ ResolvedModelDescriptor ResolveModelDescriptorFromArchName(std::string_view arch
     if (MatchesAny(lowered, std::array<std::string_view, 7>{"qwen35", "qwen3.5", "qwen35moe", "qwen35_moe",
                                                             "qwen3.5_moe", "qwen3_5_moe", "qwen3_5_moe_text"})) {
         return make_result(DescribeModelVariant(ModelVariant::QWEN35));
+    }
+    if (MatchesAny(lowered, std::array<std::string_view, 6>{"lfm2moe", "lfm2_moe", "lfm2.5", "lfm2_5", "lfm25", "lfm2"})) {
+        return make_result(DescribeModelVariant(ModelVariant::LFM2MOE));
     }
     if (MatchesAny(lowered, std::array<std::string_view, 5>{"glm4_moe", "glm4moe", "glm4.5", "glm-4.5", "glm4"})) {
         return make_result(DescribeModelVariant(ModelVariant::GLM4_MOE));
@@ -465,6 +478,7 @@ const char* ModelVariantName(ModelVariant variant) {
     case ModelVariant::QWEN3NEXT: return "qwen3next";
     case ModelVariant::QWEN35: return "qwen35";
     case ModelVariant::QWEN36: return "qwen36";
+    case ModelVariant::LFM2MOE: return "lfm2moe";
     case ModelVariant::GLM4_MOE: return "glm4_moe";
     case ModelVariant::GLM5_DSA: return "glm5_dsa";
     case ModelVariant::MISTRAL: return "mistral";

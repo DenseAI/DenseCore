@@ -537,6 +537,7 @@ const char* Scheduler::EmptyReasonName(SchedulerEmptyReason reason) {
     case SchedulerEmptyReason::PrefillBudgetZero: return "prefill_budget_zero";
     case SchedulerEmptyReason::ContextBucketMismatch: return "context_bucket_mismatch";
     case SchedulerEmptyReason::MaxNumSeqsReached: return "max_num_seqs_reached";
+    case SchedulerEmptyReason::MaxPrefillSeqsReached: return "max_prefill_seqs_reached";
     case SchedulerEmptyReason::MoeBudgetDeferred: return "moe_budget_deferred";
     case SchedulerEmptyReason::WaitingSeqPresentButUnschedulable: return "waiting_seq_present_but_unschedulable";
     case SchedulerEmptyReason::RunningSeqPresentButDecodeUnschedulable:

@@ -42,6 +42,7 @@ enum class SchedulerEmptyReason {
     PrefillBudgetZero,
     ContextBucketMismatch,
     MaxNumSeqsReached,
+    MaxPrefillSeqsReached,
     MoeBudgetDeferred,
     WaitingSeqPresentButUnschedulable,
     RunningSeqPresentButDecodeUnschedulable,

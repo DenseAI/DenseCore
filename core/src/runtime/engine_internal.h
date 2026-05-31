@@ -90,6 +90,7 @@ ggml_type ResolveEffectiveKVCacheType(const TransformerModel* model, ggml_type r
 size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int k_head_dim, int v_head_dim, int n_head_kv, int n_layer,
                                    int index_head_dim = 0);
 KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type);
+densecore::SchedulerConfig BuildRuntimeSchedulerConfig(const KVCacheConfig& kv_config);
 
 struct EngineState;
 void PushResultEvent(EngineState* state, int request_id, const std::string& token, int token_id, bool finished,

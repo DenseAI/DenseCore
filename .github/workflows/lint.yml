@@ -78,3 +78,25 @@ jobs:
 
       - name: Run C++ format check
         run: make format-check-cpp
+
+  qa-e2e-policy:
+    name: QA/E2E Cost Guard
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check benchmark harness syntax
+        run: |
+          bash -n \
+            benchmarks/gcp_mt_e2e.sh \
+            benchmarks/remote_llama_server_eval.sh \
+            benchmarks/remote_server_eval.sh \
+            benchmarks/run_q5_server_compare_matrix.sh
+
+      - name: Enforce cost-safe QA/E2E defaults
+        run: |
+          grep -q 'RUN_NUMA_SMOKE="${RUN_NUMA_SMOKE:-0}"' benchmarks/gcp_mt_e2e.sh
+          grep -q 'RUN_NUMA_SMOKE=0' benchmarks/gcp_mt_e2e.sh
+          ! grep -R "RUN_NUMA_SMOKE=\"\${RUN_NUMA_SMOKE:-1}\"" benchmarks/*.sh

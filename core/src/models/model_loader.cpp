@@ -1973,6 +1973,14 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 }
             }
         }
+        if (model->arch_flags.is_lfm2_shortconv) {
+            static const char* kLFM2Prefixes[] = {"lfm2moe", "lfm2"};
+            for (const char* prefix : kLFM2Prefixes) {
+                if (std::find(prefixes.begin(), prefixes.end(), prefix) == prefixes.end()) {
+                    prefixes.emplace_back(prefix);
+                }
+            }
+        }
         for (const auto& prefix : prefixes) {
             std::string key = prefix + "." + suffix;
             int idx = gguf_find_key(ctx_gguf, key.c_str());
@@ -2655,6 +2663,82 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
     }
 
+    // Load LFM2 / LFM2.5 parameters (double-gated short conv + GQA attention hybrid, MoE FFN).
+    if (model->arch_flags.is_lfm2_shortconv) {
+        const auto fail_lfm2 = [&](const std::string& reason) {
+            return fail_load("invalid LFM2 configuration: " + reason);
+        };
+
+        uint32_t tmp = static_cast<uint32_t>(model->lfm2_conv_kernel);
+        get_u32("shortconv.l_cache", tmp);
+        if (tmp == static_cast<uint32_t>(model->lfm2_conv_kernel)) get_u32("conv_L_cache", tmp);
+        model->lfm2_conv_kernel = static_cast<int>(tmp);
+
+        // Leading dense FFN blocks; remaining blocks are MoE. Reuse moe_first_k_dense_replace so the
+        // existing per-layer dense/MoE split (see expert loading below) applies unchanged.
+        tmp = 0;
+        get_u32("leading_dense_block_count", tmp);
+        if (tmp == 0) get_u32("num_dense_layers", tmp);
+        if (tmp == 0) get_u32("n_dense_layers", tmp);
+        model->lfm2_num_dense_layers = static_cast<int>(tmp);
+        if (model->moe_first_k_dense_replace <= 0) {
+            model->moe_first_k_dense_replace = model->lfm2_num_dense_layers;
+        }
+
+        if (model->lfm2_conv_kernel <= 1) {
+            return fail_lfm2("short conv kernel (conv_L_cache) must be >= 2");
+        }
+
+        // Per-layer mixer schedule: 1 = short-conv layer, 0 = full attention layer.
+        std::vector<std::string> layer_types;
+        get_str_array("layer_types", layer_types);
+        model->lfm2_layer_is_conv.assign(model->hparams.n_layer, 0);
+        if (!layer_types.empty()) {
+            if (layer_types.size() != static_cast<size_t>(model->hparams.n_layer)) {
+                return fail_lfm2("partial layer_types export");
+            }
+            for (size_t i = 0; i < static_cast<size_t>(model->hparams.n_layer); ++i) {
+                std::string type = layer_types[i];
+                std::transform(type.begin(), type.end(), type.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                const bool is_full_attn =
+                    (type == "full_attention" || type == "attention" || type == "self_attention");
+                const bool is_conv = (type == "conv" || type == "shortconv" || type == "short_conv");
+                if (!is_full_attn && !is_conv) {
+                    return fail_lfm2("unknown layer_types entry '" + layer_types[i] + "'");
+                }
+                model->lfm2_layer_is_conv[i] = is_conv ? 1 : 0;
+            }
+        } else {
+            // No explicit schedule: fall back to per-layer shortconv tensor presence.
+            for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+                const std::string prefix = "blk." + std::to_string(i) + ".";
+                const bool has_conv = gguf_find_tensor(ctx_gguf, (prefix + "shortconv.conv.weight").c_str()) != -1 ||
+                                      gguf_find_tensor(ctx_gguf, (prefix + "conv.conv.weight").c_str()) != -1;
+                model->lfm2_layer_is_conv[i] = has_conv ? 1 : 0;
+            }
+        }
+
+        int n_conv_layers = 0;
+        int n_attn_layers = 0;
+        for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+            if (model->lfm2_layer_is_conv[i]) {
+                n_conv_layers++;
+            } else {
+                n_attn_layers++;
+            }
+        }
+        if (n_conv_layers == 0 || n_attn_layers == 0) {
+            return fail_lfm2("schedule must contain both short-conv and full-attention layers");
+        }
+
+        std::cout << "[DenseCore] LFM2 params: conv_L_cache=" << model->lfm2_conv_kernel
+                  << " dense_layers=" << model->lfm2_num_dense_layers << " conv_layers=" << n_conv_layers
+                  << " attention_layers=" << n_attn_layers << " experts=" << model->hparams.n_experts
+                  << " experts_used=" << model->hparams.n_experts_used
+                  << " rope_freq_base=" << model->hparams.rope_freq_base << std::endl;
+    }
+
     // Load BOS/EOS token IDs from tokenizer metadata
     int idx_bos = gguf_find_key(ctx_gguf, "tokenizer.ggml.bos_token_id");
     if (idx_bos != -1) {
@@ -3239,10 +3323,27 @@ TransformerModel* LoadGGUFModel(const char* path) {
                              get_layer_tensor_any(i, {"moe_gate.weight", "router.proj.weight", "mlp.gate.weight",
                                                       "ffn_gate_inp.weight", "ffn_gate_inp"}));
 
-        // Determine if this is an SSM layer or full attention layer
+        // Determine mixer type: LFM2 short-conv, hybrid SSM, or full attention.
+        const bool is_conv = model->IsLFM2ConvLayer(static_cast<int>(i));
         const bool is_ssm = model->IsHybridSSMLayer(static_cast<int>(i));
 
-        if (is_ssm) {
+        if (is_conv) {
+            // LFM2 / LFM2.5 short-conv mixer: in_proj -> (B*x) -> depthwise causal conv -> (C*) -> out_proj
+            model->layers[i].Set(model_keys::kShortConvInProj,
+                                 get_layer_tensor_any(i, {"shortconv.in_proj.weight", "conv.in_proj.weight"}));
+            model->layers[i].Set(model_keys::kShortConvConv,
+                                 get_layer_tensor_any(i, {"shortconv.conv.weight", "conv.conv.weight"}));
+            model->layers[i].Set(model_keys::kShortConvOutProj,
+                                 get_layer_tensor_any(i, {"shortconv.out_proj.weight", "conv.out_proj.weight"}));
+            if (i == 0) {
+                auto* in_proj = model->layers[i].Get(model_keys::kShortConvInProj);
+                auto* conv = model->layers[i].Get(model_keys::kShortConvConv);
+                if (in_proj && conv) {
+                    std::cout << "[DenseCore] LFM2 short-conv layer 0: in_proj [" << in_proj->ne[0] << "x"
+                              << in_proj->ne[1] << "], conv [" << conv->ne[0] << "x" << conv->ne[1] << "]" << std::endl;
+                }
+            }
+        } else if (is_ssm) {
             // SSM/Mamba layer: fused QKV + SSM weights + gate
             struct ggml_tensor* fused_ba = get_layer_tensor_any(i, {"ssm_ba.weight", "linear_attn.in_proj_ba.weight"});
             struct ggml_tensor* ssm_alpha =
@@ -3393,6 +3494,12 @@ TransformerModel* LoadGGUFModel(const char* path) {
         if (!layer.Get(model_keys::kMoeCorrectionBias)) {
             layer.Set(model_keys::kMoeCorrectionBias,
                       find_layer_tensor_with_tokens(layer, {"e_score_correction_bias"}));
+        }
+        if (!layer.Get(model_keys::kMoeCorrectionBias)) {
+            // LFM2 / LFM2.5 (use_expert_bias): aux-loss-free routing bias exported on the router gate.
+            auto* t = get_layer_tensor_any(static_cast<int>(i), {"ffn_gate_inp.bias", "exp_probs_b.bias"});
+            if (!t) t = find_layer_tensor_with_tokens(layer, {"expert_bias"});
+            layer.Set(model_keys::kMoeCorrectionBias, t);
         }
 
         const struct ggml_tensor* packed_gate_up =
@@ -3907,6 +4014,65 @@ TransformerModel* LoadGGUFModel(const char* path) {
     std::cout << "[DenseCore] Head dimensions: n_embd_head_k=" << model->hparams.n_embd_head_k
               << ", n_embd_head_v=" << model->hparams.n_embd_head_v << ", n_head=" << model->hparams.n_head
               << std::endl;
+
+    // =========================================================================
+    // Canonicalize LFM2 / LFM2.5 depthwise short-conv weights to F32.
+    //
+    // The short-conv decode custom op reads conv weights through a raw float
+    // pointer, so dequantize each conv layer's weight into [channel][tap] layout
+    // ([channel * kernel + tap]). GGUF stores the weight as [kernel x channels]
+    // or [channels x kernel]; both are normalized here.
+    // =========================================================================
+    if (model->arch_flags.is_lfm2_shortconv) {
+        const int kernel = model->lfm2_conv_kernel;
+        const int channels = static_cast<int>(model->hparams.n_embd);
+        const int n_conv = model->LFM2NumConvLayers();
+        model->lfm2_conv_weight_f32.assign(static_cast<size_t>(std::max(0, n_conv)), {});
+        auto dequant_to_f32 = [](struct ggml_tensor* t, std::vector<float>& out) -> bool {
+            out.clear();
+            if (!t) return false;
+            const int64_t n = ggml_nelements(t);
+            if (n <= 0) return false;
+            out.resize(static_cast<size_t>(n));
+            if (t->type == GGML_TYPE_F32) {
+                std::memcpy(out.data(), t->data, static_cast<size_t>(n) * sizeof(float));
+                return true;
+            }
+            const auto* traits = ggml_get_type_traits(t->type);
+            if (traits && traits->to_float) {
+                traits->to_float(t->data, out.data(), n);
+                return true;
+            }
+            out.clear();
+            return false;
+        };
+        for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+            if (!model->IsLFM2ConvLayer(static_cast<int>(i))) continue;
+            const int ordinal = model->LFM2ConvOrdinal(static_cast<int>(i));
+            struct ggml_tensor* conv_w = model->layers[i].Get(model_keys::kShortConvConv);
+            std::vector<float> raw;
+            if (!conv_w || !dequant_to_f32(conv_w, raw)) {
+                return fail_load("LFM2 layer " + std::to_string(i) + " missing/undecodable shortconv.conv.weight");
+            }
+            const bool kxc = (conv_w->ne[0] == kernel && conv_w->ne[1] == channels);
+            const bool cxk = (conv_w->ne[0] == channels && conv_w->ne[1] == kernel);
+            if (!kxc && !cxk) {
+                return fail_load("LFM2 layer " + std::to_string(i) + " shortconv.conv.weight has unexpected shape");
+            }
+            std::vector<float>& out = model->lfm2_conv_weight_f32[static_cast<size_t>(ordinal)];
+            out.assign(static_cast<size_t>(channels) * static_cast<size_t>(kernel), 0.0f);
+            for (int ch = 0; ch < channels; ++ch) {
+                for (int k = 0; k < kernel; ++k) {
+                    // raw is row-major over (ne[1], ne[0]); index accordingly for each layout.
+                    const float v = kxc ? raw[static_cast<size_t>(ch) * kernel + k]
+                                        : raw[static_cast<size_t>(k) * channels + ch];
+                    out[static_cast<size_t>(ch) * kernel + k] = v;
+                }
+            }
+        }
+        std::cout << "[DenseCore] Canonicalized " << n_conv << " LFM2 short-conv weight tensors (channels=" << channels
+                  << ", kernel=" << kernel << ")" << std::endl;
+    }
 
     // =========================================================================
     // Dequantize SSM callback tensors to F32.

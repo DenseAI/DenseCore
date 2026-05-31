@@ -2845,6 +2845,7 @@ void EngineLoop(EngineState* state) {
                     // globally on the shared model, otherwise batched execution
                     // cross-contaminates sequences and forces single-request mode.
                     EnsureRequestHybridSSMRuntimeState(current_model, req);
+                    EnsureRequestLFM2RuntimeState(current_model, req);
                     InitializeRequestPrefixCacheState(req, current_model);
                     LogDeterminismBoundary("after_tokenization", req, current_model,
                                            /*prefix_cache_allowed=*/req->prefix_cache_allowed,
@@ -4347,7 +4348,9 @@ void EngineLoop(EngineState* state) {
                     reset_cached_graph_runtime_context(it->second.work_ctx.get());
                     if (DoesDecodeGraphCacheRequireRuntimeRebind(current_model)) {
                         const auto rebind_begin = std::chrono::steady_clock::now();
-                        rebind_ok = RebindHybridSSMDecodeGraphRuntimeState(it->second.graph, batch);
+                        rebind_ok = current_model->arch_flags.is_lfm2_shortconv
+                                        ? RebindLFM2DecodeGraphRuntimeState(it->second.graph, batch)
+                                        : RebindHybridSSMDecodeGraphRuntimeState(it->second.graph, batch);
                         graph_runtime_rebind_ns +=
                             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                       std::chrono::steady_clock::now() - rebind_begin)
@@ -4486,7 +4489,9 @@ void EngineLoop(EngineState* state) {
                                 if (cache_entry_admissible && DoesDecodeGraphCacheRequireRuntimeRebind(current_model)) {
                                     const auto rebind_begin = std::chrono::steady_clock::now();
                                     const bool rebind_ok =
-                                        RebindHybridSSMDecodeGraphRuntimeState(candidate.graph, batch);
+                                        current_model->arch_flags.is_lfm2_shortconv
+                                            ? RebindLFM2DecodeGraphRuntimeState(candidate.graph, batch)
+                                            : RebindHybridSSMDecodeGraphRuntimeState(candidate.graph, batch);
                                     graph_runtime_rebind_ns +=
                                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                   std::chrono::steady_clock::now() - rebind_begin)

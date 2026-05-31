@@ -99,6 +99,34 @@ dense-base:
   affinity: {}
 ```
 
+## C4/C4A LLM MVP Profiles
+
+The chart also ships reference values for the current CPU-first LLM MVP target:
+one model per pod, model weights mounted from a PVC, DenseCloud health/metrics
+contracts enabled, and KEDA driven by DenseCore inference metrics.
+
+| Profile | Use when | Values file |
+| --- | --- | --- |
+| GCP C4 Qwen3.6 35B | x86 C4 16-core Qwen3.6-35B-A3B serving | `examples/values-gcp-c4-qwen36-35b.yaml` |
+| GCP C4A Qwen3.6 35B | ARM C4A 16-core Qwen3.6-35B-A3B serving | `examples/values-gcp-c4a-qwen36-35b.yaml` |
+| GCP C4A Gemma4 26B | ARM C4A 16-core Gemma4-26B-A4B serving | `examples/values-gcp-c4a-gemma4-26b.yaml` |
+
+These files are not universal production defaults. SREs should still replace
+PVC names, image tags, node labels, ServiceMonitor labels, ingress policy, and
+KEDA thresholds with cluster-local values. They are intended to make the
+DenseCloud + DenseCore contract concrete enough to render and review before
+cluster-specific edits.
+
+Validate the source checkout with the local DenseCloud sibling chart:
+
+```bash
+scripts/helm_densecore_mvp.sh
+```
+
+The script packages `../DenseCloud/charts/dense-base` into a temporary chart
+workspace, then runs `helm lint` and `helm template` for the default chart and
+all MVP values files without dirtying the repository.
+
 ## Autoscaling
 
 For LLM inference, queue depth and active requests are usually better scaling

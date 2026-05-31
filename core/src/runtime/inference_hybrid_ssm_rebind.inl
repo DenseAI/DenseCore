@@ -84,3 +84,47 @@ bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchS
 
     return conv_rebinds > 0 && delta_rebinds > 0 && conv_rebinds == delta_rebinds;
 }
+
+// LFM2 / LFM2.5: re-point the short-conv custom ops in a cached decode graph at
+// the current batch's per-sequence conv state. Only the conv mixer carries
+// cross-token state; MoE/attention nodes are stateless across replays.
+bool RebindLFM2DecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& batch) {
+    if (!graph) {
+        return false;
+    }
+    if (batch.seq_id.empty() || batch.hybrid_ssm_runtime_states.empty()) {
+        return false;
+    }
+
+    struct Custom2ParamsView {
+        ggml_custom2_op_t fun;
+        int n_tasks;
+        void* userdata;
+    };
+    static_assert(sizeof(Custom2ParamsView) <= GGML_MAX_OP_PARAMS, "Custom2ParamsView too large");
+
+    const int* seq_ids = batch.seq_id.data();
+    const auto* runtime_states = &batch.hybrid_ssm_runtime_states;
+    int conv_rebinds = 0;
+
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor* node = ggml_graph_node(graph, i);
+        if (!node || node->op != GGML_OP_MAP_CUSTOM2) {
+            continue;
+        }
+        Custom2ParamsView params{};
+        std::memcpy(&params, node->op_params, sizeof(params));
+        if (params.fun == cb_lfm2_shortconv) {
+            auto* ud = static_cast<LFM2ShortConvUserData*>(params.userdata);
+            if (!ud) {
+                return false;
+            }
+            ud->token_seq_ids = seq_ids;
+            ud->runtime_states = runtime_states;
+            conv_rebinds++;
+        }
+    }
+
+    return conv_rebinds > 0;
+}

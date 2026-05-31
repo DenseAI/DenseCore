@@ -154,6 +154,35 @@ TEST(SchedulerArchitecture, PrefillSeqLimitSerializesWaitingPrefillWithoutLoweri
     EXPECT_TRUE(decode.prefill_seq_ids.empty());
 }
 
+TEST(SchedulerArchitecture, TwoPrefillSeqsCanRunTogetherWhenRuntimeConfigAdmitsThem) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = true;
+    cfg.max_num_seqs = 2;
+    cfg.max_prefill_seqs = 2;
+    cfg.max_prefill_tokens = 16;
+    cfg.max_num_batched_tokens = 32;
+
+    BlockManager block_manager(/*num_blocks=*/512, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    const int seq_a = scheduler.AddRequest(/*request_id=*/103, /*prompt_len=*/8, /*max_output_len=*/32);
+    const int seq_b = scheduler.AddRequest(/*request_id=*/104, /*prompt_len=*/8, /*max_output_len=*/32);
+    ASSERT_GT(seq_a, 0);
+    ASSERT_GT(seq_b, 0);
+
+    SchedulerOutput first = scheduler.Schedule();
+    ASSERT_EQ(first.prefill_seq_ids.size(), 2u);
+    EXPECT_EQ(first.prefill_seq_ids[0], seq_a);
+    EXPECT_EQ(first.prefill_seq_ids[1], seq_b);
+    EXPECT_EQ(first.num_prefill_tokens, 16);
+    EXPECT_TRUE(first.decode_seq_ids.empty());
+}
+
+TEST(SchedulerArchitecture, PrefillSeqLimitHasDedicatedDiagnosticReason) {
+    EXPECT_STREQ(Scheduler::EmptyReasonName(SchedulerEmptyReason::MaxPrefillSeqsReached),
+                 "max_prefill_seqs_reached");
+}
+
 TEST(SchedulerArchitecture, DoesNotMixPrefillAndDecodeInSingleStep) {
     BlockManager block_manager(/*num_blocks=*/256, BLOCK_SIZE);
     Scheduler scheduler(&block_manager, MakeTestConfig());

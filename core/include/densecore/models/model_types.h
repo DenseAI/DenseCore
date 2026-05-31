@@ -46,6 +46,9 @@ enum class ModelArch : uint8_t {
     // Hybrid SSM-Transformer Architectures
     QWEN35,  // Qwen3.5 (Mamba2 SSM + Attention hybrid)
 
+    // Hybrid Conv-Transformer Architectures
+    LFM2,  // LFM2 / LFM2.5 (double-gated short conv + GQA attention, MoE FFN)
+
     // Multimodal Architectures
     LLAVA,    // LLaVA (LLM + Vision)
     QWEN_VL,  // Qwen-VL (LLM + Vision)
@@ -59,6 +62,7 @@ enum class ModelVariant : uint8_t {
     QWEN3NEXT,
     QWEN35,
     QWEN36,
+    LFM2MOE,
     GLM4_MOE,
     GLM5_DSA,
     MISTRAL,
@@ -80,6 +84,7 @@ struct ModelArchFlags {
     bool requires_q_norm = false;            // Qwen3: RMS norm on Q before attention
     bool requires_k_norm = false;            // Qwen3: RMS norm on K before attention
     bool is_hybrid_ssm = false;              // Qwen3.5: Mamba2 SSM + Attention hybrid
+    bool is_lfm2_shortconv = false;          // LFM2/LFM2.5: double-gated short conv + GQA attention hybrid
     bool is_glm_moe = false;                 // GLM-4.5/5: grouped MoE routing + shared experts
     bool is_glm_dsa = false;                 // GLM-5: MLA + DSA attention path
     bool is_gemma4 = false;                  // Gemma4: alternate KV-head metadata and MoE routing
@@ -218,6 +223,10 @@ static constexpr const char* kSSMBeta = "ssm_beta.weight";    // secondary proje
 static constexpr const char* kSSMDtBias = "ssm_dt.bias";
 static constexpr const char* kSSMNorm = "ssm_norm.weight";
 static constexpr const char* kSSMOut = "ssm_out.weight";
+// LFM2 / LFM2.5 short-conv layer keys (double-gated short convolution mixer)
+static constexpr const char* kShortConvInProj = "shortconv_in_proj.weight";
+static constexpr const char* kShortConvConv = "shortconv_conv.weight";
+static constexpr const char* kShortConvOutProj = "shortconv_out_proj.weight";
 static constexpr const char* kAttnGate = "attn_gate.weight";
 static constexpr const char* kPostAttnNorm = "post_attention_norm.weight";
 static constexpr const char* kAttnRopeFreqs = "rope_freqs.weight";
@@ -487,6 +496,33 @@ struct TransformerModel {
     // When absent, runtime falls back to the legacy modulo-based interval rule.
     std::vector<uint8_t> hybrid_layer_is_ssm;
 
+    // LFM2 / LFM2.5 parameters (populated when arch_flags.is_lfm2_shortconv = true)
+    int lfm2_conv_kernel = 3;       // conv_L_cache: short causal depthwise conv kernel size
+    int lfm2_num_dense_layers = 0;  // leading layers using dense FFN; remaining layers are MoE
+    // Per-layer mask (1 = short-conv mixer layer, 0 = full attention layer). Derived from GGUF
+    // layer_types metadata or from per-layer shortconv tensor presence at load time.
+    std::vector<uint8_t> lfm2_layer_is_conv;
+    // Canonical f32 depthwise conv weights for each short-conv layer, indexed by conv-layer
+    // ordinal (NOT physical layer index). Layout per entry: [channel * lfm2_conv_kernel + tap].
+    std::vector<std::vector<float>> lfm2_conv_weight_f32;
+
+    // Returns the conv-layer ordinal (position among short-conv layers) for a physical layer, or -1.
+    int LFM2ConvOrdinal(int layer_idx) const {
+        if (!IsLFM2ConvLayer(layer_idx)) return -1;
+        int ordinal = 0;
+        for (int i = 0; i < layer_idx; ++i) {
+            if (i < static_cast<int>(lfm2_layer_is_conv.size()) && lfm2_layer_is_conv[static_cast<size_t>(i)]) {
+                ++ordinal;
+            }
+        }
+        return ordinal;
+    }
+    int LFM2NumConvLayers() const {
+        int n = 0;
+        for (uint8_t v : lfm2_layer_is_conv) n += (v != 0) ? 1 : 0;
+        return n;
+    }
+
     // Gemma4 encodes per-layer KV-head counts in GGUF metadata.
     // The runtime uses this when present to derive layer-local attention head
     // shapes instead of collapsing everything to a single global scalar.
@@ -582,6 +618,17 @@ struct TransformerModel {
             return hybrid_layer_is_ssm[static_cast<size_t>(layer_idx)] != 0;
         }
         return layer_idx % ssm_full_attn_interval != ssm_full_attn_interval - 1;
+    }
+
+    // Returns true if `layer_idx` is an LFM2 short-conv mixer layer (vs. a full attention layer).
+    bool IsLFM2ConvLayer(int layer_idx) const {
+        if (!arch_flags.is_lfm2_shortconv || layer_idx < 0 || layer_idx >= static_cast<int>(hparams.n_layer)) {
+            return false;
+        }
+        if (layer_idx < static_cast<int>(lfm2_layer_is_conv.size())) {
+            return lfm2_layer_is_conv[static_cast<size_t>(layer_idx)] != 0;
+        }
+        return false;
     }
 
     // Vision model parameters (populated when arch is VIT, CLIP_VISION, etc.)

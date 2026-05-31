@@ -8,6 +8,8 @@
 #include <immintrin.h>
 #endif
 
+#include "densecore/models/lfm2_shortconv_math.h"
+
 MoEUserData* AllocateMoEUserData(struct ggml_context* ctx_c) {
     if (!ctx_c) {
         return nullptr;
@@ -2292,6 +2294,54 @@ void cb_ssm_conv1d_custom(struct ggml_tensor* dst, int ith, int nth, void* userd
         return;
     }
     cb_ssm_conv1d(dst, dst->src[0], ith, nth, userdata);
+}
+
+// LFM2 / LFM2.5 double-gated short-conv mixer custom op (ggml_map_custom2 form).
+//   dst : [channels, N]  (shape donor; written here)
+//   a   : shape donor (unused content)
+//   b   : packed BCx projection [3*channels, N]
+// Per-sequence conv state lives in SSMSequenceRuntimeState.conv_state, indexed
+// by conv-layer ordinal. Single-task (the conv is cheap vs. the projections).
+static void cb_lfm2_shortconv(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
+                              int ith, int nth, void* userdata) {
+    (void)a;
+    (void)nth;
+    if (ith != 0) return;  // single-task kernel
+    auto* ud = static_cast<LFM2ShortConvUserData*>(userdata);
+    if (!ud || !dst || !b || !ud->conv_weight) return;
+    const float* bcx = reinterpret_cast<const float*>(b->data);
+    float* out = reinterpret_cast<float*>(dst->data);
+    if (!bcx || !out) return;
+
+    const int channels = ud->channels;
+    const int kernel = ud->kernel;
+    if (channels <= 0 || kernel <= 1) return;
+    const int N = static_cast<int>(b->ne[1]);
+    const ptrdiff_t in_stride = static_cast<ptrdiff_t>(b->nb[1] / sizeof(float));
+    const ptrdiff_t out_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
+    const size_t conv_state_elems = densecore::models::LFM2ShortConvStateElements(channels, kernel);
+    const densecore::models::LFM2ShortConvConfig cfg{channels, kernel};
+
+    for (int t = 0; t < N; ++t) {
+        float* conv_state = nullptr;
+        if (ud->runtime_states && ud->token_seq_ids && ud->conv_ordinal >= 0) {
+            const int seq_idx = ud->token_seq_ids[t];
+            if (seq_idx >= 0 && seq_idx < static_cast<int>(ud->runtime_states->size())) {
+                auto* seq_states = (*ud->runtime_states)[static_cast<size_t>(seq_idx)];
+                if (seq_states && ud->conv_ordinal < static_cast<int>(seq_states->size())) {
+                    auto& st = (*seq_states)[static_cast<size_t>(ud->conv_ordinal)].conv_state;
+                    if (st.size() >= conv_state_elems) {
+                        conv_state = st.data();
+                    }
+                }
+            }
+        }
+        if (!conv_state) continue;  // missing per-seq state: leave output untouched
+
+        const float* col = bcx + static_cast<ptrdiff_t>(t) * in_stride;
+        densecore::models::LFM2ShortConvStep(cfg, /*b=*/col, /*c=*/col + channels, /*x=*/col + 2 * channels,
+                                             ud->conv_weight, conv_state, out + static_cast<ptrdiff_t>(t) * out_stride);
+    }
 }
 
 void cb_ssm_qwen35_delta_qkv_only(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,

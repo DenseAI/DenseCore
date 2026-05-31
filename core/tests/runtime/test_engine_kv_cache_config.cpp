@@ -232,7 +232,7 @@ TEST(EngineKVCacheConfig, AutoKVTargetUsesAvailableMemoryWhenNoEnvTargetIsSet) {
     EXPECT_LE(config.max_seq_len, model.hparams.n_ctx);
 }
 
-TEST(EngineKVCacheConfig, LargeHybridSsmDefaultsToTwoWeightSharedSequences) {
+TEST(EngineKVCacheConfig, LargeHybridSsmDefaultsToFourConcurrentSequences) {
     ScopedEnvVar target_mb("DENSECORE_KV_TARGET_MB", "4096");
     ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "8192");
     ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", nullptr);
@@ -245,8 +245,8 @@ TEST(EngineKVCacheConfig, LargeHybridSsmDefaultsToTwoWeightSharedSequences) {
 
     const KVCacheConfig config = ComputeKVCacheConfig(&model, GGML_TYPE_F16);
 
-    EXPECT_EQ(config.max_num_seqs, 2)
-        << "Large 35B-class hybrid-SSM serving should reserve KV for c=2 by default instead of over-reserving c=4";
+    EXPECT_EQ(config.max_num_seqs, 4)
+        << "Large 35B-class hybrid-SSM serving should default to pod-level concurrency instead of serial c=2 admission";
 }
 
 TEST(EngineKVCacheConfig, ExplicitMaxNumSeqsOverridesLargeModelDefault) {
@@ -297,6 +297,20 @@ TEST(EngineKVCacheConfig, AutoKVTargetKeepsLargeGemma4ContextUsableWithoutEnvOve
         << "Large Gemma4 models should derive usable long-context capacity from current memory and bytes/token "
            "instead of requiring a model-specific DENSECORE_MAX_SEQ_LEN override";
     EXPECT_LE(config.max_seq_len, model.hparams.n_ctx);
+}
+
+TEST(EngineKVCacheConfig, RuntimeSchedulerConfigRaisesActiveSeqsButKeepsPrefillSerial) {
+    KVCacheConfig kv_config;
+    kv_config.max_num_seqs = 4;
+    kv_config.max_seq_len = 4096;
+
+    const densecore::SchedulerConfig scheduler_config = BuildRuntimeSchedulerConfig(kv_config);
+
+    EXPECT_EQ(scheduler_config.max_num_seqs, 4);
+    EXPECT_EQ(scheduler_config.max_prefill_seqs, 1);
+    EXPECT_TRUE(scheduler_config.enable_mixed_prefill_decode);
+    EXPECT_GT(scheduler_config.max_mixed_prefill_tokens, 0);
+    EXPECT_LE(scheduler_config.max_mixed_prefill_tokens, scheduler_config.max_prefill_tokens);
 }
 
 TEST(EngineKVCacheConfig, ExplicitKVTargetStillActsAsOverride) {

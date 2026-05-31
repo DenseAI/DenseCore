@@ -480,7 +480,7 @@ bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model) {
 }
 
 bool DoesDecodeGraphCacheRequireRuntimeRebind(const TransformerModel* model) {
-    return model && model->arch_flags.is_hybrid_ssm;
+    return model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_lfm2_shortconv);
 }
 
 bool IsDecodeGraphCacheDebugValidationEnabled() {
@@ -1114,6 +1114,41 @@ void EnsureRequestHybridSSMRuntimeState(TransformerModel* model, Request* req) {
         if (state.conv_state.size() != expected_conv || state.ssm_state.size() != expected_ssm ||
             !state.MatchesShape(conv_channels, model->ssm_conv_kernel, model->ssm_time_step_rank, head_dim,
                                 model->ssm_state_size)) {
+            reinit_all();
+            return;
+        }
+        state.Reset();
+    }
+}
+
+void EnsureRequestLFM2RuntimeState(TransformerModel* model, Request* req) {
+    if (!model || !req || !model->arch_flags.is_lfm2_shortconv) {
+        return;
+    }
+
+    // LFM2 short-conv layers only carry a conv-state ring (no SSM recurrent
+    // state). Reuse the per-request SSMSequenceRuntimeState container, sized to
+    // the number of conv layers and indexed by conv-layer ordinal. conv_channels
+    // == hidden size; the ssm_state buffer is left empty (n_heads/dims = 0).
+    const int conv_channels = static_cast<int>(model->hparams.n_embd);
+    const int kernel = model->lfm2_conv_kernel;
+    const size_t n_conv_layers = static_cast<size_t>(model->LFM2NumConvLayers());
+    const size_t expected_conv =
+        TransformerModel::SSMSequenceRuntimeState::ExpectedConvStateElements(conv_channels, kernel);
+
+    const auto reinit_all = [&]() {
+        req->ssm_runtime_states.resize(n_conv_layers);
+        for (auto& state : req->ssm_runtime_states) {
+            state.Init(conv_channels, kernel, /*n_heads=*/0, /*head_dim=*/0, /*d_state=*/0);
+        }
+    };
+
+    if (req->ssm_runtime_states.size() != n_conv_layers) {
+        reinit_all();
+        return;
+    }
+    for (auto& state : req->ssm_runtime_states) {
+        if (state.conv_state.size() != expected_conv || !state.ssm_state.empty()) {
             reinit_all();
             return;
         }

@@ -264,7 +264,7 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         }
         if (output.prefill_seq_ids.size() >= static_cast<size_t>(std::max(1, config_.max_prefill_seqs))) {
             if (blocked_reason == SchedulerEmptyReason::None) {
-                blocked_reason = SchedulerEmptyReason::MaxNumSeqsReached;
+                blocked_reason = SchedulerEmptyReason::MaxPrefillSeqsReached;
                 diagnostic_seq_id = group.sequence_ids.empty() ? -1 : group.sequence_ids[0];
             }
             still_waiting.push_back(group);

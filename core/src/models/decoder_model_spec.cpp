@@ -43,6 +43,12 @@ DecoderMoERouter ResolveMoERouter(const TransformerModel* model, const Transform
     if (model && (model->arch_flags.is_glm_moe || model->arch_flags.is_glm_dsa)) {
         return DecoderMoERouter::GroupedSigmoidTopK;
     }
+    if (model && model->arch_flags.is_lfm2_shortconv) {
+        // LFM2 / LFM2.5 (use_expert_bias): sigmoid scores + additive expert bias for
+        // selection, then norm_topk. With n_group=1 the grouped-sigmoid router reduces
+        // to exactly this aux-loss-free routing.
+        return DecoderMoERouter::GroupedSigmoidTopK;
+    }
     return DecoderMoERouter::SoftmaxTopK;
 }
 
