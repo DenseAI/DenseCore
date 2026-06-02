@@ -178,6 +178,34 @@ TEST(SchedulerArchitecture, TwoPrefillSeqsCanRunTogetherWhenRuntimeConfigAdmitsT
     EXPECT_TRUE(first.decode_seq_ids.empty());
 }
 
+TEST(SchedulerArchitecture, ParallelPrefillUsesBoundedPerSequenceChunks) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = true;
+    cfg.max_num_seqs = 4;
+    cfg.max_prefill_seqs = 4;
+    cfg.max_prefill_tokens = 2048;
+    cfg.max_num_batched_tokens = 2048;
+    cfg.max_parallel_prefill_chunk_tokens = 128;
+
+    BlockManager block_manager(/*num_blocks=*/4096, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    std::vector<int> seqs;
+    for (int i = 0; i < 4; ++i) {
+        const int seq = scheduler.AddRequest(/*request_id=*/200 + i, /*prompt_len=*/425, /*max_output_len=*/32);
+        ASSERT_GT(seq, 0);
+        seqs.push_back(seq);
+    }
+
+    SchedulerOutput first = scheduler.Schedule();
+    ASSERT_EQ(first.prefill_seq_ids.size(), 4u);
+    ASSERT_EQ(first.prefill_chunk_info.size(), 4u);
+    EXPECT_EQ(first.num_prefill_tokens, 512);
+    for (const auto& chunk : first.prefill_chunk_info) {
+        EXPECT_EQ(chunk.chunk_tokens, 128);
+    }
+}
+
 TEST(SchedulerArchitecture, PrefillSeqLimitHasDedicatedDiagnosticReason) {
     EXPECT_STREQ(Scheduler::EmptyReasonName(SchedulerEmptyReason::MaxPrefillSeqsReached),
                  "max_prefill_seqs_reached");

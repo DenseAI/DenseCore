@@ -26,6 +26,9 @@ Scheduler::Scheduler(BlockManager* block_manager, const SchedulerConfig& config)
                                                     config_.max_prefill_tokens));
     config_.max_prefill_seqs = std::max(
         1, scheduler_internal::ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_PREFILL_SEQS"), config_.max_prefill_seqs));
+    config_.max_parallel_prefill_chunk_tokens =
+        std::max(1, scheduler_internal::ParseEnvInt(std::getenv("DENSECORE_SCHED_MAX_PARALLEL_PREFILL_CHUNK_TOKENS"),
+                                                    config_.max_parallel_prefill_chunk_tokens));
     decode_homogeneous_batch_n_past_ =
         scheduler_internal::ParseEnvBool(std::getenv("DENSECORE_SCHED_DECODE_HOMOGENEOUS_N_PAST"),
                                          /*default_value=*/false);
@@ -45,6 +48,8 @@ Scheduler::Scheduler(BlockManager* block_manager, const SchedulerConfig& config)
                    0.0f, 1.0f);
     config_.max_prefill_tokens = std::min(config_.max_prefill_tokens, std::max(1, config_.max_num_batched_tokens));
     config_.max_prefill_seqs = std::min(config_.max_prefill_seqs, std::max(1, config_.max_num_seqs));
+    config_.max_parallel_prefill_chunk_tokens =
+        std::min(config_.max_parallel_prefill_chunk_tokens, config_.max_prefill_tokens);
 }
 
 int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, int priority,

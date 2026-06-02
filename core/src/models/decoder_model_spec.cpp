@@ -75,6 +75,9 @@ DecoderPrefillLogitsPolicy ResolvePrefillLogitsPolicy(const TransformerModel* mo
     if (model->arch_flags.is_gemma4) {
         return DecoderPrefillLogitsPolicy::LastTokenForMoE;
     }
+    if (model->arch_flags.is_lfm2_shortconv) {
+        return DecoderPrefillLogitsPolicy::LastTokenForMoE;
+    }
     return DecoderPrefillLogitsPolicy::FullSequence;
 }
 

@@ -155,6 +155,10 @@ struct SchedulerConfig {
     bool enable_chunked_prefill = true;
     int max_prefill_tokens = 2048;  // Max prefill tokens per iteration
     int max_prefill_seqs = 256;     // Max prefill sequences per iteration
+    // Per-sequence chunk cap used only when more than one prefill can be
+    // admitted in the same scheduler step. This keeps parallel prefill graph
+    // shapes bounded without slowing the single-request long-prefill path.
+    int max_parallel_prefill_chunk_tokens = 128;
     // Optional mixed-phase mode: when enabled, decode-first iterations may admit
     // a bounded prefill chunk into the same batch if the decode context bucket is
     // homogeneous. This reduces long-prompt head-of-line blocking without

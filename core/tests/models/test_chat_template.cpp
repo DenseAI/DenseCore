@@ -103,6 +103,48 @@ TEST(ChatTemplateTest, Qwen35CanonicalRenderKeepsNoThinkingAssistantScaffold) {
               "<think>\n\n</think>\n\n");
 }
 
+TEST(ChatTemplateTest, LFM2AutoTemplateUsesStartOfTextChatMLGenerationPrompt) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+
+    EXPECT_EQ(wrapped,
+              "<|startoftext|>"
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n");
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+}
+
+TEST(ChatTemplateTest, LFM2CanonicalRenderUsesStartOfTextChatMLGenerationPrompt) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    densecore::models::CanonicalChatMessage message;
+    message.role = "user";
+    message.content = "hello";
+
+    const std::string rendered = densecore::models::RenderModelChatMessages(
+        &model, {message}, densecore::models::CanonicalChatRenderOptions{});
+
+    EXPECT_EQ(rendered,
+              "<|startoftext|>"
+              "<|im_start|>system\n"
+              "You are a direct answer engine. Output only the final answer requested by the user. Do not quote, "
+              "paraphrase, explain, analyze, or mention the request.<|im_end|>\n"
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n");
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(rendered));
+}
+
 TEST(ChatTemplateTest, Qwen3DefaultsToThinkingWhenEnvIsUnset) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN3;

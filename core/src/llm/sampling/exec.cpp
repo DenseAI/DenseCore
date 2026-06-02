@@ -503,6 +503,86 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         return token;
     }
 
+    const bool trace_enabled = ShouldCaptureSamplingDebugTrace(params);
+    const bool greedy_repetition_only =
+        params.temperature <= 0.0f && params.grammar == nullptr && has_history && params.repetition_penalty != 1.0f &&
+        params.frequency_penalty == 0.0f && params.presence_penalty == 0.0f && params.final_logit_softcap <= 0.0f &&
+        debug_top_n <= 0 && !trace_enabled;
+    if (greedy_repetition_only) {
+        thread_local std::vector<int> repeated_tokens;
+        repeated_tokens.clear();
+        repeated_tokens.reserve(params.token_history->size());
+        for (int token : *params.token_history) {
+            if (token >= range_start && token < range_end) {
+                repeated_tokens.push_back(token);
+            }
+        }
+        std::sort(repeated_tokens.begin(), repeated_tokens.end());
+
+        int best_idx = range_start;
+        float best_val = -INFINITY;
+        bool found = false;
+        size_t repeat_pos = 0;
+        const bool unrestricted_allow = !params.allowed_token_ids || params.allowed_token_ids->empty();
+        const auto* disallowed = params.disallowed_token_ids;
+        const bool unrestricted = unrestricted_allow && (!disallowed || disallowed->empty());
+        size_t disallowed_pos = 0;
+        if (unrestricted_allow && disallowed && !disallowed->empty()) {
+            disallowed_pos = static_cast<size_t>(std::lower_bound(disallowed->begin(), disallowed->end(), range_start) -
+                                                 disallowed->begin());
+        }
+        for (int token_id = range_start; token_id < range_end; ++token_id) {
+            bool blocked = false;
+            if (!unrestricted) {
+                if (unrestricted_allow && disallowed && !disallowed->empty()) {
+                    while (disallowed_pos < disallowed->size() && (*disallowed)[disallowed_pos] < token_id) {
+                        ++disallowed_pos;
+                    }
+                    blocked = disallowed_pos < disallowed->size() && (*disallowed)[disallowed_pos] == token_id;
+                } else {
+                    blocked = is_disallowed(token_id) || !is_allowed(token_id);
+                }
+            }
+            if (blocked) {
+                continue;
+            }
+
+            float v = last_logits[token_id];
+            if (!std::isfinite(v)) {
+                continue;
+            }
+            while (repeat_pos < repeated_tokens.size() && repeated_tokens[repeat_pos] < token_id) {
+                ++repeat_pos;
+            }
+            if (repeat_pos < repeated_tokens.size() && repeated_tokens[repeat_pos] == token_id) {
+                size_t repeat_end = repeat_pos + 1;
+                while (repeat_end < repeated_tokens.size() && repeated_tokens[repeat_end] == token_id) {
+                    ++repeat_end;
+                }
+                const size_t count = repeat_end - repeat_pos;
+                for (size_t rep = 0; rep < count; ++rep) {
+                    if (v < 0.0f) {
+                        v *= params.repetition_penalty;
+                    } else {
+                        v /= params.repetition_penalty;
+                    }
+                }
+                repeat_pos = repeat_end;
+            }
+            if (!std::isfinite(v)) {
+                continue;
+            }
+            if (!found || v > best_val || (v == best_val && token_id < best_idx)) {
+                best_val = v;
+                best_idx = token_id;
+                found = true;
+            }
+        }
+        const int token = found ? best_idx : first_allowed_token();
+        debug_log_sample(token);
+        return token;
+    }
+
     thread_local std::vector<float> working_logits;
     const bool requires_working_logits = params.grammar && params.vocab;
     if (requires_working_logits) {

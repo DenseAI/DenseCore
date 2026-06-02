@@ -46,6 +46,25 @@ TEST(ModelDescriptorTest, PlainGemmaHintsDoNotMisclassifyModel) {
     EXPECT_FALSE(resolved.arch_flags.is_gemma4);
 }
 
+TEST(ModelDescriptorTest, ResolveLFM2AliasMarksShortConvAndTokenizer) {
+    for (const char* alias : {"lfm2moe", "lfm2_moe", "lfm2.5", "lfm2"}) {
+        const auto resolved = densecore::models::ResolveModelDescriptor(alias);
+        ASSERT_TRUE(resolved.known) << alias;
+        EXPECT_EQ(resolved.arch, ModelArch::LFM2) << alias;
+        EXPECT_EQ(resolved.variant, ModelVariant::LFM2MOE) << alias;
+        EXPECT_TRUE(resolved.arch_flags.is_lfm2_shortconv) << alias;
+        EXPECT_TRUE(resolved.arch_flags.requires_q_norm) << alias;
+        EXPECT_TRUE(resolved.arch_flags.requires_k_norm) << alias;
+        EXPECT_FALSE(resolved.arch_flags.is_hybrid_ssm) << alias;
+    }
+    EXPECT_EQ(densecore::models::DescribeModelVariant(ModelVariant::LFM2MOE).tokenizer_family,
+              densecore::models::TokenizerFamily::LFM2_BYTE_BPE);
+    EXPECT_EQ(densecore::models::ResolveTokenizerFamilyFromMetadata("lfm2"),
+              densecore::models::TokenizerFamily::LFM2_BYTE_BPE);
+    EXPECT_EQ(densecore::models::ResolvePromptTemplateFamilyFromMetadata("lfm2", ""),
+              densecore::models::PromptTemplateFamily::CHATML);
+}
+
 TEST(ModelDescriptorTest, ResolveQwen35AliasMarksHybridSSM) {
     const auto resolved = densecore::models::ResolveModelDescriptor("qwen3_5_moe_text");
 

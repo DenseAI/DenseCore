@@ -222,6 +222,39 @@ TEST(WorkerResultDispatchTest, DecodeSummaryIncludesQ5MoeTelemetry) {
               std::string::npos);
 }
 
+TEST(WorkerResultDispatchTest, LFM2DecodeSummaryIncludesDedicatedFastPathAliases) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_lfm2_shortconv = true;
+    model.hparams.n_experts = 32;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.native_moe_fast_decode_used_ops = 5;
+    req.native_moe_fast_decode_w1w3_used_ops = 2;
+    req.native_moe_fast_decode_w2_used_ops = 3;
+    req.native_moe_fast_w1w3_used_ops = 2;
+    req.native_moe_fast_w2_used_ops = 3;
+    req.qwen35_moe_forward_calls = 1;
+    req.qwen35_moe_path = "native_graph";
+    req.qwen35_moe_w1w3_weight_type_hist[0] = 2;
+    req.qwen35_moe_w2_weight_type_hist[0] = 3;
+    req.ssm_conv1d_calls = 4;
+    req.graph_cache_miss_count = 1;
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("[LFM2DecodeSummary]"), std::string::npos);
+    EXPECT_NE(captured.find("lfm2_native_moe_decode_used_ops=5"), std::string::npos);
+    EXPECT_NE(captured.find("lfm2_w1w3_q4k_repacked_used_ops=2"), std::string::npos);
+    EXPECT_NE(captured.find("lfm2_w2_q4k_repacked_used_ops=3"), std::string::npos);
+    EXPECT_NE(captured.find("lfm2_shortconv_sequence_fast_used_ops=4"), std::string::npos);
+    EXPECT_NE(captured.find("lfm2_decode_graph_rebuilds=1"), std::string::npos);
+}
+
 TEST(WorkerResultDispatchTest, DecodeSummaryTagsQwen36AndGemma4Variants) {
     struct Case {
         ModelArch arch;

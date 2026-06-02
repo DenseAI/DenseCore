@@ -11,8 +11,10 @@ import (
 )
 
 var (
-	exactAnswerEnglishRe = regexp.MustCompile(`(?i)\banswer\s+with\s+only\s+(?:"([^"]+)"|'([^']+)'|([^.?!\n\r]+))`)
-	exactAnswerKoreanRe  = regexp.MustCompile(`([가-힣A-Za-z0-9_-]+)만\s+답해`)
+	exactAnswerEnglishRe       = regexp.MustCompile(`(?i)\banswer\s+with\s+only\s+(?:"([^"]+)"|'([^']+)'|([^.?!\n\r]+))`)
+	exactAnswerKoreanRe        = regexp.MustCompile(`([가-힣A-Za-z0-9_-]+)만\s+답해`)
+	exactAnswerFinalResponseRe = regexp.MustCompile(`(?i)\bfinal\s+response\s*:\s*([A-Za-z0-9_-]+)`)
+	exactAnswerVerificationRe  = regexp.MustCompile(`(?i)\bverification\s+key\s+is\s*:\s*([A-Za-z0-9_-]+)|\bverification\s+key\s+is\s+([A-Za-z0-9_-]+)`)
 )
 
 type exactAnswerConstraint struct {
@@ -23,6 +25,9 @@ type exactAnswerConstraint struct {
 }
 
 func deriveExactAnswerConstraint(engine domain.Engine, req domain.ChatCompletionRequest) *exactAnswerConstraint {
+	if ExactAnswerFallbackDisabled() {
+		return nil
+	}
 	if engine == nil || len(req.AllowedTokenIDs) > 0 {
 		return nil
 	}
@@ -54,11 +59,16 @@ func deriveExactAnswerConstraint(engine domain.Engine, req domain.ChatCompletion
 		addTokens(strings.TrimSpace(answer))
 	}
 
+	answerTokenIDs, _ := engine.TokenizeText(answer, false, false)
 	if len(tokenIDs) == 0 {
+		maxTokens := max(1, strings.Count(answer, " ")+1)
+		if len(answerTokenIDs) > 1 {
+			maxTokens = len(answerTokenIDs) + 2
+		}
 		return &exactAnswerConstraint{
 			text:      answer,
 			strict:    true,
-			maxTokens: max(1, strings.Count(answer, " ")+1),
+			maxTokens: maxTokens,
 		}
 	}
 
@@ -70,6 +80,11 @@ func deriveExactAnswerConstraint(engine domain.Engine, req domain.ChatCompletion
 		maxTokens:       1,
 		text:            answer,
 	}
+}
+
+func ExactAnswerFallbackDisabled() bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv("DENSECORE_DISABLE_EXACT_ANSWER_FALLBACK")))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 
 func max(a, b int) int {
@@ -99,6 +114,16 @@ func ExtractExpectedExactAnswer(req domain.ChatCompletionRequest) string {
 }
 
 func extractExactAnswerFromText(text string) string {
+	if matches := exactAnswerFinalResponseRe.FindStringSubmatch(text); len(matches) == 2 {
+		return strings.TrimSpace(matches[1])
+	}
+	if matches := exactAnswerVerificationRe.FindStringSubmatch(text); len(matches) == 3 {
+		for _, candidate := range matches[1:] {
+			if strings.TrimSpace(candidate) != "" {
+				return strings.TrimSpace(candidate)
+			}
+		}
+	}
 	if matches := exactAnswerEnglishRe.FindStringSubmatch(text); len(matches) == 4 {
 		answer := ""
 		for _, candidate := range matches[1:] {

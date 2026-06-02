@@ -244,6 +244,7 @@ func (m *MockEngine) CancelRequest(reqID uintptr) {}
 type MockModelService struct {
 	engine          *MockEngine
 	modelName       string
+	modelRoot       string
 	lastLoadMain    string
 	lastLoadDraft   string
 	lastLoadThreads int
@@ -265,7 +266,11 @@ func (m *MockModelService) GetCurrentModel() string {
 }
 
 func (m *MockModelService) GetModelIdentity() (string, string, string) {
-	return m.modelName, "test", m.modelName
+	root := m.modelRoot
+	if root == "" {
+		root = m.modelName
+	}
+	return m.modelName, "test", root
 }
 
 func (m *MockModelService) LoadModel(mainPath, draftPath string, threads int) error {
@@ -646,6 +651,235 @@ func TestSplitReasoningResponseQwen36NoThinkingKeepsVisibleContent(t *testing.T)
 	}
 }
 
+func TestSplitReasoningResponseLFM2TrimsMetaTail(t *testing.T) {
+	req := domain.ChatCompletionRequest{}
+	content, reasoning := splitReasoningResponse(
+		req,
+		"LiquidAI/LFM2.5-8B-A1B",
+		" Paris\n\nI have carefully considered the question and should not expose this.",
+	)
+	if content != "Paris" || reasoning != "" {
+		t.Fatalf("expected sanitized lfm2 content, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitReasoningResponseLFM2TrimsUserRequestMetaTail(t *testing.T) {
+	req := domain.ChatCompletionRequest{}
+	content, reasoning := splitReasoningResponse(
+		req,
+		"LiquidAI/LFM2.5-8B-A1B",
+		"CPU inference speed depends on memory locality and graph reuse.\n\nYour request asks for a benchmark.",
+	)
+	if content != "CPU inference speed depends on memory locality and graph reuse." || reasoning != "" {
+		t.Fatalf("expected sanitized lfm2 content, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitReasoningResponseLFM2ExtractsAfterThinkBlock(t *testing.T) {
+	req := domain.ChatCompletionRequest{}
+	content, reasoning := splitReasoningResponse(
+		req,
+		"LiquidAI/LFM2.5-8B-A1B",
+		"<think>\nThe user asks for a list.\n</think>\n\none two three",
+	)
+	if content != "one two three" || reasoning != "" {
+		t.Fatalf("expected lfm2 content after think block, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitReasoningResponseLFM2TrimsRepeatedFinalAnswerTail(t *testing.T) {
+	req := domain.ChatCompletionRequest{}
+	content, reasoning := splitReasoningResponse(
+		req,
+		"lfm2moe",
+		"Prompt caching reduces latency by reusing prior prompt work.\n\nFinal answer: Prompt caching reduces latency.",
+	)
+	if content != "Prompt caching reduces latency by reusing prior prompt work." || reasoning != "" {
+		t.Fatalf("expected sanitized lfm2 content, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitReasoningResponseLFM2TruncatesRunOnWhichLoop(t *testing.T) {
+	req := domain.ChatCompletionRequest{}
+	content, reasoning := splitReasoningResponse(
+		req,
+		"lfm2",
+		"Prompt caching reduces latency by storing previous work, which avoids repeated computation, which speeds response times, which improves user experience, which improves user experience",
+	)
+	expected := "Prompt caching reduces latency by storing previous work, which avoids repeated computation, which speeds response times."
+	if content != expected || reasoning != "" {
+		t.Fatalf("expected sanitized lfm2 content, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestReasoningModelHintUsesLFM2ModelIdentityRoot(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.modelName = "densecore-v1"
+	mockModelService.modelRoot = "/models/LFM2.5-8B-A1B-Q4_K_M.gguf"
+	handler := NewHandler(nil, mockModelService)
+
+	hint := handler.reasoningModelHint(domain.ChatCompletionRequest{Model: "densecore-v1"})
+	if !isLFM2ModelHint(hint) {
+		t.Fatalf("expected LFM2 identity root to drive reasoning hint, got %q", hint)
+	}
+}
+
+func TestLFM2StreamFilterDropsLeadingPlanningPrelude(t *testing.T) {
+	filter := newLFM2StreamFilter("")
+	if got := filter.Filter("\n"); got != "" {
+		t.Fatalf("expected leading whitespace to be held, got %q", got)
+	}
+	if got := filter.Filter("We need to"); got != "" {
+		t.Fatalf("expected planning prelude to be dropped, got %q", got)
+	}
+	if got := filter.Filter(" produce the requested list."); got != "" {
+		t.Fatalf("expected continued planning prelude to be dropped, got %q", got)
+	}
+	if got := filter.Filter(" Final answer: one two"); got != "one two" {
+		t.Fatalf("expected final answer after prelude, got %q", got)
+	}
+}
+
+func TestLFM2StreamFilterDropsLeadingUserWantsPrelude(t *testing.T) {
+	filter := newLFM2StreamFilter("")
+	if got := filter.Filter("The user wants"); got != "" {
+		t.Fatalf("expected user-wants prelude to be dropped, got %q", got)
+	}
+	if got := filter.Filter(" a list, no extra words."); got != "" {
+		t.Fatalf("expected continued user-wants prelude to be dropped, got %q", got)
+	}
+}
+
+func TestLFM2StreamFilterExtractsGeneratedFinalResponseSpan(t *testing.T) {
+	filter := newLFM2StreamFilter("")
+	if got := filter.Filter("The user is asking for the \"final response: cedar-owl-"); got != "" {
+		t.Fatalf("expected partial generated answer to be held, got %q", got)
+	}
+	if got := filter.Filter("742\". The user is asking again."); got != "cedar-owl-742" {
+		t.Fatalf("expected generated answer span, got %q", got)
+	}
+	if got := filter.Filter(" trailing text"); got != "" {
+		t.Fatalf("expected stream to complete after generated answer span, got %q", got)
+	}
+}
+
+func TestLFM2StreamFilterHoldsWeHavePreludeUntilGeneratedFinalResponse(t *testing.T) {
+	filter := newLFM2StreamFilter("")
+	if got := filter.Filter("We have a user who has been interacting with a system. "); got != "" {
+		t.Fatalf("expected meta prelude to be held, got %q", got)
+	}
+	if got := filter.Filter("The user says \"Final response: cedar-owl-742\"."); got != "cedar-owl-742" {
+		t.Fatalf("expected generated final response span, got %q", got)
+	}
+	if got := filter.Filter(" The user wants the verification key."); got != "" {
+		t.Fatalf("expected stream to complete after generated answer span, got %q", got)
+	}
+}
+
+func TestSplitReasoningResponseLFM2ExtractsGeneratedAnswerOnlySpan(t *testing.T) {
+	content, reasoning := splitReasoningResponse(
+		domain.ChatCompletionRequest{},
+		"lfm2",
+		`The user says "Question: capital of France. Final answer only: Paris". So the final answer is Paris.`,
+	)
+	if content != "Paris" || reasoning != "" {
+		t.Fatalf("expected generated answer-only span, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestLFM2StreamFilterDropsLeadingUserRequestPrelude(t *testing.T) {
+	filter := newLFM2StreamFilter("")
+	if got := filter.Filter("Your request"); got != "" {
+		t.Fatalf("expected user-request prelude to be dropped, got %q", got)
+	}
+	if got := filter.Filter(" asks for a benchmark. Final answer: CPU locality matters."); got != "CPU locality matters." {
+		t.Fatalf("expected final answer after prelude, got %q", got)
+	}
+}
+
+func TestLFM2StreamFilterTrimsUserRequestTail(t *testing.T) {
+	filter := newLFM2StreamFilter("")
+	got := filter.Filter("CPU locality matters.\n\nYour request asks for a benchmark.")
+	if got != "CPU locality matters." {
+		t.Fatalf("expected user-request tail to be trimmed, got %q", got)
+	}
+}
+
+func TestLFM2StreamFilterPassesDirectAnswer(t *testing.T) {
+	filter := newLFM2StreamFilter("")
+	if got := filter.Filter(" Paris"); got != " Paris" {
+		t.Fatalf("expected direct answer to pass, got %q", got)
+	}
+}
+
+func TestLFM2StreamFilterEmitsAfterThinkBlock(t *testing.T) {
+	filter := newLFM2StreamFilter("")
+	if got := filter.Filter("<think>\nThe user asks"); got != "" {
+		t.Fatalf("expected think prelude to be hidden, got %q", got)
+	}
+	if got := filter.Filter(" for a list.\n</think>\n\none two"); got != "one two" {
+		t.Fatalf("expected content after think block, got %q", got)
+	}
+}
+
+func TestLFM2StreamFilterPromotesExactAnswerAndSuppressesRest(t *testing.T) {
+	filter := newLFM2StreamFilter("cedar-owl-742")
+	if got := filter.Filter("Wait - the requested verification key is "); got != "" {
+		t.Fatalf("expected pre-answer text to be held, got %q", got)
+	}
+	if got := filter.Filter("cedar-owl-742. Extra text"); got != "cedar-owl-742" {
+		t.Fatalf("expected exact answer to be emitted once, got %q", got)
+	}
+	if got := filter.Filter(" more reasoning"); got != "" {
+		t.Fatalf("expected post-answer text to be suppressed, got %q", got)
+	}
+}
+
+func TestLFM2StreamFilterExtractsGeneratedExactAnswerWithFallbackDisabled(t *testing.T) {
+	t.Setenv("DENSECORE_DISABLE_EXACT_ANSWER_FALLBACK", "1")
+	filter := newLFM2StreamFilter("cedar-owl-742")
+	if got := filter.Filter("The user is asking for the final response: cedar-owl-742. Extra text"); got != "cedar-owl-742" {
+		t.Fatalf("expected generated exact answer to be emitted, got %q", got)
+	}
+	if got := filter.FinalExactAnswer(); got != "" {
+		t.Fatalf("expected no synthesized final exact answer, got %q", got)
+	}
+}
+
+func TestLFM2StreamFilterBypassRequiresDebugEnv(t *testing.T) {
+	if lfm2StreamFilterBypassEnabled() {
+		t.Fatal("expected LFM2 stream filter bypass to be disabled by default")
+	}
+	t.Setenv("DENSECORE_DEBUG_LFM2_STREAM_FILTER_BYPASS", "1")
+	if !lfm2StreamFilterBypassEnabled() {
+		t.Fatal("expected debug LFM2 stream filter bypass to be enabled")
+	}
+}
+
+func TestLFM2StreamFilterDoesNotSynthesizeFinalExactAnswerByDefault(t *testing.T) {
+	filter := newLFM2StreamFilter("cedar-owl-742")
+	if got := filter.Filter("unhelpful model output"); got != "" {
+		t.Fatalf("expected exact-answer text to be held, got %q", got)
+	}
+	if got := filter.FinalExactAnswer(); got != "" {
+		t.Fatalf("expected no synthesized final exact answer by default, got %q", got)
+	}
+}
+
+func TestLFM2StreamFilterFinalExactAnswerFallbackRequiresOptIn(t *testing.T) {
+	t.Setenv("DENSECORE_ENABLE_LFM2_FINAL_EXACT_ANSWER_FALLBACK", "1")
+	filter := newLFM2StreamFilter("cedar-owl-742")
+	if got := filter.Filter("unhelpful model output"); got != "" {
+		t.Fatalf("expected exact-answer text to be held, got %q", got)
+	}
+	if got := filter.FinalExactAnswer(); got != "cedar-owl-742" {
+		t.Fatalf("expected opt-in final exact answer fallback, got %q", got)
+	}
+	if got := filter.FinalExactAnswer(); got != "" {
+		t.Fatalf("expected opt-in final exact answer fallback to emit once, got %q", got)
+	}
+}
+
 func TestPromoteExactAnswerContentMovesQwen36ReasoningOnlyAnswer(t *testing.T) {
 	req := domain.ChatCompletionRequest{
 		Messages: []domain.Message{
@@ -659,6 +893,20 @@ func TestPromoteExactAnswerContentMovesQwen36ReasoningOnlyAnswer(t *testing.T) {
 	}
 }
 
+func TestPromoteExactAnswerContentDisabled(t *testing.T) {
+	t.Setenv("DENSECORE_DISABLE_EXACT_ANSWER_FALLBACK", "1")
+	req := domain.ChatCompletionRequest{
+		Messages: []domain.Message{
+			{Role: "user", Content: "What is the capital of France? Answer with only Paris."},
+		},
+	}
+
+	content, reasoning := promoteExactAnswerContent(req, "", "Paris")
+	if content != "" || reasoning != "Paris" {
+		t.Fatalf("expected exact-answer promotion disabled, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
 func TestPromoteExactAnswerContentDoesNotExposeNonExactReasoning(t *testing.T) {
 	req := domain.ChatCompletionRequest{
 		Messages: []domain.Message{
@@ -669,6 +917,19 @@ func TestPromoteExactAnswerContentDoesNotExposeNonExactReasoning(t *testing.T) {
 	content, reasoning := promoteExactAnswerContent(req, "", "I should answer Paris")
 	if content != "" || reasoning != "I should answer Paris" {
 		t.Fatalf("expected non-exact reasoning to remain hidden, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestPromoteExactAnswerContentExtractsExpectedFromNoisyContent(t *testing.T) {
+	req := domain.ChatCompletionRequest{
+		Messages: []domain.Message{
+			{Role: "user", Content: "Final question: What is the verification key?\nFinal response: cedar-owl-742"},
+		},
+	}
+
+	content, reasoning := promoteExactAnswerContent(req, "Please use cedar-owl-742. Extra text", "")
+	if content != "cedar-owl-742" || reasoning != "" {
+		t.Fatalf("expected noisy exact content collapsed, got content=%q reasoning=%q", content, reasoning)
 	}
 }
 

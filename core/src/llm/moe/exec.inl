@@ -2307,6 +2307,8 @@ static void cb_lfm2_shortconv(struct ggml_tensor* dst, const struct ggml_tensor*
     (void)a;
     (void)nth;
     if (ith != 0) return;  // single-task kernel
+    const auto profile_begin = IsQwen36ProfilingEnabled() ? std::chrono::steady_clock::now()
+                                                          : std::chrono::steady_clock::time_point{};
     auto* ud = static_cast<LFM2ShortConvUserData*>(userdata);
     if (!ud || !dst || !b || !ud->conv_weight) return;
     const float* bcx = reinterpret_cast<const float*>(b->data);
@@ -2319,6 +2321,9 @@ static void cb_lfm2_shortconv(struct ggml_tensor* dst, const struct ggml_tensor*
     const int N = static_cast<int>(b->ne[1]);
     const ptrdiff_t in_stride = static_cast<ptrdiff_t>(b->nb[1] / sizeof(float));
     const ptrdiff_t out_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
+    // dst is a freshly allocated shape donor; zero it so any token whose per-seq
+    // state fails to resolve yields zeros rather than uninitialized memory.
+    std::memset(out, 0, ggml_nbytes(dst));
     const size_t conv_state_elems = densecore::models::LFM2ShortConvStateElements(channels, kernel);
     const densecore::models::LFM2ShortConvConfig cfg{channels, kernel};
 
@@ -2341,6 +2346,14 @@ static void cb_lfm2_shortconv(struct ggml_tensor* dst, const struct ggml_tensor*
         const float* col = bcx + static_cast<ptrdiff_t>(t) * in_stride;
         densecore::models::LFM2ShortConvStep(cfg, /*b=*/col, /*c=*/col + channels, /*x=*/col + 2 * channels,
                                              ud->conv_weight, conv_state, out + static_cast<ptrdiff_t>(t) * out_stride);
+    }
+    if (ud->profile && profile_begin != std::chrono::steady_clock::time_point{}) {
+        const auto profile_end = std::chrono::steady_clock::now();
+        AddQwen36ProfileNs(ud->profile->ssm_conv1d_ns,
+                           static_cast<uint64_t>(
+                               std::chrono::duration_cast<std::chrono::nanoseconds>(profile_end - profile_begin)
+                                   .count()));
+        ud->profile->ssm_conv1d_calls.fetch_add(1, std::memory_order_relaxed);
     }
 }
 

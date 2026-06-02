@@ -279,6 +279,42 @@ func TestNormalizeSamplingQwen36NoThinkingDefaultsUseLongFormProfile(t *testing.
 	}
 }
 
+func TestNormalizeSamplingLFM2DefaultsUseConservativeProfile(t *testing.T) {
+	svc := &ChatService{}
+
+	temperature, topP, topK, repetitionPenalty := svc.normalizeSampling("/tmp/LFM2.5-8B-A1B-Q4_K_M.gguf", "", "", domain.ChatCompletionRequest{
+		MaxTokens: 80,
+	})
+	if temperature != 0.2 {
+		t.Fatalf("expected lfm2 temperature 0.2, got %v", temperature)
+	}
+	if topP != 0.8 {
+		t.Fatalf("expected lfm2 top_p 0.8, got %v", topP)
+	}
+	if topK != 20 {
+		t.Fatalf("expected lfm2 top_k 20, got %v", topK)
+	}
+	if repetitionPenalty != 1.05 {
+		t.Fatalf("expected lfm2 repetition penalty 1.05, got %v", repetitionPenalty)
+	}
+}
+
+func TestNormalizeSamplingLFM2TemperatureZeroKeepsDefaultRepetitionPenalty(t *testing.T) {
+	svc := &ChatService{}
+
+	temperature, topP, topK, repetitionPenalty := svc.normalizeSampling("/tmp/LFM2.5-8B-A1B-Q4_K_M.gguf", "", "", domain.ChatCompletionRequest{
+		MaxTokens:      128,
+		Temperature:    0.0,
+		TemperatureSet: true,
+		TopK:           1,
+		TopKSet:        true,
+	})
+	if temperature != 0.0 || topP != 1.0 || topK != 1 || repetitionPenalty != 1.05 {
+		t.Fatalf("expected lfm2 greedy decode to keep quality repetition penalty, got temp=%v top_p=%v top_k=%v rep=%v",
+			temperature, topP, topK, repetitionPenalty)
+	}
+}
+
 func TestNormalizeSamplingQwenThinkingDefaults(t *testing.T) {
 	svc := &ChatService{}
 	t.Setenv("DENSECORE_QWEN35_ENABLE_THINKING", "true")
@@ -608,6 +644,42 @@ func TestPreparePromptGemmaRenderedChatSubmitAvoidsPreviewTokenizationWhenSuppor
 	}
 	if engine.previewRenderedText != "" || engine.previewText != "" {
 		t.Fatalf("expected rendered chat path to avoid preview tokenization, previewRendered=%q previewText=%q",
+			engine.previewRenderedText, engine.previewText)
+	}
+}
+
+func TestPreparePromptLFM2RenderedChatSubmitAvoidsPreviewTokenizationWhenSupported(t *testing.T) {
+	engine := &chatServiceRenderedChatTestEngine{
+		chatServiceRenderTestEngine: chatServiceRenderTestEngine{
+			renderedPrompt:        "<|startoftext|><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+			previewTokenIDs:       []int{2, 4, 6, 8},
+			renderedTokenizerType: "lfm2",
+			renderedChatTemplate:  "<|im_start|>",
+			renderedModelVariant:  "lfm2moe",
+			renderedPromptFamily:  "chatml",
+		},
+	}
+	modelService := &chatServiceRenderTestModelService{
+		engine: engine,
+		model:  "/tmp/LFM2.5-8B-A1B-Q4_K_M.gguf",
+	}
+	svc := NewChatService(modelService, queue.NewRequestQueue(4))
+
+	prepared, err := svc.preparePrompt(engine, domain.ChatCompletionRequest{
+		Messages:  []domain.Message{{Role: "user", Content: "What is the capital of France?"}},
+		MaxTokens: 8,
+	}, modelService.model)
+	if err != nil {
+		t.Fatalf("preparePrompt returned error: %v", err)
+	}
+	if !prepared.renderedChatSubmit {
+		t.Fatalf("expected LFM2 rendered chat submit path")
+	}
+	if prepared.tokenSource != "engine_submit_rendered_chat" {
+		t.Fatalf("tokenSource=%q want engine_submit_rendered_chat", prepared.tokenSource)
+	}
+	if engine.previewRenderedText != "" || engine.previewText != "" {
+		t.Fatalf("expected LFM2 rendered chat path to avoid preview tokenization, previewRendered=%q previewText=%q",
 			engine.previewRenderedText, engine.previewText)
 	}
 }

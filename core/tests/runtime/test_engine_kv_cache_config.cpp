@@ -299,7 +299,7 @@ TEST(EngineKVCacheConfig, AutoKVTargetKeepsLargeGemma4ContextUsableWithoutEnvOve
     EXPECT_LE(config.max_seq_len, model.hparams.n_ctx);
 }
 
-TEST(EngineKVCacheConfig, RuntimeSchedulerConfigRaisesActiveSeqsButKeepsPrefillSerial) {
+TEST(EngineKVCacheConfig, RuntimeSchedulerConfigRaisesActiveSeqsAndBoundsParallelPrefillChunks) {
     KVCacheConfig kv_config;
     kv_config.max_num_seqs = 4;
     kv_config.max_seq_len = 4096;
@@ -308,6 +308,7 @@ TEST(EngineKVCacheConfig, RuntimeSchedulerConfigRaisesActiveSeqsButKeepsPrefillS
 
     EXPECT_EQ(scheduler_config.max_num_seqs, 4);
     EXPECT_EQ(scheduler_config.max_prefill_seqs, 1);
+    EXPECT_EQ(scheduler_config.max_parallel_prefill_chunk_tokens, 256);
     EXPECT_TRUE(scheduler_config.enable_mixed_prefill_decode);
     EXPECT_GT(scheduler_config.max_mixed_prefill_tokens, 0);
     EXPECT_LE(scheduler_config.max_mixed_prefill_tokens, scheduler_config.max_prefill_tokens);

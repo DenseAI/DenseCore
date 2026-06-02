@@ -86,6 +86,18 @@ TransformerModel MakeQwen35HybridDecodeModel() {
     return model;
 }
 
+TransformerModel MakeLFM2ShortConvDecodeModel() {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.arch_flags.is_lfm2_shortconv = true;
+    model.hparams.n_embd = 4096;
+    model.hparams.n_head = 16;
+    model.hparams.n_head_kv = 8;
+    return model;
+}
+
 BatchSpec MakeDecodeOnlyBatch(int num_seqs, int n_past) {
     BatchSpec batch{};
     batch.num_seqs = num_seqs;
@@ -451,6 +463,13 @@ TEST(DecodeGraphCachePolicyTest, Qwen36HybridSSMSingleDecodeCanUseDecodeGraphCac
     EXPECT_TRUE(DoesDecodeGraphCacheRequireRuntimeRebind(&model));
 }
 
+TEST(DecodeGraphCachePolicyTest, LFM2ShortConvSingleDecodeCanUseDecodeGraphCache) {
+    const TransformerModel model = MakeLFM2ShortConvDecodeModel();
+
+    EXPECT_TRUE(IsDecodeGraphCacheSafeForModel(&model));
+    EXPECT_TRUE(DoesDecodeGraphCacheRequireRuntimeRebind(&model));
+}
+
 TEST(DecodeGraphCachePolicyTest, HybridSSMModelsRequireRuntimeRebind) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
@@ -678,6 +697,21 @@ TEST(DecodeGraphCachePolicyTest, QwenHybridSingleDecodeTopologyIsCacheStableWith
     ScopedEnvOverride min_batch_ctx_env("DENSECORE_PAGED_DECODE_MIN_BATCH_CONTEXT", "64");
 
     EXPECT_TRUE(IsStablePagedDecodeTopologyForCache(&qwen36, &cache, batch));
+}
+
+TEST(DecodeGraphCachePolicyTest, LFM2ShortConvSingleDecodeTopologyIsCacheStableWithoutForcedPagedDecode) {
+    TransformerModel lfm2 = MakeLFM2ShortConvDecodeModel();
+    lfm2.hparams.n_head_kv = 2;
+    lfm2.hparams.n_embd_head_k = 256;
+    const BatchSpec batch = MakeDecodeOnlyBatch(/*num_seqs=*/1, /*n_past=*/63);
+    PagedKVCache cache{};
+    cache.cache_type = GGML_TYPE_F16;
+    cache.max_blocks = 8;
+
+    ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", "128");
+    ScopedEnvOverride min_batch_ctx_env("DENSECORE_PAGED_DECODE_MIN_BATCH_CONTEXT", "64");
+
+    EXPECT_TRUE(IsStablePagedDecodeTopologyForCache(&lfm2, &cache, batch));
 }
 
 TEST(DecodeGraphCachePolicyTest, Qwen35SingleDecodeTopologyUsesAttentionWeightHeadDims) {

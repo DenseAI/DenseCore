@@ -33,6 +33,8 @@ func FormatChatPromptWithMetadata(modelHint, tokenizerType, chatTemplate string,
 		return formatQwen35Prompt(modelHint, messages, templateKwargs)
 	case promptFamilyGemma:
 		return formatGemmaTurnPrompt(modelHint, messages, templateKwargs)
+	case promptFamilyLFM2:
+		return formatLFM2Prompt(messages)
 	default:
 		systemMessages, conversationMessages := splitChatMessages(messages)
 		if len(systemMessages) == 0 {
@@ -57,6 +59,54 @@ func splitChatMessages(messages []domain.Message) ([]domain.Message, []domain.Me
 	}
 
 	return systemMessages, conversationMessages
+}
+
+func formatLFM2Prompt(messages []domain.Message) string {
+	profile := resolvePromptProfile("lfm2")
+	var sb strings.Builder
+	sb.WriteString("<|startoftext|>")
+	writeTurn := func(role, content string) {
+		content = normalizePromptContent(content)
+		if content == "" {
+			return
+		}
+		sb.WriteString(profile.openTag)
+		sb.WriteString(role)
+		sb.WriteString("\n")
+		sb.WriteString(content)
+		sb.WriteString(profile.closeTag)
+	}
+
+	hasSystem := false
+	for _, msg := range messages {
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		if role == roleSystem || role == roleDeveloper {
+			hasSystem = true
+			break
+		}
+	}
+	if !hasSystem {
+		writeTurn(profile.systemRole, profile.defaultSystemPrompt)
+	}
+
+	for _, msg := range messages {
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		switch role {
+		case roleSystem, roleDeveloper:
+			writeTurn(profile.systemRole, msg.FlattenedText())
+		case roleUser:
+			writeTurn(profile.userRole, msg.FlattenedText())
+		case roleAssistant:
+			writeTurn(profile.assistantRole, msg.FlattenedText())
+		case roleTool:
+			writeTurn(roleTool, msg.FlattenedText())
+		}
+	}
+
+	sb.WriteString(profile.openTag)
+	sb.WriteString(profile.assistantRole)
+	sb.WriteString("\n")
+	return sb.String()
 }
 
 func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwargs *domain.ChatTemplateKwargs) string {

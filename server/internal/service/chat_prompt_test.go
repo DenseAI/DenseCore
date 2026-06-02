@@ -20,6 +20,11 @@ func TestResolvePromptProfileKnownFamilies(t *testing.T) {
 		t.Fatalf("expected gemma turn-tag profile, got family=%v kind=%v", gemma.family, gemma.kind)
 	}
 
+	lfm2 := resolvePromptProfile("/tmp/LFM2.5-8B-A1B-Q4_K_M.gguf")
+	if lfm2.family != promptFamilyLFM2 || lfm2.kind != promptProfileKindChatML {
+		t.Fatalf("expected lfm2 chatml profile, got family=%v kind=%v", lfm2.family, lfm2.kind)
+	}
+
 	generic := resolvePromptProfile("/tmp/llama-3.2-base.gguf")
 	if generic.family != promptFamilyGeneric || generic.kind != promptProfileKindGenericTranscript {
 		t.Fatalf("expected generic transcript profile fallback, got family=%v kind=%v", generic.family, generic.kind)
@@ -55,6 +60,19 @@ func TestFormatChatPromptQwenUsesChatML(t *testing.T) {
 	}
 	if !strings.HasSuffix(prompt, "<think>\n") {
 		t.Fatalf("expected qwen thinking preamble, got %q", prompt)
+	}
+}
+
+func TestFormatChatPromptLFM2UsesStartOfTextChatMLWithDefaultSystem(t *testing.T) {
+	prompt := FormatChatPrompt("/tmp/LFM2.5-8B-A1B-Q4_K_M.gguf", []domain.Message{
+		{Role: "user", Content: "hello"},
+	}, nil)
+
+	expected := "<|startoftext|><|im_start|>system\n" +
+		"You are a direct answer engine. Output only the final answer requested by the user. Do not quote, paraphrase, explain, analyze, or mention the request." +
+		"<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
+	if prompt != expected {
+		t.Fatalf("expected lfm2 chat template, got %q", prompt)
 	}
 }
 

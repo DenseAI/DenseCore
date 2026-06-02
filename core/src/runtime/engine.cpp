@@ -276,6 +276,9 @@ densecore::SchedulerConfig BuildRuntimeSchedulerConfig(const KVCacheConfig& kv_c
     config.max_model_len = std::max(1, kv_config.max_seq_len);
     config.max_num_batched_tokens = std::max(1, config.max_num_batched_tokens);
     config.max_prefill_tokens = std::min(std::max(1, config.max_prefill_tokens), config.max_num_batched_tokens);
+    config.max_parallel_prefill_chunk_tokens = 256;
+    config.max_parallel_prefill_chunk_tokens =
+        std::min(std::max(1, config.max_parallel_prefill_chunk_tokens), config.max_prefill_tokens);
     config.enable_mixed_prefill_decode = true;
     config.max_mixed_prefill_tokens = std::min(std::max(1, config.max_mixed_prefill_tokens),
                                                std::max(1, config.max_prefill_tokens / 4));

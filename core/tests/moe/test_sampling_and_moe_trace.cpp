@@ -18,6 +18,7 @@ int ResolveQwen36MoECallbackTaskCountForTest(const TransformerModel* model, cons
 bool ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(bool is_qwen36_hybrid_moe, int physical_cores,
                                                                int simd_level);
 bool ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(int physical_cores, int simd_level);
+bool ResolveLFM2SmallDecodeExpertParallelAutoEligibleForTest(int physical_cores, int simd_level);
 int ResolveQwen36SmallDecodeExpertWorkersForTest(int top_k, int worker_cap, int requested_override);
 bool RouteMoEGemma4TopKForTest(const struct ggml_tensor* gate_logits, const TransformerModel* model,
                                const TransformerLayer* layer, int top_k, densecore::moe::MoERouteResult* routing);
@@ -250,6 +251,17 @@ TEST(MoETrace, Gemma4SmallDecodeExpertParallelAutoPolicyTargetsC4AShape) {
         8, static_cast<int>(SimdLevel::SVE2)));
     EXPECT_TRUE(densecore::testing::ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(
         16, static_cast<int>(SimdLevel::AVX512)));
+}
+
+TEST(MoETrace, LFM2SmallDecodeExpertParallelAutoPolicyTargetsHighTopKMoE) {
+    using densecore::simd::SimdLevel;
+
+    EXPECT_TRUE(densecore::testing::ResolveLFM2SmallDecodeExpertParallelAutoEligibleForTest(
+        16, static_cast<int>(SimdLevel::SVE2)));
+    EXPECT_TRUE(densecore::testing::ResolveLFM2SmallDecodeExpertParallelAutoEligibleForTest(
+        16, static_cast<int>(SimdLevel::AVX512)));
+    EXPECT_FALSE(densecore::testing::ResolveLFM2SmallDecodeExpertParallelAutoEligibleForTest(
+        8, static_cast<int>(SimdLevel::SVE2)));
 }
 
 TEST(MoETrace, Qwen36SmallDecodeExpertParallelWorkerDefaultCapsAtEight) {
@@ -837,6 +849,133 @@ TEST(Gemma4PackedLayout, RuntimeMatchesCanonicalReferenceWithDownScaleSidecar) {
 
     EXPECT_NEAR(output_data[0], expected0, 1e-5f);
     EXPECT_NEAR(output_data[1], expected1, 1e-5f);
+
+    ggml_free(ctx);
+}
+
+// Parity golden for the multi-expert / multi-token / top_k>1 accumulation path of
+// CpuBackend::ForwardMoE. The single-expert test above only exercises one assignment;
+// this drives two experts across a two-token batch with weighted top_k routing and
+// checks the runtime output against an independently computed canonical reference.
+// It is self-checking (no recorded snapshot) so it guards behavior across the planned
+// extraction/file-move of ForwardMoE: re-running it before and after must agree.
+TEST(Gemma4PackedLayout, MultiExpertTopKMatchesCanonicalReference) {
+    ggml_init_params params{};
+    params.mem_size = 1 << 20;
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    constexpr int hidden = 2;
+    constexpr int intermediate = 2;
+    constexpr int experts = 2;
+
+    // Per-expert FP32 weights. [r][c] indexing matches the single-expert test above.
+    const float gate_vals[experts][intermediate][hidden] = {{{1.0f, 0.0f}, {0.0f, 1.0f}},
+                                                            {{1.0f, 0.0f}, {0.0f, 1.0f}}};
+    const float up_vals[experts][intermediate][hidden] = {{{0.5f, 0.0f}, {0.0f, 0.25f}},
+                                                          {{0.25f, 0.0f}, {0.0f, 0.5f}}};
+    const float down_vals[experts][hidden][intermediate] = {{{1.0f, 0.0f}, {0.0f, 2.0f}},
+                                                            {{2.0f, 0.0f}, {0.0f, 1.0f}}};
+    const float scale_vals[experts][hidden][intermediate] = {{{2.0f, 1.0f}, {1.0f, 0.5f}},
+                                                            {{1.0f, 1.0f}, {1.0f, 1.0f}}};
+
+    ggml_tensor* gate_up = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hidden, intermediate, 2, experts);
+    ggml_tensor* down = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, intermediate, hidden, 1, experts);
+    ggml_tensor* down_scale = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, intermediate, hidden, 1, experts);
+    ASSERT_NE(gate_up, nullptr);
+    ASSERT_NE(down, nullptr);
+    ASSERT_NE(down_scale, nullptr);
+
+    for (int e = 0; e < experts; ++e) {
+        for (int r = 0; r < intermediate; ++r) {
+            for (int c = 0; c < hidden; ++c) {
+                auto* gate_base = reinterpret_cast<char*>(gate_up->data);
+                *reinterpret_cast<float*>(gate_base + static_cast<size_t>(e) * gate_up->nb[3] +
+                                          static_cast<size_t>(0) * gate_up->nb[2] +
+                                          static_cast<size_t>(r) * gate_up->nb[1] +
+                                          static_cast<size_t>(c) * gate_up->nb[0]) = gate_vals[e][r][c];
+                *reinterpret_cast<float*>(gate_base + static_cast<size_t>(e) * gate_up->nb[3] +
+                                          static_cast<size_t>(1) * gate_up->nb[2] +
+                                          static_cast<size_t>(r) * gate_up->nb[1] +
+                                          static_cast<size_t>(c) * gate_up->nb[0]) = up_vals[e][r][c];
+            }
+        }
+        for (int r = 0; r < hidden; ++r) {
+            for (int c = 0; c < intermediate; ++c) {
+                auto* down_base = reinterpret_cast<char*>(down->data);
+                *reinterpret_cast<float*>(down_base + static_cast<size_t>(e) * down->nb[3] +
+                                          static_cast<size_t>(r) * down->nb[1] +
+                                          static_cast<size_t>(c) * down->nb[0]) = down_vals[e][r][c];
+                auto* scale_base = reinterpret_cast<char*>(down_scale->data);
+                *reinterpret_cast<float*>(scale_base + static_cast<size_t>(e) * down_scale->nb[3] +
+                                          static_cast<size_t>(r) * down_scale->nb[1] +
+                                          static_cast<size_t>(c) * down_scale->nb[0]) = scale_vals[e][r][c];
+            }
+        }
+    }
+
+    TransformerLayer layer;
+    layer.is_moe = true;
+    for (int e = 0; e < experts; ++e) {
+        densecore::gemma4::PackedExpertViews views{};
+        std::string reason;
+        ASSERT_TRUE(densecore::gemma4::MakePackedExpertViews(ctx, gate_up, down, down_scale, e, &views, &reason))
+            << reason;
+        layer.SetExpert(e, model_keys::kGemma4PackedGateUpExpert, views.gate_up);
+        layer.SetExpert(e, model_keys::kFfnGate, views.gate);
+        layer.SetExpert(e, model_keys::kFfnUp, views.up);
+        layer.SetExpert(e, model_keys::kFfnDown, views.down);
+        layer.SetExpert(e, model_keys::kGemma4PackedDownScale, views.down_scale);
+    }
+
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_experts = experts;
+
+    auto expert_weights = densecore::testing::BuildExpertWeightsForTest(&layer, &model);
+    ASSERT_EQ(expert_weights.size(), static_cast<size_t>(experts));
+
+    // Two tokens, each routed to both experts (top_k = 2) with distinct weights.
+    const float tokens[2][hidden] = {{1.0f, 2.0f}, {2.0f, 1.0f}};
+    const float route_weights[2][experts] = {{0.6f, 0.4f}, {0.3f, 0.7f}};
+
+    std::vector<float> input_data = {tokens[0][0], tokens[0][1], tokens[1][0], tokens[1][1]};
+    std::vector<float> output_data(2 * hidden, 0.0f);
+    densecore::Tensor input = densecore::Tensor::Make2D(input_data.data(), 2, hidden);
+    densecore::Tensor output = densecore::Tensor::Make2D(output_data.data(), 2, hidden);
+
+    densecore::moe::MoERouteResult routing{};
+    routing.batch_size = 2;
+    routing.top_k = experts;
+    routing.expert_ids = {0, 1, 0, 1};
+    routing.token_indices = {0, 0, 1, 1};
+    routing.weights = {route_weights[0][0], route_weights[0][1], route_weights[1][0], route_weights[1][1]};
+
+    densecore::GetCpuBackend().ForwardMoE(input, routing, expert_weights, &output);
+
+    // Independent canonical reference: out_t = sum_e w[t][e] * expert_ffn(e, token_t).
+    auto expert_ffn = [&](int e, const float* x, float* out_h) {
+        const float gate0 = gate_vals[e][0][0] * x[0] + gate_vals[e][0][1] * x[1];
+        const float gate1 = gate_vals[e][1][0] * x[0] + gate_vals[e][1][1] * x[1];
+        const float up0 = up_vals[e][0][0] * x[0] + up_vals[e][0][1] * x[1];
+        const float up1 = up_vals[e][1][0] * x[0] + up_vals[e][1][1] * x[1];
+        const float h0 = GeluTanhApproxTest(gate0) * up0;
+        const float h1 = GeluTanhApproxTest(gate1) * up1;
+        out_h[0] = h0 * (down_vals[e][0][0] * scale_vals[e][0][0]) + h1 * (down_vals[e][0][1] * scale_vals[e][0][1]);
+        out_h[1] = h0 * (down_vals[e][1][0] * scale_vals[e][1][0]) + h1 * (down_vals[e][1][1] * scale_vals[e][1][1]);
+    };
+    for (int t = 0; t < 2; ++t) {
+        float expected[hidden] = {0.0f, 0.0f};
+        for (int e = 0; e < experts; ++e) {
+            float ffn_out[hidden];
+            expert_ffn(e, tokens[t], ffn_out);
+            expected[0] += route_weights[t][e] * ffn_out[0];
+            expected[1] += route_weights[t][e] * ffn_out[1];
+        }
+        EXPECT_NEAR(output_data[t * hidden + 0], expected[0], 1e-5f) << "token " << t << " hidden 0";
+        EXPECT_NEAR(output_data[t * hidden + 1], expected[1], 1e-5f) << "token " << t << " hidden 1";
+    }
 
     ggml_free(ctx);
 }

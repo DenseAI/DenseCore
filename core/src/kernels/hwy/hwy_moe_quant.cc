@@ -87,6 +87,19 @@ HWY_INLINE int NearestIntForQ8K(float value) {
     return (bits & 0x007fffff) - 0x00400000;
 }
 
+HWY_INLINE void DecodeQ4KScales(const uint8_t scales_packed[kMoEKScaleSize], uint32_t utmp[4]) {
+    static constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    static constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    static constexpr uint32_t kmask3 = 0x03030303;
+
+    std::memcpy(utmp, scales_packed, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+}
+
 bool QuantizeRowQ8KImpl(const float* input, void* q8_output, int64_t cols) {
     if (!input || !q8_output || cols <= 0 || (cols % kMoEQK_K) != 0) {
         return false;
@@ -139,10 +152,6 @@ bool DotKQ8KImpl(const void* weight_row, const void* q8_input_row, int64_t cols,
     const auto* x = static_cast<const BlockT*>(weight_row);
     const auto* y = static_cast<const MoEQ8KBlock*>(q8_input_row);
 
-    static constexpr uint32_t kmask1 = 0x3f3f3f3f;
-    static constexpr uint32_t kmask2 = 0x0f0f0f0f;
-    static constexpr uint32_t kmask3 = 0x03030303;
-
     uint32_t utmp[4];
     int8_t unpacked[kMoEQK_K];
     int32_t dot_chunks[8];
@@ -176,12 +185,7 @@ bool DotKQ8KImpl(const void* weight_row, const void* q8_input_row, int64_t cols,
             }
         }
 
-        std::memcpy(utmp, x[bi].scales, 12);
-        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-        const uint32_t uaux = utmp[1] & kmask1;
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= kmask1;
+        DecodeQ4KScales(x[bi].scales, utmp);
 
         const auto* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
         const auto* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
@@ -226,6 +230,29 @@ bool DotQ4KQ8KImpl(const void* q4_weight_row, const void* q8_input_row, int64_t 
     return DotKQ8KImpl<MoEQ4KBlock, false>(q4_weight_row, q8_input_row, cols, output);
 }
 
+bool FusedSwiGLUQ4KQ8KRowsImpl(const void* q4_gate_rows, const void* q4_up_rows, const void* q8_input_row,
+                               int64_t cols, int64_t row_count, size_t row_bytes, float* output) {
+    if (!q4_gate_rows || !q4_up_rows || !q8_input_row || !output || cols <= 0 || row_count <= 0 ||
+        (cols % kMoEQK_K) != 0 || row_bytes == 0) {
+        return false;
+    }
+
+    const auto* gate_base = static_cast<const uint8_t*>(q4_gate_rows);
+    const auto* up_base = static_cast<const uint8_t*>(q4_up_rows);
+    for (int64_t row = 0; row < row_count; ++row) {
+        float gate = 0.0f;
+        float up = 0.0f;
+        const void* gate_row = gate_base + static_cast<size_t>(row) * row_bytes;
+        const void* up_row = up_base + static_cast<size_t>(row) * row_bytes;
+        if (!DotKQ8KImpl<MoEQ4KBlock, false>(gate_row, q8_input_row, cols, &gate) ||
+            !DotKQ8KImpl<MoEQ4KBlock, false>(up_row, q8_input_row, cols, &up)) {
+            return false;
+        }
+        output[row] = (gate / (1.0f + std::exp(-gate))) * up;
+    }
+    return true;
+}
+
 bool DotQ5KQ8KImpl(const void* q5_weight_row, const void* q8_input_row, int64_t cols, float* output) {
     return DotKQ8KImpl<MoEQ5KBlock, true>(q5_weight_row, q8_input_row, cols, output);
 }
@@ -241,6 +268,7 @@ namespace hwy_kernels {
 
 HWY_EXPORT(QuantizeRowQ8KImpl);
 HWY_EXPORT(DotQ4KQ8KImpl);
+HWY_EXPORT(FusedSwiGLUQ4KQ8KRowsImpl);
 HWY_EXPORT(DotQ5KQ8KImpl);
 
 bool QuantizeRowQ8K_Hwy(const float* input, void* q8_output, int64_t cols) {
@@ -249,6 +277,12 @@ bool QuantizeRowQ8K_Hwy(const float* input, void* q8_output, int64_t cols) {
 
 bool DotQ4KQ8K_Hwy(const void* q4_weight_row, const void* q8_input_row, int64_t cols, float* output) {
     return HWY_DYNAMIC_DISPATCH(DotQ4KQ8KImpl)(q4_weight_row, q8_input_row, cols, output);
+}
+
+bool FusedSwiGLUQ4KQ8KRows_Hwy(const void* q4_gate_rows, const void* q4_up_rows, const void* q8_input_row,
+                               int64_t cols, int64_t row_count, size_t row_bytes, float* output) {
+    return HWY_DYNAMIC_DISPATCH(FusedSwiGLUQ4KQ8KRowsImpl)(q4_gate_rows, q4_up_rows, q8_input_row, cols, row_count,
+                                                          row_bytes, output);
 }
 
 bool DotQ5KQ8K_Hwy(const void* q5_weight_row, const void* q8_input_row, int64_t cols, float* output) {

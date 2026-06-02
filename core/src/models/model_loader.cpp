@@ -906,7 +906,6 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         }
     }
 #endif
-
     if (pending_cpu_repack.empty() && pending_fused_cpu_repack.empty() && pending_cpu_amx.empty() &&
         pending_fused_cpu_amx.empty()) {
         return;
@@ -2033,6 +2032,32 @@ TransformerModel* LoadGGUFModel(const char* path) {
         }
     };
 
+    auto get_u32_array = [&](const std::string& suffix, std::vector<uint32_t>& vals) {
+        const int idx = find_prefixed_key(suffix);
+        if (idx == -1 || gguf_get_kv_type(ctx_gguf, idx) != GGUF_TYPE_ARRAY) {
+            return false;
+        }
+
+        const int n = gguf_get_arr_n(ctx_gguf, idx);
+        const gguf_type arr_type = gguf_get_arr_type(ctx_gguf, idx);
+        const void* arr_data = gguf_get_arr_data(ctx_gguf, idx);
+        if (!arr_data || n <= 0 || (arr_type != GGUF_TYPE_UINT32 && arr_type != GGUF_TYPE_INT32)) {
+            return false;
+        }
+
+        vals.resize(static_cast<size_t>(n));
+        if (arr_type == GGUF_TYPE_UINT32) {
+            const auto* raw = static_cast<const uint32_t*>(arr_data);
+            std::copy(raw, raw + n, vals.begin());
+        } else {
+            const auto* raw = static_cast<const int32_t*>(arr_data);
+            for (int i = 0; i < n; ++i) {
+                vals[static_cast<size_t>(i)] = raw[i] > 0 ? static_cast<uint32_t>(raw[i]) : 0u;
+            }
+        }
+        return true;
+    };
+
     auto get_f32 = [&](const std::string& suffix, float& val) {
         const int idx = find_prefixed_key(suffix);
         if (idx != -1) {
@@ -2115,8 +2140,24 @@ TransformerModel* LoadGGUFModel(const char* path) {
     get_u32("attention.head_count_kv", model->hparams.n_head_kv);
     get_u32("context_length", model->hparams.n_ctx);
 
-    if (model->hparams.n_head_kv == 0) model->hparams.n_head_kv = model->hparams.n_head;
     model->gemma4_layer_n_head_kv.clear();
+    if (model->arch_flags.is_lfm2_shortconv) {
+        std::vector<uint32_t> layer_head_kv;
+        if (get_u32_array("attention.head_count_kv", layer_head_kv)) {
+            if (layer_head_kv.size() != static_cast<size_t>(model->hparams.n_layer)) {
+                return fail_load("invalid LFM2 configuration: partial attention.head_count_kv export");
+            }
+            const auto first_attention_kv =
+                std::find_if(layer_head_kv.begin(), layer_head_kv.end(), [](uint32_t n) { return n > 0; });
+            if (first_attention_kv == layer_head_kv.end()) {
+                return fail_load("invalid LFM2 configuration: attention.head_count_kv has no attention layers");
+            }
+            model->hparams.n_head_kv = *first_attention_kv;
+            model->gemma4_layer_n_head_kv = std::move(layer_head_kv);
+        }
+    }
+
+    if (model->hparams.n_head_kv == 0) model->hparams.n_head_kv = model->hparams.n_head;
     if (has_gemma4_kv_array) {
         const int idx = gemma4_head_count_kv_idx;
         const gguf_type arr_type = gguf_get_arr_type(ctx_gguf, idx);
@@ -3183,6 +3224,17 @@ TransformerModel* LoadGGUFModel(const char* path) {
     model->token_embd_norm = get_tensor("token_embd_norm.weight");
     model->token_embd_norm_bias = get_tensor("token_embd_norm.bias");
     model->output_norm = get_tensor("output_norm.weight");
+    if (model->arch_flags.is_lfm2_shortconv && !model->output_norm && model->token_embd_norm) {
+        // LFM2's `embedding_norm` is the FINAL pre-logits norm (not an input
+        // embedding norm). The official llama.cpp GGUF exports it as
+        // `output_norm.weight`; tolerate alternate converters that emit it as
+        // `token_embd_norm.weight` by promoting it to the output norm so it is
+        // applied after the layers rather than on the input embeddings.
+        model->output_norm = model->token_embd_norm;
+        model->token_embd_norm = nullptr;
+        model->token_embd_norm_bias = nullptr;
+        std::cout << "[DenseCore] LFM2: using token_embd_norm as final output_norm" << std::endl;
+    }
     if (arch_lower == "nomic-bert") {
         return fail_load("nomic-bert GGUF embeddings are not enabled: this encoder uses fused QKV/RoPE/SwiGLU "
                          "layout and has not passed DenseCore embedding parity QA");

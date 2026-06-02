@@ -302,6 +302,12 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
         }
         if (can_chunk) {
             prefill_budget = std::min(prefill_budget, config_.max_prefill_tokens);
+            const bool parallel_prefill_pressure =
+                config_.max_prefill_seqs > 1 &&
+                (sorted_queue.size() > 1 || !output.prefill_seq_ids.empty());
+            if (parallel_prefill_pressure) {
+                prefill_budget = std::min(prefill_budget, config_.max_parallel_prefill_chunk_tokens);
+            }
             if (group.max_prefill_chunk_tokens > 0) {
                 prefill_budget = std::min(prefill_budget, group.max_prefill_chunk_tokens);
             }

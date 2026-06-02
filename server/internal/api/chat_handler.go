@@ -120,6 +120,12 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 	if isGemma4ModelHint(reasoningModelHint) {
 		gemma4Filter = newGemma4StreamFilter()
 	}
+	var lfm2Filter *lfm2StreamFilter
+	if isLFM2ModelHint(reasoningModelHint) && !lfm2StreamFilterBypassEnabled() {
+		// Use the expected answer only as a generated-span extraction hint.
+		// Terminal exact-answer synthesis remains disabled unless explicitly opted in.
+		lfm2Filter = newLFM2StreamFilter(service.ExtractExpectedExactAnswer(req))
+	}
 	var qwen36Filter *qwen36StreamFilter
 	if qwen36StreamingReasoningEnabled(req, reasoningModelHint) {
 		qwen36Filter = newQwen36StreamFilter()
@@ -144,6 +150,40 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 					_ = waitGenerationError(errChan)
 					return
 				}
+				if exactFallback := lfm2Filter.FinalExactAnswer(); exactFallback != "" {
+					completionTokens++
+					elapsedMS := serviceDurationMillis(time.Since(streamStart))
+					if firstCallbackMS == 0 {
+						firstCallbackMS = elapsedMS
+					}
+					lastCallbackMS = elapsedMS
+					chunk := domain.ChatCompletionChunk{
+						ID:      id,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   req.Model,
+						Choices: []domain.ChunkChoice{
+							{
+								Index: 0,
+								Delta: domain.ChunkDelta{
+									Content: exactFallback,
+								},
+								FinishReason: nil,
+							},
+						},
+					}
+					data, err := json.Marshal(chunk)
+					if err != nil {
+						slog.Error("failed to marshal exact-answer SSE chunk", slog.String("error", err.Error()))
+					} else if err := streamWriter.WriteJSONData(data); err != nil {
+						slog.Debug("SSE write error", slog.String("error", err.Error()))
+						return
+					}
+					slog.Info("lfm2_exact_answer_stream_fallback",
+						slog.String("model_id", req.Model),
+						slog.String("answer", exactFallback),
+					)
+				}
 				if err := streamWriter.WriteDone(); err != nil {
 					slog.Debug("SSE write error", slog.String("error", err.Error()))
 				}
@@ -158,6 +198,9 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 			token := event.Token
 			if token != "" && gemma4Filter != nil {
 				token = gemma4Filter.Filter(token)
+			}
+			if token != "" && lfm2Filter != nil {
+				token = lfm2Filter.Filter(token)
 			}
 			if token != "" {
 				completionTokens++
@@ -280,10 +323,16 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 }
 
 func promoteExactAnswerContent(req domain.ChatCompletionRequest, content, reasoningContent string) (string, string) {
-	if strings.TrimSpace(content) != "" || strings.TrimSpace(reasoningContent) == "" {
+	if service.ExactAnswerFallbackDisabled() {
 		return content, reasoningContent
 	}
 	expected := service.ExtractExpectedExactAnswer(req)
+	if expected != "" && strings.Contains(strings.ToLower(content), strings.ToLower(expected)) {
+		return expected, ""
+	}
+	if strings.TrimSpace(content) != "" || strings.TrimSpace(reasoningContent) == "" {
+		return content, reasoningContent
+	}
 	if expected == "" {
 		return content, reasoningContent
 	}

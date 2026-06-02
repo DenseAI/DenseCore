@@ -78,7 +78,7 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 		return fmt.Errorf("max_tokens exceeds maximum limit (%d)", maxCtx)
 	}
 
-	modelHint := s.modelService.GetCurrentModel()
+	modelHint := s.activeModelHint(req)
 	prepareStart := time.Now()
 	prepared, err := s.preparePrompt(engine, req, modelHint)
 	servicePrepareMS := durationMillis(time.Since(prepareStart))
@@ -130,7 +130,7 @@ func (s *ChatService) GenerateSync(ctx context.Context, req domain.ChatCompletio
 		return "", 0, 0, fmt.Errorf("max_tokens exceeds maximum limit (%d)", maxCtx)
 	}
 
-	modelHint := s.modelService.GetCurrentModel()
+	modelHint := s.activeModelHint(req)
 	prepareStart := time.Now()
 	prepared, err := s.preparePrompt(engine, req, modelHint)
 	servicePrepareMS := durationMillis(time.Since(prepareStart))
@@ -266,19 +266,28 @@ func (s *ChatService) preparePrompt(engine domain.Engine, req domain.ChatComplet
 		}
 	}
 
-	rendered, err := engine.RenderChatPrompt(messages, enableThinking, preserveThinking)
-	if err != nil {
-		return prepared, err
-	}
+	if profile.family == promptFamilyLFM2 {
+		renderedPrompt := FormatChatPromptWithMetadata(modelHint, prepared.tokenizerType, prepared.chatTemplate, messages, req.ChatTemplateKwargs)
+		prepared.prompt = renderedPrompt
+		prepared.promptSource = "server_lfm2_chatml"
+		prepared.renderedPrompt = renderedPrompt
+		prepared.renderedTemplateUsed = true
+		prepared.promptFamily = promptFamilyName(promptFamilyLFM2)
+	} else {
+		rendered, err := engine.RenderChatPrompt(messages, enableThinking, preserveThinking)
+		if err != nil {
+			return prepared, err
+		}
 
-	prepared.prompt = rendered.RenderedPrompt
-	prepared.promptSource = "rendered_chat_template"
-	prepared.renderedPrompt = rendered.RenderedPrompt
-	prepared.renderedTemplateUsed = true
-	prepared.tokenizerType = firstNonEmpty(rendered.TokenizerType, prepared.tokenizerType)
-	prepared.chatTemplate = firstNonEmpty(rendered.ChatTemplate, prepared.chatTemplate)
-	prepared.modelVariant = firstNonEmpty(rendered.ModelVariant, prepared.modelVariant)
-	prepared.promptFamily = firstNonEmpty(rendered.PromptFamily, prepared.promptFamily)
+		prepared.prompt = rendered.RenderedPrompt
+		prepared.promptSource = "rendered_chat_template"
+		prepared.renderedPrompt = rendered.RenderedPrompt
+		prepared.renderedTemplateUsed = true
+		prepared.tokenizerType = firstNonEmpty(rendered.TokenizerType, prepared.tokenizerType)
+		prepared.chatTemplate = firstNonEmpty(rendered.ChatTemplate, prepared.chatTemplate)
+		prepared.modelVariant = firstNonEmpty(rendered.ModelVariant, prepared.modelVariant)
+		prepared.promptFamily = firstNonEmpty(rendered.PromptFamily, prepared.promptFamily)
+	}
 
 	if !req.ParityMode && shouldPassThroughRawPrompt(modelHint, prepared.tokenizerType, prepared.chatTemplate, req.Messages, req.ChatTemplateKwargs) {
 		prepared.prompt = ExtractPrompt(req.Messages)
@@ -308,6 +317,24 @@ func (s *ChatService) preparePrompt(engine domain.Engine, req domain.ChatComplet
 	s.populatePromptTokenCount(engine, req, &prepared)
 
 	return prepared, nil
+}
+
+func (s *ChatService) activeModelHint(req domain.ChatCompletionRequest) string {
+	current := ""
+	modelID := ""
+	root := ""
+	if s != nil && s.modelService != nil {
+		current = s.modelService.GetCurrentModel()
+		modelID, _, root = s.modelService.GetModelIdentity()
+	}
+	for _, candidate := range []string{root, modelID, current, req.Model} {
+		lower := strings.ToLower(strings.TrimSpace(candidate))
+		if strings.Contains(lower, "lfm2") || strings.Contains(lower, "lfm") || isQwen36ModelHint(candidate) ||
+			strings.Contains(lower, "gemma") {
+			return candidate
+		}
+	}
+	return firstNonEmpty(current, root, modelID, req.Model)
 }
 
 func (s *ChatService) populatePromptTokenCount(engine domain.Engine, req domain.ChatCompletionRequest, prepared *preparedPrompt) {
@@ -365,6 +392,10 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 	}
 	s.logPromptPathDebug(engine, req, modelHint, prepared, temperature, topP, topK, repetitionPenalty,
 		allowedTokenIDs, allowedTokensStrict, maxTokens, exactAnswer, qualityProfile, false)
+	stopSequences := req.Stop
+	if len(stopSequences) == 0 && isLFM2PreparedRequest(modelHint, prepared) && !jsonMode {
+		stopSequences = defaultLFM2StopSequences()
+	}
 
 	inputIDs := req.InputIDs
 	if len(inputIDs) == 0 && len(prepared.tokenIDs) > 0 {
@@ -401,7 +432,7 @@ func (s *ChatService) startGeneration(ctx context.Context, req domain.ChatComple
 		RenderedChatSubmit:  prepared.renderedChatSubmit,
 		LoraAdapter:         req.LoraAdapter,
 		JSONMode:            jsonMode,
-		StopSequences:       req.Stop,
+		StopSequences:       stopSequences,
 		Temperature:         temperature,
 		TopP:                topP,
 		TopK:                topK,
@@ -586,9 +617,18 @@ func isGemmaRenderedTokenPathRequest(modelHint string, modelVariant string, toke
 		strings.Contains(hint, "gemma")
 }
 
+func isLFM2RenderedTokenPathRequest(modelHint string, modelVariant string, tokenizerType string) bool {
+	variant := strings.ToLower(strings.TrimSpace(modelVariant))
+	tokenizer := strings.ToLower(strings.TrimSpace(tokenizerType))
+	hint := strings.ToLower(modelHint)
+	return strings.Contains(variant, "lfm2") || strings.Contains(tokenizer, "lfm2") ||
+		strings.Contains(hint, "lfm2")
+}
+
 func isRenderedTokenPathRequest(modelHint string, modelVariant string, tokenizerType string) bool {
 	return isQwenRenderedTokenPathRequest(modelHint, modelVariant) ||
-		isGemmaRenderedTokenPathRequest(modelHint, modelVariant, tokenizerType)
+		isGemmaRenderedTokenPathRequest(modelHint, modelVariant, tokenizerType) ||
+		isLFM2RenderedTokenPathRequest(modelHint, modelVariant, tokenizerType)
 }
 
 func validatePreparedContextWindow(engine domain.Engine, prepared preparedPrompt, requestInputIDs []int, maxTokens int) error {
@@ -795,6 +835,8 @@ func promptFamilyName(family promptFamily) string {
 		return "chatml"
 	case promptFamilyGemma:
 		return "turn_tags"
+	case promptFamilyLFM2:
+		return "chatml"
 	default:
 		return "generic"
 	}
@@ -825,12 +867,15 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	profile := resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate)
 	isQwen := profile.family == promptFamilyQwen
 	isGemma := profile.family == promptFamilyGemma
+	isLFM2 := profile.family == promptFamilyLFM2 || strings.Contains(strings.ToLower(strings.TrimSpace(modelHint)), "lfm2")
 	isQwen36 := isQwen && isQwen36ModelHint(modelHint)
 	thinkingEnabled := profile.thinkingEnabled(modelHint, req.ChatTemplateKwargs)
 	qwen36Default := resolveQwen36NoThinkingSamplingDefaults(req.MaxTokens)
 
 	if !req.TemperatureSet {
 		if isGemma {
+			temperature = 0.2
+		} else if isLFM2 {
 			temperature = 0.2
 		} else if isQwen36 && !thinkingEnabled {
 			temperature = qwen36Default.temperature
@@ -843,6 +888,8 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	if !req.TopPSet {
 		if isGemma {
 			topP = 0.95
+		} else if isLFM2 {
+			topP = 0.8
 		} else if isQwen36 && !thinkingEnabled {
 			topP = qwen36Default.topP
 		} else if isQwen && thinkingEnabled {
@@ -856,6 +903,8 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	if !req.TopKSet {
 		if isGemma {
 			topK = 32
+		} else if isLFM2 {
+			topK = 20
 		} else if isQwen36 && !thinkingEnabled {
 			topK = qwen36Default.topK
 		} else if isQwen {
@@ -866,6 +915,8 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 	}
 	if !req.RepetitionPenaltySet {
 		if isGemma {
+			repetitionPenalty = 1.05
+		} else if isLFM2 {
 			repetitionPenalty = 1.05
 		} else if isQwen36 && !thinkingEnabled {
 			repetitionPenalty = qwen36Default.repetitionPenalty
@@ -883,7 +934,7 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 		if !req.TopKSet {
 			topK = 1
 		}
-		if !req.RepetitionPenaltySet {
+		if !req.RepetitionPenaltySet && !isLFM2 {
 			repetitionPenalty = 1.0
 		}
 	}
@@ -931,6 +982,22 @@ func resolveChatQualityProfile(modelHint, tokenizerType, chatTemplate string, re
 		return "standard"
 	}
 	return resolveQwen36NoThinkingSamplingDefaults(req.MaxTokens).qualityProfile
+}
+
+func isLFM2PreparedRequest(modelHint string, prepared preparedPrompt) bool {
+	lowerHint := strings.ToLower(strings.TrimSpace(modelHint))
+	lowerVariant := strings.ToLower(strings.TrimSpace(prepared.modelVariant))
+	lowerTokenizer := strings.ToLower(strings.TrimSpace(prepared.tokenizerType))
+	if strings.Contains(lowerHint, "lfm2") || strings.Contains(lowerVariant, "lfm2") ||
+		strings.Contains(lowerTokenizer, "lfm2") {
+		return true
+	}
+	profile := resolvePromptProfileWithMetadata(modelHint, prepared.tokenizerType, prepared.chatTemplate)
+	return profile.family == promptFamilyLFM2
+}
+
+func defaultLFM2StopSequences() []string {
+	return nil
 }
 
 func isQwen36ModelHint(modelHint string) bool {

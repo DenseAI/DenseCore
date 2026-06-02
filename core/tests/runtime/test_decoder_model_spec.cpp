@@ -226,3 +226,40 @@ TEST(DecoderModelSpec, QwenPrefillLastLogitsPolicyDefaultsOnForQwen35AndQwen36) 
                                                                    opt_out_policy));
     EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&qwen36_spec, /*num_seqs=*/2, /*n_tokens=*/8));
 }
+
+TEST(DecoderModelSpec, LFM2ShortConvMoEPrefillUsesLastTokenLogitsWithoutEnvGate) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_lfm2_shortconv = true;
+    model.hparams.n_layer = 2;
+    model.hparams.n_experts = 64;
+    model.hparams.n_experts_used = 6;
+    model.layers.resize(2);
+    model.layers[0].is_moe = true;
+    model.layers[0].experts.resize(64);
+    model.layers[1].is_moe = true;
+    model.layers[1].experts.resize(64);
+
+    const auto spec = densecore::models::BuildDecoderModelSpec(&model);
+    ASSERT_EQ(spec.layers.size(), 2u);
+    EXPECT_EQ(spec.runtime_topology, densecore::models::DecoderRuntimeTopology::DenseAttentionMoE);
+    EXPECT_EQ(spec.output.prefill_logits_policy, densecore::models::DecoderPrefillLogitsPolicy::LastTokenForMoE);
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        spec, densecore::models::DecoderSpecializationKind::PrefillLastLogits));
+    EXPECT_TRUE(densecore::models::DecoderModelSpecHasSpecialization(
+        spec, densecore::models::DecoderSpecializationKind::GroupedMoERouter));
+    EXPECT_EQ(spec.layers[0].ffn.router, densecore::models::DecoderMoERouter::GroupedSigmoidTopK);
+    EXPECT_EQ(spec.layers[0].ffn.top_k, 6);
+
+    densecore::models::DecoderPrefillRuntimePolicy policy =
+        densecore::models::DefaultDecoderPrefillRuntimePolicy();
+    policy.qwen35_prefill_last_logits_only = false;
+    policy.qwen36_prefill_last_logits_only = false;
+    EXPECT_TRUE(densecore::models::ShouldUsePrefillLastLogitsOnly(&spec, /*num_seqs=*/1, /*n_tokens=*/8, policy));
+    EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&spec, /*num_seqs=*/1, /*n_tokens=*/1, policy));
+    EXPECT_FALSE(densecore::models::ShouldUsePrefillLastLogitsOnly(&spec, /*num_seqs=*/2, /*n_tokens=*/8, policy));
+
+    const std::string formatted = densecore::models::FormatDecoderModelSpec(spec);
+    EXPECT_NE(formatted.find("prefill_logits=last_token_for_moe"), std::string::npos);
+}

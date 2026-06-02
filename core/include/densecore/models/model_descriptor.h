@@ -14,6 +14,7 @@ enum class TokenizerFamily : uint8_t {
     GPT2_BYTE_BPE,
     QWEN_BYTE_BPE,
     QWEN35_UNICODE_BPE,
+    LFM2_BYTE_BPE,
     GEMMA_SENTENCEPIECE,
     GLM_BYTE_BPE,
     BERT_WORDPIECE,

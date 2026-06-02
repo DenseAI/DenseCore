@@ -76,7 +76,7 @@ constexpr ModelDescriptor kDescriptors[] = {
     {ModelVariant::LFM2MOE,
      ModelArch::LFM2,
      "lfm2moe",
-     TokenizerFamily::GPT2_BYTE_BPE,
+     TokenizerFamily::LFM2_BYTE_BPE,
      PromptTemplateFamily::CHATML,
      false,
      false,
@@ -369,6 +369,9 @@ TokenizerFamily ResolveTokenizerFamilyFromMetadata(std::string_view tokenizer_ty
     if (lowered.find("qwen") != std::string::npos) {
         return TokenizerFamily::QWEN_BYTE_BPE;
     }
+    if (lowered.find("lfm2") != std::string::npos || lowered.find("lfm") != std::string::npos) {
+        return TokenizerFamily::LFM2_BYTE_BPE;
+    }
     if (lowered.find("gemma") != std::string::npos) {
         return TokenizerFamily::GEMMA_SENTENCEPIECE;
     }
@@ -413,7 +416,8 @@ PromptTemplateFamily ResolvePromptTemplateFamilyFromMetadata(std::string_view to
     const TokenizerFamily tokenizer_family = ResolveTokenizerFamilyFromMetadata(tokenizer_lower);
     switch (tokenizer_family) {
     case TokenizerFamily::QWEN_BYTE_BPE:
-    case TokenizerFamily::QWEN35_UNICODE_BPE: return PromptTemplateFamily::CHATML;
+    case TokenizerFamily::QWEN35_UNICODE_BPE:
+    case TokenizerFamily::LFM2_BYTE_BPE: return PromptTemplateFamily::CHATML;
     case TokenizerFamily::GEMMA_SENTENCEPIECE:
         if (tokenizer_lower.find("gemma4") != std::string::npos) {
             return PromptTemplateFamily::TURN_TAGS;
@@ -461,11 +465,11 @@ PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model) 
 
 bool IsKnownTokenizerModel(std::string_view tokenizer_name) {
     const std::string lowered = AsciiLower(tokenizer_name);
-    static constexpr std::array<std::string_view, 25> kKnown = {
+    static constexpr std::array<std::string_view, 26> kKnown = {
         "llama",   "gpt2",      "qwen2",      "qwen2.5", "qwen3",       "qwen3next",        "qwen35",
         "qwen3.5", "qwen35moe", "qwen36",     "qwen3.6", "qwen3_5_moe", "qwen3_5_moe_text", "mistral",
-        "gemma",   "gemma4",    "bpe",        "glm4",    "glm",         "sentencepiece",    "spm",
-        "bert",    "bert-bpe",  "jina-v2-en", "t5",
+        "gemma",   "gemma4",    "lfm2",       "bpe",     "glm4",        "glm",              "sentencepiece",
+        "spm",     "bert",      "bert-bpe",   "jina-v2-en", "t5",
     };
     return MatchesAny(lowered, kKnown);
 }
@@ -503,6 +507,7 @@ const char* TokenizerFamilyName(TokenizerFamily family) {
     case TokenizerFamily::GPT2_BYTE_BPE: return "gpt2_byte_bpe";
     case TokenizerFamily::QWEN_BYTE_BPE: return "qwen_byte_bpe";
     case TokenizerFamily::QWEN35_UNICODE_BPE: return "qwen35_unicode_bpe";
+    case TokenizerFamily::LFM2_BYTE_BPE: return "lfm2_byte_bpe";
     case TokenizerFamily::GEMMA_SENTENCEPIECE: return "gemma_sentencepiece";
     case TokenizerFamily::GLM_BYTE_BPE: return "glm_byte_bpe";
     case TokenizerFamily::BERT_WORDPIECE: return "bert_wordpiece";

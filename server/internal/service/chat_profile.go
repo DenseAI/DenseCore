@@ -26,6 +26,7 @@ const (
 	promptFamilyGeneric promptFamily = iota
 	promptFamilyQwen
 	promptFamilyGemma
+	promptFamilyLFM2
 )
 
 type promptProfile struct {
@@ -80,6 +81,10 @@ func resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate str
 	lower := strings.ToLower(strings.TrimSpace(modelHint))
 	tokenizerLower := strings.ToLower(strings.TrimSpace(tokenizerType))
 	templateLower := strings.ToLower(strings.TrimSpace(chatTemplate))
+	if strings.Contains(tokenizerLower, "lfm2") || strings.Contains(tokenizerLower, "lfm") ||
+		strings.Contains(lower, "lfm2") || strings.Contains(lower, "lfm") {
+		return fallbackPromptProfile("lfm2")
+	}
 	switch {
 	case strings.Contains(templateLower, "<|im_start|>") || strings.Contains(templateLower, "<|im_end|>"):
 		return fallbackPromptProfile("qwen")
@@ -114,6 +119,8 @@ func resolvePromptProfileWithMetadata(modelHint, tokenizerType, chatTemplate str
 
 func inferPromptFamilyFromModelHint(modelHint string) promptFamily {
 	switch {
+	case strings.Contains(modelHint, "lfm2") || strings.Contains(modelHint, "lfm"):
+		return promptFamilyLFM2
 	case strings.Contains(modelHint, "gemma"):
 		return promptFamilyGemma
 	case strings.Contains(modelHint, "qwen"):
@@ -181,6 +188,8 @@ func parsePromptFamily(family string) promptFamily {
 		return promptFamilyQwen
 	case "gemma":
 		return promptFamilyGemma
+	case "lfm2", "lfm":
+		return promptFamilyLFM2
 	default:
 		return promptFamilyGeneric
 	}
@@ -209,6 +218,17 @@ func firstNonEmpty(values ...string) string {
 func fallbackPromptProfile(modelHint string) promptProfile {
 	lower := strings.ToLower(strings.TrimSpace(modelHint))
 	switch {
+	case strings.Contains(lower, "lfm2") || strings.Contains(lower, "lfm"):
+		return promptProfile{
+			family:              promptFamilyLFM2,
+			kind:                promptProfileKindChatML,
+			userRole:            "user",
+			assistantRole:       "assistant",
+			systemRole:          "system",
+			openTag:             "<|im_start|>",
+			closeTag:            "<|im_end|>\n",
+			defaultSystemPrompt: "You are a direct answer engine. Output only the final answer requested by the user. Do not quote, paraphrase, explain, analyze, or mention the request.",
+		}
 	case strings.Contains(lower, "qwen"):
 		return promptProfile{
 			family:              promptFamilyQwen,

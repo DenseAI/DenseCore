@@ -578,15 +578,16 @@ bool CanUseQ5KRepackedMoEGemvFastPath() {
 }
 
 bool IsQwenA3BHybridMoEModel(const TransformerModel* model);
+bool IsLFM2MoEModelForSmallDecodeParallel(const TransformerModel* model);
 
 bool CanUseSmallDecodeQuantizedTileParallel(const TransformerModel* model) {
     const char* env = std::getenv("DENSECORE_MOE_ENABLE_SMALL_DECODE_QUANT_TILE_PARALLEL");
     if (env && env[0] != '\0') {
         return std::strcmp(env, "0") != 0 && std::strcmp(env, "off") != 0 && std::strcmp(env, "OFF") != 0;
     }
-    // Enable by default for Qwen A3B hybrid MoE models — tile-parallel GEMV
-    // spreads expert work across all available cores during single-token decode.
-    return IsQwenA3BHybridMoEModel(model);
+    // Enable by default for high-top-k CPU MoE decode models; tile-parallel
+    // GEMV spreads single-token expert work across all available cores.
+    return IsQwenA3BHybridMoEModel(model) || IsLFM2MoEModelForSmallDecodeParallel(model);
 }
 
 using MoEQ4Kx8Block = densecore::kernels::Q4KRepackedGemvBlock;
@@ -1440,8 +1441,14 @@ bool IsGemma4MoEModelForSmallDecodeParallel(const TransformerModel* model) {
     return model && model->arch_flags.is_gemma4 && model->hparams.n_experts > 0;
 }
 
+bool IsLFM2MoEModelForSmallDecodeParallel(const TransformerModel* model) {
+    return model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv &&
+           model->hparams.n_experts > 0 && model->hparams.n_experts_used > 1;
+}
+
 bool IsSmallDecodeExpertParallelAutoModel(const TransformerModel* model) {
-    return IsQwenA3BHybridMoEModel(model) || IsGemma4MoEModelForSmallDecodeParallel(model);
+    return IsQwenA3BHybridMoEModel(model) || IsGemma4MoEModelForSmallDecodeParallel(model) ||
+           IsLFM2MoEModelForSmallDecodeParallel(model);
 }
 
 bool IsSmallDecodeExpertParallelSimdLevel(densecore::simd::SimdLevel level) {
@@ -3459,7 +3466,133 @@ size_t GetExpertMatrixDequantBytes(int ggml_type_id, const CpuBackend::ExpertPac
     return static_cast<size_t>(rows * cols * sizeof(float));
 }
 
+// Snapshot of MoE registry hot-expert state plus the per-call active-expert set,
+// used to decide whether the tiny decode-specialized path can run. Extracted from
+// CpuBackend::ForwardMoE so the gathering logic is a self-contained unit with
+// explicit inputs; the caller unpacks these fields back into its locals.
+struct MoESmallDecodeState {
+    std::shared_ptr<moe::ExpertProfiler> profiler;
+    // Hot / previous-batch expert ids captured from the registry. The fixed arrays
+    // are the fast path; the *_overflow vectors hold the data when the registry set
+    // exceeds the fixed-array capacity (snapshot_ok == false).
+    std::array<int, kSmallDecodeMaxSnapshotExperts> local_hot_experts{};
+    int local_hot_count = 0;
+    std::array<int, kSmallDecodeMaxSnapshotExperts> previous_batch_experts{};
+    int previous_batch_count = 0;
+    bool snapshot_ok = true;
+    std::vector<int> local_hot_experts_overflow;
+    std::vector<int> previous_batch_experts_overflow;
+    // Distinct experts touched by this call's routing, plus the largest per-expert
+    // assignment count (>1 disqualifies the small-decode path).
+    std::array<int, kSmallDecodeMaxAssignments> current_batch_experts{};
+    int current_batch_expert_count = 0;
+    int max_expert_batch = 0;
+};
+
+// Templated on the registry pointer type so this anonymous-namespace helper does
+// not have to name CpuBackend::MoELayerRegistry (a private nested type). The only
+// caller is CpuBackend::ForwardMoE, which has access at the point of instantiation.
+template <typename RegistryPtr>
+MoESmallDecodeState GatherMoESmallDecodeState(const RegistryPtr& registry, const moe::MoERouteResult& routing,
+                                              int num_experts, int total_assignments, bool small_decode_candidate) {
+    MoESmallDecodeState state;
+    if (registry) {
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        state.profiler = registry->profiler;
+        if (small_decode_candidate) {
+            state.snapshot_ok =
+                CopyIntVectorToFixedArray(registry->local_expert_ids, &state.local_hot_experts,
+                                          &state.local_hot_count) &&
+                CopyIntVectorToFixedArray(registry->last_batch_experts, &state.previous_batch_experts,
+                                          &state.previous_batch_count);
+            if (!state.snapshot_ok) {
+                state.local_hot_experts_overflow = registry->local_expert_ids;
+                state.previous_batch_experts_overflow = registry->last_batch_experts;
+            }
+        } else {
+            state.local_hot_experts_overflow = registry->local_expert_ids;
+            state.previous_batch_experts_overflow = registry->last_batch_experts;
+        }
+    }
+
+    if (small_decode_candidate && state.snapshot_ok) {
+        for (int i = 0; i < total_assignments; ++i) {
+            const int expert_id = routing.expert_ids[static_cast<size_t>(i)];
+            if (expert_id < 0 || expert_id >= num_experts) {
+                continue;
+            }
+            bool seen = false;
+            int expert_batch_count = 0;
+            for (int j = 0; j < total_assignments; ++j) {
+                if (routing.expert_ids[static_cast<size_t>(j)] == expert_id) {
+                    ++expert_batch_count;
+                }
+            }
+            state.max_expert_batch = std::max(state.max_expert_batch, expert_batch_count);
+            for (int j = 0; j < state.current_batch_expert_count; ++j) {
+                if (state.current_batch_experts[static_cast<size_t>(j)] == expert_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen && state.current_batch_expert_count < kSmallDecodeMaxAssignments) {
+                state.current_batch_experts[static_cast<size_t>(state.current_batch_expert_count++)] = expert_id;
+            }
+        }
+    }
+    return state;
+}
+
+// Handles the Gemma4 / Qwen3.6 "safe reference" fast paths that bypass the
+// optimized MoE execution entirely. Returns true if the call was fully handled
+// (the caller must then return); false to continue with the normal MoE path.
+bool TryExecuteMoESafeReferenceFastPath(CpuBackend* backend, const TransformerModel* model, int layer_idx,
+                                        const BatchSpec* batch, const float* input_data, int batch_size,
+                                        int hidden_dim, const moe::MoERouteResult& routing,
+                                        const CpuBackend::ExpertWeights* experts, int num_experts, float* out_data,
+                                        bool qwen36_short_prefill_safe_reference, bool safe_reference_mode) {
+    const bool gemma4_safe_reference_mode = model && model->arch_flags.is_gemma4 && safe_reference_mode;
+    if (gemma4_safe_reference_mode) {
+        if (!ExecuteMoEReferencePath(input_data, batch_size, hidden_dim, routing, experts, num_experts, out_data)) {
+            std::fprintf(stderr, "[MoE_REF_EXEC] Gemma4 safe-reference execution failed; output left zeroed\n");
+            return true;
+        }
+        RecordMoEReferencePathTrace(backend, layer_idx, batch, routing, num_experts);
+        if (ShouldRunMoEReferenceCheck()) {
+            RunMoEReferenceCheck(input_data, batch_size, hidden_dim, routing, experts, num_experts, out_data);
+        }
+        return true;
+    }
+    if (qwen36_short_prefill_safe_reference &&
+        ExecuteMoEReferencePath(input_data, batch_size, hidden_dim, routing, experts, num_experts, out_data)) {
+        if (ShouldRunMoEReferenceCheck()) {
+            RunMoEReferenceCheck(input_data, batch_size, hidden_dim, routing, experts, num_experts, out_data);
+        }
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
+
+bool RunQ4KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* gate_weight_ptr,
+                                               const void* up_weight_ptr, const float* input_data,
+                                               const uint8_t* qinput_data, size_t qinput_row_bytes,
+                                               float* output_data, int64_t rows, int64_t cols, int64_t input_cols,
+                                               int numa_node, bool allow_parallel) {
+    if (!backend || !gate_weight_ptr || !up_weight_ptr || !input_data || !qinput_data || !output_data || rows <= 0 ||
+        cols <= 0 || input_cols <= 0 || qinput_row_bytes == 0) {
+        return false;
+    }
+    auto gate_packed = GetOrCreateQ4KRepackedMoEWeight(gate_weight_ptr, cols, input_cols);
+    auto up_packed = GetOrCreateQ4KRepackedMoEWeight(up_weight_ptr, cols, input_cols);
+    if (!gate_packed || !up_packed) {
+        return false;
+    }
+    return RunQ4KRepackedMoEFusedSwiGLUM4(backend, gate_packed, up_packed, input_data, qinput_data,
+                                          qinput_row_bytes, output_data, rows, cols, input_cols, numa_node,
+                                          allow_parallel);
+}
 
 void CpuBackend::ApplyMultiLoRA(
     const Tensor& input, const std::string& layer_name,
@@ -3755,27 +3888,9 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
     const bool safe_reference_mode =
         qwen36_short_prefill_safe_reference ||
         (num_experts > 0 ? IsMoESafeReferenceModeEnabled(&experts[0]) : IsMoESafeReferenceModeEnabled());
-    const bool gemma4_safe_reference_mode = model && model->arch_flags.is_gemma4 && safe_reference_mode;
-    if (gemma4_safe_reference_mode) {
-        if (!ExecuteMoEReferencePath(input_data, batch_size, static_cast<int>(hidden_dim), routing, experts,
-                                     num_experts, out_data)) {
-            std::fprintf(stderr, "[MoE_REF_EXEC] Gemma4 safe-reference execution failed; output left zeroed\n");
-            return;
-        }
-        RecordMoEReferencePathTrace(this, layer_idx, batch, routing, num_experts);
-        if (ShouldRunMoEReferenceCheck()) {
-            RunMoEReferenceCheck(input_data, batch_size, static_cast<int>(hidden_dim), routing, experts, num_experts,
-                                 out_data);
-        }
-        return;
-    }
-    if (qwen36_short_prefill_safe_reference &&
-        ExecuteMoEReferencePath(input_data, batch_size, static_cast<int>(hidden_dim), routing, experts, num_experts,
-                                out_data)) {
-        if (ShouldRunMoEReferenceCheck()) {
-            RunMoEReferenceCheck(input_data, batch_size, static_cast<int>(hidden_dim), routing, experts, num_experts,
-                                 out_data);
-        }
+    if (TryExecuteMoESafeReferenceFastPath(this, model, layer_idx, batch, input_data, batch_size,
+                                           static_cast<int>(hidden_dim), routing, experts, num_experts, out_data,
+                                           qwen36_short_prefill_safe_reference, safe_reference_mode)) {
         return;
     }
     bool small_decode_requires_general_path = false;
@@ -3794,62 +3909,25 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
         }
     }
 
-    std::shared_ptr<moe::ExpertProfiler> profiler;
-    std::array<int, kSmallDecodeMaxSnapshotExperts> small_step_local_hot_experts{};
-    std::array<int, kSmallDecodeMaxSnapshotExperts> small_step_previous_batch_experts{};
-    int small_step_local_hot_count = 0;
-    int small_step_previous_batch_count = 0;
-    bool small_step_snapshot_ok = true;
-    std::vector<int> local_hot_experts;
-    std::vector<int> previous_batch_experts;
-    if (registry) {
-        std::lock_guard<std::mutex> lock(registry->mutex);
-        profiler = registry->profiler;
-        if (small_decode_candidate) {
-            small_step_snapshot_ok =
-                CopyIntVectorToFixedArray(registry->local_expert_ids, &small_step_local_hot_experts,
-                                          &small_step_local_hot_count) &&
-                CopyIntVectorToFixedArray(registry->last_batch_experts, &small_step_previous_batch_experts,
-                                          &small_step_previous_batch_count);
-            if (!small_step_snapshot_ok) {
-                local_hot_experts = registry->local_expert_ids;
-                previous_batch_experts = registry->last_batch_experts;
-            }
-        } else {
-            local_hot_experts = registry->local_expert_ids;
-            previous_batch_experts = registry->last_batch_experts;
-        }
-    }
-
-    std::array<int, kSmallDecodeMaxAssignments> small_step_current_batch_experts{};
-    int small_step_current_batch_expert_count = 0;
-    int small_step_max_expert_batch = 0;
-    if (small_decode_candidate && small_step_snapshot_ok) {
-        for (int i = 0; i < total_assignments; ++i) {
-            const int expert_id = routing.expert_ids[static_cast<size_t>(i)];
-            if (expert_id < 0 || expert_id >= num_experts) {
-                continue;
-            }
-            bool seen = false;
-            int expert_batch_count = 0;
-            for (int j = 0; j < total_assignments; ++j) {
-                if (routing.expert_ids[static_cast<size_t>(j)] == expert_id) {
-                    ++expert_batch_count;
-                }
-            }
-            small_step_max_expert_batch = std::max(small_step_max_expert_batch, expert_batch_count);
-            for (int j = 0; j < small_step_current_batch_expert_count; ++j) {
-                if (small_step_current_batch_experts[static_cast<size_t>(j)] == expert_id) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen && small_step_current_batch_expert_count < kSmallDecodeMaxAssignments) {
-                small_step_current_batch_experts[static_cast<size_t>(small_step_current_batch_expert_count++)] =
-                    expert_id;
-            }
-        }
-    }
+    // Gather registry hot-expert snapshot + this call's active-expert set. The
+    // returned struct owns the data; we bind the original local names to its fields
+    // so the downstream small-decode logic is unchanged.
+    MoESmallDecodeState small_decode_state =
+        GatherMoESmallDecodeState(registry, routing, num_experts, total_assignments, small_decode_candidate);
+    std::shared_ptr<moe::ExpertProfiler> profiler = std::move(small_decode_state.profiler);
+    const std::array<int, kSmallDecodeMaxSnapshotExperts>& small_step_local_hot_experts =
+        small_decode_state.local_hot_experts;
+    const int small_step_local_hot_count = small_decode_state.local_hot_count;
+    const std::array<int, kSmallDecodeMaxSnapshotExperts>& small_step_previous_batch_experts =
+        small_decode_state.previous_batch_experts;
+    const int small_step_previous_batch_count = small_decode_state.previous_batch_count;
+    const bool small_step_snapshot_ok = small_decode_state.snapshot_ok;
+    const std::vector<int>& local_hot_experts = small_decode_state.local_hot_experts_overflow;
+    const std::vector<int>& previous_batch_experts = small_decode_state.previous_batch_experts_overflow;
+    const std::array<int, kSmallDecodeMaxAssignments>& small_step_current_batch_experts =
+        small_decode_state.current_batch_experts;
+    const int small_step_current_batch_expert_count = small_decode_state.current_batch_expert_count;
+    const int small_step_max_expert_batch = small_decode_state.max_expert_batch;
 
     const bool small_decode_ready = small_decode_candidate && !small_decode_requires_general_path &&
                                     small_step_snapshot_ok && small_step_max_expert_batch <= 1 &&
@@ -5393,6 +5471,17 @@ bool ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(int physical_core
     model.variant = ModelVariant::GEMMA4;
     model.arch_flags.is_gemma4 = true;
     model.hparams.n_experts = 128;
+    return ResolveSmallDecodeExpertParallelAutoEligible(&model, physical_cores,
+                                                        static_cast<densecore::simd::SimdLevel>(simd_level));
+}
+
+bool ResolveLFM2SmallDecodeExpertParallelAutoEligibleForTest(int physical_cores, int simd_level) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_lfm2_shortconv = true;
+    model.hparams.n_experts = 32;
+    model.hparams.n_experts_used = 32;
     return ResolveSmallDecodeExpertParallelAutoEligible(&model, physical_cores,
                                                         static_cast<densecore::simd::SimdLevel>(simd_level));
 }

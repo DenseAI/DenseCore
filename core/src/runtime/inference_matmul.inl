@@ -1133,12 +1133,12 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
             const bool q6_shape_decode_for_census = N > 0 && K > 0 && (N % QK_K) == 0 && K >= 1024 && N >= 1024;
             const bool q6_effective_decode_for_census =
                 callback_phase == InferenceExecutionPhase::Decode || q6_shape_decode_for_census;
-            const bool q6_decode_candidate =
-                q6_effective_decode_for_census && dispatch_path &&
-                std::strcmp(dispatch_path, "q6k_direct_vecdot") == 0;
-            const bool q6_used = q6_decode_candidate && dispatch_path &&
-                                 std::strcmp(dispatch_path, "q6k_direct_vecdot") == 0 &&
-                                 q6_type_traits_cpu_for_census && q6_type_traits_cpu_for_census->vec_dot;
+            const bool q6_direct_path =
+                dispatch_path && (std::strcmp(dispatch_path, "q6k_direct_vecdot") == 0 ||
+                                  std::strcmp(dispatch_path, "q6k_direct_vecdot_rowpair") == 0);
+            const bool q6_decode_candidate = q6_effective_decode_for_census && q6_direct_path;
+            const bool q6_used =
+                q6_decode_candidate && q6_type_traits_cpu_for_census && q6_type_traits_cpu_for_census->vec_dot;
             const char* reject_reason = "none";
             if (!q6_decode_candidate) {
                 reject_reason = "not_decode";
@@ -1151,7 +1151,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
             const char* graph_phase_name = q6_shape_decode_for_census ? "decode_shape" : callback_phase_name;
             const char* effective_phase_name = q6_effective_decode_for_census ? "decode" : callback_phase_name;
             RecordQ6KGemvDecision(callback_work_ctx, q6_decode_candidate, q6_used, reject_reason, weight_name, 1, K, N,
-                                  wall_ns, effective_phase_name, graph_phase_name, callback_phase_name);
+                                  wall_ns, effective_phase_name, graph_phase_name, callback_phase_name, dispatch_path);
             q6k_decision_recorded = true;
         }
         if (!matmul_dispatch_census_enabled) {
@@ -1332,12 +1332,40 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
             q6_reject_reason = "kernel_unavailable";
         }
         if (q6_can_use_direct) {
-            for (int k = k_start; k < k_end; ++k) {
+            // The 2-row (nrc=2) vec_dot shape is only correct where ggml actually
+            // implements it: ARM with __ARM_FEATURE_MATMUL_INT8. On x86 the
+            // q6_K x q8_K kernel ignores nrc>1 and writes only sums[0], leaving
+            // every odd output row at 0 -> corrupted LM-head logits (wrong first
+            // token; long-context retrieval fails). Keep rowpair ARM-only and use
+            // the single-row path on x86. Mirrors CanUseGgmlQ4KVecDotRowPairForNativeMoE.
+            const bool q6_can_use_rowpair =
+#if defined(__aarch64__) || defined(_M_ARM64)
+                q6_type_traits_cpu->nrows >= 2 && row_stride > 0 && (N % ggml_blck_size(weight_type)) == 0;
+#else
+                false;
+#endif
+            int k = k_start;
+            if (q6_can_use_rowpair && (k & 1)) {
+                const void* row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
+                q6_type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
+                ++k;
+            }
+            if (q6_can_use_rowpair) {
+                for (; k + 1 < k_end; k += 2) {
+                    const void* row_ptr =
+                        reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
+                    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    q6_type_traits_cpu->vec_dot(N, sums, 2, row_ptr, row_stride, quant_input, 0, 2);
+                    output[k] = sums[0];
+                    output[k + 1] = sums[1];
+                }
+            }
+            for (; k < k_end; ++k) {
                 const void* row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
                 q6_type_traits_cpu->vec_dot(N, &output[k], 0, row_ptr, 0, quant_input, 0, 1);
             }
-            maybe_log_gemv_timing("q6k_direct_vecdot");
-            record_gemv_dispatch_census("q6k_direct_vecdot");
+            maybe_log_gemv_timing(q6_can_use_rowpair ? "q6k_direct_vecdot_rowpair" : "q6k_direct_vecdot");
+            record_gemv_dispatch_census(q6_can_use_rowpair ? "q6k_direct_vecdot_rowpair" : "q6k_direct_vecdot");
             return;
         }
         if (ith == 0 && callback_work_ctx) {
@@ -1346,7 +1374,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
             const char* effective_phase_name = q6k_effective_decode_gemv ? "decode" : callback_phase_name;
             RecordQ6KGemvDecision(callback_work_ctx, q6k_decode_candidate, /*used=*/false, q6_reject_reason,
                                   weight_name, 1, K, N, 0, effective_phase_name, graph_phase_name,
-                                  callback_phase_name);
+                                  callback_phase_name, nullptr);
             q6k_decision_recorded = true;
         }
     }
@@ -2366,7 +2394,8 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     ShouldUseArmNativeQ4KVecDotValidated(weight_type, type_traits_cpu, weight_name, sample_row_ptr,
                                                          quant_input_base, x_rows[static_cast<size_t>(tile_start)], N);
 
-                if (!ud->force_reference_scalar && can_use_quant_nrc_fast && quant_input_base &&
+                if (!ud->force_reference_scalar && !ud->disable_quant_nrc_fast && can_use_quant_nrc_fast &&
+                    quant_input_base &&
                     allow_native_q4k_vecdot) {
                     if (IsHybridSSMQkvWeightName(weight_name) && IsDebugMatmulDispatchEnabled() && ith == 0 &&
                         tile_start == 0) {
@@ -5459,17 +5488,29 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const bool qwen36_hybrid_ssm_q4k_prefill_relevant =
         (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) && M > 1 &&
         input->type == GGML_TYPE_F32;
+    const bool lfm2_prefill_q4k_relevant =
+        model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv && M > 1 &&
+        input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q4_K;
+    const bool lfm2_prefill_quant_nrc_unsafe =
+        model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv && M > 1 &&
+        input->type == GGML_TYPE_F32 && ggml_is_quantized(weight->type)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        ;
+#else
+        && false;
+#endif
+    const bool q4k_batched_prefill_relevant =
+        qwen36_hybrid_ssm_q4k_prefill_relevant || lfm2_prefill_q4k_relevant;
     const bool qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k =
-        qwen36_hybrid_ssm_q4k_prefill_relevant && weight->type == GGML_TYPE_Q4_K;
+        q4k_batched_prefill_relevant && weight->type == GGML_TYPE_Q4_K;
     const bool qwen36_hybrid_ssm_q4k_prefill_shape_supported =
         qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k && weight->ne[0] == input->ne[0] &&
         (input->ne[0] % QK_K == 0);
     const bool qwen36_hybrid_ssm_q4k_prefill_kernel_available = IsQ4KTrueBatchedKernelEnabled();
     const bool qwen36_hybrid_ssm_q4k_prefill_lora_active = current_batch && !current_batch->lora_map.empty();
     const bool qwen36_hybrid_ssm_q4k_prefill_probe_candidate =
-        (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) && M > 1 &&
-        weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 && weight->ne[0] == input->ne[0] &&
-        (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled() &&
+        q4k_batched_prefill_relevant && weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 &&
+        weight->ne[0] == input->ne[0] && (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled() &&
         (!current_batch || current_batch->lora_map.empty());
     Qwen36PrefillQ4KBatchedRejectReason qwen36_q4k_reject_reason =
         Qwen36PrefillQ4KBatchedRejectReason::None;
@@ -5481,11 +5522,15 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         qwen36_q4k_admission_key ? LookupQwen36Q4KBatchedAdmission(qwen36_q4k_admission_key)
                                  : Qwen36Q4KBatchedAdmissionValue{};
     const bool qwen36_q4k_mode_off =
+        qwen36_hybrid_ssm_q4k_prefill_relevant &&
         fast_path_config.qwen36_prefill_q4k_batched == densecore::llm::config::Qwen36PrefillQ4KBatchedMode::Off;
     const bool qwen36_q4k_mode_on =
+        qwen36_hybrid_ssm_q4k_prefill_relevant &&
         fast_path_config.qwen36_prefill_q4k_batched == densecore::llm::config::Qwen36PrefillQ4KBatchedMode::On;
     const bool qwen36_q4k_mode_probe =
-        fast_path_config.qwen36_prefill_q4k_batched == densecore::llm::config::Qwen36PrefillQ4KBatchedMode::Probe;
+        (qwen36_hybrid_ssm_q4k_prefill_relevant &&
+         fast_path_config.qwen36_prefill_q4k_batched == densecore::llm::config::Qwen36PrefillQ4KBatchedMode::Probe) ||
+        lfm2_prefill_q4k_relevant;
     const bool qwen36_q4k_probe_rejected =
         qwen36_q4k_mode_probe && qwen36_q4k_admission.state == Qwen36Q4KBatchedAdmissionState::Reject;
     bool qwen36_lm_head_q4k_prefill_fast_path_eligible = false;
@@ -5577,6 +5622,26 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         record_graph_matmul("ggml_mul_mat");
         return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
                                   "temporary_reference_qwen35_prefill_quant_correctness");
+    }
+
+    // C4A long-context LFM2 QA currently drifts on the ARM custom quantized
+    // prefill lane (first decode token collapses to token id 1 after a
+    // 954-token prompt). Keep decode on the native MoE fast path, but reject
+    // ARM prefill quant custom admission until the selected projection kernel
+    // has a passing parity gate and beats native GGML.
+    if (model && model->variant == ModelVariant::LFM2MOE && ggml_is_quantized(weight->type) &&
+        input->type == GGML_TYPE_F32 && M > 1 &&
+#if defined(__aarch64__) || defined(_M_ARM64)
+        true
+#else
+        false
+#endif
+    ) {
+        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
+                          "lfm2_arm_prefill_quant_correctness");
+        record_graph_matmul("ggml_mul_mat");
+        return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
+                                  "temporary_reference_lfm2_arm_prefill_quant_correctness");
     }
 
     const bool gemma4_q4k_prefill_fast_path_eligible =
@@ -5689,7 +5754,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         qwen36_hybrid_ssm_q4k_prefill_probe_candidate && has_quant_vec_dot && has_quant_from_float &&
         quant_input_size_ok && quant_true_batched_kernel_ready;
     qwen36_q4k_reject_reason = ResolveQwen36PrefillQ4KBatchedReason(
-        qwen36_hybrid_ssm_q4k_prefill_relevant, qwen36_q4k_mode_off, qwen36_hybrid_ssm_q4k_prefill_lora_active,
+        q4k_batched_prefill_relevant, qwen36_q4k_mode_off, qwen36_hybrid_ssm_q4k_prefill_lora_active,
         qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k, qwen36_hybrid_ssm_q4k_prefill_shape_supported,
         qwen36_hybrid_ssm_q4k_prefill_kernel_available, has_quant_vec_dot, qwen36_q4k_candidate_ready,
         qwen36_q4k_mode_on, qwen36_q4k_mode_probe,
@@ -5714,10 +5779,14 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const bool qwen36_prefill_prefers_ggml_quant =
         model && model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm && input_cols > 1 &&
         (!qwen36_q4k_probe_admitted || qwen36_q4k_mode_off || qwen36_q4k_probe_rejected);
+    const bool lfm2_prefill_prefers_ggml_quant =
+        model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv && input_cols > 1 &&
+        weight->type == GGML_TYPE_Q4_K && (!qwen36_q4k_probe_admitted || qwen36_q4k_probe_rejected);
     const bool is_small_batch_quant_candidate =
         (input_cols > 1 && input_cols <= max_small_batch_quant_cols && input->type == GGML_TYPE_F32 &&
          ggml_is_quantized(weight->type) && !qwen35_dense_prefill_prefers_ggml_quant &&
-         !qwen36_prefill_prefers_ggml_quant && has_quant_vec_dot && has_quant_from_float && quant_input_size_ok);
+         !qwen36_prefill_prefers_ggml_quant && !lfm2_prefill_prefers_ggml_quant && has_quant_vec_dot &&
+         has_quant_from_float && quant_input_size_ok);
     const bool is_small_batch_candidate = is_small_batch_f32_candidate || is_small_batch_quant_candidate;
 
     const char* wtype_label = MatmulWeightTypeLabel(weight->type, false, false);
@@ -5802,6 +5871,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         ud->qwen36_prefill_q4k_probe =
             qwen36_q4k_mode_probe && qwen36_q4k_admission.state == Qwen36Q4KBatchedAdmissionState::Unknown;
         ud->qwen36_prefill_q4k_admitted = qwen36_q4k_probe_admitted;
+        ud->disable_quant_nrc_fast = lfm2_prefill_quant_nrc_unsafe;
         ud->gemma4_dense_prefill_native = gemma4_dense_prefill_native_allowed;
         if (gemma4_dense_prefill_native_allowed) {
             RecordGemma4DensePrefillNativeDecision(
@@ -5830,6 +5900,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             reason = "qwen35_dense_prefill_ggml_quant";
         else if (qwen36_prefill_prefers_ggml_quant)
             reason = "qwen36_prefill_ggml_quant";
+        else if (lfm2_prefill_prefers_ggml_quant)
+            reason = "lfm2_prefill_q4k_probe_rejected";
         else if (!has_quant_vec_dot)
             reason = "no_vec_dot";
         else if (!has_quant_from_float)

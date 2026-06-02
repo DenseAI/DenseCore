@@ -76,6 +76,8 @@ func TestExtractExactAnswerFromText(t *testing.T) {
 		{"What is the deployment codename? Answer with only the codename.", ""},
 		{"Repeat the exact secret code only. Answer with only BLUE-PEARL-471.", "BLUE-PEARL-471"},
 		{"What is the capital of France? Answer with only \"Paris\".", "Paris"},
+		{"Final question: What is the verification key?\nFinal response: cedar-owl-742", "cedar-owl-742"},
+		{"The verification key is: cedar-owl-742", "cedar-owl-742"},
 		{"한국의 수도는 어디인가요? 서울만 답해 주세요.", "서울"},
 		{"Say hello.", ""},
 	}
@@ -114,6 +116,23 @@ func TestDeriveExactAnswerConstraint(t *testing.T) {
 	}
 }
 
+func TestDeriveExactAnswerConstraintDisabled(t *testing.T) {
+	t.Setenv("DENSECORE_DISABLE_EXACT_ANSWER_FALLBACK", "1")
+	engine := &exactAnswerTestEngine{
+		tokens: map[string][]int{
+			"Paris": {9079},
+		},
+	}
+	req := domain.ChatCompletionRequest{
+		Messages:  []domain.Message{{Role: "user", Content: "What is the capital of France? Answer with only Paris."}},
+		MaxTokens: 8,
+	}
+
+	if got := deriveExactAnswerConstraint(engine, req); got != nil {
+		t.Fatalf("expected exact-answer constraint disabled, got %#v", got)
+	}
+}
+
 func TestDeriveExactAnswerConstraintMultiTokenFallback(t *testing.T) {
 	engine := &exactAnswerTestEngine{
 		tokens: map[string][]int{
@@ -134,5 +153,8 @@ func TestDeriveExactAnswerConstraintMultiTokenFallback(t *testing.T) {
 	}
 	if len(got.allowedTokenIDs) != 0 {
 		t.Fatalf("allowedTokenIDs=%v want empty for multi-token fallback", got.allowedTokenIDs)
+	}
+	if got.maxTokens != 4 {
+		t.Fatalf("maxTokens=%d want 4", got.maxTokens)
 	}
 }

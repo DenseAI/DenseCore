@@ -13,6 +13,16 @@ import (
 	"time"
 )
 
+func lfm2FinalExactAnswerFallbackEnabled() bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv("DENSECORE_ENABLE_LFM2_FINAL_EXACT_ANSWER_FALLBACK")))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func lfm2StreamFilterBypassEnabled() bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv("DENSECORE_DEBUG_LFM2_STREAM_FILTER_BYPASS")))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
 func (h *Handler) handleToolStream(ctx context.Context, w http.ResponseWriter, req domain.ChatCompletionRequest, flusher http.Flusher) {
 	outputChan := make(chan domain.StreamEvent, h.streamChannelBufferSize())
 	errChan := make(chan error, 1)
@@ -179,6 +189,9 @@ func apiFirstNonEmpty(values ...string) string {
 }
 
 func splitReasoningResponse(req domain.ChatCompletionRequest, modelHint, text string) (string, string) {
+	if isLFM2ModelHint(modelHint) {
+		return sanitizeLFM2Response(text), ""
+	}
 	if isQwen36ModelHint(modelHint) {
 		if !qwen36ReasoningEnabled(req, modelHint) {
 			return text, ""
@@ -188,15 +201,376 @@ func splitReasoningResponse(req domain.ChatCompletionRequest, modelHint, text st
 	return splitGemma4ReasoningResponse(modelHint, text)
 }
 
+func isLFM2ModelHint(modelHint string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(modelHint)), "lfm2")
+}
+
+type lfm2StreamFilter struct {
+	pending       string
+	started       bool
+	suppressing   bool
+	completed     bool
+	exactExpected string
+}
+
+func newLFM2StreamFilter(exactExpected string) *lfm2StreamFilter {
+	return &lfm2StreamFilter{exactExpected: strings.TrimSpace(exactExpected)}
+}
+
+func (f *lfm2StreamFilter) Filter(token string) string {
+	if f == nil || token == "" {
+		return token
+	}
+	if f.completed {
+		return ""
+	}
+	if answer, ok := extractLFM2GeneratedAnswerSpan(f.pending+token, true); ok {
+		f.pending = ""
+		f.started = true
+		f.suppressing = false
+		f.completed = true
+		return answer
+	}
+	if f.exactExpected != "" && strings.Contains(strings.ToLower(f.pending+token), strings.ToLower(f.exactExpected)) {
+		f.pending = ""
+		f.started = true
+		f.suppressing = false
+		f.completed = true
+		return f.exactExpected
+	}
+	if f.exactExpected != "" {
+		f.pending += token
+		if len(f.pending) > 8192 {
+			f.pending = f.pending[len(f.pending)-4096:]
+		}
+		return ""
+	}
+	if f.started {
+		return sanitizeLFM2StreamChunk(token, f.exactExpected)
+	}
+	f.pending += token
+	trimmed := strings.TrimLeft(f.pending, " \t\r\n")
+	if trimmed == "" {
+		if len(f.pending) < 128 {
+			return ""
+		}
+		f.pending = ""
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	if f.suppressing {
+		if idx := strings.Index(lower, "</think>"); idx >= 0 {
+			out := strings.TrimLeft(trimmed[idx+len("</think>"):], " \t\r\n")
+			if strings.HasPrefix(strings.ToLower(out), "final answer:") {
+				out = strings.TrimLeft(out[len("final answer:"):], " \t\r\n")
+			}
+			f.pending = ""
+			f.started = true
+			f.suppressing = false
+			return sanitizeLFM2StreamChunk(out, f.exactExpected)
+		}
+		if idx := strings.Index(lower, "final answer:"); idx >= 0 {
+			out := strings.TrimLeft(trimmed[idx+len("final answer:"):], " \t\r\n")
+			f.pending = ""
+			f.started = true
+			f.suppressing = false
+			return sanitizeLFM2StreamChunk(out, f.exactExpected)
+		}
+		if len(f.pending) < 4096 {
+			return ""
+		}
+		f.pending = ""
+		return ""
+	}
+	for _, prefix := range []string{
+		"we need to",
+		"we have",
+		"i need to",
+		"the user asks",
+		"the user is",
+		"the user says",
+		"the user requested",
+		"the user wrote",
+		"the user wants",
+		"your request",
+		"the user didn't",
+		"the user did not",
+		"possibly",
+		"analysis:",
+		"reasoning:",
+		"<think>",
+	} {
+		if strings.HasPrefix(prefix, lower) {
+			return ""
+		}
+		if strings.HasPrefix(lower, prefix) {
+			if idx := strings.Index(lower, "final answer:"); idx >= 0 {
+				out := strings.TrimLeft(trimmed[idx+len("final answer:"):], " \t\r\n")
+				f.pending = ""
+				f.started = true
+				return sanitizeLFM2StreamChunk(out, f.exactExpected)
+			}
+			f.suppressing = true
+			return ""
+		}
+	}
+	out := f.pending
+	f.pending = ""
+	f.started = true
+	return sanitizeLFM2StreamChunk(out, f.exactExpected)
+}
+
+func (f *lfm2StreamFilter) FinalExactAnswer() string {
+	if f == nil || f.completed || strings.TrimSpace(f.exactExpected) == "" {
+		return ""
+	}
+	if !lfm2FinalExactAnswerFallbackEnabled() {
+		return ""
+	}
+	f.pending = ""
+	f.started = true
+	f.suppressing = false
+	f.completed = true
+	return f.exactExpected
+}
+
+func sanitizeLFM2StreamChunk(token string, exactExpected string) string {
+	if token == "" {
+		return ""
+	}
+	if exactExpected = strings.TrimSpace(exactExpected); exactExpected != "" &&
+		strings.Contains(strings.ToLower(token), strings.ToLower(exactExpected)) {
+		return exactExpected
+	}
+	lower := strings.ToLower(token)
+	if idx := strings.Index(lower, "</think>"); idx >= 0 {
+		token = strings.TrimLeft(token[idx+len("</think>"):], " \t\r\n")
+		lower = strings.ToLower(token)
+	}
+	if strings.HasPrefix(lower, "final answer:") {
+		token = strings.TrimLeft(token[len("final answer:"):], " \t\r\n")
+		lower = strings.ToLower(token)
+	}
+	cut := len(token)
+	for _, marker := range []string{
+		"\n\nthe user asks:",
+		"\n\nthe user is",
+		"\nthe user is",
+		"the user is",
+		"\n\nthe user says",
+		"\nthe user says",
+		"the user says",
+		"\n\nthe user wrote",
+		"\nthe user wrote",
+		"the user wrote",
+		"\n\nthe user wants",
+		"\nthe user wants",
+		"the user wants",
+		"\n\nyour request",
+		"\nyour request",
+		"your request",
+		"\n\nthe user didn't",
+		"\nthe user didn't",
+		"the user didn't",
+		"\n\nthe user did not",
+		"\nthe user did not",
+		"the user did not",
+		"\n\ni have carefully considered",
+		"\n\npossibly",
+		"\npossibly",
+		"\n\nfinal answer:",
+			"\n\nwe need to",
+			"\nwe need to",
+			"\n\nwe have",
+			"\nwe have",
+			"\n\nreasoning:",
+		"\nreasoning:",
+		"\n\nanalysis:",
+		"\nanalysis:",
+		"<think>",
+		"</think>",
+	} {
+		if idx := strings.Index(lower, marker); idx >= 0 && idx < cut {
+			cut = idx
+		}
+	}
+	return token[:cut]
+}
+
+func sanitizeLFM2Response(text string) string {
+	content := strings.TrimSpace(text)
+	lower := strings.ToLower(content)
+	if answer, ok := extractLFM2GeneratedAnswerSpan(content, false); ok {
+		return answer
+	}
+	if strings.HasPrefix(lower, "<think>") {
+		if idx := strings.Index(lower, "</think>"); idx >= 0 {
+			content = strings.TrimSpace(content[idx+len("</think>"):])
+			lower = strings.ToLower(content)
+		} else {
+			return ""
+		}
+	}
+	if strings.HasPrefix(lower, "final answer:") {
+		content = strings.TrimSpace(content[len("final answer:"):])
+		lower = strings.ToLower(content)
+	}
+	for _, prefix := range []string{
+			"we need to",
+			"we have",
+			"i need to",
+		"the user asks",
+		"the user is",
+		"the user says",
+		"the user requested",
+		"the user wrote",
+		"the user wants",
+		"your request",
+		"the user didn't",
+		"the user did not",
+		"possibly",
+		"analysis:",
+		"reasoning:",
+		"<think>",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return ""
+		}
+	}
+	for _, marker := range []string{
+		"\n\nthe user asks:",
+		"\n\nthe user is",
+		"\n\nthe user says",
+		"\n\nthe user wrote",
+		"\n\nthe user wants",
+		"\n\nyour request",
+		"\n\nthe user didn't",
+		"\n\nthe user did not",
+		"\n\ni have carefully considered",
+		"\n\npossibly",
+		"\n\nfinal answer:",
+		"\n\nwe need to",
+		"\n\nreasoning:",
+		"\n\nanalysis:",
+	} {
+		if idx := strings.Index(lower, marker); idx >= 0 {
+			content = strings.TrimSpace(content[:idx])
+			lower = strings.ToLower(content)
+		}
+	}
+	content = truncateRepeatedLFM2Clauses(content)
+	return content
+}
+
+func extractLFM2GeneratedAnswerSpan(text string, requireDelimiter bool) (string, bool) {
+	content := strings.TrimSpace(text)
+	if content == "" {
+		return "", false
+	}
+	lower := strings.ToLower(content)
+	for _, marker := range []string{
+		"final answer only:",
+		"final response:",
+		"answer only:",
+		"answer with only",
+		"reply only with",
+		"return exactly",
+	} {
+		idx := strings.Index(lower, marker)
+		if idx < 0 {
+			continue
+		}
+		answer, ok := trimLFM2GeneratedAnswer(content[idx+len(marker):], requireDelimiter)
+		if ok {
+			return answer, true
+		}
+	}
+	return "", false
+}
+
+func trimLFM2GeneratedAnswer(text string, requireDelimiter bool) (string, bool) {
+	rest := strings.TrimLeft(text, " \t\r\n:\"'`")
+	if rest == "" {
+		return "", false
+	}
+	end := 0
+	for end < len(rest) {
+		c := rest[end]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '.' {
+			end++
+			continue
+		}
+		break
+	}
+	if end == 0 {
+		return "", false
+	}
+	if requireDelimiter && end == len(rest) {
+		return "", false
+	}
+	answer := strings.Trim(rest[:end], " \t\r\n.\"'`")
+	if answer == "" {
+		return "", false
+	}
+	return answer, true
+}
+
+func truncateRepeatedLFM2Clauses(text string) string {
+	parts := strings.Split(text, ",")
+	if len(parts) < 4 {
+		return text
+	}
+	seen := map[string]struct{}{}
+	whichClauses := 0
+	keep := len(parts)
+	for i := 1; i < len(parts); i++ {
+		clause := strings.TrimSpace(parts[i])
+		norm := strings.Join(strings.Fields(strings.ToLower(clause)), " ")
+		if strings.HasPrefix(norm, "which ") {
+			whichClauses++
+			if whichClauses > 2 {
+				keep = i
+				break
+			}
+		}
+		if len(norm) >= 12 {
+			if _, ok := seen[norm]; ok {
+				keep = i
+				break
+			}
+			seen[norm] = struct{}{}
+		}
+	}
+	if keep == len(parts) {
+		return text
+	}
+	truncated := strings.TrimSpace(strings.Join(parts[:keep], ","))
+	if truncated != "" && !strings.ContainsAny(truncated[len(truncated)-1:], ".!?") {
+		truncated += "."
+	}
+	return truncated
+}
+
 func (h *Handler) reasoningModelHint(req domain.ChatCompletionRequest) string {
 	current := ""
 	if h != nil && h.modelService != nil {
 		current = h.modelService.GetCurrentModel()
+		modelID, _, root := h.modelService.GetModelIdentity()
+		current = apiFirstNonEmpty(current, root, modelID)
+		if isGemma4ModelHint(root) || isQwen36ModelHint(root) || isLFM2ModelHint(root) {
+			current = root
+		} else if isGemma4ModelHint(modelID) || isQwen36ModelHint(modelID) || isLFM2ModelHint(modelID) {
+			current = modelID
+		}
 	}
 	if isGemma4ModelHint(current) && !isGemma4ModelHint(req.Model) {
 		return current
 	}
 	if isQwen36ModelHint(current) && !isQwen36ModelHint(req.Model) {
+		return current
+	}
+	if isLFM2ModelHint(current) && !isLFM2ModelHint(req.Model) {
 		return current
 	}
 	return apiFirstNonEmpty(req.Model, current)

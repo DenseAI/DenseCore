@@ -471,6 +471,9 @@ bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model) {
     if (IsQwenHybridSSMSingleDecodeCacheCandidate(model)) {
         return true;
     }
+    if (model->arch_flags.is_lfm2_shortconv) {
+        return true;
+    }
     // Other hybrid-SSM graphs still contain request-local state pointers until
     // their runtime rebind coverage is qualified.
     if (model->arch_flags.is_hybrid_ssm) {
@@ -906,6 +909,9 @@ bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const Pa
     if (!IsDecodeOnlyBatchLayout(batch, n_tokens_in_batch)) {
         return debug_fail("non_decode_layout", n_tokens_in_batch);
     }
+    if (model->arch_flags.is_lfm2_shortconv && batch.num_seqs == 1) {
+        return true;
+    }
 
     int n_head = 0;
     int n_head_kv = 0;
@@ -927,7 +933,8 @@ bool IsStablePagedDecodeTopologyForCache(const TransformerModel* model, const Pa
     if (batch.num_seqs > 1) {
         return true;
     }
-    return IsPagedDecodeModeAlwaysOn() || IsQwenHybridSSMSingleDecodeCacheCandidate(model);
+    return IsPagedDecodeModeAlwaysOn() || IsQwenHybridSSMSingleDecodeCacheCandidate(model) ||
+           model->arch_flags.is_lfm2_shortconv;
 }
 
 DecodeWorkerStats& GetDecodeWorkerStats() {
@@ -1464,7 +1471,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     }
     const auto descriptor = densecore::models::DescribeModel(model);
     if (descriptor.variant != ModelVariant::QWEN35 && descriptor.variant != ModelVariant::QWEN36 &&
-        descriptor.variant != ModelVariant::GEMMA4) {
+        descriptor.variant != ModelVariant::GEMMA4 && descriptor.variant != ModelVariant::LFM2MOE) {
         return;
     }
     const auto ns_to_ms = [](uint64_t ns) { return static_cast<double>(ns) / 1000000.0; };
@@ -1509,6 +1516,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         summary_tag = "[Qwen35DecodeSummary]";
     } else if (descriptor.variant == ModelVariant::GEMMA4) {
         summary_tag = "[Gemma4DecodeSummary]";
+    } else if (descriptor.variant == ModelVariant::LFM2MOE) {
+        summary_tag = "[LFM2DecodeSummary]";
     }
     const auto weight_hist_string = [](const std::array<uint64_t, kMatmulWeightTypeHistCount>& hist) {
         static constexpr const char* labels[kMatmulWeightTypeHistCount] = {"q4_k", "q5_k", "q6_k", "q8_0",
@@ -1659,6 +1668,19 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const uint64_t native_moe_fast_decode_seen_ops =
         std::max(req->native_moe_fast_decode_candidate_ops,
                  req->native_moe_fast_decode_used_ops + req->native_moe_fast_decode_rejected_ops);
+    const bool lfm2_summary = descriptor.variant == ModelVariant::LFM2MOE;
+    const bool lfm2_w1w3_q4k_seen = lfm2_summary && req->qwen35_moe_w1w3_weight_type_hist[0] > 0;
+    const bool lfm2_w2_q4k_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[0] > 0;
+    const bool lfm2_w2_q6k_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[2] > 0;
+    const uint64_t lfm2_native_moe_decode_used_ops = lfm2_summary ? req->native_moe_fast_decode_used_ops : 0;
+    const uint64_t lfm2_w1w3_q4k_repacked_used_ops =
+        lfm2_w1w3_q4k_seen ? req->native_moe_fast_decode_w1w3_used_ops : 0;
+    const uint64_t lfm2_w2_q4k_repacked_used_ops =
+        lfm2_w2_q4k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
+    const uint64_t lfm2_w2_q6k_vecdot_used_ops =
+        lfm2_w2_q6k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
+    const uint64_t lfm2_shortconv_sequence_fast_used_ops = lfm2_summary ? req->ssm_conv1d_calls : 0;
+    const uint64_t lfm2_decode_graph_rebuilds = lfm2_summary ? req->graph_cache_miss_count : 0;
     const char* qwen35_native_moe_down_exec_path =
         native_moe_fast_w2_q5k_used ? "custom_op" : (req->native_moe_fallback_w2_ops > 0 ? "ggml_mul_mat_id" : "none");
     const char* native_graph_moe_down_q5k_applicability = "unsupported";
@@ -1678,7 +1700,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const int qwen35_moe_instrumentation_missing =
         qwen35_moe_descriptor && req->qwen35_moe_forward_calls == 0 ? 1 : req->qwen35_moe_instrumentation_missing;
     const bool native_moe_expected =
-        (descriptor.variant == ModelVariant::QWEN35 || descriptor.variant == ModelVariant::QWEN36) &&
+        (descriptor.variant == ModelVariant::QWEN35 || descriptor.variant == ModelVariant::QWEN36 ||
+         descriptor.variant == ModelVariant::LFM2MOE) &&
         model->hparams.n_experts > 0 &&
         (req->qwen35_moe_path == "native_graph" || req->native_moe_graph_ns > 0 ||
          !req->native_moe_graph_node_hist.empty());
@@ -2134,6 +2157,13 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " native_moe_fast_w2_q5k_ms=" << ns_to_ms(req->native_moe_fast_w2_q5k_ns)
         << " native_moe_fast_w2_q5k_config=builtin"
         << " native_moe_fast_w2_q5k_effective_state=" << native_moe_fast_w2_q5k_effective_state
+        << " lfm2_native_moe_decode_used_ops=" << lfm2_native_moe_decode_used_ops
+        << " lfm2_w1w3_q4k_repacked_used_ops=" << lfm2_w1w3_q4k_repacked_used_ops
+        << " lfm2_w2_q4k_repacked_used_ops=" << lfm2_w2_q4k_repacked_used_ops
+        << " lfm2_w2_q6k_vecdot_used_ops=" << lfm2_w2_q6k_vecdot_used_ops
+        << " lfm2_greedy_lm_head_argmax_used_ops=0"
+        << " lfm2_shortconv_sequence_fast_used_ops=" << lfm2_shortconv_sequence_fast_used_ops
+        << " lfm2_decode_graph_rebuilds=" << lfm2_decode_graph_rebuilds
         << " qwen35_native_moe_down_exec_path=" << qwen35_native_moe_down_exec_path
         << " qwen35_native_moe_down_q5k_config=builtin"
         << " qwen35_native_moe_down_q5k_seen_ops=" << native_moe_fast_w2_q5k_seen_ops

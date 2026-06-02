@@ -374,6 +374,8 @@ static const char* MatmulModelFamilyName(ModelVariant variant) {
             return "qwen36";
         case ModelVariant::GEMMA4:
             return "gemma4";
+        case ModelVariant::LFM2MOE:
+            return "lfm2";
         case ModelVariant::GEMMA:
             return "gemma";
         case ModelVariant::QWEN3:
@@ -1595,6 +1597,9 @@ void RecordNativeMoEFastDecodeDecision(InferenceWorkContext* ctx, bool candidate
         if (wall_ns != 0) {
             p.native_moe_fast_decode_ns.fetch_add(wall_ns, std::memory_order_relaxed);
             p.native_moe_fast_total_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+            if (w1w3_used) {
+                p.native_moe_fast_w1w3_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+            }
         }
     } else if (candidate) {
         p.native_moe_fast_decode_rejected_ops.fetch_add(1, std::memory_order_relaxed);
@@ -1750,7 +1755,8 @@ void RecordGemma4NativeFusedGateUpUsed(InferenceWorkContext* ctx) {
 
 void RecordQ6KGemvDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,
                            const char* weight_name, int64_t m, int64_t n, int64_t k, uint64_t wall_ns,
-                           const char* effective_phase, const char* graph_phase, const char* callback_phase) {
+                           const char* effective_phase, const char* graph_phase, const char* callback_phase,
+                           const char* dispatch_path) {
     if (!ctx) {
         return;
     }
@@ -1785,7 +1791,9 @@ void RecordQ6KGemvDecision(InferenceWorkContext* ctx, bool candidate, bool used,
         MatmulShapeCensusEntry entry;
         entry.model_family = MatmulModelFamilyName(ctx->model_variant);
         entry.phase = effective_phase && effective_phase[0] ? effective_phase : MatmulPhaseName(ctx->phase);
-        entry.dispatch_path = used ? "q6k_direct_vecdot" : (candidate ? "candidate_rejected" : "pre_candidate_rejected");
+        entry.dispatch_path =
+            used ? (dispatch_path && dispatch_path[0] ? dispatch_path : "q6k_direct_vecdot")
+                 : (candidate ? "candidate_rejected" : "pre_candidate_rejected");
         entry.weight_type = "q6_k";
         entry.shape_bucket = MatmulShapeBucket(m, n, k);
         entry.left_name = weight_name && weight_name[0] ? weight_name : "unnamed_weight";
@@ -3360,6 +3368,7 @@ inline GemvBatchedUserData* GetGemvBatchedUserData() {
     ud->qwen36_prefill_q4k_admission_key = 0;
     ud->qwen36_prefill_q4k_probe = false;
     ud->qwen36_prefill_q4k_admitted = false;
+    ud->disable_quant_nrc_fast = false;
     ud->qwen36_prefill_q4k_probe_done.store(0, std::memory_order_relaxed);
     ud->qwen36_prefill_q4k_probe_failures.store(0, std::memory_order_relaxed);
     ud->qwen36_prefill_q4k_probe_internal_errors.store(0, std::memory_order_relaxed);

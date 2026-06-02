@@ -510,6 +510,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             conv_ud->layer_idx = il;
             conv_ud->token_seq_ids = batch.seq_id.data();
             conv_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
+            conv_ud->profile = &GetCurrentWorkContext()->qwen36_profile;
             y = ggml_map_custom2(ctx_c, y, bcx, cb_lfm2_shortconv, 1, conv_ud);
             ggml_set_name(y, "lfm2_shortconv_y");
 
@@ -2180,6 +2181,11 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 if (is_gemma4_moe) {
                     throw densecore::InvalidArgumentException(
                         "Gemma4 MoE native graph construction failed; refusing slow CPU backend MoE fallback");
+                }
+                if (model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv &&
+                    GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode) {
+                    throw densecore::InvalidArgumentException(
+                        "LFM2 decode native MoE fast path unavailable; refusing slow CPU backend MoE fallback");
                 }
                 MoEUserData* moe_ud = AllocateMoEUserData(ctx_c);
                 if (moe_ud) {

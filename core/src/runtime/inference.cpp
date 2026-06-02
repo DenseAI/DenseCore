@@ -84,6 +84,14 @@
 #define DENSECORE_DEFAULT_FUSED_QKV 1
 #endif
 
+namespace densecore {
+bool RunQ4KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* gate_weight_ptr,
+                                               const void* up_weight_ptr, const float* input_data,
+                                               const uint8_t* qinput_data, size_t qinput_row_bytes,
+                                               float* output_data, int64_t rows, int64_t cols, int64_t input_cols,
+                                               int numa_node, bool allow_parallel);
+}
+
 #include "runtime/inference_graph_support.inl"
 
 // Keep these implementation chunks in the same translation unit so GGML custom

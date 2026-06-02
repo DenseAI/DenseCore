@@ -264,6 +264,15 @@ bool SupportsQwenNoThinkDirective(const TransformerModel* model) {
     return descriptor.variant != ModelVariant::QWEN36;
 }
 
+bool IsLFM2MoeModel(const TransformerModel* model) {
+    return model && DescribeModel(model).variant == ModelVariant::LFM2MOE;
+}
+
+const char* LFM2DefaultSystemPrompt() {
+    return "You are a direct answer engine. Output only the final answer requested by the user. Do not quote, "
+           "paraphrase, explain, analyze, or mention the request.";
+}
+
 void AppendQwenAssistantGenerationCue(const TransformerModel* model, bool thinking_enabled, std::string* out) {
     if (!out || !model) {
         return;
@@ -526,7 +535,10 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
     const PromptTemplateProfile profile = ResolveModelPromptTemplateProfile(model);
     if (profile.kind == PromptTemplateKind::CHATML) {
         std::string wrapped;
-        wrapped.reserve(prompt.size() + 160);
+        wrapped.reserve(prompt.size() + 180);
+        if (IsLFM2MoeModel(model)) {
+            wrapped += "<|startoftext|>";
+        }
         std::string user_prompt = prompt;
         if (profile.supports_thinking && !profile.thinking_enabled && SupportsQwenNoThinkDirective(model)) {
             user_prompt = AppendQwenNoThinkDirective(std::move(user_prompt));
@@ -609,11 +621,18 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
 
     if (profile.kind == PromptTemplateKind::CHATML) {
         std::string rendered;
-        rendered.reserve(messages.size() * 64);
+        rendered.reserve(messages.size() * 64 + 48);
+        if (IsLFM2MoeModel(model)) {
+            rendered += "<|startoftext|>";
+        }
         int last_user_index = -1;
+        bool has_system_message = false;
         for (size_t i = 0; i < messages.size(); ++i) {
-            if (LowerTrimmed(messages[i].role) == "user") {
+            const std::string role = LowerTrimmed(messages[i].role);
+            if (role == "user") {
                 last_user_index = static_cast<int>(i);
+            } else if (role == "system" || role == "developer") {
+                has_system_message = true;
             }
         }
         auto append_block = [&](const std::string& role, const std::string& content) {
@@ -627,6 +646,10 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
             rendered += normalized;
             rendered += profile.close_tag;
         };
+
+        if (IsLFM2MoeModel(model) && !has_system_message) {
+            append_block(profile.system_role, LFM2DefaultSystemPrompt());
+        }
 
         for (size_t i = 0; i < messages.size(); ++i) {
             const std::string role = LowerTrimmed(messages[i].role);
@@ -652,7 +675,9 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
         rendered += profile.open_tag;
         rendered += profile.assistant_role;
         rendered += "\n";
-        AppendQwenAssistantGenerationCue(model, thinking_enabled, &rendered);
+        if (!IsLFM2MoeModel(model)) {
+            AppendQwenAssistantGenerationCue(model, thinking_enabled, &rendered);
+        }
         return rendered;
     }
 

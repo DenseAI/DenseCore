@@ -310,6 +310,10 @@ bool UseQwen35Pretokenizer(const TransformerModel* model) {
     return densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE;
 }
 
+bool UseLFM2Pretokenizer(const TransformerModel* model) {
+    return densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::LFM2_BYTE_BPE;
+}
+
 bool UseGemmaPretokenizer(const TransformerModel* model) {
     return densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::GEMMA_SENTENCEPIECE;
 }
@@ -341,6 +345,7 @@ bool IsByteLevelBpeTokenizer(const TransformerModel* model) {
     case densecore::models::TokenizerFamily::GPT2_BYTE_BPE:
     case densecore::models::TokenizerFamily::QWEN_BYTE_BPE:
     case densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE:
+    case densecore::models::TokenizerFamily::LFM2_BYTE_BPE:
     case densecore::models::TokenizerFamily::GLM_BYTE_BPE: return true;
     case densecore::models::TokenizerFamily::BERT_WORDPIECE: return false;
     case densecore::models::TokenizerFamily::BERT_BPE: return false;
@@ -1030,6 +1035,13 @@ std::vector<std::string> PretokenizeForByteBpe(const TransformerModel* model, co
 
     if (UseQwen35Pretokenizer(model)) {
         return PretokenizeQwenUnicode(text, true);
+    }
+    if (UseLFM2Pretokenizer(model)) {
+        // LFM2 / LFM2.5 use a cl100k/Llama-3-family pre-tokenizer:
+        //   (?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+
+        // The Unicode-aware splitter matches this (multilingual \p{L}); pass
+        // qwen35_mode=false to keep digits grouped in runs of 1..3 (\p{N}{1,3}).
+        return PretokenizeQwenUnicode(text, /*qwen35_mode=*/false);
     }
 
     try {

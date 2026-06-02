@@ -1492,6 +1492,16 @@ const char* PrefixCacheSkipReasonForModel(const TransformerModel* model) {
     return "none";
 }
 
+// Models whose layers carry per-sequence recurrent/conv state (hybrid SSM and
+// LFM2 short-conv) cannot reconstruct that state from cached KV blocks alone.
+// Prefix-cache reuse for them is only correct when the boundary state is
+// snapshotted at block registration and restored on a cache hit. This predicate
+// gates that snapshot/restore lifecycle (the machinery itself is state-agnostic;
+// it copies SSMSequenceRuntimeState, which for LFM2 holds conv_state only).
+bool ModelRequiresPrefixStateSnapshot(const TransformerModel* model) {
+    return model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_lfm2_shortconv);
+}
+
 bool IsHybridSSMSnapshotRestoreAllowedForModel(const TransformerModel* model) {
     if (IsHybridSSMSnapshotRestoreDisabled()) {
         return false;
@@ -1504,17 +1514,26 @@ bool IsHybridSSMSnapshotRestoreAllowedForModel(const TransformerModel* model) {
 
 BlockManager::HybridSSMSnapshotValidator BuildHybridSSMSnapshotValidatorForRequest(const TransformerModel* model,
                                                                                    const Request* req) {
-    if (!model || !req || !model->arch_flags.is_hybrid_ssm || req->ssm_runtime_states.empty()) {
+    if (!ModelRequiresPrefixStateSnapshot(model) || !req || req->ssm_runtime_states.empty()) {
         return {};
     }
 
     const size_t expected_layers = req->ssm_runtime_states.size();
-    const int expected_conv = model->ssm_inner_size + 2 * model->ssm_group_count * model->ssm_state_size;
-    const int expected_head_dim = model->ssm_inner_size / std::max(1, model->ssm_time_step_rank);
-    const size_t expected_conv_elems =
-        TransformerModel::SSMSequenceRuntimeState::ExpectedConvStateElements(expected_conv, model->ssm_conv_kernel);
-    const size_t expected_ssm_elems = TransformerModel::SSMSequenceRuntimeState::ExpectedStateElements(
-        model->ssm_time_step_rank, expected_head_dim, model->ssm_state_size);
+    size_t expected_conv_elems = 0;
+    size_t expected_ssm_elems = 0;
+    if (model->arch_flags.is_lfm2_shortconv) {
+        // LFM2 short-conv layers keep only a conv-state ring (no SSM recurrent state).
+        expected_conv_elems = TransformerModel::SSMSequenceRuntimeState::ExpectedConvStateElements(
+            static_cast<int>(model->hparams.n_embd), model->lfm2_conv_kernel);
+        expected_ssm_elems = 0;
+    } else {
+        const int expected_conv = model->ssm_inner_size + 2 * model->ssm_group_count * model->ssm_state_size;
+        const int expected_head_dim = model->ssm_inner_size / std::max(1, model->ssm_time_step_rank);
+        expected_conv_elems =
+            TransformerModel::SSMSequenceRuntimeState::ExpectedConvStateElements(expected_conv, model->ssm_conv_kernel);
+        expected_ssm_elems = TransformerModel::SSMSequenceRuntimeState::ExpectedStateElements(
+            model->ssm_time_step_rank, expected_head_dim, model->ssm_state_size);
+    }
 
     return [expected_layers, expected_conv_elems,
             expected_ssm_elems](const std::vector<TransformerModel::SSMSequenceRuntimeState>& states) {
@@ -1558,7 +1577,7 @@ BlockManager::PrefixCacheMatch ProbeReusablePrefixCacheForRequest(PagedKVCache* 
         req->original_prompt_tokens_for_cache.empty()) {
         return match;
     }
-    const bool require_snapshot = model && model->arch_flags.is_hybrid_ssm;
+    const bool require_snapshot = ModelRequiresPrefixStateSnapshot(model);
     const auto snapshot_validator = BuildHybridSSMSnapshotValidatorForRequest(model, req);
     match = kv_cache->block_manager->FindLongestCachedPrefixWithVerification(
         req->original_prompt_tokens_for_cache.data(), static_cast<int>(req->original_prompt_tokens_for_cache.size()),
@@ -2870,7 +2889,7 @@ void EngineLoop(EngineState* state) {
                         req->id, static_cast<int>(req->original_prompt_tokens_for_cache.size()), req->max_tokens,
                         req->priority, scheduler_prefix_tokens,
                         /*allow_chunked_prefill=*/!req->is_embedding,
-                        /*require_hybrid_ssm_prefix_snapshot=*/current_model && current_model->arch_flags.is_hybrid_ssm,
+                        /*require_hybrid_ssm_prefix_snapshot=*/ModelRequiresPrefixStateSnapshot(current_model),
                         prefill_chunk_tokens, hybrid_ssm_snapshot_validator);
 
                     if (seq_id < 0) {
@@ -3093,7 +3112,7 @@ void EngineLoop(EngineState* state) {
                         req->registered_prefix_blocks =
                             std::max(req->registered_prefix_blocks, hit.cached_tokens / BLOCK_SIZE);
 
-                        if (current_model && current_model->arch_flags.is_hybrid_ssm && !hit.cached_block_ids.empty() &&
+                        if (ModelRequiresPrefixStateSnapshot(current_model) && !hit.cached_block_ids.empty() &&
                             !req->ssm_runtime_states.empty()) {
                             std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot;
                             const int snapshot_block = hit.cached_block_ids.back();
@@ -5140,12 +5159,14 @@ void EngineLoop(EngineState* state) {
             const bool decode_graph_regression_single_seq_hybrid =
                 batch.num_seqs == 1 && current_model && current_model->arch_flags.is_hybrid_ssm &&
                 densecore::models::DescribeModel(current_model).variant == ModelVariant::QWEN36;
+            const bool decode_graph_regression_single_seq_lfm2 =
+                batch.num_seqs == 1 && current_model && current_model->arch_flags.is_lfm2_shortconv;
             const bool decode_graph_regression_single_seq_gemma4 =
                 batch.num_seqs == 1 && current_model && current_model->arch_flags.is_gemma4;
             const bool run_decode_graph_cache_regression_check =
                 cpu_backend_active && current_kv_cache && using_cached_decode_graph && decode_single_token_layout &&
                 (batch.num_seqs > 1 || decode_graph_regression_single_seq_hybrid ||
-                 decode_graph_regression_single_seq_gemma4) &&
+                 decode_graph_regression_single_seq_lfm2 || decode_graph_regression_single_seq_gemma4) &&
                 batch.lora_map.empty() && IsDecodeGraphCacheRegressionEnabled() &&
                 decode_graph_regression_checked_steps < DecodeGraphCacheRegressionSteps();
             const bool run_batched_decode_correctness_check =
@@ -5208,7 +5229,7 @@ void EngineLoop(EngineState* state) {
                     decode_check_ready = true;
                 }
 
-                if (current_model && current_model->arch_flags.is_hybrid_ssm) {
+                if (ModelRequiresPrefixStateSnapshot(current_model)) {
                     decode_check_ssm_ready =
                         batch.hybrid_ssm_runtime_states.size() == static_cast<size_t>(batch.num_seqs);
                     if (decode_check_ssm_ready) {
@@ -6607,8 +6628,7 @@ void EngineLoop(EngineState* state) {
                                 }
 
                                 uint64_t hash = BlockManager::ComputeTokenHash(tokens_ptr + start_token, block_tokens);
-                                const bool attach_hybrid_snapshot = current_model &&
-                                                                    current_model->arch_flags.is_hybrid_ssm &&
+                                const bool attach_hybrid_snapshot = ModelRequiresPrefixStateSnapshot(current_model) &&
                                                                     ((blk_idx + 1) * BLOCK_SIZE == req->n_past);
                                 if (attach_hybrid_snapshot) {
                                     DebugLogHybridSSMSnapshot("save", req->id, req->n_past, block_id,

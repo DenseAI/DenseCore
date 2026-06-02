@@ -1165,6 +1165,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_lfm2_shortconv_math.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_qwen35_ssm_qkv_projection.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_qwen36_model_loader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_lfm2_model_loader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_chat_template.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_model_descriptor.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_decoder_model_spec.cpp
