@@ -3069,29 +3069,14 @@ static bool Qwen35NativeMoEKQ8KFusedSwiGLURows(ggml_type weight_type, const void
     if (!gate_row_start || !up_row_start || !qrow || !out_start || cols <= 0 || row_count <= 0 || row_bytes == 0) {
         return false;
     }
-    if (weight_type == GGML_TYPE_Q5_K) {
-        const auto* gate_base = static_cast<const char*>(gate_row_start);
-        const auto* up_base = static_cast<const char*>(up_row_start);
-        for (int64_t row = 0; row < row_count; ++row) {
-            const void* gate_row = gate_base + static_cast<size_t>(row) * row_bytes;
-            const void* up_row = up_base + static_cast<size_t>(row) * row_bytes;
-            float gate = 0.0f;
-            float up = 0.0f;
-            if (!Qwen35NativeMoEKQ8KDotRow(weight_type, gate_row, qrow, cols, &gate) ||
-                !Qwen35NativeMoEKQ8KDotRow(weight_type, up_row, qrow, cols, &up)) {
-                return false;
-            }
-            out_start[row] = NativeMoESiLU(gate) * up;
-        }
-        return true;
-    }
-    if (weight_type != GGML_TYPE_Q4_K) {
+    if (weight_type != GGML_TYPE_Q4_K && weight_type != GGML_TYPE_Q5_K) {
         return false;
     }
     const ggml_type_traits_cpu* traits =
-        PreferGgmlQ4KVecDotForNativeMoE() ? ggml_get_type_traits_cpu(GGML_TYPE_Q4_K) : nullptr;
+        (weight_type == GGML_TYPE_Q5_K || PreferGgmlQ4KVecDotForNativeMoE()) ? ggml_get_type_traits_cpu(weight_type)
+                                                                             : nullptr;
     if (traits && traits->vec_dot && traits->vec_dot_type == GGML_TYPE_Q8_K &&
-        (cols % ggml_blck_size(GGML_TYPE_Q4_K)) == 0) {
+        (cols % ggml_blck_size(weight_type)) == 0) {
         const auto* gate_base = static_cast<const char*>(gate_row_start);
         const auto* up_base = static_cast<const char*>(up_row_start);
         int64_t row = 0;
@@ -3117,6 +3102,10 @@ static bool Qwen35NativeMoEKQ8KFusedSwiGLURows(ggml_type weight_type, const void
             out_start[row] = NativeMoESiLU(gate) * up;
         }
         return true;
+    }
+
+    if (weight_type == GGML_TYPE_Q5_K) {
+        return false;
     }
 
     return densecore::hwy_kernels::FusedSwiGLUQ4KQ8KRows_Hwy(gate_row_start, up_row_start, qrow, cols, row_count,
@@ -3186,7 +3175,7 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
         }
         return;
     }
-    if (q4_gateup && n_tokens > 4 && use_shared_q8 &&
+    if ((q4_gateup || q5_gateup) && n_tokens > 4 && use_shared_q8 &&
         Qwen35BuildMoEAssignments(selected_experts, gate_exps->ne[2], &assignments)) {
         const size_t qrow_bytes = shared_q8->row_bytes;
         thread_local std::vector<uint8_t> qtile;
@@ -3227,9 +3216,16 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                     }
                     std::memcpy(qtile.data() + static_cast<size_t>(ai - tile_start) * qrow_bytes, qrow, qrow_bytes);
                 }
-                if (!densecore::RunMoEQ4KRawBatchedFusedSwiGLU(&backend, gate_base, up_base, qtile.data(), qrow_bytes,
-                                                               out_tile.data(), tile_m, n_ff, gate_exps->ne[0],
-                                                               /*numa_node=*/0, /*allow_parallel=*/false)) {
+                const bool ok =
+                    q4_gateup
+                        ? densecore::RunMoEQ4KRawBatchedFusedSwiGLU(
+                              &backend, gate_base, up_base, qtile.data(), qrow_bytes, out_tile.data(), tile_m, n_ff,
+                              gate_exps->ne[0], /*numa_node=*/0, /*allow_parallel=*/false)
+                        : densecore::RunMoEKQuantRawBatchedFusedSwiGLU(
+                              &backend, static_cast<int>(gate_exps->type), gate_base, up_base, qtile.data(),
+                              qrow_bytes, out_tile.data(), tile_m, n_ff, gate_exps->ne[0], /*numa_node=*/0,
+                              /*allow_parallel=*/false);
+                if (!ok) {
                     if (shared_q8) {
                         shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
                     }
