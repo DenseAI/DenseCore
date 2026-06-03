@@ -447,6 +447,17 @@ bool RunQwen35NativeMoEQ5KQ8KDotRowForTest(const void* weight_row, const void* q
                                            float* output) {
     return densecore::hwy_kernels::DotQ5KQ8K_Hwy(weight_row, q8_input, cols, output);
 }
+int64_t Qwen35NativeMoEMaxDirectTokensForTest() {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_experts = 1;
+    model.hparams.n_experts_used = 1;
+    model.layers.resize(1);
+    model.layers[0].is_moe = true;
+    return ::NativeMoEFastPathMaxDirectTokens(&model);
+}
 bool RunQwen35NativeQuantizeRowQ8KForTest(const float* input, void* q8_output, int64_t cols) {
     return ::Qwen35NativeQuantizeRowQ8K(input, static_cast<uint8_t*>(q8_output), cols);
 }
@@ -585,9 +596,50 @@ bool QActCacheResetAcrossCachedDecodeReuseForTest() {
     ggml_free(ggml_ctx);
     return filled && reset;
 }
-bool RunQwen36Q4KBatchedShadowProbeForTest(int nth, int force_fail_ith, bool* output_matches_reference,
-                                           int* admission_state, int* reject_reason) {
-    if (output_matches_reference) *output_matches_reference = false;
+
+bool QActBatchedCacheReusesSameTensorForTest() {
+    InferenceWorkContext ctx{};
+    ctx.execution_generation = 42;
+    constexpr int M = 4;
+    constexpr int N = QK_K;
+    std::vector<float> values(static_cast<size_t>(M) * static_cast<size_t>(N));
+    for (size_t i = 0; i < values.size(); ++i) {
+        values[i] = static_cast<float>(i % 127) * 0.003f;
+    }
+    std::vector<const float*> rows(static_cast<size_t>(M));
+    for (int m = 0; m < M; ++m) {
+        rows[static_cast<size_t>(m)] = values.data() + static_cast<size_t>(m) * static_cast<size_t>(N);
+    }
+
+    ggml_init_params params{64 * 1024, nullptr, false};
+    ggml_context* ggml_ctx = ggml_init(params);
+    if (!ggml_ctx) {
+        return false;
+    }
+    ggml_tensor* t0 = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, N, M);
+    if (!t0) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+    t0->data = values.data();
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, N);
+    const size_t q8_total_bytes = q8_row_bytes * static_cast<size_t>(M);
+    const uint8_t* first = ::GetOrFillBatchedQuantizedActivationCache(
+        &ctx, t0, t0->data, rows, M, N, GGML_TYPE_Q8_K, q8_row_bytes, q8_total_bytes, 7, q8_traits);
+    const uint64_t misses_after_first = ctx.qwen36_profile.qact_cache_misses.load(std::memory_order_relaxed);
+    const uint8_t* second = ::GetOrFillBatchedQuantizedActivationCache(
+        &ctx, t0, t0->data, rows, M, N, GGML_TYPE_Q8_K, q8_row_bytes, q8_total_bytes, 7, q8_traits);
+    const uint64_t hits_after_second = ctx.qwen36_profile.qact_cache_hits.load(std::memory_order_relaxed);
+    const uint64_t reused_after_second = ctx.qwen36_profile.qact_cache_reused_bytes.load(std::memory_order_relaxed);
+    ggml_free(ggml_ctx);
+    return first && second && first == second && misses_after_first == 1 && hits_after_second == 1 &&
+           reused_after_second == q8_total_bytes;
+}
+
+bool RunQwen36Q4KBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle,
+                                      int* admission_state, int* reject_reason) {
+    if (output_matches_vecdot_oracle) *output_matches_vecdot_oracle = false;
     if (admission_state) *admission_state = 0;
     if (reject_reason) *reject_reason = 0;
     constexpr int rows = 8;
@@ -632,7 +684,7 @@ bool RunQwen36Q4KBatchedShadowProbeForTest(int nth, int force_fail_ith, bool* ou
                               cols);
     }
     std::fill_n(reinterpret_cast<float*>(dst->data), rows * tokens, 12345.0f);
-    const uint64_t key = 0x9d360000ull + static_cast<uint64_t>(force_fail_ith + 2);
+    constexpr uint64_t key = 0x9d360000ull;
     {
         std::lock_guard<std::mutex> lock(::Qwen36Q4KBatchedAdmissionMutex());
         ::Qwen36Q4KBatchedAdmissionMap().erase(key);
@@ -647,17 +699,16 @@ bool RunQwen36Q4KBatchedShadowProbeForTest(int nth, int force_fail_ith, bool* ou
     ud.quant_row_stride = densecore::AlignUp(ggml_row_size(GGML_TYPE_Q8_K, cols), static_cast<size_t>(64));
     ud.slot_id = -1;
     ud.qwen36_prefill_q4k_admission_key = key;
-    ud.qwen36_prefill_q4k_probe = true;
+    ud.qwen36_prefill_q4k_probe = false;
     ud.qwen36_prefill_q4k_admitted = true;
+    ud.require_q4k_true_batched = true;
     InferenceWorkContext work_ctx{};
     ResetInferenceWorkContext(&work_ctx);
     ud.work_ctx = &work_ctx;
     SetCurrentWorkContext(&work_ctx);
-    Qwen36Q4KBatchedProbeForceFailThreadForTest().store(force_fail_ith, std::memory_order_relaxed);
     for (int ith = 0; ith < std::max(1, nth); ++ith) {
         cb_gemv_batched_custom(dst, ith, std::max(1, nth), &ud);
     }
-    Qwen36Q4KBatchedProbeForceFailThreadForTest().store(-1, std::memory_order_relaxed);
     SetCurrentWorkContext(nullptr);
     std::vector<uint8_t> q8(static_cast<size_t>(tokens) * ud.quant_row_stride);
     for (int m = 0; m < tokens; ++m) {
@@ -671,8 +722,11 @@ bool RunQwen36Q4KBatchedShadowProbeForTest(int nth, int force_fail_ith, bool* ou
                               static_cast<size_t>(r) * ggml_row_size(GGML_TYPE_Q4_K, cols);
         for (int m = 0; m < tokens; ++m) {
             float ref = 0.0f;
-            q4_traits->vec_dot(cols, &ref, 0, row_ptr, 0, q8.data() + static_cast<size_t>(m) * ud.quant_row_stride, 0,
-                               1);
+            if (!densecore::hwy_kernels::DotQ4KQ8K_Hwy(row_ptr, q8.data() + static_cast<size_t>(m) * ud.quant_row_stride,
+                                                       cols, &ref)) {
+                matches = false;
+                continue;
+            }
             const float got = out[static_cast<size_t>(m) * rows + r];
             if (std::fabs(got - ref) > 1e-5f) {
                 matches = false;
@@ -680,7 +734,7 @@ bool RunQwen36Q4KBatchedShadowProbeForTest(int nth, int force_fail_ith, bool* ou
         }
     }
     const auto value = ::LookupQwen36Q4KBatchedAdmission(key);
-    if (output_matches_reference) *output_matches_reference = matches;
+    if (output_matches_vecdot_oracle) *output_matches_vecdot_oracle = matches;
     if (admission_state) *admission_state = static_cast<int>(value.state);
     if (reject_reason) *reject_reason = static_cast<int>(value.reject_reason);
     ggml_free(ggml_ctx);
@@ -688,6 +742,31 @@ bool RunQwen36Q4KBatchedShadowProbeForTest(int nth, int force_fail_ith, bool* ou
 }
 int ResolveQwen36MoECallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int top_k) {
     return ::ResolveQwen36MoECallbackTaskCount(model, batch, top_k);
+}
+
+bool ShouldEnableNativeMoEFastPathByDefaultForTest(const TransformerModel* model, int phase, int mode) {
+    return ::ShouldEnableNativeMoEFastPathByDefault(model, static_cast<InferenceExecutionPhase>(phase),
+                                                   static_cast<densecore::env::RuntimeToggleMode>(mode));
+}
+
+bool CanUseQwenNativeMoEGateUpForTest(const TransformerModel* model, const ggml_tensor* gate_exps,
+                                      const ggml_tensor* up_exps, const ggml_tensor* input,
+                                      const ggml_tensor* selected_experts, int phase) {
+    InferenceWorkContext* previous_ctx = GetCurrentWorkContext();
+    std::unique_ptr<InferenceWorkContext, void (*)(InferenceWorkContext*)> owned_ctx(nullptr,
+                                                                                    DestroyInferenceWorkContext);
+    if (!previous_ctx) {
+        owned_ctx.reset(CreateInferenceWorkContext());
+        SetCurrentWorkContext(owned_ctx.get());
+    }
+    const InferenceExecutionPhase previous = GetCurrentExecutionPhase();
+    SetCurrentExecutionPhase(static_cast<InferenceExecutionPhase>(phase));
+    const bool accepted = ::CanUseQwen35NativeMoEGateUpRawQXKSwiGLU(model, gate_exps, up_exps, input, selected_experts);
+    SetCurrentExecutionPhase(previous);
+    if (!previous_ctx) {
+        SetCurrentWorkContext(nullptr);
+    }
+    return accepted;
 }
 }  // namespace testing
 }  // namespace densecore

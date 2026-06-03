@@ -40,7 +40,7 @@ double ParsePositiveDoubleEnv(const char* name, double default_value) {
 Qwen36PrefillQ4KBatchedMode ParseQwen36PrefillQ4KBatchedMode(const char* value) {
     const std::string mode = env::AsciiLowerCopy(value);
     if (mode.empty() || mode == "probe" || mode == "auto") {
-        return Qwen36PrefillQ4KBatchedMode::Probe;
+        return Qwen36PrefillQ4KBatchedMode::On;
     }
     if (mode == "off" || mode == "0" || mode == "false" || mode == "no") {
         return Qwen36PrefillQ4KBatchedMode::Off;

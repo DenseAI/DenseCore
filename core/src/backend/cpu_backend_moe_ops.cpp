@@ -1,6 +1,7 @@
 #include "backend/cpu_backend_internal.h"
 #include "ggml-cpu.h"  // For ggml_get_type_traits_cpu (vec_dot)
 #include "kernels/hwy/hwy_kernels.h"
+#include "kernels/kernel_caps.h"
 #include "kernels/q4k_repacked_gemv.h"
 #include "runtime/runtime_env.h"
 
@@ -287,9 +288,9 @@ bool ComputeMoEQ4KQ8KBatchedRow(const void* weight_row, const uint8_t* quant_inp
     return ComputeMoEQ4KQ8KBatchedRowScalar(weight_row, quant_input_base, quant_row_stride, M, K, out_sums);
 }
 
-bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
-                                   size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
-                                   int numa_node, bool allow_parallel) {
+bool RunMoEQ4KRawBatchedProjectionImpl(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
+                                       size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
+                                       int numa_node, bool allow_parallel) {
     if (!backend || !weight_ptr || !qinput_data || !out_data || M <= 0 || M > kMoEQuantizedProjectionMaxBatch ||
         N <= 0 || K <= 0 || (K % QK_K) != 0) {
         return false;
@@ -329,9 +330,9 @@ bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, 
     return ok.load(std::memory_order_relaxed);
 }
 
-bool RunMoEQ4KRawBatchedFusedSwiGLU(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
-                                    const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
-                                    int64_t N, int64_t K, int numa_node, bool allow_parallel) {
+bool RunMoEQ4KRawBatchedFusedSwiGLUImpl(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
+                                        const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data,
+                                        int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel) {
     if (!backend || !gate_weight_ptr || !up_weight_ptr || !qinput_data || !out_data || M <= 0 ||
         M > kMoEQuantizedProjectionMaxBatch || N <= 0 || K <= 0 || (K % QK_K) != 0) {
         return false;
@@ -432,11 +433,8 @@ bool CanUseMoEQ4KRawBatchedScalar() {
 }
 
 bool CanUseKQuantRowPairVecDotFastPath() {
-#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_MATMUL_INT8)
-    return true;
-#else
-    return false;
-#endif
+    // Phase 0: single source of truth in kernels/kernel_caps.h.
+    return densecore::kernels::KQuantVecDotRowPairSupported();
 }
 
 bool CanUseQ4KRowPairVecDotFastPath() {
@@ -2375,8 +2373,8 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
     }
     if (CanUseMoEQ4KRawBatchedScalar() && wtype == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K && M > 1 &&
         K % ggml_blck_size(GGML_TYPE_Q4_K) == 0) {
-        if (RunMoEQ4KRawBatchedProjection(backend, weight_ptr, qinput_data, iq_row_bytes, out_data, M, N, K, numa_node,
-                                          allow_parallel)) {
+        if (RunMoEQ4KRawBatchedProjectionImpl(backend, weight_ptr, qinput_data, iq_row_bytes, out_data, M, N, K,
+                                              numa_node, allow_parallel)) {
             LogMoEMatmulPath("ggml_q4k_raw_batched", static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0,
                              allow_parallel);
             record_q4k_repacked(false, "raw_batched_used");
@@ -2870,8 +2868,8 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
     }
     if (CanUseMoEQ4KRawBatchedScalar() && gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K &&
         iq_type == GGML_TYPE_Q8_K && M > 1 && K % ggml_blck_size(GGML_TYPE_Q4_K) == 0) {
-        if (RunMoEQ4KRawBatchedFusedSwiGLU(backend, gate_weight_ptr, up_weight_ptr, qinput_data, iq_row_bytes, out_data,
-                                           M, N, K, numa_node, allow_parallel)) {
+        if (RunMoEQ4KRawBatchedFusedSwiGLUImpl(backend, gate_weight_ptr, up_weight_ptr, qinput_data, iq_row_bytes,
+                                               out_data, M, N, K, numa_node, allow_parallel)) {
             LogMoEMatmulPath("ggml_q4k_raw_batched_fused_swiglu", static_cast<int>(M), static_cast<int>(K),
                              static_cast<int>(N), 0, allow_parallel);
             record_q4k_repacked(false, "raw_batched_used");
@@ -3592,6 +3590,20 @@ bool RunQ4KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* 
     return RunQ4KRepackedMoEFusedSwiGLUM4(backend, gate_packed, up_packed, input_data, qinput_data,
                                           qinput_row_bytes, output_data, rows, cols, input_cols, numa_node,
                                           allow_parallel);
+}
+
+bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
+                                   size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
+                                   int numa_node, bool allow_parallel) {
+    return RunMoEQ4KRawBatchedProjectionImpl(backend, weight_ptr, qinput_data, qinput_row_bytes, out_data, M, N, K,
+                                            numa_node, allow_parallel);
+}
+
+bool RunMoEQ4KRawBatchedFusedSwiGLU(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
+                                    const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
+                                    int64_t N, int64_t K, int numa_node, bool allow_parallel) {
+    return RunMoEQ4KRawBatchedFusedSwiGLUImpl(backend, gate_weight_ptr, up_weight_ptr, qinput_data, qinput_row_bytes,
+                                             out_data, M, N, K, numa_node, allow_parallel);
 }
 
 void CpuBackend::ApplyMultiLoRA(

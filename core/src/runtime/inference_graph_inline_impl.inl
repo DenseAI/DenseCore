@@ -2182,10 +2182,14 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     throw densecore::InvalidArgumentException(
                         "Gemma4 MoE native graph construction failed; refusing slow CPU backend MoE fallback");
                 }
-                if (model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv &&
-                    GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode) {
+                const bool qwen_native_moe = (model->variant == ModelVariant::QWEN35 ||
+                                              model->variant == ModelVariant::QWEN36) &&
+                                             model->arch_flags.is_hybrid_ssm;
+                const bool lfm2_native_moe =
+                    model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv;
+                if (qwen_native_moe || lfm2_native_moe) {
                     throw densecore::InvalidArgumentException(
-                        "LFM2 decode native MoE fast path unavailable; refusing slow CPU backend MoE fallback");
+                        "Native MoE fast path unavailable; refusing slow CPU backend MoE fallback");
                 }
                 MoEUserData* moe_ud = AllocateMoEUserData(ctx_c);
                 if (moe_ud) {

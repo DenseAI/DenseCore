@@ -38,8 +38,9 @@ extern bool Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode mode
 extern bool QActCacheSharedDataDifferentTensorMissesForTest();
 extern bool QActCacheSameTensorDifferentTokenOrSlotMissesForTest(bool change_token_pos);
 extern bool QActCacheResetAcrossCachedDecodeReuseForTest();
-extern bool RunQwen36Q4KBatchedShadowProbeForTest(int nth, int force_fail_ith, bool* output_matches_reference,
-                                                  int* admission_state, int* reject_reason);
+extern bool QActBatchedCacheReusesSameTensorForTest();
+extern bool RunQwen36Q4KBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle, int* admission_state,
+                                             int* reject_reason);
 extern int ResolveQwen36PrefillQ4KBatchedReasonForTest(bool relevant, bool mode_off, bool lora_active,
                                                        bool weight_is_q4k, bool shape_supported,
                                                        bool kernel_available, bool has_vec_dot, bool candidate_ready,
@@ -312,6 +313,10 @@ TEST(DecodeGraphCachePolicyTest, QActCacheResetsAcrossCachedDecodeGraphReuse) {
     EXPECT_TRUE(densecore::testing::QActCacheResetAcrossCachedDecodeReuseForTest());
 }
 
+TEST(DecodeGraphCachePolicyTest, QActBatchedCacheReusesSameTensorWithinExecution) {
+    EXPECT_TRUE(densecore::testing::QActBatchedCacheReusesSameTensorForTest());
+}
+
 TEST(DecodeGraphCachePolicyTest, Qwen36PrefillQ4KReasonDoesNotAdmitInvalidCandidates) {
     constexpr int kPass = 1;
     EXPECT_EQ(densecore::testing::ResolveQwen36PrefillQ4KBatchedReasonForTest(
@@ -368,26 +373,26 @@ TEST(DecodeGraphCachePolicyTest, Qwen36SSMQ8PrefillAMXAdmissionRequiresExplicitP
     EXPECT_EQ(densecore::testing::ResolveQwen36SSMQ8PrefillAMXReasonForTest(kModeOn, kPrefill, false), 0);
 }
 
-TEST(DecodeGraphCachePolicyTest, Qwen36ProbeUnknownPublishesReferenceOutput) {
-    bool output_matches_reference = false;
+TEST(DecodeGraphCachePolicyTest, Qwen36DirectBatchedPathPublishesKernelOutput) {
+    bool output_matches_vecdot_oracle = false;
     int admission_state = 0;
     int reject_reason = 0;
-    ASSERT_TRUE(densecore::testing::RunQwen36Q4KBatchedShadowProbeForTest(
-        /*nth=*/2, /*force_fail_ith=*/-1, &output_matches_reference, &admission_state, &reject_reason));
-    EXPECT_TRUE(output_matches_reference);
-    EXPECT_NE(admission_state, 0);
-    EXPECT_TRUE(reject_reason == 6 || reject_reason == 8);
+    ASSERT_TRUE(densecore::testing::RunQwen36Q4KBatchedDirectForTest(
+        /*nth=*/2, &output_matches_vecdot_oracle, &admission_state, &reject_reason));
+    EXPECT_TRUE(output_matches_vecdot_oracle);
+    EXPECT_EQ(admission_state, 0);
+    EXPECT_EQ(reject_reason, 0);
 }
 
-TEST(DecodeGraphCachePolicyTest, Qwen36ProbeRejectsIfAnyWorkerPartitionFails) {
-    bool output_matches_reference = false;
+TEST(DecodeGraphCachePolicyTest, Qwen36DirectBatchedPathDoesNotShadowRejectPartitions) {
+    bool output_matches_vecdot_oracle = false;
     int admission_state = 0;
     int reject_reason = 0;
-    ASSERT_TRUE(densecore::testing::RunQwen36Q4KBatchedShadowProbeForTest(
-        /*nth=*/2, /*force_fail_ith=*/1, &output_matches_reference, &admission_state, &reject_reason));
-    EXPECT_TRUE(output_matches_reference);
-    EXPECT_EQ(admission_state, 2);
-    EXPECT_EQ(reject_reason, 6);
+    ASSERT_TRUE(densecore::testing::RunQwen36Q4KBatchedDirectForTest(
+        /*nth=*/2, &output_matches_vecdot_oracle, &admission_state, &reject_reason));
+    EXPECT_TRUE(output_matches_vecdot_oracle);
+    EXPECT_EQ(admission_state, 0);
+    EXPECT_EQ(reject_reason, 0);
 }
 
 TEST(DecodeGraphCachePolicyTest, Q4KCopiedGemvExperimentMatchesVecDotReference) {

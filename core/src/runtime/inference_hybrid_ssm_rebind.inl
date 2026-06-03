@@ -1,3 +1,5 @@
+#include "densecore/models/model_execution_contract.h"
+
 bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& batch) {
     if (!graph) {
         return false;
@@ -127,4 +129,37 @@ bool RebindLFM2DecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& 
     }
 
     return conv_rebinds > 0;
+}
+
+bool RebindDecodeGraphRuntimeStateForModel(const TransformerModel* model, GgmlGraphHandle* graph,
+                                           const BatchSpec& batch) {
+    const auto contract = densecore::models::BuildModelExecutionContract(model);
+    if (!densecore::models::ModelExecutionContractRequiresDecodeGraphRuntimeRebind(contract)) {
+        return true;
+    }
+
+    bool needs_hybrid_ssm_rebind = false;
+    bool needs_lfm2_rebind = false;
+    for (const auto& descriptor : contract.rebind_descriptors) {
+        switch (descriptor.op_kind) {
+        case densecore::models::ExecutionCustomOpRebindKind::HybridSSMConv1D:
+        case densecore::models::ExecutionCustomOpRebindKind::HybridSSMDelta:
+            needs_hybrid_ssm_rebind = true;
+            break;
+        case densecore::models::ExecutionCustomOpRebindKind::LFM2ShortConv:
+            needs_lfm2_rebind = true;
+            break;
+        case densecore::models::ExecutionCustomOpRebindKind::None:
+            break;
+        }
+    }
+
+    bool ok = true;
+    if (needs_hybrid_ssm_rebind) {
+        ok = RebindHybridSSMDecodeGraphRuntimeState(graph, batch) && ok;
+    }
+    if (needs_lfm2_rebind) {
+        ok = RebindLFM2DecodeGraphRuntimeState(graph, batch) && ok;
+    }
+    return ok;
 }

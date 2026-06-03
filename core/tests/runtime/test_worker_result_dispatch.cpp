@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "densecore/runtime/ggml_compute_policy.h"
 #include "runtime/worker_internal.h"
 #include "runtime/kernel_admission.h"
 
@@ -131,6 +132,8 @@ TEST(WorkerResultDispatchTest, Qwen35DecodeSummaryUsesDedicatedTag) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
     model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_experts = 128;
 
     Request req{};
     InitDecodeSummaryRequest(&req);
@@ -222,6 +225,81 @@ TEST(WorkerResultDispatchTest, DecodeSummaryIncludesQ5MoeTelemetry) {
               std::string::npos);
 }
 
+TEST(WorkerResultDispatchTest, QwenDecodeSummaryMarksFallbackAsFastPathFailure) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_experts = 128;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.qwen_target_ggml_compute_ops = 2;
+    req.qwen_target_ggml_matmul_ops = 2;
+    req.qwen_target_ggml_compute_last_reason = "temporary_reference_generic_matmul_fallback";
+    req.qwen_target_ggml_compute_last_op = "ggml_mul_mat";
+    req.qwen_target_ggml_compute_target = "qwen35_35b_a3b";
+    req.native_moe_fallback_w2_ops = 1;
+    req.native_moe_fast_w2_q5k_rejected_ops = 1;
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("qwen_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_fast_path_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_fast_path_failure_reason=ggml_compute_or_matmul_path"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=ggml_compute_or_matmul_path"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_target_ggml_compute_ops=2"), std::string::npos);
+    EXPECT_NE(captured.find("native_moe_fallback_w2_ops=1"), std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, QwenTargetRejectsTemporaryReferenceGgmlComputeByDefault) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_experts = 128;
+
+    const auto plan = densecore::runtime::ResolveQwenHotPathPlan(&model);
+    ASSERT_TRUE(plan.target_model);
+    EXPECT_TRUE(densecore::runtime::ShouldRejectQwenGgmlCompute(
+        plan, "temporary_reference_generic_matmul_fallback"));
+    EXPECT_TRUE(densecore::runtime::ShouldRejectQwenGgmlCompute(plan, "native_moe_w2_fast_node_missing"));
+}
+
+TEST(WorkerResultDispatchTest, QwenDecodeSummaryAcceptsNativeMoeFastGateUpAndDown) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_experts = 128;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.native_moe_fast_decode_used_ops = 2;
+    req.native_moe_fast_decode_w1w3_used_ops = 1;
+    req.native_moe_fast_decode_w2_used_ops = 1;
+    req.native_moe_fast_w1w3_used_ops = 1;
+    req.native_moe_fast_w2_used_ops = 1;
+    req.native_moe_fast_w2_q5k_used_ops = 1;
+    req.qwen35_moe_forward_calls = 1;
+    req.qwen35_moe_path = "native_graph";
+    req.qwen35_moe_w1w3_weight_type_hist[0] = 1;
+    req.qwen35_moe_w2_weight_type_hist[1] = 1;
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=none"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_fast_path_ok=1"), std::string::npos);
+}
+
 TEST(WorkerResultDispatchTest, LFM2DecodeSummaryIncludesDedicatedFastPathAliases) {
     TransformerModel model{};
     model.arch = ModelArch::LFM2;
@@ -253,6 +331,33 @@ TEST(WorkerResultDispatchTest, LFM2DecodeSummaryIncludesDedicatedFastPathAliases
     EXPECT_NE(captured.find("lfm2_w2_q4k_repacked_used_ops=3"), std::string::npos);
     EXPECT_NE(captured.find("lfm2_shortconv_sequence_fast_used_ops=4"), std::string::npos);
     EXPECT_NE(captured.find("lfm2_decode_graph_rebuilds=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=none"), std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, LFM2DecodeSummaryMarksNativeMoeFallbackAsFastPathFailure) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_lfm2_shortconv = true;
+    model.hparams.n_experts = 32;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.native_moe_fallback_w1w3_ops = 1;
+    req.qwen35_moe_forward_calls = 1;
+    req.qwen35_moe_path = "native_graph";
+    req.qwen35_moe_w1w3_weight_type_hist[0] = 1;
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("[LFM2DecodeSummary]"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=native_moe_w1w3_or_w2_fallback"), std::string::npos);
 }
 
 TEST(WorkerResultDispatchTest, DecodeSummaryTagsQwen36AndGemma4Variants) {

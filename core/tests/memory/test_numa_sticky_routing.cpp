@@ -34,6 +34,7 @@
 #include "densecore/moe/profiler.h"
 #include "densecore/simd/hwy_ops.h"
 #include "densecore/simd/simd_ops.h"
+#include "kernels/kernel_caps.h"
 
 using namespace densecore;
 using namespace densecore::moe;
@@ -69,6 +70,8 @@ bool RunGgmlQuantizedFusedGEGLUProjectionForTest(CpuBackend* backend, const void
                                                  int gate_ggml_type_id, const void* up_weight_ptr, int up_ggml_type_id,
                                                  const Tensor& input, Tensor* output, int64_t N, int64_t K);
 bool RunQwen35NativeMoEQ4KQ8KDotRowForTest(const void* weight_row, const void* q8_input, int64_t cols,
+                                           float* output);
+bool RunQwen35NativeMoEQ5KQ8KDotRowForTest(const void* weight_row, const void* q8_input, int64_t cols,
                                            float* output);
 bool RunQwen35NativeQuantizeRowQ8KForTest(const float* input, void* q8_output, int64_t cols);
 }  // namespace densecore::testing
@@ -1747,7 +1750,7 @@ TEST(NumaStickyRouting, Q6KQ8KRowPairVecDotMatchesScalarRows) {
     const auto* q6_traits = ggml_get_type_traits_cpu(qtype);
     ASSERT_NE(q6_traits, nullptr);
     ASSERT_NE(q6_traits->vec_dot, nullptr);
-    if (q6_traits->nrows < 2) {
+    if (!densecore::kernels::KQuantVecDotRowPairSupported()) {
         GTEST_SKIP() << "Q6_K row-pair vec_dot is not available for this build.";
     }
 
@@ -1821,6 +1824,39 @@ TEST(NumaStickyRouting, Qwen35NativeQ4KQ8KDotKeepsDenseCoreQ8CompatibilityOnX86)
         EXPECT_FLOAT_EQ(native_value, hwy_value) << "row=" << row;
     }
 #endif
+}
+
+TEST(NumaStickyRouting, QwenNativeQ5KGateUpDotUsesDenseCoreQ8FastPath) {
+    constexpr int K = 256;
+    constexpr int N = 8;
+    constexpr ggml_type qtype = GGML_TYPE_Q5_K;
+
+    std::mt19937 rng(1831);
+    std::uniform_real_distribution<float> input_dist(-1.25f, 1.25f);
+    std::uniform_real_distribution<float> weight_dist(-0.75f, 0.75f);
+
+    std::vector<float> input(static_cast<size_t>(K));
+    std::vector<float> weight_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : weight_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> weight_q5k;
+    QuantizeRowsForTest(qtype, weight_f32, N, K, &weight_q5k);
+
+    const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, K);
+    std::vector<uint8_t> densecore_q8(q8_row_bytes);
+    ASSERT_TRUE(densecore::testing::RunQwen35NativeQuantizeRowQ8KForTest(input.data(), densecore_q8.data(), K));
+
+    const size_t row_bytes = ggml_row_size(qtype, K);
+    for (int row = 0; row < N; ++row) {
+        const void* weight_row = weight_q5k.data() + static_cast<size_t>(row) * row_bytes;
+        float native_value = 0.0f;
+        float hwy_value = 0.0f;
+        ASSERT_TRUE(densecore::testing::RunQwen35NativeMoEQ5KQ8KDotRowForTest(weight_row, densecore_q8.data(), K,
+                                                                              &native_value));
+        ASSERT_TRUE(densecore::hwy_kernels::DotQ5KQ8K_Hwy(weight_row, densecore_q8.data(), K, &hwy_value));
+        EXPECT_FLOAT_EQ(native_value, hwy_value) << "row=" << row;
+    }
 }
 
 TEST(NumaStickyRouting, GgmlQ4KRepackedPrefillGemmFusedSwiGLUMatchesDenseReferenceWithTail) {

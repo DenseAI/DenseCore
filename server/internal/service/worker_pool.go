@@ -91,6 +91,17 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 			slog.String("req_id", req.ID),
 			slog.String("priority", fmtPriority(req.Priority)),
 		)
+		if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
+			slog.Info("request lifecycle: queue_dequeue",
+				slog.String("trace_id", req.TraceID),
+				slog.String("queue_request_id", req.ID),
+				slog.Int("worker_id", workerID),
+				slog.String("priority", fmtPriority(req.Priority)),
+				slog.Int("max_tokens", req.MaxTokens),
+				slog.Int("prompt_len", len(req.Prompt)),
+				slog.Int("input_ids", len(req.InputIDs)),
+			)
+		}
 		queueWaitMS := durationMillis(time.Since(req.EnqueueTime))
 
 		outputChan := req.OutputChan
@@ -111,6 +122,14 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 
 		// 4. Submit to Engine
 		submitStart := time.Now()
+		if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
+			slog.Info("request lifecycle: engine_submit_begin",
+				slog.String("trace_id", req.TraceID),
+				slog.String("queue_request_id", req.ID),
+				slog.Int("worker_id", workerID),
+				slog.Int("queue_wait_ms", int(queueWaitMS)),
+			)
+		}
 		completionCh, err := p.submitRequestToEngine(engine, req, outputChan)
 		engineSubmitMS := durationMillis(time.Since(submitStart))
 

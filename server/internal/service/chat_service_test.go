@@ -178,7 +178,7 @@ func TestNormalizeSamplingQwenNoThinkingDefaults(t *testing.T) {
 	}
 }
 
-func TestStartGenerationQwen35ExactAnswerUsesEnginePath(t *testing.T) {
+func TestStartGenerationQwen35ExactAnswerDoesNotConstrainEnginePath(t *testing.T) {
 	engine := &exactAnswerTestEngine{
 		tokens: map[string][]int{
 			"Paris":  {9079},
@@ -225,13 +225,13 @@ func TestStartGenerationQwen35ExactAnswerUsesEnginePath(t *testing.T) {
 			events[0].Terminal, events[0].IsFinished, events[0].TerminalError())
 	}
 	if !engine.textSubmitCalled {
-		t.Fatalf("expected exact-answer request to be submitted to engine text path")
+		t.Fatalf("expected request to be submitted to engine text path")
 	}
-	if got, want := engine.lastAllowedTokenIDs, []int{9079, 12908}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("allowedTokenIDs=%v want %v", got, want)
+	if len(engine.lastAllowedTokenIDs) != 0 {
+		t.Fatalf("allowedTokenIDs=%v want empty", engine.lastAllowedTokenIDs)
 	}
-	if !engine.lastAllowedStrict {
-		t.Fatalf("expected strict exact-answer token constraint")
+	if engine.lastAllowedStrict {
+		t.Fatalf("expected no strict exact-answer token constraint")
 	}
 }
 
@@ -367,7 +367,7 @@ func TestNormalizeSamplingHonorsExplicitRequestValues(t *testing.T) {
 	}
 }
 
-func TestResolveChatQualityProfileUsesExactAnswerOverrideForQwen36(t *testing.T) {
+func TestResolveChatQualityProfileDoesNotUseExactAnswerOverrideForQwen36(t *testing.T) {
 	engine := &exactAnswerTestEngine{
 		tokens: map[string][]int{
 			"Paris":  {17},
@@ -384,13 +384,13 @@ func TestResolveChatQualityProfileUsesExactAnswerOverrideForQwen36(t *testing.T)
 	}
 
 	exactAnswer := deriveExactAnswerConstraint(engine, req)
-	if exactAnswer == nil {
-		t.Fatalf("expected exact-answer constraint")
+	if exactAnswer != nil {
+		t.Fatalf("expected no exact-answer constraint, got %#v", exactAnswer)
 	}
 
 	profile := resolveChatQualityProfile("/tmp/Qwen3.6-35B-A3B-Q4_K_M.gguf", "", "", req, exactAnswer)
-	if profile != "exact_answer" {
-		t.Fatalf("expected quality profile exact_answer, got %q", profile)
+	if profile != "qwen36_longform" {
+		t.Fatalf("expected quality profile qwen36_longform, got %q", profile)
 	}
 }
 

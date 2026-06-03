@@ -193,10 +193,11 @@ struct DenseCoreFallbackPolicy {
     static constexpr bool kEnvOverrideAllowed = false;
 
     static bool AllowsGgmlCompute(const QwenHotPathPlan& plan, const char* reason) {
+        (void)reason;
         if (!plan.target_model) {
             return true;
         }
-        return IsExplicitTemporaryReferenceFallback(reason);
+        return false;
     }
 };
 

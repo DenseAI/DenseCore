@@ -83,6 +83,37 @@ const densecore::llm::config::WorkerRuntimeConfig& GetWorkerRuntimeConfig() {
     return GetFastPathRuntimeConfig().worker;
 }
 
+bool IsRequestLifecycleTraceEnabled() {
+    static const bool enabled =
+        densecore::llm::config::ReadBoolEnv("DENSECORE_DEBUG_REQUEST_LIFECYCLE", false);
+    return enabled;
+}
+
+void LogRequestLifecyclePhase(const char* phase, const Request* req, const TransformerModel* model, int seq_id = -1,
+                              int batch_seqs = 0, int batch_tokens = 0, int active_threads = 0,
+                              const char* detail = nullptr) {
+    if (!IsRequestLifecycleTraceEnabled()) {
+        return;
+    }
+    const auto descriptor = densecore::models::DescribeModel(model);
+    std::cerr << "[RequestLifecycle] phase=" << (phase ? phase : "unknown")
+              << " request_id=" << (req ? req->id : -1)
+              << " seq_id=" << seq_id
+              << " variant=" << densecore::models::ModelVariantName(descriptor.variant)
+              << " is_prefill=" << (req && req->is_prefill ? 1 : 0)
+              << " prompt_tokens=" << (req ? req->tokens.size() : 0)
+              << " n_past=" << (req ? req->n_past : 0)
+              << " generated=" << (req ? req->generated_count : 0)
+              << " max_tokens=" << (req ? req->max_tokens : 0)
+              << " batch_seqs=" << batch_seqs
+              << " batch_tokens=" << batch_tokens
+              << " active_threads=" << active_threads;
+    if (detail && detail[0] != '\0') {
+        std::cerr << " detail=" << detail;
+    }
+    std::cerr << std::endl;
+}
+
 class ScopedFastPathRuntimeConfigBinder {
 public:
     explicit ScopedFastPathRuntimeConfigBinder(const densecore::llm::config::FastPathRuntimeConfig* config)
@@ -922,7 +953,9 @@ NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const Transfo
         } else if (std::strstr(name, "_expert_sum") || std::strstr(name, "_moe_out")) {
             bucket = Reduce;
         }
-        const bool fast_w1w3_node = bucket == W1W3 && std::strstr(name, "_gateup_raw_q4k_swiglu");
+        const bool fast_w1w3_node = bucket == W1W3 &&
+                                     (std::strstr(name, "_gateup_raw_q4k_swiglu") ||
+                                      std::strstr(name, "_gateup_raw_qxk_swiglu"));
         const bool fast_w2_node = bucket == W2 && std::strstr(name, "_down_q5k_fast");
         buckets[static_cast<std::size_t>(bucket)].ns += elapsed_ns;
         buckets[static_cast<std::size_t>(bucket)].count += 1;
@@ -2709,6 +2742,7 @@ void EngineLoop(EngineState* state) {
                     if (!req) break;  // Queue empty
 
                     state->RemovePendingRequest(req->id);
+                    LogRequestLifecyclePhase("engine_queue_pop", req, current_model);
 
                     // std::cerr << "[DEBUG] EngineLoop: Popped request " << req->id
                     //           << std::endl;
@@ -2910,6 +2944,7 @@ void EngineLoop(EngineState* state) {
 
                     // Store seq_id in request for O(1) cleanup lookup
                     req->seq_id = seq_id;
+                    LogRequestLifecyclePhase("scheduler_admit", req, current_model, seq_id);
 
                     // Store mapping and add to active list
                     seq_to_request[seq_id] = req;
@@ -3865,6 +3900,11 @@ void EngineLoop(EngineState* state) {
             }
 
             batch.num_seqs = batch_requests.size();
+            LogRequestLifecyclePhase("batch_ready", !batch_requests.empty() ? batch_requests.front() : nullptr,
+                                     current_model,
+                                     !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id
+                                                                                       : -1,
+                                     batch.num_seqs, static_cast<int>(batch.tokens.size()));
 
             bool is_prefill_batch = false;
             for (Request* req : batch_requests) {
@@ -4367,9 +4407,7 @@ void EngineLoop(EngineState* state) {
                     reset_cached_graph_runtime_context(it->second.work_ctx.get());
                     if (DoesDecodeGraphCacheRequireRuntimeRebind(current_model)) {
                         const auto rebind_begin = std::chrono::steady_clock::now();
-                        rebind_ok = current_model->arch_flags.is_lfm2_shortconv
-                                        ? RebindLFM2DecodeGraphRuntimeState(it->second.graph, batch)
-                                        : RebindHybridSSMDecodeGraphRuntimeState(it->second.graph, batch);
+                        rebind_ok = RebindDecodeGraphRuntimeStateForModel(current_model, it->second.graph, batch);
                         graph_runtime_rebind_ns +=
                             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                       std::chrono::steady_clock::now() - rebind_begin)
@@ -4508,9 +4546,7 @@ void EngineLoop(EngineState* state) {
                                 if (cache_entry_admissible && DoesDecodeGraphCacheRequireRuntimeRebind(current_model)) {
                                     const auto rebind_begin = std::chrono::steady_clock::now();
                                     const bool rebind_ok =
-                                        current_model->arch_flags.is_lfm2_shortconv
-                                            ? RebindLFM2DecodeGraphRuntimeState(candidate.graph, batch)
-                                            : RebindHybridSSMDecodeGraphRuntimeState(candidate.graph, batch);
+                                        RebindDecodeGraphRuntimeStateForModel(current_model, candidate.graph, batch);
                                     graph_runtime_rebind_ns +=
                                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                   std::chrono::steady_clock::now() - rebind_begin)
@@ -4996,6 +5032,13 @@ void EngineLoop(EngineState* state) {
                                             &state->inference_ctx, nullptr, 0, nullptr, is_prefill_batch,
                                             active_threads);
                         }
+                        LogRequestLifecyclePhase("graph_build_begin",
+                                                 !batch_requests.empty() ? batch_requests.front() : nullptr,
+                                                 current_model,
+                                                 !batch_requests.empty() && batch_requests.front()
+                                                     ? batch_requests.front()->seq_id
+                                                     : -1,
+                                                 batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads);
 
                         // Reset persistent context (O(1) - reuses existing memory buffer)
                         // This prepares a fresh context for graph building without malloc/free
@@ -5028,14 +5071,31 @@ void EngineLoop(EngineState* state) {
                                             &state->inference_ctx, nullptr, 0, output, is_prefill_batch,
                                             active_threads);
                         }
+                        LogRequestLifecyclePhase("graph_build_end",
+                                                 !batch_requests.empty() ? batch_requests.front() : nullptr,
+                                                 current_model,
+                                                 !batch_requests.empty() && batch_requests.front()
+                                                     ? batch_requests.front()->seq_id
+                                                     : -1,
+                                                 batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads);
                     }
                 }
             }
 
             if (!output || !embd_inp || !pos) {
                 LOG_ERROR("Fatal: Content creation failed or tensors missing");
+                LogRequestLifecyclePhase("graph_build_failed",
+                                         !batch_requests.empty() ? batch_requests.front() : nullptr, current_model,
+                                         !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id
+                                                                                           : -1,
+                                         batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads);
                 continue;  // Recover
             }
+            LogRequestLifecyclePhase(reused_decode_graph || reused_prefill_graph ? "graph_reuse_ready" : "graph_ready",
+                                     !batch_requests.empty() ? batch_requests.front() : nullptr, current_model,
+                                     !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id
+                                                                                       : -1,
+                                     batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads);
             if (!graph_build_accounted && graph_build_begin != std::chrono::steady_clock::time_point() &&
                 graph_build_end != std::chrono::steady_clock::time_point() && graph_build_end >= graph_build_begin) {
                 const auto graph_build_ns = static_cast<uint64_t>(
@@ -5486,8 +5546,20 @@ void EngineLoop(EngineState* state) {
             DebugDumpGraphNodes(gf, is_decode_batch ? "decode" : "prefill");
             ResetMoEStrictFailure();
             ResetPagedDecodeGraphExecutionState(gf);
+            LogRequestLifecyclePhase("graph_compute_begin", !batch_requests.empty() ? batch_requests.front() : nullptr,
+                                     current_model,
+                                     !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id
+                                                                                       : -1,
+                                     batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads,
+                                     is_decode_batch ? "decode" : "prefill");
             ggml_backend_graph_compute(active_backend, gf);
             const auto compute_end = std::chrono::steady_clock::now();
+            LogRequestLifecyclePhase("graph_compute_end", !batch_requests.empty() ? batch_requests.front() : nullptr,
+                                     current_model,
+                                     !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id
+                                                                                       : -1,
+                                     batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads,
+                                     is_decode_batch ? "decode" : "prefill");
             AccumulateQwen36SSMProjectionNodeTimes(work_ctx.get(), gf);
             const Qwen36PrefillBreakdown qwen36_prefill_breakdown =
                 is_prefill_batch ? SummarizeQwen36PrefillNodeTimes(current_model, gf) : Qwen36PrefillBreakdown{};
@@ -5635,8 +5707,7 @@ void EngineLoop(EngineState* state) {
                             req->native_moe_fallback_w2_ns += fallback_w2_ns;
                             req->native_moe_fallback_w1w3_ops += fallback_w1w3_count;
                             req->native_moe_fallback_w2_ops += fallback_w2_count;
-                            req->native_moe_fallback_ops +=
-                                fallback_w1w3_count + fallback_w2_count + native_moe_graph_timing.reduce_count;
+                            req->native_moe_fallback_ops += fallback_w1w3_count + fallback_w2_count;
                             if (fast_w1w3_count > 0) {
                                 req->native_moe_fast_decode_candidate_ops += fast_w1w3_count;
                                 req->native_moe_fast_decode_used_ops += fast_w1w3_count;
@@ -5666,21 +5737,28 @@ void EngineLoop(EngineState* state) {
                                 if (fast_w2_count == 0) {
                                     req->native_moe_fast_decode_candidate_ops += 1;
                                     req->native_moe_fast_decode_rejected_ops += 1;
-                                    req->native_moe_fast_decode_last_reject_reason = "fallback_safety";
+                                    req->native_moe_fast_decode_last_reject_reason = "native_moe_w2_fast_node_missing";
                                 }
                                 if (fallback_w2_count > 0) {
                                     req->native_moe_fast_w2_q5k_candidate_ops += 1;
                                     req->native_moe_fast_w2_q5k_rejected_ops += 1;
-                                    req->native_moe_fast_w2_q5k_last_reject_reason = "fallback_safety";
+                                    req->native_moe_fast_w2_q5k_last_reject_reason = "native_moe_w2_fast_node_missing";
                                 }
                             }
                         } else if (current_model && current_model->variant == ModelVariant::QWEN36) {
-                            req->qwen36_prefill_native_moe_fast_candidate_ops +=
+                            const uint64_t fast_w2_count =
+                                std::min(native_moe_graph_timing.w2_fast_count, native_moe_graph_timing.w2_count);
+                            const uint64_t fast_w1w3_count =
+                                std::min(native_moe_graph_timing.w1w3_fast_count, native_moe_graph_timing.w1w3_count);
+                            const uint64_t candidate_count =
                                 native_moe_graph_timing.w1w3_count + native_moe_graph_timing.w2_count;
-                            req->qwen36_prefill_native_moe_fast_rejected_ops +=
-                                native_moe_graph_timing.w1w3_count + native_moe_graph_timing.w2_count;
-                            req->qwen36_prefill_native_moe_fast_last_reject_reason =
-                                "prefill_batch_shape_not_supported";
+                            const uint64_t used_count = fast_w1w3_count + fast_w2_count;
+                            req->qwen36_prefill_native_moe_fast_candidate_ops += candidate_count;
+                            req->qwen36_prefill_native_moe_fast_used_ops += used_count;
+                            if (candidate_count > used_count) {
+                                req->qwen36_prefill_native_moe_fast_rejected_ops += candidate_count - used_count;
+                                req->qwen36_prefill_native_moe_fast_last_reject_reason = "native_moe_node_not_fast";
+                            }
                         }
                         req->moe_route_ns += native_moe_graph_timing.route_ns;
                         req->moe_w1w3_ns += native_moe_graph_timing.w1w3_ns;

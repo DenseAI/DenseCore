@@ -1869,6 +1869,16 @@ InferenceWorkContext* CreateInferenceWorkContext() {
 }
 
 void DestroyInferenceWorkContext(InferenceWorkContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    const BatchSpec* batch = ctx->batch;
+    if (batch && g_shared_batch.load(std::memory_order_acquire) == batch) {
+        g_shared_batch.store(nullptr, std::memory_order_release);
+    }
+    if (tls_work_ctx == ctx) {
+        tls_work_ctx = nullptr;
+    }
     delete ctx;
 }
 
@@ -3368,6 +3378,7 @@ inline GemvBatchedUserData* GetGemvBatchedUserData() {
     ud->qwen36_prefill_q4k_admission_key = 0;
     ud->qwen36_prefill_q4k_probe = false;
     ud->qwen36_prefill_q4k_admitted = false;
+    ud->require_q4k_true_batched = false;
     ud->disable_quant_nrc_fast = false;
     ud->qwen36_prefill_q4k_probe_done.store(0, std::memory_order_relaxed);
     ud->qwen36_prefill_q4k_probe_failures.store(0, std::memory_order_relaxed);

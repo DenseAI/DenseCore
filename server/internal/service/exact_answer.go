@@ -1,10 +1,7 @@
 package service
 
 import (
-	"log/slog"
-	"os"
 	"regexp"
-	"sort"
 	"strings"
 
 	"descore-server/internal/domain"
@@ -24,74 +21,8 @@ type exactAnswerConstraint struct {
 	text            string
 }
 
-func deriveExactAnswerConstraint(engine domain.Engine, req domain.ChatCompletionRequest) *exactAnswerConstraint {
-	if ExactAnswerFallbackDisabled() {
-		return nil
-	}
-	if engine == nil || len(req.AllowedTokenIDs) > 0 {
-		return nil
-	}
-
-	answer := extractExpectedExactAnswer(req)
-	debug := os.Getenv("DENSECORE_DEBUG_EXACT_QA") != ""
-	if debug {
-		slog.Info("exact-answer extraction", slog.String("answer", answer))
-	}
-	if answer == "" {
-		return nil
-	}
-
-	var tokenIDs []int
-	addTokens := func(text string) {
-		ids, err := engine.TokenizeText(text, false, false)
-		if debug {
-			slog.Info("exact-answer tokenization", slog.String("text", text), slog.Any("ids", ids), slog.Any("err", err))
-		}
-		if err != nil || len(ids) != 1 {
-			return
-		}
-		tokenIDs = append(tokenIDs, ids[0])
-	}
-
-	addTokens(answer)
-	addTokens(" " + answer)
-	if strings.TrimSpace(answer) != answer {
-		addTokens(strings.TrimSpace(answer))
-	}
-
-	answerTokenIDs, _ := engine.TokenizeText(answer, false, false)
-	if len(tokenIDs) == 0 {
-		maxTokens := max(1, strings.Count(answer, " ")+1)
-		if len(answerTokenIDs) > 1 {
-			maxTokens = len(answerTokenIDs) + 2
-		}
-		return &exactAnswerConstraint{
-			text:      answer,
-			strict:    true,
-			maxTokens: maxTokens,
-		}
-	}
-
-	sort.Ints(tokenIDs)
-	tokenIDs = slicesCompact(tokenIDs)
-	return &exactAnswerConstraint{
-		allowedTokenIDs: tokenIDs,
-		strict:          true,
-		maxTokens:       1,
-		text:            answer,
-	}
-}
-
-func ExactAnswerFallbackDisabled() bool {
-	value := strings.TrimSpace(strings.ToLower(os.Getenv("DENSECORE_DISABLE_EXACT_ANSWER_FALLBACK")))
-	return value == "1" || value == "true" || value == "yes" || value == "on"
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+func deriveExactAnswerConstraint(_ domain.Engine, _ domain.ChatCompletionRequest) *exactAnswerConstraint {
+	return nil
 }
 
 func extractExpectedExactAnswer(req domain.ChatCompletionRequest) string {
@@ -161,17 +92,4 @@ func isGenericExactAnswerReference(answer string) bool {
 	default:
 		return false
 	}
-}
-
-func slicesCompact(values []int) []int {
-	if len(values) == 0 {
-		return values
-	}
-	out := values[:1]
-	for _, v := range values[1:] {
-		if v != out[len(out)-1] {
-			out = append(out, v)
-		}
-	}
-	return out
 }

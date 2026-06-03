@@ -17,6 +17,7 @@
 #include "densecore/backend/hardware_topology.h"
 #include "densecore/exceptions.h"
 #include "densecore/models/model_descriptor.h"
+#include "densecore/models/model_execution_contract.h"
 #include "ggml.h"
 #include "kernels/q4k_repacked_gemv.h"
 #include "models/model_inference_policy.h"
@@ -466,24 +467,20 @@ bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model) {
     if (model->arch_flags.is_gemma4) {
         return densecore::models::SupportsPagedDecodeAttention(model);
     }
-    // Qwen3.5/Qwen3.6 hybrid-SSM single-token decode has stable paged-attention
-    // topology and the SSM custom-op runtime state is rebound on every cache reuse.
-    if (IsQwenHybridSSMSingleDecodeCacheCandidate(model)) {
-        return true;
-    }
-    if (model->arch_flags.is_lfm2_shortconv) {
-        return true;
-    }
-    // Other hybrid-SSM graphs still contain request-local state pointers until
-    // their runtime rebind coverage is qualified.
-    if (model->arch_flags.is_hybrid_ssm) {
-        return false;
+
+    const auto contract = densecore::models::BuildModelExecutionContract(model);
+    if (contract.has_stateful_custom_ops) {
+        return densecore::models::ModelExecutionContractAllowsDecodeGraphCache(contract);
     }
     return true;
 }
 
 bool DoesDecodeGraphCacheRequireRuntimeRebind(const TransformerModel* model) {
-    return model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_lfm2_shortconv);
+    if (!model) {
+        return false;
+    }
+    const auto contract = densecore::models::BuildModelExecutionContract(model);
+    return densecore::models::ModelExecutionContractRequiresDecodeGraphRuntimeRebind(contract);
 }
 
 bool IsDecodeGraphCacheDebugValidationEnabled() {
@@ -1470,6 +1467,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         return;
     }
     const auto descriptor = densecore::models::DescribeModel(model);
+    const auto execution_contract = densecore::models::BuildModelExecutionContract(model);
     if (descriptor.variant != ModelVariant::QWEN35 && descriptor.variant != ModelVariant::QWEN36 &&
         descriptor.variant != ModelVariant::GEMMA4 && descriptor.variant != ModelVariant::LFM2MOE) {
         return;
@@ -1707,6 +1705,28 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
          !req->native_moe_graph_node_hist.empty());
     const int native_moe_timing_missing =
         native_moe_expected && req->native_moe_graph_ns == 0 ? 1 : req->native_moe_timing_missing;
+    const bool target_fast_path_required =
+        densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(execution_contract);
+    const bool target_ggml_path_seen =
+        req->qwen_target_ggml_compute_ops > 0 || req->decode_matmul_path_hist[0] > 0 ||
+        req->decode_matmul_path_hist[1] > 0 || req->prefill_matmul_path_hist[0] > 0 ||
+        req->prefill_matmul_path_hist[1] > 0;
+    const bool target_native_moe_fallback_seen =
+        req->native_moe_fallback_w1w3_ops > 0 || req->native_moe_fallback_w2_ops > 0;
+    const bool target_native_moe_rejected =
+        req->native_moe_fast_decode_rejected_ops > 0 || req->native_moe_fast_w2_q5k_rejected_ops > 0 ||
+        req->qwen36_prefill_native_moe_fast_rejected_ops > 0;
+    const bool target_fast_path_ok = !target_fast_path_required ||
+                                     (!target_ggml_path_seen && !target_native_moe_fallback_seen &&
+                                      !target_native_moe_rejected);
+    const char* target_fast_path_failure_reason = "none";
+    if (target_fast_path_required && target_ggml_path_seen) {
+        target_fast_path_failure_reason = "ggml_compute_or_matmul_path";
+    } else if (target_fast_path_required && target_native_moe_fallback_seen) {
+        target_fast_path_failure_reason = "native_moe_w1w3_or_w2_fallback";
+    } else if (target_fast_path_required && target_native_moe_rejected) {
+        target_fast_path_failure_reason = "native_moe_fast_path_rejected";
+    }
     const char* q6k_effective_state = "unused";
     if (req->q6k_gemv_used_ops != 0) {
         q6k_effective_state = "used";
@@ -2211,6 +2231,12 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << (req->qwen_target_ggml_compute_last_op.empty() ? "none" : req->qwen_target_ggml_compute_last_op.c_str())
         << " qwen_target_ggml_compute_target="
         << (req->qwen_target_ggml_compute_target.empty() ? "none" : req->qwen_target_ggml_compute_target.c_str())
+        << " target_fast_path_required=" << (target_fast_path_required ? 1 : 0)
+        << " target_fast_path_ok=" << (target_fast_path_ok ? 1 : 0)
+        << " target_fast_path_failure_reason=" << target_fast_path_failure_reason
+        << " qwen_fast_path_required=" << (target_fast_path_required ? 1 : 0)
+        << " qwen_fast_path_ok=" << (target_fast_path_ok ? 1 : 0)
+        << " qwen_fast_path_failure_reason=" << target_fast_path_failure_reason
         << " qwen36_prefill_total_ms=" << ns_to_ms(req->qwen36_prefill_total_ns)
         << " qwen36_prefill_ssm_projection_ms=" << ns_to_ms(req->qwen36_prefill_ssm_projection_ns)
         << " qwen36_prefill_ssm_delta_state_ms=" << ns_to_ms(req->qwen36_prefill_ssm_delta_state_ns)

@@ -751,6 +751,46 @@ static const uint8_t* GetOrFillQuantizedActivationCache(InferenceWorkContext* ct
     return ctx->qact_buffer.data();
 }
 
+static const uint8_t* GetOrFillBatchedQuantizedActivationCache(
+    InferenceWorkContext* ctx, const ggml_tensor* src_tensor, const void* source,
+    const std::vector<const float*>& x_rows, int M, int N, ggml_type quant_type, size_t quant_row_stride,
+    size_t quant_bytes, int64_t token_pos, const ggml_type_traits_cpu* input_type_traits) {
+    if (!ctx || !src_tensor || !source || M <= 0 || N <= 0 || quant_type == GGML_TYPE_F32 || quant_row_stride == 0 ||
+        quant_bytes == 0 || !input_type_traits || !input_type_traits->from_float ||
+        x_rows.size() < static_cast<size_t>(M)) {
+        return nullptr;
+    }
+    for (int m = 0; m < M; ++m) {
+        if (!x_rows[static_cast<size_t>(m)]) {
+            return nullptr;
+        }
+    }
+    const int64_t len = static_cast<int64_t>(M) * static_cast<int64_t>(N);
+    if (ctx->qact_generation == ctx->execution_generation && ctx->qact_tensor == src_tensor &&
+        ctx->qact_source == source && ctx->qact_len == len && ctx->qact_type == quant_type &&
+        ctx->qact_bytes == quant_bytes && ctx->qact_slot_id == -1 && ctx->qact_token_pos == token_pos &&
+        ctx->qact_buffer.size() == quant_bytes) {
+        RecordQActCacheHit(ctx, quant_bytes);
+        return ctx->qact_buffer.data();
+    }
+
+    ctx->qact_buffer.resize(quant_bytes);
+    for (int m = 0; m < M; ++m) {
+        uint8_t* q_ptr = ctx->qact_buffer.data() + static_cast<size_t>(m) * quant_row_stride;
+        input_type_traits->from_float(x_rows[static_cast<size_t>(m)], q_ptr, static_cast<int64_t>(N));
+    }
+    ctx->qact_tensor = src_tensor;
+    ctx->qact_generation = ctx->execution_generation;
+    ctx->qact_source = source;
+    ctx->qact_len = len;
+    ctx->qact_type = quant_type;
+    ctx->qact_bytes = quant_bytes;
+    ctx->qact_slot_id = -1;
+    ctx->qact_token_pos = token_pos;
+    RecordQActCacheMiss(ctx);
+    return ctx->qact_buffer.data();
+}
+
 enum class Qwen36Q4KBatchedAdmissionState : int { Unknown = 0, Pass = 1, Reject = 2 };
 
 enum class Qwen36PrefillQ4KBatchedRejectReason : int {
@@ -1332,18 +1372,13 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
             q6_reject_reason = "kernel_unavailable";
         }
         if (q6_can_use_direct) {
-            // The 2-row (nrc=2) vec_dot shape is only correct where ggml actually
-            // implements it: ARM with __ARM_FEATURE_MATMUL_INT8. On x86 the
-            // q6_K x q8_K kernel ignores nrc>1 and writes only sums[0], leaving
-            // every odd output row at 0 -> corrupted LM-head logits (wrong first
-            // token; long-context retrieval fails). Keep rowpair ARM-only and use
-            // the single-row path on x86. Mirrors CanUseGgmlQ4KVecDotRowPairForNativeMoE.
-            const bool q6_can_use_rowpair =
-#if defined(__aarch64__) || defined(_M_ARM64)
-                q6_type_traits_cpu->nrows >= 2 && row_stride > 0 && (N % ggml_blck_size(weight_type)) == 0;
-#else
-                false;
-#endif
+            // Phase 0: the nrc=2 row-pair shape is only correct where ggml
+            // implements it (ARM i8mm). kernels::KQuantVecDotRowPairSupported() is
+            // the single source of truth; do NOT gate on traits->nrows (some x86
+            // builds advertise nrows==2 without honoring nrc==2 -> corrupted logits).
+            const bool q6_can_use_rowpair = densecore::kernels::KQuantVecDotRowPairSupported() &&
+                                            q6_type_traits_cpu->nrows >= 2 && row_stride > 0 &&
+                                            (N % ggml_blck_size(weight_type)) == 0;
             int k = k_start;
             if (q6_can_use_rowpair && (k & 1)) {
                 const void* row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
@@ -2038,6 +2073,11 @@ static inline bool ComputeQ4KQ8KBatchedRow(const void* weight_row, const uint8_t
     }
 #endif
 #if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+    // The current x86 AVX2 implementation does not preserve Q4_K x Q8_K
+    // vec_dot parity for all rows. Keep Qwen/LFM2 true-batched admission on
+    // the validated DenseCore scalar path instead of silently publishing bad
+    // logits from the SIMD branch.
+    return ComputeQ4KQ8KBatchedRowScalar(weight_row, quant_input_base, quant_row_stride, M, N, out_sums);
     static const bool debug_q4k_path = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_PATH");
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
@@ -2142,8 +2182,10 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
     bool qwen36_probe_local_failed = false;
     bool qwen36_probe_local_internal_error = false;
     float qwen36_probe_local_max_abs_error = 0.0f;
+    constexpr bool qwen36_shadow_probe_enabled = false;
     const auto finalize_qwen36_probe = [&]() {
-        if (!ud->qwen36_prefill_q4k_probe || !ud->qwen36_prefill_q4k_admission_key) {
+        if (!qwen36_shadow_probe_enabled || !ud->qwen36_prefill_q4k_probe ||
+            !ud->qwen36_prefill_q4k_admission_key) {
             return;
         }
         InferenceWorkContext* probe_work_ctx = callback_work_ctx;
@@ -2275,6 +2317,10 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         const bool can_use_q4k_true_batched = can_quantize_inputs && weight_type == GGML_TYPE_Q4_K &&
                                               vec_dot_type == GGML_TYPE_Q8_K && IsQ4KTrueBatchedKernelEnabled() &&
                                               (N % QK_K == 0);
+        if (ud->require_q4k_true_batched && !can_use_q4k_true_batched) {
+            throw densecore::InvalidArgumentException(
+                std::string("LFM2 prefill Q4_K true-batched callback rejected for ") + weight_name);
+        }
         const int quant_tile_cols = ResolveQuantBatchedTileCols(
             ParsePositiveEnvInt("DENSECORE_BATCHED_QUANT_TILE_COLS", kMaxSmallBatchColsHard), vec_dot_nrows,
             can_use_q4k_true_batched);
@@ -2329,6 +2375,55 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
 
         if (can_quantize_inputs) {
             thread_local std::vector<uint8_t> quant_inputs_tls;
+            static constexpr size_t kMaxFullBatchedQActCacheBytes = 32ull * 1024ull * 1024ull;
+            const auto& qact_config = ResolveFastPathRuntimeConfig(callback_batch);
+            const bool qact_cache_enabled_for_batched =
+                ud->require_q4k_true_batched || QuantizedActivationCacheEnabled(qact_config);
+            const size_t full_quant_total_size = quant_row_stride * static_cast<size_t>(M);
+            const int64_t token_pos =
+                (callback_batch && callback_batch->num_seqs == 1 && !callback_batch->pos.empty())
+                    ? callback_batch->pos.front()
+                    : std::numeric_limits<int64_t>::min();
+            const bool can_use_full_batched_qact =
+                qact_cache_enabled_for_batched && callback_work_ctx && ud->quantized_stamp && M > quant_tile_cols &&
+                full_quant_total_size > 0 && full_quant_total_size <= kMaxFullBatchedQActCacheBytes &&
+                can_use_q4k_true_batched;
+            const uint64_t full_batched_qact_stamp =
+                can_use_full_batched_qact
+                    ? ComputeGemvBatchedQuantStamp(callback_batch, M, ud->slot_id, src->data, weight_tensor->data)
+                    : 0;
+            const uint8_t* full_batched_qact_base = nullptr;
+            bool used_full_batched_qact_buffer = false;
+            if (can_use_full_batched_qact) {
+                if (ith == 0) {
+                    full_batched_qact_base = GetOrFillBatchedQuantizedActivationCache(
+                        callback_work_ctx, src, src->data, x_rows, M, N, vec_dot_type, quant_row_stride,
+                        full_quant_total_size, token_pos, input_type_traits);
+                    if (full_batched_qact_base) {
+                        ud->quantized_stamp->store(full_batched_qact_stamp, std::memory_order_release);
+                        used_full_batched_qact_buffer = true;
+                    }
+                } else {
+                    int spin_count = 0;
+                    while (ud->quantized_stamp->load(std::memory_order_acquire) != full_batched_qact_stamp) {
+                        if (spin_count >= 4096) {
+                            break;
+                        }
+                        SpinPause(spin_count++);
+                    }
+                    if (ud->quantized_stamp->load(std::memory_order_acquire) == full_batched_qact_stamp &&
+                        callback_work_ctx->qact_generation == callback_work_ctx->execution_generation &&
+                        callback_work_ctx->qact_tensor == src && callback_work_ctx->qact_source == src->data &&
+                        callback_work_ctx->qact_len == static_cast<int64_t>(M) * static_cast<int64_t>(N) &&
+                        callback_work_ctx->qact_type == vec_dot_type &&
+                        callback_work_ctx->qact_bytes == full_quant_total_size &&
+                        callback_work_ctx->qact_slot_id == -1 && callback_work_ctx->qact_token_pos == token_pos &&
+                        callback_work_ctx->qact_buffer.size() == full_quant_total_size) {
+                        full_batched_qact_base = callback_work_ctx->qact_buffer.data();
+                        used_full_batched_qact_buffer = true;
+                    }
+                }
+            }
             const bool can_sync_on_stamp =
                 M <= quant_tile_cols && nth > 1 && ud->slot_id >= 0 && ud->quant_input_shared && ud->quantized_stamp;
             const uint64_t expected_stamp =
@@ -2344,7 +2439,13 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 const uint8_t* quant_input_base = nullptr;
                 bool used_local_quant_buffer = false;
 
-                if (use_shared_quant_buffer) {
+                if (used_full_batched_qact_buffer && full_batched_qact_base) {
+                    quant_input_base = full_batched_qact_base + static_cast<size_t>(tile_start) * quant_row_stride;
+                    if (ith == 0 && !logged_quant_reuse) {
+                        RecordSharedQuantReuse(true);
+                        logged_quant_reuse = true;
+                    }
+                } else if (use_shared_quant_buffer) {
                     if (ith == 0) {
                         for (int m = 0; m < tile_m; ++m) {
                             uint8_t* q_ptr = ud->quant_input_shared + static_cast<size_t>(m) * quant_row_stride;
@@ -2388,6 +2489,10 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     }
                 }
 
+                if (ud->require_q4k_true_batched && !quant_input_base) {
+                    throw densecore::InvalidArgumentException(
+                        std::string("LFM2 prefill Q4_K true-batched quant input unavailable for ") + weight_name);
+                }
                 const bool can_use_quant_nrc_fast = output_contig && vec_dot_nrows >= tile_m;
                 const void* sample_row_ptr = weight_base + static_cast<size_t>(k_start) * weight_row_stride;
                 const bool allow_native_q4k_vecdot =
@@ -2414,8 +2519,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 }
 
                 if (!ud->force_reference_scalar && can_use_q4k_true_batched && quant_input_base &&
-                    (!ud->qwen36_prefill_q4k_admission_key || ud->qwen36_prefill_q4k_admitted ||
-                     ud->qwen36_prefill_q4k_probe)) {
+                    (!ud->qwen36_prefill_q4k_admission_key || ud->qwen36_prefill_q4k_admitted)) {
                     alignas(64) std::array<float, kMaxSmallBatchColsHard> row_sums{};
                     static const bool debug_q4k_kernel_check = []() {
                         const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_CHECK");
@@ -2437,7 +2541,9 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     float max_diff_ref = 0.0f;
                     bool all_rows_ok = true;
                     bool probe_failed = false;
-                    const bool run_qwen36_probe = ud->qwen36_prefill_q4k_probe && ud->qwen36_prefill_q4k_admission_key;
+                    const bool run_qwen36_probe =
+                        qwen36_shadow_probe_enabled && ud->qwen36_prefill_q4k_probe &&
+                        ud->qwen36_prefill_q4k_admission_key;
                     constexpr float kQwen36Q4KBatchedProbeTol = 1e-3f;
                     for (int k = k_start; k < k_end; ++k) {
                         const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
@@ -2536,6 +2642,10 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         continue;
                     }
                 }
+                if (ud->require_q4k_true_batched) {
+                    throw densecore::InvalidArgumentException(
+                        std::string("LFM2 prefill Q4_K true-batched kernel failed for ") + weight_name);
+                }
 
                 for (int k = k_start; k < k_end; ++k) {
                     const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
@@ -2551,6 +2661,10 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
             finalize_qwen36_probe();
             return;
         }
+    }
+    if (ud->require_q4k_true_batched) {
+        throw densecore::InvalidArgumentException(
+            std::string("LFM2 prefill Q4_K true-batched callback could not quantize input for ") + weight_name);
     }
 
     if (IsHybridSSMQkvWeightName(weight_name) && IsDebugMatmulDispatchEnabled() && ith == 0) {
@@ -3902,7 +4016,9 @@ inline struct ggml_tensor* ggml_mul_mat_gemv_batched(struct ggml_context* ctx, s
     if (physical_cores > 0) {
         n_threads = std::min(n_threads, physical_cores);
     }
-    if (K < 256) {
+    const bool f32_large_batch_skinny_output =
+        weight->type == GGML_TYPE_F32 && M >= 64 && K <= 64 && N >= 512;
+    if (!f32_large_batch_skinny_output && K < 256) {
         n_threads = std::min(n_threads, 2);
     } else if (K < 1024) {
         n_threads = std::min(n_threads, 4);
@@ -5256,6 +5372,14 @@ static bool CanUseGemma4DecodeNative(const TransformerModel* model, const ggml_t
  */
 struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* weight, struct ggml_tensor* input,
                                   TransformerModel* model) {
+    if (model && weight && input && model->arch_flags.is_lfm2_shortconv && input->type == GGML_TYPE_F32 &&
+        input->ne[1] > 1) {
+        auto it_source = model->cpu_repack_alias_sources.find(weight);
+        if (it_source != model->cpu_repack_alias_sources.end() && it_source->second &&
+            it_source->second->type == GGML_TYPE_Q4_K && it_source->second->ne[0] == input->ne[0]) {
+            weight = it_source->second;
+        }
+    }
     bool using_cpu_repack_alias = false;
     bool using_qwen36_ssm_q8_prefill_amx_alias = false;
     ggml_tensor* const original_weight = weight;
@@ -5282,16 +5406,14 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const bool prefer_qwen_hybrid_ssm_quant_batched_over_repack =
         original_qwen_hybrid_ssm_projection && qwen_hybrid_small_prefill_q4k && weight && input &&
         weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 && weight->ne[0] == input->ne[0] &&
-        (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled()
-#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
-        ;
-#else
-        && false;
-#endif
+        (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled();
     const bool prefer_gemma4_q4k_prefill_densecore_path =
         model && model->arch_flags.is_gemma4 && input && input->type == GGML_TYPE_F32 &&
         weight && weight->type == GGML_TYPE_Q4_K && input->ne[1] > 1 && input->ne[0] == weight->ne[0] &&
         IsQ4KTrueBatchedKernelEnabled();
+    const bool prefer_lfm2_quant_prefill_densecore_path =
+        model && model->arch_flags.is_lfm2_shortconv && input && input->type == GGML_TYPE_F32 &&
+        weight && ggml_is_quantized(weight->type) && input->ne[1] > 1 && input->ne[0] == weight->ne[0];
     if (model && input && input->type == GGML_TYPE_F32) {
         if (input->ne[1] <= 1) {
             auto it_decode_repack = model->cpu_decode_repack_aliases.find(weight);
@@ -5306,7 +5428,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             const bool amx_decode_regression_risk =
                 (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) && amx_alias &&
                 input->ne[1] == 1;
-            if (!prefer_gemma4_q4k_prefill_densecore_path && !prefer_qwen_hybrid_ssm_quant_batched_over_repack &&
+            if (!prefer_gemma4_q4k_prefill_densecore_path && !prefer_lfm2_quant_prefill_densecore_path &&
+                !prefer_qwen_hybrid_ssm_quant_batched_over_repack &&
                 !amx_decode_regression_risk) {
                 weight = it_repack->second;
                 using_cpu_repack_alias = true;
@@ -5488,11 +5611,13 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const bool qwen36_hybrid_ssm_q4k_prefill_relevant =
         (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) && M > 1 &&
         input->type == GGML_TYPE_F32;
+    const bool qwen36_lm_head_q4k_prefill_relevant =
+        is_qwen36_lm_head && M > 1 && input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q4_K;
     const bool lfm2_prefill_q4k_relevant =
-        model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv && M > 1 &&
+        model && model->arch_flags.is_lfm2_shortconv && M > 1 &&
         input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q4_K;
     const bool lfm2_prefill_quant_nrc_unsafe =
-        model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv && M > 1 &&
+        model && model->arch_flags.is_lfm2_shortconv && M > 1 &&
         input->type == GGML_TYPE_F32 && ggml_is_quantized(weight->type)
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
         ;
@@ -5500,7 +5625,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         && false;
 #endif
     const bool q4k_batched_prefill_relevant =
-        qwen36_hybrid_ssm_q4k_prefill_relevant || lfm2_prefill_q4k_relevant;
+        qwen36_hybrid_ssm_q4k_prefill_relevant || qwen36_lm_head_q4k_prefill_relevant || lfm2_prefill_q4k_relevant;
     const bool qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k =
         q4k_batched_prefill_relevant && weight->type == GGML_TYPE_Q4_K;
     const bool qwen36_hybrid_ssm_q4k_prefill_shape_supported =
@@ -5522,13 +5647,17 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         qwen36_q4k_admission_key ? LookupQwen36Q4KBatchedAdmission(qwen36_q4k_admission_key)
                                  : Qwen36Q4KBatchedAdmissionValue{};
     const bool qwen36_q4k_mode_off =
-        qwen36_hybrid_ssm_q4k_prefill_relevant &&
+        (qwen36_hybrid_ssm_q4k_prefill_relevant || qwen36_lm_head_q4k_prefill_relevant) &&
         fast_path_config.qwen36_prefill_q4k_batched == densecore::llm::config::Qwen36PrefillQ4KBatchedMode::Off;
     const bool qwen36_q4k_mode_on =
-        qwen36_hybrid_ssm_q4k_prefill_relevant &&
+        (qwen36_hybrid_ssm_q4k_prefill_relevant || qwen36_lm_head_q4k_prefill_relevant) &&
         fast_path_config.qwen36_prefill_q4k_batched == densecore::llm::config::Qwen36PrefillQ4KBatchedMode::On;
+    // Qwen3.6 and LFM2 target prefill Q4_K go directly to the DenseCore
+    // true-batched kernel by default. "probe"/"auto" are parsed as On now; the
+    // probe enum remains only for older diagnostic callers that construct the
+    // config directly.
     const bool qwen36_q4k_mode_probe =
-        (qwen36_hybrid_ssm_q4k_prefill_relevant &&
+        ((qwen36_hybrid_ssm_q4k_prefill_relevant || qwen36_lm_head_q4k_prefill_relevant) &&
          fast_path_config.qwen36_prefill_q4k_batched == densecore::llm::config::Qwen36PrefillQ4KBatchedMode::Probe) ||
         lfm2_prefill_q4k_relevant;
     const bool qwen36_q4k_probe_rejected =
@@ -5556,12 +5685,19 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                                   "temporary_reference_forced_hybrid_ssm_qkv");
     }
 
-    if (using_cpu_repack_alias) {
+    const bool defer_cpu_repack_alias_to_batched_q4k =
+        using_cpu_repack_alias && M > 1 && input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q4_K &&
+        is_compatible && IsQ4KTrueBatchedKernelEnabled();
+    if (using_cpu_repack_alias && !defer_cpu_repack_alias_to_batched_q4k) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
                           "GGML_CPU_REPACK");
         record_graph_matmul("ggml_mul_mat");
         return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
                                   "temporary_reference_cpu_repack_alias");
+    }
+    if (defer_cpu_repack_alias_to_batched_q4k) {
+        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
+                          "GGML_CPU_REPACK_DEFER_Q4K_BATCHED");
     }
     if (using_qwen36_ssm_q8_prefill_amx_alias) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
@@ -5594,7 +5730,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out;
     const bool force_qwen36_hybrid_ssm_q4k_native_prefill =
         (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
-        qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k && !qwen36_q4k_mode_on;
+        qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k && qwen36_q4k_mode_off;
     if (force_plain_hybrid_ssm_prefill &&
         (!qwen_hybrid_ssm_quant_prefill_fast_path_eligible || force_qwen36_hybrid_ssm_q4k_native_prefill) &&
         ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 && M > 1) {
@@ -5624,13 +5760,11 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                                   "temporary_reference_qwen35_prefill_quant_correctness");
     }
 
-    // C4A long-context LFM2 QA currently drifts on the ARM custom quantized
-    // prefill lane (first decode token collapses to token id 1 after a
-    // 954-token prompt). Keep decode on the native MoE fast path, but reject
-    // ARM prefill quant custom admission until the selected projection kernel
-    // has a passing parity gate and beats native GGML.
-    if (model && model->variant == ModelVariant::LFM2MOE && ggml_is_quantized(weight->type) &&
-        input->type == GGML_TYPE_F32 && M > 1 &&
+    // LFM2 ARM prefill only admits Q4_K through the true-batched kernel below.
+    // Keep other quantized prefill tensors on native GGML rather than sending
+    // them through the slower custom scalar fallback.
+    if (model && model->arch_flags.is_lfm2_shortconv && ggml_is_quantized(weight->type) &&
+        weight->type != GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 && M > 1 &&
 #if defined(__aarch64__) || defined(_M_ARM64)
         true
 #else
@@ -5638,10 +5772,10 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
 #endif
     ) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
-                          "lfm2_arm_prefill_quant_correctness");
+                          "lfm2_arm_prefill_non_q4k_reference");
         record_graph_matmul("ggml_mul_mat");
         return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
-                                  "temporary_reference_lfm2_arm_prefill_quant_correctness");
+                                  "temporary_reference_lfm2_arm_prefill_non_q4k");
     }
 
     const bool gemma4_q4k_prefill_fast_path_eligible =
@@ -5728,6 +5862,12 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         (input_cols == 1) && (weight->type == GGML_TYPE_F32 || ggml_is_quantized(weight->type));
     const bool is_small_batch_f32_candidate = (input_cols > 1 && input_cols <= max_small_batch_cols &&
                                                input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
+    const bool is_moe_router_f32_prefill_candidate =
+        model && input_cols > 1 && input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 &&
+        std::strstr(w_name, ".ffn_gate_inp.weight") != nullptr && weight->ne[0] == input->ne[0] &&
+        weight->ne[1] <= 512 && weight->ne[0] >= 512 &&
+        (model->arch_flags.is_lfm2_shortconv || model->variant == ModelVariant::QWEN35 ||
+         model->variant == ModelVariant::QWEN36);
     bool has_quant_vec_dot = false;
     bool has_quant_from_float = false;
     bool quant_input_size_ok = false;
@@ -5751,8 +5891,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         }
     }
     const bool qwen36_q4k_candidate_ready =
-        qwen36_hybrid_ssm_q4k_prefill_probe_candidate && has_quant_vec_dot && has_quant_from_float &&
-        quant_input_size_ok && quant_true_batched_kernel_ready;
+        q4k_batched_prefill_relevant && has_quant_vec_dot && has_quant_from_float &&
+        quant_input_size_ok && quant_true_batched_kernel_ready && !qwen36_hybrid_ssm_q4k_prefill_lora_active;
     qwen36_q4k_reject_reason = ResolveQwen36PrefillQ4KBatchedReason(
         q4k_batched_prefill_relevant, qwen36_q4k_mode_off, qwen36_hybrid_ssm_q4k_prefill_lora_active,
         qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k, qwen36_hybrid_ssm_q4k_prefill_shape_supported,
@@ -5767,7 +5907,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     }
     const bool qwen36_q4k_probe_admitted =
         qwen36_q4k_candidate_ready &&
-        (qwen36_q4k_mode_on ||
+        (qwen36_q4k_mode_on || lfm2_prefill_q4k_relevant ||
          (qwen36_q4k_mode_probe && qwen36_q4k_admission.state != Qwen36Q4KBatchedAdmissionState::Reject));
     const bool qwen35_dense_prefill_prefers_ggml_quant =
         model && model->variant == ModelVariant::QWEN35 && model->hparams.n_experts <= 0 && input_cols > 1 &&
@@ -5782,12 +5922,33 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const bool lfm2_prefill_prefers_ggml_quant =
         model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv && input_cols > 1 &&
         weight->type == GGML_TYPE_Q4_K && (!qwen36_q4k_probe_admitted || qwen36_q4k_probe_rejected);
+    const bool lfm2_prefill_q4k_true_batched_admitted =
+        lfm2_prefill_q4k_relevant && is_compatible && input_cols <= max_small_batch_quant_cols &&
+        qwen36_q4k_candidate_ready && qwen36_q4k_probe_admitted;
+    if (lfm2_prefill_q4k_relevant && !lfm2_prefill_q4k_true_batched_admitted) {
+        const char* reason = Qwen36PrefillQ4KBatchedRejectReasonName(static_cast<int>(qwen36_q4k_reject_reason));
+        if (qwen36_q4k_reject_reason == Qwen36PrefillQ4KBatchedRejectReason::None ||
+            qwen36_q4k_reject_reason == Qwen36PrefillQ4KBatchedRejectReason::Admitted) {
+            if (!is_compatible) {
+                reason = "incompatible_shape";
+            } else if (input_cols > max_small_batch_quant_cols) {
+                reason = "M>max_quant_cols";
+            } else if (!qwen36_q4k_candidate_ready) {
+                reason = "candidate_not_ready";
+            } else {
+                reason = "not_admitted";
+            }
+        }
+        throw densecore::InvalidArgumentException(
+            std::string("LFM2 prefill Q4_K requires DenseCore true-batched path; rejected: ") + reason);
+    }
     const bool is_small_batch_quant_candidate =
         (input_cols > 1 && input_cols <= max_small_batch_quant_cols && input->type == GGML_TYPE_F32 &&
          ggml_is_quantized(weight->type) && !qwen35_dense_prefill_prefers_ggml_quant &&
          !qwen36_prefill_prefers_ggml_quant && !lfm2_prefill_prefers_ggml_quant && has_quant_vec_dot &&
          has_quant_from_float && quant_input_size_ok);
-    const bool is_small_batch_candidate = is_small_batch_f32_candidate || is_small_batch_quant_candidate;
+    const bool is_small_batch_candidate =
+        is_small_batch_f32_candidate || is_moe_router_f32_prefill_candidate || is_small_batch_quant_candidate;
 
     const char* wtype_label = MatmulWeightTypeLabel(weight->type, false, false);
 
@@ -5869,9 +6030,14 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         ud->force_reference_scalar = false;
         ud->qwen36_prefill_q4k_admission_key = qwen36_q4k_admission_key;
         ud->qwen36_prefill_q4k_probe =
-            qwen36_q4k_mode_probe && qwen36_q4k_admission.state == Qwen36Q4KBatchedAdmissionState::Unknown;
+            !lfm2_prefill_q4k_relevant && qwen36_q4k_mode_probe &&
+            !qwen36_lm_head_q4k_prefill_relevant &&
+            qwen36_q4k_admission.state == Qwen36Q4KBatchedAdmissionState::Unknown;
         ud->qwen36_prefill_q4k_admitted = qwen36_q4k_probe_admitted;
-        ud->disable_quant_nrc_fast = lfm2_prefill_quant_nrc_unsafe;
+        ud->require_q4k_true_batched =
+            lfm2_prefill_q4k_relevant || qwen36_hybrid_ssm_q4k_prefill_relevant ||
+            qwen36_lm_head_q4k_prefill_relevant;
+        ud->disable_quant_nrc_fast = lfm2_prefill_quant_nrc_unsafe || lfm2_prefill_q4k_relevant;
         ud->gemma4_dense_prefill_native = gemma4_dense_prefill_native_allowed;
         if (gemma4_dense_prefill_native_allowed) {
             RecordGemma4DensePrefillNativeDecision(

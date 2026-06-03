@@ -48,6 +48,7 @@
 #include "densecore/memory/kv_cache.h"  // Added for KV cache
 #include "densecore/memory/memory_pool.h"
 #include "densecore/models/decoder_model_spec.h"
+#include "densecore/models/model_execution_contract.h"
 #include "densecore/models/qwen35_ssm_math.h"
 #include "densecore/moe/moe_routing.h"
 #include "densecore/quantization/int4_types.h"  // For TensorInt4
@@ -56,6 +57,7 @@
 #include "densecore/runtime/scheduler.h"
 #include "densecore/simd/simd_ops.h"
 #include "kernels/hwy/hwy_kernels.h"
+#include "kernels/kernel_caps.h"
 #include "kernels/q4k_repacked_gemv.h"
 #include "llm/attention/exec.h"
 #include "llm/attention/internal.h"
@@ -90,6 +92,12 @@ bool RunQ4KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* 
                                                const uint8_t* qinput_data, size_t qinput_row_bytes,
                                                float* output_data, int64_t rows, int64_t cols, int64_t input_cols,
                                                int numa_node, bool allow_parallel);
+bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
+                                   size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
+                                   int numa_node, bool allow_parallel);
+bool RunMoEQ4KRawBatchedFusedSwiGLU(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
+                                    const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
+                                    int64_t N, int64_t K, int numa_node, bool allow_parallel);
 }
 
 #include "runtime/inference_graph_support.inl"

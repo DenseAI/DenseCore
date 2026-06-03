@@ -357,6 +357,39 @@ bool IsQwen36SSMQ8ProjectionTensor(const ggml_tensor* source) {
            std::strstr(name, "ssm_out.weight");
 }
 
+void RegisterCpuRepackAlias(TransformerModel* model, ggml_tensor* source, ggml_tensor* alias) {
+    if (!model || !source || !alias) {
+        return;
+    }
+    auto existing = model->cpu_repack_aliases.find(source);
+    if (existing != model->cpu_repack_aliases.end() && existing->second) {
+        model->cpu_repack_alias_sources.erase(existing->second);
+    }
+    model->cpu_repack_aliases[source] = alias;
+    model->cpu_repack_alias_sources[alias] = source;
+}
+
+void EraseCpuRepackAlias(TransformerModel* model, const ggml_tensor* source) {
+    if (!model || !source) {
+        return;
+    }
+    auto it = model->cpu_repack_aliases.find(source);
+    if (it != model->cpu_repack_aliases.end()) {
+        if (it->second) {
+            model->cpu_repack_alias_sources.erase(it->second);
+        }
+        model->cpu_repack_aliases.erase(it);
+    }
+}
+
+void ClearCpuRepackAliases(TransformerModel* model) {
+    if (!model) {
+        return;
+    }
+    model->cpu_repack_aliases.clear();
+    model->cpu_repack_alias_sources.clear();
+}
+
 void ClearQwen36SSMQ8PrefillAMXAliasesImpl(TransformerModel* model) {
     if (!model) {
         return;
@@ -646,7 +679,7 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         }
         const std::string name = std::string(source->name[0] ? source->name : "weight") + suffix;
         ggml_set_name(alias, name.c_str());
-        model->cpu_repack_aliases[source] = alias;
+        RegisterCpuRepackAlias(model, source, alias);
         if (use_amx) {
             model->cpu_amx_aliases[alias] = true;
         }
@@ -925,7 +958,7 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
                     if (item.decode_only) {
                         model->cpu_decode_repack_aliases.erase(item.source);
                     } else {
-                        model->cpu_repack_aliases.erase(item.source);
+                        EraseCpuRepackAlias(model, item.source);
                     }
                 }
             }
@@ -943,7 +976,7 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
                     if (item.decode_only) {
                         model->cpu_decode_repack_aliases.erase(item.source);
                     } else {
-                        model->cpu_repack_aliases.erase(item.source);
+                        EraseCpuRepackAlias(model, item.source);
                     }
                 }
                 continue;
@@ -1148,7 +1181,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
                       << " because converted byte size does not match alias" << std::endl;
             return false;
         }
-        model->cpu_repack_aliases[source] = alias;
+        RegisterCpuRepackAlias(model, source, alias);
         pending.push_back({source, alias, std::move(bytes), use_kleidiai_for_type(alias->type)});
         return true;
     };
@@ -1428,7 +1461,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         std::cerr << "[DenseCore] Warning: Gemma4 CPU_REPACK aliases require CPU_REPACK because this model uses "
                      "non-KleidiAI quant types, but CPU_REPACK is unavailable"
                   << std::endl;
-        model->cpu_repack_aliases.clear();
+        ClearCpuRepackAliases(model);
         return;
     }
 
@@ -1438,7 +1471,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         if (!buffer) {
             std::cerr << "[DenseCore] Warning: failed to allocate Gemma4 " << primary_repack_buft_name << " buffer"
                       << std::endl;
-            model->cpu_repack_aliases.clear();
+            ClearCpuRepackAliases(model);
             return;
         }
         model->cpu_repack_buffers.push_back(buffer);
@@ -1448,7 +1481,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
             ggml_backend_alloc_ctx_tensors_from_buft(model->ctx_cpu_kleidiai, repack_bufts.cpu_kleidiai);
         if (!buffer) {
             std::cerr << "[DenseCore] Warning: failed to allocate Gemma4 CPU_KLEIDIAI buffer" << std::endl;
-            model->cpu_repack_aliases.clear();
+            ClearCpuRepackAliases(model);
             return;
         }
         model->cpu_repack_buffers.push_back(buffer);
@@ -1481,7 +1514,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         std::memcpy(alias->data, item.bytes.data(), item.bytes.size());
         model->numa_buffers.push_back({data, item.bytes.size(), densecore::AllocationType::Aligned});
         model->cpu_repack_buffers.push_back(buffer);
-        model->cpu_repack_aliases[item.source] = alias;
+        RegisterCpuRepackAlias(model, item.source, alias);
         item.alias = alias;
         return true;
     };
@@ -1537,7 +1570,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
                           << item.alias->ne[1] << "," << item.alias->ne[2] << "," << item.alias->ne[3]
                           << "]; keeping raw tensor for that projection" << std::endl;
             }
-            model->cpu_repack_aliases.erase(item.source);
+            EraseCpuRepackAlias(model, item.source);
             continue;
         }
         supported.push_back(item);
@@ -1560,7 +1593,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
     }
     if (supported.empty() && fused_supported == 0) {
         std::cerr << "[DenseCore] Warning: no Gemma4 CPU_REPACK aliases were supported by this ggml build" << std::endl;
-        model->cpu_repack_aliases.clear();
+        ClearCpuRepackAliases(model);
         return;
     }
     size_t bytes = 0;

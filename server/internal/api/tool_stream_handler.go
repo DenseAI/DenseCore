@@ -13,11 +13,6 @@ import (
 	"time"
 )
 
-func lfm2FinalExactAnswerFallbackEnabled() bool {
-	value := strings.TrimSpace(strings.ToLower(os.Getenv("DENSECORE_ENABLE_LFM2_FINAL_EXACT_ANSWER_FALLBACK")))
-	return value == "1" || value == "true" || value == "yes" || value == "on"
-}
-
 func lfm2StreamFilterBypassEnabled() bool {
 	value := strings.TrimSpace(strings.ToLower(os.Getenv("DENSECORE_DEBUG_LFM2_STREAM_FILTER_BYPASS")))
 	return value == "1" || value == "true" || value == "yes" || value == "on"
@@ -320,20 +315,6 @@ func (f *lfm2StreamFilter) Filter(token string) string {
 	return sanitizeLFM2StreamChunk(out, f.exactExpected)
 }
 
-func (f *lfm2StreamFilter) FinalExactAnswer() string {
-	if f == nil || f.completed || strings.TrimSpace(f.exactExpected) == "" {
-		return ""
-	}
-	if !lfm2FinalExactAnswerFallbackEnabled() {
-		return ""
-	}
-	f.pending = ""
-	f.started = true
-	f.suppressing = false
-	f.completed = true
-	return f.exactExpected
-}
-
 func sanitizeLFM2StreamChunk(token string, exactExpected string) string {
 	if token == "" {
 		return ""
@@ -379,11 +360,11 @@ func sanitizeLFM2StreamChunk(token string, exactExpected string) string {
 		"\n\npossibly",
 		"\npossibly",
 		"\n\nfinal answer:",
-			"\n\nwe need to",
-			"\nwe need to",
-			"\n\nwe have",
-			"\nwe have",
-			"\n\nreasoning:",
+		"\n\nwe need to",
+		"\nwe need to",
+		"\n\nwe have",
+		"\nwe have",
+		"\n\nreasoning:",
 		"\nreasoning:",
 		"\n\nanalysis:",
 		"\nanalysis:",
@@ -416,9 +397,9 @@ func sanitizeLFM2Response(text string) string {
 		lower = strings.ToLower(content)
 	}
 	for _, prefix := range []string{
-			"we need to",
-			"we have",
-			"i need to",
+		"we need to",
+		"we have",
+		"i need to",
 		"the user asks",
 		"the user is",
 		"the user says",

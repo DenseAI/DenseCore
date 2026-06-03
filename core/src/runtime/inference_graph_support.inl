@@ -68,19 +68,36 @@ constexpr const char* kGemma4PackedDownExpertsKey = "ffn_down_exps";
 constexpr const char* kGemma4PackedDownExpertsScaleKey = "ffn_down_exps.scale";
 std::atomic<uint64_t> g_moe_graph_wiring_debug_counter{0};
 constexpr int64_t kQwen36C4AmxGraphMaxTokens = 128;
-
-ggml_tensor* QwenTargetGgmlMulMatIdFallback(ggml_context* ctx, const TransformerModel* model,
-                                            ggml_tensor* weight, ggml_tensor* input,
-                                            ggml_tensor* selected_experts, const char* reason) {
-    RecordQwenTargetGgmlComputeFallback(
-        GetCurrentWorkContext(), model, densecore::runtime::GgmlComputeOp::MatmulId, reason,
-        weight && weight->name[0] ? weight->name : "(unnamed)", GetCurrentExecutionPhase());
-    return ggml_mul_mat_id(ctx, weight, input, selected_experts);
-}
+constexpr int64_t kNativeMoEFastPathDefaultMaxDirectTokens = 4096;
 
 bool IsQwen35NativeMoEDownQ5KDiagEnabled() {
     static const bool enabled = densecore::env::ParseTruthyEnv("DENSECORE_NATIVE_MOE_FAST_W2_Q5K_DIAG", false);
     return enabled;
+}
+
+bool ModelRequiresNativeMoEFastPath(const TransformerModel* model) {
+    if (!model) {
+        return false;
+    }
+    const auto contract = densecore::models::BuildModelExecutionContract(model);
+    return densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(contract);
+}
+
+int64_t NativeMoEFastPathMaxDirectTokens(const TransformerModel* model) {
+    if (!model) {
+        return kNativeMoEFastPathDefaultMaxDirectTokens;
+    }
+    const auto contract = densecore::models::BuildModelExecutionContract(model);
+    const int64_t contract_limit = densecore::models::ModelExecutionContractNativeMoEMaxDirectTokens(contract);
+    return contract_limit > 0 ? contract_limit : kNativeMoEFastPathDefaultMaxDirectTokens;
+}
+
+bool ShouldEnableNativeMoEFastPathByDefault(const TransformerModel* model, InferenceExecutionPhase phase,
+                                            densecore::env::RuntimeToggleMode mode) {
+    if (phase != InferenceExecutionPhase::Decode && phase != InferenceExecutionPhase::Prefill) {
+        return false;
+    }
+    return ModelRequiresNativeMoEFastPath(model) && mode != densecore::env::RuntimeToggleMode::Off;
 }
 
 bool IsDebugLFM2NativeMoEReferenceEnabled() {
@@ -1956,7 +1973,7 @@ ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
 // ============================================================================
 
 constexpr int kQwen35SharedQ8MaxTasks = 128;
-constexpr int64_t kQwen35NativeMoEMaxDirectTokens = 128;
+constexpr int64_t kQwen35NativeMoEBatchedQ4KMaxAssignments = 256;
 
 struct Qwen35SharedQ8RowsUserData {
     int64_t cols = 0;
@@ -2095,6 +2112,17 @@ static const uint8_t* Qwen35SharedQ8RowPtr(const Qwen35SharedQ8RowsUserData* ud,
     return ud->rows + static_cast<size_t>(linear) * ud->row_bytes;
 }
 
+static void Qwen35NativeMoEZeroDst2D(ggml_tensor* dst, int64_t n_rows, int64_t n_tokens) {
+    if (!dst || !dst->data) return;
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t row = 0; row < n_rows; ++row) {
+            *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                      static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                      static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1])) = 0.0f;
+        }
+    }
+}
+
 struct Qwen35MoEAssignment {
     int32_t expert = -1;
     int32_t token = -1;
@@ -2143,28 +2171,12 @@ static const float* Qwen35NativeMoEDownHiddenRowPtr(const ggml_tensor* hidden, i
                                           static_cast<size_t>(token) * static_cast<size_t>(hidden->nb[2]));
 }
 
-static bool PreferGgmlQ4KVecDotForNativeMoE() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return true;
-#else
-    // x86: route LFM2/Qwen native-MoE W1/W3 + W2 Q4_K decode through ggml's
-    // hand-tuned vec_dot_q4_K_q8_K (AVX2 / AVX512-VNNI) instead of the scalar
-    // DotKQ8KImpl fallback. This is the same kernel llama.cpp uses; only the
-    // single-row (nrc=1) call shape is taken (see CanUseGgmlQ4KVecDotRowPair...).
-    return ggml_cpu_has_avx2();
-#endif
-}
+// Phase 0: capability decisions now live in kernels/kernel_caps.h (single source
+// of truth). These thin wrappers preserve the call-site names.
+static bool PreferGgmlQ4KVecDotForNativeMoE() { return densecore::kernels::PreferGgmlKQuantVecDot(); }
 
 static bool CanUseGgmlQ4KVecDotRowPairForNativeMoE() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return true;
-#else
-    // ggml's x86 vec_dot_q4_K_q8_K does not implement the nrc=2 row-pair shape
-    // (that path is ARM __ARM_FEATURE_MATMUL_INT8 only); calling it with nrc=2
-    // leaves the second lane at 0 (the historical "native_value=0" parity
-    // failure). Keep row-pair fusion ARM-only and use nrc=1 on x86.
-    return false;
-#endif
+    return densecore::kernels::KQuantVecDotRowPairSupported();
 }
 
 static bool Qwen35NativeMoEDownQ5KQuantizeHidden(const ggml_tensor* hidden, int64_t token, int64_t topk_index,
@@ -2628,7 +2640,11 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
     const bool use_shared_q8 = PrepareQwen35SharedQ8Rows(shared_q8, hidden, ith, nth);
     thread_local std::vector<Qwen35MoEAssignment> assignments;
 
-    if (n_tokens > 4 && Qwen35BuildMoEAssignments(selected_experts, down_exps->ne[2], &assignments)) {
+    if (n_tokens > 4 && down_exps->type == GGML_TYPE_Q4_K && use_shared_q8 &&
+        Qwen35BuildMoEAssignments(selected_experts, down_exps->ne[2], &assignments)) {
+        if (ith != 0) {
+            return;
+        }
         for (Qwen35MoEAssignment& assignment : assignments) {
             assignment.weight = 0.0f;
         }
@@ -2650,87 +2666,58 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
                 }
             }
         }
-        for (int64_t token = 0; token < n_tokens; ++token) {
-            for (int64_t pair = pair_start; pair < pair_end; ++pair) {
-                const int64_t row = pair * 2;
-                *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                          static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
-                                          static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1])) = 0.0f;
-                *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                          static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0]) +
-                                          static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1])) = 0.0f;
-            }
-            if (owns_odd_tail) {
-                const int64_t row = n_embd - 1;
-                *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                          static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
-                                          static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1])) = 0.0f;
-            }
-        }
+        Qwen35NativeMoEZeroDst2D(dst, n_embd, n_tokens);
+        const size_t qrow_bytes = shared_q8->row_bytes;
+        thread_local std::vector<uint8_t> qtile;
+        thread_local std::vector<float> out_tile;
+        thread_local std::vector<Qwen35MoEAssignment> tile_assignments;
+        qtile.resize(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments) * qrow_bytes);
+        out_tile.resize(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments) * static_cast<size_t>(n_embd));
+        tile_assignments.reserve(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments));
+        densecore::CpuBackend& backend = densecore::GetCpuBackend();
         for (size_t group_start = 0; group_start < assignments.size();) {
             const int32_t expert = assignments[group_start].expert;
             size_t group_end = group_start + 1;
             while (group_end < assignments.size() && assignments[group_end].expert == expert) {
                 ++group_end;
             }
-            for (int64_t pair = pair_start; pair < pair_end; ++pair) {
-                const int64_t row = pair * 2;
-                for (size_t ai = group_start; ai < group_end; ++ai) {
-                    const Qwen35MoEAssignment& assignment = assignments[ai];
-                    if (assignment.weight == 0.0f) continue;
-                    const uint8_t* qrow =
-                        use_shared_q8 ? Qwen35SharedQ8RowPtr(shared_q8, assignment.topk_index, assignment.token)
-                                      : nullptr;
-                    if (!qrow) {
-                        if (!Qwen35NativeMoEDownQ5KQuantizeHidden(hidden, assignment.token, assignment.topk_index,
-                                                                  qbuf)) {
-                            continue;
-                        }
-                        qrow = qbuf.data();
-                    }
-                    float value0 = 0.0f;
-                    float value1 = 0.0f;
-                    if (!Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(down_exps, expert, row, qrow, &value0,
-                                                                           &value1)) {
+            for (size_t tile_start = group_start; tile_start < group_end;) {
+                tile_assignments.clear();
+                while (tile_start < group_end &&
+                       tile_assignments.size() < static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments)) {
+                    const Qwen35MoEAssignment& assignment = assignments[tile_start++];
+                    if (assignment.weight == 0.0f) {
                         continue;
                     }
-                    float* dst0 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                           static_cast<size_t>(row) *
-                                                               static_cast<size_t>(dst->nb[0]) +
-                                                           static_cast<size_t>(assignment.token) *
-                                                               static_cast<size_t>(dst->nb[1]));
-                    float* dst1 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                           static_cast<size_t>(row + 1) *
-                                                               static_cast<size_t>(dst->nb[0]) +
-                                                           static_cast<size_t>(assignment.token) *
-                                                               static_cast<size_t>(dst->nb[1]));
-                    *dst0 += value0 * assignment.weight;
-                    *dst1 += value1 * assignment.weight;
-                }
-            }
-            if (owns_odd_tail) {
-                const int64_t row = n_embd - 1;
-                for (size_t ai = group_start; ai < group_end; ++ai) {
-                    const Qwen35MoEAssignment& assignment = assignments[ai];
-                    if (assignment.weight == 0.0f) continue;
-                    const uint8_t* qrow =
-                        use_shared_q8 ? Qwen35SharedQ8RowPtr(shared_q8, assignment.topk_index, assignment.token)
-                                      : nullptr;
+                    const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, assignment.topk_index, assignment.token);
                     if (!qrow) {
-                        if (!Qwen35NativeMoEDownQ5KQuantizeHidden(hidden, assignment.token, assignment.topk_index,
-                                                                  qbuf)) {
-                            continue;
-                        }
-                        qrow = qbuf.data();
+                        continue;
                     }
-                    float value = 0.0f;
-                    if (Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qrow, &value)) {
-                        float* dst_ptr =
-                            reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                     static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
-                                                     static_cast<size_t>(assignment.token) *
-                                                         static_cast<size_t>(dst->nb[1]));
-                        *dst_ptr += value * assignment.weight;
+                    std::memcpy(qtile.data() + tile_assignments.size() * qrow_bytes, qrow, qrow_bytes);
+                    tile_assignments.push_back(assignment);
+                }
+                if (tile_assignments.empty()) {
+                    continue;
+                }
+                const int64_t tile_m = static_cast<int64_t>(tile_assignments.size());
+                const char* down_base = static_cast<const char*>(down_exps->data) +
+                                        static_cast<size_t>(expert) * static_cast<size_t>(down_exps->nb[2]);
+                if (!densecore::RunMoEQ4KRawBatchedProjection(&backend, down_base, qtile.data(), qrow_bytes,
+                                                              out_tile.data(), tile_m, n_embd, down_exps->ne[0],
+                                                              /*numa_node=*/0, /*allow_parallel=*/true)) {
+                    return;
+                }
+                for (int64_t m = 0; m < tile_m; ++m) {
+                    const Qwen35MoEAssignment& assignment = tile_assignments[static_cast<size_t>(m)];
+                    const float weight = assignment.weight;
+                    float* dst_col = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                              static_cast<size_t>(assignment.token) *
+                                                                  static_cast<size_t>(dst->nb[1]));
+                    const float* src_row = out_tile.data() + static_cast<size_t>(m) * static_cast<size_t>(n_embd);
+                    for (int64_t row = 0; row < n_embd; ++row) {
+                        *reinterpret_cast<float*>(reinterpret_cast<char*>(dst_col) +
+                                                  static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0])) +=
+                            src_row[row] * weight;
                     }
                 }
             }
@@ -2920,19 +2907,15 @@ static bool CanReplaceQwen35W2WithCustomCallback(const TransformerModel* model, 
     }
     const BatchSpec* current_batch = GetCurrentBatch();
     const auto& fast_config = ResolveFastPathRuntimeConfig(current_batch);
-    const bool lfm2_fast_path = lfm2_native_moe &&
-                                (phase == InferenceExecutionPhase::Decode ||
-                                 phase == InferenceExecutionPhase::Prefill);
     const bool fast_moe_enabled =
-        lfm2_fast_path ? fast_config.native_moe_fast_decode != densecore::env::RuntimeToggleMode::Off
-                       : fast_config.native_moe_fast_decode == densecore::env::RuntimeToggleMode::On;
+        ShouldEnableNativeMoEFastPathByDefault(model, phase, fast_config.native_moe_fast_decode);
     if (!fast_moe_enabled) {
-        return reject(lfm2_native_moe ? "lfm2_fast_moe_disabled" : "native_moe_fast_decode_not_forced");
+        return reject("native_moe_fast_decode_disabled");
     }
     if (current_batch && !current_batch->lora_map.empty()) {
         return reject("dynamic_lora");
     }
-    if (selected_experts->ne[1] <= 0 || selected_experts->ne[1] > kQwen35NativeMoEMaxDirectTokens) {
+    if (selected_experts->ne[1] <= 0 || selected_experts->ne[1] > NativeMoEFastPathMaxDirectTokens(model)) {
         return reject("unsupported_token_count");
     }
     if (IsQwen35NativeMoEDownQ5KDiagEnabled()) {
@@ -3023,10 +3006,40 @@ static bool Qwen35NativeMoEQ4KQ8KDotRow(const void* weight_row, const uint8_t* q
     return densecore::hwy_kernels::DotQ4KQ8K_Hwy(weight_row, qrow, cols, out_value);
 }
 
-static bool Qwen35NativeMoEQ4KQ8KFusedSwiGLURows(const void* gate_row_start, const void* up_row_start,
-                                                 const uint8_t* qrow, int64_t cols, int64_t row_count,
-                                                 size_t row_bytes, float* out_start) {
+static bool Qwen35NativeMoEKQ8KDotRow(ggml_type weight_type, const void* weight_row, const uint8_t* qrow,
+                                      int64_t cols, float* out_value) {
+    if (weight_type == GGML_TYPE_Q4_K) {
+        return Qwen35NativeMoEQ4KQ8KDotRow(weight_row, qrow, cols, out_value);
+    }
+    if (weight_type == GGML_TYPE_Q5_K) {
+        return densecore::hwy_kernels::DotQ5KQ8K_Hwy(weight_row, qrow, cols, out_value);
+    }
+    return false;
+}
+
+static bool Qwen35NativeMoEKQ8KFusedSwiGLURows(ggml_type weight_type, const void* gate_row_start,
+                                               const void* up_row_start, const uint8_t* qrow, int64_t cols,
+                                               int64_t row_count, size_t row_bytes, float* out_start) {
     if (!gate_row_start || !up_row_start || !qrow || !out_start || cols <= 0 || row_count <= 0 || row_bytes == 0) {
+        return false;
+    }
+    if (weight_type == GGML_TYPE_Q5_K) {
+        const auto* gate_base = static_cast<const char*>(gate_row_start);
+        const auto* up_base = static_cast<const char*>(up_row_start);
+        for (int64_t row = 0; row < row_count; ++row) {
+            const void* gate_row = gate_base + static_cast<size_t>(row) * row_bytes;
+            const void* up_row = up_base + static_cast<size_t>(row) * row_bytes;
+            float gate = 0.0f;
+            float up = 0.0f;
+            if (!Qwen35NativeMoEKQ8KDotRow(weight_type, gate_row, qrow, cols, &gate) ||
+                !Qwen35NativeMoEKQ8KDotRow(weight_type, up_row, qrow, cols, &up)) {
+                return false;
+            }
+            out_start[row] = NativeMoESiLU(gate) * up;
+        }
+        return true;
+    }
+    if (weight_type != GGML_TYPE_Q4_K) {
         return false;
     }
     const ggml_type_traits_cpu* traits =
@@ -3064,7 +3077,7 @@ static bool Qwen35NativeMoEQ4KQ8KFusedSwiGLURows(const void* gate_row_start, con
                                                              row_bytes, out_start);
 }
 
-static void RunQwen35NativeMoEGateUpRawQ4KSwiGLU(ggml_tensor* dst, const ggml_tensor* gate_exps,
+static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_tensor* gate_exps,
                                                  const ggml_tensor* up_exps, const ggml_tensor* input,
                                                  const ggml_tensor* selected_experts, int ith, int nth,
                                                  Qwen35SharedQ8RowsUserData* shared_q8) {
@@ -3074,13 +3087,15 @@ static void RunQwen35NativeMoEGateUpRawQ4KSwiGLU(ggml_tensor* dst, const ggml_te
     const int64_t n_ff = dst->ne[0];
     const int64_t top_k = selected_experts->ne[0];
     const int64_t n_tokens = selected_experts->ne[1];
-    if (dst->type != GGML_TYPE_F32 || gate_exps->type != GGML_TYPE_Q4_K || up_exps->type != GGML_TYPE_Q4_K ||
-        input->type != GGML_TYPE_F32 || selected_experts->type != GGML_TYPE_I32 || gate_exps->ne[1] != n_ff ||
-        up_exps->ne[1] != n_ff || dst->ne[1] != top_k || dst->ne[2] != n_tokens ||
-        gate_exps->ne[2] != up_exps->ne[2]) {
+    const bool q4_gateup = gate_exps->type == GGML_TYPE_Q4_K && up_exps->type == GGML_TYPE_Q4_K;
+    const bool q5_gateup = gate_exps->type == GGML_TYPE_Q5_K && up_exps->type == GGML_TYPE_Q5_K;
+    if (dst->type != GGML_TYPE_F32 || (!q4_gateup && !q5_gateup) || input->type != GGML_TYPE_F32 ||
+        selected_experts->type != GGML_TYPE_I32 || gate_exps->ne[1] != n_ff || up_exps->ne[1] != n_ff ||
+        dst->ne[1] != top_k || dst->ne[2] != n_tokens || gate_exps->ne[2] != up_exps->ne[2]) {
         return;
     }
-    if (gate_exps->ne[0] != up_exps->ne[0] || (gate_exps->ne[0] % QK_K) != 0) {
+    const int64_t block_size = ggml_blck_size(gate_exps->type);
+    if (gate_exps->ne[0] != up_exps->ne[0] || block_size <= 0 || (gate_exps->ne[0] % block_size) != 0) {
         return;
     }
 
@@ -3093,7 +3108,7 @@ static void RunQwen35NativeMoEGateUpRawQ4KSwiGLU(ggml_tensor* dst, const ggml_te
     if (ith == 0 && shared_q8) {
         shared_q8->repacked_swiglu_failed.store(0, std::memory_order_relaxed);
     }
-    if (shared_q8 && shared_q8->prefer_q4k_repacked_swiglu && n_tokens == 1 && use_shared_q8) {
+    if (q4_gateup && shared_q8 && shared_q8->prefer_q4k_repacked_swiglu && n_tokens == 1 && use_shared_q8) {
         if (ith != 0) {
             return;
         }
@@ -3125,8 +3140,17 @@ static void RunQwen35NativeMoEGateUpRawQ4KSwiGLU(ggml_tensor* dst, const ggml_te
         }
         return;
     }
-    if (n_tokens > 4 &&
+    if (q4_gateup && n_tokens > 4 && use_shared_q8 &&
         Qwen35BuildMoEAssignments(selected_experts, gate_exps->ne[2], &assignments)) {
+        if (ith != 0) {
+            return;
+        }
+        const size_t qrow_bytes = shared_q8->row_bytes;
+        thread_local std::vector<uint8_t> qtile;
+        thread_local std::vector<float> out_tile;
+        qtile.resize(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments) * qrow_bytes);
+        out_tile.resize(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments) * static_cast<size_t>(n_ff));
+        densecore::CpuBackend& backend = densecore::GetCpuBackend();
         for (size_t group_start = 0; group_start < assignments.size();) {
             const int32_t expert = assignments[group_start].expert;
             size_t group_end = group_start + 1;
@@ -3137,30 +3161,41 @@ static void RunQwen35NativeMoEGateUpRawQ4KSwiGLU(ggml_tensor* dst, const ggml_te
                                     static_cast<size_t>(expert) * static_cast<size_t>(gate_exps->nb[2]);
             const char* up_base = static_cast<const char*>(up_exps->data) +
                                   static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]);
-            for (int64_t row = row_start; row < row_end; ++row) {
-                const char* gate_row = gate_base + static_cast<size_t>(row) * static_cast<size_t>(gate_exps->nb[1]);
-                const char* up_row = up_base + static_cast<size_t>(row) * static_cast<size_t>(up_exps->nb[1]);
-                for (size_t ai = group_start; ai < group_end; ++ai) {
+            for (size_t tile_start = group_start; tile_start < group_end;
+                 tile_start += static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments)) {
+                const size_t tile_end =
+                    std::min(group_end, tile_start + static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments));
+                const int64_t tile_m = static_cast<int64_t>(tile_end - tile_start);
+                for (size_t ai = tile_start; ai < tile_end; ++ai) {
                     const Qwen35MoEAssignment& assignment = assignments[ai];
-                    const uint8_t* qrow =
-                        use_shared_q8 ? Qwen35SharedQ8RowPtr(shared_q8, assignment.token, 0) : nullptr;
+                    const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, assignment.token, 0);
                     if (!qrow) {
-                        if (!Qwen35NativeMoEGateUpQuantizeInput(input, assignment.token, qbuf)) continue;
-                        qrow = qbuf.data();
+                        if (shared_q8) {
+                            shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
+                        }
+                        return;
                     }
-                    float gate_value = 0.0f;
-                    float up_value = 0.0f;
-                    if (!Qwen35NativeMoEQ4KQ8KDotRow(gate_row, qrow, gate_exps->ne[0], &gate_value) ||
-                        !Qwen35NativeMoEQ4KQ8KDotRow(up_row, qrow, up_exps->ne[0], &up_value)) {
-                        continue;
+                    std::memcpy(qtile.data() + static_cast<size_t>(ai - tile_start) * qrow_bytes, qrow, qrow_bytes);
+                }
+                if (!densecore::RunMoEQ4KRawBatchedFusedSwiGLU(&backend, gate_base, up_base, qtile.data(), qrow_bytes,
+                                                               out_tile.data(), tile_m, n_ff, gate_exps->ne[0],
+                                                               /*numa_node=*/0, /*allow_parallel=*/true)) {
+                    if (shared_q8) {
+                        shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
                     }
-                    const float silu = NativeMoESiLU(gate_value);
-                    *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                              static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
-                                              static_cast<size_t>(assignment.topk_index) *
-                                                  static_cast<size_t>(dst->nb[1]) +
-                                              static_cast<size_t>(assignment.token) *
-                                                  static_cast<size_t>(dst->nb[2])) = silu * up_value;
+                    return;
+                }
+                for (size_t ai = tile_start; ai < tile_end; ++ai) {
+                    const Qwen35MoEAssignment& assignment = assignments[ai];
+                    const float* src = out_tile.data() + static_cast<size_t>(ai - tile_start) * static_cast<size_t>(n_ff);
+                    for (int64_t row = 0; row < n_ff; ++row) {
+                        *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                  static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                                  static_cast<size_t>(assignment.topk_index) *
+                                                      static_cast<size_t>(dst->nb[1]) +
+                                                  static_cast<size_t>(assignment.token) *
+                                                      static_cast<size_t>(dst->nb[2])) = src[row];
+                    }
                 }
             }
             group_start = group_end;
@@ -3189,8 +3224,9 @@ static void RunQwen35NativeMoEGateUpRawQ4KSwiGLU(ggml_tensor* dst, const ggml_te
                                                         static_cast<size_t>(row_start) * static_cast<size_t>(dst->nb[0]) +
                                                         static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
                                                         static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2]));
-            if (!Qwen35NativeMoEQ4KQ8KFusedSwiGLURows(gate_row_start, up_row_start, qrow, gate_exps->ne[0], row_count,
-                                                      static_cast<size_t>(gate_exps->nb[1]), out_start)) {
+            if (!Qwen35NativeMoEKQ8KFusedSwiGLURows(gate_exps->type, gate_row_start, up_row_start, qrow,
+                                                    gate_exps->ne[0], row_count,
+                                                    static_cast<size_t>(gate_exps->nb[1]), out_start)) {
                 if (shared_q8) {
                     shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
                 }
@@ -3200,11 +3236,11 @@ static void RunQwen35NativeMoEGateUpRawQ4KSwiGLU(ggml_tensor* dst, const ggml_te
     }
 }
 
-static void cb_qwen35_native_moe_gateup_raw_q4k_swiglu(struct ggml_tensor* dst, int ith, int nth,
+static void cb_qwen35_native_moe_gateup_raw_qxk_swiglu(struct ggml_tensor* dst, int ith, int nth,
                                                         void* userdata) {
     const auto start = std::chrono::steady_clock::now();
     auto* shared_q8 = static_cast<Qwen35SharedQ8RowsUserData*>(userdata);
-    RunQwen35NativeMoEGateUpRawQ4KSwiGLU(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
+    RunQwen35NativeMoEGateUpRawQXKSwiGLU(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
                                          dst ? dst->src[2] : nullptr, dst ? dst->src[3] : nullptr, ith, nth,
                                          shared_q8);
     if (ith == 0) {
@@ -3224,12 +3260,12 @@ static void cb_qwen35_native_moe_gateup_raw_q4k_swiglu(struct ggml_tensor* dst, 
     }
 }
 
-static bool CanUseQwen35NativeMoEGateUpRawQ4KSwiGLU(const TransformerModel* model, const ggml_tensor* gate_exps,
+static bool CanUseQwen35NativeMoEGateUpRawQXKSwiGLU(const TransformerModel* model, const ggml_tensor* gate_exps,
                                                     const ggml_tensor* up_exps, const ggml_tensor* input,
                                                     const ggml_tensor* selected_experts) {
     auto reject = [](const char* reason) {
         if (IsQwen35NativeMoEDownQ5KDiagEnabled()) {
-            std::fprintf(stderr, "[W1W3_Q4K_DIAG] gateup_raw rejected: %s\n", reason);
+            std::fprintf(stderr, "[W1W3_QXK_DIAG] gateup_raw rejected: %s\n", reason);
         }
         return false;
     };
@@ -3246,23 +3282,24 @@ static bool CanUseQwen35NativeMoEGateUpRawQ4KSwiGLU(const TransformerModel* mode
     }
     const BatchSpec* current_batch = GetCurrentBatch();
     const auto& fast_config = ResolveFastPathRuntimeConfig(current_batch);
-    const bool lfm2_fast_path = lfm2_native_moe &&
-                                (phase == InferenceExecutionPhase::Decode ||
-                                 phase == InferenceExecutionPhase::Prefill);
     const bool fast_moe_enabled =
-        lfm2_fast_path ? fast_config.native_moe_fast_decode != densecore::env::RuntimeToggleMode::Off
-                       : fast_config.native_moe_fast_decode == densecore::env::RuntimeToggleMode::On;
+        ShouldEnableNativeMoEFastPathByDefault(model, phase, fast_config.native_moe_fast_decode);
     if (!fast_moe_enabled) {
-        return reject(lfm2_native_moe ? "lfm2_fast_moe_disabled" : "fast_decode_not_forced");
+        return reject("native_moe_fast_decode_disabled");
     }
     if (current_batch && !current_batch->lora_map.empty()) return reject("dynamic_lora");
-    if (gate_exps->type != GGML_TYPE_Q4_K || up_exps->type != GGML_TYPE_Q4_K ||
-        input->type != GGML_TYPE_F32 || selected_experts->type != GGML_TYPE_I32) {
+    const bool qwen_supported_gateup =
+        qwen_native_moe && ((gate_exps->type == GGML_TYPE_Q4_K && up_exps->type == GGML_TYPE_Q4_K) ||
+                            (gate_exps->type == GGML_TYPE_Q5_K && up_exps->type == GGML_TYPE_Q5_K));
+    const bool lfm2_supported_gateup =
+        lfm2_native_moe && gate_exps->type == GGML_TYPE_Q4_K && up_exps->type == GGML_TYPE_Q4_K;
+    if ((!qwen_supported_gateup && !lfm2_supported_gateup) || input->type != GGML_TYPE_F32 ||
+        selected_experts->type != GGML_TYPE_I32) {
         return reject("unsupported_type");
     }
     if (!gate_exps->data || !up_exps->data) return reject("missing_weight_data");
     if (gate_exps->view_src || up_exps->view_src) return reject("weight_view");
-    if (input->ne[1] <= 0 || input->ne[1] > kQwen35NativeMoEMaxDirectTokens) {
+    if (input->ne[1] <= 0 || input->ne[1] > NativeMoEFastPathMaxDirectTokens(model)) {
         return reject("unsupported_token_count");
     }
     if (selected_experts->ne[1] != input->ne[1]) return reject("selected_expert_token_mismatch");
@@ -3270,147 +3307,18 @@ static bool CanUseQwen35NativeMoEGateUpRawQ4KSwiGLU(const TransformerModel* mode
         gate_exps->ne[1] != up_exps->ne[1] || gate_exps->ne[2] != up_exps->ne[2]) {
         return reject("shape_mismatch");
     }
-    if ((gate_exps->ne[0] % QK_K) != 0) return reject("bad_q4k_alignment");
+    const int64_t block_size = ggml_blck_size(gate_exps->type);
+    if (block_size <= 0 || (gate_exps->ne[0] % block_size) != 0) return reject("bad_kquant_alignment");
     if (IsQwen35NativeMoEDownQ5KDiagEnabled()) {
-        std::fprintf(stderr, "[W1W3_Q4K_DIAG] gateup_raw accepted\n");
+        std::fprintf(stderr, "[W1W3_QXK_DIAG] gateup_raw accepted type=%d\n", static_cast<int>(gate_exps->type));
     }
     return true;
 }
-
-#if defined(__aarch64__) || defined(_M_ARM64)
-static ggml_tensor* TryBuildQwen35NativeMoEGraphArmLegacy(ggml_context* ctx, ggml_cgraph* gf,
-                                                          TransformerModel* model, TransformerLayer* layer,
-                                                          int layer_idx, ggml_tensor* routed_input,
-                                                          ggml_tensor* gate_logits, int top_k,
-                                                          const densecore::models::DecoderLayerSpec* layer_spec) {
-    const bool qwen_native_moe =
-        model && (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
-        model->arch_flags.is_hybrid_ssm;
-    const bool lfm2_native_moe = model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv;
-    if (!ctx || !gf || !model || !layer || !routed_input || !gate_logits ||
-        (!qwen_native_moe && !lfm2_native_moe)) {
-        return nullptr;
-    }
-    if (layer_spec && qwen_native_moe && layer_spec->ffn.router != densecore::models::DecoderMoERouter::SoftmaxTopK) {
-        return nullptr;
-    }
-    if (layer_spec && lfm2_native_moe &&
-        layer_spec->ffn.router != densecore::models::DecoderMoERouter::GroupedSigmoidTopK) {
-        return nullptr;
-    }
-
-    ggml_tensor* gate_exps = GetLayerTensorAny(layer, {"ffn_gate_exps.weight", "ffn_gate_exps"});
-    ggml_tensor* up_exps = GetLayerTensorAny(layer, {"ffn_up_exps.weight", "ffn_up_exps"});
-    ggml_tensor* down_exps = GetLayerTensorAny(layer, {"ffn_down_exps.weight", "ffn_down_exps"});
-    if (!gate_exps || !up_exps || !down_exps) {
-        return nullptr;
-    }
-
-    if (!lfm2_native_moe) {
-        gate_exps = UseCpuRepackAliasIfAvailable(model, gate_exps);
-        up_exps = UseCpuRepackAliasIfAvailable(model, up_exps);
-        down_exps = UseCpuRepackAliasIfAvailable(model, down_exps);
-    }
-
-    const int64_t n_tokens = routed_input->ne[1];
-    const int64_t n_embd = routed_input->ne[0];
-    const int64_t n_experts = gate_logits->ne[0];
-    const int64_t n_expert_used = std::max<int64_t>(1, std::min<int64_t>(top_k, n_experts));
-    if (n_tokens <= 0 || n_embd <= 0 || n_experts <= 0 || gate_logits->ne[1] != n_tokens ||
-        gate_exps->ne[0] != n_embd || up_exps->ne[0] != n_embd || gate_exps->ne[2] != n_experts ||
-        up_exps->ne[2] != n_experts || down_exps->ne[2] != n_experts || gate_exps->ne[1] != up_exps->ne[1] ||
-        down_exps->ne[0] != gate_exps->ne[1] || down_exps->ne[1] != n_embd) {
-        if (IsMoEWiringDebugEnabled()) {
-            std::fprintf(stderr,
-                         "[Qwen35NativeMoE][ARM] rejected layer=%d input=[%lld,%lld] logits=[%lld,%lld] "
-                         "gate=[%lld,%lld,%lld,%lld] up=[%lld,%lld,%lld,%lld] down=[%lld,%lld,%lld,%lld]\n",
-                         layer_idx, static_cast<long long>(routed_input->ne[0]),
-                         static_cast<long long>(routed_input->ne[1]), static_cast<long long>(gate_logits->ne[0]),
-                         static_cast<long long>(gate_logits->ne[1]), static_cast<long long>(gate_exps->ne[0]),
-                         static_cast<long long>(gate_exps->ne[1]), static_cast<long long>(gate_exps->ne[2]),
-                         static_cast<long long>(gate_exps->ne[3]), static_cast<long long>(up_exps->ne[0]),
-                         static_cast<long long>(up_exps->ne[1]), static_cast<long long>(up_exps->ne[2]),
-                         static_cast<long long>(up_exps->ne[3]), static_cast<long long>(down_exps->ne[0]),
-                         static_cast<long long>(down_exps->ne[1]), static_cast<long long>(down_exps->ne[2]),
-                         static_cast<long long>(down_exps->ne[3]));
-        }
-        return nullptr;
-    }
-
-    ggml_tensor* probs = lfm2_native_moe ? ggml_sigmoid(ctx, gate_logits) : ggml_soft_max(ctx, gate_logits);
-    ggml_set_name(probs, "qwen35_native_moe_probs");
-    ggml_tensor* selection_scores = probs;
-    if (lfm2_native_moe) {
-        if (ggml_tensor* bias = layer->Get(model_keys::kMoeCorrectionBias);
-            bias && bias->type == GGML_TYPE_F32 && bias->ne[0] == n_experts) {
-            selection_scores = ggml_add(ctx, probs, bias);
-            ggml_set_name(selection_scores, "lfm2_native_moe_biased_selection_scores");
-        }
-    }
-    ggml_tensor* selected_experts = ggml_argsort_top_k(ctx, selection_scores, static_cast<int>(n_expert_used));
-    ggml_set_name(selected_experts, "qwen35_native_moe_topk");
-    ggml_build_forward_expand(gf, selected_experts);
-
-    probs = ggml_reshape_3d(ctx, probs, 1, n_experts, n_tokens);
-    ggml_tensor* weights = ggml_get_rows(ctx, probs, selected_experts);
-    ggml_set_name(weights, "qwen35_native_moe_weights");
-    if (model->moe_norm_topk_prob) {
-        weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
-        ggml_tensor* weight_sum = ggml_sum_rows(ctx, weights);
-        weight_sum = ggml_clamp(ctx, weight_sum, 6.103515625e-5f, INFINITY);
-        weights = ggml_div(ctx, weights, weight_sum);
-        weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
-    }
-    if (model->moe_routed_scaling_factor != 0.0f && model->moe_routed_scaling_factor != 1.0f) {
-        weights = ggml_scale(ctx, weights, model->moe_routed_scaling_factor);
-    }
-    ggml_set_name(weights, "qwen35_native_moe_norm_weights");
-    ggml_build_forward_expand(gf, weights);
-
-    ggml_tensor* cur3 = ggml_reshape_3d(ctx, routed_input, n_embd, 1, n_tokens);
-    ggml_tensor* gate = ggml_mul_mat_id(ctx, gate_exps, cur3, selected_experts);
-    ggml_set_name(gate, "qwen35_native_moe_gate");
-    ggml_tensor* up = ggml_mul_mat_id(ctx, up_exps, cur3, selected_experts);
-    ggml_set_name(up, "qwen35_native_moe_up");
-    ggml_tensor* hidden = ggml_mul(ctx, ggml_silu(ctx, gate), up);
-    ggml_set_name(hidden, "qwen35_native_moe_swiglu");
-    ggml_tensor* experts = ggml_mul_mat_id(ctx, down_exps, hidden, selected_experts);
-    experts = ggml_mul(ctx, experts, weights);
-    ggml_set_name(experts, "qwen35_native_moe_weighted_down");
-
-    ggml_tensor* expert_views[32] = {nullptr};
-    if (n_expert_used > static_cast<int64_t>(std::size(expert_views))) {
-        return nullptr;
-    }
-    for (int64_t i = 0; i < n_expert_used; ++i) {
-        expert_views[i] = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2],
-                                       static_cast<size_t>(i) * static_cast<size_t>(experts->nb[1]));
-        ggml_build_forward_expand(gf, expert_views[i]);
-    }
-    ggml_tensor* out = expert_views[0];
-    for (int64_t i = 1; i < n_expert_used; ++i) {
-        out = ggml_add(ctx, out, expert_views[i]);
-    }
-    if (n_expert_used == 1) {
-        out = ggml_cont(ctx, out);
-    }
-    char name[80];
-    std::snprintf(name, sizeof(name), "blk.%d.qwen35_native_moe_out", layer_idx);
-    ggml_set_name(out, name);
-    return out;
-}
-#endif
 
 ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, TransformerModel* model,
                                           TransformerLayer* layer, int layer_idx, ggml_tensor* routed_input,
                                           ggml_tensor* gate_logits, int top_k,
                                           const densecore::models::DecoderLayerSpec* layer_spec) {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    if (!model || model->variant != ModelVariant::LFM2MOE) {
-        return TryBuildQwen35NativeMoEGraphArmLegacy(ctx, gf, model, layer, layer_idx, routed_input, gate_logits, top_k,
-                                                     layer_spec);
-    }
-#endif
     const bool qwen_native_moe =
         model && (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
         model->arch_flags.is_hybrid_ssm;
@@ -3441,6 +3349,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         lfm2_native_moe && graph_phase == InferenceExecutionPhase::Decode && !lfm2_debug_reference;
     ggml_tensor* raw_gate_exps = gate_exps;
     ggml_tensor* raw_up_exps = up_exps;
+    ggml_tensor* raw_down_exps = down_exps;
     if (!lfm2_native_moe) {
         gate_exps = UseCpuRepackAliasForTokenCount(model, gate_exps, n_tokens);
         up_exps = UseCpuRepackAliasForTokenCount(model, up_exps, n_tokens);
@@ -3484,28 +3393,28 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         const bool dynamic_lora_active = current_batch && !current_batch->lora_map.empty();
         const bool supported_lfm2_w2_quant = down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q6_K;
         const bool supported_qwen_w2_quant = down_exps->type == GGML_TYPE_Q5_K || down_exps->type == GGML_TYPE_Q6_K;
-        const bool supported_quant =
-            w1w3_type == GGML_TYPE_Q4_K && (lfm2_native_moe ? supported_lfm2_w2_quant : supported_qwen_w2_quant);
-        const bool supported_w1w3_quant = w1w3_type == GGML_TYPE_Q4_K;
+        const bool supported_w1w3_quant =
+            lfm2_native_moe ? w1w3_type == GGML_TYPE_Q4_K
+                            : (w1w3_type == GGML_TYPE_Q4_K || w1w3_type == GGML_TYPE_Q5_K);
         const bool supported_w2_quant = lfm2_native_moe ? supported_lfm2_w2_quant : supported_qwen_w2_quant;
+        const bool supported_quant = supported_w1w3_quant && supported_w2_quant;
         const bool supported_shape =
             (phase == InferenceExecutionPhase::Decode || phase == InferenceExecutionPhase::Prefill) &&
-            n_tokens > 0 && n_tokens <= kQwen35NativeMoEMaxDirectTokens;
+            n_tokens > 0 && n_tokens <= NativeMoEFastPathMaxDirectTokens(model);
         const bool selected_experts_available = n_expert_used > 0 && n_expert_used <= n_experts;
         const bool fast_kernel_available = supported_quant;
         const bool fast_decode_candidate =
             phase == InferenceExecutionPhase::Decode && n_experts > 0 && (qwen_native_moe || lfm2_native_moe);
         const bool fast_decode_enabled =
-            lfm2_fast_only_decode ? fast_config.native_moe_fast_decode != densecore::env::RuntimeToggleMode::Off
-                                  : fast_config.native_moe_fast_decode == densecore::env::RuntimeToggleMode::On;
+            ShouldEnableNativeMoEFastPathByDefault(model, phase, fast_config.native_moe_fast_decode);
         const bool fast_decode_supported =
             fast_decode_candidate && fast_decode_enabled && supported_shape && selected_experts_available &&
             supported_quant && !dynamic_lora_active && fast_kernel_available;
         const bool defer_to_native_w2_custom_node = fast_decode_supported;
         if (fast_decode_candidate && !defer_to_native_w2_custom_node) {
-            const char* reason = fast_decode_supported ? "fallback_safety" : "none";
+            const char* reason = "none";
             if (!fast_decode_enabled) {
-                reason = lfm2_native_moe ? "lfm2_fast_decode_disabled" : "not_forced";
+                reason = "native_moe_fast_decode_disabled";
             } else if (!supported_shape) {
                 reason = lfm2_native_moe ? "callback_shape_mismatch" : "unsupported_shape";
             } else if (!selected_experts_available) {
@@ -3567,12 +3476,11 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     ggml_set_name(selected_experts, "qwen35_native_moe_topk");
     ggml_build_forward_expand(gf, selected_experts);
 
-    ggml_tensor* cur3 = ggml_reshape_3d(ctx, routed_input, n_embd, 1, n_tokens);
     ggml_tensor* gate = nullptr;
     ggml_tensor* up = nullptr;
     ggml_tensor* hidden = nullptr;
     if (!lfm2_debug_reference &&
-        CanUseQwen35NativeMoEGateUpRawQ4KSwiGLU(model, raw_gate_exps, raw_up_exps, routed_input, selected_experts)) {
+        CanUseQwen35NativeMoEGateUpRawQXKSwiGLU(model, raw_gate_exps, raw_up_exps, routed_input, selected_experts)) {
         Qwen35SharedQ8RowsUserData* gateup_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, routed_input);
         if (gateup_q8_ud) {
             // LFM2 decode stays on the validated raw Q4_K x Q8_K vecdot path.
@@ -3582,32 +3490,17 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         }
         ggml_tensor* args[] = {raw_gate_exps, raw_up_exps, routed_input, selected_experts};
         hidden = ggml_custom_4d(ctx, GGML_TYPE_F32, raw_gate_exps->ne[1], n_expert_used, n_tokens, 1, args, 4,
-                                cb_qwen35_native_moe_gateup_raw_q4k_swiglu, GGML_N_TASKS_MAX, gateup_q8_ud);
-        ggml_set_name(hidden, "qwen35_native_moe_gateup_raw_q4k_swiglu");
-    } else if (lfm2_fast_only_decode) {
+                                cb_qwen35_native_moe_gateup_raw_qxk_swiglu, GGML_N_TASKS_MAX, gateup_q8_ud);
+        ggml_set_name(hidden, "qwen35_native_moe_gateup_raw_qxk_swiglu");
+    } else if (qwen_native_moe || lfm2_native_moe) {
         if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
             RecordNativeMoEFastDecodeDecision(work_ctx, /*candidate=*/true, /*used=*/false,
                                              "w1w3_fast_callback_unavailable",
                                              /*w1w3_used=*/false, /*w2_used=*/false);
         }
         return nullptr;
-    } else if (use_fused_gate_up) {
-        ggml_tensor* gate_up = QwenTargetGgmlMulMatIdFallback(
-            ctx, model, gate_up_exps, cur3, selected_experts,
-            "temporary_reference_qwen_moe_fused_gate_up_mul_mat_id");
-        ggml_set_name(gate_up, "qwen35_native_moe_gate_up");
-        gate = ggml_view_3d(ctx, gate_up, gate_exps->ne[1], n_expert_used, n_tokens, gate_up->nb[1], gate_up->nb[2], 0);
-        ggml_set_name(gate, "qwen35_native_moe_gate");
-        up = ggml_view_3d(ctx, gate_up, up_exps->ne[1], n_expert_used, n_tokens, gate_up->nb[1], gate_up->nb[2],
-                          static_cast<size_t>(gate_exps->ne[1]) * static_cast<size_t>(gate_up->nb[0]));
-        ggml_set_name(up, "qwen35_native_moe_up");
     } else {
-        gate = QwenTargetGgmlMulMatIdFallback(ctx, model, gate_exps, cur3, selected_experts,
-                                             "temporary_reference_qwen_moe_gate_mul_mat_id");
-        ggml_set_name(gate, "qwen35_native_moe_gate");
-        up = QwenTargetGgmlMulMatIdFallback(ctx, model, up_exps, cur3, selected_experts,
-                                           "temporary_reference_qwen_moe_up_mul_mat_id");
-        ggml_set_name(up, "qwen35_native_moe_up");
+        return nullptr;
     }
     if (!hidden) {
         hidden = ggml_swiglu_split(ctx, gate, up);
@@ -3615,8 +3508,9 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     }
     ggml_tensor* fused_out = nullptr;
     Qwen35SharedQ8RowsUserData* hidden_q8_ud = nullptr;
+    ggml_tensor* fast_down_exps = qwen_native_moe ? raw_down_exps : down_exps;
     if (!lfm2_debug_reference &&
-        CanFuseQwen35W2NormWeightsFromLogitsWithCustomCallback(model, down_exps, hidden, selected_experts,
+        CanFuseQwen35W2NormWeightsFromLogitsWithCustomCallback(model, fast_down_exps, hidden, selected_experts,
                                                                 gate_logits)) {
         hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden);
         if (hidden_q8_ud && lfm2_native_moe) {
@@ -3624,8 +3518,8 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             hidden_q8_ud->weighted_logits_norm_topk = model->moe_norm_topk_prob;
             hidden_q8_ud->weighted_logits_scale = model->moe_routed_scaling_factor;
         }
-        ggml_tensor* args[] = {down_exps, hidden, selected_experts, gate_logits};
-        fused_out = ggml_custom_4d(ctx, GGML_TYPE_F32, down_exps->ne[1], selected_experts->ne[1], 1, 1, args, 4,
+        ggml_tensor* args[] = {fast_down_exps, hidden, selected_experts, gate_logits};
+        fused_out = ggml_custom_4d(ctx, GGML_TYPE_F32, fast_down_exps->ne[1], selected_experts->ne[1], 1, 1, args, 4,
                                    cb_qwen35_native_moe_down_q5k_weighted_logits, GGML_N_TASKS_MAX, hidden_q8_ud);
         ggml_set_name(fused_out, lfm2_native_moe ? "lfm2_native_moe_down_qxk_fast_weighted_logits"
                                                  : "qwen35_native_moe_down_q5k_fast_weighted_logits");
@@ -3677,12 +3571,12 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     ggml_build_forward_expand(gf, weights);
 
     if (!lfm2_debug_reference &&
-        CanFuseQwen35W2WeightedSumWithCustomCallback(model, down_exps, hidden, selected_experts, weights)) {
+        CanFuseQwen35W2WeightedSumWithCustomCallback(model, fast_down_exps, hidden, selected_experts, weights)) {
         if (!hidden_q8_ud) {
             hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden);
         }
-        ggml_tensor* args[] = {down_exps, hidden, selected_experts, weights};
-        fused_out = ggml_custom_4d(ctx, GGML_TYPE_F32, down_exps->ne[1], selected_experts->ne[1], 1, 1, args, 4,
+        ggml_tensor* args[] = {fast_down_exps, hidden, selected_experts, weights};
+        fused_out = ggml_custom_4d(ctx, GGML_TYPE_F32, fast_down_exps->ne[1], selected_experts->ne[1], 1, 1, args, 4,
                                    cb_qwen35_native_moe_down_q5k_weighted_sum, GGML_N_TASKS_MAX, hidden_q8_ud);
         ggml_set_name(fused_out, "qwen35_native_moe_down_q5k_fast_weighted_sum");
     }
@@ -3694,18 +3588,18 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         return fused_out;
     }
     ggml_tensor* experts = nullptr;
-    if (!lfm2_debug_reference && CanReplaceQwen35W2WithCustomCallback(model, down_exps, hidden, selected_experts)) {
+    if (!lfm2_debug_reference && CanReplaceQwen35W2WithCustomCallback(model, fast_down_exps, hidden, selected_experts)) {
         if (!hidden_q8_ud) {
             hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden);
         }
-        ggml_tensor* args[] = {down_exps, hidden, selected_experts};
-        experts = ggml_custom_4d(ctx, GGML_TYPE_F32, down_exps->ne[1], selected_experts->ne[0],
+        ggml_tensor* args[] = {fast_down_exps, hidden, selected_experts};
+        experts = ggml_custom_4d(ctx, GGML_TYPE_F32, fast_down_exps->ne[1], selected_experts->ne[0],
                                  selected_experts->ne[1], 1, args, 3,
                                  cb_qwen35_native_moe_down_q5k, GGML_N_TASKS_MAX, hidden_q8_ud);
         ggml_set_name(experts, "qwen35_native_moe_down_q5k_fast");
     }
     if (!experts) {
-        if (lfm2_fast_only_decode) {
+        if (qwen_native_moe || lfm2_native_moe) {
             if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
                 RecordNativeMoEFastDecodeDecision(work_ctx, /*candidate=*/true, /*used=*/false,
                                                  "w2_fast_callback_unavailable",
@@ -3714,11 +3608,9 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             return nullptr;
         }
         if (IsQwen35NativeMoEDownQ5KDiagEnabled()) {
-            std::fprintf(stderr, "[W2_Q5K_DIAG] FALLBACK: layer=%d using ggml_mul_mat_id\n", layer_idx);
+            std::fprintf(stderr, "[W2_Q5K_DIAG] rejected: layer=%d w2 custom callback unavailable\n", layer_idx);
         }
-        experts = QwenTargetGgmlMulMatIdFallback(ctx, model, down_exps, hidden, selected_experts,
-                                                 "temporary_reference_qwen_moe_down_mul_mat_id");
-        ggml_set_name(experts, "qwen35_native_moe_down");
+        return nullptr;
     }
 
     ggml_tensor* out =
@@ -5150,6 +5042,7 @@ struct GemvBatchedUserData {
     uint64_t qwen36_prefill_q4k_admission_key = 0;
     bool qwen36_prefill_q4k_probe = false;
     bool qwen36_prefill_q4k_admitted = false;
+    bool require_q4k_true_batched = false;
     bool disable_quant_nrc_fast = false;
     bool gemma4_dense_prefill_native = false;
     std::atomic<int> qwen36_prefill_q4k_probe_done{0};

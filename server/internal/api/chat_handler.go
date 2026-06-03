@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -122,8 +121,7 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 	}
 	var lfm2Filter *lfm2StreamFilter
 	if isLFM2ModelHint(reasoningModelHint) && !lfm2StreamFilterBypassEnabled() {
-		// Use the expected answer only as a generated-span extraction hint.
-		// Terminal exact-answer synthesis remains disabled unless explicitly opted in.
+		// Use the expected answer only to trim a span that the model actually generated.
 		lfm2Filter = newLFM2StreamFilter(service.ExtractExpectedExactAnswer(req))
 	}
 	var qwen36Filter *qwen36StreamFilter
@@ -149,40 +147,6 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 					writeGenerationError(ctx, w, flusher, req.Model, err, streamWriter.Started())
 					_ = waitGenerationError(errChan)
 					return
-				}
-				if exactFallback := lfm2Filter.FinalExactAnswer(); exactFallback != "" {
-					completionTokens++
-					elapsedMS := serviceDurationMillis(time.Since(streamStart))
-					if firstCallbackMS == 0 {
-						firstCallbackMS = elapsedMS
-					}
-					lastCallbackMS = elapsedMS
-					chunk := domain.ChatCompletionChunk{
-						ID:      id,
-						Object:  "chat.completion.chunk",
-						Created: created,
-						Model:   req.Model,
-						Choices: []domain.ChunkChoice{
-							{
-								Index: 0,
-								Delta: domain.ChunkDelta{
-									Content: exactFallback,
-								},
-								FinishReason: nil,
-							},
-						},
-					}
-					data, err := json.Marshal(chunk)
-					if err != nil {
-						slog.Error("failed to marshal exact-answer SSE chunk", slog.String("error", err.Error()))
-					} else if err := streamWriter.WriteJSONData(data); err != nil {
-						slog.Debug("SSE write error", slog.String("error", err.Error()))
-						return
-					}
-					slog.Info("lfm2_exact_answer_stream_fallback",
-						slog.String("model_id", req.Model),
-						slog.String("answer", exactFallback),
-					)
 				}
 				if err := streamWriter.WriteDone(); err != nil {
 					slog.Debug("SSE write error", slog.String("error", err.Error()))
@@ -275,7 +239,6 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 	}
 
 	content, reasoningContent := splitReasoningResponse(req, h.reasoningModelHint(req), responseText)
-	content, reasoningContent = promoteExactAnswerContent(req, content, reasoningContent)
 	var toolCalls []domain.ToolCall
 	finishReason := resolveSyncFinishReason(completionTokens, req.MaxTokens)
 	if toolParsingEnabled(req) {
@@ -320,24 +283,4 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		slog.Error("failed to encode response", slog.String("error", err.Error()))
 	}
-}
-
-func promoteExactAnswerContent(req domain.ChatCompletionRequest, content, reasoningContent string) (string, string) {
-	if service.ExactAnswerFallbackDisabled() {
-		return content, reasoningContent
-	}
-	expected := service.ExtractExpectedExactAnswer(req)
-	if expected != "" && strings.Contains(strings.ToLower(content), strings.ToLower(expected)) {
-		return expected, ""
-	}
-	if strings.TrimSpace(content) != "" || strings.TrimSpace(reasoningContent) == "" {
-		return content, reasoningContent
-	}
-	if expected == "" {
-		return content, reasoningContent
-	}
-	if strings.EqualFold(strings.TrimSpace(reasoningContent), expected) {
-		return expected, ""
-	}
-	return content, reasoningContent
 }

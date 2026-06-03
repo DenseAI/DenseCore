@@ -695,6 +695,7 @@ struct TransformerModel {
     struct ggml_context* ctx_cpu_kleidiai = nullptr;
     std::vector<ggml_backend_buffer_t> cpu_repack_buffers;
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_repack_aliases;
+    std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_repack_alias_sources;
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_decode_repack_aliases;
     // Scoped Qwen3.6 SSM prefill-only AMX aliases. They are prepared only for
     // a prefill execution and cleared before decode so the canonical Q8_0 GGUF

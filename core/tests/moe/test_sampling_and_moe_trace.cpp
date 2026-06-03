@@ -10,11 +10,17 @@
 #include "ggml.h"
 #include "models/gemma4_packed_expert_layout.h"
 #include "runtime/inference_types_internal.h"
+#include "runtime/runtime_env.h"
 
 namespace densecore::testing {
 std::vector<CpuBackend::ExpertWeights> BuildExpertWeightsForTest(const TransformerLayer* layer,
                                                                  const TransformerModel* model);
 int ResolveQwen36MoECallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int top_k);
+bool ShouldEnableNativeMoEFastPathByDefaultForTest(const TransformerModel* model, int phase, int mode);
+int64_t Qwen35NativeMoEMaxDirectTokensForTest();
+bool CanUseQwenNativeMoEGateUpForTest(const TransformerModel* model, const ggml_tensor* gate_exps,
+                                      const ggml_tensor* up_exps, const ggml_tensor* input,
+                                      const ggml_tensor* selected_experts, int phase);
 bool ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(bool is_qwen36_hybrid_moe, int physical_cores,
                                                                int simd_level);
 bool ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(int physical_cores, int simd_level);
@@ -225,6 +231,118 @@ TEST(MoETrace, Qwen36MoECallbackTaskCountStaysSingleThreaded) {
     setenv("DENSECORE_QWEN36_MOE_PARALLEL", "off", 1);
     EXPECT_EQ(densecore::testing::ResolveQwen36MoECallbackTaskCountForTest(&model, &batch, 8), 1);
     unsetenv("DENSECORE_QWEN36_MOE_PARALLEL");
+}
+
+TEST(MoETrace, NativeMoEFastPathAutoIsDefaultForSupportedHybridMoEModels) {
+    using densecore::env::RuntimeToggleMode;
+
+    TransformerModel qwen35{};
+    qwen35.arch = ModelArch::QWEN35;
+    qwen35.variant = ModelVariant::QWEN35;
+    qwen35.arch_flags.is_hybrid_ssm = true;
+    qwen35.hparams.n_experts = 128;
+
+    TransformerModel qwen36{};
+    qwen36.arch = ModelArch::QWEN35;
+    qwen36.variant = ModelVariant::QWEN36;
+    qwen36.arch_flags.is_hybrid_ssm = true;
+    qwen36.hparams.n_experts = 128;
+
+    TransformerModel lfm2{};
+    lfm2.variant = ModelVariant::LFM2MOE;
+    lfm2.arch_flags.is_lfm2_shortconv = true;
+    lfm2.hparams.n_experts = 128;
+
+    EXPECT_TRUE(densecore::testing::ShouldEnableNativeMoEFastPathByDefaultForTest(
+        &qwen35, static_cast<int>(InferenceExecutionPhase::Decode), static_cast<int>(RuntimeToggleMode::Auto)));
+    EXPECT_TRUE(densecore::testing::ShouldEnableNativeMoEFastPathByDefaultForTest(
+        &qwen36, static_cast<int>(InferenceExecutionPhase::Prefill), static_cast<int>(RuntimeToggleMode::Auto)));
+    EXPECT_TRUE(densecore::testing::ShouldEnableNativeMoEFastPathByDefaultForTest(
+        &lfm2, static_cast<int>(InferenceExecutionPhase::Decode), static_cast<int>(RuntimeToggleMode::Auto)));
+}
+
+TEST(MoETrace, NativeMoEFastPathCoversLongPrefillWindow) {
+    EXPECT_GE(densecore::testing::Qwen35NativeMoEMaxDirectTokensForTest(), 4096);
+}
+
+TEST(MoETrace, NativeMoEFastPathDefaultRejectsUnsupportedOrExplicitlyDisabledModels) {
+    using densecore::env::RuntimeToggleMode;
+
+    TransformerModel qwen_dense{};
+    qwen_dense.arch = ModelArch::QWEN35;
+    qwen_dense.variant = ModelVariant::QWEN36;
+    qwen_dense.arch_flags.is_hybrid_ssm = false;
+    qwen_dense.hparams.n_experts = 128;
+
+    TransformerModel qwen_no_experts{};
+    qwen_no_experts.arch = ModelArch::QWEN35;
+    qwen_no_experts.variant = ModelVariant::QWEN35;
+    qwen_no_experts.arch_flags.is_hybrid_ssm = true;
+    qwen_no_experts.hparams.n_experts = 0;
+
+    TransformerModel gemma{};
+    gemma.variant = ModelVariant::GEMMA4;
+    gemma.hparams.n_experts = 16;
+
+    TransformerModel qwen_supported{};
+    qwen_supported.arch = ModelArch::QWEN35;
+    qwen_supported.variant = ModelVariant::QWEN35;
+    qwen_supported.arch_flags.is_hybrid_ssm = true;
+    qwen_supported.hparams.n_experts = 128;
+
+    EXPECT_FALSE(densecore::testing::ShouldEnableNativeMoEFastPathByDefaultForTest(
+        &qwen_dense, static_cast<int>(InferenceExecutionPhase::Decode), static_cast<int>(RuntimeToggleMode::Auto)));
+    EXPECT_FALSE(densecore::testing::ShouldEnableNativeMoEFastPathByDefaultForTest(
+        &qwen_no_experts, static_cast<int>(InferenceExecutionPhase::Decode), static_cast<int>(RuntimeToggleMode::Auto)));
+    EXPECT_FALSE(densecore::testing::ShouldEnableNativeMoEFastPathByDefaultForTest(
+        &gemma, static_cast<int>(InferenceExecutionPhase::Decode), static_cast<int>(RuntimeToggleMode::Auto)));
+    EXPECT_FALSE(densecore::testing::ShouldEnableNativeMoEFastPathByDefaultForTest(
+        &qwen_supported, static_cast<int>(InferenceExecutionPhase::Decode), static_cast<int>(RuntimeToggleMode::Off)));
+}
+
+TEST(MoETrace, QwenNativeMoEGateUpAdmissionSupportsQ5ButLFM2StaysQ4Only) {
+    ggml_init_params params{};
+    params.mem_size = 1 << 20;
+    params.mem_buffer = nullptr;
+    params.no_alloc = false;
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+    struct Guard {
+        ggml_context* ctx;
+        ~Guard() { ggml_free(ctx); }
+    } guard{ctx};
+
+    constexpr int64_t k = 256;
+    constexpr int64_t n_ff = 16;
+    constexpr int64_t n_experts = 4;
+    constexpr int64_t top_k = 2;
+    ggml_tensor* gate_q5 = ggml_new_tensor_3d(ctx, GGML_TYPE_Q5_K, k, n_ff, n_experts);
+    ggml_tensor* up_q5 = ggml_new_tensor_3d(ctx, GGML_TYPE_Q5_K, k, n_ff, n_experts);
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+    ggml_tensor* selected = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, 1);
+    ASSERT_NE(gate_q5, nullptr);
+    ASSERT_NE(up_q5, nullptr);
+    ASSERT_NE(input, nullptr);
+    ASSERT_NE(selected, nullptr);
+
+    TransformerModel qwen{};
+    qwen.arch = ModelArch::QWEN35;
+    qwen.variant = ModelVariant::QWEN36;
+    qwen.arch_flags.is_hybrid_ssm = true;
+    qwen.hparams.n_experts = static_cast<int32_t>(n_experts);
+    qwen.hparams.n_experts_used = static_cast<int32_t>(top_k);
+
+    EXPECT_TRUE(densecore::testing::CanUseQwenNativeMoEGateUpForTest(
+        &qwen, gate_q5, up_q5, input, selected, static_cast<int>(InferenceExecutionPhase::Prefill)));
+
+    TransformerModel lfm2{};
+    lfm2.variant = ModelVariant::LFM2MOE;
+    lfm2.arch_flags.is_lfm2_shortconv = true;
+    lfm2.hparams.n_experts = static_cast<int32_t>(n_experts);
+    lfm2.hparams.n_experts_used = static_cast<int32_t>(top_k);
+
+    EXPECT_FALSE(densecore::testing::CanUseQwenNativeMoEGateUpForTest(
+        &lfm2, gate_q5, up_q5, input, selected, static_cast<int>(InferenceExecutionPhase::Decode)));
 }
 
 TEST(MoETrace, Qwen36SmallDecodeExpertParallelAutoPolicyTargetsC4AShape) {
@@ -952,7 +1070,8 @@ TEST(Gemma4PackedLayout, MultiExpertTopKMatchesCanonicalReference) {
     routing.token_indices = {0, 0, 1, 1};
     routing.weights = {route_weights[0][0], route_weights[0][1], route_weights[1][0], route_weights[1][1]};
 
-    densecore::GetCpuBackend().ForwardMoE(input, routing, expert_weights, &output);
+    TransformerLayer layer_key;
+    densecore::GetCpuBackend().ForwardMoE(&layer_key, input, routing, expert_weights, &output);
 
     // Independent canonical reference: out_t = sum_e w[t][e] * expert_ffn(e, token_t).
     auto expert_ffn = [&](int e, const float* x, float* out_h) {

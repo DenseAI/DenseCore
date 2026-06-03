@@ -5,19 +5,90 @@
 
 #include <gtest/gtest.h>
 
+#include "densecore/backend/cpu_backend.h"
 #include "densecore/hal/op_registry.h"
 #include "densecore/hal/operation_graph.h"
 #include "densecore/hal/tensor.h"
 #include "densecore/moe/moe_routing.h"
+#include "densecore/simd/hwy_ops.h"
+#include "ggml-cpu.h"
+#include "ggml.h"
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <vector>
 
 namespace densecore {
+
+bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
+                                   size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
+                                   int numa_node, bool allow_parallel);
+bool RunMoEQ4KRawBatchedFusedSwiGLU(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
+                                    const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
+                                    int64_t N, int64_t K, int numa_node, bool allow_parallel);
+
 namespace {
+
+float MoETestFastExp(float x) {
+    if (x < -50.0f) x = -50.0f;
+    if (x > 50.0f) x = 50.0f;
+
+    constexpr float kLog2E = 1.4426950408889634f;
+    const float y = x * kLog2E;
+    const int32_t i = static_cast<int32_t>(std::floor(y));
+    const float f = y - static_cast<float>(i);
+    const float p = 1.0f + f * (0.6960656421638072f + f * (0.224494337302845f + f * 0.07944023841053369f));
+
+    const int32_t exp_bits = (i + 127) << 23;
+    float two_i = 0.0f;
+    std::memcpy(&two_i, &exp_bits, sizeof(two_i));
+    return two_i * p;
+}
+
+float MoETestSiLU(float x) {
+    return x / (1.0f + MoETestFastExp(-x));
+}
+
+std::vector<float> MakePatternedFloats(int64_t rows, int64_t cols, float scale) {
+    std::vector<float> data(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t col = 0; col < cols; ++col) {
+            const int v = static_cast<int>((row * 17 + col * 29 + 7) % 41) - 20;
+            data[static_cast<size_t>(row) * static_cast<size_t>(cols) + static_cast<size_t>(col)] =
+                static_cast<float>(v) * scale;
+        }
+    }
+    return data;
+}
+
+void QuantizeRowsCpu(ggml_type type, const std::vector<float>& src, int64_t rows, int64_t cols,
+                     std::vector<uint8_t>* dst) {
+    ASSERT_NE(dst, nullptr);
+    const auto* traits = ggml_get_type_traits_cpu(type);
+    ASSERT_NE(traits, nullptr);
+    ASSERT_NE(traits->from_float, nullptr);
+    const size_t row_bytes = ggml_row_size(type, cols);
+    ASSERT_GT(row_bytes, 0u);
+    dst->assign(static_cast<size_t>(rows) * row_bytes, 0);
+    for (int64_t row = 0; row < rows; ++row) {
+        traits->from_float(src.data() + static_cast<size_t>(row) * static_cast<size_t>(cols),
+                           dst->data() + static_cast<size_t>(row) * row_bytes, cols);
+    }
+}
+
+float Q4KQ8KVecDotReference(const std::vector<uint8_t>& qweight, const std::vector<uint8_t>& qinput, int64_t row,
+                            int64_t input_row, int64_t K) {
+    const size_t weight_row_bytes = ggml_row_size(GGML_TYPE_Q4_K, K);
+    const size_t input_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, K);
+    float out = 0.0f;
+    EXPECT_TRUE(hwy_kernels::DotQ4KQ8K_Hwy(qweight.data() + static_cast<size_t>(row) * weight_row_bytes,
+                                           qinput.data() + static_cast<size_t>(input_row) * input_row_bytes, K,
+                                           &out));
+    return out;
+}
 
 class MoEOpsTest : public ::testing::Test {
 protected:
@@ -32,6 +103,80 @@ TEST_F(MoEOpsTest, OpTypeEnumValues) {
     EXPECT_EQ(static_cast<uint8_t>(OpType::MoEScatter), 71);
     EXPECT_EQ(static_cast<uint8_t>(OpType::MoEGather), 72);
     EXPECT_EQ(static_cast<uint8_t>(OpType::MoEForward), 73);
+}
+
+TEST_F(MoEOpsTest, Q4KRawBatchedFusedSwiGLUMatchesScalarVecDot) {
+    constexpr int64_t M = 6;
+    constexpr int64_t K = 256;
+    constexpr int64_t N = 19;
+
+    const std::vector<float> gate_f32 = MakePatternedFloats(N, K, 0.021f);
+    const std::vector<float> up_f32 = MakePatternedFloats(N, K, 0.017f);
+    const std::vector<float> input_f32 = MakePatternedFloats(M, K, 0.013f);
+
+    std::vector<uint8_t> qgate;
+    std::vector<uint8_t> qup;
+    std::vector<uint8_t> qinput;
+    QuantizeRowsCpu(GGML_TYPE_Q4_K, gate_f32, N, K, &qgate);
+    QuantizeRowsCpu(GGML_TYPE_Q4_K, up_f32, N, K, &qup);
+    QuantizeRowsCpu(GGML_TYPE_Q8_K, input_f32, M, K, &qinput);
+
+    std::vector<float> actual(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+    CpuBackend& backend = GetCpuBackend();
+    ASSERT_TRUE(RunMoEQ4KRawBatchedFusedSwiGLU(&backend, qgate.data(), qup.data(), qinput.data(),
+                                              ggml_row_size(GGML_TYPE_Q8_K, K), actual.data(), M, N, K,
+                                              /*numa_node=*/0, /*allow_parallel=*/false));
+
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t n = 0; n < N; ++n) {
+            const float gate = Q4KQ8KVecDotReference(qgate, qinput, n, m, K);
+            const float up = Q4KQ8KVecDotReference(qup, qinput, n, m, K);
+            const float expected = MoETestSiLU(gate) * up;
+            EXPECT_NEAR(actual[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)], expected,
+                        1e-4f)
+                << "m=" << m << " n=" << n;
+        }
+    }
+}
+
+TEST_F(MoEOpsTest, Q4KRawBatchedProjectionSupportsWeightedScatter) {
+    constexpr int64_t M = 5;
+    constexpr int64_t K = 256;
+    constexpr int64_t N = 23;
+    constexpr int64_t Tokens = 3;
+
+    const std::vector<float> weight_f32 = MakePatternedFloats(N, K, 0.019f);
+    const std::vector<float> input_f32 = MakePatternedFloats(M, K, 0.011f);
+
+    std::vector<uint8_t> qweight;
+    std::vector<uint8_t> qinput;
+    QuantizeRowsCpu(GGML_TYPE_Q4_K, weight_f32, N, K, &qweight);
+    QuantizeRowsCpu(GGML_TYPE_Q8_K, input_f32, M, K, &qinput);
+
+    std::vector<float> projected(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+    CpuBackend& backend = GetCpuBackend();
+    ASSERT_TRUE(RunMoEQ4KRawBatchedProjection(&backend, qweight.data(), qinput.data(),
+                                             ggml_row_size(GGML_TYPE_Q8_K, K), projected.data(), M, N, K,
+                                             /*numa_node=*/0, /*allow_parallel=*/false));
+
+    const int token_for_m[M] = {0, 1, 1, 2, 0};
+    const float route_weight[M] = {0.75f, 0.2f, 0.55f, 1.0f, 0.125f};
+    std::vector<float> actual(static_cast<size_t>(Tokens) * static_cast<size_t>(N), 0.0f);
+    std::vector<float> expected(static_cast<size_t>(Tokens) * static_cast<size_t>(N), 0.0f);
+
+    for (int64_t m = 0; m < M; ++m) {
+        const int token = token_for_m[m];
+        for (int64_t n = 0; n < N; ++n) {
+            actual[static_cast<size_t>(token) * static_cast<size_t>(N) + static_cast<size_t>(n)] +=
+                projected[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] * route_weight[m];
+            expected[static_cast<size_t>(token) * static_cast<size_t>(N) + static_cast<size_t>(n)] +=
+                Q4KQ8KVecDotReference(qweight, qinput, n, m, K) * route_weight[m];
+        }
+    }
+
+    for (size_t i = 0; i < actual.size(); ++i) {
+        EXPECT_NEAR(actual[i], expected[i], 1e-4f) << "i=" << i;
+    }
 }
 
 TEST_F(MoEOpsTest, OpTypeNames) {

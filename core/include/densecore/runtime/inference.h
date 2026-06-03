@@ -600,6 +600,8 @@ void SetCurrentBatch(const BatchSpec* batch);
 // Rebind those runtime pointers before executing a reused graph.
 bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& batch);
 bool RebindLFM2DecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& batch);
+bool RebindDecodeGraphRuntimeStateForModel(const TransformerModel* model, GgmlGraphHandle* graph,
+                                           const BatchSpec& batch);
 
 // Grammar constraint for structured output (e.g., JSON mode)
 enum class JSONState {

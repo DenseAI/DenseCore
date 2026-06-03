@@ -835,14 +835,10 @@ func TestLFM2StreamFilterPromotesExactAnswerAndSuppressesRest(t *testing.T) {
 	}
 }
 
-func TestLFM2StreamFilterExtractsGeneratedExactAnswerWithFallbackDisabled(t *testing.T) {
-	t.Setenv("DENSECORE_DISABLE_EXACT_ANSWER_FALLBACK", "1")
+func TestLFM2StreamFilterExtractsGeneratedExactAnswerWithoutSynthesis(t *testing.T) {
 	filter := newLFM2StreamFilter("cedar-owl-742")
 	if got := filter.Filter("The user is asking for the final response: cedar-owl-742. Extra text"); got != "cedar-owl-742" {
 		t.Fatalf("expected generated exact answer to be emitted, got %q", got)
-	}
-	if got := filter.FinalExactAnswer(); got != "" {
-		t.Fatalf("expected no synthesized final exact answer, got %q", got)
 	}
 }
 
@@ -856,80 +852,11 @@ func TestLFM2StreamFilterBypassRequiresDebugEnv(t *testing.T) {
 	}
 }
 
-func TestLFM2StreamFilterDoesNotSynthesizeFinalExactAnswerByDefault(t *testing.T) {
-	filter := newLFM2StreamFilter("cedar-owl-742")
-	if got := filter.Filter("unhelpful model output"); got != "" {
-		t.Fatalf("expected exact-answer text to be held, got %q", got)
-	}
-	if got := filter.FinalExactAnswer(); got != "" {
-		t.Fatalf("expected no synthesized final exact answer by default, got %q", got)
-	}
-}
-
-func TestLFM2StreamFilterFinalExactAnswerFallbackRequiresOptIn(t *testing.T) {
+func TestLFM2StreamFilterIgnoresLegacyFinalExactAnswerOptIn(t *testing.T) {
 	t.Setenv("DENSECORE_ENABLE_LFM2_FINAL_EXACT_ANSWER_FALLBACK", "1")
 	filter := newLFM2StreamFilter("cedar-owl-742")
 	if got := filter.Filter("unhelpful model output"); got != "" {
 		t.Fatalf("expected exact-answer text to be held, got %q", got)
-	}
-	if got := filter.FinalExactAnswer(); got != "cedar-owl-742" {
-		t.Fatalf("expected opt-in final exact answer fallback, got %q", got)
-	}
-	if got := filter.FinalExactAnswer(); got != "" {
-		t.Fatalf("expected opt-in final exact answer fallback to emit once, got %q", got)
-	}
-}
-
-func TestPromoteExactAnswerContentMovesQwen36ReasoningOnlyAnswer(t *testing.T) {
-	req := domain.ChatCompletionRequest{
-		Messages: []domain.Message{
-			{Role: "user", Content: "What is the capital of France? Answer with only Paris."},
-		},
-	}
-
-	content, reasoning := promoteExactAnswerContent(req, "", "Paris")
-	if content != "Paris" || reasoning != "" {
-		t.Fatalf("expected exact answer promoted to content, got content=%q reasoning=%q", content, reasoning)
-	}
-}
-
-func TestPromoteExactAnswerContentDisabled(t *testing.T) {
-	t.Setenv("DENSECORE_DISABLE_EXACT_ANSWER_FALLBACK", "1")
-	req := domain.ChatCompletionRequest{
-		Messages: []domain.Message{
-			{Role: "user", Content: "What is the capital of France? Answer with only Paris."},
-		},
-	}
-
-	content, reasoning := promoteExactAnswerContent(req, "", "Paris")
-	if content != "" || reasoning != "Paris" {
-		t.Fatalf("expected exact-answer promotion disabled, got content=%q reasoning=%q", content, reasoning)
-	}
-}
-
-func TestPromoteExactAnswerContentDoesNotExposeNonExactReasoning(t *testing.T) {
-	req := domain.ChatCompletionRequest{
-		Messages: []domain.Message{
-			{Role: "user", Content: "What is the capital of France? Answer with only Paris."},
-		},
-	}
-
-	content, reasoning := promoteExactAnswerContent(req, "", "I should answer Paris")
-	if content != "" || reasoning != "I should answer Paris" {
-		t.Fatalf("expected non-exact reasoning to remain hidden, got content=%q reasoning=%q", content, reasoning)
-	}
-}
-
-func TestPromoteExactAnswerContentExtractsExpectedFromNoisyContent(t *testing.T) {
-	req := domain.ChatCompletionRequest{
-		Messages: []domain.Message{
-			{Role: "user", Content: "Final question: What is the verification key?\nFinal response: cedar-owl-742"},
-		},
-	}
-
-	content, reasoning := promoteExactAnswerContent(req, "Please use cedar-owl-742. Extra text", "")
-	if content != "cedar-owl-742" || reasoning != "" {
-		t.Fatalf("expected noisy exact content collapsed, got content=%q reasoning=%q", content, reasoning)
 	}
 }
 

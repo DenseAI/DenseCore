@@ -107,7 +107,7 @@ struct FastPathRuntimeConfig {
     DecodePagedAttentionPolicy decode_paged_attention{};
     KVRetentionPolicy kv_retention{};
     PrefillGraphCachePolicy prefill_graph_cache{};
-    Qwen36PrefillQ4KBatchedMode qwen36_prefill_q4k_batched = Qwen36PrefillQ4KBatchedMode::Probe;
+    Qwen36PrefillQ4KBatchedMode qwen36_prefill_q4k_batched = Qwen36PrefillQ4KBatchedMode::On;
     densecore::env::RuntimeToggleMode qwen36_ssm_q8_amx_alias = densecore::env::RuntimeToggleMode::Off;
     Qwen36SSMQ8PrefillAMXMode qwen36_ssm_q8_prefill_amx = Qwen36SSMQ8PrefillAMXMode::Probe;
     int qwen36_ssm_q8_prefill_amx_min_tokens = 256;

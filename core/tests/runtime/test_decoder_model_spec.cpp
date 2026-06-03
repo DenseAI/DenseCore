@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "densecore/models/decoder_model_spec.h"
+#include "densecore/models/model_execution_contract.h"
 
 namespace {
 
@@ -164,6 +165,66 @@ TEST(DecoderModelSpec, Qwen36HybridMoEResolvesReusableSoftmaxContract) {
     EXPECT_FALSE(HasOp(spec.layers[0], densecore::models::DecoderSemanticOpKind::AttentionCore));
 }
 
+TEST(ModelExecutionContract, Qwen36HybridSSMMoEDeclaresLayerStateAndRebindContract) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_layer = 2;
+    model.hparams.n_embd = 2048;
+    model.hparams.n_experts = 256;
+    model.hparams.n_experts_used = 8;
+    model.ssm_inner_size = 2048;
+    model.ssm_group_count = 16;
+    model.ssm_state_size = 128;
+    model.ssm_time_step_rank = 16;
+    model.ssm_conv_kernel = 4;
+    model.hybrid_layer_is_ssm = {1, 0};
+    model.layers.resize(2);
+    model.layers[0].is_moe = true;
+    model.layers[0].experts.resize(256);
+
+    const auto contract = densecore::models::BuildModelExecutionContract(&model);
+    ASSERT_TRUE(contract.valid) << densecore::models::FormatModelExecutionContract(contract);
+    EXPECT_EQ(contract.decoder_runtime_topology, densecore::models::DecoderRuntimeTopology::HybridSSMMoE);
+    EXPECT_TRUE(contract.has_hybrid_ssm_mixer);
+    EXPECT_TRUE(contract.has_moe);
+    EXPECT_TRUE(contract.has_stateful_custom_ops);
+    EXPECT_TRUE(contract.requires_native_moe_fast_path);
+    EXPECT_GE(contract.native_moe_max_direct_tokens, 4096);
+    EXPECT_TRUE(densecore::models::ModelExecutionContractAllowsDecodeGraphCache(contract));
+    EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresDecodeGraphRuntimeRebind(contract));
+    EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(contract));
+    EXPECT_GE(densecore::models::ModelExecutionContractNativeMoEMaxDirectTokens(contract), 4096);
+    ASSERT_EQ(contract.layers.size(), 2u);
+    ASSERT_EQ(contract.rebind_descriptors.size(), 2u);
+
+    const auto& layer = contract.layers[0];
+    EXPECT_TRUE(layer.has_hybrid_ssm_mixer);
+    EXPECT_TRUE(layer.has_moe);
+    EXPECT_EQ(layer.ssm_ordinal, 0);
+    EXPECT_EQ(layer.runtime_state_shape.kind, densecore::models::ExecutionRuntimeStateKind::HybridSSM);
+    EXPECT_EQ(layer.runtime_state_shape.conv_channels, 2048 + 2 * 16 * 128);
+    EXPECT_EQ(layer.runtime_state_shape.kernel_size, 4);
+    EXPECT_EQ(layer.runtime_state_shape.n_heads, 16);
+    EXPECT_EQ(layer.runtime_state_shape.head_dim, 128);
+    EXPECT_EQ(layer.runtime_state_shape.state_size, 128);
+    EXPECT_EQ(layer.moe_router, densecore::models::DecoderMoERouter::SoftmaxTopK);
+    EXPECT_EQ(layer.moe_top_k, 8);
+    EXPECT_EQ(layer.moe_num_experts, 256);
+    EXPECT_EQ(layer.moe_expert_layout, densecore::models::ExecutionMoEExpertLayoutKind::SeparateExpertMaps);
+    EXPECT_EQ(layer.rebind_descriptors.size(), 2u);
+    EXPECT_EQ(layer.rebind_descriptors[0].op_kind, densecore::models::ExecutionCustomOpRebindKind::HybridSSMConv1D);
+    EXPECT_EQ(layer.rebind_descriptors[1].op_kind, densecore::models::ExecutionCustomOpRebindKind::HybridSSMDelta);
+
+    const std::string formatted = densecore::models::FormatModelExecutionContract(contract);
+    EXPECT_NE(formatted.find("requires_rebind=true"), std::string::npos);
+    EXPECT_NE(formatted.find("requires_native_moe_fast_path=true"), std::string::npos);
+    EXPECT_NE(formatted.find("native_moe_max_direct_tokens=4096"), std::string::npos);
+    EXPECT_NE(formatted.find("hybrid_ssm_conv1d@layer0"), std::string::npos);
+    EXPECT_NE(formatted.find("hybrid_ssm_delta@layer0"), std::string::npos);
+}
+
 TEST(DecoderModelSpec, Qwen36GroupedMetadataStillUsesLlamaCppSoftmaxRouter) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
@@ -262,4 +323,59 @@ TEST(DecoderModelSpec, LFM2ShortConvMoEPrefillUsesLastTokenLogitsWithoutEnvGate)
 
     const std::string formatted = densecore::models::FormatDecoderModelSpec(spec);
     EXPECT_NE(formatted.find("prefill_logits=last_token_for_moe"), std::string::npos);
+}
+
+TEST(ModelExecutionContract, LFM2ShortConvDeclaresConvOrdinalsAndRebindContract) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_lfm2_shortconv = true;
+    model.hparams.n_layer = 3;
+    model.hparams.n_embd = 8;
+    model.hparams.n_experts = 64;
+    model.hparams.n_experts_used = 6;
+    model.lfm2_conv_kernel = 3;
+    model.lfm2_layer_is_conv = {1, 0, 1};
+    model.lfm2_conv_weight_f32 = {
+        std::vector<float>(static_cast<size_t>(8 * 3), 0.1f),
+        std::vector<float>(static_cast<size_t>(8 * 3), 0.2f),
+    };
+    model.layers.resize(3);
+    for (auto& layer : model.layers) {
+        layer.is_moe = true;
+        layer.experts.resize(64);
+    }
+
+    const auto contract = densecore::models::BuildModelExecutionContract(&model);
+    ASSERT_TRUE(contract.valid) << densecore::models::FormatModelExecutionContract(contract);
+    EXPECT_TRUE(contract.has_lfm2_shortconv_mixer);
+    EXPECT_TRUE(contract.has_moe);
+    EXPECT_TRUE(contract.has_stateful_custom_ops);
+    EXPECT_TRUE(contract.requires_native_moe_fast_path);
+    EXPECT_GE(contract.native_moe_max_direct_tokens, 4096);
+    EXPECT_TRUE(densecore::models::ModelExecutionContractAllowsDecodeGraphCache(contract));
+    EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresDecodeGraphRuntimeRebind(contract));
+    EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(contract));
+    EXPECT_GE(densecore::models::ModelExecutionContractNativeMoEMaxDirectTokens(contract), 4096);
+    ASSERT_EQ(contract.layers.size(), 3u);
+    ASSERT_EQ(contract.rebind_descriptors.size(), 2u);
+
+    EXPECT_TRUE(contract.layers[0].has_lfm2_shortconv_mixer);
+    EXPECT_EQ(contract.layers[0].conv_ordinal, 0);
+    EXPECT_EQ(contract.layers[0].runtime_state_shape.kind, densecore::models::ExecutionRuntimeStateKind::LFM2ShortConv);
+    EXPECT_EQ(contract.layers[0].runtime_state_shape.conv_channels, 8);
+    EXPECT_EQ(contract.layers[0].runtime_state_shape.kernel_size, 3);
+    EXPECT_EQ(contract.layers[0].runtime_state_shape.expected_conv_state_elements, 16u);
+    EXPECT_EQ(contract.layers[0].tensor_ownership, densecore::models::ExecutionTensorOwnership::LoaderCanonicalBuffer);
+    EXPECT_FALSE(contract.layers[1].has_lfm2_shortconv_mixer);
+    EXPECT_TRUE(contract.layers[2].has_lfm2_shortconv_mixer);
+    EXPECT_EQ(contract.layers[2].conv_ordinal, 1);
+    EXPECT_EQ(contract.layers[2].tensor_ownership, densecore::models::ExecutionTensorOwnership::LoaderCanonicalBuffer);
+    EXPECT_EQ(contract.layers[0].moe_router, densecore::models::DecoderMoERouter::GroupedSigmoidTopK);
+
+    const std::string formatted = densecore::models::FormatModelExecutionContract(contract);
+    EXPECT_NE(formatted.find("requires_native_moe_fast_path=true"), std::string::npos);
+    EXPECT_NE(formatted.find("native_moe_max_direct_tokens=4096"), std::string::npos);
+    EXPECT_NE(formatted.find("lfm2_shortconv@layer0"), std::string::npos);
+    EXPECT_NE(formatted.find("lfm2_shortconv@layer2"), std::string::npos);
 }

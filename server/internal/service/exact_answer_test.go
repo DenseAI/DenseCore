@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"reflect"
 	"testing"
 
 	"descore-server/internal/domain"
@@ -88,7 +87,7 @@ func TestExtractExactAnswerFromText(t *testing.T) {
 	}
 }
 
-func TestDeriveExactAnswerConstraint(t *testing.T) {
+func TestDeriveExactAnswerConstraintDisabledByDefault(t *testing.T) {
 	engine := &exactAnswerTestEngine{
 		tokens: map[string][]int{
 			"Paris":  {9079},
@@ -101,22 +100,12 @@ func TestDeriveExactAnswerConstraint(t *testing.T) {
 	}
 
 	got := deriveExactAnswerConstraint(engine, req)
-	if got == nil {
-		t.Fatalf("expected constraint, got nil")
-	}
-	if !got.strict || got.maxTokens != 1 {
-		t.Fatalf("unexpected constraint flags: strict=%v maxTokens=%d", got.strict, got.maxTokens)
-	}
-	wantIDs := []int{9079, 12908}
-	if !reflect.DeepEqual(got.allowedTokenIDs, wantIDs) {
-		t.Fatalf("allowedTokenIDs=%v want %v", got.allowedTokenIDs, wantIDs)
-	}
-	if got.text != "Paris" {
-		t.Fatalf("text=%q want Paris", got.text)
+	if got != nil {
+		t.Fatalf("expected no exact-answer constraint, got %#v", got)
 	}
 }
 
-func TestDeriveExactAnswerConstraintDisabled(t *testing.T) {
+func TestDeriveExactAnswerConstraintIgnoresLegacyDisableEnv(t *testing.T) {
 	t.Setenv("DENSECORE_DISABLE_EXACT_ANSWER_FALLBACK", "1")
 	engine := &exactAnswerTestEngine{
 		tokens: map[string][]int{
@@ -133,7 +122,7 @@ func TestDeriveExactAnswerConstraintDisabled(t *testing.T) {
 	}
 }
 
-func TestDeriveExactAnswerConstraintMultiTokenFallback(t *testing.T) {
+func TestDeriveExactAnswerConstraintDoesNotUseMultiTokenFallback(t *testing.T) {
 	engine := &exactAnswerTestEngine{
 		tokens: map[string][]int{
 			"BLUE-PEARL-471": {101, 202},
@@ -145,16 +134,7 @@ func TestDeriveExactAnswerConstraintMultiTokenFallback(t *testing.T) {
 	}
 
 	got := deriveExactAnswerConstraint(engine, req)
-	if got == nil {
-		t.Fatalf("expected constraint, got nil")
-	}
-	if got.text != "BLUE-PEARL-471" {
-		t.Fatalf("text=%q want BLUE-PEARL-471", got.text)
-	}
-	if len(got.allowedTokenIDs) != 0 {
-		t.Fatalf("allowedTokenIDs=%v want empty for multi-token fallback", got.allowedTokenIDs)
-	}
-	if got.maxTokens != 4 {
-		t.Fatalf("maxTokens=%d want 4", got.maxTokens)
+	if got != nil {
+		t.Fatalf("expected no exact-answer fallback constraint, got %#v", got)
 	}
 }

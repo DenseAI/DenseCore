@@ -170,7 +170,7 @@ TEST(LLMRuntimeConfigTest, NewQwenFastPathEnvFlagsFailClosedOnInvalidValues) {
     ScopedEnvVar q4k_copied_experiment("DENSECORE_ENABLE_Q4K_COPIED_GEMV_EXPERIMENT", nullptr);
     ScopedEnvVar qact_cache("DENSECORE_ENABLE_QACT_CACHE", nullptr);
     auto config = densecore::llm::config::LoadFastPathRuntimeConfig();
-    EXPECT_EQ(config.qwen36_prefill_q4k_batched, densecore::llm::config::Qwen36PrefillQ4KBatchedMode::Probe);
+    EXPECT_EQ(config.qwen36_prefill_q4k_batched, densecore::llm::config::Qwen36PrefillQ4KBatchedMode::On);
     EXPECT_EQ(config.qwen36_ssm_q8_amx_alias, densecore::env::RuntimeToggleMode::Off);
     EXPECT_EQ(config.qwen36_ssm_q8_prefill_amx, densecore::llm::config::Qwen36SSMQ8PrefillAMXMode::Probe);
     EXPECT_EQ(config.qwen36_expert_cpu_repack, densecore::env::RuntimeToggleMode::Auto);

@@ -502,6 +502,7 @@ set(SOURCES
     src/runtime/inference.cpp
     src/models/model_types.cpp
     src/models/decoder_model_spec.cpp
+    src/models/model_execution_contract.cpp
     src/models/model_loader.cpp
     src/models/tokenizer.cpp
     src/runtime/memory/kv_cache.cpp
