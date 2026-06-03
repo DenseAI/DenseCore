@@ -593,12 +593,16 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm && N > 1 &&
                 attn_qkv->type == GGML_TYPE_Q8_0 && attn_gate_w->type == GGML_TYPE_Q8_0 &&
                 ssm_out_w->type == GGML_TYPE_Q8_0;
-            const bool prefer_plain_qwen35_hybrid_matmul =
+            const bool qwen35_hybrid_ssm_q6_projection =
+                model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm &&
+                (attn_qkv->type == GGML_TYPE_Q6_K || attn_gate_w->type == GGML_TYPE_Q6_K ||
+                 ssm_out_w->type == GGML_TYPE_Q6_K);
+            const bool prefer_plain_qwen_hybrid_matmul =
                 model->arch_flags.is_hybrid_ssm &&
-                (model->variant == ModelVariant::QWEN35 ||
+                ((model->variant == ModelVariant::QWEN35 && qwen35_hybrid_ssm_q6_projection) ||
                  (model->variant == ModelVariant::QWEN36 && !qwen36_hybrid_ssm_q8_prefill_projection_set));
 #else
-            const bool prefer_plain_qwen35_hybrid_matmul = false;
+            const bool prefer_plain_qwen_hybrid_matmul = false;
 #endif
             ggml_tensor* fused_qkv_gate = nullptr;
 #if !defined(__aarch64__) && !defined(_M_ARM64)
@@ -612,8 +616,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 #endif
             struct ggml_tensor* qkv_mixed =
                 fused_qkv_gate ? ggml_view_2d(ctx_c, fused_qkv_gate, conv_channels, N, fused_qkv_gate->nb[1], 0)
-                               : (prefer_plain_qwen35_hybrid_matmul ? ggml_mul_mat(ctx_c, attn_qkv, cur)
-                                                                     : smart_mul_mat(ctx_c, attn_qkv, cur, model));
+                               : (prefer_plain_qwen_hybrid_matmul ? ggml_mul_mat(ctx_c, attn_qkv, cur)
+                                                                   : smart_mul_mat(ctx_c, attn_qkv, cur, model));
             if (model->variant == ModelVariant::QWEN35 && !fused_qkv_gate) {
                 ggml_set_name(qkv_mixed, "qwen35_ssm_qkv_proj");
             } else if (model->variant == ModelVariant::QWEN36) {
@@ -680,8 +684,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 fused_qkv_gate
                     ? ggml_view_2d(ctx_c, fused_qkv_gate, d_inner, N, fused_qkv_gate->nb[1],
                                    static_cast<size_t>(conv_channels) * static_cast<size_t>(fused_qkv_gate->nb[0]))
-                    : (prefer_plain_qwen35_hybrid_matmul ? ggml_mul_mat(ctx_c, attn_gate_w, cur)
-                                                         : smart_mul_mat(ctx_c, attn_gate_w, cur, model));
+                    : (prefer_plain_qwen_hybrid_matmul ? ggml_mul_mat(ctx_c, attn_gate_w, cur)
+                                                       : smart_mul_mat(ctx_c, attn_gate_w, cur, model));
             if (model->variant == ModelVariant::QWEN35) {
                 ggml_set_name(z, "qwen35_ssm_gate_proj");
             }
@@ -767,8 +771,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             // qkv/gate/out can share the same Q4_K true-batched admission logic.
             // ARM remains conservative above because C4A validation historically
             // found silent SSM projection corruption outside the native path.
-            cur = prefer_plain_qwen35_hybrid_matmul ? ggml_mul_mat(ctx_c, ssm_out_w, y)
-                                                    : smart_mul_mat(ctx_c, ssm_out_w, y, model);
+            cur = prefer_plain_qwen_hybrid_matmul ? ggml_mul_mat(ctx_c, ssm_out_w, y)
+                                                  : smart_mul_mat(ctx_c, ssm_out_w, y, model);
             if (model->variant == ModelVariant::QWEN35) {
                 ggml_set_name(cur, "qwen35_ssm_out_proj");
             }
@@ -2470,10 +2474,13 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 throw densecore::InvalidArgumentException("Missing FFN weights in TransformerLayer");
             }
 #if defined(__aarch64__) || defined(_M_ARM64)
-            const bool prefer_plain_qwen35_hybrid_ffn =
+            const bool qwen35_hybrid_ffn =
                 model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
+            const bool prefer_plain_qwen35_hybrid_ffn_down = qwen35_hybrid_ffn && ffn_down->type != GGML_TYPE_Q5_K;
+            const bool prefer_separate_qwen35_hybrid_ffn_gate_up = qwen35_hybrid_ffn && cur->ne[1] > 1;
 #else
-            const bool prefer_plain_qwen35_hybrid_ffn = false;
+            const bool prefer_plain_qwen35_hybrid_ffn_down = false;
+            const bool prefer_separate_qwen35_hybrid_ffn_gate_up = false;
 #endif
             struct ggml_tensor* w1 = nullptr;
             struct ggml_tensor* w3 = nullptr;
@@ -2481,7 +2488,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             struct ggml_tensor* dense_gate_up_fused =
                 ((model->arch_flags.is_gemma4 || model->variant == ModelVariant::QWEN35 ||
                   model->variant == ModelVariant::QWEN36) &&
-                 !prefer_plain_qwen35_hybrid_ffn && cur->type == GGML_TYPE_F32)
+                 !prefer_separate_qwen35_hybrid_ffn_gate_up && cur->type == GGML_TYPE_F32)
                     ? layer.Get("ffn_gate_up.cpu_repack_fused")
                     : nullptr;
             if (model->variant == ModelVariant::QWEN35 && cur->ne[1] <= 32) {
@@ -2511,10 +2518,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     w3 = ggml_view_2d(ctx_c, gate_up, ffn_up->ne[1], cur->ne[1], gate_up->nb[1], up_offset);
                 }
             } else {
-                w1 = prefer_plain_qwen35_hybrid_ffn ? ggml_mul_mat(ctx_c, ffn_gate, cur)
-                                                    : smart_mul_mat(ctx_c, ffn_gate, cur, model);
-                w3 = prefer_plain_qwen35_hybrid_ffn ? ggml_mul_mat(ctx_c, ffn_up, cur)
-                                                    : smart_mul_mat(ctx_c, ffn_up, cur, model);
+                w1 = smart_mul_mat(ctx_c, ffn_gate, cur, model);
+                w3 = smart_mul_mat(ctx_c, ffn_up, cur, model);
             }
             if (ShouldRunFfnProjectionReferenceProbe(il)) {
                 ProjectionReferenceUserData* w1_ref_ud = GetProjectionReferenceUserData();
@@ -2580,8 +2585,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // Apply Multi-LoRA [FFN Down]
             struct ggml_tensor* ffn_input = cur;
-            cur = prefer_plain_qwen35_hybrid_ffn ? ggml_mul_mat(ctx_c, ffn_down, cur)
-                                                 : smart_mul_mat(ctx_c, ffn_down, cur, model);
+            cur = prefer_plain_qwen35_hybrid_ffn_down ? ggml_mul_mat(ctx_c, ffn_down, cur)
+                                                      : smart_mul_mat(ctx_c, ffn_down, cur, model);
             if (ShouldRunFfnProjectionReferenceProbe(il)) {
                 ProjectionReferenceUserData* down_ref_ud = GetProjectionReferenceUserData();
                 down_ref_ud->weight_tensor = ffn_down;

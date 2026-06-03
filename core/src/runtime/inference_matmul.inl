@@ -5994,7 +5994,10 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             }
         }
         const int qwen36_ssm_projection_kind = Qwen36SSMProjectionKind(original_w_name);
-        if (dispatch_work_ctx && model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm &&
+        const bool original_qwen_hybrid_ssm_model =
+            (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+            model->arch_flags.is_hybrid_ssm;
+        if (dispatch_work_ctx && original_qwen_hybrid_ssm_model &&
             qwen36_ssm_projection_kind != 0 && original_weight) {
             RecordQwen36SSMProjectionWeightType(dispatch_work_ctx, original_weight->type);
         }

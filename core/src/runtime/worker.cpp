@@ -847,9 +847,11 @@ HybridSSMGraphTimingBreakdown SummarizeHybridSSMGraphNodeTimes(const Transformer
     return out;
 }
 
+bool IsQwenHybridSSMModel(const TransformerModel* model);
+
 Qwen36PrefillBreakdown SummarizeQwen36PrefillNodeTimes(const TransformerModel* model, const ggml_cgraph* graph) {
     Qwen36PrefillBreakdown out;
-    if (!model || model->variant != ModelVariant::QWEN36 || !graph) {
+    if (!IsQwenHybridSSMModel(model) || !graph) {
         return out;
     }
     const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
@@ -864,7 +866,11 @@ Qwen36PrefillBreakdown SummarizeQwen36PrefillNodeTimes(const TransformerModel* m
         }
         const uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_us) * 1000ULL;
         const char* name = node->name[0] ? node->name : "unnamed";
-        const bool is_ssm_proj = HasNamePrefix(node, "qwen36_ssm_qkv_proj") ||
+        const bool is_ssm_proj = HasNamePrefix(node, "qwen35_ssm_qkv_gate_fused_proj") ||
+                                 HasNamePrefix(node, "qwen35_ssm_qkv_proj") ||
+                                 HasNamePrefix(node, "qwen35_ssm_gate_proj") ||
+                                 HasNamePrefix(node, "qwen35_ssm_out_proj") ||
+                                 HasNamePrefix(node, "qwen36_ssm_qkv_proj") ||
                                  HasNamePrefix(node, "qwen36_ssm_gate_proj") ||
                                  HasNamePrefix(node, "qwen36_ssm_out_proj");
         if (is_ssm_proj) {
@@ -881,12 +887,16 @@ Qwen36PrefillBreakdown SummarizeQwen36PrefillNodeTimes(const TransformerModel* m
         entry.op_type = ggml_op_name(node->op);
         entry.dispatch_path =
             is_ssm_proj ? "ssm_projection" : (std::strstr(name, "moe") ? "mlp_or_moe" : ggml_op_name(node->op));
-        entry.weight_type = "node";
+        const ggml_tensor* src0 = node->src[0];
+        const ggml_tensor* src1 = node->src[1];
+        entry.weight_type = src0 ? ggml_type_name(src0->type) : "node";
         std::ostringstream shape;
         shape << "M=" << node->ne[1] << ",N=" << node->ne[0] << ",K=" << (node->ne[2] > 1 ? node->ne[2] : 0);
         entry.shape_bucket = shape.str();
         entry.left_name = name;
-        entry.right_name = "elapsed_us";
+        const char* src0_name = src0 && src0->name[0] ? src0->name : "<src0>";
+        const char* src1_name = src1 && src1->name[0] ? src1->name : "<src1>";
+        entry.right_name = std::string("src0=") + src0_name + ",src1=" + src1_name;
         entry.ops = static_cast<uint64_t>(elapsed_us);
         out.top_slow_ops.push_back(std::move(entry));
     }
@@ -1407,6 +1417,14 @@ bool IsQwen36HybridSSMModel(const TransformerModel* model) {
     return densecore::models::DescribeModel(model).variant == ModelVariant::QWEN36;
 }
 
+bool IsQwenHybridSSMModel(const TransformerModel* model) {
+    if (!model || !model->arch_flags.is_hybrid_ssm) {
+        return false;
+    }
+    const ModelVariant variant = densecore::models::DescribeModel(model).variant;
+    return variant == ModelVariant::QWEN35 || variant == ModelVariant::QWEN36;
+}
+
 bool Qwen36HybridSSMProjectionWeightsAreNotQ4K(const TransformerModel* model) {
     if (!IsQwen36HybridSSMModel(model)) {
         return false;
@@ -1435,7 +1453,7 @@ struct Qwen36SSMProjectionTypeSummary {
 
 Qwen36SSMProjectionTypeSummary SummarizeQwen36SSMProjectionTypes(const TransformerModel* model) {
     Qwen36SSMProjectionTypeSummary summary;
-    if (!IsQwen36HybridSSMModel(model)) {
+    if (!IsQwenHybridSSMModel(model)) {
         return summary;
     }
     std::map<std::string, int> type_counts;
@@ -5632,7 +5650,7 @@ void EngineLoop(EngineState* state) {
                             req->decode_graph_top_slow_nodes.resize(kMatmulTopShapeCount);
                         }
                     }
-                    if (is_prefill_batch && current_model && current_model->variant == ModelVariant::QWEN36) {
+                    if (is_prefill_batch && IsQwenHybridSSMModel(current_model)) {
                         req->qwen36_prefill_graph_build_ns += qwen36_prefill_graph_build_ns;
                         req->qwen36_prefill_graph_execute_ns += graph_execute_ns;
                         req->qwen36_prefill_total_ns += qwen36_prefill_graph_build_ns + graph_execute_ns;
@@ -5928,7 +5946,7 @@ void EngineLoop(EngineState* state) {
                         }
                     }
                     if (is_prefill_batch && req->qwen36_ssm_projection_actual_types.empty() &&
-                        IsQwen36HybridSSMModel(current_model)) {
+                        IsQwenHybridSSMModel(current_model)) {
                         const Qwen36SSMProjectionTypeSummary type_summary =
                             SummarizeQwen36SSMProjectionTypes(current_model);
                         req->qwen36_ssm_projection_actual_types = type_summary.actual_types;
