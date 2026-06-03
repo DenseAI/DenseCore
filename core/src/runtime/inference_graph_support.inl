@@ -3170,7 +3170,8 @@ static bool CanReplaceQwen35W2WithCustomCallback(const TransformerModel* model, 
     if (!qwen_native_moe && !lfm2_native_moe) return reject("wrong_variant");
     if (model->hparams.n_experts <= 0) return reject("no_experts");
     const bool supported_down_quant =
-        lfm2_native_moe ? (down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q6_K)
+        lfm2_native_moe ? (down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q5_K ||
+                           down_exps->type == GGML_TYPE_Q6_K || down_exps->type == GGML_TYPE_Q8_0)
                         : (down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q5_K ||
                            down_exps->type == GGML_TYPE_Q6_K || down_exps->type == GGML_TYPE_Q8_0);
     if (!supported_down_quant) {
@@ -3610,7 +3611,8 @@ static bool CanUseQwen35NativeMoEGateUpRawQXKSwiGLU(const TransformerModel* mode
         qwen_native_moe && ((gate_exps->type == GGML_TYPE_Q4_K && up_exps->type == GGML_TYPE_Q4_K) ||
                             (gate_exps->type == GGML_TYPE_Q5_K && up_exps->type == GGML_TYPE_Q5_K));
     const bool lfm2_supported_gateup =
-        lfm2_native_moe && gate_exps->type == GGML_TYPE_Q4_K && up_exps->type == GGML_TYPE_Q4_K;
+        lfm2_native_moe && ((gate_exps->type == GGML_TYPE_Q4_K && up_exps->type == GGML_TYPE_Q4_K) ||
+                            (gate_exps->type == GGML_TYPE_Q5_K && up_exps->type == GGML_TYPE_Q5_K));
     if ((!qwen_supported_gateup && !lfm2_supported_gateup) || input->type != GGML_TYPE_F32 ||
         selected_experts->type != GGML_TYPE_I32) {
         return reject("unsupported_type");
@@ -3733,12 +3735,14 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         const auto& fast_config = ResolveFastPathRuntimeConfig(current_batch);
         const InferenceExecutionPhase phase = graph_phase;
         const bool dynamic_lora_active = current_batch && !current_batch->lora_map.empty();
-        const bool supported_lfm2_w2_quant = down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q6_K;
+        const bool supported_lfm2_w2_quant =
+            down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q5_K ||
+            down_exps->type == GGML_TYPE_Q6_K || down_exps->type == GGML_TYPE_Q8_0;
         const bool supported_qwen_w2_quant =
             down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q5_K ||
             down_exps->type == GGML_TYPE_Q6_K || down_exps->type == GGML_TYPE_Q8_0;
         const bool supported_w1w3_quant =
-            lfm2_native_moe ? w1w3_type == GGML_TYPE_Q4_K
+            lfm2_native_moe ? (w1w3_type == GGML_TYPE_Q4_K || w1w3_type == GGML_TYPE_Q5_K)
                             : (w1w3_type == GGML_TYPE_Q4_K || w1w3_type == GGML_TYPE_Q5_K);
         const bool supported_w2_quant = lfm2_native_moe ? supported_lfm2_w2_quant : supported_qwen_w2_quant;
         const bool supported_quant = supported_w1w3_quant && supported_w2_quant;
@@ -5380,6 +5384,7 @@ struct GemvBatchedUserData {
     bool require_q4k_true_batched = false;
     bool disable_quant_nrc_fast = false;
     bool gemma4_dense_prefill_native = false;
+    bool lfm2_q8_repacked_batched = false;
     bool qwen36_ssm_q8_repacked_batched = false;
     bool qwen36_ssm_q8_direct_batched = false;
     std::atomic<int> qwen36_prefill_q4k_probe_done{0};

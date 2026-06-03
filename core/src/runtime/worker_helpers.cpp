@@ -1652,6 +1652,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const std::string decode_matmul_top_shapes = shape_census_string(req->decode_matmul_top_shapes);
     const std::string prefill_matmul_weight_hist = weight_hist_string(req->prefill_matmul_weight_type_hist);
     const std::string prefill_matmul_path_hist = path_hist_string(req->prefill_matmul_path_hist);
+    const std::string prefill_matmul_top_shapes = shape_census_string(req->prefill_matmul_top_shapes);
+    const std::string prefill_matmul_ggml_top_shapes = shape_census_string(req->prefill_matmul_ggml_top_shapes);
     const std::string q6k_gemv_weight_shapes = shape_census_string(req->q6k_gemv_weight_shapes);
     const std::string native_moe_graph_top_slow_nodes = shape_census_string(req->native_moe_graph_top_slow_nodes);
     const std::string decode_graph_top_slow_nodes = shape_census_string(req->decode_graph_top_slow_nodes);
@@ -1709,15 +1711,24 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                  req->native_moe_fast_decode_used_ops + req->native_moe_fast_decode_rejected_ops);
     const bool lfm2_summary = descriptor.variant == ModelVariant::LFM2MOE;
     const bool lfm2_w1w3_q4k_seen = lfm2_summary && req->qwen35_moe_w1w3_weight_type_hist[0] > 0;
+    const bool lfm2_w1w3_q5k_seen = lfm2_summary && req->qwen35_moe_w1w3_weight_type_hist[1] > 0;
     const bool lfm2_w2_q4k_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[0] > 0;
+    const bool lfm2_w2_q5k_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[1] > 0;
     const bool lfm2_w2_q6k_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[2] > 0;
+    const bool lfm2_w2_q8_0_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[3] > 0;
     const uint64_t lfm2_native_moe_decode_used_ops = lfm2_summary ? req->native_moe_fast_decode_used_ops : 0;
     const uint64_t lfm2_w1w3_q4k_repacked_used_ops =
         lfm2_w1w3_q4k_seen ? req->native_moe_fast_decode_w1w3_used_ops : 0;
+    const uint64_t lfm2_w1w3_q5k_vecdot_used_ops =
+        lfm2_w1w3_q5k_seen ? req->native_moe_fast_decode_w1w3_used_ops : 0;
     const uint64_t lfm2_w2_q4k_repacked_used_ops =
         lfm2_w2_q4k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
+    const uint64_t lfm2_w2_q5k_vecdot_used_ops =
+        lfm2_w2_q5k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
     const uint64_t lfm2_w2_q6k_vecdot_used_ops =
         lfm2_w2_q6k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
+    const uint64_t lfm2_w2_q8_0_direct_used_ops =
+        lfm2_w2_q8_0_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
     const uint64_t lfm2_shortconv_sequence_fast_used_ops = lfm2_summary ? req->ssm_conv1d_calls : 0;
     const uint64_t lfm2_decode_graph_rebuilds = lfm2_summary ? req->graph_cache_miss_count : 0;
     const char* qwen35_native_moe_down_exec_path =
@@ -2089,7 +2100,10 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " decode_matmul_path_hist=" << decode_matmul_path_hist
         << " decode_matmul_top_shapes=" << decode_matmul_top_shapes
         << " prefill_matmul_weight_type_hist=" << prefill_matmul_weight_hist
-        << " prefill_matmul_path_hist=" << prefill_matmul_path_hist << " q6k_gemv_seen_ops=" << req->q6k_gemv_seen_ops
+        << " prefill_matmul_path_hist=" << prefill_matmul_path_hist
+        << " prefill_matmul_top_shapes=" << prefill_matmul_top_shapes
+        << " prefill_matmul_ggml_top_shapes=" << prefill_matmul_ggml_top_shapes
+        << " q6k_gemv_seen_ops=" << req->q6k_gemv_seen_ops
         << " q6k_gemv_candidate_ops=" << req->q6k_gemv_candidate_ops << " q6k_gemv_used_ops=" << req->q6k_gemv_used_ops
         << " q6k_gemv_rejected_ops=" << req->q6k_gemv_rejected_ops
         << " q6k_gemv_reject_quant_input_null_ops=" << req->q6k_gemv_reject_quant_input_null_ops
@@ -2263,8 +2277,11 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " native_moe_fast_w2_q5k_effective_state=" << native_moe_fast_w2_q5k_effective_state
         << " lfm2_native_moe_decode_used_ops=" << lfm2_native_moe_decode_used_ops
         << " lfm2_w1w3_q4k_repacked_used_ops=" << lfm2_w1w3_q4k_repacked_used_ops
+        << " lfm2_w1w3_q5k_vecdot_used_ops=" << lfm2_w1w3_q5k_vecdot_used_ops
         << " lfm2_w2_q4k_repacked_used_ops=" << lfm2_w2_q4k_repacked_used_ops
+        << " lfm2_w2_q5k_vecdot_used_ops=" << lfm2_w2_q5k_vecdot_used_ops
         << " lfm2_w2_q6k_vecdot_used_ops=" << lfm2_w2_q6k_vecdot_used_ops
+        << " lfm2_w2_q8_0_direct_used_ops=" << lfm2_w2_q8_0_direct_used_ops
         << " lfm2_greedy_lm_head_argmax_used_ops=0"
         << " lfm2_shortconv_sequence_fast_used_ops=" << lfm2_shortconv_sequence_fast_used_ops
         << " lfm2_decode_graph_rebuilds=" << lfm2_decode_graph_rebuilds

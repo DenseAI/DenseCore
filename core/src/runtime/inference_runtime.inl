@@ -292,6 +292,8 @@ struct InferenceWorkContext {
     mutable std::mutex matmul_dispatch_census_mutex;
     std::vector<MatmulDispatchCensusEntry> matmul_dispatch_census_entries;
     std::vector<MatmulShapeCensusEntry> decode_matmul_shape_entries;
+    std::vector<MatmulShapeCensusEntry> prefill_matmul_shape_entries;
+    std::vector<MatmulShapeCensusEntry> prefill_matmul_ggml_shape_entries;
     std::vector<MatmulShapeCensusEntry> q6k_gemv_shape_entries;
     std::vector<MatmulShapeCensusEntry> qwen36_prefill_slow_entries;
     SSMConv1DUserData ssm_conv1d_pool[128];
@@ -1236,11 +1238,15 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
         std::lock_guard<std::mutex> lock(ctx->matmul_dispatch_census_mutex);
         snapshot.matmul_dispatch_top_slow_entries = ctx->matmul_dispatch_census_entries;
         snapshot.decode_matmul_top_shapes = ctx->decode_matmul_shape_entries;
+        snapshot.prefill_matmul_top_shapes = ctx->prefill_matmul_shape_entries;
+        snapshot.prefill_matmul_ggml_top_shapes = ctx->prefill_matmul_ggml_shape_entries;
         snapshot.q6k_gemv_weight_shapes = ctx->q6k_gemv_shape_entries;
         snapshot.qwen36_prefill_top_slow_ops = ctx->qwen36_prefill_slow_entries;
     }
     SortAndTrimMatmulDispatchCensusEntries(&snapshot.matmul_dispatch_top_slow_entries);
     SortAndTrimMatmulShapeCensusEntries(&snapshot.decode_matmul_top_shapes);
+    SortAndTrimMatmulShapeCensusEntries(&snapshot.prefill_matmul_top_shapes);
+    SortAndTrimMatmulShapeCensusEntries(&snapshot.prefill_matmul_ggml_top_shapes);
     SortAndTrimMatmulShapeCensusEntries(&snapshot.q6k_gemv_weight_shapes);
     SortAndTrimMatmulShapeCensusEntries(&snapshot.qwen36_prefill_top_slow_ops);
     snapshot.q4k_copied_gemv_experiment_used =
@@ -1682,6 +1688,20 @@ void RecordGraphBuildMatmulCensus(InferenceWorkContext* ctx, InferenceExecutionP
     } else if (phase == InferenceExecutionPhase::Prefill) {
         p.prefill_matmul_weight_type_hist[weight_idx].fetch_add(1, std::memory_order_relaxed);
         p.prefill_matmul_path_hist[path_idx].fetch_add(1, std::memory_order_relaxed);
+        MatmulShapeCensusEntry entry;
+        entry.phase = "prefill";
+        entry.model_family = MatmulModelFamilyName(ctx->model_variant);
+        entry.dispatch_path = MatmulPathHistLabel(path_idx);
+        entry.weight_type = MatmulWeightTypeHistLabel(weight_idx);
+        entry.shape_bucket = MatmulShapeBucket(m, n, k);
+        entry.left_name = left_name && left_name[0] ? left_name : "unnamed_weight";
+        entry.right_name = right_name && right_name[0] ? right_name : "unnamed_input";
+        entry.ops = 1;
+        std::lock_guard<std::mutex> lock(ctx->matmul_dispatch_census_mutex);
+        AddMatmulShapeCensusEntry(&ctx->prefill_matmul_shape_entries, entry);
+        if (path_idx == 0 || path_idx == 1) {
+            AddMatmulShapeCensusEntry(&ctx->prefill_matmul_ggml_shape_entries, entry);
+        }
     }
 }
 
@@ -3381,6 +3401,7 @@ inline GemvBatchedUserData* GetGemvBatchedUserData() {
     ud->require_q4k_true_batched = false;
     ud->disable_quant_nrc_fast = false;
     ud->gemma4_dense_prefill_native = false;
+    ud->lfm2_q8_repacked_batched = false;
     ud->qwen36_ssm_q8_repacked_batched = false;
     ud->qwen36_ssm_q8_direct_batched = false;
     ud->qwen36_prefill_q4k_probe_done.store(0, std::memory_order_relaxed);

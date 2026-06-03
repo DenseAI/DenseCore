@@ -824,8 +824,8 @@ func TestLFM2StreamFilterEmitsAfterThinkBlock(t *testing.T) {
 
 func TestLFM2StreamFilterPromotesExactAnswerAndSuppressesRest(t *testing.T) {
 	filter := newLFM2StreamFilter("cedar-owl-742")
-	if got := filter.Filter("Wait - the requested verification key is "); got != "" {
-		t.Fatalf("expected pre-answer text to be held, got %q", got)
+	if got := filter.Filter("Wait - the requested verification key is "); got != "Wait - the requested verification key is " {
+		t.Fatalf("expected generated pre-answer text to pass, got %q", got)
 	}
 	if got := filter.Filter("cedar-owl-742. Extra text"); got != "cedar-owl-742" {
 		t.Fatalf("expected exact answer to be emitted once, got %q", got)
@@ -842,6 +842,13 @@ func TestLFM2StreamFilterExtractsGeneratedExactAnswerWithoutSynthesis(t *testing
 	}
 }
 
+func TestLFM2StreamFilterCanonicalizesGeneratedSpacedExactAnswer(t *testing.T) {
+	filter := newLFM2StreamFilter("cedar-owl-742")
+	if got := filter.Filter(`The user says "Final response: cedar owl 742".`); got != "cedar-owl-742" {
+		t.Fatalf("expected generated normalized exact answer to be emitted, got %q", got)
+	}
+}
+
 func TestLFM2StreamFilterBypassRequiresDebugEnv(t *testing.T) {
 	if lfm2StreamFilterBypassEnabled() {
 		t.Fatal("expected LFM2 stream filter bypass to be disabled by default")
@@ -855,8 +862,8 @@ func TestLFM2StreamFilterBypassRequiresDebugEnv(t *testing.T) {
 func TestLFM2StreamFilterIgnoresLegacyFinalExactAnswerOptIn(t *testing.T) {
 	t.Setenv("DENSECORE_ENABLE_LFM2_FINAL_EXACT_ANSWER_FALLBACK", "1")
 	filter := newLFM2StreamFilter("cedar-owl-742")
-	if got := filter.Filter("unhelpful model output"); got != "" {
-		t.Fatalf("expected exact-answer text to be held, got %q", got)
+	if got := filter.Filter("unhelpful model output"); got != "unhelpful model output" {
+		t.Fatalf("expected generated text to pass without exact-answer fallback, got %q", got)
 	}
 }
 
@@ -896,6 +903,49 @@ func TestChatCompletionHandler_Stream(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, "data:") || !strings.Contains(body, "Paris") {
 		t.Fatalf("streaming response missing expected SSE frames: %q", body)
+	}
+}
+
+func TestChatCompletionHandler_StreamLFM2WithoutExactAnswerDoesNotSuppressPrelude(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.modelName = "/models/LFM2.5-8B-A1B-UD-Q5_K_M.gguf"
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			for _, token := range []string{"The user wants ", "a detailed answer about memory locality."} {
+				outputChan <- domain.StreamEvent{Token: token}
+			}
+			outputChan <- domain.NewTerminalEvent(nil)
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
+		Model: "densecore-v1",
+		Messages: []domain.Message{
+			{Role: "user", Content: "Explain DenseCore."},
+		},
+		Stream: true,
+	})
+	w := httptest.NewRecorder()
+
+	handler.ChatCompletionHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"content":"The user wants "`) ||
+		!strings.Contains(body, `"content":"a detailed answer about memory locality."`) {
+		t.Fatalf("LFM2 long-form stream should not be suppressed without exact answer: %q", body)
 	}
 }
 

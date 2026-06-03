@@ -484,6 +484,8 @@ struct Request {
     std::array<uint64_t, kMatmulWeightTypeHistCount> prefill_matmul_weight_type_hist{};
     std::array<uint64_t, kMatmulPathHistCount> prefill_matmul_path_hist{};
     std::vector<MatmulShapeCensusEntry> decode_matmul_top_shapes;
+    std::vector<MatmulShapeCensusEntry> prefill_matmul_top_shapes;
+    std::vector<MatmulShapeCensusEntry> prefill_matmul_ggml_top_shapes;
     uint64_t qwen_target_ggml_compute_ops = 0;
     uint64_t qwen_target_ggml_matmul_ops = 0;
     uint64_t qwen_target_ggml_matmul_id_ops = 0;
@@ -918,6 +920,8 @@ struct Request {
         prefill_matmul_weight_type_hist.fill(0);
         prefill_matmul_path_hist.fill(0);
         decode_matmul_top_shapes.clear();
+        prefill_matmul_top_shapes.clear();
+        prefill_matmul_ggml_top_shapes.clear();
         qwen_target_ggml_compute_ops = 0;
         qwen_target_ggml_matmul_ops = 0;
         qwen_target_ggml_matmul_id_ops = 0;

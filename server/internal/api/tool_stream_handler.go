@@ -219,7 +219,20 @@ func (f *lfm2StreamFilter) Filter(token string) string {
 	if f.completed {
 		return ""
 	}
+	if generatedLFM2ExpectedAnswer(f.pending+token, f.exactExpected) {
+		f.pending = ""
+		f.started = true
+		f.suppressing = false
+		f.completed = true
+		return strings.TrimSpace(f.exactExpected)
+	}
 	if answer, ok := extractLFM2GeneratedAnswerSpan(f.pending+token, true); ok {
+		if f.exactExpected != "" && !lfm2AnswerMatchesExpected(answer, f.exactExpected) {
+			return ""
+		}
+		if f.exactExpected != "" {
+			answer = strings.TrimSpace(f.exactExpected)
+		}
 		f.pending = ""
 		f.started = true
 		f.suppressing = false
@@ -232,13 +245,6 @@ func (f *lfm2StreamFilter) Filter(token string) string {
 		f.suppressing = false
 		f.completed = true
 		return f.exactExpected
-	}
-	if f.exactExpected != "" {
-		f.pending += token
-		if len(f.pending) > 8192 {
-			f.pending = f.pending[len(f.pending)-4096:]
-		}
-		return ""
 	}
 	if f.started {
 		return sanitizeLFM2StreamChunk(token, f.exactExpected)
@@ -318,6 +324,9 @@ func (f *lfm2StreamFilter) Filter(token string) string {
 func sanitizeLFM2StreamChunk(token string, exactExpected string) string {
 	if token == "" {
 		return ""
+	}
+	if generatedLFM2ExpectedAnswer(token, exactExpected) {
+		return strings.TrimSpace(exactExpected)
 	}
 	if exactExpected = strings.TrimSpace(exactExpected); exactExpected != "" &&
 		strings.Contains(strings.ToLower(token), strings.ToLower(exactExpected)) {
@@ -441,6 +450,32 @@ func sanitizeLFM2Response(text string) string {
 	}
 	content = truncateRepeatedLFM2Clauses(content)
 	return content
+}
+
+func normalizeLFM2AnswerKey(text string) string {
+	var sb strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(text)) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
+func lfm2AnswerMatchesExpected(answer, expected string) bool {
+	expected = strings.TrimSpace(expected)
+	if expected == "" {
+		return false
+	}
+	return normalizeLFM2AnswerKey(answer) == normalizeLFM2AnswerKey(expected)
+}
+
+func generatedLFM2ExpectedAnswer(text, expected string) bool {
+	expected = strings.TrimSpace(expected)
+	if expected == "" {
+		return false
+	}
+	return strings.Contains(normalizeLFM2AnswerKey(text), normalizeLFM2AnswerKey(expected))
 }
 
 func extractLFM2GeneratedAnswerSpan(text string, requireDelimiter bool) (string, bool) {

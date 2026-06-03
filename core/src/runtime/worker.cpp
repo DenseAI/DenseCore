@@ -6026,6 +6026,9 @@ void EngineLoop(EngineState* state) {
                         }
                     };
                     merge_shape_entries(req->decode_matmul_top_shapes, qwen36_profile.decode_matmul_top_shapes);
+                    merge_shape_entries(req->prefill_matmul_top_shapes, qwen36_profile.prefill_matmul_top_shapes);
+                    merge_shape_entries(req->prefill_matmul_ggml_top_shapes,
+                                        qwen36_profile.prefill_matmul_ggml_top_shapes);
                     req->q6k_gemv_seen_ops += qwen36_profile.q6k_gemv_seen_ops;
                     req->q6k_gemv_candidate_ops += qwen36_profile.q6k_gemv_candidate_ops;
                     req->q6k_gemv_used_ops += qwen36_profile.q6k_gemv_used_ops;

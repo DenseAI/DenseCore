@@ -302,7 +302,7 @@ TEST(MoETrace, NativeMoEFastPathDefaultRejectsUnsupportedOrExplicitlyDisabledMod
         &qwen_supported, static_cast<int>(InferenceExecutionPhase::Decode), static_cast<int>(RuntimeToggleMode::Off)));
 }
 
-TEST(MoETrace, QwenNativeMoEGateUpAdmissionSupportsQ5ButLFM2StaysQ4Only) {
+TEST(MoETrace, NativeMoEGateUpAdmissionSupportsQ5ForQwenAndLFM2) {
     ggml_init_params params{};
     params.mem_size = 1 << 20;
     params.mem_buffer = nullptr;
@@ -343,7 +343,7 @@ TEST(MoETrace, QwenNativeMoEGateUpAdmissionSupportsQ5ButLFM2StaysQ4Only) {
     lfm2.hparams.n_experts = static_cast<int32_t>(n_experts);
     lfm2.hparams.n_experts_used = static_cast<int32_t>(top_k);
 
-    EXPECT_FALSE(densecore::testing::CanUseQwenNativeMoEGateUpForTest(
+    EXPECT_TRUE(densecore::testing::CanUseQwenNativeMoEGateUpForTest(
         &lfm2, gate_q5, up_q5, input, selected, static_cast<int>(InferenceExecutionPhase::Decode)));
 }
 
@@ -392,6 +392,21 @@ TEST(MoETrace, QwenNativeMoEW2AdmissionSupportsMixedQ4Q5Q6Q8DownExperts) {
         &qwen, down_q6, hidden, selected, static_cast<int>(InferenceExecutionPhase::Prefill)));
     EXPECT_TRUE(densecore::testing::CanUseQwenNativeMoEW2ForTest(
         &qwen, down_q8, hidden, selected, static_cast<int>(InferenceExecutionPhase::Prefill)));
+
+    TransformerModel lfm2{};
+    lfm2.variant = ModelVariant::LFM2MOE;
+    lfm2.arch_flags.is_lfm2_shortconv = true;
+    lfm2.hparams.n_experts = static_cast<int32_t>(n_experts);
+    lfm2.hparams.n_experts_used = static_cast<int32_t>(top_k);
+
+    EXPECT_TRUE(densecore::testing::CanUseQwenNativeMoEW2ForTest(
+        &lfm2, down_q4, hidden, selected, static_cast<int>(InferenceExecutionPhase::Prefill)));
+    EXPECT_TRUE(densecore::testing::CanUseQwenNativeMoEW2ForTest(
+        &lfm2, down_q5, hidden, selected, static_cast<int>(InferenceExecutionPhase::Prefill)));
+    EXPECT_TRUE(densecore::testing::CanUseQwenNativeMoEW2ForTest(
+        &lfm2, down_q6, hidden, selected, static_cast<int>(InferenceExecutionPhase::Prefill)));
+    EXPECT_TRUE(densecore::testing::CanUseQwenNativeMoEW2ForTest(
+        &lfm2, down_q8, hidden, selected, static_cast<int>(InferenceExecutionPhase::Prefill)));
 }
 
 TEST(MoETrace, Qwen36SmallDecodeExpertParallelAutoPolicyTargetsC4AShape) {

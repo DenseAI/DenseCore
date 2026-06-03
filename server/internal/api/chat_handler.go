@@ -121,8 +121,12 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 	}
 	var lfm2Filter *lfm2StreamFilter
 	if isLFM2ModelHint(reasoningModelHint) && !lfm2StreamFilterBypassEnabled() {
-		// Use the expected answer only to trim a span that the model actually generated.
-		lfm2Filter = newLFM2StreamFilter(service.ExtractExpectedExactAnswer(req))
+		// Only exact-answer QA prompts use the LFM2 stream filter. General long-form
+		// completions must stream generated tokens directly; broad prelude suppression
+		// can otherwise hide the whole response and make quality gates unstable.
+		if exactExpected := service.ExtractExpectedExactAnswer(req); exactExpected != "" {
+			lfm2Filter = newLFM2StreamFilter(exactExpected)
+		}
 	}
 	var qwen36Filter *qwen36StreamFilter
 	if qwen36StreamingReasoningEnabled(req, reasoningModelHint) {

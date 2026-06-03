@@ -1863,6 +1863,16 @@ struct DensecoreBlockQ8K {
 static_assert(sizeof(DensecoreBlockQ8K) == sizeof(float) + QK_K + (QK_K / 16) * sizeof(int16_t),
               "DensecoreBlockQ8K layout mismatch");
 
+struct DensecoreBlockQ5K {
+    ggml_fp16_t d;
+    ggml_fp16_t dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qh[QK_K / 8];
+    uint8_t qs[QK_K / 2];
+};
+static_assert(sizeof(DensecoreBlockQ5K) == 2 * sizeof(ggml_fp16_t) + K_SCALE_SIZE + QK_K / 8 + QK_K / 2,
+              "DensecoreBlockQ5K layout mismatch");
+
 // True-batched Q4_K x Q8_K row dot:
 // - Reuses Q4_K decode/scales once per weight row.
 // - Computes all M column dots in one pass.
@@ -1927,6 +1937,108 @@ static inline bool ComputeQ4KQ8KBatchedRowScalar(const void* weight_row, const u
             std::memset(dot_chunks, 0, sizeof(dot_chunks));
             const int8_t* q8 = yb.qs;
             const int8_t* uq = unpacked_q4;
+            int is = 0;
+            for (int j = 0; j < QK_K / 32; ++j) {
+                const int32_t scale = static_cast<int32_t>(scales[is++]);
+                for (int rep = 0; rep < 4; ++rep) {
+                    for (int l = 0; l < 8; ++l) {
+                        dot_chunks[l] += scale * (static_cast<int32_t>(q8[l]) * static_cast<int32_t>(uq[l]));
+                    }
+                    q8 += 8;
+                    uq += 8;
+                }
+            }
+
+            const float yd = yb.d;
+            const float d = x_d * yd;
+            const float dmin = x_dmin * yd;
+            for (int l = 0; l < 8; ++l) {
+                lane_acc[m][l] += d * static_cast<float>(dot_chunks[l]);
+            }
+            min_acc[m] -= dmin * static_cast<float>(sumi);
+        }
+    }
+
+    for (int m = 0; m < M; ++m) {
+        float sum = min_acc[m];
+        for (int l = 0; l < 8; ++l) {
+            sum += lane_acc[m][l];
+        }
+        out_sums[m] = sum;
+    }
+
+    return true;
+}
+
+static inline bool ComputeQ5KQ8KBatchedRowScalar(const void* weight_row, const uint8_t* quant_input_base,
+                                                 size_t quant_row_stride, int M, int N, float* out_sums) {
+    if (!weight_row || !quant_input_base || !out_sums) return false;
+    if (M <= 0 || M > kMaxSmallBatchColsHard) return false;
+    if (N <= 0 || (N % QK_K) != 0) return false;
+    if (quant_row_stride < static_cast<size_t>(sizeof(DensecoreBlockQ8K)) * static_cast<size_t>(N / QK_K)) {
+        return false;
+    }
+
+    const auto* x_blocks = reinterpret_cast<const DensecoreBlockQ5K*>(weight_row);
+    const int nb = N / QK_K;
+    float lane_acc[kMaxSmallBatchColsHard][8];
+    float min_acc[kMaxSmallBatchColsHard];
+    std::memset(lane_acc, 0, sizeof(lane_acc));
+    std::memset(min_acc, 0, sizeof(min_acc));
+
+    static constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    static constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    static constexpr uint32_t kmask3 = 0x03030303;
+
+    int8_t unpacked_q5[QK_K];
+    uint32_t utmp[4];
+    int32_t dot_chunks[8];
+
+    for (int bi = 0; bi < nb; ++bi) {
+        const auto& xb = x_blocks[bi];
+        const uint8_t* q4 = xb.qs;
+        const uint8_t* high = xb.qh;
+        int8_t* uq5 = unpacked_q5;
+        uint8_t high_mask = 1;
+        for (int j = 0; j < QK_K / 64; ++j) {
+            for (int l = 0; l < 32; ++l) {
+                uq5[l] = static_cast<int8_t>((q4[l] & 0xF) + ((high[l] & high_mask) ? 16 : 0));
+            }
+            uq5 += 32;
+            high_mask <<= 1;
+            for (int l = 0; l < 32; ++l) {
+                uq5[l] = static_cast<int8_t>((q4[l] >> 4) + ((high[l] & high_mask) ? 16 : 0));
+            }
+            uq5 += 32;
+            high_mask <<= 1;
+            q4 += 32;
+        }
+
+        std::memcpy(utmp, xb.scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const uint8_t* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
+        const uint8_t* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
+        const float x_d = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.d));
+        const float x_dmin = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.dmin));
+
+        for (int m = 0; m < M; ++m) {
+            const auto* y_blocks = reinterpret_cast<const DensecoreBlockQ8K*>(
+                quant_input_base + static_cast<size_t>(m) * quant_row_stride);
+            const auto& yb = y_blocks[bi];
+
+            int32_t sumi = 0;
+            for (int j = 0; j < QK_K / 16; ++j) {
+                sumi += static_cast<int32_t>(yb.bsums[j]) * static_cast<int32_t>(mins[j / 2]);
+            }
+
+            std::memset(dot_chunks, 0, sizeof(dot_chunks));
+            const int8_t* q8 = yb.qs;
+            const int8_t* uq = unpacked_q5;
             int is = 0;
             for (int j = 0; j < QK_K / 32; ++j) {
                 const int32_t scale = static_cast<int32_t>(scales[is++]);
@@ -2028,6 +2140,95 @@ static inline bool ComputeQ4KQ8KBatchedRowDotprod(const void* weight_row, const 
 
             const float d = q4_d * yb.d;
             const float dmin = q4_dmin * yb.d;
+            out_sums[m] += d * static_cast<float>(dot_scaled) - dmin * static_cast<float>(min_dot);
+        }
+    }
+    return true;
+}
+
+static inline bool ComputeQ5KQ8KBatchedRowDotprod(const void* weight_row, const uint8_t* quant_input_base,
+                                                  size_t quant_row_stride, int M, int N, float* out_sums) {
+    if (!weight_row || !quant_input_base || !out_sums) return false;
+    if (M <= 0 || M > kMaxSmallBatchColsHard) return false;
+    if (N <= 0 || (N % QK_K) != 0) return false;
+    if (quant_row_stride < static_cast<size_t>(sizeof(DensecoreBlockQ8K)) * static_cast<size_t>(N / QK_K)) {
+        return false;
+    }
+
+    std::fill(out_sums, out_sums + M, 0.0f);
+    const auto* q5_blocks = reinterpret_cast<const DensecoreBlockQ5K*>(weight_row);
+    const int nb = N / QK_K;
+
+    static constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    static constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    static constexpr uint32_t kmask3 = 0x03030303;
+    const uint8x16_t low_mask = vdupq_n_u8(0x0F);
+    const uint8x16_t zero = vdupq_n_u8(0);
+    const uint8x16_t high_value = vdupq_n_u8(16);
+
+    for (int bi = 0; bi < nb; ++bi) {
+        const auto& xb = q5_blocks[bi];
+
+        uint32_t utmp[4];
+        std::memcpy(utmp, xb.scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const auto* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
+        const auto* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
+        const float q5_d = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.d));
+        const float q5_dmin = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.dmin));
+
+        int8x16_t q5_vec[QK_K / 32][2];
+        const uint8_t* q5 = xb.qs;
+        const uint8_t* qh = xb.qh;
+        uint8_t high_mask = 1;
+        for (int chunk = 0; chunk < QK_K / 64; ++chunk) {
+            const uint8x16_t packed0 = vld1q_u8(q5);
+            const uint8x16_t packed1 = vld1q_u8(q5 + 16);
+            const uint8x16_t high0 = vld1q_u8(qh);
+            const uint8x16_t high1 = vld1q_u8(qh + 16);
+            q5 += 32;
+
+            uint8x16_t mask = vdupq_n_u8(high_mask);
+            uint8x16_t add0 = vandq_u8(vcgtq_u8(vandq_u8(high0, mask), zero), high_value);
+            uint8x16_t add1 = vandq_u8(vcgtq_u8(vandq_u8(high1, mask), zero), high_value);
+            q5_vec[2 * chunk][0] = vreinterpretq_s8_u8(vaddq_u8(vandq_u8(packed0, low_mask), add0));
+            q5_vec[2 * chunk][1] = vreinterpretq_s8_u8(vaddq_u8(vandq_u8(packed1, low_mask), add1));
+
+            high_mask <<= 1;
+            mask = vdupq_n_u8(high_mask);
+            add0 = vandq_u8(vcgtq_u8(vandq_u8(high0, mask), zero), high_value);
+            add1 = vandq_u8(vcgtq_u8(vandq_u8(high1, mask), zero), high_value);
+            q5_vec[2 * chunk + 1][0] = vreinterpretq_s8_u8(vaddq_u8(vshrq_n_u8(packed0, 4), add0));
+            q5_vec[2 * chunk + 1][1] = vreinterpretq_s8_u8(vaddq_u8(vshrq_n_u8(packed1, 4), add1));
+            high_mask <<= 1;
+        }
+
+        for (int m = 0; m < M; ++m) {
+            const auto* q8_blocks = reinterpret_cast<const DensecoreBlockQ8K*>(
+                quant_input_base + static_cast<size_t>(m) * quant_row_stride);
+            const auto& yb = q8_blocks[bi];
+
+            int32_t min_dot = 0;
+            for (int j = 0; j < QK_K / 16; ++j) {
+                min_dot += static_cast<int32_t>(yb.bsums[j]) * static_cast<int32_t>(mins[j / 2]);
+            }
+
+            int32_t dot_scaled = 0;
+            const int8_t* q8 = yb.qs;
+            for (int group = 0; group < QK_K / 32; ++group) {
+                int32x4_t acc = vdupq_n_s32(0);
+                acc = vdotq_s32(acc, vld1q_s8(q8 + group * 32), q5_vec[group][0]);
+                acc = vdotq_s32(acc, vld1q_s8(q8 + group * 32 + 16), q5_vec[group][1]);
+                dot_scaled += static_cast<int32_t>(scales[group]) * vaddvq_s32(acc);
+            }
+
+            const float d = q5_d * yb.d;
+            const float dmin = q5_dmin * yb.d;
             out_sums[m] += d * static_cast<float>(dot_scaled) - dmin * static_cast<float>(min_dot);
         }
     }
@@ -2257,6 +2458,16 @@ static inline bool ComputeQ4KQ8KBatchedRow(const void* weight_row, const uint8_t
     }
 #endif
     return ComputeQ4KQ8KBatchedRowScalar(weight_row, quant_input_base, quant_row_stride, M, N, out_sums);
+}
+
+static inline bool ComputeQ5KQ8KBatchedRow(const void* weight_row, const uint8_t* quant_input_base,
+                                           size_t quant_row_stride, int M, int N, float* out_sums) {
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+    if (ComputeQ5KQ8KBatchedRowDotprod(weight_row, quant_input_base, quant_row_stride, M, N, out_sums)) {
+        return true;
+    }
+#endif
+    return ComputeQ5KQ8KBatchedRowScalar(weight_row, quant_input_base, quant_row_stride, M, N, out_sums);
 }
 
 /**
@@ -2634,16 +2845,19 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         const bool can_use_q4k_true_batched = can_quantize_inputs && weight_type == GGML_TYPE_Q4_K &&
                                               vec_dot_type == GGML_TYPE_Q8_K && IsQ4KTrueBatchedKernelEnabled() &&
                                               (N % QK_K == 0);
+        const bool can_use_q5k_true_batched = can_quantize_inputs && weight_type == GGML_TYPE_Q5_K &&
+                                              vec_dot_type == GGML_TYPE_Q8_K && (N % QK_K == 0);
         if (ud->require_q4k_true_batched && !can_use_q4k_true_batched) {
             throw densecore::InvalidArgumentException(
                 std::string("LFM2 prefill Q4_K true-batched callback rejected for ") + weight_name);
         }
         const int quant_tile_cols = ResolveQuantBatchedTileCols(
             ParsePositiveEnvInt("DENSECORE_BATCHED_QUANT_TILE_COLS", kMaxSmallBatchColsHard), vec_dot_nrows,
-            can_use_q4k_true_batched);
+            can_use_q4k_true_batched || can_use_q5k_true_batched);
 
         const bool can_use_q8_0_repacked_batched =
-            (ud->gemma4_dense_prefill_native || ud->qwen36_ssm_q8_repacked_batched) &&
+            (ud->gemma4_dense_prefill_native || ud->lfm2_q8_repacked_batched ||
+             ud->qwen36_ssm_q8_repacked_batched) &&
             weight_type == GGML_TYPE_Q8_0 && input_contig && output_contig &&
             type_traits_cpu->vec_dot_type == GGML_TYPE_Q8_0 && input_type_traits && input_type_traits->from_float &&
             (N % QK8_0) == 0 && (K % 4) == 0 && M >= 4;
@@ -2680,7 +2894,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         float* out_group =
                             reinterpret_cast<float*>(output_base + static_cast<size_t>(m) * output_col_stride) +
                             k_aligned_start;
-                        if (ud->qwen36_ssm_q8_repacked_batched) {
+                        if (ud->qwen36_ssm_q8_repacked_batched || ud->lfm2_q8_repacked_batched) {
                             DenseCoreGemvQ8_0_4x8Q8_0Generic(N, out_group, packed->data.data() + packed_offset,
                                                              q8_row.data(), k_aligned_end - k_aligned_start);
                         } else {
@@ -2690,8 +2904,10 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     }
                     run_scalar_cols(m, std::max(k_aligned_end, k_start), k_end);
                 }
-                LogMatmulPathOnce(ud->qwen36_ssm_q8_repacked_batched ? "qwen36_ssm_q8_0_repacked_batched"
-                                                                      : "gemma4_q8_0_repacked_batched");
+                LogMatmulPathOnce(ud->qwen36_ssm_q8_repacked_batched
+                                      ? "qwen36_ssm_q8_0_repacked_batched"
+                                      : (ud->lfm2_q8_repacked_batched ? "lfm2_q8_0_repacked_batched"
+                                                                      : "gemma4_q8_0_repacked_batched"));
                 record_quant_profile(true, false);
                 return;
             }
@@ -2962,6 +3178,25 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                                     1, std::memory_order_relaxed);
                             }
                         }
+                        record_quant_profile(true, true);
+                        continue;
+                    }
+                }
+                if (!ud->force_reference_scalar && can_use_q5k_true_batched && quant_input_base) {
+                    alignas(64) std::array<float, kMaxSmallBatchColsHard> row_sums{};
+                    bool all_rows_ok = true;
+                    for (int k = k_start; k < k_end; ++k) {
+                        const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
+                        if (!ComputeQ5KQ8KBatchedRow(row_ptr, quant_input_base, quant_row_stride, tile_m, N,
+                                                     row_sums.data())) {
+                            all_rows_ok = false;
+                            break;
+                        }
+                        for (int m = 0; m < tile_m; ++m) {
+                            store_out(tile_start + m, k, row_sums[static_cast<size_t>(m)]);
+                        }
+                    }
+                    if (all_rows_ok) {
                         record_quant_profile(true, true);
                         continue;
                     }
@@ -5943,13 +6178,16 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const bool lfm2_prefill_q4k_relevant =
         model && model->arch_flags.is_lfm2_shortconv && M > 1 &&
         input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q4_K;
+    const bool lfm2_prefill_q6k_relevant =
+        model && model->arch_flags.is_lfm2_shortconv && M > 1 &&
+        input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q6_K;
     const bool lfm2_prefill_quant_nrc_unsafe =
         model && model->arch_flags.is_lfm2_shortconv && M > 1 &&
-        input->type == GGML_TYPE_F32 && ggml_is_quantized(weight->type)
+        input->type == GGML_TYPE_F32 && ggml_is_quantized(weight->type) &&
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-        ;
+        true;
 #else
-        && false;
+        weight->type == GGML_TYPE_Q6_K;
 #endif
     const bool q4k_batched_prefill_relevant =
         qwen36_hybrid_ssm_q4k_prefill_relevant || qwen36_lm_head_q4k_prefill_relevant || lfm2_prefill_q4k_relevant;
@@ -6067,11 +6305,15 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                                   "temporary_reference_hybrid_ssm_prefill_correctness");
     }
 
-    // LFM2 ARM prefill only admits Q4_K through the true-batched kernel below.
-    // Keep other quantized prefill tensors on native GGML rather than sending
-    // them through the slower custom scalar fallback.
+    // LFM2 ARM prefill admits the target dense quantized projections directly
+    // through DenseCore callbacks. Unknown quant types stay on native GGML until
+    // a model-backed path is qualified.
+    const bool lfm2_prefill_q5k_q6k_or_q8_relevant =
+        model && model->arch_flags.is_lfm2_shortconv && input->type == GGML_TYPE_F32 && M > 1 &&
+        (weight->type == GGML_TYPE_Q5_K || weight->type == GGML_TYPE_Q6_K || weight->type == GGML_TYPE_Q8_0);
     if (model && model->arch_flags.is_lfm2_shortconv && ggml_is_quantized(weight->type) &&
-        weight->type != GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 && M > 1 &&
+        weight->type != GGML_TYPE_Q4_K && !lfm2_prefill_q5k_q6k_or_q8_relevant &&
+        input->type == GGML_TYPE_F32 && M > 1 &&
 #if defined(__aarch64__) || defined(_M_ARM64)
         true
 #else
@@ -6247,7 +6489,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             std::string("LFM2 prefill Q4_K requires DenseCore true-batched path; rejected: ") + reason);
     }
     const bool is_small_batch_quant_candidate =
-        (input_cols > 1 && input_cols <= max_small_batch_quant_cols && input->type == GGML_TYPE_F32 &&
+        (input_cols > 1 && (input_cols <= max_small_batch_quant_cols || lfm2_prefill_q6k_relevant) &&
+         input->type == GGML_TYPE_F32 &&
          ggml_is_quantized(weight->type) && !qwen35_dense_prefill_prefers_ggml_quant &&
          !qwen36_prefill_prefers_ggml_quant && !lfm2_prefill_prefers_ggml_quant && has_quant_vec_dot &&
          has_quant_from_float && quant_input_size_ok);
@@ -6343,6 +6586,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             qwen36_lm_head_q4k_prefill_relevant;
         ud->disable_quant_nrc_fast = lfm2_prefill_quant_nrc_unsafe || lfm2_prefill_q4k_relevant;
         ud->gemma4_dense_prefill_native = gemma4_dense_prefill_native_allowed;
+        ud->lfm2_q8_repacked_batched =
+            model && model->arch_flags.is_lfm2_shortconv && weight->type == GGML_TYPE_Q8_0 && input_cols > 1;
         // Qwen3.6 SSM Q8_0 prefill owns a narrow direct path instead of
         // delegating to GGML vec_dot from the generic batched callback. That
         // keeps the graph fallback-free and makes the projection easy to
