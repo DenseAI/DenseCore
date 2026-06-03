@@ -41,6 +41,7 @@ extern bool QActCacheResetAcrossCachedDecodeReuseForTest();
 extern bool QActBatchedCacheReusesSameTensorForTest();
 extern bool RunQwen36Q4KBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle, int* admission_state,
                                              int* reject_reason);
+extern bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle);
 extern int ResolveQwen36PrefillQ4KBatchedReasonForTest(bool relevant, bool mode_off, bool lora_active,
                                                        bool weight_is_q4k, bool shape_supported,
                                                        bool kernel_available, bool has_vec_dot, bool candidate_ready,
@@ -393,6 +394,13 @@ TEST(DecodeGraphCachePolicyTest, Qwen36DirectBatchedPathDoesNotShadowRejectParti
     EXPECT_TRUE(output_matches_vecdot_oracle);
     EXPECT_EQ(admission_state, 0);
     EXPECT_EQ(reject_reason, 0);
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36SSMQ8RepackedBatchedPathMatchesVecDotOracle) {
+    bool output_matches_vecdot_oracle = false;
+    ASSERT_TRUE(densecore::testing::RunQwen36SSMQ8RepackedBatchedDirectForTest(
+        /*nth=*/4, &output_matches_vecdot_oracle));
+    EXPECT_TRUE(output_matches_vecdot_oracle);
 }
 
 TEST(DecodeGraphCachePolicyTest, Q4KCopiedGemvExperimentMatchesVecDotReference) {

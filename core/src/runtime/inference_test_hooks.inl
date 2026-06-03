@@ -740,6 +740,92 @@ bool RunQwen36Q4KBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracl
     ggml_free(ggml_ctx);
     return true;
 }
+
+bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle) {
+    constexpr int rows = 128;
+    constexpr int cols = QK8_0 * 4;
+    constexpr int tokens = 8;
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+    if (!q8_traits || !q8_traits->from_float || !q8_traits->vec_dot || q8_traits->vec_dot_type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    ggml_init_params params{256 * 1024, nullptr, false};
+    ggml_context* ggml_ctx = ggml_init(params);
+    if (!ggml_ctx) {
+        return false;
+    }
+    ggml_tensor* input = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, cols, tokens);
+    ggml_tensor* weight = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_Q8_0, cols, rows);
+    ggml_tensor* dst = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, rows, tokens);
+    if (!input || !weight || !dst || !input->data || !weight->data || !dst->data) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+    dst->src[0] = input;
+    dst->src[1] = weight;
+    std::snprintf(weight->name, sizeof(weight->name), "blk.0.attn_qkv.weight");
+    auto* input_f32 = reinterpret_cast<float*>(input->data);
+    for (int m = 0; m < tokens; ++m) {
+        for (int c = 0; c < cols; ++c) {
+            input_f32[static_cast<size_t>(m) * cols + c] =
+                std::sin(static_cast<float>(m * 29 + c) * 0.011f) * 0.5f;
+        }
+    }
+    std::vector<float> weight_f32(static_cast<size_t>(rows) * cols);
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            weight_f32[static_cast<size_t>(r) * cols + c] =
+                std::cos(static_cast<float>(r * 13 + c) * 0.017f) * 0.375f;
+        }
+        q8_traits->from_float(weight_f32.data() + static_cast<size_t>(r) * cols,
+                              static_cast<uint8_t*>(weight->data) +
+                                  static_cast<size_t>(r) * ggml_row_size(GGML_TYPE_Q8_0, cols),
+                              cols);
+    }
+    std::fill_n(reinterpret_cast<float*>(dst->data), rows * tokens, 12345.0f);
+    GemvBatchedUserData ud{};
+    ud.weight_tensor = weight;
+    ud.N = cols;
+    ud.K = rows;
+    ud.M = tokens;
+    ud.weight_type = GGML_TYPE_Q8_0;
+    ud.input_quant_type = GGML_TYPE_Q8_0;
+    ud.quant_row_stride = densecore::AlignUp(ggml_row_size(GGML_TYPE_Q8_0, cols), static_cast<size_t>(64));
+    ud.slot_id = -1;
+    ud.qwen36_ssm_q8_repacked_batched = true;
+    InferenceWorkContext work_ctx{};
+    ResetInferenceWorkContext(&work_ctx);
+    ud.work_ctx = &work_ctx;
+    SetCurrentWorkContext(&work_ctx);
+    for (int ith = 0; ith < std::max(1, nth); ++ith) {
+        cb_gemv_batched_custom(dst, ith, std::max(1, nth), &ud);
+    }
+    SetCurrentWorkContext(nullptr);
+
+    std::vector<uint8_t> q8_input(static_cast<size_t>(tokens) * ud.quant_row_stride);
+    for (int m = 0; m < tokens; ++m) {
+        q8_traits->from_float(input_f32 + static_cast<size_t>(m) * cols,
+                              q8_input.data() + static_cast<size_t>(m) * ud.quant_row_stride, cols);
+    }
+    bool matches = true;
+    auto* out = reinterpret_cast<float*>(dst->data);
+    for (int r = 0; r < rows; ++r) {
+        const void* row_ptr = static_cast<const uint8_t*>(weight->data) +
+                              static_cast<size_t>(r) * ggml_row_size(GGML_TYPE_Q8_0, cols);
+        for (int m = 0; m < tokens; ++m) {
+            float ref = 0.0f;
+            q8_traits->vec_dot(cols, &ref, 0, row_ptr, 0,
+                               q8_input.data() + static_cast<size_t>(m) * ud.quant_row_stride, 0, 1);
+            const float got = out[static_cast<size_t>(m) * rows + r];
+            if (std::fabs(got - ref) > 1e-4f) {
+                matches = false;
+            }
+        }
+    }
+    if (output_matches_vecdot_oracle) *output_matches_vecdot_oracle = matches;
+    ggml_free(ggml_ctx);
+    return true;
+}
 int ResolveQwen36MoECallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int top_k) {
     return ::ResolveQwen36MoECallbackTaskCount(model, batch, top_k);
 }

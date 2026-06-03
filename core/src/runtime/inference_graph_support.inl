@@ -5107,6 +5107,7 @@ struct GemvBatchedUserData {
     bool require_q4k_true_batched = false;
     bool disable_quant_nrc_fast = false;
     bool gemma4_dense_prefill_native = false;
+    bool qwen36_ssm_q8_repacked_batched = false;
     std::atomic<int> qwen36_prefill_q4k_probe_done{0};
     std::atomic<int> qwen36_prefill_q4k_probe_failures{0};
     std::atomic<int> qwen36_prefill_q4k_probe_internal_errors{0};

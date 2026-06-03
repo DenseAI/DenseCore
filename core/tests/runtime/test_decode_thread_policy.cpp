@@ -331,7 +331,7 @@ TEST(DecodeThreadPolicy, Qwen36PrefillChunkAutoEnvTunesAdmissionThresholdAndDefa
     EXPECT_EQ(ResolveQwen36PrefillChunkTokens(&model, &req), 256);
 }
 
-TEST(DecodeThreadPolicy, Qwen36PrefillChunkEnvCannotExceedSafeDefaultChunk) {
+TEST(DecodeThreadPolicy, Qwen36PrefillChunkExplicitEnvCanExceedAutoDefaultForBenchmarking) {
     ScopedEnvVar chunk_override("DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS", "768");
     ScopedEnvVar auto_min("DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS", "512");
     ScopedEnvVar default_tokens("DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS", "1024");
@@ -346,7 +346,7 @@ TEST(DecodeThreadPolicy, Qwen36PrefillChunkEnvCannotExceedSafeDefaultChunk) {
     req.prompt_token_count = 1536;
     req.prompt_tokens_for_cache.resize(1536, 1);
 
-    EXPECT_EQ(ResolveQwen36PrefillChunkTokens(&model, &req), ExpectedHybridSsmChunkTokensForRuntime());
+    EXPECT_EQ(ResolveQwen36PrefillChunkTokens(&model, &req), 768);
 }
 
 TEST(DecodeThreadPolicy, Qwen36PrefillChunkAutoKeepsOneKPromptsUnchunked) {

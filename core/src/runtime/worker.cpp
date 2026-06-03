@@ -1807,7 +1807,7 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
 
     const int explicit_tokens = densecore::env::ParsePositiveEnvInt(chunk_env, 0);
     if (explicit_tokens > 0) {
-        return std::min(explicit_tokens, default_chunk_tokens);
+        return explicit_tokens;
     }
 
     const char* env_value = std::getenv(chunk_env);

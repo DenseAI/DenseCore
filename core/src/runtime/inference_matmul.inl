@@ -2325,11 +2325,12 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
             ParsePositiveEnvInt("DENSECORE_BATCHED_QUANT_TILE_COLS", kMaxSmallBatchColsHard), vec_dot_nrows,
             can_use_q4k_true_batched);
 
-        const bool can_use_gemma4_q8_0_repacked_batched =
-            ud->gemma4_dense_prefill_native && weight_type == GGML_TYPE_Q8_0 && input_contig && output_contig &&
+        const bool can_use_q8_0_repacked_batched =
+            (ud->gemma4_dense_prefill_native || ud->qwen36_ssm_q8_repacked_batched) &&
+            weight_type == GGML_TYPE_Q8_0 && input_contig && output_contig &&
             type_traits_cpu->vec_dot_type == GGML_TYPE_Q8_0 && input_type_traits && input_type_traits->from_float &&
             (N % QK8_0) == 0 && (K % 4) == 0 && M >= 4;
-        if (can_use_gemma4_q8_0_repacked_batched) {
+        if (can_use_q8_0_repacked_batched) {
             auto packed = GetOrCreateQ8RepackedGemvWeight(weight_base, K, N, /*force_enable=*/true);
             if (packed && packed->blocks_per_row > 0) {
                 const size_t q8_row_size = ggml_row_size(GGML_TYPE_Q8_0, static_cast<int64_t>(N));
@@ -2367,7 +2368,8 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     }
                     run_scalar_cols(m, std::max(k_aligned_end, k_start), k_end);
                 }
-                LogMatmulPathOnce("gemma4_q8_0_repacked_batched");
+                LogMatmulPathOnce(ud->qwen36_ssm_q8_repacked_batched ? "qwen36_ssm_q8_0_repacked_batched"
+                                                                      : "gemma4_q8_0_repacked_batched");
                 record_quant_profile(true, false);
                 return;
             }
@@ -3983,6 +3985,7 @@ inline struct ggml_tensor* ggml_mul_mat_gemv_batched(struct ggml_context* ctx, s
     userdata->weight_type = weight->type;
     userdata->input_quant_type = GGML_TYPE_F32;
     userdata->gemma4_dense_prefill_native = false;
+    userdata->qwen36_ssm_q8_repacked_batched = false;
 
     if (ggml_is_quantized(weight->type)) {
         const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight->type);
@@ -6039,6 +6042,10 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             qwen36_lm_head_q4k_prefill_relevant;
         ud->disable_quant_nrc_fast = lfm2_prefill_quant_nrc_unsafe || lfm2_prefill_q4k_relevant;
         ud->gemma4_dense_prefill_native = gemma4_dense_prefill_native_allowed;
+        ud->qwen36_ssm_q8_repacked_batched =
+            (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
+            weight->type == GGML_TYPE_Q8_0 && input->type == GGML_TYPE_F32 && M > 1 &&
+            weight->ne[0] == input->ne[0];
         if (gemma4_dense_prefill_native_allowed) {
             RecordGemma4DensePrefillNativeDecision(
                 dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext(), /*candidate=*/false,
