@@ -1295,7 +1295,7 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
 #endif
 
     const float attention_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k));
-    constexpr int kQwen35FastDefaultVChunk = 64;
+    constexpr int kQwen35FastDefaultVChunk = 256;
     double first_pass_dual_dot_ms = 0.0;
     double state_update_only_ms = 0.0;
     for (int v0 = 0; v0 < cfg.head_dim_v; v0 += kQwen35FastDefaultVChunk) {

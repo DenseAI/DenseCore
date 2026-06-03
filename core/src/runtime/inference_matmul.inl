@@ -79,11 +79,12 @@ struct DenseCoreQ8_0x4Block {
 static_assert(sizeof(DenseCoreQ8_0x4Block) == 4 * sizeof(ggml_fp16_t) + QK8_0 * 4,
               "Q8_0x4 block layout must match ggml repack layout");
 
-static bool DenseCoreQ8_0_4x8GemmM4FromF32(int n, float* out, size_t out_stride_floats, const void* packed_weight,
-                                           const float* input_rows, std::vector<DenseCoreQ8_0x4Block>& qtile,
-                                           int nc) {
+static bool DenseCoreQ8_0_4x8GemmM4FromQ8(int n, float* out, size_t out_stride_floats, const void* packed_weight,
+                                          const uint8_t* q8_input_base, size_t q8_row_stride,
+                                          std::vector<DenseCoreQ8_0x4Block>& qtile, int nc) {
 #if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-    if (!out || !packed_weight || !input_rows || n <= 0 || (n % QK8_0) != 0 || (nc % 4) != 0) {
+    if (!out || !packed_weight || !q8_input_base || n <= 0 || (n % QK8_0) != 0 || (nc % 4) != 0 ||
+        q8_row_stride < ggml_row_size(GGML_TYPE_Q8_0, n)) {
         return false;
     }
     const int nb = n / QK8_0;
@@ -91,20 +92,14 @@ static bool DenseCoreQ8_0_4x8GemmM4FromF32(int n, float* out, size_t out_stride_
     for (int b = 0; b < nb; ++b) {
         DenseCoreQ8_0x4Block& block = qtile[static_cast<size_t>(b)];
         for (int row = 0; row < 4; ++row) {
-            const float* src = input_rows + static_cast<size_t>(row) * static_cast<size_t>(n) +
-                               static_cast<size_t>(b) * QK8_0;
-            float max_abs = 0.0f;
-            for (int i = 0; i < QK8_0; ++i) {
-                max_abs = std::max(max_abs, std::fabs(src[i]));
-            }
-            const float d = max_abs / 127.0f;
-            const float id = d != 0.0f ? 1.0f / d : 0.0f;
-            block.d[row] = ggml_fp32_to_fp16(d);
-            for (int i = 0; i < QK8_0; ++i) {
-                const int group = i / 8;
-                const int lane = i & 7;
-                const int q = std::clamp(static_cast<int>(std::nearbyint(src[i] * id)), -128, 127);
-                block.qs[group * 32 + row * 8 + lane] = static_cast<int8_t>(q);
+            const auto* src = reinterpret_cast<const block_q8_0*>(
+                q8_input_base + static_cast<size_t>(row) * q8_row_stride +
+                static_cast<size_t>(b) * sizeof(block_q8_0));
+            block.d[row] = src->d;
+            for (int group = 0; group < 4; ++group) {
+                for (int lane = 0; lane < 8; ++lane) {
+                    block.qs[group * 32 + row * 8 + lane] = src->qs[group * 8 + lane];
+                }
             }
         }
     }
@@ -158,7 +153,8 @@ static bool DenseCoreQ8_0_4x8GemmM4FromF32(int n, float* out, size_t out_stride_
     (void)out;
     (void)out_stride_floats;
     (void)packed_weight;
-    (void)input_rows;
+    (void)q8_input_base;
+    (void)q8_row_stride;
     (void)qtile;
     (void)nc;
     return false;
@@ -2562,10 +2558,11 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                             float* out_group =
                                 reinterpret_cast<float*>(output_base + static_cast<size_t>(m) * output_col_stride) +
                                 k_aligned_start;
-                            const bool used_gemm_m4 = DenseCoreQ8_0_4x8GemmM4FromF32(
+                            const bool used_gemm_m4 = DenseCoreQ8_0_4x8GemmM4FromQ8(
                                 N, out_group, output_col_stride / sizeof(float),
-                                packed->data.data() + packed_offset, x_rows[static_cast<size_t>(m)], q8_gemm_tile,
-                                k_aligned_end - k_aligned_start);
+                                packed->data.data() + packed_offset,
+                                q8_input_base + static_cast<size_t>(m) * q8_row_stride, q8_row_stride,
+                                q8_gemm_tile, k_aligned_end - k_aligned_start);
                             if (!used_gemm_m4) {
                                 for (int r = 0; r < 4; ++r) {
                                     const uint8_t* q_ptr =
