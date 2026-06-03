@@ -1747,7 +1747,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const int native_moe_timing_missing =
         native_moe_expected && req->native_moe_graph_ns == 0 ? 1 : req->native_moe_timing_missing;
     const bool target_fast_path_required =
-        qwen_hot_path_plan.target_model ||
+        densecore::models::ModelExecutionContractRequiresFallbackFreeFastPath(execution_contract) ||
         densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(execution_contract);
     const bool target_ggml_path_seen =
         req->qwen_target_ggml_compute_ops > 0 || req->decode_matmul_path_hist[0] > 0 ||
@@ -1910,6 +1910,10 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " model_execution_contract_has_lfm2_shortconv="
         << (execution_contract.has_lfm2_shortconv_mixer ? 1 : 0)
         << " model_execution_contract_stateful_custom_ops=" << (execution_contract.has_stateful_custom_ops ? 1 : 0)
+        << " model_execution_contract_fast_path_class="
+        << densecore::models::ExecutionFastPathClassName(execution_contract.fast_path_class)
+        << " model_execution_contract_requires_fallback_free_fast_path="
+        << (execution_contract.requires_fallback_free_fast_path ? 1 : 0)
         << " model_execution_contract_requires_rebind="
         << (execution_contract.requires_decode_graph_runtime_rebind ? 1 : 0)
         << " model_execution_contract_decode_cache_static_safe="

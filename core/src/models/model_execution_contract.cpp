@@ -139,6 +139,23 @@ bool IsLFM2ShortConvMoEContract(const ModelExecutionContract& contract) {
     return contract.variant == ModelVariant::LFM2MOE && contract.has_lfm2_shortconv_mixer && contract.has_moe;
 }
 
+ExecutionFastPathClass ResolveFastPathClass(const TransformerModel* model, const ModelExecutionContract& contract) {
+    if (!model) {
+        return ExecutionFastPathClass::None;
+    }
+    if (IsQwenHybridSSMContract(contract) && contract.has_moe) {
+        return ExecutionFastPathClass::QwenHybridSSMMoE;
+    }
+    if ((contract.variant == ModelVariant::QWEN35 || contract.variant == ModelVariant::QWEN36) &&
+        !contract.has_moe && !contract.has_hybrid_ssm_mixer) {
+        return ExecutionFastPathClass::QwenDense;
+    }
+    if (IsLFM2ShortConvMoEContract(contract)) {
+        return ExecutionFastPathClass::LFM2ShortConvMoE;
+    }
+    return ExecutionFastPathClass::None;
+}
+
 }  // namespace
 
 ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model) {
@@ -230,8 +247,11 @@ ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model
 
     contract.has_moe = contract.has_moe || model->hparams.n_experts > 0;
     contract.has_stateful_custom_ops = contract.has_hybrid_ssm_mixer || contract.has_lfm2_shortconv_mixer;
+    contract.fast_path_class = ResolveFastPathClass(model, contract);
+    contract.requires_fallback_free_fast_path = contract.fast_path_class != ExecutionFastPathClass::None;
     contract.requires_native_moe_fast_path =
-        contract.has_moe && (IsQwenHybridSSMContract(contract) || IsLFM2ShortConvMoEContract(contract));
+        contract.fast_path_class == ExecutionFastPathClass::QwenHybridSSMMoE ||
+        contract.fast_path_class == ExecutionFastPathClass::LFM2ShortConvMoE;
     if (contract.requires_native_moe_fast_path) {
         contract.native_moe_max_direct_tokens = kDefaultNativeMoEFastPathMaxDirectTokens;
     }
@@ -264,6 +284,10 @@ bool ModelExecutionContractAllowsDecodeGraphCache(const ModelExecutionContract& 
 
 bool ModelExecutionContractRequiresDecodeGraphRuntimeRebind(const ModelExecutionContract& contract) {
     return contract.valid && contract.requires_decode_graph_runtime_rebind;
+}
+
+bool ModelExecutionContractRequiresFallbackFreeFastPath(const ModelExecutionContract& contract) {
+    return contract.valid && contract.requires_fallback_free_fast_path;
 }
 
 bool ModelExecutionContractRequiresNativeMoEFastPath(const ModelExecutionContract& contract) {
@@ -315,6 +339,16 @@ const char* ExecutionCustomOpRebindKindName(ExecutionCustomOpRebindKind kind) {
     return "unknown";
 }
 
+const char* ExecutionFastPathClassName(ExecutionFastPathClass kind) {
+    switch (kind) {
+    case ExecutionFastPathClass::None: return "none";
+    case ExecutionFastPathClass::QwenDense: return "qwen_dense";
+    case ExecutionFastPathClass::QwenHybridSSMMoE: return "qwen_hybrid_ssm_moe";
+    case ExecutionFastPathClass::LFM2ShortConvMoE: return "lfm2_shortconv_moe";
+    }
+    return "unknown";
+}
+
 std::string FormatModelExecutionContract(const ModelExecutionContract& contract) {
     std::ostringstream oss;
     oss << "ModelExecutionContract{variant=" << static_cast<int>(contract.variant)
@@ -323,6 +357,9 @@ std::string FormatModelExecutionContract(const ModelExecutionContract& contract)
         << ",has_moe=" << (contract.has_moe ? "true" : "false")
         << ",has_hybrid_ssm=" << (contract.has_hybrid_ssm_mixer ? "true" : "false")
         << ",has_lfm2_shortconv=" << (contract.has_lfm2_shortconv_mixer ? "true" : "false")
+        << ",fast_path_class=" << ExecutionFastPathClassName(contract.fast_path_class)
+        << ",requires_fallback_free_fast_path="
+        << (contract.requires_fallback_free_fast_path ? "true" : "false")
         << ",requires_native_moe_fast_path=" << (contract.requires_native_moe_fast_path ? "true" : "false")
         << ",native_moe_max_direct_tokens=" << contract.native_moe_max_direct_tokens
         << ",decode_cache_static_safe=" << (contract.decode_graph_cache_static_safe ? "true" : "false")

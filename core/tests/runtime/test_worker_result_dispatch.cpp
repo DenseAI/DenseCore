@@ -150,6 +150,8 @@ TEST(WorkerResultDispatchTest, Qwen35DecodeSummaryUsesDedicatedTag) {
     EXPECT_NE(captured.find("kleidiai_candidate_ops="), std::string::npos);
     EXPECT_NE(captured.find("kleidiai_last_reject_reason="), std::string::npos);
     EXPECT_NE(captured.find("model_execution_contract_valid=1"), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_fast_path_class=qwen_hybrid_ssm_moe"), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_requires_fallback_free_fast_path=1"), std::string::npos);
     EXPECT_NE(captured.find("model_execution_contract_requires_native_moe_fast_path=1"), std::string::npos);
     EXPECT_NE(captured.find("graph_plan_route=inline_hybrid_ssm"), std::string::npos);
     EXPECT_NE(captured.find("graph_plan_family=DecoderHybridSSM"), std::string::npos);
@@ -297,6 +299,9 @@ TEST(WorkerResultDispatchTest, DenseQwenDecodeSummaryRequiresTargetFastPath) {
 
     EXPECT_NE(captured.find("qwen_hot_path_target=1"), std::string::npos);
     EXPECT_NE(captured.find("qwen_hot_path_dense_lane=1"), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_fast_path_class=qwen_dense"), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_requires_fallback_free_fast_path=1"), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_requires_native_moe_fast_path=0"), std::string::npos);
     EXPECT_NE(captured.find("qwen_fast_path_required=1"), std::string::npos);
     EXPECT_NE(captured.find("qwen_fast_path_ok=0"), std::string::npos);
     EXPECT_NE(captured.find("qwen_fast_path_failure_reason=ggml_compute_or_matmul_path"), std::string::npos);

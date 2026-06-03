@@ -40,6 +40,13 @@ enum class ExecutionCustomOpRebindKind : uint8_t {
     LFM2ShortConv,
 };
 
+enum class ExecutionFastPathClass : uint8_t {
+    None = 0,
+    QwenDense,
+    QwenHybridSSMMoE,
+    LFM2ShortConvMoE,
+};
+
 struct ExecutionRuntimeStateShape {
     ExecutionRuntimeStateKind kind = ExecutionRuntimeStateKind::None;
     int conv_channels = 0;
@@ -85,6 +92,8 @@ struct ModelExecutionContract {
     bool has_hybrid_ssm_mixer = false;
     bool has_lfm2_shortconv_mixer = false;
     bool has_stateful_custom_ops = false;
+    bool requires_fallback_free_fast_path = false;
+    ExecutionFastPathClass fast_path_class = ExecutionFastPathClass::None;
     bool requires_native_moe_fast_path = false;
     int64_t native_moe_max_direct_tokens = 0;
     bool decode_graph_cache_static_safe = true;
@@ -97,6 +106,7 @@ struct ModelExecutionContract {
 ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model);
 bool ModelExecutionContractAllowsDecodeGraphCache(const ModelExecutionContract& contract);
 bool ModelExecutionContractRequiresDecodeGraphRuntimeRebind(const ModelExecutionContract& contract);
+bool ModelExecutionContractRequiresFallbackFreeFastPath(const ModelExecutionContract& contract);
 bool ModelExecutionContractRequiresNativeMoEFastPath(const ModelExecutionContract& contract);
 int64_t ModelExecutionContractNativeMoEMaxDirectTokens(const ModelExecutionContract& contract);
 
@@ -104,6 +114,7 @@ const char* ExecutionRuntimeStateKindName(ExecutionRuntimeStateKind kind);
 const char* ExecutionTensorOwnershipName(ExecutionTensorOwnership ownership);
 const char* ExecutionMoEExpertLayoutKindName(ExecutionMoEExpertLayoutKind kind);
 const char* ExecutionCustomOpRebindKindName(ExecutionCustomOpRebindKind kind);
+const char* ExecutionFastPathClassName(ExecutionFastPathClass kind);
 std::string FormatModelExecutionContract(const ModelExecutionContract& contract);
 
 }  // namespace densecore::models

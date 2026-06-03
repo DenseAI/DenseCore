@@ -191,10 +191,13 @@ TEST(ModelExecutionContract, Qwen36HybridSSMMoEDeclaresLayerStateAndRebindContra
     EXPECT_TRUE(contract.has_hybrid_ssm_mixer);
     EXPECT_TRUE(contract.has_moe);
     EXPECT_TRUE(contract.has_stateful_custom_ops);
+    EXPECT_TRUE(contract.requires_fallback_free_fast_path);
+    EXPECT_EQ(contract.fast_path_class, densecore::models::ExecutionFastPathClass::QwenHybridSSMMoE);
     EXPECT_TRUE(contract.requires_native_moe_fast_path);
     EXPECT_GE(contract.native_moe_max_direct_tokens, 4096);
     EXPECT_TRUE(densecore::models::ModelExecutionContractAllowsDecodeGraphCache(contract));
     EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresDecodeGraphRuntimeRebind(contract));
+    EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresFallbackFreeFastPath(contract));
     EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(contract));
     EXPECT_GE(densecore::models::ModelExecutionContractNativeMoEMaxDirectTokens(contract), 4096);
     ASSERT_EQ(contract.layers.size(), 2u);
@@ -220,10 +223,38 @@ TEST(ModelExecutionContract, Qwen36HybridSSMMoEDeclaresLayerStateAndRebindContra
 
     const std::string formatted = densecore::models::FormatModelExecutionContract(contract);
     EXPECT_NE(formatted.find("requires_rebind=true"), std::string::npos);
+    EXPECT_NE(formatted.find("fast_path_class=qwen_hybrid_ssm_moe"), std::string::npos);
+    EXPECT_NE(formatted.find("requires_fallback_free_fast_path=true"), std::string::npos);
     EXPECT_NE(formatted.find("requires_native_moe_fast_path=true"), std::string::npos);
     EXPECT_NE(formatted.find("native_moe_max_direct_tokens=4096"), std::string::npos);
     EXPECT_NE(formatted.find("hybrid_ssm_conv1d@layer0"), std::string::npos);
     EXPECT_NE(formatted.find("hybrid_ssm_delta@layer0"), std::string::npos);
+}
+
+TEST(ModelExecutionContract, QwenDenseDeclaresFallbackFreeFastPathWithoutNativeMoERequirement) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = false;
+    model.hparams.n_layer = 2;
+    model.hparams.n_embd = 4096;
+    model.hparams.n_experts = 0;
+    model.layers.resize(2);
+
+    const auto contract = densecore::models::BuildModelExecutionContract(&model);
+    ASSERT_TRUE(contract.valid) << densecore::models::FormatModelExecutionContract(contract);
+    EXPECT_FALSE(contract.has_moe);
+    EXPECT_FALSE(contract.has_hybrid_ssm_mixer);
+    EXPECT_EQ(contract.fast_path_class, densecore::models::ExecutionFastPathClass::QwenDense);
+    EXPECT_TRUE(contract.requires_fallback_free_fast_path);
+    EXPECT_FALSE(contract.requires_native_moe_fast_path);
+    EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresFallbackFreeFastPath(contract));
+    EXPECT_FALSE(densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(contract));
+
+    const std::string formatted = densecore::models::FormatModelExecutionContract(contract);
+    EXPECT_NE(formatted.find("fast_path_class=qwen_dense"), std::string::npos);
+    EXPECT_NE(formatted.find("requires_fallback_free_fast_path=true"), std::string::npos);
+    EXPECT_NE(formatted.find("requires_native_moe_fast_path=false"), std::string::npos);
 }
 
 TEST(DecoderModelSpec, Qwen36GroupedMetadataStillUsesLlamaCppSoftmaxRouter) {
@@ -360,10 +391,13 @@ TEST(ModelExecutionContract, LFM2ShortConvDeclaresConvOrdinalsAndRebindContract)
     EXPECT_TRUE(contract.has_lfm2_shortconv_mixer);
     EXPECT_TRUE(contract.has_moe);
     EXPECT_TRUE(contract.has_stateful_custom_ops);
+    EXPECT_TRUE(contract.requires_fallback_free_fast_path);
+    EXPECT_EQ(contract.fast_path_class, densecore::models::ExecutionFastPathClass::LFM2ShortConvMoE);
     EXPECT_TRUE(contract.requires_native_moe_fast_path);
     EXPECT_GE(contract.native_moe_max_direct_tokens, 4096);
     EXPECT_TRUE(densecore::models::ModelExecutionContractAllowsDecodeGraphCache(contract));
     EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresDecodeGraphRuntimeRebind(contract));
+    EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresFallbackFreeFastPath(contract));
     EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(contract));
     EXPECT_GE(densecore::models::ModelExecutionContractNativeMoEMaxDirectTokens(contract), 4096);
     ASSERT_EQ(contract.layers.size(), 3u);
@@ -383,6 +417,8 @@ TEST(ModelExecutionContract, LFM2ShortConvDeclaresConvOrdinalsAndRebindContract)
     EXPECT_EQ(contract.layers[0].moe_router, densecore::models::DecoderMoERouter::GroupedSigmoidTopK);
 
     const std::string formatted = densecore::models::FormatModelExecutionContract(contract);
+    EXPECT_NE(formatted.find("fast_path_class=lfm2_shortconv_moe"), std::string::npos);
+    EXPECT_NE(formatted.find("requires_fallback_free_fast_path=true"), std::string::npos);
     EXPECT_NE(formatted.find("requires_native_moe_fast_path=true"), std::string::npos);
     EXPECT_NE(formatted.find("native_moe_max_direct_tokens=4096"), std::string::npos);
     EXPECT_NE(formatted.find("lfm2_shortconv@layer0"), std::string::npos);
