@@ -72,6 +72,99 @@ static void DenseCoreGemvQ8_0_4x8Q8_0Generic(int n, float* out, const void* pack
     }
 }
 
+struct DenseCoreQ8_0x4Block {
+    ggml_fp16_t d[4];
+    int8_t qs[QK8_0 * 4];
+};
+static_assert(sizeof(DenseCoreQ8_0x4Block) == 4 * sizeof(ggml_fp16_t) + QK8_0 * 4,
+              "Q8_0x4 block layout must match ggml repack layout");
+
+static bool DenseCoreQ8_0_4x8GemmM4FromF32(int n, float* out, size_t out_stride_floats, const void* packed_weight,
+                                           const float* input_rows, std::vector<DenseCoreQ8_0x4Block>& qtile,
+                                           int nc) {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    if (!out || !packed_weight || !input_rows || n <= 0 || (n % QK8_0) != 0 || (nc % 4) != 0) {
+        return false;
+    }
+    const int nb = n / QK8_0;
+    qtile.resize(static_cast<size_t>(nb));
+    for (int b = 0; b < nb; ++b) {
+        DenseCoreQ8_0x4Block& block = qtile[static_cast<size_t>(b)];
+        for (int row = 0; row < 4; ++row) {
+            const float* src = input_rows + static_cast<size_t>(row) * static_cast<size_t>(n) +
+                               static_cast<size_t>(b) * QK8_0;
+            float max_abs = 0.0f;
+            for (int i = 0; i < QK8_0; ++i) {
+                max_abs = std::max(max_abs, std::fabs(src[i]));
+            }
+            const float d = max_abs / 127.0f;
+            const float id = d != 0.0f ? 1.0f / d : 0.0f;
+            block.d[row] = ggml_fp32_to_fp16(d);
+            for (int i = 0; i < QK8_0; ++i) {
+                const int group = i / 8;
+                const int lane = i & 7;
+                const int q = std::clamp(static_cast<int>(std::nearbyint(src[i] * id)), -128, 127);
+                block.qs[group * 32 + row * 8 + lane] = static_cast<int8_t>(q);
+            }
+        }
+    }
+
+    const auto* b_ptr_base = static_cast<const DenseCoreQ8_0x4Block*>(packed_weight);
+    const DenseCoreQ8_0x4Block* a_ptr_base = qtile.data();
+    for (int x = 0; x < nc; x += 4) {
+        const DenseCoreQ8_0x4Block* b_ptr = b_ptr_base + static_cast<size_t>(x / 4) * static_cast<size_t>(nb);
+        const DenseCoreQ8_0x4Block* a_ptr = a_ptr_base;
+
+        float32x4_t acc_f32[4];
+        for (int i = 0; i < 4; ++i) {
+            acc_f32[i] = vdupq_n_f32(0);
+        }
+        for (int b = 0; b < nb; ++b) {
+            int32x4_t acc[4];
+            for (int i = 0; i < 4; ++i) {
+                acc[i] = vdupq_n_s32(0);
+            }
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                const int8x16_t a01 = vld1q_s8(a_ptr->qs + chunk * 32);
+                const int8x16_t a23 = vld1q_s8(a_ptr->qs + chunk * 32 + 16);
+                const int8x16_t b01 = vld1q_s8(b_ptr->qs + chunk * 32);
+                const int8x16_t b23 = vld1q_s8(b_ptr->qs + chunk * 32 + 16);
+                acc[0] = vmmlaq_s32(acc[0], a01, b01);
+                acc[1] = vmmlaq_s32(acc[1], a01, b23);
+                acc[2] = vmmlaq_s32(acc[2], a23, b01);
+                acc[3] = vmmlaq_s32(acc[3], a23, b23);
+            }
+
+            const int32x4_t row0 = vcombine_s32(vget_low_s32(acc[0]), vget_low_s32(acc[1]));
+            const int32x4_t row1 = vcombine_s32(vget_high_s32(acc[0]), vget_high_s32(acc[1]));
+            const int32x4_t row2 = vcombine_s32(vget_low_s32(acc[2]), vget_low_s32(acc[3]));
+            const int32x4_t row3 = vcombine_s32(vget_high_s32(acc[2]), vget_high_s32(acc[3]));
+            const float32x4_t a_d = vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(a_ptr->d)));
+            const float32x4_t b_d = vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(b_ptr->d)));
+            acc_f32[0] = vfmaq_f32(acc_f32[0], vcvtq_f32_s32(row0), vmulq_laneq_f32(b_d, a_d, 0));
+            acc_f32[1] = vfmaq_f32(acc_f32[1], vcvtq_f32_s32(row1), vmulq_laneq_f32(b_d, a_d, 1));
+            acc_f32[2] = vfmaq_f32(acc_f32[2], vcvtq_f32_s32(row2), vmulq_laneq_f32(b_d, a_d, 2));
+            acc_f32[3] = vfmaq_f32(acc_f32[3], vcvtq_f32_s32(row3), vmulq_laneq_f32(b_d, a_d, 3));
+            ++a_ptr;
+            ++b_ptr;
+        }
+        for (int row = 0; row < 4; ++row) {
+            vst1q_f32(out + static_cast<size_t>(row) * out_stride_floats + x, acc_f32[row]);
+        }
+    }
+    return true;
+#else
+    (void)n;
+    (void)out;
+    (void)out_stride_floats;
+    (void)packed_weight;
+    (void)input_rows;
+    (void)qtile;
+    (void)nc;
+    return false;
+#endif
+}
+
 static inline float DenseCoreQ8_0BlockDot(const block_q8_0* weight_blocks, const block_q8_0* input_blocks,
                                           int n) {
     if (!weight_blocks || !input_blocks || n <= 0 || (n % QK8_0) != 0) {
@@ -2375,12 +2468,58 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         if (q8_traits && q8_traits->from_float) {
             const size_t q8_row_size = ggml_row_size(GGML_TYPE_Q8_0, static_cast<int64_t>(N));
             const size_t q8_row_stride = densecore::AlignUp(q8_row_size, static_cast<size_t>(64));
+            const size_t q8_total_size = q8_row_stride * static_cast<size_t>(M);
+            const int64_t token_pos =
+                (callback_batch && callback_batch->num_seqs == 1 && !callback_batch->pos.empty())
+                    ? callback_batch->pos.front()
+                    : std::numeric_limits<int64_t>::min();
+            const bool can_share_q8_inputs =
+                callback_work_ctx && ud->quantized_stamp && ud->slot_id >= 0 && q8_total_size > 0;
+            const uint64_t q8_inputs_stamp =
+                can_share_q8_inputs
+                    ? ComputeGemvBatchedQuantStamp(callback_batch, M, ud->slot_id, src->data, weight_tensor->data)
+                    : 0;
+            const uint8_t* q8_input_base = nullptr;
+            bool used_shared_q8_inputs = false;
             thread_local std::vector<uint8_t> q8_inputs;
-            q8_inputs.resize(q8_row_stride * static_cast<size_t>(M));
-            for (int m = 0; m < M; ++m) {
-                q8_traits->from_float(x_rows[static_cast<size_t>(m)],
-                                      q8_inputs.data() + static_cast<size_t>(m) * q8_row_stride,
-                                      static_cast<int64_t>(N));
+            if (can_share_q8_inputs) {
+                if (ith == 0) {
+                    q8_input_base = GetOrFillBatchedQuantizedActivationCache(
+                        callback_work_ctx, src, src->data, x_rows, M, N, GGML_TYPE_Q8_0, q8_row_stride,
+                        q8_total_size, token_pos, q8_traits);
+                    if (q8_input_base) {
+                        ud->quantized_stamp->store(q8_inputs_stamp, std::memory_order_release);
+                        used_shared_q8_inputs = true;
+                    }
+                } else {
+                    int spin_count = 0;
+                    while (ud->quantized_stamp->load(std::memory_order_acquire) != q8_inputs_stamp) {
+                        if (spin_count >= 16384) {
+                            break;
+                        }
+                        SpinPause(spin_count++);
+                    }
+                    if (ud->quantized_stamp->load(std::memory_order_acquire) == q8_inputs_stamp &&
+                        callback_work_ctx->qact_generation == callback_work_ctx->execution_generation &&
+                        callback_work_ctx->qact_tensor == src && callback_work_ctx->qact_source == src->data &&
+                        callback_work_ctx->qact_len == static_cast<int64_t>(M) * static_cast<int64_t>(N) &&
+                        callback_work_ctx->qact_type == GGML_TYPE_Q8_0 &&
+                        callback_work_ctx->qact_bytes == q8_total_size && callback_work_ctx->qact_slot_id == -1 &&
+                        callback_work_ctx->qact_token_pos == token_pos &&
+                        callback_work_ctx->qact_buffer.size() == q8_total_size) {
+                        q8_input_base = callback_work_ctx->qact_buffer.data();
+                        used_shared_q8_inputs = true;
+                    }
+                }
+            }
+            if (!q8_input_base) {
+                q8_inputs.resize(q8_total_size);
+                for (int m = 0; m < M; ++m) {
+                    q8_traits->from_float(x_rows[static_cast<size_t>(m)],
+                                          q8_inputs.data() + static_cast<size_t>(m) * q8_row_stride,
+                                          static_cast<int64_t>(N));
+                }
+                q8_input_base = q8_inputs.data();
             }
 
             auto run_scalar_cols = [&](int m, int col_begin, int col_end) {
@@ -2388,7 +2527,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     return;
                 }
                 const auto* x_blocks = reinterpret_cast<const block_q8_0*>(
-                    q8_inputs.data() + static_cast<size_t>(m) * q8_row_stride);
+                    q8_input_base + static_cast<size_t>(m) * q8_row_stride);
                 for (int k = col_begin; k < col_end; ++k) {
                     const auto* w_blocks = reinterpret_cast<const block_q8_0*>(
                         weight_base + static_cast<size_t>(k) * weight_row_stride);
@@ -2400,10 +2539,53 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 auto packed = GetOrCreateQ8RepackedGemvWeight(weight_base, K, N, /*force_enable=*/true);
                 if (packed && packed->blocks_per_row > 0) {
                     const size_t q8_4x8_block_bytes = 4 * sizeof(ggml_fp16_t) + QK8_0 * 4;
+                    const size_t q8_0x4_row_group_bytes =
+                        static_cast<size_t>(N / QK8_0) * q8_4x8_block_bytes;
                     const int k_aligned_start = (k_start + 3) & ~3;
                     const int k_aligned_end = k_end & ~3;
-                    for (int m = 0; m < M; ++m) {
-                        const uint8_t* q_ptr = q8_inputs.data() + static_cast<size_t>(m) * q8_row_stride;
+                    const bool can_use_q8_gemm_m4 =
+                        input_col_stride == static_cast<size_t>(N) * sizeof(float) &&
+                        (output_col_stride % sizeof(float)) == 0 && (M >= 4);
+                    thread_local std::vector<DenseCoreQ8_0x4Block> q8_gemm_tile;
+                    if (can_use_q8_gemm_m4) {
+                        q8_gemm_tile.reserve(q8_0x4_row_group_bytes / sizeof(DenseCoreQ8_0x4Block));
+                    }
+                    int m = 0;
+                    for (; can_use_q8_gemm_m4 && m + 3 < M; m += 4) {
+                        for (int r = 0; r < 4; ++r) {
+                            run_scalar_cols(m + r, k_start, std::min(k_aligned_start, k_end));
+                        }
+                        if (k_aligned_start < k_aligned_end) {
+                            const size_t packed_offset =
+                                static_cast<size_t>(k_aligned_start / 4) *
+                                static_cast<size_t>(packed->blocks_per_row) * q8_4x8_block_bytes;
+                            float* out_group =
+                                reinterpret_cast<float*>(output_base + static_cast<size_t>(m) * output_col_stride) +
+                                k_aligned_start;
+                            const bool used_gemm_m4 = DenseCoreQ8_0_4x8GemmM4FromF32(
+                                N, out_group, output_col_stride / sizeof(float),
+                                packed->data.data() + packed_offset, x_rows[static_cast<size_t>(m)], q8_gemm_tile,
+                                k_aligned_end - k_aligned_start);
+                            if (!used_gemm_m4) {
+                                for (int r = 0; r < 4; ++r) {
+                                    const uint8_t* q_ptr =
+                                        q8_input_base + static_cast<size_t>(m + r) * q8_row_stride;
+                                    float* row_out_group =
+                                        reinterpret_cast<float*>(
+                                            output_base + static_cast<size_t>(m + r) * output_col_stride) +
+                                        k_aligned_start;
+                                    ggml_gemv_q8_0_4x8_q8_0(N, row_out_group, 0,
+                                                            packed->data.data() + packed_offset, q_ptr, 1,
+                                                            k_aligned_end - k_aligned_start);
+                                }
+                            }
+                        }
+                        for (int r = 0; r < 4; ++r) {
+                            run_scalar_cols(m + r, std::max(k_aligned_end, k_start), k_end);
+                        }
+                    }
+                    for (; m < M; ++m) {
+                        const uint8_t* q_ptr = q8_input_base + static_cast<size_t>(m) * q8_row_stride;
                         run_scalar_cols(m, k_start, std::min(k_aligned_start, k_end));
                         if (k_aligned_start < k_aligned_end) {
                             const size_t packed_offset =
@@ -2418,6 +2600,9 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         run_scalar_cols(m, std::max(k_aligned_end, k_start), k_end);
                     }
                     LogMatmulPathOnce("qwen36_ssm_q8_0_repacked_direct_batched");
+                    if (ith == 0) {
+                        RecordSharedQuantReuse(used_shared_q8_inputs);
+                    }
                     record_quant_profile(true, false);
                     return;
                 }
@@ -2429,6 +2614,9 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 }
             }
             LogMatmulPathOnce("qwen36_ssm_q8_0_direct_batched");
+            if (ith == 0) {
+                RecordSharedQuantReuse(used_shared_q8_inputs);
+            }
             record_quant_profile(true, false);
             return;
         }
@@ -5703,6 +5891,11 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
 	    const auto qwen_ggml_fallback = [&](densecore::runtime::GgmlComputeOp op, const char* reason) {
 	        InferenceWorkContext* work_ctx = dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext();
 	        RecordQwenTargetGgmlComputeFallback(work_ctx, model, op, reason, w_name, dispatch_phase);
+            if (matmul_plan.target_qwen_hot_path) {
+                throw densecore::InvalidArgumentException(
+                    std::string("Qwen target hot path cannot fall back to GGML matmul: ") +
+                    (reason ? reason : "unknown"));
+            }
 	        return ggml_mul_mat(ctx, weight, input);
 	    };
     densecore::runtime::KernelAdmissionDescriptor kleidiai_desc{};
@@ -5744,12 +5937,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         (is_hybrid_ssm_qkv || is_qwen35_hybrid_ssm_gate || is_qwen35_hybrid_ssm_out ||
          is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
         M > 1 && weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 && weight->ne[0] == input->ne[0] &&
-        (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled()
-#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
-        ;
-#else
-        && false;
-#endif
+        (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled();
     const bool qwen36_hybrid_ssm_q4k_prefill_relevant =
         (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) && M > 1 &&
         input->type == GGML_TYPE_F32;
@@ -5866,9 +6054,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     // Keep quantized large-M prefill for qkv, gate, and ssm_out on native GGML;
     // custom quant lanes for Qwen3.6 hybrid SSM have crashed the Go-server path.
     const bool force_plain_hybrid_ssm_prefill =
-        is_qwen35_hybrid_ssm_gate || is_qwen35_hybrid_ssm_out ||
-        (is_hybrid_ssm_qkv &&
-         (!model || model->variant != ModelVariant::QWEN36)) ||
+        (is_hybrid_ssm_qkv && !qwen_hybrid_ssm_quant_prefill_fast_path_eligible &&
+         (!model || (model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36))) ||
         is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out;
     const bool force_qwen36_hybrid_ssm_q4k_native_prefill =
         (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
@@ -5881,25 +6068,6 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         record_graph_matmul("ggml_mul_mat");
         return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
                                   "temporary_reference_hybrid_ssm_prefill_correctness");
-    }
-
-    // The wider qwen35 long-prefill graph is still unstable on C4A when the
-    // custom quantized projection lane is used outside the SSM blocks as well.
-    // Keep qwen35 quantized prefill projections on native GGML until the graph
-    // is fully stable end-to-end. Decode (M==1) remains on the faster path.
-    if (model && model->variant == ModelVariant::QWEN35 && ggml_is_quantized(weight->type) &&
-        input->type == GGML_TYPE_F32 && M > 1 &&
-#if defined(__aarch64__) || defined(_M_ARM64)
-        true
-#else
-        false
-#endif
-    ) {
-        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
-                          "qwen35_prefill_quant_correctness");
-        record_graph_matmul("ggml_mul_mat");
-        return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
-                                  "temporary_reference_qwen35_prefill_quant_correctness");
     }
 
     // LFM2 ARM prefill only admits Q4_K through the true-batched kernel below.
@@ -6053,11 +6221,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
          (qwen36_q4k_mode_probe && qwen36_q4k_admission.state != Qwen36Q4KBatchedAdmissionState::Reject));
     const bool qwen35_dense_prefill_prefers_ggml_quant =
         model && model->variant == ModelVariant::QWEN35 && model->hparams.n_experts <= 0 && input_cols > 1 &&
-#if defined(__aarch64__) || defined(_M_ARM64)
-        true;
-#else
         false;
-#endif
     const bool qwen36_prefill_prefers_ggml_quant =
         model && model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm && input_cols > 1 &&
         !is_qwen36_hybrid_ssm_q8_prefill &&

@@ -206,7 +206,8 @@ struct Gemma4PackedMoERoots {
 };
 
 struct Qwen35SharedQ8RowsUserData;
-static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_context* ctx, const ggml_tensor* src);
+static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_context* ctx, const ggml_tensor* src,
+                                                                      int64_t max_assignments = 0);
 
 ggml_tensor* GetLayerTensorAny(TransformerLayer* layer, std::initializer_list<const char*> keys) {
     if (!layer) {
@@ -1974,6 +1975,14 @@ ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
 
 constexpr int kQwen35SharedQ8MaxTasks = 128;
 constexpr int64_t kQwen35NativeMoEBatchedQ4KMaxAssignments = 256;
+constexpr int64_t kQwen35NativeMoEGateUpBatchTile = 8;
+
+struct Qwen35MoEAssignment {
+    int32_t expert = -1;
+    int32_t token = -1;
+    int32_t topk_index = -1;
+    float weight = 1.0f;
+};
 
 struct Qwen35SharedQ8RowsUserData {
     int64_t cols = 0;
@@ -1990,10 +1999,16 @@ struct Qwen35SharedQ8RowsUserData {
     bool weighted_logits_lfm2_sigmoid = false;
     bool weighted_logits_norm_topk = true;
     float weighted_logits_scale = 1.0f;
+    std::atomic<uint64_t> assignments_ready_epoch{0};
+    std::atomic<int> assignments_failed{0};
+    Qwen35MoEAssignment* assignments = nullptr;
+    size_t assignment_capacity = 0;
+    size_t assignment_count = 0;
     uint64_t task_epoch[kQwen35SharedQ8MaxTasks] = {};
 };
 
-static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_context* ctx, const ggml_tensor* src) {
+static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_context* ctx, const ggml_tensor* src,
+                                                                      int64_t max_assignments) {
     if (!ctx || !src || src->type != GGML_TYPE_F32 || src->ne[0] <= 0 || src->ne[1] <= 0 || src->ne[2] <= 0) {
         return nullptr;
     }
@@ -2003,10 +2018,15 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
         return nullptr;
     }
     const size_t rows_bytes = row_bytes * static_cast<size_t>(rows);
+    const size_t assignment_capacity =
+        max_assignments > 0 ? static_cast<size_t>(std::min<int64_t>(max_assignments, 4096 * 64)) : 0;
+    const size_t assignments_bytes = assignment_capacity * sizeof(Qwen35MoEAssignment);
     if (ggml_get_no_alloc(ctx)) {
         thread_local Qwen35SharedQ8RowsUserData dry_run_ud;
         thread_local std::vector<uint8_t> dry_run_rows;
+        thread_local std::vector<Qwen35MoEAssignment> dry_run_assignments;
         dry_run_rows.resize(rows_bytes);
+        dry_run_assignments.resize(assignment_capacity);
         dry_run_ud.cols = src->ne[0];
         dry_run_ud.ne1 = src->ne[1];
         dry_run_ud.ne2 = src->ne[2];
@@ -2021,11 +2041,19 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
         dry_run_ud.weighted_logits_lfm2_sigmoid = false;
         dry_run_ud.weighted_logits_norm_topk = true;
         dry_run_ud.weighted_logits_scale = 1.0f;
+        dry_run_ud.assignments_ready_epoch.store(0, std::memory_order_relaxed);
+        dry_run_ud.assignments_failed.store(0, std::memory_order_relaxed);
+        dry_run_ud.assignments = dry_run_assignments.empty() ? nullptr : dry_run_assignments.data();
+        dry_run_ud.assignment_capacity = dry_run_assignments.size();
+        dry_run_ud.assignment_count = 0;
         std::memset(dry_run_ud.task_epoch, 0, sizeof(dry_run_ud.task_epoch));
         return &dry_run_ud;
     }
     ggml_tensor* ud_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, sizeof(Qwen35SharedQ8RowsUserData));
     ggml_tensor* rows_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, static_cast<int64_t>(rows_bytes));
+    ggml_tensor* assignments_storage =
+        assignments_bytes > 0 ? ggml_new_tensor_1d(ctx, GGML_TYPE_I8, static_cast<int64_t>(assignments_bytes))
+                              : nullptr;
     if (!ud_storage || !ud_storage->data || !rows_storage || !rows_storage->data) {
         return nullptr;
     }
@@ -2040,6 +2068,13 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
     ud->weighted_logits_lfm2_sigmoid = false;
     ud->weighted_logits_norm_topk = true;
     ud->weighted_logits_scale = 1.0f;
+    ud->assignments_ready_epoch.store(0, std::memory_order_relaxed);
+    ud->assignments_failed.store(0, std::memory_order_relaxed);
+    if (assignments_storage && assignments_storage->data) {
+        ud->assignments = static_cast<Qwen35MoEAssignment*>(assignments_storage->data);
+        ud->assignment_capacity = assignment_capacity;
+    }
+    ud->assignment_count = 0;
     return ud;
 }
 
@@ -2136,13 +2171,6 @@ static void Qwen35NativeMoEZeroDst2DRange(ggml_tensor* dst, int64_t row_start, i
     }
 }
 
-struct Qwen35MoEAssignment {
-    int32_t expert = -1;
-    int32_t token = -1;
-    int32_t topk_index = -1;
-    float weight = 1.0f;
-};
-
 static bool Qwen35BuildMoEAssignments(const ggml_tensor* selected_experts, int64_t n_experts,
                                       std::vector<Qwen35MoEAssignment>* assignments) {
     if (!selected_experts || !selected_experts->data || selected_experts->type != GGML_TYPE_I32 ||
@@ -2175,6 +2203,76 @@ static bool Qwen35BuildMoEAssignments(const ggml_tensor* selected_experts, int64
         return a.topk_index < b.topk_index;
     });
     return !assignments->empty();
+}
+
+static bool Qwen35BuildMoEAssignmentsToBuffer(const ggml_tensor* selected_experts, int64_t n_experts,
+                                              Qwen35MoEAssignment* assignments, size_t assignment_capacity,
+                                              size_t* assignment_count_out) {
+    if (assignment_count_out) {
+        *assignment_count_out = 0;
+    }
+    if (!selected_experts || !selected_experts->data || selected_experts->type != GGML_TYPE_I32 ||
+        n_experts <= 0 || !assignments || assignment_capacity == 0 || !assignment_count_out) {
+        return false;
+    }
+    const int64_t top_k = selected_experts->ne[0];
+    const int64_t n_tokens = selected_experts->ne[1];
+    if (top_k <= 0 || n_tokens <= 0 ||
+        static_cast<uint64_t>(top_k) * static_cast<uint64_t>(n_tokens) > assignment_capacity) {
+        return false;
+    }
+    size_t count = 0;
+    const char* selected_base = static_cast<const char*>(selected_experts->data);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t k = 0; k < top_k; ++k) {
+            const int32_t expert = *reinterpret_cast<const int32_t*>(
+                selected_base + static_cast<size_t>(k) * static_cast<size_t>(selected_experts->nb[0]) +
+                static_cast<size_t>(token) * static_cast<size_t>(selected_experts->nb[1]));
+            if (expert < 0 || expert >= n_experts) {
+                continue;
+            }
+            assignments[count++] = {expert, static_cast<int32_t>(token), static_cast<int32_t>(k), 1.0f};
+        }
+    }
+    std::sort(assignments, assignments + count, [](const Qwen35MoEAssignment& a, const Qwen35MoEAssignment& b) {
+        if (a.expert != b.expert) return a.expert < b.expert;
+        if (a.token != b.token) return a.token < b.token;
+        return a.topk_index < b.topk_index;
+    });
+    *assignment_count_out = count;
+    return count > 0;
+}
+
+static const Qwen35MoEAssignment* PrepareQwen35SharedMoEAssignments(
+    Qwen35SharedQ8RowsUserData* ud, const ggml_tensor* selected_experts, int64_t n_experts, int ith,
+    size_t* assignment_count_out) {
+    if (assignment_count_out) {
+        *assignment_count_out = 0;
+    }
+    if (!ud || !selected_experts || ith < 0 || !assignment_count_out) {
+        return nullptr;
+    }
+    const uint64_t epoch = ud->epoch.load(std::memory_order_acquire);
+    if (epoch == 0) {
+        return nullptr;
+    }
+    if (ith == 0) {
+        size_t count = 0;
+        const bool ok = Qwen35BuildMoEAssignmentsToBuffer(selected_experts, n_experts, ud->assignments,
+                                                          ud->assignment_capacity, &count);
+        ud->assignment_count = ok ? count : 0;
+        ud->assignments_failed.store(ok ? 0 : 1, std::memory_order_relaxed);
+        ud->assignments_ready_epoch.store(epoch, std::memory_order_release);
+    } else {
+        while (ud->assignments_ready_epoch.load(std::memory_order_acquire) != epoch) {
+            std::this_thread::yield();
+        }
+    }
+    if (ud->assignments_failed.load(std::memory_order_acquire) != 0) {
+        return nullptr;
+    }
+    *assignment_count_out = ud->assignment_count;
+    return ud->assignments;
 }
 
 static const float* Qwen35NativeMoEDownHiddenRowPtr(const ggml_tensor* hidden, int64_t token, int64_t topk_index) {
@@ -2328,8 +2426,37 @@ static bool Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
     const char* expert_base = static_cast<const char*>(down_exps->data) +
                               static_cast<size_t>(expert) * static_cast<size_t>(down_exps->nb[2]);
 
-    const int64_t pair_start = (row_start + 1) / 2;
-    const int64_t pair_end = row_end / 2;
+    if (wtype == GGML_TYPE_Q4_K && row_start < row_end && (row_start % 8) == 0 && ((row_end - row_start) % 8) == 0) {
+        const int64_t row_count = row_end - row_start;
+        thread_local std::vector<float> projection_tile;
+        projection_tile.resize(tile_assignments.size() * static_cast<size_t>(row_count));
+        densecore::CpuBackend& backend = densecore::GetCpuBackend();
+        const void* weight_start = expert_base + static_cast<size_t>(row_start) * w_row_bytes;
+        const bool projected = densecore::RunMoEQ4KRawBatchedProjection(
+            &backend, weight_start, qtile, qrow_bytes, projection_tile.data(),
+            static_cast<int64_t>(tile_assignments.size()), row_count, K, /*numa_node=*/0, /*allow_parallel=*/false);
+        if (projected) {
+            for (size_t m = 0; m < tile_assignments.size(); ++m) {
+                const Qwen35MoEAssignment& assignment = tile_assignments[m];
+                if (assignment.weight == 0.0f) {
+                    continue;
+                }
+                char* dst_col = static_cast<char*>(dst->data) +
+                                static_cast<size_t>(assignment.token) * static_cast<size_t>(dst->nb[1]);
+                const float* src = projection_tile.data() + m * static_cast<size_t>(row_count);
+                for (int64_t row = 0; row < row_count; ++row) {
+                    *reinterpret_cast<float*>(dst_col + static_cast<size_t>(row_start + row) *
+                                                            static_cast<size_t>(dst->nb[0])) +=
+                        src[row] * assignment.weight;
+                }
+            }
+            return true;
+        }
+    }
+
+    const bool supports_row_pair = traits->nrows >= 2 || wtype == GGML_TYPE_Q5_K;
+    const int64_t pair_start = supports_row_pair ? (row_start + 1) / 2 : 0;
+    const int64_t pair_end = supports_row_pair ? (row_end / 2) : 0;
     if ((row_start & 1) != 0) {
         const int64_t row = row_start;
         const void* w_row = expert_base + static_cast<size_t>(row) * w_row_bytes;
@@ -2344,20 +2471,36 @@ static bool Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
                 sum * assignment.weight;
         }
     }
-    for (int64_t pair = pair_start; pair < pair_end; ++pair) {
-        const int64_t row = pair * 2;
-        const void* w_row = expert_base + static_cast<size_t>(row) * w_row_bytes;
-        for (size_t m = 0; m < tile_assignments.size(); ++m) {
-            const Qwen35MoEAssignment& assignment = tile_assignments[m];
-            const uint8_t* qrow = qtile + m * qrow_bytes;
-            float sums[4] = {};
-            traits->vec_dot(static_cast<int>(K), sums, 2, w_row, w_row_bytes, qrow, 0, 2);
-            char* dst_col = static_cast<char*>(dst->data) +
-                            static_cast<size_t>(assignment.token) * static_cast<size_t>(dst->nb[1]);
-            *reinterpret_cast<float*>(dst_col + static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0])) +=
-                sums[0] * assignment.weight;
-            *reinterpret_cast<float*>(dst_col + static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0])) +=
-                sums[1] * assignment.weight;
+    if (supports_row_pair) {
+        for (int64_t pair = pair_start; pair < pair_end; ++pair) {
+            const int64_t row = pair * 2;
+            const void* w_row = expert_base + static_cast<size_t>(row) * w_row_bytes;
+            for (size_t m = 0; m < tile_assignments.size(); ++m) {
+                const Qwen35MoEAssignment& assignment = tile_assignments[m];
+                const uint8_t* qrow = qtile + m * qrow_bytes;
+                float sums[4] = {};
+                traits->vec_dot(static_cast<int>(K), sums, 2, w_row, w_row_bytes, qrow, 0, 2);
+                char* dst_col = static_cast<char*>(dst->data) +
+                                static_cast<size_t>(assignment.token) * static_cast<size_t>(dst->nb[1]);
+                *reinterpret_cast<float*>(dst_col + static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0])) +=
+                    sums[0] * assignment.weight;
+                *reinterpret_cast<float*>(dst_col + static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0])) +=
+                    sums[1] * assignment.weight;
+            }
+        }
+    } else {
+        for (int64_t row = row_start; row < row_end; ++row) {
+            const void* w_row = expert_base + static_cast<size_t>(row) * w_row_bytes;
+            for (size_t m = 0; m < tile_assignments.size(); ++m) {
+                const Qwen35MoEAssignment& assignment = tile_assignments[m];
+                const uint8_t* qrow = qtile + m * qrow_bytes;
+                float sum = 0.0f;
+                traits->vec_dot(static_cast<int>(K), &sum, 0, w_row, 0, qrow, 0, 1);
+                char* dst_col = static_cast<char*>(dst->data) +
+                                static_cast<size_t>(assignment.token) * static_cast<size_t>(dst->nb[1]);
+                *reinterpret_cast<float*>(dst_col + static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0])) +=
+                    sum * assignment.weight;
+            }
         }
     }
     if ((row_end & 1) != 0 && row_end - 1 >= row_start) {
@@ -2578,7 +2721,19 @@ static void RunQwen35NativeMoEDownQ5KWeightedSumFastPath(ggml_tensor* dst, const
     thread_local std::vector<uint8_t> qbuf;
     thread_local std::vector<Qwen35MoEAssignment> assignments;
 
-    if (n_tokens > 4 && Qwen35BuildMoEAssignments(selected_experts, down_exps->ne[2], &assignments)) {
+    if (n_tokens > 4) {
+        size_t shared_assignment_count = 0;
+        const Qwen35MoEAssignment* shared_assignments =
+            use_shared_q8 ? PrepareQwen35SharedMoEAssignments(shared_q8, selected_experts, down_exps->ne[2], ith,
+                                                              &shared_assignment_count)
+                          : nullptr;
+        if (shared_assignments && shared_assignment_count > 0) {
+            assignments.assign(shared_assignments, shared_assignments + shared_assignment_count);
+        } else if (!Qwen35BuildMoEAssignments(selected_experts, down_exps->ne[2], &assignments)) {
+            assignments.clear();
+        }
+    }
+    if (n_tokens > 4 && !assignments.empty()) {
         for (Qwen35MoEAssignment& assignment : assignments) {
             const float* weight_ptr = Qwen35NativeMoEDownWeightPtr(weights, assignment.token, assignment.topk_index);
             assignment.weight = weight_ptr ? *weight_ptr : 0.0f;
@@ -2767,9 +2922,19 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
     thread_local std::vector<Qwen35MoEAssignment> assignments;
 
     const bool batched_qxk_down =
-        down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q5_K;
-    if (n_tokens > 4 && batched_qxk_down && use_shared_q8 &&
-        Qwen35BuildMoEAssignments(selected_experts, down_exps->ne[2], &assignments)) {
+        down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q5_K || down_exps->type == GGML_TYPE_Q6_K;
+    if (n_tokens > 4 && batched_qxk_down && use_shared_q8) {
+        size_t shared_assignment_count = 0;
+        const Qwen35MoEAssignment* shared_assignments =
+            PrepareQwen35SharedMoEAssignments(shared_q8, selected_experts, down_exps->ne[2], ith,
+                                              &shared_assignment_count);
+        if (shared_assignments && shared_assignment_count > 0) {
+            assignments.assign(shared_assignments, shared_assignments + shared_assignment_count);
+        } else if (!Qwen35BuildMoEAssignments(selected_experts, down_exps->ne[2], &assignments)) {
+            assignments.clear();
+        }
+    }
+    if (n_tokens > 4 && batched_qxk_down && use_shared_q8 && !assignments.empty()) {
         const int64_t row_start = (static_cast<int64_t>(ith) * n_embd) / nth;
         const int64_t row_end = (static_cast<int64_t>(ith + 1) * n_embd) / nth;
         if (row_start >= row_end) return;
@@ -3214,6 +3379,8 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
     const bool use_shared_q8 = PrepareQwen35SharedQ8Rows(shared_q8, input, ith, nth);
     thread_local std::vector<uint8_t> qbuf;
     thread_local std::vector<Qwen35MoEAssignment> assignments;
+    thread_local std::vector<uint8_t> gateup_qtile;
+    thread_local std::vector<float> gateup_tile_out;
     if (ith == 0 && shared_q8) {
         shared_q8->repacked_swiglu_failed.store(0, std::memory_order_relaxed);
     }
@@ -3249,16 +3416,25 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
         }
         return;
     }
-    if ((q4_gateup || q5_gateup) && n_tokens > 4 && use_shared_q8 &&
-        Qwen35BuildMoEAssignments(selected_experts, gate_exps->ne[2], &assignments)) {
+    size_t assignment_count = 0;
+    const Qwen35MoEAssignment* assignment_data = nullptr;
+    if ((q4_gateup || q5_gateup) && n_tokens > 4 && use_shared_q8) {
+        assignment_data = PrepareQwen35SharedMoEAssignments(shared_q8, selected_experts, gate_exps->ne[2], ith,
+                                                            &assignment_count);
+        if (!assignment_data && Qwen35BuildMoEAssignments(selected_experts, gate_exps->ne[2], &assignments)) {
+            assignment_data = assignments.data();
+            assignment_count = assignments.size();
+        }
+    }
+    if ((q4_gateup || q5_gateup) && n_tokens > 4 && use_shared_q8 && assignment_data && assignment_count > 0) {
         if (row_count <= 0) {
             return;
         }
         const size_t weight_row_bytes = ggml_row_size(gate_exps->type, gate_exps->ne[0]);
-        for (size_t group_start = 0; group_start < assignments.size();) {
-            const int32_t expert = assignments[group_start].expert;
+        for (size_t group_start = 0; group_start < assignment_count;) {
+            const int32_t expert = assignment_data[group_start].expert;
             size_t group_end = group_start + 1;
-            while (group_end < assignments.size() && assignments[group_end].expert == expert) {
+            while (group_end < assignment_count && assignment_data[group_end].expert == expert) {
                 ++group_end;
             }
             const char* gate_base = static_cast<const char*>(gate_exps->data) +
@@ -3267,8 +3443,55 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                                   static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]);
             const void* gate_row_start = gate_base + static_cast<size_t>(row_start) * weight_row_bytes;
             const void* up_row_start = up_base + static_cast<size_t>(row_start) * weight_row_bytes;
+            if (q4_gateup && row_count > 0 && group_end - group_start >= 2 && shared_q8 &&
+                shared_q8->row_bytes > 0) {
+                densecore::CpuBackend& backend = densecore::GetCpuBackend();
+                const size_t qrow_bytes = shared_q8->row_bytes;
+                gateup_qtile.resize(static_cast<size_t>(kQwen35NativeMoEGateUpBatchTile) * qrow_bytes);
+                gateup_tile_out.resize(static_cast<size_t>(kQwen35NativeMoEGateUpBatchTile) *
+                                       static_cast<size_t>(row_count));
+                for (size_t tile_start = group_start; tile_start < group_end;) {
+                    size_t tile_count = 0;
+                    while (tile_start < group_end && tile_count < static_cast<size_t>(kQwen35NativeMoEGateUpBatchTile)) {
+                        const Qwen35MoEAssignment& assignment = assignment_data[tile_start++];
+                        const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, assignment.token, 0);
+                        if (!qrow) {
+                            shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
+                            return;
+                        }
+                        std::memcpy(gateup_qtile.data() + tile_count * qrow_bytes, qrow, qrow_bytes);
+                        ++tile_count;
+                    }
+                    if (tile_count == 0) {
+                        continue;
+                    }
+                    const bool ok = densecore::RunMoEQ4KRawBatchedFusedSwiGLU(
+                        &backend, gate_row_start, up_row_start, gateup_qtile.data(), qrow_bytes,
+                        gateup_tile_out.data(), static_cast<int64_t>(tile_count), row_count, gate_exps->ne[0],
+                        /*numa_node=*/0, /*allow_parallel=*/false);
+                    if (!ok) {
+                        shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
+                        return;
+                    }
+                    const size_t emitted_start = tile_start - tile_count;
+                    for (size_t tm = 0; tm < tile_count; ++tm) {
+                        const Qwen35MoEAssignment& assignment = assignment_data[emitted_start + tm];
+                        float* out = reinterpret_cast<float*>(
+                            static_cast<char*>(dst->data) +
+                            static_cast<size_t>(row_start) * static_cast<size_t>(dst->nb[0]) +
+                            static_cast<size_t>(assignment.topk_index) * static_cast<size_t>(dst->nb[1]) +
+                            static_cast<size_t>(assignment.token) * static_cast<size_t>(dst->nb[2]));
+                        const float* src = gateup_tile_out.data() + tm * static_cast<size_t>(row_count);
+                        for (int64_t row = 0; row < row_count; ++row) {
+                            out[row] = src[row];
+                        }
+                    }
+                }
+                group_start = group_end;
+                continue;
+            }
             for (size_t ai = group_start; ai < group_end; ++ai) {
-                const Qwen35MoEAssignment& assignment = assignments[ai];
+                const Qwen35MoEAssignment& assignment = assignment_data[ai];
                 const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, assignment.token, 0);
                 if (!qrow) {
                     if (shared_q8) {
@@ -3602,7 +3825,8 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     ggml_tensor* hidden = nullptr;
     if (!lfm2_debug_reference &&
         CanUseQwen35NativeMoEGateUpRawQXKSwiGLU(model, raw_gate_exps, raw_up_exps, routed_input, selected_experts)) {
-        Qwen35SharedQ8RowsUserData* gateup_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, routed_input);
+        Qwen35SharedQ8RowsUserData* gateup_q8_ud =
+            AllocateQwen35SharedQ8RowsUserData(ctx, routed_input, n_expert_used * n_tokens);
         if (gateup_q8_ud) {
             // LFM2 decode stays on the validated raw Q4_K x Q8_K vecdot path.
             // The repacked W1/W3 probe was slower on C4A and produced invalid
@@ -3628,7 +3852,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     if (!lfm2_debug_reference &&
         CanFuseQwen35W2NormWeightsFromLogitsWithCustomCallback(model, fast_down_exps, hidden, selected_experts,
                                                                 gate_logits)) {
-        hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden);
+        hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden, selected_experts->ne[0] * selected_experts->ne[1]);
         if (hidden_q8_ud && lfm2_native_moe) {
             hidden_q8_ud->weighted_logits_lfm2_sigmoid = true;
             hidden_q8_ud->weighted_logits_norm_topk = model->moe_norm_topk_prob;
@@ -3689,7 +3913,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     if (!lfm2_debug_reference &&
         CanFuseQwen35W2WeightedSumWithCustomCallback(model, fast_down_exps, hidden, selected_experts, weights)) {
         if (!hidden_q8_ud) {
-            hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden);
+            hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden, selected_experts->ne[0] * selected_experts->ne[1]);
         }
         ggml_tensor* args[] = {fast_down_exps, hidden, selected_experts, weights};
         fused_out = ggml_custom_4d(ctx, GGML_TYPE_F32, fast_down_exps->ne[1], selected_experts->ne[1], 1, 1, args, 4,
@@ -3706,7 +3930,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     ggml_tensor* experts = nullptr;
     if (!lfm2_debug_reference && CanReplaceQwen35W2WithCustomCallback(model, fast_down_exps, hidden, selected_experts)) {
         if (!hidden_q8_ud) {
-            hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden);
+            hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden, selected_experts->ne[0] * selected_experts->ne[1]);
         }
         ggml_tensor* args[] = {fast_down_exps, hidden, selected_experts};
         experts = ggml_custom_4d(ctx, GGML_TYPE_F32, fast_down_exps->ne[1], selected_experts->ne[0],

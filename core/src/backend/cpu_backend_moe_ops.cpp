@@ -351,6 +351,7 @@ bool RunMoEKQuantRawBatchedProjectionImpl(CpuBackend* backend, ggml_type weight_
     const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
     std::atomic<bool> ok{true};
 
+    const bool use_pair_vecdot = std::max<int>(1, static_cast<int>(traits->nrows)) >= 2;
     const int64_t pair_count = N / 2;
     const auto compute_pair_range = [&](int pair_start, int pair_end) {
         for (int pair = pair_start; pair < pair_end; ++pair) {
@@ -369,13 +370,33 @@ bool RunMoEKQuantRawBatchedProjectionImpl(CpuBackend* backend, ggml_type weight_
         }
     };
 
-    if (pair_count > 0) {
+    if (use_pair_vecdot && pair_count > 0) {
         if (n_threads <= 1 || pair_count < 32) {
             compute_pair_range(0, static_cast<int>(pair_count));
         } else {
             pool.ParallelFor(static_cast<int>(pair_count),
                              [&](int pair_start, int pair_end, int) { compute_pair_range(pair_start, pair_end); });
         }
+    } else {
+        const auto compute_row_range = [&](int n_start, int n_end) {
+            for (int n = n_start; n < n_end; ++n) {
+                const void* row_ptr = static_cast<const char*>(weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+                for (int64_t m = 0; m < M; ++m) {
+                    const uint8_t* qrow = qinput_data + static_cast<size_t>(m) * qinput_row_bytes;
+                    traits->vec_dot(static_cast<int>(K),
+                                    out_data + static_cast<size_t>(m) * static_cast<size_t>(N) +
+                                        static_cast<size_t>(n),
+                                    0, row_ptr, 0, qrow, 0, 1);
+                }
+            }
+        };
+        if (n_threads <= 1 || N < 64) {
+            compute_row_range(0, static_cast<int>(N));
+        } else {
+            pool.ParallelFor(static_cast<int>(N),
+                             [&](int n_start, int n_end, int) { compute_row_range(n_start, n_end); });
+        }
+        return ok.load(std::memory_order_relaxed);
     }
     if ((N & 1) != 0) {
         const int64_t n = N - 1;
@@ -459,6 +480,7 @@ bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight
     const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
     std::atomic<bool> ok{true};
 
+    const bool use_pair_vecdot = std::max<int>(1, static_cast<int>(traits->nrows)) >= 2;
     const int64_t pair_count = N / 2;
     const auto compute_pair_range = [&](int pair_start, int pair_end) {
         for (int pair = pair_start; pair < pair_end; ++pair) {
@@ -484,13 +506,38 @@ bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight
         }
     };
 
-    if (pair_count > 0) {
+    if (use_pair_vecdot && pair_count > 0) {
         if (n_threads <= 1 || pair_count < 32) {
             compute_pair_range(0, static_cast<int>(pair_count));
         } else {
             pool.ParallelFor(static_cast<int>(pair_count),
                              [&](int pair_start, int pair_end, int) { compute_pair_range(pair_start, pair_end); });
         }
+    } else {
+        const auto compute_row_range = [&](int n_start, int n_end) {
+            for (int n = n_start; n < n_end; ++n) {
+                const void* gate_row =
+                    static_cast<const char*>(gate_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+                const void* up_row =
+                    static_cast<const char*>(up_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+                for (int64_t m = 0; m < M; ++m) {
+                    const uint8_t* qrow = qinput_data + static_cast<size_t>(m) * qinput_row_bytes;
+                    float gate_sum = 0.0f;
+                    float up_sum = 0.0f;
+                    traits->vec_dot(static_cast<int>(K), &gate_sum, 0, gate_row, 0, qrow, 0, 1);
+                    traits->vec_dot(static_cast<int>(K), &up_sum, 0, up_row, 0, qrow, 0, 1);
+                    out_data[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
+                        (gate_sum / (1.0f + internal::FastExp(-gate_sum))) * up_sum;
+                }
+            }
+        };
+        if (n_threads <= 1 || N < 64) {
+            compute_row_range(0, static_cast<int>(N));
+        } else {
+            pool.ParallelFor(static_cast<int>(N),
+                             [&](int n_start, int n_end, int) { compute_row_range(n_start, n_end); });
+        }
+        return ok.load(std::memory_order_relaxed);
     }
     if ((N & 1) != 0) {
         const int64_t n = N - 1;
