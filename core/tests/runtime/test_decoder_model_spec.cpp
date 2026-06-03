@@ -8,6 +8,7 @@
 
 #include "densecore/models/decoder_model_spec.h"
 #include "densecore/models/model_execution_contract.h"
+#include "densecore/models/model_graph_capabilities.h"
 
 namespace {
 
@@ -323,6 +324,14 @@ TEST(DecoderModelSpec, LFM2ShortConvMoEPrefillUsesLastTokenLogitsWithoutEnvGate)
 
     const std::string formatted = densecore::models::FormatDecoderModelSpec(spec);
     EXPECT_NE(formatted.find("prefill_logits=last_token_for_moe"), std::string::npos);
+
+    const auto capabilities = densecore::models::ResolveModelGraphCapabilities(&model);
+    EXPECT_TRUE(capabilities.has_lfm2_shortconv_mixer);
+    EXPECT_TRUE(capabilities.has_moe);
+    EXPECT_EQ(capabilities.decoder_runtime_topology, densecore::models::DecoderRuntimeTopology::DenseAttentionMoE);
+
+    const auto graph_resolution = densecore::models::ResolveGraphFamily(&model);
+    EXPECT_EQ(graph_resolution.preferred_family, densecore::models::GraphFamily::DecoderHybridSSM);
 }
 
 TEST(ModelExecutionContract, LFM2ShortConvDeclaresConvOrdinalsAndRebindContract) {

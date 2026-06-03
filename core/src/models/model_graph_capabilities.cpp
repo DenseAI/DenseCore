@@ -68,7 +68,7 @@ DecoderRuntimeTopology InferDecoderRuntimeTopologyFromCapabilities(const ModelGr
         return capabilities.has_moe ? DecoderRuntimeTopology::SlidingSharedKVMoE
                                     : DecoderRuntimeTopology::SlidingSharedKV;
     }
-    if (capabilities.has_hybrid_ssm_mixer) {
+    if (capabilities.has_hybrid_ssm_mixer || capabilities.has_lfm2_shortconv_mixer) {
         return capabilities.has_moe ? DecoderRuntimeTopology::HybridSSMMoE : DecoderRuntimeTopology::HybridSSM;
     }
     if (capabilities.has_moe) {
@@ -183,6 +183,7 @@ ModelGraphCapabilities ResolveModelGraphCapabilities(const TransformerModel* mod
     effective_flags.requires_q_norm = effective_flags.requires_q_norm || model->arch_flags.requires_q_norm;
     effective_flags.requires_k_norm = effective_flags.requires_k_norm || model->arch_flags.requires_k_norm;
     effective_flags.is_gemma4 = effective_flags.is_gemma4 || model->arch_flags.is_gemma4;
+    effective_flags.is_lfm2_shortconv = effective_flags.is_lfm2_shortconv || model->arch_flags.is_lfm2_shortconv;
     std::shared_ptr<const DecoderModelSpec> scratch_spec;
     const DecoderModelSpec* decoder_spec = GetDecoderModelSpec(model);
     if (!decoder_spec) {
@@ -215,6 +216,8 @@ ModelGraphCapabilities ResolveModelGraphCapabilities(const TransformerModel* mod
         decoder_spec && (decoder_spec->has_shared_kv || AnyLayerSpec(decoder_spec, LayerReadsSharedKv));
     capabilities.has_hybrid_ssm_mixer =
         decoder_spec && (decoder_spec->has_hybrid_ssm_mixer || AnyLayerSpec(decoder_spec, LayerUsesHybridSsm));
+    capabilities.has_lfm2_shortconv_mixer =
+        capabilities.topology == GraphTopology::DECODER_ONLY && effective_flags.is_lfm2_shortconv;
     capabilities.has_moe = decoder_spec && (decoder_spec->has_moe || AnyLayerSpec(decoder_spec, LayerUsesMoe));
     capabilities.requires_q_norm = AnyLayerSpec(decoder_spec, LayerRequiresQNorm) ||
                                    (decoder_spec && decoder_spec->layers.empty() && effective_flags.requires_q_norm);
@@ -286,9 +289,9 @@ GraphFamilyResolution ResolveGraphFamily(const TransformerModel* model) {
     }
 
     const DecoderRuntimeTopology decoder_topology =
-        capabilities.decoder_runtime_topology != DecoderRuntimeTopology::Unknown
-            ? capabilities.decoder_runtime_topology
-            : InferDecoderRuntimeTopologyFromCapabilities(capabilities);
+        capabilities.has_lfm2_shortconv_mixer || capabilities.decoder_runtime_topology == DecoderRuntimeTopology::Unknown
+            ? InferDecoderRuntimeTopologyFromCapabilities(capabilities)
+            : capabilities.decoder_runtime_topology;
     switch (decoder_topology) {
     case DecoderRuntimeTopology::HybridSSM:
     case DecoderRuntimeTopology::HybridSSMMoE:
@@ -308,7 +311,7 @@ GraphFamilyResolution ResolveGraphFamily(const TransformerModel* model) {
     default: break;
     }
 
-    if (capabilities.has_hybrid_ssm_mixer) {
+    if (capabilities.has_hybrid_ssm_mixer || capabilities.has_lfm2_shortconv_mixer) {
         resolution.preferred_family = GraphFamily::DecoderHybridSSM;
         resolution.fallback_chain = {GraphFamily::DecoderDenseAttention};
         resolution.fail_closed = true;
@@ -345,6 +348,8 @@ GraphAdmissionResult AdmitGraphBuilder(const GraphFamilyResolution& resolution, 
                   "requires shared-KV source semantics", &reasons);
         AddReason(capabilities.has_hybrid_ssm_mixer && !support.supports_hybrid_ssm_mixer,
                   "requires hybrid SSM mixer semantics", &reasons);
+        AddReason(capabilities.has_lfm2_shortconv_mixer && !support.supports_lfm2_shortconv_mixer,
+                  "requires LFM2 short-conv mixer semantics", &reasons);
         AddReason(capabilities.has_moe && !support.supports_moe, "requires MoE routing semantics", &reasons);
         AddReason(capabilities.requires_q_norm && !support.supports_q_norm, "requires Q norm before attention",
                   &reasons);
@@ -428,6 +433,7 @@ std::string FormatModelGraphCapabilities(const ModelGraphCapabilities& capabilit
         << ", sliding_window=" << (capabilities.has_sliding_window_attention ? "true" : "false")
         << ", shared_kv=" << (capabilities.has_shared_kv_source ? "true" : "false")
         << ", hybrid_ssm=" << (capabilities.has_hybrid_ssm_mixer ? "true" : "false")
+        << ", lfm2_shortconv=" << (capabilities.has_lfm2_shortconv_mixer ? "true" : "false")
         << ", moe=" << (capabilities.has_moe ? "true" : "false")
         << ", q_norm=" << (capabilities.requires_q_norm ? "true" : "false")
         << ", k_norm=" << (capabilities.requires_k_norm ? "true" : "false")

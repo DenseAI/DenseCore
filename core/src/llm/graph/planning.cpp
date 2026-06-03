@@ -13,6 +13,7 @@ densecore::models::GraphBuilderSupport MakeDenseCoreInlineGraphSupport() {
     support.supports_sliding_window_attention = true;
     support.supports_shared_kv_source = true;
     support.supports_hybrid_ssm_mixer = true;
+    support.supports_lfm2_shortconv_mixer = true;
     support.supports_moe = true;
     support.supports_q_norm = true;
     support.supports_k_norm = true;

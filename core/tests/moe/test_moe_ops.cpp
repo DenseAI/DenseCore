@@ -142,7 +142,7 @@ TEST_F(MoEOpsTest, Q4KRawBatchedFusedSwiGLUMatchesScalarVecDot) {
 TEST_F(MoEOpsTest, Q4KRawBatchedProjectionSupportsWeightedScatter) {
     constexpr int64_t M = 5;
     constexpr int64_t K = 256;
-    constexpr int64_t N = 23;
+    constexpr int64_t N = 96;
     constexpr int64_t Tokens = 3;
 
     const std::vector<float> weight_f32 = MakePatternedFloats(N, K, 0.019f);
@@ -157,7 +157,7 @@ TEST_F(MoEOpsTest, Q4KRawBatchedProjectionSupportsWeightedScatter) {
     CpuBackend& backend = GetCpuBackend();
     ASSERT_TRUE(RunMoEQ4KRawBatchedProjection(&backend, qweight.data(), qinput.data(),
                                              ggml_row_size(GGML_TYPE_Q8_K, K), projected.data(), M, N, K,
-                                             /*numa_node=*/0, /*allow_parallel=*/false));
+                                             /*numa_node=*/0, /*allow_parallel=*/true));
 
     const int token_for_m[M] = {0, 1, 1, 2, 0};
     const float route_weight[M] = {0.75f, 0.2f, 0.55f, 1.0f, 0.125f};

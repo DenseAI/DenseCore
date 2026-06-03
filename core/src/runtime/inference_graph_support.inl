@@ -2273,10 +2273,12 @@ static bool Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(const ggml_tensor*
                Qwen35NativeMoEDownQ8_0DotRowForExpertWithHidden(down_exps, expert, row + 1, hidden_row, out1);
     }
     if (!qbuf) return false;
-    if (down_exps->type == GGML_TYPE_Q4_K && CanUseGgmlQ4KVecDotRowPairForNativeMoE()) {
-        const ggml_type_traits_cpu* traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
+    if ((down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q5_K ||
+         down_exps->type == GGML_TYPE_Q6_K) &&
+        CanUseGgmlQ4KVecDotRowPairForNativeMoE()) {
+        const ggml_type_traits_cpu* traits = ggml_get_type_traits_cpu(down_exps->type);
         if (traits && traits->vec_dot && traits->vec_dot_type == GGML_TYPE_Q8_K &&
-            (down_exps->ne[0] % ggml_blck_size(GGML_TYPE_Q4_K)) == 0) {
+            (down_exps->ne[0] % ggml_blck_size(down_exps->type)) == 0) {
             const char* weight_row = static_cast<const char*>(down_exps->data) +
                                      static_cast<size_t>(expert) * static_cast<size_t>(down_exps->nb[2]) +
                                      static_cast<size_t>(row) * static_cast<size_t>(down_exps->nb[1]);
@@ -2745,7 +2747,7 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
                                         static_cast<size_t>(expert) * static_cast<size_t>(down_exps->nb[2]);
                 if (!densecore::RunMoEQ4KRawBatchedProjection(&backend, down_base, qtile.data(), qrow_bytes,
                                                               out_tile.data(), tile_m, n_embd, down_exps->ne[0],
-                                                              /*numa_node=*/0, /*allow_parallel=*/false)) {
+                                                              /*numa_node=*/0, /*allow_parallel=*/true)) {
                     return;
                 }
                 for (int64_t m = 0; m < tile_m; ++m) {
@@ -3186,20 +3188,24 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
     }
     if (q4_gateup && n_tokens > 4 && use_shared_q8 &&
         Qwen35BuildMoEAssignments(selected_experts, gate_exps->ne[2], &assignments)) {
-        if (ith != 0) {
-            return;
-        }
         const size_t qrow_bytes = shared_q8->row_bytes;
         thread_local std::vector<uint8_t> qtile;
         thread_local std::vector<float> out_tile;
         qtile.resize(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments) * qrow_bytes);
         out_tile.resize(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments) * static_cast<size_t>(n_ff));
         densecore::CpuBackend& backend = densecore::GetCpuBackend();
+        size_t group_ordinal = 0;
         for (size_t group_start = 0; group_start < assignments.size();) {
             const int32_t expert = assignments[group_start].expert;
             size_t group_end = group_start + 1;
             while (group_end < assignments.size() && assignments[group_end].expert == expert) {
                 ++group_end;
+            }
+            const bool owns_group = (group_ordinal % static_cast<size_t>(nth)) == static_cast<size_t>(ith);
+            ++group_ordinal;
+            if (!owns_group) {
+                group_start = group_end;
+                continue;
             }
             const char* gate_base = static_cast<const char*>(gate_exps->data) +
                                     static_cast<size_t>(expert) * static_cast<size_t>(gate_exps->nb[2]);

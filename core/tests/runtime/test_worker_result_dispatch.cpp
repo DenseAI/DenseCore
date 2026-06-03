@@ -364,6 +364,9 @@ TEST(WorkerResultDispatchTest, LFM2DecodeSummaryIncludesDedicatedFastPathAliases
     EXPECT_NE(captured.find("lfm2_w2_q4k_repacked_used_ops=3"), std::string::npos);
     EXPECT_NE(captured.find("lfm2_shortconv_sequence_fast_used_ops=4"), std::string::npos);
     EXPECT_NE(captured.find("lfm2_decode_graph_rebuilds=1"), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_has_lfm2_shortconv=1"), std::string::npos);
+    EXPECT_NE(captured.find("graph_plan_route=inline_hybrid_ssm"), std::string::npos);
+    EXPECT_NE(captured.find("graph_plan_family=DecoderHybridSSM"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_ok=1"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_failure_reason=none"), std::string::npos);

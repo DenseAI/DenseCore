@@ -50,6 +50,7 @@ struct ModelGraphCapabilities {
     bool has_sliding_window_attention = false;
     bool has_shared_kv_source = false;
     bool has_hybrid_ssm_mixer = false;
+    bool has_lfm2_shortconv_mixer = false;
     bool has_moe = false;
     bool requires_q_norm = false;
     bool requires_k_norm = false;
@@ -81,6 +82,7 @@ struct GraphBuilderSupport {
     bool supports_sliding_window_attention = false;
     bool supports_shared_kv_source = false;
     bool supports_hybrid_ssm_mixer = false;
+    bool supports_lfm2_shortconv_mixer = false;
     bool supports_moe = false;
     bool supports_q_norm = false;
     bool supports_k_norm = false;
