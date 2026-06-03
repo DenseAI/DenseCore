@@ -589,9 +589,14 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // 1. qkv_mixed projection: normed input [n_embd, N] → [conv_channels, N]
 #if defined(__aarch64__) || defined(_M_ARM64)
+            const bool qwen36_hybrid_ssm_q8_prefill_projection_set =
+                model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm && N > 1 &&
+                attn_qkv->type == GGML_TYPE_Q8_0 && attn_gate_w->type == GGML_TYPE_Q8_0 &&
+                ssm_out_w->type == GGML_TYPE_Q8_0;
             const bool prefer_plain_qwen35_hybrid_matmul =
-                (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
-                model->arch_flags.is_hybrid_ssm;
+                model->arch_flags.is_hybrid_ssm &&
+                (model->variant == ModelVariant::QWEN35 ||
+                 (model->variant == ModelVariant::QWEN36 && !qwen36_hybrid_ssm_q8_prefill_projection_set));
 #else
             const bool prefer_plain_qwen35_hybrid_matmul = false;
 #endif

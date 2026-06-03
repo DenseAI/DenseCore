@@ -1571,6 +1571,186 @@ TEST(Qwen35SSMQkvProjection, Qwen36PrefillRouterF32UsesDenseCoreBatchedPathForLa
     EXPECT_EQ(snapshot.qwen_target_ggml_compute_ops, 0u);
 }
 
+TEST(Qwen35SSMQkvProjection, Qwen36SSMQ8PrefillUsesDenseCoreBatchedPath) {
+    struct ggml_init_params params = {
+        .mem_size = 1024 * 1024 * 64,
+        .mem_buffer = nullptr,
+        .no_alloc = false,
+    };
+    struct ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    InferenceWorkContext* work_ctx = CreateInferenceWorkContext();
+    ASSERT_NE(work_ctx, nullptr);
+    SetCurrentWorkContext(work_ctx);
+    struct Guard {
+        InferenceWorkContext* work_ctx;
+        struct ggml_context* ctx;
+        ~Guard() {
+            SetCurrentWorkContext(nullptr);
+            DestroyInferenceWorkContext(work_ctx);
+            ggml_free(ctx);
+        }
+    } guard{work_ctx, ctx};
+
+    TransformerModel model;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+
+    constexpr int input_dim = QK8_0 * 4;
+    constexpr int output_dim = 128;
+    constexpr int tokens = 16;
+
+    ggml_tensor* weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, input_dim, output_dim);
+    ASSERT_NE(weight, nullptr);
+    ggml_set_name(weight, "blk.0.attn_qkv.weight");
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input_dim, tokens);
+    ASSERT_NE(input, nullptr);
+
+    std::vector<float> weight_f32(static_cast<size_t>(output_dim) * input_dim);
+    for (int row = 0; row < output_dim; ++row) {
+        for (int col = 0; col < input_dim; ++col) {
+            weight_f32[static_cast<size_t>(row) * input_dim + col] =
+                std::sin(static_cast<float>(row * 17 + col) * 0.017f) * 0.25f;
+        }
+    }
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+    ASSERT_NE(q8_traits, nullptr);
+    ASSERT_NE(q8_traits->from_float, nullptr);
+    const size_t weight_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, input_dim);
+    for (int row = 0; row < output_dim; ++row) {
+        q8_traits->from_float(weight_f32.data() + static_cast<size_t>(row) * input_dim,
+                              reinterpret_cast<uint8_t*>(weight->data) + static_cast<size_t>(row) * weight_row_bytes,
+                              input_dim);
+    }
+
+    auto* input_f32 = reinterpret_cast<float*>(input->data);
+    for (int token = 0; token < tokens; ++token) {
+        for (int col = 0; col < input_dim; ++col) {
+            input_f32[static_cast<size_t>(token) * input_dim + col] =
+                std::cos(static_cast<float>(token * 31 + col) * 0.013f) * 0.5f;
+        }
+    }
+
+    ggml_tensor* result = densecore::testing::SmartMulMatTest(ctx, weight, input, &model);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->op, GGML_OP_CUSTOM);
+    EXPECT_TRUE(ResultReferencesTensor(result, weight));
+    EXPECT_EQ(result->ne[0], output_dim);
+    EXPECT_EQ(result->ne[1], tokens);
+
+    struct ggml_cgraph* graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+    ggml_graph_compute_with_ctx(ctx, graph, 4);
+
+    const auto* out = reinterpret_cast<const float*>(result->data);
+    for (int token = 0; token < tokens; ++token) {
+        for (int row = 0; row < output_dim; ++row) {
+            float ref = 0.0f;
+            for (int col = 0; col < input_dim; ++col) {
+                ref += input_f32[static_cast<size_t>(token) * input_dim + col] *
+                       weight_f32[static_cast<size_t>(row) * input_dim + col];
+            }
+            EXPECT_NEAR(out[static_cast<size_t>(token) * output_dim + row], ref, 7e-2f)
+                << "token=" << token << " row=" << row;
+        }
+    }
+
+    const auto snapshot = GetQwen36ProfileSnapshot(work_ctx);
+    EXPECT_EQ(snapshot.qwen_target_ggml_compute_ops, 0u);
+}
+
+TEST(Qwen35SSMQkvProjection, Qwen36SSMQ8PrefillActualQkvShapeComputesDenseCorePath) {
+    struct ggml_init_params params = {
+        .mem_size = 1024 * 1024 * 128,
+        .mem_buffer = nullptr,
+        .no_alloc = false,
+    };
+    struct ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    InferenceWorkContext* work_ctx = CreateInferenceWorkContext();
+    ASSERT_NE(work_ctx, nullptr);
+    SetCurrentWorkContext(work_ctx);
+    struct Guard {
+        InferenceWorkContext* work_ctx;
+        struct ggml_context* ctx;
+        ~Guard() {
+            SetCurrentWorkContext(nullptr);
+            DestroyInferenceWorkContext(work_ctx);
+            ggml_free(ctx);
+        }
+    } guard{work_ctx, ctx};
+
+    TransformerModel model;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+
+    constexpr int input_dim = 2048;
+    constexpr int output_dim = 8192;
+    constexpr int tokens = 19;
+
+    ggml_tensor* weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, input_dim, output_dim);
+    ASSERT_NE(weight, nullptr);
+    ggml_set_name(weight, "blk.0.attn_qkv.weight");
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input_dim, tokens);
+    ASSERT_NE(input, nullptr);
+
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+    ASSERT_NE(q8_traits, nullptr);
+    ASSERT_NE(q8_traits->from_float, nullptr);
+    const size_t weight_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, input_dim);
+    std::vector<float> row_f32(input_dim);
+    auto weight_value = [](int row, int col) {
+        return std::sin(static_cast<float>(row * 13 + col * 7) * 0.0031f) * 0.18f;
+    };
+    for (int row = 0; row < output_dim; ++row) {
+        for (int col = 0; col < input_dim; ++col) {
+            row_f32[static_cast<size_t>(col)] = weight_value(row, col);
+        }
+        q8_traits->from_float(row_f32.data(),
+                              reinterpret_cast<uint8_t*>(weight->data) + static_cast<size_t>(row) * weight_row_bytes,
+                              input_dim);
+    }
+
+    auto* input_f32 = reinterpret_cast<float*>(input->data);
+    auto input_value = [](int token, int col) {
+        return std::cos(static_cast<float>(token * 17 + col * 5) * 0.0047f) * 0.42f;
+    };
+    for (int token = 0; token < tokens; ++token) {
+        for (int col = 0; col < input_dim; ++col) {
+            input_f32[static_cast<size_t>(token) * input_dim + col] = input_value(token, col);
+        }
+    }
+
+    ggml_tensor* result = densecore::testing::SmartMulMatTest(ctx, weight, input, &model);
+    ASSERT_NE(result, nullptr);
+    ASSERT_EQ(result->op, GGML_OP_CUSTOM);
+    EXPECT_TRUE(ResultReferencesTensor(result, weight));
+    EXPECT_EQ(result->ne[0], output_dim);
+    EXPECT_EQ(result->ne[1], tokens);
+
+    struct ggml_cgraph* graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+    ggml_graph_compute_with_ctx(ctx, graph, 8);
+
+    const auto* out = reinterpret_cast<const float*>(result->data);
+    const std::array<int, 8> sample_rows = {0, 1, 127, 1024, 2047, 4096, 6143, 8191};
+    for (int token = 0; token < tokens; ++token) {
+        for (int row : sample_rows) {
+            float ref = 0.0f;
+            for (int col = 0; col < input_dim; ++col) {
+                ref += input_value(token, col) * weight_value(row, col);
+            }
+            EXPECT_NEAR(out[static_cast<size_t>(token) * output_dim + row], ref, 1.2e-1f)
+                << "token=" << token << " row=" << row;
+        }
+    }
+
+    const auto snapshot = GetQwen36ProfileSnapshot(work_ctx);
+    EXPECT_EQ(snapshot.qwen_target_ggml_compute_ops, 0u);
+}
+
 TEST(Qwen35SSMQkvProjection, Qwen36LmHeadLargeBatchQ40RejectsNativeGgmlFallback) {
     struct ggml_init_params params = {
         .mem_size = 1024 * 1024 * 128,

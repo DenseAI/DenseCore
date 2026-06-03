@@ -95,6 +95,9 @@ bool RunQ4KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* 
 bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
                                    size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
                                    int numa_node, bool allow_parallel);
+bool RunMoEKQuantRawBatchedProjection(CpuBackend* backend, int ggml_type_id, const void* weight_ptr,
+                                      const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data,
+                                      int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel);
 bool RunMoEQ4KRawBatchedFusedSwiGLU(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
                                     const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
                                     int64_t N, int64_t K, int numa_node, bool allow_parallel);

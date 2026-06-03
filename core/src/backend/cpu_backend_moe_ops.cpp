@@ -330,6 +330,66 @@ bool RunMoEQ4KRawBatchedProjectionImpl(CpuBackend* backend, const void* weight_p
     return ok.load(std::memory_order_relaxed);
 }
 
+bool RunMoEKQuantRawBatchedProjectionImpl(CpuBackend* backend, ggml_type weight_type, const void* weight_ptr,
+                                          const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data,
+                                          int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel) {
+    if (!backend || !weight_ptr || !qinput_data || !out_data || M <= 0 ||
+        M > kMoEQuantizedProjectionMaxBatch || N <= 0 || K <= 0 || !ggml_is_quantized(weight_type)) {
+        return false;
+    }
+    const auto* traits = ggml_get_type_traits_cpu(weight_type);
+    if (!traits || !traits->vec_dot || traits->vec_dot_type != GGML_TYPE_Q8_K ||
+        K % ggml_blck_size(weight_type) != 0) {
+        return false;
+    }
+    if (qinput_row_bytes < ggml_row_size(GGML_TYPE_Q8_K, K)) {
+        return false;
+    }
+
+    const size_t weight_row_bytes = ggml_row_size(weight_type, K);
+    auto& pool = backend->GetThreadPool(numa_node);
+    const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
+    std::atomic<bool> ok{true};
+
+    const int64_t pair_count = N / 2;
+    const auto compute_pair_range = [&](int pair_start, int pair_end) {
+        for (int pair = pair_start; pair < pair_end; ++pair) {
+            if (!ok.load(std::memory_order_relaxed)) {
+                return;
+            }
+            const int64_t n = static_cast<int64_t>(pair) * 2;
+            const void* row_ptr = static_cast<const char*>(weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+            for (int64_t m = 0; m < M; ++m) {
+                const uint8_t* qrow = qinput_data + static_cast<size_t>(m) * qinput_row_bytes;
+                float sums[4] = {};
+                traits->vec_dot(static_cast<int>(K), sums, 2, row_ptr, weight_row_bytes, qrow, 0, 2);
+                out_data[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = sums[0];
+                out_data[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n + 1)] = sums[1];
+            }
+        }
+    };
+
+    if (pair_count > 0) {
+        if (n_threads <= 1 || pair_count < 32) {
+            compute_pair_range(0, static_cast<int>(pair_count));
+        } else {
+            pool.ParallelFor(static_cast<int>(pair_count),
+                             [&](int pair_start, int pair_end, int) { compute_pair_range(pair_start, pair_end); });
+        }
+    }
+    if ((N & 1) != 0) {
+        const int64_t n = N - 1;
+        const void* row_ptr = static_cast<const char*>(weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+        for (int64_t m = 0; m < M; ++m) {
+            const uint8_t* qrow = qinput_data + static_cast<size_t>(m) * qinput_row_bytes;
+            float sum = 0.0f;
+            traits->vec_dot(static_cast<int>(K), &sum, 0, row_ptr, 0, qrow, 0, 1);
+            out_data[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = sum;
+        }
+    }
+    return ok.load(std::memory_order_relaxed);
+}
+
 bool RunMoEQ4KRawBatchedFusedSwiGLUImpl(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
                                         const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data,
                                         int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel) {
@@ -397,9 +457,9 @@ bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight
     const size_t weight_row_bytes = ggml_row_size(weight_type, K);
     auto& pool = backend->GetThreadPool(numa_node);
     const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
-    const int64_t pair_count = N / 2;
     std::atomic<bool> ok{true};
 
+    const int64_t pair_count = N / 2;
     const auto compute_pair_range = [&](int pair_start, int pair_end) {
         for (int pair = pair_start; pair < pair_end; ++pair) {
             if (!ok.load(std::memory_order_relaxed)) {
@@ -414,8 +474,8 @@ bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight
                 const uint8_t* qrow = qinput_data + static_cast<size_t>(m) * qinput_row_bytes;
                 float gate_sums[32] = {};
                 float up_sums[32] = {};
-                traits->vec_dot(static_cast<int>(K), gate_sums, 16, gate_row, weight_row_bytes, qrow, 0, 2);
-                traits->vec_dot(static_cast<int>(K), up_sums, 16, up_row, weight_row_bytes, qrow, 0, 2);
+                traits->vec_dot(static_cast<int>(K), gate_sums, 2, gate_row, weight_row_bytes, qrow, 0, 2);
+                traits->vec_dot(static_cast<int>(K), up_sums, 2, up_row, weight_row_bytes, qrow, 0, 2);
                 out_data[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
                     (gate_sums[0] / (1.0f + internal::FastExp(-gate_sums[0]))) * up_sums[0];
                 out_data[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n + 1)] =
@@ -2482,7 +2542,7 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                     const int64_t n = static_cast<int64_t>(pair) * 2;
                     const void* w_row = w_data + static_cast<size_t>(n) * w_row_bytes;
                     float sums[32] = {};
-                    type_traits_cpu->vec_dot(static_cast<int>(K), sums, 16, w_row, w_row_bytes, qi, 0, 2);
+                    type_traits_cpu->vec_dot(static_cast<int>(K), sums, 2, w_row, w_row_bytes, qi, 0, 2);
                     out_row[n] = sums[0];
                     out_row[n + 1] = sums[1];
                 }
@@ -2525,7 +2585,7 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                     const int64_t n = static_cast<int64_t>(pair) * 2;
                     const void* w_row = w_data + static_cast<size_t>(n) * w_row_bytes;
                     float sums[32] = {};
-                    type_traits_cpu->vec_dot(static_cast<int>(K), sums, 16, w_row, w_row_bytes, qi, 0, 2);
+                    type_traits_cpu->vec_dot(static_cast<int>(K), sums, 2, w_row, w_row_bytes, qi, 0, 2);
                     out_row[n] = sums[0];
                     out_row[n + 1] = sums[1];
                 }
@@ -2592,7 +2652,7 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                     const int64_t n = static_cast<int64_t>(pair) * 2;
                     const void* w_row = w_data + static_cast<size_t>(n) * w_row_bytes;
                     float sums[32] = {};
-                    type_traits_cpu->vec_dot(static_cast<int>(K), sums, 16, w_row, w_row_bytes, qi, 0, 2);
+                    type_traits_cpu->vec_dot(static_cast<int>(K), sums, 2, w_row, w_row_bytes, qi, 0, 2);
                     out_row[n] = sums[0];
                     out_row[n + 1] = sums[1];
                 }
@@ -2788,8 +2848,8 @@ bool TryRunGgmlQuantizedFusedGEGLUProjection(CpuBackend* backend, const void* ga
                 const void* up_row = up_data + static_cast<size_t>(n) * up_row_bytes;
                 float gate_sums[32] = {};
                 float up_sums[32] = {};
-                gate_traits_cpu->vec_dot(static_cast<int>(K), gate_sums, 16, gate_row, gate_row_bytes, qi, 0, 2);
-                up_traits_cpu->vec_dot(static_cast<int>(K), up_sums, 16, up_row, up_row_bytes, qi, 0, 2);
+                gate_traits_cpu->vec_dot(static_cast<int>(K), gate_sums, 2, gate_row, gate_row_bytes, qi, 0, 2);
+                up_traits_cpu->vec_dot(static_cast<int>(K), up_sums, 2, up_row, up_row_bytes, qi, 0, 2);
                 out_row[n] = GeluTanhApprox(gate_sums[0]) * up_sums[0];
                 out_row[n + 1] = GeluTanhApprox(gate_sums[1]) * up_sums[1];
             }
@@ -2971,8 +3031,8 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
                     const void* up_row = up_data + static_cast<size_t>(n) * up_row_bytes;
                     float gate_sums[32] = {};
                     float up_sums[32] = {};
-                    gate_traits_cpu->vec_dot(static_cast<int>(K), gate_sums, 16, gate_row, gate_row_bytes, qi, 0, 2);
-                    up_traits_cpu->vec_dot(static_cast<int>(K), up_sums, 16, up_row, up_row_bytes, qi, 0, 2);
+                    gate_traits_cpu->vec_dot(static_cast<int>(K), gate_sums, 2, gate_row, gate_row_bytes, qi, 0, 2);
+                    up_traits_cpu->vec_dot(static_cast<int>(K), up_sums, 2, up_row, up_row_bytes, qi, 0, 2);
                     out_row[n] = (gate_sums[0] / (1.0f + internal::FastExp(-gate_sums[0]))) * up_sums[0];
                     out_row[n + 1] = (gate_sums[1] / (1.0f + internal::FastExp(-gate_sums[1]))) * up_sums[1];
                 }
@@ -3031,8 +3091,8 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
                     const void* up_row = up_data + static_cast<size_t>(n) * up_row_bytes;
                     float gate_sums[32] = {};
                     float up_sums[32] = {};
-                    gate_traits_cpu->vec_dot(static_cast<int>(K), gate_sums, 16, gate_row, gate_row_bytes, qi, 0, 2);
-                    up_traits_cpu->vec_dot(static_cast<int>(K), up_sums, 16, up_row, up_row_bytes, qi, 0, 2);
+                    gate_traits_cpu->vec_dot(static_cast<int>(K), gate_sums, 2, gate_row, gate_row_bytes, qi, 0, 2);
+                    up_traits_cpu->vec_dot(static_cast<int>(K), up_sums, 2, up_row, up_row_bytes, qi, 0, 2);
                     out_row[n] = (gate_sums[0] / (1.0f + internal::FastExp(-gate_sums[0]))) * up_sums[0];
                     out_row[n + 1] = (gate_sums[1] / (1.0f + internal::FastExp(-gate_sums[1]))) * up_sums[1];
                 }
@@ -3666,6 +3726,13 @@ bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, 
                                    int numa_node, bool allow_parallel) {
     return RunMoEQ4KRawBatchedProjectionImpl(backend, weight_ptr, qinput_data, qinput_row_bytes, out_data, M, N, K,
                                             numa_node, allow_parallel);
+}
+
+bool RunMoEKQuantRawBatchedProjection(CpuBackend* backend, int ggml_type_id, const void* weight_ptr,
+                                      const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data,
+                                      int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel) {
+    return RunMoEKQuantRawBatchedProjectionImpl(backend, static_cast<ggml_type>(ggml_type_id), weight_ptr, qinput_data,
+                                               qinput_row_bytes, out_data, M, N, K, numa_node, allow_parallel);
 }
 
 bool RunMoEQ4KRawBatchedFusedSwiGLU(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,

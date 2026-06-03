@@ -3380,6 +3380,9 @@ inline GemvBatchedUserData* GetGemvBatchedUserData() {
     ud->qwen36_prefill_q4k_admitted = false;
     ud->require_q4k_true_batched = false;
     ud->disable_quant_nrc_fast = false;
+    ud->gemma4_dense_prefill_native = false;
+    ud->qwen36_ssm_q8_repacked_batched = false;
+    ud->qwen36_ssm_q8_direct_batched = false;
     ud->qwen36_prefill_q4k_probe_done.store(0, std::memory_order_relaxed);
     ud->qwen36_prefill_q4k_probe_failures.store(0, std::memory_order_relaxed);
     ud->qwen36_prefill_q4k_probe_internal_errors.store(0, std::memory_order_relaxed);

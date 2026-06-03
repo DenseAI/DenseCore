@@ -2123,6 +2123,19 @@ static void Qwen35NativeMoEZeroDst2D(ggml_tensor* dst, int64_t n_rows, int64_t n
     }
 }
 
+static void Qwen35NativeMoEZeroDst2DRange(ggml_tensor* dst, int64_t row_start, int64_t row_end, int64_t n_tokens) {
+    if (!dst || !dst->data) return;
+    row_start = std::max<int64_t>(0, row_start);
+    row_end = std::min<int64_t>(dst->ne[0], row_end);
+    if (row_start >= row_end) return;
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        char* dst_col = static_cast<char*>(dst->data) + static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]);
+        for (int64_t row = row_start; row < row_end; ++row) {
+            *reinterpret_cast<float*>(dst_col + static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0])) = 0.0f;
+        }
+    }
+}
+
 struct Qwen35MoEAssignment {
     int32_t expert = -1;
     int32_t token = -1;
@@ -2283,7 +2296,7 @@ static bool Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(const ggml_tensor*
                                      static_cast<size_t>(expert) * static_cast<size_t>(down_exps->nb[2]) +
                                      static_cast<size_t>(row) * static_cast<size_t>(down_exps->nb[1]);
             float sums[32] = {};
-            traits->vec_dot(static_cast<int>(down_exps->ne[0]), sums, 16, weight_row,
+            traits->vec_dot(static_cast<int>(down_exps->ne[0]), sums, 2, weight_row,
                             static_cast<size_t>(down_exps->nb[1]), qbuf, 0, 2);
             *out0 = sums[0];
             *out1 = sums[1];
@@ -2292,6 +2305,76 @@ static bool Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(const ggml_tensor*
     }
     return Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qbuf, hidden_row, out0) &&
            Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row + 1, qbuf, hidden_row, out1);
+}
+
+static bool Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
+    ggml_tensor* dst, const ggml_tensor* down_exps, const uint8_t* qtile, size_t qrow_bytes,
+    const std::vector<Qwen35MoEAssignment>& tile_assignments, int32_t expert, int64_t row_start, int64_t row_end) {
+    if (!dst || !down_exps || !qtile || !dst->data || !down_exps->data || tile_assignments.empty()) {
+        return false;
+    }
+    const ggml_type wtype = down_exps->type;
+    const auto* traits = ggml_get_type_traits_cpu(wtype);
+    if (!traits || !traits->vec_dot || traits->vec_dot_type != GGML_TYPE_Q8_K) {
+        return false;
+    }
+    const int64_t K = down_exps->ne[0];
+    const int64_t n_embd = down_exps->ne[1];
+    if (K <= 0 || n_embd <= 0 || row_start < 0 || row_end > n_embd || row_start > row_end ||
+        (K % ggml_blck_size(wtype)) != 0 || qrow_bytes < ggml_row_size(GGML_TYPE_Q8_K, K)) {
+        return false;
+    }
+    const size_t w_row_bytes = ggml_row_size(wtype, K);
+    const char* expert_base = static_cast<const char*>(down_exps->data) +
+                              static_cast<size_t>(expert) * static_cast<size_t>(down_exps->nb[2]);
+
+    const int64_t pair_start = (row_start + 1) / 2;
+    const int64_t pair_end = row_end / 2;
+    if ((row_start & 1) != 0) {
+        const int64_t row = row_start;
+        const void* w_row = expert_base + static_cast<size_t>(row) * w_row_bytes;
+        for (size_t m = 0; m < tile_assignments.size(); ++m) {
+            const Qwen35MoEAssignment& assignment = tile_assignments[m];
+            const uint8_t* qrow = qtile + m * qrow_bytes;
+            float sum = 0.0f;
+            traits->vec_dot(static_cast<int>(K), &sum, 0, w_row, 0, qrow, 0, 1);
+            char* dst_col = static_cast<char*>(dst->data) +
+                            static_cast<size_t>(assignment.token) * static_cast<size_t>(dst->nb[1]);
+            *reinterpret_cast<float*>(dst_col + static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0])) +=
+                sum * assignment.weight;
+        }
+    }
+    for (int64_t pair = pair_start; pair < pair_end; ++pair) {
+        const int64_t row = pair * 2;
+        const void* w_row = expert_base + static_cast<size_t>(row) * w_row_bytes;
+        for (size_t m = 0; m < tile_assignments.size(); ++m) {
+            const Qwen35MoEAssignment& assignment = tile_assignments[m];
+            const uint8_t* qrow = qtile + m * qrow_bytes;
+            float sums[4] = {};
+            traits->vec_dot(static_cast<int>(K), sums, 2, w_row, w_row_bytes, qrow, 0, 2);
+            char* dst_col = static_cast<char*>(dst->data) +
+                            static_cast<size_t>(assignment.token) * static_cast<size_t>(dst->nb[1]);
+            *reinterpret_cast<float*>(dst_col + static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0])) +=
+                sums[0] * assignment.weight;
+            *reinterpret_cast<float*>(dst_col + static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0])) +=
+                sums[1] * assignment.weight;
+        }
+    }
+    if ((row_end & 1) != 0 && row_end - 1 >= row_start) {
+        const int64_t row = row_end - 1;
+        const void* w_row = expert_base + static_cast<size_t>(row) * w_row_bytes;
+        for (size_t m = 0; m < tile_assignments.size(); ++m) {
+            const Qwen35MoEAssignment& assignment = tile_assignments[m];
+            const uint8_t* qrow = qtile + m * qrow_bytes;
+            float sum = 0.0f;
+            traits->vec_dot(static_cast<int>(K), &sum, 0, w_row, 0, qrow, 0, 1);
+            char* dst_col = static_cast<char*>(dst->data) +
+                            static_cast<size_t>(assignment.token) * static_cast<size_t>(dst->nb[1]);
+            *reinterpret_cast<float*>(dst_col + static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0])) +=
+                sum * assignment.weight;
+        }
+    }
+    return true;
 }
 
 static void RunQwen35NativeMoEDownQ5KFastPath(ggml_tensor* dst, const ggml_tensor* down_exps,
@@ -2683,14 +2766,15 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
     const bool use_shared_q8 = PrepareQwen35SharedQ8Rows(shared_q8, hidden, ith, nth);
     thread_local std::vector<Qwen35MoEAssignment> assignments;
 
-    if (n_tokens > 4 && down_exps->type == GGML_TYPE_Q4_K && use_shared_q8 &&
+    const bool batched_qxk_down =
+        down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q5_K;
+    if (n_tokens > 4 && batched_qxk_down && use_shared_q8 &&
         Qwen35BuildMoEAssignments(selected_experts, down_exps->ne[2], &assignments)) {
-        if (ith != 0) {
-            return;
-        }
-        for (Qwen35MoEAssignment& assignment : assignments) {
-            assignment.weight = 0.0f;
-        }
+        const int64_t row_start = (static_cast<int64_t>(ith) * n_embd) / nth;
+        const int64_t row_end = (static_cast<int64_t>(ith + 1) * n_embd) / nth;
+        if (row_start >= row_end) return;
+        thread_local std::vector<float> topk_weight_matrix;
+        topk_weight_matrix.assign(static_cast<size_t>(n_tokens) * static_cast<size_t>(top_k), 0.0f);
         for (int64_t token = 0; token < n_tokens; ++token) {
             float topk_weights[64];
             const bool weights_ok =
@@ -2703,21 +2787,27 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
             if (!weights_ok) {
                 continue;
             }
-            for (Qwen35MoEAssignment& assignment : assignments) {
-                if (assignment.token == token && assignment.topk_index >= 0 && assignment.topk_index < 64) {
-                    assignment.weight = topk_weights[assignment.topk_index];
-                }
+            float* token_weights =
+                topk_weight_matrix.data() + static_cast<size_t>(token) * static_cast<size_t>(top_k);
+            for (int64_t k = 0; k < top_k; ++k) {
+                token_weights[static_cast<size_t>(k)] = topk_weights[k];
             }
         }
-        Qwen35NativeMoEZeroDst2D(dst, n_embd, n_tokens);
+        for (Qwen35MoEAssignment& assignment : assignments) {
+            assignment.weight = 0.0f;
+            if (assignment.token >= 0 && assignment.token < n_tokens && assignment.topk_index >= 0 &&
+                assignment.topk_index < top_k) {
+                assignment.weight =
+                    topk_weight_matrix[static_cast<size_t>(assignment.token) * static_cast<size_t>(top_k) +
+                                       static_cast<size_t>(assignment.topk_index)];
+            }
+        }
+        Qwen35NativeMoEZeroDst2DRange(dst, row_start, row_end, n_tokens);
         const size_t qrow_bytes = shared_q8->row_bytes;
         thread_local std::vector<uint8_t> qtile;
-        thread_local std::vector<float> out_tile;
         thread_local std::vector<Qwen35MoEAssignment> tile_assignments;
         qtile.resize(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments) * qrow_bytes);
-        out_tile.resize(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments) * static_cast<size_t>(n_embd));
         tile_assignments.reserve(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments));
-        densecore::CpuBackend& backend = densecore::GetCpuBackend();
         for (size_t group_start = 0; group_start < assignments.size();) {
             const int32_t expert = assignments[group_start].expert;
             size_t group_end = group_start + 1;
@@ -2742,26 +2832,10 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
                 if (tile_assignments.empty()) {
                     continue;
                 }
-                const int64_t tile_m = static_cast<int64_t>(tile_assignments.size());
-                const char* down_base = static_cast<const char*>(down_exps->data) +
-                                        static_cast<size_t>(expert) * static_cast<size_t>(down_exps->nb[2]);
-                if (!densecore::RunMoEQ4KRawBatchedProjection(&backend, down_base, qtile.data(), qrow_bytes,
-                                                              out_tile.data(), tile_m, n_embd, down_exps->ne[0],
-                                                              /*numa_node=*/0, /*allow_parallel=*/true)) {
+                const bool ok = Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
+                    dst, down_exps, qtile.data(), qrow_bytes, tile_assignments, expert, row_start, row_end);
+                if (!ok) {
                     return;
-                }
-                for (int64_t m = 0; m < tile_m; ++m) {
-                    const Qwen35MoEAssignment& assignment = tile_assignments[static_cast<size_t>(m)];
-                    const float weight = assignment.weight;
-                    float* dst_col = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                              static_cast<size_t>(assignment.token) *
-                                                                  static_cast<size_t>(dst->nb[1]));
-                    const float* src_row = out_tile.data() + static_cast<size_t>(m) * static_cast<size_t>(n_embd);
-                    for (int64_t row = 0; row < n_embd; ++row) {
-                        *reinterpret_cast<float*>(reinterpret_cast<char*>(dst_col) +
-                                                  static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0])) +=
-                            src_row[row] * weight;
-                    }
                 }
             }
             group_start = group_end;
@@ -3086,8 +3160,8 @@ static bool Qwen35NativeMoEKQ8KFusedSwiGLURows(ggml_type weight_type, const void
                 const void* up_row = up_base + static_cast<size_t>(row) * row_bytes;
                 float gate_sums[32] = {};
                 float up_sums[32] = {};
-                traits->vec_dot(static_cast<int>(cols), gate_sums, 16, gate_row, row_bytes, qrow, 0, 2);
-                traits->vec_dot(static_cast<int>(cols), up_sums, 16, up_row, row_bytes, qrow, 0, 2);
+                traits->vec_dot(static_cast<int>(cols), gate_sums, 2, gate_row, row_bytes, qrow, 0, 2);
+                traits->vec_dot(static_cast<int>(cols), up_sums, 2, up_row, row_bytes, qrow, 0, 2);
                 out_start[row] = NativeMoESiLU(gate_sums[0]) * up_sums[0];
                 out_start[row + 1] = NativeMoESiLU(gate_sums[1]) * up_sums[1];
             }
@@ -3177,71 +3251,46 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
     }
     if ((q4_gateup || q5_gateup) && n_tokens > 4 && use_shared_q8 &&
         Qwen35BuildMoEAssignments(selected_experts, gate_exps->ne[2], &assignments)) {
-        const size_t qrow_bytes = shared_q8->row_bytes;
-        thread_local std::vector<uint8_t> qtile;
-        thread_local std::vector<float> out_tile;
-        qtile.resize(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments) * qrow_bytes);
-        out_tile.resize(static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments) * static_cast<size_t>(n_ff));
-        densecore::CpuBackend& backend = densecore::GetCpuBackend();
-        size_t group_ordinal = 0;
+        if (row_count <= 0) {
+            return;
+        }
+        const size_t weight_row_bytes = ggml_row_size(gate_exps->type, gate_exps->ne[0]);
         for (size_t group_start = 0; group_start < assignments.size();) {
             const int32_t expert = assignments[group_start].expert;
             size_t group_end = group_start + 1;
             while (group_end < assignments.size() && assignments[group_end].expert == expert) {
                 ++group_end;
             }
-            const bool owns_group = (group_ordinal % static_cast<size_t>(nth)) == static_cast<size_t>(ith);
-            ++group_ordinal;
-            if (!owns_group) {
-                group_start = group_end;
-                continue;
-            }
             const char* gate_base = static_cast<const char*>(gate_exps->data) +
                                     static_cast<size_t>(expert) * static_cast<size_t>(gate_exps->nb[2]);
             const char* up_base = static_cast<const char*>(up_exps->data) +
                                   static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]);
-            for (size_t tile_start = group_start; tile_start < group_end;
-                 tile_start += static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments)) {
-                const size_t tile_end =
-                    std::min(group_end, tile_start + static_cast<size_t>(kQwen35NativeMoEBatchedQ4KMaxAssignments));
-                const int64_t tile_m = static_cast<int64_t>(tile_end - tile_start);
-                for (size_t ai = tile_start; ai < tile_end; ++ai) {
-                    const Qwen35MoEAssignment& assignment = assignments[ai];
-                    const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, assignment.token, 0);
-                    if (!qrow) {
-                        if (shared_q8) {
-                            shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
-                        }
-                        return;
-                    }
-                    std::memcpy(qtile.data() + static_cast<size_t>(ai - tile_start) * qrow_bytes, qrow, qrow_bytes);
-                }
-                const bool ok =
-                    q4_gateup
-                        ? densecore::RunMoEQ4KRawBatchedFusedSwiGLU(
-                              &backend, gate_base, up_base, qtile.data(), qrow_bytes, out_tile.data(), tile_m, n_ff,
-                              gate_exps->ne[0], /*numa_node=*/0, /*allow_parallel=*/false)
-                        : densecore::RunMoEKQuantRawBatchedFusedSwiGLU(
-                              &backend, static_cast<int>(gate_exps->type), gate_base, up_base, qtile.data(),
-                              qrow_bytes, out_tile.data(), tile_m, n_ff, gate_exps->ne[0], /*numa_node=*/0,
-                              /*allow_parallel=*/false);
-                if (!ok) {
+            const void* gate_row_start = gate_base + static_cast<size_t>(row_start) * weight_row_bytes;
+            const void* up_row_start = up_base + static_cast<size_t>(row_start) * weight_row_bytes;
+            for (size_t ai = group_start; ai < group_end; ++ai) {
+                const Qwen35MoEAssignment& assignment = assignments[ai];
+                const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, assignment.token, 0);
+                if (!qrow) {
                     if (shared_q8) {
                         shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
                     }
                     return;
                 }
-                for (size_t ai = tile_start; ai < tile_end; ++ai) {
-                    const Qwen35MoEAssignment& assignment = assignments[ai];
-                    const float* src = out_tile.data() + static_cast<size_t>(ai - tile_start) * static_cast<size_t>(n_ff);
-                    for (int64_t row = 0; row < n_ff; ++row) {
-                        *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                  static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
-                                                  static_cast<size_t>(assignment.topk_index) *
-                                                      static_cast<size_t>(dst->nb[1]) +
-                                                  static_cast<size_t>(assignment.token) *
-                                                      static_cast<size_t>(dst->nb[2])) = src[row];
+                float* out = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                      static_cast<size_t>(row_start) *
+                                                          static_cast<size_t>(dst->nb[0]) +
+                                                      static_cast<size_t>(assignment.topk_index) *
+                                                          static_cast<size_t>(dst->nb[1]) +
+                                                      static_cast<size_t>(assignment.token) *
+                                                          static_cast<size_t>(dst->nb[2]));
+                const bool ok = Qwen35NativeMoEKQ8KFusedSwiGLURows(gate_exps->type, gate_row_start, up_row_start,
+                                                                    qrow, gate_exps->ne[0], row_count,
+                                                                    weight_row_bytes, out);
+                if (!ok) {
+                    if (shared_q8) {
+                        shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
                     }
+                    return;
                 }
             }
             group_start = group_end;
@@ -5108,6 +5157,7 @@ struct GemvBatchedUserData {
     bool disable_quant_nrc_fast = false;
     bool gemma4_dense_prefill_native = false;
     bool qwen36_ssm_q8_repacked_batched = false;
+    bool qwen36_ssm_q8_direct_batched = false;
     std::atomic<int> qwen36_prefill_q4k_probe_done{0};
     std::atomic<int> qwen36_prefill_q4k_probe_failures{0};
     std::atomic<int> qwen36_prefill_q4k_probe_internal_errors{0};

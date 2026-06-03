@@ -22,6 +22,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../src/backend/thread_pool_impl.h"
@@ -822,6 +823,31 @@ TEST(NumaStickyRouting, ThreadPool_NestedParallelForFromWorkerCompletesInline) {
     });
 
     EXPECT_EQ(inner_visits.load(std::memory_order_relaxed), 12);
+}
+
+TEST(NumaStickyRouting, ThreadPool_ConcurrentExternalParallelForCompletes) {
+    ThreadPool pool(0, 4);
+    std::atomic<bool> start{false};
+    std::atomic<int> visits{0};
+
+    auto caller = [&]() {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int iter = 0; iter < 100; ++iter) {
+            pool.ParallelFor(128, [&](int begin, int end, int /*thread_id*/) {
+                visits.fetch_add(end - begin, std::memory_order_relaxed);
+            });
+        }
+    };
+
+    std::thread a(caller);
+    std::thread b(caller);
+    start.store(true, std::memory_order_release);
+    a.join();
+    b.join();
+
+    EXPECT_EQ(visits.load(std::memory_order_relaxed), 2 * 100 * 128);
 }
 
 // =============================================================================

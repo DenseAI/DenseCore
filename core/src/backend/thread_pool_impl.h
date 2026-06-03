@@ -118,15 +118,20 @@ public:
 
         // Single-threaded fast path
         const int active_threads = std::max(1, std::min(num_threads_, total_work));
-        if (active_threads <= 1 || detail::g_active_thread_pool == this ||
-            active_parallel_dispatch_.load(std::memory_order_acquire)) {
+        if (active_threads <= 1 || detail::g_active_thread_pool == this) {
+            work_fn(0, total_work, 0);
+            return;
+        }
+
+        bool expected_inactive = false;
+        if (!active_parallel_dispatch_.compare_exchange_strong(expected_inactive, true, std::memory_order_acq_rel,
+                                                               std::memory_order_acquire)) {
             work_fn(0, total_work, 0);
             return;
         }
 
         // Ensure pool is initialized (thread-safe)
         EnsureInitialized();
-        active_parallel_dispatch_.store(true, std::memory_order_release);
 
         // Store work function and range
         current_work_fn_ = &work_fn;
@@ -171,14 +176,19 @@ public:
      */
     void ParallelGemv(float* output, const float* input, const float* weight, int K, int N) {
         const int active_threads = std::max(1, std::min(num_threads_, std::max(1, N)));
-        if (active_threads <= 1 || detail::g_active_thread_pool == this ||
-            active_parallel_dispatch_.load(std::memory_order_acquire)) {
+        if (active_threads <= 1 || detail::g_active_thread_pool == this) {
+            simd::GemvParallel(output, input, weight, K, N, 0, 1);
+            return;
+        }
+
+        bool expected_inactive = false;
+        if (!active_parallel_dispatch_.compare_exchange_strong(expected_inactive, true, std::memory_order_acq_rel,
+                                                               std::memory_order_acquire)) {
             simd::GemvParallel(output, input, weight, K, N, 0, 1);
             return;
         }
 
         EnsureInitialized();
-        active_parallel_dispatch_.store(true, std::memory_order_release);
 
         // Store GEMV parameters
         gemv_output_ = output;

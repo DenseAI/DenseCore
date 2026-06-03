@@ -26,6 +26,9 @@ namespace densecore {
 bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
                                    size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
                                    int numa_node, bool allow_parallel);
+bool RunMoEKQuantRawBatchedProjection(CpuBackend* backend, int ggml_type_id, const void* weight_ptr,
+                                      const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data,
+                                      int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel);
 bool RunMoEQ4KRawBatchedFusedSwiGLU(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
                                     const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
                                     int64_t N, int64_t K, int numa_node, bool allow_parallel);
@@ -228,6 +231,35 @@ TEST_F(MoEOpsTest, Q4KRawBatchedProjectionSupportsWeightedScatter) {
 
     for (size_t i = 0; i < actual.size(); ++i) {
         EXPECT_NEAR(actual[i], expected[i], 1e-4f) << "i=" << i;
+    }
+}
+
+TEST_F(MoEOpsTest, Q5KRawBatchedProjectionMatchesVecDot) {
+    constexpr int64_t M = 7;
+    constexpr int64_t K = 256;
+    constexpr int64_t N = 21;
+
+    const std::vector<float> weight_f32 = MakePatternedFloats(N, K, 0.015f);
+    const std::vector<float> input_f32 = MakePatternedFloats(M, K, 0.009f);
+
+    std::vector<uint8_t> qweight;
+    std::vector<uint8_t> qinput;
+    QuantizeRowsCpu(GGML_TYPE_Q5_K, weight_f32, N, K, &qweight);
+    QuantizeRowsCpu(GGML_TYPE_Q8_K, input_f32, M, K, &qinput);
+
+    std::vector<float> actual(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+    CpuBackend& backend = GetCpuBackend();
+    ASSERT_TRUE(RunMoEKQuantRawBatchedProjection(&backend, static_cast<int>(GGML_TYPE_Q5_K), qweight.data(),
+                                                qinput.data(), ggml_row_size(GGML_TYPE_Q8_K, K), actual.data(), M, N,
+                                                K, /*numa_node=*/0, /*allow_parallel=*/true));
+
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t n = 0; n < N; ++n) {
+            const float expected = KQuantQ8KVecDotReference(GGML_TYPE_Q5_K, qweight, qinput, n, m, K);
+            EXPECT_NEAR(actual[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)], expected,
+                        1e-5f)
+                << "m=" << m << " n=" << n;
+        }
     }
 }
 
