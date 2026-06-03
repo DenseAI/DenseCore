@@ -149,6 +149,12 @@ TEST(WorkerResultDispatchTest, Qwen35DecodeSummaryUsesDedicatedTag) {
     EXPECT_NE(captured.find("kleidiai_compiled_enabled="), std::string::npos);
     EXPECT_NE(captured.find("kleidiai_candidate_ops="), std::string::npos);
     EXPECT_NE(captured.find("kleidiai_last_reject_reason="), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_valid=1"), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_requires_native_moe_fast_path=1"), std::string::npos);
+    EXPECT_NE(captured.find("graph_plan_route=inline_hybrid_ssm"), std::string::npos);
+    EXPECT_NE(captured.find("graph_plan_family=DecoderHybridSSM"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_hot_path_target=1"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_hot_path_moe_lane=1"), std::string::npos);
 }
 
 TEST(WorkerResultDispatchTest, DecodeSummaryIncludesPrefixCacheMetrics) {
@@ -268,6 +274,33 @@ TEST(WorkerResultDispatchTest, QwenTargetRejectsTemporaryReferenceGgmlComputeByD
     EXPECT_TRUE(densecore::runtime::ShouldRejectQwenGgmlCompute(
         plan, "temporary_reference_generic_matmul_fallback"));
     EXPECT_TRUE(densecore::runtime::ShouldRejectQwenGgmlCompute(plan, "native_moe_w2_fast_node_missing"));
+}
+
+TEST(WorkerResultDispatchTest, DenseQwenDecodeSummaryRequiresTargetFastPath) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = false;
+    model.hparams.n_experts = 0;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.qwen_target_ggml_compute_ops = 1;
+    req.qwen_target_ggml_matmul_ops = 1;
+    req.qwen_target_ggml_compute_last_reason = "temporary_reference_dense_projection";
+    req.qwen_target_ggml_compute_last_op = "ggml_mul_mat";
+    req.qwen_target_ggml_compute_target = "qwen35_9b_dense";
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("qwen_hot_path_target=1"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_hot_path_dense_lane=1"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_fast_path_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_fast_path_failure_reason=ggml_compute_or_matmul_path"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_target_ggml_compute_target=qwen35_9b_dense"), std::string::npos);
 }
 
 TEST(WorkerResultDispatchTest, QwenDecodeSummaryAcceptsNativeMoeFastGateUpAndDown) {

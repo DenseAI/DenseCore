@@ -18,6 +18,7 @@
 #include "densecore/exceptions.h"
 #include "densecore/models/model_descriptor.h"
 #include "densecore/models/model_execution_contract.h"
+#include "densecore/models/model_graph_capabilities.h"
 #include "ggml.h"
 #include "kernels/q4k_repacked_gemv.h"
 #include "models/model_inference_policy.h"
@@ -101,6 +102,44 @@ const char* RuntimeToggleModeSummaryName(densecore::env::RuntimeToggleMode mode)
     case densecore::env::RuntimeToggleMode::On: return "on";
     }
     return "off";
+}
+
+const char* TransformerGraphExecutionRouteSummaryName(densecore::TransformerGraphExecutionRoute route) {
+    switch (route) {
+    case densecore::TransformerGraphExecutionRoute::RegistryBuilder: return "registry_builder";
+    case densecore::TransformerGraphExecutionRoute::InlineDenseAttention: return "inline_dense_attention";
+    case densecore::TransformerGraphExecutionRoute::InlineHybridSSM: return "inline_hybrid_ssm";
+    case densecore::TransformerGraphExecutionRoute::InlineSlidingWindowSharedKV:
+        return "inline_sliding_window_shared_kv";
+    case densecore::TransformerGraphExecutionRoute::Reject:
+    default: return "reject";
+    }
+}
+
+std::string JoinExecutionContractRejections(const densecore::models::ModelExecutionContract& contract) {
+    if (contract.rejection_reasons.empty()) {
+        return "none";
+    }
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < contract.rejection_reasons.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << contract.rejection_reasons[i];
+    }
+    return oss.str();
+}
+
+std::string SummaryToken(std::string value) {
+    if (value.empty()) {
+        return "none";
+    }
+    for (char& ch : value) {
+        if (std::isspace(static_cast<unsigned char>(ch))) {
+            ch = '_';
+        }
+    }
+    return value;
 }
 
 densecore::env::RuntimeToggleMode ParseSummaryRuntimeToggleFailClosed(const char* name,
@@ -1468,6 +1507,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     }
     const auto descriptor = densecore::models::DescribeModel(model);
     const auto execution_contract = densecore::models::BuildModelExecutionContract(model);
+    const auto graph_plan = densecore::ResolveTransformerGraphExecutionPlan(model);
+    const auto qwen_hot_path_plan = densecore::runtime::ResolveQwenHotPathPlan(model);
     if (descriptor.variant != ModelVariant::QWEN35 && descriptor.variant != ModelVariant::QWEN36 &&
         descriptor.variant != ModelVariant::GEMMA4 && descriptor.variant != ModelVariant::LFM2MOE) {
         return;
@@ -1706,21 +1747,26 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const int native_moe_timing_missing =
         native_moe_expected && req->native_moe_graph_ns == 0 ? 1 : req->native_moe_timing_missing;
     const bool target_fast_path_required =
+        qwen_hot_path_plan.target_model ||
         densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(execution_contract);
     const bool target_ggml_path_seen =
         req->qwen_target_ggml_compute_ops > 0 || req->decode_matmul_path_hist[0] > 0 ||
         req->decode_matmul_path_hist[1] > 0 || req->prefill_matmul_path_hist[0] > 0 ||
         req->prefill_matmul_path_hist[1] > 0;
+    const bool target_graph_plan_rejected = graph_plan.route == densecore::TransformerGraphExecutionRoute::Reject;
     const bool target_native_moe_fallback_seen =
         req->native_moe_fallback_w1w3_ops > 0 || req->native_moe_fallback_w2_ops > 0;
     const bool target_native_moe_rejected =
         req->native_moe_fast_decode_rejected_ops > 0 || req->native_moe_fast_w2_q5k_rejected_ops > 0 ||
         req->qwen36_prefill_native_moe_fast_rejected_ops > 0;
     const bool target_fast_path_ok = !target_fast_path_required ||
-                                     (!target_ggml_path_seen && !target_native_moe_fallback_seen &&
+                                     (!target_graph_plan_rejected && !target_ggml_path_seen &&
+                                      !target_native_moe_fallback_seen &&
                                       !target_native_moe_rejected);
     const char* target_fast_path_failure_reason = "none";
-    if (target_fast_path_required && target_ggml_path_seen) {
+    if (target_fast_path_required && target_graph_plan_rejected) {
+        target_fast_path_failure_reason = "graph_plan_rejected";
+    } else if (target_fast_path_required && target_ggml_path_seen) {
         target_fast_path_failure_reason = "ggml_compute_or_matmul_path";
     } else if (target_fast_path_required && target_native_moe_fallback_seen) {
         target_fast_path_failure_reason = "native_moe_w1w3_or_w2_fallback";
@@ -1773,6 +1819,10 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         return "none";
     };
     const char* effective_attention_path = resolve_effective_attention_path();
+    const std::string execution_contract_rejections = JoinExecutionContractRejections(execution_contract);
+    const std::string graph_selected_builder = SummaryToken(graph_plan.selected_builder_name);
+    const std::string graph_debug_reason = SummaryToken(graph_plan.debug_reason);
+    const std::string graph_registry_builder_key = SummaryToken(graph_plan.registry_builder_key);
     if (descriptor.variant == ModelVariant::GEMMA4) {
         std::cerr << "[Gemma4PrefillSummary]" << " req=" << req->id << " prefill_ttft_ms=" << prefill_ttft_ms
                   << " prompt_tokens=" << prompt_tokens << " prefill_tok_s=" << prefill_tok_s
@@ -1852,6 +1902,36 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " decode_threads=" << req->decode_thread_count
         << " decode_policy=" << (req->decode_thread_policy.empty() ? "none" : req->decode_thread_policy.c_str())
         << " simd_level=" << densecore::simd::SimdLevelName(simd_level) << " physical_cores=" << physical_core_count
+        << " model_execution_contract_valid=" << (execution_contract.valid ? 1 : 0)
+        << " model_execution_contract_topology="
+        << densecore::models::DecoderRuntimeTopologyName(execution_contract.decoder_runtime_topology)
+        << " model_execution_contract_has_moe=" << (execution_contract.has_moe ? 1 : 0)
+        << " model_execution_contract_has_hybrid_ssm=" << (execution_contract.has_hybrid_ssm_mixer ? 1 : 0)
+        << " model_execution_contract_has_lfm2_shortconv="
+        << (execution_contract.has_lfm2_shortconv_mixer ? 1 : 0)
+        << " model_execution_contract_stateful_custom_ops=" << (execution_contract.has_stateful_custom_ops ? 1 : 0)
+        << " model_execution_contract_requires_rebind="
+        << (execution_contract.requires_decode_graph_runtime_rebind ? 1 : 0)
+        << " model_execution_contract_decode_cache_static_safe="
+        << (execution_contract.decode_graph_cache_static_safe ? 1 : 0)
+        << " model_execution_contract_requires_native_moe_fast_path="
+        << (execution_contract.requires_native_moe_fast_path ? 1 : 0)
+        << " model_execution_contract_native_moe_max_direct_tokens="
+        << execution_contract.native_moe_max_direct_tokens
+        << " model_execution_contract_layer_count=" << execution_contract.layers.size()
+        << " model_execution_contract_rebind_count=" << execution_contract.rebind_descriptors.size()
+        << " model_execution_contract_rejections=" << execution_contract_rejections
+        << " graph_plan_route=" << TransformerGraphExecutionRouteSummaryName(graph_plan.route)
+        << " graph_plan_family=" << densecore::models::GraphFamilyName(graph_plan.resolution.preferred_family)
+        << " graph_plan_fail_closed=" << (graph_plan.resolution.fail_closed ? 1 : 0)
+        << " graph_plan_registry_builder_key=" << graph_registry_builder_key
+        << " graph_plan_selected_builder=" << graph_selected_builder
+        << " graph_plan_debug_reason=" << graph_debug_reason
+        << " qwen_hot_path_target=" << (qwen_hot_path_plan.target_model ? 1 : 0)
+        << " qwen_hot_path_label=" << densecore::runtime::QwenHotPathTargetLabel(qwen_hot_path_plan)
+        << " qwen_hot_path_dense_lane=" << (qwen_hot_path_plan.dense_lane ? 1 : 0)
+        << " qwen_hot_path_moe_lane=" << (qwen_hot_path_plan.moe_lane ? 1 : 0)
+        << " qwen_hot_path_hybrid_ssm_lane=" << (qwen_hot_path_plan.hybrid_ssm_lane ? 1 : 0)
         << " scheduler_wait_ms=" << ns_to_ms(req->scheduler_wait_ns)
         << " batch_build_ms=" << ns_to_ms(req->batch_build_ns) << " graph_build_ms=" << ns_to_ms(req->graph_build_ns)
         << " graph_rebind_ms=" << ns_to_ms(req->graph_rebind_ns)
