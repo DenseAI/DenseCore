@@ -21,6 +21,8 @@ int64_t Qwen35NativeMoEMaxDirectTokensForTest();
 bool CanUseQwenNativeMoEGateUpForTest(const TransformerModel* model, const ggml_tensor* gate_exps,
                                       const ggml_tensor* up_exps, const ggml_tensor* input,
                                       const ggml_tensor* selected_experts, int phase);
+bool CanUseQwenNativeMoEW2ForTest(const TransformerModel* model, const ggml_tensor* down_exps,
+                                  const ggml_tensor* hidden, const ggml_tensor* selected_experts, int phase);
 bool ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(bool is_qwen36_hybrid_moe, int physical_cores,
                                                                int simd_level);
 bool ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(int physical_cores, int simd_level);
@@ -343,6 +345,53 @@ TEST(MoETrace, QwenNativeMoEGateUpAdmissionSupportsQ5ButLFM2StaysQ4Only) {
 
     EXPECT_FALSE(densecore::testing::CanUseQwenNativeMoEGateUpForTest(
         &lfm2, gate_q5, up_q5, input, selected, static_cast<int>(InferenceExecutionPhase::Decode)));
+}
+
+TEST(MoETrace, QwenNativeMoEW2AdmissionSupportsMixedQ4Q5Q6Q8DownExperts) {
+    ggml_init_params params{};
+    params.mem_size = 64 << 20;
+    params.mem_buffer = nullptr;
+    params.no_alloc = false;
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+    struct Guard {
+        ggml_context* ctx;
+        ~Guard() { ggml_free(ctx); }
+    } guard{ctx};
+
+    constexpr int64_t k = 512;
+    constexpr int64_t n_embd = 2048;
+    constexpr int64_t n_experts = 4;
+    constexpr int64_t top_k = 2;
+    constexpr int64_t n_tokens = 19;
+    ggml_tensor* down_q4 = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, k, n_embd, n_experts);
+    ggml_tensor* down_q5 = ggml_new_tensor_3d(ctx, GGML_TYPE_Q5_K, k, n_embd, n_experts);
+    ggml_tensor* down_q6 = ggml_new_tensor_3d(ctx, GGML_TYPE_Q6_K, k, n_embd, n_experts);
+    ggml_tensor* down_q8 = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, k, n_embd, n_experts);
+    ggml_tensor* hidden = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, top_k, n_tokens);
+    ggml_tensor* selected = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, n_tokens);
+    ASSERT_NE(down_q4, nullptr);
+    ASSERT_NE(down_q5, nullptr);
+    ASSERT_NE(down_q6, nullptr);
+    ASSERT_NE(down_q8, nullptr);
+    ASSERT_NE(hidden, nullptr);
+    ASSERT_NE(selected, nullptr);
+
+    TransformerModel qwen{};
+    qwen.arch = ModelArch::QWEN35;
+    qwen.variant = ModelVariant::QWEN36;
+    qwen.arch_flags.is_hybrid_ssm = true;
+    qwen.hparams.n_experts = static_cast<int32_t>(n_experts);
+    qwen.hparams.n_experts_used = static_cast<int32_t>(top_k);
+
+    EXPECT_TRUE(densecore::testing::CanUseQwenNativeMoEW2ForTest(
+        &qwen, down_q4, hidden, selected, static_cast<int>(InferenceExecutionPhase::Prefill)));
+    EXPECT_TRUE(densecore::testing::CanUseQwenNativeMoEW2ForTest(
+        &qwen, down_q5, hidden, selected, static_cast<int>(InferenceExecutionPhase::Prefill)));
+    EXPECT_TRUE(densecore::testing::CanUseQwenNativeMoEW2ForTest(
+        &qwen, down_q6, hidden, selected, static_cast<int>(InferenceExecutionPhase::Prefill)));
+    EXPECT_TRUE(densecore::testing::CanUseQwenNativeMoEW2ForTest(
+        &qwen, down_q8, hidden, selected, static_cast<int>(InferenceExecutionPhase::Prefill)));
 }
 
 TEST(MoETrace, Qwen36SmallDecodeExpertParallelAutoPolicyTargetsC4AShape) {

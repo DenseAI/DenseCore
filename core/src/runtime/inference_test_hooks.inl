@@ -768,6 +768,25 @@ bool CanUseQwenNativeMoEGateUpForTest(const TransformerModel* model, const ggml_
     }
     return accepted;
 }
+
+bool CanUseQwenNativeMoEW2ForTest(const TransformerModel* model, const ggml_tensor* down_exps,
+                                  const ggml_tensor* hidden, const ggml_tensor* selected_experts, int phase) {
+    InferenceWorkContext* previous_ctx = GetCurrentWorkContext();
+    std::unique_ptr<InferenceWorkContext, void (*)(InferenceWorkContext*)> owned_ctx(nullptr,
+                                                                                    DestroyInferenceWorkContext);
+    if (!previous_ctx) {
+        owned_ctx.reset(CreateInferenceWorkContext());
+        SetCurrentWorkContext(owned_ctx.get());
+    }
+    const InferenceExecutionPhase previous = GetCurrentExecutionPhase();
+    SetCurrentExecutionPhase(static_cast<InferenceExecutionPhase>(phase));
+    const bool accepted = ::CanReplaceQwen35W2WithCustomCallback(model, down_exps, hidden, selected_experts);
+    SetCurrentExecutionPhase(previous);
+    if (!previous_ctx) {
+        SetCurrentWorkContext(nullptr);
+    }
+    return accepted;
+}
 }  // namespace testing
 }  // namespace densecore
 #endif
