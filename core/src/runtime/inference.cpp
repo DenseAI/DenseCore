@@ -36,9 +36,6 @@
 #include <unordered_map>
 #include <vector>
 
-#if defined(__linux__)
-#include <sys/sysinfo.h>  // sysinfo() RAM probe for the Qwen35 gate/up Q5_K repack budget gate
-#endif
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #endif

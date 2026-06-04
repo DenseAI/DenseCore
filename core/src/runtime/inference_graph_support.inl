@@ -3688,172 +3688,12 @@ static void ProbeQwen35NativeMoEGateUpReference(const ggml_tensor* dst, const gg
                  static_cast<long long>(max_row), max_actual, max_ref, Qwen35NativeMoEReferenceTolerance());
 }
 
-// ---------------------------------------------------------------------------
-// Persistent Q5_K -> q5_K_8x8 repack for Qwen3.5/3.6 MoE gate/up experts.
-//
-// The decode gate/up custom op otherwise runs one DotQ5KQ8K_Hwy per output row
-// (see Qwen35NativeMoEKQ8KFusedSwiGLURows), whose cost is dominated by per-row
-// Q5_K bit-unpacking. ggml's repacked q5_K_8x8 GEMV unpacks 8 rows together and
-// reuses the shared Q8_K activation, matching the efficiency of the Q8_0 down
-// lane. That is why decode_moe_w1w3 runs far slower than decode_moe_w2 despite
-// only ~2x the weight bytes.
-//
-// Unlike the runtime LRU repack cache in cpu_backend_moe_ops.cpp (capped at a
-// few GiB and therefore prone to thrashing on multi-GiB MoE weight sets), this
-// cache is build-once / keep: keyed by the source weight pointer, never evicts,
-// and is single-flighted under the lock so steady-state decode pays no per-token
-// repack cost. The repacked layout is byte-for-byte the same size as the source
-// Q5_K weights, so the extra footprint equals the gate/up weight size and is
-// budget-gated against live free RAM (fail-closed to the raw lane otherwise).
-// ---------------------------------------------------------------------------
-struct Qwen35GateUpQ5KRepackEntry {
-    std::vector<uint8_t> bytes;
-    int64_t n_ff = 0;
-    int64_t hidden = 0;
-    int64_t n_experts = 0;
-    size_t expert_bytes = 0;
-};
-
 static bool Qwen35GateUpQ5KRepackKernelAvailable() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return ggml_cpu_has_neon() && ggml_cpu_has_dotprod();
 #else
     return false;
 #endif
-}
-
-// Refuse to build the repack when it would not comfortably fit in available RAM
-// so a memory-constrained host transparently falls back to the raw decode lane
-// instead of risking an OOM kill. The check uses live free RAM, so as successive
-// per-layer tensors are repacked it self-limits once headroom is exhausted.
-static bool Qwen35GateUpQ5KRepackBudgetOk(size_t need_bytes) {
-#if defined(__linux__)
-    {
-        FILE* fp = std::fopen("/proc/meminfo", "r");
-        if (fp) {
-            char key[64] = {};
-            char unit[16] = {};
-            unsigned long long value_kb = 0;
-            while (std::fscanf(fp, "%63s %llu %15s\n", key, &value_kb, unit) == 3) {
-                if (std::strcmp(key, "MemAvailable:") == 0) {
-                    std::fclose(fp);
-                    constexpr uint64_t kHeadroom = 8ull * 1024ull * 1024ull * 1024ull;
-                    const uint64_t available = static_cast<uint64_t>(value_kb) * 1024ull;
-                    return available > static_cast<uint64_t>(need_bytes) + kHeadroom;
-                }
-            }
-            std::fclose(fp);
-        }
-    }
-    struct sysinfo info {};
-    if (sysinfo(&info) == 0 && info.mem_unit > 0) {
-        const uint64_t unit = static_cast<uint64_t>(info.mem_unit);
-        const uint64_t available =
-            (static_cast<uint64_t>(info.freeram) + static_cast<uint64_t>(info.bufferram)) * unit;
-        constexpr uint64_t kHeadroom = 8ull * 1024ull * 1024ull * 1024ull;
-        return available > static_cast<uint64_t>(need_bytes) + kHeadroom;
-    }
-#endif
-    (void)need_bytes;
-    return true;  // no probe available: rely on the bad_alloc guard during resize
-}
-
-static std::shared_ptr<Qwen35GateUpQ5KRepackEntry> GetOrBuildQwen35GateUpQ5KRepack(const ggml_tensor* exps,
-                                                                                   const char** reject_reason) {
-    auto reject = [&](const char* reason) -> std::shared_ptr<Qwen35GateUpQ5KRepackEntry> {
-        if (reject_reason) {
-            *reject_reason = reason;
-        }
-        return nullptr;
-    };
-    if (reject_reason) {
-        *reject_reason = nullptr;
-    }
-    if (!exps) {
-        return reject("missing_tensor");
-    }
-    if (!exps->data) {
-        return reject("missing_data");
-    }
-    if (exps->type != GGML_TYPE_Q5_K) {
-        return reject("not_q5k");
-    }
-    if (exps->view_src) {
-        return reject("view_tensor");
-    }
-    if (exps->ne[0] <= 0 || exps->ne[1] <= 0 || exps->ne[2] <= 0) {
-        return reject("invalid_shape");
-    }
-    const int64_t hidden = exps->ne[0];     // K (input dim / gemv n)
-    const int64_t n_ff = exps->ne[1];       // N (output rows per expert)
-    const int64_t n_experts = exps->ne[2];
-    const int64_t block_size = ggml_blck_size(GGML_TYPE_Q5_K);
-    if (block_size <= 0 || (hidden % block_size) != 0 || (n_ff % 8) != 0) {
-        return reject("unsupported_shape");
-    }
-    const size_t row_size = ggml_row_size(GGML_TYPE_Q5_K, hidden);
-    if (row_size == 0) {
-        return reject("zero_row_size");
-    }
-    const size_t expert_bytes = row_size * static_cast<size_t>(n_ff);
-    // Require compact row/expert strides so each source slice matches the dense
-    // layout ggml_repack_q5_K_8x8 consumes.
-    if (static_cast<size_t>(exps->nb[1]) != row_size || static_cast<size_t>(exps->nb[2]) < expert_bytes) {
-        return reject("non_compact_stride");
-    }
-
-    struct Cache {
-        std::mutex mu;
-        std::unordered_map<const void*, std::shared_ptr<Qwen35GateUpQ5KRepackEntry>> entries;
-        std::unordered_map<const void*, const char*> failure_reasons;
-    };
-    static Cache cache;
-    const void* key = exps->data;
-
-    std::lock_guard<std::mutex> lock(cache.mu);
-    auto it = cache.entries.find(key);
-    if (it != cache.entries.end()) {
-        const auto& existing = it->second;
-        if (existing && existing->n_ff == n_ff && existing->hidden == hidden && existing->n_experts == n_experts) {
-            return existing;
-        }
-        auto failure_it = cache.failure_reasons.find(key);
-        return reject(failure_it != cache.failure_reasons.end() ? failure_it->second : "memoized_failure");
-    }
-
-    const size_t need = expert_bytes * static_cast<size_t>(n_experts);
-    if (!Qwen35GateUpQ5KRepackBudgetOk(need)) {
-        cache.entries.emplace(key, nullptr);
-        cache.failure_reasons.emplace(key, "budget_refused");
-        return reject("budget_refused");
-    }
-
-    auto entry = std::make_shared<Qwen35GateUpQ5KRepackEntry>();
-    entry->n_ff = n_ff;
-    entry->hidden = hidden;
-    entry->n_experts = n_experts;
-    entry->expert_bytes = expert_bytes;
-    try {
-        entry->bytes.resize(need);
-    } catch (...) {
-        cache.entries.emplace(key, nullptr);
-        cache.failure_reasons.emplace(key, "allocation_failed");
-        return reject("allocation_failed");
-    }
-
-    const char* src_base = static_cast<const char*>(exps->data);
-    for (int64_t e = 0; e < n_experts; ++e) {
-        const void* src = src_base + static_cast<size_t>(e) * static_cast<size_t>(exps->nb[2]);
-        void* dst = entry->bytes.data() + static_cast<size_t>(e) * expert_bytes;
-        if (ggml_repack_q5_K_8x8(src, expert_bytes, n_ff, hidden, dst, expert_bytes) != 0) {
-            cache.entries.emplace(key, nullptr);
-            cache.failure_reasons.emplace(key, "ggml_repack_failed");
-            return reject("ggml_repack_failed");
-        }
-    }
-
-    cache.entries.emplace(key, entry);
-    return entry;
 }
 
 static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_tensor* gate_exps,
@@ -3924,12 +3764,10 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
         ProbeQwen35NativeMoEGateUpReference(dst, gate_exps, up_exps, input, selected_experts, 0, n_ff, shared_q8);
         return;
     }
-    // Q5_K decode fast lane: run the repacked q5_K_8x8 GEMV (build-once persistent
-    // repack) instead of the per-row DotQ5KQ8K_Hwy raw lane. Each ggml worker owns
-    // a tile-aligned slice of the n_ff output rows and reuses the shared Q8_K
-    // activation already prepared above, so all cores stay busy with no per-token
-    // repack. Admission is controlled by real capability, layout, and memory
-    // checks only; there is intentionally no env-controlled behavior fork.
+    // Q5_K decode fast lane: run the loader-owned single-copy q5_K_8x8 layout
+    // through ggml's GEMV kernel. Do not build a runtime repack cache here:
+    // keeping both raw Q5_K and q5_K_8x8 copies was the RAM wall for 35B Q5.
+    // Graph admission guarantees q5_single_copy_8x8 before this callback is used.
     if (q5_gateup && n_tokens == 1 && use_shared_q8 && dst->nb[0] == static_cast<int64_t>(sizeof(float)) &&
         (n_ff % 8) == 0) {
         auto* work_ctx = GetCurrentWorkContext();
@@ -3938,90 +3776,62 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                 RecordMoEQ5KRepackedDecision(work_ctx, /*candidate=*/true, /*used=*/false,
                                              "qwen35_gateup_q5k_repack_kernel_unavailable");
             }
-            if (q5_single_copy_8x8) {
+            shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!q5_single_copy_8x8) {
+            if (ith == 0) {
+                RecordMoEQ5KRepackedDecision(work_ctx, /*candidate=*/true, /*used=*/false,
+                                             "qwen35_gateup_q5k_single_copy_missing");
+            }
+            shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
+            return;
+        }
+        if (ith == 0) {
+            RecordMoEQ5KRepackedDecision(work_ctx, /*candidate=*/true, /*used=*/true, nullptr);
+        }
+        const int64_t hidden_dim = gate_exps->ne[0];
+        const size_t row_size = ggml_row_size(GGML_TYPE_Q5_K, hidden_dim);
+        const int64_t tile_total = n_ff / 8;
+        const int64_t tile_lo = (static_cast<int64_t>(ith) * tile_total) / nth;
+        const int64_t tile_hi = (static_cast<int64_t>(ith + 1) * tile_total) / nth;
+        const int64_t r0 = tile_lo * 8;
+        const int64_t r1 = tile_hi * 8;
+        if (r1 > r0) {
+            const int nc = static_cast<int>(r1 - r0);
+            const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, 0, 0);
+            if (!qrow) {
                 shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
                 return;
             }
-            // Repack kernel unavailable: fall through to the maintained raw lane below.
-        } else {
-            const char* gate_repack_reject = nullptr;
-            const char* up_repack_reject = nullptr;
-            std::shared_ptr<Qwen35GateUpQ5KRepackEntry> gate_rp;
-            std::shared_ptr<Qwen35GateUpQ5KRepackEntry> up_rp;
-            if (!q5_single_copy_8x8) {
-                gate_rp = GetOrBuildQwen35GateUpQ5KRepack(gate_exps, &gate_repack_reject);
-                up_rp = GetOrBuildQwen35GateUpQ5KRepack(up_exps, &up_repack_reject);
-            }
-            if (q5_single_copy_8x8 || (gate_rp && up_rp)) {
-                if (ith == 0) {
-                    RecordMoEQ5KRepackedDecision(work_ctx, /*candidate=*/true, /*used=*/true, nullptr);
+            const size_t tile_byte_off = static_cast<size_t>(r0) * row_size;
+            thread_local std::vector<float> q5k_gate_buf;
+            thread_local std::vector<float> q5k_up_buf;
+            if (static_cast<int>(q5k_gate_buf.size()) < nc) q5k_gate_buf.resize(static_cast<size_t>(nc));
+            if (static_cast<int>(q5k_up_buf.size()) < nc) q5k_up_buf.resize(static_cast<size_t>(nc));
+            for (int64_t k = 0; k < top_k; ++k) {
+                int32_t expert = -1;
+                if (!Qwen35NativeMoEDownQ5KReadExpert(selected_experts, gate_exps, 0, k, &expert)) {
+                    continue;
                 }
-                const int64_t hidden_dim = gate_exps->ne[0];
-                const size_t row_size = ggml_row_size(GGML_TYPE_Q5_K, hidden_dim);
-                const int64_t tile_total = n_ff / 8;
-                const int64_t tile_lo = (static_cast<int64_t>(ith) * tile_total) / nth;
-                const int64_t tile_hi = (static_cast<int64_t>(ith + 1) * tile_total) / nth;
-                const int64_t r0 = tile_lo * 8;
-                const int64_t r1 = tile_hi * 8;
-                if (r1 > r0) {
-                    const int nc = static_cast<int>(r1 - r0);
-                    const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, 0, 0);
-                    if (!qrow) {
-                        shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
-                        return;
-                    }
-                    // Byte offset of the first 8-row tile this worker owns. Each
-                    // repacked tile spans 8 rows == 8 * row_size bytes, and r0 is a
-                    // multiple of 8, so the offset is exactly r0 * row_size.
-                    const size_t tile_byte_off = static_cast<size_t>(r0) * row_size;
-                    thread_local std::vector<float> q5k_gate_buf;
-                    thread_local std::vector<float> q5k_up_buf;
-                    if (static_cast<int>(q5k_gate_buf.size()) < nc) q5k_gate_buf.resize(static_cast<size_t>(nc));
-                    if (static_cast<int>(q5k_up_buf.size()) < nc) q5k_up_buf.resize(static_cast<size_t>(nc));
-                    for (int64_t k = 0; k < top_k; ++k) {
-                        int32_t expert = -1;
-                        if (!Qwen35NativeMoEDownQ5KReadExpert(selected_experts, gate_exps, 0, k, &expert)) {
-                            continue;
-                        }
-                        const uint8_t* gate_vx =
-                            q5_single_copy_8x8
-                                ? static_cast<const uint8_t*>(gate_exps->data) +
-                                      static_cast<size_t>(expert) * static_cast<size_t>(gate_exps->nb[2]) +
-                                      tile_byte_off
-                                : gate_rp->bytes.data() + static_cast<size_t>(expert) * gate_rp->expert_bytes +
-                                      tile_byte_off;
-                        const uint8_t* up_vx =
-                            q5_single_copy_8x8
-                                ? static_cast<const uint8_t*>(up_exps->data) +
-                                      static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]) + tile_byte_off
-                                : up_rp->bytes.data() + static_cast<size_t>(expert) * up_rp->expert_bytes +
-                                      tile_byte_off;
-                        ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_gate_buf.data(), 0, gate_vx, qrow, 1,
-                                                nc);
-                        ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_up_buf.data(), 0, up_vx, qrow, 1,
-                                                nc);
-                        float* out_col = reinterpret_cast<float*>(
-                            static_cast<char*>(dst->data) + static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]));
-                        for (int i = 0; i < nc; ++i) {
-                            out_col[r0 + i] = NativeMoESiLU(q5k_gate_buf[static_cast<size_t>(i)]) *
-                                              q5k_up_buf[static_cast<size_t>(i)];
-                        }
-                    }
+                const uint8_t* gate_vx = static_cast<const uint8_t*>(gate_exps->data) +
+                                         static_cast<size_t>(expert) * static_cast<size_t>(gate_exps->nb[2]) +
+                                         tile_byte_off;
+                const uint8_t* up_vx = static_cast<const uint8_t*>(up_exps->data) +
+                                       static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]) +
+                                       tile_byte_off;
+                ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_gate_buf.data(), 0, gate_vx, qrow, 1,
+                                        nc);
+                ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_up_buf.data(), 0, up_vx, qrow, 1, nc);
+                float* out_col = reinterpret_cast<float*>(
+                    static_cast<char*>(dst->data) + static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]));
+                for (int i = 0; i < nc; ++i) {
+                    out_col[r0 + i] =
+                        NativeMoESiLU(q5k_gate_buf[static_cast<size_t>(i)]) * q5k_up_buf[static_cast<size_t>(i)];
                 }
-                if (!q5_single_copy_8x8) {
-                    ProbeQwen35NativeMoEGateUpReference(dst, gate_exps, up_exps, input, selected_experts, r0, r1,
-                                                        shared_q8);
-                }
-                return;
             }
-            if (ith == 0) {
-                const char* reason =
-                    !gate_rp ? (gate_repack_reject ? gate_repack_reject : "qwen35_gate_q5k_repack_unavailable")
-                             : (up_repack_reject ? up_repack_reject : "qwen35_up_q5k_repack_unavailable");
-                RecordMoEQ5KRepackedDecision(work_ctx, /*candidate=*/true, /*used=*/false, reason);
-            }
-            // Repack unavailable: fall through to the maintained raw lane below.
         }
+        return;
     }
     size_t assignment_count = 0;
     const Qwen35MoEAssignment* assignment_data = nullptr;
@@ -4391,6 +4201,22 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         gate_up_exps && gate_up_exps->type == gate_exps->type && gate_up_exps->ne[0] == gate_exps->ne[0] &&
         gate_up_exps->ne[1] == gate_exps->ne[1] + up_exps->ne[1] && gate_up_exps->ne[2] == n_experts;
     const ggml_type w1w3_type = use_fused_gate_up ? gate_up_exps->type : gate_exps->type;
+    const bool qwen_q5_gateup_single_copy =
+        qwen_native_moe && !use_fused_gate_up && raw_gate_exps && raw_up_exps &&
+        raw_gate_exps->type == GGML_TYPE_Q5_K && raw_up_exps->type == GGML_TYPE_Q5_K &&
+        model->q5k_8x8_repacked_tensors.find(raw_gate_exps) != model->q5k_8x8_repacked_tensors.end() &&
+        model->q5k_8x8_repacked_tensors.find(raw_up_exps) != model->q5k_8x8_repacked_tensors.end();
+    if (qwen_native_moe && w1w3_type == GGML_TYPE_Q5_K && !qwen_q5_gateup_single_copy) {
+        if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
+            RecordMoEQ5KRepackedDecision(work_ctx, /*candidate=*/true, /*used=*/false,
+                                         "qwen35_gateup_q5k_single_copy_missing");
+            RecordNativeMoEFastDecodeDecision(work_ctx, /*candidate=*/true, /*used=*/false,
+                                             "qwen35_gateup_q5k_single_copy_missing",
+                                             /*w1w3_used=*/false,
+                                             /*w2_used=*/false);
+        }
+        return reject_native_moe("qwen35_gateup_q5k_single_copy_missing");
+    }
     if (InferenceWorkContext* work_ctx = GetCurrentWorkContext()) {
         const BatchSpec* current_batch = GetCurrentBatch();
         const auto& fast_config = ResolveFastPathRuntimeConfig(current_batch);
@@ -4498,11 +4324,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             // The repacked W1/W3 probe was slower on C4A and produced invalid
             // long-QA output on C4, so it is not an admission path.
             gateup_q8_ud->prefer_q4k_repacked_swiglu = false;
-            gateup_q8_ud->q5k_gateup_8x8_single_copy =
-                raw_gate_exps && raw_up_exps && raw_gate_exps->type == GGML_TYPE_Q5_K &&
-                raw_up_exps->type == GGML_TYPE_Q5_K &&
-                model->q5k_8x8_repacked_tensors.find(raw_gate_exps) != model->q5k_8x8_repacked_tensors.end() &&
-                model->q5k_8x8_repacked_tensors.find(raw_up_exps) != model->q5k_8x8_repacked_tensors.end();
+            gateup_q8_ud->q5k_gateup_8x8_single_copy = qwen_q5_gateup_single_copy;
         }
         ggml_tensor* args[] = {raw_gate_exps, raw_up_exps, routed_input, selected_experts};
         hidden = ggml_custom_4d(ctx, GGML_TYPE_F32, raw_gate_exps->ne[1], n_expert_used, n_tokens, 1, args, 4,
