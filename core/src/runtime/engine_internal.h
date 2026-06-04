@@ -474,6 +474,8 @@ struct Request {
     uint64_t gemv_custom_phase_unknown_ops = 0;
     uint64_t gemv_custom_force_reference_ops = 0;
     uint64_t gemv_custom_dynamic_lora_ops = 0;
+    uint64_t lfm2_decode_lm_head_custom_gemv_used_ops = 0;
+    uint64_t lfm2_decode_lm_head_custom_gemv_ns = 0;
     std::array<uint64_t, kMatmulWeightTypeHistCount> gemv_custom_weight_type_hist{};
     std::array<uint64_t, kMatmulQuantInputTypeHistCount> gemv_custom_quant_input_type_hist{};
     int gemv_custom_tasks_effective = 0;
@@ -910,6 +912,8 @@ struct Request {
         gemv_custom_phase_unknown_ops = 0;
         gemv_custom_force_reference_ops = 0;
         gemv_custom_dynamic_lora_ops = 0;
+        lfm2_decode_lm_head_custom_gemv_used_ops = 0;
+        lfm2_decode_lm_head_custom_gemv_ns = 0;
         gemv_custom_weight_type_hist.fill(0);
         gemv_custom_quant_input_type_hist.fill(0);
         gemv_custom_tasks_effective = 0;

@@ -2061,6 +2061,7 @@ struct Qwen35SharedQ8RowsUserData {
     std::atomic<int> failed{0};
     bool prefer_q4k_repacked_swiglu = false;
     bool q5k_gateup_8x8_single_copy = false;
+    bool q5k_gateup_8x8_single_copy_required = false;
     std::atomic<int> repacked_swiglu_failed{0};
     bool weighted_logits_lfm2_sigmoid = false;
     bool weighted_logits_norm_topk = true;
@@ -2105,6 +2106,7 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
         dry_run_ud.failed.store(0, std::memory_order_relaxed);
         dry_run_ud.prefer_q4k_repacked_swiglu = false;
         dry_run_ud.q5k_gateup_8x8_single_copy = false;
+        dry_run_ud.q5k_gateup_8x8_single_copy_required = false;
         dry_run_ud.repacked_swiglu_failed.store(0, std::memory_order_relaxed);
         dry_run_ud.weighted_logits_lfm2_sigmoid = false;
         dry_run_ud.weighted_logits_norm_topk = true;
@@ -2134,6 +2136,7 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
     ud->rows = static_cast<uint8_t*>(rows_storage->data);
     ud->prefer_q4k_repacked_swiglu = false;
     ud->q5k_gateup_8x8_single_copy = false;
+    ud->q5k_gateup_8x8_single_copy_required = false;
     ud->repacked_swiglu_failed.store(0, std::memory_order_relaxed);
     ud->weighted_logits_lfm2_sigmoid = false;
     ud->weighted_logits_norm_topk = true;
@@ -3709,6 +3712,8 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
     const bool q4_gateup = gate_exps->type == GGML_TYPE_Q4_K && up_exps->type == GGML_TYPE_Q4_K;
     const bool q5_gateup = gate_exps->type == GGML_TYPE_Q5_K && up_exps->type == GGML_TYPE_Q5_K;
     const bool q5_single_copy_8x8 = q5_gateup && shared_q8 && shared_q8->q5k_gateup_8x8_single_copy;
+    const bool q5_single_copy_required =
+        q5_gateup && shared_q8 && shared_q8->q5k_gateup_8x8_single_copy_required;
     if (dst->type != GGML_TYPE_F32 || (!q4_gateup && !q5_gateup) || input->type != GGML_TYPE_F32 ||
         selected_experts->type != GGML_TYPE_I32 || gate_exps->ne[1] != n_ff || up_exps->ne[1] != n_ff ||
         dst->ne[1] != top_k || dst->ne[2] != n_tokens || gate_exps->ne[2] != up_exps->ne[2]) {
@@ -3764,12 +3769,13 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
         ProbeQwen35NativeMoEGateUpReference(dst, gate_exps, up_exps, input, selected_experts, 0, n_ff, shared_q8);
         return;
     }
-    // Q5_K decode fast lane: run the loader-owned single-copy q5_K_8x8 layout
-    // through ggml's GEMV kernel. Do not build a runtime repack cache here:
-    // keeping both raw Q5_K and q5_K_8x8 copies was the RAM wall for 35B Q5.
-    // Graph admission guarantees q5_single_copy_8x8 before this callback is used.
-    if (q5_gateup && n_tokens == 1 && use_shared_q8 && dst->nb[0] == static_cast<int64_t>(sizeof(float)) &&
-        (n_ff % 8) == 0) {
+    // Qwen Q5_K decode fast lane: run the loader-owned single-copy q5_K_8x8
+    // layout through ggml's GEMV kernel. Do not build a runtime repack cache
+    // here: keeping both raw Q5_K and q5_K_8x8 copies was the RAM wall for 35B
+    // Q5. LFM2 Q5 does not use this Qwen-only layout and must fall through to
+    // its validated raw vecdot lane instead of being rejected here.
+    if (q5_gateup && (q5_single_copy_8x8 || q5_single_copy_required) && n_tokens == 1 && use_shared_q8 &&
+        dst->nb[0] == static_cast<int64_t>(sizeof(float)) && (n_ff % 8) == 0) {
         auto* work_ctx = GetCurrentWorkContext();
         if (!Qwen35GateUpQ5KRepackKernelAvailable()) {
             if (ith == 0) {
@@ -4325,6 +4331,8 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             // long-QA output on C4, so it is not an admission path.
             gateup_q8_ud->prefer_q4k_repacked_swiglu = false;
             gateup_q8_ud->q5k_gateup_8x8_single_copy = qwen_q5_gateup_single_copy;
+            gateup_q8_ud->q5k_gateup_8x8_single_copy_required =
+                qwen_native_moe && w1w3_type == GGML_TYPE_Q5_K;
         }
         ggml_tensor* args[] = {raw_gate_exps, raw_up_exps, routed_input, selected_experts};
         hidden = ggml_custom_4d(ctx, GGML_TYPE_F32, raw_gate_exps->ne[1], n_expert_used, n_tokens, 1, args, 4,
@@ -5894,6 +5902,7 @@ struct GemvUserData {
     InferenceExecutionPhase phase_snapshot = InferenceExecutionPhase::Unknown;
     bool gemma4_decode_native = false;
     bool gemma4_decode_lm_head = false;
+    bool lfm2_decode_lm_head = false;
 };
 
 struct GemvBatchedUserData {

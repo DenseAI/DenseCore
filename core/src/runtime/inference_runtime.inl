@@ -97,6 +97,8 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> gemv_custom_dynamic_lora_ops{0};
     std::array<std::atomic<uint64_t>, kMatmulWeightTypeHistCount> gemv_custom_weight_type_hist{};
     std::array<std::atomic<uint64_t>, kMatmulQuantInputTypeHistCount> gemv_custom_quant_input_type_hist{};
+    std::atomic<uint64_t> lfm2_decode_lm_head_custom_gemv_used_ops{0};
+    std::atomic<uint64_t> lfm2_decode_lm_head_custom_gemv_ns{0};
     std::atomic<int> gemv_custom_tasks_effective{0};
     std::atomic<int> gemv_custom_tasks_cap_reason{0};
     std::atomic<uint64_t> decode_matmul_created_ops{0};
@@ -725,6 +727,8 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.gemv_custom_phase_unknown_ops.store(0, std::memory_order_relaxed);
     p.gemv_custom_force_reference_ops.store(0, std::memory_order_relaxed);
     p.gemv_custom_dynamic_lora_ops.store(0, std::memory_order_relaxed);
+    p.lfm2_decode_lm_head_custom_gemv_used_ops.store(0, std::memory_order_relaxed);
+    p.lfm2_decode_lm_head_custom_gemv_ns.store(0, std::memory_order_relaxed);
     ResetAtomicHistogram(p.gemv_custom_weight_type_hist);
     ResetAtomicHistogram(p.gemv_custom_quant_input_type_hist);
     p.gemv_custom_tasks_effective.store(0, std::memory_order_relaxed);
@@ -1020,6 +1024,10 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.gemv_custom_phase_unknown_ops = p.gemv_custom_phase_unknown_ops.load(std::memory_order_relaxed);
     snapshot.gemv_custom_force_reference_ops = p.gemv_custom_force_reference_ops.load(std::memory_order_relaxed);
     snapshot.gemv_custom_dynamic_lora_ops = p.gemv_custom_dynamic_lora_ops.load(std::memory_order_relaxed);
+    snapshot.lfm2_decode_lm_head_custom_gemv_used_ops =
+        p.lfm2_decode_lm_head_custom_gemv_used_ops.load(std::memory_order_relaxed);
+    snapshot.lfm2_decode_lm_head_custom_gemv_ns =
+        p.lfm2_decode_lm_head_custom_gemv_ns.load(std::memory_order_relaxed);
     SnapshotAtomicHistogram(snapshot.gemv_custom_weight_type_hist, p.gemv_custom_weight_type_hist);
     SnapshotAtomicHistogram(snapshot.gemv_custom_quant_input_type_hist, p.gemv_custom_quant_input_type_hist);
     snapshot.gemv_custom_tasks_effective = p.gemv_custom_tasks_effective.load(std::memory_order_relaxed);

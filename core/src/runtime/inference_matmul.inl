@@ -1294,6 +1294,9 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     const auto gemma4_decode_begin =
         (ith == 0 && ud->gemma4_decode_native) ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point{};
+    const auto lfm2_lm_head_begin =
+        (ith == 0 && ud->lfm2_decode_lm_head) ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
     const auto q6k_begin = (ith == 0 && weight_type == GGML_TYPE_Q6_K) ? std::chrono::steady_clock::now()
                                                                        : std::chrono::steady_clock::time_point{};
     bool q6k_decision_recorded = false;
@@ -1349,6 +1352,18 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
             RecordQ6KGemvDecision(callback_work_ctx, q6_decode_candidate, q6_used, reject_reason, weight_name, 1, K, N,
                                   wall_ns, effective_phase_name, graph_phase_name, callback_phase_name, dispatch_path);
             q6k_decision_recorded = true;
+        }
+        if (ith == 0 && callback_work_ctx && ud->lfm2_decode_lm_head) {
+            if (wall_ns == 0 && lfm2_lm_head_begin != std::chrono::steady_clock::time_point{}) {
+                wall_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                    std::chrono::steady_clock::now() - lfm2_lm_head_begin)
+                                                    .count());
+            }
+            auto& profile = callback_work_ctx->qwen36_profile;
+            profile.lfm2_decode_lm_head_custom_gemv_used_ops.fetch_add(1, std::memory_order_relaxed);
+            if (wall_ns > 0) {
+                profile.lfm2_decode_lm_head_custom_gemv_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+            }
         }
         if (!matmul_dispatch_census_enabled) {
             if (gemma4_decode_begin != std::chrono::steady_clock::time_point{}) {
@@ -4648,13 +4663,9 @@ inline struct ggml_tensor* ggml_mul_mat_gemv(struct ggml_context* ctx, struct gg
     userdata->K = K;
     userdata->weight_type = weight->type;
     userdata->input_quant_type = GGML_TYPE_F32;
-    userdata->model_identity = 0;
     userdata->dynamic_lora_active = false;
-    userdata->force_q8_repacked_gemv = false;
     userdata->work_ctx = GetCurrentWorkContext();
     userdata->phase_snapshot = GetCurrentExecutionPhase();
-    userdata->gemma4_decode_native = false;
-    userdata->gemma4_decode_lm_head = false;
     if (const BatchSpec* batch = GetCurrentBatch()) {
         userdata->dynamic_lora_active = !batch->lora_map.empty();
     }
@@ -6749,6 +6760,11 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             !IsGemma4SharedDenseFfnWeightName(w_name);
         ud->gemma4_decode_native = gemma4_decode_native_allowed;
         ud->gemma4_decode_lm_head = gemma4_lm_head;
+        const bool lfm2_tied_lm_head =
+            model && model->arch_flags.is_lfm2_shortconv &&
+            (model->output == weight || std::strcmp(w_name, "token_embd.weight") == 0 ||
+             std::strcmp(w_name, "output.weight") == 0 || std::strcmp(w_name, "output") == 0);
+        ud->lfm2_decode_lm_head = lfm2_tied_lm_head && matmul_expected_decode;
         if (dispatch_work_ctx && is_gemma4_model && ggml_is_quantized(weight->type)) {
             dispatch_work_ctx->qwen36_profile.ggml_delegated_quant_gemv_ops.fetch_add(
                 1, std::memory_order_relaxed);

@@ -1729,6 +1729,10 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         lfm2_w2_q6k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
     const uint64_t lfm2_w2_q8_0_direct_used_ops =
         lfm2_w2_q8_0_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
+    const uint64_t lfm2_decode_lm_head_custom_gemv_used_ops =
+        lfm2_summary ? req->lfm2_decode_lm_head_custom_gemv_used_ops : 0;
+    const uint64_t lfm2_decode_lm_head_custom_gemv_ns =
+        lfm2_summary ? req->lfm2_decode_lm_head_custom_gemv_ns : 0;
     const uint64_t lfm2_shortconv_sequence_fast_used_ops = lfm2_summary ? req->ssm_conv1d_calls : 0;
     const uint64_t lfm2_decode_graph_rebuilds = lfm2_summary ? req->graph_cache_miss_count : 0;
     const char* qwen35_native_moe_down_exec_path =
@@ -2286,6 +2290,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " lfm2_w2_q5k_vecdot_used_ops=" << lfm2_w2_q5k_vecdot_used_ops
         << " lfm2_w2_q6k_vecdot_used_ops=" << lfm2_w2_q6k_vecdot_used_ops
         << " lfm2_w2_q8_0_direct_used_ops=" << lfm2_w2_q8_0_direct_used_ops
+        << " lfm2_decode_lm_head_custom_gemv_used_ops=" << lfm2_decode_lm_head_custom_gemv_used_ops
+        << " lfm2_decode_lm_head_custom_gemv_ms=" << ns_to_ms(lfm2_decode_lm_head_custom_gemv_ns)
         << " lfm2_greedy_lm_head_argmax_used_ops=0"
         << " lfm2_shortconv_sequence_fast_used_ops=" << lfm2_shortconv_sequence_fast_used_ops
         << " lfm2_decode_graph_rebuilds=" << lfm2_decode_graph_rebuilds

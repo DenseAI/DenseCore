@@ -6081,6 +6081,10 @@ void EngineLoop(EngineState* state) {
                     req->gemv_custom_phase_unknown_ops += qwen36_profile.gemv_custom_phase_unknown_ops;
                     req->gemv_custom_force_reference_ops += qwen36_profile.gemv_custom_force_reference_ops;
                     req->gemv_custom_dynamic_lora_ops += qwen36_profile.gemv_custom_dynamic_lora_ops;
+                    req->lfm2_decode_lm_head_custom_gemv_used_ops +=
+                        qwen36_profile.lfm2_decode_lm_head_custom_gemv_used_ops;
+                    req->lfm2_decode_lm_head_custom_gemv_ns +=
+                        qwen36_profile.lfm2_decode_lm_head_custom_gemv_ns;
                     for (std::size_t i = 0; i < req->gemv_custom_weight_type_hist.size(); ++i) {
                         req->gemv_custom_weight_type_hist[i] += qwen36_profile.gemv_custom_weight_type_hist[i];
                     }
