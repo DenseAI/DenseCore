@@ -2667,8 +2667,15 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // Apply Multi-LoRA [FFN Down]
             struct ggml_tensor* ffn_input = cur;
-            cur = prefer_plain_qwen35_hybrid_ffn_down ? ggml_mul_mat(ctx_c, ffn_down, cur)
-                                                      : smart_mul_mat(ctx_c, ffn_down, cur, model);
+            if (prefer_plain_qwen35_hybrid_ffn_down) {
+                RecordQwenTargetGgmlComputeFallback(GetCurrentWorkContext(), model,
+                                                    densecore::runtime::GgmlComputeOp::Matmul,
+                                                    "qwen35_hybrid_dense_ffn_down_plain_ggml", ffn_down->name,
+                                                    GetCurrentExecutionPhase());
+                cur = ggml_mul_mat(ctx_c, ffn_down, cur);
+            } else {
+                cur = smart_mul_mat(ctx_c, ffn_down, cur, model);
+            }
             if (ShouldRunFfnProjectionReferenceProbe(il)) {
                 ProjectionReferenceUserData* down_ref_ud = GetProjectionReferenceUserData();
                 down_ref_ud->weight_tensor = ffn_down;
