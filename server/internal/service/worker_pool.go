@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"descore-server/internal/domain"
@@ -14,6 +15,7 @@ import (
 type QueueProcessor struct {
 	queue        *queue.RequestQueue
 	modelService domain.ModelService
+	admissionMu  sync.Mutex
 }
 
 type awaitableEngine interface {
@@ -122,18 +124,29 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 
 		// 4. Submit to Engine
 		submitStart := time.Now()
+		completionScopedAdmission := engineRequiresCompletionScopedAdmission(engine)
+		admissionLocked := false
+		if completionScopedAdmission {
+			p.admissionMu.Lock()
+			admissionLocked = true
+		}
 		if envFlagEnabled("DENSECORE_DEBUG_REQUEST_LIFECYCLE") {
 			slog.Info("request lifecycle: engine_submit_begin",
 				slog.String("trace_id", req.TraceID),
 				slog.String("queue_request_id", req.ID),
 				slog.Int("worker_id", workerID),
 				slog.Int("queue_wait_ms", int(queueWaitMS)),
+				slog.Bool("completion_scoped_admission", completionScopedAdmission),
 			)
 		}
 		completionCh, err := p.submitRequestToEngine(engine, req, outputChan)
 		engineSubmitMS := durationMillis(time.Since(submitStart))
 
 		if err != nil {
+			if admissionLocked {
+				p.admissionMu.Unlock()
+				admissionLocked = false
+			}
 			slog.Error("engine submission failed",
 				slog.String("trace_id", req.TraceID),
 				slog.String("req_id", req.ID),
@@ -154,6 +167,14 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 				return
 			}
 			trackerStarted = true
+			if completionScopedAdmission {
+				p.trackCompletion(req, outputChan, completionCh, abandoned)
+				if admissionLocked {
+					p.admissionMu.Unlock()
+					admissionLocked = false
+				}
+				return
+			}
 			go p.trackCompletion(req, outputChan, completionCh, abandoned)
 		}
 
@@ -181,6 +202,20 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 
 		slog.Debug("worker submitted request", slog.Int("worker_id", workerID), slog.String("req_id", req.ID))
 	}
+}
+
+func engineRequiresCompletionScopedAdmission(engine domain.Engine) bool {
+	provider, ok := engine.(domain.RuntimeOptimizationStateProvider)
+	if !ok {
+		return false
+	}
+	state, err := provider.GetRuntimeOptimizationState()
+	if err != nil {
+		slog.Warn("runtime optimization state unavailable; preserving async admission",
+			slog.String("error", err.Error()))
+		return false
+	}
+	return state.HybridSSMSnapshotRestoreEnabled
 }
 
 func (p *QueueProcessor) submitRequestToEngine(engine domain.Engine, req *queue.QueuedRequest, outputChan chan domain.StreamEvent) (<-chan struct{}, error) {

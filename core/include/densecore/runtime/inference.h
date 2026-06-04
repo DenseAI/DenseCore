@@ -282,8 +282,6 @@ struct Qwen36ProfileSnapshot {
     uint64_t q4k_repacked_gemv_resident_bytes = 0;
     uint64_t q4k_repacked_gemv_distinct_weights_seen = 0;
     uint64_t q4k_repacked_gemv_repeated_repack_count = 0;
-    uint64_t q4k_copied_gemv_experiment_cache_hits = 0;
-    uint64_t q4k_copied_gemv_experiment_cache_misses = 0;
     uint64_t qact_cache_hits = 0;
     uint64_t qact_cache_misses = 0;
     uint64_t qact_cache_reused_bytes = 0;
@@ -489,8 +487,6 @@ struct Qwen36ProfileSnapshot {
     uint64_t qwen36_prefill_mlp_or_moe_ns = 0;
     uint64_t qwen36_prefill_graph_build_ns = 0;
     uint64_t qwen36_prefill_graph_execute_ns = 0;
-    int q4k_copied_gemv_experiment_used = 0;
-    int q4k_copied_gemv_experiment_last_reject_reason = 0;
     int paged_attn_decode_head_tile_effective = 0;
     int arm_batched_quant_used = 0;
     int attention_path_paged = 0;
@@ -575,11 +571,8 @@ const char* Q6KGemvRejectReasonName(int reason);
 const char* Qwen35MoEPathName(int code);
 bool Q4KRepackedGemvRejectReasonIsCacheThrash(int reason);
 const char* GemvCustomTaskCapReasonName(int reason);
-const char* Q4KCopiedGemvExperimentRejectReasonName(int reason);
 const char* Qwen36PrefillQ4KBatchedRejectReasonName(int reason);
 const char* Qwen36SSMQ8PrefillAMXRejectReasonName(int reason);
-void ClearQ4KCopiedGemvExperimentCacheForModel(uintptr_t model_identity);
-void ClearQ4KCopiedGemvExperimentCache();
 bool PrepareQwen36SSMQ8PrefillAMXAliasesForExecution(TransformerModel* model);
 void ClearQwen36SSMQ8PrefillAMXAliases(TransformerModel* model);
 

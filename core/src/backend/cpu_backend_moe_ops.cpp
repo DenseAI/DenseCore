@@ -638,19 +638,11 @@ bool IsKQuantRowPairGatedProjectionType(ggml_type weight_type, ggml_type input_t
 }
 
 bool CanUseQ4KRepackedMoEGemvFastPath() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return false;
-#else
-    return ggml_cpu_has_avx2();
-#endif
+    return densecore::kernels::Q4KRealPackedGemvKernelAvailable();
 }
 
 bool CanUseQ4KRepackedMoEGEGLUFastPath() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return false;
-#else
-    return ggml_cpu_has_avx2();
-#endif
+    return densecore::kernels::Q4KRealPackedGemvKernelAvailable();
 }
 
 densecore::env::RuntimeToggleMode Gemma4NativeFusedGeluMode() {
@@ -659,11 +651,7 @@ densecore::env::RuntimeToggleMode Gemma4NativeFusedGeluMode() {
 }
 
 bool CanUseQ4KRepackedMoEPrefillFastPath() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return false;
-#else
-    return ggml_cpu_has_avx2();
-#endif
+    return densecore::kernels::Q4KRealPackedGemvKernelAvailable();
 }
 
 densecore::env::RuntimeToggleMode Gemma4MoEPrefillQuantBatchMode() {
@@ -752,12 +740,6 @@ bool IsQwenA3BHybridMoEModel(const TransformerModel* model);
 bool IsLFM2MoEModelForSmallDecodeParallel(const TransformerModel* model);
 
 bool CanUseSmallDecodeQuantizedTileParallel(const TransformerModel* model) {
-    const char* env = std::getenv("DENSECORE_MOE_ENABLE_SMALL_DECODE_QUANT_TILE_PARALLEL");
-    if (env && env[0] != '\0') {
-        return std::strcmp(env, "0") != 0 && std::strcmp(env, "off") != 0 && std::strcmp(env, "OFF") != 0;
-    }
-    // Enable by default for high-top-k CPU MoE decode models; tile-parallel
-    // GEMV spreads single-token expert work across all available cores.
     return IsQwenA3BHybridMoEModel(model) || IsLFM2MoEModelForSmallDecodeParallel(model);
 }
 
@@ -783,30 +765,19 @@ static_assert(sizeof(MoEQ6Kx8Block) == 8 * sizeof(uint16_t) + (QK_K / 16) * 8 + 
               "MoE Q6_Kx8 block layout must match ggml block_q6_Kx8");
 
 size_t GetRepackedMoECacheLimitBytes() {
-    // Backward-compatible name: this cache limit now applies to the remaining
-    // MoE-local Q5_K/Q6_K repack caches. Q4_K uses the shared single-flight
-    // densecore::kernels::Q4KRepackedGemvWeight cache below.
-    const char* env = std::getenv("DENSECORE_MOE_Q4K_REPACK_CACHE_MB");
-    if (!env || env[0] == '\0') {
-        constexpr size_t kMinBytes = 1024ull * 1024ull * 1024ull;
-        constexpr size_t kMaxBytes = 4ull * 1024ull * 1024ull * 1024ull;
+    constexpr size_t kMinBytes = 1024ull * 1024ull * 1024ull;
+    constexpr size_t kMaxBytes = 4ull * 1024ull * 1024ull * 1024ull;
 #if defined(__linux__)
-        struct sysinfo info {};
-        if (sysinfo(&info) == 0 && info.mem_unit > 0) {
-            const uint64_t unit = static_cast<uint64_t>(info.mem_unit);
-            const uint64_t free_bytes =
-                (static_cast<uint64_t>(info.freeram) + static_cast<uint64_t>(info.bufferram)) * unit;
-            const size_t target = static_cast<size_t>(free_bytes / 8);
-            return std::clamp(target, kMinBytes, kMaxBytes);
-        }
+    struct sysinfo info {};
+    if (sysinfo(&info) == 0 && info.mem_unit > 0) {
+        const uint64_t unit = static_cast<uint64_t>(info.mem_unit);
+        const uint64_t free_bytes =
+            (static_cast<uint64_t>(info.freeram) + static_cast<uint64_t>(info.bufferram)) * unit;
+        const size_t target = static_cast<size_t>(free_bytes / 8);
+        return std::clamp(target, kMinBytes, kMaxBytes);
+    }
 #endif
-        return 2ull * 1024ull * 1024ull * 1024ull;
-    }
-    const long long mb = std::strtoll(env, nullptr, 10);
-    if (mb <= 0) {
-        return 0;
-    }
-    return static_cast<size_t>(mb) * 1024ull * 1024ull;
+    return 2ull * 1024ull * 1024ull * 1024ull;
 }
 
 struct RepackedMoEKey {
@@ -1698,14 +1669,6 @@ void LogSmallDecodeExecutionPath(const char* path, int assignments, int workers,
                  assignments, workers, batch_size);
 }
 
-void LogSmallDecodeFallback(const char* reason, int assignments, int workers, int batch_size) {
-    if (!IsMoEMatmulPathDebugEnabled()) {
-        return;
-    }
-    std::fprintf(stderr, "[MOE_SMALL_DECODE] path=serial_fallback reason=%s assignments=%d workers=%d batch=%d\n",
-                 reason ? reason : "unknown", assignments, workers, batch_size);
-}
-
 bool IsQwenA3BHybridMoEModel(const TransformerModel* model) {
     return model && (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
            model->arch_flags.is_hybrid_ssm && model->hparams.n_experts > 0 && model->hparams.n_experts_used > 1;
@@ -1730,23 +1693,6 @@ bool IsSmallDecodeExpertParallelSimdLevel(densecore::simd::SimdLevel level) {
            densecore::simd::HasX86Avx2OrBetter(level);
 }
 
-densecore::env::RuntimeToggleMode ResolveSmallDecodeExpertParallelMode(const TransformerModel* model) {
-    const densecore::env::RuntimeToggleMode generic_mode = densecore::env::ParseRuntimeToggleMode(
-        "DENSECORE_MOE_SMALL_DECODE_EXPERT_PARALLEL", densecore::env::RuntimeToggleMode::Auto);
-    if (std::getenv("DENSECORE_MOE_SMALL_DECODE_EXPERT_PARALLEL")) {
-        return generic_mode;
-    }
-    if (model && model->variant == ModelVariant::QWEN35 && std::getenv("DENSECORE_QWEN35_MOE_PARALLEL")) {
-        return densecore::env::ParseRuntimeToggleMode("DENSECORE_QWEN35_MOE_PARALLEL",
-                                                      densecore::env::RuntimeToggleMode::Auto);
-    }
-    if (model && model->variant == ModelVariant::QWEN36 && std::getenv("DENSECORE_QWEN36_MOE_PARALLEL")) {
-        return densecore::env::ParseRuntimeToggleMode("DENSECORE_QWEN36_MOE_PARALLEL",
-                                                      densecore::env::RuntimeToggleMode::Auto);
-    }
-    return densecore::env::RuntimeToggleMode::Auto;
-}
-
 bool ResolveSmallDecodeExpertParallelAutoEligible(const TransformerModel* model, int physical_cores, int worker_cap,
                                                   densecore::simd::SimdLevel level) {
     const int effective_cores = std::max(physical_cores, worker_cap);
@@ -1766,7 +1712,6 @@ int ResolveSmallDecodeExpertWorkers(int top_k, int worker_cap, int requested_ove
 
 struct SmallDecodeExpertParallelDecision {
     bool requested = false;
-    bool forced_on = false;
     bool enabled = false;
     int workers = 1;
     const char* reason = "disabled";
@@ -1779,14 +1724,7 @@ SmallDecodeExpertParallelDecision ResolveSmallDecodeExpertParallelDecision(const
     const int requested_override = GetSmallDecodeExpertWorkers();
     decision.workers = ResolveSmallDecodeExpertWorkers(top_k, worker_cap, requested_override);
 
-    const densecore::env::RuntimeToggleMode mode = ResolveSmallDecodeExpertParallelMode(model);
-    decision.forced_on = mode == densecore::env::RuntimeToggleMode::On;
-    if (mode == densecore::env::RuntimeToggleMode::Off) {
-        decision.reason = "mode_off";
-        return decision;
-    }
-
-    if (!decision.forced_on && !IsSmallDecodeExpertParallelAutoModel(model)) {
+    if (!IsSmallDecodeExpertParallelAutoModel(model)) {
         decision.reason = "not_auto_moe_model";
         return decision;
     }
@@ -1825,7 +1763,7 @@ SmallDecodeExpertParallelDecision ResolveSmallDecodeExpertParallelDecision(const
     }
 
     decision.enabled = true;
-    decision.reason = mode == densecore::env::RuntimeToggleMode::On ? "forced_on" : "auto";
+    decision.reason = "auto";
     return decision;
 }
 
@@ -1876,10 +1814,6 @@ void MaybeLogGemma4PackedChecksum(const CpuBackend::ExpertWeights& expert, const
 }
 
 bool ShouldParallelizeExpertFFNInner(int64_t batch, int64_t hidden_dim, int64_t intermediate_dim) {
-    const char* force_env = std::getenv("DENSECORE_MOE_FORCE_INNER_PARALLEL");
-    if (force_env && force_env[0] != '\0') {
-        return std::strcmp(force_env, "0") != 0;
-    }
 #if defined(__aarch64__) || defined(_M_ARM64)
     // Qwen3.5-35B-A3B batch=1 decode on C4A repeatedly executes tiny expert
     // GEMV/GEMM fragments (top-k experts, one token). Fanning each fragment out
@@ -1889,42 +1823,12 @@ bool ShouldParallelizeExpertFFNInner(int64_t batch, int64_t hidden_dim, int64_t 
     if (batch <= 1 && hidden_dim <= 4096 && intermediate_dim <= 8192 && work_items <= 8192) {
         return false;
     }
+#else
+    (void)batch;
+    (void)hidden_dim;
+    (void)intermediate_dim;
 #endif
     return true;
-}
-
-bool ShouldForcePrefillInnerParallelExperts() {
-    const char* env = std::getenv("DENSECORE_MOE_PREFILL_FORCE_INNER_PARALLEL");
-    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-}
-
-bool ShouldBalanceParallelExpertWork() {
-    const char* env = std::getenv("DENSECORE_MOE_BALANCE_PARALLEL_EXPERT_WORK");
-    if (!env || env[0] == '\0') {
-        return true;
-    }
-    return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
-}
-
-bool ShouldUseDynamicParallelExpertQueue() {
-    const char* env = std::getenv("DENSECORE_MOE_DYNAMIC_PARALLEL_EXPERT_QUEUE");
-    if (!env || env[0] == '\0') {
-        return true;
-    }
-    return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
-}
-
-int GetDynamicParallelExpertQueueChunk() {
-    const char* env = std::getenv("DENSECORE_MOE_DYNAMIC_PARALLEL_EXPERT_QUEUE_CHUNK");
-    if (!env || env[0] == '\0') {
-        return 1;
-    }
-    char* end = nullptr;
-    const long parsed = std::strtol(env, &end, 10);
-    if (end == env || parsed <= 0) {
-        return 1;
-    }
-    return static_cast<int>(std::min<long>(parsed, 32));
 }
 
 bool IsMoEReferenceCheckEnabled() {
@@ -2627,7 +2531,7 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
         RecordMoEQ5KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "pack_or_run_failed");
         return false;
     };
-    const bool enable_q4k_repacked_projection_prefill = false;
+    const bool enable_q4k_repacked_projection_prefill = true;
     if (enable_q4k_repacked_projection_prefill && q4k_prefill_repacked_eligible && prefer_q4k_repacked_prefill) {
         auto packed = GetOrCreateQ4KRepackedMoEWeight(weight_ptr, N, K);
         if (packed && M >= 4 &&
@@ -3849,25 +3753,6 @@ bool TryExecuteMoESafeReferenceFastPath(CpuBackend* backend, const TransformerMo
 
 }  // namespace
 
-bool RunQ4KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* gate_weight_ptr,
-                                               const void* up_weight_ptr, const float* input_data,
-                                               const uint8_t* qinput_data, size_t qinput_row_bytes,
-                                               float* output_data, int64_t rows, int64_t cols, int64_t input_cols,
-                                               int numa_node, bool allow_parallel) {
-    if (!backend || !gate_weight_ptr || !up_weight_ptr || !input_data || !qinput_data || !output_data || rows <= 0 ||
-        cols <= 0 || input_cols <= 0 || qinput_row_bytes == 0) {
-        return false;
-    }
-    auto gate_packed = GetOrCreateQ4KRepackedMoEWeight(gate_weight_ptr, cols, input_cols);
-    auto up_packed = GetOrCreateQ4KRepackedMoEWeight(up_weight_ptr, cols, input_cols);
-    if (!gate_packed || !up_packed) {
-        return false;
-    }
-    return RunQ4KRepackedMoEFusedSwiGLUM4(backend, gate_packed, up_packed, input_data, qinput_data,
-                                          qinput_row_bytes, output_data, rows, cols, input_cols, numa_node,
-                                          allow_parallel);
-}
-
 bool RunQ5KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* gate_weight_ptr,
                                                const void* up_weight_ptr, const float* input_data,
                                                const uint8_t* qinput_data, size_t qinput_row_bytes,
@@ -3890,13 +3775,6 @@ bool RunMoEKQuantRawBatchedProjection(CpuBackend* backend, int ggml_type_id, con
                                       int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel) {
     return RunMoEKQuantRawBatchedProjectionImpl(backend, static_cast<ggml_type>(ggml_type_id), weight_ptr, qinput_data,
                                                qinput_row_bytes, out_data, M, N, K, numa_node, allow_parallel);
-}
-
-bool RunMoEQ4KRawBatchedFusedSwiGLU(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
-                                    const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
-                                    int64_t N, int64_t K, int numa_node, bool allow_parallel) {
-    return RunMoEQ4KRawBatchedFusedSwiGLUImpl(backend, gate_weight_ptr, up_weight_ptr, qinput_data, qinput_row_bytes,
-                                             out_data, M, N, K, numa_node, allow_parallel);
 }
 
 bool RunMoEKQuantRawBatchedFusedSwiGLU(CpuBackend* backend, int ggml_type_id, const void* gate_weight_ptr,
@@ -4783,11 +4661,6 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             }
             return;
         }
-        if (expert_parallel_decision.forced_on) {
-            LogSmallDecodeFallback(expert_parallel_decision.reason, total_assignments, effective_small_decode_workers,
-                                   batch_size);
-        }
-
         const bool reused_single_output_scratch = small_decode_output_scratch.HasCapacity(hidden_dim);
         small_decode_output_scratch.Resize(this, hidden_dim);
         if (profile && reused_single_output_scratch) {
@@ -5138,25 +5011,6 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             }
         }
     }
-    if (!small_decode_ready) {
-        const SmallDecodeExpertParallelDecision expert_parallel_decision =
-            ResolveSmallDecodeExpertParallelDecision(model, batch_size, top_k, safe_reference_mode, /*worker_cap=*/1);
-        if (expert_parallel_decision.forced_on) {
-            const char* fallback_reason = expert_parallel_decision.reason;
-            if (!small_decode_candidate) {
-                fallback_reason = "shape_not_small_decode";
-            } else if (small_decode_requires_general_path) {
-                fallback_reason = "weights_require_general_path";
-            } else if (!small_step_snapshot_ok) {
-                fallback_reason = "snapshot_unavailable";
-            } else if (small_step_max_expert_batch > 1) {
-                fallback_reason = "expert_batch_gt_one";
-            } else if (small_step_current_batch_expert_count <= 0) {
-                fallback_reason = "no_active_experts";
-            }
-            LogSmallDecodeFallback(fallback_reason, total_assignments, 1, batch_size);
-        }
-    }
     const int reuse_union =
         static_cast<int>(current_batch_experts.size() + previous_batch_experts.size() - reuse_intersection);
     const int max_expert_batch = reorder_map.max_expert_batch;
@@ -5337,11 +5191,8 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
     std::chrono::steady_clock::duration dequant_duration{};
     std::chrono::steady_clock::duration expert_duration{};
     std::mutex work_stats_mutex;
-    const bool force_inner_parallel_prefill =
-        ShouldForcePrefillInnerParallelExperts() && !small_decode_step && batch_size > 1;
     const bool prefer_inner_parallel_prefill =
-        force_inner_parallel_prefill ||
-        (!small_decode_step && batch_size > 1 && active_work.size() < static_cast<size_t>(worker_threads));
+        !small_decode_step && batch_size > 1 && active_work.size() < static_cast<size_t>(worker_threads);
     const bool parallelize_experts = !prefer_inner_parallel_prefill && !small_decode_step && batch_size > 1 &&
                                      active_work.size() >= static_cast<size_t>(std::max(4, worker_threads / 2)) &&
                                      registry != nullptr;
@@ -5351,12 +5202,10 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                      "dequant_cache_enabled=%d parallelize_experts=%d reason=%s\n",
                      arm_disable_registry_dequant_cache ? 1 : 0, registry ? 1 : 0, dequant_cache_enabled ? 1 : 0,
                      parallelize_experts ? 1 : 0,
-                     force_inner_parallel_prefill    ? "prefill_inner_parallel_forced"
-                     : prefer_inner_parallel_prefill ? "prefill_inner_parallel"
-                                                     : "cache_lane_available");
+                     prefer_inner_parallel_prefill ? "prefill_inner_parallel" : "cache_lane_available");
     }
 
-    if (parallelize_experts && ShouldBalanceParallelExpertWork() && active_work.size() > 1) {
+    if (parallelize_experts && active_work.size() > 1) {
         const int active_threads = std::max(1, std::min(worker_threads, static_cast<int>(active_work.size())));
         const int work_per_thread = (static_cast<int>(active_work.size()) + active_threads - 1) / active_threads;
         std::vector<ActiveExpertWork> by_cost = active_work;
@@ -5674,10 +5523,9 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
 
     if (parallelize_experts) {
         const int active_threads = std::max(1, std::min(worker_threads, static_cast<int>(active_work.size())));
-        if (ShouldUseDynamicParallelExpertQueue() && active_work.size() > static_cast<size_t>(active_threads)) {
+        if (active_work.size() > static_cast<size_t>(active_threads)) {
             std::atomic<int> next_expert{0};
-            const int queue_chunk =
-                std::max(1, std::min(GetDynamicParallelExpertQueueChunk(), static_cast<int>(active_work.size())));
+            constexpr int queue_chunk = 1;
             reorder_pool.ParallelFor(active_threads, [&](int, int, int) {
                 for (;;) {
                     const int idx = next_expert.fetch_add(queue_chunk, std::memory_order_relaxed);

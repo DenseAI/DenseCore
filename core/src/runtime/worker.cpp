@@ -5952,9 +5952,6 @@ void EngineLoop(EngineState* state) {
                                  qwen36_profile.q4k_repacked_gemv_distinct_weights_seen);
                     req->q4k_repacked_gemv_repeated_repack_count +=
                         qwen36_profile.q4k_repacked_gemv_repeated_repack_count;
-                    req->q4k_copied_gemv_experiment_cache_hits += qwen36_profile.q4k_copied_gemv_experiment_cache_hits;
-                    req->q4k_copied_gemv_experiment_cache_misses +=
-                        qwen36_profile.q4k_copied_gemv_experiment_cache_misses;
                     req->qact_cache_hits += qwen36_profile.qact_cache_hits;
                     req->qact_cache_misses += qwen36_profile.qact_cache_misses;
                     req->qact_cache_reused_bytes += qwen36_profile.qact_cache_reused_bytes;
@@ -6381,14 +6378,6 @@ void EngineLoop(EngineState* state) {
                     req->qwen36_prefill_mlp_or_moe_ns += qwen36_profile.qwen36_prefill_mlp_or_moe_ns;
                     req->qwen36_prefill_graph_build_ns += qwen36_profile.qwen36_prefill_graph_build_ns;
                     req->qwen36_prefill_graph_execute_ns += qwen36_profile.qwen36_prefill_graph_execute_ns;
-                    req->q4k_copied_gemv_experiment_used =
-                        std::max(req->q4k_copied_gemv_experiment_used, qwen36_profile.q4k_copied_gemv_experiment_used);
-                    if (qwen36_profile.q4k_copied_gemv_experiment_last_reject_reason != 0) {
-                        req->q4k_copied_gemv_experiment_last_reject_reason =
-                            qwen36_profile.q4k_copied_gemv_experiment_last_reject_reason;
-                        req->q4k_copied_gemv_experiment_reject_reason = Q4KCopiedGemvExperimentRejectReasonName(
-                            qwen36_profile.q4k_copied_gemv_experiment_last_reject_reason);
-                    }
                     req->paged_attn_decode_head_tile_effective =
                         std::max(req->paged_attn_decode_head_tile_effective,
                                  qwen36_profile.paged_attn_decode_head_tile_effective);

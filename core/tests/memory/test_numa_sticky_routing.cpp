@@ -1452,7 +1452,7 @@ TEST(NumaStickyRouting, ForwardMoE_ExpertFlagForcesReferencePathOnArm) {
 #endif
 }
 
-TEST(NumaStickyRouting, ForwardMoESmallDecodeExpertParallelMatchesSerialRoutingOrder) {
+TEST(NumaStickyRouting, ForwardMoESmallDecodeMatchesSerialRoutingOrder) {
     if (std::thread::hardware_concurrency() < 2) {
         GTEST_SKIP() << "Needs at least two hardware threads to exercise expert-parallel small decode.";
     }
@@ -1494,14 +1494,8 @@ TEST(NumaStickyRouting, ForwardMoESmallDecodeExpertParallelMatchesSerialRoutingO
 
     std::vector<float> parallel_output(static_cast<size_t>(batch * hidden_dim), 0.0f);
     Tensor parallel_output_tensor = Tensor::Make2D(parallel_output.data(), batch, hidden_dim);
-    EnvGuard parallel_enable("DENSECORE_MOE_SMALL_DECODE_EXPERT_PARALLEL", "1");
-    EnvGuard parallel_workers("DENSECORE_MOE_SMALL_DECODE_EXPERT_WORKERS", "4");
-    EnvGuard matmul_trace("DENSECORE_DEBUG_MOE_MATMUL_PATHS", "1");
-    ::testing::internal::CaptureStderr();
     backend.ForwardMoE(input_tensor, routing, experts, &parallel_output_tensor);
-    const std::string stderr_output = ::testing::internal::GetCapturedStderr();
 
-    EXPECT_NE(stderr_output.find("[MOE_SMALL_DECODE] path=expert_parallel"), std::string::npos);
     for (size_t i = 0; i < serial_output.size(); ++i) {
         EXPECT_NEAR(parallel_output[i], serial_output[i], 1e-5f) << "index=" << i;
     }

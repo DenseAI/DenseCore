@@ -416,8 +416,6 @@ struct Request {
     uint64_t q4k_repacked_gemv_resident_bytes = 0;
     uint64_t q4k_repacked_gemv_distinct_weights_seen = 0;
     uint64_t q4k_repacked_gemv_repeated_repack_count = 0;
-    uint64_t q4k_copied_gemv_experiment_cache_hits = 0;
-    uint64_t q4k_copied_gemv_experiment_cache_misses = 0;
     uint64_t qact_cache_hits = 0;
     uint64_t qact_cache_misses = 0;
     uint64_t qact_cache_reused_bytes = 0;
@@ -651,9 +649,6 @@ struct Request {
     uint64_t gemma4_prefill_mul_mat_id_ns = 0;
     uint64_t gemma4_prefill_mul_mat_ns = 0;
     uint64_t gemma4_prefill_flash_attention_ns = 0;
-    int q4k_copied_gemv_experiment_used = 0;
-    int q4k_copied_gemv_experiment_last_reject_reason = 0;
-    std::string q4k_copied_gemv_experiment_reject_reason;
     std::string callback_mode;
     int paged_attn_decode_head_tile_effective = 0;
     int arm_batched_quant_used = 0;
@@ -854,8 +849,6 @@ struct Request {
         q4k_repacked_gemv_resident_bytes = 0;
         q4k_repacked_gemv_distinct_weights_seen = 0;
         q4k_repacked_gemv_repeated_repack_count = 0;
-        q4k_copied_gemv_experiment_cache_hits = 0;
-        q4k_copied_gemv_experiment_cache_misses = 0;
         qact_cache_hits = 0;
         qact_cache_misses = 0;
         qact_cache_reused_bytes = 0;
@@ -1089,9 +1082,6 @@ struct Request {
         gemma4_prefill_mul_mat_id_ns = 0;
         gemma4_prefill_mul_mat_ns = 0;
         gemma4_prefill_flash_attention_ns = 0;
-        q4k_copied_gemv_experiment_used = 0;
-        q4k_copied_gemv_experiment_last_reject_reason = 0;
-        q4k_copied_gemv_experiment_reject_reason.clear();
         callback_mode.clear();
         paged_attn_decode_head_tile_effective = 0;
         arm_batched_quant_used = 0;
@@ -1867,10 +1857,6 @@ struct EngineState {
 
         if (!lru_id.empty()) {
             LOG_INFO("Evicting LRU model: ", lru_id);
-            auto it = models.find(lru_id);
-            if (it != models.end() && it->second && it->second->model) {
-                ClearQ4KCopiedGemvExperimentCacheForModel(reinterpret_cast<uintptr_t>(it->second->model.get()));
-            }
             models.erase(lru_id);
         }
     }
@@ -2002,7 +1988,6 @@ struct EngineState {
         // Cleanup all models - smart pointers handle automatic cleanup
         {
             std::lock_guard<std::mutex> lock(models_mu);
-            ClearQ4KCopiedGemvExperimentCache();
             models.clear();
         }
 

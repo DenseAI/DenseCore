@@ -142,15 +142,6 @@ std::string SummaryToken(std::string value) {
     return value;
 }
 
-densecore::env::RuntimeToggleMode ParseSummaryRuntimeToggleFailClosed(const char* name,
-                                                                      densecore::env::RuntimeToggleMode default_mode) {
-    const char* value = std::getenv(name);
-    if (!value || value[0] == '\0') {
-        return default_mode;
-    }
-    return densecore::env::ParseRuntimeToggleModeValue(value, densecore::env::RuntimeToggleMode::Off);
-}
-
 int EffectiveCloudWorkerCap(int physical_core_count, int base_threads, bool benchmark_or_server_perf_profile) {
     if (!benchmark_or_server_perf_profile || base_threads < 16) {
         return CapThreadsToAvailableCores(physical_core_count, base_threads);
@@ -1678,8 +1669,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const std::string qwen35_moe_w2_hist = weight_hist_string(req->qwen35_moe_w2_weight_type_hist);
     const std::string qwen36_prefill_top_slow_ops = shape_census_string(req->qwen36_prefill_top_slow_ops);
     const std::string gemma4_prefill_top_slow_ops = shape_census_string(req->gemma4_prefill_top_slow_ops);
-    const auto native_moe_fast_decode_config = ParseSummaryRuntimeToggleFailClosed(
-        "DENSECORE_NATIVE_MOE_FAST_DECODE", densecore::env::RuntimeToggleMode::Auto);
+    const auto native_moe_fast_decode_config = densecore::env::RuntimeToggleMode::On;
     const bool native_moe_fast_w2_q5k_used = req->native_moe_fast_w2_q5k_used_ops > 0;
     const bool native_moe_fast_w2_q5k_rejected = req->native_moe_fast_w2_q5k_rejected_ops > 0;
     const char* native_moe_fast_mode_effective = "auto_discovery_only";
@@ -2127,13 +2117,6 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " q6k_gemv_weight_shapes=" << q6k_gemv_weight_shapes
         << " q6k_gemv_total_ms=" << ns_to_ms(req->q6k_gemv_total_ns)
         << " q6k_gemv_effective_state=" << q6k_effective_state
-        << " q4k_copied_gemv_experiment_used=" << req->q4k_copied_gemv_experiment_used
-        << " q4k_copied_gemv_experiment_cache_hits=" << req->q4k_copied_gemv_experiment_cache_hits
-        << " q4k_copied_gemv_experiment_cache_misses=" << req->q4k_copied_gemv_experiment_cache_misses
-        << " q4k_copied_gemv_experiment_reject_reason="
-        << (req->q4k_copied_gemv_experiment_reject_reason.empty()
-                ? "none"
-                : req->q4k_copied_gemv_experiment_reject_reason.c_str())
         << " qact_cache_hits=" << req->qact_cache_hits << " qact_cache_misses=" << req->qact_cache_misses
         << " qact_cache_reused_bytes=" << req->qact_cache_reused_bytes
         << " moe_small_decode_parallel_candidate_ops=" << req->moe_small_decode_parallel_candidate_ops

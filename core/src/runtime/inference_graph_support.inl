@@ -3736,39 +3736,6 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
     if (ith == 0 && shared_q8) {
         shared_q8->repacked_swiglu_failed.store(0, std::memory_order_relaxed);
     }
-    if (q4_gateup && shared_q8 && shared_q8->prefer_q4k_repacked_swiglu && n_tokens == 1 && use_shared_q8) {
-        if (ith != 0) {
-            return;
-        }
-        densecore::CpuBackend& backend = densecore::GetCpuBackend();
-        const float* input_row = Qwen35NativeMoEGateUpInputRowPtr(input, 0);
-        const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, 0, 0);
-        if (!input_row || !qrow) {
-            shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
-            return;
-        }
-        for (int64_t k = 0; k < top_k; ++k) {
-            int32_t expert = -1;
-            if (!Qwen35NativeMoEDownQ5KReadExpert(selected_experts, gate_exps, 0, k, &expert)) {
-                continue;
-            }
-            const char* gate_base = static_cast<const char*>(gate_exps->data) +
-                                    static_cast<size_t>(expert) * static_cast<size_t>(gate_exps->nb[2]);
-            const char* up_base = static_cast<const char*>(up_exps->data) +
-                                  static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]);
-            float* out = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                  static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]));
-            const bool ok = densecore::RunQ4KRepackedMoEFusedSwiGLURawProjection(
-                &backend, gate_base, up_base, input_row, qrow, shared_q8->row_bytes, out, /*rows=*/1, n_ff,
-                gate_exps->ne[0], /*numa_node=*/0, /*allow_parallel=*/false);
-            if (!ok) {
-                shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
-                return;
-            }
-        }
-        ProbeQwen35NativeMoEGateUpReference(dst, gate_exps, up_exps, input, selected_experts, 0, n_ff, shared_q8);
-        return;
-    }
     // Qwen Q5_K decode fast lane: run the loader-owned single-copy q5_K_8x8
     // layout through ggml's GEMV kernel. Do not build a runtime repack cache
     // here: keeping both raw Q5_K and q5_K_8x8 copies was the RAM wall for 35B
@@ -3869,6 +3836,7 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                                   static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]);
             const void* gate_row_start = gate_base + static_cast<size_t>(row_start) * weight_row_bytes;
             const void* up_row_start = up_base + static_cast<size_t>(row_start) * weight_row_bytes;
+            const bool repacked_gateup = q5_single_copy_8x8;
             const bool can_use_batched_gateup =
                 (q4_gateup || q5_gateup) && (compact_gateup_rows || q5_single_copy_8x8) && row_count > 0 &&
                 group_end - group_start >= 2 && shared_q8 && shared_q8->row_bytes > 0 &&
@@ -3877,7 +3845,7 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                 densecore::CpuBackend& backend = densecore::GetCpuBackend();
                 const size_t qrow_bytes = shared_q8->row_bytes;
                 gateup_qtile.resize(static_cast<size_t>(kQwen35NativeMoEGateUpBatchTile) * qrow_bytes);
-                if (q5_single_copy_8x8) {
+                if (repacked_gateup) {
                     gateup_input_tile.resize(static_cast<size_t>(kQwen35NativeMoEGateUpBatchTile) *
                                              static_cast<size_t>(gate_exps->ne[0]));
                 }
@@ -3889,13 +3857,13 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                         const Qwen35MoEAssignment& assignment = assignment_data[tile_start++];
                         const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, assignment.token, 0);
                         const float* input_row =
-                            q5_single_copy_8x8 ? Qwen35NativeMoEGateUpInputRowPtr(input, assignment.token) : nullptr;
-                        if (!qrow || (q5_single_copy_8x8 && !input_row)) {
+                            repacked_gateup ? Qwen35NativeMoEGateUpInputRowPtr(input, assignment.token) : nullptr;
+                        if (!qrow || (repacked_gateup && !input_row)) {
                             shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
                             return;
                         }
                         std::memcpy(gateup_qtile.data() + tile_count * qrow_bytes, qrow, qrow_bytes);
-                        if (q5_single_copy_8x8) {
+                        if (repacked_gateup) {
                             std::memcpy(gateup_input_tile.data() + tile_count * static_cast<size_t>(gate_exps->ne[0]),
                                         input_row, static_cast<size_t>(gate_exps->ne[0]) * sizeof(float));
                         }
@@ -3905,12 +3873,7 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                         continue;
                     }
                     const bool ok =
-                        q4_gateup
-                            ? densecore::RunMoEQ4KRawBatchedFusedSwiGLU(
-                                  &backend, gate_row_start, up_row_start, gateup_qtile.data(), qrow_bytes,
-                                  gateup_tile_out.data(), static_cast<int64_t>(tile_count), row_count,
-                                  gate_exps->ne[0], /*numa_node=*/0, /*allow_parallel=*/false)
-                            : q5_single_copy_8x8
+                        q5_single_copy_8x8
                             ? densecore::RunQ5KRepackedMoEFusedSwiGLURawProjection(
                                   &backend, gate_row_start, up_row_start, gateup_input_tile.data(),
                                   gateup_qtile.data(), qrow_bytes, gateup_tile_out.data(),
@@ -4047,8 +4010,11 @@ static void cb_qwen35_native_moe_gateup_raw_qxk_swiglu(struct ggml_tensor* dst, 
             shared_q8 && shared_q8->repacked_swiglu_failed.load(std::memory_order_relaxed) != 0;
         const char* reject_reason = nullptr;
         if (swiglu_failed) {
-            reject_reason = shared_q8->prefer_q4k_repacked_swiglu ? "lfm2_w1w3_repacked_swiglu_failed"
-                                                                  : "lfm2_w1w3_range_swiglu_failed";
+            reject_reason = shared_q8->q5k_gateup_8x8_single_copy_required
+                                ? "qwen35_gateup_q5k_single_copy_failed"
+                            : shared_q8->prefer_q4k_repacked_swiglu
+                                ? "lfm2_w1w3_repacked_swiglu_failed"
+                                : "lfm2_w1w3_range_swiglu_failed";
         }
         RecordNativeMoEFastDecodeDecision(GetCurrentWorkContext(), /*candidate=*/true, /*used=*/!swiglu_failed,
                                          reject_reason, /*w1w3_used=*/!swiglu_failed, /*w2_used=*/false,

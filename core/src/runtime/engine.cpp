@@ -3064,10 +3064,6 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
     // Add to pool
     {
         std::lock_guard<std::mutex> lock(state->models_mu);
-        auto old = state->models.find(model_id);
-        if (old != state->models.end() && old->second && old->second->model) {
-            ClearQ4KCopiedGemvExperimentCacheForModel(reinterpret_cast<uintptr_t>(old->second->model.get()));
-        }
         state->models[model_id] = std::move(entry);
 
         // Set as default if no default exists
@@ -3101,9 +3097,6 @@ int UnloadModel(DenseCoreHandle handle, const char* model_id) {
         return DENSECORE_STATUS_INVALID_ARGUMENT;  // Cannot unload last model
     }
 
-    if (it->second && it->second->model) {
-        ClearQ4KCopiedGemvExperimentCacheForModel(reinterpret_cast<uintptr_t>(it->second->model.get()));
-    }
     state->models.erase(it);
 
     // Update default if needed

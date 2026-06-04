@@ -44,8 +44,6 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> q4k_repacked_gemv_resident_bytes{0};
     std::atomic<uint64_t> q4k_repacked_gemv_distinct_weights_seen{0};
     std::atomic<uint64_t> q4k_repacked_gemv_repeated_repack_count{0};
-    std::atomic<uint64_t> q4k_copied_gemv_experiment_cache_hits{0};
-    std::atomic<uint64_t> q4k_copied_gemv_experiment_cache_misses{0};
     std::atomic<uint64_t> qact_cache_hits{0};
     std::atomic<uint64_t> qact_cache_misses{0};
     std::atomic<uint64_t> qact_cache_reused_bytes{0};
@@ -218,8 +216,6 @@ struct Qwen36ProfileCounters {
     std::atomic<int> moe_selected_expert_count{0};
     std::atomic<int> moe_top_k{0};
     std::atomic<int> moe_expert_parallel_tasks{0};
-    std::atomic<int> q4k_copied_gemv_experiment_used{0};
-    std::atomic<int> q4k_copied_gemv_experiment_last_reject_reason{0};
     std::atomic<int> paged_attn_decode_head_tile_effective{0};
     std::atomic<int> arm_batched_quant_used{0};
     std::atomic<int> attention_path_paged{0};
@@ -676,8 +672,6 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.q4k_repacked_gemv_resident_bytes.store(0, std::memory_order_relaxed);
     p.q4k_repacked_gemv_distinct_weights_seen.store(0, std::memory_order_relaxed);
     p.q4k_repacked_gemv_repeated_repack_count.store(0, std::memory_order_relaxed);
-    p.q4k_copied_gemv_experiment_cache_hits.store(0, std::memory_order_relaxed);
-    p.q4k_copied_gemv_experiment_cache_misses.store(0, std::memory_order_relaxed);
     p.qact_cache_hits.store(0, std::memory_order_relaxed);
     p.qact_cache_misses.store(0, std::memory_order_relaxed);
     p.qact_cache_reused_bytes.store(0, std::memory_order_relaxed);
@@ -875,8 +869,6 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
         ctx->q6k_gemv_shape_entries.clear();
         ctx->qwen36_prefill_slow_entries.clear();
     }
-    p.q4k_copied_gemv_experiment_used.store(0, std::memory_order_relaxed);
-    p.q4k_copied_gemv_experiment_last_reject_reason.store(0, std::memory_order_relaxed);
     p.paged_attn_decode_head_tile_effective.store(0, std::memory_order_relaxed);
     p.arm_batched_quant_used.store(0, std::memory_order_relaxed);
     p.attention_path_paged.store(0, std::memory_order_relaxed);
@@ -951,10 +943,6 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
         p.q4k_repacked_gemv_distinct_weights_seen.load(std::memory_order_relaxed);
     snapshot.q4k_repacked_gemv_repeated_repack_count =
         p.q4k_repacked_gemv_repeated_repack_count.load(std::memory_order_relaxed);
-    snapshot.q4k_copied_gemv_experiment_cache_hits =
-        p.q4k_copied_gemv_experiment_cache_hits.load(std::memory_order_relaxed);
-    snapshot.q4k_copied_gemv_experiment_cache_misses =
-        p.q4k_copied_gemv_experiment_cache_misses.load(std::memory_order_relaxed);
     snapshot.qact_cache_hits = p.qact_cache_hits.load(std::memory_order_relaxed);
     snapshot.qact_cache_misses = p.qact_cache_misses.load(std::memory_order_relaxed);
     snapshot.qact_cache_reused_bytes = p.qact_cache_reused_bytes.load(std::memory_order_relaxed);
@@ -1258,10 +1246,6 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     SortAndTrimMatmulShapeCensusEntries(&snapshot.prefill_matmul_ggml_top_shapes);
     SortAndTrimMatmulShapeCensusEntries(&snapshot.q6k_gemv_weight_shapes);
     SortAndTrimMatmulShapeCensusEntries(&snapshot.qwen36_prefill_top_slow_ops);
-    snapshot.q4k_copied_gemv_experiment_used =
-        p.q4k_copied_gemv_experiment_used.load(std::memory_order_relaxed);
-    snapshot.q4k_copied_gemv_experiment_last_reject_reason =
-        p.q4k_copied_gemv_experiment_last_reject_reason.load(std::memory_order_relaxed);
     snapshot.paged_attn_decode_head_tile_effective =
         p.paged_attn_decode_head_tile_effective.load(std::memory_order_relaxed);
     snapshot.arm_batched_quant_used = p.arm_batched_quant_used.load(std::memory_order_relaxed);

@@ -1,15 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
-#include <cmath>
-#include <atomic>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "densecore/runtime/inference.h"
 #include "ggml-cpu.h"
 #include "densecore/models/model_types.h"
+#include "kernels/q4k_repacked_gemv.h"
 #include "models/model_inference_policy.h"
 #include "densecore/memory/kv_cache.h"
 #include "runtime/runtime_env.h"
@@ -24,16 +22,6 @@ extern uint64_t HashQwen36Q4KBatchedAdmissionKeyForTest(const TransformerModel* 
 extern void StoreQwen36Q4KBatchedAdmissionForTest(uint64_t key, bool pass, float max_abs_error, const char* reason);
 extern int LookupQwen36Q4KBatchedAdmissionForTest(uint64_t key);
 extern void DowngradeQwen36Q4KBatchedAdmissionForTest(uint64_t key, float max_abs_error);
-extern bool GetOrCreateQ4KCopiedGemvExperimentWeightForTest(const void* weight_data, uintptr_t model_identity,
-                                                           int64_t rows, int64_t cols, ggml_type type,
-                                                           uint64_t lora_epoch, bool* cache_hit);
-extern bool RunQ4KCopiedGemvExperimentRowsForTest(const void* weight_data, const void* q8_input,
-                                                  uintptr_t model_identity, int64_t rows, int64_t cols,
-                                                  uint64_t lora_epoch, float* output, bool* cache_hit);
-extern void ClearQ4KCopiedGemvExperimentCacheForTest(uintptr_t model_identity);
-extern void ClearAllQ4KCopiedGemvExperimentCacheForTest();
-extern size_t Q4KCopiedGemvExperimentCacheEntryCountForTest();
-extern uint64_t Q4KCopiedGemvExperimentCachePackCountForTest();
 extern bool Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode mode, int* reject_reason);
 extern bool QActCacheSharedDataDifferentTensorMissesForTest();
 extern bool QActCacheSameTensorDifferentTokenOrSlotMissesForTest(bool change_token_pos);
@@ -216,86 +204,16 @@ TEST(DecodeGraphCachePolicyTest, Qwen36PrefillQ4KRuntimeFailureDowngradesAdmitte
     EXPECT_EQ(densecore::testing::LookupQwen36Q4KBatchedAdmissionForTest(key), 2);
 }
 
-TEST(DecodeGraphCachePolicyTest, Q4KCopiedGemvExperimentCacheKeySeparatesTensorShapeAndLoraEpoch) {
-    densecore::testing::ClearAllQ4KCopiedGemvExperimentCacheForTest();
-    std::vector<uint8_t> w0(ggml_row_size(GGML_TYPE_Q4_K, QK_K) * 4);
-    std::vector<uint8_t> w1(ggml_row_size(GGML_TYPE_Q4_K, QK_K) * 4);
-    bool hit = true;
-    EXPECT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
-        w0.data(), 7, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
-    EXPECT_FALSE(hit);
-    EXPECT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
-        w0.data(), 7, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
-    EXPECT_TRUE(hit);
-    EXPECT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
-        w1.data(), 7, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
-    EXPECT_FALSE(hit);
-    EXPECT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
-        w0.data(), 7, 4, QK_K, GGML_TYPE_Q4_K, 1, &hit));
-    EXPECT_FALSE(hit);
-}
-
-TEST(DecodeGraphCachePolicyTest, Q4KCopiedGemvExperimentCacheDoesNotDuplicateConcurrentFirstUse) {
-    densecore::testing::ClearAllQ4KCopiedGemvExperimentCacheForTest();
-    std::vector<uint8_t> weight(ggml_row_size(GGML_TYPE_Q4_K, QK_K) * 4);
-    constexpr int thread_count = 8;
-    std::atomic<int> ready{0};
-    std::atomic<bool> start{false};
-    std::vector<std::thread> threads;
-    threads.reserve(thread_count);
-    for (int i = 0; i < thread_count; ++i) {
-        threads.emplace_back([&]() {
-            ready.fetch_add(1, std::memory_order_release);
-            while (!start.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-            bool hit = false;
-            EXPECT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
-                weight.data(), 77, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
-        });
-    }
-    while (ready.load(std::memory_order_acquire) != thread_count) {
-        std::this_thread::yield();
-    }
-    const uint64_t before = densecore::testing::Q4KCopiedGemvExperimentCachePackCountForTest();
-    start.store(true, std::memory_order_release);
-    for (auto& thread : threads) {
-        thread.join();
-    }
-    EXPECT_EQ(densecore::testing::Q4KCopiedGemvExperimentCacheEntryCountForTest(), 1u);
-    EXPECT_EQ(densecore::testing::Q4KCopiedGemvExperimentCachePackCountForTest() - before, 1u);
-}
-
-TEST(DecodeGraphCachePolicyTest, Q4KCopiedGemvExperimentCacheClearForModelRemovesOnlyThatModel) {
-    densecore::testing::ClearAllQ4KCopiedGemvExperimentCacheForTest();
-    std::vector<uint8_t> w0(ggml_row_size(GGML_TYPE_Q4_K, QK_K) * 4);
-    std::vector<uint8_t> w1(ggml_row_size(GGML_TYPE_Q4_K, QK_K) * 4);
-    bool hit = false;
-    ASSERT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
-        w0.data(), 101, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
-    ASSERT_TRUE(densecore::testing::GetOrCreateQ4KCopiedGemvExperimentWeightForTest(
-        w1.data(), 202, 4, QK_K, GGML_TYPE_Q4_K, 0, &hit));
-    ASSERT_EQ(densecore::testing::Q4KCopiedGemvExperimentCacheEntryCountForTest(), 2u);
-    densecore::testing::ClearQ4KCopiedGemvExperimentCacheForTest(101);
-    EXPECT_EQ(densecore::testing::Q4KCopiedGemvExperimentCacheEntryCountForTest(), 1u);
-    densecore::testing::ClearAllQ4KCopiedGemvExperimentCacheForTest();
-    EXPECT_EQ(densecore::testing::Q4KCopiedGemvExperimentCacheEntryCountForTest(), 0u);
-}
-
 TEST(DecodeGraphCachePolicyTest, Q4KRepackedGateAdmitsWhenRealKernelIsAvailable) {
     int reject_reason = 0;
     EXPECT_FALSE(densecore::testing::Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode::Off,
                                                                    &reject_reason));
     EXPECT_EQ(reject_reason, 1);
-#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
-    EXPECT_TRUE(densecore::testing::Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode::On,
-                                                                  &reject_reason));
-    EXPECT_EQ(reject_reason, 0);
-#else
-    EXPECT_FALSE(densecore::testing::Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode::On,
-                                                                   &reject_reason));
-    EXPECT_NE(reject_reason, 0);
-#endif
+    const bool available = densecore::kernels::Q4KRealPackedGemvKernelAvailable();
+    EXPECT_EQ(densecore::testing::Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode::On,
+                                                                &reject_reason),
+              available);
+    EXPECT_EQ(reject_reason == 0, available);
 }
 
 TEST(DecodeGraphCachePolicyTest, QActCacheDoesNotReuseWhenDifferentTensorsShareDataPointer) {
@@ -401,56 +319,6 @@ TEST(DecodeGraphCachePolicyTest, Qwen36SSMQ8RepackedBatchedPathMatchesVecDotOrac
     ASSERT_TRUE(densecore::testing::RunQwen36SSMQ8RepackedBatchedDirectForTest(
         /*nth=*/4, &output_matches_vecdot_oracle));
     EXPECT_TRUE(output_matches_vecdot_oracle);
-}
-
-TEST(DecodeGraphCachePolicyTest, Q4KCopiedGemvExperimentMatchesVecDotReference) {
-    densecore::testing::ClearAllQ4KCopiedGemvExperimentCacheForTest();
-    constexpr int rows = 4;
-    constexpr int cols = QK_K;
-    const auto* q4_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
-    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
-    ASSERT_NE(q4_traits, nullptr);
-    ASSERT_NE(q8_traits, nullptr);
-    ASSERT_NE(q4_traits->from_float, nullptr);
-    ASSERT_NE(q4_traits->vec_dot, nullptr);
-    ASSERT_NE(q8_traits->from_float, nullptr);
-    ASSERT_EQ(q4_traits->vec_dot_type, GGML_TYPE_Q8_K);
-
-    std::vector<float> weights(static_cast<size_t>(rows * cols));
-    std::vector<float> x(static_cast<size_t>(cols));
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            weights[static_cast<size_t>(r * cols + c)] =
-                std::sin(static_cast<float>(r * 17 + c) * 0.031f) * 0.25f;
-        }
-    }
-    for (int c = 0; c < cols; ++c) {
-        x[static_cast<size_t>(c)] = std::cos(static_cast<float>(c) * 0.027f) * 0.5f;
-    }
-
-    const size_t q4_row_bytes = ggml_row_size(GGML_TYPE_Q4_K, cols);
-    const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, cols);
-    std::vector<uint8_t> q4(static_cast<size_t>(rows) * q4_row_bytes);
-    std::vector<uint8_t> q8(q8_row_bytes);
-    for (int r = 0; r < rows; ++r) {
-        q4_traits->from_float(weights.data() + static_cast<size_t>(r * cols),
-                              q4.data() + static_cast<size_t>(r) * q4_row_bytes, cols);
-    }
-    q8_traits->from_float(x.data(), q8.data(), cols);
-
-    std::vector<float> ref(rows, 0.0f);
-    std::vector<float> got(rows, 0.0f);
-    for (int r = 0; r < rows; ++r) {
-        q4_traits->vec_dot(cols, &ref[static_cast<size_t>(r)], 0,
-                           q4.data() + static_cast<size_t>(r) * q4_row_bytes, 0, q8.data(), 0, 1);
-    }
-    bool hit = true;
-    ASSERT_TRUE(densecore::testing::RunQ4KCopiedGemvExperimentRowsForTest(q4.data(), q8.data(), 99, rows, cols, 0,
-                                                                          got.data(), &hit));
-    EXPECT_FALSE(hit);
-    for (int r = 0; r < rows; ++r) {
-        EXPECT_NEAR(got[static_cast<size_t>(r)], ref[static_cast<size_t>(r)], 1e-6f);
-    }
 }
 
 TEST(DecodeGraphCachePolicyTest, UnqualifiedHybridSSMModelsAreNotDecodeGraphCacheSafeYet) {

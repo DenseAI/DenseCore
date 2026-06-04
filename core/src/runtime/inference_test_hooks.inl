@@ -427,18 +427,6 @@ void DowngradeQwen36Q4KBatchedAdmissionForTest(uint64_t key, float max_abs_error
     ::DowngradeQwen36Q4KBatchedAdmissionOnRuntimeFailure(
         key, max_abs_error, ::Qwen36PrefillQ4KBatchedRejectReason::ProbeInternalError, nullptr);
 }
-bool GetOrCreateQ4KCopiedGemvExperimentWeightForTest(const void* weight_data, uintptr_t model_identity, int64_t rows,
-                                                     int64_t cols, ggml_type type, uint64_t lora_epoch,
-                                                     bool* cache_hit) {
-    return static_cast<bool>(::GetOrCreateQ4KCopiedGemvExperimentWeight(weight_data, model_identity, rows, cols, type,
-                                                                        lora_epoch, cache_hit));
-}
-bool RunQ4KCopiedGemvExperimentRowsForTest(const void* weight_data, const void* q8_input, uintptr_t model_identity,
-                                           int64_t rows, int64_t cols, uint64_t lora_epoch, float* output,
-                                           bool* cache_hit) {
-    return ::RunQ4KCopiedGemvExperimentRows(weight_data, q8_input, model_identity, rows, cols, lora_epoch, output,
-                                            cache_hit);
-}
 bool RunQwen35NativeMoEQ4KQ8KDotRowForTest(const void* weight_row, const void* q8_input, int64_t cols,
                                            float* output) {
     return ::Qwen35NativeMoEQ4KQ8KDotRow(weight_row, static_cast<const uint8_t*>(q8_input), cols, output);
@@ -467,22 +455,6 @@ int64_t Qwen35NativeMoEMaxDirectTokensForTest() {
 }
 bool RunQwen35NativeQuantizeRowQ8KForTest(const float* input, void* q8_output, int64_t cols) {
     return ::Qwen35NativeQuantizeRowQ8K(input, static_cast<uint8_t*>(q8_output), cols);
-}
-void ClearQ4KCopiedGemvExperimentCacheForTest(uintptr_t model_identity) {
-    ::ClearQ4KCopiedGemvExperimentCacheForModel(model_identity);
-}
-void ClearAllQ4KCopiedGemvExperimentCacheForTest() {
-    ::ClearQ4KCopiedGemvExperimentCache();
-}
-size_t Q4KCopiedGemvExperimentCacheEntryCountForTest() {
-    auto& state = ::Q4KCopiedGemvCache();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    return state.cache.size();
-}
-uint64_t Q4KCopiedGemvExperimentCachePackCountForTest() {
-    auto& state = ::Q4KCopiedGemvCache();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    return state.pack_count;
 }
 bool Q4KRepackedGemvEnabledForTest(densecore::env::RuntimeToggleMode mode, int* reject_reason) {
     densecore::llm::config::FastPathRuntimeConfig config{};

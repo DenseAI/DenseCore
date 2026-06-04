@@ -101,21 +101,7 @@ size_t ReadAvailableMemoryBytes() {
 }
 
 size_t ManualCacheLimitBytes() {
-    static const size_t limit = []() {
-        const char* env = std::getenv("DENSECORE_Q4K_REPACKED_GEMV_CACHE_MB");
-        if (!env || env[0] == '\0') {
-            env = std::getenv("DENSECORE_MOE_Q4K_REPACK_CACHE_MB");
-        }
-        if (!env || env[0] == '\0') {
-            return kUninitializedCacheLimit;
-        }
-        const long long mb = std::strtoll(env, nullptr, 10);
-        if (mb <= 0) {
-            return size_t{0};
-        }
-        return static_cast<size_t>(mb) * kMiB;
-    }();
-    return limit;
+    return kUninitializedCacheLimit;
 }
 
 void EvictIfNeededLocked(Q4KRepackedGemvCacheState& state, const Q4KRepackedGemvKey& protected_key, size_t cache_limit,
@@ -152,6 +138,8 @@ void EvictIfNeededLocked(Q4KRepackedGemvCacheState& state, const Q4KRepackedGemv
 bool Q4KRepackedGemvIsaSupported() {
 #if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
     return ggml_cpu_has_avx2();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return ggml_cpu_has_neon() && ggml_cpu_has_dotprod();
 #else
     return false;
 #endif
