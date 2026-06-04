@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +35,10 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/sysinfo.h>  // sysinfo() RAM probe for the Qwen35 gate/up Q5_K repack budget gate
+#endif
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
@@ -88,6 +93,11 @@
 
 namespace densecore {
 bool RunQ4KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* gate_weight_ptr,
+                                               const void* up_weight_ptr, const float* input_data,
+                                               const uint8_t* qinput_data, size_t qinput_row_bytes,
+                                               float* output_data, int64_t rows, int64_t cols, int64_t input_cols,
+                                               int numa_node, bool allow_parallel);
+bool RunQ5KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* gate_weight_ptr,
                                                const void* up_weight_ptr, const float* input_data,
                                                const uint8_t* qinput_data, size_t qinput_row_bytes,
                                                float* output_data, int64_t rows, int64_t cols, int64_t input_cols,

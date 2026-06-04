@@ -30,6 +30,8 @@
 #include <arm_neon.h>
 #endif
 
+extern "C" void ggml_gemm_q5_K_8x8_q8_K(int n, float* s, size_t bs, const void* vx, const void* vy, int nr, int nc);
+
 namespace densecore {
 
 namespace {
@@ -88,6 +90,7 @@ inline float GeluTanhApprox(float x);
 const std::array<float, 1 << 16>& GetGeluF16LookupTable();
 bool ExpertHasGgmlQuantizedWeights(const CpuBackend::ExpertWeights& expert);
 bool IsScalarScaleSidecar(const ggml_tensor* scale_tensor);
+void LogMoEMatmulPath(const char* path, int M, int K, int N, int group_size, bool allow_parallel);
 
 struct MoEBlockQ8K {
     float d;
@@ -479,6 +482,12 @@ bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight
     auto& pool = backend->GetThreadPool(numa_node);
     const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
     std::atomic<bool> ok{true};
+    const auto log_path = [&]() {
+        const char* path = weight_type == GGML_TYPE_Q5_K   ? "ggml_q5k_raw_batched_fused_swiglu"
+                           : weight_type == GGML_TYPE_Q5_1 ? "ggml_q5_1_raw_batched_fused_swiglu"
+                                                           : "ggml_kquant_raw_batched_fused_swiglu";
+        LogMoEMatmulPath(path, static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0, allow_parallel);
+    };
 
     const bool use_pair_vecdot = std::max<int>(1, static_cast<int>(traits->nrows)) >= 2;
     const int64_t pair_count = N / 2;
@@ -537,6 +546,9 @@ bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight
             pool.ParallelFor(static_cast<int>(N),
                              [&](int n_start, int n_end, int) { compute_row_range(n_start, n_end); });
         }
+        if (ok.load(std::memory_order_relaxed)) {
+            log_path();
+        }
         return ok.load(std::memory_order_relaxed);
     }
     if ((N & 1) != 0) {
@@ -552,6 +564,9 @@ bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight
             out_data[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
                 (gate_sum / (1.0f + internal::FastExp(-gate_sum))) * up_sum;
         }
+    }
+    if (ok.load(std::memory_order_relaxed)) {
+        log_path();
     }
     return ok.load(std::memory_order_relaxed);
 }
@@ -720,30 +735,12 @@ bool CanUseGgmlQuantizedMoEPrefillBatch(const CpuBackend::ExpertWeights& exp, in
 }
 
 bool CanUseQ6KRepackedMoEGemvFastPath() {
-    const char* enable_env = std::getenv("DENSECORE_MOE_ENABLE_Q6K_REPACKED_GEMV");
-    if (!enable_env || enable_env[0] == '\0' || std::strcmp(enable_env, "0") == 0) {
-        return false;
-    }
-    const char* env = std::getenv("DENSECORE_MOE_DISABLE_Q6K_REPACKED_GEMV");
-    if (env && env[0] != '\0' && std::strcmp(env, "0") != 0) {
-        return false;
-    }
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return ggml_cpu_has_neon() && ggml_cpu_has_dotprod();
-#else
+    // Q6_K repacked MoE GEMV is not a maintained fast path yet. Keep it closed
+    // without an env override until it has correctness and throughput evidence.
     return false;
-#endif
 }
 
 bool CanUseQ5KRepackedMoEGemvFastPath() {
-    const char* enable_env = std::getenv("DENSECORE_MOE_ENABLE_Q5K_REPACKED_GEMV");
-    if (!enable_env || enable_env[0] == '\0' || std::strcmp(enable_env, "0") == 0) {
-        return false;
-    }
-    const char* env = std::getenv("DENSECORE_MOE_DISABLE_Q5K_REPACKED_GEMV");
-    if (env && env[0] != '\0' && std::strcmp(env, "0") != 0) {
-        return false;
-    }
 #if defined(__aarch64__) || defined(_M_ARM64)
     return ggml_cpu_has_neon() && ggml_cpu_has_dotprod();
 #else
@@ -1301,6 +1298,109 @@ bool RunQ5KRepackedMoEGemv(CpuBackend* backend, const std::shared_ptr<Q5KRepacke
             compute_tiles(0, tile_count);
         }
     }
+    return true;
+}
+
+bool RunQ5KRepackedMoEFusedSwiGLURawProjectionImpl(CpuBackend* backend, const void* gate_weight_ptr,
+                                                   const void* up_weight_ptr, const float* input_data,
+                                                   const uint8_t* qinput_data, size_t qinput_row_bytes,
+                                                   float* output_data, int64_t rows, int64_t cols,
+                                                   int64_t input_cols, int numa_node, bool allow_parallel) {
+    if (!backend || !gate_weight_ptr || !up_weight_ptr || !qinput_data || !output_data || rows <= 0 || cols <= 0 ||
+        input_cols <= 0 || qinput_row_bytes == 0 || (cols % 8) != 0 || (input_cols % QK_K) != 0) {
+        return false;
+    }
+
+    auto& pool = backend->GetThreadPool(numa_node);
+    const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
+    const int tile_count = static_cast<int>(cols / 8);
+    const int blocks_per_row = static_cast<int>(input_cols / QK_K);
+    const size_t q8_tile_bytes = static_cast<size_t>(input_cols / QK_K) * sizeof(MoEBlockQ8Kx4);
+    const auto* gate_blocks = static_cast<const MoEQ5Kx8Block*>(gate_weight_ptr);
+    const auto* up_blocks = static_cast<const MoEQ5Kx8Block*>(up_weight_ptr);
+
+    static thread_local std::vector<uint8_t> q8x4_buf;
+    if (q8x4_buf.size() < q8_tile_bytes) {
+        q8x4_buf.resize(q8_tile_bytes);
+    }
+
+    bool used_gemm_m4 = false;
+    int64_t row = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    for (; row + 3 < rows; row += 4) {
+        if (!input_data) {
+            return false;
+        }
+        used_gemm_m4 = true;
+        const float* input_tile = input_data + static_cast<size_t>(row) * static_cast<size_t>(input_cols);
+        ggml_quantize_mat_q8_K_4x8(input_tile, q8x4_buf.data(), input_cols);
+        float* out_tile = output_data + static_cast<size_t>(row) * static_cast<size_t>(cols);
+        const auto compute_tiles = [&](int tile_start, int tile_end) {
+            std::array<float, 32> gate_tile{};
+            std::array<float, 32> up_tile{};
+            for (int tile = tile_start; tile < tile_end; ++tile) {
+                const void* gate_vx = gate_blocks + static_cast<size_t>(tile) * blocks_per_row;
+                const void* up_vx = up_blocks + static_cast<size_t>(tile) * blocks_per_row;
+                ggml_gemm_q5_K_8x8_q8_K(static_cast<int>(input_cols), gate_tile.data(), 8, gate_vx,
+                                         q8x4_buf.data(), 4, 8);
+                ggml_gemm_q5_K_8x8_q8_K(static_cast<int>(input_cols), up_tile.data(), 8, up_vx, q8x4_buf.data(), 4,
+                                         8);
+                for (int r = 0; r < 4; ++r) {
+                    float* out_row =
+                        out_tile + static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(tile) * 8;
+                    const float* gate_row = gate_tile.data() + static_cast<size_t>(r) * 8;
+                    const float* up_row = up_tile.data() + static_cast<size_t>(r) * 8;
+                    for (int c = 0; c < 8; ++c) {
+                        const float gate_sum = gate_row[c];
+                        out_row[c] = (gate_sum / (1.0f + internal::FastExp(-gate_sum))) * up_row[c];
+                    }
+                }
+            }
+        };
+        if (n_threads > 1 && tile_count >= 2) {
+            pool.ParallelFor(tile_count, [&](int start, int end, int) { compute_tiles(start, end); });
+        } else {
+            compute_tiles(0, tile_count);
+        }
+    }
+#else
+    (void)input_data;
+    if (rows >= 4) {
+        return false;
+    }
+#endif
+
+    for (; row < rows; ++row) {
+        const auto* qi = qinput_data + static_cast<size_t>(row) * qinput_row_bytes;
+        float* out_row = output_data + static_cast<size_t>(row) * static_cast<size_t>(cols);
+        const auto compute_tiles = [&](int tile_start, int tile_end) {
+            std::array<float, 8> gate_tile{};
+            std::array<float, 8> up_tile{};
+            for (int tile = tile_start; tile < tile_end; ++tile) {
+                const void* gate_vx = gate_blocks + static_cast<size_t>(tile) * blocks_per_row;
+                const void* up_vx = up_blocks + static_cast<size_t>(tile) * blocks_per_row;
+                ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(input_cols), gate_tile.data(), 0, gate_vx, qi, 1, 8);
+                ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(input_cols), up_tile.data(), 0, up_vx, qi, 1, 8);
+                float* out = out_row + static_cast<size_t>(tile) * 8;
+                for (int c = 0; c < 8; ++c) {
+                    const float gate_sum = gate_tile[c];
+                    out[c] = (gate_sum / (1.0f + internal::FastExp(-gate_sum))) * up_tile[c];
+                }
+            }
+        };
+        if (n_threads > 1 && tile_count >= 2) {
+            pool.ParallelFor(tile_count, [&](int start, int end, int) { compute_tiles(start, end); });
+        } else {
+            compute_tiles(0, tile_count);
+        }
+    }
+
+    InferenceWorkContext* census_ctx = GetCurrentWorkContext();
+    RecordMoEQ5KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/true, nullptr);
+    LogMoEMatmulPath(used_gemm_m4 ? "ggml_q5k_repacked_prefill_gemm_m4_fused_swiglu"
+                                  : "ggml_q5k_repacked_fused_swiglu",
+                     static_cast<int>(rows), static_cast<int>(input_cols), static_cast<int>(cols), 0,
+                     allow_parallel);
     return true;
 }
 
@@ -2512,7 +2612,7 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
             return false;
         }
         if (!CanUseQ5KRepackedMoEGemvFastPath()) {
-            RecordMoEQ5KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "env_or_kernel_disabled");
+            RecordMoEQ5KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "kernel_unavailable");
             return false;
         }
         auto packed = GetOrCreateQ5KRepackedMoEWeight(weight_ptr, N, K);
@@ -3766,6 +3866,16 @@ bool RunQ4KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* 
     return RunQ4KRepackedMoEFusedSwiGLUM4(backend, gate_packed, up_packed, input_data, qinput_data,
                                           qinput_row_bytes, output_data, rows, cols, input_cols, numa_node,
                                           allow_parallel);
+}
+
+bool RunQ5KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* gate_weight_ptr,
+                                               const void* up_weight_ptr, const float* input_data,
+                                               const uint8_t* qinput_data, size_t qinput_row_bytes,
+                                               float* output_data, int64_t rows, int64_t cols, int64_t input_cols,
+                                               int numa_node, bool allow_parallel) {
+    return RunQ5KRepackedMoEFusedSwiGLURawProjectionImpl(backend, gate_weight_ptr, up_weight_ptr, input_data,
+                                                         qinput_data, qinput_row_bytes, output_data, rows, cols,
+                                                         input_cols, numa_node, allow_parallel);
 }
 
 bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,

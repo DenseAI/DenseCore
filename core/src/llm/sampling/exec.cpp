@@ -493,12 +493,70 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         }
         debug_sample_count++;
     };
+    auto capture_raw_top_candidates = [&]() {
+        std::vector<SamplingDebugCandidate> top;
+        top.reserve(8);
+        auto worse_first = [](const SamplingDebugCandidate& a, const SamplingDebugCandidate& b) {
+            if (a.post_penalty_logit == b.post_penalty_logit) return a.token_id < b.token_id;
+            return a.post_penalty_logit > b.post_penalty_logit;
+        };
+        for (int token_id = range_start; token_id < range_end; ++token_id) {
+            if (is_disallowed(token_id) || !is_allowed(token_id)) {
+                continue;
+            }
+            const float v = last_logits[token_id];
+            if (!std::isfinite(v)) {
+                continue;
+            }
+            SamplingDebugCandidate cand;
+            cand.token_id = token_id;
+            cand.pre_penalty_logit = v;
+            cand.post_penalty_logit = v;
+            if (top.size() < 8) {
+                top.push_back(cand);
+                std::push_heap(top.begin(), top.end(), worse_first);
+            } else if (cand.post_penalty_logit > top.front().post_penalty_logit ||
+                       (cand.post_penalty_logit == top.front().post_penalty_logit &&
+                        cand.token_id < top.front().token_id)) {
+                std::pop_heap(top.begin(), top.end(), worse_first);
+                top.back() = cand;
+                std::push_heap(top.begin(), top.end(), worse_first);
+            }
+        }
+        std::sort(top.begin(), top.end(), [](const SamplingDebugCandidate& a, const SamplingDebugCandidate& b) {
+            if (a.post_penalty_logit == b.post_penalty_logit) return a.token_id < b.token_id;
+            return a.post_penalty_logit > b.post_penalty_logit;
+        });
+        return top;
+    };
+    auto maybe_record_raw_sampling_trace = [&](int sampled_token) {
+        if (!ShouldCaptureSamplingDebugTrace(params)) {
+            return;
+        }
+        SamplingDebugTraceEntry entry;
+        entry.request_id = params.request_id;
+        entry.output_token_index = params.output_token_index;
+        entry.sampled_token_id = sampled_token;
+        entry.temperature = params.temperature;
+        entry.top_p = params.top_p;
+        entry.top_k = params.top_k;
+        entry.repetition_penalty = params.repetition_penalty;
+        entry.top_pre_penalty = capture_raw_top_candidates();
+        entry.top_post_penalty = entry.top_pre_penalty;
+        std::lock_guard<std::mutex> lock(SamplingDebugTraceMutex());
+        auto& storage = SamplingDebugTraceStorage();
+        storage.push_back(std::move(entry));
+        if (storage.size() > 64) {
+            storage.erase(storage.begin(), storage.begin() + static_cast<std::ptrdiff_t>(storage.size() - 64));
+        }
+    };
 
     const bool has_history = params.token_history && !params.token_history->empty();
     const bool has_penalty = has_history && (params.repetition_penalty != 1.0f || params.frequency_penalty != 0.0f ||
                                              params.presence_penalty != 0.0f);
     if (params.temperature <= 0.0f && params.grammar == nullptr && !has_penalty) {
         const int token = finite_argmax_raw();
+        maybe_record_raw_sampling_trace(token);
         debug_log_sample(token);
         return token;
     }

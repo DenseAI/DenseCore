@@ -1770,10 +1770,12 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const bool target_native_moe_rejected =
         req->native_moe_fast_decode_rejected_ops > 0 || req->native_moe_fast_w2_q5k_rejected_ops > 0 ||
         req->qwen36_prefill_native_moe_fast_rejected_ops > 0;
+    const bool target_hybrid_ssm_stateful_ops_missing =
+        execution_contract.has_hybrid_ssm_mixer && (req->ssm_conv1d_calls == 0 || req->ssm_delta_calls == 0);
     const bool target_fast_path_ok = !target_fast_path_required ||
                                      (!target_graph_plan_rejected && !target_ggml_path_seen &&
                                       !target_native_moe_fallback_seen &&
-                                      !target_native_moe_rejected);
+                                      !target_native_moe_rejected && !target_hybrid_ssm_stateful_ops_missing);
     const char* target_fast_path_failure_reason = "none";
     if (target_fast_path_required && target_graph_plan_rejected) {
         target_fast_path_failure_reason = "graph_plan_rejected";
@@ -1783,6 +1785,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         target_fast_path_failure_reason = "native_moe_w1w3_or_w2_fallback";
     } else if (target_fast_path_required && target_native_moe_rejected) {
         target_fast_path_failure_reason = "native_moe_fast_path_rejected";
+    } else if (target_fast_path_required && target_hybrid_ssm_stateful_ops_missing) {
+        target_fast_path_failure_reason = "hybrid_ssm_stateful_ops_missing";
     }
     const char* q6k_effective_state = "unused";
     if (req->q6k_gemv_used_ops != 0) {

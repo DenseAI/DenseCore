@@ -611,6 +611,10 @@ inline float SumSquares(const float* values, int n) {
     return DotSquares(values, n);
 }
 
+inline float L2InvNormGgml(float sum_sq, float eps) {
+    return 1.0f / std::max(std::sqrt(sum_sq), eps);
+}
+
 inline float DotProduct(const float* lhs, const float* rhs, int n) {
     float sum = 0.0f;
 #if defined(__AVX512F__)
@@ -984,6 +988,10 @@ size_t Qwen35SSMHeadStateElements(int head_dim_k, int head_dim_v) {
     return static_cast<size_t>(head_dim_k) * static_cast<size_t>(head_dim_v);
 }
 
+inline size_t Qwen35SSMStateIndexKV(int k, int v, int head_dim_v) {
+    return static_cast<size_t>(k) * static_cast<size_t>(head_dim_v) + static_cast<size_t>(v);
+}
+
 bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head,
                                  Qwen35SSMHeadStepStats* stats, Qwen35SSMHeadStepDebugBuffers* debug) {
     if (!cfg.input_t || !cfg.q_head || !cfg.k_head || !cfg.v_head || !cfg.z_head || !cfg.alpha_row || !cfg.beta_row ||
@@ -1036,8 +1044,8 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
     const auto norm_begin = collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const float q_sum_sq = DotSquares(cfg.q_head, cfg.head_dim_k);
     const float k_sum_sq = DotSquares(cfg.k_head, cfg.head_dim_k);
-    const float q_inv_norm = 1.0f / std::sqrt(q_sum_sq + cfg.norm_eps);
-    const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+    const float q_inv_norm = L2InvNormGgml(q_sum_sq, cfg.norm_eps);
+    const float k_inv_norm = L2InvNormGgml(k_sum_sq, cfg.norm_eps);
     ScaleCopy(q_norm.data(), cfg.q_head, q_inv_norm, cfg.head_dim_k);
     ScaleCopy(k_norm.data(), cfg.k_head, k_inv_norm, cfg.head_dim_k);
     if (debug && debug->q_norm) {
@@ -1057,7 +1065,7 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
     std::fill(kv_mem.begin(), kv_mem.end(), 0.0f);
     std::fill(y_head, y_head + cfg.head_dim_v, 0.0f);
     for (int k = 0; k < cfg.head_dim_k; ++k) {
-        const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        const float* state_row = state_kv + Qwen35SSMStateIndexKV(k, 0, cfg.head_dim_v);
         const float k_val = k_norm[static_cast<size_t>(k)];
         AccumulateScaled(kv_mem.data(), state_row, k_val, cfg.head_dim_v);
     }
@@ -1078,14 +1086,14 @@ bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* stat
     const double kv_mem_ms = collect_timing ? ms_since(kv_mem_begin) : 0.0;
     const double decay_state_ms = 0.0;
 
-    // State update: state_kv[k, v] = decay * state_kv[k, v] + k_norm[k] * delta[v]
+    // State update mirrors llama.cpp delta-net: state[k, v] = decay * state[k, v] + k_norm[k] * delta[v].
     const auto state_update_begin =
         collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const float attention_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim_k));
     for (int k = 0; k < cfg.head_dim_k; ++k) {
         const float k_val = k_norm[static_cast<size_t>(k)];
         const float q_val = q_norm[static_cast<size_t>(k)];
-        float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        float* state_row = state_kv + Qwen35SSMStateIndexKV(k, 0, cfg.head_dim_v);
         DecayAddScaledAndAccumulate(state_row, delta.data(), y_head, decay, k_val, q_val * attention_scale,
                                     cfg.head_dim_v);
     }
@@ -1165,7 +1173,7 @@ inline bool Qwen35RunGatedDeltaHeadStepFastDefaultUntiledReference(const Qwen35S
     for (int k = 0; k < cfg.head_dim_k; ++k) {
         const float k_val = cfg.k_head[k] * k_inv_norm;
         const float q_val = cfg.q_head[k] * q_inv_norm;
-        const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        const float* state_row = state_kv + Qwen35SSMStateIndexKV(k, 0, cfg.head_dim_v);
         AccumulateScaledPair(delta_ref.data(), y_head, state_row, k_val, q_val, cfg.head_dim_v);
     }
 
@@ -1180,7 +1188,7 @@ inline bool Qwen35RunGatedDeltaHeadStepFastDefaultUntiledReference(const Qwen35S
 
     for (int k = 0; k < cfg.head_dim_k; ++k) {
         const float k_val = cfg.k_head[k] * k_inv_norm;
-        float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        float* state_row = state_kv + Qwen35SSMStateIndexKV(k, 0, cfg.head_dim_v);
         UpdateStateFromDelta(state_row, delta_ref.data(), decay, k_val, cfg.head_dim_v);
     }
 
@@ -1246,8 +1254,8 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
     if (!cfg.has_precomputed_qk_norm) {
         q_sum_sq = DotSquares(cfg.q_head, cfg.head_dim_k);
         k_sum_sq = DotSquares(cfg.k_head, cfg.head_dim_k);
-        q_inv_norm = 1.0f / std::sqrt(q_sum_sq + cfg.norm_eps);
-        k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+        q_inv_norm = L2InvNormGgml(q_sum_sq, cfg.norm_eps);
+        k_inv_norm = L2InvNormGgml(k_sum_sq, cfg.norm_eps);
     } else if (stats) {
         q_sum_sq = DotSquares(cfg.q_head, cfg.head_dim_k);
         k_sum_sq = DotSquares(cfg.k_head, cfg.head_dim_k);
@@ -1307,7 +1315,7 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
         for (int k = 0; k < cfg.head_dim_k; ++k) {
             const float k_val = cfg.k_head[k] * k_inv_norm;
             const float q_val = cfg.q_head[k] * q_inv_norm;
-            const float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v + v0;
+            const float* state_row = state_kv + Qwen35SSMStateIndexKV(k, v0, cfg.head_dim_v);
             AccumulateScaledPair(delta_data + v0, y_head + v0, state_row, k_val, q_val, chunk);
         }
         if (collect_timing) {
@@ -1323,7 +1331,7 @@ bool Qwen35RunGatedDeltaHeadStepFastDefault(const Qwen35SSMHeadStepConfig& cfg, 
             collect_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         for (int k = 0; k < cfg.head_dim_k; ++k) {
             const float k_val = cfg.k_head[k] * k_inv_norm;
-            float* state_row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v + v0;
+            float* state_row = state_kv + Qwen35SSMStateIndexKV(k, v0, cfg.head_dim_v);
             UpdateStateFromDelta(state_row, delta_data + v0, decay, k_val, chunk);
         }
         if (collect_timing) {

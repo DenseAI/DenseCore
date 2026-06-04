@@ -1304,6 +1304,44 @@ static void CheckSSMFiniteTensor(int layer_idx, const int* token_seq_ids, const 
     }
 }
 
+static bool IsDebugSSMDeltaStatsEnabled() {
+    static const bool enabled = ParseTruthyEnv("DENSECORE_DEBUG_SSM_DELTA_STATS", false);
+    return enabled;
+}
+
+static int DebugSSMDeltaStatsLayer() {
+    static const int layer = ParseIntEnv("DENSECORE_DEBUG_SSM_DELTA_STATS_LAYER", -1);
+    return layer;
+}
+
+static int DebugSSMDeltaStatsToken() {
+    static const int token = ParseIntEnv("DENSECORE_DEBUG_SSM_DELTA_STATS_TOKEN", -1);
+    return token;
+}
+
+static bool ShouldLogSSMDeltaStats(int layer_idx, int token_idx) {
+    if (!IsDebugSSMDeltaStatsEnabled()) {
+        return false;
+    }
+    const int target_layer = DebugSSMDeltaStatsLayer();
+    if (target_layer >= 0 && target_layer != layer_idx) {
+        return false;
+    }
+    const int target_token = DebugSSMDeltaStatsToken();
+    return target_token < 0 || target_token == token_idx;
+}
+
+static bool ConsumeSSMDeltaStatsBudget() {
+    static std::atomic<int> remaining{ParsePositiveEnvInt("DENSECORE_DEBUG_SSM_DELTA_STATS_MAX_CALLS", 16)};
+    int current = remaining.load(std::memory_order_relaxed);
+    while (current > 0) {
+        if (remaining.compare_exchange_weak(current, current - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 [[noreturn]] static void FatalQwen35SSMRuntimeError(int layer_idx, int token_idx, int seq_idx, int head_idx,
                                                     const char* message) {
     std::fprintf(stderr, "[DenseCore][Qwen35SSM] FATAL layer=%d token=%d seq=%d head=%d: %s\n", layer_idx, token_idx,
@@ -1321,9 +1359,6 @@ static void cb_projection_reference_probe(struct ggml_tensor* dst, const struct 
     if (ith != 0) return;
     auto* ud = static_cast<ProjectionReferenceUserData*>(userdata);
     if (!dst || !src || !ud || !ud->weight_tensor || !ud->input_tensor) return;
-    if (dst->data && src->data) {
-        std::memcpy(dst->data, src->data, ggml_nbytes(src));
-    }
     if (!src->data) {
         return;
     }
@@ -1354,21 +1389,37 @@ static void cb_projection_reference_probe(struct ggml_tensor* dst, const struct 
     }
 
     const float* runtime = reinterpret_cast<const float*>(src->data);
-    const int total = ggml_nelements(src);
+    const int64_t total = ggml_nelements(src);
     if (total <= 0 || static_cast<size_t>(total) != ref.size()) {
         std::fprintf(stderr,
-                     "[PROJ_REF] layer=%d stage=%s var=%s status=skipped reason=shape_mismatch runtime=%d ref=%zu\n",
-                     ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown", total,
-                     ref.size());
+                     "[PROJ_REF] layer=%d stage=%s var=%s status=skipped reason=shape_mismatch runtime=%lld ref=%zu "
+                     "src_type=%d src_ne=[%lld,%lld,%lld,%lld] dst_type=%d dst_ne=[%lld,%lld,%lld,%lld]\n",
+                     ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown",
+                     static_cast<long long>(total), ref.size(), static_cast<int>(src->type),
+                     static_cast<long long>(src->ne[0]), static_cast<long long>(src->ne[1]),
+                     static_cast<long long>(src->ne[2]), static_cast<long long>(src->ne[3]),
+                     dst ? static_cast<int>(dst->type) : -1, dst ? static_cast<long long>(dst->ne[0]) : -1LL,
+                     dst ? static_cast<long long>(dst->ne[1]) : -1LL,
+                     dst ? static_cast<long long>(dst->ne[2]) : -1LL,
+                     dst ? static_cast<long long>(dst->ne[3]) : -1LL);
         return;
+    }
+    if (dst->data && src->data && dst->type == src->type && ggml_nelements(dst) == total) {
+        std::memcpy(dst->data, src->data, static_cast<size_t>(total) * ggml_type_size(src->type));
     }
 
     float max_abs_diff = 0.0f;
-    int max_idx = -1;
-    int first_bad_idx = -1;
+    int64_t max_idx = -1;
+    int64_t first_bad_idx = -1;
     bool runtime_nonfinite = false;
     bool ref_nonfinite = false;
-    for (int i = 0; i < total; ++i) {
+    double runtime_sum = 0.0;
+    double ref_sum = 0.0;
+    double runtime_sum_sq = 0.0;
+    double ref_sum_sq = 0.0;
+    float runtime_max_abs = 0.0f;
+    float ref_max_abs = 0.0f;
+    for (int64_t i = 0; i < total; ++i) {
         const bool runtime_finite = std::isfinite(runtime[i]);
         const bool ref_finite = std::isfinite(ref[static_cast<size_t>(i)]);
         if (!runtime_finite || !ref_finite) {
@@ -1379,6 +1430,14 @@ static void cb_projection_reference_probe(struct ggml_tensor* dst, const struct 
             }
             continue;
         }
+        const float runtime_v = runtime[i];
+        const float ref_v = ref[static_cast<size_t>(i)];
+        runtime_sum += static_cast<double>(runtime_v);
+        ref_sum += static_cast<double>(ref_v);
+        runtime_sum_sq += static_cast<double>(runtime_v) * static_cast<double>(runtime_v);
+        ref_sum_sq += static_cast<double>(ref_v) * static_cast<double>(ref_v);
+        runtime_max_abs = std::max(runtime_max_abs, std::fabs(runtime_v));
+        ref_max_abs = std::max(ref_max_abs, std::fabs(ref_v));
         const float diff = std::fabs(runtime[i] - ref[static_cast<size_t>(i)]);
         if (diff > max_abs_diff) {
             max_abs_diff = diff;
@@ -1386,19 +1445,28 @@ static void cb_projection_reference_probe(struct ggml_tensor* dst, const struct 
         }
     }
 
-    const int row_dim = static_cast<int>(src->ne[0]);
-    const int bad_token = (first_bad_idx >= 0 && row_dim > 0) ? first_bad_idx / row_dim : -1;
-    const int bad_elem = (first_bad_idx >= 0 && row_dim > 0) ? first_bad_idx % row_dim : -1;
+    const int64_t row_dim = src->ne[0];
+    const int64_t bad_token = (first_bad_idx >= 0 && row_dim > 0) ? first_bad_idx / row_dim : -1;
+    const int64_t bad_elem = (first_bad_idx >= 0 && row_dim > 0) ? first_bad_idx % row_dim : -1;
     const int bad_seq = (bad_token >= 0 && ud->token_seq_ids && bad_token < static_cast<int>(src->ne[1]))
-                            ? ud->token_seq_ids[bad_token]
+                            ? ud->token_seq_ids[static_cast<int>(bad_token)]
                             : -1;
+    const double denom = static_cast<double>(std::max<int64_t>(1, total));
+    const double runtime_mean = runtime_sum / denom;
+    const double ref_mean = ref_sum / denom;
+    const double runtime_rms = std::sqrt(runtime_sum_sq / denom);
+    const double ref_rms = std::sqrt(ref_sum_sq / denom);
 
     std::fprintf(stderr,
-                 "[PROJ_REF] layer=%d stage=%s var=%s total=%d first_bad_idx=%d token=%d seq=%d elem=%d "
-                 "runtime_nonfinite=%d ref_nonfinite=%d max_abs_diff=%.8g max_idx=%d\n",
-                 ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown", total,
-                 first_bad_idx, bad_token, bad_seq, bad_elem, runtime_nonfinite ? 1 : 0, ref_nonfinite ? 1 : 0,
-                 max_abs_diff, max_idx);
+                 "[PROJ_REF] layer=%d stage=%s var=%s total=%lld first_bad_idx=%lld token=%lld seq=%d elem=%lld "
+                 "runtime_nonfinite=%d ref_nonfinite=%d max_abs_diff=%.8g max_idx=%lld "
+                 "runtime_max_abs=%.8g ref_max_abs=%.8g runtime_rms=%.8g ref_rms=%.8g "
+                 "runtime_mean=%.8g ref_mean=%.8g\n",
+                 ud->layer_idx, ud->stage ? ud->stage : "unknown", ud->var_name ? ud->var_name : "unknown",
+                 static_cast<long long>(total), static_cast<long long>(first_bad_idx), static_cast<long long>(bad_token),
+                 bad_seq, static_cast<long long>(bad_elem), runtime_nonfinite ? 1 : 0, ref_nonfinite ? 1 : 0,
+                 max_abs_diff, static_cast<long long>(max_idx), static_cast<double>(runtime_max_abs),
+                 static_cast<double>(ref_max_abs), runtime_rms, ref_rms, runtime_mean, ref_mean);
     if (first_bad_idx >= 0) {
         std::fprintf(stderr, "[PROJ_REF] first_bad runtime=%g ref=%g\n", static_cast<double>(runtime[first_bad_idx]),
                      static_cast<double>(ref[static_cast<size_t>(first_bad_idx)]));
@@ -2099,8 +2167,8 @@ static bool RunQwen35ReferenceHeadStep(const Qwen35SSMHeadStepConfig& cfg, float
         q_sum_sq += cfg.q_head[i] * cfg.q_head[i];
         k_sum_sq += cfg.k_head[i] * cfg.k_head[i];
     }
-    const float q_inv_norm = 1.0f / std::sqrt(q_sum_sq + cfg.norm_eps);
-    const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+    const float q_inv_norm = 1.0f / std::max(std::sqrt(q_sum_sq), cfg.norm_eps);
+    const float k_inv_norm = 1.0f / std::max(std::sqrt(k_sum_sq), cfg.norm_eps);
     for (int i = 0; i < cfg.head_dim_k; ++i) {
         q_norm[static_cast<size_t>(i)] = cfg.q_head[i] * q_inv_norm;
         k_norm[static_cast<size_t>(i)] = cfg.k_head[i] * k_inv_norm;
@@ -2165,11 +2233,12 @@ static void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src
         if (ith != 0) {
             return;
         }
-        if (!IsQwen36ProfilingEnabled()) {
-            return;
-        }
         auto* ud_profile = static_cast<SSMConv1DUserData*>(userdata);
         if (!ud_profile || !ud_profile->profile) {
+            return;
+        }
+        ud_profile->profile->ssm_conv1d_calls.fetch_add(1, std::memory_order_relaxed);
+        if (!IsQwen36ProfilingEnabled()) {
             return;
         }
         const auto profile_end = std::chrono::steady_clock::now();
@@ -2177,7 +2246,6 @@ static void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src
                            static_cast<uint64_t>(
                                std::chrono::duration_cast<std::chrono::nanoseconds>(profile_end - profile_begin)
                                    .count()));
-        ud_profile->profile->ssm_conv1d_calls.fetch_add(1, std::memory_order_relaxed);
     };
     const float* input = src ? reinterpret_cast<const float*>(src->data) : nullptr;
     float* output = dst ? reinterpret_cast<float*>(dst->data) : nullptr;
@@ -2227,7 +2295,9 @@ static void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src
             }
         }
         if (!conv_state) {
-            continue;
+            const int seq_idx = (ud->token_seq_ids && t < N) ? ud->token_seq_ids[t] : -1;
+            FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, -1,
+                                       "SSM conv1d: missing recurrent conv state");
         }
         if (debug_conv_ref && !conv_state_before.empty()) {
             std::memcpy(conv_state_before.data(), conv_state, conv_state_elems * sizeof(float));
@@ -2454,8 +2524,8 @@ void cb_ssm_alpha_beta_qk_project_map3(struct ggml_tensor* dst, const struct ggm
         float k_sum_sq = 0.0f;
         float qk_raw_dot = 0.0f;
         QKNormProducts(q_head, k_head, ud->head_dim_k, &q_sum_sq, &k_sum_sq, &qk_raw_dot);
-        const float q_inv_norm = 1.0f / std::sqrt(q_sum_sq + ud->norm_eps);
-        const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + ud->norm_eps);
+        const float q_inv_norm = 1.0f / std::max(std::sqrt(q_sum_sq), ud->norm_eps);
+        const float k_inv_norm = 1.0f / std::max(std::sqrt(k_sum_sq), ud->norm_eps);
         float* out_t = out + static_cast<ptrdiff_t>(t) * out_stride + 2 * ud->n_heads;
         out_t[h] = q_inv_norm;
         out_t[ud->n_groups + h] = k_inv_norm;
@@ -2734,7 +2804,8 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
             const float* alpha_row = ud->alpha_weight + static_cast<size_t>(h) * ud->n_embd;
             const float* beta_row = ud->beta_weight + static_cast<size_t>(h) * ud->n_embd;
             if (!token_ssm_state_base) {
-                continue;
+                FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h,
+                                           "SSM delta: missing recurrent state");
             }
             const size_t state_offset = static_cast<size_t>(h) * static_cast<size_t>(state_stride);
             const size_t state_elems = static_cast<size_t>(state_stride);
@@ -2913,10 +2984,114 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
             }
         }
 
+        if (head_begin < head_end && ShouldLogSSMDeltaStats(ud->layer_idx, t) && ConsumeSSMDeltaStatsBudget()) {
+            double sum = 0.0;
+            double sum_sq = 0.0;
+            double z_sum_sq = 0.0;
+            double q_sum_sq = 0.0;
+            double k_sum_sq = 0.0;
+            double v_sum_sq = 0.0;
+            double input_sum_sq = 0.0;
+            float max_abs = 0.0f;
+            float z_max_abs = 0.0f;
+            float q_max_abs = 0.0f;
+            float k_max_abs = 0.0f;
+            float v_max_abs = 0.0f;
+            float input_max_abs = 0.0f;
+            int finite_count = 0;
+            int q_finite_count = 0;
+            int k_finite_count = 0;
+            int v_finite_count = 0;
+            int input_finite_count = 0;
+            int first_bad_idx = -1;
+            const int elem_begin = head_begin * head_v_dim;
+            const int elem_end = head_end * head_v_dim;
+            for (int i = elem_begin; i < elem_end; ++i) {
+                const float v = y[i];
+                if (!std::isfinite(v)) {
+                    if (first_bad_idx < 0) {
+                        first_bad_idx = i;
+                    }
+                    continue;
+                }
+                ++finite_count;
+                sum += static_cast<double>(v);
+                sum_sq += static_cast<double>(v) * static_cast<double>(v);
+                max_abs = std::max(max_abs, std::fabs(v));
+                const float z_v = z_t[i];
+                if (std::isfinite(z_v)) {
+                    z_sum_sq += static_cast<double>(z_v) * static_cast<double>(z_v);
+                    z_max_abs = std::max(z_max_abs, std::fabs(z_v));
+                }
+            }
+            for (int h = head_begin; h < head_end; ++h) {
+                const int src_k_head = resolve_src_k_head(h);
+                const float* q_head = q_base + static_cast<size_t>(src_k_head) * head_k_dim;
+                const float* k_head = k_base + static_cast<size_t>(src_k_head) * head_k_dim;
+                const float* v_head = v_base + static_cast<size_t>(h) * head_v_dim;
+                for (int i = 0; i < head_k_dim; ++i) {
+                    const float q_v = q_head[i];
+                    const float k_v = k_head[i];
+                    if (std::isfinite(q_v)) {
+                        ++q_finite_count;
+                        q_sum_sq += static_cast<double>(q_v) * static_cast<double>(q_v);
+                        q_max_abs = std::max(q_max_abs, std::fabs(q_v));
+                    }
+                    if (std::isfinite(k_v)) {
+                        ++k_finite_count;
+                        k_sum_sq += static_cast<double>(k_v) * static_cast<double>(k_v);
+                        k_max_abs = std::max(k_max_abs, std::fabs(k_v));
+                    }
+                }
+                for (int i = 0; i < head_v_dim; ++i) {
+                    const float v_v = v_head[i];
+                    if (std::isfinite(v_v)) {
+                        ++v_finite_count;
+                        v_sum_sq += static_cast<double>(v_v) * static_cast<double>(v_v);
+                        v_max_abs = std::max(v_max_abs, std::fabs(v_v));
+                    }
+                }
+            }
+            if (ith == 0) {
+                for (int i = 0; i < ud->n_embd; ++i) {
+                    const float input_v = input_t[i];
+                    if (std::isfinite(input_v)) {
+                        ++input_finite_count;
+                        input_sum_sq += static_cast<double>(input_v) * static_cast<double>(input_v);
+                        input_max_abs = std::max(input_max_abs, std::fabs(input_v));
+                    }
+                }
+            }
+            const double denom = static_cast<double>(std::max(1, finite_count));
+            const double mean = sum / denom;
+            const double rms = std::sqrt(sum_sq / denom);
+            const double z_rms = std::sqrt(z_sum_sq / denom);
+            const double q_rms = std::sqrt(q_sum_sq / static_cast<double>(std::max(1, q_finite_count)));
+            const double k_rms = std::sqrt(k_sum_sq / static_cast<double>(std::max(1, k_finite_count)));
+            const double v_rms = std::sqrt(v_sum_sq / static_cast<double>(std::max(1, v_finite_count)));
+            const double input_rms =
+                std::sqrt(input_sum_sq / static_cast<double>(std::max(1, input_finite_count)));
+            const int seq_idx_for_log = (ud->token_seq_ids && t < N) ? ud->token_seq_ids[t] : -1;
+            std::fprintf(stderr,
+                         "[SSM_DELTA_STATS] layer=%d token=%d seq=%d ith=%d nth=%d heads=[%d,%d) elems=[%d,%d) "
+                         "finite=%d first_bad_idx=%d max_abs=%.8g rms=%.8g mean=%.8g first=%.8g last=%.8g "
+                         "z_max_abs=%.8g z_rms=%.8g q_max_abs=%.8g q_rms=%.8g k_max_abs=%.8g k_rms=%.8g "
+                         "v_max_abs=%.8g v_rms=%.8g input_max_abs=%.8g input_rms=%.8g input_finite=%d\n",
+                         ud->layer_idx, t, seq_idx_for_log, ith, task_count, head_begin, head_end, elem_begin, elem_end,
+                         finite_count, first_bad_idx, static_cast<double>(max_abs), rms, mean,
+                         static_cast<double>(y[elem_begin]), static_cast<double>(y[elem_end - 1]),
+                         static_cast<double>(z_max_abs), z_rms, static_cast<double>(q_max_abs), q_rms,
+                         static_cast<double>(k_max_abs), k_rms, static_cast<double>(v_max_abs), v_rms,
+                         static_cast<double>(input_max_abs), input_rms, input_finite_count);
+        }
+
         if (trace_layer_aggregate) {
             LogQwen35SSMLayerAggregate("normal", ud->layer_idx, t, seq_idx, layer_aggregate_hash);
         }
 
+    }
+    if (ud && ud->profile && ith == 0) {
+        ud->profile->ssm_delta_calls.fetch_add(1, std::memory_order_relaxed);
     }
     if (IsQwen36ProfilingEnabled() && ud && ud->profile) {
         const auto profile_end = std::chrono::steady_clock::now();
@@ -2925,7 +3100,6 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
         AddQwen36ProfileNs(ud->profile->ssm_delta_ns, elapsed_ns);
         if (ith == 0) {
             AddQwen36ProfileNs(ud->profile->ssm_delta_wall_ns, elapsed_ns);
-            ud->profile->ssm_delta_calls.fetch_add(1, std::memory_order_relaxed);
         }
     }
 }

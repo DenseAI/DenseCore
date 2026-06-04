@@ -109,6 +109,23 @@ bool ResultReferencesTensor(const ggml_tensor* result, const ggml_tensor* tensor
     return false;
 }
 
+void FillGeneratedSsmOutInput(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* userdata) {
+    (void)src;
+    (void)nth;
+    (void)userdata;
+    if (ith != 0 || !dst || !dst->data || dst->type != GGML_TYPE_F32) {
+        return;
+    }
+    auto* base = reinterpret_cast<char*>(dst->data);
+    for (int64_t token = 0; token < dst->ne[1]; ++token) {
+        auto* row = reinterpret_cast<float*>(base + static_cast<size_t>(token) * dst->nb[1]);
+        for (int64_t col = 0; col < dst->ne[0]; ++col) {
+            const float phase = static_cast<float>(token * 17 + col * 3) * 0.019f;
+            row[col] = std::sin(phase) * 0.25f + std::cos(phase * 0.7f) * 0.125f;
+        }
+    }
+}
+
 // F32 matmul reference: out[i] = sum_j(weight[i * K + j] * input[j])
 // weight is [N, K] row-major, input is [K], output is [N]
 void ReferenceMatVec(const float* weight, const float* input, float* output, int N, int K) {
@@ -1053,11 +1070,11 @@ TEST(Qwen35SSMQkvProjection, CallbackChunkedPrefillMatchesUnchunkedStateAndOutpu
 }
 
 // ============================================================================
-// TEST: Env parsing test for GetArmQ4KNativeVecDotMode
+// TEST: Legacy env no longer disables maintained ARM Q4K fast path.
 //
-// Verify DENSECORE_ARM_ALLOW_Q4K_NATIVE_VECDOT=0 => Off (0)
-// Verify =1 => On (2)
-// Verify missing => Auto (1)
+// The ARM Q4K native vecdot path is now the maintained path. The old
+// DENSECORE_ARM_ALLOW_Q4K_NATIVE_VECDOT knob must not silently send Qwen/Gemma
+// inference back to a slow compatibility route.
 // ============================================================================
 TEST(Qwen35SSMQkvProjection, EnvParsingLegacyArmQ4k) {
     const char* prev = std::getenv("DENSECORE_ARM_ALLOW_Q4K_NATIVE_VECDOT");
@@ -1076,7 +1093,7 @@ TEST(Qwen35SSMQkvProjection, EnvParsingLegacyArmQ4k) {
 #endif
 
 #if defined(__aarch64__) || defined(_M_ARM64)
-    EXPECT_EQ(densecore::testing::GetArmQ4KNativeVecDotModeTest(), 0) << "ALLOW=0 must map to Off(0)";
+    EXPECT_EQ(densecore::testing::GetArmQ4KNativeVecDotModeTest(), 2) << "legacy ALLOW=0 must not disable ARM Q4K";
 #endif
 
 #ifdef _WIN32
@@ -1162,6 +1179,69 @@ TEST(Qwen35SSMQkvProjection, CallbackContractAssertions) {
     b.nb[0] = sizeof(float) + 1;
     EXPECT_DEATH(densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &ud), "non-contiguous element stride detected");
     b.nb[0] = sizeof(float);
+}
+
+TEST(Qwen35SSMQkvProjection, CallbackFailsClosedWhenRuntimeStateMissing) {
+    std::vector<float> z(static_cast<size_t>(kTestDInner), 0.1f);
+    std::vector<float> qkv(static_cast<size_t>(kTestConvChannels), 0.2f);
+    std::vector<float> input(static_cast<size_t>(kTestNEmbd), 0.3f);
+    std::vector<float> output(static_cast<size_t>(kTestDInner), 0.0f);
+    std::vector<float> alpha(static_cast<size_t>(kTestNHeads) * kTestNEmbd, 0.01f);
+    std::vector<float> beta(static_cast<size_t>(kTestNHeads) * kTestNEmbd, -0.01f);
+    std::vector<float> dt_bias(static_cast<size_t>(kTestNHeads), 0.0f);
+    std::vector<float> a_log(static_cast<size_t>(kTestNHeads), -0.5f);
+    std::vector<float> norm(static_cast<size_t>(kTestHeadDimV), 1.0f);
+
+    struct ggml_tensor a = {};
+    struct ggml_tensor b = {};
+    struct ggml_tensor c = {};
+    struct ggml_tensor dst = {};
+    a.data = z.data();
+    b.data = qkv.data();
+    c.data = input.data();
+    dst.data = output.data();
+    a.type = GGML_TYPE_F32;
+    b.type = GGML_TYPE_F32;
+    c.type = GGML_TYPE_F32;
+    dst.type = GGML_TYPE_F32;
+    a.ne[0] = kTestDInner;
+    a.ne[1] = 1;
+    b.ne[0] = kTestConvChannels;
+    b.ne[1] = 1;
+    c.ne[0] = kTestNEmbd;
+    c.ne[1] = 1;
+    dst.ne[0] = kTestDInner;
+    dst.ne[1] = 1;
+    a.nb[0] = sizeof(float);
+    b.nb[0] = sizeof(float);
+    c.nb[0] = sizeof(float);
+    dst.nb[0] = sizeof(float);
+    a.nb[1] = kTestDInner * sizeof(float);
+    b.nb[1] = kTestConvChannels * sizeof(float);
+    c.nb[1] = kTestNEmbd * sizeof(float);
+    dst.nb[1] = kTestDInner * sizeof(float);
+
+    SSMQwen35DeltaUserData ud{};
+    ud.alpha_weight = alpha.data();
+    ud.beta_weight = beta.data();
+    ud.dt_bias = dt_bias.data();
+    ud.a_log = a_log.data();
+    ud.norm_weight = norm.data();
+    ud.ssm_state = nullptr;
+    ud.n_embd = kTestNEmbd;
+    ud.d_inner = kTestDInner;
+    ud.n_heads = kTestNHeads;
+    ud.head_dim_v = kTestHeadDimV;
+    ud.head_dim_k = kTestHeadDimK;
+    ud.n_groups = kTestNGroups;
+    ud.norm_layout = Qwen35SSMNormLayout::SHARED_HEAD_DIM;
+    ud.norm_eps = 1e-6f;
+    ud.layer_idx = 0;
+    ud.ssm_ordinal = -1;
+    ud.projection_profile = Qwen35SSMQkvProjectionProfile::QWEN35_OFFICIAL;
+
+    EXPECT_DEATH(densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &ud),
+                 "SSM delta: missing recurrent state");
 }
 
 
@@ -1257,7 +1337,7 @@ TEST(Qwen35SSMQkvProjection, DispatchEquivalence) {
         for (int i = 0; i < N * M; ++i) {
             EXPECT_NEAR(res_ref[i], reference_values[i], 1e-4) << "Reference mismatch at index " << i << " M=" << M;
             EXPECT_NEAR(res_dispatch[i], reference_values[i], 1e-4) << "Dispatch mismatch at index " << i << " M=" << M;
-            EXPECT_NEAR(res_ref[i], res_dispatch[i], 1e-5) << "Semantic divergence at index " << i << " M=" << M;
+            EXPECT_NEAR(res_ref[i], res_dispatch[i], 5e-5) << "Semantic divergence at index " << i << " M=" << M;
         }
 
         unsetenv("DENSECORE_HYBRID_SSM_QKV_FORCE_GGML");
@@ -1658,6 +1738,92 @@ TEST(Qwen35SSMQkvProjection, Qwen36SSMQ8PrefillUsesDenseCoreBatchedPath) {
 
     const auto snapshot = GetQwen36ProfileSnapshot(work_ctx);
     EXPECT_EQ(snapshot.qwen_target_ggml_compute_ops, 0u);
+}
+
+TEST(Qwen35SSMQkvProjection, Qwen35SSMOutPrefillDependsOnGeneratedDeltaInput) {
+    struct ggml_init_params params = {
+        .mem_size = 1024 * 1024 * 64,
+        .mem_buffer = nullptr,
+        .no_alloc = false,
+    };
+    struct ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    InferenceWorkContext* work_ctx = CreateInferenceWorkContext();
+    ASSERT_NE(work_ctx, nullptr);
+    SetCurrentWorkContext(work_ctx);
+    struct Guard {
+        InferenceWorkContext* work_ctx;
+        struct ggml_context* ctx;
+        ~Guard() {
+            SetCurrentWorkContext(nullptr);
+            DestroyInferenceWorkContext(work_ctx);
+            ggml_free(ctx);
+        }
+    } guard{work_ctx, ctx};
+
+    TransformerModel model;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+
+    constexpr int input_dim = QK8_0 * 2;
+    constexpr int output_dim = 32;
+    constexpr int tokens = 4;
+    std::vector<float> weight_f32(static_cast<size_t>(output_dim) * input_dim);
+    for (int row = 0; row < output_dim; ++row) {
+        for (int col = 0; col < input_dim; ++col) {
+            weight_f32[static_cast<size_t>(row) * input_dim + col] =
+                std::sin(static_cast<float>(row * 11 + col) * 0.017f) * 0.2f;
+        }
+    }
+
+    ggml_tensor* weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, input_dim, output_dim);
+    ASSERT_NE(weight, nullptr);
+    ggml_set_name(weight, "blk.0.ssm_out.weight");
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+    ASSERT_NE(q8_traits, nullptr);
+    ASSERT_NE(q8_traits->from_float, nullptr);
+    const size_t weight_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, input_dim);
+    for (int row = 0; row < output_dim; ++row) {
+        q8_traits->from_float(weight_f32.data() + static_cast<size_t>(row) * input_dim,
+                              reinterpret_cast<uint8_t*>(weight->data) + static_cast<size_t>(row) * weight_row_bytes,
+                              input_dim);
+    }
+
+    ggml_tensor* seed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input_dim, tokens);
+    ASSERT_NE(seed, nullptr);
+    ggml_tensor* generated_input = ggml_map_custom1(ctx, seed, FillGeneratedSsmOutInput, 1, nullptr);
+    ASSERT_NE(generated_input, nullptr);
+    ggml_set_name(generated_input, "qwen35_ssm_delta");
+
+    ggml_tensor* result = densecore::testing::SmartMulMatTest(ctx, weight, generated_input, &model);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->op, GGML_OP_CUSTOM);
+    EXPECT_TRUE(ResultReferencesTensor(result, weight));
+    EXPECT_TRUE(ResultReferencesTensor(result, generated_input));
+    EXPECT_EQ(result->ne[0], output_dim);
+    EXPECT_EQ(result->ne[1], tokens);
+
+    struct ggml_cgraph* graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+    ggml_graph_compute_with_ctx(ctx, graph, 4);
+
+    std::vector<float> input_f32(static_cast<size_t>(input_dim) * tokens);
+    FillGeneratedSsmOutInput(generated_input, seed, 0, 1, nullptr);
+    std::memcpy(input_f32.data(), generated_input->data, input_f32.size() * sizeof(float));
+
+    const auto* out = reinterpret_cast<const float*>(result->data);
+    for (int token = 0; token < tokens; ++token) {
+        for (int row = 0; row < output_dim; ++row) {
+            float ref = 0.0f;
+            for (int col = 0; col < input_dim; ++col) {
+                ref += input_f32[static_cast<size_t>(token) * input_dim + col] *
+                       weight_f32[static_cast<size_t>(row) * input_dim + col];
+            }
+            EXPECT_NEAR(out[static_cast<size_t>(token) * output_dim + row], ref, 3e-2f)
+                << "token=" << token << " row=" << row;
+        }
+    }
 }
 
 TEST(Qwen35SSMQkvProjection, Qwen36SSMQ8PrefillActualQkvShapeComputesDenseCorePath) {

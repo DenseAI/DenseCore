@@ -41,6 +41,9 @@
 #include "models/gemma4_packed_expert_layout.h"
 #include "models/model_inference_policy.h"
 
+int ggml_repack_q5_K_8x8(const void* data, size_t data_size, int64_t rows, int64_t cols, void* dst,
+                         size_t dst_size);
+
 namespace {
 constexpr const char* kGemma4RouterScaleKey = "gemma4.router.scale";
 constexpr const char* kGemma4RouterPerExpertScaleKey = "gemma4.router.per_expert_scale";
@@ -511,16 +514,98 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         return;
     }
 #if defined(__aarch64__) || defined(_M_ARM64)
-    if (model->arch_flags.is_hybrid_ssm) {
+    const bool arm_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
+    const bool arm_qwen_hybrid_ssm =
+        arm_hybrid_ssm && (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36);
+    if (arm_hybrid_ssm && !arm_qwen_hybrid_ssm) {
         return;
     }
+#else
+    constexpr bool arm_hybrid_ssm = false;
 #endif
 
     const CpuRepackBufferTypes repack_bufts =
         FindCpuRepackBufferTypes(model->cpu_backend ? model->cpu_backend : model->backend);
-    if (!repack_bufts.cpu_repack) {
+    if (!repack_bufts.cpu_repack && !arm_hybrid_ssm) {
         return;
     }
+
+    auto repack_q5k_8x8_in_place = [&](ggml_tensor* tensor, size_t* out_bytes) -> bool {
+        if (out_bytes) {
+            *out_bytes = 0;
+        }
+        const int64_t block_size = ggml_blck_size(GGML_TYPE_Q5_K);
+        if (!tensor || !tensor->data || tensor->type != GGML_TYPE_Q5_K || tensor->view_src != nullptr ||
+            tensor->ne[0] <= 0 || tensor->ne[1] <= 0 || tensor->ne[2] <= 0 || block_size <= 0 ||
+            (tensor->ne[0] % block_size) != 0 || (tensor->ne[1] % 8) != 0) {
+            return false;
+        }
+        const int64_t cols = tensor->ne[0];
+        const int64_t rows = tensor->ne[1];
+        const int64_t experts = tensor->ne[2];
+        const size_t row_bytes = ggml_row_size(GGML_TYPE_Q5_K, cols);
+        const size_t expert_bytes = static_cast<size_t>(rows) * row_bytes;
+        if (row_bytes == 0 || expert_bytes == 0 || tensor->nb[1] != static_cast<int64_t>(row_bytes) ||
+            tensor->nb[2] < static_cast<int64_t>(expert_bytes)) {
+            return false;
+        }
+        const size_t packed_bytes = expert_bytes * static_cast<size_t>(experts);
+        std::vector<uint8_t> packed(packed_bytes);
+        const auto* src_base = static_cast<const uint8_t*>(tensor->data);
+        for (int64_t expert = 0; expert < experts; ++expert) {
+            const uint8_t* src = src_base + static_cast<size_t>(expert) * static_cast<size_t>(tensor->nb[2]);
+            uint8_t* dst = packed.data() + static_cast<size_t>(expert) * expert_bytes;
+            if (ggml_repack_q5_K_8x8(src, expert_bytes, rows, cols, dst, expert_bytes) != 0) {
+                return false;
+            }
+        }
+        auto* dst_base = static_cast<uint8_t*>(tensor->data);
+        for (int64_t expert = 0; expert < experts; ++expert) {
+            std::memcpy(dst_base + static_cast<size_t>(expert) * static_cast<size_t>(tensor->nb[2]),
+                        packed.data() + static_cast<size_t>(expert) * expert_bytes, expert_bytes);
+        }
+        model->q5k_8x8_repacked_tensors.insert(tensor);
+        if (out_bytes) {
+            *out_bytes = packed_bytes;
+        }
+        return true;
+    };
+
+    auto prepare_qwen_gateup_q5k_8x8 = [&]() {
+        if ((model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36) ||
+            !model->arch_flags.is_hybrid_ssm) {
+            return;
+        }
+        size_t candidates = 0;
+        size_t prepared = 0;
+        size_t bytes = 0;
+        for (auto& layer : model->layers) {
+            ggml_tensor* gate = layer.Get("ffn_gate_exps.weight") ? layer.Get("ffn_gate_exps.weight")
+                                                                  : layer.Get("ffn_gate_exps");
+            ggml_tensor* up =
+                layer.Get("ffn_up_exps.weight") ? layer.Get("ffn_up_exps.weight") : layer.Get("ffn_up_exps");
+            for (ggml_tensor* tensor : {gate, up}) {
+                if (!tensor || tensor->type != GGML_TYPE_Q5_K) {
+                    continue;
+                }
+                ++candidates;
+                if (model->q5k_8x8_repacked_tensors.find(tensor) != model->q5k_8x8_repacked_tensors.end()) {
+                    continue;
+                }
+                size_t tensor_bytes = 0;
+                if (repack_q5k_8x8_in_place(tensor, &tensor_bytes)) {
+                    ++prepared;
+                    bytes += tensor_bytes;
+                }
+            }
+        }
+        if (candidates > 0) {
+            std::cout << "[DenseCore] Qwen gate/up Q5_K single-copy 8x8 repack: candidates=" << candidates
+                      << ", prepared=" << prepared << ", bytes=" << (bytes / 1024 / 1024) << " MiB" << std::endl;
+        }
+    };
+
+    prepare_qwen_gateup_q5k_8x8();
 
     const size_t tensor_slots = static_cast<size_t>(std::max<uint32_t>(1, model->hparams.n_layer)) * 16 + 128;
     auto init_alias_context = [&](ggml_context** ctx, const char* name) -> bool {
@@ -558,6 +643,14 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
     std::vector<PendingAlias> pending_cpu_repack;
     pending_cpu_repack.reserve(model->layers.size() * 8);
     std::vector<PendingFusedAlias> pending_fused_cpu_repack;
+    std::vector<PendingFusedAlias> pending_plain_cpu_fused;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    size_t qwen_ssm_qkvgate_candidates = 0;
+    size_t qwen_ssm_qkvgate_reject_missing = 0;
+    size_t qwen_ssm_qkvgate_reject_type_or_shape = 0;
+    size_t qwen_ssm_qkvgate_reject_stride = 0;
+    size_t qwen_ssm_qkvgate_reject_context = 0;
+#endif
     auto is_qwen36_ssm_q8_projection = [&](const ggml_tensor* source) -> bool {
         if (!source || source->type != GGML_TYPE_Q8_0 || !source->name[0]) {
             return false;
@@ -894,11 +987,69 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
 #endif
     };
 
-    if (model->tok_embeddings && model->tok_embeddings != model->output) {
-        make_alias(model->tok_embeddings, ".fast_matmul_2d");
-    }
-    if (model->output && model->output != model->tok_embeddings) {
-        make_alias(model->output, ".fast_matmul_2d");
+#if defined(__aarch64__) || defined(_M_ARM64)
+    auto make_qwen_hybrid_ssm_qkv_gate_cpu_fused_alias = [&](TransformerLayer& layer, uint32_t layer_idx) {
+        if ((model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36) ||
+            !model->arch_flags.is_hybrid_ssm) {
+            return;
+        }
+        ggml_tensor* qkv = layer.Get(model_keys::kAttnQkvWeight);
+        ggml_tensor* gate = layer.Get(model_keys::kAttnGate);
+        if (!qkv || !gate || !qkv->data || !gate->data || qkv->view_src || gate->view_src) {
+            ++qwen_ssm_qkvgate_reject_missing;
+            return;
+        }
+        if (qkv->type != GGML_TYPE_Q8_0 || gate->type != GGML_TYPE_Q8_0 || qkv->ne[0] != gate->ne[0] ||
+            qkv->ne[2] != 1 || gate->ne[2] != 1 || qkv->ne[3] != 1 || gate->ne[3] != 1) {
+            ++qwen_ssm_qkvgate_reject_type_or_shape;
+            return;
+        }
+        const size_t row_bytes = ggml_row_size(qkv->type, qkv->ne[0]);
+        if (row_bytes == 0 || qkv->nb[1] < row_bytes || gate->nb[1] < row_bytes) {
+            ++qwen_ssm_qkvgate_reject_stride;
+            return;
+        }
+        if (!init_alias_context(&model->ctx_cpu_repack, "CPU_REPACK")) {
+            ++qwen_ssm_qkvgate_reject_context;
+            return;
+        }
+        ++qwen_ssm_qkvgate_candidates;
+        const int64_t fused_rows = qkv->ne[1] + gate->ne[1];
+        ggml_tensor* alias = ggml_new_tensor_2d(model->ctx_cpu_repack, qkv->type, qkv->ne[0], fused_rows);
+        if (!alias) {
+            return;
+        }
+        char name[128];
+        std::snprintf(name, sizeof(name), "blk.%u.ssm_qkv_gate.cpu_fused_2d", layer_idx);
+        ggml_set_name(alias, name);
+
+        PendingFusedAlias fused{};
+        fused.layer = &layer;
+        fused.alias = alias;
+        fused.key = "attn_qkv_gate.cpu_fused_decode";
+        fused.bytes.resize(row_bytes * static_cast<size_t>(fused_rows));
+        size_t dst_row = 0;
+        auto append_rows = [&](const ggml_tensor* src) {
+            const uint8_t* src_bytes = static_cast<const uint8_t*>(src->data);
+            for (int64_t r = 0; r < src->ne[1]; ++r) {
+                std::memcpy(fused.bytes.data() + dst_row * row_bytes,
+                            src_bytes + static_cast<size_t>(r) * static_cast<size_t>(src->nb[1]), row_bytes);
+                ++dst_row;
+            }
+        };
+        append_rows(qkv);
+        append_rows(gate);
+        pending_plain_cpu_fused.push_back(std::move(fused));
+    };
+#endif
+
+    if (!arm_hybrid_ssm) {
+        if (model->tok_embeddings && model->tok_embeddings != model->output) {
+            make_alias(model->tok_embeddings, ".fast_matmul_2d");
+        }
+        if (model->output && model->output != model->tok_embeddings) {
+            make_alias(model->output, ".fast_matmul_2d");
+        }
     }
 #if !defined(__aarch64__) && !defined(_M_ARM64)
     if (model->output && (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
@@ -906,14 +1057,16 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         make_decode_alias(model->output, ".decode_fast_matmul");
     }
 #endif
-    for (auto& layer : model->layers) {
-        for (const auto& item : layer.tensors) {
-            if (model->arch_flags.is_hybrid_ssm && model->variant == ModelVariant::QWEN35 &&
-                (item.first.find("ffn_gate_exps") != std::string::npos ||
-                 item.first.find("ffn_up_exps") != std::string::npos)) {
-                continue;
+    if (!arm_hybrid_ssm) {
+        for (auto& layer : model->layers) {
+            for (const auto& item : layer.tensors) {
+                if (model->arch_flags.is_hybrid_ssm && model->variant == ModelVariant::QWEN35 &&
+                    (item.first.find("ffn_gate_exps") != std::string::npos ||
+                     item.first.find("ffn_up_exps") != std::string::npos)) {
+                    continue;
+                }
+                make_alias(item.second, ".fast_matmul");
             }
-            make_alias(item.second, ".fast_matmul");
         }
     }
 #if !defined(__aarch64__) && !defined(_M_ARM64)
@@ -938,11 +1091,60 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
             }
         }
     }
+#else
+    if (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) {
+        for (uint32_t i = 0; i < model->layers.size(); ++i) {
+            make_qwen_hybrid_ssm_qkv_gate_cpu_fused_alias(model->layers[i], i);
+        }
+    }
 #endif
-    if (pending_cpu_repack.empty() && pending_fused_cpu_repack.empty() && pending_cpu_amx.empty() &&
-        pending_fused_cpu_amx.empty()) {
+    if (pending_cpu_repack.empty() && pending_fused_cpu_repack.empty() && pending_plain_cpu_fused.empty() &&
+        pending_cpu_amx.empty() && pending_fused_cpu_amx.empty()) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        if (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) {
+            std::cout << "[DenseCore] Qwen hybrid SSM qkv_gate fused alias admission: candidates="
+                      << qwen_ssm_qkvgate_candidates << ", plain_prepared=0"
+                      << ", reject_missing=" << qwen_ssm_qkvgate_reject_missing
+                      << ", reject_type_or_shape=" << qwen_ssm_qkvgate_reject_type_or_shape
+                      << ", reject_stride=" << qwen_ssm_qkvgate_reject_stride
+                      << ", reject_context=" << qwen_ssm_qkvgate_reject_context << std::endl;
+        }
+#endif
         return;
     }
+
+    auto commit_plain_cpu_fused_alias = [&](PendingFusedAlias& item) -> bool {
+        if (!item.alias || !item.layer || item.key.empty() || item.bytes.empty() ||
+            item.alias->type != GGML_TYPE_Q8_0 || item.bytes.size() != ggml_nbytes(item.alias)) {
+            return false;
+        }
+        ggml_tensor* alias = ggml_new_tensor(model->ctx_cpu_repack, item.alias->type, GGML_MAX_DIMS, item.alias->ne);
+        if (!alias) {
+            return false;
+        }
+        ggml_set_name(alias, item.alias->name[0] ? item.alias->name : "qwen_hybrid_ssm_qkv_gate_fused_q8_0");
+
+        void* data = densecore::NumaAllocator::AllocateAlignedOnNode(item.bytes.size(), 64, -1);
+        if (!data) {
+            return false;
+        }
+        ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(data, item.bytes.size());
+        if (!buffer) {
+            densecore::NumaAllocator::Free(data, item.bytes.size(), densecore::AllocationType::Aligned);
+            return false;
+        }
+        if (ggml_backend_tensor_alloc(buffer, alias, data) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            densecore::NumaAllocator::Free(data, item.bytes.size(), densecore::AllocationType::Aligned);
+            return false;
+        }
+        std::memcpy(alias->data, item.bytes.data(), item.bytes.size());
+        model->numa_buffers.push_back({data, item.bytes.size(), densecore::AllocationType::Aligned});
+        model->cpu_repack_buffers.push_back(buffer);
+        item.layer->Set(item.key, alias);
+        item.alias = alias;
+        return true;
+    };
 
     auto allocate_and_commit_aliases = [&](std::vector<PendingAlias>& pending, ggml_context* ctx,
                                            std::vector<PendingFusedAlias>& pending_fused,
@@ -1050,6 +1252,28 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
                                 "AMX");
     allocate_and_commit_aliases(pending_cpu_repack, model->ctx_cpu_repack, pending_fused_cpu_repack,
                                 repack_bufts.cpu_repack, "CPU_REPACK");
+    size_t plain_fused_count = 0;
+    size_t plain_fused_bytes = 0;
+    for (auto& item : pending_plain_cpu_fused) {
+        if (commit_plain_cpu_fused_alias(item)) {
+            ++plain_fused_count;
+            plain_fused_bytes += ggml_nbytes(item.alias);
+        }
+    }
+    if (plain_fused_count > 0) {
+        std::cout << "[DenseCore] CPU plain fused aliases prepared: aliases=" << plain_fused_count
+                  << ", bytes=" << (plain_fused_bytes / 1024 / 1024) << " MiB" << std::endl;
+    }
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) {
+        std::cout << "[DenseCore] Qwen hybrid SSM qkv_gate fused alias admission: candidates="
+                  << qwen_ssm_qkvgate_candidates << ", plain_prepared=" << plain_fused_count
+                  << ", reject_missing=" << qwen_ssm_qkvgate_reject_missing
+                  << ", reject_type_or_shape=" << qwen_ssm_qkvgate_reject_type_or_shape
+                  << ", reject_stride=" << qwen_ssm_qkvgate_reject_stride
+                  << ", reject_context=" << qwen_ssm_qkvgate_reject_context << std::endl;
+    }
+#endif
 }
 
 void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
@@ -3360,7 +3584,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                                                                  "post_attention_layernorm.weight"}));
         model->layers[i].Set(model_keys::kAttnOutputNorm, get_layer_tensor_any(i, {"attn_output_norm.weight"}));
         model->layers[i].Set(model_keys::kAttnOutputNormBias, get_layer_tensor_any(i, {"attn_output_norm.bias"}));
-        // Fallback: Qwen3.5 uses post_attention_norm instead of ffn_norm
+        // Qwen3.5 names the FFN pre-norm tensor post_attention_norm.
         if (!model->layers[i].Get(model_keys::kFfnNorm) && model->layers[i].Get(model_keys::kPostAttnNorm)) {
             model->layers[i].Set(model_keys::kFfnNorm, model->layers[i].Get(model_keys::kPostAttnNorm));
         }
@@ -4353,7 +4577,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
                     delete model;
                     return nullptr;
                 }
-                if (i == 0) {
+                if (ssm_ordinal == 0) {
                     const char* ssm_debug_values = std::getenv("DENSECORE_DEBUG_QWEN36_SSM_VALUES");
                     std::cout << "[DenseCore] Qwen3.5 SSM tensor types: conv1d=" << ggml_type_name(conv->type)
                               << " alpha=" << ggml_type_name(alpha->type) << " beta=" << ggml_type_name(beta->type)

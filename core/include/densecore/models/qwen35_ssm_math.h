@@ -117,7 +117,7 @@ size_t Qwen35SSMHeadStateElements(int head_dim_k, int head_dim_v);
 
 // Runs one Qwen3.5 gated-delta recurrent step for a single head.
 //
-// `state_kv` uses the canonical reference layout [K, V], flattened as
+// `state_kv` mirrors llama.cpp's delta-net state layout [K, V], flattened as
 // `state[k * head_dim_v + v]`. The function updates state in place and writes
 // the gated RMSNorm output to `y_head`.
 bool Qwen35RunGatedDeltaHeadStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float* y_head,

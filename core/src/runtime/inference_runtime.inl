@@ -240,6 +240,7 @@ struct InferenceWorkContext {
     const BatchSpec* batch = nullptr;
     ModelVariant model_variant = ModelVariant::UNKNOWN;
     InferenceExecutionPhase phase = InferenceExecutionPhase::Unknown;
+    bool graph_build_no_alloc = false;
     Qwen36ProfileCounters qwen36_profile;
     KVCacheUserData kv_pool[256];
     std::vector<Gemma4SharedKVState> gemma4_shared_kv_states;
@@ -1907,6 +1908,7 @@ void ResetInferenceWorkContext(InferenceWorkContext* ctx) {
     static std::atomic<uint64_t> generation_counter{1};
     ctx->batch = nullptr;
     ctx->phase = InferenceExecutionPhase::Unknown;
+    ctx->graph_build_no_alloc = false;
     ctx->execution_generation = generation_counter.fetch_add(1, std::memory_order_relaxed);
     ResetQwen36Profile(ctx);
     ctx->gemma4_shared_kv_states.clear();
@@ -1945,6 +1947,7 @@ void ResetCachedDecodeGraphWorkContext(InferenceWorkContext* ctx) {
     if (!ctx) return;
     static std::atomic<uint64_t> generation_counter{1000000000ull};
     ctx->phase = InferenceExecutionPhase::Decode;
+    ctx->graph_build_no_alloc = false;
     ctx->execution_generation = generation_counter.fetch_add(1, std::memory_order_relaxed);
     ResetQwen36Profile(ctx);
     ctx->paged_attention_shared_k_block_ptrs.clear();
@@ -1972,6 +1975,18 @@ void SetCurrentWorkContext(InferenceWorkContext* ctx) {
 
 InferenceWorkContext* GetCurrentWorkContext() {
     return tls_work_ctx;
+}
+
+void SetInferenceWorkContextGraphBuildNoAlloc(InferenceWorkContext* ctx, bool no_alloc) {
+    if (!ctx) {
+        return;
+    }
+    ctx->graph_build_no_alloc = no_alloc;
+}
+
+bool IsCurrentGraphBuildNoAlloc() {
+    InferenceWorkContext* ctx = GetCurrentWorkContext();
+    return ctx && ctx->graph_build_no_alloc;
 }
 
 void SetInferenceWorkContextModelVariant(InferenceWorkContext* ctx, ModelVariant variant) {
@@ -2178,6 +2193,7 @@ inline ProjectionReferenceUserData* GetProjectionReferenceUserData() {
         ctx->projection_reference_index = 0;
         idx = 0;
     }
+    ctx->projection_reference_pool[idx] = ProjectionReferenceUserData{};
     return &ctx->projection_reference_pool[idx];
 }
 

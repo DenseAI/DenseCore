@@ -43,6 +43,7 @@ enum class ExecutionCustomOpRebindKind : uint8_t {
 enum class ExecutionFastPathClass : uint8_t {
     None = 0,
     QwenDense,
+    QwenHybridSSMDense,
     QwenHybridSSMMoE,
     LFM2ShortConvMoE,
 };

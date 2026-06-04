@@ -257,6 +257,48 @@ TEST(ModelExecutionContract, QwenDenseDeclaresFallbackFreeFastPathWithoutNativeM
     EXPECT_NE(formatted.find("requires_native_moe_fast_path=false"), std::string::npos);
 }
 
+TEST(ModelExecutionContract, QwenHybridSSMDenseDeclaresFallbackFreeRebindWithoutNativeMoERequirement) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_layer = 2;
+    model.hparams.n_embd = 2048;
+    model.hparams.n_experts = 0;
+    model.ssm_inner_size = 2048;
+    model.ssm_group_count = 16;
+    model.ssm_state_size = 128;
+    model.ssm_time_step_rank = 16;
+    model.ssm_conv_kernel = 4;
+    model.hybrid_layer_is_ssm = {1, 0};
+    model.layers.resize(2);
+
+    const auto contract = densecore::models::BuildModelExecutionContract(&model);
+    ASSERT_TRUE(contract.valid) << densecore::models::FormatModelExecutionContract(contract);
+    EXPECT_EQ(contract.decoder_runtime_topology, densecore::models::DecoderRuntimeTopology::HybridSSM);
+    EXPECT_TRUE(contract.has_hybrid_ssm_mixer);
+    EXPECT_FALSE(contract.has_moe);
+    EXPECT_TRUE(contract.has_stateful_custom_ops);
+    EXPECT_EQ(contract.fast_path_class, densecore::models::ExecutionFastPathClass::QwenHybridSSMDense);
+    EXPECT_TRUE(contract.requires_fallback_free_fast_path);
+    EXPECT_FALSE(contract.requires_native_moe_fast_path);
+    EXPECT_EQ(contract.native_moe_max_direct_tokens, 0);
+    EXPECT_TRUE(densecore::models::ModelExecutionContractAllowsDecodeGraphCache(contract));
+    EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresDecodeGraphRuntimeRebind(contract));
+    EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresFallbackFreeFastPath(contract));
+    EXPECT_FALSE(densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(contract));
+    ASSERT_EQ(contract.rebind_descriptors.size(), 2u);
+
+    const std::string formatted = densecore::models::FormatModelExecutionContract(contract);
+    EXPECT_NE(formatted.find("requires_rebind=true"), std::string::npos);
+    EXPECT_NE(formatted.find("fast_path_class=qwen_hybrid_ssm_dense"), std::string::npos);
+    EXPECT_NE(formatted.find("requires_fallback_free_fast_path=true"), std::string::npos);
+    EXPECT_NE(formatted.find("requires_native_moe_fast_path=false"), std::string::npos);
+    EXPECT_NE(formatted.find("native_moe_max_direct_tokens=0"), std::string::npos);
+    EXPECT_NE(formatted.find("hybrid_ssm_conv1d@layer0"), std::string::npos);
+    EXPECT_NE(formatted.find("hybrid_ssm_delta@layer0"), std::string::npos);
+}
+
 TEST(DecoderModelSpec, Qwen36GroupedMetadataStillUsesLlamaCppSoftmaxRouter) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;

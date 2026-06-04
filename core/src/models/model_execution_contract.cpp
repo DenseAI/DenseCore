@@ -143,8 +143,9 @@ ExecutionFastPathClass ResolveFastPathClass(const TransformerModel* model, const
     if (!model) {
         return ExecutionFastPathClass::None;
     }
-    if (IsQwenHybridSSMContract(contract) && contract.has_moe) {
-        return ExecutionFastPathClass::QwenHybridSSMMoE;
+    if (IsQwenHybridSSMContract(contract)) {
+        return contract.has_moe ? ExecutionFastPathClass::QwenHybridSSMMoE
+                                : ExecutionFastPathClass::QwenHybridSSMDense;
     }
     if ((contract.variant == ModelVariant::QWEN35 || contract.variant == ModelVariant::QWEN36) &&
         !contract.has_moe && !contract.has_hybrid_ssm_mixer) {
@@ -343,6 +344,7 @@ const char* ExecutionFastPathClassName(ExecutionFastPathClass kind) {
     switch (kind) {
     case ExecutionFastPathClass::None: return "none";
     case ExecutionFastPathClass::QwenDense: return "qwen_dense";
+    case ExecutionFastPathClass::QwenHybridSSMDense: return "qwen_hybrid_ssm_dense";
     case ExecutionFastPathClass::QwenHybridSSMMoE: return "qwen_hybrid_ssm_moe";
     case ExecutionFastPathClass::LFM2ShortConvMoE: return "lfm2_shortconv_moe";
     }

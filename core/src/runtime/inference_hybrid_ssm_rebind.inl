@@ -23,14 +23,22 @@ bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchS
         int n_tasks;
         void* userdata;
     };
+    struct CustomParamsView {
+        ggml_custom_op_t fun;
+        int n_tasks;
+        void* userdata;
+    };
     static_assert(sizeof(Custom1ParamsView) <= GGML_MAX_OP_PARAMS, "Custom1ParamsView too large");
     static_assert(sizeof(Custom2ParamsView) <= GGML_MAX_OP_PARAMS, "Custom2ParamsView too large");
     static_assert(sizeof(Custom3ParamsView) <= GGML_MAX_OP_PARAMS, "Custom3ParamsView too large");
+    static_assert(sizeof(CustomParamsView) <= GGML_MAX_OP_PARAMS, "CustomParamsView too large");
 
     int conv_rebinds = 0;
     int delta_rebinds = 0;
     const int* seq_ids = batch.seq_id.data();
     const auto* runtime_states = &batch.hybrid_ssm_runtime_states;
+    auto* current_work_ctx = GetCurrentWorkContext();
+    auto* profile = current_work_ctx ? &current_work_ctx->qwen36_profile : nullptr;
 
     const int n_nodes = ggml_graph_n_nodes(graph);
     for (int i = 0; i < n_nodes; ++i) {
@@ -49,6 +57,7 @@ bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchS
                 }
                 ud->token_seq_ids = seq_ids;
                 ud->runtime_states = runtime_states;
+                ud->profile = profile;
                 conv_rebinds++;
             }
             continue;
@@ -64,6 +73,7 @@ bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchS
                 }
                 ud->token_seq_ids = seq_ids;
                 ud->runtime_states = runtime_states;
+                ud->profile = profile;
                 delta_rebinds++;
             }
             continue;
@@ -79,6 +89,23 @@ bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchS
                 }
                 ud->token_seq_ids = seq_ids;
                 ud->runtime_states = runtime_states;
+                ud->profile = profile;
+                delta_rebinds++;
+            }
+            continue;
+        }
+
+        if (node->op == GGML_OP_CUSTOM) {
+            CustomParamsView params{};
+            std::memcpy(&params, node->op_params, sizeof(params));
+            if (params.fun == cb_ssm_qwen35_delta_custom) {
+                auto* ud = static_cast<SSMQwen35DeltaUserData*>(params.userdata);
+                if (!ud) {
+                    return false;
+                }
+                ud->token_seq_ids = seq_ids;
+                ud->runtime_states = runtime_states;
+                ud->profile = profile;
                 delta_rebinds++;
             }
         }

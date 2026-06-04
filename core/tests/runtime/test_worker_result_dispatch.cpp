@@ -201,7 +201,7 @@ TEST(WorkerResultDispatchTest, DecodeSummaryIncludesQ5MoeTelemetry) {
     req.moe_q5k_repacked_candidate_ops = 3;
     req.moe_q5k_repacked_used_ops = 1;
     req.moe_q5k_repacked_rejected_ops = 2;
-    req.moe_q5k_repacked_last_reject_reason = "env_or_kernel_disabled";
+    req.moe_q5k_repacked_last_reject_reason = "kernel_unavailable";
     req.gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops = 4;
     req.gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops = 5;
     req.qwen35_moe_w1w3_weight_type_hist[2] = 6;
@@ -223,7 +223,7 @@ TEST(WorkerResultDispatchTest, DecodeSummaryIncludesQ5MoeTelemetry) {
     EXPECT_NE(captured.find("moe_q5k_repacked_candidate_ops=3"), std::string::npos);
     EXPECT_NE(captured.find("moe_q5k_repacked_used_ops=1"), std::string::npos);
     EXPECT_NE(captured.find("moe_q5k_repacked_rejected_ops=2"), std::string::npos);
-    EXPECT_NE(captured.find("moe_q5k_repacked_last_reject_reason=env_or_kernel_disabled"), std::string::npos);
+    EXPECT_NE(captured.find("moe_q5k_repacked_last_reject_reason=kernel_unavailable"), std::string::npos);
     EXPECT_NE(captured.find("gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops=4"),
               std::string::npos);
     EXPECT_NE(captured.find("gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops=5"), std::string::npos);

@@ -11,6 +11,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "densecore/hal/tensor.h"
@@ -697,6 +698,9 @@ struct TransformerModel {
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_repack_aliases;
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_repack_alias_sources;
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_decode_repack_aliases;
+    // Qwen35/36 MoE gate/up tensors whose GGUF Q5_K bytes were replaced at load
+    // with ggml's q5_K_8x8 layout. These tensors must only use repacked kernels.
+    std::unordered_set<const struct ggml_tensor*> q5k_8x8_repacked_tensors;
     // Scoped Qwen3.6 SSM prefill-only AMX aliases. They are prepared only for
     // a prefill execution and cleared before decode so the canonical Q8_0 GGUF
     // tensors remain the decode-visible representation.

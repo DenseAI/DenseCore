@@ -447,6 +447,13 @@ bool RunQwen35NativeMoEQ5KQ8KDotRowForTest(const void* weight_row, const void* q
                                            float* output) {
     return densecore::hwy_kernels::DotQ5KQ8K_Hwy(weight_row, q8_input, cols, output);
 }
+bool RunQwen35NativeMoEQ5KFusedSwiGLURowsForTest(const void* gate_rows, const void* up_rows, const void* q8_input,
+                                                 int64_t cols, int64_t row_count, size_t row_bytes,
+                                                 float* output) {
+    return ::Qwen35NativeMoEKQ8KFusedSwiGLURows(GGML_TYPE_Q5_K, gate_rows, up_rows,
+                                                static_cast<const uint8_t*>(q8_input), cols, row_count, row_bytes,
+                                                output);
+}
 int64_t Qwen35NativeMoEMaxDirectTokensForTest() {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;

@@ -15,6 +15,7 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -75,6 +76,9 @@ bool RunQwen35NativeMoEQ4KQ8KDotRowForTest(const void* weight_row, const void* q
 bool RunQwen35NativeMoEQ5KQ8KDotRowForTest(const void* weight_row, const void* q8_input, int64_t cols,
                                            float* output);
 bool RunQwen35NativeQuantizeRowQ8KForTest(const float* input, void* q8_output, int64_t cols);
+bool RunQwen35NativeMoEQ5KFusedSwiGLURowsForTest(const void* gate_rows, const void* up_rows, const void* q8_input,
+                                                 int64_t cols, int64_t row_count, size_t row_bytes,
+                                                 float* output);
 }  // namespace densecore::testing
 
 namespace {
@@ -165,6 +169,14 @@ void QuantizeRowsForTest(ggml_type qtype, const std::vector<float>& src, int row
                            quantized->data() + static_cast<size_t>(row) * row_bytes, cols);
     }
 }
+
+struct TestBlockQ8K {
+    float d;
+    int8_t qs[QK_K];
+    int16_t bsums[QK_K / 16];
+};
+static_assert(sizeof(TestBlockQ8K) == sizeof(float) + QK_K + (QK_K / 16) * sizeof(int16_t),
+              "test Q8_K layout mismatch");
 
 void GgmlQuantizedProjectionVecDotReference(ggml_type weight_type, const std::vector<uint8_t>& weight,
                                             const std::vector<float>& input, int M, int K, int N,
@@ -1883,6 +1895,138 @@ TEST(NumaStickyRouting, QwenNativeQ5KGateUpDotUsesDenseCoreQ8FastPath) {
         ASSERT_TRUE(densecore::hwy_kernels::DotQ5KQ8K_Hwy(weight_row, densecore_q8.data(), K, &hwy_value));
         EXPECT_FLOAT_EQ(native_value, hwy_value) << "row=" << row;
     }
+}
+
+TEST(NumaStickyRouting, QwenNativeQ5KFusedSwiGLURowsUseDenseCoreQ8FastPath) {
+    constexpr int K = 256;
+    constexpr int N = 8;
+    constexpr ggml_type qtype = GGML_TYPE_Q5_K;
+
+    std::mt19937 rng(1832);
+    std::uniform_real_distribution<float> input_dist(-1.25f, 1.25f);
+    std::uniform_real_distribution<float> weight_dist(-0.75f, 0.75f);
+
+    std::vector<float> input(static_cast<size_t>(K));
+    std::vector<float> gate_f32(static_cast<size_t>(N * K));
+    std::vector<float> up_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : gate_f32) v = weight_dist(rng);
+    for (float& v : up_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> gate_q5k;
+    std::vector<uint8_t> up_q5k;
+    QuantizeRowsForTest(qtype, gate_f32, N, K, &gate_q5k);
+    QuantizeRowsForTest(qtype, up_f32, N, K, &up_q5k);
+
+    const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, K);
+    std::vector<uint8_t> densecore_q8(q8_row_bytes);
+    ASSERT_TRUE(densecore::testing::RunQwen35NativeQuantizeRowQ8KForTest(input.data(), densecore_q8.data(), K));
+    std::vector<uint8_t> ggml_q8(q8_row_bytes);
+    {
+        const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+        ASSERT_NE(q8_traits, nullptr);
+        ASSERT_NE(q8_traits->from_float, nullptr);
+        q8_traits->from_float(input.data(), ggml_q8.data(), K);
+    }
+    EXPECT_EQ(densecore_q8, ggml_q8);
+
+    const size_t row_bytes = ggml_row_size(qtype, K);
+    std::vector<float> fused_out(N, 0.0f);
+    ASSERT_TRUE(densecore::testing::RunQwen35NativeMoEQ5KFusedSwiGLURowsForTest(
+        gate_q5k.data(), up_q5k.data(), densecore_q8.data(), K, N, row_bytes, fused_out.data()));
+
+    for (int row = 0; row < N; ++row) {
+        const void* gate_row = gate_q5k.data() + static_cast<size_t>(row) * row_bytes;
+        const void* up_row = up_q5k.data() + static_cast<size_t>(row) * row_bytes;
+        float gate = 0.0f;
+        float up = 0.0f;
+        ASSERT_TRUE(densecore::hwy_kernels::DotQ5KQ8K_Hwy(gate_row, densecore_q8.data(), K, &gate));
+        ASSERT_TRUE(densecore::hwy_kernels::DotQ5KQ8K_Hwy(up_row, densecore_q8.data(), K, &up));
+        const auto* q5_traits = ggml_get_type_traits(qtype);
+        ASSERT_NE(q5_traits, nullptr);
+        ASSERT_NE(q5_traits->to_float, nullptr);
+        std::vector<float> gate_deq(K);
+        std::vector<float> up_deq(K);
+        std::vector<float> input_deq(K);
+        q5_traits->to_float(gate_row, gate_deq.data(), K);
+        q5_traits->to_float(up_row, up_deq.data(), K);
+        const auto* q8_blocks = reinterpret_cast<const TestBlockQ8K*>(ggml_q8.data());
+        for (int bi = 0; bi < K / QK_K; ++bi) {
+            for (int i = 0; i < QK_K; ++i) {
+                input_deq[static_cast<size_t>(bi * QK_K + i)] =
+                    q8_blocks[bi].d * static_cast<float>(q8_blocks[bi].qs[i]);
+            }
+        }
+        float gate_ref = 0.0f;
+        float up_ref = 0.0f;
+        for (int i = 0; i < K; ++i) {
+            gate_ref += gate_deq[static_cast<size_t>(i)] * input_deq[static_cast<size_t>(i)];
+            up_ref += up_deq[static_cast<size_t>(i)] * input_deq[static_cast<size_t>(i)];
+        }
+        EXPECT_NEAR(gate, gate_ref, 1e-4f) << "gate row=" << row;
+        EXPECT_NEAR(up, up_ref, 1e-4f) << "up row=" << row;
+        const float expected = gate * (1.0f / (1.0f + std::exp(-gate))) * up;
+        EXPECT_NEAR(fused_out[static_cast<size_t>(row)], expected, 1e-4f) << "row=" << row;
+    }
+}
+
+TEST(NumaStickyRouting, QwenNativeQ5KRepackedGateUpMatchesRawFusedSwiGLU) {
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+    GTEST_SKIP() << "q5_K_8x8 gate/up repacked GEMV is only admitted on ARM dotprod targets";
+#else
+    if (!ggml_cpu_has_neon() || !ggml_cpu_has_dotprod()) {
+        GTEST_SKIP() << "q5_K_8x8 gate/up repacked GEMV requires ARM NEON dotprod";
+    }
+    constexpr int K = 256;
+    constexpr int N = 16;
+    constexpr ggml_type qtype = GGML_TYPE_Q5_K;
+
+    std::mt19937 rng(1833);
+    std::uniform_real_distribution<float> input_dist(-1.25f, 1.25f);
+    std::uniform_real_distribution<float> weight_dist(-0.75f, 0.75f);
+
+    std::vector<float> input(static_cast<size_t>(K));
+    std::vector<float> gate_f32(static_cast<size_t>(N * K));
+    std::vector<float> up_f32(static_cast<size_t>(N * K));
+    for (float& v : input) v = input_dist(rng);
+    for (float& v : gate_f32) v = weight_dist(rng);
+    for (float& v : up_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> gate_q5k;
+    std::vector<uint8_t> up_q5k;
+    QuantizeRowsForTest(qtype, gate_f32, N, K, &gate_q5k);
+    QuantizeRowsForTest(qtype, up_f32, N, K, &up_q5k);
+
+    const size_t row_bytes = ggml_row_size(qtype, K);
+    const size_t raw_bytes = row_bytes * static_cast<size_t>(N);
+    ASSERT_EQ(gate_q5k.size(), raw_bytes);
+    ASSERT_EQ(up_q5k.size(), raw_bytes);
+
+    const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, K);
+    std::vector<uint8_t> densecore_q8(q8_row_bytes);
+    ASSERT_TRUE(densecore::testing::RunQwen35NativeQuantizeRowQ8KForTest(input.data(), densecore_q8.data(), K));
+
+    std::vector<float> raw_fused(N, 0.0f);
+    ASSERT_TRUE(densecore::testing::RunQwen35NativeMoEQ5KFusedSwiGLURowsForTest(
+        gate_q5k.data(), up_q5k.data(), densecore_q8.data(), K, N, row_bytes, raw_fused.data()));
+
+    std::vector<uint8_t> gate_repacked(raw_bytes, 0);
+    std::vector<uint8_t> up_repacked(raw_bytes, 0);
+    ASSERT_EQ(ggml_repack_q5_K_8x8(gate_q5k.data(), raw_bytes, N, K, gate_repacked.data(), gate_repacked.size()), 0);
+    ASSERT_EQ(ggml_repack_q5_K_8x8(up_q5k.data(), raw_bytes, N, K, up_repacked.data(), up_repacked.size()), 0);
+
+    std::vector<float> gate(N, 0.0f);
+    std::vector<float> up(N, 0.0f);
+    ggml_gemv_q5_K_8x8_q8_K(K, gate.data(), 0, gate_repacked.data(), densecore_q8.data(), 1, N);
+    ggml_gemv_q5_K_8x8_q8_K(K, up.data(), 0, up_repacked.data(), densecore_q8.data(), 1, N);
+
+    for (int row = 0; row < N; ++row) {
+        const float repacked = gate[static_cast<size_t>(row)] *
+                               (1.0f / (1.0f + std::exp(-gate[static_cast<size_t>(row)]))) *
+                               up[static_cast<size_t>(row)];
+        EXPECT_NEAR(repacked, raw_fused[static_cast<size_t>(row)], 1e-4f) << "row=" << row;
+    }
+#endif
 }
 
 TEST(NumaStickyRouting, GgmlQ4KRepackedPrefillGemmFusedSwiGLUMatchesDenseReferenceWithTail) {

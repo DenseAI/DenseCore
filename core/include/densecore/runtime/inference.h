@@ -513,6 +513,8 @@ void ResetInferenceWorkContext(InferenceWorkContext* ctx);
 void ResetCachedDecodeGraphWorkContext(InferenceWorkContext* ctx);
 void SetCurrentWorkContext(InferenceWorkContext* ctx);
 InferenceWorkContext* GetCurrentWorkContext();
+void SetInferenceWorkContextGraphBuildNoAlloc(InferenceWorkContext* ctx, bool no_alloc);
+bool IsCurrentGraphBuildNoAlloc();
 void SetInferenceWorkContextModelVariant(InferenceWorkContext* ctx, ModelVariant variant);
 void SetCurrentExecutionPhase(InferenceExecutionPhase phase);
 InferenceExecutionPhase GetCurrentExecutionPhase();

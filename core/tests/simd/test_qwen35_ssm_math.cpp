@@ -57,8 +57,8 @@ void RunReferenceStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float
         k_sum_sq += cfg.k_head[i] * cfg.k_head[i];
     }
 
-    const float q_inv_norm = 1.0f / std::sqrt(q_sum_sq + cfg.norm_eps);
-    const float k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+    const float q_inv_norm = 1.0f / std::max(std::sqrt(q_sum_sq), cfg.norm_eps);
+    const float k_inv_norm = 1.0f / std::max(std::sqrt(k_sum_sq), cfg.norm_eps);
     for (int i = 0; i < cfg.head_dim_k; ++i) {
         q_norm[static_cast<size_t>(i)] = cfg.q_head[i] * q_inv_norm;
         k_norm[static_cast<size_t>(i)] = cfg.k_head[i] * k_inv_norm;
@@ -78,8 +78,9 @@ void RunReferenceStep(const Qwen35SSMHeadStepConfig& cfg, float* state_kv, float
 
     for (int k = 0; k < cfg.head_dim_k; ++k) {
         float* row = state_kv + static_cast<size_t>(k) * cfg.head_dim_v;
+        const float k_val = k_norm[static_cast<size_t>(k)];
         for (int v = 0; v < cfg.head_dim_v; ++v) {
-            row[v] += k_norm[static_cast<size_t>(k)] * delta[static_cast<size_t>(v)];
+            row[v] += k_val * delta[static_cast<size_t>(v)];
         }
     }
 
@@ -161,8 +162,8 @@ bool RunLegacyFastDefaultForComparison(const Qwen35SSMHeadStepConfig& cfg, float
             q_sum_sq += cfg.q_head[k] * cfg.q_head[k];
             k_sum_sq += cfg.k_head[k] * cfg.k_head[k];
         }
-        q_inv_norm = 1.0f / std::sqrt(q_sum_sq + cfg.norm_eps);
-        k_inv_norm = 1.0f / std::sqrt(k_sum_sq + cfg.norm_eps);
+        q_inv_norm = 1.0f / std::max(std::sqrt(q_sum_sq), cfg.norm_eps);
+        k_inv_norm = 1.0f / std::max(std::sqrt(k_sum_sq), cfg.norm_eps);
     }
 
     std::vector<float> delta(static_cast<size_t>(cfg.head_dim_v), 0.0f);

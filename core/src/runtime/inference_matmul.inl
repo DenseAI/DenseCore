@@ -2619,18 +2619,195 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         }
     }
 
-    auto store_out = [&](int m, int k, float value) {
-        char* out_col = output_base + static_cast<size_t>(m) * output_col_stride;
-        if (output_contig) {
-            reinterpret_cast<float*>(out_col)[k] = value;
-        } else {
-            *reinterpret_cast<float*>(out_col + static_cast<size_t>(k) * dst->nb[0]) = value;
-        }
-    };
+	    const char* weight_base = reinterpret_cast<const char*>(weight_tensor->data);
 
-    const char* weight_base = reinterpret_cast<const char*>(weight_tensor->data);
+	    auto store_out = [&](int m, int k, float value) {
+	        char* out_col = output_base + static_cast<size_t>(m) * output_col_stride;
+	        if (output_contig) {
+	            reinterpret_cast<float*>(out_col)[k] = value;
+	        } else {
+	            *reinterpret_cast<float*>(out_col + static_cast<size_t>(k) * dst->nb[0]) = value;
+	        }
+	    };
+	    auto load_out = [&](int m, int k) -> float {
+	        const char* out_col = output_base + static_cast<size_t>(m) * output_col_stride;
+	        if (output_contig) {
+	            return reinterpret_cast<const float*>(out_col)[k];
+	        }
+	        return *reinterpret_cast<const float*>(out_col + static_cast<size_t>(k) * dst->nb[0]);
+	    };
+	    auto maybe_log_output_partition = [&](const char* path) {
+	        static const bool debug_out = ParseTruthyEnv("DENSECORE_DEBUG_GEMV_BATCHED_OUT", false);
+	        if (!debug_out) {
+	            return;
+	        }
+	        static const char* target_weight = std::getenv("DENSECORE_DEBUG_GEMV_BATCHED_OUT_WEIGHT");
+	        if (target_weight && target_weight[0] != '\0' && !std::strstr(weight_name, target_weight)) {
+	            return;
+	        }
+	        static const int target_token = ParseIntEnv("DENSECORE_DEBUG_GEMV_BATCHED_OUT_TOKEN", -1);
+	        const int m_debug = (target_token >= 0) ? target_token : (M - 1);
+	        if (m_debug < 0 || m_debug >= M) {
+	            return;
+	        }
+	        static const int row_begin_env = ParseIntEnv("DENSECORE_DEBUG_GEMV_BATCHED_OUT_ROW_BEGIN", -1);
+	        static const int row_end_env = ParseIntEnv("DENSECORE_DEBUG_GEMV_BATCHED_OUT_ROW_END", -1);
+	        const int stat_begin = std::max(k_start, row_begin_env >= 0 ? row_begin_env : k_start);
+	        const int stat_end = std::min(k_end, row_end_env >= 0 ? row_end_env : k_end);
+	        if (stat_begin >= stat_end) {
+	            return;
+	        }
+	        static std::atomic<int> remaining{ParsePositiveEnvInt("DENSECORE_DEBUG_GEMV_BATCHED_OUT_MAX_CALLS", 64)};
+	        int budget = remaining.load(std::memory_order_relaxed);
+	        while (budget > 0 && !remaining.compare_exchange_weak(
+	                                 budget, budget - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+	        }
+	        if (budget <= 0) {
+	            return;
+	        }
 
-    if (weight_type == GGML_TYPE_F32) {
+	        float min_v = std::numeric_limits<float>::infinity();
+	        float max_v = -std::numeric_limits<float>::infinity();
+	        float max_abs = 0.0f;
+	        double sum = 0.0;
+	        double sum_sq = 0.0;
+	        int finite = 0;
+	        int nonzero = 0;
+	        for (int k = stat_begin; k < stat_end; ++k) {
+	            const float v = load_out(m_debug, k);
+	            if (!std::isfinite(v)) {
+	                continue;
+	            }
+	            min_v = std::min(min_v, v);
+	            max_v = std::max(max_v, v);
+	            max_abs = std::max(max_abs, std::fabs(v));
+	            sum += v;
+	            sum_sq += static_cast<double>(v) * static_cast<double>(v);
+	            finite++;
+	            if (std::fabs(v) > 1.0e-12f) {
+	                nonzero++;
+	            }
+	        }
+	        if (!std::isfinite(min_v)) {
+	            min_v = 0.0f;
+	        }
+	        if (!std::isfinite(max_v)) {
+	            max_v = 0.0f;
+	        }
+
+	        const float* x_row = x_rows[static_cast<size_t>(m_debug)];
+	        float input_max_abs = 0.0f;
+	        double input_sum_sq = 0.0;
+	        int input_finite = 0;
+	        for (int i = 0; i < N; ++i) {
+	            const float v = x_row[i];
+	            if (!std::isfinite(v)) {
+	                continue;
+	            }
+	            input_max_abs = std::max(input_max_abs, std::fabs(v));
+	            input_sum_sq += static_cast<double>(v) * static_cast<double>(v);
+	            input_finite++;
+	        }
+
+	        float sample0 = 0.0f;
+	        float sample_mid = 0.0f;
+	        float sample_last = 0.0f;
+	        const int sample_mid_k = stat_begin + (stat_end - stat_begin) / 2;
+	        sample0 = load_out(m_debug, stat_begin);
+	        sample_mid = load_out(m_debug, sample_mid_k);
+	        sample_last = load_out(m_debug, stat_end - 1);
+
+	        float w0_max_abs = 0.0f;
+	        float wmid_max_abs = 0.0f;
+	        float wlast_max_abs = 0.0f;
+	        double w0_sum_sq = 0.0;
+	        double wmid_sum_sq = 0.0;
+	        double wlast_sum_sq = 0.0;
+	        int w0_finite = 0;
+	        int wmid_finite = 0;
+	        int wlast_finite = 0;
+	        const auto* debug_traits = ggml_get_type_traits(weight_type);
+	        if (debug_traits && debug_traits->to_float) {
+	            thread_local std::vector<float> debug_weight_row;
+	            debug_weight_row.resize(static_cast<size_t>(N));
+	            auto scan_weight = [&](int k, float& row_max_abs, double& row_sum_sq, int& row_finite) {
+	                const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
+	                debug_traits->to_float(row_ptr, debug_weight_row.data(), N);
+	                for (int i = 0; i < N; ++i) {
+	                    const float v = debug_weight_row[static_cast<size_t>(i)];
+	                    if (!std::isfinite(v)) {
+	                        continue;
+	                    }
+	                    row_max_abs = std::max(row_max_abs, std::fabs(v));
+	                    row_sum_sq += static_cast<double>(v) * static_cast<double>(v);
+	                    row_finite++;
+	                }
+	            };
+	            scan_weight(stat_begin, w0_max_abs, w0_sum_sq, w0_finite);
+	            scan_weight(sample_mid_k, wmid_max_abs, wmid_sum_sq, wmid_finite);
+	            scan_weight(stat_end - 1, wlast_max_abs, wlast_sum_sq, wlast_finite);
+	        }
+
+	        std::fprintf(stderr,
+	                     "[GEMV_BATCHED_OUT] path=%s w=%s ith=%d nth=%d M=%d N=%d K=%d token=%d "
+	                     "rows=[%d,%d) stat_rows=[%d,%d) type=%d finite=%d nonzero=%d min=%.8g max=%.8g "
+	                     "max_abs=%.8g mean=%.8g rms=%.8g sample={%d:%.8g,%d:%.8g,%d:%.8g} "
+	                     "input_finite=%d input_max_abs=%.8g input_rms=%.8g "
+	                     "w0={finite:%d,max_abs:%.8g,rms:%.8g} wmid={finite:%d,max_abs:%.8g,rms:%.8g} "
+	                     "wlast={finite:%d,max_abs:%.8g,rms:%.8g}\n",
+	                     path ? path : "(unknown)", weight_name, ith, nth, M, N, K, m_debug, k_start, k_end,
+	                     stat_begin, stat_end, static_cast<int>(weight_type), finite, nonzero, min_v, max_v, max_abs,
+	                     finite ? sum / finite : 0.0, finite ? std::sqrt(sum_sq / finite) : 0.0, stat_begin, sample0,
+	                     sample_mid_k, sample_mid, stat_end - 1, sample_last, input_finite, input_max_abs,
+	                     input_finite ? std::sqrt(input_sum_sq / input_finite) : 0.0, w0_finite, w0_max_abs,
+	                     w0_finite ? std::sqrt(w0_sum_sq / w0_finite) : 0.0, wmid_finite, wmid_max_abs,
+	                     wmid_finite ? std::sqrt(wmid_sum_sq / wmid_finite) : 0.0, wlast_finite, wlast_max_abs,
+	                     wlast_finite ? std::sqrt(wlast_sum_sq / wlast_finite) : 0.0);
+	    };
+
+	    static const bool debug_batched_io = []() {
+	        const char* env = std::getenv("DENSECORE_DEBUG_GEMV_BATCHED_IO");
+	        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+	    }();
+	    if (debug_batched_io && ith == 0 && std::strstr(weight_name, "ssm_out")) {
+	        static std::atomic<int> debug_count{0};
+	        const int idx = debug_count.fetch_add(1, std::memory_order_relaxed);
+	        if (idx < 16) {
+	            auto log_input_col = [&](int m) {
+	                if (m < 0 || m >= M) return;
+	                const float* row = x_rows[static_cast<size_t>(m)];
+	                float min_v = std::numeric_limits<float>::infinity();
+	                float max_v = -std::numeric_limits<float>::infinity();
+	                float max_abs = 0.0f;
+	                double sum_sq = 0.0;
+	                double sum = 0.0;
+	                int finite = 0;
+	                for (int i = 0; i < N; ++i) {
+	                    const float v = row[i];
+	                    if (!std::isfinite(v)) continue;
+	                    min_v = std::min(min_v, v);
+	                    max_v = std::max(max_v, v);
+	                    max_abs = std::max(max_abs, std::fabs(v));
+	                    sum += v;
+	                    sum_sq += static_cast<double>(v) * static_cast<double>(v);
+	                    finite++;
+	                }
+	                if (!std::isfinite(min_v)) min_v = 0.0f;
+	                if (!std::isfinite(max_v)) max_v = 0.0f;
+	                std::fprintf(stderr,
+	                             "[GEMV_BATCHED_IO] w=%s call=%d token=%d M=%d N=%d K=%d finite=%d min=%.8g max=%.8g "
+	                             "max_abs=%.8g mean=%.8g rms=%.8g first=%.8g\n",
+	                             weight_name, idx, m, M, N, K, finite, min_v, max_v, max_abs,
+	                             finite ? sum / finite : 0.0, finite ? std::sqrt(sum_sq / finite) : 0.0,
+	                             N > 0 ? row[0] : 0.0f);
+	            };
+	            log_input_col(0);
+	            if (M > 1) {
+	                log_input_col(M - 1);
+	            }
+	        }
+	    }
+	    if (weight_type == GGML_TYPE_F32) {
         if (IsHybridSSMQkvWeightName(weight_name) && IsDebugMatmulDispatchEnabled() && ith == 0) {
             LogHybridSSMQkvDispatch(weight_name, weight_type, M, K, N, "BATCHED_F32_CALLBACK", false, false, false);
         }
@@ -2644,11 +2821,12 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
             const float* A = reinterpret_cast<const float*>(input_base);
             const float* B = reinterpret_cast<const float*>(weight_base);
             float* C = reinterpret_cast<float*>(output_base);
-            // k_start/k_end map to n_start/n_end in GEMM Split-N convention
-            densecore::hwy_kernels::GemmFP32_Hwy(C, A, B, M, K, N, k_start, k_end);
-            record_quant_profile(false, false);
-            return;
-        }
+	            // k_start/k_end map to n_start/n_end in GEMM Split-N convention
+	            densecore::hwy_kernels::GemmFP32_Hwy(C, A, B, M, K, N, k_start, k_end);
+	            maybe_log_output_partition("f32_hwy");
+	            record_quant_profile(false, false);
+	            return;
+	        }
 
         // Strided fallback: scalar with weight row reuse
         for (int k = k_start; k < k_end; ++k) {
@@ -2661,13 +2839,14 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     sums[static_cast<size_t>(m)] += x_rows[static_cast<size_t>(m)][i] * w;
                 }
             }
-            for (int m = 0; m < M; ++m) {
-                store_out(m, k, sums[static_cast<size_t>(m)]);
-            }
-        }
-        record_quant_profile(false, false);
-        return;
-    }
+	            for (int m = 0; m < M; ++m) {
+	                store_out(m, k, sums[static_cast<size_t>(m)]);
+	            }
+	        }
+	        maybe_log_output_partition("f32_scalar");
+	        record_quant_profile(false, false);
+	        return;
+	    }
 
     if (ud->qwen36_ssm_q8_direct_batched && weight_type == GGML_TYPE_Q8_0 && input_contig && output_contig &&
         (N % QK8_0) == 0) {
@@ -2808,12 +2987,13 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         run_scalar_cols(m, std::max(k_aligned_end, k_start), k_end);
                     }
                     LogMatmulPathOnce("qwen36_ssm_q8_0_repacked_direct_batched");
-                    if (ith == 0) {
-                        RecordSharedQuantReuse(used_shared_q8_inputs);
-                    }
-                    record_quant_profile(true, false);
-                    return;
-                }
+	                    if (ith == 0) {
+	                        RecordSharedQuantReuse(used_shared_q8_inputs);
+	                    }
+	                    maybe_log_output_partition("q8_repacked_direct");
+	                    record_quant_profile(true, false);
+	                    return;
+	                }
             }
 
             for (int k = k_start; k < k_end; ++k) {
@@ -2822,12 +3002,13 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 }
             }
             LogMatmulPathOnce("qwen36_ssm_q8_0_direct_batched");
-            if (ith == 0) {
-                RecordSharedQuantReuse(used_shared_q8_inputs);
-            }
-            record_quant_profile(true, false);
-            return;
-        }
+	            if (ith == 0) {
+	                RecordSharedQuantReuse(used_shared_q8_inputs);
+	            }
+	            maybe_log_output_partition("q8_direct_scalar");
+	            record_quant_profile(true, false);
+	            return;
+	        }
     }
 
     const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight_type);
@@ -3053,10 +3234,10 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
                         type_traits_cpu->vec_dot(N, out_ptr, dst->nb[1], row_ptr, 0, quant_input_base, quant_row_stride,
                                                  tile_m);
-                    }
-                    LogMatmulPathOnce("gemv_batched_quant_nrc");
-                    continue;
-                }
+	                    }
+	                    LogMatmulPathOnce("gemv_batched_quant_nrc");
+	                    continue;
+	                }
 
                 if (!ud->force_reference_scalar && can_use_q4k_true_batched && quant_input_base &&
                     (!ud->qwen36_prefill_q4k_admission_key || ud->qwen36_prefill_q4k_admitted)) {
@@ -3169,11 +3350,11 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         DowngradeQwen36Q4KBatchedAdmissionOnRuntimeFailure(
                             ud->qwen36_prefill_q4k_admission_key, max_abs_diff,
                             Qwen36PrefillQ4KBatchedRejectReason::ProbeInternalError, downgrade_ctx);
-                    }
-                    if (all_rows_ok) {
-                        if (ith == 0 && ud->qwen36_prefill_q4k_admission_key) {
-                            InferenceWorkContext* work_ctx = callback_work_ctx;
-                            if (work_ctx) {
+	                    }
+	                    if (all_rows_ok) {
+	                        if (ith == 0 && ud->qwen36_prefill_q4k_admission_key) {
+	                            InferenceWorkContext* work_ctx = callback_work_ctx;
+	                            if (work_ctx) {
                                 work_ctx->qwen36_profile.qwen36_prefill_q4k_batched_used.store(
                                     1, std::memory_order_relaxed);
                             }
@@ -3195,11 +3376,11 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         for (int m = 0; m < tile_m; ++m) {
                             store_out(tile_start + m, k, row_sums[static_cast<size_t>(m)]);
                         }
-                    }
-                    if (all_rows_ok) {
-                        record_quant_profile(true, true);
-                        continue;
-                    }
+	                    }
+	                    if (all_rows_ok) {
+	                        record_quant_profile(true, true);
+	                        continue;
+	                    }
                 }
                 if (ud->require_q4k_true_batched) {
                     throw densecore::InvalidArgumentException(
@@ -3212,13 +3393,14 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         float sum = 0.0f;
                         const void* q_ptr = quant_input_base + static_cast<size_t>(m) * quant_row_stride;
                         type_traits_cpu->vec_dot(N, &sum, 0, row_ptr, 0, q_ptr, 0, 1);
-                        store_out(tile_start + m, k, sum);
-                    }
-                }
-            }
-            record_quant_profile(true, false);
-            finalize_qwen36_probe();
-            return;
+	                        store_out(tile_start + m, k, sum);
+	                    }
+	                }
+	            }
+	            maybe_log_output_partition("quant_vecdot_scalar");
+	            record_quant_profile(true, false);
+	            finalize_qwen36_probe();
+	            return;
         }
     }
     if (ud->require_q4k_true_batched) {
@@ -3254,11 +3436,25 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 sums[static_cast<size_t>(m)] += x_rows[static_cast<size_t>(m)][i] * w;
             }
         }
-        for (int m = 0; m < M; ++m) {
-            store_out(m, k, sums[static_cast<size_t>(m)]);
-        }
+	        for (int m = 0; m < M; ++m) {
+	            store_out(m, k, sums[static_cast<size_t>(m)]);
+	        }
+	    }
+	    maybe_log_output_partition("dequant_reference_scalar");
+	    record_quant_profile(ggml_is_quantized(weight_type), false);
+}
+
+void cb_gemv_batched_custom_map3(struct ggml_tensor* dst, const struct ggml_tensor* shape,
+                                 const struct ggml_tensor* input, const struct ggml_tensor* weight, int ith, int nth,
+                                 void* userdata) {
+    (void)shape;
+    if (!dst || !input || !weight) {
+        return;
     }
-    record_quant_profile(ggml_is_quantized(weight_type), false);
+    struct ggml_tensor view = *dst;
+    view.src[0] = const_cast<struct ggml_tensor*>(input);
+    view.src[1] = const_cast<struct ggml_tensor*>(weight);
+    cb_gemv_batched_custom(&view, ith, nth, userdata);
 }
 
 static void ComputeFlashAttentionReference(const float* q, const float* k, const float* v, float* out, int n_head,
@@ -4527,7 +4723,8 @@ inline struct ggml_tensor* ggml_mul_mat_gemv(struct ggml_context* ctx, struct gg
 }
 
 inline struct ggml_tensor* ggml_mul_mat_gemv_batched(struct ggml_context* ctx, struct ggml_tensor* weight,
-                                                     struct ggml_tensor* input, GemvBatchedUserData* userdata) {
+                                                     struct ggml_tensor* input, GemvBatchedUserData* userdata,
+                                                     bool use_map3_dependencies = false) {
     const int K = static_cast<int>(weight->ne[1]);  // Output dimension
     const int N = static_cast<int>(weight->ne[0]);  // Input dimension
     const int M = static_cast<int>(input->ne[1]);   // Batch columns
@@ -4584,6 +4781,13 @@ inline struct ggml_tensor* ggml_mul_mat_gemv_batched(struct ggml_context* ctx, s
     n_threads = std::max(1, std::min(n_threads, K));
 
     const int64_t ne_res[4] = {K, M, 1, 1};
+    if (use_map3_dependencies) {
+        struct ggml_tensor* shape = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_res);
+        struct ggml_tensor* result =
+            ggml_map_custom3(ctx, shape, input, weight, cb_gemv_batched_custom_map3, n_threads, userdata);
+        return result;
+    }
+
     struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_res);
     result->op = GGML_OP_CUSTOM;
     result->src[0] = input;
@@ -6162,10 +6366,10 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const bool is_qwen36_hybrid_ssm_gate = is_qwen36_hybrid_ssm && std::strstr(w_name, "attn_gate");
     const bool is_qwen36_hybrid_ssm_out = model && model->variant == ModelVariant::QWEN36 &&
                                           model->arch_flags.is_hybrid_ssm && std::strstr(w_name, "ssm_out");
-    const bool is_qwen36_hybrid_ssm_q8_prefill =
-        (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
-        weight->type == GGML_TYPE_Q8_0 && input->type == GGML_TYPE_F32 && M > 1 &&
-        weight->ne[0] == input->ne[0];
+    const bool is_qwen_hybrid_ssm_q8_prefill =
+        ((is_qwen35_hybrid_ssm && IsHybridSSMQkvWeightName(w_name)) || is_qwen35_hybrid_ssm_gate ||
+         is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
+        weight->type == GGML_TYPE_Q8_0 && input->type == GGML_TYPE_F32 && M > 1 && weight->ne[0] == input->ne[0];
     const bool is_qwen36_lm_head = model && model->output == weight && model->variant == ModelVariant::QWEN36 &&
                                    model->arch_flags.is_hybrid_ssm;
     const bool qwen_hybrid_ssm_quant_prefill_fast_path_eligible =
@@ -6298,7 +6502,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const bool force_qwen36_hybrid_ssm_q4k_native_prefill =
         (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
         qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k && qwen36_q4k_mode_off;
-    if (force_plain_hybrid_ssm_prefill && !is_qwen36_hybrid_ssm_q8_prefill &&
+    if (force_plain_hybrid_ssm_prefill && !is_qwen_hybrid_ssm_q8_prefill &&
         (!qwen_hybrid_ssm_quant_prefill_fast_path_eligible || force_qwen36_hybrid_ssm_q4k_native_prefill) &&
         ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 && M > 1) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
@@ -6466,7 +6670,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         false;
     const bool qwen36_prefill_prefers_ggml_quant =
         model && model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm && input_cols > 1 &&
-        !is_qwen36_hybrid_ssm_q8_prefill &&
+        !is_qwen_hybrid_ssm_q8_prefill &&
         (!qwen36_q4k_probe_admitted || qwen36_q4k_mode_off || qwen36_q4k_probe_rejected);
     const bool lfm2_prefill_prefers_ggml_quant =
         model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv && input_cols > 1 &&
@@ -6591,28 +6795,28 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         ud->gemma4_dense_prefill_native = gemma4_dense_prefill_native_allowed;
         ud->lfm2_q8_repacked_batched =
             model && model->arch_flags.is_lfm2_shortconv && weight->type == GGML_TYPE_Q8_0 && input_cols > 1;
-        // Qwen3.6 SSM Q8_0 prefill owns a narrow direct path instead of
-        // delegating to GGML vec_dot from the generic batched callback. That
-        // keeps the graph fallback-free and makes the projection easy to
-        // isolate when C4A prefill regresses.
+        // Qwen36 hybrid-SSM Q8_0 prefill owns a direct DenseCore path for
+        // qkv/gate/out. Qwen35 requires qkv+gate direct as the minimum stable
+        // set: qkv through the generic ARM quant path can corrupt delta source
+        // metadata, and gate can silently zero most rows.
         ud->qwen36_ssm_q8_repacked_batched = false;
-        ud->qwen36_ssm_q8_direct_batched = is_qwen36_hybrid_ssm_q8_prefill;
+        ud->qwen36_ssm_q8_direct_batched = is_qwen_hybrid_ssm_q8_prefill;
         if (gemma4_dense_prefill_native_allowed) {
             RecordGemma4DensePrefillNativeDecision(
                 dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext(), /*candidate=*/false,
                 /*used=*/true, nullptr, weight->type, /*replaced_mul_mat_ops=*/1,
                 /*duplicate_work_detected=*/false);
         }
-        LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
-                                is_small_batch_quant_candidate
-                                    ? (quant_true_batched_kernel_ready && weight->type == GGML_TYPE_Q4_K
-                                           ? "GGML_QUANT_Q4K_TRUE_BATCHED"
-                                           : "GGML_QUANT_NRC_M")
-                                    : "BATCHED_F32",
-                                is_small_batch_quant_candidate, false, false);
-        record_graph_matmul("custom_batched_gemv");
-        return ggml_mul_mat_gemv_batched(ctx, weight, input, ud);
-    }
+	        LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim,
+	                                is_small_batch_quant_candidate
+	                                    ? (quant_true_batched_kernel_ready && weight->type == GGML_TYPE_Q4_K
+	                                           ? "GGML_QUANT_Q4K_TRUE_BATCHED"
+	                                           : "GGML_QUANT_NRC_M")
+	                                    : "BATCHED_F32",
+	                                is_small_batch_quant_candidate, false, false);
+	        record_graph_matmul("custom_batched_gemv");
+		        return ggml_mul_mat_gemv_batched(ctx, weight, input, ud);
+	    }
 
     // Log fallback reasons for quant weights that didn't take the batched path
     if (IsDebugMatmulDispatchEnabled() && input_cols > 1 && ggml_is_quantized(weight->type) && is_compatible &&
