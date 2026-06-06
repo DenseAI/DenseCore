@@ -43,6 +43,12 @@
 #include <arm_neon.h>
 #endif
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+extern "C" {
+void ggml_gemv_q4_K_8x4_q8_K(int n, float* s, size_t bs, const void* vx, const void* vy, int nr, int nc);
+}
+#endif
+
 #include "densecore/backend/cpu_backend.h"
 #include "densecore/exceptions.h"
 #include "densecore/hal/backend_registry.h"

@@ -130,6 +130,20 @@ void AddRejection(ModelExecutionContract* contract, const char* reason) {
     contract->rejection_reasons.push_back(reason);
 }
 
+void AddForbiddenFastPath(ModelExecutionContract* contract, const char* reason) {
+    if (!contract || !reason) {
+        return;
+    }
+    contract->forbidden_fast_path_reasons.push_back(reason);
+}
+
+void AddRequiredFastPathCounter(ModelExecutionContract* contract, const char* counter) {
+    if (!contract || !counter) {
+        return;
+    }
+    contract->required_fast_path_counters.push_back(counter);
+}
+
 bool IsQwenHybridSSMContract(const ModelExecutionContract& contract) {
     return contract.has_hybrid_ssm_mixer &&
            (contract.variant == ModelVariant::QWEN35 || contract.variant == ModelVariant::QWEN36);
@@ -137,6 +151,10 @@ bool IsQwenHybridSSMContract(const ModelExecutionContract& contract) {
 
 bool IsLFM2ShortConvMoEContract(const ModelExecutionContract& contract) {
     return contract.variant == ModelVariant::LFM2MOE && contract.has_lfm2_shortconv_mixer && contract.has_moe;
+}
+
+bool IsGemma4MoEContract(const ModelExecutionContract& contract) {
+    return contract.variant == ModelVariant::GEMMA4 && contract.has_moe;
 }
 
 ExecutionFastPathClass ResolveFastPathClass(const TransformerModel* model, const ModelExecutionContract& contract) {
@@ -150,6 +168,9 @@ ExecutionFastPathClass ResolveFastPathClass(const TransformerModel* model, const
     if ((contract.variant == ModelVariant::QWEN35 || contract.variant == ModelVariant::QWEN36) &&
         !contract.has_moe && !contract.has_hybrid_ssm_mixer) {
         return ExecutionFastPathClass::QwenDense;
+    }
+    if (IsGemma4MoEContract(contract)) {
+        return ExecutionFastPathClass::Gemma4MoE;
     }
     if (IsLFM2ShortConvMoEContract(contract)) {
         return ExecutionFastPathClass::LFM2ShortConvMoE;
@@ -253,6 +274,25 @@ ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model
     contract.requires_native_moe_fast_path =
         contract.fast_path_class == ExecutionFastPathClass::QwenHybridSSMMoE ||
         contract.fast_path_class == ExecutionFastPathClass::LFM2ShortConvMoE;
+    if (contract.requires_fallback_free_fast_path) {
+        AddRequiredFastPathCounter(&contract, "target_no_ggml_path");
+    }
+    if (contract.requires_native_moe_fast_path) {
+        AddRequiredFastPathCounter(&contract, "native_moe_fast_w1w3_used_ops");
+        AddRequiredFastPathCounter(&contract, "native_moe_fast_w2_used_ops");
+    }
+    if (contract.has_hybrid_ssm_mixer) {
+        AddRequiredFastPathCounter(&contract, "ssm_conv1d_calls");
+        AddRequiredFastPathCounter(&contract, "ssm_delta_calls");
+    }
+    if (contract.fast_path_class == ExecutionFastPathClass::LFM2ShortConvMoE) {
+        AddRequiredFastPathCounter(&contract, "lfm2_shortconv_sequence_fast_used_ops");
+    }
+    if (contract.fast_path_class == ExecutionFastPathClass::Gemma4MoE) {
+        AddRequiredFastPathCounter(&contract, "gemma4_prefill_maintained_fast_ops");
+        AddRequiredFastPathCounter(&contract, "gemma4_decode_maintained_fast_ops");
+        AddForbiddenFastPath(&contract, "gemma4_arm_native_moe_prefill_quality_failed");
+    }
     if (contract.requires_native_moe_fast_path) {
         contract.native_moe_max_direct_tokens = kDefaultNativeMoEFastPathMaxDirectTokens;
     }
@@ -346,6 +386,7 @@ const char* ExecutionFastPathClassName(ExecutionFastPathClass kind) {
     case ExecutionFastPathClass::QwenDense: return "qwen_dense";
     case ExecutionFastPathClass::QwenHybridSSMDense: return "qwen_hybrid_ssm_dense";
     case ExecutionFastPathClass::QwenHybridSSMMoE: return "qwen_hybrid_ssm_moe";
+    case ExecutionFastPathClass::Gemma4MoE: return "gemma4_moe";
     case ExecutionFastPathClass::LFM2ShortConvMoE: return "lfm2_shortconv_moe";
     }
     return "unknown";
@@ -366,6 +407,22 @@ std::string FormatModelExecutionContract(const ModelExecutionContract& contract)
         << ",native_moe_max_direct_tokens=" << contract.native_moe_max_direct_tokens
         << ",decode_cache_static_safe=" << (contract.decode_graph_cache_static_safe ? "true" : "false")
         << ",requires_rebind=" << (contract.requires_decode_graph_runtime_rebind ? "true" : "false")
+        << ",required_fast_path_counters=[";
+    for (std::size_t i = 0; i < contract.required_fast_path_counters.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << contract.required_fast_path_counters[i];
+    }
+    oss << "]"
+        << ",forbidden_fast_paths=[";
+    for (std::size_t i = 0; i < contract.forbidden_fast_path_reasons.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << contract.forbidden_fast_path_reasons[i];
+    }
+    oss << "]"
         << ",layers=[";
     for (std::size_t i = 0; i < contract.layers.size(); ++i) {
         const auto& layer = contract.layers[i];

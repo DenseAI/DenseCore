@@ -760,7 +760,8 @@ DecodeGraphNodeTimingBreakdown SummarizeDecodeGraphNodeTimes(const ggml_cgraph* 
 }
 
 Gemma4PrefillAttentionTimingBreakdown SummarizeGemma4PrefillAttentionNodeTimes(const TransformerModel* model,
-                                                                               const ggml_cgraph* graph) {
+                                                                               const ggml_cgraph* graph,
+                                                                               bool collect_top_slow_ops) {
     Gemma4PrefillAttentionTimingBreakdown out;
     if (!model || !model->arch_flags.is_gemma4 || !graph) {
         return out;
@@ -791,8 +792,9 @@ Gemma4PrefillAttentionTimingBreakdown SummarizeGemma4PrefillAttentionNodeTimes(c
         if (std::strstr(node_name, "moe") || std::strstr(node_name, "ffn") || std::strstr(node_name, "shared_ffn")) {
             out.moe_or_mlp_ns += elapsed_ns;
         }
-        const bool include_node =
-            node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MUL_MAT || custom_class == "flash_attention_hal";
+        const bool include_node = collect_top_slow_ops &&
+            (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MUL_MAT ||
+             custom_class == "flash_attention_hal");
         if (include_node) {
             const ggml_tensor* weight = node->src[0];
             const ggml_tensor* input = node->src[1];
@@ -823,15 +825,17 @@ Gemma4PrefillAttentionTimingBreakdown SummarizeGemma4PrefillAttentionNodeTimes(c
             out.top_slow_ops.push_back(std::move(entry));
         }
     }
-    std::sort(out.top_slow_ops.begin(), out.top_slow_ops.end(), [](const auto& a, const auto& b) {
-        if (a.wall_ns != b.wall_ns) {
-            return a.wall_ns > b.wall_ns;
+    if (collect_top_slow_ops) {
+        std::sort(out.top_slow_ops.begin(), out.top_slow_ops.end(), [](const auto& a, const auto& b) {
+            if (a.wall_ns != b.wall_ns) {
+                return a.wall_ns > b.wall_ns;
+            }
+            return a.left_name < b.left_name;
+        });
+        constexpr std::size_t kGemma4PrefillTopSlowCount = 200;
+        if (out.top_slow_ops.size() > kGemma4PrefillTopSlowCount) {
+            out.top_slow_ops.resize(kGemma4PrefillTopSlowCount);
         }
-        return a.left_name < b.left_name;
-    });
-    constexpr std::size_t kGemma4PrefillTopSlowCount = 200;
-    if (out.top_slow_ops.size() > kGemma4PrefillTopSlowCount) {
-        out.top_slow_ops.resize(kGemma4PrefillTopSlowCount);
     }
     return out;
 }
@@ -946,7 +950,9 @@ Qwen36PrefillBreakdown SummarizeQwen36PrefillNodeTimes(const TransformerModel* m
 NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const TransformerModel* model,
                                                                    const ggml_cgraph* graph) {
     NativeMoEGraphTimingBreakdown out;
-    if (!model || (model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36) || !graph) {
+    const bool native_qwen_moe = model && (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36);
+    const bool native_lfm2_moe = model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv;
+    if ((!native_qwen_moe && !native_lfm2_moe) || !graph) {
         return out;
     }
     struct Bucket {
@@ -961,7 +967,8 @@ NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const Transfo
     bool has_native_qwen_moe = false;
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
-        if (node && node->name[0] && std::strstr(node->name, "qwen35_native_moe")) {
+        if (node && node->name[0] &&
+            (std::strstr(node->name, "qwen35_native_moe") || std::strstr(node->name, "lfm2_native_moe"))) {
             has_native_qwen_moe = true;
             break;
         }
@@ -975,7 +982,9 @@ NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const Transfo
             continue;
         }
         const char* name = node->name[0] ? node->name : "unnamed";
-        const bool native_moe_node = std::strstr(name, "qwen35_native_moe") || std::strstr(name, ".moe_gate_logits");
+        const bool native_moe_node = std::strstr(name, "qwen35_native_moe") ||
+                                     std::strstr(name, "lfm2_native_moe") ||
+                                     std::strstr(name, ".moe_gate_logits");
         if (!native_moe_node) {
             continue;
         }
@@ -1015,7 +1024,7 @@ NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const Transfo
         out.total_ns += elapsed_ns;
 
         MatmulShapeCensusEntry entry;
-        entry.phase = model->variant == ModelVariant::QWEN36 ? "qwen36" : "qwen35";
+        entry.phase = native_lfm2_moe ? "lfm2" : (model->variant == ModelVariant::QWEN36 ? "qwen36" : "qwen35");
         entry.op_type = ggml_op_name(node->op);
         entry.dispatch_path = buckets[static_cast<std::size_t>(bucket)].name;
         entry.weight_type = ggml_op_name(node->op);
@@ -1882,7 +1891,7 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
     const bool qwen_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
     const int hybrid_ssm_chunk_tokens =
 #if defined(__aarch64__) || defined(_M_ARM64)
-        192;
+        256;
 #else
         384;
 #endif
@@ -1991,7 +2000,12 @@ int ResolveModelPrefillChunkTokens(const TransformerModel* model, const Request*
 }
 
 size_t GraphContextSafetyMarginBytes() {
-    return ParseSizeEnvMb("DENSECORE_GRAPH_CTX_SAFETY_MARGIN_MB", /*default_mb=*/512, /*min_mb=*/0,
+    // The graph-size estimate already includes long-context/object safety pads.
+    // This margin is only admission headroom against live runtime pressure after
+    // weights, KV, and repacked caches are resident; a fixed 512 MiB guard was
+    // conservative enough to reject Qwen3.5 35B Q5 long QA even though the
+    // estimated graph pool itself fit in available memory.
+    return ParseSizeEnvMb("DENSECORE_GRAPH_CTX_SAFETY_MARGIN_MB", /*default_mb=*/256, /*min_mb=*/0,
                           /*max_mb=*/65536) *
            1024ULL * 1024ULL;
 }
@@ -5654,17 +5668,22 @@ void EngineLoop(EngineState* state) {
             const Qwen36PrefillBreakdown qwen36_prefill_breakdown =
                 is_prefill_batch ? SummarizeQwen36PrefillNodeTimes(current_model, gf) : Qwen36PrefillBreakdown{};
             const Gemma4PrefillAttentionTimingBreakdown gemma4_prefill_attention_breakdown =
-                is_prefill_batch ? SummarizeGemma4PrefillAttentionNodeTimes(current_model, gf)
+                is_prefill_batch ? SummarizeGemma4PrefillAttentionNodeTimes(current_model, gf,
+                                                                            IsLLMNodeTimingDumpEnabled())
                                  : Gemma4PrefillAttentionTimingBreakdown{};
+            const bool collect_decode_graph_diagnostics =
+                !is_decode_batch ||
+                (IsQwen36ProfilingEnabled() || IsDecodeProfileEnabled() || IsLLMNodeTimingDumpEnabled());
             const NativeMoEGraphTimingBreakdown native_moe_graph_timing =
-                SummarizeNativeQwenMoEGraphNodeTimes(current_model, gf);
+                collect_decode_graph_diagnostics ? SummarizeNativeQwenMoEGraphNodeTimes(current_model, gf)
+                                                 : NativeMoEGraphTimingBreakdown{};
             const HybridSSMGraphTimingBreakdown hybrid_ssm_graph_timing =
-                is_decode_batch ? SummarizeHybridSSMGraphNodeTimes(current_model, gf) : HybridSSMGraphTimingBreakdown{};
-            // Always collect the cheap op-bucket totals for decode so the
-            // graph-execute breakdown (custom/mul_mat/mul_mat_id/norm/attention/
-            // other) is visible in every profiling run; only the per-node census
-            // (top_slow_nodes) stays behind the debug-dump flag.
-            const bool collect_decode_graph_node_timing = is_decode_batch;
+                (is_decode_batch && collect_decode_graph_diagnostics) ? SummarizeHybridSSMGraphNodeTimes(current_model, gf)
+                                                                      : HybridSSMGraphTimingBreakdown{};
+            // Decode node buckets are diagnostic telemetry, not part of the
+            // maintained hot path. Keep them out of production timing unless a
+            // profile/debug mode explicitly asks for the per-node ggml census.
+            const bool collect_decode_graph_node_timing = is_decode_batch && collect_decode_graph_diagnostics;
             const bool collect_decode_graph_top_slow_nodes = is_decode_batch && IsLLMNodeTimingDumpEnabled();
             DecodeGraphNodeTimingBreakdown decode_graph_node_timing =
                 collect_decode_graph_node_timing
@@ -5805,12 +5824,14 @@ void EngineLoop(EngineState* state) {
                             const uint64_t fallback_w1w3_ns = native_moe_graph_timing.w1w3_ns - fast_w1w3_ns;
                             const uint64_t fallback_w2_count = native_moe_graph_timing.w2_count - fast_w2_count;
                             const uint64_t fallback_w2_ns = native_moe_graph_timing.w2_ns - fast_w2_ns;
+                            const bool graph_timing_counts_fast_decode_ops =
+                                !(current_model && current_model->variant == ModelVariant::LFM2MOE);
                             req->native_moe_fallback_w1w3_ns += fallback_w1w3_ns;
                             req->native_moe_fallback_w2_ns += fallback_w2_ns;
                             req->native_moe_fallback_w1w3_ops += fallback_w1w3_count;
                             req->native_moe_fallback_w2_ops += fallback_w2_count;
                             req->native_moe_fallback_ops += fallback_w1w3_count + fallback_w2_count;
-                            if (fast_w1w3_count > 0) {
+                            if (graph_timing_counts_fast_decode_ops && fast_w1w3_count > 0) {
                                 req->native_moe_fast_decode_candidate_ops += fast_w1w3_count;
                                 req->native_moe_fast_decode_used_ops += fast_w1w3_count;
                                 req->native_moe_fast_decode_w1w3_used_ops += fast_w1w3_count;
@@ -5820,7 +5841,7 @@ void EngineLoop(EngineState* state) {
                                 req->native_moe_fast_w1w3_used_ops += fast_w1w3_count;
                                 req->native_moe_fast_replaced_fallback_ops += fast_w1w3_count;
                             }
-                            if (fast_w2_count > 0) {
+                            if (graph_timing_counts_fast_decode_ops && fast_w2_count > 0) {
                                 req->native_moe_fast_decode_candidate_ops += fast_w2_count;
                                 req->native_moe_fast_decode_used_ops += fast_w2_count;
                                 req->native_moe_fast_decode_w2_used_ops += fast_w2_count;
@@ -6233,11 +6254,6 @@ void EngineLoop(EngineState* state) {
                         req->gemma4_dense_prefill_native_last_reject_reason =
                             qwen36_profile.gemma4_dense_prefill_native_last_reject_reason;
                     }
-                    req->gemma4_fast_gelu_enabled += qwen36_profile.gemma4_fast_gelu_enabled;
-                    req->gemma4_fast_gelu_used += qwen36_profile.gemma4_fast_gelu_used;
-                    req->gemma4_fast_gelu_ns += qwen36_profile.gemma4_fast_gelu_ns;
-                    req->gemma4_native_moe_prefill_gate_up_fast_gelu_ns +=
-                        qwen36_profile.gemma4_native_moe_prefill_gate_up_fast_gelu_ns;
                     req->gemma4_decode_native_candidate_ops += qwen36_profile.gemma4_decode_native_candidate_ops;
                     req->gemma4_decode_native_used_ops += qwen36_profile.gemma4_decode_native_used_ops;
                     req->gemma4_decode_native_rejected_ops += qwen36_profile.gemma4_decode_native_rejected_ops;

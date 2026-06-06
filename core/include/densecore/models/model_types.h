@@ -691,12 +691,20 @@ struct TransformerModel {
     // Optional ggml CPU_REPACK tensor aliases. These keep selected immutable
     // GGUF weights in backend-owned repacked buffers while preserving the raw
     // GGUF tensors for loader metadata, fallback paths, and parity probes.
+    enum class CpuRepackAliasLayout : uint8_t {
+        Unknown = 0,
+        Q4K8x4Q8K,
+        Q4K8x8Q8K,
+        Q5K8x4Q8K,
+        Q5K8x8Q8K,
+    };
     struct ggml_context* ctx_cpu_repack = nullptr;
     struct ggml_context* ctx_cpu_amx = nullptr;
     struct ggml_context* ctx_cpu_kleidiai = nullptr;
     std::vector<ggml_backend_buffer_t> cpu_repack_buffers;
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_repack_aliases;
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_repack_alias_sources;
+    std::unordered_map<const struct ggml_tensor*, CpuRepackAliasLayout> cpu_repack_alias_layouts;
     std::unordered_map<const struct ggml_tensor*, struct ggml_tensor*> cpu_decode_repack_aliases;
     // Qwen35/36 MoE gate/up tensors whose GGUF Q5_K bytes were replaced at load
     // with ggml's q5_K_8x8 layout. These tensors must only use repacked kernels.

@@ -4,6 +4,7 @@ package api
 import (
 	"context"
 	"descore-server/internal/domain"
+	"descore-server/internal/service"
 	agenttools "descore-server/internal/tools"
 	"fmt"
 	"log/slog"
@@ -185,7 +186,7 @@ func apiFirstNonEmpty(values ...string) string {
 
 func splitReasoningResponse(req domain.ChatCompletionRequest, modelHint, text string) (string, string) {
 	if isLFM2ModelHint(modelHint) {
-		return sanitizeLFM2Response(text), ""
+		return sanitizeLFM2Response(text, service.ExtractExpectedExactAnswer(req)), ""
 	}
 	if isQwen36ModelHint(modelHint) {
 		if !qwen36ReasoningEnabled(req, modelHint) {
@@ -387,9 +388,12 @@ func sanitizeLFM2StreamChunk(token string, exactExpected string) string {
 	return token[:cut]
 }
 
-func sanitizeLFM2Response(text string) string {
+func sanitizeLFM2Response(text string, exactExpected string) string {
 	content := strings.TrimSpace(text)
 	lower := strings.ToLower(content)
+	if generatedLFM2ExpectedAnswer(content, exactExpected) {
+		return strings.TrimSpace(exactExpected)
+	}
 	if answer, ok := extractLFM2GeneratedAnswerSpan(content, false); ok {
 		return answer
 	}

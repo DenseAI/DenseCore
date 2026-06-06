@@ -45,6 +45,7 @@ enum class ExecutionFastPathClass : uint8_t {
     QwenDense,
     QwenHybridSSMDense,
     QwenHybridSSMMoE,
+    Gemma4MoE,
     LFM2ShortConvMoE,
 };
 
@@ -102,6 +103,8 @@ struct ModelExecutionContract {
     std::vector<ModelExecutionLayerContract> layers;
     std::vector<ExecutionCustomOpRebindDescriptor> rebind_descriptors;
     std::vector<std::string> rejection_reasons;
+    std::vector<std::string> required_fast_path_counters;
+    std::vector<std::string> forbidden_fast_path_reasons;
 };
 
 ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model);

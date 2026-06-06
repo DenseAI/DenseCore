@@ -34,7 +34,8 @@ bool IsHybridSSMLayer(const TransformerModel* model, int layer_idx) {
 }
 
 DecoderMoERouter ResolveMoERouter(const TransformerModel* model, const TransformerLayer& layer, bool is_gemma4_moe) {
-    if (!layer.is_moe) {
+    const bool layer_uses_moe = layer.is_moe || is_gemma4_moe;
+    if (!layer_uses_moe) {
         return DecoderMoERouter::None;
     }
     if (is_gemma4_moe) {
@@ -249,7 +250,7 @@ DecoderModelSpec BuildDecoderModelSpec(const TransformerModel* model) {
                             : static_cast<int>(model->hparams.n_rot);
 
         auto& ffn = layer_spec.ffn;
-        ffn.is_moe = layer.is_moe;
+        ffn.is_moe = layer.is_moe || is_gemma4_moe;
         ffn.num_experts = static_cast<int>(layer.NumExperts());
         ffn.top_k = static_cast<int>(model->hparams.n_experts_used);
         ffn.activation = model->arch_flags.is_gemma4 ? DecoderActivation::GeluPytorchTanh : DecoderActivation::Silu;

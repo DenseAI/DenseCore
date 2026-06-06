@@ -180,15 +180,12 @@ struct ggml_tensor* ExecutePagedDecodeAttentionPath(struct ggml_context* ctx_c, 
                                                     int kv_cache_layer, bool gemma4_shared_kv_layer,
                                                     bool gemma4_shared_kv_source_layer, int head_dim_q, int head_dim_v,
                                                     int n_head, int n_head_kv, int n_total_tokens,
-                                                    float fast_attn_logit_softcap, bool use_explicit_attention_scale) {
+                                                    int fast_attn_sliding_window, float fast_attn_logit_softcap,
+                                                    bool use_explicit_attention_scale) {
+    (void)n_total_tokens;
     struct ggml_tensor* Q_decode = ggml_is_contiguous(Qcur) ? Qcur : ggml_cont(ctx_c, Qcur);
     struct ggml_tensor* K_decode = ggml_is_contiguous(Kcur) ? Kcur : ggml_cont(ctx_c, Kcur);
     struct ggml_tensor* V_decode = ggml_is_contiguous(Vcur) ? Vcur : ggml_cont(ctx_c, Vcur);
-    const int paged_attn_sliding_window =
-        (model->arch_flags.is_gemma4 && densecore::models::IsGemma4SlidingLayer(model, il) &&
-         model->gemma4_sliding_window > 0)
-            ? model->gemma4_sliding_window
-            : -1;
     const float paged_attn_scale = ResolveAttentionScaleForRuntime(head_dim_q, use_explicit_attention_scale);
 
     PagedAttentionUserData* ud = GetPagedAttentionUserData();
@@ -203,7 +200,7 @@ struct ggml_tensor* ExecutePagedDecodeAttentionPath(struct ggml_context* ctx_c, 
     ud->write_current_kv = !gemma4_shared_kv_layer;
     ud->force_full_history = gemma4_shared_kv_layer || gemma4_shared_kv_source_layer;
     ud->is_gemma4 = model && model->arch_flags.is_gemma4;
-    ud->sliding_window = paged_attn_sliding_window;
+    ud->sliding_window = fast_attn_sliding_window;
     ud->attention_scale = paged_attn_scale;
     ud->logit_softcap = fast_attn_logit_softcap;
     ud->epoch_started.store(0, std::memory_order_relaxed);

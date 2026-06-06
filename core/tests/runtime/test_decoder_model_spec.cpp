@@ -50,7 +50,7 @@ TEST(DecoderModelSpec, Gemma4MoEResolvesSemanticLayerContract) {
     model.layers.resize(2);
 
     auto& layer0 = model.layers[0];
-    layer0.is_moe = true;
+    layer0.is_moe = false;
     layer0.Set(model_keys::kMoeGate, NewTensor2D(ctx, 8, 4));
     layer0.Set(model_keys::kFfnGate, NewTensor2D(ctx, 8, 16));
     layer0.Set(model_keys::kFfnUp, NewTensor2D(ctx, 8, 16));
@@ -128,6 +128,32 @@ TEST(DecoderModelSpec, Gemma4MoEResolvesSemanticLayerContract) {
     EXPECT_NE(formatted.find("shared_kv_read=true"), std::string::npos);
     EXPECT_NE(formatted.find("ops=[attention_norm,attention_projection"), std::string::npos);
 
+    const auto contract = densecore::models::BuildModelExecutionContract(&model);
+    ASSERT_TRUE(contract.valid) << densecore::models::FormatModelExecutionContract(contract);
+    EXPECT_TRUE(contract.has_moe);
+    EXPECT_FALSE(contract.has_stateful_custom_ops);
+    EXPECT_EQ(contract.fast_path_class, densecore::models::ExecutionFastPathClass::Gemma4MoE);
+    EXPECT_TRUE(contract.requires_fallback_free_fast_path);
+    EXPECT_FALSE(contract.requires_native_moe_fast_path);
+    EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresFallbackFreeFastPath(contract));
+    EXPECT_FALSE(densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(contract));
+    ASSERT_EQ(contract.required_fast_path_counters.size(), 3u);
+    EXPECT_EQ(contract.required_fast_path_counters[0], "target_no_ggml_path");
+    EXPECT_EQ(contract.required_fast_path_counters[1], "gemma4_prefill_maintained_fast_ops");
+    EXPECT_EQ(contract.required_fast_path_counters[2], "gemma4_decode_maintained_fast_ops");
+    ASSERT_EQ(contract.forbidden_fast_path_reasons.size(), 1u);
+    EXPECT_EQ(contract.forbidden_fast_path_reasons[0], "gemma4_arm_native_moe_prefill_quality_failed");
+
+    const std::string contract_formatted = densecore::models::FormatModelExecutionContract(contract);
+    EXPECT_NE(contract_formatted.find("fast_path_class=gemma4_moe"), std::string::npos);
+    EXPECT_NE(contract_formatted.find("requires_fallback_free_fast_path=true"), std::string::npos);
+    EXPECT_NE(contract_formatted.find("requires_native_moe_fast_path=false"), std::string::npos);
+    EXPECT_NE(contract_formatted.find("required_fast_path_counters=[target_no_ggml_path,"
+                                      "gemma4_prefill_maintained_fast_ops,gemma4_decode_maintained_fast_ops]"),
+              std::string::npos);
+    EXPECT_NE(contract_formatted.find("forbidden_fast_paths=[gemma4_arm_native_moe_prefill_quality_failed]"),
+              std::string::npos);
+
     ggml_free(ctx);
 }
 
@@ -194,6 +220,12 @@ TEST(ModelExecutionContract, Qwen36HybridSSMMoEDeclaresLayerStateAndRebindContra
     EXPECT_TRUE(contract.requires_fallback_free_fast_path);
     EXPECT_EQ(contract.fast_path_class, densecore::models::ExecutionFastPathClass::QwenHybridSSMMoE);
     EXPECT_TRUE(contract.requires_native_moe_fast_path);
+    EXPECT_NE(std::find(contract.required_fast_path_counters.begin(), contract.required_fast_path_counters.end(),
+                        "native_moe_fast_w1w3_used_ops"),
+              contract.required_fast_path_counters.end());
+    EXPECT_NE(std::find(contract.required_fast_path_counters.begin(), contract.required_fast_path_counters.end(),
+                        "ssm_delta_calls"),
+              contract.required_fast_path_counters.end());
     EXPECT_GE(contract.native_moe_max_direct_tokens, 4096);
     EXPECT_TRUE(densecore::models::ModelExecutionContractAllowsDecodeGraphCache(contract));
     EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresDecodeGraphRuntimeRebind(contract));
@@ -248,6 +280,8 @@ TEST(ModelExecutionContract, QwenDenseDeclaresFallbackFreeFastPathWithoutNativeM
     EXPECT_EQ(contract.fast_path_class, densecore::models::ExecutionFastPathClass::QwenDense);
     EXPECT_TRUE(contract.requires_fallback_free_fast_path);
     EXPECT_FALSE(contract.requires_native_moe_fast_path);
+    ASSERT_EQ(contract.required_fast_path_counters.size(), 1u);
+    EXPECT_EQ(contract.required_fast_path_counters[0], "target_no_ggml_path");
     EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresFallbackFreeFastPath(contract));
     EXPECT_FALSE(densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(contract));
 
@@ -282,6 +316,12 @@ TEST(ModelExecutionContract, QwenHybridSSMDenseDeclaresFallbackFreeRebindWithout
     EXPECT_EQ(contract.fast_path_class, densecore::models::ExecutionFastPathClass::QwenHybridSSMDense);
     EXPECT_TRUE(contract.requires_fallback_free_fast_path);
     EXPECT_FALSE(contract.requires_native_moe_fast_path);
+    EXPECT_NE(std::find(contract.required_fast_path_counters.begin(), contract.required_fast_path_counters.end(),
+                        "target_no_ggml_path"),
+              contract.required_fast_path_counters.end());
+    EXPECT_NE(std::find(contract.required_fast_path_counters.begin(), contract.required_fast_path_counters.end(),
+                        "ssm_conv1d_calls"),
+              contract.required_fast_path_counters.end());
     EXPECT_EQ(contract.native_moe_max_direct_tokens, 0);
     EXPECT_TRUE(densecore::models::ModelExecutionContractAllowsDecodeGraphCache(contract));
     EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresDecodeGraphRuntimeRebind(contract));
@@ -436,6 +476,9 @@ TEST(ModelExecutionContract, LFM2ShortConvDeclaresConvOrdinalsAndRebindContract)
     EXPECT_TRUE(contract.requires_fallback_free_fast_path);
     EXPECT_EQ(contract.fast_path_class, densecore::models::ExecutionFastPathClass::LFM2ShortConvMoE);
     EXPECT_TRUE(contract.requires_native_moe_fast_path);
+    EXPECT_NE(std::find(contract.required_fast_path_counters.begin(), contract.required_fast_path_counters.end(),
+                        "lfm2_shortconv_sequence_fast_used_ops"),
+              contract.required_fast_path_counters.end());
     EXPECT_GE(contract.native_moe_max_direct_tokens, 4096);
     EXPECT_TRUE(densecore::models::ModelExecutionContractAllowsDecodeGraphCache(contract));
     EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresDecodeGraphRuntimeRebind(contract));

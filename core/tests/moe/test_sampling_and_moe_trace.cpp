@@ -15,7 +15,10 @@
 namespace densecore::testing {
 std::vector<CpuBackend::ExpertWeights> BuildExpertWeightsForTest(const TransformerLayer* layer,
                                                                  const TransformerModel* model);
-int ResolveQwen36MoECallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int top_k);
+int ResolveNativeMoEGraphCallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int phase,
+                                                  int64_t n_tokens, int top_k);
+bool RemapNativeMoECallbackTaskForTest(int requested_task_count, int ith, int nth, int* effective_ith,
+                                       int* effective_nth);
 bool ShouldEnableNativeMoEFastPathByDefaultForTest(const TransformerModel* model, int phase, int mode);
 int64_t Qwen35NativeMoEMaxDirectTokensForTest();
 bool CanUseQwenNativeMoEGateUpForTest(const TransformerModel* model, const ggml_tensor* gate_exps,
@@ -27,7 +30,7 @@ bool ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(bool is_qwen36_hy
                                                                int simd_level);
 bool ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(int physical_cores, int simd_level);
 bool ResolveLFM2SmallDecodeExpertParallelAutoEligibleForTest(int physical_cores, int simd_level);
-int ResolveQwen36SmallDecodeExpertWorkersForTest(int top_k, int worker_cap, int requested_override);
+int ResolveQwen36SmallDecodeExpertWorkersForTest(int top_k, int worker_cap);
 bool RouteMoEGemma4TopKForTest(const struct ggml_tensor* gate_logits, const TransformerModel* model,
                                const TransformerLayer* layer, int top_k, densecore::moe::MoERouteResult* routing);
 }  // namespace densecore::testing
@@ -212,13 +215,12 @@ TEST(MoETrace, CallbackFallsBackToTelemetryBackendWhenBackendUnset) {
     ggml_free(ctx);
 }
 
-TEST(MoETrace, Qwen36MoECallbackTaskCountStaysSingleThreaded) {
-    TransformerModel model{};
-    model.arch = ModelArch::QWEN35;
-    model.variant = ModelVariant::QWEN36;
-    model.arch_flags.is_hybrid_ssm = true;
-    model.hparams.n_experts = 128;
-    model.hparams.n_experts_used = 8;
+TEST(MoETrace, LFM2DecodeNativeMoEGraphCallbackTaskCountTracksTopK) {
+    TransformerModel lfm2{};
+    lfm2.variant = ModelVariant::LFM2MOE;
+    lfm2.arch_flags.is_lfm2_shortconv = true;
+    lfm2.hparams.n_experts = 32;
+    lfm2.hparams.n_experts_used = 4;
 
     BatchSpec batch{};
     batch.num_seqs = 1;
@@ -228,11 +230,34 @@ TEST(MoETrace, Qwen36MoECallbackTaskCountStaysSingleThreaded) {
     batch.block_tables = {{0, 1}};
     batch.n_past = {32};
 
-    setenv("DENSECORE_QWEN36_MOE_PARALLEL", "on", 1);
-    EXPECT_EQ(densecore::testing::ResolveQwen36MoECallbackTaskCountForTest(&model, &batch, 8), 1);
-    setenv("DENSECORE_QWEN36_MOE_PARALLEL", "off", 1);
-    EXPECT_EQ(densecore::testing::ResolveQwen36MoECallbackTaskCountForTest(&model, &batch, 8), 1);
-    unsetenv("DENSECORE_QWEN36_MOE_PARALLEL");
+    EXPECT_EQ(densecore::testing::ResolveNativeMoEGraphCallbackTaskCountForTest(
+                  &lfm2, &batch, static_cast<int>(InferenceExecutionPhase::Decode), 1, 4),
+              4);
+    EXPECT_EQ(densecore::testing::ResolveNativeMoEGraphCallbackTaskCountForTest(
+                  &lfm2, &batch, static_cast<int>(InferenceExecutionPhase::Decode), 1, 8),
+              4);
+    EXPECT_EQ(densecore::testing::ResolveNativeMoEGraphCallbackTaskCountForTest(
+                  &lfm2, &batch, static_cast<int>(InferenceExecutionPhase::Prefill), 16, 4),
+              GGML_N_TASKS_MAX);
+}
+
+TEST(MoETrace, NativeMoECallbackTaskRemapHonorsPerOpTaskCount) {
+    int effective_ith = -1;
+    int effective_nth = -1;
+
+    EXPECT_TRUE(densecore::testing::RemapNativeMoECallbackTaskForTest(4, 0, 16, &effective_ith, &effective_nth));
+    EXPECT_EQ(effective_ith, 0);
+    EXPECT_EQ(effective_nth, 4);
+
+    EXPECT_TRUE(densecore::testing::RemapNativeMoECallbackTaskForTest(4, 3, 16, &effective_ith, &effective_nth));
+    EXPECT_EQ(effective_ith, 3);
+    EXPECT_EQ(effective_nth, 4);
+
+    EXPECT_FALSE(densecore::testing::RemapNativeMoECallbackTaskForTest(4, 4, 16, &effective_ith, &effective_nth));
+
+    EXPECT_TRUE(densecore::testing::RemapNativeMoECallbackTaskForTest(0, 7, 16, &effective_ith, &effective_nth));
+    EXPECT_EQ(effective_ith, 7);
+    EXPECT_EQ(effective_nth, 16);
 }
 
 TEST(MoETrace, NativeMoEFastPathAutoIsDefaultForSupportedHybridMoEModels) {
@@ -447,10 +472,10 @@ TEST(MoETrace, LFM2SmallDecodeExpertParallelAutoPolicyTargetsHighTopKMoE) {
 }
 
 TEST(MoETrace, Qwen36SmallDecodeExpertParallelWorkerDefaultCapsAtEight) {
-    EXPECT_EQ(densecore::testing::ResolveQwen36SmallDecodeExpertWorkersForTest(8, 16, 0), 8);
-    EXPECT_EQ(densecore::testing::ResolveQwen36SmallDecodeExpertWorkersForTest(12, 16, 0), 8);
-    EXPECT_EQ(densecore::testing::ResolveQwen36SmallDecodeExpertWorkersForTest(8, 6, 0), 6);
-    EXPECT_EQ(densecore::testing::ResolveQwen36SmallDecodeExpertWorkersForTest(8, 16, 12), 12);
+    EXPECT_EQ(densecore::testing::ResolveQwen36SmallDecodeExpertWorkersForTest(8, 16), 8);
+    EXPECT_EQ(densecore::testing::ResolveQwen36SmallDecodeExpertWorkersForTest(12, 16), 8);
+    EXPECT_EQ(densecore::testing::ResolveQwen36SmallDecodeExpertWorkersForTest(8, 6), 6);
+    EXPECT_EQ(densecore::testing::ResolveQwen36SmallDecodeExpertWorkersForTest(0, 16), 1);
 }
 
 TEST(MoETrace, CallbackMissingUserdataFailClosesAndZeroFillsDst) {

@@ -970,15 +970,6 @@ static bool IsQ8RepackedGemvEnabled() {
     return enabled;
 }
 
-static bool IsGemma4LmHeadQ8RepackedGemvEnabled() {
-    static const bool enabled = []() -> bool {
-        const char* disable = std::getenv("DENSECORE_GEMMA4_DISABLE_LM_HEAD_Q8_REPACKED_GEMV");
-        return !(disable && disable[0] != '\0' && std::strcmp(disable, "0") != 0 &&
-                 std::strcmp(disable, "false") != 0 && std::strcmp(disable, "off") != 0);
-    }();
-    return enabled;
-}
-
 static std::shared_ptr<Q8RepackedGemvWeight> GetOrCreateQ8RepackedGemvWeight(const void* weight_data, int64_t rows,
                                                                               int64_t cols,
                                                                               bool force_enable = false) {
@@ -1547,15 +1538,9 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                 return;
             }
         }
-        static const bool q8_rowpair_enabled = []() {
-            const char* env = std::getenv("DENSECORE_ENABLE_Q8_ROWPAIR_VEC_DOT");
-            return env && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
-                   std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
-        }();
         const bool can_use_rowpair =
 #if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_MATMUL_INT8)
-            ((weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K) ||
-             (q8_rowpair_enabled && weight_type == GGML_TYPE_Q8_0 && ud->input_quant_type == GGML_TYPE_Q8_0)) &&
+            weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K &&
             (N % ggml_blck_size(weight_type)) == 0;
 #else
             false;
@@ -2266,9 +2251,14 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
     char* output_base = reinterpret_cast<char*>(dst->data);
     const size_t input_col_stride = static_cast<size_t>(src->nb[1]);
     const size_t output_col_stride = static_cast<size_t>(dst->nb[1]);
+    const int64_t output_col_stride_floats = dst->nb[1] / static_cast<int64_t>(sizeof(float));
     const size_t weight_row_stride = static_cast<size_t>(weight_tensor->nb[1]);
     const ggml_type weight_type = weight_tensor->type;
     const char* weight_name = weight_tensor->name[0] ? weight_tensor->name : "(unnamed)";
+    if ((dst->nb[1] % static_cast<int64_t>(sizeof(float))) != 0) {
+        throw densecore::InvalidArgumentException(
+            std::string("batched GEMV output column stride is not float-aligned for ") + weight_name);
+    }
     InferenceWorkContext* callback_work_ctx = ud->work_ctx ? ud->work_ctx : GetCurrentWorkContext();
     const BatchSpec* callback_batch =
         (callback_work_ctx && callback_work_ctx->batch) ? callback_work_ctx->batch : GetCurrentBatch();
@@ -2791,6 +2781,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
             throw densecore::InvalidArgumentException(
                 std::string("LFM2 prefill Q4_K true-batched callback rejected for ") + weight_name);
         }
+        static constexpr size_t kMaxFullBatchedQActCacheBytes = 32ull * 1024ull * 1024ull;
         const int quant_tile_cols = ResolveQuantBatchedTileCols(
             ParsePositiveEnvInt("DENSECORE_BATCHED_QUANT_TILE_COLS", kMaxSmallBatchColsHard), vec_dot_nrows,
             can_use_q4k_true_batched || can_use_q5k_true_batched);
@@ -2804,19 +2795,72 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         if (can_use_q8_0_repacked_batched) {
             auto packed = GetOrCreateQ8RepackedGemvWeight(weight_base, K, N, /*force_enable=*/true);
             if (packed && packed->blocks_per_row > 0) {
-                const size_t q8_row_size = ggml_row_size(GGML_TYPE_Q8_0, static_cast<int64_t>(N));
                 const size_t q8_4x8_block_bytes = 4 * sizeof(ggml_fp16_t) + QK8_0 * 4;
-                thread_local std::vector<uint8_t> q8_row;
-                q8_row.resize(q8_row_size);
+                const size_t q8_row_stride = quant_row_stride;
+                const size_t q8_total_size = q8_row_stride * static_cast<size_t>(M);
+                const int64_t token_pos =
+                    (callback_batch && callback_batch->num_seqs == 1 && !callback_batch->pos.empty())
+                        ? callback_batch->pos.front()
+                        : std::numeric_limits<int64_t>::min();
+                const bool can_share_q8_inputs =
+                    callback_work_ctx && ud->quantized_stamp && q8_total_size > 0 &&
+                    q8_total_size <= kMaxFullBatchedQActCacheBytes;
+                const uint64_t q8_inputs_stamp =
+                    can_share_q8_inputs
+                        ? ComputeGemvBatchedQuantStamp(callback_batch, M, ud->slot_id, src->data, weight_tensor->data)
+                        : 0;
+                const uint8_t* q8_input_base = nullptr;
+                bool used_shared_q8_inputs = false;
+                thread_local std::vector<uint8_t> q8_inputs;
+                if (can_share_q8_inputs) {
+                    if (ith == 0) {
+                        q8_input_base = GetOrFillBatchedQuantizedActivationCache(
+                            callback_work_ctx, src, src->data, x_rows, M, N, GGML_TYPE_Q8_0, q8_row_stride,
+                            q8_total_size, token_pos, input_type_traits);
+                        if (q8_input_base) {
+                            ud->quantized_stamp->store(q8_inputs_stamp, std::memory_order_release);
+                            used_shared_q8_inputs = true;
+                        }
+                    } else {
+                        int spin_count = 0;
+                        while (ud->quantized_stamp->load(std::memory_order_acquire) != q8_inputs_stamp) {
+                            if (spin_count >= 16384) {
+                                break;
+                            }
+                            SpinPause(spin_count++);
+                        }
+                        if (ud->quantized_stamp->load(std::memory_order_acquire) == q8_inputs_stamp &&
+                            callback_work_ctx->qact_generation == callback_work_ctx->execution_generation &&
+                            callback_work_ctx->qact_tensor == src && callback_work_ctx->qact_source == src->data &&
+                            callback_work_ctx->qact_len == static_cast<int64_t>(M) * static_cast<int64_t>(N) &&
+                            callback_work_ctx->qact_type == GGML_TYPE_Q8_0 &&
+                            callback_work_ctx->qact_bytes == q8_total_size &&
+                            callback_work_ctx->qact_slot_id == -1 && callback_work_ctx->qact_token_pos == token_pos &&
+                            callback_work_ctx->qact_buffer.size() == q8_total_size) {
+                            q8_input_base = callback_work_ctx->qact_buffer.data();
+                            used_shared_q8_inputs = true;
+                        }
+                    }
+                }
+                if (!q8_input_base) {
+                    q8_inputs.resize(q8_total_size);
+                    for (int m = 0; m < M; ++m) {
+                        input_type_traits->from_float(x_rows[static_cast<size_t>(m)],
+                                                      q8_inputs.data() + static_cast<size_t>(m) * q8_row_stride,
+                                                      static_cast<int64_t>(N));
+                    }
+                    q8_input_base = q8_inputs.data();
+                }
 
                 const auto run_scalar_cols = [&](int m, int col_begin, int col_end) {
                     if (col_begin >= col_end) {
                         return;
                     }
+                    const uint8_t* q8_row = q8_input_base + static_cast<size_t>(m) * q8_row_stride;
                     for (int k = col_begin; k < col_end; ++k) {
                         const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
                         float sum = 0.0f;
-                        type_traits_cpu->vec_dot(N, &sum, 0, row_ptr, 0, q8_row.data(), 0, 1);
+                        type_traits_cpu->vec_dot(N, &sum, 0, row_ptr, 0, q8_row, 0, 1);
                         store_out(m, k, sum);
                     }
                 };
@@ -2824,38 +2868,39 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 const int k_aligned_start = (k_start + 3) & ~3;
                 const int k_aligned_end = k_end & ~3;
                 for (int m = 0; m < M; ++m) {
-                    input_type_traits->from_float(x_rows[static_cast<size_t>(m)], q8_row.data(),
-                                                  static_cast<int64_t>(N));
-                    run_scalar_cols(m, k_start, std::min(k_aligned_start, k_end));
-                    if (k_aligned_start < k_aligned_end) {
-                        const size_t packed_offset =
-                            static_cast<size_t>(k_aligned_start / 4) *
-                            static_cast<size_t>(packed->blocks_per_row) * q8_4x8_block_bytes;
-                        float* out_group =
-                            reinterpret_cast<float*>(output_base + static_cast<size_t>(m) * output_col_stride) +
-                            k_aligned_start;
-                        if (ud->qwen36_ssm_q8_repacked_batched || ud->lfm2_q8_repacked_batched) {
-                            DenseCoreGemvQ8_0_4x8Q8_0Generic(N, out_group, packed->data.data() + packed_offset,
-                                                             q8_row.data(), k_aligned_end - k_aligned_start);
-                        } else {
-                            ggml_gemv_q8_0_4x8_q8_0(N, out_group, 0, packed->data.data() + packed_offset,
-                                                    q8_row.data(), 1, k_aligned_end - k_aligned_start);
+                        run_scalar_cols(m, k_start, std::min(k_aligned_start, k_end));
+                        if (k_aligned_start < k_aligned_end) {
+                            const size_t packed_offset =
+                                static_cast<size_t>(k_aligned_start / 4) *
+                                static_cast<size_t>(packed->blocks_per_row) * q8_4x8_block_bytes;
+                            float* out_group =
+                                reinterpret_cast<float*>(output_base + static_cast<size_t>(m) * output_col_stride) +
+                                k_aligned_start;
+                            const uint8_t* q8_row = q8_input_base + static_cast<size_t>(m) * q8_row_stride;
+                            if (ud->qwen36_ssm_q8_repacked_batched || ud->lfm2_q8_repacked_batched) {
+                                DenseCoreGemvQ8_0_4x8Q8_0Generic(N, out_group, packed->data.data() + packed_offset,
+                                                                 q8_row, k_aligned_end - k_aligned_start);
+                            } else {
+                                ggml_gemv_q8_0_4x8_q8_0(N, out_group, 0, packed->data.data() + packed_offset,
+                                                        q8_row, 1, k_aligned_end - k_aligned_start);
+                            }
                         }
+                        run_scalar_cols(m, std::max(k_aligned_end, k_start), k_end);
                     }
-                    run_scalar_cols(m, std::max(k_aligned_end, k_start), k_end);
-                }
                 LogMatmulPathOnce(ud->qwen36_ssm_q8_repacked_batched
                                       ? "qwen36_ssm_q8_0_repacked_batched"
                                       : (ud->lfm2_q8_repacked_batched ? "lfm2_q8_0_repacked_batched"
                                                                       : "gemma4_q8_0_repacked_batched"));
                 record_quant_profile(true, false);
+                if (ith == 0) {
+                    RecordSharedQuantReuse(used_shared_q8_inputs);
+                }
                 return;
             }
         }
 
         if (can_quantize_inputs) {
             thread_local std::vector<uint8_t> quant_inputs_tls;
-            static constexpr size_t kMaxFullBatchedQActCacheBytes = 32ull * 1024ull * 1024ull;
             const auto& qact_config = ResolveFastPathRuntimeConfig(callback_batch);
             const bool qact_cache_enabled_for_batched =
                 ud->require_q4k_true_batched || QuantizedActivationCacheEnabled(qact_config);
@@ -2991,8 +3036,8 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         char* out_col = output_base + static_cast<size_t>(tile_start) * output_col_stride;
                         float* out_ptr = reinterpret_cast<float*>(out_col + static_cast<size_t>(k) * sizeof(float));
                         const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
-                        type_traits_cpu->vec_dot(N, out_ptr, dst->nb[1], row_ptr, 0, quant_input_base, quant_row_stride,
-                                                 tile_m);
+                        type_traits_cpu->vec_dot(N, out_ptr, output_col_stride_floats, row_ptr, 0, quant_input_base,
+                                                 quant_row_stride, tile_m);
 	                    }
 	                    LogMatmulPathOnce("gemv_batched_quant_nrc");
 	                    continue;
@@ -3137,9 +3182,9 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         }
 	                    }
 	                    if (all_rows_ok) {
-	                        record_quant_profile(true, true);
-	                        continue;
-	                    }
+                        record_quant_profile(true, true);
+                        continue;
+                    }
                 }
                 if (ud->require_q4k_true_batched) {
                     throw densecore::InvalidArgumentException(
@@ -5727,7 +5772,6 @@ inline struct ggml_tensor* ggml_mul_mat_fp8(struct ggml_context* ctx, struct ggm
 
 enum class Gemma4NativeMatmulReject {
     None,
-    EnvOff,
     NotGemma4,
     WrongPhase,
     NotDenseCandidate,
@@ -5740,7 +5784,6 @@ enum class Gemma4NativeMatmulReject {
 static const char* Gemma4NativeMatmulRejectName(Gemma4NativeMatmulReject reason) {
     switch (reason) {
         case Gemma4NativeMatmulReject::None: return "none";
-        case Gemma4NativeMatmulReject::EnvOff: return "env_off";
         case Gemma4NativeMatmulReject::NotGemma4: return "not_gemma4";
         case Gemma4NativeMatmulReject::WrongPhase: return "wrong_phase";
         case Gemma4NativeMatmulReject::NotDenseCandidate: return "not_dense_candidate";
@@ -5752,19 +5795,9 @@ static const char* Gemma4NativeMatmulRejectName(Gemma4NativeMatmulReject reason)
     return "unknown";
 }
 
-static densecore::env::RuntimeToggleMode Gemma4DensePrefillNativeMode() {
-    return densecore::env::ParseRuntimeToggleMode("DENSECORE_GEMMA4_DENSE_PREFILL_NATIVE",
-                                                  densecore::env::RuntimeToggleMode::Auto);
-}
-
-static densecore::env::RuntimeToggleMode Gemma4DecodeNativeMode() {
-    return densecore::env::ParseRuntimeToggleMode("DENSECORE_GEMMA4_DECODE_NATIVE",
-                                                  densecore::env::RuntimeToggleMode::Auto);
-}
-
-static bool IsGemma4NativeMatmulX86Supported() {
+static bool IsGemma4NativeMatmulSupported() {
 #if defined(__aarch64__) || defined(_M_ARM64)
-    return false;
+    return true;
 #else
     return ggml_cpu_has_avx2();
 #endif
@@ -5792,8 +5825,6 @@ static bool CanUseGemma4DensePrefillNative(const TransformerModel* model, const 
         }
         return false;
     };
-    const auto mode = Gemma4DensePrefillNativeMode();
-    if (mode == densecore::env::RuntimeToggleMode::Off) return reject(Gemma4NativeMatmulReject::EnvOff);
     if (!model || !model->arch_flags.is_gemma4) return reject(Gemma4NativeMatmulReject::NotGemma4);
     if (GetCurrentExecutionPhase() != InferenceExecutionPhase::Prefill) {
         return reject(Gemma4NativeMatmulReject::WrongPhase);
@@ -5816,19 +5847,12 @@ static bool CanUseGemma4DensePrefillNative(const TransformerModel* model, const 
             return reject(Gemma4NativeMatmulReject::KernelUnavailable);
         }
     } else {
-        // The current Q8_0 dense prefill callback avoids duplicate ggml execution,
-        // but C4 validation shows it is not yet a faster supported auto path for
-        // long Gemma4 prompts. Keep it available only when explicitly forced so
-        // auto cannot trade real TTFT for cleaner counters.
-        if (mode == densecore::env::RuntimeToggleMode::Auto) {
-            return reject(Gemma4NativeMatmulReject::KernelUnavailable);
-        }
         const auto* traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
         if (!traits || !traits->vec_dot || !traits->from_float || (input->ne[0] % QK8_0) != 0) {
             return reject(Gemma4NativeMatmulReject::KernelUnavailable);
         }
     }
-    if (mode == densecore::env::RuntimeToggleMode::Auto && !IsGemma4NativeMatmulX86Supported()) {
+    if (!IsGemma4NativeMatmulSupported()) {
         return reject(Gemma4NativeMatmulReject::KernelUnavailable);
     }
     if (reject_reason) {
@@ -5847,8 +5871,6 @@ static bool CanUseGemma4DecodeNative(const TransformerModel* model, const ggml_t
         }
         return false;
     };
-    const auto mode = Gemma4DecodeNativeMode();
-    if (mode == densecore::env::RuntimeToggleMode::Off) return reject(Gemma4NativeMatmulReject::EnvOff);
     if (!model || !model->arch_flags.is_gemma4) return reject(Gemma4NativeMatmulReject::NotGemma4);
     const bool decode_shaped = input && input->ne[1] <= 1;
     if (dispatch_phase != InferenceExecutionPhase::Decode && !decode_shaped) {
@@ -5867,7 +5889,7 @@ static bool CanUseGemma4DecodeNative(const TransformerModel* model, const ggml_t
     if (weight->ne[0] != input->ne[0] || weight->ne[1] <= 0 || input->ne[0] <= 0) {
         return reject(Gemma4NativeMatmulReject::Shape);
     }
-    if (mode == densecore::env::RuntimeToggleMode::Auto && !IsGemma4NativeMatmulX86Supported()) {
+    if (!IsGemma4NativeMatmulSupported()) {
         return reject(Gemma4NativeMatmulReject::KernelUnavailable);
     }
     if (reject_reason) {
@@ -5926,17 +5948,22 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         original_qwen_hybrid_ssm_projection && qwen_hybrid_small_prefill_q4k && weight && input &&
         weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 && weight->ne[0] == input->ne[0] &&
         (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled();
-    const bool prefer_gemma4_q4k_prefill_densecore_path =
+    const bool prefer_gemma4_quant_prefill_densecore_path =
         dispatch_is_prefill_phase && model && model->arch_flags.is_gemma4 && input && input->type == GGML_TYPE_F32 &&
-        weight && weight->type == GGML_TYPE_Q4_K && input->ne[1] > 1 && input->ne[0] == weight->ne[0] &&
-        IsQ4KTrueBatchedKernelEnabled();
+        weight && (weight->type == GGML_TYPE_Q4_K || weight->type == GGML_TYPE_Q8_0) && input->ne[1] > 1 &&
+        input->ne[0] == weight->ne[0] &&
+        (weight->type != GGML_TYPE_Q4_K || IsQ4KTrueBatchedKernelEnabled());
+    const bool prefer_gemma4_quant_decode_densecore_path =
+        model && model->arch_flags.is_gemma4 && input && input->type == GGML_TYPE_F32 && weight &&
+        ggml_is_quantized(weight->type) && input->ne[1] <= 1 && input->ne[0] == weight->ne[0];
     const bool prefer_lfm2_quant_prefill_densecore_path =
         dispatch_is_prefill_phase && model && model->arch_flags.is_lfm2_shortconv && input && input->type == GGML_TYPE_F32 &&
         weight && ggml_is_quantized(weight->type) && input->ne[1] > 1 && input->ne[0] == weight->ne[0];
     if (model && input && input->type == GGML_TYPE_F32) {
         if (input->ne[1] <= 1) {
             auto it_decode_repack = model->cpu_decode_repack_aliases.find(weight);
-            if (it_decode_repack != model->cpu_decode_repack_aliases.end() && it_decode_repack->second) {
+            if (!prefer_gemma4_quant_decode_densecore_path &&
+                it_decode_repack != model->cpu_decode_repack_aliases.end() && it_decode_repack->second) {
                 weight = it_decode_repack->second;
                 using_cpu_repack_alias = true;
             }
@@ -5947,8 +5974,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             const bool amx_decode_regression_risk =
                 (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) && amx_alias &&
                 input->ne[1] == 1;
-            if (!prefer_gemma4_q4k_prefill_densecore_path && !prefer_lfm2_quant_prefill_densecore_path &&
-                !prefer_qwen_hybrid_ssm_quant_batched_over_repack &&
+            if (!prefer_gemma4_quant_prefill_densecore_path && !prefer_lfm2_quant_prefill_densecore_path &&
+                !prefer_gemma4_quant_decode_densecore_path && !prefer_qwen_hybrid_ssm_quant_batched_over_repack &&
                 !amx_decode_regression_risk) {
                 weight = it_repack->second;
                 using_cpu_repack_alias = true;
@@ -6039,18 +6066,11 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     Gemma4NativeMatmulReject gemma4_dense_prefill_reject = Gemma4NativeMatmulReject::None;
     const bool gemma4_dense_prefill_native_allowed =
         CanUseGemma4DensePrefillNative(model, weight, input, current_batch, &gemma4_dense_prefill_reject);
-    const auto gemma4_dense_prefill_mode = Gemma4DensePrefillNativeMode();
-    if (gemma4_dense_prefill_candidate && gemma4_dense_prefill_mode != densecore::env::RuntimeToggleMode::Off) {
+    if (gemma4_dense_prefill_candidate) {
         RecordGemma4DensePrefillNativeDecision(
             dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext(), /*candidate=*/true, /*used=*/false,
             gemma4_dense_prefill_native_allowed ? nullptr : Gemma4NativeMatmulRejectName(gemma4_dense_prefill_reject),
             weight->type, 0, false);
-        if (!gemma4_dense_prefill_native_allowed &&
-            gemma4_dense_prefill_mode == densecore::env::RuntimeToggleMode::On) {
-            throw densecore::InvalidArgumentException(
-                std::string("Gemma4 dense prefill native rejected: ") +
-                Gemma4NativeMatmulRejectName(gemma4_dense_prefill_reject));
-        }
     }
     Gemma4NativeMatmulReject gemma4_decode_native_reject = Gemma4NativeMatmulReject::None;
     const bool gemma4_decode_native_allowed =
@@ -6060,17 +6080,11 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         model && model->arch_flags.is_gemma4 && input && input->type == GGML_TYPE_F32 && M <= 1 &&
         (weight->type == GGML_TYPE_F32 || ggml_is_quantized(weight->type)) &&
         IsGemma4DenseWeightNameCandidate(w_name, gemma4_lm_head);
-    const auto gemma4_decode_mode = Gemma4DecodeNativeMode();
-    if (gemma4_decode_candidate && gemma4_decode_mode != densecore::env::RuntimeToggleMode::Off) {
+    if (gemma4_decode_candidate) {
         RecordGemma4DecodeNativeDecision(
             dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext(), /*candidate=*/true, /*used=*/false,
             gemma4_decode_native_allowed ? nullptr : Gemma4NativeMatmulRejectName(gemma4_decode_native_reject),
             /*moe_used=*/false, /*dense_used=*/false, /*lm_head_used=*/gemma4_lm_head, 0, 0, 0, false);
-        if (!gemma4_decode_native_allowed && gemma4_decode_mode == densecore::env::RuntimeToggleMode::On) {
-            throw densecore::InvalidArgumentException(
-                std::string("Gemma4 decode native rejected: ") +
-                Gemma4NativeMatmulRejectName(gemma4_decode_native_reject));
-        }
     }
     const bool matmul_expected_decode = M <= 1 || dispatch_phase == InferenceExecutionPhase::Decode;
     const auto record_graph_matmul = [&](const char* selected_path) {
@@ -6296,8 +6310,6 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                                   "temporary_reference_lfm2_arm_prefill_non_q4k");
     }
 
-    const bool gemma4_q4k_prefill_fast_path_eligible =
-        prefer_gemma4_q4k_prefill_densecore_path && gemma4_dense_prefill_native_allowed;
     if (model && model->arch_flags.is_gemma4 && ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 &&
         M > 1 && !gemma4_dense_prefill_native_allowed) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
@@ -6325,10 +6337,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     // ========================================================================
     if (model) {
         auto it_int4 = model->int4_weight_bindings.find(weight);
-        const bool gemma4_int4_decode_enabled =
-            !model->arch_flags.is_gemma4 ||
-            fast_path_config.gemma4_native_int4_decode != densecore::env::RuntimeToggleMode::Off;
-        if (it_int4 != model->int4_weight_bindings.end() && gemma4_int4_decode_enabled) {
+        if (it_int4 != model->int4_weight_bindings.end()) {
             const auto& binding = it_int4->second;
             if (binding.k > 0 && binding.n > 0 && binding.group_size > 0 && binding.packed && binding.scales &&
                 binding.zeros) {
@@ -6384,8 +6393,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         model && input_cols > 1 && input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 &&
         std::strstr(w_name, ".ffn_gate_inp.weight") != nullptr && weight->ne[0] == input->ne[0] &&
         weight->ne[1] <= 512 && weight->ne[0] >= 512 &&
-        (model->arch_flags.is_lfm2_shortconv || model->variant == ModelVariant::QWEN35 ||
-         model->variant == ModelVariant::QWEN36);
+        (model->arch_flags.is_lfm2_shortconv || model->arch_flags.is_gemma4 ||
+         model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36);
     bool has_quant_vec_dot = false;
     bool has_quant_from_float = false;
     bool quant_input_size_ok = false;
@@ -6500,16 +6509,11 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         ud->force_reference_scalar = false;
         ud->model_identity = reinterpret_cast<uintptr_t>(model);
         const bool is_gemma4_model = model && model->arch_flags.is_gemma4;
-        static const bool gemma4_q8_repacked_enabled = []() {
-            return densecore::env::ParseNonZeroEnv("DENSECORE_GEMMA4_ENABLE_Q8_REPACKED_GEMV", false);
-        }();
-        const bool gemma4_lm_head_q8_repacked =
-            is_gemma4_model && gemma4_lm_head && weight->type == GGML_TYPE_Q8_0 && input->type == GGML_TYPE_F32 &&
-            M == 1 && IsGemma4LmHeadQ8RepackedGemvEnabled();
-        ud->force_q8_repacked_gemv = gemma4_lm_head_q8_repacked;
-        ud->disable_q8_repacked_gemv =
-            is_gemma4_model && !gemma4_q8_repacked_enabled && !gemma4_lm_head_q8_repacked &&
-            !IsGemma4SharedDenseFfnWeightName(w_name);
+        const bool gemma4_maintained_q8_decode_repacked =
+            is_gemma4_model && weight->type == GGML_TYPE_Q8_0 && input->type == GGML_TYPE_F32 && M == 1 &&
+            (gemma4_lm_head || IsGemma4SharedDenseFfnWeightName(w_name));
+        ud->force_q8_repacked_gemv = gemma4_maintained_q8_decode_repacked;
+        ud->disable_q8_repacked_gemv = is_gemma4_model && !gemma4_maintained_q8_decode_repacked;
         ud->gemma4_decode_native = gemma4_decode_native_allowed;
         ud->gemma4_decode_lm_head = gemma4_lm_head;
         const bool lfm2_tied_lm_head =

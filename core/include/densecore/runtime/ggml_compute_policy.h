@@ -106,7 +106,7 @@ inline const char* QwenHotPathTargetLabel(const QwenHotPathPlan& plan) {
     if (plan.variant == ModelVariant::QWEN36) {
         return "qwen36_35b_a3b";
     }
-    if (plan.moe_lane || plan.hybrid_ssm_lane) {
+    if (plan.moe_lane) {
         return "qwen35_35b_a3b";
     }
     return "qwen35_9b_dense";

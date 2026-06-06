@@ -286,14 +286,6 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
     config.qwen36_expert_cpu_repack =
         ParseRuntimeToggleEnvFailClosed("DENSECORE_QWEN36_EXPERT_CPU_REPACK", env::RuntimeToggleMode::Auto);
     config.native_moe_fast_decode = env::RuntimeToggleMode::On;
-    config.gemma4_native_int4_decode =
-        ParseRuntimeToggleEnvFailClosed("DENSECORE_GEMMA4_NATIVE_INT4_DECODE", env::RuntimeToggleMode::Auto);
-    config.gemma4_int4_repack_on_load =
-        ParseRuntimeToggleEnvFailClosed("DENSECORE_GEMMA4_INT4_REPACK_ON_LOAD", env::RuntimeToggleMode::Auto);
-    config.gemma4_native_fused_gelu =
-        ParseRuntimeToggleEnvFailClosed("DENSECORE_GEMMA4_NATIVE_FUSED_GELU", env::RuntimeToggleMode::Auto);
-    config.gemma4_fast_softcap =
-        ParseRuntimeToggleEnvFailClosed("DENSECORE_GEMMA4_FAST_SOFTCAP", env::RuntimeToggleMode::Auto);
     config.q4k_repacked_gemv = env::RuntimeToggleMode::On;
     config.q6k_repacked_gemv =
         ParseRuntimeToggleEnvFailClosed("DENSECORE_Q6K_REPACKED_GEMV", env::RuntimeToggleMode::Auto);

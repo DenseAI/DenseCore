@@ -224,9 +224,9 @@ std::vector<int> TokenizeText(DenseCoreHandle handle, const std::string& text) {
     return std::vector<int>(snapshot.token_ids, snapshot.token_ids + snapshot.num_token_ids);
 }
 
-DenseCoreRequestSnapshot PreviewRuntimeRequest(DenseCoreHandle handle, const std::string& text) {
+DenseCoreRequestSnapshot PreviewRuntimeRequest(DenseCoreHandle handle, const std::string& text, int max_tokens) {
     DenseCoreRequestSnapshot snapshot{};
-    const int rc = DenseCorePreviewTextRequest(handle, text.c_str(), kMaxNewTokens,
+    const int rc = DenseCorePreviewTextRequest(handle, text.c_str(), max_tokens,
                                                /*temperature=*/0.0f, /*top_p=*/1.0f, /*top_k=*/1,
                                                /*repetition_penalty=*/kRepetitionPenalty, /*json_mode=*/0, &snapshot);
     if (rc != 0) {
@@ -249,9 +249,9 @@ std::string RenderChatPrompt(DenseCoreHandle handle, const std::string& prompt) 
     return rendered.rendered_prompt ? rendered.rendered_prompt : "";
 }
 
-std::vector<int> GenerateTokenIds(DenseCoreHandle handle, const std::string& prompt) {
+std::vector<int> GenerateTokenIds(DenseCoreHandle handle, const std::string& prompt, int max_tokens) {
     TokenResultCollector collector;
-    const int request_id = SubmitRequestWithTokenResults(handle, prompt.c_str(), kMaxNewTokens,
+    const int request_id = SubmitRequestWithTokenResults(handle, prompt.c_str(), max_tokens,
                                                          /*temperature=*/0.0f, /*top_p=*/1.0f, /*top_k=*/1,
                                                          /*repetition_penalty=*/kRepetitionPenalty, OnTokenResult,
                                                          &collector);
@@ -270,10 +270,11 @@ std::vector<int> GenerateTokenIds(DenseCoreHandle handle, const std::string& pro
     return collector.token_ids;
 }
 
-std::vector<int> GenerateTokenIdsWithSamplingConstraints(DenseCoreHandle handle, const std::string& prompt) {
+std::vector<int> GenerateTokenIdsWithSamplingConstraints(DenseCoreHandle handle, const std::string& prompt,
+                                                        int max_tokens) {
     StreamCollector collector;
     const int request_id = SubmitRequestWithSamplingConstraintsEx(
-        handle, prompt.c_str(), kMaxNewTokens, /*lora_name=*/nullptr, /*temperature=*/0.0f, /*top_p=*/1.0f, /*top_k=*/1,
+        handle, prompt.c_str(), max_tokens, /*lora_name=*/nullptr, /*temperature=*/0.0f, /*top_p=*/1.0f, /*top_k=*/1,
         /*repetition_penalty=*/kRepetitionPenalty, /*stop_sequences=*/nullptr, /*json_mode=*/0,
         /*allowed_token_ids=*/nullptr, /*num_allowed_token_ids=*/0, /*allowed_token_ids_strict=*/0,
         /*disallowed_token_ids=*/nullptr, /*num_disallowed_token_ids=*/0, OnStreamToken, &collector);
@@ -379,7 +380,8 @@ std::vector<std::string> ExtractDebugLines(const std::string& captured_stderr) {
     return lines;
 }
 
-PromptArtifacts BuildArtifacts(DenseCoreHandle handle, const std::string& user_prompt, const std::string& rendered_prompt) {
+PromptArtifacts BuildArtifacts(DenseCoreHandle handle, const std::string& user_prompt,
+                               const std::string& rendered_prompt, int max_tokens) {
     PromptArtifacts artifacts;
     artifacts.user_prompt = user_prompt;
     const bool parity_trace = []() {
@@ -402,7 +404,7 @@ PromptArtifacts BuildArtifacts(DenseCoreHandle handle, const std::string& user_p
     ScopedEnvOverride enable_attention_post("DENSECORE_DEBUG_ATTN_POST_REFERENCE", parity_trace ? "1" : nullptr);
     ScopedEnvOverride attention_post_max_calls("DENSECORE_DEBUG_ATTN_POST_REFERENCE_MAX_CALLS",
                                                parity_trace ? "8" : nullptr);
-    const DenseCoreRequestSnapshot snapshot = PreviewRuntimeRequest(handle, rendered_prompt);
+    const DenseCoreRequestSnapshot snapshot = PreviewRuntimeRequest(handle, rendered_prompt, max_tokens);
     artifacts.prompt = snapshot.rendered_prompt ? snapshot.rendered_prompt : rendered_prompt;
     artifacts.input_token_ids = TokenizeText(handle, rendered_prompt);
     artifacts.input_token_hash = HashTokenIds(artifacts.input_token_ids);
@@ -411,8 +413,8 @@ PromptArtifacts BuildArtifacts(DenseCoreHandle handle, const std::string& user_p
     ResetMoECallbackEntryCounter();
     ResetSamplingDebugTrace();
     const std::string captured = CaptureStderr([&]() {
-        artifacts.token_results_ids = GenerateTokenIds(handle, rendered_prompt);
-        artifacts.sampling_constraints_ids = GenerateTokenIdsWithSamplingConstraints(handle, rendered_prompt);
+        artifacts.token_results_ids = GenerateTokenIds(handle, rendered_prompt, max_tokens);
+        artifacts.sampling_constraints_ids = GenerateTokenIdsWithSamplingConstraints(handle, rendered_prompt, max_tokens);
     });
     artifacts.debug_lines = ExtractDebugLines(captured);
     artifacts.moe_path_trace = densecore::GetTelemetryCpuBackend().GetMoEPathTraceSnapshot();
@@ -520,21 +522,30 @@ void WriteArtifactsJson(const PromptArtifacts& artifacts, const std::string& out
 
 int main(int argc, char** argv) {
     try {
-        if (argc < 3 || argc > 4) {
-            std::cerr << "usage: gemma4_parity_probe <gguf_path> <output_json> [user_prompt]\n";
+        if (argc < 3 || argc > 5) {
+            std::cerr << "usage: gemma4_parity_probe <gguf_path> <output_json> [user_prompt] [max_tokens]\n";
             return 2;
         }
 
         const std::string gguf_path = argv[1];
         const std::string output_json = argv[2];
         const std::string user_prompt = argc == 4 ? argv[3] : std::string(kDefaultUserPrompt);
+        int max_tokens = kMaxNewTokens;
+        if (argc == 5) {
+            char* end = nullptr;
+            const long parsed = std::strtol(argv[4], &end, 10);
+            if (end == argv[4] || *end != '\0' || parsed <= 0 || parsed > 4096) {
+                throw std::runtime_error("max_tokens must be an integer in [1, 4096]");
+            }
+            max_tokens = static_cast<int>(parsed);
+        }
 
         DenseCoreHandle handle = InitEngine(gguf_path.c_str(), nullptr, ProbeThreadCount());
         if (!handle) {
             throw std::runtime_error(DenseCoreGetLastError());
         }
         const std::string chat_prompt = RenderChatPrompt(handle, user_prompt);
-        const PromptArtifacts artifacts = BuildArtifacts(handle, user_prompt, chat_prompt);
+        const PromptArtifacts artifacts = BuildArtifacts(handle, user_prompt, chat_prompt, max_tokens);
         WriteArtifactsJson(artifacts, output_json);
         FreeEngine(handle);
         return 0;

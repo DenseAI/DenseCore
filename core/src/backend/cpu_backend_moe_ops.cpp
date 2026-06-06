@@ -84,7 +84,6 @@ struct QuantizedProjectionInputCache {
 
 constexpr int64_t kMoEQuantizedProjectionMaxBatch = 256;
 constexpr int kMoEQ4KRawBatchedTileM = 8;
-constexpr const char* kGemma4MoEPrefillQuantBatchEnv = "DENSECORE_GEMMA4_MOE_PREFILL_QUANT_BATCH";
 
 inline float GeluTanhApprox(float x);
 const std::array<float, 1 << 16>& GetGeluF16LookupTable();
@@ -645,18 +644,8 @@ bool CanUseQ4KRepackedMoEGEGLUFastPath() {
     return densecore::kernels::Q4KRealPackedGemvKernelAvailable();
 }
 
-densecore::env::RuntimeToggleMode Gemma4NativeFusedGeluMode() {
-    return densecore::env::ParseRuntimeToggleMode("DENSECORE_GEMMA4_NATIVE_FUSED_GELU",
-                                                  densecore::env::RuntimeToggleMode::Auto);
-}
-
 bool CanUseQ4KRepackedMoEPrefillFastPath() {
     return densecore::kernels::Q4KRealPackedGemvKernelAvailable();
-}
-
-densecore::env::RuntimeToggleMode Gemma4MoEPrefillQuantBatchMode() {
-    return densecore::env::ParseRuntimeToggleMode(kGemma4MoEPrefillQuantBatchEnv,
-                                                  densecore::env::RuntimeToggleMode::Auto);
 }
 
 bool Gemma4MoEPrefillQuantBatchX86Supported() {
@@ -669,22 +658,15 @@ bool Gemma4MoEPrefillQuantBatchX86Supported() {
 }
 
 bool IsGemma4MoEPrefillQuantBatchEnabled(const TransformerModel* model) {
-    const auto mode = Gemma4MoEPrefillQuantBatchMode();
-    if (mode == densecore::env::RuntimeToggleMode::Off) {
-        return false;
-    }
     if (!model || !model->arch_flags.is_gemma4 || model->hparams.n_experts <= 0) {
         return false;
-    }
-    if (mode == densecore::env::RuntimeToggleMode::On) {
-        return true;
     }
     return Gemma4MoEPrefillQuantBatchX86Supported();
 }
 
 bool IsGemma4MoEPrefillQuantBatchForcedOn(const TransformerModel* model) {
-    return model && model->arch_flags.is_gemma4 && model->hparams.n_experts > 0 &&
-           Gemma4MoEPrefillQuantBatchMode() == densecore::env::RuntimeToggleMode::On;
+    (void)model;
+    return false;
 }
 
 bool CanUseGgmlQuantizedMoEPrefillBatch(const CpuBackend::ExpertWeights& exp, int64_t batch, int64_t hidden_dim,
@@ -1514,15 +1496,6 @@ bool IsMoECachePolicyDebugEnabled() {
     return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
-int GetSmallDecodeExpertWorkers() {
-    const char* env = std::getenv("DENSECORE_MOE_SMALL_DECODE_EXPERT_WORKERS");
-    if (!env || env[0] == '\0') {
-        return 0;
-    }
-    const int parsed = std::atoi(env);
-    return parsed > 0 ? parsed : 0;
-}
-
 bool IsGemma4PackedChecksumDebugEnabled() {
     const char* env = std::getenv("DENSECORE_DEBUG_GEMMA4_PACKED_CHECKSUM");
     return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
@@ -1705,8 +1678,8 @@ bool ResolveSmallDecodeExpertParallelAutoEligible(const TransformerModel* model,
     return ResolveSmallDecodeExpertParallelAutoEligible(model, physical_cores, physical_cores, level);
 }
 
-int ResolveSmallDecodeExpertWorkers(int top_k, int worker_cap, int requested_override) {
-    const int requested = requested_override > 0 ? requested_override : std::min(std::max(1, top_k), 8);
+int ResolveSmallDecodeExpertWorkers(int top_k, int worker_cap) {
+    const int requested = std::min(std::max(1, top_k), 8);
     return std::max(1, std::min(std::max(1, worker_cap), requested));
 }
 
@@ -1721,8 +1694,7 @@ SmallDecodeExpertParallelDecision ResolveSmallDecodeExpertParallelDecision(const
                                                                            int batch_size, int top_k,
                                                                            bool safe_reference_mode, int worker_cap) {
     SmallDecodeExpertParallelDecision decision;
-    const int requested_override = GetSmallDecodeExpertWorkers();
-    decision.workers = ResolveSmallDecodeExpertWorkers(top_k, worker_cap, requested_override);
+    decision.workers = ResolveSmallDecodeExpertWorkers(top_k, worker_cap);
 
     if (!IsSmallDecodeExpertParallelAutoModel(model)) {
         decision.reason = "not_auto_moe_model";
@@ -3362,7 +3334,6 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         profile_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool used_fused_int4_gateup =
         !safe_reference_mode &&
-        (!expert.use_gelu_activation || Gemma4NativeFusedGeluMode() != densecore::env::RuntimeToggleMode::Off) &&
         TryRunPackedInt4FusedGateUpProjectionDirect(backend, expert.w1_int4, expert.w3_int4, input, &hidden, numa_node,
                                                     expert.use_gelu_activation, enable_inner_parallel);
     if (used_fused_int4_gateup) {
@@ -3781,6 +3752,10 @@ bool RunMoEKQuantRawBatchedFusedSwiGLU(CpuBackend* backend, int ggml_type_id, co
                                        const void* up_weight_ptr, const uint8_t* qinput_data,
                                        size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
                                        int numa_node, bool allow_parallel) {
+    if (static_cast<ggml_type>(ggml_type_id) == GGML_TYPE_Q4_K) {
+        return RunMoEQ4KRawBatchedFusedSwiGLUImpl(backend, gate_weight_ptr, up_weight_ptr, qinput_data,
+                                                 qinput_row_bytes, out_data, M, N, K, numa_node, allow_parallel);
+    }
     return RunMoEKQuantRawBatchedFusedSwiGLUImpl(backend, static_cast<ggml_type>(ggml_type_id), gate_weight_ptr,
                                                 up_weight_ptr, qinput_data, qinput_row_bytes, out_data, M, N, K,
                                                 numa_node, allow_parallel);
@@ -4259,19 +4234,6 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             tile_par_can_use && tile_par_ep_enabled && !safe_reference_mode && batch_size == 1 &&
             small_decode_worker_cap >= 16 && total_assignments >= 2 && hidden_dim >= 1024 &&
             small_decode_intermediate_dim >= 256;
-        {
-            static std::atomic<int> tile_par_diag_count{0};
-            if (tile_par_diag_count.fetch_add(1, std::memory_order_relaxed) < 3) {
-                std::fprintf(stderr,
-                             "[MOE_TILE_DIAG] tile_parallel=%d can_use=%d ep_enabled=%d ep_reason=%s safe_ref=%d "
-                             "batch=%d worker_cap=%d assignments=%d hidden=%lld intermediate=%lld\n",
-                             use_small_decode_quantized_tile_parallel ? 1 : 0, tile_par_can_use ? 1 : 0,
-                             tile_par_ep_enabled ? 1 : 0,
-                             expert_parallel_decision.reason ? expert_parallel_decision.reason : "null",
-                             safe_reference_mode ? 1 : 0, batch_size, small_decode_worker_cap, total_assignments,
-                             static_cast<long long>(hidden_dim), static_cast<long long>(small_decode_intermediate_dim));
-            }
-        }
         if (use_small_decode_quantized_tile_parallel) {
             bool all_assignments_supported = true;
             for (int i = 0; i < total_assignments; ++i) {
@@ -4298,8 +4260,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                     ggml_is_quantized(static_cast<ggml_type>(exp.w3_type)) && down_scale_supported;
                 if (!has_quantized_gated_ffn) {
                     all_assignments_supported = false;
-                    static std::atomic<int> qgf_diag{0};
-                    if (qgf_diag.fetch_add(1, std::memory_order_relaxed) < 2) {
+                    if (IsMoEMatmulPathDebugEnabled()) {
                         std::fprintf(stderr,
                                      "[MOE_TILE_DIAG] quantized_gated_ffn FAIL expert=%d w1=%d w3=%d w2=%d "
                                      "gelu=%d down_scale=%d w1_ptr=%d w3_ptr=%d w2_ptr=%d\n",
@@ -4322,15 +4283,12 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 const int down_splits =
                     std::min<int>(std::max<int>(1, small_decode_worker_cap / std::max(1, total_assignments)),
                                   std::max<int>(1, static_cast<int>(hidden_dim / 256)));
-                {
-                    static std::atomic<int> tile_enter_diag{0};
-                    if (tile_enter_diag.fetch_add(1, std::memory_order_relaxed) < 2) {
-                        std::fprintf(stderr,
-                                     "[MOE_TILE_DIAG] ENTERING tile_parallel gate_splits=%d down_splits=%d "
-                                     "target_par=%d workers=%d assignments=%d\n",
-                                     gate_splits, down_splits, target_parallelism, small_decode_worker_cap,
-                                     total_assignments);
-                    }
+                if (IsMoEMatmulPathDebugEnabled()) {
+                    std::fprintf(stderr,
+                                 "[MOE_TILE_DIAG] ENTERING tile_parallel gate_splits=%d down_splits=%d "
+                                 "target_par=%d workers=%d assignments=%d\n",
+                                 gate_splits, down_splits, target_parallelism, small_decode_worker_cap,
+                                 total_assignments);
                 }
                 const size_t assignment_hidden_elems =
                     static_cast<size_t>(total_assignments) * static_cast<size_t>(small_decode_intermediate_dim);
@@ -4539,14 +4497,11 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             }
         }
         if (use_small_decode_expert_parallel) {
-            {
-                static std::atomic<int> ep_diag{0};
-                if (ep_diag.fetch_add(1, std::memory_order_relaxed) < 2) {
-                    std::fprintf(stderr,
-                                 "[MOE_TILE_DIAG] FALLBACK to expert_parallel (NOT tile_parallel) "
-                                 "workers=%d assignments=%d\n",
-                                 effective_small_decode_workers, total_assignments);
-                }
+            if (IsMoEMatmulPathDebugEnabled()) {
+                std::fprintf(stderr,
+                             "[MOE_TILE_DIAG] FALLBACK to expert_parallel (NOT tile_parallel) "
+                             "workers=%d assignments=%d\n",
+                             effective_small_decode_workers, total_assignments);
             }
             LogSmallDecodeExecutionPath("expert_parallel", total_assignments, effective_small_decode_workers,
                                         batch_size);
@@ -5525,15 +5480,13 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
         const int active_threads = std::max(1, std::min(worker_threads, static_cast<int>(active_work.size())));
         if (active_work.size() > static_cast<size_t>(active_threads)) {
             std::atomic<int> next_expert{0};
-            constexpr int queue_chunk = 1;
             reorder_pool.ParallelFor(active_threads, [&](int, int, int) {
                 for (;;) {
-                    const int idx = next_expert.fetch_add(queue_chunk, std::memory_order_relaxed);
+                    const int idx = next_expert.fetch_add(1, std::memory_order_relaxed);
                     if (idx >= static_cast<int>(active_work.size())) {
                         break;
                     }
-                    run_active_work_range(idx, std::min(idx + queue_chunk, static_cast<int>(active_work.size())),
-                                          false);
+                    run_active_work_range(idx, std::min(idx + 1, static_cast<int>(active_work.size())), false);
                 }
             });
         } else {
@@ -5648,8 +5601,8 @@ bool ResolveLFM2SmallDecodeExpertParallelAutoEligibleForTest(int physical_cores,
                                                         static_cast<densecore::simd::SimdLevel>(simd_level));
 }
 
-int ResolveQwen36SmallDecodeExpertWorkersForTest(int top_k, int worker_cap, int requested_override) {
-    return ResolveSmallDecodeExpertWorkers(top_k, worker_cap, requested_override);
+int ResolveQwen36SmallDecodeExpertWorkersForTest(int top_k, int worker_cap) {
+    return ResolveSmallDecodeExpertWorkers(top_k, worker_cap);
 }
 
 bool RunGgmlQuantizedProjectionForTest(CpuBackend* backend, const void* weight_ptr, int ggml_type_id,

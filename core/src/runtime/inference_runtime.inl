@@ -154,10 +154,6 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> gemma4_dense_prefill_native_ns{0};
     std::atomic<uint64_t> gemma4_dense_prefill_replaced_ggml_mul_mat_ops{0};
     std::atomic<uint64_t> gemma4_dense_prefill_duplicate_work_detected{0};
-    std::atomic<uint64_t> gemma4_fast_gelu_enabled{0};
-    std::atomic<uint64_t> gemma4_fast_gelu_used{0};
-    std::atomic<uint64_t> gemma4_fast_gelu_ns{0};
-    std::atomic<uint64_t> gemma4_native_moe_prefill_gate_up_fast_gelu_ns{0};
     std::atomic<uint64_t> gemma4_decode_native_candidate_ops{0};
     std::atomic<uint64_t> gemma4_decode_native_used_ops{0};
     std::atomic<uint64_t> gemma4_decode_native_rejected_ops{0};
@@ -782,10 +778,6 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.gemma4_dense_prefill_native_ns.store(0, std::memory_order_relaxed);
     p.gemma4_dense_prefill_replaced_ggml_mul_mat_ops.store(0, std::memory_order_relaxed);
     p.gemma4_dense_prefill_duplicate_work_detected.store(0, std::memory_order_relaxed);
-    p.gemma4_fast_gelu_enabled.store(0, std::memory_order_relaxed);
-    p.gemma4_fast_gelu_used.store(0, std::memory_order_relaxed);
-    p.gemma4_fast_gelu_ns.store(0, std::memory_order_relaxed);
-    p.gemma4_native_moe_prefill_gate_up_fast_gelu_ns.store(0, std::memory_order_relaxed);
     p.gemma4_decode_native_candidate_ops.store(0, std::memory_order_relaxed);
     p.gemma4_decode_native_used_ops.store(0, std::memory_order_relaxed);
     p.gemma4_decode_native_rejected_ops.store(0, std::memory_order_relaxed);
@@ -1106,11 +1098,6 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
         p.gemma4_dense_prefill_replaced_ggml_mul_mat_ops.load(std::memory_order_relaxed);
     snapshot.gemma4_dense_prefill_duplicate_work_detected =
         p.gemma4_dense_prefill_duplicate_work_detected.load(std::memory_order_relaxed);
-    snapshot.gemma4_fast_gelu_enabled = p.gemma4_fast_gelu_enabled.load(std::memory_order_relaxed);
-    snapshot.gemma4_fast_gelu_used = p.gemma4_fast_gelu_used.load(std::memory_order_relaxed);
-    snapshot.gemma4_fast_gelu_ns = p.gemma4_fast_gelu_ns.load(std::memory_order_relaxed);
-    snapshot.gemma4_native_moe_prefill_gate_up_fast_gelu_ns =
-        p.gemma4_native_moe_prefill_gate_up_fast_gelu_ns.load(std::memory_order_relaxed);
     snapshot.gemma4_decode_native_candidate_ops =
         p.gemma4_decode_native_candidate_ops.load(std::memory_order_relaxed);
     snapshot.gemma4_decode_native_used_ops =
@@ -1512,23 +1499,6 @@ void RecordGemma4DensePrefillNativeTiming(InferenceWorkContext* ctx, uint64_t wa
     ctx->qwen36_profile.gemma4_dense_prefill_native_ns.fetch_add(wall_ns, std::memory_order_relaxed);
 }
 
-void RecordGemma4FastGeluDecision(InferenceWorkContext* ctx, bool enabled, bool used, uint64_t wall_ns) {
-    if (!ctx) {
-        return;
-    }
-    auto& p = ctx->qwen36_profile;
-    if (enabled) {
-        p.gemma4_fast_gelu_enabled.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (used) {
-        p.gemma4_fast_gelu_used.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (wall_ns > 0) {
-        p.gemma4_fast_gelu_ns.fetch_add(wall_ns, std::memory_order_relaxed);
-        p.gemma4_native_moe_prefill_gate_up_fast_gelu_ns.fetch_add(wall_ns, std::memory_order_relaxed);
-    }
-}
-
 void RecordGemma4DecodeNativeDecision(InferenceWorkContext* ctx, bool candidate, bool used,
                                       const char* reject_reason, bool moe_used, bool dense_used,
                                       bool lm_head_used, uint64_t wall_ns, uint64_t replaced_mul_mat_ops,
@@ -1831,7 +1801,7 @@ void RecordQ6KGemvDecision(InferenceWorkContext* ctx, bool candidate, bool used,
 }
 
 void RecordQwen35MoEGraphPath(InferenceWorkContext* ctx, const char* path, int top_k, int selected_expert_count,
-                              ggml_type w1w3_type, ggml_type w2_type) {
+                              int task_count, ggml_type w1w3_type, ggml_type w2_type) {
     if (!ctx) {
         return;
     }
@@ -1850,6 +1820,44 @@ void RecordQwen35MoEGraphPath(InferenceWorkContext* ctx, const char* path, int t
     while (current_top_k < top_k &&
            !p.qwen35_moe_top_k.compare_exchange_weak(current_top_k, top_k, std::memory_order_relaxed,
                                                      std::memory_order_relaxed)) {
+    }
+    auto update_max = [](std::atomic<int>& counter, int value) {
+        int current = counter.load(std::memory_order_relaxed);
+        while (value > current && !counter.compare_exchange_weak(current, value, std::memory_order_relaxed,
+                                                                 std::memory_order_relaxed)) {
+        }
+    };
+    if (selected_expert_count > 0) {
+        update_max(p.moe_selected_expert_count, selected_expert_count);
+        update_max(p.selected_expert_count, selected_expert_count);
+    }
+    if (top_k > 0) {
+        update_max(p.moe_top_k, top_k);
+    }
+    if (task_count > 0) {
+        update_max(p.moe_task_count, task_count);
+        update_max(p.moe_expert_parallel_tasks, task_count);
+    }
+}
+
+void RecordNativeMoEGraphCallbackExecution(InferenceWorkContext* ctx, int selected_expert_count, int task_count) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    auto update_max = [](std::atomic<int>& counter, int value) {
+        int current = counter.load(std::memory_order_relaxed);
+        while (value > current && !counter.compare_exchange_weak(current, value, std::memory_order_relaxed,
+                                                                 std::memory_order_relaxed)) {
+        }
+    };
+    if (selected_expert_count > 0) {
+        update_max(p.selected_expert_count, selected_expert_count);
+        update_max(p.moe_selected_expert_count, selected_expert_count);
+    }
+    if (task_count > 0) {
+        update_max(p.moe_task_count, task_count);
+        update_max(p.moe_expert_parallel_tasks, task_count);
     }
 }
 

@@ -31,21 +31,7 @@ bool ShouldUseGemma4PagedDecodeForLayer(const TransformerModel* model, int layer
         return true;
     }
 
-    const char* mode_env = std::getenv("DENSECORE_GEMMA4_PAGED_DECODE_LAYER_MODE");
-    const char* mode = (mode_env && mode_env[0] != '\0') ? mode_env : "all";
-    const bool is_sliding_layer = densecore::models::IsGemma4SlidingLayer(model, layer_idx);
-
-    if (std::strcmp(mode, "all") == 0) {
-        return true;
-    }
-    if (std::strcmp(mode, "full") == 0) {
-        return !is_sliding_layer;
-    }
-    if (std::strcmp(mode, "off") == 0 || std::strcmp(mode, "none") == 0) {
-        return false;
-    }
-
-    return is_sliding_layer;
+    return densecore::models::IsGemma4SlidingLayer(model, layer_idx);
 }
 
 int EffectiveAutoPagedContextFloor(const TransformerModel* model, int requested_floor, int n_tokens_in_batch) {

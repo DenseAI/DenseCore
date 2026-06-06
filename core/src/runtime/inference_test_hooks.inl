@@ -383,6 +383,23 @@ struct ggml_tensor* SmartMulMatTest(struct ggml_context* ctx, struct ggml_tensor
                                     TransformerModel* model) {
     return ::smart_mul_mat(ctx, weight, input, model);
 }
+struct ggml_tensor* SmartMulMatWithPhaseTest(struct ggml_context* ctx, struct ggml_tensor* weight,
+                                             struct ggml_tensor* input, TransformerModel* model, int phase) {
+    InferenceWorkContext* previous_ctx = GetCurrentWorkContext();
+    std::unique_ptr<InferenceWorkContext, void (*)(InferenceWorkContext*)> owned_ctx(nullptr, DestroyInferenceWorkContext);
+    if (!previous_ctx) {
+        owned_ctx.reset(CreateInferenceWorkContext());
+        SetCurrentWorkContext(owned_ctx.get());
+    }
+    const InferenceExecutionPhase previous_phase = GetCurrentExecutionPhase();
+    SetCurrentExecutionPhase(static_cast<InferenceExecutionPhase>(phase));
+    struct ggml_tensor* result = ::smart_mul_mat(ctx, weight, input, model);
+    SetCurrentExecutionPhase(previous_phase);
+    if (!previous_ctx) {
+        SetCurrentWorkContext(nullptr);
+    }
+    return result;
+}
 int ResolveQuantBatchedTileColsForTest(int requested_cols, int vec_dot_nrows, bool allow_true_batched_q4k) {
     return ::ResolveQuantBatchedTileCols(requested_cols, vec_dot_nrows, allow_true_batched_q4k);
 }
@@ -392,9 +409,6 @@ bool ResolveQ4KTrueBatchedKernelPolicyForTest(int simd_level, bool compiled_with
 }
 float Gemma4GeluTanhExactForTest(float x) {
     return ::Gemma4GeluTanh(x);
-}
-float Gemma4GeluTanhApproxForTest(float x) {
-    return ::Gemma4GeluTanhApproxScalar(x);
 }
 bool ShouldUsePortableFlashHeadSeqReferenceFallbackForTest(bool explicit_debug_reference) {
     return ::ShouldUsePortableFlashHeadSeqReferenceFallback(explicit_debug_reference);
@@ -805,8 +819,11 @@ bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_ve
     ggml_free(ggml_ctx);
     return true;
 }
-int ResolveQwen36MoECallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int top_k) {
-    return ::ResolveQwen36MoECallbackTaskCount(model, batch, top_k);
+
+int ResolveNativeMoEGraphCallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int phase,
+                                                  int64_t n_tokens, int top_k) {
+    return ::ResolveNativeMoEGraphCallbackTaskCount(model, batch, static_cast<InferenceExecutionPhase>(phase), n_tokens,
+                                                    top_k);
 }
 
 bool ShouldEnableNativeMoEFastPathByDefaultForTest(const TransformerModel* model, int phase, int mode) {
@@ -851,6 +868,13 @@ bool CanUseQwenNativeMoEW2ForTest(const TransformerModel* model, const ggml_tens
         SetCurrentWorkContext(nullptr);
     }
     return accepted;
+}
+
+bool RemapNativeMoECallbackTaskForTest(int requested_task_count, int ith, int nth, int* effective_ith,
+                                       int* effective_nth) {
+    Qwen35SharedQ8RowsUserData ud{};
+    ud.requested_task_count = requested_task_count;
+    return ::RemapNativeMoECallbackTask(&ud, ith, nth, effective_ith, effective_nth);
 }
 }  // namespace testing
 }  // namespace densecore

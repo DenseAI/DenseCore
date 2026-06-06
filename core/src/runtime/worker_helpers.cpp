@@ -95,15 +95,6 @@ bool IsBenchmarkOrServerPerfProfile() {
     return profile == "single-e2e" || profile == "go-server" || profile == "native-runtime";
 }
 
-const char* RuntimeToggleModeSummaryName(densecore::env::RuntimeToggleMode mode) {
-    switch (mode) {
-    case densecore::env::RuntimeToggleMode::Off: return "off";
-    case densecore::env::RuntimeToggleMode::Auto: return "auto";
-    case densecore::env::RuntimeToggleMode::On: return "on";
-    }
-    return "off";
-}
-
 const char* TransformerGraphExecutionRouteSummaryName(densecore::TransformerGraphExecutionRoute route) {
     switch (route) {
     case densecore::TransformerGraphExecutionRoute::RegistryBuilder: return "registry_builder";
@@ -130,6 +121,34 @@ std::string JoinExecutionContractRejections(const densecore::models::ModelExecut
     return oss.str();
 }
 
+std::string JoinExecutionContractForbiddenFastPaths(const densecore::models::ModelExecutionContract& contract) {
+    if (contract.forbidden_fast_path_reasons.empty()) {
+        return "none";
+    }
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < contract.forbidden_fast_path_reasons.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << contract.forbidden_fast_path_reasons[i];
+    }
+    return oss.str();
+}
+
+std::string JoinExecutionContractRequiredFastPathCounters(const densecore::models::ModelExecutionContract& contract) {
+    if (contract.required_fast_path_counters.empty()) {
+        return "none";
+    }
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < contract.required_fast_path_counters.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << contract.required_fast_path_counters[i];
+    }
+    return oss.str();
+}
+
 std::string SummaryToken(std::string value) {
     if (value.empty()) {
         return "none";
@@ -140,6 +159,166 @@ std::string SummaryToken(std::string value) {
         }
     }
     return value;
+}
+
+struct TargetFastPathGate {
+    bool required = false;
+    bool ggml_path_seen = false;
+    bool graph_plan_rejected = false;
+    bool native_moe_fallback_seen = false;
+    bool native_moe_rejected = false;
+    bool native_moe_fast_ops_missing = false;
+    bool gemma4_moe_rejected = false;
+    bool gemma4_moe_prefill_ops_missing = false;
+    bool gemma4_moe_decode_ops_missing = false;
+    bool gemma4_moe_fast_ops_missing = false;
+    bool hybrid_ssm_stateful_ops_missing = false;
+    bool no_ggml_path = true;
+    bool no_native_moe_fallback = true;
+    bool no_native_moe_reject = true;
+    bool native_moe_fast_ops_ok = true;
+    bool gemma4_moe_fast_ops_ok = true;
+    bool stateful_ops_ok = true;
+    bool required_fast_path_counters_ok = true;
+    bool ok = true;
+    const char* failure_reason = "none";
+    std::string missing_required_fast_path_counters = "none";
+};
+
+bool Gemma4MaintainedPrefillFastOpsUsed(const Request* req) {
+    if (!req) {
+        return false;
+    }
+    static constexpr std::size_t kCustomBatchedGemvPath = 3;
+    return req->prefill_matmul_path_hist[kCustomBatchedGemvPath] > 0 && req->arm_batched_quant_used > 0;
+}
+
+bool Gemma4MaintainedDecodeFastOpsUsed(const Request* req) {
+    if (!req) {
+        return false;
+    }
+    static constexpr std::size_t kCustomGemvPath = 2;
+    return req->decode_matmul_path_hist[kCustomGemvPath] > 0 &&
+           req->gemma4_decode_native_moe_used_ops > 0;
+}
+
+bool RequiredFastPathCounterSatisfied(const Request* req, const TargetFastPathGate& gate, const std::string& counter) {
+    if (!req) {
+        return true;
+    }
+    if (counter == "target_no_ggml_path") {
+        return gate.no_ggml_path;
+    }
+    if (counter == "native_moe_fast_w1w3_used_ops") {
+        return req->native_moe_fast_w1w3_used_ops > 0;
+    }
+    if (counter == "native_moe_fast_w2_used_ops") {
+        return req->native_moe_fast_w2_used_ops > 0;
+    }
+    if (counter == "ssm_conv1d_calls") {
+        return req->ssm_conv1d_calls > 0;
+    }
+    if (counter == "ssm_delta_calls") {
+        return req->ssm_delta_calls > 0;
+    }
+    if (counter == "lfm2_shortconv_sequence_fast_used_ops") {
+        return req->ssm_conv1d_calls > 0;
+    }
+    if (counter == "gemma4_prefill_maintained_fast_ops") {
+        return Gemma4MaintainedPrefillFastOpsUsed(req);
+    }
+    if (counter == "gemma4_decode_maintained_fast_ops") {
+        return Gemma4MaintainedDecodeFastOpsUsed(req);
+    }
+    return true;
+}
+
+std::string MissingRequiredFastPathCounters(
+    const Request* req, const TargetFastPathGate& gate,
+    const densecore::models::ModelExecutionContract& execution_contract) {
+    std::ostringstream oss;
+    bool any = false;
+    for (const std::string& counter : execution_contract.required_fast_path_counters) {
+        if (RequiredFastPathCounterSatisfied(req, gate, counter)) {
+            continue;
+        }
+        if (any) {
+            oss << ",";
+        }
+        oss << counter;
+        any = true;
+    }
+    return any ? oss.str() : "none";
+}
+
+TargetFastPathGate EvaluateTargetFastPathGate(
+    const Request* req, const densecore::models::ModelExecutionContract& execution_contract, bool graph_plan_rejected) {
+    TargetFastPathGate gate{};
+    if (!req) {
+        return gate;
+    }
+    gate.required = densecore::models::ModelExecutionContractRequiresFallbackFreeFastPath(execution_contract) ||
+                    densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(execution_contract);
+    gate.ggml_path_seen = req->qwen_target_ggml_compute_ops > 0 || req->decode_matmul_path_hist[0] > 0 ||
+                          req->decode_matmul_path_hist[1] > 0 || req->prefill_matmul_path_hist[0] > 0 ||
+                          req->prefill_matmul_path_hist[1] > 0;
+    gate.graph_plan_rejected = graph_plan_rejected;
+    gate.native_moe_fallback_seen = req->native_moe_fallback_w1w3_ops > 0 || req->native_moe_fallback_w2_ops > 0;
+    gate.native_moe_rejected = req->native_moe_fast_decode_rejected_ops > 0 ||
+                               req->native_moe_fast_w2_q5k_rejected_ops > 0 ||
+                               req->qwen36_prefill_native_moe_fast_rejected_ops > 0;
+    gate.native_moe_fast_ops_missing =
+        densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(execution_contract) &&
+        (req->native_moe_fast_w1w3_used_ops == 0 || req->native_moe_fast_w2_used_ops == 0);
+
+    const bool gemma4_moe_contract =
+        execution_contract.fast_path_class == densecore::models::ExecutionFastPathClass::Gemma4MoE;
+    gate.gemma4_moe_rejected =
+        gemma4_moe_contract &&
+        (req->gemma4_moe_prefill_quant_batch_rejected_ops > 0 ||
+         req->gemma4_native_moe_prefill_rejected_layers > 0 || req->gemma4_decode_native_rejected_ops > 0);
+    gate.gemma4_moe_prefill_ops_missing = gemma4_moe_contract && !Gemma4MaintainedPrefillFastOpsUsed(req);
+    gate.gemma4_moe_decode_ops_missing = gemma4_moe_contract && !Gemma4MaintainedDecodeFastOpsUsed(req);
+    gate.gemma4_moe_fast_ops_missing =
+        gate.gemma4_moe_prefill_ops_missing || gate.gemma4_moe_decode_ops_missing;
+    gate.hybrid_ssm_stateful_ops_missing =
+        execution_contract.has_hybrid_ssm_mixer && (req->ssm_conv1d_calls == 0 || req->ssm_delta_calls == 0);
+
+    gate.no_ggml_path = !gate.ggml_path_seen;
+    gate.no_native_moe_fallback = !gate.native_moe_fallback_seen;
+    gate.no_native_moe_reject = !gate.native_moe_rejected && !gate.gemma4_moe_rejected;
+    gate.native_moe_fast_ops_ok =
+        !densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(execution_contract) ||
+        !gate.native_moe_fast_ops_missing;
+    gate.gemma4_moe_fast_ops_ok = !gemma4_moe_contract || !gate.gemma4_moe_fast_ops_missing;
+    gate.stateful_ops_ok = !execution_contract.has_hybrid_ssm_mixer || !gate.hybrid_ssm_stateful_ops_missing;
+    gate.missing_required_fast_path_counters =
+        MissingRequiredFastPathCounters(req, gate, execution_contract);
+    gate.required_fast_path_counters_ok = gate.missing_required_fast_path_counters == "none";
+    gate.ok = !gate.required || (!gate.graph_plan_rejected && gate.no_ggml_path && gate.no_native_moe_fallback &&
+                                 gate.no_native_moe_reject && gate.native_moe_fast_ops_ok &&
+                                 gate.gemma4_moe_fast_ops_ok && gate.stateful_ops_ok &&
+                                 gate.required_fast_path_counters_ok);
+
+    if (gate.required && gate.graph_plan_rejected) {
+        gate.failure_reason = "graph_plan_rejected";
+    } else if (gate.required && gate.ggml_path_seen) {
+        gate.failure_reason = "ggml_compute_or_matmul_path";
+    } else if (gate.required && gate.native_moe_fallback_seen) {
+        gate.failure_reason = "native_moe_w1w3_or_w2_fallback";
+    } else if (gate.required && gate.native_moe_rejected) {
+        gate.failure_reason = "native_moe_fast_path_rejected";
+    } else if (gate.required && gate.native_moe_fast_ops_missing) {
+        gate.failure_reason = "native_moe_fast_ops_missing";
+    } else if (gate.required && gate.gemma4_moe_rejected) {
+        gate.failure_reason = "gemma4_moe_fast_path_rejected";
+    } else if (gate.required && gate.gemma4_moe_fast_ops_missing) {
+        gate.failure_reason = gate.gemma4_moe_prefill_ops_missing ? "gemma4_moe_prefill_fast_ops_missing"
+                                                                  : "gemma4_moe_decode_fast_ops_missing";
+    } else if (gate.required && gate.hybrid_ssm_stateful_ops_missing) {
+        gate.failure_reason = "hybrid_ssm_stateful_ops_missing";
+    }
+    return gate;
 }
 
 int EffectiveCloudWorkerCap(int physical_core_count, int base_threads, bool benchmark_or_server_perf_profile) {
@@ -1669,18 +1848,14 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const std::string qwen35_moe_w2_hist = weight_hist_string(req->qwen35_moe_w2_weight_type_hist);
     const std::string qwen36_prefill_top_slow_ops = shape_census_string(req->qwen36_prefill_top_slow_ops);
     const std::string gemma4_prefill_top_slow_ops = shape_census_string(req->gemma4_prefill_top_slow_ops);
-    const auto native_moe_fast_decode_config = densecore::env::RuntimeToggleMode::On;
     const bool native_moe_fast_w2_q5k_used = req->native_moe_fast_w2_q5k_used_ops > 0;
     const bool native_moe_fast_w2_q5k_rejected = req->native_moe_fast_w2_q5k_rejected_ops > 0;
-    const char* native_moe_fast_mode_effective = "auto_discovery_only";
-    if (native_moe_fast_decode_config == densecore::env::RuntimeToggleMode::Off) {
-        native_moe_fast_mode_effective = "off";
-    } else if (req->native_moe_fast_decode_used_ops > 0) {
-        native_moe_fast_mode_effective = "auto_used_native_graph_w2_q5k";
+    const char* native_moe_fast_decode_config = "maintained";
+    const char* native_moe_fast_mode_effective = "not_applicable";
+    if (req->native_moe_fast_decode_used_ops > 0) {
+        native_moe_fast_mode_effective = "used";
     } else if (req->native_moe_fast_decode_rejected_ops > 0) {
-        native_moe_fast_mode_effective = "auto_rejected_noop";
-    } else if (native_moe_fast_decode_config == densecore::env::RuntimeToggleMode::On) {
-        native_moe_fast_mode_effective = "on_noop";
+        native_moe_fast_mode_effective = "rejected";
     }
     const char* native_moe_fast_w2_q5k_effective_state = "candidate";
     if (native_moe_fast_w2_q5k_used) {
@@ -1751,37 +1926,9 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
          !req->native_moe_graph_node_hist.empty());
     const int native_moe_timing_missing =
         native_moe_expected && req->native_moe_graph_ns == 0 ? 1 : req->native_moe_timing_missing;
-    const bool target_fast_path_required =
-        densecore::models::ModelExecutionContractRequiresFallbackFreeFastPath(execution_contract) ||
-        densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(execution_contract);
-    const bool target_ggml_path_seen =
-        req->qwen_target_ggml_compute_ops > 0 || req->decode_matmul_path_hist[0] > 0 ||
-        req->decode_matmul_path_hist[1] > 0 || req->prefill_matmul_path_hist[0] > 0 ||
-        req->prefill_matmul_path_hist[1] > 0;
     const bool target_graph_plan_rejected = graph_plan.route == densecore::TransformerGraphExecutionRoute::Reject;
-    const bool target_native_moe_fallback_seen =
-        req->native_moe_fallback_w1w3_ops > 0 || req->native_moe_fallback_w2_ops > 0;
-    const bool target_native_moe_rejected =
-        req->native_moe_fast_decode_rejected_ops > 0 || req->native_moe_fast_w2_q5k_rejected_ops > 0 ||
-        req->qwen36_prefill_native_moe_fast_rejected_ops > 0;
-    const bool target_hybrid_ssm_stateful_ops_missing =
-        execution_contract.has_hybrid_ssm_mixer && (req->ssm_conv1d_calls == 0 || req->ssm_delta_calls == 0);
-    const bool target_fast_path_ok = !target_fast_path_required ||
-                                     (!target_graph_plan_rejected && !target_ggml_path_seen &&
-                                      !target_native_moe_fallback_seen &&
-                                      !target_native_moe_rejected && !target_hybrid_ssm_stateful_ops_missing);
-    const char* target_fast_path_failure_reason = "none";
-    if (target_fast_path_required && target_graph_plan_rejected) {
-        target_fast_path_failure_reason = "graph_plan_rejected";
-    } else if (target_fast_path_required && target_ggml_path_seen) {
-        target_fast_path_failure_reason = "ggml_compute_or_matmul_path";
-    } else if (target_fast_path_required && target_native_moe_fallback_seen) {
-        target_fast_path_failure_reason = "native_moe_w1w3_or_w2_fallback";
-    } else if (target_fast_path_required && target_native_moe_rejected) {
-        target_fast_path_failure_reason = "native_moe_fast_path_rejected";
-    } else if (target_fast_path_required && target_hybrid_ssm_stateful_ops_missing) {
-        target_fast_path_failure_reason = "hybrid_ssm_stateful_ops_missing";
-    }
+    const TargetFastPathGate target_fast_path_gate =
+        EvaluateTargetFastPathGate(req, execution_contract, target_graph_plan_rejected);
     const char* q6k_effective_state = "unused";
     if (req->q6k_gemv_used_ops != 0) {
         q6k_effective_state = "used";
@@ -1829,6 +1976,10 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     };
     const char* effective_attention_path = resolve_effective_attention_path();
     const std::string execution_contract_rejections = JoinExecutionContractRejections(execution_contract);
+    const std::string execution_contract_required_fast_path_counters =
+        JoinExecutionContractRequiredFastPathCounters(execution_contract);
+    const std::string execution_contract_forbidden_fast_paths =
+        JoinExecutionContractForbiddenFastPaths(execution_contract);
     const std::string graph_selected_builder = SummaryToken(graph_plan.selected_builder_name);
     const std::string graph_debug_reason = SummaryToken(graph_plan.debug_reason);
     const std::string graph_registry_builder_key = SummaryToken(graph_plan.registry_builder_key);
@@ -1852,8 +2003,6 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                   << " gemma4_dense_prefill_native_ms=" << ns_to_ms(req->gemma4_dense_prefill_native_ns)
                   << " gemma4_dense_prefill_replaced_ggml_mul_mat_ops="
                   << req->gemma4_dense_prefill_replaced_ggml_mul_mat_ops
-                  << " gemma4_fast_gelu_used=" << req->gemma4_fast_gelu_used
-                  << " gemma4_fast_gelu_ms=" << ns_to_ms(req->gemma4_fast_gelu_ns)
                   << " gemma4_native_moe_prefill_gate_up_ms=" << ns_to_ms(req->gemma4_native_moe_prefill_gate_up_ns)
                   << " gemma4_native_moe_prefill_down_ms=" << ns_to_ms(req->gemma4_native_moe_prefill_down_ns)
                   << " gemma4_native_moe_prefill_total_ms=" << ns_to_ms(req->gemma4_native_moe_prefill_total_ns)
@@ -1934,6 +2083,9 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " model_execution_contract_layer_count=" << execution_contract.layers.size()
         << " model_execution_contract_rebind_count=" << execution_contract.rebind_descriptors.size()
         << " model_execution_contract_rejections=" << execution_contract_rejections
+        << " model_execution_contract_required_fast_path_counters="
+        << execution_contract_required_fast_path_counters
+        << " model_execution_contract_forbidden_fast_paths=" << execution_contract_forbidden_fast_paths
         << " graph_plan_route=" << TransformerGraphExecutionRouteSummaryName(graph_plan.route)
         << " graph_plan_family=" << densecore::models::GraphFamilyName(graph_plan.resolution.preferred_family)
         << " graph_plan_fail_closed=" << (graph_plan.resolution.fail_closed ? 1 : 0)
@@ -2178,11 +2330,6 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " gemma4_dense_prefill_native_ms=" << ns_to_ms(req->gemma4_dense_prefill_native_ns)
         << " gemma4_dense_prefill_replaced_ggml_mul_mat_ops=" << req->gemma4_dense_prefill_replaced_ggml_mul_mat_ops
         << " gemma4_dense_prefill_duplicate_work_detected=" << req->gemma4_dense_prefill_duplicate_work_detected
-        << " gemma4_fast_gelu_enabled=" << req->gemma4_fast_gelu_enabled
-        << " gemma4_fast_gelu_used=" << req->gemma4_fast_gelu_used
-        << " gemma4_fast_gelu_ms=" << ns_to_ms(req->gemma4_fast_gelu_ns)
-        << " gemma4_native_moe_prefill_gate_up_fast_gelu_ms="
-        << ns_to_ms(req->gemma4_native_moe_prefill_gate_up_fast_gelu_ns)
         << " gemma4_decode_native_candidate_ops=" << req->gemma4_decode_native_candidate_ops
         << " gemma4_decode_native_used_ops=" << req->gemma4_decode_native_used_ops
         << " gemma4_decode_native_rejected_ops=" << req->gemma4_decode_native_rejected_ops
@@ -2223,7 +2370,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << (req->native_moe_graph_node_hist.empty() ? "none" : req->native_moe_graph_node_hist.c_str())
         << " native_moe_graph_top_slow_nodes=" << native_moe_graph_top_slow_nodes
         << " native_moe_timing_missing=" << native_moe_timing_missing
-        << " native_moe_fast_decode_config=" << RuntimeToggleModeSummaryName(native_moe_fast_decode_config)
+        << " native_moe_fast_decode_config=" << native_moe_fast_decode_config
         << " native_moe_fast_mode_effective=" << native_moe_fast_mode_effective
         << " native_moe_fast_decode_seen_ops=" << native_moe_fast_decode_seen_ops
         << " native_moe_fast_w1w3_seen_ops=" << native_moe_fast_w1w3_seen_ops
@@ -2325,12 +2472,22 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << (req->qwen_target_ggml_compute_last_op.empty() ? "none" : req->qwen_target_ggml_compute_last_op.c_str())
         << " qwen_target_ggml_compute_target="
         << (req->qwen_target_ggml_compute_target.empty() ? "none" : req->qwen_target_ggml_compute_target.c_str())
-        << " target_fast_path_required=" << (target_fast_path_required ? 1 : 0)
-        << " target_fast_path_ok=" << (target_fast_path_ok ? 1 : 0)
-        << " target_fast_path_failure_reason=" << target_fast_path_failure_reason
-        << " qwen_fast_path_required=" << (target_fast_path_required ? 1 : 0)
-        << " qwen_fast_path_ok=" << (target_fast_path_ok ? 1 : 0)
-        << " qwen_fast_path_failure_reason=" << target_fast_path_failure_reason
+        << " target_fast_path_required=" << (target_fast_path_gate.required ? 1 : 0)
+        << " target_fast_path_ok=" << (target_fast_path_gate.ok ? 1 : 0)
+        << " target_fast_path_failure_reason=" << target_fast_path_gate.failure_reason
+        << " target_no_ggml_path=" << (target_fast_path_gate.no_ggml_path ? 1 : 0)
+        << " target_no_native_moe_fallback=" << (target_fast_path_gate.no_native_moe_fallback ? 1 : 0)
+        << " target_no_native_moe_reject=" << (target_fast_path_gate.no_native_moe_reject ? 1 : 0)
+        << " target_native_moe_fast_ops_ok=" << (target_fast_path_gate.native_moe_fast_ops_ok ? 1 : 0)
+        << " target_gemma4_moe_fast_ops_ok=" << (target_fast_path_gate.gemma4_moe_fast_ops_ok ? 1 : 0)
+        << " target_stateful_ops_ok=" << (target_fast_path_gate.stateful_ops_ok ? 1 : 0)
+        << " target_required_fast_path_counters_ok="
+        << (target_fast_path_gate.required_fast_path_counters_ok ? 1 : 0)
+        << " target_missing_required_fast_path_counters="
+        << target_fast_path_gate.missing_required_fast_path_counters
+        << " qwen_fast_path_required=" << (target_fast_path_gate.required ? 1 : 0)
+        << " qwen_fast_path_ok=" << (target_fast_path_gate.ok ? 1 : 0)
+        << " qwen_fast_path_failure_reason=" << target_fast_path_gate.failure_reason
         << " qwen36_prefill_total_ms=" << ns_to_ms(req->qwen36_prefill_total_ns)
         << " qwen36_prefill_ssm_projection_ms=" << ns_to_ms(req->qwen36_prefill_ssm_projection_ns)
         << " qwen36_prefill_ssm_delta_state_ms=" << ns_to_ms(req->qwen36_prefill_ssm_delta_state_ns)

@@ -327,6 +327,8 @@ TEST(WorkerResultDispatchTest, QwenDecodeSummaryAcceptsNativeMoeFastGateUpAndDow
     req.qwen35_moe_path = "native_graph";
     req.qwen35_moe_w1w3_weight_type_hist[0] = 1;
     req.qwen35_moe_w2_weight_type_hist[1] = 1;
+    req.ssm_conv1d_calls = 1;
+    req.ssm_delta_calls = 1;
 
     ::testing::internal::CaptureStderr();
     LogRequestDecodeSummary(&req, &model);
@@ -335,7 +337,45 @@ TEST(WorkerResultDispatchTest, QwenDecodeSummaryAcceptsNativeMoeFastGateUpAndDow
     EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_ok=1"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_failure_reason=none"), std::string::npos);
+    EXPECT_NE(captured.find("target_no_ggml_path=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_no_native_moe_fallback=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_no_native_moe_reject=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_native_moe_fast_ops_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_stateful_ops_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_required_fast_path_counters_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_missing_required_fast_path_counters=none"), std::string::npos);
     EXPECT_NE(captured.find("qwen_fast_path_ok=1"), std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, QwenDecodeSummaryRejectsMissingNativeMoeFastOps) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_experts = 128;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.qwen35_moe_forward_calls = 1;
+    req.qwen35_moe_path = "native_graph";
+    req.ssm_conv1d_calls = 1;
+    req.ssm_delta_calls = 1;
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=native_moe_fast_ops_missing"), std::string::npos);
+    EXPECT_NE(captured.find("target_native_moe_fast_ops_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_stateful_ops_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_required_fast_path_counters_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_missing_required_fast_path_counters="
+                            "native_moe_fast_w1w3_used_ops,native_moe_fast_w2_used_ops"),
+              std::string::npos);
+    EXPECT_NE(captured.find("qwen_fast_path_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_fast_path_failure_reason=native_moe_fast_ops_missing"), std::string::npos);
 }
 
 TEST(WorkerResultDispatchTest, LFM2DecodeSummaryIncludesDedicatedFastPathAliases) {
@@ -375,6 +415,38 @@ TEST(WorkerResultDispatchTest, LFM2DecodeSummaryIncludesDedicatedFastPathAliases
     EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_ok=1"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_failure_reason=none"), std::string::npos);
+    EXPECT_NE(captured.find("target_native_moe_fast_ops_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_stateful_ops_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_required_fast_path_counters_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_missing_required_fast_path_counters=none"), std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, LFM2DecodeSummaryRejectsMissingNativeMoeFastOps) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_lfm2_shortconv = true;
+    model.hparams.n_experts = 32;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.qwen35_moe_forward_calls = 1;
+    req.qwen35_moe_path = "native_graph";
+    req.ssm_conv1d_calls = 1;
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("[LFM2DecodeSummary]"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=native_moe_fast_ops_missing"), std::string::npos);
+    EXPECT_NE(captured.find("target_native_moe_fast_ops_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_stateful_ops_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_missing_required_fast_path_counters="
+                            "native_moe_fast_w1w3_used_ops,native_moe_fast_w2_used_ops"),
+              std::string::npos);
 }
 
 TEST(WorkerResultDispatchTest, LFM2DecodeSummaryMarksNativeMoeFallbackAsFastPathFailure) {
@@ -399,6 +471,107 @@ TEST(WorkerResultDispatchTest, LFM2DecodeSummaryMarksNativeMoeFallbackAsFastPath
     EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_ok=0"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_failure_reason=native_moe_w1w3_or_w2_fallback"), std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, Gemma4MoESummaryRejectsMissingFastPathCounters) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_experts = 128;
+    model.hparams.n_experts_used = 4;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("[Gemma4DecodeSummary]"), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_fast_path_class=gemma4_moe"), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_required_fast_path_counters="
+                            "target_no_ggml_path,gemma4_prefill_maintained_fast_ops,"
+                            "gemma4_decode_maintained_fast_ops"),
+              std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_forbidden_fast_paths="
+                            "gemma4_arm_native_moe_prefill_quality_failed"),
+              std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_gemma4_moe_fast_ops_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_required_fast_path_counters_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_missing_required_fast_path_counters="
+                            "gemma4_prefill_maintained_fast_ops,gemma4_decode_maintained_fast_ops"),
+              std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=gemma4_moe_prefill_fast_ops_missing"),
+              std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, Gemma4MoESummaryAcceptsPrefillAndDecodeFastCounters) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_experts = 128;
+    model.hparams.n_experts_used = 4;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.prefill_matmul_path_hist[3] = 98;  // custom_batched_gemv
+    req.decode_matmul_path_hist[2] = 3;    // custom_gemv
+    req.arm_batched_quant_used = 1;
+    req.gemma4_decode_native_moe_used_ops = 64;
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("[Gemma4DecodeSummary]"), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_fast_path_class=gemma4_moe"), std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_required_fast_path_counters="
+                            "target_no_ggml_path,gemma4_prefill_maintained_fast_ops,"
+                            "gemma4_decode_maintained_fast_ops"),
+              std::string::npos);
+    EXPECT_NE(captured.find("model_execution_contract_forbidden_fast_paths="
+                            "gemma4_arm_native_moe_prefill_quality_failed"),
+              std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_gemma4_moe_fast_ops_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_required_fast_path_counters_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_missing_required_fast_path_counters=none"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=none"), std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, Gemma4MoESummaryRejectsDecodeWhenNativeMoeIsMissing) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_experts = 128;
+    model.hparams.n_experts_used = 4;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.prefill_matmul_path_hist[3] = 98;  // custom_batched_gemv
+    req.decode_matmul_path_hist[2] = 3;    // custom_gemv
+    req.arm_batched_quant_used = 1;
+    req.gemma4_decode_native_moe_used_ops = 0;
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("[Gemma4DecodeSummary]"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_gemma4_moe_fast_ops_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_required_fast_path_counters_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_missing_required_fast_path_counters=gemma4_decode_maintained_fast_ops"),
+              std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=gemma4_moe_decode_fast_ops_missing"),
+              std::string::npos);
 }
 
 TEST(WorkerResultDispatchTest, DecodeSummaryTagsQwen36AndGemma4Variants) {

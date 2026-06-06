@@ -42,7 +42,7 @@ option(
 )
 option(
     DENSECORE_C4A_ENABLE_GGML_FASTKERNELS
-    "Enable ggml native/repack/llamafile fast kernels on C4A builds; KleidiAI remains separately quality-gated"
+    "Enable ggml native/llamafile fast kernels on C4A builds; repack and KleidiAI are gated separately"
     OFF
 )
 option(
@@ -278,11 +278,15 @@ endif()
 if(DENSECORE_TARGET_C4A AND NOT DENSECORE_C4A_ENABLE_GGML_FASTKERNELS)
     set(DENSECORE_GGML_CPU_FEATURES_DEFAULT OFF)
 endif()
+set(DENSECORE_GGML_REPACK_DEFAULT ${DENSECORE_GGML_CPU_FEATURES_DEFAULT})
+if(DENSECORE_TARGET_C4A AND NOT DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+    set(DENSECORE_GGML_REPACK_DEFAULT ON)
+endif()
 if(NOT DEFINED GGML_LLAMAFILE)
     set(GGML_LLAMAFILE ${DENSECORE_GGML_CPU_FEATURES_DEFAULT} CACHE BOOL "Enable ggml llamafile kernels")
 endif()
 if(NOT DEFINED GGML_CPU_REPACK)
-    set(GGML_CPU_REPACK ${DENSECORE_GGML_CPU_FEATURES_DEFAULT} CACHE BOOL "Enable ggml runtime repack kernels")
+    set(GGML_CPU_REPACK ${DENSECORE_GGML_REPACK_DEFAULT} CACHE BOOL "Enable ggml runtime repack kernels")
 endif()
 set(DENSECORE_CAN_USE_KLEIDIAI OFF)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND NOT DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
@@ -1391,5 +1395,6 @@ message(STATUS "GGML_CPU_REPACK: ${GGML_CPU_REPACK}")
 message(STATUS "GGML_CPU_KLEIDIAI: ${GGML_CPU_KLEIDIAI}")
 message(STATUS "C4A performance configure: cmake -S core -B build-c4a -DCMAKE_BUILD_TYPE=Release "
                "-DDENSECORE_TARGET_C4A=ON -DDENSECORE_ARM_CORRECTNESS_FIRST=OFF "
+               "-DGGML_CPU_REPACK=ON -DGGML_LLAMAFILE=OFF "
                "-DDENSECORE_BUILD_TESTS=ON -DDENSECORE_BUILD_BENCHMARKS=ON")
 message(STATUS "==========================================")

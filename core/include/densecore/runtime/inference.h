@@ -411,10 +411,6 @@ struct Qwen36ProfileSnapshot {
     uint64_t gemma4_dense_prefill_native_ns = 0;
     uint64_t gemma4_dense_prefill_replaced_ggml_mul_mat_ops = 0;
     uint64_t gemma4_dense_prefill_duplicate_work_detected = 0;
-    uint64_t gemma4_fast_gelu_enabled = 0;
-    uint64_t gemma4_fast_gelu_used = 0;
-    uint64_t gemma4_fast_gelu_ns = 0;
-    uint64_t gemma4_native_moe_prefill_gate_up_fast_gelu_ns = 0;
     uint64_t gemma4_decode_native_candidate_ops = 0;
     uint64_t gemma4_decode_native_used_ops = 0;
     uint64_t gemma4_decode_native_rejected_ops = 0;
@@ -541,7 +537,6 @@ void RecordGemma4DensePrefillNativeDecision(InferenceWorkContext* ctx, bool cand
                                             const char* reject_reason, ggml_type weight_type,
                                             uint64_t replaced_mul_mat_ops, bool duplicate_work_detected);
 void RecordGemma4DensePrefillNativeTiming(InferenceWorkContext* ctx, uint64_t wall_ns);
-void RecordGemma4FastGeluDecision(InferenceWorkContext* ctx, bool enabled, bool used, uint64_t wall_ns);
 void RecordGemma4DecodeNativeDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,
                                       bool moe_used, bool dense_used, bool lm_head_used, uint64_t wall_ns,
                                       uint64_t replaced_mul_mat_ops, uint64_t replaced_mul_mat_id_ops,
@@ -565,7 +560,8 @@ void RecordNativeMoEFastDecodeDecision(InferenceWorkContext* ctx, bool candidate
 void RecordNativeMoEFastW2Q5KDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,
                                       uint64_t wall_ns = 0);
 void RecordQwen35MoEGraphPath(InferenceWorkContext* ctx, const char* path, int top_k, int selected_expert_count,
-                              ggml_type w1w3_type, ggml_type w2_type);
+                              int task_count, ggml_type w1w3_type, ggml_type w2_type);
+void RecordNativeMoEGraphCallbackExecution(InferenceWorkContext* ctx, int selected_expert_count, int task_count);
 const char* Q4KRepackedGemvRejectReasonName(int reason);
 const char* Q6KGemvRejectReasonName(int reason);
 const char* Qwen35MoEPathName(int code);

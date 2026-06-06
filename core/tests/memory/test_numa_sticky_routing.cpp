@@ -83,6 +83,35 @@ bool RunQwen35NativeMoEQ5KFusedSwiGLURowsForTest(const void* gate_rows, const vo
 
 namespace {
 
+class ScopedEnvOverride {
+public:
+    ScopedEnvOverride(const char* name, const char* value) : name_(name ? name : "") {
+        const char* previous = std::getenv(name_.c_str());
+        if (previous) {
+            had_previous_ = true;
+            previous_ = previous;
+        }
+        if (value) {
+            setenv(name_.c_str(), value, 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+    ~ScopedEnvOverride() {
+        if (had_previous_) {
+            setenv(name_.c_str(), previous_.c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+private:
+    std::string name_;
+    bool had_previous_ = false;
+    std::string previous_;
+};
+
 uint8_t PackSignedInt4(int8_t low, int8_t high) {
     return static_cast<uint8_t>((low & 0x0F) | ((high & 0x0F) << 4));
 }
@@ -2744,6 +2773,10 @@ TEST(NumaStickyRouting, Gemma4RunsDenseMlpBranchWithoutSharedExpertMetadata) {
     gemma4.moe_n_shared_experts = 0;
 
     EXPECT_TRUE(densecore::testing::ShouldRunMoESharedDenseBranchForTest(&gemma4, true, gate, up, down));
+    {
+        ScopedEnvOverride legacy_disable("DENSECORE_GEMMA4_DISABLE_SHARED_DENSE_BRANCH", "1");
+        EXPECT_TRUE(densecore::testing::ShouldRunMoESharedDenseBranchForTest(&gemma4, true, gate, up, down));
+    }
 
     TransformerModel qwen{};
     qwen.arch = ModelArch::QWEN35;

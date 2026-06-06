@@ -82,7 +82,7 @@ TEST(BuildTransformerGraphDispatchTest, Gemma4SelectsInlineSlidingSharedKvRoute)
     EXPECT_TRUE(plan.selected_builder_name.empty());
 }
 
-TEST(BuildTransformerGraphDispatchTest, Gemma4GraphCapabilitiesUseEnvResolvedDecoderSpecSemantics) {
+TEST(BuildTransformerGraphDispatchTest, Gemma4GraphCapabilitiesUseMaintainedDecoderSpecSemantics) {
     ScopedEnvOverride disable_sliding("DENSECORE_GEMMA4_DISABLE_SLIDING_WINDOW", "1");
     ScopedEnvOverride disable_shared_kv("DENSECORE_GEMMA4_DISABLE_SHARED_KV", "1");
 
@@ -97,10 +97,10 @@ TEST(BuildTransformerGraphDispatchTest, Gemma4GraphCapabilitiesUseEnvResolvedDec
     const auto spec = densecore::models::BuildDecoderModelSpec(&model);
     const auto capabilities = densecore::models::ResolveModelGraphCapabilities(&model);
 
-    EXPECT_FALSE(spec.has_sliding_window_attention);
-    EXPECT_FALSE(spec.has_shared_kv);
-    EXPECT_FALSE(capabilities.has_sliding_window_attention);
-    EXPECT_FALSE(capabilities.has_shared_kv_source);
+    EXPECT_TRUE(spec.has_sliding_window_attention);
+    EXPECT_TRUE(spec.has_shared_kv);
+    EXPECT_TRUE(capabilities.has_sliding_window_attention);
+    EXPECT_TRUE(capabilities.has_shared_kv_source);
 }
 
 TEST(BuildTransformerGraphDispatchTest, ExecutionPlanFollowsAttachedDecoderSpecBeforeRawArchDefaults) {

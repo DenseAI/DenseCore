@@ -50,7 +50,8 @@ struct ggml_tensor* ExecutePagedDecodeAttentionPath(struct ggml_context* ctx_c, 
                                                     int kv_cache_layer, bool gemma4_shared_kv_layer,
                                                     bool gemma4_shared_kv_source_layer, int head_dim_q, int head_dim_v,
                                                     int n_head, int n_head_kv, int n_total_tokens,
-                                                    float fast_attn_logit_softcap, bool use_explicit_attention_scale);
+                                                    int fast_attn_sliding_window, float fast_attn_logit_softcap,
+                                                    bool use_explicit_attention_scale);
 struct ggml_tensor* ExecuteHalAttentionPath(struct ggml_context* ctx_c, TransformerModel* model,
                                             struct ggml_tensor* Qcur, struct ggml_tensor* K, struct ggml_tensor* V,
                                             int il, int n_tokens, int head_dim_q, int n_head_kv,

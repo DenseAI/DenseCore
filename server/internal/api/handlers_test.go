@@ -787,6 +787,36 @@ func TestSplitReasoningResponseLFM2ExtractsGeneratedAnswerOnlySpan(t *testing.T)
 	}
 }
 
+func TestSplitReasoningResponseLFM2CanonicalizesGeneratedExactAnswer(t *testing.T) {
+	req := domain.ChatCompletionRequest{
+		Messages: []domain.Message{{
+			Role:    "user",
+			Content: "Final question: What is the verification key?\nFinal response: cedar-owl-742",
+		}},
+	}
+	content, reasoning := splitReasoningResponse(
+		req,
+		"lfm2",
+		"<think>\nThe verification key is cedar owl 742, so I should provide it.",
+	)
+	if content != "cedar-owl-742" || reasoning != "" {
+		t.Fatalf("expected generated exact answer to be canonicalized, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitReasoningResponseLFM2DoesNotSynthesizeMissingExactAnswer(t *testing.T) {
+	req := domain.ChatCompletionRequest{
+		Messages: []domain.Message{{
+			Role:    "user",
+			Content: "Final question: What is the verification key?\nFinal response: cedar-owl-742",
+		}},
+	}
+	content, reasoning := splitReasoningResponse(req, "lfm2", "<think>\nStill working through the prompt.")
+	if content != "" || reasoning != "" {
+		t.Fatalf("expected no synthesized exact answer, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
 func TestLFM2StreamFilterDropsLeadingUserRequestPrelude(t *testing.T) {
 	filter := newLFM2StreamFilter("")
 	if got := filter.Filter("Your request"); got != "" {

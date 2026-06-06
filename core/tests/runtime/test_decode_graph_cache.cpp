@@ -373,22 +373,15 @@ TEST(DecodeGraphCachePolicyTest, Gemma4ModelsUseDecodeGraphCacheOncePagedDecodeI
     model.arch = ModelArch::GEMMA;
     model.arch_flags.is_gemma4 = true;
 
-    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", nullptr);
     ScopedEnvOverride gemma_cache_env("DENSECORE_GEMMA4_DECODE_GRAPH_CACHE", nullptr);
     EXPECT_TRUE(IsDecodeGraphCacheSafeForModel(&model));
     EXPECT_FALSE(DoesDecodeGraphCacheRequireRuntimeRebind(&model));
-
-    ScopedEnvOverride dense_baseline_env("DENSECORE_GEMMA4_FORCE_DENSE_BASELINE", "1");
-    EXPECT_FALSE(IsDecodeGraphCacheSafeForModel(&model));
 }
 
-TEST(DecodeGraphCachePolicyTest, Gemma4AllLayerPagedDecodeCanAdmitGraphCache) {
+TEST(DecodeGraphCachePolicyTest, Gemma4PagedDecodeAdmitsGraphCacheWithoutEnvOverride) {
     TransformerModel model{};
     model.arch = ModelArch::GEMMA;
     model.arch_flags.is_gemma4 = true;
-
-    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "1");
-    ScopedEnvOverride gemma_layer_mode_env("DENSECORE_GEMMA4_PAGED_DECODE_LAYER_MODE", "all");
 
     EXPECT_TRUE(IsDecodeGraphCacheSafeForModel(&model));
 }
@@ -416,26 +409,17 @@ bool ShouldUsePagedDecodeAttentionForTestBatch(const TransformerModel* model, in
 TEST(DecodeGraphCachePolicyTest, Gemma4PagedDecodeSupportIsEnabledByDefault) {
     const TransformerModel gemma4 = MakeDecodeModel(true);
     const TransformerModel llama = MakeDecodeModel(false);
-    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", nullptr);
 
     EXPECT_TRUE(densecore::models::SupportsPagedDecodeAttention(&gemma4));
     EXPECT_TRUE(densecore::models::SupportsPagedDecodeAttention(&llama));
 }
 
-TEST(DecodeGraphCachePolicyTest, Gemma4PagedDecodeSupportCanBeQualifiedByEnv) {
+TEST(DecodeGraphCachePolicyTest, Gemma4PagedDecodeSupportIgnoresLegacyDisableEnv) {
     const TransformerModel gemma4 = MakeDecodeModel(true);
-    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "1");
-    ScopedEnvOverride dense_baseline_env("DENSECORE_GEMMA4_FORCE_DENSE_BASELINE", nullptr);
-
-    EXPECT_TRUE(densecore::models::SupportsPagedDecodeAttention(&gemma4));
-}
-
-TEST(DecodeGraphCachePolicyTest, Gemma4DenseBaselineEscapeHatchDisablesPagedDecode) {
-    const TransformerModel gemma4 = MakeDecodeModel(true);
-    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "1");
+    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "0");
     ScopedEnvOverride dense_baseline_env("DENSECORE_GEMMA4_FORCE_DENSE_BASELINE", "1");
 
-    EXPECT_FALSE(densecore::models::SupportsPagedDecodeAttention(&gemma4));
+    EXPECT_TRUE(densecore::models::SupportsPagedDecodeAttention(&gemma4));
 }
 
 TEST(DecodeGraphCachePolicyTest, Gemma4BatchedDecodeTopologyIsStableByDefault) {
@@ -444,18 +428,16 @@ TEST(DecodeGraphCachePolicyTest, Gemma4BatchedDecodeTopologyIsStableByDefault) {
     PagedKVCache cache{};
     cache.cache_type = GGML_TYPE_F16;
     cache.max_blocks = 8;
-    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", nullptr);
 
     EXPECT_TRUE(IsStablePagedDecodeTopologyForCache(&gemma4, &cache, batch));
 }
 
-TEST(DecodeGraphCachePolicyTest, Gemma4BatchedDecodeTopologyCanUsePagedDecodeWhenQualified) {
+TEST(DecodeGraphCachePolicyTest, Gemma4BatchedDecodeTopologyUsesMaintainedPagedDecode) {
     const TransformerModel gemma4 = MakeDecodeModel(true);
     const BatchSpec batch = MakeDecodeOnlyBatch(/*num_seqs=*/2, /*n_past=*/BLOCK_SIZE);
     PagedKVCache cache{};
     cache.cache_type = GGML_TYPE_F16;
     cache.max_blocks = 8;
-    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "1");
 
     EXPECT_TRUE(IsStablePagedDecodeTopologyForCache(&gemma4, &cache, batch));
 }
@@ -468,34 +450,24 @@ TEST(DecodeGraphCachePolicyTest, Gemma4LayerHeadKvPatternCanStillUseStablePagedD
     PagedKVCache cache{};
     cache.cache_type = GGML_TYPE_F16;
     cache.max_blocks = 8;
-    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "1");
 
     EXPECT_TRUE(IsStablePagedDecodeTopologyForCache(&gemma4, &cache, batch));
 }
 
 TEST(DecodeGraphCachePolicyTest, Gemma4InferenceDecisionUsesPagedDecodeByDefault) {
     const TransformerModel gemma4 = MakeDecodeModel(true);
-    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", nullptr);
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", nullptr);
 
     EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&gemma4));
 }
 
-TEST(DecodeGraphCachePolicyTest, Gemma4InferenceDecisionCanUsePagedDecodeWhenQualified) {
+TEST(DecodeGraphCachePolicyTest, Gemma4InferenceDecisionUsesMaintainedPagedDecodeDespiteLegacyEnv) {
     const TransformerModel gemma4 = MakeDecodeModel(true);
-    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "1");
-    ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", nullptr);
-
-    EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&gemma4));
-}
-
-TEST(DecodeGraphCachePolicyTest, Gemma4InferenceDecisionCanFallBackToDenseBaselineEscapeHatch) {
-    const TransformerModel gemma4 = MakeDecodeModel(true);
-    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "1");
+    ScopedEnvOverride gemma_paged_env("DENSECORE_GEMMA4_ENABLE_PAGED_DECODE", "0");
     ScopedEnvOverride dense_baseline_env("DENSECORE_GEMMA4_FORCE_DENSE_BASELINE", "1");
     ScopedEnvOverride min_ctx_env("DENSECORE_PAGED_DECODE_MIN_CONTEXT", nullptr);
 
-    EXPECT_FALSE(ShouldUsePagedDecodeAttentionForTestBatch(&gemma4));
+    EXPECT_TRUE(ShouldUsePagedDecodeAttentionForTestBatch(&gemma4));
 }
 
 TEST(DecodeGraphCachePolicyTest, NonGemmaBatchedDecodeTopologyRemainsStablePagedDecode) {

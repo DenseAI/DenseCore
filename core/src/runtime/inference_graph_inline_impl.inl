@@ -1820,7 +1820,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     KQV = ExecutePagedDecodeAttentionPath(ctx_c, model, cache, Qcur, Kcur, Vcur, il, kv_cache_layer,
                                                           gemma4_shared_kv_layer, gemma4_shared_kv_source_layer,
                                                           head_dim_q, head_dim_v, n_head, n_head_kv, n_total_tokens,
-                                                          fast_attn_logit_softcap, use_explicit_attention_scale);
+                                                          fast_attn_sliding_window, fast_attn_logit_softcap,
+                                                          use_explicit_attention_scale);
                 } else if (attention_dispatch.use_hal_attention_dispatch) {
                     KQV = ExecuteHalAttentionPath(ctx_c, model, Qcur, K, V, il, N, head_dim_q, n_head_kv,
                                                   fast_attn_sliding_window, fast_attn_logit_softcap,
@@ -2335,7 +2336,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     ggml_tensor* gate_exps = GetLayerTensorAny(&model->layers[il], {"ffn_gate_exps.weight", "ffn_gate_exps"});
                     ggml_tensor* down_exps =
                         GetLayerTensorAny(&model->layers[il], {"ffn_down_exps.weight", "ffn_down_exps"});
-                    RecordQwen35MoEGraphPath(GetCurrentWorkContext(), "cb_moe_forward", moe_top_k, moe_top_k,
+                    RecordQwen35MoEGraphPath(GetCurrentWorkContext(), "cb_moe_forward", moe_top_k, moe_top_k, 0,
                                              gate_exps ? gate_exps->type : GGML_TYPE_COUNT,
                                              down_exps ? down_exps->type : GGML_TYPE_COUNT);
                 }
@@ -2378,13 +2379,11 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 #endif
                 struct ggml_tensor* shared_gate = nullptr;
                 struct ggml_tensor* shared_up = nullptr;
-                const bool use_prefill_fused_shared_ffn =
-                    GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill;
+                struct ggml_tensor* shared_gate_up = nullptr;
                 struct ggml_tensor* shared_gate_up_fused =
                     ((is_gemma4_moe || model->variant == ModelVariant::QWEN35 ||
                       model->variant == ModelVariant::QWEN36) &&
-                     !prefer_plain_shared_expert_matmul && shared_input->type == GGML_TYPE_F32 &&
-                     (!is_gemma4_moe || use_prefill_fused_shared_ffn))
+                     !prefer_plain_shared_expert_matmul && shared_input->type == GGML_TYPE_F32)
                         ? layer.Get("ffn_gate_up.cpu_repack_fused")
                         : nullptr;
                 if (shared_gate_up_fused &&
@@ -2393,7 +2392,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                     shared_gate_up_fused = nullptr;
                 }
                 if (shared_gate_up_fused) {
-                    struct ggml_tensor* shared_gate_up = ggml_mul_mat(ctx_c, shared_gate_up_fused, shared_input);
+                    shared_gate_up = ggml_mul_mat(ctx_c, shared_gate_up_fused, shared_input);
                     char fused_name[96];
                     std::snprintf(fused_name, sizeof(fused_name), "blk.%d.shared_ffn_gate_up.cpu_repack_fused", il);
                     ggml_set_name(shared_gate_up, fused_name);
@@ -2558,10 +2557,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 #if defined(__aarch64__) || defined(_M_ARM64)
             const bool qwen35_hybrid_ffn =
                 model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
-            const bool prefer_plain_qwen35_hybrid_ffn_down = qwen35_hybrid_ffn && ffn_down->type != GGML_TYPE_Q5_K;
             const bool prefer_separate_qwen35_hybrid_ffn_gate_up = qwen35_hybrid_ffn && cur->ne[1] > 1;
 #else
-            const bool prefer_plain_qwen35_hybrid_ffn_down = false;
             const bool prefer_separate_qwen35_hybrid_ffn_gate_up = false;
 #endif
             struct ggml_tensor* w1 = nullptr;
@@ -2667,15 +2664,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // Apply Multi-LoRA [FFN Down]
             struct ggml_tensor* ffn_input = cur;
-            if (prefer_plain_qwen35_hybrid_ffn_down) {
-                RecordQwenTargetGgmlComputeFallback(GetCurrentWorkContext(), model,
-                                                    densecore::runtime::GgmlComputeOp::Matmul,
-                                                    "qwen35_hybrid_dense_ffn_down_plain_ggml", ffn_down->name,
-                                                    GetCurrentExecutionPhase());
-                cur = ggml_mul_mat(ctx_c, ffn_down, cur);
-            } else {
-                cur = smart_mul_mat(ctx_c, ffn_down, cur, model);
-            }
+            cur = smart_mul_mat(ctx_c, ffn_down, cur, model);
             if (ShouldRunFfnProjectionReferenceProbe(il)) {
                 ProjectionReferenceUserData* down_ref_ud = GetProjectionReferenceUserData();
                 down_ref_ud->weight_tensor = ffn_down;
@@ -3021,14 +3010,6 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         final_ref_ud->stage = "lm_head";
         final_ref_ud->var_name = "logits";
         cur = ggml_map_custom1(ctx_c, cur, cb_projection_reference_probe, 1, final_ref_ud);
-    }
-    if (model->arch_flags.is_gemma4 && model->gemma4_final_logit_softcapping > 0.0f &&
-        !densecore::models::IsGemma4FinalLogitSoftcapDisabled() &&
-        std::getenv("DENSECORE_GEMMA4_GRAPH_FINAL_LOGIT_SOFTCAP") != nullptr) {
-        const float inv_softcap = 1.0f / model->gemma4_final_logit_softcapping;
-        cur = ggml_scale(ctx_c, cur, inv_softcap);
-        cur = ggml_tanh(ctx_c, cur);
-        cur = ggml_scale(ctx_c, cur, model->gemma4_final_logit_softcapping);
     }
     ggml_set_name(cur, "output");
 

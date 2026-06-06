@@ -553,10 +553,6 @@ struct Request {
     uint64_t gemma4_dense_prefill_native_ns = 0;
     uint64_t gemma4_dense_prefill_replaced_ggml_mul_mat_ops = 0;
     uint64_t gemma4_dense_prefill_duplicate_work_detected = 0;
-    uint64_t gemma4_fast_gelu_enabled = 0;
-    uint64_t gemma4_fast_gelu_used = 0;
-    uint64_t gemma4_fast_gelu_ns = 0;
-    uint64_t gemma4_native_moe_prefill_gate_up_fast_gelu_ns = 0;
     uint64_t gemma4_decode_native_candidate_ops = 0;
     uint64_t gemma4_decode_native_used_ops = 0;
     uint64_t gemma4_decode_native_rejected_ops = 0;
@@ -986,10 +982,6 @@ struct Request {
         gemma4_dense_prefill_native_ns = 0;
         gemma4_dense_prefill_replaced_ggml_mul_mat_ops = 0;
         gemma4_dense_prefill_duplicate_work_detected = 0;
-        gemma4_fast_gelu_enabled = 0;
-        gemma4_fast_gelu_used = 0;
-        gemma4_fast_gelu_ns = 0;
-        gemma4_native_moe_prefill_gate_up_fast_gelu_ns = 0;
         gemma4_decode_native_candidate_ops = 0;
         gemma4_decode_native_used_ops = 0;
         gemma4_decode_native_rejected_ops = 0;

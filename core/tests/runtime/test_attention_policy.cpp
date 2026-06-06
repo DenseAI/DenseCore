@@ -6,6 +6,7 @@
 
 #include "densecore/models/decoder_model_spec.h"
 #include "densecore/models/model_descriptor.h"
+#include "densecore/runtime/inference.h"
 #include "densecore/simd/simd_ops.h"
 #include "llm/attention/internal.h"
 #include "runtime/runtime_env.h"
@@ -14,6 +15,8 @@ namespace densecore {
 namespace testing {
 extern struct ggml_tensor* SmartMulMatTest(struct ggml_context* ctx, struct ggml_tensor* weight,
                                            struct ggml_tensor* input, TransformerModel* model);
+extern struct ggml_tensor* SmartMulMatWithPhaseTest(struct ggml_context* ctx, struct ggml_tensor* weight,
+                                                   struct ggml_tensor* input, TransformerModel* model, int phase);
 extern bool ShouldUsePrefillLastLogitsOnlyForTest(const TransformerModel* model, int num_seqs, int n_tokens);
 extern int ResolveQuantBatchedTileColsForTest(int requested_cols, int vec_dot_nrows, bool allow_true_batched_q4k);
 extern bool ResolveQ4KTrueBatchedKernelPolicyForTest(int simd_level, bool compiled_with_sve);
@@ -134,20 +137,11 @@ TEST(AttentionPolicyTest, PagedFallbackReasonNameMatchesPolicyOff) {
                  "policy_off");
 }
 
-TEST(AttentionPolicyTest, Gemma4PagedDecodeDefaultsToAllLayers) {
-    ScopedEnvOverride layer_mode("DENSECORE_GEMMA4_PAGED_DECODE_LAYER_MODE", nullptr);
+TEST(AttentionPolicyTest, Gemma4PagedDecodeUsesSlidingLayersOnly) {
     const TransformerModel gemma4 = MakeGemma4LayerPolicyModel();
 
     EXPECT_TRUE(ResolveLayerDispatch(gemma4, 0).use_paged_decode_attention);
-    EXPECT_TRUE(ResolveLayerDispatch(gemma4, 1).use_paged_decode_attention);
-}
-
-TEST(AttentionPolicyTest, Gemma4PagedDecodeLayerModeAllUsesEveryLayer) {
-    ScopedEnvOverride layer_mode("DENSECORE_GEMMA4_PAGED_DECODE_LAYER_MODE", "all");
-    const TransformerModel gemma4 = MakeGemma4LayerPolicyModel();
-
-    EXPECT_TRUE(ResolveLayerDispatch(gemma4, 0).use_paged_decode_attention);
-    EXPECT_TRUE(ResolveLayerDispatch(gemma4, 1).use_paged_decode_attention);
+    EXPECT_FALSE(ResolveLayerDispatch(gemma4, 1).use_paged_decode_attention);
 }
 
 TEST(AttentionPolicyTest, BaseDecisionRejectsInvalidDecodeLayout) {
@@ -258,6 +252,85 @@ TEST(AttentionPolicyTest, Gemma4QuantizedPrefillProjectionUsesNativeGgml) {
     ggml_tensor* result = densecore::testing::SmartMulMatTest(ctx, weight, input, &gemma4);
     ASSERT_NE(result, nullptr);
     EXPECT_EQ(result->op, GGML_OP_MUL_MAT);
+
+    ggml_free(ctx);
+}
+
+TEST(AttentionPolicyTest, Gemma4F32RouterPrefillUsesCustomBatchedPath) {
+    ggml_init_params params{};
+    params.mem_size = 32 * 1024 * 1024;
+    params.no_alloc = false;
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    TransformerModel gemma4 = MakeModel(ModelArch::GEMMA, true);
+    ggml_tensor* weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, /*ne0=*/2816, /*ne1=*/128);
+    ASSERT_NE(weight, nullptr);
+    ggml_set_name(weight, "blk.0.ffn_gate_inp.weight");
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, /*ne0=*/2816, /*ne1=*/512);
+    ASSERT_NE(input, nullptr);
+
+    ggml_tensor* result = densecore::testing::SmartMulMatWithPhaseTest(
+        ctx, weight, input, &gemma4, static_cast<int>(InferenceExecutionPhase::Prefill));
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->op, GGML_OP_CUSTOM);
+
+    ggml_free(ctx);
+}
+
+TEST(AttentionPolicyTest, Gemma4Q8PrefillCpuRepackAliasUsesRawCustomBatchedPath) {
+    ggml_init_params params{};
+    params.mem_size = 32 * 1024 * 1024;
+    params.no_alloc = false;
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    TransformerModel gemma4 = MakeModel(ModelArch::GEMMA, true);
+    ggml_tensor* original = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, /*ne0=*/2816, /*ne1=*/1024);
+    ASSERT_NE(original, nullptr);
+    ggml_set_name(original, "blk.0.attn_k.weight");
+    ggml_tensor* alias = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, /*ne0=*/2816, /*ne1=*/1024);
+    ASSERT_NE(alias, nullptr);
+    ggml_set_name(alias, "blk.0.attn_k.weight.cpu_repack_2d");
+    gemma4.cpu_repack_aliases[original] = alias;
+
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, /*ne0=*/2816, /*ne1=*/512);
+    ASSERT_NE(input, nullptr);
+
+    ggml_tensor* result = densecore::testing::SmartMulMatWithPhaseTest(
+        ctx, original, input, &gemma4, static_cast<int>(InferenceExecutionPhase::Prefill));
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->op, GGML_OP_CUSTOM);
+    EXPECT_EQ(result->src[1], original);
+
+    ggml_free(ctx);
+}
+
+TEST(AttentionPolicyTest, Gemma4Q8DecodeCpuRepackAliasUsesRawCustomGemvPath) {
+    ggml_init_params params{};
+    params.mem_size = 32 * 1024 * 1024;
+    params.no_alloc = false;
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    TransformerModel gemma4 = MakeModel(ModelArch::GEMMA, true);
+    ggml_tensor* original = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, /*ne0=*/2112, /*ne1=*/2816);
+    ASSERT_NE(original, nullptr);
+    ggml_set_name(original, "blk.0.ffn_down.weight");
+    ggml_tensor* alias = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, /*ne0=*/2112, /*ne1=*/2816);
+    ASSERT_NE(alias, nullptr);
+    ggml_set_name(alias, "blk.0.ffn_down.weight.cpu_repack_2d");
+    gemma4.cpu_decode_repack_aliases[original] = alias;
+    gemma4.cpu_repack_aliases[original] = alias;
+
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, /*ne0=*/2112, /*ne1=*/1);
+    ASSERT_NE(input, nullptr);
+
+    ggml_tensor* result = densecore::testing::SmartMulMatWithPhaseTest(
+        ctx, original, input, &gemma4, static_cast<int>(InferenceExecutionPhase::Decode));
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->op, GGML_OP_CUSTOM);
+    EXPECT_EQ(result->src[1], original);
 
     ggml_free(ctx);
 }

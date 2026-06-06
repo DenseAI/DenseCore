@@ -544,37 +544,6 @@ TEST(Gemma4FallbackDecodeTest, SlidingWindowDecodeMasksRetainedHistoryInStandard
     EXPECT_GT(std::fabs(unmasked[0] - runtime[0]), 100.0f);
 }
 
-TEST(Gemma4FallbackDecodeTest, GraphLevelDecodeFallbackRespectsSlidingMask) {
-    ScopedFlashAttentionDisableForTest flash_guard;
-    ScopedEnvOverride paged_decode_mode("DENSECORE_GEMMA4_PAGED_DECODE_LAYER_MODE", "off");
-    auto masked_model = MakeSlidingDecodeGraphModel(/*sliding_enabled=*/true);
-    auto full_model = MakeSlidingDecodeGraphModel(/*sliding_enabled=*/false);
-    auto masked_cache = MakeTinyGraphCache(masked_model.get());
-    auto full_cache = MakeTinyGraphCache(full_model.get());
-    ASSERT_NE(masked_cache, nullptr);
-    ASSERT_NE(full_cache, nullptr);
-
-    const int masked_block = masked_cache->block_manager->AllocateSingle();
-    const int full_block = full_cache->block_manager->AllocateSingle();
-    ASSERT_GE(masked_block, 0);
-    ASSERT_GE(full_block, 0);
-
-    const std::vector<SlotVec> history_k = {{{10.0f, 0.0f}}, {{10.0f, 0.0f}}, {{0.0f, 0.0f}}, {{0.0f, 0.0f}}};
-    const std::vector<SlotVec> history_v = {{{100.0f, 0.0f}}, {{0.0f, 100.0f}}, {{0.0f, 1.0f}}, {{0.0f, 0.0f}}};
-    WriteLayerSlots(masked_cache.get(), /*layer=*/0, masked_block, history_k, history_v);
-    WriteLayerSlots(full_cache.get(), /*layer=*/0, full_block, history_k, history_v);
-
-    const std::vector<float> masked_logits =
-        RunDecodeAttentionGraph(masked_model.get(), masked_cache.get(), masked_block, /*target_layer=*/0);
-    const std::vector<float> full_logits =
-        RunDecodeAttentionGraph(full_model.get(), full_cache.get(), full_block, /*target_layer=*/0);
-    ASSERT_EQ(masked_logits.size(), 2u);
-    ASSERT_EQ(full_logits.size(), 2u);
-    EXPECT_GT(L1Diff(masked_logits, full_logits), 40.0f);
-    EXPECT_GT(masked_logits[0], 40.0f);
-    EXPECT_LT(full_logits[0], 1.0f);
-}
-
 TEST(Gemma4FallbackDecodeTest, PagedDecodeSlidingLayerProducesFiniteAttentionOutput) {
     ScopedFlashAttentionDisableForTest flash_guard;
     auto model = MakeSlidingDecodeGraphModel(/*sliding_enabled=*/true);
