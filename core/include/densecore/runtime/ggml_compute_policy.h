@@ -102,8 +102,21 @@ struct QwenHotPathPlan {
     bool hybrid_ssm_lane = false;
 };
 
+struct TargetFastPathPlan {
+    ModelVariant variant = ModelVariant::UNKNOWN;
+    bool target_model = false;
+    bool qwen_target = false;
+    bool gemma4_target = false;
+    bool lfm2_target = false;
+    bool dense_lane = false;
+    bool moe_lane = false;
+    bool hybrid_ssm_lane = false;
+    bool lfm2_shortconv_lane = false;
+};
+
 struct DenseCoreMatmulPlan {
     QwenHotPathPlan qwen;
+    TargetFastPathPlan target;
     ModelVariant variant = ModelVariant::UNKNOWN;
     ggml_type weight_type = GGML_TYPE_COUNT;
     ggml_type input_type = GGML_TYPE_COUNT;
@@ -116,6 +129,7 @@ struct DenseCoreMatmulPlan {
     bool compatible = false;
     bool quantized_weight = false;
     bool target_qwen_hot_path = false;
+    bool target_fallback_free_path = false;
 };
 
 struct KernelResolution {
@@ -194,6 +208,11 @@ inline bool IsQwenTargetVariant(ModelVariant variant) {
     return variant == ModelVariant::QWEN35 || variant == ModelVariant::QWEN36;
 }
 
+inline bool IsDenseCoreFallbackFreeTargetVariant(ModelVariant variant) {
+    return variant == ModelVariant::QWEN35 || variant == ModelVariant::QWEN36 ||
+           variant == ModelVariant::GEMMA4 || variant == ModelVariant::LFM2MOE;
+}
+
 inline QwenHotPathPlan ResolveQwenHotPathPlan(const TransformerModel* model) {
     QwenHotPathPlan plan;
     if (!model) {
@@ -204,6 +223,26 @@ inline QwenHotPathPlan ResolveQwenHotPathPlan(const TransformerModel* model) {
     plan.dense_lane = plan.target_model && model->hparams.n_experts == 0 && !model->arch_flags.is_hybrid_ssm;
     plan.moe_lane = plan.target_model && model->hparams.n_experts > 0;
     plan.hybrid_ssm_lane = plan.target_model && model->arch_flags.is_hybrid_ssm;
+    return plan;
+}
+
+inline TargetFastPathPlan ResolveTargetFastPathPlan(const TransformerModel* model) {
+    TargetFastPathPlan plan;
+    if (!model) {
+        return plan;
+    }
+    plan.variant = model->variant;
+    plan.qwen_target = IsQwenTargetVariant(model->variant) ||
+                       (model->arch == ModelArch::QWEN35 && model->arch_flags.is_hybrid_ssm);
+    plan.gemma4_target = model->variant == ModelVariant::GEMMA4 || model->arch_flags.is_gemma4;
+    plan.lfm2_target = model->variant == ModelVariant::LFM2MOE || model->arch_flags.is_lfm2_shortconv;
+    plan.target_model = IsDenseCoreFallbackFreeTargetVariant(model->variant) || plan.qwen_target ||
+                        plan.gemma4_target || plan.lfm2_target;
+    plan.dense_lane = plan.target_model && model->hparams.n_experts == 0 && !model->arch_flags.is_hybrid_ssm &&
+                      !model->arch_flags.is_lfm2_shortconv;
+    plan.moe_lane = plan.target_model && model->hparams.n_experts > 0;
+    plan.hybrid_ssm_lane = plan.qwen_target && model->arch_flags.is_hybrid_ssm;
+    plan.lfm2_shortconv_lane = plan.lfm2_target && model->arch_flags.is_lfm2_shortconv;
     return plan;
 }
 
@@ -218,6 +257,28 @@ inline const char* QwenHotPathTargetLabel(const QwenHotPathPlan& plan) {
         return "qwen35_35b_a3b";
     }
     return "qwen35_9b_dense";
+}
+
+inline const char* TargetFastPathLabel(const TargetFastPathPlan& plan) {
+    if (!plan.target_model) {
+        return "compatibility_model";
+    }
+    if (plan.qwen_target) {
+        QwenHotPathPlan qwen;
+        qwen.variant = plan.variant;
+        qwen.target_model = true;
+        qwen.dense_lane = plan.dense_lane;
+        qwen.moe_lane = plan.moe_lane;
+        qwen.hybrid_ssm_lane = plan.hybrid_ssm_lane;
+        return QwenHotPathTargetLabel(qwen);
+    }
+    if (plan.gemma4_target) {
+        return "gemma4_26b_a4b";
+    }
+    if (plan.lfm2_target) {
+        return "lfm2_8b_a1b";
+    }
+    return "fallback_free_target";
 }
 
 inline const char* DenseCoreKernelFamilyName(DenseCoreKernelFamily family) {
@@ -355,6 +416,7 @@ inline DenseCoreMatmulPlan ResolveDenseCoreMatmulPlan(const TransformerModel* mo
                                                       bool is_lm_head, bool compatible) {
     DenseCoreMatmulPlan plan;
     plan.qwen = ResolveQwenHotPathPlan(model);
+    plan.target = ResolveTargetFastPathPlan(model);
     plan.variant = model ? model->variant : ModelVariant::UNKNOWN;
     plan.weight_type = weight_type;
     plan.input_type = input_type;
@@ -366,6 +428,7 @@ inline DenseCoreMatmulPlan ResolveDenseCoreMatmulPlan(const TransformerModel* mo
     plan.compatible = compatible;
     plan.quantized_weight = ggml_is_quantized(weight_type);
     plan.target_qwen_hot_path = plan.qwen.target_model;
+    plan.target_fallback_free_path = plan.target.target_model;
 
     if (!compatible || input_type != GGML_TYPE_F32) {
         plan.kernel = DenseCoreKernelFamily::TemporaryReferenceGgml;
@@ -430,8 +493,9 @@ inline KernelResolution ResolveKernelResolution(const TransformerModel* model, g
     resolution.fallback_policy =
         has_fallback_policy_override
             ? fallback_policy_override
-            : (resolution.matmul_plan.target_qwen_hot_path ? DenseCoreFallbackPolicyKind::FallbackFreeTarget
-                                                           : DenseCoreFallbackPolicyKind::CompatibilityFallback);
+            : (resolution.matmul_plan.target_fallback_free_path
+                   ? DenseCoreFallbackPolicyKind::FallbackFreeTarget
+                   : DenseCoreFallbackPolicyKind::CompatibilityFallback);
     resolution.host_backend = ResolveDenseCoreHostBackend(resolution.selected_kernel, caps);
 
     auto reject = [&resolution](const char* reason) {
@@ -464,6 +528,10 @@ inline bool IsExplicitTemporaryReferenceFallback(const char* reason) {
            std::strcmp(reason, "test_reference") == 0;
 }
 
+inline bool IsGemma4TemporaryReferencePrefillQuantNative(const char* reason) {
+    return reason && std::strcmp(reason, "temporary_reference_gemma4_prefill_quant_native") == 0;
+}
+
 struct DenseCoreFallbackPolicy {
     static constexpr bool kEnvOverrideAllowed = false;
 
@@ -474,9 +542,23 @@ struct DenseCoreFallbackPolicy {
         }
         return false;
     }
+
+    static bool AllowsGgmlCompute(const TargetFastPathPlan& plan, const char* reason) {
+        if (!plan.target_model) {
+            return true;
+        }
+        if (plan.gemma4_target && IsGemma4TemporaryReferencePrefillQuantNative(reason)) {
+            return true;
+        }
+        return false;
+    }
 };
 
 inline bool ShouldRejectQwenGgmlCompute(const QwenHotPathPlan& plan, const char* reason) {
+    return !DenseCoreFallbackPolicy::AllowsGgmlCompute(plan, reason);
+}
+
+inline bool ShouldRejectTargetGgmlCompute(const TargetFastPathPlan& plan, const char* reason) {
     return !DenseCoreFallbackPolicy::AllowsGgmlCompute(plan, reason);
 }
 

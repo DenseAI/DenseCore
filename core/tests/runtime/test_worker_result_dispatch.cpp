@@ -277,6 +277,41 @@ TEST(WorkerResultDispatchTest, QwenTargetRejectsTemporaryReferenceGgmlComputeByD
     EXPECT_TRUE(densecore::runtime::ShouldRejectQwenGgmlCompute(
         plan, "temporary_reference_generic_matmul_fallback"));
     EXPECT_TRUE(densecore::runtime::ShouldRejectQwenGgmlCompute(plan, "native_moe_w2_fast_node_missing"));
+
+    const auto target_plan = densecore::runtime::ResolveTargetFastPathPlan(&model);
+    ASSERT_TRUE(target_plan.target_model);
+    EXPECT_TRUE(target_plan.qwen_target);
+    EXPECT_TRUE(densecore::runtime::ShouldRejectTargetGgmlCompute(
+        target_plan, "temporary_reference_generic_matmul_fallback"));
+}
+
+TEST(WorkerResultDispatchTest, GemmaAndLfmTargetsRejectTemporaryReferenceGgmlComputeByDefault) {
+    TransformerModel gemma{};
+    gemma.arch = ModelArch::GEMMA;
+    gemma.variant = ModelVariant::GEMMA4;
+    gemma.arch_flags.is_gemma4 = true;
+
+    const auto gemma_plan = densecore::runtime::ResolveTargetFastPathPlan(&gemma);
+    ASSERT_TRUE(gemma_plan.target_model);
+    EXPECT_TRUE(gemma_plan.gemma4_target);
+    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(gemma_plan), "gemma4_26b_a4b");
+    EXPECT_TRUE(densecore::runtime::ShouldRejectTargetGgmlCompute(
+        gemma_plan, "temporary_reference_generic_matmul_fallback"));
+    EXPECT_FALSE(densecore::runtime::ShouldRejectTargetGgmlCompute(
+        gemma_plan, "temporary_reference_gemma4_prefill_quant_native"));
+
+    TransformerModel lfm2{};
+    lfm2.arch = ModelArch::LFM2;
+    lfm2.variant = ModelVariant::LFM2MOE;
+    lfm2.arch_flags.is_lfm2_shortconv = true;
+
+    const auto lfm2_plan = densecore::runtime::ResolveTargetFastPathPlan(&lfm2);
+    ASSERT_TRUE(lfm2_plan.target_model);
+    EXPECT_TRUE(lfm2_plan.lfm2_target);
+    EXPECT_TRUE(lfm2_plan.lfm2_shortconv_lane);
+    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(lfm2_plan), "lfm2_8b_a1b");
+    EXPECT_TRUE(densecore::runtime::ShouldRejectTargetGgmlCompute(
+        lfm2_plan, "temporary_reference_generic_matmul_fallback"));
 }
 
 TEST(KernelResolutionPolicyTest, QwenHybridSSMQ4PrefillResolvesSemanticFallbackFreePath) {
@@ -339,7 +374,9 @@ TEST(KernelResolutionPolicyTest, LFM2ShortConvAndLmHeadExposeSemanticRoles) {
     EXPECT_EQ(shortconv_resolution.tensor_role, densecore::runtime::DenseCoreTensorRole::ShortConvOut);
     EXPECT_EQ(shortconv_resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQuantGemv);
     EXPECT_EQ(shortconv_resolution.fallback_policy,
-              densecore::runtime::DenseCoreFallbackPolicyKind::CompatibilityFallback);
+              densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+    EXPECT_TRUE(shortconv_resolution.matmul_plan.target_fallback_free_path);
+    EXPECT_TRUE(shortconv_resolution.matmul_plan.target.lfm2_target);
 
     const auto lm_head_resolution = densecore::runtime::ResolveKernelResolution(
         &model, GGML_TYPE_Q6_K, GGML_TYPE_F32, /*m=*/1, /*n=*/32000, /*k=*/2048,
@@ -348,6 +385,29 @@ TEST(KernelResolutionPolicyTest, LFM2ShortConvAndLmHeadExposeSemanticRoles) {
     EXPECT_EQ(lm_head_resolution.semantic_op, densecore::runtime::DenseCoreSemanticOp::LmHead);
     EXPECT_EQ(lm_head_resolution.tensor_role, densecore::runtime::DenseCoreTensorRole::LmHead);
     EXPECT_EQ(lm_head_resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQuantGemv);
+    EXPECT_EQ(lm_head_resolution.fallback_policy,
+              densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(lm_head_resolution.matmul_plan.target), "lfm2_8b_a1b");
+}
+
+TEST(KernelResolutionPolicyTest, Gemma4DefaultResolutionIsFallbackFreeTarget) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_experts = 4;
+
+    const auto resolution = densecore::runtime::ResolveKernelResolution(
+        &model, GGML_TYPE_Q4_K, GGML_TYPE_F32, /*m=*/1, /*n=*/4096, /*k=*/2048,
+        densecore::runtime::DenseCoreMatmulPhase::Decode, "blk.0.ffn_down_exps.weight",
+        /*is_lm_head=*/false, /*compatible=*/true);
+
+    EXPECT_EQ(resolution.semantic_op, densecore::runtime::DenseCoreSemanticOp::MoeExpertDispatch);
+    EXPECT_EQ(resolution.tensor_role, densecore::runtime::DenseCoreTensorRole::MoEDown);
+    EXPECT_EQ(resolution.fallback_policy, densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+    EXPECT_TRUE(resolution.matmul_plan.target_fallback_free_path);
+    EXPECT_TRUE(resolution.matmul_plan.target.gemma4_target);
+    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(resolution.matmul_plan.target), "gemma4_26b_a4b");
 }
 
 TEST(KernelResolutionPolicyTest, ContractRequirementOverridesKernelAndFallbackPolicy) {
@@ -531,6 +591,12 @@ TEST(WorkerResultDispatchTest, LFM2DecodeSummaryIncludesDedicatedFastPathAliases
     req.qwen35_moe_w2_weight_type_hist[0] = 3;
     req.ssm_conv1d_calls = 4;
     req.graph_cache_miss_count = 1;
+    req.decode_graph_node_custom_moe_count = 2;
+    req.decode_graph_node_custom_moe_ns = 1100000;
+    req.decode_graph_node_custom_ssm_count = 4;
+    req.decode_graph_node_custom_ssm_ns = 2200000;
+    req.decode_graph_node_custom_lm_head_count = 1;
+    req.decode_graph_node_custom_lm_head_ns = 3300000;
 
     ::testing::internal::CaptureStderr();
     LogRequestDecodeSummary(&req, &model);
@@ -543,6 +609,9 @@ TEST(WorkerResultDispatchTest, LFM2DecodeSummaryIncludesDedicatedFastPathAliases
     EXPECT_NE(captured.find("lfm2_shortconv_sequence_fast_used_ops=4"), std::string::npos);
     EXPECT_NE(captured.find("lfm2_decode_graph_rebuilds=1"), std::string::npos);
     EXPECT_NE(captured.find("model_execution_contract_has_lfm2_shortconv=1"), std::string::npos);
+    EXPECT_NE(captured.find("decode_graph_custom_node_hist=moe:count=2:ms=1.1,ssm_stateful:count=4:ms=2.2,"
+                            "lm_head:count=1:ms=3.3"),
+              std::string::npos);
     EXPECT_NE(captured.find("graph_plan_route=inline_hybrid_ssm"), std::string::npos);
     EXPECT_NE(captured.find("graph_plan_family=DecoderHybridSSM"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);

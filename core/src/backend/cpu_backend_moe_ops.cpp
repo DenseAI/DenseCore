@@ -1,4 +1,6 @@
 #include "backend/cpu_backend_internal.h"
+#include "backend/cpu_backend_moe_forward_plan.h"
+#include "backend/cpu_backend_moe_projection.h"
 #include "ggml-cpu.h"  // For ggml_get_type_traits_cpu (vec_dot)
 #include "kernels/hwy/hwy_kernels.h"
 #include "kernels/kernel_caps.h"
@@ -72,15 +74,6 @@ MoEInt4PathHistogram& GetMoEInt4PathHistogram() {
     static MoEInt4PathHistogram histogram;
     return histogram;
 }
-
-struct QuantizedProjectionInputCache {
-    const float* source = nullptr;
-    int64_t rows = 0;
-    int64_t cols = 0;
-    ggml_type type = GGML_TYPE_COUNT;
-    size_t row_bytes = 0;
-    std::vector<uint8_t> bytes;
-};
 
 constexpr int64_t kMoEQuantizedProjectionMaxBatch = 256;
 constexpr int kMoEQ4KRawBatchedTileM = 8;
@@ -1501,15 +1494,6 @@ bool IsGemma4PackedChecksumDebugEnabled() {
     return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
-struct MoEExecutionTraceContext {
-    int layer_idx = -1;
-    int seq_id = -1;
-    int token_idx = -1;
-    int decode_step = -1;
-    int n_past = -1;
-    int expert_id = -1;
-};
-
 bool IsGemma4ParityTraceEnabled() {
     const char* env = std::getenv("DENSECORE_GEMMA4_PARITY_TRACE");
     return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
@@ -2380,22 +2364,6 @@ struct MoEProjectionRequest {
     bool enable_inner_parallel = false;
 };
 
-struct MoEProjectionRuntimeContext {
-    CpuBackend* backend = nullptr;
-    int numa_node = 0;
-    const Tensor* original_input = nullptr;
-    QuantizedProjectionInputCache* input_projection_cache = nullptr;
-    QuantizedProjectionInputCache* down_projection_cache = nullptr;
-    const CpuBackend::ExpertWeights* expert = nullptr;
-    const MoEExecutionTraceContext* trace_ctx = nullptr;
-    InferenceWorkContext* gemma4_quant_prefill_ctx = nullptr;
-    bool safe_reference_mode = false;
-    bool ggml_quantized_vecdot_safe = false;
-    bool force_gemma4_quant_prefill_fast_path = false;
-    bool gemma4_quant_prefill_batch_safe = false;
-    bool enable_inner_parallel = false;
-};
-
 struct MoEProjectionPlan {
     bool projection_has_scale = false;
     bool projection_scalar_scale = false;
@@ -2664,6 +2632,21 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
     const bool q4k_prefill_repacked_eligible = CanUseQ4KRepackedMoEPrefillFastPath() && wtype == GGML_TYPE_Q4_K &&
                                                iq_type == GGML_TYPE_Q8_K && M > 1 && (N % 8) == 0 &&
                                                (K % ggml_blck_size(GGML_TYPE_Q4_K)) == 0;
+    const auto try_q6k_repacked_gemv = [&]() -> bool {
+        if (wtype != GGML_TYPE_Q6_K || iq_type != GGML_TYPE_Q8_K || (N % 8) != 0 ||
+            (K % ggml_blck_size(GGML_TYPE_Q6_K)) != 0) {
+            return false;
+        }
+        auto packed = GetOrCreateQ6KRepackedMoEWeight(weight_ptr, N, K);
+        if (packed && RunQ6KRepackedMoEGemv(backend, packed, qinput_data, iq_row_bytes, out_data, M, N, numa_node,
+                                            allow_parallel)) {
+            LogMoEMatmulPath("ggml_q6k_repacked_gemv", static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0,
+                             allow_parallel);
+            record_dispatch("moe_expert");
+            return true;
+        }
+        return false;
+    };
     const auto try_q5k_repacked_gemv = [&]() -> bool {
         if (wtype != GGML_TYPE_Q5_K) {
             return false;
@@ -2746,6 +2729,9 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
             return true;
         }
     }
+    if (try_q6k_repacked_gemv()) {
+        return true;
+    }
     if (use_kquant_rowpair_vec_dot) {
         auto& pool = backend->GetThreadPool(numa_node);
         const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
@@ -2822,18 +2808,6 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                          allow_parallel);
         record_dispatch("moe_rowblock");
         return true;
-    }
-
-    if (wtype == GGML_TYPE_Q6_K && iq_type == GGML_TYPE_Q8_K && (N % 8) == 0 &&
-        (K % ggml_blck_size(GGML_TYPE_Q6_K)) == 0) {
-        auto packed = GetOrCreateQ6KRepackedMoEWeight(weight_ptr, N, K);
-        if (packed && RunQ6KRepackedMoEGemv(backend, packed, qinput_data, iq_row_bytes, out_data, M, N, numa_node,
-                                            allow_parallel)) {
-            LogMoEMatmulPath("ggml_q6k_repacked_gemv", static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0,
-                             allow_parallel);
-            record_dispatch("moe_expert");
-            return true;
-        }
     }
 
     if (wtype == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K && (N % 8) == 0 &&
@@ -3823,6 +3797,155 @@ size_t GetExpertMatrixDequantBytes(int ggml_type_id, const CpuBackend::ExpertPac
     return static_cast<size_t>(rows * cols * sizeof(float));
 }
 
+size_t GetMoEExpertDequantCacheBytes(const CpuBackend::ExpertWeights& exp, bool safe_reference_mode) {
+    return GetExpertMatrixDequantBytes(exp.w1_type, exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
+                                       static_cast<int64_t>(exp.hidden_dim), safe_reference_mode) +
+           GetExpertMatrixDequantBytes(exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
+                                       static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode,
+                                       exp.w2_scale_tensor) +
+           ((exp.w3.ptr != nullptr || exp.w3_int4.IsValid())
+                ? GetExpertMatrixDequantBytes(exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
+                                              static_cast<int64_t>(exp.hidden_dim), safe_reference_mode)
+                : 0);
+}
+
+Tensor MakeMoEWeightF32(CpuBackend* backend, void* ptr, int ggml_type_id,
+                        const CpuBackend::ExpertPackedInt4Weight& int4_binding, const ggml_tensor* scale_tensor,
+                        int64_t rows, int64_t cols, bool safe_reference_mode, AlignedScratch& scratch,
+                        size_t* dequantized_bytes, bool* dequantized_any) {
+    if (int4_binding.IsValid()) {
+        if (!safe_reference_mode) {
+            return Tensor();
+        }
+        scratch.Resize(backend, static_cast<size_t>(rows * cols));
+        if (!DequantizePackedInt4ToF32(int4_binding, rows, cols, scratch.ptr)) {
+            return Tensor();
+        }
+        if (!ApplyScaleSidecarInPlace(scale_tensor, rows, cols, scratch.ptr, nullptr)) {
+            return Tensor();
+        }
+        if (dequantized_bytes) {
+            *dequantized_bytes += static_cast<size_t>(rows * cols * sizeof(float));
+        }
+        if (dequantized_any) {
+            *dequantized_any = true;
+        }
+        return Tensor::Make2D(scratch.ptr, rows, cols);
+    }
+    if (!ptr || rows <= 0 || cols <= 0) {
+        return Tensor::Make2D(ptr, rows, cols);
+    }
+    const ggml_type wtype = static_cast<ggml_type>(ggml_type_id);
+    if (wtype == GGML_TYPE_F32 && !scale_tensor) {
+        return Tensor::Make2D(ptr, rows, cols);
+    }
+    scratch.Resize(backend, static_cast<size_t>(rows * cols));
+    if (wtype == GGML_TYPE_F32) {
+        std::memcpy(scratch.ptr, ptr, static_cast<size_t>(rows * cols) * sizeof(float));
+    } else {
+        const struct ggml_type_traits* traits = ggml_get_type_traits(wtype);
+        if (!traits || !traits->to_float) {
+            return Tensor::Make2D(ptr, rows, cols);
+        }
+        const size_t row_bytes = ggml_row_size(wtype, cols);
+        const char* src = static_cast<const char*>(ptr);
+        for (int64_t r = 0; r < rows; ++r) {
+            traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes), scratch.ptr + r * cols, cols);
+        }
+    }
+    if (scale_tensor) {
+        if (!ApplyScaleSidecarInPlace(scale_tensor, rows, cols, scratch.ptr, nullptr)) {
+            return Tensor();
+        }
+    }
+    if (dequantized_bytes) {
+        *dequantized_bytes += static_cast<size_t>(rows * cols * sizeof(float));
+    }
+    if (dequantized_any) {
+        *dequantized_any = true;
+    }
+    return Tensor::Make2D(scratch.ptr, rows, cols);
+}
+
+bool DequantizeMoEWeightToVector(void* ptr, int ggml_type_id,
+                                 const CpuBackend::ExpertPackedInt4Weight& int4_binding,
+                                 const ggml_tensor* scale_tensor, int64_t rows, int64_t cols,
+                                 bool safe_reference_mode, bool materialize_f32,
+                                 simd::AlignedVector<float>* dst) {
+    if (!dst) return false;
+    dst->clear();
+    if (int4_binding.IsValid()) {
+        if (!safe_reference_mode) return false;
+        dst->resize(static_cast<size_t>(rows * cols));
+        if (!DequantizePackedInt4ToF32(int4_binding, rows, cols, dst->data())) {
+            dst->clear();
+            return false;
+        }
+        return ApplyScaleSidecarInPlace(scale_tensor, rows, cols, dst->data(), nullptr);
+    }
+    if (!ptr || rows <= 0 || cols <= 0) return false;
+    const ggml_type wtype = static_cast<ggml_type>(ggml_type_id);
+    if (wtype == GGML_TYPE_F32 && !materialize_f32 && !scale_tensor) {
+        return true;
+    }
+    const size_t total = static_cast<size_t>(rows * cols);
+    dst->resize(total);
+    float* out = dst->data();
+    if (wtype == GGML_TYPE_F32) {
+        std::memcpy(out, ptr, total * sizeof(float));
+    } else {
+        const struct ggml_type_traits* traits = ggml_get_type_traits(wtype);
+        if (!traits || !traits->to_float) {
+            dst->clear();
+            return false;
+        }
+        const size_t row_bytes = ggml_row_size(wtype, cols);
+        const char* src = static_cast<const char*>(ptr);
+        for (int64_t r = 0; r < rows; ++r) {
+            traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes), out + r * cols, cols);
+        }
+    }
+    return ApplyScaleSidecarInPlace(scale_tensor, rows, cols, dst->data(), nullptr);
+}
+
+template <typename CacheEntry>
+void RefreshMoEDequantCacheTensors(CacheEntry* entry, const CpuBackend::ExpertWeights& exp) {
+    if (!entry) {
+        return;
+    }
+    entry->w1_tensor = entry->w1.empty()
+                           ? Tensor()
+                           : Tensor::Make2D(entry->w1.data(), static_cast<int64_t>(exp.intermediate_dim),
+                                            static_cast<int64_t>(exp.hidden_dim));
+    entry->w2_tensor = entry->w2.empty() ? Tensor()
+                                         : Tensor::Make2D(entry->w2.data(), static_cast<int64_t>(exp.hidden_dim),
+                                                          static_cast<int64_t>(exp.intermediate_dim));
+    entry->w3_tensor = entry->w3.empty()
+                           ? Tensor()
+                           : Tensor::Make2D(entry->w3.data(), static_cast<int64_t>(exp.intermediate_dim),
+                                            static_cast<int64_t>(exp.hidden_dim));
+}
+
+template <typename CacheEntry>
+void PopulateMoEDequantCacheEntry(CacheEntry* entry, const CpuBackend::ExpertWeights& exp, bool safe_reference_mode,
+                                  bool materialize_f32) {
+    if (!entry) {
+        return;
+    }
+    DequantizeMoEWeightToVector(exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr,
+                                static_cast<int64_t>(exp.intermediate_dim), static_cast<int64_t>(exp.hidden_dim),
+                                safe_reference_mode, materialize_f32, &entry->w1);
+    DequantizeMoEWeightToVector(exp.w2.ptr, exp.w2_type, exp.w2_int4, exp.w2_scale_tensor,
+                                static_cast<int64_t>(exp.hidden_dim), static_cast<int64_t>(exp.intermediate_dim),
+                                safe_reference_mode, materialize_f32, &entry->w2);
+    if (exp.w3.ptr != nullptr || exp.w3_int4.IsValid()) {
+        DequantizeMoEWeightToVector(exp.w3.ptr, exp.w3_type, exp.w3_int4, nullptr,
+                                    static_cast<int64_t>(exp.intermediate_dim), static_cast<int64_t>(exp.hidden_dim),
+                                    safe_reference_mode, materialize_f32, &entry->w3);
+    }
+    RefreshMoEDequantCacheTensors(entry, exp);
+}
+
 // Snapshot of MoE registry hot-expert state plus the per-call active-expert set,
 // used to decide whether the tiny decode-specialized path can run. Extracted from
 // CpuBackend::ForwardMoE so the gathering logic is a self-contained unit with
@@ -3844,39 +3967,6 @@ struct MoESmallDecodeState {
     std::array<int, kSmallDecodeMaxAssignments> current_batch_experts{};
     int current_batch_expert_count = 0;
     int max_expert_batch = 0;
-};
-
-struct MoEActiveExpertWork {
-    int expert_id = -1;
-    int start = 0;
-    int count = 0;
-    int numa_node = -1;
-    float ema_load = 0.0f;
-    bool local_hot = false;
-};
-
-struct MoELocalityOrderingOutcome {
-    bool considered = false;
-    bool applied = false;
-    bool skipped_small_batch = false;
-    bool skipped_low_reuse = false;
-    uint64_t numa_switches_before = 0;
-    uint64_t numa_switches_after = 0;
-};
-
-struct MoEForwardExecutionPlan {
-    std::vector<MoEActiveExpertWork> active_work;
-    std::vector<int> current_batch_experts;
-    std::unordered_set<int> previous_batch_set;
-    int reuse_intersection = 0;
-    int reuse_union = 0;
-    int max_expert_batch = 0;
-    int local_hot_count = 0;
-    int worker_threads = 1;
-    bool small_decode_step = false;
-    bool prefer_inner_parallel_prefill = false;
-    bool parallelize_experts = false;
-    MoELocalityOrderingOutcome ordering;
 };
 
 // Templated on the registry pointer type so this anonymous-namespace helper does
@@ -3931,166 +4021,6 @@ MoESmallDecodeState GatherMoESmallDecodeState(const RegistryPtr& registry, const
         }
     }
     return state;
-}
-
-uint64_t CountMoENumaSwitches(const std::vector<MoEActiveExpertWork>& work_items) {
-    uint64_t switches = 0;
-    for (size_t i = 1; i < work_items.size(); ++i) {
-        const int prev = work_items[i - 1].numa_node;
-        const int cur = work_items[i].numa_node;
-        if (prev >= 0 && cur >= 0 && prev != cur) {
-            ++switches;
-        }
-    }
-    return switches;
-}
-
-void ApplyMoELocalityOrdering(MoEForwardExecutionPlan* plan) {
-    if (!plan || plan->small_decode_step || !internal::IsMoELocalityOrderingEnabled()) {
-        return;
-    }
-
-    plan->ordering.considered = true;
-    const bool enough_active_experts =
-        static_cast<int>(plan->active_work.size()) >= internal::GetMoELocalityOrderingMinActiveExperts();
-    const bool enough_reuse_signal =
-        plan->reuse_intersection >= internal::GetMoELocalityOrderingMinReuseIntersection() || plan->local_hot_count > 0;
-
-    if (!enough_active_experts) {
-        plan->ordering.skipped_small_batch = true;
-        return;
-    }
-    if (!enough_reuse_signal) {
-        plan->ordering.skipped_low_reuse = true;
-        return;
-    }
-
-    plan->ordering.numa_switches_before = CountMoENumaSwitches(plan->active_work);
-    std::stable_sort(plan->active_work.begin(), plan->active_work.end(),
-                     [plan](const MoEActiveExpertWork& lhs, const MoEActiveExpertWork& rhs) {
-                         const auto ordering_score = [plan](const MoEActiveExpertWork& work) {
-                             const bool reused = plan->previous_batch_set.find(work.expert_id) !=
-                                                 plan->previous_batch_set.end();
-                             int score = 0;
-                             if (work.local_hot) score += 32;
-                             if (reused) score += 24;
-                             if (work.numa_node >= 0) score += 4;
-                             score += std::min(work.count, 4) * 3;
-                             return score;
-                         };
-                         const int lhs_score = ordering_score(lhs);
-                         const int rhs_score = ordering_score(rhs);
-                         if (lhs_score != rhs_score) return lhs_score > rhs_score;
-                         if (lhs.ema_load != rhs.ema_load) return lhs.ema_load < rhs.ema_load;
-                         if (lhs.count != rhs.count) return lhs.count < rhs.count;
-                         if (lhs.numa_node != rhs.numa_node) return lhs.numa_node < rhs.numa_node;
-                         return lhs.expert_id < rhs.expert_id;
-                     });
-    plan->ordering.numa_switches_after = CountMoENumaSwitches(plan->active_work);
-    plan->ordering.applied = true;
-}
-
-void BalanceMoEParallelExpertWork(std::vector<MoEActiveExpertWork>* active_work, int active_threads) {
-    if (!active_work || active_threads <= 1 || active_work->size() <= 1) {
-        return;
-    }
-
-    const int work_per_thread = (static_cast<int>(active_work->size()) + active_threads - 1) / active_threads;
-    std::vector<MoEActiveExpertWork> by_cost = *active_work;
-    std::stable_sort(by_cost.begin(), by_cost.end(), [](const MoEActiveExpertWork& lhs, const MoEActiveExpertWork& rhs) {
-        if (lhs.count != rhs.count) {
-            return lhs.count > rhs.count;
-        }
-        return lhs.expert_id < rhs.expert_id;
-    });
-
-    std::vector<std::vector<MoEActiveExpertWork>> buckets(static_cast<size_t>(active_threads));
-    std::vector<int64_t> bucket_cost(static_cast<size_t>(active_threads), 0);
-    for (const MoEActiveExpertWork& work : by_cost) {
-        int best_bucket = -1;
-        for (int bucket = 0; bucket < active_threads; ++bucket) {
-            if (static_cast<int>(buckets[static_cast<size_t>(bucket)].size()) >= work_per_thread) {
-                continue;
-            }
-            if (best_bucket < 0 ||
-                bucket_cost[static_cast<size_t>(bucket)] < bucket_cost[static_cast<size_t>(best_bucket)]) {
-                best_bucket = bucket;
-            }
-        }
-        if (best_bucket < 0) {
-            best_bucket = active_threads - 1;
-        }
-        buckets[static_cast<size_t>(best_bucket)].push_back(work);
-        bucket_cost[static_cast<size_t>(best_bucket)] += std::max(1, work.count);
-    }
-
-    active_work->clear();
-    active_work->reserve(by_cost.size());
-    for (auto& bucket : buckets) {
-        active_work->insert(active_work->end(), bucket.begin(), bucket.end());
-    }
-}
-
-MoEForwardExecutionPlan BuildMoEForwardExecutionPlan(const moe::MoEReorderMapView& reorder_map, int num_experts,
-                                                     int batch_size, int total_assignments, int worker_threads,
-                                                     bool registry_present,
-                                                     const std::unordered_set<int>& local_hot_experts,
-                                                     const std::vector<int>& previous_batch_experts,
-                                                     const std::shared_ptr<moe::ExpertProfiler>& profiler) {
-    MoEForwardExecutionPlan plan;
-    plan.worker_threads = std::max(1, worker_threads);
-    plan.active_work.reserve(static_cast<size_t>(num_experts));
-    plan.current_batch_experts.reserve(static_cast<size_t>(num_experts));
-
-    for (int expert_id = 0; expert_id < num_experts; ++expert_id) {
-        const int start = reorder_map.expert_offsets[static_cast<size_t>(expert_id)];
-        const int end = reorder_map.expert_offsets[static_cast<size_t>(expert_id + 1)];
-        const int count = end - start;
-        if (count <= 0) {
-            continue;
-        }
-
-        MoEActiveExpertWork work;
-        work.expert_id = expert_id;
-        work.start = start;
-        work.count = count;
-        work.local_hot = local_hot_experts.find(expert_id) != local_hot_experts.end();
-        if (profiler) {
-            work.numa_node = profiler->GetExpertNumaNode(expert_id);
-            work.ema_load = profiler->GetEmaLoad(expert_id);
-        }
-        plan.local_hot_count += work.local_hot ? 1 : 0;
-        plan.active_work.push_back(work);
-        plan.current_batch_experts.push_back(expert_id);
-    }
-
-    if (!previous_batch_experts.empty()) {
-        plan.previous_batch_set.insert(previous_batch_experts.begin(), previous_batch_experts.end());
-        for (int expert_id : plan.current_batch_experts) {
-            if (plan.previous_batch_set.find(expert_id) != plan.previous_batch_set.end()) {
-                ++plan.reuse_intersection;
-            }
-        }
-    }
-    plan.reuse_union =
-        static_cast<int>(plan.current_batch_experts.size() + previous_batch_experts.size() - plan.reuse_intersection);
-    plan.max_expert_batch = reorder_map.max_expert_batch;
-    plan.small_decode_step = batch_size <= 4 && total_assignments <= 8 && plan.max_expert_batch <= 1;
-
-    ApplyMoELocalityOrdering(&plan);
-
-    plan.prefer_inner_parallel_prefill =
-        !plan.small_decode_step && batch_size > 1 && plan.active_work.size() < static_cast<size_t>(plan.worker_threads);
-    plan.parallelize_experts =
-        !plan.prefer_inner_parallel_prefill && !plan.small_decode_step && batch_size > 1 &&
-        plan.active_work.size() >= static_cast<size_t>(std::max(4, plan.worker_threads / 2)) && registry_present;
-
-    if (plan.parallelize_experts && plan.active_work.size() > 1) {
-        const int active_threads = std::max(1, std::min(plan.worker_threads, static_cast<int>(plan.active_work.size())));
-        BalanceMoEParallelExpertWork(&plan.active_work, active_threads);
-    }
-
-    return plan;
 }
 
 // Handles the Gemma4 / Qwen3.6 "safe reference" fast paths that bypass the
@@ -4414,23 +4344,6 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
     static thread_local AlignedScratch w2_dequant;
     static thread_local AlignedScratch w3_dequant;
     static thread_local AlignedScratch small_decode_output_scratch;
-    const auto refresh_cached_tensors = [](MoELayerRegistry::DequantizedExpertCacheEntry* entry,
-                                           const ExpertWeights& exp) {
-        if (!entry) {
-            return;
-        }
-        entry->w1_tensor = entry->w1.empty()
-                               ? Tensor()
-                               : Tensor::Make2D(entry->w1.data(), static_cast<int64_t>(exp.intermediate_dim),
-                                                static_cast<int64_t>(exp.hidden_dim));
-        entry->w2_tensor = entry->w2.empty() ? Tensor()
-                                             : Tensor::Make2D(entry->w2.data(), static_cast<int64_t>(exp.hidden_dim),
-                                                              static_cast<int64_t>(exp.intermediate_dim));
-        entry->w3_tensor = entry->w3.empty()
-                               ? Tensor()
-                               : Tensor::Make2D(entry->w3.data(), static_cast<int64_t>(exp.intermediate_dim),
-                                                static_cast<int64_t>(exp.hidden_dim));
-    };
 
     const int total_assignments = static_cast<int>(assignment_count);
     if (total_assignments == 0 || num_experts == 0 || top_k <= 0) {
@@ -4461,6 +4374,80 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                                            qwen36_short_prefill_safe_reference, safe_reference_mode)) {
         return;
     }
+
+    const bool dequant_cache_enabled =
+        internal::IsMoEDequantCacheEnabled() && registry != nullptr && !arm_disable_registry_dequant_cache;
+    const bool cache_all_active_experts = internal::ShouldCacheAllActiveExperts();
+    const size_t dequant_cache_budget = internal::GetMoEDequantCacheBytes();
+    const auto get_or_create_dequant_cache_entry =
+        [&](int expert_id, const ExpertWeights& exp, size_t cacheable_bytes, bool materialize_f32) {
+            std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> cached_entry;
+            if (!registry || cacheable_bytes == 0 || cacheable_bytes > dequant_cache_budget) {
+                return cached_entry;
+            }
+
+            std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> existing_entry;
+            {
+                std::lock_guard<std::mutex> lock(registry->mutex);
+                auto it = registry->dequant_cache.find(expert_id);
+                if (it != registry->dequant_cache.end()) {
+                    existing_entry = it->second;
+                    if (existing_entry) {
+                        existing_entry->last_used = ++registry->dequant_cache_use_counter;
+                    }
+                }
+            }
+            if (existing_entry) {
+                return existing_entry;
+            }
+
+            auto candidate = std::make_shared<MoELayerRegistry::DequantizedExpertCacheEntry>();
+            candidate->expert_id = expert_id;
+            candidate->bytes = cacheable_bytes;
+            PopulateMoEDequantCacheEntry(candidate.get(), exp, safe_reference_mode, materialize_f32);
+
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            auto it = registry->dequant_cache.find(expert_id);
+            if (it != registry->dequant_cache.end()) {
+                cached_entry = it->second;
+                if (cached_entry) {
+                    cached_entry->last_used = ++registry->dequant_cache_use_counter;
+                }
+            } else if (candidate->bytes <= dequant_cache_budget) {
+                while (registry->dequant_cache_bytes + candidate->bytes > dequant_cache_budget &&
+                       !registry->dequant_cache.empty()) {
+                    auto evict_it = registry->dequant_cache.end();
+                    uint64_t oldest_use = std::numeric_limits<uint64_t>::max();
+                    for (auto it_cache = registry->dequant_cache.begin(); it_cache != registry->dequant_cache.end();
+                         ++it_cache) {
+                        if (!it_cache->second) {
+                            evict_it = it_cache;
+                            break;
+                        }
+                        if (it_cache->second->last_used < oldest_use) {
+                            oldest_use = it_cache->second->last_used;
+                            evict_it = it_cache;
+                        }
+                    }
+                    if (evict_it == registry->dequant_cache.end()) {
+                        break;
+                    }
+                    if (evict_it->second) {
+                        registry->dequant_cache_bytes -=
+                            std::min(registry->dequant_cache_bytes, evict_it->second->bytes);
+                    }
+                    registry->dequant_cache.erase(evict_it);
+                }
+                if (registry->dequant_cache_bytes + candidate->bytes <= dequant_cache_budget) {
+                    candidate->last_used = ++registry->dequant_cache_use_counter;
+                    registry->dequant_cache_bytes += candidate->bytes;
+                    registry->dequant_cache.emplace(expert_id, candidate);
+                    cached_entry = std::move(candidate);
+                }
+            }
+            return cached_entry;
+        };
+
     bool small_decode_requires_general_path = false;
     if (small_decode_candidate) {
         for (size_t i = 0; i < assignment_count; ++i) {
@@ -4547,68 +4534,6 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                                                 small_step_current_batch_experts.begin() +
                                                     static_cast<ptrdiff_t>(small_step_current_batch_expert_count));
         }
-
-        const bool dequant_cache_enabled =
-            internal::IsMoEDequantCacheEnabled() && registry != nullptr && !arm_disable_registry_dequant_cache;
-        const bool cache_all_active_experts = internal::ShouldCacheAllActiveExperts();
-        const size_t dequant_cache_budget = internal::GetMoEDequantCacheBytes();
-        auto make_weight_f32_small = [&](void* ptr, int ggml_type_id, const ExpertPackedInt4Weight& int4_binding,
-                                         const ggml_tensor* scale_tensor, int64_t rows, int64_t cols,
-                                         AlignedScratch& scratch, size_t* dequantized_bytes,
-                                         bool* dequantized_any) -> Tensor {
-            if (int4_binding.IsValid()) {
-                if (!safe_reference_mode) {
-                    return Tensor();
-                }
-                scratch.Resize(this, static_cast<size_t>(rows * cols));
-                if (!DequantizePackedInt4ToF32(int4_binding, rows, cols, scratch.ptr)) {
-                    return Tensor();
-                }
-                if (!ApplyScaleSidecarInPlace(scale_tensor, rows, cols, scratch.ptr, nullptr)) {
-                    return Tensor();
-                }
-                if (dequantized_bytes) {
-                    *dequantized_bytes += static_cast<size_t>(rows * cols * sizeof(float));
-                }
-                if (dequantized_any) {
-                    *dequantized_any = true;
-                }
-                return Tensor::Make2D(scratch.ptr, rows, cols);
-            }
-            if (!ptr || rows <= 0 || cols <= 0) {
-                return Tensor::Make2D(ptr, rows, cols);
-            }
-            const ggml_type wtype = static_cast<ggml_type>(ggml_type_id);
-            if (wtype == GGML_TYPE_F32 && !scale_tensor) {
-                return Tensor::Make2D(ptr, rows, cols);
-            }
-            scratch.Resize(this, static_cast<size_t>(rows * cols));
-            if (wtype == GGML_TYPE_F32) {
-                std::memcpy(scratch.ptr, ptr, static_cast<size_t>(rows * cols) * sizeof(float));
-            } else {
-                const struct ggml_type_traits* traits = ggml_get_type_traits(wtype);
-                if (!traits || !traits->to_float) {
-                    return Tensor::Make2D(ptr, rows, cols);
-                }
-                const size_t row_bytes = ggml_row_size(wtype, cols);
-                const char* src = static_cast<const char*>(ptr);
-                for (int64_t r = 0; r < rows; ++r) {
-                    traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes), scratch.ptr + r * cols, cols);
-                }
-            }
-            if (scale_tensor) {
-                if (!ApplyScaleSidecarInPlace(scale_tensor, rows, cols, scratch.ptr, nullptr)) {
-                    return Tensor();
-                }
-            }
-            if (dequantized_bytes) {
-                *dequantized_bytes += static_cast<size_t>(rows * cols * sizeof(float));
-            }
-            if (dequantized_any) {
-                *dequantized_any = true;
-            }
-            return Tensor::Make2D(scratch.ptr, rows, cols);
-        };
 
         auto& small_decode_pool = GetThreadPool(-1);
         const int small_decode_worker_cap = std::max(1, small_decode_pool.GetNumThreads());
@@ -5047,138 +4972,10 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 FixedArrayContains(small_step_previous_batch_experts, small_step_previous_batch_count, expert_id);
             const bool should_try_cache =
                 dequant_cache_enabled && (cache_all_active_experts || local_hot || reused_last_batch);
-            const size_t cacheable_bytes =
-                GetExpertMatrixDequantBytes(exp.w1_type, exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                            static_cast<int64_t>(exp.hidden_dim), safe_reference_mode) +
-                GetExpertMatrixDequantBytes(exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
-                                            static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode,
-                                            exp.w2_scale_tensor) +
-                ((exp.w3.ptr != nullptr || exp.w3_int4.IsValid())
-                     ? GetExpertMatrixDequantBytes(exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                                   static_cast<int64_t>(exp.hidden_dim), safe_reference_mode)
-                     : 0);
+            const size_t cacheable_bytes = GetMoEExpertDequantCacheBytes(exp, safe_reference_mode);
             if (should_try_cache && cacheable_bytes > 0 && cacheable_bytes <= dequant_cache_budget) {
-                std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> existing_entry;
-                {
-                    std::lock_guard<std::mutex> lock(registry->mutex);
-                    auto it = registry->dequant_cache.find(expert_id);
-                    if (it != registry->dequant_cache.end()) {
-                        existing_entry = it->second;
-                        if (existing_entry) {
-                            existing_entry->last_used = ++registry->dequant_cache_use_counter;
-                        }
-                    }
-                }
-
-                if (existing_entry) {
-                    cached_entry = std::move(existing_entry);
-                } else {
-                    auto candidate = std::make_shared<MoELayerRegistry::DequantizedExpertCacheEntry>();
-                    candidate->expert_id = expert_id;
-                    candidate->bytes = cacheable_bytes;
-                    if ((!exp.w1_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
-                        exp.w1_type != GGML_TYPE_F32) {
-                        const struct ggml_type_traits* traits =
-                            ggml_get_type_traits(static_cast<ggml_type>(exp.w1_type));
-                        if (exp.w1_int4.IsValid() && safe_reference_mode) {
-                            candidate->w1.resize(static_cast<size_t>(exp.intermediate_dim) * exp.hidden_dim);
-                            DequantizePackedInt4ToF32(exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                                      static_cast<int64_t>(exp.hidden_dim), candidate->w1.data());
-                        } else if (traits && traits->to_float) {
-                            candidate->w1.resize(static_cast<size_t>(exp.intermediate_dim) * exp.hidden_dim);
-                            const size_t row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w1_type), exp.hidden_dim);
-                            const char* src = static_cast<const char*>(exp.w1.ptr);
-                            for (int64_t r = 0; r < exp.intermediate_dim; ++r) {
-                                traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes),
-                                                 candidate->w1.data() + r * exp.hidden_dim, exp.hidden_dim);
-                            }
-                        }
-                    }
-                    if (exp.w2_scale_tensor ||
-                        ((!exp.w2_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
-                         exp.w2_type != GGML_TYPE_F32)) {
-                        const struct ggml_type_traits* traits =
-                            ggml_get_type_traits(static_cast<ggml_type>(exp.w2_type));
-                        candidate->w2.resize(static_cast<size_t>(exp.hidden_dim) * exp.intermediate_dim);
-                        if (exp.w2_int4.IsValid() && safe_reference_mode) {
-                            DequantizePackedInt4ToF32(exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
-                                                      static_cast<int64_t>(exp.intermediate_dim), candidate->w2.data());
-                        } else if (exp.w2_type == GGML_TYPE_F32) {
-                            std::memcpy(candidate->w2.data(), exp.w2.ptr, candidate->w2.size() * sizeof(float));
-                        } else if (traits && traits->to_float) {
-                            const size_t row_bytes =
-                                ggml_row_size(static_cast<ggml_type>(exp.w2_type), exp.intermediate_dim);
-                            const char* src = static_cast<const char*>(exp.w2.ptr);
-                            for (int64_t r = 0; r < exp.hidden_dim; ++r) {
-                                traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes),
-                                                 candidate->w2.data() + r * exp.intermediate_dim, exp.intermediate_dim);
-                            }
-                        }
-                        ApplyScaleSidecarInPlace(exp.w2_scale_tensor, static_cast<int64_t>(exp.hidden_dim),
-                                                 static_cast<int64_t>(exp.intermediate_dim), candidate->w2.data(),
-                                                 nullptr);
-                    }
-                    if ((exp.w3.ptr != nullptr || exp.w3_int4.IsValid()) &&
-                        (!exp.w3_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
-                        exp.w3_type != GGML_TYPE_F32) {
-                        const struct ggml_type_traits* traits =
-                            ggml_get_type_traits(static_cast<ggml_type>(exp.w3_type));
-                        if (exp.w3_int4.IsValid() && safe_reference_mode) {
-                            candidate->w3.resize(static_cast<size_t>(exp.intermediate_dim) * exp.hidden_dim);
-                            DequantizePackedInt4ToF32(exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                                      static_cast<int64_t>(exp.hidden_dim), candidate->w3.data());
-                        } else if (traits && traits->to_float) {
-                            candidate->w3.resize(static_cast<size_t>(exp.intermediate_dim) * exp.hidden_dim);
-                            const size_t row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w3_type), exp.hidden_dim);
-                            const char* src = static_cast<const char*>(exp.w3.ptr);
-                            for (int64_t r = 0; r < exp.intermediate_dim; ++r) {
-                                traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes),
-                                                 candidate->w3.data() + r * exp.hidden_dim, exp.hidden_dim);
-                            }
-                        }
-                    }
-                    refresh_cached_tensors(candidate.get(), exp);
-
-                    std::lock_guard<std::mutex> lock(registry->mutex);
-                    auto it = registry->dequant_cache.find(expert_id);
-                    if (it != registry->dequant_cache.end()) {
-                        cached_entry = it->second;
-                        if (cached_entry) {
-                            cached_entry->last_used = ++registry->dequant_cache_use_counter;
-                        }
-                    } else {
-                        while (registry->dequant_cache_bytes + candidate->bytes > dequant_cache_budget &&
-                               !registry->dequant_cache.empty()) {
-                            auto evict_it = registry->dequant_cache.end();
-                            uint64_t oldest_use = std::numeric_limits<uint64_t>::max();
-                            for (auto it_cache = registry->dequant_cache.begin();
-                                 it_cache != registry->dequant_cache.end(); ++it_cache) {
-                                if (!it_cache->second) {
-                                    evict_it = it_cache;
-                                    break;
-                                }
-                                if (it_cache->second->last_used < oldest_use) {
-                                    oldest_use = it_cache->second->last_used;
-                                    evict_it = it_cache;
-                                }
-                            }
-                            if (evict_it == registry->dequant_cache.end()) {
-                                break;
-                            }
-                            if (evict_it->second) {
-                                registry->dequant_cache_bytes -=
-                                    std::min(registry->dequant_cache_bytes, evict_it->second->bytes);
-                            }
-                            registry->dequant_cache.erase(evict_it);
-                        }
-                        if (registry->dequant_cache_bytes + candidate->bytes <= dequant_cache_budget) {
-                            candidate->last_used = ++registry->dequant_cache_use_counter;
-                            registry->dequant_cache_bytes += candidate->bytes;
-                            registry->dequant_cache.emplace(expert_id, candidate);
-                            cached_entry = std::move(candidate);
-                        }
-                    }
-                }
+                cached_entry = get_or_create_dequant_cache_entry(expert_id, exp, cacheable_bytes,
+                                                                 /*materialize_f32=*/false);
             }
 
             // When expert weights are ggml-quantized (Q4_K etc.), skip F32 dequant entirely.
@@ -5194,27 +4991,27 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                       (!exp.w1_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
                       exp.w1_type != GGML_TYPE_F32)
                          ? cached_entry->w1_tensor
-                         : make_weight_f32_small(exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr,
-                                                 static_cast<int64_t>(exp.intermediate_dim),
-                                                 static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes,
-                                                 &dequantized_any);
+                         : MakeMoEWeightF32(this, exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr,
+                                            static_cast<int64_t>(exp.intermediate_dim),
+                                            static_cast<int64_t>(exp.hidden_dim), safe_reference_mode, w1_dequant,
+                                            &dequantized_bytes, &dequantized_any);
                 w2 = (cached_entry && (exp.w2_scale_tensor || ((!exp.w2_int4.IsValid() || safe_reference_mode ||
                                                                 !CanUsePackedInt4MoEFastPath()) &&
                                                                exp.w2_type != GGML_TYPE_F32)))
                          ? cached_entry->w2_tensor
-                         : make_weight_f32_small(exp.w2.ptr, exp.w2_type, exp.w2_int4, exp.w2_scale_tensor,
-                                                 static_cast<int64_t>(exp.hidden_dim),
-                                                 static_cast<int64_t>(exp.intermediate_dim), w2_dequant,
-                                                 &dequantized_bytes, &dequantized_any);
+                         : MakeMoEWeightF32(this, exp.w2.ptr, exp.w2_type, exp.w2_int4, exp.w2_scale_tensor,
+                                            static_cast<int64_t>(exp.hidden_dim),
+                                            static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode, w2_dequant,
+                                            &dequantized_bytes, &dequantized_any);
                 if (exp.w3.ptr != nullptr || exp.w3_int4.IsValid()) {
                     w3 = (cached_entry &&
                           (!exp.w3_int4.IsValid() || safe_reference_mode || !CanUsePackedInt4MoEFastPath()) &&
                           exp.w3_type != GGML_TYPE_F32)
                              ? cached_entry->w3_tensor
-                             : make_weight_f32_small(exp.w3.ptr, exp.w3_type, exp.w3_int4, nullptr,
-                                                     static_cast<int64_t>(exp.intermediate_dim),
-                                                     static_cast<int64_t>(exp.hidden_dim), w3_dequant,
-                                                     &dequantized_bytes, &dequantized_any);
+                             : MakeMoEWeightF32(this, exp.w3.ptr, exp.w3_type, exp.w3_int4, nullptr,
+                                                static_cast<int64_t>(exp.intermediate_dim),
+                                                static_cast<int64_t>(exp.hidden_dim), safe_reference_mode, w3_dequant,
+                                                &dequantized_bytes, &dequantized_any);
                 }
             }
             // else: w1/w2/w3 remain empty Tensors -> DispatchExpertFFNImpl uses quantized GEMV path
@@ -5367,104 +5164,6 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
         }
     }
 
-    const bool dequant_cache_enabled =
-        internal::IsMoEDequantCacheEnabled() && registry != nullptr && !arm_disable_registry_dequant_cache;
-    const bool cache_all_active_experts = internal::ShouldCacheAllActiveExperts();
-    const size_t dequant_cache_budget = internal::GetMoEDequantCacheBytes();
-
-    auto make_weight_f32 = [&](void* ptr, int ggml_type_id, const ExpertPackedInt4Weight& int4_binding,
-                               const ggml_tensor* scale_tensor, int64_t rows, int64_t cols, AlignedScratch& scratch,
-                               size_t* dequantized_bytes, bool* dequantized_any) -> Tensor {
-        if (int4_binding.IsValid()) {
-            if (!safe_reference_mode) {
-                return Tensor();
-            }
-            scratch.Resize(this, static_cast<size_t>(rows * cols));
-            if (!DequantizePackedInt4ToF32(int4_binding, rows, cols, scratch.ptr)) {
-                return Tensor();
-            }
-            if (!ApplyScaleSidecarInPlace(scale_tensor, rows, cols, scratch.ptr, nullptr)) {
-                return Tensor();
-            }
-            if (dequantized_bytes) {
-                *dequantized_bytes += static_cast<size_t>(rows * cols * sizeof(float));
-            }
-            if (dequantized_any) {
-                *dequantized_any = true;
-            }
-            return Tensor::Make2D(scratch.ptr, rows, cols);
-        }
-        if (!ptr || rows <= 0 || cols <= 0) {
-            return Tensor::Make2D(ptr, rows, cols);
-        }
-        const ggml_type wtype = static_cast<ggml_type>(ggml_type_id);
-        if (wtype == GGML_TYPE_F32 && !scale_tensor) {
-            return Tensor::Make2D(ptr, rows, cols);
-        }
-        scratch.Resize(this, static_cast<size_t>(rows * cols));
-        if (wtype == GGML_TYPE_F32) {
-            std::memcpy(scratch.ptr, ptr, static_cast<size_t>(rows * cols) * sizeof(float));
-        } else {
-            const struct ggml_type_traits* traits = ggml_get_type_traits(wtype);
-            if (!traits || !traits->to_float) {
-                return Tensor::Make2D(ptr, rows, cols);
-            }
-            const size_t row_bytes = ggml_row_size(wtype, cols);
-            const char* src = static_cast<const char*>(ptr);
-            for (int64_t r = 0; r < rows; ++r) {
-                traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes), scratch.ptr + r * cols, cols);
-            }
-        }
-        if (scale_tensor) {
-            if (!ApplyScaleSidecarInPlace(scale_tensor, rows, cols, scratch.ptr, nullptr)) {
-                return Tensor();
-            }
-        }
-        if (dequantized_bytes) {
-            *dequantized_bytes += static_cast<size_t>(rows * cols * sizeof(float));
-        }
-        if (dequantized_any) {
-            *dequantized_any = true;
-        }
-        return Tensor::Make2D(scratch.ptr, rows, cols);
-    };
-
-    auto dequantize_into_buffer = [](void* ptr, int ggml_type_id, const ExpertPackedInt4Weight& int4_binding,
-                                     const ggml_tensor* scale_tensor, int64_t rows, int64_t cols,
-                                     simd::AlignedVector<float>* dst) -> bool {
-        if (!dst) return false;
-        dst->clear();
-        if (int4_binding.IsValid()) {
-            if (!IsMoESafeReferenceModeEnabled()) return false;
-            dst->resize(static_cast<size_t>(rows * cols));
-            if (!DequantizePackedInt4ToF32(int4_binding, rows, cols, dst->data())) {
-                dst->clear();
-                return false;
-            }
-            return ApplyScaleSidecarInPlace(scale_tensor, rows, cols, dst->data(), nullptr);
-        }
-        if (!ptr || rows <= 0 || cols <= 0) return false;
-        const ggml_type wtype = static_cast<ggml_type>(ggml_type_id);
-        const size_t total = static_cast<size_t>(rows * cols);
-        dst->resize(total);
-        float* out = dst->data();
-        if (wtype == GGML_TYPE_F32) {
-            std::memcpy(out, ptr, total * sizeof(float));
-        } else {
-            const struct ggml_type_traits* traits = ggml_get_type_traits(wtype);
-            if (!traits || !traits->to_float) {
-                dst->clear();
-                return false;
-            }
-            const size_t row_bytes = ggml_row_size(wtype, cols);
-            const char* src = static_cast<const char*>(ptr);
-            for (int64_t r = 0; r < rows; ++r) {
-                traits->to_float(src + r * static_cast<ptrdiff_t>(row_bytes), out + r * cols, cols);
-            }
-        }
-        return ApplyScaleSidecarInPlace(scale_tensor, rows, cols, dst->data(), nullptr);
-    };
-
     uint64_t cached_experts_this_step = 0;
     std::chrono::steady_clock::duration dequant_duration{};
     std::chrono::steady_clock::duration expert_duration{};
@@ -5564,88 +5263,10 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 dequant_cache_enabled && !can_use_gemma4_quant_prefill_batch &&
                 (cache_all_active_experts || work.local_hot ||
                  previous_batch_set.find(work.expert_id) != previous_batch_set.end() || work.count > 1);
-            const size_t cacheable_bytes =
-                GetExpertMatrixDequantBytes(exp.w1_type, exp.w1_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                            static_cast<int64_t>(exp.hidden_dim), safe_reference_mode) +
-                GetExpertMatrixDequantBytes(exp.w2_type, exp.w2_int4, static_cast<int64_t>(exp.hidden_dim),
-                                            static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode,
-                                            exp.w2_scale_tensor) +
-                ((exp.w3.ptr != nullptr || exp.w3_int4.IsValid())
-                     ? GetExpertMatrixDequantBytes(exp.w3_type, exp.w3_int4, static_cast<int64_t>(exp.intermediate_dim),
-                                                   static_cast<int64_t>(exp.hidden_dim), safe_reference_mode)
-                     : 0);
+            const size_t cacheable_bytes = GetMoEExpertDequantCacheBytes(exp, safe_reference_mode);
             if (should_try_cache && cacheable_bytes > 0 && cacheable_bytes <= dequant_cache_budget) {
-                std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> existing_entry;
-                {
-                    std::lock_guard<std::mutex> lock(registry->mutex);
-                    auto it = registry->dequant_cache.find(work.expert_id);
-                    if (it != registry->dequant_cache.end()) {
-                        existing_entry = it->second;
-                        if (existing_entry) {
-                            existing_entry->last_used = ++registry->dequant_cache_use_counter;
-                        }
-                    }
-                }
-
-                if (!existing_entry) {
-                    auto candidate = std::make_shared<MoELayerRegistry::DequantizedExpertCacheEntry>();
-                    candidate->expert_id = work.expert_id;
-                    candidate->bytes = cacheable_bytes;
-                    dequantize_into_buffer(exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr,
-                                           static_cast<int64_t>(exp.intermediate_dim),
-                                           static_cast<int64_t>(exp.hidden_dim), &candidate->w1);
-                    dequantize_into_buffer(exp.w2.ptr, exp.w2_type, exp.w2_int4, exp.w2_scale_tensor,
-                                           static_cast<int64_t>(exp.hidden_dim),
-                                           static_cast<int64_t>(exp.intermediate_dim), &candidate->w2);
-                    if (exp.w3.ptr != nullptr || exp.w3_int4.IsValid()) {
-                        dequantize_into_buffer(exp.w3.ptr, exp.w3_type, exp.w3_int4, nullptr,
-                                               static_cast<int64_t>(exp.intermediate_dim),
-                                               static_cast<int64_t>(exp.hidden_dim), &candidate->w3);
-                    }
-                    refresh_cached_tensors(candidate.get(), exp);
-
-                    std::lock_guard<std::mutex> lock(registry->mutex);
-                    auto it = registry->dequant_cache.find(work.expert_id);
-                    if (it != registry->dequant_cache.end()) {
-                        cached_entry = it->second;
-                        if (cached_entry) {
-                            cached_entry->last_used = ++registry->dequant_cache_use_counter;
-                        }
-                    } else if (candidate->bytes <= dequant_cache_budget) {
-                        while (registry->dequant_cache_bytes + candidate->bytes > dequant_cache_budget &&
-                               !registry->dequant_cache.empty()) {
-                            auto evict_it = registry->dequant_cache.end();
-                            uint64_t oldest_use = std::numeric_limits<uint64_t>::max();
-                            for (auto it_cache = registry->dequant_cache.begin();
-                                 it_cache != registry->dequant_cache.end(); ++it_cache) {
-                                if (!it_cache->second) {
-                                    evict_it = it_cache;
-                                    break;
-                                }
-                                if (it_cache->second->last_used < oldest_use) {
-                                    oldest_use = it_cache->second->last_used;
-                                    evict_it = it_cache;
-                                }
-                            }
-                            if (evict_it == registry->dequant_cache.end()) {
-                                break;
-                            }
-                            if (evict_it->second) {
-                                registry->dequant_cache_bytes -=
-                                    std::min(registry->dequant_cache_bytes, evict_it->second->bytes);
-                            }
-                            registry->dequant_cache.erase(evict_it);
-                        }
-                        if (registry->dequant_cache_bytes + candidate->bytes <= dequant_cache_budget) {
-                            candidate->last_used = ++registry->dequant_cache_use_counter;
-                            registry->dequant_cache_bytes += candidate->bytes;
-                            registry->dequant_cache.emplace(work.expert_id, candidate);
-                            cached_entry = std::move(candidate);
-                        }
-                    }
-                } else {
-                    cached_entry = std::move(existing_entry);
-                }
+                cached_entry = get_or_create_dequant_cache_entry(work.expert_id, exp, cacheable_bytes,
+                                                                 /*materialize_f32=*/true);
             }
 
             size_t dequantized_bytes = 0;
@@ -5683,16 +5304,19 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                     work.count <= kMoEQuantizedProjectionMaxBatch &&
                     (work.count == 1 || can_use_gemma4_quant_prefill_batch);
                 if (!can_use_ggml_quant_gen) {
-                    w1 = make_weight_f32(
-                        exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr, static_cast<int64_t>(exp.intermediate_dim),
-                        static_cast<int64_t>(exp.hidden_dim), w1_dequant, &dequantized_bytes, &dequantized_any);
-                    w2 = make_weight_f32(
-                        exp.w2.ptr, exp.w2_type, exp.w2_int4, exp.w2_scale_tensor, static_cast<int64_t>(exp.hidden_dim),
-                        static_cast<int64_t>(exp.intermediate_dim), w2_dequant, &dequantized_bytes, &dequantized_any);
+                    w1 = MakeMoEWeightF32(this, exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr,
+                                          static_cast<int64_t>(exp.intermediate_dim),
+                                          static_cast<int64_t>(exp.hidden_dim), safe_reference_mode, w1_dequant,
+                                          &dequantized_bytes, &dequantized_any);
+                    w2 = MakeMoEWeightF32(this, exp.w2.ptr, exp.w2_type, exp.w2_int4, exp.w2_scale_tensor,
+                                          static_cast<int64_t>(exp.hidden_dim),
+                                          static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode, w2_dequant,
+                                          &dequantized_bytes, &dequantized_any);
                     if (exp.w3.ptr != nullptr || exp.w3_int4.IsValid()) {
-                        w3 = make_weight_f32(
-                            exp.w3.ptr, exp.w3_type, exp.w3_int4, nullptr, static_cast<int64_t>(exp.intermediate_dim),
-                            static_cast<int64_t>(exp.hidden_dim), w3_dequant, &dequantized_bytes, &dequantized_any);
+                        w3 = MakeMoEWeightF32(this, exp.w3.ptr, exp.w3_type, exp.w3_int4, nullptr,
+                                              static_cast<int64_t>(exp.intermediate_dim),
+                                              static_cast<int64_t>(exp.hidden_dim), safe_reference_mode, w3_dequant,
+                                              &dequantized_bytes, &dequantized_any);
                     }
                 }
                 // else: w1/w2/w3 remain empty — DispatchExpertFFNImpl uses quantized GEMV
