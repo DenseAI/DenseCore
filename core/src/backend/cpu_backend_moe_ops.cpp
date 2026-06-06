@@ -2380,6 +2380,22 @@ struct MoEProjectionRequest {
     bool enable_inner_parallel = false;
 };
 
+struct MoEProjectionRuntimeContext {
+    CpuBackend* backend = nullptr;
+    int numa_node = 0;
+    const Tensor* original_input = nullptr;
+    QuantizedProjectionInputCache* input_projection_cache = nullptr;
+    QuantizedProjectionInputCache* down_projection_cache = nullptr;
+    const CpuBackend::ExpertWeights* expert = nullptr;
+    const MoEExecutionTraceContext* trace_ctx = nullptr;
+    InferenceWorkContext* gemma4_quant_prefill_ctx = nullptr;
+    bool safe_reference_mode = false;
+    bool ggml_quantized_vecdot_safe = false;
+    bool force_gemma4_quant_prefill_fast_path = false;
+    bool gemma4_quant_prefill_batch_safe = false;
+    bool enable_inner_parallel = false;
+};
+
 struct MoEProjectionPlan {
     bool projection_has_scale = false;
     bool projection_scalar_scale = false;
@@ -2493,6 +2509,39 @@ bool EmitMoEProjectionFromPlan(const MoEProjectionRequest& req, const MoEProject
     }
 
     return false;
+}
+
+bool RunMoEProjectionFromContext(const MoEProjectionRuntimeContext& ctx, char projection_slot, const Tensor& src,
+                                 const Tensor& dense_weight,
+                                 const CpuBackend::ExpertPackedInt4Weight& int4_binding,
+                                 const CpuBackend::ExpertWeight& raw_weight, int ggml_type_id, int64_t proj_rows,
+                                 int64_t proj_cols, Tensor* dst) {
+    MoEProjectionRequest request;
+    request.backend = ctx.backend;
+    request.numa_node = ctx.numa_node;
+    request.projection_slot = projection_slot;
+    request.src = &src;
+    request.dense_weight = &dense_weight;
+    request.int4_binding = &int4_binding;
+    request.raw_weight = &raw_weight;
+    request.ggml_type_id = ggml_type_id;
+    request.proj_rows = proj_rows;
+    request.proj_cols = proj_cols;
+    request.dst = dst;
+    request.original_input = ctx.original_input;
+    request.input_projection_cache = ctx.input_projection_cache;
+    request.down_projection_cache = ctx.down_projection_cache;
+    request.expert = ctx.expert;
+    request.trace_ctx = ctx.trace_ctx;
+    request.gemma4_quant_prefill_ctx = ctx.gemma4_quant_prefill_ctx;
+    request.safe_reference_mode = ctx.safe_reference_mode;
+    request.ggml_quantized_vecdot_safe = ctx.ggml_quantized_vecdot_safe;
+    request.force_gemma4_quant_prefill_fast_path = ctx.force_gemma4_quant_prefill_fast_path;
+    request.gemma4_quant_prefill_batch_safe = ctx.gemma4_quant_prefill_batch_safe;
+    request.enable_inner_parallel = ctx.enable_inner_parallel;
+
+    const MoEProjectionPlan plan = ResolveMoEProjectionPlan(request);
+    return EmitMoEProjectionFromPlan(request, plan);
 }
 
 bool ExpertUsesPackedInt4Only(const CpuBackend::ExpertWeights& expert) {
@@ -3599,38 +3648,20 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         gate_scratch.Resize(backend, hidden_size);
     }
 
-    // Unified projection dispatch: packed INT4 -> ggml quantized GEMV -> F32 dense
-    const auto run_projection = [&](const char projection_slot, const Tensor& src, const Tensor& dense_weight,
-                                    const CpuBackend::ExpertPackedInt4Weight& int4_binding,
-                                    const CpuBackend::ExpertWeight& raw_weight, int ggml_type_id, int64_t proj_rows,
-                                    int64_t proj_cols, Tensor* dst) {
-        MoEProjectionRequest request;
-        request.backend = backend;
-        request.numa_node = numa_node;
-        request.projection_slot = projection_slot;
-        request.src = &src;
-        request.dense_weight = &dense_weight;
-        request.int4_binding = &int4_binding;
-        request.raw_weight = &raw_weight;
-        request.ggml_type_id = ggml_type_id;
-        request.proj_rows = proj_rows;
-        request.proj_cols = proj_cols;
-        request.dst = dst;
-        request.original_input = &input;
-        request.input_projection_cache = input_projection_cache;
-        request.down_projection_cache = &local_down_projection_cache;
-        request.expert = &expert;
-        request.trace_ctx = trace_ctx;
-        request.gemma4_quant_prefill_ctx = gemma4_quant_prefill_ctx;
-        request.safe_reference_mode = safe_reference_mode;
-        request.ggml_quantized_vecdot_safe = ggml_quantized_vecdot_safe;
-        request.force_gemma4_quant_prefill_fast_path = force_gemma4_quant_prefill_fast_path;
-        request.gemma4_quant_prefill_batch_safe = gemma4_quant_prefill_batch_safe;
-        request.enable_inner_parallel = enable_inner_parallel;
-
-        const MoEProjectionPlan plan = ResolveMoEProjectionPlan(request);
-        EmitMoEProjectionFromPlan(request, plan);
-    };
+    MoEProjectionRuntimeContext projection_context;
+    projection_context.backend = backend;
+    projection_context.numa_node = numa_node;
+    projection_context.original_input = &input;
+    projection_context.input_projection_cache = input_projection_cache;
+    projection_context.down_projection_cache = &local_down_projection_cache;
+    projection_context.expert = &expert;
+    projection_context.trace_ctx = trace_ctx;
+    projection_context.gemma4_quant_prefill_ctx = gemma4_quant_prefill_ctx;
+    projection_context.safe_reference_mode = safe_reference_mode;
+    projection_context.ggml_quantized_vecdot_safe = ggml_quantized_vecdot_safe;
+    projection_context.force_gemma4_quant_prefill_fast_path = force_gemma4_quant_prefill_fast_path;
+    projection_context.gemma4_quant_prefill_batch_safe = gemma4_quant_prefill_batch_safe;
+    projection_context.enable_inner_parallel = enable_inner_parallel;
 
     std::chrono::steady_clock::duration w1_duration{};
     std::chrono::steady_clock::duration gate_duration{};
@@ -3640,8 +3671,8 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     if (!used_fused_gate_up) {
         const auto w1_begin =
             debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        run_projection('1', input, w1, expert.w1_int4, expert.w1, expert.w1_type, intermediate_dim, hidden_dim,
-                       &hidden);
+        RunMoEProjectionFromContext(projection_context, '1', input, w1, expert.w1_int4, expert.w1, expert.w1_type,
+                                    intermediate_dim, hidden_dim, &hidden);
         LogGemma4MoETensorStats("w1", hidden, trace_ctx);
         if (debug_ffn_timing) {
             w1_duration += (std::chrono::steady_clock::now() - w1_begin);
@@ -3652,7 +3683,8 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
         Tensor gate = Tensor::Make2D(gate_scratch.ptr, batch, intermediate_dim);
         const auto gate_begin =
             debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        run_projection('3', input, w3, expert.w3_int4, expert.w3, expert.w3_type, intermediate_dim, hidden_dim, &gate);
+        RunMoEProjectionFromContext(projection_context, '3', input, w3, expert.w3_int4, expert.w3, expert.w3_type,
+                                    intermediate_dim, hidden_dim, &gate);
         LogGemma4MoETensorStats("w3", gate, trace_ctx);
         if (debug_ffn_timing) {
             gate_duration += (std::chrono::steady_clock::now() - gate_begin);
@@ -3696,7 +3728,8 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     const auto w2_begin = debug_ffn_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto w2_profile_begin =
         profile_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    run_projection('2', hidden, w2, expert.w2_int4, expert.w2, expert.w2_type, hidden_dim, intermediate_dim, output);
+    RunMoEProjectionFromContext(projection_context, '2', hidden, w2, expert.w2_int4, expert.w2, expert.w2_type,
+                                hidden_dim, intermediate_dim, output);
     LogGemma4MoETensorStats("w2", *output, trace_ctx);
     MaybeLogGemma4PackedChecksum(expert, w1, w2, w3, hidden, *output, trace_ctx);
     if (profile_enabled) {
@@ -3813,6 +3846,39 @@ struct MoESmallDecodeState {
     int max_expert_batch = 0;
 };
 
+struct MoEActiveExpertWork {
+    int expert_id = -1;
+    int start = 0;
+    int count = 0;
+    int numa_node = -1;
+    float ema_load = 0.0f;
+    bool local_hot = false;
+};
+
+struct MoELocalityOrderingOutcome {
+    bool considered = false;
+    bool applied = false;
+    bool skipped_small_batch = false;
+    bool skipped_low_reuse = false;
+    uint64_t numa_switches_before = 0;
+    uint64_t numa_switches_after = 0;
+};
+
+struct MoEForwardExecutionPlan {
+    std::vector<MoEActiveExpertWork> active_work;
+    std::vector<int> current_batch_experts;
+    std::unordered_set<int> previous_batch_set;
+    int reuse_intersection = 0;
+    int reuse_union = 0;
+    int max_expert_batch = 0;
+    int local_hot_count = 0;
+    int worker_threads = 1;
+    bool small_decode_step = false;
+    bool prefer_inner_parallel_prefill = false;
+    bool parallelize_experts = false;
+    MoELocalityOrderingOutcome ordering;
+};
+
 // Templated on the registry pointer type so this anonymous-namespace helper does
 // not have to name CpuBackend::MoELayerRegistry (a private nested type). The only
 // caller is CpuBackend::ForwardMoE, which has access at the point of instantiation.
@@ -3865,6 +3931,166 @@ MoESmallDecodeState GatherMoESmallDecodeState(const RegistryPtr& registry, const
         }
     }
     return state;
+}
+
+uint64_t CountMoENumaSwitches(const std::vector<MoEActiveExpertWork>& work_items) {
+    uint64_t switches = 0;
+    for (size_t i = 1; i < work_items.size(); ++i) {
+        const int prev = work_items[i - 1].numa_node;
+        const int cur = work_items[i].numa_node;
+        if (prev >= 0 && cur >= 0 && prev != cur) {
+            ++switches;
+        }
+    }
+    return switches;
+}
+
+void ApplyMoELocalityOrdering(MoEForwardExecutionPlan* plan) {
+    if (!plan || plan->small_decode_step || !internal::IsMoELocalityOrderingEnabled()) {
+        return;
+    }
+
+    plan->ordering.considered = true;
+    const bool enough_active_experts =
+        static_cast<int>(plan->active_work.size()) >= internal::GetMoELocalityOrderingMinActiveExperts();
+    const bool enough_reuse_signal =
+        plan->reuse_intersection >= internal::GetMoELocalityOrderingMinReuseIntersection() || plan->local_hot_count > 0;
+
+    if (!enough_active_experts) {
+        plan->ordering.skipped_small_batch = true;
+        return;
+    }
+    if (!enough_reuse_signal) {
+        plan->ordering.skipped_low_reuse = true;
+        return;
+    }
+
+    plan->ordering.numa_switches_before = CountMoENumaSwitches(plan->active_work);
+    std::stable_sort(plan->active_work.begin(), plan->active_work.end(),
+                     [plan](const MoEActiveExpertWork& lhs, const MoEActiveExpertWork& rhs) {
+                         const auto ordering_score = [plan](const MoEActiveExpertWork& work) {
+                             const bool reused = plan->previous_batch_set.find(work.expert_id) !=
+                                                 plan->previous_batch_set.end();
+                             int score = 0;
+                             if (work.local_hot) score += 32;
+                             if (reused) score += 24;
+                             if (work.numa_node >= 0) score += 4;
+                             score += std::min(work.count, 4) * 3;
+                             return score;
+                         };
+                         const int lhs_score = ordering_score(lhs);
+                         const int rhs_score = ordering_score(rhs);
+                         if (lhs_score != rhs_score) return lhs_score > rhs_score;
+                         if (lhs.ema_load != rhs.ema_load) return lhs.ema_load < rhs.ema_load;
+                         if (lhs.count != rhs.count) return lhs.count < rhs.count;
+                         if (lhs.numa_node != rhs.numa_node) return lhs.numa_node < rhs.numa_node;
+                         return lhs.expert_id < rhs.expert_id;
+                     });
+    plan->ordering.numa_switches_after = CountMoENumaSwitches(plan->active_work);
+    plan->ordering.applied = true;
+}
+
+void BalanceMoEParallelExpertWork(std::vector<MoEActiveExpertWork>* active_work, int active_threads) {
+    if (!active_work || active_threads <= 1 || active_work->size() <= 1) {
+        return;
+    }
+
+    const int work_per_thread = (static_cast<int>(active_work->size()) + active_threads - 1) / active_threads;
+    std::vector<MoEActiveExpertWork> by_cost = *active_work;
+    std::stable_sort(by_cost.begin(), by_cost.end(), [](const MoEActiveExpertWork& lhs, const MoEActiveExpertWork& rhs) {
+        if (lhs.count != rhs.count) {
+            return lhs.count > rhs.count;
+        }
+        return lhs.expert_id < rhs.expert_id;
+    });
+
+    std::vector<std::vector<MoEActiveExpertWork>> buckets(static_cast<size_t>(active_threads));
+    std::vector<int64_t> bucket_cost(static_cast<size_t>(active_threads), 0);
+    for (const MoEActiveExpertWork& work : by_cost) {
+        int best_bucket = -1;
+        for (int bucket = 0; bucket < active_threads; ++bucket) {
+            if (static_cast<int>(buckets[static_cast<size_t>(bucket)].size()) >= work_per_thread) {
+                continue;
+            }
+            if (best_bucket < 0 ||
+                bucket_cost[static_cast<size_t>(bucket)] < bucket_cost[static_cast<size_t>(best_bucket)]) {
+                best_bucket = bucket;
+            }
+        }
+        if (best_bucket < 0) {
+            best_bucket = active_threads - 1;
+        }
+        buckets[static_cast<size_t>(best_bucket)].push_back(work);
+        bucket_cost[static_cast<size_t>(best_bucket)] += std::max(1, work.count);
+    }
+
+    active_work->clear();
+    active_work->reserve(by_cost.size());
+    for (auto& bucket : buckets) {
+        active_work->insert(active_work->end(), bucket.begin(), bucket.end());
+    }
+}
+
+MoEForwardExecutionPlan BuildMoEForwardExecutionPlan(const moe::MoEReorderMapView& reorder_map, int num_experts,
+                                                     int batch_size, int total_assignments, int worker_threads,
+                                                     bool registry_present,
+                                                     const std::unordered_set<int>& local_hot_experts,
+                                                     const std::vector<int>& previous_batch_experts,
+                                                     const std::shared_ptr<moe::ExpertProfiler>& profiler) {
+    MoEForwardExecutionPlan plan;
+    plan.worker_threads = std::max(1, worker_threads);
+    plan.active_work.reserve(static_cast<size_t>(num_experts));
+    plan.current_batch_experts.reserve(static_cast<size_t>(num_experts));
+
+    for (int expert_id = 0; expert_id < num_experts; ++expert_id) {
+        const int start = reorder_map.expert_offsets[static_cast<size_t>(expert_id)];
+        const int end = reorder_map.expert_offsets[static_cast<size_t>(expert_id + 1)];
+        const int count = end - start;
+        if (count <= 0) {
+            continue;
+        }
+
+        MoEActiveExpertWork work;
+        work.expert_id = expert_id;
+        work.start = start;
+        work.count = count;
+        work.local_hot = local_hot_experts.find(expert_id) != local_hot_experts.end();
+        if (profiler) {
+            work.numa_node = profiler->GetExpertNumaNode(expert_id);
+            work.ema_load = profiler->GetEmaLoad(expert_id);
+        }
+        plan.local_hot_count += work.local_hot ? 1 : 0;
+        plan.active_work.push_back(work);
+        plan.current_batch_experts.push_back(expert_id);
+    }
+
+    if (!previous_batch_experts.empty()) {
+        plan.previous_batch_set.insert(previous_batch_experts.begin(), previous_batch_experts.end());
+        for (int expert_id : plan.current_batch_experts) {
+            if (plan.previous_batch_set.find(expert_id) != plan.previous_batch_set.end()) {
+                ++plan.reuse_intersection;
+            }
+        }
+    }
+    plan.reuse_union =
+        static_cast<int>(plan.current_batch_experts.size() + previous_batch_experts.size() - plan.reuse_intersection);
+    plan.max_expert_batch = reorder_map.max_expert_batch;
+    plan.small_decode_step = batch_size <= 4 && total_assignments <= 8 && plan.max_expert_batch <= 1;
+
+    ApplyMoELocalityOrdering(&plan);
+
+    plan.prefer_inner_parallel_prefill =
+        !plan.small_decode_step && batch_size > 1 && plan.active_work.size() < static_cast<size_t>(plan.worker_threads);
+    plan.parallelize_experts =
+        !plan.prefer_inner_parallel_prefill && !plan.small_decode_step && batch_size > 1 &&
+        plan.active_work.size() >= static_cast<size_t>(std::max(4, plan.worker_threads / 2)) && registry_present;
+
+    if (plan.parallelize_experts && plan.active_work.size() > 1) {
+        const int active_threads = std::max(1, std::min(plan.worker_threads, static_cast<int>(plan.active_work.size())));
+        BalanceMoEParallelExpertWork(&plan.active_work, active_threads);
+    }
+
+    return plan;
 }
 
 // Handles the Gemma4 / Qwen3.6 "safe reference" fast paths that bypass the
@@ -5077,40 +5303,12 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
     local_hot_experts_set.reserve(local_hot_experts.size());
     local_hot_experts_set.insert(local_hot_experts.begin(), local_hot_experts.end());
 
-    struct ActiveExpertWork {
-        int expert_id = -1;
-        int start = 0;
-        int count = 0;
-        int numa_node = -1;
-        float ema_load = 0.0f;
-        bool local_hot = false;
-    };
-
-    std::vector<ActiveExpertWork> active_work;
-    active_work.reserve(static_cast<size_t>(num_experts));
-    std::vector<int> current_batch_experts;
-    current_batch_experts.reserve(static_cast<size_t>(num_experts));
-
-    for (int expert_id = 0; expert_id < num_experts; ++expert_id) {
-        const int start = reorder_map.expert_offsets[static_cast<size_t>(expert_id)];
-        const int end = reorder_map.expert_offsets[static_cast<size_t>(expert_id + 1)];
-        const int count = end - start;
-        if (count <= 0) {
-            continue;
-        }
-
-        ActiveExpertWork work;
-        work.expert_id = expert_id;
-        work.start = start;
-        work.count = count;
-        work.local_hot = local_hot_experts_set.find(expert_id) != local_hot_experts_set.end();
-        if (profiler) {
-            work.numa_node = profiler->GetExpertNumaNode(expert_id);
-            work.ema_load = profiler->GetEmaLoad(expert_id);
-        }
-        active_work.push_back(work);
-        current_batch_experts.push_back(expert_id);
-    }
+    MoEForwardExecutionPlan execution_plan = BuildMoEForwardExecutionPlan(
+        reorder_map, num_experts, batch_size, total_assignments, std::max(1, reorder_pool.GetNumThreads()),
+        registry != nullptr, local_hot_experts_set, previous_batch_experts, profiler);
+    std::vector<MoEActiveExpertWork>& active_work = execution_plan.active_work;
+    const std::vector<int>& current_batch_experts = execution_plan.current_batch_experts;
+    const std::unordered_set<int>& previous_batch_set = execution_plan.previous_batch_set;
 
     if (active_work.empty()) {
         return;
@@ -5131,23 +5329,12 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
         std::fputc('\n', stderr);
     }
 
-    int reuse_intersection = 0;
-    std::unordered_set<int> previous_batch_set;
-    if (!previous_batch_experts.empty()) {
-        previous_batch_set.insert(previous_batch_experts.begin(), previous_batch_experts.end());
-        for (int expert_id : current_batch_experts) {
-            if (previous_batch_set.find(expert_id) != previous_batch_set.end()) {
-                ++reuse_intersection;
-            }
-        }
-    }
-    const int reuse_union =
-        static_cast<int>(current_batch_experts.size() + previous_batch_experts.size() - reuse_intersection);
-    const int max_expert_batch = reorder_map.max_expert_batch;
-    const int local_hot_count = static_cast<int>(std::count_if(
-        active_work.begin(), active_work.end(), [](const ActiveExpertWork& work) { return work.local_hot; }));
-    const int worker_threads = std::max(1, reorder_pool.GetNumThreads());
-    const bool small_decode_step = batch_size <= 4 && total_assignments <= 8 && max_expert_batch <= 1;
+    const int reuse_intersection = execution_plan.reuse_intersection;
+    const int reuse_union = execution_plan.reuse_union;
+    const int max_expert_batch = execution_plan.max_expert_batch;
+    const int local_hot_count = execution_plan.local_hot_count;
+    const int worker_threads = execution_plan.worker_threads;
+    const bool small_decode_step = execution_plan.small_decode_step;
 
     moe_stats_batches_.fetch_add(1, std::memory_order_relaxed);
     moe_stats_total_active_experts_.fetch_add(static_cast<uint64_t>(active_work.size()), std::memory_order_relaxed);
@@ -5164,58 +5351,19 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
         registry->last_batch_experts = current_batch_experts;
     }
 
-    if (!small_decode_step && internal::IsMoELocalityOrderingEnabled()) {
+    if (execution_plan.ordering.considered) {
         moe_stats_total_ordering_considered_.fetch_add(1, std::memory_order_relaxed);
-
-        const bool enough_active_experts =
-            static_cast<int>(active_work.size()) >= internal::GetMoELocalityOrderingMinActiveExperts();
-        const bool enough_reuse_signal =
-            reuse_intersection >= internal::GetMoELocalityOrderingMinReuseIntersection() || local_hot_count > 0;
-
-        auto count_numa_switches = [](const std::vector<ActiveExpertWork>& work_items) -> uint64_t {
-            uint64_t switches = 0;
-            for (size_t i = 1; i < work_items.size(); ++i) {
-                const int prev = work_items[i - 1].numa_node;
-                const int cur = work_items[i].numa_node;
-                if (prev >= 0 && cur >= 0 && prev != cur) {
-                    ++switches;
-                }
-            }
-            return switches;
-        };
-
-        if (!enough_active_experts) {
+        if (execution_plan.ordering.skipped_small_batch) {
             moe_stats_total_ordering_skipped_small_batch_.fetch_add(1, std::memory_order_relaxed);
-        } else if (!enough_reuse_signal) {
+        } else if (execution_plan.ordering.skipped_low_reuse) {
             moe_stats_total_ordering_skipped_low_reuse_.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            const uint64_t switches_before = count_numa_switches(active_work);
-            moe_stats_total_ordering_numa_switches_before_.fetch_add(switches_before, std::memory_order_relaxed);
-
-            auto ordering_score = [&previous_batch_set](const ActiveExpertWork& work) -> int {
-                const bool reused = previous_batch_set.find(work.expert_id) != previous_batch_set.end();
-                int score = 0;
-                if (work.local_hot) score += 32;
-                if (reused) score += 24;
-                if (work.numa_node >= 0) score += 4;
-                score += std::min(work.count, 4) * 3;
-                return score;
-            };
-
-            std::stable_sort(active_work.begin(), active_work.end(),
-                             [&ordering_score](const ActiveExpertWork& lhs, const ActiveExpertWork& rhs) {
-                                 const int lhs_score = ordering_score(lhs);
-                                 const int rhs_score = ordering_score(rhs);
-                                 if (lhs_score != rhs_score) return lhs_score > rhs_score;
-                                 if (lhs.ema_load != rhs.ema_load) return lhs.ema_load < rhs.ema_load;
-                                 if (lhs.count != rhs.count) return lhs.count < rhs.count;
-                                 if (lhs.numa_node != rhs.numa_node) return lhs.numa_node < rhs.numa_node;
-                                 return lhs.expert_id < rhs.expert_id;
-                             });
-
-            const uint64_t switches_after = count_numa_switches(active_work);
+        }
+        if (execution_plan.ordering.applied) {
+            moe_stats_total_ordering_numa_switches_before_.fetch_add(
+                execution_plan.ordering.numa_switches_before, std::memory_order_relaxed);
             moe_stats_total_ordering_applied_.fetch_add(1, std::memory_order_relaxed);
-            moe_stats_total_ordering_numa_switches_after_.fetch_add(switches_after, std::memory_order_relaxed);
+            moe_stats_total_ordering_numa_switches_after_.fetch_add(execution_plan.ordering.numa_switches_after,
+                                                                    std::memory_order_relaxed);
         }
     }
 
@@ -5321,11 +5469,8 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
     std::chrono::steady_clock::duration dequant_duration{};
     std::chrono::steady_clock::duration expert_duration{};
     std::mutex work_stats_mutex;
-    const bool prefer_inner_parallel_prefill =
-        !small_decode_step && batch_size > 1 && active_work.size() < static_cast<size_t>(worker_threads);
-    const bool parallelize_experts = !prefer_inner_parallel_prefill && !small_decode_step && batch_size > 1 &&
-                                     active_work.size() >= static_cast<size_t>(std::max(4, worker_threads / 2)) &&
-                                     registry != nullptr;
+    const bool prefer_inner_parallel_prefill = execution_plan.prefer_inner_parallel_prefill;
+    const bool parallelize_experts = execution_plan.parallelize_experts;
     if (IsMoECachePolicyDebugEnabled()) {
         std::fprintf(stderr,
                      "[MOE_CACHE_POLICY] arm_disable_registry_dequant_cache=%d registry_present=%d "
@@ -5335,44 +5480,6 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                      prefer_inner_parallel_prefill ? "prefill_inner_parallel" : "cache_lane_available");
     }
 
-    if (parallelize_experts && active_work.size() > 1) {
-        const int active_threads = std::max(1, std::min(worker_threads, static_cast<int>(active_work.size())));
-        const int work_per_thread = (static_cast<int>(active_work.size()) + active_threads - 1) / active_threads;
-        std::vector<ActiveExpertWork> by_cost = active_work;
-        std::stable_sort(by_cost.begin(), by_cost.end(), [](const ActiveExpertWork& lhs, const ActiveExpertWork& rhs) {
-            if (lhs.count != rhs.count) {
-                return lhs.count > rhs.count;
-            }
-            return lhs.expert_id < rhs.expert_id;
-        });
-
-        std::vector<std::vector<ActiveExpertWork>> buckets(static_cast<size_t>(active_threads));
-        std::vector<int64_t> bucket_cost(static_cast<size_t>(active_threads), 0);
-        for (const ActiveExpertWork& work : by_cost) {
-            int best_bucket = -1;
-            for (int bucket = 0; bucket < active_threads; ++bucket) {
-                if (static_cast<int>(buckets[static_cast<size_t>(bucket)].size()) >= work_per_thread) {
-                    continue;
-                }
-                if (best_bucket < 0 ||
-                    bucket_cost[static_cast<size_t>(bucket)] < bucket_cost[static_cast<size_t>(best_bucket)]) {
-                    best_bucket = bucket;
-                }
-            }
-            if (best_bucket < 0) {
-                best_bucket = active_threads - 1;
-            }
-            buckets[static_cast<size_t>(best_bucket)].push_back(work);
-            bucket_cost[static_cast<size_t>(best_bucket)] += std::max(1, work.count);
-        }
-
-        active_work.clear();
-        active_work.reserve(by_cost.size());
-        for (auto& bucket : buckets) {
-            active_work.insert(active_work.end(), bucket.begin(), bucket.end());
-        }
-    }
-
     auto run_active_work_range = [&](int start_idx, int end_idx, bool allow_inner_parallel) {
         uint64_t local_cached_experts = 0;
         std::chrono::steady_clock::duration local_dequant_duration{};
@@ -5380,12 +5487,12 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
 
         for (int raw_idx = start_idx; raw_idx < end_idx; ++raw_idx) {
             const size_t idx = static_cast<size_t>(raw_idx);
-            const ActiveExpertWork& work = active_work[idx];
+            const MoEActiveExpertWork& work = active_work[idx];
             const ExpertWeights& exp = experts[static_cast<size_t>(work.expert_id)];
 
             if (!small_decode_step && internal::IsMoENextExpertPrefetchEnabled() && idx + 1 < active_work.size()) {
                 moe_stats_total_prefetch_candidates_.fetch_add(1, std::memory_order_relaxed);
-                const ActiveExpertWork& next_work = active_work[idx + 1];
+                const MoEActiveExpertWork& next_work = active_work[idx + 1];
                 const bool next_reused = previous_batch_set.find(next_work.expert_id) != previous_batch_set.end();
                 const int reuse_signals =
                     (next_work.local_hot ? 1 : 0) + (next_reused ? 1 : 0) + (next_work.count > 1 ? 1 : 0);
