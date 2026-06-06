@@ -114,7 +114,6 @@ struct FastPathRuntimeConfig {
     densecore::env::RuntimeToggleMode qwen36_expert_cpu_repack = densecore::env::RuntimeToggleMode::Auto;
     densecore::env::RuntimeToggleMode native_moe_fast_decode = densecore::env::RuntimeToggleMode::On;
     densecore::env::RuntimeToggleMode q4k_repacked_gemv = densecore::env::RuntimeToggleMode::On;
-    densecore::env::RuntimeToggleMode q6k_repacked_gemv = densecore::env::RuntimeToggleMode::Auto;
     bool q4k_repacked_gemv_allow_prefill = true;
     bool q4k_repacked_gemv_probe = false;
     bool q4k_repacked_gemv_disable_on_thrash = false;

@@ -697,12 +697,6 @@ bool CanUseGgmlQuantizedMoEPrefillBatch(const CpuBackend::ExpertWeights& exp, in
     return true;
 }
 
-bool CanUseQ6KRepackedMoEGemvFastPath() {
-    // Q6_K repacked MoE GEMV is not a maintained fast path yet. Keep it closed
-    // without an env override until it has correctness and throughput evidence.
-    return false;
-}
-
 bool CanUseQ5KRepackedMoEGemvFastPath() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return ggml_cpu_has_neon() && ggml_cpu_has_dotprod();
@@ -715,7 +709,7 @@ bool IsQwenA3BHybridMoEModel(const TransformerModel* model);
 bool IsLFM2MoEModelForSmallDecodeParallel(const TransformerModel* model);
 
 bool CanUseSmallDecodeQuantizedTileParallel(const TransformerModel* model) {
-    return IsQwenA3BHybridMoEModel(model) || IsLFM2MoEModelForSmallDecodeParallel(model);
+    return IsQwenA3BHybridMoEModel(model);
 }
 
 using MoEQ4Kx8Block = densecore::kernels::Q4KRepackedGemvBlock;
@@ -729,15 +723,6 @@ struct MoEQ5Kx8Block {
 };
 static_assert(sizeof(MoEQ5Kx8Block) == 16 * sizeof(uint16_t) + 8 * K_SCALE_SIZE + QK_K * 5,
               "MoE Q5_Kx8 block layout must match ggml block_q5_Kx8");
-
-struct MoEQ6Kx8Block {
-    uint16_t d[8];
-    int8_t scales[QK_K / 16 * 8];
-    uint8_t ql[QK_K / 2 * 8];
-    uint8_t qh[QK_K / 4 * 8];
-};
-static_assert(sizeof(MoEQ6Kx8Block) == 8 * sizeof(uint16_t) + (QK_K / 16) * 8 + (3 * QK_K / 4) * 8,
-              "MoE Q6_Kx8 block layout must match ggml block_q6_Kx8");
 
 size_t GetRepackedMoECacheLimitBytes() {
     constexpr size_t kMinBytes = 1024ull * 1024ull * 1024ull;
@@ -859,78 +844,6 @@ std::shared_ptr<Q5KRepackedMoEWeight> GetOrCreateQ5KRepackedMoEWeight(const void
     packed->last_use = now;
 
     if (ggml_repack_q5_K_8x8(weight_ptr, raw_bytes, rows, cols, packed->blocks.data(), packed->bytes) != 0) {
-        return nullptr;
-    }
-
-    cache.emplace(key, packed);
-    cache_bytes += packed->bytes;
-    while (cache_bytes > cache_limit && cache.size() > 1) {
-        auto oldest = cache.end();
-        for (auto it = cache.begin(); it != cache.end(); ++it) {
-            if (it->first == key) {
-                continue;
-            }
-            if (oldest == cache.end() || it->second->last_use < oldest->second->last_use) {
-                oldest = it;
-            }
-        }
-        if (oldest == cache.end()) {
-            break;
-        }
-        cache_bytes -= oldest->second->bytes;
-        cache.erase(oldest);
-    }
-
-    return packed;
-}
-
-struct Q6KRepackedMoEWeight {
-    int64_t rows = 0;
-    int64_t cols = 0;
-    int64_t blocks_per_row = 0;
-    size_t bytes = 0;
-    uint64_t last_use = 0;
-    std::vector<MoEQ6Kx8Block> blocks;
-};
-
-std::shared_ptr<Q6KRepackedMoEWeight> GetOrCreateQ6KRepackedMoEWeight(const void* weight_ptr, int64_t rows,
-                                                                      int64_t cols) {
-    if (!weight_ptr || rows <= 0 || cols <= 0 || (rows % 8) != 0 || (cols % QK_K) != 0 ||
-        !CanUseQ6KRepackedMoEGemvFastPath()) {
-        return nullptr;
-    }
-    const size_t cache_limit = GetRepackedMoECacheLimitBytes();
-    if (cache_limit == 0) {
-        return nullptr;
-    }
-
-    static std::mutex mutex;
-    static std::unordered_map<RepackedMoEKey, std::shared_ptr<Q6KRepackedMoEWeight>, RepackedMoEKeyHash> cache;
-    static size_t cache_bytes = 0;
-    static std::atomic<uint64_t> use_clock{0};
-
-    const size_t raw_bytes = static_cast<size_t>(rows) * ggml_row_size(GGML_TYPE_Q6_K, cols);
-    const RepackedMoEKey key{weight_ptr, rows, cols, FingerprintRepackedMoEWeight(weight_ptr, raw_bytes)};
-    const uint64_t now = use_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-
-    std::lock_guard<std::mutex> lock(mutex);
-    auto found = cache.find(key);
-    if (found != cache.end()) {
-        found->second->last_use = now;
-        return found->second;
-    }
-
-    const int64_t blocks_per_row = cols / QK_K;
-    const size_t packed_blocks = static_cast<size_t>(rows / 8) * static_cast<size_t>(blocks_per_row);
-    auto packed = std::make_shared<Q6KRepackedMoEWeight>();
-    packed->rows = rows;
-    packed->cols = cols;
-    packed->blocks_per_row = blocks_per_row;
-    packed->blocks.resize(packed_blocks);
-    packed->bytes = packed->blocks.size() * sizeof(MoEQ6Kx8Block);
-    packed->last_use = now;
-
-    if (ggml_repack_q6_K_8x8(weight_ptr, raw_bytes, rows, cols, packed->blocks.data(), packed->bytes) != 0) {
         return nullptr;
     }
 
@@ -1347,39 +1260,6 @@ bool RunQ5KRepackedMoEFusedSwiGLURawProjectionImpl(CpuBackend* backend, const vo
                                   : "ggml_q5k_repacked_fused_swiglu",
                      static_cast<int>(rows), static_cast<int>(input_cols), static_cast<int>(cols), 0,
                      allow_parallel);
-    return true;
-}
-
-bool RunQ6KRepackedMoEGemv(CpuBackend* backend, const std::shared_ptr<Q6KRepackedMoEWeight>& packed,
-                           const uint8_t* qinput_data, size_t qinput_row_bytes, float* output_data, int64_t rows,
-                           int64_t cols, int numa_node, bool allow_parallel) {
-    if (!backend || !packed || !qinput_data || !output_data || packed->rows != cols || (cols % 8) != 0 ||
-        packed->cols <= 0) {
-        return false;
-    }
-
-    auto& pool = backend->GetThreadPool(numa_node);
-    const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
-    const int tile_count = static_cast<int>(cols / 8);
-    const int blocks_per_row = static_cast<int>(packed->blocks_per_row);
-
-    for (int64_t row = 0; row < rows; ++row) {
-        const auto* qi = qinput_data + static_cast<size_t>(row) * qinput_row_bytes;
-        float* out = output_data + static_cast<size_t>(row) * cols;
-        const auto compute_tiles = [&](int tile_start, int tile_end) {
-            if (tile_start >= tile_end) {
-                return;
-            }
-            const void* vx = packed->blocks.data() + static_cast<size_t>(tile_start) * blocks_per_row;
-            ggml_gemv_q6_K_8x8_q8_K(static_cast<int>(packed->cols), out + static_cast<size_t>(tile_start) * 8, 0, vx,
-                                    qi, 1, (tile_end - tile_start) * 8);
-        };
-        if (n_threads > 1 && tile_count >= 2) {
-            pool.ParallelFor(tile_count, [&](int start, int end, int) { compute_tiles(start, end); });
-        } else {
-            compute_tiles(0, tile_count);
-        }
-    }
     return true;
 }
 
@@ -2632,21 +2512,6 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
     const bool q4k_prefill_repacked_eligible = CanUseQ4KRepackedMoEPrefillFastPath() && wtype == GGML_TYPE_Q4_K &&
                                                iq_type == GGML_TYPE_Q8_K && M > 1 && (N % 8) == 0 &&
                                                (K % ggml_blck_size(GGML_TYPE_Q4_K)) == 0;
-    const auto try_q6k_repacked_gemv = [&]() -> bool {
-        if (wtype != GGML_TYPE_Q6_K || iq_type != GGML_TYPE_Q8_K || (N % 8) != 0 ||
-            (K % ggml_blck_size(GGML_TYPE_Q6_K)) != 0) {
-            return false;
-        }
-        auto packed = GetOrCreateQ6KRepackedMoEWeight(weight_ptr, N, K);
-        if (packed && RunQ6KRepackedMoEGemv(backend, packed, qinput_data, iq_row_bytes, out_data, M, N, numa_node,
-                                            allow_parallel)) {
-            LogMoEMatmulPath("ggml_q6k_repacked_gemv", static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0,
-                             allow_parallel);
-            record_dispatch("moe_expert");
-            return true;
-        }
-        return false;
-    };
     const auto try_q5k_repacked_gemv = [&]() -> bool {
         if (wtype != GGML_TYPE_Q5_K) {
             return false;
@@ -2728,9 +2593,6 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
             record_dispatch("q4k_repacked_gemv");
             return true;
         }
-    }
-    if (try_q6k_repacked_gemv()) {
-        return true;
     }
     if (use_kquant_rowpair_vec_dot) {
         auto& pool = backend->GetThreadPool(numa_node);
@@ -4696,16 +4558,17 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                              CanUseSharedDecodeInputCacheForExpert(exp, shared_decode_input_projection_cache_ptr->type))
                                 ? shared_decode_input_projection_cache_ptr
                                 : &local_input_projection_cache;
+                        const int expert_numa_node = profiler ? profiler->GetExpertNumaNode(expert_id) : -1;
                         const bool gate_up_ok =
                             exp.use_gelu_activation
                                 ? TryRunGgmlQuantizedFusedGEGLUProjection(
                                       this, gate_ptr, exp.w1_type, up_ptr, exp.w3_type, expert_input, &hidden_tensor,
-                                      tile_rows, hidden_dim, profiler ? profiler->GetExpertNumaNode(expert_id) : -1,
-                                      /*allow_parallel=*/false, unit_input_projection_cache)
+                                      tile_rows, hidden_dim, expert_numa_node, /*allow_parallel=*/false,
+                                      unit_input_projection_cache)
                                 : TryRunGgmlQuantizedFusedSwiGLUProjection(
                                       this, gate_ptr, exp.w1_type, up_ptr, exp.w3_type, expert_input, &hidden_tensor,
-                                      tile_rows, hidden_dim, profiler ? profiler->GetExpertNumaNode(expert_id) : -1,
-                                      /*allow_parallel=*/false, unit_input_projection_cache);
+                                      tile_rows, hidden_dim, expert_numa_node, /*allow_parallel=*/false,
+                                      unit_input_projection_cache);
                         if (!gate_up_ok) {
                             tile_ok.store(false, std::memory_order_relaxed);
                         }
@@ -4781,10 +4644,11 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                                     exp.w2_type, down_input_projection_caches[static_cast<size_t>(i)].type)
                                     ? &down_input_projection_caches[static_cast<size_t>(i)]
                                     : &local_down_input_projection_cache;
+                            const int expert_numa_node = profiler ? profiler->GetExpertNumaNode(expert_id) : -1;
                             if (!TryRunGgmlQuantizedProjection(this, down_ptr, exp.w2_type, hidden_tensor,
                                                                &output_tensor, tile_rows, small_decode_intermediate_dim,
-                                                               profiler ? profiler->GetExpertNumaNode(expert_id) : -1,
-                                                               /*allow_parallel=*/false, down_input_projection_cache)) {
+                                                               expert_numa_node, /*allow_parallel=*/false,
+                                                               down_input_projection_cache)) {
                                 tile_ok.store(false, std::memory_order_relaxed);
                             } else if (exp.w2_scale_tensor != nullptr) {
                                 ApplyScalarScaleToTensor(&output_tensor, ReadScalarScaleSidecar(exp.w2_scale_tensor));

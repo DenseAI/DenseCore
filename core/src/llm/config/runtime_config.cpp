@@ -287,8 +287,6 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
         ParseRuntimeToggleEnvFailClosed("DENSECORE_QWEN36_EXPERT_CPU_REPACK", env::RuntimeToggleMode::Auto);
     config.native_moe_fast_decode = env::RuntimeToggleMode::On;
     config.q4k_repacked_gemv = env::RuntimeToggleMode::On;
-    config.q6k_repacked_gemv =
-        ParseRuntimeToggleEnvFailClosed("DENSECORE_Q6K_REPACKED_GEMV", env::RuntimeToggleMode::Auto);
     config.q4k_repacked_gemv_allow_prefill = true;
     config.q4k_repacked_gemv_probe = false;
     config.q4k_repacked_gemv_disable_on_thrash = false;
