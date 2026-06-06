@@ -395,6 +395,24 @@ inline DenseCoreSemanticOp ResolveDenseCoreSemanticOp(const TransformerModel* mo
     }
 }
 
+inline DenseCoreKernelFamily ResolveMaintainedKernelFamilyForTensorRole(
+    ggml_type raw_type, DenseCoreMatmulPhase phase, DenseCoreTensorRole role) {
+    if (role == DenseCoreTensorRole::MoEGateUp || role == DenseCoreTensorRole::MoEDown) {
+        return DenseCoreKernelFamily::DenseCoreQwenMoeDirect;
+    }
+    if (raw_type == GGML_TYPE_F32) {
+        return phase == DenseCoreMatmulPhase::Decode ? DenseCoreKernelFamily::DenseCoreF32Gemv
+                                                     : DenseCoreKernelFamily::DenseCoreF32SmallBatch;
+    }
+    if (raw_type == GGML_TYPE_Q4_K && phase == DenseCoreMatmulPhase::Prefill) {
+        return DenseCoreKernelFamily::DenseCoreQ4KBatched;
+    }
+    if (ggml_is_quantized(raw_type)) {
+        return DenseCoreKernelFamily::DenseCoreQuantGemv;
+    }
+    return DenseCoreKernelFamily::TemporaryReferenceGgml;
+}
+
 inline HostKernelCapabilities CompileTimeHostKernelCapabilities(bool q4k_true_batched = false,
                                                                 bool ggml_repack = false) {
     HostKernelCapabilities caps;
@@ -489,7 +507,11 @@ inline KernelResolution ResolveKernelResolution(const TransformerModel* model, g
                                  ? semantic_override
                                  : ResolveDenseCoreSemanticOp(model, resolution.tensor_role);
     resolution.selected_kernel =
-        kernel_override != DenseCoreKernelFamily::None ? kernel_override : resolution.matmul_plan.kernel;
+        kernel_override != DenseCoreKernelFamily::None
+            ? kernel_override
+            : (role_override != DenseCoreTensorRole::Unknown
+                   ? ResolveMaintainedKernelFamilyForTensorRole(weight_type, phase, resolution.tensor_role)
+                   : resolution.matmul_plan.kernel);
     resolution.fallback_policy =
         has_fallback_policy_override
             ? fallback_policy_override
@@ -517,6 +539,19 @@ inline KernelResolution ResolveKernelResolution(const TransformerModel* model, g
         reject("no_selected_kernel");
     }
     return resolution;
+}
+
+inline bool KernelResolutionTargetsQ4KBatchedPrefill(const KernelResolution& resolution) {
+    return resolution.selected_kernel == DenseCoreKernelFamily::DenseCoreQ4KBatched &&
+           resolution.matmul_plan.phase == DenseCoreMatmulPhase::Prefill &&
+           resolution.matmul_plan.weight_type == GGML_TYPE_Q4_K &&
+           resolution.matmul_plan.input_type == GGML_TYPE_F32 &&
+           resolution.matmul_plan.m > 1;
+}
+
+inline bool KernelResolutionSelectsQ4KBatchedPrefill(const KernelResolution& resolution) {
+    return KernelResolutionTargetsQ4KBatchedPrefill(resolution) &&
+           resolution.matmul_plan.compatible;
 }
 
 inline bool IsExplicitTemporaryReferenceFallback(const char* reason) {

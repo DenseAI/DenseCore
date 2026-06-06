@@ -222,7 +222,7 @@ bool RequiredFastPathCounterSatisfied(const Request* req, const TargetFastPathGa
         return req->ssm_delta_calls > 0;
     }
     if (counter == "lfm2_shortconv_sequence_fast_used_ops") {
-        return req->ssm_conv1d_calls > 0;
+        return req->decode_graph_node_custom_ssm_count > 0 || req->ssm_conv1d_calls > 0;
     }
     if (counter == "gemma4_prefill_maintained_fast_ops") {
         return Gemma4MaintainedPrefillFastOpsUsed(req);
@@ -317,6 +317,8 @@ TargetFastPathGate EvaluateTargetFastPathGate(
                                                                   : "gemma4_moe_decode_fast_ops_missing";
     } else if (gate.required && gate.hybrid_ssm_stateful_ops_missing) {
         gate.failure_reason = "hybrid_ssm_stateful_ops_missing";
+    } else if (gate.required && !gate.required_fast_path_counters_ok) {
+        gate.failure_reason = "required_fast_path_counters_missing";
     }
     return gate;
 }
@@ -1684,6 +1686,58 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         return;
     }
     const auto ns_to_ms = [](uint64_t ns) { return static_cast<double>(ns) / 1000000.0; };
+    const auto lfm2_argmax_reject_reason_name = [](int reason) -> const char* {
+        switch (reason) {
+        case 0:
+            return "none";
+        case 1:
+            return "not_allowed";
+        case 2:
+            return "unsupported_shape";
+        case 3:
+            return "unsupported_weight";
+        case 4:
+            return "missing_quant_input";
+        case 5:
+            return "kernel_unavailable";
+        case 6:
+            return "sync";
+        case 7:
+            return "json_mode";
+        case 8:
+            return "temperature";
+        case 9:
+            return "final_logit_softcap";
+        case 10:
+            return "action_token_range";
+        case 11:
+            return "frequency_penalty";
+        case 12:
+            return "presence_penalty";
+        case 13:
+            return "grammar";
+        case 14:
+            return "allowed_tokens";
+        case 15:
+            return "disallowed_tokens";
+        case 16:
+            return "debug_sampler";
+        case 17:
+            return "invalid_repetition_penalty";
+        case 18:
+            return "unsupported_model";
+        case 19:
+            return "non_decode_phase";
+        case 20:
+            return "embedding_batch";
+        case 21:
+            return "unsupported_batch";
+        case 22:
+            return "missing_request";
+        default:
+            return "unknown";
+        }
+    };
     const auto point_to_ms = [](std::chrono::steady_clock::time_point start,
                                 std::chrono::steady_clock::time_point end) -> double {
         if (start == std::chrono::steady_clock::time_point() || end == std::chrono::steady_clock::time_point() ||
@@ -1844,6 +1898,20 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                            << ":ms=" << ns_to_ms(req->decode_graph_node_attention_ns)
                            << ",other:count=" << req->decode_graph_node_other_count
                            << ":ms=" << ns_to_ms(req->decode_graph_node_other_ns);
+    std::ostringstream decode_graph_custom_node_hist;
+    decode_graph_custom_node_hist << "moe:count=" << req->decode_graph_node_custom_moe_count
+                                  << ":ms=" << ns_to_ms(req->decode_graph_node_custom_moe_ns)
+                                  << ",ssm_stateful:count=" << req->decode_graph_node_custom_ssm_count
+                                  << ":ms=" << ns_to_ms(req->decode_graph_node_custom_ssm_ns)
+                                  << ",projection:count=" << req->decode_graph_node_custom_projection_count
+                                  << ":ms=" << ns_to_ms(req->decode_graph_node_custom_projection_ns)
+                                  << ",lm_head:count=" << req->decode_graph_node_custom_lm_head_count
+                                  << ":ms=" << ns_to_ms(req->decode_graph_node_custom_lm_head_ns)
+                                  << ",paged_attention:count="
+                                  << req->decode_graph_node_custom_paged_attention_count
+                                  << ":ms=" << ns_to_ms(req->decode_graph_node_custom_paged_attention_ns)
+                                  << ",other:count=" << req->decode_graph_node_custom_other_count
+                                  << ":ms=" << ns_to_ms(req->decode_graph_node_custom_other_ns);
     const std::string qwen35_moe_w1w3_hist = weight_hist_string(req->qwen35_moe_w1w3_weight_type_hist);
     const std::string qwen35_moe_w2_hist = weight_hist_string(req->qwen35_moe_w2_weight_type_hist);
     const std::string qwen36_prefill_top_slow_ops = shape_census_string(req->qwen36_prefill_top_slow_ops);
@@ -1875,7 +1943,6 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         std::max(req->native_moe_fast_decode_candidate_ops,
                  req->native_moe_fast_decode_used_ops + req->native_moe_fast_decode_rejected_ops);
     const bool lfm2_summary = descriptor.variant == ModelVariant::LFM2MOE;
-    const bool lfm2_w1w3_q4k_seen = lfm2_summary && req->qwen35_moe_w1w3_weight_type_hist[0] > 0;
     const bool lfm2_w1w3_q5k_seen = lfm2_summary && req->qwen35_moe_w1w3_weight_type_hist[1] > 0;
     const bool lfm2_w2_q4k_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[0] > 0;
     const bool lfm2_w2_q5k_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[1] > 0;
@@ -1883,9 +1950,14 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const bool lfm2_w2_q8_0_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[3] > 0;
     const uint64_t lfm2_native_moe_decode_used_ops = lfm2_summary ? req->native_moe_fast_decode_used_ops : 0;
     const uint64_t lfm2_w1w3_q4k_repacked_used_ops =
-        lfm2_w1w3_q4k_seen ? req->native_moe_fast_decode_w1w3_used_ops : 0;
+        lfm2_summary ? req->lfm2_w1w3_q4k_repacked_used_ops : 0;
+    const uint64_t lfm2_w1w3_q4k_vecdot_rowpair_used_ops =
+        lfm2_summary ? req->lfm2_w1w3_q4k_vecdot_rowpair_used_ops : 0;
+    const uint64_t lfm2_w1w3_q4k_vecdot_scalar_used_ops =
+        lfm2_summary ? req->lfm2_w1w3_q4k_vecdot_scalar_used_ops : 0;
+    const uint64_t lfm2_w1w3_q4k_hwy_used_ops = lfm2_summary ? req->lfm2_w1w3_q4k_hwy_used_ops : 0;
     const uint64_t lfm2_w1w3_q5k_vecdot_used_ops =
-        lfm2_w1w3_q5k_seen ? req->native_moe_fast_decode_w1w3_used_ops : 0;
+        lfm2_w1w3_q5k_seen ? req->lfm2_w1w3_q5k_hwy_used_ops : 0;
     const uint64_t lfm2_w2_q4k_repacked_used_ops =
         lfm2_w2_q4k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
     const uint64_t lfm2_w2_q5k_vecdot_used_ops =
@@ -1898,7 +1970,20 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         lfm2_summary ? req->lfm2_decode_lm_head_custom_gemv_used_ops : 0;
     const uint64_t lfm2_decode_lm_head_custom_gemv_ns =
         lfm2_summary ? req->lfm2_decode_lm_head_custom_gemv_ns : 0;
-    const uint64_t lfm2_shortconv_sequence_fast_used_ops = lfm2_summary ? req->ssm_conv1d_calls : 0;
+    const uint64_t lfm2_greedy_lm_head_argmax_candidate_ops =
+        lfm2_summary ? req->lfm2_greedy_lm_head_argmax_candidate_ops : 0;
+    const uint64_t lfm2_greedy_lm_head_argmax_used_ops =
+        lfm2_summary ? req->lfm2_greedy_lm_head_argmax_used_ops : 0;
+    const uint64_t lfm2_greedy_lm_head_argmax_rejected_ops =
+        lfm2_summary ? req->lfm2_greedy_lm_head_argmax_rejected_ops : 0;
+    const uint64_t lfm2_greedy_lm_head_argmax_ns =
+        lfm2_summary ? req->lfm2_greedy_lm_head_argmax_ns : 0;
+    const char* lfm2_greedy_lm_head_argmax_last_reject_reason =
+        lfm2_summary ? lfm2_argmax_reject_reason_name(req->lfm2_greedy_lm_head_argmax_last_reject_reason) : "none";
+    const uint64_t lfm2_shortconv_sequence_fast_used_ops =
+        lfm2_summary ? std::max<uint64_t>(req->decode_graph_node_custom_ssm_count,
+                                          static_cast<uint64_t>(std::max(0, req->ssm_conv1d_calls)))
+                     : 0;
     const uint64_t lfm2_decode_graph_rebuilds = lfm2_summary ? req->graph_cache_miss_count : 0;
     const char* qwen35_native_moe_down_exec_path =
         native_moe_fast_w2_q5k_used ? "custom_op" : (req->native_moe_fallback_w2_ops > 0 ? "ggml_mul_mat_id" : "none");
@@ -2117,6 +2202,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " decode_sample_ms=" << ns_to_ms(req->decode_sample_ns)
         << " decode_graph_node_measured_ms=" << ns_to_ms(req->decode_graph_node_measured_ns)
         << " decode_graph_node_hist=" << decode_graph_node_hist.str()
+        << " decode_graph_custom_node_hist=" << decode_graph_custom_node_hist.str()
         << " decode_graph_top_slow_nodes=" << decode_graph_top_slow_nodes
         << " attention_ms=" << ns_to_ms(req->attention_ns)
         << " paged_attention_ms=" << ns_to_ms(req->paged_attention_ns)
@@ -2415,6 +2501,9 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " native_moe_fast_w2_q5k_effective_state=" << native_moe_fast_w2_q5k_effective_state
         << " lfm2_native_moe_decode_used_ops=" << lfm2_native_moe_decode_used_ops
         << " lfm2_w1w3_q4k_repacked_used_ops=" << lfm2_w1w3_q4k_repacked_used_ops
+        << " lfm2_w1w3_q4k_vecdot_rowpair_used_ops=" << lfm2_w1w3_q4k_vecdot_rowpair_used_ops
+        << " lfm2_w1w3_q4k_vecdot_scalar_used_ops=" << lfm2_w1w3_q4k_vecdot_scalar_used_ops
+        << " lfm2_w1w3_q4k_hwy_used_ops=" << lfm2_w1w3_q4k_hwy_used_ops
         << " lfm2_w1w3_q5k_vecdot_used_ops=" << lfm2_w1w3_q5k_vecdot_used_ops
         << " lfm2_w2_q4k_repacked_used_ops=" << lfm2_w2_q4k_repacked_used_ops
         << " lfm2_w2_q5k_vecdot_used_ops=" << lfm2_w2_q5k_vecdot_used_ops
@@ -2422,7 +2511,12 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " lfm2_w2_q8_0_direct_used_ops=" << lfm2_w2_q8_0_direct_used_ops
         << " lfm2_decode_lm_head_custom_gemv_used_ops=" << lfm2_decode_lm_head_custom_gemv_used_ops
         << " lfm2_decode_lm_head_custom_gemv_ms=" << ns_to_ms(lfm2_decode_lm_head_custom_gemv_ns)
-        << " lfm2_greedy_lm_head_argmax_used_ops=0"
+        << " lfm2_greedy_lm_head_argmax_candidate_ops=" << lfm2_greedy_lm_head_argmax_candidate_ops
+        << " lfm2_greedy_lm_head_argmax_used_ops=" << lfm2_greedy_lm_head_argmax_used_ops
+        << " lfm2_greedy_lm_head_argmax_rejected_ops=" << lfm2_greedy_lm_head_argmax_rejected_ops
+        << " lfm2_greedy_lm_head_argmax_last_reject_reason="
+        << lfm2_greedy_lm_head_argmax_last_reject_reason
+        << " lfm2_greedy_lm_head_argmax_ms=" << ns_to_ms(lfm2_greedy_lm_head_argmax_ns)
         << " lfm2_shortconv_sequence_fast_used_ops=" << lfm2_shortconv_sequence_fast_used_ops
         << " lfm2_decode_graph_rebuilds=" << lfm2_decode_graph_rebuilds
         << " qwen35_native_moe_down_exec_path=" << qwen35_native_moe_down_exec_path

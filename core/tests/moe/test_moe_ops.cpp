@@ -29,6 +29,9 @@ bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, 
 bool RunMoEKQuantRawBatchedProjection(CpuBackend* backend, int ggml_type_id, const void* weight_ptr,
                                       const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data,
                                       int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel);
+bool RunQ6KRepackedMoEProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
+                                 size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
+                                 int64_t input_cols, int numa_node, bool allow_parallel);
 bool RunMoEKQuantRawBatchedFusedSwiGLU(CpuBackend* backend, int ggml_type_id, const void* gate_weight_ptr,
                                        const void* up_weight_ptr, const uint8_t* qinput_data,
                                        size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
@@ -106,6 +109,39 @@ float KQuantQ8KVecDotReference(ggml_type weight_type, const std::vector<uint8_t>
     traits->vec_dot(static_cast<int>(K), &out, 0, qweight.data() + static_cast<size_t>(row) * weight_row_bytes, 0,
                     qinput.data() + static_cast<size_t>(input_row) * input_row_bytes, 0, 1);
     return out;
+}
+
+float DequantizedQuantDotReference(ggml_type weight_type, const std::vector<uint8_t>& qweight,
+                                   const std::vector<uint8_t>& qinput, int64_t row, int64_t input_row, int64_t K) {
+    const auto* weight_traits = ggml_get_type_traits(weight_type);
+    EXPECT_NE(weight_traits, nullptr);
+    EXPECT_NE(weight_traits->to_float, nullptr);
+    const size_t weight_row_bytes = ggml_row_size(weight_type, K);
+    const size_t input_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, K);
+    std::vector<float> weight(static_cast<size_t>(K), 0.0f);
+    std::vector<float> input(static_cast<size_t>(K), 0.0f);
+    weight_traits->to_float(qweight.data() + static_cast<size_t>(row) * weight_row_bytes, weight.data(), K);
+    constexpr int64_t kTestQ8KBlock = 256;
+    struct TestBlockQ8K {
+        float d;
+        int8_t qs[kTestQ8KBlock];
+        int16_t bsums[kTestQ8KBlock / 16];
+    };
+    static_assert(sizeof(TestBlockQ8K) == sizeof(float) + kTestQ8KBlock + (kTestQ8KBlock / 16) * sizeof(int16_t));
+    const auto* input_blocks =
+        reinterpret_cast<const TestBlockQ8K*>(qinput.data() + static_cast<size_t>(input_row) * input_row_bytes);
+    const int64_t blocks = K / kTestQ8KBlock;
+    for (int64_t block = 0; block < blocks; ++block) {
+        for (int i = 0; i < kTestQ8KBlock; ++i) {
+            input[static_cast<size_t>(block) * kTestQ8KBlock + static_cast<size_t>(i)] =
+                input_blocks[block].d * static_cast<float>(input_blocks[block].qs[i]);
+        }
+    }
+    double sum = 0.0;
+    for (int64_t k = 0; k < K; ++k) {
+        sum += static_cast<double>(weight[static_cast<size_t>(k)]) * input[static_cast<size_t>(k)];
+    }
+    return static_cast<float>(sum);
 }
 
 class MoEOpsTest : public ::testing::Test {
@@ -255,6 +291,65 @@ TEST_F(MoEOpsTest, Q5KRawBatchedProjectionMatchesVecDot) {
             const float expected = KQuantQ8KVecDotReference(GGML_TYPE_Q5_K, qweight, qinput, n, m, K);
             EXPECT_NEAR(actual[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)], expected,
                         1e-5f)
+                << "m=" << m << " n=" << n;
+        }
+    }
+}
+
+TEST_F(MoEOpsTest, Q6KRawBatchedProjectionMatchesVecDot) {
+    constexpr int64_t M = 7;
+    constexpr int64_t K = 256;
+    constexpr int64_t N = 22;
+
+    const std::vector<float> weight_f32 = MakePatternedFloats(N, K, 0.013f);
+    const std::vector<float> input_f32 = MakePatternedFloats(M, K, 0.010f);
+
+    std::vector<uint8_t> qweight;
+    std::vector<uint8_t> qinput;
+    QuantizeRowsCpu(GGML_TYPE_Q6_K, weight_f32, N, K, &qweight);
+    QuantizeRowsCpu(GGML_TYPE_Q8_K, input_f32, M, K, &qinput);
+
+    std::vector<float> actual(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+    CpuBackend& backend = GetCpuBackend();
+    ASSERT_TRUE(RunMoEKQuantRawBatchedProjection(&backend, static_cast<int>(GGML_TYPE_Q6_K), qweight.data(),
+                                                qinput.data(), ggml_row_size(GGML_TYPE_Q8_K, K), actual.data(), M, N,
+                                                K, /*numa_node=*/0, /*allow_parallel=*/true));
+
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t n = 0; n < N; ++n) {
+            const float expected = KQuantQ8KVecDotReference(GGML_TYPE_Q6_K, qweight, qinput, n, m, K);
+            EXPECT_NEAR(actual[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)], expected,
+                        1e-5f)
+                << "m=" << m << " n=" << n;
+        }
+    }
+}
+
+TEST_F(MoEOpsTest, Q6KRepackedProjectionMatchesVecDot) {
+    constexpr int64_t M = 5;
+    constexpr int64_t K = 256;
+    constexpr int64_t N = 24;
+
+    const std::vector<float> weight_f32 = MakePatternedFloats(N, K, 0.013f);
+    const std::vector<float> input_f32 = MakePatternedFloats(M, K, 0.010f);
+
+    std::vector<uint8_t> qweight;
+    std::vector<uint8_t> qinput;
+    QuantizeRowsCpu(GGML_TYPE_Q6_K, weight_f32, N, K, &qweight);
+    QuantizeRowsCpu(GGML_TYPE_Q8_K, input_f32, M, K, &qinput);
+
+    std::vector<float> actual(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+    CpuBackend& backend = GetCpuBackend();
+    if (!RunQ6KRepackedMoEProjection(&backend, qweight.data(), qinput.data(), ggml_row_size(GGML_TYPE_Q8_K, K),
+                                     actual.data(), M, N, K, /*numa_node=*/0, /*allow_parallel=*/true)) {
+        GTEST_SKIP() << "Q6_K repacked MoE projection is unavailable on this host";
+    }
+
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t n = 0; n < N; ++n) {
+            const float expected = DequantizedQuantDotReference(GGML_TYPE_Q6_K, qweight, qinput, n, m, K);
+            EXPECT_NEAR(actual[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)], expected,
+                        5e-4f)
                 << "m=" << m << " n=" << n;
         }
     }

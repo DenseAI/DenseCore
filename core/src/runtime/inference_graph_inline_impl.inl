@@ -500,22 +500,45 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             struct ggml_tensor* bcx = smart_mul_mat(ctx_c, in_proj, cur, model);
             ggml_set_name(bcx, "lfm2_shortconv_bcx");
 
-            // 2. gated depthwise causal conv (updates per-seq conv state) -> [channels, N]
-            struct ggml_tensor* y = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, channels, N);
             LFM2ShortConvUserData* conv_ud = GetLFM2ShortConvUserData();
+            InferenceWorkContext* current_work_ctx = GetCurrentWorkContext();
             conv_ud->conv_weight = model->lfm2_conv_weight_f32[static_cast<size_t>(conv_ordinal)].data();
             conv_ud->channels = channels;
             conv_ud->kernel = model->lfm2_conv_kernel;
             conv_ud->conv_ordinal = conv_ordinal;
             conv_ud->layer_idx = il;
             conv_ud->token_seq_ids = batch.seq_id.data();
+            conv_ud->token_positions = batch.pos.data();
             conv_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
-            conv_ud->profile = &GetCurrentWorkContext()->qwen36_profile;
-            y = ggml_map_custom2(ctx_c, y, bcx, cb_lfm2_shortconv, 1, conv_ud);
-            ggml_set_name(y, "lfm2_shortconv_y");
+            conv_ud->profile = &current_work_ctx->qwen36_profile;
+            conv_ud->work_ctx = current_work_ctx;
 
-            // 3. out_proj: [channels, N] -> [n_embd, N], then residual add.
-            struct ggml_tensor* mixer_out = smart_mul_mat(ctx_c, out_proj, y, model);
+            struct ggml_tensor* mixer_out = nullptr;
+            const bool lfm2_decode_fused_out =
+                N == 1 && bcx->type == GGML_TYPE_F32 && out_proj->type == GGML_TYPE_Q4_K &&
+                out_proj->ne[0] == channels;
+            if (lfm2_decode_fused_out) {
+                const int64_t ne_out[4] = {out_proj->ne[1], 1, 1, 1};
+                mixer_out = ggml_new_tensor(ctx_c, GGML_TYPE_F32, 4, ne_out);
+                mixer_out->op = GGML_OP_CUSTOM;
+                mixer_out->src[0] = bcx;
+                mixer_out->src[1] = out_proj;
+                struct {
+                    ggml_custom_op_t fun;
+                    int n_tasks;
+                    void* userdata;
+                } params = {cb_lfm2_shortconv_out_q4k_decode,
+                            ResolveTaskCount(&batch, static_cast<int>(out_proj->ne[1])), conv_ud};
+                static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "params too large");
+                std::memcpy(mixer_out->op_params, &params, sizeof(params));
+            } else {
+                // 2. gated depthwise causal conv (updates per-seq conv state) -> [channels, N]
+                struct ggml_tensor* y = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, channels, N);
+                y = ggml_map_custom2(ctx_c, y, bcx, cb_lfm2_shortconv, 1, conv_ud);
+                ggml_set_name(y, "lfm2_shortconv_y");
+                // 3. out_proj: [channels, N] -> [n_embd, N], then residual add.
+                mixer_out = smart_mul_mat(ctx_c, out_proj, y, model);
+            }
             ggml_set_name(mixer_out, "lfm2_shortconv_out");
             attn_out = mixer_out;
             attn_post_residual = ggml_add(ctx_c, mixer_out, inpL);
@@ -2380,8 +2403,10 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 struct ggml_tensor* shared_gate = nullptr;
                 struct ggml_tensor* shared_up = nullptr;
                 struct ggml_tensor* shared_gate_up = nullptr;
+                const bool lfm2_shortconv_moe =
+                    model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv;
                 struct ggml_tensor* shared_gate_up_fused =
-                    ((is_gemma4_moe || model->variant == ModelVariant::QWEN35 ||
+                    ((is_gemma4_moe || lfm2_shortconv_moe || model->variant == ModelVariant::QWEN35 ||
                       model->variant == ModelVariant::QWEN36) &&
                      !prefer_plain_shared_expert_matmul && shared_input->type == GGML_TYPE_F32)
                         ? layer.Get("ffn_gate_up.cpu_repack_fused")
@@ -2564,8 +2589,10 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             struct ggml_tensor* w1 = nullptr;
             struct ggml_tensor* w3 = nullptr;
             struct ggml_tensor* fused_gate_up_swiglu = nullptr;
+            const bool lfm2_shortconv_moe =
+                model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv;
             struct ggml_tensor* dense_gate_up_fused =
-                ((model->arch_flags.is_gemma4 || model->variant == ModelVariant::QWEN35 ||
+                ((model->arch_flags.is_gemma4 || lfm2_shortconv_moe || model->variant == ModelVariant::QWEN35 ||
                   model->variant == ModelVariant::QWEN36) &&
                  !prefer_separate_qwen35_hybrid_ffn_gate_up && cur->type == GGML_TYPE_F32)
                     ? layer.Get("ffn_gate_up.cpu_repack_fused")

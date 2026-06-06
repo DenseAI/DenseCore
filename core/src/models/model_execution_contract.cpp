@@ -175,28 +175,6 @@ ExecutionQuantLayoutKind ResolveCanonicalLayout(const TransformerModel* model, c
     return ExecutionQuantLayoutKind::RawGGUF;
 }
 
-densecore::runtime::DenseCoreKernelFamily ResolveRequiredKernelFamily(
-    ggml_type raw_type, densecore::runtime::DenseCoreMatmulPhase phase,
-    densecore::runtime::DenseCoreTensorRole role) {
-    using densecore::runtime::DenseCoreKernelFamily;
-    using densecore::runtime::DenseCoreMatmulPhase;
-    using densecore::runtime::DenseCoreTensorRole;
-    if (role == DenseCoreTensorRole::MoEGateUp || role == DenseCoreTensorRole::MoEDown) {
-        return DenseCoreKernelFamily::DenseCoreQwenMoeDirect;
-    }
-    if (raw_type == GGML_TYPE_F32) {
-        return phase == DenseCoreMatmulPhase::Decode ? DenseCoreKernelFamily::DenseCoreF32Gemv
-                                                     : DenseCoreKernelFamily::DenseCoreF32SmallBatch;
-    }
-    if (raw_type == GGML_TYPE_Q4_K && phase == DenseCoreMatmulPhase::Prefill) {
-        return DenseCoreKernelFamily::DenseCoreQ4KBatched;
-    }
-    if (ggml_is_quantized(raw_type)) {
-        return DenseCoreKernelFamily::DenseCoreQuantGemv;
-    }
-    return DenseCoreKernelFamily::TemporaryReferenceGgml;
-}
-
 bool TensorNameMatchesKey(const char* tensor_name, const std::string& tensor_key) {
     if (!tensor_name || !tensor_name[0] || tensor_key.empty()) {
         return false;
@@ -204,13 +182,31 @@ bool TensorNameMatchesKey(const char* tensor_name, const std::string& tensor_key
     return std::strcmp(tensor_name, tensor_key.c_str()) == 0 || std::strstr(tensor_name, tensor_key.c_str()) != nullptr;
 }
 
+densecore::runtime::DenseCoreTensorRole FindLoaderTensorRole(const TransformerModel* model, const ggml_tensor* tensor) {
+    using densecore::runtime::DenseCoreTensorRole;
+    if (!model || !tensor) {
+        return DenseCoreTensorRole::Unknown;
+    }
+    DenseCoreTensorRole role = model->GetTensorRole(tensor);
+    if (role != DenseCoreTensorRole::Unknown) {
+        return role;
+    }
+    for (const TransformerLayer& layer : model->layers) {
+        role = layer.GetTensorRole(tensor);
+        if (role != DenseCoreTensorRole::Unknown) {
+            return role;
+        }
+    }
+    return DenseCoreTensorRole::Unknown;
+}
+
 void FinalizeTensorRequirement(const TransformerModel* model, ModelTensorExecutionRequirement* requirement) {
     if (!requirement) {
         return;
     }
-    requirement->prefill_kernel = ResolveRequiredKernelFamily(
+    requirement->prefill_kernel = densecore::runtime::ResolveMaintainedKernelFamilyForTensorRole(
         requirement->raw_gguf_type, densecore::runtime::DenseCoreMatmulPhase::Prefill, requirement->tensor_role);
-    requirement->decode_kernel = ResolveRequiredKernelFamily(
+    requirement->decode_kernel = densecore::runtime::ResolveMaintainedKernelFamilyForTensorRole(
         requirement->raw_gguf_type, densecore::runtime::DenseCoreMatmulPhase::Decode, requirement->tensor_role);
     const bool role_has_maintained_target_contract =
         requirement->semantic_op == densecore::runtime::DenseCoreSemanticOp::HybridSsmMixer ||
@@ -230,10 +226,12 @@ ModelTensorExecutionRequirement MakeTensorRequirement(const TransformerModel* mo
     ModelTensorExecutionRequirement requirement{};
     requirement.layer_index = layer_index;
     requirement.tensor_key = tensor_key;
-    requirement.tensor_role = role;
-    requirement.semantic_op = densecore::runtime::ResolveDenseCoreSemanticOp(model, role);
+    const auto loader_role = FindLoaderTensorRole(model, tensor);
+    requirement.tensor_role =
+        loader_role != densecore::runtime::DenseCoreTensorRole::Unknown ? loader_role : role;
+    requirement.semantic_op = densecore::runtime::ResolveDenseCoreSemanticOp(model, requirement.tensor_role);
     requirement.raw_gguf_type = tensor ? tensor->type : GGML_TYPE_COUNT;
-    requirement.canonical_layout = ResolveCanonicalLayout(model, tensor, role);
+    requirement.canonical_layout = ResolveCanonicalLayout(model, tensor, requirement.tensor_role);
     requirement.repacked_layout = ExecutionQuantLayoutKind::Unknown;
     if (model && tensor) {
         if (model->qwen36_ssm_q8_prefill_amx_aliases.find(tensor) != model->qwen36_ssm_q8_prefill_amx_aliases.end()) {
@@ -475,7 +473,17 @@ int64_t ModelExecutionContractNativeMoEMaxDirectTokens(const ModelExecutionContr
 ModelTensorExecutionRequirement ResolveModelTensorExecutionRequirement(const TransformerModel* model,
                                                                       const char* tensor_name, bool is_lm_head,
                                                                       ggml_type raw_type) {
-    const auto role = densecore::runtime::ResolveDenseCoreTensorRole(model, tensor_name, is_lm_head);
+    return ResolveModelTensorExecutionRequirement(model, nullptr, tensor_name, is_lm_head, raw_type);
+}
+
+ModelTensorExecutionRequirement ResolveModelTensorExecutionRequirement(const TransformerModel* model,
+                                                                      const ggml_tensor* tensor,
+                                                                      const char* tensor_name, bool is_lm_head,
+                                                                      ggml_type raw_type) {
+    const auto loader_role = FindLoaderTensorRole(model, tensor);
+    const auto role = loader_role != densecore::runtime::DenseCoreTensorRole::Unknown
+                          ? loader_role
+                          : densecore::runtime::ResolveDenseCoreTensorRole(model, tensor_name, is_lm_head);
     ModelTensorExecutionRequirement requirement{};
     requirement.layer_index = -1;
     requirement.tensor_key = tensor_name ? tensor_name : "";

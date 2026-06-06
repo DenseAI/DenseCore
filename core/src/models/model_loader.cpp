@@ -37,6 +37,7 @@
 #include "densecore/backend/apple/apple_silicon.h"
 #include "densecore/models/decoder_model_spec.h"
 #include "densecore/models/qwen35_ssm_math.h"
+#include "densecore/runtime/ggml_compute_policy.h"
 #include "densecore/runtime/dtype_utils.h"
 #include "models/gemma4_packed_expert_layout.h"
 #include "models/model_inference_policy.h"
@@ -51,6 +52,72 @@ constexpr const char* kGemma4PreMoeNormKey = "gemma4.pre_feedforward_layernorm_2
 constexpr const char* kGemma4PostSharedNormKey = "gemma4.post_feedforward_layernorm_1.weight";
 constexpr const char* kGemma4PostMoeNormKey = "gemma4.post_feedforward_layernorm_2.weight";
 constexpr const char* kGemma4PostFfnNormKey = "gemma4.post_feedforward_layernorm.weight";
+
+void MarkLayerTensorRole(TransformerModel* model, TransformerLayer* layer, const char* key,
+                         densecore::runtime::DenseCoreTensorRole role) {
+    if (!model || !layer || !key) {
+        return;
+    }
+    ggml_tensor* tensor = layer->Get(key);
+    if (!tensor) {
+        return;
+    }
+    layer->SetTensorRole(tensor, role);
+    model->SetTensorRole(tensor, role);
+}
+
+void MarkExpertTensorRole(TransformerModel* model, TransformerLayer* layer, size_t expert_idx, const char* key,
+                          densecore::runtime::DenseCoreTensorRole role) {
+    if (!model || !layer || !key) {
+        return;
+    }
+    ggml_tensor* tensor = layer->GetExpert(expert_idx, key);
+    if (!tensor) {
+        return;
+    }
+    layer->SetTensorRole(tensor, role);
+    model->SetTensorRole(tensor, role);
+}
+
+void AnnotateModelExecutionTensorRoles(TransformerModel* model) {
+    using densecore::runtime::DenseCoreTensorRole;
+    if (!model) {
+        return;
+    }
+    model->SetTensorRole(model->output, DenseCoreTensorRole::LmHead);
+    if (model->tied_embeddings) {
+        model->SetTensorRole(model->tok_embeddings, DenseCoreTensorRole::LmHead);
+    }
+
+    for (size_t layer_idx = 0; layer_idx < model->layers.size(); ++layer_idx) {
+        TransformerLayer& layer = model->layers[layer_idx];
+        if (model->IsHybridSSMLayer(static_cast<int>(layer_idx))) {
+            MarkLayerTensorRole(model, &layer, model_keys::kAttnQkvWeight, DenseCoreTensorRole::HybridSSMQkv);
+            MarkLayerTensorRole(model, &layer, model_keys::kAttnGate, DenseCoreTensorRole::HybridSSMGate);
+            MarkLayerTensorRole(model, &layer, model_keys::kSSMOut, DenseCoreTensorRole::SSMOut);
+        }
+        if (model->IsLFM2ConvLayer(static_cast<int>(layer_idx))) {
+            MarkLayerTensorRole(model, &layer, model_keys::kShortConvInProj, DenseCoreTensorRole::ShortConvIn);
+            MarkLayerTensorRole(model, &layer, model_keys::kShortConvOutProj, DenseCoreTensorRole::ShortConvOut);
+        }
+        MarkLayerTensorRole(model, &layer, model_keys::kMoeGate, DenseCoreTensorRole::MoERouter);
+        for (const char* key : {"ffn_gate_up_exps.weight", "ffn_gate_up_exps", "experts.gate_up_proj.weight",
+                                "ffn_gate_exps.weight", "ffn_gate_exps", "experts.gate_proj.weight",
+                                "ffn_up_exps.weight", "ffn_up_exps", "experts.up_proj.weight"}) {
+            MarkLayerTensorRole(model, &layer, key, DenseCoreTensorRole::MoEGateUp);
+        }
+        for (const char* key : {"ffn_down_exps.weight", "ffn_down_exps", "experts.down_proj.weight"}) {
+            MarkLayerTensorRole(model, &layer, key, DenseCoreTensorRole::MoEDown);
+        }
+        for (size_t expert_idx = 0; expert_idx < layer.NumExperts(); ++expert_idx) {
+            MarkExpertTensorRole(model, &layer, expert_idx, model_keys::kFfnGate, DenseCoreTensorRole::MoEGateUp);
+            MarkExpertTensorRole(model, &layer, expert_idx, model_keys::kFfnUp, DenseCoreTensorRole::MoEGateUp);
+            MarkExpertTensorRole(model, &layer, expert_idx, model_keys::kGemma4PackedGateUpExpert,
+                                 DenseCoreTensorRole::MoEGateUp);
+            MarkExpertTensorRole(model, &layer, expert_idx, model_keys::kFfnDown, DenseCoreTensorRole::MoEDown);
+        }
+    }
+}
 
 bool ResolveGenericPackedProjectionBinding(ggml_context* vctx, const TransformerModel::Int4WeightBinding& root_binding,
                                            ggml_tensor* packed_view, int64_t cols, int64_t rows, int64_t row_start,
@@ -1074,10 +1141,12 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
             }
         }
     }
+    const bool enable_lfm2_fused_ffn_aliases =
+        model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv;
 #if !defined(__aarch64__) && !defined(_M_ARM64)
     const bool enable_qwen_fused_ffn_aliases =
         model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36;
-    if (enable_qwen_fused_ffn_aliases) {
+    if (enable_qwen_fused_ffn_aliases || enable_lfm2_fused_ffn_aliases) {
         for (uint32_t i = 0; i < model->layers.size(); ++i) {
             auto& layer = model->layers[i];
             make_qwen35_ssm_qkv_gate_amx_fused_alias(layer, i);
@@ -1097,6 +1166,13 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         }
     }
 #else
+    if (enable_lfm2_fused_ffn_aliases) {
+        for (uint32_t i = 0; i < model->layers.size(); ++i) {
+            auto& layer = model->layers[i];
+            make_fused_pair_alias(layer, i, "ffn_gate_up.cpu_repack_fused", "ffn_gate_up.weight",
+                                  layer.Get(model_keys::kFfnGate), layer.Get(model_keys::kFfnUp));
+        }
+    }
     if (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) {
         for (uint32_t i = 0; i < model->layers.size(); ++i) {
             make_qwen_hybrid_ssm_qkv_gate_cpu_fused_alias(model->layers[i], i);
@@ -1950,6 +2026,7 @@ static TransformerModel* CreateMockModel() {
         model->layers[i].Set(model_keys::kFfnUp, create_tensor(model->hparams.n_embd, model->hparams.n_embd * 4));
     }
 
+    AnnotateModelExecutionTensorRoles(model);
     model->decoder_spec = densecore::models::MakeDecoderModelSpec(model);
     return model;
 }
@@ -5301,6 +5378,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
 #endif
 
+    AnnotateModelExecutionTensorRoles(model);
     model->decoder_spec = densecore::models::MakeDecoderModelSpec(model);
     std::cout << "[DenseCore] Model loaded successfully" << std::endl;
     return model;
@@ -5837,6 +5915,7 @@ TransformerModel* LoadModelFromExternal(const TransformerHParams& hparams, const
         model->layers[i].Set(model_keys::kFfnUp, get_tensor(layer_prefix + "ffn_up.weight"));
     }
 
+    AnnotateModelExecutionTensorRoles(model);
     model->decoder_spec = densecore::models::MakeDecoderModelSpec(model);
     std::cout << "[DenseCore] SmartLoader: Model loaded successfully (" << ctx_size / 1024 << " KB header)."
               << std::endl;

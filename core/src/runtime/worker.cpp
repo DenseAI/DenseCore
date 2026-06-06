@@ -79,6 +79,43 @@ const densecore::llm::config::FastPathRuntimeConfig& GetFastPathRuntimeConfig() 
     return config;
 }
 
+LFM2GreedyLMHeadArgmaxRejectReason GetLFM2GreedyLMHeadArgmaxRejectReason(
+    const TransformerModel* model, const std::vector<Request*>& batch_requests, InferenceExecutionPhase phase,
+    bool is_embedding_batch) {
+    const bool is_lfm2 = model && (model->variant == ModelVariant::LFM2MOE || model->arch_flags.is_lfm2_shortconv);
+    if (!is_lfm2) return LFM2GreedyLMHeadArgmaxRejectReason::UnsupportedModel;
+    if (phase != InferenceExecutionPhase::Decode && phase != InferenceExecutionPhase::Prefill) {
+        return LFM2GreedyLMHeadArgmaxRejectReason::NonDecodePhase;
+    }
+    if (is_embedding_batch) return LFM2GreedyLMHeadArgmaxRejectReason::EmbeddingBatch;
+    if (batch_requests.size() != 1) return LFM2GreedyLMHeadArgmaxRejectReason::UnsupportedBatch;
+    if (!batch_requests.front()) return LFM2GreedyLMHeadArgmaxRejectReason::MissingRequest;
+    const Request* req = batch_requests.front();
+    if (req->json_mode) return LFM2GreedyLMHeadArgmaxRejectReason::JsonMode;
+    if (req->sampling_params.temperature > 0.0f) return LFM2GreedyLMHeadArgmaxRejectReason::Temperature;
+    if (req->sampling_params.final_logit_softcap > 0.0f) return LFM2GreedyLMHeadArgmaxRejectReason::FinalLogitSoftcap;
+    if (req->sampling_params.action_token_count > 0) return LFM2GreedyLMHeadArgmaxRejectReason::ActionTokenRange;
+    if (req->sampling_params.repetition_penalty <= 0.0f)
+        return LFM2GreedyLMHeadArgmaxRejectReason::InvalidRepetitionPenalty;
+    if (req->sampling_params.frequency_penalty != 0.0f) return LFM2GreedyLMHeadArgmaxRejectReason::FrequencyPenalty;
+    if (req->sampling_params.presence_penalty != 0.0f) return LFM2GreedyLMHeadArgmaxRejectReason::PresencePenalty;
+    if (req->sampling_params.grammar != nullptr) return LFM2GreedyLMHeadArgmaxRejectReason::Grammar;
+    if (!req->disallowed_token_ids.empty()) return LFM2GreedyLMHeadArgmaxRejectReason::DisallowedTokens;
+    if (!req->allowed_token_ids.empty()) return LFM2GreedyLMHeadArgmaxRejectReason::AllowedTokens;
+    if (req->sampling_params.allowed_token_ids && !req->sampling_params.allowed_token_ids->empty()) {
+        return LFM2GreedyLMHeadArgmaxRejectReason::AllowedTokens;
+    }
+    if (req->sampling_params.disallowed_token_ids && !req->sampling_params.disallowed_token_ids->empty()) {
+        return LFM2GreedyLMHeadArgmaxRejectReason::DisallowedTokens;
+    }
+    if (std::getenv("DENSECORE_DEBUG_SAMPLE") != nullptr ||
+        std::getenv("DENSECORE_DEBUG_SAMPLE_TOP") != nullptr ||
+        std::getenv("DENSECORE_DEBUG_SAMPLER_TRACE") != nullptr) {
+        return LFM2GreedyLMHeadArgmaxRejectReason::DebugSampler;
+    }
+    return LFM2GreedyLMHeadArgmaxRejectReason::None;
+}
+
 const densecore::llm::config::WorkerRuntimeConfig& GetWorkerRuntimeConfig() {
     return GetFastPathRuntimeConfig().worker;
 }
@@ -305,816 +342,9 @@ size_t ParseSizeEnvMb(const char* name, size_t default_mb, size_t min_mb, size_t
     return static_cast<size_t>(std::clamp<unsigned long long>(value, min_mb, max_mb));
 }
 
-bool ParseBoolEnvDefault(const char* name, bool default_value) {
-    const char* raw = std::getenv(name);
-    if (!raw || raw[0] == '\0') {
-        return default_value;
-    }
-    return !(std::strcmp(raw, "0") == 0 || std::strcmp(raw, "false") == 0 || std::strcmp(raw, "FALSE") == 0 ||
-             std::strcmp(raw, "off") == 0 || std::strcmp(raw, "OFF") == 0);
-}
+#include "runtime/worker_graph_pool_sizing.inl"
 
-bool IsFlexibleGraphPoolSizingEnabled(const TransformerModel* model) {
-    if (!model) {
-        return false;
-    }
-    return ParseBoolEnvDefault("DENSECORE_FLEXIBLE_GRAPH_POOL", true);
-}
-
-size_t ReadAvailableMemoryBytesForRuntimePools() {
-#if defined(__linux__)
-    std::FILE* file = std::fopen("/proc/meminfo", "r");
-    if (!file) {
-        return 0;
-    }
-    char line[256] = {};
-    unsigned long long kb = 0;
-    while (std::fgets(line, sizeof(line), file)) {
-        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
-            std::fclose(file);
-            return static_cast<size_t>(kb) * 1024ULL;
-        }
-    }
-    std::fclose(file);
-#endif
-    return 0;
-}
-
-void AccumulateDryRunTensorBytes(const ggml_tensor* tensor, std::unordered_set<const ggml_tensor*>& seen,
-                                 size_t& data_bytes) {
-    if (!tensor || !seen.insert(tensor).second) {
-        return;
-    }
-    if (tensor->view_src) {
-        AccumulateDryRunTensorBytes(tensor->view_src, seen, data_bytes);
-    } else if (!tensor->data) {
-        data_bytes += ggml_nbytes_pad(tensor);
-    }
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        AccumulateDryRunTensorBytes(tensor->src[i], seen, data_bytes);
-    }
-}
-
-struct FlexibleGraphPoolSizing {
-    bool ok = false;
-    size_t required_bytes = 0;
-    size_t reserved_bytes = 0;
-    size_t available_bytes = 0;
-    size_t reservation_payload_bytes = 0;
-    size_t reservation_slack_bytes = 0;
-    size_t dry_context_bytes = 0;
-    size_t dry_metadata_bytes = 0;
-    size_t graph_tensor_bytes = 0;
-    size_t margin_bytes = 0;
-    int graph_nodes = 0;
-};
-
-struct RuntimeGraphPoolReservation {
-    size_t total_bytes = 0;
-    size_t payload_bytes = 0;
-    size_t slack_bytes = 0;
-};
-
-size_t ApplyFlexibleGraphPoolGrowthReserve(size_t required_bytes,
-                                           const EngineState::GraphContextEstimate& graph_estimate) {
-    if (required_bytes == 0 || graph_estimate.effective_query_len <= 1) {
-        return required_bytes;
-    }
-    constexpr size_t MB = 1024ULL * 1024ULL;
-    const size_t measured_margin = std::max(required_bytes / 8, graph_estimate.long_context_safety_pad_bytes);
-    const size_t reserve_bytes = required_bytes + std::max<size_t>(measured_margin, 128ULL * MB);
-    return AlignUpBytes(reserve_bytes, 512ULL * MB);
-}
-
-RuntimeGraphPoolReservation ClampRuntimeGraphPoolReservation(size_t requested_bytes, size_t available_bytes) {
-    if (requested_bytes == 0 || available_bytes == 0) {
-        return {requested_bytes, requested_bytes, 0};
-    }
-    constexpr size_t MB = 1024ULL * 1024ULL;
-    const size_t max_total_bytes =
-        available_bytes > 256ULL * MB ? available_bytes - 256ULL * MB : (available_bytes * 3) / 4;
-    const size_t runtime_reserve_bytes = std::clamp<size_t>(available_bytes / 12, 512ULL * MB, 8192ULL * MB);
-    const size_t allocator_slack_bytes = std::max<size_t>(available_bytes / 64, 128ULL * MB);
-    const size_t reserved_bytes = runtime_reserve_bytes + allocator_slack_bytes;
-    const size_t usable_bytes =
-        available_bytes > reserved_bytes ? available_bytes - reserved_bytes : available_bytes / 2;
-    const size_t payload_bytes = std::min(requested_bytes, std::max<size_t>(usable_bytes, 512ULL * MB));
-    const size_t context_object_slack_bytes = std::clamp<size_t>(payload_bytes / 6, 128ULL * MB, 2048ULL * MB);
-    // Dry-run sizing can still undercount ggml object-pool pressure when the
-    // live request shape is not byte-identical to the calibration shape. Scale
-    // that reserve from the measured payload instead of baking in a VM-specific
-    // RAM number; larger hosts and larger graphs naturally get more cushion.
-    const size_t object_pool_variance_bytes = std::max(payload_bytes / 16, requested_bytes / 32);
-    size_t total_bytes =
-        AlignUpBytes(payload_bytes + context_object_slack_bytes + object_pool_variance_bytes, 64ULL * MB);
-    size_t capped_payload_bytes = payload_bytes;
-    size_t capped_slack_bytes = context_object_slack_bytes;
-    if (max_total_bytes > 0 && total_bytes > max_total_bytes) {
-        total_bytes = std::max(512ULL * MB, (max_total_bytes / (64ULL * MB)) * (64ULL * MB));
-        capped_slack_bytes = std::min(context_object_slack_bytes, std::max<size_t>(128ULL * MB, total_bytes / 16));
-        capped_payload_bytes = total_bytes > capped_slack_bytes ? total_bytes - capped_slack_bytes : total_bytes;
-        capped_payload_bytes = std::min(capped_payload_bytes, requested_bytes);
-        capped_slack_bytes = total_bytes > capped_payload_bytes ? total_bytes - capped_payload_bytes : 0;
-    }
-    return {total_bytes, capped_payload_bytes, capped_slack_bytes};
-}
-
-FlexibleGraphPoolSizing MeasureFlexibleGraphPoolSize(TransformerModel* model, PagedKVCache* cache,
-                                                     const BatchSpec& batch, bool embedding_mode,
-                                                     const EngineState::GraphContextEstimate& fallback_estimate) {
-    FlexibleGraphPoolSizing result{};
-    if (!IsFlexibleGraphPoolSizingEnabled(model)) {
-        return result;
-    }
-
-    constexpr size_t MB = 1024ULL * 1024ULL;
-    const size_t fallback_mb = std::max<size_t>(512, fallback_estimate.total_bytes / MB);
-    const size_t available_bytes = ReadAvailableMemoryBytesForRuntimePools();
-    const size_t available_mb = available_bytes / MB;
-    const size_t auto_dry_cap_mb =
-        available_mb > 0 ? std::max<size_t>(512, (available_mb * 3) / 4) : std::max<size_t>(fallback_mb, 1024);
-    const size_t dry_run_headroom_mb = fallback_estimate.effective_query_len > 1
-                                           ? std::max<size_t>(512, fallback_mb / 8)
-                                           : std::max<size_t>(128, fallback_mb / 16);
-    const size_t default_dry_mb =
-        std::min<size_t>(std::max<size_t>(fallback_mb + dry_run_headroom_mb, 1024), auto_dry_cap_mb);
-    const size_t dry_mb = ParseSizeEnvMb("DENSECORE_GRAPH_DRY_RUN_CTX_MB", default_dry_mb, 512, auto_dry_cap_mb);
-    const size_t dry_context_bytes = dry_mb * MB;
-
-    void* dry_buffer = nullptr;
-#if defined(_WIN32)
-    dry_buffer = _aligned_malloc(dry_context_bytes, 64);
-#else
-    if (posix_memalign(&dry_buffer, 64, dry_context_bytes) != 0) {
-        dry_buffer = nullptr;
-    }
-#endif
-    if (!dry_buffer) {
-        return result;
-    }
-
-    ggml_context* dry_ctx = nullptr;
-    try {
-        ggml_init_params params{
-            .mem_size = dry_context_bytes,
-            .mem_buffer = dry_buffer,
-            .no_alloc = true,
-        };
-        dry_ctx = ggml_init(params);
-        if (!dry_ctx) {
-            throw densecore::OutOfMemoryException("flexible graph pool dry-run ggml_init failed");
-        }
-        ggml_cgraph* dry_graph = ggml_new_graph_custom(dry_ctx, 32768, false);
-        ggml_tensor* dry_embd = nullptr;
-        ggml_tensor* dry_pos = nullptr;
-        auto dry_work_ctx = std::unique_ptr<InferenceWorkContext, decltype(&DestroyInferenceWorkContext)>(
-            CreateInferenceWorkContext(), DestroyInferenceWorkContext);
-        const InferenceExecutionPhase dry_phase = batch.tokens.size() > static_cast<size_t>(batch.num_seqs)
-                                                      ? InferenceExecutionPhase::Prefill
-                                                      : InferenceExecutionPhase::Decode;
-        ScopedBatchWorkContext dry_scope(dry_work_ctx.get(), &batch, dry_phase,
-                                         /*reset_context=*/true, ModelVariant::UNKNOWN,
-                                         /*graph_build_no_alloc=*/true);
-        ggml_tensor* dry_output =
-            BuildTransformerGraph(model, cache, dry_ctx, batch, embedding_mode, dry_graph, &dry_embd, &dry_pos);
-        if (!dry_graph || !dry_output || !dry_embd || !dry_pos) {
-            throw densecore::GraphBuildException("flexible graph pool dry-run graph build returned incomplete graph");
-        }
-
-        std::unordered_set<const ggml_tensor*> seen;
-        size_t data_bytes = 0;
-        const int n_nodes = ggml_graph_n_nodes(dry_graph);
-        for (int i = 0; i < n_nodes; ++i) {
-            AccumulateDryRunTensorBytes(ggml_graph_node(dry_graph, i), seen, data_bytes);
-        }
-        AccumulateDryRunTensorBytes(dry_embd, seen, data_bytes);
-        AccumulateDryRunTensorBytes(dry_pos, seen, data_bytes);
-        AccumulateDryRunTensorBytes(dry_output, seen, data_bytes);
-
-        const size_t metadata_bytes = ggml_used_mem(dry_ctx);
-        const size_t measured_bytes = metadata_bytes + data_bytes;
-        const size_t percent_margin = measured_bytes / 8;
-        const size_t min_margin = model->arch_flags.is_gemma4 ? 512ULL * MB : 128ULL * MB;
-        const size_t margin_bytes = std::max(percent_margin, min_margin);
-        const RuntimeGraphPoolReservation required_reservation =
-            ClampRuntimeGraphPoolReservation(AlignUpBytes(measured_bytes + margin_bytes, 64ULL * MB), available_bytes);
-        result.ok = true;
-        result.required_bytes = required_reservation.total_bytes;
-        const RuntimeGraphPoolReservation growth_reservation = ClampRuntimeGraphPoolReservation(
-            ApplyFlexibleGraphPoolGrowthReserve(result.required_bytes, fallback_estimate), available_bytes);
-        result.reserved_bytes = growth_reservation.total_bytes;
-        result.available_bytes = available_bytes;
-        result.reservation_payload_bytes = growth_reservation.payload_bytes;
-        result.reservation_slack_bytes = growth_reservation.slack_bytes;
-        result.dry_context_bytes = dry_context_bytes;
-        result.dry_metadata_bytes = metadata_bytes;
-        result.graph_tensor_bytes = data_bytes;
-        result.margin_bytes = margin_bytes;
-        result.graph_nodes = n_nodes;
-    } catch (const std::exception& e) {
-        std::cerr << "[DenseCore] FlexibleGraphPool dry-run skipped: " << e.what() << std::endl;
-    }
-
-    if (dry_ctx) {
-        ggml_free(dry_ctx);
-    }
-#if defined(_WIN32)
-    _aligned_free(dry_buffer);
-#else
-    std::free(dry_buffer);
-#endif
-    return result;
-}
-
-void AccumulateQwen36SSMProjectionNodeTimes(InferenceWorkContext* work_ctx, ggml_cgraph* graph) {
-    if (!work_ctx || !graph) {
-        return;
-    }
-    uint64_t qkv_ns = 0;
-    uint64_t gate_ns = 0;
-    uint64_t out_ns = 0;
-    const int n_nodes = ggml_graph_n_nodes(graph);
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor* node = ggml_graph_node(graph, i);
-        if (!node) {
-            continue;
-        }
-        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
-        if (elapsed_us <= 0) {
-            continue;
-        }
-        const uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_us) * 1000ULL;
-        if (HasNamePrefix(node, "qwen36_ssm_qkv_proj") || HasNamePrefix(node, "qwen35_ssm_qkv_proj") ||
-            HasNamePrefix(node, "qwen35_ssm_qkv_gate_fused_proj") ||
-            HasNamePrefix(node, "qwen36_ssm_qkv_gate_fused_proj")) {
-            qkv_ns += elapsed_ns;
-        } else if (HasNamePrefix(node, "qwen36_ssm_gate_proj") || HasNamePrefix(node, "qwen35_ssm_gate_proj")) {
-            gate_ns += elapsed_ns;
-        } else if (HasNamePrefix(node, "qwen36_ssm_out_proj") || HasNamePrefix(node, "qwen35_ssm_out_proj")) {
-            out_ns += elapsed_ns;
-        }
-    }
-    if (qkv_ns || gate_ns || out_ns) {
-        AddQwen36SSMProjectionWallProfile(work_ctx, qkv_ns, gate_ns, out_ns);
-    }
-}
-
-struct Qwen36PrefillBreakdown {
-    uint64_t ssm_projection_ns = 0;
-    uint64_t ssm_delta_state_ns = 0;
-    uint64_t attention_ns = 0;
-    uint64_t mlp_or_moe_ns = 0;
-    std::vector<MatmulShapeCensusEntry> top_slow_ops;
-};
-
-struct HybridSSMGraphTimingBreakdown {
-    uint64_t qkv_ns = 0;
-    uint64_t gate_ns = 0;
-    uint64_t out_ns = 0;
-    uint64_t conv1d_ns = 0;
-    uint64_t delta_ns = 0;
-    uint64_t alpha_beta_qk_ns = 0;
-    uint64_t total_ns = 0;
-};
-
-struct NativeMoEGraphTimingBreakdown {
-    uint64_t route_ns = 0;
-    uint64_t w1w3_ns = 0;
-    uint64_t activation_ns = 0;
-    uint64_t w2_ns = 0;
-    uint64_t w1w3_fast_ns = 0;
-    uint64_t w2_fast_ns = 0;
-    uint64_t reduce_ns = 0;
-    uint64_t total_ns = 0;
-    uint64_t route_count = 0;
-    uint64_t w1w3_count = 0;
-    uint64_t activation_count = 0;
-    uint64_t w2_count = 0;
-    uint64_t w1w3_fast_count = 0;
-    uint64_t w2_fast_count = 0;
-    uint64_t reduce_count = 0;
-    uint64_t native_node_count = 0;
-    std::string node_hist;
-    std::vector<MatmulShapeCensusEntry> top_slow_nodes;
-};
-
-struct DecodeGraphNodeTimingBreakdown {
-    uint64_t measured_ns = 0;
-    uint64_t custom_ns = 0;
-    uint64_t mul_mat_ns = 0;
-    uint64_t mul_mat_id_ns = 0;
-    uint64_t norm_ns = 0;
-    uint64_t view_copy_ns = 0;
-    uint64_t elementwise_ns = 0;
-    uint64_t attention_ns = 0;
-    uint64_t other_ns = 0;
-    uint64_t custom_count = 0;
-    uint64_t mul_mat_count = 0;
-    uint64_t mul_mat_id_count = 0;
-    uint64_t norm_count = 0;
-    uint64_t view_copy_count = 0;
-    uint64_t elementwise_count = 0;
-    uint64_t attention_count = 0;
-    uint64_t other_count = 0;
-    std::vector<MatmulShapeCensusEntry> top_slow_nodes;
-};
-
-struct Gemma4PrefillAttentionTimingBreakdown {
-    uint64_t attention_ns = 0;
-    uint64_t portable_flash_ns = 0;
-    uint64_t hal_ns = 0;
-    uint64_t moe_or_mlp_ns = 0;
-    uint64_t mul_mat_id_ns = 0;
-    uint64_t mul_mat_ns = 0;
-    std::vector<MatmulShapeCensusEntry> top_slow_ops;
-};
-
-static const char* DecodeGraphNodeBucketName(const ggml_tensor* node) {
-    if (!node) {
-        return "other";
-    }
-    const char* name = node->name[0] ? node->name : "";
-    if (std::strstr(name, "attn") || std::strstr(name, "paged") || std::strstr(name, "flash") ||
-        std::strstr(name, "kv_") || std::strstr(name, "rope")) {
-        return "attention";
-    }
-    switch (node->op) {
-    case GGML_OP_CUSTOM: return "custom";
-    case GGML_OP_MUL_MAT: return "mul_mat";
-    case GGML_OP_MUL_MAT_ID: return "mul_mat_id";
-    case GGML_OP_RMS_NORM:
-    case GGML_OP_NORM:
-    case GGML_OP_GROUP_NORM: return "norm";
-    case GGML_OP_VIEW:
-    case GGML_OP_RESHAPE:
-    case GGML_OP_PERMUTE:
-    case GGML_OP_TRANSPOSE:
-    case GGML_OP_CONT:
-    case GGML_OP_DUP:
-    case GGML_OP_CPY: return "view_copy";
-    case GGML_OP_ADD:
-    case GGML_OP_ADD1:
-    case GGML_OP_SUB:
-    case GGML_OP_MUL:
-    case GGML_OP_DIV:
-    case GGML_OP_SQR:
-    case GGML_OP_SQRT:
-    case GGML_OP_SCALE:
-    case GGML_OP_UNARY:
-    case GGML_OP_SOFT_MAX:
-    case GGML_OP_SUM:
-    case GGML_OP_SUM_ROWS:
-    case GGML_OP_REPEAT:
-    case GGML_OP_GET_ROWS: return "elementwise";
-    default: return "other";
-    }
-}
-
-const char* Gemma4WeightClass(const char* name);
-const char* Gemma4CensusWeightType(ggml_type type);
-bool Gemma4NodeHasCopyLikeInput(const ggml_tensor* node);
-std::string Gemma4MatmulShapeBucket(const ggml_tensor* node, const ggml_tensor* weight);
-std::string Gemma4CustomNodeClass(const ggml_tensor* node);
-
-DecodeGraphNodeTimingBreakdown SummarizeDecodeGraphNodeTimes(const ggml_cgraph* graph,
-                                                             bool collect_top_slow_nodes) {
-    DecodeGraphNodeTimingBreakdown out;
-    if (!graph) {
-        return out;
-    }
-    const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
-        if (!node) {
-            continue;
-        }
-        const char* bucket = DecodeGraphNodeBucketName(node);
-        if (std::strcmp(bucket, "custom") == 0) {
-            out.custom_count += 1;
-        } else if (std::strcmp(bucket, "mul_mat") == 0) {
-            out.mul_mat_count += 1;
-        } else if (std::strcmp(bucket, "mul_mat_id") == 0) {
-            out.mul_mat_id_count += 1;
-        } else if (std::strcmp(bucket, "norm") == 0) {
-            out.norm_count += 1;
-        } else if (std::strcmp(bucket, "view_copy") == 0) {
-            out.view_copy_count += 1;
-        } else if (std::strcmp(bucket, "elementwise") == 0) {
-            out.elementwise_count += 1;
-        } else if (std::strcmp(bucket, "attention") == 0) {
-            out.attention_count += 1;
-        } else {
-            out.other_count += 1;
-        }
-        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
-        if (elapsed_us <= 0) {
-            continue;
-        }
-        const uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_us) * 1000ULL;
-        if (std::strcmp(bucket, "custom") == 0) {
-            out.custom_ns += elapsed_ns;
-        } else if (std::strcmp(bucket, "mul_mat") == 0) {
-            out.mul_mat_ns += elapsed_ns;
-        } else if (std::strcmp(bucket, "mul_mat_id") == 0) {
-            out.mul_mat_id_ns += elapsed_ns;
-        } else if (std::strcmp(bucket, "norm") == 0) {
-            out.norm_ns += elapsed_ns;
-        } else if (std::strcmp(bucket, "view_copy") == 0) {
-            out.view_copy_ns += elapsed_ns;
-        } else if (std::strcmp(bucket, "elementwise") == 0) {
-            out.elementwise_ns += elapsed_ns;
-        } else if (std::strcmp(bucket, "attention") == 0) {
-            out.attention_ns += elapsed_ns;
-        } else {
-            out.other_ns += elapsed_ns;
-        }
-        out.measured_ns += elapsed_ns;
-
-        // The op-bucket totals above are cheap and always collected for decode so
-        // every profiling run shows where graph-execute time lands. The per-node
-        // census below allocates a string per node, so it stays behind the debug
-        // flag to keep the hot decode path free of that overhead.
-        if (!collect_top_slow_nodes) {
-            continue;
-        }
-        MatmulShapeCensusEntry entry;
-        entry.phase = "decode";
-        entry.op_type = ggml_op_name(node->op);
-        const std::string custom_class = Gemma4CustomNodeClass(node);
-        entry.dispatch_path = custom_class.empty() ? bucket : custom_class;
-        entry.weight_type = ggml_op_name(node->op);
-        std::ostringstream shape;
-        shape << "M=" << node->ne[1] << ",N=" << node->ne[0] << ",K=" << (node->ne[2] > 1 ? node->ne[2] : 0);
-        entry.shape_bucket = shape.str();
-        entry.left_name = node->name[0] ? node->name : "unnamed";
-        entry.right_name = "elapsed_us";
-        entry.ops = static_cast<uint64_t>(elapsed_us);
-        out.top_slow_nodes.push_back(std::move(entry));
-    }
-    std::sort(out.top_slow_nodes.begin(), out.top_slow_nodes.end(),
-              [](const auto& a, const auto& b) { return a.ops != b.ops ? a.ops > b.ops : a.left_name < b.left_name; });
-    if (out.top_slow_nodes.size() > kMatmulTopShapeCount) {
-        out.top_slow_nodes.resize(kMatmulTopShapeCount);
-    }
-    return out;
-}
-
-Gemma4PrefillAttentionTimingBreakdown SummarizeGemma4PrefillAttentionNodeTimes(const TransformerModel* model,
-                                                                               const ggml_cgraph* graph,
-                                                                               bool collect_top_slow_ops) {
-    Gemma4PrefillAttentionTimingBreakdown out;
-    if (!model || !model->arch_flags.is_gemma4 || !graph) {
-        return out;
-    }
-    const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
-        if (!node) {
-            continue;
-        }
-        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
-        if (elapsed_us <= 0) {
-            continue;
-        }
-        const uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_us) * 1000ULL;
-        const std::string custom_class = Gemma4CustomNodeClass(node);
-        if (custom_class == "flash_attention_hal") {
-            out.attention_ns += elapsed_ns;
-            out.portable_flash_ns += elapsed_ns;
-            out.hal_ns += elapsed_ns;
-        }
-        if (node->op == GGML_OP_MUL_MAT_ID) {
-            out.mul_mat_id_ns += elapsed_ns;
-        } else if (node->op == GGML_OP_MUL_MAT) {
-            out.mul_mat_ns += elapsed_ns;
-        }
-        const char* node_name = node->name[0] ? node->name : "";
-        if (std::strstr(node_name, "moe") || std::strstr(node_name, "ffn") || std::strstr(node_name, "shared_ffn")) {
-            out.moe_or_mlp_ns += elapsed_ns;
-        }
-        const bool include_node = collect_top_slow_ops &&
-            (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MUL_MAT ||
-             custom_class == "flash_attention_hal");
-        if (include_node) {
-            const ggml_tensor* weight = node->src[0];
-            const ggml_tensor* input = node->src[1];
-            const char* weight_name = weight && weight->name[0] ? weight->name : "<src0>";
-            const char* input_name = input && input->name[0] ? input->name : "<src1>";
-            MatmulShapeCensusEntry entry;
-            entry.phase = "prefill";
-            if (node->op == GGML_OP_MUL_MAT_ID) {
-                entry.op_type = "MUL_MAT_ID";
-                entry.dispatch_path = "ggml_mul_mat_id";
-            } else if (node->op == GGML_OP_MUL_MAT) {
-                entry.op_type = "MUL_MAT";
-                entry.dispatch_path = "ggml_mul_mat";
-            } else {
-                entry.op_type = "CUSTOM";
-                entry.dispatch_path = custom_class.empty() ? "custom" : custom_class;
-            }
-            entry.weight_type = weight ? Gemma4CensusWeightType(weight->type) : "other";
-            entry.weight_class = weight ? Gemma4WeightClass(weight_name) : "gemma4_other_dense";
-            entry.shape_bucket = Gemma4MatmulShapeBucket(node, weight);
-            entry.left_name = node_name[0] ? node_name : weight_name;
-            entry.right_name = std::string("src0=") + weight_name + ",src1=" + input_name;
-            entry.wall_ns = elapsed_ns;
-            entry.ops = static_cast<uint64_t>(elapsed_us);
-            entry.calls = 1;
-            entry.active_threads = 0;
-            entry.contiguous_or_copy_input = Gemma4NodeHasCopyLikeInput(node) ? 1 : 0;
-            out.top_slow_ops.push_back(std::move(entry));
-        }
-    }
-    if (collect_top_slow_ops) {
-        std::sort(out.top_slow_ops.begin(), out.top_slow_ops.end(), [](const auto& a, const auto& b) {
-            if (a.wall_ns != b.wall_ns) {
-                return a.wall_ns > b.wall_ns;
-            }
-            return a.left_name < b.left_name;
-        });
-        constexpr std::size_t kGemma4PrefillTopSlowCount = 200;
-        if (out.top_slow_ops.size() > kGemma4PrefillTopSlowCount) {
-            out.top_slow_ops.resize(kGemma4PrefillTopSlowCount);
-        }
-    }
-    return out;
-}
-
-HybridSSMGraphTimingBreakdown SummarizeHybridSSMGraphNodeTimes(const TransformerModel* model,
-                                                               const ggml_cgraph* graph) {
-    HybridSSMGraphTimingBreakdown out;
-    if (!model || !model->arch_flags.is_hybrid_ssm || !graph) {
-        return out;
-    }
-    const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
-        if (!node) {
-            continue;
-        }
-        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
-        if (elapsed_us <= 0) {
-            continue;
-        }
-        const uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_us) * 1000ULL;
-        if (HasNamePrefix(node, "qwen35_ssm_qkv_gate_fused_proj") ||
-            HasNamePrefix(node, "qwen36_ssm_qkv_gate_fused_proj") ||
-            HasNamePrefix(node, "qwen35_ssm_qkv_proj") || HasNamePrefix(node, "qwen36_ssm_qkv_proj")) {
-            out.qkv_ns += elapsed_ns;
-        } else if (HasNamePrefix(node, "qwen35_ssm_gate_proj") || HasNamePrefix(node, "qwen36_ssm_gate_proj")) {
-            out.gate_ns += elapsed_ns;
-        } else if (HasNamePrefix(node, "qwen35_ssm_out_proj") || HasNamePrefix(node, "qwen36_ssm_out_proj")) {
-            out.out_ns += elapsed_ns;
-        } else if (HasNamePrefix(node, "qwen35_ssm_conv1d") || HasNamePrefix(node, "qwen36_ssm_conv1d")) {
-            out.conv1d_ns += elapsed_ns;
-        } else if (HasNamePrefix(node, "qwen35_ssm_delta") || HasNamePrefix(node, "qwen36_ssm_delta")) {
-            out.delta_ns += elapsed_ns;
-        } else if (HasNamePrefix(node, "qwen35_ssm_alpha_beta_qk") || HasNamePrefix(node, "qwen36_ssm_alpha_beta_qk")) {
-            out.alpha_beta_qk_ns += elapsed_ns;
-        }
-    }
-    out.total_ns = out.qkv_ns + out.gate_ns + out.out_ns + out.conv1d_ns + out.delta_ns + out.alpha_beta_qk_ns;
-    return out;
-}
-
-bool IsQwenHybridSSMModel(const TransformerModel* model);
-
-Qwen36PrefillBreakdown SummarizeQwen36PrefillNodeTimes(const TransformerModel* model, const ggml_cgraph* graph) {
-    Qwen36PrefillBreakdown out;
-    if (!IsQwenHybridSSMModel(model) || !graph) {
-        return out;
-    }
-    if (model->variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0) {
-        return out;
-    }
-    auto safe_op_name = [](enum ggml_op op) -> const char* {
-        const int value = static_cast<int>(op);
-        return value >= 0 && value < static_cast<int>(GGML_OP_COUNT) ? ggml_op_name(op) : "<invalid-op>";
-    };
-    const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
-        if (!node) {
-            continue;
-        }
-        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
-        if (elapsed_us <= 0) {
-            continue;
-        }
-        const uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_us) * 1000ULL;
-        const char* name = node->name[0] ? node->name : "unnamed";
-        const bool is_ssm_proj = HasNamePrefix(node, "qwen35_ssm_qkv_gate_fused_proj") ||
-                                 HasNamePrefix(node, "qwen36_ssm_qkv_gate_fused_proj") ||
-                                 HasNamePrefix(node, "qwen35_ssm_qkv_proj") ||
-                                 HasNamePrefix(node, "qwen35_ssm_gate_proj") ||
-                                 HasNamePrefix(node, "qwen35_ssm_out_proj") ||
-                                 HasNamePrefix(node, "qwen36_ssm_qkv_proj") ||
-                                 HasNamePrefix(node, "qwen36_ssm_gate_proj") ||
-                                 HasNamePrefix(node, "qwen36_ssm_out_proj");
-        if (is_ssm_proj) {
-            out.ssm_projection_ns += elapsed_ns;
-        } else if (std::strstr(name, "delta") || std::strstr(name, "ssm_scan") || std::strstr(name, "conv1d")) {
-            out.ssm_delta_state_ns += elapsed_ns;
-        } else if (std::strstr(name, "attn") || std::strstr(name, "flash") || std::strstr(name, "kv_")) {
-            out.attention_ns += elapsed_ns;
-        } else if (std::strstr(name, "moe") || std::strstr(name, "ffn") || std::strstr(name, "mlp")) {
-            out.mlp_or_moe_ns += elapsed_ns;
-        }
-        MatmulShapeCensusEntry entry;
-        entry.phase = "prefill";
-        const char* op_name = safe_op_name(node->op);
-        entry.op_type = op_name;
-        entry.dispatch_path =
-            is_ssm_proj ? "ssm_projection" : (std::strstr(name, "moe") ? "mlp_or_moe" : op_name);
-        const ggml_tensor* src0 = node->src[0];
-        const ggml_tensor* src1 = node->src[1];
-        entry.weight_type = src0 ? ggml_type_name(src0->type) : "node";
-        std::ostringstream shape;
-        shape << "M=" << node->ne[1] << ",N=" << node->ne[0] << ",K=" << (node->ne[2] > 1 ? node->ne[2] : 0);
-        entry.shape_bucket = shape.str();
-        entry.left_name = name;
-        const char* src0_name = src0 && src0->name[0] ? src0->name : "<src0>";
-        const char* src1_name = src1 && src1->name[0] ? src1->name : "<src1>";
-        entry.right_name = std::string("src0=") + src0_name + ",src1=" + src1_name;
-        entry.ops = static_cast<uint64_t>(elapsed_us);
-        out.top_slow_ops.push_back(std::move(entry));
-    }
-    std::sort(out.top_slow_ops.begin(), out.top_slow_ops.end(),
-              [](const auto& a, const auto& b) { return a.ops != b.ops ? a.ops > b.ops : a.left_name < b.left_name; });
-    if (out.top_slow_ops.size() > kMatmulTopShapeCount) {
-        out.top_slow_ops.resize(kMatmulTopShapeCount);
-    }
-    return out;
-}
-
-NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const TransformerModel* model,
-                                                                   const ggml_cgraph* graph) {
-    NativeMoEGraphTimingBreakdown out;
-    const bool native_qwen_moe = model && (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36);
-    const bool native_lfm2_moe = model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv;
-    if ((!native_qwen_moe && !native_lfm2_moe) || !graph) {
-        return out;
-    }
-    struct Bucket {
-        const char* name = "other";
-        uint64_t ns = 0;
-        uint64_t count = 0;
-    };
-    std::array<Bucket, 6> buckets = {
-        {{"route", 0, 0}, {"w1w3", 0, 0}, {"activation", 0, 0}, {"w2", 0, 0}, {"reduce", 0, 0}, {"other", 0, 0}}};
-    enum BucketIndex { Route = 0, W1W3 = 1, Activation = 2, W2 = 3, Reduce = 4, Other = 5 };
-    const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
-    bool has_native_qwen_moe = false;
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
-        if (node && node->name[0] &&
-            (std::strstr(node->name, "qwen35_native_moe") || std::strstr(node->name, "lfm2_native_moe"))) {
-            has_native_qwen_moe = true;
-            break;
-        }
-    }
-    if (!has_native_qwen_moe) {
-        return out;
-    }
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
-        if (!node) {
-            continue;
-        }
-        const char* name = node->name[0] ? node->name : "unnamed";
-        const bool native_moe_node = std::strstr(name, "qwen35_native_moe") ||
-                                     std::strstr(name, "lfm2_native_moe") ||
-                                     std::strstr(name, ".moe_gate_logits");
-        if (!native_moe_node) {
-            continue;
-        }
-        ++out.native_node_count;
-        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
-        if (elapsed_us <= 0) {
-            continue;
-        }
-        const uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_us) * 1000ULL;
-        BucketIndex bucket = Other;
-        if (std::strstr(name, ".moe_gate_logits") || std::strstr(name, "_topk") || std::strstr(name, "_norm_weights") ||
-            std::strstr(name, "_probs") || std::strstr(name, "_weights") || std::strstr(name, "_scaled_weights")) {
-            bucket = Route;
-        } else if (std::strstr(name, "_gate_up") || std::strstr(name, "_gate") || std::strstr(name, "_up")) {
-            bucket = W1W3;
-        } else if (std::strstr(name, "_swiglu")) {
-            bucket = Activation;
-        } else if (std::strstr(name, "_down")) {
-            bucket = W2;
-        } else if (std::strstr(name, "_expert_sum") || std::strstr(name, "_moe_out")) {
-            bucket = Reduce;
-        }
-        const bool fast_w1w3_node = bucket == W1W3 &&
-                                     (std::strstr(name, "_gateup_raw_q4k_swiglu") ||
-                                      std::strstr(name, "_gateup_raw_qxk_swiglu"));
-        const bool fast_w2_node = bucket == W2 && std::strstr(name, "_down_q5k_fast");
-        buckets[static_cast<std::size_t>(bucket)].ns += elapsed_ns;
-        buckets[static_cast<std::size_t>(bucket)].count += 1;
-        if (fast_w1w3_node) {
-            out.w1w3_fast_ns += elapsed_ns;
-            out.w1w3_fast_count += 1;
-        }
-        if (fast_w2_node) {
-            out.w2_fast_ns += elapsed_ns;
-            out.w2_fast_count += 1;
-        }
-        out.total_ns += elapsed_ns;
-
-        MatmulShapeCensusEntry entry;
-        entry.phase = native_lfm2_moe ? "lfm2" : (model->variant == ModelVariant::QWEN36 ? "qwen36" : "qwen35");
-        entry.op_type = ggml_op_name(node->op);
-        entry.dispatch_path = buckets[static_cast<std::size_t>(bucket)].name;
-        entry.weight_type = ggml_op_name(node->op);
-        std::ostringstream shape;
-        shape << "M=" << node->ne[1] << ",N=" << node->ne[0] << ",K=" << (node->ne[2] > 1 ? node->ne[2] : 0);
-        entry.shape_bucket = shape.str();
-        entry.left_name = name;
-        entry.right_name = "elapsed_us";
-        entry.ops = static_cast<uint64_t>(elapsed_us);
-        out.top_slow_nodes.push_back(std::move(entry));
-    }
-    out.route_ns = buckets[Route].ns;
-    out.w1w3_ns = buckets[W1W3].ns;
-    out.activation_ns = buckets[Activation].ns;
-    out.w2_ns = buckets[W2].ns;
-    out.reduce_ns = buckets[Reduce].ns;
-    out.route_count = buckets[Route].count;
-    out.w1w3_count = buckets[W1W3].count;
-    out.activation_count = buckets[Activation].count;
-    out.w2_count = buckets[W2].count;
-    out.reduce_count = buckets[Reduce].count;
-    std::ostringstream hist;
-    for (std::size_t i = 0; i < buckets.size(); ++i) {
-        if (i != 0) hist << ",";
-        hist << buckets[i].name << ":count=" << buckets[i].count
-             << ":ms=" << (static_cast<double>(buckets[i].ns) / 1.0e6);
-    }
-    out.node_hist = hist.str();
-    std::sort(out.top_slow_nodes.begin(), out.top_slow_nodes.end(),
-              [](const auto& a, const auto& b) { return a.ops != b.ops ? a.ops > b.ops : a.left_name < b.left_name; });
-    if (out.top_slow_nodes.size() > kMatmulTopShapeCount) {
-        out.top_slow_nodes.resize(kMatmulTopShapeCount);
-    }
-    return out;
-}
-
-void SynthesizeDecodeGraphNodeTimingFromProfiles(DecodeGraphNodeTimingBreakdown* timing, uint64_t graph_execute_ns,
-                                                 const NativeMoEGraphTimingBreakdown& native_moe,
-                                                 const HybridSSMGraphTimingBreakdown& hybrid_ssm,
-                                                 const Qwen36ProfileSnapshot& profile) {
-    if (!timing || graph_execute_ns == 0 || timing->measured_ns != 0) {
-        return;
-    }
-    uint64_t ssm_ns = hybrid_ssm.total_ns;
-    if (ssm_ns == 0) {
-        ssm_ns = profile.ssm_qkv_wall_ns + profile.ssm_out_wall_ns + profile.ssm_delta_wall_ns;
-    }
-    uint64_t custom_ns = native_moe.total_ns + ssm_ns;
-    const uint64_t attention_ns = profile.attention_ns;
-    if (custom_ns > graph_execute_ns) {
-        custom_ns = graph_execute_ns;
-    }
-    const uint64_t after_custom = graph_execute_ns - custom_ns;
-    const uint64_t bounded_attention_ns = std::min(attention_ns, after_custom);
-    const uint64_t other_ns = graph_execute_ns - custom_ns - bounded_attention_ns;
-
-    timing->custom_ns = custom_ns;
-    timing->attention_ns = bounded_attention_ns;
-    timing->other_ns = other_ns;
-    timing->measured_ns = graph_execute_ns;
-
-    if (timing->custom_count == 0) {
-        timing->custom_count = native_moe.native_node_count + static_cast<uint64_t>(profile.ssm_conv1d_calls) +
-                               static_cast<uint64_t>(profile.ssm_delta_calls);
-    }
-    if (timing->attention_count == 0 && bounded_attention_ns > 0) {
-        timing->attention_count = 1;
-    }
-    if (timing->other_count == 0 && other_ns > 0) {
-        timing->other_count = 1;
-    }
-}
-
-bool IsGemma4NodeTimingDumpEnabled() {
-    static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_DEBUG_GEMMA4_NODE_TIMES", false);
-    return enabled;
-}
-
-bool IsLLMNodeTimingDumpEnabled() {
-    static const bool enabled = densecore::env::ParseNonZeroEnv("DENSECORE_DEBUG_LLM_NODE_TIMES", false);
-    return enabled;
-}
-
-int Gemma4NodeTimingDumpLimit() {
-    return densecore::env::ParsePositiveEnvInt("DENSECORE_DEBUG_GEMMA4_NODE_TIMES_LIMIT", 24);
-}
-
-int LLMNodeTimingDumpLimit() {
-    return densecore::env::ParsePositiveEnvInt("DENSECORE_DEBUG_LLM_NODE_TIMES_LIMIT", 24);
-}
+#include "runtime/worker_graph_timing.inl"
 
 const char* Gemma4WeightClass(const char* name) {
     if (!name || name[0] == '\0') {
@@ -1175,244 +405,7 @@ const char* Gemma4CensusWeightType(ggml_type type) {
     }
 }
 
-bool Gemma4NodeHasCopyLikeInput(const ggml_tensor* node) {
-    if (!node || !node->src[1]) {
-        return false;
-    }
-    const ggml_tensor* input = node->src[1];
-    switch (input->op) {
-    case GGML_OP_CONT:
-    case GGML_OP_CPY:
-    case GGML_OP_DUP:
-    case GGML_OP_RESHAPE:
-    case GGML_OP_VIEW:
-    case GGML_OP_PERMUTE:
-    case GGML_OP_TRANSPOSE: return true;
-    default: return false;
-    }
-}
-
-std::string Gemma4MatmulShapeBucket(const ggml_tensor* node, const ggml_tensor* weight) {
-    const int64_t out_rows = node ? node->ne[0] : 0;
-    const int64_t tokens = node ? std::max<int64_t>(node->ne[1], node->ne[2]) : 0;
-    const int64_t k = weight ? weight->ne[0] : 0;
-    const int64_t experts = weight && weight->ne[2] > 1 ? weight->ne[2] : 0;
-    const int64_t active_experts = (node && node->op == GGML_OP_MUL_MAT_ID && node->src[2]) ? node->src[2]->ne[0] : 0;
-    std::ostringstream shape;
-    shape << "M=" << tokens << ",N=" << out_rows << ",K=" << k << ",tokens=" << tokens << ",experts=" << experts
-          << ",active_experts=" << active_experts << ",copy_in=" << (Gemma4NodeHasCopyLikeInput(node) ? 1 : 0);
-    return shape.str();
-}
-
-std::string Gemma4CustomNodeClass(const ggml_tensor* node) {
-    if (!node || node->op != GGML_OP_CUSTOM) {
-        return {};
-    }
-    struct CustomOpParamsRawView {
-        std::uintptr_t fun;
-        int n_tasks;
-        void* userdata;
-    };
-    static_assert(sizeof(CustomOpParamsRawView) <= GGML_MAX_OP_PARAMS, "custom op params view too large");
-    CustomOpParamsRawView params{};
-    std::memcpy(&params, node->op_params, sizeof(params));
-    auto same_fun = [&](auto* fun) { return params.fun == reinterpret_cast<std::uintptr_t>(fun); };
-    if (same_fun(cb_gemv_custom) || same_fun(cb_gemv_batched_custom)) {
-        const ggml_tensor* weight = node->src[1];
-        const char* weight_name = weight && weight->name[0] ? weight->name : "<unnamed_weight>";
-        std::string label = same_fun(cb_gemv_custom) ? "gemv/" : "gemv_batched/";
-        label += Gemma4WeightClass(weight_name);
-        label += "/";
-        label += weight_name;
-        return label;
-    }
-    if (same_fun(cb_paged_attention_decode)) {
-        return "paged_attention_decode";
-    }
-    if (same_fun(cb_flash_attention_hal_custom)) {
-        return "flash_attention_hal";
-    }
-    if (same_fun(cb_kv_update_and_gather_custom)) {
-        return "kv_update_and_gather";
-    }
-    if (same_fun(cb_rope_precomputed_custom)) {
-        return "rope_precomputed";
-    }
-    if (same_fun(cb_matmul_hal_custom)) {
-        return "matmul_hal_custom";
-    }
-    if (same_fun(cb_matmul_int4_custom)) {
-        return "matmul_int4_custom";
-    }
-    if (same_fun(cb_matmul_fp8_custom)) {
-        return "matmul_fp8_custom";
-    }
-    return "custom_other";
-}
-
-void DebugDumpGemma4NodeTimes(const TransformerModel* model, const ggml_cgraph* graph, const char* stage) {
-    if (!model || !model->arch_flags.is_gemma4 || !graph || !IsGemma4NodeTimingDumpEnabled()) {
-        return;
-    }
-    struct Entry {
-        std::string key;
-        uint64_t total_us = 0;
-        int count = 0;
-    };
-    std::unordered_map<std::string, Entry> by_key;
-    std::unordered_map<std::string, Entry> by_op;
-    uint64_t measured_us = 0;
-    const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
-        if (!node) {
-            continue;
-        }
-        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
-        if (elapsed_us <= 0) {
-            continue;
-        }
-        char fallback_name[256];
-        const char* name = node->name[0] ? node->name : nullptr;
-        if (!name || std::strncmp(name, "node_", 5) == 0) {
-            const char* src0_name = (node->src[0] && node->src[0]->name[0]) ? node->src[0]->name : "<src0>";
-            const char* src1_name = (node->src[1] && node->src[1]->name[0]) ? node->src[1]->name : "<src1>";
-            std::snprintf(fallback_name, sizeof(fallback_name), "node_%d/src0=%s/src1=%s", i, src0_name, src1_name);
-            name = fallback_name;
-        }
-        const char* op = ggml_op_name(node->op);
-        std::string op_key = op ? op : "<op>";
-        const std::string custom_class = Gemma4CustomNodeClass(node);
-        if (!custom_class.empty()) {
-            op_key += "/";
-            op_key += custom_class;
-        }
-        std::string key = op_key + ":" + name;
-        Entry& entry = by_key[key];
-        entry.key = std::move(key);
-        entry.total_us += static_cast<uint64_t>(elapsed_us);
-        entry.count += 1;
-        Entry& op_entry = by_op[op_key];
-        op_entry.key = std::move(op_key);
-        op_entry.total_us += static_cast<uint64_t>(elapsed_us);
-        op_entry.count += 1;
-        measured_us += static_cast<uint64_t>(elapsed_us);
-    }
-    auto make_sorted_entries = [](std::unordered_map<std::string, Entry>& values) {
-        std::vector<Entry> entries;
-        entries.reserve(values.size());
-        for (auto& kv : values) {
-            entries.push_back(std::move(kv.second));
-        }
-        std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
-            if (a.total_us != b.total_us) {
-                return a.total_us > b.total_us;
-            }
-            return a.key < b.key;
-        });
-        return entries;
-    };
-    std::vector<Entry> entries = make_sorted_entries(by_key);
-    std::vector<Entry> op_entries = make_sorted_entries(by_op);
-    const int op_limit = std::min<int>(8, op_entries.size());
-    std::cerr << "[Gemma4NodeTimesByOp] stage=" << (stage ? stage : "<unknown>") << " showing=" << op_limit;
-    for (int i = 0; i < op_limit; ++i) {
-        const Entry& entry = op_entries[static_cast<size_t>(i)];
-        std::cerr << " op" << (i + 1) << "=" << entry.key << ":" << (static_cast<double>(entry.total_us) / 1000.0)
-                  << "ms/" << entry.count;
-    }
-    std::cerr << std::endl;
-    const int limit = std::min<int>(Gemma4NodeTimingDumpLimit(), entries.size());
-    std::cerr << "[Gemma4NodeTimes] stage=" << (stage ? stage : "<unknown>") << " nodes=" << n_nodes
-              << " measured_ms=" << (static_cast<double>(measured_us) / 1000.0) << " showing=" << limit << std::endl;
-    for (int i = 0; i < limit; ++i) {
-        const Entry& entry = entries[static_cast<size_t>(i)];
-        std::cerr << "  rank=" << (i + 1) << " total_ms=" << (static_cast<double>(entry.total_us) / 1000.0)
-                  << " count=" << entry.count << " key=" << entry.key << std::endl;
-    }
-}
-
-void DebugDumpLLMNodeTimes(const TransformerModel* model, const ggml_cgraph* graph, const char* stage) {
-    if (!model || !graph || !IsLLMNodeTimingDumpEnabled()) {
-        return;
-    }
-    struct Entry {
-        std::string key;
-        uint64_t total_us = 0;
-        int count = 0;
-    };
-    std::unordered_map<std::string, Entry> by_key;
-    std::unordered_map<std::string, Entry> by_op;
-    uint64_t measured_us = 0;
-    const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
-        if (!node) {
-            continue;
-        }
-        const int64_t elapsed_us = ggml_cpu_get_last_node_perf_time_us(node);
-        if (elapsed_us <= 0) {
-            continue;
-        }
-        char fallback_name[256];
-        const char* name = node->name[0] ? node->name : nullptr;
-        if (!name || std::strncmp(name, "node_", 5) == 0) {
-            const char* src0_name = (node->src[0] && node->src[0]->name[0]) ? node->src[0]->name : "<src0>";
-            const char* src1_name = (node->src[1] && node->src[1]->name[0]) ? node->src[1]->name : "<src1>";
-            std::snprintf(fallback_name, sizeof(fallback_name), "node_%d/src0=%s/src1=%s", i, src0_name, src1_name);
-            name = fallback_name;
-        }
-        const char* op = ggml_op_name(node->op);
-        std::string op_key = op ? op : "<op>";
-        const std::string custom_class = Gemma4CustomNodeClass(node);
-        if (!custom_class.empty()) {
-            op_key += "/";
-            op_key += custom_class;
-        }
-        std::string key = op_key + ":" + name;
-        Entry& entry = by_key[key];
-        entry.key = std::move(key);
-        entry.total_us += static_cast<uint64_t>(elapsed_us);
-        entry.count += 1;
-        Entry& op_entry = by_op[op_key];
-        op_entry.key = std::move(op_key);
-        op_entry.total_us += static_cast<uint64_t>(elapsed_us);
-        op_entry.count += 1;
-        measured_us += static_cast<uint64_t>(elapsed_us);
-    }
-    auto make_sorted_entries = [](std::unordered_map<std::string, Entry>& values) {
-        std::vector<Entry> entries;
-        entries.reserve(values.size());
-        for (auto& kv : values) {
-            entries.push_back(std::move(kv.second));
-        }
-        std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
-            if (a.total_us != b.total_us) {
-                return a.total_us > b.total_us;
-            }
-            return a.key < b.key;
-        });
-        return entries;
-    };
-    std::vector<Entry> entries = make_sorted_entries(by_key);
-    std::vector<Entry> op_entries = make_sorted_entries(by_op);
-    const int op_limit = std::min<int>(12, op_entries.size());
-    std::cerr << "[LLMNodeTimesByOp] stage=" << (stage ? stage : "<unknown>") << " showing=" << op_limit;
-    for (int i = 0; i < op_limit; ++i) {
-        const Entry& entry = op_entries[static_cast<size_t>(i)];
-        std::cerr << " op" << (i + 1) << "=" << entry.key << ":" << (static_cast<double>(entry.total_us) / 1000.0)
-                  << "ms/" << entry.count;
-    }
-    std::cerr << std::endl;
-    const int limit = std::min<int>(LLMNodeTimingDumpLimit(), entries.size());
-    std::cerr << "[LLMNodeTimes] stage=" << (stage ? stage : "<unknown>") << " nodes=" << n_nodes
-              << " measured_ms=" << (static_cast<double>(measured_us) / 1000.0) << " showing=" << limit << std::endl;
-    for (int i = 0; i < limit; ++i) {
-        const Entry& entry = entries[static_cast<size_t>(i)];
-        std::cerr << "  rank=" << (i + 1) << " total_ms=" << (static_cast<double>(entry.total_us) / 1000.0)
-                  << " count=" << entry.count << " key=" << entry.key << std::endl;
-    }
-}
+#include "runtime/worker_node_timing.inl"
 
 void ResetPagedDecodeGraphExecutionState(ggml_cgraph* graph) {
     if (!graph) {
@@ -1475,250 +468,7 @@ bool IsDeterminismBoundaryDebugEnabled() {
     return GetWorkerRuntimeConfig().determinism_boundary_debug;
 }
 
-bool IsPrefixCacheReuseDisabled() {
-    return GetWorkerRuntimeConfig().prefix_cache_reuse_disabled;
-}
-
-bool IsHybridSSMSnapshotRestoreDisabled() {
-    return GetWorkerRuntimeConfig().hybrid_ssm_snapshot_restore_disabled;
-}
-
-bool IsQwen36PrefixCacheReuseEnabled() {
-    return GetWorkerRuntimeConfig().qwen36_prefix_cache_reuse_enabled;
-}
-
-bool IsQwen36HybridSSMSnapshotRestoreEnabled() {
-    return GetWorkerRuntimeConfig().qwen36_hybrid_ssm_snapshot_restore_enabled;
-}
-
-bool IsQwen36HybridSSMModel(const TransformerModel* model) {
-    if (!model || !model->arch_flags.is_hybrid_ssm) {
-        return false;
-    }
-    return densecore::models::DescribeModel(model).variant == ModelVariant::QWEN36;
-}
-
-bool IsQwenHybridSSMModel(const TransformerModel* model) {
-    if (!model || !model->arch_flags.is_hybrid_ssm) {
-        return false;
-    }
-    const ModelVariant variant = densecore::models::DescribeModel(model).variant;
-    return variant == ModelVariant::QWEN35 || variant == ModelVariant::QWEN36;
-}
-
-bool Qwen36HybridSSMProjectionWeightsAreNotQ4K(const TransformerModel* model) {
-    if (!IsQwen36HybridSSMModel(model)) {
-        return false;
-    }
-    bool saw_ssm_projection = false;
-    for (const auto& layer : model->layers) {
-        for (const char* key : {model_keys::kAttnQkvWeight, model_keys::kAttnGate, model_keys::kSSMOut}) {
-            const ggml_tensor* tensor = layer.Get(key);
-            if (!tensor) {
-                continue;
-            }
-            saw_ssm_projection = true;
-            if (tensor->type == GGML_TYPE_Q4_K) {
-                return false;
-            }
-        }
-    }
-    return saw_ssm_projection;
-}
-
-struct Qwen36SSMProjectionTypeSummary {
-    std::string actual_types;
-    int quant_preserved = 0;
-    int dequantized_count = 0;
-};
-
-Qwen36SSMProjectionTypeSummary SummarizeQwen36SSMProjectionTypes(const TransformerModel* model) {
-    Qwen36SSMProjectionTypeSummary summary;
-    if (!IsQwenHybridSSMModel(model)) {
-        return summary;
-    }
-    std::map<std::string, int> type_counts;
-    int saw = 0;
-    int quantized = 0;
-    int dense = 0;
-    for (const auto& layer : model->layers) {
-        for (const auto& item : {std::pair<const char*, const char*>("ssm_qkv", model_keys::kAttnQkvWeight),
-                                 std::pair<const char*, const char*>("ssm_gate", model_keys::kAttnGate),
-                                 std::pair<const char*, const char*>("ssm_out", model_keys::kSSMOut)}) {
-            const ggml_tensor* tensor = layer.Get(item.second);
-            if (!tensor) {
-                continue;
-            }
-            ++saw;
-            if (ggml_is_quantized(tensor->type)) {
-                ++quantized;
-            } else if (tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_F32 ||
-                       tensor->type == GGML_TYPE_BF16) {
-                ++dense;
-            }
-            std::string key = std::string(item.first) + ":" + ggml_type_name(tensor->type);
-            type_counts[key]++;
-        }
-    }
-    std::ostringstream out;
-    bool first = true;
-    for (const auto& [key, count] : type_counts) {
-        if (!first) {
-            out << ",";
-        }
-        first = false;
-        out << key << ":" << count;
-    }
-    summary.actual_types = out.str();
-    summary.quant_preserved = saw > 0 && quantized == saw ? 1 : 0;
-    summary.dequantized_count = dense;
-    return summary;
-}
-
-std::string SummarizeQwen36SSMQ8ProjectionCounts(const TransformerModel* model) {
-    if (!IsQwen36HybridSSMModel(model)) {
-        return "none";
-    }
-    uint64_t qkv = 0;
-    uint64_t gate = 0;
-    uint64_t out = 0;
-    for (const auto& layer : model->layers) {
-        const ggml_tensor* qkv_tensor = layer.Get(model_keys::kAttnQkvWeight);
-        const ggml_tensor* gate_tensor = layer.Get(model_keys::kAttnGate);
-        const ggml_tensor* out_tensor = layer.Get(model_keys::kSSMOut);
-        if (qkv_tensor && qkv_tensor->type == GGML_TYPE_Q8_0) {
-            ++qkv;
-        }
-        if (gate_tensor && gate_tensor->type == GGML_TYPE_Q8_0) {
-            ++gate;
-        }
-        if (out_tensor && out_tensor->type == GGML_TYPE_Q8_0) {
-            ++out;
-        }
-    }
-    if (qkv == 0 && gate == 0 && out == 0) {
-        return "none";
-    }
-    std::ostringstream counts;
-    counts << "ssm_qkv:" << qkv << ",ssm_gate:" << gate << ",ssm_out:" << out;
-    return counts.str();
-}
-
-bool IsPrefixCacheAllowedForModel(const TransformerModel* model) {
-    if (IsPrefixCacheReuseDisabled()) {
-        return false;
-    }
-    if (IsQwen36HybridSSMModel(model) && !IsQwen36PrefixCacheReuseEnabled()) {
-        return false;
-    }
-    return true;
-}
-
-const char* PrefixCacheSkipReasonForModel(const TransformerModel* model) {
-    if (IsPrefixCacheReuseDisabled()) {
-        return "disabled_by_env";
-    }
-    if (IsQwen36HybridSSMModel(model) && !IsQwen36PrefixCacheReuseEnabled()) {
-        return "qwen36_prefix_cache_disabled";
-    }
-    return "none";
-}
-
-// Models whose layers carry per-sequence recurrent/conv state (hybrid SSM and
-// LFM2 short-conv) cannot reconstruct that state from cached KV blocks alone.
-// Prefix-cache reuse for them is only correct when the boundary state is
-// snapshotted at block registration and restored on a cache hit. This predicate
-// gates that snapshot/restore lifecycle (the machinery itself is state-agnostic;
-// it copies SSMSequenceRuntimeState, which for LFM2 holds conv_state only).
-bool ModelRequiresPrefixStateSnapshot(const TransformerModel* model) {
-    return model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_lfm2_shortconv);
-}
-
-bool IsHybridSSMSnapshotRestoreAllowedForModel(const TransformerModel* model) {
-    if (IsHybridSSMSnapshotRestoreDisabled()) {
-        return false;
-    }
-    if (IsQwen36HybridSSMModel(model) && !IsQwen36HybridSSMSnapshotRestoreEnabled()) {
-        return false;
-    }
-    return true;
-}
-
-BlockManager::HybridSSMSnapshotValidator BuildHybridSSMSnapshotValidatorForRequest(const TransformerModel* model,
-                                                                                   const Request* req) {
-    if (!ModelRequiresPrefixStateSnapshot(model) || !req || req->ssm_runtime_states.empty()) {
-        return {};
-    }
-
-    const size_t expected_layers = req->ssm_runtime_states.size();
-    size_t expected_conv_elems = 0;
-    size_t expected_ssm_elems = 0;
-    if (model->arch_flags.is_lfm2_shortconv) {
-        // LFM2 short-conv layers keep only a conv-state ring (no SSM recurrent state).
-        expected_conv_elems = TransformerModel::SSMSequenceRuntimeState::ExpectedConvStateElements(
-            static_cast<int>(model->hparams.n_embd), model->lfm2_conv_kernel);
-        expected_ssm_elems = 0;
-    } else {
-        const int expected_conv = model->ssm_inner_size + 2 * model->ssm_group_count * model->ssm_state_size;
-        const int expected_head_dim = model->ssm_inner_size / std::max(1, model->ssm_time_step_rank);
-        expected_conv_elems =
-            TransformerModel::SSMSequenceRuntimeState::ExpectedConvStateElements(expected_conv, model->ssm_conv_kernel);
-        expected_ssm_elems = TransformerModel::SSMSequenceRuntimeState::ExpectedStateElements(
-            model->ssm_time_step_rank, expected_head_dim, model->ssm_state_size);
-    }
-
-    return [expected_layers, expected_conv_elems,
-            expected_ssm_elems](const std::vector<TransformerModel::SSMSequenceRuntimeState>& states) {
-        if (states.size() != expected_layers) {
-            return false;
-        }
-        for (const auto& state : states) {
-            if (state.conv_state.size() != expected_conv_elems || state.ssm_state.size() != expected_ssm_elems) {
-                return false;
-            }
-        }
-        return true;
-    };
-}
-
-void InitializeRequestPrefixCacheState(Request* req, const TransformerModel* model) {
-    if (!req) {
-        return;
-    }
-    if (req->original_prompt_tokens_for_cache.empty()) {
-        req->original_prompt_tokens_for_cache = req->tokens;
-    }
-    if (req->prompt_tokens_for_cache.empty()) {
-        req->prompt_tokens_for_cache = req->original_prompt_tokens_for_cache;
-    }
-    if (req->prompt_token_count <= 0) {
-        req->prompt_token_count = static_cast<int>(req->original_prompt_tokens_for_cache.size());
-    }
-    req->prefix_cache_allowed = IsPrefixCacheAllowedForModel(model);
-    if (!req->prefix_cache_allowed) {
-        req->prefix_cache_skip_reason = PrefixCacheSkipReasonForModel(model);
-    } else if (req->prefix_cache_skip_reason.empty()) {
-        req->prefix_cache_skip_reason = "none";
-    }
-}
-
-BlockManager::PrefixCacheMatch ProbeReusablePrefixCacheForRequest(PagedKVCache* kv_cache, const TransformerModel* model,
-                                                                  const Request* req) {
-    BlockManager::PrefixCacheMatch match;
-    if (!kv_cache || !kv_cache->block_manager || !req || !req->prefix_cache_allowed ||
-        req->original_prompt_tokens_for_cache.empty()) {
-        return match;
-    }
-    const bool require_snapshot = ModelRequiresPrefixStateSnapshot(model);
-    const auto snapshot_validator = BuildHybridSSMSnapshotValidatorForRequest(model, req);
-    match = kv_cache->block_manager->FindLongestCachedPrefixWithVerification(
-        req->original_prompt_tokens_for_cache.data(), static_cast<int>(req->original_prompt_tokens_for_cache.size()),
-        require_snapshot, snapshot_validator);
-    if (!match.cached_block_ids.empty()) {
-        kv_cache->block_manager->Free(match.cached_block_ids);
-    }
-    return match;
-}
+#include "runtime/worker_prefix_cache_policy.inl"
 
 bool ResolveSamplingLogitsColumnForRequestImpl(int token_offset, int processed_count, int output_columns,
                                                bool sampled_from_prefill, int remaining_prompt_tokens,
@@ -1765,90 +515,7 @@ bool ResolveSamplingLogitsColumnForRequestImpl(int token_offset, int processed_c
     return true;
 }
 
-bool IsGraphCacheReuseDisabled() {
-    return GetWorkerRuntimeConfig().graph_cache_reuse_disabled;
-}
-
-bool IsMoETracePlumbingDisabled() {
-    return GetWorkerRuntimeConfig().moe_trace_plumbing_disabled;
-}
-
-bool IsMoEGraphSummaryEnabled() {
-    return GetWorkerRuntimeConfig().moe_graph_summary;
-}
-
-void MaybeLogMoEGraphSummary(struct ggml_cgraph* gf, const TransformerModel* model, bool is_prefill_batch) {
-    if (!IsMoEGraphSummaryEnabled() || !gf || !model || model->hparams.n_layer == 0 || model->hparams.n_experts == 0) {
-        return;
-    }
-    static std::atomic<bool> logged_prefill{false};
-    static std::atomic<bool> logged_decode{false};
-    if (is_prefill_batch) {
-        if (logged_prefill.exchange(true, std::memory_order_relaxed)) return;
-    } else {
-        if (logged_decode.exchange(true, std::memory_order_relaxed)) return;
-    }
-
-    const int n_nodes = ggml_graph_n_nodes(gf);
-    uint64_t moe_gating_ops = 0;
-    uint64_t moe_scatter_ops = 0;
-    uint64_t moe_forward_ops = 0;
-    uint64_t moe_gather_ops = 0;
-    uint64_t dense_ffn_matmul_ops = 0;
-    std::vector<uint64_t> layer_dense_ffn_ops(model->hparams.n_layer, 0);
-    std::vector<uint64_t> layer_moe_forward_ops(model->hparams.n_layer, 0);
-    std::vector<uint64_t> layer_moe_gate_ops(model->hparams.n_layer, 0);
-
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor* node = ggml_graph_node(gf, i);
-        if (!node) continue;
-        const char* name = node->name;
-        if (!name || !name[0]) continue;
-
-        int layer_idx = -1;
-        if (std::sscanf(name, "blk.%d.", &layer_idx) != 1) {
-            layer_idx = -1;
-        }
-        const bool layer_ok = layer_idx >= 0 && layer_idx < static_cast<int>(model->hparams.n_layer);
-
-        if (std::strstr(name, ".moe_gate_logits")) {
-            ++moe_gating_ops;
-            if (layer_ok) {
-                ++layer_moe_gate_ops[static_cast<size_t>(layer_idx)];
-            }
-        } else if (std::strstr(name, ".moe_forward")) {
-            ++moe_forward_ops;
-            if (layer_ok) {
-                ++layer_moe_forward_ops[static_cast<size_t>(layer_idx)];
-            }
-        } else if (std::strstr(name, ".ffn_gate") || std::strstr(name, ".ffn_up") || std::strstr(name, ".ffn_down")) {
-            ++dense_ffn_matmul_ops;
-            if (layer_ok) {
-                ++layer_dense_ffn_ops[static_cast<size_t>(layer_idx)];
-            }
-        }
-    }
-
-    std::fprintf(stderr,
-                 "[MOE_GRAPH_SUMMARY] phase=%s nodes=%d ops{MoEGating:%llu,MoEScatter:%llu,MoEForward:%llu,"
-                 "MoEGather:%llu,dense_ffn_matmul:%llu} layers=%u\n",
-                 is_prefill_batch ? "prefill" : "decode", n_nodes, static_cast<unsigned long long>(moe_gating_ops),
-                 static_cast<unsigned long long>(moe_scatter_ops), static_cast<unsigned long long>(moe_forward_ops),
-                 static_cast<unsigned long long>(moe_gather_ops), static_cast<unsigned long long>(dense_ffn_matmul_ops),
-                 model->hparams.n_layer);
-
-    for (uint32_t layer = 0; layer < model->hparams.n_layer; ++layer) {
-        const TransformerLayer& l = model->layers[layer];
-        std::fprintf(stderr,
-                     "[MOE_GRAPH_LAYER] phase=%s layer=%u is_moe=%d has_moe_gate=%d num_experts=%zu "
-                     "ffn_ops{moe_gate:%llu,moe_forward:%llu,dense_ffn_matmul:%llu}\n",
-                     is_prefill_batch ? "prefill" : "decode", layer, l.is_moe ? 1 : 0,
-                     l.Get(model_keys::kMoeGate) ? 1 : 0, l.NumExperts(),
-                     static_cast<unsigned long long>(layer_moe_gate_ops[layer]),
-                     static_cast<unsigned long long>(layer_moe_forward_ops[layer]),
-                     static_cast<unsigned long long>(layer_dense_ffn_ops[layer]));
-    }
-}
+#include "runtime/worker_moe_graph_summary.inl"
 
 bool ShouldZeroFillPrefillInputBuffer() {
     return GetWorkerRuntimeConfig().zero_fill_prefill_input_buffer;
@@ -1862,221 +529,7 @@ bool ShouldZeroFillPrefillKVBlocks() {
     return GetWorkerRuntimeConfig().zero_fill_prefill_kv_blocks;
 }
 
-int RequestPromptTokenCountForChunking(const Request* req) {
-    if (!req) {
-        return 0;
-    }
-    if (!req->original_prompt_tokens_for_cache.empty()) {
-        return static_cast<int>(req->original_prompt_tokens_for_cache.size());
-    }
-    if (!req->prompt_tokens_for_cache.empty()) {
-        return static_cast<int>(req->prompt_tokens_for_cache.size());
-    }
-    if (req->prompt_token_count > 0) {
-        return req->prompt_token_count;
-    }
-    return static_cast<int>(req->tokens.size());
-}
-
-int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Request* req) {
-    if (!model || !req) {
-        return -1;
-    }
-    const auto descriptor = densecore::models::DescribeModel(model);
-    if (descriptor.variant != ModelVariant::QWEN35 && descriptor.variant != ModelVariant::QWEN36) {
-        return -1;
-    }
-    const bool qwen35_dense = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts <= 0;
-    const bool qwen35_moe = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0;
-    const bool qwen_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
-    const int hybrid_ssm_chunk_tokens =
-#if defined(__aarch64__) || defined(_M_ARM64)
-        256;
-#else
-        384;
-#endif
-    const int base_chunk_tokens =
-        qwen35_dense ? 768 : ((qwen35_moe || qwen_hybrid_ssm) ? hybrid_ssm_chunk_tokens : 192);
-    const int base_auto_min_tokens = qwen35_dense ? 1024 : (qwen35_moe ? 1024 : (qwen_hybrid_ssm ? 1280 : 1536));
-    const char* chunk_env = "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS";
-    const char* default_env = "DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS";
-    const char* auto_min_env = "DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS";
-    const int configured_default_chunk_tokens = densecore::env::ParsePositiveEnvInt(default_env, base_chunk_tokens);
-    const int default_chunk_tokens = std::min(configured_default_chunk_tokens, base_chunk_tokens);
-
-    const int explicit_tokens = densecore::env::ParsePositiveEnvInt(chunk_env, 0);
-    if (explicit_tokens > 0) {
-        return explicit_tokens;
-    }
-
-    const char* env_value = std::getenv(chunk_env);
-    if (env_value && env_value[0] != '\0') {
-        const std::string lowered = densecore::env::AsciiLowerCopy(env_value);
-        if (lowered == "off" || lowered == "false" || lowered == "no") {
-            const int prompt_tokens = RequestPromptTokenCountForChunking(req);
-            const int auto_min_tokens = densecore::env::ParsePositiveEnvInt(auto_min_env, base_auto_min_tokens);
-            if (qwen_hybrid_ssm && prompt_tokens >= auto_min_tokens) {
-                return default_chunk_tokens;
-            }
-            return -1;
-        }
-        if (lowered == "on" || lowered == "true" || lowered == "yes" || lowered == "force") {
-            return default_chunk_tokens;
-        }
-    }
-
-    const int prompt_tokens = RequestPromptTokenCountForChunking(req);
-    if (prompt_tokens <= 0) {
-        return default_chunk_tokens;
-    }
-    const int auto_min_tokens = densecore::env::ParsePositiveEnvInt(auto_min_env, base_auto_min_tokens);
-    return prompt_tokens >= auto_min_tokens ? default_chunk_tokens : -1;
-}
-
-int ResolveGemma4PrefillChunkTokensImpl(const TransformerModel* model, const Request* req) {
-    if (!model || !req) {
-        return -1;
-    }
-    const auto descriptor = densecore::models::DescribeModel(model);
-    if (descriptor.variant != ModelVariant::GEMMA4 || model->hparams.n_experts <= 0) {
-        return -1;
-    }
-    const char* chunk_env = "DENSECORE_GEMMA4_PREFILL_CHUNK_TOKENS";
-    const char* default_env = "DENSECORE_GEMMA4_PREFILL_CHUNK_DEFAULT_TOKENS";
-    const char* auto_min_env = "DENSECORE_GEMMA4_PREFILL_CHUNK_AUTO_MIN_TOKENS";
-    const int explicit_tokens = densecore::env::ParsePositiveEnvInt(chunk_env, 0);
-    if (explicit_tokens > 0) {
-        return explicit_tokens;
-    }
-
-    const auto resolve_manual_default = [&]() { return densecore::env::ParsePositiveEnvInt(default_env, 128); };
-    const char* env_value = std::getenv(chunk_env);
-    bool explicit_auto = false;
-    if (env_value && env_value[0] != '\0') {
-        const std::string lowered = densecore::env::AsciiLowerCopy(env_value);
-        if (lowered == "off" || lowered == "false" || lowered == "no") {
-            return -1;
-        }
-        if (lowered == "on" || lowered == "true" || lowered == "yes" || lowered == "force") {
-            return resolve_manual_default();
-        }
-        explicit_auto = (lowered == "0" || lowered == "auto");
-    }
-    if (!explicit_auto) {
-        const densecore::env::RuntimeToggleMode mode =
-            densecore::env::ParseRuntimeToggleMode(chunk_env, densecore::env::RuntimeToggleMode::Auto);
-        if (mode == densecore::env::RuntimeToggleMode::Off) {
-            return -1;
-        }
-        if (mode == densecore::env::RuntimeToggleMode::On) {
-            return resolve_manual_default();
-        }
-    }
-
-    const int prompt_tokens = RequestPromptTokenCountForChunking(req);
-    if (prompt_tokens <= 0) {
-        return resolve_manual_default();
-    }
-    const int auto_min_tokens = densecore::env::ParsePositiveEnvInt(auto_min_env, 1024);
-    if (prompt_tokens < auto_min_tokens) {
-        return -1;
-    }
-    if (densecore::env::ParsePositiveEnvInt(default_env, 0) > 0) {
-        return resolve_manual_default();
-    }
-
-    // Gemma4 MoE prefill uses the transient ggml graph allocator, so the
-    // default path can run the whole prompt without the KV history gathers
-    // introduced by chunking.
-    return -1;
-}
-
-int ResolveModelPrefillChunkTokens(const TransformerModel* model, const Request* req) {
-    const int qwen36_tokens = ResolveQwen36PrefillChunkTokensImpl(model, req);
-    if (qwen36_tokens != -1) {
-        return qwen36_tokens;
-    }
-    return ResolveGemma4PrefillChunkTokensImpl(model, req);
-}
-
-size_t GraphContextSafetyMarginBytes() {
-    // The graph-size estimate already includes long-context/object safety pads.
-    // This margin is only admission headroom against live runtime pressure after
-    // weights, KV, and repacked caches are resident; a fixed 512 MiB guard was
-    // conservative enough to reject Qwen3.5 35B Q5 long QA even though the
-    // estimated graph pool itself fit in available memory.
-    return ParseSizeEnvMb("DENSECORE_GRAPH_CTX_SAFETY_MARGIN_MB", /*default_mb=*/256, /*min_mb=*/0,
-                          /*max_mb=*/65536) *
-           1024ULL * 1024ULL;
-}
-
-bool IsGraphContextAutoDowngradeEnabled() {
-    return ParseBoolEnvDefault("DENSECORE_GRAPH_CTX_AUTO_DOWNGRADE", true);
-}
-
-bool IsGraphContextFailClosedEnabled() {
-    return ParseBoolEnvDefault("DENSECORE_GRAPH_CTX_FAIL_CLOSED", true);
-}
-
-int ApplyGraphContextPrefillChunkDowngrade(const TransformerModel* model, Request* req, int chunk_tokens) {
-    if (!model || !req || !IsGraphContextAutoDowngradeEnabled()) {
-        return chunk_tokens;
-    }
-    const size_t available_bytes = ReadAvailableMemoryBytesForRuntimePools();
-    if (available_bytes == 0) {
-        return chunk_tokens;
-    }
-    const size_t safety_margin_bytes = GraphContextSafetyMarginBytes();
-    const size_t prompt_tokens = static_cast<size_t>(std::max(1, RequestPromptTokenCountForChunking(req)));
-    int effective_chunk = chunk_tokens;
-    const bool originally_unchunked = effective_chunk <= 1;
-    const auto initial_estimate = EngineState::EstimateGraphContextSize(
-        model, prompt_tokens, /*num_seqs_hint=*/1, originally_unchunked ? 0 : static_cast<size_t>(effective_chunk));
-    req->graph_ctx_requested_mb = initial_estimate.total_bytes / (1024ULL * 1024ULL);
-    req->graph_ctx_available_mb = available_bytes / (1024ULL * 1024ULL);
-    req->graph_ctx_safety_margin_mb = safety_margin_bytes / (1024ULL * 1024ULL);
-    if (initial_estimate.total_bytes + safety_margin_bytes <= available_bytes) {
-        return chunk_tokens;
-    }
-    if (originally_unchunked) {
-        const auto descriptor = densecore::models::DescribeModel(model);
-        const bool qwen35_moe = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0;
-        const bool qwen_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
-        effective_chunk = (qwen35_moe || qwen_hybrid_ssm) ? 384 : 512;
-        effective_chunk = std::max(1, std::min<int>(effective_chunk, static_cast<int>(prompt_tokens)));
-    }
-    const int best_effort_pressure_chunk = std::max(1, effective_chunk);
-
-    while (effective_chunk > 1) {
-        const auto estimate = EngineState::EstimateGraphContextSize(model, prompt_tokens, /*num_seqs_hint=*/1,
-                                                                    static_cast<size_t>(effective_chunk));
-        if (estimate.total_bytes + safety_margin_bytes <= available_bytes) {
-            req->graph_ctx_downgraded_chunk_tokens = effective_chunk;
-            req->graph_ctx_fail_reason.clear();
-            std::cerr << "[DenseCore] GraphCtxAutoDowngrade" << " req=" << req->id
-                      << " original_chunk_tokens=" << (originally_unchunked ? 0 : chunk_tokens)
-                      << " downgraded_chunk_tokens=" << effective_chunk
-                      << " requested_mb=" << (initial_estimate.total_bytes / (1024ULL * 1024ULL))
-                      << " downgraded_mb=" << (estimate.total_bytes / (1024ULL * 1024ULL))
-                      << " available_mb=" << req->graph_ctx_available_mb
-                      << " safety_margin_mb=" << req->graph_ctx_safety_margin_mb << std::endl;
-            return effective_chunk;
-        }
-        effective_chunk = std::max(1, effective_chunk / 2);
-    }
-
-    effective_chunk = std::max(1, best_effort_pressure_chunk);
-    req->graph_ctx_downgraded_chunk_tokens = effective_chunk;
-    req->graph_ctx_fail_reason.clear();
-    std::cerr << "[DenseCore] GraphCtxAutoDowngrade" << " req=" << req->id
-              << " original_chunk_tokens=" << (originally_unchunked ? 0 : chunk_tokens)
-              << " downgraded_chunk_tokens=" << effective_chunk
-              << " requested_mb=" << (initial_estimate.total_bytes / (1024ULL * 1024ULL)) << " downgraded_mb=unknown"
-              << " available_mb=" << req->graph_ctx_available_mb
-              << " safety_margin_mb=" << req->graph_ctx_safety_margin_mb << " reason=best_effort_pressure_chunk"
-              << std::endl;
-    return effective_chunk;
-}
+#include "runtime/worker_prefill_chunking.inl"
 
 int PrefillThreadOverride() {
     return GetWorkerRuntimeConfig().prefill_thread_override;
@@ -4027,12 +2480,25 @@ void EngineLoop(EngineState* state) {
             }
             bool main_work_context_bound_for_current_graph = false;
             std::unique_ptr<ScopedBatchWorkContext> main_work_context_scope;
+            auto bind_lfm2_greedy_lm_head_argmax_sampling = [&](InferenceWorkContext* target_ctx,
+                                                                InferenceExecutionPhase phase) {
+                const auto lfm2_argmax_reject_reason =
+                    GetLFM2GreedyLMHeadArgmaxRejectReason(current_model, batch_requests, phase, is_embedding_batch);
+                const Request* lfm2_argmax_req =
+                    (batch_requests.size() == 1 && batch_requests.front()) ? batch_requests.front() : nullptr;
+                SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(
+                    target_ctx, lfm2_argmax_reject_reason == LFM2GreedyLMHeadArgmaxRejectReason::None,
+                    lfm2_argmax_reject_reason,
+                    lfm2_argmax_req ? lfm2_argmax_req->sampling_params.repetition_penalty : 1.0f,
+                    lfm2_argmax_req ? &lfm2_argmax_req->token_history : nullptr);
+            };
             auto bind_main_work_context_for_graph = [&](const BatchSpec& graph_batch, InferenceExecutionPhase phase) {
                 main_work_context_scope.reset();
                 main_work_context_scope = std::make_unique<ScopedBatchWorkContext>(
                     work_ctx.get(), &graph_batch, phase, true,
                     current_model ? current_model->variant : ModelVariant::UNKNOWN);
                 main_work_context_bound_for_current_graph = true;
+                bind_lfm2_greedy_lm_head_argmax_sampling(work_ctx.get(), phase);
                 bool qwen36_amx_prepared = false;
                 int qwen36_amx_mode = 0;
                 for (const Request* req : batch_requests) {
@@ -4496,6 +2962,7 @@ void EngineLoop(EngineState* state) {
             bool reused_prefill_graph = false;
             bool using_cached_prefill_graph = false;
             bool built_prefill_graph_cache_entry = false;
+            InferenceWorkContext* graph_execution_work_ctx = work_ctx.get();
             if (decode_reuse_attempt_allowed) {
                 if (is_decode_batch && decode_batch_size >= 1 &&
                     decode_batch_size < static_cast<int>(kDecodeGraphCacheTrackedBatches)) {
@@ -4509,6 +2976,8 @@ void EngineLoop(EngineState* state) {
                     it->second.pos && it->second.work_ctx) {
                     bool rebind_ok = true;
                     reset_cached_graph_runtime_context(it->second.work_ctx.get());
+                    bind_lfm2_greedy_lm_head_argmax_sampling(it->second.work_ctx.get(),
+                                                             InferenceExecutionPhase::Decode);
                     if (DoesDecodeGraphCacheRequireRuntimeRebind(current_model)) {
                         const auto rebind_begin = std::chrono::steady_clock::now();
                         rebind_ok = RebindDecodeGraphRuntimeStateForModel(current_model, it->second.graph, batch);
@@ -4536,6 +3005,7 @@ void EngineLoop(EngineState* state) {
                         output = it->second.output;
                         embd_inp = it->second.embd_inp;
                         pos = it->second.pos;
+                        graph_execution_work_ctx = it->second.work_ctx.get();
                         cached_graph_verified_paged_decode_op = it->second.verified_paged_decode_op;
                         reused_decode_graph = true;
                         using_cached_decode_graph = true;
@@ -4605,6 +3075,8 @@ void EngineLoop(EngineState* state) {
                             {
                                 ScopedBatchWorkContext cache_build_ctx(candidate.work_ctx.get(), &batch,
                                                                        InferenceExecutionPhase::Decode);
+                                bind_lfm2_greedy_lm_head_argmax_sampling(candidate.work_ctx.get(),
+                                                                         InferenceExecutionPhase::Decode);
                                 candidate.output = BuildTransformerGraph(current_model, current_kv_cache, candidate.ctx,
                                                                          batch, is_embedding_batch, candidate.graph,
                                                                          &candidate.embd_inp, &candidate.pos);
@@ -4676,6 +3148,7 @@ void EngineLoop(EngineState* state) {
                                     output = entry.output;
                                     embd_inp = entry.embd_inp;
                                     pos = entry.pos;
+                                    graph_execution_work_ctx = entry.work_ctx.get();
                                     cached_graph_verified_paged_decode_op = entry.verified_paged_decode_op;
                                     built_decode_graph_cache_entry = true;
                                     using_cached_decode_graph = true;
@@ -5664,7 +4137,9 @@ void EngineLoop(EngineState* state) {
                                                                                        : -1,
                                      batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads,
                                      is_decode_batch ? "decode" : "prefill");
-            AccumulateQwen36SSMProjectionNodeTimes(work_ctx.get(), gf);
+            InferenceWorkContext* profile_work_ctx =
+                graph_execution_work_ctx ? graph_execution_work_ctx : work_ctx.get();
+            AccumulateQwen36SSMProjectionNodeTimes(profile_work_ctx, gf);
             const Qwen36PrefillBreakdown qwen36_prefill_breakdown =
                 is_prefill_batch ? SummarizeQwen36PrefillNodeTimes(current_model, gf) : Qwen36PrefillBreakdown{};
             const Gemma4PrefillAttentionTimingBreakdown gemma4_prefill_attention_breakdown =
@@ -5693,7 +4168,7 @@ void EngineLoop(EngineState* state) {
             DebugDumpGemma4NodeTimes(current_model, gf, is_decode_batch ? "decode" : "prefill");
             const auto graph_execute_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(compute_end - compute_begin).count());
-            const Qwen36ProfileSnapshot qwen36_profile = GetQwen36ProfileSnapshot(work_ctx.get());
+            const Qwen36ProfileSnapshot qwen36_profile = GetQwen36ProfileSnapshot(profile_work_ctx);
             if (collect_decode_graph_node_timing) {
                 SynthesizeDecodeGraphNodeTimingFromProfiles(&decode_graph_node_timing, graph_execute_ns,
                                                             native_moe_graph_timing, hybrid_ssm_graph_timing,
@@ -5727,6 +4202,13 @@ void EngineLoop(EngineState* state) {
                     if (collect_decode_graph_node_timing) {
                         req->decode_graph_node_measured_ns += decode_graph_node_timing.measured_ns;
                         req->decode_graph_node_custom_ns += decode_graph_node_timing.custom_ns;
+                        req->decode_graph_node_custom_moe_ns += decode_graph_node_timing.custom_moe_ns;
+                        req->decode_graph_node_custom_ssm_ns += decode_graph_node_timing.custom_ssm_ns;
+                        req->decode_graph_node_custom_projection_ns += decode_graph_node_timing.custom_projection_ns;
+                        req->decode_graph_node_custom_lm_head_ns += decode_graph_node_timing.custom_lm_head_ns;
+                        req->decode_graph_node_custom_paged_attention_ns +=
+                            decode_graph_node_timing.custom_paged_attention_ns;
+                        req->decode_graph_node_custom_other_ns += decode_graph_node_timing.custom_other_ns;
                         req->decode_graph_node_mul_mat_ns += decode_graph_node_timing.mul_mat_ns;
                         req->decode_graph_node_mul_mat_id_ns += decode_graph_node_timing.mul_mat_id_ns;
                         req->decode_graph_node_norm_ns += decode_graph_node_timing.norm_ns;
@@ -5735,6 +4217,13 @@ void EngineLoop(EngineState* state) {
                         req->decode_graph_node_attention_ns += decode_graph_node_timing.attention_ns;
                         req->decode_graph_node_other_ns += decode_graph_node_timing.other_ns;
                         req->decode_graph_node_custom_count += decode_graph_node_timing.custom_count;
+                        req->decode_graph_node_custom_moe_count += decode_graph_node_timing.custom_moe_count;
+                        req->decode_graph_node_custom_ssm_count += decode_graph_node_timing.custom_ssm_count;
+                        req->decode_graph_node_custom_projection_count += decode_graph_node_timing.custom_projection_count;
+                        req->decode_graph_node_custom_lm_head_count += decode_graph_node_timing.custom_lm_head_count;
+                        req->decode_graph_node_custom_paged_attention_count +=
+                            decode_graph_node_timing.custom_paged_attention_count;
+                        req->decode_graph_node_custom_other_count += decode_graph_node_timing.custom_other_count;
                         req->decode_graph_node_mul_mat_count += decode_graph_node_timing.mul_mat_count;
                         req->decode_graph_node_mul_mat_id_count += decode_graph_node_timing.mul_mat_id_count;
                         req->decode_graph_node_norm_count += decode_graph_node_timing.norm_count;
@@ -6103,6 +4592,24 @@ void EngineLoop(EngineState* state) {
                         qwen36_profile.lfm2_decode_lm_head_custom_gemv_used_ops;
                     req->lfm2_decode_lm_head_custom_gemv_ns +=
                         qwen36_profile.lfm2_decode_lm_head_custom_gemv_ns;
+                    req->lfm2_greedy_lm_head_argmax_candidate_ops +=
+                        qwen36_profile.lfm2_greedy_lm_head_argmax_candidate_ops;
+                    req->lfm2_greedy_lm_head_argmax_used_ops +=
+                        qwen36_profile.lfm2_greedy_lm_head_argmax_used_ops;
+                    req->lfm2_greedy_lm_head_argmax_rejected_ops +=
+                        qwen36_profile.lfm2_greedy_lm_head_argmax_rejected_ops;
+                    req->lfm2_greedy_lm_head_argmax_ns += qwen36_profile.lfm2_greedy_lm_head_argmax_ns;
+                    if (qwen36_profile.lfm2_greedy_lm_head_argmax_last_reject_reason != 0) {
+                        req->lfm2_greedy_lm_head_argmax_last_reject_reason =
+                            qwen36_profile.lfm2_greedy_lm_head_argmax_last_reject_reason;
+                    }
+                    req->lfm2_w1w3_q4k_vecdot_rowpair_used_ops +=
+                        qwen36_profile.lfm2_w1w3_q4k_vecdot_rowpair_used_ops;
+                    req->lfm2_w1w3_q4k_vecdot_scalar_used_ops +=
+                        qwen36_profile.lfm2_w1w3_q4k_vecdot_scalar_used_ops;
+                    req->lfm2_w1w3_q4k_hwy_used_ops += qwen36_profile.lfm2_w1w3_q4k_hwy_used_ops;
+                    req->lfm2_w1w3_q4k_repacked_used_ops += qwen36_profile.lfm2_w1w3_q4k_repacked_used_ops;
+                    req->lfm2_w1w3_q5k_hwy_used_ops += qwen36_profile.lfm2_w1w3_q5k_hwy_used_ops;
                     for (std::size_t i = 0; i < req->gemv_custom_weight_type_hist.size(); ++i) {
                         req->gemv_custom_weight_type_hist[i] += qwen36_profile.gemv_custom_weight_type_hist[i];
                     }
@@ -6934,7 +5441,17 @@ void EngineLoop(EngineState* state) {
                     }
 
                     const auto sample_begin = std::chrono::steady_clock::now();
-                    int best_token = SampleToken(output, sampling_logits_idx, sampling_params);
+                    int best_token = -1;
+                    float precomputed_lfm2_argmax_value = -std::numeric_limits<float>::infinity();
+                    const bool can_use_precomputed_lfm2_argmax =
+                        debug_sampling_logits_offset == 0 && debug_first_token_sampling_logits_offset == 0 &&
+                        profile_work_ctx &&
+                        TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(
+                            profile_work_ctx, static_cast<int>(output->ne[0]), &best_token,
+                            &precomputed_lfm2_argmax_value);
+                    if (!can_use_precomputed_lfm2_argmax) {
+                        best_token = SampleToken(output, sampling_logits_idx, sampling_params);
+                    }
                     const auto sample_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                      std::chrono::steady_clock::now() - sample_begin)
                                                                      .count());

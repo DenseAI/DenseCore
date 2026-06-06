@@ -68,6 +68,32 @@ enum class InferenceExecutionPhase : uint8_t {
     Decode = 2,
 };
 
+enum class LFM2GreedyLMHeadArgmaxRejectReason : int {
+    None = 0,
+    NotAllowed = 1,
+    UnsupportedShape = 2,
+    UnsupportedWeight = 3,
+    MissingQuantInput = 4,
+    KernelUnavailable = 5,
+    Sync = 6,
+    JsonMode = 7,
+    Temperature = 8,
+    FinalLogitSoftcap = 9,
+    ActionTokenRange = 10,
+    FrequencyPenalty = 11,
+    PresencePenalty = 12,
+    Grammar = 13,
+    AllowedTokens = 14,
+    DisallowedTokens = 15,
+    DebugSampler = 16,
+    InvalidRepetitionPenalty = 17,
+    UnsupportedModel = 18,
+    NonDecodePhase = 19,
+    EmbeddingBatch = 20,
+    UnsupportedBatch = 21,
+    MissingRequest = 22,
+};
+
 struct GenericInput {
     BatchInputKind kind = BatchInputKind::Tokens;
     std::vector<int> tokens;   // Text tokens
@@ -333,6 +359,16 @@ struct Qwen36ProfileSnapshot {
     uint64_t gemv_custom_dynamic_lora_ops = 0;
     uint64_t lfm2_decode_lm_head_custom_gemv_used_ops = 0;
     uint64_t lfm2_decode_lm_head_custom_gemv_ns = 0;
+    uint64_t lfm2_greedy_lm_head_argmax_candidate_ops = 0;
+    uint64_t lfm2_greedy_lm_head_argmax_used_ops = 0;
+    uint64_t lfm2_greedy_lm_head_argmax_rejected_ops = 0;
+    uint64_t lfm2_greedy_lm_head_argmax_ns = 0;
+    int lfm2_greedy_lm_head_argmax_last_reject_reason = 0;
+    uint64_t lfm2_w1w3_q4k_vecdot_rowpair_used_ops = 0;
+    uint64_t lfm2_w1w3_q4k_vecdot_scalar_used_ops = 0;
+    uint64_t lfm2_w1w3_q4k_hwy_used_ops = 0;
+    uint64_t lfm2_w1w3_q4k_repacked_used_ops = 0;
+    uint64_t lfm2_w1w3_q5k_hwy_used_ops = 0;
     std::array<uint64_t, kMatmulWeightTypeHistCount> gemv_custom_weight_type_hist{};
     std::array<uint64_t, kMatmulQuantInputTypeHistCount> gemv_custom_quant_input_type_hist{};
     int gemv_custom_tasks_effective = 0;
@@ -510,6 +546,16 @@ InferenceWorkContext* GetCurrentWorkContext();
 void SetInferenceWorkContextGraphBuildNoAlloc(InferenceWorkContext* ctx, bool no_alloc);
 bool IsCurrentGraphBuildNoAlloc();
 void SetInferenceWorkContextModelVariant(InferenceWorkContext* ctx, ModelVariant variant);
+void SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(InferenceWorkContext* ctx, bool allowed,
+                                                           LFM2GreedyLMHeadArgmaxRejectReason reject_reason,
+                                                           float repetition_penalty,
+                                                           const std::vector<int>* token_history);
+void WriteInferenceWorkContextLFM2GreedyLMHeadSparseLogits(InferenceWorkContext* ctx, float* output, int vocab_size,
+                                                           int token, float value);
+void RecordInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(InferenceWorkContext* ctx, uint64_t generation,
+                                                           int token, float value, int vocab_size);
+bool TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(const InferenceWorkContext* ctx, int vocab_size,
+                                                           int* token, float* value);
 void SetCurrentExecutionPhase(InferenceExecutionPhase phase);
 InferenceExecutionPhase GetCurrentExecutionPhase();
 const BatchSpec* GetCurrentBatch();
@@ -524,6 +570,7 @@ void RecordMoESmallDecodeParallelDecision(InferenceWorkContext* ctx, bool candid
                                           const char* reject_reason, int selected_expert_count, int top_k,
                                           int task_count);
 void RecordMoEExpertMatmulWeightType(InferenceWorkContext* ctx, ggml_type weight_type);
+void RecordLFM2NativeMoEW1W3Kernel(InferenceWorkContext* ctx, const char* kernel_name);
 void RecordMoEQ4KRepackedDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason);
 void RecordMoEQ5KRepackedDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason);
 void RecordGemma4MoEPrefillQuantBatchDecision(InferenceWorkContext* ctx, bool candidate, bool used,
@@ -554,7 +601,7 @@ void RecordQwenTargetGgmlComputeFallback(InferenceWorkContext* ctx, const Transf
 void RecordQ6KGemvDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,
                            const char* weight_name, int64_t m, int64_t n, int64_t k, uint64_t wall_ns,
                            const char* effective_phase = nullptr, const char* graph_phase = nullptr,
-                           const char* callback_phase = nullptr);
+                           const char* callback_phase = nullptr, const char* dispatch_path = nullptr);
 void RecordNativeMoEFastDecodeDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,
                                        bool w1w3_used, bool w2_used, uint64_t wall_ns = 0);
 void RecordNativeMoEFastW2Q5KDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason,

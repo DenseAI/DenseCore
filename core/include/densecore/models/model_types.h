@@ -17,6 +17,11 @@
 #include "densecore/hal/tensor.h"
 #include "densecore/memory/numa_allocator.h"
 #include "densecore/models/qwen35_ssm_math.h"
+
+namespace densecore::runtime {
+enum class DenseCoreTensorRole : int;
+}
+
 // ============================================================================
 // Model Architecture Enum
 // ============================================================================
@@ -261,6 +266,7 @@ struct OpNode {
 // Single transformer layer weights (generic map-based representation)
 struct TransformerLayer {
     std::unordered_map<std::string, struct ggml_tensor*> tensors;
+    std::unordered_map<const struct ggml_tensor*, densecore::runtime::DenseCoreTensorRole> tensor_roles;
 
     // [NEW] Execution Plan (The "Logic")
     // If this is populated, GenericGraphBuilder executes these nodes in order.
@@ -277,11 +283,41 @@ struct TransformerLayer {
     struct ggml_tensor* Get(const char* key) const { return Get(std::string(key)); }
 
     void Set(const std::string& key, struct ggml_tensor* tensor) {
+        auto it = tensors.find(key);
+        if (it != tensors.end() && it->second != tensor) {
+            tensor_roles.erase(it->second);
+        }
         if (tensor) {
             tensors[key] = tensor;
         } else {
             tensors.erase(key);
         }
+    }
+
+    void Set(const std::string& key, struct ggml_tensor* tensor,
+             densecore::runtime::DenseCoreTensorRole tensor_role) {
+        Set(key, tensor);
+        SetTensorRole(tensor, tensor_role);
+    }
+
+    void SetTensorRole(const struct ggml_tensor* tensor, densecore::runtime::DenseCoreTensorRole tensor_role) {
+        if (!tensor) {
+            return;
+        }
+        if (static_cast<int>(tensor_role) == 0) {
+            tensor_roles.erase(tensor);
+            return;
+        }
+        tensor_roles[tensor] = tensor_role;
+    }
+
+    densecore::runtime::DenseCoreTensorRole GetTensorRole(const struct ggml_tensor* tensor) const {
+        auto it = tensor_roles.find(tensor);
+        return it == tensor_roles.end() ? static_cast<densecore::runtime::DenseCoreTensorRole>(0) : it->second;
+    }
+
+    densecore::runtime::DenseCoreTensorRole GetTensorRole(const std::string& key) const {
+        return GetTensorRole(Get(key));
     }
 
     struct ggml_tensor** GetMutable(const std::string& key) {
@@ -301,11 +337,21 @@ struct TransformerLayer {
         if (idx >= experts.size()) {
             experts.resize(idx + 1);
         }
+        auto it = experts[idx].find(key);
+        if (it != experts[idx].end() && it->second != tensor) {
+            tensor_roles.erase(it->second);
+        }
         if (tensor) {
             experts[idx][key] = tensor;
         } else {
             experts[idx].erase(key);
         }
+    }
+
+    void SetExpert(size_t idx, const std::string& key, struct ggml_tensor* tensor,
+                   densecore::runtime::DenseCoreTensorRole tensor_role) {
+        SetExpert(idx, key, tensor);
+        SetTensorRole(tensor, tensor_role);
     }
 };
 
@@ -468,6 +514,23 @@ struct TransformerModel {
 
     std::vector<TransformerLayer> layers;
     std::shared_ptr<const densecore::models::DecoderModelSpec> decoder_spec;
+    std::unordered_map<const struct ggml_tensor*, densecore::runtime::DenseCoreTensorRole> tensor_roles;
+
+    void SetTensorRole(const struct ggml_tensor* tensor, densecore::runtime::DenseCoreTensorRole tensor_role) {
+        if (!tensor) {
+            return;
+        }
+        if (static_cast<int>(tensor_role) == 0) {
+            tensor_roles.erase(tensor);
+            return;
+        }
+        tensor_roles[tensor] = tensor_role;
+    }
+
+    densecore::runtime::DenseCoreTensorRole GetTensorRole(const struct ggml_tensor* tensor) const {
+        auto it = tensor_roles.find(tensor);
+        return it == tensor_roles.end() ? static_cast<densecore::runtime::DenseCoreTensorRole>(0) : it->second;
+    }
 
     // Context & Backend
     struct ggml_context* ctx_w = nullptr;      // weight context
