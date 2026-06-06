@@ -630,6 +630,49 @@ bool QActBatchedCacheReusesSameTensorForTest() {
            reused_after_second == q8_total_bytes;
 }
 
+bool QActCacheKeepsMultipleTensorEntriesForTest() {
+    InferenceWorkContext ctx{};
+    ctx.execution_generation = 42;
+    std::array<float, QK_K> values0{};
+    std::array<float, QK_K> values1{};
+    for (int i = 0; i < QK_K; ++i) {
+        values0[static_cast<size_t>(i)] = static_cast<float>(i) * 0.01f;
+        values1[static_cast<size_t>(i)] = static_cast<float>(i) * -0.02f;
+    }
+    ggml_init_params params{16 * 1024, nullptr, false};
+    ggml_context* ggml_ctx = ggml_init(params);
+    if (!ggml_ctx) {
+        return false;
+    }
+    ggml_tensor* t0 = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_F32, QK_K);
+    ggml_tensor* t1 = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_F32, QK_K);
+    if (!t0 || !t1) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+    t0->data = values0.data();
+    t1->data = values1.data();
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    const size_t q8_bytes = ggml_row_size(GGML_TYPE_Q8_K, QK_K);
+    const uint8_t* first0 =
+        ::GetOrFillQuantizedActivationCache(&ctx, t0, t0->data, values0.data(), QK_K, GGML_TYPE_Q8_K, q8_bytes, 1, 7,
+                                            q8_traits);
+    const uint8_t* first1 =
+        ::GetOrFillQuantizedActivationCache(&ctx, t1, t1->data, values1.data(), QK_K, GGML_TYPE_Q8_K, q8_bytes, 1, 7,
+                                            q8_traits);
+    const uint64_t misses_after_fill = ctx.qwen36_profile.qact_cache_misses.load(std::memory_order_relaxed);
+    const uint8_t* second0 =
+        ::GetOrFillQuantizedActivationCache(&ctx, t0, t0->data, values0.data(), QK_K, GGML_TYPE_Q8_K, q8_bytes, 1, 7,
+                                            q8_traits);
+    const uint8_t* second1 =
+        ::GetOrFillQuantizedActivationCache(&ctx, t1, t1->data, values1.data(), QK_K, GGML_TYPE_Q8_K, q8_bytes, 1, 7,
+                                            q8_traits);
+    const uint64_t hits_after_reuse = ctx.qwen36_profile.qact_cache_hits.load(std::memory_order_relaxed);
+    ggml_free(ggml_ctx);
+    return first0 && first1 && second0 && second1 && first0 == second0 && first1 == second1 &&
+           misses_after_fill == 2 && hits_after_reuse == 2;
+}
+
 bool RunQwen36Q4KBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle,
                                       int* admission_state, int* reject_reason) {
     if (output_matches_vecdot_oracle) *output_matches_vecdot_oracle = false;
@@ -734,15 +777,22 @@ bool RunQwen36Q4KBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracl
     return true;
 }
 
-bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle) {
-    constexpr int rows = 128;
-    constexpr int cols = QK8_0 * 4;
-    constexpr int tokens = 8;
+static bool RunQwen36SSMQ8RepackedBatchedShapeForTest(int rows, int cols, int tokens, int nth,
+                                                      bool exhaustive_oracle,
+                                                      bool* output_matches_vecdot_oracle,
+                                                      uint64_t* true_gemm_ops,
+                                                      uint64_t* gemv_ops) {
     const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
-    if (!q8_traits || !q8_traits->from_float || !q8_traits->vec_dot || q8_traits->vec_dot_type != GGML_TYPE_Q8_0) {
+    if (rows <= 0 || cols <= 0 || tokens <= 0 || (cols % QK8_0) != 0 || (rows % 4) != 0 || !q8_traits ||
+        !q8_traits->from_float || !q8_traits->vec_dot || q8_traits->vec_dot_type != GGML_TYPE_Q8_0) {
         return false;
     }
-    ggml_init_params params{256 * 1024, nullptr, false};
+    const size_t mem_size = std::max<size_t>(256 * 1024, ggml_row_size(GGML_TYPE_Q8_0, cols) *
+                                                               static_cast<size_t>(rows) +
+                                                               static_cast<size_t>(rows) *
+                                                                   static_cast<size_t>(tokens) * sizeof(float) +
+                                                               16 * 1024 * 1024);
+    ggml_init_params params{mem_size, nullptr, false};
     ggml_context* ggml_ctx = ggml_init(params);
     if (!ggml_ctx) {
         return false;
@@ -764,13 +814,15 @@ bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_ve
                 std::sin(static_cast<float>(m * 29 + c) * 0.011f) * 0.5f;
         }
     }
-    std::vector<float> weight_f32(static_cast<size_t>(rows) * cols);
+    const auto weight_value = [](int row, int col) {
+        return std::cos(static_cast<float>(row * 13 + col) * 0.017f) * 0.375f;
+    };
+    std::vector<float> weight_row(static_cast<size_t>(cols));
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
-            weight_f32[static_cast<size_t>(r) * cols + c] =
-                std::cos(static_cast<float>(r * 13 + c) * 0.017f) * 0.375f;
+            weight_row[static_cast<size_t>(c)] = weight_value(r, c);
         }
-        q8_traits->from_float(weight_f32.data() + static_cast<size_t>(r) * cols,
+        q8_traits->from_float(weight_row.data(),
                               static_cast<uint8_t*>(weight->data) +
                                   static_cast<size_t>(r) * ggml_row_size(GGML_TYPE_Q8_0, cols),
                               cols);
@@ -794,6 +846,13 @@ bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_ve
         cb_gemv_batched_custom(dst, ith, std::max(1, nth), &ud);
     }
     SetCurrentWorkContext(nullptr);
+    const auto snapshot = GetQwen36ProfileSnapshot(&work_ctx);
+    if (true_gemm_ops) {
+        *true_gemm_ops = snapshot.q8_batched_true_gemm_ops;
+    }
+    if (gemv_ops) {
+        *gemv_ops = snapshot.q8_batched_gemv_ops;
+    }
 
     std::vector<uint8_t> q8_input(static_cast<size_t>(tokens) * ud.quant_row_stride);
     for (int m = 0; m < tokens; ++m) {
@@ -802,7 +861,28 @@ bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_ve
     }
     bool matches = true;
     auto* out = reinterpret_cast<float*>(dst->data);
-    for (int r = 0; r < rows; ++r) {
+    std::vector<int> rows_to_check;
+    if (exhaustive_oracle) {
+        rows_to_check.reserve(static_cast<size_t>(rows));
+        for (int r = 0; r < rows; ++r) {
+            rows_to_check.push_back(r);
+        }
+    } else {
+        const int samples[] = {0, 1, 127, rows / 2, rows - 2, rows - 1};
+        for (int r : samples) {
+            bool already_added = false;
+            for (int existing : rows_to_check) {
+                if (existing == r) {
+                    already_added = true;
+                    break;
+                }
+            }
+            if (r >= 0 && r < rows && !already_added) {
+                rows_to_check.push_back(r);
+            }
+        }
+    }
+    for (int r : rows_to_check) {
         const void* row_ptr = static_cast<const uint8_t*>(weight->data) +
                               static_cast<size_t>(r) * ggml_row_size(GGML_TYPE_Q8_0, cols);
         for (int m = 0; m < tokens; ++m) {
@@ -818,6 +898,17 @@ bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_ve
     if (output_matches_vecdot_oracle) *output_matches_vecdot_oracle = matches;
     ggml_free(ggml_ctx);
     return true;
+}
+
+bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle) {
+    return RunQwen36SSMQ8RepackedBatchedShapeForTest(
+        128, QK8_0 * 4, 8, nth, /*exhaustive_oracle=*/true, output_matches_vecdot_oracle, nullptr, nullptr);
+}
+
+bool RunQwen36SSMQ8RepackedBatchedWideForTest(int nth, bool* output_matches_vecdot_oracle,
+                                              uint64_t* true_gemm_ops, uint64_t* gemv_ops) {
+    return RunQwen36SSMQ8RepackedBatchedShapeForTest(2048, QK8_0 * 384, 4, nth, /*exhaustive_oracle=*/false,
+                                                     output_matches_vecdot_oracle, true_gemm_ops, gemv_ops);
 }
 
 int ResolveNativeMoEGraphCallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int phase,

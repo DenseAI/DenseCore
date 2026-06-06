@@ -69,93 +69,109 @@ static void DenseCoreGemvQ8_0_4x8Q8_0Generic(int n, float* out, const void* pack
     }
 }
 
-struct DenseCoreQ8_0x4Block {
-    ggml_fp16_t d[4];
-    int8_t qs[QK8_0 * 4];
-};
-static_assert(sizeof(DenseCoreQ8_0x4Block) == 4 * sizeof(ggml_fp16_t) + QK8_0 * 4,
-              "Q8_0x4 block layout must match ggml repack layout");
-
-static bool DenseCoreQ8_0_4x8GemmM4FromQ8(int n, float* out, size_t out_stride_floats, const void* packed_weight,
-                                          const uint8_t* q8_input_base, size_t q8_row_stride,
-                                          std::vector<DenseCoreQ8_0x4Block>& qtile, int nc) {
-#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-    if (!out || !packed_weight || !q8_input_base || n <= 0 || (n % QK8_0) != 0 || (nc % 4) != 0 ||
-        q8_row_stride < ggml_row_size(GGML_TYPE_Q8_0, n)) {
+static bool DenseCorePackQ8_0RowsTo4x8(const uint8_t* q8_input_base, size_t q8_row_stride, int rows, int n,
+                                       std::vector<uint8_t>& packed) {
+    if (!q8_input_base || rows <= 0 || (rows % 4) != 0 || n <= 0 || (n % QK8_0) != 0) {
         return false;
     }
-    const int nb = n / QK8_0;
-    qtile.resize(static_cast<size_t>(nb));
-    for (int b = 0; b < nb; ++b) {
-        DenseCoreQ8_0x4Block& block = qtile[static_cast<size_t>(b)];
-        for (int row = 0; row < 4; ++row) {
-            const auto* src = reinterpret_cast<const block_q8_0*>(
-                q8_input_base + static_cast<size_t>(row) * q8_row_stride +
-                static_cast<size_t>(b) * sizeof(block_q8_0));
-            block.d[row] = src->d;
-            for (int group = 0; group < 4; ++group) {
-                for (int lane = 0; lane < 8; ++lane) {
-                    block.qs[group * 32 + row * 8 + lane] = src->qs[group * 8 + lane];
+    const int blocks_per_row = n / QK8_0;
+    const size_t q8_row_bytes = static_cast<size_t>(blocks_per_row) * sizeof(block_q8_0);
+    if (q8_row_stride < q8_row_bytes) {
+        return false;
+    }
+    const size_t packed_block_bytes = 4 * sizeof(ggml_fp16_t) + QK8_0 * 4;
+    packed.resize(static_cast<size_t>(rows / 4) * static_cast<size_t>(blocks_per_row) * packed_block_bytes);
+
+    for (int m = 0; m < rows; m += 4) {
+        const auto* row0 = reinterpret_cast<const block_q8_0*>(q8_input_base + static_cast<size_t>(m + 0) * q8_row_stride);
+        const auto* row1 = reinterpret_cast<const block_q8_0*>(q8_input_base + static_cast<size_t>(m + 1) * q8_row_stride);
+        const auto* row2 = reinterpret_cast<const block_q8_0*>(q8_input_base + static_cast<size_t>(m + 2) * q8_row_stride);
+        const auto* row3 = reinterpret_cast<const block_q8_0*>(q8_input_base + static_cast<size_t>(m + 3) * q8_row_stride);
+        const block_q8_0* rows_in[4] = {row0, row1, row2, row3};
+        for (int b = 0; b < blocks_per_row; ++b) {
+            uint8_t* dst = packed.data() +
+                           (static_cast<size_t>(m / 4) * static_cast<size_t>(blocks_per_row) +
+                            static_cast<size_t>(b)) *
+                               packed_block_bytes;
+            auto* dst_d = reinterpret_cast<ggml_fp16_t*>(dst);
+            auto* dst_qs = reinterpret_cast<int8_t*>(dst + 4 * sizeof(ggml_fp16_t));
+            for (int r = 0; r < 4; ++r) {
+                dst_d[r] = rows_in[r][b].d;
+            }
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                for (int r = 0; r < 4; ++r) {
+                    std::memcpy(dst_qs + chunk * 4 * 8 + r * 8, rows_in[r][b].qs + chunk * 8, 8);
                 }
             }
         }
     }
+    return true;
+}
 
-    const auto* b_ptr_base = static_cast<const DenseCoreQ8_0x4Block*>(packed_weight);
-    const DenseCoreQ8_0x4Block* a_ptr_base = qtile.data();
-    for (int x = 0; x < nc; x += 4) {
-        const DenseCoreQ8_0x4Block* b_ptr = b_ptr_base + static_cast<size_t>(x / 4) * static_cast<size_t>(nb);
-        const DenseCoreQ8_0x4Block* a_ptr = a_ptr_base;
-
-        float32x4_t acc_f32[4];
-        for (int i = 0; i < 4; ++i) {
-            acc_f32[i] = vdupq_n_f32(0);
-        }
-        for (int b = 0; b < nb; ++b) {
-            int32x4_t acc[4];
-            for (int i = 0; i < 4; ++i) {
-                acc[i] = vdupq_n_s32(0);
-            }
-            for (int chunk = 0; chunk < 4; ++chunk) {
-                const int8x16_t a01 = vld1q_s8(a_ptr->qs + chunk * 32);
-                const int8x16_t a23 = vld1q_s8(a_ptr->qs + chunk * 32 + 16);
-                const int8x16_t b01 = vld1q_s8(b_ptr->qs + chunk * 32);
-                const int8x16_t b23 = vld1q_s8(b_ptr->qs + chunk * 32 + 16);
-                acc[0] = vmmlaq_s32(acc[0], a01, b01);
-                acc[1] = vmmlaq_s32(acc[1], a01, b23);
-                acc[2] = vmmlaq_s32(acc[2], a23, b01);
-                acc[3] = vmmlaq_s32(acc[3], a23, b23);
-            }
-
-            const int32x4_t row0 = vcombine_s32(vget_low_s32(acc[0]), vget_low_s32(acc[1]));
-            const int32x4_t row1 = vcombine_s32(vget_high_s32(acc[0]), vget_high_s32(acc[1]));
-            const int32x4_t row2 = vcombine_s32(vget_low_s32(acc[2]), vget_low_s32(acc[3]));
-            const int32x4_t row3 = vcombine_s32(vget_high_s32(acc[2]), vget_high_s32(acc[3]));
-            const float32x4_t a_d = vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(a_ptr->d)));
-            const float32x4_t b_d = vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(b_ptr->d)));
-            acc_f32[0] = vfmaq_f32(acc_f32[0], vcvtq_f32_s32(row0), vmulq_laneq_f32(b_d, a_d, 0));
-            acc_f32[1] = vfmaq_f32(acc_f32[1], vcvtq_f32_s32(row1), vmulq_laneq_f32(b_d, a_d, 1));
-            acc_f32[2] = vfmaq_f32(acc_f32[2], vcvtq_f32_s32(row2), vmulq_laneq_f32(b_d, a_d, 2));
-            acc_f32[3] = vfmaq_f32(acc_f32[3], vcvtq_f32_s32(row3), vmulq_laneq_f32(b_d, a_d, 3));
-            ++a_ptr;
-            ++b_ptr;
-        }
-        for (int row = 0; row < 4; ++row) {
-            vst1q_f32(out + static_cast<size_t>(row) * out_stride_floats + x, acc_f32[row]);
-        }
+static size_t DenseCoreQ8_0RowsTo4x8PackedBytes(int rows, int n) {
+    if (rows <= 0 || (rows % 4) != 0 || n <= 0 || (n % QK8_0) != 0) {
+        return 0;
     }
+    const size_t packed_block_bytes = 4 * sizeof(ggml_fp16_t) + QK8_0 * 4;
+    return static_cast<size_t>(rows / 4) * static_cast<size_t>(n / QK8_0) * packed_block_bytes;
+}
+
+static void DenseCoreClearQ8_0RowsTo4x8ActivationCache(InferenceWorkContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->q8_gemm_packed_generation = 0;
+    ctx->q8_gemm_packed_tensor = nullptr;
+    ctx->q8_gemm_packed_source = nullptr;
+    ctx->q8_gemm_packed_rows = 0;
+    ctx->q8_gemm_packed_cols = 0;
+    ctx->q8_gemm_packed_bytes = 0;
+    ctx->q8_gemm_packed_token_pos = std::numeric_limits<int64_t>::min();
+    ctx->q8_gemm_packed_buffer.clear();
+}
+
+static constexpr bool DenseCoreQ8_0Gemm4x8FastBackendCompiled() {
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
     return true;
 #else
-    (void)n;
-    (void)out;
-    (void)out_stride_floats;
-    (void)packed_weight;
-    (void)q8_input_base;
-    (void)q8_row_stride;
-    (void)qtile;
-    (void)nc;
     return false;
 #endif
+}
+
+static bool DenseCoreValidateQ8_0RowsTo4x8ActivationCache(const InferenceWorkContext* ctx,
+                                                          const ggml_tensor* src_tensor, const void* source, int rows,
+                                                          int n, size_t packed_bytes, int64_t token_pos) {
+    return ctx && src_tensor && source && rows > 0 && n > 0 && packed_bytes > 0 &&
+           ctx->q8_gemm_packed_generation == ctx->execution_generation &&
+           ctx->q8_gemm_packed_tensor == src_tensor && ctx->q8_gemm_packed_source == source &&
+           ctx->q8_gemm_packed_rows == rows && ctx->q8_gemm_packed_cols == n &&
+           ctx->q8_gemm_packed_bytes == packed_bytes && ctx->q8_gemm_packed_token_pos == token_pos &&
+           ctx->q8_gemm_packed_buffer.size() == packed_bytes;
+}
+
+static const uint8_t* GetOrFillQ8_0RowsTo4x8ActivationCache(InferenceWorkContext* ctx,
+                                                            const ggml_tensor* src_tensor, const void* source,
+                                                            const uint8_t* q8_input_base, size_t q8_row_stride,
+                                                            int rows, int n, int64_t token_pos) {
+    const size_t packed_bytes = DenseCoreQ8_0RowsTo4x8PackedBytes(rows, n);
+    if (!ctx || !src_tensor || !source || !q8_input_base || q8_row_stride == 0 || packed_bytes == 0) {
+        return nullptr;
+    }
+    if (DenseCoreValidateQ8_0RowsTo4x8ActivationCache(ctx, src_tensor, source, rows, n, packed_bytes, token_pos)) {
+        return ctx->q8_gemm_packed_buffer.data();
+    }
+    if (!DenseCorePackQ8_0RowsTo4x8(q8_input_base, q8_row_stride, rows, n, ctx->q8_gemm_packed_buffer)) {
+        DenseCoreClearQ8_0RowsTo4x8ActivationCache(ctx);
+        return nullptr;
+    }
+    ctx->q8_gemm_packed_generation = ctx->execution_generation;
+    ctx->q8_gemm_packed_tensor = src_tensor;
+    ctx->q8_gemm_packed_source = source;
+    ctx->q8_gemm_packed_rows = rows;
+    ctx->q8_gemm_packed_cols = n;
+    ctx->q8_gemm_packed_bytes = packed_bytes;
+    ctx->q8_gemm_packed_token_pos = token_pos;
+    return ctx->q8_gemm_packed_buffer.data();
 }
 
 static inline float DenseCoreQ8_0BlockDot(const block_q8_0* weight_blocks, const block_q8_0* input_blocks,
@@ -660,6 +676,80 @@ static bool QuantizedActivationCacheEnabled(const densecore::llm::config::FastPa
            config.qact_cache == densecore::env::RuntimeToggleMode::Auto;
 }
 
+static bool QuantizedActivationKeyMatches(uint64_t generation, const ggml_tensor* tensor, const void* source,
+                                          int64_t len, ggml_type type, size_t bytes, int slot_id,
+                                          int64_t token_pos, size_t buffer_size,
+                                          const InferenceWorkContext* ctx, const ggml_tensor* src_tensor,
+                                          const void* expected_source, int64_t expected_len,
+                                          ggml_type expected_type, size_t expected_bytes,
+                                          int expected_slot_id, int64_t expected_token_pos) {
+    return ctx && generation == ctx->execution_generation && tensor == src_tensor && source == expected_source &&
+           len == expected_len && type == expected_type && bytes == expected_bytes &&
+           slot_id == expected_slot_id && token_pos == expected_token_pos && buffer_size == expected_bytes;
+}
+
+static const uint8_t* FindQuantizedActivationCacheEntry(InferenceWorkContext* ctx, const ggml_tensor* src_tensor,
+                                                        const void* source, int64_t len, ggml_type quant_type,
+                                                        size_t quant_bytes, int slot_id, int64_t token_pos) {
+    if (!ctx) {
+        return nullptr;
+    }
+    if (QuantizedActivationKeyMatches(ctx->qact_generation, ctx->qact_tensor, ctx->qact_source, ctx->qact_len,
+                                      ctx->qact_type, ctx->qact_bytes, ctx->qact_slot_id, ctx->qact_token_pos,
+                                      ctx->qact_buffer.size(), ctx, src_tensor, source, len, quant_type,
+                                      quant_bytes, slot_id, token_pos)) {
+        RecordQActCacheHit(ctx, quant_bytes);
+        return ctx->qact_buffer.data();
+    }
+    for (auto& slot : ctx->qact_extra_slots) {
+        if (QuantizedActivationKeyMatches(slot.generation, slot.tensor, slot.source, slot.len, slot.type,
+                                          slot.bytes, slot.slot_id, slot.token_pos, slot.buffer.size(), ctx,
+                                          src_tensor, source, len, quant_type, quant_bytes, slot_id, token_pos)) {
+            RecordQActCacheHit(ctx, quant_bytes);
+            return slot.buffer.data();
+        }
+    }
+    return nullptr;
+}
+
+static QuantizedActivationCacheEntry* SelectExtraQuantizedActivationSlot(InferenceWorkContext* ctx) {
+    if (!ctx) {
+        return nullptr;
+    }
+    for (auto& slot : ctx->qact_extra_slots) {
+        if (slot.generation != ctx->execution_generation || slot.buffer.empty()) {
+            return &slot;
+        }
+    }
+    int idx = ctx->qact_extra_next_slot;
+    if (idx < 0 || idx >= kExtraQuantizedActivationCacheSlots) {
+        idx = 0;
+    }
+    ctx->qact_extra_next_slot = (idx + 1) % kExtraQuantizedActivationCacheSlots;
+    return &ctx->qact_extra_slots[static_cast<size_t>(idx)];
+}
+
+static bool PrimaryQuantizedActivationSlotAvailable(const InferenceWorkContext* ctx) {
+    return !ctx || ctx->qact_generation != ctx->execution_generation || ctx->qact_buffer.empty();
+}
+
+static void StoreExtraQuantizedActivationMetadata(QuantizedActivationCacheEntry* slot, InferenceWorkContext* ctx,
+                                                  const ggml_tensor* src_tensor, const void* source, int64_t len,
+                                                  ggml_type quant_type, size_t quant_bytes, int slot_id,
+                                                  int64_t token_pos) {
+    if (!slot || !ctx) {
+        return;
+    }
+    slot->generation = ctx->execution_generation;
+    slot->tensor = src_tensor;
+    slot->source = source;
+    slot->len = len;
+    slot->type = quant_type;
+    slot->bytes = quant_bytes;
+    slot->slot_id = slot_id;
+    slot->token_pos = token_pos;
+}
+
 static const uint8_t* GetOrFillQuantizedActivationCache(InferenceWorkContext* ctx, const ggml_tensor* src_tensor,
                                                         const void* source, const float* x_f32, int64_t len,
                                                         ggml_type quant_type, size_t quant_bytes, int slot_id,
@@ -669,9 +759,9 @@ static const uint8_t* GetOrFillQuantizedActivationCache(InferenceWorkContext* ct
         !input_type_traits || !input_type_traits->from_float) {
         return nullptr;
     }
+#ifndef NDEBUG
     const bool data_pointer_matches_different_tensor =
         ctx->qact_source == source && ctx->qact_tensor && ctx->qact_tensor != src_tensor;
-#ifndef NDEBUG
     if (data_pointer_matches_different_tensor) {
         static const bool strict_qact_cache_assert = []() {
             const char* env = std::getenv("DENSECORE_DEBUG_QACT_CACHE_ASSERT");
@@ -682,25 +772,37 @@ static const uint8_t* GetOrFillQuantizedActivationCache(InferenceWorkContext* ct
         }
     }
 #endif
-    if (ctx->qact_generation == ctx->execution_generation && ctx->qact_tensor == src_tensor &&
-        ctx->qact_source == source && ctx->qact_len == len && ctx->qact_type == quant_type &&
-        ctx->qact_bytes == quant_bytes && ctx->qact_slot_id == slot_id && ctx->qact_token_pos == token_pos &&
-        ctx->qact_buffer.size() == quant_bytes) {
-        RecordQActCacheHit(ctx, quant_bytes);
+    if (const uint8_t* cached =
+            FindQuantizedActivationCacheEntry(ctx, src_tensor, source, len, quant_type, quant_bytes, slot_id,
+                                              token_pos)) {
+        return cached;
+    }
+
+    if (PrimaryQuantizedActivationSlotAvailable(ctx)) {
+        ctx->qact_buffer.resize(quant_bytes);
+        input_type_traits->from_float(x_f32, ctx->qact_buffer.data(), len);
+        ctx->qact_tensor = src_tensor;
+        ctx->qact_generation = ctx->execution_generation;
+        ctx->qact_source = source;
+        ctx->qact_len = len;
+        ctx->qact_type = quant_type;
+        ctx->qact_bytes = quant_bytes;
+        ctx->qact_slot_id = slot_id;
+        ctx->qact_token_pos = token_pos;
+        RecordQActCacheMiss(ctx);
         return ctx->qact_buffer.data();
     }
-    ctx->qact_buffer.resize(quant_bytes);
-    input_type_traits->from_float(x_f32, ctx->qact_buffer.data(), len);
-    ctx->qact_tensor = src_tensor;
-    ctx->qact_generation = ctx->execution_generation;
-    ctx->qact_source = source;
-    ctx->qact_len = len;
-    ctx->qact_type = quant_type;
-    ctx->qact_bytes = quant_bytes;
-    ctx->qact_slot_id = slot_id;
-    ctx->qact_token_pos = token_pos;
+
+    QuantizedActivationCacheEntry* slot = SelectExtraQuantizedActivationSlot(ctx);
+    if (!slot) {
+        return nullptr;
+    }
+    slot->buffer.resize(quant_bytes);
+    input_type_traits->from_float(x_f32, slot->buffer.data(), len);
+    StoreExtraQuantizedActivationMetadata(slot, ctx, src_tensor, source, len, quant_type, quant_bytes, slot_id,
+                                          token_pos);
     RecordQActCacheMiss(ctx);
-    return ctx->qact_buffer.data();
+    return slot->buffer.data();
 }
 
 static const uint8_t* GetOrFillBatchedQuantizedActivationCache(
@@ -718,29 +820,43 @@ static const uint8_t* GetOrFillBatchedQuantizedActivationCache(
         }
     }
     const int64_t len = static_cast<int64_t>(M) * static_cast<int64_t>(N);
-    if (ctx->qact_generation == ctx->execution_generation && ctx->qact_tensor == src_tensor &&
-        ctx->qact_source == source && ctx->qact_len == len && ctx->qact_type == quant_type &&
-        ctx->qact_bytes == quant_bytes && ctx->qact_slot_id == -1 && ctx->qact_token_pos == token_pos &&
-        ctx->qact_buffer.size() == quant_bytes) {
-        RecordQActCacheHit(ctx, quant_bytes);
+    if (const uint8_t* cached =
+            FindQuantizedActivationCacheEntry(ctx, src_tensor, source, len, quant_type, quant_bytes, -1,
+                                              token_pos)) {
+        return cached;
+    }
+
+    if (PrimaryQuantizedActivationSlotAvailable(ctx)) {
+        ctx->qact_buffer.resize(quant_bytes);
+        for (int m = 0; m < M; ++m) {
+            uint8_t* q_ptr = ctx->qact_buffer.data() + static_cast<size_t>(m) * quant_row_stride;
+            input_type_traits->from_float(x_rows[static_cast<size_t>(m)], q_ptr, static_cast<int64_t>(N));
+        }
+        ctx->qact_tensor = src_tensor;
+        ctx->qact_generation = ctx->execution_generation;
+        ctx->qact_source = source;
+        ctx->qact_len = len;
+        ctx->qact_type = quant_type;
+        ctx->qact_bytes = quant_bytes;
+        ctx->qact_slot_id = -1;
+        ctx->qact_token_pos = token_pos;
+        RecordQActCacheMiss(ctx);
         return ctx->qact_buffer.data();
     }
 
-    ctx->qact_buffer.resize(quant_bytes);
+    QuantizedActivationCacheEntry* slot = SelectExtraQuantizedActivationSlot(ctx);
+    if (!slot) {
+        return nullptr;
+    }
+    slot->buffer.resize(quant_bytes);
     for (int m = 0; m < M; ++m) {
-        uint8_t* q_ptr = ctx->qact_buffer.data() + static_cast<size_t>(m) * quant_row_stride;
+        uint8_t* q_ptr = slot->buffer.data() + static_cast<size_t>(m) * quant_row_stride;
         input_type_traits->from_float(x_rows[static_cast<size_t>(m)], q_ptr, static_cast<int64_t>(N));
     }
-    ctx->qact_tensor = src_tensor;
-    ctx->qact_generation = ctx->execution_generation;
-    ctx->qact_source = source;
-    ctx->qact_len = len;
-    ctx->qact_type = quant_type;
-    ctx->qact_bytes = quant_bytes;
-    ctx->qact_slot_id = -1;
-    ctx->qact_token_pos = token_pos;
+    StoreExtraQuantizedActivationMetadata(slot, ctx, src_tensor, source, len, quant_type, quant_bytes, -1,
+                                          token_pos);
     RecordQActCacheMiss(ctx);
-    return ctx->qact_buffer.data();
+    return slot->buffer.data();
 }
 
 enum class Qwen36Q4KBatchedAdmissionState : int { Unknown = 0, Pass = 1, Reject = 2 };
@@ -961,14 +1077,21 @@ static std::shared_ptr<Q8RepackedGemvWeight> GetOrCreateQ8RepackedGemvWeight(con
         (!force_enable && !IsQ8RepackedGemvEnabled())) {
         return nullptr;
     }
+    const Q8RepackedGemvKey key{weight_data, rows, cols};
+    thread_local Q8RepackedGemvKey tls_key{};
+    thread_local std::shared_ptr<Q8RepackedGemvWeight> tls_packed;
+    if (tls_packed && tls_key == key) {
+        return tls_packed;
+    }
     static std::mutex mutex;
     static std::unordered_map<Q8RepackedGemvKey, std::shared_ptr<Q8RepackedGemvWeight>, Q8RepackedGemvKeyHash> cache;
 
-    const Q8RepackedGemvKey key{weight_data, rows, cols};
     std::lock_guard<std::mutex> lock(mutex);
     auto it = cache.find(key);
     if (it != cache.end()) {
-        return it->second;
+        tls_key = key;
+        tls_packed = it->second;
+        return tls_packed;
     }
 
     const size_t src_bytes = static_cast<size_t>(rows) * ggml_row_size(GGML_TYPE_Q8_0, cols);
@@ -985,5 +1108,7 @@ static std::shared_ptr<Q8RepackedGemvWeight> GetOrCreateQ8RepackedGemvWeight(con
     }
 
     auto [insert_it, inserted] = cache.emplace(key, packed);
-    return inserted ? packed : insert_it->second;
+    tls_key = key;
+    tls_packed = inserted ? packed : insert_it->second;
+    return tls_packed;
 }

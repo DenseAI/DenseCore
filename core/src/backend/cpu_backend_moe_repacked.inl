@@ -95,6 +95,8 @@ struct Q5KRepackedMoEWeight {
 constexpr size_t kMoEQ6Kx8BlockBytes = sizeof(ggml_fp16_t) * 8 + QK_K / 16 * 8 + 3 * QK_K / 4 * 8;
 
 struct Q6KRepackedMoEWeight {
+    const void* weight_ptr = nullptr;
+    uint64_t fingerprint = 0;
     int64_t rows = 0;
     int64_t cols = 0;
     int64_t blocks_per_row = 0;
@@ -196,6 +198,8 @@ std::shared_ptr<Q6KRepackedMoEWeight> GetOrCreateQ6KRepackedMoEWeight(const void
     const int64_t blocks_per_row = cols / QK_K;
     const size_t packed_blocks = static_cast<size_t>(rows / 8) * static_cast<size_t>(blocks_per_row);
     auto packed = std::make_shared<Q6KRepackedMoEWeight>();
+    packed->weight_ptr = weight_ptr;
+    packed->fingerprint = key.fingerprint;
     packed->rows = rows;
     packed->cols = cols;
     packed->blocks_per_row = blocks_per_row;
@@ -658,4 +662,3 @@ bool RunQ5KRepackedMoEFusedSwiGLURawProjectionImpl(CpuBackend* backend, const vo
                      allow_parallel);
     return true;
 }
-

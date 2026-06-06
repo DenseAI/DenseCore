@@ -124,7 +124,7 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 		// Only exact-answer QA prompts use the LFM2 stream filter. General long-form
 		// completions must stream generated tokens directly; broad prelude suppression
 		// can otherwise hide the whole response and make quality gates unstable.
-		if exactExpected := service.ExtractExpectedExactAnswer(req); exactExpected != "" {
+		if exactExpected := service.ExtractExpectedExactAnswer(req); exactExpected != "" && lfm2StreamFilterExactAnswerEligible(req) {
 			lfm2Filter = newLFM2StreamFilter(exactExpected)
 		}
 	}

@@ -19,6 +19,13 @@ func lfm2StreamFilterBypassEnabled() bool {
 	return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 
+func lfm2StreamFilterExactAnswerEligible(req domain.ChatCompletionRequest) bool {
+	// The filter is a narrow short-answer cleanup path. Long-form benchmark and
+	// QA streams must expose generated tokens directly so a bad answer cannot be
+	// hidden by server-side suppression.
+	return req.MaxTokens > 0 && req.MaxTokens <= 32
+}
+
 func (h *Handler) handleToolStream(ctx context.Context, w http.ResponseWriter, req domain.ChatCompletionRequest, flusher http.Flusher) {
 	outputChan := make(chan domain.StreamEvent, h.streamChannelBufferSize())
 	errChan := make(chan error, 1)

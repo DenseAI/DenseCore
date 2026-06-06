@@ -219,3 +219,44 @@ FlexibleGraphPoolSizing MeasureFlexibleGraphPoolSize(TransformerModel* model, Pa
 #endif
     return result;
 }
+
+FlexibleGraphPoolSizing EstimateFlexibleGraphPoolSizeWithoutDryRun(
+    TransformerModel* model, const EngineState::GraphContextEstimate& fallback_estimate) {
+    FlexibleGraphPoolSizing result{};
+    if (!model || !IsFlexibleGraphPoolSizingEnabled(model) || fallback_estimate.total_bytes == 0) {
+        return result;
+    }
+
+    constexpr size_t MB = 1024ULL * 1024ULL;
+    const size_t available_bytes = ReadAvailableMemoryBytesForRuntimePools();
+    size_t target_bytes = fallback_estimate.total_bytes;
+    if (fallback_estimate.effective_query_len > 1) {
+        const bool hybrid_or_moe = model->arch_flags.is_hybrid_ssm || model->hparams.n_experts > 0;
+        if (hybrid_or_moe) {
+            target_bytes += std::max<size_t>(target_bytes, 1024ULL * MB);
+        } else if (model->arch_flags.is_gemma4) {
+            target_bytes += std::max<size_t>(target_bytes / 2, 1024ULL * MB);
+        } else {
+            target_bytes += std::max<size_t>(target_bytes / 4, 512ULL * MB);
+        }
+    }
+    target_bytes = AlignUpBytes(target_bytes, 512ULL * MB);
+
+    const RuntimeGraphPoolReservation required_reservation =
+        ClampRuntimeGraphPoolReservation(target_bytes, available_bytes);
+    const RuntimeGraphPoolReservation growth_reservation = ClampRuntimeGraphPoolReservation(
+        ApplyFlexibleGraphPoolGrowthReserve(required_reservation.total_bytes, fallback_estimate), available_bytes);
+
+    result.ok = true;
+    result.required_bytes = required_reservation.total_bytes;
+    result.reserved_bytes = growth_reservation.total_bytes;
+    result.available_bytes = available_bytes;
+    result.reservation_payload_bytes = growth_reservation.payload_bytes;
+    result.reservation_slack_bytes = growth_reservation.slack_bytes;
+    result.dry_context_bytes = 0;
+    result.dry_metadata_bytes = 0;
+    result.graph_tensor_bytes = fallback_estimate.base_graph_working_set_bytes;
+    result.margin_bytes = target_bytes > fallback_estimate.total_bytes ? target_bytes - fallback_estimate.total_bytes : 0;
+    result.graph_nodes = 0;
+    return result;
+}

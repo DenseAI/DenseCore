@@ -28,13 +28,13 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
     const bool qwen_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
     const int hybrid_ssm_chunk_tokens =
 #if defined(__aarch64__) || defined(_M_ARM64)
-        256;
+        64;
 #else
         384;
 #endif
     const int base_chunk_tokens =
         qwen35_dense ? 768 : ((qwen35_moe || qwen_hybrid_ssm) ? hybrid_ssm_chunk_tokens : 192);
-    const int base_auto_min_tokens = qwen35_dense ? 1024 : (qwen35_moe ? 1024 : (qwen_hybrid_ssm ? 1280 : 1536));
+    const int base_auto_min_tokens = qwen35_dense ? 1024 : ((qwen35_moe || qwen_hybrid_ssm) ? 128 : 1536);
     const char* chunk_env = "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS";
     const char* default_env = "DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS";
     const char* auto_min_env = "DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS";
@@ -147,6 +147,38 @@ size_t GraphContextSafetyMarginBytes() {
            1024ULL * 1024ULL;
 }
 
+int SelectLargestQwenPrefillChunkThatFits(const TransformerModel* model, size_t prompt_tokens, size_t available_bytes,
+                                          size_t safety_margin_bytes, int current_chunk_tokens) {
+    if (!model || prompt_tokens <= 0 || available_bytes == 0 || current_chunk_tokens <= 1) {
+        return current_chunk_tokens;
+    }
+    const auto descriptor = densecore::models::DescribeModel(model);
+    const bool qwen35_moe = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0;
+    const bool qwen36_moe = descriptor.variant == ModelVariant::QWEN36 && model->hparams.n_experts > 0;
+    const bool qwen_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
+    if (!qwen35_moe && !qwen36_moe && !qwen_hybrid_ssm) {
+        return current_chunk_tokens;
+    }
+
+    // Larger chunks reduce graph rebuilds but Qwen hybrid-SSM Q8 projections
+    // become less efficient past 128 tokens on C4A: the graph-build savings are
+    // outweighed by larger Q8 GEMM work and weaker quantized-activation reuse.
+    // Keep automatic growth inside the measured fast range and let graph-context
+    // downgrade handle memory pressure below it.
+    constexpr int kCandidates[] = {128, 96, 64, 48, 32};
+    for (int candidate : kCandidates) {
+        if (candidate <= current_chunk_tokens || static_cast<size_t>(candidate) > prompt_tokens) {
+            continue;
+        }
+        const auto estimate = EngineState::EstimateGraphContextSize(model, prompt_tokens, /*num_seqs_hint=*/1,
+                                                                    static_cast<size_t>(candidate));
+        if (estimate.total_bytes + safety_margin_bytes <= available_bytes) {
+            return candidate;
+        }
+    }
+    return current_chunk_tokens;
+}
+
 bool IsGraphContextAutoDowngradeEnabled() {
     return ParseBoolEnvDefault("DENSECORE_GRAPH_CTX_AUTO_DOWNGRADE", true);
 }
@@ -173,6 +205,24 @@ int ApplyGraphContextPrefillChunkDowngrade(const TransformerModel* model, Reques
     req->graph_ctx_available_mb = available_bytes / (1024ULL * 1024ULL);
     req->graph_ctx_safety_margin_mb = safety_margin_bytes / (1024ULL * 1024ULL);
     if (initial_estimate.total_bytes + safety_margin_bytes <= available_bytes) {
+        const int expanded_chunk =
+            SelectLargestQwenPrefillChunkThatFits(model, prompt_tokens, available_bytes, safety_margin_bytes,
+                                                  chunk_tokens);
+        if (expanded_chunk != chunk_tokens) {
+            const auto expanded_estimate = EngineState::EstimateGraphContextSize(
+                model, prompt_tokens, /*num_seqs_hint=*/1, static_cast<size_t>(expanded_chunk));
+            req->graph_ctx_requested_mb = expanded_estimate.total_bytes / (1024ULL * 1024ULL);
+            req->graph_ctx_downgraded_chunk_tokens = expanded_chunk;
+            req->graph_ctx_fail_reason.clear();
+            std::cerr << "[DenseCore] GraphCtxAutoUpgrade"
+                      << " req=" << req->id << " original_chunk_tokens=" << chunk_tokens
+                      << " expanded_chunk_tokens=" << expanded_chunk
+                      << " requested_mb=" << (initial_estimate.total_bytes / (1024ULL * 1024ULL))
+                      << " expanded_mb=" << (expanded_estimate.total_bytes / (1024ULL * 1024ULL))
+                      << " available_mb=" << req->graph_ctx_available_mb
+                      << " safety_margin_mb=" << req->graph_ctx_safety_margin_mb << std::endl;
+            return expanded_chunk;
+        }
         return chunk_tokens;
     }
     if (originally_unchunked) {

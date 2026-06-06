@@ -238,14 +238,15 @@ TEST(MoETrace, LFM2DecodeNativeMoEGraphCallbackTaskCountTracksTopK) {
     batch.deps = &deps;
 
     const int physical_cores = densecore::HardwareTopology::GetInstance().GetPhysicalCoreCount();
-    const int worker_cap = physical_cores > 0 ? std::min(config.num_threads, physical_cores) : config.num_threads;
+    const int expected_decode_tasks = physical_cores > 0 ? std::min(config.num_threads, physical_cores)
+                                                         : config.num_threads;
 
     EXPECT_EQ(densecore::testing::ResolveNativeMoEGraphCallbackTaskCountForTest(
                   &lfm2, &batch, static_cast<int>(InferenceExecutionPhase::Decode), 1, 4),
-              std::min(worker_cap, 4));
+              expected_decode_tasks);
     EXPECT_EQ(densecore::testing::ResolveNativeMoEGraphCallbackTaskCountForTest(
                   &lfm2, &batch, static_cast<int>(InferenceExecutionPhase::Decode), 1, 8),
-              std::min(worker_cap, 8));
+              expected_decode_tasks);
     EXPECT_EQ(densecore::testing::ResolveNativeMoEGraphCallbackTaskCountForTest(
                   &lfm2, &batch, static_cast<int>(InferenceExecutionPhase::Prefill), 16, 4),
               GGML_N_TASKS_MAX);

@@ -410,6 +410,17 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                         ud->lfm2_argmax_best_value = -std::numeric_limits<float>::infinity();
                         ud->lfm2_argmax_begin = std::chrono::steady_clock::now();
                     }
+                    const uintptr_t q6_cache_weight = reinterpret_cast<uintptr_t>(weight_data);
+                    if (ud->lfm2_argmax_q6k_cache_weight != q6_cache_weight ||
+                        ud->lfm2_argmax_q6k_cache_nth != nth ||
+                        ud->lfm2_argmax_q6k_cache_k != K ||
+                        ud->lfm2_argmax_q6k_cache_n != N) {
+                        ud->lfm2_argmax_q6k_cache_weight = q6_cache_weight;
+                        ud->lfm2_argmax_q6k_cache_nth = nth;
+                        ud->lfm2_argmax_q6k_cache_k = K;
+                        ud->lfm2_argmax_q6k_cache_n = N;
+                        ud->lfm2_argmax_q6k_slice_cache.assign(static_cast<size_t>(std::max(1, nth)), {});
+                    }
                 }
 
                 int local_best_token = -1;
@@ -433,10 +444,14 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                     repacked_argmax_tile.resize(static_cast<size_t>(row_count));
                     const void* row_ptr =
                         reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k_start) * row_stride;
-                    const bool projected = densecore::RunQ6KRepackedMoEProjection(
+                    std::shared_ptr<void>* slice_cache = nullptr;
+                    if (ith >= 0 && ith < static_cast<int>(ud->lfm2_argmax_q6k_slice_cache.size())) {
+                        slice_cache = &ud->lfm2_argmax_q6k_slice_cache[static_cast<size_t>(ith)];
+                    }
+                    const bool projected = densecore::RunQ6KRepackedMoEProjectionCached(
                         &densecore::GetCpuBackend(), row_ptr, static_cast<const uint8_t*>(quant_input),
                         ggml_row_size(GGML_TYPE_Q8_K, N), repacked_argmax_tile.data(), 1, row_count, N,
-                        /*numa_node=*/0, /*allow_parallel=*/false);
+                        /*numa_node=*/0, /*allow_parallel=*/false, slice_cache);
                     if (projected) {
                         used_repacked_argmax = true;
                         for (int offset = 0; offset < row_count; ++offset) {

@@ -3,6 +3,20 @@
 // ============================================================================
 #include "inference_profile_types.inl"
 
+struct QuantizedActivationCacheEntry {
+    uint64_t generation = 0;
+    const ggml_tensor* tensor = nullptr;
+    const void* source = nullptr;
+    int64_t len = 0;
+    ggml_type type = GGML_TYPE_COUNT;
+    size_t bytes = 0;
+    int slot_id = -1;
+    int64_t token_pos = std::numeric_limits<int64_t>::min();
+    std::vector<uint8_t> buffer;
+};
+
+constexpr int kExtraQuantizedActivationCacheSlots = 3;
+
 struct InferenceWorkContext {
     const BatchSpec* batch = nullptr;
     ModelVariant model_variant = ModelVariant::UNKNOWN;
@@ -40,6 +54,17 @@ struct InferenceWorkContext {
     int qact_slot_id = -1;
     int64_t qact_token_pos = std::numeric_limits<int64_t>::min();
     std::vector<uint8_t> qact_buffer;
+    std::array<QuantizedActivationCacheEntry, kExtraQuantizedActivationCacheSlots> qact_extra_slots;
+    int qact_extra_next_slot = 0;
+    uint64_t q8_gemm_packed_generation = 0;
+    const ggml_tensor* q8_gemm_packed_tensor = nullptr;
+    const void* q8_gemm_packed_source = nullptr;
+    int q8_gemm_packed_rows = 0;
+    int q8_gemm_packed_cols = 0;
+    size_t q8_gemm_packed_bytes = 0;
+    int64_t q8_gemm_packed_token_pos = std::numeric_limits<int64_t>::min();
+    std::vector<uint8_t> q8_gemm_packed_buffer;
+    std::atomic<uint64_t> q8_gemm_packed_stamp{0};
     std::mutex q4k_repacked_gemv_request_mutex;
     std::unordered_map<uint64_t, uint32_t> q4k_repacked_gemv_repack_counts;
     alignas(
@@ -91,6 +116,33 @@ struct InferenceWorkContext {
     std::vector<ggml_bf16_t> bf16_buffer;
 };
 
+static void ResetQuantizedActivationCache(InferenceWorkContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->qact_generation = 0;
+    ctx->qact_tensor = nullptr;
+    ctx->qact_source = nullptr;
+    ctx->qact_len = 0;
+    ctx->qact_type = GGML_TYPE_COUNT;
+    ctx->qact_bytes = 0;
+    ctx->qact_slot_id = -1;
+    ctx->qact_token_pos = std::numeric_limits<int64_t>::min();
+    ctx->qact_buffer.clear();
+    for (auto& slot : ctx->qact_extra_slots) {
+        slot.generation = 0;
+        slot.tensor = nullptr;
+        slot.source = nullptr;
+        slot.len = 0;
+        slot.type = GGML_TYPE_COUNT;
+        slot.bytes = 0;
+        slot.slot_id = -1;
+        slot.token_pos = std::numeric_limits<int64_t>::min();
+        slot.buffer.clear();
+    }
+    ctx->qact_extra_next_slot = 0;
+}
+
 #include "inference_profile_ops.inl"
 
 InferenceWorkContext* CreateInferenceWorkContext() {
@@ -134,15 +186,16 @@ void ResetInferenceWorkContext(InferenceWorkContext* ctx) {
     ctx->qkv_index = 0;
     ctx->add_rmsnorm_index = 0;
     ctx->gemv_quantized_stamp.store(0, std::memory_order_relaxed);
-    ctx->qact_generation = 0;
-    ctx->qact_tensor = nullptr;
-    ctx->qact_source = nullptr;
-    ctx->qact_len = 0;
-    ctx->qact_type = GGML_TYPE_COUNT;
-    ctx->qact_bytes = 0;
-    ctx->qact_slot_id = -1;
-    ctx->qact_token_pos = std::numeric_limits<int64_t>::min();
-    ctx->qact_buffer.clear();
+    ResetQuantizedActivationCache(ctx);
+    ctx->q8_gemm_packed_generation = 0;
+    ctx->q8_gemm_packed_tensor = nullptr;
+    ctx->q8_gemm_packed_source = nullptr;
+    ctx->q8_gemm_packed_rows = 0;
+    ctx->q8_gemm_packed_cols = 0;
+    ctx->q8_gemm_packed_bytes = 0;
+    ctx->q8_gemm_packed_token_pos = std::numeric_limits<int64_t>::min();
+    ctx->q8_gemm_packed_buffer.clear();
+    ctx->q8_gemm_packed_stamp.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(ctx->q4k_repacked_gemv_request_mutex);
         ctx->q4k_repacked_gemv_repack_counts.clear();
@@ -183,20 +236,27 @@ void ResetCachedDecodeGraphWorkContext(InferenceWorkContext* ctx) {
     ctx->paged_attention_shared_k_block_ptrs.clear();
     ctx->paged_attention_shared_v_block_ptrs.clear();
     ctx->gemv_quantized_stamp.store(0, std::memory_order_relaxed);
-    ctx->qact_generation = 0;
-    ctx->qact_tensor = nullptr;
-    ctx->qact_source = nullptr;
-    ctx->qact_len = 0;
-    ctx->qact_type = GGML_TYPE_COUNT;
-    ctx->qact_bytes = 0;
-    ctx->qact_slot_id = -1;
-    ctx->qact_token_pos = std::numeric_limits<int64_t>::min();
-    ctx->qact_buffer.clear();
+    ResetQuantizedActivationCache(ctx);
+    ctx->q8_gemm_packed_generation = 0;
+    ctx->q8_gemm_packed_tensor = nullptr;
+    ctx->q8_gemm_packed_source = nullptr;
+    ctx->q8_gemm_packed_rows = 0;
+    ctx->q8_gemm_packed_cols = 0;
+    ctx->q8_gemm_packed_bytes = 0;
+    ctx->q8_gemm_packed_token_pos = std::numeric_limits<int64_t>::min();
+    ctx->q8_gemm_packed_buffer.clear();
+    ctx->q8_gemm_packed_stamp.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(ctx->q4k_repacked_gemv_request_mutex);
         ctx->q4k_repacked_gemv_repack_counts.clear();
     }
     ctx->gemv_batched_quantized_stamp.store(0, std::memory_order_relaxed);
+}
+
+void ResetCachedPrefillGraphWorkContext(InferenceWorkContext* ctx) {
+    ResetCachedDecodeGraphWorkContext(ctx);
+    if (!ctx) return;
+    ctx->phase = InferenceExecutionPhase::Prefill;
 }
 
 void SetCurrentWorkContext(InferenceWorkContext* ctx) {
@@ -479,8 +539,14 @@ inline LFM2ShortConvUserData* GetLFM2ShortConvUserData() {
         throw densecore::OutOfMemoryException("LFM2ShortConvUserData pool exhausted");
     }
     LFM2ShortConvUserData* ud = &ctx->lfm2_shortconv_pool[idx];
+    ud->decode_in_proj_ready_stamp.store(0, std::memory_order_relaxed);
+    ud->decode_in_proj_done.store(0, std::memory_order_relaxed);
     ud->decode_y_stamp.store(0, std::memory_order_relaxed);
     ud->decode_out_proj_stamp.store(0, std::memory_order_relaxed);
+    ud->decode_in_proj_q4k_packed.reset();
+    ud->decode_in_proj_weight_data = nullptr;
+    ud->decode_in_proj_rows = 0;
+    ud->decode_in_proj_cols = 0;
     ud->decode_out_proj_q4k_packed.reset();
     ud->decode_out_proj_weight_data = nullptr;
     ud->decode_out_proj_rows = 0;

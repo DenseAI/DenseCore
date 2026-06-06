@@ -181,24 +181,8 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
             return true;
         }
     }
-    if (enable_q4k_repacked_projection_prefill && q4k_prefill_repacked_eligible && !prefer_q4k_repacked_prefill) {
-        auto packed = GetOrCreateQ4KRepackedMoEWeight(weight_ptr, N, K);
-        if (packed && M >= 4 &&
-            RunQ4KRepackedMoEGemmM4(backend, packed, in_data, out_data, M, N, K, numa_node, allow_parallel)) {
-            LogMoEMatmulPath("ggml_q4k_repacked_prefill_gemm_m4", static_cast<int>(M), static_cast<int>(K),
-                             static_cast<int>(N), 0, allow_parallel);
-            record_q4k_repacked(true, nullptr);
-            record_dispatch("q4k_repacked_gemv");
-            return true;
-        }
-        if (packed && RunQ4KRepackedMoEGemv(backend, packed, qinput_data, iq_row_bytes, out_data, M, N, numa_node,
-                                            allow_parallel)) {
-            LogMoEMatmulPath("ggml_q4k_repacked_prefill_gemv", static_cast<int>(M), static_cast<int>(K),
-                             static_cast<int>(N), 0, allow_parallel);
-            record_q4k_repacked(true, nullptr);
-            record_dispatch("q4k_repacked_gemv");
-            return true;
-        }
+    if (q4k_prefill_repacked_eligible && !prefer_q4k_repacked_prefill) {
+        record_q4k_repacked(false, "prefill_repack_not_preferred");
     }
     if (use_kquant_rowpair_vec_dot) {
         auto& pool = backend->GetThreadPool(numa_node);
@@ -664,18 +648,7 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
         }
     }
     if (q4k_prefill_repacked_eligible && !prefer_q4k_repacked_prefill) {
-        auto gate_packed = GetOrCreateQ4KRepackedMoEWeight(gate_weight_ptr, N, K);
-        auto up_packed = GetOrCreateQ4KRepackedMoEWeight(up_weight_ptr, N, K);
-        if (gate_packed && up_packed) {
-            if (RunQ4KRepackedMoEFusedSwiGLUM4(backend, gate_packed, up_packed, in_data, qinput_data, iq_row_bytes,
-                                               out_data, M, N, K, numa_node, allow_parallel)) {
-                LogMoEMatmulPath(M >= 4 ? "ggml_q4k_repacked_prefill_gemm_m4_tile_fused_swiglu"
-                                        : "ggml_q4k_repacked_prefill_tile_fused_swiglu",
-                                 static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0, allow_parallel);
-                record_q4k_repacked(true, nullptr);
-                return true;
-            }
-        }
+        record_q4k_repacked(false, "prefill_repack_not_preferred");
     }
     if (use_q4k_rowpair_m2_vec_dot) {
         const int64_t pair_count = N / 2;
@@ -799,4 +772,3 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
     record_q4k_repacked(false, use_q4k_rowpair_vec_dot ? "rowpair_used" : "native_vecdot");
     return true;
 }
-

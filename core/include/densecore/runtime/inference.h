@@ -311,6 +311,14 @@ struct Qwen36ProfileSnapshot {
     uint64_t qact_cache_hits = 0;
     uint64_t qact_cache_misses = 0;
     uint64_t qact_cache_reused_bytes = 0;
+    uint64_t q8_batched_weight_cache_ns = 0;
+    uint64_t q8_batched_activation_quant_ns = 0;
+    uint64_t q8_batched_activation_wait_ns = 0;
+    uint64_t q8_batched_activation_pack_ns = 0;
+    uint64_t q8_batched_compute_ns = 0;
+    uint64_t q8_batched_used_ops = 0;
+    uint64_t q8_batched_true_gemm_ops = 0;
+    uint64_t q8_batched_gemv_ops = 0;
     uint64_t moe_decode_scratch_reused = 0;
     uint64_t moe_decode_allocations_avoided = 0;
     int moe_task_count = 0;
@@ -541,6 +549,7 @@ InferenceWorkContext* CreateInferenceWorkContext();
 void DestroyInferenceWorkContext(InferenceWorkContext* ctx);
 void ResetInferenceWorkContext(InferenceWorkContext* ctx);
 void ResetCachedDecodeGraphWorkContext(InferenceWorkContext* ctx);
+void ResetCachedPrefillGraphWorkContext(InferenceWorkContext* ctx);
 void SetCurrentWorkContext(InferenceWorkContext* ctx);
 InferenceWorkContext* GetCurrentWorkContext();
 void SetInferenceWorkContextGraphBuildNoAlloc(InferenceWorkContext* ctx, bool no_alloc);
@@ -644,6 +653,8 @@ bool RebindHybridSSMDecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchS
 bool RebindLFM2DecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& batch);
 bool RebindDecodeGraphRuntimeStateForModel(const TransformerModel* model, GgmlGraphHandle* graph,
                                            const BatchSpec& batch);
+bool RebindPrefillGraphRuntimeStateForModel(const TransformerModel* model, GgmlGraphHandle* graph,
+                                            const BatchSpec& batch);
 
 // Grammar constraint for structured output (e.g., JSON mode)
 enum class JSONState {

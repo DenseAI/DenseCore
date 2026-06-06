@@ -364,6 +364,14 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.qact_cache_hits.store(0, std::memory_order_relaxed);
     p.qact_cache_misses.store(0, std::memory_order_relaxed);
     p.qact_cache_reused_bytes.store(0, std::memory_order_relaxed);
+    p.q8_batched_weight_cache_ns.store(0, std::memory_order_relaxed);
+    p.q8_batched_activation_quant_ns.store(0, std::memory_order_relaxed);
+    p.q8_batched_activation_wait_ns.store(0, std::memory_order_relaxed);
+    p.q8_batched_activation_pack_ns.store(0, std::memory_order_relaxed);
+    p.q8_batched_compute_ns.store(0, std::memory_order_relaxed);
+    p.q8_batched_used_ops.store(0, std::memory_order_relaxed);
+    p.q8_batched_true_gemm_ops.store(0, std::memory_order_relaxed);
+    p.q8_batched_gemv_ops.store(0, std::memory_order_relaxed);
     p.moe_decode_scratch_reused.store(0, std::memory_order_relaxed);
     p.moe_decode_allocations_avoided.store(0, std::memory_order_relaxed);
     p.moe_task_count.store(0, std::memory_order_relaxed);
@@ -641,6 +649,15 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.qact_cache_hits = p.qact_cache_hits.load(std::memory_order_relaxed);
     snapshot.qact_cache_misses = p.qact_cache_misses.load(std::memory_order_relaxed);
     snapshot.qact_cache_reused_bytes = p.qact_cache_reused_bytes.load(std::memory_order_relaxed);
+    snapshot.q8_batched_weight_cache_ns = p.q8_batched_weight_cache_ns.load(std::memory_order_relaxed);
+    snapshot.q8_batched_activation_quant_ns =
+        p.q8_batched_activation_quant_ns.load(std::memory_order_relaxed);
+    snapshot.q8_batched_activation_wait_ns = p.q8_batched_activation_wait_ns.load(std::memory_order_relaxed);
+    snapshot.q8_batched_activation_pack_ns = p.q8_batched_activation_pack_ns.load(std::memory_order_relaxed);
+    snapshot.q8_batched_compute_ns = p.q8_batched_compute_ns.load(std::memory_order_relaxed);
+    snapshot.q8_batched_used_ops = p.q8_batched_used_ops.load(std::memory_order_relaxed);
+    snapshot.q8_batched_true_gemm_ops = p.q8_batched_true_gemm_ops.load(std::memory_order_relaxed);
+    snapshot.q8_batched_gemv_ops = p.q8_batched_gemv_ops.load(std::memory_order_relaxed);
     snapshot.moe_decode_scratch_reused = p.moe_decode_scratch_reused.load(std::memory_order_relaxed);
     snapshot.moe_decode_allocations_avoided = p.moe_decode_allocations_avoided.load(std::memory_order_relaxed);
     snapshot.moe_task_count = p.moe_task_count.load(std::memory_order_relaxed);

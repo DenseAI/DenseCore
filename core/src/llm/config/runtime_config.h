@@ -109,7 +109,7 @@ struct FastPathRuntimeConfig {
     PrefillGraphCachePolicy prefill_graph_cache{};
     Qwen36PrefillQ4KBatchedMode qwen36_prefill_q4k_batched = Qwen36PrefillQ4KBatchedMode::On;
     densecore::env::RuntimeToggleMode qwen36_ssm_q8_amx_alias = densecore::env::RuntimeToggleMode::Off;
-    Qwen36SSMQ8PrefillAMXMode qwen36_ssm_q8_prefill_amx = Qwen36SSMQ8PrefillAMXMode::Probe;
+    Qwen36SSMQ8PrefillAMXMode qwen36_ssm_q8_prefill_amx = Qwen36SSMQ8PrefillAMXMode::Off;
     int qwen36_ssm_q8_prefill_amx_min_tokens = 256;
     densecore::env::RuntimeToggleMode qwen36_expert_cpu_repack = densecore::env::RuntimeToggleMode::Auto;
     densecore::env::RuntimeToggleMode native_moe_fast_decode = densecore::env::RuntimeToggleMode::On;

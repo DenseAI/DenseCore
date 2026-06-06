@@ -39,6 +39,10 @@ bool IsDecodeGraphCacheSafeForModel(const TransformerModel* model);
 bool DoesDecodeGraphCacheRequireRuntimeRebind(const TransformerModel* model);
 bool IsDecodeGraphCacheRegressionEnabled();
 int DecodeGraphCacheRegressionSteps();
+bool ShouldRunDecodeGraphCacheRegressionCheck(const TransformerModel* model, bool cpu_backend_active,
+                                              bool current_kv_cache_present, bool using_cached_decode_graph,
+                                              bool decode_single_token_layout, int num_seqs, bool has_lora_map,
+                                              int checked_steps);
 uint64_t BuildDecodeGraphFeatureFlags(const TransformerModel* model);
 bool VerifyCachedDecodeGraphPagedOpOnBuild(const struct ggml_cgraph* graph, int batch_size);
 void DebugVerifyCachedDecodeGraphReuseState(const struct ggml_cgraph* graph, int batch_size, bool reused_graph,

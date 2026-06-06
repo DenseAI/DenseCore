@@ -489,6 +489,40 @@ TEST(KernelResolutionPolicyTest, TensorRoleOverrideSelectsMaintainedKernelWithou
     EXPECT_EQ(resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQwenMoeDirect);
 }
 
+TEST(KernelResolutionPolicyTest, ContractRequirementPhaseKernelDrivesResolutionMatrix) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+
+    const auto requirement = densecore::models::ResolveModelTensorExecutionRequirement(
+        &model, "blk.0.attn_qkv.weight", /*is_lm_head=*/false, GGML_TYPE_Q4_K);
+    ASSERT_EQ(requirement.semantic_op, densecore::runtime::DenseCoreSemanticOp::HybridSsmMixer);
+    ASSERT_EQ(requirement.tensor_role, densecore::runtime::DenseCoreTensorRole::HybridSSMQkv);
+    ASSERT_EQ(requirement.prefill_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQ4KBatched);
+    ASSERT_EQ(requirement.decode_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQuantGemv);
+
+    densecore::runtime::HostKernelCapabilities caps{};
+    caps.q4k_true_batched = true;
+    const auto prefill_resolution = densecore::runtime::ResolveKernelResolution(
+        &model, GGML_TYPE_Q4_K, GGML_TYPE_F32, /*m=*/128, /*n=*/4096, /*k=*/2048,
+        densecore::runtime::DenseCoreMatmulPhase::Prefill, "blk.0.attn_qkv.weight",
+        /*is_lm_head=*/false, /*compatible=*/true, caps, requirement.semantic_op, requirement.tensor_role,
+        requirement.prefill_kernel, requirement.fallback_policy, /*has_fallback_policy_override=*/true);
+    const auto decode_resolution = densecore::runtime::ResolveKernelResolution(
+        &model, GGML_TYPE_Q4_K, GGML_TYPE_F32, /*m=*/1, /*n=*/4096, /*k=*/2048,
+        densecore::runtime::DenseCoreMatmulPhase::Decode, "blk.0.attn_qkv.weight",
+        /*is_lm_head=*/false, /*compatible=*/true, caps, requirement.semantic_op, requirement.tensor_role,
+        requirement.decode_kernel, requirement.fallback_policy, /*has_fallback_policy_override=*/true);
+
+    EXPECT_EQ(prefill_resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQ4KBatched);
+    EXPECT_EQ(decode_resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQuantGemv);
+    EXPECT_EQ(prefill_resolution.fallback_policy,
+              densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+    EXPECT_EQ(decode_resolution.fallback_policy,
+              densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+}
+
 TEST(KernelResolutionPolicyTest, Q4KBatchedPrefillHelpersKeepTargetSeparateFromShapeReadiness) {
     TransformerModel model{};
     model.arch = ModelArch::LFM2;

@@ -45,6 +45,14 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> qact_cache_hits{0};
     std::atomic<uint64_t> qact_cache_misses{0};
     std::atomic<uint64_t> qact_cache_reused_bytes{0};
+    std::atomic<uint64_t> q8_batched_weight_cache_ns{0};
+    std::atomic<uint64_t> q8_batched_activation_quant_ns{0};
+    std::atomic<uint64_t> q8_batched_activation_wait_ns{0};
+    std::atomic<uint64_t> q8_batched_activation_pack_ns{0};
+    std::atomic<uint64_t> q8_batched_compute_ns{0};
+    std::atomic<uint64_t> q8_batched_used_ops{0};
+    std::atomic<uint64_t> q8_batched_true_gemm_ops{0};
+    std::atomic<uint64_t> q8_batched_gemv_ops{0};
     std::atomic<uint64_t> moe_decode_scratch_reused{0};
     std::atomic<uint64_t> moe_decode_allocations_avoided{0};
     std::atomic<int> moe_task_count{0};

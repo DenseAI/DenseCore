@@ -27,6 +27,7 @@ extern bool QActCacheSharedDataDifferentTensorMissesForTest();
 extern bool QActCacheSameTensorDifferentTokenOrSlotMissesForTest(bool change_token_pos);
 extern bool QActCacheResetAcrossCachedDecodeReuseForTest();
 extern bool QActBatchedCacheReusesSameTensorForTest();
+extern bool QActCacheKeepsMultipleTensorEntriesForTest();
 extern bool RunQwen36Q4KBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle, int* admission_state,
                                              int* reject_reason);
 extern bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle);
@@ -234,6 +235,10 @@ TEST(DecodeGraphCachePolicyTest, QActCacheResetsAcrossCachedDecodeGraphReuse) {
 
 TEST(DecodeGraphCachePolicyTest, QActBatchedCacheReusesSameTensorWithinExecution) {
     EXPECT_TRUE(densecore::testing::QActBatchedCacheReusesSameTensorForTest());
+}
+
+TEST(DecodeGraphCachePolicyTest, QActCacheKeepsMultipleTensorEntriesWithinExecution) {
+    EXPECT_TRUE(densecore::testing::QActCacheKeepsMultipleTensorEntriesForTest());
 }
 
 TEST(DecodeGraphCachePolicyTest, Qwen36PrefillQ4KReasonDoesNotAdmitInvalidCandidates) {

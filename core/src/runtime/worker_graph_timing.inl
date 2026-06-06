@@ -504,7 +504,8 @@ Qwen36PrefillBreakdown SummarizeQwen36PrefillNodeTimes(const TransformerModel* m
 }
 
 NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const TransformerModel* model,
-                                                                   const ggml_cgraph* graph) {
+                                                                   const ggml_cgraph* graph,
+                                                                   bool collect_top_slow_nodes) {
     NativeMoEGraphTimingBreakdown out;
     const bool native_qwen_moe = model && (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36);
     const bool native_lfm2_moe = model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv;
@@ -520,18 +521,6 @@ NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const Transfo
         {{"route", 0, 0}, {"w1w3", 0, 0}, {"activation", 0, 0}, {"w2", 0, 0}, {"reduce", 0, 0}, {"other", 0, 0}}};
     enum BucketIndex { Route = 0, W1W3 = 1, Activation = 2, W2 = 3, Reduce = 4, Other = 5 };
     const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
-    bool has_native_qwen_moe = false;
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
-        if (node && node->name[0] &&
-            (std::strstr(node->name, "qwen35_native_moe") || std::strstr(node->name, "lfm2_native_moe"))) {
-            has_native_qwen_moe = true;
-            break;
-        }
-    }
-    if (!has_native_qwen_moe) {
-        return out;
-    }
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
         if (!node) {
@@ -579,18 +568,20 @@ NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const Transfo
         }
         out.total_ns += elapsed_ns;
 
-        MatmulShapeCensusEntry entry;
-        entry.phase = native_lfm2_moe ? "lfm2" : (model->variant == ModelVariant::QWEN36 ? "qwen36" : "qwen35");
-        entry.op_type = ggml_op_name(node->op);
-        entry.dispatch_path = buckets[static_cast<std::size_t>(bucket)].name;
-        entry.weight_type = ggml_op_name(node->op);
-        std::ostringstream shape;
-        shape << "M=" << node->ne[1] << ",N=" << node->ne[0] << ",K=" << (node->ne[2] > 1 ? node->ne[2] : 0);
-        entry.shape_bucket = shape.str();
-        entry.left_name = name;
-        entry.right_name = "elapsed_us";
-        entry.ops = static_cast<uint64_t>(elapsed_us);
-        out.top_slow_nodes.push_back(std::move(entry));
+        if (collect_top_slow_nodes) {
+            MatmulShapeCensusEntry entry;
+            entry.phase = native_lfm2_moe ? "lfm2" : (model->variant == ModelVariant::QWEN36 ? "qwen36" : "qwen35");
+            entry.op_type = ggml_op_name(node->op);
+            entry.dispatch_path = buckets[static_cast<std::size_t>(bucket)].name;
+            entry.weight_type = ggml_op_name(node->op);
+            std::ostringstream shape;
+            shape << "M=" << node->ne[1] << ",N=" << node->ne[0] << ",K=" << (node->ne[2] > 1 ? node->ne[2] : 0);
+            entry.shape_bucket = shape.str();
+            entry.left_name = name;
+            entry.right_name = "elapsed_us";
+            entry.ops = static_cast<uint64_t>(elapsed_us);
+            out.top_slow_nodes.push_back(std::move(entry));
+        }
     }
     out.route_ns = buckets[Route].ns;
     out.w1w3_ns = buckets[W1W3].ns;
@@ -609,10 +600,13 @@ NativeMoEGraphTimingBreakdown SummarizeNativeQwenMoEGraphNodeTimes(const Transfo
              << ":ms=" << (static_cast<double>(buckets[i].ns) / 1.0e6);
     }
     out.node_hist = hist.str();
-    std::sort(out.top_slow_nodes.begin(), out.top_slow_nodes.end(),
-              [](const auto& a, const auto& b) { return a.ops != b.ops ? a.ops > b.ops : a.left_name < b.left_name; });
-    if (out.top_slow_nodes.size() > kMatmulTopShapeCount) {
-        out.top_slow_nodes.resize(kMatmulTopShapeCount);
+    if (collect_top_slow_nodes) {
+        std::sort(out.top_slow_nodes.begin(), out.top_slow_nodes.end(), [](const auto& a, const auto& b) {
+            return a.ops != b.ops ? a.ops > b.ops : a.left_name < b.left_name;
+        });
+        if (out.top_slow_nodes.size() > kMatmulTopShapeCount) {
+            out.top_slow_nodes.resize(kMatmulTopShapeCount);
+        }
     }
     return out;
 }
@@ -628,7 +622,9 @@ void SynthesizeDecodeGraphNodeTimingFromProfiles(DecodeGraphNodeTimingBreakdown*
     if (ssm_ns == 0) {
         ssm_ns = profile.ssm_qkv_wall_ns + profile.ssm_out_wall_ns + profile.ssm_delta_wall_ns;
     }
-    uint64_t custom_ns = native_moe.total_ns + ssm_ns;
+    const uint64_t lm_head_ns = profile.lfm2_decode_lm_head_custom_gemv_ns;
+    const uint64_t paged_attention_ns = profile.paged_attention_ns;
+    uint64_t custom_ns = native_moe.total_ns + ssm_ns + lm_head_ns + paged_attention_ns;
     const uint64_t attention_ns = profile.attention_ns;
     if (custom_ns > graph_execute_ns) {
         custom_ns = graph_execute_ns;
@@ -640,11 +636,14 @@ void SynthesizeDecodeGraphNodeTimingFromProfiles(DecodeGraphNodeTimingBreakdown*
     timing->custom_ns = custom_ns;
     timing->custom_moe_ns = native_moe.total_ns;
     timing->custom_ssm_ns = ssm_ns;
-    timing->custom_lm_head_ns = profile.lfm2_decode_lm_head_custom_gemv_ns;
+    timing->custom_lm_head_ns = std::min(lm_head_ns, custom_ns);
+    timing->custom_paged_attention_ns = std::min(paged_attention_ns, custom_ns);
     timing->custom_other_ns = custom_ns > timing->custom_moe_ns + timing->custom_ssm_ns +
-                                              timing->custom_projection_ns + timing->custom_lm_head_ns
+                                              timing->custom_projection_ns + timing->custom_lm_head_ns +
+                                              timing->custom_paged_attention_ns
                                   ? custom_ns - timing->custom_moe_ns - timing->custom_ssm_ns -
-                                        timing->custom_projection_ns - timing->custom_lm_head_ns
+                                        timing->custom_projection_ns - timing->custom_lm_head_ns -
+                                        timing->custom_paged_attention_ns
                                   : 0;
     timing->attention_ns = bounded_attention_ns;
     timing->other_ns = other_ns;
@@ -664,6 +663,9 @@ void SynthesizeDecodeGraphNodeTimingFromProfiles(DecodeGraphNodeTimingBreakdown*
     }
     if (timing->custom_lm_head_count == 0 && profile.lfm2_decode_lm_head_custom_gemv_used_ops > 0) {
         timing->custom_lm_head_count = profile.lfm2_decode_lm_head_custom_gemv_used_ops;
+    }
+    if (timing->custom_paged_attention_count == 0 && paged_attention_ns > 0) {
+        timing->custom_paged_attention_count = 1;
     }
     if (timing->custom_other_count == 0 && timing->custom_other_ns > 0) {
         timing->custom_other_count = 1;
@@ -693,4 +695,3 @@ int Gemma4NodeTimingDumpLimit() {
 int LLMNodeTimingDumpLimit() {
     return densecore::env::ParsePositiveEnvInt("DENSECORE_DEBUG_LLM_NODE_TIMES_LIMIT", 24);
 }
-

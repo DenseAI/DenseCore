@@ -156,10 +156,13 @@ static void ApplySmartMatmulQwen36Q8PrefillAlias(
         if (plan->work_ctx) {
             plan->work_ctx->qwen36_profile.qwen36_ssm_q8_decode_used_original_q8_path.store(
                 1, std::memory_order_relaxed);
-            RecordQwen36SSMQ8PrefillAMXReject(
-                plan->work_ctx, ResolveQwen36SSMQ8PrefillAMXReason(
-                                    fast_path_config.qwen36_ssm_q8_prefill_amx, plan->dispatch_phase,
-                                    plan->current_batch && !plan->current_batch->lora_map.empty()));
+            const Qwen36SSMQ8PrefillAMXRejectReason decode_alias_reason =
+                ResolveQwen36SSMQ8PrefillAMXReason(fast_path_config.qwen36_ssm_q8_prefill_amx,
+                                                   plan->dispatch_phase,
+                                                   plan->current_batch && !plan->current_batch->lora_map.empty());
+            if (decode_alias_reason != Qwen36SSMQ8PrefillAMXRejectReason::EnvOff) {
+                RecordQwen36SSMQ8PrefillAMXReject(plan->work_ctx, decode_alias_reason);
+            }
         }
     }
     if (!plan->dispatch_is_prefill_phase || !original_qwen36_ssm_q8_projection || plan->original.input_cols <= 1) {
@@ -178,7 +181,9 @@ static void ApplySmartMatmulQwen36Q8PrefillAlias(
         fast_path_config.qwen36_ssm_q8_prefill_amx, plan->dispatch_phase,
         plan->current_batch && !plan->current_batch->lora_map.empty());
     if (q8_prefill_gate != Qwen36SSMQ8PrefillAMXRejectReason::None) {
-        reject_q8_prefill(q8_prefill_gate, false);
+        if (q8_prefill_gate != Qwen36SSMQ8PrefillAMXRejectReason::EnvOff) {
+            reject_q8_prefill(q8_prefill_gate, false);
+        }
         return;
     }
     if (plan->work_ctx) {
@@ -240,6 +245,7 @@ struct SmartMatmulPrefillProjectionPlan {
     bool qwen_hybrid_ssm_quant_prefill_fast_path_eligible = false;
     bool qwen36_hybrid_ssm_q4k_prefill_relevant = false;
     bool qwen36_lm_head_q4k_prefill_relevant = false;
+    bool qwen36_lm_head_q4k_prefill_fast_path_eligible = false;
     bool lfm2_prefill_q4k_relevant = false;
     bool lfm2_prefill_q6k_relevant = false;
     bool lfm2_prefill_quant_nrc_unsafe = false;
@@ -250,6 +256,62 @@ struct SmartMatmulPrefillProjectionPlan {
     bool qwen36_hybrid_ssm_q4k_prefill_lora_active = false;
     bool qwen36_hybrid_ssm_q4k_prefill_probe_candidate = false;
 };
+
+struct SmartMatmulQuantCapabilityPlan {
+    bool has_quant_vec_dot = false;
+    bool has_quant_from_float = false;
+    bool quant_input_size_ok = false;
+    bool quant_nrc_batch_ready = false;
+    bool quant_true_batched_kernel_ready = false;
+};
+
+struct SmartMatmulQ4KBatchedAdmissionPlan {
+    uint64_t admission_key = 0;
+    Qwen36Q4KBatchedAdmissionValue admission{};
+    Qwen36PrefillQ4KBatchedRejectReason reject_reason = Qwen36PrefillQ4KBatchedRejectReason::None;
+    bool mode_off = false;
+    bool mode_on = false;
+    bool mode_probe = false;
+    bool probe_rejected = false;
+    bool candidate_ready = false;
+    bool probe_admitted = false;
+    bool qwen36_prefers_ggml_quant = false;
+    bool lfm2_prefers_ggml_quant = false;
+    bool lfm2_q4k_true_batched_admitted = false;
+};
+
+struct SmartMatmulGemma4NativePlan {
+    bool dense_prefill_candidate = false;
+    bool dense_prefill_allowed = false;
+    Gemma4NativeMatmulReject dense_prefill_reject = Gemma4NativeMatmulReject::None;
+    bool decode_candidate = false;
+    bool decode_allowed = false;
+    Gemma4NativeMatmulReject decode_reject = Gemma4NativeMatmulReject::None;
+};
+
+struct SmartMatmulLfm2PrefillCompatibilityPlan {
+    bool q5k_q6k_or_q8_relevant = false;
+    bool force_non_q4k_reference_on_arm = false;
+};
+
+struct SmartMatmulGemvUserDataPlan {
+    bool gemma4_model = false;
+    bool gemma4_maintained_q8_decode_repacked = false;
+    bool lfm2_tied_lm_head = false;
+};
+
+constexpr int kMaxSmallBatchQuantCols = 4096;
+
+static densecore::runtime::DenseCoreKernelFamily ResolveSmartMatmulRequirementKernel(
+    const densecore::models::ModelTensorExecutionRequirement& requirement,
+    densecore::runtime::DenseCoreMatmulPhase phase) {
+    switch (phase) {
+    case densecore::runtime::DenseCoreMatmulPhase::Prefill: return requirement.prefill_kernel;
+    case densecore::runtime::DenseCoreMatmulPhase::Decode: return requirement.decode_kernel;
+    case densecore::runtime::DenseCoreMatmulPhase::Unknown:
+    default: return densecore::runtime::DenseCoreKernelFamily::None;
+    }
+}
 
 static SmartMatmulDispatchState ResolveSmartMatmulDispatchState(
     const TransformerModel* model, const ggml_tensor* weight, const ggml_tensor* input,
@@ -268,11 +330,11 @@ static SmartMatmulDispatchState ResolveSmartMatmulDispatchState(
     state.host_caps = densecore::runtime::CompileTimeHostKernelCapabilities(IsQ4KTrueBatchedKernelEnabled(),
                                                                             using_cpu_repack_alias);
     state.requirement = ResolveSmartMatmulRequirement(model, weight);
+    const auto requirement_kernel = ResolveSmartMatmulRequirementKernel(state.requirement, state.plan_phase);
     state.kernel_resolution = densecore::runtime::ResolveKernelResolution(
         model, weight ? weight->type : GGML_TYPE_COUNT, input ? input->type : GGML_TYPE_COUNT, state.m, state.n,
         state.k, state.plan_phase, state.weight_name, model && model->output == weight, state.compatible,
-        state.host_caps, state.requirement.semantic_op, state.requirement.tensor_role,
-        densecore::runtime::DenseCoreKernelFamily::None,
+        state.host_caps, state.requirement.semantic_op, state.requirement.tensor_role, requirement_kernel,
         state.requirement.fallback_policy, /*has_fallback_policy_override=*/true);
     state.matmul_plan = state.kernel_resolution.matmul_plan;
     state.tensor_role = state.kernel_resolution.tensor_role;
@@ -323,7 +385,8 @@ static SmartMatmulPrefillProjectionPlan ResolveSmartMatmulPrefillProjectionPlan(
 
     plan.qwen_hybrid_ssm_q8_prefill =
         ((dispatch.qwen35_hybrid_ssm && dispatch.hybrid_ssm_qkv) || dispatch.qwen35_hybrid_ssm_gate ||
-         dispatch.qwen36_hybrid_ssm_qkv || dispatch.qwen36_hybrid_ssm_gate || dispatch.qwen36_hybrid_ssm_out) &&
+         dispatch.qwen35_hybrid_ssm_out || dispatch.qwen36_hybrid_ssm_qkv ||
+         dispatch.qwen36_hybrid_ssm_gate || dispatch.qwen36_hybrid_ssm_out) &&
         dispatch.prefill_phase && weight->type == GGML_TYPE_Q8_0 && input->type == GGML_TYPE_F32 &&
         dispatch.m > 1 && weight->ne[0] == input->ne[0];
     plan.qwen_hybrid_ssm_quant_prefill_fast_path_eligible =
@@ -336,6 +399,13 @@ static SmartMatmulPrefillProjectionPlan ResolveSmartMatmulPrefillProjectionPlan(
         dispatch.m > 1 && input->type == GGML_TYPE_F32;
     plan.qwen36_lm_head_q4k_prefill_relevant =
         dispatch.qwen36_lm_head && q4k_batched_prefill_targeted;
+    if (plan.qwen36_lm_head_q4k_prefill_relevant && weight->type == GGML_TYPE_Q4_K &&
+        input->type == GGML_TYPE_F32 && weight->ne[0] == input->ne[0] && dispatch.host_caps.q4k_true_batched) {
+        const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight->type);
+        plan.qwen36_lm_head_q4k_prefill_fast_path_eligible =
+            type_traits_cpu && type_traits_cpu->vec_dot && type_traits_cpu->vec_dot_type == GGML_TYPE_Q8_K &&
+            (input->ne[0] % QK_K == 0);
+    }
     plan.lfm2_prefill_q4k_relevant =
         dispatch.lfm2_shortconv_semantic && q4k_batched_prefill_targeted;
     plan.lfm2_prefill_q6k_relevant =
@@ -362,6 +432,237 @@ static SmartMatmulPrefillProjectionPlan ResolveSmartMatmulPrefillProjectionPlan(
         plan.q4k_batched_prefill_relevant && q4k_batched_prefill_kernel_ready &&
         !plan.qwen36_hybrid_ssm_q4k_prefill_lora_active;
     return plan;
+}
+
+static SmartMatmulQuantCapabilityPlan ResolveSmartMatmulQuantCapabilityPlan(
+    const ggml_tensor* weight, const ggml_tensor* input, int input_cols) {
+    SmartMatmulQuantCapabilityPlan plan;
+    if (!weight || !input || !ggml_is_quantized(weight->type) || input->type != GGML_TYPE_F32) {
+        return plan;
+    }
+    const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight->type);
+    if (!type_traits_cpu || !type_traits_cpu->vec_dot) {
+        return plan;
+    }
+
+    plan.has_quant_vec_dot = true;
+    const auto* input_type_traits = ggml_get_type_traits_cpu(type_traits_cpu->vec_dot_type);
+    if (input_type_traits && input_type_traits->from_float) {
+        plan.has_quant_from_float = true;
+        const size_t quant_row_size = ggml_row_size(type_traits_cpu->vec_dot_type, input->ne[0]);
+        plan.quant_input_size_ok = quant_row_size > 0 && quant_row_size <= kMaxQuantInputBufferSize;
+    }
+    const int vec_dot_nrows = std::max<int>(1, static_cast<int>(type_traits_cpu->nrows));
+    plan.quant_nrc_batch_ready = vec_dot_nrows >= std::min(input_cols, kMaxSmallBatchColsHard);
+    plan.quant_true_batched_kernel_ready = IsQ4KTrueBatchedKernelEnabled() && weight->type == GGML_TYPE_Q4_K &&
+                                           type_traits_cpu->vec_dot_type == GGML_TYPE_Q8_K &&
+                                           (input->ne[0] % QK_K == 0);
+    return plan;
+}
+
+static SmartMatmulQ4KBatchedAdmissionPlan ResolveSmartMatmulQ4KBatchedAdmissionPlan(
+    const TransformerModel* model, const ggml_tensor* weight, const ggml_tensor* input,
+    const SmartMatmulDispatchState& dispatch, const SmartMatmulPrefillProjectionPlan& prefill,
+    const SmartMatmulQuantCapabilityPlan& quant,
+    const densecore::llm::config::FastPathRuntimeConfig& fast_path_config) {
+    SmartMatmulQ4KBatchedAdmissionPlan plan;
+    if (!weight || !input) {
+        return plan;
+    }
+
+    plan.admission_key = prefill.qwen36_hybrid_ssm_q4k_prefill_probe_candidate
+                             ? HashQwen36Q4KBatchedAdmissionKey(model, weight, input, dispatch.m, dispatch.n,
+                                                               dispatch.k)
+                             : 0;
+    plan.admission = plan.admission_key ? LookupQwen36Q4KBatchedAdmission(plan.admission_key)
+                                        : Qwen36Q4KBatchedAdmissionValue{};
+    const bool qwen36_q4k_relevant =
+        prefill.qwen36_hybrid_ssm_q4k_prefill_relevant ||
+        prefill.qwen36_lm_head_q4k_prefill_relevant;
+    plan.mode_off = qwen36_q4k_relevant &&
+                    fast_path_config.qwen36_prefill_q4k_batched ==
+                        densecore::llm::config::Qwen36PrefillQ4KBatchedMode::Off;
+    plan.mode_on = qwen36_q4k_relevant &&
+                   fast_path_config.qwen36_prefill_q4k_batched ==
+                       densecore::llm::config::Qwen36PrefillQ4KBatchedMode::On;
+    // Qwen3.6 and LFM2 target prefill Q4_K go directly to the DenseCore
+    // true-batched kernel by default. "probe"/"auto" are parsed as On now; the
+    // probe enum remains only for older diagnostic callers that construct the
+    // config directly.
+    plan.mode_probe =
+        (qwen36_q4k_relevant &&
+         fast_path_config.qwen36_prefill_q4k_batched ==
+             densecore::llm::config::Qwen36PrefillQ4KBatchedMode::Probe) ||
+        prefill.lfm2_prefill_q4k_relevant;
+    plan.probe_rejected =
+        plan.mode_probe && plan.admission.state == Qwen36Q4KBatchedAdmissionState::Reject;
+    plan.candidate_ready = prefill.q4k_batched_prefill_relevant && quant.has_quant_vec_dot &&
+                           quant.has_quant_from_float && quant.quant_input_size_ok &&
+                           quant.quant_true_batched_kernel_ready &&
+                           !prefill.qwen36_hybrid_ssm_q4k_prefill_lora_active;
+    plan.reject_reason = ResolveQwen36PrefillQ4KBatchedReason(
+        prefill.q4k_batched_prefill_relevant, plan.mode_off,
+        prefill.qwen36_hybrid_ssm_q4k_prefill_lora_active,
+        prefill.qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k,
+        prefill.qwen36_hybrid_ssm_q4k_prefill_shape_supported,
+        prefill.qwen36_hybrid_ssm_q4k_prefill_kernel_available, quant.has_quant_vec_dot,
+        plan.candidate_ready, plan.mode_on, plan.mode_probe, plan.admission.state);
+    plan.probe_admitted = plan.candidate_ready &&
+                          (plan.mode_on || prefill.lfm2_prefill_q4k_relevant ||
+                           (plan.mode_probe && plan.admission.state != Qwen36Q4KBatchedAdmissionState::Reject));
+    plan.qwen36_prefers_ggml_quant =
+        dispatch.prefill_phase && dispatch.qwen36_hybrid_ssm && dispatch.m > 1 &&
+        !prefill.qwen_hybrid_ssm_q8_prefill &&
+        (!plan.probe_admitted || plan.mode_off || plan.probe_rejected);
+    plan.lfm2_prefers_ggml_quant =
+        dispatch.prefill_phase && dispatch.lfm2_shortconv_semantic && dispatch.m > 1 &&
+        weight->type == GGML_TYPE_Q4_K && (!plan.probe_admitted || plan.probe_rejected);
+    plan.lfm2_q4k_true_batched_admitted =
+        prefill.lfm2_prefill_q4k_relevant && dispatch.compatible &&
+        dispatch.m <= kMaxSmallBatchQuantCols && plan.candidate_ready && plan.probe_admitted;
+    return plan;
+}
+
+static SmartMatmulGemma4NativePlan ResolveSmartMatmulGemma4NativePlan(
+    const TransformerModel* model, const ggml_tensor* weight, const ggml_tensor* input, const BatchSpec* batch,
+    const SmartMatmulDispatchState& dispatch, InferenceExecutionPhase dispatch_phase) {
+    SmartMatmulGemma4NativePlan plan;
+    if (!weight || !input) {
+        return plan;
+    }
+    plan.dense_prefill_candidate =
+        model && model->arch_flags.is_gemma4 && input->type == GGML_TYPE_F32 && dispatch.m > 1 &&
+        ggml_is_quantized(weight->type) && IsGemma4DenseWeightNameCandidate(dispatch.weight_name,
+                                                                            dispatch.gemma4_lm_head);
+    plan.dense_prefill_allowed =
+        CanUseGemma4DensePrefillNative(model, weight, input, batch, &plan.dense_prefill_reject);
+    plan.decode_allowed =
+        CanUseGemma4DecodeNative(model, weight, input, batch, dispatch_phase, &plan.decode_reject);
+    plan.decode_candidate =
+        model && model->arch_flags.is_gemma4 && input->type == GGML_TYPE_F32 && dispatch.m <= 1 &&
+        (weight->type == GGML_TYPE_F32 || ggml_is_quantized(weight->type)) &&
+        IsGemma4DenseWeightNameCandidate(dispatch.weight_name, dispatch.gemma4_lm_head);
+    return plan;
+}
+
+static void RecordSmartMatmulGemma4NativeCandidates(InferenceWorkContext* work_ctx, const ggml_tensor* weight,
+                                                    const SmartMatmulDispatchState& dispatch,
+                                                    const SmartMatmulGemma4NativePlan& plan) {
+    if (!weight) {
+        return;
+    }
+    InferenceWorkContext* ctx = work_ctx ? work_ctx : GetCurrentWorkContext();
+    if (plan.dense_prefill_candidate) {
+        RecordGemma4DensePrefillNativeDecision(
+            ctx, /*candidate=*/true, /*used=*/false,
+            plan.dense_prefill_allowed ? nullptr : Gemma4NativeMatmulRejectName(plan.dense_prefill_reject),
+            weight->type, 0, false);
+    }
+    if (plan.decode_candidate) {
+        RecordGemma4DecodeNativeDecision(
+            ctx, /*candidate=*/true, /*used=*/false,
+            plan.decode_allowed ? nullptr : Gemma4NativeMatmulRejectName(plan.decode_reject),
+            /*moe_used=*/false, /*dense_used=*/false, /*lm_head_used=*/dispatch.gemma4_lm_head, 0, 0, 0, false);
+    }
+}
+
+static SmartMatmulLfm2PrefillCompatibilityPlan ResolveSmartMatmulLfm2PrefillCompatibilityPlan(
+    const ggml_tensor* weight, const ggml_tensor* input, const SmartMatmulDispatchState& dispatch) {
+    SmartMatmulLfm2PrefillCompatibilityPlan plan;
+    if (!weight || !input) {
+        return plan;
+    }
+    plan.q5k_q6k_or_q8_relevant =
+        dispatch.prefill_phase && dispatch.lfm2_shortconv_semantic && input->type == GGML_TYPE_F32 &&
+        dispatch.m > 1 &&
+        (weight->type == GGML_TYPE_Q5_K || weight->type == GGML_TYPE_Q6_K || weight->type == GGML_TYPE_Q8_0);
+    plan.force_non_q4k_reference_on_arm =
+        dispatch.prefill_phase && dispatch.lfm2_shortconv_semantic && ggml_is_quantized(weight->type) &&
+        weight->type != GGML_TYPE_Q4_K && !plan.q5k_q6k_or_q8_relevant && input->type == GGML_TYPE_F32 &&
+        dispatch.m > 1 &&
+#if defined(__aarch64__) || defined(_M_ARM64)
+        true;
+#else
+        false;
+#endif
+    return plan;
+}
+
+static void RecordSmartMatmulQ4KBatchedRejectReason(InferenceWorkContext* work_ctx,
+                                                    Qwen36PrefillQ4KBatchedRejectReason reason) {
+    if (!work_ctx || reason == Qwen36PrefillQ4KBatchedRejectReason::None) {
+        return;
+    }
+    work_ctx->qwen36_profile.qwen36_prefill_q4k_batched_last_reject_reason.store(
+        static_cast<int>(reason), std::memory_order_relaxed);
+}
+
+static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const ggml_tensor* weight,
+                                                const SmartMatmulDispatchState& dispatch,
+                                                const SmartMatmulPrefillProjectionPlan& prefill,
+                                                const SmartMatmulQ4KBatchedAdmissionPlan& q4k_admission,
+                                                bool gemma4_dense_prefill_native) {
+    if (!ud || !weight) {
+        return;
+    }
+    ud->force_reference_scalar = false;
+    ud->qwen36_prefill_q4k_admission_key = q4k_admission.admission_key;
+    ud->qwen36_prefill_q4k_probe =
+        !prefill.lfm2_prefill_q4k_relevant && q4k_admission.mode_probe &&
+        !prefill.qwen36_lm_head_q4k_prefill_relevant &&
+        q4k_admission.admission.state == Qwen36Q4KBatchedAdmissionState::Unknown;
+    ud->qwen36_prefill_q4k_admitted = q4k_admission.probe_admitted;
+    ud->require_q4k_true_batched = prefill.lfm2_prefill_q4k_relevant ||
+                                   prefill.qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k ||
+                                   prefill.qwen36_lm_head_q4k_prefill_relevant;
+    ud->disable_quant_nrc_fast = prefill.lfm2_prefill_quant_nrc_unsafe ||
+                                 prefill.lfm2_prefill_q4k_relevant;
+    ud->gemma4_dense_prefill_native = gemma4_dense_prefill_native;
+    ud->lfm2_q8_repacked_batched =
+        dispatch.lfm2_shortconv_semantic && weight->type == GGML_TYPE_Q8_0 && dispatch.m > 1;
+    // Qwen hybrid-SSM Q8_0 prefill must stay inside DenseCore's owned path.
+    // Use the repacked 4x8 batched GEMM for real prefill batches; keep the
+    // direct GEMV path only for tiny micro-batches that cannot use GEMM.
+    ud->qwen36_ssm_q8_repacked_batched = prefill.qwen_hybrid_ssm_q8_prefill && dispatch.m >= 4;
+    ud->qwen36_ssm_q8_direct_batched = prefill.qwen_hybrid_ssm_q8_prefill && dispatch.m < 4;
+}
+
+static SmartMatmulGemvUserDataPlan ResolveSmartMatmulGemvUserDataPlan(
+    const TransformerModel* model, const ggml_tensor* weight, const ggml_tensor* input,
+    const SmartMatmulDispatchState& dispatch) {
+    SmartMatmulGemvUserDataPlan plan;
+    if (!weight || !input) {
+        return plan;
+    }
+    plan.gemma4_model = model && model->arch_flags.is_gemma4;
+    plan.gemma4_maintained_q8_decode_repacked =
+        plan.gemma4_model && weight->type == GGML_TYPE_Q8_0 && input->type == GGML_TYPE_F32 && dispatch.m == 1 &&
+        (dispatch.gemma4_lm_head || IsGemma4SharedDenseFfnWeightName(dispatch.weight_name));
+    plan.lfm2_tied_lm_head =
+        model && model->arch_flags.is_lfm2_shortconv &&
+        (model->output == weight || std::strcmp(dispatch.weight_name, "token_embd.weight") == 0 ||
+         std::strcmp(dispatch.weight_name, "output.weight") == 0 ||
+         std::strcmp(dispatch.weight_name, "output") == 0);
+    return plan;
+}
+
+static void ConfigureSmartMatmulGemvUserData(GemvUserData* ud, const TransformerModel* model,
+                                             const SmartMatmulDispatchState& dispatch,
+                                             const SmartMatmulGemma4NativePlan& gemma4_plan,
+                                             const SmartMatmulGemvUserDataPlan& gemv_plan,
+                                             bool matmul_expected_decode) {
+    if (!ud) {
+        return;
+    }
+    ud->force_reference_scalar = false;
+    ud->model_identity = reinterpret_cast<uintptr_t>(model);
+    ud->force_q8_repacked_gemv = gemv_plan.gemma4_maintained_q8_decode_repacked;
+    ud->disable_q8_repacked_gemv = gemv_plan.gemma4_model && !gemv_plan.gemma4_maintained_q8_decode_repacked;
+    ud->gemma4_decode_native = gemma4_plan.decode_allowed;
+    ud->gemma4_decode_lm_head = dispatch.gemma4_lm_head;
+    ud->semantic_op = dispatch.semantic_op;
+    ud->tensor_role = dispatch.tensor_role;
+    ud->lfm2_decode_lm_head = gemv_plan.lfm2_tied_lm_head && matmul_expected_decode;
 }
 
 static void RecordSmartMatmulGraphCensus(InferenceWorkContext* dispatch_work_ctx,

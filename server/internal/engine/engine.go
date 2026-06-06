@@ -5,19 +5,46 @@ package engine
 // -----------------------
 // IMPORTANT: For CI/production, set environment variables:
 //   export CGO_CFLAGS="-I${PWD}/core/include"
-//   export CGO_LDFLAGS="-L${PWD}/build -Wl,-rpath,${PWD}/build -ldensecore -lstdc++"
+//   export CGO_LDFLAGS="-L${PWD}/build -Wl,-rpath,${PWD}/build -ldensecore -lstdc++ -ldl"
 //
 // ${SRCDIR} expands to the directory containing this Go source file.
 #cgo CFLAGS: -I${SRCDIR}/../../../core/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../build -Wl,-rpath,${SRCDIR}/../../../build -ldensecore -lstdc++
+#cgo LDFLAGS: -L${SRCDIR}/../../../build -Wl,-rpath,${SRCDIR}/../../../build -ldensecore -lstdc++ -ldl
 #include <stdlib.h>
 #include <stdint.h>
+#include <dlfcn.h>
 #include "densecore.h"
 #include "densecore/plugin_loader.h"
 
 // Forward declaration of the Go callback (exported from callbacks.go)
 extern void streamCallbackGateway(char* token, int is_finished, void* user_data);
 extern void streamCallbackExGateway(char* data, int len, int token_id, int is_finished, void* user_data);
+
+static void* DenseCoreResolveExport(const char* name) {
+    void* sym = dlsym(RTLD_DEFAULT, name);
+    if (sym) {
+        return sym;
+    }
+
+    const char* candidates[] = {
+        "libdensecore.so.1",
+        "./build/libdensecore.so.1",
+        "../build/libdensecore.so.1",
+        "../../build/libdensecore.so.1",
+        NULL,
+    };
+    for (int i = 0; candidates[i] != NULL; ++i) {
+        void* lib = dlopen(candidates[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!lib) {
+            continue;
+        }
+        sym = dlsym(lib, name);
+        if (sym) {
+            return sym;
+        }
+    }
+    return NULL;
+}
 
 // Wrapper function to call SubmitRequest with the callback
 static int SubmitRequestWrapper(DenseCoreHandle handle, const char* prompt, int max_tokens, uintptr_t user_data) {
@@ -94,14 +121,23 @@ static int SubmitRenderedRequestIdsWithSamplingConstraintsWrapper(DenseCoreHandl
                                                                   const int* disallowed_token_ids,
                                                                   int num_disallowed_token_ids,
                                                                   uintptr_t user_data) {
-    return SubmitRenderedRequestIdsWithSamplingConstraintsCallbackEx(handle, rendered_prompt, tokens, n_tokens,
-                                                                     max_tokens, lora_name, temperature, top_p, top_k,
-                                                                     repetition_penalty, stop_sequences, json_mode,
-                                                                     allowed_token_ids, num_allowed_token_ids,
-                                                                     allowed_token_ids_strict, disallowed_token_ids,
-                                                                     num_disallowed_token_ids,
-                                                                     (TokenCallbackEx)streamCallbackExGateway,
-                                                                     (void*)user_data);
+    typedef int (*SubmitRenderedRequestIdsFn)(DenseCoreHandle, const char*, const int*, int, int, const char*,
+                                              float, float, int, float, const char**, int, const int*, int, int,
+                                              const int*, int, TokenCallbackEx, void*);
+    static SubmitRenderedRequestIdsFn fn = NULL;
+    static int resolved = 0;
+    if (!resolved) {
+        void* sym = DenseCoreResolveExport("SubmitRenderedRequestIdsWithSamplingConstraintsCallbackEx");
+        fn = (SubmitRenderedRequestIdsFn)sym;
+        resolved = 1;
+    }
+    if (!fn) {
+        return -998;
+    }
+    return fn(handle, rendered_prompt, tokens, n_tokens, max_tokens, lora_name, temperature, top_p, top_k,
+              repetition_penalty, stop_sequences, json_mode, allowed_token_ids, num_allowed_token_ids,
+              allowed_token_ids_strict, disallowed_token_ids, num_disallowed_token_ids,
+              (TokenCallbackEx)streamCallbackExGateway, (void*)user_data);
 }
 
 static int SubmitRenderedChatWithSamplingConstraintsWrapper(DenseCoreHandle handle,
@@ -116,11 +152,23 @@ static int SubmitRenderedChatWithSamplingConstraintsWrapper(DenseCoreHandle hand
                                                             const int* disallowed_token_ids,
                                                             int num_disallowed_token_ids,
                                                             uintptr_t user_data) {
-    return DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx(
-        handle, rendered_prompt, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty,
-        stop_sequences, json_mode, allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict,
-        disallowed_token_ids, num_disallowed_token_ids, (TokenCallbackEx)streamCallbackExGateway,
-        (void*)user_data);
+    typedef int (*SubmitRenderedChatFn)(DenseCoreHandle, const char*, int, const char*, float, float, int, float,
+                                        const char**, int, const int*, int, int, const int*, int, TokenCallbackEx,
+                                        void*);
+    static SubmitRenderedChatFn fn = NULL;
+    static int resolved = 0;
+    if (!resolved) {
+        void* sym = DenseCoreResolveExport("DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx");
+        fn = (SubmitRenderedChatFn)sym;
+        resolved = 1;
+    }
+    if (!fn) {
+        return -998;
+    }
+    return fn(handle, rendered_prompt, max_tokens, lora_name, temperature, top_p, top_k, repetition_penalty,
+              stop_sequences, json_mode, allowed_token_ids, num_allowed_token_ids, allowed_token_ids_strict,
+              disallowed_token_ids, num_disallowed_token_ids, (TokenCallbackEx)streamCallbackExGateway,
+              (void*)user_data);
 }
 
 // Forward declaration of the Go callback for embeddings (exported from callbacks.go)
@@ -149,6 +197,23 @@ static int LoadPluginWrapper(const char* plugin_path, DenseCoreHandle handle) {
 // Wrapper for optional plugin unload
 static void UnloadPluginWrapper(void) {
     DenseCoreEntUnloadPlugin();
+}
+
+typedef int (*DenseCoreGetRuntimeOptimizationStateFn)(DenseCoreHandle, DenseCoreRuntimeOptimizationState*);
+
+static int DenseCoreGetRuntimeOptimizationStateSafe(DenseCoreHandle handle,
+                                                    DenseCoreRuntimeOptimizationState* out) {
+    static DenseCoreGetRuntimeOptimizationStateFn fn = NULL;
+    static int resolved = 0;
+    if (!resolved) {
+        void* sym = DenseCoreResolveExport("DenseCoreGetRuntimeOptimizationState");
+        fn = (DenseCoreGetRuntimeOptimizationStateFn)sym;
+        resolved = 1;
+    }
+    if (!fn) {
+        return -998;
+    }
+    return fn(handle, out);
 }
 */
 import "C"
@@ -1041,7 +1106,7 @@ func (e *DenseEngine) GetChatTemplate() string {
 
 func (e *DenseEngine) GetRuntimeOptimizationState() (domain.RuntimeOptimizationState, error) {
 	var cState C.DenseCoreRuntimeOptimizationState
-	ret := C.DenseCoreGetRuntimeOptimizationState(e.handle, &cState)
+	ret := C.DenseCoreGetRuntimeOptimizationStateSafe(e.handle, &cState)
 	if ret < 0 {
 		return domain.RuntimeOptimizationState{}, fmt.Errorf("runtime optimization state failed with error code %d", ret)
 	}

@@ -66,6 +66,34 @@ TEST(BuildTransformerGraphDispatchTest, Qwen35SelectsInlineHybridSsmRoute) {
     EXPECT_TRUE(plan.selected_builder_name.empty());
 }
 
+TEST(BuildTransformerGraphDispatchTest, HybridSsmMoeGraphPlanCarriesExecutionContractFacts) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_layer = 1;
+    model.hparams.n_experts = 4;
+    model.hparams.n_experts_used = 2;
+    model.hybrid_layer_is_ssm = {1};
+    model.ssm_time_step_rank = 8;
+    model.ssm_inner_size = 64;
+    model.ssm_group_count = 1;
+    model.ssm_state_size = 16;
+    model.ssm_conv_kernel = 4;
+    model.layers.resize(1);
+    model.layers[0].is_moe = true;
+    model.layers[0].experts.resize(4);
+
+    const auto plan = densecore::ResolveTransformerGraphExecutionPlan(&model);
+
+    EXPECT_EQ(plan.resolution.preferred_family, densecore::models::GraphFamily::DecoderHybridSSM);
+    EXPECT_EQ(plan.route, densecore::TransformerGraphExecutionRoute::InlineHybridSSM);
+    EXPECT_TRUE(plan.resolution.capabilities.requires_decode_graph_runtime_rebind);
+    EXPECT_TRUE(plan.resolution.capabilities.requires_fallback_free_fast_path);
+    EXPECT_TRUE(plan.resolution.capabilities.requires_native_moe_fast_path);
+    EXPECT_EQ(plan.resolution.capabilities.native_moe_max_direct_tokens, 4096);
+}
+
 TEST(BuildTransformerGraphDispatchTest, Gemma4SelectsInlineSlidingSharedKvRoute) {
     TransformerModel model{};
     model.arch = ModelArch::GEMMA;

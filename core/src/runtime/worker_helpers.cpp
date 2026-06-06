@@ -729,6 +729,26 @@ int DecodeGraphCacheRegressionSteps() {
     return steps;
 }
 
+bool ShouldRunDecodeGraphCacheRegressionCheck(const TransformerModel* model, bool cpu_backend_active,
+                                              bool current_kv_cache_present, bool using_cached_decode_graph,
+                                              bool decode_single_token_layout, int num_seqs, bool has_lora_map,
+                                              int checked_steps) {
+    if (!cpu_backend_active || !current_kv_cache_present || !using_cached_decode_graph || !decode_single_token_layout ||
+        has_lora_map || !IsDecodeGraphCacheRegressionEnabled() ||
+        checked_steps >= DecodeGraphCacheRegressionSteps()) {
+        return false;
+    }
+    if (num_seqs > 1) {
+        return true;
+    }
+    if (num_seqs != 1 || !model) {
+        return false;
+    }
+    const auto descriptor = densecore::models::DescribeModel(model);
+    return (model->arch_flags.is_hybrid_ssm && descriptor.variant == ModelVariant::QWEN36) ||
+           model->arch_flags.is_lfm2_shortconv || model->arch_flags.is_gemma4;
+}
+
 uint64_t BuildDecodeGraphFeatureFlags(const TransformerModel* model) {
     uint64_t feature_flags = 0;
     feature_flags |= (1ull << 1);  // paged decode is the maintained decode path.
@@ -2357,6 +2377,14 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " q6k_gemv_effective_state=" << q6k_effective_state
         << " qact_cache_hits=" << req->qact_cache_hits << " qact_cache_misses=" << req->qact_cache_misses
         << " qact_cache_reused_bytes=" << req->qact_cache_reused_bytes
+        << " q8_batched_weight_cache_ms=" << ns_to_ms(req->q8_batched_weight_cache_ns)
+        << " q8_batched_activation_quant_ms=" << ns_to_ms(req->q8_batched_activation_quant_ns)
+        << " q8_batched_activation_wait_ms=" << ns_to_ms(req->q8_batched_activation_wait_ns)
+        << " q8_batched_activation_pack_ms=" << ns_to_ms(req->q8_batched_activation_pack_ns)
+        << " q8_batched_compute_ms=" << ns_to_ms(req->q8_batched_compute_ns)
+        << " q8_batched_used_ops=" << req->q8_batched_used_ops
+        << " q8_batched_true_gemm_ops=" << req->q8_batched_true_gemm_ops
+        << " q8_batched_gemv_ops=" << req->q8_batched_gemv_ops
         << " moe_small_decode_parallel_candidate_ops=" << req->moe_small_decode_parallel_candidate_ops
         << " moe_small_decode_parallel_used_ops=" << req->moe_small_decode_parallel_used_ops
         << " moe_small_decode_parallel_rejected_ops=" << req->moe_small_decode_parallel_rejected_ops

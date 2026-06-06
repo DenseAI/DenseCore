@@ -979,6 +979,53 @@ func TestChatCompletionHandler_StreamLFM2WithoutExactAnswerDoesNotSuppressPrelud
 	}
 }
 
+func TestChatCompletionHandler_StreamLFM2LongExactAnswerPromptDoesNotSuppressGeneratedTokens(t *testing.T) {
+	mockModelService := NewMockModelService()
+	mockModelService.modelName = "/models/LFM2.5-8B-A1B-Q4_K_M.gguf"
+	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+		go func() {
+			for _, token := range []string{"The user wants ", "a detailed answer about memory locality."} {
+				outputChan <- domain.StreamEvent{Token: token}
+			}
+			outputChan <- domain.NewTerminalEvent(nil)
+			close(outputChan)
+		}()
+		return nil
+	}
+
+	q := queue.NewRequestQueue(10)
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
+	handler := NewHandler(chatService, mockModelService)
+
+	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
+		Model: "densecore-v1",
+		Messages: []domain.Message{
+			{Role: "user", Content: "Reference section C: The verification key is cedar-owl-742.\nFinal question: What is the verification key?\nFinal response: cedar-owl-742"},
+		},
+		MaxTokens: 256,
+		Stream:    true,
+	})
+	w := httptest.NewRecorder()
+
+	handler.ChatCompletionHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"content":"The user wants "`) ||
+		!strings.Contains(body, `"content":"a detailed answer about memory locality."`) {
+		t.Fatalf("LFM2 long exact-answer stream should expose generated tokens: %q", body)
+	}
+	if strings.Contains(body, `"content":"cedar-owl-742"`) {
+		t.Fatalf("LFM2 long stream must not synthesize exact answers: %q", body)
+	}
+}
+
 func TestChatCompletionHandler_StreamSanitizesGemma4CurrentModel(t *testing.T) {
 	mockModelService := NewMockModelService()
 	mockModelService.modelName = "/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"

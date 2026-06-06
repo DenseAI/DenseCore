@@ -407,6 +407,59 @@ TEST(Qwen35SSMMathTest, DefaultStepMatchesInPlaceReference) {
     ExpectVectorNear(y, expected_y, 2e-6f);
 }
 
+TEST(Qwen35SSMMathTest, FastSiluGateKeepsStepFiniteAndBounded) {
+    const std::vector<float> input = {0.18f, -0.31f, 0.27f, -0.09f, 0.14f, -0.22f, 0.05f, 0.33f};
+    const std::vector<float> q = {0.42f, -0.28f, 0.13f, -0.37f};
+    const std::vector<float> k = {-0.19f, 0.34f, -0.41f, 0.16f};
+    const std::vector<float> v = {0.71f, -0.24f, 0.48f, -0.62f, 0.17f, 0.39f, -0.52f, 0.08f};
+    const std::vector<float> z = {-2.8f, -1.4f, -0.2f, 0.35f, 0.9f, 1.7f, 2.6f, 3.4f};
+    const std::vector<float> alpha_row = {0.04f, -0.07f, 0.03f, 0.09f, -0.02f, 0.06f, -0.05f, 0.01f};
+    const std::vector<float> beta_row = {-0.03f, 0.05f, -0.08f, 0.02f, 0.07f, -0.04f, 0.01f, -0.06f};
+    const std::vector<float> norm = {1.04f, 0.96f, 1.08f, 0.92f, 1.02f, 0.98f, 1.06f, 0.94f};
+    std::vector<float> state_stable = {
+        0.12f, -0.05f, 0.08f, -0.11f, 0.03f, 0.06f, -0.04f, 0.09f,
+        -0.07f, 0.14f, -0.02f, 0.05f, -0.1f, 0.04f, 0.11f, -0.03f,
+        0.06f, -0.12f, 0.1f, -0.01f, 0.07f, -0.09f, 0.02f, 0.13f,
+        -0.04f, 0.03f, -0.08f, 0.15f, -0.06f, 0.01f, -0.13f, 0.05f,
+    };
+    std::vector<float> state_fast = state_stable;
+    std::vector<float> y_stable(v.size(), 0.0f);
+    std::vector<float> y_fast(v.size(), 0.0f);
+
+    Qwen35SSMHeadStepConfig cfg{};
+    cfg.input_t = input.data();
+    cfg.q_head = q.data();
+    cfg.k_head = k.data();
+    cfg.v_head = v.data();
+    cfg.z_head = z.data();
+    cfg.alpha_row = alpha_row.data();
+    cfg.beta_row = beta_row.data();
+    cfg.norm_weight = norm.data();
+    cfg.n_embd = static_cast<int>(input.size());
+    cfg.head_dim_k = static_cast<int>(q.size());
+    cfg.head_dim_v = static_cast<int>(v.size());
+    cfg.dt_bias = -0.17f;
+    cfg.a_log = -0.73f;
+    cfg.norm_eps = 1e-6f;
+    cfg.a_log_prescaled = true;
+    cfg.has_precomputed_alpha_beta = true;
+    cfg.precomputed_alpha = -0.11f;
+    cfg.precomputed_beta = 0.23f;
+
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepFastDefault(cfg, state_stable.data(), y_stable.data()));
+    cfg.use_fast_silu = true;
+    ASSERT_TRUE(Qwen35RunGatedDeltaHeadStepFastDefault(cfg, state_fast.data(), y_fast.data()));
+
+    for (float value : y_fast) {
+        EXPECT_TRUE(std::isfinite(value));
+    }
+    for (float value : state_fast) {
+        EXPECT_TRUE(std::isfinite(value));
+    }
+    EXPECT_LT(MaxAbsDiff(state_fast, state_stable), 1e-6f);
+    EXPECT_LT(MaxAbsDiff(y_fast, y_stable), 7e-3f);
+}
+
 TEST(Qwen35SSMMathTest, IsolatedWritebackIsDeterministicAcrossRepeatedRequests) {
     const std::vector<float> input = {0.1f, -0.2f, 0.3f, -0.4f};
     const std::vector<float> q = {0.5f, -0.3f};

@@ -6,6 +6,7 @@
 
 #include "densecore/models/decoder_model_spec.h"
 #include "densecore/models/model_descriptor.h"
+#include "densecore/models/model_execution_contract.h"
 
 namespace densecore::models {
 namespace {
@@ -263,6 +264,14 @@ ModelGraphCapabilities ResolveModelGraphCapabilities(const TransformerModel* mod
     // path that exposes projector semantics in TransformerModel metadata.
     capabilities.has_multimodal_projection = capabilities.topology == GraphTopology::MULTIMODAL_PROJECTED_DECODER;
 
+    const auto execution_contract = BuildModelExecutionContract(model);
+    capabilities.requires_fallback_free_fast_path =
+        ModelExecutionContractRequiresFallbackFreeFastPath(execution_contract);
+    capabilities.requires_native_moe_fast_path = ModelExecutionContractRequiresNativeMoEFastPath(execution_contract);
+    capabilities.requires_decode_graph_runtime_rebind =
+        ModelExecutionContractRequiresDecodeGraphRuntimeRebind(execution_contract);
+    capabilities.native_moe_max_direct_tokens = ModelExecutionContractNativeMoEMaxDirectTokens(execution_contract);
+
     return capabilities;
 }
 
@@ -445,6 +454,12 @@ std::string FormatModelGraphCapabilities(const ModelGraphCapabilities& capabilit
         << ", shared_dense_ffn=" << (capabilities.requires_shared_dense_ffn ? "true" : "false")
         << ", moe_down_scale_sidecar=" << (capabilities.requires_moe_down_scale_sidecar ? "true" : "false")
         << ", ffn_post_norms=" << (capabilities.requires_ffn_post_norms ? "true" : "false")
+        << ", fallback_free_fast_path="
+        << (capabilities.requires_fallback_free_fast_path ? "true" : "false")
+        << ", native_moe_fast_path=" << (capabilities.requires_native_moe_fast_path ? "true" : "false")
+        << ", decode_graph_runtime_rebind="
+        << (capabilities.requires_decode_graph_runtime_rebind ? "true" : "false")
+        << ", native_moe_max_direct_tokens=" << capabilities.native_moe_max_direct_tokens
         << ", moe_routers=" << JoinNames(capabilities.required_moe_routers, DecoderMoERouterName)
         << ", ffn_activations=" << JoinNames(capabilities.required_ffn_activations, DecoderActivationName)
         << ", rope_kinds=" << JoinNames(capabilities.required_rope_kinds, DecoderRopeKindName)

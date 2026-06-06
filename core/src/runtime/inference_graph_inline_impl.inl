@@ -496,10 +496,6 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             }
             const int channels = static_cast<int>(in_proj->ne[1] / 3);
 
-            // 1. in_proj: [n_embd, N] -> [3*channels, N] (rows: B, C, x)
-            struct ggml_tensor* bcx = smart_mul_mat(ctx_c, in_proj, cur, model);
-            ggml_set_name(bcx, "lfm2_shortconv_bcx");
-
             LFM2ShortConvUserData* conv_ud = GetLFM2ShortConvUserData();
             InferenceWorkContext* current_work_ctx = GetCurrentWorkContext();
             conv_ud->conv_weight = model->lfm2_conv_weight_f32[static_cast<size_t>(conv_ordinal)].data();
@@ -514,8 +510,29 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             conv_ud->work_ctx = current_work_ctx;
 
             struct ggml_tensor* mixer_out = nullptr;
+            const bool lfm2_decode_fused_inout =
+                N == 1 && cur->type == GGML_TYPE_F32 && in_proj->type == GGML_TYPE_Q4_K &&
+                out_proj->type == GGML_TYPE_Q4_K && in_proj->ne[1] >= 3 * channels &&
+                in_proj->ne[0] == cur->ne[0] && out_proj->ne[0] == channels &&
+                densecore::kernels::Q4KRepackedGemvIsaSupported() &&
+                densecore::kernels::Q4KRealPackedGemvKernelAvailable();
+            if (lfm2_decode_fused_inout) {
+                ggml_tensor* args[] = {cur, in_proj, out_proj};
+                mixer_out = ggml_custom_4d(ctx_c, GGML_TYPE_F32, out_proj->ne[1], 1, 1, 1, args, 3,
+                                           cb_lfm2_shortconv_inout_q4k_decode,
+                                           ResolveTaskCount(&batch, static_cast<int>(out_proj->ne[1])), conv_ud);
+                ggml_set_name(mixer_out, "lfm2_shortconv_inout_q4k_decode");
+            }
+
+            // 1. in_proj: [n_embd, N] -> [3*channels, N] (rows: B, C, x)
+            struct ggml_tensor* bcx = nullptr;
+            if (!mixer_out) {
+                bcx = smart_mul_mat(ctx_c, in_proj, cur, model);
+                ggml_set_name(bcx, "lfm2_shortconv_bcx");
+            }
+
             const bool lfm2_decode_fused_out =
-                N == 1 && bcx->type == GGML_TYPE_F32 && out_proj->type == GGML_TYPE_Q4_K &&
+                !mixer_out && N == 1 && bcx->type == GGML_TYPE_F32 && out_proj->type == GGML_TYPE_Q4_K &&
                 out_proj->ne[0] == channels;
             if (lfm2_decode_fused_out) {
                 const int64_t ne_out[4] = {out_proj->ne[1], 1, 1, 1};
@@ -531,7 +548,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                             ResolveTaskCount(&batch, static_cast<int>(out_proj->ne[1])), conv_ud};
                 static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "params too large");
                 std::memcpy(mixer_out->op_params, &params, sizeof(params));
-            } else {
+            } else if (!mixer_out) {
                 // 2. gated depthwise causal conv (updates per-seq conv state) -> [channels, N]
                 struct ggml_tensor* y = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, channels, N);
                 y = ggml_map_custom2(ctx_c, y, bcx, cb_lfm2_shortconv, 1, conv_ud);
@@ -630,7 +647,7 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             ggml_tensor* fused_qkv_gate = nullptr;
 #if defined(__aarch64__) || defined(_M_ARM64)
             if ((model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
-                model->arch_flags.is_hybrid_ssm && N == 1) {
+                model->arch_flags.is_hybrid_ssm) {
                 if (ggml_tensor* fused_w = layer.Get("attn_qkv_gate.cpu_fused_decode")) {
                     fused_qkv_gate = smart_mul_mat(ctx_c, fused_w, cur, model);
                     ggml_set_name(fused_qkv_gate, model->variant == ModelVariant::QWEN36
@@ -781,11 +798,13 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             scan_ud->input_tensor = cur;
             scan_ud->alpha_beta_tensor = nullptr;
             scan_ud->profile = &GetCurrentWorkContext()->qwen36_profile;
-            scan_ud->fast_silu_gate = model->variant == ModelVariant::QWEN36;
+            const bool qwen_hybrid_ssm_model =
+                (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+                model->arch_flags.is_hybrid_ssm;
+            scan_ud->fast_silu_gate = qwen_hybrid_ssm_model;
             struct ggml_tensor* alpha_beta = nullptr;
             const bool precompute_qwen_hybrid_ssm_scalars =
-                model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm && batch.num_seqs == 1 &&
-                N > 1;
+                qwen_hybrid_ssm_model && batch.num_seqs == 1 && N > 1;
             if (precompute_qwen_hybrid_ssm_scalars) {
                 const int alpha_beta_rows = 2 * num_v_heads + 3 * n_groups;
                 alpha_beta = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, alpha_beta_rows, N);

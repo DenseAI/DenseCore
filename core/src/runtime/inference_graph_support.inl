@@ -2254,9 +2254,16 @@ static bool Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
         projection_tile.resize(tile_assignments.size() * static_cast<size_t>(row_count));
         densecore::CpuBackend& backend = densecore::GetCpuBackend();
         const void* weight_start = expert_base + static_cast<size_t>(row_start) * w_row_bytes;
-        const bool projected = densecore::RunQ4KRepackedMoEProjection(
-            &backend, weight_start, qtile, qrow_bytes, projection_tile.data(),
-            static_cast<int64_t>(tile_assignments.size()), row_count, K, /*numa_node=*/0, /*allow_parallel=*/false);
+        const bool prefill_rows = GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill;
+        const bool projected = prefill_rows
+                                   ? densecore::RunMoEKQuantRawBatchedProjection(
+                                         &backend, static_cast<int>(wtype), weight_start, qtile, qrow_bytes,
+                                         projection_tile.data(), static_cast<int64_t>(tile_assignments.size()),
+                                         row_count, K, /*numa_node=*/0, /*allow_parallel=*/false)
+                                   : densecore::RunQ4KRepackedMoEProjection(
+                                         &backend, weight_start, qtile, qrow_bytes, projection_tile.data(),
+                                         static_cast<int64_t>(tile_assignments.size()), row_count, K,
+                                         /*numa_node=*/0, /*allow_parallel=*/false);
         if (projected) {
             for (size_t m = 0; m < tile_assignments.size(); ++m) {
                 const Qwen35MoEAssignment& assignment = tile_assignments[m];
@@ -3620,9 +3627,9 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                                   static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]);
             const void* gate_row_start = gate_base + static_cast<size_t>(row_start) * weight_row_bytes;
             const void* up_row_start = up_base + static_cast<size_t>(row_start) * weight_row_bytes;
-            const bool q4_repacked_gateup =
-                q4_gateup && shared_q8 && shared_q8->prefer_q4k_repacked_swiglu && compact_gateup_rows &&
-                (row_count % 8) == 0;
+            const bool q4_repacked_gateup = q4_gateup && GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode &&
+                                            shared_q8 && shared_q8->prefer_q4k_repacked_swiglu &&
+                                            compact_gateup_rows && (row_count % 8) == 0;
             const bool repacked_gateup = q5_single_copy_8x8 || q4_repacked_gateup;
             const bool can_use_batched_gateup =
                 (q4_gateup || q5_gateup) && (compact_gateup_rows || q5_single_copy_8x8) && row_count > 0 &&
@@ -3720,8 +3727,9 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                                                           static_cast<size_t>(dst->nb[1]) +
                                                       static_cast<size_t>(assignment.token) *
                                                           static_cast<size_t>(dst->nb[2]));
-                if (q5_single_copy_8x8 || (q4_gateup && shared_q8 && shared_q8->prefer_q4k_repacked_swiglu &&
-                                           compact_gateup_rows && (row_count % 8) == 0)) {
+                if (q5_single_copy_8x8 ||
+                    (q4_gateup && GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode && shared_q8 &&
+                     shared_q8->prefer_q4k_repacked_swiglu && compact_gateup_rows && (row_count % 8) == 0)) {
                     const float* input_row =
                         q5_single_copy_8x8 ? Qwen35NativeMoEGateUpInputRowPtr(input, assignment.token) : nullptr;
                     const bool q5_row_aligned = !q5_single_copy_8x8 || ((row_start % 8) == 0 && (row_count % 8) == 0);
@@ -4106,10 +4114,8 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
                                           ggml_tensor* gate_logits, int top_k,
                                           const densecore::models::DecoderLayerSpec* layer_spec) {
     const QwenLikeNativeMoEGraphPlan graph_plan = ResolveQwenLikeNativeMoEGraphPlan(model);
-    const bool qwen_native_moe = graph_plan.qwen_native_moe;
-    const bool lfm2_native_moe = graph_plan.lfm2_native_moe;
     if (!ctx || !gf || !model || !layer || !routed_input || !gate_logits ||
-        (!qwen_native_moe && !lfm2_native_moe)) {
+        (!graph_plan.qwen_native_moe && !graph_plan.lfm2_native_moe)) {
         return nullptr;
     }
     auto reject_native_moe = [&](const char* reason) -> ggml_tensor* {
@@ -4131,8 +4137,8 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
                          safe_reason, layer_idx, static_cast<int>(model->variant),
                          static_cast<int>(graph_plan.graph_phase), static_cast<long long>(input0),
                          static_cast<long long>(input1), static_cast<long long>(logits0),
-                         static_cast<long long>(logits1), top_k, qwen_native_moe ? 1 : 0,
-                         lfm2_native_moe ? 1 : 0);
+                         static_cast<long long>(logits1), top_k, graph_plan.qwen_native_moe ? 1 : 0,
+                         graph_plan.lfm2_native_moe ? 1 : 0);
         }
         return nullptr;
     };
@@ -4198,7 +4204,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
 
     ggml_tensor* routing_probs = gate_logits;
     ggml_tensor* selection_scores = gate_logits;
-    if (lfm2_native_moe) {
+    if (graph_plan.lfm2_native_moe) {
         routing_probs = ggml_sigmoid(ctx, gate_logits);
         ggml_set_name(routing_probs, "lfm2_native_moe_sigmoid_probs");
         selection_scores = routing_probs;
@@ -4230,14 +4236,14 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             gateup_q8_ud->prefer_q4k_repacked_swiglu = w1w3_type == GGML_TYPE_Q4_K;
             gateup_q8_ud->q5k_gateup_8x8_single_copy = native_q5_gateup_single_copy;
             gateup_q8_ud->q5k_gateup_8x8_single_copy_required =
-                (qwen_native_moe || lfm2_native_moe) && w1w3_type == GGML_TYPE_Q5_K;
-            gateup_q8_ud->record_lfm2_w1w3_kernel = lfm2_native_moe;
+                (graph_plan.qwen_native_moe || graph_plan.lfm2_native_moe) && w1w3_type == GGML_TYPE_Q5_K;
+            gateup_q8_ud->record_lfm2_w1w3_kernel = graph_plan.lfm2_native_moe;
         }
         ggml_tensor* args[] = {raw_gate_exps, raw_up_exps, routed_input, selected_experts};
         hidden = ggml_custom_4d(ctx, GGML_TYPE_F32, raw_gate_exps->ne[1], n_expert_used, n_tokens, 1, args, 4,
                                 cb_qwen35_native_moe_gateup_raw_qxk_swiglu, native_moe_callback_tasks, gateup_q8_ud);
         ggml_set_name(hidden, "qwen35_native_moe_gateup_raw_qxk_swiglu");
-    } else if (qwen_native_moe || lfm2_native_moe) {
+    } else if (graph_plan.qwen_native_moe || graph_plan.lfm2_native_moe) {
         return reject_native_moe("w1w3_fast_callback_unavailable");
     } else {
         return reject_native_moe("unsupported_native_moe_graph");
@@ -4248,12 +4254,12 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     }
     ggml_tensor* fused_out = nullptr;
     Qwen35SharedQ8RowsUserData* hidden_q8_ud = nullptr;
-    ggml_tensor* fast_down_exps = qwen_native_moe ? raw_down_exps : down_exps;
+    ggml_tensor* fast_down_exps = graph_plan.qwen_native_moe ? raw_down_exps : down_exps;
     if (!graph_plan.lfm2_debug_reference &&
         CanFuseQwen35W2NormWeightsFromLogitsWithCustomCallback(model, fast_down_exps, hidden, selected_experts,
                                                                 gate_logits)) {
         hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden, selected_experts->ne[0] * selected_experts->ne[1]);
-        if (hidden_q8_ud && lfm2_native_moe) {
+        if (hidden_q8_ud && graph_plan.lfm2_native_moe) {
             hidden_q8_ud->work_ctx = GetCurrentWorkContext();
             hidden_q8_ud->debug_layer_idx = layer_idx;
             hidden_q8_ud->requested_task_count = native_moe_callback_tasks;
@@ -4269,8 +4275,8 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         fused_out = ggml_custom_4d(ctx, GGML_TYPE_F32, fast_down_exps->ne[1], selected_experts->ne[1], 1, 1, args, 4,
                                    cb_qwen35_native_moe_down_q5k_weighted_logits, native_moe_callback_tasks,
                                    hidden_q8_ud);
-        ggml_set_name(fused_out, lfm2_native_moe ? "lfm2_native_moe_down_qxk_fast_weighted_logits"
-                                                 : "qwen35_native_moe_down_q5k_fast_weighted_logits");
+        ggml_set_name(fused_out, graph_plan.lfm2_native_moe ? "lfm2_native_moe_down_qxk_fast_weighted_logits"
+                                                            : "qwen35_native_moe_down_q5k_fast_weighted_logits");
     }
     if (fused_out) {
         ggml_build_forward_expand(gf, fused_out);
@@ -4281,7 +4287,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     }
 
     ggml_tensor* weights = nullptr;
-    if (lfm2_native_moe) {
+    if (graph_plan.lfm2_native_moe) {
         routing_probs = ggml_reshape_3d(ctx, routing_probs, 1, n_experts, n_tokens);
         weights = ggml_get_rows(ctx, routing_probs, selected_experts);
         ggml_set_name(weights, "lfm2_native_moe_weights");
@@ -4358,7 +4364,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         ggml_set_name(experts, "qwen35_native_moe_down_q5k_fast");
     }
     if (!experts) {
-        if (qwen_native_moe || lfm2_native_moe) {
+        if (graph_plan.qwen_native_moe || graph_plan.lfm2_native_moe) {
             return reject_native_moe("w2_fast_callback_unavailable");
         }
         if (IsQwen35NativeMoEDownQ5KDiagEnabled()) {
@@ -4858,11 +4864,30 @@ static int ResolveTaskCount(const BatchSpec* batch, int work_items) {
     return std::max(1, n_tasks);
 }
 
-static int ResolveNativeMoEGraphCallbackTaskCount(const TransformerModel* model, const BatchSpec* batch,
-                                                  InferenceExecutionPhase phase, int64_t n_tokens, int top_k) {
+struct NativeMoEGraphCallbackTaskPlan {
+    bool use_per_op_task_count = false;
+    int work_items = 0;
+};
+
+static NativeMoEGraphCallbackTaskPlan ResolveNativeMoEGraphCallbackTaskPlan(const TransformerModel* model,
+                                                                            InferenceExecutionPhase phase,
+                                                                            int64_t n_tokens, int top_k) {
+    NativeMoEGraphCallbackTaskPlan plan;
     if (model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv &&
         phase == InferenceExecutionPhase::Decode && n_tokens == 1 && top_k > 1) {
-        return ResolveTaskCount(batch, /*work_items=*/0);
+        plan.use_per_op_task_count = true;
+        // LFM2 high-topK decode keeps all configured workers available; zero means no work-item cap.
+        plan.work_items = 0;
+    }
+    return plan;
+}
+
+static int ResolveNativeMoEGraphCallbackTaskCount(const TransformerModel* model, const BatchSpec* batch,
+                                                  InferenceExecutionPhase phase, int64_t n_tokens, int top_k) {
+    const NativeMoEGraphCallbackTaskPlan plan =
+        ResolveNativeMoEGraphCallbackTaskPlan(model, phase, n_tokens, top_k);
+    if (plan.use_per_op_task_count) {
+        return ResolveTaskCount(batch, plan.work_items);
     }
     return GGML_N_TASKS_MAX;
 }
@@ -5821,6 +5846,11 @@ struct GemvUserData {
     int lfm2_argmax_best_token = -1;
     float lfm2_argmax_best_value = -std::numeric_limits<float>::infinity();
     std::chrono::steady_clock::time_point lfm2_argmax_begin{};
+    uintptr_t lfm2_argmax_q6k_cache_weight = 0;
+    int lfm2_argmax_q6k_cache_nth = 0;
+    int lfm2_argmax_q6k_cache_k = 0;
+    int lfm2_argmax_q6k_cache_n = 0;
+    std::vector<std::shared_ptr<void>> lfm2_argmax_q6k_slice_cache;
 };
 
 struct GemvBatchedUserData {
@@ -6250,12 +6280,20 @@ struct LFM2ShortConvUserData {
     const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
     Qwen36ProfileCounters* profile = nullptr;
     InferenceWorkContext* work_ctx = nullptr;
+    std::shared_ptr<densecore::kernels::Q4KRepackedGemvWeight> decode_in_proj_q4k_packed;
+    const void* decode_in_proj_weight_data = nullptr;
+    int decode_in_proj_rows = 0;
+    int decode_in_proj_cols = 0;
     std::shared_ptr<densecore::kernels::Q4KRepackedGemvWeight> decode_out_proj_q4k_packed;
     const void* decode_out_proj_weight_data = nullptr;
     int decode_out_proj_rows = 0;
     int decode_out_proj_cols = 0;
+    std::vector<float> decode_bcx;
+    std::vector<uint8_t> decode_input_q8;
     std::vector<float> decode_y;
     std::vector<uint8_t> decode_y_q8;
+    std::atomic<uint64_t> decode_in_proj_ready_stamp{0};
+    std::atomic<int> decode_in_proj_done{0};
     std::atomic<uint64_t> decode_y_stamp{0};
     std::atomic<uint64_t> decode_out_proj_stamp{0};
 };

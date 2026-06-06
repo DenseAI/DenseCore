@@ -62,6 +62,10 @@ struct ModelGraphCapabilities {
     bool requires_shared_dense_ffn = false;
     bool requires_moe_down_scale_sidecar = false;
     bool requires_ffn_post_norms = false;
+    bool requires_fallback_free_fast_path = false;
+    bool requires_native_moe_fast_path = false;
+    bool requires_decode_graph_runtime_rebind = false;
+    int64_t native_moe_max_direct_tokens = 0;
     std::vector<DecoderMoERouter> required_moe_routers;
     std::vector<DecoderActivation> required_ffn_activations;
     std::vector<DecoderRopeKind> required_rope_kinds;

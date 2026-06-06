@@ -590,6 +590,9 @@ namespace testing {
     extern void CbSsmQwen35DeltaTest(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
                                      const struct ggml_tensor* c, int ith, int nth, void* userdata);
     extern int GetArmQ4KNativeVecDotModeTest();
+    extern bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle);
+    extern bool RunQwen36SSMQ8RepackedBatchedWideForTest(int nth, bool* output_matches_vecdot_oracle,
+                                                         uint64_t* true_gemm_ops, uint64_t* gemv_ops);
 }
 }
 
@@ -1069,6 +1072,146 @@ TEST(Qwen35SSMQkvProjection, CallbackChunkedPrefillMatchesUnchunkedStateAndOutpu
     EXPECT_EQ(HashFloatVector(unchunked_state), HashFloatVector(chunked_state));
 }
 
+TEST(Qwen35SSMQkvProjection, Qwen35OfficialCallbackAcceptsPrecomputedScalarFastPath) {
+    constexpr int nEmbd = 4;
+    constexpr int nHeads = 4;
+    constexpr int nGroups = 2;
+    constexpr int headDimK = 2;
+    constexpr int headDimV = 3;
+    constexpr int dInner = nHeads * headDimV;
+    constexpr int convChannels = dInner + 2 * nGroups * headDimK;
+    constexpr int tokens = 2;
+    constexpr int stateElems = nHeads * headDimK * headDimV;
+    constexpr int alphaBetaRows = 2 * nHeads + 3 * nGroups;
+
+    std::vector<float> z(static_cast<size_t>(tokens) * dInner);
+    std::vector<float> qkv(static_cast<size_t>(tokens) * convChannels);
+    std::vector<float> input(static_cast<size_t>(tokens) * nEmbd);
+    std::vector<float> alpha(static_cast<size_t>(nHeads) * nEmbd);
+    std::vector<float> beta(static_cast<size_t>(nHeads) * nEmbd);
+    std::vector<float> dt_bias(static_cast<size_t>(nHeads));
+    std::vector<float> a_log(static_cast<size_t>(nHeads));
+    std::vector<float> norm(static_cast<size_t>(headDimV));
+    std::vector<float> state_ref(static_cast<size_t>(stateElems));
+    std::vector<float> state_fast(static_cast<size_t>(stateElems));
+    std::vector<float> alpha_beta(static_cast<size_t>(tokens) * alphaBetaRows, 0.0f);
+
+    for (size_t i = 0; i < z.size(); ++i) z[i] = 0.04f * std::sin(static_cast<float>(i + 1));
+    for (size_t i = 0; i < qkv.size(); ++i) qkv[i] = 0.03f * std::cos(static_cast<float>(i + 2));
+    for (size_t i = 0; i < input.size(); ++i) input[i] = 0.05f * std::sin(static_cast<float>(i + 3) * 0.7f);
+    for (size_t i = 0; i < alpha.size(); ++i) alpha[i] = 0.02f * std::cos(static_cast<float>(i + 4) * 0.5f);
+    for (size_t i = 0; i < beta.size(); ++i) beta[i] = 0.015f * std::sin(static_cast<float>(i + 5) * 0.3f);
+    for (int h = 0; h < nHeads; ++h) {
+        dt_bias[static_cast<size_t>(h)] = -0.14f + 0.01f * static_cast<float>(h);
+        a_log[static_cast<size_t>(h)] = -1.05f - 0.025f * static_cast<float>(h);
+    }
+    for (int v = 0; v < headDimV; ++v) {
+        norm[static_cast<size_t>(v)] = 1.0f + 0.02f * static_cast<float>(v);
+    }
+    for (size_t i = 0; i < state_ref.size(); ++i) {
+        state_ref[i] = 0.025f * std::sin(static_cast<float>(i + 6) * 0.4f);
+    }
+    state_fast = state_ref;
+
+    for (int t = 0; t < tokens; ++t) {
+        const float* input_t = input.data() + static_cast<size_t>(t) * nEmbd;
+        float* out_t = alpha_beta.data() + static_cast<size_t>(t) * alphaBetaRows;
+        for (int h = 0; h < nHeads; ++h) {
+            float alpha_dot = 0.0f;
+            float beta_dot = 0.0f;
+            for (int i = 0; i < nEmbd; ++i) {
+                alpha_dot += alpha[static_cast<size_t>(h) * nEmbd + i] * input_t[i];
+                beta_dot += beta[static_cast<size_t>(h) * nEmbd + i] * input_t[i];
+            }
+            out_t[h] = dt_bias[static_cast<size_t>(h)] + alpha_dot;
+            out_t[nHeads + h] = beta_dot;
+        }
+
+        const float* qkv_t = qkv.data() + static_cast<size_t>(t) * convChannels;
+        const float* q_base = qkv_t;
+        const float* k_base = qkv_t + nGroups * headDimK;
+        float* qk_out = out_t + 2 * nHeads;
+        for (int g = 0; g < nGroups; ++g) {
+            const float* q_head = q_base + static_cast<size_t>(g) * headDimK;
+            const float* k_head = k_base + static_cast<size_t>(g) * headDimK;
+            float q_sum_sq = 0.0f;
+            float k_sum_sq = 0.0f;
+            float qk_dot = 0.0f;
+            for (int i = 0; i < headDimK; ++i) {
+                q_sum_sq += q_head[i] * q_head[i];
+                k_sum_sq += k_head[i] * k_head[i];
+                qk_dot += q_head[i] * k_head[i];
+            }
+            const float q_inv_norm = 1.0f / std::max(std::sqrt(q_sum_sq), 1e-6f);
+            const float k_inv_norm = 1.0f / std::max(std::sqrt(k_sum_sq), 1e-6f);
+            qk_out[g] = q_inv_norm;
+            qk_out[nGroups + g] = k_inv_norm;
+            qk_out[2 * nGroups + g] = qk_dot * q_inv_norm * k_inv_norm;
+        }
+    }
+
+    auto init_tensor = [](ggml_tensor* tensor, void* data, ggml_type type, int64_t ne0, int64_t ne1) {
+        *tensor = {};
+        tensor->data = data;
+        tensor->type = type;
+        tensor->ne[0] = ne0;
+        tensor->ne[1] = ne1;
+        tensor->nb[0] = sizeof(float);
+        tensor->nb[1] = ne0 * sizeof(float);
+    };
+    auto init_userdata = [&](SSMQwen35DeltaUserData* ud, float* state_ptr) {
+        *ud = {};
+        ud->alpha_weight = alpha.data();
+        ud->beta_weight = beta.data();
+        ud->dt_bias = dt_bias.data();
+        ud->a_log = a_log.data();
+        ud->norm_weight = norm.data();
+        ud->ssm_state = state_ptr;
+        ud->n_embd = nEmbd;
+        ud->d_inner = dInner;
+        ud->n_heads = nHeads;
+        ud->head_dim_v = headDimV;
+        ud->head_dim_k = headDimK;
+        ud->n_groups = nGroups;
+        ud->norm_layout = Qwen35SSMNormLayout::SHARED_HEAD_DIM;
+        ud->norm_eps = 1e-6f;
+        ud->layer_idx = 0;
+        ud->ssm_ordinal = -1;
+        ud->projection_profile = Qwen35SSMQkvProjectionProfile::QWEN35_OFFICIAL;
+    };
+
+    ggml_tensor a = {};
+    ggml_tensor b = {};
+    ggml_tensor c = {};
+    ggml_tensor dst = {};
+    ggml_tensor alpha_beta_tensor = {};
+    std::vector<float> out_ref(static_cast<size_t>(tokens) * dInner, 0.0f);
+    std::vector<float> out_fast(static_cast<size_t>(tokens) * dInner, 0.0f);
+
+    init_tensor(&a, z.data(), GGML_TYPE_F32, dInner, tokens);
+    init_tensor(&b, qkv.data(), GGML_TYPE_F32, convChannels, tokens);
+    init_tensor(&c, input.data(), GGML_TYPE_F32, nEmbd, tokens);
+    init_tensor(&alpha_beta_tensor, alpha_beta.data(), GGML_TYPE_F32, alphaBetaRows, tokens);
+
+    SSMQwen35DeltaUserData ref_ud{};
+    init_userdata(&ref_ud, state_ref.data());
+    init_tensor(&dst, out_ref.data(), GGML_TYPE_F32, dInner, tokens);
+    densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &ref_ud);
+
+    SSMQwen35DeltaUserData fast_ud{};
+    init_userdata(&fast_ud, state_fast.data());
+    fast_ud.alpha_beta_tensor = &alpha_beta_tensor;
+    init_tensor(&dst, out_fast.data(), GGML_TYPE_F32, dInner, tokens);
+    densecore::testing::CbSsmQwen35DeltaTest(&dst, &a, &b, &c, 0, 1, &fast_ud);
+
+    for (size_t i = 0; i < state_ref.size(); ++i) {
+        EXPECT_NEAR(state_fast[i], state_ref[i], 1e-6f) << "state mismatch at index " << i;
+    }
+    for (size_t i = 0; i < out_ref.size(); ++i) {
+        EXPECT_NEAR(out_fast[i], out_ref[i], 1e-6f) << "output mismatch at index " << i;
+    }
+}
+
 // ============================================================================
 // TEST: Legacy env no longer disables maintained ARM Q4K fast path.
 //
@@ -1456,6 +1599,77 @@ TEST(Qwen35SSMQkvProjection, Qwen36HybridSSMQ4KPrefillUsesDenseCoreInsteadOfRepa
 
     const auto snapshot = GetQwen36ProfileSnapshot(work_ctx);
     EXPECT_EQ(snapshot.qwen_target_ggml_compute_ops, 0u);
+    EXPECT_GT(snapshot.q8_batched_used_ops, 0u);
+    EXPECT_EQ(snapshot.q8_batched_true_gemm_ops, 0u);
+    EXPECT_GT(snapshot.q8_batched_gemv_ops, 0u);
+}
+
+TEST(Qwen35SSMQkvProjection, Qwen35HybridSSMOutQ8PrefillUsesDenseCoreDirectPath) {
+    struct ggml_init_params params = {
+        .mem_size = 1024 * 1024 * 32,
+        .mem_buffer = nullptr,
+        .no_alloc = false,
+    };
+    struct ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    InferenceWorkContext* work_ctx = CreateInferenceWorkContext();
+    ASSERT_NE(work_ctx, nullptr);
+    SetCurrentWorkContext(work_ctx);
+    struct Guard {
+        InferenceWorkContext* work_ctx;
+        struct ggml_context* ctx;
+        ~Guard() {
+            SetCurrentWorkContext(nullptr);
+            DestroyInferenceWorkContext(work_ctx);
+            ggml_free(ctx);
+        }
+    } guard{work_ctx, ctx};
+
+    TransformerModel model;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+
+    constexpr int input_dim = QK8_0 * 4;
+    constexpr int output_dim = 64;
+    constexpr int batch_cols = 8;
+
+    ggml_tensor* weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, input_dim, output_dim);
+    ASSERT_NE(weight, nullptr);
+    ggml_set_name(weight, "blk.0.ssm_out.weight");
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input_dim, batch_cols);
+    ASSERT_NE(input, nullptr);
+
+    TestRng rng(20260607);
+    FillQuantizedRows(weight, rng.Uniform(static_cast<size_t>(input_dim) * output_dim, 0.25f), input_dim,
+                      output_dim);
+    std::vector<float> input_f32 = rng.Uniform(static_cast<size_t>(input_dim) * batch_cols, 0.125f);
+    std::memcpy(input->data, input_f32.data(), input_f32.size() * sizeof(float));
+
+    ggml_tensor* result = densecore::testing::SmartMulMatTest(ctx, weight, input, &model);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->op, GGML_OP_CUSTOM);
+    EXPECT_TRUE(ResultReferencesTensor(result, weight));
+
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, result);
+    ggml_graph_compute_with_ctx(ctx, gf, 4);
+
+    ggml_tensor* expected = ggml_mul_mat(ctx, weight, input);
+    ASSERT_NE(expected, nullptr);
+    ggml_cgraph* gf_expected = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf_expected, expected);
+    ggml_graph_compute_with_ctx(ctx, gf_expected, 4);
+
+    const auto* got = reinterpret_cast<const float*>(result->data);
+    const auto* ref = reinterpret_cast<const float*>(expected->data);
+    const size_t elem_count = static_cast<size_t>(output_dim) * batch_cols;
+    for (size_t i = 0; i < elem_count; ++i) {
+        EXPECT_NEAR(got[i], ref[i], 2e-4f) << "index=" << i;
+    }
+
+    const auto snapshot = GetQwen36ProfileSnapshot(work_ctx);
+    EXPECT_EQ(snapshot.qwen_target_ggml_compute_ops, 0u);
 }
 
 TEST(Qwen35SSMQkvProjection, LFM2PrefillQ4KAliasRestoresRawWeightForBatchedAdmission) {
@@ -1739,6 +1953,24 @@ TEST(Qwen35SSMQkvProjection, Qwen36SSMQ8PrefillUsesDenseCoreBatchedPath) {
     const auto snapshot = GetQwen36ProfileSnapshot(work_ctx);
     EXPECT_EQ(snapshot.qwen_target_ggml_compute_ops, 0u);
 }
+
+TEST(Qwen35SSMQkvProjection, QwenHybridSSMQ8RepackedBatchedMatchesVecDotOracle) {
+    bool matches = false;
+    ASSERT_TRUE(densecore::testing::RunQwen36SSMQ8RepackedBatchedDirectForTest(4, &matches));
+    EXPECT_TRUE(matches);
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+TEST(Qwen35SSMQkvProjection, QwenHybridSSMQ8WideShapeUsesTrueGemmOnArm) {
+    bool matches = false;
+    uint64_t true_gemm_ops = 0;
+    uint64_t gemv_ops = 0;
+    ASSERT_TRUE(densecore::testing::RunQwen36SSMQ8RepackedBatchedWideForTest(16, &matches, &true_gemm_ops, &gemv_ops));
+    EXPECT_TRUE(matches);
+    EXPECT_GT(true_gemm_ops, 0u);
+    EXPECT_EQ(gemv_ops, 0u);
+}
+#endif
 
 TEST(Qwen35SSMQkvProjection, Qwen35SSMOutPrefillDependsOnGeneratedDeltaInput) {
     struct ggml_init_params params = {

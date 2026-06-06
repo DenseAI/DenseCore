@@ -27,7 +27,7 @@ bool ParseLegacyEnabledBool(const char* name, bool default_value) {
 Qwen36SSMQ8PrefillAMXMode ParseQwen36SSMQ8PrefillAMXMode(const char* value) {
     const std::string mode = env::AsciiLowerCopy(value);
     if (mode.empty()) {
-        return Qwen36SSMQ8PrefillAMXMode::Probe;
+        return Qwen36SSMQ8PrefillAMXMode::Off;
     }
     if (mode == "probe" || mode == "auto") {
         return Qwen36SSMQ8PrefillAMXMode::Probe;
@@ -279,8 +279,10 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
     config.qwen36_prefill_q4k_batched = Qwen36PrefillQ4KBatchedMode::On;
     config.qwen36_ssm_q8_amx_alias =
         ParseRuntimeToggleEnvFailClosed("DENSECORE_QWEN36_SSM_Q8_AMX_ALIAS", env::RuntimeToggleMode::Off);
-    config.qwen36_ssm_q8_prefill_amx =
-        ParseQwen36SSMQ8PrefillAMXMode(std::getenv("DENSECORE_QWEN36_SSM_Q8_PREFILL_AMX"));
+    // Retired from maintained fast-path selection: the old Qwen3.6 Q8 prefill
+    // AMX alias probe delegated back to GGML and polluted fallback-free
+    // telemetry with alias_unavailable rejects on C4A.
+    config.qwen36_ssm_q8_prefill_amx = Qwen36SSMQ8PrefillAMXMode::Off;
     config.qwen36_ssm_q8_prefill_amx_min_tokens =
         env::ParsePositiveEnvInt("DENSECORE_QWEN36_SSM_Q8_PREFILL_AMX_MIN_TOKENS", 256);
     config.qwen36_expert_cpu_repack =

@@ -106,6 +106,10 @@ bool RunQ4KRepackedMoEProjection(CpuBackend* backend, const void* weight_ptr, co
 bool RunQ6KRepackedMoEProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
                                  size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
                                  int64_t input_cols, int numa_node, bool allow_parallel);
+bool RunQ6KRepackedMoEProjectionCached(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
+                                       size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
+                                       int64_t input_cols, int numa_node, bool allow_parallel,
+                                       std::shared_ptr<void>* packed_cache);
 bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gate_weight_ptr,
                                             const void* up_weight_ptr, const float* input_data,
                                             const uint8_t* qinput_data, size_t qinput_row_bytes, float* output_data,

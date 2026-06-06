@@ -172,6 +172,45 @@ bool CanUseGgmlQuantizedMoEPrefillBatch(const CpuBackend::ExpertWeights& exp, in
     return true;
 }
 
+struct MoEQuantPrefillAdmissionPlan {
+    InferenceWorkContext* work_ctx = nullptr;
+    const char* reject_reason = "none";
+    bool enabled = false;
+    bool forced = false;
+    bool batch_safe = false;
+    bool ggml_quantized_vecdot_safe = false;
+    bool force_fast_path = false;
+};
+
+MoEQuantPrefillAdmissionPlan ResolveMoEQuantPrefillAdmissionPlan(
+    const CpuBackend::ExpertWeights& expert, int64_t batch, int64_t hidden_dim, int64_t intermediate_dim,
+    bool safe_reference_mode, bool enabled, bool forced) {
+    MoEQuantPrefillAdmissionPlan plan;
+    plan.work_ctx = GetCurrentWorkContext();
+    plan.enabled = enabled;
+    plan.forced = forced;
+    plan.batch_safe =
+        enabled && CanUseGgmlQuantizedMoEPrefillBatch(expert, batch, hidden_dim, intermediate_dim,
+                                                      safe_reference_mode, &plan.reject_reason);
+    plan.ggml_quantized_vecdot_safe = batch == 1 || plan.batch_safe;
+    plan.force_fast_path = forced && plan.batch_safe;
+    return plan;
+}
+
+MoEQuantPrefillAdmissionPlan ResolveGemma4MoEPrefillAdmissionPlan(const TransformerModel* model,
+                                                                  const CpuBackend::ExpertWeights& expert,
+                                                                  int64_t batch, int64_t hidden_dim,
+                                                                  int64_t intermediate_dim,
+                                                                  bool safe_reference_mode) {
+    const bool prefill_phase =
+        GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill || GetCurrentWorkContext() == nullptr;
+    const bool enabled =
+        prefill_phase && model && model->arch_flags.is_gemma4 && IsGemma4MoEPrefillQuantBatchEnabled(model);
+    const bool forced = prefill_phase && IsGemma4MoEPrefillQuantBatchForcedOn(model);
+    return ResolveMoEQuantPrefillAdmissionPlan(expert, batch, hidden_dim, intermediate_dim, safe_reference_mode,
+                                               enabled, forced);
+}
+
 bool CanUseQ5KRepackedMoEGemvFastPath() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return ggml_cpu_has_neon() && ggml_cpu_has_dotprod();
@@ -257,15 +296,9 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     const bool enable_inner_parallel =
         allow_inner_parallel && ShouldParallelizeExpertFFNInner(batch, hidden_dim, intermediate_dim);
     const bool safe_reference_mode = IsMoESafeReferenceModeEnabled(&expert);
-    const char* gemma4_quant_prefill_reject_reason = "none";
-    const bool gemma4_quant_prefill_batch_safe =
-        allow_gemma4_quant_prefill_batch &&
-        CanUseGgmlQuantizedMoEPrefillBatch(expert, batch, hidden_dim, intermediate_dim, safe_reference_mode,
-                                           &gemma4_quant_prefill_reject_reason);
-    const bool ggml_quantized_vecdot_safe = batch == 1 || gemma4_quant_prefill_batch_safe;
-    const bool force_gemma4_quant_prefill_fast_path =
-        force_gemma4_quant_prefill_batch && gemma4_quant_prefill_batch_safe;
-    InferenceWorkContext* gemma4_quant_prefill_ctx = GetCurrentWorkContext();
+    const MoEQuantPrefillAdmissionPlan quant_prefill_plan = ResolveMoEQuantPrefillAdmissionPlan(
+        expert, batch, hidden_dim, intermediate_dim, safe_reference_mode, allow_gemma4_quant_prefill_batch,
+        force_gemma4_quant_prefill_batch);
 
     hidden_scratch.Resize(backend, hidden_size);
     Tensor hidden = Tensor::Make2D(hidden_scratch.ptr, batch, intermediate_dim);
@@ -280,21 +313,21 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     fused_gate_up_request.hidden = &hidden;
     fused_gate_up_request.expert = &expert;
     fused_gate_up_request.input_projection_cache = input_projection_cache;
-    fused_gate_up_request.gemma4_quant_prefill_ctx = gemma4_quant_prefill_ctx;
+    fused_gate_up_request.gemma4_quant_prefill_ctx = quant_prefill_plan.work_ctx;
     fused_gate_up_request.intermediate_dim = intermediate_dim;
     fused_gate_up_request.hidden_dim = hidden_dim;
     fused_gate_up_request.safe_reference_mode = safe_reference_mode;
-    fused_gate_up_request.ggml_quantized_vecdot_safe = ggml_quantized_vecdot_safe;
-    fused_gate_up_request.gemma4_quant_prefill_batch_safe = gemma4_quant_prefill_batch_safe;
-    fused_gate_up_request.force_gemma4_quant_prefill_fast_path = force_gemma4_quant_prefill_fast_path;
+    fused_gate_up_request.ggml_quantized_vecdot_safe = quant_prefill_plan.ggml_quantized_vecdot_safe;
+    fused_gate_up_request.gemma4_quant_prefill_batch_safe = quant_prefill_plan.batch_safe;
+    fused_gate_up_request.force_gemma4_quant_prefill_fast_path = quant_prefill_plan.force_fast_path;
     fused_gate_up_request.enable_inner_parallel = enable_inner_parallel;
 
     const MoEFusedGateUpPlan fused_gate_up_plan = ResolveMoEFusedGateUpPlan(fused_gate_up_request);
     const bool used_fused_gate_up = EmitMoEFusedGateUpFromPlan(fused_gate_up_request, fused_gate_up_plan);
     if (!used_fused_gate_up && fused_gate_up_plan.requires_unfused_gate_projection) {
         if (fused_gate_up_plan.force_quant_prefill_failure) {
-            RecordGemma4MoEPrefillQuantBatchDecision(gemma4_quant_prefill_ctx, false, false, "gate_up_fast_path_failed",
-                                                     true, false);
+            RecordGemma4MoEPrefillQuantBatchDecision(quant_prefill_plan.work_ctx, false, false,
+                                                     "gate_up_fast_path_failed", true, false);
             throw std::runtime_error("Gemma4 MoE prefill quant batch gate/up fast path failed");
         }
         gate_scratch.Resize(backend, hidden_size);
@@ -308,11 +341,11 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     projection_context.down_projection_cache = &local_down_projection_cache;
     projection_context.expert = &expert;
     projection_context.trace_ctx = trace_ctx;
-    projection_context.gemma4_quant_prefill_ctx = gemma4_quant_prefill_ctx;
+    projection_context.gemma4_quant_prefill_ctx = quant_prefill_plan.work_ctx;
     projection_context.safe_reference_mode = safe_reference_mode;
-    projection_context.ggml_quantized_vecdot_safe = ggml_quantized_vecdot_safe;
-    projection_context.force_gemma4_quant_prefill_fast_path = force_gemma4_quant_prefill_fast_path;
-    projection_context.gemma4_quant_prefill_batch_safe = gemma4_quant_prefill_batch_safe;
+    projection_context.ggml_quantized_vecdot_safe = quant_prefill_plan.ggml_quantized_vecdot_safe;
+    projection_context.force_gemma4_quant_prefill_fast_path = quant_prefill_plan.force_fast_path;
+    projection_context.gemma4_quant_prefill_batch_safe = quant_prefill_plan.batch_safe;
     projection_context.enable_inner_parallel = enable_inner_parallel;
 
     std::chrono::steady_clock::duration w1_duration{};
@@ -647,6 +680,11 @@ bool RunQ4KRepackedMoEProjection(CpuBackend* backend, const void* weight_ptr, co
         RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "unsupported_shape");
         return false;
     }
+    if (GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill) {
+        RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false,
+                                     "prefill_uses_raw_batched");
+        return false;
+    }
     auto packed = GetOrCreateQ4KRepackedMoEWeight(weight_ptr, cols, input_cols);
     if (!packed) {
         RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "pack_failed");
@@ -683,6 +721,40 @@ bool RunQ6KRepackedMoEProjection(CpuBackend* backend, const void* weight_ptr, co
     return true;
 }
 
+bool RunQ6KRepackedMoEProjectionCached(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
+                                       size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
+                                       int64_t input_cols, int numa_node, bool allow_parallel,
+                                       std::shared_ptr<void>* packed_cache) {
+    if (!backend || !weight_ptr || !qinput_data || !output_data || rows <= 0 || cols <= 0 || input_cols <= 0 ||
+        (cols % 8) != 0 || (input_cols % ggml_blck_size(GGML_TYPE_Q6_K)) != 0) {
+        return false;
+    }
+    std::shared_ptr<Q6KRepackedMoEWeight> packed;
+    if (packed_cache && *packed_cache) {
+        packed = std::static_pointer_cast<Q6KRepackedMoEWeight>(*packed_cache);
+        if (!packed || packed->weight_ptr != weight_ptr || packed->rows != cols || packed->cols != input_cols) {
+            packed.reset();
+            packed_cache->reset();
+        }
+    }
+    if (!packed) {
+        packed = GetOrCreateQ6KRepackedMoEWeight(weight_ptr, cols, input_cols);
+        if (!packed) {
+            return false;
+        }
+        if (packed_cache) {
+            *packed_cache = packed;
+        }
+    }
+    if (!RunQ6KRepackedMoEGemv(backend, packed, qinput_data, qinput_row_bytes, output_data, rows, cols, numa_node,
+                               allow_parallel)) {
+        return false;
+    }
+    LogMoEMatmulPath("ggml_q6k_repacked_moe_projection_cached", static_cast<int>(rows),
+                     static_cast<int>(input_cols), static_cast<int>(cols), 0, allow_parallel);
+    return true;
+}
+
 bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gate_weight_ptr,
                                             const void* up_weight_ptr, const float* input_data,
                                             const uint8_t* qinput_data, size_t qinput_row_bytes, float* output_data,
@@ -693,6 +765,11 @@ bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gat
         cols <= 0 || input_cols <= 0 || (cols % 8) != 0 ||
         (input_cols % ggml_blck_size(GGML_TYPE_Q4_K)) != 0 || (rows >= 4 && !input_data)) {
         RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "unsupported_shape");
+        return false;
+    }
+    if (GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill) {
+        RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false,
+                                     "prefill_uses_raw_batched");
         return false;
     }
     auto gate_packed = GetOrCreateQ4KRepackedMoEWeight(gate_weight_ptr, cols, input_cols);
@@ -1650,28 +1727,20 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             const auto dequant_begin =
                 debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> cached_entry;
-            const bool prefill_phase =
-                GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill || GetCurrentWorkContext() == nullptr;
-            const bool gemma4_quant_prefill_enabled =
-                prefill_phase && model && model->arch_flags.is_gemma4 && IsGemma4MoEPrefillQuantBatchEnabled(model);
-            const bool gemma4_quant_prefill_forced = prefill_phase && IsGemma4MoEPrefillQuantBatchForcedOn(model);
-            const char* gemma4_quant_prefill_reject_reason = "none";
-            const bool can_use_gemma4_quant_prefill_batch =
-                gemma4_quant_prefill_enabled &&
-                CanUseGgmlQuantizedMoEPrefillBatch(exp, work.count, static_cast<int64_t>(hidden_dim),
-                                                   static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode,
-                                                   &gemma4_quant_prefill_reject_reason);
-            if (gemma4_quant_prefill_enabled && work.count > 1) {
+            const MoEQuantPrefillAdmissionPlan quant_prefill_plan = ResolveGemma4MoEPrefillAdmissionPlan(
+                model, exp, work.count, static_cast<int64_t>(hidden_dim), static_cast<int64_t>(exp.intermediate_dim),
+                safe_reference_mode);
+            if (quant_prefill_plan.enabled && work.count > 1) {
                 RecordGemma4MoEPrefillQuantBatchDecision(
-                    GetCurrentWorkContext(), true, false,
-                    can_use_gemma4_quant_prefill_batch ? nullptr : gemma4_quant_prefill_reject_reason, false, false);
-                if (gemma4_quant_prefill_forced && !can_use_gemma4_quant_prefill_batch) {
+                    quant_prefill_plan.work_ctx, true, false,
+                    quant_prefill_plan.batch_safe ? nullptr : quant_prefill_plan.reject_reason, false, false);
+                if (quant_prefill_plan.forced && !quant_prefill_plan.batch_safe) {
                     throw std::runtime_error(std::string("Gemma4 MoE prefill quant batch rejected: ") +
-                                             gemma4_quant_prefill_reject_reason);
+                                             quant_prefill_plan.reject_reason);
                 }
             }
             const bool should_try_cache =
-                dequant_cache_enabled && !can_use_gemma4_quant_prefill_batch &&
+                dequant_cache_enabled && !quant_prefill_plan.batch_safe &&
                 (cache_all_active_experts || work.local_hot ||
                  previous_batch_set.find(work.expert_id) != previous_batch_set.end() || work.count > 1);
             const size_t cacheable_bytes = GetMoEExpertDequantCacheBytes(exp, safe_reference_mode);
@@ -1713,7 +1782,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                     !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp) &&
                     (!exp.w2_scale_tensor || IsScalarScaleSidecar(exp.w2_scale_tensor)) &&
                     work.count <= kMoEQuantizedProjectionMaxBatch &&
-                    (work.count == 1 || can_use_gemma4_quant_prefill_batch);
+                    (work.count == 1 || quant_prefill_plan.batch_safe);
                 if (!can_use_ggml_quant_gen) {
                     w1 = MakeMoEWeightF32(this, exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr,
                                           static_cast<int64_t>(exp.intermediate_dim),
@@ -1770,7 +1839,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             }
             DispatchExpertFFNImpl(this, work.numa_node, expert_input, exp, w1, w2, w3, &expert_out,
                                   allow_inner_parallel, &trace_ctx, nullptr, profile,
-                                  can_use_gemma4_quant_prefill_batch, gemma4_quant_prefill_forced);
+                                  quant_prefill_plan.batch_safe, quant_prefill_plan.forced);
             if (profile) {
                 profile->expert_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                 std::chrono::steady_clock::now() - expert_profile_begin)
