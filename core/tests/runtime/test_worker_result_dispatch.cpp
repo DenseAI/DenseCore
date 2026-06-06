@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "densecore/models/model_execution_contract.h"
 #include "densecore/runtime/ggml_compute_policy.h"
 #include "runtime/worker_internal.h"
 #include "runtime/kernel_admission.h"
@@ -276,6 +277,138 @@ TEST(WorkerResultDispatchTest, QwenTargetRejectsTemporaryReferenceGgmlComputeByD
     EXPECT_TRUE(densecore::runtime::ShouldRejectQwenGgmlCompute(
         plan, "temporary_reference_generic_matmul_fallback"));
     EXPECT_TRUE(densecore::runtime::ShouldRejectQwenGgmlCompute(plan, "native_moe_w2_fast_node_missing"));
+}
+
+TEST(KernelResolutionPolicyTest, QwenHybridSSMQ4PrefillResolvesSemanticFallbackFreePath) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_experts = 128;
+
+    densecore::runtime::HostKernelCapabilities caps{};
+    caps.arm_sve2 = true;
+    caps.q4k_true_batched = true;
+    const auto resolution = densecore::runtime::ResolveKernelResolution(
+        &model, GGML_TYPE_Q4_K, GGML_TYPE_F32, /*m=*/192, /*n=*/4096, /*k=*/2048,
+        densecore::runtime::DenseCoreMatmulPhase::Prefill, "blk.0.attn_qkv.weight",
+        /*is_lm_head=*/false, /*compatible=*/true, caps);
+
+    EXPECT_EQ(resolution.semantic_op, densecore::runtime::DenseCoreSemanticOp::HybridSsmMixer);
+    EXPECT_EQ(resolution.tensor_role, densecore::runtime::DenseCoreTensorRole::HybridSSMQkv);
+    EXPECT_EQ(resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQ4KBatched);
+    EXPECT_EQ(resolution.host_backend, densecore::runtime::DenseCoreHostBackend::ArmSve2);
+    EXPECT_EQ(resolution.fallback_policy, densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+    EXPECT_EQ(resolution.rejected_count, 0);
+    EXPECT_STREQ(densecore::runtime::DenseCoreSemanticOpName(resolution.semantic_op), "hybrid_ssm_mixer");
+    EXPECT_STREQ(densecore::runtime::DenseCoreTensorRoleName(resolution.tensor_role), "hybrid_ssm_qkv");
+}
+
+TEST(KernelResolutionPolicyTest, QwenTargetGenericFallbackCarriesRejectionEvidence) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_experts = 128;
+
+    const auto resolution = densecore::runtime::ResolveKernelResolution(
+        &model, GGML_TYPE_Q4_K, GGML_TYPE_F16, /*m=*/1, /*n=*/4096, /*k=*/2048,
+        densecore::runtime::DenseCoreMatmulPhase::Decode, "blk.0.ssm_out.weight",
+        /*is_lm_head=*/false, /*compatible=*/false);
+
+    EXPECT_EQ(resolution.semantic_op, densecore::runtime::DenseCoreSemanticOp::HybridSsmMixer);
+    EXPECT_EQ(resolution.tensor_role, densecore::runtime::DenseCoreTensorRole::SSMOut);
+    EXPECT_EQ(resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::TemporaryReferenceGgml);
+    EXPECT_EQ(resolution.fallback_policy, densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+    ASSERT_GE(resolution.rejected_count, 2);
+    EXPECT_STREQ(resolution.rejected[0], "incompatible_shape");
+    EXPECT_STREQ(resolution.rejected[1], "unsupported_input_type");
+}
+
+TEST(KernelResolutionPolicyTest, LFM2ShortConvAndLmHeadExposeSemanticRoles) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_lfm2_shortconv = true;
+
+    const auto shortconv_resolution = densecore::runtime::ResolveKernelResolution(
+        &model, GGML_TYPE_Q5_K, GGML_TYPE_F32, /*m=*/1, /*n=*/2048, /*k=*/2048,
+        densecore::runtime::DenseCoreMatmulPhase::Decode, "blk.0.shortconv.out.weight",
+        /*is_lm_head=*/false, /*compatible=*/true);
+    EXPECT_EQ(shortconv_resolution.semantic_op, densecore::runtime::DenseCoreSemanticOp::Lfm2ShortConvMixer);
+    EXPECT_EQ(shortconv_resolution.tensor_role, densecore::runtime::DenseCoreTensorRole::ShortConvOut);
+    EXPECT_EQ(shortconv_resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQuantGemv);
+    EXPECT_EQ(shortconv_resolution.fallback_policy,
+              densecore::runtime::DenseCoreFallbackPolicyKind::CompatibilityFallback);
+
+    const auto lm_head_resolution = densecore::runtime::ResolveKernelResolution(
+        &model, GGML_TYPE_Q6_K, GGML_TYPE_F32, /*m=*/1, /*n=*/32000, /*k=*/2048,
+        densecore::runtime::DenseCoreMatmulPhase::Decode, "output.weight",
+        /*is_lm_head=*/true, /*compatible=*/true);
+    EXPECT_EQ(lm_head_resolution.semantic_op, densecore::runtime::DenseCoreSemanticOp::LmHead);
+    EXPECT_EQ(lm_head_resolution.tensor_role, densecore::runtime::DenseCoreTensorRole::LmHead);
+    EXPECT_EQ(lm_head_resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQuantGemv);
+}
+
+TEST(KernelResolutionPolicyTest, ContractRequirementOverridesKernelAndFallbackPolicy) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_experts = 4;
+
+    const auto requirement = densecore::models::ResolveModelTensorExecutionRequirement(
+        &model, "blk.0.ffn_gate_up_exps.weight", /*is_lm_head=*/false, GGML_TYPE_Q4_K);
+    ASSERT_EQ(requirement.tensor_role, densecore::runtime::DenseCoreTensorRole::MoEGateUp);
+    ASSERT_EQ(requirement.semantic_op, densecore::runtime::DenseCoreSemanticOp::MoeExpertDispatch);
+    ASSERT_EQ(requirement.prefill_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQwenMoeDirect);
+    ASSERT_EQ(requirement.fallback_policy, densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+
+    const auto resolution = densecore::runtime::ResolveKernelResolution(
+        &model, GGML_TYPE_Q4_K, GGML_TYPE_F32, /*m=*/192, /*n=*/4096, /*k=*/2048,
+        densecore::runtime::DenseCoreMatmulPhase::Prefill, "blk.0.ffn_gate_up_exps.weight",
+        /*is_lm_head=*/false, /*compatible=*/true, densecore::runtime::HostKernelCapabilities{},
+        requirement.semantic_op, requirement.tensor_role, requirement.prefill_kernel, requirement.fallback_policy,
+        /*has_fallback_policy_override=*/true);
+
+    EXPECT_EQ(resolution.semantic_op, densecore::runtime::DenseCoreSemanticOp::MoeExpertDispatch);
+    EXPECT_EQ(resolution.tensor_role, densecore::runtime::DenseCoreTensorRole::MoEGateUp);
+    EXPECT_EQ(resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQwenMoeDirect);
+    EXPECT_EQ(resolution.fallback_policy, densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+}
+
+TEST(KernelResolutionPolicyTest, TensorRoleHelpersClassifyProjectionFamilies) {
+    using densecore::runtime::DenseCoreTensorRole;
+
+    EXPECT_TRUE(densecore::runtime::IsHybridSsmTensorRole(DenseCoreTensorRole::HybridSSMQkv));
+    EXPECT_TRUE(densecore::runtime::IsHybridSsmTensorRole(DenseCoreTensorRole::HybridSSMGate));
+    EXPECT_TRUE(densecore::runtime::IsHybridSsmTensorRole(DenseCoreTensorRole::SSMOut));
+    EXPECT_FALSE(densecore::runtime::IsHybridSsmTensorRole(DenseCoreTensorRole::ShortConvIn));
+    EXPECT_EQ(densecore::runtime::HybridSsmProjectionKind(DenseCoreTensorRole::HybridSSMQkv), 1);
+    EXPECT_EQ(densecore::runtime::HybridSsmProjectionKind(DenseCoreTensorRole::HybridSSMGate), 2);
+    EXPECT_EQ(densecore::runtime::HybridSsmProjectionKind(DenseCoreTensorRole::SSMOut), 3);
+    EXPECT_EQ(densecore::runtime::HybridSsmProjectionKind(DenseCoreTensorRole::LmHead), 0);
+
+    EXPECT_TRUE(densecore::runtime::IsShortConvTensorRole(DenseCoreTensorRole::ShortConvIn));
+    EXPECT_TRUE(densecore::runtime::IsShortConvTensorRole(DenseCoreTensorRole::ShortConvOut));
+    EXPECT_TRUE(densecore::runtime::IsMoeExpertTensorRole(DenseCoreTensorRole::MoEGateUp));
+    EXPECT_TRUE(densecore::runtime::IsMoeExpertTensorRole(DenseCoreTensorRole::MoEDown));
+    EXPECT_FALSE(densecore::runtime::IsMoeExpertTensorRole(DenseCoreTensorRole::MoERouter));
+}
+
+TEST(KernelResolutionPolicyTest, ContractRequirementMakesLFM2ShortConvFallbackFree) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_lfm2_shortconv = true;
+
+    const auto requirement = densecore::models::ResolveModelTensorExecutionRequirement(
+        &model, "blk.0.shortconv_in_proj.weight", /*is_lm_head=*/false, GGML_TYPE_Q4_K);
+
+    EXPECT_EQ(requirement.semantic_op, densecore::runtime::DenseCoreSemanticOp::Lfm2ShortConvMixer);
+    EXPECT_EQ(requirement.tensor_role, densecore::runtime::DenseCoreTensorRole::ShortConvIn);
+    EXPECT_EQ(requirement.prefill_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQ4KBatched);
+    EXPECT_EQ(requirement.fallback_policy, densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
 }
 
 TEST(WorkerResultDispatchTest, DenseQwenDecodeSummaryRequiresTargetFastPath) {

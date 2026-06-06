@@ -1,6 +1,7 @@
 #include "densecore/models/model_execution_contract.h"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <sstream>
 
@@ -144,6 +145,122 @@ void AddRequiredFastPathCounter(ModelExecutionContract* contract, const char* co
     contract->required_fast_path_counters.push_back(counter);
 }
 
+bool IsFallbackFreeTargetModel(const TransformerModel* model) {
+    if (!model) {
+        return false;
+    }
+    if (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36 ||
+        model->variant == ModelVariant::GEMMA4 || model->variant == ModelVariant::LFM2MOE) {
+        return true;
+    }
+    if ((model->arch == ModelArch::QWEN35 && model->arch_flags.is_hybrid_ssm) ||
+        model->arch_flags.is_gemma4 || model->arch_flags.is_lfm2_shortconv) {
+        return true;
+    }
+    return false;
+}
+
+ExecutionQuantLayoutKind ResolveCanonicalLayout(const TransformerModel* model, const ggml_tensor* tensor,
+                                                densecore::runtime::DenseCoreTensorRole role) {
+    if (!tensor) {
+        return ExecutionQuantLayoutKind::Unknown;
+    }
+    if (model && model->int4_weight_bindings.find(tensor) != model->int4_weight_bindings.end()) {
+        return ExecutionQuantLayoutKind::PackedDenseCore;
+    }
+    if (role == densecore::runtime::DenseCoreTensorRole::ShortConvIn ||
+        role == densecore::runtime::DenseCoreTensorRole::ShortConvOut) {
+        return ExecutionQuantLayoutKind::LoaderCanonical;
+    }
+    return ExecutionQuantLayoutKind::RawGGUF;
+}
+
+densecore::runtime::DenseCoreKernelFamily ResolveRequiredKernelFamily(
+    ggml_type raw_type, densecore::runtime::DenseCoreMatmulPhase phase,
+    densecore::runtime::DenseCoreTensorRole role) {
+    using densecore::runtime::DenseCoreKernelFamily;
+    using densecore::runtime::DenseCoreMatmulPhase;
+    using densecore::runtime::DenseCoreTensorRole;
+    if (role == DenseCoreTensorRole::MoEGateUp || role == DenseCoreTensorRole::MoEDown) {
+        return DenseCoreKernelFamily::DenseCoreQwenMoeDirect;
+    }
+    if (raw_type == GGML_TYPE_F32) {
+        return phase == DenseCoreMatmulPhase::Decode ? DenseCoreKernelFamily::DenseCoreF32Gemv
+                                                     : DenseCoreKernelFamily::DenseCoreF32SmallBatch;
+    }
+    if (raw_type == GGML_TYPE_Q4_K && phase == DenseCoreMatmulPhase::Prefill) {
+        return DenseCoreKernelFamily::DenseCoreQ4KBatched;
+    }
+    if (ggml_is_quantized(raw_type)) {
+        return DenseCoreKernelFamily::DenseCoreQuantGemv;
+    }
+    return DenseCoreKernelFamily::TemporaryReferenceGgml;
+}
+
+bool TensorNameMatchesKey(const char* tensor_name, const std::string& tensor_key) {
+    if (!tensor_name || !tensor_name[0] || tensor_key.empty()) {
+        return false;
+    }
+    return std::strcmp(tensor_name, tensor_key.c_str()) == 0 || std::strstr(tensor_name, tensor_key.c_str()) != nullptr;
+}
+
+void FinalizeTensorRequirement(const TransformerModel* model, ModelTensorExecutionRequirement* requirement) {
+    if (!requirement) {
+        return;
+    }
+    requirement->prefill_kernel = ResolveRequiredKernelFamily(
+        requirement->raw_gguf_type, densecore::runtime::DenseCoreMatmulPhase::Prefill, requirement->tensor_role);
+    requirement->decode_kernel = ResolveRequiredKernelFamily(
+        requirement->raw_gguf_type, densecore::runtime::DenseCoreMatmulPhase::Decode, requirement->tensor_role);
+    const bool role_has_maintained_target_contract =
+        requirement->semantic_op == densecore::runtime::DenseCoreSemanticOp::HybridSsmMixer ||
+        requirement->semantic_op == densecore::runtime::DenseCoreSemanticOp::MoeRouter ||
+        requirement->semantic_op == densecore::runtime::DenseCoreSemanticOp::MoeExpertDispatch ||
+        requirement->semantic_op == densecore::runtime::DenseCoreSemanticOp::Lfm2ShortConvMixer ||
+        requirement->semantic_op == densecore::runtime::DenseCoreSemanticOp::LmHead;
+    requirement->fallback_policy =
+        IsFallbackFreeTargetModel(model) && role_has_maintained_target_contract
+            ? densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget
+            : densecore::runtime::DenseCoreFallbackPolicyKind::CompatibilityFallback;
+}
+
+ModelTensorExecutionRequirement MakeTensorRequirement(const TransformerModel* model, int layer_index,
+                                                      const std::string& tensor_key, const ggml_tensor* tensor,
+                                                      densecore::runtime::DenseCoreTensorRole role) {
+    ModelTensorExecutionRequirement requirement{};
+    requirement.layer_index = layer_index;
+    requirement.tensor_key = tensor_key;
+    requirement.tensor_role = role;
+    requirement.semantic_op = densecore::runtime::ResolveDenseCoreSemanticOp(model, role);
+    requirement.raw_gguf_type = tensor ? tensor->type : GGML_TYPE_COUNT;
+    requirement.canonical_layout = ResolveCanonicalLayout(model, tensor, role);
+    requirement.repacked_layout = ExecutionQuantLayoutKind::Unknown;
+    if (model && tensor) {
+        if (model->qwen36_ssm_q8_prefill_amx_aliases.find(tensor) != model->qwen36_ssm_q8_prefill_amx_aliases.end()) {
+            requirement.repacked_layout = ExecutionQuantLayoutKind::AmxPrefillAlias;
+        } else if (model->cpu_repack_aliases.find(tensor) != model->cpu_repack_aliases.end() ||
+                   model->cpu_decode_repack_aliases.find(tensor) != model->cpu_decode_repack_aliases.end()) {
+            requirement.repacked_layout = ExecutionQuantLayoutKind::CpuRepacked;
+        }
+    }
+    FinalizeTensorRequirement(model, &requirement);
+    return requirement;
+}
+
+void AddTensorRequirement(ModelExecutionContract* contract, ModelExecutionLayerContract* layer,
+                          const TransformerModel* model, const TransformerLayer* transformer_layer,
+                          const char* tensor_key, densecore::runtime::DenseCoreTensorRole role,
+                          const ggml_tensor* explicit_tensor = nullptr) {
+    if (!contract || !layer || !tensor_key) {
+        return;
+    }
+    const ggml_tensor* tensor = explicit_tensor ? explicit_tensor : (transformer_layer ? transformer_layer->Get(tensor_key) : nullptr);
+    ModelTensorExecutionRequirement requirement =
+        MakeTensorRequirement(model, layer->layer_index, tensor_key, tensor, role);
+    layer->tensor_requirements.push_back(requirement);
+    contract->tensor_requirements.push_back(std::move(requirement));
+}
+
 bool IsQwenHybridSSMContract(const ModelExecutionContract& contract) {
     return contract.has_hybrid_ssm_mixer &&
            (contract.variant == ModelVariant::QWEN35 || contract.variant == ModelVariant::QWEN36);
@@ -232,6 +349,12 @@ ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model
                                 ExecutionRuntimeStateKind::HybridSSM, layer.ssm_ordinal);
             AddRebindDescriptor(&contract, &layer, ExecutionCustomOpRebindKind::HybridSSMDelta,
                                 ExecutionRuntimeStateKind::HybridSSM, layer.ssm_ordinal);
+            AddTensorRequirement(&contract, &layer, model, transformer_layer, model_keys::kAttnQkvWeight,
+                                 densecore::runtime::DenseCoreTensorRole::HybridSSMQkv);
+            AddTensorRequirement(&contract, &layer, model, transformer_layer, model_keys::kAttnGate,
+                                 densecore::runtime::DenseCoreTensorRole::HybridSSMGate);
+            AddTensorRequirement(&contract, &layer, model, transformer_layer, model_keys::kSSMOut,
+                                 densecore::runtime::DenseCoreTensorRole::SSMOut);
         }
 
         if (layer.has_lfm2_shortconv_mixer) {
@@ -241,6 +364,10 @@ ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model
             layer.runtime_state_shape = LFM2ShortConvRuntimeStateShape(model);
             AddRebindDescriptor(&contract, &layer, ExecutionCustomOpRebindKind::LFM2ShortConv,
                                 ExecutionRuntimeStateKind::LFM2ShortConv, layer.conv_ordinal);
+            AddTensorRequirement(&contract, &layer, model, transformer_layer, model_keys::kShortConvInProj,
+                                 densecore::runtime::DenseCoreTensorRole::ShortConvIn);
+            AddTensorRequirement(&contract, &layer, model, transformer_layer, model_keys::kShortConvOutProj,
+                                 densecore::runtime::DenseCoreTensorRole::ShortConvOut);
         }
 
         if (layer.has_moe) {
@@ -258,6 +385,12 @@ ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model
             if (layer.moe_expert_layout == ExecutionMoEExpertLayoutKind::Unknown) {
                 AddRejection(&contract, "moe_expert_layout_unknown");
             }
+            AddTensorRequirement(&contract, &layer, model, transformer_layer, model_keys::kMoeGate,
+                                 densecore::runtime::DenseCoreTensorRole::MoERouter);
+            AddTensorRequirement(&contract, &layer, model, transformer_layer, "ffn_gate_up_exps.weight",
+                                 densecore::runtime::DenseCoreTensorRole::MoEGateUp);
+            AddTensorRequirement(&contract, &layer, model, transformer_layer, "ffn_down_exps.weight",
+                                 densecore::runtime::DenseCoreTensorRole::MoEDown);
         }
 
         layer.tensor_ownership = ResolveTensorOwnership(model, layer, transformer_layer);
@@ -339,6 +472,41 @@ int64_t ModelExecutionContractNativeMoEMaxDirectTokens(const ModelExecutionContr
     return contract.valid ? contract.native_moe_max_direct_tokens : 0;
 }
 
+ModelTensorExecutionRequirement ResolveModelTensorExecutionRequirement(const TransformerModel* model,
+                                                                      const char* tensor_name, bool is_lm_head,
+                                                                      ggml_type raw_type) {
+    const auto role = densecore::runtime::ResolveDenseCoreTensorRole(model, tensor_name, is_lm_head);
+    ModelTensorExecutionRequirement requirement{};
+    requirement.layer_index = -1;
+    requirement.tensor_key = tensor_name ? tensor_name : "";
+    requirement.tensor_role = role;
+    requirement.semantic_op = densecore::runtime::ResolveDenseCoreSemanticOp(model, role);
+    requirement.raw_gguf_type = raw_type;
+    requirement.canonical_layout = ExecutionQuantLayoutKind::RawGGUF;
+    requirement.repacked_layout = ExecutionQuantLayoutKind::Unknown;
+    FinalizeTensorRequirement(model, &requirement);
+    return requirement;
+}
+
+const ModelTensorExecutionRequirement* FindModelTensorExecutionRequirement(
+    const ModelExecutionContract& contract, const char* tensor_name, densecore::runtime::DenseCoreMatmulPhase phase) {
+    for (const auto& requirement : contract.tensor_requirements) {
+        if (!TensorNameMatchesKey(tensor_name, requirement.tensor_key)) {
+            continue;
+        }
+        if (phase == densecore::runtime::DenseCoreMatmulPhase::Prefill &&
+            requirement.prefill_kernel == densecore::runtime::DenseCoreKernelFamily::None) {
+            continue;
+        }
+        if (phase == densecore::runtime::DenseCoreMatmulPhase::Decode &&
+            requirement.decode_kernel == densecore::runtime::DenseCoreKernelFamily::None) {
+            continue;
+        }
+        return &requirement;
+    }
+    return nullptr;
+}
+
 const char* ExecutionRuntimeStateKindName(ExecutionRuntimeStateKind kind) {
     switch (kind) {
     case ExecutionRuntimeStateKind::None: return "none";
@@ -392,6 +560,18 @@ const char* ExecutionFastPathClassName(ExecutionFastPathClass kind) {
     return "unknown";
 }
 
+const char* ExecutionQuantLayoutKindName(ExecutionQuantLayoutKind kind) {
+    switch (kind) {
+    case ExecutionQuantLayoutKind::RawGGUF: return "raw_gguf";
+    case ExecutionQuantLayoutKind::LoaderCanonical: return "loader_canonical";
+    case ExecutionQuantLayoutKind::CpuRepacked: return "cpu_repacked";
+    case ExecutionQuantLayoutKind::AmxPrefillAlias: return "amx_prefill_alias";
+    case ExecutionQuantLayoutKind::PackedDenseCore: return "packed_densecore";
+    case ExecutionQuantLayoutKind::Unknown: return "unknown";
+    }
+    return "unknown";
+}
+
 std::string FormatModelExecutionContract(const ModelExecutionContract& contract) {
     std::ostringstream oss;
     oss << "ModelExecutionContract{variant=" << static_cast<int>(contract.variant)
@@ -436,7 +616,8 @@ std::string FormatModelExecutionContract(const ModelExecutionContract& contract)
             << ",state=" << ExecutionRuntimeStateKindName(layer.runtime_state_shape.kind)
             << ",router=" << DecoderMoERouterName(layer.moe_router)
             << ",expert_layout=" << ExecutionMoEExpertLayoutKindName(layer.moe_expert_layout)
-            << ",ownership=" << ExecutionTensorOwnershipName(layer.tensor_ownership) << "}";
+            << ",ownership=" << ExecutionTensorOwnershipName(layer.tensor_ownership)
+            << ",tensor_requirements=" << layer.tensor_requirements.size() << "}";
     }
     oss << "],rebinds=[";
     for (std::size_t i = 0; i < contract.rebind_descriptors.size(); ++i) {
@@ -445,6 +626,18 @@ std::string FormatModelExecutionContract(const ModelExecutionContract& contract)
             oss << ",";
         }
         oss << ExecutionCustomOpRebindKindName(descriptor.op_kind) << "@layer" << descriptor.layer_index;
+    }
+    oss << "],tensor_requirements=[";
+    for (std::size_t i = 0; i < contract.tensor_requirements.size(); ++i) {
+        const auto& requirement = contract.tensor_requirements[i];
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << requirement.tensor_key << ":" << densecore::runtime::DenseCoreTensorRoleName(requirement.tensor_role)
+            << ":prefill=" << densecore::runtime::DenseCoreKernelFamilyName(requirement.prefill_kernel)
+            << ":decode=" << densecore::runtime::DenseCoreKernelFamilyName(requirement.decode_kernel)
+            << ":layout=" << ExecutionQuantLayoutKindName(requirement.canonical_layout)
+            << ":fallback=" << densecore::runtime::DenseCoreFallbackPolicyKindName(requirement.fallback_policy);
     }
     oss << "]}";
     return oss.str();

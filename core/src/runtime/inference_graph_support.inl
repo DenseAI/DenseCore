@@ -4681,7 +4681,7 @@ static int ResolveNativeMoEGraphCallbackTaskCount(const TransformerModel* model,
                                                   InferenceExecutionPhase phase, int64_t n_tokens, int top_k) {
     if (model && model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv &&
         phase == InferenceExecutionPhase::Decode && n_tokens == 1 && top_k > 1) {
-        return ResolveTaskCount(batch, std::min<int>(std::max(1, top_k), 4));
+        return ResolveTaskCount(batch, /*work_items=*/0);
     }
     return GGML_N_TASKS_MAX;
 }

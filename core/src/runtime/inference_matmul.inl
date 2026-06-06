@@ -1,4 +1,5 @@
 #include "kernels/q4k_repacked_gemv.h"
+#include "densecore/models/model_execution_contract.h"
 
 #include <condition_variable>
 
@@ -364,22 +365,6 @@ static Qwen36SSMQ8PrefillAMXRejectReason ResolveQwen36SSMQ8PrefillAMXReason(
         return Qwen36SSMQ8PrefillAMXRejectReason::DynamicLora;
     }
     return Qwen36SSMQ8PrefillAMXRejectReason::None;
-}
-
-static int Qwen36SSMProjectionKind(const char* name) {
-    if (!name) {
-        return 0;
-    }
-    if (std::strstr(name, "attn_qkv")) {
-        return 1;
-    }
-    if (std::strstr(name, "attn_gate")) {
-        return 2;
-    }
-    if (std::strstr(name, "ssm_out")) {
-        return 3;
-    }
-    return 0;
 }
 
 static void RecordQwen36SSMQ8PrefillAMXReject(InferenceWorkContext* ctx,
@@ -5898,6 +5883,269 @@ static bool CanUseGemma4DecodeNative(const TransformerModel* model, const ggml_t
     return true;
 }
 
+static const char* SmartMatmulTensorName(const ggml_tensor* tensor) {
+    return (tensor && tensor->name[0]) ? tensor->name : "(unnamed)";
+}
+
+struct SmartMatmulOriginalTensorState {
+    ggml_tensor* weight = nullptr;
+    int input_cols = 0;
+    const char* weight_name = "(unnamed)";
+    densecore::models::ModelTensorExecutionRequirement requirement{};
+    bool hybrid_ssm_projection = false;
+    int hybrid_ssm_projection_kind = 0;
+    bool qwen_target_model = false;
+    bool qwen_hybrid_ssm_projection = false;
+    bool lfm2_shortconv_semantic = false;
+};
+
+static densecore::models::ModelTensorExecutionRequirement ResolveSmartMatmulRequirement(
+    const TransformerModel* model, const ggml_tensor* weight) {
+    return densecore::models::ResolveModelTensorExecutionRequirement(
+        model, SmartMatmulTensorName(weight), model && model->output == weight,
+        weight ? weight->type : GGML_TYPE_COUNT);
+}
+
+static ggml_tensor* ResolveSmartMatmulInitialWeight(TransformerModel* model, ggml_tensor* weight,
+                                                   const ggml_tensor* input) {
+    const densecore::models::ModelTensorExecutionRequirement requirement =
+        ResolveSmartMatmulRequirement(model, weight);
+    const bool lfm2_shortconv_semantic =
+        requirement.semantic_op == densecore::runtime::DenseCoreSemanticOp::Lfm2ShortConvMixer;
+    if (!model || !weight || !input || !lfm2_shortconv_semantic || input->type != GGML_TYPE_F32) {
+        return weight;
+    }
+    auto it_source = model->cpu_repack_alias_sources.find(weight);
+    if (it_source != model->cpu_repack_alias_sources.end() && it_source->second &&
+        it_source->second->type == GGML_TYPE_Q4_K && it_source->second->ne[0] == input->ne[0]) {
+        return it_source->second;
+    }
+    return weight;
+}
+
+struct SmartMatmulAliasSelection {
+    ggml_tensor* weight = nullptr;
+    bool using_cpu_repack_alias = false;
+};
+
+static SmartMatmulAliasSelection ResolveSmartMatmulAliasSelection(
+    TransformerModel* model, ggml_tensor* weight, const ggml_tensor* input,
+    const SmartMatmulOriginalTensorState& original, bool dispatch_is_prefill_phase) {
+    SmartMatmulAliasSelection selection;
+    selection.weight = weight;
+    if (!model || !weight || !input || input->type != GGML_TYPE_F32) {
+        return selection;
+    }
+
+    constexpr int64_t kQwenHybridSmallPrefillQ4KMaxCols = 256;
+    const bool qwen_hybrid_small_prefill_q4k =
+        dispatch_is_prefill_phase && original.input_cols > 1 &&
+        original.input_cols <= kQwenHybridSmallPrefillQ4KMaxCols;
+    const bool prefer_qwen_hybrid_ssm_quant_batched_over_repack =
+        original.qwen_hybrid_ssm_projection && qwen_hybrid_small_prefill_q4k &&
+        selection.weight->type == GGML_TYPE_Q4_K && input->ne[0] == selection.weight->ne[0] &&
+        (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled();
+    const bool prefer_gemma4_quant_prefill_densecore_path =
+        dispatch_is_prefill_phase && model->arch_flags.is_gemma4 &&
+        (selection.weight->type == GGML_TYPE_Q4_K || selection.weight->type == GGML_TYPE_Q8_0) &&
+        input->ne[1] > 1 && input->ne[0] == selection.weight->ne[0] &&
+        (selection.weight->type != GGML_TYPE_Q4_K || IsQ4KTrueBatchedKernelEnabled());
+    const bool prefer_gemma4_quant_decode_densecore_path =
+        model->arch_flags.is_gemma4 && ggml_is_quantized(selection.weight->type) &&
+        input->ne[1] <= 1 && input->ne[0] == selection.weight->ne[0];
+    const bool prefer_lfm2_quant_prefill_densecore_path =
+        dispatch_is_prefill_phase && original.lfm2_shortconv_semantic &&
+        ggml_is_quantized(selection.weight->type) && input->ne[1] > 1 &&
+        input->ne[0] == selection.weight->ne[0];
+    const bool prefer_lfm2_quant_decode_densecore_path =
+        original.lfm2_shortconv_semantic && ggml_is_quantized(selection.weight->type) &&
+        input->ne[1] <= 1 && input->ne[0] == selection.weight->ne[0];
+
+    if (input->ne[1] <= 1) {
+        auto it_decode_repack = model->cpu_decode_repack_aliases.find(selection.weight);
+        if (!prefer_gemma4_quant_decode_densecore_path && !prefer_lfm2_quant_decode_densecore_path &&
+            it_decode_repack != model->cpu_decode_repack_aliases.end() && it_decode_repack->second) {
+            selection.weight = it_decode_repack->second;
+            selection.using_cpu_repack_alias = true;
+        }
+    }
+    auto it_repack = model->cpu_repack_aliases.find(selection.weight);
+    if (!selection.using_cpu_repack_alias && it_repack != model->cpu_repack_aliases.end() && it_repack->second) {
+        const bool amx_alias = model->cpu_amx_aliases.find(it_repack->second) != model->cpu_amx_aliases.end();
+        const bool amx_decode_regression_risk =
+            (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) && amx_alias &&
+            input->ne[1] == 1;
+        if (!prefer_gemma4_quant_prefill_densecore_path && !prefer_lfm2_quant_prefill_densecore_path &&
+            !prefer_gemma4_quant_decode_densecore_path && !prefer_lfm2_quant_decode_densecore_path &&
+            !prefer_qwen_hybrid_ssm_quant_batched_over_repack && !amx_decode_regression_risk) {
+            selection.weight = it_repack->second;
+            selection.using_cpu_repack_alias = true;
+        }
+    }
+    return selection;
+}
+
+static SmartMatmulOriginalTensorState CaptureSmartMatmulOriginalTensorState(const TransformerModel* model,
+                                                                            ggml_tensor* weight,
+                                                                            const ggml_tensor* input) {
+    SmartMatmulOriginalTensorState state;
+    state.weight = weight;
+    state.input_cols = input ? static_cast<int>(input->ne[1]) : 0;
+    state.weight_name = SmartMatmulTensorName(weight);
+    state.requirement = ResolveSmartMatmulRequirement(model, weight);
+    state.hybrid_ssm_projection = densecore::runtime::IsHybridSsmTensorRole(state.requirement.tensor_role);
+    state.hybrid_ssm_projection_kind = densecore::runtime::HybridSsmProjectionKind(state.requirement.tensor_role);
+    state.qwen_target_model = model && densecore::runtime::IsQwenTargetVariant(model->variant);
+    state.qwen_hybrid_ssm_projection = state.qwen_target_model && state.hybrid_ssm_projection;
+    state.lfm2_shortconv_semantic =
+        state.requirement.semantic_op == densecore::runtime::DenseCoreSemanticOp::Lfm2ShortConvMixer;
+    return state;
+}
+
+static bool ResolveSmartMatmulPrefillPhase(InferenceExecutionPhase dispatch_phase,
+                                           const SmartMatmulOriginalTensorState& original) {
+    return dispatch_phase == InferenceExecutionPhase::Prefill ||
+           (dispatch_phase == InferenceExecutionPhase::Unknown && original.input_cols > 1);
+}
+
+static densecore::runtime::DenseCoreMatmulPhase ResolveSmartMatmulPlanPhase(
+    InferenceExecutionPhase dispatch_phase, bool dispatch_is_prefill_phase) {
+    if (dispatch_is_prefill_phase) {
+        return densecore::runtime::DenseCoreMatmulPhase::Prefill;
+    }
+    if (dispatch_phase == InferenceExecutionPhase::Decode) {
+        return densecore::runtime::DenseCoreMatmulPhase::Decode;
+    }
+    return densecore::runtime::DenseCoreMatmulPhase::Unknown;
+}
+
+struct SmartMatmulDispatchState {
+    int m = 0;
+    int k = 0;
+    int n = 0;
+    const char* weight_name = "(unnamed)";
+    const char* input_name = "(unnamed)";
+    bool gemma4_lm_head = false;
+    bool compatible = false;
+    bool prefill_phase = false;
+    densecore::runtime::DenseCoreMatmulPhase plan_phase = densecore::runtime::DenseCoreMatmulPhase::Unknown;
+    densecore::runtime::HostKernelCapabilities host_caps{};
+    densecore::models::ModelTensorExecutionRequirement requirement{};
+    densecore::runtime::KernelResolution kernel_resolution{};
+    densecore::runtime::DenseCoreMatmulPlan matmul_plan{};
+    densecore::runtime::DenseCoreTensorRole tensor_role = densecore::runtime::DenseCoreTensorRole::Unknown;
+    densecore::runtime::DenseCoreSemanticOp semantic_op = densecore::runtime::DenseCoreSemanticOp::Unknown;
+    bool hybrid_ssm_qkv = false;
+    bool hybrid_ssm_gate = false;
+    bool hybrid_ssm_out = false;
+    bool hybrid_ssm_projection = false;
+    bool moe_router = false;
+    bool lm_head_role = false;
+    bool lfm2_shortconv_semantic = false;
+    bool fallback_free_target = false;
+    bool qwen_target = false;
+    bool qwen35_target = false;
+    bool qwen36_target = false;
+    bool qwen35_hybrid_ssm = false;
+    bool qwen36_hybrid_ssm = false;
+    bool qwen35_hybrid_ssm_gate = false;
+    bool qwen35_hybrid_ssm_out = false;
+    bool qwen36_hybrid_ssm_qkv = false;
+    bool qwen36_hybrid_ssm_gate = false;
+    bool qwen36_hybrid_ssm_out = false;
+    bool qwen36_lm_head = false;
+};
+
+static SmartMatmulDispatchState ResolveSmartMatmulDispatchState(
+    const TransformerModel* model, const ggml_tensor* weight, const ggml_tensor* input,
+    const ggml_tensor* original_weight, InferenceExecutionPhase dispatch_phase, bool dispatch_is_prefill_phase,
+    bool using_cpu_repack_alias) {
+    SmartMatmulDispatchState state;
+    state.m = input ? static_cast<int>(input->ne[1]) : 0;
+    state.k = weight ? static_cast<int>(weight->ne[0]) : 0;
+    state.n = weight ? static_cast<int>(weight->ne[1]) : 0;
+    state.weight_name = SmartMatmulTensorName(weight);
+    state.input_name = SmartMatmulTensorName(input);
+    state.gemma4_lm_head = model && (model->output == weight || model->output == original_weight);
+    state.compatible = weight && input && weight->ne[0] == input->ne[0];
+    state.prefill_phase = dispatch_is_prefill_phase;
+    state.plan_phase = ResolveSmartMatmulPlanPhase(dispatch_phase, dispatch_is_prefill_phase);
+    state.host_caps = densecore::runtime::CompileTimeHostKernelCapabilities(IsQ4KTrueBatchedKernelEnabled(),
+                                                                            using_cpu_repack_alias);
+    state.requirement = ResolveSmartMatmulRequirement(model, weight);
+    const densecore::runtime::DenseCoreKernelFamily required_kernel =
+        state.plan_phase == densecore::runtime::DenseCoreMatmulPhase::Prefill
+            ? state.requirement.prefill_kernel
+            : (state.plan_phase == densecore::runtime::DenseCoreMatmulPhase::Decode
+                   ? state.requirement.decode_kernel
+                   : densecore::runtime::DenseCoreKernelFamily::None);
+    state.kernel_resolution = densecore::runtime::ResolveKernelResolution(
+        model, weight ? weight->type : GGML_TYPE_COUNT, input ? input->type : GGML_TYPE_COUNT, state.m, state.n,
+        state.k, state.plan_phase, state.weight_name, model && model->output == weight, state.compatible,
+        state.host_caps, state.requirement.semantic_op, state.requirement.tensor_role, required_kernel,
+        state.requirement.fallback_policy, /*has_fallback_policy_override=*/true);
+    state.matmul_plan = state.kernel_resolution.matmul_plan;
+    state.tensor_role = state.kernel_resolution.tensor_role;
+    state.semantic_op = state.kernel_resolution.semantic_op;
+    state.hybrid_ssm_qkv = state.tensor_role == densecore::runtime::DenseCoreTensorRole::HybridSSMQkv;
+    state.hybrid_ssm_gate = state.tensor_role == densecore::runtime::DenseCoreTensorRole::HybridSSMGate;
+    state.hybrid_ssm_out = state.tensor_role == densecore::runtime::DenseCoreTensorRole::SSMOut;
+    state.hybrid_ssm_projection = densecore::runtime::IsHybridSsmTensorRole(state.tensor_role);
+    state.moe_router = state.tensor_role == densecore::runtime::DenseCoreTensorRole::MoERouter;
+    state.lm_head_role = state.tensor_role == densecore::runtime::DenseCoreTensorRole::LmHead;
+    state.lfm2_shortconv_semantic =
+        state.semantic_op == densecore::runtime::DenseCoreSemanticOp::Lfm2ShortConvMixer;
+    state.fallback_free_target =
+        state.requirement.fallback_policy == densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget;
+    state.qwen_target = model && densecore::runtime::IsQwenTargetVariant(model->variant);
+    state.qwen35_target = model && model->variant == ModelVariant::QWEN35;
+    state.qwen36_target = model && model->variant == ModelVariant::QWEN36;
+    state.qwen35_hybrid_ssm = state.qwen35_target && state.hybrid_ssm_projection;
+    state.qwen36_hybrid_ssm = state.qwen36_target && state.hybrid_ssm_projection;
+    state.qwen35_hybrid_ssm_gate = state.qwen35_target && state.hybrid_ssm_gate;
+    state.qwen35_hybrid_ssm_out = state.qwen35_target && state.hybrid_ssm_out;
+    state.qwen36_hybrid_ssm_qkv = state.qwen36_target && state.hybrid_ssm_qkv;
+    state.qwen36_hybrid_ssm_gate = state.qwen36_target && state.hybrid_ssm_gate;
+    state.qwen36_hybrid_ssm_out = state.qwen36_target && state.hybrid_ssm_out;
+    state.qwen36_lm_head = state.qwen36_target && state.lm_head_role;
+    return state;
+}
+
+static void RecordSmartMatmulGraphCensus(InferenceWorkContext* dispatch_work_ctx,
+                                         InferenceExecutionPhase dispatch_phase,
+                                         const SmartMatmulOriginalTensorState& original,
+                                         const SmartMatmulDispatchState& dispatch,
+                                         ggml_type weight_type,
+                                         bool matmul_expected_decode,
+                                         const char* selected_path) {
+    const char* census_path = selected_path;
+    if (original.qwen_hybrid_ssm_projection || (dispatch.qwen36_target && original.hybrid_ssm_projection)) {
+        census_path = "ssm_projection";
+    }
+    RecordGraphBuildMatmulCensus(dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext(), dispatch_phase,
+                                 census_path, weight_type, dispatch.m, dispatch.n, dispatch.k, dispatch.weight_name,
+                                 dispatch.input_name, matmul_expected_decode);
+}
+
+static ggml_tensor* EmitSmartMatmulGgmlFallback(ggml_context* ctx, ggml_tensor* weight, ggml_tensor* input,
+                                               TransformerModel* model, InferenceWorkContext* dispatch_work_ctx,
+                                               InferenceExecutionPhase dispatch_phase,
+                                               const SmartMatmulDispatchState& dispatch,
+                                               densecore::runtime::GgmlComputeOp op, const char* reason) {
+    InferenceWorkContext* work_ctx = dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext();
+    RecordQwenTargetGgmlComputeFallback(work_ctx, model, op, reason, dispatch.weight_name, dispatch_phase);
+    if (dispatch.kernel_resolution.fallback_policy ==
+        densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget) {
+        throw densecore::InvalidArgumentException(
+            std::string("Target fallback-free matmul cannot fall back to GGML: tensor_role=") +
+            densecore::runtime::DenseCoreTensorRoleName(dispatch.kernel_resolution.tensor_role) +
+            " semantic_op=" +
+            densecore::runtime::DenseCoreSemanticOpName(dispatch.kernel_resolution.semantic_op) +
+            " reason=" + (reason ? reason : "unknown"));
+    }
+    return ggml_mul_mat(ctx, weight, input);
+}
+
 /**
  * Smart matrix multiplication dispatcher
  *
@@ -5911,86 +6159,39 @@ static bool CanUseGemma4DecodeNative(const TransformerModel* model, const ggml_t
  */
 struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* weight, struct ggml_tensor* input,
                                   TransformerModel* model) {
-    if (model && weight && input && model->arch_flags.is_lfm2_shortconv && input->type == GGML_TYPE_F32 &&
-        input->ne[1] > 1) {
-        auto it_source = model->cpu_repack_alias_sources.find(weight);
-        if (it_source != model->cpu_repack_alias_sources.end() && it_source->second &&
-            it_source->second->type == GGML_TYPE_Q4_K && it_source->second->ne[0] == input->ne[0]) {
-            weight = it_source->second;
-        }
-    }
+    weight = ResolveSmartMatmulInitialWeight(model, weight, input);
     bool using_cpu_repack_alias = false;
     bool using_qwen36_ssm_q8_prefill_amx_alias = false;
-    ggml_tensor* const original_weight = weight;
-    const int original_input_cols = input ? static_cast<int>(input->ne[1]) : 0;
-    const char* original_w_name = (weight && weight->name[0]) ? weight->name : "(unnamed)";
+    const SmartMatmulOriginalTensorState original_state =
+        CaptureSmartMatmulOriginalTensorState(model, weight, input);
+    ggml_tensor* const original_weight = original_state.weight;
+    const int original_input_cols = original_state.input_cols;
+    const int original_hybrid_ssm_projection_kind = original_state.hybrid_ssm_projection_kind;
     const BatchSpec* current_batch = GetCurrentBatch();
     const auto& fast_path_config = ResolveFastPathRuntimeConfig(current_batch);
     InferenceWorkContext* dispatch_work_ctx = GetCurrentWorkContext();
     const InferenceExecutionPhase dispatch_phase =
         dispatch_work_ctx ? dispatch_work_ctx->phase : InferenceExecutionPhase::Unknown;
-    const bool dispatch_is_prefill_phase = dispatch_phase == InferenceExecutionPhase::Prefill;
+    const bool dispatch_is_prefill_phase = ResolveSmartMatmulPrefillPhase(dispatch_phase, original_state);
     if (dispatch_work_ctx) {
         dispatch_work_ctx->qwen36_profile.qwen36_prefill_q4k_batched_mode.store(
             static_cast<int>(fast_path_config.qwen36_prefill_q4k_batched), std::memory_order_relaxed);
         dispatch_work_ctx->qwen36_profile.qwen36_ssm_q8_prefill_amx_mode.store(
             static_cast<int>(fast_path_config.qwen36_ssm_q8_prefill_amx), std::memory_order_relaxed);
     }
-    const bool original_qwen_hybrid_ssm_projection =
-        model && model->arch_flags.is_hybrid_ssm &&
-        (IsHybridSSMQkvWeightName(original_w_name) || std::strstr(original_w_name, "attn_gate") ||
-         std::strstr(original_w_name, "ssm_out"));
-    constexpr int64_t kQwenHybridSmallPrefillQ4KMaxCols = 256;
-    const bool qwen_hybrid_small_prefill_q4k =
-        dispatch_is_prefill_phase && original_input_cols > 1 &&
-        original_input_cols <= kQwenHybridSmallPrefillQ4KMaxCols;
-    const bool prefer_qwen_hybrid_ssm_quant_batched_over_repack =
-        original_qwen_hybrid_ssm_projection && qwen_hybrid_small_prefill_q4k && weight && input &&
-        weight->type == GGML_TYPE_Q4_K && input->type == GGML_TYPE_F32 && weight->ne[0] == input->ne[0] &&
-        (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled();
-    const bool prefer_gemma4_quant_prefill_densecore_path =
-        dispatch_is_prefill_phase && model && model->arch_flags.is_gemma4 && input && input->type == GGML_TYPE_F32 &&
-        weight && (weight->type == GGML_TYPE_Q4_K || weight->type == GGML_TYPE_Q8_0) && input->ne[1] > 1 &&
-        input->ne[0] == weight->ne[0] &&
-        (weight->type != GGML_TYPE_Q4_K || IsQ4KTrueBatchedKernelEnabled());
-    const bool prefer_gemma4_quant_decode_densecore_path =
-        model && model->arch_flags.is_gemma4 && input && input->type == GGML_TYPE_F32 && weight &&
-        ggml_is_quantized(weight->type) && input->ne[1] <= 1 && input->ne[0] == weight->ne[0];
-    const bool prefer_lfm2_quant_prefill_densecore_path =
-        dispatch_is_prefill_phase && model && model->arch_flags.is_lfm2_shortconv && input && input->type == GGML_TYPE_F32 &&
-        weight && ggml_is_quantized(weight->type) && input->ne[1] > 1 && input->ne[0] == weight->ne[0];
+    const bool original_qwen_hybrid_ssm_projection = original_state.qwen_hybrid_ssm_projection;
+    const SmartMatmulAliasSelection alias_selection =
+        ResolveSmartMatmulAliasSelection(model, weight, input, original_state, dispatch_is_prefill_phase);
+    weight = alias_selection.weight;
+    using_cpu_repack_alias = alias_selection.using_cpu_repack_alias;
     if (model && input && input->type == GGML_TYPE_F32) {
-        if (input->ne[1] <= 1) {
-            auto it_decode_repack = model->cpu_decode_repack_aliases.find(weight);
-            if (!prefer_gemma4_quant_decode_densecore_path &&
-                it_decode_repack != model->cpu_decode_repack_aliases.end() && it_decode_repack->second) {
-                weight = it_decode_repack->second;
-                using_cpu_repack_alias = true;
-            }
-        }
-        auto it_repack = model->cpu_repack_aliases.find(weight);
-        if (!using_cpu_repack_alias && it_repack != model->cpu_repack_aliases.end() && it_repack->second) {
-            const bool amx_alias = model->cpu_amx_aliases.find(it_repack->second) != model->cpu_amx_aliases.end();
-            const bool amx_decode_regression_risk =
-                (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) && amx_alias &&
-                input->ne[1] == 1;
-            if (!prefer_gemma4_quant_prefill_densecore_path && !prefer_lfm2_quant_prefill_densecore_path &&
-                !prefer_gemma4_quant_decode_densecore_path && !prefer_qwen_hybrid_ssm_quant_batched_over_repack &&
-                !amx_decode_regression_risk) {
-                weight = it_repack->second;
-                using_cpu_repack_alias = true;
-            }
-        }
-        const int qwen36_ssm_projection_kind = Qwen36SSMProjectionKind(original_w_name);
-        const bool original_qwen_hybrid_ssm_model =
-            (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
-            model->arch_flags.is_hybrid_ssm;
-        if (dispatch_work_ctx && original_qwen_hybrid_ssm_model &&
+        const int qwen36_ssm_projection_kind = original_hybrid_ssm_projection_kind;
+        if (dispatch_work_ctx && original_qwen_hybrid_ssm_projection &&
             qwen36_ssm_projection_kind != 0 && original_weight) {
             RecordQwen36SSMProjectionWeightType(dispatch_work_ctx, original_weight->type);
         }
         const bool original_qwen36_ssm_q8_projection =
-            model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm &&
+            model->variant == ModelVariant::QWEN36 && original_state.hybrid_ssm_projection &&
             qwen36_ssm_projection_kind != 0 && original_weight && original_weight->type == GGML_TYPE_Q8_0 &&
             input->type == GGML_TYPE_F32 && original_weight->ne[0] == input->ne[0];
         if (original_qwen36_ssm_q8_projection && original_input_cols <= 1 && weight == original_weight) {
@@ -6038,27 +6239,35 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             }
         }
     }
-	    const int M = static_cast<int>(input->ne[1]);
-	    const int K_dim = static_cast<int>(weight->ne[0]);
-	    const int N_dim = static_cast<int>(weight->ne[1]);
-	    const char* w_name = (weight->name[0] ? weight->name : "(unnamed)");
-	    const char* input_name = (input && input->name[0]) ? input->name : "(unnamed)";
-	    const bool gemma4_lm_head = model && (model->output == weight || model->output == original_weight);
-	    const bool is_compatible = (weight->ne[0] == input->ne[0]);
-	    const bool matmul_is_prefill_phase = dispatch_is_prefill_phase;
-	    const densecore::runtime::DenseCoreMatmulPhase matmul_plan_phase =
-        dispatch_phase == InferenceExecutionPhase::Prefill
-            ? densecore::runtime::DenseCoreMatmulPhase::Prefill
-            : (dispatch_phase == InferenceExecutionPhase::Decode
-                   ? densecore::runtime::DenseCoreMatmulPhase::Decode
-                   : densecore::runtime::DenseCoreMatmulPhase::Unknown);
-    const densecore::runtime::DenseCoreMatmulPlan matmul_plan =
-        densecore::runtime::ResolveDenseCoreMatmulPlan(model, weight->type, input ? input->type : GGML_TYPE_COUNT, M,
-                                                       N_dim, K_dim, matmul_plan_phase, w_name,
-                                                       model && model->output == weight, is_compatible);
+    const SmartMatmulDispatchState dispatch_state = ResolveSmartMatmulDispatchState(
+        model, weight, input, original_weight, dispatch_phase, dispatch_is_prefill_phase, using_cpu_repack_alias);
+    const int M = dispatch_state.m;
+    const int K_dim = dispatch_state.k;
+    const int N_dim = dispatch_state.n;
+    const char* w_name = dispatch_state.weight_name;
+    const bool gemma4_lm_head = dispatch_state.gemma4_lm_head;
+    const bool is_compatible = dispatch_state.compatible;
+    const bool matmul_is_prefill_phase = dispatch_state.prefill_phase;
+    const densecore::runtime::DenseCoreMatmulPlan& matmul_plan = dispatch_state.matmul_plan;
+    const densecore::runtime::KernelResolution& kernel_resolution = dispatch_state.kernel_resolution;
+    const bool is_hybrid_ssm_qkv = dispatch_state.hybrid_ssm_qkv;
+    const bool is_moe_router = dispatch_state.moe_router;
+    const bool is_lfm2_shortconv_semantic = dispatch_state.lfm2_shortconv_semantic;
+    const bool fallback_free_target = dispatch_state.fallback_free_target;
+    const bool is_qwen_target = dispatch_state.qwen_target;
+    const bool is_qwen35_target = dispatch_state.qwen35_target;
+    const bool is_qwen35_hybrid_ssm = dispatch_state.qwen35_hybrid_ssm;
+    const bool is_qwen36_hybrid_ssm = dispatch_state.qwen36_hybrid_ssm;
+    const bool is_qwen35_hybrid_ssm_gate = dispatch_state.qwen35_hybrid_ssm_gate;
+    const bool is_qwen35_hybrid_ssm_out = dispatch_state.qwen35_hybrid_ssm_out;
+    const bool is_qwen36_hybrid_ssm_qkv = dispatch_state.qwen36_hybrid_ssm_qkv;
+    const bool is_qwen36_hybrid_ssm_gate = dispatch_state.qwen36_hybrid_ssm_gate;
+    const bool is_qwen36_hybrid_ssm_out = dispatch_state.qwen36_hybrid_ssm_out;
+    const bool is_qwen36_lm_head = dispatch_state.qwen36_lm_head;
     if (matmul_plan.target_qwen_hot_path && IsDebugMatmulDispatchEnabled()) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
-                          "DENSECORE_PLAN", densecore::runtime::DenseCoreKernelFamilyName(matmul_plan.kernel));
+                          "DENSECORE_PLAN",
+                          densecore::runtime::DenseCoreKernelFamilyName(kernel_resolution.selected_kernel));
     }
     const bool gemma4_dense_prefill_candidate =
         model && model->arch_flags.is_gemma4 && input && input->type == GGML_TYPE_F32 && M > 1 &&
@@ -6088,26 +6297,13 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     }
     const bool matmul_expected_decode = M <= 1 || dispatch_phase == InferenceExecutionPhase::Decode;
     const auto record_graph_matmul = [&](const char* selected_path) {
-        const char* census_path = selected_path;
-        if (original_qwen_hybrid_ssm_projection || (model && model->variant == ModelVariant::QWEN36 &&
-                                                    model->arch_flags.is_hybrid_ssm &&
-                                                    Qwen36SSMProjectionKind(original_w_name) != 0)) {
-            census_path = "ssm_projection";
-        }
-        RecordGraphBuildMatmulCensus(dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext(), dispatch_phase,
-                                     census_path, weight->type, M, N_dim, K_dim, w_name, input_name,
-                                     matmul_expected_decode);
+        RecordSmartMatmulGraphCensus(dispatch_work_ctx, dispatch_phase, original_state, dispatch_state, weight->type,
+                                     matmul_expected_decode, selected_path);
     };
-	    const auto qwen_ggml_fallback = [&](densecore::runtime::GgmlComputeOp op, const char* reason) {
-	        InferenceWorkContext* work_ctx = dispatch_work_ctx ? dispatch_work_ctx : GetCurrentWorkContext();
-	        RecordQwenTargetGgmlComputeFallback(work_ctx, model, op, reason, w_name, dispatch_phase);
-	        if (matmul_plan.target_qwen_hot_path) {
-	            throw densecore::InvalidArgumentException(
-	                std::string("Qwen target hot path cannot fall back to GGML matmul: ") +
-	                (reason ? reason : "unknown"));
-	        }
-	        return ggml_mul_mat(ctx, weight, input);
-	    };
+    const auto target_ggml_fallback = [&](densecore::runtime::GgmlComputeOp op, const char* reason) {
+        return EmitSmartMatmulGgmlFallback(ctx, weight, input, model, dispatch_work_ctx, dispatch_phase,
+                                           dispatch_state, op, reason);
+    };
     densecore::runtime::KernelAdmissionDescriptor kleidiai_desc{};
     kleidiai_desc.model_variant = model ? model->variant : ModelVariant::UNKNOWN;
     kleidiai_desc.is_gemma4 = model && model->arch_flags.is_gemma4;
@@ -6127,23 +6323,11 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                           kleidiai_admission.allowed ? "KLEIDIAI_ADMITTED" : "KLEIDIAI_REJECTED",
                           densecore::runtime::KernelAdmissionRejectReasonName(kleidiai_admission.reject_reason));
     }
-    const bool is_hybrid_ssm_qkv = model && model->arch_flags.is_hybrid_ssm && IsHybridSSMQkvWeightName(w_name);
-    const bool is_qwen35_hybrid_ssm = model && model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
-    const bool is_qwen35_hybrid_ssm_gate = is_qwen35_hybrid_ssm && std::strstr(w_name, "attn_gate");
-    const bool is_qwen35_hybrid_ssm_out = is_qwen35_hybrid_ssm && std::strstr(w_name, "ssm_out");
-    const bool is_qwen36_hybrid_ssm = model && model->variant == ModelVariant::QWEN36 &&
-                                      model->arch_flags.is_hybrid_ssm;
-    const bool is_qwen36_hybrid_ssm_qkv = is_qwen36_hybrid_ssm && std::strstr(w_name, "attn_qkv");
-    const bool is_qwen36_hybrid_ssm_gate = is_qwen36_hybrid_ssm && std::strstr(w_name, "attn_gate");
-    const bool is_qwen36_hybrid_ssm_out = model && model->variant == ModelVariant::QWEN36 &&
-                                          model->arch_flags.is_hybrid_ssm && std::strstr(w_name, "ssm_out");
     const bool is_qwen_hybrid_ssm_q8_prefill =
-        ((is_qwen35_hybrid_ssm && IsHybridSSMQkvWeightName(w_name)) || is_qwen35_hybrid_ssm_gate ||
+        ((is_qwen35_hybrid_ssm && is_hybrid_ssm_qkv) || is_qwen35_hybrid_ssm_gate ||
          is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
         matmul_is_prefill_phase &&
         weight->type == GGML_TYPE_Q8_0 && input->type == GGML_TYPE_F32 && M > 1 && weight->ne[0] == input->ne[0];
-    const bool is_qwen36_lm_head = model && model->output == weight && model->variant == ModelVariant::QWEN36 &&
-                                   model->arch_flags.is_hybrid_ssm;
     const bool qwen_hybrid_ssm_quant_prefill_fast_path_eligible =
         (is_hybrid_ssm_qkv || is_qwen35_hybrid_ssm_gate || is_qwen35_hybrid_ssm_out ||
          is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
@@ -6157,13 +6341,13 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         matmul_is_prefill_phase && is_qwen36_lm_head && M > 1 && input->type == GGML_TYPE_F32 &&
         weight->type == GGML_TYPE_Q4_K;
     const bool lfm2_prefill_q4k_relevant =
-        matmul_is_prefill_phase && model && model->arch_flags.is_lfm2_shortconv && M > 1 &&
+        matmul_is_prefill_phase && is_lfm2_shortconv_semantic && M > 1 &&
         input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q4_K;
     const bool lfm2_prefill_q6k_relevant =
-        matmul_is_prefill_phase && model && model->arch_flags.is_lfm2_shortconv && M > 1 &&
+        matmul_is_prefill_phase && is_lfm2_shortconv_semantic && M > 1 &&
         input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q6_K;
     const bool lfm2_prefill_quant_nrc_unsafe =
-        matmul_is_prefill_phase && model && model->arch_flags.is_lfm2_shortconv && M > 1 &&
+        matmul_is_prefill_phase && is_lfm2_shortconv_semantic && M > 1 &&
         input->type == GGML_TYPE_F32 && ggml_is_quantized(weight->type) &&
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
         true;
@@ -6227,8 +6411,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         LogMatmulDispatch(w_name, "PLAIN_GGML", M, N_dim, K_dim, "CONSERVATIVE_FALLBACK");
         LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "PLAIN_GGML_CONSERVATIVE_FALLBACK", false, false, false);
         record_graph_matmul("ggml_mul_mat");
-        return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
-                                  "temporary_reference_forced_hybrid_ssm_qkv");
+        return target_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
+                                    "temporary_reference_forced_hybrid_ssm_qkv");
     }
 
     const bool defer_cpu_repack_alias_to_batched_q4k =
@@ -6238,8 +6422,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
                           "GGML_CPU_REPACK");
         record_graph_matmul("ggml_mul_mat");
-        return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
-                                  "temporary_reference_cpu_repack_alias");
+        return target_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
+                                    "temporary_reference_cpu_repack_alias");
     }
     if (defer_cpu_repack_alias_to_batched_q4k) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
@@ -6249,8 +6433,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
                           "GGML_AMX_Q8_PREFILL", "qwen36_ssm_q8_prefill_amx");
         record_graph_matmul("ssm_projection");
-        return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
-                                  "temporary_reference_qwen36_ssm_q8_amx_alias");
+        return target_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
+                                    "temporary_reference_qwen36_ssm_q8_amx_alias");
     }
 
     if (qwen36_hybrid_ssm_q4k_prefill_relevant && !qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k) {
@@ -6272,7 +6456,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const bool force_plain_hybrid_ssm_prefill =
         matmul_is_prefill_phase &&
         ((is_hybrid_ssm_qkv && !qwen_hybrid_ssm_quant_prefill_fast_path_eligible &&
-          (!model || (model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36))) ||
+            !is_qwen_target) ||
          is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out);
     const bool force_qwen36_hybrid_ssm_q4k_native_prefill =
         (is_qwen36_hybrid_ssm_qkv || is_qwen36_hybrid_ssm_gate || is_qwen36_hybrid_ssm_out) &&
@@ -6283,19 +6467,19 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "hybrid_ssm_prefill_correctness");
         record_graph_matmul("ggml_mul_mat");
-        return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
-                                  "temporary_reference_hybrid_ssm_prefill_correctness");
+        return target_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
+                                    "temporary_reference_hybrid_ssm_prefill_correctness");
     }
 
     // LFM2 ARM prefill admits the target dense quantized projections directly
     // through DenseCore callbacks. Unknown quant types stay on native GGML until
     // a model-backed path is qualified.
-	    const bool lfm2_prefill_q5k_q6k_or_q8_relevant =
-	        matmul_is_prefill_phase && model && model->arch_flags.is_lfm2_shortconv && input->type == GGML_TYPE_F32 &&
-	        M > 1 &&
-	        (weight->type == GGML_TYPE_Q5_K || weight->type == GGML_TYPE_Q6_K || weight->type == GGML_TYPE_Q8_0);
-	    if (matmul_is_prefill_phase && model && model->arch_flags.is_lfm2_shortconv && ggml_is_quantized(weight->type) &&
-	        weight->type != GGML_TYPE_Q4_K && !lfm2_prefill_q5k_q6k_or_q8_relevant &&
+    const bool lfm2_prefill_q5k_q6k_or_q8_relevant =
+        matmul_is_prefill_phase && is_lfm2_shortconv_semantic && input->type == GGML_TYPE_F32 &&
+        M > 1 &&
+        (weight->type == GGML_TYPE_Q5_K || weight->type == GGML_TYPE_Q6_K || weight->type == GGML_TYPE_Q8_0);
+    if (matmul_is_prefill_phase && is_lfm2_shortconv_semantic && ggml_is_quantized(weight->type) &&
+        weight->type != GGML_TYPE_Q4_K && !lfm2_prefill_q5k_q6k_or_q8_relevant &&
 	        input->type == GGML_TYPE_F32 && M > 1 &&
 #if defined(__aarch64__) || defined(_M_ARM64)
         true
@@ -6306,8 +6490,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "lfm2_arm_prefill_non_q4k_reference");
         record_graph_matmul("ggml_mul_mat");
-        return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
-                                  "temporary_reference_lfm2_arm_prefill_non_q4k");
+        return target_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
+                                    "temporary_reference_lfm2_arm_prefill_non_q4k");
     }
 
     if (model && model->arch_flags.is_gemma4 && ggml_is_quantized(weight->type) && input->type == GGML_TYPE_F32 &&
@@ -6315,7 +6499,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "gemma4_prefill_quant_native");
         record_graph_matmul("ggml_mul_mat");
-        return ggml_mul_mat(ctx, weight, input);
+        return target_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
+                                    "temporary_reference_gemma4_prefill_quant_native");
     }
 
     // Qwen3.6 long-prefill logits are release-critical for correctness. The
@@ -6328,8 +6513,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "GGML_NATIVE",
                           "qwen36_lm_head_prefill_correctness");
         record_graph_matmul("ggml_mul_mat");
-        return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
-                                  "temporary_reference_qwen36_lm_head_prefill_correctness");
+        return target_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
+                                    "temporary_reference_qwen36_lm_head_prefill_correctness");
     }
 
     // ========================================================================
@@ -6391,10 +6576,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
                                                input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
     const bool is_moe_router_f32_prefill_candidate =
         model && input_cols > 1 && input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 &&
-        std::strstr(w_name, ".ffn_gate_inp.weight") != nullptr && weight->ne[0] == input->ne[0] &&
-        weight->ne[1] <= 512 && weight->ne[0] >= 512 &&
-        (model->arch_flags.is_lfm2_shortconv || model->arch_flags.is_gemma4 ||
-         model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36);
+        is_moe_router && weight->ne[0] == input->ne[0] &&
+        weight->ne[1] <= 512 && weight->ne[0] >= 512 && fallback_free_target;
     bool has_quant_vec_dot = false;
     bool has_quant_from_float = false;
     bool quant_input_size_ok = false;
@@ -6437,16 +6620,15 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         (qwen36_q4k_mode_on || lfm2_prefill_q4k_relevant ||
          (qwen36_q4k_mode_probe && qwen36_q4k_admission.state != Qwen36Q4KBatchedAdmissionState::Reject));
     const bool qwen35_dense_prefill_prefers_ggml_quant =
-        model && model->variant == ModelVariant::QWEN35 && model->hparams.n_experts <= 0 && input_cols > 1 &&
+        is_qwen35_target && model->hparams.n_experts <= 0 && input_cols > 1 &&
         false;
     const bool qwen36_prefill_prefers_ggml_quant =
-        matmul_is_prefill_phase && model && model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm &&
+        matmul_is_prefill_phase && is_qwen36_hybrid_ssm &&
         input_cols > 1 && !is_qwen_hybrid_ssm_q8_prefill &&
         (!qwen36_q4k_probe_admitted || qwen36_q4k_mode_off || qwen36_q4k_probe_rejected);
-	    const bool lfm2_prefill_prefers_ggml_quant =
-	        matmul_is_prefill_phase && model && model->variant == ModelVariant::LFM2MOE &&
-	        model->arch_flags.is_lfm2_shortconv && input_cols > 1 && weight->type == GGML_TYPE_Q4_K &&
-	        (!qwen36_q4k_probe_admitted || qwen36_q4k_probe_rejected);
+    const bool lfm2_prefill_prefers_ggml_quant =
+        matmul_is_prefill_phase && is_lfm2_shortconv_semantic && input_cols > 1 && weight->type == GGML_TYPE_Q4_K &&
+        (!qwen36_q4k_probe_admitted || qwen36_q4k_probe_rejected);
     const bool lfm2_prefill_q4k_true_batched_admitted =
         lfm2_prefill_q4k_relevant && is_compatible && input_cols <= max_small_batch_quant_cols &&
         qwen36_q4k_candidate_ready && qwen36_q4k_probe_admitted;
@@ -6497,8 +6679,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "GGML_NATIVE", false, false, false);
             LogMatmulPathOnce("ggml_mul_mat");
             record_graph_matmul("ggml_mul_mat");
-            return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
-                                      "temporary_reference_forced_hybrid_ssm_qkv");
+            return target_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
+                                        "temporary_reference_forced_hybrid_ssm_qkv");
         }
         if (input->type != GGML_TYPE_F32) {
             fprintf(stderr, "CRITICAL: smart_mul_mat input type is %d! Tensor name: %s\n", input->type, input->name);
@@ -6542,8 +6724,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "GGML_NATIVE", false, false, false);
             LogMatmulPathOnce("ggml_mul_mat");
             record_graph_matmul("ggml_mul_mat");
-            return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
-                                      "temporary_reference_forced_hybrid_ssm_qkv");
+            return target_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
+                                        "temporary_reference_forced_hybrid_ssm_qkv");
         }
         if (is_small_batch_quant_candidate) {
             const bool use_true_batched_q4k_path = quant_true_batched_kernel_ready && weight->type == GGML_TYPE_Q4_K;
@@ -6566,7 +6748,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         ud->disable_quant_nrc_fast = lfm2_prefill_quant_nrc_unsafe || lfm2_prefill_q4k_relevant;
         ud->gemma4_dense_prefill_native = gemma4_dense_prefill_native_allowed;
         ud->lfm2_q8_repacked_batched =
-            model && model->arch_flags.is_lfm2_shortconv && weight->type == GGML_TYPE_Q8_0 && input_cols > 1;
+            is_lfm2_shortconv_semantic && weight->type == GGML_TYPE_Q8_0 && input_cols > 1;
         // Qwen36 hybrid-SSM Q8_0 prefill owns a direct DenseCore path for
         // qkv/gate/out. Qwen35 requires qkv+gate direct as the minimum stable
         // set: qkv through the generic ARM quant path can corrupt delta source
@@ -6618,8 +6800,8 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     LogHybridSSMQkvDispatch(w_name, weight->type, M, N_dim, K_dim, "GGML_NATIVE", false, false, false);
     LogMatmulPathOnce("ggml_mul_mat");
     record_graph_matmul("ggml_mul_mat");
-    return qwen_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
-                              "temporary_reference_generic_matmul_fallback");
+    return target_ggml_fallback(densecore::runtime::GgmlComputeOp::Matmul,
+                                "temporary_reference_generic_matmul_fallback");
 }
 
 // ============================================================================

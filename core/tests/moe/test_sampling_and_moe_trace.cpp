@@ -1,9 +1,11 @@
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "densecore/backend/cpu_backend.h"
+#include "densecore/backend/hardware_topology.h"
 #include "densecore/hal/backend_registry.h"
 #include "densecore/hal/tensor.h"
 #include "densecore/runtime/inference.h"
@@ -229,13 +231,22 @@ TEST(MoETrace, LFM2DecodeNativeMoEGraphCallbackTaskCountTracksTopK) {
     batch.pos = {32};
     batch.block_tables = {{0, 1}};
     batch.n_past = {32};
+    InferenceConfig config{};
+    config.num_threads = 8;
+    InferenceDependencies deps{};
+    deps.config = &config;
+    batch.deps = &deps;
+
+    const int physical_cores = densecore::HardwareTopology::GetInstance().GetPhysicalCoreCount();
+    const int expected_decode_tasks = physical_cores > 0 ? std::min(config.num_threads, physical_cores)
+                                                        : config.num_threads;
 
     EXPECT_EQ(densecore::testing::ResolveNativeMoEGraphCallbackTaskCountForTest(
                   &lfm2, &batch, static_cast<int>(InferenceExecutionPhase::Decode), 1, 4),
-              4);
+              expected_decode_tasks);
     EXPECT_EQ(densecore::testing::ResolveNativeMoEGraphCallbackTaskCountForTest(
                   &lfm2, &batch, static_cast<int>(InferenceExecutionPhase::Decode), 1, 8),
-              4);
+              expected_decode_tasks);
     EXPECT_EQ(densecore::testing::ResolveNativeMoEGraphCallbackTaskCountForTest(
                   &lfm2, &batch, static_cast<int>(InferenceExecutionPhase::Prefill), 16, 4),
               GGML_N_TASKS_MAX);

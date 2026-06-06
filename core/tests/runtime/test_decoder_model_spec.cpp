@@ -21,6 +21,11 @@ bool HasOp(const densecore::models::DecoderLayerSpec& layer, densecore::models::
                        [kind](const densecore::models::DecoderSemanticOp& op) { return op.kind == kind; });
 }
 
+const densecore::models::ModelTensorExecutionRequirement* FindRequirement(
+    const densecore::models::ModelExecutionContract& contract, const char* key) {
+    return densecore::models::FindModelTensorExecutionRequirement(contract, key);
+}
+
 }  // namespace
 
 TEST(DecoderModelSpec, Gemma4MoEResolvesSemanticLayerContract) {
@@ -143,6 +148,14 @@ TEST(DecoderModelSpec, Gemma4MoEResolvesSemanticLayerContract) {
     EXPECT_EQ(contract.required_fast_path_counters[2], "gemma4_decode_maintained_fast_ops");
     ASSERT_EQ(contract.forbidden_fast_path_reasons.size(), 1u);
     EXPECT_EQ(contract.forbidden_fast_path_reasons[0], "gemma4_arm_native_moe_prefill_quality_failed");
+    ASSERT_NE(FindRequirement(contract, "moe_gate.weight"), nullptr);
+    EXPECT_EQ(FindRequirement(contract, "moe_gate.weight")->tensor_role,
+              densecore::runtime::DenseCoreTensorRole::MoERouter);
+    EXPECT_EQ(FindRequirement(contract, "moe_gate.weight")->fallback_policy,
+              densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+    ASSERT_NE(FindRequirement(contract, "ffn_gate_up_exps.weight"), nullptr);
+    EXPECT_EQ(FindRequirement(contract, "ffn_gate_up_exps.weight")->semantic_op,
+              densecore::runtime::DenseCoreSemanticOp::MoeExpertDispatch);
 
     const std::string contract_formatted = densecore::models::FormatModelExecutionContract(contract);
     EXPECT_NE(contract_formatted.find("fast_path_class=gemma4_moe"), std::string::npos);
@@ -153,6 +166,7 @@ TEST(DecoderModelSpec, Gemma4MoEResolvesSemanticLayerContract) {
               std::string::npos);
     EXPECT_NE(contract_formatted.find("forbidden_fast_paths=[gemma4_arm_native_moe_prefill_quality_failed]"),
               std::string::npos);
+    EXPECT_NE(contract_formatted.find("moe_gate.weight:moe_router"), std::string::npos);
 
     ggml_free(ctx);
 }
@@ -232,6 +246,16 @@ TEST(ModelExecutionContract, Qwen36HybridSSMMoEDeclaresLayerStateAndRebindContra
     EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresFallbackFreeFastPath(contract));
     EXPECT_TRUE(densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(contract));
     EXPECT_GE(densecore::models::ModelExecutionContractNativeMoEMaxDirectTokens(contract), 4096);
+    ASSERT_NE(FindRequirement(contract, "attn_qkv.weight"), nullptr);
+    EXPECT_EQ(FindRequirement(contract, "attn_qkv.weight")->tensor_role,
+              densecore::runtime::DenseCoreTensorRole::HybridSSMQkv);
+    EXPECT_EQ(FindRequirement(contract, "attn_qkv.weight")->semantic_op,
+              densecore::runtime::DenseCoreSemanticOp::HybridSsmMixer);
+    EXPECT_EQ(FindRequirement(contract, "attn_qkv.weight")->fallback_policy,
+              densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+    ASSERT_NE(FindRequirement(contract, "ssm_out.weight"), nullptr);
+    EXPECT_EQ(FindRequirement(contract, "ssm_out.weight")->tensor_role,
+              densecore::runtime::DenseCoreTensorRole::SSMOut);
     ASSERT_EQ(contract.layers.size(), 2u);
     ASSERT_EQ(contract.rebind_descriptors.size(), 2u);
 
@@ -258,6 +282,7 @@ TEST(ModelExecutionContract, Qwen36HybridSSMMoEDeclaresLayerStateAndRebindContra
     EXPECT_NE(formatted.find("fast_path_class=qwen_hybrid_ssm_moe"), std::string::npos);
     EXPECT_NE(formatted.find("requires_fallback_free_fast_path=true"), std::string::npos);
     EXPECT_NE(formatted.find("requires_native_moe_fast_path=true"), std::string::npos);
+    EXPECT_NE(formatted.find("attn_qkv.weight:hybrid_ssm_qkv"), std::string::npos);
     EXPECT_NE(formatted.find("native_moe_max_direct_tokens=4096"), std::string::npos);
     EXPECT_NE(formatted.find("hybrid_ssm_conv1d@layer0"), std::string::npos);
     EXPECT_NE(formatted.find("hybrid_ssm_delta@layer0"), std::string::npos);
@@ -487,6 +512,14 @@ TEST(ModelExecutionContract, LFM2ShortConvDeclaresConvOrdinalsAndRebindContract)
     EXPECT_GE(densecore::models::ModelExecutionContractNativeMoEMaxDirectTokens(contract), 4096);
     ASSERT_EQ(contract.layers.size(), 3u);
     ASSERT_EQ(contract.rebind_descriptors.size(), 2u);
+    ASSERT_NE(FindRequirement(contract, "shortconv_in_proj.weight"), nullptr);
+    EXPECT_EQ(FindRequirement(contract, "shortconv_in_proj.weight")->semantic_op,
+              densecore::runtime::DenseCoreSemanticOp::Lfm2ShortConvMixer);
+    EXPECT_EQ(FindRequirement(contract, "shortconv_in_proj.weight")->fallback_policy,
+              densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
+    ASSERT_NE(FindRequirement(contract, "ffn_down_exps.weight"), nullptr);
+    EXPECT_EQ(FindRequirement(contract, "ffn_down_exps.weight")->decode_kernel,
+              densecore::runtime::DenseCoreKernelFamily::DenseCoreQwenMoeDirect);
 
     EXPECT_TRUE(contract.layers[0].has_lfm2_shortconv_mixer);
     EXPECT_EQ(contract.layers[0].conv_ordinal, 0);
@@ -508,4 +541,5 @@ TEST(ModelExecutionContract, LFM2ShortConvDeclaresConvOrdinalsAndRebindContract)
     EXPECT_NE(formatted.find("native_moe_max_direct_tokens=4096"), std::string::npos);
     EXPECT_NE(formatted.find("lfm2_shortconv@layer0"), std::string::npos);
     EXPECT_NE(formatted.find("lfm2_shortconv@layer2"), std::string::npos);
+    EXPECT_NE(formatted.find("shortconv_in_proj.weight:shortconv_in"), std::string::npos);
 }

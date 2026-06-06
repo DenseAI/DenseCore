@@ -1,6 +1,7 @@
 #ifndef DENSECORE_PUBLIC_RUNTIME_GGML_COMPUTE_POLICY_H
 #define DENSECORE_PUBLIC_RUNTIME_GGML_COMPUTE_POLICY_H
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 
@@ -34,6 +35,30 @@ enum class DenseCoreLayerRole : int {
     MoeDown,
 };
 
+enum class DenseCoreSemanticOp : int {
+    Unknown = 0,
+    Matmul,
+    HybridSsmMixer,
+    MoeRouter,
+    MoeExpertDispatch,
+    Lfm2ShortConvMixer,
+    LmHead,
+};
+
+enum class DenseCoreTensorRole : int {
+    Unknown = 0,
+    DenseProjection,
+    HybridSSMQkv,
+    HybridSSMGate,
+    SSMOut,
+    MoERouter,
+    MoEGateUp,
+    MoEDown,
+    LmHead,
+    ShortConvIn,
+    ShortConvOut,
+};
+
 enum class DenseCoreKernelFamily : int {
     None = 0,
     DenseCoreInt4Hwy,
@@ -45,6 +70,28 @@ enum class DenseCoreKernelFamily : int {
     DenseCoreQwenMoeDirect,
     DenseCoreHal,
     TemporaryReferenceGgml,
+};
+
+enum class DenseCoreHostBackend : int {
+    Unknown = 0,
+    GenericCpu,
+    X86Amx,
+    ArmSve2,
+    GgmlCpuRepack,
+    Hal,
+};
+
+enum class DenseCoreFallbackPolicyKind : int {
+    CompatibilityFallback = 0,
+    FallbackFreeTarget,
+};
+
+struct HostKernelCapabilities {
+    bool x86_amx = false;
+    bool arm_sve2 = false;
+    bool q4k_true_batched = false;
+    bool q5k_8x8 = false;
+    bool ggml_repack = false;
 };
 
 struct QwenHotPathPlan {
@@ -71,6 +118,17 @@ struct DenseCoreMatmulPlan {
     bool target_qwen_hot_path = false;
 };
 
+struct KernelResolution {
+    DenseCoreMatmulPlan matmul_plan;
+    DenseCoreSemanticOp semantic_op = DenseCoreSemanticOp::Unknown;
+    DenseCoreTensorRole tensor_role = DenseCoreTensorRole::Unknown;
+    DenseCoreKernelFamily selected_kernel = DenseCoreKernelFamily::None;
+    DenseCoreHostBackend host_backend = DenseCoreHostBackend::Unknown;
+    DenseCoreFallbackPolicyKind fallback_policy = DenseCoreFallbackPolicyKind::CompatibilityFallback;
+    std::array<const char*, 4> rejected{};
+    int rejected_count = 0;
+};
+
 inline const char* GgmlComputeOpName(GgmlComputeOp op) {
     switch (op) {
     case GgmlComputeOp::Matmul: return "ggml_mul_mat";
@@ -79,6 +137,56 @@ inline const char* GgmlComputeOpName(GgmlComputeOp op) {
     case GgmlComputeOp::QuantizeKv: return "ggml_quantize_kv";
     case GgmlComputeOp::Attention: return "ggml_attention";
     default: return "unknown";
+    }
+}
+
+inline const char* DenseCoreSemanticOpName(DenseCoreSemanticOp op) {
+    switch (op) {
+    case DenseCoreSemanticOp::Matmul: return "matmul";
+    case DenseCoreSemanticOp::HybridSsmMixer: return "hybrid_ssm_mixer";
+    case DenseCoreSemanticOp::MoeRouter: return "moe_router";
+    case DenseCoreSemanticOp::MoeExpertDispatch: return "moe_expert_dispatch";
+    case DenseCoreSemanticOp::Lfm2ShortConvMixer: return "lfm2_shortconv_mixer";
+    case DenseCoreSemanticOp::LmHead: return "lm_head";
+    default: return "unknown";
+    }
+}
+
+inline const char* DenseCoreTensorRoleName(DenseCoreTensorRole role) {
+    switch (role) {
+    case DenseCoreTensorRole::DenseProjection: return "dense_projection";
+    case DenseCoreTensorRole::HybridSSMQkv: return "hybrid_ssm_qkv";
+    case DenseCoreTensorRole::HybridSSMGate: return "hybrid_ssm_gate";
+    case DenseCoreTensorRole::SSMOut: return "ssm_out";
+    case DenseCoreTensorRole::MoERouter: return "moe_router";
+    case DenseCoreTensorRole::MoEGateUp: return "moe_gate_up";
+    case DenseCoreTensorRole::MoEDown: return "moe_down";
+    case DenseCoreTensorRole::LmHead: return "lm_head";
+    case DenseCoreTensorRole::ShortConvIn: return "shortconv_in";
+    case DenseCoreTensorRole::ShortConvOut: return "shortconv_out";
+    default: return "unknown";
+    }
+}
+
+inline bool IsHybridSsmTensorRole(DenseCoreTensorRole role) {
+    return role == DenseCoreTensorRole::HybridSSMQkv || role == DenseCoreTensorRole::HybridSSMGate ||
+           role == DenseCoreTensorRole::SSMOut;
+}
+
+inline bool IsShortConvTensorRole(DenseCoreTensorRole role) {
+    return role == DenseCoreTensorRole::ShortConvIn || role == DenseCoreTensorRole::ShortConvOut;
+}
+
+inline bool IsMoeExpertTensorRole(DenseCoreTensorRole role) {
+    return role == DenseCoreTensorRole::MoEGateUp || role == DenseCoreTensorRole::MoEDown;
+}
+
+inline int HybridSsmProjectionKind(DenseCoreTensorRole role) {
+    switch (role) {
+    case DenseCoreTensorRole::HybridSSMQkv: return 1;
+    case DenseCoreTensorRole::HybridSSMGate: return 2;
+    case DenseCoreTensorRole::SSMOut: return 3;
+    default: return 0;
     }
 }
 
@@ -127,6 +235,25 @@ inline const char* DenseCoreKernelFamilyName(DenseCoreKernelFamily family) {
     }
 }
 
+inline const char* DenseCoreHostBackendName(DenseCoreHostBackend backend) {
+    switch (backend) {
+    case DenseCoreHostBackend::GenericCpu: return "generic_cpu";
+    case DenseCoreHostBackend::X86Amx: return "x86_amx";
+    case DenseCoreHostBackend::ArmSve2: return "arm_sve2";
+    case DenseCoreHostBackend::GgmlCpuRepack: return "ggml_cpu_repack";
+    case DenseCoreHostBackend::Hal: return "hal";
+    default: return "unknown";
+    }
+}
+
+inline const char* DenseCoreFallbackPolicyKindName(DenseCoreFallbackPolicyKind policy) {
+    switch (policy) {
+    case DenseCoreFallbackPolicyKind::FallbackFreeTarget: return "fallback_free_target";
+    case DenseCoreFallbackPolicyKind::CompatibilityFallback: return "compatibility_fallback";
+    }
+    return "unknown";
+}
+
 inline DenseCoreLayerRole ResolveDenseCoreLayerRole(const TransformerModel* model, const char* weight_name,
                                                     bool is_lm_head) {
     if (is_lm_head) {
@@ -134,6 +261,9 @@ inline DenseCoreLayerRole ResolveDenseCoreLayerRole(const TransformerModel* mode
     }
     if (!weight_name) {
         return DenseCoreLayerRole::Unknown;
+    }
+    if (std::strstr(weight_name, "ffn_gate_inp") || std::strstr(weight_name, "moe_gate")) {
+        return DenseCoreLayerRole::MoeGate;
     }
     if (std::strstr(weight_name, "ffn_gate_exps")) return DenseCoreLayerRole::MoeGate;
     if (std::strstr(weight_name, "ffn_up_exps")) return DenseCoreLayerRole::MoeUp;
@@ -144,6 +274,79 @@ inline DenseCoreLayerRole ResolveDenseCoreLayerRole(const TransformerModel* mode
         if (std::strstr(weight_name, "ssm_out")) return DenseCoreLayerRole::HybridSsmOut;
     }
     return DenseCoreLayerRole::DenseProjection;
+}
+
+inline DenseCoreTensorRole TensorRoleFromLayerRole(DenseCoreLayerRole role) {
+    switch (role) {
+    case DenseCoreLayerRole::DenseProjection: return DenseCoreTensorRole::DenseProjection;
+    case DenseCoreLayerRole::HybridSsmQkv: return DenseCoreTensorRole::HybridSSMQkv;
+    case DenseCoreLayerRole::HybridSsmGate: return DenseCoreTensorRole::HybridSSMGate;
+    case DenseCoreLayerRole::HybridSsmOut: return DenseCoreTensorRole::SSMOut;
+    case DenseCoreLayerRole::LmHead: return DenseCoreTensorRole::LmHead;
+    case DenseCoreLayerRole::MoeGate:
+    case DenseCoreLayerRole::MoeUp: return DenseCoreTensorRole::MoEGateUp;
+    case DenseCoreLayerRole::MoeDown: return DenseCoreTensorRole::MoEDown;
+    default: return DenseCoreTensorRole::Unknown;
+    }
+}
+
+inline DenseCoreTensorRole ResolveDenseCoreTensorRole(const TransformerModel* model, const char* weight_name,
+                                                      bool is_lm_head) {
+    if (is_lm_head) {
+        return DenseCoreTensorRole::LmHead;
+    }
+    if (weight_name) {
+        if (std::strstr(weight_name, "shortconv.in") || std::strstr(weight_name, "conv_L_cache") ||
+            std::strstr(weight_name, "short_conv_in") || std::strstr(weight_name, "shortconv_in_proj")) {
+            return DenseCoreTensorRole::ShortConvIn;
+        }
+        if (std::strstr(weight_name, "shortconv.out") || std::strstr(weight_name, "short_conv_out") ||
+            std::strstr(weight_name, "shortconv_out_proj")) {
+            return DenseCoreTensorRole::ShortConvOut;
+        }
+        if (std::strstr(weight_name, "ffn_gate_inp") || std::strstr(weight_name, "moe_gate")) {
+            return DenseCoreTensorRole::MoERouter;
+        }
+        if (std::strstr(weight_name, "ffn_gate_up_exps") || std::strstr(weight_name, "experts.gate_up_proj")) {
+            return DenseCoreTensorRole::MoEGateUp;
+        }
+    }
+    return TensorRoleFromLayerRole(ResolveDenseCoreLayerRole(model, weight_name, is_lm_head));
+}
+
+inline DenseCoreSemanticOp ResolveDenseCoreSemanticOp(const TransformerModel* model, DenseCoreTensorRole role) {
+    switch (role) {
+    case DenseCoreTensorRole::HybridSSMQkv:
+    case DenseCoreTensorRole::HybridSSMGate:
+    case DenseCoreTensorRole::SSMOut: return DenseCoreSemanticOp::HybridSsmMixer;
+    case DenseCoreTensorRole::MoERouter: return DenseCoreSemanticOp::MoeRouter;
+    case DenseCoreTensorRole::MoEGateUp:
+    case DenseCoreTensorRole::MoEDown: return DenseCoreSemanticOp::MoeExpertDispatch;
+    case DenseCoreTensorRole::ShortConvIn:
+    case DenseCoreTensorRole::ShortConvOut: return DenseCoreSemanticOp::Lfm2ShortConvMixer;
+    case DenseCoreTensorRole::LmHead: return DenseCoreSemanticOp::LmHead;
+    case DenseCoreTensorRole::DenseProjection:
+        if (model && model->arch_flags.is_lfm2_shortconv) {
+            return DenseCoreSemanticOp::Lfm2ShortConvMixer;
+        }
+        return DenseCoreSemanticOp::Matmul;
+    default: return DenseCoreSemanticOp::Unknown;
+    }
+}
+
+inline HostKernelCapabilities CompileTimeHostKernelCapabilities(bool q4k_true_batched = false,
+                                                                bool ggml_repack = false) {
+    HostKernelCapabilities caps;
+#if defined(__x86_64__) || defined(_M_X64)
+    caps.x86_amx = true;
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    caps.arm_sve2 = true;
+#endif
+    caps.q4k_true_batched = q4k_true_batched;
+    caps.q5k_8x8 = caps.x86_amx || caps.arm_sve2;
+    caps.ggml_repack = ggml_repack;
+    return caps;
 }
 
 inline DenseCoreMatmulPlan ResolveDenseCoreMatmulPlan(const TransformerModel* model, ggml_type weight_type,
@@ -178,6 +381,78 @@ inline DenseCoreMatmulPlan ResolveDenseCoreMatmulPlan(const TransformerModel* mo
         plan.kernel = DenseCoreKernelFamily::DenseCoreQuantGemv;
     }
     return plan;
+}
+
+inline DenseCoreHostBackend ResolveDenseCoreHostBackend(DenseCoreKernelFamily kernel,
+                                                        const HostKernelCapabilities& caps) {
+    if (kernel == DenseCoreKernelFamily::DenseCoreHal) {
+        return DenseCoreHostBackend::Hal;
+    }
+    if (caps.ggml_repack && kernel == DenseCoreKernelFamily::TemporaryReferenceGgml) {
+        return DenseCoreHostBackend::GgmlCpuRepack;
+    }
+    if (caps.arm_sve2 &&
+        (kernel == DenseCoreKernelFamily::DenseCoreQ4KBatched ||
+         kernel == DenseCoreKernelFamily::DenseCoreQuantGemv)) {
+        return DenseCoreHostBackend::ArmSve2;
+    }
+    if (caps.x86_amx &&
+        (kernel == DenseCoreKernelFamily::DenseCoreQ4KBatched ||
+         kernel == DenseCoreKernelFamily::DenseCoreQuantGemv ||
+         kernel == DenseCoreKernelFamily::DenseCoreF32Gemv)) {
+        return DenseCoreHostBackend::X86Amx;
+    }
+    return DenseCoreHostBackend::GenericCpu;
+}
+
+inline KernelResolution ResolveKernelResolution(const TransformerModel* model, ggml_type weight_type,
+                                                ggml_type input_type, int64_t m, int64_t n, int64_t k,
+                                                DenseCoreMatmulPhase phase, const char* weight_name,
+                                                bool is_lm_head, bool compatible,
+                                                HostKernelCapabilities caps = HostKernelCapabilities{},
+                                                DenseCoreSemanticOp semantic_override = DenseCoreSemanticOp::Unknown,
+                                                DenseCoreTensorRole role_override = DenseCoreTensorRole::Unknown,
+                                                DenseCoreKernelFamily kernel_override = DenseCoreKernelFamily::None,
+                                                DenseCoreFallbackPolicyKind fallback_policy_override =
+                                                    DenseCoreFallbackPolicyKind::CompatibilityFallback,
+                                                bool has_fallback_policy_override = false) {
+    KernelResolution resolution;
+    resolution.matmul_plan = ResolveDenseCoreMatmulPlan(model, weight_type, input_type, m, n, k, phase, weight_name,
+                                                        is_lm_head, compatible);
+    resolution.tensor_role = role_override != DenseCoreTensorRole::Unknown
+                                 ? role_override
+                                 : ResolveDenseCoreTensorRole(model, weight_name, is_lm_head);
+    resolution.semantic_op = semantic_override != DenseCoreSemanticOp::Unknown
+                                 ? semantic_override
+                                 : ResolveDenseCoreSemanticOp(model, resolution.tensor_role);
+    resolution.selected_kernel =
+        kernel_override != DenseCoreKernelFamily::None ? kernel_override : resolution.matmul_plan.kernel;
+    resolution.fallback_policy =
+        has_fallback_policy_override
+            ? fallback_policy_override
+            : (resolution.matmul_plan.target_qwen_hot_path ? DenseCoreFallbackPolicyKind::FallbackFreeTarget
+                                                           : DenseCoreFallbackPolicyKind::CompatibilityFallback);
+    resolution.host_backend = ResolveDenseCoreHostBackend(resolution.selected_kernel, caps);
+
+    auto reject = [&resolution](const char* reason) {
+        if (resolution.rejected_count < static_cast<int>(resolution.rejected.size())) {
+            resolution.rejected[static_cast<std::size_t>(resolution.rejected_count)] = reason;
+        }
+        ++resolution.rejected_count;
+    };
+    if (!compatible) {
+        reject("incompatible_shape");
+    }
+    if (input_type != GGML_TYPE_F32) {
+        reject("unsupported_input_type");
+    }
+    if (weight_type == GGML_TYPE_Q4_K && m > 1 && !caps.q4k_true_batched) {
+        reject("q4k_true_batched_unavailable");
+    }
+    if (resolution.selected_kernel == DenseCoreKernelFamily::None) {
+        reject("no_selected_kernel");
+    }
+    return resolution;
 }
 
 inline bool IsExplicitTemporaryReferenceFallback(const char* reason) {
