@@ -138,11 +138,32 @@ void AddForbiddenFastPath(ModelExecutionContract* contract, const char* reason) 
     contract->forbidden_fast_path_reasons.push_back(reason);
 }
 
-void AddRequiredFastPathCounter(ModelExecutionContract* contract, const char* counter) {
-    if (!contract || !counter) {
+void AddRequiredFastPathCounter(ModelExecutionContract* contract, ExecutionFastPathCounterKind counter) {
+    if (!contract || counter == ExecutionFastPathCounterKind::Unknown) {
         return;
     }
-    contract->required_fast_path_counters.push_back(counter);
+    contract->required_fast_path_counter_kinds.push_back(counter);
+    contract->required_fast_path_counters.push_back(ExecutionFastPathCounterKindName(counter));
+}
+
+const char* SafeGgmlTypeName(ggml_type type) {
+    return type >= 0 && type < GGML_TYPE_COUNT ? ggml_type_name(type) : "unknown";
+}
+
+std::string ShapeLabel(int64_t m, int64_t n, int64_t k) {
+    std::ostringstream oss;
+    oss << "m" << (m > 0 ? std::to_string(m) : "?") << "xn" << (n > 0 ? std::to_string(n) : "?") << "xk"
+        << (k > 0 ? std::to_string(k) : "?");
+    return oss.str();
+}
+
+std::string MissingKernelReason(const ModelSemanticGraphNode& node,
+                                const densecore::runtime::KernelResolution& resolution) {
+    std::ostringstream oss;
+    oss << "missing_kernel:" << densecore::runtime::DenseCoreSemanticOpName(node.semantic_op) << "/"
+        << SafeGgmlTypeName(node.raw_gguf_type) << "/" << ShapeLabel(node.m, node.n, node.k) << "/"
+        << densecore::runtime::DenseCoreHostBackendName(resolution.host_backend);
+    return oss.str();
 }
 
 bool IsFallbackFreeTargetModel(const TransformerModel* model) {
@@ -229,6 +250,10 @@ ModelTensorExecutionRequirement MakeTensorRequirement(const TransformerModel* mo
     requirement.tensor_role = loader_role != densecore::runtime::DenseCoreTensorRole::Unknown ? loader_role : role;
     requirement.semantic_op = densecore::runtime::ResolveDenseCoreSemanticOp(model, requirement.tensor_role);
     requirement.raw_gguf_type = tensor ? tensor->type : GGML_TYPE_COUNT;
+    if (tensor) {
+        requirement.tensor_cols = tensor->ne[0];
+        requirement.tensor_rows = tensor->ne[1];
+    }
     requirement.canonical_layout = ResolveCanonicalLayout(model, tensor, requirement.tensor_role);
     requirement.repacked_layout = ExecutionQuantLayoutKind::Unknown;
     if (model && tensor) {
@@ -403,22 +428,22 @@ ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model
     contract.requires_native_moe_fast_path = contract.fast_path_class == ExecutionFastPathClass::QwenHybridSSMMoE ||
                                              contract.fast_path_class == ExecutionFastPathClass::LFM2ShortConvMoE;
     if (contract.requires_fallback_free_fast_path) {
-        AddRequiredFastPathCounter(&contract, "target_no_ggml_path");
+        AddRequiredFastPathCounter(&contract, ExecutionFastPathCounterKind::TargetNoGgmlPath);
     }
     if (contract.requires_native_moe_fast_path) {
-        AddRequiredFastPathCounter(&contract, "native_moe_fast_w1w3_used_ops");
-        AddRequiredFastPathCounter(&contract, "native_moe_fast_w2_used_ops");
+        AddRequiredFastPathCounter(&contract, ExecutionFastPathCounterKind::NativeMoeFastW1W3UsedOps);
+        AddRequiredFastPathCounter(&contract, ExecutionFastPathCounterKind::NativeMoeFastW2UsedOps);
     }
     if (contract.has_hybrid_ssm_mixer) {
-        AddRequiredFastPathCounter(&contract, "ssm_conv1d_calls");
-        AddRequiredFastPathCounter(&contract, "ssm_delta_calls");
+        AddRequiredFastPathCounter(&contract, ExecutionFastPathCounterKind::SsmConv1DCalls);
+        AddRequiredFastPathCounter(&contract, ExecutionFastPathCounterKind::SsmDeltaCalls);
     }
     if (contract.fast_path_class == ExecutionFastPathClass::LFM2ShortConvMoE) {
-        AddRequiredFastPathCounter(&contract, "lfm2_shortconv_sequence_fast_used_ops");
+        AddRequiredFastPathCounter(&contract, ExecutionFastPathCounterKind::Lfm2ShortConvSequenceFastUsedOps);
     }
     if (contract.fast_path_class == ExecutionFastPathClass::Gemma4MoE) {
-        AddRequiredFastPathCounter(&contract, "gemma4_prefill_maintained_fast_ops");
-        AddRequiredFastPathCounter(&contract, "gemma4_decode_maintained_fast_ops");
+        AddRequiredFastPathCounter(&contract, ExecutionFastPathCounterKind::Gemma4PrefillMaintainedFastOps);
+        AddRequiredFastPathCounter(&contract, ExecutionFastPathCounterKind::Gemma4DecodeMaintainedFastOps);
         AddForbiddenFastPath(&contract, "gemma4_arm_native_moe_prefill_quality_failed");
     }
     if (contract.requires_native_moe_fast_path) {
@@ -444,6 +469,7 @@ ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model
     if (!contract.valid) {
         contract.decode_graph_cache_static_safe = false;
     }
+    contract.semantic_graph_nodes = BuildModelSemanticGraph(contract);
     return contract;
 }
 
@@ -467,6 +493,83 @@ int64_t ModelExecutionContractNativeMoEMaxDirectTokens(const ModelExecutionContr
     return contract.valid ? contract.native_moe_max_direct_tokens : 0;
 }
 
+std::vector<ModelSemanticGraphNode> BuildModelSemanticGraph(const ModelExecutionContract& contract) {
+    std::vector<ModelSemanticGraphNode> nodes;
+    nodes.reserve(contract.tensor_requirements.size() * 2);
+    for (const auto& requirement : contract.tensor_requirements) {
+        if (requirement.raw_gguf_type == GGML_TYPE_COUNT) {
+            continue;
+        }
+        for (const auto phase :
+             {densecore::runtime::DenseCoreMatmulPhase::Prefill, densecore::runtime::DenseCoreMatmulPhase::Decode}) {
+            ModelSemanticGraphNode node{};
+            node.layer_index = requirement.layer_index;
+            node.tensor_key = requirement.tensor_key;
+            node.semantic_op = requirement.semantic_op;
+            node.tensor_role = requirement.tensor_role;
+            node.raw_gguf_type = requirement.raw_gguf_type;
+            node.canonical_layout = requirement.canonical_layout;
+            node.phase = phase;
+            node.required_kernel = ModelTensorExecutionRequirementKernelForPhase(requirement, phase);
+            node.fallback_policy = requirement.fallback_policy;
+            node.m = phase == densecore::runtime::DenseCoreMatmulPhase::Prefill ? 2 : 1;
+            node.n = requirement.tensor_rows;
+            node.k = requirement.tensor_cols;
+            nodes.push_back(std::move(node));
+        }
+    }
+    return nodes;
+}
+
+KernelCoverageValidationResult ValidateFallbackFreeKernelCoverage(
+    const TransformerModel* model, const ModelExecutionContract& contract,
+    densecore::runtime::HostKernelCapabilities caps) {
+    KernelCoverageValidationResult result{};
+    result.required = ModelExecutionContractRequiresFallbackFreeFastPath(contract);
+    const std::vector<ModelSemanticGraphNode> nodes = contract.semantic_graph_nodes.empty()
+                                                          ? BuildModelSemanticGraph(contract)
+                                                          : contract.semantic_graph_nodes;
+    for (const auto& node : nodes) {
+        if (node.fallback_policy != densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget) {
+            continue;
+        }
+        ++result.graph_node_count;
+        const auto resolution = densecore::runtime::ResolveKernelResolution(
+            model, node.raw_gguf_type, GGML_TYPE_F32, node.m, node.n, node.k, node.phase, node.tensor_key.c_str(),
+            node.tensor_role == densecore::runtime::DenseCoreTensorRole::LmHead, /*compatible=*/true, caps,
+            node.semantic_op, node.tensor_role, node.required_kernel, node.fallback_policy,
+            /*has_fallback_policy_override=*/true);
+        const bool covered = resolution.selected_kernel != densecore::runtime::DenseCoreKernelFamily::None &&
+                             resolution.selected_kernel !=
+                                 densecore::runtime::DenseCoreKernelFamily::TemporaryReferenceGgml &&
+                             resolution.rejected_count == 0 &&
+                             resolution.fallback_policy ==
+                                 densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget;
+        if (covered) {
+            ++result.covered_node_count;
+        } else {
+            result.missing_kernel_reasons.push_back(MissingKernelReason(node, resolution));
+        }
+    }
+    result.fallback_free = result.missing_kernel_reasons.empty();
+    return result;
+}
+
+std::string FormatKernelCoverageValidationResult(const KernelCoverageValidationResult& result) {
+    std::ostringstream oss;
+    oss << "KernelCoverage{required=" << (result.required ? "true" : "false")
+        << ",fallback_free=" << (result.fallback_free ? "true" : "false")
+        << ",covered=" << result.covered_node_count << "/" << result.graph_node_count << ",missing=[";
+    for (std::size_t i = 0; i < result.missing_kernel_reasons.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << result.missing_kernel_reasons[i];
+    }
+    oss << "]}";
+    return oss.str();
+}
+
 ModelTensorExecutionRequirement ResolveModelTensorExecutionRequirement(const TransformerModel* model,
                                                                        const char* tensor_name, bool is_lm_head,
                                                                        ggml_type raw_type) {
@@ -487,6 +590,10 @@ ModelTensorExecutionRequirement ResolveModelTensorExecutionRequirement(const Tra
     requirement.tensor_role = role;
     requirement.semantic_op = densecore::runtime::ResolveDenseCoreSemanticOp(model, role);
     requirement.raw_gguf_type = raw_type;
+    if (tensor) {
+        requirement.tensor_cols = tensor->ne[0];
+        requirement.tensor_rows = tensor->ne[1];
+    }
     requirement.canonical_layout = ExecutionQuantLayoutKind::RawGGUF;
     requirement.repacked_layout = ExecutionQuantLayoutKind::Unknown;
     FinalizeTensorRequirement(model, &requirement);
@@ -511,6 +618,26 @@ FindModelTensorExecutionRequirement(const ModelExecutionContract& contract, cons
         return &requirement;
     }
     return nullptr;
+}
+
+densecore::runtime::DenseCoreKernelFamily ModelTensorExecutionRequirementKernelForPhase(
+    const ModelTensorExecutionRequirement& requirement, densecore::runtime::DenseCoreMatmulPhase phase) {
+    switch (phase) {
+    case densecore::runtime::DenseCoreMatmulPhase::Prefill: return requirement.prefill_kernel;
+    case densecore::runtime::DenseCoreMatmulPhase::Decode: return requirement.decode_kernel;
+    case densecore::runtime::DenseCoreMatmulPhase::Unknown:
+    default: return densecore::runtime::DenseCoreKernelFamily::None;
+    }
+}
+
+densecore::runtime::KernelResolution ResolveModelTensorKernelResolution(
+    const TransformerModel* model, const ModelTensorExecutionRequirement& requirement, ggml_type weight_type,
+    ggml_type input_type, int64_t m, int64_t n, int64_t k, densecore::runtime::DenseCoreMatmulPhase phase,
+    const char* weight_name, bool is_lm_head, bool compatible, densecore::runtime::HostKernelCapabilities caps) {
+    return densecore::runtime::ResolveKernelResolution(
+        model, weight_type, input_type, m, n, k, phase, weight_name, is_lm_head, compatible, caps,
+        requirement.semantic_op, requirement.tensor_role, ModelTensorExecutionRequirementKernelForPhase(requirement, phase),
+        requirement.fallback_policy, /*has_fallback_policy_override=*/true);
 }
 
 const char* ExecutionRuntimeStateKindName(ExecutionRuntimeStateKind kind) {
@@ -578,8 +705,100 @@ const char* ExecutionQuantLayoutKindName(ExecutionQuantLayoutKind kind) {
     return "unknown";
 }
 
+const char* ExecutionFastPathCounterKindName(ExecutionFastPathCounterKind kind) {
+    switch (kind) {
+    case ExecutionFastPathCounterKind::TargetNoGgmlPath: return "target_no_ggml_path";
+    case ExecutionFastPathCounterKind::NativeMoeFastW1W3UsedOps: return "native_moe_fast_w1w3_used_ops";
+    case ExecutionFastPathCounterKind::NativeMoeFastW2UsedOps: return "native_moe_fast_w2_used_ops";
+    case ExecutionFastPathCounterKind::SsmConv1DCalls: return "ssm_conv1d_calls";
+    case ExecutionFastPathCounterKind::SsmDeltaCalls: return "ssm_delta_calls";
+    case ExecutionFastPathCounterKind::Lfm2ShortConvSequenceFastUsedOps:
+        return "lfm2_shortconv_sequence_fast_used_ops";
+    case ExecutionFastPathCounterKind::Gemma4PrefillMaintainedFastOps:
+        return "gemma4_prefill_maintained_fast_ops";
+    case ExecutionFastPathCounterKind::Gemma4DecodeMaintainedFastOps:
+        return "gemma4_decode_maintained_fast_ops";
+    case ExecutionFastPathCounterKind::Unknown:
+    default: return "unknown";
+    }
+}
+
+ExecutionFastPathCounterKind ExecutionFastPathCounterKindFromName(const std::string& name) {
+    if (name == "target_no_ggml_path") {
+        return ExecutionFastPathCounterKind::TargetNoGgmlPath;
+    }
+    if (name == "native_moe_fast_w1w3_used_ops") {
+        return ExecutionFastPathCounterKind::NativeMoeFastW1W3UsedOps;
+    }
+    if (name == "native_moe_fast_w2_used_ops") {
+        return ExecutionFastPathCounterKind::NativeMoeFastW2UsedOps;
+    }
+    if (name == "ssm_conv1d_calls") {
+        return ExecutionFastPathCounterKind::SsmConv1DCalls;
+    }
+    if (name == "ssm_delta_calls") {
+        return ExecutionFastPathCounterKind::SsmDeltaCalls;
+    }
+    if (name == "lfm2_shortconv_sequence_fast_used_ops") {
+        return ExecutionFastPathCounterKind::Lfm2ShortConvSequenceFastUsedOps;
+    }
+    if (name == "gemma4_prefill_maintained_fast_ops") {
+        return ExecutionFastPathCounterKind::Gemma4PrefillMaintainedFastOps;
+    }
+    if (name == "gemma4_decode_maintained_fast_ops") {
+        return ExecutionFastPathCounterKind::Gemma4DecodeMaintainedFastOps;
+    }
+    return ExecutionFastPathCounterKind::Unknown;
+}
+
+std::vector<ExecutionFastPathCounterKind> ModelExecutionContractRequiredFastPathCounterKinds(
+    const ModelExecutionContract& contract) {
+    if (!contract.required_fast_path_counter_kinds.empty()) {
+        return contract.required_fast_path_counter_kinds;
+    }
+
+    std::vector<ExecutionFastPathCounterKind> kinds;
+    kinds.reserve(contract.required_fast_path_counters.size());
+    for (const std::string& counter : contract.required_fast_path_counters) {
+        const auto kind = ExecutionFastPathCounterKindFromName(counter);
+        if (kind != ExecutionFastPathCounterKind::Unknown) {
+            kinds.push_back(kind);
+        }
+    }
+    return kinds;
+}
+
+std::string FormatModelExecutionContractRequiredFastPathCounters(const ModelExecutionContract& contract) {
+    const std::vector<ExecutionFastPathCounterKind> kinds = ModelExecutionContractRequiredFastPathCounterKinds(contract);
+    if (kinds.empty() && contract.required_fast_path_counters.empty()) {
+        return "none";
+    }
+
+    std::ostringstream oss;
+    bool any = false;
+    for (const auto kind : kinds) {
+        if (any) {
+            oss << ",";
+        }
+        oss << ExecutionFastPathCounterKindName(kind);
+        any = true;
+    }
+    for (const std::string& counter : contract.required_fast_path_counters) {
+        if (ExecutionFastPathCounterKindFromName(counter) != ExecutionFastPathCounterKind::Unknown) {
+            continue;
+        }
+        if (any) {
+            oss << ",";
+        }
+        oss << counter;
+        any = true;
+    }
+    return any ? oss.str() : "none";
+}
+
 std::string FormatModelExecutionContract(const ModelExecutionContract& contract) {
     std::ostringstream oss;
+    const std::string required_fast_path_counters = FormatModelExecutionContractRequiredFastPathCounters(contract);
     oss << "ModelExecutionContract{variant=" << static_cast<int>(contract.variant)
         << ",topology=" << DecoderRuntimeTopologyName(contract.decoder_runtime_topology)
         << ",valid=" << (contract.valid ? "true" : "false") << ",has_moe=" << (contract.has_moe ? "true" : "false")
@@ -592,13 +811,11 @@ std::string FormatModelExecutionContract(const ModelExecutionContract& contract)
         << ",decode_cache_static_safe=" << (contract.decode_graph_cache_static_safe ? "true" : "false")
         << ",requires_rebind=" << (contract.requires_decode_graph_runtime_rebind ? "true" : "false")
         << ",required_fast_path_counters=[";
-    for (std::size_t i = 0; i < contract.required_fast_path_counters.size(); ++i) {
-        if (i != 0) {
-            oss << ",";
-        }
-        oss << contract.required_fast_path_counters[i];
+    if (required_fast_path_counters != "none") {
+        oss << required_fast_path_counters;
     }
-    oss << "]" << ",forbidden_fast_paths=[";
+    oss << "]"
+        << ",forbidden_fast_paths=[";
     for (std::size_t i = 0; i < contract.forbidden_fast_path_reasons.size(); ++i) {
         if (i != 0) {
             oss << ",";
@@ -638,10 +855,11 @@ std::string FormatModelExecutionContract(const ModelExecutionContract& contract)
         oss << requirement.tensor_key << ":" << densecore::runtime::DenseCoreTensorRoleName(requirement.tensor_role)
             << ":prefill=" << densecore::runtime::DenseCoreKernelFamilyName(requirement.prefill_kernel)
             << ":decode=" << densecore::runtime::DenseCoreKernelFamilyName(requirement.decode_kernel)
+            << ":shape=" << ShapeLabel(0, requirement.tensor_rows, requirement.tensor_cols)
             << ":layout=" << ExecutionQuantLayoutKindName(requirement.canonical_layout)
             << ":fallback=" << densecore::runtime::DenseCoreFallbackPolicyKindName(requirement.fallback_policy);
     }
-    oss << "]}";
+    oss << "],semantic_graph_nodes=" << contract.semantic_graph_nodes.size() << "}";
     return oss.str();
 }
 

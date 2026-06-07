@@ -139,6 +139,14 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
             return false;
         }
         auto packed = GetOrCreateQ5KRepackedMoEWeight(weight_ptr, N, K);
+        if (packed && M >= 4 &&
+            RunQ5KRepackedMoEGemmM4(backend, packed, in_data, out_data, M, N, K, numa_node, allow_parallel)) {
+            RecordMoEQ5KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/true, nullptr);
+            LogMoEMatmulPath("ggml_q5k_repacked_prefill_gemm_m4", static_cast<int>(M), static_cast<int>(K),
+                             static_cast<int>(N), 0, allow_parallel);
+            record_dispatch("moe_expert");
+            return true;
+        }
         if (packed && RunQ5KRepackedMoEGemv(backend, packed, qinput_data, iq_row_bytes, out_data, M, N, numa_node,
                                             allow_parallel)) {
             RecordMoEQ5KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/true, nullptr);
@@ -150,6 +158,29 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
         RecordMoEQ5KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "pack_or_run_failed");
         return false;
     };
+    const auto try_q6k_repacked_gemm = [&]() -> bool {
+        if (wtype != GGML_TYPE_Q6_K) {
+            return false;
+        }
+        const bool q6k_input_supported = iq_type == GGML_TYPE_Q8_K;
+        const bool q6k_shape_supported =
+            q6k_input_supported && (N % 8) == 0 && (K % ggml_blck_size(GGML_TYPE_Q6_K)) == 0;
+        if (!q6k_shape_supported || !CanUseQ6KRepackedMoEGemvFastPath()) {
+            return false;
+        }
+        auto packed = GetOrCreateQ6KRepackedMoEWeight(weight_ptr, N, K);
+        if (packed && M >= 4 &&
+            RunQ6KRepackedMoEGemmM4(backend, packed, in_data, out_data, M, N, K, numa_node, allow_parallel)) {
+            LogMoEMatmulPath("ggml_q6k_repacked_prefill_gemm_m4", static_cast<int>(M), static_cast<int>(K),
+                             static_cast<int>(N), 0, allow_parallel);
+            record_dispatch("moe_expert");
+            return true;
+        }
+        return false;
+    };
+    if (try_q5k_repacked_gemv() || try_q6k_repacked_gemm()) {
+        return true;
+    }
     const bool enable_q4k_repacked_projection_prefill = true;
     if (enable_q4k_repacked_projection_prefill && q4k_prefill_repacked_eligible && prefer_q4k_repacked_prefill) {
         auto packed = GetOrCreateQ4KRepackedMoEWeight(weight_ptr, N, K);
@@ -217,10 +248,6 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
         LogMoEMatmulPath(path_name, static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), 0, allow_parallel);
         record_q4k_repacked(false, "rowpair_used");
         record_dispatch("moe_rowblock");
-        return true;
-    }
-
-    if (try_q5k_repacked_gemv()) {
         return true;
     }
 

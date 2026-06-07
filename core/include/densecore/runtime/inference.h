@@ -429,6 +429,10 @@ struct Qwen36ProfileSnapshot {
     uint64_t moe_q5k_repacked_used_ops = 0;
     uint64_t moe_q5k_repacked_rejected_ops = 0;
     std::string moe_q5k_repacked_last_reject_reason;
+    uint64_t moe_kquant_raw_batched_q4k_used_ops = 0;
+    uint64_t moe_kquant_raw_batched_q4k_ns = 0;
+    uint64_t moe_kquant_raw_batched_q5k_used_ops = 0;
+    uint64_t moe_kquant_raw_batched_q5k_ns = 0;
     uint64_t gemma4_moe_prefill_quant_batch_candidate_ops = 0;
     uint64_t gemma4_moe_prefill_quant_batch_used_ops = 0;
     uint64_t gemma4_moe_prefill_quant_batch_rejected_ops = 0;
@@ -498,6 +502,8 @@ struct Qwen36ProfileSnapshot {
     uint64_t native_moe_fast_w2_q5k_rejected_ops = 0;
     std::string native_moe_fast_w2_q5k_last_reject_reason;
     uint64_t native_moe_fast_w2_q5k_ns = 0;
+    uint64_t qwen_native_moe_w2_q5k_raw_batched_used_ops = 0;
+    uint64_t qwen_native_moe_w2_q5k_raw_batched_ns = 0;
     int qwen35_moe_path = 0;
     uint64_t qwen35_moe_layers_seen = 0;
     uint64_t qwen35_moe_forward_calls = 0;
@@ -523,6 +529,8 @@ struct Qwen36ProfileSnapshot {
     uint64_t qwen36_prefill_total_ns = 0;
     uint64_t qwen36_prefill_ssm_projection_ns = 0;
     uint64_t qwen36_prefill_ssm_delta_state_ns = 0;
+    uint64_t ssm_delta_fast_default_used_ops = 0;
+    uint64_t ssm_delta_fast_default_wall_ns = 0;
     uint64_t qwen36_prefill_attention_ns = 0;
     uint64_t qwen36_prefill_mlp_or_moe_ns = 0;
     uint64_t qwen36_prefill_graph_build_ns = 0;
@@ -582,6 +590,8 @@ void RecordMoEExpertMatmulWeightType(InferenceWorkContext* ctx, ggml_type weight
 void RecordLFM2NativeMoEW1W3Kernel(InferenceWorkContext* ctx, const char* kernel_name);
 void RecordMoEQ4KRepackedDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason);
 void RecordMoEQ5KRepackedDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason);
+void RecordMoEKQuantRawBatchedUse(InferenceWorkContext* ctx, ggml_type weight_type, uint64_t wall_ns,
+                                  bool qwen_native_w2_q5k);
 void RecordGemma4MoEPrefillQuantBatchDecision(InferenceWorkContext* ctx, bool candidate, bool used,
                                               const char* reject_reason, bool gate_up_used, bool down_used);
 void RecordGemma4NativeMoEPrefillDecision(InferenceWorkContext* ctx, bool candidate, bool used,

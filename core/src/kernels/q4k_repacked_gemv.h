@@ -50,6 +50,7 @@ struct Q4KRepackedGemvCacheStats {
     uint64_t evicted_bytes = 0;
     uint64_t repack_bytes = 0;
     uint64_t resident_bytes = 0;
+    uint64_t runtime_floor_bytes = 0;
 };
 
 bool Q4KRepackedGemvIsaSupported();
@@ -58,6 +59,12 @@ bool Q4KRepackedGemvManualCacheLimitConfigured();
 size_t Q4KRepackedGemvCacheLimitBytes();
 size_t Q4KRepackedGemvAutoCacheLimitBytes(size_t reserved_bytes);
 size_t Q4KRepackedGemvRefreshRuntimeCacheBudget(size_t reserved_bytes);
+size_t Q4KRepackedGemvRaiseRuntimeCacheBudgetFloor(size_t floor_bytes);
+size_t Q4KRepackedGemvSetRuntimeCacheBudgetFloor(size_t floor_bytes);
+size_t Q4KRepackedGemvRuntimeCacheBudgetFloorBytes();
+#ifdef DENSECORE_TEST_BUILD
+void Q4KRepackedGemvResetRuntimeCacheBudgetFloorForTest();
+#endif
 Q4KRepackedGemvCacheStats Q4KRepackedGemvCacheStatsSnapshot();
 Q4KRepackedGemvCacheStats Q4KRepackedGemvTrimCacheToBytes(size_t target_bytes);
 Q4KRepackedGemvCacheStats Q4KRepackedGemvTrimCacheForAvailableMemory(size_t reserved_bytes);

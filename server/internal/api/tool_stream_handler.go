@@ -585,16 +585,16 @@ func (h *Handler) reasoningModelHint(req domain.ChatCompletionRequest) string {
 		current = h.modelService.GetCurrentModel()
 		modelID, _, root := h.modelService.GetModelIdentity()
 		current = apiFirstNonEmpty(current, root, modelID)
-		if isGemma4ModelHint(root) || isQwen36ModelHint(root) || isLFM2ModelHint(root) {
+		if isGemma4ModelHint(root) || isQwenModelHint(root) || isLFM2ModelHint(root) {
 			current = root
-		} else if isGemma4ModelHint(modelID) || isQwen36ModelHint(modelID) || isLFM2ModelHint(modelID) {
+		} else if isGemma4ModelHint(modelID) || isQwenModelHint(modelID) || isLFM2ModelHint(modelID) {
 			current = modelID
 		}
 	}
 	if isGemma4ModelHint(current) && !isGemma4ModelHint(req.Model) {
 		return current
 	}
-	if isQwen36ModelHint(current) && !isQwen36ModelHint(req.Model) {
+	if isQwenModelHint(current) && !isQwenModelHint(req.Model) {
 		return current
 	}
 	if isLFM2ModelHint(current) && !isLFM2ModelHint(req.Model) {
@@ -923,4 +923,14 @@ func isQwen36ModelHint(modelHint string) bool {
 	lower := strings.ToLower(strings.TrimSpace(modelHint))
 	return strings.Contains(lower, "qwen3.6") || strings.Contains(lower, "qwen3_6") ||
 		strings.Contains(lower, "qwen36") || strings.Contains(lower, "qwen3next")
+}
+
+func isQwen35ModelHint(modelHint string) bool {
+	lower := strings.ToLower(strings.TrimSpace(modelHint))
+	return strings.Contains(lower, "qwen3.5") || strings.Contains(lower, "qwen3_5") ||
+		strings.Contains(lower, "qwen3-5") || strings.Contains(lower, "qwen35")
+}
+
+func isQwenModelHint(modelHint string) bool {
+	return isQwen35ModelHint(modelHint) || isQwen36ModelHint(modelHint)
 }

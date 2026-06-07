@@ -22,6 +22,8 @@ extern int ResolveQuantBatchedTileColsForTest(int requested_cols, int vec_dot_nr
 extern bool ResolveQ4KTrueBatchedKernelPolicyForTest(int simd_level, bool compiled_with_sve);
 extern bool ShouldUsePortableFlashHeadSeqReferenceFallbackForTest(bool explicit_debug_reference);
 extern bool CompiledWithX86Avx512ForFlashAttentionForTest();
+extern bool RunGemma4SafeF32BatchedForTest(int nth, bool* output_matches_oracle, bool* output_all_finite);
+extern bool RunGemma4SafeQ8BatchedForTest(int nth, bool* output_matches_vecdot_oracle, uint64_t* q8_batched_used_ops);
 }  // namespace testing
 namespace llm::attention::testing {
 extern void ResetSharedPrefillFlashMaskBuildsForTest();
@@ -235,7 +237,7 @@ TEST(AttentionPolicyTest, HeadSeqPortableFlashReferenceFallbackRequiresExplicitD
     (void)densecore::testing::CompiledWithX86Avx512ForFlashAttentionForTest();
 }
 
-TEST(AttentionPolicyTest, Gemma4QuantizedPrefillProjectionUsesNativeGgml) {
+TEST(AttentionPolicyTest, Gemma4QuantizedPrefillProjectionUsesDenseCoreBatchedPath) {
     ggml_init_params params{};
     params.mem_size = 32 * 1024 * 1024;
     params.no_alloc = false;
@@ -251,7 +253,7 @@ TEST(AttentionPolicyTest, Gemma4QuantizedPrefillProjectionUsesNativeGgml) {
 
     ggml_tensor* result = densecore::testing::SmartMulMatTest(ctx, weight, input, &gemma4);
     ASSERT_NE(result, nullptr);
-    EXPECT_EQ(result->op, GGML_OP_MUL_MAT);
+    EXPECT_EQ(result->op, GGML_OP_CUSTOM);
 
     ggml_free(ctx);
 }
@@ -276,6 +278,22 @@ TEST(AttentionPolicyTest, Gemma4F32RouterPrefillUsesCustomBatchedPath) {
     EXPECT_EQ(result->op, GGML_OP_CUSTOM);
 
     ggml_free(ctx);
+}
+
+TEST(AttentionPolicyTest, Gemma4SafeF32RouterBatchedMatchesFiniteOracle) {
+    bool matches = false;
+    bool finite = false;
+    ASSERT_TRUE(densecore::testing::RunGemma4SafeF32BatchedForTest(/*nth=*/4, &matches, &finite));
+    EXPECT_TRUE(matches);
+    EXPECT_TRUE(finite);
+}
+
+TEST(AttentionPolicyTest, Gemma4SafeQ8PrefillBatchedUsesRowVecDotOracle) {
+    bool matches = false;
+    uint64_t q8_batched_used_ops = 0;
+    ASSERT_TRUE(densecore::testing::RunGemma4SafeQ8BatchedForTest(/*nth=*/4, &matches, &q8_batched_used_ops));
+    EXPECT_TRUE(matches);
+    EXPECT_EQ(q8_batched_used_ops, 0u);
 }
 
 TEST(AttentionPolicyTest, Gemma4Q8PrefillCpuRepackAliasUsesRawCustomBatchedPath) {
@@ -328,6 +346,38 @@ TEST(AttentionPolicyTest, Gemma4Q8DecodeCpuRepackAliasUsesRawCustomGemvPath) {
 
     ggml_tensor* result = densecore::testing::SmartMulMatWithPhaseTest(
         ctx, original, input, &gemma4, static_cast<int>(InferenceExecutionPhase::Decode));
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->op, GGML_OP_CUSTOM);
+    EXPECT_EQ(result->src[1], original);
+
+    ggml_free(ctx);
+}
+
+TEST(AttentionPolicyTest, Qwen35MoEPrefillCpuRepackAliasUsesRawQ4KBatchedPath) {
+    ggml_init_params params{};
+    params.mem_size = 32 * 1024 * 1024;
+    params.no_alloc = false;
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    TransformerModel qwen35 = MakeModel(ModelArch::QWEN35);
+    qwen35.variant = ModelVariant::QWEN35;
+    qwen35.hparams.n_experts = 128;
+
+    ggml_tensor* original = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, /*ne0=*/2048, /*ne1=*/4096);
+    ASSERT_NE(original, nullptr);
+    ggml_set_name(original, "blk.0.attn_qkv.weight");
+    ggml_tensor* alias = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, /*ne0=*/2048, /*ne1=*/4096);
+    ASSERT_NE(alias, nullptr);
+    ggml_set_name(alias, "blk.0.attn_qkv.weight.fast_matmul");
+    qwen35.cpu_repack_aliases[original] = alias;
+    qwen35.cpu_repack_alias_sources[alias] = original;
+
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, /*ne0=*/2048, /*ne1=*/16);
+    ASSERT_NE(input, nullptr);
+
+    ggml_tensor* result = densecore::testing::SmartMulMatWithPhaseTest(
+        ctx, alias, input, &qwen35, static_cast<int>(InferenceExecutionPhase::Prefill));
     ASSERT_NE(result, nullptr);
     EXPECT_EQ(result->op, GGML_OP_CUSTOM);
     EXPECT_EQ(result->src[1], original);

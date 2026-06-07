@@ -152,6 +152,21 @@ bool IsGemma4LikelyControlToken(const std::string& token) {
         "</img>",
         "<bbox>",
         "</bbox>",
+        "[multimodal]",
+        "<multimodal>",
+        "<start_of_image>",
+        "<end_of_image>",
+        "<image>",
+        "</image>",
+        "<image_soft_token>",
+        "<start_of_audio>",
+        "<end_of_audio>",
+        "<audio>",
+        "</audio>",
+        "<start_of_video>",
+        "<end_of_video>",
+        "<video>",
+        "</video>",
         nullptr,
     };
     for (int i = 0; kBlockedLiterals[i] != nullptr; ++i) {
@@ -386,7 +401,8 @@ void ConfigureQwenReasoningTokenBlocklistForModel(const TransformerModel* model,
 
     static const char* kBlockedLiterals[] = {
         "<think>",          "</think>",     "<tool_call>", "</tool_call>", "<tool_response>",
-        "</tool_response>", "<|im_start|>", "/no_think",   "/nothink",     nullptr,
+        "</tool_response>", "<|im_start|>", "/no_think",   " /no_think",   "\xC4\xA0/no_think",
+        "/nothink",         " /nothink",    "\xC4\xA0/nothink", nullptr,
     };
     for (int i = 0; kBlockedLiterals[i] != nullptr; ++i) {
         auto it = model->token_to_id.find(kBlockedLiterals[i]);
@@ -466,6 +482,24 @@ void ConfigureGemma4TextTokenBlocklistForModel(const TransformerModel* model, Re
     auto is_stop_id = [&](int token_id) {
         return std::binary_search(model->stop_token_ids.begin(), model->stop_token_ids.end(), token_id);
     };
+
+    const int special_token_ids[] = {
+        model->bos_token_id,
+        model->unk_token_id,
+        model->sep_token_id,
+        model->pad_token_id,
+        model->mask_token_id,
+    };
+    for (int token_id : special_token_ids) {
+        if (token_id >= 0 && !is_stop_id(token_id)) {
+            AppendDisallowedTokenId(req, token_id);
+        }
+    }
+    for (int low_control_id : {0, 1}) {
+        if (!is_stop_id(low_control_id)) {
+            AppendDisallowedTokenId(req, low_control_id);
+        }
+    }
 
     const bool validated_token_types =
         !model->token_types.empty() && model->token_types.size() == model->vocab_tokens.size();
@@ -593,8 +627,7 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         wrapped += profile.open_tag;
         wrapped += profile.assistant_role;
         wrapped += "\n";
-        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking &&
-            !(gemma4_thinking_explicit && gemma4_thinking_env)) {
+        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking) {
             wrapped += "<|channel>thought\n<channel|>";
         }
         return wrapped;
@@ -742,7 +775,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
         rendered += profile.open_tag;
         rendered += profile.assistant_role;
         rendered += "\n";
-        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking && thinking_enabled) {
+        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking) {
             rendered += "<|channel>thought\n<channel|>";
         }
         return rendered;

@@ -111,7 +111,9 @@ inline KernelOpKind ClassifyKernelOpKind(const KernelAdmissionDescriptor& desc) 
     }
     if (std::strstr(name, "attn_gate")) return KernelOpKind::SsmGate;
     if (std::strstr(name, "ssm_out")) return KernelOpKind::SsmOutput;
-    if (std::strstr(name, "moe_gate") || std::strstr(name, "router")) return KernelOpKind::Router;
+    if (std::strstr(name, "ffn_gate_inp") || std::strstr(name, "moe_gate") || std::strstr(name, "router")) {
+        return KernelOpKind::Router;
+    }
     if (std::strstr(name, "ffn_gate_up")) return KernelOpKind::FfnGateUp;
     if (std::strstr(name, "ffn_gate")) return KernelOpKind::FfnGate;
     if (std::strstr(name, "ffn_up")) return KernelOpKind::FfnUp;

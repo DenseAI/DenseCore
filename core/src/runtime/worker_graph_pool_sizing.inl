@@ -16,20 +16,73 @@ bool IsFlexibleGraphPoolSizingEnabled(const TransformerModel* model) {
 }
 
 size_t ReadAvailableMemoryBytesForRuntimePools() {
+    const char* hint = std::getenv("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT");
+    if (hint && hint[0] != '\0') {
+        errno = 0;
+        char* end = nullptr;
+        const unsigned long long hinted_mb = std::strtoull(hint, &end, 10);
+        if (errno == 0 && end != hint && *end == '\0' && hinted_mb > 0) {
+            return static_cast<size_t>(hinted_mb) * 1024ULL * 1024ULL;
+        }
+    }
 #if defined(__linux__)
+    auto read_ull_file = [](const char* path) -> unsigned long long {
+        std::FILE* f = std::fopen(path, "r");
+        if (!f) {
+            return 0;
+        }
+        char buffer[128] = {};
+        if (!std::fgets(buffer, sizeof(buffer), f)) {
+            std::fclose(f);
+            return 0;
+        }
+        std::fclose(f);
+        if (std::strncmp(buffer, "max", 3) == 0) {
+            return 0;
+        }
+        errno = 0;
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(buffer, &end, 10);
+        if (errno != 0 || end == buffer || value == 0 || value > (1ULL << 50)) {
+            return 0;
+        }
+        return value;
+    };
+
+    size_t cgroup_available_bytes = 0;
+    const unsigned long long cgroup_v2_limit = read_ull_file("/sys/fs/cgroup/memory.max");
+    const unsigned long long cgroup_v2_current = read_ull_file("/sys/fs/cgroup/memory.current");
+    if (cgroup_v2_limit > 0) {
+        cgroup_available_bytes =
+            static_cast<size_t>((cgroup_v2_current > 0 && cgroup_v2_limit > cgroup_v2_current)
+                                    ? (cgroup_v2_limit - cgroup_v2_current)
+                                    : cgroup_v2_limit);
+    }
+    const unsigned long long cgroup_v1_limit = read_ull_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    const unsigned long long cgroup_v1_current = read_ull_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+    if (cgroup_available_bytes == 0 && cgroup_v1_limit > 0) {
+        cgroup_available_bytes =
+            static_cast<size_t>((cgroup_v1_current > 0 && cgroup_v1_limit > cgroup_v1_current)
+                                    ? (cgroup_v1_limit - cgroup_v1_current)
+                                    : cgroup_v1_limit);
+    }
+
     std::FILE* file = std::fopen("/proc/meminfo", "r");
     if (!file) {
-        return 0;
+        return cgroup_available_bytes;
     }
     char line[256] = {};
     unsigned long long kb = 0;
     while (std::fgets(line, sizeof(line), file)) {
         if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
             std::fclose(file);
-            return static_cast<size_t>(kb) * 1024ULL;
+            const size_t mem_available_bytes = static_cast<size_t>(kb) * 1024ULL;
+            return cgroup_available_bytes > 0 ? std::min(mem_available_bytes, cgroup_available_bytes)
+                                              : mem_available_bytes;
         }
     }
     std::fclose(file);
+    return cgroup_available_bytes;
 #endif
     return 0;
 }
@@ -113,6 +166,99 @@ RuntimeGraphPoolReservation ClampRuntimeGraphPoolReservation(size_t requested_by
     return {total_bytes, capped_payload_bytes, capped_slack_bytes};
 }
 
+bool ModelHasMoEGraphLayers(const TransformerModel* model) {
+    if (!model) {
+        return false;
+    }
+    if (model->hparams.n_experts > 0) {
+        return true;
+    }
+    if (model->decoder_spec && model->decoder_spec->has_moe) {
+        return true;
+    }
+    if (densecore::models::BuildModelExecutionContract(model).has_moe) {
+        return true;
+    }
+    for (const TransformerLayer& layer : model->layers) {
+        if (layer.is_moe || !layer.experts.empty()) {
+            return true;
+        }
+        for (const auto& tensor_entry : layer.tensors) {
+            const std::string& name = tensor_entry.first;
+            if (name.find("ffn_gate_up_exps") != std::string::npos ||
+                name.find("ffn_down_exps") != std::string::npos ||
+                name.find("experts.") != std::string::npos) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool IsX86QwenHybridMoEChunkedPrefillEstimate(
+    const TransformerModel* model, const EngineState::GraphContextEstimate& graph_estimate) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (!model || graph_estimate.effective_query_len <= 1 || graph_estimate.chunk_token_hint <= 1 ||
+        !model->arch_flags.is_hybrid_ssm || !ModelHasMoEGraphLayers(model)) {
+        return false;
+    }
+    return true;
+#else
+    (void)model;
+    (void)graph_estimate;
+    return false;
+#endif
+}
+
+size_t DynamicGraphObjectPoolGuardBytes(const EngineState::GraphContextEstimate& graph_estimate,
+                                        size_t requested_bytes, size_t available_bytes) {
+    if (requested_bytes == 0 || graph_estimate.effective_query_len <= 1) {
+        return 0;
+    }
+    constexpr size_t MB = 1024ULL * 1024ULL;
+    const size_t estimate_bytes = std::max(requested_bytes, graph_estimate.total_bytes);
+    size_t guard_bytes = estimate_bytes / 32;
+    guard_bytes += graph_estimate.base_graph_working_set_bytes / 64;
+    guard_bytes += graph_estimate.hybrid_ssm_extra_bytes / 16;
+    guard_bytes += graph_estimate.long_context_safety_pad_bytes / 16;
+    guard_bytes = std::max<size_t>(guard_bytes, 128ULL * MB);
+    if (available_bytes > estimate_bytes) {
+        const size_t headroom_bytes = available_bytes - estimate_bytes;
+        guard_bytes = std::min(guard_bytes, std::max<size_t>(128ULL * MB, headroom_bytes / 4));
+    }
+    return AlignUpBytes(guard_bytes, 64ULL * MB);
+}
+
+size_t GraphSequenceObjectPressureBytes(const EngineState::GraphContextEstimate& graph_estimate) {
+    if (graph_estimate.effective_query_len <= 1 || graph_estimate.effective_seq_len <= graph_estimate.effective_query_len) {
+        return 0;
+    }
+    constexpr size_t kObjectBytesPerQueryKeyPair = 64;
+    const size_t num_seqs = std::max<size_t>(1, graph_estimate.effective_num_seqs);
+    if (graph_estimate.effective_seq_len > std::numeric_limits<size_t>::max() / graph_estimate.effective_query_len) {
+        return std::numeric_limits<size_t>::max() / 2;
+    }
+    size_t pairs = graph_estimate.effective_seq_len * graph_estimate.effective_query_len;
+    if (pairs > std::numeric_limits<size_t>::max() / num_seqs) {
+        return std::numeric_limits<size_t>::max() / 2;
+    }
+    pairs *= num_seqs;
+    if (pairs > std::numeric_limits<size_t>::max() / kObjectBytesPerQueryKeyPair) {
+        return std::numeric_limits<size_t>::max() / 2;
+    }
+    return pairs * kObjectBytesPerQueryKeyPair;
+}
+
+RuntimeGraphPoolReservation GrowthReservedFlexibleGraphPoolReservation(
+    const TransformerModel* model, const EngineState::GraphContextEstimate& graph_estimate,
+    const RuntimeGraphPoolReservation& required_reservation, size_t available_bytes) {
+    if (IsX86QwenHybridMoEChunkedPrefillEstimate(model, graph_estimate)) {
+        return required_reservation;
+    }
+    return ClampRuntimeGraphPoolReservation(
+        ApplyFlexibleGraphPoolGrowthReserve(required_reservation.total_bytes, graph_estimate), available_bytes);
+}
+
 FlexibleGraphPoolSizing MeasureFlexibleGraphPoolSize(TransformerModel* model, PagedKVCache* cache,
                                                      const BatchSpec& batch, bool embedding_mode,
                                                      const EngineState::GraphContextEstimate& fallback_estimate) {
@@ -194,8 +340,8 @@ FlexibleGraphPoolSizing MeasureFlexibleGraphPoolSize(TransformerModel* model, Pa
             ClampRuntimeGraphPoolReservation(AlignUpBytes(measured_bytes + margin_bytes, 64ULL * MB), available_bytes);
         result.ok = true;
         result.required_bytes = required_reservation.total_bytes;
-        const RuntimeGraphPoolReservation growth_reservation = ClampRuntimeGraphPoolReservation(
-            ApplyFlexibleGraphPoolGrowthReserve(result.required_bytes, fallback_estimate), available_bytes);
+        const RuntimeGraphPoolReservation growth_reservation =
+            GrowthReservedFlexibleGraphPoolReservation(model, fallback_estimate, required_reservation, available_bytes);
         result.reserved_bytes = growth_reservation.total_bytes;
         result.available_bytes = available_bytes;
         result.reservation_payload_bytes = growth_reservation.payload_bytes;
@@ -230,9 +376,14 @@ FlexibleGraphPoolSizing EstimateFlexibleGraphPoolSizeWithoutDryRun(
     constexpr size_t MB = 1024ULL * 1024ULL;
     const size_t available_bytes = ReadAvailableMemoryBytesForRuntimePools();
     size_t target_bytes = fallback_estimate.total_bytes;
+    const bool x86_qwen_chunked = IsX86QwenHybridMoEChunkedPrefillEstimate(model, fallback_estimate);
     if (fallback_estimate.effective_query_len > 1) {
         const bool hybrid_or_moe = model->arch_flags.is_hybrid_ssm || model->hparams.n_experts > 0;
-        if (hybrid_or_moe) {
+        if (x86_qwen_chunked) {
+            const size_t live_scaled_slack =
+                available_bytes > 0 ? std::max<size_t>(64ULL * MB, available_bytes / 64) : 128ULL * MB;
+            target_bytes += std::clamp<size_t>(target_bytes / 16, 128ULL * MB, live_scaled_slack);
+        } else if (hybrid_or_moe) {
             target_bytes += std::max<size_t>(target_bytes, 1024ULL * MB);
         } else if (model->arch_flags.is_gemma4) {
             target_bytes += std::max<size_t>(target_bytes / 2, 1024ULL * MB);
@@ -240,12 +391,15 @@ FlexibleGraphPoolSizing EstimateFlexibleGraphPoolSizeWithoutDryRun(
             target_bytes += std::max<size_t>(target_bytes / 4, 512ULL * MB);
         }
     }
-    target_bytes = AlignUpBytes(target_bytes, 512ULL * MB);
+    target_bytes = AlignUpBytes(target_bytes, x86_qwen_chunked ? 64ULL * MB : 512ULL * MB);
+    if (x86_qwen_chunked) {
+        target_bytes += DynamicGraphObjectPoolGuardBytes(fallback_estimate, target_bytes, available_bytes);
+    }
 
     const RuntimeGraphPoolReservation required_reservation =
         ClampRuntimeGraphPoolReservation(target_bytes, available_bytes);
-    const RuntimeGraphPoolReservation growth_reservation = ClampRuntimeGraphPoolReservation(
-        ApplyFlexibleGraphPoolGrowthReserve(required_reservation.total_bytes, fallback_estimate), available_bytes);
+    const RuntimeGraphPoolReservation growth_reservation =
+        GrowthReservedFlexibleGraphPoolReservation(model, fallback_estimate, required_reservation, available_bytes);
 
     result.ok = true;
     result.required_bytes = required_reservation.total_bytes;

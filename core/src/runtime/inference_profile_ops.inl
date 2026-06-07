@@ -466,6 +466,10 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.moe_q5k_repacked_candidate_ops.store(0, std::memory_order_relaxed);
     p.moe_q5k_repacked_used_ops.store(0, std::memory_order_relaxed);
     p.moe_q5k_repacked_rejected_ops.store(0, std::memory_order_relaxed);
+    p.moe_kquant_raw_batched_q4k_used_ops.store(0, std::memory_order_relaxed);
+    p.moe_kquant_raw_batched_q4k_ns.store(0, std::memory_order_relaxed);
+    p.moe_kquant_raw_batched_q5k_used_ops.store(0, std::memory_order_relaxed);
+    p.moe_kquant_raw_batched_q5k_ns.store(0, std::memory_order_relaxed);
     p.gemma4_moe_prefill_quant_batch_candidate_ops.store(0, std::memory_order_relaxed);
     p.gemma4_moe_prefill_quant_batch_used_ops.store(0, std::memory_order_relaxed);
     p.gemma4_moe_prefill_quant_batch_rejected_ops.store(0, std::memory_order_relaxed);
@@ -529,6 +533,8 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.native_moe_fast_w2_q5k_used_ops.store(0, std::memory_order_relaxed);
     p.native_moe_fast_w2_q5k_rejected_ops.store(0, std::memory_order_relaxed);
     p.native_moe_fast_w2_q5k_ns.store(0, std::memory_order_relaxed);
+    p.qwen_native_moe_w2_q5k_raw_batched_used_ops.store(0, std::memory_order_relaxed);
+    p.qwen_native_moe_w2_q5k_raw_batched_ns.store(0, std::memory_order_relaxed);
     p.qwen35_moe_path.store(0, std::memory_order_relaxed);
     p.qwen35_moe_layers_seen.store(0, std::memory_order_relaxed);
     p.qwen35_moe_forward_calls.store(0, std::memory_order_relaxed);
@@ -540,6 +546,8 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.qwen36_prefill_total_ns.store(0, std::memory_order_relaxed);
     p.qwen36_prefill_ssm_projection_ns.store(0, std::memory_order_relaxed);
     p.qwen36_prefill_ssm_delta_state_ns.store(0, std::memory_order_relaxed);
+    p.ssm_delta_fast_default_used_ops.store(0, std::memory_order_relaxed);
+    p.ssm_delta_fast_default_wall_ns.store(0, std::memory_order_relaxed);
     p.qwen36_prefill_attention_ns.store(0, std::memory_order_relaxed);
     p.qwen36_prefill_mlp_or_moe_ns.store(0, std::memory_order_relaxed);
     p.qwen36_prefill_graph_build_ns.store(0, std::memory_order_relaxed);
@@ -790,6 +798,12 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.moe_q5k_repacked_candidate_ops = p.moe_q5k_repacked_candidate_ops.load(std::memory_order_relaxed);
     snapshot.moe_q5k_repacked_used_ops = p.moe_q5k_repacked_used_ops.load(std::memory_order_relaxed);
     snapshot.moe_q5k_repacked_rejected_ops = p.moe_q5k_repacked_rejected_ops.load(std::memory_order_relaxed);
+    snapshot.moe_kquant_raw_batched_q4k_used_ops =
+        p.moe_kquant_raw_batched_q4k_used_ops.load(std::memory_order_relaxed);
+    snapshot.moe_kquant_raw_batched_q4k_ns = p.moe_kquant_raw_batched_q4k_ns.load(std::memory_order_relaxed);
+    snapshot.moe_kquant_raw_batched_q5k_used_ops =
+        p.moe_kquant_raw_batched_q5k_used_ops.load(std::memory_order_relaxed);
+    snapshot.moe_kquant_raw_batched_q5k_ns = p.moe_kquant_raw_batched_q5k_ns.load(std::memory_order_relaxed);
     snapshot.gemma4_moe_prefill_quant_batch_candidate_ops =
         p.gemma4_moe_prefill_quant_batch_candidate_ops.load(std::memory_order_relaxed);
     snapshot.gemma4_moe_prefill_quant_batch_used_ops =
@@ -906,6 +920,10 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
     snapshot.native_moe_fast_w2_q5k_rejected_ops =
         p.native_moe_fast_w2_q5k_rejected_ops.load(std::memory_order_relaxed);
     snapshot.native_moe_fast_w2_q5k_ns = p.native_moe_fast_w2_q5k_ns.load(std::memory_order_relaxed);
+    snapshot.qwen_native_moe_w2_q5k_raw_batched_used_ops =
+        p.qwen_native_moe_w2_q5k_raw_batched_used_ops.load(std::memory_order_relaxed);
+    snapshot.qwen_native_moe_w2_q5k_raw_batched_ns =
+        p.qwen_native_moe_w2_q5k_raw_batched_ns.load(std::memory_order_relaxed);
     snapshot.qwen35_moe_path = p.qwen35_moe_path.load(std::memory_order_relaxed);
     snapshot.qwen35_moe_layers_seen = p.qwen35_moe_layers_seen.load(std::memory_order_relaxed);
     snapshot.qwen35_moe_forward_calls = p.qwen35_moe_forward_calls.load(std::memory_order_relaxed);
@@ -921,6 +939,8 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
         p.qwen36_prefill_ssm_projection_ns.load(std::memory_order_relaxed);
     snapshot.qwen36_prefill_ssm_delta_state_ns =
         p.qwen36_prefill_ssm_delta_state_ns.load(std::memory_order_relaxed);
+    snapshot.ssm_delta_fast_default_used_ops = p.ssm_delta_fast_default_used_ops.load(std::memory_order_relaxed);
+    snapshot.ssm_delta_fast_default_wall_ns = p.ssm_delta_fast_default_wall_ns.load(std::memory_order_relaxed);
     snapshot.qwen36_prefill_attention_ns = p.qwen36_prefill_attention_ns.load(std::memory_order_relaxed);
     snapshot.qwen36_prefill_mlp_or_moe_ns = p.qwen36_prefill_mlp_or_moe_ns.load(std::memory_order_relaxed);
     snapshot.qwen36_prefill_graph_build_ns = p.qwen36_prefill_graph_build_ns.load(std::memory_order_relaxed);
@@ -1134,6 +1154,24 @@ void RecordMoEQ5KRepackedDecision(InferenceWorkContext* ctx, bool candidate, boo
             std::lock_guard<std::mutex> lock(ctx->profile_string_mutex);
             ctx->moe_q5k_repacked_last_reject_reason = reject_reason;
         }
+    }
+}
+
+void RecordMoEKQuantRawBatchedUse(InferenceWorkContext* ctx, ggml_type weight_type, uint64_t wall_ns,
+                                  bool qwen_native_w2_q5k) {
+    if (!ctx) {
+        return;
+    }
+    auto& p = ctx->qwen36_profile;
+    if (weight_type == GGML_TYPE_Q4_K) {
+        p.moe_kquant_raw_batched_q4k_used_ops.fetch_add(1, std::memory_order_relaxed);
+        p.moe_kquant_raw_batched_q4k_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+    } else if (weight_type == GGML_TYPE_Q5_K && !qwen_native_w2_q5k) {
+        p.moe_kquant_raw_batched_q5k_used_ops.fetch_add(1, std::memory_order_relaxed);
+        p.moe_kquant_raw_batched_q5k_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+    } else if (weight_type == GGML_TYPE_Q5_K && qwen_native_w2_q5k) {
+        p.qwen_native_moe_w2_q5k_raw_batched_used_ops.fetch_add(1, std::memory_order_relaxed);
+        p.qwen_native_moe_w2_q5k_raw_batched_ns.fetch_add(wall_ns, std::memory_order_relaxed);
     }
 }
 

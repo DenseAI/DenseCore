@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"descore-server/internal/domain"
@@ -11,23 +12,24 @@ import (
 )
 
 type chatServiceRenderTestEngine struct {
-	renderedPrompt        string
-	lastPrompt            string
-	lastInputIDs          []int
-	lastAllowedTokenIDs   []int
-	lastAllowedStrict     bool
-	textSubmitCalled      bool
-	tokenSubmitCalled     bool
-	previewTokenIDs       []int
-	previewText           string
-	previewRenderedText   string
-	renderedTokenizerType string
-	renderedChatTemplate  string
-	renderedModelVariant  string
-	renderedPromptFamily  string
-	renderedThinking      bool
-	lastEnableThinking    *bool
-	lastPreserveThinking  *bool
+	renderedPrompt         string
+	lastPrompt             string
+	lastInputIDs           []int
+	lastAllowedTokenIDs    []int
+	lastAllowedStrict      bool
+	textSubmitCalled       bool
+	tokenSubmitCalled      bool
+	previewTokenIDs        []int
+	previewText            string
+	previewRenderedText    string
+	renderedTokenizerType  string
+	renderedChatTemplate   string
+	renderedModelVariant   string
+	renderedPromptFamily   string
+	renderedThinking       bool
+	renderChatPromptCalled bool
+	lastEnableThinking     *bool
+	lastPreserveThinking   *bool
 }
 
 type chatServiceBrokenStreamTestEngine struct {
@@ -78,6 +80,7 @@ func cloneBoolPtr(value *bool) *bool {
 
 func (e *chatServiceRenderTestEngine) RenderChatPrompt(messages []domain.Message, enableThinking *bool,
 	preserveThinking *bool) (*domain.RenderedChatPrompt, error) {
+	e.renderChatPromptCalled = true
 	e.lastEnableThinking = cloneBoolPtr(enableThinking)
 	e.lastPreserveThinking = cloneBoolPtr(preserveThinking)
 	return &domain.RenderedChatPrompt{
@@ -449,6 +452,51 @@ func TestBuildChatPromptQwenNoThinkingDoesNotInjectThinkScaffold(t *testing.T) {
 	}
 }
 
+func TestSanitizeQwenVisibleControlMarkers(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "suffix no think", in: "cobalt-river-913 /no_think", want: "cobalt-river-913"},
+		{name: "only nothink", in: "/nothink", want: ""},
+		{name: "plain text", in: "plain answer", want: "plain answer"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SanitizeQwenVisibleControlMarkers(tt.in); got != tt.want {
+				t.Fatalf("SanitizeQwenVisibleControlMarkers(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQwenVisibleControlMarkerFilterSuppressesFragmentedMarker(t *testing.T) {
+	filter := NewQwenVisibleControlMarkerFilter()
+	var out strings.Builder
+	for _, token := range []string{"cobalt", "-", "river", "-913", " /", "no", "_", "think"} {
+		out.WriteString(filter.Filter(token))
+	}
+	out.WriteString(filter.Flush())
+
+	if got := out.String(); got != "cobalt-river-913" {
+		t.Fatalf("fragmented marker filter output = %q, want cobalt-river-913", got)
+	}
+}
+
+func TestQwenVisibleControlMarkerFilterFlushesLegitimateSuffix(t *testing.T) {
+	filter := NewQwenVisibleControlMarkerFilter()
+	var out strings.Builder
+	for _, token := range []string{"path", " /", "usr"} {
+		out.WriteString(filter.Filter(token))
+	}
+	out.WriteString(filter.Flush())
+
+	if got := out.String(); got != "path /usr" {
+		t.Fatalf("legitimate suffix output = %q, want path /usr", got)
+	}
+}
+
 func TestShouldNotPassThroughRawPromptGemmaSingleTurn(t *testing.T) {
 	msgs := []domain.Message{{Role: "user", Content: "What is the capital of France?"}}
 	if shouldPassThroughRawPrompt("/tmp/gemma-4-E2B-it-Q4_K_M.gguf", "gemma4", "", msgs, nil) {
@@ -651,7 +699,9 @@ func TestPreparePromptGemmaRenderedChatSubmitAvoidsPreviewTokenizationWhenSuppor
 func TestPreparePromptLFM2RenderedChatSubmitAvoidsPreviewTokenizationWhenSupported(t *testing.T) {
 	engine := &chatServiceRenderedChatTestEngine{
 		chatServiceRenderTestEngine: chatServiceRenderTestEngine{
-			renderedPrompt:        "<|startoftext|><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+			renderedPrompt: "<|startoftext|><|im_start|>system\n" +
+				"You are a direct answer engine. Output only the final answer requested by the user. Do not quote, paraphrase, explain, analyze, or mention the request." +
+				"<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
 			previewTokenIDs:       []int{2, 4, 6, 8},
 			renderedTokenizerType: "lfm2",
 			renderedChatTemplate:  "<|im_start|>",
@@ -674,6 +724,15 @@ func TestPreparePromptLFM2RenderedChatSubmitAvoidsPreviewTokenizationWhenSupport
 	}
 	if !prepared.renderedChatSubmit {
 		t.Fatalf("expected LFM2 rendered chat submit path")
+	}
+	if !engine.renderChatPromptCalled {
+		t.Fatalf("expected LFM2 prompt preparation to use engine RenderChatPrompt")
+	}
+	if prepared.promptSource != "rendered_chat_template" {
+		t.Fatalf("promptSource=%q want rendered_chat_template", prepared.promptSource)
+	}
+	if prepared.prompt != engine.renderedPrompt {
+		t.Fatalf("prompt=%q want canonical rendered prompt %q", prepared.prompt, engine.renderedPrompt)
 	}
 	if prepared.tokenSource != "engine_submit_rendered_chat" {
 		t.Fatalf("tokenSource=%q want engine_submit_rendered_chat", prepared.tokenSource)

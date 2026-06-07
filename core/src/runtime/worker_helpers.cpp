@@ -135,16 +135,23 @@ std::string JoinExecutionContractForbiddenFastPaths(const densecore::models::Mod
     return oss.str();
 }
 
-std::string JoinExecutionContractRequiredFastPathCounters(const densecore::models::ModelExecutionContract& contract) {
-    if (contract.required_fast_path_counters.empty()) {
+int KernelCoveragePercent(const densecore::models::KernelCoverageValidationResult& coverage) {
+    if (coverage.graph_node_count == 0) {
+        return 100;
+    }
+    return static_cast<int>((coverage.covered_node_count * 100) / coverage.graph_node_count);
+}
+
+std::string JoinKernelCoverageMissing(const densecore::models::KernelCoverageValidationResult& coverage) {
+    if (coverage.missing_kernel_reasons.empty()) {
         return "none";
     }
     std::ostringstream oss;
-    for (std::size_t i = 0; i < contract.required_fast_path_counters.size(); ++i) {
+    for (std::size_t i = 0; i < coverage.missing_kernel_reasons.size(); ++i) {
         if (i != 0) {
             oss << ",";
         }
-        oss << contract.required_fast_path_counters[i];
+        oss << coverage.missing_kernel_reasons[i];
     }
     return oss.str();
 }
@@ -190,7 +197,8 @@ bool Gemma4MaintainedPrefillFastOpsUsed(const Request* req) {
         return false;
     }
     static constexpr std::size_t kCustomBatchedGemvPath = 3;
-    return req->prefill_matmul_path_hist[kCustomBatchedGemvPath] > 0 && req->arm_batched_quant_used > 0;
+    return req->gemma4_native_moe_prefill_used_layers > 0 || req->gemma4_dense_prefill_native_used_ops > 0 ||
+           (req->prefill_matmul_path_hist[kCustomBatchedGemvPath] > 0 && req->arm_batched_quant_used > 0);
 }
 
 bool Gemma4MaintainedDecodeFastOpsUsed(const Request* req) {
@@ -198,45 +206,63 @@ bool Gemma4MaintainedDecodeFastOpsUsed(const Request* req) {
         return false;
     }
     static constexpr std::size_t kCustomGemvPath = 2;
-    return req->decode_matmul_path_hist[kCustomGemvPath] > 0 && req->gemma4_decode_native_moe_used_ops > 0;
+    return req->decode_matmul_path_hist[kCustomGemvPath] > 0;
 }
 
-bool RequiredFastPathCounterSatisfied(const Request* req, const TargetFastPathGate& gate, const std::string& counter) {
+bool RequiredFastPathCounterSatisfied(const Request* req, const TargetFastPathGate& gate,
+                                      densecore::models::ExecutionFastPathCounterKind counter) {
     if (!req) {
         return true;
     }
-    if (counter == "target_no_ggml_path") {
+    using densecore::models::ExecutionFastPathCounterKind;
+    switch (counter) {
+    case ExecutionFastPathCounterKind::TargetNoGgmlPath:
         return gate.no_ggml_path;
-    }
-    if (counter == "native_moe_fast_w1w3_used_ops") {
+    case ExecutionFastPathCounterKind::NativeMoeFastW1W3UsedOps:
         return req->native_moe_fast_w1w3_used_ops > 0;
-    }
-    if (counter == "native_moe_fast_w2_used_ops") {
+    case ExecutionFastPathCounterKind::NativeMoeFastW2UsedOps:
         return req->native_moe_fast_w2_used_ops > 0;
-    }
-    if (counter == "ssm_conv1d_calls") {
+    case ExecutionFastPathCounterKind::SsmConv1DCalls:
         return req->ssm_conv1d_calls > 0;
-    }
-    if (counter == "ssm_delta_calls") {
+    case ExecutionFastPathCounterKind::SsmDeltaCalls:
         return req->ssm_delta_calls > 0;
-    }
-    if (counter == "lfm2_shortconv_sequence_fast_used_ops") {
+    case ExecutionFastPathCounterKind::Lfm2ShortConvSequenceFastUsedOps:
         return req->decode_graph_node_custom_ssm_count > 0 || req->ssm_conv1d_calls > 0;
-    }
-    if (counter == "gemma4_prefill_maintained_fast_ops") {
+    case ExecutionFastPathCounterKind::Gemma4PrefillMaintainedFastOps:
         return Gemma4MaintainedPrefillFastOpsUsed(req);
-    }
-    if (counter == "gemma4_decode_maintained_fast_ops") {
+    case ExecutionFastPathCounterKind::Gemma4DecodeMaintainedFastOps:
         return Gemma4MaintainedDecodeFastOpsUsed(req);
+    case ExecutionFastPathCounterKind::Unknown:
+    default:
+        return true;
     }
-    return true;
+}
+
+bool RequiredFastPathCounterSatisfied(const Request* req, const TargetFastPathGate& gate, const std::string& counter) {
+    return RequiredFastPathCounterSatisfied(req, gate,
+                                            densecore::models::ExecutionFastPathCounterKindFromName(counter));
 }
 
 std::string MissingRequiredFastPathCounters(const Request* req, const TargetFastPathGate& gate,
                                             const densecore::models::ModelExecutionContract& execution_contract) {
     std::ostringstream oss;
     bool any = false;
+    const auto counters = densecore::models::ModelExecutionContractRequiredFastPathCounterKinds(execution_contract);
+    for (const auto counter : counters) {
+        if (RequiredFastPathCounterSatisfied(req, gate, counter)) {
+            continue;
+        }
+        if (any) {
+            oss << ",";
+        }
+        oss << densecore::models::ExecutionFastPathCounterKindName(counter);
+        any = true;
+    }
     for (const std::string& counter : execution_contract.required_fast_path_counters) {
+        if (densecore::models::ExecutionFastPathCounterKindFromName(counter) !=
+            densecore::models::ExecutionFastPathCounterKind::Unknown) {
+            continue;
+        }
         if (RequiredFastPathCounterSatisfied(req, gate, counter)) {
             continue;
         }
@@ -258,9 +284,12 @@ TargetFastPathGate EvaluateTargetFastPathGate(const Request* req,
     }
     gate.required = densecore::models::ModelExecutionContractRequiresFallbackFreeFastPath(execution_contract) ||
                     densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(execution_contract);
-    gate.ggml_path_seen = req->qwen_target_ggml_compute_ops > 0 || req->decode_matmul_path_hist[0] > 0 ||
-                          req->decode_matmul_path_hist[1] > 0 || req->prefill_matmul_path_hist[0] > 0 ||
-                          req->prefill_matmul_path_hist[1] > 0;
+    const bool gemma4_moe_contract =
+        execution_contract.fast_path_class == densecore::models::ExecutionFastPathClass::Gemma4MoE;
+    gate.ggml_path_seen =
+        req->qwen_target_ggml_compute_ops > 0 || req->decode_matmul_path_hist[0] > 0 ||
+        req->decode_matmul_path_hist[1] > 0 || req->prefill_matmul_path_hist[0] > 0 ||
+        req->prefill_matmul_path_hist[1] > 0;
     gate.graph_plan_rejected = graph_plan_rejected;
     gate.native_moe_fallback_seen = req->native_moe_fallback_w1w3_ops > 0 || req->native_moe_fallback_w2_ops > 0;
     gate.native_moe_rejected = req->native_moe_fast_decode_rejected_ops > 0 ||
@@ -270,13 +299,13 @@ TargetFastPathGate EvaluateTargetFastPathGate(const Request* req,
         densecore::models::ModelExecutionContractRequiresNativeMoEFastPath(execution_contract) &&
         (req->native_moe_fast_w1w3_used_ops == 0 || req->native_moe_fast_w2_used_ops == 0);
 
-    const bool gemma4_moe_contract =
-        execution_contract.fast_path_class == densecore::models::ExecutionFastPathClass::Gemma4MoE;
-    gate.gemma4_moe_rejected = gemma4_moe_contract && (req->gemma4_moe_prefill_quant_batch_rejected_ops > 0 ||
-                                                       req->gemma4_native_moe_prefill_rejected_layers > 0 ||
-                                                       req->gemma4_decode_native_rejected_ops > 0);
     gate.gemma4_moe_prefill_ops_missing = gemma4_moe_contract && !Gemma4MaintainedPrefillFastOpsUsed(req);
     gate.gemma4_moe_decode_ops_missing = gemma4_moe_contract && !Gemma4MaintainedDecodeFastOpsUsed(req);
+    const bool gemma4_decode_rejected_without_maintained_decode =
+        gemma4_moe_contract && req->gemma4_decode_native_rejected_ops > 0 && gate.gemma4_moe_decode_ops_missing;
+    gate.gemma4_moe_rejected = gemma4_moe_contract && (req->gemma4_moe_prefill_quant_batch_rejected_ops > 0 ||
+                                                       req->gemma4_native_moe_prefill_rejected_layers > 0 ||
+                                                       gemma4_decode_rejected_without_maintained_decode);
     gate.gemma4_moe_fast_ops_missing = gate.gemma4_moe_prefill_ops_missing || gate.gemma4_moe_decode_ops_missing;
     gate.hybrid_ssm_stateful_ops_missing =
         execution_contract.has_hybrid_ssm_mixer && (req->ssm_conv1d_calls == 0 || req->ssm_delta_calls == 0);
@@ -1457,6 +1486,34 @@ void SuppressTaggedBlock(std::string* token_text, bool* in_block, std::string* p
     }
 }
 
+void SuppressQwenVisibleControlMarkers(std::string* token_text) {
+    if (!token_text || token_text->empty()) {
+        return;
+    }
+
+    static const char* kMarkers[] = {"/no_think", "/nothink", nullptr};
+    for (int i = 0; kMarkers[i] != nullptr; ++i) {
+        const std::string marker(kMarkers[i]);
+        size_t pos = 0;
+        while ((pos = token_text->find(marker, pos)) != std::string::npos) {
+            size_t erase_begin = pos;
+            while (erase_begin > 0 &&
+                   std::isspace(static_cast<unsigned char>((*token_text)[erase_begin - 1]))) {
+                --erase_begin;
+            }
+
+            size_t erase_end = pos + marker.size();
+            while (erase_end < token_text->size() &&
+                   std::isspace(static_cast<unsigned char>((*token_text)[erase_end]))) {
+                ++erase_end;
+            }
+
+            token_text->erase(erase_begin, erase_end - erase_begin);
+            pos = erase_begin;
+        }
+    }
+}
+
 bool IsStopTokenId(const TransformerModel* model, int token_id) {
     if (!model) return false;
     if (token_id == model->eos_token_id) {
@@ -1688,13 +1745,19 @@ void FinalizeDecodeSilentFinishReason(Request* req) {
     }
 }
 
-void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) {
+void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
+                             const densecore::TransformerGraphExecutionPlan* bound_graph_plan) {
     if (!req || !model) {
         return;
     }
     const auto descriptor = densecore::models::DescribeModel(model);
     const auto execution_contract = densecore::models::BuildModelExecutionContract(model);
-    const auto graph_plan = densecore::ResolveTransformerGraphExecutionPlan(model);
+    const auto kernel_coverage = densecore::models::ValidateFallbackFreeKernelCoverage(
+        model, execution_contract,
+        densecore::runtime::CompileTimeHostKernelCapabilities(/*q4k_true_batched=*/true, /*ggml_repack=*/false));
+    const auto fallback_graph_plan =
+        bound_graph_plan ? densecore::TransformerGraphExecutionPlan{} : densecore::ResolveTransformerGraphExecutionPlan(model);
+    const auto& graph_plan = bound_graph_plan ? *bound_graph_plan : fallback_graph_plan;
     const auto qwen_hot_path_plan = densecore::runtime::ResolveQwenHotPathPlan(model);
     if (descriptor.variant != ModelVariant::QWEN35 && descriptor.variant != ModelVariant::QWEN36 &&
         descriptor.variant != ModelVariant::GEMMA4 && descriptor.variant != ModelVariant::LFM2MOE) {
@@ -2042,9 +2105,10 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const char* effective_attention_path = resolve_effective_attention_path();
     const std::string execution_contract_rejections = JoinExecutionContractRejections(execution_contract);
     const std::string execution_contract_required_fast_path_counters =
-        JoinExecutionContractRequiredFastPathCounters(execution_contract);
+        densecore::models::FormatModelExecutionContractRequiredFastPathCounters(execution_contract);
     const std::string execution_contract_forbidden_fast_paths =
         JoinExecutionContractForbiddenFastPaths(execution_contract);
+    const std::string graph_kernel_missing = SummaryToken(JoinKernelCoverageMissing(kernel_coverage));
     const std::string graph_selected_builder = SummaryToken(graph_plan.selected_builder_name);
     const std::string graph_debug_reason = SummaryToken(graph_plan.debug_reason);
     const std::string graph_registry_builder_key = SummaryToken(graph_plan.registry_builder_key);
@@ -2144,9 +2208,15 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " model_execution_contract_native_moe_max_direct_tokens=" << execution_contract.native_moe_max_direct_tokens
         << " model_execution_contract_layer_count=" << execution_contract.layers.size()
         << " model_execution_contract_rebind_count=" << execution_contract.rebind_descriptors.size()
+        << " model_execution_contract_semantic_graph_nodes=" << execution_contract.semantic_graph_nodes.size()
         << " model_execution_contract_rejections=" << execution_contract_rejections
         << " model_execution_contract_required_fast_path_counters=" << execution_contract_required_fast_path_counters
         << " model_execution_contract_forbidden_fast_paths=" << execution_contract_forbidden_fast_paths
+        << " graph_kernel_coverage=" << KernelCoveragePercent(kernel_coverage)
+        << " graph_kernel_coverage_ok=" << (kernel_coverage.fallback_free ? 1 : 0)
+        << " graph_kernel_covered_nodes=" << kernel_coverage.covered_node_count
+        << " graph_kernel_required_nodes=" << kernel_coverage.graph_node_count
+        << " graph_kernel_missing=" << graph_kernel_missing
         << " graph_plan_route=" << TransformerGraphExecutionRouteSummaryName(graph_plan.route)
         << " graph_plan_family=" << densecore::models::GraphFamilyName(graph_plan.resolution.preferred_family)
         << " graph_plan_fail_closed=" << (graph_plan.resolution.fail_closed ? 1 : 0)
@@ -2199,6 +2269,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " ssm_gate_ms=" << ns_to_ms(req->ssm_gate_wall_ns)
         << " ssm_delta_wall_ms=" << ns_to_ms(req->ssm_delta_wall_ns) << " ssm_out_ms=" << ns_to_ms(req->ssm_out_wall_ns)
         << " ssm_conv1d_ms=" << ns_to_ms(req->ssm_conv1d_ns) << " ssm_delta_ms=" << ns_to_ms(req->ssm_delta_ns)
+        << " ssm_delta_fast_default_used_ops=" << req->ssm_delta_fast_default_used_ops
+        << " ssm_delta_fast_default_wall_ms=" << ns_to_ms(req->ssm_delta_fast_default_wall_ns)
         << " kv_update_ms=" << ns_to_ms(req->kv_update_ns) << " sample_ms=" << ns_to_ms(req->sample_ns)
         << " kleidiai_compiled_enabled=" << req->kleidiai_compiled_enabled
         << " kleidiai_candidate_ops=" << req->kleidiai_candidate_ops
@@ -2277,6 +2349,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " q4k_repacked_gemv_probe_ms=" << (static_cast<double>(req->q4k_repacked_gemv_probe_ns) / 1.0e6)
         << " q4k_repacked_gemv_resident_bytes=" << req->q4k_repacked_gemv_resident_bytes
         << " q4k_repacked_gemv_cache_limit_bytes=" << densecore::kernels::Q4KRepackedGemvCacheLimitBytes()
+        << " q4k_repacked_gemv_cache_floor_bytes="
+        << densecore::kernels::Q4KRepackedGemvRuntimeCacheBudgetFloorBytes()
         << " q4k_repacked_gemv_cache_limit_source="
         << (densecore::kernels::Q4KRepackedGemvManualCacheLimitConfigured() ? "manual" : "auto")
         << " q4k_repacked_gemv_distinct_weights_seen=" << req->q4k_repacked_gemv_distinct_weights_seen
@@ -2359,7 +2433,11 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " moe_q5k_repacked_rejected_ops=" << req->moe_q5k_repacked_rejected_ops
         << " moe_q5k_repacked_last_reject_reason="
         << (req->moe_q5k_repacked_last_reject_reason.empty() ? "none"
-                                                             : req->moe_q5k_repacked_last_reject_reason.c_str())
+                                                              : req->moe_q5k_repacked_last_reject_reason.c_str())
+        << " moe_kquant_raw_batched_q4k_used_ops=" << req->moe_kquant_raw_batched_q4k_used_ops
+        << " moe_kquant_raw_batched_q4k_ms=" << ns_to_ms(req->moe_kquant_raw_batched_q4k_ns)
+        << " moe_kquant_raw_batched_q5k_used_ops=" << req->moe_kquant_raw_batched_q5k_used_ops
+        << " moe_kquant_raw_batched_q5k_ms=" << ns_to_ms(req->moe_kquant_raw_batched_q5k_ns)
         << " gemma4_moe_prefill_quant_batch_candidate_ops=" << req->gemma4_moe_prefill_quant_batch_candidate_ops
         << " gemma4_moe_prefill_quant_batch_used_ops=" << req->gemma4_moe_prefill_quant_batch_used_ops
         << " gemma4_moe_prefill_quant_batch_rejected_ops=" << req->gemma4_moe_prefill_quant_batch_rejected_ops
@@ -2480,6 +2558,10 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                 ? "none"
                 : req->native_moe_fast_w2_q5k_last_reject_reason.c_str())
         << " native_moe_fast_w2_q5k_ms=" << ns_to_ms(req->native_moe_fast_w2_q5k_ns)
+        << " qwen_native_moe_w2_q5k_raw_batched_used_ops="
+        << req->qwen_native_moe_w2_q5k_raw_batched_used_ops
+        << " qwen_native_moe_w2_q5k_raw_batched_ms="
+        << ns_to_ms(req->qwen_native_moe_w2_q5k_raw_batched_ns)
         << " native_moe_fast_w2_q5k_config=builtin"
         << " native_moe_fast_w2_q5k_effective_state=" << native_moe_fast_w2_q5k_effective_state
         << " lfm2_native_moe_decode_used_ops=" << lfm2_native_moe_decode_used_ops

@@ -476,6 +476,8 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
             }
             bool step_ok = false;
             if (can_use_fast_default_head_step && !collect_step_stats && !step_debug_ptr) {
+                // All callback workers share the same fast-default eligibility; wall
+                // telemetry is emitted once below from ith==0.
                 step_ok = Qwen35RunGatedDeltaHeadStepFastDefault(cfg, state, y_head);
             } else {
                 step_ok = Qwen35RunGatedDeltaHeadStep(cfg, state, y_head, step_stats_ptr, step_debug_ptr);
@@ -671,6 +673,10 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
         AddQwen36ProfileNs(ud->profile->ssm_delta_ns, elapsed_ns);
         if (ith == 0) {
             AddQwen36ProfileNs(ud->profile->ssm_delta_wall_ns, elapsed_ns);
+            if (can_use_fast_default_head_step) {
+                ud->profile->ssm_delta_fast_default_used_ops.fetch_add(1, std::memory_order_relaxed);
+                AddQwen36ProfileNs(ud->profile->ssm_delta_fast_default_wall_ns, elapsed_ns);
+            }
         }
     }
 }

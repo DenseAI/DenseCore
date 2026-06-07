@@ -76,8 +76,53 @@ std::atomic<size_t>& RuntimeAutoCacheLimitBytes() {
     return limit;
 }
 
+std::atomic<size_t>& RuntimeAutoCacheFloorBytes() {
+    static std::atomic<size_t> floor{0};
+    return floor;
+}
+
 size_t ReadAvailableMemoryBytes() {
 #if defined(__linux__)
+    auto read_ull_file = [](const char* path) -> unsigned long long {
+        std::FILE* file = std::fopen(path, "r");
+        if (!file) {
+            return 0;
+        }
+        char buffer[128] = {};
+        if (!std::fgets(buffer, sizeof(buffer), file)) {
+            std::fclose(file);
+            return 0;
+        }
+        std::fclose(file);
+        if (std::strncmp(buffer, "max", 3) == 0) {
+            return 0;
+        }
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(buffer, &end, 10);
+        if (end == buffer || value == 0 || value > (1ULL << 50)) {
+            return 0;
+        }
+        return value;
+    };
+
+    size_t cgroup_available_bytes = 0;
+    const unsigned long long cgroup_v2_limit = read_ull_file("/sys/fs/cgroup/memory.max");
+    const unsigned long long cgroup_v2_current = read_ull_file("/sys/fs/cgroup/memory.current");
+    if (cgroup_v2_limit > 0) {
+        cgroup_available_bytes =
+            static_cast<size_t>((cgroup_v2_current > 0 && cgroup_v2_limit > cgroup_v2_current)
+                                    ? (cgroup_v2_limit - cgroup_v2_current)
+                                    : cgroup_v2_limit);
+    }
+    const unsigned long long cgroup_v1_limit = read_ull_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    const unsigned long long cgroup_v1_current = read_ull_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+    if (cgroup_available_bytes == 0 && cgroup_v1_limit > 0) {
+        cgroup_available_bytes =
+            static_cast<size_t>((cgroup_v1_current > 0 && cgroup_v1_limit > cgroup_v1_current)
+                                    ? (cgroup_v1_limit - cgroup_v1_current)
+                                    : cgroup_v1_limit);
+    }
+
     std::FILE* file = std::fopen("/proc/meminfo", "r");
     if (file) {
         char line[256] = {};
@@ -85,16 +130,23 @@ size_t ReadAvailableMemoryBytes() {
         while (std::fgets(line, sizeof(line), file)) {
             if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
                 std::fclose(file);
-                return static_cast<size_t>(kb) * 1024ull;
+                const size_t mem_available_bytes = static_cast<size_t>(kb) * 1024ull;
+                return cgroup_available_bytes > 0 ? std::min(mem_available_bytes, cgroup_available_bytes)
+                                                  : mem_available_bytes;
             }
         }
         std::fclose(file);
     }
+    if (cgroup_available_bytes > 0) {
+        return cgroup_available_bytes;
+    }
     struct sysinfo info {};
     if (sysinfo(&info) == 0 && info.mem_unit > 0) {
         const uint64_t unit = static_cast<uint64_t>(info.mem_unit);
-        return static_cast<size_t>((static_cast<uint64_t>(info.freeram) + static_cast<uint64_t>(info.bufferram)) *
-                                   unit);
+        const size_t sys_available_bytes =
+            static_cast<size_t>((static_cast<uint64_t>(info.freeram) + static_cast<uint64_t>(info.bufferram)) * unit);
+        return cgroup_available_bytes > 0 ? std::min(sys_available_bytes, cgroup_available_bytes)
+                                          : sys_available_bytes;
     }
 #endif
     return 0;
@@ -188,10 +240,68 @@ size_t Q4KRepackedGemvRefreshRuntimeCacheBudget(size_t reserved_bytes) {
         RuntimeAutoCacheLimitBytes().store(manual, std::memory_order_relaxed);
         return manual;
     }
-    const size_t auto_limit = Q4KRepackedGemvAutoCacheLimitBytes(reserved_bytes);
+    size_t resident_floor = 0;
+    {
+        auto& state = CacheState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        resident_floor = state.cache_bytes;
+    }
+    const size_t runtime_floor = RuntimeAutoCacheFloorBytes().load(std::memory_order_relaxed);
+    const size_t auto_limit =
+        std::max(std::max(Q4KRepackedGemvAutoCacheLimitBytes(reserved_bytes), resident_floor), runtime_floor);
     RuntimeAutoCacheLimitBytes().store(auto_limit, std::memory_order_relaxed);
     return auto_limit;
 }
+
+size_t Q4KRepackedGemvRaiseRuntimeCacheBudgetFloor(size_t floor_bytes) {
+    const size_t manual = ManualCacheLimitBytes();
+    if (manual != kUninitializedCacheLimit) {
+        RuntimeAutoCacheLimitBytes().store(manual, std::memory_order_relaxed);
+        return manual;
+    }
+    if (floor_bytes == 0) {
+        return RuntimeAutoCacheLimitBytes().load(std::memory_order_relaxed);
+    }
+    auto& runtime_floor = RuntimeAutoCacheFloorBytes();
+    size_t floor_current = runtime_floor.load(std::memory_order_relaxed);
+    while (floor_current < floor_bytes) {
+        if (runtime_floor.compare_exchange_weak(floor_current, floor_bytes, std::memory_order_relaxed,
+                                                std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    auto& runtime_limit = RuntimeAutoCacheLimitBytes();
+    size_t current = runtime_limit.load(std::memory_order_relaxed);
+    while (current == kUninitializedCacheLimit || current < floor_bytes) {
+        if (runtime_limit.compare_exchange_weak(current, floor_bytes, std::memory_order_relaxed,
+                                                std::memory_order_relaxed)) {
+            return floor_bytes;
+        }
+    }
+    return current;
+}
+
+size_t Q4KRepackedGemvSetRuntimeCacheBudgetFloor(size_t floor_bytes) {
+    const size_t manual = ManualCacheLimitBytes();
+    if (manual != kUninitializedCacheLimit) {
+        RuntimeAutoCacheLimitBytes().store(manual, std::memory_order_relaxed);
+        return manual;
+    }
+    RuntimeAutoCacheFloorBytes().store(floor_bytes, std::memory_order_relaxed);
+    RuntimeAutoCacheLimitBytes().store(floor_bytes, std::memory_order_relaxed);
+    return floor_bytes;
+}
+
+size_t Q4KRepackedGemvRuntimeCacheBudgetFloorBytes() {
+    return RuntimeAutoCacheFloorBytes().load(std::memory_order_relaxed);
+}
+
+#ifdef DENSECORE_TEST_BUILD
+void Q4KRepackedGemvResetRuntimeCacheBudgetFloorForTest() {
+    RuntimeAutoCacheFloorBytes().store(0, std::memory_order_relaxed);
+    RuntimeAutoCacheLimitBytes().store(kUninitializedCacheLimit, std::memory_order_relaxed);
+}
+#endif
 
 Q4KRepackedGemvCacheStats Q4KRepackedGemvCacheStatsSnapshot() {
     auto& state = CacheState();
@@ -199,6 +309,7 @@ Q4KRepackedGemvCacheStats Q4KRepackedGemvCacheStatsSnapshot() {
     stats.evictions = state.evictions.load(std::memory_order_relaxed);
     stats.evicted_bytes = state.evicted_bytes.load(std::memory_order_relaxed);
     stats.repack_bytes = state.repack_bytes.load(std::memory_order_relaxed);
+    stats.runtime_floor_bytes = Q4KRepackedGemvRuntimeCacheBudgetFloorBytes();
     std::lock_guard<std::mutex> lock(state.mutex);
     stats.resident_bytes = static_cast<uint64_t>(state.cache_bytes);
     return stats;
@@ -280,30 +391,21 @@ std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(const vo
         !Q4KRealPackedGemvKernelAvailable()) {
         return nullptr;
     }
-    const size_t cache_limit = Q4KRepackedGemvCacheLimitBytes();
-    if (cache_limit == 0) {
-        return nullptr;
-    }
-
     const size_t raw_bytes = static_cast<size_t>(rows) * ggml_row_size(GGML_TYPE_Q4_K, cols);
     const size_t blocks_per_row = static_cast<size_t>(cols / kQ4KSuperBlock);
     const size_t packed_blocks = static_cast<size_t>(rows / 8) * blocks_per_row;
     const size_t packed_bytes = packed_blocks * sizeof(Q4KRepackedGemvBlock);
-    if (lookup) {
-        lookup->cache_limit_bytes = static_cast<uint64_t>(cache_limit);
-        lookup->weight_bytes = static_cast<uint64_t>(packed_bytes);
-    }
-    if (packed_bytes == 0 || packed_bytes > cache_limit) {
-        if (lookup) {
-            lookup->cache_limit_too_small = true;
-            lookup->working_set_exceeds_cache = packed_bytes > cache_limit;
-            lookup->resident_bytes = Q4KRepackedGemvCacheStatsSnapshot().resident_bytes;
-        }
+    if (packed_bytes == 0) {
         return nullptr;
     }
     const Q4KRepackedGemvKey key{weight_ptr, rows, cols, FingerprintQ4KRepackedGemvWeight(weight_ptr, raw_bytes)};
     if (lookup) {
         lookup->weight_key = Q4KRepackedGemvStableKey(key);
+        lookup->weight_bytes = static_cast<uint64_t>(packed_bytes);
+    }
+    size_t cache_limit = Q4KRepackedGemvCacheLimitBytes();
+    if (lookup) {
+        lookup->cache_limit_bytes = static_cast<uint64_t>(cache_limit);
     }
     const uint64_t now = CacheState().use_clock.fetch_add(1, std::memory_order_relaxed) + 1;
     auto& state = CacheState();
@@ -339,6 +441,14 @@ std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(const vo
                     lookup->waited = false;
                 }
             }
+        }
+        if (cache_limit == 0 || packed_bytes > cache_limit) {
+            if (lookup) {
+                lookup->cache_limit_too_small = true;
+                lookup->working_set_exceeds_cache = packed_bytes > cache_limit;
+                lookup->resident_bytes = static_cast<uint64_t>(state.cache_bytes);
+            }
+            return nullptr;
         }
         entry = std::make_shared<Q4KRepackedGemvCacheEntry>();
         entry->building = true;

@@ -61,13 +61,54 @@ densecore::models::GraphBuilderSupport MakeDenseCoreInlineGraphSupport() {
 
 densecore::TransformerGraphExecutionPlan densecore::llm::graph::ResolveExecutionPlan(const TransformerModel* model) {
     TransformerGraphExecutionPlan plan{};
-    plan.resolution = models::ResolveGraphFamily(model);
 
     if (!model) {
         plan.route = TransformerGraphExecutionRoute::Reject;
         plan.debug_reason = "model is null";
         return plan;
     }
+
+    const bool qwen_hybrid_ssm =
+        model->arch_flags.is_hybrid_ssm &&
+        (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36 ||
+         model->arch == ModelArch::QWEN35);
+    if (qwen_hybrid_ssm) {
+        auto& capabilities = plan.resolution.capabilities;
+        capabilities.arch = model->arch;
+        capabilities.variant = model->variant;
+        capabilities.topology = models::GraphTopology::DECODER_ONLY;
+        capabilities.decoder_runtime_topology = model->hparams.n_experts > 0
+                                                    ? models::DecoderRuntimeTopology::HybridSSMMoE
+                                                    : models::DecoderRuntimeTopology::HybridSSM;
+        capabilities.has_dense_attention = true;
+        capabilities.has_hybrid_ssm_mixer = true;
+        capabilities.has_moe = model->hparams.n_experts > 0;
+        capabilities.requires_fallback_free_fast_path = true;
+        capabilities.requires_native_moe_fast_path = capabilities.has_moe;
+        capabilities.requires_decode_graph_runtime_rebind = true;
+        capabilities.native_moe_max_direct_tokens = capabilities.has_moe ? 4096 : 0;
+        capabilities.required_prefill_logits_policies.push_back(models::DecoderPrefillLogitsPolicy::LastTokenEnvDefaultOn);
+        capabilities.required_semantic_ops = {
+            models::DecoderSemanticOpKind::AttentionNorm,
+            models::DecoderSemanticOpKind::HybridSSMMixer,
+            models::DecoderSemanticOpKind::FfnNorm,
+            models::DecoderSemanticOpKind::ResidualAdd,
+        };
+        if (capabilities.has_moe) {
+            capabilities.required_semantic_ops.push_back(models::DecoderSemanticOpKind::MoERouter);
+            capabilities.required_semantic_ops.push_back(models::DecoderSemanticOpKind::MoEExpertDispatch);
+            capabilities.required_moe_routers.push_back(models::DecoderMoERouter::SoftmaxTopK);
+            capabilities.required_ffn_activations.push_back(models::DecoderActivation::Silu);
+        }
+        plan.resolution.preferred_family = models::GraphFamily::DecoderHybridSSM;
+        plan.resolution.fallback_chain = {models::GraphFamily::DecoderDenseAttention};
+        plan.resolution.fail_closed = true;
+        plan.route = TransformerGraphExecutionRoute::InlineHybridSSM;
+        plan.debug_reason = "qwen hybrid-SSM maintained inline route";
+        return plan;
+    }
+
+    plan.resolution = models::ResolveGraphFamily(model);
 
     std::string registry_debug;
     const auto descriptor =

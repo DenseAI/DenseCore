@@ -126,6 +126,7 @@ void EnsureRequestHybridSSMRuntimeState(TransformerModel* model, Request* req);
 void EnsureRequestLFM2RuntimeState(TransformerModel* model, Request* req);
 void SuppressTaggedBlock(std::string* token_text, bool* in_block, std::string* pending, const char* open_tag,
                          const char* close_tag);
+void SuppressQwenVisibleControlMarkers(std::string* token_text);
 bool IsStopTokenId(const TransformerModel* model, int token_id);
 bool ShouldTerminateRepetitiveLoop(const TransformerModel* model, const Request* req);
 size_t Utf8ValidPrefixLength(const std::string& s);
@@ -140,7 +141,8 @@ void NoteDecodeSampleProgress(Request* req, std::chrono::steady_clock::time_poin
 void NoteSuppressedToken(Request* req);
 void NoteVisibleEmitProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id);
 void FinalizeDecodeSilentFinishReason(Request* req);
-void LogRequestDecodeSummary(const Request* req, const TransformerModel* model);
+void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
+                             const densecore::TransformerGraphExecutionPlan* graph_plan = nullptr);
 bool HasDecodeVisibleProgressStalled(const Request* req, std::chrono::steady_clock::time_point now);
 int ResolveQwen36PrefillChunkTokens(const TransformerModel* model, const Request* req);
 int ResolveGemma4PrefillChunkTokens(const TransformerModel* model, const Request* req);

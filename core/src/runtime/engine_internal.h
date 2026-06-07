@@ -29,6 +29,7 @@
 #include "densecore/memory/kv_cache.h"
 #include "densecore/models/embedding.h"
 #include "densecore/models/lora_storage.h"
+#include "densecore/models/model_execution_contract.h"
 #include "densecore/models/model_loader.h"
 #include "densecore/models/model_types.h"
 #include "densecore/models/tokenizer.h"
@@ -557,6 +558,10 @@ struct Request {
     uint64_t moe_q5k_repacked_used_ops = 0;
     uint64_t moe_q5k_repacked_rejected_ops = 0;
     std::string moe_q5k_repacked_last_reject_reason;
+    uint64_t moe_kquant_raw_batched_q4k_used_ops = 0;
+    uint64_t moe_kquant_raw_batched_q4k_ns = 0;
+    uint64_t moe_kquant_raw_batched_q5k_used_ops = 0;
+    uint64_t moe_kquant_raw_batched_q5k_ns = 0;
     uint64_t gemma4_moe_prefill_quant_batch_candidate_ops = 0;
     uint64_t gemma4_moe_prefill_quant_batch_used_ops = 0;
     uint64_t gemma4_moe_prefill_quant_batch_rejected_ops = 0;
@@ -637,6 +642,8 @@ struct Request {
     uint64_t native_moe_fast_w2_q5k_rejected_ops = 0;
     std::string native_moe_fast_w2_q5k_last_reject_reason;
     uint64_t native_moe_fast_w2_q5k_ns = 0;
+    uint64_t qwen_native_moe_w2_q5k_raw_batched_used_ops = 0;
+    uint64_t qwen_native_moe_w2_q5k_raw_batched_ns = 0;
     uint64_t graph_ctx_requested_mb = 0;
     uint64_t graph_ctx_available_mb = 0;
     uint64_t graph_ctx_safety_margin_mb = 0;
@@ -663,6 +670,8 @@ struct Request {
     uint64_t qwen36_prefill_total_ns = 0;
     uint64_t qwen36_prefill_ssm_projection_ns = 0;
     uint64_t qwen36_prefill_ssm_delta_state_ns = 0;
+    uint64_t ssm_delta_fast_default_used_ops = 0;
+    uint64_t ssm_delta_fast_default_wall_ns = 0;
     uint64_t qwen36_prefill_attention_ns = 0;
     uint64_t qwen36_prefill_mlp_or_moe_ns = 0;
     uint64_t qwen36_prefill_graph_build_ns = 0;
@@ -1016,6 +1025,10 @@ struct Request {
         moe_q5k_repacked_used_ops = 0;
         moe_q5k_repacked_rejected_ops = 0;
         moe_q5k_repacked_last_reject_reason.clear();
+        moe_kquant_raw_batched_q4k_used_ops = 0;
+        moe_kquant_raw_batched_q4k_ns = 0;
+        moe_kquant_raw_batched_q5k_used_ops = 0;
+        moe_kquant_raw_batched_q5k_ns = 0;
         gemma4_moe_prefill_quant_batch_candidate_ops = 0;
         gemma4_moe_prefill_quant_batch_used_ops = 0;
         gemma4_moe_prefill_quant_batch_rejected_ops = 0;
@@ -1096,6 +1109,8 @@ struct Request {
         native_moe_fast_w2_q5k_rejected_ops = 0;
         native_moe_fast_w2_q5k_last_reject_reason.clear();
         native_moe_fast_w2_q5k_ns = 0;
+        qwen_native_moe_w2_q5k_raw_batched_used_ops = 0;
+        qwen_native_moe_w2_q5k_raw_batched_ns = 0;
         graph_ctx_requested_mb = 0;
         graph_ctx_available_mb = 0;
         graph_ctx_safety_margin_mb = 0;
@@ -1122,6 +1137,8 @@ struct Request {
         qwen36_prefill_total_ns = 0;
         qwen36_prefill_ssm_projection_ns = 0;
         qwen36_prefill_ssm_delta_state_ns = 0;
+        ssm_delta_fast_default_used_ops = 0;
+        ssm_delta_fast_default_wall_ns = 0;
         qwen36_prefill_attention_ns = 0;
         qwen36_prefill_mlp_or_moe_ns = 0;
         qwen36_prefill_graph_build_ns = 0;
@@ -1546,15 +1563,19 @@ struct EngineState {
 
     static GraphContextEstimate EstimateGraphContextSize(const TransformerModel* model, size_t seq_len_hint = 0,
                                                          size_t num_seqs_hint = 0, size_t chunk_token_hint = 0) {
-        auto parse_env_mb = [](const char* name, size_t default_mb, size_t min_mb, size_t hard_max_mb) -> size_t {
+        auto parse_env_mb = [](const char* name, size_t default_mb, size_t min_mb, size_t max_mb) -> size_t {
+            const size_t effective_max_mb = std::max<size_t>(1, max_mb);
+            const size_t effective_min_mb = std::min(min_mb, effective_max_mb);
+            const size_t bounded_default_mb =
+                std::min(std::max(default_mb, effective_min_mb), effective_max_mb);
             const char* env = std::getenv(name);
-            if (!env || env[0] == '\0') return default_mb;
+            if (!env || env[0] == '\0') return bounded_default_mb;
             errno = 0;
             char* end = nullptr;
             unsigned long long v = std::strtoull(env, &end, 10);
-            if (errno != 0 || end == env || *end != '\0') return default_mb;
-            if (v < min_mb) return min_mb;
-            if (v > hard_max_mb) return hard_max_mb;
+            if (errno != 0 || end == env || *end != '\0') return bounded_default_mb;
+            if (v < effective_min_mb) return effective_min_mb;
+            if (v > effective_max_mb) return effective_max_mb;
             return static_cast<size_t>(v);
         };
         auto parse_env_int = [](const char* name, int default_value, int min_value) -> int {
@@ -1569,7 +1590,28 @@ struct EngineState {
 
         constexpr size_t MB = 1024ULL * 1024ULL;
         constexpr size_t HARD_MIN_MB = 128;
-        constexpr size_t HARD_MAX_MB = 48ULL * 1024ULL;
+        constexpr size_t FALLBACK_ENV_MAX_MB = 1024ULL * 1024ULL;
+        auto saturating_add = [](size_t a, size_t b) -> size_t {
+            if (a > std::numeric_limits<size_t>::max() - b) {
+                return std::numeric_limits<size_t>::max();
+            }
+            return a + b;
+        };
+        auto saturating_mul = [](size_t a, size_t b) -> size_t {
+            if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+                return std::numeric_limits<size_t>::max();
+            }
+            return a * b;
+        };
+        auto saturating_add_inplace = [&](size_t& target, size_t value) {
+            target = saturating_add(target, value);
+        };
+        auto ceil_bytes_to_mb = [](size_t bytes) -> size_t {
+            if (bytes >= std::numeric_limits<size_t>::max() - (MB - 1)) {
+                return std::numeric_limits<size_t>::max() / MB;
+            }
+            return (bytes + MB - 1) / MB;
+        };
         auto parse_positive_ull = [](const char* text) -> unsigned long long {
             if (!text || text[0] == '\0') return 0;
             errno = 0;
@@ -1587,7 +1629,7 @@ struct EngineState {
                 }
             }
 #if defined(__linux__)
-            auto read_cgroup_limit_mb = [&](const char* path) -> size_t {
+            auto read_ull_file = [&](const char* path) -> unsigned long long {
                 std::FILE* file = std::fopen(path, "r");
                 if (!file) return 0;
                 char buffer[128] = {};
@@ -1597,7 +1639,7 @@ struct EngineState {
                 if (std::strncmp(buffer, "max", 3) == 0) return 0;
                 const unsigned long long bytes = parse_positive_ull(buffer);
                 if (bytes == 0 || bytes > (1ULL << 50)) return 0;  // Treat absurd values as "unlimited".
-                return static_cast<size_t>(bytes / MB);
+                return bytes;
             };
             auto read_mem_available_mb = [&]() -> size_t {
                 std::FILE* file = std::fopen("/proc/meminfo", "r");
@@ -1614,11 +1656,28 @@ struct EngineState {
                 return 0;
             };
 
+            size_t cgroup_available_mb = 0;
+            const unsigned long long cgroup_v2_limit = read_ull_file("/sys/fs/cgroup/memory.max");
+            const unsigned long long cgroup_v2_current = read_ull_file("/sys/fs/cgroup/memory.current");
+            if (cgroup_v2_limit > 0) {
+                const unsigned long long cgroup_v2_available =
+                    cgroup_v2_current > 0 && cgroup_v2_limit > cgroup_v2_current
+                        ? cgroup_v2_limit - cgroup_v2_current
+                        : cgroup_v2_limit;
+                cgroup_available_mb = static_cast<size_t>(cgroup_v2_available / MB);
+            }
+            const unsigned long long cgroup_v1_limit = read_ull_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+            const unsigned long long cgroup_v1_current = read_ull_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+            if (cgroup_available_mb == 0 && cgroup_v1_limit > 0) {
+                const unsigned long long cgroup_v1_available =
+                    cgroup_v1_current > 0 && cgroup_v1_limit > cgroup_v1_current
+                        ? cgroup_v1_limit - cgroup_v1_current
+                        : cgroup_v1_limit;
+                cgroup_available_mb = static_cast<size_t>(cgroup_v1_available / MB);
+            }
             size_t available_mb = 0;
-            const size_t cgroup_v2_mb = read_cgroup_limit_mb("/sys/fs/cgroup/memory.max");
-            const size_t cgroup_v1_mb = read_cgroup_limit_mb("/sys/fs/cgroup/memory/memory.limit_in_bytes");
             const size_t mem_available_mb = read_mem_available_mb();
-            for (const size_t candidate_mb : {cgroup_v2_mb, cgroup_v1_mb, mem_available_mb}) {
+            for (const size_t candidate_mb : {cgroup_available_mb, mem_available_mb}) {
                 if (candidate_mb == 0) continue;
                 available_mb = (available_mb == 0) ? candidate_mb : std::min(available_mb, candidate_mb);
             }
@@ -1635,11 +1694,36 @@ struct EngineState {
         }
 
         const auto& hp = model->hparams;
+        const bool model_has_moe_layers = [&]() {
+            if (hp.n_experts > 0) {
+                return true;
+            }
+            if (model->decoder_spec && model->decoder_spec->has_moe) {
+                return true;
+            }
+            if (densecore::models::BuildModelExecutionContract(model).has_moe) {
+                return true;
+            }
+            for (const TransformerLayer& layer : model->layers) {
+                if (layer.is_moe || !layer.experts.empty()) {
+                    return true;
+                }
+                for (const auto& tensor_entry : layer.tensors) {
+                    const std::string& name = tensor_entry.first;
+                    if (name.find("ffn_gate_up_exps") != std::string::npos ||
+                        name.find("ffn_down_exps") != std::string::npos ||
+                        name.find("experts.") != std::string::npos) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }();
         const size_t runtime_max_seq_len = static_cast<size_t>(parse_env_int("DENSECORE_MAX_SEQ_LEN", 4096, 1));
         const bool large_hidden_model =
             std::max<int32_t>(1, hp.n_layer) >= 40 && std::max<int32_t>(1, hp.n_embd) >= 2048;
         const bool large_weight_shared_llm =
-            large_hidden_model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_gemma4 || hp.n_experts > 0);
+            large_hidden_model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_gemma4 || model_has_moe_layers);
         const int default_max_num_seqs = large_weight_shared_llm ? 2 : 4;
         const size_t runtime_max_num_seqs =
             static_cast<size_t>(parse_env_int("DENSECORE_MAX_NUM_SEQS", default_max_num_seqs, 1));
@@ -1675,22 +1759,31 @@ struct EngineState {
         // back to runtime max batch/sequence. Decode has long K/V history but a
         // tiny query chunk, so using seq^2 here over-materializes the pool by
         // tens of GB on Gemma4 MoE long-context serving.
-        const size_t query_token_working_set = effective_num_seqs * effective_query_len;
-        const size_t key_token_working_set = effective_num_seqs * effective_seq_len;
+        const bool qwen_hybrid_moe_chunked_prefill_graph =
+            (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+            model->arch_flags.is_hybrid_ssm && model_has_moe_layers && has_request_shape_hint &&
+            chunk_token_hint > 1 && effective_query_len > 1 && effective_seq_len > effective_query_len;
+        const size_t graph_key_len =
+            qwen_hybrid_moe_chunked_prefill_graph ? effective_query_len : effective_seq_len;
+        const size_t query_token_working_set = saturating_mul(effective_num_seqs, effective_query_len);
+        const size_t key_token_working_set = saturating_mul(effective_num_seqs, graph_key_len);
         const int n_head = std::max<int32_t>(1, hp.n_head);
         const int n_head_kv = std::max<int32_t>(1, hp.n_head_kv > 0 ? hp.n_head_kv : hp.n_head);
         const int head_dim_k = std::max<int32_t>(1, hp.n_embd_head_k > 0 ? hp.n_embd_head_k : hp.n_embd / n_head);
         const int head_dim_v = std::max<int32_t>(1, hp.n_embd_head_v > 0 ? hp.n_embd_head_v : head_dim_k);
-        const size_t kv_history_width = static_cast<size_t>(head_dim_k + head_dim_v) * static_cast<size_t>(n_head_kv);
+        const size_t kv_history_width =
+            saturating_mul(static_cast<size_t>(head_dim_k + head_dim_v), static_cast<size_t>(n_head_kv));
         const size_t hidden_query_working_set =
-            static_cast<size_t>(std::max<int32_t>(1, hp.n_embd)) * query_token_working_set;
-        const size_t kv_history_working_set = kv_history_width * key_token_working_set;
-        const size_t hidden_query_bytes = hidden_query_working_set * sizeof(float);
-        const size_t kv_history_bytes = kv_history_working_set * sizeof(float);
+            saturating_mul(static_cast<size_t>(std::max<int32_t>(1, hp.n_embd)), query_token_working_set);
+        const size_t kv_history_working_set = saturating_mul(kv_history_width, key_token_working_set);
+        const size_t hidden_query_bytes = saturating_mul(hidden_query_working_set, sizeof(float));
+        const size_t kv_history_bytes = saturating_mul(kv_history_working_set, sizeof(float));
 
         const size_t attention_score_elems =
-            static_cast<size_t>(n_head) * effective_num_seqs * effective_query_len * effective_seq_len;
-        const size_t attention_score_bytes = attention_score_elems * sizeof(float);
+            saturating_mul(saturating_mul(saturating_mul(static_cast<size_t>(n_head), effective_num_seqs),
+                                          effective_query_len),
+                           graph_key_len);
+        const size_t attention_score_bytes = saturating_mul(attention_score_elems, sizeof(float));
         const size_t attention_score_buffer_count =
             (model->arch_flags.is_gemma4 && effective_query_len > 1) ? 3ULL : 2ULL;
 
@@ -1700,35 +1793,48 @@ struct EngineState {
         //   - score-sized buffers (scores + probs/mask-expanded scratch; Gemma4
         //     softcap attention keeps one extra score-shaped stage live)
         const size_t per_layer_activation_bytes =
-            hidden_query_bytes * 7 + kv_history_bytes + attention_score_bytes * attention_score_buffer_count;
-        const size_t base_size = static_cast<size_t>(std::max<int32_t>(1, hp.n_layer)) * per_layer_activation_bytes;
+            saturating_add(saturating_add(saturating_mul(hidden_query_bytes, 7), kv_history_bytes),
+                           saturating_mul(attention_score_bytes, attention_score_buffer_count));
+        const size_t base_size =
+            saturating_mul(static_cast<size_t>(std::max<int32_t>(1, hp.n_layer)), per_layer_activation_bytes);
         estimate.base_graph_working_set_bytes = base_size;
 
         // Residual/output/lm-head staging that can remain live across layers.
-        size_t overhead = hidden_query_bytes * 4 + kv_history_bytes + attention_score_bytes / 2;
+        size_t overhead =
+            saturating_add(saturating_add(saturating_mul(hidden_query_bytes, 4), kv_history_bytes),
+                           attention_score_bytes / 2);
 
         // Hybrid SSM / Gemma4 graphs need extra room for recurrent state views and
         // architecture-specific branch tensors, but still nowhere near full-model memory.
         if (model->arch_flags.is_hybrid_ssm) {
-            estimate.hybrid_ssm_extra_bytes +=
-                static_cast<size_t>(std::max(1, model->ssm_inner_size)) * query_token_working_set * sizeof(float) / 2;
+            saturating_add_inplace(
+                estimate.hybrid_ssm_extra_bytes,
+                saturating_mul(saturating_mul(static_cast<size_t>(std::max(1, model->ssm_inner_size)),
+                                              query_token_working_set),
+                               sizeof(float)) /
+                    2);
             const size_t chunk_working_tokens = std::max<size_t>(chunk_token_hint, effective_query_len);
-            estimate.hybrid_ssm_extra_bytes +=
-                static_cast<size_t>(std::max(1, model->ssm_inner_size)) * chunk_working_tokens * sizeof(float) / 4;
+            saturating_add_inplace(
+                estimate.hybrid_ssm_extra_bytes,
+                saturating_mul(saturating_mul(static_cast<size_t>(std::max(1, model->ssm_inner_size)),
+                                              chunk_working_tokens),
+                               sizeof(float)) /
+                    4);
         }
         if (model->arch_flags.is_gemma4) {
-            overhead += hidden_query_bytes + kv_history_bytes;
+            overhead = saturating_add(saturating_add(overhead, hidden_query_bytes), kv_history_bytes);
         }
 
-        size_t total = base_size + overhead + estimate.hybrid_ssm_extra_bytes;
+        size_t total = saturating_add(saturating_add(base_size, overhead), estimate.hybrid_ssm_extra_bytes);
 
         // Leave explicit headroom for ggml object metadata, graph bookkeeping,
         // and architecture-specific scratch that are not modeled perfectly by
         // the coarse activation estimate above. Without this margin, real
         // decoder graphs tend to miss by a few MB and abort in ggml_new_object.
-        estimate.long_context_safety_pad_bytes += std::max(total / 4, static_cast<size_t>(128) * MB);
-        estimate.long_context_safety_pad_bytes += static_cast<size_t>(8) * MB;
-        estimate.long_context_safety_pad_bytes += static_cast<size_t>(4) * MB;
+        saturating_add_inplace(estimate.long_context_safety_pad_bytes,
+                               std::max(total / 4, static_cast<size_t>(128) * MB));
+        saturating_add_inplace(estimate.long_context_safety_pad_bytes, static_cast<size_t>(8) * MB);
+        saturating_add_inplace(estimate.long_context_safety_pad_bytes, static_cast<size_t>(4) * MB);
         // Keep extra slack for long-context hybrid-SSM graphs where minor
         // topology/scratch differences can exceed estimates by ~10+ MB and
         // hard-abort inside ggml_new_object(). Fail-closed handling in serving
@@ -1736,8 +1842,30 @@ struct EngineState {
         if (model->arch_flags.is_hybrid_ssm && effective_seq_len > static_cast<size_t>(BLOCK_SIZE)) {
             const size_t long_prompt_pad_mb =
                 std::clamp<size_t>(std::max<size_t>(128, (effective_seq_len / 1024ULL) * 64ULL), 128ULL, 1024ULL);
-            estimate.long_context_safety_pad_bytes += long_prompt_pad_mb * MB;
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes, long_prompt_pad_mb * MB);
         }
+#if defined(__x86_64__) || defined(_M_X64)
+        if ((model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+            model->arch_flags.is_hybrid_ssm && model_has_moe_layers && effective_query_len > 1) {
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes, 512ULL * MB);
+            if (effective_seq_len > effective_query_len) {
+                const size_t num_seqs_for_objects = std::max<size_t>(1, effective_num_seqs);
+                if (effective_seq_len <= std::numeric_limits<size_t>::max() / effective_query_len) {
+                    size_t object_pairs = effective_seq_len * effective_query_len;
+                    if (object_pairs <= std::numeric_limits<size_t>::max() / num_seqs_for_objects) {
+                        object_pairs *= num_seqs_for_objects;
+                        if (object_pairs <= std::numeric_limits<size_t>::max() / 64ULL) {
+                            saturating_add_inplace(estimate.long_context_safety_pad_bytes, object_pairs * 64ULL);
+                        }
+                    }
+                }
+            }
+        }
+        if (model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm &&
+            effective_seq_len >= 1024ULL && effective_query_len > 1) {
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes, 256ULL * MB);
+        }
+#endif
         if (model->arch_flags.is_hybrid_ssm && effective_query_len >= 1024ULL) {
             // Hybrid-SSM long-prefill graphs can still miss the coarse estimate by
             // a few-to-tens of MB because ggml object metadata and branch-local
@@ -1746,16 +1874,20 @@ struct EngineState {
             // ggml_new_object() before fail-closed handling can run.
             const size_t hybrid_long_prefill_object_pad_mb =
                 std::clamp<size_t>(((effective_query_len + 1023ULL) / 1024ULL) * 96ULL, 96ULL, 768ULL);
-            estimate.long_context_safety_pad_bytes += hybrid_long_prefill_object_pad_mb * MB;
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes, hybrid_long_prefill_object_pad_mb * MB);
         }
         if (model->arch_flags.is_gemma4 && effective_query_len > 1) {
-            estimate.long_context_safety_pad_bytes += std::max(hidden_query_bytes / 2, attention_score_bytes / 8);
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes,
+                                   std::max(hidden_query_bytes / 2, attention_score_bytes / 8));
         }
+        const size_t available_memory_mb = detect_available_memory_mb();
+        const size_t dynamic_env_cap_mb =
+            std::max<size_t>(HARD_MIN_MB, available_memory_mb > 0 ? available_memory_mb : FALLBACK_ENV_MAX_MB);
         const size_t extra_headroom_mb =
-            parse_env_mb("DENSECORE_GRAPH_CTX_EXTRA_MB", /*default_mb=*/64, /*min_mb=*/0, HARD_MAX_MB);
+            parse_env_mb("DENSECORE_GRAPH_CTX_EXTRA_MB", /*default_mb=*/64, /*min_mb=*/0, dynamic_env_cap_mb);
         estimate.env_extra_bytes = extra_headroom_mb * MB;
-        total += estimate.long_context_safety_pad_bytes;
-        total += estimate.env_extra_bytes;
+        total = saturating_add(saturating_add(total, estimate.long_context_safety_pad_bytes),
+                               estimate.env_extra_bytes);
 
         // Clamp to runtime-configurable bounds.
         // Defaults are chosen to keep previous behavior for small models while
@@ -1767,20 +1899,28 @@ struct EngineState {
             recommended_min_mb = std::max(recommended_min_mb, static_cast<size_t>(2560));
         }
         size_t recommended_max_mb = 8192;
-        const size_t available_memory_mb = detect_available_memory_mb();
         if (available_memory_mb > 0) {
-            // `MemAvailable` / cgroup free memory is already post-weights/post-KV
-            // runtime headroom. Halving it again was too conservative on C4A: the
-            // serving path could need just over 20 GB of graph scratch while the
-            // heuristic hard-capped the pool around 19.6 GB and aborted before the
-            // first token. Keep a system reserve, but allow the graph context to
-            // use most of the remaining free memory up to the 24 GB safety cap.
-            const size_t reserved_system_mb =
-                std::clamp<std::size_t>(available_memory_mb / 8, static_cast<size_t>(4096), static_cast<size_t>(12288));
-            const size_t usable_graph_mb = available_memory_mb > reserved_system_mb
-                                               ? (available_memory_mb - reserved_system_mb)
-                                               : recommended_min_mb;
-            recommended_max_mb = std::clamp<std::size_t>(usable_graph_mb, recommended_min_mb, HARD_MAX_MB);
+            // `MemAvailable` / cgroup headroom is live runtime capacity after the
+            // model has loaded. Size the graph ceiling from that live capacity and
+            // the request-shaped estimate, rather than from a C4/C4A RAM table or
+            // a fixed 48 GB ceiling. This keeps 32k+ prefill attempts admissible
+            // when the host has room, while still leaving allocator/runtime slack.
+            const size_t estimated_graph_mb = std::max<size_t>(1, ceil_bytes_to_mb(total));
+            const size_t graph_scaled_runtime_reserve_mb =
+                std::min(estimated_graph_mb / 64, std::max<size_t>(1, available_memory_mb / 8));
+            const size_t graph_scaled_allocator_slack_mb =
+                std::min(estimated_graph_mb / 128, std::max<size_t>(1, available_memory_mb / 16));
+            const size_t runtime_reserve_mb =
+                std::max<size_t>(512, (available_memory_mb / 16) + graph_scaled_runtime_reserve_mb);
+            const size_t allocator_slack_mb =
+                std::max<size_t>(256, (available_memory_mb / 64) + graph_scaled_allocator_slack_mb);
+            const size_t requested_reserve_mb = runtime_reserve_mb + allocator_slack_mb;
+            const size_t max_reserve_mb =
+                available_memory_mb > recommended_min_mb ? available_memory_mb - recommended_min_mb : 0;
+            const size_t reserved_system_mb = std::min(requested_reserve_mb, max_reserve_mb);
+            const size_t usable_graph_mb =
+                available_memory_mb > reserved_system_mb ? available_memory_mb - reserved_system_mb : recommended_min_mb;
+            recommended_max_mb = std::clamp<std::size_t>(usable_graph_mb, recommended_min_mb, dynamic_env_cap_mb);
         } else if (model->arch_flags.is_hybrid_ssm && std::max<int32_t>(1, hp.n_embd) <= 2048 &&
                    std::max<int32_t>(1, hp.n_layer) <= 24 && effective_seq_len <= 4096 && runtime_max_num_seqs <= 4) {
             recommended_max_mb = 4096;
@@ -1788,8 +1928,8 @@ struct EngineState {
             recommended_max_mb = 6144;
         }
 
-        size_t min_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MIN_MB", recommended_min_mb, HARD_MIN_MB, HARD_MAX_MB);
-        size_t max_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MAX_MB", recommended_max_mb, HARD_MIN_MB, HARD_MAX_MB);
+        size_t min_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MIN_MB", recommended_min_mb, HARD_MIN_MB, dynamic_env_cap_mb);
+        size_t max_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MAX_MB", recommended_max_mb, HARD_MIN_MB, dynamic_env_cap_mb);
         if (max_mb < min_mb) max_mb = min_mb;
         const size_t MIN_SIZE = min_mb * MB;
         const size_t MAX_SIZE = max_mb * MB;

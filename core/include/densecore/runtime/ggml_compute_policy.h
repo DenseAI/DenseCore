@@ -556,10 +556,6 @@ inline bool IsExplicitTemporaryReferenceFallback(const char* reason) {
            std::strcmp(reason, "test_reference") == 0;
 }
 
-inline bool IsGemma4TemporaryReferencePrefillQuantNative(const char* reason) {
-    return reason && std::strcmp(reason, "temporary_reference_gemma4_prefill_quant_native") == 0;
-}
-
 struct DenseCoreFallbackPolicy {
     static constexpr bool kEnvOverrideAllowed = false;
 
@@ -572,10 +568,8 @@ struct DenseCoreFallbackPolicy {
     }
 
     static bool AllowsGgmlCompute(const TargetFastPathPlan& plan, const char* reason) {
+        (void)reason;
         if (!plan.target_model) {
-            return true;
-        }
-        if (plan.gemma4_target && IsGemma4TemporaryReferencePrefillQuantNative(reason)) {
             return true;
         }
         return false;

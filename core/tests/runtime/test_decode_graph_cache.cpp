@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,8 @@ extern bool QActCacheKeepsMultipleTensorEntriesForTest();
 extern bool RunQwen36Q4KBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle, int* admission_state,
                                              int* reject_reason);
 extern bool RunQwen36SSMQ8RepackedBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracle);
+extern bool RunQwen36SSMQ8RepackedBatchedC4ProjectionForTest(int nth, bool* output_matches_vecdot_oracle,
+                                                             uint64_t* true_gemm_ops, uint64_t* gemv_ops);
 extern int ResolveQwen36PrefillQ4KBatchedReasonForTest(bool relevant, bool mode_off, bool lora_active,
                                                        bool weight_is_q4k, bool shape_supported,
                                                        bool kernel_available, bool has_vec_dot, bool candidate_ready,
@@ -217,6 +220,18 @@ TEST(DecodeGraphCachePolicyTest, Q4KRepackedGateAdmitsWhenRealKernelIsAvailable)
     EXPECT_EQ(reject_reason == 0, available);
 }
 
+TEST(DecodeGraphCachePolicyTest, Q4KRepackedCacheFloorSurvivesRuntimeBudgetRefresh) {
+    densecore::kernels::Q4KRepackedGemvResetRuntimeCacheBudgetFloorForTest();
+    constexpr size_t kFloorBytes = 768ULL * 1024ULL * 1024ULL;
+    EXPECT_GE(densecore::kernels::Q4KRepackedGemvRaiseRuntimeCacheBudgetFloor(kFloorBytes), kFloorBytes);
+    EXPECT_GE(densecore::kernels::Q4KRepackedGemvRefreshRuntimeCacheBudget(
+                  std::numeric_limits<size_t>::max() / 4),
+              kFloorBytes);
+    EXPECT_GE(densecore::kernels::Q4KRepackedGemvCacheLimitBytes(), kFloorBytes);
+    EXPECT_GE(densecore::kernels::Q4KRepackedGemvRuntimeCacheBudgetFloorBytes(), kFloorBytes);
+    densecore::kernels::Q4KRepackedGemvResetRuntimeCacheBudgetFloorForTest();
+}
+
 TEST(DecodeGraphCachePolicyTest, QActCacheDoesNotReuseWhenDifferentTensorsShareDataPointer) {
     EXPECT_TRUE(densecore::testing::QActCacheSharedDataDifferentTensorMissesForTest());
 }
@@ -324,6 +339,17 @@ TEST(DecodeGraphCachePolicyTest, Qwen36SSMQ8RepackedBatchedPathMatchesVecDotOrac
     ASSERT_TRUE(densecore::testing::RunQwen36SSMQ8RepackedBatchedDirectForTest(
         /*nth=*/4, &output_matches_vecdot_oracle));
     EXPECT_TRUE(output_matches_vecdot_oracle);
+}
+
+TEST(DecodeGraphCachePolicyTest, Qwen36SSMQ8C4ProjectionKeepsDefaultBackendSafe) {
+    bool output_matches_vecdot_oracle = false;
+    uint64_t true_gemm_ops = 0;
+    uint64_t gemv_ops = 0;
+    ASSERT_TRUE(densecore::testing::RunQwen36SSMQ8RepackedBatchedC4ProjectionForTest(
+        /*nth=*/4, &output_matches_vecdot_oracle, &true_gemm_ops, &gemv_ops));
+    EXPECT_TRUE(output_matches_vecdot_oracle);
+    EXPECT_EQ(true_gemm_ops, 0u);
+    EXPECT_GT(gemv_ops, 0u);
 }
 
 TEST(DecodeGraphCachePolicyTest, UnqualifiedHybridSSMModelsAreNotDecodeGraphCacheSafeYet) {

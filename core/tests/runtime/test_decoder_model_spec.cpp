@@ -9,11 +9,16 @@
 #include "densecore/models/decoder_model_spec.h"
 #include "densecore/models/model_execution_contract.h"
 #include "densecore/models/model_graph_capabilities.h"
+#include "densecore/runtime/inference.h"
 
 namespace {
 
 ggml_tensor* NewTensor2D(ggml_context* ctx, int rows, int cols) {
     return ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, cols);
+}
+
+ggml_tensor* NewTypedTensor2D(ggml_context* ctx, ggml_type type, int rows, int cols) {
+    return ggml_new_tensor_2d(ctx, type, rows, cols);
 }
 
 bool HasOp(const densecore::models::DecoderLayerSpec& layer, densecore::models::DecoderSemanticOpKind kind) {
@@ -542,4 +547,94 @@ TEST(ModelExecutionContract, LFM2ShortConvDeclaresConvOrdinalsAndRebindContract)
     EXPECT_NE(formatted.find("lfm2_shortconv@layer0"), std::string::npos);
     EXPECT_NE(formatted.find("lfm2_shortconv@layer2"), std::string::npos);
     EXPECT_NE(formatted.find("shortconv_in_proj.weight:shortconv_in"), std::string::npos);
+}
+
+TEST(ModelExecutionContract, SemanticGraphCoverageValidatesLoadedLFM2KernelMatrix) {
+    ggml_init_params params{};
+    params.mem_size = 1 << 20;
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_lfm2_shortconv = true;
+    model.hparams.n_layer = 1;
+    model.hparams.n_embd = 256;
+    model.hparams.n_experts = 4;
+    model.hparams.n_experts_used = 2;
+    model.lfm2_conv_kernel = 3;
+    model.lfm2_layer_is_conv = {1};
+    model.lfm2_conv_weight_f32 = {std::vector<float>(static_cast<size_t>(256 * 3), 0.1f)};
+    model.layers.resize(1);
+    auto& layer = model.layers[0];
+    layer.is_moe = true;
+    layer.Set(model_keys::kShortConvInProj, NewTypedTensor2D(ctx, GGML_TYPE_Q4_K, 256, 64));
+    layer.Set(model_keys::kShortConvOutProj, NewTypedTensor2D(ctx, GGML_TYPE_Q4_K, 256, 64));
+    layer.Set(model_keys::kMoeGate, NewTypedTensor2D(ctx, GGML_TYPE_F32, 256, 4));
+    layer.Set("ffn_gate_up_exps.weight", NewTypedTensor2D(ctx, GGML_TYPE_Q5_K, 256, 512));
+    layer.Set("ffn_down_exps.weight", NewTypedTensor2D(ctx, GGML_TYPE_Q4_K, 512, 256));
+
+    const auto contract = densecore::models::BuildModelExecutionContract(&model);
+    ASSERT_TRUE(contract.valid) << densecore::models::FormatModelExecutionContract(contract);
+    ASSERT_FALSE(contract.semantic_graph_nodes.empty());
+    EXPECT_EQ(contract.semantic_graph_nodes.size(), 10u);
+
+    densecore::runtime::HostKernelCapabilities caps{};
+    caps.arm_sve2 = true;
+    caps.q4k_true_batched = true;
+    const auto coverage = densecore::models::ValidateFallbackFreeKernelCoverage(&model, contract, caps);
+    EXPECT_TRUE(coverage.required);
+    EXPECT_TRUE(coverage.fallback_free) << densecore::models::FormatKernelCoverageValidationResult(coverage);
+    EXPECT_EQ(coverage.covered_node_count, contract.semantic_graph_nodes.size());
+    EXPECT_EQ(coverage.graph_node_count, contract.semantic_graph_nodes.size());
+    EXPECT_TRUE(coverage.missing_kernel_reasons.empty());
+    EXPECT_NE(densecore::models::FormatModelExecutionContract(contract).find("semantic_graph_nodes=10"),
+              std::string::npos);
+    EXPECT_NE(densecore::models::FormatKernelCoverageValidationResult(coverage).find("covered=10/10"),
+              std::string::npos);
+
+    ggml_free(ctx);
+}
+
+TEST(ModelExecutionContract, SemanticGraphCoverageRejectsUnsupportedLoadedTargetTensor) {
+    ggml_init_params params{};
+    params.mem_size = 1 << 20;
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_lfm2_shortconv = true;
+    model.hparams.n_layer = 1;
+    model.hparams.n_embd = 256;
+    model.hparams.n_experts = 4;
+    model.hparams.n_experts_used = 2;
+    model.lfm2_conv_kernel = 3;
+    model.lfm2_layer_is_conv = {1};
+    model.lfm2_conv_weight_f32 = {std::vector<float>(static_cast<size_t>(256 * 3), 0.1f)};
+    model.layers.resize(1);
+    auto& layer = model.layers[0];
+    layer.is_moe = true;
+    layer.Set(model_keys::kShortConvInProj, NewTypedTensor2D(ctx, GGML_TYPE_F16, 256, 64));
+    layer.Set(model_keys::kShortConvOutProj, NewTypedTensor2D(ctx, GGML_TYPE_Q4_K, 256, 64));
+    layer.Set(model_keys::kMoeGate, NewTypedTensor2D(ctx, GGML_TYPE_F32, 256, 4));
+    layer.Set("ffn_gate_up_exps.weight", NewTypedTensor2D(ctx, GGML_TYPE_Q5_K, 256, 512));
+    layer.Set("ffn_down_exps.weight", NewTypedTensor2D(ctx, GGML_TYPE_Q4_K, 512, 256));
+
+    const auto contract = densecore::models::BuildModelExecutionContract(&model);
+    ASSERT_TRUE(contract.valid) << densecore::models::FormatModelExecutionContract(contract);
+
+    densecore::runtime::HostKernelCapabilities caps{};
+    caps.arm_sve2 = true;
+    caps.q4k_true_batched = true;
+    const auto coverage = densecore::models::ValidateFallbackFreeKernelCoverage(&model, contract, caps);
+    EXPECT_TRUE(coverage.required);
+    EXPECT_FALSE(coverage.fallback_free);
+    ASSERT_FALSE(coverage.missing_kernel_reasons.empty());
+    EXPECT_NE(coverage.missing_kernel_reasons.front().find("missing_kernel:lfm2_shortconv_mixer/f16/"),
+              std::string::npos);
+
+    ggml_free(ctx);
 }

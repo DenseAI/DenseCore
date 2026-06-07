@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 
@@ -13,6 +14,8 @@ bool DenseCoreTestOnlySuppressesReasoningTagsForPrompt(const std::string& prompt
 bool DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(const TransformerModel* model, const std::string& prompt);
 std::vector<int> DenseCoreTestOnlyQwenReasoningBlocklist(const TransformerModel* model);
 std::vector<int> DenseCoreTestOnlyGemma4TextBlocklist(const TransformerModel* model);
+bool DenseCoreTestOnlyGemma4TextBlocklistReachesSamplingParams(const TransformerModel* model);
+bool DenseCoreTestOnlyGemma4CallerDisallowMergesWithModelBlocklist(const TransformerModel* model, int caller_token_id);
 std::string DenseCoreTestOnlyPrimeQwenNoThinkingPromptText(const TransformerModel* model, const std::string& prompt);
 std::string DenseCoreTestOnlyPrimeQwenNoThinking(const TransformerModel* model, const std::string& prompt);
 bool DenseCoreTestOnlyResolveAddBosForPrompt(const TransformerModel* model, const std::string& prompt);
@@ -317,7 +320,9 @@ TEST(ChatTemplateTest, GemmaThinkingAutoTemplateInjectsThinkSystemTurn) {
               "<|turn>user\n"
               "hello"
               "<turn|>\n"
-              "<|turn>model\n");
+              "<|turn>model\n"
+              "<|channel>thought\n"
+              "<channel|>");
 }
 
 TEST(ChatTemplateTest, RoleTagAutoTemplateUsesDedicatedSystemAndAssistantTags) {
@@ -531,6 +536,34 @@ TEST(CanonicalChatRenderTest, GemmaCanonicalRendererMatchesTurnTags) {
               "<channel|>");
 }
 
+TEST(CanonicalChatRenderTest, GemmaCanonicalRendererUsesEmptyThoughtChannelWhenThinkingDisabled) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "What is the capital of France?";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    densecore::models::CanonicalChatRenderOptions options{};
+    options.enable_thinking = 0;
+    bool thinking_enabled = true;
+    const std::string rendered =
+        densecore::models::RenderModelChatMessages(&model, messages, options, &thinking_enabled);
+
+    EXPECT_FALSE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<bos>"
+              "<|turn>user\n"
+              "What is the capital of France?"
+              "<turn|>\n"
+              "<|turn>model\n"
+              "<|channel>thought\n"
+              "<channel|>");
+}
+
 TEST(QwenReasoningBlocklistTest, NoThinkingBlocksReasoningTagsButKeepsChatTerminator) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
@@ -560,8 +593,9 @@ TEST(Gemma4TextBlocklistTest, BlocksControlAndUnusedTokensButKeepsStopIds) {
     model.arch_flags.is_gemma4 = true;
     model.eos_token_id = 99;
     model.stop_token_ids = {99};
-    model.vocab_tokens = {"normal", "<unk>", "<|think|>", "<|turn>", "<unused7>", "<0x41>",
-                          "<eos>", "plain", "<|channel>", "<channel|>"};
+    model.vocab_tokens = {"normal",       "<unk>",       "<|think|>", "<|turn>",       "<unused7>",
+                          "<0x41>",       "<eos>",       "plain",     "<|channel>",    "<channel|>",
+                          "[multimodal]", "<start_of_image>"};
     model.token_to_id["normal"] = 0;
     model.token_to_id["<unk>"] = 1;
     model.token_to_id["<|think|>"] = 2;
@@ -572,11 +606,13 @@ TEST(Gemma4TextBlocklistTest, BlocksControlAndUnusedTokensButKeepsStopIds) {
     model.token_to_id["plain"] = 7;
     model.token_to_id["<|channel>"] = 8;
     model.token_to_id["<channel|>"] = 9;
-    model.token_types = {1, 2, 3, 4, 5, 6, 1, 1, 3, 3};
+    model.token_to_id["[multimodal]"] = 10;
+    model.token_to_id["<start_of_image>"] = 11;
+    model.token_types = {1, 2, 3, 4, 5, 6, 1, 1, 3, 3, 1, 1};
 
     const std::vector<int> blocked = DenseCoreTestOnlyGemma4TextBlocklist(&model);
 
-    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 0), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 0), blocked.end());
     EXPECT_NE(std::find(blocked.begin(), blocked.end(), 1), blocked.end());
     EXPECT_NE(std::find(blocked.begin(), blocked.end(), 2), blocked.end());
     EXPECT_NE(std::find(blocked.begin(), blocked.end(), 3), blocked.end());
@@ -586,7 +622,25 @@ TEST(Gemma4TextBlocklistTest, BlocksControlAndUnusedTokensButKeepsStopIds) {
     EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 7), blocked.end());
     EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 8), blocked.end());
     EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 9), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 10), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 11), blocked.end());
     EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 99), blocked.end());
+}
+
+TEST(Gemma4TextBlocklistTest, SamplingParamsUseModelDefaultBlocklist) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.eos_token_id = 99;
+    model.stop_token_ids = {99};
+    model.vocab_tokens = {"", "<bos>", "Paris", "<eos>"};
+    model.token_to_id[""] = 0;
+    model.token_to_id["<bos>"] = 1;
+    model.token_to_id["Paris"] = 2;
+    model.token_to_id["<eos>"] = 99;
+
+    EXPECT_TRUE(DenseCoreTestOnlyGemma4TextBlocklistReachesSamplingParams(&model));
+    EXPECT_TRUE(DenseCoreTestOnlyGemma4CallerDisallowMergesWithModelBlocklist(&model, 2));
 }
 
 TEST(Gemma4TextBlocklistTest, HandlesPartialTokenTypeMetadata) {

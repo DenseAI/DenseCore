@@ -132,6 +132,10 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 	if qwen36StreamingReasoningEnabled(req, reasoningModelHint) {
 		qwen36Filter = newQwen36StreamFilter()
 	}
+	var qwenMarkerFilter *service.QwenVisibleControlMarkerFilter
+	if isQwenModelHint(reasoningModelHint) {
+		qwenMarkerFilter = service.NewQwenVisibleControlMarkerFilter()
+	}
 
 	for {
 		select {
@@ -152,6 +156,20 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 					_ = waitGenerationError(errChan)
 					return
 				}
+				if qwenMarkerFilter != nil {
+					if token := qwenMarkerFilter.Flush(); token != "" {
+						completionTokens++
+						elapsedMS := serviceDurationMillis(time.Since(streamStart))
+						if firstCallbackMS == 0 {
+							firstCallbackMS = elapsedMS
+						}
+						lastCallbackMS = elapsedMS
+						if err := h.writeChatStreamToken(streamWriter, id, created, req.Model, token, qwen36Filter); err != nil {
+							slog.Debug("SSE write error", slog.String("error", err.Error()))
+							return
+						}
+					}
+				}
 				if err := streamWriter.WriteDone(); err != nil {
 					slog.Debug("SSE write error", slog.String("error", err.Error()))
 				}
@@ -169,6 +187,9 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 			}
 			if token != "" && lfm2Filter != nil {
 				token = lfm2Filter.Filter(token)
+			}
+			if token != "" && qwenMarkerFilter != nil {
+				token = qwenMarkerFilter.Filter(token)
 			}
 			if token != "" {
 				completionTokens++
@@ -193,29 +214,7 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 				continue
 			}
 
-			chunk := domain.ChatCompletionChunk{
-				ID:      id,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   req.Model,
-				Choices: []domain.ChunkChoice{
-					{
-						Index: 0,
-						Delta: domain.ChunkDelta{
-							Content:          content,
-							ReasoningContent: reasoningContent,
-						},
-						FinishReason: nil,
-					},
-				},
-			}
-
-			data, err := json.Marshal(chunk)
-			if err != nil {
-				slog.Error("failed to marshal SSE chunk", slog.String("error", err.Error()))
-				continue
-			}
-			if err := streamWriter.WriteJSONData(data); err != nil {
+			if err := h.writeChatStreamDelta(streamWriter, id, created, req.Model, content, reasoningContent); err != nil {
 				slog.Debug("SSE write error", slog.String("error", err.Error()))
 				return
 			}
@@ -232,6 +231,46 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 			return
 		}
 	}
+}
+
+func (h *Handler) writeChatStreamToken(streamWriter *sseStreamWriter, id string, created int64, model string, token string, qwen36Filter *qwen36StreamFilter) error {
+	var content string
+	var reasoningContent string
+	if qwen36Filter != nil {
+		content, reasoningContent = qwen36Filter.Filter(token)
+	} else {
+		content = token
+	}
+	if token != "" && content == "" && reasoningContent == "" {
+		return nil
+	}
+	return h.writeChatStreamDelta(streamWriter, id, created, model, content, reasoningContent)
+}
+
+func (h *Handler) writeChatStreamDelta(streamWriter *sseStreamWriter, id string, created int64, model string, content string, reasoningContent string) error {
+	chunk := domain.ChatCompletionChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: created,
+		Model:   model,
+		Choices: []domain.ChunkChoice{
+			{
+				Index: 0,
+				Delta: domain.ChunkDelta{
+					Content:          content,
+					ReasoningContent: reasoningContent,
+				},
+				FinishReason: nil,
+			},
+		},
+	}
+
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		slog.Error("failed to marshal SSE chunk", slog.String("error", err.Error()))
+		return nil
+	}
+	return streamWriter.WriteJSONData(data)
 }
 
 func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req domain.ChatCompletionRequest) {

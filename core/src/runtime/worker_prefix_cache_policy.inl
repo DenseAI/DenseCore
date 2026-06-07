@@ -31,7 +31,7 @@ bool IsQwenHybridSSMModel(const TransformerModel* model) {
 }
 
 bool Qwen36HybridSSMProjectionWeightsAreNotQ4K(const TransformerModel* model) {
-    if (!IsQwen36HybridSSMModel(model)) {
+    if (!IsQwenHybridSSMModel(model)) {
         return false;
     }
     bool saw_ssm_projection = false;
@@ -100,7 +100,7 @@ Qwen36SSMProjectionTypeSummary SummarizeQwen36SSMProjectionTypes(const Transform
 }
 
 std::string SummarizeQwen36SSMQ8ProjectionCounts(const TransformerModel* model) {
-    if (!IsQwen36HybridSSMModel(model)) {
+    if (!IsQwenHybridSSMModel(model)) {
         return "none";
     }
     uint64_t qkv = 0;

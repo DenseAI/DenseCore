@@ -397,11 +397,21 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
     const int debug_top_n = resolve_debug_top_n();
 
     auto first_allowed_token = [&]() -> int {
-        if (!params.allowed_token_ids || params.allowed_token_ids->empty()) {
-            return range_start;
+        if (params.allowed_token_ids && !params.allowed_token_ids->empty()) {
+            for (int token_id : *params.allowed_token_ids) {
+                if (token_id >= range_start && token_id < range_end && !is_disallowed(token_id)) {
+                    return token_id;
+                }
+            }
+        } else {
+            for (int token_id = range_start; token_id < range_end; ++token_id) {
+                if (!is_disallowed(token_id)) {
+                    return token_id;
+                }
+            }
         }
-        for (int token_id : *params.allowed_token_ids) {
-            if (token_id >= range_start && token_id < range_end) {
+        for (int token_id = range_start; token_id < range_end; ++token_id) {
+            if (is_allowed(token_id)) {
                 return token_id;
             }
         }
@@ -459,8 +469,31 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         static int debug_sample_count = 0;
         if (debug_sample_count >= 8) return;
         const float logit = (token_id >= range_start && token_id < range_end) ? last_logits[token_id] : NAN;
-        fprintf(stderr, "[SAMPLE_DBG #%d] idx=%d token=%d logit=%.6f range=[%d,%d)\n", debug_sample_count, idx,
-                token_id, logit, range_start, range_end);
+        int finite_allowed = 0;
+        int finite_blocked = 0;
+        int nan_count = 0;
+        int inf_count = 0;
+        for (int i = range_start; i < range_end; ++i) {
+            const float v = last_logits[i];
+            if (std::isnan(v)) {
+                ++nan_count;
+                continue;
+            }
+            if (!std::isfinite(v)) {
+                ++inf_count;
+                continue;
+            }
+            if (is_disallowed(i) || !is_allowed(i)) {
+                ++finite_blocked;
+            } else {
+                ++finite_allowed;
+            }
+        }
+        fprintf(stderr,
+                "[SAMPLE_DBG #%d] idx=%d token=%d logit=%.6f range=[%d,%d) finite_allowed=%d finite_blocked=%d "
+                "nan=%d inf=%d disallowed=%d allowed=%d\n",
+                debug_sample_count, idx, token_id, logit, range_start, range_end, finite_allowed, finite_blocked,
+                nan_count, inf_count, is_disallowed(token_id) ? 1 : 0, is_allowed(token_id) ? 1 : 0);
         if (params.vocab && debug_sample_count < 2) {
             std::vector<std::pair<float, int>> top;
             top.reserve(8);

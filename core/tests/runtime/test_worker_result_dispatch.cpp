@@ -76,6 +76,20 @@ TEST(WorkerResultDispatchTest, DirectTokenCallbackInvokesCallbackImmediately) {
     EXPECT_EQ(capture.finished_flags[0], 0);
 }
 
+TEST(WorkerResultDispatchTest, SuppressesQwenVisibleControlMarkers) {
+    std::string text = "cobalt-river-913 /no_think";
+    SuppressQwenVisibleControlMarkers(&text);
+    EXPECT_EQ(text, "cobalt-river-913");
+
+    text = "/nothink";
+    SuppressQwenVisibleControlMarkers(&text);
+    EXPECT_TRUE(text.empty());
+
+    text = "plain answer";
+    SuppressQwenVisibleControlMarkers(&text);
+    EXPECT_EQ(text, "plain answer");
+}
+
 TEST(WorkerResultDispatchTest, DirectTokenCallbackExReceivesLengthAndTokenID) {
     CallbackCapture capture;
     Request req{};
@@ -299,7 +313,9 @@ TEST(WorkerResultDispatchTest, GemmaAndLfmTargetsRejectTemporaryReferenceGgmlCom
     EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(gemma_plan), "gemma4_26b_a4b");
     EXPECT_TRUE(densecore::runtime::ShouldRejectTargetGgmlCompute(
         gemma_plan, "temporary_reference_generic_matmul_fallback"));
-    EXPECT_FALSE(densecore::runtime::ShouldRejectTargetGgmlCompute(
+    EXPECT_TRUE(densecore::runtime::ShouldRejectTargetGgmlCompute(
+        gemma_plan, "gemma4_maintained_prefill_quant_native"));
+    EXPECT_TRUE(densecore::runtime::ShouldRejectTargetGgmlCompute(
         gemma_plan, "temporary_reference_gemma4_prefill_quant_native"));
 
     TransformerModel lfm2{};
@@ -339,6 +355,60 @@ TEST(KernelResolutionPolicyTest, QwenHybridSSMQ4PrefillResolvesSemanticFallbackF
     EXPECT_EQ(resolution.rejected_count, 0);
     EXPECT_STREQ(densecore::runtime::DenseCoreSemanticOpName(resolution.semantic_op), "hybrid_ssm_mixer");
     EXPECT_STREQ(densecore::runtime::DenseCoreTensorRoleName(resolution.tensor_role), "hybrid_ssm_qkv");
+}
+
+TEST(KernelResolutionPolicyTest, ContractFastPathCounterKindsMirrorEmittedNames) {
+    struct Case {
+        ModelArch arch;
+        ModelVariant variant;
+        bool hybrid_ssm;
+        bool gemma4;
+        bool lfm2_shortconv;
+        int experts;
+    };
+    const Case cases[] = {
+        {ModelArch::QWEN35, ModelVariant::QWEN36, true, false, false, 128},
+        {ModelArch::GEMMA, ModelVariant::GEMMA4, false, true, false, 128},
+        {ModelArch::LFM2, ModelVariant::LFM2MOE, false, false, true, 32},
+    };
+
+    for (const Case& c : cases) {
+        TransformerModel model{};
+        model.arch = c.arch;
+        model.variant = c.variant;
+        model.arch_flags.is_hybrid_ssm = c.hybrid_ssm;
+        model.arch_flags.is_gemma4 = c.gemma4;
+        model.arch_flags.is_lfm2_shortconv = c.lfm2_shortconv;
+        model.hparams.n_experts = c.experts;
+
+        const auto contract = densecore::models::BuildModelExecutionContract(&model);
+        ASSERT_EQ(contract.required_fast_path_counter_kinds.size(), contract.required_fast_path_counters.size());
+        ASSERT_FALSE(contract.required_fast_path_counter_kinds.empty());
+        const auto required_kinds = densecore::models::ModelExecutionContractRequiredFastPathCounterKinds(contract);
+        ASSERT_EQ(required_kinds.size(), contract.required_fast_path_counter_kinds.size());
+        for (std::size_t i = 0; i < contract.required_fast_path_counter_kinds.size(); ++i) {
+            const auto kind = contract.required_fast_path_counter_kinds[i];
+            EXPECT_EQ(required_kinds[i], kind);
+            EXPECT_EQ(contract.required_fast_path_counters[i],
+                      densecore::models::ExecutionFastPathCounterKindName(kind));
+            EXPECT_EQ(densecore::models::ExecutionFastPathCounterKindFromName(contract.required_fast_path_counters[i]),
+                      kind);
+        }
+        auto legacy_contract = contract;
+        legacy_contract.required_fast_path_counter_kinds.clear();
+        const auto legacy_required_kinds =
+            densecore::models::ModelExecutionContractRequiredFastPathCounterKinds(legacy_contract);
+        ASSERT_EQ(legacy_required_kinds.size(), contract.required_fast_path_counter_kinds.size());
+        EXPECT_EQ(densecore::models::FormatModelExecutionContractRequiredFastPathCounters(legacy_contract),
+                  densecore::models::FormatModelExecutionContractRequiredFastPathCounters(contract));
+        for (std::size_t i = 0; i < legacy_required_kinds.size(); ++i) {
+            EXPECT_EQ(legacy_required_kinds[i], contract.required_fast_path_counter_kinds[i]);
+        }
+
+        const std::string formatted = densecore::models::FormatModelExecutionContract(contract);
+        EXPECT_NE(formatted.find("required_fast_path_counters=["), std::string::npos);
+        EXPECT_NE(formatted.find(contract.required_fast_path_counters.front()), std::string::npos);
+    }
 }
 
 TEST(KernelResolutionPolicyTest, QwenTargetGenericFallbackCarriesRejectionEvidence) {
@@ -501,22 +571,29 @@ TEST(KernelResolutionPolicyTest, ContractRequirementPhaseKernelDrivesResolutionM
     ASSERT_EQ(requirement.tensor_role, densecore::runtime::DenseCoreTensorRole::HybridSSMQkv);
     ASSERT_EQ(requirement.prefill_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQ4KBatched);
     ASSERT_EQ(requirement.decode_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQuantGemv);
+    EXPECT_EQ(densecore::models::ModelTensorExecutionRequirementKernelForPhase(
+                  requirement, densecore::runtime::DenseCoreMatmulPhase::Prefill),
+              densecore::runtime::DenseCoreKernelFamily::DenseCoreQ4KBatched);
+    EXPECT_EQ(densecore::models::ModelTensorExecutionRequirementKernelForPhase(
+                  requirement, densecore::runtime::DenseCoreMatmulPhase::Decode),
+              densecore::runtime::DenseCoreKernelFamily::DenseCoreQuantGemv);
 
     densecore::runtime::HostKernelCapabilities caps{};
+    caps.arm_sve2 = true;
     caps.q4k_true_batched = true;
-    const auto prefill_resolution = densecore::runtime::ResolveKernelResolution(
-        &model, GGML_TYPE_Q4_K, GGML_TYPE_F32, /*m=*/128, /*n=*/4096, /*k=*/2048,
-        densecore::runtime::DenseCoreMatmulPhase::Prefill, "blk.0.attn_qkv.weight",
-        /*is_lm_head=*/false, /*compatible=*/true, caps, requirement.semantic_op, requirement.tensor_role,
-        requirement.prefill_kernel, requirement.fallback_policy, /*has_fallback_policy_override=*/true);
-    const auto decode_resolution = densecore::runtime::ResolveKernelResolution(
-        &model, GGML_TYPE_Q4_K, GGML_TYPE_F32, /*m=*/1, /*n=*/4096, /*k=*/2048,
-        densecore::runtime::DenseCoreMatmulPhase::Decode, "blk.0.attn_qkv.weight",
-        /*is_lm_head=*/false, /*compatible=*/true, caps, requirement.semantic_op, requirement.tensor_role,
-        requirement.decode_kernel, requirement.fallback_policy, /*has_fallback_policy_override=*/true);
+    const auto prefill_resolution = densecore::models::ResolveModelTensorKernelResolution(
+        &model, requirement, GGML_TYPE_Q4_K, GGML_TYPE_F32, /*m=*/128, /*n=*/4096, /*k=*/2048,
+        densecore::runtime::DenseCoreMatmulPhase::Prefill, "blk.0.attn_qkv.weight", /*is_lm_head=*/false,
+        /*compatible=*/true, caps);
+    const auto decode_resolution = densecore::models::ResolveModelTensorKernelResolution(
+        &model, requirement, GGML_TYPE_Q4_K, GGML_TYPE_F32, /*m=*/1, /*n=*/4096, /*k=*/2048,
+        densecore::runtime::DenseCoreMatmulPhase::Decode, "blk.0.attn_qkv.weight", /*is_lm_head=*/false,
+        /*compatible=*/true, caps);
 
     EXPECT_EQ(prefill_resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQ4KBatched);
     EXPECT_EQ(decode_resolution.selected_kernel, densecore::runtime::DenseCoreKernelFamily::DenseCoreQuantGemv);
+    EXPECT_EQ(prefill_resolution.host_backend, densecore::runtime::DenseCoreHostBackend::ArmSve2);
+    EXPECT_EQ(decode_resolution.host_backend, densecore::runtime::DenseCoreHostBackend::ArmSve2);
     EXPECT_EQ(prefill_resolution.fallback_policy,
               densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
     EXPECT_EQ(decode_resolution.fallback_policy,
@@ -622,18 +699,29 @@ TEST(WorkerResultDispatchTest, QwenDecodeSummaryAcceptsNativeMoeFastGateUpAndDow
     req.native_moe_fast_w1w3_used_ops = 1;
     req.native_moe_fast_w2_used_ops = 1;
     req.native_moe_fast_w2_q5k_used_ops = 1;
+    req.qwen_native_moe_w2_q5k_raw_batched_used_ops = 1;
+    req.qwen_native_moe_w2_q5k_raw_batched_ns = 2'000'000;
+    req.moe_kquant_raw_batched_q4k_used_ops = 2;
+    req.moe_kquant_raw_batched_q4k_ns = 3'000'000;
+    req.moe_kquant_raw_batched_q5k_used_ops = 3;
+    req.moe_kquant_raw_batched_q5k_ns = 4'000'000;
     req.qwen35_moe_forward_calls = 1;
     req.qwen35_moe_path = "native_graph";
     req.qwen35_moe_w1w3_weight_type_hist[0] = 1;
     req.qwen35_moe_w2_weight_type_hist[1] = 1;
     req.ssm_conv1d_calls = 1;
     req.ssm_delta_calls = 1;
+    req.ssm_delta_fast_default_used_ops = 1;
+    req.ssm_delta_fast_default_wall_ns = 5'000'000;
 
     ::testing::internal::CaptureStderr();
     LogRequestDecodeSummary(&req, &model);
     const std::string captured = ::testing::internal::GetCapturedStderr();
 
     EXPECT_NE(captured.find("target_fast_path_required=1"), std::string::npos);
+    EXPECT_NE(captured.find("graph_kernel_coverage=100"), std::string::npos);
+    EXPECT_NE(captured.find("graph_kernel_coverage_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("graph_kernel_missing=none"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_ok=1"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_failure_reason=none"), std::string::npos);
     EXPECT_NE(captured.find("target_no_ggml_path=1"), std::string::npos);
@@ -644,6 +732,14 @@ TEST(WorkerResultDispatchTest, QwenDecodeSummaryAcceptsNativeMoeFastGateUpAndDow
     EXPECT_NE(captured.find("target_required_fast_path_counters_ok=1"), std::string::npos);
     EXPECT_NE(captured.find("target_missing_required_fast_path_counters=none"), std::string::npos);
     EXPECT_NE(captured.find("qwen_fast_path_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_native_moe_w2_q5k_raw_batched_used_ops=1"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_native_moe_w2_q5k_raw_batched_ms=2"), std::string::npos);
+    EXPECT_NE(captured.find("moe_kquant_raw_batched_q4k_used_ops=2"), std::string::npos);
+    EXPECT_NE(captured.find("moe_kquant_raw_batched_q4k_ms=3"), std::string::npos);
+    EXPECT_NE(captured.find("moe_kquant_raw_batched_q5k_used_ops=3"), std::string::npos);
+    EXPECT_NE(captured.find("moe_kquant_raw_batched_q5k_ms=4"), std::string::npos);
+    EXPECT_NE(captured.find("ssm_delta_fast_default_used_ops=1"), std::string::npos);
+    EXPECT_NE(captured.find("ssm_delta_fast_default_wall_ms=5"), std::string::npos);
 }
 
 TEST(WorkerResultDispatchTest, QwenDecodeSummaryRejectsMissingNativeMoeFastOps) {
@@ -862,10 +958,8 @@ TEST(WorkerResultDispatchTest, Gemma4MoESummaryAcceptsPrefillAndDecodeFastCounte
 
     Request req{};
     InitDecodeSummaryRequest(&req);
-    req.prefill_matmul_path_hist[3] = 98;  // custom_batched_gemv
+    req.gemma4_native_moe_prefill_used_layers = 29;
     req.decode_matmul_path_hist[2] = 3;    // custom_gemv
-    req.arm_batched_quant_used = 1;
-    req.gemma4_decode_native_moe_used_ops = 64;
 
     ::testing::internal::CaptureStderr();
     LogRequestDecodeSummary(&req, &model);
@@ -888,7 +982,7 @@ TEST(WorkerResultDispatchTest, Gemma4MoESummaryAcceptsPrefillAndDecodeFastCounte
     EXPECT_NE(captured.find("target_fast_path_failure_reason=none"), std::string::npos);
 }
 
-TEST(WorkerResultDispatchTest, Gemma4MoESummaryRejectsDecodeWhenNativeMoeIsMissing) {
+TEST(WorkerResultDispatchTest, Gemma4MoESummaryAcceptsCustomGemvDespiteOptionalDecodeNativeReject) {
     TransformerModel model{};
     model.arch = ModelArch::GEMMA;
     model.variant = ModelVariant::GEMMA4;
@@ -898,9 +992,63 @@ TEST(WorkerResultDispatchTest, Gemma4MoESummaryRejectsDecodeWhenNativeMoeIsMissi
 
     Request req{};
     InitDecodeSummaryRequest(&req);
-    req.prefill_matmul_path_hist[3] = 98;  // custom_batched_gemv
-    req.decode_matmul_path_hist[2] = 3;    // custom_gemv
-    req.arm_batched_quant_used = 1;
+    req.gemma4_native_moe_prefill_used_layers = 29;
+    req.decode_matmul_path_hist[2] = 3;  // maintained custom_gemv decode path
+    req.gemma4_decode_native_rejected_ops = 4;
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("[Gemma4DecodeSummary]"), std::string::npos);
+    EXPECT_NE(captured.find("gemma4_decode_native_rejected_ops=4"), std::string::npos);
+    EXPECT_NE(captured.find("target_no_native_moe_reject=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=none"), std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, Gemma4MoESummaryRejectsMaintainedQ8PrefillNativeMatmul) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_experts = 128;
+    model.hparams.n_experts_used = 4;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.gemma4_native_moe_prefill_used_layers = 29;
+    req.decode_matmul_path_hist[2] = 3;  // custom_gemv
+    req.prefill_matmul_path_hist[0] = 69;
+    req.qwen_target_ggml_compute_ops = 69;
+    req.qwen_target_ggml_matmul_ops = 69;
+    req.qwen_target_ggml_compute_last_reason = "gemma4_maintained_prefill_quant_native";
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("[Gemma4DecodeSummary]"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_target_ggml_compute_ops=69"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_target_ggml_compute_last_reason=gemma4_maintained_prefill_quant_native"),
+              std::string::npos);
+    EXPECT_NE(captured.find("target_no_ggml_path=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=0"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=ggml_compute_or_matmul_path"), std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, Gemma4MoESummaryRejectsDecodeWhenCustomGemvIsMissing) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_experts = 128;
+    model.hparams.n_experts_used = 4;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.gemma4_native_moe_prefill_used_layers = 29;
+    req.decode_matmul_path_hist[2] = 0;    // custom_gemv
     req.gemma4_decode_native_moe_used_ops = 0;
 
     ::testing::internal::CaptureStderr();

@@ -447,6 +447,29 @@ TEST(SamplingRangeTest, TemperatureZeroUsesGreedyEvenWithTopKAndTopP) {
     EXPECT_EQ(SampleToken(logits, 0, params), 3);
 }
 
+TEST(SamplingRangeTest, AllNanLogitsDoNotFallbackToDisallowedRangeStart) {
+    ggml_init_params p = {
+        .mem_size = 1024 * 1024,
+        .mem_buffer = nullptr,
+        .no_alloc = false,
+    };
+    GgmlContextGuard guard;
+    guard.ctx = ggml_init(p);
+    ASSERT_NE(guard.ctx, nullptr);
+
+    ggml_tensor* logits = MakeLogitsTensor(guard.ctx, {NAN, NAN, NAN, NAN});
+    ASSERT_NE(logits, nullptr);
+
+    std::vector<int> disallowed{0};
+    SamplingParams params;
+    params.temperature = 0.0f;
+    params.top_k = 1;
+    params.top_p = 1.0f;
+    params.disallowed_token_ids = &disallowed;
+
+    EXPECT_EQ(SampleToken(logits, 0, params), 1);
+}
+
 TEST(SamplingRangeTest, PrefillSamplingGuardUsesLastPromptColumnForUnchunkedPrefill) {
     int logits_idx = -1;
     std::string error;

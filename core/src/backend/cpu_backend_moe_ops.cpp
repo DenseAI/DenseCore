@@ -31,8 +31,12 @@
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
 #endif
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+#include <immintrin.h>
+#endif
 
 extern "C" void ggml_gemm_q5_K_8x8_q8_K(int n, float* s, size_t bs, const void* vx, const void* vy, int nr, int nc);
+extern "C" void ggml_gemm_q6_K_8x8_q8_K(int n, float* s, size_t bs, const void* vx, const void* vy, int nr, int nc);
 
 namespace densecore {
 
@@ -83,6 +87,13 @@ const std::array<float, 1 << 16>& GetGeluF16LookupTable();
 bool ExpertHasGgmlQuantizedWeights(const CpuBackend::ExpertWeights& expert);
 bool IsScalarScaleSidecar(const ggml_tensor* scale_tensor);
 void LogMoEMatmulPath(const char* path, int M, int K, int N, int group_size, bool allow_parallel);
+struct Q5KRepackedMoEWeight;
+bool CanUseQ5KRepackedMoEGemvFastPath();
+std::shared_ptr<Q5KRepackedMoEWeight> GetOrCreateQ5KRepackedMoEWeight(const void* weight_ptr, int64_t rows,
+                                                                      int64_t cols);
+bool RunQ5KRepackedMoEGemv(CpuBackend* backend, const std::shared_ptr<Q5KRepackedMoEWeight>& packed,
+                           const uint8_t* qinput_data, size_t qinput_row_bytes, float* output_data, int64_t rows,
+                           int64_t cols, int numa_node, bool allow_parallel);
 
 #include "backend/cpu_backend_moe_raw_batched.inl"
 
@@ -674,10 +685,6 @@ bool RunQ4KRepackedMoEProjection(CpuBackend* backend, const void* weight_ptr, co
         RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "unsupported_shape");
         return false;
     }
-    if (GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill) {
-        RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "prefill_uses_raw_batched");
-        return false;
-    }
     auto packed = GetOrCreateQ4KRepackedMoEWeight(weight_ptr, cols, input_cols);
     if (!packed) {
         RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "pack_failed");
@@ -759,25 +766,22 @@ bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gat
         RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "unsupported_shape");
         return false;
     }
-    if (GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill) {
-        RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "prefill_uses_raw_batched");
-        return false;
-    }
     auto gate_packed = GetOrCreateQ4KRepackedMoEWeight(gate_weight_ptr, cols, input_cols);
     auto up_packed = GetOrCreateQ4KRepackedMoEWeight(up_weight_ptr, cols, input_cols);
     if (!gate_packed || !up_packed) {
         RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "pack_failed");
         return false;
     }
+    const bool inner_parallel = allow_parallel && rows < 4;
     if (!RunQ4KRepackedMoEFusedSwiGLUM4(backend, gate_packed, up_packed, input_data, qinput_data, qinput_row_bytes,
-                                        output_data, rows, cols, input_cols, numa_node, allow_parallel)) {
+                                        output_data, rows, cols, input_cols, numa_node, inner_parallel)) {
         RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "run_failed");
         return false;
     }
     RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/true, nullptr);
     LogMoEMatmulPath(rows >= 4 ? "ggml_q4k_repacked_moe_gemm_m4_fused_swiglu"
                                : "ggml_q4k_repacked_moe_gemv_fused_swiglu",
-                     static_cast<int>(rows), static_cast<int>(input_cols), static_cast<int>(cols), 0, allow_parallel);
+                     static_cast<int>(rows), static_cast<int>(input_cols), static_cast<int>(cols), 0, inner_parallel);
     return true;
 }
 

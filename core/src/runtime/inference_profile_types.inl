@@ -147,6 +147,10 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> moe_q5k_repacked_candidate_ops{0};
     std::atomic<uint64_t> moe_q5k_repacked_used_ops{0};
     std::atomic<uint64_t> moe_q5k_repacked_rejected_ops{0};
+    std::atomic<uint64_t> moe_kquant_raw_batched_q4k_used_ops{0};
+    std::atomic<uint64_t> moe_kquant_raw_batched_q4k_ns{0};
+    std::atomic<uint64_t> moe_kquant_raw_batched_q5k_used_ops{0};
+    std::atomic<uint64_t> moe_kquant_raw_batched_q5k_ns{0};
     std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_candidate_ops{0};
     std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_used_ops{0};
     std::atomic<uint64_t> gemma4_moe_prefill_quant_batch_rejected_ops{0};
@@ -210,6 +214,8 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> native_moe_fast_w2_q5k_used_ops{0};
     std::atomic<uint64_t> native_moe_fast_w2_q5k_rejected_ops{0};
     std::atomic<uint64_t> native_moe_fast_w2_q5k_ns{0};
+    std::atomic<uint64_t> qwen_native_moe_w2_q5k_raw_batched_used_ops{0};
+    std::atomic<uint64_t> qwen_native_moe_w2_q5k_raw_batched_ns{0};
     std::atomic<int> qwen35_moe_path{0};
     std::atomic<uint64_t> qwen35_moe_layers_seen{0};
     std::atomic<uint64_t> qwen35_moe_forward_calls{0};
@@ -221,6 +227,8 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> qwen36_prefill_total_ns{0};
     std::atomic<uint64_t> qwen36_prefill_ssm_projection_ns{0};
     std::atomic<uint64_t> qwen36_prefill_ssm_delta_state_ns{0};
+    std::atomic<uint64_t> ssm_delta_fast_default_used_ops{0};
+    std::atomic<uint64_t> ssm_delta_fast_default_wall_ns{0};
     std::atomic<uint64_t> qwen36_prefill_attention_ns{0};
     std::atomic<uint64_t> qwen36_prefill_mlp_or_moe_ns{0};
     std::atomic<uint64_t> qwen36_prefill_graph_build_ns{0};

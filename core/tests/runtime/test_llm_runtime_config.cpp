@@ -150,7 +150,7 @@ TEST(LLMRuntimeConfigTest, FastPathRuntimeConfigAggregatesHotLoopPolicies) {
     EXPECT_EQ(config.kv_retention.sink_tokens, 6);
     EXPECT_EQ(config.qwen36_prefill_q4k_batched, densecore::llm::config::Qwen36PrefillQ4KBatchedMode::On);
     EXPECT_EQ(config.qwen36_ssm_q8_amx_alias, densecore::env::RuntimeToggleMode::On);
-    EXPECT_EQ(config.qwen36_ssm_q8_prefill_amx, densecore::llm::config::Qwen36SSMQ8PrefillAMXMode::Off);
+    EXPECT_EQ(config.qwen36_ssm_q8_prefill_amx, densecore::llm::config::Qwen36SSMQ8PrefillAMXMode::On);
     EXPECT_EQ(config.qwen36_expert_cpu_repack, densecore::env::RuntimeToggleMode::Off);
     EXPECT_EQ(config.q4k_repacked_gemv, densecore::env::RuntimeToggleMode::On);
     EXPECT_EQ(config.qact_cache, densecore::env::RuntimeToggleMode::On);
@@ -164,7 +164,11 @@ TEST(LLMRuntimeConfigTest, PromotedQwenFastPathsDefaultOn) {
     auto config = densecore::llm::config::LoadFastPathRuntimeConfig();
     EXPECT_EQ(config.qwen36_prefill_q4k_batched, densecore::llm::config::Qwen36PrefillQ4KBatchedMode::On);
     EXPECT_EQ(config.qwen36_ssm_q8_amx_alias, densecore::env::RuntimeToggleMode::Off);
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__aarch64__)
+    EXPECT_EQ(config.qwen36_ssm_q8_prefill_amx, densecore::llm::config::Qwen36SSMQ8PrefillAMXMode::On);
+#else
     EXPECT_EQ(config.qwen36_ssm_q8_prefill_amx, densecore::llm::config::Qwen36SSMQ8PrefillAMXMode::Off);
+#endif
     EXPECT_EQ(config.qwen36_expert_cpu_repack, densecore::env::RuntimeToggleMode::Auto);
     EXPECT_EQ(config.q4k_repacked_gemv, densecore::env::RuntimeToggleMode::On);
     EXPECT_EQ(config.qact_cache, densecore::env::RuntimeToggleMode::Off);

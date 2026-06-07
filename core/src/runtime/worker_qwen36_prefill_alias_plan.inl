@@ -11,10 +11,12 @@ static WorkerQwen36SSMQ8PrefillAliasPlan ResolveWorkerQwen36SSMQ8PrefillAliasPla
     WorkerQwen36SSMQ8PrefillAliasPlan plan;
     plan.clear_decode_aliases = is_decode_batch;
     plan.mode = fast_path_config.qwen36_ssm_q8_prefill_amx;
-    plan.prepare_prefill_aliases =
-        is_prefill_batch && model && model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm &&
-        plan.mode != densecore::llm::config::Qwen36SSMQ8PrefillAMXMode::Off &&
-        prompt_token_count >= fast_path_config.qwen36_ssm_q8_prefill_amx_min_tokens;
+    const bool qwen_hybrid_ssm =
+        model && (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+        model->arch_flags.is_hybrid_ssm;
+    plan.prepare_prefill_aliases = is_prefill_batch && qwen_hybrid_ssm &&
+                                   plan.mode != densecore::llm::config::Qwen36SSMQ8PrefillAMXMode::Off &&
+                                   prompt_token_count >= fast_path_config.qwen36_ssm_q8_prefill_amx_min_tokens;
     return plan;
 }
 

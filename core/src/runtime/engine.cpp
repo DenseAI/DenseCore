@@ -724,6 +724,8 @@ void ApplyAllowedTokenIdsFromEnv(Request* req, const TransformerModel* model) {
     if (!env || env[0] == '\0') {
         req->allowed_token_ids.clear();
         req->sampling_params.allowed_token_ids = nullptr;
+        req->sampling_params.disallowed_token_ids =
+            req->disallowed_token_ids.empty() ? nullptr : &req->disallowed_token_ids;
         return;
     }
     req->allowed_token_ids.clear();
@@ -757,6 +759,8 @@ void ApplyAllowedTokenIdsFromEnv(Request* req, const TransformerModel* model) {
     req->allowed_token_ids.erase(std::unique(req->allowed_token_ids.begin(), req->allowed_token_ids.end()),
                                  req->allowed_token_ids.end());
     req->sampling_params.allowed_token_ids = req->allowed_token_ids.empty() ? nullptr : &req->allowed_token_ids;
+    req->sampling_params.disallowed_token_ids =
+        req->disallowed_token_ids.empty() ? nullptr : &req->disallowed_token_ids;
 }
 
 void ApplyTokenIdConstraints(Request* req, const TransformerModel* model, const int* allowed_token_ids,
@@ -765,7 +769,6 @@ void ApplyTokenIdConstraints(Request* req, const TransformerModel* model, const 
     if (!req) return;
 
     req->allowed_token_ids.clear();
-    req->disallowed_token_ids.clear();
 
     if (allowed_token_ids && num_allowed_token_ids > 0) {
         req->allowed_token_ids.reserve(static_cast<size_t>(num_allowed_token_ids));
@@ -791,17 +794,17 @@ void ApplyTokenIdConstraints(Request* req, const TransformerModel* model, const 
     }
 
     if (disallowed_token_ids && num_disallowed_token_ids > 0) {
-        req->disallowed_token_ids.reserve(static_cast<size_t>(num_disallowed_token_ids));
+        req->disallowed_token_ids.reserve(req->disallowed_token_ids.size() + static_cast<size_t>(num_disallowed_token_ids));
         for (int i = 0; i < num_disallowed_token_ids; ++i) {
             const int token_id = disallowed_token_ids[i];
             if (token_id >= 0) {
                 req->disallowed_token_ids.push_back(token_id);
             }
         }
-        std::sort(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end());
-        req->disallowed_token_ids.erase(std::unique(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end()),
-                                        req->disallowed_token_ids.end());
     }
+    std::sort(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end());
+    req->disallowed_token_ids.erase(std::unique(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end()),
+                                    req->disallowed_token_ids.end());
 
     req->sampling_params.allowed_token_ids = req->allowed_token_ids.empty() ? nullptr : &req->allowed_token_ids;
     req->sampling_params.disallowed_token_ids =
@@ -988,6 +991,7 @@ void ConfigurePromptSuppressionForModel(const TransformerModel* model, Request* 
 std::unique_ptr<ModelEntry> MakeModelEntry(std::string model_id, std::string model_path,
                                            std::unique_ptr<TransformerModel> model,
                                            std::unique_ptr<PagedKVCache> kv_cache) {
+    std::cout << "[DenseCoreInitTrace] MakeModelEntry begin" << std::endl;
     auto entry = std::make_unique<ModelEntry>();
     entry->model_id = std::move(model_id);
     entry->model_path = std::move(model_path);
@@ -995,9 +999,11 @@ std::unique_ptr<ModelEntry> MakeModelEntry(std::string model_id, std::string mod
     entry->kv_cache = std::move(kv_cache);
     entry->last_used = std::chrono::steady_clock::now();
     entry->is_loaded = true;
+    std::cout << "[DenseCoreInitTrace] MakeModelEntry before graph plan" << std::endl;
     if (entry->model) {
         entry->transformer_execution_plan = densecore::ResolveTransformerGraphExecutionPlan(entry->model.get());
     }
+    std::cout << "[DenseCoreInitTrace] MakeModelEntry done" << std::endl;
     return entry;
 }
 
@@ -1102,6 +1108,25 @@ std::vector<int> DenseCoreTestOnlyGemma4TextBlocklist(const TransformerModel* mo
     Request req{};
     ConfigureGemma4TextTokenBlocklist(model, &req);
     return req.disallowed_token_ids;
+}
+
+bool DenseCoreTestOnlyGemma4TextBlocklistReachesSamplingParams(const TransformerModel* model) {
+    Request req{};
+    ConfigureGemma4TextTokenBlocklist(model, &req);
+    ApplyAllowedTokenIdsFromEnv(&req, model);
+    return req.sampling_params.disallowed_token_ids == &req.disallowed_token_ids &&
+           std::binary_search(req.disallowed_token_ids.begin(), req.disallowed_token_ids.end(), 0);
+}
+
+bool DenseCoreTestOnlyGemma4CallerDisallowMergesWithModelBlocklist(const TransformerModel* model, int caller_token_id) {
+    Request req{};
+    ConfigureGemma4TextTokenBlocklist(model, &req);
+    ApplyTokenIdConstraints(&req, model, /*allowed_token_ids=*/nullptr, /*num_allowed_token_ids=*/0,
+                            /*allowed_token_ids_strict=*/false, &caller_token_id,
+                            caller_token_id >= 0 ? 1 : 0);
+    return req.sampling_params.disallowed_token_ids == &req.disallowed_token_ids &&
+           std::binary_search(req.disallowed_token_ids.begin(), req.disallowed_token_ids.end(), 0) &&
+           std::binary_search(req.disallowed_token_ids.begin(), req.disallowed_token_ids.end(), caller_token_id);
 }
 
 std::string DenseCoreTestOnlyPrimeQwenNoThinkingPromptText(const TransformerModel* model, const std::string& prompt) {
@@ -2191,16 +2216,22 @@ DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* r
             SetError(DENSECORE_STATUS_OUT_OF_MEMORY, "InitEngineEx: failed to initialize KV cache");
             return nullptr;
         }
+        std::cout << "[DenseCoreInitTrace] KV cache initialized" << std::endl;
 
         // Wrap model and cache into ModelEntry and add to pool
+        std::cout << "[DenseCoreInitTrace] before MakeModelEntry" << std::endl;
         auto entry = MakeModelEntry("default", canonical_model_path, std::unique_ptr<TransformerModel>(model),
                                     std::unique_ptr<PagedKVCache>(cache));
+        std::cout << "[DenseCoreInitTrace] before model map insert" << std::endl;
         state->models["default"] = std::move(entry);
+        std::cout << "[DenseCoreInitTrace] after model map insert" << std::endl;
         state->default_model_id = "default";
+        std::cout << "[DenseCoreInitTrace] before optional draft" << std::endl;
         if (!LoadOptionalDraftModel(state.get(), canonical_model_path, canonical_draft_model_path,
                                     kv_config.effective_cache_type, "InitEngineEx")) {
             return nullptr;
         }
+        std::cout << "[DenseCoreInitTrace] after optional draft" << std::endl;
 
 #ifdef __APPLE__
         ConfigureHybridScheduler(state.get(), state->models["default"]->model.get());
@@ -2728,6 +2759,9 @@ int SubmitRequest(DenseCoreHandle handle, const char* prompt, int max_tokens, co
     ConfigurePromptSuppressionForModel(model_entry->model.get(), req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt,
                                       ResolveAddBosForPrompt(model_entry->model.get(), req->prompt));
+    ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
+    densecore::models::ConfigureQwen36TextTokenBlocklistForModel(model_entry->model.get(), req);
+    ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
     LogRequestRuntimePath(state, model_entry->model.get(), prompt, req);
@@ -2812,6 +2846,9 @@ int SubmitRequestWithFormatEx(DenseCoreHandle handle, const char* prompt, int ma
     ConfigurePromptSuppressionForModel(model_entry->model.get(), req);
     req->tokens = Tokenizer::Tokenize(model_entry->model.get(), req->prompt,
                                       ResolveAddBosForPrompt(model_entry->model.get(), req->prompt));
+    ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
+    densecore::models::ConfigureQwen36TextTokenBlocklistForModel(model_entry->model.get(), req);
+    ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
     LogRequestRuntimePath(state, model_entry->model.get(), prompt, req);

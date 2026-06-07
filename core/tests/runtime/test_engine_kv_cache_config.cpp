@@ -372,6 +372,31 @@ TEST(EngineKVCacheConfig, HybridSsmGraphContextCanGrowBeyondLaptopCeilingWhenMem
         << "Adaptive graph context sizing must still leave headroom on 32 GB available-memory hosts";
 }
 
+TEST(EngineKVCacheConfig, GraphContextMinEnvCanScaleBeyondOldFixed48GbCeilingWhenMemoryAllows) {
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "4096");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "1");
+    ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", "65536");
+    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", nullptr);
+    ScopedEnvVar graph_ctx_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "98304");
+    ScopedEnvVar graph_ctx_extra("DENSECORE_GRAPH_CTX_EXTRA_MB", "0");
+
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_embd = 2048;
+    model.hparams.n_layer = 24;
+    model.hparams.n_head = 8;
+    model.hparams.n_ctx = 262144;
+    model.ssm_inner_size = 2048;
+
+    const size_t graph_ctx_bytes = EngineState::CalculateGraphContextSize(&model);
+    EXPECT_GE(graph_ctx_bytes, 65536ULL * 1024ULL * 1024ULL)
+        << "Graph context sizing must not retain the old fixed 48 GB ceiling when live host memory allows more";
+    EXPECT_LE(graph_ctx_bytes, 98304ULL * 1024ULL * 1024ULL)
+        << "Env-expanded graph context should still respect current live memory headroom";
+}
+
 TEST(EngineKVCacheConfig, GraphContextHonorsExtraHeadroomEnv) {
     ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "1024");
     ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "4");
@@ -394,6 +419,87 @@ TEST(EngineKVCacheConfig, GraphContextHonorsExtraHeadroomEnv) {
 
     EXPECT_GE(with_extra, without_extra + static_cast<size_t>(64) * 1024 * 1024)
         << "DENSECORE_GRAPH_CTX_EXTRA_MB should increase graph context budget";
+}
+
+TEST(EngineKVCacheConfig, QwenHybridMoeLongPrefillUsesChunkShapeNotWholePromptGraph) {
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "32768");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "1");
+    ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
+    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", nullptr);
+    ScopedEnvVar graph_ctx_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "1048576");
+    ScopedEnvVar graph_ctx_extra("DENSECORE_GRAPH_CTX_EXTRA_MB", "0");
+
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_embd = 2048;
+    model.hparams.n_layer = 48;
+    model.hparams.n_head = 8;
+    model.hparams.n_head_kv = 8;
+    model.hparams.n_embd_head_k = 256;
+    model.hparams.n_embd_head_v = 256;
+    model.hparams.n_ff = 12288;
+    model.hparams.n_ctx = 262144;
+    model.hparams.n_experts = 128;
+    model.hparams.n_experts_used = 8;
+    model.ssm_inner_size = 2048;
+
+    const auto chunked_estimate = EngineState::EstimateGraphContextSize(&model, /*seq_len_hint=*/32768,
+                                                                        /*num_seqs_hint=*/1,
+                                                                        /*chunk_token_hint=*/320);
+    const auto whole_prompt_estimate = EngineState::EstimateGraphContextSize(&model, /*seq_len_hint=*/32768,
+                                                                             /*num_seqs_hint=*/1,
+                                                                             /*chunk_token_hint=*/32768);
+
+    EXPECT_EQ(chunked_estimate.effective_seq_len, 32768U);
+    EXPECT_EQ(chunked_estimate.effective_query_len, 320U);
+    EXPECT_EQ(chunked_estimate.effective_num_seqs, 1U);
+    EXPECT_LT(chunked_estimate.total_bytes, whole_prompt_estimate.total_bytes)
+        << "Long prefill admission should size the active graph from the current chunk, not the whole prompt";
+    EXPECT_LE(chunked_estimate.total_bytes, 1048576ULL * 1024ULL * 1024ULL)
+        << "32k chunked prefill should remain bounded by live memory instead of a machine-class constant";
+}
+
+TEST(EngineKVCacheConfig, QwenHybridMoe32kPrefillAdmissionUsesLiveMemoryEnvelope) {
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "32768");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "1");
+    ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
+    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", nullptr);
+    ScopedEnvVar graph_ctx_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "65536");
+    ScopedEnvVar graph_ctx_extra("DENSECORE_GRAPH_CTX_EXTRA_MB", "0");
+
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_embd = 2048;
+    model.hparams.n_layer = 48;
+    model.hparams.n_head = 8;
+    model.hparams.n_head_kv = 8;
+    model.hparams.n_embd_head_k = 256;
+    model.hparams.n_embd_head_v = 256;
+    model.hparams.n_ff = 12288;
+    model.hparams.n_ctx = 262144;
+    model.hparams.n_experts = 128;
+    model.hparams.n_experts_used = 8;
+    model.ssm_inner_size = 2048;
+
+    const auto chunked_estimate = EngineState::EstimateGraphContextSize(&model, /*seq_len_hint=*/32768,
+                                                                        /*num_seqs_hint=*/1,
+                                                                        /*chunk_token_hint=*/320);
+    const auto larger_host_estimate = [&]() {
+        ScopedEnvVar larger_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "131072");
+        return EngineState::EstimateGraphContextSize(&model, /*seq_len_hint=*/32768, /*num_seqs_hint=*/1,
+                                                     /*chunk_token_hint=*/320);
+    }();
+
+    EXPECT_EQ(chunked_estimate.effective_seq_len, 32768U);
+    EXPECT_EQ(chunked_estimate.effective_query_len, 320U);
+    EXPECT_LE(chunked_estimate.total_bytes, 65536ULL * 1024ULL * 1024ULL)
+        << "32k prefill graph admission must be capped by current live memory, not by a fixed C4/C4A RAM table";
+    EXPECT_LE(chunked_estimate.total_bytes, larger_host_estimate.total_bytes)
+        << "Graph budget should scale with live host headroom when the request shape is unchanged";
 }
 
 TEST(EngineKVCacheConfig, HybridSsmGraphContextGrowsForLongContextHint) {

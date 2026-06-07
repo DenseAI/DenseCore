@@ -156,6 +156,10 @@ func (s *ChatService) GenerateSync(ctx context.Context, req domain.ChatCompletio
 
 	logQwen36 := isQwen36Request(modelHint, prepared.modelVariant)
 	var responseBuilder strings.Builder
+	var qwenMarkerFilter *QwenVisibleControlMarkerFilter
+	if isQwenRenderedTokenPathRequest(modelHint, prepared.modelVariant) {
+		qwenMarkerFilter = NewQwenVisibleControlMarkerFilter()
+	}
 	completionTokens := 0
 	visibleChunks := 0
 	visibleChars := 0
@@ -173,17 +177,32 @@ func (s *ChatService) GenerateSync(ctx context.Context, req domain.ChatCompletio
 				return "", completionTokens, prepared.promptTokenCount, domain.ErrStreamClosedWithoutTerminal
 			}
 			if event.Token != "" {
+				token := event.Token
+				if qwenMarkerFilter != nil {
+					token = qwenMarkerFilter.Filter(token)
+				}
 				if completionTokens == 0 {
 					firstCallbackMS = durationMillis(time.Since(submitStart))
 				}
 				lastCallbackMS = durationMillis(time.Since(submitStart))
-				responseBuilder.WriteString(event.Token)
-				completionTokens++
-				visibleChunks++
-				visibleChars += len(event.Token)
+				if token != "" {
+					responseBuilder.WriteString(token)
+					completionTokens++
+					visibleChunks++
+					visibleChars += len(token)
+				}
 			}
 			if !event.Terminal {
 				continue
+			}
+			if qwenMarkerFilter != nil {
+				token := qwenMarkerFilter.Flush()
+				if token != "" {
+					responseBuilder.WriteString(token)
+					completionTokens++
+					visibleChunks++
+					visibleChars += len(token)
+				}
 			}
 			if logQwen36 {
 				fields := []any{
@@ -266,28 +285,19 @@ func (s *ChatService) preparePrompt(engine domain.Engine, req domain.ChatComplet
 		}
 	}
 
-	if profile.family == promptFamilyLFM2 {
-		renderedPrompt := FormatChatPromptWithMetadata(modelHint, prepared.tokenizerType, prepared.chatTemplate, messages, req.ChatTemplateKwargs)
-		prepared.prompt = renderedPrompt
-		prepared.promptSource = "server_lfm2_chatml"
-		prepared.renderedPrompt = renderedPrompt
-		prepared.renderedTemplateUsed = true
-		prepared.promptFamily = promptFamilyName(promptFamilyLFM2)
-	} else {
-		rendered, err := engine.RenderChatPrompt(messages, enableThinking, preserveThinking)
-		if err != nil {
-			return prepared, err
-		}
-
-		prepared.prompt = rendered.RenderedPrompt
-		prepared.promptSource = "rendered_chat_template"
-		prepared.renderedPrompt = rendered.RenderedPrompt
-		prepared.renderedTemplateUsed = true
-		prepared.tokenizerType = firstNonEmpty(rendered.TokenizerType, prepared.tokenizerType)
-		prepared.chatTemplate = firstNonEmpty(rendered.ChatTemplate, prepared.chatTemplate)
-		prepared.modelVariant = firstNonEmpty(rendered.ModelVariant, prepared.modelVariant)
-		prepared.promptFamily = firstNonEmpty(rendered.PromptFamily, prepared.promptFamily)
+	rendered, err := engine.RenderChatPrompt(messages, enableThinking, preserveThinking)
+	if err != nil {
+		return prepared, err
 	}
+
+	prepared.prompt = rendered.RenderedPrompt
+	prepared.promptSource = "rendered_chat_template"
+	prepared.renderedPrompt = rendered.RenderedPrompt
+	prepared.renderedTemplateUsed = true
+	prepared.tokenizerType = firstNonEmpty(rendered.TokenizerType, prepared.tokenizerType)
+	prepared.chatTemplate = firstNonEmpty(rendered.ChatTemplate, prepared.chatTemplate)
+	prepared.modelVariant = firstNonEmpty(rendered.ModelVariant, prepared.modelVariant)
+	prepared.promptFamily = firstNonEmpty(rendered.PromptFamily, prepared.promptFamily)
 
 	if !req.ParityMode && shouldPassThroughRawPrompt(modelHint, prepared.tokenizerType, prepared.chatTemplate, req.Messages, req.ChatTemplateKwargs) {
 		prepared.prompt = ExtractPrompt(req.Messages)
@@ -607,6 +617,90 @@ func isQwen35Request(modelHint string, modelVariant string) bool {
 
 func isQwenRenderedTokenPathRequest(modelHint string, modelVariant string) bool {
 	return isQwen35Request(modelHint, modelVariant) || isQwen36Request(modelHint, modelVariant)
+}
+
+func IsQwenModelHint(modelHint string) bool {
+	return isQwen35Request(modelHint, "") || isQwen36Request(modelHint, "")
+}
+
+func SanitizeQwenVisibleControlMarkers(text string) string {
+	for _, marker := range []string{"/no_think", "/nothink"} {
+		for {
+			idx := strings.Index(text, marker)
+			if idx < 0 {
+				break
+			}
+			start := idx
+			for start > 0 && isASCIISpace(text[start-1]) {
+				start--
+			}
+			end := idx + len(marker)
+			for end < len(text) && isASCIISpace(text[end]) {
+				end++
+			}
+			text = text[:start] + text[end:]
+		}
+	}
+	return text
+}
+
+type QwenVisibleControlMarkerFilter struct {
+	pending string
+}
+
+func NewQwenVisibleControlMarkerFilter() *QwenVisibleControlMarkerFilter {
+	return &QwenVisibleControlMarkerFilter{}
+}
+
+func (f *QwenVisibleControlMarkerFilter) Filter(token string) string {
+	if token == "" {
+		return ""
+	}
+	f.pending = SanitizeQwenVisibleControlMarkers(f.pending + token)
+	keep := qwenVisibleControlMarkerPendingSuffixLen(f.pending)
+	emitLen := len(f.pending) - keep
+	if emitLen <= 0 {
+		return ""
+	}
+	out := f.pending[:emitLen]
+	f.pending = f.pending[emitLen:]
+	return out
+}
+
+func (f *QwenVisibleControlMarkerFilter) Flush() string {
+	out := SanitizeQwenVisibleControlMarkers(f.pending)
+	f.pending = ""
+	return out
+}
+
+func qwenVisibleControlMarkerPendingSuffixLen(text string) int {
+	longest := 0
+	for i := 0; i < len(text); i++ {
+		suffix := text[i:]
+		j := 0
+		for j < len(suffix) && isASCIISpace(suffix[j]) {
+			j++
+		}
+		rest := suffix[j:]
+		if rest == "" {
+			if len(suffix) > longest {
+				longest = len(suffix)
+			}
+			continue
+		}
+		for _, marker := range []string{"/no_think", "/nothink"} {
+			if len(rest) < len(marker) && strings.HasPrefix(marker, rest) {
+				if len(suffix) > longest {
+					longest = len(suffix)
+				}
+			}
+		}
+	}
+	return longest
+}
+
+func isASCIISpace(ch byte) bool {
+	return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' || ch == '\f' || ch == '\v'
 }
 
 func isGemmaRenderedTokenPathRequest(modelHint string, modelVariant string, tokenizerType string) bool {

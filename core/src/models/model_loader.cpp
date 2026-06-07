@@ -387,7 +387,7 @@ bool CanUseCpuKleidiaiRepack(ggml_type type) {
     return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0;
 }
 
-bool IsQwen36SSMQ8ProjectionTensor(const ggml_tensor* source) {
+bool IsQwenHybridSSMQ8ProjectionTensor(const ggml_tensor* source) {
     if (!source || source->type != GGML_TYPE_Q8_0 || !source->name[0]) {
         return false;
     }
@@ -497,7 +497,8 @@ bool PrepareQwen36SSMQ8PrefillAMXAliasesForExecutionImpl(TransformerModel* model
     (void)model;
     return false;
 #else
-    if (!model || model->variant != ModelVariant::QWEN36 || !model->arch_flags.is_hybrid_ssm) {
+    if (!model || (model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36) ||
+        !model->arch_flags.is_hybrid_ssm) {
         return false;
     }
     if (!model->qwen36_ssm_q8_prefill_amx_aliases.empty() && !model->qwen36_ssm_q8_prefill_amx_buffers.empty()) {
@@ -526,7 +527,7 @@ bool PrepareQwen36SSMQ8PrefillAMXAliasesForExecutionImpl(TransformerModel* model
     pending.reserve(static_cast<size_t>(model->hparams.n_layer) * 3);
     auto add_alias = [&](ggml_tensor* source) {
         if (!source || !source->data || source->view_src || source->ne[0] <= 0 || source->ne[1] <= 0 ||
-            source->ne[2] != 1 || source->ne[3] != 1 || !IsQwen36SSMQ8ProjectionTensor(source)) {
+            source->ne[2] != 1 || source->ne[3] != 1 || !IsQwenHybridSSMQ8ProjectionTensor(source)) {
             return;
         }
         ggml_tensor* alias =
@@ -2948,14 +2949,42 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 const char* env = std::getenv("DENSECORE_QWEN36_STRICT_PROFILE");
                 return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
             }();
-            const bool allow_qwen36_test_profile = []() {
-                const char* env = std::getenv("DENSECORE_QWEN36_ALLOW_TEST_PROFILE");
-                return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-            }();
+	            const bool allow_qwen36_test_profile = []() {
+	                const char* env = std::getenv("DENSECORE_QWEN36_ALLOW_TEST_PROFILE");
+	                return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+	            }();
 
-            std::vector<std::string> mismatches;
-            if (static_cast<int>(model->hparams.n_embd) != expected.hidden_size) {
-                mismatches.push_back("hidden_size");
+	            if (!qwen36_dense_profile && !allow_qwen36_test_profile) {
+	                bool repaired_profile_metadata = false;
+	                if (expected.experts > 0 &&
+	                    (model->hparams.n_experts == 0 ||
+	                     static_cast<int>(model->hparams.n_experts) == expected.experts_per_token)) {
+	                    if (model->hparams.n_experts_used == 0 &&
+	                        static_cast<int>(model->hparams.n_experts) == expected.experts_per_token) {
+	                        model->hparams.n_experts_used = static_cast<uint32_t>(expected.experts_per_token);
+	                    }
+	                    model->hparams.n_experts = static_cast<uint32_t>(expected.experts);
+	                    repaired_profile_metadata = true;
+	                }
+	                if (expected.experts_per_token > 0 && model->hparams.n_experts_used == 0) {
+	                    model->hparams.n_experts_used = static_cast<uint32_t>(expected.experts_per_token);
+	                    repaired_profile_metadata = true;
+	                }
+	                if (expected.shared_experts > 0 && model->moe_n_shared_experts == 0) {
+	                    model->moe_n_shared_experts = expected.shared_experts;
+	                    repaired_profile_metadata = true;
+	                }
+	                if (repaired_profile_metadata) {
+	                    std::cout << "[DenseCore] Repaired Qwen3.6 MoE profile metadata"
+	                              << " experts=" << model->hparams.n_experts
+	                              << " experts_used=" << model->hparams.n_experts_used
+	                              << " shared_experts=" << model->moe_n_shared_experts << std::endl;
+	                }
+	            }
+
+	            std::vector<std::string> mismatches;
+	            if (static_cast<int>(model->hparams.n_embd) != expected.hidden_size) {
+	                mismatches.push_back("hidden_size");
             }
             if (static_cast<int>(model->hparams.n_layer) != expected.n_layer) {
                 mismatches.push_back("n_layer");

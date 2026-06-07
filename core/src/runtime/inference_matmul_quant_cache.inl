@@ -1,4 +1,8 @@
 // Quantized GEMV cache, probes, and admission helpers used by matmul callbacks.
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__SSE4_1__)
+#include <immintrin.h>
+#endif
+
 struct Q8RepackedGemvWeight {
     int64_t rows = 0;
     int64_t cols = 0;
@@ -28,6 +32,28 @@ struct Q8RepackedGemvKeyHash {
 
 constexpr int kQ8RepackedGemvMinOutputRows = 4096;
 
+static inline int DenseCoreQ8_0Dot8I8I8(const int8_t* weight, const int8_t* input) {
+    if (!weight || !input) {
+        return 0;
+    }
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__SSE4_1__)
+    const __m128i w8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(weight));
+    const __m128i x8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(input));
+    const __m128i w16 = _mm_cvtepi8_epi16(w8);
+    const __m128i x16 = _mm_cvtepi8_epi16(x8);
+    const __m128i prod32 = _mm_madd_epi16(w16, x16);
+    const __m128i sum64 = _mm_add_epi32(prod32, _mm_shuffle_epi32(prod32, _MM_SHUFFLE(1, 0, 3, 2)));
+    const __m128i sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(sum32);
+#else
+    int acc = 0;
+    for (int i = 0; i < 8; ++i) {
+        acc += static_cast<int>(weight[i]) * static_cast<int>(input[i]);
+    }
+    return acc;
+#endif
+}
+
 static void DenseCoreGemvQ8_0_4x8Q8_0Generic(int n, float* out, const void* packed_weight, const void* q8_input,
                                              int nc) {
     if (!out || !packed_weight || !q8_input || n <= 0 || (n % QK8_0) != 0 || (nc % 4) != 0) {
@@ -54,11 +80,7 @@ static void DenseCoreGemvQ8_0_4x8Q8_0Generic(int n, float* out, const void* pack
             for (int row = 0; row < 4; ++row) {
                 int acc = 0;
                 for (int chunk = 0; chunk < QK8_0 / 8; ++chunk) {
-                    const int q_base = chunk * 4 * 8 + row * 8;
-                    const int x_base = chunk * 8;
-                    for (int i = 0; i < 8; ++i) {
-                        acc += static_cast<int>(qs[q_base + i]) * static_cast<int>(x.qs[x_base + i]);
-                    }
+                    acc += DenseCoreQ8_0Dot8I8I8(qs + chunk * 4 * 8 + row * 8, x.qs + chunk * 8);
                 }
                 sum[row] += static_cast<float>(acc) * fp16_to_f32(scales[row]) * input_scale;
             }
@@ -189,6 +211,11 @@ static inline float DenseCoreQ8_0BlockDot(const block_q8_0* weight_blocks, const
         acc = vdotq_s32(acc, vld1q_s8(w.qs + 0), vld1q_s8(x.qs + 0));
         acc = vdotq_s32(acc, vld1q_s8(w.qs + 16), vld1q_s8(x.qs + 16));
         const int dot = vaddvq_s32(acc);
+#elif (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__SSE4_1__)
+        const int dot = DenseCoreQ8_0Dot8I8I8(w.qs + 0, x.qs + 0) +
+                        DenseCoreQ8_0Dot8I8I8(w.qs + 8, x.qs + 8) +
+                        DenseCoreQ8_0Dot8I8I8(w.qs + 16, x.qs + 16) +
+                        DenseCoreQ8_0Dot8I8I8(w.qs + 24, x.qs + 24);
 #else
         int dot = 0;
         for (int i = 0; i < QK8_0; ++i) {
