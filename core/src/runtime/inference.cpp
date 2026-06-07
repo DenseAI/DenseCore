@@ -20,8 +20,8 @@
 #include <cassert>
 #include <cctype>
 #include <cmath>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -97,9 +97,9 @@ void ggml_gemv_q4_K_8x4_q8_K(int n, float* s, size_t bs, const void* vx, const v
 namespace densecore {
 bool RunQ5KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* gate_weight_ptr,
                                                const void* up_weight_ptr, const float* input_data,
-                                               const uint8_t* qinput_data, size_t qinput_row_bytes,
-                                               float* output_data, int64_t rows, int64_t cols, int64_t input_cols,
-                                               int numa_node, bool allow_parallel);
+                                               const uint8_t* qinput_data, size_t qinput_row_bytes, float* output_data,
+                                               int64_t rows, int64_t cols, int64_t input_cols, int numa_node,
+                                               bool allow_parallel);
 bool RunQ4KRepackedMoEProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
                                  size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
                                  int64_t input_cols, int numa_node, bool allow_parallel);
@@ -110,22 +110,21 @@ bool RunQ6KRepackedMoEProjectionCached(CpuBackend* backend, const void* weight_p
                                        size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
                                        int64_t input_cols, int numa_node, bool allow_parallel,
                                        std::shared_ptr<void>* packed_cache);
-bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gate_weight_ptr,
-                                            const void* up_weight_ptr, const float* input_data,
-                                            const uint8_t* qinput_data, size_t qinput_row_bytes, float* output_data,
-                                            int64_t rows, int64_t cols, int64_t input_cols, int numa_node,
-                                            bool allow_parallel);
+bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
+                                            const float* input_data, const uint8_t* qinput_data,
+                                            size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
+                                            int64_t input_cols, int numa_node, bool allow_parallel);
 bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
                                    size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
                                    int numa_node, bool allow_parallel);
 bool RunMoEKQuantRawBatchedProjection(CpuBackend* backend, int ggml_type_id, const void* weight_ptr,
-                                      const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data,
-                                      int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel);
+                                      const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
+                                      int64_t N, int64_t K, int numa_node, bool allow_parallel);
 bool RunMoEKQuantRawBatchedFusedSwiGLU(CpuBackend* backend, int ggml_type_id, const void* gate_weight_ptr,
-                                       const void* up_weight_ptr, const uint8_t* qinput_data,
-                                       size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
-                                       int numa_node, bool allow_parallel);
-}
+                                       const void* up_weight_ptr, const uint8_t* qinput_data, size_t qinput_row_bytes,
+                                       float* out_data, int64_t M, int64_t N, int64_t K, int numa_node,
+                                       bool allow_parallel);
+}  // namespace densecore
 
 #include "runtime/inference_graph_support.inl"
 

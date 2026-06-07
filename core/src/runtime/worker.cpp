@@ -79,9 +79,10 @@ const densecore::llm::config::FastPathRuntimeConfig& GetFastPathRuntimeConfig() 
     return config;
 }
 
-LFM2GreedyLMHeadArgmaxRejectReason GetLFM2GreedyLMHeadArgmaxRejectReason(
-    const TransformerModel* model, const std::vector<Request*>& batch_requests, InferenceExecutionPhase phase,
-    bool is_embedding_batch) {
+LFM2GreedyLMHeadArgmaxRejectReason GetLFM2GreedyLMHeadArgmaxRejectReason(const TransformerModel* model,
+                                                                         const std::vector<Request*>& batch_requests,
+                                                                         InferenceExecutionPhase phase,
+                                                                         bool is_embedding_batch) {
     const bool is_lfm2 = model && (model->variant == ModelVariant::LFM2MOE || model->arch_flags.is_lfm2_shortconv);
     if (!is_lfm2) return LFM2GreedyLMHeadArgmaxRejectReason::UnsupportedModel;
     if (phase != InferenceExecutionPhase::Decode && phase != InferenceExecutionPhase::Prefill) {
@@ -108,8 +109,7 @@ LFM2GreedyLMHeadArgmaxRejectReason GetLFM2GreedyLMHeadArgmaxRejectReason(
     if (req->sampling_params.disallowed_token_ids && !req->sampling_params.disallowed_token_ids->empty()) {
         return LFM2GreedyLMHeadArgmaxRejectReason::DisallowedTokens;
     }
-    if (std::getenv("DENSECORE_DEBUG_SAMPLE") != nullptr ||
-        std::getenv("DENSECORE_DEBUG_SAMPLE_TOP") != nullptr ||
+    if (std::getenv("DENSECORE_DEBUG_SAMPLE") != nullptr || std::getenv("DENSECORE_DEBUG_SAMPLE_TOP") != nullptr ||
         std::getenv("DENSECORE_DEBUG_SAMPLER_TRACE") != nullptr) {
         return LFM2GreedyLMHeadArgmaxRejectReason::DebugSampler;
     }
@@ -121,8 +121,7 @@ const densecore::llm::config::WorkerRuntimeConfig& GetWorkerRuntimeConfig() {
 }
 
 bool IsRequestLifecycleTraceEnabled() {
-    static const bool enabled =
-        densecore::llm::config::ReadBoolEnv("DENSECORE_DEBUG_REQUEST_LIFECYCLE", false);
+    static const bool enabled = densecore::llm::config::ReadBoolEnv("DENSECORE_DEBUG_REQUEST_LIFECYCLE", false);
     return enabled;
 }
 
@@ -133,17 +132,12 @@ void LogRequestLifecyclePhase(const char* phase, const Request* req, const Trans
         return;
     }
     const auto descriptor = densecore::models::DescribeModel(model);
-    std::cerr << "[RequestLifecycle] phase=" << (phase ? phase : "unknown")
-              << " request_id=" << (req ? req->id : -1)
-              << " seq_id=" << seq_id
-              << " variant=" << densecore::models::ModelVariantName(descriptor.variant)
+    std::cerr << "[RequestLifecycle] phase=" << (phase ? phase : "unknown") << " request_id=" << (req ? req->id : -1)
+              << " seq_id=" << seq_id << " variant=" << densecore::models::ModelVariantName(descriptor.variant)
               << " is_prefill=" << (req && req->is_prefill ? 1 : 0)
-              << " prompt_tokens=" << (req ? req->tokens.size() : 0)
-              << " n_past=" << (req ? req->n_past : 0)
-              << " generated=" << (req ? req->generated_count : 0)
-              << " max_tokens=" << (req ? req->max_tokens : 0)
-              << " batch_seqs=" << batch_seqs
-              << " batch_tokens=" << batch_tokens
+              << " prompt_tokens=" << (req ? req->tokens.size() : 0) << " n_past=" << (req ? req->n_past : 0)
+              << " generated=" << (req ? req->generated_count : 0) << " max_tokens=" << (req ? req->max_tokens : 0)
+              << " batch_seqs=" << batch_seqs << " batch_tokens=" << batch_tokens
               << " active_threads=" << active_threads;
     if (detail && detail[0] != '\0') {
         std::cerr << " detail=" << detail;
@@ -253,8 +247,7 @@ bool IsPrefillGraphCacheSafeForCurrentBatch(const TransformerModel* model, const
         return model->hparams.n_experts == 0;
     }
     const auto descriptor = densecore::models::DescribeModel(model);
-    const bool qwen_hybrid =
-        descriptor.variant == ModelVariant::QWEN35 || descriptor.variant == ModelVariant::QWEN36;
+    const bool qwen_hybrid = descriptor.variant == ModelVariant::QWEN35 || descriptor.variant == ModelVariant::QWEN36;
     if (!qwen_hybrid || IsHybridSSMPrefillGraphCacheDebugProbeEnabled()) {
         return false;
     }
@@ -2508,11 +2501,10 @@ void EngineLoop(EngineState* state) {
             }
 
             batch.num_seqs = batch_requests.size();
-            LogRequestLifecyclePhase("batch_ready", !batch_requests.empty() ? batch_requests.front() : nullptr,
-                                     current_model,
-                                     !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id
-                                                                                       : -1,
-                                     batch.num_seqs, static_cast<int>(batch.tokens.size()));
+            LogRequestLifecyclePhase(
+                "batch_ready", !batch_requests.empty() ? batch_requests.front() : nullptr, current_model,
+                !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id : -1, batch.num_seqs,
+                static_cast<int>(batch.tokens.size()));
 
             bool is_prefill_batch = false;
             for (Request* req : batch_requests) {
@@ -2974,9 +2966,9 @@ void EngineLoop(EngineState* state) {
                                                        prefill_graph_ctx_bytes <= prefill_graph_cache_max_bytes;
             const bool prefill_reuse_shape_eligible =
                 prefill_graph_cache_active_effective && is_prefill_batch && !is_embedding_batch && cpu_backend_active &&
-                IsPrefillGraphCacheSafeForCurrentBatch(current_model, batch) &&
-                batch.lora_map.empty() && batch.num_seqs == 1 && batch_token_counts.size() == 1 &&
-                batch_requests.size() == 1 && !batch_requests[0]->is_embedding && prefill_graph_entry_cacheable;
+                IsPrefillGraphCacheSafeForCurrentBatch(current_model, batch) && batch.lora_map.empty() &&
+                batch.num_seqs == 1 && batch_token_counts.size() == 1 && batch_requests.size() == 1 &&
+                !batch_requests[0]->is_embedding && prefill_graph_entry_cacheable;
             const bool prefill_reuse_candidate = prefill_reuse_shape_eligible;
 
             PrefillGraphCacheKey prefill_graph_key{};
@@ -3282,10 +3274,9 @@ void EngineLoop(EngineState* state) {
                                 ScopedBatchWorkContext cache_build_ctx(
                                     candidate.work_ctx.get(), &batch, batch_execution_phase, true,
                                     current_model ? current_model->variant : ModelVariant::UNKNOWN);
-                                candidate.output =
-                                    BuildTransformerGraph(current_model, current_kv_cache, candidate.ctx, batch,
-                                                          is_embedding_batch, candidate.graph, &candidate.embd_inp,
-                                                          &candidate.pos);
+                                candidate.output = BuildTransformerGraph(current_model, current_kv_cache, candidate.ctx,
+                                                                         batch, is_embedding_batch, candidate.graph,
+                                                                         &candidate.embd_inp, &candidate.pos);
                             }
                             graph_build_end = std::chrono::steady_clock::now();
                             if (candidate.output && candidate.embd_inp && candidate.pos) {
@@ -3311,12 +3302,11 @@ void EngineLoop(EngineState* state) {
                                     }
                                 }
                                 if (cache_entry_admissible) {
-                                    while (
-                                        !prefill_graph_lru.empty() &&
-                                        (prefill_graph_cache.size() >=
-                                             static_cast<size_t>(prefill_graph_cache_lru_size) ||
-                                         prefill_graph_cache_bytes + candidate.ctx_bytes >
-                                             prefill_graph_cache_max_bytes)) {
+                                    while (!prefill_graph_lru.empty() &&
+                                           (prefill_graph_cache.size() >=
+                                                static_cast<size_t>(prefill_graph_cache_lru_size) ||
+                                            prefill_graph_cache_bytes + candidate.ctx_bytes >
+                                                prefill_graph_cache_max_bytes)) {
                                         const PrefillGraphCacheKey budget_evict_key = prefill_graph_lru.back();
                                         prefill_graph_lru.pop_back();
                                         auto budget_evict_it = prefill_graph_cache.find(budget_evict_key);
@@ -3464,8 +3454,7 @@ void EngineLoop(EngineState* state) {
                                         flexible_graph_pool_sizing_cache.emplace(sizing_key, flexible_sizing).first;
                                 }
                             }
-                            if (cached_sizing != flexible_graph_pool_sizing_cache.end() &&
-                                       cached_sizing->second.ok) {
+                            if (cached_sizing != flexible_graph_pool_sizing_cache.end() && cached_sizing->second.ok) {
                                 flexible_sizing = cached_sizing->second;
                                 used_flexible_sizing = true;
                             }
@@ -3566,8 +3555,8 @@ void EngineLoop(EngineState* state) {
                                 const auto q4k_cache_before = densecore::kernels::Q4KRepackedGemvCacheStatsSnapshot();
                                 const size_t available_for_prefill = ReadAvailableMemoryBytesForRuntimePools();
                                 const size_t safety_for_prefill = GraphContextSafetyMarginBytes();
-                                const size_t reserve_floor =
-                                    ctx_size + safety_for_prefill + std::max<size_t>(512ULL * 1024ULL * 1024ULL, ctx_size / 8);
+                                const size_t reserve_floor = ctx_size + safety_for_prefill +
+                                                             std::max<size_t>(512ULL * 1024ULL * 1024ULL, ctx_size / 8);
                                 const bool q4k_cache_fits_prefill =
                                     available_for_prefill == 0 ||
                                     q4k_cache_before.resident_bytes + reserve_floor <= available_for_prefill;
@@ -3707,25 +3696,19 @@ void EngineLoop(EngineState* state) {
                                                         std::chrono::steady_clock::now() - prefill_phase_trace_start)
                                                         .count();
                             const auto q4k_cache = densecore::kernels::Q4KRepackedGemvCacheStatsSnapshot();
-                            std::cerr << "[DenseCore] PrefillPhase"
-                                      << " phase=" << (phase ? phase : "unknown")
+                            std::cerr << "[DenseCore] PrefillPhase" << " phase=" << (phase ? phase : "unknown")
                                       << " elapsed_ms=" << elapsed_ms
                                       << " request_id=" << (trace_req ? trace_req->id : -1)
                                       << " seq_id=" << (trace_req ? trace_req->seq_id : -1)
-                                      << " batch_tokens=" << batch.tokens.size()
-                                      << " batch_seqs=" << batch.num_seqs
+                                      << " batch_tokens=" << batch.tokens.size() << " batch_seqs=" << batch.num_seqs
                                       << " n_past=" << (trace_req ? trace_req->n_past : 0)
                                       << " prompt_remaining=" << (trace_req ? trace_req->tokens.size() : 0)
-                                      << " chunk_tokens="
-                                      << (trace_req ? trace_req->prefill_chunk_tokens_effective : 0)
+                                      << " chunk_tokens=" << (trace_req ? trace_req->prefill_chunk_tokens_effective : 0)
                                       << " graph_ctx_mb="
                                       << (state->inference_ctx.compute_buffer_size / (1024ULL * 1024ULL))
-                                      << " q4k_resident_mb="
-                                      << (q4k_cache.resident_bytes / (1024ULL * 1024ULL))
-                                      << " q4k_repack_mb="
-                                      << (q4k_cache.repack_bytes / (1024ULL * 1024ULL))
-                                      << " q4k_evictions=" << q4k_cache.evictions
-                                      << std::endl;
+                                      << " q4k_resident_mb=" << (q4k_cache.resident_bytes / (1024ULL * 1024ULL))
+                                      << " q4k_repack_mb=" << (q4k_cache.repack_bytes / (1024ULL * 1024ULL))
+                                      << " q4k_evictions=" << q4k_cache.evictions << std::endl;
                         };
 
                         if (Request* trace_req = !batch_requests.empty() ? batch_requests[0] : nullptr) {
@@ -3733,13 +3716,11 @@ void EngineLoop(EngineState* state) {
                                             &state->inference_ctx, nullptr, 0, nullptr, is_prefill_batch,
                                             active_threads);
                         }
-                        LogRequestLifecyclePhase("graph_build_begin",
-                                                 !batch_requests.empty() ? batch_requests.front() : nullptr,
-                                                 current_model,
-                                                 !batch_requests.empty() && batch_requests.front()
-                                                     ? batch_requests.front()->seq_id
-                                                     : -1,
-                                                 batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads);
+                        LogRequestLifecyclePhase(
+                            "graph_build_begin", !batch_requests.empty() ? batch_requests.front() : nullptr,
+                            current_model,
+                            !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id : -1,
+                            batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads);
 
                         // Reset persistent context (O(1) - reuses existing memory buffer)
                         // This prepares a fresh context for graph building without malloc/free
@@ -3778,24 +3759,21 @@ void EngineLoop(EngineState* state) {
                                             &state->inference_ctx, nullptr, 0, output, is_prefill_batch,
                                             active_threads);
                         }
-                        LogRequestLifecyclePhase("graph_build_end",
-                                                 !batch_requests.empty() ? batch_requests.front() : nullptr,
-                                                 current_model,
-                                                 !batch_requests.empty() && batch_requests.front()
-                                                     ? batch_requests.front()->seq_id
-                                                     : -1,
-                                                 batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads);
+                        LogRequestLifecyclePhase(
+                            "graph_build_end", !batch_requests.empty() ? batch_requests.front() : nullptr,
+                            current_model,
+                            !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id : -1,
+                            batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads);
                     }
                 }
             }
 
             if (!output || !embd_inp || !pos) {
                 LOG_ERROR("Fatal: Content creation failed or tensors missing");
-                LogRequestLifecyclePhase("graph_build_failed",
-                                         !batch_requests.empty() ? batch_requests.front() : nullptr, current_model,
-                                         !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id
-                                                                                           : -1,
-                                         batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads);
+                LogRequestLifecyclePhase(
+                    "graph_build_failed", !batch_requests.empty() ? batch_requests.front() : nullptr, current_model,
+                    !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id : -1,
+                    batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads);
                 continue;  // Recover
             }
             LogRequestLifecyclePhase(reused_decode_graph || reused_prefill_graph ? "graph_reuse_ready" : "graph_ready",
@@ -3884,20 +3862,17 @@ void EngineLoop(EngineState* state) {
             if (is_prefill_batch && batch.tokens.size() >= 32) {
                 const Request* trace_req = !batch_requests.empty() ? batch_requests.front() : nullptr;
                 const auto q4k_cache = densecore::kernels::Q4KRepackedGemvCacheStatsSnapshot();
-                std::cerr << "[DenseCore] PrefillPhase"
-                          << " phase=input_ready"
+                std::cerr << "[DenseCore] PrefillPhase" << " phase=input_ready"
                           << " request_id=" << (trace_req ? trace_req->id : -1)
                           << " seq_id=" << (trace_req ? trace_req->seq_id : -1)
-                          << " batch_tokens=" << batch.tokens.size()
-                          << " batch_seqs=" << batch.num_seqs
+                          << " batch_tokens=" << batch.tokens.size() << " batch_seqs=" << batch.num_seqs
                           << " n_past=" << (trace_req ? trace_req->n_past : 0)
                           << " prompt_remaining=" << (trace_req ? trace_req->tokens.size() : 0)
                           << " chunk_tokens=" << (trace_req ? trace_req->prefill_chunk_tokens_effective : 0)
                           << " input_span_kb=" << (input_span_bytes / 1024ULL)
                           << " q4k_resident_mb=" << (q4k_cache.resident_bytes / (1024ULL * 1024ULL))
                           << " q4k_repack_mb=" << (q4k_cache.repack_bytes / (1024ULL * 1024ULL))
-                          << " q4k_evictions=" << q4k_cache.evictions
-                          << std::endl;
+                          << " q4k_evictions=" << q4k_cache.evictions << std::endl;
             }
             if (Request* trace_req = !batch_requests.empty() ? batch_requests[0] : nullptr) {
                 LogPrefillStage("before_prefill_backend_execute", trace_req, current_model, &state->inference_ctx,
@@ -3941,11 +3916,10 @@ void EngineLoop(EngineState* state) {
             maybe_set_cpu_threads();
 
             static int decode_graph_regression_checked_steps = 0;
-            const bool run_decode_graph_cache_regression_check =
-                ShouldRunDecodeGraphCacheRegressionCheck(current_model, cpu_backend_active, current_kv_cache != nullptr,
-                                                         using_cached_decode_graph, decode_single_token_layout,
-                                                         batch.num_seqs, !batch.lora_map.empty(),
-                                                         decode_graph_regression_checked_steps);
+            const bool run_decode_graph_cache_regression_check = ShouldRunDecodeGraphCacheRegressionCheck(
+                current_model, cpu_backend_active, current_kv_cache != nullptr, using_cached_decode_graph,
+                decode_single_token_layout, batch.num_seqs, !batch.lora_map.empty(),
+                decode_graph_regression_checked_steps);
             const bool run_batched_decode_correctness_check =
                 cpu_backend_active && IsBatchedDecodeCorrectnessCheckEnabled() && !is_embedding_batch &&
                 !is_prefill_batch && current_kv_cache && batch.num_seqs > 1 &&
@@ -4266,26 +4240,21 @@ void EngineLoop(EngineState* state) {
             if (is_prefill_batch && batch.tokens.size() >= 32) {
                 const Request* trace_req = !batch_requests.empty() ? batch_requests.front() : nullptr;
                 const auto q4k_cache = densecore::kernels::Q4KRepackedGemvCacheStatsSnapshot();
-                std::cerr << "[DenseCore] PrefillPhase"
-                          << " phase=compute_begin"
+                std::cerr << "[DenseCore] PrefillPhase" << " phase=compute_begin"
                           << " request_id=" << (trace_req ? trace_req->id : -1)
                           << " seq_id=" << (trace_req ? trace_req->seq_id : -1)
-                          << " batch_tokens=" << batch.tokens.size()
-                          << " batch_seqs=" << batch.num_seqs
+                          << " batch_tokens=" << batch.tokens.size() << " batch_seqs=" << batch.num_seqs
                           << " n_past=" << (trace_req ? trace_req->n_past : 0)
                           << " prompt_remaining=" << (trace_req ? trace_req->tokens.size() : 0)
                           << " chunk_tokens=" << (trace_req ? trace_req->prefill_chunk_tokens_effective : 0)
                           << " q4k_resident_mb=" << (q4k_cache.resident_bytes / (1024ULL * 1024ULL))
                           << " q4k_repack_mb=" << (q4k_cache.repack_bytes / (1024ULL * 1024ULL))
-                          << " q4k_evictions=" << q4k_cache.evictions
-                          << std::endl;
+                          << " q4k_evictions=" << q4k_cache.evictions << std::endl;
             }
-            LogRequestLifecyclePhase("graph_compute_begin", !batch_requests.empty() ? batch_requests.front() : nullptr,
-                                     current_model,
-                                     !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id
-                                                                                       : -1,
-                                     batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads,
-                                     is_decode_batch ? "decode" : "prefill");
+            LogRequestLifecyclePhase(
+                "graph_compute_begin", !batch_requests.empty() ? batch_requests.front() : nullptr, current_model,
+                !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id : -1, batch.num_seqs,
+                static_cast<int>(batch.tokens.size()), active_threads, is_decode_batch ? "decode" : "prefill");
             ggml_backend_graph_compute(active_backend, gf);
             const auto compute_end = std::chrono::steady_clock::now();
             if (is_prefill_batch && batch.tokens.size() >= 32) {
@@ -4293,34 +4262,27 @@ void EngineLoop(EngineState* state) {
                 const auto q4k_cache = densecore::kernels::Q4KRepackedGemvCacheStatsSnapshot();
                 const auto graph_execute_ms =
                     std::chrono::duration_cast<std::chrono::milliseconds>(compute_end - compute_begin).count();
-                std::cerr << "[DenseCore] PrefillPhase"
-                          << " phase=compute_end"
+                std::cerr << "[DenseCore] PrefillPhase" << " phase=compute_end"
                           << " graph_execute_ms=" << graph_execute_ms
                           << " request_id=" << (trace_req ? trace_req->id : -1)
                           << " seq_id=" << (trace_req ? trace_req->seq_id : -1)
-                          << " batch_tokens=" << batch.tokens.size()
-                          << " batch_seqs=" << batch.num_seqs
+                          << " batch_tokens=" << batch.tokens.size() << " batch_seqs=" << batch.num_seqs
                           << " n_past=" << (trace_req ? trace_req->n_past : 0)
                           << " prompt_remaining=" << (trace_req ? trace_req->tokens.size() : 0)
                           << " chunk_tokens=" << (trace_req ? trace_req->prefill_chunk_tokens_effective : 0)
                           << " q4k_resident_mb=" << (q4k_cache.resident_bytes / (1024ULL * 1024ULL))
                           << " q4k_repack_mb=" << (q4k_cache.repack_bytes / (1024ULL * 1024ULL))
-                          << " q4k_evictions=" << q4k_cache.evictions
-                          << std::endl;
+                          << " q4k_evictions=" << q4k_cache.evictions << std::endl;
             }
-            LogRequestLifecyclePhase("graph_compute_end", !batch_requests.empty() ? batch_requests.front() : nullptr,
-                                     current_model,
-                                     !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id
-                                                                                       : -1,
-                                     batch.num_seqs, static_cast<int>(batch.tokens.size()), active_threads,
-                                     is_decode_batch ? "decode" : "prefill");
+            LogRequestLifecyclePhase(
+                "graph_compute_end", !batch_requests.empty() ? batch_requests.front() : nullptr, current_model,
+                !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id : -1, batch.num_seqs,
+                static_cast<int>(batch.tokens.size()), active_threads, is_decode_batch ? "decode" : "prefill");
             InferenceWorkContext* profile_work_ctx =
                 graph_execution_work_ctx ? graph_execution_work_ctx : work_ctx.get();
             if (is_prefill_batch && batch.tokens.size() >= 32) {
-                std::cerr << "[DenseCore] PrefillPhase"
-                          << " phase=post_compute_begin"
-                          << " batch_tokens=" << batch.tokens.size()
-                          << " graph_execute_ms="
+                std::cerr << "[DenseCore] PrefillPhase" << " phase=post_compute_begin"
+                          << " batch_tokens=" << batch.tokens.size() << " graph_execute_ms="
                           << std::chrono::duration_cast<std::chrono::milliseconds>(compute_end - compute_begin).count()
                           << std::endl;
             }
@@ -4342,8 +4304,9 @@ void EngineLoop(EngineState* state) {
                     ? SummarizeNativeQwenMoEGraphNodeTimes(current_model, gf, collect_decode_graph_top_slow_nodes)
                     : NativeMoEGraphTimingBreakdown{};
             const HybridSSMGraphTimingBreakdown hybrid_ssm_graph_timing =
-                (is_decode_batch && collect_decode_graph_diagnostics) ? SummarizeHybridSSMGraphNodeTimes(current_model, gf)
-                                                                      : HybridSSMGraphTimingBreakdown{};
+                (is_decode_batch && collect_decode_graph_diagnostics)
+                    ? SummarizeHybridSSMGraphNodeTimes(current_model, gf)
+                    : HybridSSMGraphTimingBreakdown{};
             const bool collect_decode_graph_node_timing = is_decode_batch && collect_decode_graph_diagnostics;
             const bool collect_decode_graph_full_node_timing =
                 collect_decode_graph_node_timing && IsLLMNodeTimingDumpEnabled();
@@ -4357,10 +4320,8 @@ void EngineLoop(EngineState* state) {
             DebugDumpLLMNodeTimes(current_model, gf, is_decode_batch ? "decode" : "prefill");
             DebugDumpGemma4NodeTimes(current_model, gf, is_decode_batch ? "decode" : "prefill");
             if (is_prefill_batch && batch.tokens.size() >= 32) {
-                std::cerr << "[DenseCore] PrefillPhase"
-                          << " phase=post_compute_diagnostics_end"
-                          << " diagnostics="
-                          << (collect_prefill_graph_diagnostics ? "node_timing" : "summary_only")
+                std::cerr << "[DenseCore] PrefillPhase" << " phase=post_compute_diagnostics_end"
+                          << " diagnostics=" << (collect_prefill_graph_diagnostics ? "node_timing" : "summary_only")
                           << std::endl;
             }
             const auto graph_execute_ns = static_cast<uint64_t>(
@@ -4416,7 +4377,8 @@ void EngineLoop(EngineState* state) {
                         req->decode_graph_node_custom_count += decode_graph_node_timing.custom_count;
                         req->decode_graph_node_custom_moe_count += decode_graph_node_timing.custom_moe_count;
                         req->decode_graph_node_custom_ssm_count += decode_graph_node_timing.custom_ssm_count;
-                        req->decode_graph_node_custom_projection_count += decode_graph_node_timing.custom_projection_count;
+                        req->decode_graph_node_custom_projection_count +=
+                            decode_graph_node_timing.custom_projection_count;
                         req->decode_graph_node_custom_lm_head_count += decode_graph_node_timing.custom_lm_head_count;
                         req->decode_graph_node_custom_paged_attention_count +=
                             decode_graph_node_timing.custom_paged_attention_count;
@@ -4797,12 +4759,10 @@ void EngineLoop(EngineState* state) {
                     req->gemv_custom_dynamic_lora_ops += qwen36_profile.gemv_custom_dynamic_lora_ops;
                     req->lfm2_decode_lm_head_custom_gemv_used_ops +=
                         qwen36_profile.lfm2_decode_lm_head_custom_gemv_used_ops;
-                    req->lfm2_decode_lm_head_custom_gemv_ns +=
-                        qwen36_profile.lfm2_decode_lm_head_custom_gemv_ns;
+                    req->lfm2_decode_lm_head_custom_gemv_ns += qwen36_profile.lfm2_decode_lm_head_custom_gemv_ns;
                     req->lfm2_greedy_lm_head_argmax_candidate_ops +=
                         qwen36_profile.lfm2_greedy_lm_head_argmax_candidate_ops;
-                    req->lfm2_greedy_lm_head_argmax_used_ops +=
-                        qwen36_profile.lfm2_greedy_lm_head_argmax_used_ops;
+                    req->lfm2_greedy_lm_head_argmax_used_ops += qwen36_profile.lfm2_greedy_lm_head_argmax_used_ops;
                     req->lfm2_greedy_lm_head_argmax_rejected_ops +=
                         qwen36_profile.lfm2_greedy_lm_head_argmax_rejected_ops;
                     req->lfm2_greedy_lm_head_argmax_ns += qwen36_profile.lfm2_greedy_lm_head_argmax_ns;
@@ -4810,10 +4770,8 @@ void EngineLoop(EngineState* state) {
                         req->lfm2_greedy_lm_head_argmax_last_reject_reason =
                             qwen36_profile.lfm2_greedy_lm_head_argmax_last_reject_reason;
                     }
-                    req->lfm2_w1w3_q4k_vecdot_rowpair_used_ops +=
-                        qwen36_profile.lfm2_w1w3_q4k_vecdot_rowpair_used_ops;
-                    req->lfm2_w1w3_q4k_vecdot_scalar_used_ops +=
-                        qwen36_profile.lfm2_w1w3_q4k_vecdot_scalar_used_ops;
+                    req->lfm2_w1w3_q4k_vecdot_rowpair_used_ops += qwen36_profile.lfm2_w1w3_q4k_vecdot_rowpair_used_ops;
+                    req->lfm2_w1w3_q4k_vecdot_scalar_used_ops += qwen36_profile.lfm2_w1w3_q4k_vecdot_scalar_used_ops;
                     req->lfm2_w1w3_q4k_hwy_used_ops += qwen36_profile.lfm2_w1w3_q4k_hwy_used_ops;
                     req->lfm2_w1w3_q4k_repacked_used_ops += qwen36_profile.lfm2_w1w3_q4k_repacked_used_ops;
                     req->lfm2_w1w3_q5k_hwy_used_ops += qwen36_profile.lfm2_w1w3_q5k_hwy_used_ops;
@@ -5650,12 +5608,12 @@ void EngineLoop(EngineState* state) {
                     const auto sample_begin = std::chrono::steady_clock::now();
                     int best_token = -1;
                     float precomputed_lfm2_argmax_value = -std::numeric_limits<float>::infinity();
-                    const bool can_use_precomputed_lfm2_argmax =
-                        debug_sampling_logits_offset == 0 && debug_first_token_sampling_logits_offset == 0 &&
-                        profile_work_ctx &&
-                        TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(
-                            profile_work_ctx, static_cast<int>(output->ne[0]), &best_token,
-                            &precomputed_lfm2_argmax_value);
+                    const bool can_use_precomputed_lfm2_argmax = debug_sampling_logits_offset == 0 &&
+                                                                 debug_first_token_sampling_logits_offset == 0 &&
+                                                                 profile_work_ctx &&
+                                                                 TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(
+                                                                     profile_work_ctx, static_cast<int>(output->ne[0]),
+                                                                     &best_token, &precomputed_lfm2_argmax_value);
                     if (!can_use_precomputed_lfm2_argmax) {
                         best_token = SampleToken(output, sampling_logits_idx, sampling_params);
                     }

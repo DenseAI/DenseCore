@@ -280,8 +280,8 @@ densecore::SchedulerConfig BuildRuntimeSchedulerConfig(const KVCacheConfig& kv_c
     config.max_parallel_prefill_chunk_tokens =
         std::min(std::max(1, config.max_parallel_prefill_chunk_tokens), config.max_prefill_tokens);
     config.enable_mixed_prefill_decode = true;
-    config.max_mixed_prefill_tokens = std::min(std::max(1, config.max_mixed_prefill_tokens),
-                                               std::max(1, config.max_prefill_tokens / 4));
+    config.max_mixed_prefill_tokens =
+        std::min(std::max(1, config.max_mixed_prefill_tokens), std::max(1, config.max_prefill_tokens / 4));
     return config;
 }
 
@@ -1165,13 +1165,9 @@ void EnqueueRequest(EngineState* state, Request* req) {
     state->pending_requests.Push(req, req->tier);
     state->RecordPendingRequest(req->id);
     if (ParseBoolEnv("DENSECORE_DEBUG_REQUEST_LIFECYCLE", false)) {
-        std::cerr << "[RequestLifecycle] phase=engine_enqueue"
-                  << " request_id=" << req->id
-                  << " tier=" << req->tier
-                  << " prompt_tokens=" << req->tokens.size()
-                  << " max_tokens=" << req->max_tokens
-                  << " json_mode=" << (req->json_mode ? 1 : 0)
-                  << " callback_ex=" << (req->callback_ex ? 1 : 0)
+        std::cerr << "[RequestLifecycle] phase=engine_enqueue" << " request_id=" << req->id << " tier=" << req->tier
+                  << " prompt_tokens=" << req->tokens.size() << " max_tokens=" << req->max_tokens
+                  << " json_mode=" << (req->json_mode ? 1 : 0) << " callback_ex=" << (req->callback_ex ? 1 : 0)
                   << std::endl;
     }
     {

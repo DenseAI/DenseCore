@@ -182,16 +182,15 @@ struct MoEQuantPrefillAdmissionPlan {
     bool force_fast_path = false;
 };
 
-MoEQuantPrefillAdmissionPlan ResolveMoEQuantPrefillAdmissionPlan(
-    const CpuBackend::ExpertWeights& expert, int64_t batch, int64_t hidden_dim, int64_t intermediate_dim,
-    bool safe_reference_mode, bool enabled, bool forced) {
+MoEQuantPrefillAdmissionPlan ResolveMoEQuantPrefillAdmissionPlan(const CpuBackend::ExpertWeights& expert, int64_t batch,
+                                                                 int64_t hidden_dim, int64_t intermediate_dim,
+                                                                 bool safe_reference_mode, bool enabled, bool forced) {
     MoEQuantPrefillAdmissionPlan plan;
     plan.work_ctx = GetCurrentWorkContext();
     plan.enabled = enabled;
     plan.forced = forced;
-    plan.batch_safe =
-        enabled && CanUseGgmlQuantizedMoEPrefillBatch(expert, batch, hidden_dim, intermediate_dim,
-                                                      safe_reference_mode, &plan.reject_reason);
+    plan.batch_safe = enabled && CanUseGgmlQuantizedMoEPrefillBatch(expert, batch, hidden_dim, intermediate_dim,
+                                                                    safe_reference_mode, &plan.reject_reason);
     plan.ggml_quantized_vecdot_safe = batch == 1 || plan.batch_safe;
     plan.force_fast_path = forced && plan.batch_safe;
     return plan;
@@ -200,8 +199,7 @@ MoEQuantPrefillAdmissionPlan ResolveMoEQuantPrefillAdmissionPlan(
 MoEQuantPrefillAdmissionPlan ResolveGemma4MoEPrefillAdmissionPlan(const TransformerModel* model,
                                                                   const CpuBackend::ExpertWeights& expert,
                                                                   int64_t batch, int64_t hidden_dim,
-                                                                  int64_t intermediate_dim,
-                                                                  bool safe_reference_mode) {
+                                                                  int64_t intermediate_dim, bool safe_reference_mode) {
     const bool prefill_phase =
         GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill || GetCurrentWorkContext() == nullptr;
     const bool enabled =
@@ -296,9 +294,9 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     const bool enable_inner_parallel =
         allow_inner_parallel && ShouldParallelizeExpertFFNInner(batch, hidden_dim, intermediate_dim);
     const bool safe_reference_mode = IsMoESafeReferenceModeEnabled(&expert);
-    const MoEQuantPrefillAdmissionPlan quant_prefill_plan = ResolveMoEQuantPrefillAdmissionPlan(
-        expert, batch, hidden_dim, intermediate_dim, safe_reference_mode, allow_gemma4_quant_prefill_batch,
-        force_gemma4_quant_prefill_batch);
+    const MoEQuantPrefillAdmissionPlan quant_prefill_plan =
+        ResolveMoEQuantPrefillAdmissionPlan(expert, batch, hidden_dim, intermediate_dim, safe_reference_mode,
+                                            allow_gemma4_quant_prefill_batch, force_gemma4_quant_prefill_batch);
 
     hidden_scratch.Resize(backend, hidden_size);
     Tensor hidden = Tensor::Make2D(hidden_scratch.ptr, batch, intermediate_dim);
@@ -578,11 +576,9 @@ Tensor MakeMoEWeightF32(CpuBackend* backend, void* ptr, int ggml_type_id,
     return Tensor::Make2D(scratch.ptr, rows, cols);
 }
 
-bool DequantizeMoEWeightToVector(void* ptr, int ggml_type_id,
-                                 const CpuBackend::ExpertPackedInt4Weight& int4_binding,
-                                 const ggml_tensor* scale_tensor, int64_t rows, int64_t cols,
-                                 bool safe_reference_mode, bool materialize_f32,
-                                 simd::AlignedVector<float>* dst) {
+bool DequantizeMoEWeightToVector(void* ptr, int ggml_type_id, const CpuBackend::ExpertPackedInt4Weight& int4_binding,
+                                 const ggml_tensor* scale_tensor, int64_t rows, int64_t cols, bool safe_reference_mode,
+                                 bool materialize_f32, simd::AlignedVector<float>* dst) {
     if (!dst) return false;
     dst->clear();
     if (int4_binding.IsValid()) {
@@ -624,17 +620,15 @@ void RefreshMoEDequantCacheTensors(CacheEntry* entry, const CpuBackend::ExpertWe
     if (!entry) {
         return;
     }
-    entry->w1_tensor = entry->w1.empty()
-                           ? Tensor()
-                           : Tensor::Make2D(entry->w1.data(), static_cast<int64_t>(exp.intermediate_dim),
-                                            static_cast<int64_t>(exp.hidden_dim));
+    entry->w1_tensor = entry->w1.empty() ? Tensor()
+                                         : Tensor::Make2D(entry->w1.data(), static_cast<int64_t>(exp.intermediate_dim),
+                                                          static_cast<int64_t>(exp.hidden_dim));
     entry->w2_tensor = entry->w2.empty() ? Tensor()
                                          : Tensor::Make2D(entry->w2.data(), static_cast<int64_t>(exp.hidden_dim),
                                                           static_cast<int64_t>(exp.intermediate_dim));
-    entry->w3_tensor = entry->w3.empty()
-                           ? Tensor()
-                           : Tensor::Make2D(entry->w3.data(), static_cast<int64_t>(exp.intermediate_dim),
-                                            static_cast<int64_t>(exp.hidden_dim));
+    entry->w3_tensor = entry->w3.empty() ? Tensor()
+                                         : Tensor::Make2D(entry->w3.data(), static_cast<int64_t>(exp.intermediate_dim),
+                                                          static_cast<int64_t>(exp.hidden_dim));
 }
 
 template <typename CacheEntry>
@@ -663,9 +657,9 @@ void PopulateMoEDequantCacheEntry(CacheEntry* entry, const CpuBackend::ExpertWei
 
 bool RunQ5KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* gate_weight_ptr,
                                                const void* up_weight_ptr, const float* input_data,
-                                               const uint8_t* qinput_data, size_t qinput_row_bytes,
-                                               float* output_data, int64_t rows, int64_t cols, int64_t input_cols,
-                                               int numa_node, bool allow_parallel) {
+                                               const uint8_t* qinput_data, size_t qinput_row_bytes, float* output_data,
+                                               int64_t rows, int64_t cols, int64_t input_cols, int numa_node,
+                                               bool allow_parallel) {
     return RunQ5KRepackedMoEFusedSwiGLURawProjectionImpl(backend, gate_weight_ptr, up_weight_ptr, input_data,
                                                          qinput_data, qinput_row_bytes, output_data, rows, cols,
                                                          input_cols, numa_node, allow_parallel);
@@ -681,8 +675,7 @@ bool RunQ4KRepackedMoEProjection(CpuBackend* backend, const void* weight_ptr, co
         return false;
     }
     if (GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill) {
-        RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false,
-                                     "prefill_uses_raw_batched");
+        RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "prefill_uses_raw_batched");
         return false;
     }
     auto packed = GetOrCreateQ4KRepackedMoEWeight(weight_ptr, cols, input_cols);
@@ -750,26 +743,24 @@ bool RunQ6KRepackedMoEProjectionCached(CpuBackend* backend, const void* weight_p
                                allow_parallel)) {
         return false;
     }
-    LogMoEMatmulPath("ggml_q6k_repacked_moe_projection_cached", static_cast<int>(rows),
-                     static_cast<int>(input_cols), static_cast<int>(cols), 0, allow_parallel);
+    LogMoEMatmulPath("ggml_q6k_repacked_moe_projection_cached", static_cast<int>(rows), static_cast<int>(input_cols),
+                     static_cast<int>(cols), 0, allow_parallel);
     return true;
 }
 
-bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gate_weight_ptr,
-                                            const void* up_weight_ptr, const float* input_data,
-                                            const uint8_t* qinput_data, size_t qinput_row_bytes, float* output_data,
-                                            int64_t rows, int64_t cols, int64_t input_cols, int numa_node,
-                                            bool allow_parallel) {
+bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
+                                            const float* input_data, const uint8_t* qinput_data,
+                                            size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
+                                            int64_t input_cols, int numa_node, bool allow_parallel) {
     InferenceWorkContext* census_ctx = GetCurrentWorkContext();
-    if (!backend || !gate_weight_ptr || !up_weight_ptr || !qinput_data || !output_data || rows <= 0 ||
-        cols <= 0 || input_cols <= 0 || (cols % 8) != 0 ||
-        (input_cols % ggml_blck_size(GGML_TYPE_Q4_K)) != 0 || (rows >= 4 && !input_data)) {
+    if (!backend || !gate_weight_ptr || !up_weight_ptr || !qinput_data || !output_data || rows <= 0 || cols <= 0 ||
+        input_cols <= 0 || (cols % 8) != 0 || (input_cols % ggml_blck_size(GGML_TYPE_Q4_K)) != 0 ||
+        (rows >= 4 && !input_data)) {
         RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "unsupported_shape");
         return false;
     }
     if (GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill) {
-        RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false,
-                                     "prefill_uses_raw_batched");
+        RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/false, "prefill_uses_raw_batched");
         return false;
     }
     auto gate_packed = GetOrCreateQ4KRepackedMoEWeight(gate_weight_ptr, cols, input_cols);
@@ -786,8 +777,7 @@ bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gat
     RecordMoEQ4KRepackedDecision(census_ctx, /*candidate=*/true, /*used=*/true, nullptr);
     LogMoEMatmulPath(rows >= 4 ? "ggml_q4k_repacked_moe_gemm_m4_fused_swiglu"
                                : "ggml_q4k_repacked_moe_gemv_fused_swiglu",
-                     static_cast<int>(rows), static_cast<int>(input_cols), static_cast<int>(cols), 0,
-                     allow_parallel);
+                     static_cast<int>(rows), static_cast<int>(input_cols), static_cast<int>(cols), 0, allow_parallel);
     return true;
 }
 
@@ -795,27 +785,27 @@ bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, 
                                    size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
                                    int numa_node, bool allow_parallel) {
     return RunMoEQ4KRawBatchedProjectionImpl(backend, weight_ptr, qinput_data, qinput_row_bytes, out_data, M, N, K,
-                                            numa_node, allow_parallel);
+                                             numa_node, allow_parallel);
 }
 
 bool RunMoEKQuantRawBatchedProjection(CpuBackend* backend, int ggml_type_id, const void* weight_ptr,
-                                      const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data,
-                                      int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel) {
+                                      const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
+                                      int64_t N, int64_t K, int numa_node, bool allow_parallel) {
     return RunMoEKQuantRawBatchedProjectionImpl(backend, static_cast<ggml_type>(ggml_type_id), weight_ptr, qinput_data,
-                                               qinput_row_bytes, out_data, M, N, K, numa_node, allow_parallel);
+                                                qinput_row_bytes, out_data, M, N, K, numa_node, allow_parallel);
 }
 
 bool RunMoEKQuantRawBatchedFusedSwiGLU(CpuBackend* backend, int ggml_type_id, const void* gate_weight_ptr,
-                                       const void* up_weight_ptr, const uint8_t* qinput_data,
-                                       size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
-                                       int numa_node, bool allow_parallel) {
+                                       const void* up_weight_ptr, const uint8_t* qinput_data, size_t qinput_row_bytes,
+                                       float* out_data, int64_t M, int64_t N, int64_t K, int numa_node,
+                                       bool allow_parallel) {
     if (static_cast<ggml_type>(ggml_type_id) == GGML_TYPE_Q4_K) {
         return RunMoEQ4KRawBatchedFusedSwiGLUImpl(backend, gate_weight_ptr, up_weight_ptr, qinput_data,
-                                                 qinput_row_bytes, out_data, M, N, K, numa_node, allow_parallel);
+                                                  qinput_row_bytes, out_data, M, N, K, numa_node, allow_parallel);
     }
     return RunMoEKQuantRawBatchedFusedSwiGLUImpl(backend, static_cast<ggml_type>(ggml_type_id), gate_weight_ptr,
-                                                up_weight_ptr, qinput_data, qinput_row_bytes, out_data, M, N, K,
-                                                numa_node, allow_parallel);
+                                                 up_weight_ptr, qinput_data, qinput_row_bytes, out_data, M, N, K,
+                                                 numa_node, allow_parallel);
 }
 
 void CpuBackend::ApplyMultiLoRA(
@@ -1105,74 +1095,73 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
         internal::IsMoEDequantCacheEnabled() && registry != nullptr && !arm_disable_registry_dequant_cache;
     const bool cache_all_active_experts = internal::ShouldCacheAllActiveExperts();
     const size_t dequant_cache_budget = internal::GetMoEDequantCacheBytes();
-    const auto get_or_create_dequant_cache_entry =
-        [&](int expert_id, const ExpertWeights& exp, size_t cacheable_bytes, bool materialize_f32) {
-            std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> cached_entry;
-            if (!registry || cacheable_bytes == 0 || cacheable_bytes > dequant_cache_budget) {
-                return cached_entry;
-            }
+    const auto get_or_create_dequant_cache_entry = [&](int expert_id, const ExpertWeights& exp, size_t cacheable_bytes,
+                                                       bool materialize_f32) {
+        std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> cached_entry;
+        if (!registry || cacheable_bytes == 0 || cacheable_bytes > dequant_cache_budget) {
+            return cached_entry;
+        }
 
-            std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> existing_entry;
-            {
-                std::lock_guard<std::mutex> lock(registry->mutex);
-                auto it = registry->dequant_cache.find(expert_id);
-                if (it != registry->dequant_cache.end()) {
-                    existing_entry = it->second;
-                    if (existing_entry) {
-                        existing_entry->last_used = ++registry->dequant_cache_use_counter;
-                    }
-                }
-            }
-            if (existing_entry) {
-                return existing_entry;
-            }
-
-            auto candidate = std::make_shared<MoELayerRegistry::DequantizedExpertCacheEntry>();
-            candidate->expert_id = expert_id;
-            candidate->bytes = cacheable_bytes;
-            PopulateMoEDequantCacheEntry(candidate.get(), exp, safe_reference_mode, materialize_f32);
-
+        std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> existing_entry;
+        {
             std::lock_guard<std::mutex> lock(registry->mutex);
             auto it = registry->dequant_cache.find(expert_id);
             if (it != registry->dequant_cache.end()) {
-                cached_entry = it->second;
-                if (cached_entry) {
-                    cached_entry->last_used = ++registry->dequant_cache_use_counter;
-                }
-            } else if (candidate->bytes <= dequant_cache_budget) {
-                while (registry->dequant_cache_bytes + candidate->bytes > dequant_cache_budget &&
-                       !registry->dequant_cache.empty()) {
-                    auto evict_it = registry->dequant_cache.end();
-                    uint64_t oldest_use = std::numeric_limits<uint64_t>::max();
-                    for (auto it_cache = registry->dequant_cache.begin(); it_cache != registry->dequant_cache.end();
-                         ++it_cache) {
-                        if (!it_cache->second) {
-                            evict_it = it_cache;
-                            break;
-                        }
-                        if (it_cache->second->last_used < oldest_use) {
-                            oldest_use = it_cache->second->last_used;
-                            evict_it = it_cache;
-                        }
-                    }
-                    if (evict_it == registry->dequant_cache.end()) {
-                        break;
-                    }
-                    if (evict_it->second) {
-                        registry->dequant_cache_bytes -=
-                            std::min(registry->dequant_cache_bytes, evict_it->second->bytes);
-                    }
-                    registry->dequant_cache.erase(evict_it);
-                }
-                if (registry->dequant_cache_bytes + candidate->bytes <= dequant_cache_budget) {
-                    candidate->last_used = ++registry->dequant_cache_use_counter;
-                    registry->dequant_cache_bytes += candidate->bytes;
-                    registry->dequant_cache.emplace(expert_id, candidate);
-                    cached_entry = std::move(candidate);
+                existing_entry = it->second;
+                if (existing_entry) {
+                    existing_entry->last_used = ++registry->dequant_cache_use_counter;
                 }
             }
-            return cached_entry;
-        };
+        }
+        if (existing_entry) {
+            return existing_entry;
+        }
+
+        auto candidate = std::make_shared<MoELayerRegistry::DequantizedExpertCacheEntry>();
+        candidate->expert_id = expert_id;
+        candidate->bytes = cacheable_bytes;
+        PopulateMoEDequantCacheEntry(candidate.get(), exp, safe_reference_mode, materialize_f32);
+
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        auto it = registry->dequant_cache.find(expert_id);
+        if (it != registry->dequant_cache.end()) {
+            cached_entry = it->second;
+            if (cached_entry) {
+                cached_entry->last_used = ++registry->dequant_cache_use_counter;
+            }
+        } else if (candidate->bytes <= dequant_cache_budget) {
+            while (registry->dequant_cache_bytes + candidate->bytes > dequant_cache_budget &&
+                   !registry->dequant_cache.empty()) {
+                auto evict_it = registry->dequant_cache.end();
+                uint64_t oldest_use = std::numeric_limits<uint64_t>::max();
+                for (auto it_cache = registry->dequant_cache.begin(); it_cache != registry->dequant_cache.end();
+                     ++it_cache) {
+                    if (!it_cache->second) {
+                        evict_it = it_cache;
+                        break;
+                    }
+                    if (it_cache->second->last_used < oldest_use) {
+                        oldest_use = it_cache->second->last_used;
+                        evict_it = it_cache;
+                    }
+                }
+                if (evict_it == registry->dequant_cache.end()) {
+                    break;
+                }
+                if (evict_it->second) {
+                    registry->dequant_cache_bytes -= std::min(registry->dequant_cache_bytes, evict_it->second->bytes);
+                }
+                registry->dequant_cache.erase(evict_it);
+            }
+            if (registry->dequant_cache_bytes + candidate->bytes <= dequant_cache_budget) {
+                candidate->last_used = ++registry->dequant_cache_use_counter;
+                registry->dequant_cache_bytes += candidate->bytes;
+                registry->dequant_cache.emplace(expert_id, candidate);
+                cached_entry = std::move(candidate);
+            }
+        }
+        return cached_entry;
+    };
 
     bool small_decode_requires_general_path = false;
     if (small_decode_candidate) {
@@ -1644,8 +1633,8 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             moe_stats_total_ordering_skipped_low_reuse_.fetch_add(1, std::memory_order_relaxed);
         }
         if (execution_plan.ordering.applied) {
-            moe_stats_total_ordering_numa_switches_before_.fetch_add(
-                execution_plan.ordering.numa_switches_before, std::memory_order_relaxed);
+            moe_stats_total_ordering_numa_switches_before_.fetch_add(execution_plan.ordering.numa_switches_before,
+                                                                     std::memory_order_relaxed);
             moe_stats_total_ordering_applied_.fetch_add(1, std::memory_order_relaxed);
             moe_stats_total_ordering_numa_switches_after_.fetch_add(execution_plan.ordering.numa_switches_after,
                                                                     std::memory_order_relaxed);
@@ -1727,9 +1716,9 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             const auto dequant_begin =
                 debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::shared_ptr<MoELayerRegistry::DequantizedExpertCacheEntry> cached_entry;
-            const MoEQuantPrefillAdmissionPlan quant_prefill_plan = ResolveGemma4MoEPrefillAdmissionPlan(
-                model, exp, work.count, static_cast<int64_t>(hidden_dim), static_cast<int64_t>(exp.intermediate_dim),
-                safe_reference_mode);
+            const MoEQuantPrefillAdmissionPlan quant_prefill_plan =
+                ResolveGemma4MoEPrefillAdmissionPlan(model, exp, work.count, static_cast<int64_t>(hidden_dim),
+                                                     static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode);
             if (quant_prefill_plan.enabled && work.count > 1) {
                 RecordGemma4MoEPrefillQuantBatchDecision(
                     quant_prefill_plan.work_ctx, true, false,
@@ -1781,8 +1770,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 const bool can_use_ggml_quant_gen =
                     !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp) &&
                     (!exp.w2_scale_tensor || IsScalarScaleSidecar(exp.w2_scale_tensor)) &&
-                    work.count <= kMoEQuantizedProjectionMaxBatch &&
-                    (work.count == 1 || quant_prefill_plan.batch_safe);
+                    work.count <= kMoEQuantizedProjectionMaxBatch && (work.count == 1 || quant_prefill_plan.batch_safe);
                 if (!can_use_ggml_quant_gen) {
                     w1 = MakeMoEWeightF32(this, exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr,
                                           static_cast<int64_t>(exp.intermediate_dim),
@@ -1838,8 +1826,8 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 }
             }
             DispatchExpertFFNImpl(this, work.numa_node, expert_input, exp, w1, w2, w3, &expert_out,
-                                  allow_inner_parallel, &trace_ctx, nullptr, profile,
-                                  quant_prefill_plan.batch_safe, quant_prefill_plan.forced);
+                                  allow_inner_parallel, &trace_ctx, nullptr, profile, quant_prefill_plan.batch_safe,
+                                  quant_prefill_plan.forced);
             if (profile) {
                 profile->expert_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                 std::chrono::steady_clock::now() - expert_profile_begin)

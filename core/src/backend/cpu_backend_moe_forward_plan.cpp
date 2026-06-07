@@ -43,8 +43,8 @@ void ApplyMoELocalityOrdering(MoEForwardExecutionPlan* plan) {
     std::stable_sort(plan->active_work.begin(), plan->active_work.end(),
                      [plan](const MoEActiveExpertWork& lhs, const MoEActiveExpertWork& rhs) {
                          const auto ordering_score = [plan](const MoEActiveExpertWork& work) {
-                             const bool reused = plan->previous_batch_set.find(work.expert_id) !=
-                                                 plan->previous_batch_set.end();
+                             const bool reused =
+                                 plan->previous_batch_set.find(work.expert_id) != plan->previous_batch_set.end();
                              int score = 0;
                              if (work.local_hot) score += 32;
                              if (reused) score += 24;
@@ -71,12 +71,13 @@ void BalanceMoEParallelExpertWork(std::vector<MoEActiveExpertWork>* active_work,
 
     const int work_per_thread = (static_cast<int>(active_work->size()) + active_threads - 1) / active_threads;
     std::vector<MoEActiveExpertWork> by_cost = *active_work;
-    std::stable_sort(by_cost.begin(), by_cost.end(), [](const MoEActiveExpertWork& lhs, const MoEActiveExpertWork& rhs) {
-        if (lhs.count != rhs.count) {
-            return lhs.count > rhs.count;
-        }
-        return lhs.expert_id < rhs.expert_id;
-    });
+    std::stable_sort(by_cost.begin(), by_cost.end(),
+                     [](const MoEActiveExpertWork& lhs, const MoEActiveExpertWork& rhs) {
+                         if (lhs.count != rhs.count) {
+                             return lhs.count > rhs.count;
+                         }
+                         return lhs.expert_id < rhs.expert_id;
+                     });
 
     std::vector<std::vector<MoEActiveExpertWork>> buckets(static_cast<size_t>(active_threads));
     std::vector<int64_t> bucket_cost(static_cast<size_t>(active_threads), 0);
@@ -157,12 +158,13 @@ MoEForwardExecutionPlan BuildMoEForwardExecutionPlan(const moe::MoEReorderMapVie
 
     plan.prefer_inner_parallel_prefill =
         !plan.small_decode_step && batch_size > 1 && plan.active_work.size() < static_cast<size_t>(plan.worker_threads);
-    plan.parallelize_experts =
-        !plan.prefer_inner_parallel_prefill && !plan.small_decode_step && batch_size > 1 &&
-        plan.active_work.size() >= static_cast<size_t>(std::max(4, plan.worker_threads / 2)) && registry_present;
+    plan.parallelize_experts = !plan.prefer_inner_parallel_prefill && !plan.small_decode_step && batch_size > 1 &&
+                               plan.active_work.size() >= static_cast<size_t>(std::max(4, plan.worker_threads / 2)) &&
+                               registry_present;
 
     if (plan.parallelize_experts && plan.active_work.size() > 1) {
-        const int active_threads = std::max(1, std::min(plan.worker_threads, static_cast<int>(plan.active_work.size())));
+        const int active_threads =
+            std::max(1, std::min(plan.worker_threads, static_cast<int>(plan.active_work.size())));
         BalanceMoEParallelExpertWork(&plan.active_work, active_threads);
     }
 

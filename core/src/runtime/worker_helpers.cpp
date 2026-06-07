@@ -198,8 +198,7 @@ bool Gemma4MaintainedDecodeFastOpsUsed(const Request* req) {
         return false;
     }
     static constexpr std::size_t kCustomGemvPath = 2;
-    return req->decode_matmul_path_hist[kCustomGemvPath] > 0 &&
-           req->gemma4_decode_native_moe_used_ops > 0;
+    return req->decode_matmul_path_hist[kCustomGemvPath] > 0 && req->gemma4_decode_native_moe_used_ops > 0;
 }
 
 bool RequiredFastPathCounterSatisfied(const Request* req, const TargetFastPathGate& gate, const std::string& counter) {
@@ -233,9 +232,8 @@ bool RequiredFastPathCounterSatisfied(const Request* req, const TargetFastPathGa
     return true;
 }
 
-std::string MissingRequiredFastPathCounters(
-    const Request* req, const TargetFastPathGate& gate,
-    const densecore::models::ModelExecutionContract& execution_contract) {
+std::string MissingRequiredFastPathCounters(const Request* req, const TargetFastPathGate& gate,
+                                            const densecore::models::ModelExecutionContract& execution_contract) {
     std::ostringstream oss;
     bool any = false;
     for (const std::string& counter : execution_contract.required_fast_path_counters) {
@@ -251,8 +249,9 @@ std::string MissingRequiredFastPathCounters(
     return any ? oss.str() : "none";
 }
 
-TargetFastPathGate EvaluateTargetFastPathGate(
-    const Request* req, const densecore::models::ModelExecutionContract& execution_contract, bool graph_plan_rejected) {
+TargetFastPathGate EvaluateTargetFastPathGate(const Request* req,
+                                              const densecore::models::ModelExecutionContract& execution_contract,
+                                              bool graph_plan_rejected) {
     TargetFastPathGate gate{};
     if (!req) {
         return gate;
@@ -273,14 +272,12 @@ TargetFastPathGate EvaluateTargetFastPathGate(
 
     const bool gemma4_moe_contract =
         execution_contract.fast_path_class == densecore::models::ExecutionFastPathClass::Gemma4MoE;
-    gate.gemma4_moe_rejected =
-        gemma4_moe_contract &&
-        (req->gemma4_moe_prefill_quant_batch_rejected_ops > 0 ||
-         req->gemma4_native_moe_prefill_rejected_layers > 0 || req->gemma4_decode_native_rejected_ops > 0);
+    gate.gemma4_moe_rejected = gemma4_moe_contract && (req->gemma4_moe_prefill_quant_batch_rejected_ops > 0 ||
+                                                       req->gemma4_native_moe_prefill_rejected_layers > 0 ||
+                                                       req->gemma4_decode_native_rejected_ops > 0);
     gate.gemma4_moe_prefill_ops_missing = gemma4_moe_contract && !Gemma4MaintainedPrefillFastOpsUsed(req);
     gate.gemma4_moe_decode_ops_missing = gemma4_moe_contract && !Gemma4MaintainedDecodeFastOpsUsed(req);
-    gate.gemma4_moe_fast_ops_missing =
-        gate.gemma4_moe_prefill_ops_missing || gate.gemma4_moe_decode_ops_missing;
+    gate.gemma4_moe_fast_ops_missing = gate.gemma4_moe_prefill_ops_missing || gate.gemma4_moe_decode_ops_missing;
     gate.hybrid_ssm_stateful_ops_missing =
         execution_contract.has_hybrid_ssm_mixer && (req->ssm_conv1d_calls == 0 || req->ssm_delta_calls == 0);
 
@@ -292,13 +289,12 @@ TargetFastPathGate EvaluateTargetFastPathGate(
         !gate.native_moe_fast_ops_missing;
     gate.gemma4_moe_fast_ops_ok = !gemma4_moe_contract || !gate.gemma4_moe_fast_ops_missing;
     gate.stateful_ops_ok = !execution_contract.has_hybrid_ssm_mixer || !gate.hybrid_ssm_stateful_ops_missing;
-    gate.missing_required_fast_path_counters =
-        MissingRequiredFastPathCounters(req, gate, execution_contract);
+    gate.missing_required_fast_path_counters = MissingRequiredFastPathCounters(req, gate, execution_contract);
     gate.required_fast_path_counters_ok = gate.missing_required_fast_path_counters == "none";
-    gate.ok = !gate.required || (!gate.graph_plan_rejected && gate.no_ggml_path && gate.no_native_moe_fallback &&
-                                 gate.no_native_moe_reject && gate.native_moe_fast_ops_ok &&
-                                 gate.gemma4_moe_fast_ops_ok && gate.stateful_ops_ok &&
-                                 gate.required_fast_path_counters_ok);
+    gate.ok =
+        !gate.required || (!gate.graph_plan_rejected && gate.no_ggml_path && gate.no_native_moe_fallback &&
+                           gate.no_native_moe_reject && gate.native_moe_fast_ops_ok && gate.gemma4_moe_fast_ops_ok &&
+                           gate.stateful_ops_ok && gate.required_fast_path_counters_ok);
 
     if (gate.required && gate.graph_plan_rejected) {
         gate.failure_reason = "graph_plan_rejected";
@@ -734,8 +730,7 @@ bool ShouldRunDecodeGraphCacheRegressionCheck(const TransformerModel* model, boo
                                               bool decode_single_token_layout, int num_seqs, bool has_lora_map,
                                               int checked_steps) {
     if (!cpu_backend_active || !current_kv_cache_present || !using_cached_decode_graph || !decode_single_token_layout ||
-        has_lora_map || !IsDecodeGraphCacheRegressionEnabled() ||
-        checked_steps >= DecodeGraphCacheRegressionSteps()) {
+        has_lora_map || !IsDecodeGraphCacheRegressionEnabled() || checked_steps >= DecodeGraphCacheRegressionSteps()) {
         return false;
     }
     if (num_seqs > 1) {
@@ -1708,54 +1703,30 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const auto ns_to_ms = [](uint64_t ns) { return static_cast<double>(ns) / 1000000.0; };
     const auto lfm2_argmax_reject_reason_name = [](int reason) -> const char* {
         switch (reason) {
-        case 0:
-            return "none";
-        case 1:
-            return "not_allowed";
-        case 2:
-            return "unsupported_shape";
-        case 3:
-            return "unsupported_weight";
-        case 4:
-            return "missing_quant_input";
-        case 5:
-            return "kernel_unavailable";
-        case 6:
-            return "sync";
-        case 7:
-            return "json_mode";
-        case 8:
-            return "temperature";
-        case 9:
-            return "final_logit_softcap";
-        case 10:
-            return "action_token_range";
-        case 11:
-            return "frequency_penalty";
-        case 12:
-            return "presence_penalty";
-        case 13:
-            return "grammar";
-        case 14:
-            return "allowed_tokens";
-        case 15:
-            return "disallowed_tokens";
-        case 16:
-            return "debug_sampler";
-        case 17:
-            return "invalid_repetition_penalty";
-        case 18:
-            return "unsupported_model";
-        case 19:
-            return "non_decode_phase";
-        case 20:
-            return "embedding_batch";
-        case 21:
-            return "unsupported_batch";
-        case 22:
-            return "missing_request";
-        default:
-            return "unknown";
+        case 0: return "none";
+        case 1: return "not_allowed";
+        case 2: return "unsupported_shape";
+        case 3: return "unsupported_weight";
+        case 4: return "missing_quant_input";
+        case 5: return "kernel_unavailable";
+        case 6: return "sync";
+        case 7: return "json_mode";
+        case 8: return "temperature";
+        case 9: return "final_logit_softcap";
+        case 10: return "action_token_range";
+        case 11: return "frequency_penalty";
+        case 12: return "presence_penalty";
+        case 13: return "grammar";
+        case 14: return "allowed_tokens";
+        case 15: return "disallowed_tokens";
+        case 16: return "debug_sampler";
+        case 17: return "invalid_repetition_penalty";
+        case 18: return "unsupported_model";
+        case 19: return "non_decode_phase";
+        case 20: return "embedding_batch";
+        case 21: return "unsupported_batch";
+        case 22: return "missing_request";
+        default: return "unknown";
         }
     };
     const auto point_to_ms = [](std::chrono::steady_clock::time_point start,
@@ -1927,8 +1898,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
                                   << ":ms=" << ns_to_ms(req->decode_graph_node_custom_projection_ns)
                                   << ",lm_head:count=" << req->decode_graph_node_custom_lm_head_count
                                   << ":ms=" << ns_to_ms(req->decode_graph_node_custom_lm_head_ns)
-                                  << ",paged_attention:count="
-                                  << req->decode_graph_node_custom_paged_attention_count
+                                  << ",paged_attention:count=" << req->decode_graph_node_custom_paged_attention_count
                                   << ":ms=" << ns_to_ms(req->decode_graph_node_custom_paged_attention_ns)
                                   << ",other:count=" << req->decode_graph_node_custom_other_count
                                   << ":ms=" << ns_to_ms(req->decode_graph_node_custom_other_ns);
@@ -1969,35 +1939,25 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
     const bool lfm2_w2_q6k_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[2] > 0;
     const bool lfm2_w2_q8_0_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[3] > 0;
     const uint64_t lfm2_native_moe_decode_used_ops = lfm2_summary ? req->native_moe_fast_decode_used_ops : 0;
-    const uint64_t lfm2_w1w3_q4k_repacked_used_ops =
-        lfm2_summary ? req->lfm2_w1w3_q4k_repacked_used_ops : 0;
+    const uint64_t lfm2_w1w3_q4k_repacked_used_ops = lfm2_summary ? req->lfm2_w1w3_q4k_repacked_used_ops : 0;
     const uint64_t lfm2_w1w3_q4k_vecdot_rowpair_used_ops =
         lfm2_summary ? req->lfm2_w1w3_q4k_vecdot_rowpair_used_ops : 0;
-    const uint64_t lfm2_w1w3_q4k_vecdot_scalar_used_ops =
-        lfm2_summary ? req->lfm2_w1w3_q4k_vecdot_scalar_used_ops : 0;
+    const uint64_t lfm2_w1w3_q4k_vecdot_scalar_used_ops = lfm2_summary ? req->lfm2_w1w3_q4k_vecdot_scalar_used_ops : 0;
     const uint64_t lfm2_w1w3_q4k_hwy_used_ops = lfm2_summary ? req->lfm2_w1w3_q4k_hwy_used_ops : 0;
-    const uint64_t lfm2_w1w3_q5k_vecdot_used_ops =
-        lfm2_w1w3_q5k_seen ? req->lfm2_w1w3_q5k_hwy_used_ops : 0;
-    const uint64_t lfm2_w2_q4k_repacked_used_ops =
-        lfm2_w2_q4k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
-    const uint64_t lfm2_w2_q5k_vecdot_used_ops =
-        lfm2_w2_q5k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
-    const uint64_t lfm2_w2_q6k_vecdot_used_ops =
-        lfm2_w2_q6k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
-    const uint64_t lfm2_w2_q8_0_direct_used_ops =
-        lfm2_w2_q8_0_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
+    const uint64_t lfm2_w1w3_q5k_vecdot_used_ops = lfm2_w1w3_q5k_seen ? req->lfm2_w1w3_q5k_hwy_used_ops : 0;
+    const uint64_t lfm2_w2_q4k_repacked_used_ops = lfm2_w2_q4k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
+    const uint64_t lfm2_w2_q5k_vecdot_used_ops = lfm2_w2_q5k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
+    const uint64_t lfm2_w2_q6k_vecdot_used_ops = lfm2_w2_q6k_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
+    const uint64_t lfm2_w2_q8_0_direct_used_ops = lfm2_w2_q8_0_seen ? req->native_moe_fast_decode_w2_used_ops : 0;
     const uint64_t lfm2_decode_lm_head_custom_gemv_used_ops =
         lfm2_summary ? req->lfm2_decode_lm_head_custom_gemv_used_ops : 0;
-    const uint64_t lfm2_decode_lm_head_custom_gemv_ns =
-        lfm2_summary ? req->lfm2_decode_lm_head_custom_gemv_ns : 0;
+    const uint64_t lfm2_decode_lm_head_custom_gemv_ns = lfm2_summary ? req->lfm2_decode_lm_head_custom_gemv_ns : 0;
     const uint64_t lfm2_greedy_lm_head_argmax_candidate_ops =
         lfm2_summary ? req->lfm2_greedy_lm_head_argmax_candidate_ops : 0;
-    const uint64_t lfm2_greedy_lm_head_argmax_used_ops =
-        lfm2_summary ? req->lfm2_greedy_lm_head_argmax_used_ops : 0;
+    const uint64_t lfm2_greedy_lm_head_argmax_used_ops = lfm2_summary ? req->lfm2_greedy_lm_head_argmax_used_ops : 0;
     const uint64_t lfm2_greedy_lm_head_argmax_rejected_ops =
         lfm2_summary ? req->lfm2_greedy_lm_head_argmax_rejected_ops : 0;
-    const uint64_t lfm2_greedy_lm_head_argmax_ns =
-        lfm2_summary ? req->lfm2_greedy_lm_head_argmax_ns : 0;
+    const uint64_t lfm2_greedy_lm_head_argmax_ns = lfm2_summary ? req->lfm2_greedy_lm_head_argmax_ns : 0;
     const char* lfm2_greedy_lm_head_argmax_last_reject_reason =
         lfm2_summary ? lfm2_argmax_reject_reason_name(req->lfm2_greedy_lm_head_argmax_last_reject_reason) : "none";
     const uint64_t lfm2_shortconv_sequence_fast_used_ops =
@@ -2170,26 +2130,22 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << densecore::models::DecoderRuntimeTopologyName(execution_contract.decoder_runtime_topology)
         << " model_execution_contract_has_moe=" << (execution_contract.has_moe ? 1 : 0)
         << " model_execution_contract_has_hybrid_ssm=" << (execution_contract.has_hybrid_ssm_mixer ? 1 : 0)
-        << " model_execution_contract_has_lfm2_shortconv="
-        << (execution_contract.has_lfm2_shortconv_mixer ? 1 : 0)
+        << " model_execution_contract_has_lfm2_shortconv=" << (execution_contract.has_lfm2_shortconv_mixer ? 1 : 0)
         << " model_execution_contract_stateful_custom_ops=" << (execution_contract.has_stateful_custom_ops ? 1 : 0)
         << " model_execution_contract_fast_path_class="
         << densecore::models::ExecutionFastPathClassName(execution_contract.fast_path_class)
         << " model_execution_contract_requires_fallback_free_fast_path="
-        << (execution_contract.requires_fallback_free_fast_path ? 1 : 0)
-        << " model_execution_contract_requires_rebind="
+        << (execution_contract.requires_fallback_free_fast_path ? 1 : 0) << " model_execution_contract_requires_rebind="
         << (execution_contract.requires_decode_graph_runtime_rebind ? 1 : 0)
         << " model_execution_contract_decode_cache_static_safe="
         << (execution_contract.decode_graph_cache_static_safe ? 1 : 0)
         << " model_execution_contract_requires_native_moe_fast_path="
         << (execution_contract.requires_native_moe_fast_path ? 1 : 0)
-        << " model_execution_contract_native_moe_max_direct_tokens="
-        << execution_contract.native_moe_max_direct_tokens
+        << " model_execution_contract_native_moe_max_direct_tokens=" << execution_contract.native_moe_max_direct_tokens
         << " model_execution_contract_layer_count=" << execution_contract.layers.size()
         << " model_execution_contract_rebind_count=" << execution_contract.rebind_descriptors.size()
         << " model_execution_contract_rejections=" << execution_contract_rejections
-        << " model_execution_contract_required_fast_path_counters="
-        << execution_contract_required_fast_path_counters
+        << " model_execution_contract_required_fast_path_counters=" << execution_contract_required_fast_path_counters
         << " model_execution_contract_forbidden_fast_paths=" << execution_contract_forbidden_fast_paths
         << " graph_plan_route=" << TransformerGraphExecutionRouteSummaryName(graph_plan.route)
         << " graph_plan_family=" << densecore::models::GraphFamilyName(graph_plan.resolution.preferred_family)
@@ -2359,9 +2315,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " prefill_matmul_path_hist=" << prefill_matmul_path_hist
         << " prefill_matmul_top_shapes=" << prefill_matmul_top_shapes
         << " prefill_matmul_ggml_top_shapes=" << prefill_matmul_ggml_top_shapes
-        << " q6k_gemv_seen_ops=" << req->q6k_gemv_seen_ops
-        << " q6k_gemv_candidate_ops=" << req->q6k_gemv_candidate_ops << " q6k_gemv_used_ops=" << req->q6k_gemv_used_ops
-        << " q6k_gemv_rejected_ops=" << req->q6k_gemv_rejected_ops
+        << " q6k_gemv_seen_ops=" << req->q6k_gemv_seen_ops << " q6k_gemv_candidate_ops=" << req->q6k_gemv_candidate_ops
+        << " q6k_gemv_used_ops=" << req->q6k_gemv_used_ops << " q6k_gemv_rejected_ops=" << req->q6k_gemv_rejected_ops
         << " q6k_gemv_reject_quant_input_null_ops=" << req->q6k_gemv_reject_quant_input_null_ops
         << " q6k_gemv_reject_unsupported_quant_input_ops=" << req->q6k_gemv_reject_unsupported_quant_input_ops
         << " q6k_gemv_reject_shape_ops=" << req->q6k_gemv_reject_shape_ops
@@ -2374,8 +2329,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << (req->q6k_gemv_callback_phase.empty() ? "none" : req->q6k_gemv_callback_phase.c_str())
         << " q6k_gemv_weight_shapes=" << q6k_gemv_weight_shapes
         << " q6k_gemv_total_ms=" << ns_to_ms(req->q6k_gemv_total_ns)
-        << " q6k_gemv_effective_state=" << q6k_effective_state
-        << " qact_cache_hits=" << req->qact_cache_hits << " qact_cache_misses=" << req->qact_cache_misses
+        << " q6k_gemv_effective_state=" << q6k_effective_state << " qact_cache_hits=" << req->qact_cache_hits
+        << " qact_cache_misses=" << req->qact_cache_misses
         << " qact_cache_reused_bytes=" << req->qact_cache_reused_bytes
         << " q8_batched_weight_cache_ms=" << ns_to_ms(req->q8_batched_weight_cache_ns)
         << " q8_batched_activation_quant_ms=" << ns_to_ms(req->q8_batched_activation_quant_ns)
@@ -2542,8 +2497,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " lfm2_greedy_lm_head_argmax_candidate_ops=" << lfm2_greedy_lm_head_argmax_candidate_ops
         << " lfm2_greedy_lm_head_argmax_used_ops=" << lfm2_greedy_lm_head_argmax_used_ops
         << " lfm2_greedy_lm_head_argmax_rejected_ops=" << lfm2_greedy_lm_head_argmax_rejected_ops
-        << " lfm2_greedy_lm_head_argmax_last_reject_reason="
-        << lfm2_greedy_lm_head_argmax_last_reject_reason
+        << " lfm2_greedy_lm_head_argmax_last_reject_reason=" << lfm2_greedy_lm_head_argmax_last_reject_reason
         << " lfm2_greedy_lm_head_argmax_ms=" << ns_to_ms(lfm2_greedy_lm_head_argmax_ns)
         << " lfm2_shortconv_sequence_fast_used_ops=" << lfm2_shortconv_sequence_fast_used_ops
         << " lfm2_decode_graph_rebuilds=" << lfm2_decode_graph_rebuilds
@@ -2603,10 +2557,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model) 
         << " target_native_moe_fast_ops_ok=" << (target_fast_path_gate.native_moe_fast_ops_ok ? 1 : 0)
         << " target_gemma4_moe_fast_ops_ok=" << (target_fast_path_gate.gemma4_moe_fast_ops_ok ? 1 : 0)
         << " target_stateful_ops_ok=" << (target_fast_path_gate.stateful_ops_ok ? 1 : 0)
-        << " target_required_fast_path_counters_ok="
-        << (target_fast_path_gate.required_fast_path_counters_ok ? 1 : 0)
-        << " target_missing_required_fast_path_counters="
-        << target_fast_path_gate.missing_required_fast_path_counters
+        << " target_required_fast_path_counters_ok=" << (target_fast_path_gate.required_fast_path_counters_ok ? 1 : 0)
+        << " target_missing_required_fast_path_counters=" << target_fast_path_gate.missing_required_fast_path_counters
         << " qwen_fast_path_required=" << (target_fast_path_gate.required ? 1 : 0)
         << " qwen_fast_path_ok=" << (target_fast_path_gate.ok ? 1 : 0)
         << " qwen_fast_path_failure_reason=" << target_fast_path_gate.failure_reason

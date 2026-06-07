@@ -140,12 +140,12 @@ bool ModelExecutionContractRequiresFallbackFreeFastPath(const ModelExecutionCont
 bool ModelExecutionContractRequiresNativeMoEFastPath(const ModelExecutionContract& contract);
 int64_t ModelExecutionContractNativeMoEMaxDirectTokens(const ModelExecutionContract& contract);
 ModelTensorExecutionRequirement ResolveModelTensorExecutionRequirement(const TransformerModel* model,
-                                                                      const char* tensor_name, bool is_lm_head,
-                                                                      ggml_type raw_type);
+                                                                       const char* tensor_name, bool is_lm_head,
+                                                                       ggml_type raw_type);
 ModelTensorExecutionRequirement ResolveModelTensorExecutionRequirement(const TransformerModel* model,
-                                                                      const ggml_tensor* tensor,
-                                                                      const char* tensor_name, bool is_lm_head,
-                                                                      ggml_type raw_type);
+                                                                       const ggml_tensor* tensor,
+                                                                       const char* tensor_name, bool is_lm_head,
+                                                                       ggml_type raw_type);
 const ModelTensorExecutionRequirement* FindModelTensorExecutionRequirement(
     const ModelExecutionContract& contract, const char* tensor_name,
     densecore::runtime::DenseCoreMatmulPhase phase = densecore::runtime::DenseCoreMatmulPhase::Unknown);

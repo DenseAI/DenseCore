@@ -294,8 +294,7 @@ struct TransformerLayer {
         }
     }
 
-    void Set(const std::string& key, struct ggml_tensor* tensor,
-             densecore::runtime::DenseCoreTensorRole tensor_role) {
+    void Set(const std::string& key, struct ggml_tensor* tensor, densecore::runtime::DenseCoreTensorRole tensor_role) {
         Set(key, tensor);
         SetTensorRole(tensor, tensor_role);
     }

@@ -25,10 +25,6 @@ func deriveExactAnswerConstraint(_ domain.Engine, _ domain.ChatCompletionRequest
 	return nil
 }
 
-func extractExpectedExactAnswer(req domain.ChatCompletionRequest) string {
-	return ExtractExpectedExactAnswer(req)
-}
-
 func ExtractExpectedExactAnswer(req domain.ChatCompletionRequest) string {
 	if len(req.Messages) > 0 {
 		for i := len(req.Messages) - 1; i >= 0; i-- {

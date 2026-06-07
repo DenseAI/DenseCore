@@ -266,9 +266,8 @@ DENSECORE_API bool DotQ4KQ8K_Hwy(const void* q4_weight_row, const void* q8_input
  * This keeps LFM2 decode on a single DenseCore target dispatch per selected
  * expert row range instead of dispatching twice for every output row.
  */
-DENSECORE_API bool FusedSwiGLUQ4KQ8KRows_Hwy(const void* q4_gate_rows, const void* q4_up_rows,
-                                             const void* q8_input_row, int64_t cols, int64_t row_count,
-                                             size_t row_bytes, float* output);
+DENSECORE_API bool FusedSwiGLUQ4KQ8KRows_Hwy(const void* q4_gate_rows, const void* q4_up_rows, const void* q8_input_row,
+                                             int64_t cols, int64_t row_count, size_t row_bytes, float* output);
 
 /**
  * @brief Dot one GGML-compatible Q5_K weight row with one Q8_K activation row.

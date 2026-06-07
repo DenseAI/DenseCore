@@ -1597,11 +1597,13 @@ TEST(Qwen35SSMQkvProjection, Qwen36HybridSSMQ4KPrefillUsesDenseCoreInsteadOfRepa
     EXPECT_TRUE(ResultReferencesTensor(result, weight));
     EXPECT_FALSE(ResultReferencesTensor(result, repack_alias));
 
+    struct ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, result);
+    ggml_graph_compute_with_ctx(ctx, gf, 4);
+
     const auto snapshot = GetQwen36ProfileSnapshot(work_ctx);
     EXPECT_EQ(snapshot.qwen_target_ggml_compute_ops, 0u);
-    EXPECT_GT(snapshot.q8_batched_used_ops, 0u);
-    EXPECT_EQ(snapshot.q8_batched_true_gemm_ops, 0u);
-    EXPECT_GT(snapshot.q8_batched_gemv_ops, 0u);
+    EXPECT_EQ(snapshot.qwen36_prefill_q4k_batched_used, 1);
 }
 
 TEST(Qwen35SSMQkvProjection, Qwen35HybridSSMOutQ8PrefillUsesDenseCoreDirectPath) {

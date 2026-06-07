@@ -79,7 +79,7 @@ inline bool PreferGgmlKQuantVecDot() {
 //     case Verdict::kProbe: run_both_and_compare(); ParityGate::Report(...); break;
 //   }
 class ParityGate {
- public:
+public:
     enum class Verdict { kProbe, kAllow, kDeny };
 
     static uint64_t MakeKey(uint32_t op_id, const void* weight, int64_t n, int64_t k) {
@@ -107,9 +107,9 @@ class ParityGate {
             return Verdict::kProbe;
         }
         switch (it->second) {
-            case kStateAllow: return Verdict::kAllow;
-            case kStateDeny: return Verdict::kDeny;
-            default: return Verdict::kDeny;  // probe in flight elsewhere
+        case kStateAllow: return Verdict::kAllow;
+        case kStateDeny: return Verdict::kDeny;
+        default: return Verdict::kDeny;  // probe in flight elsewhere
         }
     }
 
@@ -129,7 +129,7 @@ class ParityGate {
         s.map.clear();
     }
 
- private:
+private:
     enum : int { kStateProbing = 0, kStateAllow = 1, kStateDeny = 2 };
     struct Shared {
         std::mutex mu;

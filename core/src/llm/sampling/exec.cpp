@@ -562,10 +562,10 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
     }
 
     const bool trace_enabled = ShouldCaptureSamplingDebugTrace(params);
-    const bool greedy_repetition_only =
-        params.temperature <= 0.0f && params.grammar == nullptr && has_history && params.repetition_penalty != 1.0f &&
-        params.frequency_penalty == 0.0f && params.presence_penalty == 0.0f && params.final_logit_softcap <= 0.0f &&
-        debug_top_n <= 0 && !trace_enabled;
+    const bool greedy_repetition_only = params.temperature <= 0.0f && params.grammar == nullptr && has_history &&
+                                        params.repetition_penalty != 1.0f && params.frequency_penalty == 0.0f &&
+                                        params.presence_penalty == 0.0f && params.final_logit_softcap <= 0.0f &&
+                                        debug_top_n <= 0 && !trace_enabled;
     if (greedy_repetition_only) {
         thread_local std::vector<int> repeated_tokens;
         repeated_tokens.clear();

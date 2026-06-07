@@ -37,13 +37,12 @@
 #include "densecore/backend/apple/apple_silicon.h"
 #include "densecore/models/decoder_model_spec.h"
 #include "densecore/models/qwen35_ssm_math.h"
-#include "densecore/runtime/ggml_compute_policy.h"
 #include "densecore/runtime/dtype_utils.h"
+#include "densecore/runtime/ggml_compute_policy.h"
 #include "models/gemma4_packed_expert_layout.h"
 #include "models/model_inference_policy.h"
 
-int ggml_repack_q5_K_8x8(const void* data, size_t data_size, int64_t rows, int64_t cols, void* dst,
-                         size_t dst_size);
+int ggml_repack_q5_K_8x8(const void* data, size_t data_size, int64_t rows, int64_t cols, void* dst, size_t dst_size);
 
 namespace {
 constexpr const char* kGemma4RouterScaleKey = "gemma4.router.scale";
@@ -405,8 +404,7 @@ TransformerModel::CpuRepackAliasLayout InferCpuRepackAliasLayout(const ggml_tens
         if (ggml_cpu_has_avx2() && alias->ne[1] % 8 == 0) {
             return TransformerModel::CpuRepackAliasLayout::Q4K8x8Q8K;
         }
-        if ((ggml_cpu_has_neon() && (ggml_cpu_has_matmul_int8() || ggml_cpu_has_dotprod())) &&
-            alias->ne[1] % 8 == 0) {
+        if ((ggml_cpu_has_neon() && (ggml_cpu_has_matmul_int8() || ggml_cpu_has_dotprod())) && alias->ne[1] % 8 == 0) {
             return TransformerModel::CpuRepackAliasLayout::Q4K8x4Q8K;
         }
     }
@@ -414,17 +412,16 @@ TransformerModel::CpuRepackAliasLayout InferCpuRepackAliasLayout(const ggml_tens
         if (ggml_cpu_has_avx2() && alias->ne[1] % 8 == 0) {
             return TransformerModel::CpuRepackAliasLayout::Q5K8x8Q8K;
         }
-        if ((ggml_cpu_has_neon() && (ggml_cpu_has_matmul_int8() || ggml_cpu_has_dotprod())) &&
-            alias->ne[1] % 8 == 0) {
+        if ((ggml_cpu_has_neon() && (ggml_cpu_has_matmul_int8() || ggml_cpu_has_dotprod())) && alias->ne[1] % 8 == 0) {
             return TransformerModel::CpuRepackAliasLayout::Q5K8x4Q8K;
         }
     }
     return TransformerModel::CpuRepackAliasLayout::Unknown;
 }
 
-void RegisterCpuRepackAlias(TransformerModel* model, ggml_tensor* source, ggml_tensor* alias,
-                            TransformerModel::CpuRepackAliasLayout layout =
-                                TransformerModel::CpuRepackAliasLayout::Unknown) {
+void RegisterCpuRepackAlias(
+    TransformerModel* model, ggml_tensor* source, ggml_tensor* alias,
+    TransformerModel::CpuRepackAliasLayout layout = TransformerModel::CpuRepackAliasLayout::Unknown) {
     if (!model || !source || !alias) {
         return;
     }
@@ -652,8 +649,8 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         size_t prepared = 0;
         size_t bytes = 0;
         for (auto& layer : model->layers) {
-            ggml_tensor* gate = layer.Get("ffn_gate_exps.weight") ? layer.Get("ffn_gate_exps.weight")
-                                                                  : layer.Get("ffn_gate_exps");
+            ggml_tensor* gate =
+                layer.Get("ffn_gate_exps.weight") ? layer.Get("ffn_gate_exps.weight") : layer.Get("ffn_gate_exps");
             ggml_tensor* up =
                 layer.Get("ffn_up_exps.weight") ? layer.Get("ffn_up_exps.weight") : layer.Get("ffn_up_exps");
             for (ggml_tensor* tensor : {gate, up}) {
@@ -3065,8 +3062,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 std::string type = layer_types[i];
                 std::transform(type.begin(), type.end(), type.begin(),
                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                const bool is_full_attn =
-                    (type == "full_attention" || type == "attention" || type == "self_attention");
+                const bool is_full_attn = (type == "full_attention" || type == "attention" || type == "self_attention");
                 const bool is_conv = (type == "conv" || type == "shortconv" || type == "short_conv");
                 if (!is_full_attn && !is_conv) {
                     return fail_lfm2("unknown layer_types entry '" + layer_types[i] + "'");
@@ -4439,8 +4435,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             for (int ch = 0; ch < channels; ++ch) {
                 for (int k = 0; k < kernel; ++k) {
                     // raw is row-major over (ne[1], ne[0]); index accordingly for each layout.
-                    const float v = kxc ? raw[static_cast<size_t>(ch) * kernel + k]
-                                        : raw[static_cast<size_t>(k) * channels + ch];
+                    const float v =
+                        kxc ? raw[static_cast<size_t>(ch) * kernel + k] : raw[static_cast<size_t>(k) * channels + ch];
                     out[static_cast<size_t>(ch) * kernel + k] = v;
                 }
             }

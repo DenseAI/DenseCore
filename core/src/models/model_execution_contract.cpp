@@ -34,8 +34,8 @@ ExecutionMoEExpertLayoutKind ResolveMoEExpertLayout(const TransformerLayer& laye
     }
 
     const bool has_gemma4_down_scale = HasAnyExpertTensor(layer, model_keys::kGemma4PackedDownScale);
-    const bool has_packed_gate_up = HasAnyTensor(layer, {"ffn_gate_up_exps.weight", "ffn_gate_up_exps",
-                                                        "experts.gate_up_proj.weight"});
+    const bool has_packed_gate_up =
+        HasAnyTensor(layer, {"ffn_gate_up_exps.weight", "ffn_gate_up_exps", "experts.gate_up_proj.weight"});
     const bool has_packed_down =
         HasAnyTensor(layer, {"ffn_down_exps.weight", "ffn_down_exps", "experts.down_proj.weight"});
     if (has_packed_gate_up && has_packed_down && has_gemma4_down_scale) {
@@ -153,8 +153,8 @@ bool IsFallbackFreeTargetModel(const TransformerModel* model) {
         model->variant == ModelVariant::GEMMA4 || model->variant == ModelVariant::LFM2MOE) {
         return true;
     }
-    if ((model->arch == ModelArch::QWEN35 && model->arch_flags.is_hybrid_ssm) ||
-        model->arch_flags.is_gemma4 || model->arch_flags.is_lfm2_shortconv) {
+    if ((model->arch == ModelArch::QWEN35 && model->arch_flags.is_hybrid_ssm) || model->arch_flags.is_gemma4 ||
+        model->arch_flags.is_lfm2_shortconv) {
         return true;
     }
     return false;
@@ -214,10 +214,9 @@ void FinalizeTensorRequirement(const TransformerModel* model, ModelTensorExecuti
         requirement->semantic_op == densecore::runtime::DenseCoreSemanticOp::MoeExpertDispatch ||
         requirement->semantic_op == densecore::runtime::DenseCoreSemanticOp::Lfm2ShortConvMixer ||
         requirement->semantic_op == densecore::runtime::DenseCoreSemanticOp::LmHead;
-    requirement->fallback_policy =
-        IsFallbackFreeTargetModel(model) && role_has_maintained_target_contract
-            ? densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget
-            : densecore::runtime::DenseCoreFallbackPolicyKind::CompatibilityFallback;
+    requirement->fallback_policy = IsFallbackFreeTargetModel(model) && role_has_maintained_target_contract
+                                       ? densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget
+                                       : densecore::runtime::DenseCoreFallbackPolicyKind::CompatibilityFallback;
 }
 
 ModelTensorExecutionRequirement MakeTensorRequirement(const TransformerModel* model, int layer_index,
@@ -227,8 +226,7 @@ ModelTensorExecutionRequirement MakeTensorRequirement(const TransformerModel* mo
     requirement.layer_index = layer_index;
     requirement.tensor_key = tensor_key;
     const auto loader_role = FindLoaderTensorRole(model, tensor);
-    requirement.tensor_role =
-        loader_role != densecore::runtime::DenseCoreTensorRole::Unknown ? loader_role : role;
+    requirement.tensor_role = loader_role != densecore::runtime::DenseCoreTensorRole::Unknown ? loader_role : role;
     requirement.semantic_op = densecore::runtime::ResolveDenseCoreSemanticOp(model, requirement.tensor_role);
     requirement.raw_gguf_type = tensor ? tensor->type : GGML_TYPE_COUNT;
     requirement.canonical_layout = ResolveCanonicalLayout(model, tensor, requirement.tensor_role);
@@ -252,7 +250,8 @@ void AddTensorRequirement(ModelExecutionContract* contract, ModelExecutionLayerC
     if (!contract || !layer || !tensor_key) {
         return;
     }
-    const ggml_tensor* tensor = explicit_tensor ? explicit_tensor : (transformer_layer ? transformer_layer->Get(tensor_key) : nullptr);
+    const ggml_tensor* tensor =
+        explicit_tensor ? explicit_tensor : (transformer_layer ? transformer_layer->Get(tensor_key) : nullptr);
     ModelTensorExecutionRequirement requirement =
         MakeTensorRequirement(model, layer->layer_index, tensor_key, tensor, role);
     layer->tensor_requirements.push_back(requirement);
@@ -277,11 +276,10 @@ ExecutionFastPathClass ResolveFastPathClass(const TransformerModel* model, const
         return ExecutionFastPathClass::None;
     }
     if (IsQwenHybridSSMContract(contract)) {
-        return contract.has_moe ? ExecutionFastPathClass::QwenHybridSSMMoE
-                                : ExecutionFastPathClass::QwenHybridSSMDense;
+        return contract.has_moe ? ExecutionFastPathClass::QwenHybridSSMMoE : ExecutionFastPathClass::QwenHybridSSMDense;
     }
-    if ((contract.variant == ModelVariant::QWEN35 || contract.variant == ModelVariant::QWEN36) &&
-        !contract.has_moe && !contract.has_hybrid_ssm_mixer) {
+    if ((contract.variant == ModelVariant::QWEN35 || contract.variant == ModelVariant::QWEN36) && !contract.has_moe &&
+        !contract.has_hybrid_ssm_mixer) {
         return ExecutionFastPathClass::QwenDense;
     }
     if (IsGemma4MoEContract(contract)) {
@@ -332,16 +330,17 @@ ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model
             synthetic_stateful_model ? model->arch_flags.is_lfm2_shortconv : model->IsLFM2ConvLayer(layer_idx);
         layer.has_hybrid_ssm_mixer =
             !layer.has_lfm2_shortconv_mixer &&
-            (synthetic_stateful_model ? model->arch_flags.is_hybrid_ssm
-                                      : (model->IsHybridSSMLayer(layer_idx) ||
-                                         (layer_spec && layer_spec->attention.has_hybrid_ssm_mixer)));
+            (synthetic_stateful_model
+                 ? model->arch_flags.is_hybrid_ssm
+                 : (model->IsHybridSSMLayer(layer_idx) || (layer_spec && layer_spec->attention.has_hybrid_ssm_mixer)));
         layer.has_moe = (transformer_layer && transformer_layer->is_moe) || (layer_spec && layer_spec->ffn.is_moe);
 
         if (layer.has_hybrid_ssm_mixer) {
             layer.ssm_ordinal = ssm_ordinal++;
             layer.runtime_state_shape = HybridSSMRuntimeStateShape(model);
             if (layer.ssm_ordinal >= 0 && layer.ssm_ordinal < static_cast<int>(model->ssm_layer_states.size())) {
-                layer.ssm_norm_layout = model->ssm_layer_states[static_cast<std::size_t>(layer.ssm_ordinal)].norm_layout;
+                layer.ssm_norm_layout =
+                    model->ssm_layer_states[static_cast<std::size_t>(layer.ssm_ordinal)].norm_layout;
             }
             AddRebindDescriptor(&contract, &layer, ExecutionCustomOpRebindKind::HybridSSMConv1D,
                                 ExecutionRuntimeStateKind::HybridSSM, layer.ssm_ordinal);
@@ -371,12 +370,11 @@ ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model
         if (layer.has_moe) {
             layer.moe_router = layer_spec ? layer_spec->ffn.router : DecoderMoERouter::None;
             layer.moe_top_k = layer_spec ? layer_spec->ffn.top_k : static_cast<int>(model->hparams.n_experts_used);
-            layer.moe_num_experts =
-                layer_spec ? layer_spec->ffn.num_experts
-                           : static_cast<int>(transformer_layer ? transformer_layer->NumExperts() : 0);
-            layer.moe_expert_layout =
-                transformer_layer ? ResolveMoEExpertLayout(*transformer_layer, layer_spec)
-                                  : ExecutionMoEExpertLayoutKind::Unknown;
+            layer.moe_num_experts = layer_spec
+                                        ? layer_spec->ffn.num_experts
+                                        : static_cast<int>(transformer_layer ? transformer_layer->NumExperts() : 0);
+            layer.moe_expert_layout = transformer_layer ? ResolveMoEExpertLayout(*transformer_layer, layer_spec)
+                                                        : ExecutionMoEExpertLayoutKind::Unknown;
             layer.has_packed_moe_sidecar =
                 (layer_spec && layer_spec->ffn.has_down_scale_sidecar) ||
                 (transformer_layer && HasAnyExpertTensor(*transformer_layer, model_keys::kGemma4PackedDownScale));
@@ -402,9 +400,8 @@ ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model
     contract.has_stateful_custom_ops = contract.has_hybrid_ssm_mixer || contract.has_lfm2_shortconv_mixer;
     contract.fast_path_class = ResolveFastPathClass(model, contract);
     contract.requires_fallback_free_fast_path = contract.fast_path_class != ExecutionFastPathClass::None;
-    contract.requires_native_moe_fast_path =
-        contract.fast_path_class == ExecutionFastPathClass::QwenHybridSSMMoE ||
-        contract.fast_path_class == ExecutionFastPathClass::LFM2ShortConvMoE;
+    contract.requires_native_moe_fast_path = contract.fast_path_class == ExecutionFastPathClass::QwenHybridSSMMoE ||
+                                             contract.fast_path_class == ExecutionFastPathClass::LFM2ShortConvMoE;
     if (contract.requires_fallback_free_fast_path) {
         AddRequiredFastPathCounter(&contract, "target_no_ggml_path");
     }
@@ -471,15 +468,15 @@ int64_t ModelExecutionContractNativeMoEMaxDirectTokens(const ModelExecutionContr
 }
 
 ModelTensorExecutionRequirement ResolveModelTensorExecutionRequirement(const TransformerModel* model,
-                                                                      const char* tensor_name, bool is_lm_head,
-                                                                      ggml_type raw_type) {
+                                                                       const char* tensor_name, bool is_lm_head,
+                                                                       ggml_type raw_type) {
     return ResolveModelTensorExecutionRequirement(model, nullptr, tensor_name, is_lm_head, raw_type);
 }
 
 ModelTensorExecutionRequirement ResolveModelTensorExecutionRequirement(const TransformerModel* model,
-                                                                      const ggml_tensor* tensor,
-                                                                      const char* tensor_name, bool is_lm_head,
-                                                                      ggml_type raw_type) {
+                                                                       const ggml_tensor* tensor,
+                                                                       const char* tensor_name, bool is_lm_head,
+                                                                       ggml_type raw_type) {
     const auto loader_role = FindLoaderTensorRole(model, tensor);
     const auto role = loader_role != densecore::runtime::DenseCoreTensorRole::Unknown
                           ? loader_role
@@ -496,8 +493,9 @@ ModelTensorExecutionRequirement ResolveModelTensorExecutionRequirement(const Tra
     return requirement;
 }
 
-const ModelTensorExecutionRequirement* FindModelTensorExecutionRequirement(
-    const ModelExecutionContract& contract, const char* tensor_name, densecore::runtime::DenseCoreMatmulPhase phase) {
+const ModelTensorExecutionRequirement*
+FindModelTensorExecutionRequirement(const ModelExecutionContract& contract, const char* tensor_name,
+                                    densecore::runtime::DenseCoreMatmulPhase phase) {
     for (const auto& requirement : contract.tensor_requirements) {
         if (!TensorNameMatchesKey(tensor_name, requirement.tensor_key)) {
             continue;
@@ -584,13 +582,11 @@ std::string FormatModelExecutionContract(const ModelExecutionContract& contract)
     std::ostringstream oss;
     oss << "ModelExecutionContract{variant=" << static_cast<int>(contract.variant)
         << ",topology=" << DecoderRuntimeTopologyName(contract.decoder_runtime_topology)
-        << ",valid=" << (contract.valid ? "true" : "false")
-        << ",has_moe=" << (contract.has_moe ? "true" : "false")
+        << ",valid=" << (contract.valid ? "true" : "false") << ",has_moe=" << (contract.has_moe ? "true" : "false")
         << ",has_hybrid_ssm=" << (contract.has_hybrid_ssm_mixer ? "true" : "false")
         << ",has_lfm2_shortconv=" << (contract.has_lfm2_shortconv_mixer ? "true" : "false")
         << ",fast_path_class=" << ExecutionFastPathClassName(contract.fast_path_class)
-        << ",requires_fallback_free_fast_path="
-        << (contract.requires_fallback_free_fast_path ? "true" : "false")
+        << ",requires_fallback_free_fast_path=" << (contract.requires_fallback_free_fast_path ? "true" : "false")
         << ",requires_native_moe_fast_path=" << (contract.requires_native_moe_fast_path ? "true" : "false")
         << ",native_moe_max_direct_tokens=" << contract.native_moe_max_direct_tokens
         << ",decode_cache_static_safe=" << (contract.decode_graph_cache_static_safe ? "true" : "false")
@@ -602,16 +598,14 @@ std::string FormatModelExecutionContract(const ModelExecutionContract& contract)
         }
         oss << contract.required_fast_path_counters[i];
     }
-    oss << "]"
-        << ",forbidden_fast_paths=[";
+    oss << "]" << ",forbidden_fast_paths=[";
     for (std::size_t i = 0; i < contract.forbidden_fast_path_reasons.size(); ++i) {
         if (i != 0) {
             oss << ",";
         }
         oss << contract.forbidden_fast_path_reasons[i];
     }
-    oss << "]"
-        << ",layers=[";
+    oss << "]" << ",layers=[";
     for (std::size_t i = 0; i < contract.layers.size(); ++i) {
         const auto& layer = contract.layers[i];
         if (i != 0) {

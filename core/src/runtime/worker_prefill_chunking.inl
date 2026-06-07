@@ -34,7 +34,7 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
 #endif
     const int base_chunk_tokens =
         qwen35_dense ? 768 : ((qwen35_moe || qwen_hybrid_ssm) ? hybrid_ssm_chunk_tokens : 192);
-    const int base_auto_min_tokens = qwen35_dense ? 1024 : ((qwen35_moe || qwen_hybrid_ssm) ? 128 : 1536);
+    const int base_auto_min_tokens = qwen35_dense ? 1024 : ((qwen35_moe || qwen_hybrid_ssm) ? 1280 : 1536);
     const char* chunk_env = "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS";
     const char* default_env = "DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS";
     const char* auto_min_env = "DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS";

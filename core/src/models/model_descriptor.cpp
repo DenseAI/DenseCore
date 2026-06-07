@@ -277,7 +277,8 @@ ResolvedModelDescriptor ResolveModelDescriptorFromArchName(std::string_view arch
                                                             "qwen3.5_moe", "qwen3_5_moe", "qwen3_5_moe_text"})) {
         return make_result(DescribeModelVariant(ModelVariant::QWEN35));
     }
-    if (MatchesAny(lowered, std::array<std::string_view, 6>{"lfm2moe", "lfm2_moe", "lfm2.5", "lfm2_5", "lfm25", "lfm2"})) {
+    if (MatchesAny(lowered,
+                   std::array<std::string_view, 6>{"lfm2moe", "lfm2_moe", "lfm2.5", "lfm2_5", "lfm25", "lfm2"})) {
         return make_result(DescribeModelVariant(ModelVariant::LFM2MOE));
     }
     if (MatchesAny(lowered, std::array<std::string_view, 5>{"glm4_moe", "glm4moe", "glm4.5", "glm-4.5", "glm4"})) {
@@ -466,10 +467,32 @@ PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model) 
 bool IsKnownTokenizerModel(std::string_view tokenizer_name) {
     const std::string lowered = AsciiLower(tokenizer_name);
     static constexpr std::array<std::string_view, 26> kKnown = {
-        "llama",   "gpt2",      "qwen2",      "qwen2.5", "qwen3",       "qwen3next",        "qwen35",
-        "qwen3.5", "qwen35moe", "qwen36",     "qwen3.6", "qwen3_5_moe", "qwen3_5_moe_text", "mistral",
-        "gemma",   "gemma4",    "lfm2",       "bpe",     "glm4",        "glm",              "sentencepiece",
-        "spm",     "bert",      "bert-bpe",   "jina-v2-en", "t5",
+        "llama",
+        "gpt2",
+        "qwen2",
+        "qwen2.5",
+        "qwen3",
+        "qwen3next",
+        "qwen35",
+        "qwen3.5",
+        "qwen35moe",
+        "qwen36",
+        "qwen3.6",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+        "mistral",
+        "gemma",
+        "gemma4",
+        "lfm2",
+        "bpe",
+        "glm4",
+        "glm",
+        "sentencepiece",
+        "spm",
+        "bert",
+        "bert-bpe",
+        "jina-v2-en",
+        "t5",
     };
     return MatchesAny(lowered, kKnown);
 }

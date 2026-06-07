@@ -561,10 +561,10 @@ void SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(InferenceWorkContext*
                                                            const std::vector<int>* token_history);
 void WriteInferenceWorkContextLFM2GreedyLMHeadSparseLogits(InferenceWorkContext* ctx, float* output, int vocab_size,
                                                            int token, float value);
-void RecordInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(InferenceWorkContext* ctx, uint64_t generation,
-                                                           int token, float value, int vocab_size);
-bool TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(const InferenceWorkContext* ctx, int vocab_size,
-                                                           int* token, float* value);
+void RecordInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(InferenceWorkContext* ctx, uint64_t generation, int token,
+                                                           float value, int vocab_size);
+bool TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(const InferenceWorkContext* ctx, int vocab_size, int* token,
+                                                           float* value);
 void SetCurrentExecutionPhase(InferenceExecutionPhase phase);
 InferenceExecutionPhase GetCurrentExecutionPhase();
 const BatchSpec* GetCurrentBatch();

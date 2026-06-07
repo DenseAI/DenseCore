@@ -298,7 +298,8 @@ GraphFamilyResolution ResolveGraphFamily(const TransformerModel* model) {
     }
 
     const DecoderRuntimeTopology decoder_topology =
-        capabilities.has_lfm2_shortconv_mixer || capabilities.decoder_runtime_topology == DecoderRuntimeTopology::Unknown
+        capabilities.has_lfm2_shortconv_mixer ||
+                capabilities.decoder_runtime_topology == DecoderRuntimeTopology::Unknown
             ? InferDecoderRuntimeTopologyFromCapabilities(capabilities)
             : capabilities.decoder_runtime_topology;
     switch (decoder_topology) {
@@ -454,11 +455,9 @@ std::string FormatModelGraphCapabilities(const ModelGraphCapabilities& capabilit
         << ", shared_dense_ffn=" << (capabilities.requires_shared_dense_ffn ? "true" : "false")
         << ", moe_down_scale_sidecar=" << (capabilities.requires_moe_down_scale_sidecar ? "true" : "false")
         << ", ffn_post_norms=" << (capabilities.requires_ffn_post_norms ? "true" : "false")
-        << ", fallback_free_fast_path="
-        << (capabilities.requires_fallback_free_fast_path ? "true" : "false")
+        << ", fallback_free_fast_path=" << (capabilities.requires_fallback_free_fast_path ? "true" : "false")
         << ", native_moe_fast_path=" << (capabilities.requires_native_moe_fast_path ? "true" : "false")
-        << ", decode_graph_runtime_rebind="
-        << (capabilities.requires_decode_graph_runtime_rebind ? "true" : "false")
+        << ", decode_graph_runtime_rebind=" << (capabilities.requires_decode_graph_runtime_rebind ? "true" : "false")
         << ", native_moe_max_direct_tokens=" << capabilities.native_moe_max_direct_tokens
         << ", moe_routers=" << JoinNames(capabilities.required_moe_routers, DecoderMoERouterName)
         << ", ffn_activations=" << JoinNames(capabilities.required_ffn_activations, DecoderActivationName)

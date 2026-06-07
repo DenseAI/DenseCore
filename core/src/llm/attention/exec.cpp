@@ -174,14 +174,11 @@ struct ggml_tensor* ggml_flash_attention_hal(struct ggml_context* ctx, struct gg
                                              HalAttentionTensorLayout layout = HalAttentionTensorLayout::HeadSeq,
                                              int q_start_offset = 0, int kv_start_offset = 0);
 
-struct ggml_tensor* ExecutePagedDecodeAttentionPath(struct ggml_context* ctx_c, TransformerModel* model,
-                                                    PagedKVCache* cache, struct ggml_tensor* Qcur,
-                                                    struct ggml_tensor* Kcur, struct ggml_tensor* Vcur, int il,
-                                                    int kv_cache_layer, bool gemma4_shared_kv_layer,
-                                                    bool gemma4_shared_kv_source_layer, int head_dim_q, int head_dim_v,
-                                                    int n_head, int n_head_kv, int n_total_tokens,
-                                                    int fast_attn_sliding_window, float fast_attn_logit_softcap,
-                                                    bool use_explicit_attention_scale) {
+struct ggml_tensor* ExecutePagedDecodeAttentionPath(
+    struct ggml_context* ctx_c, TransformerModel* model, PagedKVCache* cache, struct ggml_tensor* Qcur,
+    struct ggml_tensor* Kcur, struct ggml_tensor* Vcur, int il, int kv_cache_layer, bool gemma4_shared_kv_layer,
+    bool gemma4_shared_kv_source_layer, int head_dim_q, int head_dim_v, int n_head, int n_head_kv, int n_total_tokens,
+    int fast_attn_sliding_window, float fast_attn_logit_softcap, bool use_explicit_attention_scale) {
     (void)n_total_tokens;
     struct ggml_tensor* Q_decode = ggml_is_contiguous(Qcur) ? Qcur : ggml_cont(ctx_c, Qcur);
     struct ggml_tensor* K_decode = ggml_is_contiguous(Kcur) ? Kcur : ggml_cont(ctx_c, Kcur);

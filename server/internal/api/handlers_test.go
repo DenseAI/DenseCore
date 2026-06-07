@@ -16,6 +16,8 @@ import (
 	"time"
 )
 
+const testVerificationKey = "cedar-owl-742"
+
 // MockEngine implements a simple mock inference engine for testing
 type MockEngine struct {
 	generateStreamFunc func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error
@@ -755,7 +757,7 @@ func TestLFM2StreamFilterExtractsGeneratedFinalResponseSpan(t *testing.T) {
 	if got := filter.Filter("The user is asking for the \"final response: cedar-owl-"); got != "" {
 		t.Fatalf("expected partial generated answer to be held, got %q", got)
 	}
-	if got := filter.Filter("742\". The user is asking again."); got != "cedar-owl-742" {
+	if got := filter.Filter("742\". The user is asking again."); got != testVerificationKey {
 		t.Fatalf("expected generated answer span, got %q", got)
 	}
 	if got := filter.Filter(" trailing text"); got != "" {
@@ -768,7 +770,7 @@ func TestLFM2StreamFilterHoldsWeHavePreludeUntilGeneratedFinalResponse(t *testin
 	if got := filter.Filter("We have a user who has been interacting with a system. "); got != "" {
 		t.Fatalf("expected meta prelude to be held, got %q", got)
 	}
-	if got := filter.Filter("The user says \"Final response: cedar-owl-742\"."); got != "cedar-owl-742" {
+	if got := filter.Filter("The user says \"Final response: " + testVerificationKey + "\"."); got != testVerificationKey {
 		t.Fatalf("expected generated final response span, got %q", got)
 	}
 	if got := filter.Filter(" The user wants the verification key."); got != "" {
@@ -791,7 +793,7 @@ func TestSplitReasoningResponseLFM2CanonicalizesGeneratedExactAnswer(t *testing.
 	req := domain.ChatCompletionRequest{
 		Messages: []domain.Message{{
 			Role:    "user",
-			Content: "Final question: What is the verification key?\nFinal response: cedar-owl-742",
+			Content: "Final question: What is the verification key?\nFinal response: " + testVerificationKey,
 		}},
 	}
 	content, reasoning := splitReasoningResponse(
@@ -799,7 +801,7 @@ func TestSplitReasoningResponseLFM2CanonicalizesGeneratedExactAnswer(t *testing.
 		"lfm2",
 		"<think>\nThe verification key is cedar owl 742, so I should provide it.",
 	)
-	if content != "cedar-owl-742" || reasoning != "" {
+	if content != testVerificationKey || reasoning != "" {
 		t.Fatalf("expected generated exact answer to be canonicalized, got content=%q reasoning=%q", content, reasoning)
 	}
 }
@@ -808,7 +810,7 @@ func TestSplitReasoningResponseLFM2DoesNotSynthesizeMissingExactAnswer(t *testin
 	req := domain.ChatCompletionRequest{
 		Messages: []domain.Message{{
 			Role:    "user",
-			Content: "Final question: What is the verification key?\nFinal response: cedar-owl-742",
+			Content: "Final question: What is the verification key?\nFinal response: " + testVerificationKey,
 		}},
 	}
 	content, reasoning := splitReasoningResponse(req, "lfm2", "<think>\nStill working through the prompt.")
@@ -853,11 +855,11 @@ func TestLFM2StreamFilterEmitsAfterThinkBlock(t *testing.T) {
 }
 
 func TestLFM2StreamFilterPromotesExactAnswerAndSuppressesRest(t *testing.T) {
-	filter := newLFM2StreamFilter("cedar-owl-742")
+	filter := newLFM2StreamFilter(testVerificationKey)
 	if got := filter.Filter("Wait - the requested verification key is "); got != "Wait - the requested verification key is " {
 		t.Fatalf("expected generated pre-answer text to pass, got %q", got)
 	}
-	if got := filter.Filter("cedar-owl-742. Extra text"); got != "cedar-owl-742" {
+	if got := filter.Filter(testVerificationKey + ". Extra text"); got != testVerificationKey {
 		t.Fatalf("expected exact answer to be emitted once, got %q", got)
 	}
 	if got := filter.Filter(" more reasoning"); got != "" {
@@ -866,15 +868,15 @@ func TestLFM2StreamFilterPromotesExactAnswerAndSuppressesRest(t *testing.T) {
 }
 
 func TestLFM2StreamFilterExtractsGeneratedExactAnswerWithoutSynthesis(t *testing.T) {
-	filter := newLFM2StreamFilter("cedar-owl-742")
-	if got := filter.Filter("The user is asking for the final response: cedar-owl-742. Extra text"); got != "cedar-owl-742" {
+	filter := newLFM2StreamFilter(testVerificationKey)
+	if got := filter.Filter("The user is asking for the final response: " + testVerificationKey + ". Extra text"); got != testVerificationKey {
 		t.Fatalf("expected generated exact answer to be emitted, got %q", got)
 	}
 }
 
 func TestLFM2StreamFilterCanonicalizesGeneratedSpacedExactAnswer(t *testing.T) {
-	filter := newLFM2StreamFilter("cedar-owl-742")
-	if got := filter.Filter(`The user says "Final response: cedar owl 742".`); got != "cedar-owl-742" {
+	filter := newLFM2StreamFilter(testVerificationKey)
+	if got := filter.Filter(`The user says "Final response: cedar owl 742".`); got != testVerificationKey {
 		t.Fatalf("expected generated normalized exact answer to be emitted, got %q", got)
 	}
 }
@@ -891,7 +893,7 @@ func TestLFM2StreamFilterBypassRequiresDebugEnv(t *testing.T) {
 
 func TestLFM2StreamFilterIgnoresLegacyFinalExactAnswerOptIn(t *testing.T) {
 	t.Setenv("DENSECORE_ENABLE_LFM2_FINAL_EXACT_ANSWER_FALLBACK", "1")
-	filter := newLFM2StreamFilter("cedar-owl-742")
+	filter := newLFM2StreamFilter(testVerificationKey)
 	if got := filter.Filter("unhelpful model output"); got != "unhelpful model output" {
 		t.Fatalf("expected generated text to pass without exact-answer fallback, got %q", got)
 	}
@@ -1004,7 +1006,7 @@ func TestChatCompletionHandler_StreamLFM2LongExactAnswerPromptDoesNotSuppressGen
 	req := makeRequest("POST", "/v1/chat/completions", domain.ChatCompletionRequest{
 		Model: "densecore-v1",
 		Messages: []domain.Message{
-			{Role: "user", Content: "Reference section C: The verification key is cedar-owl-742.\nFinal question: What is the verification key?\nFinal response: cedar-owl-742"},
+			{Role: "user", Content: "Reference section C: The verification key is " + testVerificationKey + ".\nFinal question: What is the verification key?\nFinal response: " + testVerificationKey},
 		},
 		MaxTokens: 256,
 		Stream:    true,
@@ -1021,7 +1023,7 @@ func TestChatCompletionHandler_StreamLFM2LongExactAnswerPromptDoesNotSuppressGen
 		!strings.Contains(body, `"content":"a detailed answer about memory locality."`) {
 		t.Fatalf("LFM2 long exact-answer stream should expose generated tokens: %q", body)
 	}
-	if strings.Contains(body, `"content":"cedar-owl-742"`) {
+	if strings.Contains(body, `"content":"`+testVerificationKey+`"`) {
 		t.Fatalf("LFM2 long stream must not synthesize exact answers: %q", body)
 	}
 }

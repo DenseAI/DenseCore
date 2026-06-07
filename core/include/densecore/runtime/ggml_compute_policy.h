@@ -209,8 +209,8 @@ inline bool IsQwenTargetVariant(ModelVariant variant) {
 }
 
 inline bool IsDenseCoreFallbackFreeTargetVariant(ModelVariant variant) {
-    return variant == ModelVariant::QWEN35 || variant == ModelVariant::QWEN36 ||
-           variant == ModelVariant::GEMMA4 || variant == ModelVariant::LFM2MOE;
+    return variant == ModelVariant::QWEN35 || variant == ModelVariant::QWEN36 || variant == ModelVariant::GEMMA4 ||
+           variant == ModelVariant::LFM2MOE;
 }
 
 inline QwenHotPathPlan ResolveQwenHotPathPlan(const TransformerModel* model) {
@@ -232,8 +232,8 @@ inline TargetFastPathPlan ResolveTargetFastPathPlan(const TransformerModel* mode
         return plan;
     }
     plan.variant = model->variant;
-    plan.qwen_target = IsQwenTargetVariant(model->variant) ||
-                       (model->arch == ModelArch::QWEN35 && model->arch_flags.is_hybrid_ssm);
+    plan.qwen_target =
+        IsQwenTargetVariant(model->variant) || (model->arch == ModelArch::QWEN35 && model->arch_flags.is_hybrid_ssm);
     plan.gemma4_target = model->variant == ModelVariant::GEMMA4 || model->arch_flags.is_gemma4;
     plan.lfm2_target = model->variant == ModelVariant::LFM2MOE || model->arch_flags.is_lfm2_shortconv;
     plan.target_model = IsDenseCoreFallbackFreeTargetVariant(model->variant) || plan.qwen_target ||
@@ -395,8 +395,8 @@ inline DenseCoreSemanticOp ResolveDenseCoreSemanticOp(const TransformerModel* mo
     }
 }
 
-inline DenseCoreKernelFamily ResolveMaintainedKernelFamilyForTensorRole(
-    ggml_type raw_type, DenseCoreMatmulPhase phase, DenseCoreTensorRole role) {
+inline DenseCoreKernelFamily ResolveMaintainedKernelFamilyForTensorRole(ggml_type raw_type, DenseCoreMatmulPhase phase,
+                                                                        DenseCoreTensorRole role) {
     if (role == DenseCoreTensorRole::MoEGateUp || role == DenseCoreTensorRole::MoEDown) {
         return DenseCoreKernelFamily::DenseCoreQwenMoeDirect;
     }
@@ -473,33 +473,29 @@ inline DenseCoreHostBackend ResolveDenseCoreHostBackend(DenseCoreKernelFamily ke
         return DenseCoreHostBackend::GgmlCpuRepack;
     }
     if (caps.arm_sve2 &&
-        (kernel == DenseCoreKernelFamily::DenseCoreQ4KBatched ||
-         kernel == DenseCoreKernelFamily::DenseCoreQuantGemv)) {
+        (kernel == DenseCoreKernelFamily::DenseCoreQ4KBatched || kernel == DenseCoreKernelFamily::DenseCoreQuantGemv)) {
         return DenseCoreHostBackend::ArmSve2;
     }
     if (caps.x86_amx &&
-        (kernel == DenseCoreKernelFamily::DenseCoreQ4KBatched ||
-         kernel == DenseCoreKernelFamily::DenseCoreQuantGemv ||
+        (kernel == DenseCoreKernelFamily::DenseCoreQ4KBatched || kernel == DenseCoreKernelFamily::DenseCoreQuantGemv ||
          kernel == DenseCoreKernelFamily::DenseCoreF32Gemv)) {
         return DenseCoreHostBackend::X86Amx;
     }
     return DenseCoreHostBackend::GenericCpu;
 }
 
-inline KernelResolution ResolveKernelResolution(const TransformerModel* model, ggml_type weight_type,
-                                                ggml_type input_type, int64_t m, int64_t n, int64_t k,
-                                                DenseCoreMatmulPhase phase, const char* weight_name,
-                                                bool is_lm_head, bool compatible,
-                                                HostKernelCapabilities caps = HostKernelCapabilities{},
-                                                DenseCoreSemanticOp semantic_override = DenseCoreSemanticOp::Unknown,
-                                                DenseCoreTensorRole role_override = DenseCoreTensorRole::Unknown,
-                                                DenseCoreKernelFamily kernel_override = DenseCoreKernelFamily::None,
-                                                DenseCoreFallbackPolicyKind fallback_policy_override =
-                                                    DenseCoreFallbackPolicyKind::CompatibilityFallback,
-                                                bool has_fallback_policy_override = false) {
+inline KernelResolution ResolveKernelResolution(
+    const TransformerModel* model, ggml_type weight_type, ggml_type input_type, int64_t m, int64_t n, int64_t k,
+    DenseCoreMatmulPhase phase, const char* weight_name, bool is_lm_head, bool compatible,
+    HostKernelCapabilities caps = HostKernelCapabilities{},
+    DenseCoreSemanticOp semantic_override = DenseCoreSemanticOp::Unknown,
+    DenseCoreTensorRole role_override = DenseCoreTensorRole::Unknown,
+    DenseCoreKernelFamily kernel_override = DenseCoreKernelFamily::None,
+    DenseCoreFallbackPolicyKind fallback_policy_override = DenseCoreFallbackPolicyKind::CompatibilityFallback,
+    bool has_fallback_policy_override = false) {
     KernelResolution resolution;
-    resolution.matmul_plan = ResolveDenseCoreMatmulPlan(model, weight_type, input_type, m, n, k, phase, weight_name,
-                                                        is_lm_head, compatible);
+    resolution.matmul_plan =
+        ResolveDenseCoreMatmulPlan(model, weight_type, input_type, m, n, k, phase, weight_name, is_lm_head, compatible);
     resolution.tensor_role = role_override != DenseCoreTensorRole::Unknown
                                  ? role_override
                                  : ResolveDenseCoreTensorRole(model, weight_name, is_lm_head);
@@ -515,9 +511,8 @@ inline KernelResolution ResolveKernelResolution(const TransformerModel* model, g
     resolution.fallback_policy =
         has_fallback_policy_override
             ? fallback_policy_override
-            : (resolution.matmul_plan.target_fallback_free_path
-                   ? DenseCoreFallbackPolicyKind::FallbackFreeTarget
-                   : DenseCoreFallbackPolicyKind::CompatibilityFallback);
+            : (resolution.matmul_plan.target_fallback_free_path ? DenseCoreFallbackPolicyKind::FallbackFreeTarget
+                                                                : DenseCoreFallbackPolicyKind::CompatibilityFallback);
     resolution.host_backend = ResolveDenseCoreHostBackend(resolution.selected_kernel, caps);
 
     auto reject = [&resolution](const char* reason) {
@@ -544,14 +539,12 @@ inline KernelResolution ResolveKernelResolution(const TransformerModel* model, g
 inline bool KernelResolutionTargetsQ4KBatchedPrefill(const KernelResolution& resolution) {
     return resolution.selected_kernel == DenseCoreKernelFamily::DenseCoreQ4KBatched &&
            resolution.matmul_plan.phase == DenseCoreMatmulPhase::Prefill &&
-           resolution.matmul_plan.weight_type == GGML_TYPE_Q4_K &&
-           resolution.matmul_plan.input_type == GGML_TYPE_F32 &&
+           resolution.matmul_plan.weight_type == GGML_TYPE_Q4_K && resolution.matmul_plan.input_type == GGML_TYPE_F32 &&
            resolution.matmul_plan.m > 1;
 }
 
 inline bool KernelResolutionSelectsQ4KBatchedPrefill(const KernelResolution& resolution) {
-    return KernelResolutionTargetsQ4KBatchedPrefill(resolution) &&
-           resolution.matmul_plan.compatible;
+    return KernelResolutionTargetsQ4KBatchedPrefill(resolution) && resolution.matmul_plan.compatible;
 }
 
 inline bool IsExplicitTemporaryReferenceFallback(const char* reason) {

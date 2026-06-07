@@ -18,7 +18,8 @@
 #include "kernels/hwy/hwy_kernels.h"
 
 #if defined(DENSECORE_TARGET_C4A) && (defined(__aarch64__) || defined(_M_ARM64)) && !defined(__ARM_FEATURE_SVE2)
-#error "DENSECORE_TARGET_C4A requires compiling DenseCore with SVE2 enabled; use the c4a-perf preset or explicit armv9-a+sve2/neoverse-v2 flags."
+#error \
+    "DENSECORE_TARGET_C4A requires compiling DenseCore with SVE2 enabled; use the c4a-perf preset or explicit armv9-a+sve2/neoverse-v2 flags."
 #endif
 
 namespace densecore {
