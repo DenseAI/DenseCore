@@ -3767,7 +3767,7 @@ static bool Qwen35GateUpQ5KRepackKernelAvailable() {
 #endif
 }
 
-static bool Qwen35GateUpQ4KPrefillRepackKernelAvailable() {
+static bool Qwen35GateUpQ4KRepackKernelAvailable() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return false;
 #else
@@ -3914,13 +3914,11 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                                   static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]);
             const void* gate_row_start = gate_base + static_cast<size_t>(row_start) * weight_row_bytes;
             const void* up_row_start = up_base + static_cast<size_t>(row_start) * weight_row_bytes;
-            const bool q4_prefill_repacked_gateup =
-                q4_gateup && GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill &&
-                Qwen35GateUpQ4KPrefillRepackKernelAvailable();
+            const InferenceExecutionPhase phase = GetCurrentExecutionPhase();
             const bool q4_repacked_gateup =
                 q4_gateup && shared_q8 && shared_q8->prefer_q4k_repacked_swiglu && compact_gateup_rows &&
-                (row_count % 8) == 0 &&
-                (GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode || q4_prefill_repacked_gateup);
+                (row_count % 8) == 0 && phase == InferenceExecutionPhase::Decode &&
+                Qwen35GateUpQ4KRepackKernelAvailable();
             const bool repacked_gateup = q5_single_copy_8x8 || q4_repacked_gateup;
             const bool can_use_batched_gateup =
                 (q4_gateup || q5_gateup) && (compact_gateup_rows || q5_single_copy_8x8) && row_count > 0 &&
@@ -4018,12 +4016,12 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                                                           static_cast<size_t>(dst->nb[1]) +
                                                       static_cast<size_t>(assignment.token) *
                                                           static_cast<size_t>(dst->nb[2]));
-                if (q5_single_copy_8x8 ||
-                    (q4_gateup && shared_q8 && shared_q8->prefer_q4k_repacked_swiglu && compact_gateup_rows &&
-                     (row_count % 8) == 0 &&
-                     (GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode ||
-                      (GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill &&
-                       Qwen35GateUpQ4KPrefillRepackKernelAvailable())))) {
+                const InferenceExecutionPhase phase = GetCurrentExecutionPhase();
+                const bool q4_repacked_gateup =
+                    q4_gateup && shared_q8 && shared_q8->prefer_q4k_repacked_swiglu && compact_gateup_rows &&
+                    (row_count % 8) == 0 && phase == InferenceExecutionPhase::Decode &&
+                    Qwen35GateUpQ4KRepackKernelAvailable();
+                if (q5_single_copy_8x8 || q4_repacked_gateup) {
                     const float* input_row =
                         q5_single_copy_8x8 ? Qwen35NativeMoEGateUpInputRowPtr(input, assignment.token) : nullptr;
                     const bool q5_row_aligned = !q5_single_copy_8x8 || ((row_start % 8) == 0 && (row_count % 8) == 0);
@@ -4524,10 +4522,13 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             gateup_q8_ud->work_ctx = GetCurrentWorkContext();
             gateup_q8_ud->debug_layer_idx = layer_idx;
             gateup_q8_ud->requested_task_count = native_moe_callback_tasks;
-            // Q4_K and Q5_K both enter the maintained repacked MoE lane before
-            // raw vecdot helpers. The SIMD backend may differ by host, but the
-            // graph-level semantic path stays the same.
-            gateup_q8_ud->prefer_q4k_repacked_swiglu = w1w3_type == GGML_TYPE_Q4_K;
+            // Q4_K prefill is assignment-batched and stays on the raw-batched
+            // k-quant path; the repacked SwiGLU helper is retained for x86
+            // decode where it avoids one-row scalar work without changing the
+            // fallback-free prefill qualification lane.
+            gateup_q8_ud->prefer_q4k_repacked_swiglu =
+                w1w3_type == GGML_TYPE_Q4_K && GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode &&
+                Qwen35GateUpQ4KRepackKernelAvailable();
             gateup_q8_ud->q5k_gateup_8x8_single_copy = native_q5_gateup_single_copy;
             gateup_q8_ud->q5k_gateup_8x8_single_copy_required =
                 (graph_plan.qwen_native_moe || graph_plan.lfm2_native_moe) && w1w3_type == GGML_TYPE_Q5_K;

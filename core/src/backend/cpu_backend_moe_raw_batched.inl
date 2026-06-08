@@ -6,6 +6,16 @@ struct MoEBlockQ8K {
 static_assert(sizeof(MoEBlockQ8K) == sizeof(float) + QK_K + (QK_K / 16) * sizeof(int16_t),
               "MoE Q8_K block layout must match ggml block_q8_K");
 
+struct MoEBlockQ5K {
+    ggml_fp16_t d;
+    ggml_fp16_t dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qh[QK_K / 8];
+    uint8_t qs[QK_K / 2];
+};
+static_assert(sizeof(MoEBlockQ5K) == 2 * sizeof(ggml_fp16_t) + K_SCALE_SIZE + QK_K / 8 + QK_K / 2,
+              "MoE Q5_K block layout must match ggml block_q5_K");
+
 struct MoEBlockQ8Kx4 {
     float d[4];
     int8_t qs[QK_K * 4];
@@ -196,8 +206,8 @@ static inline float MoEHSumFloat8(const __m256 x) {
     return _mm_cvtss_f32(res);
 }
 
-bool ComputeMoEQ4KQ8KBatchedRowAvx2(const void* weight_row, const uint8_t* quant_input_base,
-                                    size_t quant_row_stride, int M, int K, float* out_sums) {
+bool ComputeMoEQ4KQ8KBatchedRowAvx2(const void* weight_row, const uint8_t* quant_input_base, size_t quant_row_stride,
+                                    int M, int K, float* out_sums) {
     if (!weight_row || !quant_input_base || !out_sums || M <= 0 || M > kMoEQ4KRawBatchedTileM || K <= 0 ||
         (K % QK_K) != 0 || QK_K != 256) {
         return false;
@@ -271,8 +281,8 @@ bool ComputeMoEQ4KQ8KBatchedRowAvx2(const void* weight_row, const uint8_t* quant
             }
             const float d = q4_d * yb.d;
             const float dmin = -q4_dmin * yb.d;
-            sums[static_cast<size_t>(m)] += d * MoEHSumFloat8(_mm256_cvtepi32_ps(sumi)) +
-                                            dmin * static_cast<float>(min_dot);
+            sums[static_cast<size_t>(m)] +=
+                d * MoEHSumFloat8(_mm256_cvtepi32_ps(sumi)) + dmin * static_cast<float>(min_dot);
         }
     }
     for (int m = 0; m < M; ++m) {
@@ -296,6 +306,215 @@ bool ComputeMoEQ4KQ8KBatchedRow(const void* weight_row, const uint8_t* quant_inp
     }
 #endif
     return ComputeMoEQ4KQ8KBatchedRowScalar(weight_row, quant_input_base, quant_row_stride, M, K, out_sums);
+}
+
+bool ComputeMoEQ5KQ8KBatchedRowScalar(const void* weight_row, const uint8_t* quant_input_base, size_t quant_row_stride,
+                                      int M, int K, float* out_sums) {
+    if (!weight_row || !quant_input_base || !out_sums || M <= 0 || M > kMoEQuantizedProjectionMaxBatch || K <= 0 ||
+        (K % QK_K) != 0) {
+        return false;
+    }
+    const int nb = K / QK_K;
+    if (quant_row_stride < sizeof(MoEBlockQ8K) * static_cast<size_t>(nb)) {
+        return false;
+    }
+
+    const auto* q5_blocks = reinterpret_cast<const MoEBlockQ5K*>(weight_row);
+    static constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    static constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    static constexpr uint32_t kmask3 = 0x03030303;
+
+    alignas(64) std::array<float, kMoEQuantizedProjectionMaxBatch> sums{};
+    int8_t unpacked_q5[QK_K];
+    uint32_t utmp[4];
+    int32_t dot_chunks[8];
+
+    for (int bi = 0; bi < nb; ++bi) {
+        const auto& xb = q5_blocks[bi];
+        const uint8_t* q4 = xb.qs;
+        const uint8_t* high = xb.qh;
+        int8_t* uq5 = unpacked_q5;
+        uint8_t high_mask = 1;
+        for (int j = 0; j < QK_K / 64; ++j) {
+            for (int l = 0; l < 32; ++l) {
+                uq5[l] = static_cast<int8_t>((q4[l] & 0xF) + ((high[l] & high_mask) ? 16 : 0));
+            }
+            uq5 += 32;
+            high_mask <<= 1;
+            for (int l = 0; l < 32; ++l) {
+                uq5[l] = static_cast<int8_t>((q4[l] >> 4) + ((high[l] & high_mask) ? 16 : 0));
+            }
+            uq5 += 32;
+            high_mask <<= 1;
+            q4 += 32;
+        }
+
+        std::memcpy(utmp, xb.scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const auto* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
+        const auto* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
+        const float q5_d = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.d));
+        const float q5_dmin = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.dmin));
+
+        for (int m = 0; m < M; ++m) {
+            const auto* q8_blocks =
+                reinterpret_cast<const MoEBlockQ8K*>(quant_input_base + static_cast<size_t>(m) * quant_row_stride);
+            const auto& yb = q8_blocks[bi];
+
+            int32_t min_dot = 0;
+            for (int j = 0; j < QK_K / 16; ++j) {
+                min_dot += static_cast<int32_t>(yb.bsums[j]) * static_cast<int32_t>(mins[j / 2]);
+            }
+
+            std::memset(dot_chunks, 0, sizeof(dot_chunks));
+            const int8_t* q8 = yb.qs;
+            const int8_t* uq = unpacked_q5;
+            int is = 0;
+            for (int j = 0; j < QK_K / 32; ++j) {
+                const int32_t scale = static_cast<int32_t>(scales[is++]);
+                for (int rep = 0; rep < 4; ++rep) {
+                    for (int l = 0; l < 8; ++l) {
+                        dot_chunks[l] += scale * static_cast<int32_t>(q8[l]) * static_cast<int32_t>(uq[l]);
+                    }
+                    q8 += 8;
+                    uq += 8;
+                }
+            }
+
+            float dot_sum = 0.0f;
+            for (int l = 0; l < 8; ++l) {
+                dot_sum += static_cast<float>(dot_chunks[l]);
+            }
+            const float d = q5_d * yb.d;
+            const float dmin = -q5_dmin * yb.d;
+            sums[static_cast<size_t>(m)] += d * dot_sum + dmin * static_cast<float>(min_dot);
+        }
+    }
+
+    for (int m = 0; m < M; ++m) {
+        out_sums[m] = sums[static_cast<size_t>(m)];
+    }
+    return true;
+}
+
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+bool ComputeMoEQ5KQ8KBatchedRowAvx2(const void* weight_row, const uint8_t* quant_input_base, size_t quant_row_stride,
+                                    int M, int K, float* out_sums) {
+    if (!weight_row || !quant_input_base || !out_sums || M <= 0 || M > kMoEQuantizedProjectionMaxBatch || K <= 0 ||
+        (K % QK_K) != 0 || QK_K != 256) {
+        return false;
+    }
+    const int nb = K / QK_K;
+    if (quant_row_stride < sizeof(MoEBlockQ8K) * static_cast<size_t>(nb)) {
+        return false;
+    }
+
+    const auto* q5_blocks = reinterpret_cast<const MoEBlockQ5K*>(weight_row);
+    alignas(64) std::array<float, kMoEQuantizedProjectionMaxBatch> sums{};
+    static constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    static constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    static constexpr uint32_t kmask3 = 0x03030303;
+    const __m256i low_mask = _mm256_set1_epi8(0x0F);
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i high_value = _mm256_set1_epi8(16);
+
+    for (int bi = 0; bi < nb; ++bi) {
+        const auto& xb = q5_blocks[bi];
+        uint32_t utmp[4];
+        std::memcpy(utmp, xb.scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const auto* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+        const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1);
+        const float q5_d = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.d));
+        const float q5_dmin = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.dmin));
+
+        __m256i q5l[QK_K / 64];
+        __m256i q5h[QK_K / 64];
+        __m256i scale_l[QK_K / 64];
+        __m256i scale_h[QK_K / 64];
+        const uint8_t* q5 = xb.qs;
+        const uint8_t* qh = xb.qh;
+        uint8_t high_mask = 1;
+        for (int j = 0; j < QK_K / 64; ++j) {
+            scale_l[j] = _mm256_set1_epi16(static_cast<int16_t>(scales[2 * j]));
+            scale_h[j] = _mm256_set1_epi16(static_cast<int16_t>(scales[2 * j + 1]));
+            const __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q5));
+            const __m256i high_bits = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh));
+            q5 += 32;
+
+            __m256i mask = _mm256_set1_epi8(static_cast<char>(high_mask));
+            __m256i add = _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(high_bits, mask), zero), high_value);
+            q5l[j] = _mm256_add_epi8(_mm256_and_si256(packed, low_mask), add);
+            high_mask <<= 1;
+
+            mask = _mm256_set1_epi8(static_cast<char>(high_mask));
+            add = _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(high_bits, mask), zero), high_value);
+            q5h[j] = _mm256_add_epi8(_mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask), add);
+            high_mask <<= 1;
+        }
+
+        for (int m = 0; m < M; ++m) {
+            const auto* q8_blocks =
+                reinterpret_cast<const MoEBlockQ8K*>(quant_input_base + static_cast<size_t>(m) * quant_row_stride);
+            const auto& yb = q8_blocks[bi];
+            const __m256i q8sums = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(yb.bsums));
+            const __m128i q8s =
+                _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+            const __m128i prod = _mm_madd_epi16(mins, q8s);
+            __m128i sum32 = _mm_hadd_epi32(prod, prod);
+            sum32 = _mm_hadd_epi32(sum32, sum32);
+            const int32_t min_dot = _mm_cvtsi128_si32(sum32);
+
+            const int8_t* q8 = yb.qs;
+            __m256i sumi = _mm256_setzero_si256();
+            for (int j = 0; j < QK_K / 64; ++j) {
+                const __m256i q8l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8));
+                q8 += 32;
+                __m256i p16l = _mm256_maddubs_epi16(q5l[j], q8l);
+                p16l = _mm256_madd_epi16(scale_l[j], p16l);
+
+                const __m256i q8h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8));
+                q8 += 32;
+                __m256i p16h = _mm256_maddubs_epi16(q5h[j], q8h);
+                p16h = _mm256_madd_epi16(scale_h[j], p16h);
+
+                sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
+            }
+
+            const float d = q5_d * yb.d;
+            const float dmin = -q5_dmin * yb.d;
+            sums[static_cast<size_t>(m)] +=
+                d * MoEHSumFloat8(_mm256_cvtepi32_ps(sumi)) + dmin * static_cast<float>(min_dot);
+        }
+    }
+
+    for (int m = 0; m < M; ++m) {
+        out_sums[m] = sums[static_cast<size_t>(m)];
+    }
+    return true;
+}
+#endif
+
+bool ComputeMoEQ5KQ8KBatchedRow(const void* weight_row, const uint8_t* quant_input_base, size_t quant_row_stride, int M,
+                                int K, float* out_sums) {
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+    if (ggml_cpu_has_avx2() &&
+        ComputeMoEQ5KQ8KBatchedRowAvx2(weight_row, quant_input_base, quant_row_stride, M, K, out_sums)) {
+        return true;
+    }
+#endif
+    return ComputeMoEQ5KQ8KBatchedRowScalar(weight_row, quant_input_base, quant_row_stride, M, K, out_sums);
 }
 
 bool RunMoEQ4KRawBatchedProjectionImpl(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
@@ -341,10 +560,10 @@ bool RunMoEQ4KRawBatchedProjectionImpl(CpuBackend* backend, const void* weight_p
     const bool success = ok.load(std::memory_order_relaxed);
     if (success) {
         const auto elapsed = std::chrono::steady_clock::now() - begin;
-        RecordMoEKQuantRawBatchedUse(GetCurrentWorkContext(), GGML_TYPE_Q4_K,
-                                     static_cast<uint64_t>(
-                                         std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
-                                     /*qwen_native_w2_q5k=*/false);
+        RecordMoEKQuantRawBatchedUse(
+            GetCurrentWorkContext(), GGML_TYPE_Q4_K,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+            /*qwen_native_w2_q5k=*/false);
     }
     return success;
 }
@@ -352,13 +571,12 @@ bool RunMoEQ4KRawBatchedProjectionImpl(CpuBackend* backend, const void* weight_p
 bool RunMoEKQuantRawBatchedProjectionImpl(CpuBackend* backend, ggml_type weight_type, const void* weight_ptr,
                                           const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data,
                                           int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel) {
-    if (!backend || !weight_ptr || !qinput_data || !out_data || M <= 0 ||
-        M > kMoEQuantizedProjectionMaxBatch || N <= 0 || K <= 0 || !ggml_is_quantized(weight_type)) {
+    if (!backend || !weight_ptr || !qinput_data || !out_data || M <= 0 || M > kMoEQuantizedProjectionMaxBatch ||
+        N <= 0 || K <= 0 || !ggml_is_quantized(weight_type)) {
         return false;
     }
     const auto* traits = ggml_get_type_traits_cpu(weight_type);
-    if (!traits || !traits->vec_dot || traits->vec_dot_type != GGML_TYPE_Q8_K ||
-        K % ggml_blck_size(weight_type) != 0) {
+    if (!traits || !traits->vec_dot || traits->vec_dot_type != GGML_TYPE_Q8_K || K % ggml_blck_size(weight_type) != 0) {
         return false;
     }
     if (qinput_row_bytes < ggml_row_size(GGML_TYPE_Q8_K, K)) {
@@ -370,6 +588,42 @@ bool RunMoEKQuantRawBatchedProjectionImpl(CpuBackend* backend, ggml_type weight_
     auto& pool = backend->GetThreadPool(numa_node);
     const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
     std::atomic<bool> ok{true};
+
+    if (weight_type == GGML_TYPE_Q5_K && M > 1 && K % ggml_blck_size(GGML_TYPE_Q5_K) == 0 &&
+        qinput_row_bytes >= ggml_row_size(GGML_TYPE_Q8_K, K)) {
+        const auto compute_rows = [&](int n_start, int n_end) {
+            alignas(64) std::array<float, kMoEQuantizedProjectionMaxBatch> sums{};
+            for (int n = n_start; n < n_end; ++n) {
+                if (!ok.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                const void* row_ptr = static_cast<const char*>(weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+                if (!ComputeMoEQ5KQ8KBatchedRow(row_ptr, qinput_data, qinput_row_bytes, static_cast<int>(M),
+                                                static_cast<int>(K), sums.data())) {
+                    ok.store(false, std::memory_order_relaxed);
+                    return;
+                }
+                for (int64_t m = 0; m < M; ++m) {
+                    out_data[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
+                        sums[static_cast<size_t>(m)];
+                }
+            }
+        };
+        if (n_threads <= 1 || N < 64) {
+            compute_rows(0, static_cast<int>(N));
+        } else {
+            pool.ParallelFor(static_cast<int>(N), [&](int n_start, int n_end, int) { compute_rows(n_start, n_end); });
+        }
+        const bool success = ok.load(std::memory_order_relaxed);
+        if (success) {
+            const auto elapsed = std::chrono::steady_clock::now() - begin;
+            RecordMoEKQuantRawBatchedUse(
+                GetCurrentWorkContext(), weight_type,
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                /*qwen_native_w2_q5k=*/false);
+        }
+        return success;
+    }
 
     const bool is_k_quant_weight =
         weight_type == GGML_TYPE_Q4_K || weight_type == GGML_TYPE_Q5_K || weight_type == GGML_TYPE_Q6_K;
@@ -407,8 +661,7 @@ bool RunMoEKQuantRawBatchedProjectionImpl(CpuBackend* backend, ggml_type weight_
                 for (int64_t m = 0; m < M; ++m) {
                     const uint8_t* qrow = qinput_data + static_cast<size_t>(m) * qinput_row_bytes;
                     traits->vec_dot(static_cast<int>(K),
-                                    out_data + static_cast<size_t>(m) * static_cast<size_t>(N) +
-                                        static_cast<size_t>(n),
+                                    out_data + static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n),
                                     0, row_ptr, 0, qrow, 0, 1);
                 }
             }
@@ -422,10 +675,10 @@ bool RunMoEKQuantRawBatchedProjectionImpl(CpuBackend* backend, ggml_type weight_
         const bool success = ok.load(std::memory_order_relaxed);
         if (success) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
-            RecordMoEKQuantRawBatchedUse(GetCurrentWorkContext(), weight_type,
-                                         static_cast<uint64_t>(
-                                             std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
-                                         /*qwen_native_w2_q5k=*/false);
+            RecordMoEKQuantRawBatchedUse(
+                GetCurrentWorkContext(), weight_type,
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                /*qwen_native_w2_q5k=*/false);
         }
         return success;
     }
@@ -442,17 +695,17 @@ bool RunMoEKQuantRawBatchedProjectionImpl(CpuBackend* backend, ggml_type weight_
     const bool success = ok.load(std::memory_order_relaxed);
     if (success) {
         const auto elapsed = std::chrono::steady_clock::now() - begin;
-        RecordMoEKQuantRawBatchedUse(GetCurrentWorkContext(), weight_type,
-                                     static_cast<uint64_t>(
-                                         std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
-                                     /*qwen_native_w2_q5k=*/false);
+        RecordMoEKQuantRawBatchedUse(
+            GetCurrentWorkContext(), weight_type,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+            /*qwen_native_w2_q5k=*/false);
     }
     return success;
 }
 
 bool RunMoEQ4KRawBatchedFusedSwiGLUImpl(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
-                                        const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data,
-                                        int64_t M, int64_t N, int64_t K, int numa_node, bool allow_parallel) {
+                                        const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
+                                        int64_t N, int64_t K, int numa_node, bool allow_parallel) {
     if (!backend || !gate_weight_ptr || !up_weight_ptr || !qinput_data || !out_data || M <= 0 ||
         M > kMoEQuantizedProjectionMaxBatch || N <= 0 || K <= 0 || (K % QK_K) != 0) {
         return false;
@@ -501,25 +754,24 @@ bool RunMoEQ4KRawBatchedFusedSwiGLUImpl(CpuBackend* backend, const void* gate_we
     const bool success = ok.load(std::memory_order_relaxed);
     if (success) {
         const auto elapsed = std::chrono::steady_clock::now() - begin;
-        RecordMoEKQuantRawBatchedUse(GetCurrentWorkContext(), GGML_TYPE_Q4_K,
-                                     static_cast<uint64_t>(
-                                         std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
-                                     /*qwen_native_w2_q5k=*/false);
+        RecordMoEKQuantRawBatchedUse(
+            GetCurrentWorkContext(), GGML_TYPE_Q4_K,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+            /*qwen_native_w2_q5k=*/false);
     }
     return success;
 }
 
 bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight_type, const void* gate_weight_ptr,
                                            const void* up_weight_ptr, const uint8_t* qinput_data,
-                                           size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N,
-                                           int64_t K, int numa_node, bool allow_parallel) {
+                                           size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
+                                           int numa_node, bool allow_parallel) {
     if (!backend || !gate_weight_ptr || !up_weight_ptr || !qinput_data || !out_data || M <= 0 ||
         M > kMoEQuantizedProjectionMaxBatch || N <= 0 || K <= 0 || !ggml_is_quantized(weight_type)) {
         return false;
     }
     const auto* traits = ggml_get_type_traits_cpu(weight_type);
-    if (!traits || !traits->vec_dot || traits->vec_dot_type != GGML_TYPE_Q8_K ||
-        K % ggml_blck_size(weight_type) != 0) {
+    if (!traits || !traits->vec_dot || traits->vec_dot_type != GGML_TYPE_Q8_K || K % ggml_blck_size(weight_type) != 0) {
         return false;
     }
 
@@ -537,6 +789,52 @@ bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight
 
     const bool use_pair_vecdot = std::max<int>(1, static_cast<int>(traits->nrows)) >= 2;
     const int64_t pair_count = N / 2;
+    if (weight_type == GGML_TYPE_Q5_K && M > 1 && K % ggml_blck_size(GGML_TYPE_Q5_K) == 0 &&
+        qinput_row_bytes >= ggml_row_size(GGML_TYPE_Q8_K, K)) {
+        const auto compute_rows = [&](int n_start, int n_end) {
+            alignas(64) std::array<float, kMoEQuantizedProjectionMaxBatch> gate_sums{};
+            alignas(64) std::array<float, kMoEQuantizedProjectionMaxBatch> up_sums{};
+            for (int n = n_start; n < n_end; ++n) {
+                if (!ok.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                const void* gate_row =
+                    static_cast<const char*>(gate_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+                const void* up_row =
+                    static_cast<const char*>(up_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+                if (!ComputeMoEQ5KQ8KBatchedRow(gate_row, qinput_data, qinput_row_bytes, static_cast<int>(M),
+                                                static_cast<int>(K), gate_sums.data()) ||
+                    !ComputeMoEQ5KQ8KBatchedRow(up_row, qinput_data, qinput_row_bytes, static_cast<int>(M),
+                                                static_cast<int>(K), up_sums.data())) {
+                    ok.store(false, std::memory_order_relaxed);
+                    return;
+                }
+                for (int64_t m = 0; m < M; ++m) {
+                    const float gate = gate_sums[static_cast<size_t>(m)];
+                    const float up = up_sums[static_cast<size_t>(m)];
+                    out_data[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
+                        (gate / (1.0f + internal::FastExp(-gate))) * up;
+                }
+            }
+        };
+        if (n_threads <= 1 || N < 64) {
+            compute_rows(0, static_cast<int>(N));
+        } else {
+            pool.ParallelFor(static_cast<int>(N), [&](int n_start, int n_end, int) { compute_rows(n_start, n_end); });
+        }
+        if (ok.load(std::memory_order_relaxed)) {
+            log_path();
+        }
+        const bool success = ok.load(std::memory_order_relaxed);
+        if (success) {
+            const auto elapsed = std::chrono::steady_clock::now() - begin;
+            RecordMoEKQuantRawBatchedUse(
+                GetCurrentWorkContext(), weight_type,
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                /*qwen_native_w2_q5k=*/false);
+        }
+        return success;
+    }
     const auto compute_pair_range = [&](int pair_start, int pair_end) {
         for (int pair = pair_start; pair < pair_end; ++pair) {
             if (!ok.load(std::memory_order_relaxed)) {
@@ -545,8 +843,7 @@ bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight
             const int64_t n = static_cast<int64_t>(pair) * 2;
             const void* gate_row =
                 static_cast<const char*>(gate_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
-            const void* up_row =
-                static_cast<const char*>(up_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+            const void* up_row = static_cast<const char*>(up_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
             for (int64_t m = 0; m < M; ++m) {
                 const uint8_t* qrow = qinput_data + static_cast<size_t>(m) * qinput_row_bytes;
                 float gate_sums[32] = {};
@@ -598,10 +895,10 @@ bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight
         const bool success = ok.load(std::memory_order_relaxed);
         if (success) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
-            RecordMoEKQuantRawBatchedUse(GetCurrentWorkContext(), weight_type,
-                                         static_cast<uint64_t>(
-                                             std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
-                                         /*qwen_native_w2_q5k=*/false);
+            RecordMoEKQuantRawBatchedUse(
+                GetCurrentWorkContext(), weight_type,
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                /*qwen_native_w2_q5k=*/false);
         }
         return success;
     }
@@ -625,10 +922,10 @@ bool RunMoEKQuantRawBatchedFusedSwiGLUImpl(CpuBackend* backend, ggml_type weight
     const bool success = ok.load(std::memory_order_relaxed);
     if (success) {
         const auto elapsed = std::chrono::steady_clock::now() - begin;
-        RecordMoEKQuantRawBatchedUse(GetCurrentWorkContext(), weight_type,
-                                     static_cast<uint64_t>(
-                                         std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
-                                     /*qwen_native_w2_q5k=*/false);
+        RecordMoEKQuantRawBatchedUse(
+            GetCurrentWorkContext(), weight_type,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+            /*qwen_native_w2_q5k=*/false);
     }
     return success;
 }
