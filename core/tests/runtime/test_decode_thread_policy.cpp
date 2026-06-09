@@ -10,7 +10,11 @@ namespace {
 using densecore::simd::SimdLevel;
 
 int ExpectedHybridSsmChunkTokensForRuntime() {
-    return 384;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return 64;
+#else
+    return 320;
+#endif
 }
 
 class ScopedEnvVar {

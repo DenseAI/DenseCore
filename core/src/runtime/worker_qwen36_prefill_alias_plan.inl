@@ -24,7 +24,9 @@ static void ApplyWorkerQwen36SSMQ8PrefillAliasPlan(
     TransformerModel* model, const WorkerQwen36SSMQ8PrefillAliasPlan& plan, std::vector<Request*>& batch_requests) {
     if (plan.clear_decode_aliases) {
         ClearQwen36SSMQ8PrefillAMXAliases(model);
-        return;
+        if (!plan.prepare_prefill_aliases) {
+            return;
+        }
     }
     if (!plan.prepare_prefill_aliases || !PrepareQwen36SSMQ8PrefillAMXAliasesForExecution(model)) {
         return;

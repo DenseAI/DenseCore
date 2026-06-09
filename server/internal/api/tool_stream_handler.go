@@ -278,12 +278,14 @@ func (f *lfm2StreamFilter) Filter(token string) string {
 			f.suppressing = false
 			return sanitizeLFM2StreamChunk(out, f.exactExpected)
 		}
-		if idx := strings.Index(lower, "final answer:"); idx >= 0 {
-			out := strings.TrimLeft(trimmed[idx+len("final answer:"):], " \t\r\n")
-			f.pending = ""
-			f.started = true
-			f.suppressing = false
-			return sanitizeLFM2StreamChunk(out, f.exactExpected)
+		for _, marker := range []string{"final answer:", "final output:"} {
+			if idx := strings.Index(lower, marker); idx >= 0 {
+				out := strings.TrimLeft(trimmed[idx+len(marker):], " \t\r\n")
+				f.pending = ""
+				f.started = true
+				f.suppressing = false
+				return sanitizeLFM2StreamChunk(out, f.exactExpected)
+			}
 		}
 		if len(f.pending) < 4096 {
 			return ""
@@ -313,11 +315,13 @@ func (f *lfm2StreamFilter) Filter(token string) string {
 			return ""
 		}
 		if strings.HasPrefix(lower, prefix) {
-			if idx := strings.Index(lower, "final answer:"); idx >= 0 {
-				out := strings.TrimLeft(trimmed[idx+len("final answer:"):], " \t\r\n")
-				f.pending = ""
-				f.started = true
-				return sanitizeLFM2StreamChunk(out, f.exactExpected)
+			for _, marker := range []string{"final answer:", "final output:"} {
+				if idx := strings.Index(lower, marker); idx >= 0 {
+					out := strings.TrimLeft(trimmed[idx+len(marker):], " \t\r\n")
+					f.pending = ""
+					f.started = true
+					return sanitizeLFM2StreamChunk(out, f.exactExpected)
+				}
 			}
 			f.suppressing = true
 			return ""
@@ -348,6 +352,13 @@ func sanitizeLFM2StreamChunk(token string, exactExpected string) string {
 	if strings.HasPrefix(lower, "final answer:") {
 		token = strings.TrimLeft(token[len("final answer:"):], " \t\r\n")
 		lower = strings.ToLower(token)
+	}
+	for _, marker := range []string{"final output:"} {
+		if strings.HasPrefix(lower, marker) {
+			token = strings.TrimLeft(token[len(marker):], " \t\r\n")
+			lower = strings.ToLower(token)
+			break
+		}
 	}
 	cut := len(token)
 	for _, marker := range []string{
@@ -385,6 +396,12 @@ func sanitizeLFM2StreamChunk(token string, exactExpected string) string {
 		"\nreasoning:",
 		"\n\nanalysis:",
 		"\nanalysis:",
+		"\n\ni'll write",
+		"\ni'll write",
+		" i'll write",
+		"\n\ni will write",
+		"\ni will write",
+		" i will write",
 		"<think>",
 		"</think>",
 	} {
@@ -409,7 +426,10 @@ func sanitizeLFM2Response(text string, exactExpected string) string {
 			content = strings.TrimSpace(content[idx+len("</think>"):])
 			lower = strings.ToLower(content)
 		} else {
-			return ""
+			if strings.TrimSpace(exactExpected) != "" {
+				return ""
+			}
+			return content
 		}
 	}
 	if strings.HasPrefix(lower, "final answer:") {
@@ -435,7 +455,10 @@ func sanitizeLFM2Response(text string, exactExpected string) string {
 		"<think>",
 	} {
 		if strings.HasPrefix(lower, prefix) {
-			return ""
+			if strings.TrimSpace(exactExpected) != "" {
+				return ""
+			}
+			return content
 		}
 	}
 	for _, marker := range []string{
@@ -647,6 +670,17 @@ func (f *gemma4StreamFilter) Filter(token string) string {
 	f.started = true
 	f.channelMode = true
 	return stripGemma4StreamMarkers(body)
+}
+
+func (f *gemma4StreamFilter) Flush() string {
+	if f == nil || f.started || f.pending == "" {
+		return ""
+	}
+	pending := f.pending
+	f.pending = ""
+	f.started = true
+	content, _ := splitGemma4ReasoningResponse("gemma4", pending)
+	return content
 }
 
 func stripGemma4StreamMarkers(token string) string {

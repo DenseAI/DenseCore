@@ -24,37 +24,12 @@ bool ParseLegacyEnabledBool(const char* name, bool default_value) {
     return std::strcmp(env_value, "0") != 0;
 }
 
-Qwen36SSMQ8PrefillAMXMode ParseQwen36SSMQ8PrefillAMXMode(const char* value) {
-    const std::string mode = env::AsciiLowerCopy(value);
-    if (mode.empty()) {
-        return Qwen36SSMQ8PrefillAMXMode::Off;
-    }
-    if (mode == "probe" || mode == "auto") {
-        return Qwen36SSMQ8PrefillAMXMode::Probe;
-    }
-    if (mode == "off" || mode == "0" || mode == "false" || mode == "no") {
-        return Qwen36SSMQ8PrefillAMXMode::Off;
-    }
-    if (mode == "on" || mode == "1" || mode == "true" || mode == "yes" || mode == "force") {
-        return Qwen36SSMQ8PrefillAMXMode::On;
-    }
-    return Qwen36SSMQ8PrefillAMXMode::Off;
-}
-
 Qwen36SSMQ8PrefillAMXMode DefaultQwen36SSMQ8PrefillAMXMode() {
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(__aarch64__)
     return Qwen36SSMQ8PrefillAMXMode::On;
 #else
     return Qwen36SSMQ8PrefillAMXMode::Off;
 #endif
-}
-
-Qwen36SSMQ8PrefillAMXMode LoadQwen36SSMQ8PrefillAMXMode() {
-    const char* env_value = std::getenv("DENSECORE_QWEN36_SSM_Q8_PREFILL_AMX");
-    if (!env_value || env_value[0] == '\0') {
-        return DefaultQwen36SSMQ8PrefillAMXMode();
-    }
-    return ParseQwen36SSMQ8PrefillAMXMode(env_value);
 }
 
 densecore::env::RuntimeToggleMode ParseRuntimeToggleEnvFailClosed(const char* name,
@@ -295,9 +270,8 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
     config.qwen36_prefill_q4k_batched = Qwen36PrefillQ4KBatchedMode::On;
     config.qwen36_ssm_q8_amx_alias =
         ParseRuntimeToggleEnvFailClosed("DENSECORE_QWEN36_SSM_Q8_AMX_ALIAS", env::RuntimeToggleMode::Off);
-    config.qwen36_ssm_q8_prefill_amx = LoadQwen36SSMQ8PrefillAMXMode();
-    config.qwen36_ssm_q8_prefill_amx_min_tokens =
-        env::ParsePositiveEnvInt("DENSECORE_QWEN36_SSM_Q8_PREFILL_AMX_MIN_TOKENS", 256);
+    config.qwen36_ssm_q8_prefill_amx = DefaultQwen36SSMQ8PrefillAMXMode();
+    config.qwen36_ssm_q8_prefill_amx_min_tokens = 256;
     config.qwen36_expert_cpu_repack =
         ParseRuntimeToggleEnvFailClosed("DENSECORE_QWEN36_EXPERT_CPU_REPACK", env::RuntimeToggleMode::Auto);
     config.native_moe_fast_decode = env::RuntimeToggleMode::On;

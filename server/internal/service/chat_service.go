@@ -1091,7 +1091,7 @@ func isLFM2PreparedRequest(modelHint string, prepared preparedPrompt) bool {
 }
 
 func defaultLFM2StopSequences() []string {
-	return nil
+	return []string{"<|im_end|>", "<|endoftext|>", "<|startoftext|>", "<|im_start|>"}
 }
 
 func isQwen36ModelHint(modelHint string) bool {

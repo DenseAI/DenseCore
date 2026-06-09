@@ -284,8 +284,8 @@ bool IsLFM2MoeModel(const TransformerModel* model) {
 }
 
 const char* LFM2DefaultSystemPrompt() {
-    return "You are a direct answer engine. Output only the final answer requested by the user. Do not quote, "
-           "paraphrase, explain, analyze, or mention the request.";
+    return "You are a helpful assistant. Answer the user's request directly. Do not describe the prompt or your "
+           "reasoning.";
 }
 
 void AppendQwenAssistantGenerationCue(const TransformerModel* model, bool thinking_enabled, std::string* out) {
@@ -374,7 +374,7 @@ PromptTemplateProfile ResolveModelPromptTemplateProfile(const TransformerModel* 
         profile.assistant_role = "model";
         profile.supports_thinking = DescribeModel(model).supports_thinking;
         profile.thinking_enabled =
-            DescribeModel(model).supports_thinking ? ParseBoolEnv("DENSECORE_GEMMA4_ENABLE_THINKING", true) : false;
+            DescribeModel(model).supports_thinking ? ParseBoolEnv("DENSECORE_GEMMA4_ENABLE_THINKING", false) : false;
         return profile;
     }
 
@@ -627,7 +627,8 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         wrapped += profile.open_tag;
         wrapped += profile.assistant_role;
         wrapped += "\n";
-        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking) {
+        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking &&
+            gemma4_thinking_explicit && gemma4_thinking_env) {
             wrapped += "<|channel>thought\n<channel|>";
         }
         return wrapped;
@@ -775,7 +776,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
         rendered += profile.open_tag;
         rendered += profile.assistant_role;
         rendered += "\n";
-        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking) {
+        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking && thinking_enabled) {
             rendered += "<|channel>thought\n<channel|>";
         }
         return rendered;

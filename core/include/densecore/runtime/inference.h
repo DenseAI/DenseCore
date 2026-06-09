@@ -92,6 +92,7 @@ enum class LFM2GreedyLMHeadArgmaxRejectReason : int {
     EmbeddingBatch = 20,
     UnsupportedBatch = 21,
     MissingRequest = 22,
+    ParityUnverified = 23,
 };
 
 struct GenericInput {
@@ -573,6 +574,7 @@ void RecordInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(InferenceWorkContext*
                                                            float value, int vocab_size);
 bool TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(const InferenceWorkContext* ctx, int vocab_size, int* token,
                                                            float* value);
+uint64_t GetInferenceWorkContextExecutionGenerationForTest(const InferenceWorkContext* ctx);
 void SetCurrentExecutionPhase(InferenceExecutionPhase phase);
 InferenceExecutionPhase GetCurrentExecutionPhase();
 const BatchSpec* GetCurrentBatch();

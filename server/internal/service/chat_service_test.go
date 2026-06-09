@@ -318,6 +318,22 @@ func TestNormalizeSamplingLFM2TemperatureZeroKeepsDefaultRepetitionPenalty(t *te
 	}
 }
 
+func TestDefaultLFM2StopSequencesIncludeChatMLTerminators(t *testing.T) {
+	stops := defaultLFM2StopSequences()
+	for _, expected := range []string{"<|im_end|>", "<|endoftext|>", "<|startoftext|>", "<|im_start|>"} {
+		found := false
+		for _, stop := range stops {
+			if stop == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected LFM2 default stop sequences to include %q, got %#v", expected, stops)
+		}
+	}
+}
+
 func TestNormalizeSamplingQwenThinkingDefaults(t *testing.T) {
 	svc := &ChatService{}
 	t.Setenv("DENSECORE_QWEN35_ENABLE_THINKING", "true")

@@ -198,7 +198,7 @@ bool Gemma4MaintainedPrefillFastOpsUsed(const Request* req) {
     }
     static constexpr std::size_t kCustomBatchedGemvPath = 3;
     return req->gemma4_native_moe_prefill_used_layers > 0 || req->gemma4_dense_prefill_native_used_ops > 0 ||
-           (req->prefill_matmul_path_hist[kCustomBatchedGemvPath] > 0 && req->arm_batched_quant_used > 0);
+           req->prefill_matmul_path_hist[kCustomBatchedGemvPath] > 0;
 }
 
 bool Gemma4MaintainedDecodeFastOpsUsed(const Request* req) {
@@ -1789,6 +1789,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
         case 20: return "embedding_batch";
         case 21: return "unsupported_batch";
         case 22: return "missing_request";
+        case 23: return "parity_unverified";
         default: return "unknown";
         }
     };
@@ -1995,6 +1996,22 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
     const uint64_t native_moe_fast_decode_seen_ops =
         std::max(req->native_moe_fast_decode_candidate_ops,
                  req->native_moe_fast_decode_used_ops + req->native_moe_fast_decode_rejected_ops);
+    const bool qwen_summary =
+        descriptor.variant == ModelVariant::QWEN35 || descriptor.variant == ModelVariant::QWEN36;
+    const uint64_t qwen_native_moe_w1w3_q4k_raw_batched_used_ops =
+        qwen_summary ? req->moe_kquant_raw_batched_q4k_used_ops : 0;
+    const uint64_t qwen_native_moe_w1w3_q4k_raw_batched_ns =
+        qwen_summary ? req->moe_kquant_raw_batched_q4k_ns : 0;
+    const uint64_t qwen_decode_q6k_lm_head_overlap_candidate_ops =
+        qwen_summary && req->decode_graph_node_custom_lm_head_count > 0
+            ? std::min<uint64_t>(req->q6k_gemv_candidate_ops,
+                                 static_cast<uint64_t>(req->decode_graph_node_custom_lm_head_count))
+            : 0;
+    const uint64_t qwen_decode_q6k_lm_head_overlap_used_ops =
+        qwen_summary && req->decode_graph_node_custom_lm_head_count > 0
+            ? std::min<uint64_t>(req->q6k_gemv_used_ops,
+                                 static_cast<uint64_t>(req->decode_graph_node_custom_lm_head_count))
+            : 0;
     const bool lfm2_summary = descriptor.variant == ModelVariant::LFM2MOE;
     const bool lfm2_w1w3_q5k_seen = lfm2_summary && req->qwen35_moe_w1w3_weight_type_hist[1] > 0;
     const bool lfm2_w2_q4k_seen = lfm2_summary && req->qwen35_moe_w2_weight_type_hist[0] > 0;
@@ -2401,6 +2418,11 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
         << " q6k_gemv_graph_phase=" << (req->q6k_gemv_graph_phase.empty() ? "none" : req->q6k_gemv_graph_phase.c_str())
         << " q6k_gemv_callback_phase="
         << (req->q6k_gemv_callback_phase.empty() ? "none" : req->q6k_gemv_callback_phase.c_str())
+        << " qwen_decode_q6k_lm_head_overlap_candidate_ops="
+        << qwen_decode_q6k_lm_head_overlap_candidate_ops
+        << " qwen_decode_q6k_lm_head_overlap_used_ops="
+        << qwen_decode_q6k_lm_head_overlap_used_ops
+        << " qwen_decode_custom_lm_head_count=" << req->decode_graph_node_custom_lm_head_count
         << " q6k_gemv_weight_shapes=" << q6k_gemv_weight_shapes
         << " q6k_gemv_total_ms=" << ns_to_ms(req->q6k_gemv_total_ns)
         << " q6k_gemv_effective_state=" << q6k_effective_state << " qact_cache_hits=" << req->qact_cache_hits
@@ -2436,6 +2458,10 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
                                                               : req->moe_q5k_repacked_last_reject_reason.c_str())
         << " moe_kquant_raw_batched_q4k_used_ops=" << req->moe_kquant_raw_batched_q4k_used_ops
         << " moe_kquant_raw_batched_q4k_ms=" << ns_to_ms(req->moe_kquant_raw_batched_q4k_ns)
+        << " qwen_native_moe_w1w3_q4k_raw_batched_used_ops="
+        << qwen_native_moe_w1w3_q4k_raw_batched_used_ops
+        << " qwen_native_moe_w1w3_q4k_raw_batched_ms="
+        << ns_to_ms(qwen_native_moe_w1w3_q4k_raw_batched_ns)
         << " moe_kquant_raw_batched_q5k_used_ops=" << req->moe_kquant_raw_batched_q5k_used_ops
         << " moe_kquant_raw_batched_q5k_ms=" << ns_to_ms(req->moe_kquant_raw_batched_q5k_ns)
         << " gemma4_moe_prefill_quant_batch_candidate_ops=" << req->gemma4_moe_prefill_quant_batch_candidate_ops

@@ -180,6 +180,7 @@ TEST(Gemma4ModelLoaderTest, AcceptsExplicitMetadataAndDisablesAutoBosForGemma4) 
     EXPECT_EQ(model->gemma4_layer_kv_source.size(), 2u);
     EXPECT_FALSE(model->tokenizer_add_bos);
     EXPECT_FLOAT_EQ(model->gemma4_attention_logit_softcapping, 50.0f);
+    EXPECT_FLOAT_EQ(model->gemma4_final_logit_softcapping, 30.0f);
 }
 
 TEST(Gemma4ModelLoaderTest, MissingAttentionLogitCapUsesLlamaCppGemmaDefault) {

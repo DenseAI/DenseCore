@@ -227,7 +227,7 @@ func fallbackPromptProfile(modelHint string) promptProfile {
 			systemRole:          "system",
 			openTag:             "<|im_start|>",
 			closeTag:            "<|im_end|>\n",
-			defaultSystemPrompt: "You are a direct answer engine. Output only the final answer requested by the user. Do not quote, paraphrase, explain, analyze, or mention the request.",
+			defaultSystemPrompt: "You are a helpful assistant. Answer the user's request directly. Do not describe the prompt or your reasoning.",
 		}
 	case strings.Contains(lower, "qwen"):
 		return promptProfile{

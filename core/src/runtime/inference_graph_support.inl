@@ -231,13 +231,11 @@ bool IsGemma4NativeMoEGraphEnabled() {
 }
 
 bool Gemma4NativeMoEPrefillKernelSupported() {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    // C4A validation: enabling the native Gemma4 MoE prefill path changes first-token logits
-    // and fails real server short QA. Keep ARM fail-closed until the gate/up/down parity bug is fixed.
+    // Real server QA currently fails when this prefill custom path is used:
+    // first-token logits drift before sampling, producing short-QA misses and
+    // repetition on Gemma4-26B Q4. Keep it fail-closed on every ISA until the
+    // gate/up/down callbacks have logits-parity coverage against the ggml path.
     return false;
-#else
-    return ggml_cpu_has_avx2();
-#endif
 }
 
 bool IsGemma4NativeMoEPrefillEnabled() {
@@ -1716,7 +1714,7 @@ ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     if (native_prefill_candidate) {
         const char* reject_reason = nullptr;
         if (!native_prefill_enabled) {
-            reject_reason = "x86_avx2_unavailable";
+            reject_reason = "parity_unverified";
         } else if (GetCurrentBatch() && !GetCurrentBatch()->lora_map.empty()) {
             reject_reason = "lora_active";
         } else if (!gate_up_exps) {

@@ -35,6 +35,29 @@ TEST(ChatTemplateTest, GemmaAutoTemplateUsesOfficialTurnFormatWithImplicitInstru
               "<|turn>user\n"
               "hello"
               "<turn|>\n"
+              "<|turn>model\n");
+}
+
+TEST(ChatTemplateTest, GemmaAutoTemplateAddsThoughtChannelOnlyWhenThinkingEnabled) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    setenv("DENSECORE_GEMMA4_ENABLE_THINKING", "1", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_GEMMA4_ENABLE_THINKING");
+
+    EXPECT_EQ(wrapped,
+              "<bos>"
+              "<|turn>system\n"
+              "<|think|>\n"
+              "<turn|>\n"
+              "<|turn>user\n"
+              "hello"
+              "<turn|>\n"
               "<|turn>model\n"
               "<|channel>thought\n"
               "<channel|>");
@@ -140,8 +163,8 @@ TEST(ChatTemplateTest, LFM2CanonicalRenderUsesStartOfTextChatMLGenerationPrompt)
     EXPECT_EQ(rendered,
               "<|startoftext|>"
               "<|im_start|>system\n"
-              "You are a direct answer engine. Output only the final answer requested by the user. Do not quote, "
-              "paraphrase, explain, analyze, or mention the request.<|im_end|>\n"
+              "You are a helpful assistant. Answer the user's request directly. Do not describe the prompt or your "
+              "reasoning.<|im_end|>\n"
               "<|im_start|>user\n"
               "hello<|im_end|>\n"
               "<|im_start|>assistant\n");
@@ -522,21 +545,16 @@ TEST(CanonicalChatRenderTest, GemmaCanonicalRendererMatchesTurnTags) {
     bool thinking_enabled = false;
     const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {}, &thinking_enabled);
 
-    EXPECT_TRUE(thinking_enabled);
+    EXPECT_FALSE(thinking_enabled);
     EXPECT_EQ(rendered,
               "<bos>"
-              "<|turn>system\n"
-              "<|think|>\n"
-              "<turn|>\n"
               "<|turn>user\n"
               "What is the capital of France?"
               "<turn|>\n"
-              "<|turn>model\n"
-              "<|channel>thought\n"
-              "<channel|>");
+              "<|turn>model\n");
 }
 
-TEST(CanonicalChatRenderTest, GemmaCanonicalRendererUsesEmptyThoughtChannelWhenThinkingDisabled) {
+TEST(CanonicalChatRenderTest, GemmaCanonicalRendererUsesPlainAssistantCueWhenThinkingDisabled) {
     TransformerModel model{};
     model.arch = ModelArch::GEMMA;
     model.arch_flags.is_gemma4 = true;
@@ -556,6 +574,36 @@ TEST(CanonicalChatRenderTest, GemmaCanonicalRendererUsesEmptyThoughtChannelWhenT
     EXPECT_FALSE(thinking_enabled);
     EXPECT_EQ(rendered,
               "<bos>"
+              "<|turn>user\n"
+              "What is the capital of France?"
+              "<turn|>\n"
+              "<|turn>model\n");
+}
+
+TEST(CanonicalChatRenderTest, GemmaCanonicalRendererUsesThoughtChannelWhenThinkingEnabled) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "What is the capital of France?";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    densecore::models::CanonicalChatRenderOptions options{};
+    options.enable_thinking = 1;
+    bool thinking_enabled = false;
+    const std::string rendered =
+        densecore::models::RenderModelChatMessages(&model, messages, options, &thinking_enabled);
+
+    EXPECT_TRUE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<bos>"
+              "<|turn>system\n"
+              "<|think|>\n"
+              "<turn|>\n"
               "<|turn>user\n"
               "What is the capital of France?"
               "<turn|>\n"

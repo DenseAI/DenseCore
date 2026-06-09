@@ -290,6 +290,129 @@ bool ComputeMoEQ4KQ8KBatchedRowAvx2(const void* weight_row, const uint8_t* quant
     }
     return true;
 }
+
+struct MoEQ4KAvx2Block {
+    __m256i q4l[QK_K / 64];
+    __m256i q4h[QK_K / 64];
+    __m256i scale_l[QK_K / 64];
+    __m256i scale_h[QK_K / 64];
+    __m128i mins;
+    float d;
+    float dmin;
+};
+
+static inline void PrepareMoEQ4KAvx2Block(const block_q4_K& xb, const __m256i low_mask, MoEQ4KAvx2Block* out) {
+    static constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    static constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    static constexpr uint32_t kmask3 = 0x03030303;
+
+    uint32_t utmp[4];
+    std::memcpy(utmp, xb.scales, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+
+    const auto* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
+    const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+    out->mins = _mm256_extracti128_si256(mins_and_scales, 1);
+    out->d = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.d));
+    out->dmin = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.dmin));
+
+    const uint8_t* q4 = xb.qs;
+    for (int j = 0; j < QK_K / 64; ++j) {
+        out->scale_l[j] = _mm256_set1_epi16(static_cast<int16_t>(scales[2 * j]));
+        out->scale_h[j] = _mm256_set1_epi16(static_cast<int16_t>(scales[2 * j + 1]));
+        const __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q4));
+        q4 += 32;
+        out->q4l[j] = _mm256_and_si256(packed, low_mask);
+        out->q4h[j] = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
+    }
+}
+
+bool ComputeMoEQ4KQ8KBatchedRowPairAvx2(const void* gate_weight_row, const void* up_weight_row,
+                                        const uint8_t* quant_input_base, size_t quant_row_stride, int M, int K,
+                                        float* gate_out_sums, float* up_out_sums) {
+    if (!gate_weight_row || !up_weight_row || !quant_input_base || !gate_out_sums || !up_out_sums || M <= 0 ||
+        M > kMoEQ4KRawBatchedTileM || K <= 0 || (K % QK_K) != 0 || QK_K != 256) {
+        return false;
+    }
+    const int nb = K / QK_K;
+    if (quant_row_stride < sizeof(MoEBlockQ8K) * static_cast<size_t>(nb)) {
+        return false;
+    }
+
+    const auto* gate_blocks = reinterpret_cast<const block_q4_K*>(gate_weight_row);
+    const auto* up_blocks = reinterpret_cast<const block_q4_K*>(up_weight_row);
+    alignas(64) std::array<float, kMoEQ4KRawBatchedTileM> gate_sums{};
+    alignas(64) std::array<float, kMoEQ4KRawBatchedTileM> up_sums{};
+    const __m256i low_mask = _mm256_set1_epi8(0x0F);
+
+    for (int bi = 0; bi < nb; ++bi) {
+        MoEQ4KAvx2Block gate_block;
+        MoEQ4KAvx2Block up_block;
+        PrepareMoEQ4KAvx2Block(gate_blocks[bi], low_mask, &gate_block);
+        PrepareMoEQ4KAvx2Block(up_blocks[bi], low_mask, &up_block);
+
+        for (int m = 0; m < M; ++m) {
+            const auto* q8_blocks =
+                reinterpret_cast<const MoEBlockQ8K*>(quant_input_base + static_cast<size_t>(m) * quant_row_stride);
+            const auto& yb = q8_blocks[bi];
+            const __m256i q8sums = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(yb.bsums));
+            const __m128i q8s =
+                _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+
+            const __m128i gate_prod = _mm_madd_epi16(gate_block.mins, q8s);
+            __m128i gate_sum32 = _mm_hadd_epi32(gate_prod, gate_prod);
+            gate_sum32 = _mm_hadd_epi32(gate_sum32, gate_sum32);
+            const int32_t gate_min_dot = _mm_cvtsi128_si32(gate_sum32);
+
+            const __m128i up_prod = _mm_madd_epi16(up_block.mins, q8s);
+            __m128i up_sum32 = _mm_hadd_epi32(up_prod, up_prod);
+            up_sum32 = _mm_hadd_epi32(up_sum32, up_sum32);
+            const int32_t up_min_dot = _mm_cvtsi128_si32(up_sum32);
+
+            const int8_t* q8 = yb.qs;
+            __m256i gate_sumi = _mm256_setzero_si256();
+            __m256i up_sumi = _mm256_setzero_si256();
+            for (int j = 0; j < QK_K / 64; ++j) {
+                const __m256i q8l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8));
+                q8 += 32;
+                const __m256i q8h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8));
+                q8 += 32;
+
+                __m256i gate_p16l = _mm256_maddubs_epi16(gate_block.q4l[j], q8l);
+                gate_p16l = _mm256_madd_epi16(gate_block.scale_l[j], gate_p16l);
+                __m256i gate_p16h = _mm256_maddubs_epi16(gate_block.q4h[j], q8h);
+                gate_p16h = _mm256_madd_epi16(gate_block.scale_h[j], gate_p16h);
+                gate_sumi = _mm256_add_epi32(gate_sumi, _mm256_add_epi32(gate_p16l, gate_p16h));
+
+                __m256i up_p16l = _mm256_maddubs_epi16(up_block.q4l[j], q8l);
+                up_p16l = _mm256_madd_epi16(up_block.scale_l[j], up_p16l);
+                __m256i up_p16h = _mm256_maddubs_epi16(up_block.q4h[j], q8h);
+                up_p16h = _mm256_madd_epi16(up_block.scale_h[j], up_p16h);
+                up_sumi = _mm256_add_epi32(up_sumi, _mm256_add_epi32(up_p16l, up_p16h));
+            }
+
+            const float gate_d = gate_block.d * yb.d;
+            const float gate_dmin = -gate_block.dmin * yb.d;
+            gate_sums[static_cast<size_t>(m)] +=
+                gate_d * MoEHSumFloat8(_mm256_cvtepi32_ps(gate_sumi)) + gate_dmin * static_cast<float>(gate_min_dot);
+
+            const float up_d = up_block.d * yb.d;
+            const float up_dmin = -up_block.dmin * yb.d;
+            up_sums[static_cast<size_t>(m)] +=
+                up_d * MoEHSumFloat8(_mm256_cvtepi32_ps(up_sumi)) + up_dmin * static_cast<float>(up_min_dot);
+        }
+    }
+
+    for (int m = 0; m < M; ++m) {
+        gate_out_sums[m] = gate_sums[static_cast<size_t>(m)];
+        up_out_sums[m] = up_sums[static_cast<size_t>(m)];
+    }
+    return true;
+}
 #endif
 
 bool ComputeMoEQ4KQ8KBatchedRow(const void* weight_row, const uint8_t* quant_input_base, size_t quant_row_stride, int M,
@@ -306,6 +429,20 @@ bool ComputeMoEQ4KQ8KBatchedRow(const void* weight_row, const uint8_t* quant_inp
     }
 #endif
     return ComputeMoEQ4KQ8KBatchedRowScalar(weight_row, quant_input_base, quant_row_stride, M, K, out_sums);
+}
+
+bool ComputeMoEQ4KQ8KBatchedRowPair(const void* gate_weight_row, const void* up_weight_row,
+                                    const uint8_t* quant_input_base, size_t quant_row_stride, int M, int K,
+                                    float* gate_out_sums, float* up_out_sums) {
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+    if (ggml_cpu_has_avx2() &&
+        ComputeMoEQ4KQ8KBatchedRowPairAvx2(gate_weight_row, up_weight_row, quant_input_base, quant_row_stride, M, K,
+                                           gate_out_sums, up_out_sums)) {
+        return true;
+    }
+#endif
+    return ComputeMoEQ4KQ8KBatchedRow(gate_weight_row, quant_input_base, quant_row_stride, M, K, gate_out_sums) &&
+           ComputeMoEQ4KQ8KBatchedRow(up_weight_row, quant_input_base, quant_row_stride, M, K, up_out_sums);
 }
 
 bool ComputeMoEQ5KQ8KBatchedRowScalar(const void* weight_row, const uint8_t* quant_input_base, size_t quant_row_stride,
@@ -719,20 +856,19 @@ bool RunMoEQ4KRawBatchedFusedSwiGLUImpl(CpuBackend* backend, const void* gate_we
     const auto compute_rows = [&](int n_start, int n_end) {
         alignas(64) float gate_sums[kMoEQ4KRawBatchedTileM];
         alignas(64) float up_sums[kMoEQ4KRawBatchedTileM];
-        for (int n = n_start; n < n_end; ++n) {
-            if (!ok.load(std::memory_order_relaxed)) {
-                return;
-            }
-            const void* gate_row =
-                static_cast<const char*>(gate_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
-            const void* up_row = static_cast<const char*>(up_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
-            for (int64_t m0 = 0; m0 < M; m0 += kMoEQ4KRawBatchedTileM) {
-                const int tile_m = static_cast<int>(std::min<int64_t>(kMoEQ4KRawBatchedTileM, M - m0));
-                const auto* q_tile = qinput_data + static_cast<size_t>(m0) * qinput_row_bytes;
-                if (!ComputeMoEQ4KQ8KBatchedRow(gate_row, q_tile, qinput_row_bytes, tile_m, static_cast<int>(K),
-                                                gate_sums) ||
-                    !ComputeMoEQ4KQ8KBatchedRow(up_row, q_tile, qinput_row_bytes, tile_m, static_cast<int>(K),
-                                                up_sums)) {
+        for (int64_t m0 = 0; m0 < M; m0 += kMoEQ4KRawBatchedTileM) {
+            const int tile_m = static_cast<int>(std::min<int64_t>(kMoEQ4KRawBatchedTileM, M - m0));
+            const auto* q_tile = qinput_data + static_cast<size_t>(m0) * qinput_row_bytes;
+            for (int n = n_start; n < n_end; ++n) {
+                if (!ok.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                const void* gate_row =
+                    static_cast<const char*>(gate_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+                const void* up_row =
+                    static_cast<const char*>(up_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+                if (!ComputeMoEQ4KQ8KBatchedRowPair(gate_row, up_row, q_tile, qinput_row_bytes, tile_m,
+                                                    static_cast<int>(K), gate_sums, up_sums)) {
                     ok.store(false, std::memory_order_relaxed);
                     return;
                 }
@@ -945,20 +1081,19 @@ bool RunMoEQ4KRawBatchedFusedGEGLU(CpuBackend* backend, const void* gate_weight_
     const auto compute_rows = [&](int n_start, int n_end) {
         alignas(64) float gate_sums[kMoEQ4KRawBatchedTileM];
         alignas(64) float up_sums[kMoEQ4KRawBatchedTileM];
-        for (int n = n_start; n < n_end; ++n) {
-            if (!ok.load(std::memory_order_relaxed)) {
-                return;
-            }
-            const void* gate_row =
-                static_cast<const char*>(gate_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
-            const void* up_row = static_cast<const char*>(up_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
-            for (int64_t m0 = 0; m0 < M; m0 += kMoEQ4KRawBatchedTileM) {
-                const int tile_m = static_cast<int>(std::min<int64_t>(kMoEQ4KRawBatchedTileM, M - m0));
-                const auto* q_tile = qinput_data + static_cast<size_t>(m0) * qinput_row_bytes;
-                if (!ComputeMoEQ4KQ8KBatchedRow(gate_row, q_tile, qinput_row_bytes, tile_m, static_cast<int>(K),
-                                                gate_sums) ||
-                    !ComputeMoEQ4KQ8KBatchedRow(up_row, q_tile, qinput_row_bytes, tile_m, static_cast<int>(K),
-                                                up_sums)) {
+        for (int64_t m0 = 0; m0 < M; m0 += kMoEQ4KRawBatchedTileM) {
+            const int tile_m = static_cast<int>(std::min<int64_t>(kMoEQ4KRawBatchedTileM, M - m0));
+            const auto* q_tile = qinput_data + static_cast<size_t>(m0) * qinput_row_bytes;
+            for (int n = n_start; n < n_end; ++n) {
+                if (!ok.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                const void* gate_row =
+                    static_cast<const char*>(gate_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+                const void* up_row =
+                    static_cast<const char*>(up_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+                if (!ComputeMoEQ4KQ8KBatchedRowPair(gate_row, up_row, q_tile, qinput_row_bytes, tile_m,
+                                                    static_cast<int>(K), gate_sums, up_sums)) {
                     ok.store(false, std::memory_order_relaxed);
                     return;
                 }

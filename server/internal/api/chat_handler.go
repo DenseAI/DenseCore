@@ -121,12 +121,11 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 	}
 	var lfm2Filter *lfm2StreamFilter
 	if isLFM2ModelHint(reasoningModelHint) && !lfm2StreamFilterBypassEnabled() {
-		// Only exact-answer QA prompts use the LFM2 stream filter. General long-form
-		// completions must stream generated tokens directly; broad prelude suppression
-		// can otherwise hide the whole response and make quality gates unstable.
-		if exactExpected := service.ExtractExpectedExactAnswer(req); exactExpected != "" && lfm2StreamFilterExactAnswerEligible(req) {
-			lfm2Filter = newLFM2StreamFilter(exactExpected)
+		exactExpected := ""
+		if expected := service.ExtractExpectedExactAnswer(req); expected != "" && lfm2StreamFilterExactAnswerEligible(req) {
+			exactExpected = expected
 		}
+		lfm2Filter = newLFM2StreamFilter(exactExpected)
 	}
 	var qwen36Filter *qwen36StreamFilter
 	if qwen36StreamingReasoningEnabled(req, reasoningModelHint) {
@@ -155,6 +154,20 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 					writeGenerationError(ctx, w, flusher, req.Model, err, streamWriter.Started())
 					_ = waitGenerationError(errChan)
 					return
+				}
+				if gemma4Filter != nil {
+					if token := gemma4Filter.Flush(); token != "" {
+						completionTokens++
+						elapsedMS := serviceDurationMillis(time.Since(streamStart))
+						if firstCallbackMS == 0 {
+							firstCallbackMS = elapsedMS
+						}
+						lastCallbackMS = elapsedMS
+						if err := h.writeChatStreamToken(streamWriter, id, created, req.Model, token, qwen36Filter); err != nil {
+							slog.Debug("SSE write error", slog.String("error", err.Error()))
+							return
+						}
+					}
 				}
 				if qwenMarkerFilter != nil {
 					if token := qwenMarkerFilter.Flush(); token != "" {

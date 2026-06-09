@@ -297,6 +297,16 @@ void SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(InferenceWorkContext*
     ctx->lfm2_greedy_lm_head_argmax_reject_reason = reject_reason;
     ctx->lfm2_greedy_lm_head_argmax_repetition_penalty = repetition_penalty;
     ctx->lfm2_greedy_lm_head_argmax_repeated_tokens.clear();
+    if (!allowed) {
+        ctx->lfm2_greedy_lm_head_argmax_generation = 0;
+        ctx->lfm2_greedy_lm_head_argmax_token = -1;
+        ctx->lfm2_greedy_lm_head_argmax_value = -std::numeric_limits<float>::infinity();
+        ctx->lfm2_greedy_lm_head_argmax_vocab_size = 0;
+        ctx->lfm2_greedy_lm_head_sparse_logits_ptr = nullptr;
+        ctx->lfm2_greedy_lm_head_sparse_logits_vocab_size = 0;
+        ctx->lfm2_greedy_lm_head_sparse_logits_token = -1;
+        return;
+    }
     if (allowed && token_history && !token_history->empty()) {
         ctx->lfm2_greedy_lm_head_argmax_repeated_tokens.assign(token_history->begin(), token_history->end());
         std::sort(ctx->lfm2_greedy_lm_head_argmax_repeated_tokens.begin(),
@@ -353,6 +363,10 @@ bool TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(const InferenceWorkCo
     *token = ctx->lfm2_greedy_lm_head_argmax_token;
     *value = ctx->lfm2_greedy_lm_head_argmax_value;
     return true;
+}
+
+uint64_t GetInferenceWorkContextExecutionGenerationForTest(const InferenceWorkContext* ctx) {
+    return ctx ? ctx->execution_generation : 0;
 }
 
 void SetCurrentExecutionPhase(InferenceExecutionPhase phase) {

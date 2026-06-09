@@ -114,6 +114,11 @@ LFM2GreedyLMHeadArgmaxRejectReason GetLFM2GreedyLMHeadArgmaxRejectReason(const T
         std::getenv("DENSECORE_DEBUG_SAMPLER_TRACE") != nullptr) {
         return LFM2GreedyLMHeadArgmaxRejectReason::DebugSampler;
     }
+    // Same contract as SampleToken's greedy path: with temperature disabled,
+    // no grammar, no token filters, and no frequency/presence/final-softcap
+    // transforms, the selected token is the finite argmax of the lm_head
+    // logits. The lm_head callback computes that argmax from the same Q6_K
+    // dot products while still honoring repetition_penalty via token_history.
     return LFM2GreedyLMHeadArgmaxRejectReason::None;
 }
 
@@ -2572,14 +2577,21 @@ void EngineLoop(EngineState* state) {
             int active_threads = base_threads;
             const int decode_batch_size = static_cast<int>(batch_requests.size());
             int prefill_prompt_token_count = 0;
-            if (is_prefill_batch && decode_batch_size == 1 && !batch_requests.empty()) {
-                const Request* const req = batch_requests.front();
-                if (req && !req->original_prompt_tokens_for_cache.empty()) {
-                    prefill_prompt_token_count = static_cast<int>(req->original_prompt_tokens_for_cache.size());
-                } else if (req && !req->prompt_tokens_for_cache.empty()) {
-                    prefill_prompt_token_count = static_cast<int>(req->prompt_tokens_for_cache.size());
-                } else if (!batch_token_counts.empty()) {
-                    prefill_prompt_token_count = batch_token_counts.front();
+            if (is_prefill_batch && !batch_requests.empty()) {
+                for (size_t i = 0; i < batch_requests.size(); ++i) {
+                    const Request* const req = batch_requests[i];
+                    if (!req || !req->is_prefill) {
+                        continue;
+                    }
+                    int req_prompt_token_count = 0;
+                    if (!req->original_prompt_tokens_for_cache.empty()) {
+                        req_prompt_token_count = static_cast<int>(req->original_prompt_tokens_for_cache.size());
+                    } else if (!req->prompt_tokens_for_cache.empty()) {
+                        req_prompt_token_count = static_cast<int>(req->prompt_tokens_for_cache.size());
+                    } else if (i < batch_token_counts.size()) {
+                        req_prompt_token_count = batch_token_counts[i];
+                    }
+                    prefill_prompt_token_count = std::max(prefill_prompt_token_count, req_prompt_token_count);
                 }
             }
             const bool is_decode_batch = !is_prefill_batch && !is_embedding_batch;

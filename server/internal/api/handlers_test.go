@@ -599,6 +599,21 @@ func TestGemma4StreamFilterSanitizesIncrementally(t *testing.T) {
 	}
 }
 
+func TestGemma4StreamFilterFlushesUnclosedThoughtChannelAsContent(t *testing.T) {
+	filter := newGemma4StreamFilter()
+	var out strings.Builder
+	for _, token := range []string{"<|channel>thought\n", "CPU ", "MoE ", "answer"} {
+		out.WriteString(filter.Filter(token))
+	}
+	out.WriteString(filter.Flush())
+	if got := out.String(); got != "CPU MoE answer" {
+		t.Fatalf("expected terminal flush to preserve visible content, got %q", got)
+	}
+	if got := filter.Flush(); got != "" {
+		t.Fatalf("second flush should be empty, got %q", got)
+	}
+}
+
 func TestGemma4StreamFilterPassesPlainText(t *testing.T) {
 	filter := newGemma4StreamFilter()
 	if got := filter.Filter("Plain answer"); got != "Plain answer" {
@@ -662,6 +677,24 @@ func TestSplitReasoningResponseLFM2TrimsMetaTail(t *testing.T) {
 	)
 	if content != "Paris" || reasoning != "" {
 		t.Fatalf("expected sanitized lfm2 content, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitReasoningResponseLFM2PreservesMetaOnlyFailureAsVisibleContent(t *testing.T) {
+	req := domain.ChatCompletionRequest{}
+	text := "The user asks for the capital of Korea, but I should not expose planner text."
+	content, reasoning := splitReasoningResponse(req, "LiquidAI/LFM2.5-8B-A1B", text)
+	if content != text || reasoning != "" {
+		t.Fatalf("expected meta-only LFM2 failure to remain visible, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitReasoningResponseLFM2PreservesUnclosedThinkAsVisibleFailure(t *testing.T) {
+	req := domain.ChatCompletionRequest{}
+	text := "<think>\nThe model never emitted a final answer."
+	content, reasoning := splitReasoningResponse(req, "lfm2", text)
+	if content != text || reasoning != "" {
+		t.Fatalf("expected unclosed LFM2 think block to remain visible, got content=%q reasoning=%q", content, reasoning)
 	}
 }
 
@@ -739,6 +772,17 @@ func TestLFM2StreamFilterDropsLeadingPlanningPrelude(t *testing.T) {
 	}
 	if got := filter.Filter(" Final answer: one two"); got != "one two" {
 		t.Fatalf("expected final answer after prelude, got %q", got)
+	}
+}
+
+func TestLFM2StreamFilterDropsLeadingPlanningUntilFinalOutput(t *testing.T) {
+	filter := newLFM2StreamFilter("")
+	if got := filter.Filter("We need to produce an output that meets constraints. "); got != "" {
+		t.Fatalf("expected planning prelude to be held, got %q", got)
+	}
+	got := filter.Filter(`Thus final output: "The described scenario outlines CPU inference behavior." I'll write a concise paragraph.`)
+	if got != `"The described scenario outlines CPU inference behavior."` {
+		t.Fatalf("expected generated final output span, got %q", got)
 	}
 }
 
@@ -938,7 +982,7 @@ func TestChatCompletionHandler_Stream(t *testing.T) {
 	}
 }
 
-func TestChatCompletionHandler_StreamLFM2WithoutExactAnswerDoesNotSuppressPrelude(t *testing.T) {
+func TestChatCompletionHandler_StreamLFM2WithoutExactAnswerSuppressesMetaOnlyPrelude(t *testing.T) {
 	mockModelService := NewMockModelService()
 	mockModelService.modelName = "/models/LFM2.5-8B-A1B-UD-Q5_K_M.gguf"
 	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
@@ -975,18 +1019,20 @@ func TestChatCompletionHandler_StreamLFM2WithoutExactAnswerDoesNotSuppressPrelud
 		t.Fatalf("Expected status 200, got %d", w.Code)
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, `"content":"The user wants "`) ||
-		!strings.Contains(body, `"content":"a detailed answer about memory locality."`) {
-		t.Fatalf("LFM2 long-form stream should not be suppressed without exact answer: %q", body)
+	if strings.Contains(body, `"content":"`) {
+		t.Fatalf("LFM2 meta-only stream should not expose planner text: %q", body)
 	}
 }
 
-func TestChatCompletionHandler_StreamLFM2LongExactAnswerPromptDoesNotSuppressGeneratedTokens(t *testing.T) {
+func TestChatCompletionHandler_StreamLFM2LongExactAnswerPromptExposesGeneratedFinalOutputOnly(t *testing.T) {
 	mockModelService := NewMockModelService()
 	mockModelService.modelName = "/models/LFM2.5-8B-A1B-Q4_K_M.gguf"
 	mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
 		go func() {
-			for _, token := range []string{"The user wants ", "a detailed answer about memory locality."} {
+			for _, token := range []string{
+				"The user wants a detailed answer about memory locality. ",
+				"Final output: CPU inference speed depends on memory locality.",
+			} {
 				outputChan <- domain.StreamEvent{Token: token}
 			}
 			outputChan <- domain.NewTerminalEvent(nil)
@@ -1019,9 +1065,8 @@ func TestChatCompletionHandler_StreamLFM2LongExactAnswerPromptDoesNotSuppressGen
 		t.Fatalf("Expected status 200, got %d", w.Code)
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, `"content":"The user wants "`) ||
-		!strings.Contains(body, `"content":"a detailed answer about memory locality."`) {
-		t.Fatalf("LFM2 long exact-answer stream should expose generated tokens: %q", body)
+	if !strings.Contains(body, `"content":"CPU inference speed depends on memory locality."`) {
+		t.Fatalf("LFM2 long exact-answer stream should expose generated final output: %q", body)
 	}
 	if strings.Contains(body, `"content":"`+testVerificationKey+`"`) {
 		t.Fatalf("LFM2 long stream must not synthesize exact answers: %q", body)

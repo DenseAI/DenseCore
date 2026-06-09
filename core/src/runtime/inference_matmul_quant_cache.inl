@@ -54,6 +54,12 @@ static inline int DenseCoreQ8_0Dot8I8I8(const int8_t* weight, const int8_t* inpu
 #endif
 }
 
+static inline float DenseCoreFp16ToFp32Fast(ggml_fp16_t value) {
+    float out_value = 0.0f;
+    ggml_cpu_fp16_to_fp32(&value, &out_value, 1);
+    return out_value;
+}
+
 static void DenseCoreGemvQ8_0_4x8Q8_0Generic(int n, float* out, const void* packed_weight, const void* q8_input,
                                              int nc) {
     if (!out || !packed_weight || !q8_input || n <= 0 || (n % QK8_0) != 0 || (nc % 4) != 0) {
@@ -63,11 +69,6 @@ static void DenseCoreGemvQ8_0_4x8Q8_0Generic(int n, float* out, const void* pack
     const size_t packed_block_bytes = 4 * sizeof(ggml_fp16_t) + QK8_0 * 4;
     const auto* packed_base = static_cast<const uint8_t*>(packed_weight);
     const auto* input_blocks = static_cast<const block_q8_0*>(q8_input);
-    const auto fp16_to_f32 = [](ggml_fp16_t value) {
-        float out_value = 0.0f;
-        ggml_cpu_fp16_to_fp32(&value, &out_value, 1);
-        return out_value;
-    };
     for (int group = 0; group < nc / 4; ++group) {
         float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         const auto* group_base = packed_base + static_cast<size_t>(group) * static_cast<size_t>(nb) * packed_block_bytes;
@@ -76,13 +77,19 @@ static void DenseCoreGemvQ8_0_4x8Q8_0Generic(int n, float* out, const void* pack
             const auto* scales = reinterpret_cast<const ggml_fp16_t*>(block_base);
             const auto* qs = reinterpret_cast<const int8_t*>(block_base + 4 * sizeof(ggml_fp16_t));
             const block_q8_0& x = input_blocks[b];
-            const float input_scale = fp16_to_f32(x.d);
+            const float input_scale = DenseCoreFp16ToFp32Fast(x.d);
+            const float row_scale[4] = {
+                DenseCoreFp16ToFp32Fast(scales[0]),
+                DenseCoreFp16ToFp32Fast(scales[1]),
+                DenseCoreFp16ToFp32Fast(scales[2]),
+                DenseCoreFp16ToFp32Fast(scales[3]),
+            };
             for (int row = 0; row < 4; ++row) {
                 int acc = 0;
                 for (int chunk = 0; chunk < QK8_0 / 8; ++chunk) {
                     acc += DenseCoreQ8_0Dot8I8I8(qs + chunk * 4 * 8 + row * 8, x.qs + chunk * 8);
                 }
-                sum[row] += static_cast<float>(acc) * fp16_to_f32(scales[row]) * input_scale;
+                sum[row] += static_cast<float>(acc) * row_scale[row] * input_scale;
             }
         }
         for (int row = 0; row < 4; ++row) {

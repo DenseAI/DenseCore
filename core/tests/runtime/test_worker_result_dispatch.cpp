@@ -713,6 +713,10 @@ TEST(WorkerResultDispatchTest, QwenDecodeSummaryAcceptsNativeMoeFastGateUpAndDow
     req.ssm_delta_calls = 1;
     req.ssm_delta_fast_default_used_ops = 1;
     req.ssm_delta_fast_default_wall_ns = 5'000'000;
+    req.q6k_gemv_candidate_ops = 2;
+    req.q6k_gemv_used_ops = 2;
+    req.q6k_gemv_effective_phase = "decode";
+    req.decode_graph_node_custom_lm_head_count = 1;
 
     ::testing::internal::CaptureStderr();
     LogRequestDecodeSummary(&req, &model);
@@ -736,8 +740,13 @@ TEST(WorkerResultDispatchTest, QwenDecodeSummaryAcceptsNativeMoeFastGateUpAndDow
     EXPECT_NE(captured.find("qwen_native_moe_w2_q5k_raw_batched_ms=2"), std::string::npos);
     EXPECT_NE(captured.find("moe_kquant_raw_batched_q4k_used_ops=2"), std::string::npos);
     EXPECT_NE(captured.find("moe_kquant_raw_batched_q4k_ms=3"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_native_moe_w1w3_q4k_raw_batched_used_ops=2"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_native_moe_w1w3_q4k_raw_batched_ms=3"), std::string::npos);
     EXPECT_NE(captured.find("moe_kquant_raw_batched_q5k_used_ops=3"), std::string::npos);
     EXPECT_NE(captured.find("moe_kquant_raw_batched_q5k_ms=4"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_decode_q6k_lm_head_overlap_candidate_ops=1"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_decode_q6k_lm_head_overlap_used_ops=1"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_decode_custom_lm_head_count=1"), std::string::npos);
     EXPECT_NE(captured.find("ssm_delta_fast_default_used_ops=1"), std::string::npos);
     EXPECT_NE(captured.find("ssm_delta_fast_default_wall_ms=5"), std::string::npos);
 }
@@ -802,6 +811,10 @@ TEST(WorkerResultDispatchTest, LFM2DecodeSummaryIncludesDedicatedFastPathAliases
     req.decode_graph_node_custom_projection_ns = 4400000;
     req.decode_graph_node_custom_lm_head_count = 1;
     req.decode_graph_node_custom_lm_head_ns = 3300000;
+    req.lfm2_greedy_lm_head_argmax_candidate_ops = 1;
+    req.lfm2_greedy_lm_head_argmax_rejected_ops = 1;
+    req.lfm2_greedy_lm_head_argmax_last_reject_reason =
+        static_cast<int>(LFM2GreedyLMHeadArgmaxRejectReason::ParityUnverified);
 
     ::testing::internal::CaptureStderr();
     LogRequestDecodeSummary(&req, &model);
@@ -814,6 +827,11 @@ TEST(WorkerResultDispatchTest, LFM2DecodeSummaryIncludesDedicatedFastPathAliases
     EXPECT_NE(captured.find("lfm2_w1w3_q4k_vecdot_scalar_used_ops=1"), std::string::npos);
     EXPECT_NE(captured.find("lfm2_w2_q4k_repacked_used_ops=3"), std::string::npos);
     EXPECT_NE(captured.find("lfm2_shortconv_sequence_fast_used_ops=4"), std::string::npos);
+    EXPECT_NE(captured.find("lfm2_greedy_lm_head_argmax_candidate_ops=1"), std::string::npos);
+    EXPECT_NE(captured.find("lfm2_greedy_lm_head_argmax_used_ops=0"), std::string::npos);
+    EXPECT_NE(captured.find("lfm2_greedy_lm_head_argmax_rejected_ops=1"), std::string::npos);
+    EXPECT_NE(captured.find("lfm2_greedy_lm_head_argmax_last_reject_reason=parity_unverified"),
+              std::string::npos);
     EXPECT_NE(captured.find("lfm2_decode_graph_rebuilds=1"), std::string::npos);
     EXPECT_NE(captured.find("model_execution_contract_has_lfm2_shortconv=1"), std::string::npos);
     EXPECT_NE(captured.find("decode_graph_custom_node_hist=moe:count=2:ms=1.1,ssm_stateful:count=4:ms=2.2,"
@@ -828,6 +846,31 @@ TEST(WorkerResultDispatchTest, LFM2DecodeSummaryIncludesDedicatedFastPathAliases
     EXPECT_NE(captured.find("target_stateful_ops_ok=1"), std::string::npos);
     EXPECT_NE(captured.find("target_required_fast_path_counters_ok=1"), std::string::npos);
     EXPECT_NE(captured.find("target_missing_required_fast_path_counters=none"), std::string::npos);
+}
+
+TEST(LFM2GreedyLMHeadArgmax, RejectingSamplingInvalidatesPrecomputedToken) {
+    InferenceWorkContext* ctx = CreateInferenceWorkContext();
+    ASSERT_NE(ctx, nullptr);
+    ResetInferenceWorkContext(ctx);
+
+    SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(
+        ctx, true, LFM2GreedyLMHeadArgmaxRejectReason::None, 1.0f, nullptr);
+    RecordInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(
+        ctx, GetInferenceWorkContextExecutionGenerationForTest(ctx), 7, 3.5f, 16);
+
+    int token = -1;
+    float value = 0.0f;
+    EXPECT_TRUE(TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(ctx, 16, &token, &value));
+    EXPECT_EQ(token, 7);
+    EXPECT_FLOAT_EQ(value, 3.5f);
+
+    SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(
+        ctx, false, LFM2GreedyLMHeadArgmaxRejectReason::ParityUnverified, 1.0f, nullptr);
+
+    token = -1;
+    value = 0.0f;
+    EXPECT_FALSE(TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(ctx, 16, &token, &value));
+    DestroyInferenceWorkContext(ctx);
 }
 
 TEST(WorkerResultDispatchTest, LFM2DecodeSummaryRejectsMissingNativeMoeFastOps) {
@@ -1004,6 +1047,35 @@ TEST(WorkerResultDispatchTest, Gemma4MoESummaryAcceptsCustomGemvDespiteOptionalD
     EXPECT_NE(captured.find("gemma4_decode_native_rejected_ops=4"), std::string::npos);
     EXPECT_NE(captured.find("target_no_native_moe_reject=1"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_failure_reason=none"), std::string::npos);
+}
+
+TEST(WorkerResultDispatchTest, Gemma4MoESummaryAcceptsX86CustomBatchedPrefill) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_experts = 128;
+    model.hparams.n_experts_used = 4;
+
+    Request req{};
+    InitDecodeSummaryRequest(&req);
+    req.prefill_matmul_path_hist[3] = 98;  // custom_batched_gemv
+    req.decode_matmul_path_hist[2] = 3;    // custom_gemv
+    req.gemma4_decode_native_rejected_ops = 3;
+
+    ::testing::internal::CaptureStderr();
+    LogRequestDecodeSummary(&req, &model);
+    const std::string captured = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(captured.find("[Gemma4DecodeSummary]"), std::string::npos);
+    EXPECT_NE(captured.find("prefill_matmul_path_hist=ggml_mul_mat:0,ggml_mul_mat_id:0,custom_gemv:0,"
+                            "custom_batched_gemv:98"),
+              std::string::npos);
+    EXPECT_NE(captured.find("target_no_ggml_path=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_no_native_moe_reject=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_fast_path_ok=1"), std::string::npos);
+    EXPECT_NE(captured.find("target_missing_required_fast_path_counters=none"), std::string::npos);
     EXPECT_NE(captured.find("target_fast_path_failure_reason=none"), std::string::npos);
 }
 

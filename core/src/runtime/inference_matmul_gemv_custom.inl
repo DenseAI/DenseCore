@@ -392,6 +392,13 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                     profile.lfm2_greedy_lm_head_argmax_last_reject_reason.store(
                         static_cast<int>(callback_work_ctx->lfm2_greedy_lm_head_argmax_reject_reason),
                         std::memory_order_relaxed);
+                    callback_work_ctx->lfm2_greedy_lm_head_argmax_generation = 0;
+                    callback_work_ctx->lfm2_greedy_lm_head_argmax_token = -1;
+                    callback_work_ctx->lfm2_greedy_lm_head_argmax_value = -std::numeric_limits<float>::infinity();
+                    callback_work_ctx->lfm2_greedy_lm_head_argmax_vocab_size = 0;
+                    callback_work_ctx->lfm2_greedy_lm_head_sparse_logits_ptr = nullptr;
+                    callback_work_ctx->lfm2_greedy_lm_head_sparse_logits_vocab_size = 0;
+                    callback_work_ctx->lfm2_greedy_lm_head_sparse_logits_token = -1;
                 }
             }
             if (lfm2_argmax_candidate && callback_work_ctx->lfm2_greedy_lm_head_argmax_allowed) {
