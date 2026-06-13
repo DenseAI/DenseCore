@@ -27,6 +27,8 @@ struct InferenceWorkContext {
         LFM2GreedyLMHeadArgmaxRejectReason::None;
     float lfm2_greedy_lm_head_argmax_repetition_penalty = 1.0f;
     std::vector<int> lfm2_greedy_lm_head_argmax_repeated_tokens;
+    std::vector<int> lfm2_greedy_lm_head_argmax_disallowed_tokens;
+    float lfm2_greedy_lm_head_argmax_final_logit_softcap = 0.0f;
     uint64_t lfm2_greedy_lm_head_argmax_generation = 0;
     int lfm2_greedy_lm_head_argmax_token = -1;
     float lfm2_greedy_lm_head_argmax_value = -std::numeric_limits<float>::infinity();
@@ -172,7 +174,9 @@ void ResetInferenceWorkContext(InferenceWorkContext* ctx) {
     ctx->lfm2_greedy_lm_head_argmax_allowed = false;
     ctx->lfm2_greedy_lm_head_argmax_reject_reason = LFM2GreedyLMHeadArgmaxRejectReason::None;
     ctx->lfm2_greedy_lm_head_argmax_repetition_penalty = 1.0f;
+    ctx->lfm2_greedy_lm_head_argmax_final_logit_softcap = 0.0f;
     ctx->lfm2_greedy_lm_head_argmax_repeated_tokens.clear();
+    ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens.clear();
     ctx->lfm2_greedy_lm_head_argmax_generation = 0;
     ctx->lfm2_greedy_lm_head_argmax_token = -1;
     ctx->lfm2_greedy_lm_head_argmax_value = -std::numeric_limits<float>::infinity();
@@ -223,7 +227,9 @@ void ResetCachedDecodeGraphWorkContext(InferenceWorkContext* ctx) {
     ctx->lfm2_greedy_lm_head_argmax_allowed = false;
     ctx->lfm2_greedy_lm_head_argmax_reject_reason = LFM2GreedyLMHeadArgmaxRejectReason::None;
     ctx->lfm2_greedy_lm_head_argmax_repetition_penalty = 1.0f;
+    ctx->lfm2_greedy_lm_head_argmax_final_logit_softcap = 0.0f;
     ctx->lfm2_greedy_lm_head_argmax_repeated_tokens.clear();
+    ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens.clear();
     ctx->lfm2_greedy_lm_head_argmax_generation = 0;
     ctx->lfm2_greedy_lm_head_argmax_token = -1;
     ctx->lfm2_greedy_lm_head_argmax_value = -std::numeric_limits<float>::infinity();
@@ -286,17 +292,26 @@ void SetInferenceWorkContextModelVariant(InferenceWorkContext* ctx, ModelVariant
     ctx->model_variant = variant;
 }
 
+ModelVariant GetCurrentInferenceWorkContextModelVariant() {
+    InferenceWorkContext* ctx = GetCurrentWorkContext();
+    return ctx ? ctx->model_variant : ModelVariant::UNKNOWN;
+}
+
 void SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(InferenceWorkContext* ctx, bool allowed,
                                                            LFM2GreedyLMHeadArgmaxRejectReason reject_reason,
                                                            float repetition_penalty,
-                                                           const std::vector<int>* token_history) {
+                                                           float final_logit_softcap,
+                                                           const std::vector<int>* token_history,
+                                                           const std::vector<int>* disallowed_token_ids) {
     if (!ctx) {
         return;
     }
     ctx->lfm2_greedy_lm_head_argmax_allowed = allowed;
     ctx->lfm2_greedy_lm_head_argmax_reject_reason = reject_reason;
     ctx->lfm2_greedy_lm_head_argmax_repetition_penalty = repetition_penalty;
+    ctx->lfm2_greedy_lm_head_argmax_final_logit_softcap = final_logit_softcap;
     ctx->lfm2_greedy_lm_head_argmax_repeated_tokens.clear();
+    ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens.clear();
     if (!allowed) {
         ctx->lfm2_greedy_lm_head_argmax_generation = 0;
         ctx->lfm2_greedy_lm_head_argmax_token = -1;
@@ -311,6 +326,16 @@ void SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(InferenceWorkContext*
         ctx->lfm2_greedy_lm_head_argmax_repeated_tokens.assign(token_history->begin(), token_history->end());
         std::sort(ctx->lfm2_greedy_lm_head_argmax_repeated_tokens.begin(),
                   ctx->lfm2_greedy_lm_head_argmax_repeated_tokens.end());
+    }
+    if (allowed && disallowed_token_ids && !disallowed_token_ids->empty()) {
+        ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens.assign(disallowed_token_ids->begin(),
+                                                                 disallowed_token_ids->end());
+        std::sort(ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens.begin(),
+                  ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens.end());
+        ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens.erase(
+            std::unique(ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens.begin(),
+                        ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens.end()),
+            ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens.end());
     }
 }
 
@@ -1809,6 +1834,7 @@ inline GemvBatchedUserData* GetGemvBatchedUserData() {
     ud->require_q4k_true_batched = false;
     ud->disable_quant_nrc_fast = false;
     ud->gemma4_dense_prefill_native = false;
+    ud->gemma4_prefill_safe_batched = false;
     ud->lfm2_q8_repacked_batched = false;
     ud->qwen36_ssm_q8_repacked_batched = false;
     ud->qwen36_ssm_q8_direct_batched = false;

@@ -28,6 +28,8 @@ bool CanUseQwenNativeMoEGateUpForTest(const TransformerModel* model, const ggml_
                                       const ggml_tensor* selected_experts, int phase);
 bool CanUseQwenNativeMoEW2ForTest(const TransformerModel* model, const ggml_tensor* down_exps,
                                   const ggml_tensor* hidden, const ggml_tensor* selected_experts, int phase);
+bool ShouldUseQwenLikeGateUpQ4KRepackedSwiGLUForTest(bool qwen_native_moe, bool lfm2_native_moe, int phase,
+                                                     bool kernel_available);
 bool ResolveQwen36SmallDecodeExpertParallelAutoEligibleForTest(bool is_qwen36_hybrid_moe, int physical_cores,
                                                                int simd_level);
 bool ResolveGemma4SmallDecodeExpertParallelAutoEligibleForTest(int physical_cores, int simd_level);
@@ -336,6 +338,18 @@ TEST(MoETrace, NativeMoEFastPathDefaultRejectsUnsupportedOrExplicitlyDisabledMod
         &gemma, static_cast<int>(InferenceExecutionPhase::Decode), static_cast<int>(RuntimeToggleMode::Auto)));
     EXPECT_FALSE(densecore::testing::ShouldEnableNativeMoEFastPathByDefaultForTest(
         &qwen_supported, static_cast<int>(InferenceExecutionPhase::Decode), static_cast<int>(RuntimeToggleMode::Off)));
+}
+
+TEST(MoETrace, Q4KGateUpRepackedDecodePathStaysQwenOnly) {
+    const int decode_phase = static_cast<int>(InferenceExecutionPhase::Decode);
+    const int prefill_phase = static_cast<int>(InferenceExecutionPhase::Prefill);
+
+    EXPECT_FALSE(densecore::testing::ShouldUseQwenLikeGateUpQ4KRepackedSwiGLUForTest(
+        /*qwen_native_moe=*/false, /*lfm2_native_moe=*/true, decode_phase, /*kernel_available=*/true));
+    EXPECT_TRUE(densecore::testing::ShouldUseQwenLikeGateUpQ4KRepackedSwiGLUForTest(
+        /*qwen_native_moe=*/true, /*lfm2_native_moe=*/false, decode_phase, /*kernel_available=*/true));
+    EXPECT_FALSE(densecore::testing::ShouldUseQwenLikeGateUpQ4KRepackedSwiGLUForTest(
+        /*qwen_native_moe=*/true, /*lfm2_native_moe=*/false, prefill_phase, /*kernel_available=*/true));
 }
 
 TEST(MoETrace, NativeMoEGateUpAdmissionSupportsQ5ForQwenAndLFM2) {

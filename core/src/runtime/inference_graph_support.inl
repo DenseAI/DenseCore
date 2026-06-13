@@ -231,10 +231,12 @@ bool IsGemma4NativeMoEGraphEnabled() {
 }
 
 bool Gemma4NativeMoEPrefillKernelSupported() {
-    // Real server QA currently fails when this prefill custom path is used:
-    // first-token logits drift before sampling, producing short-QA misses and
-    // repetition on Gemma4-26B Q4. Keep it fail-closed on every ISA until the
-    // gate/up/down callbacks have logits-parity coverage against the ggml path.
+    // C4 validation showed both candidate native prefill variants are not
+    // promotable yet: full gate/up+down passes QA but regresses prefill, and
+    // gate/up-only also regresses the default server path. Keep this fail-closed
+    // until the prefill work moves to a batched/AMX-grade implementation.
+    // This is deliberately not controlled by a benchmark env knob; once a faster
+    // path passes QA and throughput gates it should be promoted as the default.
     return false;
 }
 
@@ -673,6 +675,9 @@ struct Gemma4GateUpQ4KPrefillUserData {
     std::atomic<int64_t> next_batch{0};
     std::atomic<uint64_t> epoch{0};
     std::atomic<uint64_t> ready_epoch{0};
+    std::atomic<int> failure_count{0};
+    std::atomic<const char*> first_failure_reason{nullptr};
+    std::atomic<bool> used_recorded{false};
     static constexpr int kMaxTasks = 128;
     uint64_t task_epoch[kMaxTasks] = {};
 };
@@ -786,38 +791,27 @@ static Gemma4GateUpQ4KPrefillUserData* AllocateGemma4GateUpQ4KPrefillUserData(gg
         return nullptr;
     }
     if (ggml_get_no_alloc(ctx)) {
-        thread_local Gemma4GateUpQ4KPrefillUserData dry_ud;
-        thread_local std::vector<int32_t> dry_offsets;
-        thread_local std::vector<int32_t> dry_cursors;
-        thread_local std::vector<int32_t> dry_tokens;
-        thread_local std::vector<int32_t> dry_slots;
-        thread_local std::vector<int32_t> dry_batch_experts;
-        thread_local std::vector<int32_t> dry_batch_starts;
-        dry_offsets.resize(static_cast<size_t>(n_experts + 1));
-        dry_cursors.resize(static_cast<size_t>(n_experts));
-        dry_tokens.resize(static_cast<size_t>(max_assignments));
-        dry_slots.resize(static_cast<size_t>(max_assignments));
-        dry_batch_experts.resize(static_cast<size_t>(max_batches));
-        dry_batch_starts.resize(static_cast<size_t>(max_batches));
-        dry_ud.hidden_dim = hidden_dim;
-        dry_ud.intermediate_dim = intermediate_dim;
-        dry_ud.top_k = top_k;
-        dry_ud.n_tokens = n_tokens;
-        dry_ud.n_experts = n_experts;
-        dry_ud.max_assignments = max_assignments;
-        dry_ud.max_batches = max_batches;
-        dry_ud.expert_offsets = dry_offsets.data();
-        dry_ud.expert_cursors = dry_cursors.data();
-        dry_ud.assignment_tokens = dry_tokens.data();
-        dry_ud.assignment_slots = dry_slots.data();
-        dry_ud.batch_experts = dry_batch_experts.data();
-        dry_ud.batch_starts = dry_batch_starts.data();
-        dry_ud.total_batches.store(0, std::memory_order_relaxed);
-        dry_ud.next_batch.store(0, std::memory_order_relaxed);
-        dry_ud.epoch.store(0, std::memory_order_relaxed);
-        dry_ud.ready_epoch.store(0, std::memory_order_relaxed);
-        std::memset(dry_ud.task_epoch, 0, sizeof(dry_ud.task_epoch));
-        return &dry_ud;
+        // ggml no-alloc graph construction stores the userdata pointer in the
+        // custom op. A thread-local scratch object is unsafe because later graph
+        // builds (for example decode n_tokens=1) overwrite it before the prefill
+        // graph executes. The native prefill path is diagnostic/opt-in, so use a
+        // stable process-lifetime sidecar here until this path is promoted into a
+        // graph-owned allocation contract.
+        auto* ud = new Gemma4GateUpQ4KPrefillUserData();
+        ud->expert_offsets = new int32_t[static_cast<size_t>(n_experts + 1)]();
+        ud->expert_cursors = new int32_t[static_cast<size_t>(n_experts)]();
+        ud->assignment_tokens = new int32_t[static_cast<size_t>(max_assignments)]();
+        ud->assignment_slots = new int32_t[static_cast<size_t>(max_assignments)]();
+        ud->batch_experts = new int32_t[static_cast<size_t>(max_batches)]();
+        ud->batch_starts = new int32_t[static_cast<size_t>(max_batches)]();
+        ud->hidden_dim = hidden_dim;
+        ud->intermediate_dim = intermediate_dim;
+        ud->top_k = top_k;
+        ud->n_tokens = n_tokens;
+        ud->n_experts = n_experts;
+        ud->max_assignments = max_assignments;
+        ud->max_batches = max_batches;
+        return ud;
     }
 
     ggml_tensor* ud_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, sizeof(Gemma4GateUpQ4KPrefillUserData));
@@ -852,14 +846,68 @@ static Gemma4GateUpQ4KPrefillUserData* AllocateGemma4GateUpQ4KPrefillUserData(gg
     return ud;
 }
 
+static void MarkGemma4NativeMoEPrefillFailure(Gemma4GateUpQ4KPrefillUserData* ud, const char* reason,
+                                              const char* stage, int ith) {
+    if (!ud) {
+        return;
+    }
+    ud->failure_count.fetch_add(1, std::memory_order_relaxed);
+    const char* expected = nullptr;
+    ud->first_failure_reason.compare_exchange_strong(expected, reason, std::memory_order_relaxed);
+    if (ith == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
+        std::fprintf(stderr, "[Gemma4NativeMoEPrefillDebug] %s failed reason=%s\n", stage ? stage : "native_prefill",
+                     reason ? reason : "unknown");
+    }
+}
+
+static bool Gemma4PrefillInputShapeOk(const ggml_tensor* input, int64_t hidden_dim, int64_t top_k, int64_t n_tokens) {
+    if (!input || input->type != GGML_TYPE_F32 || input->ne[0] != hidden_dim || top_k <= 0 || n_tokens <= 0) {
+        return false;
+    }
+    if (input->ne[1] == n_tokens) {
+        return true;
+    }
+    if (input->ne[2] == n_tokens && (input->ne[1] == top_k || input->ne[1] == 1)) {
+        return true;
+    }
+    return false;
+}
+
+static bool Gemma4PrefillAssignmentShapeOk(const ggml_tensor* input, int64_t top_k, int64_t n_tokens) {
+    if (!input || input->type != GGML_TYPE_F32 || top_k <= 0 || n_tokens <= 0) {
+        return false;
+    }
+    if (input->ne[1] == n_tokens) {
+        return true;
+    }
+    if (input->ne[2] == n_tokens && (input->ne[1] == top_k || input->ne[1] == 1)) {
+        return true;
+    }
+    return false;
+}
+
+static const float* Gemma4PrefillInputRow(const ggml_tensor* input, int32_t token, int32_t slot,
+                                          const Gemma4GateUpQ4KPrefillUserData* ud) {
+    if (!input || !input->data || !ud || token < 0 || token >= ud->n_tokens || slot < 0 || slot >= ud->top_k ||
+        !Gemma4PrefillInputShapeOk(input, ud->hidden_dim, ud->top_k, ud->n_tokens)) {
+        return nullptr;
+    }
+    const char* base = static_cast<const char*>(input->data);
+    if (input->ne[1] == ud->n_tokens) {
+        return reinterpret_cast<const float*>(base + static_cast<size_t>(token) * input->nb[1]);
+    }
+    const int32_t source_slot = input->ne[1] == 1 ? 0 : slot;
+    return reinterpret_cast<const float*>(base + static_cast<size_t>(source_slot) * input->nb[1] +
+                                          static_cast<size_t>(token) * input->nb[2]);
+}
+
 static bool PrepareGemma4GateUpQ4KPrefillBatches(Gemma4GateUpQ4KPrefillUserData* ud,
                                                   const ggml_tensor* input, const ggml_tensor* selected_experts, int ith,
                                                   int nth) {
-    const bool input_token_shape_ok =
-        input && (input->ne[1] == ud->n_tokens || (input->ne[1] == ud->top_k && input->ne[2] == ud->n_tokens));
     if (!ud || !input || !selected_experts || !input->data || !selected_experts->data ||
         input->type != GGML_TYPE_F32 || selected_experts->type != GGML_TYPE_I32 || nth <= 0 || ith < 0 ||
-        ith >= nth || nth > Gemma4GateUpQ4KPrefillUserData::kMaxTasks || !input_token_shape_ok ||
+        ith >= nth || nth > Gemma4GateUpQ4KPrefillUserData::kMaxTasks ||
+        !Gemma4PrefillAssignmentShapeOk(input, ud->top_k, ud->n_tokens) ||
         selected_experts->ne[0] != ud->top_k ||
         selected_experts->ne[1] != ud->n_tokens || !ud->expert_offsets || !ud->expert_cursors ||
         !ud->assignment_tokens || !ud->assignment_slots || !ud->batch_experts || !ud->batch_starts) {
@@ -950,20 +998,38 @@ static bool PrepareGemma4GateUpQ4KPrefillBatches(Gemma4GateUpQ4KPrefillUserData*
     return true;
 }
 
-static void RunGemma4GateUpQ4KPrefillFusedGEGLU(ggml_tensor* dst, const ggml_tensor* gate_up_exps,
+static bool RunGemma4GateUpQ4KPrefillFusedGEGLU(ggml_tensor* dst, const ggml_tensor* gate_up_exps,
                                                 const ggml_tensor* input, const ggml_tensor* selected_experts,
                                                 int ith, int nth, Gemma4GateUpQ4KPrefillUserData* ud) {
     if (!dst || !gate_up_exps || !input || !selected_experts || !ud || !dst->data || !gate_up_exps->data ||
         !input->data || nth <= 0) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "gateup_missing_runtime_data", "gateup", ith);
+        return false;
     }
     if (dst->type != GGML_TYPE_F32 || gate_up_exps->type != GGML_TYPE_Q4_K || input->type != GGML_TYPE_F32 ||
         selected_experts->type != GGML_TYPE_I32 || dst->ne[0] != ud->intermediate_dim || dst->ne[1] != ud->top_k ||
-        dst->ne[2] != ud->n_tokens || input->ne[0] != ud->hidden_dim || input->ne[1] != ud->n_tokens ||
+        dst->ne[2] != ud->n_tokens ||
+        !Gemma4PrefillInputShapeOk(input, ud->hidden_dim, ud->top_k, ud->n_tokens) ||
         gate_up_exps->ne[0] != ud->hidden_dim || gate_up_exps->ne[1] != 2 * ud->intermediate_dim ||
         gate_up_exps->ne[2] != ud->n_experts || (ud->hidden_dim % QK_K) != 0 || (ud->intermediate_dim % 8) != 0 ||
         dst->nb[0] != static_cast<int64_t>(sizeof(float))) {
-        return;
+        if (ith == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
+            std::fprintf(stderr,
+                         "[Gemma4NativeMoEPrefillDebug] gateup shape_mismatch dst_ne=[%lld,%lld,%lld] "
+                         "input_ne=[%lld,%lld,%lld] gate_ne=[%lld,%lld,%lld] selected_ne=[%lld,%lld,%lld] "
+                         "ud=[hidden=%lld,intermediate=%lld,top_k=%lld,tokens=%lld,experts=%lld]\n",
+                         static_cast<long long>(dst->ne[0]), static_cast<long long>(dst->ne[1]),
+                         static_cast<long long>(dst->ne[2]), static_cast<long long>(input->ne[0]),
+                         static_cast<long long>(input->ne[1]), static_cast<long long>(input->ne[2]),
+                         static_cast<long long>(gate_up_exps->ne[0]), static_cast<long long>(gate_up_exps->ne[1]),
+                         static_cast<long long>(gate_up_exps->ne[2]), static_cast<long long>(selected_experts->ne[0]),
+                         static_cast<long long>(selected_experts->ne[1]),
+                         static_cast<long long>(selected_experts->ne[2]), static_cast<long long>(ud->hidden_dim),
+                         static_cast<long long>(ud->intermediate_dim), static_cast<long long>(ud->top_k),
+                         static_cast<long long>(ud->n_tokens), static_cast<long long>(ud->n_experts));
+        }
+        MarkGemma4NativeMoEPrefillFailure(ud, "gateup_shape_or_type_mismatch", "gateup", ith);
+        return false;
     }
     if (ith == 0) {
         ZeroGemma4PrefillF32Tensor(dst);
@@ -989,7 +1055,8 @@ static void RunGemma4GateUpQ4KPrefillFusedGEGLU(ggml_tensor* dst, const ggml_ten
                          selected_experts ? static_cast<long long>(selected_experts->ne[1]) : -1LL,
                          selected_experts ? static_cast<long long>(selected_experts->ne[2]) : -1LL);
         }
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "gateup_prepare_failed", "gateup", ith);
+        return false;
     }
     if (ith == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
         static std::atomic<int> gateup_debug_count{0};
@@ -1007,27 +1074,24 @@ static void RunGemma4GateUpQ4KPrefillFusedGEGLU(ggml_tensor* dst, const ggml_ten
     const int tile_count = static_cast<int>(ud->intermediate_dim / 8);
     const int64_t total_batches = ud->total_batches.load(std::memory_order_acquire);
     const char* weight_base = static_cast<const char*>(gate_up_exps->data);
-    const char* input_base = static_cast<const char*>(input->data);
     char* dst_base = static_cast<char*>(dst->data);
     const size_t q4_row_bytes = ggml_row_size(GGML_TYPE_Q4_K, ud->hidden_dim);
     if (q4_row_bytes == 0 || static_cast<size_t>(gate_up_exps->nb[1]) < q4_row_bytes ||
         static_cast<size_t>(gate_up_exps->nb[2]) <
             static_cast<size_t>(2 * ud->intermediate_dim - 1) * static_cast<size_t>(gate_up_exps->nb[1]) +
                 q4_row_bytes) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "gateup_row_stride_mismatch", "gateup", ith);
+        return false;
     }
     const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
     const auto* q4_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
     if (!q8_traits || !q8_traits->from_float || !q4_traits || q4_traits->vec_dot_type != GGML_TYPE_Q8_K) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "gateup_q4k_q8k_traits_unavailable", "gateup", ith);
+        return false;
     }
 
     thread_local std::vector<uint8_t> q8_tail_buf;
     q8_tail_buf.resize(ggml_row_size(GGML_TYPE_Q8_K, ud->hidden_dim));
-    const bool single_token_decode = ud->n_tokens == 1 && input->ne[1] == 1;
-    if (single_token_decode) {
-        q8_traits->from_float(reinterpret_cast<const float*>(input_base), q8_tail_buf.data(), ud->hidden_dim);
-    }
 
     for (;;) {
         const int64_t batch = ud->next_batch.fetch_add(1, std::memory_order_relaxed);
@@ -1055,11 +1119,12 @@ static void RunGemma4GateUpQ4KPrefillFusedGEGLU(ggml_tensor* dst, const ggml_ten
             if (token < 0 || token >= ud->n_tokens || slot < 0 || slot >= ud->top_k) {
                 continue;
             }
-            if (!single_token_decode) {
-                const float* src =
-                    reinterpret_cast<const float*>(input_base + static_cast<size_t>(token) * input->nb[1]);
-                q8_traits->from_float(src, q8_tail_buf.data(), ud->hidden_dim);
+            const float* src = Gemma4PrefillInputRow(input, token, slot, ud);
+            if (!src) {
+                MarkGemma4NativeMoEPrefillFailure(ud, "gateup_input_row_unavailable", "gateup", ith);
+                return false;
             }
+            q8_traits->from_float(src, q8_tail_buf.data(), ud->hidden_dim);
             for (int tile = 0; tile < tile_count; ++tile) {
                 for (int lane = 0; lane < 8; ++lane) {
                     const int64_t row = static_cast<int64_t>(tile) * 8 + lane;
@@ -1068,10 +1133,13 @@ static void RunGemma4GateUpQ4KPrefillFusedGEGLU(ggml_tensor* dst, const ggml_ten
                     const void* up_row =
                         expert_base + static_cast<size_t>(ud->intermediate_dim + row) *
                                           static_cast<size_t>(gate_up_exps->nb[1]);
-                    Gemma4QuantizedRowDot(GGML_TYPE_Q4_K, gate_row, q8_tail_buf.data(), ud->hidden_dim,
-                                          &gate_tail[lane]);
-                    Gemma4QuantizedRowDot(GGML_TYPE_Q4_K, up_row, q8_tail_buf.data(), ud->hidden_dim,
-                                          &up_tail[lane]);
+                    if (!Gemma4QuantizedRowDot(GGML_TYPE_Q4_K, gate_row, q8_tail_buf.data(), ud->hidden_dim,
+                                               &gate_tail[lane]) ||
+                        !Gemma4QuantizedRowDot(GGML_TYPE_Q4_K, up_row, q8_tail_buf.data(), ud->hidden_dim,
+                                               &up_tail[lane])) {
+                        MarkGemma4NativeMoEPrefillFailure(ud, "gateup_row_dot_failed", "gateup", ith);
+                        return false;
+                    }
                 }
                 float* out = reinterpret_cast<float*>(dst_base + static_cast<size_t>(tile) * 8 * dst->nb[0] +
                                                       static_cast<size_t>(slot) * dst->nb[1] +
@@ -1089,17 +1157,23 @@ static void RunGemma4GateUpQ4KPrefillFusedGEGLU(ggml_tensor* dst, const ggml_ten
             }
         }
     }
+    return true;
 }
 
 static void cb_gemma4_gateup_q4k_prefill_geglu(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     const auto begin = std::chrono::steady_clock::now();
-    RunGemma4GateUpQ4KPrefillFusedGEGLU(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
-                                        dst ? dst->src[2] : nullptr, ith, nth,
-                                        static_cast<Gemma4GateUpQ4KPrefillUserData*>(userdata));
+    auto* ud = static_cast<Gemma4GateUpQ4KPrefillUserData*>(userdata);
+    const bool ok = RunGemma4GateUpQ4KPrefillFusedGEGLU(dst, dst ? dst->src[0] : nullptr,
+                                                        dst ? dst->src[1] : nullptr, dst ? dst->src[2] : nullptr,
+                                                        ith, nth, ud);
     const uint64_t ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
     if (GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill) {
         RecordGemma4NativeMoEPrefillTiming(GetCurrentWorkContext(), ns, 0, ns);
+        if (!ok && ud) {
+            RecordGemma4NativeMoEPrefillDecision(GetCurrentWorkContext(), /*candidate=*/false, /*used=*/false,
+                                                 ud->first_failure_reason.load(std::memory_order_relaxed), 0, false);
+        }
     }
     if (ith == 0 && GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode) {
         RecordGemma4NativeFusedGateUpUsed(GetCurrentWorkContext());
@@ -1110,13 +1184,14 @@ static void cb_gemma4_gateup_q4k_prefill_geglu(struct ggml_tensor* dst, int ith,
     }
 }
 
-static void RunGemma4DownQuantPrefill(ggml_tensor* dst, const ggml_tensor* down_exps, const ggml_tensor* hidden,
+static bool RunGemma4DownQuantPrefill(ggml_tensor* dst, const ggml_tensor* down_exps, const ggml_tensor* hidden,
                                       const ggml_tensor* selected_experts, int ith, int nth,
                                       Gemma4GateUpQ4KPrefillUserData* ud, ggml_type weight_type,
                                       const char* debug_label) {
     if (!dst || !down_exps || !hidden || !selected_experts || !ud || !dst->data || !down_exps->data ||
         !hidden->data || nth <= 0) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_quant_missing_runtime_data", debug_label, ith);
+        return false;
     }
     if (dst->type != GGML_TYPE_F32 || down_exps->type != weight_type || hidden->type != GGML_TYPE_F32 ||
         selected_experts->type != GGML_TYPE_I32 || dst->ne[0] != ud->hidden_dim || dst->ne[1] != ud->top_k ||
@@ -1124,7 +1199,8 @@ static void RunGemma4DownQuantPrefill(ggml_tensor* dst, const ggml_tensor* down_
         hidden->ne[2] != ud->n_tokens || down_exps->ne[0] != ud->intermediate_dim ||
         down_exps->ne[1] != ud->hidden_dim || down_exps->ne[2] != ud->n_experts ||
         dst->nb[0] != static_cast<int64_t>(sizeof(float))) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_quant_shape_or_type_mismatch", debug_label, ith);
+        return false;
     }
     ggml_type input_quant_type = GGML_TYPE_COUNT;
     size_t input_quant_row_bytes = 0;
@@ -1132,17 +1208,20 @@ static void RunGemma4DownQuantPrefill(ggml_tensor* dst, const ggml_tensor* down_
                                                            &input_quant_row_bytes);
     const bool use_dequant_dot = !use_vec_dot && Gemma4CanUseDequantizedF32RowDot(weight_type, ud->intermediate_dim);
     if (!use_vec_dot && !use_dequant_dot) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_quant_dot_traits_unavailable", debug_label, ith);
+        return false;
     }
     const size_t weight_row_bytes = ggml_row_size(weight_type, ud->intermediate_dim);
     if (weight_row_bytes == 0 || static_cast<size_t>(down_exps->nb[1]) < weight_row_bytes ||
         static_cast<size_t>(down_exps->nb[2]) <
             static_cast<size_t>(ud->hidden_dim - 1) * static_cast<size_t>(down_exps->nb[1]) + weight_row_bytes) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_quant_row_stride_mismatch", debug_label, ith);
+        return false;
     }
     const ggml_type_traits_cpu* input_traits = use_vec_dot ? ggml_get_type_traits_cpu(input_quant_type) : nullptr;
     if (use_vec_dot && (!input_traits || !input_traits->from_float)) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_quant_input_traits_unavailable", debug_label, ith);
+        return false;
     }
     if (ith == 0) {
         ZeroGemma4PrefillF32Tensor(dst);
@@ -1152,7 +1231,8 @@ static void RunGemma4DownQuantPrefill(ggml_tensor* dst, const ggml_tensor* down_
             std::fprintf(stderr, "[Gemma4NativeMoEPrefillDebug] %s prepare_failed\n",
                          debug_label ? debug_label : "down_quant");
         }
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_quant_prepare_failed", debug_label, ith);
+        return false;
     }
     if (ith == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
         static std::atomic<int> down_quant_debug_count{0};
@@ -1212,9 +1292,13 @@ static void RunGemma4DownQuantPrefill(ggml_tensor* dst, const ggml_tensor* down_
                 const void* down_row =
                     expert_base + static_cast<size_t>(row) * static_cast<size_t>(down_exps->nb[1]);
                 if (use_vec_dot) {
-                    Gemma4QuantizedRowDot(weight_type, down_row, qrow.data(), ud->intermediate_dim, out + row);
-                } else {
-                    Gemma4DequantizedF32RowDot(weight_type, down_row, src, ud->intermediate_dim, out + row);
+                    if (!Gemma4QuantizedRowDot(weight_type, down_row, qrow.data(), ud->intermediate_dim, out + row)) {
+                        MarkGemma4NativeMoEPrefillFailure(ud, "down_quant_row_dot_failed", debug_label, ith);
+                        return false;
+                    }
+                } else if (!Gemma4DequantizedF32RowDot(weight_type, down_row, src, ud->intermediate_dim, out + row)) {
+                    MarkGemma4NativeMoEPrefillFailure(ud, "down_quant_dequant_row_dot_failed", debug_label, ith);
+                    return false;
                 }
             }
             if (ith == 0 && batch == 0 && r == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
@@ -1224,14 +1308,16 @@ static void RunGemma4DownQuantPrefill(ggml_tensor* dst, const ggml_tensor* down_
             }
         }
     }
+    return true;
 }
 
-static void RunGemma4DownQ4KPrefill(ggml_tensor* dst, const ggml_tensor* down_exps, const ggml_tensor* hidden,
+static bool RunGemma4DownQ4KPrefill(ggml_tensor* dst, const ggml_tensor* down_exps, const ggml_tensor* hidden,
                                     const ggml_tensor* selected_experts, int ith, int nth,
                                     Gemma4GateUpQ4KPrefillUserData* ud) {
     if (!dst || !down_exps || !hidden || !selected_experts || !ud || !dst->data || !down_exps->data ||
         !hidden->data || nth <= 0) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_q4k_missing_runtime_data", "down_q4k", ith);
+        return false;
     }
     if (dst->type != GGML_TYPE_F32 || down_exps->type != GGML_TYPE_Q4_K || hidden->type != GGML_TYPE_F32 ||
         selected_experts->type != GGML_TYPE_I32 || dst->ne[0] != ud->hidden_dim || dst->ne[1] != ud->top_k ||
@@ -1240,7 +1326,8 @@ static void RunGemma4DownQ4KPrefill(ggml_tensor* dst, const ggml_tensor* down_ex
         down_exps->ne[1] != ud->hidden_dim || down_exps->ne[2] != ud->n_experts ||
         (ud->intermediate_dim % QK_K) != 0 || (ud->hidden_dim % 8) != 0 ||
         dst->nb[0] != static_cast<int64_t>(sizeof(float))) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_q4k_shape_or_type_mismatch", "down_q4k", ith);
+        return false;
     }
     if (ith == 0) {
         ZeroGemma4PrefillF32Tensor(dst);
@@ -1249,7 +1336,8 @@ static void RunGemma4DownQ4KPrefill(ggml_tensor* dst, const ggml_tensor* down_ex
         if (ith == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
             std::fprintf(stderr, "[Gemma4NativeMoEPrefillDebug] down_q4k prepare_failed\n");
         }
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_q4k_prepare_failed", "down_q4k", ith);
+        return false;
     }
     if (ith == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
         static std::atomic<int> down_q4k_debug_count{0};
@@ -1273,12 +1361,14 @@ static void RunGemma4DownQ4KPrefill(ggml_tensor* dst, const ggml_tensor* down_ex
     if (q4_row_bytes == 0 || static_cast<size_t>(down_exps->nb[1]) < q4_row_bytes ||
         static_cast<size_t>(down_exps->nb[2]) <
             static_cast<size_t>(ud->hidden_dim - 1) * static_cast<size_t>(down_exps->nb[1]) + q4_row_bytes) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_q4k_row_stride_mismatch", "down_q4k", ith);
+        return false;
     }
     const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
     const auto* q4_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
     if (!q8_traits || !q8_traits->from_float || !q4_traits || q4_traits->vec_dot_type != GGML_TYPE_Q8_K) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_q4k_q8k_traits_unavailable", "down_q4k", ith);
+        return false;
     }
 
     thread_local std::vector<uint8_t> q8_tail_buf;
@@ -1317,8 +1407,11 @@ static void RunGemma4DownQ4KPrefill(ggml_tensor* dst, const ggml_tensor* down_ex
                     const int64_t row = static_cast<int64_t>(tile) * 8 + lane;
                     const void* down_row =
                         expert_base + static_cast<size_t>(row) * static_cast<size_t>(down_exps->nb[1]);
-                    Gemma4QuantizedRowDot(GGML_TYPE_Q4_K, down_row, q8_tail_buf.data(), ud->intermediate_dim,
-                                          &down_tail[lane]);
+                    if (!Gemma4QuantizedRowDot(GGML_TYPE_Q4_K, down_row, q8_tail_buf.data(), ud->intermediate_dim,
+                                               &down_tail[lane])) {
+                        MarkGemma4NativeMoEPrefillFailure(ud, "down_q4k_row_dot_failed", "down_q4k", ith);
+                        return false;
+                    }
                 }
                 float* out = reinterpret_cast<float*>(dst_base + static_cast<size_t>(tile) * 8 * dst->nb[0] +
                                                       static_cast<size_t>(slot) * dst->nb[1] +
@@ -1333,24 +1426,35 @@ static void RunGemma4DownQ4KPrefill(ggml_tensor* dst, const ggml_tensor* down_ex
             }
         }
     }
+    return true;
 }
 
 static void cb_gemma4_down_q4k_prefill(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     const auto begin = std::chrono::steady_clock::now();
-    RunGemma4DownQ4KPrefill(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
-                            dst ? dst->src[2] : nullptr, ith, nth,
-                            static_cast<Gemma4GateUpQ4KPrefillUserData*>(userdata));
+    auto* ud = static_cast<Gemma4GateUpQ4KPrefillUserData*>(userdata);
+    const bool ok = RunGemma4DownQ4KPrefill(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
+                                            dst ? dst->src[2] : nullptr, ith, nth, ud);
     const uint64_t ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
     RecordGemma4NativeMoEPrefillTiming(GetCurrentWorkContext(), 0, ns, ns);
+    if (ud) {
+        if (ok && !ud->used_recorded.exchange(true, std::memory_order_relaxed)) {
+            RecordGemma4NativeMoEPrefillDecision(GetCurrentWorkContext(), /*candidate=*/false, /*used=*/true, nullptr,
+                                                 /*replaced_mul_mat_id_ops=*/2, false);
+        } else if (!ok) {
+            RecordGemma4NativeMoEPrefillDecision(GetCurrentWorkContext(), /*candidate=*/false, /*used=*/false,
+                                                 ud->first_failure_reason.load(std::memory_order_relaxed), 0, false);
+        }
+    }
 }
 
-static void RunGemma4DownQ8_0Prefill(ggml_tensor* dst, const ggml_tensor* down_exps, const ggml_tensor* hidden,
+static bool RunGemma4DownQ8_0Prefill(ggml_tensor* dst, const ggml_tensor* down_exps, const ggml_tensor* hidden,
                                      const ggml_tensor* selected_experts, int ith, int nth,
                                      Gemma4GateUpQ4KPrefillUserData* ud) {
     if (!dst || !down_exps || !hidden || !selected_experts || !ud || !dst->data || !down_exps->data ||
         !hidden->data || nth <= 0) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_q8_0_missing_runtime_data", "down_q8_0", ith);
+        return false;
     }
     if (dst->type != GGML_TYPE_F32 || down_exps->type != GGML_TYPE_Q8_0 || hidden->type != GGML_TYPE_F32 ||
         selected_experts->type != GGML_TYPE_I32 || dst->ne[0] != ud->hidden_dim || dst->ne[1] != ud->top_k ||
@@ -1359,7 +1463,8 @@ static void RunGemma4DownQ8_0Prefill(ggml_tensor* dst, const ggml_tensor* down_e
         down_exps->ne[1] != ud->hidden_dim || down_exps->ne[2] != ud->n_experts ||
         (ud->intermediate_dim % QK8_0) != 0 || (ud->hidden_dim % 4) != 0 ||
         dst->nb[0] != static_cast<int64_t>(sizeof(float))) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_q8_0_shape_or_type_mismatch", "down_q8_0", ith);
+        return false;
     }
     if (ith == 0) {
         ZeroGemma4PrefillF32Tensor(dst);
@@ -1368,7 +1473,8 @@ static void RunGemma4DownQ8_0Prefill(ggml_tensor* dst, const ggml_tensor* down_e
         if (ith == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
             std::fprintf(stderr, "[Gemma4NativeMoEPrefillDebug] down_q8_0 prepare_failed\n");
         }
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_q8_0_prepare_failed", "down_q8_0", ith);
+        return false;
     }
     if (ith == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
         static std::atomic<int> down_q8_debug_count{0};
@@ -1387,7 +1493,8 @@ static void RunGemma4DownQ8_0Prefill(ggml_tensor* dst, const ggml_tensor* down_e
     if (q8_row_bytes == 0 || static_cast<size_t>(down_exps->nb[1]) < q8_row_bytes ||
         static_cast<size_t>(down_exps->nb[2]) <
             static_cast<size_t>(ud->hidden_dim - 1) * static_cast<size_t>(down_exps->nb[1]) + q8_row_bytes) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_q8_0_row_stride_mismatch", "down_q8_0", ith);
+        return false;
     }
     const int64_t total_batches = ud->total_batches.load(std::memory_order_acquire);
     const char* weight_base = static_cast<const char*>(down_exps->data);
@@ -1395,12 +1502,14 @@ static void RunGemma4DownQ8_0Prefill(ggml_tensor* dst, const ggml_tensor* down_e
     char* dst_base = static_cast<char*>(dst->data);
     const auto* weight_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
     if (!weight_traits || !weight_traits->vec_dot) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_q8_0_weight_traits_unavailable", "down_q8_0", ith);
+        return false;
     }
     const ggml_type input_quant_type = weight_traits->vec_dot_type;
     const auto* input_traits = ggml_get_type_traits_cpu(input_quant_type);
     if (!input_traits || !input_traits->from_float) {
-        return;
+        MarkGemma4NativeMoEPrefillFailure(ud, "down_q8_0_input_traits_unavailable", "down_q8_0", ith);
+        return false;
     }
 
     thread_local std::vector<uint8_t> q8_row;
@@ -1437,7 +1546,10 @@ static void RunGemma4DownQ8_0Prefill(ggml_tensor* dst, const ggml_tensor* down_e
             for (int64_t row = 0; row < ud->hidden_dim; ++row) {
                 const void* down_row =
                     expert_base + static_cast<size_t>(row) * static_cast<size_t>(down_exps->nb[1]);
-                Gemma4QuantizedRowDot(GGML_TYPE_Q8_0, down_row, q8_row.data(), ud->intermediate_dim, out + row);
+                if (!Gemma4QuantizedRowDot(GGML_TYPE_Q8_0, down_row, q8_row.data(), ud->intermediate_dim, out + row)) {
+                    MarkGemma4NativeMoEPrefillFailure(ud, "down_q8_0_row_dot_failed", "down_q8_0", ith);
+                    return false;
+                }
             }
             if (ith == 0 && batch == 0 && r == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
                 std::fprintf(stderr,
@@ -1447,34 +1559,41 @@ static void RunGemma4DownQ8_0Prefill(ggml_tensor* dst, const ggml_tensor* down_e
             }
         }
     }
+    return true;
 }
 
 static void cb_gemma4_down_q8_0_prefill(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     const auto begin = std::chrono::steady_clock::now();
-    RunGemma4DownQ8_0Prefill(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
-                             dst ? dst->src[2] : nullptr, ith, nth,
-                             static_cast<Gemma4GateUpQ4KPrefillUserData*>(userdata));
+    auto* ud = static_cast<Gemma4GateUpQ4KPrefillUserData*>(userdata);
+    const bool ok = RunGemma4DownQ8_0Prefill(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
+                                             dst ? dst->src[2] : nullptr, ith, nth, ud);
     const uint64_t ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
     RecordGemma4NativeMoEPrefillTiming(GetCurrentWorkContext(), 0, ns, ns);
-    if (ith == 0) {
-        RecordGemma4NativeMoEPrefillDecision(GetCurrentWorkContext(), /*candidate=*/true, /*used=*/true, nullptr,
+    if (ud && ok && !ud->used_recorded.exchange(true, std::memory_order_relaxed)) {
+        RecordGemma4NativeMoEPrefillDecision(GetCurrentWorkContext(), /*candidate=*/false, /*used=*/true, nullptr,
                                              /*replaced_mul_mat_id_ops=*/2, false);
+    } else if (ud && !ok) {
+        RecordGemma4NativeMoEPrefillDecision(GetCurrentWorkContext(), /*candidate=*/false, /*used=*/false,
+                                             ud->first_failure_reason.load(std::memory_order_relaxed), 0, false);
     }
 }
 
 static void cb_gemma4_down_q5_1_prefill(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     const auto begin = std::chrono::steady_clock::now();
-    RunGemma4DownQuantPrefill(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
-                              dst ? dst->src[2] : nullptr, ith, nth,
-                              static_cast<Gemma4GateUpQ4KPrefillUserData*>(userdata), GGML_TYPE_Q5_1,
-                              "down_q5_1");
+    auto* ud = static_cast<Gemma4GateUpQ4KPrefillUserData*>(userdata);
+    const bool ok = RunGemma4DownQuantPrefill(dst, dst ? dst->src[0] : nullptr, dst ? dst->src[1] : nullptr,
+                                              dst ? dst->src[2] : nullptr, ith, nth, ud, GGML_TYPE_Q5_1,
+                                              "down_q5_1");
     const uint64_t ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
     RecordGemma4NativeMoEPrefillTiming(GetCurrentWorkContext(), 0, ns, ns);
-    if (ith == 0) {
-        RecordGemma4NativeMoEPrefillDecision(GetCurrentWorkContext(), /*candidate=*/true, /*used=*/true, nullptr,
+    if (ud && ok && !ud->used_recorded.exchange(true, std::memory_order_relaxed)) {
+        RecordGemma4NativeMoEPrefillDecision(GetCurrentWorkContext(), /*candidate=*/false, /*used=*/true, nullptr,
                                              /*replaced_mul_mat_id_ops=*/2, false);
+    } else if (ud && !ok) {
+        RecordGemma4NativeMoEPrefillDecision(GetCurrentWorkContext(), /*candidate=*/false, /*used=*/false,
+                                             ud->first_failure_reason.load(std::memory_order_relaxed), 0, false);
     }
 }
 
@@ -1489,9 +1608,11 @@ static bool CanUseGemma4GateUpQ4KFusedGEGLU(const TransformerModel* model, const
     if (gate_up_exps->type != GGML_TYPE_Q4_K || input->type != GGML_TYPE_F32 || selected_experts->type != GGML_TYPE_I32) {
         return false;
     }
-    if (input->ne[1] <= 0 || input->ne[0] <= 0 || input->ne[0] != gate_up_exps->ne[0] ||
+    const int64_t n_tokens = selected_experts->ne[1];
+    const int64_t top_k = selected_experts->ne[0];
+    if (n_tokens <= 0 || top_k <= 0 || !Gemma4PrefillInputShapeOk(input, gate_up_exps->ne[0], top_k, n_tokens) ||
         gate_up_exps->ne[1] != 2 * intermediate_dim || gate_up_exps->ne[2] != n_experts ||
-        selected_experts->ne[1] != input->ne[1] || selected_experts->ne[0] <= 0) {
+        selected_experts->ne[0] <= 0) {
         return false;
     }
     const size_t row_bytes = ggml_row_size(GGML_TYPE_Q4_K, input->ne[0]);
@@ -1707,72 +1828,11 @@ ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     ggml_build_forward_expand(gf, weights);
 
     ggml_tensor* hidden = nullptr;
-    const bool native_prefill_candidate =
-        GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill && n_tokens > 0;
-    const bool native_prefill_enabled = native_prefill_candidate && IsGemma4NativeMoEPrefillEnabled();
-    InferenceWorkContext* native_prefill_profile_ctx = ggml_get_no_alloc(ctx) ? nullptr : GetCurrentWorkContext();
-    if (native_prefill_candidate) {
-        const char* reject_reason = nullptr;
-        if (!native_prefill_enabled) {
-            reject_reason = "parity_unverified";
-        } else if (GetCurrentBatch() && !GetCurrentBatch()->lora_map.empty()) {
-            reject_reason = "lora_active";
-        } else if (!gate_up_exps) {
-            reject_reason = "missing_packed_gate_up";
-        } else if (!CanUseGemma4GateUpQ4KFusedGEGLU(model, gate_up_exps, routed_input, selected_experts,
-                                                    roots.layout.intermediate_dim, roots.layout.num_experts)) {
-            reject_reason = "unsupported_gate_up_q4k_prefill";
-        } else if (!CanUseGemma4DownNativePrefill(model, down_exps, nullptr, selected_experts, roots.layout.hidden_dim,
-                                                  roots.layout.intermediate_dim, roots.layout.num_experts)) {
-            reject_reason = "unsupported_down_native_prefill";
-        }
-        RecordGemma4NativeMoEPrefillDecision(native_prefill_profile_ctx, /*candidate=*/true, /*used=*/false,
-                                             reject_reason, 0, false);
-        if (!reject_reason) {
-            Gemma4GateUpQ4KPrefillUserData* gateup_ud = AllocateGemma4GateUpQ4KPrefillUserData(
-                ctx, n_embd, roots.layout.intermediate_dim, n_expert_used, n_tokens, roots.layout.num_experts);
-            Gemma4GateUpQ4KPrefillUserData* down_ud = AllocateGemma4GateUpQ4KPrefillUserData(
-                ctx, n_embd, roots.layout.intermediate_dim, n_expert_used, n_tokens, roots.layout.num_experts);
-            if (!gateup_ud || !down_ud) {
-                RecordGemma4NativeMoEPrefillDecision(native_prefill_profile_ctx, /*candidate=*/false, /*used=*/false,
-                                                     "userdata_allocation_failed", 0, false);
-            } else {
-                ggml_tensor* gateup_args[] = {gate_up_exps, routed_input, selected_experts};
-                ggml_tensor* hidden_native =
-                    ggml_custom_4d(ctx, GGML_TYPE_F32, roots.layout.intermediate_dim, n_expert_used, n_tokens, 1,
-                                   gateup_args, 3, cb_gemma4_gateup_q4k_prefill_geglu, GGML_N_TASKS_MAX, gateup_ud);
-                ggml_set_name(hidden_native, "gemma4_native_moe_prefill_gateup_q4k");
-                ggml_tensor* down_args[] = {down_exps, hidden_native, selected_experts};
-                ggml_custom_op_t down_cb = down_exps->type == GGML_TYPE_Q8_0
-                                               ? cb_gemma4_down_q8_0_prefill
-                                               : (down_exps->type == GGML_TYPE_Q5_1 ? cb_gemma4_down_q5_1_prefill
-                                                                                    : cb_gemma4_down_q4k_prefill);
-                ggml_tensor* experts_native =
-                    ggml_custom_4d(ctx, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens, 1, down_args, 3,
-                                   down_cb, GGML_N_TASKS_MAX, down_ud);
-                ggml_set_name(experts_native, down_exps->type == GGML_TYPE_Q8_0
-                                                  ? "gemma4_native_moe_prefill_down_q8_0"
-                                                  : (down_exps->type == GGML_TYPE_Q5_1
-                                                         ? "gemma4_native_moe_prefill_down_q5_1"
-                                                         : "gemma4_native_moe_prefill_down_q4k"));
-                ggml_tensor* out = BuildMoeExpertWeightedSumWithWeights(ctx, experts_native, weights, n_embd, n_tokens,
-                                                                        "gemma4_native_moe_prefill_expert_sum");
-                if (!out) {
-                    RecordGemma4NativeMoEPrefillDecision(native_prefill_profile_ctx, /*candidate=*/false,
-                                                         /*used=*/false, "weighted_sum_build_failed", 0, false);
-                } else {
-                    ggml_build_forward_expand(gf, out);
-                    char native_name[80];
-                    std::snprintf(native_name, sizeof(native_name), "blk.%d.gemma4_native_moe_prefill_out", layer_idx);
-                    ggml_set_name(out, native_name);
-                    RecordGemma4NativeMoEPrefillDecision(native_prefill_profile_ctx, /*candidate=*/false,
-                                                         /*used=*/true, nullptr,
-                                                         /*replaced_mul_mat_id_ops=*/2, false);
-                    return out;
-                }
-            }
-        }
-    }
+    // Do not build the full native gate/up+down prefill graph yet. The C4
+    // shape-correct run passed QA but regressed prefill because the native
+    // down-projection still performs per-row scalar dot work. Keep the proven
+    // gate/up custom op below and leave down/weighted-sum on the maintained
+    // graph path until a batched down kernel is available.
 
     ggml_tensor* cur3 = ggml_reshape_3d(ctx, routed_input, n_embd, 1, n_tokens);
     ggml_tensor* gate = nullptr;
@@ -2475,7 +2535,8 @@ static bool Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
         return true;
     }
 
-    const bool prefill_rows = GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill;
+    const InferenceExecutionPhase phase = GetCurrentExecutionPhase();
+    const bool prefill_rows = phase == InferenceExecutionPhase::Prefill;
 
     if (wtype == GGML_TYPE_Q4_K && row_start < row_end && (row_start % 8) == 0 && ((row_end - row_start) % 8) == 0) {
         const int64_t row_count = row_end - row_start;
@@ -2516,9 +2577,19 @@ static bool Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
         projection_tile.resize(tile_assignments.size() * static_cast<size_t>(row_count));
         densecore::CpuBackend& backend = densecore::GetCpuBackend();
         const void* weight_start = expert_base + static_cast<size_t>(row_start) * w_row_bytes;
-        const bool projected = densecore::RunQ6KRepackedMoEProjection(
-            &backend, weight_start, qtile, qrow_bytes, projection_tile.data(),
-            static_cast<int64_t>(tile_assignments.size()), row_count, K, /*numa_node=*/0, /*allow_parallel=*/false);
+        const bool lfm2_decode_q6k_raw_batched =
+            GetCurrentInferenceWorkContextModelVariant() == ModelVariant::LFM2MOE &&
+            phase == InferenceExecutionPhase::Decode;
+        const bool projected =
+            lfm2_decode_q6k_raw_batched
+                ? densecore::RunMoEKQuantRawBatchedProjection(
+                      &backend, static_cast<int>(wtype), weight_start, qtile, qrow_bytes, projection_tile.data(),
+                      static_cast<int64_t>(tile_assignments.size()), row_count, K, /*numa_node=*/0,
+                      /*allow_parallel=*/false)
+                : densecore::RunQ6KRepackedMoEProjection(
+                      &backend, weight_start, qtile, qrow_bytes, projection_tile.data(),
+                      static_cast<int64_t>(tile_assignments.size()), row_count, K, /*numa_node=*/0,
+                      /*allow_parallel=*/false);
         if (projected) {
             for (size_t m = 0; m < tile_assignments.size(); ++m) {
                 const Qwen35MoEAssignment& assignment = tile_assignments[m];
@@ -3640,43 +3711,18 @@ static bool Qwen35NativeMoEKQ8KFusedSwiGLURows(InferenceWorkContext* work_ctx, g
         }
         return true;
     }
-    const ggml_type_traits_cpu* traits =
-        PreferGgmlQ4KVecDotForNativeMoE() ? ggml_get_type_traits_cpu(weight_type) : nullptr;
-    if (traits && traits->vec_dot && traits->vec_dot_type == GGML_TYPE_Q8_K &&
-        (cols % ggml_blck_size(weight_type)) == 0) {
-        const auto* gate_base = static_cast<const char*>(gate_row_start);
-        const auto* up_base = static_cast<const char*>(up_row_start);
-        int64_t row = 0;
-        if (CanUseGgmlQ4KVecDotRowPairForNativeMoE()) {
-            if (row_count >= 2) {
-                RecordLFM2NativeMoEW1W3Kernel(work_ctx, "q4k_vecdot_rowpair");
-            }
-            for (; row + 1 < row_count; row += 2) {
-                const void* gate_row = gate_base + static_cast<size_t>(row) * row_bytes;
-                const void* up_row = up_base + static_cast<size_t>(row) * row_bytes;
-                float gate_sums[32] = {};
-                float up_sums[32] = {};
-                traits->vec_dot(static_cast<int>(cols), gate_sums, 2, gate_row, row_bytes, qrow, 0, 2);
-                traits->vec_dot(static_cast<int>(cols), up_sums, 2, up_row, row_bytes, qrow, 0, 2);
-                out_start[row] = NativeMoESiLU(gate_sums[0]) * up_sums[0];
-                out_start[row + 1] = NativeMoESiLU(gate_sums[1]) * up_sums[1];
-            }
-        }
-        if (row < row_count) {
-            RecordLFM2NativeMoEW1W3Kernel(work_ctx, "q4k_vecdot_scalar");
-        }
-        for (; row < row_count; ++row) {
-            const void* gate_row = gate_base + static_cast<size_t>(row) * row_bytes;
-            const void* up_row = up_base + static_cast<size_t>(row) * row_bytes;
-            float gate = 0.0f;
-            float up = 0.0f;
-            traits->vec_dot(static_cast<int>(cols), &gate, 0, gate_row, 0, qrow, 0, 1);
-            traits->vec_dot(static_cast<int>(cols), &up, 0, up_row, 0, qrow, 0, 1);
-            out_start[row] = NativeMoESiLU(gate) * up;
-        }
-        return true;
-    }
-
+    // LFM2 W1/W3 (Q4_K gate/up) decode: routing this fused-SwiGLU through ggml's
+    // K-quant 2-row vec_dot (rowpair, nrc=2) produced long-form repetition and
+    // garbage on ARM. The C4A final-sweep showed lfm2_w1w3_q4k_vecdot_rowpair
+    // dominating while QA failed (repetition_detected;garbage_output_detected),
+    // whereas C4 (x86) used the validated Highway kernel (lfm2_w1w3_q4k_hwy) and
+    // passed. The row-pair K-quant vec_dot is not parity-verified for this
+    // fused-SwiGLU shape/input-layout, so force the known-good Highway path for
+    // Q4_K on every ISA. This matches x86, where PreferGgmlQ4KVecDotForNativeMoE()
+    // is already false and the ggml vec_dot branch was never taken. Q5_K above
+    // already uses Highway unconditionally. Re-enabling the row-pair fast path
+    // requires wiring it through ParityGate (kernel_caps.h) so a divergent kernel
+    // auto-falls back to this Highway reference.
     RecordLFM2NativeMoEW1W3Kernel(work_ctx, "q4k_hwy");
     return densecore::hwy_kernels::FusedSwiGLUQ4KQ8KRows_Hwy(gate_row_start, up_row_start, qrow, cols, row_count,
                                                              row_bytes, out_start);
@@ -3804,6 +3850,8 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
     const int64_t row_start = (static_cast<int64_t>(ith) * n_ff) / nth;
     const int64_t row_end = (static_cast<int64_t>(ith + 1) * n_ff) / nth;
     const int64_t row_count = row_end - row_start;
+    const bool compact_gateup_rows = gate_exps->nb[1] == ggml_row_size(gate_exps->type, gate_exps->ne[0]) &&
+                                     up_exps->nb[1] == ggml_row_size(up_exps->type, up_exps->ne[0]);
     const bool use_shared_q8 = PrepareQwen35SharedQ8Rows(shared_q8, input, ith, nth);
     thread_local std::vector<uint8_t> qbuf;
     thread_local std::vector<Qwen35MoEAssignment> assignments;
@@ -3813,6 +3861,8 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
     if (ith == 0 && shared_q8) {
         shared_q8->repacked_swiglu_failed.store(0, std::memory_order_relaxed);
     }
+    const bool lfm2_q4k_repacked_prefill =
+        shared_q8 && shared_q8->record_lfm2_w1w3_kernel && GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill;
     // Qwen Q5_K decode fast lane: run the loader-owned single-copy q5_K_8x8
     // layout through ggml's GEMV kernel. Do not build a runtime repack cache
     // here: keeping both raw Q5_K and q5_K_8x8 copies was the RAM wall for 35B
@@ -3898,8 +3948,6 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
         }
         const size_t weight_row_bytes =
             q5_single_copy_8x8 ? ggml_row_size(GGML_TYPE_Q5_K, gate_exps->ne[0]) : static_cast<size_t>(gate_exps->nb[1]);
-        const bool compact_gateup_rows = gate_exps->nb[1] == ggml_row_size(gate_exps->type, gate_exps->ne[0]) &&
-                                         up_exps->nb[1] == ggml_row_size(up_exps->type, up_exps->ne[0]);
         for (size_t group_start = 0; group_start < assignment_count;) {
             const int32_t expert = assignment_data[group_start].expert;
             size_t group_end = group_start + 1;
@@ -3914,9 +3962,10 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
             const void* up_row_start = up_base + static_cast<size_t>(row_start) * weight_row_bytes;
             const InferenceExecutionPhase phase = GetCurrentExecutionPhase();
             const bool q4_repacked_gateup =
-                q4_gateup && shared_q8 && shared_q8->prefer_q4k_repacked_swiglu && compact_gateup_rows &&
-                (row_count % 8) == 0 && phase == InferenceExecutionPhase::Decode &&
-                Qwen35GateUpQ4KRepackKernelAvailable();
+                q4_gateup && shared_q8 && compact_gateup_rows && (row_count % 8) == 0 &&
+                Qwen35GateUpQ4KRepackKernelAvailable() &&
+                ((shared_q8->prefer_q4k_repacked_swiglu && phase == InferenceExecutionPhase::Decode) ||
+                 lfm2_q4k_repacked_prefill);
             const bool repacked_gateup = q5_single_copy_8x8 || q4_repacked_gateup;
             const bool can_use_batched_gateup =
                 (q4_gateup || q5_gateup) && (compact_gateup_rows || q5_single_copy_8x8) && row_count > 0 &&
@@ -4016,9 +4065,10 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                                                           static_cast<size_t>(dst->nb[2]));
                 const InferenceExecutionPhase phase = GetCurrentExecutionPhase();
                 const bool q4_repacked_gateup =
-                    q4_gateup && shared_q8 && shared_q8->prefer_q4k_repacked_swiglu && compact_gateup_rows &&
-                    (row_count % 8) == 0 && phase == InferenceExecutionPhase::Decode &&
-                    Qwen35GateUpQ4KRepackKernelAvailable();
+                    q4_gateup && shared_q8 && compact_gateup_rows && (row_count % 8) == 0 &&
+                    Qwen35GateUpQ4KRepackKernelAvailable() &&
+                    ((shared_q8->prefer_q4k_repacked_swiglu && phase == InferenceExecutionPhase::Decode) ||
+                     lfm2_q4k_repacked_prefill);
                 if (q5_single_copy_8x8 || q4_repacked_gateup) {
                     const float* input_row =
                         q5_single_copy_8x8 ? Qwen35NativeMoEGateUpInputRowPtr(input, assignment.token) : nullptr;
@@ -4232,6 +4282,17 @@ static QwenLikeNativeMoEGraphPlan ResolveQwenLikeNativeMoEGraphPlan(const Transf
     plan.lfm2_fast_only_decode =
         plan.lfm2_native_moe && plan.graph_phase == InferenceExecutionPhase::Decode && !plan.lfm2_debug_reference;
     return plan;
+}
+
+static bool ShouldUseQwenLikeGateUpQ4KRepackedSwiGLU(const QwenLikeNativeMoEGraphPlan& graph_plan,
+                                                     ggml_type w1w3_type, InferenceExecutionPhase phase,
+                                                     bool kernel_available) {
+    if (!graph_plan.qwen_native_moe) {
+        return false;
+    }
+    // C4 x86 validation showed the single-token LFM2 Q4_K repacked SwiGLU
+    // path regresses decode throughput versus the raw k-quant row path.
+    return w1w3_type == GGML_TYPE_Q4_K && phase == InferenceExecutionPhase::Decode && kernel_available;
 }
 
 static const char* ValidateQwenLikeNativeMoERouter(
@@ -4521,12 +4582,10 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             gateup_q8_ud->debug_layer_idx = layer_idx;
             gateup_q8_ud->requested_task_count = native_moe_callback_tasks;
             // Q4_K prefill is assignment-batched and stays on the raw-batched
-            // k-quant path; the repacked SwiGLU helper is retained for x86
-            // decode where it avoids one-row scalar work without changing the
-            // fallback-free prefill qualification lane.
-            gateup_q8_ud->prefer_q4k_repacked_swiglu =
-                w1w3_type == GGML_TYPE_Q4_K && GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode &&
-                Qwen35GateUpQ4KRepackKernelAvailable();
+            // k-quant path. Decode uses the validated repacked helper for
+            // Qwen-like MoE variants when the kernel is available.
+            gateup_q8_ud->prefer_q4k_repacked_swiglu = ShouldUseQwenLikeGateUpQ4KRepackedSwiGLU(
+                graph_plan, w1w3_type, GetCurrentExecutionPhase(), Qwen35GateUpQ4KRepackKernelAvailable());
             gateup_q8_ud->q5k_gateup_8x8_single_copy = native_q5_gateup_single_copy;
             gateup_q8_ud->q5k_gateup_8x8_single_copy_required =
                 (graph_plan.qwen_native_moe || graph_plan.lfm2_native_moe) && w1w3_type == GGML_TYPE_Q5_K;

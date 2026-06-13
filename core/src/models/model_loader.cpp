@@ -1496,6 +1496,30 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         if (!repack_buffer_available_for_type(source->type)) {
             return false;
         }
+        // Only ggml-repack 2D weights whose repacked alias has a maintained,
+        // fallback-free-safe consumer. The 2D smart-matmul alias router
+        // (ResolveSmartMatmulAliasRoutingPlan) only defers Q4_K aliases to a
+        // maintained kernel (the true-batched Q4_K GEMM). Every other ggml-repack
+        // layout resolves to "temporary_reference_cpu_repack_alias", which the
+        // fallback-free gate rejects — Gemma4 C4A prefill threw on blk.0.attn_v
+        // (q6_K_8x8). Q8_0 is just as unsafe to ggml-repack here: DenseCore's
+        // maintained Q8_0 path (GetOrCreateQ8RepackedGemvWeight) does its own 4x8
+        // repack from a *standard* Q8_0 layout, so feeding it a pre-repacked
+        // q8_0_4x8 alias double-repacks into garbage, and routing the alias
+        // through ggml's repacked GEMM trips the gate.
+        //
+        // x86/C4 never hit this because its ggml CPU_REPACK buffer can only pack
+        // Q4_K: q6_K/q8_0 stay raw (q8_0 as a plain standard-layout copy) and feed
+        // the maintained paths directly. ARM's CPU_REPACK additionally supports
+        // q6_K_8x8 and q8_0_4x8, which is what newly exposed these unmaintained
+        // alias layouts. Mirror the x86 surface: only ggml-repack Q4_K here and
+        // keep the raw tensor for everything else (raw q8_0 still feeds the
+        // maintained q8 repacked GEMV/GEMM; raw q6_K feeds custom_batched_gemv).
+        // MoE expert (3D) aliases below are routed by the native-MoE path, not
+        // this 2D router, and keep their own type handling.
+        if (source->type != GGML_TYPE_Q4_K) {
+            return false;
+        }
         ggml_tensor* alias =
             ggml_new_tensor_2d(context_for_type(source->type), source->type, source->ne[0], source->ne[1]);
         return register_alias(source, alias, suffix);
@@ -3369,6 +3393,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             "<|eot_id|>",
             "<|eom_id|>",
             "<|endoftext|>",
+            "<turn|>",
+            "<end_of_turn>",
         };
         for (const auto& tok : stop_token_literals) {
             auto it = model->token_to_id.find(tok);
@@ -3386,7 +3412,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             if (model->token_types[i] != 3) continue;  // control
             const std::string& tok = model->vocab_tokens[i];
             if (tok.find("im_end") != std::string::npos || tok.find("eot") != std::string::npos ||
-                tok.find("eom") != std::string::npos || tok.find("endoftext") != std::string::npos) {
+                tok.find("eom") != std::string::npos || tok.find("endoftext") != std::string::npos ||
+                tok == "<turn|>" || tok == "<end_of_turn>") {
                 add_stop_id(static_cast<int32_t>(i));
             }
         }

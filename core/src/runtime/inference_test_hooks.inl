@@ -413,6 +413,15 @@ struct ggml_tensor* SmartMulMatWithPhaseTest(struct ggml_context* ctx, struct gg
 int ResolveQuantBatchedTileColsForTest(int requested_cols, int vec_dot_nrows, bool allow_true_batched_q4k) {
     return ::ResolveQuantBatchedTileCols(requested_cols, vec_dot_nrows, allow_true_batched_q4k);
 }
+bool ShouldUseGemma4PrefillSafeBatchedForTest(bool is_gemma4, bool prefill_phase, int m,
+                                              bool dense_prefill_allowed) {
+    TransformerModel model{};
+    model.arch_flags.is_gemma4 = is_gemma4;
+    SmartMatmulDispatchState dispatch{};
+    dispatch.prefill_phase = prefill_phase;
+    dispatch.m = m;
+    return ::ShouldUseGemma4PrefillSafeBatched(&model, dispatch, dense_prefill_allowed);
+}
 bool ResolveQ4KTrueBatchedKernelPolicyForTest(int simd_level, bool compiled_with_sve) {
     return ::ResolveQ4KTrueBatchedKernelEnabledPolicy(static_cast<densecore::simd::SimdLevel>(simd_level),
                                                       compiled_with_sve);
@@ -792,6 +801,132 @@ bool RunQwen36Q4KBatchedDirectForTest(int nth, bool* output_matches_vecdot_oracl
     return true;
 }
 
+bool RunGemma4SafeQ4KPrefillBatchedUsesQActCacheForTest(int nth, bool* output_matches_vecdot_oracle,
+                                                        uint64_t* qact_hits, uint64_t* qact_misses) {
+    if (output_matches_vecdot_oracle) *output_matches_vecdot_oracle = false;
+    if (qact_hits) *qact_hits = 0;
+    if (qact_misses) *qact_misses = 0;
+    constexpr int rows = 8;
+    constexpr int cols = QK_K;
+    constexpr int tokens = 20;
+    const auto* q4_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    if (!q4_traits || !q8_traits || !q4_traits->from_float || !q8_traits->from_float) {
+        return false;
+    }
+    ggml_init_params params{512 * 1024, nullptr, false};
+    ggml_context* ggml_ctx = ggml_init(params);
+    if (!ggml_ctx) {
+        return false;
+    }
+    ggml_tensor* input = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, cols, tokens);
+    ggml_tensor* weight0 = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_Q4_K, cols, rows);
+    ggml_tensor* weight1 = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_Q4_K, cols, rows);
+    ggml_tensor* dst0 = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, rows, tokens);
+    ggml_tensor* dst1 = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, rows, tokens);
+    if (!input || !weight0 || !weight1 || !dst0 || !dst1 || !input->data || !weight0->data || !weight1->data ||
+        !dst0->data || !dst1->data) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+    auto* input_f32 = reinterpret_cast<float*>(input->data);
+    for (int m = 0; m < tokens; ++m) {
+        for (int c = 0; c < cols; ++c) {
+            input_f32[static_cast<size_t>(m) * cols + c] =
+                std::sin(static_cast<float>(m * 23 + c) * 0.017f) * 0.5f;
+        }
+    }
+    std::vector<float> weight_f32(static_cast<size_t>(rows) * cols);
+    auto fill_weight = [&](ggml_tensor* weight, int seed) {
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                weight_f32[static_cast<size_t>(r) * cols + c] =
+                    std::cos(static_cast<float>(seed + r * 19 + c) * 0.019f) * 0.375f;
+            }
+            q4_traits->from_float(weight_f32.data() + static_cast<size_t>(r) * cols,
+                                  static_cast<uint8_t*>(weight->data) +
+                                      static_cast<size_t>(r) * ggml_row_size(GGML_TYPE_Q4_K, cols),
+                                  cols);
+        }
+    };
+    fill_weight(weight0, 3);
+    fill_weight(weight1, 47);
+    std::snprintf(weight0->name, sizeof(weight0->name), "blk.0.ffn_gate.weight");
+    std::snprintf(weight1->name, sizeof(weight1->name), "blk.0.ffn_up.weight");
+    dst0->src[0] = input;
+    dst0->src[1] = weight0;
+    dst1->src[0] = input;
+    dst1->src[1] = weight1;
+    std::fill_n(reinterpret_cast<float*>(dst0->data), rows * tokens, 12345.0f);
+    std::fill_n(reinterpret_cast<float*>(dst1->data), rows * tokens, 12345.0f);
+
+    InferenceWorkContext work_ctx{};
+    ResetInferenceWorkContext(&work_ctx);
+    SetCurrentWorkContext(&work_ctx);
+    std::atomic<uint64_t> quantized_stamp{0};
+    std::vector<uint8_t> shared_quant(static_cast<size_t>(tokens) *
+                                      densecore::AlignUp(ggml_row_size(GGML_TYPE_Q8_K, cols), static_cast<size_t>(64)));
+    auto run_weight = [&](ggml_tensor* weight, ggml_tensor* dst) {
+        GemvBatchedUserData ud{};
+        ud.weight_tensor = weight;
+        ud.N = cols;
+        ud.K = rows;
+        ud.M = tokens;
+        ud.weight_type = GGML_TYPE_Q4_K;
+        ud.input_quant_type = GGML_TYPE_Q8_K;
+        ud.quant_row_stride = densecore::AlignUp(ggml_row_size(GGML_TYPE_Q8_K, cols), static_cast<size_t>(64));
+        ud.slot_id = 0;
+        ud.quant_input_shared = shared_quant.data();
+        ud.quantized_stamp = &quantized_stamp;
+        ud.gemma4_prefill_safe_batched = true;
+        ud.work_ctx = &work_ctx;
+        for (int ith = 0; ith < std::max(1, nth); ++ith) {
+            cb_gemv_batched_custom(dst, ith, std::max(1, nth), &ud);
+        }
+    };
+    run_weight(weight0, dst0);
+    run_weight(weight1, dst1);
+    SetCurrentWorkContext(nullptr);
+
+    std::vector<uint8_t> q8(static_cast<size_t>(tokens) *
+                            densecore::AlignUp(ggml_row_size(GGML_TYPE_Q8_K, cols), static_cast<size_t>(64)));
+    const size_t q8_stride = densecore::AlignUp(ggml_row_size(GGML_TYPE_Q8_K, cols), static_cast<size_t>(64));
+    for (int m = 0; m < tokens; ++m) {
+        q8_traits->from_float(input_f32 + static_cast<size_t>(m) * cols,
+                              q8.data() + static_cast<size_t>(m) * q8_stride, cols);
+    }
+    auto matches_output = [&](const ggml_tensor* weight, const ggml_tensor* dst) {
+        bool matches = true;
+        const auto* out = reinterpret_cast<const float*>(dst->data);
+        for (int r = 0; r < rows; ++r) {
+            const void* row_ptr = static_cast<const uint8_t*>(weight->data) +
+                                  static_cast<size_t>(r) * ggml_row_size(GGML_TYPE_Q4_K, cols);
+            for (int m = 0; m < tokens; ++m) {
+                float ref = 0.0f;
+                if (!densecore::hwy_kernels::DotQ4KQ8K_Hwy(row_ptr, q8.data() + static_cast<size_t>(m) * q8_stride,
+                                                           cols, &ref)) {
+                    matches = false;
+                    continue;
+                }
+                const float got = out[static_cast<size_t>(m) * rows + r];
+                matches = matches && std::fabs(got - ref) <= 1e-5f;
+            }
+        }
+        return matches;
+    };
+    if (output_matches_vecdot_oracle) {
+        *output_matches_vecdot_oracle = matches_output(weight0, dst0) && matches_output(weight1, dst1);
+    }
+    if (qact_hits) {
+        *qact_hits = work_ctx.qwen36_profile.qact_cache_hits.load(std::memory_order_relaxed);
+    }
+    if (qact_misses) {
+        *qact_misses = work_ctx.qwen36_profile.qact_cache_misses.load(std::memory_order_relaxed);
+    }
+    ggml_free(ggml_ctx);
+    return true;
+}
+
 static bool RunQwen36SSMQ8RepackedBatchedShapeForTest(int rows, int cols, int tokens, int nth,
                                                       bool exhaustive_oracle,
                                                       bool* output_matches_vecdot_oracle,
@@ -932,6 +1067,78 @@ bool RunQwen36SSMQ8RepackedBatchedC4ProjectionForTest(int nth, bool* output_matc
                                                      output_matches_vecdot_oracle, true_gemm_ops, gemv_ops);
 }
 
+bool RunDenseCoreQ8RepackedGemvForTest(bool* output_matches_vecdot_oracle) {
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+    constexpr int rows = 64;
+    constexpr int cols = QK8_0 * 64;
+    if (!q8_traits || !q8_traits->from_float || !q8_traits->vec_dot || q8_traits->vec_dot_type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    ggml_init_params params{8 << 20, nullptr, false};
+    ggml_context* ggml_ctx = ggml_init(params);
+    if (!ggml_ctx) {
+        return false;
+    }
+    ggml_tensor* weight = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_Q8_0, cols, rows);
+    if (!weight || !weight->data) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+
+    std::vector<float> row_f32(static_cast<size_t>(cols));
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            row_f32[static_cast<size_t>(c)] =
+                std::sin(static_cast<float>(r * 19 + c) * 0.013f) * 0.35f;
+        }
+        q8_traits->from_float(row_f32.data(),
+                              static_cast<uint8_t*>(weight->data) +
+                                  static_cast<size_t>(r) * ggml_row_size(GGML_TYPE_Q8_0, cols),
+                              cols);
+    }
+
+    std::vector<float> input_f32(static_cast<size_t>(cols));
+    for (int c = 0; c < cols; ++c) {
+        input_f32[static_cast<size_t>(c)] = std::cos(static_cast<float>(c) * 0.021f) * 0.45f;
+    }
+    std::vector<uint8_t> q8_input(ggml_row_size(GGML_TYPE_Q8_0, cols));
+    q8_traits->from_float(input_f32.data(), q8_input.data(), cols);
+
+    std::vector<uint8_t> packed;
+    const bool packed_ok = DenseCorePackQ8_0RowsTo4x8(static_cast<const uint8_t*>(weight->data),
+                                                      ggml_row_size(GGML_TYPE_Q8_0, cols), rows, cols, packed);
+    if (!packed_ok) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+
+    std::vector<float> output(static_cast<size_t>(rows), 0.0f);
+    DenseCoreGemvQ8_0_4x8Q8_0Generic(cols, output.data(), packed.data(), q8_input.data(), rows);
+    std::vector<float> streamed_output(static_cast<size_t>(rows), std::numeric_limits<float>::quiet_NaN());
+    DenseCoreForEachQ8_0_4x8Q8_0DotGeneric(
+        cols, packed.data(), q8_input.data(), rows, 0,
+        [&](int row, float value) {
+            if (row >= 0 && row < rows) {
+                streamed_output[static_cast<size_t>(row)] = value;
+            }
+        });
+
+    bool matches = true;
+    for (int r = 0; r < rows; ++r) {
+        const void* row_ptr = static_cast<const uint8_t*>(weight->data) +
+                              static_cast<size_t>(r) * ggml_row_size(GGML_TYPE_Q8_0, cols);
+        float ref = 0.0f;
+        q8_traits->vec_dot(cols, &ref, 0, row_ptr, 0, q8_input.data(), 0, 1);
+        matches = matches && std::fabs(output[static_cast<size_t>(r)] - ref) <= 1e-4f;
+        matches = matches && std::fabs(streamed_output[static_cast<size_t>(r)] - ref) <= 1e-4f;
+    }
+    if (output_matches_vecdot_oracle) {
+        *output_matches_vecdot_oracle = matches;
+    }
+    ggml_free(ggml_ctx);
+    return true;
+}
+
 bool RunGemma4SafeF32BatchedForTest(int nth, bool* output_matches_oracle, bool* output_all_finite) {
     constexpr int rows = 17;
     constexpr int cols = 32;
@@ -997,6 +1204,78 @@ bool RunGemma4SafeF32BatchedForTest(int nth, bool* output_matches_oracle, bool* 
             const float got = out[static_cast<size_t>(m) * rows + r];
             finite = finite && std::isfinite(got);
             matches = matches && std::fabs(got - ref) <= 1e-5f;
+        }
+    }
+    if (output_matches_oracle) *output_matches_oracle = matches;
+    if (output_all_finite) *output_all_finite = finite;
+    ggml_free(ggml_ctx);
+    return true;
+}
+
+bool RunGemma4SafeF32MsplitBatchedForTest(int nth, bool* output_matches_oracle, bool* output_all_finite) {
+    constexpr int rows = 128;
+    constexpr int cols = 1024;
+    constexpr int tokens = 128;
+    ggml_init_params params{96 << 20, nullptr, false};
+    ggml_context* ggml_ctx = ggml_init(params);
+    if (!ggml_ctx) {
+        return false;
+    }
+    ggml_tensor* input = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, cols, tokens);
+    ggml_tensor* weight = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, cols, rows);
+    ggml_tensor* dst = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, rows, tokens);
+    if (!input || !weight || !dst || !input->data || !weight->data || !dst->data) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+    dst->src[0] = input;
+    dst->src[1] = weight;
+    std::snprintf(weight->name, sizeof(weight->name), "blk.0.ffn_gate_inp.weight");
+    auto* input_f32 = reinterpret_cast<float*>(input->data);
+    auto* weight_f32 = reinterpret_cast<float*>(weight->data);
+    for (int m = 0; m < tokens; ++m) {
+        for (int c = 0; c < cols; ++c) {
+            input_f32[static_cast<size_t>(m) * cols + c] =
+                std::sin(static_cast<float>(m * 7 + c) * 0.011f) * 0.125f;
+        }
+    }
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            weight_f32[static_cast<size_t>(r) * cols + c] =
+                std::cos(static_cast<float>(r * 5 + c) * 0.013f) * 0.0625f;
+        }
+    }
+    std::fill_n(reinterpret_cast<float*>(dst->data), rows * tokens, 12345.0f);
+    GemvBatchedUserData ud{};
+    ud.weight_tensor = weight;
+    ud.N = cols;
+    ud.K = rows;
+    ud.M = tokens;
+    ud.weight_type = GGML_TYPE_F32;
+    ud.input_quant_type = GGML_TYPE_F32;
+    ud.slot_id = -1;
+    ud.gemma4_prefill_safe_batched = true;
+    InferenceWorkContext work_ctx{};
+    ResetInferenceWorkContext(&work_ctx);
+    ud.work_ctx = &work_ctx;
+    SetCurrentWorkContext(&work_ctx);
+    for (int ith = 0; ith < std::max(1, nth); ++ith) {
+        cb_gemv_batched_custom(dst, ith, std::max(1, nth), &ud);
+    }
+    SetCurrentWorkContext(nullptr);
+    const auto* out = reinterpret_cast<const float*>(dst->data);
+    bool matches = true;
+    bool finite = true;
+    for (int m = 0; m < tokens; ++m) {
+        for (int r = 0; r < rows; ++r) {
+            double ref = 0.0;
+            for (int c = 0; c < cols; ++c) {
+                ref += static_cast<double>(input_f32[static_cast<size_t>(m) * cols + c]) *
+                       static_cast<double>(weight_f32[static_cast<size_t>(r) * cols + c]);
+            }
+            const float got = out[static_cast<size_t>(m) * rows + r];
+            finite = finite && std::isfinite(got);
+            matches = matches && std::fabs(got - static_cast<float>(ref)) <= 2e-4f;
         }
     }
     if (output_matches_oracle) *output_matches_oracle = matches;
@@ -1089,6 +1368,100 @@ bool RunGemma4SafeQ8BatchedForTest(int nth, bool* output_matches_vecdot_oracle, 
         }
     }
     if (output_matches_vecdot_oracle) *output_matches_vecdot_oracle = matches;
+    ggml_free(ggml_ctx);
+    return true;
+}
+
+bool RunGemma4NativeQ8PrefillTrueGemmForTest(int nth, bool* output_matches_vecdot_oracle,
+                                             uint64_t* true_gemm_ops, uint64_t* gemv_ops) {
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+    constexpr int rows = 128;
+    constexpr int cols = 2048;
+    constexpr int tokens = 4;
+    if (!q8_traits || !q8_traits->from_float || !q8_traits->vec_dot || q8_traits->vec_dot_type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    ggml_init_params params{32 << 20, nullptr, false};
+    ggml_context* ggml_ctx = ggml_init(params);
+    if (!ggml_ctx) {
+        return false;
+    }
+    ggml_tensor* input = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, cols, tokens);
+    ggml_tensor* weight = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_Q8_0, cols, rows);
+    ggml_tensor* dst = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, rows, tokens);
+    if (!input || !weight || !dst || !input->data || !weight->data || !dst->data) {
+        ggml_free(ggml_ctx);
+        return false;
+    }
+    dst->src[0] = input;
+    dst->src[1] = weight;
+    std::snprintf(weight->name, sizeof(weight->name), "blk.0.attn_q.weight");
+
+    auto* input_f32 = reinterpret_cast<float*>(input->data);
+    for (int m = 0; m < tokens; ++m) {
+        for (int c = 0; c < cols; ++c) {
+            input_f32[static_cast<size_t>(m) * cols + c] =
+                std::sin(static_cast<float>(m * 23 + c) * 0.007f) * 0.5f;
+        }
+    }
+    std::vector<float> row_f32(static_cast<size_t>(cols));
+    const size_t weight_row_size = ggml_row_size(GGML_TYPE_Q8_0, cols);
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            row_f32[static_cast<size_t>(c)] = std::cos(static_cast<float>(r * 19 + c) * 0.009f) * 0.25f;
+        }
+        q8_traits->from_float(row_f32.data(),
+                              static_cast<uint8_t*>(weight->data) + static_cast<size_t>(r) * weight_row_size,
+                              cols);
+    }
+
+    std::fill_n(reinterpret_cast<float*>(dst->data), rows * tokens, 12345.0f);
+    GemvBatchedUserData ud{};
+    ud.weight_tensor = weight;
+    ud.N = cols;
+    ud.K = rows;
+    ud.M = tokens;
+    ud.weight_type = GGML_TYPE_Q8_0;
+    ud.input_quant_type = GGML_TYPE_Q8_0;
+    ud.quant_row_stride = densecore::AlignUp(ggml_row_size(GGML_TYPE_Q8_0, cols), static_cast<size_t>(64));
+    ud.slot_id = -1;
+    ud.gemma4_dense_prefill_native = true;
+    InferenceWorkContext work_ctx{};
+    ResetInferenceWorkContext(&work_ctx);
+    ud.work_ctx = &work_ctx;
+    SetCurrentWorkContext(&work_ctx);
+    for (int ith = 0; ith < std::max(1, nth); ++ith) {
+        cb_gemv_batched_custom(dst, ith, std::max(1, nth), &ud);
+    }
+    SetCurrentWorkContext(nullptr);
+    const auto snapshot = GetQwen36ProfileSnapshot(&work_ctx);
+    if (true_gemm_ops) {
+        *true_gemm_ops = snapshot.q8_batched_true_gemm_ops;
+    }
+    if (gemv_ops) {
+        *gemv_ops = snapshot.q8_batched_gemv_ops;
+    }
+
+    std::vector<uint8_t> q8_input(static_cast<size_t>(tokens) * ud.quant_row_stride);
+    for (int m = 0; m < tokens; ++m) {
+        q8_traits->from_float(input_f32 + static_cast<size_t>(m) * cols,
+                              q8_input.data() + static_cast<size_t>(m) * ud.quant_row_stride, cols);
+    }
+    bool matches = true;
+    const auto* out = reinterpret_cast<const float*>(dst->data);
+    for (int r = 0; r < rows; ++r) {
+        const void* row_ptr = static_cast<const uint8_t*>(weight->data) + static_cast<size_t>(r) * weight_row_size;
+        for (int m = 0; m < tokens; ++m) {
+            float ref = 0.0f;
+            q8_traits->vec_dot(cols, &ref, 0, row_ptr, 0,
+                               q8_input.data() + static_cast<size_t>(m) * ud.quant_row_stride, 0, 1);
+            const float got = out[static_cast<size_t>(m) * rows + r];
+            matches = matches && std::fabs(got - ref) <= 1e-4f;
+        }
+    }
+    if (output_matches_vecdot_oracle) {
+        *output_matches_vecdot_oracle = matches;
+    }
     ggml_free(ggml_ctx);
     return true;
 }
@@ -1239,5 +1612,15 @@ bool ShouldRunMoESharedDenseBranchForTest(const TransformerModel* model, bool is
                                           const struct ggml_tensor* ffn_gate, const struct ggml_tensor* ffn_up,
                                           const struct ggml_tensor* ffn_down) {
     return ShouldRunMoESharedDenseBranch(model, nullptr, is_gemma4_moe, ffn_gate, ffn_up, ffn_down);
+}
+
+bool ShouldUseQwenLikeGateUpQ4KRepackedSwiGLUForTest(bool qwen_native_moe, bool lfm2_native_moe, int phase,
+                                                     bool kernel_available) {
+    QwenLikeNativeMoEGraphPlan graph_plan;
+    graph_plan.qwen_native_moe = qwen_native_moe;
+    graph_plan.lfm2_native_moe = lfm2_native_moe;
+    graph_plan.graph_phase = static_cast<InferenceExecutionPhase>(phase);
+    return ::ShouldUseQwenLikeGateUpQ4KRepackedSwiGLU(graph_plan, GGML_TYPE_Q4_K,
+                                                      static_cast<InferenceExecutionPhase>(phase), kernel_available);
 }
 }  // namespace densecore::testing

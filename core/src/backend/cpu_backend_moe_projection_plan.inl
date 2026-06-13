@@ -28,6 +28,9 @@ struct MoEProjectionRequest {
     bool ggml_quantized_vecdot_safe = false;
     bool force_gemma4_quant_prefill_fast_path = false;
     bool gemma4_quant_prefill_batch_safe = false;
+    bool record_gemma4_quant_prefill_batch = false;
+    bool prefer_q4k_repacked_prefill = false;
+    bool allow_q4k_repacked_decode_fused_swiglu = true;
     bool enable_inner_parallel = false;
 };
 
@@ -112,14 +115,15 @@ bool EmitMoEProjectionFromPlan(const MoEProjectionRequest& req, const MoEProject
             req.backend, req.raw_weight->ptr, req.ggml_type_id, *req.src, req.dst, req.proj_rows, req.proj_cols,
             req.numa_node, req.enable_inner_parallel,
             plan.use_input_projection_cache ? req.input_projection_cache : req.down_projection_cache,
-            plan.allow_rowpair_vec_dot, req.gemma4_quant_prefill_batch_safe)) {
+            plan.allow_rowpair_vec_dot, req.prefer_q4k_repacked_prefill)) {
         ApplyMoEProjectionScaleIfNeeded(req, plan);
         LogMoEMatmulPath("ggml_quantized_vecdot", static_cast<int>(req.src->shape[0]),
                          static_cast<int>(req.src->shape[1]), static_cast<int>(req.dst->shape[1]),
                          req.int4_binding->group_size, req.enable_inner_parallel);
         RecordMoEProjectionPath(req.backend, req.trace_ctx, req.expert, req.projection_slot, req.safe_reference_mode,
                                 "ggml_quantized_vecdot");
-        if (req.gemma4_quant_prefill_batch_safe && req.projection_slot == '2') {
+        if (req.record_gemma4_quant_prefill_batch && req.gemma4_quant_prefill_batch_safe &&
+            req.projection_slot == '2') {
             RecordGemma4MoEPrefillQuantBatchDecision(req.gemma4_quant_prefill_ctx, false, true, nullptr, false, true);
         }
         return true;
@@ -173,9 +177,11 @@ bool RunMoEProjectionFromContext(const MoEProjectionRuntimeContext& ctx, char pr
     request.ggml_quantized_vecdot_safe = ctx.ggml_quantized_vecdot_safe;
     request.force_gemma4_quant_prefill_fast_path = ctx.force_gemma4_quant_prefill_fast_path;
     request.gemma4_quant_prefill_batch_safe = ctx.gemma4_quant_prefill_batch_safe;
+    request.record_gemma4_quant_prefill_batch = ctx.record_gemma4_quant_prefill_batch;
+    request.prefer_q4k_repacked_prefill = ctx.prefer_q4k_repacked_prefill;
+    request.allow_q4k_repacked_decode_fused_swiglu = ctx.allow_q4k_repacked_decode_fused_swiglu;
     request.enable_inner_parallel = ctx.enable_inner_parallel;
 
     const MoEProjectionPlan plan = ResolveMoEProjectionPlan(request);
     return EmitMoEProjectionFromPlan(request, plan);
 }
-

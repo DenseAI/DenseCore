@@ -19,11 +19,19 @@ extern struct ggml_tensor* SmartMulMatWithPhaseTest(struct ggml_context* ctx, st
                                                    struct ggml_tensor* input, TransformerModel* model, int phase);
 extern bool ShouldUsePrefillLastLogitsOnlyForTest(const TransformerModel* model, int num_seqs, int n_tokens);
 extern int ResolveQuantBatchedTileColsForTest(int requested_cols, int vec_dot_nrows, bool allow_true_batched_q4k);
+extern bool ShouldUseGemma4PrefillSafeBatchedForTest(bool is_gemma4, bool prefill_phase, int m,
+                                                     bool dense_prefill_allowed);
 extern bool ResolveQ4KTrueBatchedKernelPolicyForTest(int simd_level, bool compiled_with_sve);
 extern bool ShouldUsePortableFlashHeadSeqReferenceFallbackForTest(bool explicit_debug_reference);
 extern bool CompiledWithX86Avx512ForFlashAttentionForTest();
 extern bool RunGemma4SafeF32BatchedForTest(int nth, bool* output_matches_oracle, bool* output_all_finite);
+extern bool RunGemma4SafeF32MsplitBatchedForTest(int nth, bool* output_matches_oracle, bool* output_all_finite);
 extern bool RunGemma4SafeQ8BatchedForTest(int nth, bool* output_matches_vecdot_oracle, uint64_t* q8_batched_used_ops);
+extern bool RunGemma4SafeQ4KPrefillBatchedUsesQActCacheForTest(int nth, bool* output_matches_vecdot_oracle,
+                                                               uint64_t* qact_hits, uint64_t* qact_misses);
+extern bool RunDenseCoreQ8RepackedGemvForTest(bool* output_matches_vecdot_oracle);
+extern bool RunGemma4NativeQ8PrefillTrueGemmForTest(int nth, bool* output_matches_vecdot_oracle,
+                                                    uint64_t* true_gemm_ops, uint64_t* gemv_ops);
 }  // namespace testing
 namespace llm::attention::testing {
 extern void ResetSharedPrefillFlashMaskBuildsForTest();
@@ -288,12 +296,48 @@ TEST(AttentionPolicyTest, Gemma4SafeF32RouterBatchedMatchesFiniteOracle) {
     EXPECT_TRUE(finite);
 }
 
+TEST(AttentionPolicyTest, Gemma4SafeF32RouterMsplitBatchedMatchesOracle) {
+    bool matches = false;
+    bool finite = false;
+    ASSERT_TRUE(densecore::testing::RunGemma4SafeF32MsplitBatchedForTest(/*nth=*/4, &matches, &finite));
+    EXPECT_TRUE(matches);
+    EXPECT_TRUE(finite);
+}
+
 TEST(AttentionPolicyTest, Gemma4SafeQ8PrefillBatchedUsesRowVecDotOracle) {
     bool matches = false;
     uint64_t q8_batched_used_ops = 0;
     ASSERT_TRUE(densecore::testing::RunGemma4SafeQ8BatchedForTest(/*nth=*/4, &matches, &q8_batched_used_ops));
     EXPECT_TRUE(matches);
     EXPECT_EQ(q8_batched_used_ops, 0u);
+}
+
+TEST(AttentionPolicyTest, Gemma4SafeQ4KPrefillBatchedUsesQActCache) {
+    bool matches = false;
+    uint64_t qact_hits = 0;
+    uint64_t qact_misses = 0;
+    ASSERT_TRUE(densecore::testing::RunGemma4SafeQ4KPrefillBatchedUsesQActCacheForTest(
+        /*nth=*/4, &matches, &qact_hits, &qact_misses));
+    EXPECT_TRUE(matches);
+    EXPECT_GE(qact_hits, 1u);
+    EXPECT_EQ(qact_misses, 1u);
+}
+
+TEST(AttentionPolicyTest, DenseCoreQ8RepackedGemvMatchesVecDotOracle) {
+    bool matches = false;
+    ASSERT_TRUE(densecore::testing::RunDenseCoreQ8RepackedGemvForTest(&matches));
+    EXPECT_TRUE(matches);
+}
+
+TEST(AttentionPolicyTest, Gemma4NativeQ8PrefillTrueGemmMatchesVecDotOracle) {
+    bool matches = false;
+    uint64_t true_gemm_ops = 0;
+    uint64_t gemv_ops = 0;
+    ASSERT_TRUE(densecore::testing::RunGemma4NativeQ8PrefillTrueGemmForTest(
+        /*nth=*/4, &matches, &true_gemm_ops, &gemv_ops));
+    EXPECT_TRUE(matches);
+    EXPECT_GT(true_gemm_ops, 0u);
+    EXPECT_EQ(gemv_ops, 0u);
 }
 
 TEST(AttentionPolicyTest, Gemma4Q8PrefillCpuRepackAliasUsesRawCustomBatchedPath) {
@@ -564,6 +608,17 @@ TEST(AttentionPolicyTest, QuantTileKeepsRequestedWidthWhenTrueBatchedPathExists)
     EXPECT_EQ(densecore::testing::ResolveQuantBatchedTileColsForTest(/*requested_cols=*/16, /*vec_dot_nrows=*/2,
                                                                      /*allow_true_batched_q4k=*/true),
               16);
+}
+
+TEST(AttentionPolicyTest, Gemma4PrefillSafeBatchedStaysOnExceptAdmittedDenseNativeOp) {
+    EXPECT_TRUE(densecore::testing::ShouldUseGemma4PrefillSafeBatchedForTest(
+        /*is_gemma4=*/true, /*prefill_phase=*/true, /*m=*/16, /*dense_prefill_allowed=*/false));
+    EXPECT_FALSE(densecore::testing::ShouldUseGemma4PrefillSafeBatchedForTest(
+        /*is_gemma4=*/true, /*prefill_phase=*/true, /*m=*/16, /*dense_prefill_allowed=*/true));
+    EXPECT_FALSE(densecore::testing::ShouldUseGemma4PrefillSafeBatchedForTest(
+        /*is_gemma4=*/true, /*prefill_phase=*/false, /*m=*/1, /*dense_prefill_allowed=*/false));
+    EXPECT_FALSE(densecore::testing::ShouldUseGemma4PrefillSafeBatchedForTest(
+        /*is_gemma4=*/false, /*prefill_phase=*/true, /*m=*/16, /*dense_prefill_allowed=*/false));
 }
 
 TEST(AttentionPolicyTest, Q4KTrueBatchedAutoPolicy) {

@@ -9,6 +9,20 @@ static bool IsBetterArgmaxCandidate(int token, float value, int best_token, floa
     return value > best_value || (value == best_value && token < best_token);
 }
 
+static bool SortedTokenListContainsAtOrAfter(const std::vector<int>& tokens, int token, size_t& pos) {
+    while (pos < tokens.size() && tokens[pos] < token) {
+        ++pos;
+    }
+    return pos < tokens.size() && tokens[pos] == token;
+}
+
+static float ApplyGreedyArgmaxFinalLogitSoftcap(float value, float softcap) {
+    if (softcap <= 0.0f || !std::isfinite(value)) {
+        return value;
+    }
+    return std::tanh(value / softcap) * softcap;
+}
+
 static float ApplyLFM2GreedyArgmaxRepetitionPenaltyIfDue(float value, int token,
                                                          const std::vector<int>& repeated_tokens, size_t& repeat_pos,
                                                          float repetition_penalty, bool repetition_penalty_active) {
@@ -433,6 +447,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                 int local_best_token = -1;
                 float local_best_value = -std::numeric_limits<float>::infinity();
                 const auto& repeated_tokens = callback_work_ctx->lfm2_greedy_lm_head_argmax_repeated_tokens;
+                const auto& disallowed_tokens = callback_work_ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens;
                 const float repetition_penalty = callback_work_ctx->lfm2_greedy_lm_head_argmax_repetition_penalty;
                 const bool repetition_penalty_active = repetition_penalty != 1.0f && !repeated_tokens.empty();
                 size_t repeat_pos =
@@ -440,6 +455,12 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                         ? static_cast<size_t>(std::lower_bound(repeated_tokens.begin(), repeated_tokens.end(), k_start) -
                                               repeated_tokens.begin())
                         : repeated_tokens.size();
+                size_t disallowed_pos =
+                    !disallowed_tokens.empty()
+                        ? static_cast<size_t>(std::lower_bound(disallowed_tokens.begin(), disallowed_tokens.end(),
+                                                               k_start) -
+                                              disallowed_tokens.begin())
+                        : disallowed_tokens.size();
                 int k = k_start;
                 const bool q6_can_use_repacked_argmax =
                     row_stride > 0 && (N % ggml_blck_size(weight_type)) == 0 && (k_start % 8) == 0 &&
@@ -463,6 +484,9 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                         used_repacked_argmax = true;
                         for (int offset = 0; offset < row_count; ++offset) {
                             const int token = k_start + offset;
+                            if (SortedTokenListContainsAtOrAfter(disallowed_tokens, token, disallowed_pos)) {
+                                continue;
+                            }
                             float v = repacked_argmax_tile[static_cast<size_t>(offset)];
                             v = ApplyLFM2GreedyArgmaxRepetitionPenaltyIfDue(
                                 v, token, repeated_tokens, repeat_pos, repetition_penalty, repetition_penalty_active);
@@ -475,40 +499,56 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                     }
                 }
                 if (q6_can_use_rowpair && (k & 1)) {
-                    const void* row_ptr =
-                        reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
-                    float v = 0.0f;
-                    q6_type_traits_cpu->vec_dot(N, &v, 0, row_ptr, 0, quant_input, 0, 1);
-                    v = ApplyLFM2GreedyArgmaxRepetitionPenaltyIfDue(v, k, repeated_tokens, repeat_pos,
-                                                                     repetition_penalty, repetition_penalty_active);
-                    if (IsBetterArgmaxCandidate(k, v, local_best_token, local_best_value)) {
-                        local_best_token = k;
-                        local_best_value = v;
+                    if (!SortedTokenListContainsAtOrAfter(disallowed_tokens, k, disallowed_pos)) {
+                        const void* row_ptr =
+                            reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
+                        float v = 0.0f;
+                        q6_type_traits_cpu->vec_dot(N, &v, 0, row_ptr, 0, quant_input, 0, 1);
+                        v = ApplyLFM2GreedyArgmaxRepetitionPenaltyIfDue(v, k, repeated_tokens, repeat_pos,
+                                                                         repetition_penalty, repetition_penalty_active);
+                        if (IsBetterArgmaxCandidate(k, v, local_best_token, local_best_value)) {
+                            local_best_token = k;
+                            local_best_value = v;
+                        }
                     }
                     ++k;
                 }
                 if (q6_can_use_rowpair) {
                     for (; k + 1 < k_end; k += 2) {
+                        const bool first_disallowed =
+                            SortedTokenListContainsAtOrAfter(disallowed_tokens, k, disallowed_pos);
+                        const bool second_disallowed =
+                            SortedTokenListContainsAtOrAfter(disallowed_tokens, k + 1, disallowed_pos);
+                        if (first_disallowed && second_disallowed) {
+                            continue;
+                        }
                         const void* row_ptr =
                             reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
                         float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                         q6_type_traits_cpu->vec_dot(N, sums, 2, row_ptr, row_stride, quant_input, 0, 2);
-                        sums[0] = ApplyLFM2GreedyArgmaxRepetitionPenaltyIfDue(
-                            sums[0], k, repeated_tokens, repeat_pos, repetition_penalty, repetition_penalty_active);
-                        if (IsBetterArgmaxCandidate(k, sums[0], local_best_token, local_best_value)) {
-                            local_best_token = k;
-                            local_best_value = sums[0];
+                        if (!first_disallowed) {
+                            sums[0] = ApplyLFM2GreedyArgmaxRepetitionPenaltyIfDue(
+                                sums[0], k, repeated_tokens, repeat_pos, repetition_penalty, repetition_penalty_active);
+                            if (IsBetterArgmaxCandidate(k, sums[0], local_best_token, local_best_value)) {
+                                local_best_token = k;
+                                local_best_value = sums[0];
+                            }
                         }
-                        sums[1] = ApplyLFM2GreedyArgmaxRepetitionPenaltyIfDue(
-                            sums[1], k + 1, repeated_tokens, repeat_pos, repetition_penalty,
-                            repetition_penalty_active);
-                        if (IsBetterArgmaxCandidate(k + 1, sums[1], local_best_token, local_best_value)) {
-                            local_best_token = k + 1;
-                            local_best_value = sums[1];
+                        if (!second_disallowed) {
+                            sums[1] = ApplyLFM2GreedyArgmaxRepetitionPenaltyIfDue(
+                                sums[1], k + 1, repeated_tokens, repeat_pos, repetition_penalty,
+                                repetition_penalty_active);
+                            if (IsBetterArgmaxCandidate(k + 1, sums[1], local_best_token, local_best_value)) {
+                                local_best_token = k + 1;
+                                local_best_value = sums[1];
+                            }
                         }
                     }
                 }
                 for (; k < k_end; ++k) {
+                    if (SortedTokenListContainsAtOrAfter(disallowed_tokens, k, disallowed_pos)) {
+                        continue;
+                    }
                     const void* row_ptr =
                         reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
                     float v = 0.0f;
@@ -743,6 +783,136 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
             auto packed = GetOrCreateQ8RepackedGemvWeight(weight_data, K, N, ud->force_q8_repacked_gemv);
             if (packed && packed->blocks_per_row > 0) {
                 const size_t block_bytes = 4 * sizeof(ggml_fp16_t) + QK8_0 * 4;
+                const bool gemma4_argmax_candidate =
+                    ud->gemma4_decode_lm_head && callback_work_ctx &&
+                    callback_work_ctx->lfm2_greedy_lm_head_argmax_allowed;
+                if (gemma4_argmax_candidate) {
+                    const uintptr_t argmax_key =
+                        reinterpret_cast<uintptr_t>(dst->data) ^
+                        (reinterpret_cast<uintptr_t>(src->data) << 1) ^
+                        (reinterpret_cast<uintptr_t>(weight_data) << 7) ^
+                        (static_cast<uintptr_t>(callback_work_ctx->execution_generation) * 0x9e3779b97f4a7c15ull);
+                    {
+                        std::lock_guard<std::mutex> lock(ud->lfm2_argmax_mutex);
+                        if (ud->lfm2_argmax_key != argmax_key || ud->lfm2_argmax_nth != nth) {
+                            ud->lfm2_argmax_key = argmax_key;
+                            ud->lfm2_argmax_done = 0;
+                            ud->lfm2_argmax_nth = nth;
+                            ud->lfm2_argmax_best_token = -1;
+                            ud->lfm2_argmax_best_value = -std::numeric_limits<float>::infinity();
+                            ud->lfm2_argmax_begin = std::chrono::steady_clock::now();
+                        }
+                    }
+
+                    int local_best_token = -1;
+                    float local_best_value = -std::numeric_limits<float>::infinity();
+                    const auto& repeated_tokens = callback_work_ctx->lfm2_greedy_lm_head_argmax_repeated_tokens;
+                    const auto& disallowed_tokens = callback_work_ctx->lfm2_greedy_lm_head_argmax_disallowed_tokens;
+                    const float repetition_penalty = callback_work_ctx->lfm2_greedy_lm_head_argmax_repetition_penalty;
+                    const float final_logit_softcap =
+                        callback_work_ctx->lfm2_greedy_lm_head_argmax_final_logit_softcap;
+                    const bool repetition_penalty_active = repetition_penalty != 1.0f && !repeated_tokens.empty();
+                    size_t repeat_pos =
+                        repetition_penalty_active
+                            ? static_cast<size_t>(
+                                  std::lower_bound(repeated_tokens.begin(), repeated_tokens.end(), k_start) -
+                                  repeated_tokens.begin())
+                            : repeated_tokens.size();
+                    size_t disallowed_pos =
+                        !disallowed_tokens.empty()
+                            ? static_cast<size_t>(
+                                  std::lower_bound(disallowed_tokens.begin(), disallowed_tokens.end(), k_start) -
+                                  disallowed_tokens.begin())
+                            : disallowed_tokens.size();
+
+                    auto consider_token = [&](int token, float value) {
+                        if (SortedTokenListContainsAtOrAfter(disallowed_tokens, token, disallowed_pos)) {
+                            return;
+                        }
+                        value = ApplyGreedyArgmaxFinalLogitSoftcap(value, final_logit_softcap);
+                        value = ApplyLFM2GreedyArgmaxRepetitionPenaltyIfDue(
+                            value, token, repeated_tokens, repeat_pos, repetition_penalty, repetition_penalty_active);
+                        if (IsBetterArgmaxCandidate(token, value, local_best_token, local_best_value)) {
+                            local_best_token = token;
+                            local_best_value = value;
+                        }
+                    };
+
+                    int k = k_start;
+                    for (; k < k_end && (k & 3); ++k) {
+                        const void* row_ptr =
+                            reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
+                        float v = 0.0f;
+                        type_traits_cpu->vec_dot(N, &v, 0, row_ptr, 0, quant_input, 0, 1);
+                        consider_token(k, v);
+                    }
+                    const int packed_end = k_end & ~3;
+                    if (k < packed_end) {
+                        const int packed_rows = packed_end - k;
+                        const size_t packed_offset =
+                            static_cast<size_t>(k / 4) * static_cast<size_t>(packed->blocks_per_row) * block_bytes;
+                        DenseCoreForEachQ8_0_4x8Q8_0DotGeneric(
+                            N, packed->data.data() + packed_offset, quant_input, packed_rows, k,
+                            [&](int token, float value) { consider_token(token, value); });
+                        k = packed_end;
+                    }
+                    for (; k < k_end; ++k) {
+                        const void* row_ptr =
+                            reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;
+                        float v = 0.0f;
+                        type_traits_cpu->vec_dot(N, &v, 0, row_ptr, 0, quant_input, 0, 1);
+                        consider_token(k, v);
+                    }
+
+                    bool last_thread = false;
+                    int best_token = -1;
+                    float best_value = -std::numeric_limits<float>::infinity();
+                    std::chrono::steady_clock::time_point begin;
+                    {
+                        std::lock_guard<std::mutex> lock(ud->lfm2_argmax_mutex);
+                        if (ud->lfm2_argmax_key == argmax_key) {
+                            if (IsBetterArgmaxCandidate(local_best_token, local_best_value,
+                                                        ud->lfm2_argmax_best_token,
+                                                        ud->lfm2_argmax_best_value)) {
+                                ud->lfm2_argmax_best_token = local_best_token;
+                                ud->lfm2_argmax_best_value = local_best_value;
+                            }
+                            ud->lfm2_argmax_done += 1;
+                            if (ud->lfm2_argmax_done == nth) {
+                                last_thread = true;
+                                best_token = ud->lfm2_argmax_best_token;
+                                best_value = ud->lfm2_argmax_best_value;
+                                begin = ud->lfm2_argmax_begin;
+                            }
+                        }
+                    }
+                    if (last_thread) {
+                        WriteInferenceWorkContextLFM2GreedyLMHeadSparseLogits(callback_work_ctx, output, K, best_token,
+                                                                              best_value);
+                        RecordInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(
+                            callback_work_ctx, callback_work_ctx->execution_generation, best_token, best_value, K);
+                    }
+                    uint64_t wall_ns = 0;
+                    if (begin != std::chrono::steady_clock::time_point{}) {
+                        wall_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                            std::chrono::steady_clock::now() - begin)
+                                                            .count());
+                    }
+                    maybe_log_gemv_timing("gemma4_q8_0_lm_head_argmax");
+                    if (ith == 0) {
+                        RecordGemma4DecodeNativeDecision(callback_work_ctx, /*candidate=*/false, /*used=*/true,
+                                                         nullptr, /*moe_used=*/false, /*dense_used=*/true,
+                                                         /*lm_head_used=*/true, wall_ns,
+                                                         /*replaced_mul_mat_ops=*/1,
+                                                         /*replaced_mul_mat_id_ops=*/0,
+                                                         /*duplicate_work_detected=*/false);
+                        if (matmul_dispatch_census_enabled) {
+                            RecordMatmulDispatchCensus(callback_work_ctx, callback_phase,
+                                                       "gemma4_q8_0_lm_head_argmax", weight_type, 1, K, N, wall_ns);
+                        }
+                    }
+                    return;
+                }
                 int k = k_start;
                 for (; k < k_end && (k & 3); ++k) {
                     const void* row_ptr = reinterpret_cast<const char*>(weight_data) + static_cast<size_t>(k) * row_stride;

@@ -35,9 +35,6 @@
 #include <immintrin.h>
 #endif
 
-extern "C" void ggml_gemm_q5_K_8x8_q8_K(int n, float* s, size_t bs, const void* vx, const void* vy, int nr, int nc);
-extern "C" void ggml_gemm_q6_K_8x8_q8_K(int n, float* s, size_t bs, const void* vx, const void* vy, int nr, int nc);
-
 namespace densecore {
 
 namespace {
@@ -183,6 +180,32 @@ bool CanUseGgmlQuantizedMoEPrefillBatch(const CpuBackend::ExpertWeights& exp, in
     return true;
 }
 
+bool CanUseLFM2QuantizedMoEPrefillBatch(const TransformerModel* model, const CpuBackend::ExpertWeights& exp,
+                                        int64_t batch, int64_t hidden_dim, int64_t intermediate_dim,
+                                        bool safe_reference_mode) {
+    if (!model || (!(model->variant == ModelVariant::LFM2MOE || model->arch_flags.is_lfm2_shortconv))) {
+        return false;
+    }
+    const InferenceExecutionPhase phase = GetCurrentExecutionPhase();
+    if (phase != InferenceExecutionPhase::Prefill && GetCurrentWorkContext() != nullptr) {
+        return false;
+    }
+    if (safe_reference_mode || batch <= 1 || batch > kMoEQuantizedProjectionMaxBatch) {
+        return false;
+    }
+    if (!ExpertHasGgmlQuantizedWeights(exp) || (exp.w2_scale_tensor && !IsScalarScaleSidecar(exp.w2_scale_tensor))) {
+        return false;
+    }
+    const auto w1_type = static_cast<ggml_type>(exp.w1_type);
+    const auto w2_type = static_cast<ggml_type>(exp.w2_type);
+    const auto w3_type = static_cast<ggml_type>(exp.w3_type);
+    if (w1_type != GGML_TYPE_Q4_K || w2_type != GGML_TYPE_Q4_K || w3_type != GGML_TYPE_Q4_K) {
+        return false;
+    }
+    return hidden_dim > 0 && intermediate_dim > 0 && (hidden_dim % ggml_blck_size(GGML_TYPE_Q4_K)) == 0 &&
+           (intermediate_dim % ggml_blck_size(GGML_TYPE_Q4_K)) == 0;
+}
+
 struct MoEQuantPrefillAdmissionPlan {
     InferenceWorkContext* work_ctx = nullptr;
     const char* reject_reason = "none";
@@ -280,7 +303,11 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
                            QuantizedProjectionInputCache* shared_input_projection_cache = nullptr,
                            CpuBackend::MoEForwardProfile* profile = nullptr,
                            bool allow_gemma4_quant_prefill_batch = false,
-                           bool force_gemma4_quant_prefill_batch = false) {
+                           bool force_gemma4_quant_prefill_batch = false,
+                           bool record_gemma4_quant_prefill_batch = false,
+                           bool prefer_q4k_repacked_prefill = false,
+                           bool allow_lfm2_q4k_fused_q8_down_prefill = false,
+                           bool disable_q4k_repacked_decode_fused_swiglu = false) {
     if (!backend || !output) {
         return;
     }
@@ -304,14 +331,101 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     const size_t hidden_size = static_cast<size_t>(batch * intermediate_dim);
     const bool enable_inner_parallel =
         allow_inner_parallel && ShouldParallelizeExpertFFNInner(batch, hidden_dim, intermediate_dim);
+    const bool profile_enabled = profile != nullptr;
     const bool safe_reference_mode = IsMoESafeReferenceModeEnabled(&expert);
     const MoEQuantPrefillAdmissionPlan quant_prefill_plan =
         ResolveMoEQuantPrefillAdmissionPlan(expert, batch, hidden_dim, intermediate_dim, safe_reference_mode,
                                             allow_gemma4_quant_prefill_batch, force_gemma4_quant_prefill_batch);
 
+    const bool lfm2_q4k_fused_q8_down_candidate =
+        allow_lfm2_q4k_fused_q8_down_prefill && !safe_reference_mode && batch > 1 && input.IsValid() &&
+        output->IsValid() && input.dtype == DType::F32 && output->dtype == DType::F32 && input.ndim == 2 &&
+        output->ndim == 2 && input.shape[0] == batch && input.shape[1] == hidden_dim &&
+        output->shape[0] == batch && output->shape[1] == hidden_dim && !expert.use_gelu_activation &&
+        expert.w1.ptr && expert.w2.ptr && expert.w3.ptr && expert.w1_type == GGML_TYPE_Q4_K &&
+        expert.w2_type == GGML_TYPE_Q4_K && expert.w3_type == GGML_TYPE_Q4_K &&
+        (!expert.w2_scale_tensor || IsScalarScaleSidecar(expert.w2_scale_tensor)) &&
+        hidden_dim > 0 && intermediate_dim > 0 && (hidden_dim % QK_K) == 0 && (intermediate_dim % QK_K) == 0;
+    if (lfm2_q4k_fused_q8_down_candidate) {
+        const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+        const size_t qinput_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, hidden_dim);
+        const size_t qhidden_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, intermediate_dim);
+        const size_t qinput_bytes = static_cast<size_t>(batch) * qinput_row_bytes;
+        const size_t qhidden_bytes = static_cast<size_t>(batch) * qhidden_row_bytes;
+        if (q8_traits && q8_traits->from_float && qinput_row_bytes > 0 && qhidden_row_bytes > 0) {
+            const float* input_data = input.DataAs<float>();
+            float* output_data = output->DataAs<float>();
+            const bool metadata_hit = input_projection_cache->source == input_data &&
+                                      input_projection_cache->rows == batch &&
+                                      input_projection_cache->cols == hidden_dim &&
+                                      input_projection_cache->type == GGML_TYPE_Q8_K &&
+                                      input_projection_cache->row_bytes == qinput_row_bytes;
+            const bool external_hit =
+                metadata_hit && input_projection_cache->external_bytes &&
+                input_projection_cache->external_size >= qinput_bytes;
+            const bool cache_hit =
+                external_hit || (metadata_hit && input_projection_cache->bytes.size() >= qinput_bytes);
+            if (!cache_hit) {
+                input_projection_cache->source = input_data;
+                input_projection_cache->external_bytes = nullptr;
+                input_projection_cache->external_size = 0;
+                input_projection_cache->rows = batch;
+                input_projection_cache->cols = hidden_dim;
+                input_projection_cache->type = GGML_TYPE_Q8_K;
+                input_projection_cache->row_bytes = qinput_row_bytes;
+                input_projection_cache->bytes.resize(qinput_bytes);
+                for (int64_t m = 0; m < batch; ++m) {
+                    q8_traits->from_float(input_data + static_cast<size_t>(m) * static_cast<size_t>(hidden_dim),
+                                          input_projection_cache->bytes.data() +
+                                              static_cast<size_t>(m) * qinput_row_bytes,
+                                          hidden_dim);
+                }
+            }
+            const uint8_t* qinput_data =
+                external_hit ? input_projection_cache->external_bytes : input_projection_cache->bytes.data();
+            static thread_local std::vector<uint8_t> qhidden_scratch;
+            if (qhidden_scratch.size() < qhidden_bytes) {
+                qhidden_scratch.resize(qhidden_bytes);
+            }
+
+            const auto w1w3_begin =
+                profile_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool w1w3_ok = RunMoEQ4KRawBatchedFusedSwiGLUToQ8Impl(
+                backend, expert.w1.ptr, expert.w3.ptr, qinput_data, qinput_row_bytes, qhidden_scratch.data(),
+                qhidden_row_bytes, batch, intermediate_dim, hidden_dim, numa_node, enable_inner_parallel);
+            if (profile_enabled) {
+                profile->w1w3_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w1w3_begin)
+                        .count());
+            }
+
+            const auto w2_begin =
+                profile_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool w2_ok =
+                w1w3_ok && RunMoEQ4KRawBatchedProjectionImpl(
+                                backend, expert.w2.ptr, qhidden_scratch.data(), qhidden_row_bytes, output_data, batch,
+                                hidden_dim, intermediate_dim, numa_node, enable_inner_parallel);
+            if (profile_enabled) {
+                profile->w2_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w2_begin)
+                        .count());
+            }
+            if (w2_ok) {
+                if (expert.w2_scale_tensor) {
+                    ApplyScalarScaleToTensor(output, ReadScalarScaleSidecar(expert.w2_scale_tensor));
+                }
+                LogMoEMatmulPath("lfm2_q4k_fused_swiglu_q8_down_prefill", static_cast<int>(batch),
+                                 static_cast<int>(hidden_dim), static_cast<int>(intermediate_dim), 0,
+                                 enable_inner_parallel);
+                RecordMoEProjectionPath(backend, trace_ctx, &expert, '1', safe_reference_mode, "ggml_quantized_vecdot");
+                RecordMoEProjectionPath(backend, trace_ctx, &expert, '2', safe_reference_mode, "ggml_quantized_vecdot");
+                return;
+            }
+        }
+    }
+
     hidden_scratch.Resize(backend, hidden_size);
     Tensor hidden = Tensor::Make2D(hidden_scratch.ptr, batch, intermediate_dim);
-    const bool profile_enabled = profile != nullptr;
     const auto w1w3_profile_begin =
         profile_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     MoEFusedGateUpRequest fused_gate_up_request;
@@ -329,6 +443,9 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     fused_gate_up_request.ggml_quantized_vecdot_safe = quant_prefill_plan.ggml_quantized_vecdot_safe;
     fused_gate_up_request.gemma4_quant_prefill_batch_safe = quant_prefill_plan.batch_safe;
     fused_gate_up_request.force_gemma4_quant_prefill_fast_path = quant_prefill_plan.force_fast_path;
+    fused_gate_up_request.record_gemma4_quant_prefill_batch = record_gemma4_quant_prefill_batch;
+    fused_gate_up_request.prefer_q4k_repacked_prefill = prefer_q4k_repacked_prefill;
+    fused_gate_up_request.allow_q4k_repacked_decode_fused_swiglu = !disable_q4k_repacked_decode_fused_swiglu;
     fused_gate_up_request.enable_inner_parallel = enable_inner_parallel;
 
     const MoEFusedGateUpPlan fused_gate_up_plan = ResolveMoEFusedGateUpPlan(fused_gate_up_request);
@@ -355,6 +472,9 @@ void DispatchExpertFFNImpl(CpuBackend* backend, int numa_node, const Tensor& inp
     projection_context.ggml_quantized_vecdot_safe = quant_prefill_plan.ggml_quantized_vecdot_safe;
     projection_context.force_gemma4_quant_prefill_fast_path = quant_prefill_plan.force_fast_path;
     projection_context.gemma4_quant_prefill_batch_safe = quant_prefill_plan.batch_safe;
+    projection_context.record_gemma4_quant_prefill_batch = record_gemma4_quant_prefill_batch;
+    projection_context.prefer_q4k_repacked_prefill = prefer_q4k_repacked_prefill;
+    projection_context.allow_q4k_repacked_decode_fused_swiglu = !disable_q4k_repacked_decode_fused_swiglu;
     projection_context.enable_inner_parallel = enable_inner_parallel;
 
     std::chrono::steady_clock::duration w1_duration{};
@@ -792,6 +912,15 @@ bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, 
                                              numa_node, allow_parallel);
 }
 
+bool RunMoEQ4KRawBatchedWeightedScatterProjection(
+    CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data, size_t qinput_row_bytes,
+    const int* token_indices, const float* token_weights, float* output_data, int64_t output_row_stride, int64_t M,
+    int64_t N, int64_t K, int numa_node, bool allow_parallel) {
+    return RunMoEQ4KRawBatchedWeightedScatterProjectionImpl(
+        backend, weight_ptr, qinput_data, qinput_row_bytes, token_indices, token_weights, output_data,
+        output_row_stride, M, N, K, numa_node, allow_parallel);
+}
+
 bool RunMoEKQuantRawBatchedProjection(CpuBackend* backend, int ggml_type_id, const void* weight_ptr,
                                       const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
                                       int64_t N, int64_t K, int numa_node, bool allow_parallel) {
@@ -810,6 +939,14 @@ bool RunMoEKQuantRawBatchedFusedSwiGLU(CpuBackend* backend, int ggml_type_id, co
     return RunMoEKQuantRawBatchedFusedSwiGLUImpl(backend, static_cast<ggml_type>(ggml_type_id), gate_weight_ptr,
                                                  up_weight_ptr, qinput_data, qinput_row_bytes, out_data, M, N, K,
                                                  numa_node, allow_parallel);
+}
+
+bool RunMoEQ4KRawBatchedFusedSwiGLUToQ8(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
+                                        const uint8_t* qinput_data, size_t qinput_row_bytes, uint8_t* qoutput_data,
+                                        size_t qoutput_row_bytes, int64_t M, int64_t N, int64_t K, int numa_node,
+                                        bool allow_parallel) {
+    return RunMoEQ4KRawBatchedFusedSwiGLUToQ8Impl(backend, gate_weight_ptr, up_weight_ptr, qinput_data, qinput_row_bytes,
+                                                  qoutput_data, qoutput_row_bytes, M, N, K, numa_node, allow_parallel);
 }
 
 void CpuBackend::ApplyMultiLoRA(
@@ -1651,6 +1788,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
     std::mutex work_stats_mutex;
     const bool prefer_inner_parallel_prefill = execution_plan.prefer_inner_parallel_prefill;
     const bool parallelize_experts = execution_plan.parallelize_experts;
+
     if (IsMoECachePolicyDebugEnabled()) {
         std::fprintf(stderr,
                      "[MOE_CACHE_POLICY] arm_disable_registry_dequant_cache=%d registry_present=%d "
@@ -1723,6 +1861,10 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
             const MoEQuantPrefillAdmissionPlan quant_prefill_plan =
                 ResolveGemma4MoEPrefillAdmissionPlan(model, exp, work.count, static_cast<int64_t>(hidden_dim),
                                                      static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode);
+            const bool lfm2_quant_prefill_batch_safe =
+                CanUseLFM2QuantizedMoEPrefillBatch(model, exp, work.count, static_cast<int64_t>(hidden_dim),
+                                                   static_cast<int64_t>(exp.intermediate_dim), safe_reference_mode);
+            const bool quantized_prefill_batch_safe = quant_prefill_plan.batch_safe || lfm2_quant_prefill_batch_safe;
             if (quant_prefill_plan.enabled && work.count > 1) {
                 RecordGemma4MoEPrefillQuantBatchDecision(
                     quant_prefill_plan.work_ctx, true, false,
@@ -1733,7 +1875,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 }
             }
             const bool should_try_cache =
-                dequant_cache_enabled && !quant_prefill_plan.batch_safe &&
+                dequant_cache_enabled && !quantized_prefill_batch_safe &&
                 (cache_all_active_experts || work.local_hot ||
                  previous_batch_set.find(work.expert_id) != previous_batch_set.end() || work.count > 1);
             const size_t cacheable_bytes = GetMoEExpertDequantCacheBytes(exp, safe_reference_mode);
@@ -1774,7 +1916,7 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 const bool can_use_ggml_quant_gen =
                     !safe_reference_mode && ExpertHasGgmlQuantizedWeights(exp) &&
                     (!exp.w2_scale_tensor || IsScalarScaleSidecar(exp.w2_scale_tensor)) &&
-                    work.count <= kMoEQuantizedProjectionMaxBatch && (work.count == 1 || quant_prefill_plan.batch_safe);
+                    work.count <= kMoEQuantizedProjectionMaxBatch && (work.count == 1 || quantized_prefill_batch_safe);
                 if (!can_use_ggml_quant_gen) {
                     w1 = MakeMoEWeightF32(this, exp.w1.ptr, exp.w1_type, exp.w1_int4, nullptr,
                                           static_cast<int64_t>(exp.intermediate_dim),
@@ -1802,15 +1944,16 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 local_dequant_duration += (std::chrono::steady_clock::now() - dequant_begin);
             }
 
+            const auto expert_begin =
+                debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto expert_profile_begin =
+                profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
             Tensor expert_input = Tensor::Make2D(packed_input + static_cast<size_t>(work.start) * hidden_dim,
                                                  static_cast<int64_t>(work.count), static_cast<int64_t>(hidden_dim));
             Tensor expert_out = Tensor::Make2D(packed_output + static_cast<size_t>(work.start) * hidden_dim,
                                                static_cast<int64_t>(work.count), static_cast<int64_t>(hidden_dim));
 
-            const auto expert_begin =
-                debug_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            const auto expert_profile_begin =
-                profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             MoEExecutionTraceContext trace_ctx;
             trace_ctx.layer_idx = layer_idx;
             trace_ctx.expert_id = work.expert_id;
@@ -1830,8 +1973,9 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
                 }
             }
             DispatchExpertFFNImpl(this, work.numa_node, expert_input, exp, w1, w2, w3, &expert_out,
-                                  allow_inner_parallel, &trace_ctx, nullptr, profile, quant_prefill_plan.batch_safe,
-                                  quant_prefill_plan.forced);
+                                  allow_inner_parallel, &trace_ctx, nullptr, profile, quantized_prefill_batch_safe,
+                                  quant_prefill_plan.forced, quant_prefill_plan.enabled, quant_prefill_plan.batch_safe,
+                                  lfm2_quant_prefill_batch_safe, IsLFM2MoEModelForSmallDecodeParallel(model));
             if (profile) {
                 profile->expert_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                 std::chrono::steady_clock::now() - expert_profile_begin)
@@ -1992,13 +2136,14 @@ bool RunGgmlQuantizedProjectionForTest(CpuBackend* backend, const void* weight_p
 bool RunGgmlQuantizedFusedSwiGLUProjectionForTest(CpuBackend* backend, const void* gate_weight_ptr,
                                                   int gate_ggml_type_id, const void* up_weight_ptr, int up_ggml_type_id,
                                                   const Tensor& input, Tensor* output, int64_t N, int64_t K,
-                                                  bool use_gelu_activation) {
+                                                  bool use_gelu_activation,
+                                                  QuantizedProjectionInputCache* input_cache) {
     if (use_gelu_activation) {
         return false;
     }
     return TryRunGgmlQuantizedFusedSwiGLUProjection(backend, gate_weight_ptr, gate_ggml_type_id, up_weight_ptr,
                                                     up_ggml_type_id, input, output, N, K, /*numa_node=*/0,
-                                                    /*allow_parallel=*/false, nullptr);
+                                                    /*allow_parallel=*/false, input_cache);
 }
 
 bool RunGgmlQuantizedFusedGEGLUProjectionForTest(CpuBackend* backend, const void* gate_weight_ptr,

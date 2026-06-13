@@ -76,11 +76,16 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
     const size_t total_qbytes = static_cast<size_t>(M) * iq_row_bytes;
     uint8_t* qinput_data = nullptr;
     if (input_cache) {
-        const bool cache_hit = input_cache->source == in_data && input_cache->rows == M && input_cache->cols == K &&
-                               input_cache->type == iq_type && input_cache->row_bytes == iq_row_bytes &&
-                               input_cache->bytes.size() >= total_qbytes;
+        const bool metadata_hit = input_cache->source == in_data && input_cache->rows == M &&
+                                  input_cache->cols == K && input_cache->type == iq_type &&
+                                  input_cache->row_bytes == iq_row_bytes;
+        const bool external_hit =
+            metadata_hit && input_cache->external_bytes && input_cache->external_size >= total_qbytes;
+        const bool cache_hit = external_hit || (metadata_hit && input_cache->bytes.size() >= total_qbytes);
         if (!cache_hit) {
             input_cache->source = in_data;
+            input_cache->external_bytes = nullptr;
+            input_cache->external_size = 0;
             input_cache->rows = M;
             input_cache->cols = K;
             input_cache->type = iq_type;
@@ -91,7 +96,7 @@ bool TryRunGgmlQuantizedProjection(CpuBackend* backend, const void* weight_ptr, 
                                       input_cache->bytes.data() + static_cast<size_t>(m) * iq_row_bytes, K);
             }
         }
-        qinput_data = input_cache->bytes.data();
+        qinput_data = external_hit ? const_cast<uint8_t*>(input_cache->external_bytes) : input_cache->bytes.data();
     } else {
         // Quantize the active expert batch once, then reuse it for every expert row.
         static thread_local std::vector<uint8_t> qinput_buf;
@@ -430,11 +435,16 @@ bool TryRunGgmlQuantizedFusedGEGLUProjection(CpuBackend* backend, const void* ga
     const size_t total_qbytes = static_cast<size_t>(M) * iq_row_bytes;
     uint8_t* qinput_data = nullptr;
     if (input_cache) {
-        const bool cache_hit = input_cache->source == in_data && input_cache->rows == M && input_cache->cols == K &&
-                               input_cache->type == iq_type && input_cache->row_bytes == iq_row_bytes &&
-                               input_cache->bytes.size() >= total_qbytes;
+        const bool metadata_hit = input_cache->source == in_data && input_cache->rows == M &&
+                                  input_cache->cols == K && input_cache->type == iq_type &&
+                                  input_cache->row_bytes == iq_row_bytes;
+        const bool external_hit =
+            metadata_hit && input_cache->external_bytes && input_cache->external_size >= total_qbytes;
+        const bool cache_hit = external_hit || (metadata_hit && input_cache->bytes.size() >= total_qbytes);
         if (!cache_hit) {
             input_cache->source = in_data;
+            input_cache->external_bytes = nullptr;
+            input_cache->external_size = 0;
             input_cache->rows = M;
             input_cache->cols = K;
             input_cache->type = iq_type;
@@ -445,7 +455,7 @@ bool TryRunGgmlQuantizedFusedGEGLUProjection(CpuBackend* backend, const void* ga
                                       input_cache->bytes.data() + static_cast<size_t>(m) * iq_row_bytes, K);
             }
         }
-        qinput_data = input_cache->bytes.data();
+        qinput_data = external_hit ? const_cast<uint8_t*>(input_cache->external_bytes) : input_cache->bytes.data();
     } else {
         static thread_local std::vector<uint8_t> qinput_buf;
         if (qinput_buf.size() < total_qbytes) qinput_buf.resize(total_qbytes);
@@ -554,7 +564,8 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
                                               Tensor* output, int64_t N, int64_t K, int numa_node,
                                               bool allow_parallel = true,
                                               QuantizedProjectionInputCache* input_cache = nullptr,
-                                              bool prefer_q4k_repacked_prefill = false) {
+                                              bool prefer_q4k_repacked_prefill = false,
+                                              bool allow_q4k_repacked_decode = true) {
     if (!backend || !gate_weight_ptr || !up_weight_ptr || !output || !input.IsValid() || !output->IsValid()) {
         return false;
     }
@@ -616,11 +627,16 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
     const size_t total_qbytes = static_cast<size_t>(M) * iq_row_bytes;
     uint8_t* qinput_data = nullptr;
     if (input_cache) {
-        const bool cache_hit = input_cache->source == in_data && input_cache->rows == M && input_cache->cols == K &&
-                               input_cache->type == iq_type && input_cache->row_bytes == iq_row_bytes &&
-                               input_cache->bytes.size() >= total_qbytes;
+        const bool metadata_hit = input_cache->source == in_data && input_cache->rows == M &&
+                                  input_cache->cols == K && input_cache->type == iq_type &&
+                                  input_cache->row_bytes == iq_row_bytes;
+        const bool external_hit =
+            metadata_hit && input_cache->external_bytes && input_cache->external_size >= total_qbytes;
+        const bool cache_hit = external_hit || (metadata_hit && input_cache->bytes.size() >= total_qbytes);
         if (!cache_hit) {
             input_cache->source = in_data;
+            input_cache->external_bytes = nullptr;
+            input_cache->external_size = 0;
             input_cache->rows = M;
             input_cache->cols = K;
             input_cache->type = iq_type;
@@ -631,7 +647,7 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
                                       input_cache->bytes.data() + static_cast<size_t>(m) * iq_row_bytes, K);
             }
         }
-        qinput_data = input_cache->bytes.data();
+        qinput_data = external_hit ? const_cast<uint8_t*>(input_cache->external_bytes) : input_cache->bytes.data();
     } else {
         static thread_local std::vector<uint8_t> qinput_buf;
         if (qinput_buf.size() < total_qbytes) qinput_buf.resize(total_qbytes);
@@ -717,7 +733,8 @@ bool TryRunGgmlQuantizedFusedSwiGLUProjection(CpuBackend* backend, const void* g
         record_q4k_repacked(false, "rowpair_used");
         return true;
     }
-    if (M == 1 && gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K && iq_type == GGML_TYPE_Q8_K &&
+    if (allow_q4k_repacked_decode && M == 1 && gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K &&
+        iq_type == GGML_TYPE_Q8_K &&
         (N % 8) == 0 && (K % ggml_blck_size(GGML_TYPE_Q4_K)) == 0) {
         auto gate_packed = GetOrCreateQ4KRepackedMoEWeight(gate_weight_ptr, N, K);
         auto up_packed = GetOrCreateQ4KRepackedMoEWeight(up_weight_ptr, N, K);

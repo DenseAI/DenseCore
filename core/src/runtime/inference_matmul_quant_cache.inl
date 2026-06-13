@@ -2,6 +2,14 @@
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__SSE4_1__)
 #include <immintrin.h>
 #endif
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+#include <arm_neon.h>
+#define DENSECORE_Q8_4X8_NEON_DOTPROD 1
+#endif
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_MATMUL_INT8)
+#include <arm_neon.h>
+#define DENSECORE_Q8_4X8_NEON_I8MM 1
+#endif
 
 struct Q8RepackedGemvWeight {
     int64_t rows = 0;
@@ -54,15 +62,90 @@ static inline int DenseCoreQ8_0Dot8I8I8(const int8_t* weight, const int8_t* inpu
 #endif
 }
 
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__AVX2__)
+static inline __m256i DenseCoreQ8_0LoadPacked4x8RowAVX2(const int8_t* qs, int row) {
+    const int8_t* row_qs = qs + row * 8;
+    const __m128i q0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row_qs));
+    const __m128i q1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row_qs + 32));
+    const __m128i q2 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row_qs + 64));
+    const __m128i q3 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row_qs + 96));
+    const __m128i lo = _mm_unpacklo_epi64(q0, q1);
+    const __m128i hi = _mm_unpacklo_epi64(q2, q3);
+    return _mm256_set_m128i(hi, lo);
+}
+
+static inline __m256i DenseCoreQ8_0MulSumI8PairsAccI32x8AVX2(__m256i acc, __m256i weight, __m256i input) {
+    const __m256i abs_weight = _mm256_sign_epi8(weight, weight);
+    const __m256i signed_input = _mm256_sign_epi8(input, weight);
+    const __m256i pair_sum_i16 = _mm256_maddubs_epi16(abs_weight, signed_input);
+    const __m256i ones = _mm256_set1_epi16(1);
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(pair_sum_i16, ones));
+}
+
+static inline int DenseCoreQ8_0HsumI32x8AVX2(__m256i value) {
+    __m128i sum = _mm_add_epi32(_mm256_castsi256_si128(value), _mm256_extracti128_si256(value, 1));
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(1, 0, 3, 2)));
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(sum);
+}
+
+static inline int DenseCoreQ8_0DotPacked4x8RowAVX2(const int8_t* qs, int row, const int8_t* input) {
+    const __m256i weight = DenseCoreQ8_0LoadPacked4x8RowAVX2(qs, row);
+    const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input));
+    const __m256i acc = DenseCoreQ8_0MulSumI8PairsAccI32x8AVX2(_mm256_setzero_si256(), weight, x);
+    return DenseCoreQ8_0HsumI32x8AVX2(acc);
+}
+#endif
+
+#if defined(DENSECORE_Q8_4X8_NEON_DOTPROD)
+// ARM SVE2/Neoverse (C4A) had no SIMD path here: the q8_0 4x8 GEMM/GEMV fell to the
+// scalar #else below, making the Qwen hybrid-SSM ssm_qkv_gate projection (the #1
+// prefill cost) ~2x slower than llama.cpp's i8mm kernels. These dotprod helpers
+// vectorize the int8 dot. Integer dot products are EXACT, so the result is
+// bit-identical to the scalar path (and to AVX2) — the parity-oracle tests
+// (RunDenseCoreQ8RepackedGemvForTest / RunGemma4NativeQ8PrefillTrueGemmForTest)
+// must confirm output_matches_vecdot_oracle on ARM before trusting this.
+//
+// 4x8 packed layout per block: a row's 32 int8 live in four 8-wide chunks strided
+// by 32 bytes (qs + chunk*32 + row*8). chunk c of the weight row dots input chunk c.
+static inline int DenseCoreQ8_0DotPacked4x8RowDotprodNeon(const int8_t* qs, int row, const int8_t* input) {
+    const int8_t* w = qs + row * 8;
+    const int8x16_t wA = vcombine_s8(vld1_s8(w), vld1_s8(w + 32));       // weight chunks 0,1
+    const int8x16_t wB = vcombine_s8(vld1_s8(w + 64), vld1_s8(w + 96));  // weight chunks 2,3
+    const int8x16_t xA = vld1q_s8(input);                                // input chunks 0,1
+    const int8x16_t xB = vld1q_s8(input + 16);                           // input chunks 2,3
+    int32x4_t acc = vdupq_n_s32(0);
+    acc = vdotq_s32(acc, wA, xA);
+    acc = vdotq_s32(acc, wB, xB);
+    return vaddvq_s32(acc);
+}
+
+// Both operands in 4x8 packed (strided) layout — used by the M>1 true GEMM tile.
+static inline int DenseCoreQ8_0DotPacked4x8RowsDotprodNeon(const int8_t* lhs_qs, int lhs_row,
+                                                           const int8_t* rhs_qs, int rhs_row) {
+    const int8_t* l = lhs_qs + lhs_row * 8;
+    const int8_t* r = rhs_qs + rhs_row * 8;
+    const int8x16_t lA = vcombine_s8(vld1_s8(l), vld1_s8(l + 32));
+    const int8x16_t lB = vcombine_s8(vld1_s8(l + 64), vld1_s8(l + 96));
+    const int8x16_t rA = vcombine_s8(vld1_s8(r), vld1_s8(r + 32));
+    const int8x16_t rB = vcombine_s8(vld1_s8(r + 64), vld1_s8(r + 96));
+    int32x4_t acc = vdupq_n_s32(0);
+    acc = vdotq_s32(acc, lA, rA);
+    acc = vdotq_s32(acc, lB, rB);
+    return vaddvq_s32(acc);
+}
+#endif
+
 static inline float DenseCoreFp16ToFp32Fast(ggml_fp16_t value) {
     float out_value = 0.0f;
     ggml_cpu_fp16_to_fp32(&value, &out_value, 1);
     return out_value;
 }
 
-static void DenseCoreGemvQ8_0_4x8Q8_0Generic(int n, float* out, const void* packed_weight, const void* q8_input,
-                                             int nc) {
-    if (!out || !packed_weight || !q8_input || n <= 0 || (n % QK8_0) != 0 || (nc % 4) != 0) {
+template <typename Visitor>
+static void DenseCoreForEachQ8_0_4x8Q8_0DotGeneric(int n, const void* packed_weight, const void* q8_input, int nc,
+                                                   int row_offset, Visitor&& visit) {
+    if (!packed_weight || !q8_input || n <= 0 || (n % QK8_0) != 0 || (nc % 4) != 0) {
         return;
     }
     const int nb = n / QK8_0;
@@ -84,6 +167,25 @@ static void DenseCoreGemvQ8_0_4x8Q8_0Generic(int n, float* out, const void* pack
                 DenseCoreFp16ToFp32Fast(scales[2]),
                 DenseCoreFp16ToFp32Fast(scales[3]),
             };
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__AVX2__)
+            sum[0] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowAVX2(qs, 0, x.qs)) * row_scale[0] *
+                      input_scale;
+            sum[1] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowAVX2(qs, 1, x.qs)) * row_scale[1] *
+                      input_scale;
+            sum[2] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowAVX2(qs, 2, x.qs)) * row_scale[2] *
+                      input_scale;
+            sum[3] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowAVX2(qs, 3, x.qs)) * row_scale[3] *
+                      input_scale;
+#elif defined(DENSECORE_Q8_4X8_NEON_DOTPROD)
+            sum[0] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowDotprodNeon(qs, 0, x.qs)) * row_scale[0] *
+                      input_scale;
+            sum[1] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowDotprodNeon(qs, 1, x.qs)) * row_scale[1] *
+                      input_scale;
+            sum[2] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowDotprodNeon(qs, 2, x.qs)) * row_scale[2] *
+                      input_scale;
+            sum[3] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowDotprodNeon(qs, 3, x.qs)) * row_scale[3] *
+                      input_scale;
+#else
             for (int row = 0; row < 4; ++row) {
                 int acc = 0;
                 for (int chunk = 0; chunk < QK8_0 / 8; ++chunk) {
@@ -91,9 +193,125 @@ static void DenseCoreGemvQ8_0_4x8Q8_0Generic(int n, float* out, const void* pack
                 }
                 sum[row] += static_cast<float>(acc) * row_scale[row] * input_scale;
             }
+#endif
         }
         for (int row = 0; row < 4; ++row) {
-            out[static_cast<size_t>(group) * 4 + row] = sum[row];
+            visit(row_offset + group * 4 + row, sum[row]);
+        }
+    }
+}
+
+static void DenseCoreGemvQ8_0_4x8Q8_0Generic(int n, float* out, const void* packed_weight, const void* q8_input,
+                                             int nc) {
+    if (!out) {
+        return;
+    }
+    DenseCoreForEachQ8_0_4x8Q8_0DotGeneric(
+        n, packed_weight, q8_input, nc, 0,
+        [&](int row, float value) { out[static_cast<size_t>(row)] = value; });
+}
+
+static inline int DenseCoreQ8_0DotPacked4x8Rows(const int8_t* lhs_qs, int lhs_row, const int8_t* rhs_qs,
+                                                int rhs_row) {
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__AVX2__)
+    const __m256i lhs = DenseCoreQ8_0LoadPacked4x8RowAVX2(lhs_qs, lhs_row);
+    const __m256i rhs = DenseCoreQ8_0LoadPacked4x8RowAVX2(rhs_qs, rhs_row);
+    const __m256i acc = DenseCoreQ8_0MulSumI8PairsAccI32x8AVX2(_mm256_setzero_si256(), lhs, rhs);
+    return DenseCoreQ8_0HsumI32x8AVX2(acc);
+#elif defined(DENSECORE_Q8_4X8_NEON_DOTPROD)
+    return DenseCoreQ8_0DotPacked4x8RowsDotprodNeon(lhs_qs, lhs_row, rhs_qs, rhs_row);
+#else
+    int sum = 0;
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        sum += DenseCoreQ8_0Dot8I8I8(lhs_qs + chunk * 4 * 8 + lhs_row * 8,
+                                     rhs_qs + chunk * 4 * 8 + rhs_row * 8);
+    }
+    return sum;
+#endif
+}
+
+static void DenseCoreGemmQ8_0_4x8x4Q8_0Generic(int n, float* out, int64_t out_row_stride,
+                                               const void* packed_weight, const void* packed_input, int nc) {
+    if (!out || !packed_weight || !packed_input || n <= 0 || (n % QK8_0) != 0 || nc <= 0 || (nc % 4) != 0 ||
+        out_row_stride <= 0) {
+        return;
+    }
+    const int nb = n / QK8_0;
+    const size_t packed_block_bytes = 4 * sizeof(ggml_fp16_t) + QK8_0 * 4;
+    const auto* weight_base = static_cast<const uint8_t*>(packed_weight);
+    const auto* input_base = static_cast<const uint8_t*>(packed_input);
+
+    for (int group = 0; group < nc / 4; ++group) {
+        float sum[4][4] = {};
+        const auto* weight_group =
+            weight_base + static_cast<size_t>(group) * static_cast<size_t>(nb) * packed_block_bytes;
+        for (int b = 0; b < nb; ++b) {
+            const auto* weight_block = weight_group + static_cast<size_t>(b) * packed_block_bytes;
+            const auto* input_block = input_base + static_cast<size_t>(b) * packed_block_bytes;
+            const auto* weight_scales = reinterpret_cast<const ggml_fp16_t*>(weight_block);
+            const auto* input_scales = reinterpret_cast<const ggml_fp16_t*>(input_block);
+            const auto* weight_qs = reinterpret_cast<const int8_t*>(weight_block + 4 * sizeof(ggml_fp16_t));
+            const auto* input_qs = reinterpret_cast<const int8_t*>(input_block + 4 * sizeof(ggml_fp16_t));
+            float w_scale[4];
+            float x_scale[4];
+            for (int row = 0; row < 4; ++row) {
+                w_scale[row] = DenseCoreFp16ToFp32Fast(weight_scales[row]);
+                x_scale[row] = DenseCoreFp16ToFp32Fast(input_scales[row]);
+            }
+#if defined(DENSECORE_Q8_4X8_NEON_I8MM)
+            // i8mm (smmla) 4x4 micro-kernel — what llama.cpp uses for this shape.
+            // The 4x8 pack is i8mm-native: out-rows {0,1} of a chunk are 16
+            // contiguous int8 at qs+chunk*32, {2,3} at +16 (same for the 4 input
+            // rows). vmmlaq_s32(a,b) accumulates the 2x2 tile [a0·b0, a0·b1, a1·b0,
+            // a1·b1]. Integer-exact vs the scalar/dotprod path; accumulate the
+            // block's 4 chunks, then apply per-block scales (sum[m][row] +=
+            // dot * w_scale[row] * x_scale[m]). w0..3 = weight rows, m0..3 = input rows.
+            int32x4_t acc_w01x01 = vdupq_n_s32(0);  // (w0·m0, w0·m1, w1·m0, w1·m1)
+            int32x4_t acc_w01x23 = vdupq_n_s32(0);  // (w0·m2, w0·m3, w1·m2, w1·m3)
+            int32x4_t acc_w23x01 = vdupq_n_s32(0);  // (w2·m0, w2·m1, w3·m0, w3·m1)
+            int32x4_t acc_w23x23 = vdupq_n_s32(0);  // (w2·m2, w2·m3, w3·m2, w3·m3)
+            for (int chunk = 0; chunk < QK8_0 / 8; ++chunk) {
+                const int8x16_t w01 = vld1q_s8(weight_qs + chunk * 32);
+                const int8x16_t w23 = vld1q_s8(weight_qs + chunk * 32 + 16);
+                const int8x16_t x01 = vld1q_s8(input_qs + chunk * 32);
+                const int8x16_t x23 = vld1q_s8(input_qs + chunk * 32 + 16);
+                acc_w01x01 = vmmlaq_s32(acc_w01x01, w01, x01);
+                acc_w01x23 = vmmlaq_s32(acc_w01x23, w01, x23);
+                acc_w23x01 = vmmlaq_s32(acc_w23x01, w23, x01);
+                acc_w23x23 = vmmlaq_s32(acc_w23x23, w23, x23);
+            }
+            sum[0][0] += static_cast<float>(vgetq_lane_s32(acc_w01x01, 0)) * w_scale[0] * x_scale[0];
+            sum[1][0] += static_cast<float>(vgetq_lane_s32(acc_w01x01, 1)) * w_scale[0] * x_scale[1];
+            sum[0][1] += static_cast<float>(vgetq_lane_s32(acc_w01x01, 2)) * w_scale[1] * x_scale[0];
+            sum[1][1] += static_cast<float>(vgetq_lane_s32(acc_w01x01, 3)) * w_scale[1] * x_scale[1];
+            sum[2][0] += static_cast<float>(vgetq_lane_s32(acc_w01x23, 0)) * w_scale[0] * x_scale[2];
+            sum[3][0] += static_cast<float>(vgetq_lane_s32(acc_w01x23, 1)) * w_scale[0] * x_scale[3];
+            sum[2][1] += static_cast<float>(vgetq_lane_s32(acc_w01x23, 2)) * w_scale[1] * x_scale[2];
+            sum[3][1] += static_cast<float>(vgetq_lane_s32(acc_w01x23, 3)) * w_scale[1] * x_scale[3];
+            sum[0][2] += static_cast<float>(vgetq_lane_s32(acc_w23x01, 0)) * w_scale[2] * x_scale[0];
+            sum[1][2] += static_cast<float>(vgetq_lane_s32(acc_w23x01, 1)) * w_scale[2] * x_scale[1];
+            sum[0][3] += static_cast<float>(vgetq_lane_s32(acc_w23x01, 2)) * w_scale[3] * x_scale[0];
+            sum[1][3] += static_cast<float>(vgetq_lane_s32(acc_w23x01, 3)) * w_scale[3] * x_scale[1];
+            sum[2][2] += static_cast<float>(vgetq_lane_s32(acc_w23x23, 0)) * w_scale[2] * x_scale[2];
+            sum[3][2] += static_cast<float>(vgetq_lane_s32(acc_w23x23, 1)) * w_scale[2] * x_scale[3];
+            sum[2][3] += static_cast<float>(vgetq_lane_s32(acc_w23x23, 2)) * w_scale[3] * x_scale[2];
+            sum[3][3] += static_cast<float>(vgetq_lane_s32(acc_w23x23, 3)) * w_scale[3] * x_scale[3];
+#else
+            for (int m = 0; m < 4; ++m) {
+                for (int row = 0; row < 4; ++row) {
+                    const int dot = DenseCoreQ8_0DotPacked4x8Rows(weight_qs, row, input_qs, m);
+                    sum[m][row] += static_cast<float>(dot) * w_scale[row] * x_scale[m];
+                }
+            }
+#endif
+        }
+        for (int m = 0; m < 4; ++m) {
+            float* out_row = out + static_cast<size_t>(m) * static_cast<size_t>(out_row_stride) +
+                             static_cast<size_t>(group) * 4;
+            out_row[0] = sum[m][0];
+            out_row[1] = sum[m][1];
+            out_row[2] = sum[m][2];
+            out_row[3] = sum[m][3];
         }
     }
 }
@@ -160,11 +378,7 @@ static void DenseCoreClearQ8_0RowsTo4x8ActivationCache(InferenceWorkContext* ctx
 }
 
 static constexpr bool DenseCoreQ8_0Gemm4x8FastBackendCompiled() {
-#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
     return true;
-#else
-    return false;
-#endif
 }
 
 static bool DenseCoreValidateQ8_0RowsTo4x8ActivationCache(const InferenceWorkContext* ctx,
@@ -1088,17 +1302,10 @@ static bool IsGemma4SharedDenseFfnWeightName(const char* weight_name) {
 
 static bool IsQ8RepackedGemvEnabled() {
     static const bool enabled = []() -> bool {
-        const char* env = std::getenv("DENSECORE_DISABLE_Q8_REPACKED_GEMV");
-        if (env && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
-            std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0) {
-            return false;
-        }
 #if defined(__aarch64__) || defined(_M_ARM64)
         return ggml_cpu_has_neon() && ggml_cpu_has_dotprod();
 #else
-        const char* enable_env = std::getenv("DENSECORE_ENABLE_Q8_REPACKED_GEMV");
-        return enable_env && enable_env[0] != '\0' && std::strcmp(enable_env, "0") != 0 &&
-               std::strcmp(enable_env, "false") != 0 && std::strcmp(enable_env, "off") != 0;
+        return false;
 #endif
     }();
     return enabled;

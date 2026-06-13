@@ -1,9 +1,14 @@
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdlib>
 #include <string>
 
 #include "runtime/worker_internal.h"
+
+int SelectLargestModelPrefillChunkThatFitsForTest(const TransformerModel* model, size_t prompt_tokens,
+                                                  size_t available_bytes, size_t safety_margin_bytes,
+                                                  int current_chunk_tokens);
 
 namespace {
 
@@ -599,6 +604,29 @@ TEST(DecodeThreadPolicy, Gemma4MoEPrefillChunkEnvTunesSchedulerAdmission) {
     req.prompt_tokens_for_cache.resize(520, 1);
 
     EXPECT_EQ(ResolveGemma4PrefillChunkTokens(&model, &req), 384);
+}
+
+TEST(DecodeThreadPolicy, Gemma4GraphCtxAutoUpgradeCapsAtC4MeasuredChunk) {
+    TransformerModel gemma4{};
+    gemma4.arch = ModelArch::GEMMA;
+    gemma4.variant = ModelVariant::GEMMA4;
+    gemma4.arch_flags.is_gemma4 = true;
+    gemma4.hparams.n_experts = 128;
+
+    TransformerModel qwen{};
+    qwen.arch = ModelArch::QWEN35;
+    qwen.variant = ModelVariant::QWEN36;
+    qwen.arch_flags.is_hybrid_ssm = true;
+    qwen.hparams.n_experts = 128;
+
+    constexpr size_t kPromptTokens = 3066;
+    constexpr size_t kLargeAvailableBytes = 512ULL * 1024ULL * 1024ULL * 1024ULL;
+    EXPECT_EQ(SelectLargestModelPrefillChunkThatFitsForTest(&gemma4, kPromptTokens, kLargeAvailableBytes,
+                                                            /*safety_margin_bytes=*/0, /*current_chunk_tokens=*/384),
+              448);
+    EXPECT_EQ(SelectLargestModelPrefillChunkThatFitsForTest(&qwen, kPromptTokens, kLargeAvailableBytes,
+                                                            /*safety_margin_bytes=*/0, /*current_chunk_tokens=*/96),
+              128);
 }
 
 }  // namespace

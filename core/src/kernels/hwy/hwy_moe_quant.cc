@@ -154,9 +154,18 @@ bool DotKQ8KImpl(const void* weight_row, const void* q8_input_row, int64_t cols,
 
     uint32_t utmp[4];
     int8_t unpacked[kMoEQK_K];
-    int32_t dot_chunks[8];
-    float sums[8] = {};
     float sumf = 0.0f;
+
+    // Integer dot via Highway SumOfMulQuadAccumulate: emits VNNI vpdpbusd on
+    // AVX3_DL, maddubs-based widening on AVX2, i8mm/dotprod on ARM, and a
+    // portable widen-mul fallback elsewhere. Capped at 256-bit so a 32-element
+    // K-quant sub-block (one shared 6-bit scale) never straddles a single load
+    // on 512-bit targets, while still using the 256-bit VNNI encoding there.
+    const hn::CappedTag<int32_t, 8> di32;
+    const hn::Repartition<uint8_t, decltype(di32)> du8;
+    const hn::Repartition<int8_t, decltype(di32)> di8;
+    const hn::Rebind<float, decltype(di32)> df32;
+    const size_t quad_lanes = hn::Lanes(du8);
 
     for (int bi = 0; bi < nb; ++bi) {
         const uint8_t* q = x[bi].qs;
@@ -196,38 +205,111 @@ bool DotKQ8KImpl(const void* weight_row, const void* q8_input_row, int64_t cols,
             min_dot += static_cast<int>(yb.bsums[j]) * static_cast<int>(mins[j / 2]);
         }
 
-        std::memset(dot_chunks, 0, sizeof(dot_chunks));
         const int8_t* q8 = yb.qs;
-        const int8_t* uq = unpacked;
-        int is = 0;
-        for (int j = 0; j < kMoEQK_K / 32; ++j) {
-            const int32_t scale = static_cast<int32_t>(scales[is++]);
-            for (int rep = 0; rep < 4; ++rep) {
-                for (int l = 0; l < 8; ++l) {
-                    dot_chunks[l] += scale * static_cast<int32_t>(q8[l]) * static_cast<int32_t>(uq[l]);
-                }
-                q8 += 8;
-                uq += 8;
+        const uint8_t* uq = reinterpret_cast<const uint8_t*>(unpacked);
+        auto block_acc = hn::Zero(di32);
+        for (int sub = 0; sub < kMoEQK_K / 32; ++sub) {
+            const uint8_t* w_sub = uq + static_cast<size_t>(sub) * 32;
+            const int8_t* q_sub = q8 + static_cast<size_t>(sub) * 32;
+            auto sub_acc = hn::Zero(di32);
+            for (size_t off = 0; off < 32; off += quad_lanes) {
+                const auto wv = hn::LoadU(du8, w_sub + off);
+                const auto qv = hn::LoadU(di8, q_sub + off);
+                sub_acc = hn::SumOfMulQuadAccumulate(di32, wv, qv, sub_acc);
             }
+            block_acc = hn::Add(block_acc, hn::Mul(hn::Set(di32, static_cast<int32_t>(scales[sub])), sub_acc));
         }
+        const float block_dot = hn::ReduceSum(df32, hn::ConvertTo(df32, block_acc));
 
         const float d = Fp16ToFloat(static_cast<uint16_t>(x[bi].d)) * yb.d;
         const float dmin = Fp16ToFloat(static_cast<uint16_t>(x[bi].dmin)) * yb.d;
-        for (int l = 0; l < 8; ++l) {
-            sums[l] += d * static_cast<float>(dot_chunks[l]);
-        }
+        sumf += d * block_dot;
         sumf -= dmin * static_cast<float>(min_dot);
     }
 
-    for (float v : sums) {
-        sumf += v;
-    }
     *output = sumf;
     return true;
 }
 
 bool DotQ4KQ8KImpl(const void* q4_weight_row, const void* q8_input_row, int64_t cols, float* output) {
     return DotKQ8KImpl<MoEQ4KBlock, false>(q4_weight_row, q8_input_row, cols, output);
+}
+
+bool BatchedDotQ4KQ8KRowsImpl(const void* q4_weight_row, const void* q8_input_base, size_t q8_row_stride,
+                              int64_t cols, int64_t row_count, float* outputs) {
+    if (!q4_weight_row || !q8_input_base || !outputs || cols <= 0 || row_count <= 0 || (cols % kMoEQK_K) != 0) {
+        return false;
+    }
+    const int nb = static_cast<int>(cols / kMoEQK_K);
+    const size_t q8_row_bytes = sizeof(MoEQ8KBlock) * static_cast<size_t>(nb);
+    if (q8_row_stride < q8_row_bytes) {
+        return false;
+    }
+
+    for (int64_t row = 0; row < row_count; ++row) {
+        outputs[row] = 0.0f;
+    }
+
+    const auto* x = static_cast<const MoEQ4KBlock*>(q4_weight_row);
+    uint32_t utmp[4];
+    int8_t unpacked[kMoEQK_K];
+
+    const hn::CappedTag<int32_t, 8> di32;
+    const hn::Repartition<uint8_t, decltype(di32)> du8;
+    const hn::Repartition<int8_t, decltype(di32)> di8;
+    const hn::Rebind<float, decltype(di32)> df32;
+    const size_t quad_lanes = hn::Lanes(du8);
+
+    for (int bi = 0; bi < nb; ++bi) {
+        const uint8_t* q = x[bi].qs;
+        int8_t* dst = unpacked;
+        for (int j = 0; j < kMoEQK_K / 64; ++j) {
+            for (int l = 0; l < 32; ++l) dst[l] = static_cast<int8_t>(q[l] & 0xF);
+            dst += 32;
+            for (int l = 0; l < 32; ++l) dst[l] = static_cast<int8_t>(q[l] >> 4);
+            dst += 32;
+            q += 32;
+        }
+
+        DecodeQ4KScales(x[bi].scales, utmp);
+        const auto* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
+        const auto* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
+        const float xd = Fp16ToFloat(static_cast<uint16_t>(x[bi].d));
+        const float xdmin = Fp16ToFloat(static_cast<uint16_t>(x[bi].dmin));
+        const uint8_t* uq = reinterpret_cast<const uint8_t*>(unpacked);
+
+        for (int64_t row = 0; row < row_count; ++row) {
+            const auto* y_blocks = reinterpret_cast<const MoEQ8KBlock*>(
+                static_cast<const uint8_t*>(q8_input_base) + static_cast<size_t>(row) * q8_row_stride);
+            const MoEQ8KBlock& yb = y_blocks[bi];
+
+            int min_dot = 0;
+            for (int j = 0; j < kMoEQK_K / 16; ++j) {
+                min_dot += static_cast<int>(yb.bsums[j]) * static_cast<int>(mins[j / 2]);
+            }
+
+            auto block_acc = hn::Zero(di32);
+            const int8_t* q8 = yb.qs;
+            for (int sub = 0; sub < kMoEQK_K / 32; ++sub) {
+                const uint8_t* w_sub = uq + static_cast<size_t>(sub) * 32;
+                const int8_t* q_sub = q8 + static_cast<size_t>(sub) * 32;
+                auto sub_acc = hn::Zero(di32);
+                for (size_t off = 0; off < 32; off += quad_lanes) {
+                    const auto wv = hn::LoadU(du8, w_sub + off);
+                    const auto qv = hn::LoadU(di8, q_sub + off);
+                    sub_acc = hn::SumOfMulQuadAccumulate(di32, wv, qv, sub_acc);
+                }
+                block_acc = hn::Add(block_acc, hn::Mul(hn::Set(di32, static_cast<int32_t>(scales[sub])), sub_acc));
+            }
+
+            const float block_dot = hn::ReduceSum(df32, hn::ConvertTo(df32, block_acc));
+            const float d = xd * yb.d;
+            const float dmin = xdmin * yb.d;
+            outputs[row] += d * block_dot - dmin * static_cast<float>(min_dot);
+        }
+    }
+
+    return true;
 }
 
 bool FusedSwiGLUQ4KQ8KRowsImpl(const void* q4_gate_rows, const void* q4_up_rows, const void* q8_input_row,
@@ -268,6 +350,7 @@ namespace hwy_kernels {
 
 HWY_EXPORT(QuantizeRowQ8KImpl);
 HWY_EXPORT(DotQ4KQ8KImpl);
+HWY_EXPORT(BatchedDotQ4KQ8KRowsImpl);
 HWY_EXPORT(FusedSwiGLUQ4KQ8KRowsImpl);
 HWY_EXPORT(DotQ5KQ8KImpl);
 
@@ -277,6 +360,12 @@ bool QuantizeRowQ8K_Hwy(const float* input, void* q8_output, int64_t cols) {
 
 bool DotQ4KQ8K_Hwy(const void* q4_weight_row, const void* q8_input_row, int64_t cols, float* output) {
     return HWY_DYNAMIC_DISPATCH(DotQ4KQ8KImpl)(q4_weight_row, q8_input_row, cols, output);
+}
+
+bool BatchedDotQ4KQ8KRows_Hwy(const void* q4_weight_row, const void* q8_input_base, size_t q8_row_stride,
+                              int64_t cols, int64_t row_count, float* outputs) {
+    return HWY_DYNAMIC_DISPATCH(BatchedDotQ4KQ8KRowsImpl)(q4_weight_row, q8_input_base, q8_row_stride, cols,
+                                                         row_count, outputs);
 }
 
 bool FusedSwiGLUQ4KQ8KRows_Hwy(const void* q4_gate_rows, const void* q4_up_rows, const void* q8_input_row,

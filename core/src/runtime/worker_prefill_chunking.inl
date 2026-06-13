@@ -184,8 +184,8 @@ size_t GraphContextPrefillAdmissionBaseMarginBytes(const TransformerModel* model
     return configured_margin_bytes;
 }
 
-size_t EstimateQwenMoEQ4KPrefillFutureReserveBytes(const TransformerModel* model, size_t active_prefill_tokens = 0,
-                                                   size_t available_bytes = 0) {
+size_t EstimateMoEQ4KRepackedFutureReserveBytes(const TransformerModel* model, size_t active_prefill_tokens = 0,
+                                                size_t available_bytes = 0) {
 #if defined(__aarch64__) || defined(_M_ARM64)
     (void)model;
     (void)active_prefill_tokens;
@@ -201,7 +201,9 @@ size_t EstimateQwenMoEQ4KPrefillFutureReserveBytes(const TransformerModel* model
     const auto contract = densecore::models::BuildModelExecutionContract(model);
     const bool qwen_moe = (descriptor.variant == ModelVariant::QWEN35 || descriptor.variant == ModelVariant::QWEN36) &&
                           (ModelHasMoEGraphLayers(model) || contract.has_moe);
-    if (!qwen_moe) {
+    const bool lfm2_moe = descriptor.variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv &&
+                          (ModelHasMoEGraphLayers(model) || contract.has_moe);
+    if (!qwen_moe && !lfm2_moe) {
         return 0;
     }
 
@@ -306,8 +308,8 @@ size_t EstimateQwenMoEQ4KPrefillFutureReserveBytes(const TransformerModel* model
         return a + b;
     };
 
-    // Qwen MoE Q4_K prefill uses two repacked expert matrices per routed expert
-    // (gate and up). Reserve for the current active prefill chunk, not for the
+    // Qwen/LFM2 MoE Q4_K prefill can materialize repacked expert matrices before
+    // long decode. Reserve for the current active prefill chunk, not for the
     // whole user prompt, so long-context requests scale with host headroom
     // instead of being rejected by a worst-case all-prompt cache assumption.
     size_t estimated_working_set = saturating_mul(layer_count, routed_experts_per_layer);
@@ -328,7 +330,8 @@ size_t EstimateQwenMoEQ4KPrefillFutureReserveBytes(const TransformerModel* model
         }
         reserve_bytes = std::min(reserve_bytes, dynamic_headroom_cap);
         if (active_prefill_tokens > 1) {
-            std::cerr << "[DenseCore] QwenMoEQ4KPrefillReserveEstimate"
+            std::cerr << "[DenseCore] MoEQ4KRepackedReserveEstimate"
+                      << " variant=" << densecore::models::ModelVariantName(descriptor.variant)
                       << " hp_experts=" << hp.n_experts
                       << " hp_experts_used=" << hp.n_experts_used
                       << " contract_experts=" << contract_num_experts
@@ -352,14 +355,32 @@ size_t EstimateQwenMoEQ4KPrefillFutureReserveBytes(const TransformerModel* model
 #endif
 }
 
+size_t EstimateQwenMoEQ4KPrefillFutureReserveBytes(const TransformerModel* model, size_t active_prefill_tokens = 0,
+                                                   size_t available_bytes = 0) {
+    const auto descriptor = model ? densecore::models::DescribeModel(model) : densecore::models::ModelDescriptor{};
+    if (descriptor.variant != ModelVariant::QWEN35 && descriptor.variant != ModelVariant::QWEN36) {
+        return 0;
+    }
+    return EstimateMoEQ4KRepackedFutureReserveBytes(model, active_prefill_tokens, available_bytes);
+}
+
+size_t EstimateLFM2MoEQ4KDecodeCacheFloorBytes(const TransformerModel* model, size_t active_prefill_tokens = 0,
+                                               size_t available_bytes = 0) {
+    const auto descriptor = model ? densecore::models::DescribeModel(model) : densecore::models::ModelDescriptor{};
+    if (descriptor.variant != ModelVariant::LFM2MOE || !model || !model->arch_flags.is_lfm2_shortconv) {
+        return 0;
+    }
+    return EstimateMoEQ4KRepackedFutureReserveBytes(model, active_prefill_tokens, available_bytes);
+}
+
 size_t GraphContextPrefillAdmissionMarginBytes(const TransformerModel* model, size_t active_prefill_tokens = 0,
                                                size_t available_bytes = 0) {
     return GraphContextPrefillAdmissionBaseMarginBytes(model, active_prefill_tokens, available_bytes) +
            EstimateQwenMoEQ4KPrefillFutureReserveBytes(model, active_prefill_tokens, available_bytes);
 }
 
-int SelectLargestQwenPrefillChunkThatFits(const TransformerModel* model, size_t prompt_tokens, size_t available_bytes,
-                                          size_t safety_margin_bytes, int current_chunk_tokens) {
+int SelectLargestModelPrefillChunkThatFits(const TransformerModel* model, size_t prompt_tokens, size_t available_bytes,
+                                           size_t safety_margin_bytes, int current_chunk_tokens) {
     if (!model || prompt_tokens <= 0 || available_bytes == 0 || current_chunk_tokens <= 1) {
         return current_chunk_tokens;
     }
@@ -368,17 +389,23 @@ int SelectLargestQwenPrefillChunkThatFits(const TransformerModel* model, size_t 
     const bool qwen35_moe = descriptor.variant == ModelVariant::QWEN35 && model_has_moe;
     const bool qwen36_moe = descriptor.variant == ModelVariant::QWEN36 && model_has_moe;
     const bool qwen_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
-    if (!qwen35_moe && !qwen36_moe && !qwen_hybrid_ssm) {
+    const bool gemma4_moe = descriptor.variant == ModelVariant::GEMMA4 && model_has_moe;
+    if (!qwen35_moe && !qwen36_moe && !qwen_hybrid_ssm && !gemma4_moe) {
         return current_chunk_tokens;
     }
 
-    // Larger chunks reduce graph rebuilds but Qwen hybrid-SSM Q8 projections
-    // become less efficient past 128 tokens on C4A: the graph-build savings are
-    // outweighed by larger Q8 GEMM work and weaker quantized-activation reuse.
-    // Keep automatic growth inside the measured fast range and let graph-context
-    // downgrade handle memory pressure below it.
-    constexpr int kCandidates[] = {128, 96, 64, 48, 32};
-    for (int candidate : kCandidates) {
+    constexpr int kQwenCandidates[] = {128, 96, 64, 48, 32};
+    // C4 x86 QA runs showed Gemma4's 512-token graph chunk fits but regresses
+    // TTFT versus the 448-token shape. Keep auto-upgrade capped at the measured
+    // faster chunk while leaving explicit env overrides available for diagnosis.
+    constexpr int kGemma4Candidates[] = {448, 384, 320, 288, 256, 224, 192, 160, 128};
+    const int* candidates = gemma4_moe ? kGemma4Candidates : kQwenCandidates;
+    const size_t candidate_count =
+        gemma4_moe ? (sizeof(kGemma4Candidates) / sizeof(kGemma4Candidates[0]))
+                   : (sizeof(kQwenCandidates) / sizeof(kQwenCandidates[0]));
+
+    for (size_t i = 0; i < candidate_count; ++i) {
+        const int candidate = candidates[i];
         if (candidate <= current_chunk_tokens || static_cast<size_t>(candidate) > prompt_tokens) {
             continue;
         }
@@ -421,8 +448,8 @@ int ApplyGraphContextPrefillChunkDowngrade(const TransformerModel* model, Reques
     req->graph_ctx_safety_margin_mb = safety_margin_bytes / (1024ULL * 1024ULL);
     if (initial_reservation_bytes + safety_margin_bytes <= available_bytes) {
         const int expanded_chunk =
-            SelectLargestQwenPrefillChunkThatFits(model, prompt_tokens, available_bytes, safety_margin_bytes,
-                                                  chunk_tokens);
+            SelectLargestModelPrefillChunkThatFits(model, prompt_tokens, available_bytes, safety_margin_bytes,
+                                                   chunk_tokens);
         if (expanded_chunk != chunk_tokens) {
             const size_t expanded_reservation_bytes =
                 EstimatePrefillGraphContextReservationBytes(model, prompt_tokens, static_cast<size_t>(expanded_chunk));
@@ -440,15 +467,25 @@ int ApplyGraphContextPrefillChunkDowngrade(const TransformerModel* model, Reques
         }
         return chunk_tokens;
     }
+    const auto descriptor = densecore::models::DescribeModel(model);
+    const bool model_has_moe = ModelHasMoEGraphLayers(model);
+    const bool gemma4_moe = descriptor.variant == ModelVariant::GEMMA4 && model_has_moe;
     if (originally_unchunked) {
-        const auto descriptor = densecore::models::DescribeModel(model);
         const bool qwen35_moe = descriptor.variant == ModelVariant::QWEN35 && model->hparams.n_experts > 0;
         const bool qwen_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
         effective_chunk = (qwen35_moe || qwen_hybrid_ssm) ? 384 : 512;
         effective_chunk = std::max(1, std::min<int>(effective_chunk, static_cast<int>(prompt_tokens)));
     }
-    constexpr int kPressureCandidates[] = {384, 320, 288, 256, 224, 192, 160, 128, 96, 64, 48, 32, 24, 16, 12, 8, 4, 2, 1};
-    for (int candidate : kPressureCandidates) {
+    constexpr int kDefaultPressureCandidates[] = {384, 320, 288, 256, 224, 192, 160, 128, 96, 64,
+                                                  48,  32,  24,  16,  12,  8,   4,   2,   1};
+    constexpr int kGemma4PressureCandidates[] = {448, 384, 320, 288, 256, 224, 192, 160, 128, 96,
+                                                 64,  48,  32,  24,  16,  12,  8,   4,   2,   1};
+    const int* pressure_candidates = gemma4_moe ? kGemma4PressureCandidates : kDefaultPressureCandidates;
+    const size_t pressure_candidate_count =
+        gemma4_moe ? (sizeof(kGemma4PressureCandidates) / sizeof(kGemma4PressureCandidates[0]))
+                   : (sizeof(kDefaultPressureCandidates) / sizeof(kDefaultPressureCandidates[0]));
+    for (size_t i = 0; i < pressure_candidate_count; ++i) {
+        const int candidate = pressure_candidates[i];
         if (candidate > effective_chunk || static_cast<size_t>(candidate) > prompt_tokens) {
             continue;
         }

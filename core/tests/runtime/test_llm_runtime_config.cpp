@@ -136,7 +136,6 @@ TEST(LLMRuntimeConfigTest, FastPathRuntimeConfigAggregatesHotLoopPolicies) {
     ScopedEnvVar sink_tokens("DENSECORE_KV_SINK_TOKENS", "6");
     ScopedEnvVar qwen36_ssm_q8_amx("DENSECORE_QWEN36_SSM_Q8_AMX_ALIAS", "on");
     ScopedEnvVar qwen36_expert_repack("DENSECORE_QWEN36_EXPERT_CPU_REPACK", "off");
-    ScopedEnvVar qact_cache("DENSECORE_ENABLE_QACT_CACHE", "on");
 
     const auto config = densecore::llm::config::LoadFastPathRuntimeConfig();
 
@@ -152,13 +151,12 @@ TEST(LLMRuntimeConfigTest, FastPathRuntimeConfigAggregatesHotLoopPolicies) {
     EXPECT_EQ(config.qwen36_ssm_q8_prefill_amx, densecore::llm::config::Qwen36SSMQ8PrefillAMXMode::On);
     EXPECT_EQ(config.qwen36_expert_cpu_repack, densecore::env::RuntimeToggleMode::Off);
     EXPECT_EQ(config.q4k_repacked_gemv, densecore::env::RuntimeToggleMode::On);
-    EXPECT_EQ(config.qact_cache, densecore::env::RuntimeToggleMode::On);
+    EXPECT_EQ(config.qact_cache, densecore::env::RuntimeToggleMode::Off);
 }
 
 TEST(LLMRuntimeConfigTest, PromotedQwenFastPathsDefaultOn) {
     ScopedEnvVar qwen36_ssm_q8_amx("DENSECORE_QWEN36_SSM_Q8_AMX_ALIAS", nullptr);
     ScopedEnvVar qwen36_expert_repack("DENSECORE_QWEN36_EXPERT_CPU_REPACK", nullptr);
-    ScopedEnvVar qact_cache("DENSECORE_ENABLE_QACT_CACHE", nullptr);
     auto config = densecore::llm::config::LoadFastPathRuntimeConfig();
     EXPECT_EQ(config.qwen36_prefill_q4k_batched, densecore::llm::config::Qwen36PrefillQ4KBatchedMode::On);
     EXPECT_EQ(config.qwen36_ssm_q8_amx_alias, densecore::env::RuntimeToggleMode::Off);
@@ -173,7 +171,6 @@ TEST(LLMRuntimeConfigTest, PromotedQwenFastPathsDefaultOn) {
 
     ScopedEnvVar invalid_qwen36_ssm_q8_amx("DENSECORE_QWEN36_SSM_Q8_AMX_ALIAS", "garbage");
     ScopedEnvVar invalid_qwen36_expert_repack("DENSECORE_QWEN36_EXPERT_CPU_REPACK", "garbage");
-    ScopedEnvVar invalid_qact_cache("DENSECORE_ENABLE_QACT_CACHE", "garbage");
     config = densecore::llm::config::LoadFastPathRuntimeConfig();
     EXPECT_EQ(config.qwen36_prefill_q4k_batched, densecore::llm::config::Qwen36PrefillQ4KBatchedMode::On);
     EXPECT_EQ(config.qwen36_ssm_q8_amx_alias, densecore::env::RuntimeToggleMode::Off);

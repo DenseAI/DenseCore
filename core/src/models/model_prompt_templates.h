@@ -46,6 +46,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
 void ConfigureQwenReasoningTokenBlocklistForModel(const TransformerModel* model, Request* req);
 void ConfigureQwen36TextTokenBlocklistForModel(const TransformerModel* model, Request* req);
 void ConfigureGemma4TextTokenBlocklistForModel(const TransformerModel* model, Request* req);
+void ConfigureLFM2TextTokenBlocklistForModel(const TransformerModel* model, Request* req);
 
 }  // namespace densecore::models
 

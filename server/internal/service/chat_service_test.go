@@ -297,8 +297,8 @@ func TestNormalizeSamplingLFM2DefaultsUseConservativeProfile(t *testing.T) {
 	if topK != 20 {
 		t.Fatalf("expected lfm2 top_k 20, got %v", topK)
 	}
-	if repetitionPenalty != 1.05 {
-		t.Fatalf("expected lfm2 repetition penalty 1.05, got %v", repetitionPenalty)
+	if repetitionPenalty != 1.12 {
+		t.Fatalf("expected lfm2 long-form repetition penalty 1.12, got %v", repetitionPenalty)
 	}
 }
 
@@ -312,7 +312,7 @@ func TestNormalizeSamplingLFM2TemperatureZeroKeepsDefaultRepetitionPenalty(t *te
 		TopK:           1,
 		TopKSet:        true,
 	})
-	if temperature != 0.0 || topP != 1.0 || topK != 1 || repetitionPenalty != 1.05 {
+	if temperature != 0.0 || topP != 1.0 || topK != 1 || repetitionPenalty != 1.12 {
 		t.Fatalf("expected lfm2 greedy decode to keep quality repetition penalty, got temp=%v top_p=%v top_k=%v rep=%v",
 			temperature, topP, topK, repetitionPenalty)
 	}

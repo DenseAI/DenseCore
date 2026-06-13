@@ -201,7 +201,7 @@ func splitReasoningResponse(req domain.ChatCompletionRequest, modelHint, text st
 		}
 		return splitQwenThinkResponse(text)
 	}
-	return splitGemma4ReasoningResponse(modelHint, text)
+	return splitGemma4ReasoningResponse(req, modelHint, text)
 }
 
 func isLFM2ModelHint(modelHint string) bool {
@@ -679,7 +679,7 @@ func (f *gemma4StreamFilter) Flush() string {
 	pending := f.pending
 	f.pending = ""
 	f.started = true
-	content, _ := splitGemma4ReasoningResponse("gemma4", pending)
+	content, _ := splitGemma4ReasoningResponse(domain.ChatCompletionRequest{}, "gemma4", pending)
 	return content
 }
 
@@ -826,13 +826,16 @@ func longestSuffixPrefixLen(value, target string) int {
 	return 0
 }
 
-func splitGemma4ReasoningResponse(modelHint, text string) (string, string) {
+func splitGemma4ReasoningResponse(req domain.ChatCompletionRequest, modelHint, text string) (string, string) {
 	if !isGemma4ModelHint(modelHint) {
 		return text, ""
 	}
 	if !strings.Contains(text, "<|channel>thought") {
 		if strings.HasPrefix(text, "<channel|>") {
 			return sanitizeGemma4VisibleContent(strings.TrimPrefix(text, "<channel|>")), ""
+		}
+		if gemma4ReasoningEnabled(req, modelHint) {
+			return "", sanitizeGemma4VisibleContent(text)
 		}
 		return sanitizeGemma4VisibleContent(text), ""
 	}
@@ -870,13 +873,19 @@ func splitGemma4ReasoningResponse(modelHint, text string) (string, string) {
 			channel = strings.TrimSpace(segment[:newline])
 			body = segment[newline+1:]
 		}
-		body = strings.TrimPrefix(body, bodyMarker)
+		bodyBeforeClose := body
+		bodyAfterClose := ""
+		if closeIdx := strings.Index(body, bodyMarker); closeIdx >= 0 {
+			bodyBeforeClose = body[:closeIdx]
+			bodyAfterClose = body[closeIdx+len(bodyMarker):]
+		}
 
 		switch channel {
 		case "thought", "analysis":
-			reasoning.WriteString(body)
+			reasoning.WriteString(bodyBeforeClose)
+			content.WriteString(bodyAfterClose)
 		case "final", "answer":
-			content.WriteString(body)
+			content.WriteString(bodyAfterClose)
 		default:
 			content.WriteString(marker)
 			content.WriteString(segment)
@@ -888,13 +897,30 @@ func splitGemma4ReasoningResponse(modelHint, text string) (string, string) {
 		return sanitizeGemma4VisibleContent(text), ""
 	}
 	if content.Len() == 0 {
-		return sanitizeGemma4VisibleContent(reasoning.String()), ""
+		if !gemma4ReasoningEnabled(req, modelHint) {
+			return sanitizeGemma4VisibleContent(reasoning.String()), ""
+		}
+		return "", sanitizeGemma4VisibleContent(reasoning.String())
 	}
 	return sanitizeGemma4VisibleContent(content.String()), sanitizeGemma4VisibleContent(reasoning.String())
 }
 
+func gemma4ReasoningEnabled(req domain.ChatCompletionRequest, modelHint string) bool {
+	if !isGemma4ModelHint(modelHint) {
+		return false
+	}
+	if req.ChatTemplateKwargs != nil && req.ChatTemplateKwargs.EnableThinking != nil {
+		return *req.ChatTemplateKwargs.EnableThinking
+	}
+	if value, ok := os.LookupEnv("DENSECORE_GEMMA4_ENABLE_THINKING"); ok {
+		return parseTruthyEnv(value)
+	}
+	return false
+}
+
 func sanitizeGemma4VisibleContent(text string) string {
 	text = stripGemma4BareThoughtPrelude(text)
+	text = stripGemma4MalformedLeadingChannel(text)
 	cut := len(text)
 	for _, marker := range []string{
 		"<|be_thought_out|>",
@@ -909,6 +935,22 @@ func sanitizeGemma4VisibleContent(text string) string {
 		}
 	}
 	return strings.TrimSpace(text[:cut])
+}
+
+func stripGemma4MalformedLeadingChannel(text string) string {
+	trimmed := strings.TrimSpace(text)
+	const marker = "<|channel>"
+	if !strings.HasPrefix(trimmed, marker) {
+		return text
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(trimmed, marker))
+	if idx := strings.Index(rest, "<channel|>"); idx >= 0 {
+		return strings.TrimSpace(rest[idx+len("<channel|>"):])
+	}
+	if idx := strings.IndexByte(rest, '\n'); idx >= 0 {
+		return strings.TrimSpace(rest[idx+1:])
+	}
+	return trimmed
 }
 
 func stripGemma4BareThoughtPrelude(text string) string {

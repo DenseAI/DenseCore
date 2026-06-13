@@ -5,8 +5,6 @@
 #include <limits>
 #include <mutex>
 
-extern "C" void ggml_gemm_q8_0_4x8_q8_0(int n, float* s, size_t bs, const void* vx, const void* vy, int nr, int nc);
-
 #include "inference_matmul_quant_cache.inl"
 
 #include "inference_matmul_gemv_custom.inl"
@@ -546,6 +544,133 @@ static inline bool ComputeQ4KQ8KBatchedRowAvx2(const void* weight_row, const uin
     return true;
 }
 
+static inline bool ComputeQ4KQ8KBatchedRow2Avx2(const void* weight_row0, const void* weight_row1,
+                                                const uint8_t* quant_input_base, size_t quant_row_stride, int M,
+                                                int N, float* out0_sums, float* out1_sums) {
+    if (!weight_row0 || !weight_row1 || !quant_input_base || !out0_sums || !out1_sums) return false;
+    if (M <= 0 || M > kMaxSmallBatchColsHard) return false;
+    if (N <= 0 || (N % QK_K) != 0 || QK_K != 256) return false;
+    if (quant_row_stride < static_cast<size_t>(sizeof(DensecoreBlockQ8K)) * static_cast<size_t>(N / QK_K)) {
+        return false;
+    }
+
+    const auto* x0_blocks = reinterpret_cast<const block_q4_K*>(weight_row0);
+    const auto* x1_blocks = reinterpret_cast<const block_q4_K*>(weight_row1);
+    const int nb = N / QK_K;
+    alignas(64) std::array<float, kMaxSmallBatchColsHard> sums0{};
+    alignas(64) std::array<float, kMaxSmallBatchColsHard> sums1{};
+
+    static constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    static constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    static constexpr uint32_t kmask3 = 0x03030303;
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+
+    for (int bi = 0; bi < nb; ++bi) {
+        auto prepare_block = [&](const block_q4_K& xb, __m256i* q4l, __m256i* q4h, __m256i* scale_l,
+                                 __m256i* scale_h, __m128i* mins, float* x_d, float* x_dmin) {
+            uint32_t utmp[4];
+            std::memcpy(utmp, xb.scales, 12);
+            utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+            const uint32_t uaux = utmp[1] & kmask1;
+            utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+            utmp[2] = uaux;
+            utmp[0] &= kmask1;
+
+            const uint8_t* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
+            const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+            *mins = _mm256_extracti128_si256(mins_and_scales, 1);
+            *x_d = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.d));
+            *x_dmin = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.dmin));
+
+            const uint8_t* q4 = xb.qs;
+            for (int j = 0; j < QK_K / 64; ++j) {
+                scale_l[j] = _mm256_set1_epi16(static_cast<int16_t>(scales[2 * j]));
+                scale_h[j] = _mm256_set1_epi16(static_cast<int16_t>(scales[2 * j + 1]));
+                const __m256i q4bits = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q4));
+                q4 += 32;
+                q4l[j] = _mm256_and_si256(q4bits, m4);
+                q4h[j] = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+            }
+        };
+
+        __m256i q4l0[QK_K / 64];
+        __m256i q4h0[QK_K / 64];
+        __m256i scale_l0[QK_K / 64];
+        __m256i scale_h0[QK_K / 64];
+        __m128i mins0;
+        float x0_d = 0.0f;
+        float x0_dmin = 0.0f;
+        prepare_block(x0_blocks[bi], q4l0, q4h0, scale_l0, scale_h0, &mins0, &x0_d, &x0_dmin);
+
+        __m256i q4l1[QK_K / 64];
+        __m256i q4h1[QK_K / 64];
+        __m256i scale_l1[QK_K / 64];
+        __m256i scale_h1[QK_K / 64];
+        __m128i mins1;
+        float x1_d = 0.0f;
+        float x1_dmin = 0.0f;
+        prepare_block(x1_blocks[bi], q4l1, q4h1, scale_l1, scale_h1, &mins1, &x1_d, &x1_dmin);
+
+        for (int m = 0; m < M; ++m) {
+            const auto* y_blocks = reinterpret_cast<const DensecoreBlockQ8K*>(
+                quant_input_base + static_cast<size_t>(m) * quant_row_stride);
+            const auto& yb = y_blocks[bi];
+            const __m256i q8sums = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(yb.bsums));
+            const __m128i q8s =
+                _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+
+            const __m128i prod0 = _mm_madd_epi16(mins0, q8s);
+            __m128i sum320 = _mm_hadd_epi32(prod0, prod0);
+            sum320 = _mm_hadd_epi32(sum320, sum320);
+            const int32_t min_dot0 = _mm_cvtsi128_si32(sum320);
+
+            const __m128i prod1 = _mm_madd_epi16(mins1, q8s);
+            __m128i sum321 = _mm_hadd_epi32(prod1, prod1);
+            sum321 = _mm_hadd_epi32(sum321, sum321);
+            const int32_t min_dot1 = _mm_cvtsi128_si32(sum321);
+
+            const int8_t* q8 = yb.qs;
+            __m256i sumi0 = _mm256_setzero_si256();
+            __m256i sumi1 = _mm256_setzero_si256();
+            for (int j = 0; j < QK_K / 64; ++j) {
+                const __m256i q8l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8));
+                q8 += 32;
+                const __m256i q8h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8));
+                q8 += 32;
+
+                __m256i p0l = _mm256_maddubs_epi16(q4l0[j], q8l);
+                p0l = _mm256_madd_epi16(scale_l0[j], p0l);
+                __m256i p0h = _mm256_maddubs_epi16(q4h0[j], q8h);
+                p0h = _mm256_madd_epi16(scale_h0[j], p0h);
+                sumi0 = _mm256_add_epi32(sumi0, _mm256_add_epi32(p0l, p0h));
+
+                __m256i p1l = _mm256_maddubs_epi16(q4l1[j], q8l);
+                p1l = _mm256_madd_epi16(scale_l1[j], p1l);
+                __m256i p1h = _mm256_maddubs_epi16(q4h1[j], q8h);
+                p1h = _mm256_madd_epi16(scale_h1[j], p1h);
+                sumi1 = _mm256_add_epi32(sumi1, _mm256_add_epi32(p1l, p1h));
+            }
+
+            const float yd = yb.d;
+            const float d0 = x0_d * yd;
+            const float dmin0 = -x0_dmin * yd;
+            sums0[static_cast<size_t>(m)] +=
+                d0 * HSumFloat8(_mm256_cvtepi32_ps(sumi0)) + dmin0 * static_cast<float>(min_dot0);
+
+            const float d1 = x1_d * yd;
+            const float dmin1 = -x1_dmin * yd;
+            sums1[static_cast<size_t>(m)] +=
+                d1 * HSumFloat8(_mm256_cvtepi32_ps(sumi1)) + dmin1 * static_cast<float>(min_dot1);
+        }
+    }
+
+    for (int m = 0; m < M; ++m) {
+        out0_sums[m] = sums0[static_cast<size_t>(m)];
+        out1_sums[m] = sums1[static_cast<size_t>(m)];
+    }
+    return true;
+}
+
 static inline bool ComputeQ5KQ8KBatchedRowAvx2(const void* weight_row, const uint8_t* quant_input_base,
                                                size_t quant_row_stride, int M, int N, float* out_sums) {
     if (!weight_row || !quant_input_base || !out_sums) return false;
@@ -654,11 +779,11 @@ static inline bool ComputeQ5KQ8KBatchedRowAvx2(const void* weight_row, const uin
 
 static inline bool ComputeQ4KQ8KBatchedRow(const void* weight_row, const uint8_t* quant_input_base,
                                            size_t quant_row_stride, int M, int N, float* out_sums) {
-#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
     static const bool debug_q4k_path = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_PATH");
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
     static std::atomic<bool> logged_dotprod{false};
     if (ComputeQ4KQ8KBatchedRowDotprod(weight_row, quant_input_base, quant_row_stride, M, N, out_sums)) {
         if (debug_q4k_path) {
@@ -671,12 +796,13 @@ static inline bool ComputeQ4KQ8KBatchedRow(const void* weight_row, const uint8_t
     }
 #endif
 #if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
-    static const bool debug_q4k_path = []() {
-        const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_PATH");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
     static std::atomic<bool> logged_avx2{false};
     static std::atomic<bool> logged_scalar{false};
+    // Keep the explicit AVX2 batched row kernel as the maintained x86 path.
+    // C4 validation for the same Q4_K/Q8_K batched-row shape measured the
+    // Highway VNNI experiment slower than this kernel; the Highway helper stays
+    // available for direct tests and future requalification, but is not the
+    // default matmul admission path.
     if (ggml_cpu_has_avx2() &&
         ComputeQ4KQ8KBatchedRowAvx2(weight_row, quant_input_base, quant_row_stride, M, N, out_sums)) {
         if (debug_q4k_path) {
@@ -1068,16 +1194,26 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         // GEMM K_gemm = N (input dim), GEMM N_gemm = K (output dim)
         // Split-N over K_output (the output dimension, which IS GEMM's N).
         const bool weight_contig = (weight_row_stride == static_cast<size_t>(N) * sizeof(float));
-        if (!ud->gemma4_prefill_safe_batched && input_contig && output_contig && weight_contig) {
+        if (input_contig && output_contig && weight_contig && (K % 8) == 0) {
             const float* A = reinterpret_cast<const float*>(input_base);
             const float* B = reinterpret_cast<const float*>(weight_base);
             float* C = reinterpret_cast<float*>(output_base);
-	            // k_start/k_end map to n_start/n_end in GEMM Split-N convention
-	            densecore::hwy_kernels::GemmFP32_Hwy(C, A, B, M, K, N, k_start, k_end);
-	            maybe_log_output_partition("f32_hwy");
-	            record_quant_profile(false, false);
-	            return;
-	        }
+            // k_start/k_end map to n_start/n_end in GEMM Split-N convention.
+            densecore::hwy_kernels::GemmFP32_Hwy(C, A, B, M, K, N, k_start, k_end);
+            if (ud->gemma4_prefill_safe_batched) {
+                for (int m = 0; m < M; ++m) {
+                    float* out_row = reinterpret_cast<float*>(output_base + static_cast<size_t>(m) * output_col_stride);
+                    for (int k = k_start; k < k_end; ++k) {
+                        if (!std::isfinite(out_row[k])) {
+                            out_row[k] = 0.0f;
+                        }
+                    }
+                }
+            }
+            maybe_log_output_partition("f32_hwy");
+            record_quant_profile(false, false);
+            return;
+        }
 
         // Strided fallback: scalar with weight row reuse
         for (int k = k_start; k < k_end; ++k) {
@@ -1097,14 +1233,14 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     sums[static_cast<size_t>(m)] += x * w;
                 }
             }
-	            for (int m = 0; m < M; ++m) {
-	                store_out(m, k, sums[static_cast<size_t>(m)]);
-	            }
-	        }
-	        maybe_log_output_partition("f32_scalar");
-	        record_quant_profile(false, false);
-	        return;
-	    }
+            for (int m = 0; m < M; ++m) {
+                store_out(m, k, sums[static_cast<size_t>(m)]);
+            }
+        }
+        maybe_log_output_partition("f32_scalar");
+        record_quant_profile(false, false);
+        return;
+    }
 
     if (ud->qwen36_ssm_q8_direct_batched && weight_type == GGML_TYPE_Q8_0 && input_contig && output_contig &&
         (N % QK8_0) == 0) {
@@ -1219,8 +1355,8 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
 	            }
 	            maybe_log_output_partition("q8_direct_scalar");
 	            record_quant_profile(true, false);
-	            return;
-	        }
+            return;
+        }
     }
 
     const auto* type_traits_cpu = ggml_get_type_traits_cpu(weight_type);
@@ -1252,8 +1388,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         const bool can_use_q8_0_repacked_batched =
             (ud->gemma4_dense_prefill_native || ud->lfm2_q8_repacked_batched ||
              ud->qwen36_ssm_q8_repacked_batched) &&
-            !ud->gemma4_prefill_safe_batched &&
-            weight_type == GGML_TYPE_Q8_0 && input_contig && output_contig &&
+            !ud->gemma4_prefill_safe_batched && weight_type == GGML_TYPE_Q8_0 && input_contig && output_contig &&
             type_traits_cpu->vec_dot_type == GGML_TYPE_Q8_0 && input_type_traits && input_type_traits->from_float &&
             (N % QK8_0) == 0 && (K % 4) == 0 && M >= 4;
         if (can_use_q8_0_repacked_batched) {
@@ -1282,23 +1417,40 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 const int k_aligned_start = (k_start + 3) & ~3;
                 const int k_aligned_end = k_end & ~3;
                 const int m_aligned_end = M & ~3;
-                // The 4x8 Q8_0 GEMM repacks activation rows a second time. On
-                // x86 C4, Qwen hybrid-SSM projections are N=2048 and telemetry
-                // shows the row-GEMV lane dominating prefill wall time; C4A
-                // keeps the wider threshold to avoid regressing the measured ARM
-                // path.
+                // The 4x8 Q8_0 GEMM repacks activation rows a second time, so it
+                // only wins for wide projections. The per-N threshold keeps small
+                // hybrid-SSM projections on the row-GEMV lane (where the second
+                // repack does not pay for itself) while admitting wide ones.
+                //
+                // Qwen hybrid-SSM Q8_0 prefill: on x86 C4 these go through the
+                // dedicated AMX tiled path (qwen36_ssm_q8_prefill_amx), so this
+                // block is never reached there. On C4A (no AMX) the fused
+                // ssm_qkv_gate projection is N=12288 and was degrading to per-token
+                // GEMV (q8_batched_gemv_ops dominated, ~282s compute), which is the
+                // ARM prefill bottleneck. Admit qwen36_ssm_q8_repacked_batched here
+                // so those wide SSM projections use the tiled 4x8 GEMM — the ARM
+                // analogue of the x86 AMX path — while N<threshold projections stay
+                // on GEMV.
+                bool q8_true_gemm_candidate =
+                    ud->gemma4_dense_prefill_native || ud->gemma4_prefill_safe_batched;
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
                 constexpr int kQ8TrueGemmMinN = 2048;
+                // x86/C4 routes Qwen hybrid-SSM Q8 prefill through the dedicated
+                // AMX tiled path (qwen36_ssm_q8_prefill_amx); this repacked-batched
+                // block is only an x86 fallback and keeps GEMV there by policy
+                // (DecodeGraphCachePolicyTest.Qwen36SSMQ8C4ProjectionKeepsDefaultBackendSafe).
 #else
                 constexpr int kQ8TrueGemmMinN = 4096;
+                // C4A has no AMX SSM path, so this block is the primary lane for
+                // Qwen hybrid-SSM Q8 prefill. Admit it to the tiled 4x8 GEMM (the
+                // ARM analogue of the x86 AMX path) for wide projections.
+                q8_true_gemm_candidate = q8_true_gemm_candidate || ud->qwen36_ssm_q8_repacked_batched;
 #endif
-                const bool q8_true_gemm_shape_profitable = N >= kQ8TrueGemmMinN;
+                const bool q8_true_gemm_shape_profitable = q8_true_gemm_candidate && N >= kQ8TrueGemmMinN;
                 const bool can_use_q8_true_gemm =
                     q8_true_gemm_shape_profitable && DenseCoreQ8_0Gemm4x8FastBackendCompiled() &&
                     m_aligned_end >= 4 && k_aligned_start < k_aligned_end &&
                     (output_col_stride % sizeof(float)) == 0;
-                const size_t q8_gemm_group_bytes =
-                    static_cast<size_t>(N / QK8_0) * q8_4x8_block_bytes;
                 const size_t q8_gemm_packed_bytes = DenseCoreQ8_0RowsTo4x8PackedBytes(m_aligned_end, N);
                 const bool can_share_q8_gemm_inputs =
                     can_use_q8_true_gemm && callback_work_ctx && q8_gemm_packed_bytes > 0 &&
@@ -1463,14 +1615,15 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                         const size_t packed_offset =
                             static_cast<size_t>(k_aligned_start / 4) *
                             static_cast<size_t>(packed->blocks_per_row) * q8_4x8_block_bytes;
+                        const size_t input_packed_offset =
+                            static_cast<size_t>(m / 4) * static_cast<size_t>(packed->blocks_per_row) *
+                            q8_4x8_block_bytes;
                         float* out_group =
                             reinterpret_cast<float*>(output_base + static_cast<size_t>(m) * output_col_stride) +
                             k_aligned_start;
-                        const uint8_t* q8_gemm_rows =
-                            q8_gemm_input_base + static_cast<size_t>(m / 4) * q8_gemm_group_bytes;
-                        ggml_gemm_q8_0_4x8_q8_0(N, out_group, output_col_stride / sizeof(float),
-                                                packed->data.data() + packed_offset, q8_gemm_rows, 4,
-                                                k_aligned_end - k_aligned_start);
+                        DenseCoreGemmQ8_0_4x8x4Q8_0Generic(
+                            N, out_group, output_col_stride / sizeof(float), packed->data.data() + packed_offset,
+                            q8_gemm_input_base + input_packed_offset, k_aligned_end - k_aligned_start);
                         for (int r = 0; r < 4; ++r) {
                             run_scalar_cols(m + r, std::max(k_aligned_end, k_start), k_end);
                         }
@@ -1496,6 +1649,17 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     }
                     run_scalar_cols(m, std::max(k_aligned_end, k_start), k_end);
                 }
+                if (ud->gemma4_prefill_safe_batched) {
+                    for (int row = 0; row < M; ++row) {
+                        float* out_row =
+                            reinterpret_cast<float*>(output_base + static_cast<size_t>(row) * output_col_stride);
+                        for (int col = k_start; col < k_end; ++col) {
+                            if (!std::isfinite(out_row[col])) {
+                                out_row[col] = 0.0f;
+                            }
+                        }
+                    }
+                }
                 LogMatmulPathOnce(ud->qwen36_ssm_q8_repacked_batched
                                       ? "qwen36_ssm_q8_0_repacked_batched"
                                       : (ud->lfm2_q8_repacked_batched ? "lfm2_q8_0_repacked_batched"
@@ -1515,8 +1679,12 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         if (can_quantize_inputs) {
             thread_local std::vector<uint8_t> quant_inputs_tls;
             const auto& qact_config = ResolveFastPathRuntimeConfig(callback_batch);
+            const bool gemma4_safe_q4k_prefill_qact_cache =
+                ud->gemma4_prefill_safe_batched && weight_type == GGML_TYPE_Q4_K &&
+                vec_dot_type == GGML_TYPE_Q8_K && input_contig && can_use_q4k_true_batched;
             const bool qact_cache_enabled_for_batched =
-                ud->require_q4k_true_batched || QuantizedActivationCacheEnabled(qact_config);
+                ud->require_q4k_true_batched || gemma4_safe_q4k_prefill_qact_cache ||
+                QuantizedActivationCacheEnabled(qact_config);
             const size_t full_quant_total_size = quant_row_stride * static_cast<size_t>(M);
             const int64_t token_pos =
                 (callback_batch && callback_batch->num_seqs == 1 && !callback_batch->pos.empty())
@@ -1656,6 +1824,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 if (!ud->force_reference_scalar && can_use_q4k_true_batched && quant_input_base &&
                     (!ud->qwen36_prefill_q4k_admission_key || ud->qwen36_prefill_q4k_admitted)) {
                     alignas(64) std::array<float, kMaxSmallBatchColsHard> row_sums{};
+                    alignas(64) std::array<float, kMaxSmallBatchColsHard> row_sums_next{};
                     static const bool debug_q4k_kernel_check = []() {
                         const char* env = std::getenv("DENSECORE_DEBUG_Q4K_BATCHED_KERNEL_CHECK");
                         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
@@ -1679,9 +1848,33 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                     const bool run_qwen36_probe =
                         qwen36_shadow_probe_enabled && ud->qwen36_prefill_q4k_probe &&
                         ud->qwen36_prefill_q4k_admission_key;
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+                    const bool allow_q4k_row_pair =
+                        !debug_q4k_kernel_check && !run_qwen36_probe && ggml_cpu_has_avx2() && N >= 1024;
+#else
+                    const bool allow_q4k_row_pair = false;
+#endif
                     constexpr float kQwen36Q4KBatchedProbeTol = 1e-3f;
                     for (int k = k_start; k < k_end; ++k) {
                         const void* row_ptr = weight_base + static_cast<size_t>(k) * weight_row_stride;
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+                        if (allow_q4k_row_pair && k + 1 < k_end) {
+                            const void* row_next_ptr =
+                                weight_base + static_cast<size_t>(k + 1) * weight_row_stride;
+                            if (ComputeQ4KQ8KBatchedRow2Avx2(row_ptr, row_next_ptr, quant_input_base,
+                                                             quant_row_stride, tile_m, N, row_sums.data(),
+                                                             row_sums_next.data())) {
+                                for (int m = 0; m < tile_m; ++m) {
+                                    store_out(tile_start + m, k, row_sums[static_cast<size_t>(m)]);
+                                    store_out(tile_start + m, k + 1, row_sums_next[static_cast<size_t>(m)]);
+                                }
+                                ++k;
+                                continue;
+                            }
+                        }
+#else
+                        (void)allow_q4k_row_pair;
+#endif
                         if (!ComputeQ4KQ8KBatchedRow(row_ptr, quant_input_base, quant_row_stride, tile_m, N,
                                                      row_sums.data())) {
                             all_rows_ok = false;
@@ -4441,13 +4634,40 @@ static const char* Gemma4NativeMatmulRejectName(Gemma4NativeMatmulReject reason)
     return "unknown";
 }
 
-static bool IsGemma4NativeMatmulSupported() {
+// Combined prefill+decode native route failed C4 Korea QA, so x86 admission is
+// fail-closed by default. The per-phase env knobs exist to isolate which side
+// regresses quality: enabling only the prefill knob keeps the suspect decode
+// route off. ARM keeps the validated always-on behavior.
+static bool Gemma4X86NativeMatmulEnvOn(const char* phase_env) {
+    auto truthy = [](const char* name) {
+        const char* env = std::getenv(name);
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
+               std::strcmp(env, "False") != 0 && std::strcmp(env, "FALSE") != 0;
+    };
+    return truthy("DENSECORE_GEMMA4_X86_NATIVE_MATMUL") || truthy(phase_env);
+}
+
+// Gemma4 dense native prefill matmul route. The promoted (prefill+decode)
+// route failed C4 Korea QA; prefill-only has not been isolated on C4 yet, so
+// x86 stays opt-in via DENSECORE_GEMMA4_X86_NATIVE_MATMUL_PREFILL.
+static bool IsGemma4NativePrefillMatmulSupported() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return true;
 #else
-    // C4 x86 validation showed the Gemma4 dense/decode-native route can corrupt logits
-    // into a token-0 loop. Keep this path gated off until x86 parity is proven.
-    return false;
+    static const bool enabled = Gemma4X86NativeMatmulEnvOn("DENSECORE_GEMMA4_X86_NATIVE_MATMUL_PREFILL");
+    return enabled;
+#endif
+}
+
+// Gemma4 native decode matmul route. Suspected source of the C4 QA corruption;
+// do not enable on x86 without a logits/QA trace proving the decode side is
+// fixed. Opt-in via DENSECORE_GEMMA4_X86_NATIVE_MATMUL_DECODE for diagnosis.
+static bool IsGemma4NativeDecodeMatmulSupported() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return true;
+#else
+    static const bool enabled = Gemma4X86NativeMatmulEnvOn("DENSECORE_GEMMA4_X86_NATIVE_MATMUL_DECODE");
+    return enabled;
 #endif
 }
 
@@ -4484,23 +4704,18 @@ static bool CanUseGemma4DensePrefillNative(const TransformerModel* model, const 
     if (!IsGemma4DenseWeightNameCandidate(weight->name, model->output == weight)) {
         return reject(Gemma4NativeMatmulReject::NotDenseCandidate);
     }
-    if (weight->type != GGML_TYPE_Q4_K && weight->type != GGML_TYPE_Q8_0) {
+    if (weight->type != GGML_TYPE_Q8_0) {
         return reject(Gemma4NativeMatmulReject::UnsupportedType);
     }
     if (weight->ne[0] != input->ne[0] || weight->ne[1] <= 0 || input->ne[0] <= 0) {
         return reject(Gemma4NativeMatmulReject::Shape);
     }
-    if (weight->type == GGML_TYPE_Q4_K) {
-        if ((input->ne[0] % QK_K) != 0 || (weight->ne[1] % 8) != 0) {
-            return reject(Gemma4NativeMatmulReject::KernelUnavailable);
-        }
-    } else {
-        const auto* traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
-        if (!traits || !traits->vec_dot || !traits->from_float || (input->ne[0] % QK8_0) != 0) {
-            return reject(Gemma4NativeMatmulReject::KernelUnavailable);
-        }
+    const auto* traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+    if (!traits || !traits->vec_dot || !traits->from_float || (input->ne[0] % QK8_0) != 0 ||
+        (weight->ne[1] % 4) != 0 || input->ne[1] < 4) {
+        return reject(Gemma4NativeMatmulReject::KernelUnavailable);
     }
-    if (!IsGemma4NativeMatmulSupported()) {
+    if (!IsGemma4NativePrefillMatmulSupported()) {
         return reject(Gemma4NativeMatmulReject::KernelUnavailable);
     }
     if (reject_reason) {
@@ -4537,7 +4752,7 @@ static bool CanUseGemma4DecodeNative(const TransformerModel* model, const ggml_t
     if (weight->ne[0] != input->ne[0] || weight->ne[1] <= 0 || input->ne[0] <= 0) {
         return reject(Gemma4NativeMatmulReject::Shape);
     }
-    if (!IsGemma4NativeMatmulSupported()) {
+    if (!IsGemma4NativeDecodeMatmulSupported()) {
         return reject(Gemma4NativeMatmulReject::KernelUnavailable);
     }
     if (reject_reason) {
@@ -4615,6 +4830,20 @@ static ggml_tensor* ResolveSmartMatmulInitialWeight(TransformerModel* model, ggm
 }
 
 #include "inference_matmul_plan.inl"
+
+static bool ShouldUseGemma4PrefillSafeBatched(const TransformerModel* model,
+                                              const SmartMatmulDispatchState& dispatch_state,
+                                              bool dense_prefill_allowed) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    (void)model;
+    (void)dispatch_state;
+    (void)dense_prefill_allowed;
+    return false;
+#else
+    return model && model->arch_flags.is_gemma4 && dispatch_state.prefill_phase && dispatch_state.m > 1 &&
+           !dense_prefill_allowed;
+#endif
+}
 
 /**
  * Smart matrix multiplication dispatcher
@@ -4829,12 +5058,13 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
             LogMatmulDispatch(w_name, wtype_label, M, N_dim, K_dim, "BATCHED_F32");
         }
         GemvBatchedUserData* ud = GetGemvBatchedUserData();
+        // The "safe" per-element finite-checked batched path is the x86 fallback
+        // for Gemma4 prefill. Keep it on for every op except the specific weight
+        // admitted to the native dense-prefill route; otherwise a diagnostic
+        // prefill knob silently removes finite guards from Q4_K/F32 ops and
+        // corrupts Gemma4 logits.
         const bool gemma4_prefill_safe_batched =
-#if defined(__aarch64__) || defined(_M_ARM64)
-            false;
-#else
-            model && model->arch_flags.is_gemma4 && dispatch_state.prefill_phase && M > 1;
-#endif
+            ShouldUseGemma4PrefillSafeBatched(model, dispatch_state, gemma4_native_plan.dense_prefill_allowed);
         ConfigureSmartMatmulBatchedUserData(ud, weight, dispatch_state, prefill_projection_plan,
                                             q4k_admission_plan, gemma4_native_plan.dense_prefill_allowed,
                                             gemma4_prefill_safe_batched);

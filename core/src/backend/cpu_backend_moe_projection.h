@@ -14,6 +14,8 @@ using ::InferenceWorkContext;
 
 struct QuantizedProjectionInputCache {
     const float* source = nullptr;
+    const uint8_t* external_bytes = nullptr;
+    size_t external_size = 0;
     int64_t rows = 0;
     int64_t cols = 0;
     ggml_type type = GGML_TYPE_COUNT;
@@ -43,6 +45,9 @@ struct MoEProjectionRuntimeContext {
     bool ggml_quantized_vecdot_safe = false;
     bool force_gemma4_quant_prefill_fast_path = false;
     bool gemma4_quant_prefill_batch_safe = false;
+    bool record_gemma4_quant_prefill_batch = false;
+    bool prefer_q4k_repacked_prefill = false;
+    bool allow_q4k_repacked_decode_fused_swiglu = true;
     bool enable_inner_parallel = false;
 };
 

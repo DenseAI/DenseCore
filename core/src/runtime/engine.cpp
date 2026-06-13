@@ -921,10 +921,15 @@ void ConfigureGemma4TextTokenBlocklist(const TransformerModel* model, Request* r
     densecore::models::ConfigureGemma4TextTokenBlocklistForModel(model, req);
 }
 
+void ConfigureLFM2TextTokenBlocklist(const TransformerModel* model, Request* req) {
+    densecore::models::ConfigureLFM2TextTokenBlocklistForModel(model, req);
+}
+
 bool PromptAlreadyTemplated(const std::string& prompt) {
     return prompt.find("<|im_start|>") != std::string::npos || prompt.find("<|im_end|>") != std::string::npos ||
            prompt.find("<|assistant|>") != std::string::npos || prompt.find("<|user|>") != std::string::npos ||
-           prompt.find("<|turn>") != std::string::npos || prompt.find("<turn|>") != std::string::npos;
+           prompt.find("<|turn>") != std::string::npos || prompt.find("<turn|>") != std::string::npos ||
+           prompt.find("<start_of_turn>") != std::string::npos || prompt.find("<end_of_turn>") != std::string::npos;
 }
 
 bool PromptEndsInsideTaggedBlock(const std::string& prompt, const char* open_tag, const char* close_tag) {
@@ -1107,6 +1112,12 @@ std::vector<int> DenseCoreTestOnlyQwenReasoningBlocklist(const TransformerModel*
 std::vector<int> DenseCoreTestOnlyGemma4TextBlocklist(const TransformerModel* model) {
     Request req{};
     ConfigureGemma4TextTokenBlocklist(model, &req);
+    return req.disallowed_token_ids;
+}
+
+std::vector<int> DenseCoreTestOnlyLFM2TextBlocklist(const TransformerModel* model) {
+    Request req{};
+    ConfigureLFM2TextTokenBlocklist(model, &req);
     return req.disallowed_token_ids;
 }
 
@@ -1366,6 +1377,7 @@ static int SubmitRequestWithSamplingConstraintsImpl(DenseCoreHandle handle, cons
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
     densecore::models::ConfigureQwen36TextTokenBlocklistForModel(model_entry->model.get(), req);
     ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
+    ConfigureLFM2TextTokenBlocklist(model_entry->model.get(), req);
     if ((allowed_token_ids && num_allowed_token_ids > 0) || (disallowed_token_ids && num_disallowed_token_ids > 0)) {
         ApplyTokenIdConstraints(req, model_entry->model.get(), allowed_token_ids, num_allowed_token_ids,
                                 allowed_token_ids_strict != 0, disallowed_token_ids, num_disallowed_token_ids);
@@ -1444,6 +1456,7 @@ int SubmitRequestWithTokenResults(DenseCoreHandle handle, const char* prompt, in
     req->parity_debug_token_primed = (req->tokens != token_result_tokens_before_priming);
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
     ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
+    ConfigureLFM2TextTokenBlocklist(model_entry->model.get(), req);
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     DebugPrintPromptTokens(model_entry->model.get(), req->tokens, "token_results");
     req->token_history = req->tokens;
@@ -1518,6 +1531,7 @@ static int SubmitRequestIdsWithSamplingConstraintsImpl(
         ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
         densecore::models::ConfigureQwen36TextTokenBlocklistForModel(model_entry->model.get(), req);
         ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
+        ConfigureLFM2TextTokenBlocklist(model_entry->model.get(), req);
         if ((allowed_token_ids && num_allowed_token_ids > 0) ||
             (disallowed_token_ids && num_disallowed_token_ids > 0)) {
             ApplyTokenIdConstraints(req, model_entry->model.get(), allowed_token_ids, num_allowed_token_ids,
@@ -2762,6 +2776,7 @@ int SubmitRequest(DenseCoreHandle handle, const char* prompt, int max_tokens, co
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
     densecore::models::ConfigureQwen36TextTokenBlocklistForModel(model_entry->model.get(), req);
     ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
+    ConfigureLFM2TextTokenBlocklist(model_entry->model.get(), req);
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
     LogRequestRuntimePath(state, model_entry->model.get(), prompt, req);
@@ -2849,6 +2864,7 @@ int SubmitRequestWithFormatEx(DenseCoreHandle handle, const char* prompt, int ma
     ConfigureQwenReasoningTokenBlocklist(model_entry->model.get(), req);
     densecore::models::ConfigureQwen36TextTokenBlocklistForModel(model_entry->model.get(), req);
     ConfigureGemma4TextTokenBlocklist(model_entry->model.get(), req);
+    ConfigureLFM2TextTokenBlocklist(model_entry->model.get(), req);
     ApplyAllowedTokenIdsFromEnv(req, model_entry->model.get());
     req->token_history = req->tokens;
     LogRequestRuntimePath(state, model_entry->model.get(), prompt, req);

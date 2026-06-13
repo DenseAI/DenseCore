@@ -1222,6 +1222,8 @@ void RecordGemma4NativeMoEPrefillDecision(InferenceWorkContext* ctx, bool candid
         p.gemma4_native_moe_prefill_used_layers.fetch_add(1, std::memory_order_relaxed);
     } else if (candidate && reject_reason && reject_reason[0] != '\0') {
         p.gemma4_native_moe_prefill_rejected_layers.fetch_add(1, std::memory_order_relaxed);
+    } else if (reject_reason && reject_reason[0] != '\0') {
+        p.gemma4_native_moe_prefill_rejected_layers.fetch_add(1, std::memory_order_relaxed);
     }
     if (replaced_mul_mat_id_ops > 0) {
         p.gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops.fetch_add(replaced_mul_mat_id_ops,

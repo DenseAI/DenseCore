@@ -260,6 +260,17 @@ DENSECORE_API bool QuantizeRowQ8K_Hwy(const float* input, void* q8_output, int64
 DENSECORE_API bool DotQ4KQ8K_Hwy(const void* q4_weight_row, const void* q8_input_row, int64_t cols, float* output);
 
 /**
+ * @brief Dot one GGML-compatible Q4_K weight row with a contiguous batch of
+ * Q8_K activation rows.
+ *
+ * The implementation decodes each Q4_K block once and reuses it across
+ * row_count Q8_K rows. This is the DenseCore-owned prefill counterpart to
+ * DotQ4KQ8K_Hwy and is intended for small M tiles in true-batched Q4_K paths.
+ */
+DENSECORE_API bool BatchedDotQ4KQ8KRows_Hwy(const void* q4_weight_row, const void* q8_input_base,
+                                            size_t q8_row_stride, int64_t cols, int64_t row_count, float* outputs);
+
+/**
  * @brief Compute a contiguous Q4_K gate/up row range against one Q8_K activation
  * row and write fused SwiGLU output.
  *

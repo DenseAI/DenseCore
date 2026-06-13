@@ -406,7 +406,9 @@ PromptTemplateFamily ResolvePromptTemplateFamilyFromMetadata(std::string_view to
         template_lower.find("<|im_end|>") != std::string::npos) {
         return PromptTemplateFamily::CHATML;
     }
-    if (template_lower.find("<|turn>") != std::string::npos || template_lower.find("<turn|>") != std::string::npos) {
+    if (template_lower.find("<|turn>") != std::string::npos || template_lower.find("<turn|>") != std::string::npos ||
+        template_lower.find("<start_of_turn>") != std::string::npos ||
+        template_lower.find("<end_of_turn>") != std::string::npos) {
         return PromptTemplateFamily::TURN_TAGS;
     }
     if (template_lower.find("<|assistant|>") != std::string::npos ||

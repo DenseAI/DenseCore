@@ -370,6 +370,8 @@ bool TryExecuteMoESmallDecodeQuantizedTileParallel(const MoESmallDecodeTileParal
                      gate_splits, down_splits, target_parallelism, req.worker_cap, req.total_assignments);
     }
 
+    const bool lfm2_decode_tile_fast_path =
+        GetCurrentInferenceWorkContextModelVariant() == ModelVariant::LFM2MOE;
     const size_t assignment_hidden_elems =
         static_cast<size_t>(req.total_assignments) * static_cast<size_t>(req.intermediate_dim);
     const size_t assignment_output_elems =
@@ -380,14 +382,25 @@ bool TryExecuteMoESmallDecodeQuantizedTileParallel(const MoESmallDecodeTileParal
     req.output_scratch->Resize(req.backend, assignment_output_elems);
     float* assignment_hiddens = req.hidden_scratch->ptr;
     float* assignment_outputs = req.output_scratch->ptr;
-    std::fill_n(assignment_hiddens, assignment_hidden_elems, 0.0f);
-    std::fill_n(assignment_outputs, assignment_output_elems, 0.0f);
+    if (!lfm2_decode_tile_fast_path) {
+        std::fill_n(assignment_hiddens, assignment_hidden_elems, 0.0f);
+        std::fill_n(assignment_outputs, assignment_output_elems, 0.0f);
+    }
     if (req.profile && reused_assignment_scratch) {
         req.profile->decode_scratch_reused += 2;
         req.profile->decode_allocations_avoided += 2;
     }
 
-    std::vector<QuantizedProjectionInputCache> down_input_projection_caches(static_cast<size_t>(req.total_assignments));
+    static thread_local std::vector<QuantizedProjectionInputCache> lfm2_down_input_projection_caches;
+    std::vector<QuantizedProjectionInputCache> down_input_projection_caches;
+    std::vector<QuantizedProjectionInputCache>* down_input_projection_caches_ptr = nullptr;
+    if (lfm2_decode_tile_fast_path) {
+        lfm2_down_input_projection_caches.resize(static_cast<size_t>(req.total_assignments));
+        down_input_projection_caches_ptr = &lfm2_down_input_projection_caches;
+    } else {
+        down_input_projection_caches.resize(static_cast<size_t>(req.total_assignments));
+        down_input_projection_caches_ptr = &down_input_projection_caches;
+    }
     QuantizedProjectionInputCache shared_decode_input_projection_cache;
     QuantizedProjectionInputCache* shared_decode_input_projection_cache_ptr = nullptr;
     PrepareMoESmallDecodeSharedInputCache(req, &shared_decode_input_projection_cache,
@@ -398,11 +411,11 @@ bool TryExecuteMoESmallDecodeQuantizedTileParallel(const MoESmallDecodeTileParal
     RunMoESmallDecodeTileGateUp(req, gate_splits, assignment_hiddens, shared_decode_input_projection_cache_ptr,
                                 &tile_ok);
     if (tile_ok.load(std::memory_order_relaxed) &&
-        !QuantizeMoESmallDecodeHiddenRows(req, assignment_hiddens, &down_input_projection_caches)) {
+        !QuantizeMoESmallDecodeHiddenRows(req, assignment_hiddens, down_input_projection_caches_ptr)) {
         tile_ok.store(false, std::memory_order_relaxed);
     }
     if (tile_ok.load(std::memory_order_relaxed)) {
-        RunMoESmallDecodeTileDown(req, down_splits, assignment_hiddens, assignment_outputs, &down_input_projection_caches,
+        RunMoESmallDecodeTileDown(req, down_splits, assignment_hiddens, assignment_outputs, down_input_projection_caches_ptr,
                                   &tile_ok);
     }
     if (!tile_ok.load(std::memory_order_relaxed)) {

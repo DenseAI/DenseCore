@@ -282,10 +282,10 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
     config.q4k_repacked_gemv_thrash_repack_mb = 256;
     config.q4k_repacked_gemv_thrash_eviction_ratio = 0.25;
     config.q4k_repacked_gemv_thrash_repack_cache_fraction = 0.50;
-    const char* qact_cache_env = std::getenv("DENSECORE_ENABLE_QACT_CACHE");
-    config.qact_cache = (!qact_cache_env || qact_cache_env[0] == '\0')
-                            ? env::RuntimeToggleMode::Off
-                            : env::ParseRuntimeToggleModeValue(qact_cache_env, env::RuntimeToggleMode::Off);
+    // Optional global qact-cache promotion is deliberately fail-closed. The
+    // validated Gemma4/LFM2 batched paths enable their required activation cache
+    // through model/path admission, not through an environment knob.
+    config.qact_cache = env::RuntimeToggleMode::Off;
     config.matmul_dispatch_census = env::ParseTruthyEnv("DENSECORE_MATMUL_DISPATCH_CENSUS", false);
     return config;
 }

@@ -564,10 +564,13 @@ InferenceWorkContext* GetCurrentWorkContext();
 void SetInferenceWorkContextGraphBuildNoAlloc(InferenceWorkContext* ctx, bool no_alloc);
 bool IsCurrentGraphBuildNoAlloc();
 void SetInferenceWorkContextModelVariant(InferenceWorkContext* ctx, ModelVariant variant);
+ModelVariant GetCurrentInferenceWorkContextModelVariant();
 void SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(InferenceWorkContext* ctx, bool allowed,
                                                            LFM2GreedyLMHeadArgmaxRejectReason reject_reason,
                                                            float repetition_penalty,
-                                                           const std::vector<int>* token_history);
+                                                           float final_logit_softcap,
+                                                           const std::vector<int>* token_history,
+                                                           const std::vector<int>* disallowed_token_ids);
 void WriteInferenceWorkContextLFM2GreedyLMHeadSparseLogits(InferenceWorkContext* ctx, float* output, int vocab_size,
                                                            int token, float value);
 void RecordInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(InferenceWorkContext* ctx, uint64_t generation, int token,

@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include "../src/backend/thread_pool_impl.h"
+#include "backend/cpu_backend_moe_projection.h"
 #include "densecore/backend/cpu_backend.h"
 #include "densecore.h"
 #include "ggml.h"
@@ -67,7 +69,8 @@ bool RunGgmlQuantizedProjectionForTest(CpuBackend* backend, const void* weight_p
 bool RunGgmlQuantizedFusedSwiGLUProjectionForTest(CpuBackend* backend, const void* gate_weight_ptr,
                                                   int gate_ggml_type_id, const void* up_weight_ptr,
                                                   int up_ggml_type_id, const Tensor& input, Tensor* output,
-                                                  int64_t N, int64_t K, bool use_gelu_activation = false);
+                                                  int64_t N, int64_t K, bool use_gelu_activation = false,
+                                                  QuantizedProjectionInputCache* input_cache = nullptr);
 bool RunGgmlQuantizedFusedGEGLUProjectionForTest(CpuBackend* backend, const void* gate_weight_ptr,
                                                  int gate_ggml_type_id, const void* up_weight_ptr, int up_ggml_type_id,
                                                  const Tensor& input, Tensor* output, int64_t N, int64_t K);
@@ -1750,6 +1753,71 @@ TEST(NumaStickyRouting, GgmlQ4KRawBatchedFusedSwiGLUMatchesSeparateVecDotReferen
     }
 }
 
+TEST(NumaStickyRouting, GgmlQ4KRawBatchedFusedSwiGLUUsesExternalQ8InputCache) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 8;
+    constexpr int K = 256;
+    constexpr int N = 32;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_K;
+
+    std::mt19937 rng(1805);
+    std::uniform_real_distribution<float> input_dist(-0.45f, 0.45f);
+    std::uniform_real_distribution<float> weight_dist(-0.14f, 0.14f);
+
+    std::vector<float> reference_input(static_cast<size_t>(M * K));
+    std::vector<float> different_input(static_cast<size_t>(M * K));
+    std::vector<float> gate_f32(static_cast<size_t>(N * K));
+    std::vector<float> up_f32(static_cast<size_t>(N * K));
+    for (size_t i = 0; i < reference_input.size(); ++i) {
+        reference_input[i] = input_dist(rng);
+        different_input[i] = reference_input[i] + ((i % 3 == 0) ? 0.35f : -0.25f);
+    }
+    for (float& v : gate_f32) v = weight_dist(rng);
+    for (float& v : up_f32) v = weight_dist(rng);
+
+    std::vector<uint8_t> gate_q4k;
+    std::vector<uint8_t> up_q4k;
+    std::vector<uint8_t> reference_q8;
+    QuantizeRowsForTest(qtype, gate_f32, N, K, &gate_q4k);
+    QuantizeRowsForTest(qtype, up_f32, N, K, &up_q4k);
+    QuantizeRowsForTest(GGML_TYPE_Q8_K, reference_input, M, K, &reference_q8);
+
+    std::vector<float> expected(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> actual(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> wrong_without_external(static_cast<size_t>(M * N), 0.0f);
+    Tensor reference_tensor = Tensor::Make2D(reference_input.data(), M, K);
+    Tensor different_tensor = Tensor::Make2D(different_input.data(), M, K);
+    Tensor expected_tensor = Tensor::Make2D(expected.data(), M, N);
+    Tensor actual_tensor = Tensor::Make2D(actual.data(), M, N);
+    Tensor wrong_tensor = Tensor::Make2D(wrong_without_external.data(), M, N);
+
+    ASSERT_TRUE(densecore::testing::RunGgmlQuantizedFusedSwiGLUProjectionForTest(
+        &backend, gate_q4k.data(), static_cast<int>(qtype), up_q4k.data(), static_cast<int>(qtype), reference_tensor,
+        &expected_tensor, N, K));
+    ASSERT_TRUE(densecore::testing::RunGgmlQuantizedFusedSwiGLUProjectionForTest(
+        &backend, gate_q4k.data(), static_cast<int>(qtype), up_q4k.data(), static_cast<int>(qtype), different_tensor,
+        &wrong_tensor, N, K));
+
+    QuantizedProjectionInputCache cache;
+    cache.source = different_input.data();
+    cache.external_bytes = reference_q8.data();
+    cache.external_size = reference_q8.size();
+    cache.rows = M;
+    cache.cols = K;
+    cache.type = GGML_TYPE_Q8_K;
+    cache.row_bytes = ggml_row_size(GGML_TYPE_Q8_K, K);
+    ASSERT_TRUE(densecore::testing::RunGgmlQuantizedFusedSwiGLUProjectionForTest(
+        &backend, gate_q4k.data(), static_cast<int>(qtype), up_q4k.data(), static_cast<int>(qtype), different_tensor,
+        &actual_tensor, N, K, /*use_gelu_activation=*/false, &cache));
+
+    float wrong_max_diff = 0.0f;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        wrong_max_diff = std::max(wrong_max_diff, std::fabs(wrong_without_external[i] - expected[i]));
+        EXPECT_NEAR(actual[i], expected[i], 1e-4f) << "index=" << i;
+    }
+    EXPECT_GT(wrong_max_diff, 1e-2f);
+}
+
 TEST(NumaStickyRouting, Q4KQ8KRowRangeFusedSwiGLUMatchesRowDotReference) {
     constexpr int K = 256;
     constexpr int N = 32;
@@ -1800,6 +1868,48 @@ TEST(NumaStickyRouting, Q4KQ8KRowRangeFusedSwiGLUMatchesRowDotReference) {
 
     for (int row = 0; row < row_count; ++row) {
         EXPECT_NEAR(output[static_cast<size_t>(row)], reference[static_cast<size_t>(row)], 5e-5f) << "row=" << row;
+    }
+}
+
+TEST(NumaStickyRouting, Q4KQ8KBatchedRowsMatchRowDotReference) {
+    constexpr int K = 512;
+    constexpr int row_count = 13;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_K;
+
+    std::mt19937 rng(1824);
+    std::uniform_real_distribution<float> input_dist(-0.75f, 0.75f);
+    std::uniform_real_distribution<float> weight_dist(-0.25f, 0.25f);
+
+    std::vector<float> weight_f32(static_cast<size_t>(K));
+    std::vector<float> input_f32(static_cast<size_t>(row_count) * K);
+    for (float& v : weight_f32) v = weight_dist(rng);
+    for (float& v : input_f32) v = input_dist(rng);
+
+    std::vector<uint8_t> weight_q4k;
+    QuantizeRowsForTest(qtype, weight_f32, 1, K, &weight_q4k);
+
+    const auto* q8_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    ASSERT_NE(q8_traits, nullptr);
+    ASSERT_NE(q8_traits->from_float, nullptr);
+    const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, K);
+    const size_t q8_row_stride = ((q8_row_bytes + 63) / 64) * 64;
+    std::vector<uint8_t> q8_rows(static_cast<size_t>(row_count) * q8_row_stride);
+    for (int row = 0; row < row_count; ++row) {
+        q8_traits->from_float(input_f32.data() + static_cast<size_t>(row) * K,
+                              q8_rows.data() + static_cast<size_t>(row) * q8_row_stride, K);
+    }
+
+    std::vector<float> output(row_count, 0.0f);
+    std::vector<float> reference(row_count, 0.0f);
+    ASSERT_TRUE(densecore::hwy_kernels::BatchedDotQ4KQ8KRows_Hwy(
+        weight_q4k.data(), q8_rows.data(), q8_row_stride, K, row_count, output.data()));
+    for (int row = 0; row < row_count; ++row) {
+        ASSERT_TRUE(densecore::hwy_kernels::DotQ4KQ8K_Hwy(
+            weight_q4k.data(), q8_rows.data() + static_cast<size_t>(row) * q8_row_stride, K,
+            &reference[static_cast<size_t>(row)]));
+    }
+    for (int row = 0; row < row_count; ++row) {
+        EXPECT_NEAR(output[static_cast<size_t>(row)], reference[static_cast<size_t>(row)], 1e-5f) << "row=" << row;
     }
 }
 
@@ -2307,6 +2417,80 @@ TEST(NumaStickyRouting, ForwardMoEGgmlQuantizedGeneralPathFallsBackToDenseDequan
                          reference.data(), batch, hidden_dim, intermediate_dim);
     for (size_t i = 0; i < reference.size(); ++i) {
         EXPECT_NEAR(output[i], reference[i], 2e-3f) << "index=" << i;
+    }
+}
+
+TEST(NumaStickyRouting, ForwardMoELFM2Q4KPrefillUsesRawBatchedQuantizedPath) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int batch = 8;
+    constexpr int hidden_dim = 256;
+    constexpr int intermediate_dim = 256;
+
+    QuantizedExpertFixture fixture =
+        BuildQuantizedExpertFixture(batch, hidden_dim, intermediate_dim, GGML_TYPE_Q4_K, 1702);
+
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.arch_flags.is_lfm2_shortconv = true;
+    model.hparams.n_experts = 1;
+    model.hparams.n_experts_used = 1;
+
+    moe::MoERouteResult routing;
+    routing.batch_size = batch;
+    routing.top_k = 1;
+    routing.expert_ids.resize(static_cast<size_t>(batch), 0);
+    routing.weights.resize(static_cast<size_t>(batch), 1.0f);
+    routing.token_indices.resize(static_cast<size_t>(batch), 0);
+    for (int i = 0; i < batch; ++i) {
+        routing.token_indices[static_cast<size_t>(i)] = i;
+    }
+
+    std::vector<float> output(static_cast<size_t>(batch * hidden_dim), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(fixture.input.data(), batch, hidden_dim);
+    Tensor output_tensor = Tensor::Make2D(output.data(), batch, hidden_dim);
+    std::vector<CpuBackend::ExpertWeights> experts = {fixture.expert};
+
+    EnvGuard matmul_trace("DENSECORE_DEBUG_MOE_MATMUL_PATHS", "1");
+    InferenceWorkContext* previous_ctx = GetCurrentWorkContext();
+    InferenceWorkContext* owned_ctx = nullptr;
+    if (!previous_ctx) {
+        owned_ctx = CreateInferenceWorkContext();
+        ResetInferenceWorkContext(owned_ctx);
+        SetCurrentWorkContext(owned_ctx);
+    }
+    const InferenceExecutionPhase previous_phase = GetCurrentExecutionPhase();
+    SetCurrentExecutionPhase(InferenceExecutionPhase::Prefill);
+    ::testing::internal::CaptureStderr();
+    backend.ForwardMoE(&model, nullptr, /*layer_idx=*/0, nullptr, input_tensor, routing, experts.data(),
+                       static_cast<int>(experts.size()), &output_tensor);
+    const std::string stderr_output = ::testing::internal::GetCapturedStderr();
+    SetCurrentExecutionPhase(previous_phase);
+    if (!previous_ctx) {
+        SetCurrentWorkContext(nullptr);
+        DestroyInferenceWorkContext(owned_ctx);
+    }
+
+    EXPECT_EQ(stderr_output.find("path=dense_f32"), std::string::npos) << stderr_output;
+    EXPECT_EQ(stderr_output.find("path=reference_f32"), std::string::npos) << stderr_output;
+    const bool fused_swiglu_path_used =
+        stderr_output.find("path=ggml_q4k_raw_batched_fused_swiglu") != std::string::npos ||
+        stderr_output.find("path=lfm2_q4k_fused_swiglu_q8_down_prefill") != std::string::npos ||
+        stderr_output.find("path=lfm2_q4k_fused_swiglu_q8_weighted_scatter") != std::string::npos;
+    EXPECT_TRUE(fused_swiglu_path_used) << stderr_output;
+    EXPECT_EQ(stderr_output.find("path=ggml_q4k_repacked_prefill_gemm_m4_tile_fused_swiglu"), std::string::npos)
+        << stderr_output;
+    const bool raw_batched_projection_path_used =
+        stderr_output.find("path=ggml_q4k_raw_batched M=") != std::string::npos ||
+        stderr_output.find("path=lfm2_q4k_fused_swiglu_q8_down_prefill") != std::string::npos ||
+        stderr_output.find("path=lfm2_q4k_fused_swiglu_q8_weighted_scatter") != std::string::npos;
+    EXPECT_TRUE(raw_batched_projection_path_used) << stderr_output;
+
+    std::vector<float> reference(static_cast<size_t>(batch * hidden_dim), 0.0f);
+    DenseExpertReference(fixture.input.data(), fixture.w1_ref.data(), fixture.w2_ref.data(), fixture.w3_ref.data(),
+                         reference.data(), batch, hidden_dim, intermediate_dim);
+    for (size_t i = 0; i < reference.size(); ++i) {
+        EXPECT_NEAR(output[i], reference[i], 2e-1f) << "index=" << i;
     }
 }
 

@@ -854,7 +854,7 @@ TEST(LFM2GreedyLMHeadArgmax, RejectingSamplingInvalidatesPrecomputedToken) {
     ResetInferenceWorkContext(ctx);
 
     SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(
-        ctx, true, LFM2GreedyLMHeadArgmaxRejectReason::None, 1.0f, nullptr);
+        ctx, true, LFM2GreedyLMHeadArgmaxRejectReason::None, 1.0f, 0.0f, nullptr, nullptr);
     RecordInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(
         ctx, GetInferenceWorkContextExecutionGenerationForTest(ctx), 7, 3.5f, 16);
 
@@ -865,11 +865,30 @@ TEST(LFM2GreedyLMHeadArgmax, RejectingSamplingInvalidatesPrecomputedToken) {
     EXPECT_FLOAT_EQ(value, 3.5f);
 
     SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(
-        ctx, false, LFM2GreedyLMHeadArgmaxRejectReason::ParityUnverified, 1.0f, nullptr);
+        ctx, false, LFM2GreedyLMHeadArgmaxRejectReason::ParityUnverified, 1.0f, 0.0f, nullptr, nullptr);
 
     token = -1;
     value = 0.0f;
     EXPECT_FALSE(TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(ctx, 16, &token, &value));
+    DestroyInferenceWorkContext(ctx);
+}
+
+TEST(LFM2GreedyLMHeadArgmax, DisallowedTokenFilterDoesNotInvalidatePrecomputedToken) {
+    InferenceWorkContext* ctx = CreateInferenceWorkContext();
+    ASSERT_NE(ctx, nullptr);
+    ResetInferenceWorkContext(ctx);
+
+    const std::vector<int> disallowed_tokens{3, 5, 11};
+    SetInferenceWorkContextLFM2GreedyLMHeadArgmaxSampling(
+        ctx, true, LFM2GreedyLMHeadArgmaxRejectReason::None, 1.0f, 0.0f, nullptr, &disallowed_tokens);
+    RecordInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(
+        ctx, GetInferenceWorkContextExecutionGenerationForTest(ctx), 7, 4.25f, 16);
+
+    int token = -1;
+    float value = 0.0f;
+    EXPECT_TRUE(TryGetInferenceWorkContextLFM2GreedyLMHeadArgmaxToken(ctx, 16, &token, &value));
+    EXPECT_EQ(token, 7);
+    EXPECT_FLOAT_EQ(value, 4.25f);
     DestroyInferenceWorkContext(ctx);
 }
 

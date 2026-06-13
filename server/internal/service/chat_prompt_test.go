@@ -129,7 +129,7 @@ func TestFormatChatPromptGemmaUsesTurnTemplate(t *testing.T) {
 	if strings.Contains(prompt, "<|turn>system\nYou are a helpful assistant.\n") {
 		t.Fatalf("expected no implicit gemma system prompt, got %q", prompt)
 	}
-	expected := "<bos><|turn>user\n안녕?<turn|>\n<|turn>model\n"
+	expected := "<bos><|turn>user\n안녕?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
 	if prompt != expected {
 		t.Fatalf("expected llama.cpp-compatible gemma turn template, got %q", prompt)
 	}
@@ -158,22 +158,25 @@ func TestFormatChatPromptGemmaThinkingInjectsSystemThinkMarker(t *testing.T) {
 	if !strings.HasPrefix(prompt, "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nHello<turn|>\n") {
 		t.Fatalf("expected gemma thinking marker in system turn, got %q", prompt)
 	}
-	if !strings.HasSuffix(prompt, "<|turn>model\n<|channel>thought\n<channel|>") {
-		t.Fatalf("expected gemma thinking prompt to open thought channel, got %q", prompt)
+	if !strings.HasSuffix(prompt, "<|turn>model\n") {
+		t.Fatalf("expected gemma thinking prompt to stop at model turn generation cue, got %q", prompt)
+	}
+	if strings.Contains(prompt[strings.LastIndex(prompt, "<|turn>model\n"):], "<|channel>thought\n<channel|>") {
+		t.Fatalf("expected gemma thinking prompt to let the model generate the thought channel, got %q", prompt)
 	}
 }
 
-func TestFormatChatPromptGemmaNoThinkingUsesPlainAssistantCue(t *testing.T) {
+func TestFormatChatPromptGemmaNoThinkingUsesEmptyThoughtChannelCue(t *testing.T) {
 	enableThinking := false
 	prompt := FormatChatPrompt("/tmp/gemma-4-E2B-it-Q4_K_M.gguf", []domain.Message{
 		{Role: "user", Content: "Hello"},
 	}, &domain.ChatTemplateKwargs{EnableThinking: &enableThinking})
 
-	if !strings.HasSuffix(prompt, "<|turn>model\n") {
-		t.Fatalf("expected gemma no-thinking prompt to end at assistant cue, got %q", prompt)
+	if !strings.HasSuffix(prompt, "<|turn>model\n<|channel>thought\n<channel|>") {
+		t.Fatalf("expected gemma no-thinking prompt to end at empty thought channel cue, got %q", prompt)
 	}
-	if strings.Contains(prompt, "<|channel>thought\n<channel|>") {
-		t.Fatalf("expected gemma no-thinking prompt not to inject thought channel cue, got %q", prompt)
+	if strings.Contains(prompt, "<|channel>final\n<channel|>") {
+		t.Fatalf("expected gemma no-thinking prompt not to inject final channel cue, got %q", prompt)
 	}
 }
 

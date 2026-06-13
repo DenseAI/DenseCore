@@ -1011,7 +1011,11 @@ func (s *ChatService) normalizeSampling(modelHint, tokenizerType, chatTemplate s
 		if isGemma {
 			repetitionPenalty = 1.05
 		} else if isLFM2 {
-			repetitionPenalty = 1.05
+			if req.MaxTokens >= 64 {
+				repetitionPenalty = 1.12
+			} else {
+				repetitionPenalty = 1.05
+			}
 		} else if isQwen36 && !thinkingEnabled {
 			repetitionPenalty = qwen36Default.repetitionPenalty
 		} else if isQwen {

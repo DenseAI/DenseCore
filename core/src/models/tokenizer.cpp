@@ -204,6 +204,16 @@ bool IsLikelyControlTokenLiteral(const std::string& token) {
         token == "<unk>" || token == "<mask>") {
         return true;
     }
+    // Gemma chat-turn markers use <...> (not <|...|>) and must tokenize as a
+    // single atomic special id (start_of_turn=105 / end_of_turn=106). Some GGUF
+    // exports omit/garble tokenizer.ggml.token_type, in which case the
+    // token_types-based check in IsAtomicSpecialTokenLiteral can't classify
+    // them and they would otherwise decompose into literal text, corrupting the
+    // turn structure. Recognize them by name so they survive intact (and are
+    // hidden from detokenized output, like the other control tokens above).
+    if (token == "<start_of_turn>" || token == "<end_of_turn>") {
+        return true;
+    }
     if (token == "[CLS]" || token == "[SEP]" || token == "[PAD]" || token == "[UNK]" || token == "[MASK]") {
         return true;
     }
@@ -1473,10 +1483,24 @@ std::string Tokenizer::Detokenize(const TransformerModel* model, int token_id) {
     if (!model) {
         return "";
     }
+    auto log_debug = [&](const std::string& piece) {
+        if (!IsDebugTokenizerEnabled()) {
+            return;
+        }
+        const std::string raw =
+            (token_id >= 0 && token_id < static_cast<int>(model->vocab_tokens.size())) ? model->vocab_tokens[token_id]
+                                                                                       : "";
+        std::fprintf(stderr, "[TokenizerDebug] detokenize id=%d raw=\"%s\" text=\"%s\"\n", token_id, raw.c_str(),
+                     piece.c_str());
+    };
     if (token_id >= 0 && token_id < static_cast<int>(model->stream_token_pieces.size())) {
-        return model->stream_token_pieces[static_cast<size_t>(token_id)];
+        const std::string& piece = model->stream_token_pieces[static_cast<size_t>(token_id)];
+        log_debug(piece);
+        return piece;
     }
-    return DetokenizeImpl(model, token_id);
+    std::string piece = DetokenizeImpl(model, token_id);
+    log_debug(piece);
+    return piece;
 }
 
 std::string Tokenizer::DetokenizeMultiple(const TransformerModel* model, const std::vector<int>& token_ids) {

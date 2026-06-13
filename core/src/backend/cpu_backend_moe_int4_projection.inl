@@ -133,6 +133,9 @@ struct MoEFusedGateUpRequest {
     bool ggml_quantized_vecdot_safe = false;
     bool gemma4_quant_prefill_batch_safe = false;
     bool force_gemma4_quant_prefill_fast_path = false;
+    bool record_gemma4_quant_prefill_batch = false;
+    bool prefer_q4k_repacked_prefill = false;
+    bool allow_q4k_repacked_decode_fused_swiglu = true;
     bool enable_inner_parallel = false;
 };
 
@@ -186,11 +189,12 @@ bool EmitMoEFusedGateUpFromPlan(const MoEFusedGateUpRequest& req, const MoEFused
         TryRunGgmlQuantizedFusedSwiGLUProjection(
             req.backend, req.expert->w1.ptr, req.expert->w1_type, req.expert->w3.ptr, req.expert->w3_type,
             *req.input, req.hidden, req.intermediate_dim, req.hidden_dim, req.numa_node, req.enable_inner_parallel,
-            req.input_projection_cache, req.gemma4_quant_prefill_batch_safe)) {
+            req.input_projection_cache, req.prefer_q4k_repacked_prefill,
+            req.allow_q4k_repacked_decode_fused_swiglu)) {
         LogMoEMatmulPath("ggml_quantized_fused_swiglu", static_cast<int>(req.input->shape[0]),
                          static_cast<int>(req.input->shape[1]), static_cast<int>(req.hidden->shape[1]), 0,
                          req.enable_inner_parallel);
-        if (req.gemma4_quant_prefill_batch_safe) {
+        if (req.record_gemma4_quant_prefill_batch && req.gemma4_quant_prefill_batch_safe) {
             RecordGemma4MoEPrefillQuantBatchDecision(req.gemma4_quant_prefill_ctx, false, true, nullptr, true, false);
         }
         return true;
@@ -200,11 +204,11 @@ bool EmitMoEFusedGateUpFromPlan(const MoEFusedGateUpRequest& req, const MoEFused
         TryRunGgmlQuantizedFusedGEGLUProjection(
             req.backend, req.expert->w1.ptr, req.expert->w1_type, req.expert->w3.ptr, req.expert->w3_type,
             *req.input, req.hidden, req.intermediate_dim, req.hidden_dim, req.numa_node, req.enable_inner_parallel,
-            req.input_projection_cache, req.gemma4_quant_prefill_batch_safe)) {
+            req.input_projection_cache, req.prefer_q4k_repacked_prefill)) {
         LogMoEMatmulPath("ggml_quantized_fused_geglu", static_cast<int>(req.input->shape[0]),
                          static_cast<int>(req.input->shape[1]), static_cast<int>(req.hidden->shape[1]), 0,
                          req.enable_inner_parallel);
-        if (req.gemma4_quant_prefill_batch_safe) {
+        if (req.record_gemma4_quant_prefill_batch && req.gemma4_quant_prefill_batch_safe) {
             RecordGemma4MoEPrefillQuantBatchDecision(req.gemma4_quant_prefill_ctx, false, true, nullptr, true, false);
         }
         return true;
@@ -212,4 +216,3 @@ bool EmitMoEFusedGateUpFromPlan(const MoEFusedGateUpRequest& req, const MoEFused
 
     return false;
 }
-

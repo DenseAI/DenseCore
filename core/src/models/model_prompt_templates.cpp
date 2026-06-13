@@ -42,7 +42,8 @@ bool TryParseBoolEnv(const char* name, bool* out) {
 bool PromptAlreadyTemplated(const std::string& prompt) {
     return prompt.find("<|im_start|>") != std::string::npos || prompt.find("<|im_end|>") != std::string::npos ||
            prompt.find("<|assistant|>") != std::string::npos || prompt.find("<|user|>") != std::string::npos ||
-           prompt.find("<|turn>") != std::string::npos || prompt.find("<turn|>") != std::string::npos;
+           prompt.find("<|turn>") != std::string::npos || prompt.find("<turn|>") != std::string::npos ||
+           prompt.find("<start_of_turn>") != std::string::npos || prompt.find("<end_of_turn>") != std::string::npos;
 }
 
 std::string TrimCopy(std::string value) {
@@ -327,6 +328,23 @@ bool IsQwenLikelyControlToken(const std::string& token) {
     return token.rfind("<|", 0) == 0 || token.rfind("</", 0) == 0 || token.rfind("<unused", 0) == 0;
 }
 
+bool IsLFM2LikelyControlToken(const std::string& token) {
+    if (token.empty()) {
+        return false;
+    }
+    static const char* kBlockedLiterals[] = {
+        "<|startoftext|>", "<|endoftext|>", "<|im_start|>",   "<|im_end|>",
+        "<think>",         "</think>",      "<tool_call>",    "</tool_call>",
+        "<tool_response>", "</tool_response>", nullptr,
+    };
+    for (int i = 0; kBlockedLiterals[i] != nullptr; ++i) {
+        if (token == kBlockedLiterals[i]) {
+            return true;
+        }
+    }
+    return token.rfind("<|", 0) == 0 || token.rfind("</", 0) == 0;
+}
+
 std::string AppendQwenNoThinkDirective(std::string content) {
     if (content.find("/no_think") != std::string::npos || content.find("/nothink") != std::string::npos) {
         return content;
@@ -367,8 +385,20 @@ PromptTemplateProfile ResolveModelPromptTemplateProfile(const TransformerModel* 
 
     if (prompt_family == PromptTemplateFamily::TURN_TAGS || has_turn_tokens || template_looks_turn_tags) {
         profile.kind = PromptTemplateKind::TURN_TAGS;
-        profile.open_tag = "<|turn>";
-        profile.close_tag = "<turn|>\n";
+        // Gemma turn markers vary by export. The current ggml-org Gemma4 GGUF
+        // uses atomic <|turn>/<turn|> ids, while other Gemma-family exports may
+        // expose <start_of_turn>/<end_of_turn>. Pick only literals present in
+        // the loaded vocab so the tokenizer never decomposes turn markers into
+        // ordinary text.
+        const bool has_gemma_turn_tokens =
+            HasTokenLiteral(model, "<start_of_turn>") && HasTokenLiteral(model, "<end_of_turn>");
+        if (has_gemma_turn_tokens) {
+            profile.open_tag = "<start_of_turn>";
+            profile.close_tag = "<end_of_turn>\n";
+        } else {
+            profile.open_tag = "<|turn>";
+            profile.close_tag = "<turn|>\n";
+        }
         profile.system_role = "system";
         profile.user_role = "user";
         profile.assistant_role = "model";
@@ -509,10 +539,10 @@ void ConfigureGemma4TextTokenBlocklistForModel(const TransformerModel* model, Re
             if (token_type == 1 || token_type == 6) {
                 continue;
             }
-            if (i < model->vocab_tokens.size() && IsGemma4GenerationChannelToken(model->vocab_tokens[i])) {
+            const int token_id = static_cast<int>(i);
+            if (IsGemma4GenerationChannelToken(model->vocab_tokens[i])) {
                 continue;
             }
-            const int token_id = static_cast<int>(i);
             if (!is_stop_id(token_id)) {
                 AppendDisallowedTokenId(req, token_id);
             }
@@ -547,6 +577,48 @@ void ConfigureGemma4TextTokenBlocklistForModel(const TransformerModel* model, Re
             if (!IsAsciiOneWordAnswerToken(token)) {
                 AppendDisallowedTokenId(req, token_id);
             }
+        }
+    }
+
+    std::sort(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end());
+    req->disallowed_token_ids.erase(std::unique(req->disallowed_token_ids.begin(), req->disallowed_token_ids.end()),
+                                    req->disallowed_token_ids.end());
+}
+
+void ConfigureLFM2TextTokenBlocklistForModel(const TransformerModel* model, Request* req) {
+    if (!model || !req || DescribeModel(model).variant != ModelVariant::LFM2MOE) {
+        return;
+    }
+
+    const int special_token_ids[] = {
+        model->bos_token_id,
+        model->eos_token_id,
+        model->unk_token_id,
+        model->sep_token_id,
+        model->pad_token_id,
+        model->mask_token_id,
+    };
+    for (int token_id : special_token_ids) {
+        if (token_id >= 0) {
+            AppendDisallowedTokenId(req, token_id);
+        }
+    }
+
+    const bool validated_token_types =
+        !model->token_types.empty() && model->token_types.size() == model->vocab_tokens.size();
+    if (validated_token_types) {
+        for (size_t i = 0; i < model->token_types.size(); ++i) {
+            const int32_t token_type = model->token_types[i];
+            if (token_type == 1 || token_type == 6) {
+                continue;
+            }
+            AppendDisallowedTokenId(req, static_cast<int>(i));
+        }
+    }
+
+    for (const auto& [token, token_id] : model->token_to_id) {
+        if (IsLFM2LikelyControlToken(token)) {
+            AppendDisallowedTokenId(req, token_id);
         }
     }
 
@@ -628,7 +700,7 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         wrapped += profile.assistant_role;
         wrapped += "\n";
         if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking &&
-            gemma4_thinking_explicit && gemma4_thinking_env) {
+            !(gemma4_thinking_explicit && gemma4_thinking_env)) {
             wrapped += "<|channel>thought\n<channel|>";
         }
         return wrapped;
@@ -776,7 +848,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
         rendered += profile.open_tag;
         rendered += profile.assistant_role;
         rendered += "\n";
-        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking && thinking_enabled) {
+        if (DescribeModel(model).variant == ModelVariant::GEMMA4 && profile.supports_thinking && !thinking_enabled) {
             rendered += "<|channel>thought\n<channel|>";
         }
         return rendered;

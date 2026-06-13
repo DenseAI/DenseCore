@@ -360,8 +360,10 @@ func formatGemmaTurnPrompt(modelHint string, messages []domain.Message, template
 	sb.WriteString(profile.openTag)
 	sb.WriteString(profile.assistantRole)
 	sb.WriteString("\n")
-	if profile.family == promptFamilyGemma && thinkingEnabled {
-		sb.WriteString("<|channel>thought\n<channel|>")
+	if profile.family == promptFamilyGemma {
+		if !thinkingEnabled {
+			sb.WriteString("<|channel>thought\n<channel|>")
+		}
 	}
 	return sb.String()
 }

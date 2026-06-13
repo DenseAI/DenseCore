@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -101,11 +102,11 @@ bool RunQ5KRepackedMoEFusedSwiGLURawProjection(CpuBackend* backend, const void* 
                                                int64_t rows, int64_t cols, int64_t input_cols, int numa_node,
                                                bool allow_parallel);
 bool RunQ4KRepackedMoEProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
-                                 size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
-                                 int64_t input_cols, int numa_node, bool allow_parallel);
+                                  size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
+                                  int64_t input_cols, int numa_node, bool allow_parallel);
 bool RunQ6KRepackedMoEProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
-                                 size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
-                                 int64_t input_cols, int numa_node, bool allow_parallel);
+                                  size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
+                                  int64_t input_cols, int numa_node, bool allow_parallel);
 bool RunQ6KRepackedMoEProjectionCached(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
                                        size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
                                        int64_t input_cols, int numa_node, bool allow_parallel,

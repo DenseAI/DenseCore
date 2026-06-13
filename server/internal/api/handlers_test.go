@@ -540,8 +540,9 @@ func TestChatCompletionStreamingEmitsToolCallDeltaAndDone(t *testing.T) {
 
 func TestSplitGemma4ReasoningResponse(t *testing.T) {
 	content, reasoning := splitGemma4ReasoningResponse(
+		domain.ChatCompletionRequest{},
 		"gemma4",
-		"<|channel>thought\n<channel|>consider Paris\n<|channel>final\n<channel|>Paris is the capital of France.",
+		"<|channel>thought\nconsider Paris\n<channel|><|channel>final\n<channel|>Paris is the capital of France.",
 	)
 	if content != "Paris is the capital of France." {
 		t.Fatalf("expected final content, got %q", content)
@@ -551,8 +552,40 @@ func TestSplitGemma4ReasoningResponse(t *testing.T) {
 	}
 }
 
+func TestSplitGemma4ReasoningResponseRoutesBodyAfterThoughtCloseToContent(t *testing.T) {
+	enableThinking := true
+	req := domain.ChatCompletionRequest{ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking}}
+	content, reasoning := splitGemma4ReasoningResponse(
+		req,
+		"gemma4",
+		"<|channel>thought\n* Fact: Paris.<channel|>Paris",
+	)
+	if content != "Paris" {
+		t.Fatalf("expected final body after thought close as content, got %q", content)
+	}
+	if reasoning != "* Fact: Paris." {
+		t.Fatalf("expected thought body before close as reasoning, got %q", reasoning)
+	}
+}
+
+func TestSplitGemma4ReasoningResponseStripsMalformedLeadingChannelFromContent(t *testing.T) {
+	enableThinking := true
+	req := domain.ChatCompletionRequest{ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking}}
+	content, reasoning := splitGemma4ReasoningResponse(
+		req,
+		"gemma4",
+		"<|channel>thought\nreasoning<channel|><|channel>롬\nSeoul",
+	)
+	if content != "Seoul" {
+		t.Fatalf("expected malformed channel prelude stripped from content, got %q", content)
+	}
+	if reasoning != "reasoning" {
+		t.Fatalf("expected reasoning preserved, got %q", reasoning)
+	}
+}
+
 func TestSplitGemma4ReasoningResponseHandlesBareBodyMarkerAsContent(t *testing.T) {
-	content, reasoning := splitGemma4ReasoningResponse("gemma4", "<channel|>Paris is the capital of France.")
+	content, reasoning := splitGemma4ReasoningResponse(domain.ChatCompletionRequest{}, "gemma4", "<channel|>Paris is the capital of France.")
 	if content != "Paris is the capital of France." || reasoning != "" {
 		t.Fatalf("expected body marker to be stripped into content, got content=%q reasoning=%q", content, reasoning)
 	}
@@ -560,6 +593,7 @@ func TestSplitGemma4ReasoningResponseHandlesBareBodyMarkerAsContent(t *testing.T
 
 func TestSplitGemma4ReasoningResponseTrimsTrailingControlArtifacts(t *testing.T) {
 	content, reasoning := splitGemma4ReasoningResponse(
+		domain.ChatCompletionRequest{},
 		"gemma4",
 		"Answer is complete. <|be_thought_out|>\n<channel|>Answer is complete.",
 	)
@@ -570,6 +604,7 @@ func TestSplitGemma4ReasoningResponseTrimsTrailingControlArtifacts(t *testing.T)
 
 func TestSplitGemma4ReasoningResponseStripsBareThoughtPrelude(t *testing.T) {
 	content, reasoning := splitGemma4ReasoningResponse(
+		domain.ChatCompletionRequest{},
 		"gemma4",
 		"thought\n think silently.\n\nParis is the capital of France.",
 	)
@@ -578,13 +613,36 @@ func TestSplitGemma4ReasoningResponseStripsBareThoughtPrelude(t *testing.T) {
 	}
 }
 
-func TestSplitGemma4ReasoningResponseTreatsThoughtOnlyChannelAsContent(t *testing.T) {
+func TestSplitGemma4ReasoningResponseTreatsThoughtOnlyChannelAsContentByDefault(t *testing.T) {
 	content, reasoning := splitGemma4ReasoningResponse(
+		domain.ChatCompletionRequest{},
 		"gemma4",
 		"<|channel>thought\n<channel|>CPU MoE inference handles prefill and decode differently.",
 	)
 	if content != "CPU MoE inference handles prefill and decode differently." || reasoning != "" {
 		t.Fatalf("expected thought-only channel to become visible content, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitGemma4ReasoningResponseRoutesBodyAfterThoughtCloseToContentWhenEnabled(t *testing.T) {
+	enableThinking := true
+	req := domain.ChatCompletionRequest{ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking}}
+	content, reasoning := splitGemma4ReasoningResponse(
+		req,
+		"gemma4",
+		"<|channel>thought\n<channel|>CPU MoE inference handles prefill and decode differently.",
+	)
+	if content != "CPU MoE inference handles prefill and decode differently." || reasoning != "" {
+		t.Fatalf("expected body after thought close to become content, got content=%q reasoning=%q", content, reasoning)
+	}
+}
+
+func TestSplitGemma4ReasoningResponseTreatsBareThinkingBodyAsReasoningWhenEnabled(t *testing.T) {
+	enableThinking := true
+	req := domain.ChatCompletionRequest{ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking}}
+	content, reasoning := splitGemma4ReasoningResponse(req, "gemma4", "The user asks for the capital.")
+	if content != "" || reasoning != "The user asks for the capital." {
+		t.Fatalf("expected bare thinking body to route to reasoning, got content=%q reasoning=%q", content, reasoning)
 	}
 }
 
@@ -622,14 +680,14 @@ func TestGemma4StreamFilterPassesPlainText(t *testing.T) {
 }
 
 func TestSplitGemma4ReasoningResponseKeepsBareChannelParityToken(t *testing.T) {
-	content, reasoning := splitGemma4ReasoningResponse("gemma4", "<|channel>")
+	content, reasoning := splitGemma4ReasoningResponse(domain.ChatCompletionRequest{}, "gemma4", "<|channel>")
 	if content != "<|channel>" || reasoning != "" {
 		t.Fatalf("expected bare channel token to remain content, got content=%q reasoning=%q", content, reasoning)
 	}
 }
 
 func TestSplitGemma4ReasoningResponseKeepsNonGemmaContent(t *testing.T) {
-	content, reasoning := splitGemma4ReasoningResponse("qwen3.6", "<|channel>thought\nnot a gemma response")
+	content, reasoning := splitGemma4ReasoningResponse(domain.ChatCompletionRequest{}, "qwen3.6", "<|channel>thought\nnot a gemma response")
 	if content != "<|channel>thought\nnot a gemma response" || reasoning != "" {
 		t.Fatalf("expected non-gemma content unchanged, got content=%q reasoning=%q", content, reasoning)
 	}

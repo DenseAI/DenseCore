@@ -26,6 +26,10 @@ namespace densecore {
 bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
                                    size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
                                    int numa_node, bool allow_parallel);
+bool RunMoEQ4KRawBatchedWeightedScatterProjection(
+    CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data, size_t qinput_row_bytes,
+    const int* token_indices, const float* token_weights, float* output_data, int64_t output_row_stride, int64_t M,
+    int64_t N, int64_t K, int numa_node, bool allow_parallel);
 bool RunMoEKQuantRawBatchedProjection(CpuBackend* backend, int ggml_type_id, const void* weight_ptr,
                                       const uint8_t* qinput_data, size_t qinput_row_bytes, float* out_data, int64_t M,
                                       int64_t N, int64_t K, int numa_node, bool allow_parallel);
@@ -36,6 +40,10 @@ bool RunMoEKQuantRawBatchedFusedSwiGLU(CpuBackend* backend, int ggml_type_id, co
                                        const void* up_weight_ptr, const uint8_t* qinput_data, size_t qinput_row_bytes,
                                        float* out_data, int64_t M, int64_t N, int64_t K, int numa_node,
                                        bool allow_parallel);
+bool RunMoEQ4KRawBatchedFusedSwiGLUToQ8(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
+                                        const uint8_t* qinput_data, size_t qinput_row_bytes, uint8_t* qoutput_data,
+                                        size_t qoutput_row_bytes, int64_t M, int64_t N, int64_t K, int numa_node,
+                                        bool allow_parallel);
 bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gate_weight_ptr, const void* up_weight_ptr,
                                             const float* input_data, const uint8_t* qinput_data,
                                             size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
@@ -232,6 +240,72 @@ TEST_F(MoEOpsTest, Q4KRawBatchedFusedSwiGLUMatchesVecDot) {
     }
 }
 
+TEST_F(MoEOpsTest, Q4KRawBatchedFusedSwiGLUToQ8MatchesReferenceQuantization) {
+    constexpr int64_t M = 7;
+    constexpr int64_t K = 512;
+    constexpr int64_t N = 512;
+
+    const std::vector<float> gate_f32 = MakePatternedFloats(N, K, 0.018f);
+    const std::vector<float> up_f32 = MakePatternedFloats(N, K, 0.014f);
+    const std::vector<float> input_f32 = MakePatternedFloats(M, K, 0.010f);
+
+    std::vector<uint8_t> qgate;
+    std::vector<uint8_t> qup;
+    std::vector<uint8_t> qinput;
+    QuantizeRowsCpu(GGML_TYPE_Q4_K, gate_f32, N, K, &qgate);
+    QuantizeRowsCpu(GGML_TYPE_Q4_K, up_f32, N, K, &qup);
+    QuantizeRowsCpu(GGML_TYPE_Q8_K, input_f32, M, K, &qinput);
+
+    std::vector<float> fused(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+    CpuBackend& backend = GetCpuBackend();
+    ASSERT_TRUE(RunMoEKQuantRawBatchedFusedSwiGLU(&backend, static_cast<int>(GGML_TYPE_Q4_K), qgate.data(), qup.data(),
+                                                  qinput.data(), ggml_row_size(GGML_TYPE_Q8_K, K), fused.data(), M, N,
+                                                  K, /*numa_node=*/0, /*allow_parallel=*/true));
+
+    std::vector<uint8_t> expected_q8;
+    std::vector<uint8_t> actual_q8(static_cast<size_t>(M) * ggml_row_size(GGML_TYPE_Q8_K, N), 0);
+    QuantizeRowsCpu(GGML_TYPE_Q8_K, fused, M, N, &expected_q8);
+    ASSERT_TRUE(RunMoEQ4KRawBatchedFusedSwiGLUToQ8(
+        &backend, qgate.data(), qup.data(), qinput.data(), ggml_row_size(GGML_TYPE_Q8_K, K), actual_q8.data(),
+        ggml_row_size(GGML_TYPE_Q8_K, N), M, N, K, /*numa_node=*/0, /*allow_parallel=*/true));
+
+    ASSERT_EQ(actual_q8.size(), expected_q8.size());
+    EXPECT_EQ(actual_q8, expected_q8);
+}
+
+TEST_F(MoEOpsTest, Q4KRawBatchedFusedSwiGLUToQ8LargeKMatchesReferenceQuantization) {
+    constexpr int64_t M = 9;
+    constexpr int64_t K = 1024;
+    constexpr int64_t N = 512;
+
+    const std::vector<float> gate_f32 = MakePatternedFloats(N, K, 0.015f);
+    const std::vector<float> up_f32 = MakePatternedFloats(N, K, 0.012f);
+    const std::vector<float> input_f32 = MakePatternedFloats(M, K, 0.008f);
+
+    std::vector<uint8_t> qgate;
+    std::vector<uint8_t> qup;
+    std::vector<uint8_t> qinput;
+    QuantizeRowsCpu(GGML_TYPE_Q4_K, gate_f32, N, K, &qgate);
+    QuantizeRowsCpu(GGML_TYPE_Q4_K, up_f32, N, K, &qup);
+    QuantizeRowsCpu(GGML_TYPE_Q8_K, input_f32, M, K, &qinput);
+
+    std::vector<float> fused(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+    CpuBackend& backend = GetCpuBackend();
+    ASSERT_TRUE(RunMoEKQuantRawBatchedFusedSwiGLU(&backend, static_cast<int>(GGML_TYPE_Q4_K), qgate.data(), qup.data(),
+                                                  qinput.data(), ggml_row_size(GGML_TYPE_Q8_K, K), fused.data(), M, N,
+                                                  K, /*numa_node=*/0, /*allow_parallel=*/true));
+
+    std::vector<uint8_t> expected_q8;
+    std::vector<uint8_t> actual_q8(static_cast<size_t>(M) * ggml_row_size(GGML_TYPE_Q8_K, N), 0);
+    QuantizeRowsCpu(GGML_TYPE_Q8_K, fused, M, N, &expected_q8);
+    ASSERT_TRUE(RunMoEQ4KRawBatchedFusedSwiGLUToQ8(
+        &backend, qgate.data(), qup.data(), qinput.data(), ggml_row_size(GGML_TYPE_Q8_K, K), actual_q8.data(),
+        ggml_row_size(GGML_TYPE_Q8_K, N), M, N, K, /*numa_node=*/0, /*allow_parallel=*/true));
+
+    ASSERT_EQ(actual_q8.size(), expected_q8.size());
+    EXPECT_EQ(actual_q8, expected_q8);
+}
+
 TEST_F(MoEOpsTest, Q4KRepackedPrefillFusedSwiGLUMatchesRawBatched) {
     constexpr int64_t M = 17;
     constexpr int64_t K = 512;
@@ -289,12 +363,50 @@ TEST_F(MoEOpsTest, Q4KRawBatchedProjectionSupportsWeightedScatter) {
     const float route_weight[M] = {0.75f, 0.2f, 0.55f, 1.0f, 0.125f};
     std::vector<float> actual(static_cast<size_t>(Tokens) * static_cast<size_t>(N), 0.0f);
     std::vector<float> expected(static_cast<size_t>(Tokens) * static_cast<size_t>(N), 0.0f);
+    ASSERT_TRUE(RunMoEQ4KRawBatchedWeightedScatterProjection(
+        &backend, qweight.data(), qinput.data(), ggml_row_size(GGML_TYPE_Q8_K, K), token_for_m, route_weight,
+        actual.data(), N, M, N, K, /*numa_node=*/0, /*allow_parallel=*/true));
 
     for (int64_t m = 0; m < M; ++m) {
         const int token = token_for_m[m];
         for (int64_t n = 0; n < N; ++n) {
-            actual[static_cast<size_t>(token) * static_cast<size_t>(N) + static_cast<size_t>(n)] +=
-                projected[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] * route_weight[m];
+            expected[static_cast<size_t>(token) * static_cast<size_t>(N) + static_cast<size_t>(n)] +=
+                Q4KQ8KVecDotReference(qweight, qinput, n, m, K) * route_weight[m];
+        }
+    }
+
+    for (size_t i = 0; i < actual.size(); ++i) {
+        EXPECT_NEAR(actual[i], expected[i], 1e-4f) << "i=" << i;
+    }
+}
+
+TEST_F(MoEOpsTest, Q4KRawBatchedProjectionLargeKSupportsWeightedScatter) {
+    constexpr int64_t M = 7;
+    constexpr int64_t K = 1024;
+    constexpr int64_t N = 128;
+    constexpr int64_t Tokens = 4;
+
+    const std::vector<float> weight_f32 = MakePatternedFloats(N, K, 0.016f);
+    const std::vector<float> input_f32 = MakePatternedFloats(M, K, 0.010f);
+
+    std::vector<uint8_t> qweight;
+    std::vector<uint8_t> qinput;
+    QuantizeRowsCpu(GGML_TYPE_Q4_K, weight_f32, N, K, &qweight);
+    QuantizeRowsCpu(GGML_TYPE_Q8_K, input_f32, M, K, &qinput);
+
+    const int token_for_m[M] = {0, 1, 1, 2, 3, 0, 2};
+    const float route_weight[M] = {0.75f, 0.2f, 0.55f, 1.0f, 0.125f, 0.375f, 0.625f};
+    std::vector<float> actual(static_cast<size_t>(Tokens) * static_cast<size_t>(N), 0.0f);
+    std::vector<float> expected(static_cast<size_t>(Tokens) * static_cast<size_t>(N), 0.0f);
+
+    CpuBackend& backend = GetCpuBackend();
+    ASSERT_TRUE(RunMoEQ4KRawBatchedWeightedScatterProjection(
+        &backend, qweight.data(), qinput.data(), ggml_row_size(GGML_TYPE_Q8_K, K), token_for_m, route_weight,
+        actual.data(), N, M, N, K, /*numa_node=*/0, /*allow_parallel=*/true));
+
+    for (int64_t m = 0; m < M; ++m) {
+        const int token = token_for_m[m];
+        for (int64_t n = 0; n < N; ++n) {
             expected[static_cast<size_t>(token) * static_cast<size_t>(N) + static_cast<size_t>(n)] +=
                 Q4KQ8KVecDotReference(qweight, qinput, n, m, K) * route_weight[m];
         }
