@@ -6506,19 +6506,52 @@ void cb_gelu_mul_fused(struct ggml_tensor* dst, const struct ggml_tensor* a, con
                        int nth, void* userdata) {
     (void)userdata;
     if (!a || !b || !dst || !a->data || !b->data || !dst->data) return;
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return;
+    if (a->ne[0] != b->ne[0] || a->ne[1] != b->ne[1] || a->ne[2] != b->ne[2] || a->ne[3] != b->ne[3] ||
+        dst->ne[0] != a->ne[0] || dst->ne[1] != a->ne[1] || dst->ne[2] != a->ne[2] || dst->ne[3] != a->ne[3]) {
+        return;
+    }
+    if (a->nb[0] != static_cast<int64_t>(sizeof(float)) || b->nb[0] != static_cast<int64_t>(sizeof(float)) ||
+        dst->nb[0] != static_cast<int64_t>(sizeof(float))) {
+        return;
+    }
 
-    const float* gate = reinterpret_cast<const float*>(a->data);
-    const float* up = reinterpret_cast<const float*>(b->data);
-    float* out = reinterpret_cast<float*>(dst->data);
     const size_t size = ggml_nelements(a);
-
     const size_t begin = (size * static_cast<size_t>(ith)) / static_cast<size_t>(nth);
     const size_t end = (size * static_cast<size_t>(ith + 1)) / static_cast<size_t>(nth);
-    for (size_t i = begin; i < end; ++i) {
-        const float x = gate[i];
+    if (ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(dst)) {
+        const float* gate = reinterpret_cast<const float*>(a->data);
+        const float* up = reinterpret_cast<const float*>(b->data);
+        float* out = reinterpret_cast<float*>(dst->data);
+        for (size_t i = begin; i < end; ++i) {
+            const float x = gate[i];
+            const float x3 = x * x * x;
+            const float gelu = 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x3)));
+            out[i] = gelu * up[i];
+        }
+        return;
+    }
+
+    const auto offset_bytes = [](const ggml_tensor* tensor, size_t flat_idx) -> size_t {
+        size_t rem = flat_idx;
+        size_t offset = 0;
+        for (int dim = 0; dim < 4; ++dim) {
+            const int64_t extent = tensor->ne[dim] > 0 ? tensor->ne[dim] : 1;
+            const size_t coord = rem % static_cast<size_t>(extent);
+            rem /= static_cast<size_t>(extent);
+            offset += coord * static_cast<size_t>(tensor->nb[dim]);
+        }
+        return offset;
+    };
+    for (size_t flat = begin; flat < end; ++flat) {
+        const float x =
+            *reinterpret_cast<const float*>(reinterpret_cast<const char*>(a->data) + offset_bytes(a, flat));
+        const float up =
+            *reinterpret_cast<const float*>(reinterpret_cast<const char*>(b->data) + offset_bytes(b, flat));
         const float x3 = x * x * x;
         const float gelu = 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x3)));
-        out[i] = gelu * up[i];
+        float* out = reinterpret_cast<float*>(reinterpret_cast<char*>(dst->data) + offset_bytes(dst, flat));
+        *out = gelu * up;
     }
 }
 

@@ -261,5 +261,63 @@ TEST_F(ActivationOpsTest, FusedSiLUMulHandlesStridedViewsSafely) {
     }
 }
 
+TEST_F(ActivationOpsTest, FusedGeluMulHandlesStridedViewsSafely) {
+    constexpr int64_t cols = 3;
+    constexpr int64_t rows = 2;
+    constexpr int64_t padded_cols = 7;
+
+    std::vector<float> gate_storage(static_cast<size_t>(padded_cols * rows), 0.0f);
+    std::vector<float> up_storage(static_cast<size_t>(padded_cols * rows), 0.0f);
+    std::vector<float> out_storage(static_cast<size_t>(padded_cols * rows), 0.0f);
+
+    const float gate_values[rows][cols] = {
+        {-1.5f, 0.0f, 1.25f},
+        {2.0f, -0.5f, 0.75f},
+    };
+    const float up_values[rows][cols] = {
+        {0.25f, -2.0f, 1.5f},
+        {-1.0f, 0.5f, 3.0f},
+    };
+
+    for (int64_t r = 0; r < rows; ++r) {
+        std::memcpy(gate_storage.data() + r * padded_cols, gate_values[r], sizeof(gate_values[r]));
+        std::memcpy(up_storage.data() + r * padded_cols, up_values[r], sizeof(up_values[r]));
+    }
+
+    ggml_tensor gate = {};
+    ggml_tensor up = {};
+    ggml_tensor out = {};
+    gate.type = GGML_TYPE_F32;
+    up.type = GGML_TYPE_F32;
+    out.type = GGML_TYPE_F32;
+    gate.data = gate_storage.data();
+    up.data = up_storage.data();
+    out.data = out_storage.data();
+    gate.ne[0] = cols; gate.ne[1] = rows; gate.ne[2] = 1; gate.ne[3] = 1;
+    up.ne[0] = cols; up.ne[1] = rows; up.ne[2] = 1; up.ne[3] = 1;
+    out.ne[0] = cols; out.ne[1] = rows; out.ne[2] = 1; out.ne[3] = 1;
+    gate.nb[0] = sizeof(float); gate.nb[1] = padded_cols * sizeof(float);
+    up.nb[0] = sizeof(float); up.nb[1] = padded_cols * sizeof(float);
+    out.nb[0] = sizeof(float); out.nb[1] = padded_cols * sizeof(float);
+    gate.nb[2] = gate.nb[1] * rows; gate.nb[3] = gate.nb[2];
+    up.nb[2] = up.nb[1] * rows; up.nb[3] = up.nb[2];
+    out.nb[2] = out.nb[1] * rows; out.nb[3] = out.nb[2];
+
+    cb_gelu_mul_fused(&out, &gate, &up, 0, 1, nullptr);
+
+    constexpr float kSqrt2OverPi = 0.7978845608028654f;
+    constexpr float kCoeff = 0.044715f;
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t c = 0; c < cols; ++c) {
+            const float x = gate_values[r][c];
+            const float x3 = x * x * x;
+            const float gelu = 0.5f * x * (1.0f + std::tanh(kSqrt2OverPi * (x + kCoeff * x3)));
+            const float expected = gelu * up_values[r][c];
+            EXPECT_NEAR(out_storage[static_cast<size_t>(r * padded_cols + c)], expected, 1e-5f)
+                << "row=" << r << " col=" << c;
+        }
+    }
+}
+
 }  // namespace
 }  // namespace densecore

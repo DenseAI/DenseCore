@@ -85,6 +85,10 @@ void cb_apply_multi_lora(struct ggml_tensor* dst, const struct ggml_tensor* src0
 void cb_silu_mul_fused(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b, int ith,
                        int nth, void* userdata);
 
+// Fused GELU x Mul callback (GEGLU FFN)
+void cb_gelu_mul_fused(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b, int ith,
+                       int nth, void* userdata);
+
 // KV cache management callback
 void cb_kv_manage(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* userdata);
 

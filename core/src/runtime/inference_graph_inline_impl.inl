@@ -2482,9 +2482,10 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 }
                 struct ggml_tensor* shared_ffn = nullptr;
                 const bool prefer_native_silu_mul = prefer_plain_shared_expert_matmul;
-                if (is_gemma4_moe) {
-                    // Match llama.cpp Gemma4 path: use native GEGLU so strided matmul
-                    // outputs do not rely on custom flat-memory assumptions.
+                if (is_gemma4_moe && GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode) {
+                    shared_ffn =
+                        ggml_map_custom2(ctx_c, shared_gate, shared_up, cb_gelu_mul_fused, GGML_N_TASKS_MAX, nullptr);
+                } else if (is_gemma4_moe) {
                     shared_ffn = ggml_geglu_split(ctx_c, shared_gate, shared_up);
                 } else if (prefer_native_silu_mul) {
                     shared_ffn = ggml_mul(ctx_c, ggml_silu(ctx_c, shared_gate), shared_up);
@@ -2682,9 +2683,10 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             // This saves ~50% memory bandwidth in FFN forward pass.
             if (fused_gate_up_swiglu) {
                 cur = fused_gate_up_swiglu;
+            } else if (model->arch_flags.is_gemma4 &&
+                       GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode) {
+                cur = ggml_map_custom2(ctx_c, w1, w3, cb_gelu_mul_fused, GGML_N_TASKS_MAX, nullptr);
             } else if (model->arch_flags.is_gemma4) {
-                // Match llama.cpp Gemma4 path: use native GEGLU so strided matmul
-                // outputs do not rely on custom flat-memory assumptions.
                 cur = ggml_geglu_split(ctx_c, w1, w3);
             } else {
                 if ((model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
