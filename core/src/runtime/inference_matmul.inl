@@ -4635,139 +4635,23 @@ static const char* Gemma4NativeMatmulRejectName(Gemma4NativeMatmulReject reason)
 }
 
 // Combined prefill+decode native route failed C4 Korea QA, so x86 admission is
-// fail-closed by default. The per-phase env knobs exist to isolate which side
-// regresses quality: enabling only the prefill knob keeps the suspect decode
-// route off. ARM keeps the validated always-on behavior.
-static bool Gemma4X86NativeMatmulEnvOn(const char* phase_env) {
+// fail-closed by default. Keep x86 native decode behind a diagnostic env only;
+// x86 native prefill was re-tested on C4 and rejected (20260616 env A/B:
+// 70.14 -> 69.27 tok/s prefill), so it has no runtime knob.
+static bool Gemma4X86NativeMatmulEnvOn() {
     auto truthy = [](const char* name) {
         const char* env = std::getenv(name);
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
                std::strcmp(env, "False") != 0 && std::strcmp(env, "FALSE") != 0;
     };
-    return truthy("DENSECORE_GEMMA4_X86_NATIVE_MATMUL") || truthy(phase_env);
+    return truthy("DENSECORE_GEMMA4_X86_NATIVE_MATMUL") || truthy("DENSECORE_GEMMA4_X86_NATIVE_MATMUL_DECODE");
 }
-
-// Gemma4 dense native prefill matmul route. The promoted (prefill+decode)
-// route failed C4 Korea QA; prefill-only has not been isolated on C4 yet, so
-// x86 stays opt-in via DENSECORE_GEMMA4_X86_NATIVE_MATMUL_PREFILL.
-#if !defined(__aarch64__) && !defined(_M_ARM64)
-// One-shot runtime parity self-check for the Gemma4 native Q8_0 prefill true-GEMM
-// (cb_gemv_batched_custom with gemma4_dense_prefill_native). The kernel is
-// unit-test oracle-verified on AVX2 (AttentionPolicyTest.Gemma4NativeQ8Prefill
-// TrueGemmMatchesVecDotOracle), but the x86 native route was historically
-// fail-closed over a "suspected C4 QA corruption" that turned out to be the
-// since-fixed chat-template / F32 safe-router bugs, not this GEMM. This probe
-// re-verifies the kernel against the ggml vec_dot reference on whatever ISA the
-// server actually runs (AVX-512 / AMX on C4) and admits the native path only on
-// a parity match -- otherwise the safe-batched path stays. Self-contained
-// (own ggml ctx + work ctx via ud; no graph/global mutation beyond a saved-and-
-// restored current-work-context), runs at most once, and never runs unless the
-// opt-in env is set first (see the gate below), so default builds pay nothing.
-static bool Gemma4NativePrefillParityProbePasses() {
-    static const bool ok = []() -> bool {
-        const auto* q8 = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
-        if (!q8 || !q8->from_float || !q8->vec_dot || q8->vec_dot_type != GGML_TYPE_Q8_0) {
-            return false;
-        }
-        constexpr int rows = 128;
-        constexpr int cols = 2048;
-        constexpr int tokens = 4;
-        ggml_init_params params{static_cast<size_t>(32) << 20, nullptr, false};
-        ggml_context* gctx = ggml_init(params);
-        if (!gctx) {
-            return false;
-        }
-        struct CtxGuard {
-            ggml_context* c;
-            ~CtxGuard() {
-                if (c) ggml_free(c);
-            }
-        } guard{gctx};
-        ggml_tensor* input = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, cols, tokens);
-        ggml_tensor* weight = ggml_new_tensor_2d(gctx, GGML_TYPE_Q8_0, cols, rows);
-        ggml_tensor* dst = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, rows, tokens);
-        if (!input || !weight || !dst || !input->data || !weight->data || !dst->data) {
-            return false;
-        }
-        dst->src[0] = input;
-        dst->src[1] = weight;
-        std::snprintf(weight->name, sizeof(weight->name), "blk.0.attn_q.weight");
-        auto* in = reinterpret_cast<float*>(input->data);
-        for (int m = 0; m < tokens; ++m) {
-            for (int c = 0; c < cols; ++c) {
-                in[static_cast<size_t>(m) * cols + c] = std::sin(static_cast<float>(m * 23 + c) * 0.007f) * 0.5f;
-            }
-        }
-        std::vector<float> row(static_cast<size_t>(cols));
-        const size_t wrs = ggml_row_size(GGML_TYPE_Q8_0, cols);
-        for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                row[static_cast<size_t>(c)] = std::cos(static_cast<float>(r * 19 + c) * 0.009f) * 0.25f;
-            }
-            q8->from_float(row.data(), static_cast<uint8_t*>(weight->data) + static_cast<size_t>(r) * wrs, cols);
-        }
-        std::fill_n(reinterpret_cast<float*>(dst->data), static_cast<size_t>(rows) * tokens, 12345.0f);
-        GemvBatchedUserData ud{};
-        ud.weight_tensor = weight;
-        ud.N = cols;
-        ud.K = rows;
-        ud.M = tokens;
-        ud.weight_type = GGML_TYPE_Q8_0;
-        ud.input_quant_type = GGML_TYPE_Q8_0;
-        ud.quant_row_stride = densecore::AlignUp(ggml_row_size(GGML_TYPE_Q8_0, cols), static_cast<size_t>(64));
-        ud.slot_id = -1;
-        ud.gemma4_dense_prefill_native = true;
-        InferenceWorkContext probe_ctx{};
-        ResetInferenceWorkContext(&probe_ctx);
-        ud.work_ctx = &probe_ctx;
-        InferenceWorkContext* saved = GetCurrentWorkContext();
-        SetCurrentWorkContext(&probe_ctx);
-        for (int ith = 0; ith < 4; ++ith) {
-            cb_gemv_batched_custom(dst, ith, 4, &ud);
-        }
-        SetCurrentWorkContext(saved);
-        std::vector<uint8_t> q8in(static_cast<size_t>(tokens) * ud.quant_row_stride);
-        for (int m = 0; m < tokens; ++m) {
-            q8->from_float(in + static_cast<size_t>(m) * cols,
-                           q8in.data() + static_cast<size_t>(m) * ud.quant_row_stride, cols);
-        }
-        const auto* out = reinterpret_cast<const float*>(dst->data);
-        bool matches = true;
-        for (int r = 0; r < rows && matches; ++r) {
-            const void* wr = static_cast<const uint8_t*>(weight->data) + static_cast<size_t>(r) * wrs;
-            for (int m = 0; m < tokens; ++m) {
-                float ref = 0.0f;
-                q8->vec_dot(cols, &ref, 0, wr, 0, q8in.data() + static_cast<size_t>(m) * ud.quant_row_stride, 0, 1);
-                const float got = out[static_cast<size_t>(m) * rows + r];
-                if (std::fabs(got - ref) > 1e-4f) {
-                    matches = false;
-                    break;
-                }
-            }
-        }
-        std::fprintf(stderr, "[Gemma4NativePrefillParity] x86 native Q8 GEMM vs vec_dot reference: %s\n",
-                     matches ? "MATCH (native admitted)" : "MISMATCH (safe-batched fallback)");
-        return matches;
-    }();
-    return ok;
-}
-#endif
 
 static bool IsGemma4NativePrefillMatmulSupported() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return true;
 #else
-    // Default OFF (unchanged). When the opt-in env is set, the native route is
-    // admitted ONLY if it matches the ggml vec_dot reference on this host's ISA;
-    // a mismatch auto-falls-back to the safe-batched path. This makes the C4
-    // prefill A/B safe-by-construction (no silent logit corruption).
-    static const bool enabled = []() {
-        if (!Gemma4X86NativeMatmulEnvOn("DENSECORE_GEMMA4_X86_NATIVE_MATMUL_PREFILL")) {
-            return false;
-        }
-        return Gemma4NativePrefillParityProbePasses();
-    }();
-    return enabled;
+    return false;
 #endif
 }
 
@@ -4778,7 +4662,7 @@ static bool IsGemma4NativeDecodeMatmulSupported() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return true;
 #else
-    static const bool enabled = Gemma4X86NativeMatmulEnvOn("DENSECORE_GEMMA4_X86_NATIVE_MATMUL_DECODE");
+    static const bool enabled = Gemma4X86NativeMatmulEnvOn();
     return enabled;
 #endif
 }

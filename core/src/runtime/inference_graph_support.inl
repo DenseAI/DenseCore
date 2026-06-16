@@ -4839,28 +4839,6 @@ static bool IsDebugSSMProjectionReferenceEnabled() {
     return enabled;
 }
 
-// Qwen3.5 x86 decode: opt-in to SKIP the AMX-fused qkv+gate alias
-// (`attn_qkv_gate.amx_fused_decode`) and instead run the split smart_mul_mat
-// custom-gemv projection path -- exactly what Qwen3.6 already uses on x86.
-//
-// Why: AMX ggml_mul_mat is built for M>=16 GEMM and is inefficient at M=1 decode.
-// The C4 node-times census (benchmarks/results/c4-node-times-20260615) showed
-// Qwen3.5 decode spends ~430ms in the mul_mat bucket on this fused alias while
-// Qwen3.6's split custom-gemv path keeps mul_mat ~13ms -- and Qwen3.6 ran
-// 20.24 tok/s vs Qwen3.5's 17.26 on the SAME C4 host with otherwise-identical
-// buckets. An earlier "split, no fused alias" attempt was rejected (16.57->16.34)
-// at a much older baseline; this gate lets a fresh C4 A/B re-test it without
-// changing the default. Default OFF preserves the QA-passing AMX-fused path; the
-// split path is numerically the same projection Qwen3.6 runs (QA-passing), so
-// correctness is established for the family. See qwen35_decode_optimization_log.md.
-static bool IsQwen35SsmQkvGateSplitDecodeEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_QWEN35_SSM_QKV_GATE_SPLIT_DECODE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
 static bool IsDebugAttentionProjectionReferenceEnabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("DENSECORE_DEBUG_ATTN_PROJECTION_REFERENCE");
