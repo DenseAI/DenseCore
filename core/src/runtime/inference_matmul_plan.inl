@@ -319,6 +319,7 @@ struct SmartMatmulGemvUserDataPlan {
     bool gemma4_model = false;
     bool gemma4_maintained_q8_decode_repacked = false;
     bool lfm2_tied_lm_head = false;
+    bool qwen_c4a_q6k_lm_head = false;
 };
 
 struct SmartMatmulCandidatePlan {
@@ -868,8 +869,18 @@ static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const g
     // Qwen hybrid-SSM Q8_0 prefill must stay inside DenseCore's owned path.
     // Use the repacked 4x8 batched GEMM for real prefill batches; keep the
     // direct GEMV path only for tiny micro-batches that cannot use GEMM.
-    ud->qwen36_ssm_q8_repacked_batched = prefill.qwen_hybrid_ssm_q8_prefill && dispatch.m >= 4;
-    ud->qwen36_ssm_q8_direct_batched = prefill.qwen_hybrid_ssm_q8_prefill && dispatch.m < 4;
+    ud->qwen36_ssm_q8_repacked_batched =
+#if defined(__aarch64__) || defined(_M_ARM64)
+        false;
+#else
+        prefill.qwen_hybrid_ssm_q8_prefill && dispatch.m >= 4;
+#endif
+    ud->qwen36_ssm_q8_direct_batched =
+#if defined(__aarch64__) || defined(_M_ARM64)
+        prefill.qwen_hybrid_ssm_q8_prefill;
+#else
+        prefill.qwen_hybrid_ssm_q8_prefill && dispatch.m < 4;
+#endif
 }
 
 static SmartMatmulGemvUserDataPlan ResolveSmartMatmulGemvUserDataPlan(
@@ -888,6 +899,14 @@ static SmartMatmulGemvUserDataPlan ResolveSmartMatmulGemvUserDataPlan(
         (model->output == weight || std::strcmp(dispatch.weight_name, "token_embd.weight") == 0 ||
          std::strcmp(dispatch.weight_name, "output.weight") == 0 ||
          std::strcmp(dispatch.weight_name, "output") == 0);
+    plan.qwen_c4a_q6k_lm_head =
+#if defined(__aarch64__) || defined(_M_ARM64)
+        dispatch.qwen35_target && weight->type == GGML_TYPE_Q6_K &&
+        (model->output == weight || std::strcmp(dispatch.weight_name, "output.weight") == 0 ||
+         std::strcmp(dispatch.weight_name, "lm_head.weight") == 0 || std::strcmp(dispatch.weight_name, "output") == 0);
+#else
+        false;
+#endif
     return plan;
 }
 
@@ -907,7 +926,8 @@ static void ConfigureSmartMatmulGemvUserData(GemvUserData* ud, const Transformer
     ud->gemma4_decode_lm_head = dispatch.gemma4_lm_head;
     ud->semantic_op = dispatch.semantic_op;
     ud->tensor_role = dispatch.tensor_role;
-    ud->lfm2_decode_lm_head = gemv_plan.lfm2_tied_lm_head && matmul_expected_decode;
+    ud->lfm2_decode_lm_head =
+        (gemv_plan.lfm2_tied_lm_head || gemv_plan.qwen_c4a_q6k_lm_head) && matmul_expected_decode;
 }
 
 static void RecordSmartMatmulGraphCensus(InferenceWorkContext* dispatch_work_ctx,

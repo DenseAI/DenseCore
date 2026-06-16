@@ -87,7 +87,15 @@ LFM2GreedyLMHeadArgmaxRejectReason GetGreedyLMHeadArgmaxRejectReason(const Trans
                                                                      float final_logit_softcap) {
     const bool is_lfm2 = model && (model->variant == ModelVariant::LFM2MOE || model->arch_flags.is_lfm2_shortconv);
     const bool is_gemma4 = model && model->arch_flags.is_gemma4;
-    if (!is_lfm2 && !is_gemma4) return LFM2GreedyLMHeadArgmaxRejectReason::UnsupportedModel;
+    const bool is_qwen_hybrid =
+#if defined(__aarch64__) || defined(_M_ARM64)
+        model && model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
+#else
+        false;
+#endif
+    if (!is_lfm2 && !is_gemma4 && !is_qwen_hybrid) {
+        return LFM2GreedyLMHeadArgmaxRejectReason::UnsupportedModel;
+    }
     if (phase != InferenceExecutionPhase::Decode && phase != InferenceExecutionPhase::Prefill) {
         return LFM2GreedyLMHeadArgmaxRejectReason::NonDecodePhase;
     }
@@ -3668,11 +3676,21 @@ void EngineLoop(EngineState* state) {
                                     ModelHasMoEGraphLayers(current_model);
                                 const bool prefer_cache_trim_for_qwen_prefill =
                                     IsX86QwenHybridMoEChunkedPrefillEstimate(current_model, graph_ctx_estimate);
+                                const bool c4a_qwen_hybrid_moe_prefill =
+#if defined(__aarch64__) || defined(_M_ARM64)
+                                    current_model &&
+                                    (prefill_descriptor.variant == ModelVariant::QWEN35 ||
+                                     prefill_descriptor.variant == ModelVariant::QWEN36) &&
+                                    current_model->arch_flags.is_hybrid_ssm &&
+                                    ModelHasMoEGraphLayers(current_model);
+#else
+                                    false;
+#endif
                                 const bool preserve_moe_q4k_repacked_cache =
                                     prefer_cache_trim_for_qwen_prefill || lfm2_moe_prefill;
                                 constexpr size_t MB = 1024ULL * 1024ULL;
                                 const size_t qwen_prefill_runtime_headroom =
-                                    preserve_moe_q4k_repacked_cache
+                                    (preserve_moe_q4k_repacked_cache || c4a_qwen_hybrid_moe_prefill)
                                         ? std::clamp<size_t>(
                                               available_for_prefill > 0 ? available_for_prefill / 64 : 128ULL * MB,
                                               64ULL * MB, 256ULL * MB)

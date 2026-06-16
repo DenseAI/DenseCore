@@ -168,29 +168,46 @@ bool DotKQ8KImpl(const void* weight_row, const void* q8_input_row, int64_t cols,
     const size_t quad_lanes = hn::Lanes(du8);
 
     for (int bi = 0; bi < nb; ++bi) {
+        // SIMD bit-unpack of the K-quant weight nibbles into `unpacked` (uint8
+        // 0..15 for Q4, 0..31 for Q5). This is BIT-IDENTICAL to the prior scalar
+        // unpack -- only the fill is vectorized; the integer dot below is
+        // unchanged, so the float result is bit-for-bit the same (the scalar
+        // triple loop was the dominant per-row cost; the Q5 high-bit add is now
+        // branchless). Sub-block s of chunk c lands at unpacked[c*64 + (s&1)*32];
+        // its high bit comes from qh[l] & (1<<s), reusing the 32 qh bytes.
         const uint8_t* q = x[bi].qs;
-        int8_t* dst = unpacked;
+        uint8_t* dst = reinterpret_cast<uint8_t*>(unpacked);
+        const auto lo_mask = hn::Set(du8, 0x0F);
         if constexpr (Q5) {
             const uint8_t* high = x[bi].qh;
-            uint8_t mask = 1;
-            for (int j = 0; j < kMoEQK_K / 64; ++j) {
-                for (int l = 0; l < 32; ++l) dst[l] = static_cast<int8_t>(q[l] & 0xF);
-                for (int l = 0; l < 32; ++l) dst[l] += (high[l] & mask) ? 16 : 0;
-                dst += 32;
-                mask <<= 1;
-                for (int l = 0; l < 32; ++l) dst[l] = static_cast<int8_t>(q[l] >> 4);
-                for (int l = 0; l < 32; ++l) dst[l] += (high[l] & mask) ? 16 : 0;
-                dst += 32;
-                mask <<= 1;
-                q += 32;
+            const auto sixteen = hn::Set(du8, 16);
+            for (int c = 0; c < kMoEQK_K / 64; ++c) {
+                const uint8_t* qc = q + static_cast<size_t>(c) * 32;
+                uint8_t* lo = dst + static_cast<size_t>(c) * 64;
+                uint8_t* hi = lo + 32;
+                const auto lo_bit = hn::Set(du8, static_cast<uint8_t>(1u << (2 * c)));
+                const auto hi_bit = hn::Set(du8, static_cast<uint8_t>(1u << (2 * c + 1)));
+                for (size_t off = 0; off < 32; off += quad_lanes) {
+                    const auto v = hn::LoadU(du8, qc + off);
+                    const auto qh = hn::LoadU(du8, high + off);
+                    const auto lo_add =
+                        hn::IfThenElseZero(hn::Ne(hn::And(qh, lo_bit), hn::Zero(du8)), sixteen);
+                    const auto hi_add =
+                        hn::IfThenElseZero(hn::Ne(hn::And(qh, hi_bit), hn::Zero(du8)), sixteen);
+                    hn::StoreU(hn::Add(hn::And(v, lo_mask), lo_add), du8, lo + off);
+                    hn::StoreU(hn::Add(hn::ShiftRight<4>(v), hi_add), du8, hi + off);
+                }
             }
         } else {
-            for (int j = 0; j < kMoEQK_K / 64; ++j) {
-                for (int l = 0; l < 32; ++l) dst[l] = static_cast<int8_t>(q[l] & 0xF);
-                dst += 32;
-                for (int l = 0; l < 32; ++l) dst[l] = static_cast<int8_t>(q[l] >> 4);
-                dst += 32;
-                q += 32;
+            for (int c = 0; c < kMoEQK_K / 64; ++c) {
+                const uint8_t* qc = q + static_cast<size_t>(c) * 32;
+                uint8_t* lo = dst + static_cast<size_t>(c) * 64;
+                uint8_t* hi = lo + 32;
+                for (size_t off = 0; off < 32; off += quad_lanes) {
+                    const auto v = hn::LoadU(du8, qc + off);
+                    hn::StoreU(hn::And(v, lo_mask), du8, lo + off);
+                    hn::StoreU(hn::ShiftRight<4>(v), du8, hi + off);
+                }
             }
         }
 
@@ -261,14 +278,20 @@ bool BatchedDotQ4KQ8KRowsImpl(const void* q4_weight_row, const void* q8_input_ba
     const size_t quad_lanes = hn::Lanes(du8);
 
     for (int bi = 0; bi < nb; ++bi) {
+        // SIMD Q4_K nibble unpack -- bit-identical to the prior scalar fill (see
+        // DotKQ8KImpl). The per-token dot below reuses this once-unpacked buffer.
         const uint8_t* q = x[bi].qs;
-        int8_t* dst = unpacked;
-        for (int j = 0; j < kMoEQK_K / 64; ++j) {
-            for (int l = 0; l < 32; ++l) dst[l] = static_cast<int8_t>(q[l] & 0xF);
-            dst += 32;
-            for (int l = 0; l < 32; ++l) dst[l] = static_cast<int8_t>(q[l] >> 4);
-            dst += 32;
-            q += 32;
+        uint8_t* dst = reinterpret_cast<uint8_t*>(unpacked);
+        const auto lo_mask = hn::Set(du8, 0x0F);
+        for (int c = 0; c < kMoEQK_K / 64; ++c) {
+            const uint8_t* qc = q + static_cast<size_t>(c) * 32;
+            uint8_t* lo = dst + static_cast<size_t>(c) * 64;
+            uint8_t* hi = lo + 32;
+            for (size_t off = 0; off < 32; off += quad_lanes) {
+                const auto v = hn::LoadU(du8, qc + off);
+                hn::StoreU(hn::And(v, lo_mask), du8, lo + off);
+                hn::StoreU(hn::ShiftRight<4>(v), du8, hi + off);
+            }
         }
 
         DecodeQ4KScales(x[bi].scales, utmp);

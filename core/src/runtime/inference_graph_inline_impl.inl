@@ -657,8 +657,12 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             }
 #endif
 #if !defined(__aarch64__) && !defined(_M_ARM64)
+            // Default: AMX-fused qkv+gate decode alias (one ggml_mul_mat). Opt-in
+            // DENSECORE_QWEN35_SSM_QKV_GATE_SPLIT_DECODE leaves fused_qkv_gate null so
+            // qkv_mixed/z fall to the split smart_mul_mat custom-gemv path Qwen3.6 uses
+            // on x86 (AMX mul_mat is inefficient at M=1 decode). See the env helper.
             if (model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm &&
-                model->hparams.n_experts > 0 && N == 1) {
+                model->hparams.n_experts > 0 && N == 1 && !IsQwen35SsmQkvGateSplitDecodeEnabled()) {
                 if (ggml_tensor* fused_w = layer.Get("attn_qkv_gate.amx_fused_decode")) {
                     fused_qkv_gate = ggml_mul_mat(ctx_c, fused_w, cur);
                     ggml_set_name(fused_qkv_gate, "qwen35_ssm_qkv_gate_fused_proj");

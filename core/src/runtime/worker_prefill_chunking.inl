@@ -28,7 +28,7 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
     const bool qwen_hybrid_ssm = model->arch_flags.is_hybrid_ssm;
     const int hybrid_ssm_chunk_tokens =
 #if defined(__aarch64__) || defined(_M_ARM64)
-        64;
+        192;
 #else
         320;
 #endif
@@ -394,7 +394,11 @@ int SelectLargestModelPrefillChunkThatFits(const TransformerModel* model, size_t
         return current_chunk_tokens;
     }
 
-    constexpr int kQwenCandidates[] = {128, 96, 64, 48, 32};
+    constexpr int kQwenCandidates[] = {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        192, 160,
+#endif
+        128, 96, 64, 48, 32};
     // C4 x86 QA runs showed Gemma4's 512-token graph chunk fits but regresses
     // TTFT versus the 448-token shape. Keep auto-upgrade capped at the measured
     // faster chunk while leaving explicit env overrides available for diagnosis.
