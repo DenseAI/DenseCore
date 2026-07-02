@@ -1865,6 +1865,15 @@ struct EngineState {
             effective_seq_len >= 1024ULL && effective_query_len > 1) {
             saturating_add_inplace(estimate.long_context_safety_pad_bytes, 256ULL * MB);
         }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+        if ((model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+            model->arch_flags.is_hybrid_ssm && model_has_moe_layers && effective_query_len > 128ULL) {
+            // C4A Qwen hybrid-SSM MoE prefill at 144+ token chunks builds far
+            // more ggml object metadata than the activation estimate captures.
+            // Without this ARM-specific object-pool reserve, 192-token prefill
+            // can pass admission and later abort in ggml_new_object().
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes, 3072ULL * MB);
+        }
 #endif
         if (model->arch_flags.is_hybrid_ssm && effective_query_len >= 1024ULL) {
             // Hybrid-SSM long-prefill graphs can still miss the coarse estimate by

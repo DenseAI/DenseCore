@@ -404,6 +404,7 @@ public:
     ~CpuThreadManager() { Shutdown(); }
 
     void Shutdown() {
+        node_helpers_.clear();  // join helper threads before their pools go away
         for (auto& pool : thread_pools_) {
             if (pool) {
                 pool->Shutdown();
@@ -430,8 +431,111 @@ public:
 
     int GetNumaNodeCount() const { return static_cast<int>(thread_pools_.size()); }
 
+    /**
+     * Run task(node) for node in [0, n_tasks) concurrently: node 0 executes on
+     * the calling thread, node n > 0 on a persistent helper thread pinned to
+     * that NUMA node (so the "main thread share" of a nested
+     * GetThreadPool(n).ParallelFor call also runs node-local). Blocks until
+     * every task returns. Falls back to sequential execution when the
+     * dispatcher is already busy (nested or concurrent use) — the tasks
+     * themselves must be safe to run on the calling thread.
+     */
+    void RunConcurrentNodeTasks(int n_tasks, const std::function<void(int)>& task) {
+        n_tasks = std::min(n_tasks, GetNumaNodeCount());
+        if (n_tasks <= 0 || !task) {
+            return;
+        }
+        if (n_tasks == 1) {
+            task(0);
+            return;
+        }
+        bool expected = false;
+        if (!dispatch_busy_.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire)) {
+            for (int t = 0; t < n_tasks; ++t) {
+                task(t);
+            }
+            return;
+        }
+        EnsureNodeHelpers(n_tasks - 1);
+        for (int t = 1; t < n_tasks; ++t) {
+            node_helpers_[static_cast<size_t>(t - 1)]->Post(&task);
+        }
+        task(0);
+        for (int t = 1; t < n_tasks; ++t) {
+            node_helpers_[static_cast<size_t>(t - 1)]->Wait();
+        }
+        dispatch_busy_.store(false, std::memory_order_release);
+    }
+
 private:
+    class NodeTaskHelper {
+    public:
+        explicit NodeTaskHelper(int node) : node_(node) {
+            thread_ = std::thread([this]() {
+                HardwareTopology::GetInstance().PinCurrentThreadToNumaNode(node_, PinningPolicy::SCATTER);
+                std::unique_lock<std::mutex> lock(mutex_);
+                for (;;) {
+                    cv_.wait(lock, [this] { return stop_ || pending_; });
+                    if (stop_) {
+                        return;
+                    }
+                    const std::function<void(int)>* task = task_;
+                    pending_ = false;
+                    lock.unlock();
+                    (*task)(node_);
+                    lock.lock();
+                    done_ = true;
+                    cv_.notify_all();
+                }
+            });
+        }
+
+        ~NodeTaskHelper() {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stop_ = true;
+            }
+            cv_.notify_all();
+            if (thread_.joinable()) {
+                thread_.join();
+            }
+        }
+
+        void Post(const std::function<void(int)>* task) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            task_ = task;
+            pending_ = true;
+            done_ = false;
+            cv_.notify_all();
+        }
+
+        void Wait() {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] { return done_; });
+        }
+
+    private:
+        const int node_;
+        std::thread thread_;
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        const std::function<void(int)>* task_ = nullptr;
+        bool pending_ = false;
+        bool done_ = false;
+        bool stop_ = false;
+    };
+
+    // Caller must hold dispatch_busy_ (serializes lazy creation).
+    void EnsureNodeHelpers(int count) {
+        while (static_cast<int>(node_helpers_.size()) < count) {
+            node_helpers_.push_back(std::make_unique<NodeTaskHelper>(static_cast<int>(node_helpers_.size()) + 1));
+        }
+    }
+
     std::vector<std::unique_ptr<ThreadPool>> thread_pools_;
+    std::vector<std::unique_ptr<NodeTaskHelper>> node_helpers_;
+    std::atomic<bool> dispatch_busy_{false};
     std::atomic<int> round_robin_counter_{0};
 };
 
@@ -648,6 +752,16 @@ ThreadPool& CpuBackend::GetThreadPool(int numa_node) {
 
 int CpuBackend::GetNumaNodeCount() const {
     return thread_manager_ ? thread_manager_->GetNumaNodeCount() : 0;
+}
+
+void CpuBackend::RunConcurrentNodeTasks(int n_tasks, const std::function<void(int)>& task) {
+    if (!thread_manager_) {
+        for (int t = 0; t < n_tasks; ++t) {
+            task(t);
+        }
+        return;
+    }
+    thread_manager_->RunConcurrentNodeTasks(n_tasks, task);
 }
 
 OpRegistry& CpuBackend::GetOpRegistry() {

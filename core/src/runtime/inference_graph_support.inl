@@ -3811,9 +3811,30 @@ static bool Qwen35GateUpQ5KRepackKernelAvailable() {
 #endif
 }
 
+// C4A opt-in: enable the i8mm-optimized ggml q4_K_8x8 repacked MoE gate/up lane
+// for small RAM-safe native-MoE models (LFM2). Default OFF. ARM-only; x86
+// returns false (referenced from non-arch-guarded code, so define on all archs).
+static bool C4ALfm2Q4KMoERepackOptIn() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_C4A_LFM2_Q4K_MOE_REPACK");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0 &&
+               std::strcmp(env, "FALSE") != 0;
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 static bool Qwen35GateUpQ4KRepackKernelAvailable() {
 #if defined(__aarch64__) || defined(_M_ARM64)
-    return false;
+    // ARM: ggml's q4_K_8x8 gemv/gemm is i8mm/dotprod-optimized (llama's kernel
+    // class) and Q4KRealPackedGemvKernelAvailable() is already true here. The
+    // C4A path is kept LFM2-only: Qwen prefill was measured slower on the
+    // repacked lane even with zero cache evictions.
+    return densecore::kernels::Q4KRealPackedGemvKernelAvailable() && C4ALfm2Q4KMoERepackOptIn();
 #else
     return densecore::kernels::Q4KRealPackedGemvKernelAvailable() && ggml_cpu_has_avx2();
 #endif
@@ -3862,7 +3883,8 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
         shared_q8->repacked_swiglu_failed.store(0, std::memory_order_relaxed);
     }
     const bool lfm2_q4k_repacked_prefill =
-        shared_q8 && shared_q8->record_lfm2_w1w3_kernel && GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill;
+        shared_q8 && shared_q8->record_lfm2_w1w3_kernel &&
+        GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill && C4ALfm2Q4KMoERepackOptIn();
     // Qwen Q5_K decode fast lane: run the loader-owned single-copy q5_K_8x8
     // layout through ggml's GEMV kernel. Do not build a runtime repack cache
     // here: keeping both raw Q5_K and q5_K_8x8 copies was the RAM wall for 35B
@@ -4287,12 +4309,25 @@ static QwenLikeNativeMoEGraphPlan ResolveQwenLikeNativeMoEGraphPlan(const Transf
 static bool ShouldUseQwenLikeGateUpQ4KRepackedSwiGLU(const QwenLikeNativeMoEGraphPlan& graph_plan,
                                                      ggml_type w1w3_type, InferenceExecutionPhase phase,
                                                      bool kernel_available) {
-    if (!graph_plan.qwen_native_moe) {
+    if (w1w3_type != GGML_TYPE_Q4_K || phase != InferenceExecutionPhase::Decode || !kernel_available) {
         return false;
     }
-    // C4 x86 validation showed the single-token LFM2 Q4_K repacked SwiGLU
-    // path regresses decode throughput versus the raw k-quant row path.
-    return w1w3_type == GGML_TYPE_Q4_K && phase == InferenceExecutionPhase::Decode && kernel_available;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // ARM (C4A): the raw decode lane is dotprod per-row; the repacked
+    // q4_K_8x8 gemv emits 8 output rows per i8mm call and amortizes the Q8_K
+    // input read, so the x86 "repack regresses decode" verdict does not carry
+    // over. Enable it for small RAM-safe native MoE (LFM2) only; keep the 35B
+    // Qwen native MoE on the raw path (its gate/up thrashes the repack cache).
+    // kernel_available only proves the kernel + some opt-in is active; re-check
+    // the LFM2 opt-in here so a Qwen-prefill-only flag cannot leak into LFM2
+    // decode.
+    return graph_plan.lfm2_native_moe && C4ALfm2Q4KMoERepackOptIn();
+#else
+    // x86: C4 validation showed the single-token LFM2 Q4_K repacked SwiGLU path
+    // regresses decode throughput versus the raw k-quant row path, so scope to
+    // Qwen native MoE only.
+    return graph_plan.qwen_native_moe;
+#endif
 }
 
 static const char* ValidateQwenLikeNativeMoERouter(

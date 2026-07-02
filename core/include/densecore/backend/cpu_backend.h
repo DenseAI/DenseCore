@@ -313,6 +313,18 @@ public:
      */
     int GetNumaNodeCount() const;
 
+    /**
+     * @brief Run task(node) for node in [0, n_tasks) concurrently
+     *
+     * Node 0 runs on the calling thread; node n > 0 runs on a persistent
+     * helper thread pinned to that NUMA node, so nested
+     * GetThreadPool(n).ParallelFor calls execute node-local. Blocks until all
+     * tasks return. Degrades to sequential execution on the calling thread
+     * when the dispatcher is busy (nested/concurrent use) or n_tasks exceeds
+     * the pool count.
+     */
+    void RunConcurrentNodeTasks(int n_tasks, const std::function<void(int)>& task);
+
     // ===========================================================================
     // CPU-Specific Accessors
     // ===========================================================================

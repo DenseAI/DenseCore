@@ -16,7 +16,7 @@ using densecore::simd::SimdLevel;
 
 int ExpectedHybridSsmChunkTokensForRuntime() {
 #if defined(__aarch64__) || defined(_M_ARM64)
-    return 64;
+    return 128;
 #else
     return 320;
 #endif

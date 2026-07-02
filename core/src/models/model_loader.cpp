@@ -3161,7 +3161,27 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
 
     int idx_eos = gguf_find_key(ctx_gguf, "tokenizer.ggml.eos_token_id");
-    if (idx_eos != -1) model->eos_token_id = gguf_get_val_u32(ctx_gguf, idx_eos);
+    if (idx_eos != -1) {
+        // Some models declare multiple EOS ids (e.g. GLM-5.x exposes
+        // [<|endoftext|>, <|user|>, <|observation|>]) as a GGUF array. Calling the
+        // scalar accessor on an array key is undefined, so read the first element
+        // as the primary EOS here; the full set is registered as stop tokens below
+        // so generation halts on any of them.
+        if (gguf_get_kv_type(ctx_gguf, idx_eos) == GGUF_TYPE_ARRAY) {
+            const gguf_type arr_type = gguf_get_arr_type(ctx_gguf, idx_eos);
+            const int n = gguf_get_arr_n(ctx_gguf, idx_eos);
+            const void* arr_data = gguf_get_arr_data(ctx_gguf, idx_eos);
+            if (arr_data && n > 0) {
+                if (arr_type == GGUF_TYPE_UINT32) {
+                    model->eos_token_id = static_cast<int32_t>(static_cast<const uint32_t*>(arr_data)[0]);
+                } else if (arr_type == GGUF_TYPE_INT32) {
+                    model->eos_token_id = static_cast<const int32_t*>(arr_data)[0];
+                }
+            }
+        } else {
+            model->eos_token_id = gguf_get_val_u32(ctx_gguf, idx_eos);
+        }
+    }
     int idx_unk = gguf_find_key(ctx_gguf, "tokenizer.ggml.unknown_token_id");
     if (idx_unk != -1) model->unk_token_id = gguf_get_val_u32(ctx_gguf, idx_unk);
     int idx_sep = gguf_find_key(ctx_gguf, "tokenizer.ggml.seperator_token_id");
@@ -3370,6 +3390,28 @@ TransformerModel* LoadGGUFModel(const char* path) {
             int idx = gguf_find_key(ctx_gguf, key);
             if (idx == -1) return;
             const gguf_type t = gguf_get_kv_type(ctx_gguf, idx);
+            if (t == GGUF_TYPE_ARRAY) {
+                // Multi-valued terminator lists (e.g. GLM-5.x eos_token_id) arrive
+                // as integer arrays; register every entry as a stop id.
+                const gguf_type arr_type = gguf_get_arr_type(ctx_gguf, idx);
+                const int n = gguf_get_arr_n(ctx_gguf, idx);
+                const void* arr_data = gguf_get_arr_data(ctx_gguf, idx);
+                if (!arr_data) return;
+                for (int i = 0; i < n; ++i) {
+                    switch (arr_type) {
+                    case GGUF_TYPE_UINT8: add_stop_id(static_cast<int32_t>(static_cast<const uint8_t*>(arr_data)[i])); break;
+                    case GGUF_TYPE_INT8: add_stop_id(static_cast<int32_t>(static_cast<const int8_t*>(arr_data)[i])); break;
+                    case GGUF_TYPE_UINT16: add_stop_id(static_cast<int32_t>(static_cast<const uint16_t*>(arr_data)[i])); break;
+                    case GGUF_TYPE_INT16: add_stop_id(static_cast<int32_t>(static_cast<const int16_t*>(arr_data)[i])); break;
+                    case GGUF_TYPE_UINT32: add_stop_id(static_cast<int32_t>(static_cast<const uint32_t*>(arr_data)[i])); break;
+                    case GGUF_TYPE_INT32: add_stop_id(static_cast<const int32_t*>(arr_data)[i]); break;
+                    case GGUF_TYPE_UINT64: add_stop_id(static_cast<int32_t>(static_cast<const uint64_t*>(arr_data)[i])); break;
+                    case GGUF_TYPE_INT64: add_stop_id(static_cast<int32_t>(static_cast<const int64_t*>(arr_data)[i])); break;
+                    default: break;
+                    }
+                }
+                return;
+            }
             switch (t) {
             case GGUF_TYPE_UINT8: add_stop_id(static_cast<int32_t>(gguf_get_val_u8(ctx_gguf, idx))); break;
             case GGUF_TYPE_INT8: add_stop_id(static_cast<int32_t>(gguf_get_val_i8(ctx_gguf, idx))); break;
@@ -3383,6 +3425,9 @@ TransformerModel* LoadGGUFModel(const char* path) {
             }
         };
 
+        // GLM-5.x and other multi-terminator models store the full EOS set as an
+        // array; harvest every id so generation stops on each terminator.
+        add_stop_key("tokenizer.ggml.eos_token_id");
         add_stop_key("tokenizer.ggml.eot_token_id");
         add_stop_key("tokenizer.ggml.eom_token_id");
         add_stop_key("tokenizer.ggml.end_of_turn_token_id");
@@ -5634,6 +5679,189 @@ static int GetNumaNodeCount() {
     return 1;  // Single node fallback
 }
 
+// ============================================================================
+// Per-Expert NUMA Partitioning for Fused MoE Expert Tensors
+// ============================================================================
+//
+// The whole-tensor rebind path above deliberately excludes fused MoE expert
+// tensors (ffn_gate_exps / ffn_up_exps / ffn_down_exps / ffn_gate_up_exps /
+// experts.*): the per-expert slices handed to the backend are ggml views that
+// hold absolute data pointers into those buffers, so swapping the backing
+// buffer would strand every view (including nested gemma4 packed views).
+//
+// Instead, expert slices are partitioned IN PLACE with move_pages(2): the
+// buffer address never changes (all views stay valid) and only the physical
+// pages of expert e's slice move to node (e % num_nodes). This is the
+// precondition that makes sticky routing meaningful: afterwards an expert's
+// weights live wholly on one node, so RegisterMoEExperts() placement
+// detection and the per-node FFN dispatch line up with reality. GGUF weights
+// are loaded with no_alloc=false (anonymous memory, not file-backed mmap),
+// so moving our own pages requires no extra privileges.
+
+static bool IsNumaExpertPartitionEnabled() {
+    const char* env = std::getenv("DENSECORE_NUMA_EXPERT_PARTITION");
+    return !(env && env[0] != '\0' && std::strcmp(env, "0") == 0);  // default ON
+}
+
+static bool IsFusedMoEExpertTensorName(const std::string& name) {
+    return name.find("_exps") != std::string::npos || name.rfind("experts.", 0) == 0 ||
+           name.find(".experts.") != std::string::npos;
+}
+
+struct NumaExpertPartitionStats {
+    size_t tensors = 0;
+    size_t expert_slices = 0;
+    size_t pages_moved = 0;
+    size_t pages_failed = 0;
+    std::vector<size_t> bytes_per_node;
+};
+
+#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+/**
+ * Move the physical pages of [base, base+bytes) to target_node in place.
+ * Interior page range only (boundaries shared with a neighboring expert stay
+ * where they are). Own anonymous pages, MPOL_MF_MOVE: no capability needed.
+ */
+static void MoveBufferPagesToNumaNode(void* base, size_t bytes, int target_node, NumaExpertPartitionStats* stats) {
+    static const long page_size = sysconf(_SC_PAGESIZE);
+    if (!base || bytes == 0 || target_node < 0 || page_size <= 0) {
+        return;
+    }
+    const uintptr_t start = (reinterpret_cast<uintptr_t>(base) + page_size - 1) & ~(page_size - 1);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(base) + bytes) & ~(page_size - 1);
+    if (end <= start) {
+        return;
+    }
+    const size_t num_pages = (end - start) / page_size;
+
+    constexpr size_t kBatch = 4096;
+    std::vector<void*> pages(std::min(num_pages, kBatch));
+    std::vector<int> nodes(pages.size(), target_node);
+    std::vector<int> status(pages.size(), -1);
+
+    for (size_t batch_start = 0; batch_start < num_pages; batch_start += kBatch) {
+        const size_t batch_size = std::min(kBatch, num_pages - batch_start);
+        for (size_t i = 0; i < batch_size; i++) {
+            pages[i] = reinterpret_cast<void*>(start + (batch_start + i) * page_size);
+            nodes[i] = target_node;
+            status[i] = -1;
+        }
+        const long result = move_pages(0, batch_size, pages.data(), nodes.data(), status.data(), MPOL_MF_MOVE);
+        if (result < 0) {
+            if (stats) stats->pages_failed += batch_size;
+            continue;
+        }
+        for (size_t i = 0; i < batch_size; i++) {
+            if (status[i] == target_node) {
+                if (stats) stats->pages_moved++;
+            } else if (status[i] < 0 && stats) {
+                stats->pages_failed++;
+            }
+        }
+    }
+    if (stats && target_node < static_cast<int>(stats->bytes_per_node.size())) {
+        stats->bytes_per_node[static_cast<size_t>(target_node)] += end - start;
+    }
+}
+#else
+static void MoveBufferPagesToNumaNode(void*, size_t, int, NumaExpertPartitionStats*) {}
+#endif
+
+/**
+ * Partition every MoE expert tensor across NUMA nodes, expert by expert.
+ *
+ * - Fused tensors (experts stacked along ne[2] or ne[3]): slice e's pages go
+ *   to node (e % num_nodes), or to pinned_node when pinned_node >= 0.
+ * - Standalone per-expert tensors (ffn_gate.N.weight style GGUFs): the whole
+ *   tensor moves to the expert's node.
+ *
+ * In-place: no data pointers change, all views remain valid.
+ */
+static void PartitionMoEExpertTensorsAcrossNumaNodes(TransformerModel* model, int num_nodes, int pinned_node) {
+    if (!model || num_nodes <= 1) {
+        return;
+    }
+    constexpr size_t kMinTensorBytes = 1024 * 1024;
+    NumaExpertPartitionStats stats;
+    stats.bytes_per_node.resize(static_cast<size_t>(num_nodes), 0);
+    std::unordered_set<const void*> visited;
+
+    const auto partition_fused = [&](struct ggml_tensor* t) {
+        if (!t || !t->data || t->view_src != nullptr) {
+            return;  // views are covered via their root tensor
+        }
+        if (!visited.insert(t->data).second) {
+            return;
+        }
+        const size_t total_bytes = ggml_nbytes(t);
+        if (total_bytes < kMinTensorBytes) {
+            return;
+        }
+        const int expert_axis = (t->ne[3] > 1) ? 3 : 2;
+        const int64_t n_experts = t->ne[expert_axis];
+        const size_t expert_stride = static_cast<size_t>(t->nb[expert_axis]);
+        if (n_experts <= 1 || expert_stride == 0 ||
+            expert_stride * static_cast<size_t>(n_experts) > total_bytes) {
+            return;
+        }
+        stats.tensors++;
+        for (int64_t e = 0; e < n_experts; ++e) {
+            const int target_node = pinned_node >= 0 ? pinned_node : static_cast<int>(e % num_nodes);
+            MoveBufferPagesToNumaNode(static_cast<char*>(t->data) + static_cast<size_t>(e) * expert_stride,
+                                      expert_stride, target_node, &stats);
+            stats.expert_slices++;
+        }
+    };
+
+    const auto partition_standalone = [&](struct ggml_tensor* t, int64_t expert_idx) {
+        if (!t || !t->data || t->view_src != nullptr) {
+            return;
+        }
+        if (!visited.insert(t->data).second) {
+            return;
+        }
+        const size_t total_bytes = ggml_nbytes(t);
+        if (total_bytes < kMinTensorBytes) {
+            return;
+        }
+        const int target_node = pinned_node >= 0 ? pinned_node : static_cast<int>(expert_idx % num_nodes);
+        stats.tensors++;
+        stats.expert_slices++;
+        MoveBufferPagesToNumaNode(t->data, total_bytes, target_node, &stats);
+    };
+
+    for (auto& layer : model->layers) {
+        // Fused stacked-expert tensors (qwen/gemma4/lfm2/glm style GGUFs).
+        for (const auto& entry : layer.tensors) {
+            if (IsFusedMoEExpertTensorName(entry.first)) {
+                partition_fused(entry.second);
+            }
+        }
+        // Standalone per-expert tensors (older per-expert GGUF layouts).
+        const size_t n_experts = layer.NumExperts();
+        for (size_t e = 0; e < n_experts; ++e) {
+            for (const char* key : {model_keys::kFfnGate, model_keys::kFfnUp, model_keys::kFfnDown}) {
+                partition_standalone(layer.GetExpert(e, key), static_cast<int64_t>(e));
+            }
+        }
+    }
+
+    if (stats.expert_slices > 0) {
+        static const long page_size_log = sysconf(_SC_PAGESIZE);
+        std::cout << "[DenseCore] NUMA expert partition (" << (pinned_node >= 0 ? "pinned" : "round-robin")
+                  << "): tensors=" << stats.tensors << " slices=" << stats.expert_slices << " moved="
+                  << (stats.pages_moved * static_cast<size_t>(std::max(1L, page_size_log)) / 1024 / 1024) << " MB";
+        if (stats.pages_failed > 0) {
+            std::cout << " failed_pages=" << stats.pages_failed;
+        }
+        std::cout << " [Distribution:";
+        for (int n = 0; n < num_nodes; ++n) {
+            std::cout << " N" << n << "=" << (stats.bytes_per_node[static_cast<size_t>(n)] / 1024 / 1024) << "MB";
+        }
+        std::cout << "]" << std::endl;
+    }
+}
+
 /**
  * Load GGUF model with NUMA-interleaved memory placement.
  *
@@ -5838,6 +6066,14 @@ TransformerModel* LoadGGUFModelNuma(const char* path, int numa_node, bool use_hu
         std::cout << " to Node " << numa_node;
     }
     std::cout << std::endl;
+
+    // Step 6: Per-expert NUMA partitioning of MoE expert tensors (in place;
+    // never touched by the whole-tensor rebind above because expert views
+    // hold absolute pointers into these buffers).
+    if (num_nodes > 1 && IsNumaExpertPartitionEnabled()) {
+        const int expert_pinned_node = (mode == NumaMode::PINNED) ? numa_node : -1;
+        PartitionMoEExpertTensorsAcrossNumaNodes(model, num_nodes, expert_pinned_node);
+    }
 
     // Optional: Verify placement for interleaved mode
     if (mode == NumaMode::INTERLEAVED && model->tok_embeddings && rebound_count > 0) {

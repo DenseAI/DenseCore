@@ -47,9 +47,15 @@ option(
 )
 option(
     DENSECORE_C4A_ENABLE_KLEIDIAI
-    "Enable ggml KleidiAI kernels on C4A builds. Keep OFF unless the Qwen3.6 quality gate passes."
+    "Enable ggml KleidiAI i8mm kernels on C4A builds. The Qwen3.5/3.6 + LFM2.5 quality gate now passes, so a single -DDENSECORE_C4A_ENABLE_KLEIDIAI=ON is enough; it pulls in the ggml fast-kernel prerequisite automatically. Still OFF by default; re-run the C4A QA sweep when enabling."
     OFF
 )
+# KleidiAI is layered on the ggml fast-kernel infrastructure, so an explicit
+# KleidiAI opt-in implies fast kernels on C4A. Done here (before the option is
+# consumed below) so callers only need the one KleidiAI flag.
+if(DENSECORE_C4A_ENABLE_KLEIDIAI)
+    set(DENSECORE_C4A_ENABLE_GGML_FASTKERNELS ON CACHE BOOL "" FORCE)
+endif()
 set(DENSECORE_C4A_MCPU "neoverse-v2" CACHE STRING "ARM -mcpu value used when DENSECORE_TARGET_C4A=ON")
 set(DENSECORE_C4A_GGML_ARCH "armv9-a+sve2+i8mm+bf16+dotprod" CACHE STRING
     "ggml -march value used when DENSECORE_TARGET_C4A=ON")
@@ -297,6 +303,12 @@ if(DENSECORE_TARGET_C4A AND NOT DENSECORE_C4A_ENABLE_GGML_FASTKERNELS)
 endif()
 if(DENSECORE_TARGET_C4A AND NOT DENSECORE_C4A_ENABLE_KLEIDIAI)
     set(DENSECORE_CAN_USE_KLEIDIAI OFF)
+endif()
+# Explicit C4A KleidiAI opt-in wins: enabling it pulls in fast kernels (above) and
+# turns on the i8mm path regardless of the ARM correctness-first default, so a
+# single -DDENSECORE_C4A_ENABLE_KLEIDIAI=ON is self-sufficient. Default stays OFF.
+if(DENSECORE_TARGET_C4A AND DENSECORE_C4A_ENABLE_KLEIDIAI)
+    set(DENSECORE_CAN_USE_KLEIDIAI ON)
 endif()
 if(NOT DEFINED GGML_CPU_KLEIDIAI)
     set(GGML_CPU_KLEIDIAI ${DENSECORE_CAN_USE_KLEIDIAI} CACHE BOOL "Enable ggml KleidiAI kernels")

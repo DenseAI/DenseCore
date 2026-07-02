@@ -180,60 +180,138 @@ bool PrepareMoESmallDecodeSharedInputCache(const MoESmallDecodeTileParallelReque
     return true;
 }
 
+// ============================================================================
+// NUMA sticky decode dispatch
+// ============================================================================
+// On multi-node hosts the assignments are partitioned by the NUMA node that
+// holds each expert's weights (as recorded by RegisterMoEExperts placement
+// detection / load-time expert partitioning), and each group runs on that
+// node's thread pool — concurrently across nodes via RunConcurrentNodeTasks.
+// Single-node hosts (or DENSECORE_MOE_STICKY_DECODE=0) keep the legacy
+// single-pool path unchanged.
+
+bool IsMoEStickyDecodeDispatchEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DENSECORE_MOE_STICKY_DECODE");
+        return !(env && env[0] != '\0' && std::strcmp(env, "0") == 0);  // default ON
+    }();
+    return enabled;
+}
+
+struct MoESmallDecodeNodePartition {
+    bool active = false;
+    int num_nodes = 0;
+    std::vector<std::vector<int>> node_assignments;
+};
+
+void BuildMoESmallDecodeNodePartition(const MoESmallDecodeTileParallelRequest& req,
+                                      MoESmallDecodeNodePartition* partition) {
+    partition->active = false;
+    if (!req.backend || !req.profiler || !IsMoEStickyDecodeDispatchEnabled()) {
+        return;
+    }
+    const int num_nodes = req.backend->GetNumaNodeCount();
+    if (num_nodes <= 1) {
+        return;
+    }
+    partition->num_nodes = num_nodes;
+    partition->node_assignments.assign(static_cast<size_t>(num_nodes), {});
+    for (int assignment = 0; assignment < req.total_assignments; ++assignment) {
+        const int expert_id = req.routing->expert_ids[static_cast<size_t>(assignment)];
+        int node = (expert_id >= 0 && expert_id < req.num_experts) ? req.profiler->GetExpertNumaNode(expert_id) : -1;
+        if (node < 0 || node >= num_nodes) {
+            node = assignment % num_nodes;  // unknown placement: spread for aggregate bandwidth
+        }
+        partition->node_assignments[static_cast<size_t>(node)].push_back(assignment);
+    }
+    partition->active = true;
+    static std::atomic<bool> logged{false};
+    bool expected = false;
+    if (logged.compare_exchange_strong(expected, true)) {
+        std::fprintf(stderr, "[NUMA] MoE sticky decode dispatch active (nodes=%d)\n", num_nodes);
+    }
+}
+
+inline void MoESmallDecodeGateUpUnit(const MoESmallDecodeTileParallelRequest& req, int assignment, int split,
+                                     int gate_splits, float* assignment_hiddens,
+                                     QuantizedProjectionInputCache* shared_input_cache,
+                                     std::atomic<bool>* tile_ok) {
+    const int expert_id = req.routing->expert_ids[static_cast<size_t>(assignment)];
+    if (expert_id < 0 || expert_id >= req.num_experts) {
+        return;
+    }
+    const int token_idx = MoESmallDecodeTokenIndex(req, assignment);
+    if (token_idx < 0 || token_idx >= req.batch_size) {
+        return;
+    }
+
+    const CpuBackend::ExpertWeights& exp = req.experts[static_cast<size_t>(expert_id)];
+    const int64_t tile_start = (req.intermediate_dim * split) / gate_splits;
+    const int64_t tile_end = (req.intermediate_dim * (split + 1)) / gate_splits;
+    const int64_t tile_rows = tile_end - tile_start;
+    if (tile_rows <= 0) {
+        return;
+    }
+    const size_t gate_row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w1_type), req.hidden_dim);
+    const size_t up_row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w3_type), req.hidden_dim);
+    const char* gate_ptr = static_cast<const char*>(exp.w1.ptr) + static_cast<ptrdiff_t>(tile_start * gate_row_bytes);
+    const char* up_ptr = static_cast<const char*>(exp.w3.ptr) + static_cast<ptrdiff_t>(tile_start * up_row_bytes);
+    Tensor expert_input =
+        Tensor::Make2D(const_cast<float*>(req.input_data + static_cast<size_t>(token_idx) * req.hidden_dim),
+                       1, req.hidden_dim);
+    float* hidden_tile = assignment_hiddens +
+                         static_cast<size_t>(assignment) * static_cast<size_t>(req.intermediate_dim) +
+                         static_cast<size_t>(tile_start);
+    Tensor hidden_tensor = Tensor::Make2D(hidden_tile, 1, tile_rows);
+    QuantizedProjectionInputCache local_input_projection_cache;
+    QuantizedProjectionInputCache* unit_input_projection_cache =
+        (shared_input_cache && CanUseSharedDecodeInputCacheForExpert(exp, shared_input_cache->type))
+            ? shared_input_cache
+            : &local_input_projection_cache;
+    const int expert_numa_node = req.profiler ? req.profiler->GetExpertNumaNode(expert_id) : -1;
+    const bool gate_up_ok =
+        exp.use_gelu_activation
+            ? TryRunGgmlQuantizedFusedGEGLUProjection(req.backend, gate_ptr, exp.w1_type, up_ptr, exp.w3_type,
+                                                      expert_input, &hidden_tensor, tile_rows, req.hidden_dim,
+                                                      expert_numa_node, /*allow_parallel=*/false,
+                                                      unit_input_projection_cache)
+            : TryRunGgmlQuantizedFusedSwiGLUProjection(req.backend, gate_ptr, exp.w1_type, up_ptr, exp.w3_type,
+                                                       expert_input, &hidden_tensor, tile_rows, req.hidden_dim,
+                                                       expert_numa_node, /*allow_parallel=*/false,
+                                                       unit_input_projection_cache);
+    if (!gate_up_ok) {
+        tile_ok->store(false, std::memory_order_relaxed);
+    }
+}
+
 void RunMoESmallDecodeTileGateUp(const MoESmallDecodeTileParallelRequest& req, int gate_splits,
                                  float* assignment_hiddens,
                                  QuantizedProjectionInputCache* shared_input_cache,
-                                 std::atomic<bool>* tile_ok) {
+                                 std::atomic<bool>* tile_ok,
+                                 const MoESmallDecodeNodePartition* partition = nullptr) {
+    if (partition && partition->active) {
+        req.backend->RunConcurrentNodeTasks(partition->num_nodes, [&](int node) {
+            const std::vector<int>& group = partition->node_assignments[static_cast<size_t>(node)];
+            if (group.empty()) {
+                return;
+            }
+            const int group_units = static_cast<int>(group.size()) * gate_splits;
+            req.backend->GetThreadPool(node).ParallelFor(group_units, [&](int unit_start, int unit_end,
+                                                                          int /*thread_id*/) {
+                for (int unit = unit_start; unit < unit_end && tile_ok->load(std::memory_order_relaxed); ++unit) {
+                    MoESmallDecodeGateUpUnit(req, group[static_cast<size_t>(unit / gate_splits)], unit % gate_splits,
+                                             gate_splits, assignment_hiddens, shared_input_cache, tile_ok);
+                }
+            });
+        });
+        return;
+    }
     req.pool->ParallelFor(req.total_assignments * gate_splits, [&](int unit_start, int unit_end, int /*thread_id*/) {
         for (int unit = unit_start; unit < unit_end && tile_ok->load(std::memory_order_relaxed); ++unit) {
             const int assignment = unit / gate_splits;
             const int split = unit - assignment * gate_splits;
-            const int expert_id = req.routing->expert_ids[static_cast<size_t>(assignment)];
-            if (expert_id < 0 || expert_id >= req.num_experts) {
-                continue;
-            }
-            const int token_idx = MoESmallDecodeTokenIndex(req, assignment);
-            if (token_idx < 0 || token_idx >= req.batch_size) {
-                continue;
-            }
-
-            const CpuBackend::ExpertWeights& exp = req.experts[static_cast<size_t>(expert_id)];
-            const int64_t tile_start = (req.intermediate_dim * split) / gate_splits;
-            const int64_t tile_end = (req.intermediate_dim * (split + 1)) / gate_splits;
-            const int64_t tile_rows = tile_end - tile_start;
-            if (tile_rows <= 0) {
-                continue;
-            }
-            const size_t gate_row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w1_type), req.hidden_dim);
-            const size_t up_row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w3_type), req.hidden_dim);
-            const char* gate_ptr = static_cast<const char*>(exp.w1.ptr) + static_cast<ptrdiff_t>(tile_start * gate_row_bytes);
-            const char* up_ptr = static_cast<const char*>(exp.w3.ptr) + static_cast<ptrdiff_t>(tile_start * up_row_bytes);
-            Tensor expert_input =
-                Tensor::Make2D(const_cast<float*>(req.input_data + static_cast<size_t>(token_idx) * req.hidden_dim),
-                               1, req.hidden_dim);
-            float* hidden_tile = assignment_hiddens +
-                                 static_cast<size_t>(assignment) * static_cast<size_t>(req.intermediate_dim) +
-                                 static_cast<size_t>(tile_start);
-            Tensor hidden_tensor = Tensor::Make2D(hidden_tile, 1, tile_rows);
-            QuantizedProjectionInputCache local_input_projection_cache;
-            QuantizedProjectionInputCache* unit_input_projection_cache =
-                (shared_input_cache && CanUseSharedDecodeInputCacheForExpert(exp, shared_input_cache->type))
-                    ? shared_input_cache
-                    : &local_input_projection_cache;
-            const int expert_numa_node = req.profiler ? req.profiler->GetExpertNumaNode(expert_id) : -1;
-            const bool gate_up_ok =
-                exp.use_gelu_activation
-                    ? TryRunGgmlQuantizedFusedGEGLUProjection(req.backend, gate_ptr, exp.w1_type, up_ptr, exp.w3_type,
-                                                              expert_input, &hidden_tensor, tile_rows, req.hidden_dim,
-                                                              expert_numa_node, /*allow_parallel=*/false,
-                                                              unit_input_projection_cache)
-                    : TryRunGgmlQuantizedFusedSwiGLUProjection(req.backend, gate_ptr, exp.w1_type, up_ptr, exp.w3_type,
-                                                               expert_input, &hidden_tensor, tile_rows, req.hidden_dim,
-                                                               expert_numa_node, /*allow_parallel=*/false,
-                                                               unit_input_projection_cache);
-            if (!gate_up_ok) {
-                tile_ok->store(false, std::memory_order_relaxed);
-            }
+            MoESmallDecodeGateUpUnit(req, assignment, split, gate_splits, assignment_hiddens, shared_input_cache,
+                                     tile_ok);
         }
     });
 }
@@ -266,53 +344,80 @@ bool QuantizeMoESmallDecodeHiddenRows(const MoESmallDecodeTileParallelRequest& r
     return true;
 }
 
+inline void MoESmallDecodeDownUnit(const MoESmallDecodeTileParallelRequest& req, int assignment, int split,
+                                   int down_splits, const float* assignment_hiddens, float* assignment_outputs,
+                                   std::vector<QuantizedProjectionInputCache>* down_input_caches,
+                                   std::atomic<bool>* tile_ok) {
+    const int expert_id = req.routing->expert_ids[static_cast<size_t>(assignment)];
+    if (expert_id < 0 || expert_id >= req.num_experts) {
+        return;
+    }
+    const int token_idx = MoESmallDecodeTokenIndex(req, assignment);
+    if (token_idx < 0 || token_idx >= req.batch_size) {
+        return;
+    }
+
+    const CpuBackend::ExpertWeights& exp = req.experts[static_cast<size_t>(expert_id)];
+    const int64_t tile_start = (req.hidden_dim * split) / down_splits;
+    const int64_t tile_end = (req.hidden_dim * (split + 1)) / down_splits;
+    const int64_t tile_rows = tile_end - tile_start;
+    if (tile_rows <= 0) {
+        return;
+    }
+    const size_t down_row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w2_type), req.intermediate_dim);
+    const char* down_ptr =
+        static_cast<const char*>(exp.w2.ptr) + static_cast<ptrdiff_t>(tile_start * down_row_bytes);
+    Tensor hidden_tensor = Tensor::Make2D(
+        const_cast<float*>(assignment_hiddens +
+                           static_cast<size_t>(assignment) * static_cast<size_t>(req.intermediate_dim)),
+        1, req.intermediate_dim);
+    float* output_tile = assignment_outputs + static_cast<size_t>(assignment) * static_cast<size_t>(req.hidden_dim) +
+                         static_cast<size_t>(tile_start);
+    Tensor output_tensor = Tensor::Make2D(output_tile, 1, tile_rows);
+    QuantizedProjectionInputCache local_down_input_projection_cache;
+    QuantizedProjectionInputCache* down_input_projection_cache =
+        QuantizedProjectionInputTypeMatches(exp.w2_type, (*down_input_caches)[static_cast<size_t>(assignment)].type)
+            ? &(*down_input_caches)[static_cast<size_t>(assignment)]
+            : &local_down_input_projection_cache;
+    const int expert_numa_node = req.profiler ? req.profiler->GetExpertNumaNode(expert_id) : -1;
+    if (!TryRunGgmlQuantizedProjection(req.backend, down_ptr, exp.w2_type, hidden_tensor, &output_tensor,
+                                       tile_rows, req.intermediate_dim, expert_numa_node,
+                                       /*allow_parallel=*/false, down_input_projection_cache)) {
+        tile_ok->store(false, std::memory_order_relaxed);
+    } else if (exp.w2_scale_tensor != nullptr) {
+        ApplyScalarScaleToTensor(&output_tensor, ReadScalarScaleSidecar(exp.w2_scale_tensor));
+    }
+}
+
 void RunMoESmallDecodeTileDown(const MoESmallDecodeTileParallelRequest& req, int down_splits,
                                const float* assignment_hiddens, float* assignment_outputs,
                                std::vector<QuantizedProjectionInputCache>* down_input_caches,
-                               std::atomic<bool>* tile_ok) {
+                               std::atomic<bool>* tile_ok,
+                               const MoESmallDecodeNodePartition* partition = nullptr) {
+    if (partition && partition->active) {
+        req.backend->RunConcurrentNodeTasks(partition->num_nodes, [&](int node) {
+            const std::vector<int>& group = partition->node_assignments[static_cast<size_t>(node)];
+            if (group.empty()) {
+                return;
+            }
+            const int group_units = static_cast<int>(group.size()) * down_splits;
+            req.backend->GetThreadPool(node).ParallelFor(group_units, [&](int unit_start, int unit_end,
+                                                                          int /*thread_id*/) {
+                for (int unit = unit_start; unit < unit_end && tile_ok->load(std::memory_order_relaxed); ++unit) {
+                    MoESmallDecodeDownUnit(req, group[static_cast<size_t>(unit / down_splits)], unit % down_splits,
+                                           down_splits, assignment_hiddens, assignment_outputs, down_input_caches,
+                                           tile_ok);
+                }
+            });
+        });
+        return;
+    }
     req.pool->ParallelFor(req.total_assignments * down_splits, [&](int unit_start, int unit_end, int /*thread_id*/) {
         for (int unit = unit_start; unit < unit_end && tile_ok->load(std::memory_order_relaxed); ++unit) {
             const int assignment = unit / down_splits;
             const int split = unit - assignment * down_splits;
-            const int expert_id = req.routing->expert_ids[static_cast<size_t>(assignment)];
-            if (expert_id < 0 || expert_id >= req.num_experts) {
-                continue;
-            }
-            const int token_idx = MoESmallDecodeTokenIndex(req, assignment);
-            if (token_idx < 0 || token_idx >= req.batch_size) {
-                continue;
-            }
-
-            const CpuBackend::ExpertWeights& exp = req.experts[static_cast<size_t>(expert_id)];
-            const int64_t tile_start = (req.hidden_dim * split) / down_splits;
-            const int64_t tile_end = (req.hidden_dim * (split + 1)) / down_splits;
-            const int64_t tile_rows = tile_end - tile_start;
-            if (tile_rows <= 0) {
-                continue;
-            }
-            const size_t down_row_bytes = ggml_row_size(static_cast<ggml_type>(exp.w2_type), req.intermediate_dim);
-            const char* down_ptr =
-                static_cast<const char*>(exp.w2.ptr) + static_cast<ptrdiff_t>(tile_start * down_row_bytes);
-            Tensor hidden_tensor = Tensor::Make2D(
-                const_cast<float*>(assignment_hiddens +
-                                   static_cast<size_t>(assignment) * static_cast<size_t>(req.intermediate_dim)),
-                1, req.intermediate_dim);
-            float* output_tile = assignment_outputs + static_cast<size_t>(assignment) * static_cast<size_t>(req.hidden_dim) +
-                                 static_cast<size_t>(tile_start);
-            Tensor output_tensor = Tensor::Make2D(output_tile, 1, tile_rows);
-            QuantizedProjectionInputCache local_down_input_projection_cache;
-            QuantizedProjectionInputCache* down_input_projection_cache =
-                QuantizedProjectionInputTypeMatches(exp.w2_type, (*down_input_caches)[static_cast<size_t>(assignment)].type)
-                    ? &(*down_input_caches)[static_cast<size_t>(assignment)]
-                    : &local_down_input_projection_cache;
-            const int expert_numa_node = req.profiler ? req.profiler->GetExpertNumaNode(expert_id) : -1;
-            if (!TryRunGgmlQuantizedProjection(req.backend, down_ptr, exp.w2_type, hidden_tensor, &output_tensor,
-                                               tile_rows, req.intermediate_dim, expert_numa_node,
-                                               /*allow_parallel=*/false, down_input_projection_cache)) {
-                tile_ok->store(false, std::memory_order_relaxed);
-            } else if (exp.w2_scale_tensor != nullptr) {
-                ApplyScalarScaleToTensor(&output_tensor, ReadScalarScaleSidecar(exp.w2_scale_tensor));
-            }
+            MoESmallDecodeDownUnit(req, assignment, split, down_splits, assignment_hiddens, assignment_outputs,
+                                   down_input_caches, tile_ok);
         }
     });
 }
@@ -406,17 +511,20 @@ bool TryExecuteMoESmallDecodeQuantizedTileParallel(const MoESmallDecodeTileParal
     PrepareMoESmallDecodeSharedInputCache(req, &shared_decode_input_projection_cache,
                                           &shared_decode_input_projection_cache_ptr);
 
+    MoESmallDecodeNodePartition node_partition;
+    BuildMoESmallDecodeNodePartition(req, &node_partition);
+
     std::atomic<bool> tile_ok{true};
     LogSmallDecodeExecutionPath("quantized_tile_parallel", req.total_assignments, req.worker_cap, req.batch_size);
     RunMoESmallDecodeTileGateUp(req, gate_splits, assignment_hiddens, shared_decode_input_projection_cache_ptr,
-                                &tile_ok);
+                                &tile_ok, &node_partition);
     if (tile_ok.load(std::memory_order_relaxed) &&
         !QuantizeMoESmallDecodeHiddenRows(req, assignment_hiddens, down_input_projection_caches_ptr)) {
         tile_ok.store(false, std::memory_order_relaxed);
     }
     if (tile_ok.load(std::memory_order_relaxed)) {
         RunMoESmallDecodeTileDown(req, down_splits, assignment_hiddens, assignment_outputs, down_input_projection_caches_ptr,
-                                  &tile_ok);
+                                  &tile_ok, &node_partition);
     }
     if (!tile_ok.load(std::memory_order_relaxed)) {
         return false;
