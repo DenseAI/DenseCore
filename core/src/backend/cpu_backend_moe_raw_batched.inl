@@ -309,7 +309,66 @@ bool ComputeMoEQ4KQ8KBatchedRowPairDotprod(const void* gate_weight_row, const vo
         prepare(gate_blocks[bi], &gate);
         prepare(up_blocks[bi], &up);
 
-        for (int m = 0; m < M; ++m) {
+        int m = 0;
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+        for (; m + 1 < M; m += 2) {
+            const auto* q8_blocks0 =
+                reinterpret_cast<const MoEBlockQ8K*>(quant_input_base + static_cast<size_t>(m) * quant_row_stride);
+            const auto* q8_blocks1 = reinterpret_cast<const MoEBlockQ8K*>(
+                quant_input_base + static_cast<size_t>(m + 1) * quant_row_stride);
+            const auto& yb0 = q8_blocks0[bi];
+            const auto& yb1 = q8_blocks1[bi];
+
+            int32_t gate_min_dot0 = 0;
+            int32_t up_min_dot0 = 0;
+            int32_t gate_min_dot1 = 0;
+            int32_t up_min_dot1 = 0;
+            for (int j = 0; j < QK_K / 16; ++j) {
+                const int32_t q8_sum0 = static_cast<int32_t>(yb0.bsums[j]);
+                const int32_t q8_sum1 = static_cast<int32_t>(yb1.bsums[j]);
+                const int32_t gate_min = static_cast<int32_t>(gate.mins[j / 2]);
+                const int32_t up_min = static_cast<int32_t>(up.mins[j / 2]);
+                gate_min_dot0 += q8_sum0 * gate_min;
+                up_min_dot0 += q8_sum0 * up_min;
+                gate_min_dot1 += q8_sum1 * gate_min;
+                up_min_dot1 += q8_sum1 * up_min;
+            }
+
+            int32x4_t dot_scaled = vdupq_n_s32(0);
+            for (int group = 0; group < QK_K / 32; ++group) {
+                int32x4_t dot = vdupq_n_s32(0);
+                const int8_t* q8_0 = yb0.qs + group * 32;
+                const int8_t* q8_1 = yb1.qs + group * 32;
+                for (int half = 0; half < 2; ++half) {
+                    const int8x16_t weights =
+                        vcombine_s8(vget_low_s8(gate.quants[group][half]), vget_low_s8(up.quants[group][half]));
+                    const int8x16_t inputs =
+                        vcombine_s8(vld1_s8(q8_0 + half * 16), vld1_s8(q8_1 + half * 16));
+                    dot = vmmlaq_s32(dot, inputs, weights);
+
+                    const int8x16_t weights_hi =
+                        vcombine_s8(vget_high_s8(gate.quants[group][half]), vget_high_s8(up.quants[group][half]));
+                    const int8x16_t inputs_hi =
+                        vcombine_s8(vld1_s8(q8_0 + half * 16 + 8), vld1_s8(q8_1 + half * 16 + 8));
+                    dot = vmmlaq_s32(dot, inputs_hi, weights_hi);
+                }
+                const int32_t scales[4] = {
+                    static_cast<int32_t>(gate.scales[group]), static_cast<int32_t>(up.scales[group]),
+                    static_cast<int32_t>(gate.scales[group]), static_cast<int32_t>(up.scales[group])};
+                dot_scaled = vmlaq_s32(dot_scaled, dot, vld1q_s32(scales));
+            }
+
+            gate_out_sums[m] += gate.d * yb0.d * static_cast<float>(vgetq_lane_s32(dot_scaled, 0)) -
+                                gate.dmin * yb0.d * static_cast<float>(gate_min_dot0);
+            up_out_sums[m] += up.d * yb0.d * static_cast<float>(vgetq_lane_s32(dot_scaled, 1)) -
+                              up.dmin * yb0.d * static_cast<float>(up_min_dot0);
+            gate_out_sums[m + 1] += gate.d * yb1.d * static_cast<float>(vgetq_lane_s32(dot_scaled, 2)) -
+                                    gate.dmin * yb1.d * static_cast<float>(gate_min_dot1);
+            up_out_sums[m + 1] += up.d * yb1.d * static_cast<float>(vgetq_lane_s32(dot_scaled, 3)) -
+                                  up.dmin * yb1.d * static_cast<float>(up_min_dot1);
+        }
+#endif
+        for (; m < M; ++m) {
             const auto* q8_blocks =
                 reinterpret_cast<const MoEBlockQ8K*>(quant_input_base + static_cast<size_t>(m) * quant_row_stride);
             const auto& yb = q8_blocks[bi];
@@ -1077,6 +1136,99 @@ bool ComputeMoEQ5KQ8KBatchedRowScalar(const void* weight_row, const uint8_t* qua
     return true;
 }
 
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+bool ComputeMoEQ5KQ8KBatchedRowDotprod(const void* weight_row, const uint8_t* quant_input_base,
+                                       size_t quant_row_stride, int M, int K, float* out_sums) {
+    if (!weight_row || !quant_input_base || !out_sums || M <= 0 || M > kMoEQuantizedProjectionMaxBatch || K <= 0 ||
+        (K % QK_K) != 0 || QK_K != 256) {
+        return false;
+    }
+    const int nb = K / QK_K;
+    if (quant_row_stride < sizeof(MoEBlockQ8K) * static_cast<size_t>(nb)) {
+        return false;
+    }
+
+    const auto* q5_blocks = reinterpret_cast<const MoEBlockQ5K*>(weight_row);
+    alignas(64) std::array<float, kMoEQuantizedProjectionMaxBatch> sums{};
+    static constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    static constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    static constexpr uint32_t kmask3 = 0x03030303;
+    const uint8x16_t low_mask = vdupq_n_u8(0x0F);
+    const uint8x16_t zero = vdupq_n_u8(0);
+    const uint8x16_t high_value = vdupq_n_u8(16);
+
+    for (int bi = 0; bi < nb; ++bi) {
+        const auto& xb = q5_blocks[bi];
+        uint32_t utmp[4];
+        std::memcpy(utmp, xb.scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const auto* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
+        const auto* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
+        const float q5_d = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.d));
+        const float q5_dmin = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(xb.dmin));
+
+        int8x16_t q5_vec[QK_K / 32][2];
+        const uint8_t* q5 = xb.qs;
+        const uint8_t* qh = xb.qh;
+        uint8_t high_mask = 1;
+        for (int chunk = 0; chunk < QK_K / 64; ++chunk) {
+            const uint8x16_t packed0 = vld1q_u8(q5);
+            const uint8x16_t packed1 = vld1q_u8(q5 + 16);
+            const uint8x16_t high0 = vld1q_u8(qh);
+            const uint8x16_t high1 = vld1q_u8(qh + 16);
+            q5 += 32;
+
+            uint8x16_t mask = vdupq_n_u8(high_mask);
+            uint8x16_t add0 = vandq_u8(vcgtq_u8(vandq_u8(high0, mask), zero), high_value);
+            uint8x16_t add1 = vandq_u8(vcgtq_u8(vandq_u8(high1, mask), zero), high_value);
+            q5_vec[2 * chunk][0] = vreinterpretq_s8_u8(vaddq_u8(vandq_u8(packed0, low_mask), add0));
+            q5_vec[2 * chunk][1] = vreinterpretq_s8_u8(vaddq_u8(vandq_u8(packed1, low_mask), add1));
+
+            high_mask <<= 1;
+            mask = vdupq_n_u8(high_mask);
+            add0 = vandq_u8(vcgtq_u8(vandq_u8(high0, mask), zero), high_value);
+            add1 = vandq_u8(vcgtq_u8(vandq_u8(high1, mask), zero), high_value);
+            q5_vec[2 * chunk + 1][0] = vreinterpretq_s8_u8(vaddq_u8(vshrq_n_u8(packed0, 4), add0));
+            q5_vec[2 * chunk + 1][1] = vreinterpretq_s8_u8(vaddq_u8(vshrq_n_u8(packed1, 4), add1));
+            high_mask <<= 1;
+        }
+
+        for (int m = 0; m < M; ++m) {
+            const auto* q8_blocks =
+                reinterpret_cast<const MoEBlockQ8K*>(quant_input_base + static_cast<size_t>(m) * quant_row_stride);
+            const auto& yb = q8_blocks[bi];
+
+            int32_t min_dot = 0;
+            for (int j = 0; j < QK_K / 16; ++j) {
+                min_dot += static_cast<int32_t>(yb.bsums[j]) * static_cast<int32_t>(mins[j / 2]);
+            }
+
+            int32_t dot_scaled = 0;
+            const int8_t* q8 = yb.qs;
+            for (int group = 0; group < QK_K / 32; ++group) {
+                int32x4_t acc = vdupq_n_s32(0);
+                acc = vdotq_s32(acc, vld1q_s8(q8 + group * 32), q5_vec[group][0]);
+                acc = vdotq_s32(acc, vld1q_s8(q8 + group * 32 + 16), q5_vec[group][1]);
+                dot_scaled += static_cast<int32_t>(scales[group]) * vaddvq_s32(acc);
+            }
+
+            const float d = q5_d * yb.d;
+            const float dmin = q5_dmin * yb.d;
+            sums[static_cast<size_t>(m)] +=
+                d * static_cast<float>(dot_scaled) - dmin * static_cast<float>(min_dot);
+        }
+    }
+
+    std::copy_n(sums.begin(), M, out_sums);
+    return true;
+}
+#endif
+
 #if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
 bool ComputeMoEQ5KQ8KBatchedRowAvx2(const void* weight_row, const uint8_t* quant_input_base, size_t quant_row_stride,
                                     int M, int K, float* out_sums) {
@@ -1183,6 +1335,11 @@ bool ComputeMoEQ5KQ8KBatchedRowAvx2(const void* weight_row, const uint8_t* quant
 
 bool ComputeMoEQ5KQ8KBatchedRow(const void* weight_row, const uint8_t* quant_input_base, size_t quant_row_stride, int M,
                                 int K, float* out_sums) {
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+    if (ComputeMoEQ5KQ8KBatchedRowDotprod(weight_row, quant_input_base, quant_row_stride, M, K, out_sums)) {
+        return true;
+    }
+#endif
 #if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
     if (ggml_cpu_has_avx2() &&
         ComputeMoEQ5KQ8KBatchedRowAvx2(weight_row, quant_input_base, quant_row_stride, M, K, out_sums)) {

@@ -77,7 +77,11 @@ MoEInt4PathHistogram& GetMoEInt4PathHistogram() {
 }
 
 constexpr int64_t kMoEQuantizedProjectionMaxBatch = 256;
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+constexpr int kMoEQ4KRawBatchedTileM = 16;
+#else
 constexpr int kMoEQ4KRawBatchedTileM = 8;
+#endif
 
 inline float GeluTanhApprox(float x);
 const std::array<float, 1 << 16>& GetGeluF16LookupTable();

@@ -210,7 +210,11 @@ TEST_F(MoEOpsTest, Q5KRawBatchedFusedSwiGLUMatchesDequantizedReference) {
 }
 
 TEST_F(MoEOpsTest, Q4KRawBatchedFusedSwiGLUMatchesVecDot) {
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+    constexpr int64_t M = 16;
+#else
     constexpr int64_t M = 8;
+#endif
     constexpr int64_t K = 256;
     constexpr int64_t N = 32;
 
@@ -453,6 +457,44 @@ TEST_F(MoEOpsTest, Q5KRawBatchedProjectionMatchesDequantizedReference) {
             EXPECT_NEAR(actual[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)], expected,
                         7e-3f)
                 << "m=" << m << " n=" << n;
+        }
+    }
+}
+
+TEST_F(MoEOpsTest, Q5KRawBatchedProjectionMatchesReferenceAcrossPrefillBatches) {
+    struct Case {
+        int64_t M;
+        int64_t K;
+    };
+    constexpr Case cases[] = {
+        {2, 256}, {4, 512}, {8, 256}, {16, 512}, {64, 256}, {128, 512}, {192, 256},
+    };
+    constexpr int64_t N = 3;
+
+    CpuBackend& backend = GetCpuBackend();
+    for (const Case& c : cases) {
+        const std::vector<float> weight_f32 = MakePatternedFloats(N, c.K, 0.015f);
+        const std::vector<float> input_f32 = MakePatternedFloats(c.M, c.K, 0.009f);
+
+        std::vector<uint8_t> qweight;
+        std::vector<uint8_t> qinput;
+        QuantizeRowsCpu(GGML_TYPE_Q5_K, weight_f32, N, c.K, &qweight);
+        QuantizeRowsCpu(GGML_TYPE_Q8_K, input_f32, c.M, c.K, &qinput);
+
+        std::vector<float> actual(static_cast<size_t>(c.M) * static_cast<size_t>(N), 0.0f);
+        ASSERT_TRUE(RunMoEKQuantRawBatchedProjection(
+            &backend, static_cast<int>(GGML_TYPE_Q5_K), qweight.data(), qinput.data(),
+            ggml_row_size(GGML_TYPE_Q8_K, c.K), actual.data(), c.M, N, c.K,
+            /*numa_node=*/0, /*allow_parallel=*/true))
+            << "M=" << c.M << " K=" << c.K;
+
+        for (int64_t m = 0; m < c.M; ++m) {
+            for (int64_t n = 0; n < N; ++n) {
+                const float expected = DequantizedQuantDotReference(GGML_TYPE_Q5_K, qweight, qinput, n, m, c.K);
+                EXPECT_NEAR(actual[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)], expected,
+                            7e-3f)
+                    << "M=" << c.M << " K=" << c.K << " m=" << m << " n=" << n;
+            }
         }
     }
 }

@@ -153,7 +153,11 @@ static void DenseCoreForEachQ8_0_4x8Q8_0DotGeneric(int n, const void* packed_wei
     const auto* packed_base = static_cast<const uint8_t*>(packed_weight);
     const auto* input_blocks = static_cast<const block_q8_0*>(q8_input);
     for (int group = 0; group < nc / 4; ++group) {
+#if defined(DENSECORE_Q8_4X8_NEON_I8MM)
+        float32x4_t sum_vec = vdupq_n_f32(0.0f);
+#else
         float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#endif
         const auto* group_base = packed_base + static_cast<size_t>(group) * static_cast<size_t>(nb) * packed_block_bytes;
         for (int b = 0; b < nb; ++b) {
             const auto* block_base = group_base + static_cast<size_t>(b) * packed_block_bytes;
@@ -161,13 +165,28 @@ static void DenseCoreForEachQ8_0_4x8Q8_0DotGeneric(int n, const void* packed_wei
             const auto* qs = reinterpret_cast<const int8_t*>(block_base + 4 * sizeof(ggml_fp16_t));
             const block_q8_0& x = input_blocks[b];
             const float input_scale = DenseCoreFp16ToFp32Fast(x.d);
+#if !defined(DENSECORE_Q8_4X8_NEON_I8MM)
             const float row_scale[4] = {
                 DenseCoreFp16ToFp32Fast(scales[0]),
                 DenseCoreFp16ToFp32Fast(scales[1]),
                 DenseCoreFp16ToFp32Fast(scales[2]),
                 DenseCoreFp16ToFp32Fast(scales[3]),
             };
-#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__AVX2__)
+#endif
+#if defined(DENSECORE_Q8_4X8_NEON_I8MM)
+            int32x4_t acc01 = vdupq_n_s32(0);
+            int32x4_t acc23 = vdupq_n_s32(0);
+            for (int chunk = 0; chunk < QK8_0 / 8; ++chunk) {
+                const int8x8_t input_chunk = vld1_s8(x.qs + chunk * 8);
+                const int8x16_t input_pair = vcombine_s8(input_chunk, input_chunk);
+                acc01 = vmmlaq_s32(acc01, input_pair, vld1q_s8(qs + chunk * 32));
+                acc23 = vmmlaq_s32(acc23, input_pair, vld1q_s8(qs + chunk * 32 + 16));
+            }
+            const int32x4_t dots = vcombine_s32(vget_low_s32(acc01), vget_low_s32(acc23));
+            const float32x4_t row_scale =
+                vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(scales)));
+            sum_vec = vfmaq_f32(sum_vec, vcvtq_f32_s32(dots), vmulq_n_f32(row_scale, input_scale));
+#elif (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__AVX2__)
             sum[0] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowAVX2(qs, 0, x.qs)) * row_scale[0] *
                       input_scale;
             sum[1] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowAVX2(qs, 1, x.qs)) * row_scale[1] *
@@ -195,6 +214,10 @@ static void DenseCoreForEachQ8_0_4x8Q8_0DotGeneric(int n, const void* packed_wei
             }
 #endif
         }
+#if defined(DENSECORE_Q8_4X8_NEON_I8MM)
+        float sum[4];
+        vst1q_f32(sum, sum_vec);
+#endif
         for (int row = 0; row < 4; ++row) {
             visit(row_offset + group * 4 + row, sum[row]);
         }
