@@ -2188,7 +2188,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
         }
 
         bool used_fused_pre_ffn_norm = false;
-        const bool use_fused_pre_ffn_norm = model->variant == ModelVariant::QWEN35;
+        const bool use_fused_pre_ffn_norm =
+            model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36;
         if (use_fused_pre_ffn_norm && attn_out && inpL && attn_out->type == GGML_TYPE_F32 &&
             inpL->type == GGML_TYPE_F32 && ffn_norm->type == GGML_TYPE_F32 && ffn_norm->data) {
             AddRMSNormUserData* fused_ud = GetAddRMSNormUserData();

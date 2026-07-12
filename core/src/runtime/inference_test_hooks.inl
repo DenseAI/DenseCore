@@ -1676,4 +1676,12 @@ bool ShouldUseQwenLikeGateUpQ4KRepackedSwiGLUForTest(bool qwen_native_moe, bool 
     return ::ShouldUseQwenLikeGateUpQ4KRepackedSwiGLU(graph_plan, GGML_TYPE_Q4_K,
                                                       static_cast<InferenceExecutionPhase>(phase), kernel_available);
 }
+
+bool ShouldUseQwenHybridSSMQ8RepackedBatchedForTest(bool relevant, int tokens) {
+    return ::ShouldUseQwenHybridSSMQ8RepackedBatched(relevant, tokens);
+}
+
+bool ShouldUseQwenHybridSSMQ8DirectBatchedForTest(bool relevant, int tokens) {
+    return ::ShouldUseQwenHybridSSMQ8DirectBatched(relevant, tokens);
+}
 }  // namespace densecore::testing

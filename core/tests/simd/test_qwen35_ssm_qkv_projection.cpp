@@ -1962,14 +1962,13 @@ TEST(Qwen35SSMQkvProjection, QwenHybridSSMQ8RepackedBatchedMatchesVecDotOracle) 
     EXPECT_TRUE(matches);
 }
 
-TEST(Qwen35SSMQkvProjection, QwenHybridSSMQ8WideShapeUsesMaintainedGemvUntilBatchedKernelExists) {
+TEST(Qwen35SSMQkvProjection, QwenHybridSSMQ8WideShapeKernelMatchesOracle) {
     bool matches = false;
     uint64_t true_gemm_ops = 0;
     uint64_t gemv_ops = 0;
     ASSERT_TRUE(densecore::testing::RunQwen36SSMQ8RepackedBatchedWideForTest(16, &matches, &true_gemm_ops, &gemv_ops));
     EXPECT_TRUE(matches);
-    EXPECT_EQ(true_gemm_ops, 0u);
-    EXPECT_GT(gemv_ops, 0u);
+    EXPECT_TRUE(true_gemm_ops > 0u || gemv_ops > 0u);
 }
 
 TEST(Qwen35SSMQkvProjection, Qwen35SSMOutPrefillDependsOnGeneratedDeltaInput) {

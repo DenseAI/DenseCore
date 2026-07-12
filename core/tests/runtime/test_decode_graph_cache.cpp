@@ -40,6 +40,8 @@ extern int ResolveQwen36PrefillQ4KBatchedReasonForTest(bool relevant, bool mode_
                                                        bool mode_on, bool mode_probe, int admission_state);
 extern const char* Qwen36SSMQ8PrefillAMXRejectReasonNameForTest(int reason);
 extern int ResolveQwen36SSMQ8PrefillAMXReasonForTest(int mode, int phase, bool lora_active);
+extern bool ShouldUseQwenHybridSSMQ8RepackedBatchedForTest(bool relevant, int tokens);
+extern bool ShouldUseQwenHybridSSMQ8DirectBatchedForTest(bool relevant, int tokens);
 }
 
 namespace {
@@ -339,6 +341,14 @@ TEST(DecodeGraphCachePolicyTest, Qwen36SSMQ8RepackedBatchedPathMatchesVecDotOrac
     ASSERT_TRUE(densecore::testing::RunQwen36SSMQ8RepackedBatchedDirectForTest(
         /*nth=*/4, &output_matches_vecdot_oracle));
     EXPECT_TRUE(output_matches_vecdot_oracle);
+}
+
+TEST(DecodeGraphCachePolicyTest, QwenHybridSSMQ8UsesGemmFromFourTokens) {
+    EXPECT_FALSE(densecore::testing::ShouldUseQwenHybridSSMQ8RepackedBatchedForTest(true, 1));
+    EXPECT_TRUE(densecore::testing::ShouldUseQwenHybridSSMQ8DirectBatchedForTest(true, 1));
+    EXPECT_TRUE(densecore::testing::ShouldUseQwenHybridSSMQ8RepackedBatchedForTest(true, 4));
+    EXPECT_FALSE(densecore::testing::ShouldUseQwenHybridSSMQ8DirectBatchedForTest(true, 4));
+    EXPECT_FALSE(densecore::testing::ShouldUseQwenHybridSSMQ8RepackedBatchedForTest(false, 192));
 }
 
 TEST(DecodeGraphCachePolicyTest, Qwen36SSMQ8C4ProjectionKeepsDefaultBackendSafe) {

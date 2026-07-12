@@ -4887,7 +4887,11 @@ void EngineLoop(EngineState* state) {
             const bool collect_decode_graph_diagnostics =
                 is_decode_batch &&
                 (IsQwen36ProfilingEnabled() || IsDecodeProfileEnabled() || IsLLMNodeTimingDumpEnabled());
-            const bool collect_decode_graph_top_slow_nodes = is_decode_batch && IsLLMNodeTimingDumpEnabled();
+            const bool collect_first_profiled_decode_nodes =
+                is_decode_batch && IsQwen36ProfilingEnabled() && !batch_requests.empty() && batch_requests.front() &&
+                batch_requests.front()->decode_graph_top_slow_nodes.empty();
+            const bool collect_decode_graph_top_slow_nodes =
+                is_decode_batch && (IsLLMNodeTimingDumpEnabled() || collect_first_profiled_decode_nodes);
             const NativeMoEGraphTimingBreakdown native_moe_graph_timing =
                 (collect_decode_graph_diagnostics || collect_prefill_graph_diagnostics)
                     ? SummarizeNativeQwenMoEGraphNodeTimes(current_model, gf, collect_decode_graph_top_slow_nodes)
@@ -4898,10 +4902,10 @@ void EngineLoop(EngineState* state) {
                     : HybridSSMGraphTimingBreakdown{};
             const bool collect_decode_graph_node_timing = is_decode_batch && collect_decode_graph_diagnostics;
             const bool collect_decode_graph_full_node_timing =
-                collect_decode_graph_node_timing && IsLLMNodeTimingDumpEnabled();
-            // Full ggml node census is O(graph nodes) string-heavy diagnostics.
-            // Default profiling keeps the summary schema via profile counters;
-            // per-node bucketing is reserved for explicit node-time debugging.
+                collect_decode_graph_node_timing &&
+                (IsLLMNodeTimingDumpEnabled() || collect_first_profiled_decode_nodes);
+            // Full node census is string-heavy. Capture one profiled decode graph
+            // to localize residual time; explicit node debugging may capture all.
             DecodeGraphNodeTimingBreakdown decode_graph_node_timing =
                 collect_decode_graph_full_node_timing
                     ? SummarizeDecodeGraphNodeTimes(gf, collect_decode_graph_top_slow_nodes)

@@ -242,7 +242,12 @@ static void DenseCoreGemmQ8_0_4x8x4Q8_0Generic(int n, float* out, int64_t out_ro
     const auto* input_base = static_cast<const uint8_t*>(packed_input);
 
     for (int group = 0; group < nc / 4; ++group) {
+#if defined(DENSECORE_Q8_4X8_NEON_I8MM)
+        float32x4_t acc_f32[4] = {
+            vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
+#else
         float sum[4][4] = {};
+#endif
         const auto* weight_group =
             weight_base + static_cast<size_t>(group) * static_cast<size_t>(nb) * packed_block_bytes;
         for (int b = 0; b < nb; ++b) {
@@ -252,51 +257,36 @@ static void DenseCoreGemmQ8_0_4x8x4Q8_0Generic(int n, float* out, int64_t out_ro
             const auto* input_scales = reinterpret_cast<const ggml_fp16_t*>(input_block);
             const auto* weight_qs = reinterpret_cast<const int8_t*>(weight_block + 4 * sizeof(ggml_fp16_t));
             const auto* input_qs = reinterpret_cast<const int8_t*>(input_block + 4 * sizeof(ggml_fp16_t));
+#if defined(DENSECORE_Q8_4X8_NEON_I8MM)
+            int32x4_t acc[4] = {
+                vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0)};
+            for (int chunk = 0; chunk < QK8_0 / 8; ++chunk) {
+                const int8x16_t x01 = vld1q_s8(input_qs + chunk * 32);
+                const int8x16_t x23 = vld1q_s8(input_qs + chunk * 32 + 16);
+                const int8x16_t w01 = vld1q_s8(weight_qs + chunk * 32);
+                const int8x16_t w23 = vld1q_s8(weight_qs + chunk * 32 + 16);
+                acc[0] = vmmlaq_s32(acc[0], x01, w01);
+                acc[1] = vmmlaq_s32(acc[1], x01, w23);
+                acc[2] = vmmlaq_s32(acc[2], x23, w01);
+                acc[3] = vmmlaq_s32(acc[3], x23, w23);
+            }
+            const int32x4_t row0 = vcombine_s32(vget_low_s32(acc[0]), vget_low_s32(acc[1]));
+            const int32x4_t row1 = vcombine_s32(vget_high_s32(acc[0]), vget_high_s32(acc[1]));
+            const int32x4_t row2 = vcombine_s32(vget_low_s32(acc[2]), vget_low_s32(acc[3]));
+            const int32x4_t row3 = vcombine_s32(vget_high_s32(acc[2]), vget_high_s32(acc[3]));
+            const float32x4_t x_scale = vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(input_scales)));
+            const float32x4_t w_scale = vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(weight_scales)));
+            acc_f32[0] = vfmaq_f32(acc_f32[0], vcvtq_f32_s32(row0), vmulq_laneq_f32(w_scale, x_scale, 0));
+            acc_f32[1] = vfmaq_f32(acc_f32[1], vcvtq_f32_s32(row1), vmulq_laneq_f32(w_scale, x_scale, 1));
+            acc_f32[2] = vfmaq_f32(acc_f32[2], vcvtq_f32_s32(row2), vmulq_laneq_f32(w_scale, x_scale, 2));
+            acc_f32[3] = vfmaq_f32(acc_f32[3], vcvtq_f32_s32(row3), vmulq_laneq_f32(w_scale, x_scale, 3));
+#else
             float w_scale[4];
             float x_scale[4];
             for (int row = 0; row < 4; ++row) {
                 w_scale[row] = DenseCoreFp16ToFp32Fast(weight_scales[row]);
                 x_scale[row] = DenseCoreFp16ToFp32Fast(input_scales[row]);
             }
-#if defined(DENSECORE_Q8_4X8_NEON_I8MM)
-            // i8mm (smmla) 4x4 micro-kernel — what llama.cpp uses for this shape.
-            // The 4x8 pack is i8mm-native: out-rows {0,1} of a chunk are 16
-            // contiguous int8 at qs+chunk*32, {2,3} at +16 (same for the 4 input
-            // rows). vmmlaq_s32(a,b) accumulates the 2x2 tile [a0·b0, a0·b1, a1·b0,
-            // a1·b1]. Integer-exact vs the scalar/dotprod path; accumulate the
-            // block's 4 chunks, then apply per-block scales (sum[m][row] +=
-            // dot * w_scale[row] * x_scale[m]). w0..3 = weight rows, m0..3 = input rows.
-            int32x4_t acc_w01x01 = vdupq_n_s32(0);  // (w0·m0, w0·m1, w1·m0, w1·m1)
-            int32x4_t acc_w01x23 = vdupq_n_s32(0);  // (w0·m2, w0·m3, w1·m2, w1·m3)
-            int32x4_t acc_w23x01 = vdupq_n_s32(0);  // (w2·m0, w2·m1, w3·m0, w3·m1)
-            int32x4_t acc_w23x23 = vdupq_n_s32(0);  // (w2·m2, w2·m3, w3·m2, w3·m3)
-            for (int chunk = 0; chunk < QK8_0 / 8; ++chunk) {
-                const int8x16_t w01 = vld1q_s8(weight_qs + chunk * 32);
-                const int8x16_t w23 = vld1q_s8(weight_qs + chunk * 32 + 16);
-                const int8x16_t x01 = vld1q_s8(input_qs + chunk * 32);
-                const int8x16_t x23 = vld1q_s8(input_qs + chunk * 32 + 16);
-                acc_w01x01 = vmmlaq_s32(acc_w01x01, w01, x01);
-                acc_w01x23 = vmmlaq_s32(acc_w01x23, w01, x23);
-                acc_w23x01 = vmmlaq_s32(acc_w23x01, w23, x01);
-                acc_w23x23 = vmmlaq_s32(acc_w23x23, w23, x23);
-            }
-            sum[0][0] += static_cast<float>(vgetq_lane_s32(acc_w01x01, 0)) * w_scale[0] * x_scale[0];
-            sum[1][0] += static_cast<float>(vgetq_lane_s32(acc_w01x01, 1)) * w_scale[0] * x_scale[1];
-            sum[0][1] += static_cast<float>(vgetq_lane_s32(acc_w01x01, 2)) * w_scale[1] * x_scale[0];
-            sum[1][1] += static_cast<float>(vgetq_lane_s32(acc_w01x01, 3)) * w_scale[1] * x_scale[1];
-            sum[2][0] += static_cast<float>(vgetq_lane_s32(acc_w01x23, 0)) * w_scale[0] * x_scale[2];
-            sum[3][0] += static_cast<float>(vgetq_lane_s32(acc_w01x23, 1)) * w_scale[0] * x_scale[3];
-            sum[2][1] += static_cast<float>(vgetq_lane_s32(acc_w01x23, 2)) * w_scale[1] * x_scale[2];
-            sum[3][1] += static_cast<float>(vgetq_lane_s32(acc_w01x23, 3)) * w_scale[1] * x_scale[3];
-            sum[0][2] += static_cast<float>(vgetq_lane_s32(acc_w23x01, 0)) * w_scale[2] * x_scale[0];
-            sum[1][2] += static_cast<float>(vgetq_lane_s32(acc_w23x01, 1)) * w_scale[2] * x_scale[1];
-            sum[0][3] += static_cast<float>(vgetq_lane_s32(acc_w23x01, 2)) * w_scale[3] * x_scale[0];
-            sum[1][3] += static_cast<float>(vgetq_lane_s32(acc_w23x01, 3)) * w_scale[3] * x_scale[1];
-            sum[2][2] += static_cast<float>(vgetq_lane_s32(acc_w23x23, 0)) * w_scale[2] * x_scale[2];
-            sum[3][2] += static_cast<float>(vgetq_lane_s32(acc_w23x23, 1)) * w_scale[2] * x_scale[3];
-            sum[2][3] += static_cast<float>(vgetq_lane_s32(acc_w23x23, 2)) * w_scale[3] * x_scale[2];
-            sum[3][3] += static_cast<float>(vgetq_lane_s32(acc_w23x23, 3)) * w_scale[3] * x_scale[3];
-#else
             for (int m = 0; m < 4; ++m) {
                 for (int row = 0; row < 4; ++row) {
                     const int dot = DenseCoreQ8_0DotPacked4x8Rows(weight_qs, row, input_qs, m);
@@ -308,10 +298,14 @@ static void DenseCoreGemmQ8_0_4x8x4Q8_0Generic(int n, float* out, int64_t out_ro
         for (int m = 0; m < 4; ++m) {
             float* out_row = out + static_cast<size_t>(m) * static_cast<size_t>(out_row_stride) +
                              static_cast<size_t>(group) * 4;
+#if defined(DENSECORE_Q8_4X8_NEON_I8MM)
+            vst1q_f32(out_row, acc_f32[m]);
+#else
             out_row[0] = sum[m][0];
             out_row[1] = sum[m][1];
             out_row[2] = sum[m][2];
             out_row[3] = sum[m][3];
+#endif
         }
     }
 }

@@ -840,6 +840,14 @@ static void RecordSmartMatmulQ4KBatchedRejectReason(InferenceWorkContext* work_c
         static_cast<int>(reason), std::memory_order_relaxed);
 }
 
+static bool ShouldUseQwenHybridSSMQ8RepackedBatched(bool qwen_hybrid_ssm_q8_prefill, int tokens) {
+    return qwen_hybrid_ssm_q8_prefill && tokens >= 4;
+}
+
+static bool ShouldUseQwenHybridSSMQ8DirectBatched(bool qwen_hybrid_ssm_q8_prefill, int tokens) {
+    return qwen_hybrid_ssm_q8_prefill && tokens > 0 && tokens < 4;
+}
+
 static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const ggml_tensor* weight,
                                                 const SmartMatmulDispatchState& dispatch,
                                                 const SmartMatmulPrefillProjectionPlan& prefill,
@@ -867,20 +875,12 @@ static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const g
     ud->lfm2_q8_repacked_batched =
         dispatch.lfm2_shortconv_semantic && weight->type == GGML_TYPE_Q8_0 && dispatch.m > 1;
     // Qwen hybrid-SSM Q8_0 prefill must stay inside DenseCore's owned path.
-    // Use the repacked 4x8 batched GEMM for real prefill batches; keep the
-    // direct GEMV path only for tiny micro-batches that cannot use GEMM.
+    // Batches of four or more use DenseCore's ISA-specific 4x8 GEMM. Tiny
+    // batches keep row-GEMV because activation packing cannot amortize there.
     ud->qwen36_ssm_q8_repacked_batched =
-#if defined(__aarch64__) || defined(_M_ARM64)
-        false;
-#else
-        prefill.qwen_hybrid_ssm_q8_prefill && dispatch.m >= 4;
-#endif
+        ShouldUseQwenHybridSSMQ8RepackedBatched(prefill.qwen_hybrid_ssm_q8_prefill, dispatch.m);
     ud->qwen36_ssm_q8_direct_batched =
-#if defined(__aarch64__) || defined(_M_ARM64)
-        prefill.qwen_hybrid_ssm_q8_prefill;
-#else
-        prefill.qwen_hybrid_ssm_q8_prefill && dispatch.m < 4;
-#endif
+        ShouldUseQwenHybridSSMQ8DirectBatched(prefill.qwen_hybrid_ssm_q8_prefill, dispatch.m);
 }
 
 static SmartMatmulGemvUserDataPlan ResolveSmartMatmulGemvUserDataPlan(
