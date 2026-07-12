@@ -535,6 +535,10 @@ void ResetQwen36Profile(InferenceWorkContext* ctx) {
     p.native_moe_fast_w2_q5k_ns.store(0, std::memory_order_relaxed);
     p.qwen_native_moe_w2_q5k_raw_batched_used_ops.store(0, std::memory_order_relaxed);
     p.qwen_native_moe_w2_q5k_raw_batched_ns.store(0, std::memory_order_relaxed);
+    p.qwen_native_moe_fused_router_used_ops.store(0, std::memory_order_relaxed);
+    p.qwen_native_moe_fused_router_ns.store(0, std::memory_order_relaxed);
+    p.qwen_native_moe_q4_gateup_rowpair_used_ops.store(0, std::memory_order_relaxed);
+    p.qwen_native_moe_q4_gateup_rowpair_ns.store(0, std::memory_order_relaxed);
     p.qwen35_moe_path.store(0, std::memory_order_relaxed);
     p.qwen35_moe_layers_seen.store(0, std::memory_order_relaxed);
     p.qwen35_moe_forward_calls.store(0, std::memory_order_relaxed);
@@ -924,6 +928,14 @@ Qwen36ProfileSnapshot GetQwen36ProfileSnapshot(const InferenceWorkContext* ctx) 
         p.qwen_native_moe_w2_q5k_raw_batched_used_ops.load(std::memory_order_relaxed);
     snapshot.qwen_native_moe_w2_q5k_raw_batched_ns =
         p.qwen_native_moe_w2_q5k_raw_batched_ns.load(std::memory_order_relaxed);
+    snapshot.qwen_native_moe_fused_router_used_ops =
+        p.qwen_native_moe_fused_router_used_ops.load(std::memory_order_relaxed);
+    snapshot.qwen_native_moe_fused_router_ns =
+        p.qwen_native_moe_fused_router_ns.load(std::memory_order_relaxed);
+    snapshot.qwen_native_moe_q4_gateup_rowpair_used_ops =
+        p.qwen_native_moe_q4_gateup_rowpair_used_ops.load(std::memory_order_relaxed);
+    snapshot.qwen_native_moe_q4_gateup_rowpair_ns =
+        p.qwen_native_moe_q4_gateup_rowpair_ns.load(std::memory_order_relaxed);
     snapshot.qwen35_moe_path = p.qwen35_moe_path.load(std::memory_order_relaxed);
     snapshot.qwen35_moe_layers_seen = p.qwen35_moe_layers_seen.load(std::memory_order_relaxed);
     snapshot.qwen35_moe_forward_calls = p.qwen35_moe_forward_calls.load(std::memory_order_relaxed);
@@ -1173,6 +1185,18 @@ void RecordMoEKQuantRawBatchedUse(InferenceWorkContext* ctx, ggml_type weight_ty
         p.qwen_native_moe_w2_q5k_raw_batched_used_ops.fetch_add(1, std::memory_order_relaxed);
         p.qwen_native_moe_w2_q5k_raw_batched_ns.fetch_add(wall_ns, std::memory_order_relaxed);
     }
+}
+
+void RecordQwenNativeMoEFusedRouterUse(InferenceWorkContext* ctx, uint64_t wall_ns) {
+    if (!ctx) return;
+    ctx->qwen36_profile.qwen_native_moe_fused_router_used_ops.fetch_add(1, std::memory_order_relaxed);
+    ctx->qwen36_profile.qwen_native_moe_fused_router_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+}
+
+void RecordQwenNativeMoEQ4GateUpRowPairUse(InferenceWorkContext* ctx, uint64_t wall_ns) {
+    if (!ctx) return;
+    ctx->qwen36_profile.qwen_native_moe_q4_gateup_rowpair_used_ops.fetch_add(1, std::memory_order_relaxed);
+    ctx->qwen36_profile.qwen_native_moe_q4_gateup_rowpair_ns.fetch_add(wall_ns, std::memory_order_relaxed);
 }
 
 void RecordGemma4MoEPrefillQuantBatchDecision(InferenceWorkContext* ctx, bool candidate, bool used,

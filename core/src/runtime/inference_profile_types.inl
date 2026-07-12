@@ -216,6 +216,10 @@ struct Qwen36ProfileCounters {
     std::atomic<uint64_t> native_moe_fast_w2_q5k_ns{0};
     std::atomic<uint64_t> qwen_native_moe_w2_q5k_raw_batched_used_ops{0};
     std::atomic<uint64_t> qwen_native_moe_w2_q5k_raw_batched_ns{0};
+    std::atomic<uint64_t> qwen_native_moe_fused_router_used_ops{0};
+    std::atomic<uint64_t> qwen_native_moe_fused_router_ns{0};
+    std::atomic<uint64_t> qwen_native_moe_q4_gateup_rowpair_used_ops{0};
+    std::atomic<uint64_t> qwen_native_moe_q4_gateup_rowpair_ns{0};
     std::atomic<int> qwen35_moe_path{0};
     std::atomic<uint64_t> qwen35_moe_layers_seen{0};
     std::atomic<uint64_t> qwen35_moe_forward_calls{0};

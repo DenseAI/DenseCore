@@ -51,6 +51,9 @@ bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gat
 namespace testing {
 bool RunQ5KQ8KBatchedGemvRowForTest(const void* weight_row, const void* q8_input_base, size_t q8_row_stride, int M,
                                     int cols, float* output);
+bool RunMoEQ4KQ8KBatchedRowPairParityForTest(const void* gate_weight_row, const void* up_weight_row,
+                                              const uint8_t* qinput_data, size_t qinput_row_bytes, int M, int K,
+                                              bool* specialized_pair_used);
 }  // namespace testing
 
 namespace {
@@ -221,6 +224,14 @@ TEST_F(MoEOpsTest, Q4KRawBatchedFusedSwiGLUMatchesVecDot) {
     QuantizeRowsCpu(GGML_TYPE_Q4_K, gate_f32, N, K, &qgate);
     QuantizeRowsCpu(GGML_TYPE_Q4_K, up_f32, N, K, &qup);
     QuantizeRowsCpu(GGML_TYPE_Q8_K, input_f32, M, K, &qinput);
+
+    bool specialized_pair_used = false;
+    ASSERT_TRUE(testing::RunMoEQ4KQ8KBatchedRowPairParityForTest(
+        qgate.data(), qup.data(), qinput.data(), ggml_row_size(GGML_TYPE_Q8_K, K), M, K,
+        &specialized_pair_used));
+#if defined(__AVX2__) || ((defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD))
+    EXPECT_TRUE(specialized_pair_used);
+#endif
 
     std::vector<float> actual(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
     CpuBackend& backend = GetCpuBackend();

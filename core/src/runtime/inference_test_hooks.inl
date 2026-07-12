@@ -1472,6 +1472,59 @@ int ResolveNativeMoEGraphCallbackTaskCountForTest(const TransformerModel* model,
                                                     top_k);
 }
 
+bool ComputeQwenNativeMoEStableTopKForTest(const std::vector<float>& logits, int top_k,
+                                            std::vector<int32_t>* selected,
+                                            std::vector<float>* normalized_weights) {
+    if (!selected || !normalized_weights || logits.empty() || top_k <= 0) {
+        return false;
+    }
+    selected->assign(static_cast<size_t>(top_k), -1);
+    normalized_weights->assign(static_cast<size_t>(top_k), 0.0f);
+    return ::ComputeQwenNativeMoEStableTopK(logits.data(), static_cast<int64_t>(logits.size()), top_k,
+                                             selected->data(), normalized_weights->data());
+}
+
+bool RunQwenNativeMoEFusedRouterCustomNodeForTest(const std::vector<float>& logits,
+                                                   std::vector<int32_t>* selected,
+                                                   std::vector<float>* normalized_weights) {
+    if (!selected || !normalized_weights || logits.size() < static_cast<size_t>(kQwenNativeMoEFusedRouterTopK)) {
+        return false;
+    }
+    ggml_init_params params{};
+    params.mem_size = 1 << 20;
+    params.no_alloc = false;
+    ggml_context* ctx = ggml_init(params);
+    if (!ctx) return false;
+    ggml_tensor* logits_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, static_cast<int64_t>(logits.size()), 1);
+    if (!logits_tensor || !logits_tensor->data) {
+        ggml_free(ctx);
+        return false;
+    }
+    std::memcpy(logits_tensor->data, logits.data(), logits.size() * sizeof(float));
+    QwenNativeMoEFusedRouterState* state = nullptr;
+    ggml_tensor* selected_tensor =
+        BuildQwenNativeMoEFusedRouter(ctx, logits_tensor, kQwenNativeMoEFusedRouterTopK, &state);
+    ggml_tensor* weights_tensor = selected_tensor && state
+                                      ? BuildQwenNativeMoEFusedRouterWeights(ctx, selected_tensor, state,
+                                                                            "qwen_router_weights_test")
+                                      : nullptr;
+    if (!selected_tensor || !selected_tensor->data || !weights_tensor || !weights_tensor->data) {
+        ggml_free(ctx);
+        return false;
+    }
+    cb_qwen_native_moe_fused_router(selected_tensor, 0, 1, state);
+    cb_qwen_native_moe_fused_router_weights(weights_tensor, 0, 1, state);
+    selected->assign(static_cast<const int32_t*>(selected_tensor->data),
+                     static_cast<const int32_t*>(selected_tensor->data) + kQwenNativeMoEFusedRouterTopK);
+    normalized_weights->resize(kQwenNativeMoEFusedRouterTopK);
+    for (int64_t k = 0; k < kQwenNativeMoEFusedRouterTopK; ++k) {
+        (*normalized_weights)[static_cast<size_t>(k)] = *reinterpret_cast<const float*>(
+            static_cast<const char*>(weights_tensor->data) + static_cast<size_t>(k) * weights_tensor->nb[1]);
+    }
+    ggml_free(ctx);
+    return true;
+}
+
 bool ShouldEnableNativeMoEFastPathByDefaultForTest(const TransformerModel* model, int phase, int mode) {
     return ::ShouldEnableNativeMoEFastPathByDefault(model, static_cast<InferenceExecutionPhase>(phase),
                                                    static_cast<densecore::env::RuntimeToggleMode>(mode));

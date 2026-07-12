@@ -2643,6 +2643,10 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
         << req->qwen_native_moe_w2_q5k_raw_batched_used_ops
         << " qwen_native_moe_w2_q5k_raw_batched_ms="
         << ns_to_ms(req->qwen_native_moe_w2_q5k_raw_batched_ns)
+        << " qwen_native_moe_fused_router_used_ops=" << req->qwen_native_moe_fused_router_used_ops
+        << " qwen_native_moe_fused_router_ms=" << ns_to_ms(req->qwen_native_moe_fused_router_ns)
+        << " qwen_native_moe_q4_gateup_rowpair_used_ops=" << req->qwen_native_moe_q4_gateup_rowpair_used_ops
+        << " qwen_native_moe_q4_gateup_rowpair_ms=" << ns_to_ms(req->qwen_native_moe_q4_gateup_rowpair_ns)
         << " native_moe_fast_w2_q5k_config=builtin"
         << " native_moe_fast_w2_q5k_effective_state=" << native_moe_fast_w2_q5k_effective_state
         << " lfm2_native_moe_decode_used_ops=" << lfm2_native_moe_decode_used_ops

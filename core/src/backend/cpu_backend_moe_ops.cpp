@@ -949,6 +949,34 @@ bool RunMoEQ4KRawBatchedFusedSwiGLUToQ8(CpuBackend* backend, const void* gate_we
                                                   qoutput_data, qoutput_row_bytes, M, N, K, numa_node, allow_parallel);
 }
 
+namespace testing {
+bool RunMoEQ4KQ8KBatchedRowPairParityForTest(const void* gate_weight_row, const void* up_weight_row,
+                                              const uint8_t* qinput_data, size_t qinput_row_bytes, int M, int K,
+                                              bool* specialized_pair_used) {
+    if (M <= 0 || M > kMoEQ4KRawBatchedTileM) return false;
+    std::array<float, kMoEQ4KRawBatchedTileM> gate_pair{};
+    std::array<float, kMoEQ4KRawBatchedTileM> up_pair{};
+    std::array<float, kMoEQ4KRawBatchedTileM> gate_reference{};
+    std::array<float, kMoEQ4KRawBatchedTileM> up_reference{};
+    bool specialized = false;
+    const bool pair_ok = ComputeMoEQ4KQ8KBatchedRowPair(
+        gate_weight_row, up_weight_row, qinput_data, qinput_row_bytes, M, K, gate_pair.data(), up_pair.data(),
+        &specialized);
+    const bool reference_ok =
+        ComputeMoEQ4KQ8KBatchedRow(gate_weight_row, qinput_data, qinput_row_bytes, M, K, gate_reference.data()) &&
+        ComputeMoEQ4KQ8KBatchedRow(up_weight_row, qinput_data, qinput_row_bytes, M, K, up_reference.data());
+    if (specialized_pair_used) *specialized_pair_used = specialized;
+    if (!pair_ok || !reference_ok) return false;
+    for (int m = 0; m < M; ++m) {
+        if (std::fabs(gate_pair[m] - gate_reference[m]) > 1e-4f ||
+            std::fabs(up_pair[m] - up_reference[m]) > 1e-4f) {
+            return false;
+        }
+    }
+    return true;
+}
+}  // namespace testing
+
 void CpuBackend::ApplyMultiLoRA(
     const Tensor& input, const std::string& layer_name,
     const std::unordered_map<std::shared_ptr<LoRAAdapter>, std::vector<int>>& adapter_token_map, Tensor* output) {

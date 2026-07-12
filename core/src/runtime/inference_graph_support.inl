@@ -472,6 +472,206 @@ ggml_tensor* BuildMoeExpertWeightedSumWithWeights(struct ggml_context* ctx, ggml
     return out;
 }
 
+constexpr int64_t kQwenNativeMoEFusedRouterTopK = 8;
+
+struct QwenNativeMoEFusedRouterState {
+    int64_t n_experts = 0;
+    int64_t n_tokens = 0;
+    int64_t top_k = 0;
+    float* normalized_weights = nullptr;
+    InferenceWorkContext* work_ctx = nullptr;
+};
+
+static bool QwenNativeMoERouterCandidatePrecedes(float lhs, int32_t lhs_id, float rhs, int32_t rhs_id) {
+    const bool lhs_nan = std::isnan(lhs);
+    const bool rhs_nan = std::isnan(rhs);
+    if (lhs_nan != rhs_nan) {
+        return !lhs_nan;
+    }
+    if (lhs > rhs) return true;
+    if (lhs < rhs) return false;
+    return lhs_id < rhs_id;
+}
+
+static bool ComputeQwenNativeMoEStableTopK(const float* logits, int64_t n_experts, int64_t top_k,
+                                            int32_t* selected, float* normalized_weights) {
+    if (!logits || !selected || !normalized_weights || n_experts <= 0 || top_k <= 0 || top_k > n_experts ||
+        top_k > kQwenNativeMoEFusedRouterTopK) {
+        return false;
+    }
+
+    int64_t selected_count = 0;
+    for (int32_t expert = 0; expert < n_experts; ++expert) {
+        const float score = logits[expert];
+        int64_t insert_at = selected_count;
+        while (insert_at > 0 &&
+               QwenNativeMoERouterCandidatePrecedes(score, expert, logits[selected[insert_at - 1]],
+                                                     selected[insert_at - 1])) {
+            --insert_at;
+        }
+        if (insert_at >= top_k) {
+            continue;
+        }
+        const int64_t move_end = std::min<int64_t>(selected_count, top_k - 1);
+        for (int64_t pos = move_end; pos > insert_at; --pos) {
+            selected[pos] = selected[pos - 1];
+        }
+        selected[insert_at] = expert;
+        selected_count = std::min<int64_t>(selected_count + 1, top_k);
+    }
+    if (selected_count != top_k) {
+        return false;
+    }
+
+    float max_logit = -INFINITY;
+    bool all_finite = true;
+    for (int64_t k = 0; k < top_k; ++k) {
+        const float value = logits[selected[k]];
+        all_finite = all_finite && std::isfinite(value);
+        if (std::isfinite(value)) {
+            max_logit = std::max(max_logit, value);
+        }
+    }
+
+    float denominator = 0.0f;
+    if (all_finite && std::isfinite(max_logit)) {
+        for (int64_t k = 0; k < top_k; ++k) {
+            normalized_weights[k] = std::exp(logits[selected[k]] - max_logit);
+            denominator += normalized_weights[k];
+        }
+    }
+    if (!(denominator > 0.0f) || !std::isfinite(denominator)) {
+        const float uniform = 1.0f / static_cast<float>(top_k);
+        std::fill(normalized_weights, normalized_weights + top_k, uniform);
+        return true;
+    }
+    for (int64_t k = 0; k < top_k; ++k) {
+        normalized_weights[k] /= denominator;
+    }
+    return true;
+}
+
+static QwenNativeMoEFusedRouterState* AllocateQwenNativeMoEFusedRouterState(ggml_context* ctx, int64_t n_experts,
+                                                                            int64_t n_tokens, int64_t top_k) {
+    if (!ctx || n_experts <= 0 || n_tokens <= 0 || top_k != kQwenNativeMoEFusedRouterTopK || top_k > n_experts) {
+        return nullptr;
+    }
+    const size_t weights_count = static_cast<size_t>(top_k) * static_cast<size_t>(n_tokens);
+    if (ggml_get_no_alloc(ctx)) {
+        thread_local QwenNativeMoEFusedRouterState dry_run_state;
+        thread_local std::vector<float> dry_run_weights;
+        dry_run_weights.resize(weights_count);
+        dry_run_state.n_experts = n_experts;
+        dry_run_state.n_tokens = n_tokens;
+        dry_run_state.top_k = top_k;
+        dry_run_state.normalized_weights = dry_run_weights.data();
+        dry_run_state.work_ctx = GetCurrentWorkContext();
+        return &dry_run_state;
+    }
+    ggml_tensor* state_storage =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I8, static_cast<int64_t>(sizeof(QwenNativeMoEFusedRouterState)));
+    ggml_tensor* weights_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, static_cast<int64_t>(weights_count));
+    if (!state_storage || !state_storage->data || !weights_storage || !weights_storage->data) {
+        return nullptr;
+    }
+    auto* state = new (state_storage->data) QwenNativeMoEFusedRouterState();
+    state->n_experts = n_experts;
+    state->n_tokens = n_tokens;
+    state->top_k = top_k;
+    state->normalized_weights = static_cast<float*>(weights_storage->data);
+    state->work_ctx = GetCurrentWorkContext();
+    return state;
+}
+
+static void cb_qwen_native_moe_fused_router(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    auto* state = static_cast<QwenNativeMoEFusedRouterState*>(userdata);
+    const ggml_tensor* logits = dst ? dst->src[0] : nullptr;
+    if (!dst || !state || !logits || !dst->data || !logits->data || nth <= 0 || dst->type != GGML_TYPE_I32 ||
+        logits->type != GGML_TYPE_F32 || logits->ne[0] != state->n_experts || logits->ne[1] != state->n_tokens ||
+        dst->ne[0] != state->top_k || dst->ne[1] != state->n_tokens || !state->normalized_weights) {
+        return;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    bool used = false;
+    const int64_t token_begin = (state->n_tokens * ith) / nth;
+    const int64_t token_end = (state->n_tokens * (ith + 1)) / nth;
+    for (int64_t token = token_begin; token < token_end; ++token) {
+        const float* token_logits = reinterpret_cast<const float*>(
+            static_cast<const char*>(logits->data) + static_cast<size_t>(token) * static_cast<size_t>(logits->nb[1]));
+        int32_t* token_selected = reinterpret_cast<int32_t*>(
+            static_cast<char*>(dst->data) + static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
+        float* token_weights = state->normalized_weights + static_cast<size_t>(token) * state->top_k;
+        used = ComputeQwenNativeMoEStableTopK(token_logits, state->n_experts, state->top_k, token_selected,
+                                               token_weights) || used;
+    }
+    if (used && state->work_ctx) {
+        const uint64_t elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+        RecordQwenNativeMoEFusedRouterUse(state->work_ctx, elapsed_ns);
+    }
+}
+
+static ggml_tensor* BuildQwenNativeMoEFusedRouter(ggml_context* ctx, ggml_tensor* gate_logits, int64_t top_k,
+                                                   QwenNativeMoEFusedRouterState** state_out) {
+    if (state_out) *state_out = nullptr;
+    if (!ctx || !gate_logits || gate_logits->type != GGML_TYPE_F32 || gate_logits->ne[0] < top_k ||
+        gate_logits->ne[1] != 1 || top_k != kQwenNativeMoEFusedRouterTopK) {
+        return nullptr;
+    }
+    QwenNativeMoEFusedRouterState* state =
+        AllocateQwenNativeMoEFusedRouterState(ctx, gate_logits->ne[0], gate_logits->ne[1], top_k);
+    if (!state) {
+        return nullptr;
+    }
+    ggml_tensor* args[] = {gate_logits};
+    ggml_tensor* selected = ggml_custom_4d(ctx, GGML_TYPE_I32, top_k, gate_logits->ne[1], 1, 1, args, 1,
+                                           cb_qwen_native_moe_fused_router, 1, state);
+    ggml_set_name(selected, "qwen_native_moe_fused_top8_router");
+    if (state_out) *state_out = state;
+    return selected;
+}
+
+static bool CopyQwenNativeMoEFusedRouterWeights(const QwenNativeMoEFusedRouterState* state, int64_t token,
+                                                 float* weights, int64_t weights_capacity) {
+    if (!state || !state->normalized_weights || !weights || token < 0 || token >= state->n_tokens ||
+        state->top_k <= 0 || state->top_k > weights_capacity) {
+        return false;
+    }
+    const float* src = state->normalized_weights + static_cast<size_t>(token) * state->top_k;
+    std::copy(src, src + state->top_k, weights);
+    return true;
+}
+
+static void cb_qwen_native_moe_fused_router_weights(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+    const auto* state = static_cast<const QwenNativeMoEFusedRouterState*>(userdata);
+    if (!dst || !state || !dst->src[0] || !dst->data || nth <= 0 || dst->type != GGML_TYPE_F32 ||
+        dst->ne[0] != 1 || dst->ne[1] != state->top_k || dst->ne[2] != state->n_tokens) {
+        return;
+    }
+    const int64_t token_begin = (state->n_tokens * ith) / nth;
+    const int64_t token_end = (state->n_tokens * (ith + 1)) / nth;
+    for (int64_t token = token_begin; token < token_end; ++token) {
+        for (int64_t k = 0; k < state->top_k; ++k) {
+            *reinterpret_cast<float*>(static_cast<char*>(dst->data) + static_cast<size_t>(k) * dst->nb[1] +
+                                      static_cast<size_t>(token) * dst->nb[2]) =
+                state->normalized_weights[static_cast<size_t>(token) * state->top_k + k];
+        }
+    }
+}
+
+static ggml_tensor* BuildQwenNativeMoEFusedRouterWeights(ggml_context* ctx, ggml_tensor* selected,
+                                                          QwenNativeMoEFusedRouterState* state, const char* name) {
+    if (!ctx || !selected || !state || selected->type != GGML_TYPE_I32 || selected->ne[0] != state->top_k ||
+        selected->ne[1] != state->n_tokens) {
+        return nullptr;
+    }
+    ggml_tensor* args[] = {selected};
+    ggml_tensor* weights = ggml_custom_4d(ctx, GGML_TYPE_F32, 1, state->top_k, state->n_tokens, 1, args, 1,
+                                          cb_qwen_native_moe_fused_router_weights, 1, state);
+    ggml_set_name(weights, name);
+    return weights;
+}
+
 void cb_moe_topk_weights_from_logits(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     (void)userdata;
     if (!dst || !dst->src[0] || !dst->src[1] || !dst->data || !dst->src[0]->data || !dst->src[1]->data || nth <= 0) {
@@ -1961,6 +2161,7 @@ struct Qwen35SharedQ8RowsUserData {
     bool weighted_logits_lfm2_sigmoid = false;
     bool weighted_logits_norm_topk = true;
     float weighted_logits_scale = 1.0f;
+    QwenNativeMoEFusedRouterState* fused_router_state = nullptr;
     int requested_task_count = 0;
     std::atomic<uint64_t> assignments_ready_epoch{0};
     std::atomic<int> assignments_failed{0};
@@ -2009,6 +2210,7 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
         dry_run_ud.weighted_logits_lfm2_sigmoid = false;
         dry_run_ud.weighted_logits_norm_topk = true;
         dry_run_ud.weighted_logits_scale = 1.0f;
+        dry_run_ud.fused_router_state = nullptr;
         dry_run_ud.requested_task_count = 0;
         dry_run_ud.assignments_ready_epoch.store(0, std::memory_order_relaxed);
         dry_run_ud.assignments_failed.store(0, std::memory_order_relaxed);
@@ -2041,6 +2243,7 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
     ud->weighted_logits_lfm2_sigmoid = false;
     ud->weighted_logits_norm_topk = true;
     ud->weighted_logits_scale = 1.0f;
+    ud->fused_router_state = nullptr;
     ud->requested_task_count = 0;
     ud->assignments_ready_epoch.store(0, std::memory_order_relaxed);
     ud->assignments_failed.store(0, std::memory_order_relaxed);
@@ -2805,6 +3008,18 @@ static bool Qwen35NativeMoEComputeTopKWeightsFromLogits(const ggml_tensor* gate_
     return true;
 }
 
+static bool ResolveQwen35NativeMoETopKWeights(const Qwen35SharedQ8RowsUserData* shared_q8,
+                                               const ggml_tensor* gate_logits,
+                                               const ggml_tensor* selected_experts, int64_t token, float* weights,
+                                               int64_t weights_capacity) {
+    if (shared_q8 && CopyQwenNativeMoEFusedRouterWeights(shared_q8->fused_router_state, token, weights,
+                                                         weights_capacity)) {
+        return true;
+    }
+    return Qwen35NativeMoEComputeTopKWeightsFromLogits(gate_logits, selected_experts, token, weights,
+                                                        weights_capacity);
+}
+
 static bool LFM2NativeMoEComputeTopKWeightsFromLogits(const ggml_tensor* gate_logits,
                                                        const ggml_tensor* selected_experts,
                                                        int64_t token, float* weights,
@@ -2884,7 +3099,7 @@ static void ProbeQwen35NativeMoEDownWeightedLogitsReference(const ggml_tensor* d
             ? LFM2NativeMoEComputeTopKWeightsFromLogits(gate_logits, selected_experts, token, topk_weights, 64,
                                                         shared_q8->weighted_logits_norm_topk,
                                                         shared_q8->weighted_logits_scale)
-            : Qwen35NativeMoEComputeTopKWeightsFromLogits(gate_logits, selected_experts, token, topk_weights, 64);
+            : ResolveQwen35NativeMoETopKWeights(shared_q8, gate_logits, selected_experts, token, topk_weights, 64);
     if (!weights_ok) {
         return;
     }
@@ -3258,8 +3473,8 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
                     ? LFM2NativeMoEComputeTopKWeightsFromLogits(
                           gate_logits, selected_experts, token, topk_weights, 64,
                           shared_q8->weighted_logits_norm_topk, shared_q8->weighted_logits_scale)
-                    : Qwen35NativeMoEComputeTopKWeightsFromLogits(gate_logits, selected_experts, token, topk_weights,
-                                                                  64);
+                    : ResolveQwen35NativeMoETopKWeights(shared_q8, gate_logits, selected_experts, token, topk_weights,
+                                                        64);
             if (!weights_ok) {
                 continue;
             }
@@ -3344,7 +3559,7 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
                 ? LFM2NativeMoEComputeTopKWeightsFromLogits(gate_logits, selected_experts, token, topk_weights, 64,
                                                             shared_q8->weighted_logits_norm_topk,
                                                             shared_q8->weighted_logits_scale)
-                : Qwen35NativeMoEComputeTopKWeightsFromLogits(gate_logits, selected_experts, token, topk_weights, 64);
+                : ResolveQwen35NativeMoETopKWeights(shared_q8, gate_logits, selected_experts, token, topk_weights, 64);
         if (!weights_ok) {
             continue;
         }
@@ -4601,8 +4816,17 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         }
     }
 
-    ggml_tensor* selected_experts = ggml_argsort_top_k(ctx, selection_scores, static_cast<int>(n_expert_used));
-    ggml_set_name(selected_experts, "qwen35_native_moe_topk");
+    QwenNativeMoEFusedRouterState* fused_router_state = nullptr;
+    ggml_tensor* selected_experts = nullptr;
+    if (graph_plan.qwen_native_moe && n_tokens == 1 && n_expert_used == kQwenNativeMoEFusedRouterTopK &&
+        model->moe_norm_topk_prob) {
+        selected_experts =
+            BuildQwenNativeMoEFusedRouter(ctx, gate_logits, n_expert_used, &fused_router_state);
+    }
+    if (!selected_experts) {
+        selected_experts = ggml_argsort_top_k(ctx, selection_scores, static_cast<int>(n_expert_used));
+        ggml_set_name(selected_experts, "qwen35_native_moe_topk");
+    }
     ggml_build_forward_expand(gf, selected_experts);
 
     ggml_tensor* gate = nullptr;
@@ -4657,6 +4881,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             hidden_q8_ud->work_ctx = GetCurrentWorkContext();
             hidden_q8_ud->debug_layer_idx = layer_idx;
             hidden_q8_ud->requested_task_count = native_moe_callback_tasks;
+            hidden_q8_ud->fused_router_state = fused_router_state;
         }
         ggml_tensor* args[] = {fast_down_exps, hidden, selected_experts, gate_logits};
         fused_out = ggml_custom_4d(ctx, GGML_TYPE_F32, fast_down_exps->ne[1], selected_experts->ne[1], 1, 1, args, 4,
@@ -4691,7 +4916,11 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             ggml_set_name(weights, "lfm2_native_moe_scaled_weights");
         }
     } else if (model->moe_norm_topk_prob) {
-        weights = BuildMoETopKWeightsFromLogits(ctx, gate_logits, selected_experts, "qwen35_native_moe_norm_weights");
+        weights = fused_router_state
+                      ? BuildQwenNativeMoEFusedRouterWeights(ctx, selected_experts, fused_router_state,
+                                                            "qwen35_native_moe_norm_weights")
+                      : BuildMoETopKWeightsFromLogits(ctx, gate_logits, selected_experts,
+                                                     "qwen35_native_moe_norm_weights");
         if (!weights) {
             return reject_native_moe("topk_weights_build_failed");
         }

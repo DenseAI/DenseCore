@@ -249,6 +249,102 @@ bool ComputeMoEQ4KQ8KBatchedRowDotprod(const void* weight_row, const uint8_t* qu
 
     return true;
 }
+
+bool ComputeMoEQ4KQ8KBatchedRowPairDotprod(const void* gate_weight_row, const void* up_weight_row,
+                                            const uint8_t* quant_input_base, size_t quant_row_stride, int M, int K,
+                                            float* gate_out_sums, float* up_out_sums) {
+    if (!gate_weight_row || !up_weight_row || !quant_input_base || !gate_out_sums || !up_out_sums || M <= 0 ||
+        M > kMoEQ4KRawBatchedTileM || K <= 0 || (K % QK_K) != 0) {
+        return false;
+    }
+    const int nb = K / QK_K;
+    if (quant_row_stride < sizeof(MoEBlockQ8K) * static_cast<size_t>(nb)) {
+        return false;
+    }
+
+    std::fill(gate_out_sums, gate_out_sums + M, 0.0f);
+    std::fill(up_out_sums, up_out_sums + M, 0.0f);
+    const auto* gate_blocks = reinterpret_cast<const block_q4_K*>(gate_weight_row);
+    const auto* up_blocks = reinterpret_cast<const block_q4_K*>(up_weight_row);
+    static constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    static constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    static constexpr uint32_t kmask3 = 0x03030303;
+    const uint8x16_t low_mask = vdupq_n_u8(0x0F);
+
+    struct PreparedBlock {
+        uint8_t scales[QK_K / 32];
+        uint8_t mins[QK_K / 32];
+        int8x16_t quants[QK_K / 32][2];
+        float d = 0.0f;
+        float dmin = 0.0f;
+    };
+    const auto prepare = [&](const block_q4_K& block, PreparedBlock* prepared) {
+        uint32_t unpacked[4];
+        std::memcpy(unpacked, block.scales, 12);
+        unpacked[3] = ((unpacked[2] >> 4) & kmask2) | (((unpacked[1] >> 6) & kmask3) << 4);
+        const uint32_t aux = unpacked[1] & kmask1;
+        unpacked[1] = (unpacked[2] & kmask2) | (((unpacked[0] >> 6) & kmask3) << 4);
+        unpacked[2] = aux;
+        unpacked[0] &= kmask1;
+        std::memcpy(prepared->scales, &unpacked[0], sizeof(prepared->scales));
+        std::memcpy(prepared->mins, &unpacked[2], sizeof(prepared->mins));
+        prepared->d = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(block.d));
+        prepared->dmin = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(block.dmin));
+
+        const uint8_t* q4 = block.qs;
+        for (int chunk = 0; chunk < QK_K / 64; ++chunk) {
+            const uint8x16_t packed0 = vld1q_u8(q4);
+            const uint8x16_t packed1 = vld1q_u8(q4 + 16);
+            q4 += 32;
+            prepared->quants[2 * chunk][0] = vreinterpretq_s8_u8(vandq_u8(packed0, low_mask));
+            prepared->quants[2 * chunk][1] = vreinterpretq_s8_u8(vandq_u8(packed1, low_mask));
+            prepared->quants[2 * chunk + 1][0] = vreinterpretq_s8_u8(vshrq_n_u8(packed0, 4));
+            prepared->quants[2 * chunk + 1][1] = vreinterpretq_s8_u8(vshrq_n_u8(packed1, 4));
+        }
+    };
+
+    for (int bi = 0; bi < nb; ++bi) {
+        PreparedBlock gate;
+        PreparedBlock up;
+        prepare(gate_blocks[bi], &gate);
+        prepare(up_blocks[bi], &up);
+
+        for (int m = 0; m < M; ++m) {
+            const auto* q8_blocks =
+                reinterpret_cast<const MoEBlockQ8K*>(quant_input_base + static_cast<size_t>(m) * quant_row_stride);
+            const auto& yb = q8_blocks[bi];
+            int32_t gate_min_dot = 0;
+            int32_t up_min_dot = 0;
+            for (int j = 0; j < QK_K / 16; ++j) {
+                const int32_t q8_sum = static_cast<int32_t>(yb.bsums[j]);
+                gate_min_dot += q8_sum * static_cast<int32_t>(gate.mins[j / 2]);
+                up_min_dot += q8_sum * static_cast<int32_t>(up.mins[j / 2]);
+            }
+
+            int32_t gate_dot_scaled = 0;
+            int32_t up_dot_scaled = 0;
+            const int8_t* q8 = yb.qs;
+            for (int group = 0; group < QK_K / 32; ++group) {
+                const int8x16_t q8_lo = vld1q_s8(q8 + group * 32);
+                const int8x16_t q8_hi = vld1q_s8(q8 + group * 32 + 16);
+                int32x4_t gate_acc = vdupq_n_s32(0);
+                gate_acc = vdotq_s32(gate_acc, q8_lo, gate.quants[group][0]);
+                gate_acc = vdotq_s32(gate_acc, q8_hi, gate.quants[group][1]);
+                gate_dot_scaled += static_cast<int32_t>(gate.scales[group]) * vaddvq_s32(gate_acc);
+                int32x4_t up_acc = vdupq_n_s32(0);
+                up_acc = vdotq_s32(up_acc, q8_lo, up.quants[group][0]);
+                up_acc = vdotq_s32(up_acc, q8_hi, up.quants[group][1]);
+                up_dot_scaled += static_cast<int32_t>(up.scales[group]) * vaddvq_s32(up_acc);
+            }
+
+            gate_out_sums[m] += gate.d * yb.d * static_cast<float>(gate_dot_scaled) -
+                                gate.dmin * yb.d * static_cast<float>(gate_min_dot);
+            up_out_sums[m] += up.d * yb.d * static_cast<float>(up_dot_scaled) -
+                              up.dmin * yb.d * static_cast<float>(up_min_dot);
+        }
+    }
+    return true;
+}
 #endif
 
 #if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
@@ -853,12 +949,22 @@ bool ComputeMoEQ4KQ8KBatchedRow2Avx2(const void* weight_row0, const void* weight
 
 bool ComputeMoEQ4KQ8KBatchedRowPair(const void* gate_weight_row, const void* up_weight_row,
                                     const uint8_t* quant_input_base, size_t quant_row_stride, int M, int K,
-                                    float* gate_out_sums, float* up_out_sums) {
+                                    float* gate_out_sums, float* up_out_sums,
+                                    bool* specialized_pair_used = nullptr) {
+    if (specialized_pair_used) *specialized_pair_used = false;
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+    if (ComputeMoEQ4KQ8KBatchedRowPairDotprod(gate_weight_row, up_weight_row, quant_input_base, quant_row_stride, M,
+                                              K, gate_out_sums, up_out_sums)) {
+        if (specialized_pair_used) *specialized_pair_used = true;
+        return true;
+    }
+#endif
 #if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
     if (IsLFM2PrefillQ4KRawBatchedVnniEnabled() &&
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
         ComputeMoEQ4KQ8KBatchedRowPairVnni(gate_weight_row, up_weight_row, quant_input_base, quant_row_stride, M, K,
                                            gate_out_sums, up_out_sums)) {
+        if (specialized_pair_used) *specialized_pair_used = true;
         return true;
     }
 #else
@@ -869,6 +975,7 @@ bool ComputeMoEQ4KQ8KBatchedRowPair(const void* gate_weight_row, const void* up_
     if (ggml_cpu_has_avx2() &&
         ComputeMoEQ4KQ8KBatchedRowPairAvx2(gate_weight_row, up_weight_row, quant_input_base, quant_row_stride, M, K,
                                            gate_out_sums, up_out_sums)) {
+        if (specialized_pair_used) *specialized_pair_used = true;
         return true;
     }
 #endif
@@ -1375,6 +1482,9 @@ bool RunMoEQ4KRawBatchedFusedSwiGLUImpl(CpuBackend* backend, const void* gate_we
     const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
 
     std::atomic<bool> ok{true};
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+    std::atomic<bool> arm_rowpair_used{false};
+#endif
     const auto compute_rows = [&](int n_start, int n_end) {
         alignas(64) float gate_sums[kMoEQ4KRawBatchedTileM];
         alignas(64) float up_sums[kMoEQ4KRawBatchedTileM];
@@ -1389,11 +1499,16 @@ bool RunMoEQ4KRawBatchedFusedSwiGLUImpl(CpuBackend* backend, const void* gate_we
                     static_cast<const char*>(gate_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
                 const void* up_row =
                     static_cast<const char*>(up_weight_ptr) + static_cast<size_t>(n) * weight_row_bytes;
+                bool specialized_pair_used = false;
                 if (!ComputeMoEQ4KQ8KBatchedRowPair(gate_row, up_row, q_tile, qinput_row_bytes, tile_m,
-                                                    static_cast<int>(K), gate_sums, up_sums)) {
+                                                    static_cast<int>(K), gate_sums, up_sums,
+                                                    &specialized_pair_used)) {
                     ok.store(false, std::memory_order_relaxed);
                     return;
                 }
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+                if (specialized_pair_used) arm_rowpair_used.store(true, std::memory_order_relaxed);
+#endif
                 for (int m = 0; m < tile_m; ++m) {
                     const float gate = gate_sums[m];
                     const float up = up_sums[m];
@@ -1412,10 +1527,15 @@ bool RunMoEQ4KRawBatchedFusedSwiGLUImpl(CpuBackend* backend, const void* gate_we
     const bool success = ok.load(std::memory_order_relaxed);
     if (success) {
         const auto elapsed = std::chrono::steady_clock::now() - begin;
+        const uint64_t elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
         RecordMoEKQuantRawBatchedUse(
-            GetCurrentWorkContext(), GGML_TYPE_Q4_K,
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
-            /*qwen_native_w2_q5k=*/false);
+            GetCurrentWorkContext(), GGML_TYPE_Q4_K, elapsed_ns, /*qwen_native_w2_q5k=*/false);
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_DOTPROD)
+        if (arm_rowpair_used.load(std::memory_order_relaxed)) {
+            RecordQwenNativeMoEQ4GateUpRowPairUse(GetCurrentWorkContext(), elapsed_ns);
+        }
+#endif
     }
     return success;
 }

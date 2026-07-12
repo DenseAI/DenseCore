@@ -1,5 +1,8 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
+#include <numeric>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -19,6 +22,12 @@ std::vector<CpuBackend::ExpertWeights> BuildExpertWeightsForTest(const Transform
                                                                  const TransformerModel* model);
 int ResolveNativeMoEGraphCallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int phase,
                                                   int64_t n_tokens, int top_k);
+bool ComputeQwenNativeMoEStableTopKForTest(const std::vector<float>& logits, int top_k,
+                                            std::vector<int32_t>* selected,
+                                            std::vector<float>* normalized_weights);
+bool RunQwenNativeMoEFusedRouterCustomNodeForTest(const std::vector<float>& logits,
+                                                   std::vector<int32_t>* selected,
+                                                   std::vector<float>* normalized_weights);
 bool RemapNativeMoECallbackTaskForTest(int requested_task_count, int ith, int nth, int* effective_ith,
                                        int* effective_nth);
 bool ShouldEnableNativeMoEFastPathByDefaultForTest(const TransformerModel* model, int phase, int mode);
@@ -53,6 +62,83 @@ float ReadTensorF32(const ggml_tensor* tensor, int64_t row, int64_t col) {
     const auto* base = reinterpret_cast<const char*>(tensor->data);
     return *reinterpret_cast<const float*>(base + static_cast<size_t>(row) * tensor->nb[1] +
                                            static_cast<size_t>(col) * tensor->nb[0]);
+}
+
+TEST(MoETrace, QwenFusedRouterMatchesDescendingTop8ForFiniteLogits) {
+    std::vector<float> logits(32);
+    for (size_t i = 0; i < logits.size(); ++i) {
+        logits[i] = std::sin(static_cast<float>(i) * 0.71f) + static_cast<float>(i) * 0.001f;
+    }
+    std::vector<int32_t> expected(logits.size());
+    for (size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<int32_t>(i);
+    std::sort(expected.begin(), expected.end(), [&](int32_t lhs, int32_t rhs) {
+        if (logits[lhs] != logits[rhs]) return logits[lhs] > logits[rhs];
+        return lhs < rhs;
+    });
+
+    std::vector<int32_t> selected;
+    std::vector<float> weights;
+    ASSERT_TRUE(densecore::testing::ComputeQwenNativeMoEStableTopKForTest(logits, 8, &selected, &weights));
+    ASSERT_EQ(selected.size(), 8u);
+    EXPECT_TRUE(std::equal(selected.begin(), selected.end(), expected.begin()));
+    ASSERT_EQ(weights.size(), 8u);
+    EXPECT_NEAR(std::accumulate(weights.begin(), weights.end(), 0.0f), 1.0f, 1e-6f);
+    for (float weight : weights) {
+        EXPECT_TRUE(std::isfinite(weight));
+        EXPECT_GT(weight, 0.0f);
+    }
+}
+
+TEST(MoETrace, QwenFusedRouterUsesStableExpertOrderForTies) {
+    std::vector<float> logits(24, -1.0f);
+    for (int expert : {1, 3, 4, 7, 9, 11, 15, 20, 22}) logits[expert] = 5.0f;
+
+    std::vector<int32_t> selected;
+    std::vector<float> weights;
+    ASSERT_TRUE(densecore::testing::ComputeQwenNativeMoEStableTopKForTest(logits, 8, &selected, &weights));
+    const std::vector<int32_t> expected{1, 3, 4, 7, 9, 11, 15, 20};
+    EXPECT_EQ(selected, expected);
+    for (float weight : weights) EXPECT_FLOAT_EQ(weight, 0.125f);
+}
+
+TEST(MoETrace, QwenFusedRouterCustomNodePublishesSelectedExpertsAndWeights) {
+    std::vector<float> logits(32, -4.0f);
+    for (int expert = 0; expert < 12; ++expert) logits[expert] = static_cast<float>(expert) * 0.5f;
+    std::vector<int32_t> expected_selected;
+    std::vector<float> expected_weights;
+    ASSERT_TRUE(densecore::testing::ComputeQwenNativeMoEStableTopKForTest(
+        logits, 8, &expected_selected, &expected_weights));
+
+    std::vector<int32_t> actual_selected;
+    std::vector<float> actual_weights;
+    ASSERT_TRUE(densecore::testing::RunQwenNativeMoEFusedRouterCustomNodeForTest(
+        logits, &actual_selected, &actual_weights));
+    EXPECT_EQ(actual_selected, expected_selected);
+    ASSERT_EQ(actual_weights.size(), expected_weights.size());
+    for (size_t i = 0; i < actual_weights.size(); ++i) {
+        EXPECT_FLOAT_EQ(actual_weights[i], expected_weights[i]);
+    }
+}
+
+TEST(MoETrace, QwenFusedRouterNormalizesExtremeLogitsWithoutNaNs) {
+    std::vector<float> logits(16, -1000.0f);
+    logits[0] = INFINITY;
+    logits[1] = INFINITY;
+    logits[2] = std::numeric_limits<float>::quiet_NaN();
+    logits[3] = 1000.0f;
+    logits[4] = 999.0f;
+
+    std::vector<int32_t> selected;
+    std::vector<float> weights;
+    ASSERT_TRUE(densecore::testing::ComputeQwenNativeMoEStableTopKForTest(logits, 8, &selected, &weights));
+    EXPECT_EQ(selected[0], 0);
+    EXPECT_EQ(selected[1], 1);
+    EXPECT_EQ(selected.back(), 8);
+    EXPECT_NEAR(std::accumulate(weights.begin(), weights.end(), 0.0f), 1.0f, 1e-6f);
+    for (float weight : weights) {
+        EXPECT_TRUE(std::isfinite(weight));
+        EXPECT_FLOAT_EQ(weight, 0.125f);
+    }
 }
 
 TEST(SamplingTrace, RecordsPreAndPostPenaltyTopLogits) {

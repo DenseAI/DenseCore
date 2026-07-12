@@ -5624,6 +5624,13 @@ void EngineLoop(EngineState* state) {
                         qwen36_profile.qwen_native_moe_w2_q5k_raw_batched_used_ops;
                     req->qwen_native_moe_w2_q5k_raw_batched_ns +=
                         qwen36_profile.qwen_native_moe_w2_q5k_raw_batched_ns;
+                    req->qwen_native_moe_fused_router_used_ops +=
+                        qwen36_profile.qwen_native_moe_fused_router_used_ops;
+                    req->qwen_native_moe_fused_router_ns += qwen36_profile.qwen_native_moe_fused_router_ns;
+                    req->qwen_native_moe_q4_gateup_rowpair_used_ops +=
+                        qwen36_profile.qwen_native_moe_q4_gateup_rowpair_used_ops;
+                    req->qwen_native_moe_q4_gateup_rowpair_ns +=
+                        qwen36_profile.qwen_native_moe_q4_gateup_rowpair_ns;
                     if (!qwen36_profile.native_moe_fast_decode_last_reject_reason.empty()) {
                         req->native_moe_fast_decode_last_reject_reason =
                             qwen36_profile.native_moe_fast_decode_last_reject_reason;

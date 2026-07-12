@@ -672,6 +672,10 @@ struct Request {
     uint64_t native_moe_fast_w2_q5k_ns = 0;
     uint64_t qwen_native_moe_w2_q5k_raw_batched_used_ops = 0;
     uint64_t qwen_native_moe_w2_q5k_raw_batched_ns = 0;
+    uint64_t qwen_native_moe_fused_router_used_ops = 0;
+    uint64_t qwen_native_moe_fused_router_ns = 0;
+    uint64_t qwen_native_moe_q4_gateup_rowpair_used_ops = 0;
+    uint64_t qwen_native_moe_q4_gateup_rowpair_ns = 0;
     uint64_t graph_ctx_requested_mb = 0;
     uint64_t graph_ctx_available_mb = 0;
     uint64_t graph_ctx_safety_margin_mb = 0;
@@ -1167,6 +1171,10 @@ struct Request {
         native_moe_fast_w2_q5k_ns = 0;
         qwen_native_moe_w2_q5k_raw_batched_used_ops = 0;
         qwen_native_moe_w2_q5k_raw_batched_ns = 0;
+        qwen_native_moe_fused_router_used_ops = 0;
+        qwen_native_moe_fused_router_ns = 0;
+        qwen_native_moe_q4_gateup_rowpair_used_ops = 0;
+        qwen_native_moe_q4_gateup_rowpair_ns = 0;
         graph_ctx_requested_mb = 0;
         graph_ctx_available_mb = 0;
         graph_ctx_safety_margin_mb = 0;

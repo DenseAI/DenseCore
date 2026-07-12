@@ -701,6 +701,10 @@ TEST(WorkerResultDispatchTest, QwenDecodeSummaryAcceptsNativeMoeFastGateUpAndDow
     req.native_moe_fast_w2_q5k_used_ops = 1;
     req.qwen_native_moe_w2_q5k_raw_batched_used_ops = 1;
     req.qwen_native_moe_w2_q5k_raw_batched_ns = 2'000'000;
+    req.qwen_native_moe_fused_router_used_ops = 40;
+    req.qwen_native_moe_fused_router_ns = 1'500'000;
+    req.qwen_native_moe_q4_gateup_rowpair_used_ops = 20;
+    req.qwen_native_moe_q4_gateup_rowpair_ns = 2'500'000;
     req.moe_kquant_raw_batched_q4k_used_ops = 2;
     req.moe_kquant_raw_batched_q4k_ns = 3'000'000;
     req.moe_kquant_raw_batched_q5k_used_ops = 3;
@@ -738,6 +742,10 @@ TEST(WorkerResultDispatchTest, QwenDecodeSummaryAcceptsNativeMoeFastGateUpAndDow
     EXPECT_NE(captured.find("qwen_fast_path_ok=1"), std::string::npos);
     EXPECT_NE(captured.find("qwen_native_moe_w2_q5k_raw_batched_used_ops=1"), std::string::npos);
     EXPECT_NE(captured.find("qwen_native_moe_w2_q5k_raw_batched_ms=2"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_native_moe_fused_router_used_ops=40"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_native_moe_fused_router_ms=1.5"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_native_moe_q4_gateup_rowpair_used_ops=20"), std::string::npos);
+    EXPECT_NE(captured.find("qwen_native_moe_q4_gateup_rowpair_ms=2.5"), std::string::npos);
     EXPECT_NE(captured.find("moe_kquant_raw_batched_q4k_used_ops=2"), std::string::npos);
     EXPECT_NE(captured.find("moe_kquant_raw_batched_q4k_ms=3"), std::string::npos);
     EXPECT_NE(captured.find("qwen_native_moe_w1w3_q4k_raw_batched_used_ops=2"), std::string::npos);

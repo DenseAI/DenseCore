@@ -505,6 +505,10 @@ struct Qwen36ProfileSnapshot {
     uint64_t native_moe_fast_w2_q5k_ns = 0;
     uint64_t qwen_native_moe_w2_q5k_raw_batched_used_ops = 0;
     uint64_t qwen_native_moe_w2_q5k_raw_batched_ns = 0;
+    uint64_t qwen_native_moe_fused_router_used_ops = 0;
+    uint64_t qwen_native_moe_fused_router_ns = 0;
+    uint64_t qwen_native_moe_q4_gateup_rowpair_used_ops = 0;
+    uint64_t qwen_native_moe_q4_gateup_rowpair_ns = 0;
     int qwen35_moe_path = 0;
     uint64_t qwen35_moe_layers_seen = 0;
     uint64_t qwen35_moe_forward_calls = 0;
@@ -597,6 +601,8 @@ void RecordMoEQ4KRepackedDecision(InferenceWorkContext* ctx, bool candidate, boo
 void RecordMoEQ5KRepackedDecision(InferenceWorkContext* ctx, bool candidate, bool used, const char* reject_reason);
 void RecordMoEKQuantRawBatchedUse(InferenceWorkContext* ctx, ggml_type weight_type, uint64_t wall_ns,
                                   bool qwen_native_w2_q5k);
+void RecordQwenNativeMoEFusedRouterUse(InferenceWorkContext* ctx, uint64_t wall_ns);
+void RecordQwenNativeMoEQ4GateUpRowPairUse(InferenceWorkContext* ctx, uint64_t wall_ns);
 void RecordGemma4MoEPrefillQuantBatchDecision(InferenceWorkContext* ctx, bool candidate, bool used,
                                               const char* reject_reason, bool gate_up_used, bool down_used);
 void RecordGemma4NativeMoEPrefillDecision(InferenceWorkContext* ctx, bool candidate, bool used,
