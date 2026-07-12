@@ -772,11 +772,7 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
             LogHybridSSMQkvDispatch(weight_name, weight_type, 1, K, N, "GEMV_NATIVE_VECDOT_CALLBACK", false, true,
                                     false);
         }
-        const int q8_repacked_min_rows =
-            IsGemma4SharedDenseFfnWeightName(weight_name)
-                ? ParsePositiveEnvInt("DENSECORE_GEMMA4_SHARED_Q8_REPACKED_MIN_ROWS",
-                                      kQ8RepackedGemvMinOutputRows)
-                : kQ8RepackedGemvMinOutputRows;
+        const int q8_repacked_min_rows = kQ8RepackedGemvMinOutputRows;
         if (!ud->disable_q8_repacked_gemv && weight_type == GGML_TYPE_Q8_0 && ud->input_quant_type == GGML_TYPE_Q8_0 &&
             (K >= q8_repacked_min_rows || ud->force_q8_repacked_gemv) &&
             (N % QK8_0) == 0 && (K % 4) == 0) {

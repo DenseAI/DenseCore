@@ -75,14 +75,14 @@ MoESmallDecodeState GatherMoESmallDecodeState(const RegistryPtr& registry, const
     return state;
 }
 
-// Handles the Gemma4 / Qwen3.6 "safe reference" fast paths that bypass the
-// optimized MoE execution entirely. Returns true if the call was fully handled
-// (the caller must then return); false to continue with the normal MoE path.
+// Handles the Gemma4 safe-reference hook that bypasses optimized MoE execution
+// entirely. Returns true if the call was fully handled; false continues normal
+// MoE execution.
 bool TryExecuteMoESafeReferenceFastPath(CpuBackend* backend, const TransformerModel* model, int layer_idx,
                                         const BatchSpec* batch, const float* input_data, int batch_size,
                                         int hidden_dim, const moe::MoERouteResult& routing,
                                         const CpuBackend::ExpertWeights* experts, int num_experts, float* out_data,
-                                        bool qwen36_short_prefill_safe_reference, bool safe_reference_mode) {
+                                        bool safe_reference_mode) {
     const bool gemma4_safe_reference_mode = model && model->arch_flags.is_gemma4 && safe_reference_mode;
     if (gemma4_safe_reference_mode) {
         if (!ExecuteMoEReferencePath(input_data, batch_size, hidden_dim, routing, experts, num_experts, out_data)) {
@@ -90,13 +90,6 @@ bool TryExecuteMoESafeReferenceFastPath(CpuBackend* backend, const TransformerMo
             return true;
         }
         RecordMoEReferencePathTrace(backend, layer_idx, batch, routing, num_experts);
-        if (ShouldRunMoEReferenceCheck()) {
-            RunMoEReferenceCheck(input_data, batch_size, hidden_dim, routing, experts, num_experts, out_data);
-        }
-        return true;
-    }
-    if (qwen36_short_prefill_safe_reference &&
-        ExecuteMoEReferencePath(input_data, batch_size, hidden_dim, routing, experts, num_experts, out_data)) {
         if (ShouldRunMoEReferenceCheck()) {
             RunMoEReferenceCheck(input_data, batch_size, hidden_dim, routing, experts, num_experts, out_data);
         }
@@ -220,7 +213,9 @@ void BuildMoESmallDecodeNodePartition(const MoESmallDecodeTileParallelRequest& r
         const int expert_id = req.routing->expert_ids[static_cast<size_t>(assignment)];
         int node = (expert_id >= 0 && expert_id < req.num_experts) ? req.profiler->GetExpertNumaNode(expert_id) : -1;
         if (node < 0 || node >= num_nodes) {
-            node = assignment % num_nodes;  // unknown placement: spread for aggregate bandwidth
+            partition->node_assignments.clear();
+            partition->num_nodes = 0;
+            return;  // Unknown placement is not sticky; preserve the legacy execution path.
         }
         partition->node_assignments[static_cast<size_t>(node)].push_back(assignment);
     }

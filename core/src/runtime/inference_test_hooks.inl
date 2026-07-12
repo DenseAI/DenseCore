@@ -1575,6 +1575,30 @@ bool RemapNativeMoECallbackTaskForTest(int requested_task_count, int ith, int nt
     ud.requested_task_count = requested_task_count;
     return ::RemapNativeMoECallbackTask(&ud, ith, nth, effective_ith, effective_nth);
 }
+
+bool QwenNativeMoENoAllocUserDataIsPerOpForTest() {
+    ggml_init_params params{};
+    params.mem_size = 1 << 20;
+    params.no_alloc = true;
+    ggml_context* ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor* src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, QK_K, 1, 1);
+    auto* first = ::AllocateQwen35SharedQ8RowsUserData(ctx, src, 8);
+    auto* second = ::AllocateQwen35SharedQ8RowsUserData(ctx, src, 8);
+    const bool per_op = first && second && first != second && first->rows != second->rows &&
+                        first->assignments != second->assignments;
+    const auto destroy = [](Qwen35SharedQ8RowsUserData* ud) {
+        if (!ud) return;
+        delete[] ud->rows;
+        delete[] ud->assignments;
+        delete ud;
+    };
+    destroy(first);
+    destroy(second);
+    ggml_free(ctx);
+    return per_op;
+}
 }  // namespace testing
 }  // namespace densecore
 #endif

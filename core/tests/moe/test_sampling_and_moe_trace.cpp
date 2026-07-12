@@ -30,6 +30,7 @@ bool RunQwenNativeMoEFusedRouterCustomNodeForTest(const std::vector<float>& logi
                                                    std::vector<float>* normalized_weights);
 bool RemapNativeMoECallbackTaskForTest(int requested_task_count, int ith, int nth, int* effective_ith,
                                        int* effective_nth);
+bool QwenNativeMoENoAllocUserDataIsPerOpForTest();
 bool ShouldEnableNativeMoEFastPathByDefaultForTest(const TransformerModel* model, int phase, int mode);
 int64_t Qwen35NativeMoEMaxDirectTokensForTest();
 bool CanUseQwenNativeMoEGateUpForTest(const TransformerModel* model, const ggml_tensor* gate_exps,
@@ -99,6 +100,10 @@ TEST(MoETrace, QwenFusedRouterUsesStableExpertOrderForTies) {
     const std::vector<int32_t> expected{1, 3, 4, 7, 9, 11, 15, 20};
     EXPECT_EQ(selected, expected);
     for (float weight : weights) EXPECT_FLOAT_EQ(weight, 0.125f);
+}
+
+TEST(MoETrace, QwenNativeMoENoAllocUserDataDoesNotAliasAcrossOps) {
+    EXPECT_TRUE(densecore::testing::QwenNativeMoENoAllocUserDataIsPerOpForTest());
 }
 
 TEST(MoETrace, QwenFusedRouterCustomNodePublishesSelectedExpertsAndWeights) {
@@ -830,7 +835,6 @@ TEST(MoETrace, StrictModeRecordsConsumableFailureMessage) {
 TEST(MoETrace, ForceSafeReferenceUsesReferencePathOnAllArchitectures) {
     densecore::CpuBackend& backend = densecore::GetCpuBackend();
     backend.ResetMoEPathTrace();
-    unsetenv("DENSECORE_MOE_SAFE_REFERENCE");
 
     std::vector<float> input_data = {1.0f, -0.5f};
     std::vector<float> output_data(2, 0.0f);

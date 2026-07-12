@@ -827,11 +827,6 @@ bool Qwen35CanonicalizeFusedBA(const float* raw, const int64_t ne[4], int n_embd
 
     auto beta_slot = [&](int head_idx) { return beta_out->data() + static_cast<size_t>(head_idx) * n_embd; };
     auto alpha_slot = [&](int head_idx) { return alpha_out->data() + static_cast<size_t>(head_idx) * n_embd; };
-    const bool swap_qwen36_fused_ba = []() {
-        const char* env = std::getenv("DENSECORE_QWEN36_SWAP_FUSED_BA_ORDER");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-
     if (ne[0] == n_embd && ne[1] == fused_width) {
         for (int group = 0; group < n_groups; ++group) {
             const int group_base = group * heads_per_group;
@@ -840,8 +835,8 @@ bool Qwen35CanonicalizeFusedBA(const float* raw, const int64_t ne[4], int n_embd
                 const int head_idx = group_base + local_head;
                 const int first_col = fused_base + local_head;
                 const int second_col = fused_base + heads_per_group + local_head;
-                const int beta_col = swap_qwen36_fused_ba ? second_col : first_col;
-                const int alpha_col = swap_qwen36_fused_ba ? first_col : second_col;
+                const int beta_col = first_col;
+                const int alpha_col = second_col;
                 std::copy(raw + static_cast<size_t>(beta_col) * n_embd,
                           raw + static_cast<size_t>(beta_col + 1) * n_embd, beta_slot(head_idx));
                 std::copy(raw + static_cast<size_t>(alpha_col) * n_embd,
@@ -859,8 +854,8 @@ bool Qwen35CanonicalizeFusedBA(const float* raw, const int64_t ne[4], int n_embd
                 const int head_idx = group_base + local_head;
                 const int first_row = fused_base + local_head;
                 const int second_row = fused_base + heads_per_group + local_head;
-                const int beta_row = swap_qwen36_fused_ba ? second_row : first_row;
-                const int alpha_row = swap_qwen36_fused_ba ? first_row : second_row;
+                const int beta_row = first_row;
+                const int alpha_row = second_row;
                 for (int embd_idx = 0; embd_idx < n_embd; ++embd_idx) {
                     beta_slot(head_idx)[embd_idx] = raw[static_cast<size_t>(embd_idx) * fused_width + beta_row];
                     alpha_slot(head_idx)[embd_idx] = raw[static_cast<size_t>(embd_idx) * fused_width + alpha_row];

@@ -89,15 +89,20 @@ int CpuBackend::RebalanceExperts(const TransformerLayer* layer_key, const std::v
     }
 
     std::shared_ptr<moe::ExpertProfiler> profiler;
-    std::vector<int>* local_expert_ids = nullptr;
+    std::vector<int> local_expert_ids;
     {
         std::lock_guard<std::mutex> lock(registry->mutex);
         profiler = registry->profiler;
-        local_expert_ids = &registry->local_expert_ids;
+        local_expert_ids = registry->local_expert_ids;
     }
 
-    return RebalanceExpertsInternal(hot_expert_ids, expert_weights, n_experts, target_numa_node,
-                                    profiler ? profiler.get() : nullptr, local_expert_ids);
+    const int migrated = RebalanceExpertsInternal(hot_expert_ids, expert_weights, n_experts, target_numa_node,
+                                                  profiler ? profiler.get() : nullptr, &local_expert_ids);
+    {
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        registry->local_expert_ids = std::move(local_expert_ids);
+    }
+    return migrated;
 }
 
 int CpuBackend::RebalanceExpertsInternal(const std::vector<int>& hot_expert_ids,
@@ -114,9 +119,9 @@ int CpuBackend::RebalanceExpertsInternal(const std::vector<int>& hot_expert_ids,
     }
 
     std::vector<int> experts_to_migrate = hot_expert_ids;
+    const std::vector<int> previous_local = local_expert_ids ? *local_expert_ids : std::vector<int>{};
     if (profiler && local_expert_ids && !hot_expert_ids.empty()) {
         const size_t target_size = hot_expert_ids.size();
-        std::vector<int> previous_local = *local_expert_ids;
 
         if (previous_local.empty()) {
             *local_expert_ids = hot_expert_ids;
@@ -210,12 +215,18 @@ int CpuBackend::RebalanceExpertsInternal(const std::vector<int>& hot_expert_ids,
     }
     if (numa_available() < 0) {
         std::cerr << "[CpuBackend] NUMA not available on this system" << std::endl;
+        if (local_expert_ids) {
+            *local_expert_ids = previous_local;
+        }
         return 0;
     }
 
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
         std::cerr << "[CpuBackend] Failed to get page size" << std::endl;
+        if (local_expert_ids) {
+            *local_expert_ids = previous_local;
+        }
         return 0;
     }
 
@@ -223,17 +234,22 @@ int CpuBackend::RebalanceExpertsInternal(const std::vector<int>& hot_expert_ids,
     int total_pages_failed = 0;
     static bool logged_permission_error = false;
 
-    auto migrate_buffer = [&](const ExpertWeight& weight) -> int {
-        if (!weight.ptr || weight.size == 0) return 0;
+    struct BufferMigrationResult {
+        int pages_on_target = 0;
+        bool verified = true;
+    };
+    auto migrate_buffer = [&](const ExpertWeight& weight) -> BufferMigrationResult {
+        if (!weight.ptr || weight.size == 0) return {};
 
         uintptr_t start_addr = reinterpret_cast<uintptr_t>(weight.ptr);
-        uintptr_t aligned_start = start_addr & ~(page_size - 1);
+        uintptr_t aligned_start = (start_addr + page_size - 1) & ~(page_size - 1);
         uintptr_t end_addr = start_addr + weight.size;
-        size_t num_pages = (end_addr - aligned_start + page_size - 1) / page_size;
+        uintptr_t aligned_end = end_addr & ~(page_size - 1);
+        size_t num_pages = aligned_end > aligned_start ? (aligned_end - aligned_start) / page_size : 0;
 
-        if (num_pages == 0) return 0;
+        if (num_pages == 0) return {0, false};
 
-        int pages_migrated = 0;
+        BufferMigrationResult migration;
         std::vector<void*> pages(std::min(num_pages, MOVE_PAGES_BATCH_SIZE));
         std::vector<int> nodes(pages.size(), target_numa_node);
         std::vector<int> status(pages.size(), -1);
@@ -250,15 +266,18 @@ int CpuBackend::RebalanceExpertsInternal(const std::vector<int>& hot_expert_ids,
 
             long result = move_pages(0, batch_size, pages.data(), nodes.data(), status.data(), MPOL_MF_MOVE);
 
-            if (result == 0) {
+            if (result >= 0) {
                 for (size_t i = 0; i < batch_size; i++) {
                     if (status[i] == target_numa_node) {
-                        pages_migrated++;
-                    } else if (status[i] < 0) {
+                        migration.pages_on_target++;
+                    } else {
                         total_pages_failed++;
+                        migration.verified = false;
                     }
                 }
             } else if (result < 0) {
+                migration.verified = false;
+                total_pages_failed += static_cast<int>(batch_size);
                 int err = errno;
                 if ((err == EACCES || err == EPERM) && !logged_permission_error) {
                     std::cerr << "[CpuBackend] move_pages: permission denied - disabling NUMA rebalance "
@@ -274,39 +293,58 @@ int CpuBackend::RebalanceExpertsInternal(const std::vector<int>& hot_expert_ids,
             }
         }
 
-        return pages_migrated;
+        migration.verified = migration.verified && migration.pages_on_target == static_cast<int>(num_pages) &&
+                             QueryMemoryNumaNodeRange(weight.ptr, weight.size) == target_numa_node;
+        return migration;
     };
 
+    std::unordered_set<int> successfully_migrated;
     for (int expert_id : experts_to_migrate) {
         if (expert_id < 0 || expert_id >= n_experts || static_cast<size_t>(expert_id) >= expert_weights.size()) {
             continue;
         }
 
         const ExpertWeights& weights = expert_weights[expert_id];
-        size_t expert_pages = 0;
-        expert_pages += migrate_buffer(weights.w1);
-        expert_pages += migrate_buffer(weights.w2);
-        expert_pages += migrate_buffer(weights.w3);
+        const BufferMigrationResult w1 = migrate_buffer(weights.w1);
+        const BufferMigrationResult w2 = migrate_buffer(weights.w2);
+        const BufferMigrationResult w3 = migrate_buffer(weights.w3);
+        const size_t expert_pages = static_cast<size_t>(w1.pages_on_target + w2.pages_on_target + w3.pages_on_target);
         total_pages_migrated += expert_pages;
 
-        bool bound = true;
-        if (weights.w1.ptr && weights.w1.size) {
-            bound &= BindMemoryToNumaNode(weights.w1.ptr, weights.w1.size, target_numa_node);
-        }
-        if (weights.w2.ptr && weights.w2.size) {
-            bound &= BindMemoryToNumaNode(weights.w2.ptr, weights.w2.size, target_numa_node);
-        }
-        if (weights.w3.ptr && weights.w3.size) {
-            bound &= BindMemoryToNumaNode(weights.w3.ptr, weights.w3.size, target_numa_node);
-        }
-        if (profiler && target_numa_node >= 0 && bound) {
+        const bool migrated = w1.verified && w2.verified && w3.verified && expert_pages > 0;
+        if (profiler && target_numa_node >= 0 && migrated) {
             profiler->SetExpertNumaNode(expert_id, target_numa_node);
+            successfully_migrated.insert(expert_id);
         }
 #if DENSECORE_NUMA_DEBUG
-        if (!bound) {
-            std::cerr << "[NUMA] mbind failed for expert " << expert_id << " on node " << target_numa_node << std::endl;
+        if (!migrated) {
+            std::cerr << "[NUMA] page migration was not verified for expert " << expert_id << " on node "
+                      << target_numa_node << std::endl;
         }
 #endif
+    }
+
+    if (local_expert_ids) {
+        const std::unordered_set<int> previous_set(previous_local.begin(), previous_local.end());
+        const size_t target_size = local_expert_ids->size();
+        std::vector<int> committed;
+        committed.reserve(target_size);
+        std::unordered_set<int> committed_set;
+        for (int expert_id : *local_expert_ids) {
+            const bool was_local = previous_set.find(expert_id) != previous_set.end();
+            const bool migration_succeeded = successfully_migrated.find(expert_id) != successfully_migrated.end();
+            if ((was_local || migration_succeeded) && committed_set.insert(expert_id).second) {
+                committed.push_back(expert_id);
+            }
+        }
+        // A failed newcomer must not evict a previously committed sticky expert.
+        for (int expert_id : previous_local) {
+            if (committed.size() >= target_size) break;
+            if (expert_id >= 0 && expert_id < n_experts && committed_set.insert(expert_id).second) {
+                committed.push_back(expert_id);
+            }
+        }
+        *local_expert_ids = std::move(committed);
     }
 
     if (total_pages_migrated > 0 || total_pages_failed > 0) {
@@ -321,6 +359,9 @@ int CpuBackend::RebalanceExpertsInternal(const std::vector<int>& hot_expert_ids,
 
     return total_pages_migrated;
 #else
+    if (local_expert_ids) {
+        *local_expert_ids = previous_local;
+    }
     if (target_numa_node < 0) {
         target_numa_node = 0;
     }
@@ -537,6 +578,43 @@ moe::ExpertProfiler* CpuBackend::GetProfiler(const TransformerLayer* layer_key) 
     return registry->profiler.get();
 }
 
+int CpuBackend::GetExpertNumaNode(const TransformerLayer* layer_key, int expert_id) const {
+    auto registry = GetMoELayerRegistry(layer_key);
+    if (!registry) {
+        return -1;
+    }
+    std::shared_ptr<moe::ExpertProfiler> profiler;
+    {
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        profiler = registry->profiler;
+    }
+    return profiler ? profiler->GetExpertNumaNode(expert_id) : -1;
+}
+
+bool CpuBackend::CopyExpertNumaNodes(const TransformerLayer* layer_key, int n_experts,
+                                    std::vector<int>* nodes) const {
+    if (!nodes || n_experts <= 0) {
+        return false;
+    }
+    auto registry = GetMoELayerRegistry(layer_key);
+    if (!registry) {
+        return false;
+    }
+    std::shared_ptr<moe::ExpertProfiler> profiler;
+    {
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        profiler = registry->profiler;
+    }
+    if (!profiler || profiler->GetNumExperts() < n_experts) {
+        return false;
+    }
+    nodes->resize(static_cast<size_t>(n_experts));
+    for (int expert_id = 0; expert_id < n_experts; ++expert_id) {
+        (*nodes)[static_cast<size_t>(expert_id)] = profiler->GetExpertNumaNode(expert_id);
+    }
+    return true;
+}
+
 void CpuBackend::RegisterMoEExperts(const std::vector<ExpertWeights>& experts) {
     RegisterMoEExperts(nullptr, experts);
 }
@@ -583,29 +661,25 @@ void CpuBackend::RegisterMoEExperts(const TransformerLayer* layer_key, const std
     if (registry->profiler) {
         int detected_count = 0;
         auto detect_expert_numa_node = [this](const ExpertWeights& expert) -> int {
-            std::unordered_map<int, int> node_votes;
-
-            auto vote = [this, &node_votes](void* ptr) {
-                if (!ptr) return;
-                int node = QueryMemoryNumaNode(ptr);
-                if (node >= 0) {
-                    node_votes[node]++;
+            int verified_node = -1;
+            int verified_weights = 0;
+            const auto verify_weight = [this, &verified_node, &verified_weights](const ExpertWeight& weight) {
+                if (!weight.ptr || weight.size == 0) {
+                    return true;
                 }
+                const int node = QueryMemoryNumaNodeRange(weight.ptr, weight.size);
+                if (node < 0 || (verified_node >= 0 && node != verified_node)) {
+                    return false;
+                }
+                verified_node = node;
+                ++verified_weights;
+                return true;
             };
 
-            vote(expert.w1.ptr);
-            vote(expert.w2.ptr);
-            vote(expert.w3.ptr);
-
-            int best_node = -1;
-            int best_votes = 0;
-            for (const auto& entry : node_votes) {
-                if (entry.second > best_votes || (entry.second == best_votes && entry.first < best_node)) {
-                    best_node = entry.first;
-                    best_votes = entry.second;
-                }
+            if (!verify_weight(expert.w1) || !verify_weight(expert.w2) || !verify_weight(expert.w3)) {
+                return -1;
             }
-            return best_node;
+            return verified_weights > 0 ? verified_node : -1;
         };
 
         for (size_t i = 0; i < experts.size(); ++i) {

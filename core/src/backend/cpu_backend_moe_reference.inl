@@ -26,45 +26,8 @@ bool IsMoEFFNDebugTimingEnabled() {
     return enabled;
 }
 
-bool IsMoESafeReferenceModeEnabled() {
-    const char* env = std::getenv("DENSECORE_MOE_SAFE_REFERENCE");
-    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-}
-
-bool ShouldForceMoESafeReference(const CpuBackend::ExpertWeights* expert) {
-    return expert && expert->force_safe_reference;
-}
-
 bool IsMoESafeReferenceModeEnabled(const CpuBackend::ExpertWeights* expert) {
-    return IsMoESafeReferenceModeEnabled() || ShouldForceMoESafeReference(expert);
-}
-
-bool ShouldUseQwen36ShortPrefillSafeReference() {
-    const auto mode = densecore::env::ParseRuntimeToggleMode("DENSECORE_QWEN36_SHORT_PREFILL_SAFE_REFERENCE",
-#if defined(__aarch64__) || defined(_M_ARM64)
-                                                             densecore::env::RuntimeToggleMode::Off
-#else
-                                                             densecore::env::RuntimeToggleMode::On
-#endif
-    );
-    return mode == densecore::env::RuntimeToggleMode::On;
-}
-
-bool IsQwen36ShortSingleSeqPrefillSafeReferenceCandidate(const TransformerModel* model, const BatchSpec* batch,
-                                                         int batch_size) {
-    if (!model || !batch) {
-        return false;
-    }
-    if (model->variant != ModelVariant::QWEN36 || !model->arch_flags.is_hybrid_ssm) {
-        return false;
-    }
-    if (!ShouldUseQwen36ShortPrefillSafeReference()) {
-        return false;
-    }
-    if (batch->num_seqs != 1 || batch_size <= 1 || batch_size >= 64) {
-        return false;
-    }
-    return true;
+    return expert && expert->force_safe_reference;
 }
 
 bool IsMoEMatmulPathDebugEnabled() {
@@ -925,4 +888,3 @@ template <size_t N> bool FixedArrayContains(const std::array<int, N>& values, in
     }
     return false;
 }
-

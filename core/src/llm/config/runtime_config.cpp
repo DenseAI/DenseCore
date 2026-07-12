@@ -16,29 +16,12 @@ bool IsLinuxHugepagesDisabled() {
     return value && (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0);
 }
 
-bool ParseLegacyEnabledBool(const char* name, bool default_value) {
-    const char* env_value = std::getenv(name);
-    if (!env_value || env_value[0] == '\0') {
-        return default_value;
-    }
-    return std::strcmp(env_value, "0") != 0;
-}
-
 Qwen36SSMQ8PrefillAMXMode DefaultQwen36SSMQ8PrefillAMXMode() {
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(__aarch64__)
     return Qwen36SSMQ8PrefillAMXMode::On;
 #else
     return Qwen36SSMQ8PrefillAMXMode::Off;
 #endif
-}
-
-densecore::env::RuntimeToggleMode ParseRuntimeToggleEnvFailClosed(const char* name,
-                                                                  densecore::env::RuntimeToggleMode default_mode) {
-    const char* value = std::getenv(name);
-    if (!value || value[0] == '\0') {
-        return default_mode;
-    }
-    return densecore::env::ParseRuntimeToggleModeValue(value, densecore::env::RuntimeToggleMode::Off);
 }
 
 WorkerRuntimeConfig::CallbackMode ParseCallbackMode() {
@@ -84,12 +67,9 @@ WorkerRuntimeConfig LoadWorkerRuntimeConfig() {
     config.prefix_cache_reuse_disabled = env::ParseNonZeroEnv("DENSECORE_DEBUG_DISABLE_PREFIX_CACHE_REUSE", false);
     config.hybrid_ssm_snapshot_restore_disabled =
         env::ParseNonZeroEnv("DENSECORE_DEBUG_DISABLE_HYBRID_SSM_RESTORE", false);
-    config.qwen36_prefix_cache_reuse_enabled =
-        !config.prefix_cache_reuse_disabled &&
-        ParseLegacyEnabledBool("DENSECORE_QWEN36_ENABLE_PREFIX_CACHE_REUSE", true);
+    config.qwen36_prefix_cache_reuse_enabled = !config.prefix_cache_reuse_disabled;
     config.qwen36_hybrid_ssm_snapshot_restore_enabled =
-        !config.hybrid_ssm_snapshot_restore_disabled &&
-        ParseLegacyEnabledBool("DENSECORE_QWEN36_ENABLE_HYBRID_SSM_SNAPSHOT_RESTORE", true);
+        !config.hybrid_ssm_snapshot_restore_disabled;
     config.graph_cache_reuse_disabled = env::ParseNonZeroEnv("DENSECORE_DEBUG_DISABLE_GRAPH_CACHE_REUSE", false);
     config.moe_trace_plumbing_disabled = env::ParseNonZeroEnv("DENSECORE_DEBUG_DISABLE_MOE_TRACE_PLUMBING", false);
     config.moe_graph_summary = env::ParseNonZeroEnv("DENSECORE_DEBUG_MOE_GRAPH_SUMMARY", false);
@@ -258,7 +238,7 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
     config.decode_paged_attention = LoadDecodePagedAttentionPolicy();
     config.kv_retention = LoadKVRetentionPolicy();
     config.bench_respect_threads = env::ParseTruthyEnv("DENSECORE_BENCH_RESPECT_THREADS", false);
-    config.prefill_graph_cache.enabled = ParseLegacyEnabledBool("DENSECORE_PREFILL_GRAPH_CACHE", true);
+    config.prefill_graph_cache.enabled = true;
     config.prefill_graph_cache.lru_size =
         std::max(1, env::ParsePositiveEnvInt("DENSECORE_PREFILL_GRAPH_CACHE_LRU", 16));
     const std::size_t available_mb = ReadAvailableMemoryMbForAutoRuntimeCache();
@@ -268,12 +248,8 @@ FastPathRuntimeConfig LoadFastPathRuntimeConfig() {
         std::max(128, ReadPositiveIntEnv("DENSECORE_PREFILL_GRAPH_CACHE_MAX_MB", auto_prefill_graph_cache_mb));
     config.prefill_graph_cache.max_bytes = static_cast<std::size_t>(prefill_graph_cache_mb) * 1024ULL * 1024ULL;
     config.qwen36_prefill_q4k_batched = Qwen36PrefillQ4KBatchedMode::On;
-    config.qwen36_ssm_q8_amx_alias =
-        ParseRuntimeToggleEnvFailClosed("DENSECORE_QWEN36_SSM_Q8_AMX_ALIAS", env::RuntimeToggleMode::Off);
     config.qwen36_ssm_q8_prefill_amx = DefaultQwen36SSMQ8PrefillAMXMode();
     config.qwen36_ssm_q8_prefill_amx_min_tokens = 256;
-    config.qwen36_expert_cpu_repack =
-        ParseRuntimeToggleEnvFailClosed("DENSECORE_QWEN36_EXPERT_CPU_REPACK", env::RuntimeToggleMode::Auto);
     config.native_moe_fast_decode = env::RuntimeToggleMode::On;
     config.q4k_repacked_gemv = env::RuntimeToggleMode::On;
     config.q4k_repacked_gemv_allow_prefill = true;

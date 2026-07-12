@@ -730,8 +730,6 @@ TEST(Int4Qwen36KernelTest, ArmSplitNBackendGateUpLikeShapesMatchReference) {
         Tensor Z = Tensor::Make2D(zeros.data(), N, K / group_size);
         Tensor C = Tensor::Make2D(output.data(), M, N);
 
-        ScopedEnvVar split_n("DENSECORE_ARM_INT4_SPLIT_N", "1");
-        ScopedEnvVar split_n_min("DENSECORE_ARM_INT4_SPLIT_N_MIN_N", "128");
         ScopedEnvVar debug_paths("DENSECORE_DEBUG_INT4_PATHS", "1");
         if (M == 1) {
             ::testing::internal::CaptureStderr();
@@ -774,8 +772,6 @@ TEST(Int4Qwen36KernelTest, ArmSplitNBackendDownLikeShapesMatchReference) {
         Tensor Z = Tensor::Make2D(zeros.data(), N, K / group_size);
         Tensor C = Tensor::Make2D(output.data(), M, N);
 
-        ScopedEnvVar split_n("DENSECORE_ARM_INT4_SPLIT_N", "1");
-        ScopedEnvVar split_n_min("DENSECORE_ARM_INT4_SPLIT_N_MIN_N", "128");
         ScopedEnvVar debug_paths("DENSECORE_DEBUG_INT4_PATHS", "1");
         if (M == 1) {
             ::testing::internal::CaptureStderr();

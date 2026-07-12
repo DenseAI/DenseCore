@@ -1382,8 +1382,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         }
         static constexpr size_t kMaxFullBatchedQActCacheBytes = 32ull * 1024ull * 1024ull;
         const int quant_tile_cols = ResolveQuantBatchedTileCols(
-            ParsePositiveEnvInt("DENSECORE_BATCHED_QUANT_TILE_COLS", kMaxSmallBatchColsHard), vec_dot_nrows,
-            can_use_q4k_true_batched || can_use_q5k_true_batched);
+            kMaxSmallBatchColsHard, vec_dot_nrows, can_use_q4k_true_batched || can_use_q5k_true_batched);
 
         const bool can_use_q8_0_repacked_batched =
             (ud->gemma4_dense_prefill_native || ud->lfm2_q8_repacked_batched ||
@@ -4634,19 +4633,6 @@ static const char* Gemma4NativeMatmulRejectName(Gemma4NativeMatmulReject reason)
     return "unknown";
 }
 
-// Combined prefill+decode native route failed C4 Korea QA, so x86 admission is
-// fail-closed by default. Keep x86 native decode behind a diagnostic env only;
-// x86 native prefill was re-tested on C4 and rejected (20260616 env A/B:
-// 70.14 -> 69.27 tok/s prefill), so it has no runtime knob.
-static bool Gemma4X86NativeMatmulEnvOn() {
-    auto truthy = [](const char* name) {
-        const char* env = std::getenv(name);
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
-               std::strcmp(env, "False") != 0 && std::strcmp(env, "FALSE") != 0;
-    };
-    return truthy("DENSECORE_GEMMA4_X86_NATIVE_MATMUL") || truthy("DENSECORE_GEMMA4_X86_NATIVE_MATMUL_DECODE");
-}
-
 static bool IsGemma4NativePrefillMatmulSupported() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return true;
@@ -4656,14 +4642,12 @@ static bool IsGemma4NativePrefillMatmulSupported() {
 }
 
 // Gemma4 native decode matmul route. Suspected source of the C4 QA corruption;
-// do not enable on x86 without a logits/QA trace proving the decode side is
-// fixed. Opt-in via DENSECORE_GEMMA4_X86_NATIVE_MATMUL_DECODE for diagnosis.
+// keep x86 fail-closed until a logits/QA trace proves the decode side is fixed.
 static bool IsGemma4NativeDecodeMatmulSupported() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return true;
 #else
-    static const bool enabled = Gemma4X86NativeMatmulEnvOn();
-    return enabled;
+    return false;
 #endif
 }
 

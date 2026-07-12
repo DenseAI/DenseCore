@@ -102,6 +102,9 @@ struct Qwen35SharedQ8RowsUserData;
 static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_context* ctx, const ggml_tensor* src,
                                                                       int64_t max_assignments);
 static void SetNativeMoECallbackRequestedTaskCount(Qwen35SharedQ8RowsUserData* ud, int requested_task_count);
+static void SetNativeMoENumaContext(Qwen35SharedQ8RowsUserData* ud, densecore::CpuBackend* backend,
+                                    const TransformerLayer* layer);
+static bool NativeMoEHasVerifiedNumaPlacement(densecore::CpuBackend* backend, const TransformerLayer* layer);
 static void cb_gemma4_native_moe_down_weighted_sum(struct ggml_tensor* dst, int ith, int nth, void* userdata);
 
 bool IsDebugLFM2NativeMoEReferenceEnabled() {
@@ -871,6 +874,9 @@ struct Gemma4GateUpQ4KPrefillUserData {
     int32_t* assignment_slots = nullptr;
     int32_t* batch_experts = nullptr;
     int32_t* batch_starts = nullptr;
+    densecore::CpuBackend* numa_backend = nullptr;
+    const TransformerLayer* numa_layer = nullptr;
+    bool numa_sticky_enabled = false;
     std::atomic<int64_t> total_batches{0};
     std::atomic<int64_t> next_batch{0};
     std::atomic<uint64_t> epoch{0};
@@ -881,6 +887,16 @@ struct Gemma4GateUpQ4KPrefillUserData {
     static constexpr int kMaxTasks = 128;
     uint64_t task_epoch[kMaxTasks] = {};
 };
+
+static void SetGemma4NativeMoENumaContext(Gemma4GateUpQ4KPrefillUserData* ud, densecore::CpuBackend* backend,
+                                          const TransformerLayer* layer) {
+    if (!ud) {
+        return;
+    }
+    ud->numa_backend = backend;
+    ud->numa_layer = layer;
+    ud->numa_sticky_enabled = NativeMoEHasVerifiedNumaPlacement(backend, layer);
+}
 
 constexpr int kGemma4GateUpPrefillRowsPerBatch = 16;
 
@@ -1311,50 +1327,66 @@ static bool RunGemma4GateUpQ4KPrefillFusedGEGLU(ggml_tensor* dst, const ggml_ten
         const char* expert_base =
             weight_base + static_cast<size_t>(expert) * static_cast<size_t>(gate_up_exps->nb[2]);
 
-        std::array<float, 8> gate_tail{};
-        std::array<float, 8> up_tail{};
-        for (int r = 0; r < rows; ++r) {
-            const int32_t token = ud->assignment_tokens[start + r];
-            const int32_t slot = ud->assignment_slots[start + r];
-            if (token < 0 || token >= ud->n_tokens || slot < 0 || slot >= ud->top_k) {
-                continue;
-            }
-            const float* src = Gemma4PrefillInputRow(input, token, slot, ud);
-            if (!src) {
-                MarkGemma4NativeMoEPrefillFailure(ud, "gateup_input_row_unavailable", "gateup", ith);
-                return false;
-            }
-            q8_traits->from_float(src, q8_tail_buf.data(), ud->hidden_dim);
-            for (int tile = 0; tile < tile_count; ++tile) {
-                for (int lane = 0; lane < 8; ++lane) {
-                    const int64_t row = static_cast<int64_t>(tile) * 8 + lane;
-                    const void* gate_row =
-                        expert_base + static_cast<size_t>(row) * static_cast<size_t>(gate_up_exps->nb[1]);
-                    const void* up_row =
-                        expert_base + static_cast<size_t>(ud->intermediate_dim + row) *
-                                          static_cast<size_t>(gate_up_exps->nb[1]);
-                    if (!Gemma4QuantizedRowDot(GGML_TYPE_Q4_K, gate_row, q8_tail_buf.data(), ud->hidden_dim,
-                                               &gate_tail[lane]) ||
-                        !Gemma4QuantizedRowDot(GGML_TYPE_Q4_K, up_row, q8_tail_buf.data(), ud->hidden_dim,
-                                               &up_tail[lane])) {
-                        MarkGemma4NativeMoEPrefillFailure(ud, "gateup_row_dot_failed", "gateup", ith);
-                        return false;
+        bool batch_ok = true;
+        const auto run_batch = [&] {
+            std::array<float, 8> gate_tail{};
+            std::array<float, 8> up_tail{};
+            for (int r = 0; r < rows; ++r) {
+                const int32_t token = ud->assignment_tokens[start + r];
+                const int32_t slot = ud->assignment_slots[start + r];
+                if (token < 0 || token >= ud->n_tokens || slot < 0 || slot >= ud->top_k) {
+                    continue;
+                }
+                const float* src = Gemma4PrefillInputRow(input, token, slot, ud);
+                if (!src) {
+                    MarkGemma4NativeMoEPrefillFailure(ud, "gateup_input_row_unavailable", "gateup", ith);
+                    batch_ok = false;
+                    return;
+                }
+                q8_traits->from_float(src, q8_tail_buf.data(), ud->hidden_dim);
+                for (int tile = 0; tile < tile_count; ++tile) {
+                    for (int lane = 0; lane < 8; ++lane) {
+                        const int64_t row = static_cast<int64_t>(tile) * 8 + lane;
+                        const void* gate_row =
+                            expert_base + static_cast<size_t>(row) * static_cast<size_t>(gate_up_exps->nb[1]);
+                        const void* up_row =
+                            expert_base + static_cast<size_t>(ud->intermediate_dim + row) *
+                                              static_cast<size_t>(gate_up_exps->nb[1]);
+                        if (!Gemma4QuantizedRowDot(GGML_TYPE_Q4_K, gate_row, q8_tail_buf.data(), ud->hidden_dim,
+                                                   &gate_tail[lane]) ||
+                            !Gemma4QuantizedRowDot(GGML_TYPE_Q4_K, up_row, q8_tail_buf.data(), ud->hidden_dim,
+                                                   &up_tail[lane])) {
+                            MarkGemma4NativeMoEPrefillFailure(ud, "gateup_row_dot_failed", "gateup", ith);
+                            batch_ok = false;
+                            return;
+                        }
+                    }
+                    float* out = reinterpret_cast<float*>(dst_base + static_cast<size_t>(tile) * 8 * dst->nb[0] +
+                                                          static_cast<size_t>(slot) * dst->nb[1] +
+                                                          static_cast<size_t>(token) * dst->nb[2]);
+                    Gemma4ApplyGEGLU(out, gate_tail.data(), up_tail.data(), 8);
+                    if (ith == 0 && batch == 0 && r == 0 && tile == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
+                        float max_abs = 0.0f;
+                        for (float v : gate_tail) max_abs = std::max(max_abs, std::fabs(v));
+                        for (float v : up_tail) max_abs = std::max(max_abs, std::fabs(v));
+                        std::fprintf(stderr,
+                                     "[Gemma4NativeMoEPrefillDebug] gateup_first token=%d slot=%d expert=%d max_abs=%g "
+                                     "out0=%g out1=%g\n",
+                                     token, slot, expert, max_abs, out[0], out[1]);
                     }
                 }
-                float* out = reinterpret_cast<float*>(dst_base + static_cast<size_t>(tile) * 8 * dst->nb[0] +
-                                                      static_cast<size_t>(slot) * dst->nb[1] +
-                                                      static_cast<size_t>(token) * dst->nb[2]);
-                Gemma4ApplyGEGLU(out, gate_tail.data(), up_tail.data(), 8);
-                if (ith == 0 && batch == 0 && r == 0 && tile == 0 && IsDebugGemma4NativeMoEPrefillEnabled()) {
-                    float max_abs = 0.0f;
-                    for (float v : gate_tail) max_abs = std::max(max_abs, std::fabs(v));
-                    for (float v : up_tail) max_abs = std::max(max_abs, std::fabs(v));
-                    std::fprintf(stderr,
-                                 "[Gemma4NativeMoEPrefillDebug] gateup_first token=%d slot=%d expert=%d max_abs=%g "
-                                 "out0=%g out1=%g\n",
-                                 token, slot, expert, max_abs, out[0], out[1]);
-                }
             }
+        };
+        const int node = ud->numa_sticky_enabled && ud->numa_backend && ud->numa_layer
+                             ? ud->numa_backend->GetExpertNumaNode(ud->numa_layer, expert)
+                             : -1;
+        if (node >= 0 && node < ud->numa_backend->GetNumaNodeCount()) {
+            ud->numa_backend->RunOnNumaNode(node, run_batch);
+        } else {
+            run_batch();
+        }
+        if (!batch_ok) {
+            return false;
         }
     }
     return true;
@@ -1366,6 +1398,25 @@ static void cb_gemma4_gateup_q4k_prefill_geglu(struct ggml_tensor* dst, int ith,
     const bool ok = RunGemma4GateUpQ4KPrefillFusedGEGLU(dst, dst ? dst->src[0] : nullptr,
                                                         dst ? dst->src[1] : nullptr, dst ? dst->src[2] : nullptr,
                                                         ith, nth, ud);
+    if (ith == 0 && ud && ud->numa_backend && ud->numa_layer && dst && dst->src[2] && dst->src[2]->data) {
+        const ggml_tensor* selected = dst->src[2];
+        std::vector<int> expert_ids;
+        expert_ids.reserve(static_cast<size_t>(std::max<int64_t>(0, selected->ne[0] * selected->ne[1])));
+        for (int64_t token = 0; token < selected->ne[1]; ++token) {
+            for (int64_t k = 0; k < selected->ne[0]; ++k) {
+                const int expert = *reinterpret_cast<const int32_t*>(
+                    static_cast<const char*>(selected->data) + static_cast<size_t>(k) * selected->nb[0] +
+                    static_cast<size_t>(token) * selected->nb[1]);
+                if (expert >= 0 && expert < ud->n_experts) {
+                    expert_ids.push_back(expert);
+                }
+            }
+        }
+        if (!expert_ids.empty()) {
+            ud->numa_backend->RecordExpertAccess(ud->numa_layer, expert_ids.data(),
+                                                static_cast<int>(expert_ids.size()));
+        }
+    }
     const uint64_t ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
     if (GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill) {
@@ -1959,7 +2010,7 @@ static bool CanUseGemma4DownWeightedSumDecode(const TransformerModel* model, con
 
 ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, TransformerModel* model,
                                           TransformerLayer* layer, int layer_idx, ggml_tensor* routed_input,
-                                          ggml_tensor* gate_logits, int top_k) {
+                                          ggml_tensor* gate_logits, int top_k, densecore::CpuBackend* numa_backend) {
     if (!ctx || !gf || !model || !layer || !routed_input || !gate_logits || !model->arch_flags.is_gemma4 ||
         !IsGemma4NativeMoEGraphEnabled()) {
         return nullptr;
@@ -2043,9 +2094,11 @@ ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             Gemma4GateUpQ4KPrefillUserData* gateup_ud = AllocateGemma4GateUpQ4KPrefillUserData(
                 ctx, n_embd, roots.layout.intermediate_dim, n_expert_used, n_tokens, roots.layout.num_experts);
             if (gateup_ud) {
+                SetGemma4NativeMoENumaContext(gateup_ud, numa_backend, layer);
                 ggml_tensor* args[] = {gate_up_exps, routed_input, selected_experts};
+                const int gateup_tasks = gateup_ud->numa_sticky_enabled ? 1 : GGML_N_TASKS_MAX;
                 hidden = ggml_custom_4d(ctx, GGML_TYPE_F32, roots.layout.intermediate_dim, n_expert_used, n_tokens, 1,
-                                        args, 3, cb_gemma4_gateup_q4k_prefill_geglu, GGML_N_TASKS_MAX, gateup_ud);
+                                        args, 3, cb_gemma4_gateup_q4k_prefill_geglu, gateup_tasks, gateup_ud);
                 ggml_set_name(hidden, "gemma4_native_moe_gateup_q4k_prefill_geglu");
             }
         }
@@ -2076,8 +2129,12 @@ ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         Qwen35SharedQ8RowsUserData* hidden_q8_ud =
             AllocateQwen35SharedQ8RowsUserData(ctx, hidden, n_expert_used * n_tokens);
         if (hidden_q8_ud) {
-            const int native_moe_callback_tasks = ResolveNativeMoEGraphCallbackTaskCount(
-                model, GetCurrentBatch(), GetCurrentExecutionPhase(), n_tokens, static_cast<int>(n_expert_used));
+            SetNativeMoENumaContext(hidden_q8_ud, numa_backend, layer);
+            const int native_moe_callback_tasks = NativeMoEHasVerifiedNumaPlacement(numa_backend, layer)
+                                                      ? 1
+                                                      : ResolveNativeMoEGraphCallbackTaskCount(
+                                                            model, GetCurrentBatch(), GetCurrentExecutionPhase(),
+                                                            n_tokens, static_cast<int>(n_expert_used));
             SetNativeMoECallbackRequestedTaskCount(hidden_q8_ud, native_moe_callback_tasks);
             ggml_tensor* down_args[] = {down_exps, hidden, selected_experts, weights};
             ggml_tensor* out = ggml_custom_4d(ctx, GGML_TYPE_F32, n_embd, n_tokens, 1, 1, down_args, 4,
@@ -2149,6 +2206,9 @@ struct Qwen35SharedQ8RowsUserData {
     size_t row_bytes = 0;
     uint8_t* rows = nullptr;
     InferenceWorkContext* work_ctx = nullptr;
+    densecore::CpuBackend* numa_backend = nullptr;
+    const TransformerLayer* numa_layer = nullptr;
+    bool numa_sticky_enabled = false;
     std::atomic<uint64_t> epoch{0};
     std::atomic<uint64_t> ready_epoch{0};
     std::atomic<int> remaining_tasks{0};
@@ -2186,39 +2246,18 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
         max_assignments > 0 ? static_cast<size_t>(std::min<int64_t>(max_assignments, 4096 * 64)) : 0;
     const size_t assignments_bytes = assignment_capacity * sizeof(Qwen35MoEAssignment);
     if (ggml_get_no_alloc(ctx)) {
-        thread_local Qwen35SharedQ8RowsUserData dry_run_ud;
-        thread_local std::vector<uint8_t> dry_run_rows;
-        thread_local std::vector<Qwen35MoEAssignment> dry_run_assignments;
-        dry_run_rows.resize(rows_bytes);
-        dry_run_assignments.resize(assignment_capacity);
-        dry_run_ud.cols = src->ne[0];
-        dry_run_ud.ne1 = src->ne[1];
-        dry_run_ud.ne2 = src->ne[2];
-        dry_run_ud.debug_layer_idx = -1;
-        dry_run_ud.row_bytes = row_bytes;
-        dry_run_ud.rows = dry_run_rows.data();
-        dry_run_ud.work_ctx = nullptr;
-        dry_run_ud.epoch.store(0, std::memory_order_relaxed);
-        dry_run_ud.ready_epoch.store(0, std::memory_order_relaxed);
-        dry_run_ud.remaining_tasks.store(0, std::memory_order_relaxed);
-        dry_run_ud.failed.store(0, std::memory_order_relaxed);
-        dry_run_ud.prefer_q4k_repacked_swiglu = false;
-        dry_run_ud.q5k_gateup_8x8_single_copy = false;
-        dry_run_ud.q5k_gateup_8x8_single_copy_required = false;
-        dry_run_ud.record_lfm2_w1w3_kernel = false;
-        dry_run_ud.repacked_swiglu_failed.store(0, std::memory_order_relaxed);
-        dry_run_ud.weighted_logits_lfm2_sigmoid = false;
-        dry_run_ud.weighted_logits_norm_topk = true;
-        dry_run_ud.weighted_logits_scale = 1.0f;
-        dry_run_ud.fused_router_state = nullptr;
-        dry_run_ud.requested_task_count = 0;
-        dry_run_ud.assignments_ready_epoch.store(0, std::memory_order_relaxed);
-        dry_run_ud.assignments_failed.store(0, std::memory_order_relaxed);
-        dry_run_ud.assignments = dry_run_assignments.empty() ? nullptr : dry_run_assignments.data();
-        dry_run_ud.assignment_capacity = dry_run_assignments.size();
-        dry_run_ud.assignment_count = 0;
-        std::memset(dry_run_ud.task_epoch, 0, sizeof(dry_run_ud.task_epoch));
-        return &dry_run_ud;
+        // The custom op retains userdata after graph construction. Allocate a
+        // stable sidecar per op; reusing one TLS object aliases different MoE
+        // layers and can route them with the last-built layer's placement.
+        auto* ud = new Qwen35SharedQ8RowsUserData();
+        ud->cols = src->ne[0];
+        ud->ne1 = src->ne[1];
+        ud->ne2 = src->ne[2];
+        ud->row_bytes = row_bytes;
+        ud->rows = new uint8_t[rows_bytes]();
+        ud->assignments = assignment_capacity > 0 ? new Qwen35MoEAssignment[assignment_capacity]() : nullptr;
+        ud->assignment_capacity = assignment_capacity;
+        return ud;
     }
     ggml_tensor* ud_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, sizeof(Qwen35SharedQ8RowsUserData));
     ggml_tensor* rows_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, static_cast<int64_t>(rows_bytes));
@@ -2235,6 +2274,9 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
     ud->debug_layer_idx = -1;
     ud->row_bytes = row_bytes;
     ud->rows = static_cast<uint8_t*>(rows_storage->data);
+    ud->numa_backend = nullptr;
+    ud->numa_layer = nullptr;
+    ud->numa_sticky_enabled = false;
     ud->prefer_q4k_repacked_swiglu = false;
     ud->q5k_gateup_8x8_single_copy = false;
     ud->q5k_gateup_8x8_single_copy_required = false;
@@ -2279,6 +2321,56 @@ static void SetNativeMoECallbackRequestedTaskCount(Qwen35SharedQ8RowsUserData* u
     if (ud) {
         ud->requested_task_count = requested_task_count;
     }
+}
+
+static void SetNativeMoENumaContext(Qwen35SharedQ8RowsUserData* ud, densecore::CpuBackend* backend,
+                                    const TransformerLayer* layer) {
+    if (!ud) {
+        return;
+    }
+    ud->numa_backend = backend;
+    ud->numa_layer = layer;
+    ud->numa_sticky_enabled = false;
+    if (!backend || !layer || backend->GetNumaNodeCount() <= 1) {
+        return;
+    }
+    std::vector<int> nodes;
+    if (!backend->CopyExpertNumaNodes(layer, static_cast<int>(layer->NumExperts()), &nodes)) {
+        return;
+    }
+    ud->numa_sticky_enabled =
+        !nodes.empty() && std::all_of(nodes.begin(), nodes.end(), [backend](int node) {
+            return node >= 0 && node < backend->GetNumaNodeCount();
+        });
+}
+
+static int ResolveNativeMoEExpertNumaNode(const Qwen35SharedQ8RowsUserData* ud, int expert_id) {
+    if (!ud || !ud->numa_sticky_enabled || !ud->numa_backend || !ud->numa_layer || expert_id < 0) {
+        return -1;
+    }
+    const int node = ud->numa_backend->GetExpertNumaNode(ud->numa_layer, expert_id);
+    return node >= 0 && node < ud->numa_backend->GetNumaNodeCount() ? node : -1;
+}
+
+template <typename Fn>
+static void RunNativeMoEOnExpertNode(Qwen35SharedQ8RowsUserData* ud, int expert_id, Fn&& fn) {
+    const int node = ResolveNativeMoEExpertNumaNode(ud, expert_id);
+    if (node < 0) {
+        fn(-1);
+        return;
+    }
+    ud->numa_backend->RunOnNumaNode(node, [&] { fn(node); });
+}
+
+static bool NativeMoEHasVerifiedNumaPlacement(densecore::CpuBackend* backend, const TransformerLayer* layer) {
+    if (!backend || !layer || backend->GetNumaNodeCount() <= 1) {
+        return false;
+    }
+    std::vector<int> nodes;
+    return backend->CopyExpertNumaNodes(layer, static_cast<int>(layer->NumExperts()), &nodes) && !nodes.empty() &&
+           std::all_of(nodes.begin(), nodes.end(), [backend](int node) {
+               return node >= 0 && node < backend->GetNumaNodeCount();
+           });
 }
 
 static bool Qwen35NativeQuantizeRowQ8K(const float* src, uint8_t* dst, int64_t cols) {
@@ -2668,7 +2760,8 @@ static bool Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(const ggml_tensor*
 
 static bool Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
     ggml_tensor* dst, const ggml_tensor* down_exps, const uint8_t* qtile, size_t qrow_bytes,
-    const std::vector<Qwen35MoEAssignment>& tile_assignments, int32_t expert, int64_t row_start, int64_t row_end) {
+    const std::vector<Qwen35MoEAssignment>& tile_assignments, int32_t expert, int64_t row_start, int64_t row_end,
+    int numa_node, bool allow_parallel) {
     if (!dst || !down_exps || !qtile || !dst->data || !down_exps->data || tile_assignments.empty()) {
         return false;
     }
@@ -2695,7 +2788,7 @@ static bool Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
         const auto raw_batched_begin = std::chrono::steady_clock::now();
         const bool projected = densecore::RunMoEKQuantRawBatchedProjection(
             &backend, static_cast<int>(wtype), weight_start, qtile, qrow_bytes, projection_tile.data(),
-            static_cast<int64_t>(tile_assignments.size()), row_count, K, /*numa_node=*/0, /*allow_parallel=*/false);
+            static_cast<int64_t>(tile_assignments.size()), row_count, K, numa_node, allow_parallel);
         if (projected) {
             const auto elapsed = std::chrono::steady_clock::now() - raw_batched_begin;
             RecordMoEKQuantRawBatchedUse(GetCurrentWorkContext(), wtype,
@@ -2751,11 +2844,11 @@ static bool Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
                                    ? densecore::RunMoEKQuantRawBatchedProjection(
                                          &backend, static_cast<int>(wtype), weight_start, qtile, qrow_bytes,
                                          projection_tile.data(), static_cast<int64_t>(tile_assignments.size()),
-                                         row_count, K, /*numa_node=*/0, /*allow_parallel=*/false)
+                                         row_count, K, numa_node, allow_parallel)
                                    : densecore::RunQ4KRepackedMoEProjection(
                                          &backend, weight_start, qtile, qrow_bytes, projection_tile.data(),
                                          static_cast<int64_t>(tile_assignments.size()), row_count, K,
-                                         /*numa_node=*/0, /*allow_parallel=*/false);
+                                         numa_node, allow_parallel);
         if (projected) {
             for (size_t m = 0; m < tile_assignments.size(); ++m) {
                 const Qwen35MoEAssignment& assignment = tile_assignments[m];
@@ -2787,12 +2880,10 @@ static bool Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
             lfm2_decode_q6k_raw_batched
                 ? densecore::RunMoEKQuantRawBatchedProjection(
                       &backend, static_cast<int>(wtype), weight_start, qtile, qrow_bytes, projection_tile.data(),
-                      static_cast<int64_t>(tile_assignments.size()), row_count, K, /*numa_node=*/0,
-                      /*allow_parallel=*/false)
+                      static_cast<int64_t>(tile_assignments.size()), row_count, K, numa_node, allow_parallel)
                 : densecore::RunQ6KRepackedMoEProjection(
                       &backend, weight_start, qtile, qrow_bytes, projection_tile.data(),
-                      static_cast<int64_t>(tile_assignments.size()), row_count, K, /*numa_node=*/0,
-                      /*allow_parallel=*/false);
+                      static_cast<int64_t>(tile_assignments.size()), row_count, K, numa_node, allow_parallel);
         if (projected) {
             for (size_t m = 0; m < tile_assignments.size(); ++m) {
                 const Qwen35MoEAssignment& assignment = tile_assignments[m];
@@ -2904,36 +2995,38 @@ static void RunQwen35NativeMoEDownQ5KFastPath(ggml_tensor* dst, const ggml_tenso
                 if (!Qwen35NativeMoEDownQuantizeHiddenForWeight(hidden, token, k, down_exps->type, qbuf)) continue;
                 qrow = qbuf.data();
             }
-            const int64_t pair_count = n_embd / 2;
-            const int64_t pair_start = (static_cast<int64_t>(ith) * pair_count) / nth;
-            const int64_t pair_end = (static_cast<int64_t>(ith + 1) * pair_count) / nth;
-            for (int64_t pair = pair_start; pair < pair_end; ++pair) {
-                const int64_t row = pair * 2;
-                float value0 = 0.0f;
-                float value1 = 0.0f;
-                if (Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
-                                                                       &value0, &value1)) {
-                    *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                              static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
-                                              static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
-                                              static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2])) = value0;
-                    *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                              static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0]) +
-                                              static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
-                                              static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2])) = value1;
+            RunNativeMoEOnExpertNode(shared_q8, expert, [&](int) {
+                const int64_t pair_count = n_embd / 2;
+                const int64_t pair_start = (static_cast<int64_t>(ith) * pair_count) / nth;
+                const int64_t pair_end = (static_cast<int64_t>(ith + 1) * pair_count) / nth;
+                for (int64_t pair = pair_start; pair < pair_end; ++pair) {
+                    const int64_t row = pair * 2;
+                    float value0 = 0.0f;
+                    float value1 = 0.0f;
+                    if (Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
+                                                                           &value0, &value1)) {
+                        *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                  static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                                  static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
+                                                  static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2])) = value0;
+                        *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                  static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0]) +
+                                                  static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
+                                                  static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2])) = value1;
+                    }
                 }
-            }
-            if ((n_embd & 1) != 0 && ith == nth - 1) {
-                const int64_t row = n_embd - 1;
-                float value = 0.0f;
-                if (Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
-                                                                   &value)) {
-                    *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                              static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
-                                              static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
-                                              static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2])) = value;
+                if ((n_embd & 1) != 0 && ith == nth - 1) {
+                    const int64_t row = n_embd - 1;
+                    float value = 0.0f;
+                    if (Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
+                                                                       &value)) {
+                        *reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                  static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                                  static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
+                                                  static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2])) = value;
+                    }
                 }
-            }
+            });
         }
     }
 }
@@ -3242,8 +3335,12 @@ static void RunQwen35NativeMoEDownQ5KWeightedSumFastPath(ggml_tensor* dst, const
                 if (tile_assignments.empty()) {
                     continue;
                 }
-                const bool ok = Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
-                    dst, down_exps, qtile.data(), qrow_bytes, tile_assignments, expert, row_start, row_end);
+                bool ok = false;
+                RunNativeMoEOnExpertNode(shared_q8, expert, [&](int numa_node) {
+                    ok = Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
+                        dst, down_exps, qtile.data(), qrow_bytes, tile_assignments, expert, row_start, row_end,
+                        numa_node, numa_node >= 0);
+                });
                 if (!ok) {
                     return;
                 }
@@ -3387,35 +3484,37 @@ static void RunQwen35NativeMoEDownQ5KWeightedSumFastPath(ggml_tensor* dst, const
                 if (!Qwen35NativeMoEDownQuantizeHiddenForWeight(hidden, token, k, down_exps->type, qbuf)) continue;
                 qrow = qbuf.data();
             }
-            for (int64_t pair = pair_start; pair < pair_end; ++pair) {
-                const int64_t row = pair * 2;
-                float value0 = 0.0f;
-                float value1 = 0.0f;
-                if (!Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
-                                                                       &value0, &value1)) {
-                    continue;
+            RunNativeMoEOnExpertNode(shared_q8, expert, [&](int) {
+                for (int64_t pair = pair_start; pair < pair_end; ++pair) {
+                    const int64_t row = pair * 2;
+                    float value0 = 0.0f;
+                    float value1 = 0.0f;
+                    if (!Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
+                                                                           &value0, &value1)) {
+                        continue;
+                    }
+                    float* dst0 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                           static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                                           static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
+                    float* dst1 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                           static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0]) +
+                                                           static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
+                    *dst0 += value0 * gate_weight;
+                    *dst1 += value1 * gate_weight;
                 }
-                float* dst0 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                       static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
-                                                       static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
-                float* dst1 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                       static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0]) +
-                                                       static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
-                *dst0 += value0 * gate_weight;
-                *dst1 += value1 * gate_weight;
-            }
-            if (owns_odd_tail) {
-                const int64_t row = n_embd - 1;
-                float value = 0.0f;
-                if (Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
-                                                                   &value)) {
-                    float* dst_ptr =
-                        reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                 static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
-                                                 static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
-                    *dst_ptr += value * gate_weight;
+                if (owns_odd_tail) {
+                    const int64_t row = n_embd - 1;
+                    float value = 0.0f;
+                    if (Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
+                                                                       &value)) {
+                        float* dst_ptr =
+                            reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                     static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                                     static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
+                        *dst_ptr += value * gate_weight;
+                    }
                 }
-            }
+            });
         }
     }
 }
@@ -3523,8 +3622,12 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
                 if (tile_assignments.empty()) {
                     continue;
                 }
-                const bool ok = Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
-                    dst, down_exps, qtile.data(), qrow_bytes, tile_assignments, expert, row_start, row_end);
+                bool ok = false;
+                RunNativeMoEOnExpertNode(shared_q8, expert, [&](int numa_node) {
+                    ok = Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
+                        dst, down_exps, qtile.data(), qrow_bytes, tile_assignments, expert, row_start, row_end,
+                        numa_node, numa_node >= 0);
+                });
                 if (!ok) {
                     return;
                 }
@@ -3576,35 +3679,37 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
                 if (!Qwen35NativeMoEDownQuantizeHiddenForWeight(hidden, token, k, down_exps->type, qbuf)) continue;
                 qrow = qbuf.data();
             }
-            for (int64_t pair = pair_start; pair < pair_end; ++pair) {
-                const int64_t row = pair * 2;
-                float value0 = 0.0f;
-                float value1 = 0.0f;
-                if (!Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
-                                                                       &value0, &value1)) {
-                    continue;
+            RunNativeMoEOnExpertNode(shared_q8, expert, [&](int) {
+                for (int64_t pair = pair_start; pair < pair_end; ++pair) {
+                    const int64_t row = pair * 2;
+                    float value0 = 0.0f;
+                    float value1 = 0.0f;
+                    if (!Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
+                                                                           &value0, &value1)) {
+                        continue;
+                    }
+                    float* dst0 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                           static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                                           static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
+                    float* dst1 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                           static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0]) +
+                                                           static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
+                    *dst0 += value0 * gate_weight;
+                    *dst1 += value1 * gate_weight;
                 }
-                float* dst0 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                       static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
-                                                       static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
-                float* dst1 = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                       static_cast<size_t>(row + 1) * static_cast<size_t>(dst->nb[0]) +
-                                                       static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
-                *dst0 += value0 * gate_weight;
-                *dst1 += value1 * gate_weight;
-            }
-            if (owns_odd_tail) {
-                const int64_t row = n_embd - 1;
-                float value = 0.0f;
-                if (Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
-                                                                   &value)) {
-                    float* dst_ptr =
-                        reinterpret_cast<float*>(static_cast<char*>(dst->data) +
-                                                 static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
-                                                 static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
-                    *dst_ptr += value * gate_weight;
+                if (owns_odd_tail) {
+                    const int64_t row = n_embd - 1;
+                    float value = 0.0f;
+                    if (Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qrow, hidden_row,
+                                                                       &value)) {
+                        float* dst_ptr =
+                            reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                                     static_cast<size_t>(row) * static_cast<size_t>(dst->nb[0]) +
+                                                     static_cast<size_t>(token) * static_cast<size_t>(dst->nb[1]));
+                        *dst_ptr += value * gate_weight;
+                    }
                 }
-            }
+            });
         }
     }
     const int64_t row_start = pair_start * 2;
@@ -4026,18 +4131,12 @@ static bool Qwen35GateUpQ5KRepackKernelAvailable() {
 #endif
 }
 
-// C4A opt-in: enable the i8mm-optimized ggml q4_K_8x8 repacked MoE gate/up lane
-// for small RAM-safe native-MoE models (LFM2). Default OFF. ARM-only; x86
-// returns false (referenced from non-arch-guarded code, so define on all archs).
-static bool C4ALfm2Q4KMoERepackOptIn() {
+// C4A maintained path: enable the i8mm-optimized ggml q4_K_8x8 repacked MoE
+// gate/up lane for small RAM-safe native-MoE models (LFM2). ARM-only; x86
+// stays on the existing DenseCore-owned x86 admission.
+static bool C4ALfm2Q4KMoERepackEnabled() {
 #if defined(__aarch64__) || defined(_M_ARM64)
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_C4A_LFM2_Q4K_MOE_REPACK");
-        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
-               std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0 &&
-               std::strcmp(env, "FALSE") != 0;
-    }();
-    return enabled;
+    return true;
 #else
     return false;
 #endif
@@ -4046,10 +4145,10 @@ static bool C4ALfm2Q4KMoERepackOptIn() {
 static bool Qwen35GateUpQ4KRepackKernelAvailable() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     // ARM: ggml's q4_K_8x8 gemv/gemm is i8mm/dotprod-optimized (llama's kernel
-    // class) and Q4KRealPackedGemvKernelAvailable() is already true here. The
-    // C4A path is kept LFM2-only: Qwen prefill was measured slower on the
+    // class) and Q4KRealPackedGemvKernelAvailable() is already true here. Qwen
+    // prefill remains outside this LFM2 gate because it measured slower on the
     // repacked lane even with zero cache evictions.
-    return densecore::kernels::Q4KRealPackedGemvKernelAvailable() && C4ALfm2Q4KMoERepackOptIn();
+    return densecore::kernels::Q4KRealPackedGemvKernelAvailable() && C4ALfm2Q4KMoERepackEnabled();
 #else
     return densecore::kernels::Q4KRealPackedGemvKernelAvailable() && ggml_cpu_has_avx2();
 #endif
@@ -4099,7 +4198,7 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
     }
     const bool lfm2_q4k_repacked_prefill =
         shared_q8 && shared_q8->record_lfm2_w1w3_kernel &&
-        GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill && C4ALfm2Q4KMoERepackOptIn();
+        GetCurrentExecutionPhase() == InferenceExecutionPhase::Prefill && C4ALfm2Q4KMoERepackEnabled();
     // Qwen Q5_K decode fast lane: run the loader-owned single-copy q5_K_8x8
     // layout through ggml's GEMV kernel. Do not build a runtime repack cache
     // here: keeping both raw Q5_K and q5_K_8x8 copies was the RAM wall for 35B
@@ -4156,15 +4255,17 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                 const uint8_t* up_vx = static_cast<const uint8_t*>(up_exps->data) +
                                        static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]) +
                                        tile_byte_off;
-                ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_gate_buf.data(), 0, gate_vx, qrow, 1,
-                                        nc);
-                ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_up_buf.data(), 0, up_vx, qrow, 1, nc);
                 float* out_col = reinterpret_cast<float*>(
                     static_cast<char*>(dst->data) + static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]));
-                for (int i = 0; i < nc; ++i) {
-                    out_col[r0 + i] =
-                        NativeMoESiLU(q5k_gate_buf[static_cast<size_t>(i)]) * q5k_up_buf[static_cast<size_t>(i)];
-                }
+                RunNativeMoEOnExpertNode(shared_q8, expert, [&](int) {
+                    ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_gate_buf.data(), 0, gate_vx, qrow, 1,
+                                            nc);
+                    ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_up_buf.data(), 0, up_vx, qrow, 1, nc);
+                    for (int i = 0; i < nc; ++i) {
+                        out_col[r0 + i] = NativeMoESiLU(q5k_gate_buf[static_cast<size_t>(i)]) *
+                                          q5k_up_buf[static_cast<size_t>(i)];
+                    }
+                });
             }
         }
         return;
@@ -4240,23 +4341,27 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                         continue;
                     }
                     bool ok = false;
-                    if (q5_single_copy_8x8) {
-                        ok = densecore::RunQ5KRepackedMoEFusedSwiGLURawProjection(
-                            &backend, gate_row_start, up_row_start, gateup_input_tile.data(), gateup_qtile.data(),
-                            qrow_bytes, gateup_tile_out.data(), static_cast<int64_t>(tile_count), row_count,
-                            gate_exps->ne[0], /*numa_node=*/0, /*allow_parallel=*/false);
-                    } else if (q4_repacked_gateup) {
-                        RecordLFM2NativeMoEW1W3Kernel(lfm2_w1w3_work_ctx, "q4k_repacked");
-                        ok = densecore::RunQ4KRepackedMoEFusedSwiGLUProjection(
-                            &backend, gate_row_start, up_row_start, gateup_input_tile.data(), gateup_qtile.data(),
-                            qrow_bytes, gateup_tile_out.data(), static_cast<int64_t>(tile_count), row_count,
-                            gate_exps->ne[0], /*numa_node=*/0, /*allow_parallel=*/false);
-                    } else {
-                        ok = densecore::RunMoEKQuantRawBatchedFusedSwiGLU(
-                            &backend, static_cast<int>(gate_exps->type), gate_row_start, up_row_start,
-                            gateup_qtile.data(), qrow_bytes, gateup_tile_out.data(), static_cast<int64_t>(tile_count),
-                            row_count, gate_exps->ne[0], /*numa_node=*/0, /*allow_parallel=*/false);
-                    }
+                    RunNativeMoEOnExpertNode(shared_q8, expert, [&](int numa_node) {
+                        const bool allow_parallel = numa_node >= 0;
+                        if (q5_single_copy_8x8) {
+                            ok = densecore::RunQ5KRepackedMoEFusedSwiGLURawProjection(
+                                &backend, gate_row_start, up_row_start, gateup_input_tile.data(), gateup_qtile.data(),
+                                qrow_bytes, gateup_tile_out.data(), static_cast<int64_t>(tile_count), row_count,
+                                gate_exps->ne[0], numa_node, allow_parallel);
+                        } else if (q4_repacked_gateup) {
+                            RecordLFM2NativeMoEW1W3Kernel(lfm2_w1w3_work_ctx, "q4k_repacked");
+                            ok = densecore::RunQ4KRepackedMoEFusedSwiGLUProjection(
+                                &backend, gate_row_start, up_row_start, gateup_input_tile.data(), gateup_qtile.data(),
+                                qrow_bytes, gateup_tile_out.data(), static_cast<int64_t>(tile_count), row_count,
+                                gate_exps->ne[0], numa_node, allow_parallel);
+                        } else {
+                            ok = densecore::RunMoEKQuantRawBatchedFusedSwiGLU(
+                                &backend, static_cast<int>(gate_exps->type), gate_row_start, up_row_start,
+                                gateup_qtile.data(), qrow_bytes, gateup_tile_out.data(),
+                                static_cast<int64_t>(tile_count), row_count, gate_exps->ne[0], numa_node,
+                                allow_parallel);
+                        }
+                    });
                     if (!ok) {
                         shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
                         return;
@@ -4310,17 +4415,20 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                     const float* input_row =
                         q5_single_copy_8x8 ? Qwen35NativeMoEGateUpInputRowPtr(input, assignment.token) : nullptr;
                     const bool q5_row_aligned = !q5_single_copy_8x8 || ((row_start % 8) == 0 && (row_count % 8) == 0);
-                    const bool ok =
-                        q5_single_copy_8x8
-                            ? (input_row && q5_row_aligned &&
-                               densecore::RunQ5KRepackedMoEFusedSwiGLURawProjection(
-                                   &densecore::GetCpuBackend(), gate_row_start, up_row_start, input_row, qrow,
-                                   shared_q8->row_bytes, out, /*rows=*/1, row_count, gate_exps->ne[0],
-                                   /*numa_node=*/0, /*allow_parallel=*/false))
-                            : densecore::RunQ4KRepackedMoEFusedSwiGLUProjection(
-                                  &densecore::GetCpuBackend(), gate_row_start, up_row_start, nullptr, qrow,
-                                  shared_q8->row_bytes, out, /*rows=*/1, row_count, gate_exps->ne[0],
-                                  /*numa_node=*/0, /*allow_parallel=*/false);
+                    bool ok = false;
+                    RunNativeMoEOnExpertNode(shared_q8, expert, [&](int numa_node) {
+                        const bool allow_parallel = numa_node >= 0;
+                        ok = q5_single_copy_8x8
+                                 ? (input_row && q5_row_aligned &&
+                                    densecore::RunQ5KRepackedMoEFusedSwiGLURawProjection(
+                                        &densecore::GetCpuBackend(), gate_row_start, up_row_start, input_row, qrow,
+                                        shared_q8->row_bytes, out, /*rows=*/1, row_count, gate_exps->ne[0], numa_node,
+                                        allow_parallel))
+                                 : densecore::RunQ4KRepackedMoEFusedSwiGLUProjection(
+                                       &densecore::GetCpuBackend(), gate_row_start, up_row_start, nullptr, qrow,
+                                       shared_q8->row_bytes, out, /*rows=*/1, row_count, gate_exps->ne[0], numa_node,
+                                       allow_parallel);
+                    });
                     if (ok && !q5_single_copy_8x8) {
                         RecordLFM2NativeMoEW1W3Kernel(lfm2_w1w3_work_ctx, "q4k_repacked");
                     }
@@ -4332,9 +4440,12 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                     }
                     continue;
                 }
-                const bool ok = Qwen35NativeMoEKQ8KFusedSwiGLURows(lfm2_w1w3_work_ctx, gate_exps->type, gate_row_start,
-                                                                    up_row_start, qrow, gate_exps->ne[0], row_count,
-                                                                    weight_row_bytes, out);
+                bool ok = false;
+                RunNativeMoEOnExpertNode(shared_q8, expert, [&](int) {
+                    ok = Qwen35NativeMoEKQ8KFusedSwiGLURows(lfm2_w1w3_work_ctx, gate_exps->type, gate_row_start,
+                                                            up_row_start, qrow, gate_exps->ne[0], row_count,
+                                                            weight_row_bytes, out);
+                });
                 if (!ok) {
                     if (shared_q8) {
                         shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
@@ -4378,9 +4489,13 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                                                         static_cast<size_t>(row_start) * static_cast<size_t>(dst->nb[0]) +
                                                         static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]) +
                                                         static_cast<size_t>(token) * static_cast<size_t>(dst->nb[2]));
-            if (!Qwen35NativeMoEKQ8KFusedSwiGLURows(lfm2_w1w3_work_ctx, gate_exps->type, gate_row_start, up_row_start,
-                                                    qrow, gate_exps->ne[0], row_count,
-                                                    static_cast<size_t>(gate_exps->nb[1]), out_start)) {
+            bool expert_ok = false;
+            RunNativeMoEOnExpertNode(shared_q8, expert, [&](int) {
+                expert_ok = Qwen35NativeMoEKQ8KFusedSwiGLURows(
+                    lfm2_w1w3_work_ctx, gate_exps->type, gate_row_start, up_row_start, qrow, gate_exps->ne[0], row_count,
+                    static_cast<size_t>(gate_exps->nb[1]), out_start);
+            });
+            if (!expert_ok) {
                 if (shared_q8) {
                     shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
                 }
@@ -4405,6 +4520,23 @@ static void cb_qwen35_native_moe_gateup_raw_qxk_swiglu(struct ggml_tensor* dst, 
                                          dst ? dst->src[2] : nullptr, dst ? dst->src[3] : nullptr, effective_ith,
                                          effective_nth, shared_q8);
     if (ith == 0) {
+        const ggml_tensor* selected = dst ? dst->src[3] : nullptr;
+        if (shared_q8 && shared_q8->numa_backend && shared_q8->numa_layer && selected && selected->data) {
+            std::vector<int> expert_ids;
+            expert_ids.reserve(static_cast<size_t>(std::max<int64_t>(0, selected->ne[0] * selected->ne[1])));
+            for (int64_t token = 0; token < selected->ne[1]; ++token) {
+                for (int64_t k = 0; k < selected->ne[0]; ++k) {
+                    int32_t expert = -1;
+                    if (Qwen35NativeMoEDownQ5KReadExpert(selected, dst->src[0], token, k, &expert)) {
+                        expert_ids.push_back(expert);
+                    }
+                }
+            }
+            if (!expert_ids.empty()) {
+                shared_q8->numa_backend->RecordExpertAccess(shared_q8->numa_layer, expert_ids.data(),
+                                                            static_cast<int>(expert_ids.size()));
+            }
+        }
         const int selected_experts = dst ? static_cast<int>(std::max<int64_t>(0, dst->ne[1])) : 0;
         InferenceWorkContext* work_ctx =
             shared_q8 && shared_q8->work_ctx ? shared_q8->work_ctx : GetCurrentWorkContext();
@@ -4713,7 +4845,8 @@ static void RecordQwenLikeNativeMoEGraphCensus(const QwenLikeNativeMoEGraphPlan&
 ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, TransformerModel* model,
                                           TransformerLayer* layer, int layer_idx, ggml_tensor* routed_input,
                                           ggml_tensor* gate_logits, int top_k,
-                                          const densecore::models::DecoderLayerSpec* layer_spec) {
+                                          const densecore::models::DecoderLayerSpec* layer_spec,
+                                          densecore::CpuBackend* numa_backend) {
     const QwenLikeNativeMoEGraphPlan graph_plan = ResolveQwenLikeNativeMoEGraphPlan(model);
     if (!ctx || !gf || !model || !layer || !routed_input || !gate_logits ||
         (!graph_plan.qwen_native_moe && !graph_plan.lfm2_native_moe)) {
@@ -4775,8 +4908,10 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     const int64_t n_experts = gate_logits->ne[0];
     const int64_t n_expert_used = std::max<int64_t>(1, std::min<int64_t>(top_k, n_experts));
     const int native_moe_callback_tasks =
-        ResolveNativeMoEGraphCallbackTaskCount(model, GetCurrentBatch(), graph_plan.graph_phase, n_tokens,
-                                               static_cast<int>(n_expert_used));
+        NativeMoEHasVerifiedNumaPlacement(numa_backend, layer)
+            ? 1
+            : ResolveNativeMoEGraphCallbackTaskCount(model, GetCurrentBatch(), graph_plan.graph_phase, n_tokens,
+                                                     static_cast<int>(n_expert_used));
     if (!ValidateQwenLikeNativeMoEShapes(moe_weights, routed_input, gate_logits, n_tokens, n_embd, n_experts)) {
         if (IsMoEWiringDebugEnabled()) {
             std::fprintf(stderr,
@@ -4837,6 +4972,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         Qwen35SharedQ8RowsUserData* gateup_q8_ud =
             AllocateQwen35SharedQ8RowsUserData(ctx, routed_input, n_expert_used * n_tokens);
         if (gateup_q8_ud) {
+            SetNativeMoENumaContext(gateup_q8_ud, numa_backend, layer);
             gateup_q8_ud->work_ctx = GetCurrentWorkContext();
             gateup_q8_ud->debug_layer_idx = layer_idx;
             gateup_q8_ud->requested_task_count = native_moe_callback_tasks;
@@ -4871,6 +5007,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
                                                                 gate_logits)) {
         hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden, selected_experts->ne[0] * selected_experts->ne[1]);
         if (hidden_q8_ud && graph_plan.lfm2_native_moe) {
+            SetNativeMoENumaContext(hidden_q8_ud, numa_backend, layer);
             hidden_q8_ud->work_ctx = GetCurrentWorkContext();
             hidden_q8_ud->debug_layer_idx = layer_idx;
             hidden_q8_ud->requested_task_count = native_moe_callback_tasks;
@@ -4878,6 +5015,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             hidden_q8_ud->weighted_logits_norm_topk = model->moe_norm_topk_prob;
             hidden_q8_ud->weighted_logits_scale = model->moe_routed_scaling_factor;
         } else if (hidden_q8_ud) {
+            SetNativeMoENumaContext(hidden_q8_ud, numa_backend, layer);
             hidden_q8_ud->work_ctx = GetCurrentWorkContext();
             hidden_q8_ud->debug_layer_idx = layer_idx;
             hidden_q8_ud->requested_task_count = native_moe_callback_tasks;
@@ -4945,6 +5083,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         if (!hidden_q8_ud) {
             hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden, selected_experts->ne[0] * selected_experts->ne[1]);
             if (hidden_q8_ud) {
+                SetNativeMoENumaContext(hidden_q8_ud, numa_backend, layer);
                 hidden_q8_ud->work_ctx = GetCurrentWorkContext();
                 hidden_q8_ud->debug_layer_idx = layer_idx;
                 hidden_q8_ud->requested_task_count = native_moe_callback_tasks;
@@ -4969,6 +5108,7 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
         if (!hidden_q8_ud) {
             hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden, selected_experts->ne[0] * selected_experts->ne[1]);
             if (hidden_q8_ud) {
+                SetNativeMoENumaContext(hidden_q8_ud, numa_backend, layer);
                 hidden_q8_ud->debug_layer_idx = layer_idx;
                 hidden_q8_ud->requested_task_count = native_moe_callback_tasks;
             }

@@ -976,10 +976,6 @@ static inline void ScatterTokenHeadContiguous(const float* in, struct ggml_tenso
 }
 
 static inline bool ModelUsesMRoPE(const TransformerModel* model) {
-    static const bool force_standard_qwen35_rope = ParseTruthyEnv("DENSECORE_QWEN35_FORCE_STANDARD_ROPE", false);
-    if (force_standard_qwen35_rope && model && model->arch == ModelArch::QWEN35) {
-        return false;
-    }
     return model && model->hparams.rope_sections[0] > 0 && model->hparams.rope_sections[1] > 0;
 }
 

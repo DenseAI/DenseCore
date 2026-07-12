@@ -21,7 +21,7 @@
 
 #include <sys/mman.h>
 
-#ifdef DENSECORE_USE_HWLOC
+#ifdef DENSECORE_HAS_NUMA
 #include <numa.h>
 #include <numaif.h>
 #endif
@@ -57,11 +57,11 @@ public:
     static void* AllocateOnNode(size_t bytes, int numa_node) {
         if (bytes == 0) return nullptr;
 
-#if !defined(__linux__) || !defined(DENSECORE_USE_HWLOC)
+#if !defined(__linux__) || !defined(DENSECORE_HAS_NUMA)
         (void)numa_node;
 #endif
 
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
         if (numa_node >= 0 && numa_available() >= 0) {
             return AllocateWithNumaBind(bytes, numa_node);
         }
@@ -84,11 +84,11 @@ public:
         // Round up bytes to alignment boundary
         size_t aligned_size = (bytes + alignment - 1) & ~(alignment - 1);
 
-#if !defined(__linux__) || !defined(DENSECORE_USE_HWLOC)
+#if !defined(__linux__) || !defined(DENSECORE_HAS_NUMA)
         (void)numa_node;
 #endif
 
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
         if (numa_node >= 0 && numa_available() >= 0) {
             // Use mmap for aligned NUMA allocation
             void* ptr = AllocateWithMmap(aligned_size, numa_node);
@@ -146,7 +146,7 @@ public:
 
         size_t aligned_size = (bytes + alignment - 1) & ~(alignment - 1);
 
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
         if (preferred_node >= 0 && numa_available() >= 0) {
             // Step 1: Try strict allocation on preferred node
             void* ptr = numa_alloc_onnode(aligned_size, preferred_node);
@@ -217,7 +217,7 @@ public:
      */
     static void FreeNuma(void* ptr, size_t bytes) {
         if (!ptr) return;
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
         numa_free(ptr, bytes);
 #else
         // If libnuma is not available, this path should never be taken.
@@ -269,7 +269,7 @@ public:
      * @return NUMA node ID, or -1 if unknown
      */
     static int GetMemoryNode(const void* ptr) {
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
         if (numa_available() >= 0) {
             int node = -1;
             if (get_mempolicy(&node, nullptr, 0, const_cast<void*>(ptr), MPOL_F_NODE | MPOL_F_ADDR) == 0) {
@@ -286,7 +286,7 @@ public:
      * Check if NUMA allocation is available
      */
     static bool IsNumaAvailable() {
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
         return numa_available() >= 0;
 #else
         return false;
@@ -416,7 +416,7 @@ private:
      * Bind a memory region to a specific NUMA node using mbind
      */
     static bool BindToNumaNode(void* ptr, size_t bytes, int numa_node) {
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
         if (numa_node < 0 || numa_available() < 0) return false;
 
         unsigned long nodemask = 1UL << numa_node;
@@ -433,7 +433,7 @@ private:
 #endif
     }
 
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
     /**
      * Allocate using mmap with explicit NUMA binding via mbind
      */
@@ -546,7 +546,7 @@ public:
      * @return NUMA node ID, or -1 if cannot be determined
      */
     static int GetActualNumaNode(void* ptr, size_t size) {
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
         if (!ptr || size == 0) return -1;
 
         // Use move_pages to probe actual page location

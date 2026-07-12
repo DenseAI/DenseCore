@@ -42,6 +42,10 @@ void ApplyMoELocalityOrdering(MoEForwardExecutionPlan* plan) {
     plan->ordering.numa_switches_before = CountMoENumaSwitches(plan->active_work);
     std::stable_sort(plan->active_work.begin(), plan->active_work.end(),
                      [plan](const MoEActiveExpertWork& lhs, const MoEActiveExpertWork& rhs) {
+                         const bool lhs_verified = lhs.numa_node >= 0;
+                         const bool rhs_verified = rhs.numa_node >= 0;
+                         if (lhs_verified != rhs_verified) return lhs_verified;
+                         if (lhs_verified && lhs.numa_node != rhs.numa_node) return lhs.numa_node < rhs.numa_node;
                          const auto ordering_score = [plan](const MoEActiveExpertWork& work) {
                              const bool reused =
                                  plan->previous_batch_set.find(work.expert_id) != plan->previous_batch_set.end();
@@ -57,11 +61,10 @@ void ApplyMoELocalityOrdering(MoEForwardExecutionPlan* plan) {
                          if (lhs_score != rhs_score) return lhs_score > rhs_score;
                          if (lhs.ema_load != rhs.ema_load) return lhs.ema_load < rhs.ema_load;
                          if (lhs.count != rhs.count) return lhs.count < rhs.count;
-                         if (lhs.numa_node != rhs.numa_node) return lhs.numa_node < rhs.numa_node;
                          return lhs.expert_id < rhs.expert_id;
                      });
     plan->ordering.numa_switches_after = CountMoENumaSwitches(plan->active_work);
-    plan->ordering.applied = true;
+    plan->ordering.applied = plan->ordering.numa_switches_after <= plan->ordering.numa_switches_before;
 }
 
 void BalanceMoEParallelExpertWork(std::vector<MoEActiveExpertWork>* active_work, int active_threads) {
@@ -161,6 +164,17 @@ MoEForwardExecutionPlan BuildMoEForwardExecutionPlan(const moe::MoEReorderMapVie
     plan.parallelize_experts = !plan.prefer_inner_parallel_prefill && !plan.small_decode_step && batch_size > 1 &&
                                plan.active_work.size() >= static_cast<size_t>(std::max(4, plan.worker_threads / 2)) &&
                                registry_present;
+
+    std::unordered_set<int> verified_nodes;
+    for (const MoEActiveExpertWork& work : plan.active_work) {
+        if (work.numa_node >= 0) verified_nodes.insert(work.numa_node);
+    }
+    if (verified_nodes.size() > 1) {
+        // The outer expert-parallel pool is not node-affine. Keep expert groups
+        // ordered and let each expert use its verified node-local inner pool.
+        plan.prefer_inner_parallel_prefill = true;
+        plan.parallelize_experts = false;
+    }
 
     if (plan.parallelize_experts && plan.active_work.size() > 1) {
         const int active_threads =

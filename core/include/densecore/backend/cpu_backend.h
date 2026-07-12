@@ -173,6 +173,14 @@ public:
      */
     int QueryMemoryNumaNode(void* ptr);
 
+    /**
+     * @brief Verify that sampled, fully-owned pages in a memory range share one NUMA node
+     *
+     * Boundary pages are excluded because adjacent expert slices can share them.
+     * Returns -1 when placement cannot be verified or samples span nodes.
+     */
+    int QueryMemoryNumaNodeRange(void* ptr, size_t size_bytes, int max_samples = 8);
+
 
     /**
      * @brief Copy to device (deprecated, just memcpy on CPU)
@@ -324,6 +332,7 @@ public:
      * the pool count.
      */
     void RunConcurrentNodeTasks(int n_tasks, const std::function<void(int)>& task);
+    void RunOnNumaNode(int numa_node, const std::function<void()>& task);
 
     // ===========================================================================
     // CPU-Specific Accessors
@@ -511,6 +520,8 @@ public:
      */
     moe::ExpertProfiler* GetProfiler() { return GetProfiler(nullptr); }
     moe::ExpertProfiler* GetProfiler(const TransformerLayer* layer_key);
+    int GetExpertNumaNode(const TransformerLayer* layer_key, int expert_id) const;
+    bool CopyExpertNumaNodes(const TransformerLayer* layer_key, int n_experts, std::vector<int>* nodes) const;
 
     /**
      * @brief Record expert accesses from MoE routing (hot path)

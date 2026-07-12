@@ -19,8 +19,8 @@ struct WorkerRuntimeConfig {
     bool determinism_boundary_debug = false;
     bool prefix_cache_reuse_disabled = false;
     bool hybrid_ssm_snapshot_restore_disabled = false;
-    bool qwen36_prefix_cache_reuse_enabled = false;
-    bool qwen36_hybrid_ssm_snapshot_restore_enabled = false;
+    bool qwen36_prefix_cache_reuse_enabled = true;
+    bool qwen36_hybrid_ssm_snapshot_restore_enabled = true;
     bool graph_cache_reuse_disabled = false;
     bool moe_trace_plumbing_disabled = false;
     bool moe_graph_summary = false;
@@ -108,10 +108,8 @@ struct FastPathRuntimeConfig {
     KVRetentionPolicy kv_retention{};
     PrefillGraphCachePolicy prefill_graph_cache{};
     Qwen36PrefillQ4KBatchedMode qwen36_prefill_q4k_batched = Qwen36PrefillQ4KBatchedMode::On;
-    densecore::env::RuntimeToggleMode qwen36_ssm_q8_amx_alias = densecore::env::RuntimeToggleMode::Off;
     Qwen36SSMQ8PrefillAMXMode qwen36_ssm_q8_prefill_amx = Qwen36SSMQ8PrefillAMXMode::Off;
     int qwen36_ssm_q8_prefill_amx_min_tokens = 256;
-    densecore::env::RuntimeToggleMode qwen36_expert_cpu_repack = densecore::env::RuntimeToggleMode::Auto;
     densecore::env::RuntimeToggleMode native_moe_fast_decode = densecore::env::RuntimeToggleMode::On;
     densecore::env::RuntimeToggleMode q4k_repacked_gemv = densecore::env::RuntimeToggleMode::On;
     bool q4k_repacked_gemv_allow_prefill = true;

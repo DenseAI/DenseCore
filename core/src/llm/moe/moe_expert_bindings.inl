@@ -109,10 +109,6 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
     size_t n_experts = layer->NumExperts();
     experts.reserve(n_experts);
 
-    const bool force_qwen36_moe_safe_reference = []() {
-        const char* env = std::getenv("DENSECORE_QWEN36_MOE_FORCE_SAFE_REFERENCE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
     const densecore::models::DecoderLayerSpec* layer_spec =
         densecore::models::ResolveDecoderLayerSpecForLayer(model, layer);
 
@@ -158,11 +154,6 @@ static std::vector<densecore::CpuBackend::ExpertWeights> BuildExpertWeights(cons
             w.w3_type = static_cast<int>(gw3->type);
             w.w3_tensor = gw3;
             w.w3_int4 = make_int4_binding(gw3, w.hidden_dim, w.intermediate_dim);
-        }
-
-        if (force_qwen36_moe_safe_reference && model && model->variant == ModelVariant::QWEN36 &&
-            model->hparams.n_experts > 0) {
-            w.force_safe_reference = true;
         }
 
         experts.push_back(w);

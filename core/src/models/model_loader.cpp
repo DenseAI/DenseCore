@@ -748,9 +748,6 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
     std::vector<PendingFusedAlias> pending_fused_cpu_amx;
     const auto loader_config = densecore::llm::config::LoadFastPathRuntimeConfig();
     const bool qwen36_has_ssm_q8_projection = model_has_qwen36_ssm_q8_projection();
-    const bool qwen36_ssm_q8_amx_alias_enabled =
-        model->variant == ModelVariant::QWEN36 && qwen36_has_ssm_q8_projection && repack_bufts.cpu_amx &&
-        loader_config.qwen36_ssm_q8_amx_alias != densecore::env::RuntimeToggleMode::Off;
     const bool qwen36_ssm_q8_prefill_amx_requested =
         model->variant == ModelVariant::QWEN36 && qwen36_has_ssm_q8_projection && repack_bufts.cpu_amx &&
         loader_config.qwen36_ssm_q8_prefill_amx == densecore::llm::config::Qwen36SSMQ8PrefillAMXMode::On;
@@ -759,18 +756,11 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
     // single-token decode from ~25 to ~16 tok/s. Keep this fail-closed until
     // the AMX storage is request/prefill-local or otherwise proven not to
     // perturb decode residency/locality.
-    const bool qwen36_ssm_q8_prefill_amx_enabled = false;
-    const bool qwen36_expert_cpu_repack_enabled =
-        model->variant != ModelVariant::QWEN36 ||
-        loader_config.qwen36_expert_cpu_repack == densecore::env::RuntimeToggleMode::On ||
-        (loader_config.qwen36_expert_cpu_repack == densecore::env::RuntimeToggleMode::Auto &&
-         !qwen36_ssm_q8_amx_alias_enabled);
     if (model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm) {
-        std::cout << "[DenseCore] Qwen3.6 fast-matmul alias policy: ssm_q8_amx="
-                  << (qwen36_ssm_q8_amx_alias_enabled ? "enabled" : "disabled")
-                  << ", ssm_q8_prefill_loader_alias=" << (qwen36_ssm_q8_prefill_amx_enabled ? "enabled" : "disabled")
+        std::cout << "[DenseCore] Qwen3.6 fast-matmul alias policy: ssm_q8_amx=disabled"
+                  << ", ssm_q8_prefill_loader_alias=disabled"
                   << ", ssm_q8_prefill_scoped_amx=" << (qwen36_ssm_q8_prefill_amx_requested ? "requested" : "disabled")
-                  << ", expert_cpu_repack=" << (qwen36_expert_cpu_repack_enabled ? "enabled" : "disabled")
+                  << ", expert_cpu_repack=enabled"
                   << ", ssm_q8_projection=" << (qwen36_has_ssm_q8_projection ? "present" : "absent") << std::endl;
     }
 
@@ -780,14 +770,10 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         }
         if (model->variant == ModelVariant::QWEN36 && is_2d) {
             // The Qwen3.6 UD-Q4_K_M GGUF stores SSM qkv/gate/out projections
-            // as Q8_0, so the Q4_K prefill probe is not applicable there. The
-            // load-time AMX alias remains an explicit experiment only because
-            // it is not phase-aware and can push single-token decode onto an
-            // unfavorable layout. The maintained Q8 prefill path prepares a
-            // scoped alias during prefill execution and clears it before decode.
-            if (qwen36_ssm_q8_amx_alias_enabled && is_qwen36_ssm_q8_projection(source)) {
-                return repack_bufts.cpu_amx;
-            }
+            // as Q8_0, so the Q4_K prefill probe is not applicable there.
+            // Load-time AMX aliases are intentionally disabled; the maintained
+            // Q8 prefill path prepares scoped aliases during prefill execution
+            // and clears them before decode.
             return nullptr;
         }
 #if !defined(__aarch64__) && !defined(_M_ARM64)
@@ -797,9 +783,6 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         }
 #endif
         if (model->arch_flags.is_hybrid_ssm) {
-            if (model->variant == ModelVariant::QWEN36 && !is_2d && !qwen36_expert_cpu_repack_enabled) {
-                return nullptr;
-            }
             if (!repack_bufts.cpu_repack || (!ggml_is_quantized(source->type) && source->type != GGML_TYPE_F16)) {
                 return nullptr;
             }
@@ -5565,7 +5548,7 @@ static bool RebindTensorNumaInterleaved(struct ggml_tensor* tensor, TransformerM
         return false;  // Skip small tensors - overhead not worth it
     }
 
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
     // Use numa_alloc_interleaved for true interleaved allocation
     void* new_buffer = numa_alloc_interleaved(tensor_size);
     if (!new_buffer) {
@@ -5671,7 +5654,7 @@ static bool RebindTensorNuma(struct ggml_tensor* tensor, int numa_node, Transfor
  * Get the number of available NUMA nodes for round-robin allocation.
  */
 static int GetNumaNodeCount() {
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
     if (numa_available() >= 0) {
         return numa_max_node() + 1;
     }
@@ -5716,7 +5699,7 @@ struct NumaExpertPartitionStats {
     std::vector<size_t> bytes_per_node;
 };
 
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
 /**
  * Move the physical pages of [base, base+bytes) to target_node in place.
  * Interior page range only (boundaries shared with a neighboring expert stay

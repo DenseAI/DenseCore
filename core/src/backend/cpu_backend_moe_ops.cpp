@@ -1253,14 +1253,10 @@ void CpuBackend::ForwardMoE(const TransformerModel* model, const TransformerLaye
         batch_size <= 4 && total_assignments <= kSmallDecodeMaxAssignments && !arm_large_expert_pool;
     const bool has_token_indices = !routing.token_indices.empty();
     const float* input_data = input.DataAs<float>();
-    const bool qwen36_short_prefill_safe_reference =
-        IsQwen36ShortSingleSeqPrefillSafeReferenceCandidate(model, batch, batch_size);
-    const bool safe_reference_mode =
-        qwen36_short_prefill_safe_reference ||
-        (num_experts > 0 ? IsMoESafeReferenceModeEnabled(&experts[0]) : IsMoESafeReferenceModeEnabled());
+    const bool safe_reference_mode = num_experts > 0 ? IsMoESafeReferenceModeEnabled(&experts[0]) : false;
     if (TryExecuteMoESafeReferenceFastPath(this, model, layer_idx, batch, input_data, batch_size,
                                            static_cast<int>(hidden_dim), routing, experts, num_experts, out_data,
-                                           qwen36_short_prefill_safe_reference, safe_reference_mode)) {
+                                           safe_reference_mode)) {
         return;
     }
 

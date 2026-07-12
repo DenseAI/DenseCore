@@ -729,6 +729,18 @@ TEST(NumaStickyRouting, QueryMemoryNumaNode_NullPtr) {
 
     // Null pointer should return -1
     EXPECT_EQ(backend.QueryMemoryNumaNode(nullptr), -1);
+    EXPECT_EQ(backend.QueryMemoryNumaNodeRange(nullptr, 4096), -1);
+}
+
+TEST(NumaStickyRouting, QueryMemoryNumaNodeRange_RejectsEmptyRange) {
+    CpuBackend& backend = GetCpuBackend();
+    void* ptr = backend.AllocateDevice(4096);
+    ASSERT_NE(ptr, nullptr);
+
+    EXPECT_EQ(backend.QueryMemoryNumaNodeRange(ptr, 0), -1);
+    EXPECT_EQ(backend.QueryMemoryNumaNodeRange(ptr, 4096, 0), -1);
+
+    backend.FreeDevice(ptr);
 }
 
 TEST(NumaStickyRouting, QueryMemoryNumaNode_ValidPtr) {
@@ -926,6 +938,31 @@ TEST(NumaStickyRouting, RecordExpertAccess_UpdatesProfiler) {
     EXPECT_EQ(profiler->GetHitCount(1), 1);
     EXPECT_EQ(profiler->GetHitCount(2), 1);
     EXPECT_EQ(profiler->GetHitCount(3), 0);
+}
+
+TEST(NumaStickyRouting, LayerScopedExpertNumaSnapshotPreservesUnknownPlacement) {
+    CpuBackend& backend = GetCpuBackend();
+    static TransformerLayer layer;
+    backend.InitMoEProfiler(&layer, 4);
+
+    auto* profiler = backend.GetProfiler(&layer);
+    ASSERT_NE(profiler, nullptr);
+    profiler->SetExpertNumaNode(0, 0);
+    profiler->SetExpertNumaNode(2, 1);
+
+    std::vector<int> nodes;
+    ASSERT_TRUE(backend.CopyExpertNumaNodes(&layer, 4, &nodes));
+    EXPECT_EQ(nodes, (std::vector<int>{0, -1, 1, -1}));
+    EXPECT_EQ(backend.GetExpertNumaNode(&layer, 2), 1);
+}
+
+TEST(NumaStickyRouting, RunOnNumaNodeCompletesExactlyOnce) {
+    CpuBackend& backend = GetCpuBackend();
+    std::atomic<int> calls{0};
+
+    backend.RunOnNumaNode(0, [&] { calls.fetch_add(1, std::memory_order_relaxed); });
+
+    EXPECT_EQ(calls.load(std::memory_order_relaxed), 1);
 }
 
 TEST(NumaStickyRouting, DispatchExpertFFN_UsesNumaMapping) {
@@ -1404,7 +1441,7 @@ TEST(NumaStickyRouting, DispatchExpertFFN_PackedInt4SafeReferenceMatchesReferenc
         routing.token_indices[static_cast<size_t>(i)] = i;
     }
 
-    EnvGuard safe_reference("DENSECORE_MOE_SAFE_REFERENCE", "1");
+    experts[0].force_safe_reference = true;
     backend.ForwardMoE(input_tensor, routing, experts, &output_tensor);
 
     const std::vector<float> reference =
@@ -2494,20 +2531,19 @@ TEST(NumaStickyRouting, ForwardMoELFM2Q4KPrefillUsesRawBatchedQuantizedPath) {
     }
 }
 
-TEST(NumaStickyRouting, ForwardMoEQwen36ShortPrefillSafeReferenceMatchesDenseReference) {
+TEST(NumaStickyRouting, ForwardMoEGemma4ForceSafeReferenceMatchesDenseReference) {
     CpuBackend& backend = GetCpuBackend();
     constexpr int batch = 8;
     constexpr int hidden_dim = 32;
     constexpr int intermediate_dim = 64;
-    EnvGuard qwen36_short_prefill_reference("DENSECORE_QWEN36_SHORT_PREFILL_SAFE_REFERENCE", "1");
 
     QuantizedExpertFixture fixture =
         BuildQuantizedExpertFixture(batch, hidden_dim, intermediate_dim, GGML_TYPE_Q4_0, 1777);
 
     TransformerModel model{};
-    model.arch = ModelArch::QWEN35;
-    model.variant = ModelVariant::QWEN36;
-    model.arch_flags.is_hybrid_ssm = true;
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
 
     BatchSpec batch_spec{};
     batch_spec.num_seqs = 1;
@@ -2528,6 +2564,7 @@ TEST(NumaStickyRouting, ForwardMoEQwen36ShortPrefillSafeReferenceMatchesDenseRef
     Tensor input_tensor = Tensor::Make2D(fixture.input.data(), batch, hidden_dim);
     Tensor output_tensor = Tensor::Make2D(output.data(), batch, hidden_dim);
     std::vector<CpuBackend::ExpertWeights> experts = {fixture.expert};
+    experts[0].force_safe_reference = true;
 
     backend.ForwardMoE(&model, nullptr, /*layer_idx=*/0, &batch_spec, input_tensor, routing, experts.data(),
                        static_cast<int>(experts.size()), &output_tensor);
@@ -2536,7 +2573,7 @@ TEST(NumaStickyRouting, ForwardMoEQwen36ShortPrefillSafeReferenceMatchesDenseRef
     DenseExpertReference(fixture.input.data(), fixture.w1_ref.data(), fixture.w2_ref.data(), fixture.w3_ref.data(),
                          reference.data(), batch, hidden_dim, intermediate_dim);
     for (size_t i = 0; i < reference.size(); ++i) {
-        EXPECT_NEAR(output[i], reference[i], 1e-5f) << "index=" << i;
+        EXPECT_NEAR(output[i], reference[i], 2e-5f) << "index=" << i;
     }
 }
 

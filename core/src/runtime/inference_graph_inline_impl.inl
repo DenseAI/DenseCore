@@ -2307,11 +2307,35 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
 
             // 2. Dispatch
             int moe_top_k = layer_spec ? layer_spec->ffn.top_k : static_cast<int>(model->hparams.n_experts_used);
+            densecore::BackendRegistry& moe_backend_registry = ResolveBackendRegistry(&batch);
+            densecore::ComputeBackend* moe_preferred_backend =
+                moe_backend_registry.Get(ResolvePreferredDevice(&batch));
+            auto* native_moe_backend = dynamic_cast<densecore::CpuBackend*>(moe_preferred_backend);
+            if (!native_moe_backend) {
+                native_moe_backend =
+                    dynamic_cast<densecore::CpuBackend*>(moe_backend_registry.Get(densecore::DeviceType::CPU));
+            }
+            if (!native_moe_backend) {
+                native_moe_backend = &densecore::GetTelemetryCpuBackend();
+            }
+            if (native_moe_backend) {
+                const densecore::CpuBackend::ExpertWeights* registered_experts = nullptr;
+                int registered_count = 0;
+                if (!native_moe_backend->GetRegisteredExpertsView(&model->layers[il], &registered_experts,
+                                                                  &registered_count) ||
+                    !registered_experts || registered_count <= 0) {
+                    auto expert_weights = BuildExpertWeights(&model->layers[il], model);
+                    const int n_experts = static_cast<int>(expert_weights.size());
+                    native_moe_backend->InitMoEProfiler(&model->layers[il], n_experts);
+                    native_moe_backend->RegisterMoEExperts(&model->layers[il], expert_weights);
+                }
+                EnsureMoERebalanceThread(native_moe_backend);
+            }
             struct ggml_tensor* native_moe = TryBuildGemma4NativeMoEGraph(
-                ctx_c, gf, model, &model->layers[il], il, routed_input, gate_logits, moe_top_k);
+                ctx_c, gf, model, &model->layers[il], il, routed_input, gate_logits, moe_top_k, native_moe_backend);
             if (!native_moe) {
                 native_moe = TryBuildQwen35NativeMoEGraph(ctx_c, gf, model, &model->layers[il], il, routed_input,
-                                                          gate_logits, moe_top_k, layer_spec);
+                                                          gate_logits, moe_top_k, layer_spec, native_moe_backend);
             }
             if (native_moe) {
                 cur = native_moe;

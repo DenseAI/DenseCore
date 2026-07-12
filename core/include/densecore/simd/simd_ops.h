@@ -2632,11 +2632,7 @@ inline void GemmInt4Fp32Batched_SVE(float* C, const float* A, const uint8_t* W_i
 
 #if defined(__ARM_FEATURE_DOTPROD)
 inline bool UseNeonInt4DotProdApprox() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_ARM_INT4_DOTPROD");
-        return env && std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
-    }();
-    return enabled;
+    return false;
 }
 
 inline int8x16_t UnpackInt4x16ToInt8_NEON_DotProd(const uint8_t* w_ptr) {

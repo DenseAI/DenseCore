@@ -109,21 +109,12 @@ bool ParseCpuBackendEnvBool(const char* name, bool default_value) {
     return std::strcmp(value, "0") != 0;
 }
 
-int ParseCpuBackendEnvPositiveInt(const char* name, int default_value) {
-    const char* value = std::getenv(name);
-    if (!value || *value == '\0') {
-        return default_value;
-    }
-    const int parsed = std::atoi(value);
-    return parsed > 0 ? parsed : default_value;
-}
-
 bool IsArmInt4SplitNEnabled() {
-    return ParseCpuBackendEnvBool("DENSECORE_ARM_INT4_SPLIT_N", false);
+    return true;
 }
 
 int GetArmInt4SplitNMinN() {
-    return ParseCpuBackendEnvPositiveInt("DENSECORE_ARM_INT4_SPLIT_N_MIN_N", 128);
+    return 128;
 }
 
 bool IsInt4PathDebugEnabled() {
@@ -386,6 +377,49 @@ public:
         return -1;
 #endif
     }
+
+    int QueryMemoryNumaNodeRange(void* ptr, size_t size_bytes, int max_samples) {
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
+        if (!ptr || size_bytes == 0 || max_samples <= 0 || numa_available() < 0) {
+            return -1;
+        }
+
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) {
+            return -1;
+        }
+        const uintptr_t raw_start = reinterpret_cast<uintptr_t>(ptr);
+        const uintptr_t raw_end = raw_start + size_bytes;
+        if (raw_end < raw_start) {
+            return -1;
+        }
+        const uintptr_t start = (raw_start + static_cast<uintptr_t>(page_size) - 1) &
+                                ~(static_cast<uintptr_t>(page_size) - 1);
+        const uintptr_t end = raw_end & ~(static_cast<uintptr_t>(page_size) - 1);
+        if (end <= start) {
+            return -1;
+        }
+
+        const size_t page_count = (end - start) / static_cast<size_t>(page_size);
+        const size_t sample_count = std::min(page_count, static_cast<size_t>(max_samples));
+        int verified_node = -1;
+        for (size_t sample = 0; sample < sample_count; ++sample) {
+            const size_t page_index = sample_count == 1 ? 0 : (sample * (page_count - 1)) / (sample_count - 1);
+            void* page = reinterpret_cast<void*>(start + page_index * static_cast<size_t>(page_size));
+            const int node = QueryMemoryNumaNode(page);
+            if (node < 0 || (verified_node >= 0 && node != verified_node)) {
+                return -1;
+            }
+            verified_node = node;
+        }
+        return verified_node;
+#else
+        (void)ptr;
+        (void)size_bytes;
+        (void)max_samples;
+        return -1;
+#endif
+    }
 };
 
 class CpuBackend::CpuThreadManager {
@@ -405,6 +439,8 @@ public:
 
     void Shutdown() {
         node_helpers_.clear();  // join helper threads before their pools go away
+        pinned_node_helpers_.clear();
+        pinned_node_mutexes_.clear();
         for (auto& pool : thread_pools_) {
             if (pool) {
                 pool->Shutdown();
@@ -466,6 +502,33 @@ public:
             node_helpers_[static_cast<size_t>(t - 1)]->Wait();
         }
         dispatch_busy_.store(false, std::memory_order_release);
+    }
+
+    void RunOnNumaNode(int numa_node, const std::function<void()>& task) {
+        if (!task) {
+            return;
+        }
+        if (numa_node < 0 || numa_node >= GetNumaNodeCount()) {
+            task();
+            return;
+        }
+
+        NodeTaskHelper* helper = nullptr;
+        std::mutex* dispatch_mutex = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(pinned_helpers_mutex_);
+            while (static_cast<int>(pinned_node_helpers_.size()) < GetNumaNodeCount()) {
+                pinned_node_helpers_.push_back(
+                    std::make_unique<NodeTaskHelper>(static_cast<int>(pinned_node_helpers_.size())));
+                pinned_node_mutexes_.push_back(std::make_unique<std::mutex>());
+            }
+            helper = pinned_node_helpers_[static_cast<size_t>(numa_node)].get();
+            dispatch_mutex = pinned_node_mutexes_[static_cast<size_t>(numa_node)].get();
+        }
+        std::lock_guard<std::mutex> dispatch_lock(*dispatch_mutex);
+        std::function<void(int)> wrapped = [&task](int) { task(); };
+        helper->Post(&wrapped);
+        helper->Wait();
     }
 
 private:
@@ -535,6 +598,9 @@ private:
 
     std::vector<std::unique_ptr<ThreadPool>> thread_pools_;
     std::vector<std::unique_ptr<NodeTaskHelper>> node_helpers_;
+    std::vector<std::unique_ptr<NodeTaskHelper>> pinned_node_helpers_;
+    std::vector<std::unique_ptr<std::mutex>> pinned_node_mutexes_;
+    std::mutex pinned_helpers_mutex_;
     std::atomic<bool> dispatch_busy_{false};
     std::atomic<int> round_robin_counter_{0};
 };
@@ -802,6 +868,18 @@ bool CpuBackend::BindMemoryToNumaNode(void* ptr, size_t size_bytes, int numa_nod
 
 int CpuBackend::QueryMemoryNumaNode(void* ptr) {
     return memory_manager_->QueryMemoryNumaNode(ptr);
+}
+
+void CpuBackend::RunOnNumaNode(int numa_node, const std::function<void()>& task) {
+    if (!thread_manager_) {
+        if (task) task();
+        return;
+    }
+    thread_manager_->RunOnNumaNode(numa_node, task);
+}
+
+int CpuBackend::QueryMemoryNumaNodeRange(void* ptr, size_t size_bytes, int max_samples) {
+    return memory_manager_->QueryMemoryNumaNodeRange(ptr, size_bytes, max_samples);
 }
 
 // =============================================================================
