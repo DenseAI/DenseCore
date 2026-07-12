@@ -4926,6 +4926,7 @@ void EngineLoop(EngineState* state) {
                 SynthesizeDecodeGraphNodeTimingFromProfiles(&decode_graph_node_timing, graph_execute_ns,
                                                             native_moe_graph_timing, hybrid_ssm_graph_timing,
                                                             qwen36_profile);
+                FinalizeDecodeSemanticTiming(&decode_graph_node_timing, graph_execute_ns);
             }
             const densecore::kernels::Q4KRepackedGemvCacheStats q4k_cache_after =
                 densecore::kernels::Q4KRepackedGemvCacheStatsSnapshot();
@@ -4975,6 +4976,20 @@ void EngineLoop(EngineState* state) {
                         req->decode_graph_node_elementwise_ns += decode_graph_node_timing.elementwise_ns;
                         req->decode_graph_node_attention_ns += decode_graph_node_timing.attention_ns;
                         req->decode_graph_node_other_ns += decode_graph_node_timing.other_ns;
+                        req->decode_semantic_attention_qkv_ns += decode_graph_node_timing.semantic_attention_qkv_ns;
+                        req->decode_semantic_attention_o_ns += decode_graph_node_timing.semantic_attention_o_ns;
+                        req->decode_semantic_attention_core_ns += decode_graph_node_timing.semantic_attention_core_ns;
+                        req->decode_semantic_kv_rope_ns += decode_graph_node_timing.semantic_kv_rope_ns;
+                        req->decode_semantic_moe_router_ns += decode_graph_node_timing.semantic_moe_router_ns;
+                        req->decode_semantic_moe_gate_up_ns += decode_graph_node_timing.semantic_moe_gate_up_ns;
+                        req->decode_semantic_moe_down_ns += decode_graph_node_timing.semantic_moe_down_ns;
+                        req->decode_semantic_shared_dense_ns += decode_graph_node_timing.semantic_shared_dense_ns;
+                        req->decode_semantic_dense_ffn_ns += decode_graph_node_timing.semantic_dense_ffn_ns;
+                        req->decode_semantic_lm_head_ns += decode_graph_node_timing.semantic_lm_head_ns;
+                        req->decode_semantic_norm_residual_ns += decode_graph_node_timing.semantic_norm_residual_ns;
+                        req->decode_semantic_copy_view_ns += decode_graph_node_timing.semantic_copy_view_ns;
+                        req->decode_semantic_outside_graph_ns += decode_graph_node_timing.semantic_outside_graph_ns;
+                        req->decode_semantic_unattributed_ns += decode_graph_node_timing.semantic_unattributed_ns;
                         req->decode_graph_node_custom_count += decode_graph_node_timing.custom_count;
                         req->decode_graph_node_custom_moe_count += decode_graph_node_timing.custom_moe_count;
                         req->decode_graph_node_custom_ssm_count += decode_graph_node_timing.custom_ssm_count;
@@ -4991,6 +5006,26 @@ void EngineLoop(EngineState* state) {
                         req->decode_graph_node_elementwise_count += decode_graph_node_timing.elementwise_count;
                         req->decode_graph_node_attention_count += decode_graph_node_timing.attention_count;
                         req->decode_graph_node_other_count += decode_graph_node_timing.other_count;
+                        req->decode_semantic_attention_qkv_count +=
+                            decode_graph_node_timing.semantic_attention_qkv_count;
+                        req->decode_semantic_attention_o_count +=
+                            decode_graph_node_timing.semantic_attention_o_count;
+                        req->decode_semantic_attention_core_count +=
+                            decode_graph_node_timing.semantic_attention_core_count;
+                        req->decode_semantic_kv_rope_count += decode_graph_node_timing.semantic_kv_rope_count;
+                        req->decode_semantic_moe_router_count += decode_graph_node_timing.semantic_moe_router_count;
+                        req->decode_semantic_moe_gate_up_count += decode_graph_node_timing.semantic_moe_gate_up_count;
+                        req->decode_semantic_moe_down_count += decode_graph_node_timing.semantic_moe_down_count;
+                        req->decode_semantic_shared_dense_count += decode_graph_node_timing.semantic_shared_dense_count;
+                        req->decode_semantic_dense_ffn_count += decode_graph_node_timing.semantic_dense_ffn_count;
+                        req->decode_semantic_lm_head_count += decode_graph_node_timing.semantic_lm_head_count;
+                        req->decode_semantic_norm_residual_count +=
+                            decode_graph_node_timing.semantic_norm_residual_count;
+                        req->decode_semantic_copy_view_count += decode_graph_node_timing.semantic_copy_view_count;
+                        req->decode_semantic_outside_graph_count +=
+                            decode_graph_node_timing.semantic_outside_graph_count;
+                        req->decode_semantic_unattributed_count +=
+                            decode_graph_node_timing.semantic_unattributed_count;
                         req->decode_graph_top_slow_nodes.insert(req->decode_graph_top_slow_nodes.end(),
                                                                 decode_graph_node_timing.top_slow_nodes.begin(),
                                                                 decode_graph_node_timing.top_slow_nodes.end());

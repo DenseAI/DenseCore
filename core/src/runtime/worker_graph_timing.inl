@@ -86,6 +86,20 @@ struct DecodeGraphNodeTimingBreakdown {
     uint64_t elementwise_ns = 0;
     uint64_t attention_ns = 0;
     uint64_t other_ns = 0;
+    uint64_t semantic_attention_qkv_ns = 0;
+    uint64_t semantic_attention_o_ns = 0;
+    uint64_t semantic_attention_core_ns = 0;
+    uint64_t semantic_kv_rope_ns = 0;
+    uint64_t semantic_moe_router_ns = 0;
+    uint64_t semantic_moe_gate_up_ns = 0;
+    uint64_t semantic_moe_down_ns = 0;
+    uint64_t semantic_shared_dense_ns = 0;
+    uint64_t semantic_dense_ffn_ns = 0;
+    uint64_t semantic_lm_head_ns = 0;
+    uint64_t semantic_norm_residual_ns = 0;
+    uint64_t semantic_copy_view_ns = 0;
+    uint64_t semantic_outside_graph_ns = 0;
+    uint64_t semantic_unattributed_ns = 0;
     uint64_t custom_count = 0;
     uint64_t custom_moe_count = 0;
     uint64_t custom_ssm_count = 0;
@@ -100,8 +114,211 @@ struct DecodeGraphNodeTimingBreakdown {
     uint64_t elementwise_count = 0;
     uint64_t attention_count = 0;
     uint64_t other_count = 0;
+    uint64_t semantic_attention_qkv_count = 0;
+    uint64_t semantic_attention_o_count = 0;
+    uint64_t semantic_attention_core_count = 0;
+    uint64_t semantic_kv_rope_count = 0;
+    uint64_t semantic_moe_router_count = 0;
+    uint64_t semantic_moe_gate_up_count = 0;
+    uint64_t semantic_moe_down_count = 0;
+    uint64_t semantic_shared_dense_count = 0;
+    uint64_t semantic_dense_ffn_count = 0;
+    uint64_t semantic_lm_head_count = 0;
+    uint64_t semantic_norm_residual_count = 0;
+    uint64_t semantic_copy_view_count = 0;
+    uint64_t semantic_outside_graph_count = 0;
+    uint64_t semantic_unattributed_count = 0;
     std::vector<MatmulShapeCensusEntry> top_slow_nodes;
 };
+
+enum class DecodeSemanticTimingBucket {
+    AttentionQkv,
+    AttentionO,
+    AttentionCore,
+    KvRope,
+    MoeRouter,
+    MoeGateUp,
+    MoeDown,
+    SharedDense,
+    DenseFfn,
+    LmHead,
+    NormResidual,
+    CopyView,
+    OutsideGraph,
+    Unattributed,
+};
+
+static inline bool StringContains(const char* haystack, const char* needle) {
+    return haystack && needle && std::strstr(haystack, needle) != nullptr;
+}
+
+static inline bool NodeOrInputsContain(const ggml_tensor* node, const char* needle) {
+    return node &&
+           (StringContains(node->name, needle) ||
+            (node->src[0] && StringContains(node->src[0]->name, needle)) ||
+            (node->src[1] && StringContains(node->src[1]->name, needle)) ||
+            (node->src[2] && StringContains(node->src[2]->name, needle)));
+}
+
+struct CustomOpParamsRawView {
+    std::uintptr_t fun;
+    int n_tasks;
+    void* userdata;
+};
+static_assert(sizeof(CustomOpParamsRawView) <= GGML_MAX_OP_PARAMS, "custom op params view too large");
+
+static inline CustomOpParamsRawView DecodeCustomOpParams(const ggml_tensor* node) {
+    CustomOpParamsRawView params{};
+    if (node && node->op == GGML_OP_CUSTOM) {
+        std::memcpy(&params, node->op_params, sizeof(params));
+    }
+    return params;
+}
+
+static DecodeSemanticTimingBucket DecodeSemanticBucketNameBased(const ggml_tensor* node) {
+    if (!node) {
+        return DecodeSemanticTimingBucket::Unattributed;
+    }
+    if (NodeOrInputsContain(node, "lm_head") || NodeOrInputsContain(node, "output.weight") ||
+        NodeOrInputsContain(node, "token_embd.weight")) {
+        return DecodeSemanticTimingBucket::LmHead;
+    }
+    if (NodeOrInputsContain(node, "qkv") || NodeOrInputsContain(node, "attn_q") ||
+        NodeOrInputsContain(node, "attn_k") || NodeOrInputsContain(node, "attn_v")) {
+        return DecodeSemanticTimingBucket::AttentionQkv;
+    }
+    if (NodeOrInputsContain(node, "attn_o") || NodeOrInputsContain(node, "attn_output") ||
+        NodeOrInputsContain(node, "out_proj")) {
+        return DecodeSemanticTimingBucket::AttentionO;
+    }
+    if (NodeOrInputsContain(node, "paged_attention") || NodeOrInputsContain(node, "flash_attention") ||
+        NodeOrInputsContain(node, "attn_core")) {
+        return DecodeSemanticTimingBucket::AttentionCore;
+    }
+    if (NodeOrInputsContain(node, "rope") || NodeOrInputsContain(node, "kv_") ||
+        NodeOrInputsContain(node, "k_cache") || NodeOrInputsContain(node, "v_cache")) {
+        return DecodeSemanticTimingBucket::KvRope;
+    }
+    if (NodeOrInputsContain(node, "moe_gate_logits") || NodeOrInputsContain(node, "_topk") ||
+        NodeOrInputsContain(node, "_norm_weights") || NodeOrInputsContain(node, "_probs") ||
+        NodeOrInputsContain(node, "_scaled_weights")) {
+        return DecodeSemanticTimingBucket::MoeRouter;
+    }
+    if (NodeOrInputsContain(node, "_gate_up") || NodeOrInputsContain(node, "ffn_gate") ||
+        NodeOrInputsContain(node, "ffn_up") || NodeOrInputsContain(node, "w1") || NodeOrInputsContain(node, "w3")) {
+        return DecodeSemanticTimingBucket::MoeGateUp;
+    }
+    if (NodeOrInputsContain(node, "_down") || NodeOrInputsContain(node, "ffn_down") ||
+        NodeOrInputsContain(node, "w2")) {
+        return DecodeSemanticTimingBucket::MoeDown;
+    }
+    if (NodeOrInputsContain(node, "shared_ffn") || NodeOrInputsContain(node, "shared_expert")) {
+        return DecodeSemanticTimingBucket::SharedDense;
+    }
+    if (NodeOrInputsContain(node, "ffn") || NodeOrInputsContain(node, "mlp") || NodeOrInputsContain(node, "swiglu") ||
+        NodeOrInputsContain(node, "gelu")) {
+        return DecodeSemanticTimingBucket::DenseFfn;
+    }
+    switch (node->op) {
+    case GGML_OP_RMS_NORM:
+    case GGML_OP_NORM:
+    case GGML_OP_GROUP_NORM:
+    case GGML_OP_ADD:
+    case GGML_OP_ADD1:
+    case GGML_OP_SCALE: return DecodeSemanticTimingBucket::NormResidual;
+    case GGML_OP_VIEW:
+    case GGML_OP_RESHAPE:
+    case GGML_OP_PERMUTE:
+    case GGML_OP_TRANSPOSE:
+    case GGML_OP_CONT:
+    case GGML_OP_DUP:
+    case GGML_OP_CPY: return DecodeSemanticTimingBucket::CopyView;
+    default: return DecodeSemanticTimingBucket::Unattributed;
+    }
+}
+
+static DecodeSemanticTimingBucket DecodeSemanticBucketForNode(const ggml_tensor* node) {
+    if (!node) {
+        return DecodeSemanticTimingBucket::Unattributed;
+    }
+    if (node->op == GGML_OP_CUSTOM) {
+        const CustomOpParamsRawView params = DecodeCustomOpParams(node);
+        const auto same_fun = [&](auto* fun) { return params.fun == reinterpret_cast<std::uintptr_t>(fun); };
+        if (same_fun(cb_paged_attention_decode) || same_fun(cb_flash_attention_hal_custom)) {
+            return DecodeSemanticTimingBucket::AttentionCore;
+        }
+        if (same_fun(cb_kv_update_and_gather_custom) || same_fun(cb_rope_precomputed_custom)) {
+            return DecodeSemanticTimingBucket::KvRope;
+        }
+    }
+    return DecodeSemanticBucketNameBased(node);
+}
+
+static void AddDecodeSemanticTiming(DecodeGraphNodeTimingBreakdown* out,
+                                    DecodeSemanticTimingBucket bucket,
+                                    uint64_t elapsed_ns) {
+    if (!out) {
+        return;
+    }
+    switch (bucket) {
+    case DecodeSemanticTimingBucket::AttentionQkv:
+        out->semantic_attention_qkv_ns += elapsed_ns;
+        out->semantic_attention_qkv_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::AttentionO:
+        out->semantic_attention_o_ns += elapsed_ns;
+        out->semantic_attention_o_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::AttentionCore:
+        out->semantic_attention_core_ns += elapsed_ns;
+        out->semantic_attention_core_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::KvRope:
+        out->semantic_kv_rope_ns += elapsed_ns;
+        out->semantic_kv_rope_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::MoeRouter:
+        out->semantic_moe_router_ns += elapsed_ns;
+        out->semantic_moe_router_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::MoeGateUp:
+        out->semantic_moe_gate_up_ns += elapsed_ns;
+        out->semantic_moe_gate_up_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::MoeDown:
+        out->semantic_moe_down_ns += elapsed_ns;
+        out->semantic_moe_down_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::SharedDense:
+        out->semantic_shared_dense_ns += elapsed_ns;
+        out->semantic_shared_dense_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::DenseFfn:
+        out->semantic_dense_ffn_ns += elapsed_ns;
+        out->semantic_dense_ffn_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::LmHead:
+        out->semantic_lm_head_ns += elapsed_ns;
+        out->semantic_lm_head_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::NormResidual:
+        out->semantic_norm_residual_ns += elapsed_ns;
+        out->semantic_norm_residual_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::CopyView:
+        out->semantic_copy_view_ns += elapsed_ns;
+        out->semantic_copy_view_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::OutsideGraph:
+        out->semantic_outside_graph_ns += elapsed_ns;
+        out->semantic_outside_graph_count += 1;
+        break;
+    case DecodeSemanticTimingBucket::Unattributed:
+        out->semantic_unattributed_ns += elapsed_ns;
+        out->semantic_unattributed_count += 1;
+        break;
+    }
+}
 
 static const char* DecodeGraphCustomBucketName(const ggml_tensor* node) {
     if (!node || node->op != GGML_OP_CUSTOM) {
@@ -113,14 +330,7 @@ static const char* DecodeGraphCustomBucketName(const ggml_tensor* node) {
     auto contains = [&](const char* needle) {
         return std::strstr(name, needle) || std::strstr(src0, needle) || std::strstr(src1, needle);
     };
-    struct CustomOpParamsRawView {
-        std::uintptr_t fun;
-        int n_tasks;
-        void* userdata;
-    };
-    static_assert(sizeof(CustomOpParamsRawView) <= GGML_MAX_OP_PARAMS, "custom op params view too large");
-    CustomOpParamsRawView params{};
-    std::memcpy(&params, node->op_params, sizeof(params));
+    CustomOpParamsRawView params = DecodeCustomOpParams(node);
     const auto same_fun = [&](auto* fun) { return params.fun == reinterpret_cast<std::uintptr_t>(fun); };
     if (same_fun(cb_paged_attention_decode) || same_fun(cb_flash_attention_hal_custom)) {
         return "paged_attention";
@@ -253,6 +463,7 @@ DecodeGraphNodeTimingBreakdown SummarizeDecodeGraphNodeTimes(const ggml_cgraph* 
             continue;
         }
         const uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_us) * 1000ULL;
+        AddDecodeSemanticTiming(&out, DecodeSemanticBucketForNode(node), elapsed_ns);
         if (std::strcmp(bucket, "custom") == 0) {
             out.custom_ns += elapsed_ns;
             const char* custom_bucket = DecodeGraphCustomBucketName(node);
@@ -648,6 +859,20 @@ void SynthesizeDecodeGraphNodeTimingFromProfiles(DecodeGraphNodeTimingBreakdown*
     timing->attention_ns = bounded_attention_ns;
     timing->other_ns = other_ns;
     timing->measured_ns = graph_execute_ns;
+    timing->semantic_moe_router_ns = native_moe.route_ns;
+    timing->semantic_moe_gate_up_ns = native_moe.w1w3_ns + native_moe.activation_ns;
+    timing->semantic_moe_down_ns = native_moe.w2_ns + native_moe.reduce_ns;
+    timing->semantic_attention_qkv_ns = hybrid_ssm.qkv_ns;
+    timing->semantic_attention_o_ns = hybrid_ssm.out_ns;
+    timing->semantic_dense_ffn_ns = hybrid_ssm.gate_ns;
+    timing->semantic_kv_rope_ns = hybrid_ssm.conv1d_ns + hybrid_ssm.delta_ns + hybrid_ssm.alpha_beta_qk_ns;
+    timing->semantic_lm_head_ns = std::min(lm_head_ns, custom_ns);
+    timing->semantic_attention_core_ns = bounded_attention_ns + std::min(paged_attention_ns, custom_ns);
+    const uint64_t attributed_ns =
+        timing->semantic_moe_router_ns + timing->semantic_moe_gate_up_ns + timing->semantic_moe_down_ns +
+        timing->semantic_attention_qkv_ns + timing->semantic_attention_o_ns + timing->semantic_dense_ffn_ns +
+        timing->semantic_kv_rope_ns + timing->semantic_lm_head_ns + timing->semantic_attention_core_ns;
+    timing->semantic_unattributed_ns = graph_execute_ns > attributed_ns ? graph_execute_ns - attributed_ns : 0;
 
     if (timing->custom_count == 0) {
         timing->custom_count = native_moe.native_node_count + static_cast<uint64_t>(profile.ssm_conv1d_calls) +
@@ -675,6 +900,28 @@ void SynthesizeDecodeGraphNodeTimingFromProfiles(DecodeGraphNodeTimingBreakdown*
     }
     if (timing->other_count == 0 && other_ns > 0) {
         timing->other_count = 1;
+    }
+    timing->semantic_moe_router_count = native_moe.route_count;
+    timing->semantic_moe_gate_up_count = native_moe.w1w3_count + native_moe.activation_count;
+    timing->semantic_moe_down_count = native_moe.w2_count + native_moe.reduce_count;
+    timing->semantic_attention_qkv_count = hybrid_ssm.qkv_ns > 0 ? 1 : 0;
+    timing->semantic_attention_o_count = hybrid_ssm.out_ns > 0 ? 1 : 0;
+    timing->semantic_dense_ffn_count = hybrid_ssm.gate_ns > 0 ? 1 : 0;
+    timing->semantic_kv_rope_count =
+        (hybrid_ssm.conv1d_ns > 0 ? 1 : 0) + (hybrid_ssm.delta_ns > 0 ? 1 : 0) +
+        (hybrid_ssm.alpha_beta_qk_ns > 0 ? 1 : 0);
+    timing->semantic_lm_head_count = timing->custom_lm_head_count;
+    timing->semantic_attention_core_count = timing->attention_count + timing->custom_paged_attention_count;
+    timing->semantic_unattributed_count = timing->semantic_unattributed_ns > 0 ? 1 : 0;
+}
+
+void FinalizeDecodeSemanticTiming(DecodeGraphNodeTimingBreakdown* timing, uint64_t graph_execute_ns) {
+    if (!timing || graph_execute_ns == 0 || timing->measured_ns == 0) {
+        return;
+    }
+    if (graph_execute_ns > timing->measured_ns) {
+        timing->semantic_outside_graph_ns = graph_execute_ns - timing->measured_ns;
+        timing->semantic_outside_graph_count = 1;
     }
 }
 

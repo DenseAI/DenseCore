@@ -1966,6 +1966,57 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
                                   << ":ms=" << ns_to_ms(req->decode_graph_node_custom_paged_attention_ns)
                                   << ",other:count=" << req->decode_graph_node_custom_other_count
                                   << ":ms=" << ns_to_ms(req->decode_graph_node_custom_other_ns);
+    const uint64_t decode_semantic_total_ns =
+        req->decode_semantic_attention_qkv_ns + req->decode_semantic_attention_o_ns +
+        req->decode_semantic_attention_core_ns + req->decode_semantic_kv_rope_ns +
+        req->decode_semantic_moe_router_ns + req->decode_semantic_moe_gate_up_ns +
+        req->decode_semantic_moe_down_ns + req->decode_semantic_shared_dense_ns +
+        req->decode_semantic_dense_ffn_ns + req->decode_semantic_lm_head_ns +
+        req->decode_semantic_norm_residual_ns + req->decode_semantic_copy_view_ns +
+        req->decode_semantic_outside_graph_ns + req->decode_semantic_unattributed_ns;
+    const uint64_t decode_semantic_attributed_ns =
+        decode_semantic_total_ns >= req->decode_semantic_unattributed_ns
+            ? decode_semantic_total_ns - req->decode_semantic_unattributed_ns
+            : 0;
+    const double decode_semantic_coverage_pct =
+        decode_semantic_total_ns > 0
+            ? (100.0 * static_cast<double>(decode_semantic_attributed_ns) /
+               static_cast<double>(decode_semantic_total_ns))
+            : 0.0;
+    const double decode_semantic_unattributed_pct =
+        decode_semantic_total_ns > 0
+            ? (100.0 * static_cast<double>(req->decode_semantic_unattributed_ns) /
+               static_cast<double>(decode_semantic_total_ns))
+            : 0.0;
+    std::ostringstream decode_semantic_hist;
+    decode_semantic_hist << "attention_qkv:count=" << req->decode_semantic_attention_qkv_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_attention_qkv_ns)
+                         << ",attention_o:count=" << req->decode_semantic_attention_o_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_attention_o_ns)
+                         << ",attention_core:count=" << req->decode_semantic_attention_core_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_attention_core_ns)
+                         << ",kv_rope:count=" << req->decode_semantic_kv_rope_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_kv_rope_ns)
+                         << ",moe_router:count=" << req->decode_semantic_moe_router_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_moe_router_ns)
+                         << ",moe_gate_up:count=" << req->decode_semantic_moe_gate_up_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_moe_gate_up_ns)
+                         << ",moe_down:count=" << req->decode_semantic_moe_down_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_moe_down_ns)
+                         << ",shared_dense:count=" << req->decode_semantic_shared_dense_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_shared_dense_ns)
+                         << ",dense_ffn:count=" << req->decode_semantic_dense_ffn_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_dense_ffn_ns)
+                         << ",lm_head:count=" << req->decode_semantic_lm_head_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_lm_head_ns)
+                         << ",norm_residual:count=" << req->decode_semantic_norm_residual_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_norm_residual_ns)
+                         << ",copy_view:count=" << req->decode_semantic_copy_view_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_copy_view_ns)
+                         << ",outside_graph:count=" << req->decode_semantic_outside_graph_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_outside_graph_ns)
+                         << ",unattributed:count=" << req->decode_semantic_unattributed_count
+                         << ":ms=" << ns_to_ms(req->decode_semantic_unattributed_ns);
     const std::string qwen35_moe_w1w3_hist = weight_hist_string(req->qwen35_moe_w1w3_weight_type_hist);
     const std::string qwen35_moe_w2_hist = weight_hist_string(req->qwen35_moe_w2_weight_type_hist);
     const std::string qwen36_prefill_top_slow_ops = shape_census_string(req->qwen36_prefill_top_slow_ops);
@@ -2266,6 +2317,10 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
         << " decode_graph_node_measured_ms=" << ns_to_ms(req->decode_graph_node_measured_ns)
         << " decode_graph_node_hist=" << decode_graph_node_hist.str()
         << " decode_graph_custom_node_hist=" << decode_graph_custom_node_hist.str()
+        << " decode_semantic_hist=" << decode_semantic_hist.str()
+        << " decode_semantic_total_ms=" << ns_to_ms(decode_semantic_total_ns)
+        << " decode_semantic_coverage_pct=" << decode_semantic_coverage_pct
+        << " decode_semantic_unattributed_pct=" << decode_semantic_unattributed_pct
         << " decode_graph_top_slow_nodes=" << decode_graph_top_slow_nodes
         << " attention_ms=" << ns_to_ms(req->attention_ns)
         << " paged_attention_ms=" << ns_to_ms(req->paged_attention_ns)
