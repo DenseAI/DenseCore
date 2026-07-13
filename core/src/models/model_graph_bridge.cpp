@@ -209,14 +209,14 @@ private:
     const TransformerModel* model_;
 };
 
-class OpenVlaGraphBuilder : public GraphBuilder {
+class OpenVlaContractGraphBuilder : public GraphBuilder {
 public:
-    explicit OpenVlaGraphBuilder(const TransformerModel* model) : model_(model) {}
+    explicit OpenVlaContractGraphBuilder(const TransformerModel* model) : model_(model) {}
 
     std::unique_ptr<OperationGraph> Build(const std::vector<Tensor>& inputs,
                                           const std::string& /*variant_name*/) override {
         if (inputs.size() < 2) {
-            std::cerr << "[OpenVlaGraphBuilder] Expected image + text inputs" << std::endl;
+            std::cerr << "[OpenVlaContractGraphBuilder] Expected image + text inputs" << std::endl;
             return nullptr;
         }
 
@@ -1344,9 +1344,10 @@ bool ModelGraphBridge::RegisterLlmBuilder(const TransformerModel* model) {
         return std::make_unique<GenericLlmBuilder>(model);
     });
     GraphRegistry::Instance().Register(
-        "openvla", [model]() -> std::unique_ptr<GraphBuilder> { return std::make_unique<OpenVlaGraphBuilder>(model); });
+        "openvla_contract",
+        [model]() -> std::unique_ptr<GraphBuilder> { return std::make_unique<OpenVlaContractGraphBuilder>(model); });
     std::cout << "[ModelGraphBridge] Registered GenericLlmBuilder for llm_generic/llm_universal and "
-                 "OpenVlaGraphBuilder for openvla"
+                 "OpenVlaContractGraphBuilder for openvla_contract"
               << std::endl;
     return true;
 }

@@ -5,6 +5,8 @@
 #include <string>
 
 #include "densecore/models/decoder_model_spec.h"
+#include "densecore/models/graph_registry.h"
+#include "densecore/models/model_graph_bridge.h"
 #include "densecore/models/transformer_graph_builder.h"
 #include "densecore/runtime/inference.h"
 #include "densecore/models/model_types.h"
@@ -265,6 +267,15 @@ TEST(BuildTransformerGraphDispatchTest, ExecutionHelperFailsClosedWhenExactKeyIs
     EXPECT_EQ(builder, nullptr);
     EXPECT_NE(error_reason.find("exact registry builder key 'llama' is not available for execution"),
               std::string::npos);
+}
+
+TEST(ModelGraphBridgeContractTest, OpenVlaHeuristicRequiresExplicitContractName) {
+    static TransformerModel model{};
+    model.arch = ModelArch::LLAMA;
+
+    ASSERT_TRUE(densecore::ModelGraphBridge::RegisterFromModel(&model));
+    EXPECT_EQ(densecore::GraphRegistry::Instance().GetBuilder("openvla"), nullptr);
+    EXPECT_NE(densecore::GraphRegistry::Instance().GetBuilder("openvla_contract"), nullptr);
 }
 
 }  // namespace
