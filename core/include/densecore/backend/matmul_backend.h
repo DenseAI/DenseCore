@@ -48,7 +48,7 @@ struct MatmulParams {
 };
 
 struct MatmulHeuristics {
-    int min_m = 4;
+    int min_m = 256;
     int min_n = 256;
     int min_k = 256;
     int64_t min_mnk = 2000000;

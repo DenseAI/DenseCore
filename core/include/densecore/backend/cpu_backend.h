@@ -27,6 +27,7 @@
 #include "densecore/hal/compute_backend.h"
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -315,6 +316,11 @@ public:
      * @return Reference to the thread pool for the specified node
      */
     ThreadPool& GetThreadPool(int numa_node = -1);
+
+    /**
+     * @brief Execute a range on a persistent NUMA-local CPU thread pool.
+     */
+    DENSECORE_API void ParallelFor(int total_work, const std::function<void(int, int, int)>& task, int numa_node = 0);
 
     /**
      * @brief Get the number of NUMA nodes (thread pools)

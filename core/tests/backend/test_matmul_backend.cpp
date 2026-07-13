@@ -103,6 +103,51 @@ TEST(MatmulBackend, DenseCoreF32TransBHandlesStrides) {
     }
 }
 
+TEST(MatmulBackend, DenseCoreF32TransBLargeContiguousMatchesReference) {
+    constexpr int M = 256;
+    constexpr int N = 257;
+    constexpr int K = 256;
+
+    const MatmulHeuristics heuristics = GetMatmulConfig().heuristics;
+    ASSERT_GE(M, heuristics.min_m);
+    ASSERT_GE(N, heuristics.min_n);
+    ASSERT_GE(K, heuristics.min_k);
+    ASSERT_GE(static_cast<int64_t>(M) * N * K, heuristics.min_mnk);
+
+    std::vector<float> a(static_cast<size_t>(M * K));
+    std::vector<float> b(static_cast<size_t>(N * K));
+    std::vector<float> c(static_cast<size_t>(M * N), -999.0f);
+
+    for (size_t i = 0; i < a.size(); ++i) {
+        a[i] = static_cast<float>(static_cast<int>(i % 17) - 8) / 8.0f;
+    }
+    for (size_t i = 0; i < b.size(); ++i) {
+        b[i] = static_cast<float>(static_cast<int>(i % 13) - 6) / 8.0f;
+    }
+
+    MatmulParams params;
+    params.a = a.data();
+    params.b = b.data();
+    params.c = c.data();
+    params.M = M;
+    params.N = N;
+    params.K = K;
+    params.lda = K;
+    params.ldb = K;
+    params.ldc = N;
+    params.trans_b = true;
+    params.a_type = DType::F32;
+    params.b_type = DType::F32;
+    params.c_type = DType::F32;
+
+    GetDenseCoreMatmulBackend().Execute(params);
+
+    const auto expected = ReferenceMatMulTransB(a.data(), b.data(), M, N, K, K, K);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_NEAR(c[i], expected[i], 1e-5f) << "Mismatch at output index " << i;
+    }
+}
+
 TEST(MatmulBackend, CpuBackendMatMulTransBMatchesReference) {
     constexpr int M = 2;
     constexpr int K = 4;

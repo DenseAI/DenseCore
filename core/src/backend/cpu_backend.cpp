@@ -816,6 +816,10 @@ ThreadPool& CpuBackend::GetThreadPool(int numa_node) {
     return thread_manager_->GetThreadPool(numa_node);
 }
 
+void CpuBackend::ParallelFor(int total_work, const std::function<void(int, int, int)>& task, int numa_node) {
+    GetThreadPool(numa_node).ParallelFor(total_work, task);
+}
+
 int CpuBackend::GetNumaNodeCount() const {
     return thread_manager_ ? thread_manager_->GetNumaNodeCount() : 0;
 }

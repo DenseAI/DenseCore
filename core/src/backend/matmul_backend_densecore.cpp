@@ -5,8 +5,13 @@
 
 #include "densecore/backend/matmul_backend.h"
 
+#include <algorithm>
+#include <cstdint>
+
+#include "densecore/backend/cpu_backend.h"
 #include "densecore/simd/simd_ops.h"
 #include "kernels/hwy/hwy_kernels.h"
+#include "thread_pool_impl.h"
 
 namespace densecore {
 
@@ -27,6 +32,11 @@ inline bool SupportsINT8TransB(const MatmulParams& params) {
 
 inline bool IsContiguousF32TransB(const MatmulParams& params) {
     return params.lda == params.K && params.ldb == params.K && params.ldc == params.N;
+}
+
+inline bool ShouldParallelizeF32TransB(int M, int N, int K, int64_t work) {
+    const MatmulHeuristics heuristics = GetMatmulConfig().heuristics;
+    return M >= heuristics.min_m && N >= heuristics.min_n && K >= heuristics.min_k && work >= heuristics.min_mnk;
 }
 
 inline int32_t DotInt8Int8(const int8_t* a, const int8_t* b, int n) {
@@ -195,6 +205,23 @@ void ExecuteDenseCoreMatmulTransBF32(const MatmulParams& params) {
     float* c = static_cast<float*>(params.c);
 
     if (IsContiguousF32TransB(params)) {
+        constexpr int64_t kMinWorkPerTask = 512 * 1024;
+        const int64_t work = static_cast<int64_t>(M) * N * K;
+        auto& pool = GetCpuBackend().GetThreadPool(0);
+        const int tasks_by_work =
+            static_cast<int>(std::min<int64_t>(pool.GetNumThreads(), std::max<int64_t>(1, work / kMinWorkPerTask)));
+        const int tasks = std::min({pool.GetNumThreads(), M, tasks_by_work});
+
+        if (tasks > 1 && ShouldParallelizeF32TransB(M, N, K, work)) {
+            pool.ParallelFor(tasks, [=](int task_start, int task_end, int /*thread_id*/) {
+                const int m_start = static_cast<int>(static_cast<int64_t>(task_start) * M / tasks);
+                const int m_end = static_cast<int>(static_cast<int64_t>(task_end) * M / tasks);
+                hwy_kernels::GemmFP32_Hwy(c + static_cast<size_t>(m_start) * N, a + static_cast<size_t>(m_start) * K, b,
+                                          m_end - m_start, N, K, 0, N);
+            });
+            return;
+        }
+
         hwy_kernels::GemmFP32_Hwy(c, a, b, M, N, K, 0, N);
         return;
     }
