@@ -1639,7 +1639,8 @@ TEST(NumaStickyRouting, PublicGgmlQ4KProjectionHandlesLargeBatchAndOddOutputWidt
     CpuBackend::GgmlQuantizedMatrixView weight_view{weight_q4.data(), static_cast<int32_t>(qtype), N, K,
                                                     ggml_row_size(qtype, K)};
 
-    ASSERT_TRUE(backend.MatMulGgmlQuantizedTransB(input_tensor, weight_view, &output_tensor));
+    EXPECT_EQ(backend.MatMulGgmlQuantizedTransBWithPath(input_tensor, weight_view, &output_tensor),
+              CpuBackend::GgmlQuantizedMatMulPath::Ggml);
     std::vector<float> weight_deq(static_cast<size_t>(N * K), 0.0f);
     const auto* traits = ggml_get_type_traits(qtype);
     ASSERT_NE(traits, nullptr);
@@ -1655,6 +1656,47 @@ TEST(NumaStickyRouting, PublicGgmlQ4KProjectionHandlesLargeBatchAndOddOutputWidt
         max_abs_error = std::max(max_abs_error, std::abs(output[i] - reference[i]));
     }
     EXPECT_LT(max_abs_error, 4e-2f);
+}
+
+TEST(NumaStickyRouting, PublicGgmlQ4KProjectionMatchesDenseReferenceForPrefillShape) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 101;
+    constexpr int K = 512;
+    constexpr int N = 128;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_K;
+
+    std::mt19937 rng(1813);
+    std::uniform_real_distribution<float> dist(-0.20f, 0.20f);
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> weight_f32(static_cast<size_t>(N * K));
+    for (float& value : input) value = dist(rng);
+    for (float& value : weight_f32) value = dist(rng);
+
+    std::vector<uint8_t> weight_q4;
+    QuantizeRowsForTest(qtype, weight_f32, N, K, &weight_q4);
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> reference(output.size(), 0.0f);
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+    CpuBackend::GgmlQuantizedMatrixView weight_view{weight_q4.data(), static_cast<int32_t>(qtype), N, K,
+                                                    ggml_row_size(qtype, K)};
+
+    EXPECT_EQ(backend.MatMulGgmlQuantizedTransBWithPath(input_tensor, weight_view, &output_tensor),
+              CpuBackend::GgmlQuantizedMatMulPath::Q4KRawBatched);
+    std::vector<float> weight_deq(static_cast<size_t>(N * K), 0.0f);
+    const auto* traits = ggml_get_type_traits(qtype);
+    ASSERT_NE(traits, nullptr);
+    ASSERT_NE(traits->to_float, nullptr);
+    for (int n = 0; n < N; ++n) {
+        traits->to_float(weight_q4.data() + static_cast<size_t>(n) * weight_view.row_bytes,
+                         weight_deq.data() + static_cast<size_t>(n) * K, K);
+    }
+    DenseMatMulTransBReference(input.data(), weight_deq.data(), reference.data(), M, K, N);
+    float max_abs_error = 0.0f;
+    for (size_t i = 0; i < output.size(); ++i) {
+        max_abs_error = std::max(max_abs_error, std::abs(output[i] - reference[i]));
+    }
+    EXPECT_LT(max_abs_error, 5e-2f);
 }
 
 TEST(NumaStickyRouting, PublicGgmlQ40ProjectionMatchesVecDotAndRejectsBadStride) {

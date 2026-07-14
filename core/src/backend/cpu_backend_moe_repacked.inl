@@ -296,77 +296,8 @@ bool RunQ4KRepackedMoEGemv(CpuBackend* backend, const std::shared_ptr<Q4KRepacke
 bool RunQ4KRepackedMoEGemmM4(CpuBackend* backend, const std::shared_ptr<Q4KRepackedMoEWeight>& packed,
                              const float* input_data, float* output_data, int64_t rows, int64_t cols,
                              int64_t input_cols, int numa_node, bool allow_parallel) {
-    if (!backend || !packed || !input_data || !output_data || rows < 4 || packed->rows != cols || (cols % 8) != 0 ||
-        packed->cols <= 0 || input_cols != packed->cols || (input_cols % QK_K) != 0) {
-        return false;
-    }
-
-    auto& pool = backend->GetThreadPool(numa_node);
-    const int n_threads = allow_parallel ? pool.GetNumThreads() : 1;
-    const int tile_count = static_cast<int>(cols / 8);
-    const int blocks_per_row = static_cast<int>(packed->blocks_per_row);
-    const size_t q8_tile_bytes = static_cast<size_t>(input_cols / QK_K) * sizeof(MoEBlockQ8Kx4);
-    const int64_t group_count = rows / 4;
-
-    const size_t q8_group_bytes = static_cast<size_t>(group_count) * q8_tile_bytes;
-    std::vector<uint8_t> q8x4_groups(q8_group_bytes);
-
-    const auto quantize_group = [&](int group_start, int group_end, int) {
-        for (int group = group_start; group < group_end; ++group) {
-            const int64_t row = static_cast<int64_t>(group) * 4;
-            const float* input_tile = input_data + static_cast<size_t>(row) * static_cast<size_t>(input_cols);
-            uint8_t* q8_tile = q8x4_groups.data() + static_cast<size_t>(group) * q8_tile_bytes;
-            ggml_quantize_mat_q8_K_4x8(input_tile, q8_tile, input_cols);
-        }
-    };
-    if (n_threads > 1 && group_count >= 2) {
-        pool.ParallelFor(static_cast<int>(group_count), quantize_group);
-    } else {
-        quantize_group(0, static_cast<int>(group_count), 0);
-    }
-
-    const int64_t total_tiles = group_count * static_cast<int64_t>(tile_count);
-    const auto compute_units = [&](int unit_start, int unit_end, int) {
-        for (int unit = unit_start; unit < unit_end; ++unit) {
-            const int64_t group = static_cast<int64_t>(unit) / tile_count;
-            const int tile = unit % tile_count;
-            const int64_t row = group * 4;
-            const void* vx = packed->blocks.data() + static_cast<size_t>(tile) * blocks_per_row;
-            const uint8_t* q8_tile = q8x4_groups.data() + static_cast<size_t>(group) * q8_tile_bytes;
-            float* out_tile = output_data + static_cast<size_t>(row) * static_cast<size_t>(cols) +
-                              static_cast<size_t>(tile) * 8;
-            ggml_gemm_q4_K_8x8_q8_K(static_cast<int>(packed->cols), out_tile, static_cast<size_t>(cols), vx, q8_tile,
-                                    4, 8);
-        }
-    };
-    if (n_threads > 1 && total_tiles >= 2) {
-        pool.ParallelFor(static_cast<int>(total_tiles), compute_units);
-    } else {
-        compute_units(0, static_cast<int>(total_tiles), 0);
-    }
-
-    int64_t row = group_count * 4;
-    if (row < rows) {
-        const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, input_cols);
-        static thread_local std::vector<uint8_t> q8_tail_buf;
-        const size_t tail_bytes = static_cast<size_t>(rows - row) * q8_row_bytes;
-        if (q8_tail_buf.size() < tail_bytes) {
-            q8_tail_buf.resize(tail_bytes);
-        }
-        const auto* iq_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
-        if (!iq_traits || !iq_traits->from_float) {
-            return false;
-        }
-        for (int64_t m = row; m < rows; ++m) {
-            iq_traits->from_float(input_data + static_cast<size_t>(m) * static_cast<size_t>(input_cols),
-                                  q8_tail_buf.data() + static_cast<size_t>(m - row) * q8_row_bytes, input_cols);
-        }
-        return RunQ4KRepackedMoEGemv(backend, packed, q8_tail_buf.data(), q8_row_bytes,
-                                     output_data + static_cast<size_t>(row) * static_cast<size_t>(cols), rows - row,
-                                     cols, numa_node, allow_parallel);
-    }
-
-    return true;
+    return densecore::internal::RunQ4KRepackedDenseGemm(backend, packed, input_data, output_data, rows, cols,
+                                                        input_cols, numa_node, allow_parallel);
 }
 
 bool RunQ4KRepackedMoEFusedSwiGLUM4(CpuBackend* backend, const std::shared_ptr<Q4KRepackedMoEWeight>& gate_packed,

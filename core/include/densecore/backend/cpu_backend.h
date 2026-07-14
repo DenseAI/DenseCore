@@ -95,6 +95,12 @@ public:
         bool IsValid() const { return data != nullptr && type_id >= 0 && rows > 0 && cols > 0 && row_bytes > 0; }
     };
 
+    enum class GgmlQuantizedMatMulPath : uint8_t {
+        Rejected = 0,
+        Ggml,
+        Q4KRawBatched,
+    };
+
     CpuBackend();
     ~CpuBackend() override;
 
@@ -283,6 +289,9 @@ public:
      */
     DENSECORE_API bool MatMulGgmlQuantizedTransB(const Tensor& A, const GgmlQuantizedMatrixView& W, Tensor* C,
                                                  int numa_node_id = 0);
+    DENSECORE_API GgmlQuantizedMatMulPath MatMulGgmlQuantizedTransBWithPath(const Tensor& A,
+                                                                            const GgmlQuantizedMatrixView& W, Tensor* C,
+                                                                            int numa_node_id = 0);
     void GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales, const Tensor& zero_points, Tensor* C,
                   int group_size) override;
     void RMSNorm(const Tensor& input, const Tensor& weight, Tensor* output, float eps = 1e-5f) override;

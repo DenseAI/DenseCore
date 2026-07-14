@@ -1351,7 +1351,7 @@ bool ComputeMoEQ5KQ8KBatchedRow(const void* weight_row, const uint8_t* quant_inp
 
 bool RunMoEQ4KRawBatchedProjectionImpl(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
                                        size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
-                                       int numa_node, bool allow_parallel) {
+                                       int numa_node, bool allow_parallel, bool record_metrics = true) {
     if (!backend || !weight_ptr || !qinput_data || !out_data || M <= 0 || M > kMoEQuantizedProjectionMaxBatch ||
         N <= 0 || K <= 0 || (K % QK_K) != 0) {
         return false;
@@ -1424,7 +1424,7 @@ bool RunMoEQ4KRawBatchedProjectionImpl(CpuBackend* backend, const void* weight_p
         pool.ParallelFor(static_cast<int>(N), [&](int n_start, int n_end, int) { compute_rows(n_start, n_end); });
     }
     const bool success = ok.load(std::memory_order_relaxed);
-    if (success) {
+    if (success && record_metrics) {
         const auto elapsed = std::chrono::steady_clock::now() - begin;
         RecordMoEKQuantRawBatchedUse(
             GetCurrentWorkContext(), GGML_TYPE_Q4_K,

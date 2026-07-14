@@ -1,6 +1,7 @@
 #include "backend/cpu_backend_internal.h"
 #include "backend/cpu_backend_moe_forward_plan.h"
 #include "backend/cpu_backend_moe_projection.h"
+#include "backend/cpu_backend_q4k_dense.h"
 #include "ggml-cpu.h"  // For ggml_get_type_traits_cpu (vec_dot)
 #include "kernels/hwy/hwy_kernels.h"
 #include "kernels/kernel_caps.h"
@@ -914,6 +915,16 @@ bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, 
                                    int numa_node, bool allow_parallel) {
     return RunMoEQ4KRawBatchedProjectionImpl(backend, weight_ptr, qinput_data, qinput_row_bytes, out_data, M, N, K,
                                              numa_node, allow_parallel);
+}
+
+bool internal::RunQ4KRawBatchedQuantizedProjection(CpuBackend* backend, const void* weight_data,
+                                                    const uint8_t* quantized_input,
+                                                    size_t quantized_input_row_bytes, float* output_data,
+                                                    int64_t rows, int64_t output_cols, int64_t input_cols,
+                                                    int numa_node, bool allow_parallel) {
+    return RunMoEQ4KRawBatchedProjectionImpl(backend, weight_data, quantized_input, quantized_input_row_bytes,
+                                             output_data, rows, output_cols, input_cols, numa_node, allow_parallel,
+                                             /*record_metrics=*/false);
 }
 
 bool RunMoEQ4KRawBatchedWeightedScatterProjection(

@@ -1,7 +1,9 @@
 #include "densecore/backend/cpu_backend.h"
 
+#include "backend/cpu_backend_q4k_dense.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "kernels/q4k_repacked_gemv.h"
 #include "thread_pool_impl.h"
 
 #include <algorithm>
@@ -147,21 +149,35 @@ bool RunGgmlQ4MatMul(const Tensor& input, const CpuBackend::GgmlQuantizedMatrixV
 
 bool CpuBackend::MatMulGgmlQuantizedTransB(const Tensor& A, const GgmlQuantizedMatrixView& W, Tensor* C,
                                            int numa_node_id) {
+    return MatMulGgmlQuantizedTransBWithPath(A, W, C, numa_node_id) != GgmlQuantizedMatMulPath::Rejected;
+}
+
+CpuBackend::GgmlQuantizedMatMulPath CpuBackend::MatMulGgmlQuantizedTransBWithPath(const Tensor& A,
+                                                                                  const GgmlQuantizedMatrixView& W,
+                                                                                  Tensor* C, int numa_node_id) {
     if (!A.IsValid() || !W.IsValid() || !C || !C->IsValid() || A.dtype != DType::F32 || C->dtype != DType::F32 ||
         A.ndim != 2 || C->ndim != 2 || A.shape[1] != W.cols || C->shape[0] != A.shape[0] || C->shape[1] != W.rows) {
-        return false;
+        return GgmlQuantizedMatMulPath::Rejected;
     }
 
     const ggml_type weight_type = static_cast<ggml_type>(W.type_id);
     if (!IsSupportedWeightType(weight_type) || W.cols % ggml_blck_size(weight_type) != 0 ||
         W.row_bytes != ggml_row_size(weight_type, W.cols)) {
-        return false;
+        return GgmlQuantizedMatMulPath::Rejected;
     }
 
     auto& pool = GetThreadPool(numa_node_id);
+    if (weight_type == GGML_TYPE_Q4_K && A.shape[0] >= 4 && A.shape[0] <= 256 &&
+        (W.cols % kernels::kQ4KSuperBlock) == 0) {
+        if (internal::RunQ4KRawBatchedDenseGemm(this, W.data, A.DataAs<float>(), C->DataAs<float>(), A.shape[0], W.rows,
+                                                W.cols, numa_node_id, pool.GetNumThreads() > 1)) {
+            return GgmlQuantizedMatMulPath::Q4KRawBatched;
+        }
+    }
     // ggml owns the maintained Q4_0/Q4_K kernels. The cached graph keeps the
     // weights in raw GGUF blocks and avoids rebuilding plans on resident calls.
-    return RunGgmlQ4MatMul(A, W, C, pool.GetNumThreads());
+    return RunGgmlQ4MatMul(A, W, C, pool.GetNumThreads()) ? GgmlQuantizedMatMulPath::Ggml
+                                                          : GgmlQuantizedMatMulPath::Rejected;
 }
 
 }  // namespace densecore
