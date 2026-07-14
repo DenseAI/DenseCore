@@ -547,6 +547,7 @@ set(SOURCES
     src/runtime/graph_executor.cpp
     src/models/lora_storage.cpp
     src/backend/cpu_backend.cpp
+    src/backend/cpu_backend_quantized_matmul.cpp
     src/backend/cpu_backend_moe_forward_plan.cpp
     src/backend/cpu_backend_moe_ops.cpp
     src/kernels/q4k_repacked_gemv.cpp

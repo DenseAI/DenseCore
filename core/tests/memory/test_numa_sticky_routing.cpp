@@ -1616,6 +1616,91 @@ TEST(NumaStickyRouting, GgmlQ4KRawBatchedMoEProjectionMatchesVecDotReference) {
     }
 }
 
+TEST(NumaStickyRouting, PublicGgmlQ4KProjectionHandlesLargeBatchAndOddOutputWidth) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 300;
+    constexpr int K = 256;
+    constexpr int N = 33;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_K;
+
+    std::mt19937 rng(1811);
+    std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> weight_f32(static_cast<size_t>(N * K));
+    for (float& value : input) value = dist(rng);
+    for (float& value : weight_f32) value = dist(rng);
+
+    std::vector<uint8_t> weight_q4;
+    QuantizeRowsForTest(qtype, weight_f32, N, K, &weight_q4);
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> reference;
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+    CpuBackend::GgmlQuantizedMatrixView weight_view{weight_q4.data(), static_cast<int32_t>(qtype), N, K,
+                                                    ggml_row_size(qtype, K)};
+
+    ASSERT_TRUE(backend.MatMulGgmlQuantizedTransB(input_tensor, weight_view, &output_tensor));
+    std::vector<float> weight_deq(static_cast<size_t>(N * K), 0.0f);
+    const auto* traits = ggml_get_type_traits(qtype);
+    ASSERT_NE(traits, nullptr);
+    ASSERT_NE(traits->to_float, nullptr);
+    for (int n = 0; n < N; ++n) {
+        traits->to_float(weight_q4.data() + static_cast<size_t>(n) * weight_view.row_bytes,
+                         weight_deq.data() + static_cast<size_t>(n) * K, K);
+    }
+    reference.assign(output.size(), 0.0f);
+    DenseMatMulTransBReference(input.data(), weight_deq.data(), reference.data(), M, K, N);
+    float max_abs_error = 0.0f;
+    for (size_t i = 0; i < output.size(); ++i) {
+        max_abs_error = std::max(max_abs_error, std::abs(output[i] - reference[i]));
+    }
+    EXPECT_LT(max_abs_error, 4e-2f);
+}
+
+TEST(NumaStickyRouting, PublicGgmlQ40ProjectionMatchesVecDotAndRejectsBadStride) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int M = 5;
+    constexpr int K = 320;
+    constexpr int N = 17;
+    constexpr ggml_type qtype = GGML_TYPE_Q4_0;
+
+    std::mt19937 rng(1812);
+    std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+    std::vector<float> input(static_cast<size_t>(M * K));
+    std::vector<float> weight_f32(static_cast<size_t>(N * K));
+    for (float& value : input) value = dist(rng);
+    for (float& value : weight_f32) value = dist(rng);
+
+    std::vector<uint8_t> weight_q4;
+    QuantizeRowsForTest(qtype, weight_f32, N, K, &weight_q4);
+    std::vector<float> output(static_cast<size_t>(M * N), 0.0f);
+    std::vector<float> reference;
+    Tensor input_tensor = Tensor::Make2D(input.data(), M, K);
+    Tensor output_tensor = Tensor::Make2D(output.data(), M, N);
+    CpuBackend::GgmlQuantizedMatrixView weight_view{weight_q4.data(), static_cast<int32_t>(qtype), N, K,
+                                                    ggml_row_size(qtype, K)};
+
+    ASSERT_TRUE(backend.MatMulGgmlQuantizedTransB(input_tensor, weight_view, &output_tensor));
+    std::vector<float> weight_deq(static_cast<size_t>(N * K), 0.0f);
+    const auto* traits = ggml_get_type_traits(qtype);
+    ASSERT_NE(traits, nullptr);
+    ASSERT_NE(traits->to_float, nullptr);
+    for (int n = 0; n < N; ++n) {
+        traits->to_float(weight_q4.data() + static_cast<size_t>(n) * weight_view.row_bytes,
+                         weight_deq.data() + static_cast<size_t>(n) * K, K);
+    }
+    reference.assign(output.size(), 0.0f);
+    DenseMatMulTransBReference(input.data(), weight_deq.data(), reference.data(), M, K, N);
+    float max_abs_error = 0.0f;
+    for (size_t i = 0; i < output.size(); ++i) {
+        max_abs_error = std::max(max_abs_error, std::abs(output[i] - reference[i]));
+    }
+    EXPECT_LT(max_abs_error, 4e-2f);
+
+    --weight_view.row_bytes;
+    EXPECT_FALSE(backend.MatMulGgmlQuantizedTransB(input_tensor, weight_view, &output_tensor));
+}
+
 TEST(NumaStickyRouting, GgmlQ5KMultiRowMoEProjectionMatchesVecDotReference) {
     CpuBackend& backend = GetCpuBackend();
     constexpr int M = 7;

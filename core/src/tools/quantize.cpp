@@ -63,6 +63,7 @@ bool ShouldQuantize(const std::string& name, const QuantConfig& config) {
     // Skip embeddings if configured
     if (config.skip_embeddings) {
         if (name.find("tok_embed") != std::string::npos || name.find("token_embed") != std::string::npos ||
+            name.find("word_embeddings") != std::string::npos || name.find("embed.") != std::string::npos ||
             name.find("wte") != std::string::npos) {
             return false;
         }
@@ -123,46 +124,46 @@ static bool CanUseGGMLQuantType(const struct ggml_tensor* tensor, ggml_type qtyp
  */
 QuantConfig ParseConfig(int argc, char** argv) {
     std::string type_str = (argc > 3) ? argv[3] : "q4_0";
-    int block_size = (argc > 4) ? std::atoi(argv[4]) : 128;
+    int block_size = (argc > 4 && argv[4][0] != '-') ? std::atoi(argv[4]) : 128;
+    QuantConfig cfg;
 
     // Parse format
     if (type_str == "int4" || type_str == "int4_blockwise" || type_str == "int4_paper") {
-        return INT4_PAPER_CFG(block_size);
+        cfg = INT4_PAPER_CFG(block_size);
     } else if (type_str == "q4_k_m" || type_str == "q4_k") {
-        return Q4_K_M_CFG();
+        cfg = Q4_K_M_CFG();
     } else if (type_str == "q5_k_m" || type_str == "q5_k") {
-        return Q5_K_M_CFG();
+        cfg = Q5_K_M_CFG();
     } else if (type_str == "q8_0" || type_str == "int8") {
-        return Q8_0_CFG();
+        cfg = Q8_0_CFG();
     } else if (type_str == "q4_0") {
-        QuantConfig cfg;
         cfg.format = QuantFormat::Q4_0;
         cfg.algorithm = QuantAlgorithm::GGML_Q4_0;
-        return cfg;
     } else if (type_str == "q4_1") {
         // Q4_1 uses Q4_0 config but different GGML type
-        QuantConfig cfg;
         cfg.format = QuantFormat::Q4_0;
         cfg.algorithm = QuantAlgorithm::GGML_Q4_0;
-        return cfg;
     } else if (type_str == "f16" || type_str == "fp16") {
-        QuantConfig cfg;
         cfg.format = QuantFormat::FP16;
         cfg.quantize_weights = false;
-        return cfg;
     } else if (type_str == "fp8" || type_str == "fp8_e4m3" || type_str == "fp8_e4m3fn") {
-        QuantConfig cfg = FP8_DEFAULT_CFG();
+        cfg = FP8_DEFAULT_CFG();
         cfg.format = QuantFormat::FP8_E4M3FN;
-        return cfg;
     } else if (type_str == "fp8_e5m2") {
-        QuantConfig cfg = FP8_DEFAULT_CFG();
+        cfg = FP8_DEFAULT_CFG();
         cfg.format = QuantFormat::FP8_E5M2;
-        return cfg;
+    } else {
+        cfg.format = QuantFormat::Q4_0;
     }
 
-    // Default
-    QuantConfig cfg;
-    cfg.format = QuantFormat::Q4_0;
+    for (int i = 4; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--include-output") {
+            cfg.skip_output_layer = false;
+        } else if (arg == "--include-embeddings") {
+            cfg.skip_embeddings = false;
+        }
+    }
     return cfg;
 }
 
@@ -936,7 +937,9 @@ int QuantizeINT4Custom(const char* input_path, const char* output_path, const Qu
 // ============================================================================
 
 void PrintUsage(const char* prog) {
-    std::cerr << "Usage: " << prog << " <input.gguf> <output.gguf> [type] [block_size]" << std::endl;
+    std::cerr << "Usage: " << prog
+              << " <input.gguf> <output.gguf> [type] [block_size] [--include-output] [--include-embeddings]"
+              << std::endl;
     std::cerr << std::endl;
     std::cerr << "Quantization types:" << std::endl;
     std::cerr << "  q4_0        - 4-bit basic GGML quantization (default)" << std::endl;

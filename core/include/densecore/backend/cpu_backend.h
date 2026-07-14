@@ -85,6 +85,16 @@ using ::TransformerLayer;
  */
 class CpuBackend : public ComputeBackend {
 public:
+    struct GgmlQuantizedMatrixView {
+        const void* data = nullptr;
+        int32_t type_id = -1;
+        int64_t rows = 0;
+        int64_t cols = 0;
+        size_t row_bytes = 0;
+
+        bool IsValid() const { return data != nullptr && type_id >= 0 && rows > 0 && cols > 0 && row_bytes > 0; }
+    };
+
     CpuBackend();
     ~CpuBackend() override;
 
@@ -263,6 +273,16 @@ public:
     // Base class overrides (default to round-robin dispatch)
     void MatMul(const Tensor& A, const Tensor& B, Tensor* C) override;
     void MatMulTransB(const Tensor& A, const Tensor& B, Tensor* C) override;
+    /**
+     * Multiply F32 activations by raw GGML block-quantized weight rows.
+     *
+     * The weight view must describe an [N, K] row-major matrix whose rows use
+     * the exact GGML type layout identified by type_id. This is intentionally
+     * separate from GemmInt4, whose packed-nibble scale/zero contract is not
+     * compatible with raw GGUF Q4 blocks.
+     */
+    DENSECORE_API bool MatMulGgmlQuantizedTransB(const Tensor& A, const GgmlQuantizedMatrixView& W, Tensor* C,
+                                                 int numa_node_id = 0);
     void GemmInt4(const Tensor& A, const Tensor& W, const Tensor& scales, const Tensor& zero_points, Tensor* C,
                   int group_size) override;
     void RMSNorm(const Tensor& input, const Tensor& weight, Tensor* output, float eps = 1e-5f) override;
