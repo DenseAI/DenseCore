@@ -1040,12 +1040,12 @@ void GemmInt4BatchedImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT i
     const auto mask_odd = hn::RebindMask(di8, mask_odd_u8);
 
     // ========================================================================
-    // COLUMN-FIRST M-BLOCKED GEMM (M_BLOCK=4):
+    // COLUMN-FIRST M-BLOCKED GEMM (M_BLOCK=8):
     //   outer: n (output column range assigned by thread dispatcher)
     //   middle: k/group
-    //   inner op: load ONE weight vector, apply to 4 batch rows
+    //   inner op: load ONE weight vector, apply to 8 batch rows
     // ========================================================================
-    constexpr int M_BLOCK = 4;
+    constexpr int M_BLOCK = 8;
 
     for (int n = n_start; n < n_end; ++n) {
         const uint8_t* w_row = weights + static_cast<int64_t>(n) * packed_K;
@@ -1062,15 +1062,27 @@ void GemmInt4BatchedImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT i
             auto v_acc1 = hn::Zero(df);
             auto v_acc2 = hn::Zero(df);
             auto v_acc3 = hn::Zero(df);
+            auto v_acc4 = hn::Zero(df);
+            auto v_acc5 = hn::Zero(df);
+            auto v_acc6 = hn::Zero(df);
+            auto v_acc7 = hn::Zero(df);
             float scalar_acc0 = 0.0f;
             float scalar_acc1 = 0.0f;
             float scalar_acc2 = 0.0f;
             float scalar_acc3 = 0.0f;
+            float scalar_acc4 = 0.0f;
+            float scalar_acc5 = 0.0f;
+            float scalar_acc6 = 0.0f;
+            float scalar_acc7 = 0.0f;
 
             const float* in0 = input + static_cast<int64_t>(m + 0) * input_stride;
             const float* in1 = input + static_cast<int64_t>(m + 1) * input_stride;
             const float* in2 = input + static_cast<int64_t>(m + 2) * input_stride;
             const float* in3 = input + static_cast<int64_t>(m + 3) * input_stride;
+            const float* in4 = input + static_cast<int64_t>(m + 4) * input_stride;
+            const float* in5 = input + static_cast<int64_t>(m + 5) * input_stride;
+            const float* in6 = input + static_cast<int64_t>(m + 6) * input_stride;
+            const float* in7 = input + static_cast<int64_t>(m + 7) * input_stride;
 
             for (int g = 0; g < num_full_groups; ++g) {
                 const int k_base = g * group_size;
@@ -1092,6 +1104,10 @@ void GemmInt4BatchedImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT i
                         ::hwy::Prefetch(in1 + pf_kk);
                         ::hwy::Prefetch(in2 + pf_kk);
                         ::hwy::Prefetch(in3 + pf_kk);
+                        ::hwy::Prefetch(in4 + pf_kk);
+                        ::hwy::Prefetch(in5 + pf_kk);
+                        ::hwy::Prefetch(in6 + pf_kk);
+                        ::hwy::Prefetch(in7 + pf_kk);
                     }
 
                     const int byte_off = k / 2;
@@ -1108,10 +1124,18 @@ void GemmInt4BatchedImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT i
                     const auto v_in1 = hn::LoadU(df, in1 + kk);
                     const auto v_in2 = hn::LoadU(df, in2 + kk);
                     const auto v_in3 = hn::LoadU(df, in3 + kk);
+                    const auto v_in4 = hn::LoadU(df, in4 + kk);
+                    const auto v_in5 = hn::LoadU(df, in5 + kk);
+                    const auto v_in6 = hn::LoadU(df, in6 + kk);
+                    const auto v_in7 = hn::LoadU(df, in7 + kk);
                     v_acc0 = hn::MulAdd(v_in0, v_dq, v_acc0);
                     v_acc1 = hn::MulAdd(v_in1, v_dq, v_acc1);
                     v_acc2 = hn::MulAdd(v_in2, v_dq, v_acc2);
                     v_acc3 = hn::MulAdd(v_in3, v_dq, v_acc3);
+                    v_acc4 = hn::MulAdd(v_in4, v_dq, v_acc4);
+                    v_acc5 = hn::MulAdd(v_in5, v_dq, v_acc5);
+                    v_acc6 = hn::MulAdd(v_in6, v_dq, v_acc6);
+                    v_acc7 = hn::MulAdd(v_in7, v_dq, v_acc7);
                 }
 
                 for (; k < group_size; ++k) {
@@ -1121,6 +1145,10 @@ void GemmInt4BatchedImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT i
                     scalar_acc1 += in1[kk] * dq;
                     scalar_acc2 += in2[kk] * dq;
                     scalar_acc3 += in3[kk] * dq;
+                    scalar_acc4 += in4[kk] * dq;
+                    scalar_acc5 += in5[kk] * dq;
+                    scalar_acc6 += in6[kk] * dq;
+                    scalar_acc7 += in7[kk] * dq;
                 }
             }
 
@@ -1128,6 +1156,10 @@ void GemmInt4BatchedImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT i
             float out1 = hn::ReduceSum(df, v_acc1) + scalar_acc1;
             float out2 = hn::ReduceSum(df, v_acc2) + scalar_acc2;
             float out3 = hn::ReduceSum(df, v_acc3) + scalar_acc3;
+            float out4 = hn::ReduceSum(df, v_acc4) + scalar_acc4;
+            float out5 = hn::ReduceSum(df, v_acc5) + scalar_acc5;
+            float out6 = hn::ReduceSum(df, v_acc6) + scalar_acc6;
+            float out7 = hn::ReduceSum(df, v_acc7) + scalar_acc7;
 
             if (remainder > 0) {
                 for (int kk = num_full_groups * group_size; kk < K; ++kk) {
@@ -1136,6 +1168,10 @@ void GemmInt4BatchedImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT i
                     out1 += in1[kk] * dq;
                     out2 += in2[kk] * dq;
                     out3 += in3[kk] * dq;
+                    out4 += in4[kk] * dq;
+                    out5 += in5[kk] * dq;
+                    out6 += in6[kk] * dq;
+                    out7 += in7[kk] * dq;
                 }
             }
 
@@ -1143,6 +1179,10 @@ void GemmInt4BatchedImpl(float* HWY_RESTRICT output, const float* HWY_RESTRICT i
             output[static_cast<int64_t>(m + 1) * N + n] = out1;
             output[static_cast<int64_t>(m + 2) * N + n] = out2;
             output[static_cast<int64_t>(m + 3) * N + n] = out3;
+            output[static_cast<int64_t>(m + 4) * N + n] = out4;
+            output[static_cast<int64_t>(m + 5) * N + n] = out5;
+            output[static_cast<int64_t>(m + 6) * N + n] = out6;
+            output[static_cast<int64_t>(m + 7) * N + n] = out7;
         }
 
         for (; m < m_end; ++m) {

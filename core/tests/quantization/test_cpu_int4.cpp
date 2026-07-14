@@ -535,7 +535,7 @@ TEST(Int4Qwen36KernelTest, GateUpLikeBatchedMatchesReferenceForQwen36Shapes) {
     constexpr float kTolerance = 2e-2f;
     const int packed_K = (K + 1) / 2;
 
-    for (int M : {1, 2, 4}) {
+    for (int M : {1, 2, 4, 8, 9}) {
         std::vector<float> input;
         std::vector<uint8_t> weights;
         std::vector<float> scales;
@@ -562,7 +562,7 @@ TEST(Int4Qwen36KernelTest, DownLikeBatchedMatchesReferenceForQwen36Shapes) {
     constexpr int group_size = 32;
     constexpr float kTolerance = 2e-2f;
 
-    for (int M : {1, 2, 4}) {
+    for (int M : {1, 2, 4, 8, 9}) {
         std::vector<float> input;
         std::vector<uint8_t> weights;
         std::vector<float> scales;
