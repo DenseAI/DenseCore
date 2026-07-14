@@ -97,6 +97,7 @@ struct HostKernelCapabilities {
 struct QwenHotPathPlan {
     ModelVariant variant = ModelVariant::UNKNOWN;
     bool target_model = false;
+    bool qwen35_0_8b = false;
     bool dense_lane = false;
     bool moe_lane = false;
     bool hybrid_ssm_lane = false;
@@ -106,6 +107,7 @@ struct TargetFastPathPlan {
     ModelVariant variant = ModelVariant::UNKNOWN;
     bool target_model = false;
     bool qwen_target = false;
+    bool qwen35_0_8b = false;
     bool gemma4_target = false;
     bool lfm2_target = false;
     bool dense_lane = false;
@@ -213,6 +215,11 @@ inline bool IsDenseCoreFallbackFreeTargetVariant(ModelVariant variant) {
            variant == ModelVariant::LFM2MOE;
 }
 
+inline bool IsQwen35Point8B(const TransformerModel* model) {
+    return model && model->variant == ModelVariant::QWEN35 && model->hparams.n_experts == 0 &&
+           model->arch_flags.is_hybrid_ssm && model->hparams.n_embd == 1024 && model->hparams.n_layer == 24;
+}
+
 inline QwenHotPathPlan ResolveQwenHotPathPlan(const TransformerModel* model) {
     QwenHotPathPlan plan;
     if (!model) {
@@ -220,6 +227,7 @@ inline QwenHotPathPlan ResolveQwenHotPathPlan(const TransformerModel* model) {
     }
     plan.variant = model->variant;
     plan.target_model = IsQwenTargetVariant(model->variant);
+    plan.qwen35_0_8b = IsQwen35Point8B(model);
     plan.dense_lane = plan.target_model && model->hparams.n_experts == 0 && !model->arch_flags.is_hybrid_ssm;
     plan.moe_lane = plan.target_model && model->hparams.n_experts > 0;
     plan.hybrid_ssm_lane = plan.target_model && model->arch_flags.is_hybrid_ssm;
@@ -234,6 +242,7 @@ inline TargetFastPathPlan ResolveTargetFastPathPlan(const TransformerModel* mode
     plan.variant = model->variant;
     plan.qwen_target =
         IsQwenTargetVariant(model->variant) || (model->arch == ModelArch::QWEN35 && model->arch_flags.is_hybrid_ssm);
+    plan.qwen35_0_8b = IsQwen35Point8B(model);
     plan.gemma4_target = model->variant == ModelVariant::GEMMA4 || model->arch_flags.is_gemma4;
     plan.lfm2_target = model->variant == ModelVariant::LFM2MOE || model->arch_flags.is_lfm2_shortconv;
     plan.target_model = IsDenseCoreFallbackFreeTargetVariant(model->variant) || plan.qwen_target ||
@@ -256,6 +265,9 @@ inline const char* QwenHotPathTargetLabel(const QwenHotPathPlan& plan) {
     if (plan.moe_lane) {
         return "qwen35_35b_a3b";
     }
+    if (plan.qwen35_0_8b) {
+        return "qwen35_0.8b_dense";
+    }
     return "qwen35_9b_dense";
 }
 
@@ -267,6 +279,7 @@ inline const char* TargetFastPathLabel(const TargetFastPathPlan& plan) {
         QwenHotPathPlan qwen;
         qwen.variant = plan.variant;
         qwen.target_model = true;
+        qwen.qwen35_0_8b = plan.qwen35_0_8b;
         qwen.dense_lane = plan.dense_lane;
         qwen.moe_lane = plan.moe_lane;
         qwen.hybrid_ssm_lane = plan.hybrid_ssm_lane;

@@ -463,7 +463,7 @@ func TestBuildChatPromptQwenNoThinkingDoesNotInjectThinkScaffold(t *testing.T) {
 		{Role: "user", Content: "What is the capital of France?"},
 	}, nil)
 
-	if prompt != "<|im_start|>user\nWhat is the capital of France? /no_think<|im_end|>\n<|im_start|>assistant\n" {
+	if prompt != "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n" {
 		t.Fatalf("expected plain qwen no-thinking prompt, got %q", prompt)
 	}
 }

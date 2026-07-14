@@ -113,7 +113,6 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 	profile := resolvePromptProfile(modelHint)
 	thinkingEnabled := profile.thinkingEnabled(modelHint, templateKwargs)
 	preserveThinking := profile.preserveThinking(templateKwargs)
-	supportsNoThinkDirective := !isQwen36ModelHint(modelHint)
 
 	var sb strings.Builder
 
@@ -146,17 +145,13 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 		writeChatMLBlock(roleSystem, strings.Join(leadingSystemParts, "\n\n"))
 	}
 
-	for idx := nextMessageIdx; idx < len(messages); idx++ {
-		msg := messages[idx]
+	for _, msg := range messages[nextMessageIdx:] {
 		role := strings.ToLower(strings.TrimSpace(msg.Role))
 		switch role {
 		case roleSystem, roleDeveloper:
 			// Qwen ChatML only accepts an initial system block.
 		case roleUser:
 			content := renderQwenContent(msg, false)
-			if !thinkingEnabled && supportsNoThinkDirective && idx == len(messages)-1 {
-				content = appendQwenNoThinkDirective(content)
-			}
 			writeChatMLBlock(role, content)
 		case roleAssistant:
 			writeChatMLBlock(role, renderQwenAssistantMessage(msg, preserveThinking))
@@ -182,16 +177,6 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 
 func normalizePromptContent(content string) string {
 	return strings.TrimSpace(content)
-}
-
-func appendQwenNoThinkDirective(content string) string {
-	if strings.Contains(content, "/no_think") || strings.Contains(content, "/nothink") {
-		return content
-	}
-	if content != "" && !strings.HasSuffix(content, " ") && !strings.HasSuffix(content, "\n") && !strings.HasSuffix(content, "\t") {
-		content += " "
-	}
-	return content + "/no_think"
 }
 
 func renderStructuredText(parts []domain.ContentPart, imageToken, videoToken, audioToken string) string {

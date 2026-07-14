@@ -269,17 +269,6 @@ bool ResolveQwenThinkingEnabled(const TransformerModel* model) {
     return true;
 }
 
-bool SupportsQwenNoThinkDirective(const TransformerModel* model) {
-    if (!model) {
-        return false;
-    }
-    const auto& descriptor = DescribeModel(model);
-    if (!descriptor.uses_qwen_thinking_env) {
-        return false;
-    }
-    return descriptor.variant != ModelVariant::QWEN36;
-}
-
 bool IsLFM2MoeModel(const TransformerModel* model) {
     return model && DescribeModel(model).variant == ModelVariant::LFM2MOE;
 }
@@ -343,17 +332,6 @@ bool IsLFM2LikelyControlToken(const std::string& token) {
         }
     }
     return token.rfind("<|", 0) == 0 || token.rfind("</", 0) == 0;
-}
-
-std::string AppendQwenNoThinkDirective(std::string content) {
-    if (content.find("/no_think") != std::string::npos || content.find("/nothink") != std::string::npos) {
-        return content;
-    }
-    if (!content.empty() && !std::isspace(static_cast<unsigned char>(content.back()))) {
-        content.push_back(' ');
-    }
-    content += "/no_think";
-    return content;
 }
 
 }  // namespace
@@ -645,14 +623,10 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
         if (IsLFM2MoeModel(model)) {
             wrapped += "<|startoftext|>";
         }
-        std::string user_prompt = prompt;
-        if (profile.supports_thinking && !profile.thinking_enabled && SupportsQwenNoThinkDirective(model)) {
-            user_prompt = AppendQwenNoThinkDirective(std::move(user_prompt));
-        }
         wrapped += profile.open_tag;
         wrapped += profile.user_role;
         wrapped += "\n";
-        wrapped += user_prompt;
+        wrapped += prompt;
         wrapped += profile.close_tag;
         wrapped += profile.open_tag;
         wrapped += profile.assistant_role;
@@ -731,13 +705,10 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
         if (IsLFM2MoeModel(model)) {
             rendered += "<|startoftext|>";
         }
-        int last_user_index = -1;
         bool has_system_message = false;
         for (size_t i = 0; i < messages.size(); ++i) {
             const std::string role = LowerTrimmed(messages[i].role);
-            if (role == "user") {
-                last_user_index = static_cast<int>(i);
-            } else if (role == "system" || role == "developer") {
+            if (role == "system" || role == "developer") {
                 has_system_message = true;
             }
         }
@@ -764,13 +735,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
                     append_block(profile.system_role, messages[i].content);
                 }
             } else if (role == "user") {
-                std::string content = TrimCopy(messages[i].content);
-                if (static_cast<int>(i) == last_user_index) {
-                    if (!thinking_enabled && SupportsQwenNoThinkDirective(model)) {
-                        content = AppendQwenNoThinkDirective(std::move(content));
-                    }
-                }
-                append_block(profile.user_role, content);
+                append_block(profile.user_role, messages[i].content);
             } else if (role == "assistant") {
                 append_block(profile.assistant_role, RenderQwenAssistantMessage(messages[i], preserve_thinking));
             } else if (role == "tool") {

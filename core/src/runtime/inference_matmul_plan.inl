@@ -47,13 +47,20 @@ static SmartMatmulAliasSelection ResolveSmartMatmulAliasSelection(
     const bool prefer_lfm2_quant_decode_densecore_path =
         original.lfm2_shortconv_semantic && ggml_is_quantized(selection.weight->type) &&
         input->ne[1] <= 1 && input->ne[0] == selection.weight->ne[0];
+    const bool qwen35_point8b_quant_projection =
+        densecore::runtime::IsQwen35Point8B(model) && ggml_is_quantized(selection.weight->type) &&
+        input->ne[0] == selection.weight->ne[0];
     const bool prefer_qwen_target_quant_prefill_densecore_path =
-        dispatch_is_prefill_phase && original.qwen_target_model && ggml_is_quantized(selection.weight->type) &&
-        input->ne[1] > 1 && input->ne[0] == selection.weight->ne[0];
+        ((dispatch_is_prefill_phase && original.qwen_target_model) || qwen35_point8b_quant_projection) &&
+        ggml_is_quantized(selection.weight->type) && input->ne[1] > 1 &&
+        input->ne[0] == selection.weight->ne[0];
+    const bool prefer_qwen_target_quant_decode_densecore_path =
+        qwen35_point8b_quant_projection && input->ne[1] <= 1;
 
     if (input->ne[1] <= 1) {
         auto it_decode_repack = model->cpu_decode_repack_aliases.find(selection.weight);
         if (!prefer_gemma4_quant_decode_densecore_path && !prefer_lfm2_quant_decode_densecore_path &&
+            !prefer_qwen_target_quant_decode_densecore_path &&
             it_decode_repack != model->cpu_decode_repack_aliases.end() && it_decode_repack->second) {
             selection.weight = it_decode_repack->second;
             selection.using_cpu_repack_alias = true;
@@ -68,6 +75,7 @@ static SmartMatmulAliasSelection ResolveSmartMatmulAliasSelection(
         if (!prefer_gemma4_quant_prefill_densecore_path && !prefer_lfm2_quant_prefill_densecore_path &&
             !prefer_qwen_target_quant_prefill_densecore_path &&
             !prefer_gemma4_quant_decode_densecore_path && !prefer_lfm2_quant_decode_densecore_path &&
+            !prefer_qwen_target_quant_decode_densecore_path &&
             !prefer_qwen_hybrid_ssm_quant_batched_over_repack && !amx_decode_regression_risk) {
             selection.weight = it_repack->second;
             selection.using_cpu_repack_alias = true;
@@ -868,7 +876,8 @@ static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const g
                                    prefill.qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k ||
                                    prefill.qwen36_lm_head_q4k_prefill_relevant;
     ud->gemma4_prefill_safe_batched = gemma4_prefill_safe_batched;
-    ud->disable_quant_nrc_fast = prefill.lfm2_prefill_quant_nrc_unsafe ||
+    ud->disable_quant_nrc_fast = dispatch.matmul_plan.qwen.qwen35_0_8b ||
+                                 prefill.lfm2_prefill_quant_nrc_unsafe ||
                                  prefill.lfm2_prefill_q4k_relevant ||
                                  gemma4_prefill_safe_batched;
     ud->gemma4_dense_prefill_native = gemma4_dense_prefill_native;

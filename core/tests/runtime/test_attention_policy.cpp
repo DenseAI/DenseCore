@@ -429,6 +429,40 @@ TEST(AttentionPolicyTest, Qwen35MoEPrefillCpuRepackAliasUsesRawQ4KBatchedPath) {
     ggml_free(ctx);
 }
 
+TEST(AttentionPolicyTest, Qwen35Point8BDecodeCpuRepackAliasUsesRawQ4KPath) {
+    ggml_init_params params{};
+    params.mem_size = 32 * 1024 * 1024;
+    params.no_alloc = false;
+    ggml_context* ctx = ggml_init(params);
+    ASSERT_NE(ctx, nullptr);
+
+    TransformerModel qwen35 = MakeModel(ModelArch::QWEN35);
+    qwen35.variant = ModelVariant::QWEN35;
+    qwen35.arch_flags.is_hybrid_ssm = true;
+    qwen35.hparams.n_embd = 1024;
+    qwen35.hparams.n_layer = 24;
+
+    ggml_tensor* original = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, /*ne0=*/1024, /*ne1=*/2048);
+    ASSERT_NE(original, nullptr);
+    ggml_set_name(original, "blk.0.attn_gate.weight");
+    ggml_tensor* alias = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, /*ne0=*/1024, /*ne1=*/2048);
+    ASSERT_NE(alias, nullptr);
+    ggml_set_name(alias, "blk.0.attn_gate.weight.fast_matmul");
+    qwen35.cpu_repack_aliases[original] = alias;
+    qwen35.cpu_repack_alias_sources[alias] = original;
+
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, /*ne0=*/1024, /*ne1=*/1);
+    ASSERT_NE(input, nullptr);
+
+    ggml_tensor* result = densecore::testing::SmartMulMatWithPhaseTest(
+        ctx, original, input, &qwen35, static_cast<int>(InferenceExecutionPhase::Decode));
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->op, GGML_OP_CUSTOM);
+    EXPECT_EQ(result->src[1], original);
+
+    ggml_free(ctx);
+}
+
 TEST(AttentionPolicyTest, Gemma4PrefillProjectsOnlyPromptEndLogits) {
     TransformerModel gemma4_moe = MakeModel(ModelArch::GEMMA, true);
     gemma4_moe.hparams.n_experts = 128;

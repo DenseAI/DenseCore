@@ -301,6 +301,26 @@ TEST(WorkerResultDispatchTest, QwenTargetRejectsTemporaryReferenceGgmlComputeByD
         target_plan, "temporary_reference_generic_matmul_fallback"));
 }
 
+TEST(WorkerResultDispatchTest, Qwen35Point8BUsesDedicatedHotPathLabel) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_embd = 1024;
+    model.hparams.n_layer = 24;
+    model.hparams.n_experts = 0;
+
+    const auto qwen_plan = densecore::runtime::ResolveQwenHotPathPlan(&model);
+    ASSERT_TRUE(qwen_plan.target_model);
+    EXPECT_TRUE(qwen_plan.qwen35_0_8b);
+    EXPECT_STREQ(densecore::runtime::QwenHotPathTargetLabel(qwen_plan), "qwen35_0.8b_dense");
+
+    const auto target_plan = densecore::runtime::ResolveTargetFastPathPlan(&model);
+    ASSERT_TRUE(target_plan.qwen_target);
+    EXPECT_TRUE(target_plan.qwen35_0_8b);
+    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(target_plan), "qwen35_0.8b_dense");
+}
+
 TEST(WorkerResultDispatchTest, GemmaAndLfmTargetsRejectTemporaryReferenceGgmlComputeByDefault) {
     TransformerModel gemma{};
     gemma.arch = ModelArch::GEMMA;

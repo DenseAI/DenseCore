@@ -2627,13 +2627,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
             if (!ffn_gate || !ffn_up || !ffn_down) {
                 throw densecore::InvalidArgumentException("Missing FFN weights in TransformerLayer");
             }
-#if defined(__aarch64__) || defined(_M_ARM64)
-            const bool qwen35_hybrid_ffn =
-                model->variant == ModelVariant::QWEN35 && model->arch_flags.is_hybrid_ssm;
-            const bool prefer_separate_qwen35_hybrid_ffn_gate_up = qwen35_hybrid_ffn && cur->ne[1] > 1;
-#else
-            const bool prefer_separate_qwen35_hybrid_ffn_gate_up = false;
-#endif
+            const bool prefer_separate_qwen35_hybrid_ffn_gate_up =
+                densecore::runtime::IsQwen35Point8B(model);
             struct ggml_tensor* w1 = nullptr;
             struct ggml_tensor* w3 = nullptr;
             struct ggml_tensor* fused_gate_up_swiglu = nullptr;
@@ -2645,7 +2640,8 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                  !prefer_separate_qwen35_hybrid_ffn_gate_up && cur->type == GGML_TYPE_F32)
                     ? layer.Get("ffn_gate_up.cpu_repack_fused")
                     : nullptr;
-            if (model->variant == ModelVariant::QWEN35 && cur->ne[1] <= 32) {
+            if (!prefer_separate_qwen35_hybrid_ffn_gate_up && model->variant == ModelVariant::QWEN35 &&
+                cur->ne[1] <= 32) {
                 if (struct ggml_tensor* decode_fused = layer.Get("ffn_gate_up.cpu_repack_fused_decode")) {
                     dense_gate_up_fused = decode_fused;
                 }
