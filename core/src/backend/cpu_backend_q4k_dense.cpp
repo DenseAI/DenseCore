@@ -4,6 +4,7 @@
 #include "ggml-cpu.h"
 #include "thread_pool_impl.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -56,8 +57,8 @@ bool RunQ4KRawBatchedDenseGemm(CpuBackend* backend, const void* weight_data, con
                                float* output_data, int64_t rows, int64_t output_cols, int64_t input_cols, int numa_node,
                                bool allow_parallel) {
     constexpr int64_t kMaxRawBatch = 256;
-    if (!backend || !weight_data || !input_data || !output_data || rows < 4 || rows > kMaxRawBatch ||
-        output_cols <= 0 || input_cols <= 0 || (input_cols % kernels::kQ4KSuperBlock) != 0) {
+    if (!backend || !weight_data || !input_data || !output_data || rows <= 0 || output_cols <= 0 || input_cols <= 0 ||
+        (input_cols % kernels::kQ4KSuperBlock) != 0) {
         return false;
     }
 
@@ -67,26 +68,35 @@ bool RunQ4KRawBatchedDenseGemm(CpuBackend* backend, const void* weight_data, con
         return false;
     }
     auto& scratch = GetQ4KDenseScratch();
-    const size_t q8_bytes = static_cast<size_t>(rows) * q8_row_bytes;
+    const size_t q8_bytes = static_cast<size_t>(std::min(rows, kMaxRawBatch)) * q8_row_bytes;
     if (scratch.q8_rows.size() < q8_bytes) {
         scratch.q8_rows.resize(q8_bytes);
     }
 
     auto& pool = backend->GetThreadPool(numa_node);
     const int thread_count = allow_parallel ? pool.GetNumThreads() : 1;
-    const auto quantize_rows = [&](int row_start, int row_end, int) {
-        for (int row = row_start; row < row_end; ++row) {
-            q8_traits->from_float(input_data + static_cast<size_t>(row) * static_cast<size_t>(input_cols),
-                                  scratch.q8_rows.data() + static_cast<size_t>(row) * q8_row_bytes, input_cols);
+    for (int64_t row_offset = 0; row_offset < rows; row_offset += kMaxRawBatch) {
+        const int chunk_rows = static_cast<int>(std::min(kMaxRawBatch, rows - row_offset));
+        const auto quantize_rows = [&](int row_start, int row_end, int) {
+            for (int row = row_start; row < row_end; ++row) {
+                q8_traits->from_float(input_data +
+                                          static_cast<size_t>(row_offset + row) * static_cast<size_t>(input_cols),
+                                      scratch.q8_rows.data() + static_cast<size_t>(row) * q8_row_bytes, input_cols);
+            }
+        };
+        if (thread_count > 1 && chunk_rows >= 8) {
+            pool.ParallelFor(chunk_rows, quantize_rows);
+        } else {
+            quantize_rows(0, chunk_rows, 0);
         }
-    };
-    if (thread_count > 1 && rows >= 8) {
-        pool.ParallelFor(static_cast<int>(rows), quantize_rows);
-    } else {
-        quantize_rows(0, static_cast<int>(rows), 0);
+        if (!RunQ4KRawBatchedQuantizedProjection(backend, weight_data, scratch.q8_rows.data(), q8_row_bytes,
+                                                 output_data +
+                                                     static_cast<size_t>(row_offset) * static_cast<size_t>(output_cols),
+                                                 chunk_rows, output_cols, input_cols, numa_node, allow_parallel)) {
+            return false;
+        }
     }
-    return RunQ4KRawBatchedQuantizedProjection(backend, weight_data, scratch.q8_rows.data(), q8_row_bytes, output_data,
-                                               rows, output_cols, input_cols, numa_node, allow_parallel);
+    return true;
 }
 
 bool RunQ4KRepackedDenseGemm(CpuBackend* backend, const std::shared_ptr<kernels::Q4KRepackedGemvWeight>& packed,

@@ -1640,7 +1640,7 @@ TEST(NumaStickyRouting, PublicGgmlQ4KProjectionHandlesLargeBatchAndOddOutputWidt
                                                     ggml_row_size(qtype, K)};
 
     EXPECT_EQ(backend.MatMulGgmlQuantizedTransBWithPath(input_tensor, weight_view, &output_tensor),
-              CpuBackend::GgmlQuantizedMatMulPath::Ggml);
+              CpuBackend::GgmlQuantizedMatMulPath::Q4KRawBatched);
     std::vector<float> weight_deq(static_cast<size_t>(N * K), 0.0f);
     const auto* traits = ggml_get_type_traits(qtype);
     ASSERT_NE(traits, nullptr);

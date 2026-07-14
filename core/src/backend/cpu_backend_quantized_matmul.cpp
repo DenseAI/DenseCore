@@ -167,8 +167,7 @@ CpuBackend::GgmlQuantizedMatMulPath CpuBackend::MatMulGgmlQuantizedTransBWithPat
     }
 
     auto& pool = GetThreadPool(numa_node_id);
-    if (weight_type == GGML_TYPE_Q4_K && A.shape[0] >= 4 && A.shape[0] <= 256 &&
-        (W.cols % kernels::kQ4KSuperBlock) == 0) {
+    if (weight_type == GGML_TYPE_Q4_K && A.shape[0] >= 4 && (W.cols % kernels::kQ4KSuperBlock) == 0) {
         if (internal::RunQ4KRawBatchedDenseGemm(this, W.data, A.DataAs<float>(), C->DataAs<float>(), A.shape[0], W.rows,
                                                 W.cols, numa_node_id, pool.GetNumThreads() > 1)) {
             return GgmlQuantizedMatMulPath::Q4KRawBatched;
