@@ -42,7 +42,7 @@ extern "C" {
  * Increment major on breaking changes, minor on additions.
  */
 #define DENSECORE_ENT_API_VERSION_MAJOR 1
-#define DENSECORE_ENT_API_VERSION_MINOR 0
+#define DENSECORE_ENT_API_VERSION_MINOR 1
 #define DENSECORE_ENT_API_VERSION ((DENSECORE_ENT_API_VERSION_MAJOR << 16) | DENSECORE_ENT_API_VERSION_MINOR)
 
 /**
@@ -72,6 +72,9 @@ extern "C" {
 
 /** SIEM audit logging with PII redaction */
 #define DENSECORE_ENT_CAP_AUDIT (1ULL << 5)
+
+/** Atomic request and token quota enforcement */
+#define DENSECORE_ENT_CAP_QUOTA (1ULL << 6)
 
 // =============================================================================
 // Plugin Info & Lifecycle

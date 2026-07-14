@@ -76,7 +76,7 @@ func buildAPIMiddleware(
 	rateLimiter cloudmw.RateLimiterInterface,
 	authEnabled bool,
 ) []func(http.Handler) http.Handler {
-	apiMiddleware := []func(http.Handler) http.Handler{}
+	apiMiddleware := append([]func(http.Handler) http.Handler(nil), runtimeSetup.outerAPI...)
 	if cfg.RateLimitEnabled && rateLimiter != nil {
 		apiMiddleware = append(apiMiddleware, cloudmw.RateLimitWithInterface(rateLimiter))
 	}

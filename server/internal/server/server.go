@@ -138,7 +138,7 @@ func Run(opts *Options) error {
 	slog.Info("configuration loaded", slog.String("config", cfg.String()))
 
 	tuning := configureRuntimeTuning(cfg)
-	services := assembleServices(cfg, tuning, rollback.Register)
+	services := assembleServices(cfg, tuning, runtimeSetup.usageRecorder, rollback.Register)
 	metrics := buildHTTPMetrics(cfg, services.handler)
 	apiKeyStore, authEnabled, err := setupAPIKeyStore(opts)
 	if err != nil {

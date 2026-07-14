@@ -60,7 +60,7 @@ func configureRuntimeTuning(cfg *config.ServerConfig) runtimeTuning {
 	return runtimeTuning{threads: threads, goWorkers: goWorkers}
 }
 
-func assembleServices(cfg *config.ServerConfig, tuning runtimeTuning, registerRollback func(string, cloudserver.ShutdownHook)) servicesBootstrap {
+func assembleServices(cfg *config.ServerConfig, tuning runtimeTuning, usageRecorder api.InferenceUsageRecorder, registerRollback func(string, cloudserver.ShutdownHook)) servicesBootstrap {
 	modelService := service.NewModelService()
 	registerRollback("model service", func(context.Context) error {
 		return modelService.UnloadModel()
@@ -113,6 +113,9 @@ func assembleServices(cfg *config.ServerConfig, tuning runtimeTuning, registerRo
 	}
 	if requestQueue != nil {
 		handlerOptions = append(handlerOptions, api.WithQueueStatsProvider(requestQueue))
+	}
+	if usageRecorder != nil {
+		handlerOptions = append(handlerOptions, api.WithInferenceUsageRecorder(usageRecorder))
 	}
 
 	return servicesBootstrap{

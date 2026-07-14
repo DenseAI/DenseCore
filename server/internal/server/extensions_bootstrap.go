@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 
 	cloudserver "github.com/DenseAI/DenseCloud/go/server"
 
+	"descore-server/internal/api"
 	"descore-server/internal/config"
 	"descore-server/internal/extensions"
 )
@@ -43,8 +45,14 @@ func (r *startupRollback) RunIfArmed() {
 }
 
 type runtimeExtensionsBootstrap struct {
-	runtime    extensions.Runtime
-	chassisExt []cloudserver.RuntimeExtension
+	runtime       extensions.Runtime
+	chassisExt    []cloudserver.RuntimeExtension
+	usageRecorder api.InferenceUsageRecorder
+	outerAPI      []func(http.Handler) http.Handler
+}
+
+type outerAPIMiddlewareProvider interface {
+	OuterAPIMiddleware() []func(http.Handler) http.Handler
 }
 
 func startRuntimeExtensions(cfg *config.ServerConfig, registerRollback func(string, cloudserver.ShutdownHook)) (runtimeExtensionsBootstrap, error) {
@@ -60,6 +68,14 @@ func startRuntimeExtensions(cfg *config.ServerConfig, registerRollback func(stri
 	}
 	registerRollback("runtime extensions", runtimeExt.Shutdown)
 
+	var usageRecorder api.InferenceUsageRecorder
+	var outerAPI []func(http.Handler) http.Handler
+	if recorder, ok := runtimeExt.(api.InferenceUsageRecorder); ok {
+		usageRecorder = recorder
+	}
+	if provider, ok := runtimeExt.(outerAPIMiddlewareProvider); ok {
+		outerAPI = append(outerAPI, provider.OuterAPIMiddleware()...)
+	}
 	chassisExtensions := cloudserver.RuntimeExtensions()
 	for _, ext := range chassisExtensions {
 		extension := ext
@@ -67,9 +83,17 @@ func startRuntimeExtensions(cfg *config.ServerConfig, registerRollback func(stri
 			return runtimeExtensionsBootstrap{}, fmt.Errorf("extension startup failed (%s): %w", extension.Name(), err)
 		}
 		registerRollback(fmt.Sprintf("extension %s", extension.Name()), extension.Shutdown)
+		if usageRecorder == nil {
+			if recorder, ok := extension.(api.InferenceUsageRecorder); ok {
+				usageRecorder = recorder
+			}
+		}
+		if provider, ok := extension.(outerAPIMiddlewareProvider); ok {
+			outerAPI = append(outerAPI, provider.OuterAPIMiddleware()...)
+		}
 	}
 
-	return runtimeExtensionsBootstrap{runtime: runtimeExt, chassisExt: chassisExtensions}, nil
+	return runtimeExtensionsBootstrap{runtime: runtimeExt, chassisExt: chassisExtensions, usageRecorder: usageRecorder, outerAPI: outerAPI}, nil
 }
 
 func runStartupRollbackHooks(hooks []cloudserver.ShutdownHook) {

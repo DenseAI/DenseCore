@@ -371,6 +371,18 @@ func loadPlugin(handle C.DenseCoreHandle) error {
 	}
 }
 
+// AcquireEnterprisePlugin preloads the optional plugin before commercial
+// runtime startup. Model engines share the same process-wide ownership count.
+func AcquireEnterprisePlugin() error {
+	return loadPlugin(nil)
+}
+
+// ReleaseEnterprisePlugin releases one ownership reference acquired by the
+// commercial runtime.
+func ReleaseEnterprisePlugin() {
+	unloadPlugin()
+}
+
 func unloadPlugin() {
 	pluginMu.Lock()
 	defer pluginMu.Unlock()

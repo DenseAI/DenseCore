@@ -27,6 +27,7 @@ func lfm2StreamFilterExactAnswerEligible(req domain.ChatCompletionRequest) bool 
 }
 
 func (h *Handler) handleToolStream(ctx context.Context, w http.ResponseWriter, req domain.ChatCompletionRequest, flusher http.Flusher) {
+	promptTokens := h.countChatPromptTokens(req)
 	outputChan := make(chan domain.StreamEvent, h.streamChannelBufferSize())
 	errChan := make(chan error, 1)
 	go func() {
@@ -37,6 +38,7 @@ func (h *Handler) handleToolStream(ctx context.Context, w http.ResponseWriter, r
 	created := time.Now().Unix()
 	streamStarted := false
 	var responseBuilder strings.Builder
+	completionTokens := 0
 
 	for {
 		select {
@@ -53,6 +55,10 @@ func (h *Handler) handleToolStream(ctx context.Context, w http.ResponseWriter, r
 				if err := event.TerminalError(); err != nil {
 					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 					_ = waitGenerationError(errChan)
+					return
+				}
+				if err := h.recordInferenceUsage(ctx, promptTokens, completionTokens); err != nil {
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 					return
 				}
 				parsed, err := h.parseToolOutput(req, responseBuilder.String())
@@ -93,6 +99,9 @@ func (h *Handler) handleToolStream(ctx context.Context, w http.ResponseWriter, r
 					writeGenerationError(ctx, w, flusher, req.Model, err, streamStarted)
 				}
 				return
+			}
+			if event.Token != "" {
+				completionTokens++
 			}
 			responseBuilder.WriteString(event.Token)
 		case err := <-errChan:

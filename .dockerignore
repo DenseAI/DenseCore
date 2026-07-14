@@ -9,6 +9,18 @@
 
 # Build artifacts
 build/
+build-*/
+cmake-build-*/
+_deps/
+Testing/
+graphify-out/
+workspace/
+**/build/
+**/build-*/
+**/cmake-build-*/
+**/_deps/
+**/Testing/
+**/graphify-out/
 bin/
 *.so
 *.a
@@ -19,6 +31,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+.venv-*/
+**/.venv/
+**/.venv-*/
 venv/
 env/
 .env
@@ -34,6 +49,9 @@ server/descore-server
 # Models (mount them at runtime, don't build them in)
 models/
 *.gguf
+
+# Benchmark artifacts are not runtime build inputs
+benchmarks/
 
 # Docker
 docker-compose.yml

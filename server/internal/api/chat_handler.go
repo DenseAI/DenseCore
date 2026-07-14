@@ -101,6 +101,7 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 		return
 	}
 
+	promptTokens := h.countChatPromptTokens(req)
 	outputChan := make(chan domain.StreamEvent, h.streamChannelBufferSize())
 	errChan := make(chan error, 1)
 	go func() {
@@ -182,6 +183,10 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 							return
 						}
 					}
+				}
+				if err := h.recordInferenceUsage(ctx, promptTokens, completionTokens); err != nil {
+					writeGenerationError(ctx, w, flusher, req.Model, err, streamWriter.Started())
+					return
 				}
 				if err := streamWriter.WriteDone(); err != nil {
 					slog.Debug("SSE write error", slog.String("error", err.Error()))
@@ -291,6 +296,10 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 	if err != nil {
 		message, errType, code, statusCode := classifyGenerationError(err)
 		sendError(w, message, errType, code, statusCode)
+		return
+	}
+	if err := h.recordInferenceUsage(ctx, promptTokens, completionTokens); err != nil {
+		sendError(w, "Enterprise usage accounting unavailable", "server_error", "usage_accounting_unavailable", http.StatusServiceUnavailable)
 		return
 	}
 

@@ -46,6 +46,7 @@ type Handler struct {
 	llmAPIEnabled        bool
 	queueStatsProvider   QueueStatsProvider
 	runtimeTuning        RuntimeTuningProfile
+	usageRecorder        InferenceUsageRecorder
 }
 
 type RuntimeTuningProfile struct {

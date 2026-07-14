@@ -13,6 +13,7 @@
 #include "densecore/confidential_compute.h"
 #include "densecore/license_validator.h"
 #include "densecore/numa_routing.h"
+#include "densecore/quota_enforcer.h"
 #include "densecore/telemetry_sink.h"
 
 #include <atomic>
@@ -86,6 +87,7 @@ std::atomic<const DenseCoreEntTelemetryVTable*> g_telemetry_vtable{nullptr};
 std::atomic<const DenseCoreEntLicenseVTable*> g_license_vtable{nullptr};
 std::atomic<const DenseCoreEntNumaRoutingVTable*> g_numa_routing_vtable{nullptr};
 std::atomic<const DenseCoreEntConfidentialVTable*> g_confidential_vtable{nullptr};
+std::atomic<const DenseCoreEntQuotaVTable*> g_quota_vtable{nullptr};
 
 #ifdef _WIN32
 constexpr const char* kDefaultPluginName = "densecore_ent.dll";
@@ -176,6 +178,7 @@ void ClearRegisteredVTables() {
     g_license_vtable.store(nullptr, std::memory_order_release);
     g_numa_routing_vtable.store(nullptr, std::memory_order_release);
     g_confidential_vtable.store(nullptr, std::memory_order_release);
+    g_quota_vtable.store(nullptr, std::memory_order_release);
 }
 
 void CloseDynamicLibrary(void* dl_handle) {
@@ -448,6 +451,15 @@ void DenseCoreEntRegisterConfidential(const DenseCoreEntConfidentialVTable* vtab
 
 const DenseCoreEntConfidentialVTable* DenseCoreEntGetConfidentialVTable(void) {
     return g_confidential_vtable.load(std::memory_order_acquire);
+}
+
+void DenseCoreEntRegisterQuota(const DenseCoreEntQuotaVTable* vtable) {
+    g_quota_vtable.store(vtable, std::memory_order_release);
+    ENT_LOG_INFO("Quota VTable registered");
+}
+
+const DenseCoreEntQuotaVTable* DenseCoreEntGetQuotaVTable(void) {
+    return g_quota_vtable.load(std::memory_order_acquire);
 }
 
 }  // extern "C"
