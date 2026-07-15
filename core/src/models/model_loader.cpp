@@ -863,10 +863,7 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
 
     auto make_fused_pair_alias = [&](TransformerLayer& layer, uint32_t layer_idx, const char* output_key,
                                      const char* name_fragment, ggml_tensor* first, ggml_tensor* second,
-                                     bool force_cpu_repack = false) {
-        if (model->variant == ModelVariant::QWEN36) {
-            return;
-        }
+                                     bool force_cpu_repack = false, bool allow_qwen36_amx = false) {
         if (!first || !second || !first->data || !second->data || first->view_src || second->view_src) {
             return;
         }
@@ -877,8 +874,13 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
         if (!ggml_is_quantized(first->type) || first->ne[0] <= 0 || first->ne[1] <= 0 || second->ne[1] <= 0) {
             return;
         }
-        ggml_backend_buffer_type_t alias_buft =
-            force_cpu_repack ? repack_bufts.cpu_repack : choose_alias_buffer(first, /*is_2d=*/true);
+        // Keep Qwen3.6 SSM projections on their scoped alias path. Only callers
+        // that opt in may use the fused AMX path shared with Qwen3.5.
+        ggml_backend_buffer_type_t alias_buft = force_cpu_repack
+                                                    ? repack_bufts.cpu_repack
+                                                    : (allow_qwen36_amx && model->variant == ModelVariant::QWEN36
+                                                           ? repack_bufts.cpu_amx
+                                                           : choose_alias_buffer(first, /*is_2d=*/true));
         if (!alias_buft) {
             return;
         }
@@ -1132,7 +1134,8 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
             auto& layer = model->layers[i];
             make_qwen35_ssm_qkv_gate_amx_fused_alias(layer, i);
             make_fused_pair_alias(layer, i, "ffn_gate_up.cpu_repack_fused", "ffn_gate_up.weight",
-                                  layer.Get(model_keys::kFfnGate), layer.Get(model_keys::kFfnUp));
+                                  layer.Get(model_keys::kFfnGate), layer.Get(model_keys::kFfnUp),
+                                  /*force_cpu_repack=*/false, /*allow_qwen36_amx=*/true);
             if (model->variant == ModelVariant::QWEN35) {
                 make_fused_pair_alias(layer, i, "ffn_gate_up.cpu_repack_fused_decode", "ffn_gate_up.weight.decode",
                                       layer.Get(model_keys::kFfnGate), layer.Get(model_keys::kFfnUp),

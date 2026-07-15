@@ -2452,9 +2452,11 @@ static struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* mod
                 struct ggml_tensor* shared_gate_up = nullptr;
                 const bool lfm2_shortconv_moe =
                     model->variant == ModelVariant::LFM2MOE && model->arch_flags.is_lfm2_shortconv;
+                const bool qwen_prefill_fused_shared_expert =
+                    (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+                    GetCurrentExecutionPhase() != InferenceExecutionPhase::Decode && shared_input->ne[1] > 1;
                 struct ggml_tensor* shared_gate_up_fused =
-                    ((is_gemma4_moe || lfm2_shortconv_moe || model->variant == ModelVariant::QWEN35 ||
-                      model->variant == ModelVariant::QWEN36) &&
+                    ((is_gemma4_moe || lfm2_shortconv_moe || qwen_prefill_fused_shared_expert) &&
                      !prefer_plain_shared_expert_matmul && shared_input->type == GGML_TYPE_F32)
                         ? layer.Get("ffn_gate_up.cpu_repack_fused")
                         : nullptr;
