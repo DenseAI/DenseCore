@@ -1,132 +1,108 @@
-# DenseCore Decode Benchmark (Best Combo, Reproducible)
+# Benchmark Evidence
 
-## 1) Goal
+This document separates measured evidence from product claims. DenseCore does not
+publish a speedup solely because a process completed or a single kernel counter
+improved. The real server path and inference-quality gates are part of the result.
 
-- Updated: `2026-02-17`
-- Objective: `batch=4`, `threads=8` decode throughput를 최대화하고 `llama.cpp`(`llama-batched-bench`)와 비교
-- Workload: `prompt=32`, `gen=32`, `fair-mode`, `repeats=2`
-- Models: `Qwen3-0.6B-Q4_K_M.gguf`, `Qwen3-4B-Q4_K_M.gguf`, `Llama-3.2-1B-Instruct-Q4_K_M.gguf`
+## Current Evidence Boundary
 
-## 2) Revision / Host
+The newest complete matched checkpoint available on 2026-07-13 covers Google Cloud
+C4 and C4A with Qwen3.5, Qwen3.6, and Gemma4. It is useful engineering evidence,
+but it is **not yet a promotion-grade result for commit `22b672d`**:
 
-- Repository: `DenseCore`
-- Commit: `568d3814025aa49763c5cd7ef0c6e4c7844355a2`
-- Branch: `feat/universal_graph_builder`
-- OS: `Linux 5.15.153.1-microsoft-standard-WSL2 x86_64 GNU/Linux`
-- CPU: `Intel(R) Core(TM) i7-10870H CPU @ 2.20GHz`
-- Core/Thread: `8 cores / 16 threads`
-- ISA: AVX2 (`avx2`, `f16c`), no AVX-512
+- each row is one sequential DenseCore/llama-server pair
+- the six rows were not all produced by one identical final binary
+- five-cycle ABBA medians have not been collected
+- strict QA was run separately for the final candidates
 
-## 3) Best Build Combo
+Consequently, the table supports prioritization and a dated checkpoint, not a
+blanket "DenseCore is faster than llama.cpp" claim.
 
-Build command:
+The separately documented 2026-08-03 two-socket Qwen3.6 decode checkpoint is
+not folded into this C4/C4A table: it uses a different host shape and measures
+isolated decode. See [NUMA sticky routing](NUMA_STICKY_ROUTING.md) for its
+two-repeat evidence, strict scope, and rerun contract.
 
-```bash
-cmake -S core -B build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DDENSECORE_LTO=ON \
-  -DDENSECORE_USE_SPDLOG=OFF \
-  -DDENSECORE_BUILD_TESTS=OFF \
-  -DDENSECORE_BUILD_BENCHMARKS=OFF
-cmake --build build -j8
-```
+## Matched Single-Run Checkpoint
 
-Verified from `build/CMakeCache.txt`:
+Units are prompt prefill and steady visible decode tokens per second. Higher is
+better. Delta is `(DenseCore / llama-server - 1) * 100`.
 
-- `CMAKE_BUILD_TYPE=Release`
-- `CMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG`
-- `DENSECORE_LTO=ON`
-- `DENSECORE_USE_SPDLOG=OFF`
-- `DENSECORE_BUILD_TESTS=OFF`
-- `DENSECORE_BUILD_BENCHMARKS=OFF`
-- `DENSECORE_USE_MIMALLOC=ON`
-- `DENSECORE_USE_ONEDNN=OFF`
+| Platform | Model | llama PF | Dense PF | PF delta | llama DEC | Dense DEC | DEC delta | +10% both phases |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| GCP C4 x86 | Qwen3.5-35B-A3B | 71.1831 | 102.3342 | +43.8% | 17.0785 | 21.6691 | +26.9% | checkpoint pass |
+| GCP C4 x86 | Qwen3.6-35B-A3B | 76.6175 | 102.1235 | +33.3% | 18.2489 | 21.9770 | +20.4% | checkpoint pass |
+| GCP C4 x86 | Gemma4-26B-A4B | 65.5584 | 68.2530 | +4.1% | 15.1203 | 14.2204 | -6.0% | fail |
+| GCP C4A Arm | Qwen3.5-35B-A3B | 118.6814 | 121.5738 | +2.4% | 40.0621 | 37.1703 | -7.2% | fail |
+| GCP C4A Arm | Qwen3.6-35B-A3B | 118.2867 | 121.1326 | +2.4% | 39.9335 | 36.9819 | -7.4% | fail |
+| GCP C4A Arm | Gemma4-26B-A4B | 61.0829 | 99.5260 | +62.9% | 36.4330 | 32.2212 | -11.6% | fail |
 
-## 4) Best Runtime Combo
+The strongest checkpoint is Qwen on C4 x86. Gemma4 has a strong C4A prefill row,
+but decode misses the comparison baseline. No C4A model in this checkpoint clears
+the 10% gate in both phases.
 
-- `DENSECORE_PREFILL_ATTN_SKIP_CONT_MODE=on`
-- `DENSECORE_DECODE_GRAPH_CACHE=0`
-- `DENSECORE_ENABLE_Q4K_BATCHED_KERNEL=0`
-- `DENSECORE_ENABLE_QUANT_NRC_BATCH=1`
-- `DENSECORE_BENCH_DIRECT_CALLBACK=1`
-- `DENSECORE_BENCH_DECODE_BATCH_FAST_PATH=1`
-- `DENSECORE_BENCH_FAST_PATH_MAX_BATCH=8`
-- `DENSECORE_BENCH_RESPECT_THREADS=0`
-- `DENSECORE_BENCH_TPS_MODE=all`
-- `DENSECORE_BENCH_RECORD_TOKEN_TIMES=0`
+## Quality Gate
 
-## 5) Reproduction Command
+The strict candidate checks exercise the real Go `POST /v1/chat/completions` path.
+They require:
 
-```bash
-THREADS=8 PROMPT_TOK=32 GEN_TOK=32 REPEATS=2 BATCHES="4" \
-OUT_PREFIX=benchmarks/results/fair_decode_bestcombo_final_20260217 \
-FAIR_MODE=1 PARALLEL_SUBMIT=0 COMPARE_METRIC=tps FILTER_INVALID=1 \
-DENSECORE_BENCH_TPS_MODE=all \
-DENSECORE_BENCH_DIRECT_CALLBACK=1 \
-DENSECORE_BENCH_DECODE_BATCH_FAST_PATH=1 \
-DENSECORE_BENCH_RECORD_TOKEN_TIMES=0 \
-DENSECORE_PREFILL_ATTN_SKIP_CONT_MODE=on \
-DENSECORE_DECODE_GRAPH_CACHE=0 \
-DENSECORE_ENABLE_Q4K_BATCHED_KERNEL=0 \
-DENSECORE_ENABLE_QUANT_NRC_BATCH=1 \
-DENSECORE_BENCH_RESPECT_THREADS=0 \
-./benchmarks/run_fair_decode_benchmark.sh
-```
+- short factual QA, including Paris and Seoul checks
+- the long exact-answer key `cobalt-river-913`
+- `QA_ALL_OK=1`, `LONG_QA_OK=1`, and `OUTPUT_QUALITY_OK=1`
+- the intended target fast path
+- no exact-answer promotion, canned response, reference override, or slower path
+  masking a failed target path
+- no target model fast-path rejection or unapproved fallback
 
-## 6) Final Result (Best Combo)
+Strict QA passed separately for the Qwen3.5 candidate, Qwen3.6 candidate at
+`aaa9962`, and the Gemma4 template-fixed candidate. Those QA artifacts do not by
+themselves establish throughput because they did not contain a matched baseline.
 
-Source: `benchmarks/results/fair_decode_bestcombo_final_20260217_summary.csv`
+## Comparison Contract
 
-| Model | DenseCore `mean_tps` | llama.cpp `mean_tps` | Delta (`mean_tps`) |
-|---|---:|---:|---:|
-| Qwen3-0.6B | 144.0250 | 160.4350 | -10.23% |
-| Qwen3-4B | 23.3950 | 25.4450 | -8.06% |
-| Llama-3.2-1B | 72.8650 | 90.4800 | -19.47% |
+A publishable comparison must hold these inputs constant:
 
-Key point:
+1. Same cloud machine type and CPU count.
+2. Same GGUF file and quantization.
+3. Same prompt bytes, rendered chat template, sampling parameters, and generated
+   token target.
+4. Same thread count and CPU-affinity policy.
+5. DenseCore through its Go server and llama.cpp through `llama-server` using the
+   same API-level workload.
+6. Cold/warm state declared; no silent prompt-cache reuse.
+7. Five-cycle ABBA ordering, reporting p50 and spread rather than the best run.
+8. Strict output-quality and fast-path gates on the measured DenseCore binary.
 
-- `qwen3_0.6b` DenseCore `mean_tps=144.0250` (이번 탐색 라운드 최고)
+The maintained remote harnesses are:
 
-## 7) Why This Combo Was Selected
+- `benchmarks/remote_server_eval.sh`
+- `benchmarks/remote_llama_server_eval.sh`
+- `benchmarks/fair_llm_report.py`
 
-Build A/B (same runtime profile, 1-repeat head-to-head):
+## Allowed Public Claim
 
-| Build config | Qwen3-0.6B Dense `mean_tps` | 3-model Dense 평균 TPS |
-|---|---:|---:|
-| `LTO=ON, SPDLOG=OFF` | 140.230 | 78.963 |
-| `LTO=OFF, SPDLOG=ON` | 123.300 | 73.313 |
+Before a final-HEAD ABBA rerun, use wording no stronger than:
 
-Runtime A/B (same build family, 2-repeat):
+> A QA-gated engineering checkpoint showed 20-44% higher single-stream Qwen
+> prefill/decode throughput than llama-server on Google Cloud C4 x86.
 
-| Runtime config | Qwen3-0.6B Dense `mean_tps` | 3-model Dense 평균 TPS |
-|---|---:|---:|
-| `base` (cache off, nrc on) | 140.345 | 77.313 |
-| `cache_on` | 123.010 | 73.207 |
-| `cache_on + nrc0` | 117.340 | 69.492 |
+After the rerun, replace "checkpoint" only if the same final binary passes strict
+QA and both phase medians remain at least 1.10x.
 
-Light-build 대비 개선:
+Do not claim:
 
-- Reference: `benchmarks/results/fair_decode_light_build_20260217_summary.csv`
-- Qwen3-0.6B Dense `121.2200 -> 144.0250` (`+18.81%`)
-- 3-model Dense 평균 TPS `73.020 -> 80.095` (`+9.69%`)
+- all models are faster than llama.cpp
+- C4A or Arm has reached the same Qwen advantage
+- the table proves concurrent throughput, p95 latency, or cost per token
+- a later code change inherits an earlier benchmark without rerunning it
 
-## 8) Historical Peak Snapshot (Reference Only)
+## Next Qualification
 
-- Source: `benchmarks/results/fair_decode_cycle2_b4_p32_base_summary.csv`
-- DenseCore Qwen3-0.6B `mean_tps=145.7200`
-- DenseCore Qwen3-4B `mean_tps=33.2350`
-- DenseCore Llama-3.2-1B `mean_tps=102.7150`
-- Note: 위 값은 이전 실험 스냅샷이며, 최종 재현 기준은 섹션 5-6의 `fair_decode_bestcombo_final_20260217` 결과.
+The smallest useful publication run is:
 
-## 9) Artifacts
-
-- `benchmarks/results/fair_decode_bestcombo_final_20260217_raw.csv`
-- `benchmarks/results/fair_decode_bestcombo_final_20260217_paired.csv`
-- `benchmarks/results/fair_decode_bestcombo_final_20260217_summary.csv`
-- `benchmarks/results/fair_decode_bestcombo_final_20260217_summary.json`
-- `benchmarks/results/fair_decode_lto1_log0_r1_20260217_summary.csv`
-- `benchmarks/results/fair_decode_lto0_log1_r1_20260217_summary.csv`
-- `benchmarks/results/fair_decode_bestsearch_base_20260217_summary.csv`
-- `benchmarks/results/fair_decode_bestsearch_cache_on_20260217_summary.csv`
-- `benchmarks/results/fair_decode_bestsearch_cache_on_nrc0_20260217_summary.csv`
-- `benchmarks/results/fair_decode_light_build_20260217_summary.csv`
+1. freeze one release candidate and record compiler, CMake cache, model hashes,
+   server binaries, and commit
+2. rerun strict QA on all six DenseCore rows
+3. run five-cycle ABBA for C4 Qwen3.5 and Qwen3.6 first
+4. report concurrency 1/2/4/8, TTFT p50/p95, steady decode, memory peak, and
+   tokens per dollar as separate dimensions

@@ -20,9 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Highlights
 
 First stable release. DenseCore is a memory-centric inference runtime for large language models
-on heterogeneous CPU architectures. NUMA locality and memory bandwidth determine throughput —
-not raw core count. This release validates that claim end-to-end on Google Cloud ARM, Intel,
-and AMD instances with state-of-the-art 27B–397B parameter models.
+on heterogeneous CPU architectures, built on the premise that NUMA locality and memory bandwidth
+determine throughput more than raw core count. It runs on Google Cloud ARM, Intel, and AMD
+instances with state-of-the-art 27B–397B parameter models. A scoped two-socket
+Qwen3.6 isolated-decode checkpoint exists for NUMA sticky routing, but it is not
+a general multi-socket latency or all-model claim; see `docs/NUMA_STICKY_ROUTING.md`.
 
 ### Added
 
@@ -36,7 +38,10 @@ and AMD instances with state-of-the-art 27B–397B parameter models.
 #### NUMA & Memory
 - **NUMA-aware scheduling**: Workers pinned to NUMA nodes; KV cache allocated node-local
 - **ExpertProfiler**: Per-expert NUMA node tracking and dynamic rebalancing for sparse MoE
-- **Sticky routing**: Request-level NUMA affinity maintained across decode steps
+- **Sticky expert routing**: On multi-node hosts, `DENSECORE_NUMA_WEIGHTS` partitions each MoE
+  expert's weights onto a single node, and decode dispatch groups assignments by that node so an
+  expert runs on the pool that owns its weights. Affinity is per-expert, not per-request; on
+  single-node hosts and when any expert's placement is unknown, the legacy path is used unchanged
 - **Memory bandwidth saturation analysis**: Tooling to identify throughput ceiling per topology
 
 #### Inference Engine

@@ -475,7 +475,7 @@ DenseCore/
 │   ├── ARCHITECTURE.md     # System design
 │   ├── API_REFERENCE.md    # Complete API
 │   ├── DEPLOYMENT.md       # Docker/K8s
-│   ├── MODEL_OPTIMIZATION.md
+│   ├── PERFORMANCE_TUNING.md
 │   └── ...
 └── python/README.md         # Python SDK guide
 ```

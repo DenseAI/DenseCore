@@ -1,68 +1,52 @@
 # DenseCore Documentation
 
-This documentation set is organized around the three public distribution surfaces in this repository. DenseCore is the runtime spine of Dense Series: a memory-centric, CPU-first inference runtime with explicit heterogeneous hardware paths, production server surfaces, and graceful fallback expectations.
+This directory contains the public documentation for DenseCore. It is intentionally
+small: implementation notes, benchmark experiments, cost snapshots, and refactor
+plans belong in Git history or benchmark artifacts rather than the public docs tree.
 
-- PyPI package: `densecore`
-- Docker Hub image: `denseai/densecore`
-- Source-built Go CLI and API server
+The implementation status in these documents was reviewed on 2026-07-13 against
+the performance branch at commit `22b672d`. Benchmark numbers have a separate
+evidence boundary described in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Start Here
 
 | Goal | Document |
 | --- | --- |
-| Use the Python SDK | [Python SDK Guide](../python/README.md) |
-| Run the Go CLI locally | [CLI Guide](CLI.md) |
-| Deploy the API server with Docker or Kubernetes | [Deployment Guide](DEPLOYMENT.md) |
-| Call the HTTP or gRPC APIs | [API Reference](API_REFERENCE.md) |
-| Tune production behavior | [Performance Tuning](PERFORMANCE_TUNING.md) |
+| Understand the runtime | [Architecture](ARCHITECTURE.md) |
+| Use Python or the server APIs | [API Reference](API_REFERENCE.md) |
+| Run the source-built CLI | [CLI](CLI.md) |
+| Deploy with Docker or Kubernetes | [Deployment](DEPLOYMENT.md) |
+| Select a hardware/build profile | [Hardware Support](HARDWARE_SUPPORT.md) |
+| Tune threads, memory, and concurrency | [Performance Tuning](PERFORMANCE_TUNING.md) |
+| Convert or quantize a model | [Hugging Face to GGUF](HF_TO_GGUF.md) |
+| Review performance evidence | [Benchmarks](BENCHMARKS.md) |
+| Review the scoped two-socket MoE result | [NUMA sticky routing](NUMA_STICKY_ROUTING.md) |
+
+## Operational Contracts
+
+- [Prompt Cache](prompt_cache.md): cache-safety and pod-affinity contract
+- [SLO](SLO.md): example recording rules and default objectives
+- [Operations Runbook](OPERATIONS_RUNBOOK.md): alert response procedures
+- [Helm Chart](../charts/densecore/README.md): chart-specific values and install flow
 
 ## Product Surfaces
 
-### Python SDK
+DenseCore currently exposes three maintained entry points:
 
-Use `pip install densecore` when you want:
+- the C++ runtime and C API under `core/`
+- the Python package under `python/`
+- the Go CLI and OpenAI-compatible server under `server/`
 
-- local GGUF inference from Python
-- Hugging Face Hub downloads
-- embedding and rerank helpers
-- LangChain and LangGraph integrations
+The main LLM serving path is CPU-first and GGUF-based. Optional HAL, Apple, QNN,
+and generic operation-graph components exist, but their maturity is not uniform.
+See [Hardware Support](HARDWARE_SUPPORT.md) before treating an optional backend as
+a production path.
 
-Primary doc: [../python/README.md](../python/README.md)
+## Documentation Policy
 
-### Go CLI
-
-Use the CLI when you want:
-
-- `densecore run` interactive local chat
-- `densecore serve` for a standalone API process
-
-Primary doc: [CLI.md](CLI.md)
-
-### API Server
-
-Use the API server when you want:
-
-- OpenAI-compatible chat completions
-- embeddings and rerank HTTP endpoints
-- Prometheus metrics and Kubernetes probes
-- optional gRPC service on port `50051`
-
-Primary docs:
-
-- [API_REFERENCE.md](API_REFERENCE.md)
-- [DEPLOYMENT.md](DEPLOYMENT.md)
-
-## Production Docs
-
-- [SLO](SLO.md)
-- [Operations Runbook](OPERATIONS_RUNBOOK.md)
-- [Deployment Guide](DEPLOYMENT.md)
-- [Benchmarks](BENCHMARKS.md)
-- [Architecture](ARCHITECTURE.md)
-
-## Notes
-
-- `pip install densecore` installs the Python SDK. It does not install the Go CLI.
-- The Docker Hub image runs the API server. It does not launch the interactive TUI.
-- The server expects `MAIN_MODEL_PATH` for a preloaded model in Docker and Kubernetes deployments.
-- DenseCore is CPU-first, not CPU-only. Backend maturity is hardware-specific, and optional accelerators should preserve graceful fallback behavior.
+- Performance claims must link to a reproducible method and quality gate.
+- A single diagnostic run is not a release claim.
+- Feature maturity is stated as maintained, beta, experimental, or scaffold.
+- Environment variables used only for diagnostics are not advertised as tuning
+  defaults.
+- Public docs describe committed behavior, not planned work.

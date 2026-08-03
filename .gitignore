@@ -145,6 +145,14 @@ benchmarks/results/
 benchmarks/bench_native
 benchmarks/quality_test
 benchmarks/quality_test_new
+
+# Local agent, graph-analysis, and CTest output
+.codex/
+.codex_write_probe
+core/.codex_write_probe
+graphify-out/
+core/graphify-out/
+Testing/
 tests/matmul_test_manual
 tests/patch_embed_test_manual
 

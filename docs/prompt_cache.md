@@ -1,6 +1,10 @@
-# Agent Prompt Cache
+# Prompt Cache and Affinity
 
-Environment:
+DenseCore's Go server computes prompt-cache identities and routing affinity for
+repeated prefixes. The cache contract is process-local and safety-first: a reuse
+decision must miss when runtime state cannot be restored exactly.
+
+## Configuration
 
 ```bash
 export DENSECORE_AGENT_PROMPT_CACHE=auto
@@ -11,41 +15,42 @@ export DENSECORE_AGENT_PROMPT_CACHE_DEBUG=0
 ```
 
 Modes:
-- `off`: disable cache decisions.
-- `auto`: enable only for supported and safe runtime identities.
-- `on`: enable for technically supported identities, still failing closed on unsafe reuse.
 
-Cache keys include model identity, tokenizer/template identity, rendered tool schema hash, system prompt hash, LoRA adapter, KV dtype, rope/runtime graph identity, sliding-window policy, SSM policy, parser family, and token IDs.
+- `off`: disable cache decisions
+- `auto`: enable only for supported and safe runtime identities
+- `on`: request cache use for technically supported identities; unsafe reuse still
+  fails closed
 
-Safety rules:
+Cache identity includes the model fingerprint, tokenizer and template, rendered
+tool schema, system prompt, LoRA adapter, KV dtype, RoPE/graph identity,
+sliding-window policy, SSM policy, parser family, and token IDs.
+
+## Safety Boundary
+
 - Token identity is verified before reuse.
-- Tool schema, template, LoRA, model fingerprint, KV dtype, graph family, and SSM policy changes miss.
+- Changes to tools, template, LoRA, model, KV, graph family, or state policy miss.
 - Qwen3.5/Qwen3.6 hybrid SSM reuse requires a matching SSM snapshot boundary.
-- Gemma-style sliding/shared-KV graph families are disabled until runtime restore semantics are exposed.
+- Gemma-style sliding/shared-KV reuse remains disabled where restore semantics are
+  not exposed.
 
-Metrics are exposed under the configured metrics namespace, for example `densecore_prompt_cache_hit_total`, `densecore_prompt_cache_miss_total`, `densecore_prompt_cache_tokens_reused_total`, and `densecore_ssm_snapshot_miss_total`.
+The Go server can make and observe safe cache decisions, but not every C++ model
+family exposes the restore hook needed to reuse KV/SSM state. `on` does not bypass
+that limitation.
 
-## Kubernetes cache affinity
+## Kubernetes Affinity
 
-DenseCore KV prefix reuse is intentionally pod-local. In a Kubernetes deployment,
-round-robin routing across replicas will turn many repeated prompts into cold
-prefills because the warmed KV blocks live only in the pod that processed the
-earlier request.
+Warm KV blocks live in the process that handled the earlier request. Round-robin
+routing across replicas therefore turns repeat prompts into cold prefills.
 
-DenseCore now exposes a routing contract for ingress controllers and API
-gateways:
+Request and response contract:
 
-- Request header: `X-DenseCore-Cache-Affinity`
-- Response header: `X-DenseCore-Cache-Affinity-Key`
-- Response source header: `X-DenseCore-Cache-Affinity-Source`
-- JSON request field: `cache_control.affinity_key`
-
-Use a stable, non-secret value such as a tenant/document digest, conversation
-ID, or explicit cache ID:
+- request: `X-DenseCore-Cache-Affinity`
+- response: `X-DenseCore-Cache-Affinity-Key`
+- response source: `X-DenseCore-Cache-Affinity-Source`
+- JSON field: `cache_control.affinity_key`
 
 ```json
 {
-  "model": "qwen",
   "messages": [{"role": "user", "content": "Use this document..."}],
   "cache_control": {
     "conversation_id": "conv-42",
@@ -55,25 +60,29 @@ ID, or explicit cache ID:
 }
 ```
 
-DenseCore hashes the selected value before returning it in response headers, so
-the header is stable but opaque. Selection order is:
+Selection order:
 
 1. `X-DenseCore-Cache-Affinity`
 2. `cache_control.affinity_key`
 3. `cache_control.cache_id`
 4. `cache_control.conversation_id`
-5. a best-effort prompt fingerprint fallback
+5. best-effort prompt fingerprint
 
-For Kubernetes, configure the gateway to hash on
-`X-DenseCore-Cache-Affinity` before it forwards the request. Clients can either
-send that header directly, or send `cache_control.*` and replay the returned
-`X-DenseCore-Cache-Affinity-Key` on follow-up requests. The fallback fingerprint
-is useful for observability, but production multi-turn or file-context serving
-should provide an explicit affinity key because an ingress cannot route on a
-response header for the current request.
+DenseCore hashes the selected value before returning it. Use a stable, non-secret
+tenant/document/conversation identifier. Configure the ingress or gateway to hash
+the request header before forwarding the request. A response header can guide the
+next request, not reroute the current one.
 
-Prometheus counters:
+## Metrics
 
+Metrics use the configured namespace. Default names include:
+
+- `densecore_prompt_cache_hit_total`
+- `densecore_prompt_cache_miss_total`
+- `densecore_prompt_cache_tokens_reused_total`
+- `densecore_ssm_snapshot_miss_total`
 - `densecore_cache_affinity_key_total`
 - `densecore_cache_affinity_explicit_total`
 - `densecore_cache_affinity_fallback_total`
+
+Validate emitted names on the deployed binary before installing alerts.

@@ -1,18 +1,11 @@
 # Deployment Guide
 
-This guide covers the production API server surface, not the Python SDK. DenseCore's deployment story is centered on a memory-centric runtime with explicit probes, metrics, and fallback-aware startup behavior.
+This guide covers the Go API server. The Python SDK is intended for in-process local
+inference and has a separate packaging lifecycle.
 
-## Docker Hub Image
+## Docker
 
-The published server image is:
-
-```bash
-docker pull denseai/densecore:latest
-```
-
-The container expects `MAIN_MODEL_PATH` if you want a model loaded on startup.
-
-### Run with a local model
+Run the published image with a local GGUF:
 
 ```bash
 docker run --rm -p 8080:8080 \
@@ -21,7 +14,7 @@ docker run --rm -p 8080:8080 \
   denseai/densecore:latest
 ```
 
-### Run with authentication
+With authentication:
 
 ```bash
 docker run --rm -p 8080:8080 \
@@ -32,76 +25,45 @@ docker run --rm -p 8080:8080 \
   denseai/densecore:latest
 ```
 
-### Health and smoke checks
+Smoke-test the process and model lifecycle separately:
 
 ```bash
-curl http://localhost:8080/health/live
-curl http://localhost:8080/health/ready
-curl http://localhost:8080/v1/models
+curl --fail http://localhost:8080/health/live
+curl --fail http://localhost:8080/health/startup
+curl --fail http://localhost:8080/health/ready
+curl --fail http://localhost:8080/v1/models
 ```
 
-### Chat completion example
+Build the image from this repository with:
 
 ```bash
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{"role": "user", "content": "Say hello."}],
-    "max_tokens": 64
-  }'
+docker build -t denseai/densecore:local .
 ```
-
-## Build Your Own Image
-
-```bash
-docker build -t denseai/densecore:latest .
-```
-
-The root [`Dockerfile`](../Dockerfile) builds:
-
-- the native C++ library
-- the Go API server binary
-- a Debian runtime image exposing port `8080`
-
-The runtime image sets:
-
-- `PORT=8080`
-- `HOST=0.0.0.0`
-- `THREADS=0`
-- `RATE_LIMIT_ENABLED=true`
-- `RATE_LIMIT_RPS=100`
 
 ## Docker Compose
 
-[`../docker-compose.yml`](../docker-compose.yml) starts:
-
-- `densecore` API server
-- `redis` for distributed rate limiting and API key storage
-
-Start it with:
+The checked-in `docker-compose.yml` starts DenseCore and an optional Redis service.
+It mounts `./models` read-only and expects the configured model to exist there.
 
 ```bash
 docker compose up -d
 ```
 
-Important notes about the checked-in compose file:
+Redis can back distributed API-key storage and rate limiting. Treat Redis failure
+behavior as a deployment decision: verify whether the selected configuration is
+allowed to fall back to in-memory state before using multiple replicas.
 
-- it mounts `./models:/models:ro`
-- it expects `MAIN_MODEL_PATH=/models/model.gguf`
-- Redis-backed rate limiting and keystore are enabled in the example configuration
+## Kubernetes and Helm
 
-## Kubernetes
-
-The repository ships a Helm chart in [`../charts/densecore`](../charts/densecore).
-
-Install from source:
+The chart lives in `charts/densecore` and consumes the shared DenseCloud chart
+dependency.
 
 ```bash
 helm dependency update ./charts/densecore
-helm install densecore ./charts/densecore
+helm upgrade --install densecore ./charts/densecore -f values.production.yaml
 ```
 
-Common override pattern:
+Example model PVC override:
 
 ```yaml
 dense-base:
@@ -112,75 +74,90 @@ dense-base:
   model:
     source: pvc
     existingClaim: densecore-models-pvc
-    filename: main_model.gguf
+    filename: model.gguf
 ```
 
-Apply:
+Use [`charts/densecore/README.md`](../charts/densecore/README.md) as the chart
+schema source of truth. Do not copy values from older docs without running
+`helm lint` and rendering the chart.
 
-```bash
-helm upgrade --install densecore ./charts/densecore -f my-values.yaml
-```
+### Probes and Shutdown
 
-### Ports
+- `/health/live`: process liveness
+- `/health/startup`: initial model lifecycle
+- `/health/ready`: request readiness and runtime pressure
+- `/metrics`: Prometheus scrape endpoint
 
-- HTTP service: `8080`
-- gRPC service: `50051` when enabled
+Keep startup, readiness, and liveness distinct. The server uses the DenseCloud
+runner for middleware ordering, RED metrics, signal handling, and graceful
+shutdown.
 
-### Probes
+### Optional Chart Features
 
-The server exposes:
+The chart includes optional PDB, HPA/KEDA, ServiceMonitor, Grafana dashboard, and
+NetworkPolicy surfaces. Their presence is not proof that a cluster integration is
+qualified. Validate CRDs, Prometheus queries, ingress-controller namespaces, OTel
+collector access, and model-storage behavior in the target cluster.
 
-- `/health/live`
-- `/health/ready`
-- `/health/startup`
+CPU inference is memory-heavy and often has long prefill latency. Autoscaling on
+CPU utilization alone may react too late; queue metrics are useful, but scale-up
+time and model-load time must be included in the policy.
 
-These are already wired into the Helm values.
+## Model Loading
 
-## Hot Loading
-
-If you start the server without `MAIN_MODEL_PATH`, you can load a model later:
+For predictable startup, mount one immutable GGUF and set `MAIN_MODEL_PATH`. Hot
+loading is available when the process starts without a model:
 
 ```bash
 curl -X POST http://localhost:8080/v1/models/load \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model_path": "/models/model.gguf",
-    "threads": 4
-  }'
+  -H 'Content-Type: application/json' \
+  -d '{"model_path":"/models/model.gguf","threads":16}'
 ```
 
-Unload:
+Unload with:
 
 ```bash
 curl -X POST http://localhost:8080/v1/models/unload
 ```
 
-## Environment Variables
+Avoid using hot load as a rollout mechanism unless memory release, readiness, and
+request draining have been tested for the exact model.
 
-| Variable | Meaning |
+## Production Configuration
+
+Important server variables include:
+
+| Variable | Purpose |
 | --- | --- |
-| `MAIN_MODEL_PATH` | preload model path |
-| `DRAFT_MODEL_PATH` | optional draft model path |
-| `PORT` | HTTP port |
-| `HOST` | HTTP bind address |
-| `THREADS` | inference threads |
-| `AUTH_ENABLED` | enable API key auth |
-| `API_KEYS` | in-memory API key list |
-| `GRPC_ENABLED` | enable gRPC server |
-| `GRPC_PORT` | gRPC port |
-| `GRPC_TLS_ENABLED` | enable gRPC TLS |
-| `RATE_LIMIT_ENABLED` | enable HTTP rate limiting |
-| `RATE_LIMIT_RPS` | HTTP rate limit |
-| `RATE_LIMIT_BURST` | HTTP rate limit burst |
-| `REDIS_URL` | Redis endpoint |
-| `REDIS_KEYSTORE_ENABLED` | Redis-backed key store |
-| `REDIS_RATELIMIT_ENABLED` | Redis-backed rate limiting |
-| `METRICS_ENABLED` | Prometheus endpoint toggle |
-| `METRICS_PATH` | metrics path |
+| `MAIN_MODEL_PATH` | model loaded at startup |
+| `DENSECORE_ENGINE_THREADS` | compute-thread override |
+| `DENSECORE_MAX_NUM_SEQS` | active sequence bound |
+| `DENSECORE_MAX_SEQ_LEN` | context override |
+| `DENSECORE_KV_TARGET_MB` | KV memory override |
+| `DENSECORE_SERVER_INFLIGHT` | server admission bound |
+| `REQUEST_TIMEOUT` | request deadline |
+| `SHUTDOWN_TIMEOUT` | graceful shutdown deadline |
+| `AUTH_ENABLED`, `API_KEYS` | local authentication |
+| `REDIS_URL` | Redis endpoint for enabled integrations |
+| `GRPC_ENABLED`, `GRPC_PORT` | optional gRPC service |
+| `GRPC_TLS_ENABLED` | gRPC TLS |
+| `METRICS_ENABLED`, `METRICS_PATH` | Prometheus endpoint |
 
-## Production Notes
+Do not hard-code a universal KV or context budget. Model size, quantization,
+context length, active sequences, and available host memory all affect the safe
+envelope.
 
-- The API server starts before background model loading completes.
-- `startup` and `ready` probes intentionally reflect model load state.
-- If authentication is enabled without `API_KEYS` and without a Redis keystore, startup fails.
-- Optional autoscaling or external store integrations should be validated as deployment-specific extensions, not assumed baseline behavior.
+## Operational Checks
+
+Before production traffic:
+
+1. Run a real `/v1/chat/completions` short and long QA set.
+2. Confirm the intended model fast path and absence of rejected fallback.
+3. Load-test concurrency and record TTFT, inter-token latency, queue wait, memory
+   peak, and output quality.
+4. Verify graceful termination while requests are active.
+5. Verify alert and dashboard queries against the emitted metric names.
+6. Test prompt-cache affinity if repeated prefixes are part of the workload.
+
+See [SLO.md](SLO.md) and [OPERATIONS_RUNBOOK.md](OPERATIONS_RUNBOOK.md) for the
+shipped example objectives and response procedures.
