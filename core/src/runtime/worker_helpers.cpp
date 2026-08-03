@@ -1814,6 +1814,28 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
     const double steady_visible_tok_s =
         (decode_visible_ms > 0.0) ? (static_cast<double>(steady_visible_tokens) / (decode_visible_ms / 1000.0)) : 0.0;
     const DecodeRuntimeStatsSnapshot runtime = GetDecodeRuntimeStatsSnapshot();
+    // Process-cumulative, like `runtime` above: these answer "did sticky routing
+    // ever dispatch on the native MoE path", which a per-request counter cannot,
+    // because the expert->node map is built once at model load time.
+    const NativeMoENumaStatsSnapshot native_moe_numa = GetNativeMoENumaStatsSnapshot();
+    const std::string native_moe_numa_node_hist = [&native_moe_numa]() {
+        std::ostringstream oss;
+        bool any = false;
+        for (std::size_t i = 0; i < native_moe_numa.node_dispatch_ops.size(); ++i) {
+            if (native_moe_numa.node_dispatch_ops[i] == 0) {
+                continue;
+            }
+            if (any) oss << ",";
+            oss << i << ":" << native_moe_numa.node_dispatch_ops[i];
+            any = true;
+        }
+        if (native_moe_numa.node_dispatch_overflow_ops > 0) {
+            if (any) oss << ",";
+            oss << "overflow:" << native_moe_numa.node_dispatch_overflow_ops;
+            any = true;
+        }
+        return any ? oss.str() : std::string("none");
+    }();
     const KVRuntimeStatsSnapshot kv_stats = GetKVRuntimeStatsSnapshot();
     const double paged_runtime_hit_rate =
         runtime.path_total > 0 ? (100.0 * static_cast<double>(runtime.path_paged) / runtime.path_total) : 0.0;
@@ -2421,8 +2443,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
         << " q4k_repacked_gemv_probe_ms=" << (static_cast<double>(req->q4k_repacked_gemv_probe_ns) / 1.0e6)
         << " q4k_repacked_gemv_resident_bytes=" << req->q4k_repacked_gemv_resident_bytes
         << " q4k_repacked_gemv_cache_limit_bytes=" << densecore::kernels::Q4KRepackedGemvCacheLimitBytes()
-        << " q4k_repacked_gemv_cache_floor_bytes="
-        << densecore::kernels::Q4KRepackedGemvRuntimeCacheBudgetFloorBytes()
+        << " q4k_repacked_gemv_cache_floor_bytes=" << densecore::kernels::Q4KRepackedGemvRuntimeCacheBudgetFloorBytes()
         << " q4k_repacked_gemv_cache_limit_source="
         << (densecore::kernels::Q4KRepackedGemvManualCacheLimitConfigured() ? "manual" : "auto")
         << " q4k_repacked_gemv_distinct_weights_seen=" << req->q4k_repacked_gemv_distinct_weights_seen
@@ -2473,10 +2494,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
         << " q6k_gemv_graph_phase=" << (req->q6k_gemv_graph_phase.empty() ? "none" : req->q6k_gemv_graph_phase.c_str())
         << " q6k_gemv_callback_phase="
         << (req->q6k_gemv_callback_phase.empty() ? "none" : req->q6k_gemv_callback_phase.c_str())
-        << " qwen_decode_q6k_lm_head_overlap_candidate_ops="
-        << qwen_decode_q6k_lm_head_overlap_candidate_ops
-        << " qwen_decode_q6k_lm_head_overlap_used_ops="
-        << qwen_decode_q6k_lm_head_overlap_used_ops
+        << " qwen_decode_q6k_lm_head_overlap_candidate_ops=" << qwen_decode_q6k_lm_head_overlap_candidate_ops
+        << " qwen_decode_q6k_lm_head_overlap_used_ops=" << qwen_decode_q6k_lm_head_overlap_used_ops
         << " qwen_decode_custom_lm_head_count=" << req->decode_graph_node_custom_lm_head_count
         << " q6k_gemv_weight_shapes=" << q6k_gemv_weight_shapes
         << " q6k_gemv_total_ms=" << ns_to_ms(req->q6k_gemv_total_ns)
@@ -2510,13 +2529,11 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
         << " moe_q5k_repacked_rejected_ops=" << req->moe_q5k_repacked_rejected_ops
         << " moe_q5k_repacked_last_reject_reason="
         << (req->moe_q5k_repacked_last_reject_reason.empty() ? "none"
-                                                              : req->moe_q5k_repacked_last_reject_reason.c_str())
+                                                             : req->moe_q5k_repacked_last_reject_reason.c_str())
         << " moe_kquant_raw_batched_q4k_used_ops=" << req->moe_kquant_raw_batched_q4k_used_ops
         << " moe_kquant_raw_batched_q4k_ms=" << ns_to_ms(req->moe_kquant_raw_batched_q4k_ns)
-        << " qwen_native_moe_w1w3_q4k_raw_batched_used_ops="
-        << qwen_native_moe_w1w3_q4k_raw_batched_used_ops
-        << " qwen_native_moe_w1w3_q4k_raw_batched_ms="
-        << ns_to_ms(qwen_native_moe_w1w3_q4k_raw_batched_ns)
+        << " qwen_native_moe_w1w3_q4k_raw_batched_used_ops=" << qwen_native_moe_w1w3_q4k_raw_batched_used_ops
+        << " qwen_native_moe_w1w3_q4k_raw_batched_ms=" << ns_to_ms(qwen_native_moe_w1w3_q4k_raw_batched_ns)
         << " moe_kquant_raw_batched_q5k_used_ops=" << req->moe_kquant_raw_batched_q5k_used_ops
         << " moe_kquant_raw_batched_q5k_ms=" << ns_to_ms(req->moe_kquant_raw_batched_q5k_ns)
         << " gemma4_moe_prefill_quant_batch_candidate_ops=" << req->gemma4_moe_prefill_quant_batch_candidate_ops
@@ -2604,6 +2621,17 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
         << " native_moe_fast_w1w3_seen_ops=" << native_moe_fast_w1w3_seen_ops
         << " native_moe_fast_w2_seen_ops=" << native_moe_fast_w2_seen_ops
         << " native_moe_fast_w2_q5k_seen_ops=" << native_moe_fast_w2_q5k_seen_ops
+        << " native_moe_numa_sticky_state=" << GetNativeMoENumaStickyStateName(native_moe_numa.last_state)
+        << " native_moe_numa_context_enabled=" << native_moe_numa.context_enabled_total << "/"
+        << native_moe_numa.context_set_total
+        << " native_moe_numa_sticky_dispatch_ops=" << native_moe_numa.sticky_dispatch_ops
+        << " native_moe_numa_legacy_dispatch_ops=" << native_moe_numa.legacy_dispatch_ops
+        << " native_moe_numa_grouped_decode_used_ops=" << native_moe_numa.grouped_decode_used_ops
+        << " native_moe_numa_grouped_node_tasks=" << native_moe_numa.grouped_dispatch_node_tasks
+        << " native_moe_numa_grouped_expert_items=" << native_moe_numa.grouped_dispatch_expert_items
+        << " native_moe_numa_direct_decode_used_ops=" << native_moe_numa.direct_decode_used_ops
+        << " native_moe_numa_direct_decode_rejected_ops=" << native_moe_numa.direct_decode_rejected_ops
+        << " native_moe_numa_node_dispatch_ops=" << native_moe_numa_node_hist
         << " native_moe_fast_decode_candidate_ops=" << req->native_moe_fast_decode_candidate_ops
         << " native_moe_fast_decode_used_ops=" << req->native_moe_fast_decode_used_ops
         << " native_moe_fast_decode_rejected_ops=" << req->native_moe_fast_decode_rejected_ops
@@ -2639,10 +2667,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
                 ? "none"
                 : req->native_moe_fast_w2_q5k_last_reject_reason.c_str())
         << " native_moe_fast_w2_q5k_ms=" << ns_to_ms(req->native_moe_fast_w2_q5k_ns)
-        << " qwen_native_moe_w2_q5k_raw_batched_used_ops="
-        << req->qwen_native_moe_w2_q5k_raw_batched_used_ops
-        << " qwen_native_moe_w2_q5k_raw_batched_ms="
-        << ns_to_ms(req->qwen_native_moe_w2_q5k_raw_batched_ns)
+        << " qwen_native_moe_w2_q5k_raw_batched_used_ops=" << req->qwen_native_moe_w2_q5k_raw_batched_used_ops
+        << " qwen_native_moe_w2_q5k_raw_batched_ms=" << ns_to_ms(req->qwen_native_moe_w2_q5k_raw_batched_ns)
         << " qwen_native_moe_fused_router_used_ops=" << req->qwen_native_moe_fused_router_used_ops
         << " qwen_native_moe_fused_router_ms=" << ns_to_ms(req->qwen_native_moe_fused_router_ns)
         << " qwen_native_moe_q4_gateup_rowpair_used_ops=" << req->qwen_native_moe_q4_gateup_rowpair_used_ops

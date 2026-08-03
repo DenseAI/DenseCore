@@ -78,6 +78,8 @@ bool RunQwen35NativeMoEQ4KQ8KDotRowForTest(const void* weight_row, const void* q
                                            float* output);
 bool RunQwen35NativeMoEQ5KQ8KDotRowForTest(const void* weight_row, const void* q8_input, int64_t cols,
                                            float* output);
+bool RunQ5KQ8KBatchedGemvRowForTest(const void* weight_row, const void* q8_input_base, size_t q8_row_stride, int M,
+                                    int cols, float* output);
 bool RunQwen35NativeQuantizeRowQ8KForTest(const float* input, void* q8_output, int64_t cols);
 bool RunQwen35NativeMoEQ5KFusedSwiGLURowsForTest(const void* gate_rows, const void* up_rows, const void* q8_input,
                                                  int64_t cols, int64_t row_count, size_t row_bytes,
@@ -746,18 +748,33 @@ TEST(NumaStickyRouting, QueryMemoryNumaNodeRange_RejectsEmptyRange) {
 TEST(NumaStickyRouting, QueryMemoryNumaNode_ValidPtr) {
     CpuBackend& backend = GetCpuBackend();
 
-    // Allocate some memory
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
+    const int numa_count = backend.GetNumaNodeCount();
+    if (numa_count < 2) {
+        GTEST_SKIP() << "placement detection is only meaningful across >= 2 nodes; host has " << numa_count;
+    }
+
     void* ptr = backend.AllocateDevice(4096);
     ASSERT_NE(ptr, nullptr);
 
-    // Query NUMA node - result depends on system configuration
-    // On non-NUMA systems, this returns -1
-    // On NUMA systems, this returns a valid node ID >= 0
-    int node = backend.QueryMemoryNumaNode(ptr);
-    // Either -1 (non-NUMA) or >= 0 (NUMA)
-    EXPECT_GE(node, -1);
+    // A page has no node until it is faulted in, so an untouched allocation
+    // legitimately reports -1. Touch it, then detection must name a real node:
+    // this is the query the expert->node map is built from, and if it silently
+    // degrades to -1 sticky routing reports placement_invalid and falls back.
+    std::memset(ptr, 0, 4096);
+    const int node = backend.QueryMemoryNumaNode(ptr);
+    EXPECT_GE(node, 0);
+    EXPECT_LT(node, numa_count);
 
     backend.FreeDevice(ptr);
+#else
+    // Compiled without libnuma the query is a stub with exactly one legal
+    // answer, so pin that rather than accepting anything.
+    void* ptr = backend.AllocateDevice(4096);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(backend.QueryMemoryNumaNode(ptr), -1);
+    backend.FreeDevice(ptr);
+#endif
 }
 
 TEST(NumaStickyRouting, BindMemoryToNumaNode_InvalidArgs) {
@@ -778,16 +795,38 @@ TEST(NumaStickyRouting, BindMemoryToNumaNode_InvalidArgs) {
 TEST(NumaStickyRouting, BindMemoryToNumaNode_FallbackBehavior) {
     CpuBackend& backend = GetCpuBackend();
 
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
+    const int numa_count = backend.GetNumaNodeCount();
+    if (numa_count < 2) {
+        GTEST_SKIP() << "binding is only observable across >= 2 nodes; host has " << numa_count;
+    }
+
+    // Deliberately one page. BindMemoryToNumaNode issues MPOL_BIND, and under
+    // MPOL_BIND an allocation that exceeds the target node's capacity does not
+    // fail with null -- the kernel goes to reclaim and then OOM-kills the
+    // caller, which would take this whole test binary down. Capacity-pressure
+    // scenarios belong in a separate subprocess, not here.
     void* ptr = backend.AllocateDevice(4096);
     ASSERT_NE(ptr, nullptr);
+    std::memset(ptr, 0, 4096);  // fault the page in so there is something to move
 
-    // On non-NUMA systems, returns false (no-op)
-    // On NUMA systems with only 1 node, may succeed or fail depending on permissions
-    bool result = backend.BindMemoryToNumaNode(ptr, 4096, 0);
-    // We don't assert on result since it depends on system configuration
-    (void)result;
+    // mbind carries MPOL_MF_MOVE, so each bind must actually relocate the page,
+    // not just set a policy for future faults. Walking every node also proves
+    // the target is honored rather than the page happening to start there.
+    for (int node = 0; node < numa_count; ++node) {
+        ASSERT_TRUE(backend.BindMemoryToNumaNode(ptr, 4096, node)) << "bind to node " << node << " failed";
+        EXPECT_EQ(backend.QueryMemoryNumaNode(ptr), node) << "page did not migrate to node " << node;
+    }
 
     backend.FreeDevice(ptr);
+#else
+    void* ptr = backend.AllocateDevice(4096);
+    ASSERT_NE(ptr, nullptr);
+    // Without libnuma this is a no-op stub and must report that honestly,
+    // otherwise callers would believe a binding took effect.
+    EXPECT_FALSE(backend.BindMemoryToNumaNode(ptr, 4096, 0));
+    backend.FreeDevice(ptr);
+#endif
 }
 
 // =============================================================================
@@ -797,16 +836,76 @@ TEST(NumaStickyRouting, BindMemoryToNumaNode_FallbackBehavior) {
 TEST(NumaStickyRouting, GetThreadPool_RoundRobin) {
     CpuBackend& backend = GetCpuBackend();
 
-    int numa_count = backend.GetNumaNodeCount();
-    EXPECT_GE(numa_count, 1);
+    const int numa_count = backend.GetNumaNodeCount();
+    ASSERT_GE(numa_count, 1);
+    if (numa_count < 2) {
+        GTEST_SKIP() << "round-robin is only observable with >= 2 pools; host has " << numa_count;
+    }
 
-    // -1 means round-robin across all pools
-    ThreadPool& pool1 = backend.GetThreadPool(-1);
-    ThreadPool& pool2 = backend.GetThreadPool(-1);
+    // The counter is process-global and earlier tests may have advanced it, but
+    // across exactly kRounds * numa_count draws a modulo counter must hand out
+    // every pool exactly kRounds times no matter where it started.
+    //
+    // This is the regression test for an unpinned request (-1) being resolved to
+    // the *calling* thread's node instead of falling through to the counter:
+    // that collapses round-robin onto a single pool while every individual call
+    // still returns a perfectly valid pool, so a "pool is non-null" check like
+    // the one this replaced sees nothing wrong.
+    constexpr int kRounds = 4;
+    std::vector<int> hits(static_cast<size_t>(numa_count), 0);
+    for (int i = 0; i < kRounds * numa_count; ++i) {
+        ThreadPool& pool = backend.GetThreadPool(-1);
+        const int node = pool.GetNumaNode();
+        ASSERT_GE(node, 0);
+        ASSERT_LT(node, numa_count);
+        EXPECT_GT(pool.GetNumThreads(), 0);
+        hits[static_cast<size_t>(node)]++;
+    }
 
-    // Both pools should be valid (may be same or different pool depending on counter)
-    EXPECT_GT(pool1.GetNumThreads(), 0);
-    EXPECT_GT(pool2.GetNumThreads(), 0);
+    for (int node = 0; node < numa_count; ++node) {
+        EXPECT_EQ(hits[static_cast<size_t>(node)], kRounds)
+            << "pool " << node << " received " << hits[static_cast<size_t>(node)] << " of " << (kRounds * numa_count)
+            << " round-robin draws";
+    }
+}
+
+// Sticky routing arms identically whether experts are spread across nodes or all
+// sitting on one node of several, so the reported state name is the only thing
+// that tells an operator their MoE compute is confined to a single socket. If
+// these two ever collapse to the same string that signal is gone -- which is the
+// exact condition that went unnoticed until dispatch counters were added.
+TEST(NumaStickyRouting, StickyStateNameSeparatesDegeneratePlacement) {
+    const char* spread = GetNativeMoENumaStickyStateName(static_cast<int>(NativeMoENumaStickyState::Enabled));
+    const char* degenerate =
+        GetNativeMoENumaStickyStateName(static_cast<int>(NativeMoENumaStickyState::EnabledSingleNodeDegenerate));
+
+    ASSERT_NE(spread, nullptr);
+    ASSERT_NE(degenerate, nullptr);
+    EXPECT_STREQ(spread, "enabled");
+    EXPECT_STREQ(degenerate, "enabled_degenerate");
+    EXPECT_STRNE(spread, degenerate);
+
+    // Every state must name itself; an unmapped enumerator falling through to
+    // "unknown" would make a decode summary unreadable.
+    const NativeMoENumaStickyState kAllStates[] = {
+        NativeMoENumaStickyState::Unset,
+        NativeMoENumaStickyState::NoBackend,
+        NativeMoENumaStickyState::SingleNode,
+        NativeMoENumaStickyState::PlacementUnavailable,
+        NativeMoENumaStickyState::PlacementInvalid,
+        NativeMoENumaStickyState::Enabled,
+        NativeMoENumaStickyState::EnabledSingleNodeDegenerate,
+        NativeMoENumaStickyState::DisabledByDebug,
+    };
+    std::vector<std::string> names;
+    for (NativeMoENumaStickyState state : kAllStates) {
+        const char* name = GetNativeMoENumaStickyStateName(static_cast<int>(state));
+        ASSERT_NE(name, nullptr);
+        EXPECT_STRNE(name, "unknown") << "state " << static_cast<int>(state) << " has no name";
+        names.emplace_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    EXPECT_EQ(std::adjacent_find(names.begin(), names.end()), names.end()) << "two sticky states share a name";
 }
 
 TEST(NumaStickyRouting, GetThreadPool_SpecificNode) {
@@ -865,6 +964,44 @@ TEST(NumaStickyRouting, ThreadPool_ConfigureLargeCountClampsToLogicalCapacity) {
     EXPECT_EQ(pool.GetNumThreads(), expected);
 }
 
+TEST(NumaStickyRouting, UpdateBackendThreadsCapsNumaPoolsAtLocalPhysicalCores) {
+    CpuBackend& backend = GetCpuBackend();
+    auto& cfg = InferenceConfig::Instance();
+    const int saved_config_threads = cfg.num_threads;
+    const int node_count = backend.GetNumaNodeCount();
+    ASSERT_GT(node_count, 0);
+
+    std::vector<int> saved_pool_threads;
+    saved_pool_threads.reserve(static_cast<size_t>(node_count));
+    for (int node = 0; node < node_count; ++node) {
+        saved_pool_threads.push_back(backend.GetThreadPool(node).GetNumThreads());
+    }
+
+    constexpr int kOversizedRequest = 1 << 20;
+    UpdateBackendThreads(kOversizedRequest);
+    EXPECT_EQ(cfg.num_threads, kOversizedRequest);
+    for (int node = 0; node < node_count; ++node) {
+        const int local_physical = HardwareTopology::GetInstance().GetPhysicalCoreCount(node);
+        int expected = local_physical;
+        if (expected <= 0) {
+            expected = static_cast<int>(HardwareTopology::GetInstance().GetCoresInNumaNode(node).size());
+        }
+        if (expected <= 0) {
+            expected = HardwareTopology::GetInstance().GetLogicalCoreCount();
+        }
+        if (expected <= 0) {
+            expected = static_cast<int>(std::thread::hardware_concurrency());
+        }
+        expected = std::max(1, expected);
+        EXPECT_EQ(backend.GetThreadPool(node).GetNumThreads(), expected) << "node=" << node;
+    }
+
+    cfg.num_threads = saved_config_threads;
+    for (int node = 0; node < node_count; ++node) {
+        backend.GetThreadPool(node).Configure(saved_pool_threads[static_cast<size_t>(node)]);
+    }
+}
+
 TEST(NumaStickyRouting, ThreadPool_NestedParallelForFromWorkerCompletesInline) {
     ThreadPool pool(0, 4);
     std::atomic<int> inner_visits{0};
@@ -891,7 +1028,18 @@ TEST(NumaStickyRouting, ThreadPool_ConcurrentExternalParallelForCompletes) {
             std::this_thread::yield();
         }
         for (int iter = 0; iter < 100; ++iter) {
-            pool.ParallelFor(128, [&](int begin, int end, int /*thread_id*/) {
+            pool.ParallelFor(128, [&](int begin, int end, int thread_id) {
+                // Hold the worker shares back so the dispatching thread reaches
+                // cv_done_.wait() before the last completion lands.  Without this the
+                // workers usually finish first, the wait predicate is already true on
+                // entry, and the block is never exercised -- which is how a lost
+                // wakeup on cv_done_ survived here until a 2-node host hit it.
+                if (thread_id != 0) {
+                    volatile int sink = 0;
+                    for (int spin = 0; spin < 20000; ++spin) {
+                        sink += spin;
+                    }
+                }
                 visits.fetch_add(end - begin, std::memory_order_relaxed);
             });
         }
@@ -904,6 +1052,34 @@ TEST(NumaStickyRouting, ThreadPool_ConcurrentExternalParallelForCompletes) {
     b.join();
 
     EXPECT_EQ(visits.load(std::memory_order_relaxed), 2 * 100 * 128);
+}
+
+// A dispatch whose worker shares complete before the dispatcher's own share must
+// still be reported exactly once each: the completion barrier counts participants,
+// so an over- or under-count wedges the pool.  Runs both orderings.
+TEST(NumaStickyRouting, ThreadPool_CompletionBarrierCountsEveryParticipantOnce) {
+    ThreadPool pool(0, 4);
+
+    for (int round = 0; round < 200; ++round) {
+        const bool workers_last = (round % 2) == 0;
+        std::atomic<int> visits{0};
+        std::atomic<int> shares{0};
+
+        pool.ParallelFor(64, [&](int begin, int end, int thread_id) {
+            const bool slow = workers_last ? (thread_id != 0) : (thread_id == 0);
+            if (slow) {
+                volatile int sink = 0;
+                for (int spin = 0; spin < 10000; ++spin) {
+                    sink += spin;
+                }
+            }
+            shares.fetch_add(1, std::memory_order_relaxed);
+            visits.fetch_add(end - begin, std::memory_order_relaxed);
+        });
+
+        ASSERT_EQ(visits.load(std::memory_order_relaxed), 64) << "round " << round;
+        ASSERT_EQ(shares.load(std::memory_order_relaxed), 4) << "round " << round;
+    }
 }
 
 // =============================================================================
@@ -963,6 +1139,63 @@ TEST(NumaStickyRouting, RunOnNumaNodeCompletesExactlyOnce) {
     backend.RunOnNumaNode(0, [&] { calls.fetch_add(1, std::memory_order_relaxed); });
 
     EXPECT_EQ(calls.load(std::memory_order_relaxed), 1);
+}
+
+// Regression for the MoE dispatch serialization.
+//
+// RunOnNumaNode is called from inside an already-parallel region: the native MoE
+// ops run at ggml's full task width and every task dispatches per expert. The
+// old implementation took a per-node mutex and handed the body to a single
+// pinned helper thread, so all but one caller sat blocked and the entire outer
+// parallel region collapsed onto one thread per node. Concurrent callers must
+// therefore overlap; if they cannot, this test times out at the latch instead of
+// observing any concurrency.
+TEST(NumaStickyRouting, RunOnNumaNodeDoesNotSerializeConcurrentCallers) {
+    CpuBackend& backend = GetCpuBackend();
+    constexpr int kCallers = 4;
+    if (static_cast<int>(std::thread::hardware_concurrency()) < kCallers) {
+        GTEST_SKIP() << "needs at least " << kCallers << " hardware threads";
+    }
+
+    // `arrived` only ever grows, so a task released by the latch cannot pull the
+    // predicate back below the threshold and re-block the tasks behind it.
+    std::atomic<int> arrived{0};
+    std::atomic<int> max_in_flight{0};
+    std::atomic<int> in_flight{0};
+    std::atomic<int> completed{0};
+    std::mutex latch_mu;
+    std::condition_variable latch_cv;
+
+    const auto body = [&] {
+        const int now = in_flight.fetch_add(1, std::memory_order_acq_rel) + 1;
+        int observed = max_in_flight.load(std::memory_order_relaxed);
+        while (now > observed && !max_in_flight.compare_exchange_weak(observed, now, std::memory_order_relaxed)) {
+        }
+        {
+            std::unique_lock<std::mutex> lock(latch_mu);
+            arrived.fetch_add(1, std::memory_order_acq_rel);
+            latch_cv.notify_all();
+            // Bounded so a regression serializes into a slow pass rather than a
+            // hang: the assertion below is what fails, with a readable message.
+            latch_cv.wait_for(lock, std::chrono::seconds(5),
+                              [&] { return arrived.load(std::memory_order_acquire) >= kCallers; });
+        }
+        in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        completed.fetch_add(1, std::memory_order_relaxed);
+    };
+
+    std::vector<std::thread> callers;
+    callers.reserve(kCallers);
+    for (int i = 0; i < kCallers; ++i) {
+        callers.emplace_back([&] { backend.RunOnNumaNode(0, body); });
+    }
+    for (auto& t : callers) {
+        t.join();
+    }
+
+    EXPECT_EQ(completed.load(std::memory_order_relaxed), kCallers) << "every dispatched task must run exactly once";
+    EXPECT_EQ(max_in_flight.load(std::memory_order_relaxed), kCallers)
+        << "RunOnNumaNode serialized concurrent callers instead of letting all " << kCallers << " overlap";
 }
 
 TEST(NumaStickyRouting, DispatchExpertFFN_UsesNumaMapping) {
@@ -2191,6 +2424,39 @@ TEST(NumaStickyRouting, QwenNativeQ5KGateUpDotUsesDenseCoreQ8FastPath) {
                                                                               &native_value));
         ASSERT_TRUE(densecore::hwy_kernels::DotQ5KQ8K_Hwy(weight_row, densecore_q8.data(), K, &hwy_value));
         EXPECT_FLOAT_EQ(native_value, hwy_value) << "row=" << row;
+    }
+}
+
+TEST(NumaStickyRouting, QwenNativeQ5KSingleRowKernelMatchesHighwayReference) {
+    std::mt19937 rng(1833);
+    std::uniform_real_distribution<float> input_dist(-1.25f, 1.25f);
+    std::uniform_real_distribution<float> weight_dist(-0.75f, 0.75f);
+
+    for (const int K : {256, 512}) {
+        constexpr int N = 16;
+        std::vector<float> input(static_cast<size_t>(K));
+        std::vector<float> weight_f32(static_cast<size_t>(N * K));
+        for (float& v : input) v = input_dist(rng);
+        for (float& v : weight_f32) v = weight_dist(rng);
+
+        std::vector<uint8_t> weight_q5k;
+        QuantizeRowsForTest(GGML_TYPE_Q5_K, weight_f32, N, K, &weight_q5k);
+        const size_t q8_row_bytes = ggml_row_size(GGML_TYPE_Q8_K, K);
+        std::vector<uint8_t> q8_input(q8_row_bytes);
+        ASSERT_TRUE(densecore::testing::RunQwen35NativeQuantizeRowQ8KForTest(input.data(), q8_input.data(), K));
+
+        const size_t weight_row_bytes = ggml_row_size(GGML_TYPE_Q5_K, K);
+        for (int row = 0; row < N; ++row) {
+            const void* weight_row = weight_q5k.data() + static_cast<size_t>(row) * weight_row_bytes;
+            float reference = 0.0f;
+            float candidate = 0.0f;
+            ASSERT_TRUE(densecore::testing::RunQwen35NativeMoEQ5KQ8KDotRowForTest(weight_row, q8_input.data(), K,
+                                                                                 &reference));
+            ASSERT_TRUE(densecore::testing::RunQ5KQ8KBatchedGemvRowForTest(
+                weight_row, q8_input.data(), q8_row_bytes, 1, K, &candidate));
+            EXPECT_NEAR(candidate, reference, std::max(1e-5f, std::fabs(reference) * 1e-5f))
+                << "K=" << K << " row=" << row;
+        }
     }
 }
 

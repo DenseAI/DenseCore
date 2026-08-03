@@ -273,7 +273,8 @@ TEST(ChatTemplateTest, Qwen36ExplicitOverrideDisablesThinking) {
     EXPECT_EQ(wrapped,
               "<|im_start|>user\n"
               "hello<|im_end|>\n"
-              "<|im_start|>assistant\n");
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
 }
 
 TEST(ChatTemplateTest, Qwen36DisableDoesNotInjectNoThinkDirective) {
@@ -473,6 +474,11 @@ TEST(ChatTemplateTest, QwenNoThinkingPromptSuppressesReasoningTags) {
     const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
     EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
     EXPECT_TRUE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, wrapped));
+    EXPECT_EQ(wrapped,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
     unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
 }
 
@@ -515,7 +521,7 @@ TEST(CanonicalChatRenderTest, QwenCanonicalRendererMatchesChatMLPrompt) {
               "<think>\n\n</think>\n\n");
 }
 
-TEST(CanonicalChatRenderTest, Qwen36DisableInjectsNoThinkDirective) {
+TEST(CanonicalChatRenderTest, Qwen36NoThinkingMatchesEmbeddedTemplateCue) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
     model.variant = ModelVariant::QWEN36;
@@ -535,7 +541,8 @@ TEST(CanonicalChatRenderTest, Qwen36DisableInjectsNoThinkDirective) {
     EXPECT_EQ(rendered,
               "<|im_start|>user\n"
               "hello<|im_end|>\n"
-              "<|im_start|>assistant\n");
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
 }
 
 TEST(CanonicalChatRenderTest, Qwen36ThinkingUsesOfficialPromptWithoutReasoningDirective) {

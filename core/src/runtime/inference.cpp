@@ -115,6 +115,9 @@ bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gat
                                             const float* input_data, const uint8_t* qinput_data,
                                             size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
                                             int64_t input_cols, int numa_node, bool allow_parallel);
+bool RunQ4KPrepackedMoEFusedSwiGLUTileRange(const void* fused_weight_ptr, const uint8_t* qinput_data,
+                                             float* output_data, int64_t cols, int64_t input_cols,
+                                             int tile_start, int tile_end);
 bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
                                    size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
                                    int numa_node, bool allow_parallel);
@@ -126,6 +129,9 @@ bool RunMoEKQuantRawBatchedFusedSwiGLU(CpuBackend* backend, int ggml_type_id, co
                                        float* out_data, int64_t M, int64_t N, int64_t K, int numa_node,
                                        bool allow_parallel);
 }  // namespace densecore
+
+static inline bool ComputeQ5KQ8KBatchedRow(const void* weight_row, const uint8_t* quant_input_base,
+                                           size_t quant_row_stride, int M, int N, float* out_sums);
 
 #include "runtime/inference_graph_support.inl"
 

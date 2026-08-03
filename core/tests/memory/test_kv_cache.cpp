@@ -486,6 +486,93 @@ TEST_F(BlockManagerTest, PrefixCachingWithVerification) {
     EXPECT_EQ(manager->GetRefCount(block_id), 0);  // Now fully freed
 }
 
+TEST_F(BlockManagerTest, PrefixResidencyRetainsIdleBlockWithoutMarkingItShared) {
+    std::vector<int> tokens(BLOCK_SIZE);
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        tokens[i] = 2000 + i;
+    }
+
+    const int block_id = manager->AllocateSingle();
+    ASSERT_GE(block_id, 0);
+    const uint64_t hash = BlockManager::ComputeTokenHash(tokens.data(), BLOCK_SIZE);
+    manager->RegisterPrefixBlockWithTokens(block_id, hash, tokens.data(), BLOCK_SIZE);
+
+    EXPECT_EQ(manager->GetRefCount(block_id), 1);
+    EXPECT_FALSE(manager->IsShared(block_id));
+
+    manager->FreeSingle(block_id);
+    EXPECT_EQ(manager->GetRefCount(block_id), 0);
+    EXPECT_EQ(manager->GetFreeBlockCount(), 31);
+
+    const int cached_id = manager->FindCachedBlockWithVerification(hash, tokens.data(), BLOCK_SIZE);
+    EXPECT_EQ(cached_id, block_id);
+    EXPECT_EQ(manager->GetRefCount(block_id), 1);
+    EXPECT_FALSE(manager->IsShared(block_id));
+
+    manager->FreeSingle(block_id);
+    EXPECT_EQ(manager->GetRefCount(block_id), 0);
+
+    manager->UnregisterPrefixBlock(block_id);
+    EXPECT_EQ(manager->GetFreeBlockCount(), 32);
+    EXPECT_EQ(manager->FindCachedBlockWithVerification(hash, tokens.data(), BLOCK_SIZE), -1);
+}
+
+TEST_F(BlockManagerTest, AllocateSingleEvictsIdleResidentPrefixBlockUnderPressure) {
+    BlockManager tight_manager(1, BLOCK_SIZE);
+    std::vector<int> tokens(BLOCK_SIZE);
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        tokens[i] = 2100 + i;
+    }
+
+    const int block_id = tight_manager.AllocateSingle();
+    ASSERT_EQ(block_id, 0);
+    const uint64_t hash = BlockManager::ComputeTokenHash(tokens.data(), BLOCK_SIZE);
+    tight_manager.RegisterPrefixBlockWithTokens(block_id, hash, tokens.data(), BLOCK_SIZE);
+    tight_manager.FreeSingle(block_id);
+
+    EXPECT_EQ(tight_manager.GetRefCount(block_id), 0);
+    EXPECT_EQ(tight_manager.GetFreeBlockCount(), 0);
+    EXPECT_EQ(tight_manager.FindCachedBlockWithVerification(hash, tokens.data(), BLOCK_SIZE), block_id);
+    tight_manager.FreeSingle(block_id);
+
+    const int reclaimed = tight_manager.AllocateSingle();
+    EXPECT_EQ(reclaimed, block_id);
+    EXPECT_EQ(tight_manager.FindCachedBlockWithVerification(hash, tokens.data(), BLOCK_SIZE), -1);
+    EXPECT_EQ(tight_manager.GetRefCount(block_id), 1);
+}
+
+TEST_F(BlockManagerTest, ReplacingHashEntryReleasesPreviousIdleResidentBlock) {
+    std::vector<int> tokens_a(BLOCK_SIZE);
+    std::vector<int> tokens_b(BLOCK_SIZE);
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        tokens_a[i] = 2200 + i;
+        tokens_b[i] = 2300 + i;
+    }
+
+    const int block_a = manager->AllocateSingle();
+    const int block_b = manager->AllocateSingle();
+    ASSERT_GE(block_a, 0);
+    ASSERT_GE(block_b, 0);
+
+    const uint64_t shared_hash = 0xabc12345ULL;
+    manager->RegisterPrefixBlockWithTokens(block_a, shared_hash, tokens_a.data(), BLOCK_SIZE);
+    manager->FreeSingle(block_a);
+    EXPECT_EQ(manager->GetRefCount(block_a), 0);
+
+    manager->RegisterPrefixBlockWithTokens(block_b, shared_hash, tokens_b.data(), BLOCK_SIZE);
+
+    EXPECT_EQ(manager->FindCachedBlockWithVerification(shared_hash, tokens_a.data(), BLOCK_SIZE), -1);
+    EXPECT_EQ(manager->FindCachedBlockWithVerification(shared_hash, tokens_b.data(), BLOCK_SIZE), block_b);
+    manager->FreeSingle(block_b);
+
+    EXPECT_EQ(manager->GetFreeBlockCount(), 31);
+    EXPECT_EQ(manager->GetRefCount(block_a), 0);
+    const std::vector<int> reclaimed = manager->Allocate(31);
+    EXPECT_EQ(reclaimed.size(), 31u);
+    EXPECT_NE(std::find(reclaimed.begin(), reclaimed.end(), block_a), reclaimed.end());
+    EXPECT_EQ(std::find(reclaimed.begin(), reclaimed.end(), block_b), reclaimed.end());
+}
+
 TEST_F(BlockManagerTest, PrefixCachingProgressivelyExtendsFullPromptBlocks) {
     std::vector<int> prompt_a(BLOCK_SIZE);
     std::vector<int> prompt_b(BLOCK_SIZE);

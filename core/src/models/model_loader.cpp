@@ -1115,7 +1115,8 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
     if (!arm_hybrid_ssm) {
         for (auto& layer : model->layers) {
             for (const auto& item : layer.tensors) {
-                if (model->arch_flags.is_hybrid_ssm && model->variant == ModelVariant::QWEN35 &&
+                if (model->arch_flags.is_hybrid_ssm &&
+                    (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
                     (item.first.find("ffn_gate_exps") != std::string::npos ||
                      item.first.find("ffn_up_exps") != std::string::npos)) {
                     continue;
@@ -1317,6 +1318,7 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
                                 "AMX");
     allocate_and_commit_aliases(pending_cpu_repack, model->ctx_cpu_repack, pending_fused_cpu_repack,
                                 repack_bufts.cpu_repack, "CPU_REPACK");
+
     size_t plain_fused_count = 0;
     size_t plain_fused_bytes = 0;
     for (auto& item : pending_plain_cpu_fused) {
@@ -5725,6 +5727,7 @@ static void MoveBufferPagesToNumaNode(void* base, size_t bytes, int target_node,
     std::vector<int> nodes(pages.size(), target_node);
     std::vector<int> status(pages.size(), -1);
 
+    size_t verified_pages = 0;
     for (size_t batch_start = 0; batch_start < num_pages; batch_start += kBatch) {
         const size_t batch_size = std::min(kBatch, num_pages - batch_start);
         for (size_t i = 0; i < batch_size; i++) {
@@ -5739,14 +5742,18 @@ static void MoveBufferPagesToNumaNode(void* base, size_t bytes, int target_node,
         }
         for (size_t i = 0; i < batch_size; i++) {
             if (status[i] == target_node) {
+                verified_pages++;
                 if (stats) stats->pages_moved++;
             } else if (status[i] < 0 && stats) {
                 stats->pages_failed++;
             }
         }
     }
+    // Report only what move_pages confirmed on the target node. Charging the
+    // full range here would make the "[Distribution: ...]" line show a perfect
+    // split even when every migration failed.
     if (stats && target_node < static_cast<int>(stats->bytes_per_node.size())) {
-        stats->bytes_per_node[static_cast<size_t>(target_node)] += end - start;
+        stats->bytes_per_node[static_cast<size_t>(target_node)] += verified_pages * static_cast<size_t>(page_size);
     }
 }
 #else

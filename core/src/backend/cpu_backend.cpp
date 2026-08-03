@@ -422,6 +422,13 @@ public:
     }
 };
 
+namespace {
+// Defined below with the other NUMA helpers; declared here because
+// CpuThreadManager::RunOnNumaNode uses it to skip a pointless handoff when the
+// caller already runs on the target node.
+int DetectCurrentNumaNodeHint();
+}  // namespace
+
 class CpuBackend::CpuThreadManager {
 public:
     CpuThreadManager() {
@@ -504,11 +511,37 @@ public:
         dispatch_busy_.store(false, std::memory_order_release);
     }
 
+    /**
+     * Run `task` with the calling thread's compute affinity biased toward
+     * `numa_node`, without ever serializing concurrent callers.
+     *
+     * This is called from inside an already-parallel region: the native MoE ops
+     * run with ggml's full task width (16 tasks on a 16-core host) and each task
+     * dispatches per expert. The previous implementation took a per-node mutex
+     * and handed the body to a single pinned helper thread, which collapsed that
+     * entire 16-way region onto one thread per node -- every caller but one sat
+     * blocked on the mutex. Node locality is worth having, but never at the cost
+     * of the outer parallelism, so the order of preference is:
+     *
+     *   1. caller is already on the target node -> run inline, zero cost
+     *   2. the node's helper is idle            -> hand off, gaining locality
+     *   3. otherwise                            -> run inline rather than queue
+     *
+     * The handoff stays synchronous (Post then Wait), so buffers owned by the
+     * calling thread -- including the thread_local scratch that W2 tripped over
+     * -- remain alive for the duration of the task.
+     */
     void RunOnNumaNode(int numa_node, const std::function<void()>& task) {
         if (!task) {
             return;
         }
         if (numa_node < 0 || numa_node >= GetNumaNodeCount()) {
+            task();
+            return;
+        }
+        // Already node-local: a handoff would only add a context-switch pair and
+        // bounce the freshly written scratch buffers to another core.
+        if (DetectCurrentNumaNodeHint() == numa_node) {
             task();
             return;
         }
@@ -525,7 +558,13 @@ public:
             helper = pinned_node_helpers_[static_cast<size_t>(numa_node)].get();
             dispatch_mutex = pinned_node_mutexes_[static_cast<size_t>(numa_node)].get();
         }
-        std::lock_guard<std::mutex> dispatch_lock(*dispatch_mutex);
+        std::unique_lock<std::mutex> dispatch_lock(*dispatch_mutex, std::try_to_lock);
+        if (!dispatch_lock.owns_lock()) {
+            // The helper is busy with another caller. Waiting for it would
+            // serialize this parallel region; running here costs only locality.
+            task();
+            return;
+        }
         std::function<void(int)> wrapped = [&task](int) { task(); };
         helper->Post(&wrapped);
         helper->Wait();
@@ -548,7 +587,7 @@ private:
                     lock.unlock();
                     (*task)(node_);
                     lock.lock();
-                    done_ = true;
+                    done_.store(true, std::memory_order_release);
                     cv_.notify_all();
                 }
             });
@@ -569,14 +608,27 @@ private:
             std::lock_guard<std::mutex> lock(mutex_);
             task_ = task;
             pending_ = true;
-            done_ = false;
-            cv_.notify_all();
-        }
+                done_.store(false, std::memory_order_release);
+                cv_.notify_all();
+            }
 
-        void Wait() {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] { return done_; });
-        }
+            void Wait() {
+                constexpr int kCompletionSpinIterations = 5000;
+                for (int spin = 0; spin < kCompletionSpinIterations; ++spin) {
+                    if (done_.load(std::memory_order_acquire)) {
+                        return;
+                    }
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+                    _mm_pause();
+#elif defined(__aarch64__)
+                    __asm__ volatile("yield");
+#else
+                    std::this_thread::yield();
+#endif
+                }
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return done_.load(std::memory_order_acquire); });
+            }
 
     private:
         const int node_;
@@ -585,7 +637,7 @@ private:
         std::condition_variable cv_;
         const std::function<void(int)>* task_ = nullptr;
         bool pending_ = false;
-        bool done_ = false;
+            std::atomic<bool> done_{false};
         bool stop_ = false;
     };
 
@@ -761,7 +813,9 @@ void UpdateBackendThreads(int n_threads) {
     auto& backend = GetCpuBackend();
     int numa_count = backend.GetNumaNodeCount();
     for (int i = 0; i < numa_count; ++i) {
-        backend.GetThreadPool(i).Configure(n_threads);
+        const int local_physical_cores = HardwareTopology::GetInstance().GetPhysicalCoreCount(i);
+        const int local_threads = local_physical_cores > 0 ? std::min(n_threads, local_physical_cores) : n_threads;
+        backend.GetThreadPool(i).Configure(local_threads);
     }
 }
 

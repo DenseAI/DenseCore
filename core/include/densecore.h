@@ -1109,7 +1109,7 @@ typedef enum {
  */
 typedef struct {
     const char* name;                   ///< Tensor name (e.g., "image", "audio_mel")
-    const void* data;                   ///< Pointer to tensor data (must remain valid during execution)
+    const void* data;                   ///< Pointer to host tensor data copied during submission
     int ndim;                           ///< Number of dimensions (1-4)
     int64_t shape[DENSECORE_MAX_DIMS];  ///< Shape array [dim0, dim1, dim2, dim3]
     DenseCoreDType dtype;               ///< Data type
@@ -1130,7 +1130,7 @@ typedef struct {
  * @brief Callback for graph execution completion
  *
  * @param outputs Array of output tensors
- * @param num_outputs Number of outputs
+ * @param num_outputs Number of outputs, or a negative DenseCoreStatus on failure
  * @param user_data User-provided pointer
  */
 typedef void (*GraphResultCallback)(const DenseCoreTensorOutput* outputs, int num_outputs, void* user_data);
@@ -1155,7 +1155,10 @@ typedef void (*GraphResultCallback)(const DenseCoreTensorOutput* outputs, int nu
  * @return Request ID (positive integer) on success, or negative error code
  *
  * @note Thread-safety: thread-safe for concurrent calls on the same handle.
- * @note Ownership: Input data pointers must remain valid until callback is invoked.
+ * @note Ownership: Input names, descriptors, and host data are copied before this function returns.
+ *       Output pointers are valid only for the duration of the callback.
+ * @note Failure: Accepted requests complete exactly once. On asynchronous execution failure,
+ *       callback is invoked with outputs=NULL and num_outputs set to a negative DenseCoreStatus.
  *
  * Example (Vision Encoder):
  * @code

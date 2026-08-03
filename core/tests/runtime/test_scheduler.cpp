@@ -275,6 +275,62 @@ TEST(SchedulerArchitecture, PrefixCacheHitRequiresExplicitPrefixTokens) {
     block_manager.FreeSingle(block_id);
 }
 
+TEST(SchedulerArchitecture, InitialHybridPrefillStopsAtRestorablePrefixBoundary) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = true;
+    cfg.max_prefill_tokens = 256;
+
+    BlockManager block_manager(/*num_blocks=*/256, BLOCK_SIZE);
+    Scheduler scheduler(&block_manager, cfg);
+
+    std::vector<int> prompt(2 * BLOCK_SIZE + 5, 42);
+    const int seq = scheduler.AddRequest(/*request_id=*/3, static_cast<int>(prompt.size()),
+                                         /*max_output_len=*/8, /*priority=*/0, &prompt,
+                                         /*allow_chunked_prefill=*/true,
+                                         /*require_hybrid_ssm_prefix_snapshot=*/true);
+    ASSERT_GE(seq, 0);
+
+    SchedulerOutput first = scheduler.Schedule();
+    ASSERT_EQ(first.prefill_chunk_info.size(), 1u);
+    EXPECT_EQ(first.prefill_chunk_info[0].chunk_tokens, 2 * BLOCK_SIZE);
+
+    scheduler.OnPrefillChunkComplete(seq, 2 * BLOCK_SIZE, /*prefill_finished=*/false);
+    SchedulerOutput second = scheduler.Schedule();
+    ASSERT_EQ(second.prefill_chunk_info.size(), 1u);
+    EXPECT_EQ(second.prefill_chunk_info[0].chunk_tokens, 5);
+}
+
+TEST(SchedulerArchitecture, InitialPrefillAlignmentRequiresHybridPrefixCaching) {
+    SchedulerConfig cfg = MakeTestConfig();
+    cfg.enable_chunked_prefill = true;
+    cfg.max_prefill_tokens = 256;
+
+    const std::vector<int> prompt(2 * BLOCK_SIZE + 5, 42);
+
+    BlockManager no_cache_blocks(/*num_blocks=*/256, BLOCK_SIZE);
+    Scheduler no_cache(&no_cache_blocks, cfg);
+    const int no_cache_seq = no_cache.AddRequest(/*request_id=*/4, static_cast<int>(prompt.size()),
+                                                  /*max_output_len=*/8, /*priority=*/0,
+                                                  /*prefix_tokens=*/nullptr,
+                                                  /*allow_chunked_prefill=*/true,
+                                                  /*require_hybrid_ssm_prefix_snapshot=*/true);
+    ASSERT_GE(no_cache_seq, 0);
+    SchedulerOutput no_cache_first = no_cache.Schedule();
+    ASSERT_EQ(no_cache_first.prefill_chunk_info.size(), 1u);
+    EXPECT_EQ(no_cache_first.prefill_chunk_info[0].chunk_tokens, static_cast<int>(prompt.size()));
+
+    BlockManager stateless_blocks(/*num_blocks=*/256, BLOCK_SIZE);
+    Scheduler stateless(&stateless_blocks, cfg);
+    const int stateless_seq = stateless.AddRequest(/*request_id=*/5, static_cast<int>(prompt.size()),
+                                                    /*max_output_len=*/8, /*priority=*/0, &prompt,
+                                                    /*allow_chunked_prefill=*/true,
+                                                    /*require_hybrid_ssm_prefix_snapshot=*/false);
+    ASSERT_GE(stateless_seq, 0);
+    SchedulerOutput stateless_first = stateless.Schedule();
+    ASSERT_EQ(stateless_first.prefill_chunk_info.size(), 1u);
+    EXPECT_EQ(stateless_first.prefill_chunk_info[0].chunk_tokens, static_cast<int>(prompt.size()));
+}
+
 TEST(SchedulerArchitecture, MoEClusteringIsOptInByDefault) {
     SchedulerConfig cfg;
     EXPECT_FALSE(cfg.enable_moe_clustering);

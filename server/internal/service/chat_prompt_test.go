@@ -211,7 +211,7 @@ func TestFormatChatPromptQwen36NoThinkingUsesOfficialPromptWithoutDirective(t *t
 	if strings.Contains(prompt, "/no_think") {
 		t.Fatalf("expected qwen3.6 no-thinking prompt to avoid /no_think, got %q", prompt)
 	}
-	if prompt != "<|im_start|>user\n안녕?<|im_end|>\n<|im_start|>assistant\n" {
+	if prompt != "<|im_start|>user\n안녕?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n" {
 		t.Fatalf("unexpected qwen3.6 no-thinking prompt: %q", prompt)
 	}
 }

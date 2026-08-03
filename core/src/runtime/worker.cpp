@@ -264,7 +264,7 @@ bool IsPrefillGraphCacheSafeForCurrentBatch(const TransformerModel* model, const
     }
     const auto descriptor = densecore::models::DescribeModel(model);
     const bool qwen_hybrid = descriptor.variant == ModelVariant::QWEN35 || descriptor.variant == ModelVariant::QWEN36;
-    if (!qwen_hybrid || IsHybridSSMPrefillGraphCacheDebugProbeEnabled()) {
+    if (!qwen_hybrid || model->hparams.n_experts > 0 || IsHybridSSMPrefillGraphCacheDebugProbeEnabled()) {
         return false;
     }
     return !batch.skip_output_logits && batch.num_seqs == 1 && batch.hybrid_ssm_runtime_states.size() == 1 &&
@@ -941,6 +941,19 @@ int SelectLargestModelPrefillChunkThatFitsForTest(const TransformerModel* model,
                                                   current_chunk_tokens);
 }
 
+bool IsPrefillGraphCacheSafeForCurrentBatchForTest(const TransformerModel* model, const BatchSpec& batch) {
+    return IsPrefillGraphCacheSafeForCurrentBatch(model, batch);
+}
+
+size_t IncludeGgmlGraphObjectMetadataForTest(size_t target_bytes) {
+    return IncludeGgmlGraphObjectMetadata(target_bytes);
+}
+
+int ResolveRecurrentPrefixSnapshotPrefillTokensForTest(const TransformerModel* model, bool prefix_cache_allowed,
+                                                        int n_past, int requested_tokens) {
+    return ResolveRecurrentPrefixSnapshotPrefillTokens(model, prefix_cache_allowed, n_past, requested_tokens);
+}
+
 // Worker Loop (Continuous Batching) - Uses Scheduler for batch formation
 void EngineLoop(EngineState* state) {
     struct WorkContextBinder {
@@ -1034,6 +1047,17 @@ void EngineLoop(EngineState* state) {
         }
         // Tracks the configured thread count for the CPU backend handle only.
         int last_set_threads = -1;
+        if (!state->ggml_compute_threadpool) {
+            ggml_threadpool_params threadpool_params = ggml_threadpool_params_default(n_threads);
+            state->ggml_compute_threadpool = ggml_threadpool_new(&threadpool_params);
+            if (!state->ggml_compute_threadpool) {
+                throw std::runtime_error("Failed to create persistent GGML compute thread pool");
+            }
+            state->ggml_compute_threadpool_threads = n_threads;
+            LOG_INFO("GGML persistent compute thread pool configured: {} threads", n_threads);
+        } else if (state->ggml_compute_threadpool_threads < n_threads) {
+            throw std::runtime_error("Persistent GGML compute thread pool is smaller than the configured thread count");
+        }
         if (!arm_compute_affinity.core_ids.empty()) {
             LOG_INFO("GGML backend configured: {} threads (ARM cluster policy: {})", n_threads,
                      arm_compute_affinity.label);
@@ -1069,8 +1093,14 @@ void EngineLoop(EngineState* state) {
                 topo.SetupComputeThreadAffinityFromCoreIds(arm_compute_affinity.core_ids, n_threads,
                                                            densecore::PinningPolicy::SCATTER);
             } else {
-                int target_node = (state->numa_node_id >= 0) ? state->numa_node_id : 0;
-                int physical_cores = topo.GetPhysicalCoreCount(target_node);
+                // Pass numa_node_id through unchanged. Coercing the "no node
+                // requested" sentinel (-1) to node 0 here used to confine the whole
+                // compute pool to one socket: n_threads is sized from the
+                // machine-wide physical core count above, so on a 2-socket host all
+                // of those threads were pinned onto node 0's cores -- two threads
+                // per core -- while the other socket idled through every decode.
+                const int target_node = state->numa_node_id;
+                const int physical_cores = topo.GetPhysicalCoreCount(target_node);
 
                 if (n_threads > 0 && physical_cores > 0) {
                     // Use simple SCATTER policy - spread threads across all physical cores
@@ -1385,6 +1415,11 @@ void EngineLoop(EngineState* state) {
                     // Check if cancelled before even starting
                     if (req->cancelled.load(std::memory_order_relaxed)) {
                         LOG_INFO("Skipping cancelled request: {}", req->id);
+                        if (req->is_graph_execution) {
+                            req->finished = true;
+                            state->metrics.failed_requests++;
+                            CompleteGraphRequest(req, nullptr, DENSECORE_STATUS_ENGINE_STOPPED);
+                        }
                         state->request_pool.Release(req);
                         continue;
                     }
@@ -1396,29 +1431,24 @@ void EngineLoop(EngineState* state) {
                     if (req->is_graph_execution) {
                         LOG_INFO("Worker processing graph request: {}", req->graph_name);
 
+                        bool graph_succeeded = false;
                         try {
                             // 1. Get Graph Builder
                             auto builder = densecore::GraphRegistry::Instance().GetBuilder(req->graph_name);
                             if (!builder) {
-                                throw std::runtime_error("Graph builder not found for architecture: " +
-                                                         req->graph_name);
+                                throw densecore::OperationNotSupportedException("graph builder not found for " +
+                                                                                req->graph_name);
                             }
 
-                            // 2. Wrap Inputs (Zero-Copy)
+                            // 2. Wrap request-owned inputs without another worker-side copy.
                             std::vector<densecore::Tensor> input_tensors;
                             input_tensors.reserve(req->graph_inputs.size());
 
-                            for (const auto& in : req->graph_inputs) {
+                            for (auto& in : req->graph_inputs) {
                                 std::vector<int64_t> shape;
                                 for (int i = 0; i < in.ndim; ++i) shape.push_back(in.shape[i]);
 
-                                // Create tensor wrapping external data (zero-copy)
-                                // Note: const_cast is safe here because:
-                                // 1. Graph building only reads input tensor metadata (shape, dtype)
-                                // 2. Graph execution reads input data but never writes to it
-                                // 3. Tensor::Wrap is designed for both input (read-only) and output (mutable) buffers
-                                // The underlying data is treated as immutable during the entire inference pipeline.
-                                densecore::Tensor t = densecore::Tensor::Wrap(const_cast<void*>(in.data), shape,
+                                densecore::Tensor t = densecore::Tensor::Wrap(in.bytes.data(), shape,
                                                                               static_cast<densecore::DType>(in.dtype));
                                 input_tensors.push_back(std::move(t));
                             }
@@ -1426,7 +1456,7 @@ void EngineLoop(EngineState* state) {
                             // 3. Build Graph
                             auto graph = builder->Build(input_tensors, req->graph_name);
                             if (!graph) {
-                                throw std::runtime_error("Graph build failed");
+                                throw densecore::GraphBuildException(req->graph_name);
                             }
 
                             // 4. Execute Graph
@@ -1490,16 +1520,26 @@ void EngineLoop(EngineState* state) {
                             }
 
                             // 6. Invoke Callback
-                            if (req->graph_callback) {
-                                req->graph_callback(outputs.data(), outputs.size(), req->user_data);
-                            }
+                            CompleteGraphRequest(req, outputs.data(), static_cast<int>(outputs.size()));
+                            graph_succeeded = true;
 
+                        } catch (const densecore::DenseCoreException& e) {
+                            LOG_ERROR("Graph execution error: {}", e.what());
+                            CompleteGraphRequest(req, nullptr, MapErrorCodeToStatus(e.Code()));
                         } catch (const std::exception& e) {
                             LOG_ERROR("Graph execution error: {}", e.what());
+                            CompleteGraphRequest(req, nullptr, DENSECORE_STATUS_INTERNAL_ERROR);
+                        } catch (...) {
+                            LOG_ERROR("Graph execution error: unknown exception");
+                            CompleteGraphRequest(req, nullptr, DENSECORE_STATUS_INTERNAL_ERROR);
                         }
 
                         req->finished = true;
-                        state->metrics.completed_requests++;
+                        if (graph_succeeded) {
+                            state->metrics.completed_requests++;
+                        } else {
+                            state->metrics.failed_requests++;
+                        }
                         state->request_pool.Release(req);
                         continue;
                     }
@@ -1686,8 +1726,15 @@ void EngineLoop(EngineState* state) {
                                  "cached_tokens={} cached_blocks={}",
                                  single_req->id, prefix_probe.cached_tokens, prefix_probe.cached_block_ids.size());
                     } else {
+                        const int requested_tokens = single_req->is_prefill
+                                                         ? static_cast<int>(single_req->tokens.size())
+                                                         : 1;
                         const int tokens_to_process =
-                            single_req->is_prefill ? static_cast<int>(single_req->tokens.size()) : 1;
+                            single_req->is_prefill
+                                ? ResolveRecurrentPrefixSnapshotPrefillTokens(
+                                      current_model, single_req->prefix_cache_allowed, single_req->n_past,
+                                      requested_tokens)
+                                : requested_tokens;
                         if (tokens_to_process > 0) {
                             const int blocks_needed =
                                 (single_req->n_past + tokens_to_process + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -2853,6 +2900,7 @@ void EngineLoop(EngineState* state) {
                 // non-CPU backend is selected, touching CPU thread state is irrelevant
                 // and can desynchronize bookkeeping.
                 if (!cpu_backend_active) return;
+                ggml_backend_cpu_set_threadpool(cpu_backend_handle, state->ggml_compute_threadpool);
                 if (active_threads != last_set_threads) {
                     ggml_backend_cpu_set_n_threads(cpu_backend_handle, active_threads);
                     last_set_threads = active_threads;
@@ -2897,6 +2945,9 @@ void EngineLoop(EngineState* state) {
                     std::max<size_t>(64ULL * MB, std::max(prefill_graph_ctx_bytes / 32,
                                                           graph_ctx_estimate.long_context_safety_pad_bytes / 4));
                 prefill_graph_ctx_bytes = AlignUpBytes(prefill_graph_ctx_bytes + object_pool_margin, 64ULL * MB);
+            }
+            if (prefill_graph_ctx_bytes > 0) {
+                prefill_graph_ctx_bytes = IncludeGgmlGraphObjectMetadata(prefill_graph_ctx_bytes);
             }
             bool decode_single_token_layout = !is_embedding_batch && !is_prefill_batch && batch.num_seqs > 0 &&
                                               batch.num_seqs <= decode_graph_cache_max_batch &&
@@ -3608,6 +3659,7 @@ void EngineLoop(EngineState* state) {
                                 }
                             }
                         }
+                        ctx_size = IncludeGgmlGraphObjectMetadata(ctx_size);
                         const bool graph_pool_shrink_allowed =
                             IsFlexibleGraphPoolSizingEnabled(current_model) && is_decode_batch && used_flexible_sizing;
                         const bool graph_pool_oversized =
@@ -6132,47 +6184,51 @@ void EngineLoop(EngineState* state) {
                         state->scheduler->OnDecodeStepComplete(req->seq_id, processed_count);
                         req->pending_scheduler_progress = 0;
                     };
+                    auto register_completed_prefix_blocks = [&]() {
+                        if (!prefix_cache_allowed || req->sequence_tokens_for_prefix_cache.empty() ||
+                            req->block_table.empty() || req->n_past <= 0) {
+                            return;
+                        }
+
+                        const int completed_blocks =
+                            std::min(req->n_past / BLOCK_SIZE, static_cast<int>(req->block_table.size()));
+                        const int total_tokens = static_cast<int>(req->sequence_tokens_for_prefix_cache.size());
+                        int registered_through = req->registered_prefix_blocks;
+                        for (int blk_idx = req->registered_prefix_blocks; blk_idx < completed_blocks; ++blk_idx) {
+                            const int start_token = blk_idx * BLOCK_SIZE;
+                            if (start_token + BLOCK_SIZE > total_tokens) {
+                                break;
+                            }
+
+                            const int block_id = req->block_table[static_cast<size_t>(blk_idx)];
+                            const int* block_tokens = req->sequence_tokens_for_prefix_cache.data() + start_token;
+                            const uint64_t hash = BlockManager::ComputeTokenHash(block_tokens, BLOCK_SIZE);
+                            const bool attach_hybrid_snapshot =
+                                ModelRequiresPrefixStateSnapshot(current_model) &&
+                                ((blk_idx + 1) * BLOCK_SIZE == req->n_past);
+                            if (attach_hybrid_snapshot) {
+                                DebugLogHybridSSMSnapshot("save", req->id, req->n_past, block_id,
+                                                          req->ssm_runtime_states);
+                            }
+                            current_kv_cache->block_manager->RegisterPrefixBlockWithTokens(
+                                block_id, hash, block_tokens, BLOCK_SIZE,
+                                attach_hybrid_snapshot ? &req->ssm_runtime_states : nullptr);
+                            req->prefix_cache_registered_blocks++;
+                            if (blk_idx >= req->prefix_cache_hit_blocks) {
+                                req->prefix_cache_extended_blocks++;
+                            }
+                            registered_through = blk_idx + 1;
+                        }
+                        req->registered_prefix_blocks = std::max(req->registered_prefix_blocks, registered_through);
+                    };
                     if (req->is_prefill) {
                         const int remaining_prompt_tokens = static_cast<int>(req->tokens.size());
                         req->n_past += processed_count;
                         req->empty_schedule_stall_count = 0;
                         req->last_progress_time = std::chrono::steady_clock::now();
 
-                        // Register any newly completed full blocks immediately after
-                        // this prefill chunk so prefix reuse can restore the exact
-                        // hybrid SSM boundary state for the latest completed block.
-                        if (prefix_cache_allowed && !req->original_prompt_tokens_for_cache.empty() &&
-                            !req->block_table.empty() && req->n_past > 0) {
-                            const int* tokens_ptr = req->original_prompt_tokens_for_cache.data();
-                            int total_tokens = static_cast<int>(req->original_prompt_tokens_for_cache.size());
-                            const int completed_blocks =
-                                std::min(req->n_past / BLOCK_SIZE, static_cast<int>(req->block_table.size()));
-
-                            for (int blk_idx = req->registered_prefix_blocks; blk_idx < completed_blocks; ++blk_idx) {
-                                int block_id = req->block_table[static_cast<size_t>(blk_idx)];
-                                int start_token = blk_idx * BLOCK_SIZE;
-                                int block_tokens = std::min(BLOCK_SIZE, total_tokens - start_token);
-                                if (block_tokens != BLOCK_SIZE) {
-                                    break;
-                                }
-
-                                uint64_t hash = BlockManager::ComputeTokenHash(tokens_ptr + start_token, block_tokens);
-                                const bool attach_hybrid_snapshot = ModelRequiresPrefixStateSnapshot(current_model) &&
-                                                                    ((blk_idx + 1) * BLOCK_SIZE == req->n_past);
-                                if (attach_hybrid_snapshot) {
-                                    DebugLogHybridSSMSnapshot("save", req->id, req->n_past, block_id,
-                                                              req->ssm_runtime_states);
-                                }
-                                current_kv_cache->block_manager->RegisterPrefixBlockWithTokens(
-                                    block_id, hash, tokens_ptr + start_token, block_tokens,
-                                    attach_hybrid_snapshot ? &req->ssm_runtime_states : nullptr);
-                                req->prefix_cache_registered_blocks++;
-                                if (blk_idx >= req->prefix_cache_hit_blocks) {
-                                    req->prefix_cache_extended_blocks++;
-                                }
-                            }
-                            req->registered_prefix_blocks = std::max(req->registered_prefix_blocks, completed_blocks);
-                        }
+                        // Only the terminal completed block can own this exact recurrent-state snapshot.
+                        register_completed_prefix_blocks();
 
                         // Chunked prefill in progress: continue prefill without sampling.
                         if (processed_count < remaining_prompt_tokens) {
@@ -6297,6 +6353,8 @@ void EngineLoop(EngineState* state) {
                     NoteDecodeSampleProgress(req, decode_sample_time, best_token);
                     bool terminal_error_emitted = false;
 
+                    const int processed_decode_input_token =
+                        !was_prefill_step && processed_count == 1 && req->tokens.size() == 1 ? req->tokens.front() : -1;
                     req->tokens.clear();
                     req->tokens.push_back(best_token);
                     req->generated_count++;
@@ -6410,6 +6468,13 @@ void EngineLoop(EngineState* state) {
                     // the next decode iteration.
                     if (!was_prefill_step) {
                         req->n_past += processed_count;
+                        if (processed_decode_input_token >= 0 &&
+                            static_cast<int>(req->sequence_tokens_for_prefix_cache.size()) == req->n_past - 1) {
+                            req->sequence_tokens_for_prefix_cache.push_back(processed_decode_input_token);
+                            // Decode advances recurrent state one token at a time, so an aligned
+                            // n_past is an exact reusable snapshot boundary even for unaligned prompts.
+                            register_completed_prefix_blocks();
+                        }
                         auto now = std::chrono::steady_clock::now();
                         req->empty_schedule_stall_count = 0;
                         req->last_progress_time = now;

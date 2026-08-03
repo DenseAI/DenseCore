@@ -461,6 +461,41 @@ TEST(EngineKVCacheConfig, QwenHybridMoeLongPrefillUsesChunkShapeNotWholePromptGr
         << "32k chunked prefill should remain bounded by live memory instead of a machine-class constant";
 }
 
+TEST(EngineKVCacheConfig, QwenHybridMoePrefillAccountsForNativeW2DirectOutputScratch) {
+    ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "8192");
+    ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "1");
+    ScopedEnvVar graph_ctx_min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
+    ScopedEnvVar graph_ctx_max("DENSECORE_GRAPH_CTX_MAX_MB", nullptr);
+    ScopedEnvVar graph_ctx_available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "65536");
+    ScopedEnvVar graph_ctx_extra("DENSECORE_GRAPH_CTX_EXTRA_MB", "0");
+
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_embd = 2048;
+    model.hparams.n_layer = 40;
+    model.hparams.n_head = 8;
+    model.hparams.n_head_kv = 8;
+    model.hparams.n_experts = 256;
+    model.hparams.n_experts_used = 8;
+    model.hparams.n_ctx = 262144;
+    model.ssm_inner_size = 2048;
+
+    const auto moe = EngineState::EstimateGraphContextSize(&model, /*seq_len_hint=*/372,
+                                                            /*num_seqs_hint=*/1,
+                                                            /*chunk_token_hint=*/320);
+    model.hparams.n_experts = 0;
+    model.hparams.n_experts_used = 0;
+    const auto dense = EngineState::EstimateGraphContextSize(&model, /*seq_len_hint=*/372,
+                                                              /*num_seqs_hint=*/1,
+                                                              /*chunk_token_hint=*/320);
+
+    constexpr size_t kNativeW2ScratchBytes = 8ULL * 320ULL * 2048ULL * sizeof(float) * 40ULL;
+    EXPECT_GE(moe.hybrid_ssm_extra_bytes, dense.hybrid_ssm_extra_bytes + kNativeW2ScratchBytes);
+    EXPECT_GT(moe.total_bytes, dense.total_bytes);
+}
+
 TEST(EngineKVCacheConfig, QwenHybridMoe32kPrefillAdmissionUsesLiveMemoryEnvelope) {
     ScopedEnvVar max_seq_len("DENSECORE_MAX_SEQ_LEN", "32768");
     ScopedEnvVar max_num_seqs("DENSECORE_MAX_NUM_SEQS", "1");

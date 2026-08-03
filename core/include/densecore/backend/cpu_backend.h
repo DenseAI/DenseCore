@@ -541,6 +541,26 @@ public:
      */
     bool IsRebalanceThreadRunning() const { return rebalance_running_.load(); }
 
+#ifdef DENSECORE_TEST_BUILD
+    struct NumaRebalanceTestStats {
+        uint64_t cycles = 0;
+        uint64_t interval_decreases = 0;
+        uint64_t interval_increases = 0;
+        int current_interval_ms = 0;
+    };
+
+    using MovePagesTestHook =
+        std::function<long(size_t count, void** pages, const int* nodes, int* status)>;
+    using QueryNumaNodeRangeTestHook = std::function<int(const void* ptr, size_t size)>;
+
+    void SetNumaRebalanceTestHooks(MovePagesTestHook move_pages_hook,
+                                   QueryNumaNodeRangeTestHook query_range_hook);
+    void ClearNumaRebalanceTestHooks();
+    bool IsNumaRebalanceDisabledForTest() const { return rebalance_disabled_.load(); }
+    std::vector<int> GetLocalExpertIdsForTest(const TransformerLayer* layer_key) const;
+    NumaRebalanceTestStats GetNumaRebalanceTestStats() const;
+#endif
+
     /**
      * @brief Initialize MoE expert profiler
      *
@@ -727,6 +747,14 @@ private:
     std::atomic<bool> rebalance_stop_{false};
     std::atomic<bool> rebalance_disabled_{false};
     mutable std::mutex rebalance_mutex_;  ///< Protects page migration
+#ifdef DENSECORE_TEST_BUILD
+    MovePagesTestHook move_pages_test_hook_;
+    QueryNumaNodeRangeTestHook query_numa_node_range_test_hook_;
+    std::atomic<uint64_t> rebalance_test_cycles_{0};
+    std::atomic<uint64_t> rebalance_test_interval_decreases_{0};
+    std::atomic<uint64_t> rebalance_test_interval_increases_{0};
+    std::atomic<int> rebalance_test_current_interval_ms_{0};
+#endif
 
     // MoE Expert Registries (one per layer)
     std::unordered_map<const TransformerLayer*, std::shared_ptr<MoELayerRegistry>> moe_registries_;

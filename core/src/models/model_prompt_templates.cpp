@@ -286,6 +286,8 @@ void AppendQwenAssistantGenerationCue(const TransformerModel* model, bool thinki
     if (descriptor.variant == ModelVariant::QWEN36) {
         if (thinking_enabled) {
             out->append("<think>\n");
+        } else {
+            out->append("<think>\n\n</think>\n\n");
         }
         return;
     }
@@ -635,7 +637,7 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
             const auto& descriptor = DescribeModel(model);
             if (profile.thinking_enabled) {
                 wrapped += "<think>\n";
-            } else if (descriptor.variant == ModelVariant::QWEN35) {
+            } else if (descriptor.variant == ModelVariant::QWEN35 || descriptor.variant == ModelVariant::QWEN36) {
                 wrapped += "<think>\n\n</think>\n\n";
             }
         }

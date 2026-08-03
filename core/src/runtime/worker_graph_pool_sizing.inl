@@ -229,6 +229,26 @@ size_t DynamicGraphObjectPoolGuardBytes(const EngineState::GraphContextEstimate&
     return AlignUpBytes(guard_bytes, 64ULL * MB);
 }
 
+size_t IncludeGgmlGraphObjectMetadata(size_t target_bytes) {
+    if (target_bytes == 0) {
+        return 0;
+    }
+    constexpr size_t MB = 1024ULL * 1024ULL;
+    constexpr size_t kGraphNodeCapacity = 32768;
+    // A node can retain its output, every GGML source slot, and a view object
+    // while the graph is assembled. These are context metadata, not backend
+    // tensor data.
+    constexpr size_t kTensorObjectsPerNodeReserve = GGML_MAX_SRC + 2;
+    const size_t alignment_bytes = 64ULL * MB;
+    const size_t aligned_target_bytes = AlignUpBytes(target_bytes, alignment_bytes);
+    const size_t tensor_object_metadata_bytes =
+        kGraphNodeCapacity * kTensorObjectsPerNodeReserve * ggml_tensor_overhead();
+    const size_t graph_metadata_bytes =
+        ggml_graph_overhead_custom(kGraphNodeCapacity, false) + tensor_object_metadata_bytes;
+    const size_t aligned_graph_metadata_bytes = AlignUpBytes(graph_metadata_bytes, alignment_bytes);
+    return aligned_target_bytes + aligned_graph_metadata_bytes;
+}
+
 size_t GraphSequenceObjectPressureBytes(const EngineState::GraphContextEstimate& graph_estimate) {
     if (graph_estimate.effective_query_len <= 1 || graph_estimate.effective_seq_len <= graph_estimate.effective_query_len) {
         return 0;
@@ -395,7 +415,6 @@ FlexibleGraphPoolSizing EstimateFlexibleGraphPoolSizeWithoutDryRun(
     if (x86_qwen_chunked) {
         target_bytes += DynamicGraphObjectPoolGuardBytes(fallback_estimate, target_bytes, available_bytes);
     }
-
     const RuntimeGraphPoolReservation required_reservation =
         ClampRuntimeGraphPoolReservation(target_bytes, available_bytes);
     const RuntimeGraphPoolReservation growth_reservation =

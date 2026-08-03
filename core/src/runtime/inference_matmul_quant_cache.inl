@@ -95,6 +95,25 @@ static inline int DenseCoreQ8_0DotPacked4x8RowAVX2(const int8_t* qs, int row, co
     const __m256i acc = DenseCoreQ8_0MulSumI8PairsAccI32x8AVX2(_mm256_setzero_si256(), weight, x);
     return DenseCoreQ8_0HsumI32x8AVX2(acc);
 }
+
+static inline __m128i DenseCoreQ8_0DotPacked4x8RowsAVX2(const int8_t* qs, const int8_t* input) {
+    __m256i acc = _mm256_setzero_si256();
+    for (int chunk = 0; chunk < QK8_0 / 8; ++chunk) {
+        const __m256i weights =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs + static_cast<size_t>(chunk) * 4 * 8));
+        const __m128i input8 =
+            _mm_loadl_epi64(reinterpret_cast<const __m128i*>(input + static_cast<size_t>(chunk) * 8));
+        const __m256i inputs = _mm256_broadcastq_epi64(input8);
+        acc = DenseCoreQ8_0MulSumI8PairsAccI32x8AVX2(acc, weights, inputs);
+    }
+
+    // Each 64-bit lane contains the two i32 partials for one packed row.
+    const __m256i row_pairs = _mm256_hadd_epi32(acc, _mm256_setzero_si256());
+    const __m128i lower = _mm256_castsi256_si128(row_pairs);
+    const __m128i upper = _mm256_extracti128_si256(row_pairs, 1);
+    return _mm_setr_epi32(_mm_extract_epi32(lower, 0), _mm_extract_epi32(lower, 1),
+                          _mm_extract_epi32(upper, 0), _mm_extract_epi32(upper, 1));
+}
 #endif
 
 #if defined(DENSECORE_Q8_4X8_NEON_DOTPROD)
@@ -187,14 +206,12 @@ static void DenseCoreForEachQ8_0_4x8Q8_0DotGeneric(int n, const void* packed_wei
                 vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(scales)));
             sum_vec = vfmaq_f32(sum_vec, vcvtq_f32_s32(dots), vmulq_n_f32(row_scale, input_scale));
 #elif (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__AVX2__)
-            sum[0] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowAVX2(qs, 0, x.qs)) * row_scale[0] *
-                      input_scale;
-            sum[1] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowAVX2(qs, 1, x.qs)) * row_scale[1] *
-                      input_scale;
-            sum[2] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowAVX2(qs, 2, x.qs)) * row_scale[2] *
-                      input_scale;
-            sum[3] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowAVX2(qs, 3, x.qs)) * row_scale[3] *
-                      input_scale;
+            alignas(16) int32_t row_dots[4];
+            _mm_store_si128(reinterpret_cast<__m128i*>(row_dots),
+                            DenseCoreQ8_0DotPacked4x8RowsAVX2(qs, x.qs));
+            for (int row = 0; row < 4; ++row) {
+                sum[row] += static_cast<float>(row_dots[row]) * row_scale[row] * input_scale;
+            }
 #elif defined(DENSECORE_Q8_4X8_NEON_DOTPROD)
             sum[0] += static_cast<float>(DenseCoreQ8_0DotPacked4x8RowDotprodNeon(qs, 0, x.qs)) * row_scale[0] *
                       input_scale;

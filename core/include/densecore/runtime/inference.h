@@ -214,6 +214,53 @@ struct DecodeRuntimeStatsSnapshot {
     std::array<uint64_t, kHybridSSMDispatchWeightCount * kHybridSSMDispatchPathCount> hybrid_ssm_dispatch_counts{};
 };
 
+// Observability for MoE NUMA sticky routing on the native MoE decode path.
+//
+// The native path (RunNativeMoEOnExpertNode) is the consumer the MoE-heavy
+// models actually use; the small-decode dispatcher logs its own activation but
+// covers a different path. Without these counters there is no way to tell a
+// disabled sticky router apart from an active one, because both look identical
+// in the logs. Counters are process-cumulative, like DecodeRuntimeStatsSnapshot.
+inline constexpr std::size_t kNativeMoENumaMaxTrackedNodes = 8;
+
+// Why sticky routing is or is not active. Recorded per SetNativeMoENumaContext
+// call so a disabled router reports a cause instead of just staying silent.
+enum class NativeMoENumaStickyState : int {
+    Unset = 0,             // context never established
+    NoBackend,             // no CPU backend or layer bound
+    SingleNode,            // host has <= 1 NUMA node, nothing to route across
+    PlacementUnavailable,  // expert->node map could not be read
+    PlacementInvalid,      // at least one expert has an unknown/out-of-range node
+    Enabled,               // experts span >1 node, each valid; sticky dispatch armed
+    // Armed, but every expert landed on the SAME node of a multi-node host --
+    // the layout a default load produces, because without expert partitioning
+    // first-touch puts all expert weights on the loader thread's node. Each node
+    // id is individually valid, so this passes the same gate as Enabled and
+    // routes identically; it is split out only because pinning every MoE op to
+    // one node confines the compute to one socket, which a log line reading
+    // "enabled" hides. See NUMA_TIER0_FINDINGS.md W1-A.
+    EnabledSingleNodeDegenerate,
+    DisabledByDebug,  // explicit publication/diagnostic A/B control
+};
+
+struct NativeMoENumaStatsSnapshot {
+    uint64_t context_set_total = 0;              // SetNativeMoENumaContext calls
+    uint64_t context_enabled_total = 0;          // ...of which armed sticky routing
+    uint64_t sticky_dispatch_ops = 0;            // NUMA handoffs (per expert or grouped node task)
+    uint64_t legacy_dispatch_ops = 0;            // expert runs left on the calling thread
+    uint64_t grouped_decode_used_ops = 0;        // successful grouped gate/up or down ops
+    uint64_t grouped_dispatch_node_tasks = 0;    // active node groups handed off
+    uint64_t grouped_dispatch_expert_items = 0;  // routed top-k items inside those groups
+    uint64_t direct_decode_used_ops = 0;         // successful node-local GGML outer-task ops
+    uint64_t direct_decode_rejected_ops = 0;     // direct candidates that failed closed
+    std::array<uint64_t, kNativeMoENumaMaxTrackedNodes> node_dispatch_ops{};
+    uint64_t node_dispatch_overflow_ops = 0;  // node id >= kNativeMoENumaMaxTrackedNodes
+    int last_state = static_cast<int>(NativeMoENumaStickyState::Unset);
+};
+
+NativeMoENumaStatsSnapshot GetNativeMoENumaStatsSnapshot();
+const char* GetNativeMoENumaStickyStateName(int state);
+
 // Internal decode helpers shared between graph-build and worker graph-cache admission.
 bool IsDecodeOnlyBatchLayout(const BatchSpec& batch, int n_tokens_in_batch);
 bool IsPagedDecodeCandidate(const PagedKVCache* cache, const BatchSpec& batch, int n_tokens_in_batch, int n_head,

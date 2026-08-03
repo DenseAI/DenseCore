@@ -910,6 +910,40 @@ bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gat
     return true;
 }
 
+bool RunQ4KPrepackedMoEFusedSwiGLUTileRange(const void* fused_weight_ptr, const uint8_t* qinput_data,
+                                             float* output_data, int64_t cols, int64_t input_cols,
+                                             int tile_start, int tile_end) {
+    if (!fused_weight_ptr || !qinput_data || !output_data || cols <= 0 || input_cols <= 0 ||
+        (cols % 8) != 0 || (input_cols % QK_K) != 0) {
+        return false;
+    }
+    const int tile_count = static_cast<int>(cols / 8);
+    const int blocks_per_row = static_cast<int>(input_cols / QK_K);
+    if (tile_start < 0 || tile_start > tile_end || tile_end > tile_count) {
+        return false;
+    }
+    const size_t matrix_bytes =
+        static_cast<size_t>(tile_count) * static_cast<size_t>(blocks_per_row) * sizeof(MoEQ4Kx8Block);
+    const auto* gate_blocks = static_cast<const uint8_t*>(fused_weight_ptr);
+    const auto* up_blocks = gate_blocks + matrix_bytes;
+    for (int tile = tile_start; tile < tile_end; ++tile) {
+        std::array<float, 8> gate_tile{};
+        std::array<float, 8> up_tile{};
+        const void* gate_vx = gate_blocks + static_cast<size_t>(tile) * static_cast<size_t>(blocks_per_row) *
+                                                sizeof(MoEQ4Kx8Block);
+        const void* up_vx = up_blocks + static_cast<size_t>(tile) * static_cast<size_t>(blocks_per_row) *
+                                            sizeof(MoEQ4Kx8Block);
+        ggml_gemv_q4_K_8x8_q8_K(static_cast<int>(input_cols), gate_tile.data(), 0, gate_vx, qinput_data, 1, 8);
+        ggml_gemv_q4_K_8x8_q8_K(static_cast<int>(input_cols), up_tile.data(), 0, up_vx, qinput_data, 1, 8);
+        float* out = output_data + static_cast<size_t>(tile) * 8;
+        for (int c = 0; c < 8; ++c) {
+            const float gate = gate_tile[static_cast<size_t>(c)];
+            out[c] = (gate / (1.0f + internal::FastExp(-gate))) * up_tile[static_cast<size_t>(c)];
+        }
+    }
+    return true;
+}
+
 bool RunMoEQ4KRawBatchedProjection(CpuBackend* backend, const void* weight_ptr, const uint8_t* qinput_data,
                                    size_t qinput_row_bytes, float* out_data, int64_t M, int64_t N, int64_t K,
                                    int numa_node, bool allow_parallel) {

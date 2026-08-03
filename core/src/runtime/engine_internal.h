@@ -38,6 +38,7 @@
 #include "densecore/runtime/scheduler.h"
 #include "densecore/utils/error.h"
 #include "densecore/utils/logging.h"
+#include "ggml-cpu.h"
 #include "llm/config/runtime_config.h"
 
 #ifdef __APPLE__
@@ -230,6 +231,14 @@ struct SwapState {
     }
 };
 
+struct OwnedGraphInput {
+    std::string name;
+    std::array<int64_t, DENSECORE_MAX_DIMS> shape{};
+    DenseCoreDType dtype = DENSECORE_DTYPE_F32;
+    int ndim = 0;
+    std::vector<uint8_t> bytes;
+};
+
 /**
  * Request structure representing a single inference request.
  *
@@ -253,6 +262,8 @@ struct Request {
     std::vector<int> token_history;
     std::vector<int> prompt_tokens_for_cache;           // Full prompt tokens for prefix cache registration
     std::vector<int> original_prompt_tokens_for_cache;  // Immutable copy before prefix-hit token erasure
+    // Prompt plus decode input tokens whose KV/recurrent state has actually been computed.
+    std::vector<int> sequence_tokens_for_prefix_cache;
     int prompt_token_count = 0;
     int registered_prefix_blocks = 0;
     bool prefix_cache_allowed = false;
@@ -756,8 +767,9 @@ struct Request {
     // =========================================================================
     bool is_graph_execution = false;
     std::string graph_name;
-    std::vector<DenseCoreTensorInput> graph_inputs;
+    std::vector<OwnedGraphInput> graph_inputs;
     GraphResultCallback graph_callback = nullptr;
+    std::atomic<bool> graph_callback_completed{false};
 
     // Reset request state for pool reuse
     void Reset() {
@@ -772,6 +784,7 @@ struct Request {
         token_history.clear();
         prompt_tokens_for_cache.clear();
         original_prompt_tokens_for_cache.clear();
+        sequence_tokens_for_prefix_cache.clear();
         prompt_token_count = 0;
         registered_prefix_blocks = 0;
         prefix_cache_allowed = false;
@@ -1250,6 +1263,7 @@ struct Request {
         graph_name.clear();
         graph_inputs.clear();
         graph_callback = nullptr;
+        graph_callback_completed.store(false, std::memory_order_relaxed);
     }
 
     // Destructor for cleanup
@@ -1257,6 +1271,27 @@ struct Request {
         // Block tables are cleaned up by caller before deletion
     }
 };
+
+inline bool CompleteGraphRequest(Request* req, const DenseCoreTensorOutput* outputs, int num_outputs) noexcept {
+    if (!req || !req->is_graph_execution) return false;
+
+    bool expected = false;
+    if (!req->graph_callback_completed.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                               std::memory_order_acquire)) {
+        return false;
+    }
+
+    if (req->graph_callback) {
+        try {
+            req->graph_callback(outputs, num_outputs, req->user_data);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Graph result callback threw: {}", e.what());
+        } catch (...) {
+            LOG_ERROR("Graph result callback threw an unknown exception");
+        }
+    }
+    return true;
+}
 
 /**
  * Fair queue comparator with tier-based priority and aging.
@@ -1423,6 +1458,11 @@ struct EngineState {
 
     // Number of threads for compute (0 = auto-detect)
     int n_threads = 0;
+
+    // Shared by every CPU graph execution on the single engine worker. Without
+    // an explicit pool, GGML creates and joins N-1 threads for every graph.
+    ggml_threadpool_t ggml_compute_threadpool = nullptr;
+    int ggml_compute_threadpool_threads = 0;
 
     // Thread pinning policy for compute threads
     // 0 = SCATTER (maximize L3/bandwidth, best for latency-sensitive single-user)
@@ -1885,6 +1925,23 @@ struct EngineState {
                                sizeof(float)) /
                     4);
         }
+        if ((model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+            model_has_moe_layers && effective_query_len > 1) {
+            // The native W2 callback retains one direct-output row per routed
+            // token/expert assignment in the live GGML context. The no-alloc
+            // dry run stores this scratch in a sidecar, so account for it from
+            // the model and request shape instead of treating it as metadata.
+            const size_t top_k = std::max<size_t>(1, hp.n_experts_used);
+            const size_t assignment_capacity =
+                std::min<size_t>(saturating_mul(query_token_working_set, top_k), 4096ULL * 64ULL);
+            const size_t direct_output_bytes_per_layer = saturating_mul(
+                saturating_mul(assignment_capacity, static_cast<size_t>(std::max<int32_t>(1, hp.n_embd))),
+                sizeof(float));
+            saturating_add_inplace(
+                estimate.hybrid_ssm_extra_bytes,
+                saturating_mul(direct_output_bytes_per_layer,
+                               static_cast<size_t>(std::max<int32_t>(1, hp.n_layer))));
+        }
         if (model->arch_flags.is_gemma4) {
             overhead = saturating_add(saturating_add(overhead, hidden_query_bytes), kv_history_bytes);
         }
@@ -1957,7 +2014,7 @@ struct EngineState {
         const size_t dynamic_env_cap_mb =
             std::max<size_t>(HARD_MIN_MB, available_memory_mb > 0 ? available_memory_mb : FALLBACK_ENV_MAX_MB);
         const size_t extra_headroom_mb =
-            parse_env_mb("DENSECORE_GRAPH_CTX_EXTRA_MB", /*default_mb=*/64, /*min_mb=*/0, dynamic_env_cap_mb);
+            parse_env_mb("DENSECORE_GRAPH_CTX_EXTRA_MB", /*default_mb=*/128, /*min_mb=*/0, dynamic_env_cap_mb);
         estimate.env_extra_bytes = extra_headroom_mb * MB;
         total = saturating_add(saturating_add(total, estimate.long_context_safety_pad_bytes),
                                estimate.env_extra_bytes);
@@ -2237,6 +2294,10 @@ struct EngineState {
             RemovePendingRequest(pending->id);
             pending->finished = true;
             pending->cancelled.store(true, std::memory_order_relaxed);
+            if (pending->is_graph_execution) {
+                metrics.failed_requests.fetch_add(1, std::memory_order_relaxed);
+                CompleteGraphRequest(pending, nullptr, DENSECORE_STATUS_ENGINE_STOPPED);
+            }
             request_pool.Release(pending);
         }
 
@@ -2254,6 +2315,12 @@ struct EngineState {
         {
             std::lock_guard<std::mutex> lock(models_mu);
             models.clear();
+        }
+
+        if (ggml_compute_threadpool) {
+            ggml_threadpool_free(ggml_compute_threadpool);
+            ggml_compute_threadpool = nullptr;
+            ggml_compute_threadpool_threads = 0;
         }
 
         ClearPendingCancellations();

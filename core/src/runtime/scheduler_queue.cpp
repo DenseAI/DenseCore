@@ -319,7 +319,12 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
             still_waiting.push_back(group);
             continue;
         }
-        const int tokens_needed = can_chunk ? std::min(remaining, prefill_budget) : remaining;
+        const int group_context = GetSequenceContextLen(seq_id);
+        int tokens_needed = can_chunk ? std::min(remaining, prefill_budget) : remaining;
+        if (can_chunk && group.align_initial_prefill_for_prefix_snapshot && group_context == 0 &&
+            tokens_needed > BLOCK_SIZE && tokens_needed % BLOCK_SIZE != 0) {
+            tokens_needed -= tokens_needed % BLOCK_SIZE;
+        }
         if (tokens_needed <= 0) {
             if (blocked_reason == SchedulerEmptyReason::None) {
                 blocked_reason = SchedulerEmptyReason::PrefillBudgetZero;
@@ -329,7 +334,6 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
             continue;
         }
 
-        const int group_context = GetSequenceContextLen(seq_id);
         if (config_.enforce_homogeneous_batch_n_past && target_context_len >= 0 &&
             group_context != target_context_len) {
             if (blocked_reason == SchedulerEmptyReason::None) {

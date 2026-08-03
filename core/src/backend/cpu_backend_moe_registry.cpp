@@ -17,8 +17,140 @@ void RouteMoEStub(CpuBackend& backend, int n_tokens, int n_experts_used, int n_e
 
 static constexpr size_t MOVE_PAGES_BATCH_SIZE = 4096;
 static constexpr float REBALANCE_HYSTERESIS_RATIO = 0.15f;
+static constexpr float REBALANCE_MIGRATION_STABLE_CHURN = 0.10f;
+static constexpr int REBALANCE_MIGRATION_STABLE_CYCLES = 2;
+
+std::vector<int> SelectLocalExpertsWithHysteresis(const std::vector<int>& previous_local,
+                                                   const std::vector<int>& hot_expert_ids,
+                                                   const std::vector<float>& ema_loads, int n_experts) {
+    const size_t target_size = hot_expert_ids.size();
+    std::vector<std::pair<float, int>> local_ranked;
+    local_ranked.reserve(previous_local.size());
+    std::unordered_set<int> local_set;
+
+    const auto score = [&](int expert_id) {
+        return expert_id >= 0 && static_cast<size_t>(expert_id) < ema_loads.size()
+                   ? ema_loads[static_cast<size_t>(expert_id)]
+                   : 0.0f;
+    };
+
+    for (int expert_id : previous_local) {
+        if (expert_id < 0 || expert_id >= n_experts) continue;
+        if (local_set.insert(expert_id).second) {
+            local_ranked.emplace_back(score(expert_id), expert_id);
+        }
+    }
+
+    if (local_ranked.size() > target_size) {
+        std::partial_sort(local_ranked.begin(), local_ranked.begin() + target_size, local_ranked.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        local_ranked.resize(target_size);
+    }
+
+    local_set.clear();
+    for (const auto& entry : local_ranked) {
+        local_set.insert(entry.second);
+    }
+
+    std::vector<std::pair<float, int>> candidates;
+    candidates.reserve(hot_expert_ids.size());
+    for (int expert_id : hot_expert_ids) {
+        if (expert_id < 0 || expert_id >= n_experts) continue;
+        if (local_set.find(expert_id) == local_set.end()) {
+            candidates.emplace_back(score(expert_id), expert_id);
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::sort(local_ranked.begin(), local_ranked.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    for (const auto& candidate : candidates) {
+        if (local_ranked.size() < target_size) {
+            local_ranked.push_back(candidate);
+            local_set.insert(candidate.second);
+            std::sort(local_ranked.begin(), local_ranked.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            continue;
+        }
+        if (local_ranked.empty()) break;
+
+        const auto& lowest_local = local_ranked.front();
+        if (candidate.first > lowest_local.first * (1.0f + REBALANCE_HYSTERESIS_RATIO)) {
+            local_set.erase(lowest_local.second);
+            local_ranked.front() = candidate;
+            local_set.insert(candidate.second);
+            std::sort(local_ranked.begin(), local_ranked.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
+    }
+
+    std::vector<int> selected;
+    selected.reserve(local_ranked.size());
+    for (const auto& entry : local_ranked) {
+        selected.push_back(entry.second);
+    }
+    return selected;
+}
+
+float ComputeHotSetChurn(const std::vector<int>& previous_hot, const std::vector<int>& current_hot) {
+    if (previous_hot.empty() && current_hot.empty()) return 0.0f;
+    if (previous_hot.empty() || current_hot.empty()) return 1.0f;
+
+    std::unordered_set<int> previous(previous_hot.begin(), previous_hot.end());
+    size_t overlap = 0;
+    for (int expert_id : current_hot) {
+        if (previous.find(expert_id) != previous.end()) ++overlap;
+    }
+    const size_t union_size = previous.size() + current_hot.size() - overlap;
+    return union_size > 0 ? 1.0f - static_cast<float>(overlap) / static_cast<float>(union_size) : 0.0f;
+}
+
+int NextRebalanceIntervalMs(int current_interval_ms, int base_interval_ms, bool any_high, bool all_low) {
+    const int min_interval_ms = std::max(250, base_interval_ms / 4);
+    const int max_interval_ms = std::max(base_interval_ms, base_interval_ms * 4);
+    if (any_high) {
+        return std::max(min_interval_ms, static_cast<int>(current_interval_ms * 0.7));
+    }
+    if (all_low) {
+        return std::min(max_interval_ms, static_cast<int>(current_interval_ms * 1.3));
+    }
+    return current_interval_ms;
+}
+
+int NextMigrationStableCycles(int current_cycles, bool has_previous_hot, float churn, uint64_t delta_hits) {
+    if (!has_previous_hot || delta_hits == 0 || churn > REBALANCE_MIGRATION_STABLE_CHURN) {
+        return 0;
+    }
+    return std::min(current_cycles + 1, REBALANCE_MIGRATION_STABLE_CYCLES);
+}
 
 }  // namespace
+
+#ifdef DENSECORE_TEST_BUILD
+namespace testing {
+
+std::vector<int> SelectLocalExpertsWithHysteresisForTest(const std::vector<int>& previous_local,
+                                                          const std::vector<int>& hot_expert_ids,
+                                                          const std::vector<float>& ema_loads, int n_experts) {
+    return SelectLocalExpertsWithHysteresis(previous_local, hot_expert_ids, ema_loads, n_experts);
+}
+
+float ComputeHotSetChurnForTest(const std::vector<int>& previous_hot, const std::vector<int>& current_hot) {
+    return ComputeHotSetChurn(previous_hot, current_hot);
+}
+
+int NextRebalanceIntervalMsForTest(int current_interval_ms, int base_interval_ms, bool any_high, bool all_low) {
+    return NextRebalanceIntervalMs(current_interval_ms, base_interval_ms, any_high, all_low);
+}
+
+int NextMigrationStableCyclesForTest(int current_cycles, bool has_previous_hot, float churn, uint64_t delta_hits) {
+    return NextMigrationStableCycles(current_cycles, has_previous_hot, churn, delta_hits);
+}
+
+}  // namespace testing
+#endif
 
 std::shared_ptr<CpuBackend::MoELayerRegistry> CpuBackend::GetMoELayerRegistry(const TransformerLayer* layer_key) const {
     std::lock_guard<std::mutex> lock(registry_mutex_);
@@ -121,75 +253,15 @@ int CpuBackend::RebalanceExpertsInternal(const std::vector<int>& hot_expert_ids,
     std::vector<int> experts_to_migrate = hot_expert_ids;
     const std::vector<int> previous_local = local_expert_ids ? *local_expert_ids : std::vector<int>{};
     if (profiler && local_expert_ids && !hot_expert_ids.empty()) {
-        const size_t target_size = hot_expert_ids.size();
-
         if (previous_local.empty()) {
             *local_expert_ids = hot_expert_ids;
         } else {
-            std::vector<std::pair<float, int>> local_ranked;
-            local_ranked.reserve(previous_local.size());
-            std::unordered_set<int> local_set;
-
-            for (int expert_id : previous_local) {
-                if (expert_id < 0 || expert_id >= n_experts) continue;
-                if (local_set.insert(expert_id).second) {
-                    local_ranked.emplace_back(profiler->GetEmaLoad(expert_id), expert_id);
-                }
+            std::vector<float> ema_loads(static_cast<size_t>(std::max(0, n_experts)), 0.0f);
+            for (int expert_id = 0; expert_id < n_experts; ++expert_id) {
+                ema_loads[static_cast<size_t>(expert_id)] = profiler->GetEmaLoad(expert_id);
             }
-
-            if (local_ranked.size() > target_size) {
-                std::partial_sort(local_ranked.begin(), local_ranked.begin() + target_size, local_ranked.end(),
-                                  [](const auto& a, const auto& b) { return a.first > b.first; });
-                local_ranked.resize(target_size);
-            }
-
-            local_set.clear();
-            for (const auto& entry : local_ranked) {
-                local_set.insert(entry.second);
-            }
-
-            std::vector<std::pair<float, int>> candidates;
-            candidates.reserve(hot_expert_ids.size());
-            for (int expert_id : hot_expert_ids) {
-                if (expert_id < 0 || expert_id >= n_experts) continue;
-                if (local_set.find(expert_id) == local_set.end()) {
-                    candidates.emplace_back(profiler->GetEmaLoad(expert_id), expert_id);
-                }
-            }
-
-            std::sort(candidates.begin(), candidates.end(),
-                      [](const auto& a, const auto& b) { return a.first > b.first; });
-            std::sort(local_ranked.begin(), local_ranked.end(),
-                      [](const auto& a, const auto& b) { return a.first < b.first; });
-
-            for (const auto& candidate : candidates) {
-                if (local_ranked.size() < target_size) {
-                    local_ranked.push_back(candidate);
-                    local_set.insert(candidate.second);
-                    std::sort(local_ranked.begin(), local_ranked.end(),
-                              [](const auto& a, const auto& b) { return a.first < b.first; });
-                    continue;
-                }
-
-                if (local_ranked.empty()) {
-                    break;
-                }
-
-                const auto& lowest_local = local_ranked.front();
-                if (candidate.first > lowest_local.first * (1.0f + REBALANCE_HYSTERESIS_RATIO)) {
-                    local_set.erase(lowest_local.second);
-                    local_ranked.front() = candidate;
-                    local_set.insert(candidate.second);
-                    std::sort(local_ranked.begin(), local_ranked.end(),
-                              [](const auto& a, const auto& b) { return a.first < b.first; });
-                }
-            }
-
-            local_expert_ids->clear();
-            local_expert_ids->reserve(local_ranked.size());
-            for (const auto& entry : local_ranked) {
-                local_expert_ids->push_back(entry.second);
-            }
+            *local_expert_ids =
+                SelectLocalExpertsWithHysteresis(previous_local, hot_expert_ids, ema_loads, n_experts);
         }
 
         if (!local_expert_ids->empty()) {
@@ -264,7 +336,15 @@ int CpuBackend::RebalanceExpertsInternal(const std::vector<int>& hot_expert_ids,
                 status[i] = -1;
             }
 
-            long result = move_pages(0, batch_size, pages.data(), nodes.data(), status.data(), MPOL_MF_MOVE);
+            long result = -1;
+#ifdef DENSECORE_TEST_BUILD
+            if (move_pages_test_hook_) {
+                result = move_pages_test_hook_(batch_size, pages.data(), nodes.data(), status.data());
+            } else
+#endif
+            {
+                result = move_pages(0, batch_size, pages.data(), nodes.data(), status.data(), MPOL_MF_MOVE);
+            }
 
             if (result >= 0) {
                 for (size_t i = 0; i < batch_size; i++) {
@@ -279,11 +359,13 @@ int CpuBackend::RebalanceExpertsInternal(const std::vector<int>& hot_expert_ids,
                 migration.verified = false;
                 total_pages_failed += static_cast<int>(batch_size);
                 int err = errno;
-                if ((err == EACCES || err == EPERM) && !logged_permission_error) {
-                    std::cerr << "[CpuBackend] move_pages: permission denied - disabling NUMA rebalance "
-                              << "(need CAP_SYS_NICE)" << std::endl;
-                    logged_permission_error = true;
+                if (err == EACCES || err == EPERM) {
                     rebalance_disabled_.store(true);
+                    if (!logged_permission_error) {
+                        std::cerr << "[CpuBackend] move_pages: permission denied - disabling NUMA rebalance "
+                                  << "(need CAP_SYS_NICE)" << std::endl;
+                        logged_permission_error = true;
+                    }
                 } else if (err == ESRCH) {
                     std::cerr << "[CpuBackend] move_pages: ESRCH - process not found" << std::endl;
                 } else if (err != EINVAL && err != EACCES) {
@@ -293,14 +375,31 @@ int CpuBackend::RebalanceExpertsInternal(const std::vector<int>& hot_expert_ids,
             }
         }
 
+        int verified_node = -1;
+#ifdef DENSECORE_TEST_BUILD
+        if (query_numa_node_range_test_hook_) {
+            verified_node = query_numa_node_range_test_hook_(weight.ptr, weight.size);
+        } else
+#endif
+        {
+            verified_node = QueryMemoryNumaNodeRange(weight.ptr, weight.size);
+        }
         migration.verified = migration.verified && migration.pages_on_target == static_cast<int>(num_pages) &&
-                             QueryMemoryNumaNodeRange(weight.ptr, weight.size) == target_numa_node;
+                             verified_node == target_numa_node;
         return migration;
     };
 
     std::unordered_set<int> successfully_migrated;
     for (int expert_id : experts_to_migrate) {
         if (expert_id < 0 || expert_id >= n_experts || static_cast<size_t>(expert_id) >= expert_weights.size()) {
+            continue;
+        }
+
+        // Hot-set churn can evict and later re-admit an expert even though its
+        // pages never left this node. Do not issue move_pages() again for a
+        // placement that the last fully verified migration already committed.
+        if (profiler && target_numa_node >= 0 && profiler->GetExpertNumaNode(expert_id) == target_numa_node) {
+            successfully_migrated.insert(expert_id);
             continue;
         }
 
@@ -399,6 +498,12 @@ void CpuBackend::StartRebalanceThread(int interval_ms, int top_k, bool enable_pa
 
     rebalance_stop_.store(false);
     rebalance_running_.store(true);
+#ifdef DENSECORE_TEST_BUILD
+    rebalance_test_cycles_.store(0);
+    rebalance_test_interval_decreases_.store(0);
+    rebalance_test_interval_increases_.store(0);
+    rebalance_test_current_interval_ms_.store(interval_ms);
+#endif
 
     rebalance_thread_ = std::thread([this, interval_ms, top_k, enable_page_migration]() {
         struct LayerRebalanceState {
@@ -406,11 +511,10 @@ void CpuBackend::StartRebalanceThread(int interval_ms, int top_k, bool enable_pa
             uint64_t previous_total_hits = 0;
             std::chrono::steady_clock::time_point previous_time;
             double hit_rate_ema = 0.0;
+            int migration_stable_cycles = 0;
             bool has_baseline = false;
         };
 
-        const int min_interval_ms = std::max(250, interval_ms / 4);
-        const int max_interval_ms = std::max(interval_ms, interval_ms * 4);
         int current_interval_ms = interval_ms;
 
         std::unordered_map<const TransformerLayer*, LayerRebalanceState> layer_states;
@@ -482,22 +586,7 @@ void CpuBackend::StartRebalanceThread(int interval_ms, int top_k, bool enable_pa
                     state.hit_rate_ema = 0.8 * state.hit_rate_ema + 0.2 * hit_rate;
                 }
 
-                float churn = 0.0f;
-                if (!state.previous_hot.empty() || !hot_experts.empty()) {
-                    if (state.previous_hot.empty() || hot_experts.empty()) {
-                        churn = 1.0f;
-                    } else {
-                        std::unordered_set<int> prev_set(state.previous_hot.begin(), state.previous_hot.end());
-                        size_t overlap = 0;
-                        for (int expert_id : hot_experts) {
-                            if (prev_set.find(expert_id) != prev_set.end()) {
-                                overlap++;
-                            }
-                        }
-                        size_t union_size = prev_set.size() + hot_experts.size() - overlap;
-                        churn = union_size > 0 ? 1.0f - (static_cast<float>(overlap) / union_size) : 0.0f;
-                    }
-                }
+                const float churn = ComputeHotSetChurn(state.previous_hot, hot_experts);
 
                 const float churn_high = 0.35f;
                 const float churn_low = 0.10f;
@@ -507,13 +596,18 @@ void CpuBackend::StartRebalanceThread(int interval_ms, int top_k, bool enable_pa
                 bool high_rate =
                     (state.hit_rate_ema > 0.0 && hit_rate > state.hit_rate_ema * 1.5) || hit_rate > high_rate_threshold;
 
+                state.migration_stable_cycles =
+                    NextMigrationStableCycles(state.migration_stable_cycles, !state.previous_hot.empty(), churn,
+                                              delta_hits);
+
                 any_high = any_high || high_churn || high_rate;
                 all_low = all_low && low_churn;
 
                 if (enable_page_migration) {
-                    if (!hot_experts.empty() && !weights.empty()) {
+                    if (state.migration_stable_cycles >= REBALANCE_MIGRATION_STABLE_CYCLES && !hot_experts.empty() &&
+                        !weights.empty()) {
                         RebalanceExperts(layer_key, hot_experts, weights, profiler->GetNumExperts(), -1);
-                    } else {
+                    } else if (hot_experts.empty() || weights.empty()) {
                         all_low = false;
                     }
                 }
@@ -523,11 +617,19 @@ void CpuBackend::StartRebalanceThread(int interval_ms, int top_k, bool enable_pa
                 state.previous_time = now;
             }
 
-            if (any_high) {
-                current_interval_ms = std::max(min_interval_ms, static_cast<int>(current_interval_ms * 0.7));
-            } else if (all_low) {
-                current_interval_ms = std::min(max_interval_ms, static_cast<int>(current_interval_ms * 1.3));
+#ifdef DENSECORE_TEST_BUILD
+            const int previous_interval_ms = current_interval_ms;
+#endif
+            current_interval_ms = NextRebalanceIntervalMs(current_interval_ms, interval_ms, any_high, all_low);
+#ifdef DENSECORE_TEST_BUILD
+            rebalance_test_cycles_.fetch_add(1);
+            if (current_interval_ms < previous_interval_ms) {
+                rebalance_test_interval_decreases_.fetch_add(1);
+            } else if (current_interval_ms > previous_interval_ms) {
+                rebalance_test_interval_increases_.fetch_add(1);
             }
+            rebalance_test_current_interval_ms_.store(current_interval_ms);
+#endif
         }
         rebalance_running_.store(false);
     });
@@ -542,6 +644,35 @@ void CpuBackend::StopRebalanceThread() {
 
     rebalance_running_.store(false);
 }
+
+#ifdef DENSECORE_TEST_BUILD
+void CpuBackend::SetNumaRebalanceTestHooks(MovePagesTestHook move_pages_hook,
+                                           QueryNumaNodeRangeTestHook query_range_hook) {
+    std::lock_guard<std::mutex> lock(rebalance_mutex_);
+    move_pages_test_hook_ = std::move(move_pages_hook);
+    query_numa_node_range_test_hook_ = std::move(query_range_hook);
+}
+
+void CpuBackend::ClearNumaRebalanceTestHooks() {
+    SetNumaRebalanceTestHooks({}, {});
+}
+
+std::vector<int> CpuBackend::GetLocalExpertIdsForTest(const TransformerLayer* layer_key) const {
+    auto registry = GetMoELayerRegistry(layer_key);
+    if (!registry) return {};
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    return registry->local_expert_ids;
+}
+
+CpuBackend::NumaRebalanceTestStats CpuBackend::GetNumaRebalanceTestStats() const {
+    return {
+        rebalance_test_cycles_.load(),
+        rebalance_test_interval_decreases_.load(),
+        rebalance_test_interval_increases_.load(),
+        rebalance_test_current_interval_ms_.load(),
+    };
+}
+#endif
 
 void CpuBackend::InitMoEProfiler(int n_experts, float ema_alpha) {
     InitMoEProfiler(nullptr, n_experts, ema_alpha);

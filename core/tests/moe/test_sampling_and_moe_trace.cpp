@@ -22,14 +22,23 @@ std::vector<CpuBackend::ExpertWeights> BuildExpertWeightsForTest(const Transform
                                                                  const TransformerModel* model);
 int ResolveNativeMoEGraphCallbackTaskCountForTest(const TransformerModel* model, const BatchSpec* batch, int phase,
                                                   int64_t n_tokens, int top_k);
-bool ComputeQwenNativeMoEStableTopKForTest(const std::vector<float>& logits, int top_k,
-                                            std::vector<int32_t>* selected,
-                                            std::vector<float>* normalized_weights);
-bool RunQwenNativeMoEFusedRouterCustomNodeForTest(const std::vector<float>& logits,
-                                                   std::vector<int32_t>* selected,
-                                                   std::vector<float>* normalized_weights);
+bool ComputeQwenNativeMoEStableTopKForTest(const std::vector<float>& logits, int top_k, std::vector<int32_t>* selected,
+                                           std::vector<float>* normalized_weights);
+bool RunQwenNativeMoEFusedRouterCustomNodeForTest(const std::vector<float>& logits, std::vector<int32_t>* selected,
+                                                  std::vector<float>* normalized_weights);
 bool RemapNativeMoECallbackTaskForTest(int requested_task_count, int ith, int nth, int* effective_ith,
                                        int* effective_nth);
+bool BuildNativeMoENodeGroupPlanForTest(const std::vector<int>& item_nodes, int node_count,
+                                        std::vector<int>* active_nodes);
+bool BuildNativeMoEOuterTaskPlanForTest(const std::vector<int>& task_nodes, int task_index, int node_count,
+                                        int* task_node, int* node_task_rank, int* node_task_count);
+bool ShouldUseQwenNativeMoEDownGlobalRowPartitionForTest(bool numa_sticky_enabled,
+                                                         bool weighted_logits_lfm2_sigmoid, int phase,
+                                                         int64_t n_tokens, int nth);
+bool RunNativeMoEDirectOuterTaskBarrierForTest(int task_count, int failing_task, int rounds);
+std::vector<float> ReduceNativeMoEExpertOutputsInRoutingOrderForTest(const std::vector<float>& expert_outputs,
+                                                                     const std::vector<int>& experts,
+                                                                     const std::vector<float>& weights, int row_count);
 bool QwenNativeMoENoAllocUserDataIsPerOpForTest();
 bool ShouldEnableNativeMoEFastPathByDefaultForTest(const TransformerModel* model, int phase, int mode);
 int64_t Qwen35NativeMoEMaxDirectTokensForTest();
@@ -362,6 +371,72 @@ TEST(MoETrace, NativeMoECallbackTaskRemapHonorsPerOpTaskCount) {
     EXPECT_TRUE(densecore::testing::RemapNativeMoECallbackTaskForTest(0, 7, 16, &effective_ith, &effective_nth));
     EXPECT_EQ(effective_ith, 7);
     EXPECT_EQ(effective_nth, 16);
+}
+
+TEST(MoETrace, NativeMoENodeGroupPlanCollapsesExpertsToActiveNodes) {
+    std::vector<int> active_nodes;
+    EXPECT_TRUE(densecore::testing::BuildNativeMoENodeGroupPlanForTest({0, 1, 0, 1, -1}, 2, &active_nodes));
+    EXPECT_EQ(active_nodes, (std::vector<int>{0, 1}));
+
+    EXPECT_FALSE(densecore::testing::BuildNativeMoENodeGroupPlanForTest({0, 2}, 2, &active_nodes));
+    EXPECT_TRUE(active_nodes.empty());
+}
+
+TEST(MoETrace, NativeMoEOuterTaskPlanMapsInterleavedNodeLocalRanks) {
+    const std::vector<int> task_nodes{0, 1, 0, 1, 0, 1, 0, 1};
+    for (int task = 0; task < static_cast<int>(task_nodes.size()); ++task) {
+        int task_node = -1;
+        int node_task_rank = -1;
+        int node_task_count = 0;
+        ASSERT_TRUE(densecore::testing::BuildNativeMoEOuterTaskPlanForTest(
+            task_nodes, task, 2, &task_node, &node_task_rank, &node_task_count));
+        EXPECT_EQ(task_node, task % 2);
+        EXPECT_EQ(node_task_rank, task / 2);
+        EXPECT_EQ(node_task_count, 4);
+    }
+}
+
+TEST(MoETrace, NativeMoEOuterTaskPlanRejectsInvalidMappings) {
+    int task_node = -1;
+    int node_task_rank = -1;
+    int node_task_count = 0;
+    EXPECT_FALSE(densecore::testing::BuildNativeMoEOuterTaskPlanForTest(
+        {0, 2, 0, 1}, 0, 2, &task_node, &node_task_rank, &node_task_count));
+    EXPECT_FALSE(densecore::testing::BuildNativeMoEOuterTaskPlanForTest(
+        {0}, 0, 2, &task_node, &node_task_rank, &node_task_count));
+}
+
+TEST(MoETrace, QwenDecodeUsesGlobalRowPartitionOnlyForWideStickyW2) {
+    const int decode = static_cast<int>(InferenceExecutionPhase::Decode);
+    const int prefill = static_cast<int>(InferenceExecutionPhase::Prefill);
+
+    EXPECT_TRUE(densecore::testing::ShouldUseQwenNativeMoEDownGlobalRowPartitionForTest(
+        true, false, decode, 1, 16));
+    EXPECT_FALSE(densecore::testing::ShouldUseQwenNativeMoEDownGlobalRowPartitionForTest(
+        false, false, decode, 1, 16));
+    EXPECT_FALSE(densecore::testing::ShouldUseQwenNativeMoEDownGlobalRowPartitionForTest(
+        true, true, decode, 1, 16));
+    EXPECT_FALSE(densecore::testing::ShouldUseQwenNativeMoEDownGlobalRowPartitionForTest(
+        true, false, prefill, 320, 16));
+    EXPECT_FALSE(densecore::testing::ShouldUseQwenNativeMoEDownGlobalRowPartitionForTest(
+        true, false, decode, 1, 1));
+}
+
+TEST(MoETrace, NativeMoEDirectOuterTaskBarrierPublishesSuccessAndFailure) {
+    EXPECT_TRUE(densecore::testing::RunNativeMoEDirectOuterTaskBarrierForTest(16, -1, 64));
+    EXPECT_TRUE(densecore::testing::RunNativeMoEDirectOuterTaskBarrierForTest(16, 7, 64));
+}
+
+TEST(MoETrace, NativeMoEGroupedReductionPreservesRoutingOrder) {
+    const std::vector<float> expert_outputs = {
+        1.0e20f, 10.0f, -1.0e20f, -3.0f, 3.0f, 0.5f,
+    };
+    const std::vector<float> actual = densecore::testing::ReduceNativeMoEExpertOutputsInRoutingOrderForTest(
+        expert_outputs, {3, 8, 5}, {1.0f, 1.0f, 1.0f}, 2);
+
+    ASSERT_EQ(actual.size(), 2u);
+    EXPECT_FLOAT_EQ(actual[0], 3.0f);
+    EXPECT_FLOAT_EQ(actual[1], 7.5f);
 }
 
 TEST(MoETrace, NativeMoEFastPathAutoIsDefaultForSupportedHybridMoEModels) {

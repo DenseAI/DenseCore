@@ -156,14 +156,8 @@ public:
         // Mark main thread as done
         completed_count_.fetch_add(1, std::memory_order_release);
 
-        // Wait for all workers to complete
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_done_.wait(lock, [this, active_threads] {
-                return completed_count_.load(std::memory_order_acquire) == active_threads;
-            });
-            work_ready_ = false;
-        }
+        WaitForCompletion(active_threads);
+        work_ready_.store(false, std::memory_order_release);
         active_threads_.store(1, std::memory_order_release);
         current_work_fn_ = nullptr;
         total_work_ = 0;
@@ -212,15 +206,9 @@ public:
         simd::GemvParallel(output, input, weight, K, N, 0, active_threads);
         completed_count_.fetch_add(1, std::memory_order_release);
 
-        // Wait for all workers to complete
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_done_.wait(lock, [this, active_threads] {
-                return completed_count_.load(std::memory_order_acquire) == active_threads;
-            });
-            work_ready_ = false;
-            is_gemv_work_ = false;
-        }
+        WaitForCompletion(active_threads);
+        work_ready_.store(false, std::memory_order_release);
+        is_gemv_work_ = false;
         active_threads_.store(1, std::memory_order_release);
         gemv_output_ = nullptr;
         gemv_input_ = nullptr;
@@ -231,6 +219,31 @@ public:
     }
 
 private:
+    void WaitForCompletion(int active_threads) {
+        // Decode GEMV/MoE pool work usually completes inside the same short
+        // window in which workers stay hot. Avoid putting the dispatching
+        // thread to sleep for those sub-millisecond barriers; retain the
+        // condition-variable path for long or descheduled work.
+        constexpr int kCompletionSpinIterations = 5000;
+        for (int spin = 0; spin < kCompletionSpinIterations; ++spin) {
+            if (completed_count_.load(std::memory_order_acquire) >= active_threads) {
+                return;
+            }
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+            _mm_pause();
+#elif defined(__aarch64__)
+            __asm__ volatile("yield");
+#else
+            std::this_thread::yield();
+#endif
+        }
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_done_.wait(lock, [this, active_threads] {
+            return completed_count_.load(std::memory_order_acquire) >= active_threads;
+        });
+    }
+
     static int ResolveLogicalThreadCapacity(int numa_node) {
         auto& topo = HardwareTopology::GetInstance();
         const auto local_cores = topo.GetCoresInNumaNode(numa_node);
@@ -405,9 +418,20 @@ private:
                 }
             }
 
-            // Signal completion
-            int count = completed_count_.fetch_add(1, std::memory_order_release) + 1;
-            if (count == active_threads) {
+            // Signal completion.
+            //
+            // The notify MUST be issued while holding mutex_.  completed_count_ is the
+            // predicate cv_done_ waits on, and it is published without the lock, so a
+            // dispatcher that has already evaluated the predicate as false but has not
+            // yet blocked would miss a bare notify_one() and then wait forever.  Taking
+            // the lock here forces us to queue behind that dispatcher until it is
+            // actually registered on the condition variable.
+            //
+            // Only the last participant pays for the lock, so this costs one
+            // uncontended acquire per dispatch, not one per worker.
+            const int count = completed_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (count >= active_threads) {
+                std::lock_guard<std::mutex> lock(mutex_);
                 cv_done_.notify_one();
             }
         }

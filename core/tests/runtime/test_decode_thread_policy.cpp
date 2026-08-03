@@ -9,6 +9,10 @@
 int SelectLargestModelPrefillChunkThatFitsForTest(const TransformerModel* model, size_t prompt_tokens,
                                                   size_t available_bytes, size_t safety_margin_bytes,
                                                   int current_chunk_tokens);
+size_t IncludeGgmlGraphObjectMetadataForTest(size_t target_bytes);
+bool IsPrefillGraphCacheSafeForCurrentBatchForTest(const TransformerModel* model, const BatchSpec& batch);
+int ResolveRecurrentPrefixSnapshotPrefillTokensForTest(const TransformerModel* model, bool prefix_cache_allowed,
+                                                        int n_past, int requested_tokens);
 
 namespace {
 
@@ -358,9 +362,10 @@ TEST(DecodeThreadPolicy, Qwen36PrefillChunkExplicitEnvCanExceedAutoDefaultForBen
     EXPECT_EQ(ResolveQwen36PrefillChunkTokens(&model, &req), 768);
 }
 
-TEST(DecodeThreadPolicy, Qwen36PrefillChunkAutoKeepsOneKPromptsUnchunked) {
+TEST(DecodeThreadPolicy, Qwen36PrefillChunkAutoChunksAboveRuntimeCapacity) {
     ScopedEnvVar chunk_override("DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS", nullptr);
     ScopedEnvVar auto_min("DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS", nullptr);
+    ScopedEnvVar default_tokens("DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS", nullptr);
 
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
@@ -369,10 +374,11 @@ TEST(DecodeThreadPolicy, Qwen36PrefillChunkAutoKeepsOneKPromptsUnchunked) {
     model.hparams.n_experts = 128;
 
     Request req{};
-    req.prompt_token_count = 1024;
-    req.prompt_tokens_for_cache.resize(1024, 1);
+    const int runtime_chunk_tokens = ExpectedHybridSsmChunkTokensForRuntime();
+    req.prompt_token_count = runtime_chunk_tokens + 1;
+    req.prompt_tokens_for_cache.resize(static_cast<size_t>(req.prompt_token_count), 1);
 
-    EXPECT_EQ(ResolveQwen36PrefillChunkTokens(&model, &req), -1);
+    EXPECT_EQ(ResolveQwen36PrefillChunkTokens(&model, &req), runtime_chunk_tokens);
 }
 
 TEST(DecodeThreadPolicy, Qwen36PrefillChunkAutoStillChunksVeryLongPrompts) {
@@ -627,6 +633,64 @@ TEST(DecodeThreadPolicy, Gemma4GraphCtxAutoUpgradeCapsAtC4MeasuredChunk) {
     EXPECT_EQ(SelectLargestModelPrefillChunkThatFitsForTest(&qwen, kPromptTokens, kLargeAvailableBytes,
                                                             /*safety_margin_bytes=*/0, /*current_chunk_tokens=*/96),
               128);
+}
+
+TEST(DecodeThreadPolicy, Qwen36TwoTurnPrefillReservesGgmlGraphMetadata) {
+    constexpr size_t MB = 1024ULL * 1024ULL;
+    constexpr size_t kObservedPoolBytes = 3154116608ULL;
+    constexpr size_t kObservedRequiredBytes = 3155707120ULL;
+    constexpr size_t kChunkedPoolBytes = 3690987520ULL;
+    constexpr size_t kChunkedRequiredBytes = 3696805424ULL;
+
+    const size_t reserved_bytes = IncludeGgmlGraphObjectMetadataForTest(kObservedPoolBytes);
+
+    EXPECT_EQ(reserved_bytes, 3200ULL * MB);
+    EXPECT_GT(reserved_bytes, kObservedRequiredBytes)
+        << "The physical n2-standard-96 two-turn prefill aborted just beyond the aligned pool because the GGML graph "
+           "object itself was not reserved";
+    EXPECT_EQ(IncludeGgmlGraphObjectMetadataForTest(kObservedPoolBytes - 1), 3200ULL * MB)
+        << "Graph metadata needs its own allocation quantum instead of disappearing into target alignment slack";
+    EXPECT_GT(IncludeGgmlGraphObjectMetadataForTest(kChunkedPoolBytes), kChunkedRequiredBytes)
+        << "The 320-token chunk fixed graph shape but still exceeded a six-object-per-node metadata reserve";
+}
+
+TEST(DecodeThreadPolicy, Qwen36MoePrefillSkipsContentDependentGraphCache) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_experts = 256;
+
+    std::vector<TransformerModel::SSMSequenceRuntimeState> runtime_states;
+    BatchSpec batch{};
+    batch.num_seqs = 1;
+    batch.seq_id.push_back(1);
+    batch.hybrid_ssm_runtime_states.push_back(&runtime_states);
+
+    EXPECT_FALSE(IsPrefillGraphCacheSafeForCurrentBatchForTest(&model, batch));
+
+    model.hparams.n_experts = 0;
+    EXPECT_TRUE(IsPrefillGraphCacheSafeForCurrentBatchForTest(&model, batch));
+}
+
+TEST(DecodeThreadPolicy, InitialRecurrentPrefillStopsAtRestorablePrefixBoundary) {
+    TransformerModel recurrent{};
+    recurrent.arch_flags.is_hybrid_ssm = true;
+
+    EXPECT_EQ(ResolveRecurrentPrefixSnapshotPrefillTokensForTest(&recurrent, true, 0, 37), 32);
+    EXPECT_EQ(ResolveRecurrentPrefixSnapshotPrefillTokensForTest(&recurrent, true, 0, 133), 128);
+    EXPECT_EQ(ResolveRecurrentPrefixSnapshotPrefillTokensForTest(&recurrent, true, 0, 48), 48);
+    EXPECT_EQ(ResolveRecurrentPrefixSnapshotPrefillTokensForTest(&recurrent, true, 0, 16), 16);
+}
+
+TEST(DecodeThreadPolicy, RecurrentPrefixBoundarySplitIsLimitedToInitialCacheablePrefill) {
+    TransformerModel recurrent{};
+    recurrent.arch_flags.is_hybrid_ssm = true;
+    TransformerModel stateless{};
+
+    EXPECT_EQ(ResolveRecurrentPrefixSnapshotPrefillTokensForTest(&recurrent, false, 0, 37), 37);
+    EXPECT_EQ(ResolveRecurrentPrefixSnapshotPrefillTokensForTest(&recurrent, true, 32, 37), 37);
+    EXPECT_EQ(ResolveRecurrentPrefixSnapshotPrefillTokensForTest(&stateless, true, 0, 37), 37);
 }
 
 }  // namespace

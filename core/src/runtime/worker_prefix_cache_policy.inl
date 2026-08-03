@@ -158,6 +158,24 @@ bool ModelRequiresPrefixStateSnapshot(const TransformerModel* model) {
     return model && (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_lfm2_shortconv);
 }
 
+int ResolveRecurrentPrefixSnapshotPrefillTokens(const TransformerModel* model, bool prefix_cache_allowed,
+                                                int n_past, int requested_tokens) {
+    if (!prefix_cache_allowed || !ModelRequiresPrefixStateSnapshot(model) || n_past != 0 ||
+        requested_tokens <= BLOCK_SIZE) {
+        return requested_tokens;
+    }
+
+    const int trailing_tokens = requested_tokens % BLOCK_SIZE;
+    if (trailing_tokens == 0) {
+        return requested_tokens;
+    }
+
+    // A recurrent snapshot describes one exact token boundary. Split only the
+    // first unaligned prefill so the last full prefix block owns a restorable
+    // state; the following schedule processes the short tail normally.
+    return requested_tokens - trailing_tokens;
+}
+
 bool IsHybridSSMSnapshotRestoreAllowedForModel(const TransformerModel* model) {
     if (IsHybridSSMSnapshotRestoreDisabled()) {
         return false;
@@ -214,6 +232,9 @@ void InitializeRequestPrefixCacheState(Request* req, const TransformerModel* mod
     }
     if (req->prompt_tokens_for_cache.empty()) {
         req->prompt_tokens_for_cache = req->original_prompt_tokens_for_cache;
+    }
+    if (req->sequence_tokens_for_prefix_cache.empty()) {
+        req->sequence_tokens_for_prefix_cache = req->original_prompt_tokens_for_cache;
     }
     if (req->prompt_token_count <= 0) {
         req->prompt_token_count = static_cast<int>(req->original_prompt_tokens_for_cache.size());

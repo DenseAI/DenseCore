@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "compute_backend.h"
 
@@ -77,9 +78,14 @@ public:
      * Dynamically loads a shared library containing a backend implementation.
      * The library must export a "CreateBackend" factory function.
      *
+     * The registry retains the library handle for at least as long as the
+     * backend instance so virtual dispatch and destruction remain valid.
+     *
      * @param path Path to shared library
+     * @param error_message Optional load/factory failure detail
+     * @return true when a backend was created and registered
      */
-    void LoadPlugin(const std::string& path);
+    bool LoadPlugin(const std::string& path, std::string* error_message = nullptr);
 
     /**
      * @brief Get backend by device type
@@ -131,6 +137,10 @@ public:
      */
     bool IsInitialized() const { return initialized_.load(std::memory_order_acquire); }
 
+#ifdef DENSECORE_TEST_BUILD
+    void ResetForTesting();
+#endif
+
 #ifdef __APPLE__
     /**
      * @brief Get the Apple Silicon hybrid scheduler (CPU+GPU+ANE)
@@ -146,10 +156,16 @@ public:
 
 private:
     BackendRegistry() = default;
+    ~BackendRegistry();
     BackendRegistry(const BackendRegistry&) = delete;
     BackendRegistry& operator=(const BackendRegistry&) = delete;
 
+    void Shutdown() noexcept;
+
     std::mutex mutex_;
+    // Declared before backends_ as an additional lifetime safeguard: members
+    // are destroyed in reverse declaration order.
+    std::vector<void*> plugin_handles_;
     std::unordered_map<DeviceType, std::unique_ptr<ComputeBackend>> backends_;
     DeviceType default_device_ = DeviceType::CPU;
     std::atomic<bool> initialized_{false};

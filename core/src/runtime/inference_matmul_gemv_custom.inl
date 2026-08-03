@@ -153,8 +153,9 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     const auto lfm2_lm_head_begin =
         (ith == 0 && ud->lfm2_decode_lm_head) ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
-    const auto q6k_begin = (ith == 0 && weight_type == GGML_TYPE_Q6_K) ? std::chrono::steady_clock::now()
-                                                                       : std::chrono::steady_clock::time_point{};
+    const auto q6k_begin = (ith == 0 && weight_type == GGML_TYPE_Q6_K)
+                               ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
     bool q6k_decision_recorded = false;
     const auto maybe_log_gemv_timing = [&](const char* path) {
         if (!debug_gemv_timing || ith != 0) {
@@ -178,7 +179,8 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - census_begin)
                     .count());
         }
-        if (ith == 0 && weight_type == GGML_TYPE_Q6_K && callback_work_ctx && !q6k_decision_recorded) {
+        if (ith == 0 && weight_type == GGML_TYPE_Q6_K && callback_work_ctx &&
+            !q6k_decision_recorded) {
             if (wall_ns == 0 && q6k_begin != std::chrono::steady_clock::time_point{}) {
                 wall_ns = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - q6k_begin)
@@ -347,7 +349,6 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
         }
     }
 
-    // Partition output dimension across threads
     const int k_per_thread = (K + nth - 1) / nth;
     const int k_start = ith * k_per_thread;
     const int k_end = std::min(k_start + k_per_thread, K);

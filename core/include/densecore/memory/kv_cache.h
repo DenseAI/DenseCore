@@ -54,9 +54,10 @@ constexpr int BLOCK_SIZE = 16;
 // ============================================================================
 struct PhysicalBlock {
     int id = -1;
-    int ref_count = 0;          // Reference count for CoW
+    int ref_count = 0;          // Active request references for CoW
     int num_filled_slots = 0;   // Tokens currently stored (0 ~ BLOCK_SIZE)
     uint64_t content_hash = 0;  // Hash for prefix caching
+    bool cache_resident = false;
     bool is_full() const { return num_filled_slots >= BLOCK_SIZE; }
 };
 

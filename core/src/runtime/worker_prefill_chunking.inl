@@ -34,7 +34,10 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
 #endif
     const int base_chunk_tokens =
         qwen35_dense ? 768 : ((qwen35_moe || qwen_hybrid_ssm) ? hybrid_ssm_chunk_tokens : 192);
-    const int base_auto_min_tokens = qwen35_dense ? 1024 : ((qwen35_moe || qwen_hybrid_ssm) ? 1280 : 1536);
+    const int base_auto_min_tokens =
+        qwen35_dense ? 1024 : ((qwen35_moe || qwen_hybrid_ssm) ? base_chunk_tokens : 1536);
+    const int base_fail_closed_min_tokens =
+        qwen35_dense ? 1024 : ((qwen35_moe || qwen_hybrid_ssm) ? 1280 : 1536);
     const char* chunk_env = "DENSECORE_QWEN36_PREFILL_CHUNK_TOKENS";
     const char* default_env = "DENSECORE_QWEN36_PREFILL_CHUNK_DEFAULT_TOKENS";
     const char* auto_min_env = "DENSECORE_QWEN36_PREFILL_CHUNK_AUTO_MIN_TOKENS";
@@ -51,7 +54,7 @@ int ResolveQwen36PrefillChunkTokensImpl(const TransformerModel* model, const Req
         const std::string lowered = densecore::env::AsciiLowerCopy(env_value);
         if (lowered == "off" || lowered == "false" || lowered == "no") {
             const int prompt_tokens = RequestPromptTokenCountForChunking(req);
-            const int auto_min_tokens = densecore::env::ParsePositiveEnvInt(auto_min_env, base_auto_min_tokens);
+            const int auto_min_tokens = densecore::env::ParsePositiveEnvInt(auto_min_env, base_fail_closed_min_tokens);
             if (qwen_hybrid_ssm && prompt_tokens >= auto_min_tokens) {
                 return default_chunk_tokens;
             }

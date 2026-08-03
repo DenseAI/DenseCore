@@ -166,6 +166,8 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 	if isQwen36ModelHint(modelHint) {
 		if thinkingEnabled {
 			sb.WriteString("<think>\n")
+		} else {
+			sb.WriteString("<think>\n\n</think>\n\n")
 		}
 	} else if thinkingEnabled {
 		sb.WriteString("<think>\n")

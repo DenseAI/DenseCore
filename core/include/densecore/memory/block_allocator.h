@@ -33,7 +33,9 @@
 #include <malloc.h>  // For _aligned_malloc/_aligned_free
 #endif
 
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+// libnuma, not hwloc: gate on DENSECORE_HAS_NUMA. DENSECORE_USE_HWLOC is
+// defined even in the hwloc-only build, which does not link libnuma.
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
 #include <numa.h>
 #endif
 
@@ -473,7 +475,7 @@ private:
      * @return Pointer to allocated memory, nullptr on failure
      */
     static void* AllocateNuma(size_t size, int numa_node, bool strict_numa) {
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
         if (numa_available() < 0) {
             std::cerr << "[KVBlockAllocator] NUMA not available on this system" << std::endl;
             return nullptr;
@@ -517,7 +519,7 @@ private:
      * @brief Free NUMA-allocated memory
      */
     static void FreeNuma(void* ptr, size_t size) {
-#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+#if defined(__linux__) && defined(DENSECORE_HAS_NUMA)
         if (ptr && size > 0) {
             numa_free(ptr, size);
         }

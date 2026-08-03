@@ -1329,8 +1329,9 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                             float* out_group =
                                 reinterpret_cast<float*>(output_base + static_cast<size_t>(m) * output_col_stride) +
                                 k_aligned_start;
-                            ggml_gemv_q8_0_4x8_q8_0(N, out_group, 0, packed->data.data() + packed_offset, q_ptr, 1,
-                                                    k_aligned_end - k_aligned_start);
+                            DenseCoreGemvQ8_0_4x8Q8_0Generic(
+                                N, out_group, packed->data.data() + packed_offset, q_ptr,
+                                k_aligned_end - k_aligned_start);
                         }
                         run_scalar_cols(m, std::max(k_aligned_end, k_start), k_end);
                     }
@@ -1639,8 +1640,9 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                             k_aligned_start;
                         const uint8_t* q8_row = q8_input_base + static_cast<size_t>(m) * q8_row_stride;
                         if (ud->qwen36_ssm_q8_repacked_batched || ud->lfm2_q8_repacked_batched) {
-                            DenseCoreGemvQ8_0_4x8Q8_0Generic(N, out_group, packed->data.data() + packed_offset, q8_row,
-                                                             k_aligned_end - k_aligned_start);
+                            DenseCoreGemvQ8_0_4x8Q8_0Generic(
+                                N, out_group, packed->data.data() + packed_offset, q8_row,
+                                k_aligned_end - k_aligned_start);
                         } else {
                             ggml_gemv_q8_0_4x8_q8_0(N, out_group, 0, packed->data.data() + packed_offset, q8_row, 1,
                                                      k_aligned_end - k_aligned_start);
@@ -3324,6 +3326,7 @@ inline struct ggml_tensor* ggml_mul_mat_gemv(struct ggml_context* ctx, struct gg
     const bool semantic_decode_projection = IsSemanticDecodeProjectionGemv(userdata, N, K);
     n_threads =
         ResolveGemvCustomOpTaskCount(batch, N, K, n_threads, physical_cores, semantic_decode_projection, &cap_reason);
+
     if (userdata->work_ctx) {
         SetQwen36ProfileMax(userdata->work_ctx->qwen36_profile.gemv_custom_tasks_effective, n_threads);
         userdata->work_ctx->qwen36_profile.gemv_custom_tasks_cap_reason.store(

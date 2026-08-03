@@ -75,6 +75,8 @@ int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, in
     group.arrival_time = std::chrono::steady_clock::now();
     group.num_tokens_to_process = prompt_len;
     group.max_prefill_chunk_tokens = max_prefill_chunk_tokens > 0 ? max_prefill_chunk_tokens : -1;
+    group.align_initial_prefill_for_prefix_snapshot =
+        allow_chunked_prefill && require_hybrid_ssm_prefix_snapshot && prefix_tokens && !prefix_tokens->empty();
 
     // Check for reusable full-block prefix hits.
     // Prefix reuse always leaves at least one token to execute so prompt-end

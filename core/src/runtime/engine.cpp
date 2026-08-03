@@ -2448,12 +2448,18 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
 // =============================================================================
 
 DENSECORE_API int DenseCoreLoadPlugin(const char* path) {
-    if (!path) {
-        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCoreLoadPlugin: path is null");
+    if (!path || path[0] == '\0') {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCoreLoadPlugin: path is null or empty");
         return DENSECORE_STATUS_INVALID_ARGUMENT;
     }
     try {
-        densecore::BackendRegistry::Instance().LoadPlugin(path);
+        std::string error_message;
+        if (!densecore::BackendRegistry::Instance().LoadPlugin(path, &error_message)) {
+            SetError(DENSECORE_STATUS_BACKEND_ERROR,
+                     "DenseCoreLoadPlugin: " +
+                         (error_message.empty() ? std::string("backend plugin load failed") : error_message));
+            return DENSECORE_STATUS_BACKEND_ERROR;
+        }
         ClearError();
         return DENSECORE_STATUS_OK;
     } catch (const std::exception& e) {
@@ -3210,6 +3216,63 @@ int SetDefaultModel(DenseCoreHandle handle, const char* model_id) {
 // Universal Graph Execution API
 // =============================================================================
 
+namespace {
+
+bool GraphInputByteSize(const DenseCoreTensorInput& input, size_t* byte_size, std::string* error) {
+    if (!byte_size || !error) return false;
+    if (!input.data) {
+        *error = "input data is null";
+        return false;
+    }
+    if (input.ndim <= 0 || input.ndim > DENSECORE_MAX_DIMS) {
+        *error = "input ndim must be between 1 and DENSECORE_MAX_DIMS";
+        return false;
+    }
+
+    size_t elements = 1;
+    for (int dim = 0; dim < input.ndim; ++dim) {
+        if (input.shape[dim] <= 0) {
+            *error = "input shape dimensions must be positive";
+            return false;
+        }
+        const uint64_t extent_u64 = static_cast<uint64_t>(input.shape[dim]);
+        if (extent_u64 > std::numeric_limits<size_t>::max()) {
+            *error = "input dimension exceeds addressable size";
+            return false;
+        }
+        const size_t extent = static_cast<size_t>(extent_u64);
+        if (elements > std::numeric_limits<size_t>::max() / extent) {
+            *error = "input element count overflow";
+            return false;
+        }
+        elements *= extent;
+    }
+
+    size_t bytes_per_element = 0;
+    switch (input.dtype) {
+    case DENSECORE_DTYPE_F32:
+    case DENSECORE_DTYPE_INT32: bytes_per_element = 4; break;
+    case DENSECORE_DTYPE_F16:
+    case DENSECORE_DTYPE_BF16: bytes_per_element = 2; break;
+    case DENSECORE_DTYPE_INT8: bytes_per_element = 1; break;
+    case DENSECORE_DTYPE_INT4:
+        *byte_size = elements / 2 + elements % 2;
+        return true;
+    default:
+        *error = "unsupported input dtype";
+        return false;
+    }
+
+    if (elements > std::numeric_limits<size_t>::max() / bytes_per_element) {
+        *error = "input byte size overflow";
+        return false;
+    }
+    *byte_size = elements * bytes_per_element;
+    return true;
+}
+
+}  // namespace
+
 /**
  * @brief Submit a graph execution request with tensor inputs (Non-blocking)
  */
@@ -3230,25 +3293,50 @@ DENSECORE_API int SubmitGraphRequest(DenseCoreHandle handle, const DenseCoreTens
 
     EngineState* state = (EngineState*)handle;
     Request* req = AcquireAndInitRequest(state);
+    RequestGuard guard(state, req);
 
     req->is_graph_execution = true;
     req->graph_name = graph_name;
     req->graph_callback = callback;
     req->user_data = user_data;
 
-    // Copy input descriptors (ownership of data pointer remains with caller)
-    req->graph_inputs.reserve(num_inputs);
-    for (int i = 0; i < num_inputs; ++i) {
-        req->graph_inputs.push_back(inputs[i]);
+    try {
+        req->graph_inputs.reserve(static_cast<size_t>(num_inputs));
+        for (int i = 0; i < num_inputs; ++i) {
+            size_t byte_size = 0;
+            std::string validation_error;
+            if (!GraphInputByteSize(inputs[i], &byte_size, &validation_error)) {
+                SetError(DENSECORE_STATUS_INVALID_ARGUMENT,
+                         "SubmitGraphRequest: input " + std::to_string(i) + ": " + validation_error);
+                return DENSECORE_STATUS_INVALID_ARGUMENT;
+            }
+
+            OwnedGraphInput owned;
+            owned.name = inputs[i].name ? inputs[i].name : "";
+            owned.ndim = inputs[i].ndim;
+            owned.dtype = inputs[i].dtype;
+            std::copy_n(inputs[i].shape, owned.ndim, owned.shape.begin());
+            owned.bytes.resize(byte_size);
+            std::memcpy(owned.bytes.data(), inputs[i].data, byte_size);
+            req->graph_inputs.push_back(std::move(owned));
+        }
+    } catch (const std::bad_alloc&) {
+        SetError(DENSECORE_STATUS_OUT_OF_MEMORY, "SubmitGraphRequest: failed to copy input data");
+        return DENSECORE_STATUS_OUT_OF_MEMORY;
+    } catch (const std::exception& e) {
+        SetError(DENSECORE_STATUS_INTERNAL_ERROR, std::string("SubmitGraphRequest: input copy failed: ") + e.what());
+        return DENSECORE_STATUS_INTERNAL_ERROR;
     }
 
     // Graph requests get high priority by default
     req->tier = "premium";
     req->priority = 50;
 
+    const int request_id = req->id;
     EnqueueRequest(state, req);
+    guard.release();
     ClearError();
-    return req->id;
+    return request_id;
 }
 
 namespace {
@@ -3256,6 +3344,7 @@ namespace {
 struct GraphSyncContext {
     DenseCoreTensorOutput* user_outputs;
     int num_user_outputs;
+    int status = DENSECORE_STATUS_OK;
     std::promise<void> promise;
 };
 
@@ -3265,6 +3354,11 @@ void GraphSyncCallback(const DenseCoreTensorOutput* outputs, int num_outputs, vo
     if (!ctx) return;
 
     try {
+        if (num_outputs < 0 || (!outputs && num_outputs > 0)) {
+            ctx->status = num_outputs < 0 ? num_outputs : DENSECORE_STATUS_INTERNAL_ERROR;
+            ctx->promise.set_value();
+            return;
+        }
         int count = std::min(ctx->num_user_outputs, num_outputs);
         for (int i = 0; i < count; ++i) {
             const auto& src = outputs[i];
@@ -3301,7 +3395,11 @@ void GraphSyncCallback(const DenseCoreTensorOutput* outputs, int num_outputs, vo
         }
         ctx->promise.set_value();
     } catch (...) {
-        ctx->promise.set_exception(std::current_exception());
+        try {
+            ctx->promise.set_exception(std::current_exception());
+        } catch (...) {
+            // The request completion contract is exactly once; contain broken-promise callbacks.
+        }
     }
 }
 }  // namespace
@@ -3328,7 +3426,12 @@ DENSECORE_API int ExecuteGraphSync(DenseCoreHandle handle, const DenseCoreTensor
 
     // Wait for completion
     try {
-        future.wait();
+        future.get();
+        if (ctx.status < 0) {
+            SetError(static_cast<DenseCoreStatus>(ctx.status),
+                     "ExecuteGraphSync: graph execution failed with status " + std::to_string(ctx.status));
+            return ctx.status;
+        }
         ClearError();
         return DENSECORE_STATUS_OK;
     } catch (const std::exception& e) {

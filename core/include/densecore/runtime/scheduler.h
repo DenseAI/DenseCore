@@ -74,6 +74,7 @@ struct SequenceGroup {
     int num_running_seqs = 0;
     int num_tokens_to_process = 0;
     int max_prefill_chunk_tokens = -1;
+    bool align_initial_prefill_for_prefix_snapshot = false;
 
     // Progress tracking (for smart preemption)
     int generated_tokens = 0;  // Tokens generated so far

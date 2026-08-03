@@ -118,6 +118,10 @@ struct InferenceWorkContext {
     std::vector<ggml_bf16_t> bf16_buffer;
 };
 
+static uint64_t GetInferenceWorkContextExecutionGeneration(const InferenceWorkContext* ctx) {
+    return ctx ? ctx->execution_generation : 0;
+}
+
 static void ResetQuantizedActivationCache(InferenceWorkContext* ctx) {
     if (!ctx) {
         return;

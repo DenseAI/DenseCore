@@ -180,13 +180,13 @@ bool PrepareMoESmallDecodeSharedInputCache(const MoESmallDecodeTileParallelReque
 // holds each expert's weights (as recorded by RegisterMoEExperts placement
 // detection / load-time expert partitioning), and each group runs on that
 // node's thread pool — concurrently across nodes via RunConcurrentNodeTasks.
-// Single-node hosts (or DENSECORE_MOE_STICKY_DECODE=0) keep the legacy
+// Single-node hosts (or the explicit diagnostic disable) keep the legacy
 // single-pool path unchanged.
 
 bool IsMoEStickyDecodeDispatchEnabled() {
     static const bool enabled = []() {
-        const char* env = std::getenv("DENSECORE_MOE_STICKY_DECODE");
-        return !(env && env[0] != '\0' && std::strcmp(env, "0") == 0);  // default ON
+        const char* env = std::getenv("DENSECORE_DEBUG_DISABLE_MOE_NUMA_STICKY");
+        return !(env && env[0] != '\0' && std::strcmp(env, "0") != 0);  // maintained default: ON
     }();
     return enabled;
 }

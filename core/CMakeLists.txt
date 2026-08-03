@@ -1075,22 +1075,34 @@ message(STATUS "Threading: GGML thread pool + std::thread (OpenMP disabled)")
 # Enables NUMA-aware memory allocation and thread affinity for multi-socket
 # servers. Falls back to sysfs detection if libraries are not available.
 # ==========================================================================
+# The NUMA settings are captured into variables rather than applied only to
+# `densecore`, because NumaAllocator/KVBlockAllocator live in public headers as
+# inline implementations. Any target that compiles those headers must see the
+# same macros, or it silently compiles the non-NUMA branch — which both breaks
+# ODR and makes NUMA tests validate no-ops. `densecore_tests` in particular
+# compiles the sources directly instead of linking densecore, so PUBLIC
+# propagation would not reach it. Applied to every such target below via
+# densecore_apply_numa_settings().
+set(DENSECORE_NUMA_DEFINITIONS "")
+set(DENSECORE_NUMA_INCLUDE_DIRS "")
+set(DENSECORE_NUMA_LIBRARIES "")
+
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
     pkg_check_modules(HWLOC QUIET hwloc)
     pkg_check_modules(NUMA QUIET numa)
 
     if(HWLOC_FOUND AND NUMA_FOUND)
-        target_include_directories(densecore PRIVATE
-            ${HWLOC_INCLUDE_DIRS} ${NUMA_INCLUDE_DIRS})
-        target_link_libraries(densecore PRIVATE
-            ${HWLOC_LIBRARIES} ${NUMA_LIBRARIES})
-        target_compile_definitions(densecore PRIVATE DENSECORE_USE_HWLOC DENSECORE_HAS_NUMA)
+        set(DENSECORE_NUMA_DEFINITIONS DENSECORE_USE_HWLOC DENSECORE_HAS_NUMA)
+        set(DENSECORE_NUMA_INCLUDE_DIRS ${HWLOC_INCLUDE_DIRS} ${NUMA_INCLUDE_DIRS})
+        set(DENSECORE_NUMA_LIBRARIES ${HWLOC_LIBRARIES} ${NUMA_LIBRARIES})
         message(STATUS "NUMA support enabled: hwloc ${HWLOC_VERSION}, numa ${NUMA_VERSION}")
     elseif(HWLOC_FOUND)
-        target_include_directories(densecore PRIVATE ${HWLOC_INCLUDE_DIRS})
-        target_link_libraries(densecore PRIVATE ${HWLOC_LIBRARIES})
-        target_compile_definitions(densecore PRIVATE DENSECORE_USE_HWLOC)
+        # hwloc only: topology discovery works, but libnuma allocation does not.
+        # DENSECORE_HAS_NUMA stays undefined so no libnuma symbol is referenced.
+        set(DENSECORE_NUMA_DEFINITIONS DENSECORE_USE_HWLOC)
+        set(DENSECORE_NUMA_INCLUDE_DIRS ${HWLOC_INCLUDE_DIRS})
+        set(DENSECORE_NUMA_LIBRARIES ${HWLOC_LIBRARIES})
         message(STATUS "Partial NUMA support: hwloc ${HWLOC_VERSION} (libnuma not found)")
     else()
         message(STATUS "NUMA libs not found - using fallback sysfs detection")
@@ -1098,6 +1110,25 @@ if(PkgConfig_FOUND)
 else()
     message(STATUS "pkg-config not found - NUMA support disabled")
 endif()
+
+# Apply the detected NUMA build settings to a target that compiles DenseCore
+# headers or sources. Must be called for every such target.
+function(densecore_apply_numa_settings target)
+    if(NOT TARGET ${target})
+        return()
+    endif()
+    if(DENSECORE_NUMA_INCLUDE_DIRS)
+        target_include_directories(${target} PRIVATE ${DENSECORE_NUMA_INCLUDE_DIRS})
+    endif()
+    if(DENSECORE_NUMA_LIBRARIES)
+        target_link_libraries(${target} PRIVATE ${DENSECORE_NUMA_LIBRARIES})
+    endif()
+    if(DENSECORE_NUMA_DEFINITIONS)
+        target_compile_definitions(${target} PRIVATE ${DENSECORE_NUMA_DEFINITIONS})
+    endif()
+endfunction()
+
+densecore_apply_numa_settings(densecore)
 
 # Position Independent Code (required for shared libraries)
 set_target_properties(densecore PROPERTIES
@@ -1225,6 +1256,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_llm_runtime_config.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_moe_profiler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_numa_sticky_routing.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_numa_rebalance.cpp
         # Phase 1: Universal HAL tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_transformer_ops.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_rope_2d.cpp
@@ -1264,6 +1296,9 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_plugin_loader.cpp
         # E2E smoke tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_engine_e2e.cpp
+        # Lifecycle tests mutate process-global engine/backend registries; keep them last.
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_graph_request_lifecycle.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/test_backend_plugin_loader.cpp
     )
 
     # Create test executable
@@ -1271,6 +1306,21 @@ if(DENSECORE_BUILD_TESTS)
     # This allows tests to access "internal" (hidden visibility) symbols that are not exported
     # by the shared library.
     add_executable(densecore_tests ${TEST_SOURCES} ${SOURCES})
+
+    add_library(densecore_test_backend_plugin MODULE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/plugins/valid_backend_plugin.cpp
+    )
+    add_library(densecore_test_invalid_backend_plugin MODULE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/plugins/invalid_backend_plugin.cpp
+    )
+    target_include_directories(densecore_test_backend_plugin PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_definitions(densecore_tests PRIVATE
+        DENSECORE_TEST_BACKEND_PLUGIN_PATH="$<TARGET_FILE:densecore_test_backend_plugin>"
+        DENSECORE_TEST_INVALID_BACKEND_PLUGIN_PATH="$<TARGET_FILE:densecore_test_invalid_backend_plugin>"
+    )
+    add_dependencies(densecore_tests densecore_test_backend_plugin densecore_test_invalid_backend_plugin)
 
     add_executable(gemma4_parity_probe
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/gemma4_parity_probe.cpp
@@ -1316,6 +1366,13 @@ if(DENSECORE_BUILD_TESTS)
     # Enable mock model for E2E tests (allows InitEngine("mock", ...))
     target_compile_definitions(densecore_tests PRIVATE DENSECORE_TEST_BUILD)
     target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_TEST_BUILD)
+
+    # Both targets compile the core sources and public headers directly, so they
+    # need the same NUMA macros as `densecore`. Without this, the NUMA tests in
+    # tests/memory/test_numa_sticky_routing.cpp exercise the non-NUMA fallback
+    # branch and pass on a machine where the real code path was never run.
+    densecore_apply_numa_settings(densecore_tests)
+    densecore_apply_numa_settings(gemma4_parity_probe)
     target_compile_definitions(densecore_tests PRIVATE
         DENSECORE_GGML_CPU_KLEIDIAI=$<IF:$<BOOL:${GGML_CPU_KLEIDIAI}>,1,0>)
     target_compile_definitions(gemma4_parity_probe PRIVATE

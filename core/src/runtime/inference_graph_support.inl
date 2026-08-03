@@ -1,3 +1,5 @@
+static uint64_t GetInferenceWorkContextExecutionGeneration(const InferenceWorkContext* ctx);
+
 namespace {
 
 bool IsDebugSharedExpertShapeEnabled() {
@@ -98,13 +100,16 @@ bool ShouldEnableNativeMoEFastPathByDefault(const TransformerModel* model, Infer
 
 static int ResolveNativeMoEGraphCallbackTaskCount(const TransformerModel* model, const BatchSpec* batch,
                                                   InferenceExecutionPhase phase, int64_t n_tokens, int top_k);
+static int ResolveTaskCount(const BatchSpec* batch, int work_items);
 struct Qwen35SharedQ8RowsUserData;
 static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_context* ctx, const ggml_tensor* src,
-                                                                      int64_t max_assignments);
+                                                                      int64_t max_assignments,
+                                                                      int64_t direct_output_rows);
 static void SetNativeMoECallbackRequestedTaskCount(Qwen35SharedQ8RowsUserData* ud, int requested_task_count);
 static void SetNativeMoENumaContext(Qwen35SharedQ8RowsUserData* ud, densecore::CpuBackend* backend,
                                     const TransformerLayer* layer);
 static bool NativeMoEHasVerifiedNumaPlacement(densecore::CpuBackend* backend, const TransformerLayer* layer);
+static inline void RecordNativeMoENumaDispatch(int node);
 static void cb_gemma4_native_moe_down_weighted_sum(struct ggml_tensor* dst, int ith, int nth, void* userdata);
 
 bool IsDebugLFM2NativeMoEReferenceEnabled() {
@@ -256,7 +261,8 @@ struct Gemma4PackedMoERoots {
 
 struct Qwen35SharedQ8RowsUserData;
 static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_context* ctx, const ggml_tensor* src,
-                                                                      int64_t max_assignments = 0);
+                                                                      int64_t max_assignments = 0,
+                                                                      int64_t direct_output_rows = 0);
 
 ggml_tensor* GetLayerTensorAny(TransformerLayer* layer, std::initializer_list<const char*> keys) {
     if (!layer) {
@@ -1377,10 +1383,13 @@ static bool RunGemma4GateUpQ4KPrefillFusedGEGLU(ggml_tensor* dst, const ggml_ten
                 }
             }
         };
-        const int node = ud->numa_sticky_enabled && ud->numa_backend && ud->numa_layer
-                             ? ud->numa_backend->GetExpertNumaNode(ud->numa_layer, expert)
-                             : -1;
-        if (node >= 0 && node < ud->numa_backend->GetNumaNodeCount()) {
+        const int raw_node = ud->numa_sticky_enabled && ud->numa_backend && ud->numa_layer
+                                 ? ud->numa_backend->GetExpertNumaNode(ud->numa_layer, expert)
+                                 : -1;
+        const int node =
+            (raw_node >= 0 && raw_node < ud->numa_backend->GetNumaNodeCount()) ? raw_node : -1;
+        RecordNativeMoENumaDispatch(node);
+        if (node >= 0) {
             ud->numa_backend->RunOnNumaNode(node, run_batch);
         } else {
             run_batch();
@@ -2190,6 +2199,7 @@ ggml_tensor* TryBuildGemma4NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
 constexpr int kQwen35SharedQ8MaxTasks = 128;
 constexpr int64_t kQwen35NativeMoEBatchedQ4KMaxAssignments = 256;
 constexpr int64_t kQwen35NativeMoEGateUpBatchTile = 128;
+constexpr int kQwen35NativeMoEMaxGroupedExperts = 64;
 
 struct Qwen35MoEAssignment {
     int32_t expert = -1;
@@ -2206,8 +2216,10 @@ struct Qwen35SharedQ8RowsUserData {
     size_t row_bytes = 0;
     uint8_t* rows = nullptr;
     InferenceWorkContext* work_ctx = nullptr;
+    InferenceExecutionPhase execution_phase = InferenceExecutionPhase::Unknown;
     densecore::CpuBackend* numa_backend = nullptr;
     const TransformerLayer* numa_layer = nullptr;
+    const ggml_tensor* prepacked_fused_gate_up_exps = nullptr;
     bool numa_sticky_enabled = false;
     std::atomic<uint64_t> epoch{0};
     std::atomic<uint64_t> ready_epoch{0};
@@ -2223,16 +2235,35 @@ struct Qwen35SharedQ8RowsUserData {
     float weighted_logits_scale = 1.0f;
     QwenNativeMoEFusedRouterState* fused_router_state = nullptr;
     int requested_task_count = 0;
+    // Task width the native MoE callback is currently running at, published by
+    // RemapNativeMoECallbackTask. Kernels dispatched from inside that region use
+    // it to decide whether re-parallelizing onto a node thread pool is worth it:
+    // when the outer region is already wide, it is not.
+    std::atomic<int> outer_task_width{0};
+    // 0 = unresolved, 1 = keep the validated Highway reference, 2 = use the
+    // maintained DenseCore AVX2/scalar single-row Q5_K kernel. The verdict is
+    // populated once per graph userdata before the row-parallel hot loop.
+    std::atomic<int> q5k_single_row_admission{0};
     std::atomic<uint64_t> assignments_ready_epoch{0};
     std::atomic<int> assignments_failed{0};
     Qwen35MoEAssignment* assignments = nullptr;
     size_t assignment_capacity = 0;
     size_t assignment_count = 0;
     uint64_t task_epoch[kQwen35SharedQ8MaxTasks] = {};
+    float* direct_expert_outputs = nullptr;
+    size_t direct_expert_output_capacity = 0;
+    std::atomic<uint64_t> direct_epoch{0};
+    std::atomic<int> direct_remaining_tasks{0};
+    std::atomic<int> direct_failed{0};
+    uint64_t direct_task_epoch[kQwen35SharedQ8MaxTasks] = {};
+    int outer_task_cores[kQwen35SharedQ8MaxTasks] = {};
+    int outer_task_nodes[kQwen35SharedQ8MaxTasks] = {};
+    int outer_task_mapping_count = 0;
 };
 
 static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_context* ctx, const ggml_tensor* src,
-                                                                      int64_t max_assignments) {
+                                                                      int64_t max_assignments,
+                                                                      int64_t direct_output_rows) {
     if (!ctx || !src || src->type != GGML_TYPE_F32 || src->ne[0] <= 0 || src->ne[1] <= 0 || src->ne[2] <= 0) {
         return nullptr;
     }
@@ -2245,6 +2276,11 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
     const size_t assignment_capacity =
         max_assignments > 0 ? static_cast<size_t>(std::min<int64_t>(max_assignments, 4096 * 64)) : 0;
     const size_t assignments_bytes = assignment_capacity * sizeof(Qwen35MoEAssignment);
+    const size_t direct_output_capacity =
+        direct_output_rows > 0 && assignment_capacity > 0
+            ? assignment_capacity * static_cast<size_t>(direct_output_rows)
+            : 0;
+    const size_t direct_outputs_bytes = direct_output_capacity * sizeof(float);
     if (ggml_get_no_alloc(ctx)) {
         // The custom op retains userdata after graph construction. Allocate a
         // stable sidecar per op; reusing one TLS object aliases different MoE
@@ -2257,6 +2293,8 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
         ud->rows = new uint8_t[rows_bytes]();
         ud->assignments = assignment_capacity > 0 ? new Qwen35MoEAssignment[assignment_capacity]() : nullptr;
         ud->assignment_capacity = assignment_capacity;
+        ud->direct_expert_outputs = direct_output_capacity > 0 ? new float[direct_output_capacity]() : nullptr;
+        ud->direct_expert_output_capacity = direct_output_capacity;
         return ud;
     }
     ggml_tensor* ud_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, sizeof(Qwen35SharedQ8RowsUserData));
@@ -2264,6 +2302,9 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
     ggml_tensor* assignments_storage =
         assignments_bytes > 0 ? ggml_new_tensor_1d(ctx, GGML_TYPE_I8, static_cast<int64_t>(assignments_bytes))
                               : nullptr;
+    ggml_tensor* direct_outputs_storage =
+        direct_outputs_bytes > 0 ? ggml_new_tensor_1d(ctx, GGML_TYPE_I8, static_cast<int64_t>(direct_outputs_bytes))
+                                 : nullptr;
     if (!ud_storage || !ud_storage->data || !rows_storage || !rows_storage->data) {
         return nullptr;
     }
@@ -2293,6 +2334,10 @@ static Qwen35SharedQ8RowsUserData* AllocateQwen35SharedQ8RowsUserData(ggml_conte
         ud->assignments = static_cast<Qwen35MoEAssignment*>(assignments_storage->data);
         ud->assignment_capacity = assignment_capacity;
     }
+    if (direct_outputs_storage && direct_outputs_storage->data) {
+        ud->direct_expert_outputs = static_cast<float*>(direct_outputs_storage->data);
+        ud->direct_expert_output_capacity = direct_output_capacity;
+    }
     ud->assignment_count = 0;
     return ud;
 }
@@ -2306,9 +2351,16 @@ static bool RemapNativeMoECallbackTask(Qwen35SharedQ8RowsUserData* ud, int ith, 
     if (task_count <= 0 || task_count >= nth) {
         *effective_ith = ith;
         *effective_nth = nth;
+        if (ud) {
+            // Every task publishes the same width, so a relaxed store is enough.
+            ud->outer_task_width.store(nth, std::memory_order_relaxed);
+        }
         return true;
     }
     task_count = std::max(1, task_count);
+    if (ud) {
+        ud->outer_task_width.store(task_count, std::memory_order_relaxed);
+    }
     if (ith >= task_count) {
         return false;
     }
@@ -2317,9 +2369,165 @@ static bool RemapNativeMoECallbackTask(Qwen35SharedQ8RowsUserData* ud, int ith, 
     return true;
 }
 
+// True when the caller is the only task running the native MoE op, so a kernel
+// may safely fan out onto a NUMA node's thread pool. Inside a wide outer region
+// that fan-out is pure loss: the outer tasks already saturate the machine, and
+// the node pool's workers would just oversubscribe the same cores.
+static inline bool NativeMoEKernelMayFanOut(const Qwen35SharedQ8RowsUserData* ud, int numa_node) {
+    if (numa_node < 0) {
+        return false;
+    }
+    const int width = ud ? ud->outer_task_width.load(std::memory_order_relaxed) : 0;
+    return width <= 1;
+}
+
 static void SetNativeMoECallbackRequestedTaskCount(Qwen35SharedQ8RowsUserData* ud, int requested_task_count) {
     if (ud) {
         ud->requested_task_count = requested_task_count;
+    }
+}
+
+// --------------------------------------------------------------------------
+// Native MoE NUMA sticky-routing observability
+// --------------------------------------------------------------------------
+// The small-decode dispatcher announces itself with a log line, but the native
+// MoE path below has historically been silent. That made an inactive sticky
+// router indistinguishable from an active one in a server log, so these
+// Counters record actual NUMA handoffs. Legacy paths count per expert, while
+// grouped decode paths count once per active node group.
+
+struct NativeMoENumaCounters {
+    std::atomic<uint64_t> context_set_total{0};
+    std::atomic<uint64_t> context_enabled_total{0};
+    std::atomic<uint64_t> sticky_dispatch_ops{0};
+    std::atomic<uint64_t> legacy_dispatch_ops{0};
+    std::atomic<uint64_t> grouped_decode_used_ops{0};
+    std::atomic<uint64_t> grouped_dispatch_node_tasks{0};
+    std::atomic<uint64_t> grouped_dispatch_expert_items{0};
+    std::atomic<uint64_t> direct_decode_used_ops{0};
+    std::atomic<uint64_t> direct_decode_rejected_ops{0};
+    std::array<std::atomic<uint64_t>, kNativeMoENumaMaxTrackedNodes> node_dispatch_ops{};
+    std::atomic<uint64_t> node_dispatch_overflow_ops{0};
+    std::atomic<int> last_state{static_cast<int>(NativeMoENumaStickyState::Unset)};
+};
+
+static NativeMoENumaCounters& GetNativeMoENumaCounters() {
+    static NativeMoENumaCounters counters;
+    return counters;
+}
+
+// The facts behind the sticky-routing verdict. The state alone cannot explain a
+// degenerate layout, so the expert count and the node they all landed on ride
+// along for the one-shot warning in RecordNativeMoENumaContext.
+struct NativeMoENumaPlacement {
+    NativeMoENumaStickyState state = NativeMoENumaStickyState::Unset;
+    int expert_count = 0;
+    int node_count = 0;
+    int sole_node = -1;  // set only for EnabledSingleNodeDegenerate
+};
+
+// Sticky dispatch arms for both armed states. The degenerate layout is reported
+// differently but routed identically, which keeps this split purely
+// observational: whether to fall back to core round-robin when every expert
+// sits on one node is a policy question that needs real two-socket throughput
+// numbers to answer, and spreading compute away from where the weights live can
+// cost more in remote access than it wins in parallelism.
+static constexpr bool NativeMoENumaStickyArmed(NativeMoENumaStickyState state) {
+    return state == NativeMoENumaStickyState::Enabled ||
+           state == NativeMoENumaStickyState::EnabledSingleNodeDegenerate;
+}
+
+static NativeMoENumaPlacement EvaluateNativeMoENumaPlacement(densecore::CpuBackend* backend,
+                                                             const TransformerLayer* layer) {
+    NativeMoENumaPlacement placement;
+    if (densecore::env::ParseTruthyEnv("DENSECORE_DEBUG_DISABLE_MOE_NUMA_STICKY", false)) {
+        placement.state = NativeMoENumaStickyState::DisabledByDebug;
+        return placement;
+    }
+    if (!backend || !layer) {
+        placement.state = NativeMoENumaStickyState::NoBackend;
+        return placement;
+    }
+    placement.node_count = backend->GetNumaNodeCount();
+    if (placement.node_count <= 1) {
+        placement.state = NativeMoENumaStickyState::SingleNode;
+        return placement;
+    }
+    std::vector<int> nodes;
+    if (!backend->CopyExpertNumaNodes(layer, static_cast<int>(layer->NumExperts()), &nodes) || nodes.empty()) {
+        placement.state = NativeMoENumaStickyState::PlacementUnavailable;
+        return placement;
+    }
+    placement.expert_count = static_cast<int>(nodes.size());
+    const int node_count = placement.node_count;
+    const bool all_valid = std::all_of(nodes.begin(), nodes.end(),
+                                       [node_count](int node) { return node >= 0 && node < node_count; });
+    if (!all_valid) {
+        placement.state = NativeMoENumaStickyState::PlacementInvalid;
+        return placement;
+    }
+    const int first_node = nodes.front();
+    const bool degenerate =
+        std::all_of(nodes.begin(), nodes.end(), [first_node](int node) { return node == first_node; });
+    placement.state = degenerate ? NativeMoENumaStickyState::EnabledSingleNodeDegenerate
+                                 : NativeMoENumaStickyState::Enabled;
+    placement.sole_node = degenerate ? first_node : -1;
+    return placement;
+}
+
+// One-shot so a 60-layer model does not emit 60 identical lines per decode step.
+// Reports the first observed state and, separately, the first time sticky
+// routing actually arms — the transition operators care about.
+static void RecordNativeMoENumaContext(const NativeMoENumaPlacement& placement, densecore::CpuBackend* backend) {
+    auto& counters = GetNativeMoENumaCounters();
+    counters.context_set_total.fetch_add(1, std::memory_order_relaxed);
+    counters.last_state.store(static_cast<int>(placement.state), std::memory_order_relaxed);
+
+    // Counts armed contexts, degenerate included: the router did arm, and the
+    // state field alongside it says in which form.
+    const bool armed = NativeMoENumaStickyArmed(placement.state);
+    if (armed) {
+        counters.context_enabled_total.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const bool degenerate = placement.state == NativeMoENumaStickyState::EnabledSingleNodeDegenerate;
+    static std::atomic<bool> logged_any{false};
+    static std::atomic<bool> logged_enabled{false};
+    static std::atomic<bool> logged_degenerate{false};
+    const bool first_any = !logged_any.exchange(true, std::memory_order_relaxed);
+    const bool first_enabled = armed && !logged_enabled.exchange(true, std::memory_order_relaxed);
+    // Its own one-shot: a degenerate layer arriving after a well-spread one
+    // would otherwise never warn, since logged_enabled is already set.
+    const bool first_degenerate = degenerate && !logged_degenerate.exchange(true, std::memory_order_relaxed);
+    if (!first_any && !first_enabled && !first_degenerate) {
+        return;
+    }
+    const char* state_name = GetNativeMoENumaStickyStateName(static_cast<int>(placement.state));
+    const int node_count = backend ? backend->GetNumaNodeCount() : 0;
+    if (degenerate) {
+        std::fprintf(stderr,
+                     "[NUMA] Native MoE sticky routing active but DEGENERATE (state=%s, nodes=%d) -- all %d "
+                     "experts are on node %d, so MoE compute will not spread past it and the remaining "
+                     "node(s) stay idle. Set DENSECORE_NUMA_WEIGHTS=round_robin to partition expert "
+                     "weights across nodes.\n",
+                     state_name, node_count, placement.expert_count, placement.sole_node);
+        return;
+    }
+    std::fprintf(stderr, "[NUMA] Native MoE sticky routing %s (state=%s, nodes=%d)\n",
+                 armed ? "active" : "inactive", state_name, node_count);
+}
+
+static inline void RecordNativeMoENumaDispatch(int node) {
+    auto& counters = GetNativeMoENumaCounters();
+    if (node < 0) {
+        counters.legacy_dispatch_ops.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    counters.sticky_dispatch_ops.fetch_add(1, std::memory_order_relaxed);
+    if (static_cast<std::size_t>(node) < kNativeMoENumaMaxTrackedNodes) {
+        counters.node_dispatch_ops[static_cast<std::size_t>(node)].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        counters.node_dispatch_overflow_ops.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -2330,18 +2538,24 @@ static void SetNativeMoENumaContext(Qwen35SharedQ8RowsUserData* ud, densecore::C
     }
     ud->numa_backend = backend;
     ud->numa_layer = layer;
-    ud->numa_sticky_enabled = false;
-    if (!backend || !layer || backend->GetNumaNodeCount() <= 1) {
-        return;
+    ud->execution_phase = GetCurrentExecutionPhase();
+    const NativeMoENumaPlacement placement = EvaluateNativeMoENumaPlacement(backend, layer);
+    ud->numa_sticky_enabled = NativeMoENumaStickyArmed(placement.state);
+    ud->outer_task_mapping_count = 0;
+    if (ud->numa_sticky_enabled) {
+        auto& topology = densecore::HardwareTopology::GetInstance();
+        for (int task = 0; task < kQwen35SharedQ8MaxTasks; ++task) {
+            const int core = topology.GetAssignedCore(task);
+            const int node = topology.GetAssignedNumaNode(task);
+            if (core < 0 || node < 0) {
+                break;
+            }
+            ud->outer_task_cores[task] = core;
+            ud->outer_task_nodes[task] = node;
+            ++ud->outer_task_mapping_count;
+        }
     }
-    std::vector<int> nodes;
-    if (!backend->CopyExpertNumaNodes(layer, static_cast<int>(layer->NumExperts()), &nodes)) {
-        return;
-    }
-    ud->numa_sticky_enabled =
-        !nodes.empty() && std::all_of(nodes.begin(), nodes.end(), [backend](int node) {
-            return node >= 0 && node < backend->GetNumaNodeCount();
-        });
+    RecordNativeMoENumaContext(placement, backend);
 }
 
 static int ResolveNativeMoEExpertNumaNode(const Qwen35SharedQ8RowsUserData* ud, int expert_id) {
@@ -2352,9 +2566,233 @@ static int ResolveNativeMoEExpertNumaNode(const Qwen35SharedQ8RowsUserData* ud, 
     return node >= 0 && node < ud->numa_backend->GetNumaNodeCount() ? node : -1;
 }
 
+struct NativeMoENodeGroupPlan {
+    std::array<int, kQwen35NativeMoEMaxGroupedExperts> item_nodes{};
+    std::array<int, kQwen35NativeMoEMaxGroupedExperts> active_nodes{};
+    int item_count = 0;
+    int active_node_count = 0;
+};
+
+struct NativeMoEOuterTaskPlan {
+    int task_node = -1;
+    int node_task_rank = -1;
+    int node_task_count = 0;
+};
+
+static InferenceExecutionPhase ResolveNativeMoEOuterTaskExecutionPhase(
+    const Qwen35SharedQ8RowsUserData* ud) {
+    // GGML secondary workers do not inherit the inference worker's TLS work
+    // context. A wide custom op must make one shared admission decision, so use
+    // the graph userdata's context instead of GetCurrentExecutionPhase().
+    return ud && ud->execution_phase != InferenceExecutionPhase::Unknown ? ud->execution_phase
+                                                                         : GetCurrentExecutionPhase();
+}
+
+static bool BuildNativeMoEOuterTaskPlan(const int* task_nodes, int task_count, int task_index, int node_count,
+                                        NativeMoEOuterTaskPlan* plan) {
+    if (!task_nodes || !plan || task_count <= 1 || task_count > kQwen35SharedQ8MaxTasks || task_index < 0 ||
+        task_index >= task_count || node_count <= 1) {
+        return false;
+    }
+    *plan = {};
+    const int task_node = task_nodes[task_index];
+    if (task_node < 0 || task_node >= node_count) {
+        return false;
+    }
+    int rank = 0;
+    int count = 0;
+    for (int task = 0; task < task_count; ++task) {
+        const int node = task_nodes[task];
+        if (node < 0 || node >= node_count) {
+            return false;
+        }
+        if (node == task_node) {
+            rank += task < task_index ? 1 : 0;
+            ++count;
+        }
+    }
+    if (count <= 0 || rank < 0 || rank >= count) {
+        return false;
+    }
+    plan->task_node = task_node;
+    plan->node_task_rank = rank;
+    plan->node_task_count = count;
+    return true;
+}
+
+static bool ResolveNativeMoEOuterTaskPlan(Qwen35SharedQ8RowsUserData* ud, int ith, int nth,
+                                          NativeMoEOuterTaskPlan* plan) {
+    if (!ud || !ud->numa_backend || !ud->numa_sticky_enabled || !plan || nth <= 1 ||
+        nth > kQwen35SharedQ8MaxTasks) {
+        return false;
+    }
+    if (ud->outer_task_mapping_count < nth || ith >= ud->outer_task_mapping_count) {
+        return false;
+    }
+    const int assigned_core = ud->outer_task_cores[ith];
+    if (assigned_core < 0) {
+        return false;
+    }
+    // GGML clears only task 0's affinity after each graph. Re-pin task 0 once
+    // per graph execution and persistent secondary workers only when their
+    // assignment changes. Merely observing the assigned CPU is not proof of a
+    // singleton affinity mask and would allow migration mid-kernel.
+    thread_local int pinned_outer_core = -1;
+    thread_local const InferenceWorkContext* pinned_outer_work_ctx = nullptr;
+    thread_local uint64_t pinned_outer_generation = 0;
+    const InferenceWorkContext* work_ctx = ud->work_ctx;
+    const uint64_t execution_generation = GetInferenceWorkContextExecutionGeneration(work_ctx);
+    const bool task_zero_graph_changed =
+        ith == 0 && (!work_ctx || pinned_outer_work_ctx != work_ctx || pinned_outer_generation != execution_generation);
+    if ((task_zero_graph_changed || pinned_outer_core != assigned_core) &&
+        !densecore::HardwareTopology::PinCurrentThread(assigned_core)) {
+        return false;
+    }
+    pinned_outer_core = assigned_core;
+    pinned_outer_work_ctx = work_ctx;
+    pinned_outer_generation = execution_generation;
+    return BuildNativeMoEOuterTaskPlan(ud->outer_task_nodes, nth, ith, ud->numa_backend->GetNumaNodeCount(), plan);
+}
+
+static uint64_t BeginNativeMoEDirectOuterTask(Qwen35SharedQ8RowsUserData* ud, int ith, int nth,
+                                               bool initialize_ok) {
+    if (!ud || ith < 0 || ith >= nth || nth <= 1 || nth > kQwen35SharedQ8MaxTasks) {
+        return 0;
+    }
+    uint64_t epoch = 0;
+    if (ith == 0) {
+        epoch = ud->direct_epoch.load(std::memory_order_relaxed) + 1;
+        ud->direct_failed.store(initialize_ok ? 0 : 1, std::memory_order_relaxed);
+        ud->direct_remaining_tasks.store(nth, std::memory_order_relaxed);
+        ud->direct_epoch.store(epoch, std::memory_order_release);
+    } else {
+        const uint64_t last_epoch = ud->direct_task_epoch[ith];
+        epoch = ud->direct_epoch.load(std::memory_order_acquire);
+        while (epoch == last_epoch) {
+            std::this_thread::yield();
+            epoch = ud->direct_epoch.load(std::memory_order_acquire);
+        }
+    }
+    return epoch;
+}
+
+static bool FinishNativeMoEDirectOuterTask(Qwen35SharedQ8RowsUserData* ud, int ith, uint64_t epoch, bool task_ok,
+                                           bool* is_owner_task = nullptr) {
+    if (!ud || epoch == 0) {
+        return false;
+    }
+    const bool owner_task = ith == 0;
+    if (is_owner_task) {
+        *is_owner_task = owner_task;
+    }
+    if (!task_ok) {
+        ud->direct_failed.store(1, std::memory_order_relaxed);
+    }
+    ud->direct_remaining_tasks.fetch_sub(1, std::memory_order_acq_rel);
+    ud->direct_task_epoch[ith] = epoch;
+    if (!owner_task) {
+        // GGML already places a barrier after this custom node. Let secondary
+        // workers reach it while task 0 waits for completion and publishes the
+        // reduction (or the complete grouped fallback) for the node.
+        return true;
+    }
+    while (ud->direct_remaining_tasks.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+    }
+    const bool all_ok = ud->direct_failed.load(std::memory_order_acquire) == 0;
+    auto& counters = GetNativeMoENumaCounters();
+    (all_ok ? counters.direct_decode_used_ops : counters.direct_decode_rejected_ops)
+        .fetch_add(1, std::memory_order_relaxed);
+    return all_ok;
+}
+
+static bool BuildNativeMoENodeGroupPlan(const int* item_nodes, int item_count, int node_count,
+                                        NativeMoENodeGroupPlan* plan) {
+    if (!item_nodes || !plan || item_count < 0 || item_count > kQwen35NativeMoEMaxGroupedExperts || node_count <= 0) {
+        return false;
+    }
+    *plan = {};
+    plan->item_count = item_count;
+    for (int item = 0; item < item_count; ++item) {
+        const int node = item_nodes[item];
+        plan->item_nodes[static_cast<size_t>(item)] = node;
+        if (node < 0) {
+            continue;
+        }
+        if (node >= node_count) {
+            return false;
+        }
+        bool seen = false;
+        for (int active = 0; active < plan->active_node_count; ++active) {
+            if (plan->active_nodes[static_cast<size_t>(active)] == node) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            plan->active_nodes[static_cast<size_t>(plan->active_node_count++)] = node;
+        }
+    }
+    return true;
+}
+
 template <typename Fn>
-static void RunNativeMoEOnExpertNode(Qwen35SharedQ8RowsUserData* ud, int expert_id, Fn&& fn) {
+static bool RunNativeMoEOnExpertNodeGroups(Qwen35SharedQ8RowsUserData* ud, const int* experts, int item_count,
+                                           Fn&& run_node_group) {
+    if (!ud || !ud->numa_sticky_enabled || !ud->numa_backend || !experts || item_count < 0 ||
+        item_count > kQwen35NativeMoEMaxGroupedExperts) {
+        return false;
+    }
+    const int node_count = ud->numa_backend->GetNumaNodeCount();
+    if (node_count <= 1) {
+        return false;
+    }
+
+    std::array<int, kQwen35NativeMoEMaxGroupedExperts> item_nodes{};
+    for (int item = 0; item < item_count; ++item) {
+        if (experts[item] < 0) {
+            item_nodes[static_cast<size_t>(item)] = -1;
+            continue;
+        }
+        const int node = ResolveNativeMoEExpertNumaNode(ud, experts[item]);
+        if (node < 0) {
+            return false;
+        }
+        item_nodes[static_cast<size_t>(item)] = node;
+    }
+
+    NativeMoENodeGroupPlan plan;
+    if (!BuildNativeMoENodeGroupPlan(item_nodes.data(), item_count, node_count, &plan)) {
+        return false;
+    }
+    if (plan.active_node_count == 0) {
+        return true;
+    }
+    for (int active = 0; active < plan.active_node_count; ++active) {
+        RecordNativeMoENumaDispatch(plan.active_nodes[static_cast<size_t>(active)]);
+    }
+    uint64_t routed_item_count = 0;
+    for (int item = 0; item < plan.item_count; ++item) {
+        routed_item_count += plan.item_nodes[static_cast<size_t>(item)] >= 0 ? 1 : 0;
+    }
+    auto& counters = GetNativeMoENumaCounters();
+    counters.grouped_dispatch_node_tasks.fetch_add(static_cast<uint64_t>(plan.active_node_count),
+                                                   std::memory_order_relaxed);
+    counters.grouped_dispatch_expert_items.fetch_add(routed_item_count, std::memory_order_relaxed);
+
+    const auto run_node = [&](int node) { run_node_group(node, plan); };
+    if (plan.active_node_count == 1) {
+        const int node = plan.active_nodes[0];
+        ud->numa_backend->RunOnNumaNode(node, [&] { run_node(node); });
+        return true;
+    }
+    ud->numa_backend->RunConcurrentNodeTasks(node_count, run_node);
+    return true;
+}
+
+template <typename Fn> static void RunNativeMoEOnExpertNode(Qwen35SharedQ8RowsUserData* ud, int expert_id, Fn&& fn) {
     const int node = ResolveNativeMoEExpertNumaNode(ud, expert_id);
+    RecordNativeMoENumaDispatch(node);
     if (node < 0) {
         fn(-1);
         return;
@@ -2363,14 +2801,7 @@ static void RunNativeMoEOnExpertNode(Qwen35SharedQ8RowsUserData* ud, int expert_
 }
 
 static bool NativeMoEHasVerifiedNumaPlacement(densecore::CpuBackend* backend, const TransformerLayer* layer) {
-    if (!backend || !layer || backend->GetNumaNodeCount() <= 1) {
-        return false;
-    }
-    std::vector<int> nodes;
-    return backend->CopyExpertNumaNodes(layer, static_cast<int>(layer->NumExperts()), &nodes) && !nodes.empty() &&
-           std::all_of(nodes.begin(), nodes.end(), [backend](int node) {
-               return node >= 0 && node < backend->GetNumaNodeCount();
-           });
+    return NativeMoENumaStickyArmed(EvaluateNativeMoENumaPlacement(backend, layer).state);
 }
 
 static bool Qwen35NativeQuantizeRowQ8K(const float* src, uint8_t* dst, int64_t cols) {
@@ -2655,7 +3086,7 @@ static bool Qwen35NativeMoEDownQ8_0DotRowForExpertWithQbuf(const ggml_tensor* do
 
 static bool Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(const ggml_tensor* down_exps, int32_t expert, int64_t row,
                                                            const uint8_t* qbuf, const float* hidden_row,
-                                                           float* out_value) {
+                                                           float* out_value, bool use_densecore_q5k_single_row = false) {
     if (!down_exps || !out_value) return false;
     if (expert < 0 || expert >= down_exps->ne[2] || row < 0 || row >= down_exps->ne[1]) return false;
     const int64_t cols = down_exps->ne[0];
@@ -2668,6 +3099,10 @@ static bool Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(const ggml_tensor* dow
     }
     if (!qbuf) return false;
     if (down_exps->type == GGML_TYPE_Q5_K) {
+        if (use_densecore_q5k_single_row) {
+            return ComputeQ5KQ8KBatchedRow(weight_row, qbuf, ggml_row_size(GGML_TYPE_Q8_K, cols), 1,
+                                           static_cast<int>(cols), out_value);
+        }
         if (PreferGgmlQ4KVecDotForNativeMoE()) {
             const ggml_type_traits_cpu* traits = ggml_get_type_traits_cpu(GGML_TYPE_Q5_K);
             if (traits && traits->vec_dot && traits->vec_dot_type == GGML_TYPE_Q8_K &&
@@ -2714,7 +3149,8 @@ static bool Qwen35NativeMoEDownQ5KReadExpert(const ggml_tensor* selected_experts
 
 static bool Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(const ggml_tensor* down_exps, int32_t expert,
                                                                int64_t row, const uint8_t* qbuf,
-                                                               const float* hidden_row, float* out0, float* out1) {
+                                                               const float* hidden_row, float* out0, float* out1,
+                                                               bool use_densecore_q5k_single_row = false) {
     if (!down_exps || !out0 || !out1) return false;
     if (expert < 0 || expert >= down_exps->ne[2] || row < 0 || row + 1 >= down_exps->ne[1]) return false;
     (void)hidden_row;
@@ -2754,8 +3190,54 @@ static bool Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(const ggml_tensor*
             return true;
         }
     }
-    return Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qbuf, hidden_row, out0) &&
-           Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row + 1, qbuf, hidden_row, out1);
+    return Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row, qbuf, hidden_row, out0,
+                                                         use_densecore_q5k_single_row) &&
+           Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(down_exps, expert, row + 1, qbuf, hidden_row, out1,
+                                                         use_densecore_q5k_single_row);
+}
+
+static bool ResolveQwen35NativeMoEDownQ5KSingleRowAdmission(
+    Qwen35SharedQ8RowsUserData* shared_q8, const ggml_tensor* down_exps, int32_t expert, const uint8_t* qrow) {
+    if (!shared_q8 || !down_exps || !qrow || down_exps->type != GGML_TYPE_Q5_K || expert < 0 ||
+        expert >= down_exps->ne[2] || down_exps->ne[0] <= 0 || down_exps->ne[1] <= 0) {
+        return false;
+    }
+
+    const int cached = shared_q8->q5k_single_row_admission.load(std::memory_order_acquire);
+    if (cached != 0) {
+        return cached == 2;
+    }
+
+    constexpr uint32_t kQwen35MoEDownQ5KSingleRowOp = 0x51354b31u;
+    const uint64_t key = densecore::kernels::ParityGate::MakeKey(
+        kQwen35MoEDownQ5KSingleRowOp, down_exps->data, down_exps->ne[1], down_exps->ne[0]);
+    auto verdict = densecore::kernels::ParityGate::Check(key);
+    if (verdict == densecore::kernels::ParityGate::Verdict::kProbe) {
+        const int64_t cols = down_exps->ne[0];
+        const char* weight_row = static_cast<const char*>(down_exps->data) +
+                                 static_cast<size_t>(expert) * static_cast<size_t>(down_exps->nb[2]);
+        float reference = 0.0f;
+        float candidate = 0.0f;
+        const bool reference_ok = densecore::hwy_kernels::DotQ5KQ8K_Hwy(weight_row, qrow, cols, &reference);
+        const bool candidate_ok = ComputeQ5KQ8KBatchedRow(
+            weight_row, qrow, ggml_row_size(GGML_TYPE_Q8_K, cols), 1, static_cast<int>(cols), &candidate);
+        const float max_abs_error = reference_ok && candidate_ok && std::isfinite(candidate)
+                                        ? std::fabs(candidate - reference)
+                                        : std::numeric_limits<float>::infinity();
+        densecore::kernels::ParityGate::Report(key, max_abs_error, std::fabs(reference), 1e-5f);
+        verdict = densecore::kernels::ParityGate::Check(key);
+    }
+
+    const bool use_densecore = verdict == densecore::kernels::ParityGate::Verdict::kAllow;
+    shared_q8->q5k_single_row_admission.store(use_densecore ? 2 : 1, std::memory_order_release);
+    static std::atomic<bool> logged_allow{false};
+    static std::atomic<bool> logged_deny{false};
+    std::atomic<bool>& logged = use_densecore ? logged_allow : logged_deny;
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[Q5KSingleRow] admitted=%d path=%s\n", use_densecore ? 1 : 0,
+                     use_densecore ? "densecore_avx2" : "highway_reference");
+    }
+    return use_densecore;
 }
 
 static bool Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
@@ -3336,10 +3818,16 @@ static void RunQwen35NativeMoEDownQ5KWeightedSumFastPath(ggml_tensor* dst, const
                     continue;
                 }
                 bool ok = false;
+                // Bind the thread_local scratch on the CALLING thread. When sticky
+                // routing is armed, RunNativeMoEOnExpertNode runs this body on a
+                // NUMA-pinned helper thread, where `qtile`/`tile_assignments` resolve
+                // to that thread's own empty instances. See W2 in NUMA_TIER1_FINDINGS.md.
+                const uint8_t* qtile_ptr = qtile.data();
+                const auto& tile_assignments_ref = tile_assignments;
                 RunNativeMoEOnExpertNode(shared_q8, expert, [&](int numa_node) {
                     ok = Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
-                        dst, down_exps, qtile.data(), qrow_bytes, tile_assignments, expert, row_start, row_end,
-                        numa_node, numa_node >= 0);
+                        dst, down_exps, qtile_ptr, qrow_bytes, tile_assignments_ref, expert, row_start, row_end,
+                        numa_node, NativeMoEKernelMayFanOut(shared_q8, numa_node));
                 });
                 if (!ok) {
                     return;
@@ -3519,6 +4007,293 @@ static void RunQwen35NativeMoEDownQ5KWeightedSumFastPath(ggml_tensor* dst, const
     }
 }
 
+static void ReduceNativeMoEExpertOutputsInRoutingOrder(float* dst_base, size_t dst_row_stride,
+                                                       const float* expert_outputs, const int* experts,
+                                                       const float* weights, int item_count, int64_t row_count) {
+    if (!dst_base || !expert_outputs || !experts || !weights || item_count <= 0 || row_count <= 0) {
+        return;
+    }
+    for (int item = 0; item < item_count; ++item) {
+        if (experts[item] < 0 || weights[item] == 0.0f) {
+            continue;
+        }
+        const float* item_output = expert_outputs + static_cast<size_t>(item) * static_cast<size_t>(row_count);
+        for (int64_t row = 0; row < row_count; ++row) {
+            float* dst_value =
+                reinterpret_cast<float*>(reinterpret_cast<char*>(dst_base) + static_cast<size_t>(row) * dst_row_stride);
+            *dst_value += item_output[row] * weights[item];
+        }
+    }
+}
+
+static bool TryRunQwen35NativeMoEDownWeightedLogitsGroupedDecode(
+    ggml_tensor* dst, const ggml_tensor* down_exps, const ggml_tensor* hidden,
+    const ggml_tensor* selected_experts, const ggml_tensor* gate_logits,
+    Qwen35SharedQ8RowsUserData* shared_q8);
+
+static bool ShouldUseQwen35NativeMoEDownGlobalRowPartition(bool numa_sticky_enabled,
+                                                           bool weighted_logits_lfm2_sigmoid,
+                                                           InferenceExecutionPhase phase, int64_t n_tokens, int nth) {
+    return numa_sticky_enabled && !weighted_logits_lfm2_sigmoid && phase == InferenceExecutionPhase::Decode &&
+           n_tokens == 1 && nth > 1;
+}
+
+static bool TryRunQwen35NativeMoEDownWeightedLogitsDirectOuterTasks(
+    ggml_tensor* dst, const ggml_tensor* down_exps, const ggml_tensor* hidden,
+    const ggml_tensor* selected_experts, const ggml_tensor* gate_logits, int ith, int nth,
+    Qwen35SharedQ8RowsUserData* shared_q8) {
+    if (!dst || !down_exps || !hidden || !selected_experts || !gate_logits || !shared_q8 ||
+        !shared_q8->numa_backend || !shared_q8->numa_sticky_enabled || shared_q8->weighted_logits_lfm2_sigmoid ||
+        ResolveNativeMoEOuterTaskExecutionPhase(shared_q8) != InferenceExecutionPhase::Decode ||
+        selected_experts->ne[1] != 1 ||
+        selected_experts->ne[0] <= 0 || selected_experts->ne[0] > kQwen35NativeMoEMaxGroupedExperts ||
+        (down_exps->type != GGML_TYPE_Q4_K && down_exps->type != GGML_TYPE_Q5_K &&
+         down_exps->type != GGML_TYPE_Q6_K) ||
+        dst->ne[0] != down_exps->ne[1] || nth <= 1) {
+        return false;
+    }
+
+    const int top_k = static_cast<int>(selected_experts->ne[0]);
+    const int64_t n_embd = down_exps->ne[1];
+    const size_t output_count = static_cast<size_t>(top_k) * static_cast<size_t>(n_embd);
+    bool initialize_ok = shared_q8->direct_expert_outputs &&
+                         shared_q8->direct_expert_output_capacity >= output_count;
+    if (ith == 0 && initialize_ok) {
+        std::memset(shared_q8->direct_expert_outputs, 0, output_count * sizeof(float));
+    }
+
+    NativeMoEOuterTaskPlan task_plan;
+    bool task_ok = ResolveNativeMoEOuterTaskPlan(shared_q8, ith, nth, &task_plan) && initialize_ok;
+
+    std::array<int, kQwen35NativeMoEMaxGroupedExperts> experts{};
+    std::array<float, kQwen35NativeMoEMaxGroupedExperts> weights{};
+    std::array<const uint8_t*, kQwen35NativeMoEMaxGroupedExperts> qrows{};
+    std::array<const float*, kQwen35NativeMoEMaxGroupedExperts> hidden_rows{};
+    experts.fill(-1);
+    task_ok = task_ok &&
+              ResolveQwen35NativeMoETopKWeights(shared_q8, gate_logits, selected_experts, 0, weights.data(), top_k);
+    for (int item = 0; item < top_k && task_ok; ++item) {
+        int32_t expert = -1;
+        if (!Qwen35NativeMoEDownQ5KReadExpert(selected_experts, down_exps, 0, item, &expert)) {
+            task_ok = false;
+            break;
+        }
+        experts[static_cast<size_t>(item)] = expert;
+        qrows[static_cast<size_t>(item)] = Qwen35SharedQ8RowPtr(shared_q8, item, 0);
+        hidden_rows[static_cast<size_t>(item)] = Qwen35NativeMoEDownHiddenRowPtr(hidden, 0, item);
+        const int expert_node = ResolveNativeMoEExpertNumaNode(shared_q8, expert);
+        int node_task_count = 0;
+        for (int task = 0; task < nth; ++task) {
+            node_task_count += shared_q8->outer_task_nodes[task] == expert_node ? 1 : 0;
+        }
+        if (!qrows[static_cast<size_t>(item)] || !hidden_rows[static_cast<size_t>(item)] || expert_node < 0 ||
+            node_task_count == 0) {
+            task_ok = false;
+        }
+    }
+
+    // ParityGate probing is single-owner. Concurrent probes return a temporary
+    // deny verdict, so letting every GGML task resolve admission can race and
+    // publish a nondeterministic final path. Task 0 resolves before publishing
+    // the direct epoch; acquire readers then consume the stable cached verdict.
+    if (ith == 0 && task_ok && down_exps->type == GGML_TYPE_Q5_K) {
+        (void)ResolveQwen35NativeMoEDownQ5KSingleRowAdmission(shared_q8, down_exps, experts[0], qrows[0]);
+    }
+    const uint64_t epoch = BeginNativeMoEDirectOuterTask(shared_q8, ith, nth, task_ok);
+    task_ok = task_ok && epoch != 0;
+    const bool use_densecore_q5k_single_row =
+        task_ok && down_exps->type == GGML_TYPE_Q5_K &&
+        shared_q8->q5k_single_row_admission.load(std::memory_order_acquire) == 2;
+    const int64_t pair_count = n_embd / 2;
+    const int64_t pair_start =
+        task_ok ? (pair_count * task_plan.node_task_rank) / task_plan.node_task_count : 0;
+    const int64_t pair_end =
+        task_ok ? (pair_count * (task_plan.node_task_rank + 1)) / task_plan.node_task_count : 0;
+    for (int item = 0; item < top_k && task_ok; ++item) {
+        const int expert = experts[static_cast<size_t>(item)];
+        if (ResolveNativeMoEExpertNumaNode(shared_q8, expert) != task_plan.task_node) {
+            continue;
+        }
+        float* item_output = shared_q8->direct_expert_outputs +
+                             static_cast<size_t>(item) * static_cast<size_t>(n_embd);
+        for (int64_t pair = pair_start; pair < pair_end; ++pair) {
+            const int64_t row = pair * 2;
+            float value0 = 0.0f;
+            float value1 = 0.0f;
+            if (!Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(
+                    down_exps, expert, row, qrows[static_cast<size_t>(item)],
+                    hidden_rows[static_cast<size_t>(item)], &value0, &value1, use_densecore_q5k_single_row)) {
+                task_ok = false;
+                break;
+            }
+            item_output[row] = value0;
+            item_output[row + 1] = value1;
+        }
+        if (task_ok && (n_embd & 1) != 0 && task_plan.node_task_rank == task_plan.node_task_count - 1) {
+            float value = 0.0f;
+            if (!Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(
+                    down_exps, expert, n_embd - 1, qrows[static_cast<size_t>(item)],
+                    hidden_rows[static_cast<size_t>(item)], &value, use_densecore_q5k_single_row)) {
+                task_ok = false;
+                break;
+            }
+            item_output[n_embd - 1] = value;
+        }
+    }
+
+    bool owner_task = false;
+    const bool all_ok = FinishNativeMoEDirectOuterTask(shared_q8, ith, epoch, task_ok, &owner_task);
+    if (!owner_task) {
+        return true;
+    }
+    if (!all_ok) {
+        shared_q8->outer_task_width.store(1, std::memory_order_relaxed);
+        return TryRunQwen35NativeMoEDownWeightedLogitsGroupedDecode(
+            dst, down_exps, hidden, selected_experts, gate_logits, shared_q8);
+    }
+    Qwen35NativeMoEZeroDst2DRange(dst, 0, n_embd, 1);
+    ReduceNativeMoEExpertOutputsInRoutingOrder(
+        static_cast<float*>(dst->data), static_cast<size_t>(dst->nb[0]), shared_q8->direct_expert_outputs,
+        experts.data(), weights.data(), top_k, n_embd);
+    static std::atomic<bool> logged_direct_down{false};
+    if (!logged_direct_down.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[NUMA] Qwen native MoE direct outer-task decode active "
+                     "(stage=down, tasks=%d, experts=%d)\n",
+                     nth, top_k);
+    }
+    return true;
+}
+
+static bool TryRunQwen35NativeMoEDownWeightedLogitsGroupedDecode(ggml_tensor* dst, const ggml_tensor* down_exps,
+                                                                 const ggml_tensor* hidden,
+                                                                 const ggml_tensor* selected_experts,
+                                                                 const ggml_tensor* gate_logits,
+                                                                 Qwen35SharedQ8RowsUserData* shared_q8) {
+    if (!dst || !down_exps || !hidden || !selected_experts || !gate_logits || !shared_q8 || !shared_q8->numa_backend ||
+        !shared_q8->numa_sticky_enabled || shared_q8->weighted_logits_lfm2_sigmoid ||
+        ResolveNativeMoEOuterTaskExecutionPhase(shared_q8) != InferenceExecutionPhase::Decode ||
+        selected_experts->ne[1] != 1 ||
+        selected_experts->ne[0] <= 0 || selected_experts->ne[0] > kQwen35NativeMoEMaxGroupedExperts ||
+        (down_exps->type != GGML_TYPE_Q4_K && down_exps->type != GGML_TYPE_Q5_K && down_exps->type != GGML_TYPE_Q6_K) ||
+        dst->ne[0] != down_exps->ne[1]) {
+        return false;
+    }
+    const int outer_width = shared_q8->outer_task_width.load(std::memory_order_relaxed);
+    if (outer_width > 1) {
+        return false;
+    }
+
+    const int top_k = static_cast<int>(selected_experts->ne[0]);
+    const int64_t n_embd = down_exps->ne[1];
+    std::array<int, kQwen35NativeMoEMaxGroupedExperts> experts{};
+    std::array<float, kQwen35NativeMoEMaxGroupedExperts> weights{};
+    std::array<const uint8_t*, kQwen35NativeMoEMaxGroupedExperts> qrows{};
+    std::array<const float*, kQwen35NativeMoEMaxGroupedExperts> hidden_rows{};
+    experts.fill(-1);
+    if (!ResolveQwen35NativeMoETopKWeights(shared_q8, gate_logits, selected_experts, 0, weights.data(), top_k)) {
+        return false;
+    }
+    for (int k = 0; k < top_k; ++k) {
+        int32_t expert = -1;
+        if (!Qwen35NativeMoEDownQ5KReadExpert(selected_experts, down_exps, 0, k, &expert)) {
+            continue;
+        }
+        const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, k, 0);
+        const float* hidden_row = Qwen35NativeMoEDownHiddenRowPtr(hidden, 0, k);
+        if (!qrow || !hidden_row) {
+            return false;
+        }
+        experts[static_cast<size_t>(k)] = expert;
+        qrows[static_cast<size_t>(k)] = qrow;
+        hidden_rows[static_cast<size_t>(k)] = hidden_row;
+    }
+    bool use_densecore_q5k_single_row = false;
+    if (down_exps->type == GGML_TYPE_Q5_K) {
+        for (int k = 0; k < top_k; ++k) {
+            if (experts[static_cast<size_t>(k)] >= 0 && qrows[static_cast<size_t>(k)]) {
+                use_densecore_q5k_single_row = ResolveQwen35NativeMoEDownQ5KSingleRowAdmission(
+                    shared_q8, down_exps, experts[static_cast<size_t>(k)], qrows[static_cast<size_t>(k)]);
+                break;
+            }
+        }
+    }
+
+    thread_local std::vector<float> expert_outputs;
+    expert_outputs.assign(static_cast<size_t>(top_k) * static_cast<size_t>(n_embd), 0.0f);
+    float* expert_output_data = expert_outputs.data();
+    std::atomic<bool> all_ok{true};
+    const bool grouped = RunNativeMoEOnExpertNodeGroups(
+        shared_q8, experts.data(), top_k, [&](int node, const NativeMoENodeGroupPlan& plan) {
+            std::array<int, kQwen35NativeMoEMaxGroupedExperts> group_items{};
+            int group_count = 0;
+            for (int item = 0; item < plan.item_count; ++item) {
+                if (plan.item_nodes[static_cast<size_t>(item)] == node) {
+                    group_items[static_cast<size_t>(group_count++)] = item;
+                }
+            }
+            if (group_count == 0) {
+                return;
+            }
+            const int physical_cores = densecore::HardwareTopology::GetInstance().GetPhysicalCoreCount(node);
+            const int worker_count = std::max(1, physical_cores > 0 ? physical_cores : group_count);
+            const int splits_per_expert = std::max(1, (worker_count + group_count - 1) / group_count);
+            const int total_units = group_count * splits_per_expert;
+            shared_q8->numa_backend->ParallelFor(
+                total_units,
+                [&](int unit_start, int unit_end, int) {
+                    for (int unit = unit_start; unit < unit_end && all_ok.load(std::memory_order_relaxed); ++unit) {
+                        const int item = group_items[static_cast<size_t>(unit / splits_per_expert)];
+                        const int split = unit % splits_per_expert;
+                        const int64_t pair_count = n_embd / 2;
+                        const int64_t pair_start = (pair_count * split) / splits_per_expert;
+                        const int64_t pair_end = (pair_count * (split + 1)) / splits_per_expert;
+                        float* item_output =
+                            expert_output_data + static_cast<size_t>(item) * static_cast<size_t>(n_embd);
+                        for (int64_t pair = pair_start; pair < pair_end; ++pair) {
+                            const int64_t row = pair * 2;
+                            float value0 = 0.0f;
+                            float value1 = 0.0f;
+                            if (!Qwen35NativeMoEDownQ5KDotRowPairForExpertWithQbuf(
+                                    down_exps, experts[static_cast<size_t>(item)], row,
+                                    qrows[static_cast<size_t>(item)], hidden_rows[static_cast<size_t>(item)], &value0,
+                                    &value1, use_densecore_q5k_single_row)) {
+                                all_ok.store(false, std::memory_order_relaxed);
+                                return;
+                            }
+                            item_output[row] = value0;
+                            item_output[row + 1] = value1;
+                        }
+                        if ((n_embd & 1) != 0 && split == splits_per_expert - 1) {
+                            float value = 0.0f;
+                            if (!Qwen35NativeMoEDownQ5KDotRowForExpertWithQbuf(
+                                    down_exps, experts[static_cast<size_t>(item)], n_embd - 1,
+                                    qrows[static_cast<size_t>(item)], hidden_rows[static_cast<size_t>(item)], &value,
+                                    use_densecore_q5k_single_row)) {
+                                all_ok.store(false, std::memory_order_relaxed);
+                                return;
+                            }
+                            item_output[n_embd - 1] = value;
+                        }
+                    }
+                },
+                node);
+        });
+    if (!grouped || !all_ok.load(std::memory_order_relaxed)) {
+        return false;
+    }
+
+    Qwen35NativeMoEZeroDst2DRange(dst, 0, n_embd, 1);
+    ReduceNativeMoEExpertOutputsInRoutingOrder(static_cast<float*>(dst->data), static_cast<size_t>(dst->nb[0]),
+                                               expert_output_data, experts.data(), weights.data(), top_k, n_embd);
+    GetNativeMoENumaCounters().grouped_decode_used_ops.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<bool> logged_grouped_down{false};
+    if (!logged_grouped_down.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[NUMA] Qwen native MoE grouped decode active (stage=down, experts=%d)\n", top_k);
+    }
+    return true;
+}
+
 static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, const ggml_tensor* down_exps,
                                                              const ggml_tensor* hidden,
                                                              const ggml_tensor* selected_experts,
@@ -3545,6 +4320,31 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
     const bool use_shared_q8 =
         down_exps->type != GGML_TYPE_Q8_0 && PrepareQwen35SharedQ8Rows(shared_q8, hidden, ith, nth);
     thread_local std::vector<Qwen35MoEAssignment> assignments;
+
+    // Physical 2-socket A/B showed that expert-local W2 materialization and its
+    // owner reduction cost more than locality saves. Keep sticky gate/up, but
+    // let all outer tasks row-partition W2 and accumulate in routing order.
+    const bool use_global_row_partition =
+        shared_q8 && ShouldUseQwen35NativeMoEDownGlobalRowPartition(
+                         shared_q8->numa_sticky_enabled, shared_q8->weighted_logits_lfm2_sigmoid,
+                         ResolveNativeMoEOuterTaskExecutionPhase(shared_q8), n_tokens, nth);
+
+    if (!use_global_row_partition && use_shared_q8 &&
+        TryRunQwen35NativeMoEDownWeightedLogitsDirectOuterTasks(
+            dst, down_exps, hidden, selected_experts, gate_logits, ith, nth, shared_q8)) {
+        if (ith == 0) {
+            ProbeQwen35NativeMoEDownWeightedLogitsReference(dst, down_exps, hidden, selected_experts, gate_logits, 0,
+                                                            n_embd, shared_q8);
+        }
+        return;
+    }
+    if (ith == 0 && nth == 1 && use_shared_q8 &&
+        TryRunQwen35NativeMoEDownWeightedLogitsGroupedDecode(dst, down_exps, hidden, selected_experts, gate_logits,
+                                                            shared_q8)) {
+        ProbeQwen35NativeMoEDownWeightedLogitsReference(dst, down_exps, hidden, selected_experts, gate_logits, 0,
+                                                        n_embd, shared_q8);
+        return;
+    }
 
     const bool batched_qxk_down =
         down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q5_K || down_exps->type == GGML_TYPE_Q6_K;
@@ -3623,10 +4423,16 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
                     continue;
                 }
                 bool ok = false;
+                // Bind the thread_local scratch on the CALLING thread. When sticky
+                // routing is armed, RunNativeMoEOnExpertNode runs this body on a
+                // NUMA-pinned helper thread, where `qtile`/`tile_assignments` resolve
+                // to that thread's own empty instances. See W2 in NUMA_TIER1_FINDINGS.md.
+                const uint8_t* qtile_ptr = qtile.data();
+                const auto& tile_assignments_ref = tile_assignments;
                 RunNativeMoEOnExpertNode(shared_q8, expert, [&](int numa_node) {
                     ok = Qwen35NativeMoEDownQXKAccumulateAssignmentsForRowRange(
-                        dst, down_exps, qtile.data(), qrow_bytes, tile_assignments, expert, row_start, row_end,
-                        numa_node, numa_node >= 0);
+                        dst, down_exps, qtile_ptr, qrow_bytes, tile_assignments_ref, expert, row_start, row_end,
+                        numa_node, NativeMoEKernelMayFanOut(shared_q8, numa_node));
                 });
                 if (!ok) {
                     return;
@@ -3679,7 +4485,7 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
                 if (!Qwen35NativeMoEDownQuantizeHiddenForWeight(hidden, token, k, down_exps->type, qbuf)) continue;
                 qrow = qbuf.data();
             }
-            RunNativeMoEOnExpertNode(shared_q8, expert, [&](int) {
+            const auto accumulate_expert_rows = [&] {
                 for (int64_t pair = pair_start; pair < pair_end; ++pair) {
                     const int64_t row = pair * 2;
                     float value0 = 0.0f;
@@ -3709,7 +4515,12 @@ static void RunQwen35NativeMoEDownQ5KWeightedLogitsFastPath(ggml_tensor* dst, co
                         *dst_ptr += value * gate_weight;
                     }
                 }
-            });
+            };
+            if (use_global_row_partition) {
+                accumulate_expert_rows();
+            } else {
+                RunNativeMoEOnExpertNode(shared_q8, expert, [&](int) { accumulate_expert_rows(); });
+            }
         }
     }
     const int64_t row_start = pair_start * 2;
@@ -4048,10 +4859,219 @@ static bool Qwen35NativeMoEKQ8KFusedSwiGLURows(InferenceWorkContext* work_ctx, g
                                                              row_bytes, out_start);
 }
 
+static bool TryRunQwen35NativeMoEGateUpGroupedDecode(ggml_tensor* dst, const ggml_tensor* gate_exps,
+                                                     const ggml_tensor* up_exps,
+                                                     const ggml_tensor* selected_experts,
+                                                     int64_t row_start, int64_t row_end,
+                                                     Qwen35SharedQ8RowsUserData* shared_q8);
+
+static bool TryRunQwen35NativeMoEGateUpDirectOuterTasks(ggml_tensor* dst, const ggml_tensor* gate_exps,
+                                                        const ggml_tensor* up_exps,
+                                                        const ggml_tensor* selected_experts, int ith, int nth,
+                                                        Qwen35SharedQ8RowsUserData* shared_q8) {
+    if (!dst || !gate_exps || !up_exps || !selected_experts || !shared_q8 || !shared_q8->numa_backend ||
+        !shared_q8->numa_sticky_enabled || shared_q8->record_lfm2_w1w3_kernel ||
+        ResolveNativeMoEOuterTaskExecutionPhase(shared_q8) != InferenceExecutionPhase::Decode ||
+        selected_experts->ne[1] != 1 ||
+        selected_experts->ne[0] <= 0 || selected_experts->ne[0] > kQwen35NativeMoEMaxGroupedExperts ||
+        gate_exps->type != GGML_TYPE_Q4_K || up_exps->type != GGML_TYPE_Q4_K ||
+        dst->nb[0] != static_cast<int64_t>(sizeof(float)) || nth <= 1) {
+        return false;
+    }
+    const ggml_tensor* prepacked = shared_q8->prepacked_fused_gate_up_exps;
+    const int64_t row_count = dst->ne[0];
+    if (!prepacked || !prepacked->data || prepacked->type != GGML_TYPE_Q4_K ||
+        prepacked->ne[0] != gate_exps->ne[0] || prepacked->ne[1] != 2 * row_count ||
+        prepacked->ne[2] != gate_exps->ne[2] || (row_count % 8) != 0) {
+        return false;
+    }
+
+    NativeMoEOuterTaskPlan task_plan;
+    bool task_ok = ResolveNativeMoEOuterTaskPlan(shared_q8, ith, nth, &task_plan);
+    const uint64_t epoch = BeginNativeMoEDirectOuterTask(shared_q8, ith, nth, /*initialize_ok=*/true);
+    const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, 0, 0);
+    task_ok = task_ok && qrow != nullptr;
+    const int tile_count = static_cast<int>(row_count / 8);
+    const int tile_start = task_ok ? (tile_count * task_plan.node_task_rank) / task_plan.node_task_count : 0;
+    const int tile_end = task_ok ? (tile_count * (task_plan.node_task_rank + 1)) / task_plan.node_task_count : 0;
+    const int top_k = static_cast<int>(selected_experts->ne[0]);
+    for (int item = 0; item < top_k && task_ok; ++item) {
+        int32_t expert = -1;
+        if (!Qwen35NativeMoEDownQ5KReadExpert(selected_experts, gate_exps, 0, item, &expert)) {
+            task_ok = false;
+            break;
+        }
+        const int expert_node = ResolveNativeMoEExpertNumaNode(shared_q8, expert);
+        int node_task_count = 0;
+        for (int task = 0; task < nth; ++task) {
+            node_task_count += shared_q8->outer_task_nodes[task] == expert_node ? 1 : 0;
+        }
+        if (expert_node < 0 || node_task_count == 0) {
+            task_ok = false;
+            break;
+        }
+        if (expert_node != task_plan.task_node || tile_end <= tile_start) {
+            continue;
+        }
+        const void* fused_expert = static_cast<const char*>(prepacked->data) +
+                                   static_cast<size_t>(expert) * static_cast<size_t>(prepacked->nb[2]);
+        float* out = reinterpret_cast<float*>(static_cast<char*>(dst->data) +
+                                              static_cast<size_t>(item) * static_cast<size_t>(dst->nb[1]));
+        task_ok = densecore::RunQ4KPrepackedMoEFusedSwiGLUTileRange(
+            fused_expert, qrow, out, row_count, gate_exps->ne[0], tile_start, tile_end);
+    }
+    bool owner_task = false;
+    const bool all_ok = FinishNativeMoEDirectOuterTask(shared_q8, ith, epoch, task_ok, &owner_task);
+    if (!owner_task) {
+        return true;
+    }
+    if (!all_ok) {
+        shared_q8->outer_task_width.store(1, std::memory_order_relaxed);
+        return TryRunQwen35NativeMoEGateUpGroupedDecode(
+            dst, gate_exps, up_exps, selected_experts, 0, row_count, shared_q8);
+    }
+    static std::atomic<bool> logged_direct_gateup{false};
+    if (!logged_direct_gateup.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[NUMA] Qwen native MoE direct outer-task decode active "
+                     "(stage=gateup, tasks=%d, experts=%d)\n",
+                     nth, top_k);
+    }
+    return true;
+}
+
+static bool TryRunQwen35NativeMoEGateUpGroupedDecode(ggml_tensor* dst, const ggml_tensor* gate_exps,
+                                                     const ggml_tensor* up_exps, const ggml_tensor* selected_experts,
+                                                     int64_t row_start, int64_t row_end,
+                                                     Qwen35SharedQ8RowsUserData* shared_q8) {
+    if (!dst || !gate_exps || !up_exps || !selected_experts || !shared_q8 || !shared_q8->numa_backend ||
+        !shared_q8->numa_sticky_enabled || shared_q8->record_lfm2_w1w3_kernel ||
+        GetCurrentExecutionPhase() != InferenceExecutionPhase::Decode || selected_experts->ne[1] != 1 ||
+        selected_experts->ne[0] <= 0 || selected_experts->ne[0] > kQwen35NativeMoEMaxGroupedExperts ||
+        gate_exps->type != GGML_TYPE_Q4_K || up_exps->type != GGML_TYPE_Q4_K ||
+        dst->nb[0] != static_cast<int64_t>(sizeof(float)) || row_start < 0 || row_end <= row_start) {
+        return false;
+    }
+    const int outer_width = shared_q8->outer_task_width.load(std::memory_order_relaxed);
+    if (outer_width > 1) {
+        return false;
+    }
+    const uint8_t* qrow = Qwen35SharedQ8RowPtr(shared_q8, 0, 0);
+    if (!qrow) {
+        return false;
+    }
+
+    const int top_k = static_cast<int>(selected_experts->ne[0]);
+    std::array<int, kQwen35NativeMoEMaxGroupedExperts> experts{};
+    experts.fill(-1);
+    for (int k = 0; k < top_k; ++k) {
+        int32_t expert = -1;
+        if (Qwen35NativeMoEDownQ5KReadExpert(selected_experts, gate_exps, 0, k, &expert)) {
+            experts[static_cast<size_t>(k)] = expert;
+        }
+    }
+
+    const int64_t row_count = row_end - row_start;
+    const size_t weight_row_bytes = static_cast<size_t>(gate_exps->nb[1]);
+    const ggml_tensor* prepacked = shared_q8->prepacked_fused_gate_up_exps;
+    const bool use_prepacked = prepacked && prepacked->data && prepacked->type == GGML_TYPE_Q4_K &&
+                               row_start == 0 && prepacked->ne[0] == gate_exps->ne[0] &&
+                               prepacked->ne[1] == 2 * row_count && prepacked->ne[2] == gate_exps->ne[2] &&
+                               (row_count % 8) == 0;
+    std::atomic<bool> all_ok{true};
+    const bool grouped = RunNativeMoEOnExpertNodeGroups(
+        shared_q8, experts.data(), top_k, [&](int node, const NativeMoENodeGroupPlan& plan) {
+            std::array<int, kQwen35NativeMoEMaxGroupedExperts> group_items{};
+            int group_count = 0;
+            for (int item = 0; item < plan.item_count; ++item) {
+                if (plan.item_nodes[static_cast<size_t>(item)] == node) {
+                    group_items[static_cast<size_t>(group_count++)] = item;
+                }
+            }
+            if (group_count == 0) {
+                return;
+            }
+            if (use_prepacked) {
+                const int physical_cores = densecore::HardwareTopology::GetInstance().GetPhysicalCoreCount(node);
+                const int worker_count = std::max(1, physical_cores > 0 ? physical_cores : group_count);
+                const int splits_per_expert = std::max(1, (worker_count + group_count - 1) / group_count);
+                const int total_units = group_count * splits_per_expert;
+                const int tile_count = static_cast<int>(row_count / 8);
+                shared_q8->numa_backend->ParallelFor(
+                    total_units,
+                    [&](int unit_start, int unit_end, int) {
+                        for (int unit = unit_start; unit < unit_end && all_ok.load(std::memory_order_relaxed); ++unit) {
+                            const int item = group_items[static_cast<size_t>(unit / splits_per_expert)];
+                            const int split = unit % splits_per_expert;
+                            const int tile_start = (tile_count * split) / splits_per_expert;
+                            const int tile_end = (tile_count * (split + 1)) / splits_per_expert;
+                            const int expert = experts[static_cast<size_t>(item)];
+                            const void* fused_expert = static_cast<const char*>(prepacked->data) +
+                                                       static_cast<size_t>(expert) *
+                                                           static_cast<size_t>(prepacked->nb[2]);
+                            float* out = reinterpret_cast<float*>(
+                                static_cast<char*>(dst->data) +
+                                static_cast<size_t>(item) * static_cast<size_t>(dst->nb[1]));
+                            if (!densecore::RunQ4KPrepackedMoEFusedSwiGLUTileRange(
+                                    fused_expert, qrow, out, row_count, gate_exps->ne[0], tile_start, tile_end)) {
+                                all_ok.store(false, std::memory_order_relaxed);
+                            }
+                        }
+                    },
+                    node);
+                return;
+            }
+            const int physical_cores = densecore::HardwareTopology::GetInstance().GetPhysicalCoreCount(node);
+            const int worker_count = std::max(1, physical_cores > 0 ? physical_cores : group_count);
+            const int splits_per_expert = std::max(1, (worker_count + group_count - 1) / group_count);
+            const int total_units = group_count * splits_per_expert;
+            shared_q8->numa_backend->ParallelFor(
+                total_units,
+                [&](int unit_start, int unit_end, int) {
+                    for (int unit = unit_start; unit < unit_end && all_ok.load(std::memory_order_relaxed); ++unit) {
+                        const int item = group_items[static_cast<size_t>(unit / splits_per_expert)];
+                        const int split = unit % splits_per_expert;
+                        const int64_t split_start = (row_count * split) / splits_per_expert;
+                        const int64_t split_end = (row_count * (split + 1)) / splits_per_expert;
+                        if (split_end <= split_start) {
+                            continue;
+                        }
+                        const int expert = experts[static_cast<size_t>(item)];
+                        const char* gate_row = static_cast<const char*>(gate_exps->data) +
+                                               static_cast<size_t>(expert) * static_cast<size_t>(gate_exps->nb[2]) +
+                                               static_cast<size_t>(row_start + split_start) * weight_row_bytes;
+                        const char* up_row = static_cast<const char*>(up_exps->data) +
+                                             static_cast<size_t>(expert) * static_cast<size_t>(up_exps->nb[2]) +
+                                             static_cast<size_t>(row_start + split_start) * weight_row_bytes;
+                        float* out = reinterpret_cast<float*>(
+                            static_cast<char*>(dst->data) +
+                            static_cast<size_t>(row_start + split_start) * static_cast<size_t>(dst->nb[0]) +
+                            static_cast<size_t>(item) * static_cast<size_t>(dst->nb[1]));
+                        if (!Qwen35NativeMoEKQ8KFusedSwiGLURows(nullptr, gate_exps->type, gate_row, up_row, qrow,
+                                                                gate_exps->ne[0], split_end - split_start,
+                                                                weight_row_bytes, out)) {
+                            all_ok.store(false, std::memory_order_relaxed);
+                        }
+                    }
+                },
+                node);
+        });
+    if (!grouped || !all_ok.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    GetNativeMoENumaCounters().grouped_decode_used_ops.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<bool> logged_grouped_gateup{false};
+    if (!logged_grouped_gateup.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[NUMA] Qwen native MoE grouped decode active (stage=gateup, experts=%d, kernel=%s)\n",
+                     top_k, use_prepacked ? "q4k_8x8_prepacked" : "raw_q4k");
+    }
+    return true;
+}
+
 static void ProbeQwen35NativeMoEGateUpReference(const ggml_tensor* dst, const ggml_tensor* gate_exps,
                                                 const ggml_tensor* up_exps, const ggml_tensor* input,
-                                                const ggml_tensor* selected_experts, int64_t row_start,
-                                                int64_t row_end, const Qwen35SharedQ8RowsUserData* shared_q8) {
+                                                const ggml_tensor* selected_experts, int64_t row_start, int64_t row_end,
+                                                const Qwen35SharedQ8RowsUserData* shared_q8) {
     if (!dst || !gate_exps || !up_exps || !input || !selected_experts || !dst->data || !gate_exps->data ||
         !up_exps->data || !input->data || !selected_experts->data || row_start >= row_end) {
         return;
@@ -4257,13 +5277,16 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                                        tile_byte_off;
                 float* out_col = reinterpret_cast<float*>(
                     static_cast<char*>(dst->data) + static_cast<size_t>(k) * static_cast<size_t>(dst->nb[1]));
+                // Bound on the calling thread: the body may run on a NUMA-pinned
+                // helper thread with its own empty thread_local buffers (W2).
+                float* q5k_gate_ptr = q5k_gate_buf.data();
+                float* q5k_up_ptr = q5k_up_buf.data();
                 RunNativeMoEOnExpertNode(shared_q8, expert, [&](int) {
-                    ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_gate_buf.data(), 0, gate_vx, qrow, 1,
-                                            nc);
-                    ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_up_buf.data(), 0, up_vx, qrow, 1, nc);
+                    ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_gate_ptr, 0, gate_vx, qrow, 1, nc);
+                    ggml_gemv_q5_K_8x8_q8_K(static_cast<int>(hidden_dim), q5k_up_ptr, 0, up_vx, qrow, 1, nc);
                     for (int i = 0; i < nc; ++i) {
-                        out_col[r0 + i] = NativeMoESiLU(q5k_gate_buf[static_cast<size_t>(i)]) *
-                                          q5k_up_buf[static_cast<size_t>(i)];
+                        out_col[r0 + i] =
+                            NativeMoESiLU(q5k_gate_ptr[static_cast<size_t>(i)]) * q5k_up_ptr[static_cast<size_t>(i)];
                     }
                 });
             }
@@ -4341,23 +5364,33 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                         continue;
                     }
                     bool ok = false;
+                    // ROOT CAUSE OF W2: these are thread_local buffers, and when sticky
+                    // NUMA routing is armed RunNativeMoEOnExpertNode executes this body on
+                    // a NUMA-pinned helper thread. There the thread_locals are that
+                    // thread's own instances -- empty, so .data() was returning nullptr and
+                    // every kernel below rejected on its null-argument guard. The reject
+                    // left `dst` unwritten with no fallback, silently corrupting prefill.
+                    // Bind the pointers here, on the thread that actually filled them.
+                    const float* gateup_input_tile_ptr = gateup_input_tile.data();
+                    const uint8_t* gateup_qtile_ptr = gateup_qtile.data();
+                    float* gateup_tile_out_ptr = gateup_tile_out.data();
                     RunNativeMoEOnExpertNode(shared_q8, expert, [&](int numa_node) {
-                        const bool allow_parallel = numa_node >= 0;
+                        const bool allow_parallel = NativeMoEKernelMayFanOut(shared_q8, numa_node);
                         if (q5_single_copy_8x8) {
                             ok = densecore::RunQ5KRepackedMoEFusedSwiGLURawProjection(
-                                &backend, gate_row_start, up_row_start, gateup_input_tile.data(), gateup_qtile.data(),
-                                qrow_bytes, gateup_tile_out.data(), static_cast<int64_t>(tile_count), row_count,
+                                &backend, gate_row_start, up_row_start, gateup_input_tile_ptr, gateup_qtile_ptr,
+                                qrow_bytes, gateup_tile_out_ptr, static_cast<int64_t>(tile_count), row_count,
                                 gate_exps->ne[0], numa_node, allow_parallel);
                         } else if (q4_repacked_gateup) {
                             RecordLFM2NativeMoEW1W3Kernel(lfm2_w1w3_work_ctx, "q4k_repacked");
                             ok = densecore::RunQ4KRepackedMoEFusedSwiGLUProjection(
-                                &backend, gate_row_start, up_row_start, gateup_input_tile.data(), gateup_qtile.data(),
-                                qrow_bytes, gateup_tile_out.data(), static_cast<int64_t>(tile_count), row_count,
+                                &backend, gate_row_start, up_row_start, gateup_input_tile_ptr, gateup_qtile_ptr,
+                                qrow_bytes, gateup_tile_out_ptr, static_cast<int64_t>(tile_count), row_count,
                                 gate_exps->ne[0], numa_node, allow_parallel);
                         } else {
                             ok = densecore::RunMoEKQuantRawBatchedFusedSwiGLU(
                                 &backend, static_cast<int>(gate_exps->type), gate_row_start, up_row_start,
-                                gateup_qtile.data(), qrow_bytes, gateup_tile_out.data(),
+                                gateup_qtile_ptr, qrow_bytes, gateup_tile_out_ptr,
                                 static_cast<int64_t>(tile_count), row_count, gate_exps->ne[0], numa_node,
                                 allow_parallel);
                         }
@@ -4417,7 +5450,7 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                     const bool q5_row_aligned = !q5_single_copy_8x8 || ((row_start % 8) == 0 && (row_count % 8) == 0);
                     bool ok = false;
                     RunNativeMoEOnExpertNode(shared_q8, expert, [&](int numa_node) {
-                        const bool allow_parallel = numa_node >= 0;
+                        const bool allow_parallel = NativeMoEKernelMayFanOut(shared_q8, numa_node);
                         ok = q5_single_copy_8x8
                                  ? (input_row && q5_row_aligned &&
                                     densecore::RunQ5KRepackedMoEFusedSwiGLURawProjection(
@@ -4464,6 +5497,22 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
     if (q5_single_copy_8x8) {
         if (shared_q8) {
             shared_q8->repacked_swiglu_failed.store(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    if (TryRunQwen35NativeMoEGateUpDirectOuterTasks(dst, gate_exps, up_exps, selected_experts, ith, nth,
+                                                    shared_q8)) {
+        if (ith == 0 && shared_q8->repacked_swiglu_failed.load(std::memory_order_relaxed) == 0) {
+            ProbeQwen35NativeMoEGateUpReference(dst, gate_exps, up_exps, input, selected_experts, 0, n_ff,
+                                                shared_q8);
+        }
+        return;
+    }
+    if (TryRunQwen35NativeMoEGateUpGroupedDecode(dst, gate_exps, up_exps, selected_experts, row_start, row_end,
+                                                 shared_q8)) {
+        if (shared_q8->repacked_swiglu_failed.load(std::memory_order_relaxed) == 0) {
+            ProbeQwen35NativeMoEGateUpReference(dst, gate_exps, up_exps, input, selected_experts, row_start, row_end,
+                                                shared_q8);
         }
         return;
     }
@@ -4544,20 +5593,19 @@ static void cb_qwen35_native_moe_gateup_raw_qxk_swiglu(struct ggml_tensor* dst, 
             RecordNativeMoEGraphCallbackExecution(work_ctx, selected_experts, effective_nth);
         }
         const auto end = std::chrono::steady_clock::now();
-        const auto wall_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-        const bool swiglu_failed =
-            shared_q8 && shared_q8->repacked_swiglu_failed.load(std::memory_order_relaxed) != 0;
+        const auto wall_ns =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+        const bool swiglu_failed = shared_q8 && shared_q8->repacked_swiglu_failed.load(std::memory_order_relaxed) != 0;
         const char* reject_reason = nullptr;
         if (swiglu_failed) {
-            reject_reason = shared_q8->q5k_gateup_8x8_single_copy_required
-                                ? "qwen35_gateup_q5k_single_copy_failed"
-                            : shared_q8->prefer_q4k_repacked_swiglu
-                                ? "lfm2_w1w3_repacked_swiglu_failed"
-                                : "lfm2_w1w3_range_swiglu_failed";
+            reject_reason = shared_q8->q5k_gateup_8x8_single_copy_required ? "qwen35_gateup_q5k_single_copy_failed"
+                            : shared_q8->record_lfm2_w1w3_kernel
+                                ? (shared_q8->prefer_q4k_repacked_swiglu ? "lfm2_w1w3_repacked_swiglu_failed"
+                                                                         : "lfm2_w1w3_range_swiglu_failed")
+                                : "qwen35_gateup_q4k_swiglu_failed";
         }
         RecordNativeMoEFastDecodeDecision(work_ctx, /*candidate=*/true, /*used=*/!swiglu_failed, reject_reason,
-                                         /*w1w3_used=*/!swiglu_failed, /*w2_used=*/false, swiglu_failed ? 0 : wall_ns);
+                                          /*w1w3_used=*/!swiglu_failed, /*w2_used=*/false, swiglu_failed ? 0 : wall_ns);
     }
 }
 
@@ -4668,7 +5716,7 @@ static bool ShouldUseQwenLikeGateUpQ4KRepackedSwiGLU(const QwenLikeNativeMoEGrap
     // kernel_available only proves the kernel + some opt-in is active; re-check
     // the LFM2 opt-in here so a Qwen-prefill-only flag cannot leak into LFM2
     // decode.
-    return graph_plan.lfm2_native_moe && C4ALfm2Q4KMoERepackOptIn();
+    return graph_plan.lfm2_native_moe && C4ALfm2Q4KMoERepackEnabled();
 #else
     // x86: C4 validation showed the single-token LFM2 Q4_K repacked SwiGLU path
     // regresses decode throughput versus the raw k-quant row path, so scope to
@@ -4907,11 +5955,40 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     const int64_t n_embd = routed_input->ne[0];
     const int64_t n_experts = gate_logits->ne[0];
     const int64_t n_expert_used = std::max<int64_t>(1, std::min<int64_t>(top_k, n_experts));
+    const NativeMoENumaPlacement build_placement = EvaluateNativeMoENumaPlacement(numa_backend, layer);
+    const bool build_sticky_armed = NativeMoENumaStickyArmed(build_placement.state);
+    const bool direct_outer_candidate =
+        build_sticky_armed && graph_plan.qwen_native_moe &&
+        graph_plan.graph_phase == InferenceExecutionPhase::Decode && n_tokens == 1 && raw_gate_exps && raw_up_exps &&
+        raw_down_exps && raw_gate_exps->type == GGML_TYPE_Q4_K && raw_up_exps->type == GGML_TYPE_Q4_K &&
+        (raw_down_exps->type == GGML_TYPE_Q4_K || raw_down_exps->type == GGML_TYPE_Q5_K ||
+         raw_down_exps->type == GGML_TYPE_Q6_K) &&
+        moe_weights.use_fused_gate_up && moe_weights.gate_up_exps && moe_weights.gate_up_exps->data &&
+        moe_weights.gate_up_exps->type == GGML_TYPE_Q4_K && ggml_cpu_has_avx2() &&
+        std::strstr(moe_weights.gate_up_exps->name, "cpu_repack_fused");
     const int native_moe_callback_tasks =
-        NativeMoEHasVerifiedNumaPlacement(numa_backend, layer)
+        build_sticky_armed && !direct_outer_candidate
             ? 1
-            : ResolveNativeMoEGraphCallbackTaskCount(model, GetCurrentBatch(), graph_plan.graph_phase, n_tokens,
-                                                     static_cast<int>(n_expert_used));
+            : (direct_outer_candidate
+                   ? ResolveTaskCount(GetCurrentBatch(), 0)
+                   : ResolveNativeMoEGraphCallbackTaskCount(model, GetCurrentBatch(), graph_plan.graph_phase, n_tokens,
+                                                            static_cast<int>(n_expert_used)));
+    // One-shot. Sticky routing arming at RUN time while the graph was built with
+    // the wide task count is the combination that puts a per-expert dispatch
+    // inside a wide parallel region, so the two facts have to be readable
+    // together -- the run-time sticky state alone does not say which task count
+    // the graph was wired with.
+    {
+        static std::atomic<bool> logged_build_tasks{false};
+        if (!logged_build_tasks.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[NUMA] Native MoE graph built with callback_tasks=%d (build-time sticky state=%s, "
+                         "experts=%d, nodes=%d)\n",
+                         native_moe_callback_tasks,
+                         GetNativeMoENumaStickyStateName(static_cast<int>(build_placement.state)),
+                         build_placement.expert_count, build_placement.node_count);
+        }
+    }
     if (!ValidateQwenLikeNativeMoEShapes(moe_weights, routed_input, gate_logits, n_tokens, n_embd, n_experts)) {
         if (IsMoEWiringDebugEnabled()) {
             std::fprintf(stderr,
@@ -4981,6 +6058,13 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
             // Qwen-like MoE variants when the kernel is available.
             gateup_q8_ud->prefer_q4k_repacked_swiglu = ShouldUseQwenLikeGateUpQ4KRepackedSwiGLU(
                 graph_plan, w1w3_type, GetCurrentExecutionPhase(), Qwen35GateUpQ4KRepackKernelAvailable());
+            gateup_q8_ud->prepacked_fused_gate_up_exps =
+                graph_plan.qwen_native_moe && moe_weights.use_fused_gate_up &&
+                        GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode &&
+                        moe_weights.gate_up_exps->type == GGML_TYPE_Q4_K && ggml_cpu_has_avx2() &&
+                        std::strstr(moe_weights.gate_up_exps->name, "cpu_repack_fused")
+                    ? moe_weights.gate_up_exps
+                    : nullptr;
             gateup_q8_ud->q5k_gateup_8x8_single_copy = native_q5_gateup_single_copy;
             gateup_q8_ud->q5k_gateup_8x8_single_copy_required =
                 (graph_plan.qwen_native_moe || graph_plan.lfm2_native_moe) && w1w3_type == GGML_TYPE_Q5_K;
@@ -5005,7 +6089,8 @@ ggml_tensor* TryBuildQwen35NativeMoEGraph(ggml_context* ctx, ggml_cgraph* gf, Tr
     if (!graph_plan.lfm2_debug_reference &&
         CanFuseQwen35W2NormWeightsFromLogitsWithCustomCallback(model, fast_down_exps, hidden, selected_experts,
                                                                 gate_logits)) {
-        hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(ctx, hidden, selected_experts->ne[0] * selected_experts->ne[1]);
+        hidden_q8_ud = AllocateQwen35SharedQ8RowsUserData(
+            ctx, hidden, selected_experts->ne[0] * selected_experts->ne[1], fast_down_exps->ne[1]);
         if (hidden_q8_ud && graph_plan.lfm2_native_moe) {
             SetNativeMoENumaContext(hidden_q8_ud, numa_backend, layer);
             hidden_q8_ud->work_ctx = GetCurrentWorkContext();
@@ -6370,6 +7455,40 @@ DecodeRuntimeStatsSnapshot GetDecodeRuntimeStatsSnapshot() {
         snapshot.hybrid_ssm_dispatch_counts[i] = g_hybrid_ssm_dispatch_counters[i].load(std::memory_order_relaxed);
     }
     return snapshot;
+}
+
+NativeMoENumaStatsSnapshot GetNativeMoENumaStatsSnapshot() {
+    const NativeMoENumaCounters& counters = GetNativeMoENumaCounters();
+    NativeMoENumaStatsSnapshot snapshot;
+    snapshot.context_set_total = counters.context_set_total.load(std::memory_order_relaxed);
+    snapshot.context_enabled_total = counters.context_enabled_total.load(std::memory_order_relaxed);
+    snapshot.sticky_dispatch_ops = counters.sticky_dispatch_ops.load(std::memory_order_relaxed);
+    snapshot.legacy_dispatch_ops = counters.legacy_dispatch_ops.load(std::memory_order_relaxed);
+    snapshot.grouped_decode_used_ops = counters.grouped_decode_used_ops.load(std::memory_order_relaxed);
+    snapshot.grouped_dispatch_node_tasks = counters.grouped_dispatch_node_tasks.load(std::memory_order_relaxed);
+    snapshot.grouped_dispatch_expert_items = counters.grouped_dispatch_expert_items.load(std::memory_order_relaxed);
+    snapshot.direct_decode_used_ops = counters.direct_decode_used_ops.load(std::memory_order_relaxed);
+    snapshot.direct_decode_rejected_ops = counters.direct_decode_rejected_ops.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < snapshot.node_dispatch_ops.size(); ++i) {
+        snapshot.node_dispatch_ops[i] = counters.node_dispatch_ops[i].load(std::memory_order_relaxed);
+    }
+    snapshot.node_dispatch_overflow_ops = counters.node_dispatch_overflow_ops.load(std::memory_order_relaxed);
+    snapshot.last_state = counters.last_state.load(std::memory_order_relaxed);
+    return snapshot;
+}
+
+const char* GetNativeMoENumaStickyStateName(int state) {
+    switch (static_cast<NativeMoENumaStickyState>(state)) {
+    case NativeMoENumaStickyState::Unset: return "unset";
+    case NativeMoENumaStickyState::NoBackend: return "no_backend";
+    case NativeMoENumaStickyState::SingleNode: return "single_node";
+    case NativeMoENumaStickyState::PlacementUnavailable: return "placement_unavailable";
+    case NativeMoENumaStickyState::PlacementInvalid: return "placement_invalid";
+    case NativeMoENumaStickyState::Enabled: return "enabled";
+    case NativeMoENumaStickyState::EnabledSingleNodeDegenerate: return "enabled_degenerate";
+    case NativeMoENumaStickyState::DisabledByDebug: return "disabled_by_debug";
+    }
+    return "unknown";
 }
 
 const char* GetDecodePagedFallbackReasonName(std::size_t index) {

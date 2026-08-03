@@ -1576,6 +1576,92 @@ bool RemapNativeMoECallbackTaskForTest(int requested_task_count, int ith, int nt
     return ::RemapNativeMoECallbackTask(&ud, ith, nth, effective_ith, effective_nth);
 }
 
+bool BuildNativeMoENodeGroupPlanForTest(const std::vector<int>& item_nodes, int node_count,
+                                        std::vector<int>* active_nodes) {
+    if (!active_nodes) {
+        return false;
+    }
+    NativeMoENodeGroupPlan plan;
+    if (!::BuildNativeMoENodeGroupPlan(item_nodes.data(), static_cast<int>(item_nodes.size()), node_count, &plan)) {
+        active_nodes->clear();
+        return false;
+    }
+    active_nodes->assign(plan.active_nodes.begin(), plan.active_nodes.begin() + plan.active_node_count);
+    return true;
+}
+
+bool BuildNativeMoEOuterTaskPlanForTest(const std::vector<int>& task_nodes, int task_index, int node_count,
+                                        int* task_node, int* node_task_rank, int* node_task_count) {
+    if (!task_node || !node_task_rank || !node_task_count) {
+        return false;
+    }
+    NativeMoEOuterTaskPlan plan;
+    if (!::BuildNativeMoEOuterTaskPlan(task_nodes.data(), static_cast<int>(task_nodes.size()), task_index,
+                                       node_count, &plan)) {
+        return false;
+    }
+    *task_node = plan.task_node;
+    *node_task_rank = plan.node_task_rank;
+    *node_task_count = plan.node_task_count;
+    return true;
+}
+
+bool ShouldUseQwenNativeMoEDownGlobalRowPartitionForTest(bool numa_sticky_enabled,
+                                                         bool weighted_logits_lfm2_sigmoid, int phase,
+                                                         int64_t n_tokens, int nth) {
+    return ::ShouldUseQwen35NativeMoEDownGlobalRowPartition(
+        numa_sticky_enabled, weighted_logits_lfm2_sigmoid, static_cast<InferenceExecutionPhase>(phase), n_tokens, nth);
+}
+
+bool RunNativeMoEDirectOuterTaskBarrierForTest(int task_count, int failing_task, int rounds) {
+    if (task_count <= 1 || task_count > kQwen35SharedQ8MaxTasks || failing_task >= task_count || rounds <= 0) {
+        return false;
+    }
+    Qwen35SharedQ8RowsUserData ud{};
+    for (int round = 0; round < rounds; ++round) {
+        std::atomic<int> matching_results{0};
+        std::atomic<int> owner_results{0};
+        std::vector<std::thread> tasks;
+        tasks.reserve(static_cast<size_t>(task_count));
+        for (int task = 0; task < task_count; ++task) {
+            tasks.emplace_back([&, task] {
+                const uint64_t epoch = ::BeginNativeMoEDirectOuterTask(&ud, task, task_count, true);
+                bool owner_task = false;
+                const bool result =
+                    ::FinishNativeMoEDirectOuterTask(&ud, task, epoch, task != failing_task, &owner_task);
+                const bool expected = failing_task < 0;
+                if (owner_task) {
+                    owner_results.fetch_add(1, std::memory_order_relaxed);
+                    matching_results.fetch_add(result == expected ? 1 : 0, std::memory_order_relaxed);
+                } else {
+                    matching_results.fetch_add(result ? 1 : 0, std::memory_order_relaxed);
+                }
+            });
+        }
+        for (std::thread& task : tasks) {
+            task.join();
+        }
+        if (matching_results.load(std::memory_order_relaxed) != task_count ||
+            owner_results.load(std::memory_order_relaxed) != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<float> ReduceNativeMoEExpertOutputsInRoutingOrderForTest(const std::vector<float>& expert_outputs,
+                                                                     const std::vector<int>& experts,
+                                                                     const std::vector<float>& weights, int row_count) {
+    if (row_count <= 0 || experts.size() != weights.size() ||
+        expert_outputs.size() != experts.size() * static_cast<size_t>(row_count)) {
+        return {};
+    }
+    std::vector<float> output(static_cast<size_t>(row_count), 0.0f);
+    ::ReduceNativeMoEExpertOutputsInRoutingOrder(output.data(), sizeof(float), expert_outputs.data(), experts.data(),
+                                                 weights.data(), static_cast<int>(experts.size()), row_count);
+    return output;
+}
+
 bool QwenNativeMoENoAllocUserDataIsPerOpForTest() {
     ggml_init_params params{};
     params.mem_size = 1 << 20;
@@ -1584,14 +1670,17 @@ bool QwenNativeMoENoAllocUserDataIsPerOpForTest() {
     if (!ctx) return false;
 
     ggml_tensor* src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, QK_K, 1, 1);
-    auto* first = ::AllocateQwen35SharedQ8RowsUserData(ctx, src, 8);
-    auto* second = ::AllocateQwen35SharedQ8RowsUserData(ctx, src, 8);
+    auto* first = ::AllocateQwen35SharedQ8RowsUserData(ctx, src, 8, 64);
+    auto* second = ::AllocateQwen35SharedQ8RowsUserData(ctx, src, 8, 64);
     const bool per_op = first && second && first != second && first->rows != second->rows &&
-                        first->assignments != second->assignments;
+                        first->assignments != second->assignments &&
+                        first->direct_expert_outputs != second->direct_expert_outputs &&
+                        first->direct_expert_output_capacity == 8 * 64;
     const auto destroy = [](Qwen35SharedQ8RowsUserData* ud) {
         if (!ud) return;
         delete[] ud->rows;
         delete[] ud->assignments;
+        delete[] ud->direct_expert_outputs;
         delete ud;
     };
     destroy(first);

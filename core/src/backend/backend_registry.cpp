@@ -17,6 +17,10 @@
 #include "densecore/hal/backend_registry.h"
 
 #include <iostream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "densecore/backend/cpu_backend.h"
 
@@ -47,6 +51,35 @@
 
 namespace densecore {
 
+namespace {
+
+void CloseBackendPluginHandle(void* handle) noexcept {
+    if (!handle) {
+        return;
+    }
+#if defined(_WIN32)
+    FreeLibrary(static_cast<HMODULE>(handle));
+#else
+    dlclose(handle);
+#endif
+}
+
+void SetPluginError(std::string* error_message, std::string message) {
+    if (error_message) {
+        *error_message = std::move(message);
+    }
+}
+
+bool IsValidPluginDeviceType(DeviceType device) {
+    const auto value = static_cast<uint8_t>(device);
+    return device == DeviceType::CPU || device == DeviceType::METAL || device == DeviceType::NPU ||
+           device == DeviceType::ASIC ||
+           (value >= static_cast<uint8_t>(DeviceType::CUSTOM_START) &&
+            value < static_cast<uint8_t>(DeviceType::UNKNOWN));
+}
+
+}  // namespace
+
 // =============================================================================
 // Singleton Instance
 // =============================================================================
@@ -55,6 +88,45 @@ BackendRegistry& BackendRegistry::Instance() {
     static BackendRegistry instance;
     return instance;
 }
+
+BackendRegistry::~BackendRegistry() {
+    Shutdown();
+}
+
+void BackendRegistry::Shutdown() noexcept {
+    std::unordered_map<DeviceType, std::unique_ptr<ComputeBackend>> backends;
+    std::vector<void*> plugin_handles;
+#ifdef __APPLE__
+    std::unique_ptr<HybridScheduler> hybrid_scheduler;
+#endif
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+#ifdef __APPLE__
+        hybrid_scheduler = std::move(hybridScheduler_);
+#endif
+        backends.swap(backends_);
+        plugin_handles.swap(plugin_handles_);
+        default_device_ = DeviceType::CPU;
+        initialized_.store(false, std::memory_order_release);
+    }
+
+#ifdef __APPLE__
+    hybrid_scheduler.reset();
+#endif
+    // Plugin backend destructors and vtables live in their shared libraries.
+    // Destroy every backend before releasing any retained plugin handle.
+    backends.clear();
+    for (auto it = plugin_handles.rbegin(); it != plugin_handles.rend(); ++it) {
+        CloseBackendPluginHandle(*it);
+    }
+}
+
+#ifdef DENSECORE_TEST_BUILD
+void BackendRegistry::ResetForTesting() {
+    Shutdown();
+}
+#endif
 
 // =============================================================================
 // Registration
@@ -166,7 +238,14 @@ void BackendRegistry::Register(DeviceType device, std::unique_ptr<ComputeBackend
     initialized_.store(true, std::memory_order_release);
 }
 
-void BackendRegistry::LoadPlugin(const std::string& path) {
+bool BackendRegistry::LoadPlugin(const std::string& path, std::string* error_message) {
+    if (error_message) {
+        error_message->clear();
+    }
+    if (path.empty()) {
+        SetPluginError(error_message, "plugin path is empty");
+        return false;
+    }
     std::cout << "[BackendRegistry] Loading plugin: " << path << std::endl;
 
     void* handle = nullptr;
@@ -175,38 +254,119 @@ void BackendRegistry::LoadPlugin(const std::string& path) {
 #if defined(_WIN32)
     handle = LoadLibraryA(path.c_str());
     if (!handle) {
-        std::cerr << "[BackendRegistry] Failed to load plugin: " << GetLastError() << std::endl;
-        return;
+        const std::string message = "failed to load plugin (Windows error " + std::to_string(GetLastError()) + ")";
+        std::cerr << "[BackendRegistry] " << message << std::endl;
+        SetPluginError(error_message, message);
+        return false;
     }
-    factory = (BackendFactory)GetProcAddress((HMODULE)handle, "CreateBackend");
+    factory = reinterpret_cast<BackendFactory>(GetProcAddress(static_cast<HMODULE>(handle), "CreateBackend"));
 #else
-    handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
-        std::cerr << "[BackendRegistry] Failed to load plugin: " << dlerror() << std::endl;
-        return;
+        const char* detail = dlerror();
+        const std::string message = std::string("failed to load plugin: ") + (detail ? detail : "unknown dlopen error");
+        std::cerr << "[BackendRegistry] " << message << std::endl;
+        SetPluginError(error_message, message);
+        return false;
     }
     // Clear any existing error
     dlerror();
-    factory = (BackendFactory)dlsym(handle, "CreateBackend");
+    factory = reinterpret_cast<BackendFactory>(dlsym(handle, "CreateBackend"));
 #endif
 
     if (!factory) {
-        std::cerr << "[BackendRegistry] Plugin does not export 'CreateBackend'" << std::endl;
-#if !defined(_WIN32)
-        dlclose(handle);
-#endif
-        return;
+        const std::string message = "plugin does not export 'CreateBackend'";
+        std::cerr << "[BackendRegistry] " << message << std::endl;
+        SetPluginError(error_message, message);
+        CloseBackendPluginHandle(handle);
+        return false;
     }
 
-    // Create backend instance
-    std::unique_ptr<ComputeBackend> backend(factory());
+    std::unique_ptr<ComputeBackend> backend;
+    std::string factory_error;
+    try {
+        backend = factory();
+    } catch (const std::exception& e) {
+        factory_error = std::string("CreateBackend threw: ") + e.what();
+    } catch (...) {
+        factory_error = "CreateBackend threw an unknown exception";
+    }
+    if (!factory_error.empty()) {
+        std::cerr << "[BackendRegistry] " << factory_error << std::endl;
+        SetPluginError(error_message, factory_error);
+        CloseBackendPluginHandle(handle);
+        return false;
+    }
     if (!backend) {
-        std::cerr << "[BackendRegistry] Factory returned nullptr" << std::endl;
-        return;
+        const std::string message = "CreateBackend returned nullptr";
+        std::cerr << "[BackendRegistry] " << message << std::endl;
+        SetPluginError(error_message, message);
+        CloseBackendPluginHandle(handle);
+        return false;
     }
 
-    DeviceType device_type = backend->Device();
-    Register(device_type, std::move(backend));
+    DeviceType device_type;
+    std::string backend_name;
+    std::string identification_error;
+    try {
+        device_type = backend->Device();
+        if (!IsValidPluginDeviceType(device_type)) {
+            throw std::invalid_argument("CreateBackend returned an invalid device type");
+        }
+        const char* name = backend->Name();
+        backend_name = name ? name : "<unnamed>";
+    } catch (const std::exception& e) {
+        identification_error = std::string("backend identification failed: ") + e.what();
+    } catch (...) {
+        identification_error = "backend identification failed with an unknown exception";
+    }
+    if (!identification_error.empty()) {
+        SetPluginError(error_message, identification_error);
+        backend.reset();
+        CloseBackendPluginHandle(handle);
+        return false;
+    }
+
+    bool duplicate_device = false;
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (backends_.find(device_type) != backends_.end()) {
+            duplicate_device = true;
+        } else {
+            // Retain the handle before publishing the backend. If map insertion
+            // fails, roll the handle entry back while the backend object is alive.
+            plugin_handles_.push_back(handle);
+            try {
+                const bool was_empty = backends_.empty();
+                backends_.emplace(device_type, std::move(backend));
+                if (was_empty) {
+                    default_device_ = device_type;
+                }
+                initialized_.store(true, std::memory_order_release);
+            } catch (...) {
+                plugin_handles_.pop_back();
+                throw;
+            }
+        }
+    } catch (const std::exception& e) {
+        const std::string message = std::string("failed to register plugin backend: ") + e.what();
+        SetPluginError(error_message, message);
+        backend.reset();
+        CloseBackendPluginHandle(handle);
+        return false;
+    }
+
+    if (duplicate_device) {
+        const std::string message = "backend device is already registered: " + std::string(DeviceTypeName(device_type));
+        SetPluginError(error_message, message);
+        backend.reset();
+        CloseBackendPluginHandle(handle);
+        return false;
+    }
+
+    std::cout << "[BackendRegistry] Registered plugin backend: " << backend_name
+              << " for device: " << DeviceTypeName(device_type) << std::endl;
+    return true;
 }
 
 // =============================================================================

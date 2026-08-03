@@ -48,6 +48,9 @@ bool RunQ4KRepackedMoEFusedSwiGLUProjection(CpuBackend* backend, const void* gat
                                             const float* input_data, const uint8_t* qinput_data,
                                             size_t qinput_row_bytes, float* output_data, int64_t rows, int64_t cols,
                                             int64_t input_cols, int numa_node, bool allow_parallel);
+bool RunQ4KPrepackedMoEFusedSwiGLUTileRange(const void* fused_weight_ptr, const uint8_t* qinput_data,
+                                             float* output_data, int64_t cols, int64_t input_cols,
+                                             int tile_start, int tile_end);
 namespace testing {
 bool RunQ5KQ8KBatchedGemvRowForTest(const void* weight_row, const void* q8_input_base, size_t q8_row_stride, int M,
                                     int cols, float* output);
@@ -351,6 +354,45 @@ TEST_F(MoEOpsTest, Q4KRepackedPrefillFusedSwiGLUMatchesRawBatched) {
 
     for (size_t i = 0; i < raw.size(); ++i) {
         EXPECT_NEAR(repacked[i], raw[i], 1e-4f) << "i=" << i;
+    }
+}
+
+TEST_F(MoEOpsTest, Q4KPrepackedDecodeFusedSwiGLUMatchesRepackedProjection) {
+    constexpr int64_t K = 512;
+    constexpr int64_t N = 128;
+
+    const std::vector<float> gate_f32 = MakePatternedFloats(N, K, 0.017f);
+    const std::vector<float> up_f32 = MakePatternedFloats(N, K, 0.013f);
+    const std::vector<float> input_f32 = MakePatternedFloats(1, K, 0.009f);
+
+    std::vector<uint8_t> qgate;
+    std::vector<uint8_t> qup;
+    std::vector<uint8_t> qinput;
+    QuantizeRowsCpu(GGML_TYPE_Q4_K, gate_f32, N, K, &qgate);
+    QuantizeRowsCpu(GGML_TYPE_Q4_K, up_f32, N, K, &qup);
+    QuantizeRowsCpu(GGML_TYPE_Q8_K, input_f32, 1, K, &qinput);
+
+    std::vector<uint8_t> fused_raw(qgate.size() + qup.size());
+    std::memcpy(fused_raw.data(), qgate.data(), qgate.size());
+    std::memcpy(fused_raw.data() + qgate.size(), qup.data(), qup.size());
+    std::vector<uint8_t> fused_prepacked(fused_raw.size());
+    ASSERT_EQ(ggml_repack_q4_K_8x8(fused_raw.data(), fused_raw.size(), 2 * N, K, fused_prepacked.data(),
+                                   fused_prepacked.size()),
+              0);
+
+    std::vector<float> expected(static_cast<size_t>(N), 0.0f);
+    std::vector<float> actual(static_cast<size_t>(N), 0.0f);
+    CpuBackend& backend = GetCpuBackend();
+    ASSERT_TRUE(RunQ4KRepackedMoEFusedSwiGLUProjection(
+        &backend, qgate.data(), qup.data(), nullptr, qinput.data(), ggml_row_size(GGML_TYPE_Q8_K, K), expected.data(),
+        /*rows=*/1, N, K, /*numa_node=*/0, /*allow_parallel=*/false));
+    ASSERT_TRUE(RunQ4KPrepackedMoEFusedSwiGLUTileRange(fused_prepacked.data(), qinput.data(), actual.data(), N, K,
+                                                       /*tile_start=*/0, /*tile_end=*/5));
+    ASSERT_TRUE(RunQ4KPrepackedMoEFusedSwiGLUTileRange(fused_prepacked.data(), qinput.data(), actual.data(), N, K,
+                                                       /*tile_start=*/5, /*tile_end=*/static_cast<int>(N / 8)));
+
+    for (size_t i = 0; i < actual.size(); ++i) {
+        EXPECT_NEAR(actual[i], expected[i], 1e-4f) << "i=" << i;
     }
 }
 

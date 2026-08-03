@@ -25,13 +25,26 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential
+          # libnuma/hwloc are required for the NUMA code paths to be compiled at
+          # all. Without them CMake silently selects the sysfs fallback and the
+          # NUMA sources never see a compiler, so syntax rot goes unnoticed.
+          sudo apt-get install -y cmake build-essential libnuma-dev libhwloc-dev
 
       - name: Configure CMake
         run: |
           cd core
           mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DDENSECORE_BUILD_TESTS=ON -DDENSECORE_LTO=ON
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DDENSECORE_BUILD_TESTS=ON -DDENSECORE_LTO=ON 2>&1 | tee cmake-configure.log
+
+      - name: Verify NUMA support is compiled in
+        run: |
+          # Fail loudly rather than let a missing dependency quietly downgrade
+          # the build to the non-NUMA fallback.
+          if ! grep -q "NUMA support enabled" core/build/cmake-configure.log; then
+            echo "::error::CMake did not enable NUMA support - NUMA code paths would not be compiled"
+            grep -i "numa" core/build/cmake-configure.log || true
+            exit 1
+          fi
 
       - name: Build C++ library
         run: |
@@ -104,7 +117,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential
+          sudo apt-get install -y cmake build-essential libnuma-dev libhwloc-dev
 
       - name: Build DenseCore runtime for cgo tests
         run: |

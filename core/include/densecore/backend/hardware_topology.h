@@ -156,6 +156,58 @@ public:
         return result;
     }
 
+    /**
+     * Get every physical core in the machine, ordered so that consecutive
+     * entries alternate NUMA nodes (node0-core0, node1-core0, node0-core1, ...).
+     *
+     * GetPhysicalCoreIds(-1) returns cores grouped by node, so a thread count
+     * smaller than the machine's core count would land entirely on the first
+     * node. Interleaving keeps any prefix of the list spread across sockets,
+     * which is what a compute pool sized below the core count needs.
+     */
+    std::vector<int> GetPhysicalCoreIdsInterleavedByNode() const {
+        std::vector<std::vector<int>> per_node(static_cast<size_t>(std::max(1, numa_node_count_)));
+        std::vector<int> unknown_node;
+        for (const auto& core : cores_) {
+            if (core.is_hyperthread) {
+                continue;
+            }
+            if (core.numa_node >= 0 && static_cast<size_t>(core.numa_node) < per_node.size()) {
+                per_node[static_cast<size_t>(core.numa_node)].push_back(core.logical_id);
+            } else {
+                unknown_node.push_back(core.logical_id);
+            }
+        }
+        std::vector<int> result;
+        size_t max_per_node = unknown_node.size();
+        for (const auto& node_cores : per_node) {
+            max_per_node = std::max(max_per_node, node_cores.size());
+        }
+        for (size_t slot = 0; slot < max_per_node; ++slot) {
+            for (const auto& node_cores : per_node) {
+                if (slot < node_cores.size()) {
+                    result.push_back(node_cores[slot]);
+                }
+            }
+            if (slot < unknown_node.size()) {
+                result.push_back(unknown_node[slot]);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * NUMA node a logical core belongs to, or -1 when the core is unknown.
+     */
+    int GetNumaNodeOfCore(int logical_id) const {
+        for (const auto& core : cores_) {
+            if (core.logical_id == logical_id) {
+                return core.numa_node;
+            }
+        }
+        return -1;
+    }
+
     // =========================================================================
     // Thread Pinning
     // =========================================================================
@@ -305,12 +357,21 @@ public:
      */
     void SetupComputeThreadAffinity(int numa_node, int n_threads, PinningPolicy policy = PinningPolicy::SCATTER) {
         std::lock_guard<std::mutex> lock(compute_affinity_mu_);
+        if (n_threads <= 0) return;
 
-        int target_node = (numa_node >= 0) ? numa_node : 0;
-        auto physical_cores = GetPhysicalCoreIds(target_node);
+        // A negative numa_node means "no node was requested" and must NOT collapse
+        // to node 0. Callers size n_threads from the machine-wide physical core
+        // count, so pinning that many threads into a single node's cores
+        // oversubscribes every core on that node (2 threads/core on a 2-socket
+        // box) while the other socket's cores stay completely idle for the whole
+        // run. Spread machine-wide instead, and only honour a node restriction
+        // when one was actually asked for.
+        const bool machine_wide = numa_node < 0;
+        auto physical_cores = machine_wide ? GetPhysicalCoreIdsInterleavedByNode() : GetPhysicalCoreIds(numa_node);
         if (physical_cores.empty()) return;
 
         compute_thread_cores_.resize(n_threads);
+        compute_thread_nodes_.resize(n_threads);
         size_t num_cores = physical_cores.size();
 
         for (int i = 0; i < n_threads; ++i) {
@@ -319,15 +380,24 @@ public:
             } else {
                 compute_thread_cores_[i] = physical_cores[std::min(static_cast<size_t>(i), num_cores - 1)];
             }
+            compute_thread_nodes_[i] = GetNumaNodeOfCore(compute_thread_cores_[i]);
         }
 
         compute_affinity_configured_ = true;
-        compute_affinity_numa_node_ = target_node;
+        compute_affinity_numa_node_ = machine_wide ? -1 : numa_node;
 
-        fprintf(stderr,
-                "[HardwareTopology] Compute thread affinity configured: "
-                "%d threads on NUMA node %d (%s policy)\n",
-                n_threads, target_node, (policy == PinningPolicy::SCATTER) ? "SCATTER" : "COMPACT");
+        if (machine_wide) {
+            fprintf(stderr,
+                    "[HardwareTopology] Compute thread affinity configured: "
+                    "%d threads across %d NUMA node(s), %zu physical cores (%s policy)\n",
+                    n_threads, numa_node_count_, num_cores,
+                    (policy == PinningPolicy::SCATTER) ? "SCATTER" : "COMPACT");
+        } else {
+            fprintf(stderr,
+                    "[HardwareTopology] Compute thread affinity configured: "
+                    "%d threads on NUMA node %d, %zu physical cores (%s policy)\n",
+                    n_threads, numa_node, num_cores, (policy == PinningPolicy::SCATTER) ? "SCATTER" : "COMPACT");
+        }
     }
 
     void SetupComputeThreadAffinityFromCoreIds(const std::vector<int>& core_ids, int n_threads,
@@ -341,6 +411,7 @@ public:
         if (sorted_ids.empty()) return;
 
         compute_thread_cores_.resize(n_threads);
+        compute_thread_nodes_.resize(n_threads);
         const size_t num_cores = sorted_ids.size();
         for (int i = 0; i < n_threads; ++i) {
             if (policy == PinningPolicy::SCATTER) {
@@ -348,6 +419,7 @@ public:
             } else {
                 compute_thread_cores_[i] = sorted_ids[std::min(static_cast<size_t>(i), num_cores - 1)];
             }
+            compute_thread_nodes_[i] = GetNumaNodeOfCore(compute_thread_cores_[i]);
         }
 
         compute_affinity_configured_ = true;
@@ -375,6 +447,19 @@ public:
     }
 
     /**
+     * NUMA node a compute thread index was pinned to, or -1 when affinity is not
+     * configured or the core's node is unknown.
+     */
+    int GetAssignedNumaNode(int thread_idx) const {
+        std::lock_guard<std::mutex> lock(compute_affinity_mu_);
+        if (!compute_affinity_configured_ || thread_idx < 0 ||
+            thread_idx >= static_cast<int>(compute_thread_nodes_.size())) {
+            return -1;
+        }
+        return compute_thread_nodes_[thread_idx];
+    }
+
+    /**
      * Pin the current thread based on its GGML thread index
      *
      * Call this from within GGML callbacks (cb_int4_gemm, etc.) on first
@@ -384,20 +469,32 @@ public:
      * @return true if pinned successfully (or already pinned)
      */
     bool PinComputeThread(int thread_idx) {
-        // Thread-local to track if we've already pinned this thread
-        thread_local bool already_pinned = false;
-
-        if (already_pinned) {
-            return true;  // Already pinned, skip syscall overhead
-        }
-
         int core_id = GetAssignedCore(thread_idx);
         if (core_id < 0) {
             return false;  // Affinity not configured
         }
 
+        // GGML clears the caller's affinity after every graph while its worker
+        // threads stay alive. A boolean TLS therefore becomes stale for task 0.
+        // The current CPU is not sufficient proof because a widened mask may
+        // still happen to be executing on core_id; verify the singleton mask.
+        thread_local int pinned_core = -1;
+#if defined(__linux__) && !defined(__ANDROID__)
+        if (pinned_core == core_id) {
+            cpu_set_t current_mask;
+            CPU_ZERO(&current_mask);
+            if (pthread_getaffinity_np(pthread_self(), sizeof(current_mask), &current_mask) == 0 &&
+                CPU_COUNT(&current_mask) == 1 && CPU_ISSET(core_id, &current_mask)) {
+                return true;
+            }
+        }
+#else
+        if (pinned_core == core_id) {
+            return true;
+        }
+#endif
         if (PinCurrentThread(core_id)) {
-            already_pinned = true;
+            pinned_core = core_id;
             return true;
         }
         return false;
@@ -517,12 +614,48 @@ private:
                 info.is_hyperthread = false;
             }
 
-            // Find NUMA node
-            hwloc_obj_t numa = hwloc_get_ancestor_obj_by_type(topology_, HWLOC_OBJ_NUMANODE, pu);
-            if (numa) {
-                info.numa_node = numa->logical_index;
-            } else {
-                // Some systems have memory at package level instead of NUMA node
+            // Find NUMA node.
+            //
+            // NOT via hwloc_get_ancestor_obj_by_type(HWLOC_OBJ_NUMANODE, pu):
+            // hwloc 2.0 moved NUMA nodes out of the CPU hierarchy and attached
+            // them as memory children of their local object, so that lookup
+            // returns NULL for every PU on hwloc >= 2. The old code then fell
+            // into its "no NUMA node" fallback and labelled EVERY core node 0.
+            // A 2-socket host still reported numa_node_count_ == 2 (that count
+            // comes from a separate query and stayed correct), so the mislabel
+            // was invisible in the node count while GetPhysicalCoreIds(1) came
+            // back empty -- which silently turned every node-1 pin into a no-op.
+            //
+            // Match the PU against each NUMA node's cpuset instead, which is the
+            // supported hwloc 2 idiom and still correct on hwloc 1.
+            info.numa_node = -1;
+            hwloc_obj_t numa = nullptr;
+            while ((numa = hwloc_get_next_obj_by_type(topology_, HWLOC_OBJ_NUMANODE, numa)) != nullptr) {
+                if (numa->cpuset && hwloc_bitmap_isset(numa->cpuset, pu->os_index)) {
+                    info.numa_node = numa->logical_index;
+                    break;
+                }
+            }
+            if (info.numa_node < 0) {
+                // Walk up to the nearest object that carries a nodeset, then map
+                // that node's OS index back to its logical index.
+                hwloc_obj_t ancestor = pu;
+                while (ancestor && (!ancestor->nodeset || hwloc_bitmap_iszero(ancestor->nodeset))) {
+                    ancestor = ancestor->parent;
+                }
+                if (ancestor && ancestor->nodeset) {
+                    const int os_node = hwloc_bitmap_first(ancestor->nodeset);
+                    hwloc_obj_t probe = nullptr;
+                    while ((probe = hwloc_get_next_obj_by_type(topology_, HWLOC_OBJ_NUMANODE, probe)) != nullptr) {
+                        if (static_cast<int>(probe->os_index) == os_node) {
+                            info.numa_node = probe->logical_index;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (info.numa_node < 0) {
+                // Genuinely no NUMA information (memory reported at package level).
                 info.numa_node = 0;
             }
 
@@ -777,6 +910,7 @@ private:
     // Compute thread affinity state
     mutable std::mutex compute_affinity_mu_;
     std::vector<int> compute_thread_cores_;
+    std::vector<int> compute_thread_nodes_;
     bool compute_affinity_configured_ = false;
     int compute_affinity_numa_node_ = -1;
 };

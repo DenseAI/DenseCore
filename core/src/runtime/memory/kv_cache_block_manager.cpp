@@ -3,6 +3,78 @@
 #include <atomic>
 #include <cstdlib>
 
+namespace {
+
+void ResetAllocatedBlock(BlockManager& manager, int block_id) {
+    manager.blocks[block_id].ref_count = 1;
+    manager.blocks[block_id].num_filled_slots = 0;
+    manager.blocks[block_id].content_hash = 0;
+    manager.blocks[block_id].cache_resident = false;
+}
+
+void ReleasePrefixResidencyLocked(BlockManager& manager, int block_id, bool preserve_block_for_reassignment) {
+    if (block_id < 0 || block_id >= manager.num_blocks) {
+        return;
+    }
+
+    auto& block = manager.blocks[block_id];
+    if (!block.cache_resident) {
+        return;
+    }
+
+    if (block.content_hash != 0) {
+        auto it = manager.prefix_cache.find(block.content_hash);
+        if (it != manager.prefix_cache.end() && it->second == block_id) {
+            manager.prefix_cache.erase(it);
+        }
+    }
+
+    block.content_hash = 0;
+    block.cache_resident = false;
+    manager.block_tokens.erase(block_id);
+    manager.block_hybrid_ssm_snapshots.erase(block_id);
+
+    if (!preserve_block_for_reassignment && block.ref_count == 0) {
+        block.num_filled_slots = 0;
+        manager.shards[block_id % BlockManager::NUM_SHARDS]->free_blocks.push_back(block_id);
+    }
+}
+
+void ReleasePrefixResidency(BlockManager& manager, int block_id, bool preserve_block_for_reassignment) {
+    auto& shard = *manager.shards[block_id % BlockManager::NUM_SHARDS];
+    std::lock_guard<std::mutex> s_lock(shard.mu);
+    ReleasePrefixResidencyLocked(manager, block_id, preserve_block_for_reassignment);
+}
+
+int TryEvictIdlePrefixBlockForAllocation(BlockManager& manager) {
+    std::lock_guard<std::mutex> p_lock(manager.prefix_mu);
+    for (auto it = manager.prefix_cache.begin(); it != manager.prefix_cache.end(); ++it) {
+        const int block_id = it->second;
+        if (block_id < 0 || block_id >= manager.num_blocks) {
+            continue;
+        }
+
+        auto& shard = *manager.shards[block_id % BlockManager::NUM_SHARDS];
+        std::lock_guard<std::mutex> s_lock(shard.mu);
+        auto& block = manager.blocks[block_id];
+        if (!block.cache_resident || block.ref_count != 0 || block.content_hash != it->first) {
+            continue;
+        }
+
+        block.content_hash = 0;
+        block.cache_resident = false;
+        block.num_filled_slots = 0;
+        manager.block_tokens.erase(block_id);
+        manager.block_hybrid_ssm_snapshots.erase(block_id);
+        manager.prefix_cache.erase(it);
+        ResetAllocatedBlock(manager, block_id);
+        return block_id;
+    }
+    return -1;
+}
+
+}  // namespace
+
 BlockManager::BlockManager(int num_blocks, int block_size) : num_blocks(num_blocks), block_size(block_size) {
     shards.reserve(NUM_SHARDS);
     for (int i = 0; i < NUM_SHARDS; ++i) {
@@ -15,6 +87,7 @@ BlockManager::BlockManager(int num_blocks, int block_size) : num_blocks(num_bloc
         blocks[i].ref_count = 0;
         blocks[i].num_filled_slots = 0;
         blocks[i].content_hash = 0;
+        blocks[i].cache_resident = false;
         shards[i % NUM_SHARDS]->free_blocks.push_back(i);
     }
 }
@@ -42,10 +115,7 @@ std::vector<int> BlockManager::Allocate(int n) {
             for (int k = 0; k < n; ++k) {
                 int block_id = shard.free_blocks.back();
                 shard.free_blocks.pop_back();
-
-                blocks[block_id].ref_count = 1;
-                blocks[block_id].num_filled_slots = 0;
-                blocks[block_id].content_hash = 0;
+                ResetAllocatedBlock(*this, block_id);
                 allocated.push_back(block_id);
             }
             return allocated;
@@ -60,12 +130,17 @@ std::vector<int> BlockManager::Allocate(int n) {
         while (!shard.free_blocks.empty() && static_cast<int>(allocated.size()) < n) {
             int block_id = shard.free_blocks.back();
             shard.free_blocks.pop_back();
-
-            blocks[block_id].ref_count = 1;
-            blocks[block_id].num_filled_slots = 0;
-            blocks[block_id].content_hash = 0;
+            ResetAllocatedBlock(*this, block_id);
             allocated.push_back(block_id);
         }
+    }
+
+    while (static_cast<int>(allocated.size()) < n) {
+        const int block_id = TryEvictIdlePrefixBlockForAllocation(*this);
+        if (block_id < 0) {
+            break;
+        }
+        allocated.push_back(block_id);
     }
 
     if (static_cast<int>(allocated.size()) < n) {
@@ -90,10 +165,7 @@ int BlockManager::AllocateSingle() {
         if (!shard.free_blocks.empty()) {
             int block_id = shard.free_blocks.back();
             shard.free_blocks.pop_back();
-
-            blocks[block_id].ref_count = 1;
-            blocks[block_id].num_filled_slots = 0;
-            blocks[block_id].content_hash = 0;
+            ResetAllocatedBlock(*this, block_id);
             return block_id;
         }
     }
@@ -104,15 +176,12 @@ int BlockManager::AllocateSingle() {
         if (!shard.free_blocks.empty()) {
             int block_id = shard.free_blocks.back();
             shard.free_blocks.pop_back();
-
-            blocks[block_id].ref_count = 1;
-            blocks[block_id].num_filled_slots = 0;
-            blocks[block_id].content_hash = 0;
+            ResetAllocatedBlock(*this, block_id);
             return block_id;
         }
     }
 
-    return -1;
+    return TryEvictIdlePrefixBlockForAllocation(*this);
 }
 
 void BlockManager::Free(const std::vector<int>& block_ids) {
@@ -127,24 +196,18 @@ void BlockManager::FreeSingle(int block_id) {
     int shard_idx = block_id % NUM_SHARDS;
     auto& shard = *shards[shard_idx];
 
-    {
-        std::lock_guard<std::mutex> lock(shard.mu);
-        blocks[block_id].ref_count--;
-        if (blocks[block_id].ref_count > 0) return;
-    }
-
-    std::lock_guard<std::mutex> p_lock(prefix_mu);
-    std::lock_guard<std::mutex> s_lock(shard.mu);
-    if (blocks[block_id].ref_count > 0) {
+    std::lock_guard<std::mutex> lock(shard.mu);
+    if (blocks[block_id].ref_count <= 0) {
         return;
     }
 
-    if (blocks[block_id].content_hash != 0) {
-        prefix_cache.erase(blocks[block_id].content_hash);
-        blocks[block_id].content_hash = 0;
+    blocks[block_id].ref_count--;
+    if (blocks[block_id].ref_count > 0 || blocks[block_id].cache_resident) {
+        return;
     }
-    block_tokens.erase(block_id);
-    block_hybrid_ssm_snapshots.erase(block_id);
+
+    blocks[block_id].num_filled_slots = 0;
+    blocks[block_id].content_hash = 0;
     shard.free_blocks.push_back(block_id);
 }
 
@@ -254,7 +317,7 @@ int BlockManager::FindCachedBlock(uint64_t hash) {
     int shard_idx = block_id % NUM_SHARDS;
     auto& shard = *shards[shard_idx];
     std::lock_guard<std::mutex> s_lock(shard.mu);
-    if (blocks[block_id].ref_count <= 0) {
+    if (blocks[block_id].ref_count < 0 || (!blocks[block_id].cache_resident && blocks[block_id].ref_count == 0)) {
         return -1;
     }
 
@@ -290,7 +353,7 @@ int BlockManager::FindCachedBlockWithVerification(uint64_t hash, const int* toke
     int shard_idx = block_id % NUM_SHARDS;
     auto& shard = *shards[shard_idx];
     std::lock_guard<std::mutex> s_lock(shard.mu);
-    if (blocks[block_id].ref_count <= 0) {
+    if (blocks[block_id].ref_count < 0 || (!blocks[block_id].cache_resident && blocks[block_id].ref_count == 0)) {
         return -1;
     }
 
@@ -352,10 +415,29 @@ void BlockManager::RegisterPrefixBlock(int block_id, uint64_t hash) {
     if (block_id < 0 || block_id >= num_blocks || hash == 0) return;
 
     std::lock_guard<std::mutex> p_lock(prefix_mu);
+    auto existing = prefix_cache.find(hash);
+    if (existing != prefix_cache.end() && existing->second != block_id) {
+        ReleasePrefixResidency(*this, existing->second, /*preserve_block_for_reassignment=*/false);
+    }
+
     int shard_idx = block_id % NUM_SHARDS;
     std::lock_guard<std::mutex> s_lock(shards[shard_idx]->mu);
 
+    if (blocks[block_id].ref_count <= 0 && !blocks[block_id].cache_resident) {
+        return;
+    }
+
+    if (blocks[block_id].cache_resident && blocks[block_id].content_hash != 0 && blocks[block_id].content_hash != hash) {
+        auto it = prefix_cache.find(blocks[block_id].content_hash);
+        if (it != prefix_cache.end() && it->second == block_id) {
+            prefix_cache.erase(it);
+        }
+        block_tokens.erase(block_id);
+        block_hybrid_ssm_snapshots.erase(block_id);
+    }
+
     blocks[block_id].content_hash = hash;
+    blocks[block_id].cache_resident = true;
     prefix_cache[hash] = block_id;
 }
 
@@ -365,17 +447,38 @@ void BlockManager::RegisterPrefixBlockWithTokens(
     if (block_id < 0 || block_id >= num_blocks || hash == 0) return;
 
     std::lock_guard<std::mutex> p_lock(prefix_mu);
+    auto existing = prefix_cache.find(hash);
+    if (existing != prefix_cache.end() && existing->second != block_id) {
+        ReleasePrefixResidency(*this, existing->second, /*preserve_block_for_reassignment=*/false);
+    }
+
     int shard_idx = block_id % NUM_SHARDS;
     std::lock_guard<std::mutex> s_lock(shards[shard_idx]->mu);
 
+    if (blocks[block_id].ref_count <= 0 && !blocks[block_id].cache_resident) {
+        return;
+    }
+
+    if (blocks[block_id].cache_resident && blocks[block_id].content_hash != 0 && blocks[block_id].content_hash != hash) {
+        auto it = prefix_cache.find(blocks[block_id].content_hash);
+        if (it != prefix_cache.end() && it->second == block_id) {
+            prefix_cache.erase(it);
+        }
+    }
+
     blocks[block_id].content_hash = hash;
+    blocks[block_id].cache_resident = true;
     prefix_cache[hash] = block_id;
 
     if (tokens && n_tokens > 0) {
         block_tokens[block_id] = std::vector<int>(tokens, tokens + n_tokens);
+    } else {
+        block_tokens.erase(block_id);
     }
     if (hybrid_ssm_snapshot && !hybrid_ssm_snapshot->empty()) {
         block_hybrid_ssm_snapshots[block_id] = *hybrid_ssm_snapshot;
+    } else {
+        block_hybrid_ssm_snapshots.erase(block_id);
     }
 }
 
@@ -400,13 +503,7 @@ void BlockManager::UnregisterPrefixBlock(int block_id) {
     std::lock_guard<std::mutex> p_lock(prefix_mu);
     int shard_idx = block_id % NUM_SHARDS;
     std::lock_guard<std::mutex> s_lock(shards[shard_idx]->mu);
-
-    if (blocks[block_id].content_hash != 0) {
-        prefix_cache.erase(blocks[block_id].content_hash);
-        blocks[block_id].content_hash = 0;
-    }
-    block_tokens.erase(block_id);
-    block_hybrid_ssm_snapshots.erase(block_id);
+    ReleasePrefixResidencyLocked(*this, block_id, /*preserve_block_for_reassignment=*/false);
 }
 
 uint64_t BlockManager::ComputeTokenHash(const int* tokens, int n_tokens) {
