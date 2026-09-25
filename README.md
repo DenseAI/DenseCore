@@ -5,14 +5,16 @@
 DenseCore is an open-source inference server with an OpenAI-compatible API,
 Docker deployment, health and metrics endpoints, and graceful request shutdown.
 Its native C++ runtime and Go server are built for Linux CPU serving, including
-large GGUF and MoE model paths. Kubernetes and Arm64 are available as source
+large GGUF and MoE model paths. Qwen3.6-35B-A3B is a focus of the project's
+CPU serving and optimization work. Kubernetes and Arm64 are available as source
 surfaces with narrower qualification.
 
 [![CI](https://github.com/DenseAI/DenseCore/actions/workflows/ci.yml/badge.svg)](https://github.com/DenseAI/DenseCore/actions/workflows/ci.yml)
 [![Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Developer preview](https://img.shields.io/badge/status-developer%20preview-orange)](docs/RELEASE.md)
 
-[Quick start](#quick-start) · [Try the CLI](#try-the-cli) ·
+[Quick start](#quick-start) · [Run Qwen3.6-35B-A3B](#run-qwen36-35b-a3b) ·
+[Try the CLI](#try-the-cli) ·
 [Capabilities](#what-you-get) · [Support](#support-and-maturity) ·
 [Documentation](#documentation)
 
@@ -46,6 +48,30 @@ The image contains no model downloader; the GGUF file must exist before
 startup. The port is bound to loopback. See [Deployment](docs/DEPLOYMENT.md)
 for authentication, TLS, and Kubernetes setup.
 
+### Run Qwen3.6-35B-A3B
+
+For the larger model we have actively tested and optimized, download the
+regular Q4_K_M GGUF and point the same API image at it:
+
+```bash
+mkdir -p models
+curl -fL -C - --retry 3 -o models/Qwen3.6-35B-A3B-Q4_K_M.gguf \
+  https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-Q4_K_M.gguf
+printf '%s  %s\n' \
+  '671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7' \
+  'models/Qwen3.6-35B-A3B-Q4_K_M.gguf' | sha256sum -c -
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -v "$(pwd)/models:/models:ro" \
+  -e MAIN_MODEL_PATH=/models/Qwen3.6-35B-A3B-Q4_K_M.gguf \
+  denseai/densecore:0.1.0
+```
+
+Use the readiness and chat requests above in another terminal. The GGUF alone
+is about 20 GB, so allow additional memory for inference. The published Docker
+image is `linux/amd64`; C4A/Arm64 uses a source build. Our
+[Qwen3.6 qualification report](docs/reports/2026-09-12-qwen36-v01-qualification.md)
+describes historical C4/C4A runs, not a speed guarantee for this image.
+
 ## Try the CLI
 
 To download a small default GGUF and start interactive chat instead, build the
@@ -78,14 +104,6 @@ CLI / HTTP / gRPC  →  Go server  →  C++ runtime  →  GGUF model on CPU
 The HTTP server keeps one startup model for its process lifetime. Dynamic model
 load/unload and speculative draft models are outside the v0.1 server contract.
 See [Architecture](docs/ARCHITECTURE.md) for execution and ownership details.
-
-### Running larger models
-
-DenseCore has engineering results for Qwen3.6-35B-A3B on 16-vCPU C4 and C4A
-hosts. Those dated measurements used host-specific builds and are not a speed
-claim for the current source or Docker image. Start with the
-[qualification report](docs/reports/2026-09-12-qwen36-v01-qualification.md)
-for the exact model, workload, quality checks, and comparison conditions.
 
 ## Support and maturity
 
