@@ -1,0 +1,28 @@
+name: 🤖 Model Compatibility Issue
+description: Report issues with specific models (conversion or inference failure)
+title: "[Model]: Issue with <Model Name>"
+labels: ["model-compat"]
+body:
+  - type: input
+    id: model_name
+    attributes:
+      label: Model Name / HuggingFace ID
+      placeholder: e.g. Qwen/Qwen2.5-7B-Instruct
+    validations:
+      required: true
+  - type: dropdown
+    id: quantization
+    attributes:
+      label: Quantization Type
+      options:
+        - "None (FP16)"
+        - "INT4 (Q4_K_M)"
+        - "INT8"
+        - "Other"
+    validations:
+      required: true
+  - type: textarea
+    id: error_msg
+    attributes:
+      label: Error Message
+      description: What error did you see?

@@ -1,0 +1,45 @@
+# Pre-commit hooks for DenseCore
+# Install: pip install pre-commit && pre-commit install
+
+repos:
+  # C++ formatting with clang-format
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+      - id: clang-format
+        types_or: [c, c++, objective-c++]
+        files: ^core/
+        exclude: ^core/third_party/
+
+  # Python linting and formatting with ruff
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^python/
+      - id: ruff-format
+        files: ^python/
+
+  # Go linting with golangci-lint
+  - repo: https://github.com/golangci/golangci-lint
+    rev: v1.62.2
+    hooks:
+      - id: golangci-lint
+        entry: bash -c 'cd server && golangci-lint run --timeout=5m'
+        files: ^server/.*\.go$
+        pass_filenames: false
+
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(core/third_party/|\.git/)
+      - id: end-of-file-fixer
+        exclude: ^(core/third_party/|\.git/)
+      - id: check-yaml
+        args: [--unsafe]
+        exclude: ^charts/.*templates/
+      - id: check-added-large-files
+        args: [--maxkb=500]

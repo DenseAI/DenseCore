@@ -1,0 +1,605 @@
+openapi: 3.0.0
+info:
+  title: DenseCore API
+  description: Cloud-native inference runtime (OpenAI-compatible LLM API in default profile).
+  version: 0.1.0
+  contact:
+    name: DenseCore Team
+    url: https://github.com/DenseAI/DenseCore
+servers:
+  - url: http://localhost:8080/v1
+    description: Local development server
+paths:
+  /runtime/profile:
+    get:
+      summary: Get runtime workload profile and capabilities
+      operationId: getRuntimeProfile
+      tags:
+        - Runtime
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  profile:
+                    type: string
+                  llm_api_enabled:
+                    type: boolean
+                  model_lifecycle_probes_enabled:
+                    type: boolean
+                  metrics_namespace:
+                    type: string
+                  timestamp:
+                    type: string
+                    format: date-time
+  /chat/completions:
+    post:
+      summary: Create chat completion
+      operationId: createChatCompletion
+      tags:
+        - Chat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateChatCompletionRequest'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-DenseCore-Cache-Affinity-Key:
+              description: Opaque hashed route key suitable for sticky client or gateway routing.
+              schema:
+                type: string
+            X-DenseCore-Cache-Affinity-Source:
+              description: Request field used to derive the cache affinity key.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateChatCompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /completions:
+    post:
+      summary: Create text completion
+      operationId: createCompletion
+      tags:
+        - Chat
+      description: OpenAI-compatible prompt completion route. The server also accepts the root-level compatibility alias `POST /completion`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCompletionRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateCompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /embeddings:
+    post:
+      summary: Create embeddings
+      operationId: createEmbeddings
+      tags:
+        - Embeddings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEmbeddingsRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateEmbeddingsResponse'
+  /models:
+    get:
+      summary: List models
+      operationId: listModels
+      tags:
+        - Models
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Model'
+  /rerank:
+    post:
+      summary: Rerank documents by relevance to a query
+      operationId: rerank
+      tags:
+        - Rerank
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RerankRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RerankResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+components:
+  schemas:
+    CreateChatCompletionRequest:
+      type: object
+      required:
+        - messages
+      properties:
+        model:
+          type: string
+          description: Optional compatibility ID; the fixed-model v0.1 server uses the startup model when omitted
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatCompletionMessage'
+        temperature:
+          type: number
+          default: 1.0
+        top_p:
+          type: number
+          default: 1.0
+        n:
+          type: integer
+          default: 1
+        stream:
+          type: boolean
+          default: false
+        stream_options:
+          type: object
+          properties:
+            include_usage:
+              type: boolean
+              default: false
+              description: Emit a final streaming chunk with usage before [DONE].
+        stop:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        max_tokens:
+          type: integer
+        presence_penalty:
+          type: number
+          default: 0
+        frequency_penalty:
+          type: number
+          default: 0
+        cache_control:
+          $ref: '#/components/schemas/CacheControl'
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
+          description: A list of tools the model may call
+        tool_choice:
+          oneOf:
+            - type: string
+              enum: [none, auto, required]
+            - type: object
+              properties:
+                type:
+                  type: string
+                  enum: [function]
+                function:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+          description: Controls which tool is called
+
+    CacheControl:
+      type: object
+      properties:
+        type:
+          type: string
+          description: Optional cache policy label for compatible clients.
+        conversation_id:
+          type: string
+          description: Stable conversation identifier used for prompt-cache lineage and pod affinity.
+        cache_id:
+          type: string
+          description: Stable document/session cache identifier used for prompt-cache lineage and pod affinity.
+        affinity_key:
+          type: string
+          description: Explicit Kubernetes routing key. DenseCore hashes this before returning it in affinity headers.
+
+    ChatCompletionMessage:
+      type: object
+      required:
+        - role
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          type: string
+          nullable: true
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolCall'
+          description: Tool calls made by the assistant
+        tool_call_id:
+          type: string
+          description: ID of the tool call this message is responding to
+        name:
+          type: string
+          description: Name of the function (for tool role)
+
+    CreateChatCompletionResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              message:
+                $ref: '#/components/schemas/ChatCompletionMessage'
+              finish_reason:
+                type: string
+        usage:
+          type: object
+          properties:
+            prompt_tokens:
+              type: integer
+            completion_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+
+    CreateCompletionRequest:
+      type: object
+      required:
+        - prompt
+      properties:
+        model:
+          type: string
+          description: ID of the model to use
+        prompt:
+          type: string
+        temperature:
+          type: number
+          default: 1.0
+        top_p:
+          type: number
+          default: 1.0
+        top_k:
+          type: integer
+          default: 0
+        repetition_penalty:
+          type: number
+          default: 1.0
+        stream:
+          type: boolean
+          default: false
+        stop:
+          type: array
+          items:
+            type: string
+        max_tokens:
+          type: integer
+        allowed_token_ids:
+          type: array
+          items:
+            type: integer
+        allowed_tokens_strict:
+          type: boolean
+        disallowed_token_ids:
+          type: array
+          items:
+            type: integer
+
+    CreateCompletionResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              text:
+                type: string
+              finish_reason:
+                type: string
+        usage:
+          type: object
+          properties:
+            prompt_tokens:
+              type: integer
+            completion_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+
+    CreateEmbeddingsRequest:
+      type: object
+      required:
+        - input
+      properties:
+        model:
+          type: string
+          description: Optional compatibility ID; the fixed-model v0.1 server uses the startup model when omitted
+        input:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+
+    CreateEmbeddingsResponse:
+      type: object
+      properties:
+        object:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              object:
+                type: string
+              embedding:
+                type: array
+                items:
+                  type: number
+              index:
+                type: integer
+        model:
+          type: string
+
+    Model:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        created:
+          type: integer
+        owned_by:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Bad Request
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  type:
+                    type: string
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  message:
+                    type: string
+
+    ServiceUnavailable:
+      description: Inference capacity is temporarily unavailable; retry after the indicated delay.
+      headers:
+        Retry-After:
+          description: Minimum retry delay in seconds.
+          schema:
+            type: integer
+            example: 1
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                required: [message, type, code]
+                properties:
+                  message:
+                    type: string
+                  type:
+                    type: string
+                    enum: [service_unavailable]
+                  code:
+                    type: string
+                    enum: [service_unavailable]
+    # Rerank API Schemas
+    RerankRequest:
+      type: object
+      required:
+        - query
+        - documents
+      properties:
+        model:
+          type: string
+          description: Optional compatibility ID; the fixed-model v0.1 server uses the startup model when omitted
+        query:
+          type: string
+          description: Query to rank documents against
+        documents:
+          type: array
+          items:
+            oneOf:
+              - type: string
+              - type: object
+                properties:
+                  text:
+                    type: string
+          description: Documents to rerank
+        top_n:
+          type: integer
+          description: Number of top results to return (default all)
+        return_documents:
+          type: boolean
+          default: false
+          description: Whether to include document text in response
+
+    RerankResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+                description: Original index of the document
+              relevance_score:
+                type: number
+                description: Relevance score (0-1)
+              document:
+                type: object
+                properties:
+                  text:
+                    type: string
+        model:
+          type: string
+        usage:
+          type: object
+          properties:
+            total_tokens:
+              type: integer
+
+    # Function Calling Schemas
+    Tool:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          required:
+            - name
+          properties:
+            name:
+              type: string
+              description: Name of the function
+            description:
+              type: string
+              description: Description of what the function does
+            parameters:
+              type: object
+              description: JSON Schema for function parameters
+
+    ToolCall:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Unique ID for this tool call
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          properties:
+            name:
+              type: string
+            arguments:
+              type: string
+              description: JSON string of arguments
+
+  responses:
+    BadRequest:
+      description: Bad Request
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  type:
+                    type: string
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  message:
+                    type: string

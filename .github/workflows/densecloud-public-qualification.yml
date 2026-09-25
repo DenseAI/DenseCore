@@ -1,0 +1,134 @@
+name: DenseCloud Public Qualification
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - '.github/workflows/densecloud-public-qualification.yml'
+      - 'charts/densecore/**'
+      - 'docs/DEPLOYMENT.md'
+      - 'docs/RELEASE.md'
+      - 'scripts/qualify_densecloud_public.sh'
+      - 'server/**'
+      - 'README.md'
+      - 'NOTICE'
+      - 'THIRD_PARTY_NOTICES.md'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/densecloud-public-qualification.yml'
+      - 'charts/densecore/**'
+      - 'docs/DEPLOYMENT.md'
+      - 'docs/RELEASE.md'
+      - 'scripts/qualify_densecloud_public.sh'
+      - 'server/**'
+      - 'README.md'
+      - 'NOTICE'
+      - 'THIRD_PARTY_NOTICES.md'
+  workflow_dispatch:
+    inputs:
+      run_kubernetes_smoke:
+        description: 'Run the optional self-hosted Kubernetes/API smoke'
+        required: true
+        type: boolean
+        default: false
+      helm_values:
+        description: 'Values file for the optional Kubernetes smoke'
+        required: false
+        type: string
+        default: 'charts/densecore/examples/values-cpu-inference.yaml'
+      release_name:
+        description: 'Helm release name for the optional Kubernetes smoke'
+        required: false
+        type: string
+        default: 'densecore-qualify'
+      namespace:
+        description: 'Namespace for the optional Kubernetes smoke'
+        required: false
+        type: string
+        default: 'densecore-qualify'
+
+permissions:
+  contents: read
+
+jobs:
+  public-artifact-check:
+    name: Public module and chart qualification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libnuma-dev libhwloc-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.20.1
+
+      - name: Run clean-room public qualification
+        run: |
+          bash scripts/qualify_densecloud_public.sh --output-dir .artifacts/public-qualification
+
+      - name: Upload qualification artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: densecloud-public-qualification
+          if-no-files-found: error
+          path: .artifacts/public-qualification
+          retention-days: 14
+
+  kubernetes-smoke:
+    name: Optional Kubernetes/API smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_kubernetes_smoke }}
+    needs: public-artifact-check
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libnuma-dev libhwloc-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.20.1
+
+      - name: Run Kubernetes/API smoke
+        run: |
+          bash scripts/qualify_densecloud_public.sh \
+            --output-dir .artifacts/public-qualification-smoke \
+            --run-kubernetes-smoke \
+            --helm-values "${{ inputs.helm_values }}" \
+            --release-name "${{ inputs.release_name }}" \
+            --namespace "${{ inputs.namespace }}"
+
+      - name: Upload Kubernetes smoke artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: densecloud-public-qualification-smoke
+          if-no-files-found: error
+          path: .artifacts/public-qualification-smoke
+          retention-days: 14

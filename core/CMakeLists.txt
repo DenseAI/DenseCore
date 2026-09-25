@@ -1,0 +1,1620 @@
+cmake_minimum_required(VERSION 3.14)
+
+# ==========================================================================
+# CMake 4.x + Ninja + OBJCXX Bug Workaround
+# ==========================================================================
+# CMake 4.x has a bug where CMAKE_OBJCXX_COMPILE_OBJECT is not set when
+# enable_language(OBJCXX) is called after project() with Ninja generator.
+# Workaround: Enable OBJCXX at project declaration time on Apple platforms.
+# ==========================================================================
+if(APPLE)
+    project(DenseCore VERSION 0.1.0 LANGUAGES C CXX OBJC OBJCXX)
+else()
+    project(DenseCore VERSION 0.1.0 LANGUAGES C CXX)
+endif()
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+set(DENSECORE_LINUX_ARM64 OFF)
+if(NOT APPLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(DENSECORE_LINUX_ARM64 ON)
+endif()
+
+set(DENSECORE_ARM_CORRECTNESS_FIRST_DEFAULT OFF)
+if(DENSECORE_LINUX_ARM64)
+    # Linux ARM Q4 request paths can enter third-party fast kernels that are
+    # currently not stable enough for production inference. Default to the
+    # correctness-first lane and require explicit opt-in for those kernels.
+    set(DENSECORE_ARM_CORRECTNESS_FIRST_DEFAULT ON)
+endif()
+option(
+    DENSECORE_ARM_CORRECTNESS_FIRST
+    "Prefer correctness-first ggml defaults on Linux ARM (disables KleidiAI, llamafile, repack, and native ISA auto-tuning unless explicitly overridden)"
+    ${DENSECORE_ARM_CORRECTNESS_FIRST_DEFAULT}
+)
+option(
+    DENSECORE_TARGET_C4A
+    "Build for Google Cloud C4A / Axion / Neoverse V2 (Armv9 SVE2) instead of generic aarch64"
+    OFF
+)
+option(
+    DENSECORE_C4A_ENABLE_GGML_FASTKERNELS
+    "Enable ggml native/llamafile fast kernels on C4A builds; repack and KleidiAI are gated separately"
+    OFF
+)
+option(
+    DENSECORE_C4A_ENABLE_KLEIDIAI
+    "Enable ggml KleidiAI i8mm kernels on C4A builds. The Qwen3.5/3.6 + LFM2.5 quality gate now passes, so a single -DDENSECORE_C4A_ENABLE_KLEIDIAI=ON is enough; it pulls in the ggml fast-kernel prerequisite automatically. Still OFF by default; re-run the C4A QA sweep when enabling."
+    OFF
+)
+# KleidiAI is layered on the ggml fast-kernel infrastructure, so an explicit
+# KleidiAI opt-in implies fast kernels on C4A. Done here (before the option is
+# consumed below) so callers only need the one KleidiAI flag.
+if(DENSECORE_C4A_ENABLE_KLEIDIAI)
+    set(DENSECORE_C4A_ENABLE_GGML_FASTKERNELS ON CACHE BOOL "" FORCE)
+endif()
+set(DENSECORE_C4A_MCPU "neoverse-v2" CACHE STRING "ARM -mcpu value used when DENSECORE_TARGET_C4A=ON")
+set(DENSECORE_C4A_GGML_ARCH "armv9-a+sve2+i8mm+bf16+dotprod" CACHE STRING
+    "ggml -march value used when DENSECORE_TARGET_C4A=ON")
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# ==========================================================================
+# Profile-Guided Optimization (PGO) + Link-Time Optimization (LTO)
+# ==========================================================================
+# PGO: Build optimized binaries using runtime profiling data.
+#      Step 1: cmake -DDENSECORE_PGO_GENERATE=ON .. && make && ./benchmark
+#      Step 2: cmake -DDENSECORE_PGO_USE=ON .. && make
+#      The resulting binary runs 5-10% faster on the profiled workloads.
+#
+# LTO: Enable cross-module optimization for 2-5% performance boost.
+#      Safe to enable for all release builds.
+#
+# These are used by our CI/CD to build optimized PyPI wheels, Docker images,
+# and Helm charts. End users get pre-optimized binaries without compiling.
+# ==========================================================================
+option(DENSECORE_PGO_GENERATE "Build with PGO instrumentation (Step 1: collect profile)" OFF)
+option(DENSECORE_PGO_USE "Build with PGO optimization (Step 2: use collected profile)" OFF)
+option(DENSECORE_LTO "Enable Link-Time Optimization for release builds" OFF)
+option(DENSECORE_PORTABLE "Build portable binary for heterogeneous CPU fleets" OFF)
+set(DENSECORE_CPU_TARGET "" CACHE STRING
+    "CPU target profile: native, portable, amd64-v3, or arm64")
+set_property(CACHE DENSECORE_CPU_TARGET PROPERTY STRINGS native portable amd64-v3 arm64)
+if(DENSECORE_PORTABLE)
+    if(DENSECORE_CPU_TARGET STREQUAL "" OR DENSECORE_CPU_TARGET STREQUAL "native" OR DENSECORE_CPU_TARGET STREQUAL "portable")
+        set(DENSECORE_CPU_TARGET "portable" CACHE STRING
+            "CPU target profile: native, portable, amd64-v3, or arm64" FORCE)
+    else()
+        message(FATAL_ERROR
+            "DENSECORE_PORTABLE=ON conflicts with DENSECORE_CPU_TARGET=${DENSECORE_CPU_TARGET}; "
+            "use DENSECORE_CPU_TARGET=portable or unset DENSECORE_PORTABLE.")
+    endif()
+elseif(DENSECORE_CPU_TARGET STREQUAL "")
+    set(DENSECORE_CPU_TARGET "native" CACHE STRING
+        "CPU target profile: native, portable, amd64-v3, or arm64" FORCE)
+endif()
+if(NOT DENSECORE_CPU_TARGET MATCHES "^(native|portable|amd64-v3|arm64)$")
+    message(FATAL_ERROR
+        "DENSECORE_CPU_TARGET must be one of native, portable, amd64-v3, or arm64; "
+        "got '${DENSECORE_CPU_TARGET}'")
+endif()
+if(DENSECORE_CPU_TARGET STREQUAL "portable")
+    set(DENSECORE_PORTABLE ON CACHE BOOL "Build portable binary for heterogeneous CPU fleets" FORCE)
+    set(GGML_NATIVE OFF CACHE BOOL "Optimize for native CPU" FORCE)
+elseif(DENSECORE_CPU_TARGET STREQUAL "amd64-v3")
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        message(FATAL_ERROR "DENSECORE_CPU_TARGET=amd64-v3 requires an x86_64/AMD64 target.")
+    endif()
+    set(GGML_NATIVE OFF CACHE BOOL "Optimize for native CPU" FORCE)
+elseif(DENSECORE_CPU_TARGET STREQUAL "arm64")
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        message(FATAL_ERROR "DENSECORE_CPU_TARGET=arm64 requires an aarch64/arm64 target.")
+    endif()
+    set(GGML_NATIVE OFF CACHE BOOL "Optimize for native CPU" FORCE)
+endif()
+
+# PGO profile data directory (default: build directory)
+set(DENSECORE_PGO_DIR "${CMAKE_BINARY_DIR}/pgo_data" CACHE PATH "Directory for PGO profile data")
+
+if(DENSECORE_PGO_GENERATE AND DENSECORE_PGO_USE)
+    message(FATAL_ERROR "Cannot enable both PGO_GENERATE and PGO_USE. Use one at a time.")
+endif()
+
+if(NOT MSVC)
+    # GCC/Clang PGO flags
+    if(DENSECORE_PGO_GENERATE)
+        message(STATUS "[PGO] Step 1: Building instrumented binary for profile collection")
+        message(STATUS "[PGO] After build, run representative workloads to generate profile data")
+        message(STATUS "[PGO] Profile data will be written to: ${DENSECORE_PGO_DIR}")
+        
+        file(MAKE_DIRECTORY ${DENSECORE_PGO_DIR})
+        
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            # Clang uses -fprofile-instr-generate
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-instr-generate=${DENSECORE_PGO_DIR}/default.profraw")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-instr-generate=${DENSECORE_PGO_DIR}/default.profraw")
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-instr-generate")
+            set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fprofile-instr-generate")
+        elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+            # GCC uses -fprofile-generate
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-generate=${DENSECORE_PGO_DIR}")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-generate=${DENSECORE_PGO_DIR}")
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-generate=${DENSECORE_PGO_DIR}")
+            set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fprofile-generate=${DENSECORE_PGO_DIR}")
+        endif()
+    endif()
+
+    if(DENSECORE_PGO_USE)
+        message(STATUS "[PGO] Step 2: Building optimized binary using profile data")
+        message(STATUS "[PGO] Using profile data from: ${DENSECORE_PGO_DIR}")
+        
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            # Clang: merge .profraw files first, then use .profdata
+            # User must run: llvm-profdata merge -output=${DENSECORE_PGO_DIR}/default.profdata ${DENSECORE_PGO_DIR}/*.profraw
+            set(PGO_PROFDATA "${DENSECORE_PGO_DIR}/default.profdata")
+            if(NOT EXISTS ${PGO_PROFDATA})
+                message(WARNING "[PGO] Profile data not found at ${PGO_PROFDATA}")
+                message(WARNING "[PGO] Run: llvm-profdata merge -output=${PGO_PROFDATA} ${DENSECORE_PGO_DIR}/*.profraw")
+            endif()
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-instr-use=${PGO_PROFDATA}")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-instr-use=${PGO_PROFDATA}")
+        elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+            # GCC: uses .gcda files directly
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-use=${DENSECORE_PGO_DIR} -fprofile-correction")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-use=${DENSECORE_PGO_DIR} -fprofile-correction")
+        endif()
+    endif()
+
+    # Link-Time Optimization (LTO)
+    if(DENSECORE_LTO)
+        message(STATUS "[LTO] Enabling Link-Time Optimization")
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+        
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            # ThinLTO: faster linking, better for iterative development
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -flto=thin")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -flto=thin")
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto=thin")
+            set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -flto=thin")
+            message(STATUS "[LTO] Using Clang ThinLTO for faster linking")
+        elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+            # Full LTO for GCC
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -flto")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -flto")
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto")
+            set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -flto")
+            message(STATUS "[LTO] Using GCC full LTO")
+        endif()
+    endif()
+endif()
+
+# ==========================================================================
+# Symbol Visibility Control
+# ==========================================================================
+# Hide all symbols by default, only expose functions marked with DENSECORE_API
+# This reduces .so size and improves load time
+# ==========================================================================
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN 1)
+set(CMAKE_C_VISIBILITY_PRESET hidden)
+
+# ==========================================================================
+# Version Information Injection
+# ==========================================================================
+# Generate version header from CMake project version
+# ==========================================================================
+set(DENSECORE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
+set(DENSECORE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
+set(DENSECORE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
+set(DENSECORE_VERSION_STRING "${PROJECT_VERSION}")
+
+# Get build timestamp
+string(TIMESTAMP DENSECORE_BUILD_TIMESTAMP "%Y-%m-%dT%H:%M:%SZ" UTC)
+
+# Try to get git commit hash
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE DENSECORE_GIT_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(NOT DENSECORE_GIT_COMMIT)
+        set(DENSECORE_GIT_COMMIT "unknown")
+    endif()
+else()
+    set(DENSECORE_GIT_COMMIT "unknown")
+endif()
+
+# Generate version header
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/version.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/include/densecore_version.h
+    @ONLY
+)
+
+# Output directory
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# ggml third party library path
+set(GGML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+
+# Check if ggml exists
+if(NOT EXISTS ${GGML_DIR})
+    message(FATAL_ERROR "ggml not found at ${GGML_DIR}. Please run scripts/setup_ggml.sh first.")
+endif()
+
+# Shared ARM target profile definitions.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/arm_profiles.cmake)
+
+# ==========================================================================
+# ARM target profiles for robotics devices (DenseVLA)
+# ==========================================================================
+# These profiles provide safe defaults for cross-compilation and allow
+# overriding from CLI via -DDENSECORE_ARM_MARCH=... or -DGGML_CPU_ARM_ARCH=...
+DenseCoreInitArmTargetProfiles()
+
+set(DENSECORE_ARM_PROFILE_MARCH "")
+if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    DenseCoreResolveArmProfileMarch(DENSECORE_ARM_PROFILE_MARCH)
+endif()
+
+set(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE OFF)
+if(DENSECORE_LINUX_ARM64 AND DENSECORE_ARM_CORRECTNESS_FIRST)
+    set(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE ON)
+    message(STATUS "[DenseCore] ARM correctness-first defaults enabled")
+endif()
+
+if(DENSECORE_TARGET_C4A)
+    if(NOT DENSECORE_LINUX_ARM64)
+        message(FATAL_ERROR "DENSECORE_TARGET_C4A=ON requires a non-Apple Linux aarch64 target.")
+    endif()
+    if(NOT DENSECORE_ARM_MCPU AND NOT DENSECORE_ARM_MARCH)
+        set(DENSECORE_ARM_MCPU "${DENSECORE_C4A_MCPU}" CACHE STRING
+            "Explicit ARM CPU target for -mcpu (e.g. neoverse-v1, neoverse-v2, native)" FORCE)
+    endif()
+    if(NOT DEFINED GGML_CPU_ARM_ARCH OR "${GGML_CPU_ARM_ARCH}" STREQUAL "")
+        set(GGML_CPU_ARM_ARCH "${DENSECORE_C4A_GGML_ARCH}" CACHE STRING "ggml: CPU architecture for ARM" FORCE)
+    endif()
+    message(STATUS "[DenseCore][C4A] Targeting Google Axion/Neoverse V2: "
+                   "DENSECORE_ARM_MCPU=${DENSECORE_ARM_MCPU}, GGML_CPU_ARM_ARCH=${GGML_CPU_ARM_ARCH}")
+endif()
+
+# Configure ggml options before adding subdirectory
+set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+# Note: Do NOT use FORCE for these options - allow command-line override
+if(NOT DEFINED GGML_NATIVE)
+    if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE OR DENSECORE_PORTABLE OR CMAKE_CROSSCOMPILING)
+        set(GGML_NATIVE OFF CACHE BOOL "Optimize for native CPU")
+    else()
+        set(GGML_NATIVE ON CACHE BOOL "Optimize for native CPU")
+    endif()
+endif()
+set(DENSECORE_GGML_CPU_FEATURES_DEFAULT ON)
+if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+    set(DENSECORE_GGML_CPU_FEATURES_DEFAULT OFF)
+endif()
+if(DENSECORE_TARGET_C4A AND NOT DENSECORE_C4A_ENABLE_GGML_FASTKERNELS)
+    set(DENSECORE_GGML_CPU_FEATURES_DEFAULT OFF)
+endif()
+set(DENSECORE_GGML_LLAMAFILE_DEFAULT ${DENSECORE_GGML_CPU_FEATURES_DEFAULT})
+if(DENSECORE_TARGET_C4A)
+    # The maintained Axion path uses DenseCore/ggml repack kernels. Llamafile
+    # changes Qwen dispatch ownership and caused the official build to drift.
+    set(DENSECORE_GGML_LLAMAFILE_DEFAULT OFF)
+endif()
+set(DENSECORE_GGML_REPACK_DEFAULT ${DENSECORE_GGML_CPU_FEATURES_DEFAULT})
+if(DENSECORE_TARGET_C4A AND NOT DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+    set(DENSECORE_GGML_REPACK_DEFAULT ON)
+endif()
+if(NOT DEFINED GGML_LLAMAFILE)
+    set(GGML_LLAMAFILE ${DENSECORE_GGML_LLAMAFILE_DEFAULT} CACHE BOOL "Enable ggml llamafile kernels")
+endif()
+if(NOT DEFINED GGML_CPU_REPACK)
+    set(GGML_CPU_REPACK ${DENSECORE_GGML_REPACK_DEFAULT} CACHE BOOL "Enable ggml runtime repack kernels")
+endif()
+set(DENSECORE_CAN_USE_KLEIDIAI OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND NOT DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+    set(DENSECORE_CAN_USE_KLEIDIAI ON)
+endif()
+if(DENSECORE_TARGET_C4A AND NOT DENSECORE_C4A_ENABLE_GGML_FASTKERNELS)
+    set(DENSECORE_CAN_USE_KLEIDIAI OFF)
+endif()
+if(DENSECORE_TARGET_C4A AND NOT DENSECORE_C4A_ENABLE_KLEIDIAI)
+    set(DENSECORE_CAN_USE_KLEIDIAI OFF)
+endif()
+# Explicit C4A KleidiAI opt-in wins: enabling it pulls in fast kernels (above) and
+# turns on the i8mm path regardless of the ARM correctness-first default, so a
+# single -DDENSECORE_C4A_ENABLE_KLEIDIAI=ON is self-sufficient. Default stays OFF.
+if(DENSECORE_TARGET_C4A AND DENSECORE_C4A_ENABLE_KLEIDIAI)
+    set(DENSECORE_CAN_USE_KLEIDIAI ON)
+endif()
+if(NOT DEFINED GGML_CPU_KLEIDIAI)
+    set(GGML_CPU_KLEIDIAI ${DENSECORE_CAN_USE_KLEIDIAI} CACHE BOOL "Enable ggml KleidiAI kernels")
+elseif(GGML_CPU_KLEIDIAI AND NOT DENSECORE_CAN_USE_KLEIDIAI)
+    message(STATUS "[DenseCore] Disabling GGML_CPU_KLEIDIAI until the DenseCore KleidiAI quality gate is enabled")
+    set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "Enable ggml KleidiAI kernels" FORCE)
+endif()
+if(NOT DEFINED GGML_CPU_ARM_ARCH)
+    if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+        set(GGML_CPU_ARM_ARCH "armv8-a" CACHE STRING "ggml: CPU architecture for ARM")
+    elseif(DENSECORE_ARM_PROFILE_GGML_ARCH AND (NOT GGML_NATIVE OR DENSECORE_PORTABLE OR CMAKE_CROSSCOMPILING))
+        set(GGML_CPU_ARM_ARCH "${DENSECORE_ARM_PROFILE_GGML_ARCH}" CACHE STRING "ggml: CPU architecture for ARM")
+    endif()
+endif()
+if(DENSECORE_PORTABLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set(GGML_SSE42 OFF CACHE BOOL "ggml: enable SSE 4.2" FORCE)
+    set(GGML_AVX OFF CACHE BOOL "ggml: enable AVX" FORCE)
+    set(GGML_AVX2 OFF CACHE BOOL "ggml: enable AVX2" FORCE)
+    set(GGML_AVX_VNNI OFF CACHE BOOL "ggml: enable AVX-VNNI" FORCE)
+    set(GGML_BMI2 OFF CACHE BOOL "ggml: enable BMI2" FORCE)
+    set(GGML_FMA OFF CACHE BOOL "ggml: enable FMA" FORCE)
+    set(GGML_F16C OFF CACHE BOOL "ggml: enable F16C" FORCE)
+    set(GGML_AVX512 OFF CACHE BOOL "ggml: enable AVX512F" FORCE)
+    set(GGML_AVX512_VBMI OFF CACHE BOOL "ggml: enable AVX512-VBMI" FORCE)
+    set(GGML_AVX512_VNNI OFF CACHE BOOL "ggml: enable AVX512-VNNI" FORCE)
+    set(GGML_AVX512_BF16 OFF CACHE BOOL "ggml: enable AVX512-BF16" FORCE)
+    set(GGML_AMX_TILE OFF CACHE BOOL "ggml: enable AMX-TILE" FORCE)
+    set(GGML_AMX_INT8 OFF CACHE BOOL "ggml: enable AMX-INT8" FORCE)
+    set(GGML_AMX_BF16 OFF CACHE BOOL "ggml: enable AMX-BF16" FORCE)
+endif()
+set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+
+# Add ggml as subdirectory
+add_subdirectory(${GGML_DIR})
+
+# DenseCore's ARM Q5_K/Q6_K repacked GEMM path uses two internal ggml
+# functions. Export their declarations without modifying the pinned submodule.
+if(DENSECORE_LINUX_ARM64 AND CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$" AND TARGET ggml-cpu)
+    target_compile_options(ggml-cpu PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:-include>"
+        "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/cmake/ggml_arm_repack_exports.h>"
+    )
+endif()
+
+# ggml pulls simdjson; ensure symbols are exported from the shared lib even
+# when the parent project uses hidden visibility defaults.
+if(TARGET simdjson)
+    set_target_properties(simdjson PROPERTIES
+        C_VISIBILITY_PRESET default
+        CXX_VISIBILITY_PRESET default
+        VISIBILITY_INLINES_HIDDEN OFF
+    )
+endif()
+
+# ==========================================================================
+# SIMDe Integration (for ARM64/non-x86 support)
+# ==========================================================================
+include(FetchContent)
+FetchContent_Declare(
+    simde
+    GIT_REPOSITORY https://github.com/simd-everywhere/simde.git
+    GIT_TAG v0.8.2
+)
+FetchContent_MakeAvailable(simde)
+
+# ==========================================================================
+# Google Highway (portable SIMD — single source, all ISAs)
+# ==========================================================================
+FetchContent_Declare(
+    highway
+    GIT_REPOSITORY https://github.com/google/highway.git
+    GIT_TAG 1.2.0
+)
+set(HWY_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_CONTRIB OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(HWY_FORCE_STATIC_LIBS ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(highway)
+
+
+# ==========================================================================
+# Microsoft Mimalloc (Performance Allocator)
+# ==========================================================================
+# Override standard malloc/free with mimalloc for performance.
+# Recommended for rigorous, high-throughput production environments.
+# ==========================================================================
+if(NOT WIN32)
+    option(DENSECORE_USE_MIMALLOC "Use mimalloc allocator override" ON)
+else()
+    option(DENSECORE_USE_MIMALLOC "Use mimalloc allocator override" OFF)
+endif()
+
+if(DENSECORE_USE_MIMALLOC)
+    message(STATUS "[DenseCore] Mimalloc override ENABLED")
+    
+    set(MIMALLOC_OFF OFF CACHE BOOL "" FORCE)      # Build mimalloc
+    set(MI_OVERRIDE ON CACHE BOOL "" FORCE)        # Override malloc/free
+    set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)   # Static link preferred
+    set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)   # DenseCore only links the static library
+    set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(MI_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
+
+    FetchContent_Declare(
+        mimalloc
+        GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+        GIT_TAG v2.1.2
+    )
+    FetchContent_MakeAvailable(mimalloc)
+    
+    # We will link 'mimalloc-static' to the densecore target later
+endif()
+
+# ==========================================================================
+# spdlog (Fast C++ Logging)
+# ==========================================================================
+option(DENSECORE_USE_SPDLOG "Enable spdlog for high-performance logging" ON)
+
+if(DENSECORE_USE_SPDLOG)
+    message(STATUS "[DenseCore] spdlog ENABLED")
+    set(_DENSECORE_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+    set(BUILD_SHARED_LIBS OFF)
+    set(SPDLOG_BUILD_PIC ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        spdlog
+        GIT_REPOSITORY https://github.com/gabime/spdlog.git
+        GIT_TAG v1.12.0
+    )
+    FetchContent_MakeAvailable(spdlog)
+    set(BUILD_SHARED_LIBS ${_DENSECORE_SAVED_BUILD_SHARED_LIBS})
+    unset(_DENSECORE_SAVED_BUILD_SHARED_LIBS)
+endif()
+
+option(DENSECORE_DEFAULT_INT4_SINGLE_THREADING_LAYER "Default to GGML-only threading for INT4 custom op" ON)
+option(DENSECORE_DEFAULT_PREFILL_FLASH_MASK_REUSE "Default to prefill flash-mask reuse across layers" ON)
+option(DENSECORE_DEFAULT_PRECOMPUTED_ROPE "Default to precomputed RoPE table custom-op path" ON)
+option(DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM "Default to fused residual+RMSNorm pre-FFN path" OFF)
+option(DENSECORE_DEFAULT_FUSED_QKV "Default to fused QKV projection path when F32 weights are available" ON)
+# ==========================================================================
+# ARM64 Server Tuning (non-Apple)
+# ==========================================================================
+# - Default (non-cross compile): -mcpu=native
+# - Cross compile: no default tuning flag; set one of the cache variables below
+# - Use either DENSECORE_ARM_MCPU or DENSECORE_ARM_MARCH (mutually exclusive)
+# ==========================================================================
+set(DENSECORE_ARM_MCPU "" CACHE STRING "Explicit ARM CPU target for -mcpu (e.g. neoverse-v1, neoverse-v2, native)")
+set(DENSECORE_ARM_MARCH "" CACHE STRING "Explicit ARM architecture for -march (e.g. armv8.2-a+sve+dotprod)")
+set(DENSECORE_ARM_TUNE_FLAGS "")
+set(DENSECORE_ARM_TUNE_ACTIVE FALSE)
+
+if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    message(STATUS "[DenseCore][ARM64] Target profile: ${DENSEVLA_ARM_TARGET}")
+    set(DENSECORE_ARM_NATIVE_AUTOTUNE FALSE)
+    if(GGML_NATIVE AND NOT DENSECORE_PORTABLE AND NOT CMAKE_CROSSCOMPILING AND
+       NOT DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE AND NOT DENSECORE_ARM_MCPU AND NOT DENSECORE_ARM_MARCH)
+        set(DENSECORE_ARM_NATIVE_AUTOTUNE TRUE)
+        message(STATUS "[DenseCore][ARM64] Native autotune active: preserving host ISA for DenseCore/ggml.")
+    endif()
+    if(GGML_CPU_ARM_ARCH)
+        message(STATUS "[DenseCore][ARM64] GGML_CPU_ARM_ARCH: ${GGML_CPU_ARM_ARCH}")
+    endif()
+
+    if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE AND NOT DENSECORE_ARM_MCPU AND NOT DENSECORE_ARM_MARCH)
+        set(DENSECORE_ARM_MARCH "armv8-a" CACHE STRING
+            "Explicit ARM architecture for -march (e.g. armv8.2-a+sve+dotprod)" FORCE)
+    elseif(NOT DENSECORE_ARM_NATIVE_AUTOTUNE AND
+           NOT DENSECORE_ARM_MCPU AND NOT DENSECORE_ARM_MARCH AND DENSECORE_ARM_PROFILE_MARCH)
+        set(DENSECORE_ARM_MARCH "${DENSECORE_ARM_PROFILE_MARCH}" CACHE STRING
+            "Explicit ARM architecture for -march (e.g. armv8.2-a+sve+dotprod)" FORCE)
+    endif()
+
+    if(DENSECORE_ARM_MCPU AND DENSECORE_ARM_MARCH)
+        message(FATAL_ERROR "Use either DENSECORE_ARM_MCPU or DENSECORE_ARM_MARCH, not both.")
+    endif()
+
+    set(DENSECORE_ARM_GLOBAL_ARCH_FLAG FALSE)
+    if(CMAKE_C_FLAGS MATCHES "(^| )-march=" OR CMAKE_C_FLAGS MATCHES "(^| )-mcpu=" OR
+       CMAKE_CXX_FLAGS MATCHES "(^| )-march=" OR CMAKE_CXX_FLAGS MATCHES "(^| )-mcpu=")
+        set(DENSECORE_ARM_GLOBAL_ARCH_FLAG TRUE)
+    endif()
+
+    if(DENSECORE_ARM_GLOBAL_ARCH_FLAG)
+        message(STATUS "[DenseCore][ARM64] Global ARM arch flags already set in CMAKE_C/CXX_FLAGS; "
+                       "skipping target-level -march/-mcpu injection.")
+    elseif(DENSECORE_ARM_MCPU)
+        list(APPEND DENSECORE_ARM_TUNE_FLAGS "-mcpu=${DENSECORE_ARM_MCPU}")
+    elseif(DENSECORE_ARM_MARCH)
+        list(APPEND DENSECORE_ARM_TUNE_FLAGS "-march=${DENSECORE_ARM_MARCH}")
+    elseif(CMAKE_CROSSCOMPILING)
+        message(STATUS "[DenseCore][ARM64] Cross-compiling: no default -mcpu/-march. "
+                       "Set DENSECORE_ARM_MCPU or DENSECORE_ARM_MARCH.")
+    elseif(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+        list(APPEND DENSECORE_ARM_TUNE_FLAGS "-march=armv8-a")
+        message(STATUS "[DenseCore][ARM64] ARM correctness-first mode: using -march=armv8-a.")
+    else()
+        list(APPEND DENSECORE_ARM_TUNE_FLAGS "-mcpu=native")
+        message(STATUS "[DenseCore][ARM64] Non-cross build: enabling -mcpu=native by default.")
+    endif()
+
+    if(DENSECORE_ARM_TUNE_FLAGS)
+        set(DENSECORE_ARM_TUNE_ACTIVE TRUE)
+        message(STATUS "[DenseCore][ARM64] Tuning flags: ${DENSECORE_ARM_TUNE_FLAGS}")
+    endif()
+endif()
+
+# Source files (DenseCore specific only)
+set(SOURCES
+    src/runtime/engine.cpp
+    src/runtime/request_builder.cpp
+    src/runtime/worker.cpp
+    src/runtime/worker_helpers.cpp
+    src/llm/config/runtime_config.cpp
+    src/llm/decoder/spec_runtime.cpp
+    src/llm/runtime/deps.cpp
+    src/llm/runtime/cpu_execution.cpp
+    src/llm/runtime/work_context.cpp
+    src/llm/runtime/profile.cpp
+    src/llm/weights/prepared_weights.cpp
+    src/llm/attention/internal.cpp
+    src/llm/attention/exec.cpp
+    src/llm/attention/graph_ops.cpp
+    src/llm/attention/diagnostics.cpp
+    src/llm/attention/reference.cpp
+    src/llm/attention/flash_exec.cpp
+    src/llm/attention/dsa_exec.cpp
+    src/llm/attention/paged_exec.cpp
+    src/llm/graph/planning.cpp
+    src/llm/graph/build.cpp
+    src/llm/graph/fused_ops.cpp
+    src/llm/graph/reference_policy.cpp
+    src/llm/graph/policy.cpp
+    src/llm/moe/exec.cpp
+    src/llm/moe/native.cpp
+    src/llm/moe/native_gemma.cpp
+    src/llm/ssm/glm_dsa.cpp
+    src/llm/graph/reference.cpp
+    src/llm/ssm/delta.cpp
+    src/llm/ssm/conv.cpp
+    src/llm/ssm/shortconv.cpp
+    src/llm/graph/decoder.cpp
+    src/llm/models/bert/graph.cpp
+    src/llm/matmul/graph_ops.cpp
+    src/llm/matmul/exec.cpp
+    src/llm/matmul/dispatch.cpp
+    src/llm/matmul/batched_exec.cpp
+    src/llm/matmul/execution_policy.cpp
+    src/llm/matmul/gemv_exec.cpp
+    src/llm/matmul/quant_cache.cpp
+    src/llm/matmul/diagnostics.cpp
+    src/llm/graph/cache.cpp
+    src/llm/models/common/family_internal.cpp
+    src/llm/sampling/exec.cpp
+    src/runtime/inference_context.cpp
+    src/runtime/inference.cpp
+    src/models/model_types.cpp
+    src/models/decoder_model_spec.cpp
+    src/models/model_execution_contract.cpp
+    src/models/model_loader.cpp
+    src/models/tokenizer.cpp
+    src/runtime/memory/kv_cache.cpp
+    src/runtime/memory/kv_cache_block_manager.cpp
+    src/runtime/memory/kv_cache_storage.cpp
+    src/kernels/dispatch.cpp
+    src/models/save_model.cpp
+    src/api/version.cpp
+    src/api/error_api.cpp
+    src/runtime/scheduler.cpp
+    src/runtime/scheduler_policy.cpp
+    src/runtime/scheduler_queue.cpp
+    src/runtime/action_chunker.cpp
+    src/runtime/arm_runtime.cpp
+    src/hal/operation_graph.cpp
+    src/sampler/sampler.cpp
+    # Backend abstraction
+    src/hal/op_registry.cpp
+    src/runtime/plugin_loader.cpp
+    src/runtime/graph_executor.cpp
+    src/models/lora_storage.cpp
+    src/backend/cpu_backend.cpp
+    src/backend/cpu_backend_q4k_dense.cpp
+    src/backend/cpu_backend_quantized_matmul.cpp
+    src/backend/cpu_backend_moe_forward_plan.cpp
+    src/backend/cpu_backend_moe_ops.cpp
+    src/kernels/q4k_repacked_gemv.cpp
+    src/backend/cpu_backend_moe_registry.cpp
+    src/backend/backend_registry.cpp
+    src/hal/kernel_context.cpp
+    src/backend/async_cpu_backend.cpp
+    src/models/qwen35_ssm_math.cpp
+    src/models/lfm2_shortconv_math.cpp
+    src/backend/matmul_backend.cpp
+    src/backend/matmul_backend_densecore.cpp
+    # Kernels (optimized SIMD implementations)
+
+    src/runtime/memory/kv_cache_encoder.cpp
+    src/runtime/memory/kv_cache_decoder.cpp
+    # MoE (Mixture of Experts) profiling and routing
+    src/moe/profiler.cpp
+    src/moe/moe_routing.cpp
+    src/kernels/moe_ops.cpp
+    src/kernels/matmul_cpu.cpp
+    # Quantization module
+    src/api/quantize_api.cpp
+    src/quantization/quantizer.cpp
+    src/quantization/max_quantizer.cpp
+    src/quantization/awq_quantizer.cpp
+    src/quantization/smoothquant_quantizer.cpp
+    src/quantization/int4_quantizer.cpp
+    # Pruning module
+    src/pruning/pruner.cpp
+    src/runtime/tensor_utils.cpp
+    src/simd/simd_ops.cpp  # Quantized dot product dispatcher
+    src/pruning/depth_pruner.cpp
+    src/pruning/width_pruner.cpp
+    src/pruning/attention_pruner.cpp
+    src/pruning/combined_pruner.cpp
+    # Graph Optimization module
+    src/graph/graph_optimizer.cpp
+    src/models/model_descriptor.cpp
+    src/models/model_graph_capabilities.cpp
+    src/models/model_prompt_templates.cpp
+    src/models/model_inference_policy.cpp
+    src/models/model_graph_bridge.cpp
+    src/kernels/patch_embed_cpu.cpp
+    # HAL Kernels (OpRegistry-based, vendor-extensible)
+    src/kernels/activation_ops.cpp
+    src/kernels/normalization_ops.cpp
+    src/kernels/quantization_ops.cpp
+    src/kernels/flash_attention.cpp
+    src/kernels/memory_ops.cpp
+    src/kernels/adaln.cpp
+    src/kernels/groupnorm.cpp
+    src/kernels/patch_embed_2d.cpp
+    src/kernels/rope_1d.cpp
+    src/kernels/rope_2d.cpp
+    src/kernels/timestep_embed.cpp
+    src/kernels/deformable_attention.cpp
+    src/kernels/grid_sample.cpp
+    src/kernels/image_ops_cpu.cpp
+    src/kernels/cross_attention.cpp
+    # HAL Backend Selector abstraction
+    src/hal/backend_selector.cpp
+    # Graph Builders (Strategy Pattern for BuildTransformerGraph)
+    src/graph_builders/transformer_graph_builder_base.cpp
+    src/graph_builders/whisper_graph_builder.cpp
+    src/graph_builders/llm_config_generator.cpp
+    src/graph/generic_graph_builder.cpp
+    src/backend/qnn_backend.cpp
+    src/kernels/audio_ops.cpp
+    # Universal Transformer Operations - Multimodal/Vision
+    src/kernels/window_attention.cpp
+    src/kernels/pos_interpolation.cpp
+    # Universal Transformer Operations - Video DiT/SORA
+    src/kernels/patch_embed_3d.cpp
+    src/kernels/temporal_attention.cpp
+    src/kernels/unpatchify.cpp
+    src/kernels/patchify.cpp
+    src/kernels/temporal_rope.cpp
+    # Universal Transformer Operations - Diffusion
+    src/kernels/noise_schedule.cpp
+    # Universal Transformer Operations - Autonomous/3D
+    src/kernels/bev_query.cpp
+    src/kernels/scatter_reduce.cpp
+    src/kernels/point_attention.cpp
+    # Universal Transformer Operations - Bio/Science
+    src/kernels/pair_representation.cpp
+    src/kernels/triangular_attention.cpp
+    src/kernels/invariant_point_attention.cpp
+    src/kernels/triangular_mult_update.cpp
+    src/kernels/attention_with_pair_bias.cpp
+    # Universal Transformer Operations - Audio
+    src/kernels/audio_conv1d.cpp
+    # Highway SIMD kernels (portable single-source for all ISAs)
+    src/kernels/hwy/hwy_rope.cc
+    src/kernels/hwy/hwy_activation.cc
+    src/kernels/hwy/hwy_image_ops.cc
+    src/kernels/hwy/hwy_normalization.cc
+    src/kernels/hwy/hwy_groupnorm.cc
+    src/kernels/hwy/hwy_int4.cc
+    src/kernels/hwy/hwy_matmul.cc
+    src/kernels/hwy/hwy_fp8.cc
+    src/kernels/hwy/hwy_adaln.cc
+    src/kernels/hwy/hwy_attention_pair_bias.cc
+    src/kernels/hwy/hwy_cross_attention.cc
+    src/kernels/hwy/hwy_paged_attention.cc
+    src/kernels/hwy/hwy_point_attention.cc
+    src/kernels/hwy/hwy_window_attention.cc
+    src/kernels/hwy/hwy_invariant_point_attention.cc
+    src/kernels/hwy/hwy_triangular_attention.cc
+    src/kernels/hwy/hwy_ssm.cc
+    src/kernels/hwy/hwy_moe_quant.cc
+)
+
+# ==========================================================================
+# Platform-Specific Source Additions (BEFORE add_library)
+# ==========================================================================
+# Must add platform-specific sources BEFORE add_library() is called.
+# CMake captures the source list at add_library() time.
+# ==========================================================================
+    if(APPLE)
+        # Metal source files (Objective-C++)
+        set(METAL_SOURCES
+            src/backend/apple/metal_backend.mm
+            src/backend/apple/apple_silicon.mm
+            src/backend/apple/ane_backend.mm
+            src/backend/apple/hybrid_scheduler.mm
+            src/hal/apple_backend_selector.mm
+            src/kernels/metal_universal_ops.mm
+            src/kernels/metal_linear_ops.mm
+        )
+    list(APPEND SOURCES ${METAL_SOURCES})
+    message(STATUS "[DenseCore] Added Metal/Apple sources: ${METAL_SOURCES}")
+endif()
+
+# ==========================================================================
+# SIMD Dispatch Strategy
+# ==========================================================================
+# x86: Uses __attribute__((target(...))) for function-level SIMD enabling.
+# ARM:
+#   - Apple Silicon: NEON only, tuned with -mcpu=apple-m1.
+#   - Linux ARM64 (Graviton/Neoverse): tunable with DENSECORE_ARM_MCPU/-MARCH.
+#     Default for non-cross builds is -mcpu=native.
+# Highway and runtime SIMD detection still handle ISA selection at runtime.
+# ==========================================================================
+
+
+# ==========================================================================
+# Create Shared Library (AFTER all source additions)
+# ==========================================================================
+add_library(densecore SHARED)
+
+# Include directories
+target_include_directories(densecore PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
+    $<BUILD_INTERFACE:${GGML_DIR}/include>
+    $<BUILD_INTERFACE:${GGML_DIR}/src>
+    $<BUILD_INTERFACE:${GGML_DIR}/src/ggml-cpu>
+    $<BUILD_INTERFACE:${simde_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${highway_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+# Private include: src/ for internal headers (hwy kernels, etc.)
+target_include_directories(densecore PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# Link against ggml and Highway
+target_link_libraries(densecore PRIVATE ggml hwy)
+if(TARGET simdjson)
+    target_link_libraries(densecore PRIVATE simdjson)
+endif()
+
+if(DENSECORE_USE_MIMALLOC)
+    target_link_libraries(densecore PRIVATE mimalloc-static)
+    target_compile_definitions(densecore PRIVATE DENSECORE_USE_MIMALLOC)
+    # Ensure mimalloc headers are available if needed (though usually override is automatic)
+    target_include_directories(densecore PRIVATE ${mimalloc_SOURCE_DIR}/include)
+endif()
+
+if(DENSECORE_USE_SPDLOG)
+    target_link_libraries(densecore PRIVATE spdlog::spdlog)
+    target_compile_definitions(densecore PRIVATE DENSECORE_USE_SPDLOG)
+endif()
+
+# Define DENSECORE_BUILD_SHARED for symbol export (Windows dllexport)
+target_compile_definitions(densecore PRIVATE DENSECORE_BUILD_SHARED)
+target_compile_definitions(densecore PRIVATE
+    DENSECORE_DEFAULT_INT4_SINGLE_THREADING_LAYER=$<IF:$<BOOL:${DENSECORE_DEFAULT_INT4_SINGLE_THREADING_LAYER}>,1,0>
+    DENSECORE_DEFAULT_PREFILL_FLASH_MASK_REUSE=$<IF:$<BOOL:${DENSECORE_DEFAULT_PREFILL_FLASH_MASK_REUSE}>,1,0>
+    DENSECORE_DEFAULT_PRECOMPUTED_ROPE=$<IF:$<BOOL:${DENSECORE_DEFAULT_PRECOMPUTED_ROPE}>,1,0>
+    DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM=$<IF:$<BOOL:${DENSECORE_DEFAULT_FUSED_RESIDUAL_RMSNORM}>,1,0>
+    DENSECORE_DEFAULT_FUSED_QKV=$<IF:$<BOOL:${DENSECORE_DEFAULT_FUSED_QKV}>,1,0>
+    DENSECORE_GGML_CPU_KLEIDIAI=$<IF:$<BOOL:${GGML_CPU_KLEIDIAI}>,1,0>
+)
+if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+    target_compile_definitions(densecore PRIVATE DENSECORE_ARM_CORRECTNESS_FIRST=1)
+endif()
+if(DENSECORE_TARGET_C4A)
+    target_compile_definitions(densecore PRIVATE DENSECORE_TARGET_C4A=1)
+endif()
+
+# AddressSanitizer option for memory debugging
+option(ASAN_BUILD "Enable AddressSanitizer for memory error detection" OFF)
+option(DENSECORE_BUILD_TESTS "Build DenseCore unit tests" OFF)
+
+# DENSECORE_DEBUG_* environment variables are diagnostics, not configuration.
+# They compile to their defaults in release builds so they cost nothing on hot
+# paths and stay out of the supported configuration surface. Turn this ON to
+# get them back in a release build when debugging a production issue.
+option(DENSECORE_ENABLE_DEBUG_ENV "Honour DENSECORE_DEBUG_* environment variables in release builds" OFF)
+if(DENSECORE_ENABLE_DEBUG_ENV)
+    add_compile_definitions(DENSECORE_ENABLE_DEBUG_ENV)
+    message(STATUS "Diagnostic environment variables ENABLED (DENSECORE_DEBUG_*)")
+endif()
+
+if(ASAN_BUILD)
+    message(STATUS "AddressSanitizer ENABLED - Building with -fsanitize=address")
+    set(ASAN_FLAGS -fsanitize=address -fno-omit-frame-pointer -g -O1)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
+endif()
+
+# Compiler flags and optimizations
+target_compile_options(densecore PRIVATE
+    -Wall
+    -Wextra
+    $<IF:$<BOOL:${ASAN_BUILD}>,-O1,-O3>
+    $<$<BOOL:${ASAN_BUILD}>:-fsanitize=address>
+    $<$<BOOL:${ASAN_BUILD}>:-fno-omit-frame-pointer>
+    $<$<BOOL:${ASAN_BUILD}>:-g>
+)
+
+# Platform-specific optimizations
+if(APPLE)
+    message(STATUS "Configuring for Apple platform - Using Accelerate framework")
+
+    # Objective-C++ is enabled at project() declaration time
+    # (see CMake 4.x + Ninja workaround at top of file)
+    set(CMAKE_OBJCXX_STANDARD 17)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+
+    # Set Objective-C++ flags for .mm files (METAL_SOURCES already added above)
+    set_source_files_properties(${METAL_SOURCES} PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+
+    # ==========================================================================
+    # Apple Frameworks
+    # ==========================================================================
+    # Accelerate (BLAS/LAPACK)
+    find_library(ACCELERATE_FRAMEWORK Accelerate)
+    if(ACCELERATE_FRAMEWORK)
+        target_link_libraries(densecore PRIVATE ${ACCELERATE_FRAMEWORK})
+        target_compile_definitions(densecore PRIVATE USE_ACCELERATE)
+        message(STATUS "Accelerate framework found: ${ACCELERATE_FRAMEWORK}")
+    else()
+        message(WARNING "Accelerate framework not found")
+    endif()
+
+    # Metal (GPU compute)
+    find_library(METAL_FRAMEWORK Metal)
+    find_library(METALPERFORMANCESHADERS_FRAMEWORK MetalPerformanceShaders)
+    find_library(FOUNDATION_FRAMEWORK Foundation)
+    find_library(COREML_FRAMEWORK CoreML)
+    find_library(IOKIT_FRAMEWORK IOKit)
+
+    if(METAL_FRAMEWORK)
+        # Consolidate all Apple framework linking into a single call.
+        # find_library sets variables to ...-NOTFOUND if not found,
+        # and target_link_libraries ignores such values safely.
+        target_link_libraries(densecore PRIVATE
+            ${METAL_FRAMEWORK}
+            ${FOUNDATION_FRAMEWORK}
+            ${METALPERFORMANCESHADERS_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${IOKIT_FRAMEWORK}
+        )
+
+        target_compile_definitions(densecore PRIVATE
+            DENSECORE_USE_METAL
+            DENSECORE_USE_ANE
+            GGML_USE_METAL
+        )
+        message(STATUS "Metal framework enabled for GPU acceleration")
+    else()
+        message(WARNING "Metal framework not found - GPU acceleration disabled")
+    endif()
+
+    # ==========================================================================
+    # Metal Shader Compilation
+    # ==========================================================================
+    set(METAL_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+    set(METAL_SHADERS
+        ${METAL_SHADER_DIR}/gemv.metal
+        ${METAL_SHADER_DIR}/flash_attention.metal
+        ${METAL_SHADER_DIR}/quantized_gemv.metal
+        ${METAL_SHADER_DIR}/window_attention.metal
+        ${METAL_SHADER_DIR}/temporal_attention.metal
+        ${METAL_SHADER_DIR}/triangular_attention.metal
+        ${METAL_SHADER_DIR}/patch_embed_3d.metal
+        ${METAL_SHADER_DIR}/point_cloud_ops.metal
+    )
+
+
+    if(EXISTS ${METAL_SHADER_DIR})
+        # Compile Metal shaders to metallib
+        # Note: metal -c cannot use -o with multiple input files,
+        # so we compile each .metal to .air separately, then link.
+        set(METALLIB_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/densecore.metallib)
+        set(AIR_FILES "")
+
+        foreach(SHADER ${METAL_SHADERS})
+            get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
+            set(AIR_FILE ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_NAME}.air)
+            list(APPEND AIR_FILES ${AIR_FILE})
+
+            add_custom_command(
+                OUTPUT ${AIR_FILE}
+                COMMAND xcrun -sdk macosx metal -c ${SHADER} -o ${AIR_FILE}
+                DEPENDS ${SHADER}
+                COMMENT "Compiling ${SHADER_NAME}.metal to AIR"
+                VERBATIM
+            )
+        endforeach()
+
+        add_custom_command(
+            OUTPUT ${METALLIB_OUTPUT}
+            COMMAND xcrun -sdk macosx metallib ${AIR_FILES} -o ${METALLIB_OUTPUT}
+            DEPENDS ${AIR_FILES}
+            COMMENT "Linking Metal shaders into metallib"
+            VERBATIM
+        )
+
+        add_custom_target(metal_shaders ALL DEPENDS ${METALLIB_OUTPUT})
+        add_dependencies(densecore metal_shaders)
+
+        # Install metallib alongside the library
+        install(FILES ${METALLIB_OUTPUT} DESTINATION lib)
+
+        message(STATUS "Metal shaders will be compiled from: ${METAL_SHADER_DIR}")
+    endif()
+
+    # ==========================================================================
+    # Apple Silicon Optimizations
+    # ==========================================================================
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+        message(STATUS "Apple Silicon detected - enabling ARM NEON and Metal optimizations")
+        target_compile_options(densecore PRIVATE
+            -ffast-math
+            -ffp-contract=fast
+        )
+        if(NOT DENSECORE_PORTABLE)
+            target_compile_options(densecore PRIVATE -mcpu=apple-m1)
+        endif()
+        target_compile_definitions(densecore PRIVATE
+            DENSECORE_APPLE_SILICON
+            GGML_USE_CPU
+            GGML_USE_ACCELERATE
+        )
+    else()
+        # Intel Mac
+        target_compile_definitions(densecore PRIVATE
+            GGML_USE_CPU
+            GGML_USE_ACCELERATE
+        )
+    endif()
+
+else()
+    message(STATUS "Configuring for non-Apple platform")
+
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        # Check for AVX support (compiler flags)
+        include(CheckCXXCompilerFlag)
+
+        if(MSVC)
+            # MSVC uses different flags
+            check_cxx_compiler_flag("/arch:AVX" COMPILER_SUPPORTS_AVX)
+            check_cxx_compiler_flag("/arch:AVX2" COMPILER_SUPPORTS_AVX2)
+            check_cxx_compiler_flag("/arch:AVX512" COMPILER_SUPPORTS_AVX512)
+            set(AVX_FLAG "/arch:AVX")
+            set(AVX2_FLAG "/arch:AVX2")
+            set(AVX512_FLAG "/arch:AVX512")
+        else()
+            # GCC/Clang flags
+            check_cxx_compiler_flag("-mavx" COMPILER_SUPPORTS_AVX)
+            check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+            check_cxx_compiler_flag("-mavx512f" COMPILER_SUPPORTS_AVX512)
+            set(AVX_FLAG "-mavx")
+            set(AVX2_FLAG "-mavx2" "-mfma")
+            # AVX-512 flags including VNNI for INT8 acceleration (Ice Lake+, Sapphire Rapids, Zen4+)
+            # -mavx512vnni enables vpdpbusd instruction for 4x INT8 dot products per lane
+            set(AVX512_FLAG "-mavx512f" "-mavx512dq" "-mavx512vl" "-mavx512bw" "-mavx512vnni" "-mfma")
+        endif()
+
+        # Check CPU capabilities for AVX-512 (cross-platform approach)
+        # We use a compile-and-run test to detect actual CPU support
+        set(CPU_HAS_AVX512 FALSE)
+
+        if(NOT MSVC)
+            # For GCC/Clang: Try to compile and run an AVX-512 test program
+            # This detects actual runtime CPU support, not just compiler support
+            include(CheckCXXSourceRuns)
+            set(CMAKE_REQUIRED_FLAGS "-mavx512f")
+            check_cxx_source_runs("
+                #include <immintrin.h>
+                int main() {
+                    __m512i a = _mm512_set1_epi32(1);
+                    __m512i b = _mm512_add_epi32(a, a);
+                    return _mm512_cvtsi512_si32(b) != 2 ? 1 : 0;
+                }
+            " AVX512_RUNTIME_SUPPORTED)
+            unset(CMAKE_REQUIRED_FLAGS)
+
+            if(AVX512_RUNTIME_SUPPORTED)
+                set(CPU_HAS_AVX512 TRUE)
+                message(STATUS "AVX-512 runtime support detected")
+            else()
+                # Fallback: check /proc/cpuinfo on Linux
+                if(EXISTS "/proc/cpuinfo")
+                    execute_process(
+                        COMMAND grep -q avx512f /proc/cpuinfo
+                        RESULT_VARIABLE GREP_RESULT
+                        ERROR_QUIET OUTPUT_QUIET
+                    )
+                    if(GREP_RESULT EQUAL 0)
+                        set(CPU_HAS_AVX512 TRUE)
+                        message(STATUS "AVX-512 detected via /proc/cpuinfo")
+                    endif()
+                endif()
+            endif()
+        endif()
+
+        # AMX Detection
+        check_cxx_compiler_flag("-mamx-tile -mamx-int8 -mamx-bf16" COMPILER_SUPPORTS_AMX)
+        if(COMPILER_SUPPORTS_AMX)
+            message(STATUS "Enabling AMX optimizations support")
+            set(AMX_FLAGS "-mamx-tile" "-mamx-int8" "-mamx-bf16")
+        endif()
+
+        # Apply optimizations based on detection
+        if(DENSECORE_PORTABLE)
+            message(STATUS "[DenseCore] PORTABLE mode: building baseline x86_64 binary with runtime dispatch only")
+            target_compile_definitions(densecore PRIVATE GGML_USE_CPU)
+        elseif(DENSECORE_CPU_TARGET STREQUAL "amd64-v3")
+            check_cxx_compiler_flag("-march=x86-64-v3" COMPILER_SUPPORTS_X86_64_V3)
+            if(NOT COMPILER_SUPPORTS_X86_64_V3)
+                message(FATAL_ERROR "DENSECORE_CPU_TARGET=amd64-v3 requires compiler support for -march=x86-64-v3")
+            endif()
+            message(STATUS "[DenseCore] CPU target amd64-v3: enabling deterministic x86-64-v3/AVX2 build flags")
+            target_compile_options(densecore PRIVATE -march=x86-64-v3)
+            target_compile_definitions(densecore PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
+            set(USING_AVX2 TRUE)
+        elseif(CPU_HAS_AVX512 AND COMPILER_SUPPORTS_AVX512)
+            message(STATUS "Enabling AVX-512 optimizations (compiler and CPU)")
+            target_compile_options(densecore PRIVATE ${AVX512_FLAG})
+            if(COMPILER_SUPPORTS_AMX)
+                 target_compile_options(densecore PRIVATE ${AMX_FLAGS})
+                 target_compile_definitions(densecore PRIVATE __AMX_TILE__ __AMX_INT8__ __AMX_BF16__)
+            endif()
+            target_compile_definitions(densecore PRIVATE USE_AVX512 GGML_USE_CPU GGML_USE_AVX512)
+            set(USING_AVX512 TRUE)
+        elseif(COMPILER_SUPPORTS_AVX2)
+            message(STATUS "Enabling AVX2 optimizations")
+            target_compile_options(densecore PRIVATE ${AVX2_FLAG})
+            target_compile_definitions(densecore PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
+            set(USING_AVX2 TRUE)
+        elseif(COMPILER_SUPPORTS_AVX)
+            message(STATUS "Enabling AVX optimizations")
+            target_compile_options(densecore PRIVATE ${AVX_FLAG})
+            target_compile_definitions(densecore PRIVATE USE_AVX GGML_USE_CPU GGML_USE_AVX)
+            set(USING_AVX TRUE)
+        else()
+            message(STATUS "No AVX support detected - using standard optimizations")
+            target_compile_definitions(densecore PRIVATE GGML_USE_CPU)
+        endif()
+
+        if(NOT MSVC AND DENSECORE_CPU_TARGET STREQUAL "native" AND NOT DENSECORE_PORTABLE)
+            # Optimization: Enable -march=native to use all available instructions
+            # This breaks portability (binary won't run on older CPUs) but maximizes performance
+            message(STATUS "Enabling -march=native for maximum performance on this host")
+            target_compile_options(densecore PRIVATE -march=native)
+        endif()
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        message(STATUS "Configuring for non-Apple ARM64 platform")
+        if(DENSECORE_ARM_TUNE_ACTIVE)
+            target_compile_options(densecore PRIVATE ${DENSECORE_ARM_TUNE_FLAGS})
+        endif()
+        target_compile_definitions(densecore PRIVATE GGML_USE_CPU)
+    else()
+        message(STATUS "No architecture-specific SIMD flags configured for: ${CMAKE_SYSTEM_PROCESSOR}")
+        target_compile_definitions(densecore PRIVATE GGML_USE_CPU)
+    endif()
+endif()
+
+# Threading support
+find_package(Threads REQUIRED)
+target_link_libraries(densecore PRIVATE Threads::Threads)
+if(UNIX AND NOT APPLE)
+    # Optional plugin loader uses dlopen/dlsym on Linux.
+    target_link_libraries(densecore PRIVATE dl)
+endif()
+
+# ==========================================================================
+# Threading Model: GGML Thread Pool + std::thread (NO OpenMP)
+# ==========================================================================
+# DenseCore uses a unified threading model:
+# - Request-level parallelism: std::thread workers in worker.cpp
+# - Compute-level parallelism: GGML's internal thread pool
+#
+# OpenMP is NOT used to avoid thread oversubscription (nested parallelism).
+# All SIMD kernels in densecore/simd/simd_ops.h are single-threaded and rely on the caller
+# (GGML callbacks or worker.cpp) to manage parallel execution.
+# ==========================================================================
+message(STATUS "Threading: GGML thread pool + std::thread (OpenMP disabled)")
+
+
+# ==========================================================================
+# NUMA / hwloc Support (Optional)
+# ==========================================================================
+# Enables NUMA-aware memory allocation and thread affinity for multi-socket
+# servers. Falls back to sysfs detection if libraries are not available.
+# ==========================================================================
+# The NUMA settings are captured into variables rather than applied only to
+# `densecore`, because NumaAllocator/KVBlockAllocator live in public headers as
+# inline implementations. Any target that compiles those headers must see the
+# same macros, or it silently compiles the non-NUMA branch — which both breaks
+# ODR and makes NUMA tests validate no-ops. `densecore_tests` in particular
+# compiles the sources directly instead of linking densecore, so PUBLIC
+# propagation would not reach it. Applied to every such target below via
+# densecore_apply_numa_settings().
+set(DENSECORE_NUMA_DEFINITIONS "")
+set(DENSECORE_NUMA_INCLUDE_DIRS "")
+set(DENSECORE_NUMA_LIBRARIES "")
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(HWLOC QUIET hwloc)
+    pkg_check_modules(NUMA QUIET numa)
+
+    if(HWLOC_FOUND AND NUMA_FOUND)
+        set(DENSECORE_NUMA_DEFINITIONS DENSECORE_USE_HWLOC DENSECORE_HAS_NUMA)
+        set(DENSECORE_NUMA_INCLUDE_DIRS ${HWLOC_INCLUDE_DIRS} ${NUMA_INCLUDE_DIRS})
+        set(DENSECORE_NUMA_LIBRARIES ${HWLOC_LIBRARIES} ${NUMA_LIBRARIES})
+        message(STATUS "NUMA support enabled: hwloc ${HWLOC_VERSION}, numa ${NUMA_VERSION}")
+    elseif(HWLOC_FOUND)
+        # hwloc only: topology discovery works, but libnuma allocation does not.
+        # DENSECORE_HAS_NUMA stays undefined so no libnuma symbol is referenced.
+        set(DENSECORE_NUMA_DEFINITIONS DENSECORE_USE_HWLOC)
+        set(DENSECORE_NUMA_INCLUDE_DIRS ${HWLOC_INCLUDE_DIRS})
+        set(DENSECORE_NUMA_LIBRARIES ${HWLOC_LIBRARIES})
+        message(STATUS "Partial NUMA support: hwloc ${HWLOC_VERSION} (libnuma not found)")
+    else()
+        message(STATUS "NUMA libs not found - using fallback sysfs detection")
+    endif()
+else()
+    message(STATUS "pkg-config not found - NUMA support disabled")
+endif()
+
+# Apply the detected NUMA build settings to a target that compiles DenseCore
+# headers or sources. Must be called for every such target.
+function(densecore_apply_numa_settings target)
+    if(NOT TARGET ${target})
+        return()
+    endif()
+    if(DENSECORE_NUMA_INCLUDE_DIRS)
+        target_include_directories(${target} PRIVATE ${DENSECORE_NUMA_INCLUDE_DIRS})
+    endif()
+    if(DENSECORE_NUMA_LIBRARIES)
+        target_link_libraries(${target} PRIVATE ${DENSECORE_NUMA_LIBRARIES})
+    endif()
+    if(DENSECORE_NUMA_DEFINITIONS)
+        target_compile_definitions(${target} PRIVATE ${DENSECORE_NUMA_DEFINITIONS})
+    endif()
+endfunction()
+
+densecore_apply_numa_settings(densecore)
+
+# Position Independent Code (required for shared libraries)
+set_target_properties(densecore PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    VERSION ${PROJECT_VERSION}
+    SOVERSION 1
+)
+
+# Installation rules
+set(DENSECORE_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/DenseCore")
+
+install(TARGETS densecore
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+# Quantize tool
+add_executable(quantize src/tools/quantize.cpp)
+
+target_include_directories(quantize PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${GGML_DIR}/include
+    ${GGML_DIR}/src
+    ${GGML_DIR}/src/ggml-cpu
+    ${simde_SOURCE_DIR} # Add SIMDe include path
+)
+target_include_directories(quantize PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_compile_definitions(quantize PRIVATE
+    GGML_VERSION="${GGML_VERSION}"
+    GGML_COMMIT="${GGML_COMMIT}"
+    _GNU_SOURCE
+)
+
+# Reuse the same compile options/definitions as densecore for AVX/Accelerate
+if(USE_ACCELERATE)
+    target_link_libraries(quantize PRIVATE ${ACCELERATE_FRAMEWORK})
+    target_compile_definitions(quantize PRIVATE USE_ACCELERATE GGML_USE_CPU GGML_USE_ACCELERATE)
+elseif(DENSECORE_PORTABLE)
+    target_compile_definitions(quantize PRIVATE GGML_USE_CPU)
+elseif(DENSECORE_CPU_TARGET STREQUAL "amd64-v3")
+    target_compile_options(quantize PRIVATE -march=x86-64-v3)
+    target_compile_definitions(quantize PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
+elseif(USING_AVX512)
+    target_compile_options(quantize PRIVATE -mavx512f -mavx512dq -mavx512vl -mavx512bw)
+    target_compile_definitions(quantize PRIVATE USE_AVX512 GGML_USE_CPU GGML_USE_AVX512)
+elseif(USE_AVX2)
+    target_compile_options(quantize PRIVATE -mavx2 -mfma)
+    target_compile_definitions(quantize PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
+elseif(USE_AVX)
+    target_compile_options(quantize PRIVATE -mavx)
+    target_compile_definitions(quantize PRIVATE USE_AVX GGML_USE_CPU GGML_USE_AVX)
+else()
+    target_compile_definitions(quantize PRIVATE GGML_USE_CPU)
+endif()
+
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" AND NOT DENSECORE_PORTABLE)
+    target_compile_options(quantize PRIVATE -mcpu=apple-m1)
+endif()
+if(DENSECORE_ARM_TUNE_ACTIVE)
+    target_compile_options(quantize PRIVATE ${DENSECORE_ARM_TUNE_FLAGS})
+endif()
+
+# Link against densecore (for CreateQuantizer, FreeINT4Data), ggml, and threads
+target_link_libraries(quantize PRIVATE densecore ggml Threads::Threads)
+
+install(TARGETS quantize
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(FILES
+    include/densecore.h
+    ${CMAKE_CURRENT_BINARY_DIR}/include/densecore_version.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/DenseCoreConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/DenseCoreConfig.cmake
+    INSTALL_DESTINATION ${DENSECORE_INSTALL_CMAKEDIR}
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/DenseCoreConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/DenseCoreConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/DenseCoreConfigVersion.cmake
+    DESTINATION ${DENSECORE_INSTALL_CMAKEDIR}
+)
+
+if(DENSECORE_BUILD_TESTS)
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.14.0
+    )
+    # Prevent gtest from overriding compiler/linker settings on Windows
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+
+    # Test sources (use absolute paths to ensure correct resolution)
+    set(TEST_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_simd_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_qwen35_ssm_math.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_lfm2_shortconv_math.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/simd/test_qwen35_ssm_qkv_projection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_qwen36_model_loader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_lfm2_model_loader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_chat_template.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_model_descriptor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_decoder_model_spec.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_tokenizer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_gemma4_model_loader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_transformer_graph_dispatch.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_reference_capture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_qwen_loop_guard.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_decode_graph_cache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_small_batch_decode.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_q8_small_batch.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_batched_activation_pack_cache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_q4k_fingerprint.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_attention_policy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_decode_thread_policy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_model_family_internal.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_worker_result_dispatch.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_request_lifecycle.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_request_submission.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_gemma4_decode_fallback.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_memory_pool.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_kv_cache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_scheduler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_action_chunker.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_arm_runtime.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/test_hardware_topology.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_operation_graph.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_graph_capture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/test_matmul_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_aligned_allocator.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_tensor_view.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hal/test_kernel_context.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_fp8.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/test_async_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/quantization/test_cpu_int4.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/quantization/test_int4_quantizer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/quantization/test_int4_gemv.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_engine_kv_cache_config.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_llm_runtime_config.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_moe_profiler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_numa_sticky_routing.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_numa_rebalance.cpp
+        # Phase 1: Universal HAL tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_transformer_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_rope_2d.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_deformable_attention.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_groupnorm.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hal/test_op_registry.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hal/test_op_registry_di.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/test_qnn_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_activation_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_image_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_sampling_range.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_sampling_and_moe_trace.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_normalization.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_moe_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_kv_cache_encoder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/memory/test_kv_cache_decoder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_graph_executor_integration.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_graph_domain_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_audio_ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_whisper_e2e.cpp
+        # Phase 2: Encoder-Decoder tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_attention_pair_bias_hwy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_cross_attention.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_point_attention_hwy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_triangular_attention_hwy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_paged_attention.cpp
+        # HAL Abstraction tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hal/test_hal_abstraction.cpp
+        # Universal Transformer Operations tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_universal_ops.cpp
+        # Bio/Science kernel tests
+        # ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_bio_kernels.cpp
+        # Logging tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_logging.cpp
+        # Optional plugin loader security tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_plugin_loader.cpp
+        # E2E smoke tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_engine_e2e.cpp
+        # Lifecycle tests mutate process-global engine/backend registries; keep them last.
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph/test_graph_request_lifecycle.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/test_backend_plugin_loader.cpp
+    )
+
+    # Create test executable
+    # Internal OBJECT modules are attached after all target settings below.
+    # Tests retain direct access to symbols hidden by the shared library.
+    add_executable(densecore_tests ${TEST_SOURCES})
+
+    add_library(densecore_test_backend_plugin MODULE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/plugins/valid_backend_plugin.cpp
+    )
+    add_library(densecore_test_invalid_backend_plugin MODULE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/backend/plugins/invalid_backend_plugin.cpp
+    )
+    target_include_directories(densecore_test_backend_plugin PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_definitions(densecore_tests PRIVATE
+        DENSECORE_TEST_BACKEND_PLUGIN_PATH="$<TARGET_FILE:densecore_test_backend_plugin>"
+        DENSECORE_TEST_INVALID_BACKEND_PLUGIN_PATH="$<TARGET_FILE:densecore_test_invalid_backend_plugin>"
+    )
+    add_dependencies(densecore_tests densecore_test_backend_plugin densecore_test_invalid_backend_plugin)
+
+    add_executable(gemma4_parity_probe
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/probes/gemma4_parity_probe.cpp
+    )
+
+    target_include_directories(densecore_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}/include  # Generated headers (densecore_version.h)
+        ${GGML_DIR}/include
+        ${GGML_DIR}/src
+        ${GGML_DIR}/src/ggml-cpu
+        ${simde_SOURCE_DIR}  # SIMDe for densecore/simd/simd_platform.h
+        ${highway_SOURCE_DIR}  # Google Highway SIMD
+    )
+
+    target_include_directories(gemma4_parity_probe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}/include
+        ${GGML_DIR}/include
+        ${GGML_DIR}/src
+        ${GGML_DIR}/src/ggml-cpu
+        ${simde_SOURCE_DIR}
+        ${highway_SOURCE_DIR}
+    )
+
+    # Link dependencies directly (do NOT link densecore shared lib to avoid symbol conflicts/hiding)
+    target_link_libraries(densecore_tests PRIVATE
+        ggml
+        hwy
+        GTest::gtest_main
+        Threads::Threads
+    )
+
+    target_link_libraries(gemma4_parity_probe PRIVATE
+        ggml
+        hwy
+        Threads::Threads
+    )
+
+    # Enable mock model for E2E tests (allows InitEngine("mock", ...))
+    target_compile_definitions(densecore_tests PRIVATE DENSECORE_TEST_BUILD)
+    target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_TEST_BUILD)
+
+    # Tests and the parity probe drive DENSECORE_DEBUG_* knobs directly, so they
+    # always build with the diagnostic surface live regardless of build type.
+    target_compile_definitions(densecore_tests PRIVATE DENSECORE_ENABLE_DEBUG_ENV)
+    target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_ENABLE_DEBUG_ENV)
+
+    # Both targets compile the core sources and public headers directly, so they
+    # need the same NUMA macros as `densecore`. Without this, the NUMA tests in
+    # tests/memory/test_numa_sticky_routing.cpp exercise the non-NUMA fallback
+    # branch and pass on a machine where the real code path was never run.
+    densecore_apply_numa_settings(densecore_tests)
+    densecore_apply_numa_settings(gemma4_parity_probe)
+    target_compile_definitions(densecore_tests PRIVATE
+        DENSECORE_GGML_CPU_KLEIDIAI=$<IF:$<BOOL:${GGML_CPU_KLEIDIAI}>,1,0>)
+    target_compile_definitions(gemma4_parity_probe PRIVATE
+        DENSECORE_GGML_CPU_KLEIDIAI=$<IF:$<BOOL:${GGML_CPU_KLEIDIAI}>,1,0>)
+    if(DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE)
+        target_compile_definitions(densecore_tests PRIVATE DENSECORE_ARM_CORRECTNESS_FIRST=1)
+        target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_ARM_CORRECTNESS_FIRST=1)
+    endif()
+    if(DENSECORE_TARGET_C4A)
+        target_compile_definitions(densecore_tests PRIVATE DENSECORE_TARGET_C4A=1)
+        target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_TARGET_C4A=1)
+    endif()
+
+    if(DENSECORE_USE_SPDLOG)
+        target_link_libraries(densecore_tests PRIVATE spdlog::spdlog)
+        target_compile_definitions(densecore_tests PRIVATE DENSECORE_USE_SPDLOG)
+        target_link_libraries(gemma4_parity_probe PRIVATE spdlog::spdlog)
+        target_compile_definitions(gemma4_parity_probe PRIVATE DENSECORE_USE_SPDLOG)
+    endif()
+
+    if(USE_ACCELERATE)
+        target_link_libraries(densecore_tests PRIVATE ${ACCELERATE_FRAMEWORK})
+        target_link_libraries(gemma4_parity_probe PRIVATE ${ACCELERATE_FRAMEWORK})
+    endif()
+
+    # Apply same compile flags as densecore
+    if(DENSECORE_PORTABLE)
+        target_compile_definitions(densecore_tests PRIVATE GGML_USE_CPU)
+        target_compile_definitions(gemma4_parity_probe PRIVATE GGML_USE_CPU)
+    elseif(DENSECORE_CPU_TARGET STREQUAL "amd64-v3")
+        target_compile_options(densecore_tests PRIVATE -march=x86-64-v3)
+        target_compile_definitions(densecore_tests PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
+        target_compile_options(gemma4_parity_probe PRIVATE -march=x86-64-v3)
+        target_compile_definitions(gemma4_parity_probe PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
+    elseif(CPU_HAS_AVX512 AND COMPILER_SUPPORTS_AVX512)
+        target_compile_options(densecore_tests PRIVATE ${AVX512_FLAG})
+        target_compile_definitions(densecore_tests PRIVATE USE_AVX512 GGML_USE_CPU GGML_USE_AVX512)
+        target_compile_options(gemma4_parity_probe PRIVATE ${AVX512_FLAG})
+        target_compile_definitions(gemma4_parity_probe PRIVATE USE_AVX512 GGML_USE_CPU GGML_USE_AVX512)
+    elseif(COMPILER_SUPPORTS_AVX2)
+        target_compile_options(densecore_tests PRIVATE ${AVX2_FLAG})
+        target_compile_definitions(densecore_tests PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
+        target_compile_options(gemma4_parity_probe PRIVATE ${AVX2_FLAG})
+        target_compile_definitions(gemma4_parity_probe PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
+    elseif(COMPILER_SUPPORTS_AVX)
+        target_compile_options(densecore_tests PRIVATE ${AVX_FLAG})
+        target_compile_definitions(densecore_tests PRIVATE USE_AVX GGML_USE_CPU GGML_USE_AVX)
+        target_compile_options(gemma4_parity_probe PRIVATE ${AVX_FLAG})
+        target_compile_definitions(gemma4_parity_probe PRIVATE USE_AVX GGML_USE_CPU GGML_USE_AVX)
+    else()
+        target_compile_definitions(densecore_tests PRIVATE GGML_USE_CPU)
+        target_compile_definitions(gemma4_parity_probe PRIVATE GGML_USE_CPU)
+    endif()
+
+    if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" AND NOT DENSECORE_PORTABLE)
+        target_compile_options(densecore_tests PRIVATE -mcpu=apple-m1)
+        target_compile_options(gemma4_parity_probe PRIVATE -mcpu=apple-m1)
+        # Link Apple frameworks required by Metal/CoreML/Accelerate code
+        target_link_libraries(densecore_tests PRIVATE
+            ${ACCELERATE_FRAMEWORK}
+            ${METAL_FRAMEWORK}
+            ${FOUNDATION_FRAMEWORK}
+            ${METALPERFORMANCESHADERS_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${IOKIT_FRAMEWORK}
+        )
+        target_link_libraries(gemma4_parity_probe PRIVATE
+            ${ACCELERATE_FRAMEWORK}
+            ${METAL_FRAMEWORK}
+            ${FOUNDATION_FRAMEWORK}
+            ${METALPERFORMANCESHADERS_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${IOKIT_FRAMEWORK}
+        )
+    endif()
+    if(DENSECORE_ARM_TUNE_ACTIVE)
+        target_compile_options(densecore_tests PRIVATE ${DENSECORE_ARM_TUNE_FLAGS})
+        target_compile_options(gemma4_parity_probe PRIVATE ${DENSECORE_ARM_TUNE_FLAGS})
+    endif()
+
+    # Public C consumer must exercise the installed-shape production library,
+    # never the mock/debug-enabled test OBJECT modules.
+    add_executable(densecore_api_smoke tests/api/production_library_smoke.c)
+    set_target_properties(densecore_api_smoke PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_link_libraries(densecore_api_smoke PRIVATE densecore)
+    add_test(NAME densecore_production_api_smoke COMMAND densecore_api_smoke)
+    set_tests_properties(densecore_production_api_smoke PROPERTIES TIMEOUT 120)
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME densecore_architecture_boundaries
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_architecture.py
+                    --core-dir ${CMAKE_CURRENT_SOURCE_DIR} --build-dir ${CMAKE_CURRENT_BINARY_DIR})
+        add_test(NAME densecore_architecture_checker_tests
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_check_architecture.py)
+        set_tests_properties(densecore_architecture_boundaries densecore_architecture_checker_tests
+            PROPERTIES TIMEOUT 30)
+    endif()
+
+    include(GoogleTest)
+    gtest_discover_tests(densecore_tests)
+endif()
+
+# Compile each consumer's core modules with its own finalized settings. In
+# particular, production objects must never contain test/mock/debug behavior.
+if(ASAN_BUILD AND DENSECORE_BUILD_TESTS)
+    # Tests compile their own runtime objects rather than linking libdensecore.
+    # Instrument each consumer before module settings are copied; linker flags
+    # alone would leave the test runtime and the public C consumer unchecked.
+    foreach(asan_target IN ITEMS densecore_tests gemma4_parity_probe densecore_api_smoke
+            densecore_test_backend_plugin densecore_test_invalid_backend_plugin)
+        target_compile_options(${asan_target} PRIVATE ${ASAN_FLAGS})
+        target_link_options(${asan_target} PRIVATE -fsanitize=address)
+    endforeach()
+endif()
+include(cmake/densecore_modules.cmake)
+densecore_attach_modules(densecore production)
+if(DENSECORE_BUILD_TESTS)
+    densecore_attach_modules(densecore_tests test)
+    densecore_attach_modules(gemma4_parity_probe probe)
+endif()
+
+# Print configuration summary
+message(STATUS "==========================================")
+message(STATUS "DenseCore Configuration Summary")
+message(STATUS "==========================================")
+message(STATUS "CMake Version: ${CMAKE_VERSION}")
+message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
+message(STATUS "System: ${CMAKE_SYSTEM_NAME}")
+message(STATUS "Processor: ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "DENSECORE_CPU_TARGET: ${DENSECORE_CPU_TARGET}")
+message(STATUS "DENSECORE_TARGET_C4A: ${DENSECORE_TARGET_C4A}")
+message(STATUS "DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE: ${DENSECORE_ARM_CORRECTNESS_FIRST_ACTIVE}")
+message(STATUS "DENSECORE_ARM_MCPU: ${DENSECORE_ARM_MCPU}")
+message(STATUS "DENSECORE_ARM_MARCH: ${DENSECORE_ARM_MARCH}")
+message(STATUS "GGML_CPU_ARM_ARCH: ${GGML_CPU_ARM_ARCH}")
+message(STATUS "GGML_NATIVE: ${GGML_NATIVE}")
+message(STATUS "GGML_LLAMAFILE: ${GGML_LLAMAFILE}")
+message(STATUS "GGML_CPU_REPACK: ${GGML_CPU_REPACK}")
+message(STATUS "GGML_CPU_KLEIDIAI: ${GGML_CPU_KLEIDIAI}")
+message(STATUS "C4A maintained configure: cmake --preset c4a-perf")
+message(STATUS "==========================================")

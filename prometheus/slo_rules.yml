@@ -1,0 +1,21 @@
+groups:
+  - name: densecore-slo-recording-rules
+    interval: 30s
+    rules:
+      - record: densecore:slo_request_rate5m
+        expr: sum(rate(densecore_total_requests[5m]))
+
+      - record: densecore:slo_error_rate5m
+        expr: |
+          sum(rate(densecore_failed_requests[5m]))
+          /
+          clamp_min(sum(rate(densecore_total_requests[5m])), 0.001)
+
+      - record: densecore:slo_ttft_p99_seconds
+        expr: max(densecore_time_to_first_token_seconds{quantile="0.99"})
+
+      - record: densecore:slo_itl_p99_seconds
+        expr: max(densecore_inter_token_latency_seconds{quantile="0.99"})
+
+      - record: densecore:slo_queue_wait_p99_seconds
+        expr: max(densecore_queue_wait_time_seconds{quantile="0.99"})

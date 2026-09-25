@@ -1,0 +1,46 @@
+apiVersion: v2
+name: densecore
+description: Cloud-native inference runtime (LLM-compatible by default, extensible profiles)
+
+type: application
+
+# Chart version - incremented on chart changes
+version: 0.1.0
+
+# Application version - should match the DenseCore release
+appVersion: "0.1.0"
+
+dependencies:
+  - name: dense-base
+    version: 1.1.0
+    repository: oci://ghcr.io/denseai/charts
+
+keywords:
+  - llm
+  - inference
+  - cpu
+  - ai
+  - huggingface
+  - gguf
+  - openai
+  - machine-learning
+
+home: https://github.com/DenseAI/DenseCore
+
+sources:
+  - https://github.com/DenseAI/DenseCore
+
+maintainers:
+  - name: DenseCore Team
+    email: maintainers@densecore.dev
+
+icon: https://raw.githubusercontent.com/DenseAI/DenseCore/main/docs/images/logo.png
+
+annotations:
+  category: AI/ML
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://github.com/DenseAI/DenseCore/tree/main/docs
+    - name: Docker Hub
+      url: https://hub.docker.com/r/denseai/densecore

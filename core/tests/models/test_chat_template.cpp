@@ -1,0 +1,934 @@
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <string>
+
+#include "models/model_prompt_templates.h"
+#include "densecore/models/model_types.h"
+#include "densecore/models/tokenizer.h"
+
+std::string DenseCoreTestOnlyApplyAutoChatTemplate(const TransformerModel* model, const std::string& prompt);
+bool DenseCoreTestOnlyPromptStartsInThinkBlock(const std::string& prompt);
+bool DenseCoreTestOnlySuppressesReasoningTagsForPrompt(const std::string& prompt);
+bool DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(const TransformerModel* model, const std::string& prompt);
+std::vector<int> DenseCoreTestOnlyQwenReasoningBlocklist(const TransformerModel* model);
+std::vector<int> DenseCoreTestOnlyQwenReasoningBlocklistForPrompt(const TransformerModel* model,
+                                                                  const std::string& prompt);
+std::vector<int> DenseCoreTestOnlyGemma4TextBlocklist(const TransformerModel* model);
+std::vector<int> DenseCoreTestOnlyLFM2TextBlocklist(const TransformerModel* model);
+bool DenseCoreTestOnlyGemma4TextBlocklistReachesSamplingParams(const TransformerModel* model);
+bool DenseCoreTestOnlyGemma4CallerDisallowMergesWithModelBlocklist(const TransformerModel* model, int caller_token_id);
+std::string DenseCoreTestOnlyPrimeQwenNoThinkingPromptText(const TransformerModel* model, const std::string& prompt);
+std::string DenseCoreTestOnlyPrimeQwenNoThinking(const TransformerModel* model, const std::string& prompt);
+bool DenseCoreTestOnlyResolveAddBosForPrompt(const TransformerModel* model, const std::string& prompt);
+
+TEST(ChatTemplateTest, GemmaAutoTemplateUsesOfficialTurnFormatWithImplicitInstructions) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    const std::string prompt = "hello";
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, prompt);
+
+    EXPECT_EQ(wrapped,
+              "<bos>"
+              "<|turn>user\n"
+              "hello"
+              "<turn|>\n"
+              "<|turn>model\n"
+              "<|channel>thought\n"
+              "<channel|>");
+}
+
+TEST(ChatTemplateTest, GemmaAutoTemplateUsesStartOfTurnTokensWhenPresentInVocab) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    // Some Gemma-family exports expose this alternate atomic turn spelling.
+    // Prefer whichever turn literals are present in the loaded vocab.
+    model.token_to_id["<start_of_turn>"] = 105;
+    model.token_to_id["<end_of_turn>"] = 106;
+
+    const std::string prompt = "hello";
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, prompt);
+
+    EXPECT_EQ(wrapped,
+              "<bos>"
+              "<start_of_turn>user\n"
+              "hello"
+              "<end_of_turn>\n"
+              "<start_of_turn>model\n"
+              "<|channel>thought\n"
+              "<channel|>");
+}
+
+TEST(ChatTemplateTest, GemmaAutoTemplateLeavesRealStartOfTurnPromptUntouched) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<start_of_turn>"] = 105;
+    model.token_to_id["<end_of_turn>"] = 106;
+
+    const std::string prompt = "<bos><start_of_turn>user\nhello<end_of_turn>\n<start_of_turn>model\n";
+    EXPECT_EQ(DenseCoreTestOnlyApplyAutoChatTemplate(&model, prompt), prompt);
+}
+
+TEST(ChatTemplateTest, GemmaAutoTemplateLeavesChannelCueToModelWhenThinkingEnabled) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    setenv("DENSECORE_GEMMA4_ENABLE_THINKING", "1", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_GEMMA4_ENABLE_THINKING");
+
+    EXPECT_EQ(wrapped,
+              "<bos>"
+              "<|turn>system\n"
+              "<|think|>\n"
+              "<turn|>\n"
+              "<|turn>user\n"
+              "hello"
+              "<turn|>\n"
+              "<|turn>model\n");
+}
+
+TEST(ChatTemplateTest, GemmaAutoTemplateAddsEmptyThoughtChannelWhenThinkingDisabled) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    setenv("DENSECORE_GEMMA4_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_GEMMA4_ENABLE_THINKING");
+
+    EXPECT_EQ(wrapped,
+              "<bos>"
+              "<|turn>user\n"
+              "hello"
+              "<turn|>\n"
+              "<|turn>model\n"
+              "<|channel>thought\n"
+              "<channel|>");
+}
+
+TEST(ChatTemplateTest, AutoTemplateLeavesGemmaPromptUntouchedWhenAlreadyTemplated) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    const std::string prompt = "<bos><|turn>user\nhello\n<|turn>model\n";
+    EXPECT_EQ(DenseCoreTestOnlyApplyAutoChatTemplate(&model, prompt), prompt);
+}
+
+TEST(ChatTemplateTest, QwenNoThinkingAutoTemplateKeepsChatMLScaffoldForUnicodePrompt) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "안녕?");
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+
+    EXPECT_EQ(wrapped,
+              "<|im_start|>user\n"
+              "안녕?<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
+}
+
+TEST(ChatTemplateTest, Qwen35DefaultsToNoThinkingWhenEnvIsUnset) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+
+    EXPECT_EQ(wrapped,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
+}
+
+TEST(ChatTemplateTest, Qwen35CanonicalRenderKeepsNoThinkingAssistantScaffold) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false", 1);
+    densecore::models::CanonicalChatMessage message;
+    message.role = "user";
+    message.content = "hello";
+    const std::string rendered = densecore::models::RenderModelChatMessages(
+        &model, {message}, densecore::models::CanonicalChatRenderOptions{});
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+
+    EXPECT_EQ(rendered,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
+}
+
+TEST(ChatTemplateTest, LFM2AutoTemplateUsesStartOfTextChatMLGenerationPrompt) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+
+    EXPECT_EQ(wrapped,
+              "<|startoftext|>"
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n");
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+}
+
+TEST(ChatTemplateTest, LFM2CanonicalRenderUsesStartOfTextChatMLGenerationPrompt) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    densecore::models::CanonicalChatMessage message;
+    message.role = "user";
+    message.content = "hello";
+
+    const std::string rendered = densecore::models::RenderModelChatMessages(
+        &model, {message}, densecore::models::CanonicalChatRenderOptions{});
+
+    EXPECT_EQ(rendered,
+              "<|startoftext|>"
+              "<|im_start|>system\n"
+              "You are a helpful assistant. Answer the user's request directly. Do not describe the prompt or your "
+              "reasoning.<|im_end|>\n"
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n");
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(rendered));
+}
+
+TEST(ChatTemplateTest, Qwen3DefaultsToThinkingWhenEnvIsUnset) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN3;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    unsetenv("DENSECORE_QWEN3_ENABLE_THINKING");
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+
+    EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+}
+
+TEST(ChatTemplateTest, Qwen36DefaultsToThinkingWhenEnvIsUnset) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+
+    EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_EQ(wrapped,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n");
+}
+
+TEST(ChatTemplateTest, Qwen36ExplicitOverrideDisablesThinking) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_EQ(wrapped,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
+}
+
+TEST(ChatTemplateTest, Qwen36DisableDoesNotInjectNoThinkDirective) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_EQ(wrapped.find("/no_think"), std::string::npos);
+}
+
+TEST(ChatTemplateTest, Qwen36NoThinkingDoesNotPrimeAssistantAnswerCue) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "What is the capital of France?");
+    const std::string primed = DenseCoreTestOnlyPrimeQwenNoThinking(&model, wrapped);
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_EQ(primed, wrapped);
+}
+
+TEST(ChatTemplateTest, Qwen36NoThinkingPromptTextDoesNotPrimeAssistantAnswerCueByDefault) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    const std::string primed = DenseCoreTestOnlyPrimeQwenNoThinkingPromptText(
+        &model, "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_EQ(primed,
+              "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n");
+}
+
+TEST(ChatTemplateTest, Qwen35NoThinkingDoesNotPrimeAssistantAnswerCue) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "What is the capital of France?");
+    const std::string primed = DenseCoreTestOnlyPrimeQwenNoThinking(&model, wrapped);
+
+    EXPECT_EQ(primed, wrapped);
+    EXPECT_EQ(primed.find("<|im_start|>assistant\nAnswer: "), std::string::npos);
+}
+
+TEST(ChatTemplateTest, Qwen35RenderedChatMLDisablesBos) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.tokenizer_add_bos = true;
+
+    const std::string rendered = "<|im_start|>user\nhello /no_think<|im_end|>\n<|im_start|>assistant\n";
+
+    EXPECT_FALSE(DenseCoreTestOnlyResolveAddBosForPrompt(&model, rendered));
+    EXPECT_TRUE(DenseCoreTestOnlyResolveAddBosForPrompt(&model, "hello"));
+}
+
+TEST(ChatTemplateTest, Qwen36NoThinkingPromptTextCanPrimeAssistantAnswerCueWhenExplicitlyEnabled) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    setenv("DENSECORE_QWEN36_PRIME_NO_THINKING", "1", 1);
+    const std::string primed = DenseCoreTestOnlyPrimeQwenNoThinkingPromptText(
+        &model, "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n");
+    unsetenv("DENSECORE_QWEN36_PRIME_NO_THINKING");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_NE(primed.find("<|im_start|>assistant\nAnswer: "), std::string::npos);
+}
+
+TEST(ChatTemplateTest, Qwen3NoThinkingPrimesAssistantAnswerCue) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN3;
+    model.variant = ModelVariant::QWEN3;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN3_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "What is the capital of France?");
+    const std::string primed = DenseCoreTestOnlyPrimeQwenNoThinking(&model, wrapped);
+    unsetenv("DENSECORE_QWEN3_ENABLE_THINKING");
+
+    EXPECT_NE(primed.find("<|im_start|>assistant\nAnswer: "), std::string::npos);
+}
+
+TEST(ChatTemplateTest, GemmaThinkingAutoTemplateInjectsThinkSystemTurn) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    setenv("DENSECORE_GEMMA4_ENABLE_THINKING", "true", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_GEMMA4_ENABLE_THINKING");
+
+    EXPECT_EQ(wrapped,
+              "<bos>"
+              "<|turn>system\n"
+              "<|think|>\n"
+              "<turn|>\n"
+              "<|turn>user\n"
+              "hello"
+              "<turn|>\n"
+              "<|turn>model\n"
+              "");
+}
+
+TEST(ChatTemplateTest, RoleTagAutoTemplateUsesDedicatedSystemAndAssistantTags) {
+    TransformerModel model{};
+    model.arch = ModelArch::LLAMA;
+    model.token_to_id["<|system|>"] = 1;
+    model.token_to_id["<|user|>"] = 2;
+    model.token_to_id["<|assistant|>"] = 3;
+
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+
+    EXPECT_EQ(wrapped,
+              "<|system|>\n"
+              "You are a helpful assistant.\n"
+              "<|user|>\n"
+              "hello"
+              "\n<|assistant|>\n");
+}
+
+TEST(ChatTemplateTest, QwenThinkingPromptStartsInsideThinkBlock) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN35_ENABLE_THINKING", "true", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+
+    EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+}
+
+TEST(ChatTemplateTest, QwenThinkingPromptDoesNotSuppressReasoningTags) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "true", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_FALSE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, wrapped));
+    EXPECT_EQ(wrapped.find("Think step by step inside <think> and </think>"), std::string::npos);
+}
+
+TEST(ChatTemplateTest, QwenNoThinkingPromptDoesNotStartInsideThinkBlock) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+}
+
+TEST(ChatTemplateTest, QwenNoThinkingPromptSuppressesReasoningTags) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_TRUE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, wrapped));
+    EXPECT_EQ(wrapped,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+}
+
+TEST(ChatTemplateTest, AutoTemplateCanBeDisabledForRawQaMode) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_AUTO_CHAT_TEMPLATE", "0", 1);
+    setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false", 1);
+    const std::string prompt = "The capital of France is";
+    const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, prompt);
+    unsetenv("DENSECORE_AUTO_CHAT_TEMPLATE");
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+
+    EXPECT_EQ(wrapped, prompt);
+}
+
+TEST(CanonicalChatRenderTest, QwenCanonicalRendererMatchesChatMLPrompt) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false", 1);
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "hello";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    bool thinking_enabled = true;
+    const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {}, &thinking_enabled);
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+
+    EXPECT_FALSE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
+}
+
+TEST(CanonicalChatRenderTest, Qwen36NoThinkingMatchesEmbeddedTemplateCue) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "hello";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    bool thinking_enabled = true;
+    const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {}, &thinking_enabled);
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_FALSE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
+}
+
+TEST(CanonicalChatRenderTest, Qwen36ThinkingUsesOfficialPromptWithoutReasoningDirective) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "true", 1);
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "hello";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    bool thinking_enabled = false;
+    const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {}, &thinking_enabled);
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+
+    EXPECT_TRUE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n");
+}
+
+TEST(CanonicalChatRenderTest, Qwen38DefaultsThinkingOnAndSupportsExplicitNoThinking) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN38;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "hello";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+
+    bool thinking_enabled = false;
+    std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {}, &thinking_enabled);
+    EXPECT_TRUE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<|im_start|>system\n"
+              "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
+              "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final "
+              "answer.<|im_end|>\n"
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n");
+
+    densecore::models::CanonicalChatRenderOptions options;
+    options.enable_thinking = 0;
+    thinking_enabled = true;
+    rendered = densecore::models::RenderModelChatMessages(&model, messages, options, &thinking_enabled);
+    EXPECT_FALSE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<|im_start|>user\n"
+              "hello<|im_end|>\n"
+              "<|im_start|>assistant\n"
+              "<think>\n\n</think>\n\n");
+}
+
+TEST(CanonicalChatRenderTest, Qwen38ThinkingMergesOfficialPrefixWithLeadingSystem) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN38;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    densecore::models::CanonicalChatMessage system;
+    system.role = "system";
+    system.content = "Answer as a careful systems engineer.";
+    densecore::models::CanonicalChatMessage user;
+    user.role = "user";
+    user.content = "Name two release gates.";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {system, user};
+    const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {});
+
+    EXPECT_EQ(rendered,
+              "<|im_start|>system\n"
+              "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
+              "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final "
+              "answer.\n\nAnswer as a careful systems engineer.<|im_end|>\n"
+              "<|im_start|>user\nName two release gates.<|im_end|>\n"
+              "<|im_start|>assistant\n<think>\n");
+}
+
+TEST(CanonicalChatRenderTest, Qwen36PreserveThinkingCanBeDisabledForAssistantHistory) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+
+    densecore::models::CanonicalChatMessage user{};
+    user.role = "user";
+    user.content = "hello";
+    densecore::models::CanonicalChatMessage assistant{};
+    assistant.role = "assistant";
+    assistant.content = "final";
+    assistant.reasoning_content = "chain";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {user, assistant};
+    densecore::models::CanonicalChatRenderOptions options;
+    options.preserve_thinking = 0;
+
+    const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, options);
+
+    EXPECT_NE(rendered.find("<|im_start|>assistant\nfinal<|im_end|>\n"), std::string::npos);
+    EXPECT_EQ(rendered.find("<|im_start|>assistant\n<think>\nchain"), std::string::npos);
+}
+
+TEST(CanonicalChatRenderTest, GemmaCanonicalRendererMatchesTurnTags) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "What is the capital of France?";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    bool thinking_enabled = false;
+    const std::string rendered = densecore::models::RenderModelChatMessages(&model, messages, {}, &thinking_enabled);
+
+    EXPECT_FALSE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<bos>"
+              "<|turn>user\n"
+              "What is the capital of France?"
+              "<turn|>\n"
+              "<|turn>model\n"
+              "<|channel>thought\n"
+              "<channel|>");
+}
+
+TEST(CanonicalChatRenderTest, GemmaCanonicalRendererUsesEmptyThoughtChannelWhenThinkingDisabled) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "What is the capital of France?";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    densecore::models::CanonicalChatRenderOptions options{};
+    options.enable_thinking = 0;
+    bool thinking_enabled = true;
+    const std::string rendered =
+        densecore::models::RenderModelChatMessages(&model, messages, options, &thinking_enabled);
+
+    EXPECT_FALSE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<bos>"
+              "<|turn>user\n"
+              "What is the capital of France?"
+              "<turn|>\n"
+              "<|turn>model\n"
+              "<|channel>thought\n"
+              "<channel|>");
+}
+
+TEST(CanonicalChatRenderTest, GemmaCanonicalRendererLeavesChannelCueToModelWhenThinkingEnabled) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.token_to_id["<|turn>"] = 1;
+    model.token_to_id["<turn|>"] = 2;
+
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "What is the capital of France?";
+    const std::vector<densecore::models::CanonicalChatMessage> messages = {message};
+    densecore::models::CanonicalChatRenderOptions options{};
+    options.enable_thinking = 1;
+    bool thinking_enabled = false;
+    const std::string rendered =
+        densecore::models::RenderModelChatMessages(&model, messages, options, &thinking_enabled);
+
+    EXPECT_TRUE(thinking_enabled);
+    EXPECT_EQ(rendered,
+              "<bos>"
+              "<|turn>system\n"
+              "<|think|>\n"
+              "<turn|>\n"
+              "<|turn>user\n"
+              "What is the capital of France?"
+              "<turn|>\n"
+              "<|turn>model\n");
+}
+
+TEST(QwenReasoningBlocklistTest, NoThinkingBlocksReasoningTagsButKeepsChatTerminator) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.eos_token_id = 99;
+    model.token_to_id["<think>"] = 1;
+    model.token_to_id["</think>"] = 2;
+    model.token_to_id["<|im_start|>"] = 3;
+    model.token_to_id["<|im_end|>"] = 4;
+    model.token_to_id["<tool_call>"] = 5;
+    model.token_to_id["</tool_call>"] = 6;
+    model.token_to_id["<custom_control>"] = 7;
+
+    setenv("DENSECORE_QWEN35_ENABLE_THINKING", "false", 1);
+    const std::vector<int> blocked = DenseCoreTestOnlyQwenReasoningBlocklist(&model);
+    unsetenv("DENSECORE_QWEN35_ENABLE_THINKING");
+
+    const std::vector<int> expected = {1, 2, 3, 5, 6};
+    EXPECT_EQ(blocked, expected);
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 4), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 7), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 99), blocked.end());
+}
+
+TEST(QwenReasoningBlocklistTest, RequestPromptModeOverridesOppositeProcessEnvironment) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN36;
+    model.token_to_id["<think>"] = 1;
+    model.token_to_id["</think>"] = 2;
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "false", 1);
+    EXPECT_TRUE(DenseCoreTestOnlyQwenReasoningBlocklistForPrompt(
+                    &model, "<|im_start|>assistant\n<think>\n")
+                    .empty());
+
+    setenv("DENSECORE_QWEN36_ENABLE_THINKING", "true", 1);
+    const auto no_thinking = DenseCoreTestOnlyQwenReasoningBlocklistForPrompt(
+        &model, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    unsetenv("DENSECORE_QWEN36_ENABLE_THINKING");
+    EXPECT_NE(std::find(no_thinking.begin(), no_thinking.end(), 1), no_thinking.end());
+    EXPECT_NE(std::find(no_thinking.begin(), no_thinking.end(), 2), no_thinking.end());
+}
+
+TEST(Gemma4TextBlocklistTest, BlocksControlAndUnusedTokensButKeepsStopIds) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.eos_token_id = 99;
+    model.stop_token_ids = {3, 99};
+    model.vocab_tokens = {"normal",       "<unk>",       "<|think|>", "<|turn>",       "<unused7>",
+                          "<0x41>",       "<eos>",       "plain",     "<|channel>",    "<channel|>",
+                          "[multimodal]", "<start_of_image>"};
+    model.token_to_id["normal"] = 0;
+    model.token_to_id["<unk>"] = 1;
+    model.token_to_id["<|think|>"] = 2;
+    model.token_to_id["<|turn>"] = 3;
+    model.token_to_id["<unused7>"] = 4;
+    model.token_to_id["<0x41>"] = 5;
+    model.token_to_id["<eos>"] = 6;
+    model.token_to_id["plain"] = 7;
+    model.token_to_id["<|channel>"] = 8;
+    model.token_to_id["<channel|>"] = 9;
+    model.token_to_id["[multimodal]"] = 10;
+    model.token_to_id["<start_of_image>"] = 11;
+    model.token_types = {1, 2, 3, 4, 5, 6, 1, 1, 3, 3, 1, 1};
+
+    const std::vector<int> blocked = DenseCoreTestOnlyGemma4TextBlocklist(&model);
+
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 0), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 1), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 2), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 3), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 4), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 5), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 6), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 7), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 8), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 9), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 10), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 11), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 99), blocked.end());
+}
+
+TEST(Gemma4TextBlocklistTest, SamplingParamsUseModelDefaultBlocklist) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.eos_token_id = 99;
+    model.stop_token_ids = {99};
+    model.vocab_tokens = {"", "<bos>", "Paris", "<eos>"};
+    model.token_to_id[""] = 0;
+    model.token_to_id["<bos>"] = 1;
+    model.token_to_id["Paris"] = 2;
+    model.token_to_id["<eos>"] = 99;
+
+    EXPECT_TRUE(DenseCoreTestOnlyGemma4TextBlocklistReachesSamplingParams(&model));
+    EXPECT_TRUE(DenseCoreTestOnlyGemma4CallerDisallowMergesWithModelBlocklist(&model, 2));
+}
+
+TEST(Gemma4TextBlocklistTest, HandlesPartialTokenTypeMetadata) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.arch_flags.is_gemma4 = true;
+    model.eos_token_id = 99;
+    model.stop_token_ids = {99};
+    model.vocab_tokens = {"normal", "<unk>", "<|think|>", "<|turn>", "<unused7>", "<0x41>", "<eos>", "plain"};
+    model.token_to_id["normal"] = 0;
+    model.token_to_id["<unk>"] = 1;
+    model.token_to_id["<|think|>"] = 2;
+    model.token_to_id["<|turn>"] = 3;
+    model.token_to_id["<unused7>"] = 4;
+    model.token_to_id["<0x41>"] = 5;
+    model.token_to_id["<eos>"] = 6;
+    model.token_to_id["plain"] = 7;
+    model.token_types = {1, 3, 3, 3};
+
+    const std::vector<int> blocked = DenseCoreTestOnlyGemma4TextBlocklist(&model);
+
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 1), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 2), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 3), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 4), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 5), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 6), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 7), blocked.end());
+    EXPECT_EQ(std::find(blocked.begin(), blocked.end(), 99), blocked.end());
+}
+
+TEST(Gemma4TextBlocklistTest, DetokenizesGenerationChannelTokensLikeLlamaCpp) {
+    TransformerModel model{};
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.vocab_tokens = {"<|channel>", "<channel|>", "<|turn>"};
+    model.token_types = {3, 3, 3};
+
+    EXPECT_EQ(Tokenizer::Detokenize(&model, 0), "<|channel>");
+    EXPECT_EQ(Tokenizer::Detokenize(&model, 1), "<channel|>");
+    EXPECT_EQ(Tokenizer::Detokenize(&model, 2), "");
+}
+
+TEST(LFM2TextBlocklistTest, BlocksSpecialAndChatControlTokens) {
+    TransformerModel model{};
+    model.arch = ModelArch::LFM2;
+    model.variant = ModelVariant::LFM2MOE;
+    model.bos_token_id = 10;
+    model.eos_token_id = 11;
+    model.unk_token_id = 12;
+    model.vocab_tokens = {
+        "hello",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|startoftext|>",
+        "<|endoftext|>",
+        "Paris",
+        "#",
+        "<think>",
+        "</think>",
+        "normal",
+        "<|startoftext|>",
+        "<|endoftext|>",
+        "<unk>",
+    };
+    model.token_types.assign(model.vocab_tokens.size(), 1);
+    model.token_types[1] = 3;
+    model.token_types[2] = 3;
+    model.token_types[3] = 3;
+    model.token_types[4] = 3;
+    model.token_types[7] = 3;
+    model.token_types[8] = 3;
+    for (int i = 0; i < static_cast<int>(model.vocab_tokens.size()); ++i) {
+        model.token_to_id[model.vocab_tokens[static_cast<size_t>(i)]] = i;
+    }
+
+    const std::vector<int> blocked = DenseCoreTestOnlyLFM2TextBlocklist(&model);
+    auto is_blocked = [&](int token_id) {
+        return std::binary_search(blocked.begin(), blocked.end(), token_id);
+    };
+
+    EXPECT_TRUE(is_blocked(1));
+    EXPECT_TRUE(is_blocked(2));
+    EXPECT_TRUE(is_blocked(3));
+    EXPECT_TRUE(is_blocked(4));
+    EXPECT_TRUE(is_blocked(7));
+    EXPECT_TRUE(is_blocked(8));
+    EXPECT_TRUE(is_blocked(10));
+    EXPECT_TRUE(is_blocked(11));
+    EXPECT_TRUE(is_blocked(12));
+    EXPECT_FALSE(is_blocked(0));
+    EXPECT_FALSE(is_blocked(5));
+    EXPECT_FALSE(is_blocked(6));
+}

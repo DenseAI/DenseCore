@@ -1,0 +1,17 @@
+# Markdownlint Configuration
+
+# MD013/line-length - Line length
+MD013:
+  line_length: 120
+  code_blocks: false
+  tables: false
+
+# MD033/no-inline-html - Inline HTML
+MD033: false
+
+# MD041/first-line-h1 - First line in file should be a top level header
+MD041: false
+
+# MD024/no-duplicate-header - Multiple headers with the same content
+MD024:
+  allow_different_nesting: true

@@ -1,0 +1,40 @@
+{
+  "experiment_id": "qwen36-35b-a3b-async-document-v1",
+  "workload_id": "async-document-v1",
+  "workload_sha256": "replace-with-workload-sha256",
+  "model": {
+    "name": "Qwen3.6-35B-A3B",
+    "gguf_sha256": "replace-with-model-sha256",
+    "quantization": "Q4_K_M",
+    "tokenizer_sha256": "replace-with-tokenizer-sha256"
+  },
+  "request_contract": {
+    "endpoint": "/v1/chat/completions",
+    "temperature": 0,
+    "seed": 123,
+    "max_tokens": 256,
+    "stream": true,
+    "stream_options": {"include_usage": true}
+  },
+  "slo": {
+    "p95_ttft_seconds": 15,
+    "p95_e2e_seconds": 45,
+    "minimum_success_rate": 0.99,
+    "minimum_quality_pass_rate": 0.99
+  },
+  "run_protocol": {
+    "warmup_requests": 10,
+    "measured_requests_per_leg": 100,
+    "abba_cycles": 5,
+    "cold_or_warm": "warm",
+    "prompt_cache": "disabled or declared"
+  },
+  "required_artifacts": [
+    "raw.jsonl",
+    "raw.metadata.json",
+    "quality.json",
+    "pricing.json",
+    "hardware.json",
+    "image-or-binary-digest.txt"
+  ]
+}

@@ -1,0 +1,692 @@
+package domain
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+// StreamEvent represents a token event in the stream
+// GenerationCompletion carries native sample usage and the actual termination reason.
+// A nil pointer on StreamEvent denotes a legacy engine without this metadata.
+type GenerationCompletion struct {
+	Tokens       int
+	FinishReason string
+}
+
+type StreamEvent struct {
+	Completion   *GenerationCompletion
+	Token        string
+	TokenID      int
+	IsFinished   bool
+	Terminal     bool
+	Canceled     bool
+	ErrorMessage string
+	Err          error
+}
+
+func NewTerminalEvent(err error) StreamEvent {
+	event := StreamEvent{Terminal: true}
+	if err == nil {
+		event.IsFinished = true
+		return event
+	}
+	event.Err = err
+	event.ErrorMessage = err.Error()
+	event.Canceled = errors.Is(err, context.Canceled)
+	return event
+}
+
+func (e StreamEvent) TerminalError() error {
+	if e.Err != nil {
+		return e.Err
+	}
+	if e.ErrorMessage != "" {
+		return errors.New(e.ErrorMessage)
+	}
+	if e.Canceled {
+		return context.Canceled
+	}
+	return nil
+}
+
+func (e StreamEvent) TerminalSuccess() bool {
+	return e.Terminal && e.TerminalError() == nil
+}
+
+type RenderedChatPrompt struct {
+	RenderedPrompt string
+	TokenizerType  string
+	ChatTemplate   string
+	ModelVariant   string
+	PromptFamily   string
+	Thinking       bool
+}
+
+// OpenAI-compatible request/response structures
+type ChatCompletionRequest struct {
+	Model               string              `json:"model"`
+	Messages            []Message           `json:"messages"`
+	InputIDs            []int               `json:"input_ids,omitempty"`
+	RawPrompt           string              `json:"raw_prompt,omitempty"`
+	LoraAdapter         string              `json:"lora_adapter,omitempty"`
+	ChatTemplateKwargs  *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
+	Tools               []Tool              `json:"tools,omitempty"`
+	ToolChoice          interface{}         `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool               `json:"parallel_tool_calls,omitempty"`
+	CacheControl        *CacheControl       `json:"cache_control,omitempty"`
+	MaxTokens           int                 `json:"max_tokens,omitempty"`
+	Temperature         float64             `json:"temperature,omitempty"`
+	TopP                float64             `json:"top_p,omitempty"`
+	TopK                int                 `json:"top_k,omitempty"`
+	RepetitionPenalty   float64             `json:"repetition_penalty,omitempty"`
+	AllowedTokenIDs     []int               `json:"allowed_token_ids,omitempty"`
+	AllowedTokensStrict bool                `json:"allowed_tokens_strict,omitempty"`
+	DisallowedTokenIDs  []int               `json:"disallowed_token_ids,omitempty"`
+	Stop                []string            `json:"stop,omitempty"`
+	Stream              bool                `json:"stream,omitempty"`
+	StreamOptions       *StreamOptions      `json:"stream_options,omitempty"`
+	ResponseFormat      *ResponseFormat     `json:"response_format,omitempty"`
+	ExpertCluster       []int               `json:"expert_cluster,omitempty"`
+	ParityMode          bool                `json:"parity_mode,omitempty"`
+
+	TemperatureSet       bool `json:"-"`
+	TopPSet              bool `json:"-"`
+	TopKSet              bool `json:"-"`
+	RepetitionPenaltySet bool `json:"-"`
+}
+
+func (r *ChatCompletionRequest) UnmarshalJSON(data []byte) error {
+	type rawChatCompletionRequest struct {
+		Model               string              `json:"model"`
+		Messages            []Message           `json:"messages"`
+		InputIDs            []int               `json:"input_ids,omitempty"`
+		RawPrompt           string              `json:"raw_prompt,omitempty"`
+		LoraAdapter         string              `json:"lora_adapter,omitempty"`
+		ChatTemplateKwargs  *ChatTemplateKwargs `json:"chat_template_kwargs,omitempty"`
+		Tools               []Tool              `json:"tools,omitempty"`
+		ToolChoice          interface{}         `json:"tool_choice,omitempty"`
+		ParallelToolCalls   *bool               `json:"parallel_tool_calls,omitempty"`
+		CacheControl        *CacheControl       `json:"cache_control,omitempty"`
+		MaxTokens           int                 `json:"max_tokens,omitempty"`
+		Temperature         *float64            `json:"temperature,omitempty"`
+		TopP                *float64            `json:"top_p,omitempty"`
+		TopK                *int                `json:"top_k,omitempty"`
+		RepetitionPenalty   *float64            `json:"repetition_penalty,omitempty"`
+		AllowedTokenIDs     []int               `json:"allowed_token_ids,omitempty"`
+		AllowedTokensStrict bool                `json:"allowed_tokens_strict,omitempty"`
+		DisallowedTokenIDs  []int               `json:"disallowed_token_ids,omitempty"`
+		Stop                []string            `json:"stop,omitempty"`
+		Stream              bool                `json:"stream,omitempty"`
+		StreamOptions       *StreamOptions      `json:"stream_options,omitempty"`
+		ResponseFormat      *ResponseFormat     `json:"response_format,omitempty"`
+		ExpertCluster       []int               `json:"expert_cluster,omitempty"`
+		ParityMode          bool                `json:"parity_mode,omitempty"`
+	}
+
+	var raw rawChatCompletionRequest
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	r.Model = raw.Model
+	r.Messages = raw.Messages
+	r.InputIDs = raw.InputIDs
+	r.RawPrompt = raw.RawPrompt
+	r.LoraAdapter = raw.LoraAdapter
+	r.ChatTemplateKwargs = raw.ChatTemplateKwargs
+	r.Tools = raw.Tools
+	r.ToolChoice = raw.ToolChoice
+	r.ParallelToolCalls = raw.ParallelToolCalls
+	r.CacheControl = raw.CacheControl
+	r.MaxTokens = raw.MaxTokens
+	r.AllowedTokenIDs = raw.AllowedTokenIDs
+	r.AllowedTokensStrict = raw.AllowedTokensStrict
+	r.DisallowedTokenIDs = raw.DisallowedTokenIDs
+	r.Stop = raw.Stop
+	r.Stream = raw.Stream
+	r.StreamOptions = raw.StreamOptions
+	r.ResponseFormat = raw.ResponseFormat
+	r.ExpertCluster = raw.ExpertCluster
+	r.ParityMode = raw.ParityMode
+
+	r.TemperatureSet = raw.Temperature != nil
+	if raw.Temperature != nil {
+		r.Temperature = *raw.Temperature
+	} else {
+		r.Temperature = 0
+	}
+
+	r.TopPSet = raw.TopP != nil
+	if raw.TopP != nil {
+		r.TopP = *raw.TopP
+	} else {
+		r.TopP = 0
+	}
+
+	r.TopKSet = raw.TopK != nil
+	if raw.TopK != nil {
+		r.TopK = *raw.TopK
+	} else {
+		r.TopK = 0
+	}
+
+	r.RepetitionPenaltySet = raw.RepetitionPenalty != nil
+	if raw.RepetitionPenalty != nil {
+		r.RepetitionPenalty = *raw.RepetitionPenalty
+	} else {
+		r.RepetitionPenalty = 0
+	}
+
+	return nil
+}
+
+type ResponseFormat struct {
+	Type string `json:"type"` // "text" or "json_object"
+}
+
+// StreamOptions carries OpenAI-compatible optional stream behavior.
+// Usage is emitted only after a successful terminal event when requested.
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
+}
+
+type ChatTemplateKwargs struct {
+	EnableThinking   *bool `json:"enable_thinking,omitempty"`
+	PreserveThinking *bool `json:"preserve_thinking,omitempty"`
+}
+
+type CacheControl struct {
+	Type           string `json:"type,omitempty"`
+	ConversationID string `json:"conversation_id,omitempty"`
+	CacheID        string `json:"cache_id,omitempty"`
+	// AffinityKey is a caller-provided stable routing key for Kubernetes
+	// ingress/gateway hash policies. It is hashed before it is emitted in
+	// response headers or metrics-adjacent logs.
+	AffinityKey string `json:"affinity_key,omitempty"`
+}
+
+type Message struct {
+	Role             string         `json:"role"`
+	Content          string         `json:"-"`
+	ContentParts     []ContentPart  `json:"-"`
+	ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`
+	ToolResponses    []ToolResponse `json:"tool_responses,omitempty"`
+	ToolCallID       string         `json:"tool_call_id,omitempty"`
+	Name             string         `json:"name,omitempty"`
+	ReasoningContent string         `json:"reasoning_content,omitempty"`
+}
+
+type ContentPart struct {
+	Type     string `json:"type,omitempty"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+	Image    string `json:"image,omitempty"`
+	Video    string `json:"video,omitempty"`
+	Audio    string `json:"audio,omitempty"`
+	URL      string `json:"url,omitempty"`
+}
+
+type ToolResponse struct {
+	Name     string      `json:"name,omitempty"`
+	Response interface{} `json:"response,omitempty"`
+}
+
+func (m *Message) UnmarshalJSON(data []byte) error {
+	type rawMessage struct {
+		Role             string          `json:"role"`
+		Content          json.RawMessage `json:"content"`
+		ToolCalls        []ToolCall      `json:"tool_calls,omitempty"`
+		ToolResponses    []ToolResponse  `json:"tool_responses,omitempty"`
+		ToolCallID       string          `json:"tool_call_id,omitempty"`
+		Name             string          `json:"name,omitempty"`
+		ReasoningContent string          `json:"reasoning_content,omitempty"`
+	}
+
+	var raw rawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	m.Role = raw.Role
+	m.ToolCalls = raw.ToolCalls
+	m.ToolResponses = raw.ToolResponses
+	m.ToolCallID = raw.ToolCallID
+	m.Name = raw.Name
+	m.ReasoningContent = raw.ReasoningContent
+	m.Content = ""
+	m.ContentParts = nil
+
+	if len(raw.Content) == 0 || string(raw.Content) == "null" {
+		return nil
+	}
+
+	if raw.Content[0] == '"' {
+		if err := json.Unmarshal(raw.Content, &m.Content); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if raw.Content[0] == '[' {
+		if err := json.Unmarshal(raw.Content, &m.ContentParts); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	return fmt.Errorf("unsupported message content shape")
+}
+
+func (m Message) MarshalJSON() ([]byte, error) {
+	type rawMessage struct {
+		Role             string         `json:"role"`
+		Content          interface{}    `json:"content,omitempty"`
+		ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`
+		ToolResponses    []ToolResponse `json:"tool_responses,omitempty"`
+		ToolCallID       string         `json:"tool_call_id,omitempty"`
+		Name             string         `json:"name,omitempty"`
+		ReasoningContent string         `json:"reasoning_content,omitempty"`
+	}
+	var content interface{}
+	if len(m.ContentParts) > 0 {
+		content = m.ContentParts
+	} else {
+		content = m.Content
+	}
+	return json.Marshal(rawMessage{
+		Role:             m.Role,
+		Content:          content,
+		ToolCalls:        m.ToolCalls,
+		ToolResponses:    m.ToolResponses,
+		ToolCallID:       m.ToolCallID,
+		Name:             m.Name,
+		ReasoningContent: m.ReasoningContent,
+	})
+}
+
+func (m Message) HasStructuredContent() bool {
+	return len(m.ContentParts) > 0
+}
+
+func (m Message) HasNonTextStructuredContent() bool {
+	if !m.HasStructuredContent() {
+		return false
+	}
+	for _, part := range m.ContentParts {
+		if part.Text != "" {
+			continue
+		}
+		if part.Type == "image" || part.Image != "" || part.ImageURL != "" || part.URL != "" {
+			return true
+		}
+		if part.Type == "video" || part.Video != "" {
+			return true
+		}
+		if part.Type == "audio" || part.Audio != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (m Message) FlattenedText() string {
+	if !m.HasStructuredContent() {
+		return m.Content
+	}
+	var sb strings.Builder
+	for _, part := range m.ContentParts {
+		switch {
+		case part.Text != "":
+			sb.WriteString(part.Text)
+		case part.Type == "image" || part.Image != "" || part.ImageURL != "" || part.URL != "":
+			sb.WriteString("[image]")
+		case part.Type == "video" || part.Video != "":
+			sb.WriteString("[video]")
+		case part.Type == "audio" || part.Audio != "":
+			sb.WriteString("[audio]")
+		}
+	}
+	return sb.String()
+}
+
+type ChatCompletionResponse struct {
+	ID      string   `json:"id"`
+	Object  string   `json:"object"`
+	Created int64    `json:"created"`
+	Model   string   `json:"model"`
+	Choices []Choice `json:"choices"`
+	Usage   Usage    `json:"usage"`
+}
+
+type CompletionRequest struct {
+	Model               string          `json:"model"`
+	Prompt              string          `json:"prompt"`
+	MaxTokens           int             `json:"max_tokens,omitempty"`
+	Temperature         float64         `json:"temperature,omitempty"`
+	TopP                float64         `json:"top_p,omitempty"`
+	TopK                int             `json:"top_k,omitempty"`
+	RepetitionPenalty   float64         `json:"repetition_penalty,omitempty"`
+	AllowedTokenIDs     []int           `json:"allowed_token_ids,omitempty"`
+	AllowedTokensStrict bool            `json:"allowed_tokens_strict,omitempty"`
+	DisallowedTokenIDs  []int           `json:"disallowed_token_ids,omitempty"`
+	Stop                []string        `json:"stop,omitempty"`
+	Stream              bool            `json:"stream,omitempty"`
+	ResponseFormat      *ResponseFormat `json:"response_format,omitempty"`
+	ExpertCluster       []int           `json:"expert_cluster,omitempty"`
+	ParityMode          bool            `json:"parity_mode,omitempty"`
+
+	TemperatureSet       bool `json:"-"`
+	TopPSet              bool `json:"-"`
+	TopKSet              bool `json:"-"`
+	RepetitionPenaltySet bool `json:"-"`
+}
+
+func (r *CompletionRequest) UnmarshalJSON(data []byte) error {
+	type rawCompletionRequest struct {
+		Model               string          `json:"model"`
+		Prompt              string          `json:"prompt"`
+		MaxTokens           int             `json:"max_tokens,omitempty"`
+		Temperature         *float64        `json:"temperature,omitempty"`
+		TopP                *float64        `json:"top_p,omitempty"`
+		TopK                *int            `json:"top_k,omitempty"`
+		RepetitionPenalty   *float64        `json:"repetition_penalty,omitempty"`
+		AllowedTokenIDs     []int           `json:"allowed_token_ids,omitempty"`
+		AllowedTokensStrict bool            `json:"allowed_tokens_strict,omitempty"`
+		DisallowedTokenIDs  []int           `json:"disallowed_token_ids,omitempty"`
+		Stop                []string        `json:"stop,omitempty"`
+		Stream              bool            `json:"stream,omitempty"`
+		ResponseFormat      *ResponseFormat `json:"response_format,omitempty"`
+		ExpertCluster       []int           `json:"expert_cluster,omitempty"`
+		ParityMode          bool            `json:"parity_mode,omitempty"`
+	}
+
+	var raw rawCompletionRequest
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	r.Model = raw.Model
+	r.Prompt = raw.Prompt
+	r.MaxTokens = raw.MaxTokens
+	r.AllowedTokenIDs = raw.AllowedTokenIDs
+	r.AllowedTokensStrict = raw.AllowedTokensStrict
+	r.DisallowedTokenIDs = raw.DisallowedTokenIDs
+	r.Stop = raw.Stop
+	r.Stream = raw.Stream
+	r.ResponseFormat = raw.ResponseFormat
+	r.ExpertCluster = raw.ExpertCluster
+	r.ParityMode = raw.ParityMode
+
+	r.TemperatureSet = raw.Temperature != nil
+	if raw.Temperature != nil {
+		r.Temperature = *raw.Temperature
+	}
+
+	r.TopPSet = raw.TopP != nil
+	if raw.TopP != nil {
+		r.TopP = *raw.TopP
+	}
+
+	r.TopKSet = raw.TopK != nil
+	if raw.TopK != nil {
+		r.TopK = *raw.TopK
+	}
+
+	r.RepetitionPenaltySet = raw.RepetitionPenalty != nil
+	if raw.RepetitionPenalty != nil {
+		r.RepetitionPenalty = *raw.RepetitionPenalty
+	}
+
+	return nil
+}
+
+type Choice struct {
+	Index        int     `json:"index"`
+	Message      Message `json:"message"`
+	FinishReason string  `json:"finish_reason"`
+}
+
+type CompletionResponse struct {
+	ID      string             `json:"id"`
+	Object  string             `json:"object"`
+	Created int64              `json:"created"`
+	Model   string             `json:"model"`
+	Choices []CompletionChoice `json:"choices"`
+	Usage   Usage              `json:"usage"`
+}
+
+type CompletionChoice struct {
+	Index        int    `json:"index"`
+	Text         string `json:"text"`
+	FinishReason string `json:"finish_reason"`
+}
+
+type ChatCompletionChunk struct {
+	ID      string        `json:"id"`
+	Object  string        `json:"object"`
+	Created int64         `json:"created"`
+	Model   string        `json:"model"`
+	Choices []ChunkChoice `json:"choices"`
+	Usage   *Usage        `json:"usage,omitempty"`
+}
+
+type CompletionChunk struct {
+	ID      string                  `json:"id"`
+	Object  string                  `json:"object"`
+	Created int64                   `json:"created"`
+	Model   string                  `json:"model"`
+	Choices []CompletionChunkChoice `json:"choices"`
+}
+
+type CompletionChunkChoice struct {
+	Index        int         `json:"index"`
+	Text         string      `json:"text"`
+	FinishReason interface{} `json:"finish_reason"`
+}
+
+type ChunkChoice struct {
+	Index        int         `json:"index"`
+	Delta        ChunkDelta  `json:"delta"`
+	FinishReason interface{} `json:"finish_reason"`
+}
+
+type ChunkDelta struct {
+	Role             string          `json:"role,omitempty"`
+	Content          string          `json:"content,omitempty"`
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCallDelta `json:"tool_calls,omitempty"`
+}
+
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+type ErrorResponse struct {
+	Error ErrorDetail `json:"error"`
+}
+
+type ErrorDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code"`
+}
+
+// Embedding structures
+type EmbeddingRequest struct {
+	Model          string      `json:"model"`
+	Input          interface{} `json:"input"`                     // string or []string
+	PoolingType    string      `json:"pooling_type,omitempty"`    // mean, cls, last, max
+	Normalize      *bool       `json:"normalize,omitempty"`       // L2 normalize (default: true)
+	EncodingFormat string      `json:"encoding_format,omitempty"` // float (default) or base64
+}
+
+// GetInputTexts extracts texts from Input field
+func (r *EmbeddingRequest) GetInputTexts() []string {
+	switch v := r.Input.(type) {
+	case string:
+		return []string{v}
+	case []interface{}:
+		texts := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				texts = append(texts, s)
+			}
+		}
+		return texts
+	default:
+		return nil
+	}
+}
+
+type EmbeddingResponse struct {
+	Object string          `json:"object"`
+	Data   []EmbeddingData `json:"data"`
+	Model  string          `json:"model"`
+	Usage  Usage           `json:"usage"`
+}
+
+type EmbeddingData struct {
+	Object    string    `json:"object"`
+	Embedding []float32 `json:"embedding"`
+	Index     int       `json:"index"`
+}
+
+// DetailedMetrics structure
+type DetailedMetrics struct {
+	// Request metrics
+	ActiveRequests    int   `json:"active_requests"`
+	TotalRequests     int64 `json:"total_requests"`
+	CompletedRequests int64 `json:"completed_requests"`
+	FailedRequests    int64 `json:"failed_requests"`
+	PendingRequests   int   `json:"pending_requests"`
+
+	// Token metrics
+	TotalTokensGenerated int64   `json:"total_tokens_generated"`
+	TotalPromptTokens    int64   `json:"total_prompt_tokens"`
+	TokensPerSecond      float32 `json:"tokens_per_second"`
+
+	// Latency metrics (milliseconds)
+	AvgTimeToFirstToken float32 `json:"avg_time_to_first_token_ms"`
+	P50TimeToFirstToken float32 `json:"p50_time_to_first_token_ms"`
+	P90TimeToFirstToken float32 `json:"p90_time_to_first_token_ms"`
+	P99TimeToFirstToken float32 `json:"p99_time_to_first_token_ms"`
+
+	AvgInterTokenLatency float32 `json:"avg_inter_token_latency_ms"`
+	P50InterTokenLatency float32 `json:"p50_inter_token_latency_ms"`
+	P90InterTokenLatency float32 `json:"p90_inter_token_latency_ms"`
+	P99InterTokenLatency float32 `json:"p99_inter_token_latency_ms"`
+
+	AvgQueueWaitTime float32 `json:"avg_queue_wait_time_ms"`
+	P99QueueWaitTime float32 `json:"p99_queue_wait_time_ms"`
+
+	// KV Cache metrics
+	KVCacheUsageBlocks  int     `json:"kv_cache_usage_blocks"`
+	KVCacheTotalBlocks  int     `json:"kv_cache_total_blocks"`
+	KVCacheUsagePercent float32 `json:"kv_cache_usage_percent"`
+
+	// Batch metrics
+	AvgBatchSize     float32 `json:"avg_batch_size"`
+	CurrentBatchSize int     `json:"current_batch_size"`
+
+	// Error metrics
+	OOMErrors     int `json:"oom_errors"`
+	TimeoutErrors int `json:"timeout_errors"`
+}
+
+// Rerank structures (Cohere-compatible)
+type RerankRequest struct {
+	Model           string        `json:"model"`
+	Query           string        `json:"query"`
+	Documents       []interface{} `json:"documents"` // string or RerankDocument
+	TopN            int           `json:"top_n,omitempty"`
+	ReturnDocuments bool          `json:"return_documents,omitempty"`
+}
+
+// GetDocumentTexts extracts texts from Documents field
+func (r *RerankRequest) GetDocumentTexts() []string {
+	texts := make([]string, 0, len(r.Documents))
+	for _, doc := range r.Documents {
+		switch v := doc.(type) {
+		case string:
+			texts = append(texts, v)
+		case map[string]interface{}:
+			if text, ok := v["text"].(string); ok {
+				texts = append(texts, text)
+			}
+		}
+	}
+	return texts
+}
+
+type RerankResponse struct {
+	ID      string         `json:"id"`
+	Results []RerankResult `json:"results"`
+	Model   string         `json:"model"`
+	Usage   Usage          `json:"usage,omitempty"`
+}
+
+type RerankResult struct {
+	Index          int             `json:"index"`
+	RelevanceScore float32         `json:"relevance_score"`
+	Document       *RerankDocument `json:"document,omitempty"`
+}
+
+type RerankDocument struct {
+	Text string `json:"text"`
+}
+
+// Function Calling structures
+type Tool struct {
+	Type     string       `json:"type"` // "function"
+	Function ToolFunction `json:"function"`
+}
+
+type ToolFunction struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description,omitempty"`
+	Parameters  map[string]interface{} `json:"parameters,omitempty"`
+}
+
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"` // "function"
+	Function ToolCallFunction `json:"function"`
+}
+
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"` // JSON string
+}
+
+type ToolCallDelta struct {
+	Index    int                   `json:"index"`
+	ID       string                `json:"id,omitempty"`
+	Type     string                `json:"type,omitempty"`
+	Function ToolCallDeltaFunction `json:"function,omitempty"`
+}
+
+type ToolCallDeltaFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+// Extended Message with tool support
+type MessageWithTools struct {
+	Role       string     `json:"role"` // system, user, assistant, tool
+	Content    *string    `json:"content,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
+}
+
+// Extended ChatCompletionRequest with tools
+type ChatCompletionRequestWithTools struct {
+	ChatCompletionRequest
+	Tools      []Tool      `json:"tools,omitempty"`
+	ToolChoice interface{} `json:"tool_choice,omitempty"` // "none", "auto", "required", or object
+}

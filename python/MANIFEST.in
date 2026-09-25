@@ -1,0 +1,32 @@
+# Include bundled C++ source (populated by setup.py during sdist)
+recursive-include densecore/core_src *
+prune densecore/core_src/_deps
+prune densecore/core_src/build
+prune densecore/core_src/lib
+prune densecore/core_src/bin
+prune densecore/core_src/CMakeFiles
+prune densecore/core_src/Testing
+prune densecore/core_src/cmake-build-debug
+global-exclude *.so
+global-exclude *.so.*
+global-exclude *.dylib
+global-exclude *.dylib.*
+
+# Include PEP 561 type hints
+include densecore/py.typed
+include densecore/prompt_profiles.json
+
+# Include documentation and license (copied by setup.py sdist if needed)
+include README.md
+include LICENSE
+include NOTICE
+include THIRD_PARTY_NOTICES.md
+recursive-include licenses *
+
+# Exclude build artifacts
+prune tests
+global-exclude *.pyc
+global-exclude __pycache__
+global-exclude .DS_Store
+prune densecore/core_src/.cache
+prune densecore/core_src/build_mimalloc

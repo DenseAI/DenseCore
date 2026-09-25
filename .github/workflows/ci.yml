@@ -1,0 +1,199 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'core/**'
+      - 'server/**'
+      - 'python/**'
+      - 'charts/densecore/**'
+      - 'docker/**'
+      - 'scripts/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'Makefile'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'core/**'
+      - 'server/**'
+      - 'python/**'
+      - 'charts/densecore/**'
+      - 'docker/**'
+      - 'scripts/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'Makefile'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # C++ Core Library Build and Test
+  version-consistency:
+    name: Check Version Metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Check version metadata
+        run: bash scripts/check_version_consistency.sh 0.1.0
+
+  cpp-build:
+    name: Build and Test C++ Core
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # libnuma/hwloc are required for the NUMA code paths to be compiled at
+          # all. Without them CMake silently selects the sysfs fallback and the
+          # NUMA sources never see a compiler, so syntax rot goes unnoticed.
+          sudo apt-get install -y cmake build-essential libnuma-dev libhwloc-dev
+
+      - name: Configure CMake
+        run: |
+          cd core
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DDENSECORE_BUILD_TESTS=ON -DDENSECORE_LTO=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 2>&1 | tee cmake-configure.log
+
+      - name: Verify NUMA support is compiled in
+        run: |
+          # Fail loudly rather than let a missing dependency quietly downgrade
+          # the build to the non-NUMA fallback.
+          if ! grep -q "NUMA support enabled" core/build/cmake-configure.log; then
+            echo "::error::CMake did not enable NUMA support - NUMA code paths would not be compiled"
+            grep -i "numa" core/build/cmake-configure.log || true
+            exit 1
+          fi
+
+      - name: Build C++ library
+        run: |
+          cd core/build
+          cmake --build . -j$(nproc)
+
+      - name: Run C++ tests
+        run: |
+          ctest --test-dir core/build --output-on-failure
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: libdensecore-linux
+          path: |
+            core/build/libdensecore.so*
+            core/build/libggml*.so*
+          if-no-files-found: error
+          retention-days: 7
+
+  # Python SDK Test
+  python-test:
+    name: Test Python SDK
+    runs-on: ubuntu-latest
+    needs: cpp-build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Download C++ artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: libdensecore-linux
+          path: python/densecore/
+
+      - name: Install Python package and test deps
+        working-directory: python
+        run: |
+          python -m pip install --upgrade pip
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) pip install -e ".[dev,langchain]"
+
+      - name: Run Python tests
+        working-directory: python
+        run: |
+          pytest -q
+
+  go-test:
+    name: Test Go Server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libnuma-dev libhwloc-dev
+
+      - name: Build DenseCore runtime for cgo tests
+        run: |
+          cmake -S core -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDENSECORE_BUILD_TESTS=OFF \
+            -DDENSECORE_LTO=ON
+          cmake --build build -j$(nproc)
+
+      - name: Run Go tests
+        working-directory: server
+        run: |
+          export CGO_CFLAGS="-I${GITHUB_WORKSPACE}/core/include"
+          export CGO_LDFLAGS="-L${GITHUB_WORKSPACE}/build -ldensecore -lstdc++ -ldl"
+          export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/build:${LD_LIBRARY_PATH:-}"
+          go test -mod=mod ./...
+          go test -mod=mod -race ./...
+
+  # Docker Build Test
+  docker-build:
+    name: Test Docker Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          tags: densecore:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

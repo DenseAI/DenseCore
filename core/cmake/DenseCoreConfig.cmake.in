@@ -1,0 +1,23 @@
+@PACKAGE_INIT@
+
+set_and_check(DenseCore_INCLUDE_DIR "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
+set_and_check(DenseCore_LIBRARY_DIR "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@")
+set_and_check(DenseCore_BINARY_DIR "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_BINDIR@")
+
+if(NOT TARGET DenseCore::densecore)
+    add_library(DenseCore::densecore SHARED IMPORTED)
+    set_target_properties(DenseCore::densecore PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${DenseCore_INCLUDE_DIR}"
+    )
+
+    if(WIN32)
+        set_target_properties(DenseCore::densecore PROPERTIES
+            IMPORTED_LOCATION "${DenseCore_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}densecore${CMAKE_SHARED_LIBRARY_SUFFIX}"
+            IMPORTED_IMPLIB "${DenseCore_LIBRARY_DIR}/${CMAKE_IMPORT_LIBRARY_PREFIX}densecore${CMAKE_IMPORT_LIBRARY_SUFFIX}"
+        )
+    else()
+        set_target_properties(DenseCore::densecore PROPERTIES
+            IMPORTED_LOCATION "${DenseCore_LIBRARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}densecore${CMAKE_SHARED_LIBRARY_SUFFIX}"
+        )
+    endif()
+endif()

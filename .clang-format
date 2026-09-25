@@ -1,0 +1,60 @@
+# DenseCore C++ Style Configuration
+# Based on Google style with modifications for embedded/performance code
+
+BasedOnStyle: Google
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -4
+NamespaceIndentation: None
+IndentCaseLabels: false
+IndentPPDirectives: None
+
+# Line length
+ColumnLimit: 100
+
+# Braces
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+
+# Alignment
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignTrailingComments: true
+AlignOperands: true
+AlignAfterOpenBracket: Align
+
+# Includes
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<[^/]*\.h>'      # C system headers
+    Priority: 1
+  - Regex: '^<.*>'            # C++ standard headers
+    Priority: 2
+  - Regex: '^"densecore/.*"'  # Project headers
+    Priority: 3
+  - Regex: '^".*"'            # Other local headers
+    Priority: 4
+
+# Pointers and references
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+# Modern C++ features
+Standard: c++17
+Cpp11BracedListStyle: true
+
+# Other
+SpaceAfterCStyleCast: false
+SpaceBeforeParens: ControlStatements
+SpacesInAngles: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+ReflowComments: true

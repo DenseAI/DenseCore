@@ -1,0 +1,76 @@
+# Git
+.git/
+.gitignore
+
+# IDEs
+.idea/
+.vscode/
+.claude/
+.headers/
+
+# Private release and research workspace
+private/
+
+# Build artifacts
+build/
+build-*/
+cmake-build-*/
+_deps/
+Testing/
+graphify-out/
+workspace/
+**/build/
+**/build-*/
+**/cmake-build-*/
+**/_deps/
+**/Testing/
+**/graphify-out/
+bin/
+*.so
+*.a
+*.o
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.venv-*/
+**/.venv/
+**/.venv-*/
+venv/
+env/
+.env
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+python/densecore/core_src/
+python/densecore-*/
+
+# Go
+server/descore-server
+
+# Models (mount them at runtime, don't build them in)
+models/
+*.gguf
+
+# Benchmark artifacts are not runtime build inputs
+benchmarks/
+
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# K8s
+k8s/
+
+# Documentation
+docs/
+examples/
+
+# Scripts used while building the runtime image
+scripts/*
+!scripts/collect_release_licenses.sh

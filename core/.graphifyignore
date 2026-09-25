@@ -1,0 +1,10 @@
+tests/
+third_party/
+_deps/
+build/
+bin/
+lib/
+cmake-build-debug/
+Testing/
+shaders/
+.cache/

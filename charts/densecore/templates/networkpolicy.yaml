@@ -1,0 +1,65 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $base := index .Values "dense-base" -}}
+{{- $ctx := dict "root" . "values" $base -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dense-base.fullname" $ctx }}
+  labels:
+    {{- include "dense-base.labels" $ctx | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dense-base.selectorLabels" $ctx | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if .Values.networkPolicy.egressRules }}
+    - Egress
+    {{- end }}
+  ingress:
+    # Allow traffic from ingress controller
+    {{- if .Values.networkPolicy.allowIngressController }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressControllerNamespaceLabels | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+        {{- if $base.grpc.enabled }}
+        - protocol: TCP
+          port: {{ $base.grpc.port }}
+        {{- end }}
+    {{- end }}
+    # Allow traffic from same namespace by default
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+        {{- if $base.grpc.enabled }}
+        - protocol: TCP
+          port: {{ $base.grpc.port }}
+        {{- end }}
+    # Allow Prometheus scraping
+    {{- if $base.serviceMonitor.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.monitoringNamespaceLabels | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+        {{- if $base.grpc.enabled }}
+        - protocol: TCP
+          port: {{ $base.grpc.port }}
+        {{- end }}
+    {{- end }}
+    {{- with .Values.networkPolicy.additionalIngressRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.networkPolicy.egressRules }}
+  egress:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

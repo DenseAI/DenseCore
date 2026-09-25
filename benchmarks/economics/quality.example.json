@@ -1,0 +1,7 @@
+{
+  "passed": false,
+  "gate": "replace-with-real-server-quality-command",
+  "model_sha256": "replace-with-model-sha256",
+  "server_commit": "replace-with-commit",
+  "notes": "Set passed=true only after the exact measured server image passes deterministic and long-form checks."
+}

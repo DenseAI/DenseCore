@@ -1,0 +1,201 @@
+name: Docker Build and Push
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: 'Push the image to Docker Hub'
+        required: true
+        type: boolean
+      version:
+        description: 'Release version without the v prefix'
+        required: true
+        type: string
+      source_ref:
+        description: 'Git ref to build'
+        required: false
+        type: string
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Push the image to Docker Hub'
+        required: true
+        type: boolean
+        default: false
+      version:
+        description: 'Version metadata to validate and embed'
+        required: true
+        type: string
+        default: '0.1.0'
+      source_ref:
+        description: 'Git ref to build; defaults to the dispatched ref'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: denseai/densecore
+
+jobs:
+  verify-main:
+    name: Verify tag is on main branch
+    runs-on: ubuntu-latest
+    if: inputs.publish
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Check if tag is on main branch
+        run: |
+          TAG_SHA=$(git rev-parse HEAD)
+          if git merge-base --is-ancestor "$TAG_SHA" origin/main; then
+            echo "Tag is on main branch"
+          else
+            echo "Tag is NOT on main branch - deployment blocked" >&2
+            exit 1
+          fi
+
+  docker:
+    name: Build, scan, and publish Docker image
+    runs-on: ubuntu-latest
+    needs: [verify-main]
+    if: always() && (needs.verify-main.result == 'success' || needs.verify-main.result == 'skipped')
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Check release version metadata
+        run: bash scripts/check_version_consistency.sh "${{ inputs.version }}"
+
+      - name: Validate release CPU target mappings
+        run: |
+          set -euo pipefail
+          for target in portable amd64-v3 arm64; do
+            bash scripts/resolve_release_cpu_target.sh "$target"
+          done
+          if bash scripts/resolve_release_cpu_target.sh native; then
+            echo "native must not be accepted as a publishable Docker CPU target" >&2
+            exit 1
+          fi
+
+      - name: Build local amd64 image for blocking scan
+        # All published CPU profiles use the same source revision, runtime base,
+        # and package/dependency closure. The profile changes only deterministic
+        # compiler ISA flags, so this representative image owns the shared Trivy gate.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: densecore:scan
+          build-args: |
+            VERSION=${{ inputs.version }}
+            COMMIT_SHA=${{ github.sha }}
+            DENSECORE_CPU_TARGET=portable
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run blocking Trivy image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: densecore:scan
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Verify container runtime payload
+        run: docker run --rm densecore:scan --help
+
+      - name: Download pinned release smoke model
+        run: |
+          curl --fail --location --retry 3 \
+            --output /tmp/Qwen3.5-0.8B-Q4_K_M.gguf \
+            https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-GGUF/resolve/7925ccdc665d4efdb1034791e6b553e11128e6f8/Qwen3.5-0.8B-Q4_K_M.gguf
+          echo 'f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec  /tmp/Qwen3.5-0.8B-Q4_K_M.gguf' \
+            | sha256sum --check --strict
+
+      - name: Run real-model container serving and shutdown smoke
+        run: bash scripts/container_model_smoke.sh densecore:scan /tmp/Qwen3.5-0.8B-Q4_K_M.gguf 18080
+
+      - name: Upload Trivy scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+
+      - name: Require Docker Hub credentials for publishing
+        if: inputs.publish
+        run: |
+          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
+            echo "Docker Hub credentials are required for publishing" >&2
+            exit 1
+          fi
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: inputs.publish
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ inputs.version }}
+            type=raw,value=latest,enable=${{ inputs.publish && !contains(inputs.version, '-') }}
+            type=sha,prefix={{branch}}-
+
+      - name: Build and push qualified amd64 image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ inputs.publish }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ inputs.version }}
+            COMMIT_SHA=${{ github.sha }}
+            DENSECORE_CPU_TARGET=portable
+
+      - name: Update Docker Hub description
+        if: inputs.publish
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.IMAGE_NAME }}
+          short-description: ${{ github.event.repository.description }}
+          readme-filepath: ./README.md
+        continue-on-error: true

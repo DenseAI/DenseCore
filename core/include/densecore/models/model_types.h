@@ -1,0 +1,780 @@
+#ifndef DENSECORE_MODEL_TYPES_H
+#define DENSECORE_MODEL_TYPES_H
+
+#include <ggml-backend.h>
+#include <ggml.h>
+#include <gguf.h>
+
+#include <array>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "densecore/llm/weights/prepared_weights.h"
+#include "densecore/hal/tensor.h"
+#include "densecore/memory/numa_allocator.h"
+#include "densecore/llm/ssm/state_types.h"
+
+namespace densecore::runtime {
+enum class DenseCoreTensorRole : int;
+}
+
+// ============================================================================
+// Model Architecture Enum
+// ============================================================================
+// Explicit enumeration of supported model architectures for fail-fast
+// validation and architecture-specific code paths.
+// ============================================================================
+enum class ModelArch : uint8_t {
+    UNKNOWN = 0,
+    // LLM Architectures
+    LLAMA,
+    QWEN2,
+    QWEN3,
+    GLM4_MOE,
+    GLM5_DSA,
+    MISTRAL,
+    GEMMA,
+    PHI,
+    BERT,
+
+    // Vision Architectures
+    VIT,          // Vision Transformer (ViT-B/L/H)
+    CLIP_VISION,  // CLIP Vision Encoder
+    SIGLIP,       // SigLIP Vision Encoder
+
+    // Audio Architectures
+    WHISPER,  // Whisper (encoder-decoder)
+
+    // Hybrid SSM-Transformer Architectures
+    QWEN35,  // Qwen3.5 (Mamba2 SSM + Attention hybrid)
+
+    // Hybrid Conv-Transformer Architectures
+    LFM2,  // LFM2 / LFM2.5 (double-gated short conv + GQA attention, MoE FFN)
+
+    // Multimodal Architectures
+    LLAVA,    // LLaVA (LLM + Vision)
+    QWEN_VL,  // Qwen-VL (LLM + Vision)
+};
+
+enum class ModelVariant : uint8_t {
+    UNKNOWN = 0,
+    LLAMA,
+    QWEN2,
+    QWEN3,
+    QWEN3NEXT,
+    QWEN35,
+    QWEN36,
+    QWEN38,
+    LFM2MOE,
+    GLM4_MOE,
+    GLM5_DSA,
+    MISTRAL,
+    GEMMA,
+    GEMMA4,
+    PHI,
+    BERT,
+    VIT,
+    CLIP_VISION,
+    SIGLIP,
+    WHISPER,
+    LLAVA,
+    QWEN_VL,
+};
+
+// Architecture-specific feature flags
+// These flags enable explicit checks instead of implicit null-pointer guards
+struct ModelArchFlags {
+    bool requires_q_norm = false;            // Qwen3: RMS norm on Q before attention
+    bool requires_k_norm = false;            // Qwen3: RMS norm on K before attention
+    bool is_hybrid_ssm = false;              // Qwen3.5: Mamba2 SSM + Attention hybrid
+    bool is_lfm2_shortconv = false;          // LFM2/LFM2.5: double-gated short conv + GQA attention hybrid
+    bool is_glm_moe = false;                 // GLM-4.5/5: grouped MoE routing + shared experts
+    bool is_glm_dsa = false;                 // GLM-5: MLA + DSA attention path
+    bool is_gemma4 = false;                  // Gemma4: alternate KV-head metadata and MoE routing
+    bool uses_unit_offset_rms_norm = false;  // Gemma1/2-style RMSNorm uses (1 + weight)
+};
+
+// Forward declaration for RoPE table (defined in densecore/simd/simd_ops.h)
+namespace densecore {
+namespace simd {
+struct RoPETable;
+}  // namespace simd
+namespace models {
+struct DecoderModelSpec;
+}  // namespace models
+}  // namespace densecore
+
+// ============================================================================
+// Vision Model Hyperparameters
+// ============================================================================
+struct VisionHParams {
+    uint32_t image_size = 224;       // Input image size (224, 336, 448, etc.)
+    uint32_t patch_size = 16;        // Patch size (14, 16, 32)
+    uint32_t n_channels = 3;         // Input channels (RGB=3)
+    uint32_t n_embd = 768;           // Hidden dimension
+    uint32_t n_head = 12;            // Attention heads
+    uint32_t n_layer = 12;           // Transformer layers
+    uint32_t n_intermediate = 3072;  // MLP intermediate size
+    bool use_cls_token = true;       // Whether model uses CLS token
+    float layer_norm_eps = 1e-6f;    // LayerNorm epsilon
+
+    // Computed fields
+    uint32_t n_patches() const { return (image_size / patch_size) * (image_size / patch_size); }
+    uint32_t seq_length() const { return n_patches() + (use_cls_token ? 1 : 0); }
+};
+
+// ============================================================================
+// Whisper Model Hyperparameters
+// ============================================================================
+struct WhisperHParams {
+    // Audio preprocessing
+    uint32_t n_mels = 80;          // Mel spectrogram bins
+    uint32_t n_fft = 400;          // FFT window size
+    uint32_t hop_length = 160;     // Hop length (10ms at 16kHz)
+    uint32_t sample_rate = 16000;  // Audio sample rate
+
+    // Encoder
+    uint32_t n_audio_ctx = 1500;   // Max audio context (30s / 20ms)
+    uint32_t n_audio_layer = 4;    // Encoder layers
+    uint32_t n_audio_head = 6;     // Encoder attention heads
+    uint32_t n_audio_state = 384;  // Encoder hidden dimension
+
+    // Decoder
+    uint32_t n_text_ctx = 448;    // Max text context
+    uint32_t n_text_layer = 4;    // Decoder layers
+    uint32_t n_text_head = 6;     // Decoder attention heads
+    uint32_t n_text_state = 384;  // Decoder hidden dimension
+    uint32_t n_vocab = 51865;     // Vocabulary size
+
+    float layer_norm_eps = 1e-5f;
+};
+
+// Transformer hyperparameters
+struct TransformerHParams {
+    uint32_t n_vocab = 32000;
+    uint32_t n_ctx = 512;
+    uint32_t n_embd = 4096;
+    uint32_t n_head = 32;
+    uint32_t n_head_kv = 32;
+    uint32_t n_layer = 32;
+    uint32_t n_rot = 64;
+
+    // llama.cpp style: separate head dimensions for K and V
+    // Allows models like Qwen3 where head_dim != n_embd/n_head
+    // If 0, will be auto-computed from weight tensor shapes
+    uint32_t n_embd_head_k = 0;  // K head dimension
+    uint32_t n_embd_head_v = 0;  // V head dimension
+
+    // MoE (Mixture of Experts) configuration
+    uint32_t n_experts = 0;       // Total experts (0 = dense model)
+    uint32_t n_experts_used = 0;  // Experts per token (top-k)
+    uint32_t n_ff = 0;            // FFN intermediate dimension
+
+    float f_norm_rms_eps = 1e-5f;
+    float f_attention_scale = 0.0f;
+    float rope_freq_base = 10000.0f;
+    float rope_freq_scale = 1.0f;
+    std::array<int32_t, 4> rope_sections = {0, 0, 0, 0};
+    bool rope_mrope_interleaved = false;
+};
+
+// Canonical per-layer tensor keys (GGUF-agnostic, used by graph builders)
+namespace model_keys {
+static constexpr const char* kAttnQWeight = "attn_q.weight";
+static constexpr const char* kAttnKWeight = "attn_k.weight";
+static constexpr const char* kAttnVWeight = "attn_v.weight";
+static constexpr const char* kAttnOWeight = "attn_output.weight";
+static constexpr const char* kAttnQAProj = "attn_q_a.weight";
+static constexpr const char* kAttnQANorm = "attn_q_a_norm.weight";
+static constexpr const char* kAttnQBProj = "attn_q_b.weight";
+static constexpr const char* kAttnKvAProj = "attn_kv_a.weight";
+static constexpr const char* kAttnKvANorm = "attn_kv_a_norm.weight";
+static constexpr const char* kAttnKvBProj = "attn_kv_b.weight";
+static constexpr const char* kAttnQBias = "attn_q.bias";
+static constexpr const char* kAttnKBias = "attn_k.bias";
+static constexpr const char* kAttnVBias = "attn_v.bias";
+static constexpr const char* kAttnOBias = "attn_output.bias";
+static constexpr const char* kAttnOutputNorm = "attn_output_norm.weight";
+static constexpr const char* kAttnOutputNormBias = "attn_output_norm.bias";
+static constexpr const char* kAttnQNorm = "attn_q_norm.weight";
+static constexpr const char* kAttnKNorm = "attn_k_norm.weight";
+static constexpr const char* kAttnVNorm = "attn_v_norm.weight";
+static constexpr const char* kIndexerWqB = "indexer_wq_b.weight";
+static constexpr const char* kIndexerWk = "indexer_wk.weight";
+static constexpr const char* kIndexerKNorm = "indexer_k_norm.weight";
+static constexpr const char* kIndexerWeightsProj = "indexer_weights_proj.weight";
+static constexpr const char* kAttnNorm = "attention_norm.weight";
+static constexpr const char* kFfnNorm = "ffn_norm.weight";
+static constexpr const char* kFfnGate = "ffn_gate.weight";
+static constexpr const char* kFfnUp = "ffn_up.weight";
+static constexpr const char* kFfnUpBias = "ffn_up.bias";
+static constexpr const char* kFfnDown = "ffn_down.weight";
+static constexpr const char* kFfnDownBias = "ffn_down.bias";
+static constexpr const char* kLayerOutputNorm = "layer_output_norm.weight";
+static constexpr const char* kLayerOutputNormBias = "layer_output_norm.bias";
+static constexpr const char* kFfnSharedGate = "ffn_shared_gate.weight";
+static constexpr const char* kMoeGate = "moe_gate.weight";
+static constexpr const char* kMoeCorrectionBias = "moe_e_score_correction_bias";
+static constexpr const char* kAttnQkvWeight = "attn_qkv.weight";
+static constexpr const char* kAttnQkvBias = "attn_qkv.bias";
+
+// SSM / Mamba2 layer keys (hybrid models: Qwen3.5, Jamba, etc.)
+static constexpr const char* kSSMConv1d = "ssm_conv1d.weight";
+static constexpr const char* kSSMA = "ssm_a";
+static constexpr const char* kSSMAlpha = "ssm_alpha.weight";  // dt projection
+static constexpr const char* kSSMBeta = "ssm_beta.weight";    // secondary projection
+static constexpr const char* kSSMDtBias = "ssm_dt.bias";
+static constexpr const char* kSSMNorm = "ssm_norm.weight";
+static constexpr const char* kSSMOut = "ssm_out.weight";
+// LFM2 / LFM2.5 short-conv layer keys (double-gated short convolution mixer)
+static constexpr const char* kShortConvInProj = "shortconv_in_proj.weight";
+static constexpr const char* kShortConvConv = "shortconv_conv.weight";
+static constexpr const char* kShortConvOutProj = "shortconv_out_proj.weight";
+static constexpr const char* kAttnGate = "attn_gate.weight";
+static constexpr const char* kPostAttnNorm = "post_attention_norm.weight";
+static constexpr const char* kAttnRopeFreqs = "rope_freqs.weight";
+static constexpr const char* kGemma4PerLayerInputGate = "gemma4.per_layer_input_gate.weight";
+static constexpr const char* kGemma4PerLayerProjection = "gemma4.per_layer_projection.weight";
+static constexpr const char* kGemma4PostPerLayerInputNorm = "gemma4.post_per_layer_input_norm.weight";
+static constexpr const char* kGemma4LayerOutputScale = "gemma4.layer_output_scale.weight";
+static constexpr const char* kGemma4PackedGateUpExpert = "gemma4.ffn_gate_up_expert.weight";
+static constexpr const char* kGemma4PackedDownScale = "gemma4.ffn_down_expert.scale";
+}  // namespace model_keys
+
+// ============================================================================
+// Generic Graph Operation Node
+// ============================================================================
+// Represents a single operation in the variable computational graph.
+// This allows defining the execution flow via data (JSON/Proto) rather than
+// hardcoding C++ logic for every architecture.
+// ============================================================================
+struct OpNode {
+    std::string op_name;                   // e.g., "matmul", "add", "rms_norm", "rope"
+    std::string output_name;               // Name to register the result as
+    std::vector<std::string> input_names;  // Names of input tensors (weights or activations)
+
+    // Attributes for specific ops
+    std::unordered_map<std::string, float> attrs_f;
+    std::unordered_map<std::string, int> attrs_i;
+    std::unordered_map<std::string, bool> attrs_b;
+    std::unordered_map<std::string, std::string> attrs_s;
+};
+
+// Single transformer layer weights (generic map-based representation)
+struct TransformerLayer {
+    std::unordered_map<std::string, struct ggml_tensor*> tensors;
+    std::unordered_map<const struct ggml_tensor*, densecore::runtime::DenseCoreTensorRole> tensor_roles;
+
+    // [NEW] Execution Plan (The "Logic")
+    // If this is populated, GenericGraphBuilder executes these nodes in order.
+    std::vector<OpNode> graph_nodes;
+
+    bool is_moe = false;  // True if this layer uses MoE FFN
+    std::vector<std::unordered_map<std::string, struct ggml_tensor*>> experts;
+
+    struct ggml_tensor* Get(const std::string& key) const {
+        auto it = tensors.find(key);
+        return it == tensors.end() ? nullptr : it->second;
+    }
+
+    struct ggml_tensor* Get(const char* key) const { return Get(std::string(key)); }
+
+    void Set(const std::string& key, struct ggml_tensor* tensor) {
+        auto it = tensors.find(key);
+        if (it != tensors.end() && it->second != tensor) {
+            tensor_roles.erase(it->second);
+        }
+        if (tensor) {
+            tensors[key] = tensor;
+        } else {
+            tensors.erase(key);
+        }
+    }
+
+    void Set(const std::string& key, struct ggml_tensor* tensor, densecore::runtime::DenseCoreTensorRole tensor_role) {
+        Set(key, tensor);
+        SetTensorRole(tensor, tensor_role);
+    }
+
+    void SetTensorRole(const struct ggml_tensor* tensor, densecore::runtime::DenseCoreTensorRole tensor_role) {
+        if (!tensor) {
+            return;
+        }
+        if (static_cast<int>(tensor_role) == 0) {
+            tensor_roles.erase(tensor);
+            return;
+        }
+        tensor_roles[tensor] = tensor_role;
+    }
+
+    densecore::runtime::DenseCoreTensorRole GetTensorRole(const struct ggml_tensor* tensor) const {
+        auto it = tensor_roles.find(tensor);
+        return it == tensor_roles.end() ? static_cast<densecore::runtime::DenseCoreTensorRole>(0) : it->second;
+    }
+
+    densecore::runtime::DenseCoreTensorRole GetTensorRole(const std::string& key) const {
+        return GetTensorRole(Get(key));
+    }
+
+    struct ggml_tensor** GetMutable(const std::string& key) {
+        auto it = tensors.find(key);
+        return it == tensors.end() ? nullptr : &it->second;
+    }
+
+    size_t NumExperts() const { return experts.size(); }
+
+    struct ggml_tensor* GetExpert(size_t idx, const std::string& key) const {
+        if (idx >= experts.size()) return nullptr;
+        auto it = experts[idx].find(key);
+        return it == experts[idx].end() ? nullptr : it->second;
+    }
+
+    void SetExpert(size_t idx, const std::string& key, struct ggml_tensor* tensor) {
+        if (idx >= experts.size()) {
+            experts.resize(idx + 1);
+        }
+        auto it = experts[idx].find(key);
+        if (it != experts[idx].end() && it->second != tensor) {
+            tensor_roles.erase(it->second);
+        }
+        if (tensor) {
+            experts[idx][key] = tensor;
+        } else {
+            experts[idx].erase(key);
+        }
+    }
+
+    void SetExpert(size_t idx, const std::string& key, struct ggml_tensor* tensor,
+                   densecore::runtime::DenseCoreTensorRole tensor_role) {
+        SetExpert(idx, key, tensor);
+        SetTensorRole(tensor, tensor_role);
+    }
+};
+
+// ============================================================================
+// Vision Encoder Layer (ViT, CLIP, SigLIP)
+// ============================================================================
+struct VisionEncoderLayer {
+    struct ggml_tensor* ln1_w = nullptr;  // Pre-attention LayerNorm
+    struct ggml_tensor* ln1_b = nullptr;
+    struct ggml_tensor* ln2_w = nullptr;  // Pre-MLP LayerNorm
+    struct ggml_tensor* ln2_b = nullptr;
+
+    // Self-Attention (usually fused QKV for vision)
+    struct ggml_tensor* wqkv = nullptr;  // Fused QKV projection [3*n_embd, n_embd]
+    struct ggml_tensor* bqkv = nullptr;
+    struct ggml_tensor* wo = nullptr;  // Output projection
+    struct ggml_tensor* bo = nullptr;
+
+    // Separate Q/K/V (alternative format)
+    struct ggml_tensor* wq = nullptr;
+    struct ggml_tensor* wk = nullptr;
+    struct ggml_tensor* wv = nullptr;
+
+    // MLP
+    struct ggml_tensor* mlp_fc1_w = nullptr;  // [intermediate, n_embd]
+    struct ggml_tensor* mlp_fc1_b = nullptr;
+    struct ggml_tensor* mlp_fc2_w = nullptr;  // [n_embd, intermediate]
+    struct ggml_tensor* mlp_fc2_b = nullptr;
+};
+
+// ============================================================================
+// Vision Encoder (complete vision backbone)
+// ============================================================================
+struct VisionEncoder {
+    // Patch Embedding
+    struct ggml_tensor* patch_embed_w = nullptr;  // Conv2D: [n_embd, n_channels, patch_size, patch_size]
+    struct ggml_tensor* patch_embed_b = nullptr;
+
+    // Position & Class token
+    struct ggml_tensor* cls_token = nullptr;  // [1, 1, n_embd]
+    struct ggml_tensor* pos_embed = nullptr;  // [1, seq_len, n_embd]
+
+    // Transformer layers
+    std::vector<VisionEncoderLayer> layers;
+
+    // Final LayerNorm
+    struct ggml_tensor* ln_post_w = nullptr;
+    struct ggml_tensor* ln_post_b = nullptr;
+
+    // Projection head (optional, for CLIP)
+    struct ggml_tensor* proj = nullptr;  // [proj_dim, n_embd]
+};
+
+// ============================================================================
+// Whisper Encoder Layer
+// ============================================================================
+struct WhisperEncoderLayer {
+    struct ggml_tensor* ln1_w = nullptr;
+    struct ggml_tensor* ln1_b = nullptr;
+    struct ggml_tensor* ln2_w = nullptr;
+    struct ggml_tensor* ln2_b = nullptr;
+
+    // Self-Attention
+    struct ggml_tensor* wq = nullptr;
+    struct ggml_tensor* wk = nullptr;
+    struct ggml_tensor* wv = nullptr;
+    struct ggml_tensor* bq = nullptr;
+    struct ggml_tensor* bk = nullptr;
+    struct ggml_tensor* bv = nullptr;
+    struct ggml_tensor* wo = nullptr;
+    struct ggml_tensor* bo = nullptr;
+
+    // MLP
+    struct ggml_tensor* mlp_fc1_w = nullptr;
+    struct ggml_tensor* mlp_fc1_b = nullptr;
+    struct ggml_tensor* mlp_fc2_w = nullptr;
+    struct ggml_tensor* mlp_fc2_b = nullptr;
+};
+
+// ============================================================================
+// Whisper Decoder Layer (with cross-attention)
+// ============================================================================
+struct WhisperDecoderLayer {
+    struct ggml_tensor* ln1_w = nullptr;  // Pre self-attn
+    struct ggml_tensor* ln1_b = nullptr;
+    struct ggml_tensor* ln2_w = nullptr;  // Pre cross-attn
+    struct ggml_tensor* ln2_b = nullptr;
+    struct ggml_tensor* ln3_w = nullptr;  // Pre MLP
+    struct ggml_tensor* ln3_b = nullptr;
+
+    // Self-Attention (causal)
+    struct ggml_tensor* self_wq = nullptr;
+    struct ggml_tensor* self_wk = nullptr;
+    struct ggml_tensor* self_wv = nullptr;
+    struct ggml_tensor* self_bq = nullptr;
+    struct ggml_tensor* self_bk = nullptr;
+    struct ggml_tensor* self_bv = nullptr;
+    struct ggml_tensor* self_wo = nullptr;
+    struct ggml_tensor* self_bo = nullptr;
+
+    // Cross-Attention (to encoder output)
+    struct ggml_tensor* cross_wq = nullptr;
+    struct ggml_tensor* cross_wk = nullptr;
+    struct ggml_tensor* cross_wv = nullptr;
+    struct ggml_tensor* cross_bq = nullptr;
+    struct ggml_tensor* cross_bk = nullptr;
+    struct ggml_tensor* cross_bv = nullptr;
+    struct ggml_tensor* cross_wo = nullptr;
+    struct ggml_tensor* cross_bo = nullptr;
+
+    // MLP
+    struct ggml_tensor* mlp_fc1_w = nullptr;
+    struct ggml_tensor* mlp_fc1_b = nullptr;
+    struct ggml_tensor* mlp_fc2_w = nullptr;
+    struct ggml_tensor* mlp_fc2_b = nullptr;
+};
+
+// ============================================================================
+// Whisper Model (Encoder-Decoder)
+// ============================================================================
+struct WhisperModel {
+    // Audio Frontend (Conv1D stack)
+    struct ggml_tensor* conv1_w = nullptr;  // [n_audio_state, n_mels, 3]
+    struct ggml_tensor* conv1_b = nullptr;
+    struct ggml_tensor* conv2_w = nullptr;  // [n_audio_state, n_audio_state, 3]
+    struct ggml_tensor* conv2_b = nullptr;
+
+    // Positional encoding
+    struct ggml_tensor* encoder_pos = nullptr;
+    struct ggml_tensor* decoder_pos = nullptr;
+
+    // Token embedding (decoder)
+    struct ggml_tensor* tok_embed = nullptr;
+
+    // Encoder
+    std::vector<WhisperEncoderLayer> encoder_layers;
+    struct ggml_tensor* encoder_ln_w = nullptr;
+    struct ggml_tensor* encoder_ln_b = nullptr;
+
+    // Decoder
+    std::vector<WhisperDecoderLayer> decoder_layers;
+    struct ggml_tensor* decoder_ln_w = nullptr;
+    struct ggml_tensor* decoder_ln_b = nullptr;
+
+    // Output projection (tied with tok_embed usually)
+    struct ggml_tensor* output = nullptr;
+};
+
+// Complete transformer model
+struct TransformerModel {
+    TransformerHParams hparams;
+
+    struct ggml_tensor* tok_embeddings;
+    struct ggml_tensor* position_embeddings = nullptr;
+    struct ggml_tensor* token_type_embeddings = nullptr;
+    struct ggml_tensor* token_embd_norm = nullptr;
+    struct ggml_tensor* token_embd_norm_bias = nullptr;
+    struct ggml_tensor* output_norm;
+    struct ggml_tensor* output;
+
+    std::vector<TransformerLayer> layers;
+    std::shared_ptr<const densecore::models::DecoderModelSpec> decoder_spec;
+    std::unordered_map<const struct ggml_tensor*, densecore::runtime::DenseCoreTensorRole> tensor_roles;
+
+    void SetTensorRole(const struct ggml_tensor* tensor, densecore::runtime::DenseCoreTensorRole tensor_role) {
+        if (!tensor) {
+            return;
+        }
+        if (static_cast<int>(tensor_role) == 0) {
+            tensor_roles.erase(tensor);
+            return;
+        }
+        tensor_roles[tensor] = tensor_role;
+    }
+
+    densecore::runtime::DenseCoreTensorRole GetTensorRole(const struct ggml_tensor* tensor) const {
+        auto it = tensor_roles.find(tensor);
+        return it == tensor_roles.end() ? static_cast<densecore::runtime::DenseCoreTensorRole>(0) : it->second;
+    }
+
+    // Context & Backend
+    struct ggml_context* ctx_w = nullptr;  // weight context
+    // Additional contexts owned by split GGUF shards. ctx_w remains the
+    // canonical first-shard context for compatibility with existing callers.
+    std::vector<struct ggml_context*> ctx_w_shards;
+    struct ggml_context* ctx_views = nullptr;  // view tensor metadata (expert slices, etc.)
+    ggml_backend_t backend = nullptr;          // active compute backend
+    ggml_backend_t cpu_backend = nullptr;      // CPU backend (always available)
+    ggml_backend_t metal_backend = nullptr;    // Metal backend (Apple Silicon only)
+    // Mock flag
+    bool is_mock = false;
+    // Tied embeddings flag (output = tok_embeddings)
+    bool tied_embeddings = false;
+    struct gguf_context* ctx_gguf = nullptr;
+    std::vector<struct gguf_context*> ctx_gguf_shards;
+
+    struct ggml_tensor* FindWeightTensor(const char* name) const;
+
+    template <typename Fn> void ForEachWeightContext(Fn&& fn) const {
+        if (ctx_w) {
+            fn(ctx_w);
+        }
+        for (auto* ctx : ctx_w_shards) {
+            if (ctx) {
+                fn(ctx);
+            }
+        }
+    }
+
+    // Architecture detection (for arch-specific code paths and validation)
+    ModelArch arch = ModelArch::UNKNOWN;
+    ModelVariant variant = ModelVariant::UNKNOWN;
+    ModelArchFlags arch_flags;
+    uint32_t gguf_declared_layer_count = 0;
+    uint32_t skipped_mtp_layer_count = 0;
+
+    // SSM parameters (populated when arch_flags.is_hybrid_ssm = true)
+    int ssm_conv_kernel = 4;
+    int ssm_state_size = 128;
+    int ssm_group_count = 16;
+    int ssm_time_step_rank = 16;
+    int ssm_inner_size = 2048;
+    int ssm_full_attn_interval = 4;
+    // Optional per-layer hybrid mask from GGUF metadata (1 = SSM/linear attention, 0 = full attention).
+    // When absent, runtime falls back to the legacy modulo-based interval rule.
+    std::vector<uint8_t> hybrid_layer_is_ssm;
+
+    // LFM2 / LFM2.5 parameters (populated when arch_flags.is_lfm2_shortconv = true)
+    int lfm2_conv_kernel = 3;       // conv_L_cache: short causal depthwise conv kernel size
+    int lfm2_num_dense_layers = 0;  // leading layers using dense FFN; remaining layers are MoE
+    // Per-layer mask (1 = short-conv mixer layer, 0 = full attention layer). Derived from GGUF
+    // layer_types metadata or from per-layer shortconv tensor presence at load time.
+    std::vector<uint8_t> lfm2_layer_is_conv;
+    // Canonical f32 depthwise conv weights for each short-conv layer, indexed by conv-layer
+    // ordinal (NOT physical layer index). Layout per entry: [channel * lfm2_conv_kernel + tap].
+    std::vector<std::vector<float>> lfm2_conv_weight_f32;
+
+    // Returns the conv-layer ordinal (position among short-conv layers) for a physical layer, or -1.
+    int LFM2ConvOrdinal(int layer_idx) const {
+        if (!IsLFM2ConvLayer(layer_idx)) return -1;
+        int ordinal = 0;
+        for (int i = 0; i < layer_idx; ++i) {
+            if (i < static_cast<int>(lfm2_layer_is_conv.size()) && lfm2_layer_is_conv[static_cast<size_t>(i)]) {
+                ++ordinal;
+            }
+        }
+        return ordinal;
+    }
+    int LFM2NumConvLayers() const {
+        int n = 0;
+        for (uint8_t v : lfm2_layer_is_conv) n += (v != 0) ? 1 : 0;
+        return n;
+    }
+
+    // Gemma4 encodes per-layer KV-head counts in GGUF metadata.
+    // The runtime uses this when present to derive layer-local attention head
+    // shapes instead of collapsing everything to a single global scalar.
+    std::vector<uint32_t> gemma4_layer_n_head_kv;
+    std::vector<uint8_t> gemma4_layer_is_sliding;
+    std::vector<int32_t> gemma4_layer_kv_source;
+    int gemma4_sliding_window = -1;
+    int gemma4_n_shared_kv_layers = 0;
+    int gemma4_hidden_size_per_layer_input = 0;
+    float gemma4_attention_logit_softcapping = 0.0f;
+    float gemma4_final_logit_softcapping = 0.0f;
+    float gemma4_full_attention_partial_rotary_factor = 0.25f;
+    uint32_t gemma4_key_length_full = 0;
+    uint32_t gemma4_value_length_full = 0;
+    uint32_t gemma4_key_length_swa = 0;
+    uint32_t gemma4_value_length_swa = 0;
+    float gemma4_rope_freq_base_full = 0.0f;
+    float gemma4_rope_freq_base_swa = 0.0f;
+    int gemma4_rope_dim_full = 0;
+    int gemma4_rope_dim_swa = 0;
+    struct ggml_tensor* gemma4_per_layer_model_projection = nullptr;
+    struct ggml_tensor* gemma4_per_layer_projection_norm = nullptr;
+    struct ggml_tensor* gemma4_per_layer_token_embeddings = nullptr;
+
+    // MoE routing parameters (GLM-4.5 / GLM-5 and similar)
+    int moe_n_shared_experts = 0;
+    int moe_n_group = 1;
+    int moe_topk_group = 1;
+    int moe_first_k_dense_replace = 0;
+    float moe_routed_scaling_factor = 1.0f;
+    bool moe_norm_topk_prob = true;
+
+    // GLM-5 MLA / DSA parameters
+    int glm_q_lora_rank = 0;
+    int glm_kv_lora_rank = 0;
+    int glm_qk_rope_head_dim = 0;
+    int glm_qk_nope_head_dim = 0;
+    int glm_v_head_dim = 0;
+    int glm_index_topk = 0;
+    int glm_index_head_dim = 0;
+    int glm_index_n_heads = 0;
+
+    // Compatibility aliases preserve callers while state types remain independent
+    // of model loading. Requests own sequence state; the model owns layer weights.
+    using SSMLayerRuntimeState = densecore::llm::ssm::SSMLayerRuntimeState;
+    using SSMSequenceRuntimeState = densecore::llm::ssm::SSMSequenceRuntimeState;
+    std::vector<SSMLayerRuntimeState> ssm_layer_states;
+
+    bool IsHybridSSMLayer(int layer_idx) const {
+        if (!arch_flags.is_hybrid_ssm || layer_idx < 0 || layer_idx >= static_cast<int>(hparams.n_layer)) {
+            return false;
+        }
+        if (layer_idx < static_cast<int>(hybrid_layer_is_ssm.size())) {
+            return hybrid_layer_is_ssm[static_cast<size_t>(layer_idx)] != 0;
+        }
+        return layer_idx % ssm_full_attn_interval != ssm_full_attn_interval - 1;
+    }
+
+    // Returns true if `layer_idx` is an LFM2 short-conv mixer layer (vs. a full attention layer).
+    bool IsLFM2ConvLayer(int layer_idx) const {
+        if (!arch_flags.is_lfm2_shortconv || layer_idx < 0 || layer_idx >= static_cast<int>(hparams.n_layer)) {
+            return false;
+        }
+        if (layer_idx < static_cast<int>(lfm2_layer_is_conv.size())) {
+            return lfm2_layer_is_conv[static_cast<size_t>(layer_idx)] != 0;
+        }
+        return false;
+    }
+
+    // Vision model parameters (populated when arch is VIT, CLIP_VISION, etc.)
+    VisionHParams vision_hparams;
+    bool has_vision = false;
+
+    // Whisper model parameters (populated when arch is WHISPER)
+    WhisperHParams whisper_hparams;
+    bool has_whisper = false;
+
+    // Vision encoder weights (populated when has_vision = true)
+    std::unique_ptr<VisionEncoder> vision_encoder;
+
+    // Whisper encoder/decoder weights (populated when has_whisper = true)
+    std::unique_ptr<WhisperModel> whisper_model;
+
+    // Tokenizer data
+    std::vector<std::string> vocab_tokens;
+    std::vector<float> token_scores;  // BPE merge scores (lower = higher priority)
+    std::map<std::string, int> token_to_id;
+    // Merge ranks loaded from tokenizer.ggml.merges.
+    // Key format: "<left>\x1f<right>" (unit-separator delimiter).
+    std::unordered_map<std::string, int> bpe_merge_ranks;
+    // Optional GGUF tokenizer metadata.
+    // token_type: 1=normal, 2=unknown, 3=control, 4=user_defined, 5=unused, 6=byte
+    std::vector<int32_t> token_types;
+    // Additional stop-token IDs beyond eos_token_id (e.g. <|im_end|>, <|eot_id|>).
+    std::vector<int32_t> stop_token_ids;
+    // Optional chat template string from GGUF metadata.
+    std::string chat_template;
+    // Pre-decoded stream-safe token pieces used by hot decode/token streaming.
+    std::vector<std::string> stream_token_pieces;
+    int32_t bos_token_id = 1;
+    int32_t eos_token_id = 2;
+    int32_t unk_token_id = -1;
+    int32_t sep_token_id = -1;
+    int32_t pad_token_id = -1;
+    int32_t mask_token_id = -1;
+    std::string tokenizer_type;
+    bool tokenizer_add_bos = false;
+
+    // Pre-computed RoPE cos/sin table (interleaved: [cos, sin, cos, sin, ...])
+    // Layout: [max_seq_len, head_dim] where each pair is (cos, sin)
+    // Initialized during model loading based on hparams
+    std::vector<float> rope_cos_sin;
+    int rope_head_dim = 0;  // Head dim used for RoPE table
+
+    // DenseCore custom INT4 format bindings loaded from GGUF metadata.
+    struct Int4WeightBinding {
+        const struct ggml_tensor* packed = nullptr;  // Packed INT4 bytes
+        const struct ggml_tensor* scales = nullptr;  // Per-group scales
+        const struct ggml_tensor* zeros = nullptr;   // Per-group zero points
+        int group_size = 0;
+        int64_t k = 0;  // Logical input dim
+        int64_t n = 0;  // Logical output dim
+    };
+    std::unordered_map<const struct ggml_tensor*, Int4WeightBinding> int4_weight_bindings;
+
+    using CpuRepackAliasLayout = densecore::llm::weights::PreparedWeights::CpuRepackAliasLayout;
+    densecore::llm::weights::PreparedWeights prepared_weights;
+
+    // FP8 format variants for custom packed INT8 tensor storage.
+    enum class FP8Format : uint8_t {
+        E5M2 = 0,
+        E4M3FN = 1,
+    };
+    struct FP8WeightBinding {
+        const struct ggml_tensor* packed = nullptr;  // FP8 bytes stored as I8
+        FP8Format format = FP8Format::E4M3FN;
+        int64_t k = 0;  // Logical input dim
+        int64_t n = 0;  // Logical output dim
+    };
+    std::unordered_map<const struct ggml_tensor*, FP8WeightBinding> fp8_weight_bindings;
+
+    // =========================================================================
+    // NUMA-Aware Memory Tracking
+    // =========================================================================
+    // Stores (ptr, size, allocation_type) for tensor data rebound to NUMA nodes.
+    // These buffers are NOT owned by ggml_context and MUST be freed manually
+    // in the destructor. Failing to do so will cause memory leaks.
+    // =========================================================================
+    struct NumaBuffer {
+        void* ptr = nullptr;
+        size_t size = 0;
+        densecore::AllocationType type = densecore::AllocationType::Aligned;
+    };
+    std::vector<NumaBuffer> numa_buffers;
+    // Populated only when load-time expert partitioning moved at least 99% of
+    // the addressed pages. Every layer uses the same expert-index mapping.
+    std::vector<int> numa_expert_node_hints;
+
+    // Explicitly define move operations (required due to user-declared destructor)
+    TransformerModel() = default;
+    TransformerModel(TransformerModel&&) = default;
+    TransformerModel& operator=(TransformerModel&&) = default;
+
+    // Delete copy operations (cannot copy unique_ptrs)
+    TransformerModel(const TransformerModel&) = delete;
+    TransformerModel& operator=(const TransformerModel&) = delete;
+
+    ~TransformerModel();
+};
+
+#endif  // DENSECORE_MODEL_TYPES_H

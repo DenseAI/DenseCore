@@ -1,0 +1,67 @@
+{
+  "profiles": [
+    {
+      "id": "qwen",
+      "family": "qwen",
+      "kind": "chatml",
+      "match_substrings": ["qwen"],
+      "roles": {
+        "system": "system",
+        "user": "user",
+        "assistant": "assistant"
+      },
+      "tags": {
+        "open": "<|im_start|>",
+        "close": "<|im_end|>\n"
+      },
+      "multimodal": {
+        "image": "<|vision_start|><|image_pad|><|vision_end|>",
+        "video": "<|vision_start|><|video_pad|><|vision_end|>",
+        "audio": ""
+      },
+      "default_system_prompt": "You are a helpful assistant."
+    },
+    {
+      "id": "gemma",
+      "family": "gemma",
+      "kind": "turn_tags",
+      "match_substrings": ["gemma"],
+      "roles": {
+        "system": "system",
+        "user": "user",
+        "assistant": "model"
+      },
+      "tags": {
+        "open": "<|turn>",
+        "close": "<turn|>\n"
+      },
+      "multimodal": {
+        "image": "\n\n<|image|>\n\n",
+        "video": "\n\n<|video|>\n\n",
+        "audio": "<|audio|>"
+      },
+      "default_system_prompt": "You are a helpful assistant."
+    },
+    {
+      "id": "generic",
+      "family": "generic",
+      "kind": "generic_transcript",
+      "match_substrings": [],
+      "roles": {
+        "system": "System",
+        "user": "User",
+        "assistant": "Assistant"
+      },
+      "tags": {
+        "open": "",
+        "close": ""
+      },
+      "multimodal": {
+        "image": "",
+        "video": "",
+        "audio": ""
+      },
+      "default_system_prompt": "You are a helpful assistant."
+    }
+  ]
+}

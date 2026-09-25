@@ -1,0 +1,36 @@
+# Provider-neutral CPU inference example.
+# Replace model PVC, resource shape, and scheduling labels with cluster-local values.
+
+dense-base:
+  image:
+    repository: denseai/densecore
+    tag: "0.1.0"
+
+  model:
+    source: pvc
+    existingClaim: densecore-models
+    path: /models
+    filename: model.gguf
+    envVarName: MAIN_MODEL_PATH
+
+  initContainers: []
+
+  resources:
+    requests:
+      cpu: "16"
+      memory: "64Gi"
+    limits:
+      cpu: "16"
+      memory: "64Gi"
+
+  extraEnv:
+    - name: THREADS
+      value: "16"
+    - name: DENSECORE_MAX_NUM_SEQS
+      value: "4"
+
+  nodeSelector:
+    inference.dense.ai/cpu: "true"
+
+  tolerations: []
+  affinity: {}

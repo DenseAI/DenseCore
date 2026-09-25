@@ -1,0 +1,81 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base-release",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/../build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "DENSECORE_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "portable-release",
+      "displayName": "Portable Release",
+      "description": "Generic release artifact profile: no host-native DenseCore or ggml ISA flags.",
+      "inherits": "base-release",
+      "binaryDir": "${sourceDir}/../build-portable-release",
+      "cacheVariables": {
+        "DENSECORE_PORTABLE": "ON",
+        "GGML_NATIVE": "OFF"
+      }
+    },
+    {
+      "name": "c4-perf",
+      "displayName": "C4 Performance",
+      "description": "Intel C4 performance profile with LTO and native ISA enabled for prefill/decode tuning.",
+      "inherits": "base-release",
+      "binaryDir": "${sourceDir}/../build-c4-perf",
+      "cacheVariables": {
+        "DENSECORE_LTO": "ON",
+        "DENSECORE_ARM_CORRECTNESS_FIRST": "OFF",
+        "GGML_NATIVE": "ON",
+        "GGML_AMX_TILE": "ON",
+        "GGML_AMX_INT8": "ON",
+        "GGML_AMX_BF16": "ON"
+      }
+    },
+    {
+      "name": "c4a-perf",
+      "displayName": "C4A Performance",
+      "description": "Google Axion / Neoverse-V2 performance profile with correctness-first disabled and explicit ARM tuning.",
+      "inherits": "base-release",
+      "binaryDir": "${sourceDir}/../build-c4a-perf",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc-13",
+        "CMAKE_CXX_COMPILER": "g++-13",
+        "DENSECORE_TARGET_C4A": "ON",
+        "DENSECORE_C4A_ENABLE_GGML_FASTKERNELS": "ON",
+        "DENSECORE_ARM_CORRECTNESS_FIRST": "OFF",
+        "DENSECORE_ARM_MCPU": "neoverse-v2",
+        "DENSECORE_LTO": "ON",
+        "GGML_NATIVE": "ON",
+        "GGML_CPU_ARM_ARCH": "armv9-a+sve2+i8mm+bf16+dotprod",
+        "GGML_CPU_KLEIDIAI": "OFF",
+        "GGML_LLAMAFILE": "OFF",
+        "GGML_CPU_REPACK": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-portable-release",
+      "configurePreset": "portable-release"
+    },
+    {
+      "name": "build-c4-perf",
+      "configurePreset": "c4-perf"
+    },
+    {
+      "name": "build-c4a-perf",
+      "configurePreset": "c4a-perf"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+DenseCore
+Copyright 2025-2026 DenseCore contributors
+
+This product includes software developed by the DenseCore contributors and
+third-party components. Distributed source archives, release archives, Python
+packages, and container images should preserve this NOTICE file together with
+the accompanying LICENSE and third-party attribution materials.
+
+Bundled third-party components include the C++ runtime dependencies used by the
+native extension. See THIRD_PARTY_NOTICES.md and the packaged `licenses/`
+directory for details.

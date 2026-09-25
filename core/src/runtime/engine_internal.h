@@ -1,0 +1,2582 @@
+#ifndef DENSECORE_ENGINE_INTERNAL_H
+#define DENSECORE_ENGINE_INTERNAL_H
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <sstream>
+#include <stack>
+#include <string>
+#include <thread>
+#include <unordered_set>
+#include <vector>
+
+#include "densecore.h"
+#include "densecore/hal/backend_selector.h"
+#include "densecore/hal/backend_registry.h"
+#include "densecore/backend/cpu_backend.h"
+#include "densecore/hal/op_registry.h"
+#include "densecore/memory/kv_cache.h"
+#include "densecore/models/embedding.h"
+
+#ifdef DENSECORE_TEST_BUILD
+namespace densecore::testing {
+void MaybePauseAfterPendingPublishForTest();
+}
+#endif
+#include "densecore/models/lora_storage.h"
+#include "densecore/models/model_execution_contract.h"
+#include "densecore/models/model_loader.h"
+#include "densecore/models/model_types.h"
+#include "densecore/models/tokenizer.h"
+#include "densecore/runtime/inference.h"
+#include "densecore/runtime/lockfree_queue.h"  // Lock-free sharded priority queue
+#include "densecore/runtime/scheduler.h"
+#include "densecore/utils/error.h"
+#include "densecore/utils/logging.h"
+#include "ggml-cpu.h"
+#include "llm/config/runtime_config.h"
+
+#ifdef __APPLE__
+#include "densecore/backend/apple/ane_backend.h"
+#include "densecore/backend/apple/hybrid_scheduler.h"
+#include "densecore/backend/apple/metal_backend.h"
+#endif
+
+// Engine lifecycle states for graceful shutdown
+enum class EngineStatus {
+    RUNNING,   // Normal operation, accepting requests
+    DRAINING,  // Shutdown initiated, waiting for active requests to complete
+    STOPPED    // Fully stopped, ready for cleanup
+};
+
+enum class DecodeFinishCause : uint8_t {
+    Unknown = 0,
+    StopToken,
+    StopSequence,
+    MaxTokens,
+    LoopGuard,
+    DecodeVisibleProgressTimeout,
+    SchedulerEmptyBatchStall,
+    SchedulerUnschedulable,
+    BatchBuildStall,
+    RequestCanceled,
+    OutOfMemory,
+    MissingTokens,
+    SchedulerRejected,
+    GraphBuildFailed,
+};
+
+enum class DecodeSilentFinishReason : uint8_t {
+    None = 0,
+    ReasoningSuppressedOnly,
+    Utf8PendingOnly,
+};
+
+struct KVCacheConfig {
+    int max_num_seqs = 4;
+    int max_seq_len = 4096;
+    size_t target_kv_memory = 512ULL * 1024ULL * 1024ULL;
+    size_t bytes_per_token = 0;
+    ggml_type requested_cache_type = GGML_TYPE_F16;
+    ggml_type effective_cache_type = GGML_TYPE_F16;
+};
+
+void SetLastError(DenseCoreStatus status, const std::string& message);
+void ClearLastError();
+DenseCoreStatus MapErrorCodeToStatus(densecore::ErrorCode code);
+ggml_type ResolveEffectiveKVCacheType(const TransformerModel* model, ggml_type requested_cache_type);
+size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int k_head_dim, int v_head_dim, int n_head_kv, int n_layer,
+                                   int index_head_dim = 0);
+KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type);
+densecore::SchedulerConfig BuildRuntimeSchedulerConfig(const KVCacheConfig& kv_config,
+                                                      const TransformerModel* model = nullptr);
+
+struct Request;
+struct EngineState;
+void PushResultEvent(EngineState* state, int request_id, const std::string& token, int token_id, bool finished,
+                     bool error, TokenCallback cb, TokenCallbackEx cb_ex, TokenResultCallback token_result_cb,
+                     void* user_data, GenerationCompletionCallback completion_callback = nullptr,
+                     int generated_tokens = 0, DenseCoreGenerationFinishReason finish_reason = DENSECORE_GENERATION_STOP);
+void PushEmbeddingResultEvent(EngineState* state, int request_id, std::vector<float> embedding_data,
+                              int status, EmbeddingCallback cb, void* user_data);
+void EmitRequestResult(EngineState* state, Request* req, const std::string& token, int token_id, bool finished,
+                       bool error, bool use_direct_callback);
+
+// Metrics tracking with thread-safe operations
+struct InternalMetrics {
+    std::atomic<long> total_tokens_generated{0};
+    std::atomic<int> active_requests{0};
+    std::atomic<long> total_requests{0};
+    std::atomic<long> completed_requests{0};
+    std::atomic<long> failed_requests{0};
+    std::atomic<long> total_prompt_tokens{0};
+    std::atomic<int> oom_errors{0};
+    std::atomic<int> timeout_errors{0};
+
+    std::chrono::steady_clock::time_point start_time;
+
+    InternalMetrics() : start_time(std::chrono::steady_clock::now()) {}
+
+    // Latency tracking (in microseconds for precision)
+    std::vector<long> ttft_samples;        // Time to first token
+    std::vector<long> itl_samples;         // Inter-token latency
+    std::vector<long> queue_wait_samples;  // Queue wait time
+    std::mutex metrics_mu;
+
+    void RecordTTFT(long us) {
+        std::lock_guard<std::mutex> lock(metrics_mu);
+        ttft_samples.push_back(us);
+        if (ttft_samples.size() > 10000)
+            ttft_samples.erase(ttft_samples.begin(),
+                               ttft_samples.begin() + 5000);  // Keep last 5000
+    }
+
+    void RecordITL(long us) {
+        std::lock_guard<std::mutex> lock(metrics_mu);
+        itl_samples.push_back(us);
+        if (itl_samples.size() > 10000) itl_samples.erase(itl_samples.begin(), itl_samples.begin() + 5000);
+    }
+
+    void RecordQueueWait(long us) {
+        std::lock_guard<std::mutex> lock(metrics_mu);
+        queue_wait_samples.push_back(us);
+        if (queue_wait_samples.size() > 10000)
+            queue_wait_samples.erase(queue_wait_samples.begin(), queue_wait_samples.begin() + 5000);
+    }
+
+    float CalculatePercentile(const std::vector<long>& samples, float percentile) {
+        if (samples.empty()) return 0.0f;
+        std::vector<long> sorted = samples;
+        std::sort(sorted.begin(), sorted.end());
+        size_t idx = (size_t)(percentile * sorted.size());
+        if (idx >= sorted.size()) idx = sorted.size() - 1;
+        return sorted[idx] / 1000.0f;  // Convert to ms
+    }
+
+    float CalculateAverage(const std::vector<long>& samples) {
+        if (samples.empty()) return 0.0f;
+        long sum = 0;
+        for (long s : samples) sum += s;
+        return (sum / samples.size()) / 1000.0f;  // Convert to ms
+    }
+};
+
+/**
+ * ResultEvent structure for decoupled callback execution.
+ *
+ * This struct stores all necessary data to execute a callback without
+ * holding a reference to the Request object. This allows EngineLoop to
+ * release requests immediately after pushing to the queue, avoiding the
+ * need for complex reference counting.
+ *
+ * For embedding callbacks, embedding_data uses std::vector for RAII-safe
+ * memory management - no manual new/delete required.
+ */
+struct ResultEvent {
+    GenerationCompletionCallback completion_callback = nullptr;
+    int generated_tokens = 0;
+    DenseCoreGenerationFinishReason finish_reason = DENSECORE_GENERATION_STOP;
+    int request_id;
+    std::string token_str;
+    int token_id = -1;
+    bool finished;
+    bool error;
+
+    // Callback pointers (copied from Request at event creation time)
+    TokenCallback callback;
+    TokenCallbackEx callback_ex;
+    TokenResultCallback token_result_callback;
+    EmbeddingCallback emb_callback;
+    void* user_data;
+
+    // Embedding data (RAII-managed via std::vector)
+    std::vector<float> embedding_data;
+    int embedding_status = DENSECORE_STATUS_OK;
+
+    ResultEvent()
+        : request_id(-1),
+          token_id(-1),
+          finished(false),
+          error(false),
+          callback(nullptr),
+          callback_ex(nullptr),
+          token_result_callback(nullptr),
+          emb_callback(nullptr),
+          user_data(nullptr) {}
+
+    // Move constructor - std::vector handles move semantics automatically
+    ResultEvent(ResultEvent&& other) noexcept = default;
+
+    // Move assignment - std::vector handles move semantics automatically
+    ResultEvent& operator=(ResultEvent&& other) noexcept = default;
+
+    // Disable copy (maintain move-only semantics for queue efficiency)
+    ResultEvent(const ResultEvent&) = delete;
+    ResultEvent& operator=(const ResultEvent&) = delete;
+
+    // Default destructor - std::vector handles cleanup automatically
+    ~ResultEvent() = default;
+};
+
+struct SwapState {
+    bool active = false;
+    int total_tokens = 0;
+    int num_blocks = 0;
+    std::vector<uint8_t> k_data;
+    std::vector<uint8_t> v_data;
+
+    void Clear() {
+        active = false;
+        total_tokens = 0;
+        num_blocks = 0;
+        k_data.clear();
+        v_data.clear();
+        k_data.shrink_to_fit();
+        v_data.shrink_to_fit();
+    }
+};
+
+struct OwnedGraphInput {
+    std::string name;
+    std::array<int64_t, DENSECORE_MAX_DIMS> shape{};
+    DenseCoreDType dtype = DENSECORE_DTYPE_F32;
+    int ndim = 0;
+    std::vector<uint8_t> bytes;
+};
+
+/**
+ * Request structure representing a single inference request.
+ *
+ * Lifecycle:
+ * 1. Created and submitted to pending queue
+ * 2. Moved to active queue when scheduled
+ * 3. Processed in batches
+ * 4. Marked as finished and cleaned up
+ */
+struct Request {
+    int id;
+    std::string prompt;
+    std::string lora_name;
+    int max_tokens;
+    TokenCallback callback;
+    TokenCallbackEx callback_ex = nullptr;
+    void* user_data;
+
+    // Generation state
+    std::vector<int> tokens;
+    std::vector<int> token_history;
+    std::vector<int> prompt_tokens_for_cache;           // Full prompt tokens for prefix cache registration
+    std::vector<int> original_prompt_tokens_for_cache;  // Immutable copy before prefix-hit token erasure
+    // Prompt plus decode input tokens whose KV/recurrent state has actually been computed.
+    std::vector<int> sequence_tokens_for_prefix_cache;
+    int prompt_token_count = 0;
+    int registered_prefix_blocks = 0;
+    bool prefix_cache_allowed = false;
+    bool prefix_cache_hit = false;
+    int prefix_cache_skipped_tokens = 0;
+    int prefix_cache_hit_blocks = 0;
+    int prefix_cache_registered_blocks = 0;
+    int prefix_cache_extended_blocks = 0;
+    bool hybrid_ssm_snapshot_restore_attempted = false;
+    bool hybrid_ssm_snapshot_restore_applied = false;
+    std::string prefix_cache_skip_reason;
+    std::string utf8_pending;
+    std::string think_tag_pending;
+    std::string tool_call_tag_pending;
+    std::string tool_response_tag_pending;
+    bool suppress_reasoning_tags = true;
+    bool in_think_block = false;
+    bool in_tool_call_block = false;
+    bool in_tool_response_block = false;
+    int n_past = 0;
+    bool is_prefill = true;
+    int generated_count = 0;
+    int parity_debug_output_tokens = 0;
+    bool finished = false;
+    bool parity_debug_text_primed = false;
+    bool parity_debug_token_primed = false;
+    bool parity_debug_template_applied = false;
+    std::string parity_debug_submit_api;
+
+    // Request lifecycle control
+    std::atomic<bool> cancelled{false};  // Cancellation flag
+    std::atomic<bool> generation_terminal_dispatched{false};
+    std::atomic<bool> embedding_terminal_dispatched{false};
+    std::string tier = "standard";       // Priority tier: "premium", "standard", "batch"
+
+    // Synchronization for blocking API
+    std::mutex mu;
+    std::condition_variable cv;
+
+    // PagedAttention block tables
+    BlockTable block_table;
+    SwapState swap_state;
+    bool is_swapped = false;
+
+    // Hybrid SSM per-request recurrent state.
+    // Qwen3.5-style models cannot batch correctly if these buffers are shared
+    // globally across all in-flight requests.
+    std::vector<TransformerModel::SSMSequenceRuntimeState> ssm_runtime_states;
+
+    // Embedding mode
+    bool is_embedding = false;
+    EmbeddingCallback embedding_callback = nullptr;
+    TokenResultCallback token_result_callback = nullptr;
+    densecore::PoolingStrategy pooling_type = densecore::PoolingStrategy::MEAN;
+    bool normalize_embedding = true;
+
+    // Grammar-based sampling (JSON mode)
+    bool json_mode = false;
+    GrammarConstraint grammar;
+
+    // Sampling parameters (per-request)
+    SamplingParams sampling_params;
+    std::vector<int> disallowed_token_ids;
+    std::vector<int> allowed_token_ids;
+    std::vector<std::string> stop_sequences;
+    std::string stop_buffer;
+    size_t stop_buffer_max = 0;
+
+    // Timing and metrics
+    std::chrono::steady_clock::time_point arrival_time;
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point first_token_time;
+    std::chrono::steady_clock::time_point last_token_time;
+    std::chrono::steady_clock::time_point last_sampled_token_time;
+    std::chrono::steady_clock::time_point last_external_emit_time;
+
+    // Scheduling priority (lower value = higher priority)
+    int priority = 100;
+    bool is_high_priority = false;
+    int estimated_length = 0;
+    uint64_t empty_schedule_stall_count = 0;
+    uint64_t batch_build_stall_count = 0;
+    uint64_t decode_no_output_steps = 0;
+    uint64_t sampled_token_count = 0;
+    uint64_t visible_emitted_token_count = 0;
+    uint64_t suppressed_token_count = 0;
+    uint64_t scheduler_wait_ns = 0;
+    uint64_t batch_build_ns = 0;
+    uint64_t graph_build_ns = 0;
+    uint64_t graph_rebind_ns = 0;
+    uint64_t graph_execute_ns = 0;
+    uint64_t decode_graph_execute_ns = 0;
+    uint64_t decode_attention_ns = 0;
+    uint64_t decode_paged_attention_ns = 0;
+    uint64_t decode_native_moe_graph_ns = 0;
+    uint64_t decode_moe_route_ns = 0;
+    uint64_t decode_moe_w1w3_ns = 0;
+    uint64_t decode_moe_w2_ns = 0;
+    uint64_t decode_moe_reduce_ns = 0;
+    uint64_t decode_ssm_qkv_wall_ns = 0;
+    uint64_t decode_ssm_out_wall_ns = 0;
+    uint64_t decode_ssm_delta_wall_ns = 0;
+    uint64_t decode_ssm_conv1d_ns = 0;
+    uint64_t decode_ssm_delta_ns = 0;
+    uint64_t decode_sample_ns = 0;
+    uint64_t decode_graph_node_measured_ns = 0;
+    uint64_t decode_graph_node_custom_ns = 0;
+    uint64_t decode_graph_node_custom_moe_ns = 0;
+    uint64_t decode_graph_node_custom_ssm_ns = 0;
+    uint64_t decode_graph_node_custom_projection_ns = 0;
+    uint64_t decode_graph_node_custom_lm_head_ns = 0;
+    uint64_t decode_graph_node_custom_paged_attention_ns = 0;
+    uint64_t decode_graph_node_custom_other_ns = 0;
+    uint64_t decode_graph_node_mul_mat_ns = 0;
+    uint64_t decode_graph_node_mul_mat_id_ns = 0;
+    uint64_t decode_graph_node_norm_ns = 0;
+    uint64_t decode_graph_node_view_copy_ns = 0;
+    uint64_t decode_graph_node_elementwise_ns = 0;
+    uint64_t decode_graph_node_attention_ns = 0;
+    uint64_t decode_graph_node_other_ns = 0;
+    uint64_t decode_semantic_attention_qkv_ns = 0;
+    uint64_t decode_semantic_attention_o_ns = 0;
+    uint64_t decode_semantic_attention_core_ns = 0;
+    uint64_t decode_semantic_kv_rope_ns = 0;
+    uint64_t decode_semantic_moe_router_ns = 0;
+    uint64_t decode_semantic_moe_gate_up_ns = 0;
+    uint64_t decode_semantic_moe_down_ns = 0;
+    uint64_t decode_semantic_shared_dense_ns = 0;
+    uint64_t decode_semantic_dense_ffn_ns = 0;
+    uint64_t decode_semantic_lm_head_ns = 0;
+    uint64_t decode_semantic_norm_residual_ns = 0;
+    uint64_t decode_semantic_copy_view_ns = 0;
+    uint64_t decode_semantic_outside_graph_ns = 0;
+    uint64_t decode_semantic_unattributed_ns = 0;
+    uint64_t decode_graph_node_custom_count = 0;
+    uint64_t decode_graph_node_custom_moe_count = 0;
+    uint64_t decode_graph_node_custom_ssm_count = 0;
+    uint64_t decode_graph_node_custom_projection_count = 0;
+    uint64_t decode_graph_node_custom_lm_head_count = 0;
+    uint64_t decode_graph_node_custom_paged_attention_count = 0;
+    uint64_t decode_graph_node_custom_other_count = 0;
+    uint64_t decode_graph_node_mul_mat_count = 0;
+    uint64_t decode_graph_node_mul_mat_id_count = 0;
+    uint64_t decode_graph_node_norm_count = 0;
+    uint64_t decode_graph_node_view_copy_count = 0;
+    uint64_t decode_graph_node_elementwise_count = 0;
+    uint64_t decode_graph_node_attention_count = 0;
+    uint64_t decode_graph_node_other_count = 0;
+    uint64_t decode_semantic_attention_qkv_count = 0;
+    uint64_t decode_semantic_attention_o_count = 0;
+    uint64_t decode_semantic_attention_core_count = 0;
+    uint64_t decode_semantic_kv_rope_count = 0;
+    uint64_t decode_semantic_moe_router_count = 0;
+    uint64_t decode_semantic_moe_gate_up_count = 0;
+    uint64_t decode_semantic_moe_down_count = 0;
+    uint64_t decode_semantic_shared_dense_count = 0;
+    uint64_t decode_semantic_dense_ffn_count = 0;
+    uint64_t decode_semantic_lm_head_count = 0;
+    uint64_t decode_semantic_norm_residual_count = 0;
+    uint64_t decode_semantic_copy_view_count = 0;
+    uint64_t decode_semantic_outside_graph_count = 0;
+    uint64_t decode_semantic_unattributed_count = 0;
+    uint64_t attention_ns = 0;
+    uint64_t paged_attention_ns = 0;
+    uint64_t standard_attention_ns = 0;
+    uint64_t portable_flash_attention_ns = 0;
+    uint64_t native_flash_attention_ns = 0;
+    uint64_t hal_attention_ns = 0;
+    uint64_t attention_repack_ns = 0;
+    uint64_t moe_forward_ns = 0;
+    uint64_t moe_route_ns = 0;
+    uint64_t moe_reorder_ns = 0;
+    uint64_t moe_expert_ns = 0;
+    uint64_t moe_reduce_ns = 0;
+    uint64_t moe_w1w3_ns = 0;
+    uint64_t moe_w2_ns = 0;
+    uint64_t native_moe_graph_ns = 0;
+    uint64_t moe_rowblock_ns = 0;
+    uint64_t moe_rowblock_w1w3_ns = 0;
+    uint64_t moe_rowblock_w2_ns = 0;
+    uint64_t shared_expert_ns = 0;
+    uint64_t quant_matmul_ns = 0;
+    uint64_t ssm_qkv_wall_ns = 0;
+    uint64_t ssm_gate_wall_ns = 0;
+    uint64_t ssm_delta_wall_ns = 0;
+    uint64_t ssm_out_wall_ns = 0;
+    uint64_t ssm_conv1d_ns = 0;
+    uint64_t ssm_delta_ns = 0;
+    uint64_t kv_update_ns = 0;
+    uint64_t sample_ns = 0;
+    uint64_t kleidiai_candidate_ops = 0;
+    uint64_t kleidiai_allowed_ops = 0;
+    uint64_t kleidiai_rejected_ops = 0;
+    uint64_t graph_cache_hit_count = 0;
+    uint64_t graph_cache_miss_count = 0;
+    uint64_t graph_cache_skip_count = 0;
+    uint64_t q4k_repacked_gemv_cache_hits = 0;
+    uint64_t q4k_repacked_gemv_cache_waited_hits = 0;
+    uint64_t q4k_repacked_gemv_cache_misses = 0;
+    uint64_t q4k_repacked_gemv_cache_evictions = 0;
+    uint64_t q4k_repacked_gemv_cache_evicted_bytes = 0;
+    uint64_t q4k_repacked_gemv_repack_bytes = 0;
+    uint64_t q4k_repacked_gemv_probe_ns = 0;
+    uint64_t q4k_repacked_gemv_resident_bytes = 0;
+    uint64_t q4k_repacked_gemv_distinct_weights_seen = 0;
+    uint64_t q4k_repacked_gemv_repeated_repack_count = 0;
+    uint64_t qact_cache_hits = 0;
+    uint64_t qact_cache_misses = 0;
+    uint64_t qact_cache_reused_bytes = 0;
+    uint64_t q8_batched_weight_cache_ns = 0;
+    uint64_t q8_batched_activation_quant_ns = 0;
+    uint64_t q8_batched_activation_wait_ns = 0;
+    uint64_t q8_batched_activation_pack_ns = 0;
+    uint64_t q8_batched_compute_ns = 0;
+    uint64_t q8_batched_used_ops = 0;
+    uint64_t q8_batched_true_gemm_ops = 0;
+    uint64_t q8_batched_gemv_ops = 0;
+    uint64_t moe_decode_scratch_reused = 0;
+    uint64_t moe_decode_allocations_avoided = 0;
+    std::string graph_cache_last_skip_reason;
+    int prefill_thread_count = 0;
+    int decode_thread_count = 0;
+    int active_thread_count = 0;
+    int prefill_chunk_tokens_effective = 0;
+    std::string prefill_thread_policy;
+    std::string decode_thread_policy;
+    int q4k_true_batched_used = 0;
+    int qwen36_prefill_q4k_batched_mode = 1;
+    int qwen36_prefill_q4k_batched_used = 0;
+    int qwen36_prefill_q4k_batched_probe_pass = 0;
+    float qwen36_prefill_q4k_batched_max_abs_error = 0.0f;
+    uint64_t qwen36_prefill_q4k_probe_participants = 0;
+    uint64_t qwen36_prefill_q4k_probe_failures = 0;
+    uint64_t qwen36_prefill_q4k_admission_downgraded = 0;
+    std::string qwen36_prefill_q4k_batched_reject_reason;
+    int qwen36_ssm_q8_prefill_amx_mode = 0;
+    int qwen36_ssm_q8_prefill_amx_prepared = 0;
+    int qwen36_ssm_q8_prefill_amx_used = 0;
+    std::string qwen36_ssm_q8_prefill_amx_reject_reason;
+    std::string qwen36_ssm_q8_prefill_amx_prepared_projection_counts;
+    std::string qwen36_ssm_q8_prefill_amx_projection_counts;
+    uint64_t qwen36_ssm_q8_prefill_amx_candidate_ops = 0;
+    uint64_t qwen36_ssm_q8_prefill_amx_used_ops = 0;
+    uint64_t qwen36_ssm_q8_prefill_amx_rejected_ops = 0;
+    int qwen36_ssm_q8_decode_used_original_q8_path = 0;
+    std::string qwen36_ssm_projection_actual_types;
+    std::array<uint64_t, kMatmulWeightTypeHistCount> qwen36_ssm_projection_weight_type_hist{};
+    int qwen36_ssm_projection_quant_preserved = 0;
+    int qwen36_ssm_projection_dequantized_count = 0;
+    int q4k_repacked_gemv_used = 0;
+    uint64_t q4k_repacked_gemv_seen_ops = 0;
+    uint64_t q4k_repacked_gemv_candidate_ops = 0;
+    uint64_t q4k_repacked_gemv_used_ops = 0;
+    uint64_t q4k_repacked_gemv_rejected_ops = 0;
+    int q4k_repacked_gemv_last_reject_reason = 0;
+    int q4k_repacked_gemv_primary_disable_reason = 0;
+    std::string q4k_repacked_gemv_last_reject_reason_text;
+    std::string q4k_repacked_gemv_primary_disable_reason_text;
+    int q4k_repacked_gemv_cache_thrash_detected = 0;
+    std::string q4k_repacked_gemv_effective_state;
+    uint64_t gemv_custom_total_ops = 0;
+    uint64_t gemv_custom_decode_ops = 0;
+    uint64_t gemv_custom_prefill_ops = 0;
+    uint64_t gemv_custom_q4k_seen_ops = 0;
+    uint64_t gemv_custom_non_q4k_ops = 0;
+    uint64_t gemv_custom_quant_input_null_ops = 0;
+    uint64_t gemv_custom_shape_reject_ops = 0;
+    uint64_t gemv_custom_phase_unknown_ops = 0;
+    uint64_t gemv_custom_force_reference_ops = 0;
+    uint64_t gemv_custom_dynamic_lora_ops = 0;
+    uint64_t lfm2_decode_lm_head_custom_gemv_used_ops = 0;
+    uint64_t lfm2_decode_lm_head_custom_gemv_ns = 0;
+    uint64_t lfm2_greedy_lm_head_argmax_candidate_ops = 0;
+    uint64_t lfm2_greedy_lm_head_argmax_used_ops = 0;
+    uint64_t lfm2_greedy_lm_head_argmax_rejected_ops = 0;
+    uint64_t lfm2_greedy_lm_head_argmax_ns = 0;
+    int lfm2_greedy_lm_head_argmax_last_reject_reason = 0;
+    uint64_t lfm2_w1w3_q4k_vecdot_rowpair_used_ops = 0;
+    uint64_t lfm2_w1w3_q4k_vecdot_scalar_used_ops = 0;
+    uint64_t lfm2_w1w3_q4k_hwy_used_ops = 0;
+    uint64_t lfm2_w1w3_q4k_repacked_used_ops = 0;
+    uint64_t lfm2_w1w3_q5k_hwy_used_ops = 0;
+    std::array<uint64_t, kMatmulWeightTypeHistCount> gemv_custom_weight_type_hist{};
+    std::array<uint64_t, kMatmulQuantInputTypeHistCount> gemv_custom_quant_input_type_hist{};
+    int gemv_custom_tasks_effective = 0;
+    std::string gemv_custom_tasks_cap_reason;
+    uint64_t decode_matmul_created_ops = 0;
+    std::array<uint64_t, kMatmulWeightTypeHistCount> decode_matmul_weight_type_hist{};
+    std::array<uint64_t, kMatmulPathHistCount> decode_matmul_path_hist{};
+    std::array<uint64_t, kMatmulWeightTypeHistCount> prefill_matmul_weight_type_hist{};
+    std::array<uint64_t, kMatmulPathHistCount> prefill_matmul_path_hist{};
+    std::vector<MatmulShapeCensusEntry> decode_matmul_top_shapes;
+    std::vector<MatmulShapeCensusEntry> prefill_matmul_top_shapes;
+    std::vector<MatmulShapeCensusEntry> prefill_matmul_ggml_top_shapes;
+    uint64_t qwen_target_ggml_compute_ops = 0;
+    uint64_t qwen_target_ggml_matmul_ops = 0;
+    uint64_t qwen_target_ggml_matmul_id_ops = 0;
+    uint64_t qwen_target_ggml_quant_vecdot_ops = 0;
+    uint64_t qwen_target_ggml_quantize_kv_ops = 0;
+    uint64_t qwen_target_ggml_attention_ops = 0;
+    std::string qwen_target_ggml_compute_last_reason;
+    std::string qwen_target_ggml_compute_last_op;
+    std::string qwen_target_ggml_compute_target;
+    uint64_t q6k_gemv_seen_ops = 0;
+    uint64_t q6k_gemv_candidate_ops = 0;
+    uint64_t q6k_gemv_used_ops = 0;
+    uint64_t q6k_gemv_rejected_ops = 0;
+    uint64_t q6k_gemv_reject_quant_input_null_ops = 0;
+    uint64_t q6k_gemv_reject_unsupported_quant_input_ops = 0;
+    uint64_t q6k_gemv_reject_shape_ops = 0;
+    uint64_t q6k_gemv_reject_phase_ops = 0;
+    uint64_t q6k_gemv_reject_kernel_unavailable_ops = 0;
+    std::string q6k_gemv_last_reject_reason;
+    uint64_t q6k_gemv_total_ns = 0;
+    std::string q6k_gemv_effective_phase;
+    std::string q6k_gemv_graph_phase;
+    std::string q6k_gemv_callback_phase;
+    std::vector<MatmulShapeCensusEntry> q6k_gemv_weight_shapes;
+    std::vector<MatmulShapeCensusEntry> native_moe_graph_top_slow_nodes;
+    std::vector<MatmulShapeCensusEntry> decode_graph_top_slow_nodes;
+    std::string native_moe_graph_node_hist;
+    int native_moe_timing_missing = 0;
+    uint64_t moe_small_decode_parallel_candidate_ops = 0;
+    uint64_t moe_small_decode_parallel_used_ops = 0;
+    uint64_t moe_small_decode_parallel_rejected_ops = 0;
+    std::string moe_small_decode_parallel_last_reject_reason;
+    std::array<uint64_t, kMatmulWeightTypeHistCount> moe_expert_matmul_weight_type_hist{};
+    uint64_t moe_q4k_repacked_candidate_ops = 0;
+    uint64_t moe_q4k_repacked_used_ops = 0;
+    uint64_t moe_q4k_repacked_rejected_ops = 0;
+    std::string moe_q4k_repacked_last_reject_reason;
+    uint64_t moe_q5k_repacked_candidate_ops = 0;
+    uint64_t moe_q5k_repacked_used_ops = 0;
+    uint64_t moe_q5k_repacked_rejected_ops = 0;
+    std::string moe_q5k_repacked_last_reject_reason;
+    uint64_t moe_kquant_raw_batched_q4k_used_ops = 0;
+    uint64_t moe_kquant_raw_batched_q4k_ns = 0;
+    uint64_t moe_kquant_raw_batched_q5k_used_ops = 0;
+    uint64_t moe_kquant_raw_batched_q5k_ns = 0;
+    uint64_t gemma4_moe_prefill_quant_batch_candidate_ops = 0;
+    uint64_t gemma4_moe_prefill_quant_batch_used_ops = 0;
+    uint64_t gemma4_moe_prefill_quant_batch_rejected_ops = 0;
+    std::string gemma4_moe_prefill_quant_batch_last_reject_reason;
+    uint64_t gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops = 0;
+    uint64_t gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops = 0;
+    uint64_t gemma4_moe_prefill_quant_batch_gate_up_used = 0;
+    uint64_t gemma4_moe_prefill_quant_batch_down_used = 0;
+    uint64_t gemma4_native_moe_prefill_candidate_layers = 0;
+    uint64_t gemma4_native_moe_prefill_used_layers = 0;
+    uint64_t gemma4_native_moe_prefill_rejected_layers = 0;
+    std::string gemma4_native_moe_prefill_last_reject_reason;
+    uint64_t gemma4_native_moe_prefill_gate_up_ns = 0;
+    uint64_t gemma4_native_moe_prefill_down_ns = 0;
+    uint64_t gemma4_native_moe_prefill_total_ns = 0;
+    uint64_t gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops = 0;
+    uint64_t gemma4_native_moe_prefill_duplicate_work_detected = 0;
+    uint64_t gemma4_dense_prefill_native_candidate_ops = 0;
+    uint64_t gemma4_dense_prefill_native_used_ops = 0;
+    uint64_t gemma4_dense_prefill_native_rejected_ops = 0;
+    std::string gemma4_dense_prefill_native_last_reject_reason;
+    uint64_t gemma4_dense_prefill_native_q4k_ops = 0;
+    uint64_t gemma4_dense_prefill_native_q8_0_ops = 0;
+    uint64_t gemma4_dense_prefill_native_ns = 0;
+    uint64_t gemma4_dense_prefill_replaced_ggml_mul_mat_ops = 0;
+    uint64_t gemma4_dense_prefill_duplicate_work_detected = 0;
+    uint64_t gemma4_decode_native_candidate_ops = 0;
+    uint64_t gemma4_decode_native_used_ops = 0;
+    uint64_t gemma4_decode_native_rejected_ops = 0;
+    std::string gemma4_decode_native_last_reject_reason;
+    uint64_t gemma4_decode_native_moe_used_ops = 0;
+    uint64_t gemma4_decode_native_dense_used_ops = 0;
+    uint64_t gemma4_decode_native_lm_head_used_ops = 0;
+    uint64_t gemma4_decode_native_ns = 0;
+    uint64_t gemma4_decode_replaced_ggml_mul_mat_ops = 0;
+    uint64_t gemma4_decode_replaced_ggml_mul_mat_id_ops = 0;
+    uint64_t gemma4_decode_duplicate_work_detected = 0;
+    uint64_t gemma4_native_int4_gemv_candidate_ops = 0;
+    uint64_t gemma4_native_int4_gemv_used_ops = 0;
+    uint64_t gemma4_native_int4_gemv_ns = 0;
+    uint64_t gemma4_native_int4_repacked_weight_count = 0;
+    uint64_t gemma4_native_int4_repacked_bytes = 0;
+    uint64_t gemma4_native_fused_gateup_used_ops = 0;
+    uint64_t ggml_delegated_quant_gemv_ops = 0;
+    uint64_t gemma4_native_paged_attention_candidate_ops = 0;
+    uint64_t gemma4_native_paged_attention_used_ops = 0;
+    uint64_t gemma4_native_paged_attention_ns = 0;
+    uint64_t gemma4_ggml_attention_fallback_ops = 0;
+    int gemma4_paged_attention_cache_type = -1;
+    int gemma4_paged_attention_context_len = 0;
+    uint64_t gemma4_paged_attention_head_range = 0;
+    uint64_t native_moe_fast_decode_candidate_ops = 0;
+    uint64_t native_moe_fast_decode_used_ops = 0;
+    uint64_t native_moe_fast_decode_rejected_ops = 0;
+    std::string native_moe_fast_decode_last_reject_reason;
+    uint64_t native_moe_fast_decode_w1w3_used_ops = 0;
+    uint64_t native_moe_fast_decode_w2_used_ops = 0;
+    uint64_t native_moe_fast_decode_ns = 0;
+    uint64_t native_moe_fallback_w1w3_ns = 0;
+    uint64_t native_moe_fallback_w2_ns = 0;
+    uint64_t native_moe_fast_w1w3_ns = 0;
+    uint64_t native_moe_fast_w2_ns = 0;
+    uint64_t native_moe_fast_reduce_ns = 0;
+    uint64_t native_moe_fast_total_ns = 0;
+    uint64_t native_moe_fast_w1w3_used_ops = 0;
+    uint64_t native_moe_fast_w2_used_ops = 0;
+    uint64_t native_moe_fallback_w1w3_ops = 0;
+    uint64_t native_moe_fallback_w2_ops = 0;
+    uint64_t native_moe_fallback_ops = 0;
+    uint64_t native_moe_fast_replaced_fallback_ops = 0;
+    int native_moe_fast_duplicate_work_detected = 0;
+    int native_moe_fast_missing_w2 = 0;
+    int native_moe_fast_partial_expert_coverage = 0;
+    int native_moe_fast_covered_experts = 0;
+    int native_moe_selected_experts = 0;
+    uint64_t native_moe_fast_w2_q5k_candidate_ops = 0;
+    uint64_t native_moe_fast_w2_q5k_used_ops = 0;
+    uint64_t native_moe_fast_w2_q5k_rejected_ops = 0;
+    std::string native_moe_fast_w2_q5k_last_reject_reason;
+    uint64_t native_moe_fast_w2_q5k_ns = 0;
+    uint64_t qwen_native_moe_w2_q5k_raw_batched_used_ops = 0;
+    uint64_t qwen_native_moe_w2_q5k_raw_batched_ns = 0;
+    uint64_t qwen_native_moe_fused_router_used_ops = 0;
+    uint64_t qwen_native_moe_fused_router_ns = 0;
+    uint64_t qwen_native_moe_q4_gateup_rowpair_used_ops = 0;
+    uint64_t qwen_native_moe_q4_gateup_rowpair_ns = 0;
+    uint64_t graph_ctx_requested_mb = 0;
+    uint64_t graph_ctx_available_mb = 0;
+    uint64_t graph_ctx_safety_margin_mb = 0;
+    int graph_ctx_downgraded_chunk_tokens = 0;
+    std::string graph_ctx_fail_reason;
+    std::string qwen35_moe_path;
+    uint64_t qwen35_moe_layers_seen = 0;
+    uint64_t qwen35_moe_forward_calls = 0;
+    std::array<uint64_t, kMatmulWeightTypeHistCount> qwen35_moe_w1w3_weight_type_hist{};
+    std::array<uint64_t, kMatmulWeightTypeHistCount> qwen35_moe_w2_weight_type_hist{};
+    int qwen35_moe_selected_expert_count = 0;
+    int qwen35_moe_top_k = 0;
+    int qwen35_moe_instrumentation_missing = 0;
+    int moe_selected_expert_count = 0;
+    int moe_top_k = 0;
+    int moe_expert_parallel_tasks = 0;
+    std::vector<MatmulDispatchCensusEntry> matmul_dispatch_top_slow_entries;
+    std::vector<MatmulShapeCensusEntry> qwen36_prefill_top_slow_ops;
+    std::vector<MatmulShapeCensusEntry> gemma4_prefill_top_slow_ops;
+    uint64_t qwen36_prefill_native_moe_fast_candidate_ops = 0;
+    uint64_t qwen36_prefill_native_moe_fast_used_ops = 0;
+    uint64_t qwen36_prefill_native_moe_fast_rejected_ops = 0;
+    std::string qwen36_prefill_native_moe_fast_last_reject_reason;
+    uint64_t qwen36_prefill_total_ns = 0;
+    uint64_t qwen36_prefill_ssm_projection_ns = 0;
+    uint64_t qwen36_prefill_ssm_delta_state_ns = 0;
+    uint64_t ssm_delta_fast_default_used_ops = 0;
+    uint64_t ssm_delta_fast_default_wall_ns = 0;
+    uint64_t qwen36_prefill_attention_ns = 0;
+    uint64_t qwen36_prefill_mlp_or_moe_ns = 0;
+    uint64_t qwen36_prefill_graph_build_ns = 0;
+    uint64_t qwen36_prefill_graph_execute_ns = 0;
+    uint64_t gemma4_prefill_total_ns = 0;
+    uint64_t gemma4_prefill_graph_build_ns = 0;
+    uint64_t gemma4_prefill_graph_execute_ns = 0;
+    uint64_t gemma4_prefill_attention_ns = 0;
+    uint64_t gemma4_prefill_moe_or_mlp_ns = 0;
+    uint64_t gemma4_prefill_mul_mat_id_ns = 0;
+    uint64_t gemma4_prefill_mul_mat_ns = 0;
+    uint64_t gemma4_prefill_flash_attention_ns = 0;
+    std::string callback_mode;
+    int paged_attn_decode_head_tile_effective = 0;
+    int arm_batched_quant_used = 0;
+    int attention_path_paged = 0;
+    int attention_path_standard = 0;
+    int attention_path_portable_flash = 0;
+    int attention_path_native_flash = 0;
+    int attention_path_hal = 0;
+    uint64_t flash_attention_headseq_prefill_calls = 0;
+    uint64_t flash_attention_native_decode_calls = 0;
+    uint64_t flash_attention_reference_calls = 0;
+    uint64_t flash_attention_non_avx512_tiled_calls = 0;
+    uint64_t flash_attention_avx512_tiled_calls = 0;
+    int flash_attention_last_nth = 0;
+    int flash_attention_last_active_threads = 0;
+    int kleidiai_compiled_enabled = 0;
+    int kleidiai_last_reject_reason = 0;
+    int moe_task_count = 0;
+    int moe_rowblock_used = 0;
+    int moe_rowblock_tasks = 0;
+    int selected_expert_count = 0;
+    int ssm_conv1d_calls = 0;
+    int ssm_delta_calls = 0;
+    bool token_id_submit_used = false;
+    int first_sampled_token_id = -1;
+    int first_visible_token_id = -1;
+    DecodeFinishCause decode_finish_cause = DecodeFinishCause::Unknown;
+    DecodeSilentFinishReason decode_silent_finish_reason = DecodeSilentFinishReason::None;
+    std::chrono::steady_clock::time_point last_progress_time{};
+    int pending_scheduler_progress = 0;
+
+    // Scheduler sequence ID (assigned by scheduler->AddRequest)
+    // -1 indicates not yet registered with scheduler
+    int seq_id = -1;
+
+    // =========================================================================
+    // Universal Graph Execution State (Universal Engine)
+    // =========================================================================
+    bool is_graph_execution = false;
+    std::string graph_name;
+    std::vector<OwnedGraphInput> graph_inputs;
+    GraphResultCallback graph_callback = nullptr;
+    std::atomic<bool> graph_callback_completed{false};
+
+    // Reset request state for pool reuse
+    void Reset() {
+        id = -1;
+        prompt = "";
+        lora_name.clear();
+        max_tokens = 0;
+        callback = nullptr;
+        callback_ex = nullptr;
+        user_data = nullptr;
+        tokens.clear();
+        token_history.clear();
+        prompt_tokens_for_cache.clear();
+        original_prompt_tokens_for_cache.clear();
+        sequence_tokens_for_prefix_cache.clear();
+        prompt_token_count = 0;
+        registered_prefix_blocks = 0;
+        prefix_cache_allowed = false;
+        prefix_cache_hit = false;
+        prefix_cache_skipped_tokens = 0;
+        prefix_cache_hit_blocks = 0;
+        prefix_cache_registered_blocks = 0;
+        prefix_cache_extended_blocks = 0;
+        hybrid_ssm_snapshot_restore_attempted = false;
+        hybrid_ssm_snapshot_restore_applied = false;
+        prefix_cache_skip_reason.clear();
+        utf8_pending.clear();
+        think_tag_pending.clear();
+        tool_call_tag_pending.clear();
+        tool_response_tag_pending.clear();
+        suppress_reasoning_tags = true;
+        in_think_block = false;
+        in_tool_call_block = false;
+        in_tool_response_block = false;
+        n_past = 0;
+        is_prefill = true;
+        generated_count = 0;
+        parity_debug_output_tokens = 0;
+        finished = false;
+        parity_debug_text_primed = false;
+        parity_debug_token_primed = false;
+        parity_debug_template_applied = false;
+        parity_debug_submit_api.clear();
+        token_id_submit_used = false;
+        cancelled = false;
+        generation_terminal_dispatched.store(false, std::memory_order_relaxed);
+        embedding_terminal_dispatched.store(false, std::memory_order_relaxed);
+        tier = "standard";
+        block_table.clear();
+        swap_state.Clear();
+        is_swapped = false;
+        ssm_runtime_states.clear();
+        is_embedding = false;
+        embedding_callback = nullptr;
+        token_result_callback = nullptr;
+        pooling_type = densecore::PoolingStrategy::MEAN;
+        normalize_embedding = true;
+        json_mode = false;
+        sampling_params = SamplingParams();
+        disallowed_token_ids.clear();
+        allowed_token_ids.clear();
+        stop_sequences.clear();
+        stop_buffer.clear();
+        stop_buffer_max = 0;
+        grammar.enabled = false;
+        grammar.is_json_mode = false;
+        arrival_time = std::chrono::steady_clock::time_point();
+        start_time = std::chrono::steady_clock::time_point();
+        first_token_time = std::chrono::steady_clock::time_point();
+        last_token_time = std::chrono::steady_clock::time_point();
+        last_sampled_token_time = std::chrono::steady_clock::time_point();
+        last_external_emit_time = std::chrono::steady_clock::time_point();
+        priority = 100;
+        is_high_priority = false;
+        estimated_length = 0;
+        empty_schedule_stall_count = 0;
+        batch_build_stall_count = 0;
+        decode_no_output_steps = 0;
+        sampled_token_count = 0;
+        visible_emitted_token_count = 0;
+        suppressed_token_count = 0;
+        scheduler_wait_ns = 0;
+        batch_build_ns = 0;
+        graph_build_ns = 0;
+        graph_rebind_ns = 0;
+        graph_execute_ns = 0;
+        decode_graph_execute_ns = 0;
+        decode_attention_ns = 0;
+        decode_paged_attention_ns = 0;
+        decode_native_moe_graph_ns = 0;
+        decode_moe_route_ns = 0;
+        decode_moe_w1w3_ns = 0;
+        decode_moe_w2_ns = 0;
+        decode_moe_reduce_ns = 0;
+        decode_ssm_qkv_wall_ns = 0;
+        decode_ssm_out_wall_ns = 0;
+        decode_ssm_delta_wall_ns = 0;
+        decode_ssm_conv1d_ns = 0;
+        decode_ssm_delta_ns = 0;
+        decode_sample_ns = 0;
+        decode_graph_node_measured_ns = 0;
+        decode_graph_node_custom_ns = 0;
+        decode_graph_node_custom_moe_ns = 0;
+        decode_graph_node_custom_ssm_ns = 0;
+        decode_graph_node_custom_projection_ns = 0;
+        decode_graph_node_custom_lm_head_ns = 0;
+        decode_graph_node_custom_paged_attention_ns = 0;
+        decode_graph_node_custom_other_ns = 0;
+        decode_graph_node_mul_mat_ns = 0;
+        decode_graph_node_mul_mat_id_ns = 0;
+        decode_graph_node_norm_ns = 0;
+        decode_graph_node_view_copy_ns = 0;
+        decode_graph_node_elementwise_ns = 0;
+        decode_graph_node_attention_ns = 0;
+        decode_graph_node_other_ns = 0;
+        decode_semantic_attention_qkv_ns = 0;
+        decode_semantic_attention_o_ns = 0;
+        decode_semantic_attention_core_ns = 0;
+        decode_semantic_kv_rope_ns = 0;
+        decode_semantic_moe_router_ns = 0;
+        decode_semantic_moe_gate_up_ns = 0;
+        decode_semantic_moe_down_ns = 0;
+        decode_semantic_shared_dense_ns = 0;
+        decode_semantic_dense_ffn_ns = 0;
+        decode_semantic_lm_head_ns = 0;
+        decode_semantic_norm_residual_ns = 0;
+        decode_semantic_copy_view_ns = 0;
+        decode_semantic_outside_graph_ns = 0;
+        decode_semantic_unattributed_ns = 0;
+        decode_graph_node_custom_count = 0;
+        decode_graph_node_custom_moe_count = 0;
+        decode_graph_node_custom_ssm_count = 0;
+        decode_graph_node_custom_projection_count = 0;
+        decode_graph_node_custom_lm_head_count = 0;
+        decode_graph_node_custom_paged_attention_count = 0;
+        decode_graph_node_custom_other_count = 0;
+        decode_graph_node_mul_mat_count = 0;
+        decode_graph_node_mul_mat_id_count = 0;
+        decode_graph_node_norm_count = 0;
+        decode_graph_node_view_copy_count = 0;
+        decode_graph_node_elementwise_count = 0;
+        decode_graph_node_attention_count = 0;
+        decode_graph_node_other_count = 0;
+        decode_semantic_attention_qkv_count = 0;
+        decode_semantic_attention_o_count = 0;
+        decode_semantic_attention_core_count = 0;
+        decode_semantic_kv_rope_count = 0;
+        decode_semantic_moe_router_count = 0;
+        decode_semantic_moe_gate_up_count = 0;
+        decode_semantic_moe_down_count = 0;
+        decode_semantic_shared_dense_count = 0;
+        decode_semantic_dense_ffn_count = 0;
+        decode_semantic_lm_head_count = 0;
+        decode_semantic_norm_residual_count = 0;
+        decode_semantic_copy_view_count = 0;
+        decode_semantic_outside_graph_count = 0;
+        decode_semantic_unattributed_count = 0;
+        attention_ns = 0;
+        paged_attention_ns = 0;
+        standard_attention_ns = 0;
+        portable_flash_attention_ns = 0;
+        native_flash_attention_ns = 0;
+        hal_attention_ns = 0;
+        attention_repack_ns = 0;
+        moe_forward_ns = 0;
+        moe_route_ns = 0;
+        moe_reorder_ns = 0;
+        moe_expert_ns = 0;
+        moe_reduce_ns = 0;
+        moe_w1w3_ns = 0;
+        moe_w2_ns = 0;
+        native_moe_graph_ns = 0;
+        moe_rowblock_ns = 0;
+        moe_rowblock_w1w3_ns = 0;
+        moe_rowblock_w2_ns = 0;
+        shared_expert_ns = 0;
+        quant_matmul_ns = 0;
+        ssm_qkv_wall_ns = 0;
+        ssm_gate_wall_ns = 0;
+        ssm_delta_wall_ns = 0;
+        ssm_out_wall_ns = 0;
+        ssm_conv1d_ns = 0;
+        ssm_delta_ns = 0;
+        kv_update_ns = 0;
+        sample_ns = 0;
+        kleidiai_candidate_ops = 0;
+        kleidiai_allowed_ops = 0;
+        kleidiai_rejected_ops = 0;
+        graph_cache_hit_count = 0;
+        graph_cache_miss_count = 0;
+        graph_cache_skip_count = 0;
+        q4k_repacked_gemv_cache_hits = 0;
+        q4k_repacked_gemv_cache_waited_hits = 0;
+        q4k_repacked_gemv_cache_misses = 0;
+        q4k_repacked_gemv_cache_evictions = 0;
+        q4k_repacked_gemv_cache_evicted_bytes = 0;
+        q4k_repacked_gemv_repack_bytes = 0;
+        q4k_repacked_gemv_probe_ns = 0;
+        q4k_repacked_gemv_resident_bytes = 0;
+        q4k_repacked_gemv_distinct_weights_seen = 0;
+        q4k_repacked_gemv_repeated_repack_count = 0;
+        qact_cache_hits = 0;
+        qact_cache_misses = 0;
+        qact_cache_reused_bytes = 0;
+        q8_batched_weight_cache_ns = 0;
+        q8_batched_activation_quant_ns = 0;
+        q8_batched_activation_wait_ns = 0;
+        q8_batched_activation_pack_ns = 0;
+        q8_batched_compute_ns = 0;
+        q8_batched_used_ops = 0;
+        q8_batched_true_gemm_ops = 0;
+        q8_batched_gemv_ops = 0;
+        moe_decode_scratch_reused = 0;
+        moe_decode_allocations_avoided = 0;
+        graph_cache_last_skip_reason.clear();
+        prefill_thread_count = 0;
+        decode_thread_count = 0;
+        active_thread_count = 0;
+        prefill_chunk_tokens_effective = 0;
+        prefill_thread_policy.clear();
+        decode_thread_policy.clear();
+        q4k_true_batched_used = 0;
+        qwen36_prefill_q4k_batched_mode = 1;
+        qwen36_prefill_q4k_batched_used = 0;
+        qwen36_prefill_q4k_batched_probe_pass = 0;
+        qwen36_prefill_q4k_batched_max_abs_error = 0.0f;
+        qwen36_prefill_q4k_probe_participants = 0;
+        qwen36_prefill_q4k_probe_failures = 0;
+        qwen36_prefill_q4k_admission_downgraded = 0;
+        qwen36_prefill_q4k_batched_reject_reason.clear();
+        qwen36_ssm_q8_prefill_amx_mode = 0;
+        qwen36_ssm_q8_prefill_amx_prepared = 0;
+        qwen36_ssm_q8_prefill_amx_used = 0;
+        qwen36_ssm_q8_prefill_amx_reject_reason.clear();
+        qwen36_ssm_q8_prefill_amx_prepared_projection_counts.clear();
+        qwen36_ssm_q8_prefill_amx_projection_counts.clear();
+        qwen36_ssm_q8_prefill_amx_candidate_ops = 0;
+        qwen36_ssm_q8_prefill_amx_used_ops = 0;
+        qwen36_ssm_q8_prefill_amx_rejected_ops = 0;
+        qwen36_ssm_q8_decode_used_original_q8_path = 0;
+        qwen36_ssm_projection_actual_types.clear();
+        qwen36_ssm_projection_weight_type_hist.fill(0);
+        qwen36_ssm_projection_quant_preserved = 0;
+        qwen36_ssm_projection_dequantized_count = 0;
+        q4k_repacked_gemv_used = 0;
+        q4k_repacked_gemv_seen_ops = 0;
+        q4k_repacked_gemv_candidate_ops = 0;
+        q4k_repacked_gemv_used_ops = 0;
+        q4k_repacked_gemv_rejected_ops = 0;
+        q4k_repacked_gemv_last_reject_reason = 0;
+        q4k_repacked_gemv_primary_disable_reason = 0;
+        q4k_repacked_gemv_last_reject_reason_text.clear();
+        q4k_repacked_gemv_primary_disable_reason_text.clear();
+        q4k_repacked_gemv_cache_thrash_detected = 0;
+        q4k_repacked_gemv_effective_state.clear();
+        gemv_custom_total_ops = 0;
+        gemv_custom_decode_ops = 0;
+        gemv_custom_prefill_ops = 0;
+        gemv_custom_q4k_seen_ops = 0;
+        gemv_custom_non_q4k_ops = 0;
+        gemv_custom_quant_input_null_ops = 0;
+        gemv_custom_shape_reject_ops = 0;
+        gemv_custom_phase_unknown_ops = 0;
+        gemv_custom_force_reference_ops = 0;
+        gemv_custom_dynamic_lora_ops = 0;
+        lfm2_decode_lm_head_custom_gemv_used_ops = 0;
+        lfm2_decode_lm_head_custom_gemv_ns = 0;
+        lfm2_greedy_lm_head_argmax_candidate_ops = 0;
+        lfm2_greedy_lm_head_argmax_used_ops = 0;
+        lfm2_greedy_lm_head_argmax_rejected_ops = 0;
+        lfm2_greedy_lm_head_argmax_ns = 0;
+        lfm2_greedy_lm_head_argmax_last_reject_reason = 0;
+        lfm2_w1w3_q4k_vecdot_rowpair_used_ops = 0;
+        lfm2_w1w3_q4k_vecdot_scalar_used_ops = 0;
+        lfm2_w1w3_q4k_hwy_used_ops = 0;
+        lfm2_w1w3_q4k_repacked_used_ops = 0;
+        lfm2_w1w3_q5k_hwy_used_ops = 0;
+        gemv_custom_weight_type_hist.fill(0);
+        gemv_custom_quant_input_type_hist.fill(0);
+        gemv_custom_tasks_effective = 0;
+        gemv_custom_tasks_cap_reason.clear();
+        decode_matmul_created_ops = 0;
+        decode_matmul_weight_type_hist.fill(0);
+        decode_matmul_path_hist.fill(0);
+        prefill_matmul_weight_type_hist.fill(0);
+        prefill_matmul_path_hist.fill(0);
+        decode_matmul_top_shapes.clear();
+        prefill_matmul_top_shapes.clear();
+        prefill_matmul_ggml_top_shapes.clear();
+        qwen_target_ggml_compute_ops = 0;
+        qwen_target_ggml_matmul_ops = 0;
+        qwen_target_ggml_matmul_id_ops = 0;
+        qwen_target_ggml_quant_vecdot_ops = 0;
+        qwen_target_ggml_quantize_kv_ops = 0;
+        qwen_target_ggml_attention_ops = 0;
+        qwen_target_ggml_compute_last_reason.clear();
+        qwen_target_ggml_compute_last_op.clear();
+        qwen_target_ggml_compute_target.clear();
+        q6k_gemv_seen_ops = 0;
+        q6k_gemv_candidate_ops = 0;
+        q6k_gemv_used_ops = 0;
+        q6k_gemv_rejected_ops = 0;
+        q6k_gemv_reject_quant_input_null_ops = 0;
+        q6k_gemv_reject_unsupported_quant_input_ops = 0;
+        q6k_gemv_reject_shape_ops = 0;
+        q6k_gemv_reject_phase_ops = 0;
+        q6k_gemv_reject_kernel_unavailable_ops = 0;
+        q6k_gemv_last_reject_reason.clear();
+        q6k_gemv_total_ns = 0;
+        q6k_gemv_effective_phase.clear();
+        q6k_gemv_graph_phase.clear();
+        q6k_gemv_callback_phase.clear();
+        q6k_gemv_weight_shapes.clear();
+        native_moe_graph_top_slow_nodes.clear();
+        decode_graph_top_slow_nodes.clear();
+        native_moe_graph_node_hist.clear();
+        native_moe_timing_missing = 0;
+        moe_small_decode_parallel_candidate_ops = 0;
+        moe_small_decode_parallel_used_ops = 0;
+        moe_small_decode_parallel_rejected_ops = 0;
+        moe_small_decode_parallel_last_reject_reason.clear();
+        moe_expert_matmul_weight_type_hist.fill(0);
+        moe_q4k_repacked_candidate_ops = 0;
+        moe_q4k_repacked_used_ops = 0;
+        moe_q4k_repacked_rejected_ops = 0;
+        moe_q4k_repacked_last_reject_reason.clear();
+        moe_q5k_repacked_candidate_ops = 0;
+        moe_q5k_repacked_used_ops = 0;
+        moe_q5k_repacked_rejected_ops = 0;
+        moe_q5k_repacked_last_reject_reason.clear();
+        moe_kquant_raw_batched_q4k_used_ops = 0;
+        moe_kquant_raw_batched_q4k_ns = 0;
+        moe_kquant_raw_batched_q5k_used_ops = 0;
+        moe_kquant_raw_batched_q5k_ns = 0;
+        gemma4_moe_prefill_quant_batch_candidate_ops = 0;
+        gemma4_moe_prefill_quant_batch_used_ops = 0;
+        gemma4_moe_prefill_quant_batch_rejected_ops = 0;
+        gemma4_moe_prefill_quant_batch_last_reject_reason.clear();
+        gemma4_moe_prefill_quant_batch_reject_gate_up_shape_or_type_ops = 0;
+        gemma4_moe_prefill_quant_batch_reject_down_shape_or_type_ops = 0;
+        gemma4_moe_prefill_quant_batch_gate_up_used = 0;
+        gemma4_moe_prefill_quant_batch_down_used = 0;
+        gemma4_native_moe_prefill_candidate_layers = 0;
+        gemma4_native_moe_prefill_used_layers = 0;
+        gemma4_native_moe_prefill_rejected_layers = 0;
+        gemma4_native_moe_prefill_last_reject_reason.clear();
+        gemma4_native_moe_prefill_gate_up_ns = 0;
+        gemma4_native_moe_prefill_down_ns = 0;
+        gemma4_native_moe_prefill_total_ns = 0;
+        gemma4_native_moe_prefill_replaced_ggml_mul_mat_id_ops = 0;
+        gemma4_native_moe_prefill_duplicate_work_detected = 0;
+        gemma4_dense_prefill_native_candidate_ops = 0;
+        gemma4_dense_prefill_native_used_ops = 0;
+        gemma4_dense_prefill_native_rejected_ops = 0;
+        gemma4_dense_prefill_native_last_reject_reason.clear();
+        gemma4_dense_prefill_native_q4k_ops = 0;
+        gemma4_dense_prefill_native_q8_0_ops = 0;
+        gemma4_dense_prefill_native_ns = 0;
+        gemma4_dense_prefill_replaced_ggml_mul_mat_ops = 0;
+        gemma4_dense_prefill_duplicate_work_detected = 0;
+        gemma4_decode_native_candidate_ops = 0;
+        gemma4_decode_native_used_ops = 0;
+        gemma4_decode_native_rejected_ops = 0;
+        gemma4_decode_native_last_reject_reason.clear();
+        gemma4_decode_native_moe_used_ops = 0;
+        gemma4_decode_native_dense_used_ops = 0;
+        gemma4_decode_native_lm_head_used_ops = 0;
+        gemma4_decode_native_ns = 0;
+        gemma4_decode_replaced_ggml_mul_mat_ops = 0;
+        gemma4_decode_replaced_ggml_mul_mat_id_ops = 0;
+        gemma4_decode_duplicate_work_detected = 0;
+        gemma4_native_int4_gemv_candidate_ops = 0;
+        gemma4_native_int4_gemv_used_ops = 0;
+        gemma4_native_int4_gemv_ns = 0;
+        gemma4_native_int4_repacked_weight_count = 0;
+        gemma4_native_int4_repacked_bytes = 0;
+        gemma4_native_fused_gateup_used_ops = 0;
+        ggml_delegated_quant_gemv_ops = 0;
+        gemma4_native_paged_attention_candidate_ops = 0;
+        gemma4_native_paged_attention_used_ops = 0;
+        gemma4_native_paged_attention_ns = 0;
+        gemma4_ggml_attention_fallback_ops = 0;
+        gemma4_paged_attention_cache_type = -1;
+        gemma4_paged_attention_context_len = 0;
+        gemma4_paged_attention_head_range = 0;
+        native_moe_fast_decode_candidate_ops = 0;
+        native_moe_fast_decode_used_ops = 0;
+        native_moe_fast_decode_rejected_ops = 0;
+        native_moe_fast_decode_last_reject_reason.clear();
+        native_moe_fast_decode_w1w3_used_ops = 0;
+        native_moe_fast_decode_w2_used_ops = 0;
+        native_moe_fast_decode_ns = 0;
+        native_moe_fallback_w1w3_ns = 0;
+        native_moe_fallback_w2_ns = 0;
+        native_moe_fast_w1w3_ns = 0;
+        native_moe_fast_w2_ns = 0;
+        native_moe_fast_reduce_ns = 0;
+        native_moe_fast_total_ns = 0;
+        native_moe_fast_w1w3_used_ops = 0;
+        native_moe_fast_w2_used_ops = 0;
+        native_moe_fallback_w1w3_ops = 0;
+        native_moe_fallback_w2_ops = 0;
+        native_moe_fallback_ops = 0;
+        native_moe_fast_replaced_fallback_ops = 0;
+        native_moe_fast_duplicate_work_detected = 0;
+        native_moe_fast_missing_w2 = 0;
+        native_moe_fast_partial_expert_coverage = 0;
+        native_moe_fast_covered_experts = 0;
+        native_moe_selected_experts = 0;
+        native_moe_fast_w2_q5k_candidate_ops = 0;
+        native_moe_fast_w2_q5k_used_ops = 0;
+        native_moe_fast_w2_q5k_rejected_ops = 0;
+        native_moe_fast_w2_q5k_last_reject_reason.clear();
+        native_moe_fast_w2_q5k_ns = 0;
+        qwen_native_moe_w2_q5k_raw_batched_used_ops = 0;
+        qwen_native_moe_w2_q5k_raw_batched_ns = 0;
+        qwen_native_moe_fused_router_used_ops = 0;
+        qwen_native_moe_fused_router_ns = 0;
+        qwen_native_moe_q4_gateup_rowpair_used_ops = 0;
+        qwen_native_moe_q4_gateup_rowpair_ns = 0;
+        graph_ctx_requested_mb = 0;
+        graph_ctx_available_mb = 0;
+        graph_ctx_safety_margin_mb = 0;
+        graph_ctx_downgraded_chunk_tokens = 0;
+        graph_ctx_fail_reason.clear();
+        qwen35_moe_path.clear();
+        qwen35_moe_layers_seen = 0;
+        qwen35_moe_forward_calls = 0;
+        qwen35_moe_w1w3_weight_type_hist.fill(0);
+        qwen35_moe_w2_weight_type_hist.fill(0);
+        qwen35_moe_selected_expert_count = 0;
+        qwen35_moe_top_k = 0;
+        qwen35_moe_instrumentation_missing = 0;
+        moe_selected_expert_count = 0;
+        moe_top_k = 0;
+        moe_expert_parallel_tasks = 0;
+        matmul_dispatch_top_slow_entries.clear();
+        qwen36_prefill_top_slow_ops.clear();
+        gemma4_prefill_top_slow_ops.clear();
+        qwen36_prefill_native_moe_fast_candidate_ops = 0;
+        qwen36_prefill_native_moe_fast_used_ops = 0;
+        qwen36_prefill_native_moe_fast_rejected_ops = 0;
+        qwen36_prefill_native_moe_fast_last_reject_reason.clear();
+        qwen36_prefill_total_ns = 0;
+        qwen36_prefill_ssm_projection_ns = 0;
+        qwen36_prefill_ssm_delta_state_ns = 0;
+        ssm_delta_fast_default_used_ops = 0;
+        ssm_delta_fast_default_wall_ns = 0;
+        qwen36_prefill_attention_ns = 0;
+        qwen36_prefill_mlp_or_moe_ns = 0;
+        qwen36_prefill_graph_build_ns = 0;
+        qwen36_prefill_graph_execute_ns = 0;
+        gemma4_prefill_total_ns = 0;
+        gemma4_prefill_graph_build_ns = 0;
+        gemma4_prefill_graph_execute_ns = 0;
+        gemma4_prefill_attention_ns = 0;
+        gemma4_prefill_moe_or_mlp_ns = 0;
+        gemma4_prefill_mul_mat_id_ns = 0;
+        gemma4_prefill_mul_mat_ns = 0;
+        gemma4_prefill_flash_attention_ns = 0;
+        callback_mode.clear();
+        paged_attn_decode_head_tile_effective = 0;
+        arm_batched_quant_used = 0;
+        attention_path_paged = 0;
+        attention_path_standard = 0;
+        attention_path_portable_flash = 0;
+        attention_path_native_flash = 0;
+        attention_path_hal = 0;
+        flash_attention_headseq_prefill_calls = 0;
+        flash_attention_native_decode_calls = 0;
+        flash_attention_reference_calls = 0;
+        flash_attention_non_avx512_tiled_calls = 0;
+        flash_attention_avx512_tiled_calls = 0;
+        flash_attention_last_nth = 0;
+        flash_attention_last_active_threads = 0;
+        kleidiai_compiled_enabled = 0;
+        kleidiai_last_reject_reason = 0;
+        moe_task_count = 0;
+        moe_rowblock_used = 0;
+        moe_rowblock_tasks = 0;
+        selected_expert_count = 0;
+        ssm_conv1d_calls = 0;
+        ssm_delta_calls = 0;
+        first_sampled_token_id = -1;
+        first_visible_token_id = -1;
+        decode_finish_cause = DecodeFinishCause::Unknown;
+        decode_silent_finish_reason = DecodeSilentFinishReason::None;
+        last_progress_time = std::chrono::steady_clock::time_point();
+        pending_scheduler_progress = 0;
+        seq_id = -1;
+        // Universal Engine Reset
+        is_graph_execution = false;
+        graph_name.clear();
+        graph_inputs.clear();
+        graph_callback = nullptr;
+        graph_callback_completed.store(false, std::memory_order_relaxed);
+    }
+
+    // Destructor for cleanup
+    ~Request() {
+        // Block tables are cleaned up by caller before deletion
+    }
+};
+
+void FinalizeDecodeSilentFinishReason(Request* req);
+
+inline bool CompleteGraphRequest(Request* req, const DenseCoreTensorOutput* outputs, int num_outputs) noexcept {
+    if (!req || !req->is_graph_execution) return false;
+
+    bool expected = false;
+    if (!req->graph_callback_completed.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                               std::memory_order_acquire)) {
+        return false;
+    }
+
+    if (req->graph_callback) {
+        try {
+            req->graph_callback(outputs, num_outputs, req->user_data);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Graph result callback threw: {}", e.what());
+        } catch (...) {
+            LOG_ERROR("Graph result callback threw an unknown exception");
+        }
+    }
+    return true;
+}
+
+inline bool FinalizeGenerationRequestOnce(EngineState* state, Request* req, const std::string& terminal_text,
+                                          int token_id, bool error, bool use_direct_callback) {
+    if (!state || !req || req->is_graph_execution || req->is_embedding) {
+        return false;
+    }
+
+    bool expected = false;
+    if (!req->generation_terminal_dispatched.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                                     std::memory_order_acquire)) {
+        return false;
+    }
+
+    req->finished = true;
+    FinalizeDecodeSilentFinishReason(req);
+    EmitRequestResult(state, req, terminal_text, token_id, true, error, use_direct_callback);
+    {
+        std::lock_guard<std::mutex> lock(req->mu);
+        req->cv.notify_all();
+    }
+    return true;
+}
+
+inline bool FinalizeEmbeddingRequestOnce(EngineState* state, Request* req, std::vector<float> embedding_data,
+                                         int status, bool use_direct_callback) {
+    if (!state || !req || !req->is_embedding || req->is_graph_execution) {
+        return false;
+    }
+
+    bool expected = false;
+    if (!req->embedding_terminal_dispatched.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                                    std::memory_order_acquire)) {
+        return false;
+    }
+
+    req->finished = true;
+    if (req->embedding_callback) {
+        if (use_direct_callback) {
+            if (status == DENSECORE_STATUS_OK && !embedding_data.empty()) {
+                req->embedding_callback(embedding_data.data(), static_cast<int>(embedding_data.size()), req->user_data);
+            } else {
+                const int terminal_status = status < 0 ? status : DENSECORE_STATUS_INTERNAL_ERROR;
+                req->embedding_callback(nullptr, terminal_status, req->user_data);
+            }
+        } else {
+            PushEmbeddingResultEvent(state, req->id, std::move(embedding_data), status, req->embedding_callback,
+                                     req->user_data);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(req->mu);
+        req->cv.notify_all();
+    }
+    return true;
+}
+
+/**
+ * Fair queue comparator with tier-based priority and aging.
+ * Prevents starvation of long requests using SJF + aging mechanism.
+ */
+struct FairQueueComparator {
+    // Tier priority mapping (lower = higher priority)
+    static int GetTierPriority(const std::string& tier) {
+        if (tier == "premium") return 0;
+        if (tier == "standard") return 1;
+        if (tier == "batch") return 2;
+        return 1;  // Default to standard
+    }
+
+    bool operator()(const Request* a, const Request* b) const {
+        // 1. Check tier priority first
+        int tier_a = GetTierPriority(a->tier);
+        int tier_b = GetTierPriority(b->tier);
+        if (tier_a != tier_b) {
+            return tier_a > tier_b;  // Lower tier value = higher priority (inverted
+                                     // for priority_queue)
+        }
+
+        // 2. Calculate effective priority with aging
+        // Requests waiting > 500ms get priority boost
+        auto now = std::chrono::steady_clock::now();
+        constexpr auto kAgingThreshold = std::chrono::milliseconds(500);
+
+        auto wait_a = std::chrono::duration_cast<std::chrono::milliseconds>(now - a->arrival_time);
+        auto wait_b = std::chrono::duration_cast<std::chrono::milliseconds>(now - b->arrival_time);
+
+        int effective_priority_a = a->priority;
+        int effective_priority_b = b->priority;
+
+        // Apply aging boost: reduce priority value (increase priority) for
+        // long-waiting requests
+        if (wait_a > kAgingThreshold) {
+            effective_priority_a -= 50;  // Boost priority
+        }
+        if (wait_b > kAgingThreshold) {
+            effective_priority_b -= 50;
+        }
+
+        // 3. Compare effective priorities (SJF-style: lower priority value = higher
+        // priority)
+        if (effective_priority_a != effective_priority_b) {
+            return effective_priority_a > effective_priority_b;
+        }
+
+        // 4. Tie-breaker: FCFS (earlier arrival first)
+        return a->arrival_time > b->arrival_time;
+    }
+};
+
+// Backward compatibility alias
+using RequestPriorityComparator = FairQueueComparator;
+
+/**
+ * Model entry for multi-model support.
+ * Manages a single loaded model with its KV cache and metadata.
+ */
+struct ModelEntry {
+    std::string model_id;
+    std::string model_path;
+
+    // Owned resources with automatic cleanup via RAII
+    std::unique_ptr<TransformerModel> model;
+    std::unique_ptr<PagedKVCache> kv_cache;
+    densecore::TransformerGraphExecutionPlan transformer_execution_plan{};
+
+    std::chrono::steady_clock::time_point last_used;
+    int usage_count = 0;
+    bool is_loaded = true;
+
+    // No need for custom destructor - smart pointers handle cleanup automatically
+};
+
+// Object Pool for efficient resource reuse
+template <typename T> class ObjectPool {
+public:
+    T* Acquire() {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (pool_.empty()) {
+            return new T();
+        }
+        T* obj = pool_.top();
+        pool_.pop();
+        return obj;
+    }
+
+    void Release(T* obj) {
+        if (!obj) return;
+        // Reset basic state if possible, though destructor/constructor pattern
+        // common
+        std::lock_guard<std::mutex> lock(mu_);
+        pool_.push(obj);
+    }
+
+    ~ObjectPool() {
+        while (!pool_.empty()) {
+            delete pool_.top();
+            pool_.pop();
+        }
+    }
+
+private:
+    std::stack<T*> pool_;
+    std::mutex mu_;
+};
+
+/**
+ * RAII guard for Request lifecycle management.
+ *
+ * Ensures Request is always returned to the pool, even if an exception
+ * is thrown during request processing. Call release() after successfully
+ * enqueuing to prevent early cleanup.
+ *
+ * Usage:
+ *   Request* req = state->request_pool.Acquire();
+ *   RequestGuard guard(state, req);
+ *   // ... setup request ...
+ *   EnqueueRequest(state, req);
+ *   guard.release();  // Ownership transferred to queue
+ */
+class RequestGuard {
+public:
+    RequestGuard(EngineState* state, Request* req) : state_(state), req_(req) {}
+
+    // Destructor defined after EngineState is fully declared (see below)
+    ~RequestGuard();
+
+    // Release ownership (call after successful enqueue)
+    void release() noexcept { req_ = nullptr; }
+
+    // Non-copyable, non-movable
+    RequestGuard(const RequestGuard&) = delete;
+    RequestGuard& operator=(const RequestGuard&) = delete;
+
+private:
+    EngineState* state_;
+    Request* req_;
+};
+
+/**
+ * Global engine state.
+ *
+ * Manages:
+ * - Multi-model registry and model selection
+ * - Request queues (pending and active)
+ * - Worker thread lifecycle
+ * - Metrics collection
+ */
+struct EngineState {
+    std::atomic<GenerationCompletionCallback> generation_completion_callback{nullptr};
+    // Dependency Injected Op Registry
+    std::unique_ptr<densecore::OpRegistry> op_registry;
+    InferenceConfig inference_config{};
+    // Declared after op_registry so backends release their borrowed registry
+    // before that registry is destroyed.
+    std::unique_ptr<densecore::BackendRegistry> backend_registry;
+    densecore::llm::config::FastPathRuntimeConfig fast_path_config{};
+
+    void InitializeExecutionDependencies(int threads) {
+        inference_config = InferenceConfig::Instance();
+        inference_config.num_threads = threads;
+        backend_registry = densecore::BackendRegistry::CreateForEngine();
+        auto* cpu = static_cast<densecore::CpuBackend*>(backend_registry->Get(densecore::DeviceType::CPU));
+        cpu->ConfigureThreads(threads);
+        cpu->SetOpRegistry(op_registry.get());
+    }
+
+    // Multi-model pool
+    std::map<std::string, std::unique_ptr<ModelEntry>> models;  // Smart pointer ownership
+    std::string default_model_id;
+    std::string draft_model_id;
+    std::string draft_model_path;
+    std::mutex models_mu;
+
+    // NUMA binding configuration (-1 = auto, >= 0 = specific node)
+    int numa_node_id = -1;
+
+    // Number of threads for compute (0 = auto-detect)
+    int n_threads = 0;
+
+    // Preserve the engine-level KV policy when additional models are loaded.
+    ggml_type requested_kv_cache_type = GGML_TYPE_F16;
+
+    // Shared by every CPU graph execution on the single engine worker. Without
+    // an explicit pool, GGML creates and joins N-1 threads for every graph.
+    ggml_threadpool_t ggml_compute_threadpool = nullptr;
+    int ggml_compute_threadpool_threads = 0;
+
+    // Thread pinning policy for compute threads
+    // 0 = SCATTER (maximize L3/bandwidth, best for latency-sensitive single-user)
+    // 1 = COMPACT (share L2, leave room for other processes, best for throughput)
+    int pinning_policy = 0;  // Default: SCATTER
+
+    // Advanced scheduler (vLLM-style)
+    std::unique_ptr<densecore::Scheduler> scheduler;  // Smart pointer ownership
+
+#ifdef __APPLE__
+    std::unique_ptr<densecore::HybridScheduler> hybrid_scheduler;
+    std::unique_ptr<densecore::MetalBackend> hybrid_gpu_backend;
+    std::unique_ptr<densecore::ANEBackend> hybrid_ane_backend;
+    bool hybrid_enabled = false;
+#endif
+
+    // Platform-agnostic backend selector (abstracts #ifdef __APPLE__ logic)
+    std::unique_ptr<densecore::BackendSelector> backend_selector;
+
+    // LoRA adapter storage with preloading pool
+    densecore::LoRAStorage lora_storage;
+    std::mutex lora_mu;
+    // loaded_adapters removed - use lora_storage as source of truth
+    std::string default_lora_adapter;  // For backward compatibility (global activation)
+
+    // ===========================================================================
+    // Lock-Free Request Queue (replaces mutex-protected priority_queue)
+    // ===========================================================================
+    // Uses sharded FIFO queues per priority tier with tagged pointer ABA
+    // protection. Much lower contention than mutex under high concurrency.
+    // ===========================================================================
+    densecore::ShardedPriorityQueue<Request> pending_requests;
+
+    std::vector<Request*> active_requests;  // Non-owning pointers
+
+    // Object Pool for requests (thread-safe)
+    ObjectPool<Request> request_pool;
+
+    // Mutex only for active_requests (rarely contested, not on hot path)
+    std::mutex active_mu;
+    // Condition variable for blocking wait when queue is empty
+    std::condition_variable queue_cv;
+    std::mutex cv_mu;  // Mutex for condition variable (required by
+                       // std::condition_variable)
+
+    // Pending cancellation tracking for requests still in the lock-free queue
+    std::mutex cancel_mu;
+    std::unordered_set<int> pending_cancellations;
+
+    std::mutex pending_mu;
+    std::unordered_set<int> pending_request_ids;
+    // Serializes request/model-tokenizer preparation, never generation completion.
+    std::mutex construction_mu;
+    std::mutex admission_mu;
+#ifdef DENSECORE_TEST_BUILD
+    std::atomic<bool> fail_pending_publication_for_test{false};
+#endif
+
+    // Worker thread
+    std::thread worker_thread;
+    std::atomic<EngineStatus> status{EngineStatus::RUNNING};
+
+    struct EmptyScheduleWatchdog {
+        uint64_t consecutive_loops = 0;
+        uint64_t failure_count = 0;
+        std::chrono::steady_clock::time_point first_seen;
+        std::chrono::steady_clock::time_point last_seen;
+        std::chrono::steady_clock::time_point last_log;
+    };
+    std::mutex scheduler_watchdog_mu;
+    EmptyScheduleWatchdog empty_schedule_watchdog;
+
+    // Metrics
+    InternalMetrics metrics;
+
+    // ===========================================================================
+    // DECOUPLED CALLBACK QUEUE (Resolves Streaming Deadlock)
+    // ===========================================================================
+    // Callbacks are pushed to this queue by EngineLoop and executed by a
+    // dedicated CallbackLoop thread. This prevents the worker thread from
+    // blocking on the Python GIL during callback execution.
+    //
+    // BACKPRESSURE IMPLEMENTATION (Patent Claim - Streaming Token Callback):
+    // To prevent unbounded queue growth when token generation outpaces consumption:
+    // - HIGH_WATERMARK: Signal generation slowdown
+    // - CRITICAL_WATERMARK: Block until queue drains to LOW_WATERMARK
+    // ===========================================================================
+
+    // Backpressure watermark thresholds
+    static constexpr size_t RESULT_QUEUE_LOW_WATERMARK = 64;
+    static constexpr size_t RESULT_QUEUE_HIGH_WATERMARK = 128;
+    static constexpr size_t RESULT_QUEUE_CRITICAL_WATERMARK = 256;
+
+    std::deque<ResultEvent> result_queue;
+    std::mutex result_mu;
+    std::condition_variable result_cv;
+    std::condition_variable result_drain_cv;  // For blocking wait when critical
+    std::thread callback_thread;
+    std::atomic<bool> result_producers_done{false};
+
+    // Backpressure state tracking (lock-free for hot path)
+    std::atomic<bool> backpressure_active{false};
+    std::atomic<uint64_t> backpressure_events{0};  // Metric: count of slowdown signals
+
+    struct FreeDeleter {
+        void operator()(void* ptr) const noexcept { free(ptr); }
+    };
+
+    // Persistent compute buffer for GGML context (eliminates malloc overhead)
+    // Allocated once at startup, reused across iterations
+    static constexpr size_t COMPUTE_BUFFER_SIZE =
+        1024ULL * 1024ULL * 512ULL;  // 512MB (Reduced from 4GB for RAM efficiency)
+    std::unique_ptr<char, FreeDeleter> compute_buffer;
+    bool compute_buffer_initialized = false;
+
+    // Graph Caching (shared across threads because worker is single-threaded
+    // usually, but we add a mutex just in case or for future proofing)
+    struct ggml_context* graph_ctx = nullptr;
+
+    struct GraphMetadata {
+        struct ggml_cgraph* gf;
+        struct ggml_tensor* embd_inp;
+        struct ggml_tensor* pos;
+        struct ggml_tensor* output;
+    };
+    std::map<int, GraphMetadata> graph_cache;
+    std::mutex graph_mu;
+
+    // Persistent compute context for "Rebuild Graph, Reuse Memory" strategy
+    // This eliminates malloc/free overhead during decode by reusing memory pool
+    InferenceContext inference_ctx;
+
+    void InitComputeBuffer() {
+        if (!compute_buffer_initialized) {
+            // Use 64-byte alignment for AVX-512 compatibility
+            void* ptr = nullptr;
+            if (posix_memalign(&ptr, 64, COMPUTE_BUFFER_SIZE) != 0) {
+                throw std::bad_alloc();
+            }
+            compute_buffer.reset(static_cast<char*>(ptr));
+            compute_buffer_initialized = true;
+        }
+    }
+
+    std::string DescribeSchedulerState() {
+        if (!scheduler) return "scheduler=unavailable";
+        const auto stats = scheduler->GetStats();
+        std::ostringstream oss;
+        oss << "scheduler(waiting=" << stats.waiting_count << ", running=" << stats.running_count
+            << ", swapped=" << stats.swapped_count << ", mem_usage=" << stats.memory_usage
+            << ", last_empty_reason=" << densecore::Scheduler::EmptyReasonName(stats.last_empty_reason)
+            << ", last_unschedulable_reason="
+            << densecore::Scheduler::UnschedulableReasonName(stats.last_unschedulable_reason) << ")";
+        return oss.str();
+    }
+
+    std::string DescribeActiveRequests() {
+        std::lock_guard<std::mutex> lock(active_mu);
+        std::ostringstream oss;
+        oss << "active_requests=" << active_requests.size();
+        for (Request* req : active_requests) {
+            if (!req) continue;
+            oss << " [id=" << req->id << " seq=" << req->seq_id << " prefill=" << (req->is_prefill ? 1 : 0)
+                << " finished=" << (req->finished ? 1 : 0)
+                << " cancelled=" << (req->cancelled.load(std::memory_order_relaxed) ? 1 : 0)
+                << " swapped=" << (req->is_swapped ? 1 : 0) << " tokens=" << req->tokens.size()
+                << " n_past=" << req->n_past << " generated=" << req->generated_count
+                << " empty_loops=" << req->empty_schedule_stall_count
+                << " build_stall_loops=" << req->batch_build_stall_count << "]";
+        }
+        return oss.str();
+    }
+
+    std::string DescribeEmptyScheduleWatchdog() {
+        std::lock_guard<std::mutex> lock(scheduler_watchdog_mu);
+        std::ostringstream oss;
+        oss << "empty_schedule_watchdog(loops=" << empty_schedule_watchdog.consecutive_loops
+            << ", failures=" << empty_schedule_watchdog.failure_count;
+        if (empty_schedule_watchdog.consecutive_loops > 0 &&
+            empty_schedule_watchdog.first_seen != std::chrono::steady_clock::time_point()) {
+            const auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      empty_schedule_watchdog.last_seen - empty_schedule_watchdog.first_seen)
+                                      .count();
+            oss << ", stall_ms=" << stall_ms;
+        }
+        oss << ")";
+        return oss.str();
+    }
+
+    /**
+     * Calculate required context memory based on model parameters.
+     * Returns size in bytes.
+     */
+    struct GraphContextEstimate {
+        size_t base_graph_working_set_bytes = 0;
+        size_t hybrid_ssm_extra_bytes = 0;
+        size_t long_context_safety_pad_bytes = 0;
+        size_t env_extra_bytes = 0;
+        size_t total_bytes = 0;
+        size_t effective_seq_len = 0;
+        size_t effective_query_len = 0;
+        size_t effective_num_seqs = 0;
+        size_t chunk_token_hint = 0;
+    };
+
+    static GraphContextEstimate EstimateGraphContextSize(const TransformerModel* model, size_t seq_len_hint = 0,
+                                                         size_t num_seqs_hint = 0, size_t chunk_token_hint = 0) {
+        auto parse_env_mb = [](const char* name, size_t default_mb, size_t min_mb, size_t max_mb) -> size_t {
+            const size_t effective_max_mb = std::max<size_t>(1, max_mb);
+            const size_t effective_min_mb = std::min(min_mb, effective_max_mb);
+            const size_t bounded_default_mb = std::min(std::max(default_mb, effective_min_mb), effective_max_mb);
+            const char* env = std::getenv(name);
+            if (!env || env[0] == '\0') return bounded_default_mb;
+            errno = 0;
+            char* end = nullptr;
+            unsigned long long v = std::strtoull(env, &end, 10);
+            if (errno != 0 || end == env || *end != '\0') return bounded_default_mb;
+            if (v < effective_min_mb) return effective_min_mb;
+            if (v > effective_max_mb) return effective_max_mb;
+            return static_cast<size_t>(v);
+        };
+        auto parse_env_int = [](const char* name, int default_value, int min_value) -> int {
+            const char* env = std::getenv(name);
+            if (!env || env[0] == '\0') return default_value;
+            errno = 0;
+            char* end = nullptr;
+            long v = std::strtol(env, &end, 10);
+            if (errno != 0 || end == env || *end != '\0') return default_value;
+            return static_cast<int>(std::max<long>(min_value, v));
+        };
+
+        constexpr size_t MB = 1024ULL * 1024ULL;
+        constexpr size_t HARD_MIN_MB = 128;
+        constexpr size_t FALLBACK_ENV_MAX_MB = 1024ULL * 1024ULL;
+        auto saturating_add = [](size_t a, size_t b) -> size_t {
+            if (a > std::numeric_limits<size_t>::max() - b) {
+                return std::numeric_limits<size_t>::max();
+            }
+            return a + b;
+        };
+        auto saturating_mul = [](size_t a, size_t b) -> size_t {
+            if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+                return std::numeric_limits<size_t>::max();
+            }
+            return a * b;
+        };
+        auto saturating_add_inplace = [&](size_t& target, size_t value) { target = saturating_add(target, value); };
+        auto ceil_bytes_to_mb = [](size_t bytes) -> size_t {
+            if (bytes >= std::numeric_limits<size_t>::max() - (MB - 1)) {
+                return std::numeric_limits<size_t>::max() / MB;
+            }
+            return (bytes + MB - 1) / MB;
+        };
+        auto parse_positive_ull = [](const char* text) -> unsigned long long {
+            if (!text || text[0] == '\0') return 0;
+            errno = 0;
+            char* end = nullptr;
+            const unsigned long long value = std::strtoull(text, &end, 10);
+            if (errno != 0 || end == text || *end != '\0') return 0;
+            return value;
+        };
+        auto detect_available_memory_mb = [&]() -> size_t {
+            const char* hint = std::getenv("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT");
+            if (hint && hint[0] != '\0') {
+                const unsigned long long hinted_mb = parse_positive_ull(hint);
+                if (hinted_mb > 0) {
+                    return static_cast<size_t>(hinted_mb);
+                }
+            }
+#if defined(__linux__)
+            auto read_ull_file = [&](const char* path) -> unsigned long long {
+                std::FILE* file = std::fopen(path, "r");
+                if (!file) return 0;
+                char buffer[128] = {};
+                const char* line = std::fgets(buffer, sizeof(buffer), file);
+                std::fclose(file);
+                if (!line) return 0;
+                if (std::strncmp(buffer, "max", 3) == 0) return 0;
+                const unsigned long long bytes = parse_positive_ull(buffer);
+                if (bytes == 0 || bytes > (1ULL << 50)) return 0;  // Treat absurd values as "unlimited".
+                return bytes;
+            };
+            auto read_mem_available_mb = [&]() -> size_t {
+                std::FILE* file = std::fopen("/proc/meminfo", "r");
+                if (!file) return 0;
+                char line[256] = {};
+                unsigned long long kb = 0;
+                while (std::fgets(line, sizeof(line), file)) {
+                    if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                        std::fclose(file);
+                        return static_cast<size_t>(kb / 1024ULL);
+                    }
+                }
+                std::fclose(file);
+                return 0;
+            };
+
+            size_t cgroup_available_mb = 0;
+            const unsigned long long cgroup_v2_limit = read_ull_file("/sys/fs/cgroup/memory.max");
+            const unsigned long long cgroup_v2_current = read_ull_file("/sys/fs/cgroup/memory.current");
+            if (cgroup_v2_limit > 0) {
+                const unsigned long long cgroup_v2_available =
+                    cgroup_v2_current > 0 && cgroup_v2_limit > cgroup_v2_current ? cgroup_v2_limit - cgroup_v2_current
+                                                                                 : cgroup_v2_limit;
+                cgroup_available_mb = static_cast<size_t>(cgroup_v2_available / MB);
+            }
+            const unsigned long long cgroup_v1_limit = read_ull_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+            const unsigned long long cgroup_v1_current = read_ull_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+            if (cgroup_available_mb == 0 && cgroup_v1_limit > 0) {
+                const unsigned long long cgroup_v1_available =
+                    cgroup_v1_current > 0 && cgroup_v1_limit > cgroup_v1_current ? cgroup_v1_limit - cgroup_v1_current
+                                                                                 : cgroup_v1_limit;
+                cgroup_available_mb = static_cast<size_t>(cgroup_v1_available / MB);
+            }
+            size_t available_mb = 0;
+            const size_t mem_available_mb = read_mem_available_mb();
+            for (const size_t candidate_mb : {cgroup_available_mb, mem_available_mb}) {
+                if (candidate_mb == 0) continue;
+                available_mb = (available_mb == 0) ? candidate_mb : std::min(available_mb, candidate_mb);
+            }
+            return available_mb;
+#else
+            return 0;
+#endif
+        };
+
+        GraphContextEstimate estimate{};
+        if (!model) {
+            estimate.total_bytes = 512ULL * 1024ULL * 1024ULL;
+            return estimate;
+        }
+
+        const auto& hp = model->hparams;
+        const bool model_has_moe_layers = [&]() {
+            if (hp.n_experts > 0) {
+                return true;
+            }
+            if (model->decoder_spec && model->decoder_spec->has_moe) {
+                return true;
+            }
+            if (densecore::models::BuildModelExecutionContract(model).has_moe) {
+                return true;
+            }
+            for (const TransformerLayer& layer : model->layers) {
+                if (layer.is_moe || !layer.experts.empty()) {
+                    return true;
+                }
+                for (const auto& tensor_entry : layer.tensors) {
+                    const std::string& name = tensor_entry.first;
+                    if (name.find("ffn_gate_up_exps") != std::string::npos ||
+                        name.find("ffn_down_exps") != std::string::npos || name.find("experts.") != std::string::npos) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }();
+        const size_t runtime_max_seq_len = static_cast<size_t>(parse_env_int("DENSECORE_MAX_SEQ_LEN", 4096, 1));
+        const bool large_hidden_model =
+            std::max<int32_t>(1, hp.n_layer) >= 40 && std::max<int32_t>(1, hp.n_embd) >= 2048;
+        const bool large_weight_shared_llm =
+            large_hidden_model &&
+            (model->arch_flags.is_hybrid_ssm || model->arch_flags.is_gemma4 || model_has_moe_layers);
+        const int default_max_num_seqs = large_weight_shared_llm ? 2 : 4;
+        const size_t runtime_max_num_seqs =
+            static_cast<size_t>(parse_env_int("DENSECORE_MAX_NUM_SEQS", default_max_num_seqs, 1));
+        const size_t model_max_seq_len = static_cast<size_t>(std::max<int32_t>(1, hp.n_ctx));
+        const bool has_request_shape_hint = seq_len_hint > 0 || chunk_token_hint > 0 || num_seqs_hint > 0;
+        const size_t default_seq_len = std::max<size_t>(1, std::min<size_t>(model_max_seq_len, runtime_max_seq_len));
+        const size_t request_key_len =
+            std::max<size_t>(1, std::min<size_t>(model_max_seq_len, std::max(seq_len_hint, chunk_token_hint)));
+        const size_t effective_seq_len = has_request_shape_hint ? request_key_len : default_seq_len;
+        const size_t effective_query_len =
+            has_request_shape_hint
+                ? std::max<size_t>(
+                      1, std::min<size_t>(model_max_seq_len, chunk_token_hint > 0 ? chunk_token_hint : request_key_len))
+                : default_seq_len;
+        const size_t effective_num_seqs = std::max<size_t>(
+            1, has_request_shape_hint ? (num_seqs_hint > 0 ? num_seqs_hint : 1) : runtime_max_num_seqs);
+        estimate.effective_seq_len = effective_seq_len;
+        estimate.effective_query_len = effective_query_len;
+        estimate.effective_num_seqs = effective_num_seqs;
+        estimate.chunk_token_hint = chunk_token_hint;
+
+        // The graph context backs the persistent GGML compute pool used while
+        // rebuilding and executing the active graph. It must cover:
+        //   - per-layer hidden-state / QKV / FFN activations (O(n_embd * query))
+        //   - attention score / probability scratch (O(n_head * query * key))
+        //   - a few live residual/output buffers outside the layer loop
+        //
+        // The prior estimate only used O(n_head * seq), which under-sized the
+        // pool for decoder attention graphs and caused ggml_new_object() aborts
+        // once real OpenVLA/llm_universal paths exercised longer prompts.
+        //
+        // For request-shaped graph builds, do not inflate a single decode step
+        // back to runtime max batch/sequence. Decode has long K/V history but a
+        // tiny query chunk, so using seq^2 here over-materializes the pool by
+        // tens of GB on Gemma4 MoE long-context serving.
+        const bool qwen_hybrid_moe_chunked_prefill_graph =
+            (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+            model->arch_flags.is_hybrid_ssm && model_has_moe_layers && has_request_shape_hint && chunk_token_hint > 1 &&
+            effective_query_len > 1 && effective_seq_len > effective_query_len;
+        const size_t graph_key_len = qwen_hybrid_moe_chunked_prefill_graph ? effective_query_len : effective_seq_len;
+        const size_t query_token_working_set = saturating_mul(effective_num_seqs, effective_query_len);
+        const size_t key_token_working_set = saturating_mul(effective_num_seqs, graph_key_len);
+        const int n_head = std::max<int32_t>(1, hp.n_head);
+        const int n_head_kv = std::max<int32_t>(1, hp.n_head_kv > 0 ? hp.n_head_kv : hp.n_head);
+        const int head_dim_k = std::max<int32_t>(1, hp.n_embd_head_k > 0 ? hp.n_embd_head_k : hp.n_embd / n_head);
+        const int head_dim_v = std::max<int32_t>(1, hp.n_embd_head_v > 0 ? hp.n_embd_head_v : head_dim_k);
+        const size_t kv_history_width =
+            saturating_mul(static_cast<size_t>(head_dim_k + head_dim_v), static_cast<size_t>(n_head_kv));
+        const size_t hidden_query_working_set =
+            saturating_mul(static_cast<size_t>(std::max<int32_t>(1, hp.n_embd)), query_token_working_set);
+        const size_t kv_history_working_set = saturating_mul(kv_history_width, key_token_working_set);
+        const size_t hidden_query_bytes = saturating_mul(hidden_query_working_set, sizeof(float));
+        const size_t kv_history_bytes = saturating_mul(kv_history_working_set, sizeof(float));
+
+        const size_t attention_score_elems = saturating_mul(
+            saturating_mul(saturating_mul(static_cast<size_t>(n_head), effective_num_seqs), effective_query_len),
+            graph_key_len);
+        const size_t attention_score_bytes = saturating_mul(attention_score_elems, sizeof(float));
+        const size_t attention_score_buffer_count =
+            (model->arch_flags.is_gemma4 && effective_query_len > 1) ? 3ULL : 2ULL;
+
+        // Conservative layer-local upper bound:
+        //   - ~7 query hidden-sized buffers (norm/Q/attn_out/ffn/residual staging)
+        //   - K/V history materialization at the actual KV width, not n_embd
+        //   - score-sized buffers (scores + probs/mask-expanded scratch; Gemma4
+        //     softcap attention keeps one extra score-shaped stage live)
+        const size_t per_layer_activation_bytes =
+            saturating_add(saturating_add(saturating_mul(hidden_query_bytes, 7), kv_history_bytes),
+                           saturating_mul(attention_score_bytes, attention_score_buffer_count));
+        const size_t base_size =
+            saturating_mul(static_cast<size_t>(std::max<int32_t>(1, hp.n_layer)), per_layer_activation_bytes);
+        estimate.base_graph_working_set_bytes = base_size;
+
+        // Residual/output/lm-head staging that can remain live across layers.
+        size_t overhead = saturating_add(saturating_add(saturating_mul(hidden_query_bytes, 4), kv_history_bytes),
+                                         attention_score_bytes / 2);
+
+        // Hybrid SSM / Gemma4 graphs need extra room for recurrent state views and
+        // architecture-specific branch tensors, but still nowhere near full-model memory.
+        if (model->arch_flags.is_hybrid_ssm) {
+            saturating_add_inplace(
+                estimate.hybrid_ssm_extra_bytes,
+                saturating_mul(
+                    saturating_mul(static_cast<size_t>(std::max(1, model->ssm_inner_size)), query_token_working_set),
+                    sizeof(float)) /
+                    2);
+            const size_t chunk_working_tokens = std::max<size_t>(chunk_token_hint, effective_query_len);
+            saturating_add_inplace(
+                estimate.hybrid_ssm_extra_bytes,
+                saturating_mul(
+                    saturating_mul(static_cast<size_t>(std::max(1, model->ssm_inner_size)), chunk_working_tokens),
+                    sizeof(float)) /
+                    4);
+        }
+        if ((model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+            model_has_moe_layers && effective_query_len > 1) {
+            // The native W2 callback retains one direct-output row per routed
+            // token/expert assignment in the live GGML context. The no-alloc
+            // dry run stores this scratch in a sidecar, so account for it from
+            // the model and request shape instead of treating it as metadata.
+            const size_t top_k = std::max<size_t>(1, hp.n_experts_used);
+            const size_t assignment_capacity =
+                std::min<size_t>(saturating_mul(query_token_working_set, top_k), 4096ULL * 64ULL);
+            const size_t direct_output_bytes_per_layer = saturating_mul(
+                saturating_mul(assignment_capacity, static_cast<size_t>(std::max<int32_t>(1, hp.n_embd))),
+                sizeof(float));
+            saturating_add_inplace(
+                estimate.hybrid_ssm_extra_bytes,
+                saturating_mul(direct_output_bytes_per_layer, static_cast<size_t>(std::max<int32_t>(1, hp.n_layer))));
+        }
+        if (model->arch_flags.is_gemma4) {
+            overhead = saturating_add(saturating_add(overhead, hidden_query_bytes), kv_history_bytes);
+        }
+
+        size_t total = saturating_add(saturating_add(base_size, overhead), estimate.hybrid_ssm_extra_bytes);
+
+        // Leave explicit headroom for ggml object metadata, graph bookkeeping,
+        // and architecture-specific scratch that are not modeled perfectly by
+        // the coarse activation estimate above. Without this margin, real
+        // decoder graphs tend to miss by a few MB and abort in ggml_new_object.
+        saturating_add_inplace(estimate.long_context_safety_pad_bytes,
+                               std::max(total / 4, static_cast<size_t>(128) * MB));
+        saturating_add_inplace(estimate.long_context_safety_pad_bytes, static_cast<size_t>(8) * MB);
+        saturating_add_inplace(estimate.long_context_safety_pad_bytes, static_cast<size_t>(4) * MB);
+        // Keep extra slack for long-context hybrid-SSM graphs where minor
+        // topology/scratch differences can exceed estimates by ~10+ MB and
+        // hard-abort inside ggml_new_object(). Fail-closed handling in serving
+        // cannot run if the process aborts here, so bias toward over-allocation.
+        if (model->arch_flags.is_hybrid_ssm && effective_seq_len > static_cast<size_t>(BLOCK_SIZE)) {
+            const size_t long_prompt_pad_mb =
+                std::clamp<size_t>(std::max<size_t>(128, (effective_seq_len / 1024ULL) * 64ULL), 128ULL, 1024ULL);
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes, long_prompt_pad_mb * MB);
+        }
+#if defined(__x86_64__) || defined(_M_X64)
+        if ((model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+            model->arch_flags.is_hybrid_ssm && model_has_moe_layers && effective_query_len > 1) {
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes, 512ULL * MB);
+            if (effective_seq_len > effective_query_len) {
+                const size_t num_seqs_for_objects = std::max<size_t>(1, effective_num_seqs);
+                if (effective_seq_len <= std::numeric_limits<size_t>::max() / effective_query_len) {
+                    size_t object_pairs = effective_seq_len * effective_query_len;
+                    if (object_pairs <= std::numeric_limits<size_t>::max() / num_seqs_for_objects) {
+                        object_pairs *= num_seqs_for_objects;
+                        if (object_pairs <= std::numeric_limits<size_t>::max() / 64ULL) {
+                            saturating_add_inplace(estimate.long_context_safety_pad_bytes, object_pairs * 64ULL);
+                        }
+                    }
+                }
+            }
+        }
+        if (model->variant == ModelVariant::QWEN36 && model->arch_flags.is_hybrid_ssm && effective_seq_len >= 1024ULL &&
+            effective_query_len > 1) {
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes, 256ULL * MB);
+        }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+        if ((model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
+            model->arch_flags.is_hybrid_ssm && model_has_moe_layers && effective_query_len > 128ULL) {
+            // C4A Qwen hybrid-SSM MoE prefill at 144+ token chunks builds far
+            // more ggml object metadata than the activation estimate captures.
+            // Without this ARM-specific object-pool reserve, 192-token prefill
+            // can pass admission and later abort in ggml_new_object().
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes, 3072ULL * MB);
+        }
+#endif
+        if (model->arch_flags.is_hybrid_ssm && effective_query_len >= 1024ULL) {
+            // Hybrid-SSM long-prefill graphs can still miss the coarse estimate by
+            // a few-to-tens of MB because ggml object metadata and branch-local
+            // scratch grow with the actual query chunk shape. Keep explicit
+            // object-pool headroom here so serving does not hard-abort in
+            // ggml_new_object() before fail-closed handling can run.
+            const size_t hybrid_long_prefill_object_pad_mb =
+                std::clamp<size_t>(((effective_query_len + 1023ULL) / 1024ULL) * 96ULL, 96ULL, 768ULL);
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes, hybrid_long_prefill_object_pad_mb * MB);
+        }
+        if (model->arch_flags.is_gemma4 && effective_query_len > 1) {
+            saturating_add_inplace(estimate.long_context_safety_pad_bytes,
+                                   std::max(hidden_query_bytes / 2, attention_score_bytes / 8));
+        }
+        const size_t available_memory_mb = detect_available_memory_mb();
+        const size_t dynamic_env_cap_mb =
+            std::max<size_t>(HARD_MIN_MB, available_memory_mb > 0 ? available_memory_mb : FALLBACK_ENV_MAX_MB);
+        const size_t extra_headroom_mb =
+            parse_env_mb("DENSECORE_GRAPH_CTX_EXTRA_MB", /*default_mb=*/128, /*min_mb=*/0, dynamic_env_cap_mb);
+        estimate.env_extra_bytes = extra_headroom_mb * MB;
+        total = saturating_add(saturating_add(total, estimate.long_context_safety_pad_bytes), estimate.env_extra_bytes);
+
+        // Clamp to runtime-configurable bounds.
+        // Defaults are chosen to keep previous behavior for small models while
+        // allowing larger graphs (e.g., Qwen3-4B batch=4 decode) to avoid 2GB
+        // hard-cap OOM.
+        size_t recommended_min_mb = model->arch_flags.is_gemma4 ? 1536 : (model->arch_flags.is_hybrid_ssm ? 320 : 256);
+        if (!model->arch_flags.is_gemma4 && !model->arch_flags.is_hybrid_ssm &&
+            std::max<int32_t>(1, hp.n_layer) >= 24 && std::max<int32_t>(1, hp.n_embd) >= 3072) {
+            recommended_min_mb = std::max(recommended_min_mb, static_cast<size_t>(2560));
+        }
+        size_t recommended_max_mb = 8192;
+        if (available_memory_mb > 0) {
+            // `MemAvailable` / cgroup headroom is live runtime capacity after the
+            // model has loaded. Size the graph ceiling from that live capacity and
+            // the request-shaped estimate, rather than from a C4/C4A RAM table or
+            // a fixed 48 GB ceiling. This keeps 32k+ prefill attempts admissible
+            // when the host has room, while still leaving allocator/runtime slack.
+            const size_t estimated_graph_mb = std::max<size_t>(1, ceil_bytes_to_mb(total));
+            const size_t graph_scaled_runtime_reserve_mb =
+                std::min(estimated_graph_mb / 64, std::max<size_t>(1, available_memory_mb / 8));
+            const size_t graph_scaled_allocator_slack_mb =
+                std::min(estimated_graph_mb / 128, std::max<size_t>(1, available_memory_mb / 16));
+            const size_t runtime_reserve_mb =
+                std::max<size_t>(512, (available_memory_mb / 16) + graph_scaled_runtime_reserve_mb);
+            const size_t allocator_slack_mb =
+                std::max<size_t>(256, (available_memory_mb / 64) + graph_scaled_allocator_slack_mb);
+            const size_t requested_reserve_mb = runtime_reserve_mb + allocator_slack_mb;
+            const size_t max_reserve_mb =
+                available_memory_mb > recommended_min_mb ? available_memory_mb - recommended_min_mb : 0;
+            const size_t reserved_system_mb = std::min(requested_reserve_mb, max_reserve_mb);
+            const size_t usable_graph_mb = available_memory_mb > reserved_system_mb
+                                               ? available_memory_mb - reserved_system_mb
+                                               : recommended_min_mb;
+            recommended_max_mb = std::clamp<std::size_t>(usable_graph_mb, recommended_min_mb, dynamic_env_cap_mb);
+        } else if (model->arch_flags.is_hybrid_ssm && std::max<int32_t>(1, hp.n_embd) <= 2048 &&
+                   std::max<int32_t>(1, hp.n_layer) <= 24 && effective_seq_len <= 4096 && runtime_max_num_seqs <= 4) {
+            recommended_max_mb = 4096;
+        } else if (model->arch_flags.is_hybrid_ssm && effective_seq_len <= 2048 && runtime_max_num_seqs <= 4) {
+            recommended_max_mb = 6144;
+        }
+
+        size_t min_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MIN_MB", recommended_min_mb, HARD_MIN_MB, dynamic_env_cap_mb);
+        size_t max_mb = parse_env_mb("DENSECORE_GRAPH_CTX_MAX_MB", recommended_max_mb, HARD_MIN_MB, dynamic_env_cap_mb);
+        if (max_mb < min_mb) max_mb = min_mb;
+        const size_t MIN_SIZE = min_mb * MB;
+        const size_t MAX_SIZE = max_mb * MB;
+
+        if (total < MIN_SIZE) total = MIN_SIZE;
+        if (total > MAX_SIZE) total = MAX_SIZE;
+
+        estimate.total_bytes = total;
+        return estimate;
+    }
+
+    static size_t CalculateGraphContextSize(const TransformerModel* model, size_t seq_len_hint = 0,
+                                            size_t num_seqs_hint = 0, size_t chunk_token_hint = 0) {
+        return EstimateGraphContextSize(model, seq_len_hint, num_seqs_hint, chunk_token_hint).total_bytes;
+    }
+
+    void InitGraphCache(const TransformerModel* model = nullptr) {
+        // Calculate context size dynamically based on model
+        size_t mem_size = CalculateGraphContextSize(model);
+
+        struct ggml_init_params params = {
+            .mem_size = mem_size,
+            .mem_buffer = nullptr,
+            .no_alloc = false,
+        };
+        graph_ctx = ggml_init(params);
+        std::cerr << "[DenseCore] InitGraphCache: Context initialized with " << (mem_size / (1024 * 1024)) << " MB"
+                  << std::endl;
+    }
+
+    void FreeGraphCache() {
+        // ggml_free handles all graphs allocated within the context
+        if (graph_ctx) {
+            ggml_free(graph_ctx);
+            graph_ctx = nullptr;
+        }
+        graph_cache.clear();
+    }
+
+    /**
+     * Get model by ID with usage tracking.
+     */
+    ModelEntry* GetModel(const std::string& model_id) {
+        std::lock_guard<std::mutex> lock(models_mu);
+        auto it = models.find(model_id);
+        if (it != models.end()) {
+            it->second->last_used = std::chrono::steady_clock::now();
+            it->second->usage_count++;
+            return it->second.get();
+        }
+        return nullptr;
+    }
+
+    /**
+     * Get default model or fall back to legacy model.
+     */
+    ModelEntry* GetDefaultModel() {
+        if (!default_model_id.empty()) {
+            return GetModel(default_model_id);
+        }
+
+        return nullptr;
+    }
+
+    bool ConsumePendingCancellation(int request_id) {
+        std::lock_guard<std::mutex> lock(cancel_mu);
+        auto it = pending_cancellations.find(request_id);
+        if (it == pending_cancellations.end()) {
+            return false;
+        }
+        pending_cancellations.erase(it);
+        return true;
+    }
+
+    void RecordPendingCancellation(int request_id) {
+        std::lock_guard<std::mutex> lock(cancel_mu);
+        pending_cancellations.insert(request_id);
+    }
+
+    void ClearPendingCancellations() {
+        std::lock_guard<std::mutex> lock(cancel_mu);
+        pending_cancellations.clear();
+    }
+
+    void RecordPendingRequest(int request_id) {
+        std::lock_guard<std::mutex> lock(pending_mu);
+        pending_request_ids.insert(request_id);
+    }
+
+    void RemovePendingRequest(int request_id) {
+        std::lock_guard<std::mutex> lock(pending_mu);
+        pending_request_ids.erase(request_id);
+    }
+
+    bool IsPendingRequest(int request_id) {
+        std::lock_guard<std::mutex> lock(pending_mu);
+        return pending_request_ids.find(request_id) != pending_request_ids.end();
+    }
+
+    // Called only by the worker. Terminal delivery is deliberately insufficient:
+    // finished requests still in active_requests may retain KV/recurrent state.
+    Request* PopReadyPendingRequest(bool exclusive_execution) {
+        bool blocked = false;
+        if (exclusive_execution) {
+            std::lock_guard<std::mutex> lock(active_mu);
+            blocked = !active_requests.empty();
+        }
+        if (!blocked) return pending_requests.Pop();
+        return pending_requests.PopMatching([this](Request* req) {
+            if (req->cancelled.load(std::memory_order_relaxed)) return true;
+            if (!ConsumePendingCancellation(req->id)) return false;
+            req->cancelled.store(true, std::memory_order_relaxed);
+            return true;
+        });
+    }
+
+    bool TryAdmitPendingRequest(Request* req) {
+        if (!req) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(admission_mu);
+        if (status.load(std::memory_order_acquire) != EngineStatus::RUNNING) {
+            return false;
+        }
+
+        // No Request access is valid after publication: the worker can already
+        // finish and recycle it before this submitting thread resumes.
+        const int request_id = req->id;
+        const std::string tier = req->tier;
+        const size_t prompt_tokens = req->tokens.size();
+        const int max_tokens = req->max_tokens;
+        const bool json_mode = req->json_mode;
+        const bool callback_ex = req->callback_ex != nullptr;
+        RecordPendingRequest(request_id);
+        try {
+#ifdef DENSECORE_TEST_BUILD
+            if (fail_pending_publication_for_test.exchange(false)) throw std::bad_alloc();
+#endif
+            pending_requests.Push(req, tier);
+        } catch (...) {
+            RemovePendingRequest(request_id);
+            throw;
+        }
+#ifdef DENSECORE_TEST_BUILD
+        densecore::testing::MaybePauseAfterPendingPublishForTest();
+#endif
+        if (densecore::env::ParseDiagnosticEnv("DENSECORE_DEBUG_REQUEST_LIFECYCLE", false)) {
+            std::cerr << "[RequestLifecycle] phase=engine_enqueue"
+                      << " request_id=" << request_id << " tier=" << tier
+                      << " prompt_tokens=" << prompt_tokens << " max_tokens=" << max_tokens
+                      << " json_mode=" << (json_mode ? 1 : 0)
+                      << " callback_ex=" << (callback_ex ? 1 : 0) << std::endl;
+        }
+        {
+            std::lock_guard<std::mutex> cv_lock(cv_mu);
+            queue_cv.notify_one();
+        }
+        return true;
+    }
+
+    /**
+     * Shutdown engine and cleanup resources with graceful draining.
+     * Waits up to 5 seconds for active requests to complete before force-killing.
+     */
+    void Shutdown() {
+        {
+            std::lock_guard<std::mutex> admission_lock(admission_mu);
+            EngineStatus expected = EngineStatus::RUNNING;
+            bool began_shutdown;
+            {
+                // The worker checks this predicate under cv_mu before sleeping.
+                std::lock_guard<std::mutex> wake_lock(cv_mu);
+                began_shutdown = status.compare_exchange_strong(expected, EngineStatus::DRAINING);
+            }
+            if (!began_shutdown) {
+                // Already shutting down or stopped
+                if (worker_thread.joinable()) {
+                    worker_thread.join();
+                }
+                return;
+            }
+        }
+
+        LOG_INFO("Initiating graceful shutdown (DRAINING)...");
+        queue_cv.notify_all();
+
+        // Wait for active requests to drain with 5-second timeout
+        constexpr auto kShutdownTimeout = std::chrono::seconds(5);
+        const auto start_time = std::chrono::steady_clock::now();
+
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lock(active_mu);
+                if (active_requests.empty()) {
+                    LOG_INFO("All active requests drained successfully.");
+                    break;
+                }
+            }
+
+            auto elapsed = std::chrono::steady_clock::now() - start_time;
+            if (elapsed >= kShutdownTimeout) {
+                const std::string scheduler_state = DescribeSchedulerState();
+                const std::string watchdog_state = DescribeEmptyScheduleWatchdog();
+                const std::string active_state = DescribeActiveRequests();
+                {
+                    std::lock_guard<std::mutex> lock(active_mu);
+                    LOG_WARN("Shutdown timeout after 5 seconds. Force-killing ", active_requests.size(),
+                             " active requests.");
+                    LOG_WARN("Shutdown diagnostics: {} {} {}", scheduler_state, watchdog_state, active_state);
+                    for (Request* req : active_requests) {
+                        req->cancelled.store(true, std::memory_order_relaxed);
+                    }
+                }
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        // Transition to STOPPED and notify worker
+        {
+            std::lock_guard<std::mutex> wake_lock(cv_mu);
+            status = EngineStatus::STOPPED;
+        }
+        queue_cv.notify_all();
+        result_cv.notify_all();  // Wake up callback thread
+
+        if (worker_thread.joinable()) {
+            worker_thread.join();
+        }
+
+        const bool use_direct_callback =
+            fast_path_config.worker.callback_mode == densecore::llm::config::WorkerRuntimeConfig::CallbackMode::Direct;
+
+        // Final resource recovery: drain any remaining requests after worker exit.
+        {
+            std::vector<Request*> remaining_active;
+            {
+                std::lock_guard<std::mutex> lock(active_mu);
+                remaining_active.swap(active_requests);
+            }
+
+            ModelEntry* entry = GetDefaultModel();
+            PagedKVCache* kv_cache = entry ? entry->kv_cache.get() : nullptr;
+
+            for (Request* req : remaining_active) {
+                req->cancelled.store(true, std::memory_order_relaxed);
+                bool finalized = false;
+                if (req->is_embedding) {
+                    finalized = FinalizeEmbeddingRequestOnce(this, req, {}, DENSECORE_STATUS_ENGINE_STOPPED,
+                                                             use_direct_callback);
+                } else {
+                    finalized = FinalizeGenerationRequestOnce(this, req, "Error: Engine shutdown", -1, true,
+                                                              use_direct_callback);
+                }
+                if (finalized) {
+                    metrics.failed_requests.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (kv_cache && !req->block_table.empty()) {
+                    kv_cache->block_manager->Free(req->block_table);
+                    req->block_table.clear();
+                }
+                if (scheduler && req->seq_id >= 0) {
+                    scheduler->RemoveRequest(req->seq_id, false);
+                }
+                request_pool.Release(req);
+            }
+            metrics.active_requests.store(0, std::memory_order_relaxed);
+        }
+
+        for (;;) {
+            Request* pending = pending_requests.Pop();
+            if (!pending) break;
+            RemovePendingRequest(pending->id);
+            pending->cancelled.store(true, std::memory_order_relaxed);
+            if (pending->is_graph_execution) {
+                metrics.failed_requests.fetch_add(1, std::memory_order_relaxed);
+                CompleteGraphRequest(pending, nullptr, DENSECORE_STATUS_ENGINE_STOPPED);
+            } else if (pending->is_embedding
+                           ? FinalizeEmbeddingRequestOnce(this, pending, {}, DENSECORE_STATUS_ENGINE_STOPPED,
+                                                          use_direct_callback)
+                           : FinalizeGenerationRequestOnce(this, pending, "Error: Engine shutdown", -1, true,
+                                                           use_direct_callback)) {
+                metrics.failed_requests.fetch_add(1, std::memory_order_relaxed);
+            }
+            request_pool.Release(pending);
+        }
+
+        {
+            // Pair publication with CallbackLoop's predicate mutex; atomic
+            // visibility alone cannot prevent a notification before wait().
+            std::lock_guard<std::mutex> result_lock(result_mu);
+            result_producers_done.store(true, std::memory_order_release);
+        }
+
+        // The worker can enqueue final events while it exits. Wake the callback
+        // thread again after worker/pending cleanup so it cannot miss the
+        // STOPPED transition while the shutdown path waits in join().
+        result_cv.notify_all();
+
+        // Join callback thread after draining result queue.
+        if (callback_thread.joinable()) {
+            callback_thread.join();
+        }
+
+        // Graph contexts may borrow model tensors and prepared weight buffers.
+        // Retire graph-owned userdata before releasing their model/backend owners.
+        FreeGraphCache();
+        inference_ctx.Free();
+
+        // Cleanup all models - smart pointers handle automatic cleanup
+        {
+            std::lock_guard<std::mutex> lock(models_mu);
+            models.clear();
+        }
+
+        if (ggml_compute_threadpool) {
+            ggml_threadpool_free(ggml_compute_threadpool);
+            ggml_compute_threadpool = nullptr;
+            ggml_compute_threadpool_threads = 0;
+        }
+
+        ClearPendingCancellations();
+
+
+        LOG_INFO("Engine shutdown complete.");
+    }
+
+    ~EngineState() {
+        // Ensure shutdown is called if not already stopped
+        if (status != EngineStatus::STOPPED) {
+            Shutdown();
+        }
+    }
+};
+
+// RequestGuard destructor - defined here because it needs the full EngineState definition
+inline RequestGuard::~RequestGuard() {
+    if (req_) {
+        req_->Reset();
+        state_->request_pool.Release(req_);
+    }
+}
+
+// Worker function declarations
+void EngineLoop(EngineState* state);
+void CallbackLoop(EngineState* state);
+
+// ===========================================================================
+// BACKPRESSURE HELPER: Common logic for watermark-based queue management
+// ===========================================================================
+// Patent Claim: Streaming Token Callback with Watermark-Based Backpressure
+// - HIGH_WATERMARK: Signal generation slowdown (non-blocking)
+// - CRITICAL_WATERMARK: Block until queue drains to LOW_WATERMARK
+// ===========================================================================
+inline void ApplyResultQueueBackpressure(EngineState* state, std::unique_lock<std::mutex>& lock) {
+    if (state->result_queue.size() >= EngineState::RESULT_QUEUE_CRITICAL_WATERMARK) {
+        // Critical: block until queue drains to prevent unbounded memory growth
+        state->backpressure_events.fetch_add(1, std::memory_order_relaxed);
+        state->backpressure_active.store(true, std::memory_order_relaxed);
+
+        state->result_drain_cv.wait(lock, [state]() {
+            return state->result_queue.size() <= EngineState::RESULT_QUEUE_LOW_WATERMARK ||
+                   state->status == EngineStatus::STOPPED;
+        });
+
+        state->backpressure_active.store(false, std::memory_order_relaxed);
+    } else if (state->result_queue.size() >= EngineState::RESULT_QUEUE_HIGH_WATERMARK) {
+        // Warning: signal slowdown but don't block
+        state->backpressure_active.store(true, std::memory_order_relaxed);
+    } else {
+        state->backpressure_active.store(false, std::memory_order_relaxed);
+    }
+}
+
+// Helper to push result events to the callback queue with backpressure
+inline void PushResultEvent(EngineState* state, int request_id, const std::string& token, int token_id, bool finished,
+                            bool error, TokenCallback cb, TokenCallbackEx cb_ex, TokenResultCallback token_result_cb,
+                            void* user_data, GenerationCompletionCallback completion_callback,
+                            int generated_tokens, DenseCoreGenerationFinishReason finish_reason) {
+    ResultEvent event;
+    event.completion_callback = completion_callback;
+    event.generated_tokens = generated_tokens;
+    event.finish_reason = finish_reason;
+    event.request_id = request_id;
+    event.token_str = token;
+    event.token_id = token_id;
+    event.finished = finished;
+    event.error = error;
+    event.callback = cb;
+    event.callback_ex = cb_ex;
+    event.token_result_callback = token_result_cb;
+    event.user_data = user_data;
+    event.emb_callback = nullptr;
+    // embedding_data is default-constructed as empty vector (no assignment needed)
+
+    {
+        std::unique_lock<std::mutex> lock(state->result_mu);
+        ApplyResultQueueBackpressure(state, lock);
+        state->result_queue.push_back(std::move(event));
+    }
+    state->result_cv.notify_one();
+}
+
+// Helper for embedding results (RAII-safe: takes ownership via std::move)
+inline void PushEmbeddingResultEvent(EngineState* state, int request_id, std::vector<float> embedding_data,
+                                     int status, EmbeddingCallback cb, void* user_data) {
+    ResultEvent event;
+    event.request_id = request_id;
+    event.finished = true;
+    event.error = status != DENSECORE_STATUS_OK;
+    event.callback = nullptr;
+    event.emb_callback = cb;
+    event.user_data = user_data;
+    event.embedding_data = std::move(embedding_data);  // RAII ownership transfer
+    event.embedding_status = status;
+
+    {
+        std::unique_lock<std::mutex> lock(state->result_mu);
+        ApplyResultQueueBackpressure(state, lock);
+        state->result_queue.push_back(std::move(event));
+    }
+    state->result_cv.notify_one();
+}
+
+#endif  // DENSECORE_ENGINE_INTERNAL_H

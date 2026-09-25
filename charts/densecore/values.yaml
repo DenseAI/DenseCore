@@ -1,0 +1,358 @@
+autoscaling:
+  # Legacy resource-based HPA. Prefer dense-base.keda for inference-aware
+  # scaling from product metrics such as queue depth or active requests.
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+
+networkPolicy:
+  # Legacy DenseCore NetworkPolicy helper. Prefer dense-base.networkPolicy for
+  # portable, explicit ingress/egress rules across clouds and on-prem clusters.
+  enabled: false
+  allowIngressController: true
+  ingressControllerNamespaceLabels:
+    name: ingress-nginx
+  monitoringNamespaceLabels:
+    name: monitoring
+  additionalIngressRules: []
+  egressRules: []
+
+grafana:
+  dashboards:
+    enabled: false
+    labels:
+      grafana_dashboard: "1"
+    annotations: {}
+
+dense-base:
+  nameOverride: ""
+  fullnameOverride: ""
+  replicaCount: 1
+  deploymentAnnotations: {}
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
+  image:
+    # Published linux/amd64 developer-preview image; override for other targets.
+    repository: denseai/densecore
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+
+  serviceAccount:
+    create: true
+    annotations: {}
+    name: ""
+    automount: false
+
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+  podLabels: {}
+
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  priorityClassName: ""
+  runtimeClassName: ""
+
+  securityContext:
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    runAsNonRoot: true
+
+  terminationGracePeriodSeconds: 60
+
+  lifecycle:
+    preStopSleepSeconds: 5
+
+  tmpVolume:
+    enabled: true
+    mountPath: /tmp
+    sizeLimit: ""
+    medium: ""
+
+  service:
+    enabled: true
+    type: ClusterIP
+    port: 8080
+    targetPort: http
+    annotations: {}
+    extraPorts: []
+
+  grpc:
+    enabled: false
+    port: 50051
+    tls:
+      enabled: false
+      certSecret: ""
+      certFile: /etc/densecore/grpc/tls/tls.crt
+      keyFile: /etc/densecore/grpc/tls/tls.key
+      clientCASecret: ""
+      clientCAFile: /etc/densecore/grpc/client-ca/ca.crt
+      requireClientCert: false
+    service:
+      enabled: false
+      type: ClusterIP
+      port: 50051
+      annotations: {}
+      extraPorts: []
+    ingress:
+      enabled: false
+      className: ""
+      annotations: {}
+      hosts:
+        - host: densecore-grpc.local
+          paths:
+            - path: /
+              pathType: Prefix
+      tls: []
+
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    # DenseCore prefix/KV cache is pod-local. For multi-replica serving, configure
+    # the ingress or service mesh to hash on X-DenseCore-Cache-Affinity so
+    # repeated conversation/document prefixes return to the same warm pod.
+    #
+    # NGINX Ingress example:
+    # annotations:
+    #   nginx.ingress.kubernetes.io/upstream-hash-by: "$http_x_densecore_cache_affinity"
+    #
+    # Envoy/Istio users should configure a header_hash_policy for
+    # X-DenseCore-Cache-Affinity on the route or destination rule layer.
+    hosts:
+      - host: densecore.local
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+  resources:
+    requests:
+      cpu: "4"
+      memory: "8Gi"
+    limits:
+      cpu: "6"
+      memory: "12Gi"
+
+  probes:
+    enabled: true
+    liveness:
+      path: /health/live
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readiness:
+      path: /health/ready
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+    startup:
+      path: /health/startup
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      timeoutSeconds: 5
+      failureThreshold: 60
+
+  env:
+    - name: PORT
+      value: "8080"
+    - name: WORKLOAD_PROFILE
+      value: "llm"
+    - name: LLM_API_ENABLED
+      value: "true"
+    - name: MODEL_LIFECYCLE_PROBES_ENABLED
+      value: "true"
+    - name: SERVICE_NAME
+      value: "DenseCore API Server"
+    - name: SERVICE_DESCRIPTION
+      value: ""
+    - name: GRPC_ENABLED
+      value: "false"
+    - name: GRPC_PORT
+      value: "50051"
+    - name: GRPC_TLS_ENABLED
+      value: "false"
+    - name: GRPC_TLS_CERT_FILE
+      value: "/etc/densecore/grpc/tls/tls.crt"
+    - name: GRPC_TLS_KEY_FILE
+      value: "/etc/densecore/grpc/tls/tls.key"
+    - name: GRPC_TLS_CLIENT_CA_FILE
+      value: "/etc/densecore/grpc/client-ca/ca.crt"
+    - name: GRPC_TLS_REQUIRE_CLIENT_CERT
+      value: "false"
+    - name: LOG_FORMAT
+      value: "json"
+    - name: LOG_LEVEL
+      value: "info"
+    - name: READ_TIMEOUT
+      value: "30s"
+    - name: WRITE_TIMEOUT
+      value: "120s"
+    - name: REQUEST_TIMEOUT
+      value: "120s"
+    - name: SHUTDOWN_TIMEOUT
+      value: "30s"
+    - name: MAX_REQUEST_BODY_SIZE
+      value: "10485760"
+    - name: METRICS_ENABLED
+      value: "true"
+    - name: METRICS_PATH
+      value: "/metrics"
+    - name: METRICS_NAMESPACE
+      value: "densecore"
+    - name: CORS_ENABLED
+      value: "false"
+    - name: CORS_ALLOWED_ORIGINS
+      value: ""
+    - name: RATE_LIMIT_ENABLED
+      value: "true"
+    - name: RATE_LIMIT_RPS
+      value: "100"
+    - name: RATE_LIMIT_BURST
+      value: "200"
+    - name: AUTH_ENABLED
+      value: "false"
+    - name: OTEL_ENABLED
+      value: "false"
+    - name: OTEL_ENDPOINT
+      value: "otel-collector.monitoring:4317"
+    - name: OTEL_SERVICE_NAME
+      value: "densecore"
+    - name: OTEL_INSECURE
+      value: "true"
+    - name: OTEL_SAMPLING_RATE
+      value: "1.0"
+  extraEnv: []
+  # Clients or gateways should set X-DenseCore-Cache-Affinity or
+  # cache_control.affinity_key/cache_id/conversation_id on /v1/chat/completions.
+  # DenseCore returns X-DenseCore-Cache-Affinity-Key for client replay and emits
+  # cache_affinity_* Prometheus counters for routing coverage.
+  extraEnvFrom: []
+
+  initContainers: []
+  extraInitContainers: []
+  extraContainers: []
+
+  model:
+    source: none
+    path: /models
+    filename: main_model.gguf
+    envVarName: MAIN_MODEL_PATH
+    existingClaim: ""
+    pvc:
+      storageClassName: ""
+      size: "50Gi"
+      accessModes:
+        - ReadWriteMany
+    hostPath: ""
+    hostPathType: DirectoryOrCreate
+    emptyDir:
+      sizeLimit: "20Gi"
+      medium: ""
+
+  extraVolumeMounts: []
+  extraVolumes: []
+
+  keda:
+    enabled: false
+    minReplicaCount: 1
+    maxReplicaCount: 10
+    pollingInterval: 15
+    cooldownPeriod: 60
+    advanced:
+      restoreToOriginalReplicaCount: false
+      horizontalPodAutoscalerConfig:
+        behavior:
+          scaleDown:
+            stabilizationWindowSeconds: 120
+            policies:
+              - type: Percent
+                value: 25
+                periodSeconds: 60
+          scaleUp:
+            stabilizationWindowSeconds: 0
+            policies:
+              - type: Pods
+                value: 2
+                periodSeconds: 30
+    prometheusServerAddress: "http://prometheus-server.monitoring.svc.cluster.local:80"
+    triggers:
+      custom:
+        - type: prometheus
+          metadata:
+            serverAddress: "http://prometheus-server.monitoring.svc.cluster.local:80"
+            metricName: "densecore_pending_requests"
+            threshold: "5"
+            query: "sum(densecore_pending_requests)"
+        - type: prometheus
+          metadata:
+            serverAddress: "http://prometheus-server.monitoring.svc.cluster.local:80"
+            metricName: "densecore_active_requests"
+            threshold: "8"
+            query: "sum(densecore_active_requests)"
+
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+    maxUnavailable: ""
+
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+    scrapeTimeout: 10s
+    path: /metrics
+    labels: {}
+
+  nodeSelector: {}
+  tolerations: []
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: workload-type
+                operator: In
+                values:
+                  - compute-optimized
+                  - memory-optimized
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: densecore
+            topologyKey: kubernetes.io/hostname
+  topologySpreadConstraints: []

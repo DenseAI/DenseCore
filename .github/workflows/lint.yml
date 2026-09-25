@@ -1,0 +1,149 @@
+name: Code Quality
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'core/**'
+      - 'server/**'
+      - 'python/**'
+      - 'charts/densecore/**'
+      - 'docker/**'
+      - 'scripts/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'Makefile'
+      - '.github/workflows/**'
+  push:
+    branches: [main]
+    paths:
+      - 'core/**'
+      - 'server/**'
+      - 'python/**'
+      - 'charts/densecore/**'
+      - 'docker/**'
+      - 'scripts/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'Makefile'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-lint:
+    name: Python Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+
+      - name: Run Python format and lint checks
+        working-directory: python
+        run: |
+          ruff format --check .
+          ruff check .
+
+  go-lint:
+    name: Go Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libnuma-dev libhwloc-dev
+
+      - name: Build DenseCore runtime for cgo lint
+        run: |
+          cmake -S core -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDENSECORE_BUILD_TESTS=OFF \
+            -DDENSECORE_LTO=ON
+          cmake --build build -j$(nproc)
+
+      - name: Run Go format check
+        run: make format-check-go
+
+      - name: Run Go lint
+        run: |
+          export CGO_CFLAGS="-I${GITHUB_WORKSPACE}/core/include"
+          export CGO_LDFLAGS="-L${GITHUB_WORKSPACE}/build -ldensecore -lstdc++ -ldl"
+          export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/build:${LD_LIBRARY_PATH:-}"
+          make lint-go
+
+  cpp-lint:
+    name: C++ Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+
+      - name: Check C++ diff hygiene and new-file formatting
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base="$PR_BASE_SHA"
+          elif [[ "${{ github.event_name }}" == "push" && -n "$PUSH_BASE_SHA" && ! "$PUSH_BASE_SHA" =~ ^0+$ ]] && \
+               git cat-file -e "${PUSH_BASE_SHA}^{commit}" 2>/dev/null && \
+               git merge-base --is-ancestor "$PUSH_BASE_SHA" "$GITHUB_SHA"; then
+            base="$PUSH_BASE_SHA"
+          elif git rev-parse HEAD^ >/dev/null 2>&1; then
+            base="$(git rev-parse HEAD^)"
+          else
+            echo "Root commit has no comparable C++ diff base"
+            exit 0
+          fi
+
+          git diff --check "$base" "$GITHUB_SHA" -- core/src core/include core/tests
+
+          files=()
+          while IFS= read -r -d '' file; do
+            case "$file" in
+              *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.mm) files+=("$file") ;;
+            esac
+          done < <(git diff --name-only --diff-filter=A -z "$base" "$GITHUB_SHA" -- core/src core/include core/tests)
+
+          if (( ${#files[@]} > 0 )); then
+            clang-format --dry-run --Werror "${files[@]}"
+          else
+            echo "No new C++ files to format-check"
+          fi

@@ -1,0 +1,91 @@
+# Local development stack only. The server binds to loopback and deliberately
+# leaves authentication disabled for local smoke testing; use the Helm chart or
+# an explicit production configuration for networked deployments.
+services:
+  # ===========================================
+  # Redis for Distributed Rate Limiting & API Keys
+  # ===========================================
+  redis:
+    image: redis:7-alpine
+    container_name: densecore-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - densecore-network
+
+  # ===========================================
+  # DenseCore LLM Inference Server
+  # ===========================================
+  densecore:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: denseai/densecore:0.1.0
+    container_name: densecore-server
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Mount your models directory (change the path as needed)
+      - ./models:/models:ro
+    environment:
+      # Model configuration
+      - MAIN_MODEL_PATH=/models/model.gguf # Change to your model filename
+      # Server configuration
+      - PORT=8080
+      - HOST=0.0.0.0
+      - THREADS=0 # 0 = auto-detect
+      # Rate limiting
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_RPS=100
+      - RATE_LIMIT_BURST=200
+      # Logging
+      - LOG_FORMAT=json
+      # Timeouts
+      - READ_TIMEOUT=30s
+      - WRITE_TIMEOUT=120s
+      - SHUTDOWN_TIMEOUT=30s
+      # CORS
+      - CORS_ALLOWED_ORIGINS=http://localhost:3000
+      # Authentication is disabled only because this Compose example is loopback-only.
+      - AUTH_ENABLED=false
+      # Redis (distributed rate limiting & API key store)
+      - REDIS_URL=redis://redis:6379
+      - REDIS_DB=0
+      - REDIS_RATELIMIT_ENABLED=true
+      - REDIS_KEYSTORE_ENABLED=true
+      - REDIS_KEYSTORE_CACHE_TTL=5m
+      - REDIS_KEYSTORE_CACHE_SIZE=1000
+    healthcheck:
+      test: [ "CMD", "/app/densecore-server", "healthcheck", "--url", "http://127.0.0.1:8080/health/live", "--timeout", "5s" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - densecore-network
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+
+networks:
+  densecore-network:
+    driver: bridge
+
+volumes:
+  redis-data:

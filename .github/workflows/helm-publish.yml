@@ -1,0 +1,82 @@
+name: Build Helm Beta Chart
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Manual chart version. Use a beta, rc, alpha, or dev suffix when publishing.'
+        required: true
+        type: string
+        default: '0.1.0-beta.1'
+      publish_beta:
+        description: 'Push the beta chart to GHCR'
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CHART_PATH: charts/densecore
+
+jobs:
+  helm:
+    name: Package Helm chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: 'v3.14.0'
+
+      - name: Validate beta publishing version
+        if: inputs.publish_beta
+        run: |
+          if ! printf '%s\n' "${{ inputs.version }}" | grep -Eq '(alpha|beta|rc|dev)'; then
+            echo "Helm beta publishing requires a prerelease version suffix" >&2
+            exit 1
+          fi
+
+      - name: Update chart version for manual package
+        run: |
+          sed -i "s/^version:.*/version: ${{ inputs.version }}/" "${{ env.CHART_PATH }}/Chart.yaml"
+          sed -i "s/^appVersion:.*/appVersion: \"${{ inputs.version }}\"/" "${{ env.CHART_PATH }}/Chart.yaml"
+          cat "${{ env.CHART_PATH }}/Chart.yaml"
+
+      - name: Lint Helm chart
+        run: helm lint "${{ env.CHART_PATH }}"
+
+      - name: Run Helm template test
+        run: helm template densecore "${{ env.CHART_PATH }}" --debug
+
+      - name: Package Helm chart
+        run: |
+          mkdir -p .deploy
+          helm package "${{ env.CHART_PATH }}" --destination .deploy
+
+      - name: Log in to GitHub Container Registry
+        if: inputs.publish_beta
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push beta chart to GHCR
+        if: inputs.publish_beta
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          helm push .deploy/densecore-*.tgz "oci://ghcr.io/${OWNER_LC}/charts-beta"
+
+      - name: Upload chart artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: helm-chart
+          path: .deploy/*.tgz
+          retention-days: 30

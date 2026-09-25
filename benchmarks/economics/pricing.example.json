@@ -1,0 +1,20 @@
+{
+  "snapshot_id": "replace-with-provider-sku-snapshot",
+  "provider": "Google Cloud",
+  "region": "replace-with-region",
+  "currency": "USD",
+  "pricing_basis": "on-demand Linux hourly price, excluding retained storage and egress",
+  "captured_at": "YYYY-MM-DDTHH:MM:SSZ",
+  "deployments": {
+    "cpu": {
+      "machine_type": "replace-with-c4-machine-type",
+      "node_count": 1,
+      "hourly_usd": 0.0
+    },
+    "gpu": {
+      "machine_type": "replace-with-gpu-machine-type",
+      "node_count": 1,
+      "hourly_usd": 0.0
+    }
+  }
+}

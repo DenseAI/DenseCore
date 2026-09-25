@@ -1,0 +1,6 @@
+dependencies:
+- name: dense-base
+  repository: oci://ghcr.io/denseai/charts
+  version: 1.1.0
+digest: sha256:2f5725c82002ac0e873718385625ecac58bf59abfd3813a021ccf0e54cf8821c
+generated: "2026-08-16T12:39:42.688201409+09:00"

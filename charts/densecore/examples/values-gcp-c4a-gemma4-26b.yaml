@@ -1,0 +1,113 @@
+# GCP C4A 16-core Gemma4-26B-A4B CPU inference profile.
+# Gemma4 uses the same pod/autoscaling chassis but keeps Gemma-specific runtime
+# toggles explicit so SRE changes do not accidentally enable unvalidated paths.
+
+autoscaling:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+
+dense-base:
+  replicaCount: 1
+
+  image:
+    # v0.1-rc.1 public images are linux/amd64-only. Supply a natively qualified C4A build.
+    repository: your-registry/densecore-arm64
+    tag: "c4a-qualified-build"
+
+  model:
+    source: pvc
+    existingClaim: densecore-gemma4-models
+    path: /models
+    filename: gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
+    envVarName: MAIN_MODEL_PATH
+
+  initContainers: []
+
+  resources:
+    requests:
+      cpu: "16"
+      memory: "48Gi"
+    limits:
+      cpu: "16"
+      memory: "56Gi"
+
+  extraEnv:
+    - name: THREADS
+      value: "16"
+    - name: DENSECORE_ENGINE_THREADS
+      value: "16"
+    - name: DENSECORE_GO_WORKERS
+      value: "1"
+    - name: DENSECORE_SERVER_INFLIGHT
+      value: "2"
+    - name: DENSECORE_MAX_NUM_SEQS
+      value: "4"
+    - name: DENSECORE_REQUIRE_C4A_SVE
+      value: "1"
+
+  keda:
+    enabled: true
+    minReplicaCount: 1
+    maxReplicaCount: 6
+    pollingInterval: 15
+    cooldownPeriod: 180
+    triggers:
+      custom:
+        - type: prometheus
+          metadata:
+            serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+            metricName: densecore_pending_requests
+            threshold: "3"
+            query: sum(densecore_pending_requests)
+        - type: prometheus
+          metadata:
+            serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+            metricName: densecore_active_requests
+            threshold: "2"
+            query: sum(densecore_active_requests)
+
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: prometheus
+    path: /metrics
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  networkPolicy:
+    enabled: true
+    ingress:
+      enabled: true
+      allowAll: false
+      allowSameNamespace: true
+      peers: []
+      ports:
+        - protocol: TCP
+          port: 8080
+    egress:
+      enabled: true
+      allowDNS: true
+      allowAll: false
+      peers: []
+      ports: []
+
+  nodeSelector:
+    cloud.google.com/machine-family: c4a
+    kubernetes.io/arch: arm64
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: densecore
+            topologyKey: kubernetes.io/hostname
+
+  tolerations: []
+  topologySpreadConstraints: []

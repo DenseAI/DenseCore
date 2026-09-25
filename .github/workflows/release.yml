@@ -1,0 +1,338 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to release (for example v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  security-events: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-main:
+    name: Verify release tag is on main
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Verify tag and ancestry
+        run: |
+          tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          if [[ -z "$tag_sha" ]]; then
+            echo "Release tag does not exist: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor "$tag_sha" origin/main
+
+      - name: Export release version
+        id: version
+        run: |
+          version="${RELEASE_TAG#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$(git rev-list -n 1 "$RELEASE_TAG")" >> "$GITHUB_OUTPUT"
+
+  release-gate:
+    name: Build, test, license, and security gate
+    needs: verify-main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libnuma-dev libhwloc-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install Python lock audit tools
+        run: python -m pip install --disable-pip-version-check uv==0.9.26 pip-audit==2.10.1
+
+      - name: Audit all Python locked dependencies
+        working-directory: python
+        run: |
+          uv lock --check
+          uv export --all-extras --all-groups --no-hashes --no-emit-project \
+            --output-file "${RUNNER_TEMP}/densecore-all-requirements.txt"
+          pip-audit --requirement "${RUNNER_TEMP}/densecore-all-requirements.txt" \
+            --no-deps --disable-pip --strict --progress-spinner off
+
+      - name: Check release version metadata
+        run: bash scripts/check_version_consistency.sh "${{ needs.verify-main.outputs.version }}"
+
+      - name: Check shell syntax
+        run: |
+          bash -n scripts/collect_release_licenses.sh
+          bash -n scripts/package_release.sh
+          bash -n scripts/release_smoke.sh
+          bash -n scripts/container_model_smoke.sh
+          bash -n scripts/entrypoint.sh
+          bash -n scripts/resolve_release_cpu_target.sh
+
+      - name: Validate release CPU target mappings
+        run: |
+          set -euo pipefail
+          for target in portable amd64-v3 arm64; do
+            bash scripts/resolve_release_cpu_target.sh "$target"
+          done
+          if bash scripts/resolve_release_cpu_target.sh native; then
+            echo "native must not be accepted as a publishable release CPU target" >&2
+            exit 1
+          fi
+
+      - name: Configure C++ release build
+        run: |
+          cmake -S core -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDENSECORE_CPU_TARGET=portable \
+            -DDENSECORE_PORTABLE=ON \
+            -DGGML_NATIVE=OFF \
+            -DDENSECORE_BUILD_TESTS=ON \
+            -DDENSECORE_LTO=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 2>&1 | tee cmake-configure.log
+          if grep -q -- "-march=native" cmake-configure.log; then
+            echo "::error::Portable release build selected -march=native"
+            exit 1
+          fi
+          if ! grep -q "DENSECORE_CPU_TARGET: portable" cmake-configure.log; then
+            echo "::error::Portable release build did not normalize DENSECORE_CPU_TARGET=portable"
+            exit 1
+          fi
+          if ! grep -q "NUMA support enabled" cmake-configure.log; then
+            echo "::error::CMake did not enable NUMA support for the release build"
+            grep -i "numa" cmake-configure.log || true
+            exit 1
+          fi
+          grep -q '^DENSECORE_PORTABLE:BOOL=ON$' build/CMakeCache.txt
+          grep -q '^GGML_NATIVE:BOOL=OFF$' build/CMakeCache.txt
+
+      - name: Build C++ release library
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Run C++ tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Run Go tests
+        working-directory: server
+        run: |
+          export CGO_CFLAGS="-I${GITHUB_WORKSPACE}/core/include"
+          export CGO_LDFLAGS="-L${GITHUB_WORKSPACE}/build -ldensecore -lstdc++ -ldl"
+          export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/build:${LD_LIBRARY_PATH:-}"
+          go test -mod=mod ./...
+          go test -mod=mod -race ./...
+
+      - name: Run Go vulnerability check
+        working-directory: server
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+      - name: Collect release license materials
+        run: bash scripts/collect_release_licenses.sh release/licenses
+
+  build-amd64-tarball:
+    name: Build Linux amd64 release tarball
+    needs: [verify-main, release-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libnuma-dev libhwloc-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Configure portable C++ library
+        run: |
+          cmake -S core -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDENSECORE_CPU_TARGET=portable \
+            -DDENSECORE_PORTABLE=ON \
+            -DGGML_NATIVE=OFF 2>&1 | tee cmake-configure.log
+          if grep -q -- "-march=native" cmake-configure.log; then
+            echo "::error::Portable release tarball selected -march=native"
+            exit 1
+          fi
+          if ! grep -q "DENSECORE_CPU_TARGET: portable" cmake-configure.log; then
+            echo "::error::Portable release tarball did not normalize DENSECORE_CPU_TARGET=portable"
+            exit 1
+          fi
+
+      - name: Build portable C++ library
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Verify NUMA support
+        run: |
+          if ! grep -q "NUMA support enabled" cmake-configure.log; then
+            echo "::error::Release artifact host did not enable NUMA support"
+            grep -i "numa" cmake-configure.log || true
+            exit 1
+          fi
+          grep -q '^DENSECORE_PORTABLE:BOOL=ON$' build/CMakeCache.txt
+          grep -q '^GGML_NATIVE:BOOL=OFF$' build/CMakeCache.txt
+
+      - name: Build Go server
+        working-directory: server
+        run: |
+          export CGO_LDFLAGS="-L$(pwd)/../build -ldensecore -lstdc++ -ldl"
+          export CGO_CFLAGS="-I$(pwd)/../core/include"
+          go build -mod=mod \
+            -ldflags="-s -w -X github.com/DenseAI/DenseCore/server/internal/buildinfo.Version=${{ needs.verify-main.outputs.version }}" \
+            -o "densecore-server-linux-amd64" ./cmd/densecore
+
+      - name: Collect license materials
+        run: bash scripts/collect_release_licenses.sh release/licenses
+
+      - name: Download pinned release smoke model
+        run: |
+          curl --fail --location --retry 3 \
+            --output /tmp/Qwen3.5-0.8B-Q4_K_M.gguf \
+            https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-GGUF/resolve/7925ccdc665d4efdb1034791e6b553e11128e6f8/Qwen3.5-0.8B-Q4_K_M.gguf
+          echo 'f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec  /tmp/Qwen3.5-0.8B-Q4_K_M.gguf' \
+            | sha256sum --check --strict
+
+      - name: Verify concurrent CGO prompt rendering with a real model
+        working-directory: server
+        run: |
+          export CGO_LDFLAGS="-L${GITHUB_WORKSPACE}/build -ldensecore -lstdc++ -ldl"
+          export CGO_CFLAGS="-I${GITHUB_WORKSPACE}/core/include"
+          export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/build:${LD_LIBRARY_PATH:-}"
+          DENSECORE_TEST_MODEL=/tmp/Qwen3.5-0.8B-Q4_K_M.gguf \
+            go test -mod=mod -race ./internal/engine \
+              -run '^TestRenderChatPromptConcurrentBorrowedBuffers$' -count=1 -timeout=90s
+
+      - name: Package artifacts
+        run: |
+          export DENSECORE_CMAKE_PRESET=portable-release
+          export DENSECORE_SMOKE_MODEL=/tmp/Qwen3.5-0.8B-Q4_K_M.gguf
+          bash scripts/package_release.sh "${{ needs.verify-main.outputs.version }}" \
+            --binary build \
+            --server server/densecore-server-linux-amd64 \
+            --licenses release/licenses \
+            --out .
+
+      - name: Clean-room source archive smoke
+        run: |
+          DENSECORE_RELEASE_VERSION="${{ needs.verify-main.outputs.version }}" \
+          DENSECORE_SOURCE_TARBALL="densecore-${{ needs.verify-main.outputs.version }}-source.tar.gz" \
+          DENSECORE_SMOKE_MODEL=/tmp/Qwen3.5-0.8B-Q4_K_M.gguf \
+          bash scripts/release_smoke.sh
+
+      - name: Upload qualified release candidates
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-candidates
+          if-no-files-found: error
+          path: |
+            densecore-${{ needs.verify-main.outputs.version }}-linux-amd64.tar.gz
+            densecore-${{ needs.verify-main.outputs.version }}-linux-amd64.tar.gz.sha256
+            densecore-${{ needs.verify-main.outputs.version }}-source.tar.gz
+            densecore-${{ needs.verify-main.outputs.version }}-source.tar.gz.sha256
+
+  verify-published-docker:
+    name: Verify published Docker image
+    needs: [verify-main, build-amd64-tarball]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout smoke tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Pull and verify public image provenance
+        env:
+          VERSION: ${{ needs.verify-main.outputs.version }}
+          SOURCE_SHA: ${{ needs.verify-main.outputs.source_sha }}
+        run: |
+          image="denseai/densecore:${VERSION}"
+          docker pull --platform linux/amd64 "$image"
+          test "$(docker image inspect --format '{{.Architecture}}' "$image")" = amd64
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$SOURCE_SHA"
+          docker run --rm "$image" --help
+
+      - name: Scan published image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: denseai/densecore:${{ needs.verify-main.outputs.version }}
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Download pinned release smoke model
+        run: |
+          curl --fail --location --retry 3 \
+            --output /tmp/Qwen3.5-0.8B-Q4_K_M.gguf \
+            https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-GGUF/resolve/7925ccdc665d4efdb1034791e6b553e11128e6f8/Qwen3.5-0.8B-Q4_K_M.gguf
+          echo 'f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec  /tmp/Qwen3.5-0.8B-Q4_K_M.gguf' \
+            | sha256sum --check --strict
+
+      - name: Exercise public image API and graceful shutdown
+        run: |
+          bash scripts/container_model_smoke.sh \
+            "denseai/densecore:${{ needs.verify-main.outputs.version }}" \
+            /tmp/Qwen3.5-0.8B-Q4_K_M.gguf 18080
+
+  publish-release:
+    name: Publish qualified GitHub release
+    needs: [verify-main, build-amd64-tarball, verify-published-docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download qualified release candidates
+        uses: actions/download-artifact@v7
+        with:
+          name: release-candidates
+          path: release-candidates
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: false
+          prerelease: ${{ contains(env.RELEASE_TAG, '-rc') || contains(env.RELEASE_TAG, '-beta') || contains(env.RELEASE_TAG, '-alpha') }}
+          files: release-candidates/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
