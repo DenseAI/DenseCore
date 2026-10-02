@@ -18,6 +18,9 @@ surfaces with narrower qualification.
 [Capabilities](#what-you-get) · [Support](#support-and-maturity) ·
 [Documentation](#documentation)
 
+For CPU classification and typed decisions, the source preview also supports
+[Laya GGUF with a native System One API](docs/LAYA.md).
+
 ## Quick start
 
 Download the small GGUF used by the release smoke test, verify it, and start

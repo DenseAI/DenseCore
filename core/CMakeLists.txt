@@ -391,6 +391,27 @@ if(TARGET simdjson)
     )
 endif()
 
+# Small standalone CPU decision runtime, independent of decoder/model dispatch.
+add_library(densecore_decision SHARED src/decision/laya.cpp)
+target_include_directories(densecore_decision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${GGML_DIR}/include)
+target_link_libraries(densecore_decision PRIVATE ggml ggml-cpu)
+target_compile_definitions(densecore_decision PRIVATE DENSECORE_BUILD_SHARED)
+install(TARGETS densecore_decision
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/densecore/decision.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/densecore)
+
+option(DENSECORE_DECISION_ONLY "Build only the CPU Laya decision runtime and its tests" OFF)
+if(DENSECORE_DECISION_ONLY)
+    enable_testing()
+    add_executable(densecore_decision_tests tests/decision/test_laya.cpp)
+    target_include_directories(densecore_decision_tests PRIVATE ${GGML_DIR}/include)
+    target_link_libraries(densecore_decision_tests PRIVATE densecore_decision ggml)
+    add_test(NAME densecore_decision_validation COMMAND densecore_decision_tests)
+    return()
+endif()
+
 # ==========================================================================
 # SIMDe Integration (for ARM64/non-x86 support)
 # ==========================================================================
@@ -767,6 +788,7 @@ endif()
 # Create Shared Library (AFTER all source additions)
 # ==========================================================================
 add_library(densecore SHARED)
+add_dependencies(densecore densecore_decision)
 
 # Include directories
 target_include_directories(densecore PUBLIC
@@ -1305,6 +1327,10 @@ if(DENSECORE_BUILD_TESTS)
     FetchContent_MakeAvailable(googletest)
 
     enable_testing()
+    add_executable(densecore_decision_tests tests/decision/test_laya.cpp)
+    target_include_directories(densecore_decision_tests PRIVATE ${GGML_DIR}/include)
+    target_link_libraries(densecore_decision_tests PRIVATE densecore_decision ggml)
+    add_test(NAME densecore_decision_validation COMMAND densecore_decision_tests)
 
     # Test sources (use absolute paths to ensure correct resolution)
     set(TEST_SOURCES

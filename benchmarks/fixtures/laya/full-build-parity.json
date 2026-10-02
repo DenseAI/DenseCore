@@ -1,0 +1,517 @@
+{
+  "inputs_sha256": {
+    "common": "cb77c34b3b5abfc1f59eb1a73357ad80238df397ffdddcfaf634c01949f89b3f",
+    "checkpoint": "891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c",
+    "encoder_config": "bf3ab80598fdccf414855a2ce80f22859e4492d06ca8a62ddd1cfb63972f8979",
+    "agent_config": "ae287b56bbcf5f8c4f4541ae9dfd00c914c4c48b940b8398c3058af37ba92bbd",
+    "gguf": "62db2affc0fe4b9f2538ba61299e5fd8bf876f50f765089a343cd4113eef21a4"
+  },
+  "native_library_sha256": "25d64f452e572a6c208d84c13067caee2de21ef8ceb6525026a3d347ed662741",
+  "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "python": "3.13.11",
+  "versions": {
+    "torch": "2.14.1+cpu",
+    "transformers": "5.18.0"
+  },
+  "threads": 4,
+  "learned_tensors_exact": 205,
+  "limits": {
+    "max_abs_logit": 0.001,
+    "max_abs_probability": 0.0001,
+    "act_logit_atol": 0.001,
+    "act_logit_rtol": 1e-06,
+    "max_abs_act_probability": 0.0001
+  },
+  "cases": [
+    {
+      "name": "choice",
+      "tokens": 37,
+      "markers": [
+        11,
+        17,
+        22
+      ],
+      "reference_logits": [
+        5.031761646270752,
+        -2.3319778442382812,
+        -2.1593823432922363
+      ],
+      "native_logits": [
+        5.031763076782227,
+        -2.331977367401123,
+        -2.1593821048736572
+      ],
+      "reference_act_logits": [
+        4403.689453125,
+        -3597.9921875
+      ],
+      "native_act_logits": [
+        4403.68896484375,
+        -3597.9921875
+      ],
+      "temperature": 1.7601518630981445,
+      "reference_probabilities": [
+        0.9689376950263977,
+        0.014770301058888435,
+        0.01629202626645565
+      ],
+      "native_probabilities": [
+        0.9689376950263977,
+        0.014770293608307838,
+        0.016292009502649307
+      ],
+      "max_abs_logit": 1.430511474609375e-06,
+      "max_abs_act_logit": 0.00048828125,
+      "max_abs_probability": 1.6763806343078613e-08,
+      "max_abs_act_probability": 0.0,
+      "reference_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "native_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "passed": true
+    },
+    {
+      "name": "score",
+      "tokens": 37,
+      "markers": [
+        10,
+        15,
+        20
+      ],
+      "reference_logits": [
+        -0.6433273553848267,
+        2.7015328407287598,
+        2.1357357501983643
+      ],
+      "native_logits": [
+        -0.643328070640564,
+        2.701533317565918,
+        2.1357359886169434
+      ],
+      "reference_act_logits": [
+        4436.98095703125,
+        -3636.15478515625
+      ],
+      "native_act_logits": [
+        4436.97998046875,
+        -3636.1533203125
+      ],
+      "temperature": 1.2514300346374512,
+      "reference_probabilities": [
+        0.040494404733181,
+        0.5863953232765198,
+        0.37311020493507385
+      ],
+      "native_probabilities": [
+        0.04049437865614891,
+        0.5863955020904541,
+        0.37311020493507385
+      ],
+      "max_abs_logit": 7.152557373046875e-07,
+      "max_abs_act_logit": 0.00146484375,
+      "max_abs_probability": 1.7881393432617188e-07,
+      "max_abs_act_probability": 0.0,
+      "reference_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "native_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "passed": true
+    },
+    {
+      "name": "noul_unicode",
+      "tokens": 65,
+      "markers": [
+        12,
+        22
+      ],
+      "reference_logits": [
+        3.7189698219299316,
+        0.04611140489578247
+      ],
+      "native_logits": [
+        3.718966007232666,
+        0.04611283540725708
+      ],
+      "reference_act_logits": [
+        4499.66748046875,
+        -3676.62255859375
+      ],
+      "native_act_logits": [
+        4499.66796875,
+        -3676.623046875
+      ],
+      "temperature": 1.983399510383606,
+      "reference_probabilities": [
+        0.8643382787704468,
+        0.13566173613071442
+      ],
+      "native_probabilities": [
+        0.8643379211425781,
+        0.1356620490550995
+      ],
+      "max_abs_logit": 3.814697265625e-06,
+      "max_abs_act_logit": 0.00048828125,
+      "max_abs_probability": 3.5762786865234375e-07,
+      "max_abs_act_probability": 0.0,
+      "reference_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "native_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "passed": true
+    },
+    {
+      "name": "single_option",
+      "tokens": 17,
+      "markers": [
+        9
+      ],
+      "reference_logits": [
+        1.360880970954895
+      ],
+      "native_logits": [
+        1.3608810901641846
+      ],
+      "reference_act_logits": [
+        4520.125,
+        -3688.0751953125
+      ],
+      "native_act_logits": [
+        4520.125,
+        -3688.07568359375
+      ],
+      "temperature": 1.9063563346862793,
+      "reference_probabilities": [
+        1.0
+      ],
+      "native_probabilities": [
+        1.0
+      ],
+      "max_abs_logit": 1.1920928955078125e-07,
+      "max_abs_act_logit": 0.00048828125,
+      "max_abs_probability": 0.0,
+      "max_abs_act_probability": 0.0,
+      "reference_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "native_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "passed": true
+    },
+    {
+      "name": "local_attention",
+      "tokens": 205,
+      "markers": [
+        11,
+        17,
+        22
+      ],
+      "reference_logits": [
+        1.491036057472229,
+        0.18050554394721985,
+        -0.5953011512756348
+      ],
+      "native_logits": [
+        1.4910354614257812,
+        0.18050545454025269,
+        -0.5952988862991333
+      ],
+      "reference_act_logits": [
+        4727.4482421875,
+        -3860.02734375
+      ],
+      "native_act_logits": [
+        4727.44677734375,
+        -3860.0263671875
+      ],
+      "temperature": 1.7601518630981445,
+      "reference_probabilities": [
+        0.5616101026535034,
+        0.26673415303230286,
+        0.1716557890176773
+      ],
+      "native_probabilities": [
+        0.5616098642349243,
+        0.2667340934276581,
+        0.17165598273277283
+      ],
+      "max_abs_logit": 2.2649765014648438e-06,
+      "max_abs_act_logit": 0.00146484375,
+      "max_abs_probability": 2.384185791015625e-07,
+      "max_abs_act_probability": 0.0,
+      "reference_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "native_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "passed": true
+    },
+    {
+      "name": "choice_12",
+      "tokens": 100,
+      "markers": [
+        9,
+        16,
+        23,
+        30,
+        37,
+        44,
+        51,
+        58,
+        65,
+        72,
+        79,
+        86
+      ],
+      "reference_logits": [
+        0.8354618549346924,
+        1.9031519889831543,
+        0.25235041975975037,
+        -1.5707738399505615,
+        -2.077603816986084,
+        -2.1778900623321533,
+        -1.553918719291687,
+        -1.7264010906219482,
+        -1.9081029891967773,
+        -2.6374573707580566,
+        -2.7765469551086426,
+        -2.581117868423462
+      ],
+      "native_logits": [
+        0.8354608416557312,
+        1.90315580368042,
+        0.2523486614227295,
+        -1.570771336555481,
+        -2.077603578567505,
+        -2.1778907775878906,
+        -1.5539169311523438,
+        -1.72639799118042,
+        -1.9081048965454102,
+        -2.6374592781066895,
+        -2.7765493392944336,
+        -2.5811173915863037
+      ],
+      "reference_act_logits": [
+        4088.31396484375,
+        -3337.4453125
+      ],
+      "native_act_logits": [
+        4088.313720703125,
+        -3337.4453125
+      ],
+      "temperature": 0.5,
+      "reference_probabilities": [
+        0.10197252035140991,
+        0.8627143502235413,
+        0.031768668442964554,
+        0.0008288069511763752,
+        0.0003007644263561815,
+        0.00024610402761027217,
+        0.0008572223014198244,
+        0.0006071238312870264,
+        0.0004221365670673549,
+        9.81620978564024e-05,
+        7.432453276123852e-05,
+        0.00010987009591190144
+      ],
+      "native_probabilities": [
+        0.10197167843580246,
+        0.862715482711792,
+        0.03176835551857948,
+        0.0008288060780614614,
+        0.00030076265102252364,
+        0.00024610222317278385,
+        0.0008572200895287097,
+        0.0006071237148717046,
+        0.00042213231790810823,
+        9.816110105020925e-05,
+        7.43237033020705e-05,
+        0.0001098696084227413
+      ],
+      "max_abs_logit": 3.814697265625e-06,
+      "max_abs_act_logit": 0.000244140625,
+      "max_abs_probability": 1.1324882507324219e-06,
+      "max_abs_act_probability": 0.0,
+      "reference_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "native_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "passed": true
+    },
+    {
+      "name": "choice_reordered",
+      "tokens": 37,
+      "markers": [
+        11,
+        16,
+        21
+      ],
+      "reference_logits": [
+        -2.011867046356201,
+        -1.3547061681747437,
+        5.014321327209473
+      ],
+      "native_logits": [
+        -2.011863946914673,
+        -1.3546994924545288,
+        5.014316558837891
+      ],
+      "reference_act_logits": [
+        4336.20703125,
+        -3543.57958984375
+      ],
+      "native_act_logits": [
+        4336.21142578125,
+        -3543.58251953125
+      ],
+      "temperature": 1.7601518630981445,
+      "reference_probabilities": [
+        0.01766618713736534,
+        0.0256618894636631,
+        0.9566718935966492
+      ],
+      "native_probabilities": [
+        0.01766625978052616,
+        0.025662045925855637,
+        0.9566716551780701
+      ],
+      "max_abs_logit": 6.67572021484375e-06,
+      "max_abs_act_logit": 0.00439453125,
+      "max_abs_probability": 2.384185791015625e-07,
+      "max_abs_act_probability": 0.0,
+      "reference_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "native_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "passed": true
+    },
+    {
+      "name": "max_length",
+      "tokens": 512,
+      "markers": [
+        11,
+        17,
+        22
+      ],
+      "reference_logits": [
+        1.503130555152893,
+        0.3867114186286926,
+        -0.24822998046875
+      ],
+      "native_logits": [
+        1.50313138961792,
+        0.38671091198921204,
+        -0.24823176860809326
+      ],
+      "reference_act_logits": [
+        4738.78515625,
+        -3869.00244140625
+      ],
+      "native_act_logits": [
+        4738.7861328125,
+        -3869.0029296875
+      ],
+      "temperature": 1.7601518630981445,
+      "reference_probabilities": [
+        0.5263042449951172,
+        0.27910977602005005,
+        0.19458597898483276
+      ],
+      "native_probabilities": [
+        0.5263044834136963,
+        0.2791096866130829,
+        0.19458578526973724
+      ],
+      "max_abs_logit": 1.7881393432617188e-06,
+      "max_abs_act_logit": 0.0009765625,
+      "max_abs_probability": 2.384185791015625e-07,
+      "max_abs_act_probability": 0.0,
+      "reference_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "native_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "passed": true
+    },
+    {
+      "name": "choice_after_max_length",
+      "tokens": 37,
+      "markers": [
+        11,
+        17,
+        22
+      ],
+      "reference_logits": [
+        5.031761646270752,
+        -2.3319778442382812,
+        -2.1593823432922363
+      ],
+      "native_logits": [
+        5.031763076782227,
+        -2.331977367401123,
+        -2.1593821048736572
+      ],
+      "reference_act_logits": [
+        4403.689453125,
+        -3597.9921875
+      ],
+      "native_act_logits": [
+        4403.68896484375,
+        -3597.9921875
+      ],
+      "temperature": 1.7601518630981445,
+      "reference_probabilities": [
+        0.9689376950263977,
+        0.014770301058888435,
+        0.01629202626645565
+      ],
+      "native_probabilities": [
+        0.9689376950263977,
+        0.014770293608307838,
+        0.016292009502649307
+      ],
+      "max_abs_logit": 1.430511474609375e-06,
+      "max_abs_act_logit": 0.00048828125,
+      "max_abs_probability": 1.6763806343078613e-08,
+      "max_abs_act_probability": 0.0,
+      "reference_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "native_act_probabilities": [
+        1.0,
+        0.0
+      ],
+      "passed": true
+    }
+  ],
+  "passed": true
+}

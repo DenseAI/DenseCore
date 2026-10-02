@@ -181,6 +181,7 @@ WORKDIR /app
 # Copy binaries and libraries
 COPY --from=builder /densecore-server /app/densecore-server
 COPY --from=builder /app/build/libdensecore.so* /app/lib/
+COPY --from=builder /app/build/libdensecore_decision.so* /app/lib/
 COPY --from=builder /app/build/libggml*.so* /app/lib/
 COPY --from=builder /tmp/densecore-licenses /app/licenses
 

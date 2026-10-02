@@ -1,0 +1,169 @@
+{
+  "description": "Initial F32 act-only absolute gate failures and independent PyTorch thread sensitivity. Act values are uncalibrated ~4000, not probabilities. Option absolute1e-3 and probability1e-4 gates remain unchanged. Revised act-only gate abs(error)<=1e-3+1e-6*abs(reference) plus independent softmax probability1e-4.",
+  "versions": {
+    "torch": "2.14.1+cpu",
+    "transformers": "5.18.0"
+  },
+  "cases": [
+    {
+      "name": "choice",
+      "reference_act_logits_threads4": [
+        4403.689453125,
+        -3597.9921875
+      ],
+      "reference_act_logits_threads1": [
+        4403.689453125,
+        -3597.9921875
+      ],
+      "native_act_logits": [
+        4403.68896484375,
+        -3597.9921875
+      ],
+      "reference_thread_max_abs": 0.0,
+      "native_max_abs": 0.00048828125,
+      "native_max_relative": 1.1088003759596177e-07,
+      "native_max_ulp": 1.0,
+      "initial_absolute_1e_3_pass": true
+    },
+    {
+      "name": "score",
+      "reference_act_logits_threads4": [
+        4436.98095703125,
+        -3636.15478515625
+      ],
+      "reference_act_logits_threads1": [
+        4436.98095703125,
+        -3636.15478515625
+      ],
+      "native_act_logits": [
+        4436.9794921875,
+        -3636.1533203125
+      ],
+      "reference_thread_max_abs": 0.0,
+      "native_max_abs": 0.00146484375,
+      "native_max_relative": 4.0285516433868906e-07,
+      "native_max_ulp": 6.0,
+      "initial_absolute_1e_3_pass": false
+    },
+    {
+      "name": "noul_unicode",
+      "reference_act_logits_threads4": [
+        4499.66748046875,
+        -3676.62255859375
+      ],
+      "reference_act_logits_threads1": [
+        4499.66845703125,
+        -3676.62353515625
+      ],
+      "native_act_logits": [
+        4499.669921875,
+        -3676.625
+      ],
+      "reference_thread_max_abs": 0.0009765625,
+      "native_max_abs": 0.00244140625,
+      "native_max_relative": 6.640350420639152e-07,
+      "native_max_ulp": 10.0,
+      "initial_absolute_1e_3_pass": false
+    },
+    {
+      "name": "single_option",
+      "reference_act_logits_threads4": [
+        4520.125,
+        -3688.0751953125
+      ],
+      "reference_act_logits_threads1": [
+        4520.125,
+        -3688.0751953125
+      ],
+      "native_act_logits": [
+        4520.125,
+        -3688.07568359375
+      ],
+      "reference_thread_max_abs": 0.0,
+      "native_max_abs": 0.00048828125,
+      "native_max_relative": 1.3239460372460599e-07,
+      "native_max_ulp": 2.0,
+      "initial_absolute_1e_3_pass": true
+    },
+    {
+      "name": "local_attention",
+      "reference_act_logits_threads4": [
+        4727.4482421875,
+        -3860.02734375
+      ],
+      "reference_act_logits_threads1": [
+        4727.447265625,
+        -3860.02685546875
+      ],
+      "native_act_logits": [
+        4727.44677734375,
+        -3860.02685546875
+      ],
+      "reference_thread_max_abs": 0.0009765625,
+      "native_max_abs": 0.00146484375,
+      "native_max_relative": 3.098593026606977e-07,
+      "native_max_ulp": 3.0,
+      "initial_absolute_1e_3_pass": false
+    },
+    {
+      "name": "choice_12",
+      "reference_act_logits_threads4": [
+        4088.31396484375,
+        -3337.4453125
+      ],
+      "reference_act_logits_threads1": [
+        4088.31494140625,
+        -3337.4462890625
+      ],
+      "native_act_logits": [
+        4088.314208984375,
+        -3337.44580078125
+      ],
+      "reference_thread_max_abs": 0.0009765625,
+      "native_max_abs": 0.00048828125,
+      "native_max_relative": 1.463038898918967e-07,
+      "native_max_ulp": 2.0,
+      "initial_absolute_1e_3_pass": true
+    },
+    {
+      "name": "choice_reordered",
+      "reference_act_logits_threads4": [
+        4336.20703125,
+        -3543.57958984375
+      ],
+      "reference_act_logits_threads1": [
+        4336.20703125,
+        -3543.57958984375
+      ],
+      "native_act_logits": [
+        4336.2109375,
+        -3543.58251953125
+      ],
+      "reference_thread_max_abs": 0.0,
+      "native_max_abs": 0.00390625,
+      "native_max_relative": 9.008448955682979e-07,
+      "native_max_ulp": 12.0,
+      "initial_absolute_1e_3_pass": false
+    },
+    {
+      "name": "max_length",
+      "reference_act_logits_threads4": [
+        4738.78515625,
+        -3869.00244140625
+      ],
+      "reference_act_logits_threads1": [
+        4738.78515625,
+        -3869.0029296875
+      ],
+      "native_act_logits": [
+        4738.7861328125,
+        -3869.0029296875
+      ],
+      "reference_thread_max_abs": 0.00048828125,
+      "native_max_abs": 0.0009765625,
+      "native_max_relative": 2.060786670199377e-07,
+      "native_max_ulp": 2.0,
+      "initial_absolute_1e_3_pass": true
+    }
+  ]
+}

@@ -99,6 +99,7 @@ jobs:
           name: libdensecore-linux
           path: |
             core/build/libdensecore.so*
+            core/build/libdensecore_decision.so*
             core/build/libggml*.so*
           if-no-files-found: error
           retention-days: 7

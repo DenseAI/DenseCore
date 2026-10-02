@@ -203,13 +203,14 @@ mkdir -p "$binary_root/licenses"
 
 shopt -s nullglob
 densecore_libs=("$build_dir"/libdensecore.so*)
+decision_libs=("$build_dir"/libdensecore_decision.so*)
 ggml_libs=("$build_dir"/libggml*.so*)
-if (( ${#densecore_libs[@]} == 0 || ${#ggml_libs[@]} == 0 )); then
+if (( ${#densecore_libs[@]} == 0 || ${#decision_libs[@]} == 0 || ${#ggml_libs[@]} == 0 )); then
   echo "required DenseCore or ggml shared libraries are missing from $build_dir" >&2
   exit 1
 fi
 
-cp -P "${densecore_libs[@]}" "${ggml_libs[@]}" "$binary_root/"
+cp -P "${densecore_libs[@]}" "${decision_libs[@]}" "${ggml_libs[@]}" "$binary_root/"
 cp "$server_bin" "$binary_root/densecore-server.bin"
 cat > "$binary_root/densecore-server" <<'LAUNCHER'
 #!/bin/sh
@@ -223,6 +224,7 @@ cp -R "$licenses_dir"/. "$binary_root/licenses/"
 mkdir -p "$binary_root/docs" "$binary_root/server" "$binary_root/scripts"
 cp "$root_dir/README.md" "$binary_root/README.md"
 cp "$root_dir/docs/RELEASE.md" "$binary_root/docs/RELEASE.md"
+cp "$root_dir/docs/LAYA.md" "$binary_root/docs/LAYA.md"
 cp "$root_dir/server/openapi.yaml" "$binary_root/server/openapi.yaml"
 cp "$root_dir/scripts/entrypoint.sh" "$binary_root/scripts/entrypoint.sh"
 cp "$root_dir/scripts/release_smoke.sh" "$binary_root/scripts/release_smoke.sh"
