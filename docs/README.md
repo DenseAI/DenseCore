@@ -14,6 +14,7 @@ and workload; it is not a benchmark of the current release image.
 | Deploy with Docker or Kubernetes | [Deployment](DEPLOYMENT.md) |
 | Select a hardware/build profile | [Hardware Support](HARDWARE_SUPPORT.md) |
 | Tune threads, memory, and concurrency | [Performance Tuning](PERFORMANCE_TUNING.md) |
+| Compare measured serving performance | [Benchmarks](BENCHMARKS.md) |
 | Convert or quantize a model | [Hugging Face to GGUF](HF_TO_GGUF.md) |
 | Read release scope and gates | [Release (v0.1.0)](RELEASE.md) |
 

@@ -108,6 +108,8 @@ Before any `v0.1.0` public claim, ensure each checkpoint is complete:
 - OpenAI-compatible API behavior is validated via
   [`/v1/chat/completions`](API_REFERENCE.md) + representative QA set.
 - Comparative performance claims are outside the v0.1.0 public release scope.
+  [Benchmarks](BENCHMARKS.md) records dated matched measurements from native
+  source builds; they do not qualify the release artifacts.
 - Non-primary surfaces are explicitly labeled as beta/source-preview and are not
   used to define MVP release grade.
 - A startup model supplied through `--model` or `MAIN_MODEL_PATH` is mandatory.
