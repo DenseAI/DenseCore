@@ -81,6 +81,16 @@ def compare_native(rows):
     return failures
 
 
+def wait_for_first_token(row, timeout):
+    deadline = time.monotonic() + timeout
+    while not row['first_token'].is_set():
+        if row['done'].is_set():
+            raise RuntimeError('cancel probe terminated before producing a token')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0: raise TimeoutError('cancel probe produced no token')
+        row['first_token'].wait(min(0.05, remaining))
+
+
 class InitOptions(C.Structure):
     _fields_ = [('struct_size', C.c_uint32), ('version', C.c_uint32), ('spec_type', C.c_int32), ('draft', C.c_int32)]
 
@@ -155,8 +165,7 @@ def native_child(args):
         if request < 0:
             raise RuntimeError((lib.DenseCoreGetLastError() or b'submit failed').decode(errors='replace'))
         if cancel:
-            if not row['first_token'].wait(args.timeout):
-                raise TimeoutError('cancel probe produced no token')
+            wait_for_first_token(row, args.timeout)
             row['cancel_status'] = lib.CancelRequest(handle, request)
         if not row['done'].wait(args.timeout):
             lib.CancelRequest(handle, request)
@@ -178,12 +187,17 @@ def native_child(args):
         jobs = [(case, repeat) for repeat in range(args.repeats) for case in CASES]
         with ThreadPoolExecutor(max_workers=args.child_concurrency) as pool:
             result['requests'] = list(pool.map(lambda job: submit(*job), jobs))
+        for row in result['requests']: validate_native(row)
         probe = submit({'id': 'cancel', 'prompt': 'List every integer from 1 through 10000, one per line. Start now.'}, 0, True)
         followup = submit(CASES[0], args.repeats)
         result['requests'].append(followup)
         result['cancellation'] = {'request': probe, 'passed': probe.get('cancel_status') == 0 and
                 probe.get('terminal_events') == 1 and probe.get('finish_reason') == 3 and
                 probe.get('generated_tokens', 0) < max(512, args.max_tokens)}
+    except Exception as error:
+        result['error'] = str(error)
+        write(args.out, result)
+        raise
     finally:
         lib.FreeEngine(handle)
     write(args.out, result)
@@ -330,6 +344,7 @@ def parent(args):
             if execution.returncode or not result.exists():
                 manifest['error'] = f'native {mode}/c{concurrency} failed, see preserved log'
                 manifest['passed'] = False
+                if result.exists(): manifest['failed_native_result'] = json.loads(result.read_text())
                 write(out / 'summary.json', manifest)
                 return 1
             manifest['native'].append(json.loads(result.read_text()))

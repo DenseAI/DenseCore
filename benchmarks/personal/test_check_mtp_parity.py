@@ -1,5 +1,6 @@
 import unittest
-from check_mtp_parity import compare_native, validate_native
+import threading
+from check_mtp_parity import compare_native, validate_native, wait_for_first_token
 
 
 def sample(ids=(10, 20)):
@@ -19,6 +20,11 @@ class ExactParityGateTest(unittest.TestCase):
         self.assertEqual(compare_native(rows), [])
         rows[-1]['requests'][0]['token_ids'] = [10, 99]
         self.assertIn('index 1', compare_native(rows)[0])
+
+    def test_cancel_probe_fails_immediately_after_terminal_error(self):
+        row = {'first_token': threading.Event(), 'done': threading.Event()}
+        row['done'].set()
+        with self.assertRaisesRegex(RuntimeError, 'terminated before'): wait_for_first_token(row, 60)
 
     def test_partial_matrix_cannot_pass(self):
         failures = compare_native([group('none', 1), group('mtp', 1), group('mtp', 4)])
