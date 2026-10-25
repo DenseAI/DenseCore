@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <limits>
 #include <string>
 
 #include "densecore/models/model_graph_capabilities.h"
@@ -263,13 +264,17 @@ TEST(ModelDescriptorTest, Gemma4TextPreservesAttentionLogitSoftcapMetadata) {
     EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(&model, 50.0f), 50.0f);
 }
 
-TEST(ModelDescriptorTest, Gemma4TextNormalizesInvalidAttentionLogitSoftcapMetadataToDefault) {
+TEST(ModelDescriptorTest, Gemma4TextKeepsDisabledAndInvalidAttentionSoftcapOff) {
     TransformerModel model{};
     model.arch = ModelArch::GEMMA;
     model.arch_flags.is_gemma4 = true;
 
-    EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(&model, 0.0f), 50.0f);
-    EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(&model, -3.0f), 50.0f);
+    EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(&model, 0.0f), 0.0f);
+    EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(&model, -3.0f), 0.0f);
+    EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(
+                        &model, std::numeric_limits<float>::quiet_NaN()), 0.0f);
+    EXPECT_FLOAT_EQ(densecore::models::SanitizeAttentionLogitSoftcapForLoad(
+                        &model, std::numeric_limits<float>::infinity()), 0.0f);
 }
 
 TEST(ModelDescriptorTest, NonGemmaSoftcapMetadataIsUnchanged) {

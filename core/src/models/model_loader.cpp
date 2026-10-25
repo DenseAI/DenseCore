@@ -2815,15 +2815,15 @@ TransformerModel* LoadGGUFModel(const char* path) {
         get_u32("embedding_length_per_layer_input", tmp_u32);
         model->gemma4_hidden_size_per_layer_input = static_cast<int>(tmp_u32);
 
-        float gemma4_attention_logit_cap = 50.0f;
+        // Gemma4 text attention has no default softcap. The 50.0 value in
+        // the upstream multimodal config belongs to its audio encoder.
+        float gemma4_attention_logit_cap = 0.0f;
         const bool has_attention_logit_cap = has_key("attention_logit_cap");
         if (has_attention_logit_cap) {
             get_f32("attention_logit_cap", gemma4_attention_logit_cap);
         }
         model->gemma4_attention_logit_softcapping =
-            (has_attention_logit_cap && gemma4_attention_logit_cap == 0.0f)
-                ? 0.0f
-                : densecore::models::SanitizeAttentionLogitSoftcapForLoad(model, gemma4_attention_logit_cap);
+            densecore::models::SanitizeAttentionLogitSoftcapForLoad(model, gemma4_attention_logit_cap);
         get_f32("final_logit_softcapping", model->gemma4_final_logit_softcapping);
 
         std::vector<uint8_t> sliding_pattern;

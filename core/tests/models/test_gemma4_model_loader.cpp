@@ -15,6 +15,9 @@
 #include <ggml.h>
 
 #include "densecore/runtime/inference.h"
+#include "densecore/backend/flash_attention.h"
+#include "densecore/simd/simd_ops.h"
+#include "llm/attention/internal.h"
 #include "densecore/models/model_loader.h"
 
 namespace {
@@ -190,7 +193,7 @@ TEST(Gemma4ModelLoaderTest, AcceptsExplicitMetadataAndDisablesAutoBosForGemma4) 
     EXPECT_FLOAT_EQ(model->gemma4_final_logit_softcapping, 30.0f);
 }
 
-TEST(Gemma4ModelLoaderTest, MissingAttentionLogitCapUsesLlamaCppGemmaDefault) {
+TEST(Gemma4ModelLoaderTest, MissingAttentionLogitCapKeepsGemma4TextAttentionUncapped) {
     TempPath tmp;
     auto fill = [](gguf_context* ctx) {
         SetBaseGemma4Metadata(ctx);
@@ -198,7 +201,7 @@ TEST(Gemma4ModelLoaderTest, MissingAttentionLogitCapUsesLlamaCppGemmaDefault) {
     };
     std::unique_ptr<TransformerModel> model(LoadTempGemma4(tmp.path(), fill));
     ASSERT_NE(model, nullptr);
-    EXPECT_FLOAT_EQ(model->gemma4_attention_logit_softcapping, 50.0f);
+    EXPECT_FLOAT_EQ(model->gemma4_attention_logit_softcapping, 0.0f);
 }
 
 TEST(Gemma4ModelLoaderTest, InvalidAttentionLogitCapMetadataLeavesGemma4TextAttentionSoftcapDisabled) {
@@ -398,4 +401,67 @@ TEST(Gemma4ModelLoaderTest, Gemma4MoEBranchInputsKeepSharedAndRoutedPathsSeparat
         max_abs_diff = std::max(max_abs_diff, std::fabs(snapshot.shared_input[i] - snapshot.routed_input[i]));
     }
     EXPECT_GT(max_abs_diff, 0.25f);
+}
+
+TEST(Gemma4ModelLoaderTest, LoadedTextSoftcapControlsNativeAttentionAndGreedyLogits) {
+    // Both E2B/E4B text head widths, prefill and single-token decode. These
+    // logits deliberately distinguish uncapped text attention from the audio
+    // encoder's cap=50; merely checking that execution is finite misses it.
+    for (bool explicit_cap : {false, true}) {
+        TempPath tmp;
+        const auto fill = explicit_cap ? SetBaseGemma4Metadata : +[](gguf_context* ctx) {
+            SetBaseGemma4Metadata(ctx);
+            gguf_remove_key(ctx, "gemma.attention_logit_cap");
+        };
+        std::unique_ptr<TransformerModel> model(LoadTempGemma4(tmp.path(), fill));
+        ASSERT_NE(model, nullptr);
+        const float cap = densecore::llm::attention::ResolveGemma4AttentionLogitSoftcapRuntime(model.get());
+        ASSERT_FLOAT_EQ(cap, explicit_cap ? 50.0f : 0.0f);
+        for (int head_dim : {256, 512}) {
+            for (int seq_q : {1, 2}) {
+                SCOPED_TRACE(::testing::Message() << "cap=" << cap << " head=" << head_dim << " query=" << seq_q);
+                constexpr int heads = 8;
+                std::vector<float> query(heads * seq_q * head_dim, 0.0f);
+                std::vector<float> key(2 * head_dim, 0.0f);
+                std::vector<float> value(2 * head_dim, 0.0f);
+                std::vector<float> output(query.size(), 0.0f);
+                for (int head = 0; head < heads; ++head) {
+                    for (int token = 0; token < seq_q; ++token) {
+                        query[(head * seq_q + token) * head_dim] = 1.0f;
+                    }
+                }
+                key[0] = 100.0f;
+                key[head_dim] = 101.0f;
+                value[0] = -1.0f;
+                value[head_dim] = 1.0f;
+                auto config = densecore::AutoTuneFlashConfig(head_dim, 2);
+                config.scale = 1.0f;  // Gemma4 text uses unit attention scaling.
+                config.causal = true;
+                config.q_start_offset = 2 - seq_q;
+                config.kv_start_offset = 0;
+                config.sliding_window = 512;
+                config.logit_softcap = cap;
+                for (int ith = 0; ith < 4; ++ith) {
+                    densecore::FlashAttentionGQA(query.data(), key.data(), value.data(), output.data(),
+                                                1, heads, 1, seq_q, 2, head_dim, config, ith, 4);
+                }
+                const double a = explicit_cap ? 50.0 * std::tanh(100.0 / 50.0) : 100.0;
+                const double b = explicit_cap ? 50.0 * std::tanh(101.0 / 50.0) : 101.0;
+                const float expected = static_cast<float>(std::tanh((b - a) / 2.0));
+                std::vector<float> lm_head(head_dim, 0.0f);
+                lm_head[0] = 1.0f;
+                for (int head = 0; head < heads; ++head) {
+                    const float* last = output.data() + (head * seq_q + seq_q - 1) * head_dim;
+                    const float logit = densecore::simd::DotF32(last, lm_head.data(), lm_head.size());
+                    EXPECT_NEAR(logit, expected, 2.0e-5f);
+                    // Two-token output projection: [attention feature, 0.25].
+                    // Default text must pick token0; explicit cap must pick1.
+                    EXPECT_EQ(logit > 0.25f ? 0 : 1, explicit_cap ? 1 : 0);
+                    if (seq_q == 2) {
+                        EXPECT_NEAR(output[(head * seq_q) * head_dim], -1.0f, 2.0e-5f);
+                    }
+                }
+            }
+        }
+    }
 }
