@@ -1900,9 +1900,9 @@ TEST(NumaStickyRouting, RepackedDenseGemmMatchesVecDotForKQuants) {
     }
 }
 
-// Regression for cross-token state isolation in batch>1 MoE. The previously
-// reported heap corruption did not reproduce in the current ext4 Release run
-// or 20 repeated ASAN runs; keep this case active rather than hiding it.
+// Regression for cross-token state isolation in batch>1 MoE. The corruption
+// requires an already-active NUMA pool: a lagging inactive worker previously
+// mixed dispatch generations and kept writing after the callback's lifetime.
 TEST(NumaStickyRouting, ForwardMoESmallDecodeBatchMatchesPerTokenDecode) {
     // Distinct tokens and expert pairs expose accidentally shared activation rows.
     CpuBackend& backend = GetCpuBackend();
@@ -4020,4 +4020,39 @@ TEST(NumaStickyRouting, RealQwen36A3BDeterministicHarness) {
     }
 
     FreeEngine(engine);
+}
+
+TEST(NumaStickyRouting, ThreadPoolAlternatingWidthsDoNotExecuteExpiredDispatches) {
+    ThreadPool pool(0, 8);
+    std::array<std::atomic<int>, 64> visits{};
+    std::array<std::atomic<int>, 64> generations{};
+    for (int round = 1; round <= 3000; ++round) {
+        const int work = round % 3 == 0 ? 64 : (round % 3 == 1 ? 2 : 5);
+        for (auto& value : visits) value.store(0);
+        pool.ParallelFor(work, [&, round](int begin, int end, int thread) {
+            if ((round % 2 == 0 && thread == 0) || (round % 2 != 0 && thread > 0))
+                std::this_thread::yield();
+            for (int i = begin; i < end; ++i) {
+                visits[i].fetch_add(1);
+                generations[i].store(round);
+            }
+        });
+        for (int i = 0; i < work; ++i) {
+            ASSERT_EQ(visits[i].load(), 1) << "round=" << round << " item=" << i;
+            ASSERT_EQ(generations[i].load(), round) << "item=" << i;
+        }
+    }
+}
+
+TEST(NumaStickyRouting, ThreadPoolPropagatesCallbackExceptionsAndRemainsReusable) {
+    ThreadPool pool(0, 4);
+    for (int throwing_thread : {0, 1}) {
+        if (throwing_thread >= pool.GetNumThreads()) continue;
+        EXPECT_THROW(pool.ParallelFor(64, [=](int, int, int thread) {
+            if (thread == throwing_thread) throw std::runtime_error("injected compute failure");
+        }), std::runtime_error);
+        std::atomic<int> visits{0};
+        pool.ParallelFor(64, [&](int begin, int end, int) { visits.fetch_add(end - begin); });
+        EXPECT_EQ(visits.load(), 64);
+    }
 }

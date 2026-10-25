@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <exception>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -135,18 +136,20 @@ public:
             return;
         }
 
+        DispatchGuard dispatch_guard(active_parallel_dispatch_);
         // Ensure pool is initialized (thread-safe)
         EnsureInitialized();
 
-        // Store work function and range
-        current_work_fn_ = &work_fn;
-        total_work_ = total_work;
-        active_threads_.store(active_threads, std::memory_order_release);
-        completed_count_.store(0, std::memory_order_relaxed);
-
-        // Wake up worker threads
+        // Publish payload and generation under one lock. A lagging inactive
+        // worker must never pair the previous generation with a newer payload.
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            current_work_fn_ = &work_fn;
+            total_work_ = total_work;
+            is_gemv_work_ = false;
+            dispatch_error_ = nullptr;
+            active_threads_.store(active_threads, std::memory_order_release);
+            completed_count_.store(0, std::memory_order_relaxed);
             work_ready_ = true;
             generation_++;
         }
@@ -156,17 +159,13 @@ public:
         const int work_per_thread = (total_work + active_threads - 1) / active_threads;
         const int start = 0;
         const int end = std::min(work_per_thread, total_work);
-        work_fn(start, end, 0);
+        try { work_fn(start, end, 0); } catch (...) { RecordDispatchException(); }
 
         // Mark main thread as done
         completed_count_.fetch_add(1, std::memory_order_release);
 
         WaitForCompletion(active_threads);
-        work_ready_.store(false, std::memory_order_release);
-        active_threads_.store(1, std::memory_order_release);
-        current_work_fn_ = nullptr;
-        total_work_ = 0;
-        active_parallel_dispatch_.store(false, std::memory_order_release);
+        FinishDispatch();
     }
 
     /**
@@ -187,43 +186,64 @@ public:
             return;
         }
 
+        DispatchGuard dispatch_guard(active_parallel_dispatch_);
         EnsureInitialized();
 
-        // Store GEMV parameters
-        gemv_output_ = output;
-        gemv_input_ = input;
-        gemv_weight_ = weight;
-        gemv_K_ = K;
-        gemv_N_ = N;
-        is_gemv_work_ = true;
-        active_threads_.store(active_threads, std::memory_order_release);
-        completed_count_.store(0, std::memory_order_relaxed);
-
-        // Wake up worker threads
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            gemv_output_ = output;
+            gemv_input_ = input;
+            gemv_weight_ = weight;
+            gemv_K_ = K;
+            gemv_N_ = N;
+            is_gemv_work_ = true;
+            dispatch_error_ = nullptr;
+            active_threads_.store(active_threads, std::memory_order_release);
+            completed_count_.store(0, std::memory_order_relaxed);
             work_ready_ = true;
             generation_++;
         }
         cv_work_.notify_all();
 
         // Main thread (thread 0) does its share
-        simd::GemvParallel(output, input, weight, K, N, 0, active_threads);
+        try { simd::GemvParallel(output, input, weight, K, N, 0, active_threads); }
+        catch (...) { RecordDispatchException(); }
         completed_count_.fetch_add(1, std::memory_order_release);
 
         WaitForCompletion(active_threads);
-        work_ready_.store(false, std::memory_order_release);
-        is_gemv_work_ = false;
-        active_threads_.store(1, std::memory_order_release);
-        gemv_output_ = nullptr;
-        gemv_input_ = nullptr;
-        gemv_weight_ = nullptr;
-        gemv_K_ = 0;
-        gemv_N_ = 0;
-        active_parallel_dispatch_.store(false, std::memory_order_release);
+        FinishDispatch();
     }
 
 private:
+    struct DispatchGuard {
+        std::atomic<bool>& active;
+        explicit DispatchGuard(std::atomic<bool>& flag) : active(flag) {}
+        ~DispatchGuard() { active.store(false, std::memory_order_release); }
+    };
+
+    void RecordDispatchException() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!dispatch_error_) dispatch_error_ = std::current_exception();
+    }
+
+    void FinishDispatch() {
+        std::exception_ptr error;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            work_ready_.store(false, std::memory_order_release);
+            active_threads_.store(1, std::memory_order_release);
+            current_work_fn_ = nullptr;
+            total_work_ = 0;
+            is_gemv_work_ = false;
+            gemv_output_ = nullptr;
+            gemv_input_ = nullptr;
+            gemv_weight_ = nullptr;
+            gemv_K_ = gemv_N_ = 0;
+            error = std::move(dispatch_error_);
+        }
+        if (error) std::rethrow_exception(error);
+    }
+
 #ifdef DENSECORE_TEST_BUILD
     std::atomic<uint64_t> parallel_for_calls_{0};
 #endif
@@ -365,7 +385,6 @@ private:
             // acquire semantics for proper synchronization.
             // =========================================================================
             constexpr int kSpinIterations = 5000;  // ~100-500µs on modern CPUs
-            bool got_work = false;
 
             for (int spin = 0; spin < kSpinIterations; ++spin) {
                 if (shutdown_.load(std::memory_order_acquire)) {
@@ -375,7 +394,6 @@ private:
                 // Check for new work without lock
                 if (work_ready_.load(std::memory_order_acquire) &&
                     generation_.load(std::memory_order_acquire) > my_generation) {
-                    got_work = true;
                     break;
                 }
                 // CPU pause instruction - reduces power while keeping core active
@@ -386,41 +404,49 @@ private:
 #endif
             }
 
-            // If spinning didn't find work, fall back to condition variable
-            if (!got_work) {
+            // Re-check under the publication lock even after a successful
+            // spin. The observed generation may have completed while this
+            // inactive worker was descheduled.
+            const std::function<void(int, int, int)>* work_fn = nullptr;
+            int total_work = 0;
+            int active_threads = 1;
+            bool gemv = false;
+            float* output = nullptr;
+            const float* input = nullptr;
+            const float* weight = nullptr;
+            int K = 0, N = 0;
+            {
                 std::unique_lock<std::mutex> lock(mutex_);
-                cv_work_.wait(
-                    lock, [this, &my_generation] { return shutdown_ || (work_ready_ && generation_ > my_generation); });
-
+                cv_work_.wait(lock, [this, &my_generation] {
+                    return shutdown_ || (work_ready_ && generation_ > my_generation);
+                });
                 if (shutdown_) {
                     detail::g_active_thread_pool = previous_pool;
                     return;
                 }
+                my_generation = generation_.load(std::memory_order_acquire);
+                active_threads = std::max(1, active_threads_.load(std::memory_order_acquire));
+                if (thread_id >= active_threads) continue;
+                work_fn = current_work_fn_;
+                total_work = total_work_;
+                gemv = is_gemv_work_;
+                output = gemv_output_;
+                input = gemv_input_;
+                weight = gemv_weight_;
+                K = gemv_K_;
+                N = gemv_N_;
             }
-
-            // Important: Always update my_generation to the current generation
-            // before executing work, to ensure we don't re-execute the same work.
-            my_generation = generation_.load(std::memory_order_acquire);
-
-            // Execute work
-            const int active_threads = std::max(1, active_threads_.load(std::memory_order_acquire));
-            if (thread_id >= active_threads) {
-                continue;
-            }
-
-            if (is_gemv_work_) {
-                // GEMV path
-                simd::GemvParallel(gemv_output_, gemv_input_, gemv_weight_, gemv_K_, gemv_N_, thread_id,
-                                   active_threads);
-            } else if (current_work_fn_) {
-                // Generic parallel_for path
-                const int work_per_thread = (total_work_ + active_threads - 1) / active_threads;
-                const int start = thread_id * work_per_thread;
-                const int end = std::min(start + work_per_thread, total_work_);
-
-                if (start < total_work_) {
-                    (*current_work_fn_)(start, end, thread_id);
+            try {
+                if (gemv) {
+                    simd::GemvParallel(output, input, weight, K, N, thread_id, active_threads);
+                } else if (work_fn) {
+                    const int work_per_thread = (total_work + active_threads - 1) / active_threads;
+                    const int start = thread_id * work_per_thread;
+                    const int end = std::min(start + work_per_thread, total_work);
+                    if (start < total_work) (*work_fn)(start, end, thread_id);
                 }
+            } catch (...) {
+                RecordDispatchException();
             }
 
             // Signal completion.
@@ -483,6 +509,7 @@ private:
     // vs. typical work-item latency.  A template-based approach (e.g. storing
     // void(*)(int,int,int,void*) + void* ctx) would eliminate this dispatch
     // but requires API changes; deferred until benchmarks show it matters.
+    std::exception_ptr dispatch_error_;
     const std::function<void(int, int, int)>* current_work_fn_ = nullptr;
     int total_work_ = 0;
 
