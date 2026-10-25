@@ -389,6 +389,7 @@ TEST(LLMRuntimeConfigTest, Qwen35PrefixQualificationOptInHonorsBothGlobalControl
 }
 
 #include "densecore/runtime/resource_ledger.h"
+#include "runtime/callback_scratch.h"
 TEST(ResourceLedgerTest, ConcurrentPlansCannotAllocateTheSameRemainingBudgetTwice) {
     using namespace densecore::runtime;
     const auto before = ResourceLedgerUsageSnapshot();
@@ -541,4 +542,51 @@ TEST(ResourceBudgetTest, NamespaceMountOpaqueRootDoesNotInvalidateCgroupDiscover
     EXPECT_EQ(result.memory.bytes,6000000u);
     EXPECT_EQ(result.cpu_quota_state,densecore::runtime::ResourceState::Finite);
     EXPECT_EQ(result.effective_threads,2);
+}
+
+TEST(ResourceLedgerTest, RetainedNumericScratchPreservesStandaloneAllocationAndReleasesOnce) {
+    using namespace densecore::runtime;
+    struct FailedWeight {FailedWeight(){throw std::runtime_error("construction failed");}};
+    const auto before=ResourceLedgerUsageSnapshot();
+    auto owner=std::make_shared<CallbackScratchBudget>();
+    CallbackScratchSlice retained;
+    {
+        RuntimeMemoryPlan plan;plan.callback_scratch_bytes=32;
+        plan.available_bytes=32;plan.resource_capacity_bytes=before.planned_bytes+32;
+        ResourcePlanLease model(plan);
+        ASSERT_TRUE(owner->Adopt(model,32));ASSERT_TRUE(retained.Grow(owner,32));
+        // Even after transfer empties its categories, a live model plan must
+        // reject allocations outside its accepted graph/repack reservation.
+        EXPECT_EQ(ResourceAllocationLease::AvailableBytes(AllocationCategory::Repack),0u);
+        EXPECT_FALSE(ResourceAllocationLease::Acquire(AllocationCategory::Graph,1));
+        EXPECT_FALSE(ResourceAllocationLease::Acquire(AllocationCategory::Repack,1));
+    }
+    EXPECT_EQ(ProcessPlannedMemoryBytes(),before.planned_bytes+32);
+    EXPECT_EQ(ResourceAllocationLease::AvailableBytes(AllocationCategory::Repack),UINT64_MAX);
+    EXPECT_THROW(MakeBudgetedRepackedWeight<FailedWeight>(16),std::runtime_error);
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().repack_bytes,before.repack_bytes);
+    std::weak_ptr<CallbackScratchBudget> weak=owner;owner.reset();
+    EXPECT_FALSE(weak.expired());EXPECT_EQ(ProcessPlannedMemoryBytes(),before.planned_bytes+32);
+    retained.Reset();EXPECT_TRUE(weak.expired());
+    EXPECT_EQ(ProcessPlannedMemoryBytes(),before.planned_bytes);
+}
+
+TEST(ResourceLedgerTest, NumericScratchDoesNotWeakenActiveModelCategoryLimits) {
+    using namespace densecore::runtime;
+    const auto before=ResourceLedgerUsageSnapshot();
+    auto owner=std::make_shared<CallbackScratchBudget>();
+    RuntimeMemoryPlan plan;plan.graph_bytes=before.graph_bytes+64;
+    plan.repack_bytes=before.repack_bytes+32;plan.callback_scratch_bytes=32;
+    plan.available_bytes=plan.RequiredBytes();
+    plan.resource_capacity_bytes=before.planned_bytes+plan.RequiredBytes();
+    ResourcePlanLease model(plan);ASSERT_TRUE(owner->Adopt(model,32));
+    EXPECT_EQ(ResourceAllocationLease::AvailableBytes(AllocationCategory::Graph),64u);
+    EXPECT_EQ(ResourceAllocationLease::AvailableBytes(AllocationCategory::Repack),32u);
+    auto graph=ResourceAllocationLease::Acquire(AllocationCategory::Graph,64);
+    auto repack=ResourceAllocationLease::Acquire(AllocationCategory::Repack,32);
+    ASSERT_TRUE(graph);ASSERT_TRUE(repack);
+    EXPECT_EQ(ResourceAllocationLease::AvailableBytes(AllocationCategory::Graph),0u);
+    EXPECT_EQ(ResourceAllocationLease::AvailableBytes(AllocationCategory::Repack),0u);
+    EXPECT_FALSE(ResourceAllocationLease::Acquire(AllocationCategory::Graph,1));
+    EXPECT_FALSE(ResourceAllocationLease::Acquire(AllocationCategory::Repack,1));
 }

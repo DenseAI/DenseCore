@@ -12,6 +12,9 @@ namespace resource_detail {
 struct Ledger {
     std::mutex mutex;
     std::unordered_map<const void*, RuntimeMemoryPlan> plans;
+    // Transferred numeric TLS reservations remain planned bytes, but do not
+    // activate model-specific graph/repack/admission allocation limits.
+    size_t active_model_plans = 0;
     uint64_t graph_used = 0;
     uint64_t repack_used = 0;
     uint64_t admission_used = 0;
@@ -47,8 +50,8 @@ public:
             throw densecore::OutOfMemoryException("resource plan concurrent reservation required_bytes=" +
                    std::to_string(resource_detail::Add(previous,plan.RequiredBytes())) +
                    " available_bytes=" + std::to_string(capacity));
-        ledger.plans.emplace(this,plan);
-        registered_ = true;
+        registered_ = ledger.plans.emplace(this,plan).second;
+        if (registered_) ++ledger.active_model_plans;
     }
     ResourcePlanLease(const ResourcePlanLease&) = delete;
     ResourcePlanLease& operator=(const ResourcePlanLease&) = delete;
@@ -57,6 +60,7 @@ public:
         auto& ledger = resource_detail::ProcessLedger();
         std::lock_guard<std::mutex> lock(ledger.mutex);
         ledger.plans.erase(this);
+        --ledger.active_model_plans;
     }
     bool TransferCallbackScratch(const void* owner, uint64_t envelope, std::string* error = nullptr) {
         auto& ledger=resource_detail::ProcessLedger();
@@ -151,7 +155,7 @@ public:
                                                              ResourceAllocationRejection* rejection = nullptr) {
         auto& ledger = resource_detail::ProcessLedger();
         std::lock_guard<std::mutex> lock(ledger.mutex);
-        uint64_t capacity = ledger.plans.empty() ? (category == AllocationCategory::Admission ? StandaloneAdmissionCapacity(DetectResourceBudget()) : UINT64_MAX) : 0;
+        uint64_t capacity = ledger.active_model_plans == 0 ? (category == AllocationCategory::Admission ? StandaloneAdmissionCapacity(DetectResourceBudget()) : UINT64_MAX) : 0;
         for (const auto& entry : ledger.plans)
             capacity = resource_detail::Add(capacity, CategoryCapacity(entry.second,category));
         uint64_t& used = CategoryUsed(ledger,category);
@@ -168,7 +172,7 @@ public:
     static uint64_t AvailableBytes(AllocationCategory category) {
         auto& ledger = resource_detail::ProcessLedger();
         std::lock_guard<std::mutex> lock(ledger.mutex);
-        if (ledger.plans.empty()) {
+        if (ledger.active_model_plans == 0) {
             if (category != AllocationCategory::Admission) return UINT64_MAX;
             const auto capacity=StandaloneAdmissionCapacity(DetectResourceBudget());
             return ledger.admission_used >= capacity ? 0 : capacity-ledger.admission_used;
