@@ -2445,7 +2445,12 @@ std::unique_ptr<TransformerModel> MakeE4BMetadataOnlyBudgetModel() {
         l.Set(model_keys::kFfnGate,weight(2560,10240));l.Set(model_keys::kFfnUp,weight(2560,10240));
         l.Set(model_keys::kFfnDown,weight(10240,2560));
         l.Set("attn_q_norm.weight",norm(dim));l.Set("attn_k_norm.weight",norm(dim));
-        l.Set("attn_post_norm.weight",norm(2560));l.Set("ffn_post_norm.weight",norm(2560));
+        l.Set(model_keys::kPostAttnNorm,norm(2560));
+        l.Set("gemma4.post_feedforward_layernorm.weight",norm(2560));
+        l.Set(model_keys::kGemma4PerLayerInputGate,weight(2560,256));
+        l.Set(model_keys::kGemma4PerLayerProjection,weight(256,2560));
+        l.Set(model_keys::kGemma4PostPerLayerInputNorm,norm(2560));
+        l.Set(model_keys::kGemma4LayerOutputScale,norm(1));
     }
     return m;
 }
@@ -2476,13 +2481,14 @@ TEST(Gemma4GraphBudget, MetadataOnlyE4BGraphMeasuresPagedWidthsMixedAndPrefillWi
         std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init(params),ggml_free);ASSERT_NE(ctx,nullptr);
         auto* graph=ggml_new_graph_custom(ctx.get(),32768,false);
         auto* output=BuildTransformerGraph(model.get(),&cache,ctx.get(),batch,false,graph);ASSERT_NE(output,nullptr);
-        int paged=0,gathers=0;
+        int paged=0,gathers=0,ple_post_norms=0;
         for(auto* t=ggml_get_first_tensor(ctx.get());t;t=ggml_get_next_tensor(ctx.get(),t)){
+            ple_post_norms+=std::string(ggml_get_name(t))=="gemma4_post_per_layer_input_norm";
             if(t->op!=GGML_OP_CUSTOM)continue;
             ggml_custom_op_t fn=nullptr;std::memcpy(&fn,t->op_params,sizeof(fn));
             paged+=fn==cb_paged_attention_decode;gathers+=fn==cb_kv_update_and_gather_custom;
         }
-        EXPECT_EQ(paged,42);EXPECT_EQ(gathers,0);
+        EXPECT_EQ(paged,42);EXPECT_EQ(gathers,0);EXPECT_EQ(ple_post_norms,42);
         // Mark external no-alloc weight descriptors AFTER graph construction.
         // The sizing-only allocator sees external weights but never reads them.
         alignas(64) static unsigned char external_weight_marker[64]{};
