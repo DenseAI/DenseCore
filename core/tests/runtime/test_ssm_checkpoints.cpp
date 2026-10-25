@@ -178,6 +178,27 @@ TEST(SSMCheckpointTest, PartialWritesCannotBeRestoredAndRecordingReusesAllocated
     }
 }
 
+TEST(SSMCheckpointTest, ShorterDraftLengthsReuseReservedStateSlots) {
+    Fixture fixture(4);
+    SSMCheckpointRecorder recorder;
+    recorder.Prepare(4, kChannels, kKernel, kHeads, kHeadK, kHeadV);
+    float* const original_storage = recorder.View()->recurrent;
+    for (int tokens : {2, 3, 4}) {
+        recorder.ResetRecording();
+        recorder.BindTokenSlots(nullptr, static_cast<size_t>(tokens));
+        auto expected = fixture.Initial();
+        for (int token = 0; token < tokens; ++token) (void)fixture.Run(&expected, token, 1, 1);
+        auto actual = fixture.Initial();
+        (void)fixture.Run(&actual, 0, tokens, 3, recorder.View());
+        auto restored = fixture.Initial();
+        ASSERT_TRUE(recorder.Restore(tokens - 1, &restored));
+        EXPECT_EQ(restored.conv_state, expected.conv_state);
+        EXPECT_EQ(restored.ssm_state, expected.ssm_state);
+        EXPECT_EQ(recorder.View()->recurrent, original_storage);
+        if (tokens < 4) EXPECT_FALSE(recorder.Complete(tokens));
+    }
+}
+
 TEST(SSMCheckpointTest, RejectsOverflowInvalidMapsAndOutOfRangeRecording) {
     EXPECT_THROW(SSMCheckpointRecorder::RequiredBytes(std::numeric_limits<size_t>::max(), 2, 4, 2, 3, 4),
                  std::overflow_error);
