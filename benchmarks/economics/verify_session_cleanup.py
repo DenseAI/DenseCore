@@ -143,6 +143,7 @@ def verify(document, runner=subprocess.run, now=None):
                 project_info.get('lifecycleState') != 'ACTIVE'):
             raise ValueError('active project identity was not verified')
         inventory = {}
+        inventory_ids = {collection: {} for collection in COLLECTIONS.values()}
         for kind, collection in COLLECTIONS.items():
             items = query(['compute', collection, 'list'])
             if not isinstance(items, list):
@@ -151,9 +152,16 @@ def verify(document, runner=subprocess.run, now=None):
                 uri, identifier = inventory_uri(item, project, kind)
                 if uri in inventory:
                     raise ValueError('duplicate inventory resource URI')
+                if identifier in inventory_ids[collection]:
+                    raise ValueError(f'duplicate inventory resource ID within {collection}')
                 inventory[uri] = identifier
+                inventory_ids[collection][identifier] = uri
         for uri, identifier in sorted(targets.items()):
-            row = {'uri': uri, 'expected_id': identifier, 'absent': uri not in inventory}
+            observed_uri = inventory_ids[uri.split('/')[-2]].get(identifier)
+            row = {'uri': uri, 'expected_id': identifier,
+                   'absent': uri not in inventory and observed_uri is None}
+            if observed_uri is not None:
+                row.update(expected_id_observed_uri=observed_uri, uri_mismatch=observed_uri != uri)
             if uri in inventory:
                 row.update(observed_id=inventory[uri], same_id=identifier == inventory[uri])
             report['target_resources'].append(row)

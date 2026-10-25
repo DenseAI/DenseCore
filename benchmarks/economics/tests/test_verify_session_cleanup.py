@@ -101,6 +101,37 @@ class CleanupVerificationTest(unittest.TestCase):
         self.assertEqual(len(result['untracked_resources']), 1)
         self.assertIn('zones/us-east1-b', result['untracked_resources'][0]['uri'])
 
+    def test_expected_id_under_different_name_or_scope_fails(self):
+        for name, scope in [('renamed-vm', 'zones/us-central1-a'),
+                            ('session-vm', 'zones/us-east1-b'),
+                            ('renamed-vm', 'zones/us-east1-b')]:
+            with self.subTest(name=name, scope=scope):
+                self.calls = []
+                self.answers[1] = [self.row('instances', name, '100', scope)]
+                report = cleanup.verify(self.manifest, self.runner)
+                self.assertFalse(report['passed'])
+                target = next(item for item in report['target_resources'] if item['expected_id'] == '100')
+                self.assertFalse(target['absent'])
+                self.assertTrue(target['uri_mismatch'])
+                self.assertEqual(target['expected_id_observed_uri'],
+                                 f'projects/densecore-test/{scope}/instances/{name}')
+
+    def test_duplicate_ids_within_collection_fail(self):
+        self.answers[1] = [self.row('instances', 'first-vm', '999'),
+                           self.row('instances', 'second-vm', '999', 'zones/us-east1-b')]
+        report = cleanup.verify(self.manifest, self.runner)
+        self.assertFalse(report['passed'])
+        self.assertIn('duplicate inventory resource ID within instances', report['error'])
+
+    def test_ids_in_different_collections_are_independent(self):
+        self.answers[1] = [self.row('instances', 'unrelated-vm', '101'),
+                           self.row('instances', 'shared-number-vm', '999')]
+        self.answers[2] = [self.row('disks', 'unrelated-disk', '100'),
+                           self.row('disks', 'shared-number-disk', '999')]
+        report = cleanup.verify(self.manifest, self.runner)
+        self.assertTrue(report['passed'])
+        self.assertEqual(len(report['untracked_resources']), 4)
+
     def test_global_addresses_and_regional_disks_have_distinct_scopes(self):
         self.manifest['resources'] = [
             {'kind': 'disk', 'scope': 'regions/us-central1', 'name': 'regional-disk', 'id': '400'},
