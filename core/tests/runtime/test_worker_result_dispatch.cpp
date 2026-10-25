@@ -582,7 +582,7 @@ TEST(KernelResolutionPolicyTest, Gemma4DefaultResolutionIsFallbackFreeTarget) {
     EXPECT_EQ(resolution.fallback_policy, densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
     EXPECT_TRUE(resolution.matmul_plan.target_fallback_free_path);
     EXPECT_TRUE(resolution.matmul_plan.target.gemma4_target);
-    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(resolution.matmul_plan.target), "gemma4_dense");
+    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(resolution.matmul_plan.target), "gemma4_moe");
 }
 
 TEST(KernelResolutionPolicyTest, ContractRequirementOverridesKernelAndFallbackPolicy) {
