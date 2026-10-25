@@ -28,6 +28,7 @@ bool ConfigureSpeculation(EngineState* state, int mode, int draft_n_max, std::st
         state->speculation_selected.store(1, std::memory_order_release);
         return true;
     }
+    if (state->models.size() != 1) return fail("explicit MTP requires one target model; separate draft/additional models are unsupported");
     auto* entry = state->GetDefaultModel();
     if (!entry || !entry->model || !entry->kv_cache) return fail("MTP requires a loaded target model");
     auto& model = *entry->model;
@@ -51,10 +52,10 @@ bool ConfigureSpeculation(EngineState* state, int mode, int draft_n_max, std::st
         const uint64_t graph = Add(64ULL * 1024 * 1024,
                                   Mul(sizeof(float), Add(Mul(Mul(16, model.hparams.n_embd),32), scores)));
         const uint64_t distributions = Mul(Mul(Mul(draft_n_max + 3, model.hparams.n_vocab), sizeof(double)), concurrency);
-        const uint64_t additional = Add(Add(head_kv,prompt_hidden),Add(graph,distributions));
-        // The reference path does not speculate the target, so it allocates no
-        // recurrent target checkpoints. This single MTP reservation includes
-        // independent head KV, prompt hidden copies, graph and probability data.
+        const uint64_t checkpoints = densecore::llm::speculative::TargetCheckpointBank::RequiredBytes(model, draft_n_max);
+        const uint64_t additional = Add(Add(head_kv,prompt_hidden),Add(Add(graph,distributions),checkpoints));
+        // One fenced verification graph at a time shares a model-owned bank.
+        // Sessions keep independent head KV and hidden/distribution state.
         plan.mtp_checkpoint_bytes = additional;
         if (!plan.Fits()) {
             return fail("MTP resource plan required_bytes=" + std::to_string(plan.RequiredBytes()) +
@@ -63,10 +64,11 @@ bool ConfigureSpeculation(EngineState* state, int mode, int draft_n_max, std::st
         if (!entry->resource_lease) return fail("MTP requires an enforced model resource reservation");
         std::string reservation_error;
         if (!entry->resource_lease->ExtendMTP(additional, &reservation_error)) return fail(reservation_error);
+        entry->mtp_target_checkpoints = std::make_unique<densecore::llm::speculative::TargetCheckpointBank>(model, draft_n_max);
         entry->kv_config.memory_plan = plan;
         state->speculation_max_context = static_cast<int>(context);
         state->speculation_reserved_bytes = additional;
-        state->speculation_reason = "explicit sequential MTP reference; automatic performance qualification pending";
+        state->speculation_reason = "explicit batched MTP with serialized verification; automatic performance qualification pending";
         state->speculation_selected.store(2, std::memory_order_release);
         LOG_INFO("MTP reference selected: context={} concurrency={} draft_n_max={} head_kv={} prompt_hidden={} graph={} distributions={} reservation={}",
                  context,concurrency,draft_n_max,head_kv,prompt_hidden,graph,distributions,additional);

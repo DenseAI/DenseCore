@@ -59,6 +59,7 @@ bool RebindHybridSSMGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& b
                 }
                 ud->token_seq_ids = seq_ids;
                 ud->runtime_states = runtime_states;
+                ud->checkpoints = nullptr;
                 ud->profile = profile;
                 conv_rebinds++;
             }
@@ -82,6 +83,7 @@ bool RebindHybridSSMGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& b
                 }
                 ud->token_seq_ids = seq_ids;
                 ud->runtime_states = runtime_states;
+                ud->checkpoints = nullptr;
                 ud->profile = profile;
                 delta_rebinds++;
             }
@@ -98,6 +100,7 @@ bool RebindHybridSSMGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& b
                 }
                 ud->token_seq_ids = seq_ids;
                 ud->runtime_states = runtime_states;
+                ud->checkpoints = nullptr;
                 ud->profile = profile;
                 delta_rebinds++;
             }
@@ -121,6 +124,7 @@ bool RebindHybridSSMGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& b
                 }
                 ud->token_seq_ids = seq_ids;
                 ud->runtime_states = runtime_states;
+                ud->checkpoints = nullptr;
                 ud->profile = profile;
                 delta_rebinds++;
             }
@@ -182,6 +186,7 @@ bool RebindLFM2DecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& 
                 ud->token_seq_ids = seq_ids;
                 ud->token_positions = positions;
                 ud->runtime_states = runtime_states;
+                ud->checkpoints = nullptr;
                 conv_rebinds++;
             }
         } else if (node->op == GGML_OP_CUSTOM) {
@@ -195,6 +200,7 @@ bool RebindLFM2DecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& 
                 ud->token_seq_ids = seq_ids;
                 ud->token_positions = positions;
                 ud->runtime_states = runtime_states;
+                ud->checkpoints = nullptr;
                 conv_rebinds++;
             }
         }

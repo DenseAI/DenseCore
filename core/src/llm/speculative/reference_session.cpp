@@ -178,6 +178,89 @@ void ReferenceSession::MakeProposals(int selected_token, const SamplingParams& p
             std::find(source_.stop_token_ids.begin(), source_.stop_token_ids.end(), selected_token) != source_.stop_token_ids.end()) break;
     }
 }
+std::vector<int> ReferenceSession::VerificationDraft(int maximum) const {
+    if (maximum < 0) throw std::invalid_argument("negative verification draft limit");
+    const size_t count = std::min(pending_.size(), static_cast<size_t>(maximum));
+    std::vector<int> result;
+    result.reserve(count);
+    for (size_t i = 0; i < count; ++i) result.push_back(pending_[i].token);
+    return result;
+}
+VerificationResult ReferenceSession::VerifyBatched(ggml_tensor* logits, int first_column, size_t draft_count,
+                                                   const SamplingParams& params, std::mt19937& target_rng) {
+    if (!logits || first_column < 0 || draft_count < 1 || draft_count > pending_.size() ||
+        static_cast<size_t>(first_column) + draft_count >= static_cast<size_t>(logits->ne[1]))
+        throw std::invalid_argument("invalid batched target logits/proposals");
+    VerificationResult result;
+    result.tokens.reserve(draft_count + 1);
+    auto history = params.token_history ? *params.token_history : std::vector<int>{};
+    GrammarConstraint grammar = params.grammar ? *params.grammar : GrammarConstraint{};
+    SamplingParams transformed = params;
+    transformed.token_history = &history;
+    if (params.grammar) transformed.grammar = &grammar;
+    for (size_t i = 0; i < draft_count; ++i) {
+        transformed.output_token_index = params.output_token_index + static_cast<int>(i);
+        const auto target = BuildSamplingDistribution(logits, first_column + static_cast<int>(i), transformed);
+        const auto step = VerifyToken(pending_[i].token, pending_[i].distribution, target,
+                                      params.temperature <= 0, accept_rng_, target_rng);
+        result.tokens.push_back(step.token);
+        ++verified_;
+        if (!step.accepted) { ++rejected_; break; }
+        ++accepted_;
+        if (step.token == source_.eos_token_id ||
+            std::find(source_.stop_token_ids.begin(), source_.stop_token_ids.end(), step.token) != source_.stop_token_ids.end()) {
+            // Treat terminal output as the final committed token, retaining
+            // target state before consuming EOS instead of sampling beyond it.
+            break;
+        }
+        ++result.accepted_draft_tokens;
+        history.push_back(step.token);
+        if (history.size() > 2048) history.erase(history.begin());
+        if (params.grammar) grammar.UpdateState(Tokenizer::Detokenize(&source_, step.token));
+    }
+    if (result.accepted_draft_tokens == draft_count) {
+        transformed.output_token_index = params.output_token_index + static_cast<int>(draft_count);
+        result.tokens.push_back(SampleTokenWithRng(logits, first_column + static_cast<int>(draft_count), transformed, target_rng));
+    }
+    pending_.clear();
+    return result;
+}
+void ReferenceSession::CompleteBatched(const int* inputs, const float* hidden, size_t stride,
+                                        const VerificationResult& result, const SamplingParams& params,
+                                        const InferenceDependencies* deps, const std::atomic<bool>& cancelled) {
+    if (result.tokens.size() != result.accepted_draft_tokens + 1 || result.tokens.empty())
+        throw std::invalid_argument("invalid verification output boundary");
+    ObserveTarget(inputs, hidden, stride, static_cast<int>(result.accepted_draft_tokens + 1), false);
+    if (target_seen_ > head_past_) {
+        // K proposals processed head inputs x0..x(K-1), whereas the K+1
+        // target graph also consumed xK to produce the bonus distribution.
+        // Catch that last accepted input up before starting the next head run.
+        const size_t last = result.accepted_draft_tokens;
+        if (!last || target_seen_ != head_past_ + 1)
+            throw std::runtime_error("MTP head/target acceptance boundary mismatch");
+        std::vector<float> previous(hidden + (last-1)*stride,
+                                    hidden + (last-1)*stride + source_.hparams.n_embd);
+        ForwardHead({inputs[last]}, previous, nullptr, deps);
+    }
+    auto history = params.token_history ? *params.token_history : std::vector<int>{};
+    GrammarConstraint grammar = params.grammar ? *params.grammar : GrammarConstraint{};
+    for (size_t i = 0; i + 1 < result.tokens.size(); ++i) {
+        history.push_back(result.tokens[i]);
+        if (history.size() > 2048) history.erase(history.begin());
+        if (params.grammar) grammar.UpdateState(Tokenizer::Detokenize(&source_, result.tokens[i]));
+    }
+    SamplingParams future = params;
+    future.token_history = &history;
+    if (params.grammar) future.grammar = &grammar;
+    const int selected = result.tokens.back();
+    const bool contains_stop = std::any_of(result.tokens.begin(), result.tokens.end(), [&](int token) {
+        return token == source_.eos_token_id ||
+            std::find(source_.stop_token_ids.begin(), source_.stop_token_ids.end(), token) != source_.stop_token_ids.end();
+    });
+    if (!contains_stop && target_seen_ < max_context_ && selected != source_.eos_token_id &&
+        std::find(source_.stop_token_ids.begin(), source_.stop_token_ids.end(), selected) == source_.stop_token_ids.end())
+        MakeProposals(selected, future, deps, cancelled);
+}
 int ReferenceSession::Sample(ggml_tensor* target_logits, int column, const SamplingParams& params,
                              std::mt19937& target_rng, const InferenceDependencies* deps,
                              const std::atomic<bool>& cancelled) {
@@ -191,8 +274,9 @@ int ReferenceSession::Sample(ggml_tensor* target_logits, int column, const Sampl
         const auto result = VerifyToken(proposal.token, proposal.distribution, p,
                                         params.temperature <= 0, accept_rng_, target_rng);
         selected = result.token;
+        ++verified_;
         if (result.accepted) ++accepted_;
-        else pending_.clear();
+        else { ++rejected_; pending_.clear(); }
     }
     Bootstrap(deps, cancelled);
     if (pending_.empty() && target_seen_ < max_context_ && selected != source_.eos_token_id &&

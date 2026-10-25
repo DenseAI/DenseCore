@@ -715,6 +715,8 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             conv_ud->token_seq_ids = batch.seq_id.data();
             conv_ud->runtime_states = &batch.hybrid_ssm_runtime_states;
             conv_ud->profile = GetInferenceWorkContextProfile(GetCurrentWorkContext());
+            conv_ud->checkpoints = overrides && overrides->ssm_checkpoints
+                ? overrides->ssm_checkpoints->at(static_cast<size_t>(ssm_ordinal)) : nullptr;
             const int ssm_conv_tasks =
                 ResolveSsmConvTaskCount(model->variant, batch.num_seqs, N, conv_channels,
                                         ResolveInferenceConfig(&batch).num_threads, IsSerialMultiSequenceSsmForced());
@@ -796,6 +798,8 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             scan_ud->input_tensor = cur;
             scan_ud->alpha_beta_tensor = nullptr;
             scan_ud->profile = GetInferenceWorkContextProfile(GetCurrentWorkContext());
+            scan_ud->checkpoints = overrides && overrides->ssm_checkpoints
+                ? overrides->ssm_checkpoints->at(static_cast<size_t>(ssm_ordinal)) : nullptr;
             const bool qwen_hybrid_ssm_model =
                 (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36 ||
                  model->variant == ModelVariant::QWEN38) &&
@@ -2063,7 +2067,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             }
 
             if (!embedding_mode && il == static_cast<int>(model->layers.size()) - 1 &&
-                !(overrides && overrides->full_normalized_hidden) && ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
+                !(overrides && (overrides->full_normalized_hidden || overrides->retain_all_logits)) && ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
                 last_layer_prefill_compacted = true;
                 const size_t last_token_offset = static_cast<size_t>(N - 1) * static_cast<size_t>(cur->nb[1]);
                 cur = ggml_view_2d(ctx_c, cur, cur->ne[0], 1, cur->nb[1], last_token_offset);
@@ -3003,7 +3007,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
     }
 
     const bool per_sequence_prefill_logits =
-        !embedding_mode && ShouldUsePrefillPerSequenceLastLogits(model, batch, static_cast<int>(cur->ne[1]));
+        !embedding_mode && !(overrides && overrides->retain_all_logits) && ShouldUsePrefillPerSequenceLastLogits(model, batch, static_cast<int>(cur->ne[1]));
     if (per_sequence_prefill_logits) {
         struct ggml_tensor* gathered = nullptr;
         for (int seq = 0; seq < batch.num_seqs; ++seq) {
@@ -3050,7 +3054,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
 
     // LM Head projection: [n_embd, N] -> [n_vocab, N]
     struct ggml_tensor* cur_input_to_lm_head = cur;
-    if (!per_sequence_prefill_logits && cur->ne[1] > 1 && ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
+    if (!(overrides && overrides->retain_all_logits) && !per_sequence_prefill_logits && cur->ne[1] > 1 && ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
         const int64_t actual_tokens = cur->ne[1];
         const size_t last_token_offset = static_cast<size_t>(actual_tokens - 1) * static_cast<size_t>(cur->nb[1]);
         cur_input_to_lm_head = ggml_view_2d(ctx_c, cur, cur->ne[0], 1, cur->nb[1], last_token_offset);

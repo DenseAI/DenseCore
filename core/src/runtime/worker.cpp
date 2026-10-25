@@ -1087,6 +1087,7 @@ void EngineLoop(EngineState* state) {
         // Mapping: scheduler seq_id -> Request*
         std::unordered_map<int, Request*> seq_to_request;
         std::unordered_map<int, std::unique_ptr<densecore::llm::speculative::ReferenceSession>> mtp_sessions;
+        int mtp_last_scheduled_seq = -1;
         using namespace densecore::llm::graph;
         GraphCache graph_cache;
         std::unordered_map<std::string, FlexibleGraphPoolSizing> flexible_graph_pool_sizing_cache;
@@ -1984,6 +1985,7 @@ void EngineLoop(EngineState* state) {
 
             // 8. Form BatchSpec from SchedulerOutput
             BatchSpec batch;
+            bool mtp_verification_batch = false;
             InferenceDependencies deps;
             std::vector<Request*> batch_requests;
             std::vector<int> batch_token_counts;
@@ -2237,7 +2239,14 @@ void EngineLoop(EngineState* state) {
             }
 
             // Process decode sequences
-            for (int seq_id : sched_output.decode_seq_ids) {
+            auto mtp_decode_ids = sched_output.decode_seq_ids;
+            if (state->speculation_selected.load(std::memory_order_acquire) == 2) {
+                std::sort(mtp_decode_ids.begin(), mtp_decode_ids.end());
+                const auto pivot = std::upper_bound(mtp_decode_ids.begin(), mtp_decode_ids.end(), mtp_last_scheduled_seq);
+                std::rotate(mtp_decode_ids.begin(), pivot, mtp_decode_ids.end());
+            }
+            for (int seq_id : mtp_decode_ids) {
+                if (state->speculation_selected.load(std::memory_order_acquire) == 2 && !batch_requests.empty()) break;
                 batch_build_stats.scheduled_decode_count++;
                 auto req_it = seq_to_request.find(seq_id);
                 if (req_it == seq_to_request.end()) {
@@ -2269,8 +2278,26 @@ void EngineLoop(EngineState* state) {
                     continue;
                 }
 
-                // Decode: single token
-                if (!ensure_request_blocks_writable(req, req->n_past, 1)) {
+                std::vector<int> verification_draft;
+                if (state->speculation_selected.load(std::memory_order_acquire) == 2) {
+                    const auto session = mtp_sessions.find(req->id);
+                    if (session != mtp_sessions.end()) {
+                        const int maximum = std::max(0, std::min({state->spec_draft_n_max.load(),
+                            state->speculation_max_context - req->n_past - 1,
+                            req->max_tokens - req->generated_count - 1}));
+                        verification_draft = session->second->VerificationDraft(maximum);
+                    }
+                }
+                const int verification_width = 1 + static_cast<int>(verification_draft.size());
+                if (verification_width > 1 && !state->scheduler->ReserveSpeculativeSlots(
+                        req->seq_id, req->n_past + verification_width, &req->block_table)) {
+                    finalize_generation_error(req, DecodeFinishCause::OutOfMemory,
+                        "Error: MTP could not reserve target verification KV", global_direct_callback);
+                    free_request_blocks(req);
+                    remove_request_from_scheduler(req, false);
+                    continue;
+                }
+                if (!ensure_request_blocks_writable(req, req->n_past, verification_width)) {
                     batch_build_stats.skipped_block_writable_count++;
                     note_batch_build_stall(req);
                     LOG_WARN("Skipping req {} in decode: failed to ensure writable KV block (seq_id={}, n_past={})",
@@ -2280,15 +2307,24 @@ void EngineLoop(EngineState* state) {
 
                 int batch_seq_idx = batch_requests.size();
                 batch.tokens.push_back(req->tokens.back());
-                batch.pos.push_back(req->n_past);
-                batch.seq_id.push_back(batch_seq_idx);
+                batch.tokens.insert(batch.tokens.end(), verification_draft.begin(), verification_draft.end());
+                for (int token = 0; token < verification_width; ++token) {
+                    batch.pos.push_back(req->n_past + token);
+                    batch.seq_id.push_back(batch_seq_idx);
+                }
+                if (verification_width > 1) {
+                    mtp_verification_batch = true;
+                    if (!model_entry->mtp_target_checkpoints) throw std::runtime_error("missing MTP checkpoint bank");
+                    model_entry->mtp_target_checkpoints->Begin(verification_width);
+                }
+                if (state->speculation_selected.load(std::memory_order_acquire) == 2) mtp_last_scheduled_seq = req->seq_id;
                 batch.block_tables.push_back(req->block_table);
                 batch.n_past.push_back(req->n_past);
                 batch.scheduler_seq_ids.push_back(req->seq_id);
                 batch.hybrid_ssm_runtime_states.push_back(req->ssm_runtime_states.empty() ? nullptr
                                                                                           : &req->ssm_runtime_states);
                 batch_requests.push_back(req);
-                batch_token_counts.push_back(1);
+                batch_token_counts.push_back(verification_width);
                 batch_build_stats.built_batch_count++;
                 reset_batch_build_stall(req);
 
@@ -2661,6 +2697,9 @@ void EngineLoop(EngineState* state) {
                         if (!is_embedding_batch && state->speculation_selected.load(std::memory_order_acquire) == 2) {
                             GraphAssemblyOverrides overrides;
                             overrides.full_normalized_hidden = &mtp_target_hidden;
+                            overrides.retain_all_logits = mtp_verification_batch;
+                            overrides.ssm_checkpoints = mtp_verification_batch
+                                ? &model_entry->mtp_target_checkpoints->Views() : nullptr;
                             *graph_output = BuildTransformerGraphInlineImpl(current_model, current_kv_cache, graph_ctx,
                                                 batch, false, graph, graph_embd_inp, graph_pos, &overrides);
                         } else {
@@ -5840,7 +5879,7 @@ void EngineLoop(EngineState* state) {
                 int processed_count = (i < static_cast<int>(batch_token_counts.size())) ? batch_token_counts[i] : 1;
 
                 int last_token_idx = token_offset + processed_count - 1;
-                if (!is_embedding_batch && state->speculation_selected.load(std::memory_order_acquire) == 2) {
+                if (!is_embedding_batch && !mtp_verification_batch && state->speculation_selected.load(std::memory_order_acquire) == 2) {
                     try {
                         if (!mtp_target_hidden || !mtp_target_hidden->data || mtp_target_hidden->type != GGML_TYPE_F32 ||
                             mtp_target_hidden->ne[1] != static_cast<int64_t>(batch.tokens.size())) {
@@ -6022,6 +6061,7 @@ void EngineLoop(EngineState* state) {
                                                                   std::to_string(req->id) + ": " +
                                                                   sampling_guard_error);
                     }
+                    if (mtp_verification_batch) sampling_logits_idx = token_offset;
                     const int debug_sampling_logits_offset = GetDebugSamplingLogitsOffset();
                     if (debug_sampling_logits_offset != 0) {
                         const int adjusted = sampling_logits_idx + debug_sampling_logits_offset;
@@ -6077,6 +6117,9 @@ void EngineLoop(EngineState* state) {
                     const auto sample_begin = std::chrono::steady_clock::now();
                     LogRequestLifecyclePhase("sample_begin", req, current_model, req->seq_id, batch.num_seqs,
                                              static_cast<int>(batch.tokens.size()), active_threads);
+                    std::vector<int> committed_tokens;
+                    bool mtp_batched_verified = false;
+                    const int mtp_target_base = req->n_past;
                     int best_token = -1;
                     float precomputed_lfm2_argmax_value = -std::numeric_limits<float>::infinity();
                     const bool can_use_precomputed_lfm2_argmax = debug_sampling_logits_offset == 0 &&
@@ -6088,8 +6131,43 @@ void EngineLoop(EngineState* state) {
                     if (!can_use_precomputed_lfm2_argmax) {
                         if (state->speculation_selected.load(std::memory_order_acquire) == 2) {
                             try {
-                                best_token = mtp_sessions.at(req->id)->Sample(output, sampling_logits_idx, sampling_params,
-                                                       req->SamplingRng(), batch.deps, req->cancelled);
+                                auto& session = *mtp_sessions.at(req->id);
+                                if (mtp_verification_batch) {
+                                    if (session.TargetSeen() != mtp_target_base)
+                                        throw std::runtime_error("MTP target/session context mismatch");
+                                    if (!mtp_target_hidden || !mtp_target_hidden->data ||
+                                        mtp_target_hidden->ne[1] != static_cast<int64_t>(batch.tokens.size()))
+                                        throw std::runtime_error("missing K+1 target hidden rows");
+                                    auto result = session.VerifyBatched(output, token_offset,
+                                        static_cast<size_t>(processed_count - 1), sampling_params, req->SamplingRng());
+                                    const auto* hidden = reinterpret_cast<const float*>(
+                                        static_cast<const char*>(mtp_target_hidden->data) + token_offset * mtp_target_hidden->nb[1]);
+                                    session.CompleteBatched(batch.tokens.data() + token_offset, hidden,
+                                        mtp_target_hidden->nb[1] / sizeof(float), result, sampling_params, batch.deps, req->cancelled);
+                                    auto& bank = *model_entry->mtp_target_checkpoints;
+                                    if (!bank.CanRestore(result.accepted_draft_tokens, req->ssm_runtime_states))
+                                        throw std::runtime_error("incomplete target recurrent checkpoints");
+                                    committed_tokens = std::move(result.tokens);
+                                    // All output allocations and checkpoint validation precede
+                                    // the exclusive scheduler/KV/recurrent commit.
+                                    req->n_past = mtp_target_base + processed_count;
+                                    for (size_t block = 0; block < req->block_table.size(); ++block)
+                                        current_kv_cache->block_manager->SetFilledSlots(req->block_table[block],
+                                            std::clamp(req->n_past - static_cast<int>(block)*BLOCK_SIZE, 0, BLOCK_SIZE));
+                                    state->scheduler->OnDecodeStepComplete(req->seq_id, processed_count);
+                                    if (!state->scheduler->RollbackSpeculativeSuffix(req->seq_id,
+                                            mtp_target_base + static_cast<int>(result.accepted_draft_tokens) + 1,
+                                            &req->block_table, &req->n_past))
+                                        throw std::runtime_error("MTP target rollback failed");
+                                    if (!bank.Restore(result.accepted_draft_tokens, req->ssm_runtime_states)) std::terminate();
+                                    session.NoteTargetRollback();
+                                    req->pending_scheduler_progress = 0;
+                                    mtp_batched_verified = true;
+                                    best_token = committed_tokens.front();
+                                } else {
+                                    best_token = session.Sample(output, sampling_logits_idx, sampling_params,
+                                        req->SamplingRng(), batch.deps, req->cancelled);
+                                }
                             } catch (const std::exception& e) {
                                 finalize_generation_error(req, req->cancelled.load() ? DecodeFinishCause::RequestCanceled
                                                                                    : DecodeFinishCause::GraphBuildFailed,
@@ -6104,12 +6182,45 @@ void EngineLoop(EngineState* state) {
                             best_token = SampleTokenWithRng(output, sampling_logits_idx, sampling_params, req->SamplingRng());
                         }
                     }
+                    if (state->speculation_selected.load(std::memory_order_acquire) == 2) {
+                        const auto& session = *mtp_sessions.at(req->id);
+                        std::cerr << "[MTPVerify] request_id=" << req->id << " target_width=" << (mtp_verification_batch ? processed_count : 1)
+                                  << " physical_tokens=" << batch.tokens.size()
+                                  << " proposed=" << session.Proposed() << " verified=" << session.Verified()
+                                  << " accepted=" << session.Accepted() << " rejected=" << session.Rejected()
+                                  << " target_rollbacks=" << session.TargetRollbacks() << std::endl;
+                    }
+                    if (committed_tokens.empty()) committed_tokens.push_back(best_token);
+                    auto trim_mtp_boundary = [&](size_t emitted) {
+                        if (!mtp_batched_verified || emitted == committed_tokens.size()) return;
+                        const size_t slot = emitted ? emitted - 1 : 0;
+                        // With zero emitted tokens the already-committed input0
+                        // may remain consumed; cancellation terminates immediately.
+                        const int keep = mtp_target_base + static_cast<int>(std::max(size_t{1}, emitted));
+                        auto& bank = *model_entry->mtp_target_checkpoints;
+                        if (!bank.CanRestore(slot, req->ssm_runtime_states) ||
+                            !state->scheduler->RollbackSpeculativeSuffix(req->seq_id, keep,
+                                &req->block_table, &req->n_past) ||
+                            !bank.Restore(slot, req->ssm_runtime_states))
+                            throw std::runtime_error("MTP output boundary rollback failed");
+                        mtp_sessions.at(req->id)->NoteTargetRollback();
+                    };
+                    for (size_t committed_index = 0; committed_index < committed_tokens.size(); ++committed_index) {
+                        if (req->cancelled.load(std::memory_order_relaxed)) {
+                            trim_mtp_boundary(committed_index);
+                            finalize_generation_error(req, DecodeFinishCause::RequestCanceled,
+                                "Error: request canceled", global_direct_callback);
+                            free_request_blocks(req);
+                            remove_request_from_scheduler(req, false);
+                            break;
+                        }
+                        best_token = committed_tokens[committed_index];
                     LogRequestLifecyclePhase("sample_end", req, current_model, req->seq_id, batch.num_seqs,
                                              static_cast<int>(batch.tokens.size()), active_threads);
                     const auto sample_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                      std::chrono::steady_clock::now() - sample_begin)
                                                                      .count());
-                    req->sample_ns += sample_ns;
+                    if (committed_index == 0) req->sample_ns += sample_ns;
                     if (IsVerboseTokenTraceEnabled()) {
                         std::cerr << "[TRACE] Sampled token " << best_token << " for request " << req->id << std::endl;
                     }
@@ -6234,7 +6345,7 @@ void EngineLoop(EngineState* state) {
                     // that token is only sampled here and will be written to KV on
                     // the next decode iteration.
                     if (!was_prefill_step) {
-                        req->n_past += processed_count;
+                        if (!mtp_batched_verified) req->n_past += processed_count;
                         if (processed_decode_input_token >= 0 &&
                             static_cast<int>(req->sequence_tokens_for_prefix_cache.size()) == req->n_past - 1) {
                             req->sequence_tokens_for_prefix_cache.push_back(processed_decode_input_token);
@@ -6245,7 +6356,7 @@ void EngineLoop(EngineState* state) {
                         auto now = std::chrono::steady_clock::now();
                         req->empty_schedule_stall_count = 0;
                         req->last_progress_time = now;
-                        commit_decode_scheduler_progress();
+                        if (!mtp_batched_verified) commit_decode_scheduler_progress();
                         auto itl_us =
                             std::chrono::duration_cast<std::chrono::microseconds>(now - req->last_token_time).count();
                         state->metrics.RecordITL(itl_us);
@@ -6254,7 +6365,7 @@ void EngineLoop(EngineState* state) {
 
                     // Ensure we have enough blocks for the NEXT token
                     int blocks_needed = (req->n_past + 1 + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                    while ((int)req->block_table.size() < blocks_needed) {
+                    while (!mtp_batched_verified && (int)req->block_table.size() < blocks_needed) {
                         auto new_blocks = current_kv_cache->block_manager->Allocate(1);
                         if (new_blocks.empty()) {
                             std::cerr << "[DenseCore] OOM during generation for req " << req->id << std::endl;
@@ -6287,6 +6398,7 @@ void EngineLoop(EngineState* state) {
                     // Check finish conditions
                     if (req->finished || IsStopTokenId(current_model, best_token) ||
                         req->generated_count >= req->max_tokens) {
+                        trim_mtp_boundary(committed_index + 1);
                         LogRequestLifecyclePhase("finish_begin", req, current_model, req->seq_id, batch.num_seqs,
                                                  static_cast<int>(batch.tokens.size()), active_threads);
                         if (!req->finished) {
@@ -6418,6 +6530,8 @@ void EngineLoop(EngineState* state) {
                         free_request_blocks(req);
                         remove_request_from_scheduler(req, /*completed=*/true);
                     }
+                    if (req->finished) break;
+                    } // Common output commit for each verified token.
                 }
                 token_offset += processed_count;
             }

@@ -1,3 +1,5 @@
+#include "densecore/runtime/scheduler.h"
+#include "llm/speculative/target_checkpoints.h"
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -221,4 +223,84 @@ TEST(SSMCheckpointTest, RejectsOverflowInvalidMapsAndOutOfRangeRecording) {
                             3 * (kChannels + kHeads);
     EXPECT_EQ(recorder.Bytes(), expected);
 }
+}
+
+TEST(SSMCheckpointTest, TargetBankPreflightsEveryLayerBeforeAnyRestore) {
+    TransformerModel model;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_layer = 2;
+    model.hybrid_layer_is_ssm = {1, 1};
+    model.ssm_inner_size = kInner;
+    model.ssm_group_count = kGroups;
+    model.ssm_state_size = kHeadK;
+    model.ssm_time_step_rank = kHeads;
+    model.ssm_conv_kernel = kKernel;
+    densecore::llm::speculative::TargetCheckpointBank bank(model, 3);
+    ASSERT_EQ(bank.Views().size(), 2u);
+    Fixture fixture(4);
+    std::vector<State> states{fixture.Initial(), fixture.Initial()};
+    bank.Begin(4);
+    fixture.Run(&states[0], 0, 4, 2, bank.Views()[0]);
+    const auto first_before = states[0];
+    EXPECT_FALSE(bank.CanRestore(0, states));
+    EXPECT_FALSE(bank.Restore(0, states));
+    EXPECT_EQ(states[0].conv_state, first_before.conv_state);
+    EXPECT_EQ(states[0].ssm_state, first_before.ssm_state);
+    fixture.Run(&states[1], 0, 4, 2, bank.Views()[1]);
+    ASSERT_TRUE(bank.CanRestore(1, states));
+    ASSERT_TRUE(bank.Restore(1, states));
+    auto expected = fixture.Initial();
+    fixture.Run(&expected, 0, 2, 1);
+    for (const auto& state : states) {
+        EXPECT_EQ(state.conv_state, expected.conv_state);
+        EXPECT_EQ(state.ssm_state, expected.ssm_state);
+    }
+    bank.Begin(2);  // reuse the same reserved capacity for K=1
+    EXPECT_FALSE(bank.CanRestore(1, states));
+}
+
+TEST(SSMCheckpointTest, TargetTransactionCrossesKVBlockAndRestoresEveryAcceptanceBoundary) {
+    for (int draft = 1; draft <= 3; ++draft) for (int accepted = 0; accepted <= draft; ++accepted) {
+        SCOPED_TRACE(draft); SCOPED_TRACE(accepted);
+        TransformerModel model;
+        model.arch_flags.is_hybrid_ssm = true;
+        model.hparams.n_layer = 1;
+        model.hybrid_layer_is_ssm = {1};
+        model.ssm_inner_size = kInner; model.ssm_group_count = kGroups;
+        model.ssm_state_size = kHeadK; model.ssm_time_step_rank = kHeads; model.ssm_conv_kernel = kKernel;
+        densecore::llm::speculative::TargetCheckpointBank bank(model, draft);
+        BlockManager manager(32, BLOCK_SIZE);
+        densecore::SchedulerConfig config;
+        config.max_num_seqs = 1; config.max_prefill_seqs = 1;
+        config.max_num_batched_tokens = 64; config.max_model_len = 64;
+        densecore::Scheduler scheduler(&manager, config);
+        const int base = BLOCK_SIZE - 1;
+        const int sequence = scheduler.AddRequest(123, base, 32);
+        auto scheduled = scheduler.Schedule();
+        ASSERT_EQ(scheduled.new_block_allocations.size(), 1u);
+        auto blocks = scheduled.new_block_allocations.front().second;
+        scheduler.OnPrefillChunkComplete(sequence, base, true);
+        ASSERT_TRUE(scheduler.ReserveSpeculativeSlots(sequence, base+draft+1, &blocks));
+        Fixture fixture(draft+1);
+        std::vector<State> states{fixture.Initial()};
+        bank.Begin(draft+1);
+        fixture.Run(&states[0], 0, draft+1, 3, bank.Views()[0]);
+        ASSERT_TRUE(bank.CanRestore(accepted, states));
+        int past = base+draft+1;
+        for (size_t index = 0; index < blocks.size(); ++index)
+            manager.SetFilledSlots(blocks[index], std::clamp(past-static_cast<int>(index)*BLOCK_SIZE, 0, BLOCK_SIZE));
+        scheduler.OnDecodeStepComplete(sequence, draft+1);
+        ASSERT_TRUE(scheduler.RollbackSpeculativeSuffix(sequence, base+accepted+1, &blocks, &past));
+        ASSERT_TRUE(bank.Restore(accepted, states));
+        EXPECT_EQ(past, base+accepted+1);
+        auto expected = fixture.Initial();
+        fixture.Run(&expected, 0, accepted+1, 1);
+        EXPECT_EQ(states[0].conv_state, expected.conv_state);
+        EXPECT_EQ(states[0].ssm_state, expected.ssm_state);
+        EXPECT_EQ(manager.GetFilledSlots(blocks.back()), past % BLOCK_SIZE ? past % BLOCK_SIZE : BLOCK_SIZE);
+        EXPECT_EQ(scheduler.Schedule().batch_context_len, past);
+        scheduler.RemoveRequest(sequence);
+        manager.Free(blocks);
+        EXPECT_EQ(manager.GetFreeBlockCount(), 32);
+    }
 }

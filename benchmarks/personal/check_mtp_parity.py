@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 import threading
@@ -25,6 +26,27 @@ CASES = [
     {"id": "capital", "prompt": "What is the capital of France? Reply with only the city name.", "expected": r"\bParis\b"},
     {"id": "arithmetic", "prompt": "What is 17 plus 25? Reply with only the integer.", "expected": r"\b42\b"},
 ]
+
+
+NATIVE_CASES = CASES + [{"id": "long_parity", "prompt":
+    "Write every integer from 1 through 80, one integer per line. Do not skip any integers. Start with 1."}]
+
+
+def extract_mtp_counters(log):
+    requests = {}
+    for line in log.splitlines():
+        if '[MTPVerify]' not in line:
+            continue
+        fields = {key: int(value) for key, value in re.findall(r'(\w+)=(\d+)', line)}
+        if 'request_id' not in fields:
+            continue
+        current = requests.setdefault(fields.pop('request_id'), {})
+        for key, value in fields.items():
+            current[key] = max(current.get(key, 0), value)
+    return {'requests': requests,
+            'maximum_target_width': max((row.get('target_width', 0) for row in requests.values()), default=0),
+            **{key: sum(row.get(key, 0) for row in requests.values()) for key in
+               ('proposed', 'verified', 'accepted', 'rejected', 'target_rollbacks')}}
 
 
 def digest(path):
@@ -184,7 +206,7 @@ def native_child(args):
         result['runtime_plan']['spec_reason'] = plan.spec_reason.decode(errors='replace')
         if lib.DenseCoreSetGenerationCompletionCallback(handle, completed) != 0:
             raise RuntimeError('native completion metadata callback unavailable')
-        jobs = [(case, repeat) for repeat in range(args.repeats) for case in CASES]
+        jobs = [(case, repeat) for repeat in range(args.repeats) for case in NATIVE_CASES]
         with ThreadPoolExecutor(max_workers=args.child_concurrency) as pool:
             result['requests'] = list(pool.map(lambda job: submit(*job), jobs))
         for row in result['requests']: validate_native(row)
@@ -340,20 +362,34 @@ def parent(args):
                 native_environment['LD_PRELOAD'] = ' '.join(dict.fromkeys([str(library), *existing]))
             with (out / f'native-{mode}-c{concurrency}.log').open('w') as output:
                 execution = subprocess.run(command, env=native_environment, stdout=output, stderr=subprocess.STDOUT,
-                    timeout=args.timeout * (len(CASES) * args.repeats + 5))
+                    timeout=args.timeout * (len(NATIVE_CASES) * args.repeats + 5))
             if execution.returncode or not result.exists():
                 manifest['error'] = f'native {mode}/c{concurrency} failed, see preserved log'
                 manifest['passed'] = False
                 if result.exists(): manifest['failed_native_result'] = json.loads(result.read_text())
                 write(out / 'summary.json', manifest)
                 return 1
-            manifest['native'].append(json.loads(result.read_text()))
+            native_row = json.loads(result.read_text())
+            native_row['mtp_counters'] = extract_mtp_counters((out / f'native-{mode}-c{concurrency}.log').read_text())
+            manifest['native'].append(native_row)
             write(out / 'summary.json', manifest)
         if args.server:
             environment['DENSECORE_MAX_NUM_SEQS'] = str(max(args.concurrency))
             manifest['http'].append(http_mode(args, mode, out, environment))
             write(out / 'summary.json', manifest)
     failures = compare_native(manifest['native'])
+    if args.require_batched_mtp:
+        for row in manifest['native']:
+            if row['mode'] != 'mtp': continue
+            counters = row['mtp_counters']
+            if counters['maximum_target_width'] <= 1 or counters['target_rollbacks'] <= 0:
+                failures.append(f"mtp/c{row['concurrency']}: actual batched verification/rollback not observed")
+            if not counters['accepted'] or not counters['rejected']:
+                failures.append(f"mtp/c{row['concurrency']}: both acceptance and rejection were not exercised")
+            for request in row['requests']:
+                if request['case'] == 'long_parity' and request['generated_tokens'] < 32:
+                    failures.append(f"mtp/c{row['concurrency']}: long parity case produced fewer than 32 tokens")
+
     finals = {}
     for mode_result in manifest['http']:
         for group in mode_result['groups']:
@@ -389,7 +425,8 @@ def main():
     parser.add_argument('--concurrency', type=int, nargs='+', choices=(1, 2, 4, 8), default=[1, 2, 4])
     parser.add_argument('--repeats', type=int, default=2)
     parser.add_argument('--draft', type=int, choices=(1, 2, 3), default=2)
-    parser.add_argument('--max-tokens', type=int, default=96)
+    parser.add_argument('--max-tokens', type=int, default=128)
+    parser.add_argument('--require-batched-mtp', action='store_true', help='require observed acceptance, rejection, K+1 graphs and rollback')
     parser.add_argument('--http-max-tokens', type=int, default=1024)
     parser.add_argument('--timeout', type=float, default=180)
     parser.add_argument('--port', type=int, default=18089)
@@ -397,6 +434,7 @@ def main():
     parser.add_argument('--mode', choices=('none', 'mtp'), help=argparse.SUPPRESS)
     parser.add_argument('--child-concurrency', type=int, default=1, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.require_batched_mtp and args.max_tokens < 128: parser.error('--require-batched-mtp needs --max-tokens >= 128')
     if args.repeats < 1 or args.threads < 1 or args.context < 1: parser.error('repeats, threads and context must be positive')
     if args.native_child:
         native_child(args)

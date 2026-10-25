@@ -1,6 +1,6 @@
 import unittest
 import threading
-from check_mtp_parity import compare_native, validate_native, wait_for_first_token
+from check_mtp_parity import compare_native, validate_native, wait_for_first_token, extract_mtp_counters
 
 
 def sample(ids=(10, 20)):
@@ -53,3 +53,16 @@ class ExactParityGateTest(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+class MtpCounterEvidenceTest(unittest.TestCase):
+    def test_cumulative_counters_are_counted_once_per_request_and_width_is_retained(self):
+        rows = extract_mtp_counters("""
+[MTPVerify] request_id=1 target_width=4 proposed=9 verified=3 accepted=2 rejected=1 target_rollbacks=1
+[MTPVerify] request_id=1 target_width=1 proposed=12 verified=4 accepted=3 rejected=1 target_rollbacks=2
+[MTPVerify] request_id=2 target_width=2 proposed=2 verified=1 accepted=0 rejected=1 target_rollbacks=1
+""")
+        self.assertEqual(rows['maximum_target_width'], 4)
+        self.assertEqual(rows['proposed'], 14)
+        self.assertEqual(rows['accepted'], 3)
+        self.assertEqual(rows['rejected'], 2)
+        self.assertEqual(rows['target_rollbacks'], 3)

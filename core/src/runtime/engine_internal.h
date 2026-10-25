@@ -1,5 +1,6 @@
 #include "densecore/runtime/resource_budget.h"
 #include "densecore/runtime/resource_ledger.h"
+#include "llm/speculative/target_checkpoints.h"
 #ifndef DENSECORE_ENGINE_INTERNAL_H
 #define DENSECORE_ENGINE_INTERNAL_H
 
@@ -1545,6 +1546,7 @@ using RequestPriorityComparator = FairQueueComparator;
  */
 struct ModelEntry {
     std::unique_ptr<densecore::runtime::ResourcePlanLease> resource_lease;
+    std::unique_ptr<densecore::llm::speculative::TargetCheckpointBank> mtp_target_checkpoints;
     KVCacheConfig kv_config{}; // Effective context/concurrency and one initialization memory plan.
     std::string model_id;
     std::string model_path;

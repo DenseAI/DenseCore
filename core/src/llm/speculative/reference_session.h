@@ -28,8 +28,21 @@ public:
     void ObserveTarget(const int* tokens, const float* hidden, size_t stride, int count, bool prefill);
     int Sample(ggml_tensor* target_logits, int column, const SamplingParams& params, std::mt19937& target_rng,
                const InferenceDependencies* deps, const std::atomic<bool>& cancelled);
+    // Worker-only K+1 transaction API. The ordinary committed token is input0;
+    // these head proposals supply input1..K. Verification never emits output.
+    std::vector<int> VerificationDraft(int maximum) const;
+    VerificationResult VerifyBatched(ggml_tensor* logits, int first_column, size_t draft_count,
+                                      const SamplingParams& params, std::mt19937& target_rng);
+    void CompleteBatched(const int* inputs, const float* hidden, size_t stride,
+                         const VerificationResult& result, const SamplingParams& params,
+                         const InferenceDependencies* deps, const std::atomic<bool>& cancelled);
+    int TargetSeen() const { return target_seen_; }
     uint64_t Accepted() const { return accepted_; }
     uint64_t Proposed() const { return proposed_; }
+    uint64_t Verified() const { return verified_; }
+    uint64_t Rejected() const { return rejected_; }
+    uint64_t TargetRollbacks() const { return target_rollbacks_; }
+    void NoteTargetRollback() { ++target_rollbacks_; }
 private:
     struct HeadOutput { std::vector<float> hidden; Distribution distribution; int token = -1; };
     struct Proposal { int token; Distribution distribution; };
@@ -48,6 +61,6 @@ private:
     std::mt19937 draft_rng_, accept_rng_;
     int max_context_, draft_n_max_, threads_, head_past_ = 0, target_seen_ = 0;
     bool bootstrapped_ = false;
-    uint64_t accepted_ = 0, proposed_ = 0;
+    uint64_t accepted_ = 0, proposed_ = 0, verified_ = 0, rejected_ = 0, target_rollbacks_ = 0;
 };
 }  // namespace densecore::llm::speculative

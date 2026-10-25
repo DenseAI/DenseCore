@@ -117,6 +117,84 @@ TEST(MtpReferenceSession, VerifiesGreedyProposalsAndRecoversFromRejection) {
     ggml_free(ctx);
 }
 
+TEST(MtpBatchedSession, EveryAcceptanceBoundaryAndFullAcceptCatchupSupportsAllDraftLimits) {
+    for (int maximum = 1; maximum <= 3; ++maximum) for (int accept = 0; accept <= maximum; ++accept) {
+        SCOPED_TRACE(maximum); SCOPED_TRACE(accept);
+        auto source = MakeTinyNextNSource();
+        auto* ctx = ggml_init({1024*1024, nullptr, false});
+        ASSERT_NE(ctx, nullptr);
+        auto* first = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 1);
+        static_cast<float*>(first->data)[0] = 1; static_cast<float*>(first->data)[1] = 3;
+        ReferenceSession session(*source, 16, maximum, 1234, 1);
+        SamplingParams params;
+        params.temperature = 0;
+        std::vector<int> history;
+        params.token_history = &history;
+        std::atomic<bool> cancelled{false};
+        std::mt19937 rng(7);
+        const int prompt = 1;
+        const float hidden[] = {3, 4};
+        session.ObserveTarget(&prompt, hidden, 2, 1, true);
+        ASSERT_EQ(session.Sample(first, 0, params, rng, nullptr, cancelled), 1);
+        history.push_back(1);
+        const auto proposals = session.VerificationDraft(maximum);
+        ASSERT_EQ(proposals, std::vector<int>(maximum, 1));
+        auto* logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, maximum+1);
+        for (int row = 0; row <= maximum; ++row) {
+            auto* values = reinterpret_cast<float*>(static_cast<char*>(logits->data) + row*logits->nb[1]);
+            const int selected = row < accept ? 1 : 0;
+            values[selected] = 3; values[1-selected] = 1;
+        }
+        const auto result = session.VerifyBatched(logits, 0, maximum, params, rng);
+        ASSERT_EQ(result.accepted_draft_tokens, static_cast<size_t>(accept));
+        std::vector<int> expected(accept, 1); expected.push_back(0);
+        EXPECT_EQ(result.tokens, expected);
+        std::vector<int> inputs(maximum+1, 1);
+        std::vector<float> target_hidden;
+        for (int row = 0; row <= maximum; ++row) target_hidden.insert(target_hidden.end(), {3,4});
+        EXPECT_NO_THROW(session.CompleteBatched(inputs.data(), target_hidden.data(), 2,
+            result, params, nullptr, cancelled));
+        EXPECT_FALSE(session.VerificationDraft(maximum).empty());
+        EXPECT_EQ(session.Verified(), static_cast<uint64_t>(std::min(accept+1, maximum)));
+        EXPECT_EQ(session.Rejected(), static_cast<uint64_t>(accept != maximum));
+        ggml_free(ctx);
+    }
+}
+
+TEST(MtpBatchedSession, AcceptedEosDoesNotReadOrSampleThePostEosBonusDistribution) {
+    auto source = MakeTinyNextNSource();
+    source->eos_token_id = 1;
+    auto* ctx = ggml_init({1024*1024, nullptr, false});
+    ASSERT_NE(ctx, nullptr);
+    auto* initial = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 1);
+    static_cast<float*>(initial->data)[0] = 3; static_cast<float*>(initial->data)[1] = 1;
+    ReferenceSession session(*source, 16, 3, 1234, 1);
+    SamplingParams params;
+    params.temperature = 0;
+    std::vector<int> history;
+    params.token_history = &history;
+    std::atomic<bool> cancelled{false};
+    std::mt19937 rng(7);
+    const int prompt = 0;
+    const float hidden[] = {3, 4};
+    session.ObserveTarget(&prompt, hidden, 2, 1, true);
+    ASSERT_EQ(session.Sample(initial, 0, params, rng, nullptr, cancelled), 0);
+    history.push_back(0);
+    ASSERT_EQ(session.VerificationDraft(3), (std::vector<int>{1}));
+    auto* logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 2);
+    auto* values = static_cast<float*>(logits->data);
+    values[0] = 1; values[1] = 3;
+    values[2] = values[3] = std::numeric_limits<float>::quiet_NaN();
+    const auto result = session.VerifyBatched(logits, 0, 1, params, rng);
+    EXPECT_EQ(result.tokens, (std::vector<int>{1}));
+    EXPECT_EQ(result.accepted_draft_tokens, 0u);
+    const int input[] = {0, 1};
+    const float states[] = {3,4,3,4};
+    EXPECT_NO_THROW(session.CompleteBatched(input, states, 2, result, params, nullptr, cancelled));
+    EXPECT_TRUE(session.VerificationDraft(3).empty());
+    ggml_free(ctx);
+}
+
 TEST(MtpConfiguration, KeepsAutomaticModeOffAndRejectsUnsupportedOrUnbudgetedExplicitMode) {
     EngineState state;
     std::string error;
@@ -182,11 +260,12 @@ TEST(NextNGraph, TargetCaptureIsOutputNormalizedAndKeepsEveryPromptRow) {
     ggml_tensor* hidden = nullptr;
     GraphAssemblyOverrides overrides;
     overrides.full_normalized_hidden = &hidden;
+    overrides.retain_all_logits = true;
     auto* output = BuildTransformerGraphInlineImpl(&view.Model(), cache.get(), ctx, batch,
                                                    false, graph, nullptr, nullptr, &overrides);
     ASSERT_NE(hidden, nullptr);
     ASSERT_EQ(hidden->ne[1], 2); // retain both rows despite last-token LM-head policy
-    EXPECT_EQ(output->ne[1], 1);
+    EXPECT_EQ(output->ne[1], 2); // verifier needs every target position
     ASSERT_EQ(ggml_graph_compute_with_ctx(ctx, graph, 1), GGML_STATUS_SUCCESS);
     const auto* data = static_cast<float*>(hidden->data);
     for (size_t row = 0; row < 2; ++row) {
