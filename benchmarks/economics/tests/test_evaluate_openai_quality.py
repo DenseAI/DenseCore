@@ -104,7 +104,7 @@ class QualityEvaluationTest(unittest.TestCase):
 
     def test_reasoning_only_correct_word_cannot_pass_with_thinking_enabled(self):
         case = {"id": "reasoning-only", "expected_all": ["Paris"]}
-        for visible, reasoning in [("", "Paris"), ("<think>Paris</think>London", ""), ("<think>Paris", "")]:
+        for visible, reasoning in [("", "Paris"), ("<think>Paris</think>London", ""), ("<think>Paris", ""), ("Paris<think>unfinished", "")]:
             with self.subTest(visible=visible):
                 with patch.object(quality, "request_visible_content", return_value=(200, visible, reasoning, None)):
                     result = quality.evaluate_case("unused", case, 1, enable_thinking=True)

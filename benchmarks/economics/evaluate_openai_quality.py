@@ -101,7 +101,7 @@ def evaluate_case(url: str, case: dict[str, Any], timeout_s: float, enable_think
     while "<think>" in evaluation_content:
         before, _, tail = evaluation_content.partition("<think>")
         _, closing, after = tail.partition("</think>")
-        evaluation_content = before + after if closing else before
+        evaluation_content = before + after if closing else ""
     if "</think>" in evaluation_content:
         evaluation_content = evaluation_content.rsplit("</think>", 1)[1]
     normalized = evaluation_content.casefold()
