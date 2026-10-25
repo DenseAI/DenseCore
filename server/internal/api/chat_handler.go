@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/DenseAI/DenseCore/server/internal/domain"
+	"github.com/DenseAI/DenseCore/server/internal/harmony"
 	"github.com/DenseAI/DenseCore/server/internal/service"
 )
 
@@ -70,6 +71,10 @@ func (h *Handler) ChatCompletionHandler(w http.ResponseWriter, r *http.Request) 
 	// Extract context for cancellation propagation
 	ctx := r.Context()
 
+	if isHarmonyModelHint(h.reasoningModelHint(req)) && toolParsingEnabled(req) {
+		sendError(w, "Harmony tool calling is not supported by text-only inference", "invalid_request_error", ErrCodeInvalidRequest, http.StatusBadRequest)
+		return
+	}
 	if req.Stream {
 		h.handleStream(ctx, w, req)
 	} else {
@@ -114,6 +119,10 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 	lastCallbackMS := 0.0
 	completionTokens := 0
 	reasoningModelHint := h.reasoningModelHint(req)
+	var harmonyDecoder *harmony.Decoder
+	if isHarmonyModelHint(reasoningModelHint) {
+		harmonyDecoder = harmony.NewDecoder()
+	}
 	var gemma4Filter *gemma4StreamFilter
 	if isGemma4ModelHint(reasoningModelHint) {
 		gemma4Filter = newGemma4StreamFilter()
@@ -167,6 +176,20 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 				if qwenMarkerFilter != nil && token != "" {
 					token = qwenMarkerFilter.Filter(token)
 				}
+				if harmonyDecoder != nil {
+					delta, err := harmonyDecoder.Write(token)
+					if err != nil {
+						_ = streamWriter.Flush()
+						writeGenerationError(ctx, w, flusher, req.Model, domain.ErrInternal(err.Error()), streamWriter.Started())
+						return
+					}
+					if delta.Content != "" || delta.Reasoning != "" {
+						if err := h.writeChatStreamDelta(streamWriter, id, created, req.Model, delta.Content, delta.Reasoning); err != nil {
+							return
+						}
+					}
+					token = ""
+				}
 				if token != "" {
 					if err := h.writeChatStreamToken(streamWriter, id, created, req.Model, token, qwen36Filter); err != nil {
 						slog.Debug("SSE write error", slog.String("error", err.Error()))
@@ -219,6 +242,19 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 					if content != "" || reasoningContent != "" {
 						if err := h.writeChatStreamDelta(streamWriter, id, created, req.Model, content, reasoningContent); err != nil {
 							slog.Debug("SSE write error", slog.String("error", err.Error()))
+							return
+						}
+					}
+				}
+				if harmonyDecoder != nil {
+					delta, err := harmonyDecoder.Finish()
+					if err != nil {
+						_ = streamWriter.Flush()
+						writeGenerationError(ctx, w, flusher, req.Model, domain.ErrInternal(err.Error()), streamWriter.Started())
+						return
+					}
+					if delta.Content != "" || delta.Reasoning != "" {
+						if err := h.writeChatStreamDelta(streamWriter, id, created, req.Model, delta.Content, delta.Reasoning); err != nil {
 							return
 						}
 					}
@@ -341,7 +377,17 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 		return
 	}
 
-	content, reasoningContent := splitReasoningResponse(req, h.reasoningModelHint(req), responseText)
+	var content, reasoningContent string
+	if isHarmonyModelHint(h.reasoningModelHint(req)) {
+		delta, parseErr := harmony.Split(responseText)
+		if parseErr != nil {
+			sendError(w, parseErr.Error(), "server_error", "invalid_harmony_output", http.StatusInternalServerError)
+			return
+		}
+		content, reasoningContent = delta.Content, delta.Reasoning
+	} else {
+		content, reasoningContent = splitReasoningResponse(req, h.reasoningModelHint(req), responseText)
+	}
 	var toolCalls []domain.ToolCall
 	finishReason := resolveGenerationFinishReason(completion, completionTokens, req.MaxTokens)
 	if toolParsingEnabled(req) {

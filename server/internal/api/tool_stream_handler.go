@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/DenseAI/DenseCore/server/internal/domain"
+	"github.com/DenseAI/DenseCore/server/internal/harmony"
 	agenttools "github.com/DenseAI/DenseCore/server/internal/tools"
 )
 
@@ -184,7 +185,19 @@ func apiFirstNonEmpty(values ...string) string {
 	return ""
 }
 
+func isHarmonyModelHint(modelHint string) bool {
+	hint := strings.ToLower(strings.TrimSpace(modelHint))
+	return strings.Contains(hint, "gpt-oss") || strings.Contains(hint, "gpt_oss")
+}
+
 func splitReasoningResponse(req domain.ChatCompletionRequest, modelHint, text string) (string, string) {
+	if isHarmonyModelHint(modelHint) {
+		delta, err := harmony.Split(text)
+		if err != nil {
+			return "", ""
+		}
+		return delta.Content, delta.Reasoning
+	}
 	if isLFM2ModelHint(modelHint) {
 		return sanitizeLFM2Response(text), ""
 	}
@@ -279,11 +292,14 @@ func (h *Handler) reasoningModelHint(req domain.ChatCompletionRequest) string {
 		current = h.modelService.GetCurrentModel()
 		modelID, _, root := h.modelService.GetModelIdentity()
 		current = apiFirstNonEmpty(current, root, modelID)
-		if isGemma4ModelHint(root) || isQwenModelHint(root) || isLFM2ModelHint(root) {
+		if isGemma4ModelHint(root) || isQwenModelHint(root) || isLFM2ModelHint(root) || isHarmonyModelHint(root) {
 			current = root
-		} else if isGemma4ModelHint(modelID) || isQwenModelHint(modelID) || isLFM2ModelHint(modelID) {
+		} else if isGemma4ModelHint(modelID) || isQwenModelHint(modelID) || isLFM2ModelHint(modelID) || isHarmonyModelHint(modelID) {
 			current = modelID
 		}
+	}
+	if isHarmonyModelHint(current) && !isHarmonyModelHint(req.Model) {
+		return current
 	}
 	if isGemma4ModelHint(current) && !isGemma4ModelHint(req.Model) {
 		return current
