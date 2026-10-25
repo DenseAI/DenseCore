@@ -437,6 +437,10 @@ static std::vector<float> ExecuteTransformerGraphForTestImpl(TransformerModel* m
         return {};
     }
 
+    struct RestoreWorkContext {
+        InferenceWorkContext* previous = GetCurrentWorkContext();
+        ~RestoreWorkContext() { SetCurrentWorkContext(previous); }
+    } restore;
     SetCurrentWorkContext(work_ctx.get());
     ResetInferenceWorkContext(work_ctx.get());
     SetCurrentExecutionPhase(static_cast<int>(batch.tokens.size()) > std::max(1, batch.num_seqs)
@@ -449,18 +453,15 @@ static std::vector<float> ExecuteTransformerGraphForTestImpl(TransformerModel* m
         /*.mem_buffer =*/nullptr,
         /*.no_alloc   =*/false,
     };
-    struct ggml_context* ctx = ggml_init(params);
-    if (!ctx) {
-        SetCurrentWorkContext(nullptr);
-        return {};
-    }
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+    if (!ctx) return {};
 
     std::vector<float> logits;
-    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 32768, false);
-    struct ggml_tensor* output = BuildTransformerGraph(model, cache, ctx, batch, embedding_mode, gf, nullptr, nullptr);
+    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx.get(), 32768, false);
+    struct ggml_tensor* output = BuildTransformerGraph(model, cache, ctx.get(), batch, embedding_mode, gf, nullptr, nullptr);
     if (output) {
         // Match production: the builder must register its output in the graph.
-        ggml_graph_compute_with_ctx(ctx, gf, std::max(1, num_threads));
+        ggml_graph_compute_with_ctx(ctx.get(), gf, std::max(1, num_threads));
         if (output->data && output->type == GGML_TYPE_F32) {
             const int rows = static_cast<int>(output->ne[0]);
             const int cols = std::max(1, static_cast<int>(output->ne[1]));
@@ -474,9 +475,7 @@ static std::vector<float> ExecuteTransformerGraphForTestImpl(TransformerModel* m
         }
     }
 
-    ggml_free(ctx);
     ResetInferenceWorkContext(work_ctx.get());
-    SetCurrentWorkContext(nullptr);
     return logits;
 }
 std::vector<float> ExecuteTransformerGraphForTest(TransformerModel* model, PagedKVCache* cache, const BatchSpec& batch,

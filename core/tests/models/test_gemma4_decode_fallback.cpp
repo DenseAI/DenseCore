@@ -1460,9 +1460,20 @@ TEST(Gemma4FallbackDecodeTest, NonSharedAttentionStillRequiresAllProjections) {
     auto model = MakeBaseGemma4GraphModel(2);
     model->layers[1].Set(model_keys::kAttnKWeight, nullptr);
     model->layers[1].Set(model_keys::kAttnVWeight, nullptr);
+    std::unique_ptr<InferenceWorkContext, decltype(&DestroyInferenceWorkContext)> caller_work(
+        CreateInferenceWorkContext(), DestroyInferenceWorkContext);
+    ASSERT_NE(caller_work, nullptr);
+    struct RestoreWorkContext {
+        InferenceWorkContext* previous = GetCurrentWorkContext();
+        ~RestoreWorkContext() { SetCurrentWorkContext(previous); }
+    } restore;
+    SetCurrentWorkContext(caller_work.get());
     EXPECT_THROW(densecore::testing::ExecuteTransformerGraphForTest(
                      model.get(), nullptr, MakeSingleSequencePrefillBatch({1, 0, 1}), 1),
                  densecore::InvalidArgumentException);
+    // The helper owns its temporary context even when graph construction throws;
+    // the caller's TLS binding must remain valid after the original exception.
+    EXPECT_EQ(GetCurrentWorkContext(), caller_work.get());
 }
 
 TEST(Gemma4FallbackDecodeTest, SharedKvSourceValidatesE4BIndexTypeAndHeadShape) {
