@@ -862,5 +862,58 @@ TEST(SchedulerArchitecture, InitialCohortFillDoesNotDelayDecodeForChunkedPrompts
         EXPECT_EQ(next.decode_seq_ids, std::vector<int>({a}));
     }
 }
+
+TEST(SchedulerArchitecture, PrefixAdmissionRetainsExactValidatedSnapshotUntilWorkerCommit) {
+    BlockManager manager(64, BLOCK_SIZE);
+    Scheduler scheduler(&manager, MakeTestConfig());
+    std::vector<int> prompt(BLOCK_SIZE + 1);
+    for (size_t i = 0; i < prompt.size(); ++i) prompt[i] = 10 + static_cast<int>(i);
+    const int block = manager.AllocateSingle();
+    ASSERT_GE(block, 0);
+    std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot(1);
+    snapshot[0].conv_state = {3.0f};
+    snapshot[0].ssm_state = {7.0f};
+    const auto hash = BlockManager::ComputeTokenHash(prompt.data(), BLOCK_SIZE);
+    manager.RegisterPrefixBlockWithTokens(block, hash, prompt.data(), BLOCK_SIZE, &snapshot);
+    const int seq = scheduler.AddRequest(1, prompt.size(), 8, 0, &prompt, true, true, -1,
+                                         [](const auto& states) { return states.size() == 1; });
+    ASSERT_GE(seq, 0);
+    EXPECT_EQ(manager.GetRefCount(block), 2);
+    manager.FreeSingle(block);
+    // Eviction/unregistration must not invalidate the admission capture.
+    snapshot[0].ssm_state = {99.0f};
+    manager.RegisterPrefixBlockWithTokens(block, hash, prompt.data(), BLOCK_SIZE, &snapshot);
+    manager.UnregisterPrefixBlock(block);
+    auto output = scheduler.Schedule();
+    ASSERT_EQ(output.prefix_cache_hits.size(), 1u);
+    auto lease = scheduler.TakePrefixLease(seq);
+    ASSERT_NE(lease, nullptr);
+    ASSERT_NE(lease->snapshot, nullptr);
+    EXPECT_EQ(lease->snapshot->at(0).ssm_state, std::vector<float>{7.0f});
+    EXPECT_EQ(manager.GetRefCount(block), 1);
+    // Failed restore/cancellation before worker commit releases the pinned refs.
+    lease.reset();
+    EXPECT_EQ(manager.GetRefCount(block), 0);
+    for (const auto& allocation : output.new_block_allocations) manager.Free(allocation.second);
+    scheduler.RemoveRequest(seq, false);
+}
+
+TEST(SchedulerArchitecture, CancelWaitingPrefixAdmissionReleasesItsReferences) {
+    BlockManager manager(64, BLOCK_SIZE);
+    Scheduler scheduler(&manager, MakeTestConfig());
+    std::vector<int> prompt(BLOCK_SIZE + 1, 51);
+    const int block = manager.AllocateSingle();
+    ASSERT_GE(block, 0);
+    manager.RegisterPrefixBlockWithTokens(block, BlockManager::ComputeTokenHash(prompt.data(), BLOCK_SIZE),
+                                          prompt.data(), BLOCK_SIZE);
+    const int seq = scheduler.AddRequest(1, prompt.size(), 8, 0, &prompt, true, false);
+    ASSERT_GE(seq, 0);
+    EXPECT_EQ(manager.GetRefCount(block), 2);
+    scheduler.RemoveRequest(seq, false);
+    EXPECT_EQ(manager.GetRefCount(block), 1);
+    EXPECT_EQ(scheduler.TakePrefixLease(seq), nullptr);
+    manager.FreeSingle(block);
+}
+
 }  // namespace
 }  // namespace densecore

@@ -58,6 +58,22 @@ enum class SchedulerUnschedulableReason {
  * Sequence group - represents one request that may have multiple sequences
  * (e.g., beam search, parallel sampling)
  */
+// Shared copies in scheduler sorting/output retain one acquired KV reference.
+// Before worker commit this lease owns the refs; after commit Request owns them.
+struct PrefixCacheLease {
+    BlockManager* manager;
+    std::vector<int> blocks;
+    std::shared_ptr<const std::vector<TransformerModel::SSMSequenceRuntimeState>> snapshot;
+    bool transferred = false;
+
+    PrefixCacheLease(BlockManager* owner, const BlockManager::PrefixCacheMatch& match,
+                     std::shared_ptr<const std::vector<TransformerModel::SSMSequenceRuntimeState>> captured)
+        : manager(owner), blocks(match.cached_block_ids), snapshot(std::move(captured)) {}
+    ~PrefixCacheLease() { if (!transferred && manager) manager->Free(blocks); }
+    PrefixCacheLease(const PrefixCacheLease&) = delete;
+    PrefixCacheLease& operator=(const PrefixCacheLease&) = delete;
+};
+
 struct SequenceGroup {
     int request_id;
     std::vector<int> sequence_ids;
@@ -277,7 +293,12 @@ public:
 
     Stats GetStats() const;
 
+    // Transfer the admission lease to the worker. The worker either commits it
+    // into its request block table or lets the lease release all acquired refs.
+    std::shared_ptr<PrefixCacheLease> TakePrefixLease(int seq_id);
+
 private:
+    std::unordered_map<int, std::shared_ptr<PrefixCacheLease>> prefix_leases_;
     float GetMemoryUsage() const;
 
     void PreemptSequences(SchedulerOutput& output);

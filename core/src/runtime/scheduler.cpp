@@ -56,28 +56,52 @@ int Scheduler::AddRequest(int request_id, int prompt_len, int max_output_len, in
     // Prefix reuse always leaves at least one token to execute so prompt-end
     // logits are still computed by the normal prefill path.
     if (prefix_tokens && !prefix_tokens->empty()) {
-        auto match = block_manager_->FindLongestCachedPrefixWithVerification(
-            prefix_tokens->data(), prompt_len, require_hybrid_ssm_prefix_snapshot, hybrid_ssm_snapshot_validator);
+        std::shared_ptr<const std::vector<TransformerModel::SSMSequenceRuntimeState>> snapshot;
+        auto match = block_manager_->FindLongestCachedPrefixWithSnapshot(
+            prefix_tokens->data(), prompt_len, require_hybrid_ssm_prefix_snapshot, hybrid_ssm_snapshot_validator,
+            &snapshot);
         if (match.cached_tokens > 0 && !match.cached_block_ids.empty()) {
+            std::shared_ptr<PrefixCacheLease> lease;
+            try {
+                lease = std::make_shared<PrefixCacheLease>(block_manager_, match, std::move(snapshot));
+            } catch (...) {
+                block_manager_->Free(match.cached_block_ids);
+                throw;
+            }
+            prefix_leases_[group.sequence_ids[0]] = std::move(lease);
             group.shared_prefix_len = match.cached_tokens;
             group.shared_block_ids = std::move(match.cached_block_ids);
             group.num_tokens_to_process = std::max(0, prompt_len - group.shared_prefix_len);
         }
     }
 
-    waiting_queue_.push_back(group);
-    seq_status_[group.sequence_ids[0]] = SequenceStatus::WAITING;
+    try {
+        waiting_queue_.push_back(group);
+        seq_status_[group.sequence_ids[0]] = SequenceStatus::WAITING;
 
-    // Track for smart preemption
-    int seq_id = group.sequence_ids[0];
-    seq_priority_[seq_id] = priority;
-    seq_arrival_[seq_id] = group.arrival_time;
-    seq_generated_tokens_[seq_id] = 0;
-    seq_context_len_[seq_id] = group.shared_prefix_len;
-    seq_prompt_len_[seq_id] = prompt_len;
-    seq_allow_chunked_prefill_[seq_id] = allow_chunked_prefill;
+        // Track for smart preemption
+        int seq_id = group.sequence_ids[0];
+        seq_priority_[seq_id] = priority;
+        seq_arrival_[seq_id] = group.arrival_time;
+        seq_generated_tokens_[seq_id] = 0;
+        seq_context_len_[seq_id] = group.shared_prefix_len;
+        seq_prompt_len_[seq_id] = prompt_len;
+        seq_allow_chunked_prefill_[seq_id] = allow_chunked_prefill;
 
-    return seq_id;
+        return seq_id;
+    } catch (...) {
+        CleanupSequenceState(group.sequence_ids[0], true, false);
+        throw;
+    }
+}
+
+std::shared_ptr<PrefixCacheLease> Scheduler::TakePrefixLease(int seq_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = prefix_leases_.find(seq_id);
+    if (it == prefix_leases_.end()) return {};
+    auto lease = std::move(it->second);
+    prefix_leases_.erase(it);
+    return lease;
 }
 
 void Scheduler::RemoveRequest(int seq_id, bool finished) {
@@ -95,10 +119,19 @@ void Scheduler::CleanupSequenceState(int seq_id, bool erase_from_waiting_queue, 
     // Free resources
     FreeSequence(seq_id);
 
+    // Waiting groups retain prefix references in their leases. Only blocks
+    // already handed to a worker (or fresh allocations) use the legacy path.
+    auto lease_it = prefix_leases_.find(seq_id);
+    const auto pending_lease = lease_it != prefix_leases_.end() ? lease_it->second : nullptr;
     if (free_block_manager_blocks) {
         auto seq_blocks_it = seq_block_ids_.find(seq_id);
         if (seq_blocks_it != seq_block_ids_.end() && !seq_blocks_it->second.empty()) {
-            block_manager_->Free(seq_blocks_it->second);
+            for (int block : seq_blocks_it->second) {
+                if (!pending_lease || pending_lease->transferred ||
+                    std::find(pending_lease->blocks.begin(), pending_lease->blocks.end(), block) == pending_lease->blocks.end()) {
+                    block_manager_->FreeSingle(block);
+                }
+            }
         }
     }
 
@@ -124,6 +157,7 @@ void Scheduler::CleanupSequenceState(int seq_id, bool erase_from_waiting_queue, 
     seq_allow_chunked_prefill_.erase(seq_id);
     seq_predicted_experts_.erase(seq_id);
     seq_block_ids_.erase(seq_id);
+    prefix_leases_.erase(seq_id);
 }
 
 bool Scheduler::HasRequests() const {

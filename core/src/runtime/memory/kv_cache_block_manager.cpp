@@ -364,7 +364,16 @@ int BlockManager::FindCachedBlockWithVerification(uint64_t hash, const int* toke
 BlockManager::PrefixCacheMatch
 BlockManager::FindLongestCachedPrefixWithVerification(const int* tokens, int n_tokens, bool require_hybrid_ssm_snapshot,
                                                       const HybridSSMSnapshotValidator& hybrid_ssm_snapshot_validator) {
+    return FindLongestCachedPrefixWithSnapshot(tokens, n_tokens, require_hybrid_ssm_snapshot,
+                                               hybrid_ssm_snapshot_validator, nullptr);
+}
+
+BlockManager::PrefixCacheMatch BlockManager::FindLongestCachedPrefixWithSnapshot(
+    const int* tokens, int n_tokens, bool require_hybrid_ssm_snapshot,
+    const HybridSSMSnapshotValidator& hybrid_ssm_snapshot_validator,
+    std::shared_ptr<const std::vector<TransformerModel::SSMSequenceRuntimeState>>* out_snapshot) {
     PrefixCacheMatch match;
+    if (out_snapshot) out_snapshot->reset();
     if (!tokens || n_tokens <= BLOCK_SIZE) {
         return match;
     }
@@ -378,38 +387,46 @@ BlockManager::FindLongestCachedPrefixWithVerification(const int* tokens, int n_t
     acquired_blocks.reserve(max_reusable_tokens / BLOCK_SIZE);
     int terminal_snapshot_block_count = require_hybrid_ssm_snapshot ? 0 : -1;
 
-    for (int offset = 0; offset < max_reusable_tokens; offset += BLOCK_SIZE) {
-        // KV and recurrent state at block N depend on every token before N.
-        // Key by the cumulative prefix while retaining local block tokens for
-        // collision verification; a local-block-only key can splice state from
-        // an identical block reached through a different left context.
-        const uint64_t hash = ComputeTokenHash(tokens, offset + BLOCK_SIZE);
-        const int block_id = FindCachedBlockWithVerification(hash, tokens + offset, BLOCK_SIZE);
-        if (block_id < 0) {
-            break;
-        }
+    try {
+        for (int offset = 0; offset < max_reusable_tokens; offset += BLOCK_SIZE) {
+            // KV and recurrent state at block N depend on every token before N.
+            // Key by the cumulative prefix while retaining local block tokens for
+            // collision verification; a local-block-only key can splice state from
+            // an identical block reached through a different left context.
+            const uint64_t hash = ComputeTokenHash(tokens, offset + BLOCK_SIZE);
+            const int block_id = FindCachedBlockWithVerification(hash, tokens + offset, BLOCK_SIZE);
+            if (block_id < 0) {
+                break;
+            }
 
-        acquired_blocks.push_back(block_id);
-        if (require_hybrid_ssm_snapshot) {
-            std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot;
-            if (LoadHybridSSMSnapshotForBlock(block_id, &snapshot) &&
-                (!hybrid_ssm_snapshot_validator || hybrid_ssm_snapshot_validator(snapshot))) {
-                terminal_snapshot_block_count = static_cast<int>(acquired_blocks.size());
+            acquired_blocks.push_back(block_id);
+            if (require_hybrid_ssm_snapshot) {
+                std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot;
+                if (LoadHybridSSMSnapshotForBlock(block_id, &snapshot) &&
+                    (!hybrid_ssm_snapshot_validator || hybrid_ssm_snapshot_validator(snapshot))) {
+                    if (out_snapshot) {
+                        *out_snapshot =
+                            std::make_shared<const std::vector<TransformerModel::SSMSequenceRuntimeState>>(std::move(snapshot));
+                    }
+                    terminal_snapshot_block_count = static_cast<int>(acquired_blocks.size());
+                }
             }
         }
-    }
 
-    if (require_hybrid_ssm_snapshot) {
-        if (terminal_snapshot_block_count <= 0) {
-            Free(acquired_blocks);
-            acquired_blocks.clear();
-        } else if (terminal_snapshot_block_count < static_cast<int>(acquired_blocks.size())) {
-            std::vector<int> dropped(acquired_blocks.begin() + terminal_snapshot_block_count, acquired_blocks.end());
-            Free(dropped);
-            acquired_blocks.resize(static_cast<size_t>(terminal_snapshot_block_count));
+        if (require_hybrid_ssm_snapshot) {
+            if (terminal_snapshot_block_count <= 0) {
+                Free(acquired_blocks);
+                acquired_blocks.clear();
+            } else if (terminal_snapshot_block_count < static_cast<int>(acquired_blocks.size())) {
+                std::vector<int> dropped(acquired_blocks.begin() + terminal_snapshot_block_count, acquired_blocks.end());
+                Free(dropped);
+                acquired_blocks.resize(static_cast<size_t>(terminal_snapshot_block_count));
+            }
         }
+    } catch (...) {
+        Free(acquired_blocks);
+        throw;
     }
-
     match.cached_block_ids = std::move(acquired_blocks);
     match.cached_tokens = static_cast<int>(match.cached_block_ids.size()) * BLOCK_SIZE;
     return match;

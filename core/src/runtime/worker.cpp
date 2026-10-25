@@ -1603,67 +1603,52 @@ void EngineLoop(EngineState* state) {
                     auto req_it = seq_to_request.find(hit.seq_id);
                     if (req_it != seq_to_request.end()) {
                         Request* req = req_it->second;
+                        const bool requires_snapshot = ModelRequiresPrefixStateSnapshot(current_model);
+                        auto lease = state->scheduler->TakePrefixLease(hit.seq_id);
+                        bool restore_ok = hit.cached_tokens > 0 && hit.cached_tokens % BLOCK_SIZE == 0 &&
+                                          hit.cached_tokens < static_cast<int>(req->tokens.size()) && lease &&
+                                          lease->blocks == hit.cached_block_ids && !lease->transferred;
+                        if (requires_snapshot) {
+                            req->hybrid_ssm_snapshot_restore_attempted = true;
+                            determinism_hybrid_restore_attempt_reqs.insert(req->id);
+                            restore_ok = restore_ok && IsHybridSSMSnapshotRestoreAllowedForModel(current_model) &&
+                                         lease->snapshot && !req->ssm_runtime_states.empty();
+                            const auto validator = BuildHybridSSMSnapshotValidatorForRequest(current_model, req);
+                            restore_ok = restore_ok && validator && validator(*lease->snapshot);
+                        }
+                        if (!restore_ok) {
+                            // Admission has already sized this request assuming a
+                            // hit. Fail explicitly; never execute a truncated prompt.
+                            finalize_generation_error(req, DecodeFinishCause::GraphBuildFailed,
+                                                      "Error: admitted prefix snapshot could not be restored",
+                                                      global_direct_callback);
+                            free_request_blocks(req);
+                            remove_request_from_scheduler(req, false);
+                            continue;
+                        }
+                        req->block_table.reserve(req->block_table.size() + hit.cached_block_ids.size());
+                        if (requires_snapshot) {
+                            req->ssm_runtime_states = *lease->snapshot;
+                            req->hybrid_ssm_snapshot_restore_applied = true;
+                            determinism_hybrid_restore_applied_reqs.insert(req->id);
+                            DebugLogHybridSSMSnapshot("restore_after", req->id, hit.cached_tokens,
+                                                      hit.cached_block_ids.back(), req->ssm_runtime_states);
+                        }
+                        // Commit prompt/KV/counters only after restoration. Reserve
+                        // above makes the ownership transfer non-allocating.
+                        req->block_table.insert(req->block_table.begin(), hit.cached_block_ids.begin(),
+                                                hit.cached_block_ids.end());
+                        lease->transferred = true;
+                        req->tokens.erase(req->tokens.begin(), req->tokens.begin() + hit.cached_tokens);
+                        req->n_past += hit.cached_tokens;
+                        req->registered_prefix_blocks =
+                            std::max(req->registered_prefix_blocks, hit.cached_tokens / BLOCK_SIZE);
                         req->prefix_cache_allowed = prefix_cache_allowed;
                         req->prefix_cache_hit = true;
                         req->prefix_cache_skipped_tokens += hit.cached_tokens;
                         req->prefix_cache_hit_blocks += static_cast<int>(hit.cached_block_ids.size());
                         req->prefix_cache_skip_reason = "none";
                         determinism_prefix_hit_reqs.insert(req->id);
-                        // Append shared blocks from prefix cache
-                        req->block_table.insert(req->block_table.end(), hit.cached_block_ids.begin(),
-                                                hit.cached_block_ids.end());
-
-                        // Advance n_past and adjust tokens to process
-                        req->n_past += hit.cached_tokens;
-                        if (hit.cached_tokens > 0 && hit.cached_tokens <= (int)req->tokens.size()) {
-                            req->tokens.erase(req->tokens.begin(), req->tokens.begin() + hit.cached_tokens);
-                        }
-                        req->registered_prefix_blocks =
-                            std::max(req->registered_prefix_blocks, hit.cached_tokens / BLOCK_SIZE);
-
-                        if (ModelRequiresPrefixStateSnapshot(current_model) && !hit.cached_block_ids.empty() &&
-                            !req->ssm_runtime_states.empty()) {
-                            std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot;
-                            const int snapshot_block = hit.cached_block_ids.back();
-                            const auto snapshot_validator =
-                                BuildHybridSSMSnapshotValidatorForRequest(current_model, req);
-                            auto snapshot_shape_ok =
-                                [&](const std::vector<TransformerModel::SSMSequenceRuntimeState>& states) {
-                                    if (hit.cached_tokens <= 0 || hit.cached_tokens % BLOCK_SIZE != 0) {
-                                        return false;
-                                    }
-                                    if (hit.cached_block_ids.empty() || snapshot_block != hit.cached_block_ids.back()) {
-                                        return false;
-                                    }
-                                    return snapshot_validator && snapshot_validator(states);
-                                };
-                            determinism_hybrid_restore_attempt_reqs.insert(req->id);
-                            req->hybrid_ssm_snapshot_restore_attempted = true;
-                            if (!IsHybridSSMSnapshotRestoreAllowedForModel(current_model)) {
-                                if (IsHybridSSMSnapshotDebugEnabled()) {
-                                    std::cerr << "[HybridSSMSnapshot] restore_disabled req=" << req->id
-                                              << " cached_tokens=" << hit.cached_tokens
-                                              << " block_id=" << snapshot_block << std::endl;
-                                }
-                            } else if (current_kv_cache->block_manager->LoadHybridSSMSnapshotForBlock(snapshot_block,
-                                                                                                      &snapshot) &&
-                                       snapshot_shape_ok(snapshot)) {
-                                DebugLogHybridSSMSnapshot("restore_before", req->id, hit.cached_tokens, snapshot_block,
-                                                          snapshot);
-                                req->ssm_runtime_states = std::move(snapshot);
-                                determinism_hybrid_restore_applied_reqs.insert(req->id);
-                                req->hybrid_ssm_snapshot_restore_applied = true;
-                                DebugLogHybridSSMSnapshot("restore_after", req->id, hit.cached_tokens, snapshot_block,
-                                                          req->ssm_runtime_states);
-                            } else if (!snapshot.empty()) {
-                                LOG_WARN("Discarding hybrid SSM snapshot for req {}: shape mismatch on block {}",
-                                         req->id, snapshot_block);
-                            } else if (IsHybridSSMSnapshotDebugEnabled()) {
-                                std::cerr << "[HybridSSMSnapshot] restore_miss req=" << req->id
-                                          << " cached_tokens=" << hit.cached_tokens << " block_id=" << snapshot_block
-                                          << std::endl;
-                            }
-                        }
                         LogDeterminismBoundary(
                             "after_prefix_restore", req, current_model, prefix_cache_allowed,
                             /*prefix_cache_hit=*/true,

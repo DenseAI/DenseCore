@@ -205,6 +205,13 @@ struct BlockManager {
     FindLongestCachedPrefixWithVerification(const int* tokens, int n_tokens, bool require_hybrid_ssm_snapshot,
                                             const HybridSSMSnapshotValidator& hybrid_ssm_snapshot_validator = {});
 
+    // Additional admission API: captures the exact validated recurrent state
+    // together with the acquired KV references, preserving PrefixCacheMatch ABI.
+    PrefixCacheMatch FindLongestCachedPrefixWithSnapshot(
+        const int* tokens, int n_tokens, bool require_hybrid_ssm_snapshot,
+        const HybridSSMSnapshotValidator& validator,
+        std::shared_ptr<const std::vector<TransformerModel::SSMSequenceRuntimeState>>* out_snapshot);
+
     // Register a block in prefix cache
     void RegisterPrefixBlock(int block_id, uint64_t hash);
 
