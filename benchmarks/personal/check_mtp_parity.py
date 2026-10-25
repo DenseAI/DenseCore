@@ -474,7 +474,7 @@ def main():
     if args.native_child:
         native_child(args)
         return 0
-    if 1 not in args.concurrency: parser.error('concurrency must include 1 for the isolation baseline')
+    if 1 not in args.concurrency and not args.baseline_summary: parser.error('concurrency must include 1 or provide --baseline-summary for the isolation baseline')
     args.concurrency = sorted(set(args.concurrency))
     try:
         if args.build_lock:

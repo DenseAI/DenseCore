@@ -90,3 +90,16 @@ class BaselineReuseGateTest(unittest.TestCase):
             path.write_text(json.dumps(baseline))
             with self.assertRaisesRegex(ValueError, 'native evidence invalid'):
                 load_c1_baseline(path, provenance, 2048, 8)
+
+class BaselineCommandLineTest(unittest.TestCase):
+    def test_new_cells_with_baseline_reach_parent(self):
+        from unittest.mock import patch
+        import check_mtp_parity as probe
+        argv = ['probe', '--library', 'lib.so', '--model', 'model.gguf', '--out', 'out',
+                '--concurrency', '2', '4', '--baseline-summary', 'baseline.json']
+        with patch('sys.argv', argv), patch.object(probe, 'parent', return_value=0) as run:
+            self.assertEqual(probe.main(), 0)
+            self.assertEqual(run.call_args.args[0].concurrency, [2,4])
+        with patch('sys.argv', argv[:-2]), patch.object(probe, 'parent') as run:
+            with self.assertRaises(SystemExit): probe.main()
+            run.assert_not_called()
