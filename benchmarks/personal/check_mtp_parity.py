@@ -318,8 +318,14 @@ def parent(args):
                 '--child-concurrency', str(concurrency), '--library', str(library), '--model', str(model),
                 '--threads', str(args.threads), '--draft', str(args.draft), '--repeats', str(args.repeats),
                 '--max-tokens', str(args.max_tokens), '--timeout', str(args.timeout), '--out', str(result)]
+            native_environment = dict(environment)
+            if platform.system() == 'Linux':
+                # Match the SDK's startup preload workaround for initial-exec
+                # TLS in DenseCore/libgomp; late ctypes dlopen can exhaust TLS.
+                existing = native_environment.get('LD_PRELOAD', '').split()
+                native_environment['LD_PRELOAD'] = ' '.join(dict.fromkeys([str(library), *existing]))
             with (out / f'native-{mode}-c{concurrency}.log').open('w') as output:
-                execution = subprocess.run(command, env=environment, stdout=output, stderr=subprocess.STDOUT,
+                execution = subprocess.run(command, env=native_environment, stdout=output, stderr=subprocess.STDOUT,
                     timeout=args.timeout * (len(CASES) * args.repeats + 5))
             if execution.returncode or not result.exists():
                 manifest['error'] = f'native {mode}/c{concurrency} failed, see preserved log'
