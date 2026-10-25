@@ -2502,10 +2502,8 @@ struct EngineState {
     }
 
     ~EngineState() {
-        // Ensure shutdown is called if not already stopped
-        if (status != EngineStatus::STOPPED) {
-            Shutdown();
-        }
+        // STOPPED may mean the worker failed; its threads/models still need cleanup.
+        Shutdown();
     }
 };
 
