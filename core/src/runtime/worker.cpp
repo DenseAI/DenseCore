@@ -47,6 +47,9 @@
 #include "llm/graph/cache.h"
 #include "llm/sampling/sampling_rng.h"
 #include "llm/speculative/reference_session.h"
+#ifdef DENSECORE_TEST_BUILD
+#include "llm/matmul/work_state.h"
+#endif
 #include "llm/graph/build_internal.h"
 #include "runtime/engine_internal.h"
 #include "runtime/runtime_env.h"
