@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <string>
@@ -15,7 +17,12 @@
 #include "densecore/memory/kv_cache.h"
 #include "runtime/runtime_env.h"
 #include "runtime/worker_internal.h"
+#include "runtime/inference_types_internal.h"
 #include "llm/graph/cache.h"
+
+void cb_kv_update_and_gather_custom(ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_kv_update_and_gather(ggml_tensor* dst, const ggml_tensor* src, int ith, int nth, void* userdata);
+void cb_paged_attention_decode(ggml_tensor* dst, int ith, int nth, void* userdata);
 
 namespace densecore::testing {
 extern bool ShouldUsePagedDecodeAttentionForBatchTest(const TransformerModel* model, const PagedKVCache* cache,
@@ -1017,3 +1024,161 @@ TEST(GraphCacheOwnershipTest, MeasuredNoAllocArenaAllocatesComputesAndReusesBack
     }
     ggml_backend_free(backend);
 }
+
+namespace {
+struct HistoryGraphContext {
+    ggml_context* ctx = ggml_init({4 * 1024 * 1024, nullptr, false});
+    ~HistoryGraphContext() { if (ctx) ggml_free(ctx); }
+};
+
+ggml_tensor* NewFixedHistoryGather(ggml_context* ctx, ggml_tensor* src, int total, void* userdata = nullptr) {
+    ggml_tensor* args[] = {src};
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, 2, 1, total, 1, args, 1,
+                          cb_kv_update_and_gather_custom, 1, userdata);
+}
+
+TEST(GraphCacheHistoryPolicyTest, RejectsFixedHistoryEvenWhenDynamicPagedOpsAreAlsoLive) {
+    HistoryGraphContext owner;
+    ASSERT_NE(owner.ctx, nullptr);
+    auto* source = ggml_new_tensor_3d(owner.ctx, GGML_TYPE_F32, 2, 1, 1);
+    auto* fixed = NewFixedHistoryGather(owner.ctx, source, 3);
+    ggml_tensor* args[] = {source};
+    auto* paged = ggml_custom_4d(owner.ctx, GGML_TYPE_F32, 2, 1, 1, 1, args, 1,
+                                 cb_paged_attention_decode, 1, nullptr);
+    auto* graph = ggml_new_graph_custom(owner.ctx, 64, false);
+    auto* mixed = ggml_add(owner.ctx, fixed, ggml_repeat(owner.ctx, paged, fixed));
+    ggml_build_forward_expand(graph, mixed);
+    EXPECT_TRUE(VerifyCachedDecodeGraphPagedOpOnBuild(graph, 2));
+    EXPECT_STREQ(GraphCacheHistoryRejectionReason(graph, false, 0, 1), "fixed_history_kv_gather");
+}
+
+TEST(GraphCacheHistoryPolicyTest, PreservesDynamicPagedGraphAndIgnoresDeadGatherTensor) {
+    HistoryGraphContext owner;
+    ASSERT_NE(owner.ctx, nullptr);
+    auto* source = ggml_new_tensor_3d(owner.ctx, GGML_TYPE_F32, 2, 1, 1);
+    NewFixedHistoryGather(owner.ctx, source, 3);  // Allocated metadata, not a live graph dependency.
+    ggml_tensor* args[] = {source};
+    auto* paged = ggml_custom_4d(owner.ctx, GGML_TYPE_F32, 2, 1, 1, 1, args, 1,
+                                 cb_paged_attention_decode, 1, nullptr);
+    auto* graph = ggml_new_graph_custom(owner.ctx, 64, false);
+    ggml_build_forward_expand(graph, paged);
+    EXPECT_EQ(GraphCacheHistoryRejectionReason(graph, false, 0, 1), nullptr);
+}
+
+TEST(GraphCacheHistoryPolicyTest, PrefillReuseKeysAndChecksTheCompleteHistoryShape) {
+    HistoryGraphContext owner;
+    ASSERT_NE(owner.ctx, nullptr);
+    auto* source = ggml_new_tensor_3d(owner.ctx, GGML_TYPE_F32, 2, 1, 1);
+    auto* fixed = NewFixedHistoryGather(owner.ctx, source, 3);
+    auto* graph = ggml_new_graph_custom(owner.ctx, 64, false);
+    ggml_build_forward_expand(graph, fixed);
+    EXPECT_EQ(GraphCacheHistoryRejectionReason(graph, true, 2, 1), nullptr);
+    EXPECT_STREQ(GraphCacheHistoryRejectionReason(graph, true, 4, 1), "fixed_history_shape_mismatch");
+    EXPECT_STREQ(GraphCacheHistoryRejectionReason(graph, true, 2, 2), "fixed_history_shape_mismatch");
+    densecore::llm::graph::PrefillGraphCacheKey initial{}, grown{};
+    initial.tokens = grown.tokens = 1;
+    initial.n_past = 2;
+    grown.n_past = 4;
+    EXPECT_FALSE(initial == grown);
+    EXPECT_NE(densecore::llm::graph::PrefillGraphCacheKeyHash{}(initial),
+              densecore::llm::graph::PrefillGraphCacheKeyHash{}(grown));
+}
+
+TEST(GraphCacheHistoryPolicyTest, RejectsLegacyBorrowedBatchGatherForDecodeAndPrefill) {
+    HistoryGraphContext owner;
+    ASSERT_NE(owner.ctx, nullptr);
+    auto* source = ggml_new_tensor_3d(owner.ctx, GGML_TYPE_F32, 2, 1, 1);
+    auto* legacy = ggml_map_custom1(owner.ctx, source, cb_kv_update_and_gather, 1, nullptr);
+    auto* graph = ggml_new_graph_custom(owner.ctx, 64, false);
+    ggml_build_forward_expand(graph, legacy);
+    EXPECT_STREQ(GraphCacheHistoryRejectionReason(graph, false, 0, 1), "borrowed_history_kv_gather");
+    EXPECT_STREQ(GraphCacheHistoryRejectionReason(graph, true, 0, 1), "borrowed_history_kv_gather");
+}
+
+struct HistoryAttentionGraph {
+    HistoryGraphContext owner;
+    KVCacheUserData key_data{};
+    KVCacheUserData value_data{};
+    ggml_cgraph* graph = nullptr;
+    ggml_tensor* logits = nullptr;
+
+    HistoryAttentionGraph(PagedKVCache* cache, InferenceWorkContext* work, int past) {
+        auto* ctx = owner.ctx;
+        key_data = {cache, 0, 2, true};
+        value_data = {cache, 0, 2, false};
+        key_data.work_ctx = value_data.work_ctx = work;
+        key_data.force_full_history = value_data.force_full_history = true;
+        auto* current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 1, 1);
+        auto* current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 1, 1);
+        std::fill_n(static_cast<float*>(current_k->data), 2, 0.0f);
+        std::fill_n(static_cast<float*>(current_v->data), 2, 0.0f);
+        auto* keys = NewFixedHistoryGather(ctx, current_k, past + 1, &key_data);
+        auto* values = NewFixedHistoryGather(ctx, current_v, past + 1, &value_data);
+        auto* query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 1);
+        static_cast<float*>(query->data)[0] = 1.0f;
+        static_cast<float*>(query->data)[1] = 0.0f;
+        auto* scores = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, keys, 2, past + 1), query);
+        auto* probabilities = ggml_soft_max(ctx, scores);
+        auto* values_transposed = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, values, 2, past + 1)));
+        auto* attention = ggml_mul_mat(ctx, values_transposed, probabilities);
+        auto* projection = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 3);
+        const float weights[] = {1, 0, 0, 1, -1, -1};
+        std::memcpy(projection->data, weights, sizeof(weights));
+        logits = ggml_mul_mat(ctx, projection, attention);
+        graph = ggml_new_graph_custom(ctx, 64, false);
+        ggml_build_forward_expand(graph, logits);
+    }
+
+    std::array<float, 3> Compute() {
+        EXPECT_EQ(ggml_graph_compute_with_ctx(owner.ctx, graph, 1), GGML_STATUS_SUCCESS);
+        std::array<float, 3> result{};
+        std::memcpy(result.data(), logits->data, sizeof(result));
+        return result;
+    }
+};
+
+TEST(GraphCacheHistoryPolicyTest, GrowingPastChangesAttentionLogitsAndMustRebuildFixedGather) {
+    TransformerModel model{};
+    model.hparams.n_embd = model.hparams.n_embd_head_k = model.hparams.n_embd_head_v = 2;
+    model.hparams.n_head = model.hparams.n_head_kv = model.hparams.n_layer = 1;
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(&model, 1, 64, GGML_TYPE_F32, -1));
+    ASSERT_NE(cache, nullptr);
+    const int block = cache->block_manager->AllocateSingle();
+    ASSERT_GE(block, 0);
+    const std::array<float, 10> zeros{};
+    cache->WriteKSlots(block, 0, 0, 5, zeros.data());
+    cache->WriteVSlots(block, 0, 0, 5, zeros.data());
+    struct WorkOwner {
+        InferenceWorkContext* previous = GetCurrentWorkContext();
+        InferenceWorkContext* value = CreateInferenceWorkContext();
+        WorkOwner() { SetCurrentWorkContext(value); }
+        ~WorkOwner() { SetCurrentWorkContext(previous); DestroyInferenceWorkContext(value); }
+    } work;
+    ASSERT_NE(work.value, nullptr);
+    BatchSpec batch;
+    batch.num_seqs = 1;
+    batch.tokens = {1};
+    batch.seq_id = {0};
+    batch.pos = {2};
+    batch.n_past = {2};
+    batch.block_tables = {{block}};
+    SetCurrentBatch(&batch);
+    HistoryAttentionGraph original(cache.get(), work.value, 2);
+    const auto initial = original.Compute();
+    EXPECT_NEAR(initial[0], 0.0f, 1e-6f);
+    const float additional_values[] = {10, 0, 0, 5};
+    cache->WriteVSlots(block, 0, 2, 2, additional_values);
+    batch.pos[0] = batch.n_past[0] = 4;
+    SetCurrentBatch(&batch);
+    const auto stale = original.Compute();  // Reproduces the previously admitted unkeyed decode graph.
+    HistoryAttentionGraph rebuilt(cache.get(), work.value, 4);
+    const auto correct = rebuilt.Compute();
+    EXPECT_NEAR(stale[0], 0.0f, 1e-6f);
+    EXPECT_NEAR(correct[0], 2.0f, 1e-5f);
+    EXPECT_NEAR(correct[1], 1.0f, 1e-5f);
+    EXPECT_NEAR(correct[2], -3.0f, 1e-5f);
+    EXPECT_STREQ(GraphCacheHistoryRejectionReason(original.graph, false, 0, 1), "fixed_history_kv_gather");
+    EXPECT_EQ(GraphCacheHistoryRejectionReason(rebuilt.graph, true, 4, 1), nullptr);
+    cache->block_manager->FreeSingle(block);
+}
+}  // namespace

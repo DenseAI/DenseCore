@@ -45,6 +45,8 @@ bool ShouldRunDecodeGraphCacheRegressionCheck(const TransformerModel* model, boo
                                               int checked_steps);
 uint64_t BuildDecodeGraphFeatureFlags(const TransformerModel* model);
 bool VerifyCachedDecodeGraphPagedOpOnBuild(const struct ggml_cgraph* graph, int batch_size);
+const char* GraphCacheHistoryRejectionReason(const struct ggml_cgraph* graph, bool history_in_key,
+                                             int n_past, int n_tokens);
 void DebugVerifyCachedDecodeGraphReuseState(const struct ggml_cgraph* graph, int batch_size, bool reused_graph,
                                             bool verified_paged_decode_op);
 int DecodeGraphCacheMaxBatch();
@@ -96,6 +98,7 @@ struct DecodeWorkerStats {
     std::atomic<uint64_t> graph_cache_hits{0};
     std::atomic<uint64_t> graph_cache_builds{0};
     std::atomic<uint64_t> graph_cache_rejected_uncacheable{0};
+    std::atomic<uint64_t> graph_cache_history_rejections{0};
     std::atomic<uint64_t> graph_cache_skip_disabled{0};
     std::atomic<uint64_t> graph_cache_skip_layout{0};
     std::atomic<uint64_t> graph_cache_skip_max_batch{0};

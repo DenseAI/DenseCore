@@ -40,6 +40,8 @@
 
 // Defined in inference.cpp (GGML custom paged decode callback).
 void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
+void cb_kv_update_and_gather(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* userdata);
 
 namespace {
 
@@ -431,6 +433,35 @@ bool GraphContainsPagedDecodeCustomOp(const struct ggml_cgraph* graph) {
     return false;
 }
 
+const char* GraphCacheHistoryRejectionReasonImpl(const struct ggml_cgraph* graph, bool history_in_key,
+                                             int n_past, int n_tokens) {
+    if (!graph) return "missing_graph";
+    if (n_tokens <= 0 || (history_in_key && n_past < 0)) return "invalid_history_shape";
+    const int64_t expected_total = static_cast<int64_t>(n_past) + n_tokens;
+    auto* mutable_graph = const_cast<struct ggml_cgraph*>(graph);
+    for (int i = 0; i < ggml_graph_n_nodes(mutable_graph); ++i) {
+        const auto* node = ggml_graph_node(mutable_graph, i);
+        if (!node) continue;
+        if (node->op == GGML_OP_CUSTOM) {
+            ggml_custom_op_t fn = nullptr;
+            std::memcpy(&fn, node->op_params, sizeof(fn));
+            if (fn != cb_kv_update_and_gather_custom) continue;
+            // This callback derives history length from its output tensor shape,
+            // not from the current batch. Decode keys omit n_past; prefill keys
+            // include both n_past and token count and can safely pin this shape.
+            if (!history_in_key) return "fixed_history_kv_gather";
+            if (node->ne[2] != expected_total) return "fixed_history_shape_mismatch";
+        } else if (node->op == GGML_OP_MAP_CUSTOM1) {
+            ggml_custom1_op_t fn = nullptr;
+            std::memcpy(&fn, node->op_params, sizeof(fn));
+            // Legacy userdata also borrows a batch pointer; no runtime rebind
+            // contract exists for it, even when the history shape is keyed.
+            if (fn == cb_kv_update_and_gather) return "borrowed_history_kv_gather";
+        }
+    }
+    return nullptr;
+}
+
 bool CompiledWithArmSveForSummary() {
 #if defined(__ARM_FEATURE_SVE)
     return true;
@@ -532,6 +563,11 @@ size_t LongestTagCarry(const std::string& text, const std::string& open, const s
 }
 
 }  // namespace
+
+const char* GraphCacheHistoryRejectionReason(const struct ggml_cgraph* graph, bool history_in_key,
+                                             int n_past, int n_tokens) {
+    return GraphCacheHistoryRejectionReasonImpl(graph, history_in_key, n_past, n_tokens);
+}
 
 bool IsQwenHybridSSMSingleDecodeCacheCandidate(const TransformerModel* model);
 
@@ -2382,6 +2418,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
         << " graph_cache_hits=" << req->graph_cache_hit_count << " graph_cache_misses=" << req->graph_cache_miss_count
         << " graph_cache_skips=" << req->graph_cache_skip_count << " graph_cache_last_skip_reason="
         << (req->graph_cache_last_skip_reason.empty() ? "none" : req->graph_cache_last_skip_reason.c_str())
+        << " graph_cache_history_rejections_total="
+        << GetDecodeWorkerStats().graph_cache_history_rejections.load(std::memory_order_relaxed)
         << " prefix_cache_allowed=" << (req->prefix_cache_allowed ? 1 : 0)
         << " prefix_cache_hit=" << (req->prefix_cache_hit ? 1 : 0)
         << " prefix_cache_evicted_blocks_total=" << prefix_evictions.kv_blocks

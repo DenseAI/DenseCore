@@ -2915,6 +2915,19 @@ void EngineLoop(EngineState* state) {
                     req->graph_cache_last_skip_reason = safe_reason;
                 }
             };
+            auto note_history_shape_rejection = [&](const char* reason, bool decode) {
+                GetDecodeWorkerStats().graph_cache_history_rejections.fetch_add(1, std::memory_order_relaxed);
+                if (decode) {
+                    note_decode_graph_cache_skip(reason);
+                } else {
+                    for (Request* req : batch_requests) {
+                        if (!req) continue;
+                        req->graph_cache_skip_count++;
+                        req->graph_cache_last_skip_reason = reason;
+                    }
+                }
+                LOG_INFO("Graph cache history rejected: phase={} reason={}", decode ? "decode" : "prefill", reason);
+            };
             if (decode_reuse_shape_eligible && !cpu_backend_active && IsDebugGraphLoggingEnabled()) {
                 std::cerr << "[DecodeGraphCache][DEBUG] skip cache reuse due to backend/device mismatch"
                           << " (device=" << DeviceTypeName(deps.preferred_device)
@@ -3012,6 +3025,15 @@ void EngineLoop(EngineState* state) {
                         .attempts.fetch_add(1, std::memory_order_relaxed);
                 }
                 auto* cached = graph_cache.FindDecode(decode_graph_key);
+                if (cached && cached->graph) {
+                    if (const char* reason = GraphCacheHistoryRejectionReason(
+                            cached->graph, /*history_in_key=*/false, 0, static_cast<int>(batch.tokens.size()))) {
+                        note_history_shape_rejection(reason, true);
+                        graph_cache.EraseDecode(decode_graph_key);
+                        graph_cache.MarkUncacheable(decode_graph_key, decode_graph_uncacheable_limit);
+                        cached = nullptr;
+                    }
+                }
                 if (cached != nullptr && cached->graph && cached->output && cached->embd_inp &&
                     cached->pos && cached->work_ctx) {
                     bool rebind_ok = true;
@@ -3064,6 +3086,14 @@ void EngineLoop(EngineState* state) {
 
             if (!reused_decode_graph && prefill_reuse_candidate) {
                 auto* cached = graph_cache.FindPrefill(prefill_graph_key);
+                if (cached && cached->graph) {
+                    if (const char* reason = GraphCacheHistoryRejectionReason(
+                            cached->graph, /*history_in_key=*/true, prefill_graph_key.n_past, prefill_graph_key.tokens)) {
+                        note_history_shape_rejection(reason, false);
+                        graph_cache.ErasePrefill(prefill_graph_key);
+                        cached = nullptr;
+                    }
+                }
                 if (cached != nullptr && cached->graph && cached->output && cached->embd_inp &&
                     cached->pos && cached->work_ctx) {
                     bool rebind_ok = true;
@@ -3141,12 +3171,20 @@ void EngineLoop(EngineState* state) {
                             graph_build_end = std::chrono::steady_clock::now();
                             if (candidate.output && candidate.embd_inp && candidate.pos) {
                                 bool cache_entry_admissible = true;
+                                const char* history_reason = GraphCacheHistoryRejectionReason(
+                                    candidate.graph, /*history_in_key=*/false, 0,
+                                    static_cast<int>(batch.tokens.size()));
+                                if (history_reason) {
+                                    cache_entry_admissible = false;
+                                    note_history_shape_rejection(history_reason, true);
+                                    decode_cache_insert_skip_recorded = true;
+                                }
                                 const bool requires_paged_decode_verify =
                                     decode_single_token_layout && batch.num_seqs > 1;
                                 candidate.verified_paged_decode_op =
                                     !requires_paged_decode_verify ||
                                     VerifyCachedDecodeGraphPagedOpOnBuild(candidate.graph, batch.num_seqs);
-                                if (requires_paged_decode_verify && !candidate.verified_paged_decode_op) {
+                                if (history_reason || (requires_paged_decode_verify && !candidate.verified_paged_decode_op)) {
                                     cache_entry_admissible = false;
                                     const bool inserted_uncacheable =
                                         graph_cache.MarkUncacheable(decode_graph_key, decode_graph_uncacheable_limit);
@@ -3163,8 +3201,9 @@ void EngineLoop(EngineState* state) {
 
                                         if (IsDebugGraphLoggingEnabled()) {
                                             std::cerr
-                                                << "[DecodeGraphCache] key marked uncacheable (missing paged op), "
-                                                   "skipping future cache attempts."
+                                                << "[DecodeGraphCache] key marked uncacheable: reason="
+                                                << (history_reason ? history_reason : "missing_paged_op")
+                                                << ", skipping future cache attempts."
                                                 << " (bs=" << decode_graph_key.batch_size
                                                 << ", threads=" << decode_graph_key.threads << ")" << std::endl;
                                         }
@@ -3289,7 +3328,13 @@ void EngineLoop(EngineState* state) {
                             graph_build_end = std::chrono::steady_clock::now();
                             if (candidate.output && candidate.embd_inp && candidate.pos) {
                                 bool cache_entry_admissible = true;
-                                if (current_model && current_model->arch_flags.is_hybrid_ssm) {
+                                if (const char* reason = GraphCacheHistoryRejectionReason(
+                                        candidate.graph, /*history_in_key=*/true, prefill_graph_key.n_past,
+                                        prefill_graph_key.tokens)) {
+                                    cache_entry_admissible = false;
+                                    note_history_shape_rejection(reason, false);
+                                }
+                                if (cache_entry_admissible && current_model && current_model->arch_flags.is_hybrid_ssm) {
                                     ResetCachedPrefillGraphWorkContext(candidate.work_ctx.get());
                                     SetCurrentWorkContext(candidate.work_ctx.get());
                                     SetCurrentExecutionPhase(InferenceExecutionPhase::Prefill);
