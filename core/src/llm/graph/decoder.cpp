@@ -2338,6 +2338,10 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             if (!native_moe_backend) {
                 native_moe_backend = &densecore::llm::runtime::ResolveCpuBackend(GetCurrentBatch());
             }
+            // A request-owned NextN head dispatches directly from its stacked
+            // packed tensors. It must not register transient layer addresses,
+            // start rebalance, or inherit trunk NUMA/sticky placement state.
+            if (model->IsValidatedQwenNextNMoEGraph()) native_moe_backend = nullptr;
             if (native_moe_backend && model->arch != ModelArch::GPT_OSS) {
                 const densecore::CpuBackend::ExpertWeights* registered_experts = nullptr;
                 int registered_count = 0;

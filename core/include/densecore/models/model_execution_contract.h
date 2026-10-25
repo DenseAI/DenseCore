@@ -48,6 +48,7 @@ enum class ExecutionFastPathClass : uint8_t {
     QwenHybridSSMMoE,
     Gemma4MoE,
     LFM2ShortConvMoE,
+    QwenNextNMoE, // validated internal full-attention head, no synthetic SSM
 };
 
 enum class ExecutionQuantLayoutKind : uint8_t {

@@ -302,6 +302,12 @@ ExecutionFastPathClass ResolveFastPathClass(const TransformerModel* model, const
     if (!model) {
         return ExecutionFastPathClass::None;
     }
+    if (model->IsValidatedQwenNextNMoEGraph() && contract.has_moe &&
+        !contract.has_hybrid_ssm_mixer && model->layers.size() == 1 &&
+        model->arch == ModelArch::QWEN35 &&
+        (model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36)) {
+        return ExecutionFastPathClass::QwenNextNMoE;
+    }
     if (IsQwenHybridSSMContract(contract)) {
         return contract.has_moe ? ExecutionFastPathClass::QwenHybridSSMMoE : ExecutionFastPathClass::QwenHybridSSMDense;
     }
@@ -430,7 +436,8 @@ ModelExecutionContract BuildModelExecutionContract(const TransformerModel* model
     contract.fast_path_class = ResolveFastPathClass(model, contract);
     contract.requires_fallback_free_fast_path = contract.fast_path_class != ExecutionFastPathClass::None;
     contract.requires_native_moe_fast_path = contract.fast_path_class == ExecutionFastPathClass::QwenHybridSSMMoE ||
-                                             contract.fast_path_class == ExecutionFastPathClass::LFM2ShortConvMoE;
+                                             contract.fast_path_class == ExecutionFastPathClass::LFM2ShortConvMoE ||
+                                             contract.fast_path_class == ExecutionFastPathClass::QwenNextNMoE;
     if (contract.requires_fallback_free_fast_path) {
         AddRequiredFastPathCounter(&contract, ExecutionFastPathCounterKind::TargetNoGgmlPath);
     }
@@ -694,6 +701,7 @@ const char* ExecutionFastPathClassName(ExecutionFastPathClass kind) {
     case ExecutionFastPathClass::QwenHybridSSMMoE: return "qwen_hybrid_ssm_moe";
     case ExecutionFastPathClass::Gemma4MoE: return "gemma4_moe";
     case ExecutionFastPathClass::LFM2ShortConvMoE: return "lfm2_shortconv_moe";
+    case ExecutionFastPathClass::QwenNextNMoE: return "qwen_nextn_moe";
     }
     return "unknown";
 }

@@ -23,6 +23,8 @@ namespace densecore::runtime {
 enum class DenseCoreTensorRole : int;
 }
 
+namespace densecore::llm::speculative { class NextNGraph; }
+
 // ============================================================================
 // Model Architecture Enum
 // ============================================================================
@@ -799,6 +801,13 @@ struct TransformerModel {
     float gpt_oss_yarn_beta_slow = 1.0f;
 
     ~TransformerModel();
+
+    bool IsValidatedQwenNextNMoEGraph() const { return validated_qwen_nextn_moe_graph_; }
+private:
+    // Runtime-only graph profile. No GGUF/filename or public C option can set
+    // this marker; NextNGraph sets it only after checking all head tensors.
+    friend class densecore::llm::speculative::NextNGraph;
+    bool validated_qwen_nextn_moe_graph_ = false;
 };
 
 #endif  // DENSECORE_MODEL_TYPES_H
