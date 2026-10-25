@@ -32,6 +32,48 @@
 
 namespace {
 
+TEST(EngineInitOptions, RejectsUnsupportedExplicitMtpBeforeLoading) {
+    DenseCoreInitOptions options{sizeof(DenseCoreInitOptions), DENSECORE_INIT_OPTIONS_VERSION,
+                                DENSECORE_SPEC_MTP, 2};
+    EXPECT_EQ(InitEngineWithOptions("missing.gguf", nullptr, 1, -1, 0, -1, &options), nullptr);
+    EXPECT_NE(std::string(DenseCoreGetLastError()).find("explicit mtp"), std::string::npos);
+}
+
+TEST(EngineInitOptions, RejectsMalformedOptionsAndKvTypeBeforeLoading) {
+    DenseCoreInitOptions options{sizeof(DenseCoreInitOptions), DENSECORE_INIT_OPTIONS_VERSION,
+                                DENSECORE_SPEC_AUTO, 2};
+    options.struct_size = sizeof(uint32_t);
+    EXPECT_EQ(InitEngineWithOptions("missing.gguf", nullptr, 1, -1, 0, -1, &options), nullptr);
+    EXPECT_NE(std::string(DenseCoreGetLastError()).find("truncated"), std::string::npos);
+    options.struct_size = sizeof(DenseCoreInitOptions);
+    options.version = 999;
+    EXPECT_EQ(InitEngineWithOptions("missing.gguf", nullptr, 1, -1, 0, -1, &options), nullptr);
+    EXPECT_NE(std::string(DenseCoreGetLastError()).find("version"), std::string::npos);
+    options.version = DENSECORE_INIT_OPTIONS_VERSION;
+    options.spec_type = 99;
+    EXPECT_EQ(InitEngineWithOptions("missing.gguf", nullptr, 1, -1, 0, -1, &options), nullptr);
+    EXPECT_NE(std::string(DenseCoreGetLastError()).find("spec_type"), std::string::npos);
+    options.spec_type = DENSECORE_SPEC_AUTO;
+    options.spec_draft_n_max = 4;
+    EXPECT_EQ(InitEngineWithOptions("missing.gguf", nullptr, 1, -1, 0, -1, &options), nullptr);
+    EXPECT_NE(std::string(DenseCoreGetLastError()).find("draft"), std::string::npos);
+    options.spec_draft_n_max = 2;
+    EXPECT_EQ(InitEngineWithOptions("missing.gguf", nullptr, 1, -1, 0, 100, &options), nullptr);
+    EXPECT_NE(std::string(DenseCoreGetLastError()).find("KV cache type"), std::string::npos);
+}
+
+TEST(EngineInitOptions, AutoAndNonePreserveLegacyInitialization) {
+    DenseCoreInitOptions options{sizeof(DenseCoreInitOptions), DENSECORE_INIT_OPTIONS_VERSION,
+                                DENSECORE_SPEC_AUTO, 2};
+    for (int mode : {DENSECORE_SPEC_AUTO, DENSECORE_SPEC_NONE}) {
+        options.spec_type = mode;
+        DenseCoreHandle handle = InitEngineWithOptions("mock", nullptr, 1, -1, 0, -1, &options);
+        ASSERT_NE(handle, nullptr) << DenseCoreGetLastError();
+        FreeEngine(handle);
+    }
+    EXPECT_NE(std::string(DenseCoreSpeculationAutoSelectionReason()).find("no qualified"), std::string::npos);
+}
+
 // ============================================================================
 // Callback helpers
 // ============================================================================

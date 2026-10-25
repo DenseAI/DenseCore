@@ -405,18 +405,21 @@ func NewDenseEngine(mainModelPath, draftModelPath string, threads int) (*DenseEn
 		return nil, err
 	}
 
-	var handle C.DenseCoreHandle
-	if useExplicitKVType {
-		log.Printf("[engine] initializing DenseCore with explicit KV cache type=%s", strings.ToLower(strings.TrimSpace(os.Getenv("DENSECORE_KV_TYPE"))))
-		// Keep explicit KV type selection from also pinning the entire load path
-		// to NUMA node 0. Let the runtime pick its default placement so large
-		// models can fall back to interleaved or auto placement instead of
-		// failing a strict single-node KV allocation.
-		handle = C.InitEngineWithKVType(cMainPath, cDraftPath, C.int(threads), C.int(-1), C.int(0), kvType)
-	} else {
-		// InitEngine(model_path, reserved, threads)
-		handle = C.InitEngine(cMainPath, cDraftPath, C.int(threads))
+	spec, err := speculationOptionsFromEnv()
+	if err != nil {
+		return nil, err
 	}
+	options := C.DenseCoreInitOptions{
+		struct_size:      C.uint32_t(C.sizeof_DenseCoreInitOptions),
+		version:          C.DENSECORE_INIT_OPTIONS_VERSION,
+		spec_type:        C.int32_t(spec.mode),
+		spec_draft_n_max: C.int32_t(spec.draftLimit),
+	}
+	cacheType := C.int(-1)
+	if useExplicitKVType {
+		cacheType = C.int(kvType)
+	}
+	handle := C.InitEngineWithOptions(cMainPath, cDraftPath, C.int(threads), -1, 0, cacheType, &options)
 	if handle == nil {
 		lastErr := C.DenseCoreGetLastError()
 		if lastErr != nil {
@@ -438,6 +441,7 @@ func NewDenseEngine(mainModelPath, draftModelPath string, threads int) (*DenseEn
 		StartMapCleanupTicker(1*time.Minute, 5*time.Minute)
 	})
 
+	log.Printf("[engine] speculation requested=%s draft_n_max=%d selected=%s", spec.name, spec.draftLimit, C.GoString(C.DenseCoreSpeculationAutoSelectionReason()))
 	eng := &DenseEngine{handle: handle}
 	eng.initializeGenerationPolicy()
 	return eng, nil

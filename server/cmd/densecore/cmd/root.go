@@ -10,8 +10,9 @@ import (
 const defaultCLIHost = "127.0.0.1"
 
 var rootCmd = &cobra.Command{
-	Use:   "densecore",
-	Short: "DenseCore: cloud-native inference runtime",
+	Use:               "densecore",
+	Short:             "DenseCore: cloud-native inference runtime",
+	PersistentPreRunE: configureSpeculationFlags,
 	Long: `DenseCore is a high-performance cloud-native inference runtime.
 It provides an OpenAI-compatible LLM API in the default profile and can run locally or in the cloud.
 
@@ -26,6 +27,8 @@ func Execute() {
 }
 
 func init() {
+	rootCmd.PersistentFlags().String("spec-type", "auto", "Speculation: auto, none, mtp (requires a validated execution profile)")
+	rootCmd.PersistentFlags().Int("spec-draft-n-max", 2, "Maximum MTP draft tokens (1, 2 or 3)")
 	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose output")
 	rootCmd.PersistentFlags().String("host", defaultCLIHost, "Bind address")
 	rootCmd.PersistentFlags().Int("port", 8080, "Port number")

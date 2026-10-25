@@ -388,6 +388,34 @@ typedef enum {
 DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const char* reserved, int threads,
                                                    int numa_node_id, int pinning_policy, DenseCoreKVType kv_cache_type);
 
+/** Speculation is selected at initialization; AUTO requires a qualified profile. */
+typedef enum {
+    DENSECORE_SPEC_AUTO = 0,
+    DENSECORE_SPEC_NONE = 1,
+    DENSECORE_SPEC_MTP = 2,
+} DenseCoreSpecType;
+
+#define DENSECORE_INIT_OPTIONS_VERSION 1u
+typedef struct {
+    uint32_t struct_size;
+    uint32_t version;
+    int32_t spec_type;          /**< DenseCoreSpecType; default AUTO. */
+    int32_t spec_draft_n_max;   /**< 1..3; default 2. */
+} DenseCoreInitOptions;
+
+/**
+ * Additive initialization API; NULL options select AUTO, draft limit 2.
+ * kv_cache_type=-1 preserves InitEngineEx's default KV configuration.
+ * AUTO uses ordinary decode unless model, CPU and concurrency are qualified.
+ * Explicit MTP fails when no executable, qualified MTP profile is available.
+ * Earlier initialization APIs retain their signatures and default behavior.
+ */
+DENSECORE_API DenseCoreHandle InitEngineWithOptions(const char* model_path, const char* reserved, int threads,
+    int numa_node_id, int pinning_policy, int kv_cache_type, const DenseCoreInitOptions* options);
+
+/** Selection reason for the currently registered AUTO profiles (static string). */
+DENSECORE_API const char* DenseCoreSpeculationAutoSelectionReason(void);
+
 /**
  * Submit a request to the DenseCore engine (Non-blocking)
 

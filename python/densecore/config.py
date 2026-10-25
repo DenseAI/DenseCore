@@ -47,9 +47,14 @@ class ModelConfig:
 
     # Quantization
     kv_cache_type: str = "f16"  # "f32", "f16", "q8_0"
+    spec_type: str = "auto"
+    spec_draft_n_max: int = 2
 
     def __post_init__(self) -> None:
         """Validate configuration parameters."""
+        from .speculation import init_options
+
+        init_options(self.spec_type, self.spec_draft_n_max)
         if self.threads < 0:
             raise ValueError(f"threads must be >= 0, got {self.threads}")
         if self.context_length <= 0:
@@ -70,6 +75,8 @@ class ModelConfig:
             "use_mlock": self.use_mlock,
             "n_gpu_layers": self.n_gpu_layers,
             "kv_cache_type": self.kv_cache_type,
+            "spec_type": self.spec_type,
+            "spec_draft_n_max": self.spec_draft_n_max,
         }
 
     @classmethod

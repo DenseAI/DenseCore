@@ -624,6 +624,7 @@ set(SOURCES
     src/models/save_model.cpp
     src/api/version.cpp
     src/api/error_api.cpp
+    src/api/init_options.cpp
     src/runtime/scheduler.cpp
     src/runtime/scheduler_policy.cpp
     src/runtime/scheduler_queue.cpp

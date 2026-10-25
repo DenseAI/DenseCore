@@ -56,6 +56,7 @@ from .chat_template import (
 )
 from .config import GenerationConfig, ModelConfig
 from .lora import LoRAManager
+from .speculation import NativeInitOptions, init_options, initialize_native
 
 # ==============================================================================
 # GIL Release Architecture
@@ -603,6 +604,8 @@ class DenseCore:
     Args:
         model_path: Path to the GGUF model file (required)
         threads: Number of CPU threads (0 = auto-detect)
+        spec_type: Speculation mode: auto, none or mtp (requires validated native profile)
+        spec_draft_n_max: Maximum MTP draft tokens (1, 2 or 3)
         hf_repo_id: HuggingFace repo ID for loading tokenizer
         config: Optional ModelConfig for advanced settings
 
@@ -642,7 +645,10 @@ class DenseCore:
         kv_cache_dtype: str = "fp16",
         backend: str = "cpu",
         custom_backend_path: Optional[str] = None,
+        spec_type: str = "auto",
+        spec_draft_n_max: int = 2,
     ):
+        options = init_options(spec_type, spec_draft_n_max)
         self._handle = None
         self._closed = True
         self._requests: Dict[int, Any] = {}
@@ -663,6 +669,7 @@ class DenseCore:
         if config is not None:
             model_path = config.model_path or model_path
             threads = config.threads if config.threads > 0 else threads
+            options = init_options(config.spec_type, config.spec_draft_n_max)
 
         if not model_path:
             raise ValueError("model_path is required")
@@ -725,18 +732,16 @@ class DenseCore:
                 f"[DenseCore] Initializing with model: {model_path}, kv_cache_dtype: {kv_cache_dtype}"
             )
 
-        # Use extended API if kv_cache_dtype is specified (non-default)
-        if kv_cache_dtype.lower() != "fp16" and hasattr(self._lib, "InitEngineWithKVType"):
-            self._handle = self._lib.InitEngineWithKVType(
-                model_path_bytes, None, threads, -1, 0, kv_type_value
-            )
-        else:
-            self._handle = self._lib.InitEngine(model_path_bytes, None, threads)
+        self._handle = initialize_native(self._lib, model_path_bytes, threads, kv_type_value, options)
 
         if self._verbose:
             print(f"[DenseCore] Engine initialized, handle: {self._handle}")
         if not self._handle:
-            raise RuntimeError(f"Failed to initialize DenseCore engine for model: {model_path}")
+            detail = ""
+            if hasattr(self._lib, "DenseCoreGetLastError"):
+                native_error = self._lib.DenseCoreGetLastError()
+                detail = native_error.decode("utf-8", errors="replace") if native_error else ""
+            raise RuntimeError(f"Failed to initialize DenseCore engine for model: {model_path}: {detail}")
 
         # Load LoRA adapter if provided
         if lora_adapter_path:
@@ -811,6 +816,16 @@ class DenseCore:
         # InitEngine
         self._lib.InitEngine.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
         self._lib.InitEngine.restype = ctypes.c_void_p
+
+        if hasattr(self._lib, "InitEngineWithOptions"):
+            self._lib.InitEngineWithOptions.argtypes = [
+                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(NativeInitOptions),
+            ]
+            self._lib.InitEngineWithOptions.restype = ctypes.c_void_p
+        if hasattr(self._lib, "DenseCoreGetLastError"):
+            self._lib.DenseCoreGetLastError.argtypes = []
+            self._lib.DenseCoreGetLastError.restype = ctypes.c_char_p
 
         # InitEngineWithKVType (extended API with KV cache type)
         try:
