@@ -107,31 +107,56 @@ inline ResourceBudget DetectResourceBudget(const ResourceReader& read, int affin
     struct Membership { std::string controllers, path; bool v2; };
     std::vector<Membership> memberships;
     const bool membership_read = read("/proc/self/cgroup", text);
+    bool membership_malformed = false;
     if (membership_read) {
         std::istringstream input(text); std::string line;
         while (std::getline(input, line)) {
+            if (ResourceWord(line).empty()) continue;
             auto a = line.find(':'), b = line.find(':', a == std::string::npos ? 0 : a+1);
-            if (a == std::string::npos || b == std::string::npos) continue;
+            uint64_t hierarchy = 0;
+            if (a == std::string::npos || b == std::string::npos || b+1 >= line.size() ||
+                line[b+1] != '/' || !ResourceUnsigned(line.substr(0,a),hierarchy)) {
+                membership_malformed = true;
+                continue;
+            }
             memberships.push_back({line.substr(a+1,b-a-1), line.substr(b+1), b == a+1});
         }
     }
     struct Mount { std::string root, path, type, controllers; };
     std::vector<Mount> mounts;
     const bool mounts_read = read("/proc/self/mountinfo", text);
+    bool mounts_malformed = false;
+    bool saw_mount_record = false;
     if (mounts_read) {
         std::istringstream input(text); std::string line;
         while (std::getline(input, line)) {
-            auto separator = line.find(" - "); if (separator == std::string::npos) continue;
+            if (ResourceWord(line).empty()) continue;
+            auto separator = line.find(" - ");
+            if (separator == std::string::npos) { mounts_malformed = true; continue; }
             std::istringstream before(line.substr(0,separator)), after(line.substr(separator+3));
             std::string id, parent, device, root, path, options, type, source, super;
-            before >> id >> parent >> device >> root >> path >> options;
-            after >> type >> source >> super;
+            if (!(before >> id >> parent >> device >> root >> path >> options) ||
+                !(after >> type >> source >> super) || root.empty() || root[0] != '/' || path.empty() || path[0] != '/') {
+                mounts_malformed = true;
+                continue;
+            }
+            saw_mount_record = true;
             if (type == "cgroup" || type == "cgroup2") mounts.push_back({ResourceUnescape(root), ResourceUnescape(path),type,super});
         }
     }
-    bool memory_error = !membership_read || !mounts_read;
-    bool cpu_error = false;
+    const bool empty_membership_with_cgroup_mount = memberships.empty() && !mounts.empty();
+    const bool discovery_error = !membership_read || !mounts_read || membership_malformed || mounts_malformed ||
+                                 !saw_mount_record || empty_membership_with_cgroup_mount;
+    bool memory_error = discovery_error;
+    bool cpu_error = discovery_error;
+    const bool needs_memory = std::any_of(memberships.begin(),memberships.end(),[](const auto& entry) {
+        return entry.v2 || ResourceController(entry.controllers,"memory");
+    });
+    const bool needs_cpu = std::any_of(memberships.begin(),memberships.end(),[](const auto& entry) {
+        return entry.v2 || ResourceController(entry.controllers,"cpu");
+    });
     bool observed_memory = false;
+    bool observed_cpu = false;
     for (const auto& membership : memberships) for (const auto& mount : mounts) {
         if (membership.v2 != (mount.type == "cgroup2")) continue;
         const bool memory = membership.v2 || (ResourceController(membership.controllers,"memory") && ResourceController(mount.controllers,"memory"));
@@ -169,6 +194,7 @@ inline ResourceBudget DetectResourceBudget(const ResourceReader& read, int affin
                 }
             }
             if (cpu) {
+                observed_cpu = true;
                 std::string quota_text, period_text;
                 bool ok = get(membership.v2 ? "cpu.max" : "cpu.cfs_quota_us", quota_text);
                 std::istringstream fields(quota_text); std::string quota, period;
@@ -197,12 +223,15 @@ inline ResourceBudget DetectResourceBudget(const ResourceReader& read, int affin
         }
     }
     // A missing finite constraint cannot safely be replaced by host availability.
-    if (memory_error || (!memberships.empty() && !observed_memory)) {
+    if (memory_error || (needs_memory && !observed_memory)) {
         if (result.memory.state != ResourceState::Finite || result.memory.bytes != 0)
             result.memory = {ResourceState::Unknown,0};
         if (result.cgroup_memory_limit.state != ResourceState::Finite || result.cgroup_memory_limit.bytes != 0)
             result.cgroup_memory_limit = {ResourceState::Unknown,0};
     }
+    if (!discovery_error && !needs_memory) result.cgroup_memory_limit = {ResourceState::Unlimited,0};
+    if (!discovery_error && !needs_cpu) result.cpu_quota_state = ResourceState::Unlimited;
+    if (needs_cpu && !observed_cpu) cpu_error = true;
     if (result.cpu_quota_state == ResourceState::Finite)
         result.effective_threads = std::min(result.effective_threads, static_cast<int>(std::min<double>(1000000,std::max(1.0,std::ceil(result.cpu_quota)))));
     if (cpu_error) {

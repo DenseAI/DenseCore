@@ -451,3 +451,45 @@ TEST(ResourceLedgerTest, ActualKVReconciliationGrowsAtomicallyAndRejectsWithoutC
     EXPECT_TRUE(lease.EnsureKVBytes(40, &error));
     EXPECT_EQ(ProcessPlannedMemoryBytes(),before.planned_bytes+60);
 }
+
+TEST(ResourceBudgetTest, UnreadableHierarchyDiscoveryNeverFallsBackToHostCapacity) {
+    for (const auto* unavailable : {"/proc/self/cgroup","/proc/self/mountinfo"}) {
+        auto files = V2Resources();
+        files.erase(unavailable);
+        const auto result = FixtureBudget(files);
+        EXPECT_EQ(result.memory.state,densecore::runtime::ResourceState::Unknown) << unavailable;
+        EXPECT_EQ(result.cpu_quota_state,densecore::runtime::ResourceState::Unknown) << unavailable;
+        EXPECT_EQ(result.effective_threads,1) << unavailable;
+    }
+}
+TEST(ResourceBudgetTest, MalformedHierarchyDiscoveryIsUnknownInsteadOfUnlimited) {
+    for (const auto* corrupt : {"/proc/self/cgroup","/proc/self/mountinfo"}) {
+        auto files = V2Resources();
+        files[corrupt] = "malformed record";
+        const auto result = FixtureBudget(files);
+        EXPECT_EQ(result.memory.state,densecore::runtime::ResourceState::Unknown) << corrupt;
+        EXPECT_EQ(result.cpu_quota_state,densecore::runtime::ResourceState::Unknown) << corrupt;
+        EXPECT_EQ(result.effective_threads,1) << corrupt;
+    }
+}
+TEST(ResourceBudgetTest, ExplicitlyAbsentHierarchyUsesHostMemoryAndAffinity) {
+    ResourceFiles files{{"/proc/meminfo","MemAvailable: 10000 kB\n"},
+                        {"/proc/self/cgroup",""},
+                        {"/proc/self/mountinfo","1 0 0:1 / / rw - ext4 /dev/root rw\n"}};
+    const auto result = FixtureBudget(files,4);
+    EXPECT_EQ(result.memory.state,densecore::runtime::ResourceState::Finite);
+    EXPECT_EQ(result.memory.bytes,10240000u);
+    EXPECT_EQ(result.cgroup_memory_limit.state,densecore::runtime::ResourceState::Unlimited);
+    EXPECT_EQ(result.cpu_quota_state,densecore::runtime::ResourceState::Unlimited);
+    EXPECT_EQ(result.effective_threads,4);
+}
+TEST(ResourceBudgetTest, EmptyMountInfoOrInconsistentEmptyMembershipIsUnknown) {
+    for (const auto* empty : {"/proc/self/cgroup","/proc/self/mountinfo"}) {
+        auto files = V2Resources();
+        files[empty] = "";
+        const auto result = FixtureBudget(files);
+        EXPECT_EQ(result.memory.state,densecore::runtime::ResourceState::Unknown);
+        EXPECT_EQ(result.cpu_quota_state,densecore::runtime::ResourceState::Unknown);
+        EXPECT_EQ(result.effective_threads,1);
+    }
+}
