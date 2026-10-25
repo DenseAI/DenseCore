@@ -2,7 +2,7 @@
 
 **Release readiness is incomplete.** No v0.2 image, tag or release has been
 published by this work. Community post text remains the user's responsibility.
-The current integrated source is `4ad6a35`; historical private-model and earlier
+The current integrated source is `48dd55a`; historical private-model and earlier
 package evidence below retain separate identities.
 
 Intended deployments are personal PCs, resource-limited CPU Kubernetes pods and
@@ -11,29 +11,45 @@ metadata-driven pooling, request/prefix ownership, speculative verification and
 native-backed Python completion metadata. See the [release gates](V0_2_RELEASE_GATES.md)
 and [model catalog](MODEL_CATALOG.md).
 
-- Integrated `4ad6a35`: native 1347 run / 1333 passed / the exact same 14 skips /
-  zero failures or disabled tests. Selected critical ASAN/LSan: 702 run / 693
-  passed / the same 9 skips / zero failures, disabled tests or sanitizer reports.
-  All 12 added JSON and Gemma Q4/F32/capture cases are included. Final wrapper
-  audits are no-work with stable tested binaries, source, generated headers and
-  dependencies; initial relinks remain recorded. This is fixture qualification,
-  separate from the real-model probes below; prior `db9883a`/`3ed5428` archives remain.
+- Integrated `48dd55a`: native 1358 / passed 1344 / the same 14 skips; strict
+  critical ASAN/LSan 727 / passed 718 / the same 9 skips, zero failures/disabled/
+  reports. All prior 702 plus 11 added and 14 existing newly selected loader cases
+  execute. Actual final wrapper audits are no-work; an immutable 33-file artifact
+  binds source and runtime bytes. Go all/race 3, SDK 164/27 optional skips and
+  personal stdlib 88 pass. These fixtures do not establish all SDK loader modes.
+- Actual `48dd55a` hard-mask NONE/MTP lifecycle passes: four contradictory-mask
+  errors with zero output/generated tokens, six healthy peers/recoveries and
+  exact terminal/metadata counts. Only healthy MTP requests show proposal
+  verification. Original V1 static-TLS failure before engine init is UNEXECUTED;
+  reviewed V2 corrects only qualified-library startup preload.
+- Actual root `48dd55a` E2B formal 20 cache-ON/OFF c=1/c=4 plus four staggered requests
+  match old/own c1 IDs and complete answers; no mixed physical graph is claimed.
+  E4B context 2048/capacity 4 init FAIL (plan 5,921,446,144 > 4,681,576,448 available bytes),
+  zero generation, failed-init RSS 6,236,108 KiB. This is not RAM savings or a
+  successful supported-RAM estimate. Earlier private a9 capacity 1 remains separate.
+- Private H `613a` still fails three of eight c8 comparisons and is unmerged.
+  Private Linux TLS `a70cd4e` passes three SDK loader modes without execve but
+  all three raw modes SIGSEGV during teardown (allocator provenance); unqualified
+  and unmerged. Matched `4ad6a35`/`48dd55a` SDK file mode restarts once, `-c`/stdin fail
+  static TLS. These loader probes invoke no engine/model.
 - Shared-sampler fixes cover disabled top-k, conditional nucleus filtering and
   grammar intersections. Mock-native full-worker NONE error/peer/recovery checks
   pass. Same-source Go all/race checks, SDK 164 unit checks/27 optional skips and
   88 standard-library benchmark tests passed; they are not actual Python JSON proof.
-- Actual `4ad6a35` pinned 0.8B and 2B JSON NONE/MTP c1/c4 native and HTTP probes
+- Source-labeled `4ad6a35` pinned 0.8B and 2B JSON NONE/MTP c1/c4 native and HTTP probes
   pass: each model has 16 main native/32 HTTP requests, native cancel/recovery and
   HTTP stream/nonstream/disconnect/recovery, plus 54 actual grammar-complete
   finishes. Two tiny object cases and a strict brace-ID whitelist are the scope;
-  public global action range and real Python JSON are unqualified.
+  public global action range and real Python JSON are unqualified. These model
+  passes do not automatically transfer to source `48dd55a`.
 - The unchanged probabilistic matrix on `4ad6a35` is **overall FAIL**: 0.8B c1
   and 2B c1/c4 pass; 0.8B c4 fails one NONE French final-punctuation check among
   160 HTTP requests. One separate NONE stop-instruction negative is retained.
   All 32 stop probes suppress the marker; 31 actual string-stop finishes and
   actual MTP rejection/rollback are recorded. Native completion/cancel/recovery
   and HTTP disconnect/recovery pass. No random-ID/distribution, causal quality
-  improvement, speed or automatic/default claim follows.
+  improvement, speed or automatic/default claim follows, and this failed matrix
+  is not silently inherited or replaced by source `48dd55a` lifecycle probes.
 - Real Python on integrated `143a2ad` passed 12 cases plus three raw native-token
   controls: completion counts/finish, cancellation, stream/task cleanup and
   recovery. Prompt counts remain client estimates, not native prompt accounting.
@@ -50,10 +66,10 @@ and [model catalog](MODEL_CATALOG.md).
 - Private Gemma `d4088c7` cache-ON c4 failed: rank-0 requests 1/5 produced 135 IDs
   against c1's 127, first difference index 52. Same-source cache-OFF, mixed and
   E4B matrices were not run. DEBUG `658e626` narrowed a surviving PLE delta;
-  Private `a9efe78` subsequently passes 20 E2B cache-ON/OFF c1/c4 raw-ID checks
+  Private `a9efe78` subsequently passes 20 E2B cache-ON/OFF c=1/c=4 raw-ID checks
   and four staggered requests, each matching its own c1 complete answer/EOS.
-  E4B context2048/cap4 fails capacity before generation; a separately requested
-  cap1 profile passes one native long case, without a cap4 retry or silent reduction.
+  E4B context 2048/capacity 4 fails capacity before generation; a separately requested
+  capacity 1 profile passes one native long case, without a capacity 4 retry or silent reduction.
   Q4/F32 fixes/fixtures are in `4ad6a35` native/ASAN. Private model outcomes do not
   transfer automatically to root4ad6, broad support, HTTP or performance/default gates.
 - Separate Go-only `386b800` portable amd64 image passed actual container and

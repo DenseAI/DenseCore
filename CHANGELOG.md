@@ -41,15 +41,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   not run. Private `658e626` DEBUG narrowed a surviving delta to F32 PLE projection
   from identical input. Private `a9efe78` then passes 20 E2B cache-ON/OFF
   c1/c4 checks and four staggered requests against their own c1 IDs/final answers.
-  E4B context2048/cap4 fails capacity before generation; a separately requested
-  cap1 profile passes one native long case. Q4/F32 fixes and capture fixtures are
+  E4B context 2048/capacity 4 fails capacity before generation; a separately requested
+  capacity 1 profile passes one native long case. Q4/F32 fixes and capture fixtures are
   now in `4ad6a35` native/ASAN; private model results do not transfer automatically
   to that root, broad Gemma support or performance/default qualification.
 - Correct shared-sampler top-k=0, conditional nucleus probabilities and grammar
   intersections with whitelist/range constraints. Mock-native full-worker
   NONE request error/peer/recovery checks pass. Common NONE/MTP JSON completion
   now commits the root-closing token and finishes STOP, including the exact token
-  budget boundary. Actual pinned-model native/HTTP JSON checks pass; public global
+  budget boundary. Actual `4ad6a35` pinned-model native/HTTP JSON checks pass; public global
   action-range composition remains fixture-only and real Python JSON is untested.
 - Verify model downloads/cached bytes and add native image-profile, limited-pod
   and reproducible CPU gates. Separate Go-only `386b800` portable amd64 actual
@@ -57,15 +57,31 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   during accepted work, bounded stream completion and cleanup. Strict Count
   still fails. Current integrated core image is untested; original successful
   init-log capture has syntax checks only, awaiting final kind validation.
-- Integrated `4ad6a35` native: 1347 run, 1333 passed, exactly the same 14 skips,
-  zero failures/disabled. Critical ASAN/LSan: 702 run, 693 passed, the same 9 skips,
-  zero failures/disabled/reports. All 12 new JSON and Gemma Q4/F32/capture cases
-  are included. Final wrapper audits are no-work with stable source, binary,
-  generated headers and dependencies; initial relinks remain recorded. Go all/race,
-  SDK unit and benchmark-tool checks are separately recorded on the same source.
-  Historical `db9883a`/`3ed5428` results remain source-labeled. These checks and the
-  narrow real-model probes do not qualify a final package, broad model support,
-  performance or default promotion.
+- Integrated `48dd55a` native: 1358 run / 1344 passed / the same 14 skips;
+  strict critical ASAN/LSan: 727 run / 718 passed / the same 9 skips, zero
+  failures/disabled/reports. The sanitizer selection contains all prior 702,
+  11 added cases and 14 existing loader cases newly selected. Go all/race 3,
+  SDK 164/27 optional skips and personal-tool 88 checks pass. Final actual
+  wrapper audits are no-work; the immutable artifact pins 33 files. Earlier
+  `4ad6a35`, `db9883a` and `3ed5428` evidence remains source-labeled.
+- Actual `48dd55a` hard-mask lifecycle: NONE/MTP contradictory allow 16/deny 16
+  JSON-off requests at temperatures 0/0.7 produce four zero-output ERROR finishes;
+  six active-peer/recovery requests pass. Healthy MTP controls show actual
+  verification/rejection/rollback; no successful verification is claimed for
+  failing requests. V1 static-TLS failure before engine initialization remains
+  UNEXECUTED; reviewed V2 changes only verified-library startup preload.
+- Actual `48dd55a` E2B formal 20 cache-ON/OFF c=1/c=4 and four staggered requests
+  match their old/own c1 IDs and complete answers. E4B context 2048/capacity 4 still
+  fails initialization capacity (required 5,921,446,144 > available 4,681,576,448
+  plan bytes), with zero generation. Failed-init peak RSS 6,236,108 KiB is not
+  successful RAM sizing or a RAM-savings result. Earlier a9 cap1 is separate.
+- Private H candidate `613a` still diverges in three of eight c8 requests and
+  is not merged. Linux TLS candidate `a70cd4e` passes three SDK loader modes
+  without execve, but all three raw ctypes modes SIGSEGV during teardown with
+  allocator provenance; it is unqualified/unmerged. Matched `4ad6a35`/`48dd55a` SDK file
+  runs restart automatically while `-c`/stdin fail static TLS, without model calls.
+  The `4ad6a35` JSON passes and overall probabilistic FAIL are not inherited by `48dd55a`.
+  No final package, broad support, speed, automatic/default or release promotion.
 
 See [v0.2 release gates](docs/V0_2_RELEASE_GATES.md) for incomplete checks;
 these entries are not a released model-support or performance announcement.

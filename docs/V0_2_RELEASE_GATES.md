@@ -11,25 +11,25 @@ performance/default promotions are qualified.
 
 ## Evidence boundaries
 
-The integrated source snapshot is
-`4ad6a35896230d4d40a99e998916460a4954023f`. Full native: 1347 run, 1333 passed,
-exactly the same 14 existing skips, zero failures/disabled. Same-source Go
-all-package/race checks, SDK 164 unit checks with 27 existing optional skips,
-and 88 standard-library benchmark tests passed. These adapter/tool checks are
-separate from actual model execution and are not real Python JSON proof.
+The current frozen source is `48dd55a1630b37ca3e5e3658f0293a7beee81392`.
+Full native: 1358 run / 1344 passed / the same 14 skips, zero failures/disabled.
+Strict critical ASAN/LSan: 727 run / 718 passed / the same 9 skips, zero failures/
+disabled/reports. All prior 702 execute, with 11 new source cases and 14 existing
+loader cases newly selected; this remains a selected suite, not all 1358 normal
+tests. Same-source Go all/race 3, SDK 164 unit checks/27 optional skips and personal
+stdlib 88 pass. SDK unit passes do not establish every Linux loading context.
+Final actual wrapper library/test audits are no-work with stable bytes. The
+immutable artifact manifest pins 33 files and has SHA-256
+`34bdec57d3b39db6d1a675a9c9b08322cf456687af89fa65021e24d3cf69c77d`.
+The library SHA is
+`eaa3a208f22bec2e04ddeb3b4bb1060b5ae280dbdf0e59d4ee9bb796522209b3`;
+the server SHA is
+`72c38b718736afe8bc73feb54bbabf859a7414bcd859008a7f47acb2c0e97ad6`.
 
-Critical ASAN/LSan on this exact source: 702 run, 693 passed, the same 9 skips
-as archived `db9883a`, zero failures/disabled/reports with leak detection enabled.
-The selected suite includes all 12 added JSON lifecycle/session/helper and Gemma
-Q4/F32/PLE-capture cases; two existing JSON tests are newly selected by the filter.
-It is not the complete 1347-test normal suite. The tested ASAN binary is
-`f26937b6a2306f4e7f6f0634ecfc0915cc51ab5d82c6951ab8a7c1659b5e4442`.
-Final actual wrapper audits are no-work. Source, vendor, generated headers,
-dependencies and tested binaries are stable; initial audit relinks remain
-recorded. Serving library SHA is
-`220bf8cbac2858e66ef5703c2ffe16fcf7db710da203d89975e35947608f662d` and server SHA is
-`b180e2e6004180e9291de556061be8edb42e1cce526a91b3315dc452661324c5`.
-Historical `db9883a` native1335/ASAN688 and `3ed5428` ASAN archives remain separate.
+Prior `4ad6a35` native 1347/1333/14 and ASAN 702/693/9 remain source-labeled,
+including its JSON model passes and probabilistic overall FAIL below. They do
+not automatically transfer to `48dd55a`. Earlier `db9883a` native 1335/ASAN 688 and
+`3ed5428` sanitizer archives remain preserved as well.
 
 The shared sampler treats top-k=0 as disabling that filter without forcing
 greedy selection, conditions nucleus filtering on prior-filter survivors and
@@ -47,11 +47,11 @@ Python tokenizer is available), not native prompt accounting.
 
 | Track | Verified evidence and source | Remaining gate |
 |---|---|---|
-| A | Integrated `4ad6a35` full native and 693-pass/9-skip critical ASAN; prior `143a2ad` Go/Python lifecycle | H c=8 parity failure remains unresolved. Private a9 Gemma passes retain their source boundary; future functional fixes require source-matched sanitizer/model qualification |
+| A | Integrated `48dd55a` native 1344-pass/14-skip and critical ASAN 718-pass/9-skip; actual hard-mask NONE/MTP request isolation pass | H c8 parity remains unresolved; SDK TLS/package contexts remain limited; later fixes need source-matched checks |
 | B/H | Resource/planner fixtures; earlier 4 GiB serving and explicit 1 GiB rejection without OOM kill; historical `7ecaf86` embedding AUTO/LAST 12 bitwise C/Python/HTTP comparisons | Actual `143a2ad` c=8 resource/cleanup evidence passes, but request isolation does not; final image/platform checks remain |
-| B Gemma | Private `a9efe78` E2B cache-ON/OFF c1/c4 20 same-case checks and four staggered requests pass; historical ad1/d408 failures retained | a9 E4B cap4 capacity FAIL; separate cap1 one-case PASS. No broad Gemma/HTTP/default/performance qualification or automatic transfer to `4ad6a35` model proof |
+| B Gemma | Root `48dd55a` E2B formal 20 cache-ON/OFF c=1/c=4 plus four staggered own-c1 cases PASS; private a9 passes and ad1/d408 failures retained | Root `48dd55a` E4B context 2048/capacity 4 capacity FAIL before generation. Private a9 capacity 1 is separate. No mixed-physical-graph, broad HTTP/support/default/performance claim |
 | C | Historical `7ecaf86` README-pinned 0.8B/plain 2B combined prefix checks passed c=1/2/4, five-turn answers, restore/skipped prefill, cancellation and eviction | Do not inherit those results across later numerical changes; Qwen3.6, matched performance and default-policy promotion remain separate |
-| D | Historical `7ecaf86` greedy parity retained; integrated `4ad6a35` 0.8B/2B JSON NONE/MTP c1/c4 native+HTTP pass and actual probabilistic rejection/rollback/stop suppression | Current probabilistic matrix overall FAIL: one 0.8B c4 French punctuation failure plus separate stop-instruction negative. Population distribution, speed, 35B MoE and auto qualification absent |
+| D | Root `48dd55a` narrow hard-mask NONE/MTP lifecycle PASS. Source `4ad6a35` JSON both-model PASS and probabilistic rejection/rollback/stop evidence retained; historical `7ecaf86` greedy parity separate | Source `4ad6a35` probabilistic matrix overall FAIL: one 0.8B c4 French punctuation failure plus separate stop-instruction negative. No inheritance to `48dd55a`; distribution/speed/35B/auto absent |
 | E | Go-only `386b800` portable amd64 image passed actual container and kind strict active drain, resource limits, checksum rejection and safe memory refusal | Strict Count quality still fails. Current root core has no final image validation; original init-log capture has syntax checks only; native Arm remains unverified |
 | F | GPT-OSS packed MXFP4/bias/router/activation, attention sink/window and tokenizer/Harmony fixtures | Actual HTTP/long/c=1/4/stop/stream inference and supported peak RSS/context remain unverified; safe capacity refusal is not model support |
 | G | Public physical-NUMA preflight and matched ABBA harness | Actual 35B/122B two-socket measurements, 16/48 physical cores and remote-memory penalty; no promotion |
@@ -67,6 +67,11 @@ admitted c=8 request replaces baseline EOS at zero-based token position 50 with 
 newline and continues to the 128-token cap. Separate cache-OFF and cache-OFF with
 all thread policies fixed to 8 reproduce the failure. This does not establish a
 physical-slot cause or qualify either control as a workaround.
+
+Private H candidate `613a` also remains FAIL: three of eight c8 requests
+replace the original 51-token EOS boundary and continue to the 128-token cap in
+the fixed 8-thread/cache-OFF control. It is not merged into `48dd55a`; no H fix, workaround,
+quality or performance promotion follows.
 
 Gemma E2B private `d4088c7` contains the canonical Q4 decode/stride guard changes.
 Its cache-ON c1 repeats have 127 native IDs, but two concurrent groups fail:
@@ -85,7 +90,7 @@ separate. Diagnostic reproduction does not establish
 full-model isolation, absence of every observer effect, or model support.
 
 Private `a9efe78fec43c25f29510098a17f61cbe8dd9f55` subsequently passes the
-E2B formal cache-ON/OFF c1/c4 grid: 20 complete native requests all match the
+E2B formal cache-ON/OFF c=1/c=4 grid: 20 complete native requests all match the
 original 127-ID c1 baseline and EOS. With context2048, capacity4, Q8 KV, NONE,
 prefix OFF and requested threads8, a separate four-request staggered test also
 matches each case's own c1 raw IDs, complete answer and EOS. Submission timing
@@ -93,13 +98,40 @@ proves overlapping request lifetimes, not a mixed physical graph. These actual
 private-source passes coexist with the earlier ad1/d408 failures; neither is
 silently substituted for the other or inherited by root `4ad6a35`.
 
-On the same private a9 source, E4B context2048/cap4 initialization fails explicitly
-before generation: required plan4,532,711,424 bytes versus available3,428,679,680.
+On the same private a9 source, E4B context 2048/capacity 4 initialization fails explicitly
+before generation: required plan 4,532,711,424 bytes versus available 3,428,679,680.
 No request or c4 wave ran, and that profile was not reduced or retried. A separately
-requested PC context2048/cap1 profile passes one native long-answer case with
+requested PC context 2048/capacity 1 profile passes one native long-answer case with
 59 sampled tokens and one STOP/terminal/completion. It is not a cap4, repeat,
 cache-OFF, HTTP, supported-RAM-range, broad-model or performance qualification.
 The capacity failure remains preserved; successful cap1 is a distinct profile.
+
+Actual root `48dd55a` requalifies the E2B formal 20 cache-ON/OFF c=1/c=4 grid:
+all match the old 127-ID baseline and EOS. Four additional owned-case c1 baselines
+and four staggered requests also pass; each staggered case matches its own c1
+IDs, complete answer and EOS. The formal 20 plus staggered 4 are the requested
+isolation cases, with four extra baseline captures (28 captured requests total).
+Overlapping lifetimes do not prove a mixed physical graph. No HTTP, arbitrary
+Gemma support, default or performance qualification follows from this grid.
+
+The SAME pinned E4B file on root `48dd55a`, context 2048/capacity 4, fails initialization:
+plan required 5,921,446,144 bytes > available 4,681,576,448 bytes. Generation and
+native input/EOS preparation are not reached. Failed-init whole-process peak
+RSS is 6,236,108 KiB. Neither that highwater nor its difference from prior private
+runs establishes RAM savings or minimum/sufficient RAM for successful serving.
+Private a9 capacity 1 success remains a separate source/profile, not a root `48dd55a` pass.
+
+Actual root `48dd55a` hard-mask probe V2 passes NONE/MTP: strict allow 16/deny 16,
+JSON-off, temperatures 0/0.7 yield four zero-commit ERROR requests with one
+metadata and terminal each while healthy peers are active. Six healthy peer/
+recovery requests finish normally. Healthy MTP controls have actual width 3
+proposal/verification/accept/reject/rollback evidence. Failing MTP requests
+have no successful proposal-verification telemetry; do not infer head work from
+absent logs. V1 failed at ctypes static-TLS loading before any engine/model
+initialization and remains UNEXECUTED. Reviewed V2 changes only verified-library
+startup preload, preserves the same inputs/settings/validators, and proves
+actual engine load/free, process exit and complete EOF. This is lifecycle,
+not final-answer quality, population distribution, speed or default promotion.
 
 Private stop candidate `5ad54a5` completed 72 native requests, eight native
 cancel/recovery cases and eight HTTP disconnect/recovery cases. Its 32 configured
@@ -110,7 +142,7 @@ all retain strict FAIL: six HTTP quality failures among 160 main requests.
 French formatting and stop-instruction failures are preserved without assigning
 them to model or engine by assumption. These samples prove neither population
 distribution equivalence nor acceleration. They are private-source evidence,
-not the current `4ad6a35` matrix described below.
+not the later `4ad6a35` matrix described below.
 
 Integrated `4ad6a35` closes the JSON completion gap: ordinary and MTP output
 commit the root-closing token before STOP; fixtures cover an exact max-token
@@ -119,12 +151,12 @@ Actual pinned 0.8B and 2B each pass 16 main native and 32 HTTP checks with NONE/
 c=1/4, greedy K2, context2048 and threads8. Strict brace-whitelist `{}` and
 ordinary `{"answer":42}` cases, native cancel/recovery, HTTP stream/nonstream/disconnect/
 recovery and UTF-8/usage/terminal checks pass. Each model records 54 actual
-`grammar_complete` finishes and batched target width3 with acceptance/rollback.
+`grammar_complete` finishes and batched target width 3 with acceptance/rollback.
 JSON rejection was not observed; formal rejection fixtures and probabilistic
 coverage remain separate. Delivered JSON CallbackEx IDs are a subset of native
 samples; real Python JSON and public global action range are not qualified.
 Two tiny objects do not establish arbitrary JSON/model support. c=4 denotes
-logical engine capacity; width3 is one request's K+1 verification graph, not
+logical engine capacity; width 3 is one request's K+1 verification graph, not
 four-sequence physical batching or a throughput qualification.
 
 The unchanged non-JSON probabilistic matrix on the same `4ad6a35` artifact is
@@ -135,7 +167,7 @@ format side metric does not include that probe. No engine/model cause is proven.
 All 72 native finals including recovery, eight native cancellations and eight
 HTTP disconnect/recoveries pass. Of 160 main HTTP requests, one fails the final
 quality gate. All 32 stop probes suppress the literal marker and 31 actual
-`stop_sequence` finishes are logged. All MTP profiles observe width3,
+`stop_sequence` finishes are logged. All MTP profiles observe width 3,
 acceptance/rejection/rollback (885 verifications, 329 rejections, 568 rollbacks in
 aggregate). These counts are execution evidence, not latency/throughput results.
 Current failures and the earlier private six/160 remain independently recorded;
@@ -158,6 +190,22 @@ number-only formatting still failed (also on pinned llama.cpp oracle
 Historical prefix checks used the model-specific opt-in; actual restore and
 snapshot/KV eviction are distinct from performance promotion. Near-full pressure
 outputs are control workloads, not complete-answer quality proof.
+
+## Linux SDK loading boundary
+
+Matched `4ad6a35` and `48dd55a` SDK runs in the recorded interpreter/NumPy environment
+show file execution succeeds via exactly one automatic execve restart. Both
+`-c` and stdin fail with the same static-TLS OSError; this is not established
+as a new `48dd55a` regression. These probes call get_library/symbol-owner checks only,
+not an engine or model, and do not generalize to all user environments.
+
+Private source `a70cd4e23892947d7391e9674f369ea6527f35ee` Linux dynamic-TLS
+candidate passes three SDK loader modes without execve. All three raw ctypes
+modes load but SIGSEGV during process teardown, so the candidate is unqualified
+and unmerged. Exact allocator provenance records a 31-byte Registry allocation
+through libc malloc/global libstdc++ new, followed by DenseCore sized delete
+reaching mimalloc during destruction. SDK loader passes do not waive that
+raw-process failure or establish model support. No engine/model was called.
 
 ## Package boundary
 
@@ -220,6 +268,16 @@ D21, record release readiness as incomplete and the release delayed.
 These are local ledger identifiers, not public download promises. Archive raw
 identities before publishing any claim; use the relative reproduction links above.
 
+- `v02-integrated-48dd-artifact.json`, `v02-staging-48dd-asan-report.json`;
+  immutable manifest SHA is recorded above. `v02-hard-mask-48dd-v2-report.json`
+  binds reviewed local V2 tool/script hashes, callbacks, owners and process receipts;
+  `v02-hard-mask-48dd-infrastructure-failure.json` preserves V1 UNEXECUTED.
+- `v02-gemma-48dd55-native-isolation-summary.json`,
+  `v02-gemma-48dd55-e4b-capacity-result.json` retain the root `48dd55a` model boundaries.
+- `v02-sdk-tls-loader-matched/report.json`, `v02-linux-dlopen-a70-report.json`,
+  `v02-linux-dlopen-a70-raw-allocation-provenance.log`, and
+  `v02-h-613a-original200-c8-ctx512-cache0-fixed8-control/analysis.json` retain
+  matched loader failures and unmerged candidate negatives.
 - `v02-integrated-4ad6-artifact.json`, `v02-json-4ad6-asan-report.json`;
   `v02-mtp-json-4ad6-08b-report.json`, `v02-mtp-json-4ad6-2b-report.json`;
   `v02-4ad6-sampling-commands.json`, `v02-mtp-sampling-4ad6-matrix-report.json`
