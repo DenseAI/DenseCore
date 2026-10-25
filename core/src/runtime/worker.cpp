@@ -3348,6 +3348,7 @@ void EngineLoop(EngineState* state) {
                             sizing_key += ":" + std::to_string(graph_ctx_estimate.effective_query_len);
                             sizing_key += ":" + std::to_string(graph_ctx_estimate.effective_num_seqs);
                             sizing_key += ":" + std::to_string(graph_ctx_estimate.chunk_token_hint);
+                            sizing_key += ":" + std::to_string(batch.tokens.size());
                             auto cached_sizing = flexible_graph_pool_sizing_cache.find(sizing_key);
                             if (cached_sizing == flexible_graph_pool_sizing_cache.end()) {
                                 flexible_sizing =
