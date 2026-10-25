@@ -36,6 +36,14 @@ class PrefixEvidenceTest(unittest.TestCase):
         self.assertEqual(compare(groups), [])
         self.assertTrue(any('eviction not observed' in x for x in compare(groups, True)))
 
+    def test_missing_concurrency_and_cancel_evidence_fail(self):
+        groups = valid_groups()
+        groups['on']['requested_concurrency'] = [1, 2, 4]
+        groups['on']['cancellation']['passed'] = False
+        failures = compare(groups)
+        self.assertTrue(any('c4 request matrix incomplete' in x for x in failures))
+        self.assertTrue(any('cancellation/recovery' in x for x in failures))
+
     def test_restore_hit_and_skipped_tokens_are_each_required(self):
         for field in ('hits', 'restores', 'skipped_tokens'):
             groups = valid_groups()

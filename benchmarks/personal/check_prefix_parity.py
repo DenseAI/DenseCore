@@ -139,6 +139,8 @@ def child(args):
         if lib.DenseCoreGetRuntimePlan(handle, C.byref(plan)) != 0:
             raise RuntimeError('runtime plan unavailable')
         result['runtime_plan'] = {name: getattr(plan, name) for name, _ in plan._fields_ if name != 'spec_reason'}
+        if plan.spec_selected != 1:
+            raise RuntimeError('requested ordinary decode was not selected')
         if lib.DenseCoreSetGenerationCompletionCallback(handle, complete) != 0:
             raise RuntimeError('completion callback unavailable')
         probe = system + question('France')
@@ -275,6 +277,10 @@ def parent(args):
             manifest['http'][mode] = http_final_answers(args, mode, env)
             write(args.out / 'summary.json', manifest)
     failures = compare(manifest['native'], args.require_eviction)
+    for mode, result in manifest['native'].items():
+        plan = result.get('runtime_plan', {})
+        if plan.get('effective_context') != args.context or plan.get('effective_concurrency') != max(args.concurrency):
+            failures.append(f'{mode}: effective context/concurrency differs from requested workload')
     for mode, result in manifest['http'].items():
         if len(result) != 5: failures.append(f'HTTP {mode}: five-turn evidence incomplete')
         for row in result:
