@@ -441,12 +441,10 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
                 }
             }
         }
-        for (int token_id = range_start; token_id < range_end; ++token_id) {
-            if (is_allowed(token_id)) {
-                return token_id;
-            }
-        }
-        return range_start;
+        // Nonfinite logits may use a deterministic legal fallback, but hard
+        // token constraints cannot be relaxed when their support is empty.
+        throw densecore::llm::sampling::SamplingConstraintError(
+            "no token satisfies vocabulary range and token masks");
     };
     auto finite_argmax_raw = [last_logits, range_start, range_end, &is_disallowed, &is_allowed, &first_allowed_token,
                               &params]() -> int {
