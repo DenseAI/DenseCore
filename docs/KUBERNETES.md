@@ -7,7 +7,9 @@ actual hardware; they cannot be inferred from an amd64 fixture or an image build
 
 The [limited-pod example](../charts/densecore/examples/values-local-pod.yaml)
 uses Qwen3.5-0.8B at a full revision and SHA-256, a checksum-verifying init
-container, a shared model volume and limits of 2 CPU / 4 GiB. It is a local image
+container, a shared model volume, an explicit 2048-token context and limits of
+2 CPU / 4 GiB. This context is a test/deployment setting, not an automatic
+production context reduction. It is a local image
 example, not a published v0.2 image claim. Replace image repositories/tags and
 pull policies with your own validated images in a real cluster.
 

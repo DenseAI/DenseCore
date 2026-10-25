@@ -30,6 +30,7 @@ docker run --detach \
   --publish "127.0.0.1:$port:8080" \
   --mount "type=bind,src=$(realpath "$model"),dst=/models/release-smoke.gguf,readonly" \
   --env MAIN_MODEL_PATH=/models/release-smoke.gguf \
+  --env DENSECORE_MAX_SEQ_LEN="${DENSECORE_SMOKE_CONTEXT:-2048}" \
   "$image" >/dev/null
 
 wait_for_http() {
@@ -53,6 +54,7 @@ base_url="http://127.0.0.1:$port"
 wait_for_http "$base_url/health/live"
 wait_for_http "$base_url/health/startup"
 wait_for_http "$base_url/health/ready"
+docker inspect "$container_name" > "$tmp_dir/positive-container-config.json"
 curl -fsS "$base_url/v1/models" >"$tmp_dir/models.json"
 
 curl -fsS -H 'Content-Type: application/json' \
