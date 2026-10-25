@@ -43,3 +43,52 @@ After result retrieval independently list VM, disks and reserved addresses and
 verify deletion, including resources created before an interrupted run. An
 unavailable API or disabled billing is a blocked cloud prerequisite, not a reason
 to auto-enable services or substitute local fixtures for cloud evidence.
+
+## Read-only cleanup receipt
+
+Record every session-created VM, disk (including boot disks) and reserved address
+with its project, scope, name and numeric ID before cleanup. Keep those records
+outside the repository with the session's raw evidence. After independently
+deleting them, verify their absence with a new receipt:
+
+```json
+{
+  "schema_version": 1,
+  "project": "densecore-project",
+  "resources": [
+    {"kind": "instance", "scope": "zones/us-central1-a", "name": "session-vm", "id": "123"},
+    {"kind": "disk", "scope": "zones/us-central1-a", "name": "session-boot", "id": "124"},
+    {"kind": "address", "scope": "regions/us-central1", "name": "session-ip", "id": "125"}
+  ]
+}
+```
+
+```bash
+python3 benchmarks/economics/verify_session_cleanup.py /tmp/session-resources.json \
+  --output /tmp/session-cleanup.json
+```
+
+Before any provider call, the verifier locally checks that the installed SDK
+recognizes and disables `core/should_prompt_to_enable_api` and
+`compute/allow_partial_error`, forced through environment properties. Unknown or
+enabled guards fail before inventory. This matters because SDK prompts can
+accept their default on EOF; closed input alone does not prevent API enablement.
+The provider commands only describe the project and list instances, disks and
+addresses. The verifier never enables an API or changes a cloud resource.
+An inactive/wrong project, failed command, warning, invalid inventory,
+or remaining target produces a failed receipt. A same-name replacement in the
+same scope also fails even when its numeric ID changed. Stopped VMs, unattached
+disks and unused addresses still count as present.
+
+The new receipt retains the manifest/verifier hashes and the exact commands,
+stdout, stderr and their SHA-256 hashes (commands use compact JSON arrays).
+Existing evidence files are never overwritten.
+Unlisted resources are reported separately; a pass covers only the explicitly
+listed targets, not an assertion that the project is empty or the final bill is
+settled. Review that inventory for resources omitted after an interrupted run,
+and retain pending liabilities in the cost ledger until billing settles.
+
+The underlying list commands are unfiltered and unlimited. In particular,
+[address listing includes global and regional addresses by default](https://docs.cloud.google.com/sdk/gcloud/reference/compute/addresses/list).
+This verifier has local fake-command regression coverage; an actual GCP receipt
+must still be obtained for each paid session.
