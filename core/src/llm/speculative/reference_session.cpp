@@ -12,7 +12,10 @@ class RestoreInferenceContext {
 public:
     RestoreInferenceContext() : work_(GetCurrentWorkContext()), batch_(GetCurrentBatch()), phase_(GetCurrentExecutionPhase()) {}
     ~RestoreInferenceContext() {
-        SetCurrentWorkContext(work_); SetCurrentBatch(batch_); SetCurrentExecutionPhase(phase_);
+        SetCurrentWorkContext(work_);
+        if (batch_) SetCurrentBatch(batch_);
+        else ClearCurrentBatch();
+        SetCurrentExecutionPhase(phase_);
     }
 private:
     InferenceWorkContext* work_;

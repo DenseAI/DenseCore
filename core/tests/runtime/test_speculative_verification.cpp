@@ -179,7 +179,7 @@ TEST(NextNGraph, ExecutesHiddenTokenFusionAndSharedOutputHead) {
     EXPECT_NEAR(static_cast<float*>(next_hidden->data)[0], logits[0], 1e-6f);
     EXPECT_NEAR(static_cast<float*>(next_hidden->data)[1], logits[1], 1e-6f);
     ggml_free(ctx);
-    SetCurrentBatch(nullptr);
+    ClearCurrentBatch();
     SetCurrentWorkContext(nullptr);
     cache->block_manager->Free(blocks);
 }
