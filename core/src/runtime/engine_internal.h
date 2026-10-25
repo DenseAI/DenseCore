@@ -106,6 +106,9 @@ size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int k_head_dim, int v_h
                                    int index_head_dim = 0);
 KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type);
 KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type);
+DenseCoreHandle InitializeEngineWithOptionsInternal(const char* model_path, const char* reserved, int threads,
+    int numa_node_id, int pinning_policy, int kv_type, int spec_type, int draft_n_max);
+
 densecore::SchedulerConfig BuildRuntimeSchedulerConfig(const KVCacheConfig& kv_config,
                                                       const TransformerModel* model = nullptr);
 

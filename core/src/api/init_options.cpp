@@ -1,8 +1,6 @@
 #include "densecore.h"
 
 #include "runtime/engine_internal.h"
-#include "runtime/speculation_config.h"
-#include <memory>
 #include <cstdio>
 
 namespace {
@@ -47,25 +45,8 @@ DENSECORE_API DenseCoreHandle InitEngineWithOptions(const char* model_path, cons
     if (kv_cache_type < -1 || kv_cache_type > DENSECORE_KV_INT4) {
         return invalid("InitEngineWithOptions: unsupported KV cache type");
     }
-    DenseCoreHandle handle = kv_cache_type == -1
-        ? InitEngineEx(model_path, reserved, threads, numa_node_id, pinning_policy)
-        : InitEngineWithKVType(model_path, reserved, threads, numa_node_id, pinning_policy,
-                               static_cast<DenseCoreKVType>(kv_cache_type));
-    if (!handle) return nullptr;
-    std::unique_ptr<void, decltype(&FreeEngine)> owner(handle, FreeEngine);
-    try {
-        std::string error;
-        if (!ConfigureSpeculation(static_cast<EngineState*>(handle), spec, draft_limit, &error)) {
-            owner.reset();
-            SetLastError(DENSECORE_STATUS_UNSUPPORTED_OPERATION, "InitEngineWithOptions: " + error);
-            return nullptr;
-        }
-        return owner.release();
-    } catch (const std::exception& e) {
-        owner.reset();
-        SetLastError(DENSECORE_STATUS_INTERNAL_ERROR, e.what());
-        return nullptr;
-    }
+    return InitializeEngineWithOptionsInternal(model_path, reserved, threads, numa_node_id, pinning_policy,
+                                               kv_cache_type, spec, draft_limit);
 }
 
 DENSECORE_API int DenseCoreGetRuntimePlan(DenseCoreHandle handle, DenseCoreRuntimePlan* out) {

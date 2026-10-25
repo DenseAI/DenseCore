@@ -40,6 +40,7 @@
 #include "models/model_prompt_templates.h"
 #include "runtime/engine_internal.h"
 #include "runtime/request_builder.h"
+#include "runtime/speculation_config.h"
 #include "runtime/runtime_env.h"
 #include "runtime/worker_internal.h"
 
@@ -967,7 +968,7 @@ bool StartEngineThreads(EngineState* state) {
 // setup and cleanup. Only the requested KV type differs.
 DenseCoreHandle InitializeEngineCommon(const char* model_path, const char* reserved, int threads,
                                       int numa_node_id, int pinning_policy, ggml_type requested_type,
-                                      const char* api_name) {
+                                      const char* api_name, int spec_type = 0, int draft_n_max = 2) {
     try {
         ClearError();
         static std::once_flag log_init_flag;
@@ -978,7 +979,13 @@ DenseCoreHandle InitializeEngineCommon(const char* model_path, const char* reser
         threads = ResolveEngineThreadCount(threads);
         InitializeRuntimeBackends(threads);
         auto state = InitializeEngineResources(paths, threads, numa_node_id, pinning_policy, requested_type, api_name);
-        if (!state || !StartEngineThreads(state.get())) return nullptr;
+        if (!state) return nullptr;
+        std::string speculation_error;
+        if (!ConfigureSpeculation(state.get(), spec_type, draft_n_max, &speculation_error)) {
+            SetError(DENSECORE_STATUS_UNSUPPORTED_OPERATION, std::string(api_name) + ": " + speculation_error);
+            return nullptr;
+        }
+        if (!StartEngineThreads(state.get())) return nullptr;
         ClearError();
         return static_cast<DenseCoreHandle>(state.release());
     } catch (const densecore::DenseCoreException& e) {
@@ -990,6 +997,21 @@ DenseCoreHandle InitializeEngineCommon(const char* model_path, const char* reser
 }
 
 }  // namespace
+
+DenseCoreHandle InitializeEngineWithOptionsInternal(const char* model_path, const char* reserved, int threads,
+                                                    int numa_node_id, int pinning_policy, int kv_type,
+                                                    int spec_type, int draft_n_max) {
+    ggml_type cache_type = GGML_TYPE_COUNT;
+    switch (kv_type) {
+        case DENSECORE_KV_FP16: cache_type = GGML_TYPE_F16; break;
+        case DENSECORE_KV_FP32: cache_type = GGML_TYPE_F32; break;
+        case DENSECORE_KV_INT8: cache_type = GGML_TYPE_Q8_0; break;
+        case DENSECORE_KV_INT4: cache_type = GGML_TYPE_Q4_0; break;
+        default: break; // -1 keeps the model's existing default KV policy.
+    }
+    return InitializeEngineCommon(model_path, reserved, threads, numa_node_id, pinning_policy,
+                                  cache_type, "InitEngineWithOptions", spec_type, draft_n_max);
+}
 
 /**
  * @brief Initialize engine with default NUMA settings (simplified API)
