@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-EVALUATOR_VERSION = "final-answer-complete-v5"
+EVALUATOR_VERSION = "final-answer-complete-v6"
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -69,6 +69,7 @@ def request_visible_content(
         "temperature": case.get("temperature", 0),
         "top_p": case.get("top_p", 1),
         "top_k": case.get("top_k", 1),
+        "repetition_penalty": case.get("repetition_penalty", 1.0),
         "seed": case.get("seed", 123),
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -136,6 +137,13 @@ def evaluate_case(url: str, case: dict[str, Any], timeout_s: float, enable_think
         "visible_content": visible_content,
         "reasoning_content": reasoning_content,
         "evaluation_channel": "final_content",
+        "requested_sampling": {
+            "temperature": case.get("temperature", 0),
+            "top_p": case.get("top_p", 1),
+            "top_k": case.get("top_k", 1),
+            "repetition_penalty": case.get("repetition_penalty", 1.0),
+            "seed": case.get("seed", 123),
+        },
         "final_content": evaluation_content,
         "missing_expected": missing,
         "forbidden_found": forbidden,

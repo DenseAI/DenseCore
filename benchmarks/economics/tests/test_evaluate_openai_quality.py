@@ -70,6 +70,7 @@ class QualityEvaluationTest(unittest.TestCase):
                 f"http://127.0.0.1:{server.server_port}/v1/chat/completions", case, 5, enable_thinking=False
             )
             self.assertEqual(received["top_k"], 1)
+            self.assertEqual(received["repetition_penalty"], 1.0)
             self.assertEqual(received["chat_template_kwargs"], {"enable_thinking": False})
         finally:
             server.shutdown()
