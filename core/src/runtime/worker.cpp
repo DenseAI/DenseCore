@@ -4244,7 +4244,15 @@ void EngineLoop(EngineState* state) {
             // - Added unnecessary latency to every inference call
             // - Could fail under heavy load or on different CPU architectures
             // =======================================================================
-            if (!main_work_context_bound_for_current_graph) {
+            // Cached callbacks retain their owning work context. The build scope
+            // clears its batch/phase on exit, so bind that same owner for every
+            // execution, including the first one, without resetting its userdata.
+            std::unique_ptr<ScopedBatchWorkContext> cached_execution_scope;
+            if (graph_execution_work_ctx && graph_execution_work_ctx != work_ctx.get()) {
+                cached_execution_scope = std::make_unique<ScopedBatchWorkContext>(
+                    graph_execution_work_ctx, &batch, batch_execution_phase, false,
+                    current_model ? current_model->variant : ModelVariant::UNKNOWN);
+            } else if (!main_work_context_bound_for_current_graph) {
                 bind_main_work_context_for_graph(batch, batch_execution_phase);
             } else {
                 SetCurrentExecutionPhase(batch_execution_phase);

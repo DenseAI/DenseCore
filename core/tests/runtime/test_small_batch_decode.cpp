@@ -11,6 +11,7 @@ bool RunQwenNativeM4GraphForTest(bool fused, bool* matches, uint64_t* ops);
 bool QwenQ4DownPairAvailableForTest();
 bool RunQwenQ4DownPairCallbackForTest(bool qwen36, int tokens, int phase, bool* matches, uint64_t* used);
 int ModelVariantAfterWorkContextResetForTest(int kind);
+bool CachedGraphExecutionBindingForTest(bool replay);
 }  // namespace densecore::testing
 
 TEST(SmallBatchDecodeTest, CachedGraphAndProfileResetPreserveModelIdentity) {
@@ -98,4 +99,9 @@ TEST(SmallBatchDecodeTest, NativeTilesRespectPaddedInputAndOutputColumns) {
         EXPECT_TRUE(exact);
         EXPECT_EQ(used, densecore::testing::NativeM4AvailableForTest(q6) ? 1u : 0u);
     }
+}
+
+TEST(CachedGraphExecutionContextTest, BindsOwnerOnFirstExecutionAndReplay) {
+    EXPECT_TRUE(densecore::testing::CachedGraphExecutionBindingForTest(false));
+    EXPECT_TRUE(densecore::testing::CachedGraphExecutionBindingForTest(true));
 }
