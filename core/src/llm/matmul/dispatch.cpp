@@ -1238,6 +1238,8 @@ static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const T
     ud->require_q4k_true_batched = prefill.lfm2_prefill_q4k_relevant ||
                                    prefill.qwen36_hybrid_ssm_q4k_prefill_weight_is_q4k ||
                                    prefill.qwen36_lm_head_q4k_prefill_relevant;
+    ud->gemma4_canonical_q4k_columns = model && model->variant == ModelVariant::GEMMA4 &&
+                                         weight->type == GGML_TYPE_Q4_K && !ud->require_q4k_true_batched;
     ud->gemma4_prefill_safe_batched = gemma4_prefill_safe_batched;
     ud->disable_quant_nrc_fast = dispatch.matmul_plan.qwen.qwen35_0_8b || prefill.lfm2_prefill_quant_nrc_unsafe ||
                                  prefill.lfm2_prefill_q4k_relevant || gemma4_prefill_safe_batched;

@@ -216,6 +216,42 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         }
     }
 
+    // Canonical Gemma Q4_K columns use the identical packed/raw GEMV policy
+    // and accumulation order as M=1. GGML workers still own disjoint output
+    // rows; the scheduler keeps the physical batch and its independent KV.
+    // The local userdata deliberately has no shared quant buffer/stamp: every
+    // worker owns its TLS activation bytes until it finishes that column.
+    if (ud->gemma4_canonical_q4k_columns && weight_type == GGML_TYPE_Q4_K &&
+        ud->input_quant_type == GGML_TYPE_Q8_K && output_contig &&
+        callback_phase == InferenceExecutionPhase::Decode &&
+        !ud->gemma4_prefill_safe_batched && !ud->force_reference_scalar) {
+        GemvUserData column_ud{};
+        column_ud.weight_tensor = const_cast<ggml_tensor*>(weight_tensor);
+        column_ud.N = N;
+        column_ud.K = K;
+        column_ud.weight_type = weight_type;
+        column_ud.input_quant_type = GGML_TYPE_Q8_K;
+        column_ud.force_reference_scalar = ud->force_reference_scalar;
+        column_ud.dynamic_lora_active = callback_batch && !callback_batch->lora_map.empty();
+        column_ud.work_ctx = callback_work_ctx;
+        column_ud.phase_snapshot = callback_phase;
+        for (int m = 0; m < M; ++m) {
+            ggml_tensor column_input = *src;
+            column_input.data = const_cast<float*>(x_rows[static_cast<size_t>(m)]);
+            column_input.ne[1] = column_input.ne[2] = column_input.ne[3] = 1;
+            column_input.nb[0] = sizeof(float);
+            column_input.nb[1] = column_input.nb[2] = column_input.nb[3] = N * sizeof(float);
+            ggml_tensor column_output = *dst;
+            column_output.data = output_base + static_cast<size_t>(m) * output_col_stride;
+            column_output.ne[1] = column_output.ne[2] = column_output.ne[3] = 1;
+            column_output.src[0] = &column_input;
+            column_output.src[1] = const_cast<ggml_tensor*>(weight_tensor);
+            cb_gemv_custom(&column_output, ith, nth, &column_ud);
+
+        }
+        return;
+    }
+
     const char* weight_base = reinterpret_cast<const char*>(weight_tensor->data);
 
     auto store_out = [&](int m, int k, float value) {
