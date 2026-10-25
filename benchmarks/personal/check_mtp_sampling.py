@@ -295,6 +295,8 @@ def parent(args, cases):
                    if request.get('strict_format') is not None]
     format_rows += [request['strict_format'] for mode in manifest['http'] for group in mode['groups']
                     for request in group['requests'] if request.get('strict_format') is not None]
+    format_rows += [mode['disconnect_probe']['followup']['strict_format'] for mode in manifest['http']
+                    if mode['disconnect_probe']['followup'].get('strict_format') is not None]
     manifest['strict_instruction_format'] = {'checked': len(format_rows),
         'passed': bool(format_rows) and all(row['passed'] for row in format_rows),
         'failures': sum(not row['passed'] for row in format_rows),
