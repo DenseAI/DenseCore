@@ -1120,3 +1120,24 @@ TEST(DecodeThreadPolicy, CommittedGraphBudgetLimitsOptionalGrowthButKeepsRequire
     EXPECT_LE(pool,budget);
     EXPECT_GT(PlanRuntimeGraphPoolBytes(&model,26,1,26,26,required_floor/2),required_floor/2);
 }
+
+size_t ReadAvailableMemoryBytesForRuntimePoolsForTest();
+TEST(DecodeThreadPolicy, PhysicalSafetyMarginIsNotChargedAgainstGraphCategoryAgain) {
+    using namespace densecore::runtime;
+    const auto detected = DetectResourceBudget();
+    ASSERT_EQ(detected.memory.state,ResourceState::Finite);
+    const uint64_t physical = detected.memory.bytes;
+    ASSERT_GT(physical,0u);
+    RuntimeMemoryPlan plan;
+    plan.resource_capacity_bytes = physical;
+    plan.available_bytes = physical;
+    plan.graph_bytes = physical/4;
+    ResourcePlanLease lease(plan);
+    const size_t category = ResourceAllocationLease::AvailableBytes(AllocationCategory::Graph);
+    const size_t pool = category*7/8;
+    const size_t safety_margin = category/2;
+    EXPECT_LE(pool,category);
+    EXPECT_FALSE(GraphPoolReplacementFitsForTest(pool,safety_margin,category));
+    EXPECT_TRUE(GraphPoolReplacementFitsForTest(pool,safety_margin,
+                                               ReadAvailableMemoryBytesForRuntimePoolsForTest()));
+}

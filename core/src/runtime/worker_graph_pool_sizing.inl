@@ -4,16 +4,19 @@ bool IsFlexibleGraphPoolSizingEnabled(const TransformerModel* model) {
 }
 
 size_t ReadAvailableMemoryBytesForRuntimePools() {
-    const char* hint = std::getenv("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT");
-    if (hint && hint[0]) {
-        uint64_t mb = 0;
-        if (densecore::runtime::ResourceUnsigned(hint, mb) && mb <= SIZE_MAX / (1024*1024)) return mb * (1024*1024);
-    }
     const auto memory = densecore::runtime::DetectResourceBudget().memory;
-    const uint64_t graph_available = densecore::runtime::ResourceAllocationLease::AvailableBytes(
-        densecore::runtime::AllocationCategory::Graph);
-    return memory.state == densecore::runtime::ResourceState::Finite
-               ? static_cast<size_t>(std::min(memory.bytes,graph_available)) : 0;
+    if (memory.state != densecore::runtime::ResourceState::Finite) return 0;
+    uint64_t available = memory.bytes;
+    const char* hint = std::getenv("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT");
+    uint64_t mb = 0;
+    if (hint && densecore::runtime::ResourceUnsigned(hint,mb) && mb <= SIZE_MAX/(1024*1024))
+        available = std::min<uint64_t>(available,mb*(1024*1024));
+    return static_cast<size_t>(available);
+}
+
+size_t ReadAvailableGraphReservationBytes() {
+    return static_cast<size_t>(std::min<uint64_t>(ReadAvailableMemoryBytesForRuntimePools(),
+        densecore::runtime::ResourceAllocationLease::AvailableBytes(densecore::runtime::AllocationCategory::Graph)));
 }
 
 void AccumulateDryRunTensorBytes(const ggml_tensor* tensor, std::unordered_set<const ggml_tensor*>& seen,
@@ -256,7 +259,7 @@ FlexibleGraphPoolSizing MeasureFlexibleGraphPoolSize(TransformerModel* model, Pa
 
     constexpr size_t MB = 1024ULL * 1024ULL;
     const size_t fallback_mb = std::max<size_t>(512, fallback_estimate.total_bytes / MB);
-    const size_t available_bytes = ReadAvailableMemoryBytesForRuntimePools();
+    const size_t available_bytes = ReadAvailableGraphReservationBytes();
     const size_t available_mb = available_bytes / MB;
     const size_t auto_dry_cap_mb =
         available_mb > 0 ? std::max<size_t>(512, (available_mb * 3) / 4) : std::max<size_t>(fallback_mb, 1024);
@@ -365,7 +368,7 @@ FlexibleGraphPoolSizing EstimateFlexibleGraphPoolSizeWithoutDryRun(
     }
 
     constexpr size_t MB = 1024ULL * 1024ULL;
-    const size_t available_bytes = available_override == SIZE_MAX ? ReadAvailableMemoryBytesForRuntimePools() : available_override;
+    const size_t available_bytes = available_override == SIZE_MAX ? ReadAvailableGraphReservationBytes() : available_override;
     size_t target_bytes = fallback_estimate.total_bytes;
     const bool x86_qwen_chunked = IsX86QwenHybridMoEChunkedPrefillEstimate(model, fallback_estimate);
     if (fallback_estimate.effective_query_len > 1) {

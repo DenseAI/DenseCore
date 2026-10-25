@@ -642,6 +642,10 @@ size_t ResolveGraphPoolReservationBytesForTest(size_t required_payload_bytes, si
     return ResolveGraphPoolReservationBytes(required_payload_bytes, current_pool_bytes, allow_growth_reserve);
 }
 
+size_t ReadAvailableMemoryBytesForRuntimePoolsForTest() {
+    return ReadAvailableMemoryBytesForRuntimePools();
+}
+
 bool GraphPoolReplacementFitsForTest(size_t target_bytes, size_t safety_margin_bytes, size_t available_bytes) {
     return GraphPoolReplacementFits(target_bytes, safety_margin_bytes, available_bytes);
 }
