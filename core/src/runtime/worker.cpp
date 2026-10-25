@@ -44,6 +44,7 @@
 #include "llm/attention/exec.h"
 #include "llm/config/runtime_config.h"
 #include "llm/graph/cache.h"
+#include "llm/sampling/sampling_rng.h"
 #include "runtime/engine_internal.h"
 #include "runtime/runtime_env.h"
 #include "runtime/worker_internal.h"
@@ -5892,7 +5893,7 @@ void EngineLoop(EngineState* state) {
                                                                      profile_work_ctx, static_cast<int>(output->ne[0]),
                                                                      &best_token, &precomputed_lfm2_argmax_value);
                     if (!can_use_precomputed_lfm2_argmax) {
-                        best_token = SampleToken(output, sampling_logits_idx, sampling_params);
+                        best_token = SampleTokenWithRng(output, sampling_logits_idx, sampling_params, req->SamplingRng());
                     }
                     LogRequestLifecyclePhase("sample_end", req, current_model, req->seq_id, batch.num_seqs,
                                              static_cast<int>(batch.tokens.size()), active_threads);

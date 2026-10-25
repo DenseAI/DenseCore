@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <random>
 #include <sstream>
 #include <stack>
 #include <string>
@@ -344,6 +345,23 @@ struct Request {
 
     // Sampling parameters (per-request)
     SamplingParams sampling_params;
+    std::mt19937 sampling_rng;
+    bool sampling_rng_initialized = false;
+
+    std::mt19937& SamplingRng() {
+        if (!sampling_rng_initialized) {
+            const uint64_t seed = sampling_params.seed;
+            if (seed != 0) {
+                std::seed_seq sequence{static_cast<uint32_t>(seed), static_cast<uint32_t>(seed >> 32)};
+                sampling_rng.seed(sequence);
+            } else {
+                sampling_rng.seed(std::random_device{}());
+            }
+            sampling_rng_initialized = true;
+        }
+        return sampling_rng;
+    }
+
     std::vector<int> disallowed_token_ids;
     std::vector<int> allowed_token_ids;
     std::vector<std::string> stop_sequences;
@@ -835,6 +853,7 @@ struct Request {
         parity_debug_submit_api.clear();
         token_id_submit_used = false;
         cancelled = false;
+        sampling_rng_initialized = false;
         generation_terminal_dispatched.store(false, std::memory_order_relaxed);
         embedding_terminal_dispatched.store(false, std::memory_order_relaxed);
         tier = "standard";

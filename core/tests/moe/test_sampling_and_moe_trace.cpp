@@ -17,6 +17,8 @@
 #include "models/gemma4_packed_expert_layout.h"
 #include "runtime/inference_types_internal.h"
 #include "runtime/runtime_env.h"
+#include "runtime/engine_internal.h"
+#include "llm/sampling/sampling_rng.h"
 #include "llm/runtime/work_context.h"
 
 namespace densecore::testing {
@@ -1561,4 +1563,33 @@ TEST(MoETrace, GraphBoundCallbackCannotFallBackWithoutCpuDependencies) {
     EXPECT_FLOAT_EQ(static_cast<const float*>(output->data)[0], 0.0f);
     EXPECT_FLOAT_EQ(static_cast<const float*>(output->data)[1], 0.0f);
     ResetMoEStrictFailure();
+}
+
+TEST(SamplingRequestIsolation, SeededStreamsIgnoreInterleavingAndPoolReuse) {
+    ggml_init_params init{4096, nullptr, false};
+    auto* ctx = ggml_init(init);
+    ASSERT_NE(ctx, nullptr);
+    auto* logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 1);
+    for (int i = 0; i < 8; ++i) static_cast<float*>(logits->data)[i] = float(i) * 0.1f;
+    for (int top_k : {3, 8}) {
+        Request a, b, noise;
+        a.sampling_params.seed = b.sampling_params.seed = 0xf1234567abcdefULL;
+        noise.sampling_params.seed = 4321;
+        a.sampling_params.top_k = b.sampling_params.top_k = noise.sampling_params.top_k = top_k;
+        a.sampling_params.top_p = b.sampling_params.top_p = noise.sampling_params.top_p = top_k == 3 ? 1.0f : 0.8f;
+        std::vector<int> expected;
+        for (int i = 0; i < 64; ++i) {
+            expected.push_back(SampleTokenWithRng(logits, 0, a.sampling_params, a.SamplingRng()));
+        }
+        for (int i = 0; i < 64; ++i) {
+            for (int j = 0; j < i % 5; ++j)
+                SampleTokenWithRng(logits, 0, noise.sampling_params, noise.SamplingRng());
+            EXPECT_EQ(SampleTokenWithRng(logits, 0, b.sampling_params, b.SamplingRng()), expected[i]);
+        }
+        b.Reset();
+        b.sampling_params = a.sampling_params;
+        for (int i = 0; i < 64; ++i)
+            EXPECT_EQ(SampleTokenWithRng(logits, 0, b.sampling_params, b.SamplingRng()), expected[i]);
+    }
+    ggml_free(ctx);
 }

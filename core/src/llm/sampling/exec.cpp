@@ -1,4 +1,5 @@
 #include "densecore/runtime/inference.h"
+#include "llm/sampling/sampling_rng.h"
 
 #include "runtime/runtime_env.h"
 #include <algorithm>
@@ -347,7 +348,7 @@ void ApplyGrammarMask(float* logits, int n_vocab, const GrammarConstraint* gramm
 // Token Sampling
 // ============================================================================
 
-int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& params) {
+static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingParams& params, std::mt19937& rng) {
     if (!logits || !logits->data) return 0;
 
     float* logits_data = (float*)logits->data;
@@ -1021,29 +1022,8 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
             return candidates.front().token_id;
         }
 
-        thread_local std::unique_ptr<std::mt19937> rng;
-        thread_local uint64_t last_seed = 0;
-        thread_local bool seeded_from_device = false;
-        if (!rng) {
-            rng = std::make_unique<std::mt19937>(std::random_device{}());
-            seeded_from_device = true;
-            last_seed = 0;
-        }
-        if (params.seed != 0) {
-            if (last_seed != params.seed || seeded_from_device) {
-                std::seed_seq seq{static_cast<uint32_t>(params.seed), static_cast<uint32_t>(params.seed >> 32)};
-                rng->seed(seq);
-                last_seed = params.seed;
-                seeded_from_device = false;
-            }
-        } else if (!seeded_from_device) {
-            rng->seed(std::random_device{}());
-            last_seed = 0;
-            seeded_from_device = true;
-        }
-
         std::uniform_real_distribution<float> dist(0.0f, total_mass);
-        const float random_val = dist(*rng);
+        const float random_val = dist(rng);
         float cumulative_mass = 0.0f;
         for (const auto& candidate : candidates) {
             cumulative_mass += candidate.mass;
@@ -1138,29 +1118,8 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
         return candidates.front().token_id;
     }
 
-    thread_local std::unique_ptr<std::mt19937> rng;
-    thread_local uint64_t last_seed = 0;
-    thread_local bool seeded_from_device = false;
-    if (!rng) {
-        rng = std::make_unique<std::mt19937>(std::random_device{}());
-        seeded_from_device = true;
-        last_seed = 0;
-    }
-    if (params.seed != 0) {
-        if (last_seed != params.seed || seeded_from_device) {
-            std::seed_seq seq{static_cast<uint32_t>(params.seed), static_cast<uint32_t>(params.seed >> 32)};
-            rng->seed(seq);
-            last_seed = params.seed;
-            seeded_from_device = false;
-        }
-    } else if (!seeded_from_device) {
-        rng->seed(std::random_device{}());
-        last_seed = 0;
-        seeded_from_device = true;
-    }
-
     std::uniform_real_distribution<float> dist(0.0f, total_mass);
-    const float random_val = dist(*rng);
+    const float random_val = dist(rng);
     float cumulative_mass = 0.0f;
     for (const auto& candidate : candidates) {
         cumulative_mass += candidate.mass;
@@ -1176,4 +1135,25 @@ int SampleToken(struct ggml_tensor* logits, int idx, const SamplingParams& param
     debug_dump_top_candidates("sorted_front_fallback", candidates.front().token_id);
     debug_log_sample(candidates.front().token_id);
     return candidates.front().token_id;
+}
+
+int SampleTokenWithRng(GgmlTensorHandle* logits, int idx, const SamplingParams& params, std::mt19937& rng) {
+    return SampleTokenImpl(logits, idx, params, rng);
+}
+
+int SampleToken(GgmlTensorHandle* logits, int idx, const SamplingParams& params) {
+    // Compatibility path for direct callers without request ownership. The
+    // worker always supplies its request's generator through SampleTokenWithRng.
+    thread_local std::mt19937 rng(std::random_device{}());
+    thread_local uint64_t last_seed = 0;
+    if (last_seed != params.seed) {
+        if (params.seed != 0) {
+            std::seed_seq seq{static_cast<uint32_t>(params.seed), static_cast<uint32_t>(params.seed >> 32)};
+            rng.seed(seq);
+        } else {
+            rng.seed(std::random_device{}());
+        }
+        last_seed = params.seed;
+    }
+    return SampleTokenImpl(logits, idx, params, rng);
 }
