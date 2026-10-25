@@ -2,7 +2,7 @@
 
 **Release readiness is incomplete.** No v0.2 image, tag or release has been
 published by this work. Community post text remains the user's responsibility.
-The current integrated source is `143a2ad`; sanitizer, private model and earlier
+The current integrated source is `db9883a`; sanitizer, private model and earlier
 package evidence below have separate identities.
 
 Intended deployments are personal PCs, resource-limited CPU Kubernetes pods and
@@ -11,19 +11,26 @@ metadata-driven pooling, request/prefix ownership, speculative verification and
 native-backed Python completion metadata. See the [release gates](V0_2_RELEASE_GATES.md)
 and [model catalog](MODEL_CATALOG.md).
 
-- Integrated `143a2ad`: native 1312 run / 1298 passed / the same 14 skips /
-  zero failures or disabled tests; Go all-package and three repeated race runs
-  passed. Python SDK 164 passed / 27 existing optional skips on unchanged SDK
-  modules, plus 61 standard-library benchmark tests.
-- ASAN/LSan belongs to `3ed5428`: 662 run / 653 passed / 9 existing skips /
-  zero failures/reports. It excludes subsequent diagnostic ownership changes;
-  it is not a full-source `143a2ad` sanitizer result.
+- Integrated `db9883a`: native 1335 run / 1321 passed / the exact same 14 skips /
+  zero failures or disabled tests; 108 focused checks passed. The first audit
+  relinked the executable with unchanged SHA. The repeat audit is no-work on the
+  same source/test binary; this is not serving or model qualification.
+- Shared-sampler fixes cover disabled top-k, conditional nucleus filtering and
+  grammar intersections. Mock-native full-worker NONE error/peer/recovery regression
+  passes; new-source actual HTTP/Python sampling is not qualified.
+- Prior `143a2ad` Go all/race3, SDK 164/27 optional skips and benchmark stdlib 61
+  results retain that source boundary.
+- Selected critical ASAN/LSan on exact `db9883a`: 688 run / 679 passed / the same
+  9 prior skips / zero failures, disabled tests or reports. The final actual
+  wrapper audit is no-work with unchanged tested binary/source/header. This
+  excludes unmerged PLE/JSON work and is not real-model qualification; the prior
+  `3ed5428` sanitizer archive remains separate.
 - Real Python on integrated `143a2ad` passed 12 cases plus three raw native-token
   controls: completion counts/finish, cancellation, stream/task cleanup and
   recovery. Prompt counts remain client estimates, not native prompt accounting.
-- Actual c=8 resource testing observed active=8/pending=8, rejected oversized
-  prompt admission without callbacks and finalized all 36 accepted requests
-  once. Greedy parity still fails at EOS token position 50, continuing to the
+- Prior `143a2ad` actual c=8 resource testing observed active=8/pending=8,
+  rejected oversized prompt admission without callbacks and finalized all 36
+  accepted requests once. Greedy parity still fails at EOS token position 50, continuing to the
   128-token limit. Cache OFF and all-thread-policy=8 controls also fail.
 - Historical `7ecaf86` pinned 0.8B/plain 2B prefix and embedding checks passed.
   Those results are not automatically inherited by later numerical changes.
@@ -32,10 +39,13 @@ and [model catalog](MODEL_CATALOG.md).
   six HTTP failures/160 main requests. Native completion/cancel/recovery passes
   and zero literal-stop leaks across 32 probes (27 actual string stops) are
   separate checks. No population-distribution or speed claim follows.
-- Private Gemma `ad1aa84` matches c1 IDs in six of eight concurrent requests;
-  rank-2 failures persist with cache OFF. Debug `e9662e5` first observes a
-  Q4_K projection difference from identical inputs. A fix and support promotion
-  remain pending; E4B canonical/mixed validation is held.
+- Private Gemma `d4088c7` cache-ON c4 still fails: rank-0 requests 1/5 produce
+  135 IDs against c1's 127, first difference index 52. Same-source cache-OFF,
+  mixed and E4B matrices are not run. Private DEBUG `658e626` reproduces the PLE
+  delta with 17 exact core stages; identical gated inputs still diverge through
+  F32 PLE projection. Its observer is not root-merged and the fix is pending.
+- MTP JSON completion remains a source-confirmed gap with separate implementation
+  pending; no new-source native/HTTP/Python completion proof is claimed.
 - Separate Go-only `386b800` portable amd64 image passed actual container and
   kind strict drain: same-round readiness 503/new-admission 503/native active=1,
   accepted stream finish/DONE once, 7.596/7.903 seconds after signal commands

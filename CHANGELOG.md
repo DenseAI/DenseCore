@@ -30,21 +30,29 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   cold/warm parity and pinned 0.8B/2B prefix restoration/eviction checks passed;
   those results do not automatically carry over later numerical changes.
 - Add Gemma per-request attention/Q4 KV and GPT-OSS packed-expert/Harmony
-  candidates. Private Gemma E2B c4 parity is 6/8, with rank-2 failures even with cache
-  OFF; paired projection diagnosis is incomplete. E4B canonical/mixed and actual
-  GPT-OSS inference remain unqualified.
+  candidates. Private `d4088c7` E2B c4 parity still fails (rank-0 requests 1/5:
+  135 versus 127 IDs, first difference 52). Same-source cache-OFF/mixed/E4B are
+  not run. Private `658e626` DEBUG narrows a surviving delta to F32 PLE projection
+  from identical input; observer/root integration and functional fix remain pending.
+- Correct shared-sampler top-k=0, conditional nucleus probabilities and grammar
+  intersections with whitelist/range constraints. Mock-native full-worker
+  NONE request error/peer/recovery checks pass; actual new-source HTTP/Python sampling
+  is unqualified. MTP JSON completion has a separate pending implementation.
 - Verify model downloads/cached bytes and add native image-profile, limited-pod
   and reproducible CPU gates. Separate Go-only `386b800` portable amd64 actual
   container/kind strict drain observed readiness 503, admission 503 and native active=1
   during accepted work, bounded stream completion and cleanup. Strict Count
   still fails. Current integrated core image is untested; original successful
   init-log capture has syntax checks only, awaiting final kind validation.
-- Integrated `143a2ad` native: 1312 run, 1298 passed, the same 14 skips, zero
-  failures/disabled tests; Go all-package and three repeated race runs passed.
-  Python SDK: 164 passed/27 existing optional skips; benchmark stdlib tests: 61 passed. Scoped ASAN/LSan on `3ed5428`:
-  662 run, 653 passed, the same 9 skips, zero reports; later diagnostic ownership
-  changes are outside that sanitizer run. No final-release, model-support or
-  performance/default promotion follows from these checks.
+- Integrated `db9883a` native: 1335 run, 1321 passed, exactly the same 14 skips,
+  zero failures/disabled; focused 108 passed. Initial audit relinked with unchanged
+  executable SHA, so it is not a no-work result. A repeat no-work audit matches
+  the same source/test binary. Selected critical ASAN/LSan on exact `db9883a`:
+  688 run, 679 passed, the same 9 prior skips, zero failures/disabled/reports;
+  final actual wrapper audit is no-work on the tested artifact. Unmerged PLE
+  and pending JSON changes remain outside that result. Prior `143a2ad` Go/Python
+  and archived `3ed5428` ASAN remain source-labeled, not new-source adapter/model proof.
+  No final package, model-support or performance/default promotion follows.
 
 See [v0.2 release gates](docs/V0_2_RELEASE_GATES.md) for incomplete checks;
 these entries are not a released model-support or performance announcement.
