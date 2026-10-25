@@ -471,7 +471,11 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         // GEMM K_gemm = N (input dim), GEMM N_gemm = K (output dim)
         // Split-N over K_output (the output dimension, which IS GEMM's N).
         const bool weight_contig = (weight_row_stride == static_cast<size_t>(N) * sizeof(float));
-        if (input_contig && output_contig && weight_contig && (K % 8) == 0) {
+        // Highway's ABI has no outer strides: inner contiguity alone does not
+        // make padded input columns or output rows a dense matrix.
+        if (input_contig && output_contig && weight_contig &&
+            input_col_stride == static_cast<size_t>(N) * sizeof(float) &&
+            output_col_stride == static_cast<size_t>(K) * sizeof(float) && (K % 8) == 0) {
             const auto branch_begin = matmul_dispatch_census_enabled ? std::chrono::steady_clock::now()
                                                                      : std::chrono::steady_clock::time_point{};
             const float* A = reinterpret_cast<const float*>(input_base);
