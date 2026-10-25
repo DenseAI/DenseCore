@@ -475,15 +475,15 @@ func TestNormalizeSamplingParityModeSkipsFriendlyDefaults(t *testing.T) {
 	}
 }
 
-func TestBuildChatPromptQwenNoThinkingDoesNotInjectThinkScaffold(t *testing.T) {
+func TestBuildChatPromptQwenNoThinkingUsesPinnedClosedThoughtCue(t *testing.T) {
 	t.Setenv("DENSECORE_QWEN3_ENABLE_THINKING", "false")
 
 	prompt := BuildChatPrompt("/tmp/Qwen3-0.6B-Q4_K_M.gguf", []domain.Message{
 		{Role: "user", Content: "What is the capital of France?"},
 	}, nil)
 
-	if prompt != "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n" {
-		t.Fatalf("expected plain qwen no-thinking prompt, got %q", prompt)
+	if prompt != "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n" {
+		t.Fatalf("expected pinned Qwen3 closed-thought cue, got %q", prompt)
 	}
 }
 

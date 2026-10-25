@@ -179,7 +179,7 @@ func formatQwen35Prompt(modelHint string, messages []domain.Message, templateKwa
 		}
 	} else if thinkingEnabled {
 		sb.WriteString("<think>\n")
-	} else if isQwen35ModelHint(modelHint) {
+	} else if isQwen35ModelHint(modelHint) || isQwen3ModelHint(modelHint) {
 		sb.WriteString("<think>\n\n</think>\n\n")
 	}
 	return sb.String()
@@ -758,4 +758,13 @@ func preparedGenerationInput(prepared preparedPrompt, inputIDs []int) domain.Gen
 		kind = domain.GenerationInputTokenIDs
 	}
 	return domain.GenerationInput{Kind: kind, Text: prepared.prompt, TokenIDs: inputIDs}
+}
+
+// Qwen3 uses the same explicit closed-thought cue as its pinned GGUF template.
+// Keep the separate Next family out of this text-model compatibility rule.
+func isQwen3ModelHint(modelHint string) bool {
+	lower := strings.ToLower(strings.TrimSpace(modelHint))
+	return strings.Contains(lower, "qwen3") && !isQwen35ModelHint(lower) &&
+		!isQwen36ModelHint(lower) && !isQwen38ModelHint(lower) &&
+		!strings.Contains(lower, "qwen3next") && !strings.Contains(lower, "qwen3-next")
 }

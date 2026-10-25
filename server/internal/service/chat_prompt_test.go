@@ -330,3 +330,17 @@ func TestFormatChatPromptGemmaAssistantToolCallUsesToolSyntax(t *testing.T) {
 		t.Fatalf("expected gemma tool call syntax, got %q", prompt)
 	}
 }
+
+func TestFormatChatPromptQwen3NoThinkingMatchesPinnedGgufCue(t *testing.T) {
+	enabled := false
+	prompt := FormatChatPrompt("/models/Qwen3-0.6B-Q8_0.gguf", []domain.Message{{Role: "user", Content: "hello"}}, &domain.ChatTemplateKwargs{EnableThinking: &enabled})
+	expected := "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+	if prompt != expected {
+		t.Fatalf("pinned Qwen3 no-thinking cue mismatch: %q", prompt)
+	}
+	enabled = true
+	prompt = FormatChatPrompt("/models/Qwen3-0.6B-Q8_0.gguf", []domain.Message{{Role: "user", Content: "hello"}}, &domain.ChatTemplateKwargs{EnableThinking: &enabled})
+	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n<think>\n") {
+		t.Fatalf("thinking opt-in changed: %q", prompt)
+	}
+}

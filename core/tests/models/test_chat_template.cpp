@@ -235,6 +235,29 @@ TEST(ChatTemplateTest, Qwen3DefaultsToThinkingWhenEnvIsUnset) {
     EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
 }
 
+TEST(ChatTemplateTest, Qwen3NoThinkingMatchesPinnedGgufGenerationCue) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN3;
+    model.variant = ModelVariant::QWEN3;
+    model.token_to_id["<|im_start|>"] = 1;
+    model.token_to_id["<|im_end|>"] = 2;
+    const std::string expected = "<|im_start|>user\nhello<|im_end|>\n"
+                                 "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    setenv("DENSECORE_QWEN3_ENABLE_THINKING", "false", 1);
+    const auto simple = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
+    unsetenv("DENSECORE_QWEN3_ENABLE_THINKING");
+    EXPECT_EQ(simple, expected);
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(simple));
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "hello";
+    densecore::models::CanonicalChatRenderOptions options{};
+    options.enable_thinking = 0;
+    bool thinking_enabled = true;
+    EXPECT_EQ(densecore::models::RenderModelChatMessages(&model, {message}, options, &thinking_enabled), expected);
+    EXPECT_FALSE(thinking_enabled);
+}
+
 TEST(ChatTemplateTest, Qwen36DefaultsToThinkingWhenEnvIsUnset) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN35;
