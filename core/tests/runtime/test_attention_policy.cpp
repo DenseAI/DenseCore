@@ -156,11 +156,13 @@ TEST(AttentionPolicyTest, PagedFallbackReasonNameMatchesPolicyOff) {
                  "policy_off");
 }
 
-TEST(AttentionPolicyTest, Gemma4PagedDecodeUsesSlidingLayersOnly) {
+TEST(AttentionPolicyTest, Gemma4CachedDecodeUsesOwnedHistoryForSlidingAndFullLayers) {
     const TransformerModel gemma4 = MakeGemma4LayerPolicyModel();
 
+    // Full layers need the same sequence-owned history as sliding layers;
+    // the independent-history graph fixture checks their numerical isolation.
     EXPECT_TRUE(ResolveLayerDispatch(gemma4, 0).use_paged_decode_attention);
-    EXPECT_FALSE(ResolveLayerDispatch(gemma4, 1).use_paged_decode_attention);
+    EXPECT_TRUE(ResolveLayerDispatch(gemma4, 1).use_paged_decode_attention);
 }
 
 TEST(AttentionPolicyTest, BaseDecisionRejectsInvalidDecodeLayout) {
@@ -229,23 +231,32 @@ TEST(AttentionPolicyTest, DispatchDecisionUsesHalForNonCpuPreferredDevice) {
     EXPECT_EQ(decision.attention_path_kind, densecore::llm::attention::DecodeAttentionPathKind::Hal);
 }
 
-TEST(AttentionPolicyTest, Gemma4PrefillUsesPortableCpuFlashForGqaSoftcapSemantics) {
+TEST(AttentionPolicyTest, Gemma4CachedPrefillUsesOwnedHistoryAndUncachedUsesPortableFlash) {
     TransformerModel gemma4 = MakeModel(ModelArch::GEMMA, true);
     densecore::llm::attention::BasePagedDecodeExecutionDecision base{};
     base.use_paged_decode_attention = false;
     base.paged_decode_supported = true;
 
-    const auto decision = densecore::llm::attention::ResolveDecodeAttentionDispatchDecision(
-        &gemma4, base, /*use_cache=*/true, /*layer_idx=*/0, /*n_tokens_in_batch=*/22, /*n_past_val=*/0,
-        /*n_head=*/16, /*n_head_kv=*/8, /*head_dim_q=*/256, /*head_dim_kv=*/256, /*head_dim_v=*/256,
-        densecore::DeviceType::CPU, /*flash_attention_disabled=*/false, /*flash_attention_forced=*/false,
-        /*flash_attention_isa_supported=*/false, /*portable_cpu_flash_attention_enabled=*/true,
-        /*ops_registry_initialized=*/true, /*force_safe_gqa_decode_enabled=*/true,
-        /*debug_disable_fast_attn_from_layer=*/-1, /*qcur_contiguous=*/false, /*k_contiguous=*/false,
-        /*v_contiguous=*/false, /*single_seq_layout=*/false);
+    const auto resolve = [&](bool use_cache) {
+        return densecore::llm::attention::ResolveDecodeAttentionDispatchDecision(
+            &gemma4, base, use_cache, /*layer_idx=*/0, /*n_tokens_in_batch=*/22, /*n_past_val=*/0,
+            /*n_head=*/16, /*n_head_kv=*/8, /*head_dim_q=*/256, /*head_dim_kv=*/256, /*head_dim_v=*/256,
+            densecore::DeviceType::CPU, /*flash_attention_disabled=*/false, /*flash_attention_forced=*/false,
+            /*flash_attention_isa_supported=*/false, /*portable_cpu_flash_attention_enabled=*/true,
+            /*ops_registry_initialized=*/true, /*force_safe_gqa_decode_enabled=*/true,
+            /*debug_disable_fast_attn_from_layer=*/-1, /*qcur_contiguous=*/false, /*k_contiguous=*/false,
+            /*v_contiguous=*/false, /*single_seq_layout=*/false);
+    };
 
-    EXPECT_TRUE(decision.use_portable_cpu_flash_attention);
-    EXPECT_EQ(decision.attention_path_kind, densecore::llm::attention::DecodeAttentionPathKind::PortableCpuFlash);
+    const auto cached = resolve(true);
+    EXPECT_TRUE(cached.use_paged_decode_attention);
+    EXPECT_FALSE(cached.use_portable_cpu_flash_attention);
+    EXPECT_EQ(cached.attention_path_kind, densecore::llm::attention::DecodeAttentionPathKind::Paged);
+
+    const auto uncached = resolve(false);
+    EXPECT_FALSE(uncached.use_paged_decode_attention);
+    EXPECT_TRUE(uncached.use_portable_cpu_flash_attention);
+    EXPECT_EQ(uncached.attention_path_kind, densecore::llm::attention::DecodeAttentionPathKind::PortableCpuFlash);
 }
 
 TEST(AttentionPolicyTest, HeadSeqPortableFlashReferenceFallbackRequiresExplicitDebugOptIn) {
