@@ -3023,7 +3023,9 @@ void EngineLoop(EngineState* state) {
                         .mem_buffer = nullptr,
                         .no_alloc = false,
                     };
-                    candidate.ctx = candidate.work_ctx ? ggml_init(decode_params) : nullptr;
+                    candidate.allocation_lease = densecore::runtime::ResourceAllocationLease::Acquire(
+                        densecore::runtime::AllocationCategory::Graph, decode_params.mem_size);
+                    candidate.ctx = candidate.work_ctx && candidate.allocation_lease ? ggml_init(decode_params) : nullptr;
                     if (candidate.ctx) {
                         candidate.graph = ggml_new_graph_custom(candidate.ctx, 32768, false);
                         if (candidate.graph) {
@@ -3171,7 +3173,9 @@ void EngineLoop(EngineState* state) {
                         .mem_buffer = nullptr,
                         .no_alloc = false,
                     };
-                    candidate.ctx = candidate.work_ctx ? ggml_init(prefill_params) : nullptr;
+                    candidate.allocation_lease = densecore::runtime::ResourceAllocationLease::Acquire(
+                        densecore::runtime::AllocationCategory::Graph, prefill_params.mem_size);
+                    candidate.ctx = candidate.work_ctx && candidate.allocation_lease ? ggml_init(prefill_params) : nullptr;
                     if (candidate.ctx) {
                         candidate.graph = ggml_new_graph_custom(candidate.ctx, 32768, false);
                         if (candidate.graph) {

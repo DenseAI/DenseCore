@@ -133,6 +133,14 @@ std::unique_ptr<ModelEntry> MakeModelEntry(std::string model_id, std::string mod
                                            std::unique_ptr<PagedKVCache> kv_cache, const KVCacheConfig& kv_config) {
     auto entry = std::make_unique<ModelEntry>();
     entry->kv_config = kv_config;
+    if (kv_config.memory_plan.RequiredBytes() > 0 && kv_cache) {
+        uint64_t actual_kv = 0;
+        for (const auto* allocator : {kv_cache->k_allocator.get(),kv_cache->v_allocator.get(),kv_cache->index_allocator.get()}) {
+            if (allocator) actual_kv = densecore::runtime::resource_detail::Add(actual_kv,allocator->ArenaSize());
+        }
+        entry->kv_config.memory_plan.kv_bytes = std::max(actual_kv,kv_config.memory_plan.kv_bytes);
+    }
+    entry->resource_lease = std::make_unique<densecore::runtime::ResourcePlanLease>(entry->kv_config.memory_plan);
     entry->model_id = std::move(model_id);
     entry->model_path = std::move(model_path);
     entry->model = std::move(model);
@@ -437,16 +445,21 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
         return config;
 #endif
     }
+    const uint64_t physical_available = resources.memory.bytes;
+    const uint64_t other_reserved = densecore::runtime::ProcessPlannedMemoryBytes();
+    resources.memory.bytes = other_reserved >= physical_available ? 0 : physical_available-other_reserved;
     auto plan_for = [&](int sequences) {
         densecore::runtime::RuntimeMemoryPlan plan;
         constexpr uint64_t MB = 1024*1024;
+        plan.resource_capacity_bytes = physical_available;
         plan.available_bytes = resources.memory.bytes;
         const size_t rounded_context = (static_cast<size_t>(config.max_seq_len) + BLOCK_SIZE-1) / BLOCK_SIZE * BLOCK_SIZE;
         plan.kv_bytes = SaturatingMulSize(SaturatingMulSize(config.bytes_per_token,rounded_context),sequences);
         const size_t graph_seq = std::max(1,std::min(config.max_seq_len,2048));
         const auto graph = EngineState::EstimateGraphContextSize(model,graph_seq,sequences,
                                   model && model->arch_flags.is_hybrid_ssm ? graph_seq : std::min<size_t>(graph_seq,192));
-        plan.graph_bytes = graph.total_bytes;
+        // One persistent/cached graph plus a replacement or calibration graph.
+        plan.graph_bytes = SaturatingMulSize(graph.total_bytes,2);
         plan.repack_bytes = std::min<uint64_t>(plan.available_bytes/8,4ULL*1024*MB);
         if (model && model->arch_flags.is_hybrid_ssm && model->ssm_time_step_rank > 0) {
             const size_t channels = static_cast<size_t>(std::max(0,model->ssm_inner_size)) +

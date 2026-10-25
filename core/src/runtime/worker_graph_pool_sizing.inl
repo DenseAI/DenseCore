@@ -265,6 +265,9 @@ FlexibleGraphPoolSizing MeasureFlexibleGraphPoolSize(TransformerModel* model, Pa
     const size_t dry_mb = std::clamp<size_t>(default_dry_mb, 512, auto_dry_cap_mb);
     const size_t dry_context_bytes = dry_mb * MB;
 
+    auto dry_allocation = densecore::runtime::ResourceAllocationLease::Acquire(
+        densecore::runtime::AllocationCategory::Graph, dry_context_bytes);
+    if (!dry_allocation) return result;
     void* dry_buffer = nullptr;
 #if defined(_WIN32)
     dry_buffer = _aligned_malloc(dry_context_bytes, 64);

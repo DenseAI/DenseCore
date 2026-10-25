@@ -1,4 +1,5 @@
 #include "densecore/runtime/resource_budget.h"
+#include "densecore/runtime/resource_ledger.h"
 #ifndef DENSECORE_ENGINE_INTERNAL_H
 #define DENSECORE_ENGINE_INTERNAL_H
 
@@ -1455,6 +1456,7 @@ using RequestPriorityComparator = FairQueueComparator;
  * Manages a single loaded model with its KV cache and metadata.
  */
 struct ModelEntry {
+    std::unique_ptr<densecore::runtime::ResourcePlanLease> resource_lease;
     KVCacheConfig kv_config{}; // Effective context/concurrency and one initialization memory plan.
     std::string model_id;
     std::string model_path;

@@ -124,7 +124,8 @@ std::shared_ptr<Q5KRepackedMoEWeight> GetOrCreateQ5KRepackedMoEWeight(const void
     const int64_t blocks_per_row = cols / QK_K;
     const size_t packed_blocks = static_cast<size_t>(rows / 8) * static_cast<size_t>(blocks_per_row);
     if (packed_blocks > cache_limit / sizeof(MoEQ5Kx8Block)) return nullptr;
-    auto packed = std::make_shared<Q5KRepackedMoEWeight>();
+    auto packed = densecore::runtime::MakeBudgetedRepackedWeight<Q5KRepackedMoEWeight>(packed_blocks * sizeof(MoEQ5Kx8Block));
+    if (!packed) return nullptr;
     packed->rows = rows;
     packed->cols = cols;
     packed->blocks_per_row = blocks_per_row;
@@ -186,7 +187,8 @@ std::shared_ptr<Q6KRepackedMoEWeight> GetOrCreateQ6KRepackedMoEWeight(const void
     const int64_t blocks_per_row = cols / QK_K;
     const size_t packed_blocks = static_cast<size_t>(rows / 8) * static_cast<size_t>(blocks_per_row);
     if (packed_blocks > cache_limit / kMoEQ6Kx8BlockBytes) return nullptr;
-    auto packed = std::make_shared<Q6KRepackedMoEWeight>();
+    auto packed = densecore::runtime::MakeBudgetedRepackedWeight<Q6KRepackedMoEWeight>(packed_blocks * kMoEQ6Kx8BlockBytes);
+    if (!packed) return nullptr;
     packed->weight_ptr = weight_ptr;
     packed->fingerprint = key.fingerprint;
     packed->rows = rows;

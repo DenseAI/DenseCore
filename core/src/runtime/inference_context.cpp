@@ -1,3 +1,4 @@
+#include "densecore/runtime/resource_ledger.h"
 #include "densecore/runtime/inference.h"
 
 #include <cstdlib>
@@ -15,6 +16,9 @@ void InferenceContext::Init(size_t buffer_size) {
         return;
     }
 
+    auto allocation = densecore::runtime::ResourceAllocationLease::Acquire(
+        densecore::runtime::AllocationCategory::Graph, buffer_size);
+    if (!allocation) throw densecore::OutOfMemoryException("InferenceContext: graph resource plan exhausted");
     constexpr size_t kAlignment = 64;
     void* ptr = nullptr;
 #if defined(_WIN32)
@@ -38,10 +42,13 @@ void InferenceContext::Init(size_t buffer_size) {
     ctx_compute = ggml_init(params);
 
     if (ctx_compute) {
+        try { densecore::runtime::RetainGraphAllocation(this, std::move(allocation)); }
+        catch (...) { Free(); throw; }
         initialized = true;
         std::cerr << "[InferenceContext] Initialized with " << (buffer_size / (1024 * 1024)) << " MB persistent buffer"
                   << std::endl;
     } else {
+        Free();
         throw densecore::OutOfMemoryException("InferenceContext: ggml_init failed");
     }
 }
@@ -81,4 +88,5 @@ void InferenceContext::Free() {
     }
     compute_buffer_size = 0;
     initialized = false;
+    densecore::runtime::ReleaseGraphAllocation(this);
 }

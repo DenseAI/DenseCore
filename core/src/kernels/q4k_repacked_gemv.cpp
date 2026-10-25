@@ -1,3 +1,4 @@
+#include "densecore/runtime/resource_ledger.h"
 #include "densecore/runtime/resource_budget.h"
 #include "kernels/q4k_repacked_gemv.h"
 
@@ -412,20 +413,22 @@ std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(const vo
         state.entries[key] = entry;
     }
 
-    auto candidate = std::make_shared<Q4KRepackedGemvWeight>();
-    candidate->rows = rows;
-    candidate->cols = cols;
-    candidate->blocks_per_row = cols / kQ4KSuperBlock;
-    candidate->blocks.resize(packed_blocks);
-    candidate->bytes = packed_bytes;
-    candidate->last_use = now;
-    if (ggml_repack_q4_K_8x8(weight_ptr, raw_bytes, rows, cols, candidate->blocks.data(), candidate->bytes) != 0) {
-        candidate.reset();
-    } else {
-        state.repack_bytes.fetch_add(static_cast<uint64_t>(packed_bytes), std::memory_order_relaxed);
-        if (lookup) {
-            lookup->repacked = true;
-            lookup->repack_bytes = static_cast<uint64_t>(packed_bytes);
+    auto candidate = densecore::runtime::MakeBudgetedRepackedWeight<Q4KRepackedGemvWeight>(packed_bytes);
+    if (candidate) {
+        candidate->rows = rows;
+        candidate->cols = cols;
+        candidate->blocks_per_row = cols / kQ4KSuperBlock;
+        candidate->blocks.resize(packed_blocks);
+        candidate->bytes = packed_bytes;
+        candidate->last_use = now;
+        if (ggml_repack_q4_K_8x8(weight_ptr, raw_bytes, rows, cols, candidate->blocks.data(), candidate->bytes) != 0) {
+            candidate.reset();
+        } else {
+            state.repack_bytes.fetch_add(static_cast<uint64_t>(packed_bytes), std::memory_order_relaxed);
+            if (lookup) {
+                lookup->repacked = true;
+                lookup->repack_bytes = static_cast<uint64_t>(packed_bytes);
+            }
         }
     }
 
@@ -689,20 +692,22 @@ std::shared_ptr<RepackedDenseGemmWeight> GetOrCreateRepackedDenseGemmWeight(int3
         state.entries[key] = entry;
     }
 
-    auto candidate = std::make_shared<RepackedDenseGemmWeight>();
-    candidate->source_type = ggml_type_id;
-    candidate->rows = rows;
-    candidate->cols = cols;
-    candidate->blocks_per_row = static_cast<int64_t>(blocks_per_row);
-    candidate->block_bytes = block_bytes;
-    candidate->bytes = packed_bytes;
-    candidate->last_use = now;
-    candidate->blocks.resize(packed_bytes);
-    if (DenseGemmRepack(ggml_type_id, weight_ptr, raw_bytes, rows, cols, candidate->blocks.data(), packed_bytes) != 0) {
-        candidate.reset();
-    } else if (lookup) {
-        lookup->repacked = true;
-        lookup->repack_bytes = static_cast<uint64_t>(packed_bytes);
+    auto candidate = densecore::runtime::MakeBudgetedRepackedWeight<RepackedDenseGemmWeight>(packed_bytes);
+    if (candidate) {
+        candidate->source_type = ggml_type_id;
+        candidate->rows = rows;
+        candidate->cols = cols;
+        candidate->blocks_per_row = static_cast<int64_t>(blocks_per_row);
+        candidate->block_bytes = block_bytes;
+        candidate->bytes = packed_bytes;
+        candidate->last_use = now;
+        candidate->blocks.resize(packed_bytes);
+        if (DenseGemmRepack(ggml_type_id, weight_ptr, raw_bytes, rows, cols, candidate->blocks.data(), packed_bytes) != 0) {
+            candidate.reset();
+        } else if (lookup) {
+            lookup->repacked = true;
+            lookup->repack_bytes = static_cast<uint64_t>(packed_bytes);
+        }
     }
 
     {

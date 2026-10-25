@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "densecore/runtime/inference.h"
+#include "densecore/runtime/resource_ledger.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
@@ -99,6 +100,7 @@ struct CachedGraphStorage {
     CachedGraphStorage& operator=(const CachedGraphStorage&) = delete;
     void Reset();
 
+    std::shared_ptr<densecore::runtime::ResourceAllocationLease> allocation_lease;
     std::vector<uint8_t> ctx_buffer;
     ggml_context* ctx = nullptr;
     ggml_cgraph* graph = nullptr;
@@ -138,6 +140,9 @@ public:
     void Reset();
 
 private:
+    std::shared_ptr<densecore::runtime::ResourceAllocationLease> metadata_lease_;
+    std::vector<std::shared_ptr<densecore::runtime::ResourceAllocationLease>> payload_leases_;
+    size_t charged_payload_bytes_ = 0;
     void* metadata_buffer_ = nullptr;
     ggml_context* ctx_ = nullptr;
     ggml_gallocr_t gallocr_ = nullptr;

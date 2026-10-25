@@ -20,6 +20,7 @@ CachedGraphStorage::CachedGraphStorage(CachedGraphStorage&& other) noexcept {
 CachedGraphStorage& CachedGraphStorage::operator=(CachedGraphStorage&& other) noexcept {
     if (this != &other) {
         Reset();
+        allocation_lease = std::move(other.allocation_lease);
         ctx_buffer = std::move(other.ctx_buffer);
         ctx = std::exchange(other.ctx, nullptr);
         graph = std::exchange(other.graph, nullptr);
@@ -42,6 +43,7 @@ void CachedGraphStorage::Reset() {
     pos = nullptr;
     work_ctx.reset();
     ctx_buffer.clear();
+    allocation_lease.reset();
 }
 
 void PrefillGraphCacheEntry::Reset() {
@@ -69,6 +71,9 @@ bool ScopedGgmlGraphArena::Init(size_t metadata_bytes, ggml_backend_t backend) {
     if (!backend || metadata_bytes == 0) {
         return false;
     }
+    metadata_lease_ = densecore::runtime::ResourceAllocationLease::Acquire(
+        densecore::runtime::AllocationCategory::Graph, metadata_bytes);
+    if (!metadata_lease_) return false;
 #if defined(_WIN32)
     metadata_buffer_ = _aligned_malloc(metadata_bytes, 64);
 #else
@@ -77,6 +82,7 @@ bool ScopedGgmlGraphArena::Init(size_t metadata_bytes, ggml_backend_t backend) {
     }
 #endif
     if (!metadata_buffer_) {
+        Reset();
         return false;
     }
     ggml_init_params params{
@@ -105,7 +111,19 @@ bool ScopedGgmlGraphArena::Init(size_t metadata_bytes, ggml_backend_t backend) {
 }
 
 bool ScopedGgmlGraphArena::AllocGraph(ggml_cgraph* graph) {
-    return gallocr_ && graph && ggml_gallocr_alloc_graph(gallocr_, graph);
+    if (!gallocr_ || !graph) return false;
+    // This allocator has one CPU/backend buffer type. Measure before allocating,
+    // so its scratch cannot independently spend the graph-pool reservation.
+    size_t required = 0;
+    ggml_gallocr_reserve_n_size(gallocr_, graph, nullptr, nullptr, &required);
+    if (required > charged_payload_bytes_) {
+        auto lease = densecore::runtime::ResourceAllocationLease::Acquire(
+            densecore::runtime::AllocationCategory::Graph, required-charged_payload_bytes_);
+        if (!lease) return false;
+        payload_leases_.push_back(std::move(lease));
+        charged_payload_bytes_ = required;
+    }
+    return ggml_gallocr_alloc_graph(gallocr_, graph);
 }
 
 ggml_context* ScopedGgmlGraphArena::ctx() const {
@@ -131,6 +149,9 @@ void ScopedGgmlGraphArena::Reset() {
     }
     metadata_bytes_ = 0;
     backend_ = nullptr;
+    metadata_lease_.reset();
+    payload_leases_.clear();
+    charged_payload_bytes_ = 0;
 }
 
 GraphCache::~GraphCache() {

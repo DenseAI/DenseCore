@@ -387,3 +387,49 @@ TEST(LLMRuntimeConfigTest, Qwen35PrefixQualificationOptInHonorsBothGlobalControl
         }
     }
 }
+
+#include "densecore/runtime/resource_ledger.h"
+TEST(ResourceLedgerTest, ConcurrentPlansCannotAllocateTheSameRemainingBudgetTwice) {
+    using namespace densecore::runtime;
+    const auto before = ResourceLedgerUsageSnapshot();
+    RuntimeMemoryPlan plan;
+    plan.resource_capacity_bytes = before.planned_bytes + 100;
+    plan.available_bytes = 100;
+    plan.graph_bytes = 60;
+    ResourcePlanLease first(plan);
+    EXPECT_THROW(ResourcePlanLease second(plan), densecore::OutOfMemoryException);
+    EXPECT_EQ(ProcessPlannedMemoryBytes(), before.planned_bytes + 60);
+    std::string error;
+    EXPECT_TRUE(first.ExtendMTP(40, &error));
+    EXPECT_FALSE(first.ExtendMTP(1, &error));
+    EXPECT_NE(error.find("required_bytes="), std::string::npos);
+}
+TEST(ResourceLedgerTest, AllocationLifetimesRemainChargedAfterCacheReferenceIsReleased) {
+    using namespace densecore::runtime;
+    const auto before = ResourceLedgerUsageSnapshot();
+    RuntimeMemoryPlan plan;
+    plan.graph_bytes = before.graph_bytes + 64;
+    plan.repack_bytes = before.repack_bytes + 64;
+    plan.available_bytes = plan.RequiredBytes();
+    plan.resource_capacity_bytes = resource_detail::Add(before.planned_bytes,plan.RequiredBytes());
+    ResourcePlanLease reservation(plan);
+    auto cached = ResourceAllocationLease::Acquire(AllocationCategory::Repack,64);
+    ASSERT_TRUE(cached);
+    auto in_flight = cached;
+    cached.reset();
+    EXPECT_FALSE(ResourceAllocationLease::Acquire(AllocationCategory::Repack,1));
+    in_flight.reset();
+    EXPECT_TRUE(ResourceAllocationLease::Acquire(AllocationCategory::Repack,1));
+    auto graph = ResourceAllocationLease::Acquire(AllocationCategory::Graph,64);
+    ASSERT_TRUE(graph);
+    EXPECT_FALSE(ResourceAllocationLease::Acquire(AllocationCategory::Graph,1));
+    graph.reset();
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes);
+}
+TEST(ResourceLedgerTest, FailedWeightConstructionDoesNotStrandAnAllocationCharge) {
+    using namespace densecore::runtime;
+    struct FailedWeight { FailedWeight() { throw std::runtime_error("construction failed"); } };
+    const auto before = ResourceLedgerUsageSnapshot();
+    EXPECT_THROW(MakeBudgetedRepackedWeight<FailedWeight>(16),std::runtime_error);
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().repack_bytes,before.repack_bytes);
+}

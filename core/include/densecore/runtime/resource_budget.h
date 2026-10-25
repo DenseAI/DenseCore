@@ -31,6 +31,7 @@ struct ResourceBudget {
     int effective_threads = 1;
 };
 struct RuntimeMemoryPlan {
+    uint64_t resource_capacity_bytes = 0; // Physical headroom before subtracting other committed plans.
     uint64_t available_bytes = 0;
     uint64_t kv_bytes = 0;
     uint64_t graph_bytes = 0;
