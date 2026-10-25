@@ -175,6 +175,12 @@ void Scheduler::FreeSequence(int seq_id) {
 }
 
 SchedulerOutput Scheduler::Schedule() {
+    return ScheduleWithPhasePreference(0);
+}
+SchedulerOutput Scheduler::ScheduleForSpeculation(bool prefer_decode) {
+    return ScheduleWithPhasePreference(prefer_decode ? 1 : 2);
+}
+SchedulerOutput Scheduler::ScheduleWithPhasePreference(int phase_preference) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     SchedulerOutput output;
@@ -195,15 +201,15 @@ SchedulerOutput Scheduler::Schedule() {
     // 3. Phase isolation policy: preserve the current decode-first isolated path
     // by default, but optionally admit a bounded prefill chunk into a decode
     // iteration when the decode context bucket is homogeneous.
-    if (config_.isolate_prefill_decode) {
+    if (config_.isolate_prefill_decode || phase_preference != 0) {
         const bool has_waiting = !waiting_queue_.empty();
         const bool has_running = !running_seqs_.empty();
 
         bool schedule_prefill_first = false;
         if (has_waiting) {
-            if (!has_running) {
+            if (!has_running || phase_preference == 2) {
                 schedule_prefill_first = true;
-            } else if (config_.fill_slots_before_first_decode &&
+            } else if (phase_preference == 0 && config_.fill_slots_before_first_decode &&
                        running_seqs_.size() < static_cast<size_t>(config_.max_num_seqs) &&
                        std::all_of(waiting_queue_.begin(), waiting_queue_.end(), [&](const SequenceGroup& group) {
                            return group.num_tokens_to_process <= config_.max_prefill_tokens &&
@@ -215,7 +221,7 @@ SchedulerOutput Scheduler::Schedule() {
                            return it != seq_generated_tokens_.end() && it->second == 0;
                        })) {
                 schedule_prefill_first = true;
-            } else if (consecutive_decode_batches_ >= config_.max_consecutive_decode_batches) {
+            } else if (phase_preference == 0 && consecutive_decode_batches_ >= config_.max_consecutive_decode_batches) {
                 schedule_prefill_first = true;
             }
         }

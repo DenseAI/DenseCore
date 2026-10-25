@@ -1,3 +1,4 @@
+#include "llm/speculative/fair_schedule.h"
 #include <gtest/gtest.h>
 
 #include <limits>
@@ -662,5 +663,123 @@ TEST(SpeculativeCheckpoints, RequiresBoundedDraftAndCapturedBoundary) {
     RecurrentCheckpoints bank(3);
     RecurrentCheckpoints::States states;
     EXPECT_THROW(bank.Restore(1, states), std::out_of_range);
+}
+
+TEST(MtpFairSchedule, ContinuousNewHigherIdsCannotStarveAnOlderLiveDecoder) {
+    FairSchedule policy;
+    std::vector<SchedulingIdentity> live{{0, 100}};
+    ASSERT_EQ(policy.Order(live).front(), 0);
+    policy.DecodeExecuted(live.front());
+    live.insert(live.end(), {{1,101}, {2,102}, {3,103}});
+    int next = 4, long_runs = 0, gap = 0;
+    for (int step = 0; step < 100; ++step) {
+        policy.Prune([&](SchedulingIdentity item) { return std::find(live.begin(), live.end(), item) != live.end(); });
+        const auto order = policy.Order(live);
+        ASSERT_EQ(order.size(), 4u);
+        const int selected = order.front();
+        const auto identity = *std::find_if(live.begin(), live.end(),
+            [&](SchedulingIdentity item) { return item.sequence == selected; });
+        policy.DecodeExecuted(identity);
+        if (selected == 0) { ++long_runs; gap = 0; }
+        else {
+            ++gap;
+            live.erase(std::remove(live.begin(), live.end(), identity), live.end());
+            live.push_back({next, 100+next}); ++next;
+        }
+        EXPECT_LT(gap, 4); // at most three other live requests before long0
+        EXPECT_LE(policy.Size(), 4u);
+    }
+    EXPECT_GE(long_runs, 25);
+}
+
+TEST(MtpFairSchedule, DeferredPhasesAndRecycledSequenceIdsDoNotConsumeATurn) {
+    FairSchedule policy;
+    std::vector<SchedulingIdentity> live{{0,10}, {1,11}};
+    EXPECT_EQ(policy.Order(live), (std::vector<int>{0,1}));
+    policy.PrefillExecuted();
+    EXPECT_EQ(policy.Choose(true,true), FairSchedule::Phase::Decode);
+    EXPECT_EQ(policy.Order(live).front(), 0); // observing/deferring never rotates
+    policy.NoExecution(FairSchedule::Phase::Decode);
+    EXPECT_EQ(policy.Choose(true,true), FairSchedule::Phase::Prefill);
+    EXPECT_EQ(policy.Order(live).front(), 0);
+    policy.PrefillExecuted();
+    policy.DecodeExecuted({0,10});
+    EXPECT_EQ(policy.Order(live).front(), 1);
+    live = {{0,99}, {1,11}};
+    policy.Prune([&](SchedulingIdentity item) { return std::find(live.begin(),live.end(),item) != live.end(); });
+    EXPECT_EQ(policy.Order(live), (std::vector<int>{1,0}));
+    policy.Forget({1,11});
+    EXPECT_EQ(policy.Order({{0,99}}), (std::vector<int>{0}));
+}
+
+TEST(MtpFairSchedule, DeferredScheduledPrefillKeepsItsContextTokensAndOwnedAllocation) {
+    BlockManager manager(32, BLOCK_SIZE);
+    densecore::SchedulerConfig config;
+    config.max_num_seqs = 2; config.max_prefill_seqs = 1;
+    config.max_num_batched_tokens = 64; config.fill_slots_before_first_decode = true;
+    densecore::Scheduler scheduler(&manager, config);
+    const int long_seq = scheduler.AddRequest(100, 1, 1000);
+    auto first = scheduler.Schedule();
+    ASSERT_EQ(first.new_block_allocations.size(), 1u);
+    const auto long_blocks = first.new_block_allocations.front().second;
+    scheduler.OnPrefillChunkComplete(long_seq,1,true);
+    const int short_seq = scheduler.AddRequest(101,3,1);
+    auto deferred = scheduler.Schedule(); // legacy fill-before-first-decode policy
+    ASSERT_EQ(deferred.prefill_seq_ids, (std::vector<int>{short_seq}));
+    ASSERT_TRUE(deferred.decode_seq_ids.empty());
+    ASSERT_EQ(deferred.prefill_chunk_info.size(),1u);
+    ASSERT_EQ(deferred.new_block_allocations.size(),1u);
+    const auto short_blocks = deferred.new_block_allocations.front().second;
+    const int free_after_reservation = manager.GetFreeBlockCount();
+    auto decode = scheduler.ScheduleForSpeculation(true);
+    EXPECT_EQ(decode.decode_seq_ids, (std::vector<int>{long_seq}));
+    auto again = scheduler.ScheduleForSpeculation(false);
+    EXPECT_EQ(again.prefill_seq_ids, deferred.prefill_seq_ids);
+    EXPECT_EQ(again.prefill_chunk_info.front().chunk_tokens,3);
+    EXPECT_EQ(again.batch_context_len, deferred.batch_context_len);
+    EXPECT_TRUE(again.new_block_allocations.empty());
+    EXPECT_EQ(manager.GetFreeBlockCount(),free_after_reservation);
+    scheduler.OnPrefillChunkComplete(short_seq,3,true);
+    scheduler.RemoveRequest(short_seq); scheduler.RemoveRequest(long_seq);
+    manager.Free(short_blocks); manager.Free(long_blocks);
+    EXPECT_EQ(manager.GetFreeBlockCount(),32);
+}
+
+TEST(MtpFairSchedule, ContinuousOneTokenPrefillsStillAllowBoundedLongDecodeProgress) {
+    BlockManager manager(32,BLOCK_SIZE);
+    densecore::SchedulerConfig config;
+    config.max_num_seqs=2; config.max_prefill_seqs=1; config.max_num_batched_tokens=64;
+    config.max_model_len=4096; config.fill_slots_before_first_decode=true;
+    densecore::Scheduler scheduler(&manager,config);
+    FairSchedule policy;
+    const int long_seq=scheduler.AddRequest(100,1,1000);
+    const auto initial=scheduler.Schedule();
+    auto long_blocks=initial.new_block_allocations.front().second;
+    scheduler.OnPrefillChunkComplete(long_seq,1,true);
+    manager.SetFilledSlots(long_blocks.front(),1);
+    int past=1;
+    for (int arrival=0; arrival<40; ++arrival) {
+        const int short_seq=scheduler.AddRequest(200+arrival,1,1);
+        ASSERT_TRUE(policy.PreferDecode());
+        auto decoded=scheduler.ScheduleForSpeculation(policy.PreferDecode());
+        ASSERT_EQ(decoded.decode_seq_ids,(std::vector<int>{long_seq}));
+        ASSERT_TRUE(scheduler.ReserveSpeculativeSlots(long_seq,past+1,&long_blocks));
+        scheduler.OnDecodeStepComplete(long_seq,1); ++past;
+        for (size_t block=0;block<long_blocks.size();++block)
+            manager.SetFilledSlots(long_blocks[block],std::clamp(past-static_cast<int>(block)*BLOCK_SIZE,0,BLOCK_SIZE));
+        policy.DecodeExecuted({long_seq,100});
+        auto prefilled=scheduler.ScheduleForSpeculation(policy.PreferDecode());
+        ASSERT_EQ(prefilled.prefill_seq_ids,(std::vector<int>{short_seq}));
+        ASSERT_EQ(prefilled.prefill_chunk_info.front().chunk_tokens,1);
+        ASSERT_EQ(prefilled.new_block_allocations.size(),1u);
+        auto short_blocks=prefilled.new_block_allocations.front().second;
+        scheduler.OnPrefillChunkComplete(short_seq,1,true);
+        // max_tokens=1 completes directly after prefill, before first decode.
+        scheduler.RemoveRequest(short_seq); manager.Free(short_blocks);
+        policy.PrefillExecuted();
+    }
+    EXPECT_EQ(past,41);
+    scheduler.RemoveRequest(long_seq); manager.Free(long_blocks);
+    EXPECT_EQ(manager.GetFreeBlockCount(),32);
 }
 }  // namespace

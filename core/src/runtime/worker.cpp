@@ -47,6 +47,7 @@
 #include "llm/graph/cache.h"
 #include "llm/sampling/sampling_rng.h"
 #include "llm/speculative/reference_session.h"
+#include "llm/speculative/fair_schedule.h"
 #ifdef DENSECORE_TEST_BUILD
 #include "llm/matmul/work_state.h"
 #endif
@@ -1087,7 +1088,7 @@ void EngineLoop(EngineState* state) {
         // Mapping: scheduler seq_id -> Request*
         std::unordered_map<int, Request*> seq_to_request;
         std::unordered_map<int, std::unique_ptr<densecore::llm::speculative::ReferenceSession>> mtp_sessions;
-        int mtp_last_scheduled_seq = -1;
+        densecore::llm::speculative::FairSchedule mtp_fairness;
         using namespace densecore::llm::graph;
         GraphCache graph_cache;
         std::unordered_map<std::string, FlexibleGraphPoolSizing> flexible_graph_pool_sizing_cache;
@@ -1147,6 +1148,7 @@ void EngineLoop(EngineState* state) {
             if (req && req->seq_id >= 0) {
                 state->scheduler->RemoveRequest(req->seq_id, completed);
                 seq_to_request.erase(req->seq_id);
+                mtp_fairness.Forget({req->seq_id, req->id});
             }
         };
         auto finalize_generation_error = [&](Request* req, DecodeFinishCause finish_cause,
@@ -1638,7 +1640,9 @@ void EngineLoop(EngineState* state) {
                 flush_scheduler_progress(requests_to_flush);
                 // std::cerr << "[DEBUG] EngineLoop: Calling Scheduler->Schedule()"
                 //           << std::endl;
-                sched_output = state->scheduler->Schedule();
+                sched_output = state->speculation_selected.load(std::memory_order_acquire) == 2
+                    ? state->scheduler->ScheduleForSpeculation(mtp_fairness.PreferDecode())
+                    : state->scheduler->Schedule();
             }
             // std::cerr << "[DEBUG] EngineLoop: Schedule returned "
             //           << sched_output.prefill_seq_ids.size() << " prefill, "
@@ -2142,8 +2146,37 @@ void EngineLoop(EngineState* state) {
             batch_requests.reserve(reserved_batch_requests);
             batch_token_counts.reserve(reserved_batch_requests);
 
-            // Process prefill sequences
+            using MtpPhase = densecore::llm::speculative::FairSchedule::Phase;
+            const bool mtp_serial = state->speculation_selected.load(std::memory_order_acquire) == 2;
+            std::vector<int> mtp_decode_order;
+            MtpPhase mtp_phase = MtpPhase::None;
+            if (mtp_serial) {
+                mtp_fairness.Prune([&](densecore::llm::speculative::SchedulingIdentity identity) {
+                    const auto found = seq_to_request.find(identity.sequence);
+                    return found != seq_to_request.end() && found->second &&
+                           found->second->id == identity.request && !found->second->finished;
+                });
+                std::vector<densecore::llm::speculative::SchedulingIdentity> eligible;
+                for (int sequence : sched_output.decode_seq_ids) {
+                    const auto found = seq_to_request.find(sequence);
+                    if (found != seq_to_request.end() && found->second && !found->second->finished &&
+                        !found->second->cancelled.load(std::memory_order_relaxed) &&
+                        !found->second->is_prefill && !found->second->tokens.empty())
+                        eligible.push_back({sequence, found->second->id});
+                }
+                mtp_decode_order = mtp_fairness.Order(eligible);
+                const bool prefill_ready = std::any_of(sched_output.prefill_seq_ids.begin(),
+                    sched_output.prefill_seq_ids.end(), [&](int sequence) {
+                        const auto found = seq_to_request.find(sequence);
+                        return found != seq_to_request.end() && found->second && !found->second->finished &&
+                            !found->second->cancelled.load(std::memory_order_relaxed) && found->second->is_prefill;
+                    });
+                mtp_phase = mtp_fairness.Choose(prefill_ready, !mtp_decode_order.empty());
+            }
+            // Deferred prefill allocation metadata remains owned, but its prompt
+            // context/remaining tokens advance only after successful execution.
             for (int seq_id : sched_output.prefill_seq_ids) {
+                if (mtp_serial && mtp_phase != MtpPhase::Prefill) break;
                 batch_build_stats.scheduled_prefill_count++;
                 auto req_it = seq_to_request.find(seq_id);
                 if (req_it == seq_to_request.end()) {
@@ -2239,14 +2272,9 @@ void EngineLoop(EngineState* state) {
             }
 
             // Process decode sequences
-            auto mtp_decode_ids = sched_output.decode_seq_ids;
-            if (state->speculation_selected.load(std::memory_order_acquire) == 2) {
-                std::sort(mtp_decode_ids.begin(), mtp_decode_ids.end());
-                const auto pivot = std::upper_bound(mtp_decode_ids.begin(), mtp_decode_ids.end(), mtp_last_scheduled_seq);
-                std::rotate(mtp_decode_ids.begin(), pivot, mtp_decode_ids.end());
-            }
-            for (int seq_id : mtp_decode_ids) {
-                if (state->speculation_selected.load(std::memory_order_acquire) == 2 && !batch_requests.empty()) break;
+            const auto& decode_order = mtp_serial ? mtp_decode_order : sched_output.decode_seq_ids;
+            for (int seq_id : decode_order) {
+                if (mtp_serial && (mtp_phase != MtpPhase::Decode || !batch_requests.empty())) break;
                 batch_build_stats.scheduled_decode_count++;
                 auto req_it = seq_to_request.find(seq_id);
                 if (req_it == seq_to_request.end()) {
@@ -2317,7 +2345,6 @@ void EngineLoop(EngineState* state) {
                     if (!model_entry->mtp_target_checkpoints) throw std::runtime_error("missing MTP checkpoint bank");
                     model_entry->mtp_target_checkpoints->Begin(verification_width);
                 }
-                if (state->speculation_selected.load(std::memory_order_acquire) == 2) mtp_last_scheduled_seq = req->seq_id;
                 batch.block_tables.push_back(req->block_table);
                 batch.n_past.push_back(req->n_past);
                 batch.scheduler_seq_ids.push_back(req->seq_id);
@@ -2337,6 +2364,7 @@ void EngineLoop(EngineState* state) {
             }
 
             if (batch_requests.empty()) {
+                if (mtp_serial) mtp_fairness.NoExecution(mtp_phase);
                 std::sort(batch_build_stats.stalled_requests.begin(), batch_build_stats.stalled_requests.end());
                 batch_build_stats.stalled_requests.erase(
                     std::unique(batch_build_stats.stalled_requests.begin(), batch_build_stats.stalled_requests.end()),
@@ -4734,6 +4762,11 @@ void EngineLoop(EngineState* state) {
                           << " q4k_resident_mb=" << (q4k_cache.resident_bytes / (1024ULL * 1024ULL))
                           << " q4k_repack_mb=" << (q4k_cache.repack_bytes / (1024ULL * 1024ULL))
                           << " q4k_evictions=" << q4k_cache.evictions << std::endl;
+            }
+            if (mtp_serial) {
+                if (is_prefill_batch) mtp_fairness.PrefillExecuted();
+                else if (!batch_requests.empty()) mtp_fairness.DecodeExecuted({batch_requests.front()->seq_id,
+                                                                             batch_requests.front()->id});
             }
             LogRequestLifecyclePhase(
                 "graph_compute_end", !batch_requests.empty() ? batch_requests.front() : nullptr, current_model,

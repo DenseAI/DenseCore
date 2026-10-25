@@ -236,6 +236,8 @@ public:
      * Main scheduling algorithm
      */
     SchedulerOutput Schedule();
+    // Additive MTP boundary policy; ordinary Schedule() retains its behavior.
+    SchedulerOutput ScheduleForSpeculation(bool prefer_decode);
 
     /**
      * Fork a sequence for beam search / parallel sampling
@@ -299,6 +301,7 @@ public:
     std::shared_ptr<PrefixCacheLease> TakePrefixLease(int seq_id);
 
 private:
+    SchedulerOutput ScheduleWithPhasePreference(int preference);
     std::unordered_map<int, std::shared_ptr<PrefixCacheLease>> prefix_leases_;
     float GetMemoryUsage() const;
     float GetMemoryPressure() const;
