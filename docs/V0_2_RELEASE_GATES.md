@@ -12,29 +12,31 @@ performance/default promotions are qualified.
 ## Evidence boundaries
 
 The integrated source snapshot is
-`db9883aabeb22ed450681ea2ddcb4d0771d99526`. Its full native run executed 1335
-checks: 1321 passed, exactly the same 14 existing skips, zero failures and zero
-disabled tests; 108 focused checks passed. The initial dependency audit relinked
-the test executable, so its successful exit alone is not a no-work audit claim.
-The recorded executable SHA remained unchanged (`935d4e946718ea3e0a5f0c7449f5385122b4eb3313ec0d41a68ac2e0f2d896e0`).
-A subsequent no-work audit was confirmed against the same source and executable
-SHA in the supplemental audit receipt. Both observations are retained; this
-qualifies only the native test artifact, not a serving library/server or model.
+`4ad6a35896230d4d40a99e998916460a4954023f`. Full native: 1347 run, 1333 passed,
+exactly the same 14 existing skips, zero failures/disabled. Same-source Go
+all-package/race checks, SDK 164 unit checks with 27 existing optional skips,
+and 88 standard-library benchmark tests passed. These adapter/tool checks are
+separate from actual model execution and are not real Python JSON proof.
 
-The shared sampler now treats top-k=0 as disabling that filter without forcing
-greedy selection, conditions nucleus filtering
-on candidates retained by prior filters, and intersects grammar with global
-whitelists/disallowed tokens and action ranges. A full-worker **mock-native**
-regression observed the unsatisfiable-grammar failure before the fix, then
-NONE-decode request-local error cleanup with successful peer and recovery on the
-corrected `4545e05`/`db9883a` lineage. This is not real-model HTTP or Python proof.
-The earlier `4545e05` focused run still failed a legacy sampling-reference test;
-`db9883a` corrects the conditional reference and passes all 108 focused checks.
+Critical ASAN/LSan on this exact source: 702 run, 693 passed, the same 9 skips
+as archived `db9883a`, zero failures/disabled/reports with leak detection enabled.
+The selected suite includes all 12 added JSON lifecycle/session/helper and Gemma
+Q4/F32/PLE-capture cases; two existing JSON tests are newly selected by the filter.
+It is not the complete 1347-test normal suite. The tested ASAN binary is
+`f26937b6a2306f4e7f6f0634ecfc0915cc51ab5d82c6951ab8a7c1659b5e4442`.
+Final actual wrapper audits are no-work. Source, vendor, generated headers,
+dependencies and tested binaries are stable; initial audit relinks remain
+recorded. Serving library SHA is
+`220bf8cbac2858e66ef5703c2ffe16fcf7db710da203d89975e35947608f662d` and server SHA is
+`b180e2e6004180e9291de556061be8edb42e1cce526a91b3315dc452661324c5`.
+Historical `db9883a` native1335/ASAN688 and `3ed5428` ASAN archives remain separate.
 
-Go all-package checks and three repeated race runs, Python SDK 164 checks with
-27 existing optional skips, and 61 standard-library benchmark tests belong to
-prior integrated `143a2ad` (the SDK suite used unchanged SDK modules). They are
-not new `db9883a` adapter or serving qualifications.
+The shared sampler treats top-k=0 as disabling that filter without forcing
+greedy selection, conditions nucleus filtering on prior-filter survivors and
+intersects active grammar with global masks/valid action ranges. Mock-native
+unsatisfiable-grammar error/peer/recovery and ordinary/MTP JSON closing-token
+boundaries pass. The old `4545e05` legacy-reference failure and test-only
+`db9883a` oracle correction remain preserved; neither is relabeled as a model run.
 
 Real Python generation on the exact integrated `143a2ad` library passed 12 cases
 and three native-token controls, covering completion counts/finish reasons,
@@ -43,25 +45,13 @@ cleanup, incomplete stop-prefix flush and recovery. Completion accounting is
 native-backed. Prompt-token accounting remains a client estimate (zero when no
 Python tokenizer is available), not native prompt accounting.
 
-The expanded critical ASAN/LSan suite now also qualifies exact source
-**`db9883a`**: 688 checks, 679 passed, exactly the same 9 prior skips, zero
-failures/disabled tests and zero ASAN/LSan reports with leak detection enabled.
-It includes composed filters, disabled top-k, grammar intersections, typed
-request isolation and raw diagnostics. Testing used the final
-`0cd90110583e91c8638d3b8ab6d6a3cdc2eb3509b992e607fe5f95397e065339` executable
-after a wrapper relink; the final actual wrapper audit was no-work with unchanged
-source, header and tested binary. This is a selected critical suite, not all
-1335 normal tests or a real-model test. The earlier `3ed5428` 653-pass/9-skip
-sanitizer archive remains separate. Unmerged Gemma PLE functional changes,
-private observers and pending JSON completion work are outside this result.
-
 | Track | Verified evidence and source | Remaining gate |
 |---|---|---|
-| A | Integrated `db9883a` full native/focused checks and 679-pass/9-skip critical ASAN; prior `143a2ad` Go/Python lifecycle | Prior actual c=8/Gemma parity failures remain unresolved; future functional fixes require new sanitizer/model qualification |
+| A | Integrated `4ad6a35` full native and 693-pass/9-skip critical ASAN; prior `143a2ad` Go/Python lifecycle | Prior actual c=8/Gemma parity failures remain unresolved; future functional fixes require new sanitizer/model qualification |
 | B/H | Resource/planner fixtures; earlier 4 GiB serving and explicit 1 GiB rejection without OOM kill; historical `7ecaf86` embedding AUTO/LAST 12 bitwise C/Python/HTTP comparisons | Actual `143a2ad` c=8 resource/cleanup evidence passes, but request isolation does not; final image/platform checks remain |
-| B Gemma | Historical E2B c1 and private `ad1aa84` checks retained; private `d4088c7` cache-ON c1 repeats pass but c4 parity is 6/8 | Rank-0 requests differ from c1. Cache-OFF/mixed/E4B are not run on d408; F32 per-layer projection fix is pending |
+| B Gemma | Historical E2B c1 and private `ad1aa84` checks retained; private `d4088c7` cache-ON c1 repeats pass but c4 parity is 6/8 | Rank-0 requests differ from c1. Cache-OFF/mixed/E4B were not run on d408. Q4/F32 fixes are in `4ad6a35` native/ASAN; model requalification remains separate |
 | C | Historical `7ecaf86` README-pinned 0.8B/plain 2B combined prefix checks passed c=1/2/4, five-turn answers, restore/skipped prefill, cancellation and eviction | Do not inherit those results across later numerical changes; Qwen3.6, matched performance and default-policy promotion remain separate |
-| D | Historical `7ecaf86` 0.8B/2B K2 c1/c4 native 128-ID parity; private `5ad54a5` native completion/cancel/recovery and literal-stop checks | All four private stochastic profiles fail strict HTTP quality (6 failures/160). Final-root matrix, population distribution, speed, 35B MoE and automatic qualification remain absent |
+| D | Historical `7ecaf86` greedy parity retained; integrated `4ad6a35` 0.8B/2B JSON NONE/MTP c1/c4 native+HTTP pass and actual probabilistic rejection/rollback/stop suppression | Current probabilistic matrix overall FAIL: one 0.8B c4 French punctuation failure plus separate stop-instruction negative. Population distribution, speed, 35B MoE and auto qualification absent |
 | E | Go-only `386b800` portable amd64 image passed actual container and kind strict active drain, resource limits, checksum rejection and safe memory refusal | Strict Count quality still fails. Current root core has no final image validation; original init-log capture has syntax checks only; native Arm remains unverified |
 | F | GPT-OSS packed MXFP4/bias/router/activation, attention sink/window and tokenizer/Harmony fixtures | Actual HTTP/long/c=1/4/stop/stream inference and supported peak RSS/context remain unverified; safe capacity refusal is not model support |
 | G | Public physical-NUMA preflight and matched ABBA harness | Actual 35B/122B two-socket measurements, 16/48 physical cores and remote-memory penalty; no promotion |
@@ -89,8 +79,9 @@ Private DEBUG observer `658e626` reproduces the previous visible per-layer
 embedding (PLE) delta with all 17 attention/FFN core stages bit-identical.
 Global projection/lookup stages are exact; the local F32 gate delta disappears
 through GELU, but identical gated inputs yield different F32 PLE projection
-outputs (about `4.77e-7` / `2.38e-7`). The observer is not merged into this root,
-and a separate F32 fix is pending. Diagnostic reproduction does not establish
+outputs (about `4.77e-7` / `2.38e-7`). The later Q4/F32 fixes and capture fixtures
+are included in `4ad6a35` native/ASAN; source-matched model requalification remains
+separate. Diagnostic reproduction does not establish
 full-model isolation, absence of every observer effect, or model support.
 
 Private stop candidate `5ad54a5` completed 72 native requests, eight native
@@ -102,13 +93,46 @@ all retain strict FAIL: six HTTP quality failures among 160 main requests.
 French formatting and stop-instruction failures are preserved without assigning
 them to model or engine by assumption. These samples prove neither population
 distribution equivalence nor acceleration. They are private-source evidence,
-not a completed matrix for integrated `db9883a` or its new shared sampler.
+not the current `4ad6a35` matrix described below.
 
-A separate MTP JSON completion gap is source-confirmed: completed grammar
-permits whitespace, while common token commit does not yet finish the request
-at the closing token. A separate implementation is pending. Earlier stochastic
-cases without JSON fields do not qualify actual JSON generation; new combined
-native, HTTP and Python JSON/finish checks remain required.
+Integrated `4ad6a35` closes the JSON completion gap: ordinary and MTP output
+commit the root-closing token before STOP; fixtures cover an exact max-token
+boundary. Actual model probes below use a 512-token output budget.
+Actual pinned 0.8B and 2B each pass 16 main native and 32 HTTP checks with NONE/MTP,
+c=1/4, greedy K2, context2048 and threads8. Strict brace-whitelist `{}` and
+ordinary `{"answer":42}` cases, native cancel/recovery, HTTP stream/nonstream/disconnect/
+recovery and UTF-8/usage/terminal checks pass. Each model records 54 actual
+`grammar_complete` finishes and batched target width3 with acceptance/rollback.
+JSON rejection was not observed; formal rejection fixtures and probabilistic
+coverage remain separate. Delivered JSON CallbackEx IDs are a subset of native
+samples; real Python JSON and public global action range are not qualified.
+Two tiny objects do not establish arbitrary JSON/model support. c=4 denotes
+logical engine capacity; width3 is one request's K+1 verification graph, not
+four-sequence physical batching or a throughput qualification.
+
+The unchanged non-JSON probabilistic matrix on the same `4ad6a35` artifact is
+**overall FAIL**. 0.8B c1 and 2B c1/c4 pass; 0.8B c4 fails one streamed NONE French
+answer missing final punctuation (normal STOP/DONE and usage32, budget1024).
+A separate NONE stop probe also fails the exact Paris instruction; the existing
+format side metric does not include that probe. No engine/model cause is proven.
+All 72 native finals including recovery, eight native cancellations and eight
+HTTP disconnect/recoveries pass. Of 160 main HTTP requests, one fails the final
+quality gate. All 32 stop probes suppress the literal marker and 31 actual
+`stop_sequence` finishes are logged. All MTP profiles observe width3,
+acceptance/rejection/rollback (885 verifications, 329 rejections, 568 rollbacks in
+aggregate). These counts are execution evidence, not latency/throughput results.
+Current failures and the earlier private six/160 remain independently recorded;
+unseeded samples establish neither population-distribution equivalence nor causal
+quality improvement. JSON success does not waive this failure.
+
+Reproduction uses the unchanged [public sampling cases](../benchmarks/personal/mtp_sampling_cases.json)
+and validators: context2048, threads8, K2, c=1/4, repeats2, temperature0.7,
+top-k40, top-p0.95, repetition-penalty1.05 and native/HTTP output budget1024.
+Min-p remains the native default0 (not exposed by the public API); there is no
+public seed parameter. Each cell holds the shared lock independently, uses a
+new output directory and checks the exact artifact/model/dependency hashes.
+No prompt/threshold edits or retries were used. JSON commands and the required
+source-bound unit-report preflight are documented in the JSON probe guide below.
 
 Historical Qwen3 `7ecaf86` default/off HTTP modes passed 16 semantic/protocol
 cases, reasoning/final separation and cold/warm native parity. Explicit-off
@@ -150,6 +174,7 @@ model and harness identities with every raw failure.
 - State: [prefix](../benchmarks/personal/check_prefix_parity.py),
   [MTP parity](../benchmarks/personal/check_mtp_parity.py),
   [stochastic MTP](../benchmarks/personal/check_mtp_sampling.py),
+  [JSON probe](../benchmarks/personal/README_mtp_json.md),
   [concurrency](../benchmarks/personal/check_concurrency_budget.py) and
   [Python SDK](../python/README.md).
 - Package: [container smoke](../scripts/container_model_smoke.sh),
@@ -178,6 +203,12 @@ D21, record release readiness as incomplete and the release delayed.
 These are local ledger identifiers, not public download promises. Archive raw
 identities before publishing any claim; use the relative reproduction links above.
 
+- `v02-integrated-4ad6-artifact.json`, `v02-json-4ad6-asan-report.json`;
+  `v02-mtp-json-4ad6-08b-report.json`, `v02-mtp-json-4ad6-2b-report.json`;
+  `v02-4ad6-sampling-commands.json`, `v02-mtp-sampling-4ad6-matrix-report.json`
+  and each `v02-mtp-sampling-4ad6-{08b,2b}-{c1,c4}-report.json` retain raw hashes,
+  exact pins, counter/stop log references and per-cell failures. The JSON probe
+  requires a source-bound unit-qualified artifact/report; see its reproduction link.
 - `v02-sampler-db988-report.json`, `v02-sampler-db988-native-results.json`,
   `v02-sampler-db988-focused-results.json`, `v02-sampler-db988-audit.log`;
   `v02-sampler-db988-audit-receipt.json` confirms the later no-work audit on

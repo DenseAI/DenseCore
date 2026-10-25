@@ -24,35 +24,44 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `7ecaf86` 0.8B/2B K2 c1/c4 greedy checks passed. Private `5ad54a5` literal-stop
   probes show zero leaks/32 probes and 27 actual string-stop finishes, while all
   four stochastic profile quality gates still fail (6/160 HTTP requests).
-  Population-distribution, speed and automatic qualification remain absent;
-  automatic profiles stay empty.
+  These historical failures remain preserved. On integrated `4ad6a35`, pinned
+  0.8B/2B JSON NONE/MTP c1/c4 native and HTTP checks pass. The unchanged
+  probabilistic matrix passes 0.8B c1 and 2B c1/c4, but 0.8B c4 still fails one
+  French final-punctuation check; a separate stop-instruction negative is retained.
+  Across 32 configured stop probes there are zero marker leaks and 31 actual
+  string-stop finishes; actual MTP rejection/rollback is observed. The overall
+  probabilistic gate remains FAIL. No population-distribution, speed or automatic
+  qualification follows; automatic profiles stay empty.
 - Make non-F32 prefill attention consume stored KV precision. Historical Qwen3
   cold/warm parity and pinned 0.8B/2B prefix restoration/eviction checks passed;
   those results do not automatically carry over later numerical changes.
 - Add Gemma per-request attention/Q4 KV and GPT-OSS packed-expert/Harmony
   candidates. Private `d4088c7` E2B c4 parity still fails (rank-0 requests 1/5:
-  135 versus 127 IDs, first difference 52). Same-source cache-OFF/mixed/E4B are
-  not run. Private `658e626` DEBUG narrows a surviving delta to F32 PLE projection
-  from identical input; observer/root integration and functional fix remain pending.
+  135 versus 127 IDs, first difference 52). Same-source cache-OFF/mixed/E4B were
+  not run. Private `658e626` DEBUG narrowed a surviving delta to F32 PLE projection
+  from identical input. Q4/F32 fixes and capture fixtures are now in `4ad6a35`
+  native/ASAN; source-matched model requalification remains separate.
 - Correct shared-sampler top-k=0, conditional nucleus probabilities and grammar
   intersections with whitelist/range constraints. Mock-native full-worker
-  NONE request error/peer/recovery checks pass; actual new-source HTTP/Python sampling
-  is unqualified. MTP JSON completion has a separate pending implementation.
+  NONE request error/peer/recovery checks pass. Common NONE/MTP JSON completion
+  now commits the root-closing token and finishes STOP, including the exact token
+  budget boundary. Actual pinned-model native/HTTP JSON checks pass; public global
+  action-range composition remains fixture-only and real Python JSON is untested.
 - Verify model downloads/cached bytes and add native image-profile, limited-pod
   and reproducible CPU gates. Separate Go-only `386b800` portable amd64 actual
   container/kind strict drain observed readiness 503, admission 503 and native active=1
   during accepted work, bounded stream completion and cleanup. Strict Count
   still fails. Current integrated core image is untested; original successful
   init-log capture has syntax checks only, awaiting final kind validation.
-- Integrated `db9883a` native: 1335 run, 1321 passed, exactly the same 14 skips,
-  zero failures/disabled; focused 108 passed. Initial audit relinked with unchanged
-  executable SHA, so it is not a no-work result. A repeat no-work audit matches
-  the same source/test binary. Selected critical ASAN/LSan on exact `db9883a`:
-  688 run, 679 passed, the same 9 prior skips, zero failures/disabled/reports;
-  final actual wrapper audit is no-work on the tested artifact. Unmerged PLE
-  and pending JSON changes remain outside that result. Prior `143a2ad` Go/Python
-  and archived `3ed5428` ASAN remain source-labeled, not new-source adapter/model proof.
-  No final package, model-support or performance/default promotion follows.
+- Integrated `4ad6a35` native: 1347 run, 1333 passed, exactly the same 14 skips,
+  zero failures/disabled. Critical ASAN/LSan: 702 run, 693 passed, the same 9 skips,
+  zero failures/disabled/reports. All 12 new JSON and Gemma Q4/F32/capture cases
+  are included. Final wrapper audits are no-work with stable source, binary,
+  generated headers and dependencies; initial relinks remain recorded. Go all/race,
+  SDK unit and benchmark-tool checks are separately recorded on the same source.
+  Historical `db9883a`/`3ed5428` results remain source-labeled. These checks and the
+  narrow real-model probes do not qualify a final package, broad model support,
+  performance or default promotion.
 
 See [v0.2 release gates](docs/V0_2_RELEASE_GATES.md) for incomplete checks;
 these entries are not a released model-support or performance announcement.
