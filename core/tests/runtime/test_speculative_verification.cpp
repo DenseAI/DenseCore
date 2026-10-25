@@ -391,6 +391,8 @@ TEST(SpeculativeRollback, SchedulerAndRecurrentStateRestoreTogetherAtBoundary) {
     const auto after = scheduler.Schedule();
     EXPECT_EQ(after.batch_context_len, 17);
     scheduler.RemoveRequest(seq);
+    // Ordinary blocks remain worker-owned; scheduler removal only drops metadata.
+    manager.Free(blocks);
     EXPECT_EQ(manager.GetFreeBlockCount(), 32);
 }
 
