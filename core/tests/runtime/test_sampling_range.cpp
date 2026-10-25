@@ -16,6 +16,8 @@
 #include "ggml.h"
 #include "densecore/runtime/inference.h"
 #include "runtime/worker_internal.h"
+#include "llm/sampling/sampling_errors.h"
+#include "llm/sampling/sampling_rng.h"
 
 namespace {
 
@@ -481,6 +483,73 @@ TEST(SamplingRangeTest, TemperatureZeroUsesGreedyEvenWithTopKAndTopP) {
     params.seed = 123;
 
     EXPECT_EQ(SampleToken(logits, 0, params), 3);
+}
+
+TEST(SamplingRangeTest, EmptyHardTokenSupportNeverFallsBackOutsideMasks) {
+    GgmlContextGuard guard;
+    guard.ctx = ggml_init({1024 * 1024, nullptr, false});
+    ASSERT_NE(guard.ctx, nullptr);
+    for (int mask_case = 0; mask_case < 4; ++mask_case) {
+        for (float value : {3.0f, NAN, -INFINITY}) {
+            for (int route = 0; route < 5; ++route) {
+                SCOPED_TRACE(mask_case);
+                SCOPED_TRACE(value);
+                SCOPED_TRACE(route);
+                auto* logits = MakeLogitsTensor(guard.ctx, {value, value, value, value});
+                std::vector<int> allowed, denied, history{0};
+                SamplingParams params;
+                if (mask_case == 0) { allowed = {2}; denied = {2}; }
+                if (mask_case == 1) {
+                    params.action_token_start = 1;
+                    params.action_token_count = 2;
+                    denied = {1, 2};
+                }
+                if (mask_case == 2) allowed = {4, 9};
+                if (mask_case == 3) {
+                    params.action_token_start = 1;
+                    params.action_token_count = 2;
+                    allowed = {0, 3};
+                }
+                params.allowed_token_ids = allowed.empty() ? nullptr : &allowed;
+                params.disallowed_token_ids = denied.empty() ? nullptr : &denied;
+                params.temperature = route < 3 ? 0.0f : 0.7f;
+                params.top_k = route == 4 ? 1 : 0;
+                if (route == 1 || route == 2) params.token_history = &history;
+                if (route == 1) params.repetition_penalty = 1.2f;
+                if (route == 2) params.frequency_penalty = 0.3f;
+                std::mt19937 rng(123), before = rng;
+                EXPECT_THROW(SampleTokenWithRng(logits, 0, params, rng),
+                             densecore::llm::sampling::SamplingConstraintError);
+                EXPECT_EQ(rng, before);
+                // The MTP probability builder uses the same hard support and
+                // must never manufacture a forbidden one-hot fallback either.
+                EXPECT_THROW(BuildSamplingDistribution(logits, 0, params),
+                             densecore::llm::sampling::SamplingConstraintError);
+            }
+        }
+    }
+}
+
+TEST(SamplingRangeTest, NonfiniteFallbackRetainsLegalHardSupportAndRngState) {
+    GgmlContextGuard guard;
+    guard.ctx = ggml_init({1024 * 1024, nullptr, false});
+    ASSERT_NE(guard.ctx, nullptr);
+    for (float value : {NAN, -INFINITY}) {
+        for (float temperature : {0.0f, 0.7f}) {
+            auto* logits = MakeLogitsTensor(guard.ctx, {value, value, value, value});
+            std::vector<int> allowed{0, 1, 3}, denied{1};
+            SamplingParams params;
+            params.action_token_start = 1;
+            params.action_token_count = 3;
+            params.allowed_token_ids = &allowed;
+            params.disallowed_token_ids = &denied;
+            params.temperature = temperature;
+            std::mt19937 rng(987), before = rng;
+            EXPECT_EQ(SampleTokenWithRng(logits, 0, params, rng), 3);
+            EXPECT_EQ(rng, before);
+            EXPECT_EQ(BuildSamplingDistribution(logits, 0, params), (std::vector<double>{0, 0, 0, 1}));
+        }
+    }
 }
 
 TEST(SamplingRangeTest, AllNanLogitsDoNotFallbackToDisallowedRangeStart) {

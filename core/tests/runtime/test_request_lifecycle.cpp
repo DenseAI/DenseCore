@@ -502,6 +502,47 @@ TEST_F(RequestLifecycleTest, EmptyGrammarIntersectionFailsOnlyItsRequestAndAllow
     EXPECT_EQ(recovery.final_count, 1);
 }
 
+TEST_F(RequestLifecycleTest, ContradictoryNonJsonMasksFailOnlyTheirRequestsAndAllowRecovery) {
+    auto* state = static_cast<EngineState*>(engine_);
+    std::array<CallbackState, 2> invalid;
+    CallbackState peer, recovery;
+    EngineCloseGuard close_before_callback_state{&engine_};
+    const int forbidden = 'A';
+    densecore::testing::EnablePauseAfterSchedulerAdmissionForTest(true);
+    for (int route = 0; route < 2; ++route) {
+        ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(
+            engine_, "contradictory-mask", 2, nullptr, route == 0 ? 0.0f : 0.7f, 1.0f, 0, 1.0f,
+            nullptr, 0, &forbidden, 1, 1, &forbidden, 1, LifecycleCallbackEx, &invalid[route]), 0);
+        if (route == 0)
+            ASSERT_TRUE(densecore::testing::WaitForPauseAfterSchedulerAdmissionForTest(5000));
+    }
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(
+        engine_, "healthy-peer", 2, nullptr, 0.0f, 1.0f, 1, 1.0f,
+        nullptr, 0, nullptr, 0, 0, nullptr, 0, LifecycleCallbackEx, &peer), 0);
+    densecore::testing::ReleasePauseAfterSchedulerAdmissionForTest();
+    for (auto& capture : invalid) ASSERT_TRUE(capture.WaitForFinal());
+    ASSERT_TRUE(peer.WaitForFinal());
+    EXPECT_EQ(state->status.load(), EngineStatus::RUNNING);
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(
+        engine_, "healthy-recovery", 2, nullptr, 0.0f, 1.0f, 1, 1.0f,
+        nullptr, 0, nullptr, 0, 0, nullptr, 0, LifecycleCallbackEx, &recovery), 0);
+    ASSERT_TRUE(recovery.WaitForFinal());
+    FreeEngine(engine_);
+    engine_ = nullptr; // Join before inspecting terminal uniqueness.
+    for (auto& capture : invalid) {
+        EXPECT_EQ(capture.final_count, 1);
+        EXPECT_TRUE(capture.tokens.empty());
+        ASSERT_EQ(capture.final_texts.size(), 1u);
+        EXPECT_NE(capture.final_texts.front().find("Error: Sampling constraints:"), std::string::npos);
+    }
+    for (auto* capture : {&peer, &recovery}) {
+        EXPECT_EQ(capture->final_count, 1);
+        EXPECT_FALSE(capture->tokens.empty());
+        ASSERT_EQ(capture->final_texts.size(), 1u);
+        EXPECT_EQ(capture->final_texts.front().find("Error:"), std::string::npos);
+    }
+}
+
 TEST_F(RequestLifecycleTest, WorkerExceptionTerminatesActiveAndPendingRequestsAndRejectsAdmission) {
     auto* state = static_cast<EngineState*>(engine_);
     densecore::testing::EnablePauseAfterSchedulerAdmissionForTest(true);
