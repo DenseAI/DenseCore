@@ -12,13 +12,17 @@ drain = importlib.util.module_from_spec(spec); spec.loader.exec_module(drain)
 
 
 class ActiveDrainProtocolTest(unittest.TestCase):
-    def exercise(self, max_tokens=None, duplicate_done=False):
+    def exercise(self, max_tokens=None, duplicate_done=False, inactive=False):
         signaled = threading.Event()
         started = threading.Event()
         bodies = []
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args): pass
             def do_GET(self):
+                if self.path == '/metrics':
+                    self.send_response(200); self.end_headers()
+                    self.wfile.write(b'densecore_active_requests 0\n' if inactive else b'densecore_active_requests 1\n')
+                    return
                 self.send_response(503 if signaled.is_set() else 200); self.end_headers()
             def do_POST(self):
                 if signaled.is_set():
@@ -40,12 +44,13 @@ class ActiveDrainProtocolTest(unittest.TestCase):
                 out = Path(tmp) / 'result.json'
                 call = lambda: drain.run(f'http://127.0.0.1:{server.server_port}', ['test-signal'], out, 3,
                     **({} if max_tokens is None else {'max_tokens': max_tokens}))
-                if duplicate_done:
+                if duplicate_done or inactive:
                     with self.assertRaises(RuntimeError): call()
                 else:
                     call()
                 return json.loads(out.read_text()), bodies
         finally:
+            signaled.set()
             server.shutdown(); server.server_close(); thread.join()
 
     def test_bounded_workload_signal_and_exact_terminal(self):
@@ -53,6 +58,7 @@ class ActiveDrainProtocolTest(unittest.TestCase):
         self.assertEqual(result['request_max_tokens'], 32)
         self.assertEqual(bodies[0]['max_tokens'], 32)
         self.assertTrue(result['stream_incomplete_before_signal'])
+        self.assertEqual(result['active_requests_before_signal'], 1)
         self.assertTrue(result['admission_blocked'])
         self.assertTrue(result['ready_removed'])
         self.assertEqual(result['done_count'], 1)
@@ -68,6 +74,11 @@ class ActiveDrainProtocolTest(unittest.TestCase):
         result, _ = self.exercise(duplicate_done=True)
         self.assertEqual(result['done_count'], 2)
         self.assertIn('duplicate', result['error'])
+
+    def test_buffered_stream_without_active_native_work_does_not_qualify(self):
+        result, _ = self.exercise(inactive=True)
+        self.assertEqual(result['active_requests_before_signal'], 0)
+        self.assertNotIn('signal_seconds', result)
 
     def test_invalid_bound_does_not_start_request(self):
         with self.assertRaises(ValueError): drain.run('http://unused', [], 'unused.json', 3, max_tokens=0)

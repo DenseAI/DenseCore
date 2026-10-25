@@ -29,7 +29,9 @@ that the accepted stream finishes while readiness and new admission disappear.
 The positive drain request is explicitly bounded to 32 output tokens so it can
 finish within the configured 30-second shutdown budget. The standalone drain
 client keeps its 256-token default and accepts `--max-tokens`; it records the
-request bound, first-token/signal times and exactly one terminal event. This is
+request bound, first-token/signal times, the native active-request gauge before
+SIGTERM and exactly one terminal event. An unfinished buffered HTTP stream alone
+does not qualify as proof that native inference is still active. This is
 evidence for the bounded request, not a promise that an unbounded request can
 always complete before termination.
 

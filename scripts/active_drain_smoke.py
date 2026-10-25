@@ -2,6 +2,7 @@
 """Verify a real accepted stream survives SIGTERM while new admission stops."""
 import argparse
 import json
+import re
 import subprocess
 import threading
 import time
@@ -10,7 +11,7 @@ import urllib.request
 from pathlib import Path
 
 
-def run(base_url, signal_command, output, timeout, max_tokens=256):
+def run(base_url, signal_command, output, timeout, max_tokens=256, active_metric="densecore_active_requests"):
     if max_tokens < 1:
         raise ValueError("max_tokens must be positive")
     began = time.monotonic()
@@ -65,6 +66,17 @@ def run(base_url, signal_command, output, timeout, max_tokens=256):
             raise RuntimeError("no stream token observed before drain")
         if completed.is_set():
             raise RuntimeError("stream completed before SIGTERM; active drain was not tested")
+        # An unfinished buffered HTTP stream alone does not prove native work
+        # remains active. Require the native engine gauge before delivering SIGTERM.
+        with urllib.request.urlopen(base_url + "/metrics", timeout=min(timeout, 2)) as metrics:
+            raw_metrics = metrics.read().decode()
+        pattern = r"^" + re.escape(active_metric) + r"(?:\{[^}]*\})?\s+([0-9.eE+-]+)(?:\s|$)"
+        samples = re.findall(pattern, raw_metrics, re.MULTILINE)
+        result["active_metric_name"] = active_metric
+        result["active_requests_before_signal"] = sum(float(value) for value in samples)
+        result["active_metric_seconds"] = time.monotonic() - began
+        if not samples or result["active_requests_before_signal"] != 1 or completed.is_set():
+            raise RuntimeError("exactly one active native request was not proven before SIGTERM")
         result["stream_incomplete_before_signal"] = True
         result["signal_seconds"] = time.monotonic() - began
         result["events_before_signal"] = len(result["events"])
@@ -105,10 +117,11 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True)
     parser.add_argument("--timeout", type=float, default=30)
     parser.add_argument("--max-tokens", type=int, default=256, help="Bounded accepted workload; keep within the configured shutdown deadline")
+    parser.add_argument("--active-metric", default="densecore_active_requests", help="Native active-request gauge exposed by /metrics")
     parser.add_argument("signal_command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.signal_command
     if command and command[0] == "--": command = command[1:]
     if not command: parser.error("provide the SIGTERM command after --")
     if args.max_tokens < 1: parser.error("--max-tokens must be positive")
-    run(args.url.rstrip("/"), command, args.output, args.timeout, args.max_tokens)
+    run(args.url.rstrip("/"), command, args.output, args.timeout, args.max_tokens, args.active_metric)
