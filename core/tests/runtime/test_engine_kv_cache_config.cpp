@@ -722,7 +722,7 @@ TEST(EngineKVCacheConfig, SafeAutoConcurrencyReducesSequencesInsteadOfEffectiveC
     ScopedEnvVar target("DENSECORE_KV_TARGET_MB", "128");
     ScopedEnvVar context("DENSECORE_MAX_SEQ_LEN", "4096");
     ScopedEnvVar concurrency("DENSECORE_MAX_NUM_SEQS", nullptr);
-    ScopedEnvVar memory("DENSECORE_KV_AVAILABLE_MB_HINT", "2048");
+    ScopedEnvVar memory("DENSECORE_KV_AVAILABLE_MB_HINT", "4096");
     auto model = MakeModel(128, 16, 8);
     model.hparams.n_ctx = 4096;
     auto safe = ComputeSafeKVCacheConfig(&model, GGML_TYPE_F16);
@@ -730,4 +730,20 @@ TEST(EngineKVCacheConfig, SafeAutoConcurrencyReducesSequencesInsteadOfEffectiveC
     EXPECT_GE(safe.max_num_seqs, 1);
     EXPECT_LT(safe.max_num_seqs, 8);
     EXPECT_TRUE(safe.memory_plan.Fits());
+}
+
+TEST(EngineKVCacheConfig, SafeBudgetRejectsWhenEvenOneSequenceCannotFit) {
+    ScopedEnvVar target("DENSECORE_KV_TARGET_MB", "128");
+    ScopedEnvVar context("DENSECORE_MAX_SEQ_LEN", "4096");
+    ScopedEnvVar concurrency("DENSECORE_MAX_NUM_SEQS", nullptr);
+    ScopedEnvVar memory("DENSECORE_KV_AVAILABLE_MB_HINT", "2048");
+    auto model = MakeModel(128, 16, 8);
+    model.hparams.n_ctx = 4096;
+    try {
+        ComputeSafeKVCacheConfig(&model, GGML_TYPE_F16);
+        FAIL() << "one-sequence capacity shortfall must fail instead of shrinking context";
+    } catch (const std::exception& error) {
+        EXPECT_NE(std::string(error.what()).find("context=4096"),std::string::npos);
+        EXPECT_NE(std::string(error.what()).find("available_bytes="),std::string::npos);
+    }
 }
