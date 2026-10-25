@@ -23,11 +23,15 @@ const (
 )
 
 type engineSlot struct {
-	engine    domain.Engine
-	closing   bool
-	refCount  int
-	wg        sync.WaitGroup
-	closeOnce sync.Once
+	engine          domain.Engine
+	closing         bool
+	refCount        int
+	wg              sync.WaitGroup
+	closeOnce       sync.Once
+	closeErr        error
+	closeDone       chan struct{}
+	legacyBeginOnce sync.Once
+	legacyBeginDone chan struct{}
 }
 
 type engineLease struct {
@@ -360,21 +364,43 @@ func (s *ModelService) AcquireEngineLease() *engineLease {
 
 // BeginEngineShutdown stops new leases and asks the native engine to resolve
 // accepted requests before the HTTP server waits for handlers to drain.
-func (s *ModelService) BeginEngineShutdown() {
+func (s *ModelService) BeginEngineShutdown() { _ = s.BeginEngineShutdownContext(context.Background()) }
+
+func (s *ModelService) BeginEngineShutdownContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.Lock()
 	slot := s.currentSlot
+	var shutdowner interface{ BeginShutdownContext(context.Context) error }
+	var legacyDone <-chan struct{}
 	if slot != nil {
 		slot.closing = true
-	}
-	var eng domain.Engine
-	if slot != nil {
-		eng = slot.engine
+		shutdowner, _ = slot.engine.(interface{ BeginShutdownContext(context.Context) error })
+		if shutdowner == nil {
+			if legacy, ok := slot.engine.(interface{ BeginShutdown() }); ok {
+				// Publish the completion owner while holding the same mutex
+				// that removes a model slot. Close cannot pass this barrier.
+				slot.legacyBeginOnce.Do(func() {
+					slot.legacyBeginDone = make(chan struct{})
+					go func() { defer close(slot.legacyBeginDone); legacy.BeginShutdown() }()
+				})
+				legacyDone = slot.legacyBeginDone
+			}
+		}
 	}
 	s.mu.Unlock()
-
-	if shutdowner, ok := eng.(interface{ BeginShutdown() }); ok {
-		shutdowner.BeginShutdown()
+	if shutdowner != nil {
+		return shutdowner.BeginShutdownContext(ctx)
 	}
+	if legacyDone != nil {
+		select {
+		case <-legacyDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return ctx.Err()
 }
 
 func (s *ModelService) releaseEngineLease(slot *engineSlot) {
@@ -411,7 +437,33 @@ func (s *ModelService) closeEngineSlot(ctx context.Context, slot *engineSlot) er
 	}
 
 	slot.closeOnce.Do(func() {
-		slot.engine.Close()
+		slot.closeDone = make(chan struct{})
+		go func() {
+			defer close(slot.closeDone)
+			s.mu.RLock()
+			legacyDone := slot.legacyBeginDone
+			s.mu.RUnlock()
+			if legacyDone != nil {
+				<-legacyDone
+			}
+			if closer, ok := slot.engine.(interface{ CloseContext(context.Context) error }); ok {
+				slot.closeErr = closer.CloseContext(ctx)
+			} else {
+				slot.engine.Close()
+			}
+		}()
 	})
-	return nil
+	if ctx == nil {
+		<-slot.closeDone
+		return slot.closeErr
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-slot.closeDone:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return slot.closeErr
+	}
 }

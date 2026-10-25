@@ -289,3 +289,137 @@ func TestUnloadModelContextDefersCloseAfterTimeout(t *testing.T) {
 		t.Fatal("engine was not closed after deferred lease release")
 	}
 }
+
+type contextShutdownTestEngine struct {
+	modelServiceTestEngine
+	selected chan context.Context
+	release  chan struct{}
+}
+
+func (e *contextShutdownTestEngine) BeginShutdownContext(ctx context.Context) error {
+	e.selected <- ctx
+	select {
+	case <-e.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func TestPreShutdownPropagatesOriginalContextAndClosesLeasesFirst(t *testing.T) {
+	engine := &contextShutdownTestEngine{selected: make(chan context.Context, 1), release: make(chan struct{})}
+	svc := NewModelService()
+	svc.currentSlot = &engineSlot{engine: engine}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(30*time.Second))
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- svc.BeginEngineShutdownContext(ctx) }()
+	selected := <-engine.selected
+	if selected != ctx {
+		t.Fatal("shutdown replaced the runner context")
+	}
+	if lease := svc.AcquireEngineLease(); lease != nil {
+		lease.Close()
+		t.Fatal("lease admitted while native shutdown draining")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown=%v", err)
+	}
+}
+
+type blockingCloseTestEngine struct {
+	modelServiceTestEngine
+	entered, release chan struct{}
+}
+
+func (e *blockingCloseTestEngine) Close() {
+	close(e.entered)
+	<-e.release
+	e.modelServiceTestEngine.Close()
+}
+func TestModelCloseContextReturnsWithoutFreeingAnInUseCleanup(t *testing.T) {
+	engine := &blockingCloseTestEngine{modelServiceTestEngine: modelServiceTestEngine{closeCh: make(chan struct{})}, entered: make(chan struct{}), release: make(chan struct{})}
+	svc := NewModelService()
+	slot := &engineSlot{engine: engine}
+	svc.currentSlot = slot
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- svc.UnloadModelContext(ctx) }()
+	<-engine.entered
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("close=%v", err)
+	}
+	if got := atomic.LoadInt32(&engine.closeCount); got != 0 {
+		t.Fatalf("early free=%d", got)
+	}
+	close(engine.release)
+	if err := svc.closeEngineSlot(context.Background(), slot); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&engine.closeCount); got != 1 {
+		t.Fatalf("free count=%d", got)
+	}
+}
+
+type blockingLegacyShutdownEngine struct {
+	modelServiceTestEngine
+	entered, release          chan struct{}
+	beginReturned, earlyClose atomic.Bool
+}
+
+func (e *blockingLegacyShutdownEngine) Close() {
+	if !e.beginReturned.Load() {
+		e.earlyClose.Store(true)
+	}
+	e.modelServiceTestEngine.Close()
+}
+
+func (e *blockingLegacyShutdownEngine) BeginShutdown() {
+	if atomic.AddInt32(&e.beginShutdownCount, 1) == 1 {
+		close(e.entered)
+	}
+	<-e.release
+	e.beginReturned.Store(true)
+}
+func TestLegacyBeginRetainsModelUntilCleanupReturnsAfterContextExpiry(t *testing.T) {
+	engine := &blockingLegacyShutdownEngine{modelServiceTestEngine: modelServiceTestEngine{closeCh: make(chan struct{})}, entered: make(chan struct{}), release: make(chan struct{})}
+	svc := NewModelService()
+	slot := &engineSlot{engine: engine}
+	svc.currentSlot = slot
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan error, 1)
+	go func() { started <- svc.BeginEngineShutdownContext(ctx) }()
+	<-engine.entered
+	cancel()
+	if err := <-started; !errors.Is(err, context.Canceled) {
+		t.Fatalf("begin=%v", err)
+	}
+	if err := svc.BeginEngineShutdownContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("repeat=%v", err)
+	}
+	if err := svc.UnloadModelContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("unload=%v", err)
+	}
+	if got := atomic.LoadInt32(&engine.closeCount); got != 0 {
+		t.Fatalf("close raced legacy begin: %d", got)
+	}
+	select {
+	case <-engine.closeCh:
+		t.Fatal("legacy close completed before BeginShutdown returned")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(engine.release)
+	if err := svc.closeEngineSlot(context.Background(), slot); err != nil {
+		t.Fatal(err)
+	}
+	if engine.earlyClose.Load() {
+		t.Fatal("Close raced in-flight legacy BeginShutdown")
+	}
+	if got := atomic.LoadInt32(&engine.closeCount); got != 1 {
+		t.Fatalf("close=%d", got)
+	}
+	if got := atomic.LoadInt32(&engine.beginShutdownCount); got != 1 {
+		t.Fatalf("begin=%d", got)
+	}
+}

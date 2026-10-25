@@ -219,8 +219,7 @@ func buildPreShutdownHooks(services servicesBootstrap) []cloudserver.ShutdownHoo
 	if services.modelService == nil {
 		return nil
 	}
-	return []cloudserver.ShutdownHook{func(context.Context) error {
-		services.modelService.BeginEngineShutdown()
-		return nil
+	return []cloudserver.ShutdownHook{func(ctx context.Context) error {
+		return services.modelService.BeginEngineShutdownContext(ctx)
 	}}
 }

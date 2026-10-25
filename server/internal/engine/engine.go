@@ -46,6 +46,14 @@ static void* DenseCoreResolveExport(const char* name) {
     return NULL;
 }
 
+static int DenseCoreShutdownWithGrace(DenseCoreHandle handle, int64_t grace_ms) {
+    typedef int (*ShutdownFn)(DenseCoreHandle, const DenseCoreShutdownOptions*);
+    ShutdownFn fn = (ShutdownFn)DenseCoreResolveExport("DenseCoreShutdownEngineWithOptions");
+    if (!fn) return DENSECORE_STATUS_UNSUPPORTED_OPERATION;
+    DenseCoreShutdownOptions options = {sizeof(DenseCoreShutdownOptions), 1, grace_ms};
+    return fn(handle,&options);
+}
+
 // Wrapper function to call SubmitRequest with the callback
 static int SubmitRequestWrapper(DenseCoreHandle handle, const char* prompt, int max_tokens, uintptr_t user_data) {
     return SubmitRequest(handle, prompt, max_tokens, NULL, (TokenCallback)streamCallbackGateway, (void*)user_data);
@@ -281,6 +289,7 @@ func parseKVCacheType(raw string) (C.DenseCoreKVType, bool, error) {
 
 // DenseEngine wraps the C++ engine with thread safety
 type DenseEngine struct {
+	shutdownLifecycle    shutdownLifecycle
 	generationAdmission  GenerationAdmission
 	generationPolicyOnce sync.Once
 	generationExclusive  bool
@@ -881,25 +890,42 @@ func (e *DenseEngine) GetEmbeddingsWithOptions(prompt string, poolingType string
 	}
 }
 
-// BeginShutdown stops native admission and resolves accepted callbacks while
-// retaining the handle for the final Close after request leases are released.
-func (e *DenseEngine) BeginShutdown() {
+// BeginShutdown preserves the legacy five-second native grace policy.
+func (e *DenseEngine) BeginShutdown() { _ = e.BeginShutdownContext(context.Background()) }
+
+// BeginShutdownContext uses the caller's remaining overall shutdown budget.
+// Context expiry bounds the caller; native safe joins retain handle ownership.
+func (e *DenseEngine) BeginShutdownContext(ctx context.Context) error {
+	return e.shutdownLifecycle.begin(ctx, e.stopNative)
+}
+func (e *DenseEngine) stopNative(ctx context.Context) error {
+	e.mu.Lock()
+	handle := e.handle
+	e.mu.Unlock()
+	if handle == nil {
+		return nil
+	}
+	status := C.DenseCoreShutdownWithGrace(handle, C.int64_t(remainingShutdownMillis(ctx, time.Now())))
+	if status < 0 {
+		return fmt.Errorf("native shutdown failed with error code %d", status)
+	}
+	return nil
+}
+func (e *DenseEngine) freeNative() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.handle != nil {
-		C.BeginEngineShutdown(e.handle)
+		// Keep backend code loaded through any final native cleanup retry.
+		C.FreeEngine(e.handle)
+		e.handle = nil
+		unloadPlugin()
 	}
 }
 
-// Free the engine
-func (e *DenseEngine) Close() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.handle != nil {
-		unloadPlugin()
-		C.FreeEngine(e.handle)
-		e.handle = nil
-	}
+// Close waits for the single cleanup owner and frees the handle exactly once.
+func (e *DenseEngine) Close() { _ = e.CloseContext(context.Background()) }
+func (e *DenseEngine) CloseContext(ctx context.Context) error {
+	return e.shutdownLifecycle.close(ctx, e.stopNative, e.freeNative)
 }
 
 // Get metrics from the engine

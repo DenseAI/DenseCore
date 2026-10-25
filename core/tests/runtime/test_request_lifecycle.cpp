@@ -914,3 +914,84 @@ TEST_F(RequestLifecycleTest, PartiallyAdmittedEmbeddingBatchTerminatesEveryChild
     engine_=nullptr;
     EXPECT_EQ(batch.sizes.size(),2u);
 }
+
+TEST(EngineShutdownPolicyTest, ConfiguredDeadlineExtendsLegacyWindowWithoutRestartingIt) {
+    const auto now=EngineShutdownClock::time_point(std::chrono::seconds(100));
+    const auto legacy=EngineShutdownDeadline(5000,now);
+    const auto configured=EngineShutdownDeadline(30000,now);
+    EXPECT_TRUE(EngineShutdownGraceExpired(legacy,now+std::chrono::seconds(6)));
+    EXPECT_FALSE(EngineShutdownGraceExpired(configured,now+std::chrono::seconds(6)));
+    EXPECT_TRUE(EngineShutdownGraceExpired(configured,now+std::chrono::seconds(30)));
+    EXPECT_EQ(EngineShutdownDeadline(0,now),now);
+    EXPECT_THROW(EngineShutdownDeadline(-1,now),std::invalid_argument);
+    EXPECT_THROW(EngineShutdownDeadline(INT64_MAX,now),std::invalid_argument);
+    EXPECT_THROW(EngineShutdownDeadline(1,EngineShutdownClock::time_point::max()),std::invalid_argument);
+}
+
+TEST_F(RequestLifecycleTest, InvalidShutdownOptionsKeepAdmissionOpen) {
+    DenseCoreShutdownOptions options{sizeof(DenseCoreShutdownOptions),2,30000};
+    EXPECT_EQ(DenseCoreShutdownEngineWithOptions(engine_,&options),DENSECORE_STATUS_INVALID_ARGUMENT);
+    options.version=1;
+    options.struct_size=sizeof(DenseCoreShutdownOptions)-1;
+    EXPECT_EQ(DenseCoreShutdownEngineWithOptions(engine_,&options),DENSECORE_STATUS_INVALID_ARGUMENT);
+    options.struct_size=sizeof(DenseCoreShutdownOptions);
+    options.grace_timeout_ms=-1;
+    EXPECT_EQ(DenseCoreShutdownEngineWithOptions(engine_,&options),DENSECORE_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(static_cast<EngineState*>(engine_)->status.load(),EngineStatus::RUNNING);
+    CallbackState callback;
+    EngineCloseGuard close_before_callback{&engine_};
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(engine_,"valid-after-invalid-shutdown",2,nullptr,0,1,1,1,
+                         nullptr,0,nullptr,0,0,nullptr,0,LifecycleCallbackEx,&callback),0);
+    ASSERT_TRUE(callback.WaitForFinal());
+    EXPECT_EQ(callback.final_count,1);
+}
+
+TEST_F(RequestLifecycleTest, ExpiredConfiguredGraceCancelsHeldRequestExactlyOnce) {
+    auto* state=static_cast<EngineState*>(engine_);
+    CallbackState callback;
+    EngineCloseGuard close_before_callback{&engine_};
+    densecore::testing::EnablePauseAfterSchedulerAdmissionForTest(true);
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(engine_,"held-through-deadline",32,nullptr,0,1,1,1,
+                         nullptr,0,nullptr,0,0,nullptr,0,LifecycleCallbackEx,&callback),0);
+    ASSERT_TRUE(densecore::testing::WaitForPauseAfterSchedulerAdmissionForTest(5000));
+    DenseCoreShutdownOptions options{sizeof(DenseCoreShutdownOptions),1,0};
+    int shutdown_status=DENSECORE_STATUS_INTERNAL_ERROR;
+    std::thread shutdown([&]{shutdown_status=DenseCoreShutdownEngineWithOptions(engine_,&options);});
+    const auto deadline=EngineShutdownClock::now()+5s;
+    while (state->status.load()!=EngineStatus::STOPPED && EngineShutdownClock::now()<deadline) std::this_thread::yield();
+    const bool stopped=state->status.load()==EngineStatus::STOPPED;
+    densecore::testing::ReleasePauseAfterSchedulerAdmissionForTest();
+    shutdown.join();
+    ASSERT_TRUE(stopped);
+    EXPECT_EQ(shutdown_status,DENSECORE_STATUS_OK);
+    ASSERT_TRUE(callback.WaitForFinal());
+    EXPECT_EQ(callback.final_count,1);
+    ASSERT_EQ(callback.final_texts.size(),1u);
+    EXPECT_FALSE(callback.final_texts[0].empty());
+    EXPECT_EQ(DenseCoreShutdownEngineWithOptions(engine_,&options),DENSECORE_STATUS_OK);
+    FreeEngine(engine_);engine_=nullptr;
+    EXPECT_EQ(callback.final_count,1);
+}
+
+TEST_F(RequestLifecycleTest, ConfiguredGraceLetsActiveRequestCompleteAndRejectsNewAdmission) {
+    auto* state=static_cast<EngineState*>(engine_);
+    CallbackState callback;
+    EngineCloseGuard close_before_callback{&engine_};
+    densecore::testing::EnablePauseAfterSchedulerAdmissionForTest(true);
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(engine_,"finish-within-grace",2,nullptr,0,1,1,1,
+                         nullptr,0,nullptr,0,0,nullptr,0,LifecycleCallbackEx,&callback),0);
+    ASSERT_TRUE(densecore::testing::WaitForPauseAfterSchedulerAdmissionForTest(5000));
+    DenseCoreShutdownOptions options{sizeof(DenseCoreShutdownOptions),1,30000};
+    int shutdown_status=DENSECORE_STATUS_INTERNAL_ERROR;
+    std::thread shutdown([&]{shutdown_status=DenseCoreShutdownEngineWithOptions(engine_,&options);});
+    const bool draining=WaitForEngineShutdownStarted(state);
+    EXPECT_EQ(SubmitRequest(engine_,"new-during-drain",2,nullptr,nullptr,nullptr),DENSECORE_STATUS_ENGINE_STOPPED);
+    densecore::testing::ReleasePauseAfterSchedulerAdmissionForTest();
+    shutdown.join();
+    ASSERT_TRUE(draining);
+    EXPECT_EQ(shutdown_status,DENSECORE_STATUS_OK);
+    ASSERT_TRUE(callback.WaitForFinal());
+    EXPECT_EQ(callback.final_count,1);
+    ASSERT_EQ(callback.final_texts.size(),1u);
+    EXPECT_TRUE(callback.final_texts[0].empty());
+}

@@ -52,6 +52,7 @@ void MaybePauseAfterPendingPublishForTest();
 #include "densecore/utils/logging.h"
 #include "ggml-cpu.h"
 #include "llm/config/runtime_config.h"
+#include "runtime/shutdown_policy.h"
 
 #ifdef __APPLE__
 #include "densecore/backend/apple/ane_backend.h"
@@ -2427,9 +2428,9 @@ struct EngineState {
 
     /**
      * Shutdown engine and cleanup resources with graceful draining.
-     * Waits up to 5 seconds for active requests to complete before force-killing.
+     * Uses the supplied grace deadline; legacy callers default to five seconds.
      */
-    void Shutdown() {
+    void Shutdown(EngineShutdownClock::time_point deadline = EngineShutdownDeadline(5000)) {
         // Cleanup remains necessary after a worker failure has closed admission.
         // Serialize repeated callers so they never race on std::thread::join.
         std::lock_guard<std::mutex> shutdown_lock(shutdown_mu);
@@ -2445,9 +2446,8 @@ struct EngineState {
         LOG_INFO("Initiating graceful shutdown (DRAINING)...");
         queue_cv.notify_all();
 
-        // Wait for active requests to drain with 5-second timeout
-        constexpr auto kShutdownTimeout = std::chrono::seconds(5);
-        const auto start_time = std::chrono::steady_clock::now();
+        // The caller computes this deadline before lock acquisition, so repeated
+        // shutdown callers cannot restart an overall grace period.
 
         while (true) {
             {
@@ -2458,15 +2458,13 @@ struct EngineState {
                 }
             }
 
-            auto elapsed = std::chrono::steady_clock::now() - start_time;
-            if (elapsed >= kShutdownTimeout) {
+            if (EngineShutdownGraceExpired(deadline)) {
                 const std::string scheduler_state = DescribeSchedulerState();
                 const std::string watchdog_state = DescribeEmptyScheduleWatchdog();
                 const std::string active_state = DescribeActiveRequests();
                 {
                     std::lock_guard<std::mutex> lock(active_mu);
-                    LOG_WARN("Shutdown timeout after 5 seconds. Force-killing ", active_requests.size(),
-                             " active requests.");
+                    LOG_WARN("Shutdown grace deadline expired; cancelling {} active requests.", active_requests.size());
                     LOG_WARN("Shutdown diagnostics: {} {} {}", scheduler_state, watchdog_state, active_state);
                     for (Request* req : active_requests) {
                         req->cancelled.store(true, std::memory_order_relaxed);
@@ -2475,7 +2473,8 @@ struct EngineState {
                 break;
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            const auto wake = std::min(deadline,EngineShutdownClock::now()+std::chrono::milliseconds(100));
+            std::this_thread::sleep_until(wake);
         }
 
         // Transition to STOPPED and notify worker

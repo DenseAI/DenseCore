@@ -209,3 +209,22 @@ chart dependencies, resolves `github.com/DenseAI/DenseCloud@v1.1.0`, pulls
 `oci://ghcr.io/denseai/charts/dense-base:1.1.0` anonymously, rebuilds the
 local chart dependency from OCI, and runs the DenseCore Go server tests against
 the rebuilt native runtime from isolated caches.
+
+### Native graceful shutdown budget
+
+The server passes the runner's existing shutdown context into native engine
+draining. `SHUTDOWN_TIMEOUT` is one overall deadline starting at shutdown, shared
+by native draining, HTTP/gRPC shutdown and later cleanup hooks; each phase uses
+its remaining time. Readiness and model lease admission close before native
+active requests drain. A request that exceeds the remaining grace is cancelled
+and receives its terminal error once; the timeout does not promise completion
+of an arbitrarily long generation.
+
+The additive C API `DenseCoreShutdownEngineWithOptions` accepts a version-1
+`DenseCoreShutdownOptions` with nonnegative `grace_timeout_ms`. Existing
+`BeginEngineShutdown` and `FreeEngine` keep their five-second default. Native
+safe joins may outlast grace while a kernel or user callback returns. Go bounds
+the caller by its context while one cleanup goroutine retains the handle, and
+frees it exactly once only after native cleanup completes. This does not kill
+an in-use native thread or release its handle early. Container process exit and
+active-request draining require validation on the rebuilt image.

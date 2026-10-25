@@ -1548,6 +1548,30 @@ void BeginEngineShutdown(DenseCoreHandle handle) {
     }
 }
 
+int DenseCoreShutdownEngineWithOptions(DenseCoreHandle handle, const DenseCoreShutdownOptions* options) {
+    if (!handle || !options || options->struct_size < sizeof(DenseCoreShutdownOptions) || options->version != 1) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT,"shutdown options require size/version 1 and a valid engine");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+    EngineShutdownClock::time_point deadline;
+    try { deadline = EngineShutdownDeadline(options->grace_timeout_ms); }
+    catch (const std::invalid_argument& error) {
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT,error.what());
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        static_cast<EngineState*>(handle)->Shutdown(deadline);
+        ClearError();
+        return DENSECORE_STATUS_OK;
+    } catch (const std::bad_alloc&) {
+        SetError(DENSECORE_STATUS_OUT_OF_MEMORY,"shutdown cleanup allocation failed");
+        return DENSECORE_STATUS_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        SetError(DENSECORE_STATUS_INTERNAL_ERROR,error.what());
+        return DENSECORE_STATUS_INTERNAL_ERROR;
+    }
+}
+
 void FreeEngine(DenseCoreHandle handle) {
     if (handle) {
         EngineState* state = (EngineState*)handle;

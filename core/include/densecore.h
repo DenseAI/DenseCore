@@ -797,6 +797,23 @@ DENSECORE_API int GetEmbeddingDimension(DenseCoreHandle handle);
  */
 DENSECORE_API void BeginEngineShutdown(DenseCoreHandle handle);
 
+/** Version 1: zero grace cancels active requests immediately. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t version;
+    int64_t grace_timeout_ms;
+} DenseCoreShutdownOptions;
+
+/**
+ * Close admission and drain using the specified grace period, retaining handle.
+ * Invalid options return INVALID_ARGUMENT without starting shutdown. Safe final
+ * worker/callback joins may outlast grace if user callbacks or kernels block;
+ * callers must retain the handle until this call finishes before FreeEngine().
+ * Existing BeginEngineShutdown()/FreeEngine() retain their five-second default.
+ */
+DENSECORE_API int DenseCoreShutdownEngineWithOptions(DenseCoreHandle handle,
+                                                    const DenseCoreShutdownOptions* options);
+
 /**
  * @brief Get the maximum context length (tokens) for the loaded model
  *
