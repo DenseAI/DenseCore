@@ -412,7 +412,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     }
 
     const BatchSpec* batch = GetCurrentBatch();
-    if (!batch || (batch->num_seqs != q_tokens && !ud->attention_sinks) ||
+    if (!batch || (batch->num_seqs != q_tokens && !ud->attention_sinks && !ud->is_gemma4) ||
         static_cast<int>(batch->tokens.size()) != q_tokens ||
         static_cast<int>(batch->seq_id.size()) != q_tokens || static_cast<int>(batch->pos.size()) != q_tokens ||
         static_cast<int>(batch->block_tables.size()) != batch->num_seqs ||
@@ -426,7 +426,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
     // Token-parallel fast path is only valid when the scheduler intentionally
     // collapsed work to one task per token. Otherwise keep the mixed
     // token/head-tiled path so batched decode can use more than q_tokens tasks.
-    const bool token_parallel_mode = (nth == q_tokens && q_tokens > 1 && !ud->attention_sinks);
+    const bool token_parallel_mode = (nth == q_tokens && q_tokens > 1 && !ud->attention_sinks && !ud->is_gemma4);
 
     // Phase 1: Write current decode K/V to paged cache (parallel over tokens).
     // Each thread handles a disjoint subset of decode tokens, then synchronizes
@@ -691,9 +691,11 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                 if (seq_idx >= 0 && seq_idx < batch->num_seqs) {
                     const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
                     const int pos_i = batch->pos[static_cast<size_t>(token_idx)];
-                    // GPT-OSS also uses this native path for prefill/mixed work;
-                    // each query sees prior positions in its own sequence.
-                    const int n_past_i = ud->attention_sinks ? pos_i : batch->n_past[static_cast<size_t>(seq_idx)];
+                    // GPT-OSS and Gemma also use this native path for prefill
+                    // and mixed work. Each query sees its own sequence only,
+                    // through its actual position, never later rows of a chunk.
+                    const int n_past_i = (ud->attention_sinks || ud->is_gemma4)
+                        ? pos_i : batch->n_past[static_cast<size_t>(seq_idx)];
                     if (!block_table.empty() && pos_i >= 0 && n_past_i >= 0) {
                         cached_seq_idx = seq_idx;
                         cached_block_table = &block_table;

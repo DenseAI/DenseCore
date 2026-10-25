@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <unordered_set>
 
 #ifndef GGML_KQ_MASK_PAD
 #define GGML_KQ_MASK_PAD 32
@@ -172,6 +173,49 @@ struct ggml_tensor* ExecutePagedDecodeAttentionPath(
     bool gemma4_shared_kv_source_layer, int head_dim_q, int head_dim_v, int n_head, int n_head_kv, int n_total_tokens,
     int fast_attn_sliding_window, float fast_attn_logit_softcap, bool use_explicit_attention_scale) {
     (void)n_total_tokens;
+    if (model && model->arch_flags.is_gemma4) {
+        const auto reject = [](const char* reason) {
+            throw std::invalid_argument(std::string("Gemma native per-request attention: ") + reason);
+        };
+        const BatchSpec* batch = GetCurrentBatch();
+        if (!cache || !Qcur || !Kcur || !Vcur || Qcur->type != GGML_TYPE_F32 ||
+            Kcur->type != GGML_TYPE_F32 || Vcur->type != GGML_TYPE_F32 || !batch ||
+            batch->num_seqs <= 0 || batch->tokens.empty() ||
+            batch->seq_id.size() != batch->tokens.size() || batch->pos.size() != batch->tokens.size() ||
+            batch->n_past.size() != static_cast<size_t>(batch->num_seqs) ||
+            batch->block_tables.size() != static_cast<size_t>(batch->num_seqs)) reject("invalid batch/layout");
+        const int tokens = static_cast<int>(batch->tokens.size());
+        if (kv_cache_layer < 0 || kv_cache_layer >= cache->n_layer || head_dim_q <= 0 || head_dim_v <= 0 ||
+            n_head <= 0 || n_head_kv <= 0 || n_head % n_head_kv != 0 ||
+            cache->GetHeadCountForLayer(kv_cache_layer) != n_head_kv ||
+            cache->GetHeadDimForLayer(kv_cache_layer) != head_dim_q ||
+            cache->GetVHeadDimForLayer(kv_cache_layer) != head_dim_v ||
+            Qcur->ne[0] != head_dim_q || Qcur->ne[1] != n_head || Qcur->ne[2] != tokens || Qcur->ne[3] != 1 ||
+            Kcur->ne[0] != head_dim_q || Kcur->ne[1] != n_head_kv || Kcur->ne[2] != tokens || Kcur->ne[3] != 1 ||
+            Vcur->ne[0] != head_dim_v || Vcur->ne[1] != n_head_kv || Vcur->ne[2] != tokens || Vcur->ne[3] != 1)
+            reject("unsupported per-layer head/tensor shape");
+        if (cache->cache_type != GGML_TYPE_F32 && cache->cache_type != GGML_TYPE_F16 &&
+            cache->cache_type != GGML_TYPE_Q8_0 && cache->cache_type != GGML_TYPE_Q4_0)
+            reject("unsupported KV dtype");
+        if (ggml_is_quantized(cache->cache_type) &&
+            (head_dim_q % ggml_blck_size(cache->cache_type) != 0 ||
+             head_dim_v % ggml_blck_size(cache->cache_type) != 0)) reject("unaligned quantized KV head");
+        auto next = batch->n_past;
+        std::unordered_set<uint64_t> written;
+        for (int token = 0; token < tokens; ++token) {
+            const int seq = batch->seq_id[token];
+            const int pos = batch->pos[token];
+            if (seq < 0 || seq >= batch->num_seqs || pos < 0 || pos == std::numeric_limits<int>::max() ||
+                next[seq] < 0 || pos != next[seq]) reject("noncontiguous or invalid per-sequence positions");
+            ++next[seq];
+            const auto& table = batch->block_tables[seq];
+            if (static_cast<size_t>(pos / BLOCK_SIZE) >= table.size()) reject("missing current KV block");
+            const int block = table[pos / BLOCK_SIZE];
+            if (block < 0 || block >= cache->max_blocks) reject("invalid current KV block");
+            const uint64_t slot = (static_cast<uint64_t>(block) << 32) | static_cast<uint32_t>(pos % BLOCK_SIZE);
+            if (!gemma4_shared_kv_layer && !written.insert(slot).second) reject("aliased current KV writes");
+        }
+    }
     struct ggml_tensor* Q_decode = ggml_is_contiguous(Qcur) ? Qcur : ggml_cont(ctx_c, Qcur);
     struct ggml_tensor* K_decode = ggml_is_contiguous(Kcur) ? Kcur : ggml_cont(ctx_c, Kcur);
     struct ggml_tensor* V_decode = ggml_is_contiguous(Vcur) ? Vcur : ggml_cont(ctx_c, Vcur);

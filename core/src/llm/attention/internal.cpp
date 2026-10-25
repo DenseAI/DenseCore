@@ -26,13 +26,6 @@ struct DecodeContextSummary {
     bool valid = false;
 };
 
-bool ShouldUseGemma4PagedDecodeForLayer(const TransformerModel* model, int layer_idx) {
-    if (!model || !model->arch_flags.is_gemma4) {
-        return true;
-    }
-
-    return densecore::models::IsGemma4SlidingLayer(model, layer_idx);
-}
 
 int EffectiveAutoPagedContextFloor(const TransformerModel* model, int requested_floor, int n_tokens_in_batch) {
     if (!model) {
@@ -427,10 +420,15 @@ DecodeAttentionDispatchDecision ResolveDecodeAttentionDispatchDecision(
     bool qcur_contiguous, bool k_contiguous, bool v_contiguous, bool single_seq_layout) {
     (void)layer_idx;
     DecodeAttentionDispatchDecision decision;
-    decision.use_paged_decode_attention = base_paged_decode.use_paged_decode_attention;
-    if (decision.use_paged_decode_attention && !ShouldUseGemma4PagedDecodeForLayer(model, layer_idx)) {
-        decision.use_paged_decode_attention = false;
-    }
+    // Cached Gemma queries require sequence-owned history and actual query
+    // positions for full/sliding attention, including short and mixed batches.
+    // The native paged operator handles these directly; single-sequence flat
+    // causal masks cannot represent independent requests. This correctness
+    // requirement takes precedence over the optional paged-decode heuristic.
+    const bool explicit_single_query_nonpaged = single_seq_layout && n_tokens_in_batch == 1 &&
+        base_paged_decode.paged_decode_decision.reason == DecodePagedFallbackReason::PolicyOff;
+    decision.use_paged_decode_attention = base_paged_decode.use_paged_decode_attention ||
+        (model && model->arch_flags.is_gemma4 && use_cache && !explicit_single_query_nonpaged);
     decision.paged_decode_candidate = base_paged_decode.paged_decode_decision.candidate;
     decision.paged_decode_supported = base_paged_decode.paged_decode_supported;
 

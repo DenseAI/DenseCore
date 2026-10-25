@@ -1600,6 +1600,10 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                 struct ggml_tensor* V_all = Vcur;  // Default to current V
 
                 const bool use_cache = (cache != nullptr);
+                if (model->arch_flags.is_gemma4 && !use_cache && batch.num_seqs > 1) {
+                    throw densecore::InvalidArgumentException(
+                        "Gemma independent multi-sequence attention requires owned KV histories");
+                }
                 const BasePagedDecodeExecutionDecision base_paged_decode =
                     densecore::llm::attention::ResolveBasePagedDecodeExecutionDecision(
                         decode_paged_policy, model, cache, batch, N, n_head, n_head_kv, head_dim_q, head_dim_kv);

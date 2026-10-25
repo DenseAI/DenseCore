@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "densecore/backend/flash_attention.h"
@@ -15,6 +16,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "llm/graph/checked_ops.h"
+#include "llm/attention/exec.h"
 #include "llm/graph/gemma4_shared_kv.h"
 #include "llm/config/runtime_config.h"
 #include "densecore/runtime/inference.h"
@@ -1610,4 +1612,207 @@ TEST(Gemma4DecodeGraphTest, IndependentFullAttentionDecodeMatchesFourOwnedHistor
     const auto actual=densecore::testing::ExecuteTransformerGraphForTest(model.get(),cache.get(),batch,4);
     ASSERT_EQ(actual.size(),expected.size());
     for(size_t i=0;i<actual.size();++i) EXPECT_NEAR(actual[i],expected[i],1e-5f)<<"logit="<<i;
+}
+
+TEST(Gemma4DecodeGraphTest, MixedPrefillDecodeUsesEachQueryPositionAndOwnedHistory) {
+    auto model=MakeBaseGemma4GraphModel(1);model->gemma4_layer_is_sliding={0u};model->gemma4_sliding_window=-1;
+    SetTensorData(model->tok_embeddings,{0.f,0.f,0.f,0.f});
+    ConfigureLayerQkv(model->layers[0].Get(model_keys::kAttnQWeight),model->layers[0].Get(model_keys::kAttnKWeight),
+                      model->layers[0].Get(model_keys::kAttnVWeight),model->layers[0].Get(model_keys::kAttnOWeight),
+                      {0.f,0.f,0.f,0.f},{0.f,0.f,0.f,0.f},{0.f,0.f,0.f,0.f},{1.f,0.f,0.f,1.f});
+    const auto make_cache=[&]() {return std::unique_ptr<PagedKVCache>(InitPagedKVCache(model.get(),2,8,GGML_TYPE_F32,-1));};
+    const auto seed=[&](PagedKVCache* cache,int block,int past,float sign) {
+        const SlotVec key={0.f,0.f},value={sign,-sign};
+        for(int t=0;t<past;++t){cache->WriteKSlot(block,0,t,key.data());cache->WriteVSlot(block,0,t,value.data());}
+    };
+    auto a=make_cache(),b=make_cache();ASSERT_NE(a,nullptr);ASSERT_NE(b,nullptr);
+    const int ba=a->block_manager->AllocateSingle(),bb=b->block_manager->AllocateSingle();ASSERT_GE(ba,0);ASSERT_GE(bb,0);
+    seed(a.get(),ba,1,1.f);seed(b.get(),bb,3,-1.f);
+    std::vector<float> expected;
+    for(auto [cache,block,pos]:std::vector<std::tuple<PagedKVCache*,int,int>>{{a.get(),ba,1},{b.get(),bb,3},{a.get(),ba,2}}) {
+        auto one=densecore::testing::ExecuteTransformerAttentionForTest(model.get(),cache,MakeSingleTokenDecodeBatch(0,pos,block),0,1);
+        ASSERT_EQ(one.size(),2u);expected.insert(expected.end(),one.begin(),one.end());
+    }
+    auto mixed=make_cache();ASSERT_NE(mixed,nullptr);
+    const int ma=mixed->block_manager->AllocateSingle(),mb=mixed->block_manager->AllocateSingle();ASSERT_GE(ma,0);ASSERT_GE(mb,0);
+    seed(mixed.get(),ma,1,1.f);seed(mixed.get(),mb,3,-1.f);
+    BatchSpec batch{};batch.num_seqs=2;batch.tokens={0,0,0};batch.seq_id={0,1,0};batch.pos={1,3,2};
+    batch.n_past={1,3};batch.block_tables={{ma},{mb}};
+    const auto actual=densecore::testing::ExecuteTransformerAttentionForTest(model.get(),mixed.get(),batch,0,4);
+    ASSERT_EQ(actual.size(),expected.size());
+    for(size_t i=0;i<actual.size();++i)EXPECT_NEAR(actual[i],expected[i],1e-6f)<<"attention="<<i;
+    EXPECT_NEAR(actual[0],0.5f,1e-6f);EXPECT_NEAR(actual[4],1.f/3.f,1e-6f); // No later-prefill-token visibility.
+}
+
+namespace {
+void CheckWideGemmaPagedOracle(ggml_type type,bool sliding,bool reader,bool prescaled) {
+    constexpr int query_heads=4,kv_heads=2;
+    const int dim=sliding?256:512,source=sliding?0:1,layer=reader?source+2:source;
+    auto model=MakeBaseGemma4GraphModel(4);model->hparams.n_head=query_heads;model->hparams.n_head_kv=kv_heads;
+    model->hparams.n_embd_head_k=model->hparams.n_embd_head_v=512;
+    model->gemma4_layer_n_head_kv={2,2,2,2};model->gemma4_layer_is_sliding={1,0,1,0};
+    model->gemma4_layer_kv_source={0,1,0,1};model->gemma4_n_shared_kv_layers=2;
+    model->gemma4_key_length_swa=model->gemma4_value_length_swa=256;
+    model->gemma4_key_length_full=model->gemma4_value_length_full=512;
+    auto cache=std::unique_ptr<PagedKVCache>(InitPagedKVCache(model.get(),4,16,type,-1));
+    auto ref=std::unique_ptr<PagedKVCache>(InitPagedKVCache(model.get(),4,16,type,-1));
+    ASSERT_NE(cache,nullptr);ASSERT_NE(ref,nullptr);ASSERT_EQ(cache->cache_type,type);
+    ASSERT_EQ(cache->GetHeadDimForLayer(source),dim);ASSERT_EQ(cache->head_dim,512);
+    std::array<int,4> blocks{},refblocks{};
+    for(int seq=0;seq<4;++seq){blocks[seq]=cache->block_manager->AllocateSingle();refblocks[seq]=ref->block_manager->AllocateSingle();ASSERT_GE(blocks[seq],0);ASSERT_GE(refblocks[seq],0);}
+    BatchSpec batch{};batch.num_seqs=4;batch.tokens.assign(7,0);batch.seq_id={0,1,2,0,2,3,2};
+    batch.n_past={1,2,3,4};batch.pos={1,2,3,2,4,4,5};
+    for(int seq=0;seq<4;++seq)batch.block_tables.push_back({blocks[seq]});
+    const auto values=[&](int seq,int pos,bool key){
+        std::vector<float> out(dim*kv_heads);
+        for(int h=0;h<kv_heads;++h)for(int d=0;d<dim;++d)
+            out[h*dim+d]=static_cast<float>((seq*11+pos*5+h*7+d*(key?3:7))%(key?23:19)-(key?11:9))/(key?16.f:8.f);
+        return out;
+    };
+    for(int seq=0;seq<4;++seq)for(int t=0;t<BLOCK_SIZE;++t){
+        auto k=values(seq,t,true),v=values(seq,t,false);
+        if(t>=batch.n_past[seq]){std::fill(k.begin(),k.end(),11.f);std::fill(v.begin(),v.end(),-17.f);}
+        for(auto [target,block]:std::vector<std::pair<PagedKVCache*,int>>{{cache.get(),blocks[seq]},{ref.get(),refblocks[seq]}}){
+            target->WriteKSlot(block,source,t,k.data());target->WriteVSlot(block,source,t,v.data());
+        }
+    }
+    std::vector<float> query(7*query_heads*dim),keys(7*kv_heads*dim),vals(keys.size());
+    const float scale=prescaled?1.f:1.f/std::sqrt(static_cast<float>(dim));
+    for(int row=0;row<7;++row){
+        const int seq=batch.seq_id[row],pos=batch.pos[row];auto k=values(seq,pos,true),v=values(seq,pos,false);
+        std::copy(k.begin(),k.end(),keys.begin()+row*kv_heads*dim);std::copy(v.begin(),v.end(),vals.begin()+row*kv_heads*dim);
+        ref->WriteKSlot(refblocks[seq],source,pos,k.data());ref->WriteVSlot(refblocks[seq],source,pos,v.data());
+        if(reader){cache->WriteKSlot(blocks[seq],source,pos,k.data());cache->WriteVSlot(blocks[seq],source,pos,v.data());}
+        for(int h=0;h<query_heads;++h)for(int d=0;d<dim;++d){
+            float q=static_cast<float>((d*13+h*7+seq*3)%31-15)/4.f;
+            if(prescaled)q/=std::sqrt(static_cast<float>(dim));
+            query[(row*query_heads+h)*dim+d]=q;
+        }
+    }
+    // Consumer-local K/V are deliberately wrong; only the source cache may be read.
+    if(reader){std::fill(keys.begin(),keys.end(),99.f);std::fill(vals.begin(),vals.end(),-101.f);}
+    const auto snapshot=[&](){
+        std::vector<uint8_t> out;
+        for(int seq=0;seq<4;++seq)for(bool key:{true,false}){
+            const auto* data=static_cast<const uint8_t*>(key?cache->GetKBlockPtr(blocks[seq],source):cache->GetVBlockPtr(blocks[seq],source));
+            const size_t bytes=key?cache->GetBytesPerBlock():cache->GetVBytesPerBlock();out.insert(out.end(),data,data+bytes);
+        }
+        return out;
+    };
+    const auto before=snapshot();
+    std::unique_ptr<InferenceWorkContext,decltype(&DestroyInferenceWorkContext)> work(CreateInferenceWorkContext(),DestroyInferenceWorkContext);
+    ASSERT_NE(work,nullptr);struct Restore{InferenceWorkContext* old=GetCurrentWorkContext();~Restore(){SetCurrentWorkContext(old);}} restore;
+    SetCurrentWorkContext(work.get());ResetInferenceWorkContext(work.get());SetCurrentBatch(&batch);SetCurrentExecutionPhase(InferenceExecutionPhase::Prefill);
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({8*1024*1024,nullptr,false}),ggml_free);ASSERT_NE(ctx,nullptr);
+    auto* q=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,dim,query_heads,7);
+    auto* k=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,dim,kv_heads,7);
+    auto* v=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,dim,kv_heads,7);
+    std::memcpy(q->data,query.data(),query.size()*4);std::memcpy(k->data,keys.data(),keys.size()*4);std::memcpy(v->data,vals.data(),vals.size()*4);
+    const int window=sliding?1:-1;constexpr float softcap=.75f;
+    auto* output=ExecutePagedDecodeAttentionPath(
+        ctx.get(),model.get(),cache.get(),q,k,v,layer,source,reader,true,dim,dim,query_heads,kv_heads,7,window,softcap,prescaled);
+    ASSERT_NE(output,nullptr);auto* graph=ggml_new_graph_custom(ctx.get(),64,false);ggml_build_forward_expand(graph,output);
+    ASSERT_EQ(ggml_graph_compute_with_ctx(ctx.get(),graph,4),GGML_STATUS_SUCCESS);
+    if(reader)EXPECT_EQ(snapshot(),before)<<"shared consumer modified producer KV";
+    const float* actual=static_cast<const float*>(output->data);double observed_cap_effect=0;
+    for(int row=0;row<7;++row)for(int h=0;h<query_heads;++h){
+        const int seq=batch.seq_id[row],pos=batch.pos[row],first=sliding?std::max(0,pos-window):0;
+        std::vector<std::vector<float>> stored_k(pos+1),stored_v(pos+1);
+        std::vector<double> scores(pos+1),uncapped(pos+1);double maxscore=-INFINITY,maxraw=-INFINITY;
+        for(int t=first;t<=pos;++t){
+            stored_k[t].resize(dim*kv_heads);stored_v[t].resize(dim*kv_heads);
+            ref->ReadKSlot(refblocks[seq],source,t,stored_k[t].data());ref->ReadVSlot(refblocks[seq],source,t,stored_v[t].data());
+            double dot=0;for(int d=0;d<dim;++d)dot+=static_cast<double>(query[(row*query_heads+h)*dim+d])*stored_k[t][(h/2)*dim+d];
+            uncapped[t]=dot*scale;scores[t]=std::tanh(uncapped[t]/softcap)*softcap;maxscore=std::max(maxscore,scores[t]);maxraw=std::max(maxraw,uncapped[t]);
+        }
+        double denom=0,rawdenom=0;for(int t=first;t<=pos;++t){denom+=std::exp(scores[t]-maxscore);rawdenom+=std::exp(uncapped[t]-maxraw);}
+        for(int d=0;d<dim;++d){
+            double expected=0,unclipped=0;for(int t=first;t<=pos;++t){const double value=stored_v[t][(h/2)*dim+d];expected+=std::exp(scores[t]-maxscore)/denom*value;unclipped+=std::exp(uncapped[t]-maxraw)/rawdenom*value;}
+            observed_cap_effect=std::max(observed_cap_effect,std::abs(expected-unclipped));
+            EXPECT_NEAR(actual[(row*query_heads+h)*dim+d],expected,1e-4)<<"row="<<row<<" head="<<h<<" d="<<d;
+        }
+    }
+    EXPECT_GT(observed_cap_effect,1e-4)<<"nonzero Q/K fixture must distinguish softcap from ordinary attention";
+}
+}
+
+TEST(Gemma4DecodeGraphTest, MixedWideQuantizedHeadsUseScaledSoftcapAndReadOnlySharedSource) {
+    for(auto type:{GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_Q8_0,GGML_TYPE_Q4_0})
+        for(bool sliding:{false,true})for(bool reader:{false,true})for(bool prescaled:{false,true}){
+            SCOPED_TRACE(ggml_type_name(type));
+            SCOPED_TRACE(sliding);
+            SCOPED_TRACE(reader);
+            SCOPED_TRACE(prescaled);
+            CheckWideGemmaPagedOracle(type,sliding,reader,prescaled);
+        }
+}
+
+TEST(Gemma4DecodeGraphTest, WideSharedLayerLogitsMatchFourIndependentRequests) {
+    for (auto type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        SCOPED_TRACE(ggml_type_name(type));
+        auto model = MakeBaseGemma4GraphModel(4);
+        model->hparams.n_head = 2;
+        model->hparams.n_embd_head_k = model->hparams.n_embd_head_v = 512;
+        model->gemma4_layer_is_sliding = {1, 0, 1, 0};
+        model->gemma4_layer_kv_source = {0, 1, 0, 1};
+        model->gemma4_n_shared_kv_layers = 2;
+        model->gemma4_key_length_swa = model->gemma4_value_length_swa = 256;
+        model->gemma4_key_length_full = model->gemma4_value_length_full = 512;
+        model->gemma4_sliding_window = 1;
+        SetTensorData(model->tok_embeddings, {.5f, -.25f, -.375f, .75f});
+        for (int layer = 0; layer < 4; ++layer) {
+            const int dim = layer % 2 ? 512 : 256;
+            auto matrix = [&](int in, int out, int salt) {
+                auto* tensor = ggml_new_tensor_2d(model->ctx_w, GGML_TYPE_F32, in, out);
+                auto* data = static_cast<float*>(tensor->data);
+                for (int i = 0; i < in * out; ++i) data[i] = ((i * 7 + salt) % 17 - 8) / 128.f;
+                return tensor;
+            };
+            auto& weights = model->layers[layer];
+            weights.Set(model_keys::kAttnQWeight, matrix(2, dim * 2, layer));
+            weights.Set(model_keys::kAttnKWeight, layer < 2 ? matrix(2, dim, layer + 3) : nullptr);
+            weights.Set(model_keys::kAttnVWeight, layer < 2 ? matrix(2, dim, layer + 5) : nullptr);
+            weights.Set(model_keys::kAttnOWeight, matrix(dim * 2, 2, layer + 7));
+        }
+        const auto seed = [&](PagedKVCache* cache, int block, int seq) {
+            for (int layer = 0; layer < 2; ++layer) {
+                const int dim = layer ? 512 : 256;
+                std::vector<float> k(dim), v(dim);
+                for (int t = 0; t <= seq; ++t) {
+                    for (int d = 0; d < dim; ++d) {
+                        k[d] = ((d * 3 + seq * 5 + t) % 23 - 11) / 16.f;
+                        v[d] = ((d * 7 + seq * 11 + t) % 19 - 9) / 8.f;
+                    }
+                    cache->WriteKSlot(block, layer, t, k.data());
+                    cache->WriteVSlot(block, layer, t, v.data());
+                }
+            }
+        };
+        std::vector<float> expected;
+        for (int seq = 0; seq < 4; ++seq) {
+            std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(model.get(), 4, 8, type, -1));
+            ASSERT_NE(cache, nullptr);
+            const int block = cache->block_manager->AllocateSingle();
+            ASSERT_GE(block, 0);
+            seed(cache.get(), block, seq);
+            const auto logits = densecore::testing::ExecuteTransformerGraphForTest(
+                model.get(), cache.get(), MakeSingleTokenDecodeBatch(seq % 2, seq + 1, block), 1);
+            ASSERT_EQ(logits.size(), 2u);
+            expected.insert(expected.end(), logits.begin(), logits.end());
+        }
+        std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(model.get(), 4, 8, type, -1));
+        ASSERT_NE(cache, nullptr);
+        BatchSpec batch{};
+        batch.num_seqs = 4; batch.tokens = {0, 1, 0, 1}; batch.seq_id = {0, 1, 2, 3};
+        batch.pos = batch.n_past = {1, 2, 3, 4};
+        for (int seq = 0; seq < 4; ++seq) {
+            const int block = cache->block_manager->AllocateSingle();
+            ASSERT_GE(block, 0);
+            seed(cache.get(), block, seq);
+            batch.block_tables.push_back({block});
+        }
+        const auto actual = densecore::testing::ExecuteTransformerGraphForTest(model.get(), cache.get(), batch, 4);
+        ASSERT_EQ(actual.size(), expected.size());
+        for (size_t i = 0; i < actual.size(); ++i) EXPECT_NEAR(actual[i], expected[i], 1e-5) << "logit=" << i;
+    }
 }
