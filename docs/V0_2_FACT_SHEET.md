@@ -1,24 +1,42 @@
 # v0.2 launch fact sheet — draft
 
-**Status: release readiness incomplete.** No v0.2 image, tag or release has been
-published by this implementation task. This sheet is for preparing a later
-launch; community post text remains the user's responsibility.
+**Release readiness is incomplete.** No v0.2 image, tag or release has been
+published by this work. Community post text remains the user's responsibility.
+Evidence below belongs to frozen candidate `7ecaf86`, not to unverified follow-up
+fixes or a future release.
 
-Intended deployments are a personal PC, an existing CPU Kubernetes pod and a
-two-socket NUMA host. The candidate adds explicit resource budgeting, checked
-model artifacts, metadata-driven embedding pooling and safer request/prefix
-state ownership. Model-specific execution and platform qualification are tracked
-in the [release gates](V0_2_RELEASE_GATES.md) and [model catalog](MODEL_CATALOG.md).
+Intended deployments are a personal PC, a resource-limited CPU Kubernetes pod
+and a two-socket NUMA host. The candidate adds resource budgeting, checked model
+artifacts, metadata-driven embedding pooling, request/prefix ownership and
+stored-KV-precision consistency. See the [release gates](V0_2_RELEASE_GATES.md)
+and [model catalog](MODEL_CATALOG.md) for exact scope.
 
-Use no new performance headline yet. Historical TTFT gains do not establish an
-aggregate-throughput or completion-time lead. The MTP candidate includes batched target verification and rollback. A pinned
-0.8B file passed frozen-binary greedy and stream/cancel checks, with final
-integration and performance qualification still pending. Its automatic profile
-registry is empty. NUMA defaults remain unpromoted. The gpt-oss packed native execution
-candidate has no current speed or PC RAM-support claim.
+- Native tests: 1263 passed with 14 existing skips; selected ASAN/LSan: 600 passed with
+  9 existing skips, zero failures/reports. These passes do not override the
+  real-model failures below.
+- README-pinned 0.8B and plain 2B prefix checks passed exact native parity,
+  five-turn answers, actual snapshot restoration, cancellation and eviction.
+  Embedding AUTO/LAST passed 12 bitwise C/Python/HTTP comparisons.
+- Qwen3 default/off HTTP modes passed 16 semantic/protocol cases. Explicit-off
+  number-only formatting still failed, also in the pinned llama oracle.
+- MTP 0.8B/2B K=2 c=1/c=4 greedy/native/HTTP checks passed. First real stochastic
+  sampling failed HTTP stop handling in both NONE and MTP. Automatic profiles
+  remain zero; complete long-answer/distribution and performance gates remain.
+- Gemma E2B c=1 long/repeat checks passed 6/6; c=4 same-input slot isolation
+  failed despite semantic/EOS successes. Canonical E4B qualification is pending.
+- Local portable amd64 image components passed 4 GiB serving, explicit 1 GiB
+  rejection and kind checksum checks. Strict Count and full active drain failed.
+  Separate Go-only readiness candidate `f50d958` has race-test evidence; its
+  image validation is pending and cannot qualify the later final package.
 
-A publishable fact sheet must name the exact source and image digests, model
-revision/SHA, tested CPU/RAM/context/concurrency, complete final-answer results,
-matched performance artifacts and all unsupported combinations. Only report
-required PC RAM with measured peak RSS and the corresponding context. Do not
-replace unavailable Arm/NUMA/model evidence with CI configuration or fixtures.
+No new speed headline is supported. Historical TTFT gains do not establish
+aggregate throughput or completion-time superiority. MTP/NUMA defaults remain
+unpromoted. C4/C4A, physical NUMA, 35B/122B, native Arm and real GPT-OSS inference
+remain unverified for this candidate; no PC RAM range is claimed for GPT-OSS.
+Paid validation spending is $0 of the $50 cap.
+
+Before publication, name the exact source/image/model identities, CPU/RAM/
+context/concurrency, complete-answer and isolation outcomes, matched performance
+samples and unsupported combinations. Publish required PC RAM only with measured
+peak RSS and context. Local raw ledger filenames are recorded in the release
+gates; they are not publicly available artifact promises.

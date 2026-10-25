@@ -9,27 +9,41 @@ separate gates. Fixture or compilation success does not qualify a model. A
 missing or truncated final answer fails quality even if reasoning contains the
 expected text. The current automatic MTP profile registry is empty.
 
-| Track | Implemented candidate | Required remaining release evidence |
-|---|---|---|
-| A | Request-owned RNG; fatal worker shutdown and terminal-publication fallback; coherent native thread-pool generations | Post-fix ASAN/full-suite and real c=1/2/4 isolation; external same-seed stochastic validation is unavailable until request seed wiring exists |
-| B/H | Common cgroup v1/v2, ancestor quota/cpuset/affinity budget; AUTO pooling; context-preserving concurrency fit; shared graph/repack reservations | Final integrated native tests, real embedding parity, limited-container model success and explicit memory rejection |
-| B Gemma | Variant labels, native float/quant projections and published shared-KV consumers | E2B then pinned E4B complete long answers, repeat/c=1/4 quality and layer logits |
-| C | Admission-owned snapshot/KV leases, restoration before hit commit, bounded captures | Exact restore/hit/skipped-prefill evidence, #1/#4 and five turns, eviction/cancel/concurrency for each target model |
-| D | NextN trunk/head split, dense/MoE head execution, shared sampler distribution, batched K+1 target verification, rollback and per-position SSM checkpoints, fair service and qualification matcher | Final combined ASAN and post-integration model matrix; 2B/35B MoE and stochastic end-to-end quality; five-ABBA speed/resource/latency/throughput qualification before automatic activation |
-| E | Pinned model cache/downloads; native image profile CI; chart/container/drain harnesses | Final image real serving, checksum failure, actual limited pod and active drain; native Arm validation |
-| F | GPT-OSS packed MXFP4 expert math, biases/router/activation, attention sink/window, tokenizer/Harmony | Complete native fixture suite, real-model HTTP/long output/c=1/4/stop/stream and measured peak RSS/context |
-| G | Public physical-NUMA preflight and matched ABBA harness | Actual two-socket 35B and 122B measurements; 16/48 physical-core placements and remote-memory penalty |
+The current evidence snapshot is frozen source
+`7ecaf86072246752ac15a1bf7caab1b2ff5f9217`. Its global stored-KV-precision
+change affects cold non-F32 attention, so earlier `8c5433a` model successes do
+not automatically carry forward. Later fixes require their own integrated
+binary and model/package checks.
 
-Qwen3.5 prefix qualification uses `DENSECORE_QWEN35_PREFIX_CACHE_REUSE=1` with
-both global prefix/snapshot controls enabled. It remains off by default. Qwen3.6
-keeps its model-specific qualification gate. Explicit MTP uses batched K+1
-target verification with suffix rollback and SSM recovery. Frozen revision
-`44d7675` passed same-file 128-token greedy checks for the pinned 0.8B MTP file,
-K=1/2/3 at c=1, and K=2 at c=2/4, including actual acceptance/rejection/rollback
-and HTTP stream/cancel recovery. That evidence predates the subsequent cache,
-head-memory and fairness fixes, whose combined binary must be rechecked. It is
-correctness evidence for that file and binary, with no acceleration claim.
-The production qualification registry remains empty.
+| Track | Verified on canonical `7ecaf86` | Remaining release gate |
+|---|---|---|
+| A | Full native: 1263 passed, 14 existing skips, zero failures (1277 total). Selected ASAN/LSan suite: 600 passed, 9 existing skips, zero failures/reports (609 total). Qwen3 cold/warm native ID parity and HTTP reasoning/final separation passed | Gemma E2B c=4 same-prompt isolation fails; actual stochastic HTTP stop strings leak in both NONE and MTP. Fix and requalify affected paths |
+| B/H | Resource/planner fixtures, pinned 0.8B serving within 4 GiB, explicit initialization rejection within 1 GiB without OOM kill; embedding AUTO/LAST C/Python/HTTP 12 comparisons bitwise equal, finite and normalized | Final integrated image/pod verification after fixes; broader c=8 resource/isolation and platform qualification |
+| B Gemma | Pinned E2B c=1 long-answer/repeat HTTP quality passed 6/6 | E2B c=4 same-prompt outputs differ by slot despite 24 semantic/EOS successes; native-ID investigation and E4B canonical long/repeat/c=1/4 qualification remain |
+| C | README-pinned 0.8B and plain 2B combined strict checks passed: c=1/2/4, five-turn final answers, actual restore/skipped prefill, cancellation/recovery and real snapshot/KV eviction | Qwen3.6 model-specific qualification; matched performance and default-policy promotion remain separate |
+| D | 0.8B/2B MTP files, K=2, c=1/c=4: same-file NONE/MTP 128 native IDs and HTTP/stream/cancel/recovery passed | Actual stochastic 0.8B c=1 fails HTTP stop handling (NONE 3 leaks, MTP 2); remaining stochastic cells, current K=1/3, real 35B MoE head and performance qualification remain |
+| E | Local portable amd64 image built; 4 GiB serving/1 GiB rejection and kind chart/downloader/limits/checksum components passed | Strict Count and full active drain fail. Go-only readiness fix plus stricter active-observation harness is a separate pending image validation; final integrated package and native Arm remain unqualified |
+| F | GPT-OSS packed MXFP4/bias/router/activation, attention sink/window and tokenizer/Harmony fixtures | Real-model HTTP/long output/c=1/4/stop/stream and peak RSS/context unavailable on this host; safe capacity refusal is not inference support |
+| G | Public physical-NUMA preflight and matched ABBA harness | Actual two-socket 35B/122B measurements, 16/48 physical-core placement and remote-memory penalty; no default promotion |
+
+Qwen3.5 prefix qualification used `DENSECORE_QWEN35_PREFIX_CACHE_REUSE=1`
+with global prefix/snapshot controls enabled. The opt-in remains separate from
+quality and performance promotion. Qwen3.6 retains its model-specific gate.
+The combined 0.8B/2B runs each observed 14 real restores. Separate near-full
+pressure runs reclaimed 105 KV blocks and respectively 10/11 snapshots
+(202,014,720 / 222,216,192 logical payload bytes). Pressure-control output is
+not complete-answer quality evidence, and turn-five single samples are not a
+performance comparison.
+
+Explicit MTP executes batched K+1 verification with suffix rollback and SSM
+recovery. Its 128-token parity runs may finish by length; they do not prove a
+complete long answer or stochastic distribution equivalence. The first real
+stochastic run used temperature 0.7, top-p 0.95, top-k 40 and repetition penalty
+1.05 and failed the HTTP stop gate. Native acceptance/rejection/rollback was
+observed, but that does not excuse literal stop text reaching clients. Native
+request seed wiring and real-model distribution qualification remain absent.
+The production AUTO registry contains zero profiles and selects NONE without
+model hashing or runtime-profile capture. No MTP acceleration is claimed.
 
 ## Reproduction and evidence
 
@@ -39,9 +53,14 @@ headers or registration before collecting any real-model evidence.
 
 - Native: complete `densecore_tests`, A/D ASAN, and focused model-logit/rollback tests.
 - Adapters: changed Go and Python tests; Go race checks for callback/admission paths.
-- Real quality: `benchmarks/economics/evaluate_openai_quality.py` requires a final
-  answer, successful finish and complete SSE stream. Save raw output and all
-  failures. Textual HTTP parity is weaker than full generated-token-ID parity.
+- Real quality: the [final-answer evaluator](../benchmarks/economics/evaluate_openai_quality.py)
+  requires a final answer, successful finish and complete SSE stream. Save raw
+  output and all failures. Textual HTTP parity is weaker than full native-ID parity.
+- State parity: [prefix/eviction](../benchmarks/personal/check_prefix_parity.py),
+  [greedy MTP](../benchmarks/personal/check_mtp_parity.py) and
+  [stochastic MTP](../benchmarks/personal/check_mtp_sampling.py) entry points.
+  Match each ledger's actual harness/case SHA and parameters: separately recorded
+  harness revisions are not interchangeable merely because filenames match.
 - Final package: [container smoke](../scripts/container_model_smoke.sh) and
   [kind smoke](../scripts/kind_model_smoke.sh); [Kubernetes instructions](KUBERNETES.md).
 - Artifact identities: [model catalog](MODEL_CATALOG.md).
@@ -68,38 +87,56 @@ remove a track or turn fixture passes into real-model support.
 
 ## Retained failures and current integration boundary
 
-Revision `44d7675` is frozen for raw model evidence; follow-on work is isolated
-on `v02/integration-next`. Its full native run passed 1184 tests with 14 existing
-skips and no failures. This count does not certify the follow-on source.
+- Qwen3 HTTP default/off thinking modes passed 16 semantic/protocol cases,
+  including reasoning/final separation and complete streams. The separate
+  explicit-off “only a number” arithmetic gate failed: output included
+  `6 × 7 = 42`. The pinned llama.cpp oracle (`74bca3950054eed1795f525cb9cf06bfe796492d`)
+  also failed that format requirement. Keep the format failure; an oracle
+  failure does not relax the DenseCore gate. Native prefix OFF/ON parity is a
+  separate passed check on canonical F16 KV.
+- E2B c=4 long-answer outputs differ for the same input across slots, with
+  reported completion counts 129/128/128/132. HTTP 200, correct semantic content
+  and EOS do not establish request isolation. Raw native-ID investigation is
+  pending. Serializing c=4 or silently reducing concurrency does not pass it.
+  Canonical E4B validation remains pending; earlier Paris or fixture successes
+  are not complete model support.
+- The canonical image is a **local** portable amd64 candidate with image ID
+  `sha256:affcd8eda8028aa5124a769b62d22533024821c17cdbc2a8b7fe3ebc3bd55cf9`.
+  Strict Count still fails. An accepted stream completed more than five seconds
+  after shutdown began, but readiness remained 200 while work was active;
+  full active drain fails. Late readiness/admission observations do not pass
+  the lifecycle gate.
+- Separate Go-only candidate `f50d958b283d76441c1ff774febfef0d6108ab05`
+  includes early readiness withdrawal, drain-time read-only diagnostics and a
+  harness requiring same-round readiness 503/new-admission refusal while an
+  accepted request is active. Focused repeated and full relevant Go race checks
+  passed. Its core tree is identical to `7ecaf86`; actual image/container/kind
+  validation is pending. This is not the final image for later Gemma/stop fixes.
 
-- Gemma E2B short answers passed, but its long-answer cacheON run repeated
-  Mercury. The same file passed with cacheOFF and in llama.cpp. The candidate
-  now rejects graph reuse across unkeyed fixed-history KV shapes. Frozen
-  `82463c0` subsequently completed the ordered long answer with DONE and EOS
-  with default cache configured ON (unsafe graphs were skipped, with zero hits).
-  This is one HTTP final-answer check; native-ID parity and c=4 remain required.
-- Gemma E4B first failed at a published shared-KV consumer lacking private K/V.
-  Shared-source validation and native Q4_0 projection fixes subsequently produced
-  a correct Paris answer on `82463c0`, but the following long request failed.
-  Instrumented replay isolated a graph-ledger refusal: a new 512 MiB metadata
-  arena was requested with only 192 MiB free of its 1920 MiB capacity. Idle-arena
-  pressure recycling is under test; a complete long answer remains required.
-- The earlier portable candidate served within 4 GiB and explicitly rejected
-  an undersized 1 GiB configuration. Its strict Count quality check failed, as
-  did the same-file llama comparison; retain the failure. Active drain hit the
-  old native five-second timeout. The sized native grace API and actual-active
-  smoke instrumentation require a new final-image container/kind run.
-- GPT-OSS safely rejected initialization on the available-memory envelope;
-  complete HTTP inference and a supported PC RAM range remain unverified.
+Local raw ledger filenames (not published artifact download links):
 
-Raw local evidence is retained under `/home/jaewook/dc/logs/v02-*`, including
-`v02-mtp-dense-matrix-report.json`. Archive those raw files with exact source,
-model/library hashes and commands before publishing any result.
+- `v02-canonical-7ec-artifact.json`: exact source/build/library/server identities,
+  native/ASAN/Go checks and dependency audits. Python harness 35 passed on this
+  candidate; Python binding 49 passed on unchanged `8c5433a` sources.
+- `v02-correctness-canonical-7ec-results.json`,
+  `v02-canonical7ec-qwen3-default-qa.json`,
+  `v02-canonical7ec-qwen3-off-qa.json`,
+  `v02-canonical7ec-qwen3-off-strict-number.json` and
+  `v02-qwen3-canonical7ec-llama-oracle.json`: prefix, embedding and separated
+  Qwen3 native/HTTP/oracle outcomes.
+- `v02-mtp-canonical7ec-matrix-report.json` and
+  `v02-mtp-sampling7ec-08b-c1/summary.json`: greedy matrix and retained
+  stochastic stop/punctuation failures.
+- `v02-canonical7ec-e2b-c1-qa.json` and
+  `v02-canonical7ec-e2b-c4-qa.json`: c=1 quality and c=4 isolation failure.
+- `v02-packaging-canonical7ec-reviewed-components.json` and
+  `v02-readiness-evidence.json`: reviewed package failures and the separate
+  Go-only fix boundary. An older component summary's drain “pass” is superseded
+  by the reviewed full-lifecycle failure.
 
-AUTO pre-KV selection is now connected to stable loaded model bytes and the
-native CPU/build/runtime contract, including loaded GGML dependencies and the
-chosen prefill chunk. Candidate tests passed 62/62 before final integration;
-production still ships zero profiles. The initial collector qualifies only
-proven single-node, full-online-affinity Linux execution; partial cpusets,
-unknown conditions and unverified dependency/allocator overrides choose NONE.
-This restriction does not change ordinary resource-aware serving.
+Archive raw results with their identities before publishing claims. Public
+reproduction entry points are the relative script/document links above, not
+local evidence paths. AUTO collection initially accepts only proven single-node,
+full-online-affinity Linux execution; partial cpusets, unknown runtime conditions
+and unverified dependency/allocator overrides choose NONE. Ordinary resource-aware
+serving is independent of that conservative automatic-qualification restriction.

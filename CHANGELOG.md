@@ -17,11 +17,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   terminate failed worker requests and fix native thread-pool generation races.
 - Add NextN loading, batched MTP target verification, suffix/SSM recovery and
   bounded speculative service. Automatic qualification profiles remain empty.
-  Batched verification/SSM integration and automatic speed qualification remain pending.
+  Canonical 0.8B/2B K2 c1/c4 greedy checks passed; real stochastic HTTP stop
+  handling and automatic speed qualification remain incomplete.
+- Make non-F32 prefill attention consume actual stored KV precision, matching
+  cached history. Canonical Qwen3 cold/warm parity passed; earlier binary quality
+  results do not automatically carry across this numerical change.
 - Add Gemma native float-projection and GPT-OSS native packed-expert/Harmony
-  candidates; real-model and final-package gates are tracked separately.
+  candidates. Gemma E2B c1 long/repeat checks passed, while c4 isolation fails;
+  E4B and actual GPT-OSS inference remain unqualified.
 - Verify model downloads and cached bytes before publication, and add native
   image-profile, limited-pod, drain and reproducible CPU comparison gates.
+  Canonical image components passed 4 GiB serving, 1 GiB explicit rejection and
+  kind checksum checks; strict Count and full active drain failed. A separate
+  Go-only readiness fix has race-test evidence, with image validation pending.
+- Revalidate pinned 0.8B/2B prefix restoration/eviction and embedding AUTO/LAST
+  (12 bitwise comparisons). Canonical native tests passed 1263 with 14 existing
+  skips; ASAN/LSan passed 600 with 9 existing skips and zero reports. Real-model
+  failures still block release readiness; no performance/default promotion.
 
 See [v0.2 release gates](docs/V0_2_RELEASE_GATES.md) for incomplete checks;
 these entries are not a released model-support or performance announcement.
@@ -58,11 +70,12 @@ these entries are not a released model-support or performance announcement.
 
 ### Added
 
-- **Qwen3.6-35B-A3B text-only support**: DenseCore aliases Qwen3.6 GGUF/HF
+- **Qwen3.6-35B-A3B text-only execution path**: DenseCore aliases Qwen3.6 GGUF/HF
   metadata onto the `qwen35moe` hybrid-SSM runtime, reconstructs the
   3-linear/1-full layer schedule from `full_attention_interval=4` when needed,
   and keeps multimodal execution fail-closed while skipping auxiliary vision
-  tensors on the text path.
+  tensors on the text path. v0.2 real-model/platform/performance qualification
+  remains pending.
 
 ## [0.1.0] - 2026-09-25
 
