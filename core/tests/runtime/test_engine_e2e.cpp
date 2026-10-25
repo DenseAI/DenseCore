@@ -39,24 +39,29 @@ TEST(EngineInitOptions, RejectsUnsupportedExplicitMtpModel) {
     EXPECT_NE(std::string(DenseCoreGetLastError()).find("explicit MTP"), std::string::npos);
 }
 
-TEST(EngineInitOptions, ExplicitMtpPreservesItsValidatedTargetOnModelMutations) {
-    EngineState state;
-    state.default_model_id = "target";
-    state.models.emplace("target", std::make_unique<ModelEntry>());
-    state.models.emplace("other", std::make_unique<ModelEntry>());
-    state.speculation_selected.store(DENSECORE_SPEC_MTP);
+TEST(EngineInitOptions, SelectedMtpPreservesItsValidatedTargetOnModelMutations) {
+    for (const int requested : {DENSECORE_SPEC_AUTO, DENSECORE_SPEC_MTP}) {
+        SCOPED_TRACE(requested);
+        EngineState state;
+        state.default_model_id = "target";
+        state.models.emplace("target", std::make_unique<ModelEntry>());
+        state.models.emplace("other", std::make_unique<ModelEntry>());
+        state.speculation_requested.store(requested);
+        state.speculation_selected.store(DENSECORE_SPEC_MTP);
 
-    EXPECT_EQ(LoadModel(&state, "unvalidated", "not-opened.gguf", 1),
-              DENSECORE_STATUS_UNSUPPORTED_OPERATION);
-    EXPECT_NE(std::string(DenseCoreGetLastError()).find("explicit MTP"), std::string::npos);
-    EXPECT_EQ(state.models.size(), 2u);
-    EXPECT_EQ(SetDefaultModel(&state, "other"), DENSECORE_STATUS_UNSUPPORTED_OPERATION);
-    EXPECT_EQ(state.default_model_id, "target");
-    EXPECT_EQ(SetDefaultModel(&state, "target"), DENSECORE_STATUS_OK);
+        EXPECT_EQ(LoadModel(&state, "unvalidated", "not-opened.gguf", 1),
+                  DENSECORE_STATUS_UNSUPPORTED_OPERATION);
+        const char* context = requested == DENSECORE_SPEC_AUTO ? "qualified automatic MTP" : "explicit MTP";
+        EXPECT_NE(std::string(DenseCoreGetLastError()).find(context), std::string::npos);
+        EXPECT_EQ(state.models.size(), 2u);
+        EXPECT_EQ(SetDefaultModel(&state, "other"), DENSECORE_STATUS_UNSUPPORTED_OPERATION);
+        EXPECT_EQ(state.default_model_id, "target");
+        EXPECT_EQ(SetDefaultModel(&state, "target"), DENSECORE_STATUS_OK);
 
-    state.speculation_selected.store(DENSECORE_SPEC_NONE);
-    EXPECT_EQ(SetDefaultModel(&state, "other"), DENSECORE_STATUS_OK);
-    EXPECT_EQ(state.default_model_id, "other");
+        state.speculation_selected.store(DENSECORE_SPEC_NONE);
+        EXPECT_EQ(SetDefaultModel(&state, "other"), DENSECORE_STATUS_OK);
+        EXPECT_EQ(state.default_model_id, "other");
+    }
 }
 
 TEST(EngineInitOptions, RejectsMalformedOptionsAndKvTypeBeforeLoading) {
