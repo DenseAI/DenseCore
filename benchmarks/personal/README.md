@@ -37,6 +37,14 @@ python3 benchmarks/personal/check_prefix_parity.py \
   --out /tmp/prefix-parity
 ```
 
+If a large KV pool reclaims ordinary cached blocks while retaining every
+snapshot-bearing block, a separate `--concurrency 1 --near-full-pressure`
+run sizes one cold prompt using native owned request snapshots and reserves
+one output token plus a 16-token margin. This targets snapshot reclamation
+without assuming a particular hot probe must be evicted. It remains subject
+to the same positive KV/snapshot removal counters and exact off/on token gate;
+its c1 result does not replace the 1/2/4 request-isolation matrix.
+
 The optional server probe validates complete final chat answers with
 `cache_prompt=true`; text found only in reasoning and truncated answers fail.
 Without `--server`, the report explicitly leaves HTTP final answers unverified.

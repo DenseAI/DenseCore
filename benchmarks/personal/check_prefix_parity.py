@@ -23,6 +23,34 @@ from check_mtp_parity import (COMPLETE, TOKEN, InitOptions, RuntimePlan, digest,
 from compare_servers import validate_response
 
 
+class RequestSnapshot(C.Structure):
+    _fields_ = [('prompt', C.c_char_p), ('ids', C.POINTER(C.c_int)), ('count', C.c_int),
+                ('submit', C.c_int), ('temperature', C.c_float), ('top_p', C.c_float),
+                ('top_k', C.c_int), ('penalty', C.c_float),
+                *[(name, C.c_int) for name in ('json_mode', 'template_applied', 'text_primed', 'token_primed')],
+                *[(name, C.c_char_p) for name in ('tokenizer', 'variant', 'family')], ('owns', C.c_int)]
+
+
+def near_full_pressure_prompt(count_tokens, target):
+    """Size a distinct cold prompt using the actual prepared native token count."""
+    if target < 32:
+        raise ValueError('near-full pressure requires at least32 prompt tokens')
+    unit = 'Independent cold eviction audit record with unrelated facts. '
+    suffix = 'What is the capital of France? Answer with the city name only.\nAssistant:'
+    low, high = 0, target
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count_tokens(unit * middle + suffix) <= target:
+            low = middle
+        else:
+            high = middle - 1
+    prompt = unit * low + suffix
+    count = count_tokens(prompt)
+    if not target - 16 <= count <= target:
+        raise ValueError(f'near-full pressure token count{count} does not cover target{target}')
+    return prompt, count
+
+
 def prefix_evidence(text):
     fields = ('blocks', 'hybrid_snapshots', 'hybrid_payload_bytes')
     counts = {field: [int(x) for x in re.findall(rf'prefix_cache_evicted_{field}_total=(\d+)', text)]
@@ -119,14 +147,14 @@ def child(args):
         with mutex:
             records[int(userdata)].update(generated_tokens=count, finish_reason=reason)
 
-    def submit(label, prompt, cancel=False):
+    def submit(label, prompt, cancel=False, max_tokens=None):
         with mutex:
             key = len(records) + 1
             row = {'label': label, 'prompt': prompt, 'token_ids': [], 'pieces': [], 'terminal_events': 0,
                    'done': threading.Event(), 'first_token': threading.Event()}
             records[key] = row
         started = time.monotonic()
-        request = lib.SubmitRequestWithTokenResults(handle, prompt.encode(), 1024 if cancel else args.max_tokens,
+        request = lib.SubmitRequestWithTokenResults(handle, prompt.encode(), 1024 if cancel else (max_tokens or args.max_tokens),
                                                     0.0, 1.0, 0, 1.0, token, C.c_void_p(key))
         row['request_id'] = request
         if request < 0:
@@ -157,6 +185,8 @@ def child(args):
         result['runtime_plan'] = {name: getattr(plan, name) for name, _ in plan._fields_ if name != 'spec_reason'}
         if plan.spec_selected != 1:
             raise RuntimeError('requested ordinary decode was not selected')
+        if args.near_full_pressure and (plan.effective_concurrency != 1 or plan.effective_context != args.context):
+            raise RuntimeError('near-full pressure requires the exact requested c1 context capacity')
         if lib.DenseCoreSetGenerationCompletionCallback(handle, complete) != 0:
             raise RuntimeError('completion callback unavailable')
         probe = system + question('France')
@@ -178,6 +208,25 @@ def child(args):
         # eviction from a cache that simply retained every probe.
         for i in range(args.churn):
             result['churn_requests'].append(submit(f'churn{i}', f'Cache pressure document {i}. ' * 24 + question('France')))
+        if args.near_full_pressure:
+            lib.DenseCoreBuildRequestSnapshot.argtypes = [C.c_void_p, C.c_char_p, C.c_int, C.c_float,
+                C.c_float, C.c_int, C.c_float, C.c_int, C.POINTER(RequestSnapshot)]
+            lib.DenseCoreFreeRequestSnapshot.argtypes = [C.POINTER(RequestSnapshot)]
+            def prepared_token_count(prompt):
+                snapshot = RequestSnapshot()
+                status = lib.DenseCoreBuildRequestSnapshot(handle, prompt.encode(), 1, 0., 1., 0, 1., 0,
+                                                          C.byref(snapshot))
+                if status != 0:
+                    raise RuntimeError((lib.DenseCoreGetLastError() or b'pressure snapshot failed').decode(errors='replace'))
+                try:
+                    return snapshot.count
+                finally:
+                    lib.DenseCoreFreeRequestSnapshot(C.byref(snapshot))
+            target = args.context - 17  # one generated token plus16-token margin
+            pressure_prompt, prompt_count = near_full_pressure_prompt(prepared_token_count, target)
+            result['near_full_pressure'] = {'prompt_tokens': prompt_count, 'target_tokens': target,
+                                           'requested_max_tokens': 1, 'effective_context': args.context}
+            result['requests'].append(submit('near-full-pressure', pressure_prompt, max_tokens=1))
         result['requests'].append(submit('after-churn', probe))
     except BaseException as error:
         result['error'] = str(error)
@@ -270,7 +319,7 @@ def parent(args):
                 'qualification': 'correctness evidence only; no default promotion or performance claim'}
     if args.server: manifest['server_sha256'] = digest(args.server)
     manifest['configuration'] = {name: getattr(args, name) for name in
-        ('context', 'threads', 'concurrency', 'max_tokens', 'http_max_tokens', 'churn')}
+        ('context', 'threads', 'concurrency', 'max_tokens', 'http_max_tokens', 'churn', 'near_full_pressure')}
     manifest['dependencies'] = {str(path): digest(path) for path in
         (Path(__file__).with_name('check_mtp_parity.py'), Path(__file__).with_name('compare_servers.py'))}
     manifest['host'] = os.uname()._asdict() if hasattr(os.uname(), '_asdict') else list(os.uname())
@@ -290,6 +339,8 @@ def parent(args):
                    '--model', str(args.model), '--out', str(raw), '--threads', str(args.threads),
                    '--max-tokens', str(args.max_tokens), '--timeout', str(args.timeout), '--churn', str(args.churn),
                    '--concurrency', *map(str, args.concurrency)]
+        if args.near_full_pressure:
+            command.extend(['--near-full-pressure', '--context', str(args.context)])
         with log.open('w') as output:
             run = subprocess.run(command, env=env, stdout=output, stderr=subprocess.STDOUT,
                                  timeout=args.timeout * (20 + args.churn + sum(args.concurrency)))
@@ -340,6 +391,8 @@ def main():
     parser.add_argument('--timeout', type=float, default=180)
     parser.add_argument('--churn', type=int, default=32)
     parser.add_argument('--require-eviction', action='store_true')
+    parser.add_argument('--near-full-pressure', action='store_true',
+                        help='c1 only: cold prepared prompt near context capacity to reclaim snapshot-bearing blocks')
     parser.add_argument('--port', type=int, default=18090)
     parser.add_argument('--child', choices=('off', 'on'), help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -347,6 +400,8 @@ def main():
     args.concurrency = sorted(set(args.concurrency))
     if min(args.threads, args.context, args.max_tokens) < 1 or args.churn < 0 or args.timeout <= 0:
         parser.error('threads/context/tokens/timeout must be positive; churn must be nonnegative')
+    if args.near_full_pressure and args.concurrency != [1]:
+        parser.error('near-full pressure requires concurrency1 so one request can occupy the KV pool')
     if args.child:
         child(args)
         return 0

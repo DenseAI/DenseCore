@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from check_prefix_parity import attach_log_evidence, compare, prefix_evidence
+from check_prefix_parity import attach_log_evidence, compare, prefix_evidence, near_full_pressure_prompt
 
 
 def valid_groups():
@@ -93,6 +93,31 @@ class PrefixEvidenceTest(unittest.TestCase):
             group['requests'][4]['prompt'] = group['requests'][0]['prompt']
             group['requests'][4]['token_ids'] = [4, 99]
         self.assertTrue(any('scheduling/concurrency' in x for x in compare(groups)))
+
+
+class NearFullPressureTests(unittest.TestCase):
+    def test_uses_prepared_native_counts_with_headroom(self):
+        calls = []
+        def count(prompt):
+            calls.append(prompt)
+            return len(prompt.split()) + 11  # preparation adds tokens too
+        prompt, size = near_full_pressure_prompt(count, 2031)
+        self.assertEqual(size, count(prompt))
+        self.assertLessEqual(size, 2031)
+        self.assertGreaterEqual(size, 2015)
+        self.assertTrue(prompt.startswith('Independent cold eviction audit'))
+        self.assertLess(len(calls), 16)
+
+    def test_rejects_insufficient_context(self):
+        with self.assertRaises(ValueError):
+            near_full_pressure_prompt(lambda text: len(text.split()), 20)
+
+    def test_cold_pressure_ids_are_part_of_exact_parity_gate(self):
+        groups = valid_groups()
+        for group in groups.values():
+            group['requests'].append(dict(group['requests'][0], label='near-full-pressure', prompt='cold'))
+        groups['on']['requests'][-1]['token_ids'] = [99, 2]
+        self.assertTrue(any('near-full-pressure: off/on exact' in failure for failure in compare(groups, True)))
 
 
 if __name__ == '__main__': unittest.main()
