@@ -6,12 +6,19 @@ cluster="densecore-smoke-$$"
 namespace=densecore-smoke
 artifacts=${DENSECORE_SMOKE_ARTIFACTS:-$(mktemp -d /tmp/densecore-kind-smoke.XXXXXX)}
 mkdir -p "$artifacts"
+# Keep kind from replacing the user's current context or modifying its kubeconfig.
+export KUBECONFIG="$artifacts/kubeconfig"
 cleanup() {
   local status=$?
   kubectl --context "kind-$cluster" -n "$namespace" get pods -o yaml > "$artifacts/pods.yaml" 2>&1 || true
   kubectl --context "kind-$cluster" -n "$namespace" logs -l app.kubernetes.io/instance=smoke --all-containers=true > "$artifacts/pods.log" 2>&1 || true
   [[ -z "${forward_pid:-}" ]] || kill "$forward_pid" 2>/dev/null || true
-  kind delete cluster --name "$cluster" > "$artifacts/cleanup.log" 2>&1 || true
+  if ! kind delete cluster --name "$cluster" > "$artifacts/cleanup.log" 2>&1; then
+    echo "kind cluster cleanup failed; inspect $artifacts/cleanup.log" >&2
+    status=1
+  fi
+  # This generated file contains ephemeral client credentials; keep it out of uploaded evidence.
+  rm -f "$KUBECONFIG"
   echo "kind smoke artifacts: $artifacts"
   return "$status"
 }

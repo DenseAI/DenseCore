@@ -19,7 +19,8 @@ helm template smoke charts/densecore -f charts/densecore/examples/values-local-p
 bash scripts/kind_model_smoke.sh
 ```
 
-The kind harness creates and removes its own cluster. It installs the actual
+The kind harness creates and removes its own cluster using an isolated
+kubeconfig in the artifact directory; it preserves your existing cluster context. It installs the actual
 chart, runs the downloader, waits for ready, checks installed resource limits,
 opens a real generation stream, deletes the pod while generating, and requires
 that the accepted stream finishes while readiness and new admission disappear.
