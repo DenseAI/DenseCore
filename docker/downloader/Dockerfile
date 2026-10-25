@@ -46,7 +46,6 @@ USER downloader
 # Environment variable defaults (can be overridden at runtime)
 ENV MODEL_REPO="lmstudio-community/Qwen3.5-0.8B-GGUF"
 ENV MODEL_FILE="Qwen3.5-0.8B-Q4_K_M.gguf"
-ENV HF_TOKEN=""
 
 # Health check - verify Python and huggingface_hub are available
 HEALTHCHECK --interval=30s --timeout=5s --retries=1 \

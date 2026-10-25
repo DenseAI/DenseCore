@@ -30,7 +30,6 @@ dense-base:
   extraEnv:
     - {name: THREADS, value: '0'}
     - {name: DENSECORE_MAX_SEQ_LEN, value: '2048'}
-    - {name: SHUTDOWN_TIMEOUT, value: 30s}
   lifecycle:
     preStopSleepSeconds: 0
   terminationGracePeriodSeconds: 40

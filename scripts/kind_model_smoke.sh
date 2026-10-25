@@ -8,17 +8,35 @@ artifacts=${DENSECORE_SMOKE_ARTIFACTS:-$(mktemp -d /tmp/densecore-kind-smoke.XXX
 mkdir -p "$artifacts"
 # Keep kind from replacing the user's current context or modifying its kubeconfig.
 export KUBECONFIG="$artifacts/kubeconfig"
+checksum_status=not_run
+chart_status=not_run
+ready_status=not_run
+limits_status=not_run
+drain_status=not_run
+cleanup_status=not_run
 cleanup() {
   local status=$?
   kubectl --context "kind-$cluster" -n "$namespace" get pods -o yaml > "$artifacts/pods.yaml" 2>&1 || true
   kubectl --context "kind-$cluster" -n "$namespace" logs -l app.kubernetes.io/instance=smoke --all-containers=true > "$artifacts/pods.log" 2>&1 || true
   [[ -z "${forward_pid:-}" ]] || kill "$forward_pid" 2>/dev/null || true
+  [[ -z "${log_pid:-}" ]] || kill "$log_pid" 2>/dev/null || true
+  cleanup_status=pass
   if ! kind delete cluster --name "$cluster" > "$artifacts/cleanup.log" 2>&1; then
+    cleanup_status=fail
     echo "kind cluster cleanup failed; inspect $artifacts/cleanup.log" >&2
     status=1
   fi
   # This generated file contains ephemeral client credentials; keep it out of uploaded evidence.
   rm -f "$KUBECONFIG"
+  python3 - "$artifacts" "$status" "$checksum_status" "$chart_status" "$ready_status" "$limits_status" "$drain_status" "$cleanup_status" <<'PY'
+import json, sys
+from pathlib import Path
+result = dict(zip(('corrupt_cache_rejection', 'chart_installation', 'model_ready', 'installed_limits', 'active_drain', 'cluster_cleanup'), sys.argv[3:]))
+result['overall_pass'] = int(sys.argv[2]) == 0 and all(value == 'pass' for value in result.values())
+result['scope'] = 'kind chart/downloader/limits/active-drain components; final-answer quality is a separate gate'
+result['release_qualified'] = False
+Path(sys.argv[1], 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
+PY
   echo "kind smoke artifacts: $artifacts"
   return "$status"
 }
@@ -67,20 +85,14 @@ checks = pod['status']['initContainerStatuses']
 assert checks[1]['state']['terminated']['exitCode'] == 1, checks
 assert not pod['status'].get('containerStatuses') or all(not c['state'].get('running') for c in pod['status']['containerStatuses'])
 PYTEST
+checksum_status=pass
 helm dependency build "$root/charts/densecore" > "$artifacts/chart-dependencies.log" 2>&1
 helm template smoke "$root/charts/densecore" -f "$root/charts/densecore/examples/values-local-pod.yaml" > "$artifacts/rendered.yaml"
 helm --kube-context "kind-$cluster" upgrade --install smoke "$root/charts/densecore" -n "$namespace" \
   -f "$root/charts/densecore/examples/values-local-pod.yaml" --wait --timeout 10m
+chart_status=pass
 pod=$(kubectl --context "kind-$cluster" -n "$namespace" get pods -l app.kubernetes.io/instance=smoke -o jsonpath='{.items[0].metadata.name}')
 kubectl --context "kind-$cluster" -n "$namespace" get pod "$pod" -o json > "$artifacts/pod-before.json"
-kubectl --context "kind-$cluster" -n "$namespace" port-forward "pod/$pod" 18081:8080 > "$artifacts/port-forward.log" 2>&1 &
-forward_pid=$!
-for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:18081/health/ready > /dev/null && break; sleep 1; done
-curl -fsS http://127.0.0.1:18081/health/ready > "$artifacts/ready.json"
-# Deleting the pod delivers SIGTERM while an actual accepted request is generating.
-python3 "$root/scripts/active_drain_smoke.py" --url http://127.0.0.1:18081 --output "$artifacts/drain.json" --timeout 30 --max-tokens "${DENSECORE_SMOKE_DRAIN_MAX_TOKENS:-32}" -- \
-  kubectl --context "kind-$cluster" -n "$namespace" delete pod "$pod" --wait=false
-kubectl --context "kind-$cluster" -n "$namespace" wait --for=delete "pod/$pod" --timeout=45s
 # Resource limits must be present in the installed pod, not only in the values file.
 python3 - "$artifacts/pod-before.json" <<'PY'
 import json, sys
@@ -90,4 +102,19 @@ assert server['resources']['limits'] == {'cpu': '2', 'memory': '4Gi'}, server['r
 status = pod['status']['initContainerStatuses'][0]
 assert status['state']['terminated']['exitCode'] == 0, status
 PY
+limits_status=pass
+kubectl --context "kind-$cluster" -n "$namespace" port-forward "pod/$pod" 18081:8080 > "$artifacts/port-forward.log" 2>&1 &
+forward_pid=$!
+for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:18081/health/ready > /dev/null && break; sleep 1; done
+curl -fsS http://127.0.0.1:18081/health/ready > "$artifacts/ready.json"
+ready_status=pass
+server_container=$(kubectl --context "kind-$cluster" -n "$namespace" get pod "$pod" -o jsonpath='{.spec.containers[0].name}')
+kubectl --context "kind-$cluster" -n "$namespace" logs --follow "$pod" -c "$server_container" > "$artifacts/active-pod-live.log" 2>&1 &
+log_pid=$!
+drain_status=fail
+# Deleting the pod delivers SIGTERM while an actual accepted request is generating.
+python3 "$root/scripts/active_drain_smoke.py" --url http://127.0.0.1:18081 --output "$artifacts/drain.json" --timeout 30 --max-tokens "${DENSECORE_SMOKE_DRAIN_MAX_TOKENS:-32}" -- \
+  kubectl --context "kind-$cluster" -n "$namespace" delete pod "$pod" --wait=false
+kubectl --context "kind-$cluster" -n "$namespace" wait --for=delete "pod/$pod" --timeout=45s
+drain_status=pass
 echo 'kind model/downloader/limits/active-drain smoke passed'
