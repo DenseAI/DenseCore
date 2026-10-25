@@ -24,3 +24,14 @@ func AcquireRequestEngine(modelService domain.ModelService) (domain.Engine, func
 func acquireRequestEngine(modelService domain.ModelService) (domain.Engine, func()) {
 	return AcquireRequestEngine(modelService)
 }
+
+// AcquireObservationEngine is restricted to diagnostic readers. Implementations
+// without the optional observation contract retain the request-lease policy.
+func AcquireObservationEngine(modelService domain.ModelService) (domain.Engine, func()) {
+	if provider, ok := modelService.(interface {
+		AcquireEngineObservationLease() (domain.Engine, func())
+	}); ok {
+		return provider.AcquireEngineObservationLease()
+	}
+	return AcquireRequestEngine(modelService)
+}

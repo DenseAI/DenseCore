@@ -346,10 +346,25 @@ func (s *ModelService) IsLoading() bool {
 }
 
 func (s *ModelService) AcquireEngineLease() *engineLease {
+	return s.acquireEngineLease(false)
+}
+
+// AcquireEngineObservationLease retains the engine for read-only diagnostics
+// during drain. Unload detaches the slot under mu before waiting for its leases,
+// so observation cannot reopen admission or race final handle destruction.
+func (s *ModelService) AcquireEngineObservationLease() (domain.Engine, func()) {
+	lease := s.acquireEngineLease(true)
+	if lease == nil {
+		return nil, func() {}
+	}
+	return lease.Engine(), lease.Close
+}
+
+func (s *ModelService) acquireEngineLease(observation bool) *engineLease {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.currentSlot == nil || s.currentSlot.engine == nil || s.currentSlot.closing {
+	if s.currentSlot == nil || s.currentSlot.engine == nil || (s.currentSlot.closing && !observation) {
 		return nil
 	}
 

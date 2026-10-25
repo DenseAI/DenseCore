@@ -423,3 +423,62 @@ func TestLegacyBeginRetainsModelUntilCleanupReturnsAfterContextExpiry(t *testing
 		t.Fatalf("begin=%d", got)
 	}
 }
+
+func TestObservationDuringNativeDrainRetainsOwnerWithoutReopeningAdmission(t *testing.T) {
+	engine := &contextShutdownTestEngine{selected: make(chan context.Context, 1), release: make(chan struct{})}
+	svc := NewModelService()
+	svc.currentSlot = &engineSlot{engine: engine}
+	accepted := svc.AcquireEngineLease()
+	if accepted == nil {
+		t.Fatal("initial admission rejected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	draining := make(chan error, 1)
+	go func() { draining <- svc.BeginEngineShutdownContext(ctx) }()
+	select {
+	case <-engine.selected:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if request, release := AcquireRequestEngine(svc); request != nil {
+		release()
+		t.Fatal("request admission reopened during drain")
+	}
+	observed, releaseObservation := AcquireObservationEngine(svc)
+	if observed != engine {
+		t.Fatal("diagnostic lost native engine while drain active")
+	}
+	defer releaseObservation()
+	if accepted.Engine() != engine {
+		t.Fatal("accepted lease lost its engine")
+	}
+	accepted.Close()
+	close(engine.release)
+	if err := <-draining; err != nil {
+		t.Fatal(err)
+	}
+	unloaded := make(chan error, 1)
+	go func() { unloaded <- svc.UnloadModelContext(ctx) }()
+	waitForCondition(t, time.Second, func() bool { return svc.GetEngine() == nil }, "unload did not detach model")
+	if got := atomic.LoadInt32(&engine.closeCount); got != 0 {
+		t.Fatalf("freed engine while diagnostic retained owner: %d", got)
+	}
+	if request, release := AcquireObservationEngine(svc); request != nil {
+		release()
+		t.Fatal("observation admitted after model detached")
+	}
+	releaseObservation()
+	releaseObservation() // Same lease closes exactly once.
+	select {
+	case err := <-unloaded:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if got := atomic.LoadInt32(&engine.closeCount); got != 1 {
+		t.Fatalf("close count=%d, want 1", got)
+	}
+}

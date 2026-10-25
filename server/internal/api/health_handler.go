@@ -73,7 +73,7 @@ func (h *Handler) effectiveRuntimeOptimizationState() (domain.RuntimeOptimizatio
 	if h == nil || h.modelService == nil {
 		return domain.RuntimeOptimizationState{}, false
 	}
-	engine, releaseEngine := service.AcquireRequestEngine(h.modelService)
+	engine, releaseEngine := service.AcquireObservationEngine(h.modelService)
 	defer releaseEngine()
 	if engine == nil {
 		return domain.RuntimeOptimizationState{}, false

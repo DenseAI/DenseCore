@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/DenseAI/DenseCore/server/internal/domain"
 	"github.com/DenseAI/DenseCore/server/internal/promptcache"
 	"github.com/DenseAI/DenseCore/server/internal/service"
 	agenttools "github.com/DenseAI/DenseCore/server/internal/tools"
@@ -29,8 +30,17 @@ func (h *Handler) MetricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // RenderMetrics renders DenseCore-specific Prometheus metrics for the shared DenseCloud endpoint.
 func (h *Handler) RenderMetrics() string {
-	engine, releaseEngine := service.AcquireRequestEngine(h.modelService)
-	defer releaseEngine()
+	engine, releaseEngine := service.AcquireObservationEngine(h.modelService)
+	modelLoaded := 0
+	var metrics *domain.DetailedMetrics
+	func() {
+		defer releaseEngine()
+		if engine != nil {
+			modelLoaded = 1
+			metrics = engine.GetDetailedMetrics()
+		}
+	}()
+	// The snapshot owns Go values. Formatting/network writes retain no engine lease.
 	var w strings.Builder
 	metric := func(name string) string {
 		return h.metricsNamespace + "_" + name
@@ -53,10 +63,6 @@ func (h *Handler) RenderMetrics() string {
 	fmt.Fprintf(&w, "# TYPE %s gauge\n", metric("llm_api_enabled"))
 	fmt.Fprintf(&w, "%s %d\n\n", metric("llm_api_enabled"), llmEnabled)
 
-	modelLoaded := 0
-	if engine != nil {
-		modelLoaded = 1
-	}
 	fmt.Fprintf(&w, "# HELP %s Model loaded status (1=loaded)\n", metric("model_loaded"))
 	fmt.Fprintf(&w, "# TYPE %s gauge\n", metric("model_loaded"))
 	fmt.Fprintf(&w, "%s %d\n\n", metric("model_loaded"), modelLoaded)
@@ -108,12 +114,11 @@ func (h *Handler) RenderMetrics() string {
 		fmt.Fprintf(&w, "%s %d\n\n", metric("queue_total_dropped"), queueStats.TotalDropped)
 	}
 
-	if engine == nil {
+	if metrics == nil {
 		return w.String()
 	}
 
 	// Engine-provided LLM inference metrics.
-	metrics := engine.GetDetailedMetrics()
 
 	// Request metrics
 	fmt.Fprintf(&w, "# HELP %s Number of currently active requests\n", metric("active_requests"))
