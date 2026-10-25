@@ -7,6 +7,7 @@
 #include "llm/sampling/sampling_rng.h"
 #include "densecore/runtime/scheduler.h"
 #include "llm/speculative/nextn_graph.h"
+#include "llm/graph/build_internal.h"
 #include "llm/speculative/reference_session.h"
 #include "runtime/speculation_config.h"
 #include "runtime/engine_internal.h"
@@ -142,6 +143,51 @@ TEST(NextNGraph, RejectsMalformedHeadBeforeWorkerExecution) {
     source->mtp_heads[0].tensors["attn_q.weight"] = original;
     source->mtp_heads[0].tensors["attn_k_norm.weight"] = ggml_new_tensor_1d(source->ctx_w, GGML_TYPE_F16, 2);
     EXPECT_THROW((void)NextNGraph(*source), std::invalid_argument);
+}
+
+TEST(NextNGraph, TargetCaptureIsOutputNormalizedAndKeepsEveryPromptRow) {
+    auto owner = MakeTinyNextNSource();
+    const float embeddings[] = {1, 2, 3, 4};
+    const float norm_weight[] = {2, 3};
+    std::memcpy(owner->tok_embeddings->data, embeddings, sizeof(embeddings));
+    std::memcpy(owner->output_norm->data, norm_weight, sizeof(norm_weight));
+    NextNGraph view(*owner);
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(&view.Model(), 1, 16, GGML_TYPE_F32, -1));
+    ASSERT_NE(cache, nullptr);
+    const auto blocks = cache->block_manager->Allocate(1);
+    ASSERT_EQ(blocks.size(), 1u);
+    BatchSpec batch{};
+    batch.num_seqs = 1;
+    batch.tokens = {0, 1}; batch.pos = {0, 1}; batch.seq_id = {0, 0}; batch.n_past = {0};
+    batch.block_tables = {blocks};
+    std::unique_ptr<InferenceWorkContext, decltype(&DestroyInferenceWorkContext)> work(
+        CreateInferenceWorkContext(), DestroyInferenceWorkContext);
+    SetCurrentWorkContext(work.get()); ResetInferenceWorkContext(work.get());
+    SetCurrentExecutionPhase(InferenceExecutionPhase::Prefill); SetCurrentBatch(&batch);
+    auto* ctx = ggml_init({32 * 1024 * 1024, nullptr, false});
+    ASSERT_NE(ctx, nullptr);
+    auto* graph = ggml_new_graph_custom(ctx, 32768, false);
+    ggml_tensor* hidden = nullptr;
+    GraphAssemblyOverrides overrides;
+    overrides.full_normalized_hidden = &hidden;
+    auto* output = BuildTransformerGraphInlineImpl(&view.Model(), cache.get(), ctx, batch,
+                                                   false, graph, nullptr, nullptr, &overrides);
+    ASSERT_NE(hidden, nullptr);
+    ASSERT_EQ(hidden->ne[1], 2); // retain both rows despite last-token LM-head policy
+    EXPECT_EQ(output->ne[1], 1);
+    ASSERT_EQ(ggml_graph_compute_with_ctx(ctx, graph, 1), GGML_STATUS_SUCCESS);
+    const auto* data = static_cast<float*>(hidden->data);
+    for (size_t row = 0; row < 2; ++row) {
+        const float a = embeddings[row * 2], b = embeddings[row * 2 + 1];
+        const float inverse = 1 / std::sqrt((a * a + b * b) / 2 + owner->hparams.f_norm_rms_eps);
+        EXPECT_NEAR(data[row * 2], a * inverse * 2, 1e-5f);
+        EXPECT_NEAR(data[row * 2 + 1], b * inverse * 3, 1e-5f);
+    }
+    const auto* logits = static_cast<float*>(output->data);
+    EXPECT_NEAR(logits[0], data[2], 1e-6f);
+    EXPECT_NEAR(logits[1], data[3], 1e-6f);
+    ggml_free(ctx); ClearCurrentBatch(); SetCurrentWorkContext(nullptr);
+    cache->block_manager->Free(blocks);
 }
 
 TEST(NextNGraph, ExecutesHiddenTokenFusionAndSharedOutputHead) {

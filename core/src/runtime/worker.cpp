@@ -2630,7 +2630,7 @@ void EngineLoop(EngineState* state) {
                     try {
                         if (!is_embedding_batch && state->speculation_selected.load(std::memory_order_acquire) == 2) {
                             GraphAssemblyOverrides overrides;
-                            overrides.pre_output_norm_hidden = &mtp_target_hidden;
+                            overrides.full_normalized_hidden = &mtp_target_hidden;
                             *graph_output = BuildTransformerGraphInlineImpl(current_model, current_kv_cache, graph_ctx,
                                                 batch, false, graph, graph_embd_inp, graph_pos, &overrides);
                         } else {

@@ -2062,7 +2062,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             }
 
             if (il == static_cast<int>(model->layers.size()) - 1 &&
-                !(overrides && overrides->pre_output_norm_hidden) && ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
+                !(overrides && overrides->full_normalized_hidden) && ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
                 const size_t last_token_offset = static_cast<size_t>(N - 1) * static_cast<size_t>(cur->nb[1]);
                 cur = ggml_view_2d(ctx_c, cur, cur->ne[0], 1, cur->nb[1], last_token_offset);
                 cur = ggml_cont(ctx_c, cur);
@@ -2979,10 +2979,14 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
         }
     }
-    if (overrides && overrides->pre_output_norm_hidden) {
-        *overrides->pre_output_norm_hidden = cur;
-        ggml_set_output(cur);
-        if (gf) ggml_build_forward_expand(gf, cur);
+    if (overrides && overrides->full_normalized_hidden) {
+        // llama.cpp qwen35 h_nextn is AFTER the target output norm. Capture
+        // every row here, while the ordinary LM-head path may compact rows.
+        auto* hidden = apply_weighted_rms_norm(cur, model->output_norm, "mtp_target_hidden",
+                                               static_cast<int>(model->layers.size()));
+        *overrides->full_normalized_hidden = hidden;
+        ggml_set_output(hidden);
+        if (gf) ggml_build_forward_expand(gf, hidden);
     }
     if (batch.skip_output_logits && !embedding_mode) {
         ggml_set_name(cur, "prefill_no_logits_output");

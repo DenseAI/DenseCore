@@ -4,7 +4,9 @@
 
 struct GraphAssemblyOverrides {
     ggml_tensor* input_embeddings = nullptr;
-    ggml_tensor** pre_output_norm_hidden = nullptr;
+    // NextN consumes the target's output-normalized hidden rows, before any
+    // last-token/per-sequence compaction. See pinned qwen35 target h_nextn.
+    ggml_tensor** full_normalized_hidden = nullptr;
     ggml_tensor** normalized_hidden = nullptr;
 };
 
