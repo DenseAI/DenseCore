@@ -816,16 +816,14 @@ void EngineLoop(EngineState* state) {
             std::lock_guard<std::mutex> active_lock(state->active_mu);
             failed.swap(state->active_requests);
         }
-        if (dequeued_request && std::find(failed.begin(), failed.end(), dequeued_request) == failed.end()) {
-            failed.push_back(dequeued_request);
-        }
+        Request* unpublished = dequeued_request;
+        if (unpublished && std::find(failed.begin(), failed.end(), unpublished) != failed.end()) unpublished = nullptr;
         dequeued_request = nullptr;
-        while (auto* pending = state->pending_requests.Pop()) failed.push_back(pending);
         auto* entry = state->GetDefaultModel();
         auto* cache = entry ? entry->kv_cache.get() : nullptr;
         const bool direct = state->fast_path_config.worker.callback_mode ==
                             densecore::llm::config::WorkerRuntimeConfig::CallbackMode::Direct;
-        for (auto* req : failed) {
+        auto finish_failed_request = [&](Request* req) {
             state->RemovePendingRequest(req->id);
             req->cancelled.store(true, std::memory_order_relaxed);
             if (cache && !req->block_table.empty()) {
@@ -855,7 +853,10 @@ void EngineLoop(EngineState* state) {
                 req->cv.notify_all();
             }
             state->request_pool.Release(req);
-        }
+        };
+        if (unpublished) finish_failed_request(unpublished);
+        for (auto* req : failed) finish_failed_request(req);
+        while (auto* pending = state->pending_requests.Pop()) finish_failed_request(pending);
         state->metrics.active_requests.store(0, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(state->result_mu);
