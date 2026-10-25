@@ -1281,3 +1281,227 @@ TEST(GraphCacheHistoryPolicyTest, GrowingPastChangesAttentionLogitsAndMustRebuil
     cache->block_manager->FreeSingle(block);
 }
 }  // namespace
+
+// Storage precision must not depend on whether prompt history was cached.
+void cb_kv_write_only(ggml_tensor*,const ggml_tensor*,int,int,void*);
+namespace {
+struct KvPrecisionOwner {
+    InferenceWorkContext* previous=GetCurrentWorkContext();
+    InferenceWorkContext* work=CreateInferenceWorkContext();
+    ggml_context* tensors=ggml_init({1024*1024,nullptr,false});
+    TransformerModel model;
+    std::unique_ptr<PagedKVCache> cache;
+    std::vector<int> blocks;
+    explicit KvPrecisionOwner(ggml_type type,bool heterogeneous_gemma=false) {
+        model.hparams.n_embd_head_k=model.hparams.n_embd_head_v=32;
+        model.hparams.n_head=model.hparams.n_head_kv=2;model.hparams.n_layer=1;
+        if(heterogeneous_gemma) {
+            model.arch=ModelArch::GEMMA;model.arch_flags.is_gemma4=true;
+            model.hparams.n_embd_head_k=model.hparams.n_embd_head_v=256;model.hparams.n_layer=2;
+            model.gemma4_key_length_swa=model.gemma4_value_length_swa=256;
+            model.gemma4_key_length_full=model.gemma4_value_length_full=512;
+            model.gemma4_layer_is_sliding={1,0};model.gemma4_layer_n_head_kv={2,1};
+            model.gemma4_layer_kv_source={0,1};
+        }
+        cache.reset(InitPagedKVCache(&model,1,64,type,-1));
+        if(!work||!tensors||!cache)throw std::bad_alloc();
+        SetCurrentWorkContext(work);
+        for(int i=0;i<2;++i){auto block=cache->block_manager->AllocateSingle();if(block<0)throw std::bad_alloc();blocks.push_back(block);}
+    }
+    ~KvPrecisionOwner(){SetCurrentWorkContext(previous);DestroyInferenceWorkContext(work);ggml_free(tensors);}
+    std::vector<float> Run(int past,int count,bool key,int threads=3,bool strided=false,int layer=0) {
+        BatchSpec batch;batch.num_seqs=1;batch.n_past={past};batch.block_tables={blocks};
+        batch.tokens.assign(count,1);batch.seq_id.assign(count,0);
+        for(int t=0;t<count;++t)batch.pos.push_back(past+t);
+        SetCurrentBatch(&batch);
+        const int width=key?cache->GetHeadDimForLayer(layer):cache->GetVHeadDimForLayer(layer);
+        const int heads=cache->GetHeadCountForLayer(layer),elements=width*heads;
+        auto* backing=ggml_new_tensor_3d(tensors,GGML_TYPE_F32,strided?width*2:width,heads,count);
+        auto* input=strided ? ggml_view_3d(tensors,backing,width,heads,count,backing->nb[1],backing->nb[2],0) : backing;
+        auto* output=ggml_new_tensor_3d(tensors,GGML_TYPE_F32,width,heads,past+count);
+        // Fixed IEEE bytes avoid a fixture-only FMA/vectorization difference
+        // between a long input initialization loop and its short suffix loop.
+        for(int t=0;t<count;++t)for(int d=0;d<elements;++d) {
+            uint32_t bits=0x3f8009d5u+static_cast<uint32_t>((past+t)*elements+d)*291u;
+            if(!key)bits|=0x80000000u;
+            std::memcpy(static_cast<char*>(input->data)+t*input->nb[2]+(d/width)*input->nb[1]+(d%width)*sizeof(float),&bits,sizeof(bits));
+        }
+        KVCacheUserData data{cache.get(),layer,width,key};data.work_ctx=work;
+        if(past==0)for(int ith=0;ith<threads;++ith)cb_kv_write_only(output,input,ith,threads,&data);
+        else {output->src[0]=input;for(int ith=0;ith<threads;++ith)cb_kv_update_and_gather_custom(output,ith,threads,&data);}
+        auto* values=static_cast<float*>(output->data);
+        std::vector<float> result(values,values+(past+count)*elements);
+        ResetInferenceWorkContext(work);return result;
+    }
+};
+}
+TEST(KvAttentionStoragePrecision, FullVersusSplitF32RemainsBitwiseEqual) {
+    for(bool key:{true,false}) {
+        KvPrecisionOwner whole(GGML_TYPE_F32);const auto cold=whole.Run(0,21,key);
+        KvPrecisionOwner split(GGML_TYPE_F32);split.Run(0,16,key);const auto warm=split.Run(16,5,key);
+        EXPECT_EQ(cold,warm);
+    }
+}
+TEST(KvAttentionStoragePrecision, FullVersusSplitF16UsesIdenticalStoredRepresentation) {
+    for(bool key:{true,false}) {
+        KvPrecisionOwner whole(GGML_TYPE_F16);const auto cold=whole.Run(0,21,key);
+        KvPrecisionOwner split(GGML_TYPE_F16);split.Run(0,16,key);const auto warm=split.Run(16,5,key);
+        EXPECT_EQ(cold,warm);
+        std::vector<float> stored(21*64);
+        for(int t=0;t<21;++t){
+            auto* slot=stored.data()+t*64;
+            if(key)whole.cache->ReadKSlots(whole.blocks[t/BLOCK_SIZE],0,t%BLOCK_SIZE,1,slot);
+            else whole.cache->ReadVSlots(whole.blocks[t/BLOCK_SIZE],0,t%BLOCK_SIZE,1,slot);
+        }
+        EXPECT_EQ(cold,stored);
+        EXPECT_EQ(cold[0],warm[0])<<"kind="<<(key?"K":"V")<<" cold="<<cold[0]<<" history="<<warm[0];
+    }
+}
+
+TEST(KvAttentionStoragePrecision, AllKvTypesFullSplitAndSingleTokenUseActualStoredCodec) {
+    for(auto type:{GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_Q8_0,GGML_TYPE_Q4_0})for(bool key:{true,false}) {
+        SCOPED_TRACE(ggml_type_name(type));
+        SCOPED_TRACE(key?"K":"V");
+        KvPrecisionOwner whole(type);ASSERT_EQ(whole.cache->cache_type,type);
+        const auto cold=whole.Run(0,21,key);
+        KvPrecisionOwner split(type);split.Run(0,16,key);const auto warm=split.Run(16,5,key);
+        EXPECT_EQ(cold,warm);
+        KvPrecisionOwner sequential(type);std::vector<float> incremental;
+        for(int t=0;t<21;++t)incremental=sequential.Run(t,1,key);
+        EXPECT_EQ(cold,incremental);
+        std::vector<float> stored(21*64);
+        for(int t=0;t<21;++t) {
+            auto* slot=stored.data()+t*64;
+            if(key)whole.cache->ReadKSlots(whole.blocks[t/BLOCK_SIZE],0,t%BLOCK_SIZE,1,slot);
+            else whole.cache->ReadVSlots(whole.blocks[t/BLOCK_SIZE],0,t%BLOCK_SIZE,1,slot);
+        }
+        EXPECT_EQ(cold,stored);
+    }
+}
+
+TEST(KvAttentionStoragePrecision, StridedFullAndOffsetTailUseStoredRepresentation) {
+    for(auto type:{GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_Q8_0,GGML_TYPE_Q4_0})for(bool key:{true,false}) {
+        SCOPED_TRACE(ggml_type_name(type));
+        SCOPED_TRACE(key?"K":"V");
+        KvPrecisionOwner whole(type);const auto cold=whole.Run(0,21,key,3,true);
+        KvPrecisionOwner split(type);split.Run(0,16,key,3,true);const auto warm=split.Run(16,5,key,3,true);
+        EXPECT_EQ(cold,warm);
+    }
+}
+TEST(KvAttentionStoragePrecision, MixedSequenceStridesPreserveInputPaddingAndSharedPrefixCanaries) {
+    for(auto type:{GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_Q8_0,GGML_TYPE_Q4_0})for(bool key:{true,false}) {
+        SCOPED_TRACE(ggml_type_name(type));
+        SCOPED_TRACE(key?"K":"V");
+        KvPrecisionOwner owner(type);ASSERT_EQ(owner.cache->cache_type,type);
+        std::vector<int> other;
+        for(int i=0;i<2;++i){int block=owner.cache->block_manager->AllocateSingle();ASSERT_GE(block,0);other.push_back(block);}
+        std::vector<float> canary(BLOCK_SIZE*64,-13.125f);
+        for(int block:{owner.blocks[0],owner.blocks[1],other[0],other[1]}) {
+            owner.cache->WriteKSlots(block,0,0,BLOCK_SIZE,canary.data());
+            owner.cache->WriteVSlots(block,0,0,BLOCK_SIZE,canary.data());
+        }
+        ASSERT_EQ(owner.cache->block_manager->Fork(other[0]),other[0]);
+        ASSERT_TRUE(owner.cache->block_manager->IsShared(other[0]));
+        std::vector<uint8_t> prefix_k,prefix_v;
+        owner.cache->CopyBlocksToHost({owner.blocks[1],other[0]},&prefix_k,&prefix_v);
+        BatchSpec batch;batch.num_seqs=2;batch.tokens={1,2,3,4};batch.seq_id={0,1,0,1};
+        batch.pos={0,16,1,17};batch.n_past={0,16};batch.block_tables={owner.blocks,other};SetCurrentBatch(&batch);
+        auto* source_storage=ggml_new_tensor_3d(owner.tensors,GGML_TYPE_F32,64,2,4);
+        auto* result_storage=ggml_new_tensor_3d(owner.tensors,GGML_TYPE_F32,64,2,4);
+        std::fill_n(static_cast<float*>(source_storage->data),512,99.f);
+        std::fill_n(static_cast<float*>(result_storage->data),512,77.f);
+        auto* source=ggml_view_3d(owner.tensors,source_storage,32,2,4,256,512,0);
+        auto* result=ggml_view_3d(owner.tensors,result_storage,32,2,4,256,512,0);
+        for(int t=0;t<4;++t)for(int h=0;h<2;++h)for(int d=0;d<32;++d) {
+            uint32_t bits=0x3f8009d5u+static_cast<uint32_t>(t*64+h*32+d)*291u;
+            std::memcpy(static_cast<char*>(source->data)+t*512+h*256+d*4,&bits,4);
+        }
+        std::vector<float> original(static_cast<float*>(source_storage->data),static_cast<float*>(source_storage->data)+512);
+        KVCacheUserData data{owner.cache.get(),0,32,key};data.work_ctx=owner.work;
+        for(int ith=0;ith<3;++ith)cb_kv_write_only(result,source,ith,3,&data);
+        EXPECT_EQ(original,(std::vector<float>(static_cast<float*>(source_storage->data),static_cast<float*>(source_storage->data)+512)));
+        for(int t=0;t<4;++t) {
+            float stored[64];const int block=batch.block_tables[batch.seq_id[t]][batch.pos[t]/BLOCK_SIZE];
+            if(key)owner.cache->ReadKSlots(block,0,batch.pos[t]%BLOCK_SIZE,1,stored);
+            else owner.cache->ReadVSlots(block,0,batch.pos[t]%BLOCK_SIZE,1,stored);
+            for(int h=0;h<2;++h)for(int d=0;d<64;++d) {
+                const float actual=static_cast<float*>(result_storage->data)[t*128+h*64+d];
+                EXPECT_EQ(actual,d<32?stored[h*32+d]:77.f);
+            }
+        }
+        std::vector<uint8_t> after_k,after_v;
+        owner.cache->CopyBlocksToHost({owner.blocks[1],other[0]},&after_k,&after_v);
+        EXPECT_EQ(prefix_k,after_k);EXPECT_EQ(prefix_v,after_v);
+        EXPECT_EQ(owner.cache->block_manager->GetRefCount(other[0]),2);
+        owner.cache->block_manager->FreeSingle(other[0]);
+        ResetInferenceWorkContext(owner.work);
+    }
+}
+
+TEST(KvAttentionStoragePrecision, InvalidStoredOutputMappingsFailBeforePublishingStaleRows) {
+    KvPrecisionOwner owner(GGML_TYPE_F16);
+    auto* source=ggml_new_tensor_3d(owner.tensors,GGML_TYPE_F32,32,2,2);
+    auto* output=ggml_new_tensor_3d(owner.tensors,GGML_TYPE_F32,32,2,2);
+    std::fill_n(static_cast<float*>(source->data),128,1.0003f);
+    KVCacheUserData data{owner.cache.get(),0,32,true};data.work_ctx=owner.work;
+    for(int invalid=0;invalid<5;++invalid) {
+        BatchSpec batch;batch.num_seqs=1;batch.tokens={1,2};batch.pos={0,1};batch.seq_id={0,0};
+        batch.n_past={0};batch.block_tables={owner.blocks};
+        if(invalid==0)batch.pos.clear();
+        if(invalid==1)batch.seq_id={2,2};
+        if(invalid==2)batch.pos={-1,0};
+        if(invalid==3)batch.block_tables={{}};
+        if(invalid==4)batch.block_tables={{owner.cache->max_blocks}};
+        SetCurrentBatch(&batch);
+        std::fill_n(static_cast<float*>(output->data),128,77.f);
+        EXPECT_THROW(cb_kv_write_only(output,source,0,1,&data),densecore::InvalidArgumentException);
+        EXPECT_EQ(static_cast<float*>(output->data)[0],77.f);
+        output->src[0]=source;
+        EXPECT_THROW(cb_kv_update_and_gather_custom(output,0,1,&data),densecore::InvalidArgumentException);
+        EXPECT_EQ(static_cast<float*>(output->data)[0],77.f);
+        ResetInferenceWorkContext(owner.work);
+    }
+}
+
+TEST(KvAttentionStoragePrecision, GemmaHeterogeneousLayerPaddingAndReadOnlySourcesRemainCanonical) {
+    for(auto type:{GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_Q8_0,GGML_TYPE_Q4_0})for(bool key:{true,false}) {
+        SCOPED_TRACE(ggml_type_name(type));
+        SCOPED_TRACE(key?"K":"V");
+        KvPrecisionOwner whole(type,true),split(type,true);
+        ASSERT_EQ(whole.cache->cache_type,type);
+        ASSERT_EQ(whole.cache->head_dim,512);ASSERT_EQ(whole.cache->n_head_kv,2);
+        for(int layer=0;layer<2;++layer) {
+            SCOPED_TRACE(layer);
+            const int width=layer==0?256:512,heads=layer==0?2:1,elements=width*heads;
+            ASSERT_EQ(whole.cache->GetHeadDimForLayer(layer),width);
+            ASSERT_EQ(whole.cache->GetVHeadDimForLayer(layer),width);
+            ASSERT_EQ(whole.cache->GetHeadCountForLayer(layer),heads);
+            SetCurrentWorkContext(whole.work);const auto cold=whole.Run(0,21,key,3,true,layer);
+            SetCurrentWorkContext(split.work);split.Run(0,16,key,3,true,layer);
+            const auto warm=split.Run(16,5,key,3,true,layer);EXPECT_EQ(cold,warm);
+            std::vector<float> stored(21*elements);
+            for(int t=0;t<21;++t) {
+                auto* values=stored.data()+t*elements;
+                if(key)whole.cache->ReadKSlots(whole.blocks[t/BLOCK_SIZE],layer,t%BLOCK_SIZE,1,values);
+                else whole.cache->ReadVSlots(whole.blocks[t/BLOCK_SIZE],layer,t%BLOCK_SIZE,1,values);
+            }
+            EXPECT_EQ(cold,stored);
+            std::vector<uint8_t> before_k,before_v;
+            whole.cache->CopyBlocksToHost(whole.blocks,&before_k,&before_v);
+            SetCurrentWorkContext(whole.work);
+            BatchSpec batch;batch.num_seqs=1;batch.tokens.assign(5,1);batch.seq_id.assign(5,0);
+            batch.pos={16,17,18,19,20};batch.n_past={16};batch.block_tables={whole.blocks};SetCurrentBatch(&batch);
+            auto* source=ggml_new_tensor_3d(whole.tensors,GGML_TYPE_F32,width,heads,5);
+            auto* result=ggml_new_tensor_3d(whole.tensors,GGML_TYPE_F32,width,heads,21);
+            std::fill_n(static_cast<float*>(source->data),5*elements,777.f);result->src[0]=source;
+            KVCacheUserData data{whole.cache.get(),layer,width,key};data.work_ctx=whole.work;
+            data.read_only_shared_kv=true;data.force_full_history=true;
+            for(int ith=0;ith<3;++ith)cb_kv_update_and_gather_custom(result,ith,3,&data);
+            EXPECT_EQ(cold,(std::vector<float>(static_cast<float*>(result->data),static_cast<float*>(result->data)+21*elements)));
+            std::vector<uint8_t> after_k,after_v;
+            whole.cache->CopyBlocksToHost(whole.blocks,&after_k,&after_v);
+            EXPECT_EQ(before_k,after_k);EXPECT_EQ(before_v,after_v);
+            ResetInferenceWorkContext(whole.work);
+        }
+    }
+}

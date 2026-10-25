@@ -423,7 +423,8 @@ static inline void ZeroTokenSpanHead(struct ggml_tensor* dst, int token_idx, int
 
 void WriteCurrentBatchKvToCache(const BatchSpec* batch, const struct ggml_tensor* src,
                                               PagedKVCache* cache, int layer, int head_dim, int n_head_kv, bool is_k,
-                                              int token_begin, int token_end, int* writes_ok, int* writes_skipped) {
+                                              int token_begin, int token_end, int* writes_ok, int* writes_skipped,
+                                              ggml_tensor* stored_output, int output_token_offset) {
     if (!batch || !src || !cache || !src->data || head_dim <= 0 || n_head_kv <= 0) {
         return;
     }
@@ -454,6 +455,7 @@ void WriteCurrentBatchKvToCache(const BatchSpec* batch, const struct ggml_tensor
 
     for (int i = begin; i < end;) {
         if (i >= static_cast<int>(batch->seq_id.size()) || i >= static_cast<int>(batch->pos.size())) {
+            if (stored_output) throw densecore::InvalidArgumentException("stored KV output requires complete current-token mapping");
             if (writes_skipped) {
                 ++(*writes_skipped);
             }
@@ -463,7 +465,10 @@ void WriteCurrentBatchKvToCache(const BatchSpec* batch, const struct ggml_tensor
 
         const int seq_id = batch->seq_id[i];
         const int pos = batch->pos[i];
+        if (stored_output && pos < 0)
+            throw densecore::InvalidArgumentException("stored KV output requires a nonnegative token position");
         if (seq_id < 0 || seq_id >= static_cast<int>(batch->block_tables.size())) {
+            if (stored_output) throw densecore::InvalidArgumentException("stored KV output requires complete current-token mapping");
             if (writes_skipped) {
                 ++(*writes_skipped);
             }
@@ -475,6 +480,7 @@ void WriteCurrentBatchKvToCache(const BatchSpec* batch, const struct ggml_tensor
         const int logical_block = pos / BLOCK_SIZE;
         const int slot = pos % BLOCK_SIZE;
         if (logical_block < 0 || logical_block >= static_cast<int>(block_table.size())) {
+            if (stored_output) throw densecore::InvalidArgumentException("stored KV output requires complete current-token mapping");
             if (writes_skipped) {
                 ++(*writes_skipped);
             }
@@ -483,6 +489,9 @@ void WriteCurrentBatchKvToCache(const BatchSpec* batch, const struct ggml_tensor
         }
 
         const int block_id = block_table[logical_block];
+        if (stored_output && !(is_k ? cache->GetKSlotPtr(block_id, layer, slot)
+                                    : cache->GetVSlotPtr(block_id, layer, slot)))
+            throw densecore::InvalidArgumentException("stored KV output requires valid physical cache storage");
         int run = 1;
         while (i + run < end && i + run < static_cast<int>(batch->seq_id.size()) &&
                i + run < static_cast<int>(batch->pos.size())) {
@@ -591,11 +600,32 @@ void WriteCurrentBatchKvToCache(const BatchSpec* batch, const struct ggml_tensor
                          max_idx >= 0 ? static_cast<double>(run_data[max_idx]) : 0.0,
                          max_idx >= 0 ? static_cast<double>(roundtrip[static_cast<size_t>(max_idx)]) : 0.0);
         }
+        if (stored_output) {
+            // Publish exactly the representation consumed by future KV history.
+            // Each worker reads only the slots it just wrote; no filled-slot
+            // metadata or cross-worker barrier is needed. Reuse the writer's
+            // existing run scratch and the cache codec, including quantized KV.
+            const float* stored = run_data;
+            if (cache->cache_type != GGML_TYPE_F32) {
+                if (is_k) cache->ReadKSlots(block_id, layer, slot, run, packed.data());
+                else cache->ReadVSlots(block_id, layer, slot, run, packed.data());
+                stored = packed.data();
+            }
+            ScatterTokenSpanHeadContiguous(stored, stored_output, output_token_offset + i, run, head_dim, n_head_kv);
+        }
         if (writes_ok) {
             *writes_ok += run;
         }
         i += run;
     }
+}
+
+// Preserve the existing internal C++ entry point used by paged attention.
+void WriteCurrentBatchKvToCache(const BatchSpec* batch, const ggml_tensor* src,
+                               PagedKVCache* cache, int layer, int head_dim, int n_head_kv, bool is_k,
+                               int token_begin, int token_end, int* writes_ok, int* writes_skipped) {
+    WriteCurrentBatchKvToCache(batch, src, cache, layer, head_dim, n_head_kv, is_k,
+                              token_begin, token_end, writes_ok, writes_skipped, nullptr, 0);
 }
 
 static inline bool ReadSingleCurrentBatchKvFromCache(const BatchSpec* batch, PagedKVCache* cache, int layer,
@@ -782,10 +812,12 @@ void cb_kv_write_only(struct ggml_tensor* dst, const struct ggml_tensor* src, in
     const int t_start = ith * tokens_per_thread;
     const int t_end = std::min(t_start + tokens_per_thread, N);
 
+    const bool publish_stored = ud->cache->cache_type != GGML_TYPE_F32;
     if (t_end > t_start) {
         WriteCurrentBatchKvToCache(batch, src, ud->cache, ud->layer, head_dim, n_head_kv, ud->is_k, t_start, t_end,
-                                   nullptr, nullptr);
+                                   nullptr, nullptr, publish_stored ? dst : nullptr, 0);
     }
+    if (publish_stored) return;
 
     const size_t head_block_size = static_cast<size_t>(head_dim) * static_cast<size_t>(n_head_kv);
     if (t_end > t_start) {
@@ -840,7 +872,8 @@ void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, v
         const int t_end = std::min(t_start + tokens_per_thread, N);
         if (t_end > t_start) {
             WriteCurrentBatchKvToCache(batch, src, ud->cache, ud->layer, head_dim, n_head_kv, ud->is_k, t_start, t_end,
-                                       nullptr, nullptr);
+                                       nullptr, nullptr,
+                                       (ud->cache->cache_type != GGML_TYPE_F32 && N > 1) ? dst : nullptr, n_past);
         }
     }
 
@@ -910,7 +943,7 @@ void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, v
         }
     }
 
-    if (N > 0 && !read_only_shared_kv) {
+    if (N > 0 && !read_only_shared_kv && (ud->cache->cache_type == GGML_TYPE_F32 || N == 1)) {
         const int tokens_per_thread = (N + nth - 1) / nth;
         const int t_start = ith * tokens_per_thread;
         const int t_end = std::min(t_start + tokens_per_thread, N);
