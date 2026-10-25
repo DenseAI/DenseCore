@@ -503,6 +503,7 @@ TEST(RequestTerminalPublicationTest, GenerationQueueFailureFallsBackOnceAndWakes
     EngineState state;
     Request req;
     CallbackState callback;
+    req.Reset();
     req.callback_ex = LifecycleCallbackEx;
     req.user_data = &callback;
     state.fail_result_publication_for_test.store(true);
@@ -518,6 +519,7 @@ TEST(RequestTerminalPublicationTest, EmbeddingQueueFailurePreservesSuccessPayloa
     EngineState state;
     Request req;
     EmbeddingCallbackState callback;
+    req.Reset();
     req.is_embedding = true;
     req.embedding_callback = EmbeddingLifecycleCallback;
     req.user_data = &callback;

@@ -1480,12 +1480,16 @@ public:
         return obj;
     }
 
-    void Release(T* obj) {
+    void Release(T* obj) noexcept {
         if (!obj) return;
-        // Reset basic state if possible, though destructor/constructor pattern
-        // common
-        std::lock_guard<std::mutex> lock(mu_);
-        pool_.push(obj);
+        try {
+            std::lock_guard<std::mutex> lock(mu_);
+            pool_.push(obj);
+        } catch (...) {
+            // Recycling is optional. OOM while growing the free-object stack
+            // must not interrupt terminal cleanup or leak the unpooled object.
+            delete obj;
+        }
     }
 
     ~ObjectPool() {
