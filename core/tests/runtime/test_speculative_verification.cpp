@@ -123,6 +123,10 @@ TEST(MtpConfiguration, KeepsAutomaticModeOffAndRejectsUnsupportedOrUnbudgetedExp
     EXPECT_NE(error.find("required_bytes="), std::string::npos);
     EXPECT_EQ(state.speculation_selected.load(), 1);
     state.models["default"]->kv_config.memory_plan.available_bytes = 1024ULL * 1024 * 1024;
+    auto& plan = state.models["default"]->kv_config.memory_plan;
+    plan.resource_capacity_bytes = plan.available_bytes;
+    plan.kv_bytes = 1024; // ensure the synthetic base plan is registered
+    state.models["default"]->resource_lease = std::make_unique<densecore::runtime::ResourcePlanLease>(plan);
     ASSERT_TRUE(ConfigureSpeculation(&state, 2, 2, &error)) << error;
     EXPECT_EQ(state.speculation_selected.load(), 2);
     EXPECT_EQ(state.speculation_max_context, 16);

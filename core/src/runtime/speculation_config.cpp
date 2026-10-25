@@ -60,6 +60,9 @@ bool ConfigureSpeculation(EngineState* state, int mode, int draft_n_max, std::st
             return fail("MTP resource plan required_bytes=" + std::to_string(plan.RequiredBytes()) +
                         " available_bytes=" + std::to_string(plan.available_bytes));
         }
+        if (!entry->resource_lease) return fail("MTP requires an enforced model resource reservation");
+        std::string reservation_error;
+        if (!entry->resource_lease->ExtendMTP(additional, &reservation_error)) return fail(reservation_error);
         entry->kv_config.memory_plan = plan;
         state->speculation_max_context = static_cast<int>(context);
         state->speculation_reserved_bytes = additional;
