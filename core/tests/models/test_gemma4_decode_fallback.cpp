@@ -1567,3 +1567,47 @@ TEST(Gemma4FallbackDecodeTest, E4BQ4ZeroProjectionUsesNativeQuantWithPreparedAli
         }
     }
 }
+
+TEST(Gemma4DecodeGraphTest, IndependentFullAttentionDecodeMatchesFourOwnedHistories) {
+    auto model = MakeBaseGemma4GraphModel(1);
+    model->gemma4_layer_is_sliding = {0u};
+    model->gemma4_sliding_window = -1;
+    SetTensorData(model->tok_embeddings, {0.f,0.f,0.f,0.f});
+    ConfigureLayerQkv(model->layers[0].Get(model_keys::kAttnQWeight),
+                      model->layers[0].Get(model_keys::kAttnKWeight),
+                      model->layers[0].Get(model_keys::kAttnVWeight),
+                      model->layers[0].Get(model_keys::kAttnOWeight),
+                      {0.f,0.f,0.f,0.f}, {0.f,0.f,0.f,0.f}, {0.f,0.f,0.f,0.f}, {1.f,0.f,0.f,1.f});
+    const std::array<int,4> past = {1,2,3,4};
+    const auto make_cache = [&]() {
+        return std::unique_ptr<PagedKVCache>(InitPagedKVCache(model.get(),4,8,GGML_TYPE_F32,-1));
+    };
+    const auto seed = [&](PagedKVCache* cache,int block,int seq) {
+        const SlotVec key = {0.f,0.f};
+        const SlotVec value = seq%2 ? SlotVec{-1.f,1.f} : SlotVec{1.f,-1.f};
+        for(int token=0;token<past[seq];++token) {
+            cache->WriteKSlot(block,0,token,key.data());
+            cache->WriteVSlot(block,0,token,value.data());
+        }
+    };
+    std::vector<float> expected;
+    for(int seq=0;seq<4;++seq) {
+        auto cache=make_cache();ASSERT_NE(cache,nullptr);
+        const int block=cache->block_manager->AllocateSingle();ASSERT_GE(block,0);seed(cache.get(),block,seq);
+        const auto single=densecore::testing::ExecuteTransformerGraphForTest(
+            model.get(),cache.get(),MakeSingleTokenDecodeBatch(0,past[seq],block),1);
+        ASSERT_EQ(single.size(),2u);
+        EXPECT_GT(single[seq%2],single[1-seq%2]);
+        expected.insert(expected.end(),single.begin(),single.end());
+    }
+    auto cache=make_cache();ASSERT_NE(cache,nullptr);
+    BatchSpec batch{};batch.num_seqs=4;batch.tokens={0,0,0,0};batch.seq_id={0,1,2,3};
+    batch.n_past.assign(past.begin(),past.end());batch.pos=batch.n_past;
+    for(int seq=0;seq<4;++seq) {
+        const int block=cache->block_manager->AllocateSingle();ASSERT_GE(block,0);seed(cache.get(),block,seq);
+        batch.block_tables.push_back({block});
+    }
+    const auto actual=densecore::testing::ExecuteTransformerGraphForTest(model.get(),cache.get(),batch,4);
+    ASSERT_EQ(actual.size(),expected.size());
+    for(size_t i=0;i<actual.size();++i) EXPECT_NEAR(actual[i],expected[i],1e-5f)<<"logit="<<i;
+}
