@@ -12,11 +12,14 @@
 #include "densecore/backend/flash_attention.h"
 #include "runtime/inference_types_internal.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "densecore/runtime/inference.h"
 #include "densecore/memory/kv_cache.h"
 #include "densecore/models/model_types.h"
 
 namespace densecore::testing {
+ggml_tensor* SmartMulMatWithPhaseTest(ggml_context* ctx, ggml_tensor* weight, ggml_tensor* input,
+                                     TransformerModel* model, int phase);
 std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float>& q,
                                                          const std::vector<float>& k,
                                                          const std::vector<float>& v,
@@ -1101,5 +1104,117 @@ TEST(Qwen3EmbeddingGraphTest, SplitHalfRotaryMatchesCausalAttentionReference) {
     ASSERT_EQ(actual.size(), expected.size());
     for (size_t i = 0; i < expected.size(); ++i) {
         EXPECT_NEAR(actual[i], expected[i], 2e-4f) << "hidden index=" << i;
+    }
+}
+
+// Per-layer projection is BF16 in the public E2B file, unlike the quantized
+// attention/FFN matrices. Exercise both decode and multi-column prefill, with
+// padded row strides, against the represented weights (not unrounded inputs).
+TEST(Gemma4FallbackDecodeTest, NativeFloatProjectionMatchesRepresentedWeightsForEveryColumn) {
+    std::unique_ptr<InferenceWorkContext, void (*)(InferenceWorkContext*)> work_ctx(
+        CreateInferenceWorkContext(), DestroyInferenceWorkContext);
+    ASSERT_NE(work_ctx, nullptr);
+    struct RestoreContext {
+        InferenceWorkContext* previous = GetCurrentWorkContext();
+        ~RestoreContext() { SetCurrentWorkContext(previous); }
+    } restore;
+    SetCurrentWorkContext(work_ctx.get());
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int m : {1, 4, 25}) {
+            SCOPED_TRACE(static_cast<int>(type));
+            SCOPED_TRACE(m);
+            ggml_init_params params{4 * 1024 * 1024, nullptr, false};
+            std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+            ASSERT_NE(ctx, nullptr);
+            constexpr int k = 33;
+            constexpr int n = 7;
+            ggml_tensor* storage = ggml_new_tensor_2d(ctx.get(), type, k + 3, n);
+            ggml_tensor* weight = ggml_view_2d(ctx.get(), storage, k, n, storage->nb[1], 0);
+            ggml_set_name(weight, "per_layer_model_proj.weight");
+            ggml_tensor* input_storage = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k + 5, m);
+            ggml_tensor* input = ggml_view_2d(ctx.get(), input_storage, k, m, input_storage->nb[1], sizeof(float));
+            std::vector<float> represented(n * k);
+            for (int row = 0; row < n; ++row) {
+                char* data = static_cast<char*>(weight->data) + row * weight->nb[1];
+                for (int col = 0; col < k; ++col) {
+                    const float value = std::sin(static_cast<float>(row * k + col) * 0.071f) * 0.3f;
+                    float rounded = value;
+                    if (type == GGML_TYPE_F16) {
+                        const auto half = ggml_fp32_to_fp16(value);
+                        std::memcpy(data + col * sizeof(half), &half, sizeof(half));
+                        rounded = ggml_fp16_to_fp32(half);
+                    } else if (type == GGML_TYPE_BF16) {
+                        const auto half = ggml_fp32_to_bf16(value);
+                        std::memcpy(data + col * sizeof(half), &half, sizeof(half));
+                        rounded = ggml_bf16_to_fp32(half);
+                    } else {
+                        std::memcpy(data + col * sizeof(float), &value, sizeof(float));
+                    }
+                    represented[row * k + col] = rounded;
+                }
+            }
+            for (int col = 0; col < m; ++col) {
+                float* values = reinterpret_cast<float*>(static_cast<char*>(input->data) + col * input->nb[1]);
+                for (int j = 0; j < k; ++j) values[j] = std::cos(static_cast<float>(col + j) * 0.17f);
+            }
+            TransformerModel model{};
+            model.variant = ModelVariant::GEMMA4;
+            model.arch_flags.is_gemma4 = true;
+            ggml_tensor* result = densecore::testing::SmartMulMatWithPhaseTest(
+                ctx.get(), weight, input, &model, static_cast<int>(m == 1 ? InferenceExecutionPhase::Decode : InferenceExecutionPhase::Prefill));
+            ASSERT_NE(result, nullptr);
+            EXPECT_EQ(result->op, GGML_OP_CUSTOM);
+            ASSERT_EQ(result->ne[0], n);
+            ASSERT_EQ(result->ne[1], m);
+            ggml_cgraph* graph = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(graph, result);
+            ASSERT_EQ(ggml_graph_compute_with_ctx(ctx.get(), graph, 4), GGML_STATUS_SUCCESS);
+            const float* actual = static_cast<const float*>(result->data);
+            for (int col = 0; col < m; ++col) {
+                const float* values = reinterpret_cast<const float*>(static_cast<const char*>(input->data) + col * input->nb[1]);
+                for (int row = 0; row < n; ++row) {
+                    double reference = 0;
+                    for (int j = 0; j < k; ++j) reference += static_cast<double>(values[j]) * represented[row * k + j];
+                    EXPECT_NEAR(actual[col * n + row], reference, 2e-6);
+                }
+            }
+        }
+    }
+}
+
+TEST(Gemma4FallbackDecodeTest, Bf16ProjectionLayerLogitsMatchRoundedF32AcrossDecodeSteps) {
+    ScopedFlashAttentionDisableForTest flash_guard;
+    auto model = MakeSlidingDecodeGraphModel(false);
+    auto reference = MakeSlidingDecodeGraphModel(false);
+    for (const char* key : {model_keys::kAttnQWeight, model_keys::kAttnKWeight, model_keys::kAttnVWeight,
+                            model_keys::kAttnOWeight, model_keys::kFfnGate, model_keys::kFfnUp, model_keys::kFfnDown}) {
+        ggml_tensor* original = model->layers[0].Get(key);
+        ggml_tensor* rounded = reference->layers[0].Get(key);
+        ggml_tensor* bf16 = ggml_new_tensor_2d(model->ctx_w, GGML_TYPE_BF16, original->ne[0], original->ne[1]);
+        ggml_set_name(bf16, key);
+        for (int64_t i = 0; i < ggml_nelements(original); ++i) {
+            const auto value = ggml_fp32_to_bf16(std::sin(static_cast<float>(i + 1) * 0.37f) * 0.31f);
+            static_cast<ggml_bf16_t*>(bf16->data)[i] = value;
+            static_cast<float*>(rounded->data)[i] = ggml_bf16_to_fp32(value);
+        }
+        model->layers[0].Set(key, bf16);
+    }
+    auto cache = MakeTinyGraphCache(model.get());
+    auto reference_cache = MakeTinyGraphCache(reference.get());
+    ASSERT_NE(cache, nullptr);
+    ASSERT_NE(reference_cache, nullptr);
+    const int block = cache->block_manager->AllocateSingle();
+    const int reference_block = reference_cache->block_manager->AllocateSingle();
+    ASSERT_GE(block, 0);
+    ASSERT_GE(reference_block, 0);
+    for (int step = 0; step < 4; ++step) {
+        SCOPED_TRACE(step);
+        auto actual = densecore::testing::ExecuteTransformerGraphForTest(
+            model.get(), cache.get(), MakeSingleTokenDecodeBatch(1, step, block), 4);
+        auto expected = densecore::testing::ExecuteTransformerGraphForTest(
+            reference.get(), reference_cache.get(), MakeSingleTokenDecodeBatch(1, step, reference_block), 1);
+        ASSERT_EQ(actual.size(), expected.size());
+        ASSERT_EQ(actual.size(), static_cast<size_t>(kTinyGraphVocab));
+        for (size_t i = 0; i < actual.size(); ++i) EXPECT_NEAR(actual[i], expected[i], 1e-6);
     }
 }

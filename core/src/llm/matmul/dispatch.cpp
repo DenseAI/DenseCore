@@ -42,6 +42,56 @@ bool CpuRepackAliasHasLayout(const TransformerModel*, const ggml_tensor*, Transf
 }
 using densecore::llm::graph::detail::CpuRepackAliasHasLayout;
 
+// Gemma's per-layer projections can be BF16 while the surrounding graph is
+// F32. Convert only one weight row per task, shared across the input columns;
+// never expand the model matrix or delegate this operation to a GGML matmul.
+static void Gemma4FloatProjection(struct ggml_tensor* dst, int ith, int nth, void*) {
+    const ggml_tensor* weight = dst->src[1];
+    const ggml_tensor* input = dst->src[0];
+    const int64_t k = weight->ne[0];
+    std::vector<float> row(static_cast<size_t>(k));
+    for (int64_t n = ith; n < weight->ne[1]; n += nth) {
+        const char* packed = static_cast<const char*>(weight->data) + n * weight->nb[1];
+        const float* values = nullptr;
+        if (weight->type == GGML_TYPE_F32) {
+            values = reinterpret_cast<const float*>(packed);
+        } else if (weight->type == GGML_TYPE_BF16) {
+            ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t*>(packed), row.data(), k);
+            values = row.data();
+        } else {
+            ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t*>(packed), row.data(), k);
+            values = row.data();
+        }
+        for (int64_t m = 0; m < input->ne[1]; ++m) {
+            const float* activation = reinterpret_cast<const float*>(
+                static_cast<const char*>(input->data) + m * input->nb[1]);
+            float* output = reinterpret_cast<float*>(static_cast<char*>(dst->data) + m * dst->nb[1]);
+            output[n] = densecore::simd::DotF32(values, activation, static_cast<size_t>(k));
+        }
+    }
+}
+
+static bool CanUseGemma4FloatProjection(const TransformerModel* model, const ggml_tensor* weight,
+                                        const ggml_tensor* input, const BatchSpec* batch) {
+    return model && model->arch_flags.is_gemma4 && weight && input &&
+           (!batch || batch->lora_map.empty()) && input->type == GGML_TYPE_F32 &&
+           (weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_BF16 ||
+            (weight->type == GGML_TYPE_F32 &&
+             (input->ne[1] > kMaxSmallBatchColsHard ||
+              weight->nb[1] != static_cast<size_t>(weight->ne[0]) * sizeof(float) ||
+              input->nb[1] != static_cast<size_t>(input->ne[0]) * sizeof(float)))) &&
+           weight->ne[0] == input->ne[0] && input->ne[0] > 0 && input->ne[1] > 0 && weight->ne[1] > 0 &&
+           weight->ne[2] == 1 && weight->ne[3] == 1 && input->ne[2] == 1 && input->ne[3] == 1 &&
+           weight->nb[0] == ggml_type_size(weight->type) && input->nb[0] == sizeof(float);
+}
+
+static ggml_tensor* BuildGemma4FloatProjection(ggml_context* ctx, ggml_tensor* weight, ggml_tensor* input,
+                                              const BatchSpec* batch) {
+    ggml_tensor* args[] = {input, weight};
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, weight->ne[1], input->ne[1], 1, 1, args, 2,
+                          Gemma4FloatProjection, ResolveTaskCount(batch, static_cast<int>(weight->ne[1])), nullptr);
+}
+
 enum class Gemma4NativeMatmulReject {
     None,
     NotGemma4,
@@ -1362,6 +1412,21 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
     const densecore::runtime::DenseCoreMatmulPlan& matmul_plan = dispatch_state.matmul_plan;
     const densecore::runtime::KernelResolution& kernel_resolution = dispatch_state.kernel_resolution;
     const bool force_plain_hybrid_ssm_qkv = dispatch_state.hybrid_ssm_qkv && ShouldForcePlainGgmlForHybridSSMQkv();
+    if (CanUseGemma4FloatProjection(model, weight, input, current_batch)) {
+        LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim,
+                          "DENSECORE_GEMMA4_FLOAT_PROJECTION");
+        if (dispatch_phase == InferenceExecutionPhase::Prefill && M > 1) {
+            RecordGemma4DensePrefillNativeDecision(dispatch_work_ctx, true, true, nullptr, weight->type, 1, false);
+        } else {
+            RecordGemma4DecodeNativeDecision(dispatch_work_ctx, true, true, nullptr, false, true,
+                                             model->output == weight, 0, 1, 0, false);
+        }
+        RecordSmartMatmulGraphCensus(dispatch_work_ctx, dispatch_phase, original_state, dispatch_state, weight->type,
+                                     M <= 1 || dispatch_phase == InferenceExecutionPhase::Decode,
+                                     M <= 1 ? "custom_gemv" : "custom_batched_gemv");
+        return BuildGemma4FloatProjection(ctx, weight, input, current_batch);
+    }
+
     if (matmul_plan.target_qwen_hot_path && IsDebugMatmulDispatchEnabled()) {
         LogMatmulDispatch(w_name, MatmulWeightTypeLabel(weight->type, false, false), M, N_dim, K_dim, "DENSECORE_PLAN",
                           densecore::runtime::DenseCoreKernelFamilyName(kernel_resolution.selected_kernel));
