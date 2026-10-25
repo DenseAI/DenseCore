@@ -2,150 +2,161 @@
 
 D0 is 2026-10-25; D21 is 2026-11-15. Scope is A–H: personal PCs,
 resource-limited Kubernetes pods and two-socket NUMA. DeepSeek V4/V4.1 is
-excluded. This is an execution ledger, not a released-support announcement.
+excluded. Release readiness remains incomplete.
 
-Code, real-model correctness, matched performance and automatic activation are
-separate gates. Fixture or compilation success does not qualify a model. A
-missing or truncated final answer fails quality even if reasoning contains the
-expected text. The current automatic MTP profile registry is empty.
+Implementation, real-model correctness, matched performance and automatic
+activation are separate gates. A missing or truncated final answer fails even
+when reasoning contains the expected text. No automatic MTP profiles or new
+performance/default promotions are qualified.
 
-The current evidence snapshot is frozen source
-`7ecaf86072246752ac15a1bf7caab1b2ff5f9217`. Its global stored-KV-precision
-change affects cold non-F32 attention, so earlier `8c5433a` model successes do
-not automatically carry forward. Later fixes require their own integrated
-binary and model/package checks.
+## Evidence boundaries
 
-| Track | Verified on canonical `7ecaf86` | Remaining release gate |
+The integrated source snapshot is
+`143a2ad5d87cd96d654e51b0e411d1da28eefaec`. Its full native run executed 1312
+checks: 1298 passed, the same 14 existing skips, zero failures and zero disabled
+tests. Go all-package checks and three repeated race runs passed. The Python SDK
+suite passed 164 checks with 27 existing optional skips on unchanged SDK modules;
+61 standard-library benchmark tests passed.
+
+Real Python generation on the exact integrated `143a2ad` library passed 12 cases
+and three native-token controls, covering completion counts/finish reasons,
+concurrent metadata, cancellation of the actual native request ID, iterator/task
+cleanup, incomplete stop-prefix flush and recovery. Completion accounting is
+native-backed. Prompt-token accounting remains a client estimate (zero when no
+Python tokenizer is available), not native prompt accounting.
+
+The expanded ASAN/LSan result belongs to **`3ed5428`**, not full source `143a2ad`:
+662 checks, 653 passed, the same 9 existing skips, zero failures/disabled tests
+and zero sanitizer reports with leak detection enabled. It covers ordered
+terminals, stop output, Gemma per-request attention and Q4 KV changes; subsequent
+`83e0307` diagnostic user-data ownership changes are outside that run.
+
+| Track | Verified evidence and source | Remaining gate |
 |---|---|---|
-| A | Full native: 1263 passed, 14 existing skips, zero failures (1277 total). Selected ASAN/LSan suite: 600 passed, 9 existing skips, zero failures/reports (609 total). Qwen3 cold/warm native ID parity and HTTP reasoning/final separation passed | Gemma E2B c=4 same-prompt isolation fails; actual stochastic HTTP stop strings leak in both NONE and MTP. Fix and requalify affected paths |
-| B/H | Resource/planner fixtures, pinned 0.8B serving within 4 GiB, explicit initialization rejection within 1 GiB without OOM kill; embedding AUTO/LAST C/Python/HTTP 12 comparisons bitwise equal, finite and normalized | Final integrated image/pod verification after fixes; broader c=8 resource/isolation and platform qualification |
-| B Gemma | Pinned E2B c=1 long-answer/repeat HTTP quality passed 6/6 | E2B c=4 same-prompt outputs differ by slot despite 24 semantic/EOS successes; native-ID investigation and E4B canonical long/repeat/c=1/4 qualification remain |
-| C | README-pinned 0.8B and plain 2B combined strict checks passed: c=1/2/4, five-turn final answers, actual restore/skipped prefill, cancellation/recovery and real snapshot/KV eviction | Qwen3.6 model-specific qualification; matched performance and default-policy promotion remain separate |
-| D | 0.8B/2B MTP files, K=2, c=1/c=4: same-file NONE/MTP 128 native IDs and HTTP/stream/cancel/recovery passed | Actual stochastic 0.8B c=1 fails HTTP stop handling (NONE 3 leaks, MTP 2); remaining stochastic cells, current K=1/3, real 35B MoE head and performance qualification remain |
-| E | Local portable amd64 image built; 4 GiB serving/1 GiB rejection and kind chart/downloader/limits/checksum components passed | Strict Count and full active drain fail. Separate f50 image improves active readiness/grace but returns 500 instead of required 503 to new requests; typed admission fix and new container/kind validation remain pending. Final package/native Arm remain unqualified |
-| F | GPT-OSS packed MXFP4/bias/router/activation, attention sink/window and tokenizer/Harmony fixtures | Real-model HTTP/long output/c=1/4/stop/stream and peak RSS/context unavailable on this host; safe capacity refusal is not inference support |
-| G | Public physical-NUMA preflight and matched ABBA harness | Actual two-socket 35B/122B measurements, 16/48 physical-core placement and remote-memory penalty; no default promotion |
+| A | Integrated `143a2ad` native/Go checks and real Python lifecycle checks above; `3ed5428` scoped sanitizers | Actual c=8 greedy parity and Gemma concurrent parity still fail; final combined sanitizer/model qualification remains required |
+| B/H | Resource/planner fixtures; earlier 4 GiB serving and explicit 1 GiB rejection without OOM kill; historical `7ecaf86` embedding AUTO/LAST 12 bitwise C/Python/HTTP comparisons | Actual `143a2ad` c=8 resource/cleanup evidence passes, but request isolation does not; final image/platform checks remain |
+| B Gemma | Historical `7ecaf86` E2B c=1 long/repeat HTTP quality 6/6; private `ad1aa84` concurrent parity 6/8 | Two requests differ from c=1 even with cache off. Projection diagnosis is incomplete; E4B canonical/mixed qualification is held |
+| C | Historical `7ecaf86` README-pinned 0.8B/plain 2B combined prefix checks passed c=1/2/4, five-turn answers, restore/skipped prefill, cancellation and eviction | Do not inherit those results across later numerical changes; Qwen3.6, matched performance and default-policy promotion remain separate |
+| D | Historical `7ecaf86` 0.8B/2B K2 c1/c4 native 128-ID parity; private `5ad54a5` native completion/cancel/recovery and literal-stop checks | All four private stochastic profiles fail strict HTTP quality (6 failures/160). Final-root matrix, population distribution, speed, 35B MoE and automatic qualification remain absent |
+| E | Go-only `386b800` portable amd64 image passed actual container and kind strict active drain, resource limits, checksum rejection and safe memory refusal | Strict Count quality still fails. Current root core has no final image validation; original init-log capture has syntax checks only; native Arm remains unverified |
+| F | GPT-OSS packed MXFP4/bias/router/activation, attention sink/window and tokenizer/Harmony fixtures | Actual HTTP/long/c=1/4/stop/stream inference and supported peak RSS/context remain unverified; safe capacity refusal is not model support |
+| G | Public physical-NUMA preflight and matched ABBA harness | Actual 35B/122B two-socket measurements, 16/48 physical cores and remote-memory penalty; no promotion |
 
-Qwen3.5 prefix qualification used `DENSECORE_QWEN35_PREFIX_CACHE_REUSE=1`
-with global prefix/snapshot controls enabled. The opt-in remains separate from
-quality and performance promotion. Qwen3.6 retains its model-specific gate.
-The combined 0.8B/2B runs each observed 14 real restores. Separate near-full
-pressure runs reclaimed 105 KV blocks and respectively 10/11 snapshots
-(202,014,720 / 222,216,192 logical payload bytes). Pressure-control output is
-not complete-answer quality evidence, and turn-five single samples are not a
-performance comparison.
+## Retained correctness failures
 
-Explicit MTP executes batched K+1 verification with suffix rollback and SSM
-recovery. Its 128-token parity runs may finish by length; they do not prove a
-complete long answer or stochastic distribution equivalence. The first real
-stochastic run used temperature 0.7, top-p 0.95, top-k 40 and repetition penalty
-1.05 and failed the HTTP stop gate. Native acceptance/rejection/rollback was
-observed, but that does not excuse literal stop text reaching clients. Native
-request seed wiring and real-model distribution qualification remain absent.
-The production AUTO registry contains zero profiles and selects NONE without
-model hashing or runtime-profile capture. No MTP acceleration is claimed.
+Actual H resource testing on `143a2ad` observed a pressure snapshot with 8 active
+and 8 pending requests (maximum observed pending 12). Oversized prompt admission
+returned an explicit memory error with no callbacks; all 36 accepted requests
+published one terminal and one completion. These pass bounded resource/lifecycle
+checks, not isolation or throughput qualification. Greedy parity fails: the last
+admitted c=8 request replaces baseline EOS at zero-based token position 50 with a
+newline and continues to the 128-token cap. Separate cache-OFF and cache-OFF with
+all thread policies fixed to 8 reproduce the failure. This does not establish a
+physical-slot cause or qualify either control as a workaround.
 
-## Reproduction and evidence
+Gemma E2B private `ad1aa84` matches c=1's 127 native IDs in six of eight concurrent
+requests; admission-rank 2 requests differ (121 IDs, first difference 23). Cache
+OFF reproduces the same outputs. Paired debug `e9662e5` observes bit-identical
+projection inputs and the first difference in Q4_K query projection output
+(maximum absolute difference `6.103515625e-05`). This narrows investigation;
+it is not a completed fix or model-support result. E4B canonical and mixed-model
+runs remain held behind the isolation defect.
 
-Use `dc-build` with one shared build lock in the local multi-worktree setup.
-Build/test source must remain stable during compilation; rebuild after changing
-headers or registration before collecting any real-model evidence.
+Private stop candidate `5ad54a5` completed 72 native requests, eight native
+cancel/recovery cases and eight HTTP disconnect/recovery cases. Its 32 configured
+literal-stop probes leaked no stop markers; native logs observed 27 actual
+`stop_sequence` finishes. Native-ID-to-HTTP case mapping at c=4 is unproven, so
+these counts are aggregate evidence. The 0.8B/2B × c=1/c=4 stochastic profiles
+all retain strict FAIL: six HTTP quality failures among 160 main requests.
+French formatting and stop-instruction failures are preserved without assigning
+them to model or engine by assumption. These samples prove neither population
+distribution equivalence nor acceleration. They are private-source evidence,
+not a completed matrix for integrated `143a2ad`.
 
-- Native: complete `densecore_tests`, A/D ASAN, and focused model-logit/rollback tests.
-- Adapters: changed Go and Python tests; Go race checks for callback/admission paths.
-- Real quality: the [final-answer evaluator](../benchmarks/economics/evaluate_openai_quality.py)
-  requires a final answer, successful finish and complete SSE stream. Save raw
-  output and all failures. Textual HTTP parity is weaker than full native-ID parity.
-- State parity: [prefix/eviction](../benchmarks/personal/check_prefix_parity.py),
-  [greedy MTP](../benchmarks/personal/check_mtp_parity.py) and
-  [stochastic MTP](../benchmarks/personal/check_mtp_sampling.py) entry points.
-  Match each ledger's actual harness/case SHA and parameters: separately recorded
-  harness revisions are not interchangeable merely because filenames match.
-- Final package: [container smoke](../scripts/container_model_smoke.sh) and
-  [kind smoke](../scripts/kind_model_smoke.sh); [Kubernetes instructions](KUBERNETES.md).
-- Artifact identities: [model catalog](MODEL_CATALOG.md).
-- CPU comparisons: [personal PC](../benchmarks/personal/README.md) and
-  [physical NUMA](../benchmarks/numa/README.md) harnesses.
+Historical Qwen3 `7ecaf86` default/off HTTP modes passed 16 semantic/protocol
+cases, reasoning/final separation and cold/warm native parity. Explicit-off
+number-only formatting still failed (also on pinned llama.cpp oracle
+`74bca3950054eed1795f525cb9cf06bfe796492d`). Oracle failure does not relax a gate.
+Historical prefix checks used the model-specific opt-in; actual restore and
+snapshot/KV eviction are distinct from performance promotion. Near-full pressure
+outputs are control workloads, not complete-answer quality proof.
 
-Performance requires fixed model bytes, binary/library hashes, CPU/build flags,
-sampling, cache state and input/output lengths. Keep all five ABBA cycles and
-predeclared A/A noise. Judge C4/C4A × c=1/c=4 independently with no compensating
-regressions. Promotion requires at least max(3%, A/A noise), with additional
-1.15× decode for MTP or +15% 48-core decode for NUMA and no completion-time,
-TTFT, throughput or memory regressions. K=2 remains preferred if K=3 has no
-significant advantage.
+## Package boundary
 
-Cloud spending is capped at $50, with $10 held for billing delay/disk/transfer
-and price changes; see [session budget](../benchmarks/economics/SESSION_BUDGET.md).
-On D0 the configured GCP project had billing disabled and Compute API disabled.
-No paid validation was performed or charged. Cloud/platform performance and
-native Arm gates therefore remain unavailable until those prerequisites change.
+The separate Go-only source `386b800d8e27a775a45d8a6798430200d5ceb292` produced
+local portable amd64 image
+`sha256:17e914ce8e30a1a9a651855c3e2b6ffd43907aaea143d3b51ef58c85b05835fd`.
+Its native/runtime file hashes match `7ecaf86`; only the Go server changed.
+Actual container and kind tests both observed readiness 503, new-admission 503
+and native active=1 in the same probe round while the accepted stream remained
+incomplete. Each bounded 32-token stream finished with one finish and one DONE,
+7.596/7.903 seconds after the signal command, within the original 30-second
+budget. Resource limits, corrupt-cache rejection and cleanup passed. Strict
+Count quality remains FAIL; the image is not release-qualified.
 
-If mandatory correctness or final-package checks remain incomplete on D21,
-record release readiness as incomplete and the release delayed. Do not silently
-remove a track or turn fixture passes into real-model support.
+Earlier `7ecaf86` readiness-200 and `f50d958` 149×HTTP-500 admission failures remain
+recorded. The 386 run did not preserve the original successful init stdout
+before pod deletion. The later capture change binds original pod UID/container
+ID, image IDs, exit status and log SHA before deletion; it has only shell/Python
+syntax qualification so far. A final kind run must prove that new artifact.
+Neither the Go-only image proof nor that syntax check qualifies the changed root
+core, later Gemma/stop work or native Arm.
 
-## Retained failures and current integration boundary
+## Reproduction and promotion
 
-- Qwen3 HTTP default/off thinking modes passed 16 semantic/protocol cases,
-  including reasoning/final separation and complete streams. The separate
-  explicit-off “only a number” arithmetic gate failed: output included
-  `6 × 7 = 42`. The pinned llama.cpp oracle (`74bca3950054eed1795f525cb9cf06bfe796492d`)
-  also failed that format requirement. Keep the format failure; an oracle
-  failure does not relax the DenseCore gate. Native prefix OFF/ON parity is a
-  separate passed check on canonical F16 KV.
-- E2B c=4 long-answer outputs differ for the same input across slots, with
-  reported completion counts 129/128/128/132. HTTP 200, correct semantic content
-  and EOS do not establish request isolation. Raw native-ID investigation is
-  pending. Serializing c=4 or silently reducing concurrency does not pass it.
-  Canonical E4B validation remains pending; earlier Paris or fixture successes
-  are not complete model support.
-- The canonical image is a **local** portable amd64 candidate with image ID
-  `sha256:affcd8eda8028aa5124a769b62d22533024821c17cdbc2a8b7fe3ebc3bd55cf9`.
-  Strict Count still fails. An accepted stream completed more than five seconds
-  after shutdown began, but readiness remained 200 while work was active;
-  full active drain fails. Late readiness/admission observations do not pass
-  the lifecycle gate.
-- Separate Go-only candidate `f50d958b283d76441c1ff774febfef0d6108ab05`
-  includes early readiness withdrawal, drain-time read-only diagnostics and a
-  harness requiring same-round readiness 503/new-admission refusal while an
-  accepted request is active. Focused repeated and full relevant Go race checks
-  passed. Its core tree is identical to `7ecaf86`. The actual f50 container
-  observed readiness 503 and native-active=1 while the accepted 32-token stream
-  remained active. That stream finished normally by length with one finish and
-  one DONE, 7.962 seconds after the signal command (over five seconds, within the
-  configured 30-second grace). However, all 149 new chat POST probes returned
-  HTTP 500 (`no model loaded`) rather than required 503. Full active drain still
-  fails. A typed closing/admission error fix and repeat container/kind proof are
-  pending; the obsolete f50 kind waiter was canceled before it acquired the
-  execution slot. This is not the final image for later Gemma/stop fixes.
+Use `dc-build` with the shared build/model lock in the local multi-worktree
+setup. Keep build source stable and preserve exact source, binary, library,
+model and harness identities with every raw failure.
 
-Local raw ledger filenames (not published artifact download links):
+- Quality: the [final-answer evaluator](../benchmarks/economics/evaluate_openai_quality.py)
+  requires final content and a successful complete response.
+- State: [prefix](../benchmarks/personal/check_prefix_parity.py),
+  [MTP parity](../benchmarks/personal/check_mtp_parity.py),
+  [stochastic MTP](../benchmarks/personal/check_mtp_sampling.py),
+  [concurrency](../benchmarks/personal/check_concurrency_budget.py) and
+  [Python SDK](../python/README.md).
+- Package: [container smoke](../scripts/container_model_smoke.sh),
+  [kind smoke](../scripts/kind_model_smoke.sh), [Kubernetes](KUBERNETES.md)
+  and the [model catalog](MODEL_CATALOG.md).
+- Performance: [personal PC](../benchmarks/personal/README.md),
+  [physical NUMA](../benchmarks/numa/README.md) and
+  [session budget](../benchmarks/economics/SESSION_BUDGET.md).
 
-- `v02-canonical-7ec-artifact.json`: exact source/build/library/server identities,
-  native/ASAN/Go checks and dependency audits. Python harness 35 passed on this
-  candidate; Python binding 49 passed on unchanged `8c5433a` sources.
+Performance requires matched bytes, CPU/build, sampling, cache and token lengths,
+all five ABBA cycles and predeclared A/A noise. Judge C4/C4A × c=1/c=4 separately.
+Promotion requires max(3%, A/A noise), with additional 1.15× MTP decode or +15%
+48-core NUMA decode, and no TTFT/completion/throughput/memory regression. K=2
+remains preferred if K=3 has no significant advantage. No such result is claimed.
+AUTO profiles remain zero; unsupported/unknown profiles select NONE.
+
+The recorded read-only GCP check (2026-10-25 13:36 UTC) found billing disabled
+on both configured projects and Compute API disabled on the primary project.
+Paid validation spending is $0; the cap is $50 with $10 reserved for billing
+lag/disk/transfer/price changes. Actual GPT-OSS, physical NUMA/122B, C4/C4A and
+native Arm gates remain unverified. If mandatory checks remain incomplete on
+D21, record release readiness as incomplete and the release delayed.
+
+## Local evidence ledger names
+
+These are local ledger identifiers, not public download promises. Archive raw
+identities before publishing any claim; use the relative reproduction links above.
+
+- `v02-integrated-143-artifact.json`, `v02-integrated-143-native-results.json`,
+  `v02-followup-3ed-asan-report.json`, `v02-followup-804-python-all.log`,
+  `v02-followup-personal-stdlib-verified.log`.
+- `v02-python-generation-integrated143/result.json` and `manifest.json`.
+- `v02-h-integrated143-c8-ctx512/analysis.json`, and the sibling
+  `v02-h-integrated143-c8-ctx512-cache0-control` /
+  `v02-h-integrated143-c8-ctx512-cache0-fixed8-control` native ledgers.
+- `v02-mtp-sampling-stop5ad-matrix-report.json`,
+  `v02-stop5ad-native-stop-correlation.json`.
+- `v02-gemma-e2b-ad1-native-comparison.json`,
+  `v02-gemma-e2b-e966-projection-inputs-comparison.json`.
+- `v02-packaging-admission386-reviewed-components.json`,
+  `v02-packaging-kind-admission386/summary.json`;
+  prior `v02-packaging-canonical7ec-reviewed-components.json` and
+  `v02-packaging-readiness-f50-reviewed-components.json` failures remain retained.
 - `v02-correctness-canonical-7ec-results.json`,
-  `v02-canonical7ec-qwen3-default-qa.json`,
-  `v02-canonical7ec-qwen3-off-qa.json`,
-  `v02-canonical7ec-qwen3-off-strict-number.json` and
-  `v02-qwen3-canonical7ec-llama-oracle.json`: prefix, embedding and separated
-  Qwen3 native/HTTP/oracle outcomes.
-- `v02-mtp-canonical7ec-matrix-report.json` and
-  `v02-mtp-sampling7ec-08b-c1/summary.json`: greedy matrix and retained
-  stochastic stop/punctuation failures.
-- `v02-canonical7ec-e2b-c1-qa.json` and
-  `v02-canonical7ec-e2b-c4-qa.json`: c=1 quality and c=4 isolation failure.
-- `v02-packaging-canonical7ec-reviewed-components.json` and
-  `v02-readiness-evidence.json`: reviewed package failures and the separate
-  Go-only fix boundary. Local `densecore-container-smoke.oBcKiV/drain.json`
-  records the actual f50 readiness/grace successes and 149 admission-status
-  failures. An older component summary's drain “pass” is superseded
-  by the reviewed full-lifecycle failure.
-
-Archive raw results with their identities before publishing claims. Public
-reproduction entry points are the relative script/document links above, not
-local evidence paths. AUTO collection initially accepts only proven single-node,
-full-online-affinity Linux execution; partial cpusets, unknown runtime conditions
-and unverified dependency/allocator overrides choose NONE. Ordinary resource-aware
-serving is independent of that conservative automatic-qualification restriction.
+  `v02-mtp-canonical7ec-matrix-report.json`,
+  `v02-canonical7ec-qwen3-off-strict-number.json`,
+  `v02-cloud-current-readonly-summary.json`.

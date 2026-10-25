@@ -12,30 +12,39 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### v0.2 candidates (qualification in progress)
 
 - Add common Linux resource budgeting, context-preserving automatic concurrency,
-  versioned initialization/runtime diagnostics and embedding pooling AUTO.
-- Isolate request RNG; retain prefix snapshot/KV ownership through restoration;
-  terminate failed worker requests and fix native thread-pool generation races.
-- Add NextN loading, batched MTP target verification, suffix/SSM recovery and
-  bounded speculative service. Automatic qualification profiles remain empty.
-  Canonical 0.8B/2B K2 c1/c4 greedy checks passed; real stochastic HTTP stop
-  handling and automatic speed qualification remain incomplete.
-- Make non-F32 prefill attention consume actual stored KV precision, matching
-  cached history. Canonical Qwen3 cold/warm parity passed; earlier binary quality
-  results do not automatically carry across this numerical change.
-- Add Gemma native float-projection and GPT-OSS native packed-expert/Harmony
-  candidates. Gemma E2B c1 long/repeat checks passed, while c4 isolation fails;
-  E4B and actual GPT-OSS inference remain unqualified.
-- Verify model downloads and cached bytes before publication, and add native
-  image-profile, limited-pod, drain and reproducible CPU comparison gates.
-  Canonical image components passed 4 GiB serving, 1 GiB explicit rejection and
-  kind checksum checks; strict Count and full active drain failed. A separate
-  A separate Go-only image withdrew readiness and completed its active stream,
-  but new requests returned 500 instead of required 503; full drain still fails
-  and repeat container/kind validation awaits the typed admission fix.
-- Revalidate pinned 0.8B/2B prefix restoration/eviction and embedding AUTO/LAST
-  (12 bitwise comparisons). Canonical native tests passed 1263 with 14 existing
-  skips; ASAN/LSan passed 600 with 9 existing skips and zero reports. Real-model
-  failures still block release readiness; no performance/default promotion.
+  versioned diagnostics and embedding pooling AUTO. Actual integrated `143a2ad`
+  c8 resource/admission/cancellation checks pass, but greedy EOS parity fails,
+  including cache-OFF and fixed-thread-policy controls. No concurrency promotion.
+- Isolate request RNG, retain prefix snapshot/KV ownership through restoration,
+  terminate failed workers and order terminal publication. Native-backed Python
+  completion counts/finish metadata and native-request-ID cancellation passed
+  12 real generation/lifecycle cases plus three native-token controls on
+  integrated `143a2ad`. Prompt counts remain client estimates.
+- Add NextN loading, batched MTP verification and suffix/SSM recovery. Historical
+  `7ecaf86` 0.8B/2B K2 c1/c4 greedy checks passed. Private `5ad54a5` literal-stop
+  probes show zero leaks/32 probes and 27 actual string-stop finishes, while all
+  four stochastic profile quality gates still fail (6/160 HTTP requests).
+  Population-distribution, speed and automatic qualification remain absent;
+  automatic profiles stay empty.
+- Make non-F32 prefill attention consume stored KV precision. Historical Qwen3
+  cold/warm parity and pinned 0.8B/2B prefix restoration/eviction checks passed;
+  those results do not automatically carry over later numerical changes.
+- Add Gemma per-request attention/Q4 KV and GPT-OSS packed-expert/Harmony
+  candidates. Private Gemma E2B c4 parity is 6/8, with rank-2 failures even with cache
+  OFF; paired projection diagnosis is incomplete. E4B canonical/mixed and actual
+  GPT-OSS inference remain unqualified.
+- Verify model downloads/cached bytes and add native image-profile, limited-pod
+  and reproducible CPU gates. Separate Go-only `386b800` portable amd64 actual
+  container/kind strict drain observed readiness 503, admission 503 and native active=1
+  during accepted work, bounded stream completion and cleanup. Strict Count
+  still fails. Current integrated core image is untested; original successful
+  init-log capture has syntax checks only, awaiting final kind validation.
+- Integrated `143a2ad` native: 1312 run, 1298 passed, the same 14 skips, zero
+  failures/disabled tests; Go all-package and three repeated race runs passed.
+  Python SDK: 164 passed/27 existing optional skips; benchmark stdlib tests: 61 passed. Scoped ASAN/LSan on `3ed5428`:
+  662 run, 653 passed, the same 9 skips, zero reports; later diagnostic ownership
+  changes are outside that sanitizer run. No final-release, model-support or
+  performance/default promotion follows from these checks.
 
 See [v0.2 release gates](docs/V0_2_RELEASE_GATES.md) for incomplete checks;
 these entries are not a released model-support or performance announcement.
