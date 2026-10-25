@@ -1455,6 +1455,7 @@ using RequestPriorityComparator = FairQueueComparator;
  * Manages a single loaded model with its KV cache and metadata.
  */
 struct ModelEntry {
+    KVCacheConfig kv_config{}; // Effective context/concurrency and one initialization memory plan.
     std::string model_id;
     std::string model_path;
 

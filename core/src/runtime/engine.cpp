@@ -130,8 +130,9 @@ namespace fs = std::filesystem;
 
 std::unique_ptr<ModelEntry> MakeModelEntry(std::string model_id, std::string model_path,
                                            std::unique_ptr<TransformerModel> model,
-                                           std::unique_ptr<PagedKVCache> kv_cache) {
+                                           std::unique_ptr<PagedKVCache> kv_cache, const KVCacheConfig& kv_config) {
     auto entry = std::make_unique<ModelEntry>();
+    entry->kv_config = kv_config;
     entry->model_id = std::move(model_id);
     entry->model_path = std::move(model_path);
     entry->model = std::move(model);
@@ -644,7 +645,7 @@ bool LoadOptionalDraftModel(EngineState* state, const std::string& main_model_pa
     }
 
     auto draft_entry = MakeModelEntry("draft", draft_model_path, std::move(draft_model_owner),
-                                      std::unique_ptr<PagedKVCache>(draft_cache));
+                                      std::unique_ptr<PagedKVCache>(draft_cache), draft_kv_config);
 
     state->models["draft"] = std::move(draft_entry);
     state->draft_model_id = "draft";
@@ -909,7 +910,7 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
         return nullptr;
     }
     auto entry = MakeModelEntry("default", paths.model_path, std::move(model_owner),
-                                std::unique_ptr<PagedKVCache>(cache));
+                                std::unique_ptr<PagedKVCache>(cache), kv_config);
     state->models["default"] = std::move(entry);
     state->default_model_id = "default";
 
@@ -1117,7 +1118,7 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
 
         // Create model entry
         auto entry = MakeModelEntry("default", canonical_model_path, std::move(model_owner),
-                                    std::unique_ptr<PagedKVCache>(cache));
+                                    std::unique_ptr<PagedKVCache>(cache), kv_config);
         state->models["default"] = std::move(entry);
         state->default_model_id = "default";
         if (!LoadOptionalDraftModel(state.get(), canonical_model_path, canonical_draft_model_path, cache_type,
@@ -1674,7 +1675,7 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
 
         // Create model entry with unique_ptr ownership
         auto entry = MakeModelEntry(model_id, canonical_model_path, std::move(model_owner),
-                                    std::unique_ptr<PagedKVCache>(cache));
+                                    std::unique_ptr<PagedKVCache>(cache), kv_config);
 
         // Add to pool
         {
