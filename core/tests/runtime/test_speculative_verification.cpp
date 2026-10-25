@@ -905,7 +905,10 @@ TEST(MtpJsonCompletion, EveryClosingRowAcceptRejectAndBonusKeepsExactTargetBound
     for (int maximum = 1; maximum <= 3; ++maximum) for (int closing = 0; closing <= maximum; ++closing)
     for (bool rejected : {false, true}) for (float temperature : {0.f, .7f}) {
         if (closing == maximum && rejected) continue; // Bonus has no draft acceptance decision.
-        SCOPED_TRACE(maximum); SCOPED_TRACE(closing); SCOPED_TRACE(rejected); SCOPED_TRACE(temperature);
+        SCOPED_TRACE(maximum);
+        SCOPED_TRACE(closing);
+        SCOPED_TRACE(rejected);
+        SCOPED_TRACE(temperature);
         const auto exercise = [&]() {
             auto source = MakeTinyNextNSource();
             source->vocab_tokens = source->stream_token_pieces = {"1", "}"};
