@@ -1111,8 +1111,8 @@ TEST(Qwen3EmbeddingGraphTest, SplitHalfRotaryMatchesCausalAttentionReference) {
 // attention/FFN matrices. Exercise both decode and multi-column prefill, with
 // padded row strides, against the represented weights (not unrounded inputs).
 TEST(Gemma4FallbackDecodeTest, NativeFloatProjectionMatchesRepresentedWeightsForEveryColumn) {
-    std::unique_ptr<InferenceWorkContext, void (*)(InferenceWorkContext*)> work_ctx(
-        CreateInferenceWorkContext(), DestroyInferenceWorkContext);
+    std::unique_ptr<InferenceWorkContext, void (*)(InferenceWorkContext*)> work_ctx(CreateInferenceWorkContext(),
+                                                                                    DestroyInferenceWorkContext);
     ASSERT_NE(work_ctx, nullptr);
     struct RestoreContext {
         InferenceWorkContext* previous = GetCurrentWorkContext();
@@ -1120,62 +1120,67 @@ TEST(Gemma4FallbackDecodeTest, NativeFloatProjectionMatchesRepresentedWeightsFor
     } restore;
     SetCurrentWorkContext(work_ctx.get());
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
-        for (int m : {1, 4, 25}) {
-            SCOPED_TRACE(static_cast<int>(type));
-            SCOPED_TRACE(m);
-            ggml_init_params params{4 * 1024 * 1024, nullptr, false};
-            std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
-            ASSERT_NE(ctx, nullptr);
-            constexpr int k = 33;
-            constexpr int n = 7;
-            ggml_tensor* storage = ggml_new_tensor_2d(ctx.get(), type, k + 3, n);
-            ggml_tensor* weight = ggml_view_2d(ctx.get(), storage, k, n, storage->nb[1], 0);
-            ggml_set_name(weight, "per_layer_model_proj.weight");
-            ggml_tensor* input_storage = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k + 5, m);
-            ggml_tensor* input = ggml_view_2d(ctx.get(), input_storage, k, m, input_storage->nb[1], sizeof(float));
-            std::vector<float> represented(n * k);
-            for (int row = 0; row < n; ++row) {
-                char* data = static_cast<char*>(weight->data) + row * weight->nb[1];
-                for (int col = 0; col < k; ++col) {
-                    const float value = std::sin(static_cast<float>(row * k + col) * 0.071f) * 0.3f;
-                    float rounded = value;
-                    if (type == GGML_TYPE_F16) {
-                        const auto half = ggml_fp32_to_fp16(value);
-                        std::memcpy(data + col * sizeof(half), &half, sizeof(half));
-                        rounded = ggml_fp16_to_fp32(half);
-                    } else if (type == GGML_TYPE_BF16) {
-                        const auto half = ggml_fp32_to_bf16(value);
-                        std::memcpy(data + col * sizeof(half), &half, sizeof(half));
-                        rounded = ggml_bf16_to_fp32(half);
-                    } else {
-                        std::memcpy(data + col * sizeof(float), &value, sizeof(float));
-                    }
-                    represented[row * k + col] = rounded;
-                }
-            }
-            for (int col = 0; col < m; ++col) {
-                float* values = reinterpret_cast<float*>(static_cast<char*>(input->data) + col * input->nb[1]);
-                for (int j = 0; j < k; ++j) values[j] = std::cos(static_cast<float>(col + j) * 0.17f);
-            }
-            TransformerModel model{};
-            model.variant = ModelVariant::GEMMA4;
-            model.arch_flags.is_gemma4 = true;
-            ggml_tensor* result = densecore::testing::SmartMulMatWithPhaseTest(
-                ctx.get(), weight, input, &model, static_cast<int>(m == 1 ? InferenceExecutionPhase::Decode : InferenceExecutionPhase::Prefill));
-            ASSERT_NE(result, nullptr);
-            EXPECT_EQ(result->op, GGML_OP_CUSTOM);
-            ASSERT_EQ(result->ne[0], n);
-            ASSERT_EQ(result->ne[1], m);
-            ggml_cgraph* graph = ggml_new_graph(ctx.get());
-            ggml_build_forward_expand(graph, result);
-            ASSERT_EQ(ggml_graph_compute_with_ctx(ctx.get(), graph, 4), GGML_STATUS_SUCCESS);
-            const float* actual = static_cast<const float*>(result->data);
-            for (int col = 0; col < m; ++col) {
-                const float* values = reinterpret_cast<const float*>(static_cast<const char*>(input->data) + col * input->nb[1]);
+        for (int k : {33, 1536, 2560}) {
+            for (int m : {1, 4, 25}) {
+                SCOPED_TRACE(k);
+                SCOPED_TRACE(static_cast<int>(type));
+                SCOPED_TRACE(m);
+                ggml_init_params params{4 * 1024 * 1024, nullptr, false};
+                std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+                ASSERT_NE(ctx, nullptr);
+                constexpr int n = 7;
+                ggml_tensor* storage = ggml_new_tensor_2d(ctx.get(), type, k + 3, n);
+                ggml_tensor* weight = ggml_view_2d(ctx.get(), storage, k, n, storage->nb[1], 0);
+                ggml_set_name(weight, "per_layer_model_proj.weight");
+                ggml_tensor* input_storage = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k + 5, m);
+                ggml_tensor* input = ggml_view_2d(ctx.get(), input_storage, k, m, input_storage->nb[1], sizeof(float));
+                std::vector<float> represented(n * k);
                 for (int row = 0; row < n; ++row) {
-                    double reference = 0;
-                    for (int j = 0; j < k; ++j) reference += static_cast<double>(values[j]) * represented[row * k + j];
-                    EXPECT_NEAR(actual[col * n + row], reference, 2e-6);
+                    char* data = static_cast<char*>(weight->data) + row * weight->nb[1];
+                    for (int col = 0; col < k; ++col) {
+                        const float value = std::sin(static_cast<float>(row * k + col) * 0.071f) * 0.3f;
+                        float rounded = value;
+                        if (type == GGML_TYPE_F16) {
+                            const auto half = ggml_fp32_to_fp16(value);
+                            std::memcpy(data + col * sizeof(half), &half, sizeof(half));
+                            rounded = ggml_fp16_to_fp32(half);
+                        } else if (type == GGML_TYPE_BF16) {
+                            const auto half = ggml_fp32_to_bf16(value);
+                            std::memcpy(data + col * sizeof(half), &half, sizeof(half));
+                            rounded = ggml_bf16_to_fp32(half);
+                        } else {
+                            std::memcpy(data + col * sizeof(float), &value, sizeof(float));
+                        }
+                        represented[row * k + col] = rounded;
+                    }
+                }
+                for (int col = 0; col < m; ++col) {
+                    float* values = reinterpret_cast<float*>(static_cast<char*>(input->data) + col * input->nb[1]);
+                    for (int j = 0; j < k; ++j) values[j] = std::cos(static_cast<float>(col + j) * 0.17f);
+                }
+                TransformerModel model{};
+                model.variant = ModelVariant::GEMMA4;
+                model.arch_flags.is_gemma4 = true;
+                ggml_tensor* result = densecore::testing::SmartMulMatWithPhaseTest(
+                    ctx.get(), weight, input, &model,
+                    static_cast<int>(m == 1 ? InferenceExecutionPhase::Decode : InferenceExecutionPhase::Prefill));
+                ASSERT_NE(result, nullptr);
+                EXPECT_EQ(result->op, GGML_OP_CUSTOM);
+                ASSERT_EQ(result->ne[0], n);
+                ASSERT_EQ(result->ne[1], m);
+                ggml_cgraph* graph = ggml_new_graph(ctx.get());
+                ggml_build_forward_expand(graph, result);
+                ASSERT_EQ(ggml_graph_compute_with_ctx(ctx.get(), graph, 4), GGML_STATUS_SUCCESS);
+                const float* actual = static_cast<const float*>(result->data);
+                for (int col = 0; col < m; ++col) {
+                    const float* values =
+                        reinterpret_cast<const float*>(static_cast<const char*>(input->data) + col * input->nb[1]);
+                    for (int row = 0; row < n; ++row) {
+                        double reference = 0;
+                        for (int j = 0; j < k; ++j)
+                            reference += static_cast<double>(values[j]) * represented[row * k + j];
+                        EXPECT_NEAR(actual[col * n + row], reference, 2e-6 * std::max(1.0, std::abs(reference)));
+                    }
                 }
             }
         }
