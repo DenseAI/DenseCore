@@ -168,6 +168,11 @@ def sample(config, case, threads, cpus, out):
                             result['dispatch_policy_error'] = str(error)
                             break
                         time.sleep(.05)
+            result['comparison_qualified'] = bool(result['quality_pass'] and
+                (case == 'llama' or result.get('dispatch_policy_proof', {}).get('verified')))
+            if not result['comparison_qualified']:
+                result['unqualified_observed_aggregate_output_tps'] = result['aggregate_completed_output_tps']
+                result['aggregate_completed_output_tps'] = None
             out.write_text(json.dumps(result, indent=2, ensure_ascii=False) + '\n')
             if not result['quality_pass']: raise RuntimeError(f'quality gate failed; raw sample: {out}')
             if result.get('dispatch_policy_error'):
