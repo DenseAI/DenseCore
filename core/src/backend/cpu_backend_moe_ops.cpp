@@ -1,3 +1,4 @@
+#include "densecore/runtime/resource_budget.h"
 #include "backend/cpu_backend_internal.h"
 #include "backend/cpu_moe_execution.h"
 #include "backend/cpu_backend_moe_forward_plan.h"
