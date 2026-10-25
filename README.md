@@ -1,6 +1,6 @@
 # DenseCore
 
-**Serve 35B MoE models on plain CPUs. First token up to 39% sooner than llama.cpp.**
+**CPU-first GGUF serving for personal PCs, CPU pods and large MoE models.**
 
 A CPU-first LLM inference server: native C++ runtime, Go API server,
 OpenAI-compatible endpoints. No GPU.
@@ -10,6 +10,9 @@ OpenAI-compatible endpoints. No GPU.
 [![Developer preview](https://img.shields.io/badge/status-developer%20preview-orange)](docs/RELEASE.md)
 
 ## Performance
+
+The following native-build results are historical engineering evidence from
+2026-09-13. They do not qualify the current checkout or portable image.
 
 Qwen3.6-35B-A3B Q4_K_M · 16 vCPU · real `/v1/chat/completions` requests ·
 DenseCore vs llama.cpp on the same host
@@ -21,9 +24,11 @@ DenseCore vs llama.cpp on the same host
 | C4 · Intel Xeon (x86) | 1 | **2.90 s** vs 3.62 s (−20%) | **13.4** vs 13.0 (+3%) |
 | C4 · Intel Xeon (x86) | 4 | **8.06 s** vs 13.21 s (−39%) | 20.2 vs **20.7** (−2%) |
 
-DenseCore answers first in every cell and wins single-stream throughput;
-llama.cpp still leads batch throughput at four concurrent requests. Both engines
-passed the same output-quality suite. Native builds, measured 2026-09-13.
+In these measurements DenseCore had lower TTFT; prefill scheduling contributes
+to that result. It does not establish a full-request completion-time advantage.
+llama.cpp led aggregate output throughput at four concurrent requests. Both engines
+passed the recorded output-quality suite; a new build needs fresh quality and
+performance qualification.
 [Method and limits →](docs/BENCHMARKS.md)
 
 ## Quick start
@@ -53,7 +58,7 @@ git clone --recurse-submodules https://github.com/DenseAI/DenseCore.git && cd De
 make server && mkdir -p models
 
 curl -fL -C - -o models/Qwen3.6-35B-A3B-Q4_K_M.gguf \
-  https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-Q4_K_M.gguf
+  https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/resolve/7878dc9a905c7c9379e5e8d6a1aa9affdd6839c5/Qwen3.6-35B-A3B-Q4_K_M.gguf
 echo '671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7  models/Qwen3.6-35B-A3B-Q4_K_M.gguf' | sha256sum -c -
 
 ./bin/densecore-server serve --model models/Qwen3.6-35B-A3B-Q4_K_M.gguf --threads 16
@@ -61,7 +66,9 @@ echo '671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7  models/Q
 
 The GGUF is about 20 GB; plan for more RAM than that. Source builds need a C++
 toolchain, CMake and Go 1.25.13+. For interactive chat with a small default
-model, run `./bin/densecore-server run`.
+model, run `./bin/densecore-server run`. It uses the same pinned Qwen3.5-0.8B
+artifact as the quick start and verifies cached/downloaded bytes before serving.
+See the [model catalog](docs/MODEL_CATALOG.md) and [limited CPU pod guide](docs/KUBERNETES.md).
 
 ## What you get
 

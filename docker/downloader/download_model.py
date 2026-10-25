@@ -9,7 +9,11 @@ This script handles downloading models from Hugging Face Hub with:
 - Graceful error handling with clear exit codes
 """
 
+import hashlib
 import os
+import re
+import shutil
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -40,6 +44,7 @@ def download_with_retry(
     filename: str,
     local_dir: Path,
     token: Optional[str],
+    revision: str,
 ) -> Path:
     """
     Download a model file with exponential backoff retry.
@@ -78,6 +83,7 @@ def download_with_retry(
                 filename=filename,
                 local_dir=str(local_dir),
                 token=token,
+                revision=revision,
             )
 
             log("info", f"Download successful: {path}")
@@ -117,66 +123,79 @@ def download_with_retry(
     ) from last_exception
 
 
+DEFAULT_REPO = "lmstudio-community/Qwen3.5-0.8B-GGUF"
+DEFAULT_FILE = "Qwen3.5-0.8B-Q4_K_M.gguf"
+DEFAULT_REVISION = "7925ccdc665d4efdb1034791e6b553e11128e6f8"
+DEFAULT_SHA256 = "f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec"
+
+
+def verify_sha256(path: Path, expected: str) -> None:
+    with path.open("rb") as handle:
+        actual = hashlib.file_digest(handle, "sha256").hexdigest()
+    if actual != expected:
+        raise RuntimeError(f"SHA-256 mismatch for {path.name}: expected {expected}, got {actual}")
+
+
 def create_symlink(source: Path, target: Path) -> None:
-    """Create a symlink, removing existing if necessary."""
-    if target.exists() or target.is_symlink():
-        target.unlink()
-    target.symlink_to(source)
-    log("info", f"Created symlink: {target} -> {source}")
+    """Publish a verified model with an atomic alias replacement."""
+    if source == target:
+        return
+    with tempfile.TemporaryDirectory(prefix=".publish-", dir=target.parent) as staging:
+        temporary = Path(staging) / "model-link"
+        temporary.symlink_to(source.resolve())
+        temporary.replace(target)
+    log("info", f"Published verified model: {target} -> {source}")
 
 
 def main() -> int:
-    """
-    Main entry point.
-
-    Returns:
-        0 on success, non-zero on failure
-    """
-    # Read configuration from environment
-    model_repo = get_env_or_default("MODEL_REPO", "Qwen/Qwen2.5-0.5B-Instruct-GGUF")
-    model_file = get_env_or_default("MODEL_FILE", "qwen2.5-0.5b-instruct-q4_k_m.gguf")
-    hf_token = os.environ.get("HF_TOKEN", "").strip() or None
-
-    log("info", f"Configuration: repo={model_repo}, file={model_file}")
-
-    # Ensure models directory exists
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Check if model already exists (via symlink or direct file)
-    main_model_path = MODELS_DIR / MAIN_MODEL_NAME
-    model_file_path = MODELS_DIR / model_file
-
-    if main_model_path.exists():
-        log("info", f"Model already exists at {main_model_path}. Skipping download.")
-        return 0
-
-    if model_file_path.exists():
-        log("info", f"Model file exists at {model_file_path}. Creating symlink.")
-        create_symlink(model_file_path, main_model_path)
-        return 0
-
-    # Download the model
     try:
-        downloaded_path = download_with_retry(
-            repo_id=model_repo,
-            filename=model_file,
-            local_dir=MODELS_DIR,
-            token=hf_token,
-        )
-
-        # Create symlink to main_model.gguf if different
-        if downloaded_path.name != MAIN_MODEL_NAME:
-            create_symlink(downloaded_path, main_model_path)
-
-        log("info", "Model download complete!")
+        model_repo = get_env_or_default("MODEL_REPO", DEFAULT_REPO)
+        model_file = get_env_or_default("MODEL_FILE", DEFAULT_FILE)
+        is_default = (model_repo, model_file) == (DEFAULT_REPO, DEFAULT_FILE)
+        revision = get_env_or_default("MODEL_REVISION", DEFAULT_REVISION if is_default else "")
+        expected = get_env_or_default("MODEL_SHA256", DEFAULT_SHA256 if is_default else "").lower()
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+            raise RuntimeError("MODEL_REVISION must be a full immutable 40-character commit hash")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise RuntimeError("MODEL_SHA256 must be the expected 64-character SHA-256")
+        filename = Path(model_file)
+        if filename.is_absolute() or ".." in filename.parts or model_file in ("", "."):
+            raise RuntimeError("MODEL_FILE must be a relative repository filename without '..'")
+        hf_token = os.environ.get("HF_TOKEN", "").strip() or None
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        main_model_path = MODELS_DIR / MAIN_MODEL_NAME
+        model_file_path = MODELS_DIR / ".artifacts" / expected / filename
+        legacy_path = MODELS_DIR / filename
+        if not model_file_path.resolve().is_relative_to(MODELS_DIR.resolve()):
+            raise RuntimeError("Cached model path escapes the model directory")
+        log("info", f"Configuration: repo={model_repo}, file={model_file}, revision={revision}, sha256={expected}")
+        # An existing alias is not evidence that the requested revision is cached.
+        # Hash the requested file on every init, including a shared PVC cache hit.
+        if model_file_path.exists():
+            verify_sha256(model_file_path, expected)
+        else:
+            with tempfile.TemporaryDirectory(prefix=".download-", dir=MODELS_DIR) as staging:
+                if legacy_path.exists():
+                    if not legacy_path.resolve().is_relative_to(MODELS_DIR.resolve()):
+                        raise RuntimeError("Cached model path escapes the model directory")
+                    # Preserve old paths used by other pods while migrating a legacy cache.
+                    verify_sha256(legacy_path, expected)
+                    downloaded_path = Path(staging) / "verified-legacy.gguf"
+                    shutil.copyfile(legacy_path, downloaded_path)
+                else:
+                    downloaded_path = download_with_retry(
+                        repo_id=model_repo, filename=model_file, local_dir=Path(staging),
+                        token=hf_token, revision=revision,
+                    )
+                verify_sha256(downloaded_path, expected)
+                model_file_path.parent.mkdir(parents=True, exist_ok=True)
+                downloaded_path.replace(model_file_path)
+        create_symlink(model_file_path, main_model_path)
+        log("info", "Model checksum verified; model path is ready")
         return 0
-
-    except RuntimeError as e:
-        log("error", f"Fatal error: {e}")
+    except Exception as error:
+        log("error", f"Model not published: {error}")
         return 1
-    except Exception as e:
-        log("error", f"Unexpected fatal error: {e}")
-        return 2
 
 
 if __name__ == "__main__":

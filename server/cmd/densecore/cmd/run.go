@@ -29,24 +29,30 @@ var runCmd = &cobra.Command{
 	Short: "Run a model with interactive chat",
 	Long:  `Run a model directly in your terminal with a beautiful chat interface.`,
 	Args:  cobra.MaximumNArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		modelName := "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+	RunE: func(cmd *cobra.Command, args []string) error {
+		modelName := defaultModelRepo
 		if len(args) > 0 {
 			modelName = args[0]
 		}
 
 		filename, _ := cmd.Flags().GetString("filename")
+		revision, _ := cmd.Flags().GetString("revision")
+		checksum, _ := cmd.Flags().GetString("sha256")
+		artifact, err := resolveModelArtifact(modelName, filename, revision, checksum)
+		if err != nil {
+			return err
+		}
 		port, _ := cmd.Flags().GetInt("port")
 		if port == 0 {
 			port = 8080
 		}
 
 		// Run the TUI program
-		p := tea.NewProgram(initialModel(modelName, filename, port), tea.WithAltScreen())
+		p := tea.NewProgram(initialModel(artifact, port), tea.WithAltScreen())
 		if _, err := p.Run(); err != nil {
-			fmt.Printf("Error: %v\n", err)
-			os.Exit(1)
+			return err
 		}
+		return nil
 	},
 }
 
@@ -139,6 +145,7 @@ type chatMessage struct {
 }
 
 type model struct {
+	artifact        modelArtifact
 	modelName       string
 	filename        string
 	port            int
@@ -171,10 +178,7 @@ type streamEvent struct {
 	err   error
 }
 
-func initialModel(modelName, filename string, port int) model {
-	if filename == "" {
-		filename = inferFilename(modelName)
-	}
+func initialModel(artifact modelArtifact, port int) model {
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
@@ -186,8 +190,9 @@ func initialModel(modelName, filename string, port int) model {
 	ti.Width = 60
 
 	return model{
-		modelName:    modelName,
-		filename:     filename,
+		artifact:     artifact,
+		modelName:    artifact.Repo,
+		filename:     artifact.Filename,
 		port:         port,
 		state:        stateChecking,
 		messages:     []chatMessage{},
@@ -198,22 +203,11 @@ func initialModel(modelName, filename string, port int) model {
 	}
 }
 
-func inferFilename(modelName string) string {
-	lowerName := strings.ToLower(modelName)
-	if strings.Contains(lowerName, "qwen") {
-		return "qwen2.5-0.5b-instruct-q4_k_m.gguf"
-	}
-	if strings.Contains(lowerName, "llama-2-7b") {
-		return "llama-2-7b-chat.Q4_K_M.gguf"
-	}
-	return "model.gguf"
-}
-
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		tea.WindowSize(),
 		m.spinner.Tick,
-		checkModelCmd(m.filename),
+		checkModelCmd(m.artifact),
 	)
 }
 
@@ -247,68 +241,67 @@ func closeQuietly(closer io.Closer) {
 // Commands
 // ============================================================================
 
-func checkModelCmd(filename string) tea.Cmd {
+func checkModelCmd(artifact modelArtifact) tea.Cmd {
 	return func() tea.Msg {
-		cacheDir := getModelCacheDir()
-		modelPath := filepath.Join(cacheDir, filename)
+		modelPath := artifact.cachePath(getModelCacheDir())
 		if _, err := os.Stat(modelPath); err == nil {
+			if err := verifyModelFile(modelPath, artifact.SHA256); err != nil {
+				return downloadErrorMsg{err: err}
+			}
 			return modelExistsMsg{path: modelPath}
 		}
 		return modelNotFoundMsg{}
 	}
 }
 
-// startDownloadCmd starts download in goroutine and sends events to channel
-func startDownloadCmd(modelName, filename string, sub chan tea.Msg) tea.Cmd {
+// Download into a temporary file; publish the cache path only after SHA verification.
+func startDownloadCmd(artifact modelArtifact, sub chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
 		go func() {
-			cacheDir := getModelCacheDir()
-			if err := os.MkdirAll(cacheDir, 0755); err != nil {
+			modelPath := artifact.cachePath(getModelCacheDir())
+			if err := os.MkdirAll(filepath.Dir(modelPath), 0755); err != nil {
 				sub <- downloadErrorMsg{err: err}
 				return
 			}
-
-			modelPath := filepath.Join(cacheDir, filename)
-			url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", modelName, filename)
-
-			resp, err := http.Get(url)
+			resp, err := (&http.Client{Timeout: 30 * time.Minute}).Get(artifact.downloadURL())
 			if err != nil {
 				sub <- downloadErrorMsg{err: err}
 				return
 			}
 			defer closeQuietly(resp.Body)
-
 			if resp.StatusCode != http.StatusOK {
 				sub <- downloadErrorMsg{err: fmt.Errorf("HTTP %d", resp.StatusCode)}
 				return
 			}
-
-			file, err := os.Create(modelPath)
+			file, err := os.CreateTemp(filepath.Dir(modelPath), ".download-*")
 			if err != nil {
 				sub <- downloadErrorMsg{err: err}
 				return
 			}
-
-			// ProgressReader sends updates through the channel
+			temporary := file.Name()
+			defer os.Remove(temporary)
 			pr := &ProgressReader{
-				reader:     resp.Body,
-				total:      resp.ContentLength,
-				lastUpdate: time.Now(),
-				onProgress: func(curr, total int64) {
-					sub <- downloadProgressMsg{downloaded: curr, total: total}
-				},
+				reader: resp.Body, total: resp.ContentLength, lastUpdate: time.Now(),
+				onProgress: func(curr, total int64) { sub <- downloadProgressMsg{downloaded: curr, total: total} },
 			}
-
-			if _, err := io.Copy(file, pr); err != nil {
-				closeQuietly(file)
+			_, copyErr := io.Copy(file, pr)
+			closeErr := file.Close()
+			if copyErr != nil {
+				sub <- downloadErrorMsg{err: copyErr}
+				return
+			}
+			if closeErr != nil {
+				sub <- downloadErrorMsg{err: closeErr}
+				return
+			}
+			if err := verifyModelFile(temporary, artifact.SHA256); err != nil {
 				sub <- downloadErrorMsg{err: err}
 				return
 			}
-			if err := file.Close(); err != nil {
+			if err := os.Rename(temporary, modelPath); err != nil {
 				sub <- downloadErrorMsg{err: err}
 				return
 			}
-
 			sub <- downloadCompleteMsg{path: modelPath}
 		}()
 		return nil
@@ -529,7 +522,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.progress = 0
 		// Start download + subscribe to channel
 		return m, tea.Batch(
-			startDownloadCmd(m.modelName, m.filename, m.downloadChan),
+			startDownloadCmd(m.artifact, m.downloadChan),
 			waitForDownloadMsg(m.downloadChan),
 		)
 
@@ -554,7 +547,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case portFoundMsg:
 		m.port = msg.port
-		modelPath := filepath.Join(getModelCacheDir(), m.filename)
+		modelPath := m.artifact.cachePath(getModelCacheDir())
 		return m, tea.Batch(m.spinner.Tick, startServerCmd(modelPath, m.port))
 
 	case serverReadyMsg:
@@ -713,6 +706,8 @@ func getModelCacheDir() string {
 
 func init() {
 	runCmd.Flags().StringP("filename", "f", "", "Specific GGUF filename to download")
+	runCmd.Flags().String("revision", "", "Immutable Hugging Face commit (required for custom models)")
+	runCmd.Flags().String("sha256", "", "Expected model SHA-256 (required for custom models)")
 	runCmd.Flags().IntP("port", "p", 8080, "Port for the local server")
 	rootCmd.AddCommand(runCmd)
 }
