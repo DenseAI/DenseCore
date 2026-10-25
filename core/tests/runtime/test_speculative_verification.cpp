@@ -29,7 +29,8 @@ struct ReferenceSessionTestAccess {
         session.pending_.clear();
         for (int row = 0; row < maximum; ++row) {
             const int token = row == closing_row && !rejected ? 1 : 0;
-            Distribution distribution(2, 0); distribution[token] = 1;
+            Distribution distribution(2, 0);
+            distribution[token] = 1;
             session.pending_.push_back({token, std::move(distribution)});
         }
     }
@@ -891,8 +892,8 @@ TEST(MtpJsonCompletion, CompletedSelectionNeverForwardsOrDrawsAnotherProposal) {
         std::atomic<bool> cancelled{false};
         // There is deliberately no target hidden anchor. Any ForwardHead call
         // would throw, so this proves completion is checked before that call.
-        EXPECT_NO_THROW(ReferenceSessionTestAccess::MakeClosingProposal(session, already_complete ? 0 : 1,
-                                                                        params, cancelled));
+        EXPECT_NO_THROW(
+            ReferenceSessionTestAccess::MakeClosingProposal(session, already_complete ? 0 : 1, params, cancelled));
         EXPECT_EQ(ReferenceSessionTestAccess::Rngs(session), before);
         EXPECT_EQ(session.Proposed(), 0u);
         EXPECT_EQ(ReferenceSessionTestAccess::HeadPast(session), 0);
@@ -901,107 +902,126 @@ TEST(MtpJsonCompletion, CompletedSelectionNeverForwardsOrDrawsAnotherProposal) {
     }
 }
 
-TEST(MtpJsonCompletion, EveryClosingRowAcceptRejectAndBonusKeepsExactTargetBoundary) {
-    for (int maximum = 1; maximum <= 3; ++maximum) for (int closing = 0; closing <= maximum; ++closing)
-    for (bool rejected : {false, true}) for (float temperature : {0.f, .7f}) {
-        if (closing == maximum && rejected) continue; // Bonus has no draft acceptance decision.
-        SCOPED_TRACE(maximum);
-        SCOPED_TRACE(closing);
-        SCOPED_TRACE(rejected);
-        SCOPED_TRACE(temperature);
-        const auto exercise = [&]() {
-            auto source = MakeTinyNextNSource();
-            source->vocab_tokens = source->stream_token_pieces = {"1", "}"};
-            ReferenceSession session(*source, 16, maximum, 1234, 1);
-            std::atomic<bool> cancelled{false};
-            const int prompt = 0;
-            const float initial_hidden[] = {3,4};
-            session.ObserveTarget(&prompt, initial_hidden, 2, 1, true);
-            ReferenceSessionTestAccess::BootstrapOnly(session, cancelled);
-            ReferenceSessionTestAccess::JsonProposals(session, maximum, closing, rejected);
-            const auto proposals = session.VerificationDraft(maximum);
-            ASSERT_EQ(proposals.size(), static_cast<size_t>(maximum));
-            GrammarConstraint grammar;
-            grammar.enabled = grammar.is_json_mode = true;
-            grammar.state = JSONState::IN_NUMBER;
-            grammar.brace_depth = 1; // Valid output prefix such as {"answer":1.
-            SamplingParams params;
-            params.temperature = temperature;
-            params.top_k = 1; params.top_p = 1;
-            params.grammar = &grammar; params.vocab = &source->vocab_tokens;
-            std::vector<int> history{0}; params.token_history = &history;
-            std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init({1024*1024,nullptr,false}), ggml_free);
-            ASSERT_NE(ctx, nullptr);
-            auto* logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 2, maximum+1);
-            for (int row = 0; row <= maximum; ++row) {
-                auto* values = reinterpret_cast<float*>(static_cast<char*>(logits->data) + row*logits->nb[1]);
-                if (row > closing) values[0] = values[1] = NAN; // Must never read a post-completion distribution.
-                else { const int selected = row == closing ? 1 : 0; values[selected] = 3; values[1-selected] = 1; }
-            }
-            std::mt19937 target(7), expected_target = target;
-            const auto before = ReferenceSessionTestAccess::Rngs(session);
-            auto expected_accept = before.second;
-            const int verified = std::min(closing+1, maximum);
-            if (temperature > 0) {
-                for (int row = 0; row < verified; ++row) (void)std::generate_canonical<double,53>(expected_accept);
-                if (rejected) (void)std::generate_canonical<double,53>(expected_target);
-            }
-            VerificationResult result;
-            ASSERT_NO_THROW(result = session.VerifyBatched(logits, 0, maximum, params, target));
-            std::vector<int> expected(closing, 0); expected.push_back(1);
-            EXPECT_EQ(result.tokens, expected);
-            EXPECT_EQ(result.accepted_draft_tokens, static_cast<size_t>(closing));
-            EXPECT_EQ(session.Verified(), static_cast<uint64_t>(verified));
-            EXPECT_EQ(session.Accepted(), static_cast<uint64_t>(closing + (closing < maximum && !rejected ? 1 : 0)));
-            EXPECT_EQ(session.Rejected(), rejected ? 1u : 0u);
-            EXPECT_EQ(target, expected_target);
-            EXPECT_EQ(ReferenceSessionTestAccess::Rngs(session).first, before.first);
-            EXPECT_EQ(ReferenceSessionTestAccess::Rngs(session).second, expected_accept);
-            std::vector<int> inputs{0}; inputs.insert(inputs.end(), proposals.begin(), proposals.end());
-            std::vector<float> hidden;
-            for (int row = 0; row <= maximum; ++row) hidden.insert(hidden.end(), {3,4});
-            const auto after_verify = ReferenceSessionTestAccess::Rngs(session);
-            ASSERT_NO_THROW(session.CompleteBatched(inputs.data(), hidden.data(), 2, result, params, nullptr, cancelled));
-            EXPECT_EQ(ReferenceSessionTestAccess::Rngs(session), after_verify);
-            EXPECT_EQ(target, expected_target);
-            EXPECT_EQ(ReferenceSessionTestAccess::HeadPast(session), session.TargetSeen());
-            EXPECT_TRUE(session.VerificationDraft(maximum).empty());
-            EXPECT_EQ(session.Proposed(), 0u);
-            EXPECT_EQ(grammar.state, JSONState::IN_NUMBER); // Only the worker consumes committed output grammar.
+void CheckJsonClosingBoundaryCase(int maximum, int closing, bool rejected, float temperature) {
+    SCOPED_TRACE(maximum);
+    SCOPED_TRACE(closing);
+    SCOPED_TRACE(rejected);
+    SCOPED_TRACE(temperature);
+    auto source = MakeTinyNextNSource();
+    source->vocab_tokens = source->stream_token_pieces = {"1", "}"};
+    ReferenceSession session(*source, 16, maximum, 1234, 1);
+    std::atomic<bool> cancelled{false};
+    const int prompt = 0;
+    const float initial_hidden[] = {3, 4};
+    session.ObserveTarget(&prompt, initial_hidden, 2, 1, true);
+    ReferenceSessionTestAccess::BootstrapOnly(session, cancelled);
+    ReferenceSessionTestAccess::JsonProposals(session, maximum, closing, rejected);
+    const auto proposals = session.VerificationDraft(maximum);
+    ASSERT_EQ(proposals.size(), static_cast<size_t>(maximum));
+    GrammarConstraint grammar;
+    grammar.enabled = grammar.is_json_mode = true;
+    grammar.state = JSONState::IN_NUMBER;
+    grammar.brace_depth = 1;  // Valid output prefix such as {"answer":1.
+    SamplingParams params;
+    params.temperature = temperature;
+    params.top_k = 1;
+    params.top_p = 1;
+    params.grammar = &grammar;
+    params.vocab = &source->vocab_tokens;
+    std::vector<int> history{0};
+    params.token_history = &history;
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init({1024 * 1024, nullptr, false}), ggml_free);
+    ASSERT_NE(ctx, nullptr);
+    auto* logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 2, maximum + 1);
+    for (int row = 0; row <= maximum; ++row) {
+        auto* values = reinterpret_cast<float*>(static_cast<char*>(logits->data) + row * logits->nb[1]);
+        if (row > closing)
+            values[0] = values[1] = NAN;  // Must never read a post-completion distribution.
+        else {
+            const int selected = row == closing ? 1 : 0;
+            values[selected] = 3;
+            values[1 - selected] = 1;
+        }
+    }
+    std::mt19937 target(7), expected_target = target;
+    const auto before = ReferenceSessionTestAccess::Rngs(session);
+    auto expected_accept = before.second;
+    const int verified = std::min(closing + 1, maximum);
+    if (temperature > 0) {
+        for (int row = 0; row < verified; ++row) (void)std::generate_canonical<double, 53>(expected_accept);
+        if (rejected) (void)std::generate_canonical<double, 53>(expected_target);
+    }
+    VerificationResult result;
+    ASSERT_NO_THROW(result = session.VerifyBatched(logits, 0, maximum, params, target));
+    std::vector<int> expected(closing, 0);
+    expected.push_back(1);
+    EXPECT_EQ(result.tokens, expected);
+    EXPECT_EQ(result.accepted_draft_tokens, static_cast<size_t>(closing));
+    EXPECT_EQ(session.Verified(), static_cast<uint64_t>(verified));
+    EXPECT_EQ(session.Accepted(), static_cast<uint64_t>(closing + (closing < maximum && !rejected ? 1 : 0)));
+    EXPECT_EQ(session.Rejected(), rejected ? 1u : 0u);
+    EXPECT_EQ(target, expected_target);
+    EXPECT_EQ(ReferenceSessionTestAccess::Rngs(session).first, before.first);
+    EXPECT_EQ(ReferenceSessionTestAccess::Rngs(session).second, expected_accept);
+    std::vector<int> inputs{0};
+    inputs.insert(inputs.end(), proposals.begin(), proposals.end());
+    std::vector<float> hidden;
+    for (int row = 0; row <= maximum; ++row) hidden.insert(hidden.end(), {3, 4});
+    const auto after_verify = ReferenceSessionTestAccess::Rngs(session);
+    ASSERT_NO_THROW(session.CompleteBatched(inputs.data(), hidden.data(), 2, result, params, nullptr, cancelled));
+    EXPECT_EQ(ReferenceSessionTestAccess::Rngs(session), after_verify);
+    EXPECT_EQ(target, expected_target);
+    EXPECT_EQ(ReferenceSessionTestAccess::HeadPast(session), session.TargetSeen());
+    EXPECT_TRUE(session.VerificationDraft(maximum).empty());
+    EXPECT_EQ(session.Proposed(), 0u);
+    EXPECT_EQ(grammar.state,
+              JSONState::IN_NUMBER);  // Only the worker consumes committed output grammar.
 
-            BlockManager manager(32, BLOCK_SIZE);
-            densecore::SchedulerConfig config;
-            config.max_num_seqs = config.max_prefill_seqs = 1; config.max_num_batched_tokens = 64;
-            densecore::Scheduler scheduler(&manager, config);
-            const int sequence = scheduler.AddRequest(77, 15, 64);
-            const auto prompt_schedule = scheduler.Schedule();
-            ASSERT_EQ(prompt_schedule.new_block_allocations.size(), 1u);
-            auto blocks = prompt_schedule.new_block_allocations[0].second;
-            scheduler.OnPrefillChunkComplete(sequence, 15, true);
-            ASSERT_TRUE(scheduler.ReserveSpeculativeSlots(sequence, 15+maximum+1, &blocks));
-            scheduler.OnDecodeStepComplete(sequence, maximum+1);
-            int n_past = 15+maximum+1;
-            for (size_t block = 0; block < blocks.size(); ++block)
-                manager.SetFilledSlots(blocks[block], std::clamp(n_past-static_cast<int>(block)*BLOCK_SIZE,0,BLOCK_SIZE));
-            RecurrentCheckpoints::States states(1);
-            RecurrentCheckpoints checkpoints(maximum);
-            for (int row = 0; row <= maximum; ++row) {
-                states[0].conv_state = {static_cast<float>(10+row)};
-                states[0].ssm_state = {static_cast<float>(20+row)};
-                checkpoints.Capture(row, states);
+    BlockManager manager(32, BLOCK_SIZE);
+    densecore::SchedulerConfig config;
+    config.max_num_seqs = config.max_prefill_seqs = 1;
+    config.max_num_batched_tokens = 64;
+    densecore::Scheduler scheduler(&manager, config);
+    const int sequence = scheduler.AddRequest(77, 15, 64);
+    const auto prompt_schedule = scheduler.Schedule();
+    ASSERT_EQ(prompt_schedule.new_block_allocations.size(), 1u);
+    auto blocks = prompt_schedule.new_block_allocations[0].second;
+    scheduler.OnPrefillChunkComplete(sequence, 15, true);
+    ASSERT_TRUE(scheduler.ReserveSpeculativeSlots(sequence, 15 + maximum + 1, &blocks));
+    scheduler.OnDecodeStepComplete(sequence, maximum + 1);
+    int n_past = 15 + maximum + 1;
+    for (size_t block = 0; block < blocks.size(); ++block)
+        manager.SetFilledSlots(blocks[block], std::clamp(n_past - static_cast<int>(block) * BLOCK_SIZE, 0, BLOCK_SIZE));
+    RecurrentCheckpoints::States states(1);
+    RecurrentCheckpoints checkpoints(maximum);
+    for (int row = 0; row <= maximum; ++row) {
+        states[0].conv_state = {static_cast<float>(10 + row)};
+        states[0].ssm_state = {static_cast<float>(20 + row)};
+        checkpoints.Capture(row, states);
+    }
+    const int keep = 15 + closing + 1;
+    ASSERT_TRUE(RestoreAcceptanceBoundary(scheduler, sequence, keep, blocks, n_past, checkpoints,
+                                          result.accepted_draft_tokens, states));
+    EXPECT_EQ(n_past, keep);
+    EXPECT_EQ(manager.GetFilledSlots(blocks.back()), keep % BLOCK_SIZE ? keep % BLOCK_SIZE : BLOCK_SIZE);
+    EXPECT_EQ(states[0].conv_state[0], 10 + closing);
+    EXPECT_EQ(states[0].ssm_state[0], 20 + closing);
+    scheduler.RemoveRequest(sequence);
+    manager.Free(blocks);
+    EXPECT_EQ(manager.GetFreeBlockCount(), 32);
+}
+
+TEST(MtpJsonCompletion, EveryClosingRowAcceptRejectAndBonusKeepsExactTargetBoundary) {
+    for (int maximum = 1; maximum <= 3; ++maximum) {
+        for (int closing = 0; closing <= maximum; ++closing) {
+            for (bool rejected : {false, true}) {
+                if (closing == maximum && rejected) continue;  // Bonus has no draft acceptance decision.
+                for (float temperature : {0.f, .7f}) {
+                    CheckJsonClosingBoundaryCase(maximum, closing, rejected, temperature);
+                }
             }
-            const int keep = 15+closing+1;
-            ASSERT_TRUE(RestoreAcceptanceBoundary(scheduler, sequence, keep, blocks, n_past,
-                                                   checkpoints, result.accepted_draft_tokens, states));
-            EXPECT_EQ(n_past, keep);
-            EXPECT_EQ(manager.GetFilledSlots(blocks.back()), keep % BLOCK_SIZE ? keep % BLOCK_SIZE : BLOCK_SIZE);
-            EXPECT_EQ(states[0].conv_state[0], 10+closing);
-            EXPECT_EQ(states[0].ssm_state[0], 20+closing);
-            scheduler.RemoveRequest(sequence); manager.Free(blocks);
-            EXPECT_EQ(manager.GetFreeBlockCount(), 32);
-        };
-        exercise();
+        }
     }
 }
 
-} // namespace
+}  // namespace

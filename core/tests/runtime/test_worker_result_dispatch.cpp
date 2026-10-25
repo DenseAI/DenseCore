@@ -1995,58 +1995,81 @@ TEST(StopOutputIntegration, AdmissionReservesTerminalBeforeRequestPublicationAnd
 
 TEST(JsonCompletionCommit, OrdinaryGreedyClosingTokenUsesNormalOutputAndStopAtExactBudget) {
     const std::vector<std::string> vocab = {"{", "\"", "answer", ":", "42", "}", " "};
-    const std::vector<int> script = {0,1,2,1,3,4,5,6}; // Whitespace must not be sampled after closing token5.
-    for (bool direct : {false,true}) for (int callback_mode = 0; callback_mode < 3; ++callback_mode)
-    for (int maximum : {7,128}) {
-        EngineState engine; engine.status = EngineStatus::STOPPED;
-        engine.generation_completion_callback.store(StopCompletion);
-        StopOutputCapture capture;
-        Request req; req.Reset(); req.id = 123; req.json_mode = true; req.max_tokens = maximum;
-        req.grammar.enabled = req.grammar.is_json_mode = true;
-        InitGrammarConstraint(&req.grammar, vocab);
-        PrepareGenerationTerminalNode(&req, 0);
-        req.user_data = &capture;
-        if (callback_mode == 0) req.callback = StopLegacy;
-        else if (callback_mode == 1) req.callback_ex = StopEx;
-        else req.token_result_callback = StopStructured;
-        SamplingParams params; params.temperature = 0; params.top_k = 1; params.top_p = 1;
-        params.grammar = &req.grammar; params.vocab = &vocab;
-        std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init({16384,nullptr,false}), ggml_free);
-        ASSERT_NE(ctx, nullptr);
-        auto* logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, vocab.size(), 1);
-        std::mt19937 rng(11); const auto before = rng;
-        for (int desired : script) {
-            auto* values = static_cast<float*>(logits->data);
-            std::fill_n(values, vocab.size(), -5.f); values[desired] = 5;
-            const int token = SampleTokenWithRng(logits, 0, params, rng);
-            ASSERT_EQ(token, desired);
-            ++req.generated_count; ++engine.metrics.total_tokens_generated;
-            const auto& piece = vocab[token];
-            const bool complete = densecore::llm::sampling::AdvanceJsonGrammarAndCheckCompletion(&req.grammar, piece);
-            EmitRequestResult(&engine, &req, piece, token, false, false, direct);
-            if (ResolveCommittedTokenFinish(&req, false, complete)) {
-                EXPECT_TRUE(FinalizeSuccessfulGenerationRequest(&engine, &req, direct));
-                break;
+    const std::vector<int> script = {0, 1, 2, 1, 3, 4, 5, 6};  // Whitespace must not be sampled after closing token5.
+    for (bool direct : {false, true})
+        for (int callback_mode = 0; callback_mode < 3; ++callback_mode)
+            for (int maximum : {7, 128}) {
+                EngineState engine;
+                engine.status = EngineStatus::STOPPED;
+                engine.generation_completion_callback.store(StopCompletion);
+                StopOutputCapture capture;
+                Request req;
+                req.Reset();
+                req.id = 123;
+                req.json_mode = true;
+                req.max_tokens = maximum;
+                req.grammar.enabled = req.grammar.is_json_mode = true;
+                InitGrammarConstraint(&req.grammar, vocab);
+                PrepareGenerationTerminalNode(&req, 0);
+                req.user_data = &capture;
+                if (callback_mode == 0)
+                    req.callback = StopLegacy;
+                else if (callback_mode == 1)
+                    req.callback_ex = StopEx;
+                else
+                    req.token_result_callback = StopStructured;
+                SamplingParams params;
+                params.temperature = 0;
+                params.top_k = 1;
+                params.top_p = 1;
+                params.grammar = &req.grammar;
+                params.vocab = &vocab;
+                std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init({16384, nullptr, false}), ggml_free);
+                ASSERT_NE(ctx, nullptr);
+                auto* logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, vocab.size(), 1);
+                std::mt19937 rng(11);
+                const auto before = rng;
+                for (int desired : script) {
+                    auto* values = static_cast<float*>(logits->data);
+                    std::fill_n(values, vocab.size(), -5.f);
+                    values[desired] = 5;
+                    const int token = SampleTokenWithRng(logits, 0, params, rng);
+                    ASSERT_EQ(token, desired);
+                    ++req.generated_count;
+                    ++engine.metrics.total_tokens_generated;
+                    const auto& piece = vocab[token];
+                    const bool complete =
+                        densecore::llm::sampling::AdvanceJsonGrammarAndCheckCompletion(&req.grammar, piece);
+                    EmitRequestResult(&engine, &req, piece, token, false, false, direct);
+                    if (ResolveCommittedTokenFinish(&req, false, complete)) {
+                        EXPECT_TRUE(FinalizeSuccessfulGenerationRequest(&engine, &req, direct));
+                        break;
+                    }
+                }
+                if (!direct) {
+                    engine.result_producers_done.store(true);
+                    engine.result_cv.notify_all();
+                    CallbackLoop(&engine);
+                }
+                EXPECT_EQ(req.generated_count, 7);
+                EXPECT_EQ(engine.metrics.total_tokens_generated.load(), 7);
+                EXPECT_EQ(rng, before);
+                EXPECT_EQ(req.decode_finish_cause, DecodeFinishCause::GrammarComplete);
+                EXPECT_STREQ(DecodeFinishCauseName(req.decode_finish_cause), "grammar_complete");
+                EXPECT_EQ(capture.visible, "{\"answer\":42}");
+                if (callback_mode) EXPECT_EQ(capture.ids, (std::vector<int>{0, 1, 2, 1, 3, 4, 5}));
+                EXPECT_EQ(capture.generated, 7);
+                EXPECT_EQ(capture.reason, DENSECORE_GENERATION_STOP);
+                EXPECT_EQ(capture.terminals, 1);
+                EXPECT_EQ(capture.completions, 1);
+                EXPECT_EQ(capture.after_terminal, 0);
             }
-        }
-        if (!direct) {
-            engine.result_producers_done.store(true); engine.result_cv.notify_all(); CallbackLoop(&engine);
-        }
-        EXPECT_EQ(req.generated_count, 7);
-        EXPECT_EQ(engine.metrics.total_tokens_generated.load(), 7);
-        EXPECT_EQ(rng, before);
-        EXPECT_EQ(req.decode_finish_cause, DecodeFinishCause::GrammarComplete);
-        EXPECT_STREQ(DecodeFinishCauseName(req.decode_finish_cause), "grammar_complete");
-        EXPECT_EQ(capture.visible, "{\"answer\":42}");
-        if (callback_mode) EXPECT_EQ(capture.ids, (std::vector<int>{0,1,2,1,3,4,5}));
-        EXPECT_EQ(capture.generated, 7); EXPECT_EQ(capture.reason, DENSECORE_GENERATION_STOP);
-        EXPECT_EQ(capture.terminals, 1); EXPECT_EQ(capture.completions, 1);
-        EXPECT_EQ(capture.after_terminal, 0);
-    }
 }
 
 TEST(JsonCompletionCommit, ExistingTerminalCausesWinAndCompletionPrecedesLength) {
-    Request req; req.Reset(); req.generated_count = req.max_tokens = 7;
+    Request req;
+    req.Reset();
+    req.generated_count = req.max_tokens = 7;
     EXPECT_TRUE(ResolveCommittedTokenFinish(&req, false, true));
     EXPECT_EQ(req.decode_finish_cause, DecodeFinishCause::GrammarComplete);
     req.decode_finish_cause = DecodeFinishCause::Unknown;
@@ -2057,13 +2080,53 @@ TEST(JsonCompletionCommit, ExistingTerminalCausesWinAndCompletionPrecedesLength)
     EXPECT_EQ(req.decode_finish_cause, DecodeFinishCause::MaxTokens);
     for (auto cause : {DecodeFinishCause::RequestCanceled, DecodeFinishCause::OutOfMemory,
                        DecodeFinishCause::GraphBuildFailed, DecodeFinishCause::StopSequence}) {
-        req.finished = true; req.decode_finish_cause = cause;
+        req.finished = true;
+        req.decode_finish_cause = cause;
         EXPECT_TRUE(ResolveCommittedTokenFinish(&req, true, true));
         EXPECT_EQ(req.decode_finish_cause, cause);
     }
-    GrammarConstraint disabled; disabled.state = JSONState::COMPLETED;
+    GrammarConstraint disabled;
+    disabled.state = JSONState::COMPLETED;
     EXPECT_FALSE(densecore::llm::sampling::AdvanceJsonGrammarAndCheckCompletion(&disabled, "}"));
     EXPECT_TRUE(disabled.accumulated.empty());
-    disabled.enabled = true; // Non-JSON still has no completion policy.
+    disabled.enabled = true;  // Non-JSON still has no completion policy.
     EXPECT_FALSE(densecore::llm::sampling::IsJsonGrammarComplete(&disabled));
+}
+
+TEST(JsonCompletionCommit, LiteralNestedStringAndEscapedBracesOnlyCloseTheRoot) {
+    using densecore::llm::sampling::AdvanceJsonGrammarAndCheckCompletion;
+    using densecore::llm::sampling::IsJsonGrammarComplete;
+    GrammarConstraint nested;
+    nested.enabled = true;
+    nested.is_json_mode = true;
+    EXPECT_FALSE(AdvanceJsonGrammarAndCheckCompletion(&nested, "{\"outer\":{\"answer\":42"));
+    EXPECT_EQ(nested.brace_depth, 2);
+    EXPECT_FALSE(AdvanceJsonGrammarAndCheckCompletion(&nested, "}"));
+    EXPECT_EQ(nested.brace_depth, 1);
+    EXPECT_FALSE(IsJsonGrammarComplete(&nested));
+    EXPECT_TRUE(AdvanceJsonGrammarAndCheckCompletion(&nested, "}"));
+    EXPECT_EQ(nested.brace_depth, 0);
+
+    GrammarConstraint quoted;
+    quoted.enabled = true;
+    quoted.is_json_mode = true;
+    EXPECT_FALSE(AdvanceJsonGrammarAndCheckCompletion(&quoted, "{\"text\":\""));
+    EXPECT_FALSE(AdvanceJsonGrammarAndCheckCompletion(&quoted, "} inside"));
+    EXPECT_FALSE(AdvanceJsonGrammarAndCheckCompletion(&quoted, "\\"));
+    EXPECT_TRUE(quoted.in_escape);
+    EXPECT_FALSE(AdvanceJsonGrammarAndCheckCompletion(&quoted, "\""));
+    EXPECT_EQ(quoted.state, JSONState::IN_STRING_VALUE);
+    EXPECT_FALSE(AdvanceJsonGrammarAndCheckCompletion(&quoted, " still text"));
+    EXPECT_TRUE(AdvanceJsonGrammarAndCheckCompletion(&quoted, "\"}"));
+    EXPECT_EQ(quoted.brace_depth, 0);
+
+    GrammarConstraint combined;
+    combined.enabled = true;
+    combined.is_json_mode = true;
+    EXPECT_FALSE(AdvanceJsonGrammarAndCheckCompletion(&combined, "{\"outer\":{\"answer\":42"));
+    EXPECT_TRUE(AdvanceJsonGrammarAndCheckCompletion(&combined, "}}"));
+    const auto committed = combined.accumulated;
+    EXPECT_EQ(committed, "{\"outer\":{\"answer\":42}}");
+    EXPECT_TRUE(AdvanceJsonGrammarAndCheckCompletion(&combined, "uncommitted"));
+    EXPECT_EQ(combined.accumulated, committed);  // Completed entry never consumes a following piece.
 }

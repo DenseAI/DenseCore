@@ -14,4 +14,4 @@ inline bool AdvanceJsonGrammarAndCheckCompletion(GrammarConstraint* grammar, con
     grammar->UpdateState(piece);
     return IsJsonGrammarComplete(grammar);
 }
-}
+}  // namespace densecore::llm::sampling

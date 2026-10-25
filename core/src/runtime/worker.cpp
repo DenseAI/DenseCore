@@ -48,6 +48,7 @@
 #include "llm/graph/cache.h"
 #include "llm/sampling/sampling_errors.h"
 #include "llm/sampling/sampling_rng.h"
+#include "llm/sampling/grammar_completion.h"
 #include "llm/speculative/reference_session.h"
 #include "llm/speculative/fair_schedule.h"
 #ifdef DENSECORE_TEST_BUILD
@@ -6414,8 +6415,10 @@ void EngineLoop(EngineState* state) {
                     }
 
                     if (req->json_mode && !token_str.empty()) {
-                        req->grammar.UpdateState(token_str);
+                        densecore::llm::sampling::AdvanceJsonGrammarAndCheckCompletion(&req->grammar, token_str);
                     }
+                    const bool json_completed = req->json_mode &&
+                        densecore::llm::sampling::IsJsonGrammarComplete(&req->grammar);
 
                     if (req->stop_buffer_max > 0) {
                         PublishStopFilteredToken(state, req, token_str, best_token, global_direct_callback,
@@ -6475,7 +6478,8 @@ void EngineLoop(EngineState* state) {
 
                     // Ensure we have enough blocks for the NEXT token
                     int blocks_needed = (req->n_past + 1 + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                    while (!mtp_batched_verified && req->decode_finish_cause != DecodeFinishCause::StopSequence &&
+                    while (!mtp_batched_verified && !json_completed &&
+                           req->decode_finish_cause != DecodeFinishCause::StopSequence &&
                            (int)req->block_table.size() < blocks_needed) {
                         auto new_blocks = current_kv_cache->block_manager->Allocate(1);
                         if (new_blocks.empty()) {
@@ -6491,18 +6495,10 @@ void EngineLoop(EngineState* state) {
                     }
 
                     // Check finish conditions
-                    if (req->finished || IsStopTokenId(current_model, best_token) ||
-                        req->generated_count >= req->max_tokens) {
+                    if (ResolveCommittedTokenFinish(req, IsStopTokenId(current_model, best_token), json_completed)) {
                         trim_mtp_boundary(committed_index + 1);
                         LogRequestLifecyclePhase("finish_begin", req, current_model, req->seq_id, batch.num_seqs,
                                                  static_cast<int>(batch.tokens.size()), active_threads);
-                        if (!req->finished) {
-                            if (IsStopTokenId(current_model, best_token)) {
-                                req->decode_finish_cause = DecodeFinishCause::StopToken;
-                            } else if (req->generated_count >= req->max_tokens) {
-                                req->decode_finish_cause = DecodeFinishCause::MaxTokens;
-                            }
-                        }
                         req->finished = true;
                         if (IsMoEPathTraceDumpEnabled() && !IsMoETracePlumbingDisabled()) {
                             const auto forward_calls =

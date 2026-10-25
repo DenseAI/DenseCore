@@ -1,6 +1,7 @@
 #include "llm/speculative/reference_session.h"
 #include "llm/speculative/head_memory.h"
 #include "llm/sampling/sampling_rng.h"
+#include "llm/sampling/grammar_completion.h"
 #include "densecore/models/tokenizer.h"
 #include "ggml-cpu.h"
 #include <algorithm>
@@ -196,6 +197,11 @@ void ReferenceSession::ReplayObservedTarget(const InferenceDependencies* deps, c
 }
 void ReferenceSession::MakeProposals(int selected_token, const SamplingParams& params,
                                      const InferenceDependencies* deps, const std::atomic<bool>& cancelled) {
+    CheckCancelled(cancelled);
+    if (densecore::llm::sampling::IsJsonGrammarComplete(params.grammar)) {
+        pending_.clear();
+        return;
+    }
     const int keep = target_seen_;
     if (keep < 0 || keep > head_past_ || !cache_->block_manager->RollbackExclusiveSuffix(&blocks_, keep)) {
         throw std::runtime_error("MTP head rollback failed");
@@ -212,7 +218,8 @@ void ReferenceSession::MakeProposals(int selected_token, const SamplingParams& p
         CheckCancelled(cancelled);
         history.push_back(selected_token);
         if (history.size() > 2048) history.erase(history.begin(), history.begin() + (history.size() - 2048));
-        if (params.grammar) grammar.UpdateState(Tokenizer::Detokenize(&source_, selected_token));
+        if (params.grammar && densecore::llm::sampling::AdvanceJsonGrammarAndCheckCompletion(
+                                  &grammar, Tokenizer::Detokenize(&source_, selected_token))) break;
         auto step = ForwardHead({selected_token}, hidden, &draft_params, deps);
         pending_.push_back({step.token, std::move(step.distribution)});
         ++proposed_;
@@ -257,10 +264,15 @@ VerificationResult ReferenceSession::VerifyBatched(ggml_tensor* logits, int firs
             // target state before consuming EOS instead of sampling beyond it.
             break;
         }
+        if (params.grammar && densecore::llm::sampling::AdvanceJsonGrammarAndCheckCompletion(
+                                  &grammar, Tokenizer::Detokenize(&source_, step.token))) {
+            // Like EOS, this is a committed output, not an input to retain.
+            // Do not inspect a following target row or sample a bonus token.
+            break;
+        }
         ++result.accepted_draft_tokens;
         history.push_back(step.token);
         if (history.size() > 2048) history.erase(history.begin());
-        if (params.grammar) grammar.UpdateState(Tokenizer::Detokenize(&source_, step.token));
     }
     if (result.accepted_draft_tokens == draft_count) {
         transformed.output_token_index = params.output_token_index + static_cast<int>(draft_count);
