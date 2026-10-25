@@ -127,7 +127,7 @@ fi
 
 check_active_drain() {
   python3 "$(dirname "$0")/active_drain_smoke.py" --url "$base_url" \
-    --output "$tmp_dir/drain.json" --timeout 30 -- docker kill --signal TERM "$container_name" || return 1
+    --output "$tmp_dir/drain.json" --timeout 30 --max-tokens "${DENSECORE_SMOKE_DRAIN_MAX_TOKENS:-32}" -- docker kill --signal TERM "$container_name" || return 1
 
   # Bound the process exit independently from the request drain timeout.
   for _ in $(seq 1 35); do

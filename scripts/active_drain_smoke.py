@@ -10,13 +10,17 @@ import urllib.request
 from pathlib import Path
 
 
-def run(base_url, signal_command, output, timeout):
+def run(base_url, signal_command, output, timeout, max_tokens=256):
+    if max_tokens < 1:
+        raise ValueError("max_tokens must be positive")
+    began = time.monotonic()
     observed = threading.Event()
     completed = threading.Event()
-    result = {"events": [], "ready_removed": False, "admission_blocked": False}
+    result = {"events": [], "ready_removed": False, "admission_blocked": False,
+        "request_max_tokens": max_tokens, "done_count": 0, "finish_count": 0}
     payload = json.dumps({"model": "densecore", "messages": [{"role": "user", "content":
         "List the integers from 1 to 200, one at a time, without skipping any."}],
-        "max_tokens": 256, "temperature": 0, "stream": True,
+        "max_tokens": max_tokens, "temperature": 0, "stream": True,
         "chat_template_kwargs": {"enable_thinking": False}}).encode()
 
     def stream():
@@ -29,8 +33,13 @@ def run(base_url, signal_command, output, timeout):
                         continue
                     data = line[5:].strip()
                     if data == b"[DONE]":
+                        result["done_count"] += 1
                         result["done"] = True
-                        break
+                        if result["done_count"] != 1:
+                            raise RuntimeError("duplicate stream [DONE] terminal")
+                        continue
+                    if result["done_count"]:
+                        raise RuntimeError("stream payload after [DONE]")
                     event = json.loads(data)
                     result["events"].append(event)
                     if "error" in event:
@@ -38,8 +47,11 @@ def run(base_url, signal_command, output, timeout):
                     for choice in event.get("choices", []):
                         delta = choice.get("delta", {})
                         if delta.get("content") or delta.get("reasoning_content"):
+                            if not observed.is_set():
+                                result["first_token_seconds"] = time.monotonic() - began
                             observed.set()
                         if choice.get("finish_reason"):
+                            result["finish_count"] += 1
                             result["finish_reason"] = choice["finish_reason"]
         except Exception as error:
             result["error"] = str(error)
@@ -53,6 +65,9 @@ def run(base_url, signal_command, output, timeout):
             raise RuntimeError("no stream token observed before drain")
         if completed.is_set():
             raise RuntimeError("stream completed before SIGTERM; active drain was not tested")
+        result["stream_incomplete_before_signal"] = True
+        result["signal_seconds"] = time.monotonic() - began
+        result["events_before_signal"] = len(result["events"])
         started = time.monotonic()
         subprocess.run(signal_command, check=True, timeout=10)
         while time.monotonic() - started < min(timeout, 10):
@@ -76,7 +91,7 @@ def run(base_url, signal_command, output, timeout):
         if not completed.wait(timeout):
             raise RuntimeError("accepted request exceeded drain deadline")
         result["drain_seconds"] = time.monotonic() - started
-        if not result.get("done") or result.get("finish_reason") not in ("stop", "length") or result.get("error"):
+        if result["done_count"] != 1 or result["finish_count"] != 1 or result.get("finish_reason") not in ("stop", "length") or result.get("error"):
             raise RuntimeError("accepted request did not finish successfully during drain")
         if not result["ready_removed"] or not result["admission_blocked"]:
             raise RuntimeError("readiness or new admission stayed available during drain")
@@ -89,9 +104,11 @@ if __name__ == "__main__":
     parser.add_argument("--url", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--timeout", type=float, default=30)
+    parser.add_argument("--max-tokens", type=int, default=256, help="Bounded accepted workload; keep within the configured shutdown deadline")
     parser.add_argument("signal_command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.signal_command
     if command and command[0] == "--": command = command[1:]
     if not command: parser.error("provide the SIGTERM command after --")
-    run(args.url.rstrip("/"), command, args.output, args.timeout)
+    if args.max_tokens < 1: parser.error("--max-tokens must be positive")
+    run(args.url.rstrip("/"), command, args.output, args.timeout, args.max_tokens)

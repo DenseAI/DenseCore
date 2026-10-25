@@ -26,6 +26,13 @@ kubeconfig in the artifact directory; it preserves your existing cluster context
 chart, runs the downloader, waits for ready, checks installed resource limits,
 opens a real generation stream, deletes the pod while generating, and requires
 that the accepted stream finishes while readiness and new admission disappear.
+The positive drain request is explicitly bounded to 32 output tokens so it can
+finish within the configured 30-second shutdown budget. The standalone drain
+client keeps its 256-token default and accepts `--max-tokens`; it records the
+request bound, first-token/signal times and exactly one terminal event. This is
+evidence for the bounded request, not a promise that an unbounded request can
+always complete before termination.
+
 It preserves rendered manifests, pod state and drain output under its printed
 artifact directory. Image builds, model downloads and kind have their own local
 disk/RAM requirements; run native builds serially on small development machines.

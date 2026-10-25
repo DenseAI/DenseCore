@@ -78,7 +78,7 @@ forward_pid=$!
 for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:18081/health/ready > /dev/null && break; sleep 1; done
 curl -fsS http://127.0.0.1:18081/health/ready > "$artifacts/ready.json"
 # Deleting the pod delivers SIGTERM while an actual accepted request is generating.
-python3 "$root/scripts/active_drain_smoke.py" --url http://127.0.0.1:18081 --output "$artifacts/drain.json" --timeout 30 -- \
+python3 "$root/scripts/active_drain_smoke.py" --url http://127.0.0.1:18081 --output "$artifacts/drain.json" --timeout 30 --max-tokens "${DENSECORE_SMOKE_DRAIN_MAX_TOKENS:-32}" -- \
   kubectl --context "kind-$cluster" -n "$namespace" delete pod "$pod" --wait=false
 kubectl --context "kind-$cluster" -n "$namespace" wait --for=delete "pod/$pod" --timeout=45s
 # Resource limits must be present in the installed pod, not only in the values file.
