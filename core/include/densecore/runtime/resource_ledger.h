@@ -60,22 +60,38 @@ public:
     bool ExtendMTP(uint64_t bytes, std::string* error = nullptr) {
         auto& ledger = resource_detail::ProcessLedger();
         std::lock_guard<std::mutex> lock(ledger.mutex);
+        return ExtendLocked(ledger,bytes,&RuntimeMemoryPlan::mtp_checkpoint_bytes,"MTP",error);
+    }
+    bool EnsureKVBytes(uint64_t bytes, std::string* error = nullptr) {
+        auto& ledger = resource_detail::ProcessLedger();
+        std::lock_guard<std::mutex> lock(ledger.mutex);
+        const auto it = ledger.plans.find(this);
+        if (it == ledger.plans.end()) {
+            if (error) *error = "resource plan is unavailable for KV reservation";
+            return false;
+        }
+        const uint64_t current = it->second.kv_bytes;
+        return ExtendLocked(ledger,bytes > current ? bytes-current : 0,&RuntimeMemoryPlan::kv_bytes,"KV",error);
+    }
+private:
+    bool ExtendLocked(resource_detail::Ledger& ledger, uint64_t bytes, uint64_t RuntimeMemoryPlan::* category,
+                      const char* name, std::string* error) {
         auto it = ledger.plans.find(this);
         if (it == ledger.plans.end()) {
-            if (error) *error = "resource plan is unavailable for MTP reservation";
+            if (error) *error = std::string("resource plan is unavailable for ") + name + " reservation";
             return false;
         }
         const uint64_t capacity = it->second.resource_capacity_bytes ? it->second.resource_capacity_bytes : it->second.available_bytes;
         const uint64_t previous = resource_detail::PlannedBytesLocked(ledger);
-        if (previous > capacity || bytes > capacity-previous || bytes > UINT64_MAX-it->second.mtp_checkpoint_bytes) {
-            if (error) *error = "MTP resource plan required_bytes=" + std::to_string(resource_detail::Add(previous,bytes)) +
+        if (previous > capacity || bytes > capacity-previous || bytes > UINT64_MAX-(it->second.*category)) {
+            if (error) *error = std::string(name) + " resource plan required_bytes=" + std::to_string(resource_detail::Add(previous,bytes)) +
                                 " available_bytes=" + std::to_string(capacity);
             return false;
         }
-        it->second.mtp_checkpoint_bytes += bytes;
+        it->second.*category += bytes;
         return true;
     }
-private:
+
     bool registered_ = false;
 };
 

@@ -433,3 +433,21 @@ TEST(ResourceLedgerTest, FailedWeightConstructionDoesNotStrandAnAllocationCharge
     EXPECT_THROW(MakeBudgetedRepackedWeight<FailedWeight>(16),std::runtime_error);
     EXPECT_EQ(ResourceLedgerUsageSnapshot().repack_bytes,before.repack_bytes);
 }
+
+TEST(ResourceLedgerTest, ActualKVReconciliationGrowsAtomicallyAndRejectsWithoutChangingReservation) {
+    using namespace densecore::runtime;
+    const auto before = ResourceLedgerUsageSnapshot();
+    RuntimeMemoryPlan plan;
+    plan.kv_bytes = 50;
+    plan.available_bytes = 100;
+    plan.resource_capacity_bytes = before.planned_bytes + 100;
+    ResourcePlanLease lease(plan);
+    std::string error;
+    EXPECT_TRUE(lease.EnsureKVBytes(60, &error));
+    EXPECT_EQ(ProcessPlannedMemoryBytes(),before.planned_bytes+60);
+    EXPECT_FALSE(lease.EnsureKVBytes(101, &error));
+    EXPECT_NE(error.find("required_bytes="),std::string::npos);
+    EXPECT_EQ(ProcessPlannedMemoryBytes(),before.planned_bytes+60);
+    EXPECT_TRUE(lease.EnsureKVBytes(40, &error));
+    EXPECT_EQ(ProcessPlannedMemoryBytes(),before.planned_bytes+60);
+}
