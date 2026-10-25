@@ -8,6 +8,7 @@ linked from [Benchmarks](BENCHMARKS.md).
 | Purpose | Repository and full revision | File | SHA-256 | v0.2 qualification |
 |---|---|---|---|---|
 | Default CLI, downloader and quick start | `lmstudio-community/Qwen3.5-0.8B-GGUF@7925ccdc665d4efdb1034791e6b553e11128e6f8` | `Qwen3.5-0.8B-Q4_K_M.gguf` | `f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec` | Final integrated image/pod qualification pending |
+| Qwen3.5-2B baseline | `unsloth/Qwen3.5-2B-GGUF@f6d5376be1edb4d416d56da11e5397a961aca8ae` | `Qwen3.5-2B-Q4_K_M.gguf` | `aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223` | Local bytes match the public pin; integrated final-answer qualification pending |
 | Qwen3 small dense baseline | `Qwen/Qwen3-0.6B-GGUF@23749fefcc72300e3a2ad315e1317431b06b590a` | `Qwen3-0.6B-Q8_0.gguf` | `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031` | Day 0 local baseline; integrated final-answer qualification pending |
 | Embedding baseline | `Qwen/Qwen3-Embedding-0.6B-GGUF@370f27d7550e0def9b39c1f16d3fbaa13aa67728` | `Qwen3-Embedding-0.6B-Q8_0.gguf` | `06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439` | Day 0 explicit-LAST baseline; AUTO qualification pending |
 | Qwen3.5-0.8B MTP target | `unsloth/Qwen3.5-0.8B-MTP-GGUF@cf8a611f6ed2c2060046219a19f12cd3d5ecd67c` | `Qwen3.5-0.8B-Q4_K_M.gguf` | `ac7c9d7a1b3e3695bb3bd50f8ceaa97f9c93e99ccc3d3d1a620301b6dd6d3d86` | Pending same-file correctness/performance qualification; no automatic activation |
@@ -27,10 +28,9 @@ Local MTP test files may have an added `-MTP` suffix. The catalog lists the
 original repository filenames; the MTP/non-MTP repositories can use identical
 filenames for different bytes, so compare SHA-256 and revision rather than names.
 
-The local Qwen3.5-2B-Q4_K_M fixture has SHA-256
-`aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223`.
-Its source revision remains unresolved, so results on that file must name the
-local SHA and must not be presented as a reproducible public artifact pin.
+The local Qwen3.5-2B fixture was matched byte-for-byte to the public pin above
+using the repository file SHA-256 metadata. This resolves its previously unknown
+source identity without changing its quality qualification status.
 
 Custom interactive CLI models require explicit integrity:
 
