@@ -987,3 +987,33 @@ TEST(GraphCacheOwnershipTest, ArenaAcquireReportsHitsAndRetainsMostRecentlyUsedK
     cache.AcquireArena(b, 4096, 2, &reused);
     EXPECT_FALSE(reused);
 }
+
+TEST(GraphCacheOwnershipTest, MeasuredNoAllocArenaAllocatesComputesAndReusesBackendBuffers) {
+    using namespace densecore::llm::graph;
+    ggml_backend_t backend=ggml_backend_cpu_init();
+    ASSERT_NE(backend,nullptr);
+    {
+        ScopedGgmlGraphArena arena;
+        for (int width : {4,4,64,4}) {
+            ASSERT_TRUE(arena.Ensure(1024*1024,backend));
+            auto* ctx=arena.ctx();
+            auto* input=ggml_new_tensor_1d(ctx,GGML_TYPE_F32,width);
+            ggml_set_input(input);
+            auto* output=ggml_add(ctx,input,input);
+            ggml_set_output(output);
+            auto* graph=ggml_new_graph_custom(ctx,32,false);
+            ggml_build_forward_expand(graph,output);
+            EXPECT_EQ(input->data,nullptr); // Metadata arena uses no_alloc=true.
+            ASSERT_TRUE(arena.AllocGraph(graph));
+            ASSERT_NE(input->data,nullptr);
+            ASSERT_NE(output->data,nullptr);
+            std::vector<float> values(width),actual(width);
+            for(int i=0;i<width;++i) values[i]=static_cast<float>(i+1);
+            ggml_backend_tensor_set(input,values.data(),0,values.size()*sizeof(float));
+            ASSERT_EQ(ggml_backend_graph_compute(backend,graph),GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(output,actual.data(),0,actual.size()*sizeof(float));
+            for(int i=0;i<width;++i) EXPECT_FLOAT_EQ(actual[i],2*values[i]);
+        }
+    }
+    ggml_backend_free(backend);
+}

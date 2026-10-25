@@ -123,6 +123,10 @@ bool ScopedGgmlGraphArena::AllocGraph(ggml_cgraph* graph) {
         payload_leases_.push_back(std::move(lease));
         charged_payload_bytes_ = required;
     }
+    // reserve_n_size updates topology assignments but deliberately leaves its
+    // buffers unallocated. alloc_graph may now see matching assignments and
+    // skip its automatic reserve, so commit buffers explicitly after admission.
+    if (!ggml_gallocr_reserve(gallocr_, graph)) return false;
     return ggml_gallocr_alloc_graph(gallocr_, graph);
 }
 
