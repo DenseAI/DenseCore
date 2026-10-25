@@ -14,6 +14,7 @@ struct Ledger {
     std::unordered_map<const void*, RuntimeMemoryPlan> plans;
     uint64_t graph_used = 0;
     uint64_t repack_used = 0;
+    uint64_t admission_used = 0;
 };
 inline Ledger& ProcessLedger() {
     // Process lifetime: static repack cache deleters may run during DSO teardown.
@@ -95,7 +96,15 @@ private:
     bool registered_ = false;
 };
 
-enum class AllocationCategory { Graph, Repack };
+enum class AllocationCategory { Graph, Repack, Admission };
+// No-model graph adapters have no committed allocator plan. Keep their
+// admission bounded, but never manufacture capacity from exhaustion/read failure.
+inline uint64_t StandaloneAdmissionCapacity(const ResourceBudget& budget) {
+    constexpr uint64_t ceiling = 128ULL*1024*1024;
+    if (budget.memory.state == ResourceState::Unknown) return 0;
+    if (budget.memory.state == ResourceState::Unlimited) return ceiling;
+    return std::min<uint64_t>(ceiling,budget.memory.bytes/32);
+}
 // Charge actual allocation lifetimes, including evicted but still referenced
 // weights and simultaneous cache builders. Inactive/standalone kernel tests use
 // the pre-existing local cache policy without an engine reservation.
@@ -104,11 +113,10 @@ public:
     static std::shared_ptr<ResourceAllocationLease> Acquire(AllocationCategory category, uint64_t bytes) {
         auto& ledger = resource_detail::ProcessLedger();
         std::lock_guard<std::mutex> lock(ledger.mutex);
-        uint64_t capacity = ledger.plans.empty() ? UINT64_MAX : 0;
+        uint64_t capacity = ledger.plans.empty() ? (category == AllocationCategory::Admission ? StandaloneAdmissionCapacity(DetectResourceBudget()) : UINT64_MAX) : 0;
         for (const auto& entry : ledger.plans)
-            capacity = resource_detail::Add(capacity, category == AllocationCategory::Graph
-                                                           ? entry.second.graph_bytes : entry.second.repack_bytes);
-        uint64_t& used = category == AllocationCategory::Graph ? ledger.graph_used : ledger.repack_used;
+            capacity = resource_detail::Add(capacity, CategoryCapacity(entry.second,category));
+        uint64_t& used = CategoryUsed(ledger,category);
         if (used > capacity || bytes > capacity-used) return {};
         // Allocate the control block before charging so bad_alloc cannot strand a charge.
         auto result = std::shared_ptr<ResourceAllocationLease>(new ResourceAllocationLease(category,bytes));
@@ -119,22 +127,36 @@ public:
     static uint64_t AvailableBytes(AllocationCategory category) {
         auto& ledger = resource_detail::ProcessLedger();
         std::lock_guard<std::mutex> lock(ledger.mutex);
-        if (ledger.plans.empty()) return UINT64_MAX;
+        if (ledger.plans.empty()) {
+            if (category != AllocationCategory::Admission) return UINT64_MAX;
+            const auto capacity=StandaloneAdmissionCapacity(DetectResourceBudget());
+            return ledger.admission_used >= capacity ? 0 : capacity-ledger.admission_used;
+        }
         uint64_t capacity = 0;
         for (const auto& entry : ledger.plans)
-            capacity = resource_detail::Add(capacity,category == AllocationCategory::Graph
-                                                       ? entry.second.graph_bytes : entry.second.repack_bytes);
-        const uint64_t used = category == AllocationCategory::Graph ? ledger.graph_used : ledger.repack_used;
+            capacity = resource_detail::Add(capacity,CategoryCapacity(entry.second,category));
+        const uint64_t used = CategoryUsed(ledger,category);
         return used >= capacity ? 0 : capacity-used;
     }
     ~ResourceAllocationLease() {
         if (!charged_) return;
         auto& ledger = resource_detail::ProcessLedger();
         std::lock_guard<std::mutex> lock(ledger.mutex);
-        uint64_t& used = category_ == AllocationCategory::Graph ? ledger.graph_used : ledger.repack_used;
+        uint64_t& used = CategoryUsed(ledger,category_);
         used = bytes_ > used ? 0 : used-bytes_;
     }
 private:
+    static uint64_t CategoryCapacity(const RuntimeMemoryPlan& plan, AllocationCategory category) {
+        if (category == AllocationCategory::Graph) return plan.graph_bytes;
+        if (category == AllocationCategory::Repack) return plan.repack_bytes;
+        // Partition the existing allocator reserve; this is not extra headroom.
+        return plan.allocator_bytes / 2;
+    }
+    static uint64_t& CategoryUsed(resource_detail::Ledger& ledger, AllocationCategory category) {
+        if (category == AllocationCategory::Graph) return ledger.graph_used;
+        if (category == AllocationCategory::Repack) return ledger.repack_used;
+        return ledger.admission_used;
+    }
     ResourceAllocationLease(AllocationCategory category, uint64_t bytes) : category_(category), bytes_(bytes) {}
     AllocationCategory category_;
     uint64_t bytes_;
@@ -171,10 +193,10 @@ inline void ReleaseGraphAllocation(const void* owner) {
 } // namespace densecore::runtime
 
 namespace densecore::runtime {
-struct ResourceLedgerUsage { uint64_t planned_bytes, graph_bytes, repack_bytes; };
+struct ResourceLedgerUsage { uint64_t planned_bytes, graph_bytes, repack_bytes, admission_bytes; };
 inline ResourceLedgerUsage ResourceLedgerUsageSnapshot() {
     auto& ledger = resource_detail::ProcessLedger();
     std::lock_guard<std::mutex> lock(ledger.mutex);
-    return {resource_detail::PlannedBytesLocked(ledger),ledger.graph_used,ledger.repack_used};
+    return {resource_detail::PlannedBytesLocked(ledger),ledger.graph_used,ledger.repack_used,ledger.admission_used};
 }
 } // namespace densecore::runtime

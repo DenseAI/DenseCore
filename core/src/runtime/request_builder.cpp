@@ -498,12 +498,79 @@ void PrepareTextRequest(TransformerModel* model, Request* req, const char* promp
 
 }  // namespace
 
-Request* AcquireAndInitRequest(EngineState* state) {
+Request* AcquireAndInitRequest(EngineState* state, uint64_t payload_bytes) {
+    std::shared_ptr<densecore::runtime::ResourceAllocationLease> payload;
+    if (payload_bytes) {
+        payload = densecore::runtime::ResourceAllocationLease::Acquire(densecore::runtime::AllocationCategory::Admission,payload_bytes);
+        if (!payload) throw densecore::OutOfMemoryException("native graph admission budget exhausted");
+    }
     Request* req = state->request_pool.Acquire();
     req->Reset();
+    req->admission_payload_lease = std::move(payload);
     req->id = global_req_id.fetch_add(1);
     req->arrival_time = std::chrono::steady_clock::now();
     return req;
+}
+
+std::shared_ptr<densecore::runtime::ResourceAllocationLease> ReserveTextRequestPayload(EngineState* state, const char* prompt, int input_tokens,
+    int max_tokens, const char* lora, const char* const* stops, int allowed, int disallowed) {
+    using namespace densecore::runtime;
+    const uint64_t available = ResourceAllocationLease::AvailableBytes(AllocationCategory::Admission);
+    uint64_t bytes = 16*1024; // queue nodes, control blocks, template and diagnostic overhead
+    auto charge = [&](uint64_t count, uint64_t width) {
+        if (count > UINT64_MAX / width || count*width > UINT64_MAX-bytes)
+            throw densecore::OutOfMemoryException("native request admission size overflow");
+        bytes += count*width;
+        if (bytes > available) throw densecore::OutOfMemoryException(
+            "native request admission required_bytes="+std::to_string(bytes)+
+            " available_bytes="+std::to_string(available));
+    };
+    auto text = [&](const char* value, uint64_t width) {
+        if (!value) return;
+        // Stop scanning oversized caller input before any owned copy/tokenization.
+        const uint64_t limit = available/width;
+        uint64_t length = 0;
+        while (length <= limit && value[length]) ++length;
+        charge(length,width);
+    };
+    text(prompt,256); // byte-fallback tokens, transient tokenizer buffers, six token histories
+    text(lora,2);
+    if (stops) for (uint64_t i=0; stops[i]; ++i) {
+        charge(1,sizeof(std::string));
+        text(stops[i],8); // parsed strings and maximum matching buffer
+    }
+    charge(static_cast<uint64_t>(std::max(0,input_tokens)),64);
+    charge(static_cast<uint64_t>(std::max(0,allowed)),16);
+    charge(static_cast<uint64_t>(std::max(0,disallowed)),16);
+    auto* entry = state->GetDefaultModel();
+    uint64_t context = entry ? static_cast<uint64_t>(std::max(1,entry->kv_config.max_seq_len)) : 1;
+    uint64_t max_piece_bytes = 1;
+    if (entry && entry->model) {
+        if (!entry->admission_max_piece_bytes) {
+            for (const auto& piece : entry->model->vocab_tokens)
+                max_piece_bytes = std::max<uint64_t>(max_piece_bytes,piece.size());
+            entry->admission_max_piece_bytes = max_piece_bytes;
+        }
+        max_piece_bytes = entry->admission_max_piece_bytes;
+    }
+    // Even streaming can accumulate in the native result queue behind a slow
+    // callback. Reserve worst-case output up to the effective context ceiling.
+    const uint64_t output = std::min<uint64_t>(context,static_cast<uint64_t>(std::max(0,max_tokens)));
+    if (entry && entry->model) charge(static_cast<uint64_t>(entry->model->hparams.n_embd),8);
+    charge(context,64); // generated histories/prefix bookkeeping cannot exceed KV context
+    charge(output+1,resource_detail::Add(sizeof(ResultEvent)+64,
+           resource_detail::Add(resource_detail::Add(max_piece_bytes,max_piece_bytes),
+                                resource_detail::Add(max_piece_bytes,max_piece_bytes))));
+    auto payload = ResourceAllocationLease::Acquire(AllocationCategory::Admission,bytes);
+    if (!payload) throw densecore::OutOfMemoryException("native request admission budget exhausted");
+    return payload;
+}
+Request* AcquireBoundedTextRequest(EngineState* state, const char* prompt, int input_tokens,
+    int max_tokens, const char* lora, const char* const* stops, int allowed, int disallowed) {
+    auto payload = ReserveTextRequestPayload(state,prompt,input_tokens,max_tokens,lora,stops,allowed,disallowed);
+    auto* request = AcquireAndInitRequest(state);
+    request->admission_payload_lease = std::move(payload);
+    return request;
 }
 
 namespace {
@@ -621,7 +688,7 @@ int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char* prompt, int poo
             return DENSECORE_STATUS_MODEL_LOAD_FAILED;
         }
 
-        Request* req = AcquireAndInitRequest(state);
+        Request* req = AcquireBoundedTextRequest(state,prompt,0,0);
         RequestGuard request_guard(state, req);
 
         req->prompt = prompt;
@@ -696,7 +763,7 @@ static int SubmitRequestWithSamplingConstraintsImpl(DenseCoreHandle handle, cons
             return DENSECORE_STATUS_MODEL_LOAD_FAILED;
         }
 
-        Request* req = AcquireAndInitRequest(state);
+        Request* req = AcquireBoundedTextRequest(state,prompt,0,max_tokens,lora_name,stop_sequences,num_allowed_token_ids,num_disallowed_token_ids);
         RequestGuard request_guard(state, req);
         req->lora_name = lora_name ? lora_name : "";
         req->parity_debug_submit_api = "SubmitRequestWithSamplingConstraintsEx";
@@ -765,7 +832,7 @@ int SubmitRequestWithTokenResults(DenseCoreHandle handle, const char* prompt, in
             return DENSECORE_STATUS_MODEL_LOAD_FAILED;
         }
 
-        Request* req = AcquireAndInitRequest(state);
+        Request* req = AcquireBoundedTextRequest(state,prompt,0,max_tokens);
         RequestGuard request_guard(state, req);
         req->token_result_callback = callback;
         req->parity_debug_submit_api = "SubmitRequestWithTokenResults";
@@ -820,7 +887,7 @@ static int SubmitRequestIdsWithSamplingConstraintsImpl(
         EngineState* state = (EngineState*)handle;
         std::unique_lock<std::mutex> construction_lock(state->construction_mu);
 
-        Request* req = AcquireAndInitRequest(state);
+        Request* req = AcquireBoundedTextRequest(state,rendered_prompt,n_tokens,max_tokens,lora_name,stop_sequences,num_allowed_token_ids,num_disallowed_token_ids);
         RequestGuard request_guard(state, req);
         req->lora_name = lora_name ? lora_name : "";
         req->parity_debug_submit_api = submit_api ? submit_api : "SubmitRequestIdsWithSamplingConstraintsEx";
@@ -930,7 +997,16 @@ int SubmitBatchEmbeddingRequest(DenseCoreHandle handle, const char** prompts, in
         int first_id = -1;
         for (int i = 0; i < num_prompts; i++) {
             int id = SubmitEmbeddingRequestEx(handle, prompts[i], pooling_type, normalize, callback, user_data);
-            if (i == 0) first_id = id;
+            if (i == 0) {
+                first_id = id;
+                // No children were accepted: the caller can safely release its
+                // callback immediately after this rejected batch returns.
+                if (id < 0) return id;
+            } else if (id < 0) {
+                // A positive-return batch owns num_prompts terminal deliveries,
+                // including children that cannot obtain an admission slot.
+                try { callback(nullptr,id,user_data); } catch (...) {}
+            }
         }
 
         if (first_id > 0) {
@@ -1323,6 +1399,13 @@ int DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx(
     float top_p, int top_k, float repetition_penalty, const char** stop_sequences, int json_mode,
     const int* allowed_token_ids, int num_allowed_token_ids, int allowed_token_ids_strict,
     const int* disallowed_token_ids, int num_disallowed_token_ids, TokenCallbackEx callback, void* user_data) {
+    return RequestApiBoundary("DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx", [&]() -> int {
+    if (!handle || !rendered_prompt) return DENSECORE_STATUS_INVALID_ARGUMENT;
+    auto* state = static_cast<EngineState*>(handle);
+    std::unique_lock<std::mutex> preparation_lock(state->construction_mu);
+    auto preparation_lease = ReserveTextRequestPayload(state,rendered_prompt,0,max_tokens,lora_name,
+                                                       stop_sequences,num_allowed_token_ids,num_disallowed_token_ids);
+    preparation_lock.unlock();
     DenseCoreRequestSnapshot snapshot{};
     const auto release_snapshot = [](DenseCoreRequestSnapshot* value) { DenseCoreFreeRequestSnapshot(value); };
     const std::unique_ptr<DenseCoreRequestSnapshot, decltype(release_snapshot)> snapshot_guard(&snapshot,
@@ -1341,6 +1424,7 @@ int DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx(
         "DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx",
         "DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx");
     return request_id;
+    });
 }
 
 void DenseCoreFreeRequestSnapshot(DenseCoreRequestSnapshot* snapshot) {
@@ -1407,7 +1491,7 @@ int SubmitRequest(DenseCoreHandle handle, const char* prompt, int max_tokens, co
             return DENSECORE_STATUS_MODEL_LOAD_FAILED;
         }
 
-        Request* req = AcquireAndInitRequest(state);
+        Request* req = AcquireBoundedTextRequest(state,prompt,0,max_tokens,lora_name);
         RequestGuard request_guard(state, req);
 
         req->prompt = prompt;
@@ -1440,7 +1524,7 @@ int SubmitLegacyTokenRequest(DenseCoreHandle handle, const int* tokens, int n_to
         }
         auto* state = static_cast<EngineState*>(handle);
         std::unique_lock<std::mutex> construction_lock(state->construction_mu);
-        Request* req = AcquireAndInitRequest(state);
+        Request* req = AcquireBoundedTextRequest(state,nullptr,n_tokens,max_tokens,lora_name);
         RequestGuard request_guard(state, req);
         // Basic and format-ID APIs intentionally do not apply sampling-ID priming
         // or model blocklists. They preserve the caller's exact token sequence.
@@ -1493,7 +1577,7 @@ int SubmitRequestWithFormatEx(DenseCoreHandle handle, const char* prompt, int ma
             return DENSECORE_STATUS_MODEL_LOAD_FAILED;
         }
 
-        Request* req = AcquireAndInitRequest(state);
+        Request* req = AcquireBoundedTextRequest(state,prompt,0,max_tokens,lora_name);
         RequestGuard request_guard(state, req);
 
         req->prompt = prompt;

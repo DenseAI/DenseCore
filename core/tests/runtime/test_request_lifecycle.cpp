@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <climits>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -11,6 +12,7 @@
 
 #include "densecore.h"
 #include "runtime/engine_internal.h"
+#include "runtime/request_builder.h"
 
 namespace densecore {
 namespace testing {
@@ -701,4 +703,214 @@ TEST_F(RequestLifecycleTest, FullBudgetShutdownFinalizesActiveAndRawPendingReque
     FreeEngine(engine_);
     engine_ = nullptr;
     for (const auto& callback : callbacks) EXPECT_EQ(callback.final_count, 1);
+}
+
+TEST_F(RequestLifecycleTest, PendingPayloadBudgetRejectsBeforeCopyForTextIdsAndEmbedding) {
+    using namespace densecore::runtime;
+    CallbackState generation;
+    EmbeddingCallbackState embedding;
+    EngineCloseGuard close_before_callback_state{&engine_};
+    const int token = 1;
+    EXPECT_EQ(SubmitRequestIds(engine_,&token,INT_MAX,8,nullptr,nullptr),DENSECORE_STATUS_OUT_OF_MEMORY);
+    DenseCoreTensorInput graph_input{};
+    EXPECT_EQ(SubmitGraphRequest(engine_,&graph_input,INT_MAX,"huge-input-count",nullptr,nullptr),DENSECORE_STATUS_OUT_OF_MEMORY);
+    const std::string oversized(ResourceAllocationLease::AvailableBytes(AllocationCategory::Admission)/256+1,'x');
+    EXPECT_EQ(SubmitRequest(engine_,oversized.c_str(),8,nullptr,nullptr,nullptr),DENSECORE_STATUS_OUT_OF_MEMORY);
+    auto blocker = ResourceAllocationLease::Acquire(AllocationCategory::Admission,
+                          ResourceAllocationLease::AvailableBytes(AllocationCategory::Admission));
+    ASSERT_NE(blocker,nullptr);
+    EXPECT_EQ(SubmitRequestWithSamplingConstraintsCallbackEx(engine_,"budget-reject",8,nullptr,0,1,1,1,
+                      nullptr,0,nullptr,0,0,nullptr,0,LifecycleCallbackEx,&generation),DENSECORE_STATUS_OUT_OF_MEMORY);
+    EXPECT_NE(std::string(DenseCoreGetLastError()).find("admission"),std::string::npos);
+    // This deliberately tiny buffer must never be read using the hostile count.
+    EXPECT_EQ(SubmitRequestIds(engine_,&token,INT_MAX,8,nullptr,nullptr),DENSECORE_STATUS_OUT_OF_MEMORY);
+    EXPECT_EQ(SubmitEmbeddingRequest(engine_,"budget-reject",EmbeddingLifecycleCallback,&embedding),DENSECORE_STATUS_OUT_OF_MEMORY);
+    const char* first_prompt="batch-reject";
+    EXPECT_EQ(SubmitBatchEmbeddingRequest(engine_,&first_prompt,INT_MAX,-1,1,EmbeddingLifecycleCallback,&embedding),DENSECORE_STATUS_OUT_OF_MEMORY);
+    EXPECT_EQ(generation.callback_count,0);
+    EXPECT_EQ(embedding.callback_count,0);
+    EXPECT_TRUE(static_cast<EngineState*>(engine_)->pending_requests.Empty());
+    blocker.reset();
+    EXPECT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(engine_,"budget-recovers",2,nullptr,0,1,1,1,
+                      nullptr,0,nullptr,0,0,nullptr,0,LifecycleCallbackEx,&generation),0);
+    ASSERT_TRUE(generation.WaitForFinal());
+    EXPECT_EQ(generation.final_count,1);
+    ASSERT_GT(SubmitEmbeddingRequest(engine_,"embedding-recovers",EmbeddingLifecycleCallback,&embedding),0);
+    ASSERT_TRUE(embedding.Wait());
+    EXPECT_EQ(embedding.callback_count,1);
+    EXPECT_GT(embedding.terminal_size,0);
+}
+
+TEST_F(RequestLifecycleTest, RequestPoolRetirementFreesPayloadButKeepsMetadataCharged) {
+    using namespace densecore::runtime;
+    auto* state=static_cast<EngineState*>(engine_);
+    const auto before=ResourceAllocationLease::AvailableBytes(AllocationCategory::Admission);
+    auto* req=state->request_pool.Acquire();
+    req->Reset();
+    req->prompt.assign(1024*1024,'x');
+    req->tokens.resize(1024*1024);
+    req->grammar.accumulated.assign(1024*1024,'x');
+    req->admission_payload_lease=ResourceAllocationLease::Acquire(AllocationCategory::Admission,8*1024*1024);
+    ASSERT_NE(req->admission_payload_lease,nullptr);
+    state->request_pool.Release(req);
+    EXPECT_EQ(ResourceAllocationLease::AvailableBytes(AllocationCategory::Admission),before-sizeof(Request)-128);
+    auto* reused=state->request_pool.Acquire();
+    EXPECT_EQ(reused,req);
+    EXPECT_LT(reused->prompt.capacity(),1024u);
+    EXPECT_EQ(reused->tokens.capacity(),0u);
+    EXPECT_LT(reused->grammar.accumulated.capacity(),1024u);
+    EXPECT_FALSE(reused->admission_payload_lease);
+    state->request_pool.Release(reused);
+}
+
+TEST_F(RequestLifecycleTest, AcceptedPendingPayloadReservationsReleaseAfterCancellationAndShutdown) {
+    using namespace densecore::runtime;
+    std::array<CallbackState,8> callbacks;
+    EmbeddingCallbackState embedding;
+    EngineCloseGuard close_before_callbacks{&engine_};
+    auto* state=static_cast<EngineState*>(engine_);
+    const auto before=ResourceLedgerUsageSnapshot().admission_bytes;
+    densecore::testing::EnablePauseBeforePendingDequeueForTest(true);
+    int last=-1;
+    for (auto& callback:callbacks) {
+        last=SubmitRequestWithSamplingConstraintsCallbackEx(engine_,"pending-payload",2,nullptr,0,1,1,1,
+                      nullptr,0,nullptr,0,0,nullptr,0,LifecycleCallbackEx,&callback);
+        ASSERT_GT(last,0) << DenseCoreGetLastError();
+    }
+    const int embedding_id=SubmitEmbeddingRequest(engine_,"pending-embedding",EmbeddingLifecycleCallback,&embedding);
+    ASSERT_GT(embedding_id,0) << DenseCoreGetLastError();
+    ASSERT_TRUE(densecore::testing::WaitForPauseBeforePendingDequeueForTest(5000));
+    EXPECT_GT(ResourceLedgerUsageSnapshot().admission_bytes,before+9*sizeof(Request));
+    auto blocker=ResourceAllocationLease::Acquire(AllocationCategory::Admission,
+                         ResourceAllocationLease::AvailableBytes(AllocationCategory::Admission));
+    ASSERT_NE(blocker,nullptr);
+    EXPECT_EQ(SubmitRequest(engine_,"refused",2,nullptr,nullptr,nullptr),DENSECORE_STATUS_OUT_OF_MEMORY);
+    ASSERT_EQ(CancelRequest(engine_,last),DENSECORE_STATUS_OK);
+    ASSERT_EQ(CancelRequest(engine_,embedding_id),DENSECORE_STATUS_OK);
+    densecore::testing::ReleasePauseBeforePendingDequeueForTest();
+    for (auto& callback:callbacks) {ASSERT_TRUE(callback.WaitForFinal());EXPECT_EQ(callback.final_count,1);}
+    ASSERT_TRUE(embedding.Wait());
+    EXPECT_EQ(embedding.callback_count,1);
+    EXPECT_LT(embedding.terminal_size,0);
+    blocker.reset();
+    FreeEngine(engine_);
+    engine_=nullptr;
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().admission_bytes,before);
+}
+
+TEST(RequestAdmissionBudgetTest, QueuedResultRetainsPayloadReservationAfterRequestRetirement) {
+    using namespace densecore::runtime;
+    RuntimeMemoryPlan plan;
+    plan.available_bytes=plan.allocator_bytes=256*1024;
+    ResourcePlanLease deterministic_plan(plan);
+    EngineState state;
+    Request req;
+    req.Reset();
+    const auto before=ResourceLedgerUsageSnapshot().admission_bytes;
+    req.admission_payload_lease=ResourceAllocationLease::Acquire(AllocationCategory::Admission,64*1024);
+    ASSERT_NE(req.admission_payload_lease,nullptr);
+    PushResultEvent(&state,1,"owned-output",1,true,false,nullptr,nullptr,nullptr,nullptr,nullptr,1,
+                    DENSECORE_GENERATION_STOP,req.admission_payload_lease);
+    req.ReleaseExecutionState();
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().admission_bytes,before+64*1024);
+    auto blocker=ResourceAllocationLease::Acquire(AllocationCategory::Admission,
+                          ResourceAllocationLease::AvailableBytes(AllocationCategory::Admission));
+    ASSERT_NE(blocker,nullptr);
+    EXPECT_THROW(AcquireBoundedTextRequest(&state,"must-wait-for-output",0,1),densecore::OutOfMemoryException);
+    {
+        // Simulate a callback thread that has not consumed its owned result yet.
+        std::lock_guard<std::mutex> lock(state.result_mu);
+        ASSERT_EQ(state.result_queue.size(),1u);
+        state.result_queue.clear();
+    }
+    auto* recovered=AcquireBoundedTextRequest(&state,"output-drained",0,1);
+    ASSERT_NE(recovered,nullptr);
+    state.request_pool.Release(recovered);
+    blocker.reset();
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().admission_bytes,before+sizeof(Request)+128);
+}
+
+TEST(RequestAdmissionBudgetTest, StandaloneBudgetPreservesUnknownExhaustedAndUnlimitedStates) {
+    using namespace densecore::runtime;
+    ResourceBudget budget;
+    EXPECT_EQ(StandaloneAdmissionCapacity(budget),0u);
+    budget.memory={ResourceState::Finite,0};
+    EXPECT_EQ(StandaloneAdmissionCapacity(budget),0u);
+    budget.memory={ResourceState::Finite,64*1024*1024};
+    EXPECT_EQ(StandaloneAdmissionCapacity(budget),2*1024*1024u);
+    budget.memory={ResourceState::Unlimited,0};
+    EXPECT_EQ(StandaloneAdmissionCapacity(budget),128*1024*1024u);
+}
+
+TEST(RequestAdmissionBudgetTest, TerminalFallbackCallbacksKeepTheirPayloadReservation) {
+    using namespace densecore::runtime;
+    RuntimeMemoryPlan plan;
+    plan.available_bytes=plan.allocator_bytes=64*1024;
+    ResourcePlanLease deterministic_plan(plan);
+    EngineState state;
+    const auto before=ResourceLedgerUsageSnapshot().admission_bytes;
+    struct Probe {uint64_t expected; int calls=0; bool charged=false;};
+    Probe generation{before+1024},embedding{before+1024};
+    auto generation_callback=[](const char*,int finished,void* user) {
+        auto& probe=*static_cast<Probe*>(user);
+        ++probe.calls;
+        probe.charged=finished && ResourceLedgerUsageSnapshot().admission_bytes>=probe.expected;
+    };
+    auto embedding_callback=[](const float*,int size,void* user) {
+        auto& probe=*static_cast<Probe*>(user);
+        ++probe.calls;
+        probe.charged=size==1 && ResourceLedgerUsageSnapshot().admission_bytes>=probe.expected;
+    };
+    state.fail_result_publication_for_test.store(true);
+    PushResultEvent(&state,1,"terminal",1,true,false,generation_callback,nullptr,nullptr,&generation,nullptr,1,
+                    DENSECORE_GENERATION_STOP,ResourceAllocationLease::Acquire(AllocationCategory::Admission,1024));
+    EXPECT_EQ(generation.calls,1);
+    EXPECT_TRUE(generation.charged);
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().admission_bytes,before);
+    state.fail_result_publication_for_test.store(true);
+    PushEmbeddingResultEvent(&state,2,{1.0f},DENSECORE_STATUS_OK,embedding_callback,&embedding,
+                             ResourceAllocationLease::Acquire(AllocationCategory::Admission,1024));
+    EXPECT_EQ(embedding.calls,1);
+    EXPECT_TRUE(embedding.charged);
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().admission_bytes,before);
+}
+
+TEST_F(RequestLifecycleTest, PartiallyAdmittedEmbeddingBatchTerminatesEveryChild) {
+    using namespace densecore::runtime;
+    struct BatchProbe {std::mutex mu; std::condition_variable cv; std::vector<int> sizes;};
+    BatchProbe batch;
+    EmbeddingCallbackState initial;
+    EngineCloseGuard close_before_callbacks{&engine_};
+    auto callback=[](const float*,int size,void* user) {
+        auto& probe=*static_cast<BatchProbe*>(user);
+        {std::lock_guard<std::mutex> lock(probe.mu);probe.sizes.push_back(size);}
+        probe.cv.notify_all();
+    };
+    densecore::testing::EnablePauseBeforePendingDequeueForTest(true);
+    const auto before=ResourceLedgerUsageSnapshot().admission_bytes;
+    ASSERT_GT(SubmitEmbeddingRequest(engine_,"same-text",EmbeddingLifecycleCallback,&initial),0);
+    ASSERT_TRUE(densecore::testing::WaitForPauseBeforePendingDequeueForTest(5000));
+    const auto one_request=ResourceLedgerUsageSnapshot().admission_bytes-before;
+    const auto remaining=ResourceAllocationLease::AvailableBytes(AllocationCategory::Admission);
+    ASSERT_GT(remaining,one_request);
+    auto blocker=ResourceAllocationLease::Acquire(AllocationCategory::Admission,remaining-one_request);
+    ASSERT_NE(blocker,nullptr);
+    const char* prompts[]={"same-text","same-text"};
+    ASSERT_GT(SubmitBatchEmbeddingRequest(engine_,prompts,2,-1,1,callback,&batch),0);
+    {
+        std::lock_guard<std::mutex> lock(batch.mu);
+        ASSERT_EQ(batch.sizes.size(),1u);
+        EXPECT_EQ(batch.sizes[0],DENSECORE_STATUS_OUT_OF_MEMORY);
+    }
+    densecore::testing::ReleasePauseBeforePendingDequeueForTest();
+    ASSERT_TRUE(initial.Wait());
+    {
+        std::unique_lock<std::mutex> lock(batch.mu);
+        ASSERT_TRUE(batch.cv.wait_for(lock,10s,[&]{return batch.sizes.size()==2;}));
+        EXPECT_GT(batch.sizes[1],0);
+    }
+    blocker.reset();
+    FreeEngine(engine_);
+    engine_=nullptr;
+    EXPECT_EQ(batch.sizes.size(),2u);
 }

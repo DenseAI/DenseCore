@@ -1786,7 +1786,34 @@ DENSECORE_API int SubmitGraphRequest(DenseCoreHandle handle, const DenseCoreTens
         }
 
         EngineState* state = (EngineState*)handle;
-        Request* req = AcquireAndInitRequest(state);
+        using namespace densecore::runtime;
+        const uint64_t available = ResourceAllocationLease::AvailableBytes(AllocationCategory::Admission);
+        uint64_t payload_bytes = 16*1024;
+        auto charge = [&](uint64_t bytes) {
+            payload_bytes = resource_detail::Add(payload_bytes,bytes);
+            if (payload_bytes > available || payload_bytes == UINT64_MAX)
+                throw densecore::OutOfMemoryException("native graph admission budget exhausted");
+        };
+        charge(static_cast<uint64_t>(num_inputs)*sizeof(OwnedGraphInput));
+        auto charge_name = [&](const char* name) {
+            if (!name) return;
+            uint64_t length=0;
+            while (length <= available && name[length]) ++length;
+            charge(length);
+        };
+        charge_name(graph_name);
+        // Validate and reserve the entire payload before any owned tensor copy.
+        for (int i=0;i<num_inputs;++i) {
+            size_t bytes=0;
+            std::string error;
+            if (!GraphInputByteSize(inputs[i],&bytes,&error)) {
+                SetError(DENSECORE_STATUS_INVALID_ARGUMENT,"SubmitGraphRequest: "+error);
+                return DENSECORE_STATUS_INVALID_ARGUMENT;
+            }
+            charge(bytes);
+            charge_name(inputs[i].name);
+        }
+        Request* req = AcquireAndInitRequest(state,payload_bytes);
         RequestGuard guard(state, req);
 
         req->is_graph_execution = true;

@@ -118,9 +118,11 @@ struct EngineState;
 void PushResultEvent(EngineState* state, int request_id, const std::string& token, int token_id, bool finished,
                      bool error, TokenCallback cb, TokenCallbackEx cb_ex, TokenResultCallback token_result_cb,
                      void* user_data, GenerationCompletionCallback completion_callback = nullptr,
-                     int generated_tokens = 0, DenseCoreGenerationFinishReason finish_reason = DENSECORE_GENERATION_STOP);
+                     int generated_tokens = 0, DenseCoreGenerationFinishReason finish_reason = DENSECORE_GENERATION_STOP,
+                     std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease = {});
 void PushEmbeddingResultEvent(EngineState* state, int request_id, std::vector<float> embedding_data,
-                              int status, EmbeddingCallback cb, void* user_data);
+                              int status, EmbeddingCallback cb, void* user_data,
+                              std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease = {});
 void EmitRequestResult(EngineState* state, Request* req, const std::string& token, int token_id, bool finished,
                        bool error, bool use_direct_callback);
 
@@ -195,6 +197,7 @@ struct InternalMetrics {
  * memory management - no manual new/delete required.
  */
 struct ResultEvent {
+    std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_payload_lease;
     GenerationCompletionCallback completion_callback = nullptr;
     int generated_tokens = 0;
     DenseCoreGenerationFinishReason finish_reason = DENSECORE_GENERATION_STOP;
@@ -276,6 +279,9 @@ struct OwnedGraphInput {
  * 4. Marked as finished and cleaned up
  */
 struct Request {
+    // Metadata remains charged while pooled; owned payload is freed at retirement.
+    std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_metadata_lease;
+    std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_payload_lease;
     int id;
     std::string prompt;
     std::string lora_name;
@@ -821,12 +827,78 @@ struct Request {
     // Release the budgeted execution payload now, preserving terminal flags
     // and completion state until the object is actually acquired and reset.
     void ReleaseExecutionState() noexcept {
+        BlockTable().swap(block_table);
+        decltype(prompt)().swap(prompt);
+        decltype(lora_name)().swap(lora_name);
+        decltype(tokens)().swap(tokens);
+        decltype(token_history)().swap(token_history);
+        decltype(prompt_tokens_for_cache)().swap(prompt_tokens_for_cache);
+        decltype(original_prompt_tokens_for_cache)().swap(original_prompt_tokens_for_cache);
+        decltype(sequence_tokens_for_prefix_cache)().swap(sequence_tokens_for_prefix_cache);
+        decltype(prefix_cache_skip_reason)().swap(prefix_cache_skip_reason);
+        decltype(utf8_pending)().swap(utf8_pending);
+        decltype(think_tag_pending)().swap(think_tag_pending);
+        decltype(tool_call_tag_pending)().swap(tool_call_tag_pending);
+        decltype(tool_response_tag_pending)().swap(tool_response_tag_pending);
+        decltype(parity_debug_submit_api)().swap(parity_debug_submit_api);
+        decltype(tier)().swap(tier);
+        decltype(ssm_runtime_states)().swap(ssm_runtime_states);
+        decltype(disallowed_token_ids)().swap(disallowed_token_ids);
+        decltype(allowed_token_ids)().swap(allowed_token_ids);
+        decltype(stop_sequences)().swap(stop_sequences);
+        decltype(stop_buffer)().swap(stop_buffer);
+        decltype(graph_cache_last_skip_reason)().swap(graph_cache_last_skip_reason);
+        decltype(prefill_thread_policy)().swap(prefill_thread_policy);
+        decltype(decode_thread_policy)().swap(decode_thread_policy);
+        decltype(qwen36_prefill_q4k_batched_reject_reason)().swap(qwen36_prefill_q4k_batched_reject_reason);
+        decltype(qwen36_ssm_q8_prefill_amx_reject_reason)().swap(qwen36_ssm_q8_prefill_amx_reject_reason);
+        decltype(qwen36_ssm_q8_prefill_amx_prepared_projection_counts)().swap(qwen36_ssm_q8_prefill_amx_prepared_projection_counts);
+        decltype(qwen36_ssm_q8_prefill_amx_projection_counts)().swap(qwen36_ssm_q8_prefill_amx_projection_counts);
+        decltype(qwen36_ssm_projection_actual_types)().swap(qwen36_ssm_projection_actual_types);
+        decltype(q4k_repacked_gemv_last_reject_reason_text)().swap(q4k_repacked_gemv_last_reject_reason_text);
+        decltype(q4k_repacked_gemv_primary_disable_reason_text)().swap(q4k_repacked_gemv_primary_disable_reason_text);
+        decltype(q4k_repacked_gemv_effective_state)().swap(q4k_repacked_gemv_effective_state);
+        decltype(gemv_custom_tasks_cap_reason)().swap(gemv_custom_tasks_cap_reason);
+        decltype(decode_matmul_top_shapes)().swap(decode_matmul_top_shapes);
+        decltype(prefill_matmul_top_shapes)().swap(prefill_matmul_top_shapes);
+        decltype(prefill_matmul_ggml_top_shapes)().swap(prefill_matmul_ggml_top_shapes);
+        decltype(qwen_target_ggml_compute_last_reason)().swap(qwen_target_ggml_compute_last_reason);
+        decltype(qwen_target_ggml_compute_last_op)().swap(qwen_target_ggml_compute_last_op);
+        decltype(qwen_target_ggml_compute_target)().swap(qwen_target_ggml_compute_target);
+        decltype(q6k_gemv_last_reject_reason)().swap(q6k_gemv_last_reject_reason);
+        decltype(q6k_gemv_effective_phase)().swap(q6k_gemv_effective_phase);
+        decltype(q6k_gemv_graph_phase)().swap(q6k_gemv_graph_phase);
+        decltype(q6k_gemv_callback_phase)().swap(q6k_gemv_callback_phase);
+        decltype(q6k_gemv_weight_shapes)().swap(q6k_gemv_weight_shapes);
+        decltype(native_moe_graph_top_slow_nodes)().swap(native_moe_graph_top_slow_nodes);
+        decltype(decode_graph_top_slow_nodes)().swap(decode_graph_top_slow_nodes);
+        decltype(native_moe_graph_node_hist)().swap(native_moe_graph_node_hist);
+        decltype(moe_small_decode_parallel_last_reject_reason)().swap(moe_small_decode_parallel_last_reject_reason);
+        decltype(moe_q4k_repacked_last_reject_reason)().swap(moe_q4k_repacked_last_reject_reason);
+        decltype(moe_q5k_repacked_last_reject_reason)().swap(moe_q5k_repacked_last_reject_reason);
+        decltype(gemma4_moe_prefill_quant_batch_last_reject_reason)().swap(gemma4_moe_prefill_quant_batch_last_reject_reason);
+        decltype(gemma4_native_moe_prefill_last_reject_reason)().swap(gemma4_native_moe_prefill_last_reject_reason);
+        decltype(gemma4_dense_prefill_native_last_reject_reason)().swap(gemma4_dense_prefill_native_last_reject_reason);
+        decltype(gemma4_decode_native_last_reject_reason)().swap(gemma4_decode_native_last_reject_reason);
+        decltype(native_moe_fast_decode_last_reject_reason)().swap(native_moe_fast_decode_last_reject_reason);
+        decltype(native_moe_fast_w2_q5k_last_reject_reason)().swap(native_moe_fast_w2_q5k_last_reject_reason);
+        decltype(graph_ctx_fail_reason)().swap(graph_ctx_fail_reason);
+        decltype(qwen35_moe_path)().swap(qwen35_moe_path);
+        decltype(matmul_dispatch_top_slow_entries)().swap(matmul_dispatch_top_slow_entries);
+        decltype(qwen36_prefill_top_slow_ops)().swap(qwen36_prefill_top_slow_ops);
+        decltype(gemma4_prefill_top_slow_ops)().swap(gemma4_prefill_top_slow_ops);
+        decltype(qwen36_prefill_native_moe_fast_last_reject_reason)().swap(qwen36_prefill_native_moe_fast_last_reject_reason);
+        decltype(callback_mode)().swap(callback_mode);
+        decltype(graph_name)().swap(graph_name);
+        decltype(graph_inputs)().swap(graph_inputs);
+        std::string().swap(grammar.accumulated);
         ssm_runtime_states.clear();
         swap_state.active = false;
         swap_state.total_tokens = 0;
         swap_state.num_blocks = 0;
         std::vector<uint8_t>().swap(swap_state.k_data);
         std::vector<uint8_t>().swap(swap_state.v_data);
+        admission_payload_lease.reset();
     }
 
     // Reset request state for pool reuse
@@ -1401,7 +1473,7 @@ inline bool FinalizeEmbeddingRequestOnce(EngineState* state, Request* req, std::
             }
         } else {
             PushEmbeddingResultEvent(state, req->id, std::move(embedding_data), status, req->embedding_callback,
-                                     req->user_data);
+                                     req->user_data,req->admission_payload_lease);
         }
     }
     {
@@ -1476,6 +1548,7 @@ struct ModelEntry {
     KVCacheConfig kv_config{}; // Effective context/concurrency and one initialization memory plan.
     std::string model_id;
     std::string model_path;
+    uint64_t admission_max_piece_bytes = 0; // Initialized under construction_mu on first text admission.
 
     // Owned resources with automatic cleanup via RAII
     std::unique_ptr<TransformerModel> model;
@@ -1493,12 +1566,13 @@ struct ModelEntry {
 template <typename T> class ObjectPool {
 public:
     using RetireCallback = void (*)(T*) noexcept;
-    explicit ObjectPool(RetireCallback retire = nullptr) : retire_(retire) {}
+    using Factory = T* (*)();
+    explicit ObjectPool(RetireCallback retire = nullptr, Factory factory = nullptr) : retire_(retire), factory_(factory) {}
 
     T* Acquire() {
         std::lock_guard<std::mutex> lock(mu_);
         if (pool_.empty()) {
-            return new T();
+            return factory_ ? factory_() : new T();
         }
         T* obj = pool_.top();
         pool_.pop();
@@ -1527,6 +1601,7 @@ public:
 
 private:
     RetireCallback retire_ = nullptr;
+    Factory factory_ = nullptr;
     std::stack<T*> pool_;
     std::mutex mu_;
 };
@@ -1665,7 +1740,14 @@ struct EngineState {
     std::vector<Request*> active_requests;  // Non-owning pointers
 
     // Object Pool for requests (thread-safe)
-    ObjectPool<Request> request_pool{[](Request* request) noexcept { request->ReleaseExecutionState(); }};
+    ObjectPool<Request> request_pool{[](Request* request) noexcept { request->ReleaseExecutionState(); }, []() {
+        auto metadata = densecore::runtime::ResourceAllocationLease::Acquire(
+            densecore::runtime::AllocationCategory::Admission,sizeof(Request)+128);
+        if (!metadata) throw densecore::OutOfMemoryException("native request admission metadata budget exhausted");
+        auto request = std::make_unique<Request>();
+        request->admission_metadata_lease = std::move(metadata);
+        return request.release();
+    }};
 
     // Mutex only for active_requests (rarely contested, not on hot path)
     std::mutex active_mu;
@@ -2555,9 +2637,11 @@ inline void ApplyResultQueueBackpressure(EngineState* state, std::unique_lock<st
 inline void PushResultEvent(EngineState* state, int request_id, const std::string& token, int token_id, bool finished,
                             bool error, TokenCallback cb, TokenCallbackEx cb_ex, TokenResultCallback token_result_cb,
                             void* user_data, GenerationCompletionCallback completion_callback,
-                            int generated_tokens, DenseCoreGenerationFinishReason finish_reason) {
+                            int generated_tokens, DenseCoreGenerationFinishReason finish_reason,
+                            std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease) {
     try {
         ResultEvent event;
+        event.admission_payload_lease = admission_lease;
         event.completion_callback = completion_callback;
         event.generated_tokens = generated_tokens;
         event.finish_reason = finish_reason;
@@ -2609,8 +2693,10 @@ inline void PushResultEvent(EngineState* state, int request_id, const std::strin
 
 // Helper for embedding results (RAII-safe: takes ownership via std::move)
 inline void PushEmbeddingResultEvent(EngineState* state, int request_id, std::vector<float> embedding_data,
-                                     int status, EmbeddingCallback cb, void* user_data) {
+                                     int status, EmbeddingCallback cb, void* user_data,
+                                     std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease) {
     ResultEvent event;
+    event.admission_payload_lease = admission_lease;
     event.request_id = request_id;
     event.finished = true;
     event.error = status != DENSECORE_STATUS_OK;

@@ -585,7 +585,7 @@ void EmitRequestResult(EngineState* state, Request* req, const std::string& toke
 
     PushResultEvent(state, req->id, token, token_id, finished, error, req->callback, req->callback_ex,
                     req->token_result_callback, req->user_data, completion_callback, req->generated_count,
-                    finish_reason);
+                    finish_reason,req->admission_payload_lease);
 }
 
 bool ShouldBypassSingleRequestFastPathForLongHybridSSM(const TransformerModel* model, const Request* req) {

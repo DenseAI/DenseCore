@@ -48,3 +48,46 @@ def test_native_worker_error_is_reported_instead_of_zero_embedding():
     model._lib = FailedNative()
     with pytest.raises(RuntimeError, match="worker failed"):
         model._embed_single("text", -1, True)
+
+
+def test_admission_rejection_raises_without_waiting_for_a_callback():
+    model = fake_model()
+
+    class RejectedNative:
+        def SubmitEmbeddingRequestEx(self, *args):
+            return -3
+
+    model._lib = RejectedNative()
+    with pytest.raises(RuntimeError, match="Embedding request failed: -3"):
+        model._embed_single("text", -1, True)
+
+
+def test_rejected_batch_raises_without_waiting_for_callbacks():
+    model = fake_model()
+    model._BATCH_EMBEDDING_CALLBACK = lambda callback: callback
+
+    class RejectedNative:
+        def SubmitBatchEmbeddingRequest(self, *args):
+            return -3
+
+    model._lib = RejectedNative()
+    with pytest.raises(RuntimeError, match="Batch embedding request failed: -3"):
+        model._embed_batch_native(["a", "b"], -1, True, False)
+
+
+def test_partial_batch_admission_failure_finishes_before_raising():
+    import ctypes
+
+    model = fake_model()
+    model._BATCH_EMBEDDING_CALLBACK = lambda callback: callback
+
+    class PartialNative:
+        def SubmitBatchEmbeddingRequest(self, handle, texts, count, pooling, norm, callback, user):
+            vector = np.array([1.0, 0.0], dtype=np.float32)
+            callback(vector.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), 2, None)
+            callback(None, -3, None)
+            return 1
+
+    model._lib = PartialNative()
+    with pytest.raises(RuntimeError, match="Batch embedding worker failed"):
+        model._embed_batch_native(["a", "b"], -1, True, False)
