@@ -10,6 +10,8 @@ linked from [Benchmarks](BENCHMARKS.md).
 | Default CLI, downloader and quick start | `lmstudio-community/Qwen3.5-0.8B-GGUF@7925ccdc665d4efdb1034791e6b553e11128e6f8` | `Qwen3.5-0.8B-Q4_K_M.gguf` | `f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec` | Final integrated image/pod qualification pending |
 | Qwen3 small dense baseline | `Qwen/Qwen3-0.6B-GGUF@23749fefcc72300e3a2ad315e1317431b06b590a` | `Qwen3-0.6B-Q8_0.gguf` | `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031` | Day 0 local baseline; integrated final-answer qualification pending |
 | Embedding baseline | `Qwen/Qwen3-Embedding-0.6B-GGUF@370f27d7550e0def9b39c1f16d3fbaa13aa67728` | `Qwen3-Embedding-0.6B-Q8_0.gguf` | `06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439` | Day 0 explicit-LAST baseline; AUTO qualification pending |
+| Qwen3.5-0.8B MTP target | `unsloth/Qwen3.5-0.8B-MTP-GGUF@cf8a611f6ed2c2060046219a19f12cd3d5ecd67c` | `Qwen3.5-0.8B-Q4_K_M.gguf` | `ac7c9d7a1b3e3695bb3bd50f8ceaa97f9c93e99ccc3d3d1a620301b6dd6d3d86` | Pending same-file correctness/performance qualification; no automatic activation |
+| Qwen3.5-2B MTP target | `unsloth/Qwen3.5-2B-MTP-GGUF@e05864f8066d874d5f85aaff007ae57a2a7d1efe` | `Qwen3.5-2B-Q4_K_M.gguf` | `18c92228fc1498a02506f64593f7cc8cc02f406f732a217c6ba99ad1254d4f0b` | Pending same-file correctness/performance qualification; no automatic activation |
 | 35B comparison | `ggml-org/Qwen3.6-35B-A3B-GGUF@7878dc9a905c7c9379e5e8d6a1aa9affdd6839c5` | `Qwen3.6-35B-A3B-Q4_K_M.gguf` | `671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7` | Historical native benchmark; new C4/C4A and NUMA qualification pending |
 | Gemma E2B text inference target | `unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2` | `gemma-4-E2B-it-Q4_K_M.gguf` | `740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8` | Pending integrated real-model qualification |
 | Gemma E4B text inference target | `ggml-org/gemma-4-E4B-it-GGUF@a69f018d7678a2b9f5e705f8903d6fb29b9b25dc` | `gemma-4-E4B-it-Q4_0.gguf` | `a555b900214b477d8880e7832e0b8925e139b0159640036b09fe472b6f2097f2` | Pending real-model qualification; pin is not a support claim |
@@ -20,6 +22,10 @@ Its result does not qualify the default file above. The Day 0 Gemma E2B fixture
 (`ac0069eb…6845`) also differs from the public E2B pin in this table. Native
 kernel fixtures do not qualify that public artifact. Local files with unknown
 source revision remain local evidence; do not turn their filenames into pins.
+
+Local MTP test files may have an added `-MTP` suffix. The catalog lists the
+original repository filenames; the MTP/non-MTP repositories can use identical
+filenames for different bytes, so compare SHA-256 and revision rather than names.
 
 The local Qwen3.5-2B-Q4_K_M fixture has SHA-256
 `aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223`.
