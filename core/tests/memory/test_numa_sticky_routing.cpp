@@ -1900,9 +1900,9 @@ TEST(NumaStickyRouting, RepackedDenseGemmMatchesVecDotForKQuants) {
     }
 }
 
-// Regression for cross-token state isolation in batch>1 MoE. The corruption
-// requires an already-active NUMA pool: a lagging inactive worker previously
-// mixed dispatch generations and kept writing after the callback's lifetime.
+// Regression for cross-token state isolation in batch>1 MoE. A persistent
+// registry previously reused dequantized tensors across unrelated expert
+// buffers/shapes, so NUMA matmul wrote stale dimensions into new scratch.
 TEST(NumaStickyRouting, ForwardMoESmallDecodeBatchMatchesPerTokenDecode) {
     // Distinct tokens and expert pairs expose accidentally shared activation rows.
     CpuBackend& backend = GetCpuBackend();
