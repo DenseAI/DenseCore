@@ -35,6 +35,9 @@ int PositionIdsPerToken(const TransformerModel* model);
 
 // Reference checks and diagnostics
 HiddenSnapshotUserData* AllocateHiddenSnapshotUserData(struct ggml_context* ctx_c);
+// Adds a side-branch capture without replacing the actual consumer input.
+ggml_tensor* AttachPassiveHiddenSnapshot(ggml_context* ctx, ggml_cgraph* graph, ggml_tensor* input,
+                                         int layer, const char* stage);
 void CheckSSMFiniteTensor(int layer_idx, const int* token_seq_ids, const struct ggml_tensor* tensor, const char* stage,
                           const char* var_name);
 AttentionCoreReferenceUserData* GetAttentionCoreReferenceUserData();

@@ -257,6 +257,11 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
         return ggml_cast(ctx_c, src, GGML_TYPE_F32);
     };
 
+    const auto attach_ple_snapshot = [&](int layer, const char* stage, ggml_tensor* input) {
+        if (model->arch_flags.is_gemma4 && ShouldRunHiddenSnapshotProbe(layer, stage))
+            AttachPassiveHiddenSnapshot(ctx_c, gf, input, layer, stage);
+    };
+
     auto apply_weighted_rms_norm = [&](struct ggml_tensor * src, struct ggml_tensor * norm_weight,
                                        const char* debug_name, int debug_layer_idx = -1) -> struct ggml_tensor* {
         if (!src || !norm_weight) {
@@ -285,6 +290,16 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                     std::snprintf(rms_name, sizeof(rms_name), "%s_rms", debug_name);
                 }
                 ggml_set_name(out, rms_name);
+            }
+            if (model->arch_flags.is_gemma4 && debug_name && debug_layer_idx >= 0 &&
+                std::strcmp(debug_name, "gemma4_post_per_layer_input_norm") == 0)
+                attach_ple_snapshot(debug_layer_idx, "ple_post_rms_unweighted", out);
+            if (model->arch_flags.is_gemma4 && debug_name &&
+                std::strcmp(debug_name, "gemma4_per_layer_projection_norm") == 0 &&
+                ShouldRunHiddenSnapshotProbe(0, "ple_model_rms_unweighted")) {
+                auto* rows = ggml_reshape_3d(ctx_c, out, model->gemma4_hidden_size_per_layer_input,
+                                           model->hparams.n_layer, N);
+                attach_ple_snapshot(0, "ple_model_rms_unweighted", Gemma4LayerInputView(ctx_c, rows, 0, 0, N));
             }
             out = checked_mul(ctx_c, out, effective_norm_weight, debug_name ? debug_name : "weighted_rms_norm");
             if (debug_name) {
@@ -323,6 +338,12 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
     };
 
     struct ggml_tensor* gemma4_per_layer_inputs = nullptr;
+    ggml_tensor* ple_model_input = nullptr;
+    ggml_tensor* ple_model_projected = nullptr;
+    ggml_tensor* ple_model_scaled = nullptr;
+    ggml_tensor* ple_model_normed = nullptr;
+    ggml_tensor* ple_lookup = nullptr;
+    ggml_tensor* ple_token_scaled = nullptr;
     if (model->arch_flags.is_gemma4 && model->gemma4_hidden_size_per_layer_input > 0 &&
         model->gemma4_per_layer_model_projection && model->gemma4_per_layer_projection_norm &&
         model->gemma4_per_layer_token_embeddings) {
@@ -330,20 +351,26 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
         const int n_layer_i = static_cast<int>(model->hparams.n_layer);
 
         struct ggml_tensor* token_inputs = ggml_get_rows(ctx_c, model->gemma4_per_layer_token_embeddings, embd_inp);
+        ple_lookup = token_inputs;
+        ple_model_input = cur;
         token_inputs = ggml_scale(ctx_c, token_inputs, std::sqrt(static_cast<float>(hidden_per_layer)));
         token_inputs = ggml_reshape_3d(ctx_c, token_inputs, hidden_per_layer, n_layer_i, N);
+        ple_token_scaled = token_inputs;
 
         struct ggml_tensor* projected_inputs =
             smart_mul_mat(ctx_c, model->gemma4_per_layer_model_projection, cur, model);
+        ple_model_projected = projected_inputs;
         projected_inputs =
             ggml_scale(ctx_c, projected_inputs, 1.0f / std::sqrt(static_cast<float>(model->hparams.n_embd)));
         projected_inputs = ggml_reshape_3d(ctx_c, projected_inputs, hidden_per_layer, n_layer_i, N);
+        ple_model_scaled = projected_inputs;
 
         struct ggml_tensor* projected_inputs_2d =
             ggml_reshape_2d(ctx_c, projected_inputs, hidden_per_layer, n_layer_i * N);
         projected_inputs_2d = apply_weighted_rms_norm(projected_inputs_2d, model->gemma4_per_layer_projection_norm,
                                                       "gemma4_per_layer_projection_norm");
         gemma4_per_layer_inputs = ggml_reshape_3d(ctx_c, projected_inputs_2d, hidden_per_layer, n_layer_i, N);
+        ple_model_normed = gemma4_per_layer_inputs;
         gemma4_per_layer_inputs = ggml_add(ctx_c, gemma4_per_layer_inputs, token_inputs);
         gemma4_per_layer_inputs = ggml_scale(ctx_c, gemma4_per_layer_inputs, std::pow(2.0f, -0.5f));
     }
@@ -2915,12 +2942,29 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                 }
                 struct ggml_tensor* per_layer_input =
                     Gemma4LayerInputView(ctx_c, gemma4_per_layer_inputs, il, selected_start, selected_tokens);
+                const auto attach_ple_slice = [&](const char* stage, ggml_tensor* source) {
+                    if (ShouldRunHiddenSnapshotProbe(il, stage))
+                        attach_ple_snapshot(il, stage, Gemma4LayerInputView(ctx_c, source, il, selected_start, selected_tokens));
+                };
+                attach_ple_snapshot(il, "ple_model_input", ple_model_input);
+                attach_ple_snapshot(il, "ple_model_projected", ple_model_projected);
+                attach_ple_snapshot(il, "ple_token_lookup", ple_lookup);
+                attach_ple_slice("ple_model_scaled", ple_model_scaled);
+                attach_ple_slice("ple_model_normed", ple_model_normed);
+                attach_ple_slice("ple_token_scaled", ple_token_scaled);
+                attach_ple_snapshot(il, "ple_selected_input", per_layer_input);
+                attach_ple_snapshot(il, "ple_gate_input", cur);
                 struct ggml_tensor* per_layer_delta = smart_mul_mat(ctx_c, per_layer_gate, cur, model);
+                attach_ple_snapshot(il, "ple_gate_projected", per_layer_delta);
                 per_layer_delta = ggml_gelu(ctx_c, per_layer_delta);
+                attach_ple_snapshot(il, "ple_gate_gelu", per_layer_delta);
                 per_layer_delta = checked_mul(ctx_c, per_layer_delta, per_layer_input, "gemma4 per-layer input gate");
+                attach_ple_snapshot(il, "ple_gated_input", per_layer_delta);
                 per_layer_delta = smart_mul_mat(ctx_c, per_layer_proj, per_layer_delta, model);
+                attach_ple_snapshot(il, "ple_projected", per_layer_delta);
                 per_layer_delta = apply_weighted_rms_norm(per_layer_delta, post_per_layer_norm,
                                                           "gemma4_post_per_layer_input_norm", il);
+                attach_ple_snapshot(il, "ple_post_weighted_norm", per_layer_delta);
                 cur = ggml_add(ctx_c, cur, per_layer_delta);
                 if (ShouldRunHiddenSnapshotProbe(il, "after_per_layer_input")) {
                     auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);

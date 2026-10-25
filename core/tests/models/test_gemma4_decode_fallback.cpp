@@ -2148,3 +2148,59 @@ TEST(Gemma4DecodeGraphTest, CanonicalQ4KProjectionMatchesOwnedSingleColumnsAtEve
         }
     }
 }
+
+
+TEST(Gemma4DecodeGraphTest, PassivePleSnapshotKeepsActualConsumerAndStridedTokenColumns) {
+    constexpr int hidden=256,layers=35;
+    for(bool deferred:{false,true})for(int tokens:{1,3})for(int layer:{0,34}) {
+        SCOPED_TRACE(deferred);
+        SCOPED_TRACE(tokens);
+        SCOPED_TRACE(layer);
+        std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(
+            ggml_init({2*1024*1024,nullptr,deferred}),ggml_free);
+        ASSERT_NE(ctx,nullptr);
+        auto* backing=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,hidden,layers,tokens);
+        ggml_set_input(backing);
+        auto* selected=densecore::llm::graph::detail::Gemma4LayerInputView(ctx.get(),backing,layer,0,tokens);
+        auto* consumer_input=ggml_cont(ctx.get(),selected);
+        auto* actual=ggml_scale(ctx.get(),consumer_input,.5f);
+        auto* graph=ggml_new_graph_custom(ctx.get(),128,false);
+        auto* tap=AttachPassiveHiddenSnapshot(ctx.get(),graph,selected,layer,"ple_selected_input");
+        ggml_set_output(actual);ggml_build_forward_expand(graph,actual);
+        EXPECT_EQ(actual->src[0],consumer_input);
+        EXPECT_EQ(consumer_input->src[0],selected);
+        EXPECT_EQ(tap->src[0],selected);
+        EXPECT_EQ(selected->nb[1],hidden*layers*sizeof(float));
+        EXPECT_EQ(ggml_get_no_alloc(ctx.get()),deferred);
+        std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(),ggml_backend_free);
+        ASSERT_NE(backend,nullptr);
+        std::unique_ptr<ggml_gallocr,decltype(&ggml_gallocr_free)> allocator(
+            ggml_gallocr_new(ggml_backend_cpu_buffer_type()),ggml_gallocr_free);
+        ASSERT_NE(allocator,nullptr);
+        if(deferred) {
+            ASSERT_TRUE(ggml_gallocr_reserve(allocator.get(),graph));
+            ASSERT_TRUE(ggml_gallocr_alloc_graph(allocator.get(),graph));
+        }
+        ASSERT_NE(backing->data,nullptr);
+        for(int64_t i=0;i<ggml_nelements(backing);++i)
+            static_cast<float*>(backing->data)[i]=static_cast<float>((i*17)%251-125)/32.f;
+        ASSERT_EQ(ggml_backend_graph_compute(backend.get(),graph),GGML_STATUS_SUCCESS);
+        for(int token=0;token<tokens;++token)for(int column=0;column<hidden;++column) {
+            const int64_t original=(token*layers+layer)*hidden+column;
+            const float expected=static_cast<float>((original*17)%251-125)/32.f;
+            EXPECT_FLOAT_EQ(static_cast<float*>(tap->data)[token*hidden+column],expected);
+            EXPECT_FLOAT_EQ(static_cast<float*>(actual->data)[token*hidden+column],expected*.5f);
+        }
+        EXPECT_EQ(actual->src[0],consumer_input);
+        EXPECT_EQ(consumer_input->src[0],selected); // capture never replaces the real operation input.
+    }
+}
+
+TEST(Gemma4DecodeGraphTest, PassivePleSnapshotRejectsUnflattenedLayerTokenLayout) {
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({256*1024,nullptr,true}),ggml_free);
+    ASSERT_NE(ctx,nullptr);
+    auto* input=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,256,35,3);
+    auto* graph=ggml_new_graph_custom(ctx.get(),128,false);
+    EXPECT_THROW(AttachPassiveHiddenSnapshot(ctx.get(),graph,input,0,"ple_selected_input"),densecore::InvalidArgumentException);
+    EXPECT_TRUE(ggml_get_no_alloc(ctx.get()));
+}

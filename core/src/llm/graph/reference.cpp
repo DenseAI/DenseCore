@@ -555,6 +555,23 @@ void cb_rmsnorm_reference_probe(struct ggml_tensor* dst, const struct ggml_tenso
                  seq_id, runtime_nonfinite ? 1 : 0, ref_nonfinite ? 1 : 0, max_abs_diff, max_idx, max_actual, max_ref);
 }
 
+ggml_tensor* AttachPassiveHiddenSnapshot(ggml_context* ctx, ggml_cgraph* graph, ggml_tensor* input,
+                                         int layer, const char* stage) {
+    if (!ctx || !graph || !input || !stage || input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) ||
+        input->ne[0] <= 0 || input->ne[1] <= 0 || input->ne[2] != 1 || input->ne[3] != 1) {
+        throw densecore::InvalidArgumentException("passive hidden snapshot requires an owned graph and F32 matrix");
+    }
+    auto* ud = AllocateHiddenSnapshotUserData(ctx);
+    ud->layer_idx = layer;
+    ud->token_idx = -1;
+    ud->stage = stage;
+    ud->var_name = stage;
+    auto* tap = ggml_map_custom1(ctx, input, cb_hidden_snapshot_probe, 1, ud);
+    ggml_set_output(tap);
+    ggml_build_forward_expand(graph, tap);
+    return tap;
+}
+
 void cb_hidden_snapshot_probe(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth,
                               void* userdata) {
     (void)nth;
