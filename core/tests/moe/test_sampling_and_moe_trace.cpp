@@ -1800,3 +1800,54 @@ TEST(SamplingComposedFilters, SingletonFiltersKeepTheirAnalyticDistributions) {
     params.min_p = .6f;
     ExpectAnalyticDistribution(AnalyticSamplerDistribution(FourProbabilityLogits(), params), {4./7,3./7,0,0});
 }
+
+
+TEST(SamplingNoTopK, NonpositiveTopKLeavesTheFullSoftmaxDistribution) {
+    SamplingParams params;
+    params.temperature = 1;
+    params.top_p = 1;
+    for (int top_k : {0, -1}) {
+        SCOPED_TRACE(top_k); // Zero is public disabled semantics; negative matches internal legacy range handling.
+        params.top_k = top_k;
+        ExpectAnalyticDistribution(AnalyticSamplerDistribution(FourProbabilityLogits(), params), {.4,.3,.2,.1});
+    }
+}
+
+TEST(SamplingNoTopK, FullSoftmaxDrawsReachNonmaximalTokens) {
+    ggml_init_params init{16384, nullptr, false};
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(init), ggml_free);
+    ASSERT_NE(ctx, nullptr);
+    auto* logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4, 1);
+    const auto values = FourProbabilityLogits();
+    std::copy(values.begin(), values.end(), static_cast<float*>(logits->data));
+    SamplingParams params;
+    params.temperature = 1;
+    params.top_k = 0;
+    params.top_p = 1;
+    std::mt19937 rng(17);
+    int counts[4] = {};
+    constexpr int draws = 4000;
+    for (int i = 0; i < draws; ++i) ++counts[SampleTokenWithRng(logits, 0, params, rng)];
+    const double expected[] = {.4,.3,.2,.1};
+    for (int i = 0; i < 4; ++i) EXPECT_NEAR(static_cast<double>(counts[i])/draws, expected[i], .04);
+}
+
+TEST(SamplingNoTopK, TemperatureZeroAndTopKOneRemainGreedyWithoutRngDraws) {
+    ggml_init_params init{16384, nullptr, false};
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(init), ggml_free);
+    ASSERT_NE(ctx, nullptr);
+    auto* logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4, 1);
+    const auto values = FourProbabilityLogits();
+    std::copy(values.begin(), values.end(), static_cast<float*>(logits->data));
+    for (int mode = 0; mode < 3; ++mode) {
+        SamplingParams params;
+        params.temperature = mode == 2 ? 1 : 0;
+        params.top_k = mode == 0 ? 0 : mode == 1 ? -1 : 1;
+        params.top_p = 1;
+        std::mt19937 rng(17);
+        const auto before = rng;
+        EXPECT_EQ(SampleTokenWithRng(logits, 0, params, rng), 0);
+        EXPECT_EQ(rng, before);
+        ExpectAnalyticDistribution(BuildSamplingDistribution(logits, 0, params), {1,0,0,0});
+    }
+}

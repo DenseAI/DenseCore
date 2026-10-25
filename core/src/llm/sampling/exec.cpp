@@ -961,7 +961,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
         return found ? best_idx : first_allowed_token();
     };
 
-    if (params.temperature <= 0.0f || (params.top_k <= 1 && params.top_p >= 1.0f && params.min_p <= 0.0f)) {
+    if (params.temperature <= 0.0f || (params.top_k == 1 && params.top_p >= 1.0f && params.min_p <= 0.0f)) {
         const int token = finite_argmax_adjusted();
         maybe_record_sampling_trace(token);
         debug_dump_top_candidates("argmax_adjusted", token);
