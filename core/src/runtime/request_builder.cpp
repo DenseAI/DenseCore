@@ -202,7 +202,9 @@ bool ShouldPrimeQwenNoThinkingPrompt(const TransformerModel* model) {
         return false;
     }
     if (descriptor.variant == ModelVariant::QWEN3) {
-        return !ParseBoolEnv("DENSECORE_QWEN3_ENABLE_THINKING", true);
+        // Its official disabled-thinking cue is a closed <think> block.
+        // Inserting Answer: before that block changes the model's protocol.
+        return false;
     }
     if (descriptor.variant == ModelVariant::QWEN35) {
         return false;

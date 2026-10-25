@@ -385,7 +385,7 @@ TEST(ChatTemplateTest, Qwen36NoThinkingPromptTextCanPrimeAssistantAnswerCueWhenE
     EXPECT_NE(primed.find("<|im_start|>assistant\nAnswer: "), std::string::npos);
 }
 
-TEST(ChatTemplateTest, Qwen3NoThinkingPrimesAssistantAnswerCue) {
+TEST(ChatTemplateTest, Qwen3NoThinkingPreservesOfficialCueWithoutAnswerPriming) {
     TransformerModel model{};
     model.arch = ModelArch::QWEN3;
     model.variant = ModelVariant::QWEN3;
@@ -395,9 +395,13 @@ TEST(ChatTemplateTest, Qwen3NoThinkingPrimesAssistantAnswerCue) {
     setenv("DENSECORE_QWEN3_ENABLE_THINKING", "false", 1);
     const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "What is the capital of France?");
     const std::string primed = DenseCoreTestOnlyPrimeQwenNoThinking(&model, wrapped);
+    const std::string primed_text = DenseCoreTestOnlyPrimeQwenNoThinkingPromptText(&model, wrapped);
     unsetenv("DENSECORE_QWEN3_ENABLE_THINKING");
 
-    EXPECT_NE(primed.find("<|im_start|>assistant\nAnswer: "), std::string::npos);
+    EXPECT_EQ(primed, wrapped);
+    EXPECT_EQ(primed_text, wrapped);
+    EXPECT_EQ(wrapped, "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n"
+                       "<|im_start|>assistant\n<think>\n\n</think>\n\n");
 }
 
 TEST(ChatTemplateTest, GemmaThinkingAutoTemplateInjectsThinkSystemTurn) {
