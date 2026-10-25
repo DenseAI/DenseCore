@@ -436,7 +436,14 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
 
 // Keep the legacy effective default context, then fit concurrency around it.
 // Explicit context is a contract and must not silently shrink to a KV target.
-KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type) {
+KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type,
+                                      int speculation_mode, int draft_n_max) {
+    if (speculation_mode < DENSECORE_SPEC_AUTO || speculation_mode > DENSECORE_SPEC_MTP ||
+        draft_n_max < 1 || draft_n_max > 3 || (speculation_mode == DENSECORE_SPEC_MTP && !model))
+        throw std::invalid_argument("invalid speculation resource configuration");
+    if (speculation_mode == DENSECORE_SPEC_MTP &&
+        model->variant != ModelVariant::QWEN35 && model->variant != ModelVariant::QWEN36)
+        throw std::invalid_argument("explicit MTP supports Qwen3.5/3.6 NextN graphs only");
     KVCacheConfig config = ComputeKVCacheConfig(model, requested_cache_type);
     bool explicit_context = false, explicit_concurrency = false;
     const int context = ReadEnvInt("DENSECORE_MAX_SEQ_LEN", config.max_seq_len, &explicit_context);
@@ -487,9 +494,10 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
             plan.recurrent_bytes = SaturatingMulSize(SaturatingMulSize(per_request,sequences),3);
             plan.prefix_snapshot_bytes = 512*MB;
         }
-        // No checkpoints allocated while no MTP profile is qualified. The real
-        // K+1 request-state cost must replace zero when a profile is enabled.
-        plan.mtp_checkpoint_bytes = 0;
+        // Reserve real head/checkpoint cost before selecting concurrency and
+        // before the primary KV arena is allocated. AUTO has no eligible profile.
+        plan.mtp_checkpoint_bytes = speculation_mode == DENSECORE_SPEC_MTP
+            ? CalculateSpeculationMemory(*model, config.max_seq_len, sequences, draft_n_max).Total() : 0;
         plan.allocator_bytes = std::max<uint64_t>(256*MB,plan.available_bytes/16);
         const uint64_t fixed = plan.RequiredBytes();
         const size_t cache_reserve = DecodeGraphCacheCtxBytes();
@@ -499,6 +507,10 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
         const size_t prefill_pool = PlanRuntimeGraphPoolBytes(model,key_context,1,prefill_chunk,prefill_chunk,pool_available);
         const size_t decode_pool = PlanRuntimeGraphPoolBytes(model,key_context,sequences,1,sequences,pool_available);
         size_t peak_pool = std::max(prefill_pool,decode_pool);
+        if (speculation_mode == DENSECORE_SPEC_MTP) {
+            const size_t width = std::min<size_t>(draft_n_max + 1, key_context);
+            peak_pool = std::max(peak_pool, PlanRuntimeGraphPoolBytes(model, key_context, 1, width, width, pool_available));
+        }
         auto candidate_config = config;
         candidate_config.max_num_seqs = sequences;
         candidate_config.max_prefill_chunk_tokens = prefill_chunk;
@@ -919,7 +931,7 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
 
     const ggml_type default_cache_type = requested_type == GGML_TYPE_COUNT ? ResolveDefaultKVCacheType(model) : requested_type;
     state->requested_kv_cache_type = default_cache_type;
-    const KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, default_cache_type);
+    const KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, default_cache_type, spec_type, draft_n_max);
     auto reservation = std::make_unique<densecore::runtime::ResourcePlanLease>(kv_config.memory_plan);
     if (kv_config.effective_cache_type != kv_config.requested_cache_type) {
         LOG_WARN("Requested KV type {} is incompatible with this model; using {}",

@@ -13,6 +13,34 @@ uint64_t Mul(uint64_t a, uint64_t b) {
     return a * b;
 }
 }
+uint64_t SpeculationMemoryCost::Total() const {
+    return Add(Add(head_kv, prompt_hidden), Add(Add(graph, distributions), checkpoints));
+}
+SpeculationMemoryCost CalculateSpeculationMemory(const TransformerModel& model, uint64_t context,
+                                                 uint64_t concurrency, int draft_n_max) {
+    if (!context || !concurrency || draft_n_max < 1 || draft_n_max > 3 ||
+        model.hparams.n_embd <= 0 || model.hparams.n_head <= 0 || model.hparams.n_vocab <= 0)
+        throw std::invalid_argument("invalid MTP resource dimensions");
+    const uint64_t rounded = Mul(Add(context, BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE);
+    const int key_dim = model.hparams.n_embd_head_k > 0 ? model.hparams.n_embd_head_k
+        : model.hparams.n_embd / model.hparams.n_head;
+    const int value_dim = model.hparams.n_embd_head_v > 0 ? model.hparams.n_embd_head_v : key_dim;
+    if (key_dim <= 0 || value_dim <= 0 || model.hparams.n_head_kv <= 0)
+        throw std::invalid_argument("invalid MTP head KV shape");
+    const uint64_t head_bpt = ComputeKVCacheBytesPerToken(GGML_TYPE_F16, key_dim, value_dim, model.hparams.n_head_kv, 1);
+    if (!head_bpt) throw std::invalid_argument("invalid MTP head KV shape");
+    SpeculationMemoryCost cost;
+    cost.head_kv = Mul(Mul(head_bpt, rounded), concurrency);
+    cost.prompt_hidden = Mul(Mul(Mul(context, model.hparams.n_embd), sizeof(float)), concurrency);
+    const uint64_t scores = Mul(Mul(16, model.hparams.n_head), context);
+    cost.graph = Add(64ULL * 1024 * 1024,
+        Mul(sizeof(float), Add(Mul(Mul(16, model.hparams.n_embd), 32), scores)));
+    cost.distributions = Mul(Mul(Mul(draft_n_max + 3, model.hparams.n_vocab), sizeof(double)), concurrency);
+    cost.checkpoints = densecore::llm::speculative::TargetCheckpointBank::RequiredBytes(model, draft_n_max);
+    (void)cost.Total();
+    return cost;
+}
+
 bool ConfigureSpeculation(EngineState* state, int mode, int draft_n_max, std::string* error) {
     const auto fail = [&](const std::string& message) { if (error) *error = message; return false; };
     if (!state || mode < 0 || mode > 2 || draft_n_max < 1 || draft_n_max > 3) {
@@ -43,17 +71,9 @@ bool ConfigureSpeculation(EngineState* state, int mode, int draft_n_max, std::st
         if (context == 0 || concurrency == 0 || plan.available_bytes == 0) {
             return fail("MTP requires an effective context/concurrency memory plan");
         }
-        const uint64_t rounded = Add(context, BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
-        const uint64_t head_bpt = ComputeKVCacheBytesPerToken(GGML_TYPE_F16, model.hparams.n_embd_head_k,
-            model.hparams.n_embd_head_v, model.hparams.n_head_kv, 1);
-        const uint64_t head_kv = Mul(Mul(head_bpt, rounded), concurrency);
-        const uint64_t prompt_hidden = Mul(Mul(Mul(context, model.hparams.n_embd), sizeof(float)), concurrency);
-        const uint64_t scores = Mul(Mul(16, model.hparams.n_head), context);
-        const uint64_t graph = Add(64ULL * 1024 * 1024,
-                                  Mul(sizeof(float), Add(Mul(Mul(16, model.hparams.n_embd),32), scores)));
-        const uint64_t distributions = Mul(Mul(Mul(draft_n_max + 3, model.hparams.n_vocab), sizeof(double)), concurrency);
-        const uint64_t checkpoints = densecore::llm::speculative::TargetCheckpointBank::RequiredBytes(model, draft_n_max);
-        const uint64_t additional = Add(Add(head_kv,prompt_hidden),Add(Add(graph,distributions),checkpoints));
+        const auto cost = CalculateSpeculationMemory(model, context, concurrency, draft_n_max);
+        const uint64_t additional = cost.Total();
+        const uint64_t reserved_mtp = plan.mtp_checkpoint_bytes;
         // One fenced verification graph at a time shares a model-owned bank.
         // Sessions keep independent head KV and hidden/distribution state.
         plan.mtp_checkpoint_bytes = additional;
@@ -63,7 +83,11 @@ bool ConfigureSpeculation(EngineState* state, int mode, int draft_n_max, std::st
         }
         if (!entry->resource_lease) return fail("MTP requires an enforced model resource reservation");
         std::string reservation_error;
-        if (!entry->resource_lease->ExtendMTP(additional, &reservation_error)) return fail(reservation_error);
+        if (reserved_mtp == 0) {
+            if (!entry->resource_lease->ExtendMTP(additional, &reservation_error)) return fail(reservation_error);
+        } else if (reserved_mtp != additional) {
+            return fail("MTP preallocation resource contract does not match initialization cost");
+        }
         entry->mtp_target_checkpoints = std::make_unique<densecore::llm::speculative::TargetCheckpointBank>(model, draft_n_max);
         entry->kv_config.memory_plan = plan;
         state->speculation_max_context = static_cast<int>(context);
@@ -71,7 +95,7 @@ bool ConfigureSpeculation(EngineState* state, int mode, int draft_n_max, std::st
         state->speculation_reason = "explicit batched MTP with serialized verification; automatic performance qualification pending";
         state->speculation_selected.store(2, std::memory_order_release);
         LOG_INFO("MTP reference selected: context={} concurrency={} draft_n_max={} head_kv={} prompt_hidden={} graph={} distributions={} reservation={}",
-                 context,concurrency,draft_n_max,head_kv,prompt_hidden,graph,distributions,additional);
+                 context,concurrency,draft_n_max,cost.head_kv,cost.prompt_hidden,cost.graph,cost.distributions,additional);
         return true;
     } catch (const std::exception& e) {
         return fail(std::string("MTP initialization failed: ") + e.what());

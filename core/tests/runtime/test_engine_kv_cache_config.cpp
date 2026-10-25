@@ -5,6 +5,9 @@
 
 #include "runtime/engine_internal.h"
 #include "runtime/worker_internal.h"
+#include "runtime/speculation_config.h"
+#include "densecore/exceptions.h"
+#include <limits>
 
 namespace {
 
@@ -780,4 +783,52 @@ TEST(EngineKVCacheConfig, Qwen35TwoThousandTokenContextUsesScheduledPrefillShape
         EXPECT_EQ(scheduler.max_prefill_seqs,1);
         EXPECT_EQ(scheduler.max_prefill_tokens,config.max_prefill_chunk_tokens);
     }
+}
+
+namespace {
+TransformerModel MakeMtpBudgetModel() {
+    auto model = MakeModel(64, 4, 4);
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_vocab = 20000000; // Shape only: no weights/vocabulary allocation.
+    model.hparams.n_ctx = 16;
+    model.ssm_inner_size = 64;
+    model.ssm_time_step_rank = 4;
+    model.ssm_state_size = 16;
+    model.ssm_group_count = 4;
+    model.ssm_conv_kernel = 4;
+    model.ssm_full_attn_interval = 4;
+    model.ssm_layer_states.resize(3);
+    return model;
+}
+}
+
+TEST(EngineKVCacheConfig, AutoConcurrencyIncludesMtpBeforeKvAllocationAndKeepsContext) {
+    ScopedEnvVar context("DENSECORE_MAX_SEQ_LEN", "16");
+    ScopedEnvVar concurrency("DENSECORE_MAX_NUM_SEQS", nullptr);
+    ScopedEnvVar memory("DENSECORE_KV_AVAILABLE_MB_HINT", "4096");
+    auto model = MakeMtpBudgetModel();
+    const auto plain = ComputeSafeKVCacheConfig(&model, GGML_TYPE_F16);
+    const auto mtp = ComputeSafeKVCacheConfig(&model, GGML_TYPE_F16, DENSECORE_SPEC_MTP, 2);
+    EXPECT_EQ(plain.max_num_seqs, 8);
+    EXPECT_GE(mtp.max_num_seqs, 1);
+    EXPECT_LT(mtp.max_num_seqs, plain.max_num_seqs);
+    EXPECT_EQ(mtp.max_seq_len, 16);
+    EXPECT_TRUE(mtp.memory_plan.Fits());
+    EXPECT_EQ(mtp.memory_plan.mtp_checkpoint_bytes,
+              CalculateSpeculationMemory(model, 16, mtp.max_num_seqs, 2).Total());
+    ScopedEnvVar explicit_eight("DENSECORE_MAX_NUM_SEQS", "8");
+    EXPECT_THROW(ComputeSafeKVCacheConfig(&model, GGML_TYPE_F16, DENSECORE_SPEC_MTP, 2),
+                 densecore::OutOfMemoryException);
+}
+
+TEST(EngineKVCacheConfig, MtpMemoryCostChecksOverflowAndResolvesValueHeadDefault) {
+    auto model = MakeMtpBudgetModel();
+    const auto cost = CalculateSpeculationMemory(model, 16, 2, 2);
+    EXPECT_EQ(cost.head_kv, ComputeKVCacheBytesPerToken(GGML_TYPE_F16, 64, 64, 4, 1) * 16 * 2);
+    EXPECT_GT(cost.checkpoints, 0u);
+    EXPECT_THROW(CalculateSpeculationMemory(model, UINT64_MAX, 1, 2), std::overflow_error);
+    EXPECT_THROW(CalculateSpeculationMemory(model, 16, 0, 2), std::invalid_argument);
+    EXPECT_THROW(CalculateSpeculationMemory(model, 16, 1, 4), std::invalid_argument);
 }
