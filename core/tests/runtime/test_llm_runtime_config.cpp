@@ -493,3 +493,42 @@ TEST(ResourceBudgetTest, EmptyMountInfoOrInconsistentEmptyMembershipIsUnknown) {
         EXPECT_EQ(result.effective_threads,1);
     }
 }
+
+TEST(ResourceBudgetTest, HybridHierarchyUsesAuthoritativeV1Controllers) {
+    ResourceFiles files{{"/proc/meminfo","MemAvailable: 10000 kB\n"},
+        {"/proc/self/cgroup","5:memory:/slice/task\n4:cpu,cpuacct:/slice/task\n0::/slice/task\n"},
+        {"/proc/self/mountinfo","1 0 0:1 /slice /memory rw - cgroup cgroup rw,memory\n2 0 0:2 /slice /cpu rw - cgroup cgroup rw,cpu,cpuacct\n3 0 0:3 / /unified rw - cgroup2 cgroup rw\n"},
+        {"/memory/memory.limit_in_bytes","6000000"}, {"/memory/memory.usage_in_bytes","2000000"},
+        {"/memory/task/memory.limit_in_bytes","5000000"}, {"/memory/task/memory.usage_in_bytes","4000000"},
+        {"/cpu/cpu.cfs_quota_us","-1"}, {"/cpu/task/cpu.cfs_quota_us","50000"}, {"/cpu/task/cpu.cfs_period_us","100000"},
+        {"/unified/cgroup.controllers",""}};
+    const auto result = FixtureBudget(files,8);
+    EXPECT_EQ(result.memory.state,densecore::runtime::ResourceState::Finite);
+    EXPECT_EQ(result.memory.bytes,1000000u);
+    EXPECT_EQ(result.cpu_quota_state,densecore::runtime::ResourceState::Finite);
+    EXPECT_DOUBLE_EQ(result.cpu_quota,0.5);
+    EXPECT_EQ(result.effective_threads,1);
+}
+TEST(ResourceBudgetTest, UnavailableChildControllersStillHonorControllingAncestors) {
+    auto files = V2Resources();
+    files["/cg/cgroup.controllers"] = "cpu memory cpuset";
+    files["/cg/pods/one/cgroup.controllers"] = "";
+    files.erase("/cg/pods/one/memory.max");
+    files.erase("/cg/pods/one/cpu.max");
+    const auto result = FixtureBudget(files);
+    EXPECT_EQ(result.memory.state,densecore::runtime::ResourceState::Finite);
+    EXPECT_EQ(result.memory.bytes,6000000u);
+    EXPECT_EQ(result.cpu_quota_state,densecore::runtime::ResourceState::Finite);
+    EXPECT_DOUBLE_EQ(result.cpu_quota,1.5);
+    EXPECT_EQ(result.effective_threads,2);
+}
+TEST(ResourceBudgetTest, ValidV2HierarchyWithoutResourceControllersUsesHostBudget) {
+    auto files = V2Resources();
+    files["/cg/cgroup.controllers"] = "";
+    const auto result = FixtureBudget(files,4);
+    EXPECT_EQ(result.memory.state,densecore::runtime::ResourceState::Finite);
+    EXPECT_EQ(result.memory.bytes,10240000u);
+    EXPECT_EQ(result.cgroup_memory_limit.state,densecore::runtime::ResourceState::Unlimited);
+    EXPECT_EQ(result.cpu_quota_state,densecore::runtime::ResourceState::Unlimited);
+    EXPECT_EQ(result.effective_threads,4);
+}

@@ -90,6 +90,11 @@ inline std::string ResourceUnescape(std::string s) {
 inline bool ResourceController(const std::string& list, const std::string& controller) {
     return ("," + list + ",").find("," + controller + ",") != std::string::npos;
 }
+inline bool ResourceControllerWords(const std::string& list, const std::string& controller) {
+    std::istringstream input(list); std::string word;
+    while (input >> word) if (word == controller) return true;
+    return false;
+}
 inline ResourceBudget DetectResourceBudget(const ResourceReader& read, int affinity_threads) {
     ResourceBudget result;
     result.effective_threads = std::max(1, affinity_threads);
@@ -149,19 +154,36 @@ inline ResourceBudget DetectResourceBudget(const ResourceReader& read, int affin
                                  !saw_mount_record || empty_membership_with_cgroup_mount;
     bool memory_error = discovery_error;
     bool cpu_error = discovery_error;
-    const bool needs_memory = std::any_of(memberships.begin(),memberships.end(),[](const auto& entry) {
-        return entry.v2 || ResourceController(entry.controllers,"memory");
-    });
-    const bool needs_cpu = std::any_of(memberships.begin(),memberships.end(),[](const auto& entry) {
-        return entry.v2 || ResourceController(entry.controllers,"cpu");
-    });
+    const auto v1_has = [&](const char* controller) {
+        return std::any_of(memberships.begin(),memberships.end(),[&](const auto& entry) {
+            return !entry.v2 && ResourceController(entry.controllers,controller);
+        });
+    };
+    const bool v1_memory = v1_has("memory"), v1_cpu = v1_has("cpu"), v1_cpuset = v1_has("cpuset");
+    const bool has_v2 = std::any_of(memberships.begin(),memberships.end(),[](const auto& entry) { return entry.v2; });
+    bool saw_v2_mount = false;
+    bool needs_memory = v1_memory;
+    bool needs_cpu = v1_cpu;
     bool observed_memory = false;
     bool observed_cpu = false;
     for (const auto& membership : memberships) for (const auto& mount : mounts) {
         if (membership.v2 != (mount.type == "cgroup2")) continue;
-        const bool memory = membership.v2 || (ResourceController(membership.controllers,"memory") && ResourceController(mount.controllers,"memory"));
-        const bool cpu = membership.v2 || (ResourceController(membership.controllers,"cpu") && ResourceController(mount.controllers,"cpu"));
-        const bool cpuset = membership.v2 || (ResourceController(membership.controllers,"cpuset") && ResourceController(mount.controllers,"cpuset"));
+        std::string available_controllers;
+        const bool has_controller_list = membership.v2 && read((std::filesystem::path(mount.path)/"cgroup.controllers").string(),available_controllers);
+        if (membership.v2) saw_v2_mount = true;
+        const auto v2_available = [&](const char* controller) {
+            return !has_controller_list || ResourceControllerWords(available_controllers,controller);
+        };
+        // A controller belongs to only one hierarchy. A hybrid host's empty
+        // v2 hierarchy must not mask its authoritative v1 CPU/memory limits.
+        const bool memory = membership.v2 ? (!v1_memory && v2_available("memory"))
+            : ResourceController(membership.controllers,"memory") && ResourceController(mount.controllers,"memory");
+        const bool cpu = membership.v2 ? (!v1_cpu && v2_available("cpu"))
+            : ResourceController(membership.controllers,"cpu") && ResourceController(mount.controllers,"cpu");
+        const bool cpuset = membership.v2 ? (!v1_cpuset && v2_available("cpuset"))
+            : ResourceController(membership.controllers,"cpuset") && ResourceController(mount.controllers,"cpuset");
+        needs_memory = needs_memory || memory;
+        needs_cpu = needs_cpu || cpu;
         if (!memory && !cpu && !cpuset) continue;
         std::string relative;
         if (mount.root == "/") relative = membership.path;
@@ -174,16 +196,22 @@ inline ResourceBudget DetectResourceBudget(const ResourceReader& read, int affin
         if (path.string() != boundary.string() && path.string().rfind(boundary.string()+"/",0) != 0) continue;
         for (;;) {
             auto get = [&](const char* file, std::string& value) { errno = 0; return read((path/file).string(), value); };
+            const auto unavailable_here = [&](const char* controller, int read_error) {
+                std::string controllers;
+                return membership.v2 && read_error == ENOENT && get("cgroup.controllers",controllers) &&
+                       !ResourceControllerWords(controllers,controller);
+            };
             if (memory) {
                 observed_memory = true;
                 std::string limit_text, current_text; uint64_t limit = 0, current = 0;
                 if (!get(membership.v2 ? "memory.max" : "memory.limit_in_bytes",limit_text)) {
                     // The actual hierarchy root has no controller limit files.
                     // ENOENT is distinct from EACCES and malformed constrained ancestors.
-                    if (membership.v2 && path == boundary && mount.root == "/" && errno == ENOENT) {
+                    const int read_error = errno;
+                    if ((membership.v2 && path == boundary && mount.root == "/" && read_error == ENOENT)) {
                         if (result.cgroup_memory_limit.state == ResourceState::Unknown)
                             result.cgroup_memory_limit.state = ResourceState::Unlimited;
-                    } else memory_error = true;
+                    } else if (!unavailable_here("memory",read_error)) memory_error = true;
                 } else if (ResourceWord(limit_text) == "max" || (!membership.v2 && ResourceUnsigned(limit_text,limit) && limit >= (uint64_t{1}<<60))) {
                     if (result.cgroup_memory_limit.state == ResourceState::Unknown) result.cgroup_memory_limit.state = ResourceState::Unlimited;
                 } else if (!ResourceUnsigned(limit_text,limit) || !get(membership.v2 ? "memory.current" : "memory.usage_in_bytes",current_text) || !ResourceUnsigned(current_text,current)) memory_error = true;
@@ -197,19 +225,20 @@ inline ResourceBudget DetectResourceBudget(const ResourceReader& read, int affin
                 observed_cpu = true;
                 std::string quota_text, period_text;
                 bool ok = get(membership.v2 ? "cpu.max" : "cpu.cfs_quota_us", quota_text);
+                const int quota_read_error = errno;
                 std::istringstream fields(quota_text); std::string quota, period;
                 fields >> quota;
                 if (membership.v2) fields >> period; else if (get("cpu.cfs_period_us",period_text)) period = ResourceWord(period_text);
                 uint64_t q = 0, p = 0;
                 if (ok && (quota == "max" || quota == "-1")) {
                     if (result.cpu_quota_state == ResourceState::Unknown) result.cpu_quota_state = ResourceState::Unlimited;
-                } else if (!ok && membership.v2 && path == boundary && mount.root == "/" && errno == ENOENT) {
+                } else if (!ok && membership.v2 && path == boundary && mount.root == "/" && quota_read_error == ENOENT) {
                     if (result.cpu_quota_state == ResourceState::Unknown) result.cpu_quota_state = ResourceState::Unlimited;
                 } else if (ok && ResourceUnsigned(quota,q) && ResourceUnsigned(period,p) && p > 0) {
                     double ratio = double(q)/double(p);
                     if (result.cpu_quota_state != ResourceState::Finite || ratio < result.cpu_quota) result.cpu_quota = ratio;
                     result.cpu_quota_state = ResourceState::Finite;
-                } else cpu_error = true;
+                } else if (ok || !unavailable_here("cpu",quota_read_error)) cpu_error = true;
             }
             if (cpuset) {
                 std::string cpus;
@@ -222,6 +251,10 @@ inline ResourceBudget DetectResourceBudget(const ResourceReader& read, int affin
             path = path.parent_path();
         }
     }
+    if (has_v2 && !saw_v2_mount) {
+        if (!v1_memory) memory_error = true;
+        if (!v1_cpu) cpu_error = true;
+    }
     // A missing finite constraint cannot safely be replaced by host availability.
     if (memory_error || (needs_memory && !observed_memory)) {
         if (result.memory.state != ResourceState::Finite || result.memory.bytes != 0)
@@ -229,8 +262,8 @@ inline ResourceBudget DetectResourceBudget(const ResourceReader& read, int affin
         if (result.cgroup_memory_limit.state != ResourceState::Finite || result.cgroup_memory_limit.bytes != 0)
             result.cgroup_memory_limit = {ResourceState::Unknown,0};
     }
-    if (!discovery_error && !needs_memory) result.cgroup_memory_limit = {ResourceState::Unlimited,0};
-    if (!discovery_error && !needs_cpu) result.cpu_quota_state = ResourceState::Unlimited;
+    if (!memory_error && !needs_memory) result.cgroup_memory_limit = {ResourceState::Unlimited,0};
+    if (!cpu_error && !needs_cpu) result.cpu_quota_state = ResourceState::Unlimited;
     if (needs_cpu && !observed_cpu) cpu_error = true;
     if (result.cpu_quota_state == ResourceState::Finite)
         result.effective_threads = std::min(result.effective_threads, static_cast<int>(std::min<double>(1000000,std::max(1.0,std::ceil(result.cpu_quota)))));
