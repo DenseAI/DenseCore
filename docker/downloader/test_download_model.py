@@ -57,6 +57,24 @@ class DownloadIntegrityTest(unittest.TestCase):
             with self.subTest(key=key), patch.dict(os.environ, {key: value}):
                 self.assertEqual(downloader.main(), 1)
 
+    def test_new_revision_cannot_overwrite_previous_verified_artifact(self):
+        def fetch(**kwargs):
+            path = kwargs['local_dir'] / 'model.gguf'
+            path.write_bytes(self.payload)
+            return path
+        with patch.object(downloader, 'download_with_retry', side_effect=fetch):
+            self.assertEqual(downloader.main(), 0)
+            previous = (self.root / downloader.MAIN_MODEL_NAME).resolve()
+            old_bytes = previous.read_bytes()
+            self.payload = b'new revision bytes'
+            with patch.dict(os.environ, {'MODEL_REVISION': 'b' * 40,
+                    'MODEL_SHA256': hashlib.sha256(self.payload).hexdigest()}):
+                self.assertEqual(downloader.main(), 0)
+            current = (self.root / downloader.MAIN_MODEL_NAME).resolve()
+            self.assertNotEqual(previous, current)
+            self.assertEqual(previous.read_bytes(), old_bytes)
+            self.assertEqual(current.read_bytes(), self.payload)
+
     def test_cache_symlink_cannot_escape_models_directory(self):
         with tempfile.TemporaryDirectory() as outside:
             other = Path(outside) / 'model.gguf'; other.write_bytes(self.payload)
