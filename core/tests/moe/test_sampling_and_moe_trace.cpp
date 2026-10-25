@@ -22,6 +22,7 @@
 #include "runtime/runtime_env.h"
 #include "runtime/engine_internal.h"
 #include "llm/sampling/sampling_rng.h"
+#include "llm/sampling/sampling_errors.h"
 #include "llm/runtime/work_context.h"
 
 namespace densecore::testing {
@@ -1849,5 +1850,98 @@ TEST(SamplingNoTopK, TemperatureZeroAndTopKOneRemainGreedyWithoutRngDraws) {
         EXPECT_EQ(SampleTokenWithRng(logits, 0, params, rng), 0);
         EXPECT_EQ(rng, before);
         ExpectAnalyticDistribution(BuildSamplingDistribution(logits, 0, params), {1,0,0,0});
+    }
+}
+
+
+namespace {
+int AnalyticSamplerDraw(const std::vector<float>& values, const SamplingParams& params, std::mt19937& rng) {
+    ggml_init_params init{16384, nullptr, false};
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(init), ggml_free);
+    if (!ctx) throw std::runtime_error("analytic sampler fixture allocation failed");
+    auto* logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, static_cast<int64_t>(values.size()), 1);
+    std::copy(values.begin(), values.end(), static_cast<float*>(logits->data));
+    return SampleTokenWithRng(logits, 0, params, rng);
+}
+GrammarConstraint OpeningObjectGrammar(const std::vector<std::string>& vocab) {
+    GrammarConstraint grammar;
+    grammar.enabled = grammar.is_json_mode = true;
+    grammar.state = JSONState::EXPECT_OBJECT_START;
+    InitGrammarConstraint(&grammar, vocab);
+    return grammar;
+}
+}
+
+TEST(SamplingGrammarIntersection, WhitelistIntersectsGrammarInsteadOfBeingBypassed) {
+    const std::vector<std::string> vocab = {"invalid", "{", " {"};
+    std::vector<int> allowed{2}; // Both braces satisfy grammar; only globalID2 satisfies whitelist.
+    auto grammar = OpeningObjectGrammar(vocab);
+    SamplingParams params;
+    params.top_k = 0;
+    params.top_p = 1;
+    params.allowed_token_ids = &allowed;
+    params.grammar = &grammar;
+    params.vocab = &vocab;
+    for (float temperature : {0.f, 1.f}) {
+        params.temperature = temperature;
+        ExpectAnalyticDistribution(AnalyticSamplerDistribution({0,9,1}, params), {0,0,1});
+        std::mt19937 rng(71);
+        EXPECT_EQ(AnalyticSamplerDraw({0,9,1}, params, rng), 2);
+        EXPECT_EQ(grammar.state, JSONState::EXPECT_OBJECT_START);
+        EXPECT_TRUE(grammar.accumulated.empty());
+    }
+}
+
+TEST(SamplingGrammarIntersection, NonzeroActionRangeUsesGlobalVocabularyIdsWithMasks) {
+    const std::vector<std::string> vocab = {"invalid", "{", " {", "\n", ":"};
+    std::vector<int> allowed{2,3,4}, blocked{3};
+    auto grammar = OpeningObjectGrammar(vocab);
+    SamplingParams params;
+    params.top_k = 0;
+    params.top_p = 1;
+    params.action_token_start = 2;
+    params.action_token_count = 3;
+    params.allowed_token_ids = &allowed;
+    params.disallowed_token_ids = &blocked;
+    params.grammar = &grammar;
+    params.vocab = &vocab;
+    // ID1 is grammatically valid but outside range. ID3 is whitespace but
+    // blacklisted. ID4 is in range/whitelist but invalid in this grammar state.
+    for (float temperature : {0.f, 1.f}) {
+        params.temperature = temperature;
+        ExpectAnalyticDistribution(AnalyticSamplerDistribution({100,90,1,80,70}, params), {0,0,1,0,0});
+        std::mt19937 rng(71);
+        EXPECT_EQ(AnalyticSamplerDraw({100,90,1,80,70}, params, rng), 2);
+        EXPECT_EQ(grammar.state, JSONState::EXPECT_OBJECT_START);
+    }
+}
+
+TEST(SamplingGrammarIntersection, EmptyFiniteSupportThrowsTypedErrorWithoutRngOrGrammarAdvance) {
+    const std::vector<std::string> vocab = {"invalid", "{", " {"};
+    std::vector<int> allowed{2}, blocked{2};
+    auto grammar = OpeningObjectGrammar(vocab);
+    SamplingParams params;
+    params.top_k = 0;
+    params.top_p = 1;
+    params.action_token_start = 2;
+    params.action_token_count = 1;
+    params.allowed_token_ids = &allowed;
+    params.disallowed_token_ids = &blocked;
+    params.grammar = &grammar;
+    params.vocab = &vocab;
+    for (float temperature : {0.f, 1.f}) for (bool nonfinite : {false, true}) {
+        params.temperature = temperature;
+        blocked = nonfinite ? std::vector<int>{} : std::vector<int>{2};
+        const std::vector<float> values = {0,9,nonfinite ? NAN : 1.f};
+        std::mt19937 rng(71);
+        const auto before = rng;
+        EXPECT_THROW(AnalyticSamplerDistribution(values, params), densecore::llm::sampling::SamplingConstraintError);
+        EXPECT_THROW(AnalyticSamplerDraw(values, params, rng), densecore::llm::sampling::SamplingConstraintError);
+        EXPECT_EQ(rng, before);
+        EXPECT_EQ(grammar.state, JSONState::EXPECT_OBJECT_START);
+        EXPECT_EQ(grammar.brace_depth, 0);
+        EXPECT_EQ(grammar.bracket_depth, 0);
+        EXPECT_FALSE(grammar.in_escape);
+        EXPECT_TRUE(grammar.accumulated.empty());
     }
 }

@@ -1,5 +1,6 @@
 #include "densecore/runtime/inference.h"
 #include "llm/sampling/sampling_rng.h"
+#include "llm/sampling/sampling_errors.h"
 
 #include "runtime/runtime_env.h"
 #include <algorithm>
@@ -375,7 +376,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
 
     int range_start = 0;
     int range_end = n_vocab;
-    if (params.action_token_count > 0 && params.grammar == nullptr) {
+    if (params.action_token_count > 0) {
         const int requested_start = std::max(0, params.action_token_start);
         if (requested_start < n_vocab) {
             const int64_t requested_end = static_cast<int64_t>(requested_start) + params.action_token_count;
@@ -740,15 +741,22 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
     thread_local std::vector<float> working_logits;
     const bool requires_working_logits = params.grammar && params.vocab;
     if (requires_working_logits) {
-        working_logits.assign(last_logits + range_start, last_logits + range_end);
+        // Grammar vocabulary and token masks use global token IDs. Mask the
+        // full row, then read the selected action range from that same row.
+        working_logits.assign(last_logits, last_logits + n_vocab);
         if (params.disallowed_token_ids && !params.disallowed_token_ids->empty()) {
             for (int token_id : *params.disallowed_token_ids) {
-                if (token_id >= range_start && token_id < range_end) {
-                    working_logits[token_id - range_start] = -INFINITY;
+                if (token_id >= 0 && token_id < n_vocab) {
+                    working_logits[token_id] = -INFINITY;
                 }
             }
         }
-        ApplyGrammarMask(working_logits.data(), active_vocab, params.grammar, *params.vocab);
+        if (params.allowed_token_ids && !params.allowed_token_ids->empty()) {
+            for (int token_id = 0; token_id < n_vocab; ++token_id) {
+                if (!is_allowed(token_id)) working_logits[token_id] = -INFINITY;
+            }
+        }
+        ApplyGrammarMask(working_logits.data(), n_vocab, params.grammar, *params.vocab);
     }
 
     thread_local std::vector<int> token_counts;
@@ -765,7 +773,8 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
 
     auto base_logit_at = [&](int local_token) -> float {
         if (requires_working_logits) {
-            return ApplyFinalLogitSoftcap(working_logits[static_cast<size_t>(local_token)], params.final_logit_softcap);
+            return ApplyFinalLogitSoftcap(working_logits[static_cast<size_t>(range_start + local_token)],
+                                         params.final_logit_softcap);
         }
         return ApplyFinalLogitSoftcap(last_logits[range_start + local_token], params.final_logit_softcap);
     };
@@ -958,6 +967,10 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
                 found = true;
             }
         }
+        if (!found && requires_working_logits) {
+            throw densecore::llm::sampling::SamplingConstraintError(
+                "no finite token satisfies grammar, vocabulary range and token masks");
+        }
         return found ? best_idx : first_allowed_token();
     };
 
@@ -1043,6 +1056,10 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
     }
 
     if (!found_finite || !std::isfinite(max_logit)) {
+        if (requires_working_logits) {
+            throw densecore::llm::sampling::SamplingConstraintError(
+                "no finite token satisfies grammar, vocabulary range and token masks");
+        }
         const int token = finite_argmax_raw();
         maybe_record_sampling_trace(token);
         debug_dump_top_candidates("argmax_raw_fallback", token);
