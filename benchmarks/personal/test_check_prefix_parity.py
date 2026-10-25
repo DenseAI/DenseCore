@@ -11,7 +11,9 @@ def valid_groups():
              'generated_tokens': 2, 'finish_reason': 1, 'terminal_events': 1} for i, label in enumerate(labels)]
     group = {'requests': rows, 'cancellation': {'passed': True},
              'prefix_evidence': {'hits': 2, 'restores': 2, 'skipped_tokens': [64, 64]},
-             'eviction': {'observed_miss_after_hit': True}}
+             'eviction': {'observed_miss_after_hit': True, 'counters_present': True,
+                          'kv_blocks_reclaimed_delta': 2, 'hybrid_snapshot_entries_removed_delta': 1,
+                          'hybrid_logical_payload_bytes_removed_delta': 24}}
     return {'off': copy.deepcopy(group), 'on': copy.deepcopy(group)}
 
 
@@ -32,9 +34,19 @@ class PrefixEvidenceTest(unittest.TestCase):
 
     def test_pressure_alone_does_not_prove_eviction(self):
         groups = valid_groups()
-        groups['on']['eviction']['observed_miss_after_hit'] = False
+        groups['on']['eviction']['counters_present'] = False
         self.assertEqual(compare(groups), [])
         self.assertTrue(any('eviction not observed' in x for x in compare(groups, True)))
+
+    def test_retained_hot_probe_can_pass_only_with_real_kv_and_snapshot_eviction(self):
+        groups = valid_groups()
+        groups['on']['eviction']['observed_miss_after_hit'] = False
+        self.assertEqual(compare(groups, True), [])
+        for field in ('kv_blocks_reclaimed_delta', 'hybrid_snapshot_entries_removed_delta',
+                      'hybrid_logical_payload_bytes_removed_delta'):
+            changed = copy.deepcopy(groups)
+            changed['on']['eviction'][field] = 0
+            self.assertTrue(any('eviction not observed' in x for x in compare(changed, True)))
 
     def test_missing_concurrency_and_cancel_evidence_fail(self):
         groups = valid_groups()
@@ -59,12 +71,21 @@ class PrefixEvidenceTest(unittest.TestCase):
     def test_log_evidence_uses_actual_request_id(self):
         group = valid_groups()['on']
         attach_log_evidence(group, '[Qwen35DecodeSummary] req=4 prefix_cache_hit=1 '
-            'prefix_cache_skipped_tokens=64 hybrid_ssm_snapshot_restore_applied=1\n'
+            'prefix_cache_skipped_tokens=64 hybrid_ssm_snapshot_restore_applied=1 '
+            'prefix_cache_evicted_blocks_total=10 prefix_cache_evicted_hybrid_snapshots_total=3 '
+            'prefix_cache_evicted_hybrid_payload_bytes_total=100\n'
             '[Qwen35DecodeSummary] req=11 prefix_cache_hit=0 prefix_cache_skipped_tokens=0 '
-            'hybrid_ssm_snapshot_restore_applied=0\n')
+            'hybrid_ssm_snapshot_restore_applied=0 prefix_cache_evicted_blocks_total=12 '
+            'prefix_cache_evicted_hybrid_snapshots_total=4 prefix_cache_evicted_hybrid_payload_bytes_total=124\n')
         self.assertTrue(group['eviction']['observed_miss_after_hit'])
-        self.assertEqual(group['prefix_evidence'], {'hits': 1, 'restores': 1, 'skipped_tokens': [64]})
-        self.assertEqual(prefix_evidence('prefix_cache_hit=10'), {'hits': 0, 'restores': 0, 'skipped_tokens': []})
+        self.assertEqual(group['prefix_evidence']['hits'], 1)
+        self.assertEqual(group['prefix_evidence']['restores'], 1)
+        self.assertEqual(group['prefix_evidence']['skipped_tokens'], [64])
+        self.assertEqual(group['eviction']['kv_blocks_reclaimed_delta'], 2)
+        self.assertEqual(group['eviction']['hybrid_snapshot_entries_removed_delta'], 1)
+        self.assertEqual(group['eviction']['hybrid_logical_payload_bytes_removed_delta'], 24)
+        self.assertEqual(prefix_evidence('prefix_cache_hit=10')['hits'], 0)
+        self.assertFalse(prefix_evidence('prefix_cache_hit=1')['eviction_counters_present'])
 
     def test_same_prompt_across_concurrency_must_match(self):
         groups = valid_groups()

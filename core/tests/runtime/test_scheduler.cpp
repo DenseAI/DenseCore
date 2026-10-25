@@ -4,6 +4,7 @@
 #include <string>
 
 #include "densecore/runtime/scheduler.h"
+#include "runtime/memory/prefix_cache_eviction_stats.h"
 
 namespace densecore::testing {
 size_t SetPrefixAdmissionSnapshotLimitForTest(size_t bytes);
@@ -926,6 +927,38 @@ TEST(SchedulerArchitecture, CacheResidencyCanBeReclaimedForWaitingPrefill) {
     scheduler.RemoveRequest(seq, false);
     manager.Free(output.new_block_allocations.front().second);
     manager.FreeSingle(pinned);
+}
+
+TEST(SchedulerArchitecture, EvictionCountersCountOnlyActualIdlePrefixReclamation) {
+    const auto before = runtime::PrefixCacheEvictionStatsSnapshot();
+    BlockManager manager(2, BLOCK_SIZE);
+    const auto cached = manager.Allocate(2);
+    ASSERT_EQ(cached.size(), 2u);
+    std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot(1);
+    snapshot[0].conv_state = {1};
+    snapshot[0].ssm_state = {2, 3};
+    for (int id : cached) manager.RegisterPrefixBlockWithTokens(id, 500 + id, nullptr, 0, &snapshot);
+    manager.Free(cached);
+    const int pinned = manager.FindCachedBlock(500 + cached.front());
+    ASSERT_GE(pinned, 0);
+    const int allocated = manager.AllocateSingle();
+    ASSERT_GE(allocated, 0);
+    EXPECT_NE(allocated, pinned);
+    auto after = runtime::PrefixCacheEvictionStatsSnapshot();
+    EXPECT_EQ(after.kv_blocks - before.kv_blocks, 1u);
+    EXPECT_EQ(after.hybrid_snapshots - before.hybrid_snapshots, 1u);
+    EXPECT_EQ(after.hybrid_payload_bytes - before.hybrid_payload_bytes, 3u * sizeof(float));
+    manager.FreeSingle(allocated);
+    manager.FreeSingle(pinned);
+    after = runtime::PrefixCacheEvictionStatsSnapshot();
+    EXPECT_EQ(after.kv_blocks - before.kv_blocks, 1u);  // Ref release alone is not an eviction.
+    const auto replacement = manager.Allocate(2);
+    ASSERT_EQ(replacement.size(), 2u);
+    after = runtime::PrefixCacheEvictionStatsSnapshot();
+    EXPECT_EQ(after.kv_blocks - before.kv_blocks, 2u);
+    EXPECT_EQ(after.hybrid_snapshots - before.hybrid_snapshots, 2u);
+    EXPECT_EQ(after.hybrid_payload_bytes - before.hybrid_payload_bytes, 6u * sizeof(float));
+    manager.Free(replacement);
 }
 
 TEST(SchedulerArchitecture, IdleCachedBlocksDoNotPreemptRunningDecode) {

@@ -23,6 +23,7 @@
 #include "kernels/q4k_repacked_gemv.h"
 #include "models/model_inference_policy.h"
 #include "runtime/kernel_admission.h"
+#include "runtime/memory/prefix_cache_eviction_stats.h"
 #include "runtime/runtime_env.h"
 
 #ifndef DENSECORE_DEFAULT_PRECOMPUTED_ROPE
@@ -1842,6 +1843,7 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
         return any ? oss.str() : std::string("none");
     }();
     const KVRuntimeStatsSnapshot kv_stats = GetKVRuntimeStatsSnapshot();
+    const auto prefix_evictions = densecore::runtime::PrefixCacheEvictionStatsSnapshot();
     const double paged_runtime_hit_rate =
         runtime.path_total > 0 ? (100.0 * static_cast<double>(runtime.path_paged) / runtime.path_total) : 0.0;
     const int attention_path_total = req->attention_path_paged + req->attention_path_standard +
@@ -2382,6 +2384,9 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
         << (req->graph_cache_last_skip_reason.empty() ? "none" : req->graph_cache_last_skip_reason.c_str())
         << " prefix_cache_allowed=" << (req->prefix_cache_allowed ? 1 : 0)
         << " prefix_cache_hit=" << (req->prefix_cache_hit ? 1 : 0)
+        << " prefix_cache_evicted_blocks_total=" << prefix_evictions.kv_blocks
+        << " prefix_cache_evicted_hybrid_snapshots_total=" << prefix_evictions.hybrid_snapshots
+        << " prefix_cache_evicted_hybrid_payload_bytes_total=" << prefix_evictions.hybrid_payload_bytes
         << " prefix_cache_skipped_tokens=" << req->prefix_cache_skipped_tokens
         << " prefix_cache_hit_blocks=" << req->prefix_cache_hit_blocks
         << " prefix_cache_registered_blocks=" << req->prefix_cache_registered_blocks

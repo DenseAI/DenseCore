@@ -40,8 +40,12 @@ python3 benchmarks/personal/check_prefix_parity.py \
 The optional server probe validates complete final chat answers with
 `cache_prompt=true`; text found only in reasoning and truncated answers fail.
 Without `--server`, the report explicitly leaves HTTP final answers unverified.
-`--require-eviction` requires an identical probe that previously hit the cache to
-become a miss after pressure; retaining all probes is an unverified eviction
-gate, even if token parity passes. Increase `--churn` as needed for the configured
-KV capacity. Every request, raw native log and HTTP response is preserved in the
+`--require-eviction` requires positive allocator counter deltas for physically
+reclaimed KV blocks and removed hybrid snapshot entries and logical payload
+bytes. Snapshot removal does not claim immediate physical memory release while
+an admission lease still owns a copy. Counters are process cumulative; each
+off/on child is a fresh process with one model. A particular hot probe can remain
+cached while other entries are reclaimed; its hit/miss is recorded separately.
+Old binaries without these counters cannot pass this gate. Increase `--churn`
+as needed for the configured KV capacity. Every request, raw native log and HTTP response is preserved in the
 output directory. This tool does not enable model defaults or establish speed.

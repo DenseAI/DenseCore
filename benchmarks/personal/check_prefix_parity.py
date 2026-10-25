@@ -2,8 +2,8 @@
 """Same-file native prefix token parity and optional HTTP final-answer validation.
 
 Runs fresh off/on processes; exact callback IDs include sampled stop tokens.
-Cache pressure is diagnostic unless a previously hit identical prompt becomes a
-miss. No speed, physical batching, model-support, or default-promotion claim.
+Cache pressure must produce actual allocator KV/snapshot eviction counters to
+pass its strict gate. No speed, batching, support, or default-promotion claim.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -24,9 +24,15 @@ from compare_servers import validate_response
 
 
 def prefix_evidence(text):
+    fields = ('blocks', 'hybrid_snapshots', 'hybrid_payload_bytes')
+    counts = {field: [int(x) for x in re.findall(rf'prefix_cache_evicted_{field}_total=(\d+)', text)]
+              for field in fields}
     return {'hits': len(re.findall(r'prefix_cache_hit=1\b', text)),
             'restores': len(re.findall(r'hybrid_ssm_snapshot_restore_applied=1\b', text)),
-            'skipped_tokens': [int(x) for x in re.findall(r'prefix_cache_skipped_tokens=(\d+)', text) if int(x)]}
+            'skipped_tokens': [int(x) for x in re.findall(r'prefix_cache_skipped_tokens=(\d+)', text) if int(x)],
+            'eviction_counters_present': all(counts.values()),
+            'eviction_counters': {field: {'start': min(values), 'end': max(values), 'delta': max(values)-min(values)}
+                                  for field, values in counts.items() if values}}
 
 
 def compare(groups, require_eviction=False):
@@ -69,8 +75,11 @@ def compare(groups, require_eviction=False):
     evidence = groups['on'].get('prefix_evidence', {})
     if not evidence.get('hits') or not evidence.get('restores') or not evidence.get('skipped_tokens'):
         failures.append('on: actual snapshot restore/hit/skipped-prefill evidence missing')
-    if require_eviction and not groups['on'].get('eviction', {}).get('observed_miss_after_hit'):
-        failures.append('eviction not observed: identical previously cached probe must become a miss')
+    eviction = groups['on'].get('eviction', {})
+    if require_eviction and (not eviction.get('counters_present') or
+            any(eviction.get(field, 0) <= 0 for field in ('kv_blocks_reclaimed_delta',
+                'hybrid_snapshot_entries_removed_delta', 'hybrid_logical_payload_bytes_removed_delta'))):
+        failures.append('eviction not observed: actual KV reclamation and hybrid snapshot removal counters required')
     return failures
 
 
@@ -184,8 +193,8 @@ def child(args):
 
 def attach_log_evidence(result, text):
     result['prefix_evidence'] = prefix_evidence(text)
-    # Per-request profile lines carry IDs and actual hit metrics. A miss after
-    # a known hit proves loss of the cached probe, unlike pressure alone.
+    # Keep the particular probe's residency as information. Cache policy can
+    # legitimately retain this hot probe while reclaiming different entries.
     profiles = {}
     for line in text.splitlines():
         if 'prefix_cache_hit=' not in line: continue
@@ -196,7 +205,14 @@ def attach_log_evidence(result, text):
     before = profiles.get(rows.get('repeat4', {}).get('request_id'))
     after = profiles.get(rows.get('after-churn', {}).get('request_id'))
     result['eviction'] = {'probe_before_hit': before, 'probe_after_hit': after,
-                          'observed_miss_after_hit': before == 1 and after == 0}
+                          'observed_miss_after_hit': before == 1 and after == 0,
+                          'scope': 'process-cumulative allocator counters; fresh single-model child',
+                          'counters_present': result['prefix_evidence']['eviction_counters_present']}
+    counters = result['prefix_evidence']['eviction_counters']
+    for source, target in (('blocks', 'kv_blocks_reclaimed_delta'),
+            ('hybrid_snapshots', 'hybrid_snapshot_entries_removed_delta'),
+            ('hybrid_payload_bytes', 'hybrid_logical_payload_bytes_removed_delta')):
+        result['eviction'][target] = counters.get(source, {}).get('delta', 0)
 
 
 def http_final_answers(args, mode, environment):

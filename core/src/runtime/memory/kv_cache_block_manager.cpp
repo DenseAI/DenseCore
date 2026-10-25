@@ -1,9 +1,14 @@
 #include "runtime/memory/kv_cache_internal.h"
+#include "runtime/memory/prefix_cache_eviction_stats.h"
 
 #include <atomic>
 #include <cstdlib>
 
 namespace {
+
+std::atomic<uint64_t> evicted_prefix_kv_blocks{0};
+std::atomic<uint64_t> evicted_prefix_hybrid_snapshots{0};
+std::atomic<uint64_t> evicted_prefix_hybrid_payload_bytes{0};
 
 using HybridSnapshot = std::vector<TransformerModel::SSMSequenceRuntimeState>;
 struct AdmissionSnapshotBudget {
@@ -113,16 +118,32 @@ int TryEvictIdlePrefixBlockForAllocation(BlockManager& manager) {
         block.content_hash = 0;
         block.cache_resident = false;
         block.num_filled_slots = 0;
+        const auto snapshot = manager.block_hybrid_ssm_snapshots.find(block_id);
+        uint64_t payload_bytes = 0;
+        if (snapshot != manager.block_hybrid_ssm_snapshots.end()) {
+            for (const auto& state : snapshot->second)
+                payload_bytes += (state.conv_state.size() + state.ssm_state.size()) * sizeof(float);
+        }
         manager.block_tokens.erase(block_id);
-        manager.block_hybrid_ssm_snapshots.erase(block_id);
+        if (manager.block_hybrid_ssm_snapshots.erase(block_id)) {
+            evicted_prefix_hybrid_payload_bytes.fetch_add(payload_bytes, std::memory_order_relaxed);
+            evicted_prefix_hybrid_snapshots.fetch_add(1, std::memory_order_relaxed);
+        }
         manager.prefix_cache.erase(it);
         ResetAllocatedBlock(manager, block_id);
+        evicted_prefix_kv_blocks.fetch_add(1, std::memory_order_release);
         return block_id;
     }
     return -1;
 }
 
 }  // namespace
+
+densecore::runtime::PrefixCacheEvictionStats densecore::runtime::PrefixCacheEvictionStatsSnapshot() {
+    const auto blocks = evicted_prefix_kv_blocks.load(std::memory_order_acquire);
+    return {blocks, evicted_prefix_hybrid_snapshots.load(std::memory_order_relaxed),
+            evicted_prefix_hybrid_payload_bytes.load(std::memory_order_relaxed)};
+}
 
 BlockManager::BlockManager(int num_blocks, int block_size) : num_blocks(num_blocks), block_size(block_size) {
     shards.reserve(NUM_SHARDS);
