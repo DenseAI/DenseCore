@@ -317,6 +317,12 @@ TEST(GptOssGraphTest, TinyGgufLoaderPreservesBiasesSlidingAndHarmonyStops) {
     const int fd = mkstemps(path, 5);
     ASSERT_NE(fd, -1);
     close(fd);
+    // Architecture cannot silently take the generic GPT-2 segmentation path.
+    gguf_set_val_str(gguf, "tokenizer.ggml.pre", "gpt2");
+    ASSERT_TRUE(gguf_write_to_file(gguf, path, false));
+    std::unique_ptr<TransformerModel> unsupported(LoadGGUFModel(path));
+    EXPECT_EQ(unsupported, nullptr);
+    gguf_set_val_str(gguf, "tokenizer.ggml.pre", "gpt-4o");
     ASSERT_TRUE(gguf_write_to_file(gguf, path, false));
     gguf_free(gguf);
     std::unique_ptr<TransformerModel> loaded(LoadGGUFModel(path));

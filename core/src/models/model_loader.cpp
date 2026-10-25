@@ -2339,6 +2339,12 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
 
     model->arch = resolved_arch.arch;
+    if (model->arch == ModelArch::GPT_OSS &&
+        densecore::models::ResolveTokenizerFamilyFromMetadata(tokenizer_type) !=
+            densecore::models::TokenizerFamily::O200K_BYTE_BPE) {
+        return fail_load("gpt-oss requires a qualified o200k tokenizer.ggml.pre value (gpt-4o or o200k_base)");
+    }
+
     model->variant = resolved_arch.variant;
     model->arch_flags = resolved_arch.arch_flags;
     if (!resolved_arch.known) {
