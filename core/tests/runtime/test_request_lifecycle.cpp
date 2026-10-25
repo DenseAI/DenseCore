@@ -1106,3 +1106,77 @@ TEST_F(RequestLifecycleTest, StoppedEngineRejectsModelPreparationAndKeepsReadQue
     DenseCoreTensor tensor{};
     EXPECT_EQ(DenseCoreSetWeight(engine_,"missing-weight",&tensor),DENSECORE_STATUS_MODEL_LOAD_FAILED);
 }
+
+namespace {
+struct JsonLifecycleCapture {
+    CallbackState callbacks;
+    std::vector<int> delivered_ids;
+    int metadata_count = 0;
+    int generated = -1;
+    DenseCoreGenerationFinishReason reason = DENSECORE_GENERATION_ERROR;
+};
+void JsonLifecycleToken(const char* text, int length, int id, int finished, void* data) {
+    auto& capture = *static_cast<JsonLifecycleCapture*>(data);
+    if (!finished && id >= 0) {
+        std::lock_guard<std::mutex> lock(capture.callbacks.mu);
+        capture.delivered_ids.push_back(id);
+    }
+    LifecycleCallbackEx(text, length, id, finished, &capture.callbacks);
+}
+void JsonLifecycleCompletion(int generated, DenseCoreGenerationFinishReason reason, void* data) {
+    auto& capture = *static_cast<JsonLifecycleCapture*>(data);
+    std::lock_guard<std::mutex> lock(capture.callbacks.mu);
+    ++capture.metadata_count;
+    capture.generated = generated;
+    capture.reason = reason;
+}
+}
+
+TEST_F(RequestLifecycleTest, JsonCompletionStopsAtClosingTokenAndKeepsPeersHealthy) {
+    auto* state = static_cast<EngineState*>(engine_);
+    std::array<JsonLifecycleCapture, 2> json;
+    JsonLifecycleCapture peer, recovery;
+    EngineCloseGuard close_before_callbacks{&engine_};
+    ASSERT_EQ(DenseCoreSetGenerationCompletionCallback(engine_, JsonLifecycleCompletion), DENSECORE_STATUS_OK);
+    const int braces[] = {123,125}; // Mock vocabulary uses global ASCII IDs '{' and '}'.
+    const int healthy[] = {65};
+    for (int index = 0; index < 2; ++index) {
+        const int maximum = index == 0 ? 8 : 2;
+        ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(
+            engine_, "json-object", maximum, nullptr, 0, 1, 1, 1, nullptr, 1,
+            braces, 2, 1, nullptr, 0, JsonLifecycleToken, &json[index]), 0);
+        if (index == 0) {
+            ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(
+                engine_, "healthy-peer", 2, nullptr, 0, 1, 1, 1, nullptr, 0,
+                healthy, 1, 1, nullptr, 0, JsonLifecycleToken, &peer), 0);
+        }
+    }
+    for (auto& capture : json) ASSERT_TRUE(capture.callbacks.WaitForFinal());
+    ASSERT_TRUE(peer.callbacks.WaitForFinal());
+    EXPECT_EQ(state->status.load(), EngineStatus::RUNNING);
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(
+        engine_, "healthy-recovery", 2, nullptr, 0, 1, 1, 1, nullptr, 0,
+        healthy, 1, 1, nullptr, 0, JsonLifecycleToken, &recovery), 0);
+    ASSERT_TRUE(recovery.callbacks.WaitForFinal());
+    FreeEngine(engine_); engine_ = nullptr; // Join before reading final callback state.
+    for (auto& capture : json) {
+        std::string text;
+        for (const auto& piece : capture.callbacks.tokens) text += piece;
+        EXPECT_EQ(text, "{}");
+        EXPECT_EQ(capture.delivered_ids, (std::vector<int>{123,125}));
+        EXPECT_EQ(capture.generated, 2);
+        EXPECT_EQ(capture.reason, DENSECORE_GENERATION_STOP);
+        EXPECT_EQ(capture.metadata_count, 1);
+        EXPECT_EQ(capture.callbacks.final_count, 1);
+        ASSERT_EQ(capture.callbacks.final_texts.size(), 1u);
+        EXPECT_TRUE(capture.callbacks.final_texts.front().empty());
+    }
+    for (auto* capture : {&peer,&recovery}) {
+        EXPECT_EQ(capture->callbacks.final_count, 1);
+        EXPECT_EQ(capture->metadata_count, 1);
+        EXPECT_EQ(capture->generated, 2);
+        EXPECT_EQ(capture->reason, DENSECORE_GENERATION_LENGTH);
+        ASSERT_EQ(capture->callbacks.final_texts.size(), 1u);
+        EXPECT_TRUE(capture->callbacks.final_texts.front().empty());
+    }
+}
