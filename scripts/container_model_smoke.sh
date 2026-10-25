@@ -56,16 +56,26 @@ wait_for_http "$base_url/health/ready"
 curl -fsS "$base_url/v1/models" >"$tmp_dir/models.json"
 
 curl -fsS -H 'Content-Type: application/json' \
-  -d '{"model":"densecore-v1","messages":[{"role":"user","content":"Say hello in one short sentence."}],"max_tokens":16,"stream":false}' \
+  -d '{"model":"densecore-v1","messages":[{"role":"user","content":"What is the capital of France? Answer with the city name only."}],"max_tokens":64,"temperature":0,"chat_template_kwargs":{"enable_thinking":false},"stream":false}' \
   "$base_url/v1/chat/completions" >"$tmp_dir/nonstream.json"
 
 curl -fsS -H 'Content-Type: application/json' \
-  -d '{"model":"densecore-v1","messages":[{"role":"user","content":"Count to two."}],"max_tokens":16,"stream":true}' \
+  -d '{"model":"densecore-v1","messages":[{"role":"user","content":"Count from 1 to 2. Reply only with the two digits."}],"max_tokens":64,"temperature":0,"chat_template_kwargs":{"enable_thinking":false},"stream":true}' \
   "$base_url/v1/chat/completions" >"$tmp_dir/stream.sse"
 
 python3 - "$tmp_dir/models.json" "$tmp_dir/nonstream.json" "$tmp_dir/stream.sse" <<'PY'
 import json
+import re
 import sys
+
+
+def final_text(text):
+    if "<think>" in text:
+        if "</think>" not in text:
+            return ""
+        text = text.rsplit("</think>", 1)[1]
+    return text.strip()
+
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     models = json.load(handle)
@@ -76,10 +86,13 @@ with open(sys.argv[2], encoding="utf-8") as handle:
     response = json.load(handle)
 choices = response.get("choices")
 content = choices[0].get("message", {}).get("content") if choices else None
-if not isinstance(content, str) or not content.strip():
-    raise SystemExit("non-streaming response content is empty or invalid")
+if not isinstance(content, str) or not re.fullmatch(r"Paris[.!]?", final_text(content), flags=re.IGNORECASE):
+    raise SystemExit("non-streaming response has no correct final answer")
+if choices[0].get("finish_reason") != "stop":
+    raise SystemExit("non-streaming final answer was truncated or incomplete")
 
 terminal = False
+finish_reason = None
 visible = []
 with open(sys.argv[3], encoding="utf-8") as handle:
     for raw in handle:
@@ -93,11 +106,15 @@ with open(sys.argv[3], encoding="utf-8") as handle:
         event = json.loads(payload)
         for choice in event.get("choices", []):
             delta = choice.get("delta", {})
-            visible.append(delta.get("content") or delta.get("reasoning_content") or "")
+            visible.append(delta.get("content") or "")
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
 if not terminal:
     raise SystemExit("streaming response did not reach [DONE]")
-if not "".join(visible).strip():
-    raise SystemExit("streaming response content is empty")
+if finish_reason != "stop":
+    raise SystemExit("streaming final answer was truncated or incomplete")
+if not re.search(r"1\D*2", final_text("".join(visible))):
+    raise SystemExit("streaming response has no correct final answer")
 PY
 
 python3 "$(dirname "$0")/active_drain_smoke.py" --url "$base_url" \
