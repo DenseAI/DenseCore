@@ -610,6 +610,14 @@ bool BlockManager::RollbackExclusiveSuffix(std::vector<int>* block_ids, int keep
         for (size_t j = 0; j < i; ++j) if ((*block_ids)[j] == id) return false;
         if (i >= first_touched && (blocks[id].ref_count != 1 || blocks[id].cache_resident)) return false;
     }
+    if (partial && blocks[(*block_ids)[keep_blocks - 1]].num_filled_slots < keep_tokens % block_size) return false;
+    // Allocation must finish before any ownership/slot mutation, so a bad_alloc
+    // cannot strand a partially returned suffix.
+    std::vector<size_t> returned(shards.size(), 0);
+    for (size_t i = keep_blocks; i < block_ids->size(); ++i) ++returned[(*block_ids)[i] % NUM_SHARDS];
+    for (size_t shard = 0; shard < shards.size(); ++shard) {
+        shards[shard]->free_blocks.reserve(shards[shard]->free_blocks.size() + returned[shard]);
+    }
     if (partial) blocks[(*block_ids)[keep_blocks - 1]].num_filled_slots = keep_tokens % block_size;
     for (size_t i = keep_blocks; i < block_ids->size(); ++i) {
         const int id = (*block_ids)[i];
