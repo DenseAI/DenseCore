@@ -32,6 +32,17 @@ NATIVE_CASES = CASES + [{"id": "long_parity", "prompt":
     "Write every integer from 1 through 80, one integer per line. Do not skip any integers. Start with 1."}]
 
 
+def record_native_piece(row, item, *, strict_utf8=False):
+    """Retain text-only flushes without inventing a generated token ID."""
+    if item.token_id >= 0:
+        row['token_ids'].append(item.token_id)
+        row['first_token'].set()
+    try:
+        row['pieces'].append((item.text or b'').decode('utf-8', errors='strict' if strict_utf8 else 'replace'))
+    except UnicodeDecodeError as error:
+        row['utf8_errors'].append(str(error))
+
+
 def extract_mtp_counters(log):
     requests = {}
     for line in log.splitlines():
@@ -189,10 +200,8 @@ def native_child(args):
             if item.is_finished:
                 row['terminal_events'] += 1
                 row['done'].set()
-            elif item.token_id >= 0:
-                row['token_ids'].append(item.token_id)
-                row['pieces'].append((item.text or b'').decode('utf-8', errors='replace'))
-                row['first_token'].set()
+            else:
+                record_native_piece(row, item)
 
     @COMPLETE
     def completed(count, reason, data):

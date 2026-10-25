@@ -90,13 +90,8 @@ def native_child(args, cases):
             if item.is_finished:
                 row['terminal_events'] += 1
                 row['done'].set()
-            elif item.token_id >= 0:
-                row['token_ids'].append(item.token_id)
-                try:
-                    row['pieces'].append((item.text or b'').decode('utf-8', 'strict'))
-                except UnicodeDecodeError as error:
-                    row['utf8_errors'].append(str(error))
-                row['first_token'].set()
+            else:
+                protocol.record_native_piece(row, item, strict_utf8=True)
 
     @protocol.COMPLETE
     def completed(count, reason, data):

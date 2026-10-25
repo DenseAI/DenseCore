@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 import unittest
+import threading
 from unittest.mock import patch
 
 import check_mtp_sampling as smoke
@@ -160,3 +161,22 @@ class PromptRequirementConsistencyTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NativeTextOnlyFlushTest(unittest.TestCase):
+    def test_flush_preserves_unicode_text_without_counting_an_id(self):
+        row = dict(token_ids=[], pieces=[], utf8_errors=[], first_token=threading.Event())
+        smoke.protocol.record_native_piece(row, SimpleNamespace(token_id=7, text=b'Hi'), strict_utf8=True)
+        smoke.protocol.record_native_piece(row, SimpleNamespace(token_id=8, text=b''), strict_utf8=True)
+        smoke.protocol.record_native_piece(row, SimpleNamespace(token_id=-1, text='<é'.encode()), strict_utf8=True)
+        self.assertEqual(row['token_ids'], [7, 8])
+        self.assertEqual(''.join(row['pieces']), 'Hi<é')
+        self.assertTrue(row['first_token'].is_set())
+        self.assertEqual(row['utf8_errors'], [])
+
+    def test_text_only_flush_does_not_signal_a_generated_token(self):
+        row = dict(token_ids=[], pieces=[], utf8_errors=[], first_token=threading.Event())
+        smoke.protocol.record_native_piece(row, SimpleNamespace(token_id=-1, text=b'prefix'), strict_utf8=True)
+        self.assertFalse(row['first_token'].is_set())
+        smoke.protocol.record_native_piece(row, SimpleNamespace(token_id=-1, text=b'\xff'), strict_utf8=True)
+        self.assertEqual(len(row['utf8_errors']), 1)
