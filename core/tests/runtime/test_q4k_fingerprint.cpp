@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cmath>
+#include <cstring>
 #include <vector>
 
 #include "kernels/q4k_repacked_gemv.h"
+#include "densecore.h"
 
 namespace {
 using densecore::kernels::FingerprintQ4KRepackedGemvWeight;
@@ -55,5 +58,42 @@ TEST(Q4KFingerprintTest, LaneOrderAndRepeatedPatternsRemainDistinct) {
             std::swap(data[first], data[second]);
         }
     }
+}
+
+TEST(Q4KRepackedLifetimeTest, EngineRetirementInvalidatesReusedStorageWithIdenticalEdges) {
+    using namespace densecore::kernels;
+    if (!Q4KRealPackedGemvKernelAvailable()) GTEST_SKIP() << "Host has no packed Q4_K kernel";
+    constexpr int64_t rows = 128;
+    constexpr int64_t cols = 256;
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q4_K, cols);
+    std::vector<float> source(rows * cols);
+    for (size_t i = 0; i < source.size(); ++i) source[i] = std::sin(static_cast<float>(i) * 0.017f);
+    std::vector<uint8_t> reused_storage(rows * row_bytes);
+    for (int64_t row = 0; row < rows; ++row)
+        ggml_quantize_chunk(GGML_TYPE_Q4_K, source.data() + row * cols, reused_storage.data() + row * row_bytes,
+                            0, 1, cols, nullptr);
+    const auto fingerprint = FingerprintQ4KRepackedGemvWeight(reused_storage.data(), reused_storage.size());
+    const auto original = GetOrCreateQ4KRepackedGemvWeight(reused_storage.data(), rows, cols);
+    ASSERT_NE(original, nullptr);
+    const auto original_blocks = original->blocks;
+    // A new allocation/model can reuse this address, shape and sampled edges.
+    // Real engine teardown must retire its process-global packed-weight views.
+    DenseCoreHandle engine = InitEngine("mock", nullptr, 1);
+    ASSERT_NE(engine, nullptr) << DenseCoreGetLastError();
+    FreeEngine(engine);
+    reused_storage[reused_storage.size() / 2 + 64] ^= 0x11;
+    ASSERT_EQ(fingerprint, FingerprintQ4KRepackedGemvWeight(reused_storage.data(), reused_storage.size()));
+    Q4KRepackedGemvCacheLookup lookup;
+    const auto replacement = GetOrCreateQ4KRepackedGemvWeight(reused_storage.data(), rows, cols, &lookup);
+    ASSERT_NE(replacement, nullptr);
+    EXPECT_FALSE(lookup.cache_hit);
+    EXPECT_NE(replacement, original);
+    // The old inflight shared owner remains valid across retirement.
+    EXPECT_EQ(std::memcmp(original->blocks.data(), original_blocks.data(), original->bytes), 0);
+    std::vector<Q4KRepackedGemvBlock> expected(original_blocks.size());
+    ASSERT_EQ(ggml_repack_q4_K_8x8(reused_storage.data(), reused_storage.size(), rows, cols,
+                                  expected.data(), original->bytes), 0);
+    EXPECT_EQ(std::memcmp(replacement->blocks.data(), expected.data(), replacement->bytes), 0);
+    EXPECT_NE(std::memcmp(original->blocks.data(), expected.data(), original->bytes), 0);
 }
 }  // namespace
