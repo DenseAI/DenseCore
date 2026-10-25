@@ -72,6 +72,21 @@ def sample(config, case, threads, cpus, out):
                 except OSError:
                     if time.monotonic() >= deadline: raise RuntimeError('server readiness timeout')
                     time.sleep(.5)
+            maps_path = Path(f'/proc/{process.pid}/maps')
+            maps = maps_path.read_text()
+            out.with_suffix('.proc-maps.txt').write_text(maps)
+            loaded = {}
+            for line in maps.splitlines():
+                parts = line.split(maxsplit=5)
+                if len(parts) < 6 or not parts[5].startswith('/'):
+                    continue
+                path = Path(parts[5])
+                if not any(name in path.name for name in ('libdensecore', 'libggml', 'libllama')):
+                    continue
+                if str(path) not in loaded and path.is_file():
+                    with path.open('rb') as handle:
+                        loaded[str(path)] = hashlib.file_digest(handle, 'sha256').hexdigest()
+            metadata['loaded_library_sha256'] = loaded
             result = measure.group(f'http://127.0.0.1:{port}', config['prompts'], 1,
                 config.get('max_tokens', 1024), config['expected_pattern'])
             result['provenance'] = metadata
