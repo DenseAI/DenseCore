@@ -27,7 +27,7 @@ func Execute() {
 }
 
 func init() {
-	rootCmd.PersistentFlags().String("spec-type", "auto", "Speculation: auto, none, mtp (requires a validated execution profile)")
+	rootCmd.PersistentFlags().String("spec-type", "auto", "Speculation: auto (qualified profiles), none, mtp (explicit correctness reference)")
 	rootCmd.PersistentFlags().Int("spec-draft-n-max", 2, "Maximum MTP draft tokens (1, 2 or 3)")
 	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose output")
 	rootCmd.PersistentFlags().String("host", defaultCLIHost, "Bind address")
