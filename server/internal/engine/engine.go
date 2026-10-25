@@ -419,6 +419,10 @@ func NewDenseEngine(mainModelPath, draftModelPath string, threads int) (*DenseEn
 	if useExplicitKVType {
 		cacheType = C.int(kvType)
 	}
+	// Native initialization errors are thread-local; read them on the same OS
+	// thread even if the goroutine would otherwise migrate between cgo calls.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle := C.InitEngineWithOptions(cMainPath, cDraftPath, C.int(threads), -1, 0, cacheType, &options)
 	if handle == nil {
 		lastErr := C.DenseCoreGetLastError()
@@ -441,7 +445,13 @@ func NewDenseEngine(mainModelPath, draftModelPath string, threads int) (*DenseEn
 		StartMapCleanupTicker(1*time.Minute, 5*time.Minute)
 	})
 
-	log.Printf("[engine] speculation requested=%s draft_n_max=%d selected=%s", spec.name, spec.draftLimit, C.GoString(C.DenseCoreSpeculationAutoSelectionReason()))
+	plan := C.DenseCoreRuntimePlan{}
+	plan.struct_size = C.uint32_t(C.sizeof_DenseCoreRuntimePlan)
+	plan.version = 1
+	if C.DenseCoreGetRuntimePlan(handle, &plan) == C.DENSECORE_STATUS_OK {
+		log.Printf("[engine] effective threads=%d context=%d concurrency=%d memory_required=%d memory_available=%d kv=%d graph=%d repack=%d recurrent=%d prefix=%d mtp=%d allocator=%d", plan.effective_threads, plan.effective_context, plan.effective_concurrency, plan.required_bytes, plan.available_bytes, plan.kv_bytes, plan.graph_bytes, plan.repack_bytes, plan.recurrent_bytes, plan.prefix_snapshot_bytes, plan.mtp_bytes, plan.allocator_bytes)
+		log.Printf("[engine] speculation requested=%s draft_n_max=%d selected=%d reason=%s", spec.name, spec.draftLimit, plan.spec_selected, C.GoString(&plan.spec_reason[0]))
+	}
 	eng := &DenseEngine{handle: handle}
 	eng.initializeGenerationPolicy()
 	return eng, nil

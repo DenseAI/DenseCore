@@ -56,7 +56,7 @@ from .chat_template import (
 )
 from .config import GenerationConfig, ModelConfig
 from .lora import LoRAManager
-from .speculation import NativeInitOptions, init_options, initialize_native
+from .speculation import NativeInitOptions, NativeRuntimePlan, init_options, initialize_native, runtime_plan
 
 # ==============================================================================
 # GIL Release Architecture
@@ -749,6 +749,12 @@ class DenseCore:
 
         self._closed = False  # Mark as open so close() works correctly
 
+    def get_runtime_plan(self) -> dict:
+        """Return effective settings and reserved memory bytes (not measured RSS)."""
+        if self._closed or not self._handle:
+            raise EngineNotInitializedError("engine is closed")
+        return runtime_plan(self._lib, self._handle)
+
     @classmethod
     def from_pretrained(
         cls,
@@ -823,6 +829,9 @@ class DenseCore:
                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(NativeInitOptions),
             ]
             self._lib.InitEngineWithOptions.restype = ctypes.c_void_p
+        if hasattr(self._lib, "DenseCoreGetRuntimePlan"):
+            self._lib.DenseCoreGetRuntimePlan.argtypes = [ctypes.c_void_p, ctypes.POINTER(NativeRuntimePlan)]
+            self._lib.DenseCoreGetRuntimePlan.restype = ctypes.c_int
         if hasattr(self._lib, "DenseCoreGetLastError"):
             self._lib.DenseCoreGetLastError.argtypes = []
             self._lib.DenseCoreGetLastError.restype = ctypes.c_char_p

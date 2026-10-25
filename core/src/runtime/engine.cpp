@@ -789,7 +789,7 @@ struct InitPaths {
 
 bool ResolveInitPaths(const char* model_path, const char* reserved, const char* api_name, InitPaths* paths) {
     if (!model_path) {
-        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "InitEngineEx: model_path is null");
+        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, std::string(api_name) + ": model_path is null");
         return false;
     }
 
@@ -844,11 +844,12 @@ void InitializeRuntimeBackends(int threads) {
 }
 
 std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, int threads, int numa_node_id,
-                                                       int pinning_policy) {
+                                                       int pinning_policy, ggml_type requested_type,
+                                                       const char* api_name) {
     auto model_owner = std::unique_ptr<TransformerModel>(LoadModelWithNuma(paths.model_path.c_str(), numa_node_id));
     TransformerModel* model = model_owner.get();
     if (!model) {
-        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "InitEngineEx: failed to load model");
+        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, std::string(api_name) + ": failed to load model");
         return nullptr;
     }
 
@@ -860,9 +861,13 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
     state->op_registry = std::make_unique<densecore::OpRegistry>();
     state->InitializeExecutionDependencies(threads);
 
-    const ggml_type default_cache_type = ResolveDefaultKVCacheType(model);
+    const ggml_type default_cache_type = requested_type == GGML_TYPE_COUNT ? ResolveDefaultKVCacheType(model) : requested_type;
     state->requested_kv_cache_type = default_cache_type;
     const KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, default_cache_type);
+    if (kv_config.effective_cache_type != kv_config.requested_cache_type) {
+        LOG_WARN("Requested KV type {} is incompatible with this model; using {}",
+                 KVCacheTypeDisplayName(kv_config.requested_cache_type), KVCacheTypeDisplayName(kv_config.effective_cache_type));
+    }
     std::cout << "[DenseCore] Auto-configured max_seq_len: " << kv_config.max_seq_len << " (KV capacity: ~"
               << (kv_config.bytes_per_token * kv_config.max_seq_len *
                   static_cast<size_t>(std::max(1, kv_config.max_num_seqs)) / 1024 / 1024)
@@ -898,7 +903,7 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
                                            kv_config.effective_cache_type, state->numa_node_id);
     if (!cache) {
         // model_owner releases the loaded model on this failure path.
-        SetError(DENSECORE_STATUS_OUT_OF_MEMORY, "InitEngineEx: failed to initialize KV cache");
+        SetError(DENSECORE_STATUS_OUT_OF_MEMORY, std::string(api_name) + ": failed to initialize KV cache");
         return nullptr;
     }
     auto entry = MakeModelEntry("default", paths.model_path, std::move(model_owner),
@@ -906,8 +911,8 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
     state->models["default"] = std::move(entry);
     state->default_model_id = "default";
 
-    if (!LoadOptionalDraftModel(state.get(), paths.model_path, paths.draft_model_path, kv_config.effective_cache_type,
-                                "InitEngineEx")) {
+    if (!LoadOptionalDraftModel(state.get(), paths.model_path, paths.draft_model_path, default_cache_type,
+                                api_name)) {
         return nullptr;
     }
 
@@ -922,7 +927,7 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
 
     if (!state->models["default"]->kv_cache || !state->models["default"]->kv_cache->block_manager) {
         LOG_CRITICAL("FATAL: Failed to initialize Scheduler. BlockManager is missing.");
-        SetError(DENSECORE_STATUS_INTERNAL_ERROR, "InitEngineEx: failed to initialize scheduler");
+        SetError(DENSECORE_STATUS_INTERNAL_ERROR, std::string(api_name) + ": failed to initialize scheduler");
         return nullptr;
     }
     state->scheduler = std::make_unique<densecore::Scheduler>(state->models["default"]->kv_cache->block_manager,
@@ -944,6 +949,32 @@ bool StartEngineThreads(EngineState* state) {
     return true;
 }
 
+// Every public initialization entry point uses the same path/resource/backend
+// setup and cleanup. Only the requested KV type differs.
+DenseCoreHandle InitializeEngineCommon(const char* model_path, const char* reserved, int threads,
+                                      int numa_node_id, int pinning_policy, ggml_type requested_type,
+                                      const char* api_name) {
+    try {
+        ClearError();
+        static std::once_flag log_init_flag;
+        std::call_once(log_init_flag, []() { densecore::utils::InitLogging(); });
+        if (!ValidateRuntimeEnvironment(api_name)) return nullptr;
+        InitPaths paths;
+        if (!ResolveInitPaths(model_path, reserved, api_name, &paths)) return nullptr;
+        threads = ResolveEngineThreadCount(threads);
+        InitializeRuntimeBackends(threads);
+        auto state = InitializeEngineResources(paths, threads, numa_node_id, pinning_policy, requested_type, api_name);
+        if (!state || !StartEngineThreads(state.get())) return nullptr;
+        ClearError();
+        return static_cast<DenseCoreHandle>(state.release());
+    } catch (const densecore::DenseCoreException& e) {
+        SetError(MapErrorCodeToStatus(e.Code()), e.what());
+    } catch (const std::exception& e) {
+        SetError(DENSECORE_STATUS_INTERNAL_ERROR, std::string(api_name) + ": " + e.what());
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 /**
@@ -960,204 +991,23 @@ DENSECORE_API DenseCoreHandle InitEngine(const char* model_path, const char* res
 /**
  * @brief Initialize engine with NUMA and thread pinning control (extended API)
  */
-DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* reserved, int threads, int numa_node_id,
-                                           int pinning_policy) {
-    try {
-        ClearError();
-        // Initialize logging subsystem (once)
-        static std::once_flag log_init_flag;
-        std::call_once(log_init_flag, []() { densecore::utils::InitLogging(); });
-
-        if (!ValidateRuntimeEnvironment("InitEngineEx")) {
-            return nullptr;
-        }
-
-        InitPaths init_paths;
-        if (!ResolveInitPaths(model_path, reserved, "InitEngineEx", &init_paths)) {
-            return nullptr;
-        }
-
-
-        threads = ResolveEngineThreadCount(threads);
-        LOG_INFO("Threading configured: {} threads (GGML thread pool + std::thread, no OpenMP)", threads);
-
-        InitializeRuntimeBackends(threads);
-        auto state = InitializeEngineResources(init_paths, threads, numa_node_id, pinning_policy);
-        if (!state) {
-            return nullptr;
-        }
-
-        if (!StartEngineThreads(state.get())) {
-            return nullptr;
-        }
-
-        ClearError();
-        return (DenseCoreHandle)state.release();  // Transfer ownership to caller
-    } catch (const densecore::DenseCoreException& e) {
-        LOG_ERROR("Exception in InitEngine: {}", e.what());
-        SetError(MapErrorCodeToStatus(e.Code()), e.what());
-        return nullptr;
-    } catch (const std::exception& e) {
-        LOG_ERROR("Exception in InitEngine: {}", e.what());
-        SetError(DENSECORE_STATUS_INTERNAL_ERROR, "InitEngineEx: exception");
-        return nullptr;
-    }
+DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* reserved, int threads,
+                                         int numa_node_id, int pinning_policy) {
+    return InitializeEngineCommon(model_path, reserved, threads, numa_node_id, pinning_policy,
+                                  GGML_TYPE_COUNT, "InitEngineEx");
 }
 
-/**
- * @brief Initialize engine with KV cache type specification
- *
- * Extended initialization with control over KV cache precision.
- * INT8 KV cache uses approximately half the storage of FP16. Output quality
- * must be validated for the target model and workload.
- */
 DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const char* reserved, int threads,
-                                                   int numa_node_id, int pinning_policy,
-                                                   DenseCoreKVType kv_cache_type) {
-    try {
-        ClearError();
-        if (!ValidateRuntimeEnvironment("InitEngineWithKVType")) {
-            return nullptr;
-        }
-        if (!model_path) {
-            SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "InitEngineWithKVType: model_path is null");
-            return nullptr;
-        }
-
-        std::string canonical_model_path;
-        if (!ValidateModelPathArg(model_path, "InitEngineWithKVType", "model_path", &canonical_model_path)) {
-            return nullptr;
-        }
-        const std::string draft_model_path = ResolveDraftModelPath(reserved);
-        std::string canonical_draft_model_path;
-        if (!draft_model_path.empty() && !ValidateModelPathArg(draft_model_path, "InitEngineWithKVType",
-                                                               "draft_model_path", &canonical_draft_model_path)) {
-            return nullptr;
-        }
-        // Convert enum to ggml_type
-        ggml_type cache_type = GGML_TYPE_F16;  // Default
-        switch (kv_cache_type) {
+                                                 int numa_node_id, int pinning_policy, DenseCoreKVType kv_cache_type) {
+    ggml_type cache_type = GGML_TYPE_F16;
+    switch (kv_cache_type) {
         case DENSECORE_KV_FP32: cache_type = GGML_TYPE_F32; break;
-        case DENSECORE_KV_INT8:
-            cache_type = GGML_TYPE_Q8_0;
-            std::cout << "[DenseCore] Using INT8 KV Cache (50% memory reduction)" << std::endl;
-            break;
-        case DENSECORE_KV_INT4:
-            cache_type = GGML_TYPE_Q4_0;
-            std::cout << "[DenseCore] Using INT4 KV Cache (75% memory reduction)" << std::endl;
-            break;
-        case DENSECORE_KV_FP16:
-        default: cache_type = GGML_TYPE_F16; break;
-        }
-
-        // Reuse InitEngineEx logic but with custom KV cache type
-        // Thread configuration
-        threads = ResolveEngineThreadCount(threads);
-        std::cout << "[DenseCore] Threading configured: " << threads << " threads" << std::endl;
-
-        // SIMD dispatch initialization
-        if (!densecore::OpsRegistry::IsInitialized()) {
-            densecore::OpsRegistry::Init();
-        }
-
-        // Backend registration
-        // Each EngineState initializes its own backend after creating OpRegistry.
-
-        auto model_owner = std::unique_ptr<TransformerModel>(LoadModelWithNuma(canonical_model_path.c_str(), numa_node_id));
-        TransformerModel* model = model_owner.get();
-        if (!model) {
-            SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "InitEngineWithKVType: failed to load model");
-            return nullptr;
-        }
-
-        // RAII: Use unique_ptr to guarantee cleanup on exception
-        auto state = std::make_unique<EngineState>();
-        state->numa_node_id = numa_node_id;
-        state->pinning_policy = pinning_policy;
-        state->n_threads = threads;
-        state->requested_kv_cache_type = cache_type;
-        state->fast_path_config = densecore::llm::config::LoadFastPathRuntimeConfig();
-
-        // Initialize OpRegistry (Dependency Injection)
-        state->op_registry = std::make_unique<densecore::OpRegistry>();
-        state->InitializeExecutionDependencies(threads);
-
-        KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, cache_type);
-        if (kv_config.effective_cache_type != kv_config.requested_cache_type) {
-            std::cout << "[DenseCore] Requested " << KVCacheTypeDisplayName(kv_config.requested_cache_type)
-                      << " KV cache is not supported for this model/runtime; using "
-                      << KVCacheTypeDisplayName(kv_config.effective_cache_type) << " instead" << std::endl;
-        }
-
-        std::cout << "[DenseCore] Auto-configured max_seq_len: " << kv_config.max_seq_len << " (KV capacity: ~"
-                  << (kv_config.bytes_per_token * kv_config.max_seq_len *
-                      static_cast<size_t>(std::max(1, kv_config.max_num_seqs)) / 1024 / 1024)
-                  << " MB total, max_num_seqs=" << kv_config.max_num_seqs << ")" << std::endl;
-
-        // Initialize PagedKVCache with specified type
-        PagedKVCache* cache = InitPagedKVCache(model, kv_config.max_num_seqs, kv_config.max_seq_len,
-                                               kv_config.effective_cache_type, state->numa_node_id);
-        if (!cache) {
-            // model_owner releases the loaded model on this failure path.
-            // state is automatically cleaned up by unique_ptr
-            SetError(DENSECORE_STATUS_OUT_OF_MEMORY, "InitEngineWithKVType: failed to initialize KV cache");
-            return nullptr;
-        }
-
-        // Log cache type
-        const char* type_name = KVCacheTypeDisplayName(kv_config.effective_cache_type);
-        std::cout << "[DenseCore] KV Cache initialized with type: " << type_name << std::endl;
-
-        // Create model entry
-        auto entry = MakeModelEntry("default", canonical_model_path, std::move(model_owner),
-                                    std::unique_ptr<PagedKVCache>(cache), kv_config);
-        state->models["default"] = std::move(entry);
-        state->default_model_id = "default";
-        if (!LoadOptionalDraftModel(state.get(), canonical_model_path, canonical_draft_model_path, cache_type,
-                                    "InitEngineWithKVType")) {
-            return nullptr;
-        }
-
-#ifdef __APPLE__
-        ConfigureHybridScheduler(state.get(), state->models["default"]->model.get());
-        state->backend_selector = densecore::CreateBackendSelector(state->hybrid_scheduler.get());
-#else
-        state->backend_selector = densecore::CreateBackendSelector(nullptr);
-#endif
-
-        // Initialize Scheduler
-        if (state->models["default"]->kv_cache && state->models["default"]->kv_cache->block_manager) {
-            state->scheduler = std::make_unique<densecore::Scheduler>(state->models["default"]->kv_cache->block_manager,
-                                                                      BuildRuntimeSchedulerConfig(kv_config, state->models["default"]->model.get()));
-            std::cout << "[DenseCore] Scheduler initialized." << std::endl;
-        } else {
-            std::cerr << "[DenseCore] FATAL: Failed to initialize Scheduler." << std::endl;
-            SetError(DENSECORE_STATUS_INTERNAL_ERROR, "InitEngineWithKVType: failed to initialize scheduler");
-            // state is automatically cleaned up by unique_ptr
-            return nullptr;
-        }
-
-        // Initialize compute buffer
-        state->InitComputeBuffer();
-
-        // Start background threads
-        state->status = EngineStatus::RUNNING;
-        state->worker_thread = std::thread(EngineLoop, state.get());
-        state->callback_thread = std::thread(CallbackLoop, state.get());
-
-        std::cout << "[DenseCore] Started worker thread and callback thread" << std::endl;
-        ClearError();
-        return (DenseCoreHandle)state.release();  // Transfer ownership to caller
-
-    } catch (const densecore::DenseCoreException& e) {
-        std::cerr << "[DenseCore] Exception in InitEngineWithKVType: " << e.what() << std::endl;
-        SetError(MapErrorCodeToStatus(e.Code()), e.what());
-        return nullptr;
-    } catch (const std::exception& e) {
-        std::cerr << "[DenseCore] Exception in InitEngineWithKVType: " << e.what() << std::endl;
-        SetError(DENSECORE_STATUS_INTERNAL_ERROR, "InitEngineWithKVType: exception");
-        return nullptr;
+        case DENSECORE_KV_INT8: cache_type = GGML_TYPE_Q8_0; break;
+        case DENSECORE_KV_INT4: cache_type = GGML_TYPE_Q4_0; break;
+        case DENSECORE_KV_FP16: default: break;
     }
+    return InitializeEngineCommon(model_path, reserved, threads, numa_node_id, pinning_policy,
+                                  cache_type, "InitEngineWithKVType");
 }
 
 // =============================================================================

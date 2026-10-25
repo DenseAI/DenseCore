@@ -33,3 +33,29 @@ def initialize_native(lib, model_path: bytes, threads: int, kv_type: int, option
             raise RuntimeError("selected KV cache type requires InitEngineWithKVType")
         return lib.InitEngineWithKVType(model_path, None, threads, -1, 0, kv_type)
     return lib.InitEngine(model_path, None, threads)
+
+
+class NativeRuntimePlan(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("version", ctypes.c_uint32),
+        ("effective_threads", ctypes.c_int32), ("effective_context", ctypes.c_int32),
+        ("effective_concurrency", ctypes.c_int32), ("spec_requested", ctypes.c_int32),
+        ("spec_selected", ctypes.c_int32), ("spec_draft_n_max", ctypes.c_int32),
+        *[(name, ctypes.c_uint64) for name in (
+            "available_bytes", "required_bytes", "kv_bytes", "graph_bytes", "repack_bytes",
+            "recurrent_bytes", "prefix_snapshot_bytes", "mtp_bytes", "allocator_bytes")],
+        ("spec_reason", ctypes.c_char * 192),
+    ]
+
+
+def runtime_plan(lib, handle) -> dict:
+    if not hasattr(lib, "DenseCoreGetRuntimePlan"):
+        raise RuntimeError("runtime diagnostics require DenseCoreGetRuntimePlan")
+    result = NativeRuntimePlan()
+    result.struct_size = ctypes.sizeof(result)
+    result.version = 1
+    if lib.DenseCoreGetRuntimePlan(handle, ctypes.byref(result)) != 0:
+        raise RuntimeError("failed to read native runtime plan")
+    values = {name: getattr(result, name) for name, _ in result._fields_}
+    values["spec_reason"] = result.spec_reason.decode("utf-8", errors="replace")
+    return values

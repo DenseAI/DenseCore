@@ -424,7 +424,8 @@ typedef struct {
  * Additive initialization API; NULL options select AUTO, draft limit 2.
  * kv_cache_type=-1 preserves InitEngineEx's default KV configuration.
  * AUTO uses ordinary decode unless model, CPU and concurrency are qualified.
- * Explicit MTP fails when no executable, qualified MTP profile is available.
+ * Explicit MTP uses the sequential correctness reference where supported;
+ * unsupported model/shape/resource combinations fail with an initialization error.
  * Earlier initialization APIs retain their signatures and default behavior.
  */
 DENSECORE_API DenseCoreHandle InitEngineWithOptions(const char* model_path, const char* reserved, int threads,
@@ -432,6 +433,20 @@ DENSECORE_API DenseCoreHandle InitEngineWithOptions(const char* model_path, cons
 
 /** Selection reason for the currently registered AUTO profiles (static string). */
 DENSECORE_API const char* DenseCoreSpeculationAutoSelectionReason(void);
+
+/** Effective startup plan; memory fields are reserved bytes, not measured RSS. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t version;
+    int32_t effective_threads, effective_context, effective_concurrency;
+    int32_t spec_requested, spec_selected, spec_draft_n_max;
+    uint64_t available_bytes, required_bytes;
+    uint64_t kv_bytes, graph_bytes, repack_bytes, recurrent_bytes;
+    uint64_t prefix_snapshot_bytes, mtp_bytes, allocator_bytes;
+    char spec_reason[192];
+} DenseCoreRuntimePlan;
+DENSECORE_API int DenseCoreGetRuntimePlan(DenseCoreHandle handle, DenseCoreRuntimePlan* out);
+
 
 /**
  * Submit a request to the DenseCore engine (Non-blocking)

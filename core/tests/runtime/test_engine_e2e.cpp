@@ -32,11 +32,11 @@
 
 namespace {
 
-TEST(EngineInitOptions, RejectsUnsupportedExplicitMtpBeforeLoading) {
+TEST(EngineInitOptions, RejectsUnsupportedExplicitMtpModel) {
     DenseCoreInitOptions options{sizeof(DenseCoreInitOptions), DENSECORE_INIT_OPTIONS_VERSION,
                                 DENSECORE_SPEC_MTP, 2};
-    EXPECT_EQ(InitEngineWithOptions("missing.gguf", nullptr, 1, -1, 0, -1, &options), nullptr);
-    EXPECT_NE(std::string(DenseCoreGetLastError()).find("explicit mtp"), std::string::npos);
+    EXPECT_EQ(InitEngineWithOptions("mock", nullptr, 1, -1, 0, -1, &options), nullptr);
+    EXPECT_NE(std::string(DenseCoreGetLastError()).find("explicit MTP"), std::string::npos);
 }
 
 TEST(EngineInitOptions, RejectsMalformedOptionsAndKvTypeBeforeLoading) {
@@ -69,6 +69,17 @@ TEST(EngineInitOptions, AutoAndNonePreserveLegacyInitialization) {
         options.spec_type = mode;
         DenseCoreHandle handle = InitEngineWithOptions("mock", nullptr, 1, -1, 0, -1, &options);
         ASSERT_NE(handle, nullptr) << DenseCoreGetLastError();
+        DenseCoreRuntimePlan plan{};
+        plan.struct_size = sizeof(plan);
+        plan.version = 1;
+        ASSERT_EQ(DenseCoreGetRuntimePlan(handle, &plan), DENSECORE_STATUS_OK);
+        EXPECT_EQ(plan.spec_requested, mode);
+        EXPECT_EQ(plan.spec_selected, DENSECORE_SPEC_NONE);
+        EXPECT_EQ(plan.effective_threads, 1);
+        EXPECT_GT(plan.effective_context, 0);
+        EXPECT_GE(plan.effective_concurrency, 1);
+        EXPECT_LE(plan.effective_concurrency, 8);
+        EXPECT_LE(plan.required_bytes, plan.available_bytes);
         FreeEngine(handle);
     }
     EXPECT_NE(std::string(DenseCoreSpeculationAutoSelectionReason()).find("no qualified"), std::string::npos);

@@ -1,11 +1,14 @@
 #include "densecore.h"
 
 #include "runtime/engine_internal.h"
+#include "runtime/speculation_config.h"
+#include <memory>
+#include <cstdio>
 
 namespace {
 // A profile must have same-file parity, rollback/streaming/isolation checks and
 // matched performance evidence before becoming eligible here. No profile has
-// passed those gates yet; accepting explicit MTP would silently run plain decode.
+// passed those gates yet. Explicit MTP uses the sequential correctness reference.
 constexpr const char* kAutoReason = "none: no qualified model/CPU/concurrency MTP profile registered";
 }
 
@@ -44,16 +47,60 @@ DENSECORE_API DenseCoreHandle InitEngineWithOptions(const char* model_path, cons
     if (kv_cache_type < -1 || kv_cache_type > DENSECORE_KV_INT4) {
         return invalid("InitEngineWithOptions: unsupported KV cache type");
     }
-    if (spec == DENSECORE_SPEC_MTP) {
-        SetLastError(DENSECORE_STATUS_UNSUPPORTED_OPERATION,
-            "InitEngineWithOptions: explicit mtp is unavailable; no validated execution profile is registered");
+    DenseCoreHandle handle = kv_cache_type == -1
+        ? InitEngineEx(model_path, reserved, threads, numa_node_id, pinning_policy)
+        : InitEngineWithKVType(model_path, reserved, threads, numa_node_id, pinning_policy,
+                               static_cast<DenseCoreKVType>(kv_cache_type));
+    if (!handle) return nullptr;
+    std::unique_ptr<void, decltype(&FreeEngine)> owner(handle, FreeEngine);
+    try {
+        std::string error;
+        if (!ConfigureSpeculation(static_cast<EngineState*>(handle), spec, draft_limit, &error)) {
+            owner.reset();
+            SetLastError(DENSECORE_STATUS_UNSUPPORTED_OPERATION, "InitEngineWithOptions: " + error);
+            return nullptr;
+        }
+        return owner.release();
+    } catch (const std::exception& e) {
+        owner.reset();
+        SetLastError(DENSECORE_STATUS_INTERNAL_ERROR, e.what());
         return nullptr;
     }
-    if (kv_cache_type == -1) {
-        return InitEngineEx(model_path, reserved, threads, numa_node_id, pinning_policy);
+}
+
+DENSECORE_API int DenseCoreGetRuntimePlan(DenseCoreHandle handle, DenseCoreRuntimePlan* out) {
+    if (!handle || !out || out->struct_size < sizeof(DenseCoreRuntimePlan) || out->version != 1) {
+        SetLastError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCoreGetRuntimePlan: invalid handle or structure header");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
     }
-    return InitEngineWithKVType(model_path, reserved, threads, numa_node_id, pinning_policy,
-        static_cast<DenseCoreKVType>(kv_cache_type));
+    auto* state = static_cast<EngineState*>(handle);
+    std::lock_guard<std::mutex> lock(state->models_mu);
+    const auto found = state->models.find(state->default_model_id);
+    if (found == state->models.end() || !found->second) return DENSECORE_STATUS_INVALID_ARGUMENT;
+    const auto& config = found->second->kv_config;
+    const auto& memory = config.memory_plan;
+    DenseCoreRuntimePlan result{};
+    result.struct_size = sizeof(result);
+    result.version = 1;
+    result.effective_threads = state->n_threads;
+    result.effective_context = config.max_seq_len;
+    result.effective_concurrency = config.max_num_seqs;
+    result.spec_requested = state->speculation_requested.load(std::memory_order_acquire);
+    result.spec_selected = state->speculation_selected.load(std::memory_order_acquire);
+    result.spec_draft_n_max = state->spec_draft_n_max.load(std::memory_order_acquire);
+    result.available_bytes = memory.available_bytes;
+    result.required_bytes = memory.RequiredBytes();
+    result.kv_bytes = memory.kv_bytes;
+    result.graph_bytes = memory.graph_bytes;
+    result.repack_bytes = memory.repack_bytes;
+    result.recurrent_bytes = memory.recurrent_bytes;
+    result.prefix_snapshot_bytes = memory.prefix_snapshot_bytes;
+    result.mtp_bytes = memory.mtp_checkpoint_bytes;
+    result.allocator_bytes = memory.allocator_bytes;
+    std::snprintf(result.spec_reason, sizeof(result.spec_reason), "%s", state->speculation_reason.c_str());
+    *out = result;
+    ClearLastError();
+    return DENSECORE_STATUS_OK;
 }
 
 }  // extern "C"
