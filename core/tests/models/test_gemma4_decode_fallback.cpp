@@ -30,6 +30,7 @@
 #include "densecore/models/model_types.h"
 
 namespace densecore::testing {
+bool IsGemma4PleF32ProjectionForTest(const TransformerModel*, const ggml_tensor*);
 ggml_tensor* SmartMulMatWithPhaseTest(ggml_context* ctx, ggml_tensor* weight, ggml_tensor* input,
                                      TransformerModel* model, int phase);
 std::vector<float> ComputeStandardAttentionOutputForTest(const std::vector<float>& q,
@@ -2234,7 +2235,15 @@ TEST(Gemma4DecodeGraphTest, CanonicalPleF32ProjectionMatchesOldSingleColumnPrimi
         model->hparams.n_embd = embedding;
         model->gemma4_hidden_size_per_layer_input = hidden;
         model->layers[0].Set(gate ? model_keys::kGemma4PerLayerInputGate : model_keys::kGemma4PerLayerProjection, weight);
-        const auto run = [&](int columns, int first, int threads, bool strided) {
+        const auto run = [&](int columns, int first, int threads, bool strided,
+                             InferenceExecutionPhase phase=InferenceExecutionPhase::Decode,
+                             bool lora=false, bool reference=false, bool registered=true, bool disable=false) {
+            const char* role=gate ? model_keys::kGemma4PerLayerInputGate : model_keys::kGemma4PerLayerProjection;
+            struct RoleRestore {
+                TransformerModel* model; const char* role; ggml_tensor* previous;
+                ~RoleRestore(){model->layers[0].Set(role,previous);}
+            } role_restore{model.get(),role,model->layers[0].Get(role)};
+            if(!registered)model->layers[0].Set(role,nullptr);
             std::unique_ptr<InferenceWorkContext, decltype(&DestroyInferenceWorkContext)> work(
                 CreateInferenceWorkContext(), DestroyInferenceWorkContext);
             struct Restore { InferenceWorkContext* previous; ~Restore(){SetCurrentWorkContext(previous);} } restore{GetCurrentWorkContext()};
@@ -2245,7 +2254,8 @@ TEST(Gemma4DecodeGraphTest, CanonicalPleF32ProjectionMatchesOldSingleColumnPrimi
                 batch.seq_id.push_back(c); batch.pos.push_back(43+c); batch.n_past.push_back(43+c);
             }
             InferenceDependencies deps; batch.deps=&deps;
-            SetCurrentBatch(&batch); SetCurrentExecutionPhase(InferenceExecutionPhase::Decode);
+            if(lora)batch.lora_map[nullptr]={0};
+            SetCurrentBatch(&batch); SetCurrentExecutionPhase(phase);
             std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(
                 ggml_init({2*1024*1024, nullptr, false}), ggml_free);
             auto* storage=ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, reduction+(strided ? 16 : 0), columns);
@@ -2253,7 +2263,7 @@ TEST(Gemma4DecodeGraphTest, CanonicalPleF32ProjectionMatchesOldSingleColumnPrimi
             for (int c=0; c<columns; ++c)
                 std::memcpy(static_cast<char*>(input->data)+c*input->nb[1], inputs.data()+(first+c)*reduction, reduction*sizeof(float));
             auto* output=densecore::testing::SmartMulMatWithPhaseTest(ctx.get(), weight, input, model.get(),
-                static_cast<int>(InferenceExecutionPhase::Decode));
+                static_cast<int>(phase));
             struct Params { ggml_custom_op_t fun; int n_tasks; void* userdata; } params{};
             if (output->op!=GGML_OP_CUSTOM) throw std::runtime_error("PLE CPU fixture did not select a maintained custom callback");
             std::memcpy(&params, output->op_params, sizeof(params));
@@ -2262,10 +2272,18 @@ TEST(Gemma4DecodeGraphTest, CanonicalPleF32ProjectionMatchesOldSingleColumnPrimi
                 if (!weight_strided) EXPECT_EQ(params.fun, cb_gemv_custom);
                 else EXPECT_NE(params.fun, cb_gemv_custom); // existing Gemma4FloatProjection/DotF32.
             }
+            if(params.fun==cb_gemv_batched_custom) {
+                auto* userdata=static_cast<GemvBatchedUserData*>(params.userdata);
+                EXPECT_EQ(userdata->gemma4_canonical_ple_f32_columns,registered);
+                userdata->force_reference_scalar=reference;
+                if(disable)userdata->gemma4_canonical_ple_f32_columns=false;
+            }
             params.n_tasks=threads; // actual thread5, including the 256-output gate.
             std::memcpy(output->op_params, &params, sizeof(params));
             auto* graph=ggml_new_graph_custom(ctx.get(), 128, false); ggml_build_forward_expand(graph, output);
             EXPECT_EQ(ggml_graph_compute_with_ctx(ctx.get(), graph, threads), GGML_STATUS_SUCCESS);
+            if(columns>1 && (phase!=InferenceExecutionPhase::Decode || lora || reference || !registered || disable))
+                EXPECT_EQ(GetInferenceWorkContextProfile(work.get())->gemv_custom_total_ops.load(),0);
             std::vector<float> result(outputs*columns);
             for (int c=0; c<columns; ++c)
                 std::memcpy(result.data()+c*outputs, static_cast<char*>(output->data)+c*output->nb[1], outputs*sizeof(float));
@@ -2286,5 +2304,39 @@ TEST(Gemma4DecodeGraphTest, CanonicalPleF32ProjectionMatchesOldSingleColumnPrimi
                     << " first_unequal_output=" << std::distance(expected.begin(),first.first);
             }
         }
+        for(auto phase:{InferenceExecutionPhase::Prefill,InferenceExecutionPhase::Unknown}) {
+            const auto current=run(4,0,5,true,phase);
+            const auto previous=run(4,0,5,true,phase,false,false,true,true);
+            EXPECT_EQ(std::memcmp(current.data(),previous.data(),current.size()*sizeof(float)),0);
+        }
+        for(int exclusion:{0,1,2}) {
+            const bool lora=exclusion==0, reference=exclusion==1, registered=exclusion!=2;
+            const auto current=run(4,0,5,true,InferenceExecutionPhase::Decode,lora,reference,registered);
+            const auto previous=run(4,0,5,true,InferenceExecutionPhase::Decode,lora,reference,registered,true);
+            EXPECT_EQ(std::memcmp(current.data(),previous.data(),current.size()*sizeof(float)),0);
+        }
     }
+}
+
+
+TEST(Gemma4DecodeGraphTest, CanonicalPleF32AdmissionRequiresActualRoleShapeAndFamily) {
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({256*1024,nullptr,true}),ggml_free);
+    ASSERT_NE(ctx,nullptr);
+    auto model=MakeBaseGemma4GraphModel(1);
+    model->variant=ModelVariant::GEMMA4;
+    model->hparams.n_embd=1536;model->gemma4_hidden_size_per_layer_input=256;
+    auto* weight=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,1536,256);
+    auto* foreign=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,1536,256);
+    ggml_set_name(weight,"blk.0.inp_gate.weight");ggml_set_name(foreign,weight->name);
+    model->layers[0].Set(model_keys::kGemma4PerLayerInputGate,weight);
+    EXPECT_TRUE(densecore::testing::IsGemma4PleF32ProjectionForTest(model.get(),weight));
+    EXPECT_FALSE(densecore::testing::IsGemma4PleF32ProjectionForTest(model.get(),foreign));
+    model->gemma4_hidden_size_per_layer_input=512;
+    EXPECT_FALSE(densecore::testing::IsGemma4PleF32ProjectionForTest(model.get(),weight));
+    model->gemma4_hidden_size_per_layer_input=256;model->variant=ModelVariant::QWEN35;
+    EXPECT_FALSE(densecore::testing::IsGemma4PleF32ProjectionForTest(model.get(),weight));
+    model->variant=ModelVariant::GEMMA4;
+    auto* global_bf16=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_BF16,1536,8960);
+    model->layers[0].Set(model_keys::kGemma4PerLayerInputGate,global_bf16);
+    EXPECT_FALSE(densecore::testing::IsGemma4PleF32ProjectionForTest(model.get(),global_bf16));
 }

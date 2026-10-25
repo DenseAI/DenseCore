@@ -1221,6 +1221,25 @@ static const ggml_tensor* ResolveQwen38Q4K8x8Alias(const TransformerModel* model
     return nullptr;
 }
 
+// Only the two actual Gemma PLE tensors are admitted. Other F32 projections,
+// global BF16 PLE preparation and every non-Gemma family keep their policy.
+static bool IsGemma4PleF32Projection(const TransformerModel* model, const ggml_tensor* weight) {
+    if (!model || model->variant != ModelVariant::GEMMA4 || !model->arch_flags.is_gemma4 || !weight ||
+        weight->type != GGML_TYPE_F32 || weight->nb[0] != sizeof(float) ||
+        weight->ne[2] != 1 || weight->ne[3] != 1 ||
+        model->hparams.n_embd <= 0 || model->gemma4_hidden_size_per_layer_input <= 0)
+        return false;
+    const int embedding = model->hparams.n_embd;
+    const int hidden = model->gemma4_hidden_size_per_layer_input;
+    for (const auto& layer : model->layers) {
+        if (layer.Get(model_keys::kGemma4PerLayerInputGate) == weight &&
+            weight->ne[0] == embedding && weight->ne[1] == hidden) return true;
+        if (layer.Get(model_keys::kGemma4PerLayerProjection) == weight &&
+            weight->ne[0] == hidden && weight->ne[1] == embedding) return true;
+    }
+    return false;
+}
+
 static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const TransformerModel* model,
                                                 const ggml_tensor* weight, const SmartMatmulDispatchState& dispatch,
                                                 const SmartMatmulPrefillProjectionPlan& prefill,
@@ -1240,6 +1259,8 @@ static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const T
                                    prefill.qwen36_lm_head_q4k_prefill_relevant;
     ud->gemma4_canonical_q4k_columns = model && model->variant == ModelVariant::GEMMA4 &&
                                          weight->type == GGML_TYPE_Q4_K && !ud->require_q4k_true_batched;
+    ud->gemma4_canonical_ple_f32_columns = IsGemma4PleF32Projection(model, weight) &&
+                                             !ud->require_q4k_true_batched;
     ud->gemma4_prefill_safe_batched = gemma4_prefill_safe_batched;
     ud->disable_quant_nrc_fast = dispatch.matmul_plan.qwen.qwen35_0_8b || prefill.lfm2_prefill_quant_nrc_unsafe ||
                                  prefill.lfm2_prefill_q4k_relevant || gemma4_prefill_safe_batched;
@@ -1664,6 +1685,9 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
 
 #ifdef DENSECORE_TEST_BUILD
 namespace densecore::testing {
+bool IsGemma4PleF32ProjectionForTest(const TransformerModel* model, const ggml_tensor* weight) {
+    return ::IsGemma4PleF32Projection(model, weight);
+}
 bool ShouldUseGemma4PrefillSafeBatchedForTest(bool is_gemma4, bool prefill_phase, int m, bool dense_prefill_allowed) {
     TransformerModel model{};
     model.arch_flags.is_gemma4 = is_gemma4;

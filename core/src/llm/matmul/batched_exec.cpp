@@ -216,13 +216,16 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         }
     }
 
-    // Canonical Gemma Q4_K columns use the identical packed/raw GEMV policy
-    // and accumulation order as M=1. GGML workers still own disjoint output
-    // rows; the scheduler keeps the physical batch and its independent KV.
-    // The local userdata deliberately has no shared quant buffer/stamp: every
-    // worker owns its TLS activation bytes until it finishes that column.
-    if (ud->gemma4_canonical_q4k_columns && weight_type == GGML_TYPE_Q4_K &&
-        ud->input_quant_type == GGML_TYPE_Q8_K && output_contig &&
+    // Preserve each supported projection's exact M=1 arithmetic. Workers
+    // still own disjoint output rows; the scheduler retains its physical batch.
+    // Private userdata has no shared quant buffer/stamp, so another worker
+    // cannot overwrite an activation row while this worker still consumes it.
+    const bool canonical_q4k = ud->gemma4_canonical_q4k_columns && weight_type == GGML_TYPE_Q4_K &&
+                               ud->input_quant_type == GGML_TYPE_Q8_K;
+    const bool canonical_ple_f32 = ud->gemma4_canonical_ple_f32_columns && weight_type == GGML_TYPE_F32 &&
+                                   ud->input_quant_type == GGML_TYPE_F32 && input_contig &&
+                                   (!callback_batch || callback_batch->lora_map.empty());
+    if ((canonical_q4k || canonical_ple_f32) && output_contig &&
         callback_phase == InferenceExecutionPhase::Decode &&
         !ud->gemma4_prefill_safe_batched && !ud->force_reference_scalar) {
         GemvUserData column_ud{};
@@ -230,12 +233,25 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         column_ud.N = N;
         column_ud.K = K;
         column_ud.weight_type = weight_type;
-        column_ud.input_quant_type = GGML_TYPE_Q8_K;
+        column_ud.input_quant_type = ud->input_quant_type;
         column_ud.force_reference_scalar = ud->force_reference_scalar;
         column_ud.dynamic_lora_active = callback_batch && !callback_batch->lora_map.empty();
         column_ud.work_ctx = callback_work_ctx;
         column_ud.phase_snapshot = callback_phase;
         for (int m = 0; m < M; ++m) {
+            if (canonical_ple_f32 && weight_row_stride != static_cast<size_t>(N) * sizeof(float)) {
+                // A padded F32 row takes Gemma4FloatProjection/DotF32 at M=1,
+                // while a contiguous row takes cb_gemv_custom/GemvParallel.
+                // Keep both old singleton primitives, rather than assuming
+                // that two mathematically equivalent SIMD dots have equal bits.
+                auto* output = reinterpret_cast<float*>(output_base + static_cast<size_t>(m) * output_col_stride);
+                for (int k = k_start; k < k_end; ++k) {
+                    const auto* row = reinterpret_cast<const float*>(
+                        static_cast<const char*>(weight_tensor->data) + static_cast<size_t>(k) * weight_row_stride);
+                    output[k] = densecore::simd::DotF32(row, x_rows[static_cast<size_t>(m)], static_cast<size_t>(N));
+                }
+                continue;
+            }
             ggml_tensor column_input = *src;
             column_input.data = const_cast<float*>(x_rows[static_cast<size_t>(m)]);
             column_input.ne[1] = column_input.ne[2] = column_input.ne[3] = 1;
